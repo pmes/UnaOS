@@ -322,19 +322,25 @@ fn fs_append(console: &mut Console, arg: &str, data: &[u8]) {
 /// JD6 `rm`: delete a file at `path` in ANY reachable directory — `delete_located` marks the
 /// directory slot `0xE5` FIRST, then frees the cluster chain (all FAT copies), the crash-safe order
 /// fat.rs guarantees. A directory target is refused (`-EISDIR` — use `rmdir` for directories, JD7);
-/// an absent name is `-ENOENT`. Rides the dir-aware locate_in_dir twin.
-fn fs_rm(console: &mut Console, arg: &str) {
+/// an absent name is `-ENOENT`, EXCEPT under `force` (the JD14 `-f` flag), which suppresses the
+/// missing-target error quietly (POSIX `rm -f`); a wrong-usage `-EISDIR` is still shown under `-f`.
+/// Rides the dir-aware locate_in_dir twin.
+fn fs_rm(console: &mut Console, arg: &str, force: bool) {
     let fs = match crate::fs::fat::mount() {
         Ok(fs) => fs,
         Err(e) => return console.println(&alloc::format!("rm: no FAT filesystem ({:?})", e)),
     };
     let (parent, name, canon) = match resolve_write_target(&fs, arg) {
         Ok(t) => t,
-        Err(msg) => return console.println(&alloc::format!("rm: {}", msg)),
+        // JD14: `-f` is lenient about a missing target (POSIX `rm -f NOSUCH` is quiet). A missing
+        // parent component means the target does not exist, so force suppresses the message.
+        Err(msg) => { if !force { console.println(&alloc::format!("rm: {}", msg)); } return; }
     };
     match fs.locate_in_dir(parent, &name) {
         Ok((de, dl, doff)) => {
             if de.is_dir {
+                // A wrong-usage error (a directory without `-r`), NOT a "missing target" — shown even
+                // under `-f`, exactly as POSIX `rm -f DIR` still complains.
                 return console.println(&alloc::format!(
                     "rm: {}: is a directory (-EISDIR)", joined(&canon, de.name())));
             }
@@ -345,8 +351,9 @@ fn fs_rm(console: &mut Console, arg: &str) {
                     "rm: {}: {} ({:?})", joined(&canon, &name), fat_errno(e), e)),
             }
         }
-        Err(FatError::NotFound) => console.println(&alloc::format!(
-            "rm: {}: not found (-ENOENT)", joined(&canon, &name))),
+        // JD14: a missing leaf is quiet under `-f`.
+        Err(FatError::NotFound) => { if !force { console.println(&alloc::format!(
+            "rm: {}: not found (-ENOENT)", joined(&canon, &name))); } }
         Err(e) => console.println(&alloc::format!(
             "rm: {}: {} ({:?})", joined(&canon, &name), fat_errno(e), e)),
     }
@@ -440,10 +447,14 @@ fn fs_rmdir(console: &mut Console, arg: &str) {
 /// JD7's nature (it only CALLS existing public API). `src` must be a file (a directory source is
 /// `-EISDIR` — recursive `cp -r` is a JD9 candidate, out of scope this arc). If `dst` resolves to an
 /// existing DIRECTORY the copy lands as `dst/<src-leaf>` (the `cp FILE DIR/` idiom); otherwise `dst`
-/// names the destination file (created, or truncated in place if it already exists). Honest errors:
-/// src missing → `-ENOENT`; src is a dir → `-EISDIR`; dst parent missing → `-ENOENT`; dst parent is a
-/// file → `-ENOTDIR`; the volume/dir full → `-ENOSPC`; copying a file onto itself (same canonical
-/// path) → `-EINVAL`.
+/// names the destination file. JD14: no-clobber is the PANEL DEFAULT — an existing destination FILE is
+/// refused (`-EEXIST`) unless `force` (`-f`) is set, which opts into truncate-in-place overwrite; `-n`
+/// reasserts the default. (This aligns `cp` with `mv`'s pre-existing no-clobber default — a deliberate
+/// divergence from POSIX `cp`, which overwrites silently; the panel favours safety + cp/mv symmetry.)
+/// Honest errors:
+/// src missing → `-ENOENT`; src is a dir → `-EISDIR`; dst exists (no `-f`) → `-EEXIST`; dst parent
+/// missing → `-ENOENT`; dst parent is a file → `-ENOTDIR`; the volume/dir full → `-ENOSPC`; copying a
+/// file onto itself (same canonical path) → `-EINVAL`.
 ///
 /// SIZE HANDLING (JD8-M2 decision): the copy STREAMS the bytes in fixed windows via the offset-aware
 /// `read_at` (existing public fat.rs API — the U9/read-path twin of `read_file`, so this reaches for
@@ -452,7 +463,7 @@ fn fs_rmdir(console: &mut Console, arg: &str) {
 /// per-window `write_grow` re-walks the growing destination chain (bounded, and every FAT/data access
 /// rides the JD3 wall-clock BOT pump — a stalled transfer is `-EIO`, never a hang on the timerless EL1
 /// core); a future single-pass primitive could tighten that, tracked as a JD9 note.
-fn fs_cp(console: &mut Console, src: &str, dst: &str) {
+fn fs_cp(console: &mut Console, src: &str, dst: &str, force: bool) {
     let fs = match crate::fs::fat::mount() {
         Ok(fs) => fs,
         Err(e) => return console.println(&alloc::format!("cp: no FAT filesystem ({:?})", e)),
@@ -490,7 +501,7 @@ fn fs_cp(console: &mut Console, src: &str, dst: &str) {
     }
     // --- Create-or-truncate the destination and stream the bytes (shared with the JD9 `cp -r` per-file
     //     leg, so the streaming/errno logic lives in exactly one place). ---
-    match copy_file_into(&fs, &de_src, &src_canon, dparent, &dleaf, &dcanon) {
+    match copy_file_into(&fs, &de_src, &src_canon, dparent, &dleaf, &dcanon, force) {
         Ok(bytes) => console.println(&alloc::format!(
             "copied {} -> {} ({} bytes)", src_canon, dest_disp, bytes)),
         Err(msg) => console.println(&alloc::format!("cp: {}", msg)),
@@ -514,6 +525,7 @@ fn copy_file_into(
     dparent: u32,
     dleaf: &str,
     dcanon: &str,
+    force: bool,
 ) -> Result<u64, String> {
     let dest_disp = joined(dcanon, dleaf);
     // --- Create-or-truncate the destination as a fresh 0-length file (the JD6 write prologue). ---
@@ -521,6 +533,14 @@ fn copy_file_into(
         Ok((de, dl, doff)) => {
             if de.is_dir {
                 return Err(alloc::format!("{}: is a directory (-EISDIR)", joined(dcanon, de.name())));
+            }
+            // JD14: no-clobber is the panel default — an existing FILE destination is refused unless
+            // `-f` was given (which opts into the overwrite/truncate below). The `cp -r` recursion
+            // always writes into a freshly-created (empty) tree, so it passes `force = true` and this
+            // guard never trips there.
+            if !force {
+                return Err(alloc::format!(
+                    "{}: file exists (-EEXIST); use cp -f to overwrite", dest_disp));
             }
             fs.delete_located(dl, doff, de.first_cluster()).map_err(|e| {
                 alloc::format!("{}: truncate failed {} ({:?})", dest_disp, fat_errno(e), e)
@@ -627,7 +647,9 @@ fn cp_tree(
             stats.dirs += 1;
             cp_tree(fs, de.first_cluster(), &child_src, cde.first_cluster(), &child_dst, depth + 1, stats)?;
         } else {
-            let bytes = copy_file_into(fs, de, &child_src, dst_cluster, nm, dst_canon)?;
+            // The destination subtree is freshly created (empty), so no child name can pre-exist —
+            // pass `force = true` so the JD14 no-clobber guard never trips inside a fresh `cp -r` tree.
+            let bytes = copy_file_into(fs, de, &child_src, dst_cluster, nm, dst_canon, true)?;
             stats.files += 1;
             stats.bytes += bytes;
         }
@@ -653,7 +675,7 @@ fn cp_tree(
 /// A mid-tree failure stops and reports the honest partial count (dirs/files/bytes copied so far) plus the
 /// failing path + errno; nothing is rolled back (a partial tree is left on disk, crash-safe per the
 /// FATDIRS/JD6 ordering — the operator can `rmdir`/`rm` it).
-fn fs_cp_recursive(console: &mut Console, src: &str, dst: &str) {
+fn fs_cp_recursive(console: &mut Console, src: &str, dst: &str, force: bool) {
     let fs = match crate::fs::fat::mount() {
         Ok(fs) => fs,
         Err(e) => return console.println(&alloc::format!("cp: no FAT filesystem ({:?})", e)),
@@ -666,7 +688,7 @@ fn fs_cp_recursive(console: &mut Console, src: &str, dst: &str) {
         Err(msg) => return console.println(&alloc::format!("cp: {}", msg)),
     };
     if !de_src.is_dir {
-        return fs_cp(console, src, dst); // `cp -r FILE DST` == `cp FILE DST`
+        return fs_cp(console, src, dst, force); // `cp -r FILE DST` == `cp FILE DST` (JD14: -f honoured)
     }
     // --- Decide the TARGET directory path (the `cp DIR DEST` idiom). ---
     let dst_norm = normalize_path(&cwd_path(), dst);
@@ -683,9 +705,13 @@ fn fs_cp_recursive(console: &mut Console, src: &str, dst: &str) {
             "cp: cannot copy directory {} into itself or its own subtree ({}) (-EINVAL)",
             src_canon, target));
     }
-    // --- The top-level target must not already exist (fresh-tree rule → honest -EEXIST). ---
+    // --- The top-level target must not already exist (fresh-tree rule → honest -EEXIST). JD14: `-f`
+    //     overwrites a FILE destination (the degrade-to-`fs_cp` path above), but a directory-TREE
+    //     merge/replace is out of scope even with `-f` — an existing tree target stays -EEXIST (remove
+    //     it first with `rm -r`, then `cp -r`). Keeps the destructive surface bounded and honest. ---
     if resolve_path(&fs, &target).is_ok() {
-        return console.println(&alloc::format!("cp: {}: already exists (-EEXIST)", target));
+        return console.println(&alloc::format!(
+            "cp: {}: already exists (-EEXIST); remove it first (rm -r) to replace a tree", target));
     }
     // --- Create the top-level target directory (its parent must exist), then recurse into it. ---
     let (tparent, tleaf, tcanon) = match resolve_write_target(&fs, &target) {
@@ -792,31 +818,33 @@ fn rm_tree(
 /// `OWNED_FILES` ACL and composes the same F3-locked `read_dir`/`locate_in_dir`/`delete_located`/
 /// `remove_dir` primitives JD6/JD7/JD9 already exercise and ledger, so it inherits their locking
 /// analysis unchanged (no new fat.rs surface, no new lock, no new namespace interaction).
-fn fs_rm_recursive(console: &mut Console, arg: &str) {
+fn fs_rm_recursive(console: &mut Console, arg: &str, force: bool) {
     let fs = match crate::fs::fat::mount() {
         Ok(fs) => fs,
         Err(e) => return console.println(&alloc::format!("rm: no FAT filesystem ({:?})", e)),
     };
     // Refuse the root explicitly, with the honest errno, BEFORE any walk. `normalize_path` folds
-    // `rm -r .` at the root and `rm -r ..` that pops to it into "/".
+    // `rm -r .` at the root and `rm -r ..` that pops to it into "/". The root refusal stands even
+    // under `-f` — `rm -rf /` is a footgun the panel never honours (cluster 0 is unremovable).
     let norm = normalize_path(&cwd_path(), arg);
     if norm == "/" {
         return console.println("rm: -r /: cannot remove the root directory (-EBUSY)");
     }
-    // Resolve the target. A FILE degrades to a plain `rm`; a DIRECTORY is the recursive case.
+    // Resolve the target. A FILE degrades to a plain `rm`; a DIRECTORY is the recursive case. Under
+    // `-f`, a missing target is quiet (POSIX `rm -rf NOSUCH`).
     let (de_src, src_canon) = match resolve_path(&fs, &norm) {
         Ok(Resolved::Root) =>
             return console.println("rm: -r /: cannot remove the root directory (-EBUSY)"),
         Ok(Resolved::Entry(de, canon)) => (de, canon),
-        Err(msg) => return console.println(&alloc::format!("rm: {}", msg)),
+        Err(msg) => { if !force { console.println(&alloc::format!("rm: {}", msg)); } return; }
     };
     if !de_src.is_dir {
-        return fs_rm(console, arg); // `rm -r FILE` == `rm FILE`
+        return fs_rm(console, arg, force); // `rm -r FILE` == `rm FILE` (JD14: -f honoured)
     }
     // A directory: walk to its parent so the now-empty top directory can be removed after `rm_tree`.
     let (parent, leaf, parent_canon) = match resolve_write_target(&fs, &norm) {
         Ok(t) => t,
-        Err(msg) => return console.println(&alloc::format!("rm: {}", msg)),
+        Err(msg) => { if !force { console.println(&alloc::format!("rm: {}", msg)); } return; }
     };
     let mut stats = RmStats { dirs: 0, files: 0 };
     match rm_tree(&fs, de_src.first_cluster(), &src_canon, 1, &mut stats) {
@@ -854,7 +882,10 @@ fn fs_rm_recursive(console: &mut Console, arg: &str) {
 /// itself or into its own subtree is refused (`-EINVAL`, the JD9 `is_descendant` canonical-prefix
 /// compare); the destination must not already exist (no-clobber panel default → `-EEXIST`, mirroring
 /// the FATMOVE seam's own dest-exists refusal shell-side) — EXCEPT a rename to the source's own
-/// canonical name (same parent + same leaf), which the seam treats as a no-op success. Honest errno
+/// canonical name (same parent + same leaf), which the seam treats as a no-op success. JD14: `-f`
+/// (force) opts into overwriting an existing FILE destination — the existing file is deleted first
+/// (delete-dst-first), then the entry is relinked into the freed slot; a DIRECTORY destination is
+/// still refused even under `-f` (clobbering a whole subtree would need `rm -r` — kept out of `mv`). Honest errno
 /// surface: src missing → `-ENOENT`; root as src → `-EBUSY`; dst parent missing → `-ENOENT`; dst
 /// parent is a file → `-ENOTDIR`; dst dir full → `-ENOSPC`; a non-8.3 dst name → `-EINVAL`; a
 /// directory across parents → `-EISDIR`.
@@ -864,7 +895,7 @@ fn fs_rm_recursive(console: &mut Console, arg: &str) {
 /// a future K-line seam, ledgered in the pi4 FATMOVE SECURITY note). CRASH SAFETY is the seam's job:
 /// `move_entry` publishes the destination BEFORE `0xE5`ing the source, so a power-cut mid-move leaves
 /// a benign duplicate (two names, one chain), never a lost chain.
-fn fs_mv(console: &mut Console, src: &str, dst: &str) {
+fn fs_mv(console: &mut Console, src: &str, dst: &str, force: bool) {
     let fs = match crate::fs::fat::mount() {
         Ok(fs) => fs,
         Err(e) => return console.println(&alloc::format!("mv: no FAT filesystem ({:?})", e)),
@@ -904,13 +935,40 @@ fn fs_mv(console: &mut Console, src: &str, dst: &str) {
             "mv: cannot move directory {} into itself or its own subtree ({}) (-EINVAL)",
             src_canon, dest_disp));
     }
+    // --- Guard: a DIRECTORY source that would cross parents cannot be moved (its `..` needs rewriting —
+    //     the seam refuses with IsDirectory). Surface that BEFORE any `-f` delete-dst-first below, so
+    //     force never removes the destination for a move that is going to fail anyway. ---
+    if de_src.is_dir && src_parent != dparent {
+        return console.println(&alloc::format!(
+            "mv: {}: cannot move a directory across directories (-EISDIR); rename it in place or use cp -r + rm -r",
+            src_canon));
+    }
     // --- Dest pre-check (no-clobber). Skip it only when the destination IS the source (same parent +
     //     same canonical leaf) — a rename to the same name, which `rename_entry` treats as a no-op. ---
     let same_target = src_parent == dparent && dleaf.eq_ignore_ascii_case(src_leaf);
     if !same_target {
         match fs.locate_in_dir(dparent, &dleaf) {
-            Ok((de, _, _)) => return console.println(&alloc::format!(
-                "mv: {}: file exists (-EEXIST)", joined(&dcanon, de.name()))),
+            Ok((de, dl, doff)) => {
+                // JD14: no-clobber is the default — an existing destination is `-EEXIST` unless `-f`.
+                if !force {
+                    return console.println(&alloc::format!(
+                        "mv: {}: file exists (-EEXIST); use mv -f to overwrite", joined(&dcanon, de.name())));
+                }
+                // `-f`: overwrite an existing FILE destination by removing it first (delete-dst-first),
+                // then the rename/move below re-publishes the entry into the freed slot. A DIRECTORY
+                // destination is NOT clobbered even with `-f` (that would need a recursive delete) —
+                // refuse it honestly so `-f` can never silently destroy a whole subtree.
+                if de.is_dir {
+                    return console.println(&alloc::format!(
+                        "mv: {}: is a directory — refusing to overwrite (-EISDIR); remove it first (rm -r)",
+                        joined(&dcanon, de.name())));
+                }
+                if let Err(e) = fs.delete_located(dl, doff, de.first_cluster()) {
+                    return console.println(&alloc::format!(
+                        "mv: {}: overwrite (remove existing) failed {} ({:?})",
+                        joined(&dcanon, de.name()), fat_errno(e), e));
+                }
+            }
             Err(FatError::NotFound) => {}
             Err(e) => return console.println(&alloc::format!(
                 "mv: {}: {} ({:?})", dest_disp, fat_errno(e), e)),
@@ -1333,7 +1391,7 @@ fn expand_sources(console: &mut Console, fs: &FatFs, verb: &str, sources: &[&str
 /// `-EISDIR`, use `rmdir`) or, when `recursive` (JD13 `rm -r *`), `fs_rm_recursive` (a directory tree,
 /// a file degrades to a plain delete). SNAPSHOT-safety holds through the recursion too: each concrete
 /// match is re-resolved by its canonical path, and a completed `rm -r` never touches a sibling's slot.
-fn rm_globbed(console: &mut Console, args: &[&str], recursive: bool) {
+fn rm_globbed(console: &mut Console, args: &[&str], recursive: bool, force: bool) {
     let fs = match crate::fs::fat::mount() {
         Ok(fs) => fs,
         Err(e) => return console.println(&alloc::format!("rm: no FAT filesystem ({:?})", e)),
@@ -1341,13 +1399,14 @@ fn rm_globbed(console: &mut Console, args: &[&str], recursive: bool) {
     for a in args {
         match glob_expand(&fs, a) {
             Glob::Literal(p) =>
-                if recursive { fs_rm_recursive(console, &p) } else { fs_rm(console, &p) },
+                if recursive { fs_rm_recursive(console, &p, force) } else { fs_rm(console, &p, force) },
+            // JD14: a no-match wildcard is quiet under `-f` (POSIX `rm -f *.none` is silent).
             Glob::Matched { entries, .. } if entries.is_empty() =>
-                console.println(&alloc::format!("rm: {}: no match", a)),
+                { if !force { console.println(&alloc::format!("rm: {}: no match", a)); } }
             Glob::Matched { parent_canon, entries } => {
                 for de in &entries {
                     let path = joined(&parent_canon, de.name());
-                    if recursive { fs_rm_recursive(console, &path) } else { fs_rm(console, &path) }
+                    if recursive { fs_rm_recursive(console, &path, force) } else { fs_rm(console, &path, force) }
                 }
             }
         }
@@ -1358,7 +1417,7 @@ fn rm_globbed(console: &mut Console, args: &[&str], recursive: bool) {
 /// literals); with more than one source the destination MUST be an existing directory (several files
 /// can only land INTO a directory). Each source rides the existing `fs_cp` / `fs_cp_recursive` (the
 /// `FILE DIR/` idiom lands each under `dst/<leaf>`). SNAPSHOT-then-copy.
-fn cp_globbed(console: &mut Console, sources: &[&str], dst: &str, recursive: bool) {
+fn cp_globbed(console: &mut Console, sources: &[&str], dst: &str, recursive: bool, force: bool) {
     let fs = match crate::fs::fat::mount() {
         Ok(fs) => fs,
         Err(e) => return console.println(&alloc::format!("cp: no FAT filesystem ({:?})", e)),
@@ -1372,9 +1431,9 @@ fn cp_globbed(console: &mut Console, sources: &[&str], dst: &str, recursive: boo
     }
     for s in &srcs {
         if recursive {
-            fs_cp_recursive(console, s, dst);
+            fs_cp_recursive(console, s, dst, force);
         } else {
-            fs_cp(console, s, dst);
+            fs_cp(console, s, dst, force);
         }
     }
 }
@@ -1383,7 +1442,7 @@ fn cp_globbed(console: &mut Console, sources: &[&str], dst: &str, recursive: boo
 /// one source the destination MUST be an existing directory. Each source rides the existing `fs_mv`
 /// (the `SRC DIR/` idiom lands each under `dst/<leaf>`). SNAPSHOT-then-move — a wildcard move never
 /// invalidates its own list.
-fn mv_globbed(console: &mut Console, sources: &[&str], dst: &str) {
+fn mv_globbed(console: &mut Console, sources: &[&str], dst: &str, force: bool) {
     let fs = match crate::fs::fat::mount() {
         Ok(fs) => fs,
         Err(e) => return console.println(&alloc::format!("mv: no FAT filesystem ({:?})", e)),
@@ -1396,8 +1455,36 @@ fn mv_globbed(console: &mut Console, sources: &[&str], dst: &str) {
         return console.println(&alloc::format!("mv: target {}: not a directory (-ENOTDIR)", dst));
     }
     for s in &srcs {
-        fs_mv(console, s, dst);
+        fs_mv(console, s, dst, force);
     }
+}
+
+/// JD14: split a `cp`/`mv`/`rm` argument list into `(recursive, force, no_clobber, positional paths)`.
+/// A FLAG arg is `-` followed by one or more ASCII letters — bundled short flags, so `-rf` == `-r -f`;
+/// `r`/`R` set recursive, `f` sets force (`-f`), `n` sets no-clobber (`-n`), any other letter is an
+/// ignored unknown flag. Everything else is a positional path (this also fixes the pre-JD14 exact-token
+/// `-r` match, which never recognized a bundled `rm -rf DIR`). Consistent with the established
+/// convention that a leading-`-` arg is a flag — a file literally named `-x` is still reachable as
+/// `./-x` (its letters parse as unknown/ignored flags, exactly the pre-JD14 behaviour). `-` alone, or
+/// an arg with a non-letter after the dash (e.g. `-2`), is treated as a path.
+fn split_flags<'a>(args: &[&'a str]) -> (bool, bool, bool, Vec<&'a str>) {
+    let (mut recursive, mut force, mut no_clobber) = (false, false, false);
+    let mut paths: Vec<&'a str> = Vec::new();
+    for &a in args {
+        if a.len() > 1 && a.starts_with('-') && a[1..].bytes().all(|b| b.is_ascii_alphabetic()) {
+            for c in a[1..].chars() {
+                match c {
+                    'r' | 'R' => recursive = true,
+                    'f' => force = true,
+                    'n' => no_clobber = true,
+                    _ => {} // unknown flag — ignored (keeps a file named `-x` reachable as `./-x`)
+                }
+            }
+        } else {
+            paths.push(a);
+        }
+    }
+    (recursive, force, no_clobber, paths)
 }
 
 pub struct History {
@@ -1442,12 +1529,13 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             console.println("STORAGE:  diskinfo, usbinfo, read <lba>, write <lba> <byte>");
             console.println("FILES:    fatinfo (FAT geometry), ls [dir], cd [dir], pwd, cat <path>");
             console.println("PAGING:   head <path> [n], tail <path> [n]  (first / last n lines, default 10)");
-            console.println("WRITE:    touch <path>, write <path> <text>, append <path> <text>, rm [-r] <path>");
+            console.println("WRITE:    touch <path>, write <path> <text>, append <path> <text>, rm [-r] [-f] <path>");
             console.println("DIRS:     mkdir <path>, rmdir <path>  (create / remove empty directories)");
             console.println("          rm -r <dir>  (recursively delete a directory tree; root refused)");
-            console.println("COPY:     cp <src> <dst>  (copy a file; cp FILE DIR/ lands as DIR/<leaf>)");
+            console.println("COPY:     cp [-f] <src> <dst>  (copy a file; cp FILE DIR/ lands as DIR/<leaf>)");
             console.println("          cp -r <srcdir> <dst>  (recursively copy a directory tree)");
-            console.println("MOVE:     mv <src...> <dst>  (move/rename a file or dir, O(1); mv SRC DIR/ lands as DIR/<leaf>)");
+            console.println("MOVE:     mv [-f] <src...> <dst>  (move/rename a file or dir, O(1); mv SRC DIR/ lands as DIR/<leaf>)");
+            console.println("FLAGS:    default is no-clobber; -f = force overwrite (rm: quiet on missing), -n = no-clobber");
             console.println("WILDCARD: * / ? in the last path component — ls/cat/rm/cp/mv expand it (e.g. rm *.TMP, cp *.TXT DOCS/)");
             console.println("          (create/edit/delete/copy/move files & dirs anywhere in the tree; sync = write-through, durable)");
             #[cfg(target_arch = "aarch64")]
@@ -1697,19 +1785,20 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // recursively deletes a directory tree (files then directories, depth-first; the root is
             // refused; an honest partial count on a mid-tree failure). Flags (leading `-`) are filtered
             // from the paths exactly as `cp`/`mv` do — a name literally beginning with `-` is reachable as
-            // `./-name`. Without `-r`, a directory target stays -EISDIR (byte-identical to pre-JD13).
-            let recursive = args.iter().any(|a| *a == "-r" || *a == "-R");
-            let paths: Vec<&str> = args.iter().copied().filter(|a| !a.starts_with('-')).collect();
+            // `./-name`. Without `-r`, a directory target stays -EISDIR (byte-identical to pre-JD13). JD14:
+            // `-f`/force suppresses the missing-target error (POSIX `rm -f NOSUCH`/`rm -rf NOSUCH` are
+            // quiet, and a no-match wildcard is quiet); bundled short flags parse (`rm -rf DIR`).
+            let (recursive, force, _no_clobber, paths) = split_flags(&args);
             if paths.is_empty() {
-                console.println("usage: rm [-r] <path> [path ...]");
+                console.println("usage: rm [-r] [-f] <path> [path ...]");
             } else if !paths.iter().any(|a| has_glob(a)) {
-                // No wildcard: delete each literal target (a single non-recursive arg is byte-identical
-                // to pre-JD13).
+                // No wildcard: delete each literal target (a single non-recursive/non-force arg is
+                // byte-identical to pre-JD14).
                 for &a in &paths {
-                    if recursive { fs_rm_recursive(console, a); } else { fs_rm(console, a); }
+                    if recursive { fs_rm_recursive(console, a, force); } else { fs_rm(console, a, force); }
                 }
             } else {
-                rm_globbed(console, &paths, recursive);
+                rm_globbed(console, &paths, recursive, force);
             }
         },
         "mkdir" | "md" => {
@@ -1731,21 +1820,23 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // directory tree. Flags (leading `-`) precede the paths; only `-r`/`-R` are recognized (any
             // other leading-`-` arg is ignored as an unknown flag — a name literally beginning with `-` is
             // reachable as `./-name`). JD12: sources expand trailing wildcards and there may be several,
-            // the LAST path being the destination (into a directory). `cp [-r] <src...> <dst>`.
-            let recursive = args.iter().any(|a| *a == "-r" || *a == "-R");
-            let paths: Vec<&str> = args.iter().copied().filter(|a| !a.starts_with('-')).collect();
+            // the LAST path being the destination (into a directory). JD14: no-clobber is the DEFAULT —
+            // an existing destination FILE is `-EEXIST` unless `-f` (which overwrites); `-n` reasserts
+            // the default (and overrides `-f`). `cp [-r] [-f|-n] <src...> <dst>`.
+            let (recursive, force_raw, no_clobber, paths) = split_flags(&args);
+            let force = force_raw && !no_clobber; // `-n` (no-clobber) overrides `-f` for safety
             if paths.len() < 2 {
-                console.println("usage: cp [-r] <src...> <dst>");
+                console.println("usage: cp [-r] [-f|-n] <src...> <dst>");
             } else if paths.len() == 2 && !has_glob(paths[0]) && !has_glob(paths[1]) {
-                // No wildcard, one src: byte-identical to pre-JD12 cp.
+                // No wildcard, one src: byte-identical to pre-JD12 cp (plus the JD14 no-clobber default).
                 if recursive {
-                    fs_cp_recursive(console, paths[0], paths[1]);
+                    fs_cp_recursive(console, paths[0], paths[1], force);
                 } else {
-                    fs_cp(console, paths[0], paths[1]);
+                    fs_cp(console, paths[0], paths[1], force);
                 }
             } else {
                 let dst = paths[paths.len() - 1];
-                cp_globbed(console, &paths[..paths.len() - 1], dst, recursive);
+                cp_globbed(console, &paths[..paths.len() - 1], dst, recursive, force);
             }
         },
         "mv" | "move" | "ren" | "rename" => {
@@ -1754,15 +1845,20 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // place (files AND dirs); across parents → move (files only, a dir there is -EISDIR). The
             // `mv SRC DIR/` idiom lands the entry under DIR as the source leaf. JD12: sources expand
             // trailing wildcards and there may be several, the LAST path being the destination
-            // directory. `mv <src...> <dst>`.
-            if args.len() < 2 {
-                console.println("usage: mv <src...> <dst>");
-            } else if args.len() == 2 && !has_glob(args[0]) && !has_glob(args[1]) {
-                // No wildcard, one src: byte-identical to pre-JD12 mv.
-                fs_mv(console, args[0], args[1]);
+            // directory. JD14: no-clobber is the DEFAULT — an existing destination is `-EEXIST` unless
+            // `-f` (which overwrites a FILE dest via delete-dst-first; a directory dest is still refused);
+            // `-n` reasserts the default. Flags are filtered from the paths like `cp`/`rm`.
+            // `mv [-f|-n] <src...> <dst>`.
+            let (_recursive, force_raw, no_clobber, paths) = split_flags(&args);
+            let force = force_raw && !no_clobber; // `-n` (no-clobber) overrides `-f` for safety
+            if paths.len() < 2 {
+                console.println("usage: mv [-f|-n] <src...> <dst>");
+            } else if paths.len() == 2 && !has_glob(paths[0]) && !has_glob(paths[1]) {
+                // No wildcard, one src: byte-identical to pre-JD12 mv (plus the JD14 flag parse).
+                fs_mv(console, paths[0], paths[1], force);
             } else {
-                let dst = args[args.len() - 1];
-                mv_globbed(console, &args[..args.len() - 1], dst);
+                let dst = paths[paths.len() - 1];
+                mv_globbed(console, &paths[..paths.len() - 1], dst, force);
             }
         },
         "sync" => {

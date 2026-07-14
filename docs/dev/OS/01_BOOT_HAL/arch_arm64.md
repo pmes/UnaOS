@@ -2547,6 +2547,77 @@ several trees at once, with a power-cycle to confirm the deletions are durable (
 after the cycle proves the clusters were genuinely freed and reused). ⚠ Verify the serial bridge captures a
 full boot BEFORE burning bench time (§JB1f) — with JD11 the transcript is the primary output-evidence channel.
 
+### JD14 — the `-f`/force + `-n`/no-clobber flag family for `cp`/`mv`/`rm`
+
+The verb set closed at JD13; JD14 adds the POSIX-style flag family that completes the everyday ergonomics —
+`cp -f`/`mv -f` to overwrite, `rm -f`/`rm -rf` to delete quietly, `-n` to make the no-clobber default
+explicit. Like JD6–JD13 it is **`shell.rs`-only and adds NO `fat.rs` logic** — it composes the existing
+public primitives (`locate_in_dir`/`delete_located`/`rename_entry`/`move_entry`, all call-never-edit). A new
+`split_flags(argv)` helper parses **bundled short flags** (`-rf` == `-r -f`), which also fixes a latent
+pre-JD14 gap: the old exact-token match (`*a == "-r"`) never recognized `rm -rf DIR`, so `rm -rf` silently
+fell through to `-EISDIR`.
+
+**No-clobber is now the panel DEFAULT for `cp` AND `mv`.** `mv` already refused a pre-existing destination
+(`-EEXIST`); JD14 brings `cp` into line — an existing destination FILE is `-EEXIST` unless `-f`. This is a
+deliberate divergence from POSIX `cp` (which overwrites silently): the panel favours safety and cp/mv
+symmetry over strict POSIX. It is a behaviour change to plain `cp` onto an existing file (previously a silent
+truncate-in-place overwrite, now `-EEXIST`) — no automated gate exercises the panel `cp` path (the shell is
+keystroke-driven and tegra-only), so the change is gate-neutral and surfaces only at the attended bench.
+
+**`-f`/force — opt into overwrite:**
+- `cp -f SRC DST` overwrites an existing destination FILE via the JD8 truncate-in-place path
+  (`copy_file_into` gains a `force` param; the `cp -r` recursion always writes into a freshly-created,
+  empty tree, so it passes `force = true` and the guard never trips there).
+- `mv -f SRC DST` overwrites an existing destination FILE by **delete-dst-first**: the existing file is
+  removed (`delete_located`), then the entry is relinked (`rename_entry`/`move_entry`) into the freed slot.
+- A **DIRECTORY** destination is never clobbered even with `-f` (overwriting a whole subtree would need a
+  recursive delete) — `mv -f` onto a directory is refused `-EISDIR` ("remove it first (rm -r)"), and
+  `cp -r`'s fresh-tree `-EEXIST` rule stands regardless of `-f` (a directory-tree merge/replace is out of
+  scope — remove the target with `rm -r` first). This keeps `-f`'s destructive surface bounded to a single
+  file, never a subtree.
+
+**`-n`/no-clobber — reassert the default.** `-n` makes the (now default) no-clobber behaviour explicit and,
+for safety, **overrides `-f`** if both are given (`force = has(-f) && !has(-n)`).
+
+**`rm -f` / `rm -rf` — quiet on a missing target.** POSIX `rm -f NOSUCH` exits quietly; JD14 suppresses the
+`-ENOENT` (a missing leaf, a missing parent component, and a no-match wildcard all go quiet under `-f`), so
+`rm -rf OLD*` is the natural idiom that pairs with JD13's recursive delete. Two guards are NOT relaxed by
+`-f`: `rm -rf /` is still refused `-EBUSY` (the whole-volume footgun), and a wrong-usage `-EISDIR` (a
+directory without `-r`) is still reported — `-f` suppresses only the *missing-target* error, exactly as
+POSIX `rm -f` still complains about a directory.
+
+**Flag filtering.** Flags (a `-` followed by one or more ASCII letters) are filtered out of the positional
+paths for all three verbs (`mv` gains this; `cp`/`rm` already did). A file literally named `-x` is still
+reachable as `./-x` (its letters parse as unknown/ignored flags — the established convention); an arg with a
+non-letter after the dash (`-2`) or `-` alone is treated as a path.
+
+**Errno additions** (shell-side, the JD6–JD13 pattern):
+
+| condition | tag |
+|---|---|
+| `cp`/`mv` onto an existing FILE without `-f` | `-EEXIST` |
+| `mv -f` onto an existing DIRECTORY | `-EISDIR` (remove it first with `rm -r`) |
+| `cp -r` onto an existing directory tree (even with `-f`) | `-EEXIST` (remove it first with `rm -r`) |
+| `rm -f`/`rm -rf` on a missing target or no-match wildcard | (quiet — no output) |
+| `rm -rf /` | `-EBUSY` (unchanged — not relaxed by `-f`) |
+
+**Principal — unchanged.** The shell is still EL1 ASID 0, the PUBLIC principal; the flags add no new fat.rs
+surface, no new lock, and no ACL interaction — they only gate which existing primitive runs.
+
+**Gate (QEMU):** `./arroyo check` + `UNAOS_TEGRA=1 ./arroyo check` green both arches (no new warnings — only
+the pre-existing `shutdown` double-`hlt_loop`); `./arroyo test-arm 22` → `MISSION SUCCESS`; `UNAOS_GICV3=1
+./arroyo test-arm 40` → CAPSTONE 6/6; `UNAOS_HUBSTORAGE=1 ./arroyo test 25` → `MISSION SUCCESS`;
+`esp-jetson kernel.elf` links, **109 `tegra:` strings** — UNCHANGED from JD11–JD13 (the flag strings carry
+no `tegra:` token; validate media by count, not size). Zero x86 behavioural change. As in JD2–JD13 the shell
+command path is not headless-reachable in-lane, so the shell-level verdict is **attended-pending**.
+
+**Metal verdict — ⏳ ATTENDED-PENDING.** Bench card [`jd14-bench.md`](../../../../unaos/scripts/jd14-bench.md):
+confirm the no-clobber default (`cp A B` / `mv A B` onto an existing B is `-EEXIST`), `-f` overwrite for both,
+`mv -f` onto a directory refused, `rm -f NOSUCH` / `rm -rf NOSUCH*` quiet, `rm -rf DIR` (bundled flags) removing
+a tree, and `rm -rf /` still `-EBUSY`, with a power-cycle to confirm the overwrites/deletes are durable. Pairs
+with the JD13 bench in one attended Orin session. ⚠ Verify the serial bridge captures a full boot BEFORE
+burning bench time (§JB1f) — with JD11 the transcript is the primary output-evidence channel.
+
 ### JB1f — the unhealed early-vector window (the round-6 boot crash), closed (`85f74f8`)
 
 **The evidence (2026-07-11 attended bench, real Orin).** Kernel `446abd3` (the JD6 tip): 2/2 boots
