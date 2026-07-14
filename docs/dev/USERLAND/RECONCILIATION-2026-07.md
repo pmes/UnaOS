@@ -113,6 +113,8 @@ and wrapped with host I/O by the userspace `libs/fs/unafs`.
 3. **`libs/drive` → `unaos/libs/sys/helm/src/rover/`**, with `libs/input`/`libs/pwm`
    documented as the TALUS kernel-lane device-class libs (they are deliberate work, not
    drift — the survey initially flagged them only because they lack READMEs; READMEs owed).
+   **Executed** — the crate is now `helm` (module `rover`) at `unaos/libs/sys/helm`;
+   `libs/input` and `libs/pwm` carry READMEs; the helm core has a charter README.
 4. **UnaFS ring-split** per the map.
 5. **`libs/views/` extraction** — lift the chat view out of lumen as the first shared view
    crate.

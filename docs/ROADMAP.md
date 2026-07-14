@@ -238,15 +238,16 @@ FlySky NB4 Plus ──AFHDS3──▶ FGr8B ──i-BUS (UART 115200)──▶ U
   I2C driver is reusable for sensors). **The actuation codec now exists
   host-native** in [`libs/pwm/pca9685`](../libs/pwm/pca9685) (`#![no_std]`,
   zero-dependency): prescale + per-channel duty register writes, frozen by
-  datasheet KATs, with the `drive`↔`pca9685` µs→duty seam proven host-side. What
-  remains is the I2C transport + the attended actuation gate.
+  datasheet KATs, with the `helm::rover`↔`pca9685` µs→duty seam proven host-side.
+  What remains is the I2C transport + the attended actuation gate.
 - **Drive service** (arch-neutral): bounded command channel, 20 ms control
   loop, ARM/DISARM state machine, 500 ms deadman, software throttle cap,
   cross-core watchdog, panic-handler-forces-neutral. A 3-position transmitter
   channel selects DISARM / MANUAL / AUTO. **The arch-neutral core now exists
-  host-native** in [`libs/drive`](../libs/drive) (`#![no_std]`, embeds in the
-  kernel later); its safety invariants I1–I8 are proven by the test battery in
-  `libs/drive/tests/invariants.rs`.
+  host-native** as the `rover` domain of the kernel helm core
+  [`unaos/libs/sys/helm`](../unaos/libs/sys/helm) (`#![no_std]`-capable, embeds
+  in the kernel with `default-features = false`); its safety invariants I1–I8 are
+  proven by the test battery in `unaos/libs/sys/helm/tests/rover_invariants.rs`.
 - **Power**: Orin barrel input is 7–20 V → 3S LiPo direct.
 - Milestones: GICv3/scheduler (shared with the Jetson catchup lane) → i-BUS
   decode demo **(host-side landed — the `libs/input/ibus` codec + format-freeze KATs;

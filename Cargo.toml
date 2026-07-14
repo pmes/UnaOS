@@ -7,7 +7,7 @@ members = [
     "libs/resonance",
     "libs/fs/unafs",
     "libs/input/ibus",
-    "libs/drive",
+    "unaos/libs/sys/helm",
     "libs/pwm/pca9685",
     "libs/bandy",
     "libs/euclase",

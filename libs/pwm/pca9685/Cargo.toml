@@ -11,9 +11,9 @@ description = "PCA9685 16-channel 12-bit PWM register/prescale codec (no_std, ze
 # frozen by the datasheet known-answer tests in `tests/`.
 [dependencies]
 
-# Dev-only: the seam KAT (`tests/seam_drive.rs`) proves a `drive::Actuation` (µs)
-# composes through this codec's µs→counts helper. A path dep, not crates.io, and
-# it never enters the shipping/no_std artifact — dev-dependencies do not build
+# Dev-only: the seam KAT (`tests/seam_drive.rs`) proves a `helm::rover::Actuation`
+# (µs) composes through this codec's µs→counts helper. A path dep, not crates.io,
+# and it never enters the shipping/no_std artifact — dev-dependencies do not build
 # for `cargo check -p pca9685 --no-default-features`.
 [dev-dependencies]
-drive = { path = "../../drive" }
+helm = { path = "../../../unaos/libs/sys/helm" }

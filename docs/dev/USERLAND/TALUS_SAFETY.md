@@ -13,16 +13,18 @@ ever near a 3S LiPo. Two crates hold it:
 - [`libs/input/ibus`](../../../libs/input/ibus) — the FlySky i-BUS servo frame codec
   (`#![no_std]`, zero-dependency). The wire format is frozen by the
   known-answer tests in `libs/input/ibus/tests/kat_vectors.rs`.
-- [`libs/drive`](../../../libs/drive) — the arch-neutral drive-service core: the
+- [`unaos/libs/sys/helm`](../../../unaos/libs/sys/helm) — the kernel helm core;
+  its `rover` domain module is the arch-neutral rover control core: the
   DISARM / MANUAL / AUTO state machine with a FAILSAFE latch. The invariants
-  below are proven by the named tests in `libs/drive/tests/invariants.rs`.
+  below are proven by the named tests in
+  `unaos/libs/sys/helm/tests/rover_invariants.rs`.
 - [`libs/pwm/pca9685`](../../../libs/pwm/pca9685) — the actuation-output codec
   (`#![no_std]`, zero-dependency). Turns update rates and microsecond pulse
   widths into the PCA9685's I2C register writes; the encoding is frozen by the
   datasheet known-answer tests in `libs/pwm/pca9685/tests/kat_vectors.rs`. It
   computes bytes only — there is no I2C transport here (a later kernel arc).
 
-Both crates are `#![forbid(unsafe_code)]`. The `drive` core is `no_std` (verified
+Both crates are `#![forbid(unsafe_code)]`. The `helm` core is `no_std` (verified
 with `cargo check -p drive --no-default-features`) so the future kernel drive
 service embeds it unchanged; the injected `Clock` and `ActuatorSink` seams let
 the whole battery run on a simulated clock and a mock sink with zero real
@@ -39,7 +41,7 @@ bench precondition it maps to. The bench precondition is what a person verifies
 with the transmitter and a servo/ESC (or a scope on the PWM line) before that
 interlock is considered silicon-confirmed.
 
-| # | Invariant | Proven by (`libs/drive/tests/invariants.rs`) | Bench precondition |
+| # | Invariant | Proven by (`unaos/libs/sys/helm/tests/rover_invariants.rs`) | Bench precondition |
 |---|-----------|-----------------------------------------------|--------------------|
 | **I1** | **Neutral unless armed** — the sink receives exact neutral in DISARM and FAILSAFE, always, regardless of stick position. | `i1_neutral_unless_armed` | Mode switch low (DISARM) with the sticks deflected ⇒ steering centred, ESC at stop. |
 | **I2** | **Deadman** — more than 500 ms without a fresh *valid* frame while armed forces neutral and latches FAILSAFE; a late frame does not silently resume — a re-arm is required. | `i2_deadman_latches_failsafe_and_requires_rearm` | Transmitter off (or out of range) ⇒ wheels neutral within ~520 ms (deadman + one control tick — see the design decision below) and stay neutral until the operator disarms and re-arms. |
@@ -120,7 +122,8 @@ hardware. The remaining TALUS legs, each behind this checklist, are:
   counts; the sleep→prescale→wake init order). What remains for metal is the
   **I2C transport** that moves those `(reg, val)` writes onto the wire, plus the
   attended actuation gate — no ESC is energised until every interlock below is
-  bench-green. The `drive`↔`pca9685` seam (a `drive::ActuatorSink` that encodes
-  through the codec) is proven host-side in `libs/pwm/pca9685/tests/seam_drive.rs`.
+  bench-green. The `helm::rover`↔`pca9685` seam (a `helm::rover::ActuatorSink`
+  that encodes through the codec) is proven host-side in
+  `libs/pwm/pca9685/tests/seam_drive.rs`.
 - **Power.** The Orin barrel input accepts 7–20 V, so a 3S LiPo drives it
   directly. No actuator is energised until every interlock above is bench-green.

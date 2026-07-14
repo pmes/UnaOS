@@ -14,9 +14,14 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! The arch-neutral rover **drive-service core** — TALUS's safety state machine.
+//! The arch-neutral rover control core — TALUS's safety state machine.
 //!
-//! ROADMAP §4 puts UnaOS between the RC receiver and the actuators. This crate
+//! This is the first per-machine domain of the kernel [`helm`](crate) core: the
+//! rover's DISARM/MANUAL/AUTO interlock with a FAILSAFE latch. Failsafes do not
+//! generalize (a rover's safe state is "stop"), so each machine class is its own
+//! domain module under `helm`.
+//!
+//! ROADMAP §4 puts UnaOS between the RC receiver and the actuators. This module
 //! is the safety-critical middle: it takes decoded [`ibus::Frame`]s in, runs a
 //! DISARM / MANUAL / AUTO state machine with a FAILSAFE latch, and drives an
 //! injected [`ActuatorSink`] in microseconds. The transmitter is the human
@@ -25,7 +30,7 @@
 //! # Design constraints
 //!
 //! - `#![no_std]`, `#![forbid(unsafe_code)]`, no external dependencies (only our
-//!   own `ibus`). The kernel drive service embeds this same core later.
+//!   own `ibus`). The kernel rover service embeds this same core later.
 //! - **Injected seams** so tests are deterministic with zero real sleeps: a
 //!   monotonic [`Clock`] (ms) and an [`ActuatorSink`] (steering µs + throttle
 //!   µs). The default-on `std` feature adds the [`sim`] harness (FakeClock +
@@ -53,9 +58,6 @@
 //!   neutral; the kernel panic handler calls the same [`DriveCore::force_neutral`].
 //! - **I8 bounded command channel** — AUTO commands queue in a fixed-capacity,
 //!   drop-oldest ring ([`CmdQueue`]); it never blocks the tick.
-
-#![cfg_attr(not(feature = "std"), no_std)]
-#![forbid(unsafe_code)]
 
 mod command;
 #[cfg(feature = "std")]
