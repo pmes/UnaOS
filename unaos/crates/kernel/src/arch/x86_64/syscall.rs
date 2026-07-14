@@ -2284,6 +2284,14 @@ pub fn record_ring3_kill(name: &str, vec: u8, err: u64, cr2: u64) {
         SOCK3_KILLED.fetch_add(1, Ordering::AcqRel);
         return;
     }
+    // SOCK-4: the transferable-socket GRANTOR / GRANTEE fixtures are well-behaved (register + inline-data,
+    // plus the grantee's recv-buffer + USED-word stores to its own RW pages) — a kill is a real SOCK-4 bug,
+    // its own counter. Not in PROCS, so the launcher times out to FAIL on `SOCK4_DONE`.
+    #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+    if name == "sock4-grantor" || name == "sock4-grantee" {
+        SOCK4_KILLED.fetch_add(1, Ordering::AcqRel);
+        return;
+    }
     // U6x: the owner/grantee fixtures are well-behaved (register-only apart from the grantee's read-back store); a
     // kill is a real U6x bug — its own counter, never the U1b `killed_unexpected` count. The launcher's
     // unconditional cleanup still tears the fixtures' slots + Proc entries down.
@@ -2402,6 +2410,29 @@ extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
                         U6GX_GRANTEE_WITNESS.store(a0 as u32, Ordering::Release);
                     }
                     U6GX_DONE.fetch_add(1, Ordering::AcqRel);
+                    let cpu = crate::arch::percpu::this_cpu().cpu_index as usize;
+                    if let Some(id) = crate::arch::sched::current_task_id(cpu) {
+                        if let Some(i) = proc_find_running(id) {
+                            PROCS[i].state.store(PEXITED, Ordering::Release);
+                        }
+                    }
+                    crate::arch::sched::exit(); // never returns
+                }
+                // SOCK-4: the transferable-socket GRANTEE has a launcher-PLANTED Proc entry (the grantor's
+                // Child handle names it, owner-scoped, so SYS_XFER can resolve it), so — exactly like the
+                // u7x child / u6gx grantee — its exit must be routed BY NAME BEFORE the Proc-reap
+                // short-circuit below, or its witness (and SOCK4_DONE) would be swallowed by that path. The
+                // GRANTOR has no Proc entry but rides the same arm for symmetry. Mark the planted entry
+                // EXITED (a late SYS_XFER to this recipient then fails the RUNNING check). Knob-off /
+                // aarch64 never emit this arm.
+                #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+                if nm == Some("sock4-grantor") || nm == Some("sock4-grantee") {
+                    if nm == Some("sock4-grantor") {
+                        SOCK4_GRANTOR_WITNESS.store(a0 as u32, Ordering::Release);
+                    } else {
+                        SOCK4_GRANTEE_WITNESS.store(a0 as u32, Ordering::Release);
+                    }
+                    SOCK4_DONE.fetch_add(1, Ordering::AcqRel);
                     let cpu = crate::arch::percpu::this_cpu().cpu_index as usize;
                     if let Some(id) = crate::arch::sched::current_task_id(cpu) {
                         if let Some(i) = proc_find_running(id) {
@@ -2546,6 +2577,9 @@ extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
                     SOCK3_WITNESS.store(a0 as u32, Ordering::Release);
                     SOCK3_DONE.fetch_add(1, Ordering::AcqRel);
                 }
+                // SOCK-4: the grantor + grantee are routed BY NAME in the pre-short-circuit block above
+                // (the grantee is PLANTED in PROCS, so it must be caught before the Proc-reap short-circuit
+                // — the u7x child / u6gx grantee discipline), so no arm is needed here.
                 Some(n) if n.starts_with("u3-") => {
                     // U3 per-process-CR3 fixture task exiting (its own accounting, so the U1a/U1b
                     // default counts stay byte-for-byte). The readback verdict reads slot memory.
@@ -2608,8 +2642,15 @@ fn sys_socket(domain: u64, ty: u64, proto: u64) -> i64 {
     // Publish kind + rights, then the live value LAST (Release) — a resolver that sees the live value
     // also sees Socket + its rights. Value = the GEN-FENCED socket-id `(gen << 32) | (sid + 1)` (never
     // the 0/RESERVING sentinels; the gen half rejects a stale handle to a reused registry slot).
+    // SOCK-4: the mint now carries `CAP_GRANT` — the delegation right — so the OWNER may hand its own
+    // socket to another principal via `SYS_XFER` / `SYS_CAP` GRANT (a socket is the process's own
+    // resource; `CAP_GRANT` cannot be self-added later, so transferability must be endowed at mint).
+    // The gen fence (SOCK-3) + owner migration (`sys_recv`) make the transfer safe by construction — a
+    // stale cross-row handle can never rebind to a recycled slot. Send still needs `CAP_WRITE`, recv
+    // `CAP_READ`, so a transfer/grant can still ATTENUATE to send-only / recv-only, and dropping
+    // `CAP_GRANT` on transfer (single-level) keeps the grantee from re-delegating.
     handle_set_kind(row, h, KIND_SOCKET);
-    handle_set_rights(row, h, CAP_READ | CAP_WRITE);
+    handle_set_rights(row, h, CAP_READ | CAP_WRITE | CAP_GRANT);
     handle_set(row, h, sock_id_pack(sid));
     h as i64
 }
@@ -2641,6 +2682,30 @@ fn socket_id_of(row: usize, handle: u64, req: u32) -> Result<usize, i64> {
             }
         }
         _ => Err(EACCES),
+    }
+}
+
+/// SOCK-4: when `sys_recv` installs a received `KIND_SOCKET` cap, MOVE the persistent socket's registry
+/// ownership to the receiving row so the moved cap resolves (`sock_valid` is owner-scoped). Decodes the
+/// gen-fenced socket-id out of the handle value word `target` (the `socket_id_of` decode) and calls
+/// `smolnet::reassign_owner`, which reassigns iff the slot is still present at the SAME generation AND
+/// still owned by `from_row` — the transfer's SENDER (from the record; a disowned record's `u64::MAX`
+/// sender matches no row). A non-Socket kind is a no-op; a stale deposit (socket freed+reused since the
+/// transfer) fails the gen check, and a deposit whose sender no longer owns the socket (it already MOVED
+/// to an earlier grantee — the sender's residual `CAP_GRANT` handle must not steal it back out from
+/// under the current owner) fails the owner check: either way the received handle stays dead (fails
+/// `sock_valid`) — never rebinding to a different tenant, never re-migrating a moved socket.
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+fn xfer_socket_migrate(kind: u8, target: u64, from_row: u64, new_row: usize) {
+    if kind != KIND_SOCKET {
+        return;
+    }
+    let Ok(from_row) = usize::try_from(from_row) else {
+        return; // a disowned record (u64::MAX sender) owns nothing on 32-bit-usize targets either
+    };
+    if let Some(sid) = ((target & 0xFFFF_FFFF) as usize).checked_sub(1) {
+        let generation = (target >> 32) as u32;
+        crate::smolnet::reassign_owner(sid, generation, from_row, new_row);
     }
 }
 
@@ -6729,6 +6794,22 @@ fn sys_recv_for(row: usize) -> i64 {
         handle_set_rights(row, h, rights);
         HANDLE_XFER_REC[row][h].store(rec, Ordering::Release); // the revocation hook, pre-live
         HANDLE_DERIV[row][h].store(node, Ordering::Release); // the derivation edge, pre-live (U8x)
+        // SOCK-4: a received Socket cap MOVES the persistent socket's registry ownership to THIS row, so
+        // the moved cap actually resolves (`sock_valid` is owner-scoped). Done after the handle install
+        // committed (a re-queue on a full table above never migrates), before the live value publish. A
+        // no-op for non-Socket kinds; a stale deposit (socket freed+reused since XFER) fails the gen
+        // check inside and the received handle stays dead — no cross-tenant rebind. The migration also
+        // demands the transfer's SENDER (from the record) still OWNS the socket: a sender whose socket
+        // already moved to an earlier grantee cannot use a second deposit to steal it back (its residual
+        // CAP_GRANT handle is delegation-dead once ownership left it). The whole line is knob-gated, so
+        // knob-off / aarch64 (where no socket is ever transferable) is byte-identical.
+        #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+        xfer_socket_migrate(
+            kind,
+            target,
+            XFER_REC_SENDER[(rec - 1) as usize].load(Ordering::Acquire),
+            row,
+        );
         handle_set(row, h, target);
         xfer_slot_release(row, k); // consume the inbox slot (record ownership moved to the handle)
         return h as i64;
@@ -9472,6 +9553,511 @@ fn sock3_launcher(demo_cpu: usize) {
     }
 }
 
+// =============================================================================
+// SOCK-4 (scope B): TRANSFERABLE sockets — the two-fixture ring-3 demo + the kernel-side gen-rebind proof
+// (x86-only, knob-on). A socket is now minted with `CAP_GRANT` (see `sys_socket`), so its OWNER may hand it
+// to another principal via `SYS_XFER`; the receiving row RECVs it, and `sys_recv`'s `xfer_socket_migrate`
+// MOVES the persistent socket's registry ownership to the grantee (so `sock_valid` — owner-scoped —
+// resolves for it). The gen fence (SOCK-3) closes the recycled-slot UAF: a stale cross-row handle to a
+// freed+reused slot is `-EACCES`, never a rebind.
+//
+// TWO fixtures in one blob (the U7x idiom), run in two separate slots (only the entry differs). Both are
+// register + inline-data only, apart from the GRANTEE's stores to its OWN RW pages (the recvfrom buffer at
+// window +0x1000 and the USED word at +0x3008). The GO words at +0x3000 in each slot are written ONLY by
+// the launcher (through the slot backing); the fixtures poll them. SEQUENCING mirrors U7x (x86 ring 3 is
+// IF-masked/cooperative, no yield syscall): each fixture runs on its OWN dedicated AP, the launcher on a
+// third, and the polls are bounded spins (an exhausted budget falls through to the witness exit — the
+// verdict FAILs honestly rather than wedging the core).
+//
+// GRANTOR (`sock4-grantor`, pre-endowed at idx 2 with a Child handle naming the grantee): (0) mint a UDP
+// socket (carries CAP_READ|CAP_WRITE|CAP_GRANT); (1) an OVER-RIGHTS SYS_XFER (req = +CAP_EXEC, a bit the
+// socket lacks) must be -EACCES — cross-process attenuation intact; (2) the REAL SYS_XFER (req =
+// CAP_READ|CAP_WRITE, dropping CAP_GRANT — single-level) deposits the socket cap; then it spins on its GO
+// (released only after the grantee has RECV'd + used the socket, so migration provably happened); (3) a
+// SYS_SENDTO through its OWN handle must now be -EACCES — the socket MOVED to the grantee, so the grantor's
+// handle is owner-mismatched (the cross-row stale-handle rejection). Witness (r12, exit status) ALL = 0xF.
+// GRANTEE (`sock4-grantee`, row EMPTY at spawn — the single-writer snapshot depends on it): spins on its GO
+// (released only after the launcher's pending-deposit/untouched-row snapshot), then (0) SYS_RECV -> the
+// transferred socket handle; (1) SYS_BIND it (proves the moved cap RESOLVES under the grantee's row AND
+// carries CAP_WRITE); (2) SYS_SENDTO a DNS query; (3) SYS_RECVFROM the reply; (4) the reply is FROM
+// 10.0.2.3:53 — a full datagram round-trip on the RECEIVED socket. Sets the USED word (the launcher's cue).
+// Witness (r12) ALL = 0x1F. ABI: rax=number, args rdi/rsi/rdx, return rax; r12-r15 + rbx callee-saved.
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+core::arch::global_asm!(
+    r#"
+    .globl unaos_user_sock4_blob_start
+unaos_user_sock4_blob_start:
+    .balign 16
+    .globl unaos_user_sock4_grantor
+unaos_user_sock4_grantor:
+    xor  r12d, r12d                           // witness = 0
+    mov  rax, 19                              // SYS_SOCKET(AF_INET=2, SOCK_DGRAM=2, proto=0)
+    mov  rdi, 2
+    mov  rsi, 2
+    mov  rdx, 0
+    syscall
+    test rax, rax
+    js   8f                                    // mint failed (<0) -> exit witness=0
+    mov  r13, rax                              // r13 = socket handle (CAP_READ|CAP_WRITE|CAP_GRANT)
+    or   r12, 1                                // bit0: socket minted
+    mov  rax, 13                               // SYS_XFER(dest=child idx 2, src=r13, req) — OVER-RIGHTS
+    mov  rdi, 2
+    mov  rsi, r13
+    mov  rdx, 7                                // CAP_READ|CAP_WRITE|CAP_EXEC — socket lacks CAP_EXEC -> -EACCES
+    syscall
+    cmp  rax, -13                              // exactly -EACCES ?
+    jne  8f
+    or   r12, 2                                // bit1: cross-process attenuation held
+    mov  rax, 13                               // SYS_XFER(dest=2, src=r13, req) — the REAL move
+    mov  rdi, 2
+    mov  rsi, r13
+    mov  rdx, 3                                // CAP_READ|CAP_WRITE (drops CAP_GRANT — single-level)
+    syscall
+    test rax, rax
+    js   8f                                    // deposit failed -> partial witness
+    or   r12, 4                                // bit2: socket cap deposited (transfer id >= 1)
+    lea  rbx, [rip + unaos_user_sock4_blob_start]
+    add  rbx, 0x3000                           // rbx = GO VA (grantor's own slot +0x3000)
+    mov  r14, 0x8000000                        // bounded GO poll budget (pure loads + pause)
+2:  mov  rax, [rbx]
+    test rax, rax
+    jnz  3f
+    pause
+    dec  r14
+    jnz  2b
+    jmp  8f                                    // GO never released -> partial witness (verdict FAILs)
+3:  mov  rax, 21                               // SYS_SENDTO(h, msg, 32) — the socket MOVED away at grantee RECV
+    mov  rdi, r13
+    lea  rsi, [rip + unaos_user_sock4_msg]
+    mov  rdx, 32
+    syscall
+    cmp  rax, -13                              // exactly -EACCES (owner migrated to the grantee) ?
+    jne  8f
+    or   r12, 8                                // bit3: migrated-away handle rejected
+8:  mov  rax, 2                                // SYS_EXIT(witness) -> routed by name into SOCK4_GRANTOR_WITNESS
+    mov  rdi, r12
+    syscall
+1:  jmp  1b                                    // sys_exit never returns; guard
+
+    .balign 16
+    .globl unaos_user_sock4_grantee
+unaos_user_sock4_grantee:
+    xor  r12d, r12d                            // witness = 0
+    lea  rbx, [rip + unaos_user_sock4_blob_start]
+    add  rbx, 0x3000                           // rbx = GO VA (USED word = rbx+8), grantee's own slot
+    mov  r15, 0x8000000                        // GO poll budget
+11: mov  rax, [rbx]
+    test rax, rax
+    jnz  12f
+    pause
+    dec  r15
+    jnz  11b
+    jmp  19f                                   // GO never released -> exit (empty witness)
+12: mov  r15, 0x100000                         // RECV poll budget
+13: mov  rax, 14                               // SYS_RECV -> the transferred socket handle
+    syscall
+    test rax, rax
+    jns  14f                                    // >= 0 -> received
+    pause
+    dec  r15
+    jnz  13b
+    jmp  19f                                   // nothing ever arrived -> partial witness
+14: mov  r13, rax                              // r13 = socket handle (migrated to us at RECV)
+    or   r12, 1                                // bit0: received
+    mov  rax, 20                               // SYS_BIND(h, 49223) — proves the moved cap resolves + CAP_WRITE
+    mov  rdi, r13
+    mov  rsi, 49223
+    syscall
+    test rax, rax
+    jnz  18f                                    // bind failed -> the moved cap did NOT work
+    or   r12, 2                                // bit1: bind ok (moved cap WORKS)
+    lea  r14, [rip + unaos_user_sock4_blob_start]
+    add  r14, 0x1000                            // r14 -> recv buffer (grantee's own RW data page)
+    mov  r15, 16                                // sendto+recvfrom retry budget
+15: mov  rax, 21                                // SYS_SENDTO(h, msg, 32)
+    mov  rdi, r13
+    lea  rsi, [rip + unaos_user_sock4_msg]
+    mov  rdx, 32
+    syscall
+    test rax, rax
+    js   16f                                    // sendto -EAGAIN -> retry this round
+    or   r12, 4                                 // bit2: sendto succeeded
+    mov  rax, 22                                // SYS_RECVFROM(h, buf, 64)
+    mov  rdi, r13
+    mov  rsi, r14
+    mov  rdx, 64
+    syscall
+    cmp  rax, 8
+    jge  17f                                    // >= header -> got a datagram
+16: dec  r15
+    jnz  15b
+    jmp  18f                                    // budget exhausted -> USED + exit
+17: or   r12, 8                                 // bit3: recvfrom returned a datagram
+    cmp  byte ptr [r14 + 0], 10                 // verify src ip 10.0.2.3 ...
+    jne  18f
+    cmp  byte ptr [r14 + 1], 0
+    jne  18f
+    cmp  byte ptr [r14 + 2], 2
+    jne  18f
+    cmp  byte ptr [r14 + 3], 3
+    jne  18f
+    cmp  byte ptr [r14 + 4], 53                 // ... and src port 53 (LE low byte)
+    jne  18f
+    cmp  byte ptr [r14 + 5], 0                  // (LE high byte)
+    jne  18f
+    or   r12, 16                                // bit4: source is 10.0.2.3:53 (round-trip on the RECEIVED socket)
+18: mov  qword ptr [rbx + 8], 1                 // USED word — the launcher's cue that RECV + migration happened
+19: mov  rax, 2                                 // SYS_EXIT(witness) -> routed by name into SOCK4_GRANTEE_WITNESS
+    mov  rdi, r12
+    syscall
+20: jmp  20b                                    // sys_exit never returns; guard
+
+    // Shared SYS_SENDTO message: 8-byte addr header [dst 10.0.2.3][port 53 LE][pad u16], then the 24-byte
+    // DNS A-query for "una.os" (txn id 0x5343). Inline in the RX code page (a legal SENDTO source — the
+    // whole range is inside the ring-3 window). Total = 32 bytes (matches `mov rdx, 32`).
+    .balign 8
+    .globl unaos_user_sock4_msg
+unaos_user_sock4_msg:
+    .byte 10, 0, 2, 3
+    .byte 53, 0
+    .byte 0, 0
+    .byte 0x53, 0x43, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    .byte 0x03, 0x75, 0x6e, 0x61, 0x02, 0x6f, 0x73, 0x00
+    .byte 0x00, 0x01, 0x00, 0x01
+
+    .globl unaos_user_sock4_blob_end
+unaos_user_sock4_blob_end:
+"#
+);
+
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+unsafe extern "C" {
+    static unaos_user_sock4_blob_start: u8;
+    static unaos_user_sock4_blob_end: u8;
+    static unaos_user_sock4_grantor: u8;
+    static unaos_user_sock4_grantee: u8;
+}
+
+/// The two SOCK-4 fixtures' witness bitmasks (their exit statuses), routed by name in `SYS_EXIT`.
+/// `SOCK4_DONE` counts BOTH exits (want 2); `SOCK4_KILLED` counts a (bug) fault-kill of either.
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+static SOCK4_GRANTOR_WITNESS: AtomicU32 = AtomicU32::new(0);
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+static SOCK4_GRANTEE_WITNESS: AtomicU32 = AtomicU32::new(0);
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+static SOCK4_DONE: AtomicU32 = AtomicU32::new(0);
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+static SOCK4_KILLED: AtomicU32 = AtomicU32::new(0);
+/// Grantor: socket/attenuation/xfer/rejected (4 bits). Grantee: received/bind/sendto/recvfrom/source (5 bits).
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+const SOCK4_GRANTOR_WITNESS_ALL: u32 = 0x0F;
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+const SOCK4_GRANTEE_WITNESS_ALL: u32 = 0x1F;
+
+/// Build a SOCK-4 fixture slot at `entry_sym` (the `sock3_build`/`u7x_build` shape): allocate a private
+/// slot, scrub the whole window, copy the blob into its RX-RO code page through the identity alias, return
+/// the run params. `None` on slot-alloc failure. The grantor is pre-endowed (its Child handle) by the
+/// launcher after build; the grantee is left EMPTY (the single-writer snapshot depends on it).
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+fn sock4_build(entry_sym: *const u8) -> Option<U7xFix> {
+    let slot = crate::arch::memory::alloc_user_space()?;
+    let bstart = &raw const unaos_user_sock4_blob_start as usize;
+    let bend = &raw const unaos_user_sock4_blob_end as usize;
+    let blen = bend - bstart;
+    assert!(blen as u64 <= PAGE_SIZE, "SOCK-4 blob does not fit in a code page");
+    let off = (entry_sym as usize - bstart) as u64;
+    let backing = crate::arch::memory::slot_backing_ptr(slot);
+    unsafe {
+        core::ptr::write_bytes(backing, 0, (USER_WINDOW_PAGES * PAGE_SIZE) as usize);
+        core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen);
+    }
+    Some(U7xFix {
+        entry: USER_BASE + off,
+        sp: USER_BASE + USER_WINDOW_PAGES * PAGE_SIZE - 16,
+        cr3: crate::arch::memory::slot_cr3(slot),
+        slot,
+    })
+}
+
+/// SOCK-4 M1 — the kernel-side transferable-socket proof the two-fixture demo cannot fully stage: the
+/// U11x-style stale-cross-row GEN-REBIND proof (socket edition). Drives the REAL syscall bodies
+/// (`sys_xfer_from`/`sys_recv_for`) + the smolnet registry over two scratch rows (5 = grantor A, 6 = grantee
+/// B — every demo fixture has exited and torn down by the time this runs, so the rows are provably clear;
+/// both < USER_SLOTS, so neither is the refused `SHARED_ROW`). Returns true iff ALL hold:
+///
+///   1. A mints a UDP socket (owner = A) carrying CAP_READ|CAP_WRITE|CAP_GRANT; A resolves it.
+///   2. A transfers it to B (attenuated to CAP_READ|CAP_WRITE); B RECVs it -> `xfer_socket_migrate` moves
+///      the registry ownership to B.
+///   3. THE MOVED CAP WORKS: B now resolves the socket (owner-matched under B).
+///   4. A's original handle is DEAD (owner migrated to B) — the cross-row stale handle is `-EACCES`.
+///   4b. THE STEAL FENCE (review fix): A's residual `CAP_GRANT` handle deposits AGAIN — to C — and the
+///       deposit itself lands (handle-level rights are all `sys_xfer` checks), but the migration at C's
+///       RECV is REFUSED (the sender A no longer owns the socket): C's received handle is dead and B's
+///       ownership is undisturbed — a second transfer can never yank a moved socket back.
+///   5. THE GEN-REBIND FENCE: B frees the socket (gen bumps), then a fresh socket REUSES the same slot at
+///      the NEW generation — B's old handle (old gen) stays `-EACCES`, provably no rebind to the new tenant.
+///   6. LEDGER HYGIENE: after dropping every planted handle/Proc entry, the handle rows, inboxes, transfer
+///      records AND the derivation ledger are all fully clear.
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+fn sock4_kernel_check() -> bool {
+    const A: usize = 5; // scratch grantor row
+    const B: usize = 6; // scratch grantee row
+    const PIDB: u64 = 0xE4; // planted grantee pid (never collides: PROCS holds only planted entries now)
+    let mut ok = true;
+
+    if !crate::smolnet::init() {
+        return false; // no NIC / stack — the demo already skipped, so this never runs then
+    }
+    // Plant B's Proc entry (the pid->slot map `sys_xfer` resolves through; `proc_reserve` marks it RUNNING).
+    let Some(pb) = proc_reserve() else {
+        return false;
+    };
+    PROCS[pb].slot.store(B + 1, Ordering::Release); // +1-biased, like sys_spawn's pid->slot map
+    PROCS[pb].pid.store(PIDB, Ordering::Release);
+
+    // 1. A mints a UDP socket owned by row A, carrying the full CAP_READ|CAP_WRITE|CAP_GRANT (the sys_socket
+    //    mint), and holds a Child handle naming B for the transfer.
+    let Some(sid) = crate::smolnet::stack_open(A) else {
+        proc_free(pb);
+        return false;
+    };
+    let gen0 = crate::smolnet::sock_gen(sid);
+    let val = ((gen0 as u64) << 32) | ((sid as u64) + 1); // the sock_id_pack value word
+    install_cap(A, 2, KIND_SOCKET, val, CAP_READ | CAP_WRITE | CAP_GRANT);
+    install_cap(A, 3, KIND_CHILD, PIDB, CAP_READ);
+    ok &= socket_id_of(A, 2, CAP_WRITE) == Ok(sid); // A owns + resolves its socket
+
+    // 2. Transfer to B (attenuate to CAP_READ|CAP_WRITE); B RECVs -> ownership migrates to B.
+    let t = sys_xfer_from(A, 3, 2, (CAP_READ | CAP_WRITE) as u64);
+    ok &= t > 0;
+    let hb = sys_recv_for(B);
+    ok &= hb >= 0;
+
+    // 3. THE MOVED CAP WORKS: B resolves the socket now (owner-matched under B after migration).
+    ok &= hb >= 0 && socket_id_of(B, hb as u64, CAP_WRITE) == Ok(sid);
+    // 4. A's original handle is DEAD: its owner is now B, so the cross-row handle is -EACCES.
+    ok &= socket_id_of(A, 2, CAP_WRITE) == Err(EACCES);
+
+    // 4b. THE STEAL FENCE (review fix): A's handle still carries CAP_GRANT (rights are handle-local), so a
+    //     SECOND deposit — to C — lands; but `xfer_socket_migrate` at C's RECV demands the sender still OWN
+    //     the socket, and A doesn't (it moved to B at step 2). C's received handle must be dead and B must
+    //     still resolve — the residual grantor handle can never steal the socket back from its new owner.
+    const C: usize = 7; // scratch second-grantee row (< USER_SLOTS; clear like A/B — see the doc comment)
+    const PIDC: u64 = 0xE5; // planted second-grantee pid (same never-collides argument as PIDB)
+    let Some(pc) = proc_reserve() else {
+        if hb >= 0 {
+            handle_clear(B, hb as usize);
+        }
+        handle_clear(A, 2);
+        handle_clear(A, 3);
+        crate::smolnet::stack_close(sid);
+        proc_free(pb);
+        return false;
+    };
+    PROCS[pc].slot.store(C + 1, Ordering::Release);
+    PROCS[pc].pid.store(PIDC, Ordering::Release);
+    install_cap(A, 4, KIND_CHILD, PIDC, CAP_READ);
+    let t2 = sys_xfer_from(A, 4, 2, (CAP_READ | CAP_WRITE) as u64);
+    ok &= t2 > 0; // the deposit lands — sys_xfer's checks are handle-level by design
+    let hc = sys_recv_for(C);
+    ok &= hc >= 0; // the cap is delivered ...
+    ok &= hc >= 0 && socket_id_of(C, hc as u64, CAP_WRITE) == Err(EACCES); // ... but DEAD: migration refused
+    ok &= hb >= 0 && socket_id_of(B, hb as u64, CAP_WRITE) == Ok(sid); // B undisturbed — still the owner
+    if hc >= 0 {
+        handle_clear(C, hc as usize); // frees the second transfer's record + node before the gen-fence step
+    }
+    handle_clear(A, 4);
+    proc_free(pc);
+
+    // 5. THE GEN-REBIND FENCE. B frees the socket (gen bumps) — then a fresh socket first-fit-REUSES the same
+    //    slot at the NEW gen. B's old handle carries (sid, gen0), so it must stay -EACCES against BOTH the
+    //    freed slot and the new tenant — no rebind (the U11x fd discipline, socket edition).
+    crate::smolnet::stack_close(sid);
+    ok &= crate::smolnet::sock_gen(sid) != gen0; // the generation advanced on free
+    ok &= hb >= 0 && socket_id_of(B, hb as u64, CAP_WRITE) == Err(EACCES); // stale against the freed slot
+    let Some(sid2) = crate::smolnet::stack_open(A) else {
+        // cleanup on the unlikely alloc failure, then fail
+        if hb >= 0 {
+            handle_clear(B, hb as usize);
+        }
+        handle_clear(A, 2);
+        handle_clear(A, 3);
+        proc_free(pb);
+        return false;
+    };
+    ok &= sid2 == sid; // first-fit reused the freed slot — the rebind hazard is now live
+    ok &= hb >= 0 && socket_id_of(B, hb as u64, CAP_WRITE) == Err(EACCES); // still -EACCES vs the NEW tenant
+    crate::smolnet::stack_close(sid2);
+
+    // 6. Drop everything planted, then demand every ledger fully clear (no record/node/slot leaked).
+    if hb >= 0 {
+        handle_clear(B, hb as usize); // frees the transfer record + drops the delivered cap's node
+    }
+    handle_clear(A, 2); // drops the transfer source's derivation root node
+    handle_clear(A, 3);
+    proc_free(pb);
+    ok &= handle_row_is_clear(A) && handle_row_is_clear(B) && handle_row_is_clear(C);
+    ok &= xfer_row_is_clear(A) && xfer_row_is_clear(B) && xfer_row_is_clear(C);
+    ok &= xfer_recs_all_free() && deriv_all_free();
+    ok
+}
+
+/// SOCK-4 launcher + verdict — chained LAST off `sock3_launcher` (so its line lands after the whole storage
+/// + UDP/TCP-socket chain). The transferable-socket two-fixture demo (the U7x idiom) + the M1 kernel-side
+/// gen-rebind proof. `demo_cpu` (the task arg) is the GRANTEE's core; the GRANTOR runs on a third AP, the
+/// launcher on its own (cooperative ring 3 hogs its core while polling). Flow:
+///   1. One-shot; skip silently with no NIC (NETWORK-gated). Skip with a line if fewer than 3 APs.
+///   2. Plant the grantee Proc entry; build + spawn the GRANTEE (row EMPTY — it parks on its GO word);
+///      publish its pid->slot map; build + pre-endow the GRANTOR (Child handle naming the grantee); spawn it.
+///   3. Single-writer witness: wait for the grantor's deposit to land in the grantee's inbox, then — grantee
+///      provably pre-RECV (parked on its GO) — verify its handle row is still CLEAR. Release the grantee GO.
+///   4. Wait for the grantee's USED word (RECV + migration + round-trip landed), then release the grantor GO
+///      — so its post-transfer SYS_SENDTO rejection is provably AFTER the ownership migration.
+///   5. Verdict: wait for both witness exits, the teardown proof (both rows + inboxes clear, records free),
+///      then run `sock4_kernel_check` (the M1 gen-rebind proof). PASS iff both witnesses full AND used AND
+///      the snapshot held AND cleared AND the kernel check held AND no kill.
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+fn sock4_launcher(demo_cpu: usize) {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    // NETWORK-gated: no NIC -> no smolnet stack -> skip cleanly (the no-NIC control path stays line-free).
+    if crate::drivers::e1000::hw_addr().is_none() {
+        return;
+    }
+    if !crate::smolnet::init() {
+        return;
+    }
+    // The grantor's dedicated core: a third AP, distinct from the grantee's (`demo_cpu`) and this launcher's
+    // (cooperative ring 3 hogs its core while polling, so sharing either would deadlock the sequencing).
+    let online = crate::arch::smp::online_aps();
+    let Some(&grantor_cpu) = online.get(2) else {
+        serial_println!(":: SOCK-4: fewer than 3 application processors — transferable-socket demo skipped ::");
+        return;
+    };
+    // Plant the grantee's Proc entry FIRST (nothing else claimed if the table is full).
+    let Some(pi) = proc_reserve() else {
+        serial_println!(":: SOCK-4: no free process entry — transferable-socket demo skipped ::");
+        return;
+    };
+    // Build + spawn the GRANTEE (its handle row stays EMPTY — the single-writer snapshot depends on that; it
+    // parks on its GO word, making no syscall that could populate anything).
+    let Some(grantee) = sock4_build(&raw const unaos_user_sock4_grantee) else {
+        serial_println!(":: SOCK-4: no free address-space slot — transferable-socket demo skipped ::");
+        proc_free(pi);
+        return;
+    };
+    let grantee_pid = crate::arch::sched::spawn_user_in_space(
+        "sock4-grantee",
+        grantee.entry,
+        grantee.sp,
+        demo_cpu,
+        grantee.cr3,
+    );
+    PROCS[pi].slot.store(grantee.slot + 1, Ordering::Release); // slot first (the sys_spawn discipline)
+    PROCS[pi].pid.store(grantee_pid, Ordering::Release); // then the pid, the live key
+    // Build + pre-endow + spawn the GRANTOR (idx 2 = a Child handle naming the grantee, for SYS_XFER).
+    let Some(grantor) = sock4_build(&raw const unaos_user_sock4_grantor) else {
+        serial_println!(":: SOCK-4: no free address-space slot — transferable-socket demo skipped (grantee parks out) ::");
+        proc_free(pi);
+        return;
+    };
+    install_cap(grantor.slot, 2, KIND_CHILD, grantee_pid, CAP_READ);
+    serial_println!(
+        ":: SOCK-4: transferable sockets — SYS_XFER moves a KIND_SOCKET cap cross-row (owner migrates), the grantee round-trips it, the grantor's stale handle is rejected ::"
+    );
+    crate::arch::sched::spawn_user_in_space(
+        "sock4-grantor",
+        grantor.entry,
+        grantor.sp,
+        grantor_cpu,
+        grantor.cr3,
+    );
+
+    // 3. Single-writer witness: the grantor's deposit is live in the grantee's inbox + the grantee's row is
+    //    still untouched (it is parked on the GO word this launcher has not released).
+    let ddeadline = crate::arch::ticks() + 5000;
+    let mut deposit_seen = false;
+    while !deposit_seen && crate::arch::ticks() < ddeadline {
+        deposit_seen = (0..NXFER).any(|k| {
+            let t = XFER_SLOT_TX[grantee.slot][k].load(Ordering::Acquire);
+            t != 0 && t != HANDLE_RESERVING
+        });
+        if !deposit_seen {
+            crate::arch::sched::yield_now();
+        }
+    }
+    let snap_ok = deposit_seen && handle_row_is_clear(grantee.slot);
+    u7x_release_go(grantee.slot);
+
+    // 4. Use-then-reject sequencing: wait for the grantee's USED word (RECV + migration + round-trip done),
+    //    then release the grantor GO so its post-transfer SYS_SENDTO is provably after the ownership move.
+    let used_ptr =
+        unsafe { crate::arch::memory::slot_backing_ptr(grantee.slot).add(U7X_USED_OFF) as *const u64 };
+    let udeadline = crate::arch::ticks() + 8000;
+    while unsafe { core::ptr::read_volatile(used_ptr) } == 0 && crate::arch::ticks() < udeadline {
+        crate::arch::sched::yield_now();
+    }
+    let used = unsafe { core::ptr::read_volatile(used_ptr) };
+    u7x_release_go(grantor.slot);
+
+    // 5a. Wait (bounded) for both witness exits, then snapshot both witnesses + the kill count.
+    let vdeadline = crate::arch::ticks() + 10_000;
+    while SOCK4_DONE.load(Ordering::Acquire) < 2 && crate::arch::ticks() < vdeadline {
+        crate::arch::sched::yield_now();
+    }
+    let gw = SOCK4_GRANTOR_WITNESS.load(Ordering::Acquire);
+    let ew = SOCK4_GRANTEE_WITNESS.load(Ordering::Acquire);
+    let killed = SOCK4_KILLED.load(Ordering::Acquire);
+
+    // 5b. Teardown/leak proof: both rows + both inboxes clear and the transfer-record ledger fully FREE (the
+    //     record was released when the grantee's received handle tore down). Poll bounded; false->true.
+    let all_clear = |gs: usize, es: usize| {
+        handle_row_is_clear(gs)
+            && handle_row_is_clear(es)
+            && xfer_row_is_clear(gs)
+            && xfer_row_is_clear(es)
+            && xfer_recs_all_free()
+    };
+    let tdeadline = crate::arch::ticks() + 2000;
+    while !all_clear(grantor.slot, grantee.slot) && crate::arch::ticks() < tdeadline {
+        crate::arch::sched::yield_now();
+    }
+    let cleared = all_clear(grantor.slot, grantee.slot);
+    proc_free(pi); // the planted pid->slot entry (the fixtures exited by name, never through the Proc path)
+
+    // 5c. The M1 kernel-side gen-rebind proof (needs the drained ledgers the wait above establishes).
+    let kernel_ok = cleared && sock4_kernel_check();
+
+    if gw == SOCK4_GRANTOR_WITNESS_ALL
+        && ew == SOCK4_GRANTEE_WITNESS_ALL
+        && used != 0
+        && snap_ok
+        && cleared
+        && kernel_ok
+        && killed == 0
+    {
+        serial_println!(
+            ":: SOCK-4: transferable sockets — grantee received + round-tripped the moved socket, grantor's migrated-away handle -EACCES, gen-rebind rejected, teardown clean -> PASS ::"
+        );
+    } else {
+        serial_println!(
+            ":: SOCK-4: transferable sockets FAIL — grantor={:#x} grantee={:#x} used={} snap={} cleared={} kernel={} killed={} done={} (want {:#x}/{:#x}/1/true/true/true/0/2) ::",
+            gw,
+            ew,
+            used,
+            snap_ok,
+            cleared,
+            kernel_ok,
+            killed,
+            SOCK4_DONE.load(Ordering::Acquire),
+            SOCK4_GRANTOR_WITNESS_ALL,
+            SOCK4_GRANTEE_WITNESS_ALL
+        );
+    }
+}
+
 /// U8x launcher + verdict — called by `u7x_launcher` after the whole U7x flow (program-order gating; see
 /// `u7x_launcher`). Flow: one-shot guard; skip silently with no block device (the control-path discipline —
 /// U8x needs no disk); build + pre-endow + spawn the single fixture (`u8x-tree`: index 2 = a console cap
@@ -9552,6 +10138,11 @@ fn u8x_launcher(demo_cpu: usize) {
     // last. It gates on a NIC internally, so no-NIC configs skip cleanly. Knob-off / aarch64 never emit it.
     #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
     sock3_launcher(demo_cpu);
+    // SOCK-4 (knob-on, x86-only): chain the transferable-socket two-fixture demo + the M1 kernel-side
+    // gen-rebind proof after SOCK-3, so its line lands last. It gates on a NIC + a third AP internally, so
+    // no-NIC / low-AP configs skip cleanly. Knob-off / aarch64 never emit it.
+    #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+    sock4_launcher(demo_cpu);
 }
 
 /// Build the U9x fixture slot — the `u8x_build` shape for the U9x blob (allocate, scrub the WHOLE window, copy

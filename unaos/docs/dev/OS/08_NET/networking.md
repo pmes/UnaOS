@@ -246,11 +246,89 @@ no netdev change. Two witnesses fire knob-on:
 Reproduce: `UNAOS_SMOLNET=1 ./arroyo test 90` — MISSION SUCCESS plus both lines. The `sock3-tcp` fixture
 runs on an AP; a stolen segment is handled by the same non-blocking poll/retry discipline SOCK-2 uses.
 
+## SOCK-4 — transferable sockets (a socket cap moves across processes)
+
+SOCK-4 (scope B) makes a socket **capability movable to another process** — the socket analogue of the
+U7x/U8x console-cap transfer. Same knob (`UNAOS_SMOLNET`), x86-only, byte-identical knob-off / aarch64. It
+adds **no new syscall** (next free number stays **26**): a socket rides the existing `SYS_XFER` (13) /
+`SYS_RECV` (14) transfer machinery, which already special-cased `KIND_SOCKET` — this arc makes that path
+actually *work* and proves it safe.
+
+### The two changes that make a socket transferable
+
+1. **`sys_socket` mints `CAP_GRANT`.** SOCK-2/3 minted `CAP_READ|CAP_WRITE` (no `CAP_GRANT`), so `SYS_XFER`
+   (which requires `CAP_GRANT` on the source) could never move a socket. The mint now carries
+   `CAP_READ|CAP_WRITE|CAP_GRANT`: a socket is the owning process's own resource, and `CAP_GRANT` cannot be
+   self-added later (rights only attenuate), so transferability must be endowed at mint. Send still needs
+   `CAP_WRITE`, recv `CAP_READ`, so a transfer/grant can still ATTENUATE to send-only / recv-only, and a
+   transfer that drops `CAP_GRANT` (single-level) keeps the grantee from re-delegating.
+
+2. **`sys_recv` MIGRATES socket ownership.** The persistent registry slot records an **owner row**, and
+   `sock_valid` (the gen fence's owner check) requires `owner == caller_row`. A transferred socket handle
+   carries the same gen-fenced value word, but its registry owner is still the GRANTOR's row — so without a
+   migration it would fail `sock_valid` at the grantee (`-EACCES`). When `sys_recv` installs a received
+   `KIND_SOCKET` cap it calls `smolnet::reassign_owner(sid, gen, from_row, new_row)` (`xfer_socket_migrate`):
+   under the `STACK` lock, iff slot `sid` is still present at the SAME generation AND still owned by the
+   transfer's SENDER (`from_row`, from the transfer record), its owner moves to the receiving
+   row. Only the owner field changes — the smoltcp socket + its stream/packet buffers are untouched, so a
+   bound port or an in-flight connection survives the hand-off (a MOVE, not a re-open).
+
+### Single-owner, gen-fenced, safe by construction
+
+A socket has exactly **one owner at any instant**. After the move the grantor's original handle is
+owner-mismatched — a `sys_send`/`sys_recv` through it is `-EACCES` (the cross-row stale-handle rejection).
+Teardown stays single-owner-correct: `free_row_sockets` frees a socket only for its current owner, so the
+grantee's exit reclaims the socket and the grantor's exit reclaims nothing (its dangling handle is just
+cleared). And the SOCK-3 **generation fence** does the rest: once the owner frees the slot, `SOCK_GEN[sid]`
+bumps, so a stale cross-row handle carrying the old generation is `-EACCES` against BOTH the freed slot and
+whatever socket first-fit-reuses it — **no rebind** (the U11x file-id discipline, socket edition). A stale
+deposit (the socket freed+reused between `SYS_XFER` and `SYS_RECV`) fails `reassign_owner`'s gen check, so
+the received handle is dead-on-arrival rather than stealing a different tenant's socket.
+
+### The witnesses
+
+Both fire knob-on, chained after the SOCK-3 verdict:
+
+- **M1, kernel-side** — `sock4_kernel_check()` drives the real syscall bodies (`sys_xfer_from` /
+  `sys_recv_for`) over two scratch rows: mint (owner A) → transfer → RECV migrates ownership to B → the moved
+  cap **resolves for B** AND A's handle is `-EACCES` → then the **gen-rebind proof**: B frees the socket
+  (gen bumps), a fresh socket first-fit-reuses the slot at the new generation, and B's old-generation handle
+  stays `-EACCES`. Folded into the launcher verdict (`kernel=true`).
+- **M2, ring-3** — a two-fixture demo (`sock4-grantor` / `sock4-grantee`, the U7x idiom, on dedicated APs).
+  The grantor mints a UDP socket, proves cross-process attenuation (an over-rights `SYS_XFER` is `-EACCES`),
+  and transfers it (dropping `CAP_GRANT`); the grantee `SYS_RECV`s it and completes a **datagram round-trip
+  to slirp's resolver on the MOVED socket** (`bind`/`sendto`/`recvfrom` from `10.0.2.3:53`); then the
+  grantor's post-transfer `SYS_SENDTO` through its migrated-away handle is `-EACCES`. A single-writer
+  snapshot (the deposit is pending while the grantee's row is still untouched) + teardown-clear round it out:
+  `:: SOCK-4: transferable sockets — grantee received + round-tripped the moved socket, grantor's migrated-away handle -EACCES, gen-rebind rejected, teardown clean -> PASS ::`.
+
+Reproduce: `UNAOS_SMOLNET=1 ./arroyo test 90` — MISSION SUCCESS plus the SOCK-4 PASS line (and the SOCK-1/2/3
+witnesses intact). The demo needs a NIC + three APs; it skips cleanly otherwise.
+
+### Residuals (ledgered)
+
+- **Move, not copy.** `SYS_XFER` is documented as depositing an attenuated *copy*; for a stateful,
+  owner-scoped socket the transfer is a **move** (the grantor's handle dies once the grantee receives). This
+  is the safe choice — co-ownership would break the single-owner teardown model.
+- **First-recv-wins on a double transfer (review fix — the steal fence).** As landed, a double transfer was
+  last-recv-wins: the grantor's residual handle still carries `CAP_GRANT` (rights are handle-local), so a
+  SECOND `SYS_XFER` after the move could re-migrate the socket at the new recipient's RECV — a covert
+  revocation yanking a live, in-use socket back out from under its owner (contradicting the "grantor's
+  handle dies" model above). The review fix makes `reassign_owner` demand the transfer's **sender still own
+  the socket at delivery**: the first RECV wins, every later deposit's handle arrives dead, and the current
+  owner is undisturbed. Proven by the M1 kernel check's step 4b (deposit lands, migration refused, B still
+  resolves).
+- **Single-level.** A transferred socket cap drops `CAP_GRANT`, so the grantee cannot re-delegate it;
+  cascading re-transfer + revoke of a socket is the revocation-tree machinery's concern, deferred.
+- **UDP demo.** The two-fixture demo round-trips a UDP socket; a TCP socket transfers identically (same
+  `KIND_SOCKET`, same value word, same migration), exercised by the kind-agnostic M1 kernel check.
+
 ## The road from here
 
 | Arc | Content |
 | :--- | :--- |
 | SOCK-1 | smoltcp dep + `Device` adapter + `ping`/`arp`/`netinfo` + ICMP witness, knob-gated |
 | SOCK-2 | the UDP socket syscall family (`sys_socket`/`bind`/`sendto`/`recvfrom`, #19–22) + persistent `SocketSet`, ring 3 reaches the network |
-| **SOCK-3** (this) | TCP client sockets (`sys_connect`/`sys_send`/`sys_sock_recv`, #23–25) + gen-fenced socket handles + chunked-lock TCP pump, ring 3 gets a byte stream |
-| SOCK-4+ | TCP server/listen sockets; transferable sockets (the gen fence is in place); DHCP via smoltcp; aarch64 NIC bring-up; retire the hand-rolled shell surface |
+| SOCK-3 | TCP client sockets (`sys_connect`/`sys_send`/`sys_sock_recv`, #23–25) + gen-fenced socket handles + chunked-lock TCP pump, ring 3 gets a byte stream |
+| **SOCK-4** (this) | transferable sockets — `sys_socket` mints `CAP_GRANT`, `sys_recv` migrates socket ownership, a socket cap moves cross-row (gen-fenced, single-owner); no new syscall |
+| SOCK-5+ | TCP server/listen sockets; DHCP via smoltcp; aarch64 NIC bring-up; retire the hand-rolled shell surface |

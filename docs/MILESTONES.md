@@ -574,6 +574,49 @@ Spec promotions committed here; the granular arc detail is in each arc's own ent
 
 ---
 
+## net-sock1 track — 2026-07-14 (SOCK-4 scope B — transferable sockets: a socket cap moves across processes)
+
+### SOCK-4 — transferable sockets (a `KIND_SOCKET` cap moves cross-row, gen-fenced) 🔬 `net-sock1`
+- **What:** scope B of [§1b](ROADMAP.md) SOCK-4 — make a socket **capability movable to another process**
+  (the U7x/U8x console-cap transfer, socket edition). **No new syscall** (next free stays **26**): a socket
+  rides the existing `SYS_XFER`(13)/`SYS_RECV`(14) inbox machinery, which already special-cased `KIND_SOCKET`.
+  Same `UNAOS_SMOLNET` knob, x86-only, byte-identical knob-off / aarch64.
+- **The two changes that make it real:** (1) `sys_socket` now mints `CAP_READ|CAP_WRITE|CAP_GRANT` — SOCK-2/3
+  minted no `CAP_GRANT`, so `SYS_XFER` (which demands it on the source) could never move a socket; `CAP_GRANT`
+  cannot be self-added later (rights only attenuate), so transferability is endowed at mint. (2) `sys_recv`
+  MIGRATES the socket's registry ownership to the grantee — `sock_valid` is owner-scoped, so a transferred
+  handle would fail its owner CHECK unless the persistent socket's `reg` owner follows the cap. The install of
+  a received `KIND_SOCKET` cap calls `smolnet::reassign_owner(sid, gen, new_row)` (`xfer_socket_migrate`):
+  under the `STACK` lock, iff slot `sid` is present at the SAME generation, ownership moves — only the owner
+  field, the smoltcp socket + buffers untouched (a MOVE, so a bound port survives the hand-off).
+- **Single-owner, gen-fenced, safe by construction:** a socket has exactly one owner at any instant. After the
+  move the grantor's original handle is owner-mismatched (`-EACCES`); `free_row_sockets` frees a socket only
+  for its current owner; and the SOCK-3 gen fence rejects any stale old-gen handle to a freed+reused slot — no
+  rebind (the U11x `file_desc_validate` discipline). A stale deposit (freed+reused between XFER and RECV)
+  fails `reassign_owner`'s gen check → the received handle is dead-on-arrival, never stealing a tenant's
+  socket. **This DISCHARGES the SOCK-2 review's warning** ("the moment a future arc makes a socket
+  transferable this is a recycled-slot UAF") by construction.
+- **Evidence:** a two-fixture ring-3 demo (`sock4-grantor`/`sock4-grantee`, the U7x idiom, on dedicated APs):
+  the grantor mints a UDP socket, proves cross-process attenuation (over-rights `SYS_XFER` → `-EACCES`) and
+  transfers it (dropping `CAP_GRANT`, single-level); the grantee `SYS_RECV`s it and completes a datagram
+  round-trip to slirp's resolver **on the moved socket** (`bind`/`sendto`/`recvfrom` FROM `10.0.2.3:53`); the
+  grantor's post-transfer `SYS_SENDTO` through its migrated-away handle is `-EACCES`; single-writer snapshot +
+  teardown-clear hold. Plus a kernel-side `sock4_kernel_check` folding the **U11x gen-rebind proof** (grantee
+  frees → gen bumps → a fresh socket first-fit-reuses the slot at the new gen → the old-gen handle stays
+  `-EACCES`). `:: SOCK-4: transferable sockets — grantee received + round-tripped the moved socket, grantor's
+  migrated-away handle -EACCES, gen-rebind rejected, teardown clean -> PASS ::`.
+- **Gates:** `UNAOS_SMOLNET=1 ./arroyo test 90` MISSION SUCCESS + the SOCK-4 PASS line (3/3 deterministic),
+  SOCK-1/2/3 witnesses intact; knob-off `./arroyo test`/`test-arm` MISSION with NO SOCK-4 lines (all code
+  `#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]` — byte-identical both arches); `check` both
+  arches on+off, no new warnings. **Lane:** `arch/x86_64/syscall.rs` + `smolnet.rs`; `crates/net`/`fat.rs`/
+  `sched.rs`/`Cargo.toml` untouched (reuses the existing socket features); **zero aarch64.**
+- **Residuals:** it is a MOVE not a copy (the safe choice for a stateful owner-scoped resource); a double
+  transfer is last-recv-wins (no UAF/leak); single-level (no re-delegation — socket revocation trees
+  deferred); the demo round-trips UDP but a TCP socket transfers identically (the kind-agnostic kernel check
+  covers it). Metal-pending (SOCK has no metal leg — no wired NIC on any current board).
+
+---
+
 ## net-sock1 track — 2026-07-12 (SOCK-3 — TCP client sockets: ring 3 gets a byte stream)
 
 ### SOCK-3 — `sys_connect`/`sys_send`/`sys_sock_recv` (TCP client) over the persistent smoltcp stack 🔬 `net-sock1`
