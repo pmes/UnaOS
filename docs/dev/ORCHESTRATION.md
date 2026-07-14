@@ -211,8 +211,11 @@ Prep everything offline; batch the questions per boot.
 - **After a bench session's final landing report, the Maestro replies ONLY if
   something needs fixing or deciding.** A clean report needs no acknowledgment —
   the session is expected to be over; the fold happens on the Maestro's side and
-  the docs are the receipt. (Mid-bench questions — a paused board waiting on a
-  call — are the opposite: answer those immediately, they block silicon time.)
+  the docs are the receipt. The why (Peter): a closing ack between coordination
+  surfaces is internal dialog published as if it were signal — the work product
+  (folds, commits, docs) is the communication. (Mid-bench questions — a paused
+  board waiting on a call — are the opposite: answer those immediately, they
+  block silicon time.)
 
 **Code-prerequisite sequencing**: metal that is blocked on a code prerequisite is
 sequenced explicitly, not counted against the gate for the current round. Example:
