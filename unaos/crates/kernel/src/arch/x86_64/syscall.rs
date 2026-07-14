@@ -2688,17 +2688,24 @@ fn socket_id_of(row: usize, handle: u64, req: u32) -> Result<usize, i64> {
 /// SOCK-4: when `sys_recv` installs a received `KIND_SOCKET` cap, MOVE the persistent socket's registry
 /// ownership to the receiving row so the moved cap resolves (`sock_valid` is owner-scoped). Decodes the
 /// gen-fenced socket-id out of the handle value word `target` (the `socket_id_of` decode) and calls
-/// `smolnet::reassign_owner`, which reassigns iff the slot is still present at the SAME generation. A
-/// non-Socket kind is a no-op; a stale deposit (socket freed+reused since the transfer) fails the gen
-/// check and the received handle stays dead (fails `sock_valid`) — never rebinding to a different tenant.
+/// `smolnet::reassign_owner`, which reassigns iff the slot is still present at the SAME generation AND
+/// still owned by `from_row` — the transfer's SENDER (from the record; a disowned record's `u64::MAX`
+/// sender matches no row). A non-Socket kind is a no-op; a stale deposit (socket freed+reused since the
+/// transfer) fails the gen check, and a deposit whose sender no longer owns the socket (it already MOVED
+/// to an earlier grantee — the sender's residual `CAP_GRANT` handle must not steal it back out from
+/// under the current owner) fails the owner check: either way the received handle stays dead (fails
+/// `sock_valid`) — never rebinding to a different tenant, never re-migrating a moved socket.
 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
-fn xfer_socket_migrate(kind: u8, target: u64, new_row: usize) {
+fn xfer_socket_migrate(kind: u8, target: u64, from_row: u64, new_row: usize) {
     if kind != KIND_SOCKET {
         return;
     }
+    let Ok(from_row) = usize::try_from(from_row) else {
+        return; // a disowned record (u64::MAX sender) owns nothing on 32-bit-usize targets either
+    };
     if let Some(sid) = ((target & 0xFFFF_FFFF) as usize).checked_sub(1) {
         let generation = (target >> 32) as u32;
-        crate::smolnet::reassign_owner(sid, generation, new_row);
+        crate::smolnet::reassign_owner(sid, generation, from_row, new_row);
     }
 }
 
@@ -6791,10 +6798,18 @@ fn sys_recv_for(row: usize) -> i64 {
         // the moved cap actually resolves (`sock_valid` is owner-scoped). Done after the handle install
         // committed (a re-queue on a full table above never migrates), before the live value publish. A
         // no-op for non-Socket kinds; a stale deposit (socket freed+reused since XFER) fails the gen
-        // check inside and the received handle stays dead — no cross-tenant rebind. The whole line is
-        // knob-gated, so knob-off / aarch64 (where no socket is ever transferable) is byte-identical.
+        // check inside and the received handle stays dead — no cross-tenant rebind. The migration also
+        // demands the transfer's SENDER (from the record) still OWNS the socket: a sender whose socket
+        // already moved to an earlier grantee cannot use a second deposit to steal it back (its residual
+        // CAP_GRANT handle is delegation-dead once ownership left it). The whole line is knob-gated, so
+        // knob-off / aarch64 (where no socket is ever transferable) is byte-identical.
         #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
-        xfer_socket_migrate(kind, target, row);
+        xfer_socket_migrate(
+            kind,
+            target,
+            XFER_REC_SENDER[(rec - 1) as usize].load(Ordering::Acquire),
+            row,
+        );
         handle_set(row, h, target);
         xfer_slot_release(row, k); // consume the inbox slot (record ownership moved to the handle)
         return h as i64;
@@ -9775,6 +9790,10 @@ fn sock4_build(entry_sym: *const u8) -> Option<U7xFix> {
 ///      the registry ownership to B.
 ///   3. THE MOVED CAP WORKS: B now resolves the socket (owner-matched under B).
 ///   4. A's original handle is DEAD (owner migrated to B) — the cross-row stale handle is `-EACCES`.
+///   4b. THE STEAL FENCE (review fix): A's residual `CAP_GRANT` handle deposits AGAIN — to C — and the
+///       deposit itself lands (handle-level rights are all `sys_xfer` checks), but the migration at C's
+///       RECV is REFUSED (the sender A no longer owns the socket): C's received handle is dead and B's
+///       ownership is undisturbed — a second transfer can never yank a moved socket back.
 ///   5. THE GEN-REBIND FENCE: B frees the socket (gen bumps), then a fresh socket REUSES the same slot at
 ///      the NEW generation — B's old handle (old gen) stays `-EACCES`, provably no rebind to the new tenant.
 ///   6. LEDGER HYGIENE: after dropping every planted handle/Proc entry, the handle rows, inboxes, transfer
@@ -9819,6 +9838,37 @@ fn sock4_kernel_check() -> bool {
     // 4. A's original handle is DEAD: its owner is now B, so the cross-row handle is -EACCES.
     ok &= socket_id_of(A, 2, CAP_WRITE) == Err(EACCES);
 
+    // 4b. THE STEAL FENCE (review fix): A's handle still carries CAP_GRANT (rights are handle-local), so a
+    //     SECOND deposit — to C — lands; but `xfer_socket_migrate` at C's RECV demands the sender still OWN
+    //     the socket, and A doesn't (it moved to B at step 2). C's received handle must be dead and B must
+    //     still resolve — the residual grantor handle can never steal the socket back from its new owner.
+    const C: usize = 7; // scratch second-grantee row (< USER_SLOTS; clear like A/B — see the doc comment)
+    const PIDC: u64 = 0xE5; // planted second-grantee pid (same never-collides argument as PIDB)
+    let Some(pc) = proc_reserve() else {
+        if hb >= 0 {
+            handle_clear(B, hb as usize);
+        }
+        handle_clear(A, 2);
+        handle_clear(A, 3);
+        crate::smolnet::stack_close(sid);
+        proc_free(pb);
+        return false;
+    };
+    PROCS[pc].slot.store(C + 1, Ordering::Release);
+    PROCS[pc].pid.store(PIDC, Ordering::Release);
+    install_cap(A, 4, KIND_CHILD, PIDC, CAP_READ);
+    let t2 = sys_xfer_from(A, 4, 2, (CAP_READ | CAP_WRITE) as u64);
+    ok &= t2 > 0; // the deposit lands — sys_xfer's checks are handle-level by design
+    let hc = sys_recv_for(C);
+    ok &= hc >= 0; // the cap is delivered ...
+    ok &= hc >= 0 && socket_id_of(C, hc as u64, CAP_WRITE) == Err(EACCES); // ... but DEAD: migration refused
+    ok &= hb >= 0 && socket_id_of(B, hb as u64, CAP_WRITE) == Ok(sid); // B undisturbed — still the owner
+    if hc >= 0 {
+        handle_clear(C, hc as usize); // frees the second transfer's record + node before the gen-fence step
+    }
+    handle_clear(A, 4);
+    proc_free(pc);
+
     // 5. THE GEN-REBIND FENCE. B frees the socket (gen bumps) — then a fresh socket first-fit-REUSES the same
     //    slot at the NEW gen. B's old handle carries (sid, gen0), so it must stay -EACCES against BOTH the
     //    freed slot and the new tenant — no rebind (the U11x fd discipline, socket edition).
@@ -9846,8 +9896,8 @@ fn sock4_kernel_check() -> bool {
     handle_clear(A, 2); // drops the transfer source's derivation root node
     handle_clear(A, 3);
     proc_free(pb);
-    ok &= handle_row_is_clear(A) && handle_row_is_clear(B);
-    ok &= xfer_row_is_clear(A) && xfer_row_is_clear(B);
+    ok &= handle_row_is_clear(A) && handle_row_is_clear(B) && handle_row_is_clear(C);
+    ok &= xfer_row_is_clear(A) && xfer_row_is_clear(B) && xfer_row_is_clear(C);
     ok &= xfer_recs_all_free() && deriv_all_free();
     ok
 }

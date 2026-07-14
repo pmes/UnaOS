@@ -267,8 +267,9 @@ actually *work* and proves it safe.
    `sock_valid` (the gen fence's owner check) requires `owner == caller_row`. A transferred socket handle
    carries the same gen-fenced value word, but its registry owner is still the GRANTOR's row — so without a
    migration it would fail `sock_valid` at the grantee (`-EACCES`). When `sys_recv` installs a received
-   `KIND_SOCKET` cap it calls `smolnet::reassign_owner(sid, gen, new_row)` (`xfer_socket_migrate`): under the
-   `STACK` lock, iff slot `sid` is still present at the SAME generation, its owner moves to the receiving
+   `KIND_SOCKET` cap it calls `smolnet::reassign_owner(sid, gen, from_row, new_row)` (`xfer_socket_migrate`):
+   under the `STACK` lock, iff slot `sid` is still present at the SAME generation AND still owned by the
+   transfer's SENDER (`from_row`, from the transfer record), its owner moves to the receiving
    row. Only the owner field changes — the smoltcp socket + its stream/packet buffers are untouched, so a
    bound port or an in-flight connection survives the hand-off (a MOVE, not a re-open).
 
@@ -309,9 +310,14 @@ witnesses intact). The demo needs a NIC + three APs; it skips cleanly otherwise.
 - **Move, not copy.** `SYS_XFER` is documented as depositing an attenuated *copy*; for a stateful,
   owner-scoped socket the transfer is a **move** (the grantor's handle dies once the grantee receives). This
   is the safe choice — co-ownership would break the single-owner teardown model.
-- **Last-recv-wins on a double transfer.** Transferring the same socket to two recipients moves it to
-  whichever receives last; the other's handle goes owner-stale. No UAF, no leak (single owner throughout) —
-  an unusual usage, not a hazard.
+- **First-recv-wins on a double transfer (review fix — the steal fence).** As landed, a double transfer was
+  last-recv-wins: the grantor's residual handle still carries `CAP_GRANT` (rights are handle-local), so a
+  SECOND `SYS_XFER` after the move could re-migrate the socket at the new recipient's RECV — a covert
+  revocation yanking a live, in-use socket back out from under its owner (contradicting the "grantor's
+  handle dies" model above). The review fix makes `reassign_owner` demand the transfer's **sender still own
+  the socket at delivery**: the first RECV wins, every later deposit's handle arrives dead, and the current
+  owner is undisturbed. Proven by the M1 kernel check's step 4b (deposit lands, migration refused, B still
+  resolves).
 - **Single-level.** A transferred socket cap drops `CAP_GRANT`, so the grantee cannot re-delegate it;
   cascading re-transfer + revoke of a socket is the revocation-tree machinery's concern, deferred.
 - **UDP demo.** The two-fixture demo round-trips a UDP socket; a TCP socket transfers identically (same

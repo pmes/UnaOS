@@ -695,26 +695,31 @@ pub fn sock_valid(row: usize, sid: usize, generation: u32) -> bool {
 /// socket cap needs. `sock_valid` is owner-scoped, so a socket handed to another row via `SYS_XFER`
 /// would fail its owner CHECK there unless the persistent socket's `reg` owner follows the cap. Called
 /// from `sys_recv` when it installs a received `KIND_SOCKET` handle. Under the `STACK` lock: iff slot
-/// `sid` is present AND its CURRENT generation equals `generation` (the gen the received handle carries),
-/// reassign its owner to `new_row` and return `true`. A gen mismatch (the socket was freed+reused since
-/// the transfer was deposited) or a free/absent slot returns `false` — the received handle then stays
+/// `sid` is present AND its CURRENT generation equals `generation` (the gen the received handle carries)
+/// AND its CURRENT owner is `from_row` (the transfer's SENDER — the depositor must still own the socket
+/// at delivery), reassign its owner to `new_row` and return `true`. A gen mismatch (the socket was
+/// freed+reused since the transfer was deposited), an owner mismatch (the socket already MOVED away —
+/// the sender's residual `CAP_GRANT` handle must not re-migrate a socket it no longer owns out from
+/// under the current owner), or a free/absent slot returns `false` — the received handle then stays
 /// dead (fails `sock_valid`), never rebinding to a DIFFERENT tenant of the slot. Only the owner field
 /// moves; the smoltcp handle + its stream/packet buffers are untouched (a MOVE, not a re-open), so an
 /// in-flight connection or bound port survives the hand-off. After the move the GRANTOR's original
 /// handle is owner-mismatched (dead), so a socket has exactly ONE owner at any instant — the teardown
 /// (`free_row_sockets`) and the gen fence both stay single-owner-correct.
-pub fn reassign_owner(sid: usize, generation: u32, new_row: usize) -> bool {
+pub fn reassign_owner(sid: usize, generation: u32, from_row: usize, new_row: usize) -> bool {
     if sid >= NSOCK {
         return false;
     }
     let mut g = STACK.lock();
     let Some(stack) = g.as_mut() else { return false };
     match stack.reg[sid] {
-        Some((handle, _owner, kind)) if SOCK_GEN[sid].load(Ordering::Acquire) == generation => {
+        Some((handle, owner, kind))
+            if owner == from_row && SOCK_GEN[sid].load(Ordering::Acquire) == generation =>
+        {
             stack.reg[sid] = Some((handle, new_row, kind));
             true
         }
-        _ => false, // free, absent, or stale (freed+reused since the transfer was deposited)
+        _ => false, // free, absent, stale (freed+reused), or already moved away from the sender
     }
 }
 
