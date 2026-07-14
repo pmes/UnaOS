@@ -1,0 +1,18 @@
+[package]
+name = "helm-handler"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+
+# Design-stage handler — see README.md. No dependencies yet: the message
+# contract (Bandy `SMessage` action-request / pass-ask-refuse decision, reading
+# principia's safety levels) lands with the first drivable domain. The crate
+# name is `helm-handler` to avoid colliding with the kernel `helm` core at
+# unaos/libs/sys/helm; this Ring 3 handler is distinct from that Ring 0 interlock.
+[dependencies]
+
+# Standalone, deliberately outside the root workspace (like the other
+# design-stage handlers, it is not a `workspace.members` entry). The empty table
+# below marks it its own package root so a bare `cargo check` here resolves
+# without being pulled into the main build.
+[workspace]
