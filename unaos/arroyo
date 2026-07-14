@@ -565,7 +565,7 @@ kernel8() {
     # byte i = (i*7+3)&0xFF — spans 3 unafs blocks so extent walking is exercised).
     echo -e "${COLOR_YELLOW}⚡ Staging unafs K3 volume (host unafs CLI)...${COLOR_RESET}"
     local UNAFS_K3_IMG="${WORKSPACE_DIR}/target/unafs-k3.img"
-    local UNAFS_CLI_MANIFEST="${WORKSPACE_DIR}/../apps/cli/unafs/Cargo.toml"
+    local UNAFS_CLI_MANIFEST="${WORKSPACE_DIR}/../tools/unafs/Cargo.toml"
     rm -f "$UNAFS_K3_IMG"
     printf 'Hello from native UnaFS on the Pi 4!\n' > "${WORKSPACE_DIR}/target/K3HELLO.TXT"
     python3 -c "import sys; sys.stdout.buffer.write(bytes(((i*7+3) & 0xFF) for i in range(12288)))" \
