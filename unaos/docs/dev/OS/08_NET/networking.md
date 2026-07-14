@@ -323,6 +323,66 @@ witnesses intact). The demo needs a NIC + three APs; it skips cleanly otherwise.
 - **UDP demo.** The two-fixture demo round-trips a UDP socket; a TCP socket transfers identically (same
   `KIND_SOCKET`, same value word, same migration), exercised by the kind-agnostic M1 kernel check.
 
+## SOCK-5 — DHCP via smoltcp (the persistent stack leases its own address)
+
+SOCK-5 (scope B) retires the persistent stack's **knob-on dependency on the hand-rolled DHCP lease**.
+Before this arc, the persistent smoltcp interface was configured with a *static* address copied from
+`e1000::hw_addr()` — an address the **hand-rolled** `crates/net` DHCP client had obtained. SOCK-5 gives
+the smoltcp stack **its own** `dhcpv4::Socket`, so knob-on it acquires and applies its lease
+autonomously. Same knob (`UNAOS_SMOLNET`), x86-only, byte-identical knob-off / aarch64. **No new
+syscall** (next free number stays **26**) and **no new ring-3 surface**: DHCP is a kernel-internal
+interface-configuration function, not a capability ring 3 can invoke.
+
+### The mechanism
+
+The DHCP client rides the existing persistent `STACK`. The socket-set storage grows by one reserved
+slot (`NSOCK + 1`) for a **kernel-internal** DHCP socket that is **never recorded in `reg`** — so it
+never counts against ring-3 socket allocation (`stack_open*` still sees exactly `NSOCK` slots) and no
+`free_row_sockets`/`stack_close` ever touches it. `SmolStack` gains a `dhcp: Option<SocketHandle>`.
+
+`ensure_stack` builds the interface **with the static `hw_addr` lease + slirp gateway applied at
+build** (via `apply_ipv4_config`, the one config surface) and adds the `dhcpv4::Socket` — so ANY
+first-touch, including a lazy ring-3 `sys_socket` on a boot where no launcher pre-built the stack,
+yields a configured, working interface with no pump under the lock. The acquisition itself,
+`dhcp_acquire`, runs **only from `init()`** (the large-stack boot path) and is one-shot
+(`DHCP_ATTEMPTED`): it pumps the interface until the DHCP socket emits `Event::Configured`
+(`DISCOVER → OFFER → REQUEST → ACK`), **releasing the `STACK` lock every `TCP_CHUNK` iterations**
+(the same SOCK-2-review lock-release discipline the TCP connect pump follows — the review fix: the
+original landing held the lock, IF-masked, for the whole budget), then REPLACES the static config
+with the leased `address` (CIDR) and `router` (default gateway). It is **iteration-bounded**
+(`DHCP_PUMP`, clock-free like every other pump); on a silent server the build-time **static config
+simply stands**, so the SOCK-1/2/3/4 witnesses keep a configured interface either way. Everything
+stays **static / BSS** — the `dhcpv4::Socket` carries its own fixed internal storage, no heap.
+
+### The witness
+
+One kernel-side, one-shot witness fires knob-on (M1), latched so it prints exactly once at the first
+stack build:
+
+```
+:: SOCK-5: smoltcp dhcpv4 lease 10.0.2.20/24 gw 10.0.2.2 — witness OK ::
+```
+
+The proof is end-to-end and self-checking: under slirp's DHCP server the leased address is
+`10.0.2.20` — **not** the `10.0.2.15` static default the interface used to hard-code — and the SOCK-2
+UDP-DNS, SOCK-3 TCP-DNS, and SOCK-4 transfer round-trips **all still pass on that DHCP-assigned
+address**, confirming the whole socket family now runs on a lease smoltcp obtained itself. (A silent
+server would instead print `… no offer — fell back to static … — witness INCOMPLETE ::`.)
+
+Reproduce: `UNAOS_SMOLNET=1 ./arroyo test 90` — MISSION SUCCESS plus the SOCK-5 witness line and the
+SOCK-1/2/3/4 lines intact.
+
+### Residuals (ledgered)
+
+- **One-shot acquisition, no lease renewal.** The boot acquisition configures the interface once;
+  smoltcp's DHCP renew/rebind timers are not driven past that (the persistent stack keeps the lease for
+  the session — adequate under slirp's effectively-infinite lease, and the fallback covers a silent
+  server). A future arc can keep the DHCP socket pumping in `service_net` for renewal.
+- **The hand-rolled DHCP still runs in the driver knob-off** (it is the live stack when `UNAOS_SMOLNET`
+  is off) and, knob-on, still leases the driver's own `hw_addr` — the two DHCP clients share the NIC's
+  single MAC, so slirp hands them the same address. Fully retiring the hand-rolled `crates/net` DHCP is
+  part of the eventual "retire the hand-rolled stack" arc, not this one.
+
 ## The road from here
 
 | Arc | Content |
@@ -330,5 +390,6 @@ witnesses intact). The demo needs a NIC + three APs; it skips cleanly otherwise.
 | SOCK-1 | smoltcp dep + `Device` adapter + `ping`/`arp`/`netinfo` + ICMP witness, knob-gated |
 | SOCK-2 | the UDP socket syscall family (`sys_socket`/`bind`/`sendto`/`recvfrom`, #19–22) + persistent `SocketSet`, ring 3 reaches the network |
 | SOCK-3 | TCP client sockets (`sys_connect`/`sys_send`/`sys_sock_recv`, #23–25) + gen-fenced socket handles + chunked-lock TCP pump, ring 3 gets a byte stream |
-| **SOCK-4** (this) | transferable sockets — `sys_socket` mints `CAP_GRANT`, `sys_recv` migrates socket ownership, a socket cap moves cross-row (gen-fenced, single-owner); no new syscall |
-| SOCK-5+ | TCP server/listen sockets; DHCP via smoltcp; aarch64 NIC bring-up; retire the hand-rolled shell surface |
+| SOCK-4 | transferable sockets — `sys_socket` mints `CAP_GRANT`, `sys_recv` migrates socket ownership, a socket cap moves cross-row (gen-fenced, single-owner); no new syscall |
+| **SOCK-5** (this) | DHCP via smoltcp — the persistent stack leases its own address with `dhcpv4::Socket`; no new syscall, no ring-3 surface, static fallback |
+| SOCK-6+ | TCP server/listen sockets; aarch64 NIC bring-up; retire the hand-rolled shell surface + `crates/net` DHCP |

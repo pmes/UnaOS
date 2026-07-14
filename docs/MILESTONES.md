@@ -605,6 +605,40 @@ Spec promotions committed here; the granular arc detail is in each arc's own ent
 
 ---
 
+## net-sock1 track — 2026-07-14 (SOCK-5 scope B — DHCP via smoltcp: the persistent stack leases its own address)
+
+### SOCK-5 — smoltcp `dhcpv4::Socket` configures the persistent interface 🔬 `net-sock1`
+- **What:** scope B of [§1b](ROADMAP.md) SOCK-5 — retire the persistent stack's knob-on dependency on the
+  hand-rolled DHCP lease. The smoltcp interface used to copy a *static* address from `e1000::hw_addr()` (the
+  address the hand-rolled `crates/net` DHCP had obtained); now it runs its **own** `dhcpv4::Socket` and applies
+  the lease itself. Same `UNAOS_SMOLNET` knob, x86-only, byte-identical knob-off / aarch64. **No new syscall**
+  (next free stays **26**) and **no new ring-3 surface** — DHCP is kernel-internal interface configuration.
+- **The mechanism:** the socket-set storage grows to `NSOCK + 1` for a kernel-internal DHCP socket that is
+  **never recorded in `reg`** (so `stack_open*` still sees exactly `NSOCK` ring-3 slots and no teardown touches
+  it); `SmolStack` gains a `dhcp: Option<SocketHandle>`. `ensure_stack` builds the interface **address-less /
+  route-less** and adds the DHCP socket; `configure_via_dhcp` (called once, right after the build, from the
+  large-stack launcher/BSP-witness context) pumps a bounded, clock-free loop until `Event::Configured`, then
+  applies the leased address (CIDR) + router (default gateway). On a silent server it **falls back to the static
+  `hw_addr` lease + slirp gateway**, so SOCK-1/2/3/4 keep a configured interface either way. Fully static/BSS
+  (the `dhcpv4::Socket` carries its own fixed internal storage; no heap).
+- **Evidence:** a one-shot kernel witness `:: SOCK-5: smoltcp dhcpv4 lease 10.0.2.20/24 gw 10.0.2.2 — witness
+  OK ::`. The proof is self-checking end-to-end: under slirp the lease is `10.0.2.20` — **not** the `10.0.2.15`
+  static default the interface used to hard-code — and the SOCK-2 UDP-DNS, SOCK-3 TCP-DNS, and SOCK-4 transfer
+  round-trips all still PASS on that DHCP-assigned address.
+- **Gates:** `UNAOS_SMOLNET=1 ./arroyo test 90` MISSION SUCCESS + the SOCK-5 witness OK line, SOCK-1/2/3/4
+  witnesses intact; knob-off `./arroyo test 25` / `test-arm 22` MISSION with NO SOCK-5 line (all code
+  `#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]` — byte-identical both arches); `check` both arches
+  on+off, no new warnings. **Lane:** `smolnet.rs` + `Cargo.toml` (`socket-dhcpv4` feature) + docs;
+  `arch/x86_64/syscall.rs`/`drivers/e1000.rs`/`crates/net`/`fat.rs`/`sched.rs` untouched; **zero aarch64.**
+- **Residuals:** one-shot acquisition, no lease renewal (adequate under slirp's effectively-infinite lease; a
+  future arc can pump the DHCP socket in `service_net` for renew/rebind); the hand-rolled `crates/net` DHCP
+  still runs in the driver (it is the live stack knob-off, and knob-on still leases the driver's own `hw_addr` —
+  both clients share the NIC's single MAC so slirp hands them the same address) — fully retiring it belongs to
+  the eventual "retire the hand-rolled stack" arc. Metal-pending (SOCK has no metal leg — no wired NIC on any
+  current board).
+
+---
+
 ## net-sock1 track — 2026-07-14 (SOCK-4 scope B — transferable sockets: a socket cap moves across processes)
 
 ### SOCK-4 — transferable sockets (a `KIND_SOCKET` cap moves cross-row, gen-fenced) 🔬 `net-sock1`

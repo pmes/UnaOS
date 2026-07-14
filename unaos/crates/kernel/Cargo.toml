@@ -108,4 +108,4 @@ uart_16550 = "0.6.0"
 #   socket-icmp     — the ICMP echo socket that `ping`/the boot witness drive
 #   socket-udp      — SOCK-2: the UDP sockets behind the sys_socket/bind/sendto/recvfrom family
 #   socket-tcp      — SOCK-3: the TCP client sockets behind sys_connect/sys_send/sys_recv
-smoltcp = { version = "=0.13.1", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-icmp", "socket-udp", "socket-tcp"], optional = true }
+smoltcp = { version = "=0.13.1", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-icmp", "socket-udp", "socket-tcp", "socket-dhcpv4"], optional = true }

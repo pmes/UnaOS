@@ -37,11 +37,11 @@ use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
-use smoltcp::socket::{icmp, tcp, udp};
+use smoltcp::socket::{dhcpv4, icmp, tcp, udp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{
     EthernetAddress, HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, IpEndpoint,
-    IpListenEndpoint, Ipv4Address,
+    IpListenEndpoint, Ipv4Address, Ipv4Cidr,
 };
 use spin::Mutex as SpinMutex;
 
@@ -388,9 +388,21 @@ const CONNECT_PUMP: i64 = 400_000;
 /// The chunk size a lock-released TCP pump advances before dropping + re-acquiring `STACK` — short
 /// enough that a concurrent socket syscall on another CPU never spins on `STACK.lock()` for a full pump.
 const TCP_CHUNK: i64 = 4_000;
+/// SOCK-5: bounded poll budget for the one-shot boot DHCP acquisition (iteration-bounded, clock-free
+/// like every other pump). slirp's DHCP server answers a DISCOVER in a handful of frames, so the full
+/// DISCOVER → OFFER → REQUEST → ACK exchange settles well inside this; the budget only caps how long a
+/// silent server stalls the (large-stack) builder before we fall back to the static lease.
+const DHCP_PUMP: i64 = 400_000;
+
+/// SOCK-5: one-shot latch — the DHCP acquisition (and its witness line) runs exactly once, from the
+/// first `init()` call (review fix: never from a lazy `ensure_stack` first-touch).
+static DHCP_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 
 // --- static socket-set + per-socket packet-buffer storage (all BSS, `&'static mut`) ---
-static mut SOCK_SET_STORAGE: [SocketStorage<'static>; NSOCK] = [SocketStorage::EMPTY; NSOCK];
+// SOCK-5: NSOCK ring-3 socket slots + ONE reserved slot for the kernel-internal DHCP client
+// socket (which never appears in `reg`, so `stack_open*` still sees exactly NSOCK free slots).
+static mut SOCK_SET_STORAGE: [SocketStorage<'static>; NSOCK + 1] =
+    [SocketStorage::EMPTY; NSOCK + 1];
 static mut UDP_RX_META: [[udp::PacketMetadata; UDP_PKTS]; NSOCK] =
     [[udp::PacketMetadata::EMPTY; UDP_PKTS]; NSOCK];
 static mut UDP_RX_DATA: [[u8; UDP_BUF]; NSOCK] = [[0u8; UDP_BUF]; NSOCK];
@@ -430,6 +442,10 @@ struct SmolStack {
     dev: E1000Phy,
     /// socket-id (index) → (smoltcp handle, owning HANDLES row, transport kind). `None` = free slot.
     reg: [Option<(SocketHandle, usize, SockKind)>; NSOCK],
+    /// SOCK-5: the kernel-internal DHCPv4 client socket (in the reserved storage slot, NOT in `reg`).
+    /// `dhcp_acquire` (from `init()`, one-shot, chunked) drives it to a lease that replaces the
+    /// build-time static config.
+    dhcp: Option<SocketHandle>,
 }
 
 static STACK: SpinMutex<Option<SmolStack>> = SpinMutex::new(None);
@@ -449,28 +465,120 @@ fn ensure_stack(guard: &mut Option<SmolStack>) -> bool {
     let mut dev = E1000Phy::new([0; 4]);
     let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
     config.random_seed = 0x5343_4B32; // "SCK2"
-    let mut iface = Interface::new(config, &mut dev, Instant::from_millis(0));
-    iface.update_ip_addrs(|addrs| {
-        let _ = addrs.push(IpCidr::new(
-            IpAddress::v4(our_ip[0], our_ip[1], our_ip[2], our_ip[3]),
-            24,
-        ));
-    });
-    let _ = iface.routes_mut().add_default_ipv4_route(Ipv4Address::new(
-        GATEWAY_IP[0],
-        GATEWAY_IP[1],
-        GATEWAY_IP[2],
-        GATEWAY_IP[3],
-    ));
+    let iface = Interface::new(config, &mut dev, Instant::from_millis(0));
     // SAFETY: the storage statics are borrowed `&'static mut` EXACTLY ONCE, here, under
     // the `STACK` lock with `guard` proven `None` — no aliasing. `SocketSet::new` retains
     // the borrow for the singleton's life; per-socket buffers are borrowed disjointly in
     // `stack_open` (a free `reg` slot ⇒ its buffer set is unborrowed).
     let storage: &'static mut [SocketStorage<'static>] =
         unsafe { &mut *core::ptr::addr_of_mut!(SOCK_SET_STORAGE) };
-    let sockets = SocketSet::new(storage);
-    *guard = Some(SmolStack { iface, sockets, dev, reg: [None; NSOCK] });
+    let mut sockets = SocketSet::new(storage);
+    // The DHCP socket takes the reserved (NSOCK+1-th) storage slot and is NOT recorded in `reg`, so
+    // it never counts against ring-3 socket allocation and no `stack_open*`/`free_row_sockets` touches it.
+    let dhcp_handle = sockets.add(dhcpv4::Socket::new());
+    let mut stack = SmolStack { iface, sockets, dev, reg: [None; NSOCK], dhcp: Some(dhcp_handle) };
+    // The static lease + slirp gateway are applied AT BUILD (review fix): any first-touch —
+    // including a lazy ring-3 `sys_socket` on a boot where no launcher pre-built the stack — gets a
+    // configured, working interface with NO pump under the lock and nothing on the syscall stack.
+    // The DHCP acquisition that REPLACES this config runs only from `init()` (the large-stack boot
+    // path), chunked with lock releases — see `dhcp_acquire`.
+    apply_ipv4_config(
+        &mut stack,
+        Ipv4Cidr::new(Ipv4Address::new(our_ip[0], our_ip[1], our_ip[2], our_ip[3]), 24),
+        Ipv4Address::new(GATEWAY_IP[0], GATEWAY_IP[1], GATEWAY_IP[2], GATEWAY_IP[3]),
+    );
+    *guard = Some(stack);
     true
+}
+
+/// Apply an IPv4 address + default route to the persistent interface, replacing any prior config
+/// (the one config surface — `ensure_stack`'s static build config and `dhcp_acquire`'s lease both
+/// route through here).
+fn apply_ipv4_config(stack: &mut SmolStack, cidr: Ipv4Cidr, gw: Ipv4Address) {
+    stack.iface.update_ip_addrs(|addrs| {
+        addrs.clear();
+        let _ = addrs.push(IpCidr::Ipv4(cidr));
+    });
+    let _ = stack.iface.routes_mut().remove_default_ipv4_route();
+    let _ = stack.iface.routes_mut().add_default_ipv4_route(gw);
+}
+
+/// SOCK-5 (shaped by the review fix): run the interface's DHCPv4 client to a lease and apply it —
+/// **chunked**, releasing the `STACK` lock every `TCP_CHUNK` poll iterations (the same SOCK-2-review
+/// discipline the TCP connect pump follows) so a concurrent socket syscall on another CPU never spins
+/// on the lock for the whole acquisition, and never holding it for more than one chunk on this
+/// IF-masked CPU. One-shot (`DHCP_ATTEMPTED`) and called only from `init()` — the large-stack boot
+/// path; a lazy ring-3-first-touch `ensure_stack` never runs this (it applies the static config at
+/// build), so the acquisition can never land on a 16 KiB syscall stack. On a lease the static config
+/// is REPLACED (address + router, `apply_ipv4_config`); on a silent server (budget exhausted) the
+/// static fallback simply stands. Emits the SOCK-5 witness line exactly once either way.
+fn dhcp_acquire() {
+    if DHCP_ATTEMPTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let mut leased: Option<Ipv4Cidr> = None;
+    let mut router: Option<Ipv4Address> = None;
+    let mut spent = 0i64;
+    'acquire: while spent < DHCP_PUMP {
+        let mut g = STACK.lock();
+        let Some(stack) = g.as_mut() else { return };
+        let Some(dhcp_handle) = stack.dhcp else { return };
+        for _ in 0..TCP_CHUNK {
+            {
+                // Split-borrow so `iface.poll` gets `&mut dev` + `&mut sockets` disjointly (the DHCP
+                // socket egresses/ingresses through the ordinary interface poll, like any socket).
+                let SmolStack { iface, sockets, dev, .. } = stack;
+                let now = POLL_CLOCK.fetch_add(1, Ordering::Relaxed);
+                iface.poll(Instant::from_millis(now), dev, sockets);
+            }
+            spent += 1;
+            // The lease is delivered as a DHCP socket event; `address`/`router` are Copy, so extract
+            // them and leave the apply to the post-loop section (one config point, fresh lock).
+            match stack.sockets.get_mut::<dhcpv4::Socket>(dhcp_handle).poll() {
+                Some(dhcpv4::Event::Configured(cfg)) => {
+                    leased = Some(cfg.address);
+                    router = cfg.router;
+                    break 'acquire;
+                }
+                Some(dhcpv4::Event::Deconfigured) | None => {}
+            }
+            if spent >= DHCP_PUMP {
+                break;
+            }
+        }
+        // Release BETWEEN chunks (the TCP_CHUNK discipline) — the guard drops here, letting a
+        // concurrent socket syscall acquire `STACK` before the next chunk.
+        drop(g);
+    }
+
+    let mut g = STACK.lock();
+    let Some(stack) = g.as_mut() else { return };
+    if let Some(cidr) = leased {
+        let gw = router.unwrap_or(Ipv4Address::new(
+            GATEWAY_IP[0],
+            GATEWAY_IP[1],
+            GATEWAY_IP[2],
+            GATEWAY_IP[3],
+        ));
+        apply_ipv4_config(stack, cidr, gw);
+        let addr = cidr.address().octets();
+        serial_println!(
+            ":: SOCK-5: smoltcp dhcpv4 lease {}.{}.{}.{}/{} gw {} — witness OK ::",
+            addr[0], addr[1], addr[2], addr[3], cidr.prefix_len(),
+            e1000::fmt_ip(&gw.octets())
+        );
+    } else {
+        // The build-time static config stands untouched; report it honestly.
+        let (addr, plen) = match stack.iface.ip_addrs().first() {
+            Some(IpCidr::Ipv4(c)) => (c.address().octets(), c.prefix_len()),
+            _ => ([0, 0, 0, 0], 0),
+        };
+        serial_println!(
+            ":: SOCK-5: smoltcp dhcpv4 no offer — static fallback stands {}.{}.{}.{}/{} gw {} — witness INCOMPLETE ::",
+            addr[0], addr[1], addr[2], addr[3], plen,
+            e1000::fmt_ip(&GATEWAY_IP)
+        );
+    }
 }
 
 /// Drive `iters` poll iterations against the persistent interface (bounded, clock-free).
@@ -489,8 +597,16 @@ fn stack_pump(stack: &mut SmolStack, iters: i64) {
 /// shallow-chain context (the BSP main loop or a launcher task) BEFORE any ring-3 `sys_socket`, so the
 /// one-time ~4 KiB construction transient never lands on a ring-3 task's syscall stack. `false` if no NIC.
 pub fn init() -> bool {
-    let mut g = STACK.lock();
-    ensure_stack(&mut g)
+    let ok = {
+        let mut g = STACK.lock();
+        ensure_stack(&mut g)
+    };
+    if ok {
+        // SOCK-5 (review fix): the DHCP acquisition runs HERE — the large-stack boot path — one-shot,
+        // with the STACK lock released between bounded chunks. Never from ensure_stack.
+        dhcp_acquire();
+    }
+    ok
 }
 
 /// Allocate a UDP socket in the persistent set, owned by HANDLES row `owner`. Builds the
