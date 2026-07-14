@@ -265,7 +265,7 @@ Spec promotions committed here; the granular arc detail is in each arc's own ent
 
 ## hw-jetson track — 2026-07-14 (JD14 — `-f`/`-n` flag family for `cp`/`mv`/`rm`)
 
-### JD14 — `-f`/force + `-n`/no-clobber flags for `cp`/`mv`/`rm` (`shell.rs`-only, call-never-edit) 🔬 `hw-jetson`
+### JD14 — `-f`/force + `-n`/no-clobber flags for `cp`/`mv`/`rm` (`shell.rs`-only, call-never-edit) ✅ metal-confirmed 2026-07-14 `hw-jetson`
 - **Why:** the verb set closed at JD13, but the everyday POSIX ergonomics were missing — no way to overwrite a
   destination, and `rm NOSUCH` always complained. JD14 adds the flag family that completes it: `cp -f`/`mv -f`
   overwrite, `rm -f`/`rm -rf` delete quietly, `-n` makes the no-clobber default explicit.
@@ -286,17 +286,18 @@ Spec promotions committed here; the granular arc detail is in each arc's own ent
   UNCHANGED from JD11–JD13 (the flag strings carry no `tegra:` token; validate by count, not size). Zero x86
   behavioural change. No `kernel8-test` on the jetson side. Lane: only `shell.rs`
   (fat.rs/console.rs/main.rs/NET arms/unafs verbs untouched).
-- **Metal:** ⏳ **ATTENDED-PENDING** — the interactive path only runs on silicon. Bench card
-  [`jd14-bench.md`](../unaos/scripts/jd14-bench.md): confirm the no-clobber default (`cp A B`/`mv A B` onto an
-  existing B is `-EEXIST`), `-f` overwrite for both, `mv -f` onto a directory refused, `rm -f NOSUCH` /
-  `rm -rf NOSUCH*` quiet, `rm -rf DIR` (bundled flags) removing a tree, `rm -rf /` still `-EBUSY`, with a
-  power-cycle for durability. Pairs with the JD13 bench in one attended session.
+- **Metal:** ✅ **METAL-CONFIRMED 2026-07-14** (attended Orin bench, one card session with JD13; kernel
+  `57ae4b2`, serial `jetson-serial-2026-07-14-101517.log`, 5 clean boots / 0 heals). All card sections
+  passed: no-clobber default, `-f` overwrite both verbs, `mv -f` dir-dest refused, quiet `rm -f`/`-rf` on
+  missing/no-match, bundled `rm -rf DIR`, `rm -rf /` `-EBUSY`, forced-overwrite durable across a real
+  power-cycle. Bench-corrected: the card's §4 `cp -rf` criterion was wrong — the fresh-tree `-EEXIST` fires
+  on the COMPUTED target (`823b5ba`); silicon confirmed both the copy-INTO nest and the second-run refusal.
 - **Detail:** [`arch_arm64.md` §JD14](dev/OS/01_BOOT_HAL/arch_arm64.md). **Commit:** on `hw-jetson` (the seat
   assigns the integration hash at merge).
 
 ## hw-jetson track — 2026-07-14 (JD13 — recursive `rm -r` on the panel shell)
 
-### JD13 — recursive `rm -r <dir>` (`shell.rs`-only, call-never-edit) 🔬 `hw-jetson`
+### JD13 — recursive `rm -r <dir>` (`shell.rs`-only, call-never-edit) ✅ metal-confirmed 2026-07-14 `hw-jetson`
 - **Why:** the create/copy/move/delete quadrant had a gap — `rm` was file-only (a directory was `-EISDIR`) and
   `rmdir` removes only an EMPTY directory, so there was no one-command way to delete a subtree. JD13 closes the
   destructive side (`rm -r DOCS`) and multiplies with the JD12 glob (`rm -r OLD*/`). It is the delete twin of
@@ -321,11 +322,12 @@ Spec promotions committed here; the granular arc detail is in each arc's own ent
   UNCHANGED from JD11/JD12 (the `rm -r` strings carry no `tegra:` token; validate by count, not size). Zero x86
   behavioural change. No `kernel8-test` on the jetson side. Lane: only `shell.rs` (fat.rs/console.rs/main.rs/NET
   arms untouched).
-- **Metal:** ⏳ **ATTENDED-PENDING** — the interactive path only runs on silicon. Bench card
-  [`jd13-bench.md`](../unaos/scripts/jd13-bench.md): build a small nested tree, `rm -r` it and confirm it is
-  gone (summary counts every dir/file), then the guards (`rm DIR` no-`-r` → `-EISDIR`, `rm -r /` → `-EBUSY`,
-  `rm -r NOSUCH` → `-ENOENT`, `rm -r FILE` → plain delete) and a glob form (`rm -r OLD*/`), with a power-cycle +
-  a re-created same-named tree to prove the freed clusters were genuinely reused.
+- **Metal:** ✅ **METAL-CONFIRMED 2026-07-14** (attended Orin bench, one card session with JD14; kernel
+  `57ae4b2`, serial `jetson-serial-2026-07-14-101517.log`, 1059 KEY / 149 OUT, 5 clean boots / 0 heals /
+  0 fatals, CAPSTONE all-6 every boot). Full card: the tree removed with honest counts, every guard fired
+  (`-EISDIR`/`-EBUSY`/`-ENOENT`/file-degrade), the glob form cleared several trees, and the power-cycle +
+  same-named re-create capstone proved the freed clusters were genuinely released and reused (fresh bytes
+  read back, not the deleted tree's).
 - **Detail:** [`arch_arm64.md` §JD13](dev/OS/01_BOOT_HAL/arch_arm64.md). **Commit:** on `hw-jetson` (the seat
   assigns the integration hash at merge).
 

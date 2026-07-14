@@ -2538,14 +2538,14 @@ and tegra never runs in QEMU), so the shell-level verdict is **attended-pending*
 `rm -r` composes are already exercised headless by the U10/U11 write/delete fixtures and FATDIRS's own
 `fatdirs_check` selftest.
 
-**Metal verdict — ⏳ ATTENDED-PENDING.** The interactive path can only be exercised on silicon. Bench card
-[`jd13-bench.md`](../../../../unaos/scripts/jd13-bench.md): build a small tree (`mkdir` + `write` a few files
-and a nested subdir), `rm -r` it and confirm the whole tree is gone (`ls` shows nothing left, the summary
-counts every dir/file), then the guards — `rm DIR` without `-r` is `-EISDIR`, `rm -r /` is `-EBUSY`,
-`rm -r NOSUCH` is `-ENOENT`, `rm -r FILE` degrades to a plain delete — and a glob form (`rm -r OLD*/`) removing
-several trees at once, with a power-cycle to confirm the deletions are durable (a re-created same-named tree
-after the cycle proves the clusters were genuinely freed and reused). ⚠ Verify the serial bridge captures a
-full boot BEFORE burning bench time (§JB1f) — with JD11 the transcript is the primary output-evidence channel.
+**Metal verdict — ✅ METAL-CONFIRMED (2026-07-14 attended Orin bench, one card session with JD14; kernel =
+`hw-jetson` tip `57ae4b2`, 109 `tegra:` strings; serial `~/unaos-bench/jetson-serial-2026-07-14-101517.log`,
+1059 KEY / 149 OUT lines, 5 clean boots, 0 heals / 0 fatals / 0 BOT-timeouts, erratum-1941500 bit8=0 +
+CAPSTONE all-6 every boot).** All bench-card sections passed: the tree built, `rm -r` removed it with an
+honest summary; every guard fired (`rm DIR` no-`-r` → `-EISDIR`, `rm -r /` → `-EBUSY`, `rm -r NOSUCH` →
+`-ENOENT`, `rm -r FILE` → plain delete); the glob form removed several trees; and the power-cycle capstone
+held — a re-created same-named tree read back fresh content (`cat` returned the new bytes, not the deleted
+tree's), proving the freed clusters were genuinely released and reused across a real power cut.
 
 ### JD14 — the `-f`/force + `-n`/no-clobber flag family for `cp`/`mv`/`rm`
 
@@ -2611,12 +2611,15 @@ the pre-existing `shutdown` double-`hlt_loop`); `./arroyo test-arm 22` → `MISS
 no `tegra:` token; validate media by count, not size). Zero x86 behavioural change. As in JD2–JD13 the shell
 command path is not headless-reachable in-lane, so the shell-level verdict is **attended-pending**.
 
-**Metal verdict — ⏳ ATTENDED-PENDING.** Bench card [`jd14-bench.md`](../../../../unaos/scripts/jd14-bench.md):
-confirm the no-clobber default (`cp A B` / `mv A B` onto an existing B is `-EEXIST`), `-f` overwrite for both,
-`mv -f` onto a directory refused, `rm -f NOSUCH` / `rm -rf NOSUCH*` quiet, `rm -rf DIR` (bundled flags) removing
-a tree, and `rm -rf /` still `-EBUSY`, with a power-cycle to confirm the overwrites/deletes are durable. Pairs
-with the JD13 bench in one attended Orin session. ⚠ Verify the serial bridge captures a full boot BEFORE
-burning bench time (§JB1f) — with JD11 the transcript is the primary output-evidence channel.
+**Metal verdict — ✅ METAL-CONFIRMED (2026-07-14 attended Orin bench, same card session as JD13; evidence
+line above in §JD13).** All bench-card sections passed: no-clobber default (`cp`/`mv` onto an existing file
+`-EEXIST`), `-f` overwrite for both, `mv -f` onto a directory refused, `rm -f NOSUCH`/`rm -rf NOSUCH*` quiet,
+bundled `rm -rf DIR` removed a tree, `rm -rf /` stayed `-EBUSY`, and a forced `cp -f` overwrite survived a
+real power-cycle (boot-2 `cat` read the overwritten bytes). Two bench findings folded: (1) `cp -r`'s
+fresh-tree `-EEXIST` fires on the COMPUTED target (`cp -r SRC EXISTING_DIR` correctly takes the JD9
+copy-INTO idiom; the refusal needs `EXISTING_DIR/SRC` to pre-exist — confirmed both ways on silicon; the
+bench card's original §4 criterion was wrong and is corrected in-repo, `823b5ba`); (2) `mv -f` in the same
+directory prints `renamed` not `moved` — correct JD10 wording (same-parent = `rename_entry`).
 
 ### JB1f — the unhealed early-vector window (the round-6 boot crash), closed (`85f74f8`)
 
