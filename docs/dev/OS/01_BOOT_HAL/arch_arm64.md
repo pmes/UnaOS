@@ -2847,6 +2847,71 @@ completion on the same kernel. A silent hang is a FAIL — screen state + serial
 > this binary, and per-binary layout luck (a strike site landing in the window) is the documented variance —
 > none landed here. The bridge survived every board power-cycle without re-enumerating (no re-run needed).
 
+### JD16 — `ls -l`: long listing with REAL FAT timestamps
+
+JD1–JD15 kept `fat.rs` **call-never-edit** for the shell verbs. JD16 is the first arc to touch it, and the
+edit is deliberately narrow: a **read-side-only** addition to the parsed directory entry. The `-f`/`-n` flag
+family and the file/dir verbs never needed a timestamp; `ls -l` does, and FAT already carries one in every
+short directory entry — JD16 simply surfaces it.
+
+**The `fat.rs` read-side grant (bounded).** `DirEntry` gains two fields, `mtime_time` and `mtime_date`, filled
+by `classify_dir_slot` from the standard FAT short-entry offsets **0x16 (last-write time)** and **0x18
+(last-write date)** — the same 32-byte slot the existing walkers already parse, so there is **zero extra I/O**
+and every pre-JD16 caller is byte-identical (the two new fields are simply ignored by code that does not read
+them). Nothing else in `fat.rs` changes: no write primitive, no entry-layout serialization, no lock. This is
+strictly the DirEntry struct + parse path, so the concurrent x86 write-side arc (STOR-S8) reconciles cleanly.
+Creation time (0x0E/0x10) is intentionally **not** read — mtime is what `ls -l` shows, and a second timestamp
+would only widen the reconciliation surface.
+
+**The FAT timestamp format — documented honestly.** FAT packs the moment into two 16-bit words:
+
+| word | offset | bit layout |
+|---|---|---|
+| DATE | 0x18 | bits 15..9 = `year − 1980`, bits 8..5 = month (1..12), bits 4..0 = day (1..31) |
+| TIME | 0x16 | bits 15..11 = hour (0..23), bits 10..5 = minute (0..59), bits 4..0 = **seconds/2** |
+
+Consequences, stated plainly: the **epoch is 1980-01-01**; the resolution is **2 seconds** (the low bit of
+real seconds is unrepresentable); and there is **no timezone** — the on-disk value is wall-clock local time as
+whatever tool wrote it saw, with no stored UTC offset, so `DirEntry::mtime()` presents the packed fields
+verbatim (a new `FatTimestamp { year, month, day, hour, min, sec }`). An **all-zero pair** decodes to the
+`is_zero()` sentinel (month/day 0) — a value a real stamp never produces — so the display renders it honestly
+rather than as a bogus 1980 date.
+
+**The shell (`shell.rs` FAT-verb region).** The `ls` arm parses an `-l`/`-L` flag (the JD14 convention: a
+`-`+letters arg is a flag and is filtered out of the positional path, so a file literally named `-l` is still
+reachable as `./-l`; unknown flag letters are ignored). Plain `ls` is **unchanged** — byte-identical short
+table. `ls -l` adds the FAT last-write timestamp column between size and name (a directory shows `<DIR>` and a
+trailing `/` marker):
+
+```
+ls -l
+       42  2026-07-14 11:37:22  README.TXT
+    <DIR>        2026-07-14 11:38:04  DOCS/
+       17         -            K4TEST.TXT
+2 file(s), 1 dir(s)
+```
+
+`fmt_mtime` renders a zeroed stamp as a dashed placeholder of the same width — the honest display for entries
+a host tool wrote with a 0 field, **and for every kernel-written entry** (see below). The long format threads
+through the same `print_dir_listing` used by both the single-path `ls` and the JD12 wildcard `ls *.EXT`, so
+`ls -l *.TXT` gets the timestamp column too.
+
+**What a KERNEL-written file's timestamp actually contains — observed, not invented.** The kernel has **no
+RTC**. The `fat.rs` create path (`create_in_root`/`create_in_dir`) zeroes the entire 32-byte entry except
+name/attr/first_cluster/size — so the time and date words are written as **0**, and the JD5/JD6 write/append
+paths only republish size + chain-head (a U10 read-modify-write), never the timestamp. Therefore **a file the
+OS itself creates or writes carries an all-zero mtime**, which `ls -l` renders as the dashed placeholder. That
+is the correct, honest verdict for this arc: the OS does not fabricate a clock reading. Files written on the
+host (by `mkfs`/copy tools) carry whatever real timestamp that host stamped, and those show through faithfully.
+**A real on-write clock (RTC read on Pi/Jetson, or a monotonic-since-boot stamp) is a named FUTURE arc**, not
+JD16 — JD16's contract is to display truthfully whatever the on-disk field holds.
+
+**Gate (QEMU):** `./arroyo check` + `UNAOS_TEGRA=1 ./arroyo check` green both arches (no new warnings beyond
+the pre-existing set); `./arroyo test-arm 22` → `MISSION SUCCESS`; `./arroyo kernel8-test` → **40 PASS / 0
+FAIL** (this battery protects `fat.rs`, shared with the Pi image); `./arroyo test 25` → `MISSION SUCCESS`
+(x86, `fat.rs` shared there too). As in JD2–JD15 the shell command path is not headless-reachable in-lane, so
+the shell-level `ls -l` verdict is **attended-pending** (bench card `unaos/scripts/jd16-bench.md`).
+
 ## 4. Jetson Orin Nano headless bring-up (Arc JM2)
 
 The Orin is brought up **headless over serial**. The only console that has ever
