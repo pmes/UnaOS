@@ -33,7 +33,7 @@
 //  * ARP MAC surfacing: smoltcp hides the resolved neighbor MAC, so the Device snoops inbound ARP
 //    replies for the target IP (via `net::arp::learn`, a read-only reuse) into `snoop`.
 
-use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicUsize, Ordering};
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
@@ -385,6 +385,12 @@ const RECV_PUMP: i64 = 400_000;
 /// SYN-ACK has not landed yet so a ring-3 poll loop can re-drive it. `recv`/`send` reuse the UDP
 /// budgets' spirit. Every TCP pump releases the `STACK` lock BETWEEN chunks (see `tcp_pump_chunked`).
 const CONNECT_PUMP: i64 = 400_000;
+/// SOCK-6: bounded poll budget for one `stack_accept` call. Smaller than `CONNECT_PUMP` because accept
+/// is a POLL for an inbound handshake whose arrival time the guest does not control — a ring-3 caller (or
+/// the witness) re-drives `sys_accept` repeatedly, so each call need only be long enough to catch a
+/// handshake already in flight, not to wait out a silent peer. Kept modest so the perpetual-listen
+/// witness pumps cheaply every `service_net` pass while awaiting the injector.
+const ACCEPT_PUMP: i64 = 40_000;
 /// The chunk size a lock-released TCP pump advances before dropping + re-acquiring `STACK` — short
 /// enough that a concurrent socket syscall on another CPU never spins on `STACK.lock()` for a full pump.
 const TCP_CHUNK: i64 = 4_000;
@@ -868,6 +874,19 @@ pub enum RecvOutcome {
     Eof,
 }
 
+/// SOCK-6: the outcome of a bounded `stack_accept` pump.
+pub enum AcceptOutcome {
+    /// A peer completed the 3-way handshake — the listening socket is now ESTABLISHED and carries the
+    /// accepted connection IN PLACE (same `sid` + buffers). Ring 3 mints a fresh `KIND_SOCKET` handle
+    /// for it (an alias of the same gen-fenced socket-id) and streams on it with `send`/`sock_recv`.
+    Connected,
+    /// No inbound connection yet — still LISTENING at budget exhaustion (ring 3: `-EAGAIN`, re-drive accept).
+    Pending,
+    /// The socket is not armed for listen (never listened / already connected+closed / gone / wrong-kind).
+    /// Ring 3: `-EINVAL`.
+    NotListening,
+}
+
 /// Allocate a TCP socket in the persistent set, owned by HANDLES row `owner`. Builds the socket from
 /// the free slot's STATIC stream buffers (`TCP_RX_DATA`/`TCP_TX_DATA[sid]`) and records the handle
 /// kind-tagged `Tcp`. Returns the socket-id (the `reg` index) or `None` if all slots are in use / no NIC.
@@ -1039,6 +1058,57 @@ pub fn stack_recv(sid: usize, out: &mut [u8]) -> RecvOutcome {
         .unwrap_or(RecvOutcome::WouldBlock)
 }
 
+// =============================================================================
+// SOCK-6 (ROADMAP §1b): TCP SERVER / LISTEN sockets over the SAME persistent stack.
+//
+// A ring-3 process turns a TCP socket into a passive server with two syscalls:
+//   * `sys_listen(handle, port)` -> `stack_listen`: arm the socket as a LISTENER on a local port
+//     (smoltcp `tcp::Socket::listen`). Passive — no pump; the accept pump drives the inbound handshake.
+//   * `sys_accept(handle)` -> `stack_accept`: NON-BLOCKING poll for an inbound connection. When a peer
+//     completes the 3-way handshake the listening smoltcp socket transitions to ESTABLISHED IN PLACE
+//     (smoltcp's listen->established model: the listener socket BECOMES the connection — it does not
+//     spawn a child), so the accepted connection rides `sid`'s existing socket + stream buffers. The
+//     syscall then mints a FRESH `KIND_SOCKET` handle aliasing the same gen-fenced socket-id for the
+//     caller to stream on (`send`/`sock_recv`) and eventually `close`. This is a single-accept-per-listen
+//     model: to accept another connection, open + listen a fresh socket. It composes with SOCK-4 — the
+//     fresh connection cap can be `SYS_XFER`'d to a handler (inetd-style hand-off).
+//
+// Every accept pump releases the `STACK` lock between chunks (`tcp_pump_chunked`), the SOCK-2-review
+// fold, so a concurrent socket syscall on another CPU never spins on `STACK.lock()` for a whole pump.
+// =============================================================================
+
+/// SOCK-6: arm TCP socket `sid` as a passive LISTENER on local `port`. `Ok(())`, or `Err(())` (unknown
+/// sid / wrong-kind / port 0 / smoltcp refuses — the socket is already open). No pump: listening is
+/// passive descriptor state (the accept pump drives the inbound handshake), so this is IF-masked-safe.
+pub fn stack_listen(sid: usize, port: u16) -> Result<(), ()> {
+    if port == 0 {
+        return Err(());
+    }
+    let mut g = STACK.lock();
+    let stack = g.as_mut().ok_or(())?;
+    let handle = tcp_handle(stack, sid).ok_or(())?;
+    stack.sockets.get_mut::<tcp::Socket>(handle).listen(port).map_err(|_| ())
+}
+
+/// SOCK-6: non-blocking ACCEPT on listening socket `sid`. Pumps a bounded loop (lock released between
+/// chunks) driving the inbound handshake, then reports `Connected` once a peer has completed it (the
+/// socket is ESTABLISHED — the accepted connection rides `sid`'s existing socket + buffers in place),
+/// `Pending` if none arrived within the budget (ring 3 re-drives `sys_accept`), or `NotListening` if the
+/// socket is not armed for listen / vanished / wrong-kind. NEVER blocks.
+pub fn stack_accept(sid: usize) -> AcceptOutcome {
+    tcp_pump_chunked(sid, ACCEPT_PUMP, AcceptOutcome::NotListening, |sock| {
+        match sock.state() {
+            // Still waiting for a SYN, or mid-handshake (SYN received, ACK pending) — keep pumping.
+            tcp::State::Listen | tcp::State::SynReceived => None,
+            // Never armed / listener closed without connecting — not an accept-able socket.
+            tcp::State::Closed => Some(AcceptOutcome::NotListening),
+            // Established (or already past it) — a peer connected; the socket now carries the connection.
+            _ => Some(AcceptOutcome::Connected),
+        }
+    })
+    .unwrap_or(AcceptOutcome::Pending) // budget exhausted still LISTENING -> caller re-drives
+}
+
 // --- the boot UDP round-trip witness (M1), driven one-shot from service_net knob-on ---
 
 /// True once the SOCK-2 witness has run (one-shot).
@@ -1181,4 +1251,118 @@ fn tcp_dns_roundtrip() -> (bool, usize) {
     };
     stack_close(sid);
     (true, n)
+}
+
+// --- the TCP SERVER witness (SOCK-6 M2), driven STATEFUL from service_net knob-on ---
+//
+// Unlike SOCK-1..3/5 (one-shot, guest-INITIATED round-trips hermetic under slirp), a server witness
+// needs a peer to connect INTO the guest — which slirp's NAT will not do. The witness therefore ARMS a
+// listener and stays LISTENING across service_net passes, awaiting `scripts/net-inject.py`'s gateway-side
+// active-open under `UNAOS_NET=socket`. Under the default (hermetic) slirp backend no peer ever connects,
+// so it prints the honest `witness PENDING` note once and keeps listening cheaply (light per-pass pump) —
+// the mission stays green; the `witness OK` line is emitted only when a real inbound connection is
+// accepted + echoed (the injector run). This is the "honest OK/INCOMPLETE" discipline SOCK-2/5 use.
+
+/// SOCK-6 listen port for the server witness (avoids the hand-rolled stack's ports: 7 echo, 7777/7778
+/// self-test, 9998/9999 UDP, 53 DNS). `net-inject.py` active-opens here.
+pub const SOCK6_LISTEN_PORT: u16 = 8080;
+/// Witness state: 0 = idle (arm the listener), 1 = listening (poll accept), 2 = serving (connected —
+/// awaiting the peer's probe), 3 = done (connection served + echoed).
+static WITNESS6_STATE: AtomicU32 = AtomicU32::new(0);
+/// service_net call counter — settle past SOCK-3's witness before arming.
+static WITNESS6_TICKS: AtomicU32 = AtomicU32::new(0);
+/// The listening socket-id, stored between passes (the socket lives in the persistent set, owned by the
+/// kernel `usize::MAX` row so no ring-3 teardown frees it). `usize::MAX` = none armed yet.
+static WITNESS6_SID: AtomicUsize = AtomicUsize::new(usize::MAX);
+/// The one-shot PENDING note prints exactly once even though the listener may RE-ARM across a
+/// frame-stealing-lost attempt (the two RX drains — hand-rolled `poll()` and the smolnet pump — race
+/// for inbound frames; a lost handshake/probe just re-arms and retries rather than latching INCOMPLETE).
+static WITNESS6_PENDING_SHOWN: AtomicBool = AtomicBool::new(false);
+/// Warm up past SOCK-3's witness (WARMUP 40) so the boot self-test + the ICMP/UDP/TCP witnesses settle.
+const WITNESS6_WARMUP: u32 = 56;
+
+/// SOCK-6 server witness (M2), STATEFUL across `service_net` passes: arm a TCP LISTENER on
+/// `SOCK6_LISTEN_PORT`, then each pass poll `accept`; when a peer connects, receive its probe, echo it
+/// back, close, and emit the UNCOUNTED `witness OK` line. Proves the listen/accept seam carries a real
+/// inbound connection end to end. Runs on the BSP main loop AFTER the NET_DEVICE guard drops (the pumps
+/// re-lock NET_DEVICE per ring op). No-op once served / no NIC. The ring-3 `sys_listen`/`sys_accept`
+/// syscalls wrap this exact seam.
+pub fn witness_tick6() {
+    let state = WITNESS6_STATE.load(Ordering::Relaxed);
+    if state == 3 {
+        return; // a connection was already accepted, its probe echoed, and the witness latched
+    }
+    if WITNESS6_TICKS.fetch_add(1, Ordering::Relaxed) < WITNESS6_WARMUP {
+        return;
+    }
+    if e1000::hw_addr().is_none() {
+        return;
+    }
+
+    if state == 0 {
+        // Arm the listener. Kernel ownership (`usize::MAX`) — never a ring-3 slot, so
+        // `free_row_sockets` for a real task never frees it; it is closed explicitly below.
+        let Some(sid) = stack_open_tcp(usize::MAX) else {
+            return; // no free slot / no NIC yet — retry next pass
+        };
+        if stack_listen(sid, SOCK6_LISTEN_PORT).is_err() {
+            stack_close(sid);
+            return;
+        }
+        WITNESS6_SID.store(sid, Ordering::Relaxed);
+        WITNESS6_STATE.store(1, Ordering::Relaxed);
+        // Announce the armed listener exactly once (re-arms after a lost attempt stay quiet).
+        if !WITNESS6_PENDING_SHOWN.swap(true, Ordering::Relaxed) {
+            serial_println!(
+                ":: SOCK-6: smoltcp tcp listen :{} armed — awaiting inbound connect (UNAOS_NET=socket injector) — witness PENDING ::",
+                SOCK6_LISTEN_PORT
+            );
+        }
+        return;
+    }
+
+    let sid = WITNESS6_SID.load(Ordering::Relaxed);
+
+    if state == 1 {
+        // Listening — poll accept (a light bounded pump per pass; the injector re-drives).
+        match stack_accept(sid) {
+            AcceptOutcome::Connected => {
+                // A peer completed the handshake — advance to SERVING (await its probe). Do NOT recv
+                // here: the probe may not have landed yet, so serving gets its own patient passes.
+                WITNESS6_STATE.store(2, Ordering::Relaxed);
+            }
+            AcceptOutcome::Pending => { /* still listening — poll again next pass */ }
+            AcceptOutcome::NotListening => {
+                // The listener vanished / never armed — re-arm on the next pass.
+                stack_close(sid);
+                WITNESS6_SID.store(usize::MAX, Ordering::Relaxed);
+                WITNESS6_STATE.store(0, Ordering::Relaxed);
+            }
+        }
+        return;
+    }
+
+    // State 2: serving — the connection is ESTABLISHED; wait (across passes) for the peer's probe,
+    // echo it, and latch OK. A clean EOF before any probe means the peer closed early — re-arm.
+    let mut buf = [0u8; 64];
+    match stack_recv(sid, &mut buf) {
+        RecvOutcome::Data(n) => {
+            let sent = stack_send(sid, &buf[..n]).unwrap_or(0);
+            stack_close(sid);
+            WITNESS6_STATE.store(3, Ordering::Relaxed);
+            serial_println!(
+                ":: SOCK-6: smoltcp tcp accept :{} — received {} bytes, echoed {} back — witness {} ::",
+                SOCK6_LISTEN_PORT, n, sent,
+                if sent == n { "OK" } else { "INCOMPLETE" }
+            );
+        }
+        RecvOutcome::WouldBlock => { /* connected, no probe yet — retry recv next pass */ }
+        RecvOutcome::Eof => {
+            // The peer closed before sending a probe (a lost/aborted attempt) — re-arm and let the
+            // injector retry, rather than latch a false INCOMPLETE.
+            stack_close(sid);
+            WITNESS6_SID.store(usize::MAX, Ordering::Relaxed);
+            WITNESS6_STATE.store(0, Ordering::Relaxed);
+        }
+    }
 }

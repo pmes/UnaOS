@@ -1200,6 +1200,11 @@ pub fn service_net() {
     // post-guard discipline — its connect/recv pumps short-lock NET_DEVICE per ring op.
     #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
     crate::smolnet::witness_tick3();
+    // SOCK-6 (knob-on): the smoltcp TCP SERVER witness — STATEFUL (arms a listener, then polls accept
+    // across passes). Awaits an inbound connect from scripts/net-inject.py under UNAOS_NET=socket;
+    // hermetic slirp never connects in, so it prints an honest PENDING note and keeps listening cheaply.
+    #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+    crate::smolnet::witness_tick6();
 }
 
 /// Outcome of a blocking [`ping`] (rendered by the `ping` shell command).
