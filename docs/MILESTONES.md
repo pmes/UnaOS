@@ -937,6 +937,40 @@ Spec promotions committed here; the granular arc detail is in each arc's own ent
 - **Detail:** [`SECURITY.md` §K1 (K4-ready bullet)](SECURITY.md). **Commit:** `34cdb94` (`hw-pi4`); docs in
   the follow-on.
 
+## hw-pi4 track — 2026-07-14 (K5 — the two ledgered UnaFS-ATR persistence races CLOSED)
+
+### K5 — revoke/re-persist SMP-window (M1) + `atr_ensure` first-create race (M2) 🔬 `hw-pi4`
+- **Why:** K3's 3-lens review ledgered two open UnaFS-ATR persistence races. (M1) A concurrent full-row
+  re-persist (`atr_persist_grow` from a writer core, or a second owner-incarnation grant) that snapshotted
+  OWNED_FILES between a two-phase revoke's disk-narrow and its in-RAM commit could write the still-present
+  grant back to disk — RESURRECTING the revoked grantee at the next mount (a fail-OPEN in the SMP direction).
+  (M2) `atr_ensure`'s first-CREATE of `UNAFS.ATR` was not `ns`-serialized (the F3 span rule forbids `ns`
+  across a multi-cluster grow) — a benign-latent SMP double-create race. Both untriggered today (single EL0
+  core) but closable ahead of SMP EL0; both `arch/aarch64/syscall.rs`-only, zero x86.
+- **What (M1 — the lock-span):** the two-phase revoke (`sys_fgrant_revoke_2phase`) now holds `ns` across
+  snapshot→disk-narrow→in-RAM-commit (one span), and every full-row re-persister (`atr_persist_grants`,
+  `atr_persist_grow`) takes its OWNED_FILES snapshot UNDER that same `ns` — gated on a light NAMED-owner
+  probe first, so the anonymous battery path takes NO `ns` and does ZERO disk I/O (byte-identical). The disk
+  half was extracted to `atr_write_grant_row_locked` (ns-assumed). **Lock-legality:** NAMESPACE is the legal
+  spanning lock — `NAMESPACE ⊃ OWNED_FILES` is respected (the OWNED_FILES helpers take-and-release WITHIN,
+  so no inner lock is held when `ns` is taken → deadlock-free), and the disk op is the single-sector M1
+  `write_at` seam (NOT a grow), so the F3 ns-latency rule holds. The re-persisters and the revoke then
+  serialize globally; no stale snapshot can land after a disk-narrow.
+- **What (M2 — the create gate):** a dedicated lock-free CAS gate (`ATR_CREATING`) serializes the
+  create-if-absent DECISION and double-checks under the gate, WITHOUT holding a lock across the grow (winner
+  grows; a contender BAILS its persist rather than spins) — F3-safe. A read-only fast path means steady-state
+  persists never contend the gate. **Honest residual:** a persist that loses the CAS is deferred this pass —
+  never double-creates, degradation always toward fail-safe (not-yet-persisted).
+- **Tested (QEMU):** `check` both arches (x86 unchanged); `kernel8-test` = **23 PASS + CAPSTONE 6 / 0 FAIL
+  byte-equivalent** + all prior witnesses (K1-atr/persist/corrupt/K2-liveenf/K3-revoke/IMG-SIG/K4-ready +
+  F3 locked 240000/240000) intact + the new uncounted `:: K5-lockspan: … PASS [w=0x3f] ::` (6 assertions:
+  reproduces the OLD resurrection at the decomposed-primitive level — the window is REAL — then shows the
+  production revoke + re-persist stays narrowed across reboot, the kept grant survives, the create gate is
+  not leaked), zero R1/CMD13; `test-arm` MISSION SUCCESS. Deterministic single-core; the full cross-core
+  timing race is metal-latent (like the F3 witness).
+- **Detail:** [`SECURITY.md` §K1 (K5 bullet)](SECURITY.md). **Commit:** `unafs(aarch64): K5 —
+  lock-span the revoke/re-persist window + serialize the ATR first-create` (`hw-pi4`).
+
 ## hw-pi4 track — 2026-07-12 (FATMOVE — the fat.rs rename/move seam: `rename_entry` / `move_entry`)
 
 ### FATMOVE — `rename_entry` / `move_entry`: additive, lock-correct FAT rename + cross-directory move 🔬 `hw-pi4`

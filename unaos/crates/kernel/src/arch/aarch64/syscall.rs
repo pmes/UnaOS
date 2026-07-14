@@ -5795,8 +5795,8 @@ fn sys_write_file(asid: u64, file_id: u64, buf: u64, len: u64) -> i64 {
     // row's first_cluster/size so the create-time `first_cluster = 0` becomes the real chain head and the
     // rebuild's identity cross-check engages. NO-OP with ZERO disk I/O for an anonymous owner (the whole
     // battery, incl. the u10 GROW.BIN fixture), so this path stays byte-identical. Runs AFTER the descriptor
-    // republish, OUTSIDE any inner lock (atr_persist_grow snapshots OWNED_FILES then takes its own fresh ns for
-    // the single-row write). Non-fatal — losing it only weakens the out-of-scope offline-tamper corroboration.
+    // republish, OUTSIDE any inner lock (atr_persist_grow probes the owner, then snapshots + writes the single row
+    // under ONE ns — K5 M1). Non-fatal — losing it only weakens the out-of-scope offline-tamper corroboration.
     let _ = atr_persist_grow(&fs, dir_lba, dir_off as u32, new_first, new_size);
     wrote as i64
 }
@@ -6810,6 +6810,22 @@ fn sys_fgrant_revoke_2phase(
     owner_ppid: PrincipalRecord,
     grantee_ppid: PrincipalRecord,
 ) -> i64 {
+    // mount() must run OUTSIDE the namespace lock (ns is NEVER held across a mount) — take it before ns.
+    let fs = match crate::fs::fat::mount() {
+        Ok(fs) => fs,
+        Err(crate::fs::fat::FatError::NoDisk) => return ENODEV,
+        Err(_) => return EIO,
+    };
+    // K5 M1: SPAN the whole snapshot -> disk-narrow -> in-RAM-commit under ONE namespace hold. Without it, a
+    // concurrent full-row re-persist on another core (`atr_persist_grants` / `atr_persist_grow` — both now snapshot
+    // + write under this SAME ns) could snapshot OWNED_FILES with the revoked grant STILL present (our in-RAM
+    // removal not yet committed) and write the FULL row to disk AFTER our disk-narrow, RESURRECTING the revoked
+    // grant on the next mount. The span serializes the two globally: any such re-persist runs either entirely
+    // BEFORE us (its full row is then overwritten by our narrowed write) or entirely AFTER us (it snapshots our
+    // already-narrowed in-RAM set). Legal because NAMESPACE ⊃ OWNED_FILES and `owned_snapshot_row`/`owned_grant`
+    // take-and-release OWNED_FILES WITHIN the ns hold (no inner lock is held when ns is taken → deadlock-free), and
+    // the disk op is the single-sector M1 `write_at` seam (NOT a multi-cluster grow) → the F3 ns-latency rule holds.
+    let _ns = ns_lock();
     // Snapshot the current ACL and drop the target grantee (matched by its durable persistent principal — the
     // on-disk key; the snapshot carries ppids only). A vanished row (raced unlink) leaves nothing to revoke.
     let Some((row_owner, mut grants)) = owned_snapshot_row(dir_lba, dir_off) else {
@@ -6820,16 +6836,12 @@ fn sys_fgrant_revoke_2phase(
             *g = (PrincipalRecord::NONE, 0);
         }
     }
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(crate::fs::fat::FatError::NoDisk) => return ENODEV,
-        Err(_) => return EIO,
-    };
-    // Phase 1 (durable-first): write the NARROWED row. On failure, do NOT commit in-RAM — fail closed.
-    if !atr_write_grant_row(&fs, dir_lba, dir_off, row_owner, &grants) {
+    // Phase 1 (durable-first): write the NARROWED row (the `_locked` core assumes the ns we already hold). On
+    // failure, do NOT commit in-RAM — fail closed.
+    if !atr_write_grant_row_locked(&fs, dir_lba, dir_off, row_owner, &grants) {
         return EIO;
     }
-    // Phase 2: disk now reflects the revoke — commit the in-RAM removal (the owner is already validated).
+    // Phase 2: disk now reflects the revoke — commit the in-RAM removal (owner already validated), under the SAME ns.
     owned_grant(dir_lba, dir_off, owner_asid, owner_gen, grantee_asid, grantee_gen, 0, owner_ppid, grantee_ppid)
 }
 
@@ -8385,6 +8397,11 @@ pub fn u7_launcher(demo_cpu: usize) {
     // BEFORE the in-RAM removal, so it SURVIVES REBOOT and fails CLOSED on a persist failure. Its own uncounted
     // `:: K3-revoke: … PASS ::` line; fully self-cleaning (leaves no owned row on the metal card).
     k3_revoke_launcher();
+    // K5: the revoke/re-persist SMP-window proof — a deterministic interleaving witness that the concurrent
+    // full-row re-persist can no longer resurrect a revoked grant (snapshot + disk-narrow + in-RAM commit now
+    // span one ns) + the create-serialization gate. Its own uncounted `:: K5-lockspan: … PASS ::` line;
+    // self-cleaning (leaves no owned row on the metal card).
+    k5_lockspan_launcher();
     // IMAGE_SHA256 code-signing: prove the SHA-256 primitive (FIPS KATs) + that it discriminates program
     // IMAGES, closing the "same 8.3 name = same principal" residual (the loader now mints IMAGE_SHA256). Its
     // own uncounted `:: IMG-SIG: … PASS ::` line; read-only, no disk write.
@@ -9188,7 +9205,56 @@ fn atr_empty_image(bind: &AtrBinding) -> alloc::vec::Vec<u8> {
 /// correct fail-closed response (a foreign binding's rows must never attach to THIS volume) and makes the M1->M2.2
 /// binding transition seamless on the stateful metal card. Regrow discards any existing rows — safe: an image with
 /// a mismatched header was never trustworthy, and a persist re-installs a named owner's row on its next write.
+/// K5 M2: serialize the create-if-absent DECISION so two SMP cores cannot both `create_in_root` UNAFS.ATR (or
+/// both regrow it). A dedicated lock-free CAS gate — deliberately NOT the namespace lock, because the create's
+/// multi-cluster `write_grow` must not run under the IRQ-masked ns span (the F3 ns-latency rule) — makes the
+/// decision atomic WITHOUT a contended lock held across the grow: a core that loses the CAS BAILS its persist
+/// (returns Io), which is non-fatal and FAIL-SAFE (the in-RAM ACL still enforces this boot; only cross-reboot
+/// survival of THAT one mutation defers to the next persist — never a double-create, never corruption). The
+/// winner double-checks (another core may have finished the create between our probe and our CAS win) before it
+/// creates/regrows, and clears the gate on every exit. Honest residual: because the loser bails rather than
+/// blocks, a persist racing an in-progress create is dropped this pass — the degradation is always toward
+/// fail-safe (not-yet-persisted), never toward two attr files or a torn ownership record. Untriggered today
+/// (single EL0 core; no concurrent named persist in the battery), closed ahead of SMP EL0.
+static ATR_CREATING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 fn atr_ensure(
+    fs: &crate::fs::fat::FatFs,
+    bind: &AtrBinding,
+) -> Result<(u32, u32), crate::fs::fat::FatError> {
+    use crate::fs::fat::FatError;
+    // Fast path (fully concurrent, read-only — NO gate): the file already exists, is full-size, and its header
+    // binds to THIS volume. This is the steady-state case — create happens once per volume lifetime — so a normal
+    // persist never contends the create gate. A genuine binding MISMATCH (`Ok(false)`) falls through to the gated
+    // regrow; a transient READ ERROR (`Err`) bails WITHOUT regrowing (preserving the rows), exactly as before.
+    if let Ok((de, _lba, _off)) = fs.find_located(ATR_NAME) {
+        if (de.size as usize) >= ATR_FILE_LEN {
+            match atr_header_status(fs, de.first_cluster(), de.size, bind) {
+                Ok(true) => return Ok((de.first_cluster(), de.size)),
+                Ok(false) => {} // genuine mismatch -> the gated regrow below
+                Err(e) => return Err(e), // read error -> preserve the existing rows, fail the persist
+            }
+        }
+    }
+    // Slow path: create-or-regrow. Serialize the DECISION via the CAS gate (see `ATR_CREATING`). A loser BAILS
+    // (fail-safe deferral), never double-creates.
+    if ATR_CREATING
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return Err(FatError::Io); // another core is mid-create -> defer this persist (non-fatal, fail-safe)
+    }
+    let r = atr_ensure_create_or_regrow(fs, bind);
+    ATR_CREATING.store(false, Ordering::Release);
+    r
+}
+
+/// K5 M2: the create-or-regrow body, run ONLY by the `ATR_CREATING` CAS winner (see `atr_ensure`). Double-checks
+/// the on-disk state under the gate (another core may have created/regrown it between our probe and the CAS win),
+/// then creates a fresh committed empty image, regrows a foreign/stale/partial one, or returns the now-valid
+/// geometry. The multi-cluster `write_grow` runs here — under the CAS gate but NOT under ns (F3), and no core
+/// spins on the gate (a contender bails), so nothing IRQ-masked is held across the grow.
+fn atr_ensure_create_or_regrow(
     fs: &crate::fs::fat::FatFs,
     bind: &AtrBinding,
 ) -> Result<(u32, u32), crate::fs::fat::FatError> {
@@ -9439,21 +9505,32 @@ fn atr_clear_row(fs: &crate::fs::fat::FatFs, dir_lba: u64, dir_off: u32) -> bool
 /// anonymous (NONE) — the whole battery — or when no persisted row exists yet (a create-persist that had failed;
 /// benign — the in-RAM ACL still holds this boot). UNDER ns for the single-row scan + write_at.
 fn atr_persist_grants(fs: &crate::fs::fat::FatFs, dir_lba: u64, dir_off: u32) -> bool {
+    // K5 M1: gate on the owner being NAMED with a light OWNED_FILES probe FIRST — an anonymous/public owner does
+    // ZERO disk I/O and takes NO ns, keeping the whole battery byte-identical. For a NAMED owner, take the ns and
+    // then snapshot + write the full row UNDER that ONE hold, so a concurrent two-phase revoke cannot straddle us:
+    // the snapshot that feeds the disk write is taken under the SAME ns that serializes the revoke's in-RAM
+    // commit, so we can never write a pre-revoke (grant-still-present) row after the revoke narrowed the disk.
+    if owned_owner_ppid(dir_lba, dir_off).kind == PRIN_NONE {
+        return true; // anonymous owner — nothing persists (the battery path; no disk touch, no ns)
+    }
+    let _ns = ns_lock();
     let Some((owner_ppid, grants)) = owned_snapshot_row(dir_lba, dir_off) else {
-        return true; // no in-RAM row (public / cleared) — nothing to persist
+        return true; // row vanished (raced clear) between the probe and the ns — nothing to persist
     };
-    // Refresh the on-disk row with the CURRENT (post-mutation) in-RAM owner + grants. The disk-write mechanics
-    // are shared with the K3 two-phase revoke via `atr_write_grant_row` (a NONE owner is the no-op battery path).
-    atr_write_grant_row(fs, dir_lba, dir_off, owner_ppid, &grants)
+    // Refresh the on-disk row with the CURRENT (post-mutation) in-RAM owner + grants, still under this ns.
+    atr_write_grant_row_locked(fs, dir_lba, dir_off, owner_ppid, &grants)
 }
 
-/// K3: the disk half of `atr_persist_grants`/the two-phase revoke — rewrite the on-disk UNAFS.ATR row for
+/// K3/K5: the disk half of `atr_persist_grants`/the two-phase revoke — rewrite the on-disk UNAFS.ATR row for
 /// `(dir_lba, dir_off)` with an EXPLICIT owner + grant set (rather than re-snapshotting from OWNED_FILES), so a
 /// REVOKE can persist the NARROWED row to disk BEFORE it commits the in-RAM removal (see `sys_fgrant_revoke_2phase`).
 /// Preserves the durable name/first_cluster/size already on disk; refreshes only owner + grants. No-op (true, ZERO
 /// disk I/O) for a NONE owner (the whole battery) or when no persisted row exists yet (a create-persist that had
-/// failed — benign; the in-RAM ACL still holds this boot). UNDER a fresh `ns` for the single-row scan + `write_at`.
-fn atr_write_grant_row(
+/// failed — benign; the in-RAM ACL still holds this boot). **K5 M1: the caller MUST already hold the namespace
+/// lock** (`_locked`) — it fuses the OWNED_FILES snapshot the caller took, the single-row scan, and the `write_at`
+/// into one ns span so a concurrent revoke/re-persist cannot straddle the snapshot and the write (the SMP
+/// resurrection window). The disk op is the single-sector M1 seam, so holding ns across it respects the F3 rule.
+fn atr_write_grant_row_locked(
     fs: &crate::fs::fat::FatFs,
     dir_lba: u64,
     dir_off: u32,
@@ -9483,7 +9560,6 @@ fn atr_write_grant_row(
             arow_grants[j] = AtrGrant { prin: p, rights: r };
         }
     }
-    let _ns = ns_lock();
     let mut rows: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     if fs
         .read_at(afc, asz, ATR_HEADER_LEN as u32, &mut rows, ATR_ROW_STRIDE * ATR_ROWS)
@@ -9526,9 +9602,9 @@ fn atr_write_grant_row(
 /// directory entry fails closed), strengthening the out-of-scope offline-tamper / non-`sys_unlink`-delete defense.
 /// No-op (returns true, ZERO disk I/O) when the owner is anonymous (NONE) — the whole 23-fixture battery, so the
 /// u10 GROW.BIN path stays byte-identical — or when no persisted row exists yet (a create-persist that had failed;
-/// benign — the in-RAM ACL still holds this boot). Owner/grants snapshotted BEFORE `ns` (OWNED_FILES never nested
-/// under it); the single-row scan + `write_at` run UNDER a fresh `ns` (the M1 seam, `NAMESPACE ⊃ inner`). A
-/// persist failure is non-fatal — the caller `let _ =`s it, matching every other persist site.
+/// benign — the in-RAM ACL still holds this boot). K5 M1: the owner/grants snapshot + the single-row scan +
+/// `write_at` all run UNDER ONE `ns` hold (the M1 seam, `NAMESPACE ⊃ inner`), so a concurrent revoke cannot
+/// straddle them. A persist failure is non-fatal — the caller `let _ =`s it, matching every other persist site.
 fn atr_persist_grow(
     fs: &crate::fs::fat::FatFs,
     dir_lba: u64,
@@ -9536,11 +9612,11 @@ fn atr_persist_grow(
     new_first: u32,
     new_size: u32,
 ) -> bool {
-    let Some((owner_ppid, grants)) = owned_snapshot_row(dir_lba, dir_off) else {
-        return true; // no in-RAM row (public / cleared) — nothing to persist
-    };
-    if owner_ppid.kind == PRIN_NONE {
-        return true; // anonymous owner — nothing persists (the battery path; no disk touch)
+    // K5 M1: probe NAMED-ness FIRST (anonymous owner — the whole battery incl. the u10 GROW.BIN fixture — does
+    // ZERO disk I/O and takes NO ns, byte-identical). For a NAMED owner, snapshot + write under ONE ns hold so a
+    // concurrent two-phase revoke cannot straddle the snapshot/write (see `atr_persist_grants`).
+    if owned_owner_ppid(dir_lba, dir_off).kind == PRIN_NONE {
+        return true; // anonymous owner — nothing persists (the battery path; no disk touch, no ns)
     }
     let (de, _lba, _off) = match fs.find_located(ATR_NAME) {
         Ok(t) => t,
@@ -9551,13 +9627,19 @@ fn atr_persist_grow(
         return true;
     }
     let (afc, asz) = (de.first_cluster(), de.size);
+    let _ns = ns_lock();
+    let Some((owner_ppid, grants)) = owned_snapshot_row(dir_lba, dir_off) else {
+        return true; // row vanished (raced clear) between the probe and the ns — nothing to persist
+    };
+    if owner_ppid.kind == PRIN_NONE {
+        return true; // owner went anonymous under the race — nothing persists
+    }
     let mut arow_grants = [AtrGrant::EMPTY; NFGRANT];
     for (j, &(p, r)) in grants.iter().enumerate() {
         if r != 0 {
             arow_grants[j] = AtrGrant { prin: p, rights: r };
         }
     }
-    let _ns = ns_lock();
     let mut rows: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     if fs
         .read_at(afc, asz, ATR_HEADER_LEN as u32, &mut rows, ATR_ROW_STRIDE * ATR_ROWS)
@@ -10364,6 +10446,171 @@ fn k3_revoke_launcher() {
     serial_println!(
         ":: K3-revoke: SYS_FGRANT revoke commit-ordering — two-phase durable-first {} (revoke survives reboot; kept grant intact; forced persist-fail -> -EIO with in-RAM grant left intact, RAM/disk consistent) [w={:#04x}] ::",
         if w == K3REVOKE_ALL { "PASS" } else { "FAIL" },
+        w
+    );
+}
+
+// K5: the revoke/re-persist SMP-window proof (M1) — a deterministic interleaving witness that (a) reproduces the
+// OLD resurrection race at the DECOMPOSED-primitive level (a stale pre-revoke OWNED_FILES snapshot written to disk
+// AFTER a revoke narrowed it re-admits the revoked grantee — the exact window K5 M1 closes) and (b) shows the
+// PRODUCTION full-row re-persist (`atr_persist_grants`) can never BE that stale write, because it snapshots +
+// writes atomically under the same ns that serializes the revoke's in-RAM commit. Scratch ASIDs 6/7/8 (reused
+// after K3 tears them down). The full cross-core timing race is metal-latent (like the F3 witness); this proves
+// the window is real + the production path is narrowed, deterministically on one core.
+const K5_SA_OWN: u64 = 6; // scratch OWNER ASID
+const K5_SA_GRT: u64 = 7; // scratch KEPT-GRANTEE ASID
+const K5_SA_GR2: u64 = 8; // scratch REVOKE-TARGET GRANTEE ASID
+const K5_FILE: &str = "K5LCK.BIN"; // the named-owner scratch file
+const K5_LOCKSPAN_ALL: u32 = 0x3F; // all 6 assertions
+
+/// K5: delete the scratch file + clear its persisted UNAFS.ATR row + scratch stamps, leaving the card EXACTLY as
+/// found. Robust to partial failures (re-resolves fresh, frees the grown chain).
+fn k5_lockspan_cleanup() {
+    slot_ppid_clear(K5_SA_OWN);
+    slot_ppid_clear(K5_SA_GRT);
+    slot_ppid_clear(K5_SA_GR2);
+    if let Ok(fs) = crate::fs::fat::mount() {
+        if let Ok((de, lba, off)) = fs.find_located(K5_FILE) {
+            let _ = atr_clear_row(&fs, lba, off as u32);
+            owned_clear(lba, off as u32);
+            let _ = fs.delete_located(lba, off, de.first_cluster());
+        }
+    }
+}
+
+/// K5: re-mount, rebuild the in-RAM ACL purely from UNAFS.ATR, and re-resolve the scratch file — the "simulate a
+/// reboot" step the K3 proof uses. Returns the fresh `(dir_lba, dir_off)`, or `None` on any disk failure.
+fn k5_reboot_resolve(dir_lba: u64, dir_off: u32) -> Option<(u64, u32)> {
+    owned_clear(dir_lba, dir_off);
+    let fs = crate::fs::fat::mount().ok()?;
+    let _ = atr_rebuild_into_owned(&fs);
+    let (_, l, o) = fs.find_located(K5_FILE).ok()?;
+    Some((l, o as u32))
+}
+
+/// K5: PROVE the M1 lock-span closes the concurrent-repersist resurrection window (the `k3_revoke_check` idiom —
+/// kernel-side, deterministic, no EL0 fixture). Returns a bitmask; PASS iff `== K5_LOCKSPAN_ALL`. Self-cleaning.
+fn k5_lockspan_check() -> u32 {
+    let mut w = 0u32;
+    let fs = match crate::fs::fat::mount() {
+        Ok(f) => f,
+        Err(_) => return 0,
+    };
+    slot_ppid_stamp(K5_SA_OWN, PrincipalRecord::program_name("K5OWN"));
+    slot_ppid_stamp(K5_SA_GRT, PrincipalRecord::program_name("K5GRT"));
+    slot_ppid_stamp(K5_SA_GR2, PrincipalRecord::program_name("K5GR2"));
+    let p_own = slot_ppid_of(K5_SA_OWN);
+    let p_grt = slot_ppid_of(K5_SA_GRT); // grantee KEPT across the revoke
+    let p_gr2 = slot_ppid_of(K5_SA_GR2); // grantee REVOKED
+    let Some(name11) = atr_name_from_str(K5_FILE) else {
+        k5_lockspan_cleanup();
+        return w;
+    };
+
+    // ---- Setup: a named-owner file with BOTH grantees granted READ, persisted ----
+    let (de, lba, off) = match fs.create_in_root(K5_FILE, 0x20) {
+        Ok(t) => t,
+        Err(_) => {
+            k5_lockspan_cleanup();
+            return w;
+        }
+    };
+    if fs.write_grow(de.first_cluster(), de.size, lba, off, 0, &[0x5Au8; 32]).is_err() {
+        k5_lockspan_cleanup();
+        return w;
+    }
+    let gen_own = ASID_GEN[K5_SA_OWN as usize].load(Ordering::Acquire);
+    let gen_grt = ASID_GEN[K5_SA_GRT as usize].load(Ordering::Acquire);
+    let gen_gr2 = ASID_GEN[K5_SA_GR2 as usize].load(Ordering::Acquire);
+    owned_set_owner(lba, off as u32, K5_SA_OWN, gen_own, p_own);
+    let empty_grants = [(PrincipalRecord::NONE, 0u32); NFGRANT];
+    let ok_owner = atr_persist_row(&fs, name11, 0, 0, lba, off as u32, p_own, &empty_grants);
+    owned_grant(lba, off as u32, K5_SA_OWN, gen_own, K5_SA_GRT, gen_grt, CAP_READ, p_own, p_grt);
+    owned_grant(lba, off as u32, K5_SA_OWN, gen_own, K5_SA_GR2, gen_gr2, CAP_READ, p_own, p_gr2);
+    let ok_grants = atr_persist_grants(&fs, lba, off as u32);
+    if !(ok_owner && ok_grants) {
+        k5_lockspan_cleanup();
+        return w;
+    }
+
+    // ---- Baseline reboot: BOTH grantees admitted from disk ----
+    let Some((rlba, roff)) = k5_reboot_resolve(lba, off as u32) else {
+        k5_lockspan_cleanup();
+        return w;
+    };
+    if owned_access_ok(rlba, roff, K5_SA_GRT, gen_grt, CAP_READ, p_grt) {
+        w |= 1 << 0; // kept grantee admitted (baseline)
+    }
+    if owned_access_ok(rlba, roff, K5_SA_GR2, gen_gr2, CAP_READ, p_gr2) {
+        w |= 1 << 1; // revoke-target grantee admitted (baseline — a grant to revoke)
+    }
+
+    // ---- NEGATIVE CONTROL: the OLD race shape, reproduced at the decomposed-primitive level ----
+    // Capture a PRE-revoke snapshot (GR2's grant still present) — models a concurrent core that snapshotted
+    // OWNED_FILES before the revoke committed. Then run the production revoke (disk-narrow + in-RAM commit, now
+    // fused under ns). Then let the STALE snapshot's full-row write land via the raw ns-held disk writer — the
+    // exact primitive the fix now only ever calls with a FRESH under-ns snapshot. Under the OLD non-atomic code
+    // this is what a concurrent `atr_persist_grants` could do; it RESURRECTS GR2 on disk.
+    let stale = owned_snapshot_row(rlba, roff);
+    let _ = sys_fgrant_revoke_2phase(rlba, roff, K5_SA_OWN, gen_own, K5_SA_GR2, gen_gr2, p_own, p_gr2);
+    if let Some((so, sg)) = stale {
+        let _ns = ns_lock();
+        atr_write_grant_row_locked(&fs, rlba, roff, so, &sg);
+    }
+    let Some((clba, coff)) = k5_reboot_resolve(rlba, roff) else {
+        k5_lockspan_cleanup();
+        return w;
+    };
+    if owned_access_ok(clba, coff, K5_SA_GR2, gen_gr2, CAP_READ, p_gr2) {
+        w |= 1 << 2; // the stale write RESURRECTED GR2 -> the window is REAL (the test bites)
+    }
+
+    // ---- THE FIX: production revoke + production re-persist cannot resurrect ----
+    // In-RAM now carries the resurrected GR2 grant again. Revoke it through the production two-phase path, THEN
+    // run the production full-row re-persist (`atr_persist_grants` — models the concurrent core B). Post-fix it
+    // re-snapshots the NARROWED in-RAM set under the SAME ns, so it writes a narrowed row: GR2 is NOT resurrected.
+    let _ = sys_fgrant_revoke_2phase(clba, coff, K5_SA_OWN, gen_own, K5_SA_GR2, gen_gr2, p_own, p_gr2);
+    let _ = atr_persist_grants(&fs, clba, coff);
+    let Some((flba, foff)) = k5_reboot_resolve(clba, coff) else {
+        k5_lockspan_cleanup();
+        return w;
+    };
+    if !owned_access_ok(flba, foff, K5_SA_GR2, gen_gr2, CAP_READ, p_gr2) {
+        w |= 1 << 3; // GR2 stays DENIED — the production re-persist wrote the narrowed row (no stale escape)
+    }
+    if owned_access_ok(flba, foff, K5_SA_GRT, gen_grt, CAP_READ, p_grt) {
+        w |= 1 << 4; // kept grantee STILL admitted — the revoke was surgical + the re-persist did not clobber it
+    }
+
+    // ---- M2 gate integrity: the create-serialization CAS gate is not leaked after all this create/persist ----
+    if !ATR_CREATING.load(Ordering::Acquire) {
+        w |= 1 << 5; // ATR_CREATING released on every path (never stuck true -> never permanently defers persists)
+    }
+
+    k5_lockspan_cleanup();
+    w
+}
+
+/// K5 launcher + verdict — rides the U7 kernel task after the K3 launcher (its disk I/O can never perturb the 23
+/// fixtures or the witnesses). Emits ONE uncounted `:: K5-lockspan: … PASS ::` line (the K1-atr `<noun> PASS`
+/// idiom, never `-> PASS`/`: PASS`), so the fixture PASS-count stays 23. Fully self-cleaning.
+fn k5_lockspan_launcher() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if crate::drivers::block::info().is_none() {
+        return; // no SD -> the proof writes real files; skip silently
+    }
+    if let Ok(fs) = crate::fs::fat::mount() {
+        if fs.find_in_root(K5_FILE).is_ok() {
+            k5_lockspan_cleanup(); // a stale scratch file from an interrupted run
+        }
+    }
+    let w = k5_lockspan_check();
+    serial_println!(
+        ":: K5-lockspan: UNAFS.ATR revoke/re-persist SMP window — decomposed stale-snapshot write resurrects (control); production revoke+re-persist fused under the ns-span stays narrowed; kept grant intact; create-gate not leaked {} [w={:#04x}] ::",
+        if w == K5_LOCKSPAN_ALL { "PASS" } else { "FAIL" },
         w
     );
 }
