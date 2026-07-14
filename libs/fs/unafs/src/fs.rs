@@ -364,8 +364,15 @@ impl<D: BlockDevice> UnaFS<D> {
             inode.size = current_offset;
         }
 
-        self.write_inode(&inode)?;
+        // Persist the allocation bitmap BEFORE the inode that references any newly
+        // allocated block. A power cut in this window must LEAK (a block marked used but
+        // unreferenced), never DANGLE (an inode referencing a block the persisted bitmap
+        // still calls free — which mount() does NOT fsck away, so the next allocation
+        // first-fit-reuses it → silent cross-file corruption). This mirrors the
+        // mutation-engine ordering (`allocate_and_write_extents` syncs before the inode
+        // swap) and upholds the §K4 "never dangles a reference" guarantee.
         self.sync_metadata()?;
+        self.write_inode(&inode)?;
 
         self.journal
             .log(&mut self.device, JournalOp::EndWrite { inode_id })?;
