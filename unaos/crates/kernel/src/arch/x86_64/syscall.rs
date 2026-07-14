@@ -2952,9 +2952,13 @@ fn sys_listen(handle: u64, port: u64) -> i64 {
 /// inbound handshake; `-EAGAIN` = none yet (ring 3 re-invokes accept); `-EINVAL` = the socket is not
 /// armed for listen (never listened / already closed / wrong kind). On success the listening smoltcp
 /// socket has become the ESTABLISHED connection IN PLACE, so this mints a fresh `KIND_SOCKET` handle
-/// aliasing the SAME gen-fenced socket-id (the SOCK-4 multi-handle-to-one-socket pattern) carrying
-/// `CAP_READ|CAP_WRITE|CAP_GRANT` — the caller streams on it (`send`/`sock_recv`) and may `SYS_XFER` it
-/// to a handler (inetd-style). Single-accept-per-listen: to accept again, open + listen a fresh socket.
+/// aliasing the SAME gen-fenced socket-id (the SOCK-4 multi-handle-to-one-socket pattern). The minted
+/// rights are the INTERSECTION of `CAP_READ|CAP_WRITE|CAP_GRANT` with the LISTENER handle's current
+/// rights — accept is a derivation, not a mint-from-nothing, so an ATTENUATED listener (e.g. a
+/// `CAP_READ`-only SOCK-4 grantee) cannot amplify itself a full-rights connection (the SOCK-4
+/// attenuation boundary: any bit the holder does not have is an amplification). A full-rights owner
+/// gets the POSIX-like full connection handle and may `SYS_XFER` it to a handler (inetd-style).
+/// Single-accept-per-listen: to accept again, open + listen a fresh socket.
 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
 fn sys_accept(handle: u64) -> i64 {
     let row = caller_row();
@@ -2973,7 +2977,11 @@ fn sys_accept(handle: u64) -> i64 {
                 return EAGAIN;
             };
             handle_set_kind(row, h, KIND_SOCKET);
-            handle_set_rights(row, h, CAP_READ | CAP_WRITE | CAP_GRANT);
+            // Derive, don't mint: intersect with the listener handle's CURRENT rights so an attenuated
+            // listener (SOCK-4 reduced-rights transfer) cannot amplify into a full-rights connection.
+            let listener_rights =
+                HANDLE_RIGHTS[row][handle as usize].load(Ordering::Acquire);
+            handle_set_rights(row, h, (CAP_READ | CAP_WRITE | CAP_GRANT) & listener_rights);
             handle_set(row, h, sock_id_pack(sid));
             h as i64
         }
