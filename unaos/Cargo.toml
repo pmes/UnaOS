@@ -4,5 +4,9 @@ members = [
     "crates/kernel",
     "crates/net",
 ]
+# The Ring-0-embeddable cores under `libs/` (e.g. `libs/sys/helm`) are members of
+# the root host workspace, not the kernel workspace — the kernel pulls them as
+# path deps with `default-features = false`. Excluded here so they attach upward.
+exclude = ["libs"]
 resolver = "2"
 

@@ -23,7 +23,7 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use crate::{Actuation, ActuatorSink, Clock};
+use super::{Actuation, ActuatorSink, Clock};
 
 /// A hand-advanced monotonic millisecond clock. Cloning yields another handle
 /// onto the same time value.
@@ -65,7 +65,7 @@ impl Clock for FakeClock {
 }
 
 /// An [`ActuatorSink`] that records every setpoint it is handed. Clone it before
-/// moving one copy into a [`DriveCore`](crate::DriveCore); the retained clone
+/// moving one copy into a [`DriveCore`](super::DriveCore); the retained clone
 /// reads the trace, including the final neutral written on drop.
 #[derive(Clone, Debug, Default)]
 pub struct MockSink {

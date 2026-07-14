@@ -20,8 +20,8 @@
 //! the drive core emits are exactly the µs the codec consumes — without adding
 //! any behaviour to either crate.
 
-use drive::{Actuation, ActuatorSink, Config, DriveCore};
-use drive::sim::FakeClock;
+use helm::rover::{Actuation, ActuatorSink, Config, DriveCore};
+use helm::rover::sim::FakeClock;
 use pca9685::{channel_pulse_us, Prescale, Write};
 use std::cell::RefCell;
 use std::rc::Rc;

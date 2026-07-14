@@ -18,8 +18,8 @@
 //! to the test of the same number. All tests run on a simulated clock and mock
 //! sink — deterministic, zero real sleeps.
 
-use drive::sim::{FakeClock, MockSink};
-use drive::{
+use helm::rover::sim::{FakeClock, MockSink};
+use helm::rover::{
     Actuation, CmdQueue, Command, Config, DriveCore, Frame, State, CMD_CAPACITY, NUM_CHANNELS,
 };
 

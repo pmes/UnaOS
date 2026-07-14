@@ -257,7 +257,8 @@ topology and republishes `MatrixEvent::TopologyMutated` when the tree changes.
 | Elessar snapshot / kit / vessel-compile pipeline | Not implemented (detection seed only) |
 | `vessels/` + `kits/` + `tools/` directory migration | Adopted, pending arcs (still `apps/` on disk) |
 | `libs/views/` chat-view extraction | Adopted, pending arc |
-| helm handler + `unaos/libs/sys/helm/` move | Adopted, pending arcs (core currently at `libs/drive`) |
+| helm core `unaos/libs/sys/helm/` move | Executed — core moved from `libs/drive` to `unaos/libs/sys/helm` (crate `helm`, module `rover`) |
+| helm handler scaffold | Adopted, pending arc |
 
 ---
 
