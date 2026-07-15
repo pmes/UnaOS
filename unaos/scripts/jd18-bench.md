@@ -11,8 +11,12 @@ cleanly with the JD15–JD17 benches in one attended session.
 ## 0. Prep the media (Peter flashes — session cannot write `/Volumes`)
 - **Kernel:** rebuild the tegra ESP LAST (any `test-arm` clobbers it) and validate by COUNT:
   `UNAOS_TEGRA=1 ./arroyo esp-jetson` → `strings target/aarch64_esp/kernel.elf | grep -c 'tegra:'`
-  must be **UNCHANGED from JD17** (JD18 adds no `tegra:` token). Copy `EFI` + `kernel.elf` to the boot stick,
-  `dot_clean`, eject. Validate by count, not size.
+  must be **UNCHANGED from JD17** (JD18 adds no `tegra:` token).
+- **⛔ Flash ONLY from the staged artifact, never from `target/`** (the standing hard rule —
+  `~/unaos-bench/flash/README.md`). The builder copies the whole `aarch64_esp` payload (`EFI/` + `kernel.elf`)
+  to `~/unaos-bench/flash/orin/UnaOS-orin-esp-<UTCstampZ>-<git7>.tar` and appends a `MANIFEST` line with its
+  sha256; verify that sha256 before flashing. Untar it onto the boot stick, `dot_clean`, eject. Validate the
+  kernel by `tegra:` count, not size. (This arc's staged artifact + sha are quoted in the JD18 landing report.)
 - **Data card:** a **separate** FAT16 card (the tegra pattern — the boot stick is NOT the block device),
   present AT BOOT, in the reader behind the hub. **⚠ `dot_clean` the DATA card too** and strip `._*` AppleDouble
   sidecars — they are glob-visible on FAT 8.3 short names and would inflate `find`/`du` counts (a dirty fixture,
