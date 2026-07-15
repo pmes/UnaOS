@@ -37,9 +37,10 @@ CAPSTONE 6/6 COMPLETE (workers on cores 2+3), the first full-core boot in the fa
 the regression.** Same boot, riders captured: **K3-revoke `[w=0x7f]`** (two-phase durable-first
 revoke ordering on the REAL card — previously QEMU-only) + **K5-lockspan `[w=0x3f]`**; plus F2/F3
 locked 240000/240000 under true 4-core parallelism, K3-mount `[w=0x1ff]`, K4-write `[w=0x7f]`,
-0 forbidden. Stale-fixture caveat: U9/U10/U10-create/U11/U6-grants showed the documented stale-card
-signature (probe bench's un-re-prepped card) — NOT regressions; the strict pristine-card 32/32 line
-rides the next Pi sitting. Detail: `arch_arm64.md §CORE3-SMP` METAL-CONFIRMED paragraph.
+0 forbidden. Boot 1's stale-fixture caveat (documented signature, not regressions) was closed the
+same day by **boot 2 on a pristine card (staged `b9bcf53` image, 718,160 B): `MBENCH PASS 32/32
+required, 0 forbidden` in a single boot — CAPSTONE 6/6 again, full created-file family real-PASS,
+F2/F3 locked, riders re-captured.** Detail: `arch_arm64.md §CORE3-SMP` METAL-CONFIRMED paragraph.
 
 ---
 

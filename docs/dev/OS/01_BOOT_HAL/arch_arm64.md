@@ -254,9 +254,13 @@ gate on silicon). **Zero forbidden lines** (no PANIC/EXCEPTION/CMD13/R1/heal). C
 from the bench: the boot showed the documented stale-fixture signature (card not re-prepped since
 the probe bench's 3 boots) — U9/U10 false-FAIL-looking lines (`sector_changed=false` /
 `size_grew=false`) + U10-create/U11/U6-grants `(stale image) — demo skipped`. Documented
-signature, NOT regressions (0 forbidden, `cleared=true killed=0`); the strict pristine-card 32/32
-line rides the next Pi sitting after a card re-prep. Serial: `~/unaos-bench/` (bridge capture,
-2026-07-15). Core-3-down on >1 MiB images is no longer an expected signature.
+signature, NOT regressions (0 forbidden, `cleared=true killed=0`). **The strict line closed the
+same day: boot 2 (pristine card, fresh flash of the staged `b9bcf53` image, 718,160 B — still
+>1 MiB) = `MBENCH PASS 32/32 required witnesses, 0 forbidden` in a single boot — CAPSTONE 6/6
+again (second consecutive full-core >1 MiB boot), the whole created-file family real-PASS
+(U9/U10/U10-create/U10-delete/U11+defer/reuse/reap/U6-grants), F2/F3 locked 240000/240000, both
+riders re-captured.** Serial: `~/unaos-bench/pi-serial-2026-07-15-core3fix-32of32.log`.
+Core-3-down on >1 MiB images is no longer an expected signature.
 
 **Scheduler on the `virt` path — the boot core, since JC3.** The aarch64 scheduler
 was `#[cfg(feature = "baremetal")]`-gated and coupled to EL1 (`ELR_EL1`/`SPSR_EL1`
