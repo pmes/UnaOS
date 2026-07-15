@@ -52,7 +52,10 @@ mkdir NEW
 write NEW/K.TXT new-content
 write NEW/EXTRA.TXT extra
 cp -rf NEW OLD/NEW           # OLD/NEW does not exist yet -> plain fresh copy (nest under OLD) — OK, "copied ..."
-cp -rf NEW OLD/NEW           # OLD/NEW now exists -> -f tree-replace -> "copied /NEW/ -> /OLD/NEW/ ..."
+cp -rf NEW OLD/NEW           # ⚠ ERRATA (2026-07-15 bench): OLD/NEW is an existing DIR -> the copy-INTO
+                             #  idiom takes precedence (consistent with §2 and POSIX) -> nests /OLD/NEW/NEW/.
+cp -rf NEW OLD               # THE true differing-tree replace: target = OLD/NEW (exists) -> delete-then-
+                             #  rebuild -> "copied /NEW/ -> /OLD/NEW/ ..." (prior nested content GONE)
 cat OLD/NEW/EXTRA.TXT        # -> "extra"   (the fresh tree, not a merge of a prior one)
 ```
 
