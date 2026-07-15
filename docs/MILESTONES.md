@@ -12,7 +12,7 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ## hw-pi4 track — 2026-07-15 (K6 — native-attr migration; the UNAFS.ATR sidecar retired)
 
-### K6 — U6 ACL migrated onto native unafs typed attributes 🔬 `hw-pi4`
+### K6 — U6 ACL migrated onto native unafs typed attributes ✅✅ METAL-CONFIRMED `hw-pi4`
 
 **What it does:** retires the security-K4 residual carried since IMG-SIG — the U6 owner/grants ACL's
 durable form lived in `UNAFS.ATR`, a plaintext FAT file on the very volume the ACL polices, outside the
@@ -38,9 +38,15 @@ sidecar rows → exactly the IMAGE row migrates+verifies+sidecar-deletes; both-c
 re-run converges; legacy row stays) plus K1-persist `0x3fff` / K2-liveenf `0x7f` / K3-revoke `0x7f` /
 K5-lockspan `0x3f` all reworked to prove the NATIVE store end-to-end; K3-mount/K4-write intact
 (self-cleaning holds the exact-two-entries ls); `test-arm` MISSION SUCCESS; unafs host suites green
-(crate untouched — kernel uses only its existing public API). Zero x86. **Metal:** rides the K6 bench —
-card REPARTITION mandatory (verdict 3); WATCH: measure the worst-case IRQ-masked window around the
-fused revoke/re-persist (the Option A rider).
+(crate untouched — kernel uses only its existing public API). Zero x86. **✅✅ METAL-CONFIRMED
+(2026-07-15 attended bench, repartitioned card = a full flash of the staged `a89f853` image):
+MBENCH PASS 33/33 required, 0 forbidden, single boot** — `K6-migrate PASS [w=0xff]` on silicon;
+K1-persist/K2-liveenf/K3-revoke (incl. the forced-fail `-EIO` leg)/K5-lockspan all proving the
+NATIVE store on metal; CAPSTONE 6/6 (4/4 cores, third consecutive full-core boot post-CORE3-FIX);
+F2/F3 locked 240000/240000. Log `~/unaos-bench/pi-serial-2026-07-15-k6-33of33.log`. **WATCH
+(Option-A rider) still OPEN:** the ns-hold CNTPCT measurement has no kernel emit yet — this
+sitting gives the behavioral proxy only (no stall, normal battery cadence); a knob-gated
+instrumented build (core3probe idiom) rides the next Pi arc's sitting to produce the number.
 
 - **Detail:** [`SECURITY.md` §K1 (K6 bullet)](SECURITY.md). **Commits:** `df56c0c` M1 seam+codec ·
   `4ad4b76` M2 migration · `d1db421` M3+M4 live-path+fixtures+spec (`hw-pi4`).
