@@ -2298,6 +2298,14 @@ pub fn record_ring3_kill(name: &str, vec: u8, err: u64, cr2: u64) {
         SOCK4_KILLED.fetch_add(1, Ordering::AcqRel);
         return;
     }
+    // SINKHOLE-1 (zeolite): the DNS resolver fixture is well-behaved (register + its own RW data pages —
+    // the file/recv/response buffers). A kill is a real zeolite bug — its own counter, never the U1b
+    // `killed_unexpected` count. Not in PROCS, so the launcher times out to FAIL on `ZEOLITE_DONE`.
+    #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+    if name == "zeolite-resolver" {
+        ZEOLITE_KILLED.fetch_add(1, Ordering::AcqRel);
+        return;
+    }
     // U6x: the owner/grantee fixtures are well-behaved (register-only apart from the grantee's read-back store); a
     // kill is a real U6x bug — its own counter, never the U1b `killed_unexpected` count. The launcher's
     // unconditional cleanup still tears the fixtures' slots + Proc entries down.
@@ -2587,6 +2595,14 @@ extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
                     // never emit this arm.
                     SOCK3_WITNESS.store(a0 as u32, Ordering::Release);
                     SOCK3_DONE.fetch_add(1, Ordering::AcqRel);
+                }
+                #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+                Some("zeolite-resolver") => {
+                    // SINKHOLE-1: the DNS resolver fixture conveys its 8-bit witness bitmask as its exit
+                    // STATUS (by name, the same idiom). `ZEOLITE_DONE` gates the launcher's read. Knob-off /
+                    // aarch64 never emit this arm.
+                    ZEOLITE_WITNESS.store(a0 as u32, Ordering::Release);
+                    ZEOLITE_DONE.fetch_add(1, Ordering::AcqRel);
                 }
                 // SOCK-4: the grantor + grantee are routed BY NAME in the pre-short-circuit block above
                 // (the grantee is PLANTED in PROCS, so it must be caught before the Proc-reap short-circuit
@@ -10226,6 +10242,550 @@ fn sock4_launcher(demo_cpu: usize) {
     }
 }
 
+// =============================================================================
+// SINKHOLE-1 (zeolite): the ring-3 DNS resolver fixture + its launcher (x86-only, knob-on). The DNS
+// SINKHOLE proof — "the Pi-hole concept, done the UnaOS way." The fixture is an INLINE,
+// position-independent blob (the sock2 idiom — NOT an on-disk bin) that:
+//   (0) loads a BLOCKLIST from BLOCK.TXT via the S7 dynamic-open path (ring-3 SYS_OPEN RO + SYS_READ —
+//       a genuine STOR-feeds-NET composition witness), falling back to a builtin list (+ honest marker)
+//       when no FAT volume is mounted;
+//   (1) SELF-TEST #1 (hermetic): parses an inline DNS query for ADS.EXAMPLE, matches it against the
+//       blocklist (BLOCKED), and BUILDS a well-formed 0.0.0.0 A-answer — the sinkhole DECISION + response
+//       construction, proven without a peer;
+//   (2) SELF-TEST #2 / FORWARD (hermetic under slirp): parses an inline query for una.os, confirms it is
+//       NOT blocked, and FORWARDS it to the upstream resolver (10.0.2.3:53), relaying the real answer —
+//       the forward leg;
+//   (3) SERVE (needs the UNAOS_NET=socket `dns` injector): binds UDP :53, and for a bounded window
+//       recvfroms an inbound query; a blocked name is sinkholed to 0.0.0.0 over the wire to the client.
+// The two legs have conflicting media (slirp answers upstream but cannot inject inbound; the socket
+// injector injects inbound but has no upstream resolver), so — like SOCK-6/7 — the SERVE leg reads
+// PENDING under hermetic slirp and OK under the injector, while the FORWARD + composition legs prove
+// hermetically. The hostile-payload DNS name parser (`zdns_parse_and_match`) is strictly bounded:
+// every field access is length-checked, labels are capped, and ANY label-length byte with a high bit
+// set (compression pointers 0b11 AND the reserved 0b01/0b10 forms) is REFUSED — no pointer is ever
+// followed, so no compression loop is possible; any malformed packet is rejected without a crash.
+// Witness bits (accumulated in r12, exit status):
+//   bit0 list loaded · bit1 list from FAT (else builtin) · bit2 ADS.EXAMPLE matched blocklist ·
+//   bit3 built a well-formed 0.0.0.0 answer · bit4 una.os NOT blocked (forward decision) ·
+//   bit5 forwarded una.os -> got a real answer from 10.0.2.3:53 · bit6 served an inbound query on :53 ·
+//   bit7 sinkholed the served query to 0.0.0.0 over the wire.
+// =============================================================================
+
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+core::arch::global_asm!(
+    r#"
+    .globl unaos_user_zeolite_blob_start
+unaos_user_zeolite_blob_start:
+    .balign 16
+    .globl unaos_user_zeolite
+unaos_user_zeolite:
+    cld
+    xor r12, r12                              // witness = 0
+    lea r14, [rip + unaos_user_zeolite_blob_start]
+    add r14, 0x1000                           // r14 -> data page base (window page 1, RW)
+
+    // --- (0) load the blocklist: SYS_OPEN("BLOCK.TXT", RO) + SYS_READ (the S7 dynamic-open path) ---
+    mov rax, 11                               // SYS_OPEN
+    lea rdi, [rip + zdns_blockname]
+    mov rsi, [rip + zdns_blocknamelen]
+    xor rdx, rdx                              // mode 0 = read-only
+    syscall
+    test rax, rax
+    js zdns_builtin                           // open failed (no FAT / absent) -> builtin list
+    mov r13, rax                              // r13 = file handle
+    mov rax, 12                               // SYS_READ(handle, FILEBUF, 2048)
+    mov rdi, r13
+    lea rsi, [r14 + 0x000]                    // FILEBUF (data page)
+    mov rdx, 2048
+    syscall
+    test rax, rax
+    jle zdns_close_builtin                    // empty/failed read -> close + builtin
+    mov [r14 + 0xD00], rax                    // file_len = bytes read
+    mov rax, 17                               // SYS_CLOSE(handle) — resolver keeps only its sockets
+    mov rdi, r13
+    syscall
+    or r12, 1                                 // bit0: list loaded
+    or r12, 2                                 // bit1: from the FAT BLOCK.TXT
+    jmp zdns_have_list
+zdns_close_builtin:
+    mov rax, 17                               // SYS_CLOSE(handle)
+    mov rdi, r13
+    syscall
+zdns_builtin:
+    // Plant the builtin fallback blocklist into FILEBUF (uppercase, LF-separated).
+    lea rsi, [rip + zdns_builtinlist]
+    mov rdx, [rip + zdns_builtinlen]
+    lea rdi, [r14 + 0x000]
+    mov rcx, rdx
+    rep movsb
+    mov [r14 + 0xD00], rdx                    // file_len = builtin length
+    or r12, 1                                 // bit0: list loaded (builtin; bit1 stays clear)
+zdns_have_list:
+
+    // --- (1) SELF-TEST #1: parse+match the inline ADS.EXAMPLE query -> BLOCKED + build 0.0.0.0 answer ---
+    lea rsi, [rip + zdns_blockedquery]
+    mov rcx, [rip + zdns_blockedquerylen]
+    call zdns_parse_and_match                 // rax: 0 ok/not-blocked, 1 blocked, 2 malformed
+    cmp rax, 1
+    jne zdns_st2                              // not blocked (unexpected) -> skip bit2/3
+    or r12, 4                                 // bit2: ADS.EXAMPLE matched the blocklist
+    lea rsi, [rip + zdns_blockedquery]
+    mov rcx, [rip + zdns_blockedquerylen]
+    lea rdi, [r14 + 0x1008]                   // RESPBUF DNS area (dst-addr hdr occupies +0x1000..+0x1008)
+    call zdns_build_sinkhole                  // rax = response DNS length
+    // Self-check the built answer: QR bit set + RDATA (last 4 bytes) == 0.0.0.0.
+    test byte ptr [r14 + 0x100A], 0x80        // DNS flags byte (offset 2 of the response) — QR
+    jz zdns_st2
+    lea r9, [r14 + 0x1008]
+    add r9, rax
+    sub r9, 4                                 // -> RDATA
+    cmp dword ptr [r9], 0
+    jne zdns_st2
+    or r12, 8                                 // bit3: built a well-formed 0.0.0.0 answer
+
+zdns_st2:
+    // --- (2) SELF-TEST #2 / FORWARD: parse+match una.os -> NOT blocked, forward upstream 10.0.2.3:53 ---
+    lea rsi, [rip + zdns_realquery]
+    mov rcx, [rip + zdns_realquerylen]
+    call zdns_parse_and_match
+    test rax, rax
+    jnz zdns_serve                            // blocked(1) / malformed(2) -> unexpected, skip forward
+    or r12, 16                                // bit4: una.os NOT blocked (forward decision)
+    mov rax, 19                               // SYS_SOCKET(AF_INET=2, SOCK_DGRAM=2, 0)
+    mov rdi, 2
+    mov rsi, 2
+    xor rdx, rdx
+    syscall
+    test rax, rax
+    js zdns_serve
+    mov r13, rax                              // r13 = upstream socket
+    mov rax, 20                               // SYS_BIND(handle, 49260)
+    mov rdi, r13
+    mov rsi, 49260
+    syscall
+    mov r15, 6                                // forward retry budget (slirp answers round 1; keep short so
+                                              // a medium with no upstream — the socket injector — fails fast
+                                              // and the SERVE leg starts promptly, overlapping the injector)
+zdns_fwd_loop:
+    mov rax, 21                               // SYS_SENDTO(handle, msg, len)
+    mov rdi, r13
+    lea rsi, [rip + zdns_fwdmsg]              // [10.0.2.3][53 LE][pad] + una.os DNS payload
+    mov rdx, [rip + zdns_fwdmsglen]
+    syscall
+    test rax, rax
+    js zdns_fwd_retry
+    mov rax, 22                               // SYS_RECVFROM(handle, UPRECV, 512)
+    mov rdi, r13
+    lea rsi, [r14 + 0x1400]                   // UPRECV
+    mov rdx, 512
+    syscall
+    cmp rax, 8                                // >= 8-byte src header -> a datagram landed
+    jl zdns_fwd_retry
+    cmp byte ptr [r14 + 0x1400], 10           // src ip 10.0.2.3 ...
+    jne zdns_fwd_retry
+    cmp byte ptr [r14 + 0x1401], 0
+    jne zdns_fwd_retry
+    cmp byte ptr [r14 + 0x1402], 2
+    jne zdns_fwd_retry
+    cmp byte ptr [r14 + 0x1403], 3
+    jne zdns_fwd_retry
+    cmp byte ptr [r14 + 0x1404], 53           // ... src port 53 (LE low byte)
+    jne zdns_fwd_retry
+    cmp byte ptr [r14 + 0x1405], 0
+    jne zdns_fwd_retry
+    or r12, 32                                // bit5: forwarded + real answer relayed from upstream
+    jmp zdns_fwd_done
+zdns_fwd_retry:
+    dec r15
+    jnz zdns_fwd_loop
+zdns_fwd_done:
+    mov rax, 17                               // SYS_CLOSE(upstream socket)
+    mov rdi, r13
+    syscall
+
+zdns_serve:
+    // --- (3) SERVE: bind UDP :53, recvfrom a bounded window; a blocked name -> 0.0.0.0 to the client ---
+    mov rax, 19                               // SYS_SOCKET(AF_INET, SOCK_DGRAM, 0)
+    mov rdi, 2
+    mov rsi, 2
+    xor rdx, rdx
+    syscall
+    test rax, rax
+    js zdns_exit
+    mov r13, rax                              // r13 = serve socket
+    mov rax, 20                               // SYS_BIND(handle, 53)
+    mov rdi, r13
+    mov rsi, 53
+    syscall
+    test rax, rax
+    jnz zdns_exit                             // bind :53 failed
+    mov r15, 24                               // serve round budget: a bounded window for an inbound query.
+                                              // Under the injector a query is caught + sinkholed on the
+                                              // first round (fast exit); hermetically all rounds run to their
+                                              // -EAGAIN budget then the fixture exits (the PENDING path).
+zdns_serve_loop:
+    mov rax, 22                               // SYS_RECVFROM(serve, RECVBUF, 512)
+    mov rdi, r13
+    lea rsi, [r14 + 0x800]                    // RECVBUF = [8-byte src hdr][DNS query]
+    mov rdx, 512
+    syscall
+    cmp rax, 20                               // >= 8 hdr + 12 DNS header -> a plausible query
+    jl zdns_serve_next
+    or r12, 64                                // bit6: served an inbound datagram on :53
+    mov rcx, rax
+    sub rcx, 8                                // DNS message length
+    mov [r14 + 0xD08], rcx                    // stash it (parse clobbers rcx)
+    lea rsi, [r14 + 0x808]                    // DNS message start (past the 8-byte src header)
+    call zdns_parse_and_match
+    cmp rax, 1
+    jne zdns_serve_next                       // not blocked / malformed -> keep serving (no sinkhole)
+    // Blocked: build the 0.0.0.0 response and send it to the client (client addr = RECVBUF[0..8]).
+    mov rax, [r14 + 0x800]                    // copy the 8-byte client src header -> RESPBUF dst header
+    mov [r14 + 0x1000], rax
+    lea rsi, [r14 + 0x808]                    // query DNS
+    mov rcx, [r14 + 0xD08]                    // its length
+    lea rdi, [r14 + 0x1008]                   // response DNS area
+    call zdns_build_sinkhole                  // rax = response DNS length
+    add rax, 8                                // + the 8-byte dst header
+    mov rdx, rax
+    mov rax, 21                               // SYS_SENDTO(serve, RESPBUF, 8+resp)
+    mov rdi, r13
+    lea rsi, [r14 + 0x1000]
+    syscall
+    or r12, 128                               // bit7: sinkholed the served query over the wire (latched)
+    jmp zdns_serve_next                        // keep serving across the window (answer every blocked query),
+                                              // so an over-the-wire injector reliably rendezvouses with an answer
+zdns_serve_next:
+    dec r15
+    jnz zdns_serve_loop
+zdns_exit:
+    mov rax, 2                                // SYS_EXIT(witness) -> routed by name into ZEOLITE_WITNESS
+    mov rdi, r12
+    syscall
+zdns_hang:
+    jmp zdns_hang                             // sys_exit never returns; guard
+
+// --- zdns_parse_and_match: hostile-payload-hardened DNS question-name parse + blocklist match ---
+//   in:  rsi = DNS message start, rcx = message length; r14 = data base
+//   out: rax = 1 blocked, 0 valid/not-blocked, 2 malformed. Fills NAMEBUF (r14+0xC00) with the
+//        uppercase dotted name, length in r11. Preserves r12/r13/r14/r15.
+//   Every field access is bounds-checked against the packet end; a label-length byte with EITHER
+//   high bit set is refused (compression pointers AND reserved forms) so no pointer is followed and
+//   no compression loop can exist; the assembled name is capped well under NAMEBUF.
+zdns_parse_and_match:
+    cmp rcx, 17                               // header(12) + root(1) + qtype(2) + qclass(2) minimum
+    jb zdns_malformed
+    lea rdi, [rsi + 12]                       // cursor = past the 12-byte header
+    lea r9, [rsi + rcx]                       // r9 = packet end
+    lea r10, [r14 + 0xC00]                    // NAMEBUF
+    xor r11, r11                              // assembled name length = 0
+zdns_lbl_loop:
+    cmp rdi, r9
+    jae zdns_malformed                        // no room to read a length byte
+    movzx rax, byte ptr [rdi]
+    inc rdi
+    test al, al
+    jz zdns_name_done                         // 0x00 -> end of name
+    test al, 0xC0                             // high bit(s) set -> pointer/reserved -> REFUSE
+    jnz zdns_malformed
+    // valid label length 1..63 in al. Cap the assembled name (with a dot) well under NAMEBUF.
+    mov r8, r11
+    add r8, rax
+    cmp r8, 250
+    ja zdns_malformed
+    mov r8, rdi
+    add r8, rax                               // label must fit inside the packet
+    cmp r8, r9
+    ja zdns_malformed
+    test r11, r11
+    jz zdns_no_dot
+    mov byte ptr [r10 + r11], 0x2E            // '.' separator between labels
+    inc r11
+zdns_no_dot:
+    mov rcx, rax                              // copy `al` bytes, uppercased
+zdns_copy_lbl:
+    mov dl, byte ptr [rdi]
+    cmp dl, 0x61                              // 'a'
+    jb zdns_noup
+    cmp dl, 0x7A                              // 'z'
+    ja zdns_noup
+    sub dl, 0x20
+zdns_noup:
+    mov byte ptr [r10 + r11], dl
+    inc rdi
+    inc r11
+    dec rcx
+    jnz zdns_copy_lbl
+    jmp zdns_lbl_loop
+zdns_name_done:
+    // Match NAMEBUF[0..r11] (uppercase) against the blocklist lines in FILEBUF.
+    test r11, r11
+    jz zdns_not_blocked                       // empty (root) name matches nothing
+    lea r8, [r14 + 0x000]                     // fp = FILEBUF
+    mov rcx, [r14 + 0xD00]                    // file_len
+    mov r9, r8
+    add r9, rcx                               // fend
+zdns_line_start:
+    cmp r8, r9
+    jae zdns_not_blocked
+    xor rcx, rcx                              // idx into NAMEBUF
+    mov rdx, r8                               // p = line cursor
+zdns_cmp_char:
+    cmp rdx, r9
+    jae zdns_line_end                         // EOF ends the line
+    mov al, byte ptr [rdx]
+    cmp al, 0x0A                              // '\n'
+    je zdns_line_end
+    cmp al, 0x0D                              // '\r'
+    je zdns_line_end
+    cmp rcx, r11
+    jae zdns_line_nomatch                     // line longer than the name -> no match
+    cmp al, 0x61
+    jb zdns_lnoup
+    cmp al, 0x7A
+    ja zdns_lnoup
+    sub al, 0x20
+zdns_lnoup:
+    cmp al, byte ptr [r10 + rcx]
+    jne zdns_line_nomatch
+    inc rcx
+    inc rdx
+    jmp zdns_cmp_char
+zdns_line_end:
+    cmp rcx, r11                              // whole name consumed AND line ended -> exact match
+    je zdns_blocked
+    mov r8, rdx
+    jmp zdns_skip_eol
+zdns_line_nomatch:
+    // scan rdx forward to the end of this line, then advance past the EOL
+zdns_scan_eol:
+    cmp rdx, r9
+    jae zdns_adv
+    mov al, byte ptr [rdx]
+    cmp al, 0x0A
+    je zdns_adv
+    cmp al, 0x0D
+    je zdns_adv
+    inc rdx
+    jmp zdns_scan_eol
+zdns_adv:
+    mov r8, rdx
+zdns_skip_eol:
+    cmp r8, r9
+    jae zdns_not_blocked
+    mov al, byte ptr [r8]
+    cmp al, 0x0A
+    je zdns_skip_inc
+    cmp al, 0x0D
+    je zdns_skip_inc
+    jmp zdns_line_start
+zdns_skip_inc:
+    inc r8
+    jmp zdns_skip_eol
+zdns_blocked:
+    mov rax, 1
+    ret
+zdns_not_blocked:
+    xor rax, rax
+    ret
+zdns_malformed:
+    mov rax, 2
+    ret
+
+// --- zdns_build_sinkhole: build a DNS response answering the query with a single A-record 0.0.0.0 ---
+//   in:  rsi = query DNS start, rcx = query DNS length, rdi = destination DNS buffer
+//   out: rax = response DNS length. Preserves r12/r13/r14/r15.
+//   The response = the query bytes (header + question) with QR/RA set, ANCOUNT=1, plus a 16-byte
+//   answer (name pointer 0xC00C, TYPE A, CLASS IN, TTL 0, RDLENGTH 4, RDATA 0.0.0.0).
+zdns_build_sinkhole:
+    mov r8, rdi                               // dest base
+    mov r9, rcx                               // query length
+    rep movsb                                 // copy the query (header+question) verbatim
+    or byte ptr [r8 + 2], 0x80                // QR = 1 (response)
+    mov byte ptr [r8 + 3], 0x80               // RA = 1, RCODE = 0
+    mov byte ptr [r8 + 6], 0x00               // ANCOUNT hi
+    mov byte ptr [r8 + 7], 0x01               // ANCOUNT lo = 1
+    mov rax, r8
+    add rax, r9                               // -> the appended answer
+    mov byte ptr [rax + 0], 0xC0              // name = pointer to offset 12 (the qname)
+    mov byte ptr [rax + 1], 0x0C
+    mov byte ptr [rax + 2], 0x00              // TYPE = A
+    mov byte ptr [rax + 3], 0x01
+    mov byte ptr [rax + 4], 0x00              // CLASS = IN
+    mov byte ptr [rax + 5], 0x01
+    mov dword ptr [rax + 6], 0x00000000       // TTL = 0
+    mov byte ptr [rax + 10], 0x00             // RDLENGTH hi
+    mov byte ptr [rax + 11], 0x04             // RDLENGTH lo = 4
+    mov dword ptr [rax + 12], 0x00000000      // RDATA = 0.0.0.0
+    mov rax, r9
+    add rax, 16                               // response length = query length + 16-byte answer
+    ret
+
+    .balign 8
+zdns_blocknamelen:
+    .quad zdns_blockname_end - zdns_blockname
+zdns_blockname:
+    .ascii "BLOCK.TXT"
+zdns_blockname_end:
+    .balign 8
+zdns_builtinlen:
+    .quad zdns_builtinlist_end - zdns_builtinlist
+zdns_builtinlist:
+    .ascii "ADS.EXAMPLE\nTRACK.EXAMPLE\n"
+zdns_builtinlist_end:
+    // Inline DNS query for ADS.EXAMPLE (header + QNAME + QTYPE A + QCLASS IN). txn id 0x5A44 = "ZD".
+    .balign 8
+zdns_blockedquerylen:
+    .quad zdns_blockedquery_end - zdns_blockedquery
+zdns_blockedquery:
+    .byte 0x5A, 0x44, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    .byte 0x03, 0x41, 0x44, 0x53, 0x07, 0x45, 0x58, 0x41, 0x4D, 0x50, 0x4C, 0x45, 0x00
+    .byte 0x00, 0x01, 0x00, 0x01
+zdns_blockedquery_end:
+    // Inline DNS query for "una.os" (the forward self-test name — deliberately NOT in the blocklist).
+    .balign 8
+zdns_realquerylen:
+    .quad zdns_realquery_end - zdns_realquery
+zdns_realquery:
+    .byte 0x5A, 0x45, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    .byte 0x03, 0x75, 0x6E, 0x61, 0x02, 0x6F, 0x73, 0x00
+    .byte 0x00, 0x01, 0x00, 0x01
+zdns_realquery_end:
+    // SYS_SENDTO message for the upstream forward: 8-byte addr header [10.0.2.3][53 LE][pad] + the
+    // una.os DNS payload (the same 24 bytes as zdns_realquery).
+    .balign 8
+zdns_fwdmsglen:
+    .quad zdns_fwdmsg_end - zdns_fwdmsg
+zdns_fwdmsg:
+    .byte 10, 0, 2, 3
+    .byte 53, 0
+    .byte 0, 0
+    .byte 0x5A, 0x45, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    .byte 0x03, 0x75, 0x6E, 0x61, 0x02, 0x6F, 0x73, 0x00
+    .byte 0x00, 0x01, 0x00, 0x01
+zdns_fwdmsg_end:
+    .globl unaos_user_zeolite_blob_end
+unaos_user_zeolite_blob_end:
+"#
+);
+
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+unsafe extern "C" {
+    static unaos_user_zeolite_blob_start: u8;
+    static unaos_user_zeolite_blob_end: u8;
+    static unaos_user_zeolite: u8;
+}
+
+/// The zeolite resolver fixture's witness bitmask (its exit status), routed by name in `SYS_EXIT`.
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+static ZEOLITE_WITNESS: AtomicU32 = AtomicU32::new(0);
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+static ZEOLITE_DONE: AtomicU32 = AtomicU32::new(0);
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+static ZEOLITE_KILLED: AtomicU32 = AtomicU32::new(0);
+
+/// Build the zeolite fixture slot (the sock2 shape): allocate a private slot, scrub the whole window,
+/// copy the blob into its RX-RO code page. `None` on slot-alloc failure.
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+fn zeolite_build() -> Option<U7xFix> {
+    let slot = crate::arch::memory::alloc_user_space()?;
+    let bstart = &raw const unaos_user_zeolite_blob_start as usize;
+    let bend = &raw const unaos_user_zeolite_blob_end as usize;
+    let blen = bend - bstart;
+    assert!(blen as u64 <= PAGE_SIZE, "zeolite blob does not fit in a code page");
+    let off = (&raw const unaos_user_zeolite as usize - bstart) as u64;
+    let backing = crate::arch::memory::slot_backing_ptr(slot);
+    unsafe {
+        core::ptr::write_bytes(backing, 0, (USER_WINDOW_PAGES * PAGE_SIZE) as usize);
+        core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen);
+    }
+    Some(U7xFix {
+        entry: USER_BASE + off,
+        sp: USER_BASE + USER_WINDOW_PAGES * PAGE_SIZE - 16,
+        cr3: crate::arch::memory::slot_cr3(slot),
+        slot,
+    })
+}
+
+/// SINKHOLE-1 (zeolite) launcher + verdict — chained LAST off `sock4_launcher`, so its lines land after
+/// every other demo. Flow: one-shot; skip silently with no NIC; pre-build the persistent smolnet stack
+/// on this large-stack task; build + spawn the `zeolite-resolver` fixture; wait (bounded) for its witness
+/// exit + socket teardown; print two verdict lines — the composition/forward leg (proves hermetically)
+/// and the sinkhole-serve leg (OK under the `dns` injector, PENDING under hermetic slirp).
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+fn zeolite_launcher(demo_cpu: usize) {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if crate::drivers::e1000::hw_addr().is_none() {
+        return; // NETWORK-gated: no NIC -> skip cleanly, line-free
+    }
+    if !crate::smolnet::init() {
+        return;
+    }
+    let Some(fix) = zeolite_build() else {
+        serial_println!(":: zeolite: no free address-space slot — DNS sinkhole demo skipped ::");
+        return;
+    };
+    serial_println!(
+        ":: zeolite: DNS sinkhole (the Pi-hole concept, UnaOS way) — ring-3 resolver binds :53, blocks from a list, forwards the rest ::"
+    );
+    crate::arch::sched::spawn_user_in_space("zeolite-resolver", fix.entry, fix.sp, demo_cpu, fix.cr3);
+
+    let vdeadline = crate::arch::ticks() + 40_000;
+    while ZEOLITE_DONE.load(Ordering::Acquire) < 1 && crate::arch::ticks() < vdeadline {
+        crate::arch::sched::yield_now();
+    }
+    let w = ZEOLITE_WITNESS.load(Ordering::Acquire);
+    let killed = ZEOLITE_KILLED.load(Ordering::Acquire);
+    let tdeadline = crate::arch::ticks() + 2000;
+    while !handle_row_is_clear(fix.slot) && crate::arch::ticks() < tdeadline {
+        crate::arch::sched::yield_now();
+    }
+    let cleared = handle_row_is_clear(fix.slot);
+
+    let list_loaded = w & 1 != 0;
+    let from_fat = w & 2 != 0;
+    let blocked_ok = w & 4 != 0 && w & 8 != 0;
+    let fwd_decided = w & 16 != 0;
+    let fwd_relayed = w & 32 != 0;
+    let served = w & 64 != 0 && w & 128 != 0;
+    let list_src = if from_fat { "BLOCK.TXT via S7 dynamic-open" } else { "builtin list (no FAT)" };
+
+    // Leg 1: the STOR-feeds-NET composition + hostile-parse + forward, all hermetic.
+    if list_loaded && blocked_ok && fwd_decided && fwd_relayed && killed == 0 {
+        serial_println!(
+            ":: zeolite: blocklist from {}, blocked ADS.EXAMPLE -> 0.0.0.0 (answer built), forwarded una.os -> 10.0.2.3:53 real answer relayed — witness OK ::",
+            list_src
+        );
+    } else if list_loaded && blocked_ok && fwd_decided && !fwd_relayed && killed == 0 {
+        // The forward leg's upstream is unreachable on this medium (the UNAOS_NET=socket injector has
+        // no slirp resolver) — the sinkhole DECISION + build proved; the upstream relay is INCOMPLETE here.
+        serial_println!(
+            ":: zeolite: blocklist from {}, blocked ADS.EXAMPLE -> 0.0.0.0 (answer built), una.os NOT blocked -> forwarded to 10.0.2.3:53 (no upstream on this medium) — witness INCOMPLETE ::",
+            list_src
+        );
+    } else {
+        serial_println!(
+            ":: zeolite: DNS sinkhole FAIL — witness={:#x} (list={} fat={} blocked+built={} fwd_decided={} fwd_relayed={}) cleared={} killed={} done={} ::",
+            w, list_loaded, from_fat, blocked_ok, fwd_decided, fwd_relayed, cleared, killed,
+            ZEOLITE_DONE.load(Ordering::Acquire)
+        );
+    }
+
+    // Leg 2: the over-the-wire sinkhole serve — needs the UNAOS_NET=socket `dns` injector.
+    if served {
+        serial_println!(
+            ":: zeolite: served an inbound query on :53 — blocked name sinkholed to 0.0.0.0 over the wire — witness OK ::"
+        );
+    } else {
+        serial_println!(
+            ":: zeolite: resolver bound :53 — awaiting an inbound query (UNAOS_NET=socket net-inject dns) — witness PENDING ::"
+        );
+    }
+}
+
 /// U8x launcher + verdict — called by `u7x_launcher` after the whole U7x flow (program-order gating; see
 /// `u7x_launcher`). Flow: one-shot guard; skip silently with no block device (the control-path discipline —
 /// U8x needs no disk); build + pre-endow + spawn the single fixture (`u8x-tree`: index 2 = a console cap
@@ -10311,6 +10871,11 @@ fn u8x_launcher(demo_cpu: usize) {
     // no-NIC / low-AP configs skip cleanly. Knob-off / aarch64 never emit it.
     #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
     sock4_launcher(demo_cpu);
+    // SINKHOLE-1 (zeolite, knob-on, x86-only): chain the ring-3 DNS resolver / sinkhole demo LAST, so its
+    // lines land after every other demo. It gates on a NIC internally, so no-NIC configs skip cleanly.
+    // Knob-off / aarch64 never emit its lines.
+    #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+    zeolite_launcher(demo_cpu);
 }
 
 /// Build the U9x fixture slot — the `u8x_build` shape for the U9x blob (allocate, scrub the WHOLE window, copy

@@ -946,6 +946,50 @@ Spec promotions committed here; the granular arc detail is in each arc's own ent
 
 ---
 
+## net-zeolite track — 2026-07-15 (SINKHOLE-1 "zeolite" — the DNS resolver / sinkhole, x86 QEMU proof)
+
+### SINKHOLE-1 — ring-3 DNS resolver: binds `:53`, sinkholes blocked names, forwards the rest 🔬 `us-zeolite1`
+- **What:** the first slice of the UnaOS DNS sinkhole ("the Pi-hole concept, done the UnaOS way") —
+  [ROADMAP §1b](ROADMAP.md) / `plans/unaos/future/unaos-dns-sinkhole.md`. A **ring-3 resolver** fixture
+  (`zeolite-resolver`, the sock2 inline-blob idiom) binds UDP `:53`, answers BLOCKED names with `0.0.0.0`, and
+  forwards the rest to the upstream resolver (`10.0.2.3:53`). Same `UNAOS_SMOLNET` knob, x86-only, byte-identical
+  knob-off / aarch64. **No new syscall (next free stays 28) and no new ring-3 surface** — composed entirely from
+  landed capabilities: SOCK-2 UDP syscalls for serve + forward, and the **STOR-1 S7 dynamic-open path** for the
+  blocklist. The differentiator: the resolver holds ONLY its two UDP sockets + one RO blocklist descriptor.
+- **The blocklist is a FILE (STOR feeds NET):** `BLOCK.TXT` (planted by `make-fat-img.sh`: `ADS.EXAMPLE`,
+  `TRACK.EXAMPLE`; UPPERCASE, one per line) is opened RO via `sys_open`→`open_dynamic_ondisk`→`sys_read` (the S7
+  path — needs `UNAOS_IRQSTORAGE=1` + a mounted FAT). No FAT ⇒ a builtin fallback list + honest `builtin` marker.
+- **Witness medium (resolved: split legs):** medium (a) — a guest-internal round-trip — was **probed and ruled
+  out** (smoltcp has no loopback; a datagram to the guest's own `ip:port` is not self-delivered). So: the
+  **forward + composition leg proves hermetically** (two self-tests through the hardened parser: `ADS.EXAMPLE` →
+  blocked → `0.0.0.0` answer built; `una.os` → not blocked → forwarded to `10.0.2.3:53`, real answer relayed), and
+  the **serve leg needs the `UNAOS_NET=socket` injector** (`net-inject.py dns`), reading PENDING hermetically.
+- **Hostile-payload parser hardening:** `zdns_parse_and_match` (ring 3, the first UnaOS parse of an attacker
+  payload) — every field bounds-checked before access; ANY label-length byte with a high bit set is refused
+  (compression pointers + reserved forms), so no pointer is followed and no compression loop can exist; labels
+  capped 63, name capped 250 < its 256-byte buffer; malformed ⇒ reject-without-crash (neither sinkholed nor
+  forwarded). The `0.0.0.0` builder writes a fixed 16-byte answer (no wire-controlled length).
+- **Evidence:** hermetic `UNAOS_SMOLNET=1 ./arroyo test 90` →
+  `:: zeolite: blocklist from builtin list (no FAT), blocked ADS.EXAMPLE -> 0.0.0.0 (answer built), forwarded una.os -> 10.0.2.3:53 real answer relayed — witness OK ::`
+  + the serve PENDING line, SOCK-1..7 intact. Full composition
+  `UNAOS_SMOLNET=1 UNAOS_IRQSTORAGE=1 UNAOS_FATIMG=sf ./arroyo test 200` → the same line with **`blocklist from
+  BLOCK.TXT via S7 dynamic-open`**, STOR chain 0 FAIL + S8-write intact. Over-the-wire sinkhole (guest-side
+  proven across runs): `UNAOS_NET=socket UNAOS_SMOLNET=1 ./arroyo test` + `net-inject.py dns` →
+  `:: zeolite: served an inbound query on :53 — blocked name sinkholed to 0.0.0.0 over the wire — witness OK ::`.
+- **Gates:** knob-off `./arroyo test 25` / `test-arm 22` MISSION with NO zeolite line (all code
+  `#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]` — byte-identical both arches); `check` both arches
+  on+off, no new warnings. Also folds the SOCK-7 review NOTE-3: a `debug_assert` on `SocketSet` occupancy before
+  `peel_and_rearm`'s `add` (the `NSOCK+1` exact-fit ceiling). **Lane:** `arch/x86_64/syscall.rs` + `smolnet.rs`
+  (one-line rider) + `scripts/net-inject.py` (`dns` verb) + `scripts/make-fat-img.sh` (`BLOCK.TXT`) + docs;
+  `crates/net`/`fat.rs`/`sched.rs`/`builder`/`Cargo.toml` untouched; **zero aarch64.**
+- **Residuals:** single in-flight forward, no cache, no query log, single-question/A-record; the serve leg's
+  committed proof is the injector medium (medium (a) ruled out); the end-to-end injector rendezvous is
+  timing-sensitive (late-spawn window + the guest must ARP the client), guest-side sinkhole deterministic;
+  `copy_from_user` still deferred. **Metal-pending** (no wired NIC on any current board — QEMU slirp / the
+  socket-netdev injector is the honest gate).
+
+---
+
 ## net-sock1 track — 2026-07-14 (SOCK-5 scope B — DHCP via smoltcp: the persistent stack leases its own address)
 
 ### SOCK-5 — smoltcp `dhcpv4::Socket` configures the persistent interface 🔬 `net-sock1`

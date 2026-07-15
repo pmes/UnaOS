@@ -1225,6 +1225,17 @@ fn peel_and_rearm(stack: &mut SmolStack, lsid: usize) -> AcceptOutcome {
     };
     // Build + arm the replacement listener on the SAME port, into a fresh smoltcp socket.
     let new_listener = build_tcp_socket(new_buf);
+    // SOCK-7 review NOTE-3 (zeolite rider): `SOCK_SET_STORAGE` is an EXACT fit — `NSOCK` ring-3
+    // slots + 1 reserved DHCP socket — and `SocketSet::add` PANICS when full. This `add` is the
+    // occupancy PEAK: the re-armed listener is inserted while the established socket is still in
+    // the set (about to be repurposed as the peeled connection), so nothing is removed first. The
+    // peel guard above (a free reg slot ⇒ a free buffer set ⇒ room) keeps it within capacity today;
+    // assert the invariant so a future `NSOCK`/reserved-socket change trips HERE in a debug build
+    // rather than panicking smoltcp in the field.
+    debug_assert!(
+        stack.sockets.iter().count() < NSOCK + 1,
+        "zeolite/SOCK-7: SocketSet at capacity before peel_and_rearm add — occupancy invariant broken"
+    );
     let new_handle = stack.sockets.add(new_listener);
     if stack.sockets.get_mut::<tcp::Socket>(new_handle).listen(port).is_err() {
         // Could not re-arm — roll back the half-built listener so nothing leaks, and report the
