@@ -168,15 +168,72 @@ default topology has `usb-tablet` (absolute); add `-device usb-mouse,bus=xhci.0`
 (via `UNAOS_QEMU_EXTRA`) for the relative path. Inject motion over QMP
 (`input-send-event` with `rel`/`abs` axes) to drive the counter.
 
+### 7c. Enumeration robustness (XENUM-1)
+
+Three real, metal-observed enumeration/hub gaps surfaced at the mouse bench
+(2026-07-15) and were closed additively in the shared enum/hub path. None is a
+HID-decode bug; all are in the connect/hub topology layer. QEMU cannot reproduce
+the underlying silicon timing/topology, so each fix emits an assertable trace and
+is metal-verified at an attended bench.
+
+- **M1 — hot-plug CSC re-queue.** A live re-plug of an already-enumerated device
+  logged `CSC during enumeration (reset side-effect); not re-queuing` and never
+  re-enumerated (workaround: power-cycle with the device pre-plugged). Root cause:
+  a disconnect (CSC with CCS=0) left the device's slot **active**, so the
+  subsequent re-plug (CSC with CCS=1) matched the `has_slot` guard and was dropped
+  as a reset artifact.
+
+  **The CSC classification (the crux).** The USB reset the driver issues to
+  enumerate a port itself asserts CSC — but CCS stays **1** throughout (the reset
+  never drops the connection). A genuine unplug→replug produces a CCS **0→1**
+  edge. So a CCS=0 edge is the unambiguous "the device physically left" signal
+  that separates a genuine hot re-plug from the self-induced reset artifact, and
+  the deferred re-queue is armed **only** by a real CCS=0 edge — it can never be
+  armed by the reset artifact, so it cannot loop.
+
+  Fix: on a disconnect edge, `dispose_disconnected_slots` tears down every slot
+  bound to the port (storage/FTDI/HID bindings cleared, DISABLE_SLOT queued,
+  `reset_soft_state`) so a re-plug enumerates as a fresh connect. A disconnect on
+  the port currently mid-enumeration instead arms `enum_saw_disconnect` + a
+  deferred re-queue (`requeue_after_settle`, drained at the top of
+  `start_next_port`) so a device replugged during its own enumeration is not lost
+  while the in-flight FSM keeps ownership of its half-built slot. The
+  reset-artifact CSC (CCS stable, no disconnect edge) is still swallowed.
+
+- **M2 — hub-downstream zeroed-descriptor retry.** A device downstream of a
+  working hub enumerated as `class=0x0 vid=0000 pid=0000` + "no HID interrupt
+  endpoint" — GET_DESCRIPTOR(device) returned all zeros (the documented vid=0000
+  hub-downstream intermittency). `enumerate_downstream` now retries the 18-byte
+  device-descriptor read up to `XENUM_DESC_RETRIES` (4) times whenever it reads
+  all-zero/short (`bLength < 18` or `bDescriptorType != 0x01`), zeroing the buffer
+  before each attempt and pacing a settle between them. A descriptor that never
+  reads valid leaves the device **unconfigured** (honest), not enumerated.
+
+- **M3 — SuperSpeed hub descriptor (0x2A).** A USB3 hub read "0 downstream ports
+  (characteristics 0x0903)" because `bring_up_hub` always requested the USB2 Hub
+  Descriptor (`bDescriptorType` 0x29); SuperSpeed hubs answer the SuperSpeed Hub
+  Descriptor (0x2A). `bring_up_hub` now branches on the hub's trained speed
+  (slot-context Speed field, SS IDs ≥ 4): 0x2A for SS, 0x29 for HS/FS. A hub
+  reporting 0 ports is treated as a failed bring-up (aborted) rather than a
+  silently-marked 0-port hub that strands every device behind it.
+
+Bench-assertable trace substrings: `torn down on disconnect` / `re-queuing
+deferred hot re-plug` (M1), `device-descriptor all-zero/short` /
+`never read valid after` (M2), `desc-type 0x2a` / `reported 0 downstream ports`
+(M3), and the `HUB slot N speed S (SS|HS/FS) desc-type 0xNN: P downstream ports`
+line the QEMU hub path already prints.
+
 ---
 
 ## 8. Status and limitations
 
 Implemented: controller bring-up + BIOS→OS handoff, interrupt-driven event
 delivery, device enumeration (with connect debounce + bounded, paced retry
-recovery), single-tier USB hubs (HID **and mass storage** downstream), BOT
-mass-storage read/write, and HID input. aarch64 uses a polled variant (no
-interrupts there yet).
+recovery, hot-plug re-enumeration after disconnect, and a bounded retry on a
+zeroed hub-downstream descriptor read), single-tier USB hubs (HS/FS **and
+SuperSpeed** hubs; HID **and mass storage** downstream), BOT mass-storage
+read/write, and HID input. aarch64 uses a polled variant (no interrupts there
+yet). See §7c for the XENUM-1 enumeration-robustness fixes.
 
 Not yet implemented: endpoint STALL recovery, multi-tier hubs, and broader class
 support. The `skip_xhci` Cargo feature (`UNAOS_SKIP_XHCI=1`) disables USB bring-up

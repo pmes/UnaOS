@@ -10,6 +10,36 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-rmbp track — 2026-07-15 (XENUM-1 — xHCI enumeration robustness: hot-plug / hub-downstream / SS-hub)
+
+### XENUM-1 — three metal-observed enumeration/hub gaps closed additively 🔬 `hw-rmbp`
+
+**What it does:** hardens the shared xHCI enumeration/hub path against three real, metal-observed
+failures surfaced at the UI1-MOUSE bench (Peter: "hot swap usb does not work", "mouse won't work with
+hub"). All in `drivers/xhci/mod.rs`, additive to the enum/hub path (storage BOT / FTDI / async-EP0 FSMs
+byte-behavior). **M1 — hot-plug CSC re-queue:** a live re-plug logged `CSC during enumeration (reset
+side-effect); not re-queuing` and never enumerated because a disconnect left the slot active; now a
+disconnect edge (CSC, CCS=0) tears down the port's slots (`dispose_disconnected_slots`) so a re-plug
+enumerates fresh, and a disconnect of the port mid-enumeration arms a deferred re-queue
+(`requeue_after_settle`). The classification crux: the reset WE issue asserts CSC with CCS **stable at 1**,
+so only a genuine CCS=0 edge arms the re-queue — it cannot loop on the reset artifact. **M2 —
+hub-downstream zeroed-descriptor retry:** a device behind a working hub read `class=0 vid=0000 pid=0000`;
+`enumerate_downstream` now retries the device-descriptor read 4× on an all-zero/short read
+(`bLength < 18` or `type != 0x01`), leaving a never-valid device unconfigured (honest). **M3 — SuperSpeed
+hub descriptor:** a USB3 hub read 0 ports because the driver requested the USB2 Hub Descriptor (0x29);
+`bring_up_hub` now branches on the hub's trained speed (slot-context Speed ≥ 4 → 0x2A SS, else 0x29) and
+aborts a 0-port hub. No `syscall.rs`/`irqstorage.rs`/`fat.rs`/`sched.rs`; no aarch64 files.
+
+**How it was tested:** 🔬 QEMU no-regression (QEMU models none of the silicon topology/timing bugs — the
+gate is that nothing regressed + the trace fires where reachable): `./arroyo check` both arches, no new
+warnings, zero aarch64 diffs; default `test 25` MISSION SUCCESS (usb-tablet + usb-mouse both enumerate,
+MOUSE-1 fires, proto=0 absolute + proto=2 relative); `UNAOS_IRQSTORAGE=1 UNAOS_FATIMG=sf test 200` full
+storage chain **PASS 25 / FAIL 0**, S8-write witness intact; `UNAOS_HUBSTORAGE=1 test 90` brings up the
+hubbed device + MISSION SUCCESS, M3 trace `HUB slot 1 speed 1 (HS/FS) desc-type 0x29: 8 downstream ports`;
+`test-arm 22` MISSION SUCCESS. **Metal PENDING** — attended rMBP bench (real hot-plug + hub + SS hub,
+LC-x86 coordinates); bench-assertable trace strings in the landing report. Commits `2228e0e` (M1) /
+`197a837` (M2) / `d8ab967` (M3). Unblocks PORTSW-1.
+
 ## hw-rmbp track — 2026-07-15 (UI1-MOUSE s1 — HID pointer metal-robustness + serial witness)
 
 ### UI1-MOUSE slice 1 — interrupt-IN pointer path made bench-assertable + Panther-Point-hardened 🔬 `hw-rmbp`
