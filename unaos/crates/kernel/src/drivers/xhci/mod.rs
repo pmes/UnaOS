@@ -855,6 +855,17 @@ pub struct XhciController {
     enum_cmd_phys: u64,
     /// Number of port resets issued for the current enumeration attempt (retry budget).
     enum_resets: u8,
+    /// M1 (XENUM-1): set when `enumerating_port` posts a GENUINE disconnect (CSC with CCS=0)
+    /// mid-flight. The USB reset we issue to enumerate a port itself asserts CSC, but with CCS
+    /// staying 1 the whole time — so a CCS=0 edge is the unambiguous "the device physically left"
+    /// signal that distinguishes a genuine hot re-plug from the self-induced reset artifact. Armed
+    /// only by a real CCS=0 edge (never by the reset artifact), so re-queuing off it cannot loop.
+    /// Cleared when a new port's enumeration begins.
+    enum_saw_disconnect: bool,
+    /// M1 (XENUM-1): ports to re-enumerate once the in-flight enumeration settles — a genuine
+    /// connect that arrived while a port was mid-enumeration (could not be reset immediately).
+    /// Drained into `ports_to_enumerate` at the top of `start_next_port`.
+    requeue_after_settle: Vec<u8>,
     /// The most recent enumeration stall (for `usbinfo`): where a port's enumeration died.
     last_stall: Option<EnumStall>,
     /// Total enumeration stalls since boot.
@@ -945,6 +956,8 @@ impl XhciController {
             hid_setproto_pending: Vec::new(),
             enum_active: false,
             enumerating_port: 0,
+            enum_saw_disconnect: false,
+            requeue_after_settle: Vec::new(),
             port_protocols,
             enum_stage: "idle",
             enum_stage_set_at: 0,
@@ -2304,15 +2317,40 @@ impl XhciController {
         // completion drains the queue), so the one-at-a-time invariant holds.
         if changes & (1 << 17) != 0 {
             if (portsc & 1) != 0 {
-                // Ignore a CSC that is the side-effect of the USB reset we issue when
-                // enumerating a port, or of a device that already has an active slot:
-                // re-queuing would double-enumerate and starve the ports queued behind it.
+                // CONNECT edge (CCS=1). Three cases to tell apart (M1 / XENUM-1):
+                //   (a) the reset artifact — the USB reset WE issue for `enumerating_port` asserts
+                //       CSC while CCS stays 1 throughout. Never disturbed the connection, so no
+                //       CCS=0 edge preceded it (`enum_saw_disconnect` false). SWALLOW — re-queuing
+                //       it would re-reset the port we are mid-resetting and loop forever.
+                //   (b) a genuine re-plug DURING this port's own enumeration — the device left
+                //       (a CCS=0 edge set `enum_saw_disconnect`) and came back. Can't reset it now
+                //       (enum in flight), so DEFER: re-queue once the in-flight enum settles.
+                //   (c) a genuine hot-plug on an idle port — queue and kick.
+                // The disconnect teardown below (CCS=0 branch) disposes an unplugged device's slot,
+                // so a re-plug of an already-enumerated device reaches (c) with `has_slot` false
+                // instead of being dropped as a "reset side-effect" (the metal rMBP failure).
                 let mid_enum = port_id == self.enumerating_port;
                 let has_slot = self.slots.iter().enumerate()
                     .any(|(i, s)| i != 0 && s.active && s.port_id == port_id);
-                if mid_enum || has_slot {
-                    serial_println!("xHCI: [Port {}] CSC during enumeration (reset side-effect); not re-queuing.", port_id);
+                if mid_enum {
+                    if self.enum_saw_disconnect {
+                        // (b) genuine reconnect mid-enumeration — defer, do not swallow.
+                        self.enum_saw_disconnect = false;
+                        if !self.requeue_after_settle.contains(&port_id) {
+                            self.requeue_after_settle.push(port_id);
+                        }
+                        serial_println!("xHCI: [Port {}] reconnect during enumeration; deferring re-queue until it settles.", port_id);
+                    } else {
+                        // (a) reset side-effect — CCS never dropped; swallow (loop guard).
+                        serial_println!("xHCI: [Port {}] CSC during enumeration (reset side-effect, CCS stable); not re-queuing.", port_id);
+                    }
+                } else if has_slot {
+                    // A CSC on a still-present, already-enumerated device with no disconnect edge:
+                    // a spurious connect-change (bounce that never dropped CCS). Re-enumerating a
+                    // live device would disrupt it; leave it be.
+                    serial_println!("xHCI: [Port {}] connect-change on an active device (no disconnect); not re-queuing.", port_id);
                 } else {
+                    // (c) genuine hot-plug on an idle port.
                     serial_println!("xHCI: [Port {}] device connected (hot-plug); queuing for enumeration.", port_id);
                     if !self.ports_to_enumerate.contains(&port_id) {
                         self.ports_to_enumerate.push(port_id);
@@ -2322,14 +2360,82 @@ impl XhciController {
                     }
                 }
             } else {
-                serial_println!("xHCI: [Port {}] device disconnected.", port_id);
+                // DISCONNECT edge (CCS=0). Tear down any slot bound to this port so a later re-plug
+                // enumerates as a fresh connect (case (c) above) instead of being dropped. If the
+                // disconnect is on the port we are actively enumerating, don't fight the in-flight
+                // FSM (recover_enumeration owns that slot) — just arm the deferred re-queue so the
+                // device isn't lost if it comes back before the enum gives up.
+                if port_id == self.enumerating_port {
+                    self.enum_saw_disconnect = true;
+                    serial_println!("xHCI: [Port {}] device left during its own enumeration; will re-queue after settle.", port_id);
+                } else {
+                    let disposed = self.dispose_disconnected_slots(port_id);
+                    serial_println!("xHCI: [Port {}] device disconnected ({} slot(s) torn down).", port_id, disposed);
+                }
             }
         }
+    }
+
+    /// M1 (XENUM-1): a device on `port` reported a genuine DISCONNECT (CSC with CCS=0). Tear down
+    /// every slot bound to that port so a subsequent hot re-plug is seen as a fresh connect
+    /// (`has_slot` honest) rather than dropped as a "reset side-effect". Before this a disconnect
+    /// left the slot active, so re-plugging an already-enumerated device (metal rMBP: unplug+replug
+    /// a mouse) hit the has_slot guard and never re-enumerated — the only workaround was a
+    /// power-cycle with the device pre-plugged. Mirrors the recovery disposal (storage/FTDI/HID
+    /// bindings cleared, DISABLE_SLOT queued) but, because the device is physically gone, disposes
+    /// even a "ready" storage slot (recovery's paranoia guard protects a live device across a
+    /// transient stall; a disconnect is not transient). Returns the number of slots torn down.
+    fn dispose_disconnected_slots(&mut self, port: u8) -> usize {
+        let mut n = 0usize;
+        for i in 1..self.slots.len() {
+            if !self.slots[i].active || self.slots[i].port_id != port {
+                continue;
+            }
+            if self.configuring_slot == i as u8 {
+                self.configuring_slot = 0;
+            }
+            if self.storage_slot == i as u8 {
+                self.storage_slot = 0;
+                self.storage_pending_bringup = false;
+                self.storage_note = "storage device disconnected";
+            }
+            if self.ftdi_configuring_slot == i as u8 {
+                self.ftdi_configuring_slot = 0;
+            }
+            if self.ftdi_slot == i as u8 {
+                self.ftdi_slot = 0;
+                self.ftdi_pending_bringup = false;
+                self.ftdi_pending = None;
+                ftdi::set_live(false);
+            }
+            self.hid_setproto_pending.retain(|s| *s != i as u8);
+            self.hubs_pending.retain(|s| *s != i as u8);
+            self.pending_ports.retain(|p| *p != port);
+            self.slots[i].reset_soft_state();
+            if !self.slots_to_disable.iter().any(|(s, _)| *s == i as u8) {
+                self.slots_to_disable.push((i as u8, 0));
+            }
+            serial_println!("xHCI: [Port {}] slot {} torn down on disconnect; queued for DISABLE_SLOT.", port, i);
+            n += 1;
+        }
+        n
     }
 
     /// Begin enumerating the next queued connected port. Called at boot and again each
     /// time a device finishes its setup, so at most one port is mid-enumeration.
     fn start_next_port(&mut self) {
+        // M1 (XENUM-1): fold in any port that asked to be re-enumerated once the in-flight
+        // enumeration settled (a genuine re-plug that arrived mid-enumeration). Draining here —
+        // the single point where the FSM goes idle — keeps the one-port-at-a-time invariant.
+        if !self.requeue_after_settle.is_empty() {
+            let deferred = core::mem::take(&mut self.requeue_after_settle);
+            for port in deferred {
+                if !self.ports_to_enumerate.contains(&port) {
+                    serial_println!("xHCI: [Port {}] re-queuing deferred hot re-plug for enumeration.", port);
+                    self.ports_to_enumerate.push(port);
+                }
+            }
+        }
         while let Some(port) = self.ports_to_enumerate.pop() {
             let portsc = self.read_portsc(port);
             if (portsc & 1) == 0 {
@@ -2351,6 +2457,7 @@ impl XhciController {
             }
             self.enum_active = true;
             self.enumerating_port = port;
+            self.enum_saw_disconnect = false; // M1: fresh disconnect tracking per enumeration
             self.enum_resets = 1;
             serial_println!("xHCI: === Enumerating Port {} (PORTSC={:#x}) ===", port, portsc);
             // Debounce BEFORE the first reset (USB 2.0 TATTDB: 100 ms of stable connection
