@@ -1489,6 +1489,47 @@ Spec promotions committed here; the granular arc detail is in each arc's own ent
   cross-process read/write + the namespace-lock witness + this open-any read + fsck) — attended, not owed by the
   QEMU gate.
 
+### STOR-1 S8 — writable dynamic on-disk files, OVERWRITE-ONLY (a RW open overwrites ANY on-disk file live) (2026-07-15) `hw-rmbp`
+- **What:** S7 opened arbitrary (non-staged/non-U10) on-disk files READ-ONLY; S8 retires that constraint.
+  `open_dynamic_ondisk` honors `mode` bit0, so a RW open gets `CAP_READ|CAP_WRITE` (still NO wstage — a dynamic
+  descriptor never stages). `sys_write_file` gains a DYNAMIC branch keyed on `FILE_DYNLEN != 0`, inserted right
+  after `file_desc_validate` and BEFORE the `FILE_WSTAGE == 0 → EIO` guard (which would otherwise reject the
+  wstage-less dynamic descriptor): CAS-claim `[offset, offset+want)` with `want = min(len, FILE_SIZE − offset)`,
+  validate the whole user source up front, then bounce page-at-a-time through a kernel `[u8; PAGE_SIZE]` to
+  `submit_write_file` BY the stored NAME (`dyn_write_live`, the `created_read_live` write twin). Modeled exactly
+  on `sys_read`'s S7 dynamic branch.
+- **Strictly OVERWRITE-ONLY:** a write AT/PAST EOF returns 0 — never grows. `write_at` by contract allocates no
+  clusters and touches no directory, so the on-disk SIZE stays == the descriptor's captured `FILE_SIZE` for the
+  boot even as CONTENT changes. ANY `submit_write_file` error or short chunk fails the WHOLE write `-EIO` (never a
+  masked partial — the CAS-advanced offset would make a partial-return silently skip bytes AND hide the error;
+  the ledgered N1 pattern the S7 read branch documents). Growth/allocation is explicitly OUT OF SCOPE.
+- **Deliberate widening (ledgered, not hidden):** any ring-3 task with `sys_open` can now overwrite any
+  genuinely-arbitrary on-disk file — PUBLIC-by-default for writes exactly as S7 made it PUBLIC for reads (a
+  dynamic file has no `U10_NAMES` id, so it never enters `OWNED_FILES`; invariant 5 = mirror created-file policy,
+  don't invent new policy). **Bounded by:** (1) MF2 stays closed by EXCLUSION — `sys_open_dynamic` canonicalizes
+  to 8.3 UPPERCASE and drops every staged name (HELLO.BIN EL0 code) and every U10 owned/created name in ANY
+  casing BEFORE the dynamic path, so a writable dynamic descriptor can only name a file that is neither code nor
+  ownable (`owned.bin` lowercase still refused — owner ACL intact); (2) overwrite-only (above); (3) no `ns_lock`
+  in the new path (outside the U10 mutation namespace — the S5 deadlock class stays closed).
+- **Witness:** `s8_write_witness` (`:: S8-write: … witness OK ::`, uncounted, knob-on FAT). RW-opens S8W.BIN (64
+  bytes of 0xA5, planted by `make-fat-img.sh`; non-staged/non-U10) via the REAL `sys_open_dynamic`, asserts
+  `CAP_WRITE` + `FILE_DYNLEN != 0` + size 64, overwrites a distinct 16-byte pattern live at offset 8
+  (`dyn_write_live`), reads it back == pattern, then RESTORES the 0xA5 seed and re-verifies — idempotent across
+  boots/power-cuts, image left pristine. NEGATIVE legs: a write claim at offset == size returns 0 (overwrite
+  never grows); a case-variant of staged code (`hello.bin`) RW is refused `< 0` (the MF2-under-S8 regression
+  lock).
+- **Gate:** `./arroyo check` both arches (on+off, zero aarch64, zero new warnings); knob-ON `UNAOS_IRQSTORAGE=1
+  UNAOS_FATIMG=sf test 200` = full prior chain 0 FAIL (S3/S4/S5/S6/S7 + u6gx + u11m2 intact) + the new
+  `:: S8-write: … witness OK ::`; knob-OFF `test 25` = MISSION and `UNAOS_FATIMG=sf test 200` = BYTE-IDENTICAL
+  (all S8 code `irqstorage`-gated + `FILE_DYNLEN`-keyed — no S8/dynamic lines); `UNAOS_NOSTORAGE` clean both.
+  Lane: `arch/x86_64/syscall.rs` + `scripts/make-fat-img.sh` + specs; `fat.rs`/`irqstorage.rs`/`sched.rs`/aarch64
+  untouched; **zero aarch64**.
+- **Residuals (ledgered, out of scope):** overwrite-only (no growth/allocation for arbitrary files — a writable
+  GROW path is future work); files > 2 GiB not openable (the `i32` stat channel); the widening is
+  public-by-default (a dynamic file has no owner ACL — same as S7 reads).
+- **Metal: PENDING** — QEMU-green; the attended rMBP bench promotes `round6-rmbp.spec`'s `PENDING S8-write` to
+  REQUIRE (joins the accrued STOR-1 bench batch).
+
 ## hw-pi4 track — 2026-07-10 (K1 M2–M4 — the U6 ACL SURVIVES REBOOT: persist + rebuild + gated enforcement + proofs)
 
 ### K1 M2.2/M2.3/M2.4 + M3 + M4 — `UNAFS.ATR` persistence LANDED 🔬 `hw-pi4`
