@@ -109,3 +109,26 @@ Note each experiment's serial transcript filename (`~/unaos-bench/jetson-serial-
 exact RAS lines (`ERROR: RAS Uncorrectable Error …`, `ADDR = …`, `IERR = …`) from any fault boot —
 run-to-run `ADDR` variation is itself H2 evidence. Feed the verdict to the next-arc decision (a fix
 arc, or the NVIDIA-collaboration angle §JM5-result names). ⚠ `dot_clean` the boot stick.
+
+---
+## ✅ BENCH VERDICT (2026-07-15 attended; serial `~/unaos-bench/jetson-serial-2026-07-15-smp2bench.log`)
+
+**7 boots (schedule 1–7), 7 CAPSTONEs, 0 RAS faults, 0 power-offs. THE WALL DID NOT REPRODUCE.**
+
+| boot | image | outcome |
+|---|---|---|
+| 1 | A (sel=0) | PASS — sweep: 8 GICR frames, `present=12` (3 clusters ALL answer OFF on a 6-core part; Aff2=3 −INVALID) |
+| 2 | H1 (sel=1) | PASS — PSCI 1.1; `FEATURES(CPU_ON)=0` ADVERTISED; `MIGRATE_INFO_TYPE=2` |
+| 3 | A | PASS — `present=12` identical |
+| 4 | H2 (sel=2) | PASS — RAS implemented, 2 records, BOTH clean (`V=0 UE=0`) → H2 weakened |
+| 5 | A | PASS |
+| 6 | **wall (sel=5)** | **SURPRISE — `CPU_ON RETURNED ret=0 — SURVIVED`** (aff `0x00000100`, HIGH entry `0x25b42135c`); boot continued to CAPSTONE + shell |
+| 7 | A | PASS — box healthy post-CPU_ON; bracket closed |
+
+Boot 8 (exp3) **SKIPPED** under the pre-registered surprise-STOP rule — exp5's survival mooted the
+entry-PA discrimination. **Verdict: the JM5 `CPU_ON` wall is firmware-era, fixed upstream — NOT
+reproducible on UEFI `t23x_general 39.2.0-gcid-45755727 (2026-06-01)`.** Consequences: (a) the
+born-fixed `smp_virt` bring-up is UNBLOCKED on Orin silicon — the 6-core bring-up is a proper next
+arc; (b) presence MUST gate on the DTB `/cpus` (6 real cores), NOT `AFFINITY_INFO` (answers OFF for
+fuse-disabled slots — 12 "valid" on a 6-core part) and NOT the GICR walk alone (8 frames); (c) the
+UEFI firmware build line is a recorded PRECONDITION of every future SMP bench.

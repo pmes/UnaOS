@@ -53,7 +53,20 @@ instrumented build (core3probe idiom) rides the next Pi arc's sitting to produce
 
 ---
 
-## aarch64 SMP — ORIN-SMP-2: the JM5 `CPU_ON` firmware-wall INVESTIGATION probe (`UNAOS_SMPPROBE`) — 2026-07-15 🔬 code + runbook; bench Peter-attended `hw-jetson`
+## aarch64 SMP — ORIN-SMP-2: the JM5 `CPU_ON` firmware-wall INVESTIGATION probe (`UNAOS_SMPPROBE`) — 2026-07-15 ✅ BENCHED — **VERDICT: THE WALL IS GONE on current firmware** `hw-jetson`
+
+**Attended bench 2026-07-15 (serial `jetson-serial-2026-07-15-smp2bench.log`): 7 boots, 7 CAPSTONEs, 0
+RAS faults, 0 power-offs.** Boot 6 (`smpprobe5`, the pre-registered wall reproduction) SURVIVED — `CPU_ON`
+to aff `0x00000100` with the HIGH (~9.5 GiB) kernel entry **returned 0 (SUCCESS)**, boot ran through
+CAPSTONE to the shell; the closing A-control proved the box healthy. The JM5 `CPU_ON` wall is NOT
+reproducible on UEFI 39.2.0 (2026-06-01 build) — resolved as firmware-era, fixed upstream. Supporting
+census: PSCI 1.1, `FEATURES(CPU_ON)=0` advertised, `MIGRATE_INFO_TYPE=2`; RAS records clean pre-CPU_ON
+(H2 weakened); exp3 SKIPPED under the pre-registered surprise-STOP rule (exp5's survival mooted the
+entry-PA discrimination). ⚠ NEW SILICON DATA for the bring-up arc: `AFFINITY_INFO` reports **12 valid
+slots (3 clusters, all OFF)** on the 6-core Nano while the GIC exposes **8 redistributor frames** —
+fuse-disabled cores are NOT distinguishable via PSCI queries; the presence gate must come from the DTB
+`/cpus` (6 real cores), never from AFFINITY_INFO. ⚠ Firmware version is now a BENCH PRECONDITION —
+record the UEFI build line every SMP bench; the wall may return on older firmware.
 
 **What it does:** ships instrumentation to discriminate §JM5-result's four ranked hypotheses for why
 the *first* PSCI `CPU_ON` on real Orin raises a fatal Tegra CBB-fabric RAS Uncorrectable Error while
