@@ -2922,6 +2922,73 @@ FAIL** (this battery protects `fat.rs`, shared with the Pi image); `./arroyo tes
 (x86, `fat.rs` shared there too). As in JD2–JD15 the shell command path is not headless-reachable in-lane, so
 the shell-level `ls -l` verdict is **attended-pending** (bench card `unaos/scripts/jd16-bench.md`).
 
+### JD17 — the KERNEL CLOCK: `setdate`-seeded wall time that stamps FAT mtime
+
+§JD16 exposed the honest gap: with no RTC the kernel reads, every kernel-written FAT entry carried an all-zero
+mtime and `ls -l` showed a dashed placeholder. JD17 closes that gap **without inventing a clock**: the operator
+seeds a wall-clock once per boot, the free-running architectural counter extends it forward, and the FAT
+create/write **publication** paths stamp mtime from it — but only when the operator has actually set it. UNSET
+stays first-class and honest.
+
+**The clock service (`clock.rs`, new).** A `WallTime { year, month, day, hour, min, sec }` (calendar-validated
+to the FAT-representable span **1980..=2107**) plus:
+- `set(t)` plants an **anchor**: `base_secs` (whole seconds since the 1980-01-01 epoch) paired with the
+  architectural counter reading at the moment of setting, under a small `spin::Mutex`. Re-seeding replaces the
+  anchor — the operator's correction wins. Out-of-range input returns `Err(())` (the shell shows a usage line).
+- `now()` = `base_secs + (CNTPCT_now − anchor_ticks) / CNTFRQ`, or `None` while never set this boot. The
+  counter is the **same JD3 timerless mechanism** (`CNTPCT_EL0`/`CNTFRQ_EL0`, EL-independent, never stops) the
+  BOT pump and JD4 screen-on-boot deadline already ride.
+- `fat_stamp()` packs `now()` into the two on-disk words `(time @0x16, date @0x18)` — bit-for-bit the inverse
+  of §JD16's `DirEntry::mtime()` decode (DATE: `year−1980`/month/day; TIME: hour/min/`sec÷2`) — and returns
+  **`(0, 0)` while unset**, byte-identical to the pre-JD17 zeroed field that `ls -l` renders as the dash.
+
+`from_secs` **saturates at end-2107** (the last FAT-representable moment) rather than wrapping or panicking, so
+a clock left running for 128 years degrades to a pinned honest maximum. Resolution is **2 seconds** (the FAT
+packing truncates the low second bit) and there is **no timezone** — FAT stores local wall time with no offset,
+exactly as §JD16 documented on the read side.
+
+**The frozen-x86 note — stated honestly.** No calibrated invariant-frequency counter is plumbed on x86_64 in
+this kernel (the TSC frequency is measured nowhere), so `monotonic()` returns `None` there and a set clock is
+**frozen at its seeded second** (elapsed = 0). No x86 caller sets the clock today; the `date`/`setdate` verbs
+merely compile. x86 monotonic calibration is explicitly **out of scope** (a named future arc).
+
+**The shell (`shell.rs`).** Two additive arms: `date` prints the current wall clock or `date: clock not set`
+when unset; `setdate YYYY-MM-DD HH:MM[:SS]` (seconds optional, default 0) seeds it. `parse_setdate` enforces
+the strict field shapes (dash/colon-separated decimals) and hands the numbers to `clock::set`, which owns the
+range validation. A `CLOCK:` help line was added.
+
+**The FAT write-side (`fat.rs`) — publication paths only, RMW-riding, no new lock.** The stamp lands in the
+**existing** `with_dir_lock` sector RMWs — no extra I/O, no second crash window:
+- **Both create twins** (`create_in_root`/`create_in_dir` — the VERBATIM-TWINNED slot write, kept in sync)
+  stamp the two mtime words in the same slot write. The slot is pre-zeroed, so `(0,0)`-when-unset is
+  byte-identical to the pre-JD17 create.
+- **`write_grow` step-4 publish** calls a new sibling `write_dir_entry_fields_mtime` — identical to
+  `write_dir_entry_fields` (the same `first_cluster`+`size` single-sector RMW) but additionally refreshing the
+  mtime words. Crucially, **when the clock is UNSET it leaves the existing on-disk words UNTOUCHED** — a
+  host-stamped file rewritten by a clockless kernel **keeps its old stamp** rather than being zeroed (strictly
+  less destructive than fabricating or erasing).
+
+**What does NOT refresh mtime this arc — the honest gap.** The stamp lands **only on entry-publication paths**
+(the two creates and `write_grow`'s step-4 publish). `fat.write_at` — the strictly-bounded **in-place
+overwrite** — stays **completely untouched**: it is guaranteed dir-untouched / never-grows / never-allocs, and
+the x86 S8 witness and the S3 write-through path lean on exactly that contract. Consequence, stated plainly: a
+**pure in-place overwrite does not refresh mtime this arc**. This is not user-visible from the panel shell —
+its `write` verb is truncate-recreate (a create, stamped) and its append is `write_grow` (stamped), so **every
+shell mutation still stamps**; the only unstamped path is the EL0 in-place `sys_write` syscall, and refreshing
+it would widen the S8 reconciliation surface for no shell-visible gain. `rename_entry`/`move_entry` keep the
+plain (non-mtime) sibling on purpose — **a rename/move preserves mtime**, and a fresh directory entry was
+already stamped at create.
+
+**The unset-honesty contract, in one line.** The kernel never fabricates a reading: unset ⇒ `now()` is `None`,
+`fat_stamp()` is `(0,0)`, creates write zero (the dash), and rewrites preserve whatever the on-disk stamp was.
+
+**Gate (QEMU):** `./arroyo check` + `UNAOS_TEGRA=1 ./arroyo check` green both arches (no new warnings);
+`./arroyo test-arm 22` → `MISSION SUCCESS`; `UNAOS_GICV3=1 ./arroyo test-arm 40` → CAPSTONE 6/6;
+`./arroyo kernel8-test` → **0 FAIL** (this battery protects `fat.rs`, shared with the Pi image);
+`UNAOS_HUBSTORAGE=1 ./arroyo test 25` → `MISSION SUCCESS` (x86, shared shell/fat guard). The wall-clock stamp
+is not headless-reachable in-lane, so the shell-level verdict is **attended-pending** (bench card
+`unaos/scripts/jd17-bench.md`).
+
 ## 4. Jetson Orin Nano headless bring-up (Arc JM2)
 
 The Orin is brought up **headless over serial**. The only console that has ever
