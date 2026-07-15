@@ -41,6 +41,7 @@ pub mod selftest;
 pub mod pal;
 pub mod ui;
 pub mod video;
+pub mod clock;
 pub mod console;
 pub mod user;
 pub mod vug;

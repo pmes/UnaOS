@@ -1214,6 +1214,36 @@ fn fs_tail(console: &mut Console, arg: &str, n: u32) {
     }
 }
 
+/// JD17: parse the `setdate` argument pair — `YYYY-MM-DD HH:MM[:SS]`. Strict shapes (dash- and
+/// colon-separated decimal fields, seconds optional and defaulting to 0); range validation is
+/// `clock::set`'s (`WallTime::is_valid`), so this only has to produce the numbers honestly.
+fn parse_setdate(args: &[&str]) -> Option<crate::clock::WallTime> {
+    if args.len() != 2 {
+        return None;
+    }
+    let num = |s: &str| -> Option<u32> {
+        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        s.parse::<u32>().ok()
+    };
+    let mut d = args[0].split('-');
+    let (year, month, day) = (num(d.next()?)?, num(d.next()?)?, num(d.next()?)?);
+    if d.next().is_some() {
+        return None;
+    }
+    let mut t = args[1].split(':');
+    let (hour, min) = (num(t.next()?)?, num(t.next()?)?);
+    let sec = match t.next() {
+        Some(s) => num(s)?,
+        None => 0,
+    };
+    if t.next().is_some() {
+        return None;
+    }
+    Some(crate::clock::WallTime { year, month, day, hour, min, sec })
+}
+
 /// JD16: format one entry's FAT last-write timestamp as a fixed-width `YYYY-MM-DD HH:MM:SS` field for
 /// the `ls -l` long listing. A zeroed on-disk stamp (a host tool that left it 0, or a kernel-written
 /// entry — the kernel has no RTC to stamp with; see §JD16) is shown honestly as a dashed placeholder of
@@ -1628,11 +1658,36 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             console.println("UNAFS:    uls [path], ucat <path>  (native unafs volume, absolute paths)");
             #[cfg(target_arch = "aarch64")]
             console.println("          utouch <path>, uwrite <path> <text>, umkdir <path>, urm <path>  (write-through)");
+            console.println("CLOCK:    date, setdate YYYY-MM-DD HH:MM[:SS]  (seeds mtime stamps; unset = honest dashes)");
             console.println("SMP:      sched (per-CPU run queues), pulse (full-screen CPU monitor)");
             console.println("TEST:     tste (in-OS self-test suite: boot-replay + live checks)");
             console.println("NETWORK:  netinfo, ping <ip> [count], arp <ip>");
             console.println("          connect <ip> <port> [message], udpsend <ip> <port> [message]");
             console.println("          get <ip> [port] [path]  (HTTP/1.0 GET)");
+        },
+        "date" => {
+            // JD17: show the kernel wall clock. UNSET is first-class and honest — the kernel has
+            // no RTC, so until the operator seeds it with `setdate` there is no time to show.
+            match crate::clock::now() {
+                Some(t) => console.println(&alloc::format!(
+                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                    t.year, t.month, t.day, t.hour, t.min, t.sec)),
+                None => console.println("date: clock not set (setdate YYYY-MM-DD HH:MM:SS)"),
+            }
+        },
+        "setdate" => {
+            // JD17: seed the wall clock — `setdate YYYY-MM-DD HH:MM:SS` (seconds optional). The
+            // architectural counter extends it forward from this moment; new/rewritten FAT
+            // entries are mtime-stamped from it. Re-seeding replaces the anchor.
+            match parse_setdate(&args) {
+                Some(t) if crate::clock::set(t).is_ok() => {
+                    console.println(&alloc::format!(
+                        "clock set: {:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                        t.year, t.month, t.day, t.hour, t.min, t.sec));
+                }
+                _ => console.println(
+                    "setdate: usage: setdate YYYY-MM-DD HH:MM[:SS]  (year 1980-2107)"),
+            }
         },
         "clear" => {
             // Clear both the screen and the console buffer?
