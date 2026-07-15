@@ -238,9 +238,25 @@ flagged upward separately.
 
 **Gate:** `./arroyo check` green both arches; `kernel8` builds clean; `kernel8-test` byte-equivalent
 (41 PASS, CAPSTONE 6/6 on APs [1,2,3], K3-mount `[w=0x1ff]` + K4-write `[w=0x7f]` + F2/F3 locked
-240000/240000, 0 forbidden); `test-arm` MISSION SUCCESS (virt untouched). **Metal 4/4 confirmation
-on a >1 MiB build is pending the attended bench** (LC-pi coordinates) — the real verdict, since QEMU
-brings up 4/4 at every size and can never reproduce the regression.
+240000/240000, 0 forbidden); `test-arm` MISSION SUCCESS (virt untouched). QEMU brings up 4/4 at
+every size and can never reproduce the regression — the real verdict was always metal.
+
+**✅✅ METAL-CONFIRMED (2026-07-15 attended Pi bench, Peter physical, boot 1 — the verdict).**
+A **>1 MiB build (`kernel8.img` 712,464 B loaded to `0x80000` — squarely the failing regime)
+brought ALL FOUR cores online**: cores 1/2/3 each logged their own correct id, **no phantom
+"core 0"**, no bring-up timeout, all 3 IPIs OK, and **CAPSTONE ran 6/6 COMPLETE** (workers on
+cores 2 + 3) — **the first full-core boot in the >1 MiB regime since the regression.** Same boot:
+F2/F3 witnesses both `locked 240000/240000 intact` (unlocked lost exactly 50%) under true 4-core
+parallelism, K3-mount `[w=0x1ff]`, K4-write `[w=0x7f]`, and **two rider captures** — **K3-revoke
+`[w=0x7f]`** (the SYS_FGRANT two-phase durable-first revoke ordering exercised against the REAL
+card — previously QEMU-only) and **K5-lockspan `[w=0x3f]`** (revoke/re-persist ns-span + create
+gate on silicon). **Zero forbidden lines** (no PANIC/EXCEPTION/CMD13/R1/heal). Caveat, verbatim
+from the bench: the boot showed the documented stale-fixture signature (card not re-prepped since
+the probe bench's 3 boots) — U9/U10 false-FAIL-looking lines (`sector_changed=false` /
+`size_grew=false`) + U10-create/U11/U6-grants `(stale image) — demo skipped`. Documented
+signature, NOT regressions (0 forbidden, `cleared=true killed=0`); the strict pristine-card 32/32
+line rides the next Pi sitting after a card re-prep. Serial: `~/unaos-bench/` (bridge capture,
+2026-07-15). Core-3-down on >1 MiB images is no longer an expected signature.
 
 **Scheduler on the `virt` path — the boot core, since JC3.** The aarch64 scheduler
 was `#[cfg(feature = "baremetal")]`-gated and coupled to EL1 (`ELR_EL1`/`SPSR_EL1`
