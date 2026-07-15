@@ -91,3 +91,18 @@ Boot the armed image. Expect on serial (reconstruct with `awk '/AARCH64 SMP: ORI
 Verdict = the attended observation + the serial capture (`~/unaos-bench/jetson-serial-…-smp3.log`).
 Fold ✅/notes into `arch_arm64.md §ORIN-SMP-3` + MILESTONES (⏳ → ✅ METAL-CONFIRMED) at the next
 seat/Maestro pass.
+
+---
+## ⛔ BENCH STOP VERDICT (2026-07-15 night; serial `~/unaos-bench/jetson-serial-2026-07-15-smp3bench.log`)
+
+Firmware precondition MATCHED (39.2.0 banner). Enumeration 6/6 (real fused topology: cluster0 `0x0..0x300`,
+cluster1 `0x10200/0x10300`). Then, BEFORE any `CPU_ON AP ->` result line, ×2 reproducible: `Exception
+reason=1 syndrome=0x82000010` + RAS Uncorrectable **IOB** (base `0xe010000`, Status `0xe4000612`,
+SERR=0x12 slave-error, IERR=CBB Interface 0x6, **ADDR=`0x8000000000000200`**) + **ACI** (base `0xe01a000`)
+→ box reset. STOP after the second fault; no improvised legs.
+
+**Discrimination vs SMP-2 exp5 (same firmware, same target aff `0x00000100`):** exp5 entry =
+`_smpprobe_park` → SURVIVED; SMP-3 entry = `_secondary_start_virt` (real path) → FAULTS.
+**Firmware `CPU_ON` works; the woken core's early execution drives the CBB-rejected access.**
+Next: ORIN-SMP-4 pre-registered execution bisect (park control → +SP → +regime → +MMU → +exceptions →
++GICR → full; GICR = prime suspect — 8 frames on a 6-core part; fault ADDR smells like an MMIO window).

@@ -203,7 +203,21 @@ instrumented build (core3probe idiom) rides the next Pi arc's sitting to produce
 
 ---
 
-## aarch64 SMP — ORIN-SMP-3: the real 6-core Orin bring-up (`UNAOS_TEGRASMP`) — 2026-07-15 ⏳ QEMU-green + build; metal attended-pending `hw-jetson`
+## aarch64 SMP — ORIN-SMP-3: the real 6-core Orin bring-up (`UNAOS_TEGRASMP`) — 2026-07-15 ⛔ METAL STOP — RAS-faults in the woken core's EARLY EXECUTION (the true wall, discriminated) `hw-jetson`
+
+**Attended bench 2026-07-15 night (serial `jetson-serial-2026-07-15-smp3bench.log`): STOP after 2
+identical faults.** Firmware precondition MATCHED (39.2.0 in-banner); DTB enumeration perfect — the real
+fused topology surfaced for the first time (cluster0 cores 0–3 = aff `0x0..0x300`, cluster1 cores 2–3 =
+aff `0x10200/0x10300`); then, BEFORE any `CPU_ON AP ->` result line: `Exception reason=1
+syndrome=0x82000010` + **RAS Uncorrectable IOB (Status `0xe4000612`, SERR=0x12 slave-error, IERR=CBB
+Interface 0x6, ADDR=`0x8000000000000200`) + ACI**, box reset — ×2 reproducible, no improvised legs.
+**THE DISCRIMINATION (vs SMP-2 exp5, same firmware, same first target aff `0x00000100`):** exp5's entry
+was `_smpprobe_park` (instant park) and SURVIVED; SMP-3's entry is the real `_secondary_start_virt`
+(SP → SEC_CTX regime replay → `enable_mmu_virt` → exceptions → GICR) and FAULTS ⇒ **firmware `CPU_ON`
+works; the woken core's early execution drives a CBB-rejected access — the wall is OUR path.** The
+code stays merged (knob-gated, default-OFF, byte-identical). NEXT: ORIN-SMP-4, the pre-registered
+execution BISECT (leg 0 = the proven park control; one variable per leg; the GICR leg is the prime
+suspect — 8 exposed frames on a 6-core part, and the fault ADDR smells like an MMIO window).
 
 **What it does:** wires the tegra SMP kick-off the born-fixed §ORIN-SMP bring-up was waiting on, now
 that ORIN-SMP-2's bench proved the JM5 `CPU_ON` wall is gone on current firmware. `UNAOS_TEGRASMP=1`
@@ -229,7 +243,16 @@ metal verdict is the attended Orin bench (LC-orin + Peter) per `unaos/scripts/or
 `arch/aarch64/smp_virt.rs::start_secondaries_tegra` + `fdt_tegra::cpu_affinities` + `arch_arm64.md
 §ORIN-SMP-3`.
 
-## aarch64 SMP — ORIN-SMP-2: the JM5 `CPU_ON` firmware-wall INVESTIGATION probe (`UNAOS_SMPPROBE`) — 2026-07-15 ✅ BENCHED — **VERDICT: THE WALL IS GONE on current firmware** `hw-jetson`
+## aarch64 SMP — ORIN-SMP-2: the JM5 `CPU_ON` firmware-wall INVESTIGATION probe (`UNAOS_SMPPROBE`) — 2026-07-15 ✅ BENCHED — **VERDICT (as amended by the SMP-3 bench): the CPU_ON-CALL fault is gone; the wall is the woken core's EARLY EXECUTION** `hw-jetson`
+
+**⚠ AMENDMENT (2026-07-15 night, same day):** this bench's original headline — "the wall is gone" — was
+a correct reading of the evidence available then (exp5's `CPU_ON` returned SUCCESS, box healthy), but
+the SMP-3 bring-up bench hours later showed the surviving exp5 owed its survival to its `_smpprobe_park`
+entry (the woken core parked instantly). Waking the same core into the REAL secondary path RAS-faults
+(IOB SERR=0x12 / CBB-0x6 / ADDR `0x8000000000000200`). **Corrected verdict: firmware `CPU_ON` itself
+works on UEFI 39.2.0 (that much stands); the JM5 wall is the woken core's early execution — our path,
+not the firmware call.** Everything else below (census, clean RAS records, oracle discrepancy, the
+7-boot A-B-A) stands unchanged.
 
 **Attended bench 2026-07-15 (serial `jetson-serial-2026-07-15-smp2bench.log`): 7 boots, 7 CAPSTONEs, 0
 RAS faults, 0 power-offs.** Boot 6 (`smpprobe5`, the pre-registered wall reproduction) SURVIVED — `CPU_ON`
