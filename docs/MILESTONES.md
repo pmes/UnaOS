@@ -299,6 +299,36 @@ Spec promotions committed here; the granular arc detail is in each arc's own ent
 
 ---
 
+## hw-jetson track — 2026-07-15 (JD18 — read-only tree tools: `find` + `du` + `uptime`)
+
+### JD18 — read-only TREE TOOLS: `find` (recursive glob search), `du` (subtree size tally), `uptime` (`shell.rs`; one additive `clock.rs` helper) ⏳ attended-pending
+- **Why:** the file-manager verb set is closed; JD18 adds three read-only surveying tools built entirely from
+  primitives already shipped — no new `fat.rs` surface, zero mutation.
+- **How (all `shell.rs`, composing the JD9/JD13 `read_dir` SNAPSHOT walk + JD12 `glob_match`, `.`/`..` filtered,
+  `CP_MAX_DEPTH` bound = honest `-ELOOP`, honest partial on a mid-walk `-EIO`):**
+  - **`find <root> <pattern>`** (one arg = pattern, root defaults to `.`): walks under `<root>`, matches each
+    8.3 name with the existing `glob_match` (case-insensitive; `*`/`?`; literal = exact), prints each hit as
+    its full canonical path (dirs trailing `/`), then `N match(es), M dir(s) scanned` (dirs = every `read_dir`
+    level). Missing root → `-ENOENT`; a FILE root degrades to a POSIX self-match test (`0 dir(s) scanned`).
+  - **`du <dir>`** (default cwd): per direct child prints total bytes (a file = its size, a dir = the recursive
+    subtree sum), then `total: N byte(s) in M file(s), K dir(s)`. **FAT directory entries report size 0** — only
+    file bytes are real. `du FILE` = its one line.
+  - **`uptime`:** seconds since boot from a small **additive** `clock::uptime_secs()` (aarch64
+    `CNTPCT/CNTFRQ`, x86 `None` — reads the same `monotonic()` source WITHOUT touching the JD17 anchor/`now()`),
+    rendered `up HH:MM:SS`; appends the JD17 wall clock when set. x86 → honest "no calibrated counter on this arch".
+- **Not in scope:** any mutation, `find -exec`/`-type`, mid-path globs, `du -h`, sorting beyond walk order.
+- **Tested (QEMU):** `check` + `UNAOS_TEGRA=1 check` green both arches (no new warnings); `test-arm 22` MISSION;
+  `UNAOS_GICV3=1 test-arm 40` CAPSTONE 6/6; `kernel8-test` **0 FAIL**; `UNAOS_HUBSTORAGE=1 test 25` MISSION;
+  `esp-jetson` links, `tegra:` COUNT unchanged (these verbs add no `tegra:` token; built LAST). Lane clean:
+  `shell.rs` + one additive `clock.rs` helper + docs + `jd18-bench.md`; `fat.rs` untouched.
+- **Metal:** ⏳ **attended-pending** — `jd18-bench.md`: seed a nested tree → `find` by glob → `du` tallies match
+  the seeded sizes → `uptime` sane + monotonic across two reads → all again after a power-cycle. ⚠ `dot_clean`
+  BOTH cards.
+- **Detail:** [`arch_arm64.md` §JD18](dev/OS/01_BOOT_HAL/arch_arm64.md). **Commit:** on `hw-jetson` (the seat
+  assigns the integration hash at merge).
+
+---
+
 ## hw-jetson track — 2026-07-15 (JD17 — the kernel clock: `setdate`-seeded wall time stamping FAT mtime)
 
 ### JD17 — kernel WALL CLOCK: `setdate`-seeded, counter-extended time that stamps FAT mtime (`clock.rs` new; `shell.rs`; `fat.rs` write-side) ⏳ attended-pending
