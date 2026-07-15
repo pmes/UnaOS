@@ -90,6 +90,10 @@ pub enum ExcludeClass {
     Junk,
     /// Credential-shaped (Rider 2 default-deny) — reported distinctly.
     Credential,
+    /// A symbolic link. Arc-1 SKIPS symlinks (documented) but NEVER silently:
+    /// following one would open a copy-external-content-into-the-mirror hole,
+    /// so each is surfaced as its own reported class and never dereferenced.
+    Symlink,
 }
 
 impl ExcludeRules {
@@ -669,6 +673,7 @@ impl SyncPlan {
                     let tag = match class {
                         ExcludeClass::Credential => "CREDENTIAL",
                         ExcludeClass::Junk => "junk",
+                        ExcludeClass::Symlink => "symlink (not followed)",
                     };
                     s.push_str(&format!("SKIP     pen  {} [{tag}]\n", rel.display()));
                 }
@@ -818,6 +823,8 @@ fn walk_penumbra(
             } else {
                 cur.join(&name)
             };
+            // DirEntry::metadata() does NOT follow symlinks — use that on
+            // purpose so a symlink is detected as itself, never dereferenced.
             let meta = match e.metadata() {
                 Ok(m) => m,
                 Err(_) => continue,
@@ -825,6 +832,13 @@ fn walk_penumbra(
             if let Some(class) = rules.classify(&rel) {
                 // Excluded: report it (dir OR file), and prune a dir subtree.
                 f(&rel, Some(class));
+                continue;
+            }
+            if meta.is_symlink() {
+                // Arc-1: symlinks are skipped (never followed — following
+                // would copy external content into the mirror) but ALWAYS
+                // reported. Never silent.
+                f(&rel, Some(ExcludeClass::Symlink));
                 continue;
             }
             if meta.is_dir() {

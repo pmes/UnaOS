@@ -123,13 +123,18 @@ fn cmd_status(manifest: &std::path::Path) -> Result<()> {
     }
     if !s.excluded.is_empty() {
         let creds = s.excluded.iter().filter(|e| e.class == ExcludeClass::Credential).count();
+        let links = s.excluded.iter().filter(|e| e.class == ExcludeClass::Symlink).count();
         println!(
-            "  excluded: {} ({} CREDENTIAL-shaped, skipped by default-deny)",
+            "  excluded: {} ({} CREDENTIAL-shaped default-deny, {} symlinks not followed)",
             s.excluded.len(),
-            creds
+            creds,
+            links
         );
         for e in s.excluded.iter().filter(|e| e.class == ExcludeClass::Credential) {
             println!("    - CREDENTIAL skip: {}/{}", e.root.display(), e.rel.display());
+        }
+        for e in s.excluded.iter().filter(|e| e.class == ExcludeClass::Symlink) {
+            println!("    - symlink skip (not followed): {}/{}", e.root.display(), e.rel.display());
         }
     }
     Ok(())
@@ -141,7 +146,11 @@ fn cmd_snap(manifest: &std::path::Path) -> Result<()> {
     println!("SNAP {} -> {}", r.stamp, r.dir.display());
     println!("  bundles: {}  penumbra files: {}", r.bundles.len(), r.penumbra_files);
     let creds = r.excluded.iter().filter(|e| e.class == ExcludeClass::Credential).count();
-    println!("  excluded: {} ({creds} credential-shaped)", r.excluded.len());
+    let links = r.excluded.iter().filter(|e| e.class == ExcludeClass::Symlink).count();
+    println!(
+        "  excluded: {} ({creds} credential-shaped, {links} symlinks not followed)",
+        r.excluded.len()
+    );
     Ok(())
 }
 

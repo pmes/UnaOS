@@ -452,6 +452,75 @@ fn set_readonly(root: &Path, ro: bool) {
     go(root, ro);
 }
 
+// -- symlinks: skipped but NEVER silently (LC-orin lens should-fix) ----------
+
+#[test]
+fn symlinks_are_reported_never_followed_never_silent() {
+    let live = tempfile::tempdir().unwrap();
+    init_repo(live.path(), "a.txt", "x\n");
+    let pen = tempfile::tempdir().unwrap();
+    fs::write(pen.path().join("keep.md"), "hi\n").unwrap();
+    // An external file a symlink points at — must never be copied.
+    let outside = tempfile::tempdir().unwrap();
+    fs::write(outside.path().join("external.md"), "EXTERNAL\n").unwrap();
+    std::os::unix::fs::symlink(outside.path().join("external.md"), pen.path().join("link.md"))
+        .unwrap();
+    // A directory symlink too (Peter's plans tree has legacy unaos-* dir links).
+    std::os::unix::fs::symlink(outside.path(), pen.path().join("legacy-dir")).unwrap();
+    let target = tempfile::tempdir().unwrap();
+
+    let m = mk_manifest(
+        live.path(),
+        target.path(),
+        vec![RepoUnit { name: "r".into(), path: live.path().into(), worktree: false }],
+        vec![pen.path().into()],
+    );
+
+    // STATUS reports both symlinks, distinctly classed.
+    let s = status(&m).unwrap();
+    let links: Vec<_> = s
+        .excluded
+        .iter()
+        .filter(|e| e.class == ExcludeClass::Symlink)
+        .map(|e| e.rel.clone())
+        .collect();
+    assert!(links.contains(&PathBuf::from("link.md")), "excluded: {:?}", s.excluded);
+    assert!(links.contains(&PathBuf::from("legacy-dir")));
+
+    // Dry-run plan carries the skips.
+    let plan = plan_sync(&m).unwrap();
+    let root = pen.path().file_name().unwrap().to_str().unwrap();
+    assert!(plan.actions.contains(&PlannedAction::SkipExcluded {
+        rel: PathBuf::from(root).join("link.md"),
+        class: ExcludeClass::Symlink,
+    }));
+    assert!(plan.render().contains("symlink (not followed)"));
+
+    // Apply: symlink targets are NOT copied (never followed), skip reported in SNAP.
+    let (snap_rep, _) = apply_sync(&m).unwrap();
+    assert!(snap_rep.excluded.iter().any(|e| e.class == ExcludeClass::Symlink));
+    assert!(target.path().join("penumbra").join(root).join("keep.md").exists());
+    assert!(!target.path().join("penumbra").join(root).join("link.md").exists());
+    assert!(!target.path().join("penumbra").join(root).join("legacy-dir").exists());
+    // Nothing from the external tree leaked anywhere onto the target.
+    fn find_named(p: &Path, name: &str, hits: &mut Vec<PathBuf>) {
+        if let Ok(rd) = fs::read_dir(p) {
+            for e in rd.filter_map(|e| e.ok()) {
+                let path = e.path();
+                if path.file_name().and_then(|s| s.to_str()) == Some(name) {
+                    hits.push(path.clone());
+                }
+                if path.is_dir() {
+                    find_named(&path, name, hits);
+                }
+            }
+        }
+    }
+    let mut hits = Vec::new();
+    find_named(target.path(), "external.md", &mut hits);
+    assert!(hits.is_empty(), "external content leaked: {hits:?}");
+}
+
 // -- utc stamp --------------------------------------------------------------
 
 #[test]

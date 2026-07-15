@@ -83,6 +83,11 @@ reported distinctly in STATUS / dry-run (never silently dropped):
   `*.keychain`. The crate merges a built-in credential floor on top of whatever
   the manifest lists, so forgetting a pattern cannot leak a credential.
 
+Additionally, **symlinks are never followed** (dereferencing one would copy
+content from outside the manifest boundary into the mirror). Arc-1 skips them —
+but never silently: each symlink is surfaced as its own reported class in
+STATUS, the SYNC dry-run plan (`symlink (not followed)`), and SNAP reports.
+
 > **First real run is attended.** Every automated test runs against tempdir
 > fixtures. The first real `vaire status` and the first `vaire sync --apply`
 > against the live narino tree / `/Volumes/40G` are run by Peter — they are this
