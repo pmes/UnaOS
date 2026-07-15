@@ -3091,7 +3091,9 @@ Two read-only inspection verbs that expose the on-disk truth of a FAT entry — 
 
 **Not in scope:** any mutation, glob expansion for these two verbs, raw-LBA dumps (the `read <lba>` verb already covers that), and any FAT-internal walk beyond the public API.
 
-**Gate (QEMU):** `./arroyo check` + `UNAOS_TEGRA=1 ./arroyo check` green both arches (no new warnings); `./arroyo test-arm 22` → `MISSION SUCCESS`; `UNAOS_GICV3=1 ./arroyo test-arm 40` → CAPSTONE 6/6; `./arroyo kernel8-test` → **0 FAIL** (protects `fat.rs`, shared with the Pi image; these verbs add no `fat.rs` surface); `UNAOS_HUBSTORAGE=1 ./arroyo test 25` → `MISSION SUCCESS` (x86, shared shell guard); `UNAOS_TEGRA=1 ./arroyo esp-jetson` links, validate by `tegra:` COUNT (unchanged — these verbs add no `tegra:` token) never size, built LAST after `test-arm`. Exercised interactively, so the metal verdict is **⏳ attended-pending** — bench card `unaos/scripts/jd19-bench.md` (stat a host file vs a kernel-written file vs a dir vs the root; xd known content at offsets including past-EOF + the cap note).
+**Gate (QEMU):** `./arroyo check` + `UNAOS_TEGRA=1 ./arroyo check` green both arches (no new warnings); `./arroyo test-arm 22` → `MISSION SUCCESS`; `UNAOS_GICV3=1 ./arroyo test-arm 40` → CAPSTONE 6/6; `./arroyo kernel8-test` → **0 FAIL** (protects `fat.rs`, shared with the Pi image; these verbs add no `fat.rs` surface); `UNAOS_HUBSTORAGE=1 ./arroyo test 25` → `MISSION SUCCESS` (x86, shared shell guard); `UNAOS_TEGRA=1 ./arroyo esp-jetson` links, validate by `tegra:` COUNT (unchanged — these verbs add no `tegra:` token) never size, built LAST after `test-arm`. Exercised interactively; the metal verdict is **✅ METAL-CONFIRMED (2026-07-15 attended bench)** — the
+forensic view exact on silicon: attr/cluster/entry-LBA+slot surfaced, host mtime to the second, root/
+missing/dir/past-EOF all honest (bench card `unaos/scripts/jd19-bench.md`).
 
 ## 4. Jetson Orin Nano headless bring-up (Arc JM2)
 

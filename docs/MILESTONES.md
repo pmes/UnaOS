@@ -685,7 +685,12 @@ Spec promotions committed here; the granular arc detail is in each arc's own ent
 
 ## hw-jetson track — 2026-07-15 (JD19 — read-only forensic verbs: `stat` + `xd`)
 
-### JD19 — read-only FORENSIC verbs: `stat` (full on-disk detail), `xd` (bounded hexdump) (`shell.rs`; `fat.rs` call-never-edit) ⏳ attended-pending
+### JD19 — read-only FORENSIC verbs: `stat` (full on-disk detail), `xd` (bounded hexdump) (`shell.rs`; `fat.rs` call-never-edit) ✅ METAL-CONFIRMED 2026-07-15
+- **Metal (2026-07-15 attended, serial `jetson-serial-2026-07-15-jd19card.log`):** `stat` on a
+  host-written file showed kind/size/attr `0x20 [ARCHIVE]`/cluster `0x8`/mtime exact-to-the-second
+  (14:33:50, the recorded host write time)/dir-entry `LBA 178 slot +96`; `stat /` honest ("root has no
+  directory entry"); `-ENOENT` honest. `xd` dumped 16 bytes with correct hex+ASCII, sliced 6 bytes at
+  offset 5 with the honest `[... 5 more byte(s)]` note, refused past-EOF and a directory (`-EISDIR`).
 - **Why:** the file-manager + tree-survey verbs are closed; JD19 adds the on-disk truth view — what a
   directory slot actually holds, and a hexdump of a file's raw bytes.
 - **How (all `shell.rs`, riding `resolve_path`/`locate_in_dir`/`read_at` + one raw `block::read_block`; zero
