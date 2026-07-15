@@ -7,9 +7,17 @@ license = "LGPL-3.0-or-later"
 [features]
 default = []
 
+[[bin]]
+name = "vaire"
+path = "src/bin/vaire.rs"
+
 [dependencies]
 anyhow = "1.0"
 bandy = { path = "../../libs/bandy" }
+# The dev-tree Bolt manifest is a versioned, commented config file the crate
+# reads; serde + toml deserialize it (both already in the workspace lock).
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
 # git2 removed in favor of pure-Rust gix.
 # `status` powers the real is_dirty check (index-vs-worktree, tree-vs-index).
 gix = { version = "0.80", default-features = false, features = ["parallel", "revision", "blob-diff", "status"] }

@@ -28,6 +28,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use bandy::SMessage;
+
+/// The dev-tree Bolt (BOLT-1): STATUS / SNAP / SYNC of a source tree that must
+/// exist coherently on two drives, without the live-copy flip (SWITCH is arc 2).
+pub mod devtree;
 #[cfg(feature = "gtk4")]
 use gtk4::prelude::*;
 #[cfg(feature = "gtk4")]

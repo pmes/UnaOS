@@ -1,0 +1,89 @@
+# vaire dev-tree Bolt manifest (BOLT-1) — the unit boundary, versioned + commented.
+#
+# This file declares the ONE managed unit vaire cares about in arc 1: the UnaOS
+# development tree, which must exist coherently on two drives. The crate reads
+# it (serde/toml) and never derives paths from anywhere else.
+#
+# ⚠ RIDER 1 (Maestro): running vaire against these REAL paths is Peter-attended.
+#   The executor develops and tests only against tempdir fixtures — this file is
+#   the config the first attended run will use, not something the tests touch.
+#
+# ⚠ RIDER 2 (Maestro): the [exclude.credentials] list below is DEFAULT-DENY and
+#   security-adjacent. A matching file is skipped from the penumbra AND reported
+#   (never silently). The crate also merges a built-in credential floor on top of
+#   whatever is listed here, so forgetting a pattern cannot leak a credential.
+
+# Bolt label.
+name = "unaos-devtree"
+
+# Arc-1 fact: the live copy is ALWAYS the internal narino drive. There is no
+# flip in this arc (SWITCH is arc 2). Any other value is rejected at load.
+live = "narino"
+
+# Absolute roots. live_root is READ-ONLY to this arc (the narino-never-written
+# invariant); target_root is the only side written to (git mirror + penumbra +
+# .vaire-snaps).
+live_root   = "/Users/pmes/src/github.com/pmes/UnaOS"
+target_root = "/Volumes/40G"
+
+# The untracked "penumbra": trees copied file-by-file (manifest-bounded, NEVER a
+# bare `rsync -a`), with the exclusions below applied. The plans tree is the
+# canonical penumbra for the dev tree.
+penumbra = [
+    "/Users/pmes/.claude/plans/unaos",
+]
+
+# The git units mirrored on sync: the main repo plus its sibling worktrees. Each
+# worktree's `.git` is an absolute-path pointer file; STATUS surfaces those as a
+# flagged RED-for-switch row and NEVER rewrites them (that repointing is arc 2).
+[[repo]]
+name = "unaos"
+path = "/Users/pmes/src/github.com/pmes/UnaOS"
+
+[[repo]]
+name = "unaos-rmbp"
+path = "/Users/pmes/src/github.com/pmes/UnaOS-rmbp"
+worktree = true
+
+[[repo]]
+name = "unaos-pi4"
+path = "/Users/pmes/src/github.com/pmes/UnaOS-pi4"
+worktree = true
+
+[[repo]]
+name = "unaos-jetson"
+path = "/Users/pmes/src/github.com/pmes/UnaOS-jetson"
+worktree = true
+
+[[repo]]
+name = "unaos-bolt"
+path = "/Users/pmes/src/github.com/pmes/UnaOS-bolt"
+worktree = true
+
+[exclude]
+# Ordinary build/OS noise. A bare directory name (no `*`) prunes that whole
+# subtree wherever it appears; a `*`-glob matches filenames.
+junk = [
+    "target",
+    "node_modules",
+    ".DS_Store",
+    "*.o",
+    "*.elf",
+    "*.rlib",
+]
+
+# RIDER 2 — credential-shaped default-deny. The crate ALSO enforces a built-in
+# floor of these regardless of this list; keep this explicit for auditability.
+credentials = [
+    "*.pem",
+    "*.key",
+    "*_rsa*",
+    "*.p12",
+    "*token*",
+    "*secret*",
+    "*credential*",
+    ".env",
+    ".env.*",
+    ".netrc",
+    "*.keychain",
+]

@@ -5975,7 +5975,9 @@ dependencies = [
  "gix",
  "glib 0.21.5",
  "gtk4",
+ "serde",
  "tempfile",
+ "toml",
  "unafs",
 ]
 

@@ -15,13 +15,83 @@ The Loom exists so a workspace of interdependent units moves in crystalline
 lockstep, and so its whole state can be seen at a glance and captured as
 history. Three Rites define it:
 
-1. **SYNC — the Alignment.** Bring the workspace to a coherent state: pull
-   upstream, verify local ("dirty") changes are safe, re-link paths so the
-   whole compiles as one unit. *(Prospective — RITES-2.)*
+1. **SYNC — the Alignment.** Bring the workspace to a coherent state across the
+   drives it lives on: mirror committed history and copy the manifest-bounded
+   untracked penumbra. *(Implemented for the dev-tree Bolt — see below.)*
 2. **STATUS — the God View.** Report the branch, commit, and **Crystal Color**
    of every managed unit. *(Implemented — see below.)*
-3. **SNAP — the Forging.** Crystallize the entire workspace state into an
-   atomic, rebuildable release manifest. *(Prospective — RITES-2.)*
+3. **SNAP — the Forging.** Crystallize a point-in-time workspace state as an
+   atomic, rebuildable capture (git bundles + penumbra). *(Implemented for the
+   dev-tree Bolt — see below.)*
+
+## The dev-tree Bolt (BOLT-1) — STATUS / SNAP / SYNC
+
+The Loom's first *real* managed unit is UnaOS's own development tree: a source
+tree that must exist coherently on two physical drives — the **live** internal
+"narino" drive where work happens, and a **target** copy on a removable volume
+(`/Volumes/40G`). The `devtree` module adds three coherence verbs; the live-copy
+flip (**SWITCH**) is arc 2 and is deliberately absent here.
+
+The unit boundary is a **versioned, commented manifest** — `bolt.manifest.toml`
+— that the crate reads (serde/toml). It declares the live/target roots, the git
+units (the main repo plus its sibling worktrees), the untracked penumbra roots
+(the `~/.claude/plans/unaos` tree), and the exclusion rules.
+
+- **STATUS** (`vaire status`) — pure-read coherence truth: which copy is live
+  (arc-1 fact: always narino, no flip), per-repo git truth (branch, dirty files,
+  unpushed commits, worktree-pointer flag), the penumbra delta
+  (same / only-live / differs), the last-weave stamp, and the **Crystal Color**:
+  - **Green** — target present and fully coherent.
+  - **Amber** — target present but drift exists (a dirty working tree, a target
+    mirror behind live HEAD, or a penumbra difference).
+  - **Red** — target volume absent (unsyncable).
+
+  Git worktrees (whose `.git` is an absolute-path pointer file) are surfaced as a
+  flagged **RED-for-switch** row and **never rewritten** — repointing them is
+  arc 2's job.
+- **SNAP** (`vaire snap`) — a stamped point-in-time capture written to the
+  target under `<target>/.vaire-snaps/<UTCstamp>/`: a `git bundle --all` per repo
+  plus a manifest-bounded penumbra copy. Refuses honestly if the target volume
+  is absent.
+- **SYNC** (`vaire sync [--apply]`, narino→40G one-way) — **dry-run is the
+  default**: it prints the exact would-do plan (mirror each repo, copy each
+  new/changed penumbra file, and every excluded skip). `--apply` is required to
+  write, and an apply **always SNAPs first**. Git history moves through a bare
+  mirror on the target (`git push --mirror`, all refs incl. track branches); the
+  untracked penumbra is copied file-by-file strictly off the manifest — **never**
+  a bare `rsync -a` of the tree.
+
+### The narino-never-written invariant
+
+No code path in this arc writes, deletes, renames, or chmods anything under the
+live (narino) tree. This is provable by construction: the only write surface is
+the `devtree::Target` type, built solely from the manifest's `target_root`
+(there is no constructor accepting the live root as a write destination). The
+live side is only ever opened read-only — STATUS shells read-only `git` queries
+and reads penumbra bytes; SNAP reads the live repos to write bundles *into the
+Target*; SYNC pushes live refs *into the target mirror* and copies penumbra
+files *into the Target*.
+
+### The exclusion manifest (security-adjacent, default-deny)
+
+The penumbra is filtered by two exclusion classes declared in the manifest and
+reported distinctly in STATUS / dry-run (never silently dropped):
+
+- **junk** — `target`, `node_modules`, `.DS_Store`, `*.o`, `*.elf`, `*.rlib`.
+- **credentials** — **default-deny**: `*.pem`, `*.key`, `*_rsa*`, `*.p12`,
+  `*token*`, `*secret*`, `*credential*`, `.env` / `.env.*`, `.netrc`,
+  `*.keychain`. The crate merges a built-in credential floor on top of whatever
+  the manifest lists, so forgetting a pattern cannot leak a credential.
+
+Additionally, **symlinks are never followed** (dereferencing one would copy
+content from outside the manifest boundary into the mirror). Arc-1 skips them —
+but never silently: each symlink is surfaced as its own reported class in
+STATUS, the SYNC dry-run plan (`symlink (not followed)`), and SNAP reports.
+
+> **First real run is attended.** Every automated test runs against tempdir
+> fixtures. The first real `vaire status` and the first `vaire sync --apply`
+> against the live narino tree / `/Volumes/40G` are run by Peter — they are this
+> arc's mini metal gate, not the executor's.
 
 **The Destiny:** version control becomes a metadata query. Vaire will
 eventually bypass `.git` directories and interface directly with **UnaFS** —
@@ -81,9 +151,13 @@ response onto the bus.
 
 ## Not yet present
 
-- SYNC (the Alignment) and SNAP (the Forging) — RITES-2.
-- A declarative on-disk manifest format and workspace discovery — the manifest
-  is currently built programmatically in memory.
+- **SWITCH** — the atomic live-copy flip (repointing which drive is "live",
+  rewriting worktree `.git` pointers). That is **arc 2**; arc 1 hardcodes
+  "live = narino" as a manifest fact.
+- Two-way / 40G→narino sync — arc 1 is narino→40G one-way only.
+- In-memory manifests for the other `BoltKind`s (`GitRepo`, `Vault`,
+  `NleProject`) still register programmatically; only the dev-tree Bolt reads a
+  declarative on-disk manifest so far.
 - UnaFS-native version control (the Destiny) — behind UNAFS-F1.
 - An async `ignite(...)` entry point / Synapse subscription loop — Vaire is
   driven synchronously through `handle_message`.
