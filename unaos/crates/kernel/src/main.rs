@@ -1329,6 +1329,19 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     //     the tegra-bpmp IVC channel (HSP doorbell + shared memory, MRQ_CLK/MRQ_RESET to enable the
     //     XUSB partition, then the XUSB firmware question) BEFORE any xHCI register is readable.
 
+    // ORIN-SMP-2 (JM5 `CPU_ON` firmware-wall INVESTIGATION): if `UNAOS_SMPPROBE` armed this image
+    // (the `smpprobe` feature), run ONE serial-recorded probe experiment HERE — after JM4 (GIC/timer/
+    // heap up, so SMC + AFFINITY_INFO + serial all work) and BEFORE the JM6 drop. Probe-only: the
+    // query experiments (0/1/2/4) return and the boot proceeds to CAPSTONE unchanged; the CPU_ON
+    // experiments (3/5) are the pre-registered power-fault boots (the box may RAS-fault and power off —
+    // that is DATA, see the runbook `scripts/orin-smp2-bench.md`). Compiled out entirely when the
+    // feature is off, so the default tegra image is byte-identical to baseline.
+    #[cfg(feature = "smpprobe")]
+    unaos_kernel::arch::smpprobe::run(&unaos_kernel::arch::smpprobe::ProbeCtx {
+        dtb_addr,
+        dtb_size,
+    });
+
     // 4. JM6: drop the Orin BOOT CORE EL2 -> EL1 and run the scheduler + full M4 CAPSTONE at EL1 — the
     //    first time the scheduler runs on Orin silicon. This is the tegra analogue of the virt JC3 call
     //    site (`kernel_main`), and it becomes the tegra terminus: `run_capstone_boot_core` never returns.

@@ -57,6 +57,12 @@ _feats=""
 # VPERF M2: the fbcon viewport-cap bench lever (implies videobench). x86_64 only.
 [ -n "${UNAOS_VIDEOCAP:-}" ] && _feats="${_feats}videocap,"
 [ -n "${UNAOS_TEGRA:-}" ] && _feats="${_feats}tegra,"
+# ORIN-SMP-2: UNAOS_SMPPROBE=<n> arms the JM5 CPU_ON firmware-wall investigation probe (tegra-only;
+# arch/aarch64/smpprobe.rs). The numeric value selects the experiment at compile time via
+# option_env!("UNAOS_SMPPROBE") (cargo passes the env to rustc), so each armed value is a distinct
+# image — the record echoes the live SEL so the operator can verify which experiment ran. Default
+# OFF; when unset the feature vanishes and the tegra image is byte-identical to baseline.
+[ -n "${UNAOS_SMPPROBE:-}" ] && _feats="${_feats}smpprobe,"
 if [ -n "$_feats" ]; then
     KERNEL_FEATURES="--features ${_feats%,}"
     echo -e "${COLOR_YELLOW}⚡ kernel features: ${_feats%,}${COLOR_RESET}"

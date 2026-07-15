@@ -59,6 +59,10 @@ fn main() {
     // `tegra` (Jetson Orin / Tegra234 UART) is an aarch64 board feature; mapped here for parity with
     // the `pi` knob, though this x86_64 builder never produces aarch64 media (the `arroyo` script does).
     if std::env::var("UNAOS_TEGRA").is_ok() { feats.push("tegra"); }
+    // ORIN-SMP-2: UNAOS_SMPPROBE=<n> arms the JM5 CPU_ON firmware-wall investigation probe (tegra-only
+    // aarch64; the numeric value selects the experiment via option_env). Mapped here for parity with
+    // arroyo's feature list, though this x86_64 builder never produces the aarch64 tegra media.
+    if std::env::var("UNAOS_SMPPROBE").is_ok() { feats.push("smpprobe"); }
     if !feats.is_empty() {
         let list = feats.join(",");
         kernel_cmd.arg("--features").arg(&list);

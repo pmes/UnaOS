@@ -65,6 +65,11 @@ pub mod smmu_tegra;
 // mirrors the boot log + CAPSTONE onto the Orin panel — the fix for the BltOnly-GOP dead end (JM7).
 #[cfg(feature = "tegra")]
 pub mod display_tegra;
+// ORIN-SMP-2 (JM5 `CPU_ON` firmware-wall INVESTIGATION): the `UNAOS_SMPPROBE=<n>` boot-time probe.
+// Tegra-only AND `smpprobe`-gated, so it is compiled out of every default image (the `smpprobe`-off
+// tegra binary stays byte-identical to baseline). Wired into `tegra_early_stop` after JM4.
+#[cfg(all(feature = "tegra", feature = "smpprobe"))]
+pub mod smpprobe;
 
 pub fn init() {
     serial_println!(":: AARCH64 Core Hardware Init ::");

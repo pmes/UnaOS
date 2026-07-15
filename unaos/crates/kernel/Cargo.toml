@@ -76,6 +76,13 @@ smolnet = ["dep:smoltcp"]
 # on the board) and register layout.
 tegra = []
 
+# ORIN-SMP-2: the `UNAOS_SMPPROBE=<n>` JM5 `CPU_ON` firmware-wall INVESTIGATION probe
+# (arch/aarch64/smpprobe.rs), wired into `tegra_early_stop` after JM4. Tegra-only at runtime; with
+# this feature OFF (default) the whole module + call site vanish and the tegra image is
+# byte-identical to baseline. WHICH experiment runs is `option_env!("UNAOS_SMPPROBE")` (compile-time
+# const). Enable via `UNAOS_SMPPROBE=<n> UNAOS_TEGRA=1 ./arroyo esp-jetson`.
+smpprobe = []
+
 # CORE3-PROBE: instrument the aarch64 secondary-core entry stub (`_secondary_start`) to raw-dump,
 # MMU-off / no-stack, each core's MPIDR_EL1 low byte, CurrentEL, and its arrival x0 to the Pi 4 PL011
 # (0xFE201000) BEFORE any Rust runs. Disambiguates the CORE3-SMP >1 MiB core-3 regression (firmware
