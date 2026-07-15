@@ -137,6 +137,14 @@ echo "    added SCRATCH.BIN (1024 bytes of 0xEE) for the U9x File-write demo"
 head -c 512 /dev/zero | tr '\000' '\301' > "${MNT}/GROW.BIN"
 echo "    added GROW.BIN (512 bytes of 0xC1) for the U10 file-growth demo"
 
+# STOR-1 S8: plant a DEDICATED writable-dynamic scratch file (NEVER a staged name — HELLO/SCRATCH/GROW.BIN —
+# nor README.TXT, whose prefix the S7 witness checks). 64 bytes of 0xA5 (0245 octal): the S8 write witness
+# opens it RW off the pre-stage set, overwrites a 16-byte pattern at offset 8 live, reads it back, then
+# RESTORES the 0xA5 seed — so the image is left pristine and the witness is idempotent across boots/power-cuts.
+# Overwrite-only: the file never grows, so its 64-byte size is immutable for the boot.
+head -c 64 /dev/zero | tr '\000' '\245' > "${MNT}/S8W.BIN"
+echo "    added S8W.BIN (64 bytes of 0xA5) for the STOR-1 S8 dynamic-write witness"
+
 # Strip macOS metadata (AppleDouble ._ files, Spotlight/fseventsd) so `ls` shows a clean tree.
 sync
 find "$MNT" -name '._*' -delete 2>/dev/null || true

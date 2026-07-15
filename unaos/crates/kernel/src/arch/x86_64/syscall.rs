@@ -3056,6 +3056,67 @@ fn sys_write_file(row: usize, file_id: u64, buf: u64, len: u64) -> i64 {
     let Some(idx) = file_desc_validate(row, file_id) else {
         return EACCES;
     };
+    // STOR-1 S8 (irqstorage): a DYNAMIC on-disk descriptor (`open_dynamic_ondisk` — a pre-existing file neither
+    // staged nor a U10 name) opened RW writes THROUGH to the LIVE volume BY its stored NAME, synchronously and
+    // strictly OVERWRITE-ONLY. Keyed on `FILE_DYNLEN != 0` (set ONLY knob-on, so a knob-off build never enters
+    // this branch). A dynamic descriptor owns NO wstage (FILE_WSTAGE == 0), so it MUST resolve here — BEFORE the
+    // `FILE_WSTAGE == 0 -> EIO` guard below, which would otherwise reject it. Overwrite-only: `want` clamps to
+    // `[offset, EOF)`; a write AT/PAST EOF is a clean `return 0` (never grows — `write_at` by contract does not
+    // allocate clusters or touch the directory, so the on-disk SIZE stays == the descriptor's captured
+    // FILE_SIZE for the boot even as CONTENT changes). No `ns_lock` (a dynamic name is outside the U10 mutation
+    // namespace — the S5 deadlock class stays closed).
+    #[cfg(feature = "irqstorage")]
+    if FILE_DYNLEN[row][idx].load(Ordering::Acquire) != 0 {
+        // Only ever created knob-on with the service up; fail closed defensively if the service is somehow not
+        // ready (never reached — the open refuses the dynamic path unless `s4_sync_storage()`).
+        if !crate::drivers::xhci::irqstorage::service_ready() {
+            return EIO;
+        }
+        let size = FILE_SIZE[row][idx].load(Ordering::Acquire);
+        let window = USER_WINDOW_PAGES * PAGE_SIZE;
+        // CAS-claim `[offset, offset+want)` exactly as `sys_read`/the in-place write below: clamp `want` to the
+        // bytes left to EOF (overwrite-only — a past-EOF write is 0, never a grow), and validate the WHOLE
+        // source range BEFORE the claim (a bad buffer is -EFAULT with NO claim, no copy, no offset move; the
+        // code page is a legal RX source, so `buf < USER_BASE` is the only lower bound).
+        let (offset, want) = loop {
+            let offset = FILE_OFFSET[row][idx].load(Ordering::Acquire);
+            let want = core::cmp::min(len as usize, size.saturating_sub(offset) as usize);
+            if want == 0 {
+                return 0; // at/after EOF (never grows) or nothing requested — a clean no-op, no offset move
+            }
+            let end = buf.wrapping_add(want as u64);
+            if end < buf || buf < USER_BASE || end > USER_BASE + window {
+                return EFAULT;
+            }
+            if FILE_OFFSET[row][idx]
+                .compare_exchange(offset, offset + want as u32, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break (offset, want); // [offset, offset+want) is now exclusively ours
+            }
+        };
+        // Bounce page-at-a-time through a kernel-stack buffer (the service task's kernel CR3 cannot reach the
+        // ring-3 window): copy user->kbuf, then write it live at `offset+done`. ANY submit error OR a short
+        // chunk (`n < chunk`) fails the WHOLE write -EIO — NEVER a masked partial (the offset was CAS-advanced
+        // by the full `want`, so returning `done` would silently skip `[done, want)` on the next sequential
+        // write AND hide the error; EIO leaves the offset advanced — the ledgered N1 pattern, as the read
+        // branch documents). A short write is a REAL error here: the on-disk size == captured FILE_SIZE (nothing
+        // grows/unlinks a non-U10 name), so `write_at` delivers exactly `chunk` on success.
+        let mut kbuf = [0u8; PAGE_SIZE as usize];
+        let mut done = 0usize;
+        while done < want {
+            let chunk = core::cmp::min(PAGE_SIZE as usize, want - done);
+            unsafe {
+                core::ptr::copy_nonoverlapping((buf + done as u64) as *const u8, kbuf.as_mut_ptr(), chunk);
+            }
+            let n = unsafe { dyn_write_live(row, idx, offset + done as u32, kbuf.as_mut_ptr(), chunk) };
+            if n < 0 || (n as usize) < chunk {
+                return EIO;
+            }
+            done += chunk;
+        }
+        return want as i64;
+    }
     // A File+CAP_WRITE descriptor is always RW-opened, so it owns a writable staging slot (FILE_WSTAGE holds
     // the +1-biased pool index). A File+CAP_WRITE handle with NO writable buffer (FILE_WSTAGE == 0) is a kernel
     // setup bug (an RO descriptor endowed CAP_WRITE out of band) — fail closed, never fabricate a write target.
@@ -5887,10 +5948,11 @@ fn sys_open_dynamic(row: usize, name: &str, mode: u64) -> i64 {
             return open_create_new(row, nameid, mode & O_PUBLIC != 0);
         }
     }
-    // STOR-1 S7: the name is neither staged nor a U10 name. Knob-on, fall through to DYNAMIC on-disk
-    // resolution — an open of ANY pre-existing file on the mounted FAT volume resolves through the service
-    // task (read-only), retiring the U6bx BSP-staged-set constraint. Knob-off / no-FAT / pre-service -> ENOENT
-    // below (byte-identical to pre-S7).
+    // STOR-1 S7/S8: the name is neither staged nor a U10 name. Knob-on, fall through to DYNAMIC on-disk
+    // resolution — an open of ANY pre-existing file on the mounted FAT volume resolves through the service task,
+    // retiring the U6bx BSP-staged-set constraint. S7 opened it read-only; S8 honors mode bit0, so a RW open
+    // gets CAP_WRITE and its writes route through `sys_write_file`'s overwrite-only dynamic branch. Knob-off /
+    // no-FAT / pre-service -> ENOENT below (byte-identical to pre-S7).
     //
     // CANONICALIZE to the FAT 8.3 UPPERCASE form BEFORE deciding — this is a SECURITY-critical step. The
     // on-disk resolver the dynamic path submits to (`find_located` -> `DirEntry::eq_name`) matches
@@ -6087,26 +6149,31 @@ fn dyn_name_get(row: usize, idx: usize, out: &mut [u8; MAX_NAME]) -> usize {
 /// `-ENOENT`, never re-resolved from disk as PUBLIC). This retires the U6bx BSP-staged-set constraint: an open
 /// no longer requires the file to be pre-read into the staged buffer.
 ///
-/// READ-ONLY by construction — a writable open is refused `-EACCES`. This opens NO write path to arbitrary
-/// on-disk files (MF2's "immutable code stays immutable" generalized: the S3 in-place write-through resolves
-/// by name and would otherwise be able to overwrite any resolvable file), and it keeps the ACL surface
-/// unchanged — a dynamic on-disk file has no U10 name-id, so it can never enter `OWNED_FILES` and is inherently
-/// PUBLIC (invariant 5: mirror created files' ACL — do not invent new policy). The size comes from the service
-/// task (`submit_stat`, live `find_located`), the one fact the IF-masked handler cannot resolve itself; the
-/// descriptor's reads then route live through `submit_read_file` BY NAME (`sys_read`'s dynamic branch).
+/// STOR-1 S8: mode bit0 now selects the descriptor's rights — RO (`CAP_READ`) or RW
+/// (`CAP_READ | CAP_WRITE`). A RW dynamic descriptor's writes route through `sys_write_file`'s dynamic branch:
+/// a synchronous, strictly OVERWRITE-ONLY live write-through BY NAME (`submit_write_file`), which by contract
+/// never grows the file, allocs clusters, or touches the directory — the on-disk SIZE stays immutable for the
+/// boot even though the CONTENT may now change. This IS a deliberate widening: any ring-3 task with `sys_open`
+/// can now overwrite any genuinely-arbitrary (non-staged, non-U10) on-disk file. It is bounded three ways:
+/// (1) MF2 stays closed by EXCLUSION — `sys_open_dynamic` canonicalizes to 8.3 UPPERCASE and drops every staged
+/// name (HELLO.BIN EL0 code) and every U10 owned/created name in ANY casing BEFORE this path, so a writable
+/// dynamic descriptor can only name a file that is neither code nor ownable; (2) the ACL surface is unchanged —
+/// a dynamic on-disk file has no U10 name-id, so it can never enter `OWNED_FILES` and is PUBLIC-by-default for
+/// writes exactly as S7 made it for reads (invariant 5: mirror created-file policy, don't invent new policy);
+/// (3) overwrite-only — no growth, no allocation. The size comes from the service task (`submit_stat`, live
+/// `find_located`), the one fact the IF-masked handler cannot resolve itself.
 ///
 /// No NAMESPACE lock: a dynamic on-disk file is outside the U10 mutation namespace (it can't be created,
-/// grown, or unlinked through the syscall API), so its resolve races no create/unlink — and the `submit_stat`
-/// block therefore never runs under `ns_lock` (the S5 deadlock class stays closed). Errnos: `-EACCES` (a
-/// writable open), `-ENOENT` (absent / a directory), `-EIO` (an I/O error / a size that overflows the stat
-/// channel), `-EMFILE` (the caller's FILES row is full), `-EAGAIN` (handle table full).
+/// grown, or unlinked through the syscall API), so its resolve races no create/unlink — and neither the
+/// `submit_stat` block nor the write-through submit runs under `ns_lock` (the S5 deadlock class stays closed).
+/// Errnos: `-ENOENT` (absent / a directory), `-EIO` (an I/O error / a size that overflows the stat channel),
+/// `-EMFILE` (the caller's FILES row is full), `-EAGAIN` (handle table full).
 #[cfg(feature = "irqstorage")]
 fn open_dynamic_ondisk(row: usize, name: &str, mode: u64) -> i64 {
-    // RO only: no write path to an arbitrary on-disk file this arc (MF2 generalized). A caller wanting to write
-    // an arbitrary file gets a clean `-EACCES` rather than a silent read-only downgrade.
-    if mode & 1 != 0 {
-        return EACCES;
-    }
+    // S8: honor mode bit0. A RW open endows CAP_WRITE (writes route through the overwrite-only dynamic branch
+    // in `sys_write_file`); RO keeps the S7 read-only cap. No wstage EITHER way — a dynamic descriptor never
+    // stages (FILE_WSTAGE stays 0); its writes go straight to the live volume, its reads straight off it.
+    let rw = mode & 1 != 0;
     // Resolve on the LIVE volume via the service task (blocks — the caller is a scheduled AP task, exactly as
     // `sys_read`/`sys_write_file` already block). Returns the on-disk size (`>= 0`) or a negative errno.
     let rc = unsafe { crate::drivers::xhci::irqstorage::submit_stat(name.as_bytes()) };
@@ -6114,17 +6181,19 @@ fn open_dynamic_ondisk(row: usize, name: &str, mode: u64) -> i64 {
         return if rc as i64 == ENOENT { ENOENT } else { EIO }; // ENOENT (absent/dir) vs any other -> EIO
     }
     let size = rc as u32;
-    // A read-only dynamic descriptor: NO staged blob (CREATED sentinel, so `staged_bytes`/`STAGED_NAMES.get`
-    // fail closed if the dynamic read branch is ever bypassed), NO wstage buffer (`0`), NO flush cluster (`0`).
-    // FILE_OPNAME stays 0 (not growable/created) and FILE_CREATED stays false (not unlinkable — `sys_unlink`
-    // refuses it, exactly like a staged file), so this reuses the existing descriptor lifecycle untouched.
+    // A dynamic descriptor: NO staged blob (CREATED sentinel, so `staged_bytes`/`STAGED_NAMES.get` fail closed
+    // if the dynamic branch is ever bypassed), NO wstage buffer (`0` — writes go live, never staged), NO flush
+    // cluster (`0`). FILE_OPNAME stays 0 (not growable/created) and FILE_CREATED stays false (not unlinkable —
+    // `sys_unlink` refuses it, exactly like a staged file), so this reuses the existing descriptor lifecycle
+    // untouched — the ONLY change from a created/staged RW descriptor is the empty wstage + the FILE_DYNLEN key.
     let Some(fid) = files_alloc(row, CREATED_STAGED_SENTINEL, size, 0, 0) else {
         return EMFILE; // the caller's open-file row is full
     };
     // Stamp the dynamic identity (name + the FILE_DYNLEN publish) BEFORE the handle install — the FILE_OPNAME /
-    // FILE_CREATED stamping order. `sys_read` keys its live-by-name branch on FILE_DYNLEN.
+    // FILE_CREATED stamping order. `sys_read`/`sys_write_file` key their live-by-name branches on FILE_DYNLEN.
     dyn_name_set(row, fid, name.as_bytes());
-    install_file_handle(row, fid, CAP_READ)
+    let rights = if rw { CAP_READ | CAP_WRITE } else { CAP_READ };
+    install_file_handle(row, fid, rights)
 }
 
 /// SYS_OPEN(name_ptr, name_len, mode) -> a handle index, or a negative errno. The FIRST resource-OPEN through
@@ -6266,6 +6335,25 @@ unsafe fn created_read_live(row: usize, idx: usize, offset: u32, kbuf: *mut u8, 
     unsafe { crate::drivers::xhci::irqstorage::submit_read_file(name.as_bytes(), offset, kbuf, want) }
 }
 
+/// STOR-1 S8: the WRITE twin of `created_read_live` for a DYNAMIC on-disk descriptor — resolve its stored 8.3
+/// name (`FILE_DYNLEN`/`FILE_DYNNAME` via `dyn_name_get`) and `submit_write_file` `[kbuf, kbuf+len)` at `offset`
+/// on the LIVE volume. This is the created-file write SOURCE `sys_write_file` routes a RW dynamic descriptor to
+/// knob-on, and the exact seam the S8 write witness drives with a kernel buffer. Returns the byte count written
+/// (`>= 0`) or `-EIO`. An empty name (`FILE_DYNLEN == 0` — the caller already gated on it being non-zero) is a
+/// kernel bug: fail closed `-EIO` rather than submitting an empty name. Strictly overwrite-only — the CLAMP that
+/// keeps `offset + len <= FILE_SIZE` lives in the `sys_write_file` caller; `write_at` never grows by contract.
+/// SAFETY: `kbuf` is a live kernel buffer of `>= len` bytes on the caller's stack; the caller is a scheduled
+/// task (so `submit_write_file` can block on the service task).
+#[cfg(feature = "irqstorage")]
+unsafe fn dyn_write_live(row: usize, idx: usize, offset: u32, kbuf: *mut u8, len: usize) -> i32 {
+    let mut namebuf = [0u8; MAX_NAME];
+    let nl = dyn_name_get(row, idx, &mut namebuf);
+    if nl == 0 {
+        return EIO as i32; // FILE_DYNLEN said dynamic but the name is empty — a kernel bug; fail closed
+    }
+    unsafe { crate::drivers::xhci::irqstorage::submit_write_file(&namebuf[..nl], offset, kbuf, len) }
+}
+
 /// SYS_READ(handle, buf, len) -> the byte count (`0` = EOF), or a negative errno. The object table's
 /// first resource-read CHECK on a non-Console object: `handle_resolve(row, handle, CAP_READ)` must yield
 /// a `File`. A missing right (`Denied`), a non-File kind (Console/Child/Socket), or no handle (Empty/oob)
@@ -6326,10 +6414,12 @@ fn sys_read(handle: u64, buf: u64, len: u64) -> i64 {
     // dynamic descriptor owns no staged blob and no wstage, so it MUST resolve here — it never falls through
     // to the wstage/staged serve below (which would `-EIO`). Unlike the staged/created one-page bounce, an
     // arbitrary on-disk file may exceed a page, so fill `want` a page at a time (the whole `[buf, buf+want)`
-    // dest was validated in the CAS claim above). A dynamic file is read-only + immutable for the boot (no
-    // syscall writes/grows/unlinks a non-U10 name), so its on-disk size == the descriptor's captured
-    // `FILE_SIZE`; the loop therefore delivers exactly `want` (each chunk full but the last exact one), so the
-    // CAS offset advance-by-`want` matches bytes delivered (the S2/S3 N1 note holds: no sequential-read gap).
+    // dest was validated in the CAS claim above). STOR-1 S8: a dynamic file's CONTENT may now change (a RW
+    // dynamic descriptor overwrites it live), but its SIZE is still immutable for the boot — no syscall
+    // grows/allocates/unlinks a non-U10 name (S8 is strictly overwrite-only), so its on-disk size == the
+    // descriptor's captured `FILE_SIZE`; the loop therefore delivers exactly `want` (each chunk full but the
+    // last exact one), so the CAS offset advance-by-`want` matches bytes delivered (the S2/S3 N1 note holds:
+    // no sequential-read gap).
     #[cfg(feature = "irqstorage")]
     if FILE_DYNLEN[row][idx].load(Ordering::Acquire) != 0 {
         // Only ever created knob-on with the service up; fail closed defensively if the service is somehow
@@ -11607,6 +11697,108 @@ fn s7_openany_witness() {
     }
 }
 
+/// STOR-1 S8 witness — a RW open of an ARBITRARY pre-existing on-disk file (NOT staged, NOT a U10 name) writes
+/// THROUGH to the LIVE volume, strictly overwrite-only, off the pre-stage set. Kernel-side + knob-on (uncounted
+/// idiom, no ` PASS`/` FAIL` token, so the fixture PASS count stays byte-equivalent). Target: S8W.BIN — 64 bytes
+/// of 0xA5 planted by make-fat-img.sh, NEITHER staged (HELLO/SCRATCH/GROW.BIN) NOR a U10 name, and NEVER
+/// README.TXT (S7 checks that file's prefix). It drives the REAL seams: `sys_open_dynamic(.., 1)` mints a RW
+/// dynamic descriptor (CAP_WRITE, FILE_DYNLEN != 0, size 64); the kernel-buffer helper `dyn_write_live` lands a
+/// distinct 16-byte pattern at offset 8; `submit_read_file` reads it back == pattern; then it RESTORES the 0xA5
+/// seed bytes and re-verifies — so the image/card is left pristine and the witness is IDEMPOTENT across boots +
+/// power-cuts (it never depends on prior content). Negative legs: (a) `sys_open_dynamic(.., "hello.bin", 1)` —
+/// a case-variant of staged EL0 code — MUST be refused `< 0` (the MF2-under-S8 regression lock); (b) a write
+/// claim at offset == size returns 0 (overwrite never grows). Gated on the knob-on FAT path; SILENT skip
+/// otherwise (no serial line — knob-off / no-FAT chains stay byte-identical). Tears the scratch row down through
+/// the real funnel; the dynamic descriptor owns no wstage/openf, so cleanup is a plain row free.
+#[cfg(feature = "irqstorage")]
+fn s8_write_witness() {
+    if !s4_sync_storage() {
+        return;
+    }
+    const NAME: &str = "S8W.BIN";
+    const SEED: u8 = 0xA5; // make-fat-img.sh plants 64 bytes of this
+    const SIZE: u32 = 64;
+    const OFF: u32 = 8;
+    const PAT: [u8; 16] = *b"S8-WRITE-WITNES!"; // a distinct 16-byte pattern (never 0xA5)
+    // Defensive: prove the target really exercises the DYNAMIC path (not a staged/U10 collision — it never is).
+    if staged_lookup(NAME).is_some() || u10_name_id(NAME).is_some() {
+        return;
+    }
+    let Some(r) = crate::arch::memory::alloc_user_space() else {
+        return; // no scratch address space — silent skip
+    };
+    // Drive the REAL dispatcher, RW (mode bit0). S8 mints a writable dynamic descriptor for a non-staged/non-U10
+    // on-disk file; pre-S8 this same open was -EACCES.
+    let h = sys_open_dynamic(r, NAME, 1);
+    let mut is_dyn = false;
+    let mut cap_write = false;
+    let mut size: u32 = 0;
+    let mut wrote: i32 = -1;
+    let mut readback_ok = false;
+    let mut restored_ok = false;
+    let mut eof_zero_ok = false;
+    if h >= 0 {
+        // Resolve the handle -> descriptor through the production seam, REQUIRING CAP_WRITE (S8's new right).
+        if let Ok(HandleTarget::File(file_id)) = handle_resolve(r, h as u64, CAP_WRITE) {
+            cap_write = true;
+            if let Some(fid) = file_desc_validate(r, file_id) {
+                is_dyn = FILE_DYNLEN[r][fid].load(Ordering::Acquire) != 0;
+                size = FILE_SIZE[r][fid].load(Ordering::Acquire);
+                // (1) write the distinct pattern at OFF via the kernel-buffer helper (the live write seam).
+                let mut wbuf = PAT;
+                wrote = unsafe { dyn_write_live(r, fid, OFF, wbuf.as_mut_ptr(), PAT.len()) };
+                // (2) read it back live BY THE STORED NAME and match.
+                let mut rbuf = [0u8; 16];
+                let rn = unsafe {
+                    crate::drivers::xhci::irqstorage::submit_read_file(
+                        NAME.as_bytes(), OFF, rbuf.as_mut_ptr(), 16,
+                    )
+                };
+                readback_ok = wrote == PAT.len() as i32 && rn == 16 && rbuf == PAT;
+                // (3) RESTORE the 0xA5 seed so the image stays pristine + the witness is idempotent, re-verify.
+                let mut sbuf = [SEED; 16];
+                let sw = unsafe { dyn_write_live(r, fid, OFF, sbuf.as_mut_ptr(), 16) };
+                let mut vbuf = [0u8; 16];
+                let vn = unsafe {
+                    crate::drivers::xhci::irqstorage::submit_read_file(
+                        NAME.as_bytes(), OFF, vbuf.as_mut_ptr(), 16,
+                    )
+                };
+                restored_ok = sw == 16 && vn == 16 && vbuf == [SEED; 16];
+                // (b) OVERWRITE-ONLY: a write claim at offset == size returns 0 (the clamp fires before EFAULT,
+                // so the buf is never dereferenced). Set the offset to EOF and drive the REAL sys_write_file.
+                FILE_OFFSET[r][fid].store(SIZE, Ordering::Release);
+                eof_zero_ok = sys_write_file(r, file_id, USER_BASE, 16) == 0;
+            }
+        }
+    }
+    // (a) MF2-UNDER-S8 regression lock: a case-variant of staged EL0 code ("hello.bin") RW MUST be refused — the
+    // canonicalize-to-UPPERCASE exclusion drops it before any disk resolution. Must be `< 0` (installs nothing).
+    let deny = sys_open_dynamic(r, "hello.bin", 1);
+    let excl_ok = deny < 0;
+    // Teardown: release the whole scratch row through the real funnel (clears the dynamic descriptor + handle).
+    crate::arch::memory::free_user_space_by_cr3(crate::arch::memory::slot_cr3(r));
+    let pass = h >= 0
+        && is_dyn
+        && cap_write
+        && size == SIZE
+        && readback_ok
+        && restored_ok
+        && eof_zero_ok
+        && excl_ok;
+    if pass {
+        serial_println!(
+            ":: S8-write: a non-staged on-disk file (S8W.BIN, {} bytes) opened RW + overwrote a live 16-byte pattern off the pre-stage set, read it back, RESTORED the seed (pristine + idempotent); a past-EOF write returned 0 (overwrite never grows) and a case-variant of staged code (\"hello.bin\") RW was refused (MF2 intact) == expected — witness OK ::",
+            size
+        );
+    } else {
+        serial_println!(
+            ":: S8-write FAIL — h={} is_dyn={} cap_write={} size={} readback_ok={} restored_ok={} eof_zero_ok={} excl_ok={} deny={} (want h>=0 dyn capW size={} readback restore eof0 deny<0) ::",
+            h, is_dyn, cap_write, size, readback_ok, restored_ok, eof_zero_ok, excl_ok, deny, SIZE
+        );
+    }
+}
+
 #[cfg(feature = "irqstorage")]
 fn s5_shared_backing_witness() {
     // Gate: created reads route live ONLY knob-on with a mounted FAT + the service task up. Off -> SILENT skip.
@@ -11782,6 +11974,9 @@ fn u11m2_launcher(demo_cpu: usize) {
     // STOR-1 S7: witness an ARBITRARY on-disk file (README.TXT) opens + reads off the pre-stage set (knob-on FAT).
     #[cfg(feature = "irqstorage")]
     s7_openany_witness();
+    // STOR-1 S8: witness a RW open of an arbitrary on-disk file (S8W.BIN) overwriting live off the pre-stage set.
+    #[cfg(feature = "irqstorage")]
+    s8_write_witness();
     let Some(srow) = crate::arch::memory::alloc_user_space() else {
         serial_println!(":: U11m2: no free scratch slot — cross-process unlink demo skipped ::");
         return;
