@@ -6425,8 +6425,8 @@ fn sys_open(name_ptr: u64, name_len: u64, mode: u64) -> i64 {
     // K1 M2.3 / K6 M3: WRITE-THROUGH persist of a NEW private file owned by a NAMED principal, so ownership
     // SURVIVES REBOOT — now onto the NATIVE unafs attribute volume (the K4-journaled write path), not the
     // retired UNAFS.ATR sidecar. Runs AFTER the create + owner row + handle are all committed (a fully-
-    // successful private create), OUTSIDE the caller's namespace lock (native_persist_create takes its own
-    // fresh ns for the row write). Gated on `caller_ppid.kind != NONE` — the anonymous battery never reaches
+    // successful private create), OUTSIDE the caller's namespace lock (K5B: native_persist_create takes NO ns —
+    // `native_acl_write`'s own with_unafs MOUNT hold is the serializer). Gated on `caller_ppid.kind != NONE` — the anonymous battery never reaches
     // the disk here, so the 23-fixture path stays byte-identical. A persist failure is non-fatal: the in-RAM
     // ACL still enforces THIS boot; only cross-reboot survival is lost (fails closed to PUBLIC at next mount).
     if created && asid != 0 && mode & O_PUBLIC == 0 && caller_ppid.kind != PRIN_NONE {
