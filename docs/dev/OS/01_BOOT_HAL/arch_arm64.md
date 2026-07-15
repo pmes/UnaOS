@@ -3608,3 +3608,52 @@ is **no metal leg for this arc**: the tegra binary DCEs `smp_virt` (JM5 Orin PSC
 external Tegra BL31/MCE `CPU_ON` RAS fault — see "JM5 result"), so the tegra image is byte-unchanged
 by this fix, and the disassembly is the proof of record. When the Orin `CPU_ON` firmware wall is
 cleared, the bring-up is already born fixed.
+
+### ORIN-SMP-2 — the JM5 `CPU_ON` firmware-wall INVESTIGATION probe (`UNAOS_SMPPROBE`, code-only; bench Peter-attended)
+
+JM5's metal verdict isolated the failure to the *first* PSCI `CPU_ON`: every PSCI query
+(`AFFINITY_INFO`) returns cleanly on silicon, but the first `CPU_ON` raises a fatal Tegra CBB-fabric
+RAS Uncorrectable Error inside BL31/MCE and powers the box off. This arc ships **instrumentation to
+discriminate §JM5-result's four ranked hypotheses** — not a fix and not a bench. The deliverable is a
+default-OFF probe knob plus a pre-registered A-B-A runbook (`unaos/scripts/orin-smp2-bench.md`); the
+bench is Peter-attended and power-fault boots are DATA.
+
+**The knob (`arch/aarch64/smpprobe.rs`, `tegra`+`smpprobe` gated).** `UNAOS_SMPPROBE=<n>` selects ONE
+experiment per boot, recorded to serial as grammar-checkable single-line records
+(`:: tegra: SMPPROBE sel=<n> … ::`, the pi `core3probe` idiom — bounded, expected-vs-got). The whole
+module and its one call site in `tegra_early_stop` (after JM4 GIC/timer/heap, before the JM6 drop) are
+`#[cfg(all(feature = "tegra", feature = "smpprobe"))]`; with `smpprobe` OFF (the default) they vanish
+and the tegra image is **byte-identical to baseline** (proven: two default `esp-jetson` builds hash
+identical, `tegra:` count 109). The experiment is a compile-time const from
+`option_env!("UNAOS_SMPPROBE")`, so each armed value is a **distinct image** (distinct hashes; cargo
+rebuilds on the env change) — the operator rebuilds+reflashes per boot for the A-B-A schedule, and
+every record echoes the LIVE `SEL` so the operator VERIFIES which experiment ran before trusting a
+boot. A `static` fn-pointer table + `black_box(SEL)` keep every experiment's strings linked regardless
+of `SEL`, so any armed image has the SAME **`tegra:` count = 142** (109 baseline + 33 probe strings).
+
+**Safety (RIDER (b) — probe-only).** No experiment writes fuses, BCT/EEPROM, UEFI variables, MB1/MB2
+storage, or persistent MCE/firmware config. Queries are read-only SMCs / system-register reads; the
+`CPU_ON`-issuing experiments (3, 5) command a *volatile* core-power action (what JetPack's OS does
+every boot) and write no persistent state. H4 (caller-EL) is recorded **BLOCKED-BY-DESIGN** — its
+discrimination cannot be reproduced from our minimal EL2 kernel (see the table).
+
+**Pre-registered prediction table (RIDER (a)).** Written BEFORE any bench; the runbook carries it
+verbatim. `knob → hypothesis → predicted serial record → predicted box behavior`:
+
+| knob | hypothesis / role | issues `CPU_ON`? | predicted serial record | predicted box behavior |
+|---|---|---|---|---|
+| **0** | CONTROL — `AFFINITY_INFO` topology sweep (Aff2 0–3 × Aff1 0–3) + redistributor walk | no | `sel=0 slot aff=… AFFINITY_INFO=<0/1/2 or −>` for each slot; the fused cores report valid (0/1/2), unpopulated slots return −INVALID_PARAMS; `present=<k>` | clean boot → CAPSTONE (the control) |
+| **1** | **H1** MCE/BPMP coordination — census what BL31 advertises | no | `PSCI_VERSION=…`; `FEATURES(CPU_ON)=<r>`; `FEATURES(AFFINITY_INFO)`; `MIGRATE_INFO_TYPE=<r>` | clean boot → CAPSTONE. **Read:** if `CPU_ON` is advertised (`≥0`) yet still faults, the failure is inside Tegra's `CPU_ON` impl (consistent with the MCE-coordination story), not an unrecognized call |
+| **2** | **H2** latent/poisoned RAS surfaced by the first EL3 barrier — read RAS error records BEFORE any `CPU_ON` | no | `ID_AA64PFR0.RAS=<f>`; then per record `ERXSTATUS=… V=<b> UE=<b> ERXADDR=… ERXMISC0=…` | clean boot → CAPSTONE. **Read:** a pre-existing `V=1`/`UE=1` record supports H2; all-clean weakens it |
+| **3** | **H3** entry-point-high — `CPU_ON` to the first present secondary with a LOW (2 GiB sentinel) entry PA | **yes** | `sel=3 target aff=… entry=0x80000000 … issuing CPU_ON`; then either a RAS fault (no further record) or `CPU_ON RETURNED ret=<r> — SURVIVED` | **RAS fault + power-OFF** if H3 false (fault precedes the fetch); SURVIVAL ⇒ H3 candidate |
+| **4** | **H4** caller-EL — **BLOCKED-BY-DESIGN** | no | `sel=4 exp=el1-caller BLOCKED-BY-DESIGN`; `reason=SMC from NS-EL1 vs NS-EL2 hits the same BL31 handler; JetPack's difference is its boot-time ATF handshake, not the runtime caller EL — not reproducible from our EL2 kernel` | clean boot → CAPSTONE (records the block) |
+| **5** | **H3 reference / baseline reproduction** — `CPU_ON` to the first present secondary at the HIGH (~9.5 GiB kernel) entry PA of `_smpprobe_park` | **yes** | `sel=5 target aff=… entry=0x25e……(HIGH) … issuing CPU_ON` then a RAS fault (no further record) or `CPU_ON RETURNED ret=<r> — SURVIVED` | **RAS fault + power-OFF** (the JM5 wall, isolated to one core). exp3 vs exp5 differ ONLY in the entry PA: same fault ⇒ H3 refuted |
+
+exp3/exp5 both gate the `CPU_ON` behind an `AFFINITY_INFO` presence check (the JM5 attempt-1 lesson:
+a `CPU_ON` to a fuse-disabled phantom is itself a fatal RAS) and target exactly ONE secondary (minimal
+blast radius), with the full enumeration dumped before the call so the record survives the power-off.
+
+**Gate (this executor).** `./arroyo check` green both arches ±`tegra`; `test-arm 22` MISSION SUCCESS;
+GICv3 `test-arm 40` CAPSTONE 6/6 + 3/3 secondaries (smp_virt untouched); `kernel8-test` 0-FAIL;
+`UNAOS_HUBSTORAGE` x86 MISSION SUCCESS; `esp-jetson` links, `tegra:` count 142 armed / 109 off
+(byte-identical off). The bench closes at Peter's window with LC-orin per the runbook.

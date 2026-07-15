@@ -47,6 +47,28 @@ fused revoke/re-persist (the Option A rider).
 
 ---
 
+## aarch64 SMP — ORIN-SMP-2: the JM5 `CPU_ON` firmware-wall INVESTIGATION probe (`UNAOS_SMPPROBE`) — 2026-07-15 🔬 code + runbook; bench Peter-attended `hw-jetson`
+
+**What it does:** ships instrumentation to discriminate §JM5-result's four ranked hypotheses for why
+the *first* PSCI `CPU_ON` on real Orin raises a fatal Tegra CBB-fabric RAS Uncorrectable Error while
+every PSCI *query* works. `UNAOS_SMPPROBE=<n>` (tegra + `smpprobe` gated, default OFF) selects ONE
+serial-recorded experiment per boot, wired into `tegra_early_stop` after JM4 (GIC/timer/heap up) and
+before the JM6 drop: **0** = the safe `AFFINITY_INFO` topology-sweep control; **1** = H1 PSCI
+capability census; **2** = H2 latent-RAS error-record read; **3** = H3 entry-point-high discriminator
+(`CPU_ON`, LOW sentinel entry); **4** = H4 caller-EL, recorded **BLOCKED-BY-DESIGN** (a bare caller-EL
+flip cannot reproduce JetPack's boot-time ATF handshake); **5** = the baseline JM5-wall reproduction
+(`CPU_ON`, HIGH kernel entry — exp3's entry-PA partner). Probe-only (RIDER (b)): no fuse/persistent
+firmware writes; the `CPU_ON` experiments command a volatile core-power action and power-fault boots
+are DATA. Every record echoes the live `SEL` for operator verification.
+
+**How it was tested:** `./arroyo check` green both arches ±`tegra`; `test-arm 22` MISSION SUCCESS;
+GICv3 `test-arm 40` CAPSTONE 6/6 + 3/3 secondaries (smp_virt untouched); `kernel8-test` 0-FAIL/29
+PASS; `UNAOS_HUBSTORAGE` x86 MISSION SUCCESS; `esp-jetson` links. **Knob-off byte-identity proven:**
+two default `esp-jetson` builds hash identical (`tegra:` count 109); any armed value is a distinct
+image with a STABLE `tegra:` count 142 (a `static` fn-table + `black_box(SEL)` keep all experiment
+strings linked). The A-B-A bench is Peter-attended (LC-orin) per `unaos/scripts/orin-smp2-bench.md`
+with the pre-registered prediction table. `arch/aarch64/smpprobe.rs` + `arch_arm64.md §ORIN-SMP-2`.
+
 ## aarch64 SMP — ORIN-SMP phase 1: CORE3-class audit + born-fixed PSCI re-derive — 2026-07-15 🔬 QEMU-green, no metal leg `hw-jetson`
 
 **What it does:** applies the Pi CORE3-SMP hazard analysis (MMU-off stack spill of a secondary
