@@ -599,6 +599,18 @@ pub struct DeviceSlot {
     pub mouse_intf: u8,
     pub mouse_state: u8,
     pub mouse_ring: Option<TransferRing>,
+    /// Physical address of the interrupt-IN Normal TRB the pointer read was last armed with
+    /// (0 = none armed). The interrupt-IN transfer dispatch requires an exact match for the SAME
+    /// reason EP0 does (`ep0_expect_phys`): Panther Point (Linux XHCI_SPURIOUS_SUCCESS quirk,
+    /// device 0x1e31) can post a duplicate Success event after a Short Packet for the same TD —
+    /// and a boot-mouse report is ALWAYS shorter than the endpoint MPS, so this is the periodic
+    /// short-packet case the quirk fires on. Without the match, the dup would re-decode the same
+    /// report (double cursor motion) AND re-arm a second read (ring over-arm). Set in
+    /// `queue_mouse_read`, matched in `poll_events`/`handle_event_trb`.
+    pub mouse_expect_phys: u64,
+    /// Count of REAL (non-dup) pointer reports serviced since arming — drives the bounded serial
+    /// mouse-witness (first report + every Nth), never one-line-per-report.
+    pub mouse_report_count: u32,
 
     pub is_keyboard: bool,
     pub keyboard_ep: u8,
@@ -669,6 +681,8 @@ impl DeviceSlot {
             mouse_intf: 0,
             mouse_state: 0,
             mouse_ring: None,
+            mouse_expect_phys: 0,
+            mouse_report_count: 0,
             is_keyboard: false,
             keyboard_ep: 0,
             keyboard_mps: 0,
@@ -720,6 +734,8 @@ impl DeviceSlot {
         self.mouse_interval = 0;
         self.mouse_intf = 0;
         self.mouse_state = 0;
+        self.mouse_expect_phys = 0;
+        self.mouse_report_count = 0;
         self.is_keyboard = false;
         self.keyboard_ep = 0;
         self.keyboard_mps = 0;
@@ -1466,6 +1482,24 @@ impl XhciController {
                                     }
                                     if self.slots[slot_id as usize].mouse_state == 2 {
                                         self.slots[slot_id as usize].mouse_state = 3;
+                                        // UI1-MOUSE M1: assertable enumeration witness — one line
+                                        // naming the detected pointer so a serial-only bench (the
+                                        // cursor is invisible over the FTDI cable) proves the real
+                                        // Panther-Point xHCI armed the interrupt-IN read. Uncounted
+                                        // (`== witness ::` idiom, not `-> PASS`) so no mbench COUNT
+                                        // shifts; fires ONLY when a pointer enumerated (silent on
+                                        // aarch64 / no-mouse / SKIP_XHCI, which never reach here).
+                                        {
+                                            let s = &self.slots[slot_id as usize];
+                                            serial_println!(
+                                                ":: MOUSE-1: HID pointer detected vid:pid={:04x}:{:04x} proto={} {} ep={:#04x} mps={} interval={} == witness ::",
+                                                s.vid, s.pid,
+                                                if s.mouse_is_relative { 2 } else { 0 },
+                                                if s.mouse_is_relative { "relative" } else { "absolute" },
+                                                s.mouse_ep, s.mouse_mps, s.mouse_interval
+                                            );
+                                        }
+                                        self.slots[slot_id as usize].mouse_report_count = 0;
                                         self.queue_mouse_read(slot_id as u8);
                                     }
                                     // Boot-capable HID interfaces power up in REPORT protocol (report
@@ -1741,6 +1775,20 @@ impl XhciController {
                                     
                                     if mouse_dci == Some(endpoint_id as u8) {
                                         // --- POINTER (mouse / tablet) --- reads into its own buffer.
+                                        // UI1-MOUSE M2: Panther-Point dup-Success guard
+                                        // (XHCI_SPURIOUS_SUCCESS, device 0x1e31). A boot-mouse report
+                                        // is ALWAYS shorter than the endpoint MPS, so the controller can
+                                        // post a duplicate Success for the SAME TD after the Short
+                                        // Packet. Only the completion whose TRB matches the armed read
+                                        // is real; re-decoding + re-arming on the dup would double the
+                                        // cursor motion and over-arm the interrupt-IN ring — the exact
+                                        // EP0 hazard (`ep0_expect_phys`), applied to interrupt-IN. On
+                                        // QEMU (no dup) `param` always matches, so this never trips.
+                                        if slot.mouse_expect_phys != 0 && param != slot.mouse_expect_phys {
+                                            xdbg!("xHCI: stale/spurious pointer event (slot {}, trb {:#x}, expected {:#x}); ignoring.",
+                                                slot_id, param, slot.mouse_expect_phys);
+                                            return;
+                                        }
                                         if let Some(data_buf_ptr) = slot.mouse_data_buffer {
                                             let data_data = core::slice::from_raw_parts(data_buf_ptr, 512);
                                             let _buttons = data_data[0];
@@ -1777,7 +1825,9 @@ impl XhciController {
                                                 }
                                             }
 
-                                            if slot.mouse_is_relative {
+                                            let rel = slot.mouse_is_relative;
+                                            let buttons = data_data[0];
+                                            let (last_a, last_b) = if rel {
                                                 // HID BOOT mouse: byte0 = buttons, byte1 = dx:i8, byte2 = dy:i8
                                                 // (byte3 = wheel, ignored). Signed relative deltas — sign-extend
                                                 // i8 -> i32 and emit only on actual motion.
@@ -1786,12 +1836,34 @@ impl XhciController {
                                                 if dx != 0 || dy != 0 {
                                                     crate::pal::push_event(crate::pal::Event::Mouse { x: dx, y: dy });
                                                 }
+                                                (dx, dy)
                                             } else {
                                                 // usb-tablet / absolute pointer: byte1-2 = X, byte3-4 = Y (0..32767).
                                                 let x = (data_data[1] as u16) | ((data_data[2] as u16) << 8);
                                                 let y = (data_data[3] as u16) | ((data_data[4] as u16) << 8);
                                                 if x != 0 || y != 0 {
                                                     crate::pal::push_event(crate::pal::Event::MouseAbsolute { x: x as i32, y: y as i32 });
+                                                }
+                                                (x as i32, y as i32)
+                                            };
+                                            // `slot` (the shared borrow) is no longer read past here;
+                                            // the &mut self accesses below are the count bump + re-arm.
+
+                                            // UI1-MOUSE M1: bounded serial mouse-witness — first report
+                                            // + every 32nd thereafter, NEVER one-per-report (that would
+                                            // flood the FTDI on continuous motion). Uncounted
+                                            // (`== witness ::`) so no mbench COUNT shifts.
+                                            let n = self.slots[slot_id as usize].mouse_report_count.wrapping_add(1);
+                                            self.slots[slot_id as usize].mouse_report_count = n;
+                                            if n == 1 || n % 32 == 0 {
+                                                if rel {
+                                                    serial_println!(
+                                                        ":: MOUSE-1: {} reports, last dx={} dy={} buttons={:#04x} == witness ::",
+                                                        n, last_a, last_b, buttons);
+                                                } else {
+                                                    serial_println!(
+                                                        ":: MOUSE-1: {} reports, last x={} y={} buttons={:#04x} == witness ::",
+                                                        n, last_a, last_b, buttons);
                                                 }
                                             }
 
@@ -4741,7 +4813,13 @@ impl XhciController {
                 status: self.slots[slot_id as usize].mouse_mps as u32, // Length
                 control: (1 << 10) | (1 << 5), // Type 1 | IOC
             };
-            self.slots[slot_id as usize].mouse_ring.as_mut().unwrap().push(in_trb).unwrap();
+            let idx = self.slots[slot_id as usize].mouse_ring.as_mut().unwrap().push(in_trb).unwrap();
+            // Record the physical address of the Normal TRB we just armed so the transfer
+            // dispatch can match a real completion against it and reject a Panther-Point
+            // dup-Success for the already-consumed TD (see `mouse_expect_phys`).
+            let ring_base = self.slots[slot_id as usize].mouse_ring.as_ref().unwrap().get_ptr();
+            self.slots[slot_id as usize].mouse_expect_phys =
+                ring_base + (idx as u64 * core::mem::size_of::<Trb>() as u64);
             self.ring_doorbell(slot_id, dci as u32);
             xdbg!("xHCI: Mouse Read Queued.");
         }
