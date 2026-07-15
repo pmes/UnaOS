@@ -40,7 +40,16 @@ is EHCI (invisible to this driver).
 
 ## hw-pi4 track — 2026-07-15 (K7 — legacy-sidecar enforcement removed; NS-SPAN WATCH rider)
 
-### K7 — legacy `UNAFS.ATR` rows may no longer ENFORCE + knob-gated NS-SPAN instrument 🔬 QEMU-green, metal pending
+### K7 — legacy `UNAFS.ATR` rows may no longer ENFORCE + knob-gated NS-SPAN instrument ✅✅ METAL-CONFIRMED (and the WATCH TRIPPED)
+
+**Metal (2026-07-15 attended sitting, two staged boots off `8f6db93`):** production knob-off boot
+MBENCH PASS **33/33**, 0 forbidden (reworked K1-corrupt fail-closed on silicon; CAPSTONE 6/6;
+full native K-chain); knob-on boot 33/33 + the measurement:
+`:: NS-SPAN: worst revoke=38000366 grants=38475785 grow=23764161 ticks (freq 54000000) ::`
+= **~704 / ~712 / ~440 ms IRQ-masked** — the Option-A WATCH TRIPPED (F3-era span was µs-scale).
+HARD-WON: QEMU's similar magnitude was NOT TCG slowness — polled SD I/O dominates the fused
+journaled write on real silicon too. Bounded-span redesign (K5B) now data-justified; ledgered
+live residual until it lands. Log `~/unaos-bench/pi-serial-2026-07-15-k7-sitting.log`.
 
 **What it does:** completes the sidecar retirement K6 began. K6 kept a transitional boot FALLBACK —
 after the native rebuild, `atr_maybe_boot_rebuild` still adopted any remaining (un-migrated, legacy
