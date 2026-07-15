@@ -3730,3 +3730,75 @@ UNAOS_TEGRASMP=1`; `test-arm 22` MISSION SUCCESS; GICv3 `test-arm 40` CAPSTONE 6
 (the shared `smp_virt` path is byte-untouched); `kernel8-test` 0-FAIL; `UNAOS_HUBSTORAGE` x86 MISSION
 SUCCESS; `esp-jetson` links (built LAST), knob-off byte-identity proven (two default builds hash
 identical, `tegra:` 109). The metal verdict is the attended bench with LC-orin + Peter.
+
+### ORIN-SMP-4 — the woken core's EXECUTION BISECT (`UNAOS_SMPPROBE=10..16`, knob-gated; bench Peter-attended)
+
+The SMP-3 attended bench (§ORIN-SMP-3 STOP record) DISCRIMINATED the wall: on UEFI 39.2.0 firmware
+`CPU_ON` itself works (the SMP-2 exp5 park survived, ret=0), but waking the SAME core (aff
+`0x00000100`) into the real `smp_virt::_secondary_start_virt` RAS-faults ×2 reproducibly (IOB Status
+`0xe4000612`, SERR=0x12 slave-error, IERR=CBB-0x6, ADDR `0x8000000000000200`, + ACI, box reset) BEFORE
+the BSP prints the `CPU_ON` result. So the fault is driven by the woken core's EARLY EXECUTION — some
+access in our secondary path is rejected by the Tegra CBB fabric. ORIN-SMP-4 is the pre-registered
+**execution bisect** that brackets which access, one leg per boot.
+
+**Mechanism (`arch/aarch64/smpprobe.rs`, extends the `UNAOS_SMPPROBE` probe).** Each leg 10..16 wakes
+ONE `/cpus`-named core into a MINIMAL entry stub that adds exactly ONE variable over the previous leg,
+then parks in WFE. Because a secondary's UART is unarbitrated on metal (the pi core3probe lesson), the
+woken core **never prints**; it raises a per-leg **CHECKPOINT** flag — a plain store of `0x5304_000<leg>`
++ `DC CVAC` to the Point of Coherency (the spin-table-slot idiom, MMU-off-safe) — that the BSP polls
+under a bounded ~500 ms deadline (invalidate-then-read). A raised checkpoint = the leg SURVIVED; a RAS
+power-off before the poll completes = the leg faulted and NAMES the rejected access; a bounded timeout
+with the box still up = a wrong-EL park or hang. All evidence is BSP-side serial (`:: tegra: SMPPROBE-4
+… ::`).
+
+The bisect is **self-contained** in `smpprobe.rs` (its own single 64 KiB stack, its own captured EL2
+regime `ProbeRegs`, its own checkpoint, its own entry stubs) so the working SMP-3 path in `smp_virt.rs`
+stays **byte-untouched** — the diagnostic cannot perturb the code it measures. Leg 16 replicates the
+tail of `__secondary_rust_virt` (percpu + GICv3 secondary bring-up + the SGI ping) from the same public
+building blocks (`exceptions::install`, `percpu::init`, `gic::init_secondary_v3`/`enable_sgi`/`send_sgi`)
+rather than calling the real entry, preserving that byte-identity.
+
+**The legs (one variable each, measured relative to leg 10):**
+
+| knob | variable added over the previous leg | woken-core EL/MMU | evidence |
+|---|---|---|---|
+| **10** | CONTROL — the exp5 park shape + the checkpoint store (no SP, no regime) | EL2, MMU off | checkpoint `0x53040000A` |
+| **11** | +SP into `PROBE_STACK` + push/pop one frame (MMU-off DRAM writes) | EL2, MMU off | checkpoint `0x53040000B` |
+| **12** | +regime replay: `HCR/CPTR` then `MAIR/TCR/TTBR0_EL2` (SCTLR NOT written) | EL2, MMU off | checkpoint `0x53040000C` |
+| **13** | +MMU: `tlbi alle2` + `SCTLR_EL2` write (MMU ON) + isb | EL2, MMU **on** | checkpoint `0x53040000D` |
+| **14** | +`exceptions::install()` (per-core EL2 vectors) | EL2, MMU on | checkpoint `0x53040000E` |
+| **15** | +GICR: `this_cpu_redistributor()` + ONE `GICR_WAKER` read — **PRIME SUSPECT** | EL2, MMU on | checkpoint `0x53040000F` |
+| **16** | full: +percpu + GICv3 secondary bring-up + IPI SGI (real-path replica) | EL2, MMU on | checkpoint `0x530400010` + AP→BSP SGI |
+
+**Leg 15 is the prime suspect** (RIDER 5): the GIC-600 exposes 8 redistributor frames on a 6-core part,
+and the SMP-3 fault ADDR `0x8000000000000200` smells like an MMIO window. Leg 15 is the first leg to
+touch the target's GICR frame. The read is bounded to ONE `GICR_WAKER` load (the redistributor is NOT
+woken — `GICR_WAKER` is never written) and the BSP **computes + prints the exact frame + `GICR_WAKER`
+MMIO address BEFORE any `CPU_ON`** (via `gic::redistributor_frame_for_affinity` + `GICR_WAKER_OFFSET`),
+so the prediction names the address under test. Tegra GICR base `0x0F44_0000`, 4-frame stride
+`0x4_0000`; `GICR_WAKER` at `frame + 0x14` (the BSP line reports the resolved value for the target).
+
+**Predictions (RIDER 2 — one variable per leg, written BEFORE any boot; a contradicted prediction
+STOPs the sitting):** legs 10..14 all SURVIVE (their checkpoints raise, box stays up) — they replay only
+per-core CPU state the SMP-2/JC2 path already exercised. Leg 15 is the expected fault (RAS power-off
+before its checkpoint) if the rejected access is the GICR MMIO. Leg 16 runs LAST and only if 10..15 all
+survived (otherwise the first faulting leg already named the access and 16 is SKIPPED); it is predicted
+to reproduce the SMP-3 fault, closing the bracket. Leg 10 runs FIRST every sitting (RIDER 1).
+
+**Probe-only (RIDER 4)** and **DTB-only presence (RIDER 5):** the woken core touches ONLY its own stack,
+the `SEC_CTX`-named regime registers, its own GICR frame (leg 15, one read), and the checkpoint — no
+fuse/persistent-state writes; the single target is the first non-BSP core from the DTB `/cpus` list
+(`fdt_tegra::cpu_affinities`, cfg-widened to `any(tegrasmp, smpprobe)`), never `AFFINITY_INFO`/GICR walk.
+
+**String-count / byte-identity note.** Like ORIN-SMP-3, armed images differ from baseline; the default
+(knob-off) `esp-jetson` is byte-identical across rebuilds (`tegra:` 109; the new `gic.rs` probe helpers
+are dead-code-eliminated from the default image — verified absent by `nm`). Armed values 10..16 are
+distinct kernels (`UNAOS_SMPPROBE` is a compile-time const); validate an armed image by its distinct ELF
+hash + the presence of `SMPPROBE-4` strings.
+
+**Gate (this executor).** `./arroyo check` green (both arches) + `UNAOS_TEGRA=1` + `UNAOS_TEGRA=1
+UNAOS_SMPPROBE=<n>` + `UNAOS_TEGRA=1 UNAOS_TEGRASMP=1`; `test-arm 22` MISSION SUCCESS; GICv3 `test-arm 40`
+CAPSTONE 6/6 + 3/3 secondaries (the shared `smp_virt` path is byte-untouched); `kernel8-test` 0-FAIL
+(34 PASS); `UNAOS_HUBSTORAGE` x86 MISSION SUCCESS; knob-off byte-identity proven (two default builds hash
+identical, `tegra:` 109); 7 armed leg tars staged. The metal verdict is the attended bench with LC-orin
++ Peter (runbook `scripts/orin-smp4-bench.md`).
