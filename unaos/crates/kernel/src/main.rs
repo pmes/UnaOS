@@ -1340,6 +1340,7 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     unaos_kernel::arch::smpprobe::run(&unaos_kernel::arch::smpprobe::ProbeCtx {
         dtb_addr,
         dtb_size,
+        ram_gib_mask: mmu.ram_gib_mask,
     });
 
     // ORIN-SMP-3 (the real 6-core Orin bring-up, `UNAOS_TEGRASMP=1`): with the `tegrasmp` feature

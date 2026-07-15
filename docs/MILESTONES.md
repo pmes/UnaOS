@@ -209,6 +209,35 @@ instrumented build (core3probe idiom) rides the next Pi arc's sitting to produce
 
 ---
 
+## aarch64 SMP — ORIN-SMP-4: the woken core's EXECUTION BISECT (`UNAOS_SMPPROBE=10..16`) — 2026-07-15 ⏳ QEMU-green + staged, metal attended-pending `hw-jetson`
+
+**What it does:** the pre-registered bisect that brackets the SMP-3 wall — firmware `CPU_ON` works on
+UEFI 39.2.0 but the woken core's EARLY EXECUTION drives a CBB-rejected access (IOB SERR=0x12 / CBB-0x6 /
+ADDR `0x8000000000000200`). Extends `UNAOS_SMPPROBE` (`arch/aarch64/smpprobe.rs`) with leg family
+10..16: each leg wakes ONE `/cpus`-named core (aff `0x00000100`) into a MINIMAL entry adding exactly
+ONE variable over the previous — 10 park control · 11 +SP · 12 +regime replay (SCTLR off) · 13 +MMU ·
+14 +exceptions · 15 +GICR (`this_cpu_redistributor` + one `GICR_WAKER` read, the **PRIME SUSPECT**) ·
+16 full-path replica — then parks. The woken core NEVER prints (unarbitrated UART); it raises a per-leg
+CHECKPOINT (`0x5304_000<leg>` store + `DC CVAC`, the spin-table-slot idiom) the BSP polls under a
+bounded deadline, so a silent park is distinguishable from a faulted/reset core. All evidence is
+BSP-side serial. RIDERS honored: leg 10 first + one-variable-per-leg + pre-registered predictions
+(STOP on contradiction); probe-only (own stack / SEC_CTX regime regs / own GICR frame, one read /
+checkpoint); DTB-`/cpus`-only target; the leg-15 GICR frame + `GICR_WAKER` MMIO address is COMPUTED +
+PRINTED BSP-side before any `CPU_ON`. Self-contained — `smp_virt.rs` stays BYTE-UNTOUCHED (leg 16
+replicates the `__secondary_rust_virt` tail from public building blocks).
+
+**How it was tested:** `./arroyo check` green both arches + `UNAOS_TEGRA=1` + `UNAOS_TEGRA=1
+UNAOS_SMPPROBE=15` + `UNAOS_TEGRA=1 UNAOS_TEGRASMP=1`; `test-arm 22` MISSION SUCCESS; GICv3 `test-arm 40`
+CAPSTONE 6/6 + 3/3 secondaries (shared `smp_virt` path byte-untouched); `kernel8-test` 0-FAIL (34 PASS);
+`UNAOS_HUBSTORAGE` x86 MISSION SUCCESS. **Knob-off byte-identity proven:** two default `esp-jetson`
+builds hash identical (`tegra:` 109 unchanged; the new `gic.rs` probe helpers DCE'd from the default
+image — verified absent by `nm`). Seven armed leg tars staged. QEMU cannot model the Tegra machine, so
+the metal verdict is the attended Orin bench (LC-orin + Peter) per `unaos/scripts/orin-smp4-bench.md`.
+`arch/aarch64/smpprobe.rs` + `gic.rs` (`redistributor_frame_for_affinity`/`probe_read_this_gicr_waker`)
++ `fdt_tegra::cpu_affinities` (cfg widened) + `arch_arm64.md §ORIN-SMP-4`.
+
+---
+
 ## aarch64 SMP — ORIN-SMP-3: the real 6-core Orin bring-up (`UNAOS_TEGRASMP`) — 2026-07-15 ⛔ METAL STOP — RAS-faults in the woken core's EARLY EXECUTION (the true wall, discriminated) `hw-jetson`
 
 **Attended bench 2026-07-15 night (serial `jetson-serial-2026-07-15-smp3bench.log`): STOP after 2

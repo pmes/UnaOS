@@ -390,6 +390,45 @@ pub fn enumerate_redistributor_affinities(out: &mut [u32]) -> usize {
     n
 }
 
+/// ORIN-SMP-4 (leg 15, the woken-core GICR touch): resolve THIS core's redistributor by the same
+/// `GICR_TYPER`/MPIDR walk `init_redistributor_v3` uses and return ONE read of its `GICR_WAKER`. Read
+/// ONLY — `GICR_WAKER` is never written here, so the redistributor's sleep state is unperturbed (the
+/// leg tests whether the mere MMIO *access* to the target's GICR frame is what the CBB fabric rejects,
+/// without waking it). GICv3 only; `pub` for the smpprobe bisect. Panics loudly (like the walk) if no
+/// frame matches — a woken core that can't find its own redistributor is a STOP, not a silent skip.
+#[cfg(not(feature = "pi"))]
+pub fn probe_read_this_gicr_waker() -> u32 {
+    let rd = this_cpu_redistributor();
+    unsafe { gicr_read(rd, GICR_WAKER) }
+}
+
+/// ORIN-SMP-4: compute the redistributor RD-frame base for an ARBITRARY packed affinity {Aff3..Aff0}
+/// by walking the GICR frames and matching `GICR_TYPER[63:32]` — the same walk as
+/// `this_cpu_redistributor`, but for a core other than the caller. The BSP calls this for the leg-15
+/// target BEFORE any `CPU_ON`, so the runbook/serial can name the exact GICR_WAKER MMIO address the
+/// woken core will touch (`frame + 0x14`). Returns `None` if no frame matches (or the walk passes the
+/// `Last` frame / the cap). GICv3 only; `pub` for the smpprobe bisect. Side-effect free (reads TYPER).
+#[cfg(not(feature = "pi"))]
+pub fn redistributor_frame_for_affinity(aff: u32) -> Option<usize> {
+    let mut frame = GICR_BASE;
+    for _ in 0..MAX_FRAMES {
+        let typer = unsafe { gicr_read64(frame, GICR_TYPER) };
+        if (typer >> 32) as u32 == aff {
+            return Some(frame);
+        }
+        if typer & (1 << 4) != 0 {
+            return None; // Last frame, no match
+        }
+        frame += gicr_stride(typer);
+    }
+    None
+}
+
+/// The `GICR_WAKER` offset within an RD frame — exposed so the smpprobe bisect can name the exact MMIO
+/// address (`frame + GICR_WAKER_OFFSET`) the leg-15 woken core reads. GICv3 only.
+#[cfg(not(feature = "pi"))]
+pub const GICR_WAKER_OFFSET: usize = GICR_WAKER;
+
 /// Wake this core's redistributor and put all its banked INTIDs (SGIs + PPIs) into Group 1, then
 /// return the RD base. Serves the BSP now and each AP in JC2 (call it once per core, before that
 /// core's `init_cpu_interface_v3`). Per-INTID enable/priority happens later in `enable_banked` (v3).

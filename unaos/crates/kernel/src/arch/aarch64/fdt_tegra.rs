@@ -1091,7 +1091,10 @@ pub fn nvdisplay_base(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Opti
 /// cells is `/cpus/#address-cells` (1 on Tegra234 — a single 32-bit affinity; 2 is honored for a
 /// 64-bit affinity). Read-only RAM walk, pre-heap, EL2; a malformed/unmapped blob yields 0 (the caller
 /// STOPs rather than guessing). Bounded by `out.len()`.
-#[cfg(feature = "tegrasmp")]
+// Available to the ORIN-SMP-3 kick-off (`tegrasmp`) AND the ORIN-SMP-4 bisect probe (`smpprobe`), which
+// sources its single woken-core target from the same `/cpus` oracle (RIDER 5). Off both features (the
+// default tegra image) it compiles out entirely, so baseline byte-identity is unaffected.
+#[cfg(any(feature = "tegrasmp", feature = "smpprobe"))]
 pub fn cpu_affinities(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64, out: &mut [u32]) -> usize {
     if dtb_addr == 0 || dtb_size == 0 {
         return 0;
