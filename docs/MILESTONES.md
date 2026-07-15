@@ -827,6 +827,49 @@ Spec promotions committed here; the granular arc detail is in each arc's own ent
 
 ---
 
+## net-sock7 track — 2026-07-15 (SOCK-7 — persistent-listener acceptor pool: the listener survives accepts)
+
+### SOCK-7 — persistent listener (`sys_listen` arms a listener that survives `sys_accept`) 🔬 `us-sock7`
+- **What:** [§1b](ROADMAP.md) SOCK-7 — resolves the SOCK-6 single-accept-per-listen residual. `sys_listen` now
+  arms a **persistent** listener: each `sys_accept` returns a fresh gen-fenced connection and the port keeps
+  listening. Same `UNAOS_SMOLNET` knob, x86-only, byte-identical knob-off / aarch64. **No new syscall** (26/27
+  unchanged, next free stays **28**) and **no new ring-3 surface** — the change is behind the existing `sys_accept`.
+- **The mechanism (design shape (i)):** two shapes were on the table — (i) decouple the per-slot stream buffers
+  from the reg-slot index; (ii) a pre-armed pool of N listeners on one port. **Shape (i) chosen** (minimal enabling
+  primitive, no extra BSS, and shape (ii) needs the same decoupling underneath). The TCP stream buffers, previously
+  pinned to the reg-slot index, become a **free-list** (`SmolStack.tcp_buf_used: [bool; NSOCK]`; a `Tcp` reg entry
+  carries its buffer-set index as `SockKind::Tcp(buf)`). On accept, when the listener socket reaches ESTABLISHED,
+  `peel_and_rearm` (one `STACK`-lock hold, no pump) **peels** the established socket — keeping the buffer set it
+  owns — into a **fresh reg slot** (the caller's connection), and **re-arms** the original listener slot in place
+  with a new socket on a fresh buffer set, re-listening on the same port (`SmolStack.listen_port[sid]`). The
+  listener slot keeps its **socket-id and generation** (no bump), so the caller's listener handle survives unbounded
+  accepts; each accept mints the `KIND_SOCKET` handle for the **peeled connection's** own gen-fenced socket-id
+  (rights derived as the SOCK-4 intersection with the listener handle — unchanged). **Bounded by `NSOCK`, fails
+  safe:** invariant *used buffer sets = live TCP sockets ≤ used reg slots* ⇒ a free slot always has a free buffer
+  (peel never starves); when neither is free the handshake stays buffered in the listener and is peeled by a later
+  accept (`-EAGAIN`) — never lost, listener never consumed. No new BSS/heap.
+- **Evidence:** `scripts/net-inject.py sock7` drives **two sequential** inbound connections to `:8080`; the extended
+  two-accept `smolnet::witness_tick6()` accepts+echoes the first (latches SOCK-6 OK — basic accept, the regression),
+  the listener **survives**, then accepts+echoes the second on the same persistent listener:
+  `:: SOCK-6: smoltcp tcp accept :8080 — received 11 bytes, echoed 11 back — witness OK ::` then
+  `:: SOCK-7: smoltcp tcp accept :8080 #2 — received 12 bytes, echoed 12 back on a PERSISTENT listener … — witness OK ::`
+  (injector prints `GUEST SOCK-6 ACCEPT OK` then `GUEST SOCK-7 PERSISTENT LISTENER OK`, exit 0). Hermetic
+  `UNAOS_SMOLNET=1 ./arroyo test 90` prints both honest PENDING lines, MISSION SUCCESS, SOCK-1/2/3/5 intact.
+- **Gates:** knob-off `./arroyo test 25` / `test-arm 22` MISSION with NO SOCK-7 line (all code
+  `#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]` — byte-identical both arches); knob-on hermetic
+  `UNAOS_SMOLNET=1 ./arroyo test 90` MISSION + both PENDING lines + SOCK-1/2/3/5 intact; knob-on
+  `UNAOS_NET=socket UNAOS_SMOLNET=1 ./arroyo test 90` + `net-inject.py sock7` → both SOCK-6 and SOCK-7 `witness OK`;
+  `check` both arches on+off, no new warnings. **Lane:** `smolnet.rs` + `arch/x86_64/syscall.rs` (the `sys_accept`
+  seam) + `scripts/net-inject.py` + docs; `drivers/e1000.rs`/`crates/net`/`fat.rs`/`sched.rs`/`builder`/`Cargo.toml`
+  untouched; **zero aarch64.**
+- **Residuals:** the persistent listener holds one reg slot + buffer set for its lifetime (`NSOCK − 1` left for
+  connections — a sizing change, not a design one); NSOCK back-pressure buffers-in-listener rather than a separate
+  accept backlog queue; the witness is a stateful BSP-loop poll, not a dedicated ring-3 persistent-accept fixture
+  (deferred); full `copy_from_user` for socket buffers still deferred. **Metal-pending** (no wired NIC on any
+  current board — QEMU slirp / the socket-netdev injector is the honest gate).
+
+---
+
 ## net-sock1 track — 2026-07-14 (SOCK-5 scope B — DHCP via smoltcp: the persistent stack leases its own address)
 
 ### SOCK-5 — smoltcp `dhcpv4::Socket` configures the persistent interface 🔬 `net-sock1`
