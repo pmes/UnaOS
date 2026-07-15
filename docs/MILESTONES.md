@@ -10,6 +10,31 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## aarch64 SMP — CORE3-FIX (re-derive secondary core id from MPIDR_EL1, MMU-on) — 2026-07-15 🔬 `hw-pi4`
+
+**What it does:** closes the CORE3-SMP regression — on Pi 4 metal, a `kernel8.img` crossing 1 MiB
+brought core 3 up as a phantom "core 0" (id 3 → 0), deterministically, so `CORE_READY[3]` never set
+and the CAPSTONE pair failed (30/32). The 2026-07-15 probe bench proved delivery correct (`[03E2X0]`:
+MPIDR reads 3 at EL2) and the corruption kernel-side. Disassembly then pinned the mechanism: the
+compiler spilled the `core_raw` entry argument to the **stack with the MMU off** (Device/non-cacheable
+→ DRAM), and `__secondary_rust` reloaded it **cacheable after `enable_mmu`** for the print, the
+`CORE_READY` index, and `wait_and_run` — hitting a stale (zero) L2 line seeded by the BSP's cacheable
+run over `SECONDARY_STACKS`. A mismatched-attributes coherency hazard, QEMU-invisible (no cache model),
+image-size-deterministic (1 MiB = BCM2711 L2 size, layout-dependent stale-line residency). **The fix
+(`crates/kernel/src/arch/aarch64/smp.rs`):** ignore the advisory argument and re-derive the id from
+`MPIDR_EL1` *after* `drop_to_el1()` + `enable_mmu()` (`mrs`, `& 0xff`, bounds-check, park on garbage) —
+every store/load of the id is now cacheable-coherent; the stale window is deleted, not patched. Asm
+stubs unchanged (x0 advisory); virt/Tegra paths out of lane, analogous pattern flagged upward.
+
+**How it was tested:** 🔬 QEMU-green — `./arroyo check` both arches, `kernel8` clean, `kernel8-test`
+byte-equivalent (41 PASS, CAPSTONE 6/6 on APs [1,2,3], K3-mount `[w=0x1ff]` + K4-write `[w=0x7f]` +
+F2/F3 locked 240000/240000, 0 forbidden), `test-arm` MISSION SUCCESS. Pre- and post-fix disassembly
+recorded in `arch_arm64.md §CORE3-SMP FIX` (mrs now after the `SCTLR_EL1` write; advisory x0 no longer
+spilled). **Metal 4/4 on a >1 MiB build is pending the attended bench** — the real verdict, since QEMU
+brings up 4/4 at every size and can never reproduce the fault.
+
+---
+
 ## unafs — UNAFS-F1 (dirty-mount recovery: fsck-scavenger + `recover`) — 2026-07-13 🔬 `us-unafs-f1`
 
 **What it does:** gives `unaos/libs/fs/unafs` a real crash-recovery pass for the residue the F2 mutation
