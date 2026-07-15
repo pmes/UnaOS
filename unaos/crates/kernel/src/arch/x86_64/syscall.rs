@@ -2627,6 +2627,82 @@ extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
 }
 
 // =============================================================================
+// CFU-1: the SINGLE validated kernel/user copy seam (x86). Every syscall used to open-code the same
+// ring-3 window predicate (`end < ptr || ptr < LO || end > USER_BASE + window`) and then read/write the
+// memory RAW (`from_raw_parts` / `copy_nonoverlapping`), leaning on "ring-3 VA == kernel VA in the live
+// CR3" (the identity alias). Correct-by-review, but with no single enforcement point: every new syscall
+// re-open-coded it, and one future mistake would be a kernel read/write of arbitrary memory. This block
+// UNIFIES that check + copy into three primitives; the syscalls below route through them. It does NOT
+// change the semantics of the check — it is the EXACT current predicate, overflow-safe, with the same
+// per-access lower bound. SMAP (`stac`/`clac`) is a NAMED FOLLOW-ON, NOT this arc: today the copy still
+// goes through the identity-mapped window exactly as before (see docs/SECURITY.md CFU-1).
+// =============================================================================
+
+/// The access direction a ring-3 range is validated for. `Read` admits the WHOLE window including the
+/// read-only code page (page 0 is ring3-RX — a legal read source, e.g. a fixture's RO pattern constant
+/// or the DNS/console send buffer). `Write` requires the range to start PAST the code page
+/// (`USER_BASE + PAGE_SIZE`): page 0 is RO, so a kernel store there would fault under CR0.WP or corrupt
+/// W^X-protected code. This is the exact `sys_write`/`sys_sendto` (read) vs `sys_read`/`sys_recvfrom`
+/// (write) lower-bound split, unified.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UserAccess {
+    Read,
+    Write,
+}
+
+/// The SINGLE ring-3 window predicate. Validate that `[ptr, ptr + len)` lies wholly inside the caller's
+/// user window (overflow-safe) and — for `Write` — past the read-only code page. Returns `Ok(())` or
+/// `Err(EFAULT)`. This is the exact predicate every site open-coded: `end = ptr.wrapping_add(len)`;
+/// `end < ptr` IS the wrap check (a range that wraps past u64::MAX has `end < ptr`); `ptr < LO` and
+/// `end > window_end` are the bounds. A `len == 0` range is in-bounds iff `ptr` itself is — matching the
+/// historical per-site behavior (the zero-length callers that must no-op — `sys_send`/`sys_sock_recv` —
+/// already `return 0` BEFORE reaching the check; the ones that don't — `sys_write` — validated a 0-len
+/// range against the window exactly like this, so a 0-len write with a below-window pointer is `-EFAULT`
+/// as before). `#[must_use]` so a caller cannot silently ignore the verdict.
+#[must_use]
+fn user_range_ok(ptr: u64, len: u64, access: UserAccess) -> Result<(), i64> {
+    let lo = match access {
+        UserAccess::Read => USER_BASE,                 // the RO code page is a legal read source
+        UserAccess::Write => USER_BASE + PAGE_SIZE,    // past page 0 — a kernel store must hit writable RW pages
+    };
+    let window_end = USER_BASE + USER_WINDOW_PAGES * PAGE_SIZE;
+    let end = ptr.wrapping_add(len);
+    if end < ptr || ptr < lo || end > window_end {
+        return Err(EFAULT);
+    }
+    Ok(())
+}
+
+/// Validated copy FROM a ring-3 source INTO a kernel buffer: validate `[user_ptr, user_ptr + dst.len())`
+/// as a READABLE user range (the code page is a legal source), then copy `dst.len()` bytes. `Err(EFAULT)`
+/// leaves `dst` untouched and copies nothing (fail-closed). The single kernel/user READ seam — the
+/// `sys_write`/`sys_write_file`/`sys_open` page-bounce sites route their raw `copy_nonoverlapping` here.
+/// The copy itself is the historical identity-alias `copy_nonoverlapping` (no SMAP toggle this arc).
+#[must_use]
+fn copy_from_user(dst: &mut [u8], user_ptr: u64) -> Result<(), i64> {
+    user_range_ok(user_ptr, dst.len() as u64, UserAccess::Read)?;
+    // Ring-3 VA == kernel VA in the live CR3 (identity alias); the range is proven in-window above.
+    unsafe {
+        core::ptr::copy_nonoverlapping(user_ptr as *const u8, dst.as_mut_ptr(), dst.len());
+    }
+    Ok(())
+}
+
+/// Validated copy FROM a kernel buffer OUT TO a ring-3 destination: validate `[user_ptr, user_ptr +
+/// src.len())` as a WRITABLE user range (inside the window AND past the read-only code page), then copy
+/// `src.len()` bytes. `Err(EFAULT)` writes nothing (fail-closed). The single kernel/user WRITE seam — the
+/// `sys_read`/`sys_recvfrom`/`sys_sock_recv` sites route their raw `copy_nonoverlapping` here.
+#[must_use]
+fn copy_to_user(user_ptr: u64, src: &[u8]) -> Result<(), i64> {
+    user_range_ok(user_ptr, src.len() as u64, UserAccess::Write)?;
+    // Ring-3 VA == kernel VA in the live CR3 (identity alias); the range is proven writable-in-window above.
+    unsafe {
+        core::ptr::copy_nonoverlapping(src.as_ptr(), user_ptr as *mut u8, src.len());
+    }
+    Ok(())
+}
+
+// =============================================================================
 // SOCK-2: the UDP socket syscall family (x86-only, knob-on). Each is a thin, IF-masked-safe wrapper
 // over the persistent smolnet stack (`crate::smolnet`) with the same object-table capability gate the
 // File syscalls use: a socket handle is `KIND_SOCKET` carrying `CAP_READ|CAP_WRITE`; send needs
@@ -2772,16 +2848,18 @@ fn sys_sendto(handle: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     if msg_len < 8 {
         return EINVAL; // no room even for the address header
     }
-    let window = USER_WINDOW_PAGES * PAGE_SIZE;
-    let end = msg_ptr.wrapping_add(msg_len);
-    if end < msg_ptr || msg_ptr < USER_BASE || end > USER_BASE + window {
-        return EFAULT;
+    // CFU-1: validate the WHOLE `msg` range READABLE in the ring-3 window (the code page is a legal send
+    // source) BEFORE any deref — the `sys_write` read-source discipline, now the unified seam.
+    if let Err(e) = user_range_ok(msg_ptr, msg_len, UserAccess::Read) {
+        return e;
     }
     let plen = (msg_len - 8) as usize;
     if plen > crate::smolnet::UDP_MAX_PAYLOAD {
         return EINVAL;
     }
-    // Ring-3 VA == kernel VA in the live CR3 (identity alias); the range is proven in-window above.
+    // Validate-only site (the seam borrows, it does not copy into a kernel buffer): the whole range is
+    // proven in-window above, and ring-3 VA == kernel VA in the live CR3, so the header + payload are
+    // read in place and handed to smolnet (which copies them into its tx buffers synchronously).
     let hdr = unsafe { core::slice::from_raw_parts(msg_ptr as *const u8, 8) };
     let ip = [hdr[0], hdr[1], hdr[2], hdr[3]];
     let port = u16::from_le_bytes([hdr[4], hdr[5]]);
@@ -2808,31 +2886,29 @@ fn sys_recvfrom(handle: u64, buf_ptr: u64, buf_len: u64) -> i64 {
     if buf_len < 8 {
         return EINVAL;
     }
-    // F1: recvfrom is a WRITE path (it stores the source header + payload into `buf_ptr`), so the dest
-    // must be WRITABLE user memory — inside the window AND past the read-only code page (page 0 is
-    // ring3-RX/RO; a kernel store there would fault under CR0.WP or corrupt W^X code). Lower bound is
-    // `USER_BASE + PAGE_SIZE`, matching `sys_read`'s write bound — NOT `sys_write`/`sys_sendto`'s
-    // read-source `< USER_BASE` (those legitimately read the RO code page).
-    let window = USER_WINDOW_PAGES * PAGE_SIZE;
-    let end = buf_ptr.wrapping_add(buf_len);
-    if end < buf_ptr || buf_ptr < USER_BASE + PAGE_SIZE || end > USER_BASE + window {
-        return EFAULT;
+    // CFU-1: recvfrom is a WRITE path (it stores the source header + payload into `buf_ptr`), so validate
+    // the WHOLE declared dest as WRITABLE user memory up front — inside the window AND past the read-only
+    // code page (`UserAccess::Write` = the `USER_BASE + PAGE_SIZE` lower bound). Validating the full
+    // `buf_len` (not just the 8 + n bytes actually written) keeps the -EFAULT surface byte-identical to
+    // the open-coded predicate this replaces.
+    if let Err(e) = user_range_ok(buf_ptr, buf_len, UserAccess::Write) {
+        return e;
     }
     let cap = ((buf_len - 8) as usize).min(crate::smolnet::UDP_MAX_PAYLOAD);
     let mut kbuf = [0u8; crate::smolnet::UDP_MAX_PAYLOAD];
     let Some((ip, port, n)) = crate::smolnet::stack_recvfrom(sid, &mut kbuf[..cap]) else {
         return EAGAIN;
     };
-    // Write the source-address header + payload into the (proven in-window) user buffer.
-    let dst = buf_ptr as *mut u8;
+    // Write the source-address header + payload out through the WRITE seam. The 8-byte header
+    // `[src_ip[4]][src_port u16 LE][pad u16]` then the payload (`n <= cap <= buf_len - 8`, so both
+    // subranges lie inside the buffer validated above — `copy_to_user` re-checks and cannot fail here).
     let pbytes = port.to_le_bytes();
-    unsafe {
-        core::ptr::copy_nonoverlapping(ip.as_ptr(), dst, 4);
-        *dst.add(4) = pbytes[0];
-        *dst.add(5) = pbytes[1];
-        *dst.add(6) = 0;
-        *dst.add(7) = 0;
-        core::ptr::copy_nonoverlapping(kbuf.as_ptr(), dst.add(8), n);
+    let hdr = [ip[0], ip[1], ip[2], ip[3], pbytes[0], pbytes[1], 0, 0];
+    if let Err(e) = copy_to_user(buf_ptr, &hdr) {
+        return e;
+    }
+    if let Err(e) = copy_to_user(buf_ptr + 8, &kbuf[..n]) {
+        return e;
     }
     (8 + n) as i64
 }
@@ -2855,12 +2931,13 @@ fn sys_connect(handle: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     if msg_len < 8 {
         return EINVAL; // no room for the address header
     }
-    let window = USER_WINDOW_PAGES * PAGE_SIZE;
-    let end = msg_ptr.wrapping_add(8);
-    if end < msg_ptr || msg_ptr < USER_BASE || msg_ptr + 8 > USER_BASE + window {
-        return EFAULT;
+    // CFU-1: validate the 8-byte address header READABLE in the ring-3 window (as `sys_sendto`; the code
+    // page is a legal source). Only the header is read here — the payload discipline is `sys_send`'s.
+    if let Err(e) = user_range_ok(msg_ptr, 8, UserAccess::Read) {
+        return e;
     }
-    // Ring-3 VA == kernel VA in the live CR3 (identity alias); the 8-byte header is proven in-window.
+    // Validate-only site: the 8-byte header is proven in-window above and ring-3 VA == kernel VA in the
+    // live CR3, so it is read in place.
     let hdr = unsafe { core::slice::from_raw_parts(msg_ptr as *const u8, 8) };
     let ip = [hdr[0], hdr[1], hdr[2], hdr[3]];
     let port = u16::from_le_bytes([hdr[4], hdr[5]]);
@@ -2890,12 +2967,15 @@ fn sys_send(handle: u64, buf_ptr: u64, buf_len: u64) -> i64 {
     if buf_len == 0 {
         return 0;
     }
-    let window = USER_WINDOW_PAGES * PAGE_SIZE;
-    let end = buf_ptr.wrapping_add(buf_len);
-    if end < buf_ptr || buf_ptr < USER_BASE || end > USER_BASE + window {
-        return EFAULT;
+    // CFU-1: validate the WHOLE `buf` range READABLE in the ring-3 window (the code page is a legal send
+    // source) — the `sys_write`/`sys_sendto` read-source discipline. The full `buf_len` is validated even
+    // though only the clamped `len` is streamed, keeping the -EFAULT surface byte-identical.
+    if let Err(e) = user_range_ok(buf_ptr, buf_len, UserAccess::Read) {
+        return e;
     }
     let len = (buf_len as usize).min(crate::smolnet::TCP_MAX_CHUNK);
+    // Validate-only site: the range is proven in-window above; smolnet copies the borrowed slice into its
+    // tx ring synchronously.
     let data = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, len) };
     match crate::smolnet::stack_send(sid, data) {
         Ok(n) => n as i64,
@@ -2921,19 +3001,20 @@ fn sys_sock_recv(handle: u64, buf_ptr: u64, buf_len: u64) -> i64 {
     if buf_len == 0 {
         return 0;
     }
-    // A WRITE path: the dest must be WRITABLE user memory — inside the window AND past the RO code page
-    // (the `sys_recvfrom`/`sys_read` F1 lower bound `USER_BASE + PAGE_SIZE`).
-    let window = USER_WINDOW_PAGES * PAGE_SIZE;
-    let end = buf_ptr.wrapping_add(buf_len);
-    if end < buf_ptr || buf_ptr < USER_BASE + PAGE_SIZE || end > USER_BASE + window {
-        return EFAULT;
+    // CFU-1: a WRITE path — validate the whole dest WRITABLE (inside the window AND past the RO code page,
+    // `UserAccess::Write`'s `USER_BASE + PAGE_SIZE` lower bound) up front.
+    if let Err(e) = user_range_ok(buf_ptr, buf_len, UserAccess::Write) {
+        return e;
     }
     let cap = (buf_len as usize).min(crate::smolnet::TCP_MAX_CHUNK);
     let mut kbuf = [0u8; crate::smolnet::TCP_MAX_CHUNK];
     match crate::smolnet::stack_recv(sid, &mut kbuf[..cap]) {
         crate::smolnet::RecvOutcome::Data(n) => {
-            // Copy the stream bytes into the (proven in-window, writable) user buffer.
-            unsafe { core::ptr::copy_nonoverlapping(kbuf.as_ptr(), buf_ptr as *mut u8, n) };
+            // Copy the stream bytes out through the WRITE seam (`n <= cap <= buf_len`, a subrange of the
+            // range validated above — `copy_to_user` re-checks and cannot fail here).
+            if let Err(e) = copy_to_user(buf_ptr, &kbuf[..n]) {
+                return e;
+            }
             n as i64
         }
         crate::smolnet::RecvOutcome::WouldBlock => EAGAIN,
@@ -3037,11 +3118,12 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> i64 {
         Ok(HandleTarget::File(file_id)) => return sys_write_file(row, file_id, buf, len),
         _ => return EACCES,
     }
-    let window = USER_WINDOW_PAGES * PAGE_SIZE;
-    let end = buf.wrapping_add(len);
-    // Reject overflow and any range not fully inside the user window.
-    if end < buf || buf < USER_BASE || end > USER_BASE + window {
-        return -14; // -EFAULT
+    // CFU-1: validate the whole console range READABLE in the user window (overflow-safe) BEFORE the
+    // deref — a ring-3 caller must not point `buf` at kernel RAM (exfiltration out the console) or at
+    // unmapped memory (a ring-0 fault). The seam borrows the bytes in place (the console sink consumes a
+    // &str); it does not copy into a kernel buffer, so this is a validate-only site.
+    if let Err(e) = user_range_ok(buf, len, UserAccess::Read) {
+        return e;
     }
     let bytes = unsafe { core::slice::from_raw_parts(buf as *const u8, len as usize) };
     // The console sink is UTF-8. U1a output is ASCII; for any non-UTF-8 tail, write the valid prefix
@@ -3091,20 +3173,19 @@ fn sys_write_file(row: usize, file_id: u64, buf: u64, len: u64) -> i64 {
             return EIO;
         }
         let size = FILE_SIZE[row][idx].load(Ordering::Acquire);
-        let window = USER_WINDOW_PAGES * PAGE_SIZE;
         // CAS-claim `[offset, offset+want)` exactly as `sys_read`/the in-place write below: clamp `want` to the
         // bytes left to EOF (overwrite-only — a past-EOF write is 0, never a grow), and validate the WHOLE
         // source range BEFORE the claim (a bad buffer is -EFAULT with NO claim, no copy, no offset move; the
-        // code page is a legal RX source, so `buf < USER_BASE` is the only lower bound).
+        // code page is a legal RX source, so `UserAccess::Read` is the correct lower bound). CFU-1: the
+        // validation is the unified `user_range_ok` seam; the per-page copies below route through `copy_from_user`.
         let (offset, want) = loop {
             let offset = FILE_OFFSET[row][idx].load(Ordering::Acquire);
             let want = core::cmp::min(len as usize, size.saturating_sub(offset) as usize);
             if want == 0 {
                 return 0; // at/after EOF (never grows) or nothing requested — a clean no-op, no offset move
             }
-            let end = buf.wrapping_add(want as u64);
-            if end < buf || buf < USER_BASE || end > USER_BASE + window {
-                return EFAULT;
+            if let Err(e) = user_range_ok(buf, want as u64, UserAccess::Read) {
+                return e;
             }
             if FILE_OFFSET[row][idx]
                 .compare_exchange(offset, offset + want as u32, Ordering::AcqRel, Ordering::Acquire)
@@ -3124,8 +3205,10 @@ fn sys_write_file(row: usize, file_id: u64, buf: u64, len: u64) -> i64 {
         let mut done = 0usize;
         while done < want {
             let chunk = core::cmp::min(PAGE_SIZE as usize, want - done);
-            unsafe {
-                core::ptr::copy_nonoverlapping((buf + done as u64) as *const u8, kbuf.as_mut_ptr(), chunk);
+            // CFU-1: pull this chunk in through the READ seam. `[buf+done, buf+done+chunk)` is a subrange of
+            // the range validated before the CAS claim above, so this re-check cannot fail here.
+            if let Err(e) = copy_from_user(&mut kbuf[..chunk], buf + done as u64) {
+                return e;
             }
             let n = unsafe { dyn_write_live(row, idx, offset + done as u32, kbuf.as_mut_ptr(), chunk) };
             if n < 0 || (n as usize) < chunk {
@@ -3153,7 +3236,6 @@ fn sys_write_file(row: usize, file_id: u64, buf: u64, len: u64) -> i64 {
     if FILE_OPNAME[row][idx].load(Ordering::Acquire) != 0 && (len as usize) > inplace_avail {
         return sys_write_grow(row, idx, widx, size, offset0, buf, len);
     }
-    let window = USER_WINDOW_PAGES * PAGE_SIZE;
     // U9x M2 (folding the M1 review's offset-CAS note): claim the write range with a tx-exact
     // `compare_exchange`, EXACTLY as `sys_read` claims its read range — so the write offset advance is
     // CAS-symmetric with the read path (closing the M1 load/store asymmetry before any shared writable
@@ -3162,16 +3244,16 @@ fn sys_write_file(row: usize, file_id: u64, buf: u64, len: u64) -> i64 {
     // at/after EOF is 0 bytes, never grows). The WHOLE source range is validated BEFORE the claim (inside the
     // user window, readable — the code page is RX, so the fixture's RO pattern constant is a legal source; a
     // bad buffer is -EFAULT with NO claim, no copy, no offset move). Single-writer per private slot (one
-    // IF-masked syscall at a time), so the CAS never retries here — the symmetry is the point.
+    // IF-masked syscall at a time), so the CAS never retries here — the symmetry is the point. CFU-1: the
+    // validation is the unified `user_range_ok` READ seam (the code page is a legal RX source).
     let (offset, want) = loop {
         let offset = FILE_OFFSET[row][idx].load(Ordering::Acquire);
         let want = core::cmp::min(len as usize, size.saturating_sub(offset) as usize);
         if want == 0 {
             return 0; // at/after EOF (never grows) or nothing requested — a clean no-op, no offset move
         }
-        let end = buf.wrapping_add(want as u64);
-        if end < buf || buf < USER_BASE || end > USER_BASE + window {
-            return EFAULT;
+        if let Err(e) = user_range_ok(buf, want as u64, UserAccess::Read) {
+            return e;
         }
         if FILE_OFFSET[row][idx]
             .compare_exchange(offset, offset + want as u32, Ordering::AcqRel, Ordering::Acquire)
@@ -3195,9 +3277,10 @@ fn sys_write_file(row: usize, file_id: u64, buf: u64, len: u64) -> i64 {
         if let Some(name) = STAGED_NAMES.get(sidx) {
             // Bounce the ring-3 source (validated in the CAS claim above) into a kernel-stack buffer the
             // service task can reach; write_at persists it in place. `want <= PAGE_SIZE` (staged bound).
+            // CFU-1: the bounce is the READ seam (`want` is a subrange of the validated range — cannot fail).
             let mut kbuf = [0u8; PAGE_SIZE as usize];
-            unsafe {
-                core::ptr::copy_nonoverlapping(buf as *const u8, kbuf.as_mut_ptr(), want);
+            if let Err(e) = copy_from_user(&mut kbuf[..want], buf) {
+                return e;
             }
             let n = unsafe {
                 crate::drivers::xhci::irqstorage::submit_write_file(
@@ -3226,9 +3309,11 @@ fn sys_write_file(row: usize, file_id: u64, buf: u64, len: u64) -> i64 {
         if let Some(nameid) = (FILE_OPNAME[row][idx].load(Ordering::Acquire) as usize).checked_sub(1) {
             if nameid < N_U10_NAMES {
                 let name = U10_NAMES[nameid];
+                // CFU-1: bounce the ring-3 source in through the READ seam (`want` is a subrange of the
+                // range validated in the CAS claim above — cannot fail here).
                 let mut kbuf = [0u8; PAGE_SIZE as usize];
-                unsafe {
-                    core::ptr::copy_nonoverlapping(buf as *const u8, kbuf.as_mut_ptr(), want);
+                if let Err(e) = copy_from_user(&mut kbuf[..want], buf) {
+                    return e;
                 }
                 let n = unsafe {
                     crate::drivers::xhci::irqstorage::submit_write_file(
@@ -3277,10 +3362,10 @@ fn sys_write_grow(row: usize, idx: usize, widx: usize, size: u32, offset: u32, b
     if want == 0 {
         return ENOSPC; // the one-page staging buffer is full (offset at the page end) — never in the demo
     }
-    let window = USER_WINDOW_PAGES * PAGE_SIZE;
-    let end = buf.wrapping_add(want as u64);
-    if end < buf || buf < USER_BASE || end > USER_BASE + window {
-        return EFAULT; // a bad source buffer -> no copy, no size/offset move
+    // CFU-1: validate the (clamped) grow source READABLE in the window (a bad source buffer -> -EFAULT
+    // with no copy, no size/offset move) — the unified READ seam.
+    if let Err(e) = user_range_ok(buf, want as u64, UserAccess::Read) {
+        return e;
     }
     let new_end = offset + want as u32; // <= PAGE_SIZE by the clamp above
     debug_assert!(new_end as usize <= page && new_end > offset, "grow: new_end out of range");
@@ -3298,9 +3383,11 @@ fn sys_write_grow(row: usize, idx: usize, widx: usize, size: u32, offset: u32, b
         if let Some(nameid) = (FILE_OPNAME[row][idx].load(Ordering::Acquire) as usize).checked_sub(1) {
             if nameid < N_U10_NAMES {
                 let name = U10_NAMES[nameid];
+                // CFU-1: bounce the ring-3 grow source in through the READ seam (`want` is a subrange of
+                // the range validated above — cannot fail here).
                 let mut kbuf = [0u8; PAGE_SIZE as usize];
-                unsafe {
-                    core::ptr::copy_nonoverlapping(buf as *const u8, kbuf.as_mut_ptr(), want);
+                if let Err(e) = copy_from_user(&mut kbuf[..want], buf) {
+                    return e;
                 }
                 let n = unsafe {
                     crate::drivers::xhci::irqstorage::submit_grow(name.as_bytes(), offset, kbuf.as_mut_ptr(), want)
@@ -6236,13 +6323,13 @@ fn sys_open(name_ptr: u64, name_len: u64, mode: u64) -> i64 {
     if n == 0 || n > MAX_NAME {
         return EINVAL;
     }
-    let window = USER_WINDOW_PAGES * PAGE_SIZE;
-    let end = name_ptr.wrapping_add(name_len);
-    if end < name_ptr || name_ptr < USER_BASE || end > USER_BASE + window {
-        return EFAULT;
-    }
+    // CFU-1: validate + copy the name through the READ seam in one call — `n == name_len`, so the
+    // validated range is identical to the open-coded predicate this replaces (a bad name range is
+    // -EFAULT with nothing claimed).
     let mut namebuf = [0u8; MAX_NAME];
-    namebuf[..n].copy_from_slice(unsafe { core::slice::from_raw_parts(name_ptr as *const u8, n) });
+    if let Err(e) = copy_from_user(&mut namebuf[..n], name_ptr) {
+        return e;
+    }
     let Ok(name) = core::str::from_utf8(&namebuf[..n]) else {
         return ENOENT; // a non-UTF-8 name matches no staged entry
     };
@@ -6401,7 +6488,6 @@ fn sys_read(handle: u64, buf: u64, len: u64) -> i64 {
     // concurrent reads are well-defined instead of double-delivering one range. Private slots keep their
     // single-writer discipline untouched (the CAS never retries there). The destination is validated
     // BEFORE the claim, so an -EFAULT still moves no offset and loses no bytes.
-    let window_end = USER_BASE + USER_WINDOW_PAGES * PAGE_SIZE;
     let (offset, want) = loop {
         let offset = FILE_OFFSET[row][idx].load(Ordering::Acquire);
         // Bytes available from the current offset, clamped to the request. `offset` advances only by
@@ -6410,14 +6496,13 @@ fn sys_read(handle: u64, buf: u64, len: u64) -> i64 {
         if want == 0 {
             return 0; // EOF, or the caller requested nothing
         }
-        // Validate the WHOLE destination BEFORE any claim or copy — and it must be WRITABLE user memory:
-        // inside the window AND past the read-only code page (page 0 is ring3-RX/RO; a kernel store there
-        // would either fault under CR0.WP or corrupt W^X-protected code — excluded by construction, the
-        // x86 stand-in for the twin's `user_range_ok(.., writable)`). A bad buffer is -EFAULT with no
-        // copy and no offset move.
-        let end = buf.wrapping_add(want as u64);
-        if end < buf || buf < USER_BASE + PAGE_SIZE || end > window_end {
-            return EFAULT;
+        // CFU-1: validate the WHOLE destination BEFORE any claim or copy — and it must be WRITABLE user
+        // memory: inside the window AND past the read-only code page (page 0 is ring3-RX/RO; a kernel
+        // store there would either fault under CR0.WP or corrupt W^X-protected code). This is now the
+        // unified `user_range_ok(.., UserAccess::Write)` seam (the write-dest lower bound). A bad buffer
+        // is -EFAULT with no copy and no offset move.
+        if let Err(e) = user_range_ok(buf, want as u64, UserAccess::Write) {
+            return e;
         }
         if FILE_OFFSET[row][idx]
             .compare_exchange(offset, offset + want as u32, Ordering::AcqRel, Ordering::Acquire)
@@ -6474,12 +6559,10 @@ fn sys_read(handle: u64, buf: u64, len: u64) -> i64 {
             if got == 0 {
                 break; // live EOF / short read — deliver what we have
             }
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    kbuf.as_ptr(),
-                    (buf + done as u64) as *mut u8,
-                    got,
-                );
+            // CFU-1: push this chunk out through the WRITE seam. `[buf+done, buf+done+got)` is a subrange
+            // of the destination validated before the CAS claim above, so this re-check cannot fail here.
+            if let Err(e) = copy_to_user(buf + done as u64, &kbuf[..got]) {
+                return e;
             }
             done += got;
             if got < chunk {
@@ -6524,10 +6607,11 @@ fn sys_read(handle: u64, buf: u64, len: u64) -> i64 {
             if got == 0 {
                 return 0; // live EOF / short read
             }
-            // Copy the fetched bytes out to the (already-validated) ring-3 destination — the submitter's
-            // CR3 is re-installed on resume, so the user window is mapped again.
-            unsafe {
-                core::ptr::copy_nonoverlapping(kbuf.as_ptr(), buf as *mut u8, got);
+            // CFU-1: copy the fetched bytes out through the WRITE seam — the submitter's CR3 is
+            // re-installed on resume, so the user window is mapped again. `got <= want`, a subrange of the
+            // destination validated before the CAS claim, so this re-check cannot fail here.
+            if let Err(e) = copy_to_user(buf, &kbuf[..got]) {
+                return e;
             }
             return got as i64;
         }
@@ -6561,8 +6645,10 @@ fn sys_read(handle: u64, buf: u64, len: u64) -> i64 {
         if got == 0 {
             return 0; // live EOF / short read
         }
-        unsafe {
-            core::ptr::copy_nonoverlapping(kbuf.as_ptr(), buf as *mut u8, got);
+        // CFU-1: copy the created-file bytes out through the WRITE seam (`got <= want`, a subrange of the
+        // destination validated before the CAS claim — cannot fail here).
+        if let Err(e) = copy_to_user(buf, &kbuf[..got]) {
+            return e;
         }
         return got as i64;
     }
@@ -6585,10 +6671,10 @@ fn sys_read(handle: u64, buf: u64, len: u64) -> i64 {
     if got == 0 {
         return 0; // treat a (impossible) source shrink as EOF rather than over-read
     }
-    // The dest range was validated above and the ring-3 VA equals the kernel VA in the live CR3 (the
-    // sys_write discipline, write-side): a plain bounded copy into the caller's RW pages.
-    unsafe {
-        core::ptr::copy_nonoverlapping(src.as_ptr().add(offset as usize), buf as *mut u8, got);
+    // CFU-1: the dest range was validated before the CAS claim above; copy the staged/wstage bytes out
+    // through the WRITE seam (`got <= want`, a subrange of that validated range — cannot fail here).
+    if let Err(e) = copy_to_user(buf, &src[offset as usize..offset as usize + got]) {
+        return e;
     }
     got as i64
 }
@@ -12162,6 +12248,50 @@ fn s5_witness_run(r1: usize, r2: usize, nameid: usize) -> Option<bool> {
 /// (no ` PASS`/`FAIL ::`). Gated on the knob-on FAT path (bench media is knob-on and HELLO.BIN is staged there);
 /// MF2 itself is knob-INDEPENDENT (immutable code is read-only in both states) — this witness just makes it
 /// mbench-visible on the knob-on bench.
+/// CFU-1 negative witness (uncounted, kernel-side): drive the REAL dispatcher (`syscall_dispatch`) with a
+/// `SYS_OPEN` whose name pointer takes each of the three out-of-window shapes the unified `user_range_ok`
+/// seam must reject — (a) a WRAPPING range (`ptr + len` overflows u64), (b) a pointer BELOW `USER_BASE`,
+/// (c) a range whose END exceeds the window — and prove each returns `-EFAULT` with NO side effect. SYS_OPEN
+/// is the vehicle because its `copy_from_user(name)` is the FIRST thing it does after the length check, so it
+/// reaches the seam with no handle prerequisite: the `-EFAULT` is the seam's, not a capability denial, and
+/// because `user_range_ok` rejects all three BEFORE any deref, the witness never touches the bad memory (no
+/// ring-0 fault) and SYS_OPEN claims nothing (no file opened, no descriptor allocated). Two safe positive
+/// controls (pure `user_range_ok`, no deref) prove the seam is a real gate, not an always-fail: a valid
+/// in-window range validates `Ok`, and the READ bound admits the read-only code page (page 0) that the WRITE
+/// bound rejects — the one semantic difference between the access modes. Uncounted idiom (a bare
+/// `witness OK` / `FAIL` line, no ` PASS`/` FAIL` token the mbench count asserts). Runs on any block-present
+/// path, knob-on and knob-off (a bad pointer needs no storage), so it exercises the seam on every gate.
+fn cfu_efault_witness() {
+    const NLEN: u64 = 8; // 0 < 8 <= MAX_NAME, so the length check passes and the name copy (the seam) runs
+    let window = USER_WINDOW_PAGES * PAGE_SIZE;
+    // The three rejected shapes, each driven through the real dispatcher. None dereferences the pointer —
+    // `user_range_ok` returns `Err(EFAULT)` before `copy_from_user` copies, so this is safe in any CR3.
+    let wrap = syscall_dispatch(SYS_OPEN, u64::MAX - 2, NLEN, 0); // ptr + NLEN overflows (end < ptr)
+    let below = syscall_dispatch(SYS_OPEN, USER_BASE - PAGE_SIZE, NLEN, 0); // ptr < USER_BASE
+    let above = syscall_dispatch(SYS_OPEN, USER_BASE + window - 4, NLEN, 0); // end past the window
+    // Positive controls (validate-only, no deref): a valid in-window READ range is accepted, and the READ
+    // bound admits page 0 (a legal read source) while the WRITE bound rejects it (page 0 is RO/RX).
+    let inwin_ok = user_range_ok(USER_BASE + PAGE_SIZE, NLEN, UserAccess::Read).is_ok();
+    let read_page0 = user_range_ok(USER_BASE, NLEN, UserAccess::Read).is_ok();
+    let write_page0 = user_range_ok(USER_BASE, NLEN, UserAccess::Write).is_err();
+    let ok = wrap == EFAULT
+        && below == EFAULT
+        && above == EFAULT
+        && inwin_ok
+        && read_page0
+        && write_page0;
+    if ok {
+        serial_println!(
+            ":: CFU: SYS_OPEN wrap/below/above ranges each -EFAULT, no side effect, in-window accepted, write-bound rejects the RO code page — witness OK ::"
+        );
+    } else {
+        serial_println!(
+            ":: CFU FAIL — wrap={} below={} above={} inwin_ok={} rd0={} wr0={} (want -14,-14,-14,true,true,true) ::",
+            wrap, below, above, inwin_ok, read_page0, write_page0
+        );
+    }
+}
+
 #[cfg(feature = "irqstorage")]
 fn mf2_witness() {
     if !s4_sync_storage() {
@@ -12530,6 +12660,9 @@ fn u11m2_launcher(demo_cpu: usize) {
     if crate::drivers::block::info().is_none() {
         return;
     }
+    // CFU-1: negative witness for the unified kernel/user copy seam — three out-of-window SYS_OPEN name
+    // ranges each -EFAULT through the REAL dispatcher, no side effect (uncounted; knob-on AND knob-off).
+    cfu_efault_witness();
     // STOR-1 S5: prove cross-process created-file reads serve LIVE shared backing (knob-on + FAT only). Runs
     // FIRST — DEFER.BIN and all wstage slots are free; it reuses DEFER.BIN and cleans up fully before phase 1
     // (idempotent self-heal + a post-cleanup OPENF/DYN_DELETED_G assert). SILENT skip off the knob-on FAT path.

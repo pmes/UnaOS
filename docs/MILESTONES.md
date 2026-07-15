@@ -10,6 +10,29 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-rmbp track — 2026-07-15 (CFU-1 — the single validated kernel/user copy seam)
+
+### CFU-1 — `copy_from_user`/`copy_to_user`/`user_range_ok` on x86 🔬 `hw-rmbp`
+
+**What it does:** unifies the open-coded ring-3 buffer discipline every x86 syscall carried into ONE
+validated seam in `arch/x86_64/syscall.rs`. `user_range_ok(ptr, len, Read|Write)` is the exact,
+overflow-safe window predicate (Read admits the RO code page as a source; Write requires the range past
+it); `copy_from_user`/`copy_to_user` validate-then-copy through the identity window, `#[must_use]` +
+`Result`-returning. The socket family (M1: sendto/recvfrom/connect/send/sock_recv — retiring the SOCK-2..7
+ledgered residual) and the storage/file family (M2: sys_write console, sys_write_file incl. the S8/S3/S4
+branches, sys_write_grow, sys_open's name copy, all four sys_read write-out branches) route through it.
+Validate-before-CAS-claim orderings preserved exactly; ZERO behaviour change (same errnos/clamps/partial
+semantics, byte-identical serial). The x86 SMAP `stac`/`clac` wrap is the named follow-on (pre-Broadwell
+rMBP has no SMAP), not this arc.
+
+**How it was tested:** 🔬 QEMU — `./arroyo check` both arches knob-on+off, zero new warnings, zero aarch64
+files touched; knob-ON `UNAOS_IRQSTORAGE=1 UNAOS_FATIMG=sf test 200` 25 PASS 0 FAIL (S8-write intact) +
+the new `:: CFU: … witness OK ::` negative witness (three out-of-window SYS_OPEN ranges each -EFAULT with
+no side effect, through the real dispatcher); knob-ON `UNAOS_SMOLNET=1 test 90` MISSION + SOCK-1..7 +
+zeolite + the SOCK-2/3/4 round-trips (the converted socket data paths) + the CFU witness; knob-OFF
+`test 25` 18 PASS / `UNAOS_FATIMG=sf test 200` 22 PASS byte-identical apart from the witness; `test-arm 22`
+MISSION; NOSTORAGE clean. Metal-pending.
+
 ## hw-pi4 track — 2026-07-15 (K6 — native-attr migration; the UNAFS.ATR sidecar retired)
 
 ### K6 — U6 ACL migrated onto native unafs typed attributes ✅✅ METAL-CONFIRMED `hw-pi4`
