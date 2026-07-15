@@ -119,6 +119,32 @@ instrumented build (core3probe idiom) rides the next Pi arc's sitting to produce
 
 ---
 
+## aarch64 SMP — ORIN-SMP-3: the real 6-core Orin bring-up (`UNAOS_TEGRASMP`) — 2026-07-15 ⏳ QEMU-green + build; metal attended-pending `hw-jetson`
+
+**What it does:** wires the tegra SMP kick-off the born-fixed §ORIN-SMP bring-up was waiting on, now
+that ORIN-SMP-2's bench proved the JM5 `CPU_ON` wall is gone on current firmware. `UNAOS_TEGRASMP=1`
+(tegra + `tegrasmp` gated, default OFF) brings every real Orin core online via PSCI `CPU_ON` from
+`tegra_early_stop` after JM4 and **before** the JM6 EL2→EL1 drop (so the woken cores wake at EL2 and
+replay the BSP's live EL2 regime — no EL1/`SEC_CTX` divergence needed). **Presence oracle = the DTB
+`/cpus` node ALONE** (`fdt_tegra::cpu_affinities`, one provable FDT-walk producer): RIDER 1 — no
+`CPU_ON` targets an affinity absent from `/cpus`; never `AFFINITY_INFO` (12 false-valid slots on the
+6-core Nano) and never the GICR walk (8 frames). Each secondary runs the born-fixed
+`__secondary_rust_virt` path (re-derive index from live MPIDR post-MMU). Bounded per-core wait; a miss
+= WARNING + continue. RIDER 2 — the UEFI build line (`t23x_general 39.2.0-gcid-45755727` or newer) is a
+bench precondition, restated in the kick-off's first serial line. RIDER 3 — the DTB-vs-AFFINITY_INFO-
+vs-GICR oracle discrepancy is ledgered in `arch_arm64.md §ORIN-SMP-3`.
+
+**How it was tested:** `./arroyo check` green both arches + `UNAOS_TEGRA=1` + `UNAOS_TEGRA=1
+UNAOS_TEGRASMP=1`; `test-arm 22` MISSION SUCCESS; GICv3 `test-arm 40` CAPSTONE 6/6 + 3/3 secondaries
+(the shared `smp_virt` path byte-untouched); `kernel8-test` 0-FAIL; `UNAOS_HUBSTORAGE` x86 MISSION
+SUCCESS; `esp-jetson` links (built LAST). **Knob-off byte-identity proven:** two default `esp-jetson`
+builds hash identical (`tegra:` count 109 unchanged); the armed image is a distinct ELF hash with
+`tegra:` still 109 (the kick-off's records use the `AARCH64 SMP:` family, not `tegra:`, so validate
+the armed image by hash + `ORIN-SMP-3` string presence). QEMU cannot model the Tegra machine, so the
+metal verdict is the attended Orin bench (LC-orin + Peter) per `unaos/scripts/orin-smp3-bench.md`.
+`arch/aarch64/smp_virt.rs::start_secondaries_tegra` + `fdt_tegra::cpu_affinities` + `arch_arm64.md
+§ORIN-SMP-3`.
+
 ## aarch64 SMP — ORIN-SMP-2: the JM5 `CPU_ON` firmware-wall INVESTIGATION probe (`UNAOS_SMPPROBE`) — 2026-07-15 ✅ BENCHED — **VERDICT: THE WALL IS GONE on current firmware** `hw-jetson`
 
 **Attended bench 2026-07-15 (serial `jetson-serial-2026-07-15-smp2bench.log`): 7 boots, 7 CAPSTONEs, 0
