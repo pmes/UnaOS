@@ -83,6 +83,14 @@ tegra = []
 # const). Enable via `UNAOS_SMPPROBE=<n> UNAOS_TEGRA=1 ./arroyo esp-jetson`.
 smpprobe = []
 
+# ORIN-SMP-3: the `UNAOS_TEGRASMP=1` real 6-core Orin SMP kick-off (arch/aarch64 smp_virt.rs
+# `start_secondaries_tegra` + the fdt_tegra `/cpus` presence enumerator), wired into
+# `tegra_early_stop` after JM4 and BEFORE the JM6 drop. Tegra-only. With this feature OFF (default)
+# the kick-off + its `/cpus` enumerator vanish and the tegra image is byte-identical to baseline
+# (build twice, compare hashes). The DTB `/cpus` node is the ONLY presence oracle (RIDER 1). Enable
+# via `UNAOS_TEGRASMP=1 UNAOS_TEGRA=1 ./arroyo esp-jetson`. See arch_arm64.md §ORIN-SMP-3.
+tegrasmp = ["tegra"]
+
 # CORE3-PROBE: instrument the aarch64 secondary-core entry stub (`_secondary_start`) to raw-dump,
 # MMU-off / no-stack, each core's MPIDR_EL1 low byte, CurrentEL, and its arrival x0 to the Pi 4 PL011
 # (0xFE201000) BEFORE any Rust runs. Disambiguates the CORE3-SMP >1 MiB core-3 regression (firmware

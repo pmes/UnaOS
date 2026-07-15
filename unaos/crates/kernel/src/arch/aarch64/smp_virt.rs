@@ -617,3 +617,188 @@ pub fn start_secondaries(dtb_addr: u64, dtb_size: usize) {
         n_startable
     );
 }
+
+/// ORIN-SMP-3 — the real 6-core Orin bring-up kick-off (`tegra` + `tegrasmp` gated). Called from
+/// `tegra_early_stop` after JM4 (GIC-600 + generic timer + heap up) and BEFORE the JM6 EL2->EL1 drop,
+/// so the BSP is still at **EL2**: the woken secondaries wake at the caller's EL (EL2) and replay the
+/// BSP's live EL2 regime through the born-fixed `__secondary_rust_virt` path — exactly the state
+/// `SEC_CTX`/`enable_mmu_virt` capture. (No EL1/`SEC_CTX` divergence is needed: the JM6b EL1-precise
+/// twin table is for the boot core's post-drop regime, which this kick-off precedes.)
+///
+/// **Presence oracle (RIDER 1): the DTB `/cpus` node ALONE.** The target list is produced by
+/// `fdt_tegra::cpu_affinities` from the FDT walk only — never `AFFINITY_INFO` (12 false-valid slots on
+/// the 6-core Nano) and never the redistributor walk (8 frames). No code path here issues `CPU_ON` to
+/// an affinity absent from that list; the fuse-disabled-`CPU_ON` question (JM5 attempt-1's fatal RAS)
+/// is therefore never retested by accident. If `/cpus` yields nothing (unmapped/malformed DTB, or a
+/// headless handoff with no DTB), this STOPs before any `CPU_ON` — single-core, exactly like the JM6
+/// terminus, never a phantom start.
+///
+/// **Firmware precondition (RIDER 2).** The first serial line restates it: the bench card asserts the
+/// UEFI build (`t23x_general 39.2.0-gcid-45755727` or newer, Peter-acknowledged) as the precondition
+/// under which `CPU_ON` is known to work (the SMP-2 bench verdict). A downgraded firmware = the
+/// operator STOPs at the bench before trusting the run.
+#[cfg(feature = "tegrasmp")]
+pub fn start_secondaries_tegra(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) {
+    // RIDER 2 — the firmware precondition, restated so the transcript self-documents.
+    serial_println!(
+        ":: AARCH64 SMP: ORIN-SMP-3 kick-off — PRECONDITION UEFI t23x_general 39.2.0-gcid-45755727 (or \
+         newer); CPU_ON known-good on this firmware per the SMP-2 bench ::"
+    );
+
+    let bsp_aff = gic::this_affinity();
+
+    // RIDER 1 — the ONLY presence oracle: the DTB `/cpus` enumeration. No AFFINITY_INFO, no GICR walk.
+    let mut dtb_cores = [0u32; MAX_CORES];
+    let n_dtb = super::fdt_tegra::cpu_affinities(dtb_addr, dtb_size, ram_gib_mask, &mut dtb_cores);
+    if n_dtb == 0 {
+        serial_println!(
+            ":: AARCH64 SMP: ORIN-SMP-3 — DTB /cpus named no cores (dtb=@{:#x} size={:#x}); STOP, \
+             staying single-core (no CPU_ON) ::",
+            dtb_addr, dtb_size
+        );
+        return;
+    }
+
+    // Build the dense linear-index -> affinity table: BSP = index 0, each OTHER `/cpus` core = 1,2,…
+    // in DTB order. The BSP is already running, so it is never a `CPU_ON` target.
+    let mut aff_by_index = [0u32; MAX_CORES];
+    aff_by_index[0] = bsp_aff;
+    let mut n_cores = 1usize;
+    let mut bsp_seen_in_dtb = false;
+    for &a in dtb_cores.iter().take(n_dtb) {
+        if a == bsp_aff {
+            bsp_seen_in_dtb = true;
+            continue; // the BSP holds linear index 0
+        }
+        if n_cores >= MAX_CORES {
+            serial_println!(
+                ":: AARCH64 SMP: ORIN-SMP-3 — more /cpus cores than the {}-slot cap; extra ignored ::",
+                MAX_CORES
+            );
+            break;
+        }
+        aff_by_index[n_cores] = a;
+        n_cores += 1;
+    }
+    let n_secondaries = n_cores - 1;
+
+    // Dump every enumerated core up front — BEFORE any PSCI call — so the metal capture has the full
+    // set even if a later CPU_ON faults (the JM5 attempt-1 lesson: a RAS fault ate the enumeration).
+    for idx in 0..n_cores {
+        serial_println!(
+            ":: AARCH64 SMP: ORIN-SMP-3 enumerated core {} aff={:#010x}{} (source=DTB /cpus) ::",
+            idx,
+            aff_by_index[idx],
+            if idx == 0 { " (BSP)" } else { "" }
+        );
+    }
+    if !bsp_seen_in_dtb {
+        // The running BSP's affinity was not among the DTB /cpus set — a firmware/enumeration
+        // inconsistency worth a serial note (the BSP is still index 0 and startable secondaries are
+        // unaffected; this only flags that /cpus and MPIDR disagree about the boot core).
+        serial_println!(
+            ":: AARCH64 SMP: ORIN-SMP-3 NOTE BSP aff={:#010x} not present in DTB /cpus set ::",
+            bsp_aff
+        );
+    }
+
+    // Publish the EL2 regime + secondary stacks for the MMU-off consumers, then the linear-index table
+    // (the CORE3-class fix — a woken secondary recovers its index by matching its live MPIDR affinity,
+    // never the MMU-off-spilled context id). Same publication protocol as the virt path.
+    BSP_AFFINITY.store(bsp_aff, Ordering::Release);
+    gic::enable_sgi(IPI_SGI);
+    capture_secondary_ctx();
+    cache::clean_range(&raw const SEC_CTX as usize, core::mem::size_of::<SecondaryCtx>());
+    cache::clean_invalidate_range(
+        &raw const SECONDARY_STACKS as usize,
+        core::mem::size_of::<[SecStack; MAX_CORES]>(),
+    );
+    for idx in 0..n_cores {
+        AFF_BY_INDEX[idx].store(aff_by_index[idx], Ordering::Relaxed);
+    }
+    N_CORES_PUB.store(n_cores as u32, Ordering::Release);
+
+    let freq = timer::cntfrq();
+    let freq = if freq == 0 { 62_500_000 } else { freq };
+    let bsp_ipi_before = percpu::cpu(0).ipis.load(Ordering::Acquire);
+
+    // Start each `/cpus`-named secondary. Target = its real MPIDR affinity; context id = its linear
+    // index (advisory past the MMU turn-on). Entry PA = the identity-mapped stub. A CPU_ON error is
+    // logged + skipped, never a hang. NO AFFINITY_INFO gate — the DTB already IS the presence gate.
+    let entry = _secondary_start_virt as *const () as usize as u64;
+    for idx in 1..n_cores {
+        let aff = aff_by_index[idx];
+        let ret = psci_cpu_on(affinity_to_mpidr(aff), entry, idx as u64);
+        if ret == 0 {
+            serial_println!(
+                ":: AARCH64 SMP: ORIN-SMP-3 CPU_ON AP {} (aff={:#010x}) -> SUCCESS (entry={:#x}) ::",
+                idx, aff, entry
+            );
+        } else {
+            serial_println!(
+                ":: AARCH64 SMP: ORIN-SMP-3 CPU_ON AP {} (aff={:#010x}) -> ERROR {} (skipped) ::",
+                idx, aff, ret
+            );
+        }
+    }
+
+    // Bounded wait (≤ ~500 ms each) for every secondary to publish readiness. A miss = WARNING +
+    // continue (the graceful pre-fix mode: a core that never checks in never hangs the boot).
+    for idx in 1..n_cores {
+        let deadline = timer::cntpct() + freq / 2;
+        if !wait_until(deadline, || CORE_READY[idx].load(Ordering::Acquire)) {
+            serial_println!(
+                ":: AARCH64 SMP: ORIN-SMP-3 WARNING AP {} (aff={:#010x}) did not come online ::",
+                idx, aff_by_index[idx]
+            );
+        }
+    }
+
+    // BSP -> AP proof: ping each online core and confirm its per-CPU IPI counter ticks.
+    for idx in 1..n_cores {
+        if !CORE_READY[idx].load(Ordering::Acquire) {
+            continue;
+        }
+        let before = percpu::cpu(idx).ipis.load(Ordering::Acquire);
+        gic::send_sgi(aff_by_index[idx] as usize, IPI_SGI);
+        let deadline = timer::cntpct() + freq / 10; // ~100 ms
+        let ok = wait_until(deadline, || percpu::cpu(idx).ipis.load(Ordering::Acquire) > before);
+        let after = percpu::cpu(idx).ipis.load(Ordering::Acquire);
+        serial_println!(
+            ":: AARCH64 SMP: ORIN-SMP-3 BSP -> AP {} SGI {} (count {} -> {}) ::",
+            idx,
+            if ok { "OK" } else { "TIMEOUT" },
+            before,
+            after
+        );
+    }
+
+    // AP -> BSP proof: each online AP pinged the BSP once during bring-up (see the virt-path note on
+    // SGI coalescing — the verdict is "at least one landed", the BSP never self-sends SGI 0).
+    let online = (1..n_cores)
+        .filter(|&c| CORE_READY[c].load(Ordering::Acquire))
+        .count();
+    let deadline = timer::cntpct() + freq / 10;
+    let ok = wait_until(deadline, || {
+        percpu::cpu(0).ipis.load(Ordering::Acquire) > bsp_ipi_before
+    });
+    let bsp_ipi_after = percpu::cpu(0).ipis.load(Ordering::Acquire);
+    serial_println!(
+        ":: AARCH64 SMP: ORIN-SMP-3 AP -> BSP SGI {} ({} online APs pinged, {} delivered; BSP ipi {} -> {}) ::",
+        if ok { "OK" } else { "TIMEOUT" },
+        online,
+        bsp_ipi_after - bsp_ipi_before,
+        bsp_ipi_before,
+        bsp_ipi_after
+    );
+
+    // AP periodic ticks stay DEFERRED here for the same reason as the virt path (a second core arming
+    // the shared tick clock would double-count the wall-clock budgets; JC3). The APs park on SGIs, and
+    // the boot core proceeds to the JM6 EL1 drop + CAPSTONE below.
+    serial_println!(
+        ":: AARCH64 SMP: ORIN-SMP-3 {}/{} secondaries online via PSCI CPU_ON (DTB /cpus oracle); AP \
+         timer PPI stretch deferred (JC3) ::",
+        online,
+        n_secondaries
+    );
+}

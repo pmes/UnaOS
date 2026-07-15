@@ -3657,3 +3657,76 @@ blast radius), with the full enumeration dumped before the call so the record su
 GICv3 `test-arm 40` CAPSTONE 6/6 + 3/3 secondaries (smp_virt untouched); `kernel8-test` 0-FAIL;
 `UNAOS_HUBSTORAGE` x86 MISSION SUCCESS; `esp-jetson` links, `tegra:` count 142 armed / 109 off
 (byte-identical off). The bench closes at Peter's window with LC-orin per the runbook.
+
+### ORIN-SMP-3 — the real 6-core Orin bring-up (`UNAOS_TEGRASMP`, knob-gated; bench Peter-attended)
+
+ORIN-SMP-2's attended bench proved the wall of §JM5-result is GONE on current firmware — `CPU_ON`
+returns `ret=0` and the box stays healthy on UEFI `t23x_general 39.2.0-gcid-45755727` (2026-06-01).
+This arc wires the tegra SMP kick-off that the born-fixed §ORIN-SMP bring-up was waiting on: a
+default-OFF `UNAOS_TEGRASMP=1` build-time knob that, when armed, brings every real Orin core online
+via PSCI `CPU_ON` after JM4 and before the JM6 drop. Default OFF, the whole kick-off and its `/cpus`
+enumerator vanish and the tegra image is **byte-identical to baseline** (two default `esp-jetson`
+builds hash identical, `tegra:` count 109 unchanged). The METAL verdict is the attended Orin bench
+(`unaos/scripts/orin-smp3-bench.md`); QEMU cannot model the Tegra machine, so QEMU here is
+regression-only (the shared `smp_virt` GICv3 path stays 3/3 + CAPSTONE 6/6).
+
+**Presence + table (M1).** The target list is produced by `fdt_tegra::cpu_affinities` from the
+firmware DTB `/cpus` walk ALONE (a direct `cpu@…` child's `reg` = its MPIDR affinity, cell count from
+`/cpus/#address-cells`; converted to the packed GICR-contiguous form). `start_secondaries_tegra`
+builds the dense linear-index → affinity table (BSP = `gic::this_affinity()` at index 0, each other
+`/cpus` core at 1..N in DTB order), publishes it via the existing `AFF_BY_INDEX`/`N_CORES_PUB` Release
+protocol, and prints each enumerated core's affinity to serial (the bench evidence). If `/cpus` names
+nothing (unmapped/malformed DTB, or a headless handoff without one) it STOPs single-core — never a
+phantom start.
+
+**Kick-off (M2).** `start_secondaries_tegra` runs from `tegra_early_stop` after JM4 (GIC-600 +
+generic timer + heap + SMC all live) and **before** the JM6 EL2→EL1 drop, so the BSP is still at EL2.
+It `CPU_ON`s each `/cpus`-named secondary at the `_secondary_start_virt` stub with the linear index as
+context id; each secondary runs the **born-fixed** `__secondary_rust_virt` path (re-derive the index
+from live `MPIDR_EL1` full affinity post-MMU, never the MMU-off-spilled context id — §ORIN-SMP). A
+bounded ~500 ms per-core wait gates readiness; a core that misses = WARNING + continue (the graceful
+pre-fix mode, never a hang). Expected serial: `AARCH64 SMP: AP <n> online (aff=…)` ×5 + the BSP↔AP SGI
+proofs, then the boot core proceeds to the JM6 EL1 drop + CAPSTONE.
+
+**EL regime — no divergence needed (brief point 4).** PSCI wakes a secondary at the *caller's* EL. The
+kick-off precedes the JM6b drop, so the BSP is at EL2 and the secondaries wake at EL2 and replay the
+BSP's live EL2 regime through `SEC_CTX`/`enable_mmu_virt` — exactly the state the shared `smp_virt`
+path already captures. The JM6b EL1-precise twin table (`L1_EL1`) is the boot core's *post-drop*
+regime; it is not on the secondaries' path, and no tegra `SEC_CTX` variant is required. (The stub's
+`CurrentEL != 2` guard still parks any AP a firmware monitor unexpectedly dropped to EL1, which the
+BSP observes as a clean `CORE_READY` timeout.)
+
+**RIDER 3 — the oracle discrepancy (hard-won, silicon-measured; do not re-litigate).** On the 6-core
+Orin Nano three "presence" sources DISAGREE, and only one is trustworthy:
+
+* **`AFFINITY_INFO`** answers a *valid* state (0/1/2) for **12** affinity slots — the die's full
+  12-core layout — even though only 6 are fused in. It is a firmware topology table, NOT a fused-SKU
+  presence oracle. Trusting it re-opens the JM5 attempt-1 wall: a `CPU_ON` to a fuse-disabled phantom
+  is a fatal Tegra CBB-fabric RAS Uncorrectable Error that powers the box off.
+* **The GIC-600 redistributor walk** exposes **8** frames (the die's core slots) — also more than the
+  6 real cores.
+* **The DTB `/cpus` node**, which NVIDIA's UEFI populates from the *fused* SKU, names exactly the **6**
+  present cores.
+
+So ORIN-SMP-3's target list is sourced from `/cpus` ALONE (RIDER 1): no code path issues `CPU_ON` to
+an affinity absent from that enumeration — not from `AFFINITY_INFO`, not from the GICR walk, not from
+a hardcoded list. `cpu_affinities` is the single provable producer (FDT walk only; the review lens
+verifies). The fuse-disabled-`CPU_ON` question stays UNTESTED and is not retested by accident — only a
+pre-registered leg (Peter) may probe it later.
+
+**RIDER 2 — firmware precondition.** The bench card asserts the UEFI build line
+(`t23x_general 39.2.0-gcid-45755727`, or newer Peter-acknowledged) as a precondition; a
+downgraded/different firmware = STOP before any `CPU_ON` (the wall may still stand there). The
+kick-off's first serial line restates it so the transcript self-documents.
+
+**String-count note.** Unlike ORIN-SMP-2's probe (whose records are `:: tegra: …` → count 142), the
+kick-off's records use the `:: AARCH64 SMP: ORIN-SMP-3 …` family (the `smp_virt` convention), so the
+armed image's `tegra:` count is **109 — unchanged from baseline**. Validate the armed image by the
+distinct ELF hash + the presence of `ORIN-SMP-3` strings, NOT by the `tegra:` count (which is
+identical off and on).
+
+**Gate (this executor).** `./arroyo check` green (both arches) + `UNAOS_TEGRA=1` + `UNAOS_TEGRA=1
+UNAOS_TEGRASMP=1`; `test-arm 22` MISSION SUCCESS; GICv3 `test-arm 40` CAPSTONE 6/6 + 3/3 secondaries
+(the shared `smp_virt` path is byte-untouched); `kernel8-test` 0-FAIL; `UNAOS_HUBSTORAGE` x86 MISSION
+SUCCESS; `esp-jetson` links (built LAST), knob-off byte-identity proven (two default builds hash
+identical, `tegra:` 109). The metal verdict is the attended bench with LC-orin + Peter.
