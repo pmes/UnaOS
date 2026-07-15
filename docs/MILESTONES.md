@@ -10,6 +10,43 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-pi4 track — 2026-07-15 (K6 — native-attr migration; the UNAFS.ATR sidecar retired)
+
+### K6 — U6 ACL migrated onto native unafs typed attributes 🔬 `hw-pi4`
+
+**What it does:** retires the security-K4 residual carried since IMG-SIG — the U6 owner/grants ACL's
+durable form lived in `UNAFS.ATR`, a plaintext FAT file on the very volume the ACL polices, outside the
+K4 journal. K6 moves it to NATIVE typed attributes on the unafs attribute volume (VFS verdict: fixed
+two-mount dispatch {FAT, UnaFS}; unafs = dedicated attribute volume, kernel-only client; real partition).
+One `acl-<dir_lba>-<dir_off>` unafs file per owned FAT file (`name`/`fc`/`owner`/`grants:<grantee>`
+attributes), every mutation journaled through the coherent `with_unafs` mount. A REVERSE codec
+(`principal_from_native`) reconstructs principals fail-closed; migrated == fresh mint byte-for-byte
+(the 240-bit-prefix rule, both directions). **Boot-time migration is idempotent, NATIVE-BEFORE-DELETE:**
+per committed IMAGE_SHA256 sidecar row — journaled native write → read-back verify vs an independent
+re-projection → only then delete the sidecar row; a power cut leaves BOTH copies, never neither; re-runs
+converge; legacy PROGRAM_NAME rows stay fail-closed un-migrated (ATR fallback rebuild still enforces
+them). All five live persist paths (create/grow/grant/revoke/unlink) write native; the dead sidecar
+writers are deleted; production never creates UNAFS.ATR; the EL0 SYS_OPEN deny stays. K3's two-phase
+durable-first revoke and K5's ns-spanned anti-resurrection fusion carry over verbatim against the native
+store (Option A verdict: the ns span now covers a journaled multi-sector write — a benched latency
+watch-item, not a correctness change).
+
+**How it was tested:** 🔬 QEMU — `./arroyo check` both arches; `kernel8` clean; `kernel8-test` MBENCH
+PASS **33/33** required (the spec gained `REQUIRE K6-migrate`), 0 forbidden: the new
+`K6-migrate PASS [w=0xff]` (codec round-trips; write/read/clear through the mount; plant IMAGE+legacy
+sidecar rows → exactly the IMAGE row migrates+verifies+sidecar-deletes; both-copies power-cut window →
+re-run converges; legacy row stays) plus K1-persist `0x3fff` / K2-liveenf `0x7f` / K3-revoke `0x7f` /
+K5-lockspan `0x3f` all reworked to prove the NATIVE store end-to-end; K3-mount/K4-write intact
+(self-cleaning holds the exact-two-entries ls); `test-arm` MISSION SUCCESS; unafs host suites green
+(crate untouched — kernel uses only its existing public API). Zero x86. **Metal:** rides the K6 bench —
+card REPARTITION mandatory (verdict 3); WATCH: measure the worst-case IRQ-masked window around the
+fused revoke/re-persist (the Option A rider).
+
+- **Detail:** [`SECURITY.md` §K1 (K6 bullet)](SECURITY.md). **Commits:** `df56c0c` M1 seam+codec ·
+  `4ad4b76` M2 migration · `d1db421` M3+M4 live-path+fixtures+spec (`hw-pi4`).
+
+---
+
 ## aarch64 SMP — CORE3-FIX (re-derive secondary core id from MPIDR_EL1, MMU-on) — 2026-07-15 ✅✅ METAL-CONFIRMED `hw-pi4`
 
 **What it does:** closes the CORE3-SMP regression — on Pi 4 metal, a `kernel8.img` crossing 1 MiB
