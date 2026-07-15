@@ -274,6 +274,46 @@ Spec promotions committed here; the granular arc detail is in each arc's own ent
 
 ---
 
+## hw-jetson track — 2026-07-15 (JD17 — the kernel clock: `setdate`-seeded wall time stamping FAT mtime)
+
+### JD17 — kernel WALL CLOCK: `setdate`-seeded, counter-extended time that stamps FAT mtime (`clock.rs` new; `shell.rs`; `fat.rs` write-side) ⏳ attended-pending
+- **Why:** §JD16 surfaced FAT mtime read-only and documented the honest gap — with no RTC, kernel-written
+  entries carried an all-zero stamp and `ls -l` showed a dash. JD17 closes it **without fabricating a clock**:
+  the operator seeds wall time once per boot, the free-running arch counter extends it, and the FAT
+  publication paths stamp mtime from it **when set** (untouched/zero when never set stays honest).
+- **How (`clock.rs`, new):** `WallTime` (calendar-validated 1980..=2107); `set(t)` plants an anchor =
+  `base_secs` (since the 1980 epoch) + `CNTPCT` at set, under a `spin::Mutex`; `now()` = base + elapsed
+  ticks/`CNTFRQ` (the JD3 timerless mechanism), `None` while unset; `fat_stamp()` packs `(time@0x16,
+  date@0x18)` bit-exactly inverse to §JD16's `DirEntry::mtime()` decode, `(0,0)` while unset. `from_secs`
+  **saturates at end-2107** (no wrap/panic). 2-second resolution, no timezone (local wall time, per §JD16).
+- **Frozen x86 (honest):** no calibrated invariant counter is plumbed on x86 — `monotonic()` is `None` there,
+  a set clock is frozen at its seeded second; the verbs merely compile. x86 calibration = out of scope.
+- **Shell (`shell.rs`):** `date` (prints wall clock or "clock not set") + `setdate YYYY-MM-DD HH:MM[:SS]`
+  (seconds optional); `parse_setdate` enforces strict shapes, `clock::set` owns range validation; `CLOCK:`
+  help line.
+- **FAT write-side (`fat.rs`) — publication paths only, riding the EXISTING `with_dir_lock` RMWs (no new lock,
+  no extra I/O):** both create twins (VERBATIM-twinned, pre-zeroed slot ⇒ `(0,0)`-unset byte-identical to
+  pre-JD17) + `write_grow` step-4 via a new `write_dir_entry_fields_mtime` sibling that, **when the clock is
+  unset, leaves the on-disk words UNTOUCHED** (a host-stamped file rewritten by a clockless kernel keeps its
+  stamp — strictly less destructive than zeroing).
+- **⚠ Honest gap (design ruling, LC-orin):** the stamp lands ONLY on publication paths. `fat.write_at` (the
+  bounded in-place overwrite — dir-untouched/never-grows/never-allocs, leaned on by the x86 S8 witness and S3
+  write-through) stays **completely untouched**, so a pure in-place overwrite does NOT refresh mtime this arc.
+  Not shell-visible: the panel `write` verb is truncate-recreate (stamped) and append is `write_grow`
+  (stamped), so every SHELL mutation stamps; the only unstamped path is the EL0 in-place `sys_write`.
+  `rename`/`move` keep the plain sibling on purpose (they preserve mtime).
+- **Tested (QEMU):** `check` + `UNAOS_TEGRA=1 check` green both arches (no new warnings); `test-arm 22`
+  MISSION; `UNAOS_GICV3=1 test-arm 40` CAPSTONE 6/6; `kernel8-test` **0 FAIL** (protects the shared `fat.rs`);
+  `UNAOS_HUBSTORAGE=1 test 25` MISSION (x86, shared shell/fat guard). Wall-clock stamp not headless-reachable
+  in-lane → attended card `jd17-bench.md`. Lane: `clock.rs` (new) + `shell.rs` + `fat.rs` write-side (the
+  SEAM coordinated with LC-x86/S8 — S8 touches no `fat.rs` code).
+- **Metal:** ⏳ **attended-pending** — `jd17-bench.md`: `setdate` → write a file → `ls -l` shows the stamp →
+  power-cycle → stamp survives → touch a second file next boot WITHOUT `setdate` → dashes.
+- **Detail:** [`arch_arm64.md` §JD17](dev/OS/01_BOOT_HAL/arch_arm64.md). **Commit:** on `hw-jetson` (the seat
+  assigns the integration hash at merge).
+
+---
+
 ## hw-jetson track — 2026-07-14 (JD16 — `ls -l` long listing with real FAT timestamps)
 
 ### JD16 — `ls -l`: long listing with REAL FAT last-write timestamps (first `fat.rs` READ-side edit; `shell.rs`) ⏳ attended-pending

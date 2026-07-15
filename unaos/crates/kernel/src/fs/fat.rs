@@ -1407,6 +1407,42 @@ impl FatFs {
         })
     }
 
+    /// JD17: the mtime-stamping sibling of [`FatFs::write_dir_entry_fields`] — the same single-sector
+    /// RMW publish of `first_cluster` + `size`, additionally refreshing the last-write time/date words
+    /// (@0x16/@0x18) from the kernel wall clock IN THE SAME sector write (no extra I/O, no second
+    /// crash window). While the clock is UNSET the existing on-disk words are left untouched — a
+    /// host-stamped file rewritten by a clockless kernel keeps its old stamp rather than being zeroed
+    /// (strictly less destructive than fabricating or erasing). Used by `write_grow`'s step-4 publish
+    /// — the CONTENT-mutation path; `rename_entry`/`move_entry`/`create_dir`'s publish keep the plain
+    /// sibling (a rename/move preserves mtime, and a fresh dir entry was already stamped at create).
+    fn write_dir_entry_fields_mtime(
+        &self,
+        lba: u64,
+        off: usize,
+        first_cluster: u32,
+        size: u32,
+    ) -> Result<(), FatError> {
+        if off + 32 > SECTOR_SIZE {
+            return Err(FatError::Io); // a slot never straddles a sector; a bad offset is a caller bug
+        }
+        with_dir_lock(|| {
+            let mut buf = [0u8; SECTOR_SIZE];
+            read_sector(lba, &mut buf)?;
+            let hi = (first_cluster >> 16) as u16;
+            let lo = (first_cluster & 0xFFFF) as u16;
+            buf[off + 20..off + 22].copy_from_slice(&hi.to_le_bytes());
+            buf[off + 26..off + 28].copy_from_slice(&lo.to_le_bytes());
+            buf[off + 28..off + 32].copy_from_slice(&size.to_le_bytes());
+            let (mt, md) = crate::clock::fat_stamp();
+            if (mt, md) != (0, 0) {
+                buf[off + 22..off + 24].copy_from_slice(&mt.to_le_bytes());
+                buf[off + 24..off + 26].copy_from_slice(&md.to_le_bytes());
+            }
+            write_sector(lba, &buf)?;
+            Ok(())
+        })
+    }
+
     /// U10: WRITE with GROWTH — overwrite `data` at byte offset `start`, EXTENDING the file (allocating,
     /// zero-filling, and chaining new clusters, then bumping the directory `size`) when the write runs past the
     /// current EOF. The growth twin of `write_at`; the caller uses `write_at` for the pure in-place case (a
@@ -1483,8 +1519,9 @@ impl FatFs {
             pos += take;
         }
 
-        // 4. LAST: publish size (+ chain head if it changed) to the directory — data + FAT already durable.
-        self.write_dir_entry_fields(dir_lba, dir_off, new_first, new_size)?;
+        // 4. LAST: publish size (+ chain head if it changed) to the directory — data + FAT already
+        //    durable. JD17: the _mtime sibling also refreshes the last-write stamp in this same RMW.
+        self.write_dir_entry_fields_mtime(dir_lba, dir_off, new_first, new_size)?;
         Ok((written, new_size, new_first))
     }
 
@@ -1512,6 +1549,11 @@ impl FatFs {
             }
             buf[off..off + 11].copy_from_slice(&raw);
             buf[off + 11] = attr & !0x08;
+            // JD17: stamp the last-write time/date words (@0x16/@0x18) from the kernel wall clock.
+            // (0, 0) while the clock is unset — byte-identical to the pre-JD17 zeroed field.
+            let (mt, md) = crate::clock::fat_stamp();
+            buf[off + 22..off + 24].copy_from_slice(&mt.to_le_bytes());
+            buf[off + 24..off + 26].copy_from_slice(&md.to_le_bytes());
             write_sector(lba, &buf)?;
             // Re-parse the slot we just wrote so the returned DirEntry is byte-for-byte what a reader sees.
             match classify_dir_slot(&buf[off..off + 32]) {
@@ -1582,6 +1624,11 @@ impl FatFs {
             }
             buf[off..off + 11].copy_from_slice(&raw);
             buf[off + 11] = attr & !0x08;
+            // JD17: stamp the last-write time/date words (@0x16/@0x18) from the kernel wall clock.
+            // (0, 0) while the clock is unset — byte-identical to the pre-JD17 zeroed field.
+            let (mt, md) = crate::clock::fat_stamp();
+            buf[off + 22..off + 24].copy_from_slice(&mt.to_le_bytes());
+            buf[off + 24..off + 26].copy_from_slice(&md.to_le_bytes());
             write_sector(lba, &buf)?;
             // Re-parse the slot we just wrote so the returned DirEntry is byte-for-byte what a reader sees.
             match classify_dir_slot(&buf[off..off + 32]) {
