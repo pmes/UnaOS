@@ -10,6 +10,36 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-rmbp track — 2026-07-15 (UI1-MOUSE s1 — HID pointer metal-robustness + serial witness)
+
+### UI1-MOUSE slice 1 — interrupt-IN pointer path made bench-assertable + Panther-Point-hardened 🔬 `hw-rmbp`
+
+**What it does:** pre-bench code for the existing (already end-to-end for QEMU) HID mouse/tablet path,
+turning the attended rMBP bench from eyeball-only ("Peter sees the red square move") into a serial
+assertion. **M1 — serial mouse-witness** (`drivers/xhci/mod.rs`): an enumeration line naming each
+detected pointer (`:: MOUSE-1: HID pointer detected vid:pid=.. proto=N relative|absolute ep=.. mps=..
+interval=.. == witness ::`) as its interrupt-IN read is armed, plus a **bounded** report counter (first
+report, then every 32nd — never one-per-report) carrying `last dx/dy`(rel) or `last x/y`(abs) + buttons.
+Uncounted (`== witness ::`, not `-> PASS`) so no mbench COUNT shifts; silent when no pointer enumerates.
+**M2 — Panther-Point interrupt-IN robustness** (audit result: ADDRESS_DEVICE code-4 debounce + async EP0
+`ep0_expect_phys` + SET_PROTOCOL completion already cover the mouse — it rides the shared enum/EP0 path;
+the ONE real gap was the interrupt-IN transfer dispatch): added `mouse_expect_phys` (TRB-identity match,
+the EP0 idiom applied to interrupt-IN) so a `XHCI_SPURIOUS_SUCCESS` dup-Success after the short boot-mouse
+report can't double-decode (double cursor motion) or over-arm the ring. **M3** — `UNAOS_SKIP_XHCI` degrades
+clean (witness silent, no panic). Additive to the mouse path only; storage/FTDI/enum FSM untouched; no
+`syscall.rs`; no aarch64 files.
+
+**How it was tested:** 🔬 QEMU — `./arroyo check` both arches, zero new warnings, zero aarch64 files
+touched; **absolute** (default `usb-tablet`, motion via QMP `input-send-event` abs) → enum witness
+(proto=0 absolute) + counter `1/32/64 reports, last x/y` + MISSION SUCCESS; **relative** (`-device
+usb-mouse,bus=xhci.0`, QMP rel motion) → enum witness (proto=2 relative) + counter `last dx=5 dy=3` +
+MISSION SUCCESS; `UNAOS_SKIP_XHCI=1` → zero MOUSE lines, skip banner, no panic; default `test` → MISSION
+SUCCESS + one enum witness + zero counter lines (silent, no motion). **Metal-pending** — the attended rMBP
+bench (real external USB mouse on the storage-bench topology) is LC-x86-coordinated; the built-in trackpad
+is EHCI (invisible to this driver).
+
+---
+
 ## hw-rmbp track — 2026-07-15 (CFU-1 — the single validated kernel/user copy seam)
 
 ### CFU-1 — `copy_from_user`/`copy_to_user`/`user_range_ok` on x86 🔬 `hw-rmbp`

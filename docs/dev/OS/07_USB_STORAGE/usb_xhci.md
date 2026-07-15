@@ -124,6 +124,50 @@ Boot-protocol HID keyboards, mice, and tablets enumerated on the controller are
 translated to console input events (a USB HID scancode → ASCII table lives in
 `mod.rs`), feeding the same `pal::Event` stream the console consumes.
 
+### 7a. HID pointer (mouse / tablet) path
+
+A pointer interface is detected during config-descriptor parse: `bInterfaceProtocol
+== 2` is a **boot mouse** (relative signed deltas → `mouse_is_relative = true`);
+protocol 0 is an **absolute pointer** (usb-tablet). The pointer gets its own
+`mouse_ring` (interrupt-IN) and `mouse_data_buffer` (separate from the keyboard's,
+so a composite kbd+mouse dongle arms both endpoints without their transfers racing
+into one buffer). After the device-level `SET_CONFIGURATION` the read is armed
+(`queue_mouse_read`), and a boot mouse then gets a main-loop `SET_PROTOCOL(boot)`
+(the absolute pointer is not a boot interface and is skipped — the request would
+STALL). Each report decodes to `pal::Event::Mouse{dx,dy}` (relative) or
+`MouseAbsolute{x,y}` (absolute 0..32767).
+
+**Interrupt-IN dup-Success guard (metal-robustness).** A boot-mouse report is
+*always* shorter than the endpoint MPS, which is exactly the case Panther Point's
+`XHCI_SPURIOUS_SUCCESS` quirk (device 0x1e31) fires on: after the Short Packet the
+controller can post a *duplicate* Success event for the same TD. This is the same
+hazard the async EP0 path already guards with `ep0_expect_phys` (§6). `queue_mouse_read`
+now records the physical address of the Normal TRB it armed in `mouse_expect_phys`,
+and the transfer dispatch processes only the completion whose TRB matches — a dup
+(pointing at the already-consumed TD) is ignored, so the same report is never decoded
+twice (which would double cursor motion) and the ring is never over-armed. QEMU posts
+no dup, so `param` always matches and the guard is transparent there.
+
+### 7b. Serial mouse-witness (bench-assertable)
+
+Because the cursor is invisible on a serial-only capture (the metal bench reads the
+kernel only over the FTDI cable), the pointer path emits an assertable, uncounted
+witness (`== witness ::` idiom — never `-> PASS`, so no mbench COUNT shifts):
+
+- **Enumeration** — one line per pointer as its interrupt-IN read is armed:
+  `:: MOUSE-1: HID pointer detected vid:pid=VVVV:PPPP proto=N relative|absolute
+  ep=0xNN mps=N interval=N == witness ::`.
+- **Report traffic** — a *bounded* counter (first report, then every 32nd — never
+  one line per report, which would flood the cable): `:: MOUSE-1: N reports, last
+  dx=.. dy=.. buttons=0xNN == witness ::` (relative) or `.. last x=.. y=.. ..`
+  (absolute).
+
+The witness is silent when no pointer enumerates (aarch64 QEMU virt, no-mouse, and
+`UNAOS_SKIP_XHCI` never reach the arm site). QEMU exercises both decode paths:
+default topology has `usb-tablet` (absolute); add `-device usb-mouse,bus=xhci.0`
+(via `UNAOS_QEMU_EXTRA`) for the relative path. Inject motion over QMP
+(`input-send-event` with `rel`/`abs` axes) to drive the counter.
+
 ---
 
 ## 8. Status and limitations
