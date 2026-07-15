@@ -1674,8 +1674,16 @@ Spec promotions committed here; the granular arc detail is in each arc's own ent
 - **Residuals (ledgered, out of scope):** overwrite-only (no growth/allocation for arbitrary files — a writable
   GROW path is future work); files > 2 GiB not openable (the `i32` stat channel); the widening is
   public-by-default (a dynamic file has no owner ACL — same as S7 reads).
-- **Metal: PENDING** — QEMU-green; the attended rMBP bench promotes `round6-rmbp.spec`'s `PENDING S8-write` to
-  REQUIRE (joins the accrued STOR-1 bench batch).
+- **Metal: ✅ METAL-CONFIRMED 2026-07-15** (attended rMBP bench, LC-x86 coordinating, FTDI serial log
+  `~/unaos-bench/rmbp-serial-2026-07-15-101517.log`). `S8-write` fired on THREE boots of the real 2012 rMBP
+  (RW dynamic open of S8W.BIN + live 16-byte overwrite through the service task + read-back + seed restore +
+  past-EOF-returns-0 + the `hello.bin` MF2 negative), including a GENUINE power-cut pair: boots 4+5 (full
+  round-9 media recipe `IRQSTORAGE+USBDEBUG+VIDEOBENCH`) each replayed `round6-rmbp.spec` **43/43 required,
+  0 forbidden** (boot 5 slice-asserted standalone; 44/44 on the post-promotion spec). `PENDING S8-write` →
+  **REQUIRE** (COUNT stays; the spec now locks S8 into the rMBP knob-on metal regression chain). Bench
+  bonus: boots 1–2 (knob-OFF media, an LC media-recipe error, owned in the flash MANIFEST) doubled as a
+  clean knob-OFF metal regression sweep — 23/23 of the knob-off chain, zero faults. Media staged +
+  MANIFESTed per the flash rule (`UnaOS-rmbp-esp-r9recipe-20260715T1637Z-ae06507`, sha `a62629df…`).
 
 ## hw-pi4 track — 2026-07-10 (K1 M2–M4 — the U6 ACL SURVIVES REBOOT: persist + rebuild + gated enforcement + proofs)
 
