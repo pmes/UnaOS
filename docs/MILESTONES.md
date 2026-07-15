@@ -12,7 +12,7 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ## hw-pi4 track — 2026-07-15 (K5B — the NAMESPACE-unfreeze: MOUNT-fused ACL persist)
 
-### K5B — bounded-span redesign of the fused ACL persist 🔬 QEMU-green, metal after-number pending
+### K5B — bounded-span redesign of the fused ACL persist ✅✅ METAL-CONFIRMED (the after-number landed per the ruling)
 
 **What it does.** The K7 metal sitting measured the fused ACL persist sites holding the `NAMESPACE`
 lock IRQ-masked for ~704/712/440 ms (`revoke=38000366 grants=38475785 grow=23764161` ticks @54 MHz)
@@ -39,9 +39,15 @@ stays narrowed (`[w=0x3f]`); K3 forced-fail leg green (`[w=0x7f]`); `test-arm` M
 `libs/unafs` crate untouched; zero x86. Knob-off byte-inert at the same commit (rider-stripped vs
 rider-present `kernel8.img` both `eb78f9a0…`). QEMU NS-SPAN smoke: masked with_unafs-hold
 `revoke=22653750 grants=22917187 grow=19416187` ticks @62.5 MHz — same magnitude as before, as
-designed (mask relocated, not removed). The metal sitting (LC-pi + Peter) produces the authoritative
-before/after pair + the removal-of-stall verdict. Commits `fdfafda` (M1 design note) + `bd4f073`
-(M2–M4) + docs.
+designed (mask relocated, not removed). **✅✅ METAL (2026-07-15 attended sitting, two staged boots
+off `917c219`):** verdict boot MBENCH PASS 33/33, 0 forbidden (MOUNT-fused K5-lockspan control+fix
+legs + K3 forced-fail on the new path, first silicon run); knob-on boot 33/33 + the authoritative
+dual-fact pair in ONE line: **ns-hold across ACL persist 38.0M/38.5M/23.8M ticks (before) → 0/0/0
+(after — the NAMESPACE unfrozen on silicon) BUT the per-core IRQ-masked with_unafs-hold worst
+`revoke=38077992 grants=38616777 grow=23392723` ticks @54 MHz ≈ statistically unchanged vs before —
+the ledgered NARROWED residual, exactly per the ruling (no STOP).** Log
+`~/unaos-bench/pi-serial-2026-07-15-k5b-sitting.log`. Commits `fdfafda` (M1 design note) +
+`bd4f073` (M2–M4) + `f34f300`/`7466506` docs+lens-fix.
 
 ---
 
