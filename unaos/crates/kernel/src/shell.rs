@@ -1809,6 +1809,157 @@ fn fs_du(console: &mut Console, arg: &str) {
         "total: {} byte(s) in {} file(s), {} dir(s)", grand, stats.files, stats.dirs));
 }
 
+// ---------------------------------------------------------------------------------------------
+// JD19 — read-only forensic verbs: `stat` (one entry's full on-disk detail) and `xd` (bounded
+// hexdump). Both are `shell.rs`-only, ride the existing public fat.rs API call-never-edit, and never
+// mutate: `stat` composes resolve_path/locate_in_dir plus one raw `block::read_block` of the on-disk
+// directory sector for the true attr byte (the parsed DirEntry keeps only `is_dir`); `xd` streams a
+// bounded window through the offset-aware `read_at`. Neither is glob-wired (single path) — a
+// metacharacter resolves literally, an honest `-ENOENT`, the same as a mid-path glob today.
+
+/// JD19: decode a FAT attribute byte into its flag names, space-joined (RO/HIDDEN/SYS/DIR/ARCHIVE),
+/// or `-` when none are set. Bits per the FAT short-entry spec: 0x01 read-only, 0x02 hidden, 0x04
+/// system, 0x10 directory, 0x20 archive (0x08 volume-label / 0x0F long-file-name components never
+/// reach a parsed entry — `classify_dir_slot` skips them).
+fn decode_attr(a: u8) -> String {
+    let mut s = String::new();
+    for (bit, name) in [
+        (0x01u8, "RO"),
+        (0x02, "HIDDEN"),
+        (0x04, "SYS"),
+        (0x10, "DIR"),
+        (0x20, "ARCHIVE"),
+    ] {
+        if a & bit != 0 {
+            if !s.is_empty() {
+                s.push(' ');
+            }
+            s.push_str(name);
+        }
+    }
+    if s.is_empty() {
+        s.push('-');
+    }
+    s
+}
+
+/// JD19 `stat <path>`: one entry's full on-disk detail — the forensic view. Prints the canonical
+/// absolute path, kind (file/dir), size in bytes, the raw attr byte (hex + decoded flags), first
+/// cluster (hex; `0x0` honest for a 0-length file), the FAT last-write stamp (dash when zeroed, via
+/// `fmt_mtime`), and the on-disk location (directory-entry LBA + 32-byte slot offset). `stat /`
+/// reports the root honestly — it is a directory with NO directory entry of its own. Missing path is
+/// `-ENOENT`. Read-only; no glob (a metacharacter resolves literally → `-ENOENT`).
+fn fs_stat(console: &mut Console, arg: &str) {
+    let fs = match crate::fs::fat::mount() {
+        Ok(fs) => fs,
+        Err(e) => return console.println(&alloc::format!("stat: no FAT filesystem ({:?})", e)),
+    };
+    // The volume root has no directory entry of its own — report it honestly, no slot.
+    if normalize_path(&cwd_path(), arg) == "/" {
+        console.println("  path:  /");
+        console.println("  kind:  dir");
+        console.println("  size:  0 byte(s)");
+        console.println("  entry: root has no directory entry");
+        return;
+    }
+    // Walk to the parent, then locate the leaf's on-disk slot (for the attr byte + forensic LBA/offset).
+    let (parent, leaf, parent_canon) = match resolve_write_target(&fs, arg) {
+        Ok(t) => t,
+        Err(msg) => return console.println(&alloc::format!("stat: {}", msg)),
+    };
+    let (de, dir_lba, dir_off) = match fs.locate_in_dir(parent, &leaf) {
+        Ok(t) => t,
+        Err(FatError::NotFound) => return console.println(&alloc::format!(
+            "stat: {}: not found (-ENOENT)", joined(&parent_canon, &leaf))),
+        Err(e) => return console.println(&alloc::format!(
+            "stat: {}: {} ({:?})", joined(&parent_canon, &leaf), fat_errno(e), e)),
+    };
+    let canon = joined(&parent_canon, de.name());
+    // The raw attr byte lives at slot offset +11; the parsed DirEntry keeps only `is_dir`, so read the
+    // on-disk directory sector for the true byte via the same raw block path the `read` verb uses.
+    let attr = {
+        let mut buf = [0u8; 512];
+        match crate::drivers::block::read_block(dir_lba, &mut buf) {
+            Ok(_) if dir_off + 12 <= buf.len() => Some(buf[dir_off + 11]),
+            _ => None,
+        }
+    };
+    console.println(&alloc::format!("  path:  {}", canon));
+    console.println(&alloc::format!("  kind:  {}", if de.is_dir { "dir" } else { "file" }));
+    console.println(&alloc::format!("  size:  {} byte(s)", de.size));
+    match attr {
+        Some(a) => console.println(&alloc::format!("  attr:  0x{:02x}  [{}]", a, decode_attr(a))),
+        None => console.println("  attr:  (directory sector unreadable, -EIO)"),
+    }
+    console.println(&alloc::format!("  clus:  0x{:x}", de.first_cluster()));
+    // fmt_mtime pads a zeroed stamp to a dash within a 19-char field; trim to a bare `-` here.
+    console.println(&alloc::format!("  mtime: {}", fmt_mtime(&de).trim()));
+    console.println(&alloc::format!("  entry: LBA {} slot +{}", dir_lba, dir_off));
+}
+
+/// JD19: hexdump `data` with each row labelled by its ABSOLUTE file offset (`base` + row start), in
+/// the canonical `OFFSET: <16 hex bytes> | <ascii> |` layout (non-printables render as `.`). Distinct
+/// from the `read`-verb `hexdump` (which labels rows from 0 and dumps a fixed 128 bytes): `xd` needs
+/// the true file offset and a variable length, and pads a short final row so the ASCII gutter aligns.
+fn xd_rows(console: &mut Console, base: usize, data: &[u8]) {
+    for (i, chunk) in data.chunks(16).enumerate() {
+        let mut line = alloc::format!("{:08x}: ", base + i * 16);
+        for b in chunk {
+            line.push_str(&alloc::format!("{:02x} ", b));
+        }
+        for _ in chunk.len()..16 {
+            line.push_str("   "); // pad the short final row to keep the ASCII gutter aligned
+        }
+        line.push_str(" |");
+        for b in chunk {
+            let c = if *b >= 32 && *b < 127 { *b as char } else { '.' };
+            line.push(c);
+        }
+        line.push('|');
+        console.println(&line);
+    }
+}
+
+/// JD19 `xd <path> [off] [len]`: bounded hexdump of a file's bytes via the offset-aware `read_at`.
+/// Default off=0, len=256; `len` is hard-capped at `XD_MAX` (4096). Rows carry the absolute file
+/// offset. An `off` at or past EOF is an honest empty note; a directory target is `-EISDIR`; the root
+/// is `-EISDIR`. When more bytes remain past the dumped window an honest `[... n more byte(s)]` tail
+/// note is printed. off/len are parsed decimal or `0x`-hex by the caller.
+fn fs_xd(console: &mut Console, arg: &str, off: u32, len: usize) {
+    const XD_MAX: usize = 4096;
+    let fs = match crate::fs::fat::mount() {
+        Ok(fs) => fs,
+        Err(e) => return console.println(&alloc::format!("xd: no FAT filesystem ({:?})", e)),
+    };
+    let (de, canon) = match resolve_path(&fs, &normalize_path(&cwd_path(), arg)) {
+        Ok(Resolved::Root) => return console.println("xd: /: is a directory (-EISDIR)"),
+        Ok(Resolved::Entry(de, canon)) => (de, canon),
+        Err(msg) => return console.println(&alloc::format!("xd: {}", msg)),
+    };
+    if de.is_dir {
+        return console.println(&alloc::format!("xd: {}: is a directory (-EISDIR)", canon));
+    }
+    let want = core::cmp::min(len, XD_MAX);
+    let mut data: Vec<u8> = Vec::new();
+    if let Err(e) = fs.read_at(de.first_cluster(), de.size, off, &mut data, want) {
+        return console.println(&alloc::format!("xd: {}: {} ({:?})", canon, fat_errno(e), e));
+    }
+    if data.is_empty() {
+        if off >= de.size {
+            return console.println(&alloc::format!(
+                "xd: {}: offset {} at/past EOF ({} byte(s)) — nothing to dump", canon, off, de.size));
+        }
+        return console.println(&alloc::format!("xd: {}: 0 byte(s) read", canon));
+    }
+    xd_rows(console, off as usize, &data);
+    // Honest tail note whenever the file holds more bytes past the dumped window (a cap hit, a short
+    // `len`, or both). `off + data.len()` never overflows the file: read_at delivered within `size`.
+    let shown_end = off as usize + data.len();
+    if (de.size as usize) > shown_end {
+        console.println(&alloc::format!("[... {} more byte(s)]", de.size as usize - shown_end));
+    }
+}
+
 pub struct History {
     entries: Vec<String>,
     position: usize,
@@ -1862,6 +2013,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             console.println("          (create/edit/delete/copy/move files & dirs anywhere in the tree; sync = write-through, durable)");
             console.println("TREE:     find [root] <pattern>  (recursive glob search), du [dir]  (recursive size tally)");
             console.println("          uptime  (seconds since boot; shows the wall clock when set)");
+            console.println("INSPECT:  stat <path>  (full on-disk detail), xd <path> [off] [len]  (bounded hexdump)");
             #[cfg(target_arch = "aarch64")]
             console.println("UNAFS:    uls [path], ucat <path>  (native unafs volume, absolute paths)");
             #[cfg(target_arch = "aarch64")]
@@ -2045,6 +2197,28 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                     }
                 }
                 None => console.println("uptime: no calibrated counter on this arch"),
+            }
+        },
+        "stat" => {
+            // JD19: one entry's full on-disk detail (canonical path, kind, size, attr byte + flags,
+            // first cluster, FAT mtime, and the forensic dir-entry LBA + slot offset). Read-only; no
+            // glob (a metacharacter resolves literally → -ENOENT). `stat /` reports the root honestly.
+            match args.first() {
+                None => console.println("usage: stat <path>"),
+                Some(path) => fs_stat(console, path),
+            }
+        },
+        "xd" => {
+            // JD19: bounded hexdump — `xd <path> [off] [len]` (default off=0, len=256; len capped at
+            // 4096). off/len accept decimal or 0x-hex. off past EOF = honest empty; a directory =
+            // -EISDIR; an honest `[... n more byte(s)]` tail note when the file is larger.
+            match args.first() {
+                None => console.println("usage: xd <path> [off] [len]"),
+                Some(path) => {
+                    let off = args.get(1).and_then(|s| parse_num(s)).unwrap_or(0) as u32;
+                    let len = args.get(2).and_then(|s| parse_num(s)).map(|n| n as usize).unwrap_or(256);
+                    fs_xd(console, path, off, len);
+                }
             }
         },
         #[cfg(target_arch = "aarch64")]
@@ -2587,6 +2761,15 @@ fn parse_byte(s: &str) -> Option<u8> {
         u8::from_str_radix(hex, 16).ok()
     } else {
         s.parse::<u8>().ok()
+    }
+}
+
+/// JD19: parse a `u64` offset/length accepting decimal or `0x`-hex (the `xd` off/len args).
+fn parse_num(s: &str) -> Option<u64> {
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16).ok()
+    } else {
+        s.parse::<u64>().ok()
     }
 }
 
