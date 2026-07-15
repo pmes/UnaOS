@@ -331,7 +331,7 @@ Spec promotions committed here; the granular arc detail is in each arc's own ent
 
 ## hw-jetson track — 2026-07-15 (JD18 — read-only tree tools: `find` + `du` + `uptime`)
 
-### JD18 — read-only TREE TOOLS: `find` (recursive glob search), `du` (subtree size tally), `uptime` (`shell.rs`; one additive `clock.rs` helper) ⏳ attended-pending
+### JD18 — read-only TREE TOOLS: `find` (recursive glob search), `du` (subtree size tally), `uptime` (`shell.rs`; one additive `clock.rs` helper) ✅ METAL-CONFIRMED 2026-07-15
 - **Why:** the file-manager verb set is closed; JD18 adds three read-only surveying tools built entirely from
   primitives already shipped — no new `fat.rs` surface, zero mutation.
 - **How (all `shell.rs`, composing the JD9/JD13 `read_dir` SNAPSHOT walk + JD12 `glob_match`, `.`/`..` filtered,
@@ -351,7 +351,10 @@ Spec promotions committed here; the granular arc detail is in each arc's own ent
   `UNAOS_GICV3=1 test-arm 40` CAPSTONE 6/6; `kernel8-test` **0 FAIL**; `UNAOS_HUBSTORAGE=1 test 25` MISSION;
   `esp-jetson` links, `tegra:` COUNT unchanged (these verbs add no `tegra:` token; built LAST). Lane clean:
   `shell.rs` + one additive `clock.rs` helper + docs + `jd18-bench.md`; `fat.rs` untouched.
-- **Metal:** ⏳ **attended-pending** — `jd18-bench.md`: seed a nested tree → `find` by glob → `du` tallies match
+- **Metal:** ✅ **METAL-CONFIRMED 2026-07-15** (attended Orin bench, one card session with JD15/JD16/JD17;
+  serial `jetson-serial-2026-07-15-092500.log`): `find` recursive glob correct at scale (29-match full-tree
+  sweep over 19 dirs + scoped + honest no-match), `du` tallied a seeded tree exactly (12 bytes / 3 files /
+  1 dir), `uptime` counter-derived with and without the clock parenthetical. Original card plan — `jd18-bench.md`: seed a nested tree → `find` by glob → `du` tallies match
   the seeded sizes → `uptime` sane + monotonic across two reads → all again after a power-cycle. ⚠ `dot_clean`
   BOTH cards.
 - **Detail:** [`arch_arm64.md` §JD18](dev/OS/01_BOOT_HAL/arch_arm64.md). **Commit:** on `hw-jetson` (the seat
@@ -361,7 +364,7 @@ Spec promotions committed here; the granular arc detail is in each arc's own ent
 
 ## hw-jetson track — 2026-07-15 (JD17 — the kernel clock: `setdate`-seeded wall time stamping FAT mtime)
 
-### JD17 — kernel WALL CLOCK: `setdate`-seeded, counter-extended time that stamps FAT mtime (`clock.rs` new; `shell.rs`; `fat.rs` write-side) ⏳ attended-pending
+### JD17 — kernel WALL CLOCK: `setdate`-seeded, counter-extended time that stamps FAT mtime (`clock.rs` new; `shell.rs`; `fat.rs` write-side) ✅ METAL-CONFIRMED 2026-07-15
 - **Why:** §JD16 surfaced FAT mtime read-only and documented the honest gap — with no RTC, kernel-written
   entries carried an all-zero stamp and `ls -l` showed a dash. JD17 closes it **without fabricating a clock**:
   the operator seeds wall time once per boot, the free-running arch counter extends it, and the FAT
@@ -392,7 +395,12 @@ Spec promotions committed here; the granular arc detail is in each arc's own ent
   `UNAOS_HUBSTORAGE=1 test 25` MISSION (x86, shared shell/fat guard). Wall-clock stamp not headless-reachable
   in-lane → attended card `jd17-bench.md`. Lane: `clock.rs` (new) + `shell.rs` + `fat.rs` write-side (the
   SEAM coordinated with LC-x86/S8 — S8 touches no `fat.rs` code).
-- **Metal:** ⏳ **attended-pending** — `jd17-bench.md`: `setdate` → write a file → `ls -l` shows the stamp →
+- **Metal:** ✅ **METAL-CONFIRMED 2026-07-15** (attended Orin bench; serial
+  `jetson-serial-2026-07-15-092500.log`): unset honest both boots; seed echoed and counter-extended
+  (09:50:00 → :07 → :10 live `date` reads); garbage `setdate` rejected WITHOUT disturbing the set clock;
+  post-seed files stamped at even seconds (the FAT 2-second resolution, e.g. 09:51:04/09:51:24) while a
+  pre-seed file kept its dash; the stamp survived a genuine power cut BYTE-IDENTICAL and the next boot came
+  up unset again (per-boot seed, as designed). Card plan — `jd17-bench.md`: `setdate` → write a file → `ls -l` shows the stamp →
   power-cycle → stamp survives → touch a second file next boot WITHOUT `setdate` → dashes.
 - **Detail:** [`arch_arm64.md` §JD17](dev/OS/01_BOOT_HAL/arch_arm64.md). **Commit:** on `hw-jetson` (the seat
   assigns the integration hash at merge).
@@ -401,7 +409,7 @@ Spec promotions committed here; the granular arc detail is in each arc's own ent
 
 ## hw-jetson track — 2026-07-14 (JD16 — `ls -l` long listing with real FAT timestamps)
 
-### JD16 — `ls -l`: long listing with REAL FAT last-write timestamps (first `fat.rs` READ-side edit; `shell.rs`) ⏳ attended-pending
+### JD16 — `ls -l`: long listing with REAL FAT last-write timestamps (first `fat.rs` READ-side edit; `shell.rs`) ✅ METAL-CONFIRMED 2026-07-15
 - **Why:** every FAT short directory entry already stores a last-write timestamp (offsets 0x16/0x18), but
   JD1–JD15 kept `fat.rs` call-never-edit and never surfaced it. JD16 adds `ls -l` — size + modified timestamp
   + name — by reading (not writing) that field. First arc to touch `fat.rs`, and only its read/parse path.
@@ -425,7 +433,10 @@ Spec promotions committed here; the granular arc detail is in each arc's own ent
   MISSION; `kernel8-test` **40 PASS / 0 FAIL** (this battery protects the shared `fat.rs`); `test 25` MISSION
   (x86, `fat.rs` shared there too). As in JD2–JD15 the shell command path is not headless-reachable, so the
   `ls -l` verdict is exercised by the `jd16-bench.md` attended card. Lane: `fat.rs` read-side + `shell.rs`.
-- **Metal:** ⏳ **attended-pending** — `jd16-bench.md` checks a host-written file shows its real timestamp,
+- **Metal:** ✅ **METAL-CONFIRMED 2026-07-15** (attended Orin bench; a host-written `HOSTFILE.TXT` showed its
+  real stamp to the exact second — 09:20:34, the recorded host write time — while every kernel-written entry
+  showed the honest dash; macOS's `.fseventsd` dir surfaced host-stamped as `FSEVEN~1/`, a benign fixture
+  artifact). Card plan — `jd16-bench.md` checks a host-written file shows its real timestamp,
   a kernel-`touch`ed file shows the dashed placeholder, and an mtime survives a power-cycle.
 - **Detail:** [`arch_arm64.md` §JD16](dev/OS/01_BOOT_HAL/arch_arm64.md). **Commit:** on `us-jd16` (the seat
   assigns the integration hash at merge).
@@ -434,7 +445,7 @@ Spec promotions committed here; the granular arc detail is in each arc's own ent
 
 ## hw-jetson track — 2026-07-14 (JD15 — `-f` tree-replace for `cp -r`/`mv`)
 
-### JD15 — `-f` tree-replace: forced replace of an existing directory-TREE destination (`shell.rs`-only, call-never-edit) ⏳ attended-pending
+### JD15 — `-f` tree-replace: forced replace of an existing directory-TREE destination (`shell.rs`-only, call-never-edit) ✅ METAL-CONFIRMED 2026-07-15
 - **Why:** JD14 bounded `-f` to a single FILE dest — an existing directory tree stayed `-EEXIST` (`cp -r`) or
   `-EISDIR` (`mv -f`), and the operator had to `rm -r` it first. JD15 closes the last flag-family gap:
   `cp -rf` and `mv -f` now REPLACE an existing directory-tree destination, so the forced verbs behave
@@ -458,7 +469,13 @@ Spec promotions committed here; the granular arc detail is in each arc's own ent
   in JD2–JD14 the shell command path is not headless-reachable (keystroke-driven, tegra-only), so the
   regression suite proves no breakage and the new behaviour is exercised by the `jd15-bench.md` attended card.
   Lane: only `shell.rs` (fat.rs/console.rs/main.rs/NET arms/unafs verbs untouched).
-- **Metal:** ⏳ **attended-pending** — pairs cleanly with any next Orin bench (`jd15-bench.md` builds a tree
+- **Metal:** ✅ **METAL-CONFIRMED 2026-07-15** (attended Orin bench): default `-EEXIST` refusal, `-rf`
+  tree-replace (delete-then-rebuild proven by a differing tree: replaced dir held ONLY the fresh files, a
+  previously nested subdir GONE), `mv -f` file-over-dir replace, the `-EISDIR` dir-across-parents guard fired
+  BEFORE any delete (destination untouched), self/subtree `-EINVAL` ×2 and `rm -rf /` `-EBUSY` all stood under
+  `-f`, and a completed replace survived a genuine power cut. ⚠ CARD ERRATA folded: the card's §3 second step
+  (`cp -rf NEW OLD/NEW` with `OLD/NEW` an existing dir) follows the copy-INTO idiom (nests `OLD/NEW/NEW`) —
+  consistent with §2 and POSIX; the true differing-tree replace is `cp -rf NEW OLD`. Card plan — (`jd15-bench.md` builds a tree
   with an existing tree destination, exercises `cp -rf` / `mv -f` replace, and power-cycles for the
   crash-safe-partial durability check).
 - **Detail:** [`arch_arm64.md` §JD15](dev/OS/01_BOOT_HAL/arch_arm64.md). **Commit:** on `hw-jetson` (the seat
