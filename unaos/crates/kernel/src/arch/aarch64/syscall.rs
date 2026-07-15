@@ -9814,12 +9814,167 @@ fn atr_rebuild_into_owned(fs: &crate::fs::fat::FatFs) -> usize {
     installed
 }
 
-/// K1 M2.4 / K2: the REAL-BOOT mount-rebuild hook — restore persisted ownership before EL0 programs run. GATED on
-/// `by_name_spawn_multivalued()`, now TRUE (K2 landed three launchable named programs), so a persisted owner is
-/// re-acquirable by re-spawning its named program and the rebuild is safe to run at boot. On QEMU (fresh-per-build
-/// FAT) `UNAFS.ATR` is absent here, so it installs ZERO rows and the boot path stays byte-identical; the live
-/// effect is on metal. Wired at the head of the demo launcher (in-lane). The MECHANISM is proven independently by
-/// the M3 kernel-side proof + the K2 real-program launcher, which drive `atr_rebuild_into_owned` directly.
+/// K6: project an owner principal + its grants to the OWNED native byte strings [`native_acl_write`]
+/// takes. `None` if the owner has no native projection (fail-closed — an un-nameable owner is not
+/// migrated). A grant whose grantee/rights do not project is dropped (its edge simply does not migrate).
+fn native_project_owner_grants(
+    owner: &PrincipalRecord,
+    grants: &[(PrincipalRecord, u32); NFGRANT],
+) -> Option<(alloc::vec::Vec<u8>, alloc::vec::Vec<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>)>)> {
+    let mut ob = [0u8; K4_STR_MAX];
+    let on = principal_native_string(owner, &mut ob)?;
+    let owner_bytes = ob[..on].to_vec();
+    let mut gv: alloc::vec::Vec<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>)> = alloc::vec::Vec::new();
+    for &(p, r) in grants.iter() {
+        if r == 0 || p.kind == PRIN_NONE {
+            continue;
+        }
+        let mut gk = [0u8; K4_STR_MAX];
+        let mut rv = [0u8; 2];
+        if let (Some(gn), Some(rn)) = (grant_native_key(&p, &mut gk), rights_native_value(r, &mut rv)) {
+            gv.push((gk[..gn].to_vec(), rv[..rn].to_vec()));
+        }
+    }
+    Some((owner_bytes, gv))
+}
+
+/// K6 M2: the BOOT-TIME idempotent migration pass — move committed `IMAGE_SHA256` owner rows off the
+/// `UNAFS.ATR` FAT sidecar onto native unafs attributes, NATIVE-BEFORE-DELETE. Per row: project owner +
+/// grants -> [`native_acl_write`] (journaled) -> read the row back and verify each principal reverses
+/// to the SAME `PrincipalRecord` (an independent re-projection, the migration-landmine invariant) ->
+/// only THEN [`atr_clear_row`] deletes the sidecar row. A power cut anywhere leaves BOTH copies, never
+/// neither; a re-run converges (the native write is idempotent — a row that already verifies
+/// short-circuits to sidecar-delete). Only `IMAGE_SHA256` rows migrate (ratified policy): legacy
+/// `PROGRAM_NAME` rows stay in the sidecar, un-migrated and still enforcing via the ATR fallback rebuild
+/// (a card re-prep clears them). Returns the number of rows migrated (sidecar row deleted).
+fn native_migrate_from_sidecar(fs: &crate::fs::fat::FatFs) -> usize {
+    let bind = atr_live_binding(fs);
+    let (de, _lba, _off) = match fs.find_located(ATR_NAME) {
+        Ok(t) => t,
+        _ => return 0, // no sidecar -> nothing to migrate (the QEMU boot path; the metal card carries it)
+    };
+    if (de.size as usize) < ATR_FILE_LEN {
+        return 0;
+    }
+    let (afc, asz) = (de.first_cluster(), de.size);
+    if atr_header_status(fs, afc, asz, &bind) != Ok(true) {
+        return 0; // bad/uncommitted sidecar -> migrate nothing (fail-closed; the fallback rebuild sees the same)
+    }
+    let mut rows: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    if fs
+        .read_at(afc, asz, ATR_HEADER_LEN as u32, &mut rows, ATR_ROW_STRIDE * ATR_ROWS)
+        .is_err()
+        || rows.len() != ATR_ROW_STRIDE * ATR_ROWS
+    {
+        return 0;
+    }
+    let mut migrated = 0usize;
+    for i in 0..ATR_ROWS {
+        let start = ATR_ROW_STRIDE * i;
+        let mut arr = [0u8; ATR_ROW_STRIDE];
+        arr.copy_from_slice(&rows[start..start + ATR_ROW_STRIDE]);
+        let Some(row) = atr_parse_row(&arr) else {
+            continue; // free/corrupt row -> nothing to migrate
+        };
+        if row.owner.kind != PRIN_IMAGE_SHA256 {
+            continue; // ratified: only IMAGE_SHA256 rows migrate; PROGRAM_NAME stays in the sidecar
+        }
+        let mut grants = [(PrincipalRecord::NONE, 0u32); NFGRANT];
+        for (j, g) in row.grants.iter().enumerate() {
+            if g.rights != 0 && g.prin.kind != PRIN_NONE {
+                grants[j] = (g.prin, g.rights);
+            }
+        }
+        let Some((owner_bytes, gv)) = native_project_owner_grants(&row.owner, &grants) else {
+            continue; // un-projectable owner -> leave the sidecar row (fail-closed)
+        };
+        let mut name_buf = [0u8; 12];
+        let n = atr_name_to_buf(&row.name, &mut name_buf);
+        let Ok(name) = core::str::from_utf8(&name_buf[..n]) else {
+            continue;
+        };
+        // NATIVE-BEFORE-DELETE step 1: write the native row (idempotent — a re-run overwrites identically).
+        let grefs: alloc::vec::Vec<(&[u8], &[u8])> =
+            gv.iter().map(|(k, v)| (k.as_slice(), v.as_slice())).collect();
+        if !crate::fs::unafs::native_acl_write(
+            row.dir_lba,
+            row.dir_off,
+            name,
+            row.first_cluster,
+            &owner_bytes,
+            &grefs,
+        ) {
+            continue; // native write failed -> DO NOT delete the sidecar row (both-copies -> re-run)
+        }
+        // Step 2: read back + verify each principal reverses to the SAME record (independent re-projection).
+        let Some(back) = crate::fs::unafs::native_acl_read(row.dir_lba, row.dir_off) else {
+            continue;
+        };
+        if principal_from_native(&back.owner) != Some(row.owner) || back.name != name {
+            continue; // verify failed -> keep the sidecar row (never delete an unverified migration)
+        }
+        // Every ORIGINAL grant must be present and reverse-equal in the native read-back.
+        let grants_ok = grants.iter().filter(|(_, r)| *r != 0).all(|(p, r)| {
+            back.grants.iter().any(|(gk, rv)| {
+                grantee_from_grant_key(gk) == Some(*p) && rights_from_native(rv) == *r
+            })
+        });
+        if !grants_ok {
+            continue;
+        }
+        // Step 3: verified -> delete the sidecar row (native is now the sole store for this file).
+        if atr_clear_row(fs, row.dir_lba, row.dir_off) {
+            migrated += 1;
+        }
+    }
+    migrated
+}
+
+/// K6 M2/M3: rebuild the in-RAM owner/grants ACL from the NATIVE attribute volume — the
+/// `atr_rebuild_into_owned` successor. For each native ACL row: reverse-project owner (+ grants),
+/// re-resolve the DURABLE FAT name (`find_located` — a recycled `(dir_lba, dir_off)` is only a hint),
+/// corroborate `first_cluster` when both are nonzero, and install with the NO-LIVE-OWNER sentinel.
+/// FAIL-CLOSED throughout: an unparseable owner / name-gone / cluster-mismatch yields PUBLIC, never a
+/// forged owner. Returns the number of rows installed.
+fn native_rebuild_into_owned(fs: &crate::fs::fat::FatFs) -> usize {
+    let mut installed = 0usize;
+    for row in crate::fs::unafs::native_acl_list() {
+        let Some(owner) = principal_from_native(&row.owner) else {
+            continue; // un-nameable owner -> fail-closed to public
+        };
+        let (rde, rlba, roff) = match fs.find_located(&row.name) {
+            Ok(t) => t,
+            _ => continue, // name gone -> public
+        };
+        if row.first_cluster != 0 && rde.first_cluster() != 0 && row.first_cluster != rde.first_cluster() {
+            continue; // slot now holds a DIFFERENT file -> fail-closed
+        }
+        let mut grants = [(PrincipalRecord::NONE, 0u32); NFGRANT];
+        for (j, (gk, rv)) in row.grants.iter().enumerate() {
+            if j >= NFGRANT {
+                break;
+            }
+            if let Some(p) = grantee_from_grant_key(gk) {
+                let r = rights_from_native(rv);
+                if r != 0 {
+                    grants[j] = (p, r);
+                }
+            }
+        }
+        if owned_install_persisted(rlba, roff as u32, owner, &grants) {
+            installed += 1;
+        }
+    }
+    installed
+}
+
+/// K1 M2.4 / K2 / K6: the REAL-BOOT mount-rebuild hook — restore persisted ownership before EL0 programs
+/// run. GATED on `by_name_spawn_multivalued()` (TRUE since K2). K6: first MIGRATE any committed
+/// IMAGE_SHA256 sidecar rows onto native attributes (native-before-delete), then rebuild OWNED_FILES
+/// from the NATIVE store, THEN fall back to any remaining (un-migrated PROGRAM_NAME) sidecar rows — so a
+/// row always enforces from one store or the other, never neither. On QEMU (fresh-per-build FAT) both
+/// stores are empty here, so ZERO rows install and the boot path stays byte-identical; the live effect
+/// is on metal. The MECHANISM is proven independently by the K6 witness + the K1/K2/K3/K5 launchers.
 fn atr_maybe_boot_rebuild() {
     if !by_name_spawn_multivalued() {
         return; // cross-reboot enforcement gated off (single-program world) -> no rebuild, no I/O
@@ -9828,7 +9983,9 @@ fn atr_maybe_boot_rebuild() {
         return;
     }
     if let Ok(fs) = crate::fs::fat::mount() {
-        let _ = atr_rebuild_into_owned(&fs);
+        let _ = native_migrate_from_sidecar(&fs); // K6: move committed IMAGE_SHA256 rows to native first
+        let _ = native_rebuild_into_owned(&fs); // then enforce from the native store
+        let _ = atr_rebuild_into_owned(&fs); // fallback: any un-migrated (legacy PROGRAM_NAME) sidecar rows
     }
 }
 
@@ -10920,6 +11077,12 @@ fn k4_ready_selftest() {
 /// well past any staged directory), so the ACL file it writes never collides with a live owned file.
 const K6_SCRATCH_LBA: u64 = 0xC6_C600;
 const K6_SCRATCH_OFF: u32 = 0x60;
+/// K6 M2 migration scratch keys — a synthetic IMAGE_SHA256-owned sidecar row (migrates) and a legacy
+/// PROGRAM_NAME-owned sidecar row (stays un-migrated). Made-up FAT slot identities, no live file.
+const K6_IMG_LBA: u64 = 0xC6_1116;
+const K6_IMG_OFF: u32 = 0x16;
+const K6_LEG_LBA: u64 = 0xC6_1226;
+const K6_LEG_OFF: u32 = 0x26;
 
 /// K6 M1: does a `PrincipalRecord` survive forward-projection (`principal_native_string`) and reverse
 /// (`principal_from_native`) byte-for-byte? This is the 240-bit-prefix invariant a migrated owner rests
@@ -11002,9 +11165,62 @@ fn k6_migrate_selftest() {
         w |= 1 << 4;
     }
 
-    let all = 0x1fu32;
+    // ---- M2: boot-time migration, native-before-delete (plant sidecar rows, migrate, converge) ----
+    // Drive `native_migrate_from_sidecar` end-to-end in QEMU: the real boot pass is a no-op here (the
+    // sidecar is empty at the head of u7_launcher), so plant synthetic rows and exercise the migration.
+    if let Ok(fs) = crate::fs::fat::mount() {
+        let img_owner = PrincipalRecord::image_of(b"k6-migrate-image-bytes");
+        let leg_owner = PrincipalRecord::program_name("K6LEG.BIN");
+        let empty = [(PrincipalRecord::NONE, 0u32); NFGRANT];
+        if let (Some(imgn), Some(legn)) =
+            (atr_name_from_str("K6IMG.BIN"), atr_name_from_str("K6LEG.BIN"))
+        {
+            // Clear any stale scratch from a prior interrupted run (idempotent).
+            let _ = atr_clear_row(&fs, K6_IMG_LBA, K6_IMG_OFF);
+            let _ = atr_clear_row(&fs, K6_LEG_LBA, K6_LEG_OFF);
+            let _ = crate::fs::unafs::native_acl_clear(K6_IMG_LBA, K6_IMG_OFF);
+
+            let p1 = atr_persist_row(&fs, imgn, 0x55, 0, K6_IMG_LBA, K6_IMG_OFF, img_owner, &empty);
+            let p2 = atr_persist_row(&fs, legn, 0x66, 0, K6_LEG_LBA, K6_LEG_OFF, leg_owner, &empty);
+            let n1 = native_migrate_from_sidecar(&fs);
+            // bit5: exactly the IMAGE row migrated — its native row carries the reverse-equal owner, its
+            // sidecar row is gone, and the legacy PROGRAM_NAME sidecar row STAYS (un-migrated, enforcing).
+            let img_native_ok = crate::fs::unafs::native_acl_read(K6_IMG_LBA, K6_IMG_OFF)
+                .is_some_and(|r| principal_from_native(&r.owner) == Some(img_owner));
+            let img_sidecar_gone = k2_persisted_first_cluster(&fs, K6_IMG_LBA, K6_IMG_OFF).is_none();
+            let leg_sidecar_stays = k2_persisted_first_cluster(&fs, K6_LEG_LBA, K6_LEG_OFF).is_some();
+            if p1 && p2 && n1 == 1 && img_native_ok && img_sidecar_gone && leg_sidecar_stays {
+                w |= 1 << 5;
+            }
+            // bit6: POWER-CUT CONVERGENCE — re-plant the IMAGE sidecar row so BOTH copies are present
+            // (the crash-after-native-write-before-sidecar-delete window: never neither). A re-run
+            // converges — migrates it again, re-clears the sidecar, native still reverse-equal (idempotent).
+            let p3 = atr_persist_row(&fs, imgn, 0x55, 0, K6_IMG_LBA, K6_IMG_OFF, img_owner, &empty);
+            let both_copies = crate::fs::unafs::native_acl_read(K6_IMG_LBA, K6_IMG_OFF).is_some()
+                && k2_persisted_first_cluster(&fs, K6_IMG_LBA, K6_IMG_OFF).is_some();
+            let n2 = native_migrate_from_sidecar(&fs);
+            let converged = k2_persisted_first_cluster(&fs, K6_IMG_LBA, K6_IMG_OFF).is_none()
+                && crate::fs::unafs::native_acl_read(K6_IMG_LBA, K6_IMG_OFF)
+                    .is_some_and(|r| principal_from_native(&r.owner) == Some(img_owner));
+            if p3 && both_copies && n2 == 1 && converged {
+                w |= 1 << 6;
+            }
+            // bit7: idempotent no-op — with no IMAGE sidecar rows left, migration migrates 0 and leaves the
+            // legacy PROGRAM_NAME row in place (a card re-prep, not migration, clears it).
+            let n3 = native_migrate_from_sidecar(&fs);
+            if n3 == 0 && k2_persisted_first_cluster(&fs, K6_LEG_LBA, K6_LEG_OFF).is_some() {
+                w |= 1 << 7;
+            }
+            // Self-clean: drop the native scratch + the legacy sidecar row -> pristine (empty UNAFS.ATR).
+            let _ = crate::fs::unafs::native_acl_clear(K6_IMG_LBA, K6_IMG_OFF);
+            let _ = atr_clear_row(&fs, K6_LEG_LBA, K6_LEG_OFF);
+            crate::fs::unafs::force_remount();
+        }
+    }
+
+    let all = 0xffu32;
     serial_println!(
-        ":: K6-migrate: native owner/grants round-trip through the unafs attribute volume (codec forward+reverse, write+read+clear via the coherent mount) {} [w={:#04x}] ::",
+        ":: K6-migrate: native owner/grants round-trip + sidecar migration native-before-delete (codec forward+reverse; IMAGE row migrates+verifies+converges, legacy PROGRAM_NAME stays) {} [w={:#04x}] ::",
         if w == all { "PASS" } else { "FAIL" },
         w
     );
