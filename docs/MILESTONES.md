@@ -10,6 +10,41 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-pi4 track — 2026-07-15 (K7 — legacy-sidecar enforcement removed; NS-SPAN WATCH rider)
+
+### K7 — legacy `UNAFS.ATR` rows may no longer ENFORCE + knob-gated NS-SPAN instrument 🔬 QEMU-green, metal pending
+
+**What it does:** completes the sidecar retirement K6 began. K6 kept a transitional boot FALLBACK —
+after the native rebuild, `atr_maybe_boot_rebuild` still adopted any remaining (un-migrated, legacy
+`PROGRAM_NAME`) sidecar rows as owners, so a legacy row still ENFORCED. K7 DELETES that fallback leg
+(`atr_rebuild_into_owned` is no longer called from any boot/syscall path). **No production path adopts a
+sidecar row as an owner:** a card carrying ONLY legacy rows enforces PUBLIC-ONLY (fail-closed); the native
+store is the sole enforcement store. RETAINED (until the card fleet is declared fully crossed): the boot
+MIGRATION pass (committed `IMAGE_SHA256` rows still cross native-before-delete every boot) and its sidecar
+PARSE path; the `k1_corrupt` torn-row parse-guard (now the sole, FIXTURE-ONLY caller of
+`atr_rebuild_into_owned`); the K6-migrate witness planting; and — PERMANENT — the EL0 `SYS_OPEN` deny of
+`UNAFS.ATR`. The audited write helpers (`atr_ensure`/`atr_persist_row`/`atr_clear_row`) all keep
+migration/fixture callers, so none went dead. **NS-SPAN WATCH rider (Option-A close):** a knob-gated
+(`UNAOS_NSSPAN=1` → cargo feature `nsspan`) CNTPCT instrument measures the worst-case IRQ-masked `ns`-hold
+at the three fused persist sites (revoke/grants/grow) via an RAII probe (no lock, no heap) and emits one
+`:: NS-SPAN: worst revoke=… grants=… grow=… ticks (freq …) ::` line after the K3/K5 fixtures. Default-OFF,
+knob-off byte-identical (cfg-gated + newline-neutral so panic `Location` data does not move — the loadable
+`kernel8.img` is byte-identical to the no-rider build). The metal boot closes the bench WATCH with a real
+silicon number; the QEMU tick counts (62.5 MHz TCG) are not the verdict.
+
+**How it was tested:** 🔬 QEMU — `./arroyo check` both arches; `kernel8` clean; `kernel8-test` (35s window)
+MBENCH PASS **33/33** required, 0 forbidden, knob-off (spec unchanged — no witness text moved; the K7
+deletion is invisible on QEMU where both stores are empty at boot); knob-ON build also 33/33 with the new
+`:: NS-SPAN: worst revoke=29432062 grants=37936375 grow=21382937 ticks (freq 62500000) ::` line (all three
+sites exercised; uncounted). `test-arm` MISSION SUCCESS; unafs host suites green (crate untouched). Zero
+x86. **Byte-identity:** knob-off `kernel8.img` `sha256 97dc2069…` identical between the deletion-only tree
+and the rider-present tree; knob-ON differs (`aa048fb7…`) proving the feature is active. Metal (attended,
+LC-pi + Peter) closes the NS-SPAN WATCH with the on-silicon number.
+
+- **Detail:** [`SECURITY.md` §K1 (K7 bullet)](SECURITY.md). **Commits:** on `hw-pi4` (K7 code + docs).
+
+---
+
 ## hw-pi4 track — 2026-07-15 (K6 — native-attr migration; the UNAFS.ATR sidecar retired)
 
 ### K6 — U6 ACL migrated onto native unafs typed attributes ✅✅ METAL-CONFIRMED `hw-pi4`
