@@ -145,6 +145,15 @@ echo "    added GROW.BIN (512 bytes of 0xC1) for the U10 file-growth demo"
 head -c 64 /dev/zero | tr '\000' '\245' > "${MNT}/S8W.BIN"
 echo "    added S8W.BIN (64 bytes of 0xA5) for the STOR-1 S8 dynamic-write witness"
 
+# SINKHOLE-1 (zeolite): the DNS resolver's blocklist. One UPPERCASE name per line, ASCII, LF-terminated
+# (the fixture matches case-insensitively but the file is stored canonical-uppercase so the on-the-wire
+# match is a straight per-line compare). The zeolite resolver fixture opens this via the S7 dynamic-open
+# path (ring-3 SYS_OPEN RO + SYS_READ) — a genuine STOR-feeds-NET composition. ADS.EXAMPLE is the blocked
+# name the sinkhole witness answers with 0.0.0.0; TRACK.EXAMPLE is the required second entry. "una.os"
+# (the forward self-test name) is deliberately ABSENT so it is forwarded upstream, not sinkholed.
+printf 'ADS.EXAMPLE\nTRACK.EXAMPLE\n' > "${MNT}/BLOCK.TXT"
+echo "    added BLOCK.TXT (zeolite DNS sinkhole blocklist: ADS.EXAMPLE, TRACK.EXAMPLE)"
+
 # Strip macOS metadata (AppleDouble ._ files, Spotlight/fseventsd) so `ls` shows a clean tree.
 sync
 find "$MNT" -name '._*' -delete 2>/dev/null || true

@@ -962,6 +962,149 @@ def test_smoltcp_persistent(s, guest_mac, port=8080, budget_s=60.0):
     return True
 
 
+def dns_query(txn, qname):
+    """Build a minimal DNS A-query datagram payload for `qname` (a dotted ASCII name). Header: txn id,
+    flags RD, QDCOUNT=1; QNAME = length-prefixed labels + root; QTYPE=A(1), QCLASS=IN(1)."""
+    q = struct.pack(">HHHHHH", txn, 0x0100, 1, 0, 0, 0)
+    for label in qname.split("."):
+        b = label.encode("ascii")
+        q += bytes([len(b)]) + b
+    q += b"\x00" + struct.pack(">HH", 1, 1)
+    return q
+
+
+def parse_dns_answer_a(payload):
+    """Return the first A-record RDATA (4 bytes) in a DNS response payload, or None. Skips the question
+    section, then walks the answer RRs, returning the first TYPE=A(1)/CLASS=IN(1) RDATA."""
+    if len(payload) < 12:
+        return None
+    qd = struct.unpack(">H", payload[4:6])[0]
+    an = struct.unpack(">H", payload[6:8])[0]
+    if an < 1:
+        return None
+    pos = 12
+    # Skip QD question names + QTYPE/QCLASS.
+    for _ in range(qd):
+        while pos < len(payload):
+            l = payload[pos]
+            if l == 0:
+                pos += 1
+                break
+            if l & 0xC0:  # compression pointer
+                pos += 2
+                break
+            pos += 1 + l
+        pos += 4  # QTYPE + QCLASS
+    # Walk answer RRs.
+    for _ in range(an):
+        if pos >= len(payload):
+            return None
+        if payload[pos] & 0xC0:
+            pos += 2
+        else:
+            while pos < len(payload) and payload[pos] != 0:
+                pos += 1 + payload[pos]
+            pos += 1
+        if pos + 10 > len(payload):
+            return None
+        rtype, rclass = struct.unpack(">H", payload[pos:pos + 2])[0], struct.unpack(">H", payload[pos + 2:pos + 4])[0]
+        rdlen = struct.unpack(">H", payload[pos + 8:pos + 10])[0]
+        rdata = payload[pos + 10:pos + 10 + rdlen]
+        if rtype == 1 and rclass == 1 and rdlen == 4:
+            return rdata
+        pos += 10 + rdlen
+    return None
+
+
+def test_dns_sinkhole(s, guest_mac, blocked="ADS.EXAMPLE", budget_s=60.0):
+    """SINKHOLE-1 (zeolite): inject a DNS A-query for a BLOCKED name into the guest resolver's :53 and
+    verify the guest answers 0.0.0.0 (the sinkhole). The guest's ring-3 resolver fixture arms its listener
+    only for a bounded window (and spawns LATE, after the storage chain), so — like the SOCK-6/7 witnesses
+    — we RETRANSMIT the query on a fresh source port every ~0.3s across the budget until a sinkhole answer
+    comes back or the time runs out."""
+    print("--- SINKHOLE-1: DNS query for BLOCKED name %r to %s:53 ---" % (blocked, ipstr(GUEST_IP)))
+    s.settimeout(0.3)
+    deadline = time.time() + budget_s
+    # FIXED source port + txn across all retransmits: the guest's ring-3 resolver sinkholes exactly ONE
+    # query (the first it catches in its bounded serve window) and answers THAT datagram, then exits. A
+    # rotating source port would leave the (late-arriving) answer unmatched — so we keep them constant and
+    # retransmit the same query, accepting the sinkhole answer whenever it lands.
+    sport = 40053
+    txn = 0x7A5A
+    payload = dns_query(txn, blocked)
+    # Announce MY_IP is-at MY_MAC up front: to SEND its 0.0.0.0 answer back to us the guest's smoltcp must
+    # resolve our MAC, and it will ARP for MY_IP — so a gratuitous ARP + answering its who-has is REQUIRED
+    # (unlike the TCP witnesses, where the guest learns our MAC from our inbound handshake frames).
+    send_frame(s, eth(BCAST, MY_MAC, 0x0806, arp_reply(MY_MAC, MY_IP, guest_mac, GUEST_IP)))
+    attempt = 0
+    while time.time() < deadline:
+        attempt += 1
+        send_frame(s, eth(guest_mac, MY_MAC, 0x0800,
+                          ipv4(MY_IP, GUEST_IP, 17, udp(sport, 53, MY_IP, GUEST_IP, payload))))
+        try:
+            f = recv_frame(s)
+        except socket.timeout:
+            continue
+        if not f or len(f) < 42:
+            continue
+        etype = struct.unpack(">H", f[12:14])[0]
+        # Answer the guest's ARP who-has MY_IP so it can address the sinkhole reply to us.
+        if etype == 0x0806 and struct.unpack(">H", f[20:22])[0] == 1 and f[38:42] == MY_IP:
+            send_frame(s, eth(f[6:12], MY_MAC, 0x0806, arp_reply(MY_MAC, MY_IP, f[6:12], f[28:32])))
+            continue
+        if etype != 0x0800 or (f[14] >> 4) != 4 or f[23] != 17:
+            continue
+        ihl = (f[14] & 0x0F) * 4
+        total = struct.unpack(">H", f[16:18])[0]
+        src_ip, dst_ip = f[26:30], f[30:34]
+        seg = f[14 + ihl:14 + total]
+        if len(seg) < 8:
+            continue
+        rsport = struct.unpack(">H", seg[0:2])[0]
+        rdport = struct.unpack(">H", seg[2:4])[0]
+        rpayload = seg[8:]
+        # A DNS answer from the guest resolver: src port 53, dst our source port, txn id echoed.
+        if rsport != 53 or rdport != sport:
+            continue
+        if len(rpayload) < 12 or struct.unpack(">H", rpayload[0:2])[0] != txn:
+            continue
+        udp_ck_ok = udp_checksum(src_ip, dst_ip, seg) == 0
+        ip_ck_ok = cksum(f[14:14 + ihl]) == 0
+        a = parse_dns_answer_a(rpayload)
+        if a == bytes([0, 0, 0, 0]) and udp_ck_ok and ip_ck_ok:
+            print("<- guest answered %r -> 0.0.0.0  ip_cksum=OK udp_cksum=OK (attempt %d)   [GUEST DNS SINKHOLE OK]"
+                  % (blocked, attempt))
+            return True
+        if a is not None:
+            print("<- guest answered %r -> %s (expected 0.0.0.0) ip_ck=%s udp_ck=%s"
+                  % (blocked, ipstr(a), ip_ck_ok, udp_ck_ok))
+    print("FAIL: guest resolver never sinkholed %r to 0.0.0.0 within %.0fs" % (blocked, budget_s))
+    return False
+
+
+def main_dns():
+    """Focused SINKHOLE-1 witness: connect to the QEMU socket netdev, resolve the guest MAC, and inject a
+    DNS query for the blocked name ADS.EXAMPLE, verifying the guest resolver answers 0.0.0.0."""
+    s = None
+    for _ in range(120):
+        try:
+            s = socket.create_connection((HOST, PORT), timeout=2)
+            break
+        except OSError:
+            time.sleep(0.5)
+    if s is None:
+        print("FAIL: could not connect to QEMU socket netdev at %s:%d" % (HOST, PORT))
+        return 1
+    print("connected to %s:%d" % (HOST, PORT))
+    s.settimeout(2)
+    time.sleep(3)  # let the guest bring up e1000
+    guest_mac = resolve_guest_mac(s)
+    if guest_mac is None:
+        print("FAIL: no ARP reply from guest (could not resolve 10.0.2.15)")
+        return 1
+    return 0 if test_dns_sinkhole(s, guest_mac) else 1
+
+
 def main_sock7():
     """Focused SOCK-7 witness: connect to the QEMU socket netdev, resolve the guest MAC, and drive TWO
     sequential inbound connections into the guest's PERSISTENT smoltcp listener (proving it survives the
@@ -1164,10 +1307,14 @@ def main():
 
 
 if __name__ == "__main__":
-    # `net-inject.py [host:port] [sock6|sock7]` — `sock6` runs ONLY the focused SOCK-6 server witness
+    # `net-inject.py [host:port] [dns|sock6|sock7]` — `dns` runs ONLY the focused SINKHOLE-1 witness
+    # (inject a DNS query for the blocked name ADS.EXAMPLE, assert the guest resolver answers 0.0.0.0);
+    # `sock6` runs ONLY the focused SOCK-6 server witness
     # (one inbound connection); `sock7` runs the SOCK-7 persistent-listener witness (TWO sequential
     # inbound connections to the same port — the second proves the listener survived the first accept);
     # otherwise the full hand-rolled suite.
+    if "dns" in sys.argv[1:]:
+        sys.exit(main_dns())
     if "sock7" in sys.argv[1:]:
         sys.exit(main_sock7())
     if "sock6" in sys.argv[1:]:

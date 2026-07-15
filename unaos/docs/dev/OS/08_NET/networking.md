@@ -533,6 +533,84 @@ INCOMPLETE on that medium — inherent to the injector backend, not a regression
   smoltcp behavior (present in SOCK-6's single-accept model too), a liveness — not memory/capability —
   bound; a kernel-side auto-re-arm or SYN-flood mitigation is future work.
 
+## SINKHOLE-1 (zeolite) — the DNS resolver / sinkhole, x86 QEMU proof
+
+SINKHOLE-1 is the first slice of the UnaOS DNS sinkhole ("the Pi-hole concept, done the UnaOS way"): a
+**ring-3 resolver** that binds UDP `:53`, answers BLOCKED names with `0.0.0.0` (the sinkhole), and
+FORWARDS everything else to the upstream resolver. Same knob (`UNAOS_SMOLNET`), x86-only, byte-identical
+knob-off / aarch64. It adds **no new syscall** (next free stays **28**) and **no new ring-3 surface** — the
+resolver is a ring-3 fixture (`zeolite-resolver`, the sock2 inline-blob idiom) composed entirely from the
+already-landed capabilities: the SOCK-2 UDP syscalls (`sys_socket`/`bind`/`sendto`/`recvfrom`) for serve +
+forward, and the **STOR-1 S7 dynamic-open path** (`sys_open` RO + `sys_read`) for the blocklist. That
+composition is half the point: the resolver holds ONLY its two UDP sockets and a read-only blocklist
+descriptor — capability-scoped by construction, with no web-stack bloat.
+
+### The blocklist is a FILE (STOR feeds NET)
+
+The blocklist lives on the FAT volume as `BLOCK.TXT` (planted by `make-fat-img.sh`: one UPPERCASE name per
+line, ASCII, LF-terminated — `ADS.EXAMPLE` + `TRACK.EXAMPLE`). At start the resolver opens it via the S7
+dynamic-open path (`sys_open("BLOCK.TXT")` → not staged → `open_dynamic_ondisk` → a real on-disk read) and
+`sys_read`s it into a ring-3 buffer — a genuine cross-subsystem composition witness (STOR feeds NET). The
+S7 path needs `UNAOS_IRQSTORAGE=1` + a mounted FAT (`UNAOS_FATIMG=sf`); with **no** FAT the open fails and
+the resolver falls back to a tiny **builtin list** (the same two names) and prints an honest `builtin list
+(no FAT)` marker, so the pure-net legs still witness under `UNAOS_SMOLNET=1` alone.
+
+### The witness-medium decision (resolved: split legs)
+
+The two legs have conflicting media, and medium **(a)** — a guest-internal round-trip under hermetic slirp
+via a second ring-3 client — was **probed and ruled out**: smoltcp on a single ethernet interface does
+**not** deliver a datagram socket-to-socket to the guest's own address (there is no loopback medium; a probe
+sending to `own-ip:5353` from a second socket got nothing back). So the proof is medium **(b), split legs**:
+
+- **The FORWARD + composition leg proves hermetically** (`UNAOS_SMOLNET=1`, and fully under
+  `+IRQSTORAGE +FATIMG`). The resolver runs two self-tests through its **hardened parser**: it parses an
+  inline query for `ADS.EXAMPLE`, matches the blocklist (BLOCKED), and **builds a well-formed `0.0.0.0`
+  A-answer** (the sinkhole decision + response construction, proven without a peer); then it parses an
+  inline query for `una.os`, confirms it is NOT blocked, and **forwards** it to the upstream resolver
+  (`10.0.2.3:53`, slirp's built-in DNS), relaying the real answer. One line reports it:
+  `:: zeolite: blocklist from BLOCK.TXT via S7 dynamic-open, blocked ADS.EXAMPLE -> 0.0.0.0 (answer built), forwarded una.os -> 10.0.2.3:53 real answer relayed — witness OK ::`
+  (`builtin list (no FAT)` when no FAT; `INCOMPLETE` on the injector medium, which has no upstream resolver).
+
+- **The SERVE (sinkhole-over-the-wire) leg needs the `UNAOS_NET=socket` injector.** Slirp's NAT will not
+  inject an inbound query, so — like SOCK-6/7 — the resolver binds `:53` and, over a bounded window,
+  `recvfrom`s an inbound query; a blocked name is sinkholed to `0.0.0.0` over the wire to the client.
+  `scripts/net-inject.py dns` injects a DNS A-query for `ADS.EXAMPLE` and verifies the guest answers
+  `0.0.0.0`. Under the default hermetic slirp no peer connects, so the guest prints the honest PENDING note
+  and the injector run drives the OK:
+  `:: zeolite: resolver bound :53 — awaiting an inbound query (UNAOS_NET=socket net-inject dns) — witness PENDING ::`
+  → under the injector: `:: zeolite: served an inbound query on :53 — blocked name sinkholed to 0.0.0.0 over the wire — witness OK ::`.
+
+Reproduce (hermetic, forward OK + serve PENDING): `UNAOS_SMOLNET=1 ./arroyo test 90`. Full composition
+(blocklist from FAT): `UNAOS_SMOLNET=1 UNAOS_IRQSTORAGE=1 UNAOS_FATIMG=sf ./arroyo test 200`. Over-the-wire
+sinkhole: launch `UNAOS_NET=socket UNAOS_SMOLNET=1 UNAOS_TEST_SECS=150 ./arroyo test 155` and concurrently
+`python3 scripts/net-inject.py 127.0.0.1:5555 dns`.
+
+### Hostile-payload parse hygiene
+
+This is the first arc where our code parses a HOSTILE payload (a DNS name off the wire). The parser
+(`zdns_parse_and_match`, ring 3) is **strictly bounded**: the packet length is validated before every field
+access; the cursor is checked against the packet end before each length byte and label body; any label
+whose length byte has EITHER high bit set is **REFUSED** — this rejects DNS compression pointers (`0b11…`)
+AND the reserved `0b01`/`0b10` forms alike, so **no pointer is ever followed and no compression loop can
+exist**; the assembled name is capped (≤ 250, well under its 256-byte buffer) and each label ≤ 63; and any
+malformed packet is rejected as `malformed` without a crash (the fixture simply declines to sinkhole/forward
+it). The name match is case-insensitive (both sides upper-cased). The DNS **response** builder writes a
+fixed 16-byte answer (name-pointer `0xC00C`, TYPE A, CLASS IN, TTL 0, RDLENGTH 4, RDATA `0.0.0.0`) appended
+to the copied question — no attacker-controlled length feeds any arithmetic.
+
+### Residuals (ledgered)
+
+- **Serve is proven guest-side; the end-to-end injector rendezvous is timing-sensitive.** The resolver
+  fixture spawns late (after the storage chain) and serves for a bounded window; the injector must announce
+  its own MAC (a gratuitous ARP — the guest ARPs for the client to address the reply) and retransmit a
+  fixed-port query. The guest-side sinkhole is deterministic (`witness OK` observed over the wire); the
+  committed hermetic gate carries the PENDING line, as SOCK-6/7 do.
+- **Single in-flight forward, no cache, no query log, single question / A-record only, fail-`malformed`**
+  (a packet the parser rejects is neither sinkholed nor forwarded — the conservative choice for a hostile
+  payload). All per the first-slice scope; the appliance story (aarch64/GENET NIC, ingest, logging, stats
+  view, kit) is future work.
+- **`copy_from_user`** for socket/name buffers remains the deferred hardening all of SOCK-2..7 carry.
+
 ## The road from here
 
 | Arc | Content |
@@ -543,5 +621,6 @@ INCOMPLETE on that medium — inherent to the injector backend, not a regression
 | SOCK-4 | transferable sockets — `sys_socket` mints `CAP_GRANT`, `sys_recv` migrates socket ownership, a socket cap moves cross-row (gen-fenced, single-owner); no new syscall |
 | SOCK-5 | DHCP via smoltcp — the persistent stack leases its own address with `dhcpv4::Socket`; no new syscall, no ring-3 surface, static fallback |
 | SOCK-6 | TCP server/listen sockets (`sys_listen`/`sys_accept`, #26–27) — ring 3 accepts inbound TCP; accept mints a fresh gen-fenced socket cap; net-inject `UNAOS_NET=socket` witness |
-| **SOCK-7** (this) | persistent-listener acceptor pool — `sys_listen` arms a listener that survives accepts; each `sys_accept` peels a fresh gen-fenced connection + re-arms the listener in place (buffer free-list, shape (i)); no new syscall; net-inject `sock7` two-connection witness |
-| SOCK-8+ | aarch64 NIC bring-up; DNS resolver / sinkhole; retire the hand-rolled shell surface + `crates/net` DHCP |
+| SOCK-7 | persistent-listener acceptor pool — `sys_listen` arms a listener that survives accepts; each `sys_accept` peels a fresh gen-fenced connection + re-arms the listener in place (buffer free-list, shape (i)); no new syscall; net-inject `sock7` two-connection witness |
+| **SINKHOLE-1** (zeolite, this) | ring-3 DNS resolver/sinkhole — binds `:53`, blocks names from `BLOCK.TXT` (read via the S7 dynamic-open path) with `0.0.0.0`, forwards the rest to `10.0.2.3:53`; hardened hostile-payload parser; no new syscall; net-inject `dns` sinkhole witness |
+| SOCK-8+ | aarch64 NIC bring-up (Pi GENET); the DNS appliance (ingest, cache, query log, stats view, kit); retire the hand-rolled shell surface + `crates/net` DHCP |
