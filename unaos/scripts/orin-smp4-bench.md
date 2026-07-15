@@ -93,3 +93,15 @@ knob-off DEFAULT tar for the byte-identity fallback. Shas in the MANIFEST + the 
 report. Each armed image validates by its distinct ELF hash + `strings | grep SMPPROBE-4` present;
 confirm the LIVE `sel=<n>` on the first `SMPPROBE-4` serial line matches the leg you flashed BEFORE
 trusting the boot (`UNAOS_SMPPROBE` is compile-time — one image per leg).
+
+---
+## ⚡ SITTING VERDICT (2026-07-15 attended; serial `~/unaos-bench/jetson-serial-2026-07-15-smp4bisect.log`)
+
+Legs 10–16, 7 boots, **0 faults** — firmware precondition matched every boot. 10–15 = predictions
+EXACT (leg 15's `GICR_WAKER @ 0xf460014` read survived — prime suspect INNOCENT). **Leg 16 survived
+AGAINST its prediction** — checkpoint `0x53040010`, `AP -> BSP SGI OK (BSP ipi 1 -> 2) — full path
+online`, CAPSTONE: **the first live UnaOS AP on Orin silicon.** Sitting stopped at the contradiction
+(final leg). Residue = what the replica deliberately omitted vs the real flow: (a) the AP's
+`serial_println!` (UART MMIO + console spinlock from a secondary), (b) the WFI idle tail, (c) the
+real 5-core sequence incl. cluster-1 (`0x10200/0x10300`) — tonight woke only `0x00000100`.
+SMP-5 residue legs (17 +print · 18 +WFI · 19 cluster-1 · 20 five-core) pend ratification.

@@ -203,7 +203,18 @@ instrumented build (core3probe idiom) rides the next Pi arc's sitting to produce
 
 ---
 
-## aarch64 SMP — ORIN-SMP-4: the woken core's EXECUTION BISECT (`UNAOS_SMPPROBE=10..16`) — 2026-07-15 ⏳ QEMU-green + staged, metal attended-pending `hw-jetson`
+## aarch64 SMP — ORIN-SMP-4: the woken core's EXECUTION BISECT (`UNAOS_SMPPROBE=10..16`) — 2026-07-15 ⚡ BENCHED: ALL 7 LEGS SURVIVED — **first UnaOS AP ONLINE on Orin silicon**; the fault residue is 3 named suspects `hw-jetson`
+
+**Attended bisect sitting 2026-07-15 (serial `jetson-serial-2026-07-15-smp4bisect.log`): legs 10–16, 7
+boots, 0 faults; legs 10–15 matched their pre-registered predictions EXACTLY (leg 15's GICR read —
+frame `0xf460000`, `GICR_WAKER @ 0xf460014` — survived: the prime suspect is INNOCENT); leg 16 (the
+full-path replica) CONTRADICTED its predicted SMP-3 fault by SURVIVING — checkpoint `0x53040010`, `AP
+-> BSP SGI OK (ipi 1 -> 2)`, CAPSTONE, box up: the first live UnaOS secondary on Orin.** Sitting
+stopped at the contradiction per the rider (final leg regardless). RESIDUE — the replica omitted, by
+design, exactly: (a) the AP's `serial_println!` (UART MMIO + console spinlock from a secondary), (b)
+the WFI idle tail (replica parks WFE), (c) the 5-core sequence incl. cluster-1 affs (tonight woke ONE
+core, `0x00000100`). SMP-5 = pre-registered residue legs (17 +AP-print · 18 +WFI · 19 cluster-1 core ·
+20 the real 5-core sequence), pending ratification.
 
 **What it does:** the pre-registered bisect that brackets the SMP-3 wall — firmware `CPU_ON` works on
 UEFI 39.2.0 but the woken core's EARLY EXECUTION drives a CBB-rejected access (IOB SERR=0x12 / CBB-0x6 /
