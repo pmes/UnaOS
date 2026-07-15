@@ -36,7 +36,7 @@ REQUIRE U6-grants: owner/grants on open.*-> PASS
 
 # --- K1 survive-reboot witnesses (uncounted — not `-> PASS` fixture lines) ---------
 REQUIRE K1-persist:.*SURVIVE REBOOT.*PASS
-REQUIRE K1-corrupt:.*fails closed to PUBLIC at mount PASS
+REQUIRE K1-corrupt:.*fails closed to PUBLIC at boot PASS
 OPTIONAL K1-atr:.*codec PASS
 
 # --- F2/F3 SMP witnesses (locked leg must be lossless) ------------------------------
