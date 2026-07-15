@@ -315,6 +315,11 @@ pub fn init(base_address: u64) {
 const PORT_CHANGE_BITS: u32 =
     (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20) | (1 << 21) | (1 << 22) | (1 << 23);
 
+/// M2 (XENUM-1): how many times a hub-downstream GET_DESCRIPTOR(device) is retried when it reads
+/// all-zero / short (the documented vid=0000 hub-downstream intermittency) before the device is
+/// left unconfigured. Bounded so a genuinely dead port cannot stall enumeration indefinitely.
+const XENUM_DESC_RETRIES: u32 = 4;
+
 pub static XHCI_CONTROLLER: spin::Mutex<Option<XhciController>> = spin::Mutex::new(None);
 
 /// Human-readable mass-storage enumeration/bring-up state, for the shell `diskinfo` command when no
@@ -4274,9 +4279,37 @@ impl XhciController {
         }
         let buf = self.slots[slot_id as usize].descriptor_buffer as u64;
 
-        // GET device descriptor (18 bytes).
-        if self.sync_control(slot_id, 0x80, 0x06, 0x0100, 0, 18, buf, true).is_err() {
-            serial_println!("xHCI: downstream slot {} device-descriptor failed", slot_id);
+        // GET device descriptor (18 bytes), with a bounded retry on an all-zero/short read.
+        // M2 (XENUM-1): a device freshly reset behind a hub sometimes answers the FIRST descriptor
+        // read with all zeros (bLength=0, vid=pid=0000) — the documented hub-downstream vid=0000
+        // intermittency (metal rMBP: a mouse behind a working, keyboard-bearing hub enumerated
+        // class=0 vid=0000 and got "no HID interrupt endpoint"). A valid device descriptor has
+        // bLength=18 and bDescriptorType=0x01; anything else is a bad read. Retry a few times with
+        // a paced settle (mirroring the storage path) before accepting it. A descriptor that never
+        // reads valid is logged and left UNCONFIGURED (honest) rather than treated as a real device.
+        let mut desc_ok = false;
+        for attempt in 1..=XENUM_DESC_RETRIES {
+            unsafe { core::ptr::write_bytes(buf as *mut u8, 0, 18); } // no stale-descriptor false pass
+            if self.sync_control(slot_id, 0x80, 0x06, 0x0100, 0, 18, buf, true).is_err() {
+                serial_println!("xHCI: downstream slot {} device-descriptor read failed (attempt {} of {})",
+                    slot_id, attempt, XENUM_DESC_RETRIES);
+            } else {
+                let (blen, dtype) = unsafe { let p = buf as *const u8; (*p.add(0), *p.add(1)) };
+                if blen >= 18 && dtype == 0x01 {
+                    desc_ok = true;
+                    break;
+                }
+                serial_println!(
+                    "xHCI: downstream slot {} device-descriptor all-zero/short (bLength={} type={:#x}, attempt {} of {}); retrying.",
+                    slot_id, blen, dtype, attempt, XENUM_DESC_RETRIES);
+            }
+            // Paced settle before the retry: let the device finish its own reset-recovery.
+            for _ in 0..200 { if !self.drain_event_ring_once() { crate::hlt(); } }
+        }
+        if !desc_ok {
+            serial_println!(
+                "xHCI: downstream slot {} device-descriptor never read valid after {} attempts; leaving unconfigured.",
+                slot_id, XENUM_DESC_RETRIES);
             return;
         }
         let (class, vid, pid) = unsafe {
