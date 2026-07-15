@@ -330,6 +330,37 @@ Spec promotions committed here; the granular arc detail is in each arc's own ent
 
 ---
 
+## hw-jetson track — 2026-07-15 (JD19 — read-only forensic verbs: `stat` + `xd`)
+
+### JD19 — read-only FORENSIC verbs: `stat` (full on-disk detail), `xd` (bounded hexdump) (`shell.rs`; `fat.rs` call-never-edit) ⏳ attended-pending
+- **Why:** the file-manager + tree-survey verbs are closed; JD19 adds the on-disk truth view — what a
+  directory slot actually holds, and a hexdump of a file's raw bytes.
+- **How (all `shell.rs`, riding `resolve_path`/`locate_in_dir`/`read_at` + one raw `block::read_block`; zero
+  mutation, no glob — a metacharacter resolves literally → `-ENOENT`):**
+  - **`stat <path>`:** prints canonical path, kind (file/dir), size, the raw FAT **attr byte** (hex + decoded
+    `RO`/`HIDDEN`/`SYS`/`DIR`/`ARCHIVE`, `-` when none), first cluster (hex; `0x0` for a 0-length file), the FAT
+    last-write stamp (bare `-` when zeroed, via §JD16 `fmt_mtime`), and the **on-disk location** (directory-entry
+    LBA + 32-byte slot offset). The parsed `DirEntry` keeps only `is_dir`, so the true attr byte is read back
+    from slot offset `+11` of the on-disk directory sector `locate_in_dir` points at. **`stat /` reports the root
+    honestly** — a dir with NO directory entry of its own. Missing path → `-ENOENT`.
+  - **`xd <path> [off] [len]`:** bounded hexdump via `read_at` (default off=0, len=256, `len` capped at **4096**);
+    canonical `OFFSET: 16 hex bytes | ASCII` rows at the **absolute file offset**, non-printables `.`; honest
+    `[... n more byte(s)]` tail note when the file is larger. `off` at/past EOF = honest empty note; a directory
+    (and the root) = `-EISDIR`. off/len parse decimal or `0x`-hex.
+- **Not in scope:** any mutation, glob for these verbs, raw-LBA dumps (the `read <lba>` verb covers that),
+  FAT-internal walks beyond the public API.
+- **Tested (QEMU):** `check` + `UNAOS_TEGRA=1 check` green both arches (no new warnings); `test-arm 22` MISSION;
+  `UNAOS_GICV3=1 test-arm 40` CAPSTONE 6/6; `kernel8-test` **0 FAIL**; `UNAOS_HUBSTORAGE=1 test 25` MISSION;
+  `esp-jetson` links, `tegra:` COUNT unchanged (these verbs add no `tegra:` token; built LAST). Lane clean:
+  `shell.rs` + docs + `jd19-bench.md`; `fat.rs` untouched.
+- **Metal:** ⏳ **attended-pending** — card `jd19-bench.md`: stat a host file vs a kernel-written file vs a dir
+  vs the root; xd known content at offsets incl. past-EOF + the cap note. ⚠ `dot_clean` BOTH cards; flash from a
+  STAGED artifact, never `target/`.
+- **Detail:** [`arch_arm64.md` §JD19](dev/OS/01_BOOT_HAL/arch_arm64.md). **Commit:** on `hw-jetson` (the seat
+  assigns the integration hash at merge).
+
+---
+
 ## hw-jetson track — 2026-07-15 (JD18 — read-only tree tools: `find` + `du` + `uptime`)
 
 ### JD18 — read-only TREE TOOLS: `find` (recursive glob search), `du` (subtree size tally), `uptime` (`shell.rs`; one additive `clock.rs` helper) ✅ METAL-CONFIRMED 2026-07-15

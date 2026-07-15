@@ -3081,6 +3081,18 @@ the full tree, scoped and no-match forms honest), `du` tallied a seeded tree exa
 1 dir), `uptime` counter-derived both without and with the seeded-clock parenthetical (bench card
 `unaos/scripts/jd18-bench.md`).
 
+### JD19 — read-only FORENSIC verbs: `stat` (full on-disk detail) + `xd` (bounded hexdump)
+
+Two read-only inspection verbs that expose the on-disk truth of a FAT entry — **`shell.rs`-only, zero mutation, `fat.rs` call-never-edit, NET arms + unafs verbs untouched.** Both ride primitives the read path already ships (`resolve_path`/`locate_in_dir`/`read_at`) plus, for `stat`'s attr byte, one raw `block::read_block` of the on-disk directory sector — the same raw block path the `read <lba>` verb uses. Neither is glob-wired: a metacharacter in the path resolves literally, an honest `-ENOENT`, exactly as a mid-path glob does today.
+
+**`stat <path>`.** Prints one directory entry's full detail: the canonical absolute path, kind (file/dir), size in bytes, the raw FAT **attr byte** (hex + decoded `RO`/`HIDDEN`/`SYS`/`DIR`/`ARCHIVE` flags, `-` when none set), first cluster (hex; `0x0` honest for a 0-length file), the FAT last-write stamp (a bare `-` when the on-disk pair is zeroed, via the §JD16 `fmt_mtime`/`FatTimestamp::is_zero`), and the **on-disk location** — the directory-entry LBA + 32-byte slot offset. The parsed `DirEntry` keeps only `is_dir` (not the whole attr byte), so `stat` reads the true byte back from slot offset `+11` of the on-disk directory sector returned by `locate_in_dir` (which yields `(DirEntry, dir_lba, dir_off)`). **`stat /` reports the root honestly** — a directory with **no directory entry of its own** (the FAT root has no parent slot), so the `entry:` line says so rather than inventing an LBA. A missing path is `-ENOENT`.
+
+**`xd <path> [off] [len]`.** A bounded hexdump of a file's bytes via the offset-aware `read_at`: default `off=0`, `len=256`, with `len` **hard-capped at 4096**. Rows are the canonical `OFFSET: <16 hex bytes> | <ascii> |` layout, labelled with the **absolute file offset** (starting at `off`, not from 0 like the raw `read`-verb dump) and non-printables rendered as `.`; a short final row is padded so the ASCII gutter stays aligned. When the file holds more bytes past the dumped window — a cap hit, a short `len`, or both — an honest `[... n more byte(s)]` tail note is printed. An `off` at or past EOF is an honest `offset N at/past EOF` note (no rows); a directory target (and the root) is `-EISDIR`. `off`/`len` accept decimal or `0x`-hex.
+
+**Not in scope:** any mutation, glob expansion for these two verbs, raw-LBA dumps (the `read <lba>` verb already covers that), and any FAT-internal walk beyond the public API.
+
+**Gate (QEMU):** `./arroyo check` + `UNAOS_TEGRA=1 ./arroyo check` green both arches (no new warnings); `./arroyo test-arm 22` → `MISSION SUCCESS`; `UNAOS_GICV3=1 ./arroyo test-arm 40` → CAPSTONE 6/6; `./arroyo kernel8-test` → **0 FAIL** (protects `fat.rs`, shared with the Pi image; these verbs add no `fat.rs` surface); `UNAOS_HUBSTORAGE=1 ./arroyo test 25` → `MISSION SUCCESS` (x86, shared shell guard); `UNAOS_TEGRA=1 ./arroyo esp-jetson` links, validate by `tegra:` COUNT (unchanged — these verbs add no `tegra:` token) never size, built LAST after `test-arm`. Exercised interactively, so the metal verdict is **⏳ attended-pending** — bench card `unaos/scripts/jd19-bench.md` (stat a host file vs a kernel-written file vs a dir vs the root; xd known content at offsets including past-EOF + the cap note).
+
 ## 4. Jetson Orin Nano headless bring-up (Arc JM2)
 
 The Orin is brought up **headless over serial**. The only console that has ever
