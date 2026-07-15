@@ -2435,6 +2435,18 @@ impl XhciController {
         if !self.requeue_after_settle.is_empty() {
             let deferred = core::mem::take(&mut self.requeue_after_settle);
             for port in deferred {
+                // If the in-flight enumeration that was flapping actually SUCCEEDED (the device
+                // returned fast enough to bind a slot), the port now has an active slot. Re-
+                // enumerating it as-is would allocate a SECOND slot + device context for the one
+                // device (rings mem::forget'd) — a leak. Dispose the stale slot first, exactly as
+                // the CCS=0 hot-plug path relies on dispose to make `has_slot` false, so the
+                // re-enumeration lands on a single clean slot.
+                let has_slot = self.slots.iter().enumerate()
+                    .any(|(i, s)| i != 0 && s.active && s.port_id == port);
+                if has_slot {
+                    let disposed = self.dispose_disconnected_slots(port);
+                    serial_println!("xHCI: [Port {}] deferred re-plug: disposed {} stale slot(s) before re-enumeration.", port, disposed);
+                }
                 if !self.ports_to_enumerate.contains(&port) {
                     serial_println!("xHCI: [Port {}] re-queuing deferred hot re-plug for enumeration.", port);
                     self.ports_to_enumerate.push(port);
