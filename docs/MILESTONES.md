@@ -10,6 +10,28 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## aarch64 SMP — ORIN-SMP phase 1: CORE3-class audit + born-fixed PSCI re-derive — 2026-07-15 🔬 QEMU-green, no metal leg `hw-jetson`
+
+**What it does:** applies the Pi CORE3-SMP hazard analysis (MMU-off stack spill of a secondary
+core-id reloaded stale-cacheable after the MMU turns on) to the three files that fix flagged out of
+the Pi lane. Audit verdict: `boot_virt.rs` and `boot_tegra.rs` are **SOUND** (BSP-only EL2→EL1
+drops, no incoming-id spill; `VMPIDR_EL2` seeded before any EL1 `MPIDR` read — verified in both,
+including the tegra `l1_pa` signature). `smp_virt.rs::__secondary_rust_virt` **carried the hazard**:
+pre-fix disassembly showed `str x0,[sp]` (MMU-off) → `msr SCTLR_EL2` (MMU on) → `serial_println!`
+reading `&core` by reference → `ldr x0,[sp]` (cacheable reload) feeding `CORE_READY[core]` — the
+exact Pi forcing shape. **Fix (born on the idiom, Orin-corrected):** the linear index cannot come
+from MPIDR Aff0 (0 on every Tegra234 cluster), so the BSP publishes a linear-index→packed-affinity
+table and the secondary re-derives its index MMU-on by matching its live `MPIDR_EL1` full affinity,
+parking in `wfe` on no match. Post-fix disassembly confirms every id store/load is MMU-on; the
+advisory x0 is never spilled.
+
+**How it was tested:** disassembly is the proof of record (hazard is QEMU-invisible — TCG models no
+caches). `./arroyo check` green both arches ±`tegra`; GICv3 `test-arm` — 3/3 secondaries online
+(each re-derives correctly), BSP/AP SGIs 3/3, CAPSTONE 6/6; plain `test-arm` byte-unaffected. **No
+metal leg:** the tegra binary DCEs `smp_virt` (Orin PSCI parked on the external BL31/MCE `CPU_ON`
+RAS fault), so the tegra image is byte-unchanged and there is nothing new to flash; the bring-up is
+pre-fixed for when that firmware wall clears. `smp_virt.rs` + `arch_arm64.md §ORIN-SMP`.
+
 ## aarch64 SMP — CORE3-FIX (re-derive secondary core id from MPIDR_EL1, MMU-on) — 2026-07-15 ✅✅ METAL-CONFIRMED `hw-pi4`
 
 **What it does:** closes the CORE3-SMP regression — on Pi 4 metal, a `kernel8.img` crossing 1 MiB

@@ -3520,3 +3520,62 @@ but the following must change and are **not** covered by QEMU:
   INTID); the BSP→AP direction is already per-core attributable (each AP's own IPI counter).
   Deferred to keep JM5 to one clean session; give each AP a distinct SGI INTID in a
   follow-up so AP→BSP delivery is individually attributable too.
+
+### ORIN-SMP — the CORE3-class audit of the PSCI bring-up + the born-fixed re-derive (phase 1)
+
+The Pi CORE3-SMP fix (§CORE3-SMP: an MMU-off stack spill of the secondary core-id reloaded
+stale-cacheable after the MMU turns on) flagged three analogous aarch64 files as out of the Pi
+lane — `smp_virt.rs`, `boot_virt.rs`, `boot_tegra.rs`. This arc audits all three for the same
+mismatched-attributes coherency hazard and fixes the one that carries it, so the Orin PSCI path
+is **born fixed** rather than patched after a (currently metal-blocked) bench regression. The
+hazard is **QEMU-invisible** (TCG models no caches) and **image-layout-deterministic**, so the
+verdict is the disassembly, not the QEMU battery.
+
+**Audit verdict.**
+
+* **`boot_virt.rs` — SOUND (BSP-only drop, no incoming-id spill).** `drop_to_el1(ram_gib_mask)`
+  runs on the boot core alone; there is no PSCI-delivered core-id argument to spill. The one
+  MPIDR concern — an EL1 `mrs MPIDR_EL1` reading `VMPIDR_EL2` — is handled: the naked
+  `drop_el2_to_el1_virt` seeds `VMPIDR_EL2` from the real MPIDR (`mrs x0, mpidr_el1; msr
+  vmpidr_el2, x0`) as its first pair, strictly before the `eret`, and `enable_el1_regime`
+  contains no MPIDR read. The EL1 MMU is armed dormant at EL2 (`SCTLR_EL1.M=1` before the eret),
+  so EL1 never runs MMU-off. Nothing to fix.
+* **`boot_tegra.rs` — SOUND (same shape, `l1_pa` signature audited).** `drop_to_el1(l1_pa)` is
+  likewise boot-core-only. The differing signature (`l1_pa` = `MmuInfo::ttbr0_el1`) only flows to
+  `TTBR0_EL1` inside `enable_el1_regime` — no MPIDR interaction. The VMPIDR seed order is correct:
+  `drop_el2_to_el1_tegra` seeds `VMPIDR_EL2`/`VPIDR_EL2` (after `daifset` masking) before the
+  `eret`, and neither `enable_el1_regime` nor the mask touch MPIDR. Nothing to fix.
+* **`smp_virt.rs` — HAZARD PRESENT (fixed).** `__secondary_rust_virt` receives the PSCI context
+  id (the **linear core index** — deliberately not MPIDR Aff0, which is 0 on every Tegra234
+  cluster) in x0 with the MMU off, calls `enable_mmu_virt()` (MMU on), then uses the id for
+  `percpu::init`, the `CORE_READY` index, and `serial_println!`. Pre-fix codegen (llvm-objdump of
+  the retained `virt` build) showed the exact CORE3 forcing shape:
+  `5e740: str x0,[sp]` (MMU-off spill of the id) then `5e780: msr SCTLR_EL2,x8` (MMU on) then
+  `5e8dc: bl __print` reading `&core = sp+0` by reference then `5e8e0: ldr x0,[sp]` (cacheable
+  reload) feeding the `CORE_READY[core]` Release store. Identical to the Pi: `serial_println!`'s
+  Display-by-reference makes the MMU-off stack copy load-bearing. The existing
+  `clean_invalidate_range(SECONDARY_STACKS)` before `CPU_ON` narrows but does not delete the
+  window (it clears BSP-seeded lines once; it does not make the spill/reload structurally MMU-on).
+
+**The fix (`smp_virt.rs`, born on the idiom, with the Orin correction).** The Pi's literal
+"re-derive from `MPIDR_EL1 & 0xff`" cannot apply — the linear index is not recoverable from Aff0
+on a multi-cluster part. Instead: the BSP publishes the linear-index to packed-affinity table
+(`AFF_BY_INDEX` + an `N_CORES_PUB` Release) before the first `CPU_ON`; the secondary ignores the
+now-advisory context id and, **after the MMU is on**, reads its live `MPIDR_EL1` affinity
+(`gic::this_affinity()`, full packed `{Aff3,Aff2,Aff1,Aff0}` — never a bare Aff0 mask) and matches
+it against the table to recover its own index, parking in `wfe` on no match (the graceful
+BSP-timeout failure mode). Post-fix codegen confirms the deletion: `5b5e4: msr SCTLR_EL2` (MMU on)
+then `5b5f4: mrs MPIDR_EL1` (id derived MMU-on); the only `[sp]` stores of the derived id
+(`5b620: str x19,[sp]`) and its reload (`5b79c: ldr x0,[sp]`) are both MMU-on and
+cacheable-coherent; the advisory x0 is never spilled, and the only MMU-off stores are the
+non-reloaded callee-saved saves (the function is `-> !`, no epilogue). The stale-line window is
+structurally deleted, not patched — mirroring §CORE3-SMP with the multi-cluster affinity decode.
+
+**Gate + status.** `./arroyo check` green (both arches, with and without `tegra`); `test-arm`
+GICv3 SMP path brings all 3 secondaries online (each re-derives its correct index), BSP/AP SGIs
+deliver 3/3, CAPSTONE 6/6; plain `test-arm` (GICv2 single-core) byte-unaffected (smp_virt
+runtime-gated on `is_v3`). QEMU proves only non-regression — the hazard is QEMU-invisible. There
+is **no metal leg for this arc**: the tegra binary DCEs `smp_virt` (JM5 Orin PSCI is parked on the
+external Tegra BL31/MCE `CPU_ON` RAS fault — see "JM5 result"), so the tegra image is byte-unchanged
+by this fix, and the disassembly is the proof of record. When the Orin `CPU_ON` firmware wall is
+cleared, the bring-up is already born fixed.

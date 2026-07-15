@@ -93,6 +93,18 @@ static CORE_READY: [AtomicBool; MAX_CORES] = [const { AtomicBool::new(false) }; 
 /// AP → BSP path is byte-identical to the old hardcoded `send_sgi(0, …)`.
 static BSP_AFFINITY: AtomicU32 = AtomicU32::new(0);
 
+/// The packed MPIDR affinity of each **linear core index** (`AFF_BY_INDEX[k]` = the affinity of linear
+/// core `k`; index 0 = the BSP), published by the BSP before the first `CPU_ON`. A woken secondary uses
+/// it to recover its OWN linear index by matching its live `MPIDR_EL1` affinity — the structural fix for
+/// the CORE3-class hazard: the PSCI context id delivered in x0 is spilled to the stack with the MMU OFF
+/// and can be reloaded cacheable-stale after `enable_mmu_virt` on real silicon (QEMU-invisible; see
+/// `__secondary_rust_virt`). Re-deriving the index MMU-ON deletes that stale-line window. Aff0 is NOT a
+/// core id on multi-cluster Tegra234 (Aff0=0 on every core, the cluster is in Aff2/Aff1), so the match is
+/// on the FULL packed affinity — never a bare Aff0 mask. `N_CORES_PUB`'s Release publishes the whole
+/// table; a secondary's Acquire load of it orders the affinity reads after the BSP's stores.
+static AFF_BY_INDEX: [AtomicU32; MAX_CORES] = [const { AtomicU32::new(0) }; MAX_CORES];
+static N_CORES_PUB: AtomicU32 = AtomicU32::new(0);
+
 /// One secondary's boot/idle stack (64 KiB). AArch64 SP must stay 16-aligned; `align(16)` + a
 /// power-of-two size guarantee it. Lives in BSS (zeroed by the loader). Slot 0 is unused (the BSP has
 /// the firmware's stack); each secondary takes the slot for its **linear index**, computed by
@@ -131,8 +143,12 @@ struct SecondaryCtx {
 static mut SEC_CTX: SecondaryCtx =
     SecondaryCtx { mair: 0, tcr: 0, ttbr0: 0, sctlr: 0, cptr: 0, hcr: 0 };
 
-// The secondary entry stub. Runs at EL2 with the MMU OFF. x0 = PSCI context id = **linear core index**
-// (authoritative; MPIDR Aff0 is not a core id on multi-cluster silicon, so we do NOT read MPIDR here).
+// The secondary entry stub. Runs at EL2 with the MMU OFF. x0 = PSCI context id = **linear core index**,
+// used HERE only to pick this core's stack (MPIDR Aff0 is not a core id on multi-cluster silicon, so we
+// do NOT read MPIDR in the stub). NOTE: x0 is ADVISORY past the MMU turn-on — `__secondary_rust_virt`
+// re-derives the index from MPIDR affinity once the MMU is on, because the compiler spills this MMU-off
+// argument to the stack and a cacheable reload of it can hit a stale line on >1 MiB images (the
+// CORE3-SMP hazard; see `__secondary_rust_virt` + arch_arm64.md §ORIN-SMP). The asm is unchanged.
 // It sets SP to this core's stack top, then replays — *before any compiler-generated code* — the two
 // EL2 regime bits a reset core does not inherit and that gate everything after: `HCR_EL2` (Part B, so
 // the Rust translation-register replay is interpreted under the BSP's E2H/TGE) then `CPTR_EL2` (Part C,
@@ -215,15 +231,48 @@ unsafe fn enable_mmu_virt() {
 }
 
 /// Rust entry for a PSCI-started secondary. Called from `_secondary_start_virt` with the MMU still OFF
-/// and this core's stack set (x0 = **linear core index**, the PSCI context id — NOT MPIDR Aff0). Brings
-/// the core up to parity with the BSP's per-core state, then parks in WFI able to service SGIs. Never
-/// returns.
+/// and this core's stack set. The incoming `_advisory` argument (x0 = the PSCI context id the stub used
+/// to select this core's stack) is **advisory only past the MMU turn-on** and deliberately ignored for
+/// everything after: on real silicon the compiler spills that MMU-off argument to the stack
+/// (`str x0, [sp]`) and reloads it CACHEABLE after `enable_mmu_virt` (for the `serial_println!` — which
+/// takes it by-reference — and the `CORE_READY` index), so it can hit a stale line the way the Pi
+/// CORE3-SMP regression did (mismatched-attributes coherency; QEMU-invisible, image-layout-deterministic;
+/// see smp.rs / arch_arm64.md §CORE3-SMP + §ORIN-SMP). We re-derive this core's linear index FRESH from
+/// `MPIDR_EL1` AFTER the MMU is on, matching the full packed affinity against the BSP-published
+/// `AFF_BY_INDEX` (Aff0 alone is not a core id on multi-cluster Tegra234), so every store/load of the id
+/// is cacheable-coherent. Brings the core up to parity with the BSP's per-core state, then parks in WFI
+/// able to service SGIs. Never returns.
 #[unsafe(no_mangle)]
-extern "C" fn __secondary_rust_virt(core_raw: u64) -> ! {
-    let core = core_raw as usize; // linear index; indexes the stack / per-CPU block / CORE_READY slot
+extern "C" fn __secondary_rust_virt(_advisory: u64) -> ! {
     // MMU on FIRST (replaying the BSP's EL2 regime), before any lock/atomic/FP. `serial_println!` below
     // takes a spinlock, so nothing may print before this. (HCR_EL2/CPTR_EL2 were replayed in the stub.)
     unsafe { enable_mmu_virt() };
+    // Re-derive this core's linear index from MPIDR affinity with the MMU ON — the structural fix for the
+    // CORE3-class stale-line hazard. `this_affinity()` reads MPIDR_EL1 live (at EL2 it returns the
+    // physical affinity — VMPIDR only redirects EL1 reads), so this and every use of the derived index
+    // execute cacheable-coherent, with no MMU-off store / MMU-on reload for a stale line to poison. The
+    // match is on the full packed affinity, never a bare Aff0 mask (Aff0=0 on every Tegra234 core).
+    let aff = gic::this_affinity();
+    let n = N_CORES_PUB.load(Ordering::Acquire) as usize;
+    let mut derived = usize::MAX;
+    let mut i = 1; // a secondary is never index 0 (the BSP); start the search past it
+    while i < n && i < MAX_CORES {
+        if AFF_BY_INDEX[i].load(Ordering::Relaxed) == aff {
+            derived = i;
+            break;
+        }
+        i += 1;
+    }
+    // Unknown/garbage affinity (a core the BSP never published, or index 0/out of range): park in a
+    // low-power WFE loop rather than index CORE_READY/percpu out of bounds. A parked core is exactly the
+    // graceful failure the BSP times out on (WARNING … did not come online), never worse. No lock or
+    // shared state is touched before this point (only the MMU replay + the affinity reads).
+    if derived == 0 || derived >= MAX_CORES {
+        loop {
+            unsafe { core::arch::asm!("wfe", options(nomem, nostack, preserves_flags)) };
+        }
+    }
+    let core = derived; // linear index; indexes the stack / per-CPU block / CORE_READY slot
     // Per-core VBAR_EL2 (+ HCR_EL2 IMO/FMO/AMO so a physical IRQ taken at EL2 targets EL2) — matches the
     // BSP; installed before IRQs are unmasked.
     exceptions::install();
@@ -427,6 +476,16 @@ pub fn start_secondaries(dtb_addr: u64, dtb_size: usize) {
             if idx == 0 { " (BSP)" } else { "" }
         );
     }
+
+    // Publish the linear-index → affinity table BEFORE any CPU_ON, so a woken secondary can recover its
+    // OWN linear index by matching its live MPIDR affinity (the CORE3-class fix — `__secondary_rust_virt`
+    // no longer trusts the MMU-off-spilled context id). The per-slot Relaxed stores are ordered before a
+    // secondary's reads by the `N_CORES_PUB` Release below pairing with the secondary's Acquire; the
+    // stack/SEC_CTX cache maintenance already issued (`dsb sy`) also precedes the first CPU_ON.
+    for idx in 0..n_cores {
+        AFF_BY_INDEX[idx].store(aff_by_index[idx], Ordering::Relaxed);
+    }
+    N_CORES_PUB.store(n_cores as u32, Ordering::Release);
 
     // Presence gate (JM5 attempt-1 fix): the Tegra234 GIC-600 exposes redistributor frames for the whole
     // die's core slots, but the Nano is a 6-core part — a `CPU_ON` to a fuse-disabled phantom core is a
