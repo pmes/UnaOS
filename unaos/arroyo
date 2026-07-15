@@ -63,6 +63,11 @@ _feats=""
 # image — the record echoes the live SEL so the operator can verify which experiment ran. Default
 # OFF; when unset the feature vanishes and the tegra image is byte-identical to baseline.
 [ -n "${UNAOS_SMPPROBE:-}" ] && _feats="${_feats}smpprobe,"
+# ORIN-SMP-3: UNAOS_TEGRASMP=1 arms the real 6-core Orin SMP kick-off (tegra-only;
+# arch/aarch64/smp_virt.rs::start_secondaries_tegra + the fdt_tegra `/cpus` presence enumerator).
+# Default OFF; when unset the feature (and the kick-off) vanish and the tegra image is byte-identical
+# to baseline. The `tegrasmp` feature implies `tegra`. See arch_arm64.md §ORIN-SMP-3.
+[ -n "${UNAOS_TEGRASMP:-}" ] && _feats="${_feats}tegrasmp,tegra,"
 if [ -n "$_feats" ]; then
     KERNEL_FEATURES="--features ${_feats%,}"
     echo -e "${COLOR_YELLOW}⚡ kernel features: ${_feats%,}${COLOR_RESET}"

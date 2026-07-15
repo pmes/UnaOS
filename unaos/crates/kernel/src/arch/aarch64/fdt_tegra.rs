@@ -1072,3 +1072,72 @@ pub fn nvdisplay_base(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Opti
     }
     Some((base, size))
 }
+
+/// ORIN-SMP-3: enumerate the REAL present CPU cores from the firmware DTB `/cpus` node — the ONLY
+/// presence oracle for the tegra SMP kick-off (arch_arm64.md §ORIN-SMP-3, RIDER 1). Fills `out` with
+/// each `cpu@…` node's packed affinity {Aff3[31:24],Aff2[23:16],Aff1[15:8],Aff0[7:0]} (the form
+/// `gic::this_affinity()` / `smp_virt` use) and returns the count.
+///
+/// **Why `/cpus`, not `AFFINITY_INFO` or the redistributor walk (the hard-won oracle discrepancy,
+/// silicon-measured on the 6-core Nano — RIDER 3):** `AFFINITY_INFO` answers a *valid* state (0/1/2)
+/// for 12 affinity slots (the die's full 12-core layout) even though only 6 are fused-in — it is a
+/// firmware topology table that cannot be trusted for presence. The GIC-600 exposes 8 redistributor
+/// frames (the die's core slots), also more than the 6 real cores. Only the DTB `/cpus` node, which
+/// NVIDIA's UEFI populates from the fused SKU, names exactly the 6 present cores. Trusting the wrong
+/// oracle re-opens the JM5 attempt-1 wall (a `CPU_ON` to a fuse-disabled phantom is a fatal RAS UE).
+/// So the tegra kick-off's target list is produced HERE, from the FDT walk alone.
+///
+/// A CPU's `reg` on `/cpus` is its MPIDR affinity in MPIDR layout (Aff3 at bits[39:32]); the number of
+/// cells is `/cpus/#address-cells` (1 on Tegra234 — a single 32-bit affinity; 2 is honored for a
+/// 64-bit affinity). Read-only RAM walk, pre-heap, EL2; a malformed/unmapped blob yields 0 (the caller
+/// STOPs rather than guessing). Bounded by `out.len()`.
+#[cfg(feature = "tegrasmp")]
+pub fn cpu_affinities(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64, out: &mut [u32]) -> usize {
+    if dtb_addr == 0 || dtb_size == 0 {
+        return 0;
+    }
+    let g_lo = dtb_addr >> 30;
+    let g_hi = (dtb_addr + dtb_size as u64 - 1) >> 30;
+    let mapped = |g: u64| g == 0 || (g < 64 && (ram_gib_mask >> g) & 1 != 0);
+    if !mapped(g_lo) || !mapped(g_hi) {
+        return 0;
+    }
+    let blob = unsafe { core::slice::from_raw_parts(dtb_addr as *const u8, dtb_size) };
+    let Some(fdt) = Fdt::new(blob) else {
+        return 0;
+    };
+    // /cpus #address-cells (DT default for /cpus is 1 — a single-cell MPIDR affinity).
+    let ac = {
+        let p = fdt.prop_at(b"/cpus", b"#address-cells");
+        if p.n >= 1 && p.words[0] == 2 { 2 } else { 1 }
+    };
+    let mut n = 0usize;
+    fdt.for_each_prop(|e| {
+        if n >= out.len() || e.name != b"reg" || e.depth != 3 {
+            return;
+        }
+        // A DIRECT `/cpus/cpu@…` child only: path is exactly "/cpus/<leaf>" with leaf = "cpu@…" and
+        // no deeper '/' (so a `cpu-map`/thermal grandchild's reg can never masquerade as a core).
+        let p = e.path;
+        if p.len() <= 6 || &p[..6] != b"/cpus/" {
+            return;
+        }
+        let leaf = &p[6..];
+        if leaf.len() < 4 || &leaf[..4] != b"cpu@" || leaf.iter().any(|&b| b == b'/') {
+            return;
+        }
+        let words = PropWords::capture(blob, e.val_off, e.val_len);
+        let mpidr = if ac == 2 && words.n >= 2 {
+            ((words.words[0] as u64) << 32) | words.words[1] as u64
+        } else if words.n >= 1 {
+            words.words[0] as u64
+        } else {
+            return;
+        };
+        // MPIDR layout (Aff3 @ bits[39:32]) -> packed GICR-contiguous form (Aff3 @ bits[31:24]).
+        let packed = ((((mpidr >> 32) & 0xff) as u32) << 24) | (mpidr as u32 & 0x00ff_ffff);
+        out[n] = packed;
+        n += 1;
+    });
+    n
+}
