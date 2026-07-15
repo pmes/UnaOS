@@ -34,9 +34,21 @@ touched; **absolute** (default `usb-tablet`, motion via QMP `input-send-event` a
 (proto=0 absolute) + counter `1/32/64 reports, last x/y` + MISSION SUCCESS; **relative** (`-device
 usb-mouse,bus=xhci.0`, QMP rel motion) → enum witness (proto=2 relative) + counter `last dx=5 dy=3` +
 MISSION SUCCESS; `UNAOS_SKIP_XHCI=1` → zero MOUSE lines, skip banner, no panic; default `test` → MISSION
-SUCCESS + one enum witness + zero counter lines (silent, no motion). **Metal-pending** — the attended rMBP
-bench (real external USB mouse on the storage-bench topology) is LC-x86-coordinated; the built-in trackpad
-is EHCI (invisible to this driver).
+SUCCESS + one enum witness + zero counter lines (silent, no motion). **✅ METAL-CONFIRMED 2026-07-15**
+(attended rMBP bench, LC-x86 coordinating; serial `~/unaos-bench/rmbp-mouse-metal-2026-07-15.log`): a real
+Logitech mouse (`046d:c534`) enumerated `proto=2 relative` on the real Panther-Point xHCI, streamed **1824+
+interrupt-IN reports** with correct signed deltas (all directions), buttons `0x00`+`0x01` decoded, the
+dup-Success guard held (no doubling), the **red cursor tracked on-screen** (GUI build, Peter-witnessed —
+"IT WORKS"), zero faults. FTDI mirror confirmed active on GUI builds too. The built-in trackpad is EHCI
+(invisible to this driver) — internal keyboard/trackpad-on-xHCI is the PORTSW-1 arc.
+
+**⚠ Enumeration findings (real, → the XENUM-1 follow-up; NOT mouse-code defects — the keyboard proved the
+HID path):** three xHCI enumeration-robustness gaps surfaced before the clean pre-plugged boot: (1) a
+hub-downstream device-descriptor read returned all-zeros (`vid=0000`, "no HID interrupt endpoint") — the
+vid=0000 intermittency, needs a zero/short-read retry; (2) a SuperSpeed hub read **0 downstream ports**
+(reads the USB2 hub descriptor 0x29, SS hubs need 0x2A) — devices behind it stranded; (3) a hot-plug connect
+was dropped (`CSC during enumeration … not re-queuing`) — a power-cycle with the device pre-plugged is the
+current workaround. Seed: `~/.claude/plans/unaos/queue/unaos-xenum-1.md`.
 
 ## hw-pi4 track — 2026-07-15 (K7 — legacy-sidecar enforcement removed; NS-SPAN WATCH rider)
 
