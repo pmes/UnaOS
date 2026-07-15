@@ -6815,7 +6815,7 @@ fn sys_fgrant_revoke_2phase(
     // DEEPER than the F3-era bound. Accepted on the record: the K5 fusion mechanism is preserved verbatim, and
     // the deeper IRQ-masked window is a benchable latency watch-item (the K6 bench card measures it), not a
     // correctness risk. See the K6-M3 NS-SPAN NOTE at the native wrappers.
-    let _ns = ns_lock();
+    let _ns = ns_lock(); #[cfg(feature = "nsspan")] let _nsspan = NsSpanProbe::new(&NSSPAN_REVOKE); // K7 WATCH ns-hold probe (newline-neutral inline so knob-off is byte-identical; declared after _ns -> drops first, ns still held)
     // Snapshot the current ACL and drop the target grantee (matched by its durable persistent principal — the
     // on-disk key; the snapshot carries ppids only). A vanished row (raced unlink) leaves nothing to revoke.
     let Some((row_owner, mut grants)) = owned_snapshot_row(dir_lba, dir_off) else {
@@ -8391,7 +8391,7 @@ pub fn u7_launcher(demo_cpu: usize) {
     // full-row re-persist can no longer resurrect a revoked grant (snapshot + disk-narrow + in-RAM commit now
     // span one ns) + the create-serialization gate. Its own uncounted `:: K5-lockspan: … PASS ::` line;
     // self-cleaning (leaves no owned row on the metal card).
-    k5_lockspan_launcher();
+    k5_lockspan_launcher(); #[cfg(feature = "nsspan")] nsspan_report(); // K7 WATCH: emit :: NS-SPAN: … :: after K3/K5 drive the sites (newline-neutral inline; knob-off byte-identical)
     // IMAGE_SHA256 code-signing: prove the SHA-256 primitive (FIPS KATs) + that it discriminates program
     // IMAGES, closing the "same 8.3 name = same principal" residual (the loader now mints IMAGE_SHA256). Its
     // own uncounted `:: IMG-SIG: … PASS ::` line; read-only, no disk write.
@@ -9558,8 +9558,12 @@ fn atr_clear_row(fs: &crate::fs::fat::FatFs, dir_lba: u64, dir_off: u32) -> bool
     true // no matching row — already public on disk
 }
 
-/// K1 M2.4: rebuild the in-RAM owner/grants ACL from `UNAFS.ATR` — the mount-time restore that makes ownership
-/// SURVIVE REBOOT. Reads + validates the header against the LIVE binding (any reject => the WHOLE volume is
+/// K1 M2.4: rebuild the in-RAM owner/grants ACL from `UNAFS.ATR`. **K7 (2026-07-15): FIXTURE-ONLY.** The
+/// production boot path (`atr_maybe_boot_rebuild`) NO LONGER calls this — legacy sidecar rows may not
+/// enforce. Its sole remaining caller is the `k1_corrupt` torn-row parse-guard (a self-cleaning scratch
+/// fixture that plants + tears its OWN row to prove the sidecar parse fails closed to PUBLIC, never a
+/// forged owner — the same `atr_parse_row`/`atr_header_status` primitives the retained migration pass
+/// relies on). Reads + validates the header against the LIVE binding (any reject => the WHOLE volume is
 /// all-public, the fail-closed pre-U6 baseline), then for each committed named-owner row RE-RESOLVES the file
 /// BY NAME (`find_located`, defeating the recycled-directory-slot hazard — a stale `(dir_lba, dir_off)` is only a
 /// hint), cross-checks `first_cluster` when both sides are nonzero (identity corroboration; a mismatch skips the
@@ -9873,7 +9877,7 @@ fn native_persist_grants(dir_lba: u64, dir_off: u32) -> bool {
     if owned_owner_ppid(dir_lba, dir_off).kind == PRIN_NONE {
         return true; // anonymous owner — nothing persists (the battery path; no disk touch, no ns)
     }
-    let _ns = ns_lock();
+    let _ns = ns_lock(); #[cfg(feature = "nsspan")] let _nsspan = NsSpanProbe::new(&NSSPAN_GRANTS); // K7 WATCH ns-hold probe (newline-neutral inline; knob-off byte-identical)
     let Some((owner_ppid, grants)) = owned_snapshot_row(dir_lba, dir_off) else {
         return true; // row vanished (raced clear) between the probe and the ns — nothing to persist
     };
@@ -9887,7 +9891,7 @@ fn native_persist_grow(dir_lba: u64, dir_off: u32, new_first: u32) -> bool {
     if owned_owner_ppid(dir_lba, dir_off).kind == PRIN_NONE {
         return true; // anonymous owner — the whole battery incl. the u10 GROW.BIN fixture; zero I/O
     }
-    let _ns = ns_lock();
+    let _ns = ns_lock(); #[cfg(feature = "nsspan")] let _nsspan = NsSpanProbe::new(&NSSPAN_GROW); // K7 WATCH ns-hold probe (newline-neutral inline; knob-off byte-identical)
     let Some((owner_ppid, grants)) = owned_snapshot_row(dir_lba, dir_off) else {
         return true;
     };
@@ -9912,13 +9916,19 @@ fn native_persist_grow(dir_lba: u64, dir_off: u32, new_first: u32) -> bool {
     )
 }
 
-/// K1 M2.4 / K2 / K6: the REAL-BOOT mount-rebuild hook — restore persisted ownership before EL0 programs
-/// run. GATED on `by_name_spawn_multivalued()` (TRUE since K2). K6: first MIGRATE any committed
-/// IMAGE_SHA256 sidecar rows onto native attributes (native-before-delete), then rebuild OWNED_FILES
-/// from the NATIVE store, THEN fall back to any remaining (un-migrated PROGRAM_NAME) sidecar rows — so a
-/// row always enforces from one store or the other, never neither. On QEMU (fresh-per-build FAT) both
-/// stores are empty here, so ZERO rows install and the boot path stays byte-identical; the live effect
-/// is on metal. The MECHANISM is proven independently by the K6 witness + the K1/K2/K3/K5 launchers.
+/// K1 M2.4 / K2 / K6 / K7: the REAL-BOOT mount-rebuild hook — restore persisted ownership before EL0
+/// programs run. GATED on `by_name_spawn_multivalued()` (TRUE since K2). K6: first MIGRATE any committed
+/// IMAGE_SHA256 sidecar rows onto native attributes (native-before-delete), then rebuild OWNED_FILES from
+/// the NATIVE store — the sole enforcement store.
+///
+/// K7 (2026-07-15, wholesale legacy-sidecar ENFORCEMENT removal): the sidecar FALLBACK-REBUILD leg
+/// (`atr_rebuild_into_owned`) is DELETED from this boot path. Legacy `PROGRAM_NAME` sidecar rows are NEVER
+/// adopted as owners in production — a card carrying ONLY legacy rows enforces PUBLIC-ONLY after this arc
+/// (fail-closed). The MIGRATION pass is RETAINED (committed IMAGE_SHA256 rows still cross native-before-
+/// delete on every boot, pending Peter declaring the card fleet fully crossed); only the "legacy rows can
+/// enforce" machinery is gone. On QEMU (fresh-per-build FAT) both the sidecar and the native store are
+/// empty here, so ZERO rows install and the boot path stays byte-identical; the live effect is on metal.
+/// The MECHANISM is proven independently by the K6 witness + the K1/K2/K3/K5 launchers.
 fn atr_maybe_boot_rebuild() {
     if !by_name_spawn_multivalued() {
         return; // cross-reboot enforcement gated off (single-program world) -> no rebuild, no I/O
@@ -9928,8 +9938,7 @@ fn atr_maybe_boot_rebuild() {
     }
     if let Ok(fs) = crate::fs::fat::mount() {
         let _ = native_migrate_from_sidecar(&fs); // K6: move committed IMAGE_SHA256 rows to native first
-        let _ = native_rebuild_into_owned(&fs); // then enforce from the native store
-        let _ = atr_rebuild_into_owned(&fs); // fallback: any un-migrated (legacy PROGRAM_NAME) sidecar rows
+        let _ = native_rebuild_into_owned(&fs); // K7: enforce SOLELY from the native store (no legacy fallback)
     }
 }
 
@@ -11121,7 +11130,9 @@ fn k6_migrate_selftest() {
             let p2 = atr_persist_row(&fs, legn, 0x66, 0, K6_LEG_LBA, K6_LEG_OFF, leg_owner, &empty);
             let n1 = native_migrate_from_sidecar(&fs);
             // bit5: exactly the IMAGE row migrated — its native row carries the reverse-equal owner, its
-            // sidecar row is gone, and the legacy PROGRAM_NAME sidecar row STAYS (un-migrated, enforcing).
+            // sidecar row is gone, and the legacy PROGRAM_NAME sidecar row STAYS (un-migrated). K7: a
+            // retained legacy row no longer ENFORCES (the boot fallback rebuild is deleted) — it simply
+            // persists inertly until a card re-prep clears it; this witness proves migration leaves it be.
             let img_native_ok = crate::fs::unafs::native_acl_read(K6_IMG_LBA, K6_IMG_OFF)
                 .is_some_and(|r| principal_from_native(&r.owner) == Some(img_owner));
             let img_sidecar_gone = atr_row_first_cluster(&fs, K6_IMG_LBA, K6_IMG_OFF).is_none();
@@ -13902,4 +13913,64 @@ fn uowner_run(demo_cpu: usize) {
             on_disk as u8
         );
     }
+}
+
+// =====================================================================================================
+// K7 WATCH rider (NS-SPAN) — MEASURE the IRQ-masked namespace-lock hold at the three fused persist sites
+// (`sys_fgrant_revoke_2phase`, `native_persist_grants`, `native_persist_grow`). Default-OFF, byte-identical
+// when off: the whole rider is `#[cfg(feature = "nsspan")]`-gated AND placed at end-of-file / inlined
+// newline-neutral at each site, so a knob-off build has IDENTICAL physical line numbers to a build without
+// the rider — the panic `Location` data embedded in `.rodata` (loaded) does not move (the core3probe idiom,
+// hardened for line-number stability). Knob-on: an RAII probe reads CNTPCT at ns-take and, on Drop (which
+// fires while the `_ns` guard is STILL held — the probe is declared AFTER `_ns`, so it drops FIRST), reads
+// CNTPCT again and folds the delta into a per-site worst-case `AtomicU64` via `fetch_max`. No locks, no heap
+// in the measurement path. `nsspan_report()` emits ONE serial line after the K3/K5 fixtures have exercised
+// all three sites. This closes the Option-A deeper-masked-span bench WATCH (the K6-M3 verdict) with a real
+// metal number: the fused revoke/re-persist now spans a journaled MULTI-SECTOR native unafs write, deeper
+// than the F3-era single-sector bound — this measures HOW deep on silicon.
+// =====================================================================================================
+#[cfg(feature = "nsspan")]
+static NSSPAN_REVOKE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "nsspan")]
+static NSSPAN_GRANTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "nsspan")]
+static NSSPAN_GROW: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// K7 WATCH: an RAII probe that measures the ns-lock hold at ONE site. Constructed right AFTER `ns_lock()`
+/// (declared after `_ns`, so on scope exit it drops BEFORE `_ns` — the ns is still held when we read the
+/// release timestamp). `Drop` folds `cntpct(now) - start` into `site`'s worst-case. No heap, no lock.
+#[cfg(feature = "nsspan")]
+struct NsSpanProbe {
+    start: u64,
+    site: &'static core::sync::atomic::AtomicU64,
+}
+#[cfg(feature = "nsspan")]
+impl NsSpanProbe {
+    #[inline]
+    fn new(site: &'static core::sync::atomic::AtomicU64) -> Self {
+        NsSpanProbe { start: super::timer::cntpct(), site }
+    }
+}
+#[cfg(feature = "nsspan")]
+impl Drop for NsSpanProbe {
+    #[inline]
+    fn drop(&mut self) {
+        let delta = super::timer::cntpct().wrapping_sub(self.start);
+        self.site.fetch_max(delta, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// K7 WATCH: emit the per-site worst-case ns-lock hold (in CNTPCT ticks) + the counter frequency. Called
+/// once from `u7_launcher` after the K3/K5 fixtures (which drive all three sites). Reads three atomics —
+/// no lock, no disk. A site never exercised reports 0.
+#[cfg(feature = "nsspan")]
+fn nsspan_report() {
+    use core::sync::atomic::Ordering;
+    serial_println!(
+        ":: NS-SPAN: worst revoke={} grants={} grow={} ticks (freq {}) ::",
+        NSSPAN_REVOKE.load(Ordering::Relaxed),
+        NSSPAN_GRANTS.load(Ordering::Relaxed),
+        NSSPAN_GROW.load(Ordering::Relaxed),
+        super::timer::cntfrq(),
+    );
 }

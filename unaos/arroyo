@@ -514,6 +514,14 @@ kernel8() {
         K8_FEATS="${K8_FEATS},core3probe"
         echo -e "${COLOR_YELLOW}  • UNAOS_CORE3PROBE: secondary stub raw-dumps MPIDR/EL/x0 to PL011 (see scripts/core3-probe-bench.md)${COLOR_RESET}"
     fi
+    # NS-SPAN (K7 WATCH rider): UNAOS_NSSPAN=1 adds the `nsspan` feature — instrument the IRQ-masked
+    # namespace-lock hold at the three fused persist sites (revoke/grants/grow), tracking the per-site
+    # worst-case CNTPCT delta and emitting a `:: NS-SPAN: … ::` line after the K3/K5 fixtures. Closes the
+    # Option-A deeper-masked-span bench WATCH. OFF => byte-identical (the whole rider is cfg-gated).
+    if [ -n "${UNAOS_NSSPAN:-}" ]; then
+        K8_FEATS="${K8_FEATS},nsspan"
+        echo -e "${COLOR_YELLOW}  • UNAOS_NSSPAN: instrument the ns-lock hold at revoke/grants/grow, emit :: NS-SPAN: … ::${COLOR_RESET}"
+    fi
     echo -e "${COLOR_YELLOW}⚡ Building bare-metal kernel8.img (Pi 4, microSD-slot boot)...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/kernel"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/kernel/pi-baremetal.ld" \
