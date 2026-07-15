@@ -178,14 +178,24 @@ inspection of `smp.rs`/`boot.rs`, so per the arc's STOP tripwire **no speculativ
 reservation or stack relocation was shipped** — there is no identified structure at the
 boundary for a reservation to protect.
 
-**Next step (attended Pi bench).** Instrument `_secondary_start` to raw-write to the
-PL011 (`0xFE201000`, Device, MMU-off, among the first instructions, no stack) — for each
-core: raw `MPIDR_EL1`, `CurrentEL`, and the entry value it was branched from — **before**
-any Rust, on a >1 MiB build. That disambiguates the three surviving mechanisms (core 3
-enters past the `mrs` with `x0==0` / `MPIDR` genuinely reads 0 / branch target is wrong)
-and settles whether the cause is firmware delivery or an L2-boundary cache effect. Until
-then, treat core-3 bring-up on >1 MiB images as a known, isolated defect: cores 1-2 plus
-the BSP are unaffected and the 3-core system is otherwise healthy.
+**⚡ PROBE VERDICT (attended Pi bench, 2026-07-15 — INVERTS the conclusion above).** The
+`core3probe` instrumentation (merged `da47846`; raw PL011 dump as the first instructions of
+`_secondary_start`, MMU-off, no stack) captured core 3's record clean on a real BCM2711 boot
+where core 3 subsequently failed: **`[03E2X0]` — MPIDR Aff0 = 3, CurrentEL = EL2, arrival
+x0 = 0 — on the same boot as the phantom "core 0 online" + "core 3 did not come online"**
+(log `~/unaos-bench/core3probe-boot3-2026-07-15.log`; build 712656 B, the >1 MiB regime).
+Decision-table row 1: firmware/armstub delivery of core 3 is CORRECT and `MPIDR_EL1` does
+NOT read 0. Both surviving below-kernel mechanisms are REFUTED — **the id-0 corruption is
+KERNEL-SIDE, after the asm stub**: somewhere in `__secondary_rust`/`drop_to_el1`/the
+`core_raw` argument path, a correctly-read id 3 becomes 0, only on ≥1 MiB images (a
+size-dependent spill/clobber or stack/cache interaction past the prologue — hypothesis 5
+above, "core_raw is preserved," is the one the probe overturns; the compiler-spill
+assumption is now the prime suspect and must be verified against the actual codegen of the
+>1 MiB build). The fix arc re-scopes onto that path. Probe-idiom note for any multi-core
+rerun: the three secondaries write the PL011 DR unarbitrated, so racing records drop or
+corrupt (QEMU's modeled FIFO hid this; only one clean record survives per metal boot) — add
+a UART mutex or MPIDR-staggered delay if a future probe needs all three in one boot. Until
+the fix lands, core-3-down on >1 MiB images remains the expected signature (30/32).
 
 **Scheduler on the `virt` path — the boot core, since JC3.** The aarch64 scheduler
 was `#[cfg(feature = "baremetal")]`-gated and coupled to EL1 (`ELR_EL1`/`SPSR_EL1`
