@@ -1342,6 +1342,16 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
         dtb_size,
     });
 
+    // ORIN-SMP-3 (the real 6-core Orin bring-up, `UNAOS_TEGRASMP=1`): with the `tegrasmp` feature
+    // armed, kick off the secondaries HERE — after JM4 (GIC/timer/heap/SMC all live) and while the
+    // BSP is still at EL2 (before the JM6 drop, so the woken cores replay the EL2 regime). Presence is
+    // sourced from the DTB `/cpus` node ALONE (RIDER 1); the kick-off STOPs (single-core) if `/cpus`
+    // names nothing. Default OFF => the whole call + the enumerator vanish and the tegra image is
+    // byte-identical to baseline. The metal verdict is the attended Orin bench (see §ORIN-SMP-3); on
+    // firmware where the JM5 `CPU_ON` wall still stands this would RAS-fault, so it is knob-gated.
+    #[cfg(feature = "tegrasmp")]
+    unaos_kernel::arch::smp_virt::start_secondaries_tegra(dtb_addr, dtb_size, mmu.ram_gib_mask);
+
     // 4. JM6: drop the Orin BOOT CORE EL2 -> EL1 and run the scheduler + full M4 CAPSTONE at EL1 — the
     //    first time the scheduler runs on Orin silicon. This is the tegra analogue of the virt JC3 call
     //    site (`kernel_main`), and it becomes the tegra terminus: `run_capstone_boot_core` never returns.
