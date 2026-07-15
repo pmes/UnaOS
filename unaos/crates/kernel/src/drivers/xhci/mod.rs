@@ -4046,18 +4046,37 @@ impl XhciController {
             Err(_) => { serial_println!("xHCI: HUB set-config timed out"); return; }
         }
 
-        // 2. GET_DESCRIPTOR (HUB, type 0x29) -> downstream port count + characteristics.
+        // 2. GET_DESCRIPTOR (HUB) -> downstream port count + characteristics.
         //    bmRequestType 0xA0 (D2H, class, device), wValue = type<<8.
-        if self.sync_control(hub_slot, 0xA0, 0x06, (0x29u16) << 8, 0, 64, buf, true).is_err() {
-            serial_println!("xHCI: HUB descriptor request timed out");
+        // M3 (XENUM-1): a SuperSpeed hub answers the SuperSpeed Hub Descriptor (bDescriptorType
+        // 0x2A), NOT the USB2 Hub Descriptor (0x29). A SS hub asked for 0x29 returns a malformed /
+        // zeroed descriptor -> bNbrPorts reads 0 -> every device behind it is stranded (metal rMBP:
+        // a USB3 hub on root port 5 read "0 downstream ports, characteristics 0x0903"). Branch on
+        // the hub's trained speed from its slot context Speed field (dword0 bits 23:20; SS IDs >= 4).
+        let hub_speed = unsafe {
+            let oc = self.slots[hub_slot as usize].output_context;
+            if oc.is_null() { 0 } else { (*(oc as *const u32) >> 20) & 0xF }
+        };
+        let is_ss = hub_speed >= 4;
+        let hub_desc_type: u16 = if is_ss { 0x2A } else { 0x29 };
+        if self.sync_control(hub_slot, 0xA0, 0x06, hub_desc_type << 8, 0, 64, buf, true).is_err() {
+            serial_println!("xHCI: HUB descriptor request timed out (type {:#04x})", hub_desc_type);
             return;
         }
         let (nbr_ports, characteristics) = unsafe {
             let p = buf as *const u8;
             (*p.add(2), (*p.add(3) as u16) | ((*p.add(4) as u16) << 8))
         };
-        serial_println!("xHCI: HUB slot {} has {} downstream ports (characteristics {:#06x})",
-            hub_slot, nbr_ports, characteristics);
+        serial_println!("xHCI: HUB slot {} speed {} ({}) desc-type {:#04x}: {} downstream ports (characteristics {:#06x})",
+            hub_slot, hub_speed, if is_ss { "SS" } else { "HS/FS" }, hub_desc_type, nbr_ports, characteristics);
+        // A hub reporting 0 ports strands every device behind it — treat as a failed bring-up
+        // rather than silently marking a 0-port hub (which the downstream walk would no-op over).
+        if nbr_ports == 0 {
+            serial_println!(
+                "xHCI: HUB slot {} reported 0 downstream ports (desc-type {:#04x}, speed {}); bring-up ABORTED.",
+                hub_slot, hub_desc_type, hub_speed);
+            return;
+        }
 
         let root_hub_port = self.slots[hub_slot as usize].port_id;
         let ttt = ((characteristics >> 5) & 0x3) as u32; // TT Think Time (wHubCharacteristics bits 5-6)
