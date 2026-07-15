@@ -10,7 +10,7 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
-## aarch64 SMP — CORE3-FIX (re-derive secondary core id from MPIDR_EL1, MMU-on) — 2026-07-15 🔬 `hw-pi4`
+## aarch64 SMP — CORE3-FIX (re-derive secondary core id from MPIDR_EL1, MMU-on) — 2026-07-15 ✅✅ METAL-CONFIRMED `hw-pi4`
 
 **What it does:** closes the CORE3-SMP regression — on Pi 4 metal, a `kernel8.img` crossing 1 MiB
 brought core 3 up as a phantom "core 0" (id 3 → 0), deterministically, so `CORE_READY[3]` never set
@@ -30,8 +30,16 @@ stubs unchanged (x0 advisory); virt/Tegra paths out of lane, analogous pattern f
 byte-equivalent (41 PASS, CAPSTONE 6/6 on APs [1,2,3], K3-mount `[w=0x1ff]` + K4-write `[w=0x7f]` +
 F2/F3 locked 240000/240000, 0 forbidden), `test-arm` MISSION SUCCESS. Pre- and post-fix disassembly
 recorded in `arch_arm64.md §CORE3-SMP FIX` (mrs now after the `SCTLR_EL1` write; advisory x0 no longer
-spilled). **Metal 4/4 on a >1 MiB build is pending the attended bench** — the real verdict, since QEMU
-brings up 4/4 at every size and can never reproduce the fault.
+spilled). QEMU brings up 4/4 at every size and can never reproduce the fault — the real verdict was
+always metal. **✅✅ METAL-CONFIRMED (2026-07-15 attended bench, Peter physical, boot 1):** a >1 MiB
+build (712,464 B) brought **all four cores online with correct ids — no phantom "core 0" — and ran
+CAPSTONE 6/6 COMPLETE (workers on cores 2+3), the first full-core boot in the failing regime since
+the regression.** Same boot, riders captured: **K3-revoke `[w=0x7f]`** (two-phase durable-first
+revoke ordering on the REAL card — previously QEMU-only) + **K5-lockspan `[w=0x3f]`**; plus F2/F3
+locked 240000/240000 under true 4-core parallelism, K3-mount `[w=0x1ff]`, K4-write `[w=0x7f]`,
+0 forbidden. Stale-fixture caveat: U9/U10/U10-create/U11/U6-grants showed the documented stale-card
+signature (probe bench's un-re-prepped card) — NOT regressions; the strict pristine-card 32/32 line
+rides the next Pi sitting. Detail: `arch_arm64.md §CORE3-SMP` METAL-CONFIRMED paragraph.
 
 ---
 
