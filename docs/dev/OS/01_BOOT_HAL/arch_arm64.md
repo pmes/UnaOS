@@ -3050,6 +3050,20 @@ already stamped at create.
 is not headless-reachable in-lane, so the shell-level verdict is **attended-pending** (bench card
 `unaos/scripts/jd17-bench.md`).
 
+### JD18 — read-only TREE TOOLS: `find` (recursive glob search) + `du` (subtree size tally) + `uptime`
+
+Three read-only panel additions built entirely from primitives the file-manager verb set already ships — **`shell.rs`-only, zero mutation, `fat.rs` call-never-edit, NET arms + unafs verbs untouched.** They compose the JD9 `cp_tree`/JD13 `rm_tree` `read_dir` SNAPSHOT walk, the JD12 `glob_match`, and the JD17 clock's additive `uptime_secs()` helper; `.`/`..` are filtered at every level and recursion is bounded by the shared `CP_MAX_DEPTH` (=32, honest `-ELOOP`). A mid-walk read error stops with an honest `path: reason (-EIO)` and the partial results already printed — nothing is invented.
+
+**`find <root> <pattern>`.** Recursively walks the tree under `<root>` (a directory path; one argument = the pattern with root defaulting to `.`, two = explicit root + pattern) and matches each entry's on-disk 8.3 name against `<pattern>` with the **existing JD12 `glob_match`** (case-insensitive; `*`/`?`; a literal pattern is an exact-name match). Each hit prints as its full canonical path — a directory with a trailing `/` — followed by an honest `N match(es), M dir(s) scanned` tally, where *dirs scanned* counts every `read_dir` level (the root included). A subdirectory is always recursed into whether or not its own name matched. Errors are honest: a missing root is `-ENOENT`; a **FILE root degrades to a single self-match test** (the POSIX shape — `find` on a file tests that file, `0 dir(s) scanned`); a mid-walk I/O error reports the path + errno with the partial hits standing.
+
+**`du <dir>`.** Same read walk. For each **direct child** of `<dir>` it prints the child's total bytes — a file is its own size, a directory is the recursive sum of its subtree — then a `total: N byte(s) in M file(s), K dir(s)` line. **FAT directory ENTRIES themselves report size 0** (the on-disk size field is zero for directories — only file sizes are real bytes), so a directory contributes only the sum of its descendant files. `du FILE` is that file's single line. A missing path is `-ENOENT`; a mid-walk read error reports the path + errno and the `total:` line stays honest for what was scanned before the stop.
+
+**`uptime`.** Seconds since boot from the architectural counter, via a small **additive** `clock::uptime_secs() -> Option<u64>` = `CNTPCT_EL0 / CNTFRQ_EL0` on aarch64 (the counter resets to 0 at boot and never stops — the same JD3 mechanism `now()` extends from), `None` on x86_64 (no calibrated invariant counter is plumbed). The helper reads the same `monotonic()` source `now()` uses but touches **neither the seed anchor nor the `now()`/`fat_stamp()` logic**. The verb renders `up HH:MM:SS`; when the JD17 wall clock has been seeded it appends the current time — `up 00:12:34 (clock: 2026-07-15 14:32:10)`. x86 prints an honest `uptime: no calibrated counter on this arch`.
+
+**Not in scope:** any mutation, `find -exec`/`-type` flags, mid-path globs (the JD12 trailing-leaf rule stands), `du -h` human units, and sorting beyond the natural walk order.
+
+**Gate (QEMU):** `./arroyo check` + `UNAOS_TEGRA=1 ./arroyo check` green both arches (no new warnings); `./arroyo test-arm 22` → `MISSION SUCCESS`; `UNAOS_GICV3=1 ./arroyo test-arm 40` → CAPSTONE 6/6; `./arroyo kernel8-test` → **0 FAIL** (this battery protects `fat.rs`, shared with the Pi image; these verbs add no `fat.rs` surface); `UNAOS_HUBSTORAGE=1 ./arroyo test 25` → `MISSION SUCCESS` (x86, shared shell guard); `UNAOS_TEGRA=1 ./arroyo esp-jetson` links, validate by `tegra:` COUNT (unchanged — these verbs add no `tegra:` token) never size, built LAST after `test-arm`. The tools are exercised interactively, so the shell-level verdict is **attended-pending** (bench card `unaos/scripts/jd18-bench.md`).
+
 ## 4. Jetson Orin Nano headless bring-up (Arc JM2)
 
 The Orin is brought up **headless over serial**. The only console that has ever
