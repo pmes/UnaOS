@@ -6815,7 +6815,7 @@ fn sys_fgrant_revoke_2phase(
     // DEEPER than the F3-era bound. Accepted on the record: the K5 fusion mechanism is preserved verbatim, and
     // the deeper IRQ-masked window is a benchable latency watch-item (the K6 bench card measures it), not a
     // correctness risk. See the K6-M3 NS-SPAN NOTE at the native wrappers.
-    let _ns = ns_lock();
+    let _ns = ns_lock(); #[cfg(feature = "nsspan")] let _nsspan = NsSpanProbe::new(&NSSPAN_REVOKE); // K7 WATCH ns-hold probe (newline-neutral inline so knob-off is byte-identical; declared after _ns -> drops first, ns still held)
     // Snapshot the current ACL and drop the target grantee (matched by its durable persistent principal — the
     // on-disk key; the snapshot carries ppids only). A vanished row (raced unlink) leaves nothing to revoke.
     let Some((row_owner, mut grants)) = owned_snapshot_row(dir_lba, dir_off) else {
@@ -8391,7 +8391,7 @@ pub fn u7_launcher(demo_cpu: usize) {
     // full-row re-persist can no longer resurrect a revoked grant (snapshot + disk-narrow + in-RAM commit now
     // span one ns) + the create-serialization gate. Its own uncounted `:: K5-lockspan: … PASS ::` line;
     // self-cleaning (leaves no owned row on the metal card).
-    k5_lockspan_launcher();
+    k5_lockspan_launcher(); #[cfg(feature = "nsspan")] nsspan_report(); // K7 WATCH: emit :: NS-SPAN: … :: after K3/K5 drive the sites (newline-neutral inline; knob-off byte-identical)
     // IMAGE_SHA256 code-signing: prove the SHA-256 primitive (FIPS KATs) + that it discriminates program
     // IMAGES, closing the "same 8.3 name = same principal" residual (the loader now mints IMAGE_SHA256). Its
     // own uncounted `:: IMG-SIG: … PASS ::` line; read-only, no disk write.
@@ -9355,7 +9355,7 @@ fn atr_ensure_create_or_regrow(
 /// this-volume, this-version, committed header; `Ok(false)` = a GENUINE reject (bad magic/version/geometry/
 /// committed/binding/CRC — a foreign/stale/torn header); `Err(_)` = a block READ error (NOT a mismatch). The
 /// caller decides: `atr_ensure` regrows only on `Ok(false)` (never on `Err`, which would wipe rows over a
-/// hiccup); `atr_rebuild_into_owned` treats anything but `Ok(true)` as all-public (fail-closed — a read error
+/// hiccup); `native_migrate_from_sidecar` treats anything but `Ok(true)` as migrate-nothing (fail-closed — a read error
 /// there is non-destructive).
 fn atr_header_status(
     fs: &crate::fs::fat::FatFs,
@@ -9558,76 +9558,13 @@ fn atr_clear_row(fs: &crate::fs::fat::FatFs, dir_lba: u64, dir_off: u32) -> bool
     true // no matching row — already public on disk
 }
 
-/// K1 M2.4: rebuild the in-RAM owner/grants ACL from `UNAFS.ATR` — the mount-time restore that makes ownership
-/// SURVIVE REBOOT. Reads + validates the header against the LIVE binding (any reject => the WHOLE volume is
-/// all-public, the fail-closed pre-U6 baseline), then for each committed named-owner row RE-RESOLVES the file
-/// BY NAME (`find_located`, defeating the recycled-directory-slot hazard — a stale `(dir_lba, dir_off)` is only a
-/// hint), cross-checks `first_cluster` when both sides are nonzero (identity corroboration; a mismatch skips the
-/// row), and installs an `OwnedFile` with the NO-LIVE-OWNER sentinel + the persisted principals. Returns the
-/// number of rows installed. Runs OUTSIDE the namespace lock (single-core, pre-EL0, or the M3 proof) — NEVER
-/// across `mount()`. FAIL-CLOSED throughout: name-gone / cluster-mismatch / bad-CRC / bad-binding / free row all
-/// yield PUBLIC, never a forged owner (owner AND grants share one row CRC — install-or-drop atomically).
-fn atr_rebuild_into_owned(fs: &crate::fs::fat::FatFs) -> usize {
-    let bind = atr_live_binding(fs);
-    let (de, _lba, _off) = match fs.find_located(ATR_NAME) {
-        Ok(t) => t,
-        _ => return 0, // absent or lookup error -> all-public (fail-closed)
-    };
-    if (de.size as usize) < ATR_FILE_LEN {
-        return 0; // partial/truncated image -> all-public
-    }
-    let (afc, asz) = (de.first_cluster(), de.size);
-    if atr_header_status(fs, afc, asz, &bind) != Ok(true) {
-        return 0; // bad magic/version/geometry/committed/binding/CRC OR read error -> all-public (fail-closed)
-    }
-    let mut rows: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-    if fs
-        .read_at(afc, asz, ATR_HEADER_LEN as u32, &mut rows, ATR_ROW_STRIDE * ATR_ROWS)
-        .is_err()
-        || rows.len() != ATR_ROW_STRIDE * ATR_ROWS
-    {
-        return 0;
-    }
-    let mut installed = 0usize;
-    for i in 0..ATR_ROWS {
-        let start = ATR_ROW_STRIDE * i;
-        let mut arr = [0u8; ATR_ROW_STRIDE];
-        arr.copy_from_slice(&rows[start..start + ATR_ROW_STRIDE]);
-        let Some(row) = atr_parse_row(&arr) else {
-            continue; // free slot or corrupt row -> public (owner AND grants dropped together)
-        };
-        if row.owner.kind == PRIN_NONE {
-            continue; // a valid row with no owner principal is not an ACL to install
-        }
-        // Re-resolve the DURABLE key: the 8.3 name. A name that no longer resolves fails closed (public).
-        let mut buf = [0u8; 12];
-        let n = atr_name_to_buf(&row.name, &mut buf);
-        if n == 0 {
-            continue;
-        }
-        let Ok(name) = core::str::from_utf8(&buf[..n]) else {
-            continue;
-        };
-        let (rde, rlba, roff) = match fs.find_located(name) {
-            Ok(t) => t,
-            _ => continue, // name gone -> fail-closed to public
-        };
-        // Corroborate identity by first_cluster when BOTH are nonzero (a 0-length file has no cluster).
-        if row.first_cluster != 0 && rde.first_cluster() != 0 && row.first_cluster != rde.first_cluster() {
-            continue; // the slot now holds a DIFFERENT file -> fail-closed
-        }
-        let mut grants = [(PrincipalRecord::NONE, 0u32); NFGRANT];
-        for (j, g) in row.grants.iter().enumerate() {
-            if g.rights != 0 && g.prin.kind != PRIN_NONE {
-                grants[j] = (g.prin, g.rights);
-            }
-        }
-        if owned_install_persisted(rlba, roff as u32, row.owner, &grants) {
-            installed += 1;
-        }
-    }
-    installed
-}
+// K7-F1 (2026-07-15, lens must-fix): `atr_rebuild_into_owned` — the K1-M2.4 sidecar-to-OWNED_FILES
+// rebuild — is DELETED ENTIRELY. Its last caller (`k1_corrupt_check`) installed EVERY valid sidecar row
+// into the LIVE OWNED_FILES on the real card mount, so on a legacy-carrying card the fixture re-adopted
+// legacy owners for the rest of the boot — exactly the enforcement K7 removes. The corrupt-parse guard
+// now drives the migration pass instead (see `k1_corrupt_check`). After this deletion, NO function
+// anywhere adopts sidecar rows as owners: `owned_install_persisted`'s SOLE caller is the NATIVE
+// rebuild (`native_rebuild_into_owned`) — no sidecar-parse path reaches it.
 
 /// K6: project an owner principal + its grants to the OWNED native byte strings [`native_acl_write`]
 /// takes. `None` if the owner has no native projection (fail-closed — an un-nameable owner is not
@@ -9746,7 +9683,7 @@ fn native_migrate_from_sidecar(fs: &crate::fs::fat::FatFs) -> usize {
 }
 
 /// K6 M2/M3: rebuild the in-RAM owner/grants ACL from the NATIVE attribute volume — the
-/// `atr_rebuild_into_owned` successor. For each native ACL row: reverse-project owner (+ grants),
+/// successor of the retired ATR fallback rebuild (K7-F1-deleted). For each native ACL row: reverse-project owner (+ grants),
 /// re-resolve the DURABLE FAT name (`find_located` — a recycled `(dir_lba, dir_off)` is only a hint),
 /// corroborate `first_cluster` when both are nonzero, and install with the NO-LIVE-OWNER sentinel.
 /// FAIL-CLOSED throughout: an unparseable owner / name-gone / cluster-mismatch yields PUBLIC, never a
@@ -9873,7 +9810,7 @@ fn native_persist_grants(dir_lba: u64, dir_off: u32) -> bool {
     if owned_owner_ppid(dir_lba, dir_off).kind == PRIN_NONE {
         return true; // anonymous owner — nothing persists (the battery path; no disk touch, no ns)
     }
-    let _ns = ns_lock();
+    let _ns = ns_lock(); #[cfg(feature = "nsspan")] let _nsspan = NsSpanProbe::new(&NSSPAN_GRANTS); // K7 WATCH ns-hold probe (newline-neutral inline; knob-off byte-identical)
     let Some((owner_ppid, grants)) = owned_snapshot_row(dir_lba, dir_off) else {
         return true; // row vanished (raced clear) between the probe and the ns — nothing to persist
     };
@@ -9887,7 +9824,7 @@ fn native_persist_grow(dir_lba: u64, dir_off: u32, new_first: u32) -> bool {
     if owned_owner_ppid(dir_lba, dir_off).kind == PRIN_NONE {
         return true; // anonymous owner — the whole battery incl. the u10 GROW.BIN fixture; zero I/O
     }
-    let _ns = ns_lock();
+    let _ns = ns_lock(); #[cfg(feature = "nsspan")] let _nsspan = NsSpanProbe::new(&NSSPAN_GROW); // K7 WATCH ns-hold probe (newline-neutral inline; knob-off byte-identical)
     let Some((owner_ppid, grants)) = owned_snapshot_row(dir_lba, dir_off) else {
         return true;
     };
@@ -9912,13 +9849,19 @@ fn native_persist_grow(dir_lba: u64, dir_off: u32, new_first: u32) -> bool {
     )
 }
 
-/// K1 M2.4 / K2 / K6: the REAL-BOOT mount-rebuild hook — restore persisted ownership before EL0 programs
-/// run. GATED on `by_name_spawn_multivalued()` (TRUE since K2). K6: first MIGRATE any committed
-/// IMAGE_SHA256 sidecar rows onto native attributes (native-before-delete), then rebuild OWNED_FILES
-/// from the NATIVE store, THEN fall back to any remaining (un-migrated PROGRAM_NAME) sidecar rows — so a
-/// row always enforces from one store or the other, never neither. On QEMU (fresh-per-build FAT) both
-/// stores are empty here, so ZERO rows install and the boot path stays byte-identical; the live effect
-/// is on metal. The MECHANISM is proven independently by the K6 witness + the K1/K2/K3/K5 launchers.
+/// K1 M2.4 / K2 / K6 / K7: the REAL-BOOT mount-rebuild hook — restore persisted ownership before EL0
+/// programs run. GATED on `by_name_spawn_multivalued()` (TRUE since K2). K6: first MIGRATE any committed
+/// IMAGE_SHA256 sidecar rows onto native attributes (native-before-delete), then rebuild OWNED_FILES from
+/// the NATIVE store — the sole enforcement store.
+///
+/// K7 (2026-07-15, wholesale legacy-sidecar ENFORCEMENT removal): the sidecar FALLBACK-REBUILD leg
+/// is DELETED — the function itself is gone (K7-F1). Legacy `PROGRAM_NAME` sidecar rows are NEVER
+/// adopted as owners in production — a card carrying ONLY legacy rows enforces PUBLIC-ONLY after this arc
+/// (fail-closed). The MIGRATION pass is RETAINED (committed IMAGE_SHA256 rows still cross native-before-
+/// delete on every boot, pending Peter declaring the card fleet fully crossed); only the "legacy rows can
+/// enforce" machinery is gone. On QEMU (fresh-per-build FAT) both the sidecar and the native store are
+/// empty here, so ZERO rows install and the boot path stays byte-identical; the live effect is on metal.
+/// The MECHANISM is proven independently by the K6 witness + the K1/K2/K3/K5 launchers.
 fn atr_maybe_boot_rebuild() {
     if !by_name_spawn_multivalued() {
         return; // cross-reboot enforcement gated off (single-program world) -> no rebuild, no I/O
@@ -9928,8 +9871,7 @@ fn atr_maybe_boot_rebuild() {
     }
     if let Ok(fs) = crate::fs::fat::mount() {
         let _ = native_migrate_from_sidecar(&fs); // K6: move committed IMAGE_SHA256 rows to native first
-        let _ = native_rebuild_into_owned(&fs); // then enforce from the native store
-        let _ = atr_rebuild_into_owned(&fs); // fallback: any un-migrated (legacy PROGRAM_NAME) sidecar rows
+        let _ = native_rebuild_into_owned(&fs); // K7: enforce SOLELY from the native store (no legacy fallback)
     }
 }
 
@@ -10318,6 +10260,7 @@ fn k1_corrupt_cleanup() {
     if let Ok(fs) = crate::fs::fat::mount() {
         if let Ok((de, lba, off)) = fs.find_located(K1C_FILE) {
             owned_clear(lba, off as u32);
+            let _ = crate::fs::unafs::native_acl_clear(lba, off as u32); // K7-F1: belt-and-braces (a bug-path migration must not persist)
             let _ = fs.delete_located(lba, off, de.first_cluster());
         }
         let bind = atr_live_binding(&fs);
@@ -10330,18 +10273,26 @@ fn k1_corrupt_cleanup() {
     }
 }
 
-/// K1 M4: PROVE the read-side FAIL-CLOSED rule end to end — a TORN owner row on disk must yield a PUBLIC file
-/// at mount, NEVER a forged owner. Persist a named-owner file, flip a byte in its on-disk row (busting the row
-/// CRC), simulate a reboot, rebuild, and assert the rebuild DROPPED the row so an ANONYMOUS caller is now
-/// ADMITTED (the file is public — the well-defined pre-U6 baseline), where a valid row would have DENIED it
-/// (M3). Kernel-side + deterministic; self-cleaning. `true` iff fail-closed held.
+/// K1 M4 / K7-F1: PROVE the read-side FAIL-CLOSED rule end to end — a TORN owner row on disk must yield a
+/// PUBLIC file at boot, NEVER a forged owner. K7-F1 (lens must-fix): the old vehicle for this proof was
+/// `atr_rebuild_into_owned`, which installed EVERY valid sidecar row into the LIVE OWNED_FILES — on a
+/// legacy-carrying metal card that fixture call re-adopted legacy owners for the rest of the boot,
+/// contradicting the K7 removal. That function is DELETED; the guard now drives the MIGRATION pass
+/// (`native_migrate_from_sidecar`) — the ONLY production consumer of sidecar rows — over a torn row:
+/// plant a committed `IMAGE_SHA256` row (the one kind migration would adopt), tear it on disk (bust the
+/// row CRC), and assert the whole machine fails closed: the torn row is SKIPPED (bad CRC ->
+/// `atr_parse_row` None), NOTHING lands in the native store, and OWNED_FILES gains NO owner from any
+/// sidecar input (the file stays PUBLIC — an anonymous caller is ADMITTED where a forged owner would
+/// DENY). No install-to-OWNED_FILES vehicle exists anywhere in the fixture. Kernel-side + deterministic;
+/// self-cleaning. `true` iff fail-closed held.
 fn k1_corrupt_check() -> bool {
     let fs = match crate::fs::fat::mount() {
         Ok(f) => f,
         Err(_) => return false,
     };
-    slot_ppid_stamp(K1P_SA_OWN, PrincipalRecord::program_name("PERSCOR"));
-    let p_c = slot_ppid_of(K1P_SA_OWN);
+    // A committed IMAGE_SHA256 owner — the ONLY row kind the retained migration pass adopts, so a torn
+    // one is exactly the hostile input the parse guard must reject (synthetic image bytes on purpose).
+    let p_c = PrincipalRecord::image_of(b"k1-corrupt-scratch-image");
     let Some(name11) = atr_name_from_str(K1C_FILE) else {
         k1_corrupt_cleanup();
         return false;
@@ -10360,8 +10311,6 @@ fn k1_corrupt_check() -> bool {
             return false;
         }
     };
-    let gen_c = ASID_GEN[K1P_SA_OWN as usize].load(Ordering::Acquire);
-    owned_set_owner(lba, off as u32, K1P_SA_OWN, gen_c, p_c);
     let empty_grants = [(PrincipalRecord::NONE, 0u32); NFGRANT];
     if !atr_persist_row(&fs, name11, c, sz, lba, off as u32, p_c, &empty_grants) {
         k1_corrupt_cleanup();
@@ -10371,8 +10320,8 @@ fn k1_corrupt_check() -> bool {
     // TEAR the persisted row: flip one byte in its owner field so the per-row CRC no longer matches.
     let torn = k1_tear_persisted_row(&fs, lba, off as u32);
 
-    // Reboot sim -> rebuild. The torn row (bad CRC -> atr_parse_row None) is DROPPED, so no owner installs.
-    owned_clear(lba, off as u32);
+    // Reboot sim -> drive the PRODUCTION migration pass (fresh mount, the boot idiom) over the torn row.
+    // Bad CRC -> `atr_parse_row` None -> the row is skipped fail-closed: nothing to migrate, nothing to adopt.
     let fs2 = match crate::fs::fat::mount() {
         Ok(f) => f,
         Err(_) => {
@@ -10380,17 +10329,24 @@ fn k1_corrupt_check() -> bool {
             return false;
         }
     };
-    let _ = atr_rebuild_into_owned(&fs2);
+    let _ = native_migrate_from_sidecar(&fs2);
+    // Row-scoped fail-closed assertions (deliberately NOT the global migrated count, which on a stale
+    // metal card could legitimately be nonzero for OTHER rows the boot pass transiently missed):
+    // (1) nothing landed in the NATIVE store for this key (the torn row did not migrate);
+    let native_clean = crate::fs::unafs::native_acl_read(lba, off as u32).is_none();
+    // (2) THE K7-F1 LEAK CHECK: OWNED_FILES gained NO owner from any sidecar input — the file is PUBLIC.
+    let no_owner = owned_owner_ppid(lba, off as u32).kind == PRIN_NONE;
+    // (3) enforcement agrees: an ANONYMOUS caller is ADMITTED (a forged/adopted owner would DENY).
+    let gen_c = ASID_GEN[K1P_SA_OWN as usize].load(Ordering::Acquire);
     let anon_public = match fs2.find_located(K1C_FILE) {
         Ok((_, rlba, roff)) => {
-            // Fail-closed: the file is PUBLIC now -> an ANONYMOUS caller is ADMITTED (a valid row would DENY).
             owned_access_ok(rlba, roff as u32, K1P_SA_OWN, gen_c, CAP_READ | CAP_WRITE, PrincipalRecord::NONE)
         }
         Err(_) => false,
     };
 
     k1_corrupt_cleanup();
-    torn && anon_public
+    torn && native_clean && no_owner && anon_public
 }
 
 /// K1 M4: flip one byte in the ON-DISK owner field of the UNAFS.ATR row for `(dir_lba, dir_off)`, busting its
@@ -10447,7 +10403,7 @@ fn k1_corrupt_launcher() {
     }
     let ok = k1_corrupt_check();
     serial_println!(
-        ":: K1-corrupt: UNAFS.ATR torn owner row fails closed to PUBLIC at mount {} — rebuild drops the bad-CRC row; anonymous open admitted (no forged owner) ::",
+        ":: K1-corrupt: UNAFS.ATR torn owner row fails closed to PUBLIC at boot {} — migration skips the bad-CRC row (nothing native, no OWNED_FILES owner); anonymous open admitted (no forged owner) ::",
         if ok { "PASS" } else { "FAIL" }
     );
 }
@@ -11121,7 +11077,9 @@ fn k6_migrate_selftest() {
             let p2 = atr_persist_row(&fs, legn, 0x66, 0, K6_LEG_LBA, K6_LEG_OFF, leg_owner, &empty);
             let n1 = native_migrate_from_sidecar(&fs);
             // bit5: exactly the IMAGE row migrated — its native row carries the reverse-equal owner, its
-            // sidecar row is gone, and the legacy PROGRAM_NAME sidecar row STAYS (un-migrated, enforcing).
+            // sidecar row is gone, and the legacy PROGRAM_NAME sidecar row STAYS (un-migrated). K7: a
+            // retained legacy row no longer ENFORCES (the boot fallback rebuild is deleted) — it simply
+            // persists inertly until a card re-prep clears it; this witness proves migration leaves it be.
             let img_native_ok = crate::fs::unafs::native_acl_read(K6_IMG_LBA, K6_IMG_OFF)
                 .is_some_and(|r| principal_from_native(&r.owner) == Some(img_owner));
             let img_sidecar_gone = atr_row_first_cluster(&fs, K6_IMG_LBA, K6_IMG_OFF).is_none();
@@ -11513,8 +11471,9 @@ fn fatmove_launcher() {
 // `O_CREAT` at EL0 -> its `prog:<NAME>` owns + persists the file; a (simulated) reboot rebuilds the row
 // from `UNAFS.ATR`; a fresh incarnation of the SAME named program is re-ADMITTED purely by name; a
 // DISTINCT named program (the impostor) is REFUSED. QEMU regenerates a fresh FAT per build and delivers
-// no Group-1 IRQ, so the reboot is SIMULATED same-boot (owned_clear -> remount -> atr_rebuild_into_owned,
-// the M3 standard) — the true power-cycle survival rides the attended metal bench. Fully self-cleaning so
+// no Group-1 IRQ, so the reboot is SIMULATED same-boot (owned_clear -> remount -> native rebuild,
+// the M3 standard, K6-reworked onto `native_rebuild_into_owned`) — the true power-cycle survival rides
+// the attended metal bench. Fully self-cleaning so
 // the STATEFUL metal card never accumulates a row that would brick the next real boot.
 const K2_OWN_NAME: &str = "K2OWN.BIN"; // the owner program -> principal prog:K2OWN.BIN
 const K2_IMP_NAME: &str = "K2IMP.BIN"; // the impostor program -> principal prog:K2IMP.BIN
@@ -13902,4 +13861,64 @@ fn uowner_run(demo_cpu: usize) {
             on_disk as u8
         );
     }
+}
+
+// =====================================================================================================
+// K7 WATCH rider (NS-SPAN) — MEASURE the IRQ-masked namespace-lock hold at the three fused persist sites
+// (`sys_fgrant_revoke_2phase`, `native_persist_grants`, `native_persist_grow`). Default-OFF, byte-identical
+// when off: the whole rider is `#[cfg(feature = "nsspan")]`-gated AND placed at end-of-file / inlined
+// newline-neutral at each site, so a knob-off build has IDENTICAL physical line numbers to a build without
+// the rider — the panic `Location` data embedded in `.rodata` (loaded) does not move (the core3probe idiom,
+// hardened for line-number stability). Knob-on: an RAII probe reads CNTPCT at ns-take and, on Drop (which
+// fires while the `_ns` guard is STILL held — the probe is declared AFTER `_ns`, so it drops FIRST), reads
+// CNTPCT again and folds the delta into a per-site worst-case `AtomicU64` via `fetch_max`. No locks, no heap
+// in the measurement path. `nsspan_report()` emits ONE serial line after the K3/K5 fixtures have exercised
+// all three sites. This closes the Option-A deeper-masked-span bench WATCH (the K6-M3 verdict) with a real
+// metal number: the fused revoke/re-persist now spans a journaled MULTI-SECTOR native unafs write, deeper
+// than the F3-era single-sector bound — this measures HOW deep on silicon.
+// =====================================================================================================
+#[cfg(feature = "nsspan")]
+static NSSPAN_REVOKE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "nsspan")]
+static NSSPAN_GRANTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "nsspan")]
+static NSSPAN_GROW: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// K7 WATCH: an RAII probe that measures the ns-lock hold at ONE site. Constructed right AFTER `ns_lock()`
+/// (declared after `_ns`, so on scope exit it drops BEFORE `_ns` — the ns is still held when we read the
+/// release timestamp). `Drop` folds `cntpct(now) - start` into `site`'s worst-case. No heap, no lock.
+#[cfg(feature = "nsspan")]
+struct NsSpanProbe {
+    start: u64,
+    site: &'static core::sync::atomic::AtomicU64,
+}
+#[cfg(feature = "nsspan")]
+impl NsSpanProbe {
+    #[inline]
+    fn new(site: &'static core::sync::atomic::AtomicU64) -> Self {
+        NsSpanProbe { start: super::timer::cntpct(), site }
+    }
+}
+#[cfg(feature = "nsspan")]
+impl Drop for NsSpanProbe {
+    #[inline]
+    fn drop(&mut self) {
+        let delta = super::timer::cntpct().wrapping_sub(self.start);
+        self.site.fetch_max(delta, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// K7 WATCH: emit the per-site worst-case ns-lock hold (in CNTPCT ticks) + the counter frequency. Called
+/// once from `u7_launcher` after the K3/K5 fixtures (which drive all three sites). Reads three atomics —
+/// no lock, no disk. A site never exercised reports 0.
+#[cfg(feature = "nsspan")]
+fn nsspan_report() {
+    use core::sync::atomic::Ordering;
+    serial_println!(
+        ":: NS-SPAN: worst revoke={} grants={} grow={} ticks (freq {}) ::",
+        NSSPAN_REVOKE.load(Ordering::Relaxed),
+        NSSPAN_GRANTS.load(Ordering::Relaxed),
+        NSSPAN_GROW.load(Ordering::Relaxed),
+        super::timer::cntfrq(),
+    );
 }

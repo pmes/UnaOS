@@ -92,6 +92,16 @@ smpprobe = []
 # kernel8`. See unaos/scripts/core3-probe-bench.md and docs .../arch_arm64.md §CORE3-SMP.
 core3probe = ["pi"]
 
+# NS-SPAN (K7 WATCH rider): instrument the IRQ-masked namespace-lock hold at the three fused K6/K3/K5
+# persist sites (`sys_fgrant_revoke_2phase`, `native_persist_grants`, `native_persist_grow`) — read
+# CNTPCT at ns-take and ns-release, track the per-site WORST-CASE hold in ticks, and emit ONE serial line
+# (`:: NS-SPAN: worst revoke=… grants=… grow=… ticks (freq …) ::`) after the K3/K5 fixtures run. Closes
+# the Option-A deeper-masked-span bench WATCH with a metal number. No locks / no heap in the measurement
+# path (an RAII probe reading CNTPCT + an `AtomicU64::fetch_max`). Default OFF => byte-identical (the whole
+# rider is `#[cfg(feature = "nsspan")]`-gated; the core3probe idiom). Enable via `UNAOS_NSSPAN=1 ./arroyo
+# kernel8`. aarch64 only.
+nsspan = []
+
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage
 lazy_static = { version = "1.5.0", features = ["spin_no_std"] }

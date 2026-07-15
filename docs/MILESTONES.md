@@ -10,6 +10,49 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-pi4 track — 2026-07-15 (K7 — legacy-sidecar enforcement removed; NS-SPAN WATCH rider)
+
+### K7 — legacy `UNAFS.ATR` rows may no longer ENFORCE + knob-gated NS-SPAN instrument 🔬 QEMU-green, metal pending
+
+**What it does:** completes the sidecar retirement K6 began. K6 kept a transitional boot FALLBACK —
+after the native rebuild, `atr_maybe_boot_rebuild` still adopted any remaining (un-migrated, legacy
+`PROGRAM_NAME`) sidecar rows as owners, so a legacy row still ENFORCED. K7 DELETES that fallback leg
+— and **K7-F1 (LC-pi lens must-fix, same day) deletes `atr_rebuild_into_owned` ENTIRELY**: the lens proved
+the fixture-only retention was a live leak (`k1_corrupt_check` runs every boot via `u7_launcher` and the
+function installs every valid sidecar row into the GLOBAL live `OWNED_FILES`; per-VOLUME header binding →
+a legacy card passed it → legacy rows still enforced; QEMU blind — fresh FAT has no legacy rows).
+`k1_corrupt` is reworked to guard the MIGRATION parse directly (plant a committed IMAGE_SHA256 row, tear
+it, drive `native_migrate_from_sidecar`, assert row-scoped fail-closed: torn row skipped, nothing native,
+`OWNED_FILES` gains NO owner, anonymous admitted). Post-F1 `owned_install_persisted`'s sole caller is
+`native_rebuild_into_owned`. **No path anywhere adopts a
+sidecar row as an owner:** a card carrying ONLY legacy rows enforces PUBLIC-ONLY (fail-closed); the native
+store is the sole enforcement store. RETAINED (until the card fleet is declared fully crossed): the boot
+MIGRATION pass (committed `IMAGE_SHA256` rows still cross native-before-delete every boot) and its sidecar
+PARSE path; the reworked `k1_corrupt` parse-guard; the K6-migrate witness planting; and — PERMANENT — the EL0 `SYS_OPEN` deny of
+`UNAFS.ATR`. The audited write helpers (`atr_ensure`/`atr_persist_row`/`atr_clear_row`) all keep
+migration/fixture callers, so none went dead. **NS-SPAN WATCH rider (Option-A close):** a knob-gated
+(`UNAOS_NSSPAN=1` → cargo feature `nsspan`) CNTPCT instrument measures the worst-case IRQ-masked `ns`-hold
+at the three fused persist sites (revoke/grants/grow) via an RAII probe (no lock, no heap) and emits one
+`:: NS-SPAN: worst revoke=… grants=… grow=… ticks (freq …) ::` line after the K3/K5 fixtures. Default-OFF,
+knob-off byte-identical (cfg-gated + newline-neutral so panic `Location` data does not move — the loadable
+`kernel8.img` is byte-identical to the no-rider build). The metal boot closes the bench WATCH with a real
+silicon number; the QEMU tick counts (62.5 MHz TCG) are not the verdict.
+
+**How it was tested (at the K7-F1 tip):** 🔬 QEMU — `./arroyo check` both arches; `kernel8` clean;
+`kernel8-test` (35s window) MBENCH PASS **33/33** required, 0 forbidden, knob-off AND knob-on, vs the
+UPDATED spec (the K1-corrupt REQUIRE regex folded "at mount" → "at boot" — the witness text changed with
+its mechanism); the reworked `K1-corrupt … PASS` line asserts the leak is closed (OWNED_FILES gains no
+owner from sidecar inputs); knob-ON adds the uncounted
+`:: NS-SPAN: worst revoke=… grants=… grow=… ticks (freq 62500000) ::` line (all three sites exercised).
+`test-arm` MISSION SUCCESS; unafs host suites green (crate untouched). Zero x86. **Byte-identity
+(re-proven at the F1 tip):** knob-off `kernel8.img` `sha256 7afaa85d…` identical rider-absent vs
+rider-present; knob-ON differs (`a7fdb2a9…`) proving the feature is active. Metal (attended, LC-pi +
+Peter) closes the NS-SPAN WATCH with the on-silicon number.
+
+- **Detail:** [`SECURITY.md` §K1 (K7 bullet)](SECURITY.md). **Commits:** on `hw-pi4` (K7 code + docs).
+
+---
+
 ## hw-rmbp track — 2026-07-15 (CFU-1 — the single validated kernel/user copy seam)
 
 ### CFU-1 — `copy_from_user`/`copy_to_user`/`user_range_ok` on x86 🔬 `hw-rmbp`
