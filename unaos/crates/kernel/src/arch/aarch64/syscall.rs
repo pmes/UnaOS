@@ -6802,37 +6802,64 @@ fn sys_fgrant_revoke_2phase(
     owner_ppid: PrincipalRecord,
     grantee_ppid: PrincipalRecord,
 ) -> i64 {
-    // K5 M1: SPAN the whole snapshot -> disk-narrow -> in-RAM-commit under ONE namespace hold. Without it, a
-    // concurrent full-row re-persist on another core (`native_persist_grants` / `native_persist_grow` — both
-    // snapshot + write under this SAME ns) could snapshot OWNED_FILES with the revoked grant STILL present (our
-    // in-RAM removal not yet committed) and write the FULL row to disk AFTER our disk-narrow, RESURRECTING the
-    // revoked grant on the next mount. The span serializes the two globally: any such re-persist runs either
-    // entirely BEFORE us (its full row is then overwritten by our narrowed write) or entirely AFTER us (it
-    // snapshots our already-narrowed in-RAM set). Legal because NAMESPACE ⊃ {OWNED_FILES, MOUNT} and
-    // `owned_snapshot_row`/`owned_grant` take-and-release OWNED_FILES WITHIN the ns hold (no inner lock is held
-    // when ns is taken → deadlock-free). K6 M3 (Option A verdict, Maestro 2026-07-15): the disk op is now the
-    // NATIVE journaled multi-sector unafs write, NOT the old single-sector `write_at` seam — the ns span is
-    // DEEPER than the F3-era bound. Accepted on the record: the K5 fusion mechanism is preserved verbatim, and
-    // the deeper IRQ-masked window is a benchable latency watch-item (the K6 bench card measures it), not a
-    // correctness risk. See the K6-M3 NS-SPAN NOTE at the native wrappers.
-    let _ns = ns_lock(); #[cfg(feature = "nsspan")] let _nsspan = NsSpanProbe::new(&NSSPAN_REVOKE); // K7 WATCH ns-hold probe (newline-neutral inline so knob-off is byte-identical; declared after _ns -> drops first, ns still held)
-    // Snapshot the current ACL and drop the target grantee (matched by its durable persistent principal — the
-    // on-disk key; the snapshot carries ppids only). A vanished row (raced unlink) leaves nothing to revoke.
-    let Some((row_owner, mut grants)) = owned_snapshot_row(dir_lba, dir_off) else {
-        return 0;
-    };
-    for g in grants.iter_mut() {
-        if g.1 != 0 && g.0.kind != PRIN_NONE && g.0 == grantee_ppid {
-            *g = (PrincipalRecord::NONE, 0);
+    // K5B (2026-07-15, NARROW ruling — the NAMESPACE-unfreeze): FUSE the whole snapshot -> disk-narrow ->
+    // in-RAM-commit under ONE `with_unafs` MOUNT hold, and do NOT take `ns` at all. THE K5B INVARIANT: for any
+    // file's ACL, the OWNED_FILES snapshot that produces a durable row, the journaled write of that row, and the
+    // in-RAM mutation the row reflects all occur under a single uninterrupted MOUNT hold — so any two ACL
+    // persisters run strictly serially, and no persister can observe an in-RAM state inconsistent with the last
+    // row it wrote. The K5 resurrection needed a concurrent re-persist to snapshot BETWEEN our disk-narrow and
+    // our in-RAM commit; with the commit INSIDE the same MOUNT hold as the snapshot+write (and every re-persister
+    // snapshotting inside ITS hold), that straddle is structurally impossible: a re-persist runs either entirely
+    // before us (its full row is overwritten by our narrowed write) or entirely after (it snapshots our already-
+    // narrowed set). Lock order: MOUNT ⊃ OWNED_FILES (leaf, take-and-release inside the hold; no path takes
+    // OWNED_FILES then MOUNT), composing with NAMESPACE ⊃ MOUNT — no inversion. WHY ns IS DROPPABLE: the K3-era
+    // revoke never needed ns for namespace correctness; K5 took it ONLY as the anti-resurrection serializer, and
+    // MOUNT now carries that. Effect: the ~0.7 s IRQ-masked polled-SD write no longer freezes NAMESPACE (opens/
+    // unlinks on other cores proceed); the per-core mask under with_unafs REMAINS (ledgered residual — the
+    // with_unafs IRQ-mask keystone and K3 durable-first are STOP-class, untouched). See SECURITY.md §K1 K5B.
+    //
+    // Anonymous fast path (the whole battery): a NONE-owner row never persists, so there is nothing durable to
+    // diverge from — commit in-RAM directly, ZERO disk I/O, no mount (byte-equivalent battery, the K5 idiom).
+    // A vanished row (raced unlink) leaves nothing to revoke — the pre-K5B `0`, not owned_grant's -EACCES.
+    if owned_owner_ppid(dir_lba, dir_off).kind == PRIN_NONE {
+        if owned_snapshot_row(dir_lba, dir_off).is_none() {
+            return 0;
         }
+        return owned_grant(dir_lba, dir_off, owner_asid, owner_gen, grantee_asid, grantee_gen, 0, owner_ppid, grantee_ppid);
     }
-    // Phase 1 (durable-first): write the NARROWED row to the NATIVE store (the `_locked` core assumes the ns we
-    // already hold). On failure, do NOT commit in-RAM — fail closed.
-    if !native_write_grant_row_locked(dir_lba, dir_off, row_owner, &grants) {
-        return EIO;
+    #[cfg(feature = "nsspan")] let _nsspan = NsSpanProbe::new(&NSSPAN_REVOKE); match crate::fs::unafs::with_unafs(|fs| { // K5B WATCH probe brackets the fused with_unafs call (ns not taken); newline-neutral inline so knob-off is byte-identical
+        // Snapshot the current ACL and drop the target grantee (matched by its durable persistent principal — the
+        // on-disk key; the snapshot carries ppids only). A vanished row (raced unlink) leaves nothing to revoke.
+        let Some((row_owner, mut grants)) = owned_snapshot_row(dir_lba, dir_off) else {
+            return 0;
+        };
+        for g in grants.iter_mut() {
+            if g.1 != 0 && g.0.kind != PRIN_NONE && g.0 == grantee_ppid {
+                *g = (PrincipalRecord::NONE, 0);
+            }
+        }
+        // Phase 1 (durable-first, K3 — preserved verbatim): write the NARROWED row to the NATIVE store on the
+        // mount we hold. On failure, do NOT commit in-RAM — fail closed.
+        if !native_write_grant_row_on(fs, dir_lba, dir_off, row_owner, &grants) {
+            return EIO;
+        }
+        // Phase 2: disk now reflects the revoke — commit the in-RAM removal (owner already validated), INSIDE the
+        // SAME MOUNT hold (the K5B invariant's load-bearing clause).
+        owned_grant(dir_lba, dir_off, owner_asid, owner_gen, grantee_asid, grantee_gen, 0, owner_ppid, grantee_ppid)
+    }) {
+        Ok(rc) => rc,
+        // Media without a unafs volume / no block device: no native row can exist (create-persist fails the same
+        // way), so there is nothing durable to diverge from — commit in-RAM, the pre-K5B semantics for this media
+        // class (the same error split native_acl_clear uses).
+        Err(crate::fs::unafs::MountError::NoVolume
+        | crate::fs::unafs::MountError::NoStorage
+        | crate::fs::unafs::MountError::BadSectorSize(_)) => {
+            owned_grant(dir_lba, dir_off, owner_asid, owner_gen, grantee_asid, grantee_gen, 0, owner_ppid, grantee_ppid)
+        }
+        // A real mount/parse failure on a volume that EXISTS: a persisted row may be present and un-narrowable —
+        // fail closed (K3 durable-first: in-RAM grant intact, caller gets -EIO).
+        Err(_) => EIO,
     }
-    // Phase 2: disk now reflects the revoke — commit the in-RAM removal (owner already validated), under the SAME ns.
-    owned_grant(dir_lba, dir_off, owner_asid, owner_gen, grantee_asid, grantee_gen, 0, owner_ppid, grantee_ppid)
 }
 
 // =============================================================================================
@@ -9721,27 +9748,34 @@ fn native_rebuild_into_owned(fs: &crate::fs::fat::FatFs) -> usize {
 }
 
 // =====================================================================================================
-// K6 M3: the NATIVE production persist paths — the `atr_persist_*` successors. Every wrapper preserves
-// its ATR predecessor's proven ordering discipline against the native store:
-//   * create  (`native_persist_create`)  — write-through after a fully-successful private create,
-//     outside the caller's ns; takes its OWN ns for the row write (the `atr_persist_row` shape).
-//   * grant   (`native_persist_grants`)  — NAMED-owner probe first (anonymous = zero I/O, no ns), then
-//     snapshot + write fused under ONE ns hold (the K5 anti-straddle discipline, verbatim).
-//   * revoke  (`native_write_grant_row_locked`) — the disk half of the K3 two-phase durable-first
-//     revoke; the caller (sys_fgrant_revoke_2phase) already holds ns across snapshot -> THIS write ->
-//     in-RAM commit, so the K5 lock-span property carries over unchanged.
-//   * grow    (`native_persist_grow`)    — probe, then snapshot + write under one ns.
+// K6 M3 / K5B: the NATIVE production persist paths — the `atr_persist_*` successors. Every wrapper
+// preserves its predecessor's proven ordering discipline against the native store; since K5B the fusion
+// lock is the `with_unafs` MOUNT, not `ns`:
+//   * create  (`native_persist_create`)  — write-through after a fully-successful private create; the
+//     row is fresh (empty grants), so `native_acl_write`'s own MOUNT hold is the whole discipline.
+//   * grant   (`native_persist_grants`)  — NAMED-owner probe first (anonymous = zero I/O, no mount),
+//     then snapshot + write fused under ONE with_unafs hold (the K5B invariant).
+//   * revoke  (`native_write_grant_row_on`) — the disk half of the K3 two-phase durable-first revoke;
+//     the caller (sys_fgrant_revoke_2phase) holds ONE with_unafs hold across snapshot -> THIS write ->
+//     in-RAM commit — the K5 anti-resurrection property, re-established on MOUNT (K5B).
+//   * grow    (`native_persist_grow`)    — probe, then snapshot + write under one with_unafs hold.
 //   * unlink  — `native_acl_clear` (fs/unafs.rs), gated durable-first before the 0xE5 (the K1-F2 fix).
 //
-// NS-SPAN NOTE (K6 M3 verdict, Maestro 2026-07-15 — Option A). The K5 span argument used to rest on
-// "the disk op is the single-sector M1 `write_at` seam". The native write is a JOURNALED MULTI-SECTOR
-// unafs op (inode + catalog + metadata sync through `with_unafs`), so the IRQ-masked ns span is now
-// DEEPER than the F3-era bound. This is ACCEPTED by the recorded verdict: K5's anti-resurrection fusion
-// is preserved by the identical mechanism (ns spans snapshot->durable-write->in-RAM-commit, and every
-// re-persist snapshots + writes under the same ns), while the deeper masked window is a BENCHABLE
-// latency watch-item (F3 cleared this class at real card timing), not a correctness risk. The K6 bench
-// card carries the measurement line. Lock order: NAMESPACE ⊃ MOUNT (with_unafs) — no path takes MOUNT
-// then NAMESPACE, and OWNED_FILES is take-and-release inside the ns hold as before.
+// K5B NS-SPAN NOTE (NARROW ruling, Maestro + Peter 2026-07-15 — supersedes the K6 Option-A note). The
+// K7 metal sitting measured the fused ns-hold at ~704/712/440 ms (polled SD I/O inside the journaled
+// multi-sector write) — the Option-A WATCH tripped. K5B removes `ns` from every ACL persist site: the
+// NAMESPACE is NO LONGER frozen across ACL disk I/O (opens/unlinks/creates on other cores proceed).
+// THE HONEST BOUND, inseparable from that headline: the ~0.7 s per-core IRQ-masked window across the
+// polled SD write REMAINS, relocated wholly into the `with_unafs` MOUNT hold — with_unafs masks IRQs
+// around its whole closure BY DESIGN (the K4 coherence keystone: unmasking would let a timer preempt
+// + same-core re-entry deadlock the non-reentrant MOUNT spinlock) and K3 durable-first forbids
+// deferring the write. Both protections are STOP-class, untouched; the per-core mask is a ledgered
+// residual (SECURITY.md §K1 K5B) whose true closure is out of this lane (crate batched-sync or a
+// scheduler preempt-disable primitive). THE K5B INVARIANT (the anti-resurrection argument): snapshot,
+// durable row write, and in-RAM commit under ONE uninterrupted MOUNT hold at every persister — two
+// persisters never interleave, so no stale snapshot can land after a revoke's narrow. Lock order:
+// NAMESPACE ⊃ MOUNT ⊃ OWNED_FILES (owned_* stay take-and-release leaves inside the MOUNT hold; no
+// path takes MOUNT then NAMESPACE, nor OWNED_FILES then MOUNT).
 // =====================================================================================================
 
 /// K6 M3: write-through persist of a NEW private file's owner onto the NATIVE attribute volume — the
@@ -9762,18 +9796,22 @@ fn native_persist_create(
     let Some((owner_bytes, _)) = native_project_owner_grants(&owner_ppid, &empty) else {
         return false; // un-projectable owner (reserved kind) — not persistable, fail-closed
     };
-    let _ns = ns_lock();
+    // K5B: no ns — `native_acl_write`'s own with_unafs MOUNT hold is the serializer (the row is FRESH with an
+    // empty grant set, so there is no snapshot/commit coupling for the invariant to fuse; the write itself is
+    // one uninterrupted MOUNT hold like every other persister).
     crate::fs::unafs::native_acl_write(dir_lba, dir_off, name, first_cluster, &owner_bytes, &[])
 }
 
-/// K6 M3: the disk half of the K3 two-phase revoke / the K5-fused re-persist, against the NATIVE store —
-/// the `atr_write_grant_row_locked` successor. **The caller MUST already hold the namespace lock**: it
-/// fuses the OWNED_FILES snapshot the caller took with this journaled write exactly as the ATR version
-/// did (the K5 span; see the NS-SPAN NOTE above). Recovers the durable name/first_cluster from the
-/// EXISTING native row; no row yet -> true (create-persist had failed; in-RAM still holds — the ATR
-/// "nothing to update" semantics). The K3 fault-injection knob fires after the NONE early-return, so the
-/// anonymous battery never observes it.
-fn native_write_grant_row_locked(
+/// K6 M3 / K5B: the disk half of the K3 two-phase revoke / the fused re-persist, against the NATIVE store —
+/// the `atr_write_grant_row_locked` successor. **The caller MUST already hold the `with_unafs` MOUNT** and
+/// pass it in: the K5B invariant fuses the caller's OWNED_FILES snapshot, THIS journaled write, and the
+/// caller's in-RAM commit under that single MOUNT hold (see the K5B NS-SPAN NOTE above) — re-entering
+/// `with_unafs` here would deadlock the non-reentrant MOUNT spinlock. Recovers the durable
+/// name/first_cluster from the EXISTING native row; no row yet -> true (create-persist had failed; in-RAM
+/// still holds — the ATR "nothing to update" semantics). The K3 fault-injection knob fires after the NONE
+/// early-return, so the anonymous battery never observes it.
+fn native_write_grant_row_on(
+    fs: &mut crate::fs::unafs::KernelUnaFS,
     dir_lba: u64,
     dir_off: u32,
     owner_ppid: PrincipalRecord,
@@ -9785,7 +9823,7 @@ fn native_write_grant_row_locked(
     if K3_TEST_FAIL_PERSIST.load(Ordering::Relaxed) {
         return false; // K3: test-only synthetic durable-write failure (fixture-set, self-clearing)
     }
-    let Some(existing) = crate::fs::unafs::native_acl_read(dir_lba, dir_off) else {
+    let Some(existing) = crate::fs::unafs::native_acl_read_on(fs, dir_lba, dir_off) else {
         return true; // no persisted row — nothing to update (in-RAM still enforces this boot)
     };
     let Some((owner_bytes, gv)) = native_project_owner_grants(&owner_ppid, grants) else {
@@ -9793,7 +9831,8 @@ fn native_write_grant_row_locked(
     };
     let grefs: alloc::vec::Vec<(&[u8], &[u8])> =
         gv.iter().map(|(k, v)| (k.as_slice(), v.as_slice())).collect();
-    crate::fs::unafs::native_acl_write(
+    crate::fs::unafs::native_acl_write_on(
+        fs,
         dir_lba,
         dir_off,
         &existing.name,
@@ -9803,50 +9842,58 @@ fn native_write_grant_row_locked(
     )
 }
 
-/// K6 M3: re-persist owner + grants after an ACL widen — the `atr_persist_grants` successor. NAMED-owner
-/// probe first (anonymous = zero disk I/O, no ns — the battery path), then snapshot + write fused under
-/// ONE ns hold so a concurrent two-phase revoke cannot straddle the snapshot and the write (K5, verbatim).
+/// K6 M3 / K5B: re-persist owner + grants after an ACL widen — the `atr_persist_grants` successor.
+/// NAMED-owner probe first (anonymous = zero disk I/O, no mount — the battery path), then snapshot + write
+/// fused under ONE `with_unafs` MOUNT hold (the K5B invariant): the snapshot is taken INSIDE the hold, so a
+/// concurrent two-phase revoke (which commits in-RAM inside ITS hold) cannot be straddled — this persister
+/// runs entirely before or entirely after it, never against a stale in-RAM state. `ns` is NOT taken.
 fn native_persist_grants(dir_lba: u64, dir_off: u32) -> bool {
     if owned_owner_ppid(dir_lba, dir_off).kind == PRIN_NONE {
-        return true; // anonymous owner — nothing persists (the battery path; no disk touch, no ns)
+        return true; // anonymous owner — nothing persists (the battery path; no disk touch, no mount)
     }
-    let _ns = ns_lock(); #[cfg(feature = "nsspan")] let _nsspan = NsSpanProbe::new(&NSSPAN_GRANTS); // K7 WATCH ns-hold probe (newline-neutral inline; knob-off byte-identical)
-    let Some((owner_ppid, grants)) = owned_snapshot_row(dir_lba, dir_off) else {
-        return true; // row vanished (raced clear) between the probe and the ns — nothing to persist
-    };
-    native_write_grant_row_locked(dir_lba, dir_off, owner_ppid, &grants)
+    #[cfg(feature = "nsspan")] let _nsspan = NsSpanProbe::new(&NSSPAN_GRANTS); crate::fs::unafs::with_unafs(|fs| { // K5B WATCH probe brackets the fused with_unafs call (ns not taken); newline-neutral inline
+        let Some((owner_ppid, grants)) = owned_snapshot_row(dir_lba, dir_off) else {
+            return true; // row vanished (raced clear) between the probe and the hold — nothing to persist
+        };
+        native_write_grant_row_on(fs, dir_lba, dir_off, owner_ppid, &grants)
+    })
+    .unwrap_or(true) // no volume / no storage: nothing durable exists to refresh (pre-K5B semantics)
 }
 
-/// K6 M3: refresh a NAMED-owner file's persisted `first_cluster` after a GROW — the `atr_persist_grow`
-/// successor (K2 M(b)). Recovers the durable name from the existing native row; refreshes fc + the
-/// current owner/grants snapshot under ONE ns hold (K5 discipline). No row yet / anonymous -> no-op true.
+/// K6 M3 / K5B: refresh a NAMED-owner file's persisted `first_cluster` after a GROW — the
+/// `atr_persist_grow` successor (K2 M(b)). Recovers the durable name from the existing native row;
+/// refreshes fc + the current owner/grants snapshot under ONE `with_unafs` MOUNT hold (the K5B invariant —
+/// snapshot INSIDE the hold, `ns` not taken). No row yet / anonymous -> no-op true.
 fn native_persist_grow(dir_lba: u64, dir_off: u32, new_first: u32) -> bool {
     if owned_owner_ppid(dir_lba, dir_off).kind == PRIN_NONE {
         return true; // anonymous owner — the whole battery incl. the u10 GROW.BIN fixture; zero I/O
     }
-    let _ns = ns_lock(); #[cfg(feature = "nsspan")] let _nsspan = NsSpanProbe::new(&NSSPAN_GROW); // K7 WATCH ns-hold probe (newline-neutral inline; knob-off byte-identical)
-    let Some((owner_ppid, grants)) = owned_snapshot_row(dir_lba, dir_off) else {
-        return true;
-    };
-    if owner_ppid.kind == PRIN_NONE {
-        return true; // owner went anonymous under the race — nothing persists
-    }
-    let Some(existing) = crate::fs::unafs::native_acl_read(dir_lba, dir_off) else {
-        return true; // never persisted (create-persist failed) — in-RAM still holds this boot
-    };
-    let Some((owner_bytes, gv)) = native_project_owner_grants(&owner_ppid, &grants) else {
-        return false;
-    };
-    let grefs: alloc::vec::Vec<(&[u8], &[u8])> =
-        gv.iter().map(|(k, v)| (k.as_slice(), v.as_slice())).collect();
-    crate::fs::unafs::native_acl_write(
-        dir_lba,
-        dir_off,
-        &existing.name,
-        new_first,
-        &owner_bytes,
-        &grefs,
-    )
+    #[cfg(feature = "nsspan")] let _nsspan = NsSpanProbe::new(&NSSPAN_GROW); crate::fs::unafs::with_unafs(|fs| { // K5B WATCH probe brackets the fused with_unafs call (ns not taken); newline-neutral inline
+        let Some((owner_ppid, grants)) = owned_snapshot_row(dir_lba, dir_off) else {
+            return true;
+        };
+        if owner_ppid.kind == PRIN_NONE {
+            return true; // owner went anonymous under the race — nothing persists
+        }
+        let Some(existing) = crate::fs::unafs::native_acl_read_on(fs, dir_lba, dir_off) else {
+            return true; // never persisted (create-persist failed) — in-RAM still holds this boot
+        };
+        let Some((owner_bytes, gv)) = native_project_owner_grants(&owner_ppid, &grants) else {
+            return false;
+        };
+        let grefs: alloc::vec::Vec<(&[u8], &[u8])> =
+            gv.iter().map(|(k, v)| (k.as_slice(), v.as_slice())).collect();
+        crate::fs::unafs::native_acl_write_on(
+            fs,
+            dir_lba,
+            dir_off,
+            &existing.name,
+            new_first,
+            &owner_bytes,
+            &grefs,
+        )
+    })
+    .unwrap_or(true) // no volume / no storage: nothing durable exists to refresh (pre-K5B semantics)
 }
 
 /// K1 M2.4 / K2 / K6 / K7: the REAL-BOOT mount-rebuild hook — restore persisted ownership before EL0
@@ -10614,8 +10661,11 @@ fn k5_reboot_resolve(dir_lba: u64, dir_off: u32) -> Option<(u64, u32)> {
     Some((l, o as u32))
 }
 
-/// K5: PROVE the M1 lock-span closes the concurrent-repersist resurrection window (the `k3_revoke_check` idiom —
-/// kernel-side, deterministic, no EL0 fixture). Returns a bitmask; PASS iff `== K5_LOCKSPAN_ALL`. Self-cleaning.
+/// K5/K5B: PROVE the fused persist closes the concurrent-repersist resurrection window (the `k3_revoke_check`
+/// idiom — kernel-side, deterministic, no EL0 fixture). K5B: the fusion lock is the `with_unafs` MOUNT (snapshot +
+/// durable write + in-RAM commit under ONE hold); the control leg decomposes exactly that (snapshot and write
+/// under SEPARATE holds) and demonstrates the resurrection. Returns a bitmask; PASS iff `== K5_LOCKSPAN_ALL`.
+/// Self-cleaning.
 fn k5_lockspan_check() -> u32 {
     let mut w = 0u32;
     let fs = match crate::fs::fat::mount() {
@@ -10665,17 +10715,18 @@ fn k5_lockspan_check() -> u32 {
         w |= 1 << 1; // revoke-target grantee admitted (baseline — a grant to revoke)
     }
 
-    // ---- NEGATIVE CONTROL: the OLD race shape, reproduced at the decomposed-primitive level ----
-    // Capture a PRE-revoke snapshot (GR2's grant still present) — models a concurrent core that snapshotted
-    // OWNED_FILES before the revoke committed. Then run the production revoke (disk-narrow + in-RAM commit, now
-    // fused under ns). Then let the STALE snapshot's full-row write land via the raw ns-held disk writer — the
-    // exact primitive the fix now only ever calls with a FRESH under-ns snapshot. Under the OLD non-atomic code
-    // this is what a concurrent `native_persist_grants` could do; it RESURRECTS GR2 on the NATIVE store.
+    // ---- NEGATIVE CONTROL: the race shape, reproduced with the commit DELIBERATELY DECOMPOSED from the
+    // MOUNT hold (the K5B control idiom, per the ratified conditions). Capture a PRE-revoke snapshot (GR2's
+    // grant still present) OUTSIDE any with_unafs hold — models a concurrent re-persister whose snapshot was
+    // NOT taken inside its own MOUNT hold (exactly what the K5B invariant forbids). Then run the production
+    // revoke (snapshot + disk-narrow + in-RAM commit fused under ONE with_unafs hold). Then let the STALE
+    // snapshot's full-row write land via the raw disk writer under a FRESH, separate MOUNT hold — the
+    // decomposed ordering: snapshot and write under DIFFERENT holds, with the revoke between them. It
+    // RESURRECTS GR2 on the NATIVE store — the window class is real whenever the fusion is decomposed.
     let stale = owned_snapshot_row(rlba, roff);
     let _ = sys_fgrant_revoke_2phase(rlba, roff, K5_SA_OWN, gen_own, K5_SA_GR2, gen_gr2, p_own, p_gr2);
     if let Some((so, sg)) = stale {
-        let _ns = ns_lock();
-        native_write_grant_row_locked(rlba, roff, so, &sg);
+        let _ = crate::fs::unafs::with_unafs(|ufs| native_write_grant_row_on(ufs, rlba, roff, so, &sg));
     }
     let Some((clba, coff)) = k5_reboot_resolve(rlba, roff) else {
         k5_lockspan_cleanup();
@@ -10686,9 +10737,10 @@ fn k5_lockspan_check() -> u32 {
     }
 
     // ---- THE FIX: production revoke + production re-persist cannot resurrect ----
-    // In-RAM now carries the resurrected GR2 grant again. Revoke it through the production two-phase path, THEN
-    // run the production full-row re-persist (`native_persist_grants` — models the concurrent core B). Post-fix
-    // it re-snapshots the NARROWED in-RAM set under the SAME ns, so it writes a narrowed row: GR2 is NOT resurrected.
+    // In-RAM now carries the resurrected GR2 grant again. Revoke it through the production two-phase path (whose
+    // snapshot+write+commit fuse under ONE with_unafs hold), THEN run the production full-row re-persist
+    // (`native_persist_grants` — models the concurrent core B). Post-K5B it snapshots the NARROWED in-RAM set
+    // INSIDE its own MOUNT hold, so it writes a narrowed row: GR2 is NOT resurrected.
     let _ = sys_fgrant_revoke_2phase(clba, coff, K5_SA_OWN, gen_own, K5_SA_GR2, gen_gr2, p_own, p_gr2);
     let _ = native_persist_grants(clba, coff);
     let Some((flba, foff)) = k5_reboot_resolve(clba, coff) else {
@@ -10729,7 +10781,7 @@ fn k5_lockspan_launcher() {
     }
     let w = k5_lockspan_check();
     serial_println!(
-        ":: K5-lockspan: native unafs revoke/re-persist SMP window — decomposed stale-snapshot write resurrects (control); production revoke+re-persist fused under the ns-span stays narrowed; kept grant intact; create-gate not leaked {} [w={:#04x}] ::",
+        ":: K5-lockspan: native unafs revoke/re-persist SMP window — stale snapshot written under a SEPARATE MOUNT hold resurrects (control); production revoke+re-persist fused under ONE with_unafs hold stays narrowed (K5B); kept grant intact; create-gate not leaked {} [w={:#04x}] ::",
         if w == K5_LOCKSPAN_ALL { "PASS" } else { "FAIL" },
         w
     );
@@ -11488,7 +11540,7 @@ static EL0_K2_DONE: AtomicU32 = AtomicU32::new(0); // count of K2 program sentin
 static EL0_K2_KILLED: AtomicU32 = AtomicU32::new(0); // any K2 program fault-killed (a real bug; must stay 0)
 
 // K3: test-only synthetic durable-write failure for the durable grant-row write (K6 M3: now
-// `native_write_grant_row_locked`), set TRANSIENTLY by `k3_revoke_check`
+// `native_write_grant_row_on` since K5B), set TRANSIENTLY by `k3_revoke_check`
 // (which self-clears) to prove the two-phase revoke fails CLOSED when the persist cannot land. Default false —
 // the production/battery path never sets it, so it is a single default-false relaxed load off the persist path.
 static K3_TEST_FAIL_PERSIST: AtomicBool = AtomicBool::new(false);
@@ -13864,18 +13916,21 @@ fn uowner_run(demo_cpu: usize) {
 }
 
 // =====================================================================================================
-// K7 WATCH rider (NS-SPAN) — MEASURE the IRQ-masked namespace-lock hold at the three fused persist sites
-// (`sys_fgrant_revoke_2phase`, `native_persist_grants`, `native_persist_grow`). Default-OFF, byte-identical
-// when off: the whole rider is `#[cfg(feature = "nsspan")]`-gated AND placed at end-of-file / inlined
-// newline-neutral at each site, so a knob-off build has IDENTICAL physical line numbers to a build without
-// the rider — the panic `Location` data embedded in `.rodata` (loaded) does not move (the core3probe idiom,
-// hardened for line-number stability). Knob-on: an RAII probe reads CNTPCT at ns-take and, on Drop (which
-// fires while the `_ns` guard is STILL held — the probe is declared AFTER `_ns`, so it drops FIRST), reads
-// CNTPCT again and folds the delta into a per-site worst-case `AtomicU64` via `fetch_max`. No locks, no heap
-// in the measurement path. `nsspan_report()` emits ONE serial line after the K3/K5 fixtures have exercised
-// all three sites. This closes the Option-A deeper-masked-span bench WATCH (the K6-M3 verdict) with a real
-// metal number: the fused revoke/re-persist now spans a journaled MULTI-SECTOR native unafs write, deeper
-// than the F3-era single-sector bound — this measures HOW deep on silicon.
+// K7 WATCH rider (NS-SPAN), K5B DUAL-SPAN rework — MEASURE the worst-case masked hold at the three fused
+// persist sites (`sys_fgrant_revoke_2phase`, `native_persist_grants`, `native_persist_grow`). K5B removed
+// `ns` from those sites, so the probe now brackets the fused `with_unafs` CALL (constructed before it,
+// dropped right after): the measured span is an upper bound on the per-core IRQ-masked window (the mask
+// lives INSIDE with_unafs; the bracket adds only the lock-acquire wait, honestly worst-case). Per the
+// ratified NARROW conditions the ONE emit line carries BOTH facts inseparably: ns-hold across ACL persists
+// = 0 by construction (NAMESPACE unfrozen — the K5B headline) AND the measured masked with_unafs-hold per
+// site (the ~0.7 s per-core residual, still present, ledgered). Same methodology as the K7 before-number
+// (CNTPCT deltas, per-site fetch_max, same three sites, same units) so the metal before/after pair is
+// directly comparable. Default-OFF, byte-identical when off: the whole rider is
+// `#[cfg(feature = "nsspan")]`-gated AND placed at end-of-file / inlined newline-neutral at each site, so
+// a knob-off build has IDENTICAL physical line numbers to a build without the rider — the panic `Location`
+// data embedded in `.rodata` (loaded) does not move (the core3probe idiom, hardened for line-number
+// stability). No locks, no heap in the measurement path. `nsspan_report()` emits the ONE serial line after
+// the K3/K5 fixtures have exercised all three sites.
 // =====================================================================================================
 #[cfg(feature = "nsspan")]
 static NSSPAN_REVOKE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -13884,9 +13939,9 @@ static NSSPAN_GRANTS: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomic
 #[cfg(feature = "nsspan")]
 static NSSPAN_GROW: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// K7 WATCH: an RAII probe that measures the ns-lock hold at ONE site. Constructed right AFTER `ns_lock()`
-/// (declared after `_ns`, so on scope exit it drops BEFORE `_ns` — the ns is still held when we read the
-/// release timestamp). `Drop` folds `cntpct(now) - start` into `site`'s worst-case. No heap, no lock.
+/// K7 WATCH / K5B: an RAII probe that measures the fused persist span at ONE site. K5B: constructed right
+/// BEFORE the site's `with_unafs` call and dropped right after it returns — an upper bound on the per-core
+/// IRQ-masked window inside it. `Drop` folds `cntpct(now) - start` into `site`'s worst-case. No heap, no lock.
 #[cfg(feature = "nsspan")]
 struct NsSpanProbe {
     start: u64,
@@ -13908,14 +13963,16 @@ impl Drop for NsSpanProbe {
     }
 }
 
-/// K7 WATCH: emit the per-site worst-case ns-lock hold (in CNTPCT ticks) + the counter frequency. Called
-/// once from `u7_launcher` after the K3/K5 fixtures (which drive all three sites). Reads three atomics —
-/// no lock, no disk. A site never exercised reports 0.
+/// K7 WATCH / K5B: emit the dual-span line — the ns-hold headline AND the masked with_unafs-hold caveat,
+/// inseparably in ONE line (the ratified NARROW condition). Per-site worst-case CNTPCT ticks + the counter
+/// frequency, same units/methodology as the K7 before-number. Called once from `u7_launcher` after the
+/// K3/K5 fixtures (which drive all three sites). Reads three atomics — no lock, no disk. A site never
+/// exercised reports 0.
 #[cfg(feature = "nsspan")]
 fn nsspan_report() {
     use core::sync::atomic::Ordering;
     serial_println!(
-        ":: NS-SPAN: worst revoke={} grants={} grow={} ticks (freq {}) ::",
+        ":: NS-SPAN: K5B ns-hold across ACL persist = 0 (not taken — NAMESPACE unfrozen) BUT per-core IRQ-masked with_unafs-hold worst revoke={} grants={} grow={} ticks (freq {}) — polled SD write still masks the holding core (ledgered residual) ::",
         NSSPAN_REVOKE.load(Ordering::Relaxed),
         NSSPAN_GRANTS.load(Ordering::Relaxed),
         NSSPAN_GROW.load(Ordering::Relaxed),
