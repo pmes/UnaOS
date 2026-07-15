@@ -153,6 +153,16 @@ pub fn set(t: WallTime) -> Result<(), ()> {
     Ok(())
 }
 
+/// JD18: whole seconds since boot from the free-running architectural counter, INDEPENDENT of
+/// whether the wall clock has been seeded. aarch64: `CNTPCT_EL0 / CNTFRQ_EL0` (the counter resets to
+/// 0 at boot and never stops — the same JD3 mechanism `now()` extends from). x86_64: no calibrated
+/// invariant counter is plumbed in this kernel → `None`, and the `uptime` verb prints an honest
+/// "no calibrated counter on this arch". Purely additive: it reads the same `monotonic()` source but
+/// touches neither the seed anchor nor the `now()`/`fat_stamp()` logic.
+pub fn uptime_secs() -> Option<u64> {
+    monotonic().map(|(ticks, freq)| ticks / freq)
+}
+
 /// The current wall-clock moment: the seeded second plus counter-elapsed whole seconds, or `None`
 /// while the clock has never been set this boot (the honest UNSET state).
 pub fn now() -> Option<WallTime> {
