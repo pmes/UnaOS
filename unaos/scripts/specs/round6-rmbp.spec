@@ -67,6 +67,10 @@ REQUIRE S4-mf2:.*refused -EACCES.*witness OK
 COUNT 2 S4-race.*witness OK
 REQUIRE S6-witness:.*locked 240000/240000 intact.*witness OK
 REQUIRE S7-openany:.*owner ACL not bypassed.*witness OK
+# --- S8 = STOR-1 S8: a RW open of an arbitrary on-disk file overwrites live (overwrite-only, MF2 intact).
+# --- Landed 2026-07-15, never on metal — PENDING until the attended rMBP bench first captures it, then
+# --- promote to REQUIRE. Reported as ⏳; never fails the run.
+PENDING S8-write:.*overwrite never grows.*witness OK
 
 # --- VPERF (this boot DECIDES VPERF-WC — all landed post-bench, never on metal) -----
 # THE DECIDER: eff=WC → VPERF-WC dead; eff=UC (or any non-WC) → VPERF-WC triggers

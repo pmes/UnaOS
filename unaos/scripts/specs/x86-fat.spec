@@ -60,7 +60,10 @@ OPTIONAL S4-mf2: RW open of staged code
 OPTIONAL S4-race
 OPTIONAL S6-witness: NAMESPACE cross-core RMW
 OPTIONAL S7-openany: a non-staged on-disk file
+# --- (S8 = STOR-1 S8: a RW open of an arbitrary on-disk file overwrites live, overwrite-only — 2026-07-15.) --
+OPTIONAL S8-write: a non-staged on-disk file
 FORBID S4-mf2 FAIL
 FORBID S4-race FAIL
 FORBID S6-witness FAIL
 FORBID S7-openany FAIL
+FORBID S8-write FAIL
