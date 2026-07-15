@@ -10,6 +10,41 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-pi4 track — 2026-07-15 (K5B — the NAMESPACE-unfreeze: MOUNT-fused ACL persist)
+
+### K5B — bounded-span redesign of the fused ACL persist 🔬 QEMU-green, metal after-number pending
+
+**What it does.** The K7 metal sitting measured the fused ACL persist sites holding the `NAMESPACE`
+lock IRQ-masked for ~704/712/440 ms (`revoke=38000366 grants=38475785 grow=23764161` ticks @54 MHz)
+— polled SD I/O inside the journaled multi-sector native write, with every `ns`-contending core
+spinning masked behind it. K5B (ratified NARROW ruling) re-establishes the K5 anti-resurrection
+property on the `with_unafs` MOUNT lock instead: every persist site (revoke two-phase, grants, grow,
+create) now fuses its OWNED_FILES snapshot, journaled native write, and in-RAM commit under ONE
+`with_unafs` hold, and takes NO `ns` at all. **The K5B invariant:** snapshot + durable row write +
+in-RAM commit under a single uninterrupted MOUNT hold at every persister — two persisters never
+interleave, so no stale (grant-still-present) snapshot can land on disk after a revoke's narrow.
+Lock order becomes the strict chain `NAMESPACE ⊃ MOUNT ⊃ OWNED_FILES` (no inversion). K3
+durable-first preserved verbatim (`-EIO`, in-RAM intact). **Honest bound (NARROWED, not closed):**
+the NAMESPACE freeze is gone — opens/unlinks/creates on other cores no longer stall behind an ACL
+persist — but the ~0.7 s per-core IRQ-masked window across the polled SD write remains inside the
+`with_unafs` hold (the K4 coherence keystone, STOP-class, untouched); ledgered residual, true
+closure is out of the pi lane (crate batched-sync). The NSSPAN emit is now dual-fact in one line
+(ns-hold = 0 AND the measured masked with_unafs-hold per site).
+
+**How it was tested.** 🔬 QEMU — `./arroyo check` both arches; `kernel8` clean; `kernel8-test 35` +
+mbench vs `pi4-regression.spec`: **33/33 required, 0 forbidden, knob-off AND knob-on**; the reworked
+`k5_lockspan_check` control leg demonstrates the resurrection with the fusion deliberately decomposed
+(stale snapshot written under a SEPARATE MOUNT hold) and the fix leg proves the production fused path
+stays narrowed (`[w=0x3f]`); K3 forced-fail leg green (`[w=0x7f]`); `test-arm` MISSION SUCCESS;
+`libs/unafs` crate untouched; zero x86. Knob-off byte-inert at the same commit (rider-stripped vs
+rider-present `kernel8.img` both `eb78f9a0…`). QEMU NS-SPAN smoke: masked with_unafs-hold
+`revoke=22653750 grants=22917187 grow=19416187` ticks @62.5 MHz — same magnitude as before, as
+designed (mask relocated, not removed). The metal sitting (LC-pi + Peter) produces the authoritative
+before/after pair + the removal-of-stall verdict. Commits `fdfafda` (M1 design note) + `bd4f073`
+(M2–M4) + docs.
+
+---
+
 ## hw-rmbp track — 2026-07-15 (UI1-MOUSE s1 — HID pointer metal-robustness + serial witness)
 
 ### UI1-MOUSE slice 1 — interrupt-IN pointer path made bench-assertable + Panther-Point-hardened 🔬 `hw-rmbp`

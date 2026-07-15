@@ -237,11 +237,13 @@ pub fn force_remount() {
 // COHERENCE + ORDERING. Every access flows through the one process-wide, IRQ-masked [`with_unafs`]
 // mount and each attribute mutation is a journaled `set_attribute`/`remove_attribute`/`unlink` (the K4
 // write path — new-extents-first, single-block metadata swap, free-last: a power cut LEAKS, never
-// dangles). The K3 two-phase (durable-first) and K5 (ns-spanned snapshot+write) orderings are
-// PRESERVED by the caller in `syscall.rs`: those callers hold the FAT `NAMESPACE` lock across their
-// OWNED_FILES snapshot AND this native write, so the lock still fuses the two exactly as it did for the
-// sidecar; the store the write targets is immaterial to that serialization. Lock order gains one edge:
-// `NAMESPACE ⊃ MOUNT` (no path ever takes MOUNT then NAMESPACE).
+// dangles). K5B (2026-07-15, the NAMESPACE-unfreeze): the K3 two-phase (durable-first) and K5
+// (anti-resurrection) orderings are PRESERVED by the callers in `syscall.rs` fusing on THIS mount lock —
+// each persist site takes its OWNED_FILES snapshot, performs the journaled write (`native_acl_write_on`),
+// and commits in-RAM all inside ONE `with_unafs` hold, so MOUNT itself serializes the persisters (the
+// K5B invariant); the FAT `NAMESPACE` lock is no longer held across any ACL disk write. Lock order:
+// `NAMESPACE ⊃ MOUNT ⊃ OWNED_FILES` (no path ever takes MOUNT then NAMESPACE, nor OWNED_FILES then
+// MOUNT; OWNED_FILES stays a take-and-release leaf).
 
 /// K6: the volume-root file name for the ACL row of the FAT file at `(dir_lba, dir_off)`.
 fn acl_file_name(dir_lba: u64, dir_off: u32) -> String {
@@ -278,11 +280,29 @@ pub fn native_acl_write(
     owner: &[u8],
     grants: &[(&[u8], &[u8])],
 ) -> bool {
+    with_unafs(|fs| native_acl_write_on(fs, dir_lba, dir_off, name, first_cluster, owner, grants))
+        .unwrap_or(false)
+}
+
+/// K5B: the body of [`native_acl_write`], against an ALREADY-HELD coherent mount. The persist sites
+/// (`syscall.rs`) call this inside their single fused `with_unafs` hold — snapshot, THIS journaled write,
+/// and the in-RAM commit all under one MOUNT hold (the K5B invariant) — so they must not re-enter
+/// `with_unafs` (the MOUNT spinlock is non-reentrant). Same contract as the wrapper: `true` iff every
+/// journaled step committed.
+pub fn native_acl_write_on(
+    fs: &mut KernelUnaFS,
+    dir_lba: u64,
+    dir_off: u32,
+    name: &str,
+    first_cluster: u32,
+    owner: &[u8],
+    grants: &[(&[u8], &[u8])],
+) -> bool {
     let owner_s = match core::str::from_utf8(owner) {
         Ok(s) => s,
         Err(_) => return false,
     };
-    with_unafs(|fs| {
+    {
         let root = fs.superblock.root_inode;
         let fname = acl_file_name(dir_lba, dir_off);
         let id = match fs.resolve_path(&format!("/{}", fname)) {
@@ -335,21 +355,22 @@ pub fn native_acl_write(
             }
         }
         true
-    })
-    .unwrap_or(false)
+    }
 }
 
 /// K6: read back the ACL row for `(dir_lba, dir_off)`, or `None` if there is no row (public) or the
 /// mount fails. The read is pure (no metadata write-back through the coherent mount). Used by the
 /// migration read-back verify and by a native single-row lookup.
 pub fn native_acl_read(dir_lba: u64, dir_off: u32) -> Option<NativeAclRow> {
-    with_unafs(|fs| {
-        let fname = acl_file_name(dir_lba, dir_off);
-        let id = fs.resolve_path(&format!("/{}", fname)).ok()?;
-        native_acl_row_of(fs, id)
-    })
-    .ok()
-    .flatten()
+    with_unafs(|fs| native_acl_read_on(fs, dir_lba, dir_off)).ok().flatten()
+}
+
+/// K5B: the body of [`native_acl_read`], against an ALREADY-HELD coherent mount — for callers already
+/// inside their fused `with_unafs` hold (re-entering the non-reentrant MOUNT spinlock would deadlock).
+pub fn native_acl_read_on(fs: &mut KernelUnaFS, dir_lba: u64, dir_off: u32) -> Option<NativeAclRow> {
+    let fname = acl_file_name(dir_lba, dir_off);
+    let id = fs.resolve_path(&format!("/{}", fname)).ok()?;
+    native_acl_row_of(fs, id)
 }
 
 /// K6: extract a [`NativeAclRow`] from an already-resolved ACL-file inode. A row with no `owner`
