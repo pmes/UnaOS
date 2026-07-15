@@ -434,10 +434,14 @@ static POLL_CLOCK: AtomicI64 = AtomicI64::new(1);
 
 /// Which transport a registry slot backs. A UDP handle handed to a stream syscall (or vice versa)
 /// is rejected on this tag BEFORE any `get_mut::<T>` (smoltcp's typed accessor PANICS on a mismatch).
+/// SOCK-7: a `Tcp` slot carries the INDEX of the static stream-buffer set its socket was built from —
+/// decoupled from the reg-slot index so an accepted connection can be PEELED into a fresh reg slot
+/// while keeping the buffers its established smoltcp socket already owns (the persistent-listener seam).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SockKind {
     Udp,
-    Tcp,
+    /// TCP, holding the `TCP_RX_DATA`/`TCP_TX_DATA` buffer-set index the socket was built from.
+    Tcp(usize),
 }
 
 /// The persistent stack singleton. Its fields (incl. the 3 KiB device RX/TX scratch)
@@ -448,6 +452,13 @@ struct SmolStack {
     dev: E1000Phy,
     /// socket-id (index) → (smoltcp handle, owning HANDLES row, transport kind). `None` = free slot.
     reg: [Option<(SocketHandle, usize, SockKind)>; NSOCK],
+    /// SOCK-7: which TCP stream-buffer sets are in use. Decoupled from the reg-slot index so a
+    /// re-armed listener can take a FRESH buffer set while the peeled connection keeps the set its
+    /// established socket already owns. `true` = the `TCP_RX_DATA`/`TCP_TX_DATA[i]` set is borrowed.
+    tcp_buf_used: [bool; NSOCK],
+    /// SOCK-7: the port each reg slot listens on (recorded by `stack_listen`), so `stack_accept`'s
+    /// re-arm knows which port to re-listen on after peeling an accepted connection. `0` = not a listener.
+    listen_port: [u16; NSOCK],
     /// SOCK-5: the kernel-internal DHCPv4 client socket (in the reserved storage slot, NOT in `reg`).
     /// `dhcp_acquire` (from `init()`, one-shot, chunked) drives it to a lease that replaces the
     /// build-time static config.
@@ -482,7 +493,15 @@ fn ensure_stack(guard: &mut Option<SmolStack>) -> bool {
     // The DHCP socket takes the reserved (NSOCK+1-th) storage slot and is NOT recorded in `reg`, so
     // it never counts against ring-3 socket allocation and no `stack_open*`/`free_row_sockets` touches it.
     let dhcp_handle = sockets.add(dhcpv4::Socket::new());
-    let mut stack = SmolStack { iface, sockets, dev, reg: [None; NSOCK], dhcp: Some(dhcp_handle) };
+    let mut stack = SmolStack {
+        iface,
+        sockets,
+        dev,
+        reg: [None; NSOCK],
+        tcp_buf_used: [false; NSOCK],
+        listen_port: [0; NSOCK],
+        dhcp: Some(dhcp_handle),
+    };
     // The static lease + slirp gateway are applied AT BUILD (review fix): any first-touch —
     // including a lazy ring-3 `sys_socket` on a boot where no launcher pre-built the stack — gets a
     // configured, working interface with NO pump under the lock and nothing on the syscall stack.
@@ -733,9 +752,16 @@ pub fn stack_recvfrom(sid: usize, out: &mut [u8]) -> Option<([u8; 4], u16, usize
 pub fn stack_close(sid: usize) {
     let mut g = STACK.lock();
     let Some(stack) = g.as_mut() else { return };
-    if let Some(Some((handle, _, _))) = stack.reg.get(sid).copied() {
+    if let Some(Some((handle, _, kind))) = stack.reg.get(sid).copied() {
         stack.sockets.remove(handle);
         stack.reg[sid] = None;
+        // SOCK-7: release the socket's TCP stream-buffer set back to the free-list (decoupled from sid).
+        if let SockKind::Tcp(buf) = kind {
+            free_tcp_buf(stack, buf);
+        }
+        if sid < NSOCK {
+            stack.listen_port[sid] = 0;
+        }
         // SOCK-3: bump the slot generation so a stale handle carrying the old (gen, sid) fails
         // `socket_desc_validate` after this slot is first-fit-reused (no rebind — the U11x fence).
         if sid < NSOCK {
@@ -751,10 +777,15 @@ pub fn free_row_sockets(row: usize) {
     let mut g = STACK.lock();
     let Some(stack) = g.as_mut() else { return };
     for sid in 0..NSOCK {
-        if let Some((handle, owner, _)) = stack.reg[sid] {
+        if let Some((handle, owner, kind)) = stack.reg[sid] {
             if owner == row {
                 stack.sockets.remove(handle);
                 stack.reg[sid] = None;
+                // SOCK-7: release the TCP stream-buffer set (decoupled from sid).
+                if let SockKind::Tcp(buf) = kind {
+                    free_tcp_buf(stack, buf);
+                }
+                stack.listen_port[sid] = 0;
                 // SOCK-3: bump the generation on teardown too, so a recycled slot never hands its
                 // next tenant a stale-gen socket-id a lingering handle could rebind to.
                 SOCK_GEN[sid].fetch_add(1, Ordering::AcqRel);
@@ -874,22 +905,64 @@ pub enum RecvOutcome {
     Eof,
 }
 
-/// SOCK-6: the outcome of a bounded `stack_accept` pump.
+/// SOCK-7: the outcome of a bounded `stack_accept` pump on a PERSISTENT listener.
 pub enum AcceptOutcome {
-    /// A peer completed the 3-way handshake — the listening socket is now ESTABLISHED and carries the
-    /// accepted connection IN PLACE (same `sid` + buffers). Ring 3 mints a fresh `KIND_SOCKET` handle
-    /// for it (an alias of the same gen-fenced socket-id) and streams on it with `send`/`sock_recv`.
-    Connected,
-    /// No inbound connection yet — still LISTENING at budget exhaustion (ring 3: `-EAGAIN`, re-drive accept).
+    /// A peer completed the 3-way handshake. SOCK-7: the established smoltcp socket is PEELED into a
+    /// FRESH reg slot (carried here) and the listener slot is RE-ARMED in place on the same port, so the
+    /// listener SURVIVES the accept. Ring 3 mints a `KIND_SOCKET` handle for this fresh connection
+    /// socket-id and streams on it (`send`/`sock_recv`); the caller's listener handle stays valid.
+    Connected(usize),
+    /// No inbound connection yet — still LISTENING at budget exhaustion (ring 3: `-EAGAIN`, re-drive
+    /// accept). Also returned when a handshake completed but no reg slot / buffer set is free to peel it
+    /// into (NSOCK back-pressure): the established connection stays buffered in the listener socket and
+    /// is peeled by a later accept once a slot frees — never lost.
     Pending,
     /// The socket is not armed for listen (never listened / already connected+closed / gone / wrong-kind).
     /// Ring 3: `-EINVAL`.
     NotListening,
 }
 
-/// Allocate a TCP socket in the persistent set, owned by HANDLES row `owner`. Builds the socket from
-/// the free slot's STATIC stream buffers (`TCP_RX_DATA`/`TCP_TX_DATA[sid]`) and records the handle
-/// kind-tagged `Tcp`. Returns the socket-id (the `reg` index) or `None` if all slots are in use / no NIC.
+/// SOCK-7: claim a free TCP stream-buffer set index (decoupled from the reg-slot index). `None` if all
+/// `NSOCK` sets are in use. INVARIANT: the count of used buffer sets equals the count of live TCP sockets,
+/// which is ≤ the count of used reg slots — so whenever a reg slot is free a buffer set is free too (the
+/// peel + re-arm never starves). Under the `STACK` lock (the caller holds it).
+fn alloc_tcp_buf(stack: &mut SmolStack) -> Option<usize> {
+    let idx = stack.tcp_buf_used.iter().position(|&u| !u)?;
+    stack.tcp_buf_used[idx] = true;
+    Some(idx)
+}
+
+/// SOCK-7: release a TCP stream-buffer set (its owning socket was removed). Under the `STACK` lock.
+fn free_tcp_buf(stack: &mut SmolStack, idx: usize) {
+    if idx < NSOCK {
+        stack.tcp_buf_used[idx] = false;
+    }
+}
+
+/// SOCK-7: build a TCP socket from stream-buffer set `buf` (BSS, borrowed `&'static mut` EXACTLY once —
+/// `buf` is a claimed set, so its two static buffers are not borrowed by any live socket). Mirrors the
+/// SOCK-2 `stack_open` discipline: `addr_of_mut!(STATIC[buf])` names the element as a PLACE (no
+/// intermediate reference), then `from_raw_parts_mut` re-forms the slice (no autoref through a raw deref).
+fn build_tcp_socket(buf: usize) -> tcp::Socket<'static> {
+    let (rx_data, tx_data): (&'static mut [u8], &'static mut [u8]) = unsafe {
+        (
+            core::slice::from_raw_parts_mut(
+                core::ptr::addr_of_mut!(TCP_RX_DATA[buf]) as *mut u8,
+                TCP_BUF,
+            ),
+            core::slice::from_raw_parts_mut(
+                core::ptr::addr_of_mut!(TCP_TX_DATA[buf]) as *mut u8,
+                TCP_BUF,
+            ),
+        )
+    };
+    tcp::Socket::new(tcp::SocketBuffer::new(rx_data), tcp::SocketBuffer::new(tx_data))
+}
+
+/// Allocate a TCP socket in the persistent set, owned by HANDLES row `owner`. Builds the socket from a
+/// free STATIC stream-buffer set (SOCK-7: allocated from the buffer free-list, no longer pinned to the
+/// reg-slot index) and records the handle kind-tagged `Tcp(buf)`. Returns the socket-id (the `reg`
+/// index) or `None` if all slots / buffer sets are in use / no NIC.
 pub fn stack_open_tcp(owner: usize) -> Option<usize> {
     let mut g = STACK.lock();
     if !ensure_stack(&mut g) {
@@ -897,26 +970,10 @@ pub fn stack_open_tcp(owner: usize) -> Option<usize> {
     }
     let stack = g.as_mut().unwrap();
     let sid = stack.reg.iter().position(|s| s.is_none())?;
-    // SAFETY: `sid` is a free `reg` slot, so its two TCP stream buffers are not borrowed by any live
-    // socket; borrow them `&'static mut` disjointly (distinct statics, distinct index) to build the
-    // socket, which then OWNS the borrows until it is removed. `addr_of_mut!(STATIC[sid])` names the
-    // element as a PLACE (no intermediate reference), then `from_raw_parts_mut` re-forms the slice —
-    // the SOCK-2 `stack_open` discipline (no autoref through a raw deref).
-    let (rx_data, tx_data): (&'static mut [u8], &'static mut [u8]) = unsafe {
-        (
-            core::slice::from_raw_parts_mut(
-                core::ptr::addr_of_mut!(TCP_RX_DATA[sid]) as *mut u8,
-                TCP_BUF,
-            ),
-            core::slice::from_raw_parts_mut(
-                core::ptr::addr_of_mut!(TCP_TX_DATA[sid]) as *mut u8,
-                TCP_BUF,
-            ),
-        )
-    };
-    let socket = tcp::Socket::new(tcp::SocketBuffer::new(rx_data), tcp::SocketBuffer::new(tx_data));
+    let buf = alloc_tcp_buf(stack)?;
+    let socket = build_tcp_socket(buf);
     let handle = stack.sockets.add(socket);
-    stack.reg[sid] = Some((handle, owner, SockKind::Tcp));
+    stack.reg[sid] = Some((handle, owner, SockKind::Tcp(buf)));
     Some(sid)
 }
 
@@ -924,7 +981,7 @@ pub fn stack_open_tcp(owner: usize) -> Option<usize> {
 /// wrong-kind (a UDP handle routed to a stream syscall — rejected before smoltcp's typed accessor panics).
 fn tcp_handle(stack: &SmolStack, sid: usize) -> Option<SocketHandle> {
     match stack.reg.get(sid).and_then(|s| s.as_ref()) {
-        Some((h, _, SockKind::Tcp)) => Some(*h),
+        Some((h, _, SockKind::Tcp(_))) => Some(*h),
         _ => None,
     }
 }
@@ -1059,22 +1116,32 @@ pub fn stack_recv(sid: usize, out: &mut [u8]) -> RecvOutcome {
 }
 
 // =============================================================================
-// SOCK-6 (ROADMAP §1b): TCP SERVER / LISTEN sockets over the SAME persistent stack.
+// SOCK-6/7 (ROADMAP §1b): TCP SERVER / LISTEN sockets over the SAME persistent stack.
 //
 // A ring-3 process turns a TCP socket into a passive server with two syscalls:
 //   * `sys_listen(handle, port)` -> `stack_listen`: arm the socket as a LISTENER on a local port
 //     (smoltcp `tcp::Socket::listen`). Passive — no pump; the accept pump drives the inbound handshake.
-//   * `sys_accept(handle)` -> `stack_accept`: NON-BLOCKING poll for an inbound connection. When a peer
-//     completes the 3-way handshake the listening smoltcp socket transitions to ESTABLISHED IN PLACE
-//     (smoltcp's listen->established model: the listener socket BECOMES the connection — it does not
-//     spawn a child), so the accepted connection rides `sid`'s existing socket + stream buffers. The
-//     syscall then mints a FRESH `KIND_SOCKET` handle aliasing the same gen-fenced socket-id for the
-//     caller to stream on (`send`/`sock_recv`) and eventually `close`. This is a single-accept-per-listen
-//     model: to accept another connection, open + listen a fresh socket. It composes with SOCK-4 — the
-//     fresh connection cap can be `SYS_XFER`'d to a handler (inetd-style hand-off).
+//     SOCK-7 additionally records the port so `stack_accept` can re-arm the listener after an accept.
+//   * `sys_accept(handle)` -> `stack_accept`: NON-BLOCKING poll for an inbound connection.
 //
-// Every accept pump releases the `STACK` lock between chunks (`tcp_pump_chunked`), the SOCK-2-review
-// fold, so a concurrent socket syscall on another CPU never spins on `STACK.lock()` for a whole pump.
+// SOCK-7 (PERSISTENT LISTENER). smoltcp has no listen->child model: when a peer completes the handshake
+// the LISTENING socket transitions to ESTABLISHED IN PLACE (the listener BECOMES the connection). SOCK-6
+// exposed exactly that — single-accept-per-listen: accepting CONSUMED the listener. SOCK-7 makes the
+// listener SURVIVE by decoupling the stream buffers from the reg-slot index (the buffer free-list): when
+// `stack_accept` finds the listener socket ESTABLISHED it PEELS the connection — the established smoltcp
+// socket (which keeps the stream-buffer set it already owns) is MOVED to a FRESH reg slot, and the
+// ORIGINAL listener slot is RE-ARMED IN PLACE with a NEW smoltcp socket on a fresh buffer set, listening
+// again on the same port. The listener slot keeps its socket-id AND its generation, so the caller's
+// listener handle stays valid across unbounded accepts; each accept returns a fresh gen-fenced
+// connection socket-id. Bounded by NSOCK: peeling needs a free reg slot + buffer set — the invariant
+// "used buffer sets ≤ used reg slots < NSOCK when a slot is free" guarantees a free buffer whenever a
+// slot is free, and when NEITHER is free the handshake stays buffered in the listener and is peeled by a
+// later accept (Pending / -EAGAIN), never lost. Composes with SOCK-4 — each connection cap can be
+// `SYS_XFER`'d to a handler (inetd-style hand-off) while the listener keeps accepting.
+//
+// Every accept pump releases the `STACK` lock between chunks, the SOCK-2-review fold, so a concurrent
+// socket syscall on another CPU never spins on `STACK.lock()` for a whole pump. The PEEL itself happens
+// under a single lock hold (it only shuffles reg entries + adds one smoltcp socket — no pump).
 // =============================================================================
 
 /// SOCK-6: arm TCP socket `sid` as a passive LISTENER on local `port`. `Ok(())`, or `Err(())` (unknown
@@ -1087,26 +1154,97 @@ pub fn stack_listen(sid: usize, port: u16) -> Result<(), ()> {
     let mut g = STACK.lock();
     let stack = g.as_mut().ok_or(())?;
     let handle = tcp_handle(stack, sid).ok_or(())?;
-    stack.sockets.get_mut::<tcp::Socket>(handle).listen(port).map_err(|_| ())
+    stack.sockets.get_mut::<tcp::Socket>(handle).listen(port).map_err(|_| ())?;
+    // SOCK-7: remember the port so `stack_accept`'s re-arm re-listens on it after peeling a connection.
+    if sid < NSOCK {
+        stack.listen_port[sid] = port;
+    }
+    Ok(())
 }
 
-/// SOCK-6: non-blocking ACCEPT on listening socket `sid`. Pumps a bounded loop (lock released between
-/// chunks) driving the inbound handshake, then reports `Connected` once a peer has completed it (the
-/// socket is ESTABLISHED — the accepted connection rides `sid`'s existing socket + buffers in place),
-/// `Pending` if none arrived within the budget (ring 3 re-drives `sys_accept`), or `NotListening` if the
-/// socket is not armed for listen / vanished / wrong-kind. NEVER blocks.
+/// SOCK-7: non-blocking ACCEPT on PERSISTENT listening socket `sid`. Pumps a bounded loop (lock released
+/// between chunks) driving the inbound handshake; when the listener socket reaches ESTABLISHED it PEELS
+/// the connection into a fresh reg slot and RE-ARMS the listener in place (see `peel_and_rearm`), then
+/// reports `Connected(conn_sid)`. `Pending` if none arrived within the budget, or if a handshake landed
+/// but no slot/buffer was free to peel it (the connection stays buffered; a later accept peels it —
+/// ring 3 re-drives `sys_accept`). `NotListening` if the socket is not armed for listen / vanished /
+/// wrong-kind. NEVER blocks. The listener socket-id + generation are unchanged, so the caller's listener
+/// handle survives across unbounded accepts.
 pub fn stack_accept(sid: usize) -> AcceptOutcome {
-    tcp_pump_chunked(sid, ACCEPT_PUMP, AcceptOutcome::NotListening, |sock| {
-        match sock.state() {
-            // Still waiting for a SYN, or mid-handshake (SYN received, ACK pending) — keep pumping.
-            tcp::State::Listen | tcp::State::SynReceived => None,
-            // Never armed / listener closed without connecting — not an accept-able socket.
-            tcp::State::Closed => Some(AcceptOutcome::NotListening),
-            // Established (or already past it) — a peer connected; the socket now carries the connection.
-            _ => Some(AcceptOutcome::Connected),
+    let mut spent = 0i64;
+    while spent < ACCEPT_PUMP {
+        let mut g = STACK.lock();
+        let Some(stack) = g.as_mut() else { return AcceptOutcome::NotListening };
+        let Some(handle) = tcp_handle(stack, sid) else { return AcceptOutcome::NotListening };
+        // Pump one chunk against the whole interface (drives ARP + this listener's handshake).
+        {
+            let SmolStack { iface, sockets, dev, .. } = stack;
+            for _ in 0..TCP_CHUNK {
+                let now = POLL_CLOCK.fetch_add(1, Ordering::Relaxed);
+                iface.poll(Instant::from_millis(now), dev, sockets);
+            }
         }
-    })
-    .unwrap_or(AcceptOutcome::Pending) // budget exhausted still LISTENING -> caller re-drives
+        match stack.sockets.get_mut::<tcp::Socket>(handle).state() {
+            // Still waiting for a SYN, or mid-handshake (SYN received, ACK pending) — keep pumping.
+            tcp::State::Listen | tcp::State::SynReceived => {}
+            // Never armed / listener closed without connecting — not an accept-able socket.
+            tcp::State::Closed => return AcceptOutcome::NotListening,
+            // ESTABLISHED (or past it) — a peer connected; peel the connection + re-arm the listener.
+            _ => return peel_and_rearm(stack, sid),
+        }
+        drop(g); // release BETWEEN chunks so another CPU's socket syscall can make progress
+        spent += TCP_CHUNK;
+    }
+    AcceptOutcome::Pending // budget exhausted still LISTENING -> caller re-drives
+}
+
+/// SOCK-7: the listener socket at reg slot `lsid` has reached ESTABLISHED — a peer connected. PEEL the
+/// established connection into a fresh reg slot and RE-ARM `lsid` as a listener again on the same port, so
+/// the listener SURVIVES. Under the `STACK` lock (the caller holds it), no pump. Returns
+/// `Connected(conn_sid)` on success, or `Pending` if no free reg slot / buffer set is available to peel
+/// into (NSOCK back-pressure): the established connection stays buffered in the listener socket and is
+/// peeled by a later accept once a slot frees — never lost, and the listener is NOT consumed.
+fn peel_and_rearm(stack: &mut SmolStack, lsid: usize) -> AcceptOutcome {
+    // The listener entry: its established smoltcp handle + the buffer set that socket owns + the port.
+    let Some((estab_handle, owner, SockKind::Tcp(estab_buf))) = stack.reg[lsid] else {
+        return AcceptOutcome::NotListening;
+    };
+    let port = if lsid < NSOCK { stack.listen_port[lsid] } else { 0 };
+    if port == 0 {
+        // Established but we never recorded a listen port (shouldn't happen for a real listener) — treat
+        // as not-a-listener rather than re-arm on port 0.
+        return AcceptOutcome::NotListening;
+    }
+    // Need a fresh reg slot for the peeled connection...
+    let Some(conn_sid) = stack.reg.iter().position(|s| s.is_none()) else {
+        return AcceptOutcome::Pending; // back-pressure: buffered, peeled later
+    };
+    // ...and a fresh buffer set for the re-armed listener. (Invariant: a free slot ⇒ a free buffer.)
+    let Some(new_buf) = alloc_tcp_buf(stack) else {
+        return AcceptOutcome::Pending;
+    };
+    // Build + arm the replacement listener on the SAME port, into a fresh smoltcp socket.
+    let new_listener = build_tcp_socket(new_buf);
+    let new_handle = stack.sockets.add(new_listener);
+    if stack.sockets.get_mut::<tcp::Socket>(new_handle).listen(port).is_err() {
+        // Could not re-arm — roll back the half-built listener so nothing leaks, and report the
+        // connection is still buffered (Pending): the OLD listener slot is untouched, so the next accept
+        // sees ESTABLISHED again and retries the peel.
+        stack.sockets.remove(new_handle);
+        free_tcp_buf(stack, new_buf);
+        return AcceptOutcome::Pending;
+    }
+    // Commit: the established socket becomes the CONNECTION in the fresh slot (keeps its buffer set); the
+    // listener slot is RE-ARMED in place with the new listening socket. The listener slot keeps its
+    // socket-id AND generation (no bump) so the caller's listener handle stays valid; the connection slot
+    // carries whatever generation it currently holds (the mint reads it), like any fresh open.
+    stack.reg[conn_sid] = Some((estab_handle, owner, SockKind::Tcp(estab_buf)));
+    stack.reg[lsid] = Some((new_handle, owner, SockKind::Tcp(new_buf)));
+    // The connection slot is not a listener; the listener slot keeps listening on the same port.
+    if conn_sid < NSOCK {
+        stack.listen_port[conn_sid] = 0;
+    }
+    AcceptOutcome::Connected(conn_sid)
 }
 
 // --- the boot UDP round-trip witness (M1), driven one-shot from service_net knob-on ---
@@ -1253,44 +1391,55 @@ fn tcp_dns_roundtrip() -> (bool, usize) {
     (true, n)
 }
 
-// --- the TCP SERVER witness (SOCK-6 M2), driven STATEFUL from service_net knob-on ---
+// --- the TCP SERVER witness (SOCK-6/7 M2), driven STATEFUL from service_net knob-on ---
 //
 // Unlike SOCK-1..3/5 (one-shot, guest-INITIATED round-trips hermetic under slirp), a server witness
 // needs a peer to connect INTO the guest — which slirp's NAT will not do. The witness therefore ARMS a
-// listener and stays LISTENING across service_net passes, awaiting `scripts/net-inject.py`'s gateway-side
-// active-open under `UNAOS_NET=socket`. Under the default (hermetic) slirp backend no peer ever connects,
-// so it prints the honest `witness PENDING` note once and keeps listening cheaply (light per-pass pump) —
-// the mission stays green; the `witness OK` line is emitted only when a real inbound connection is
-// accepted + echoed (the injector run). This is the "honest OK/INCOMPLETE" discipline SOCK-2/5 use.
+// PERSISTENT listener and stays LISTENING across service_net passes, awaiting `scripts/net-inject.py`'s
+// gateway-side active-opens under `UNAOS_NET=socket`. Under the default (hermetic) slirp backend no peer
+// ever connects, so it prints the honest SOCK-6 + SOCK-7 `witness PENDING` notes once and keeps listening
+// cheaply (light per-pass pump) — the mission stays green.
+//
+// SOCK-7 extends the SOCK-6 witness into a TWO-accept machine on ONE persistent listener:
+//   * the FIRST inbound connection is accepted + echoed and latches the SOCK-6 `witness OK` line
+//     (basic listen/accept still works — the regression);
+//   * the listener SURVIVES the accept (the SOCK-7 point), so the SECOND inbound connection to the SAME
+//     port is accepted + echoed on the SAME persistent listener and latches the SOCK-7 `witness OK` line.
+// The injector's `sock7` verb drives exactly these two sequential connections. Each accept PEELS a fresh
+// connection socket-id; the listener socket-id is constant across both.
 
-/// SOCK-6 listen port for the server witness (avoids the hand-rolled stack's ports: 7 echo, 7777/7778
+/// SOCK-6/7 listen port for the server witness (avoids the hand-rolled stack's ports: 7 echo, 7777/7778
 /// self-test, 9998/9999 UDP, 53 DNS). `net-inject.py` active-opens here.
 pub const SOCK6_LISTEN_PORT: u16 = 8080;
-/// Witness state: 0 = idle (arm the listener), 1 = listening (poll accept), 2 = serving (connected —
-/// awaiting the peer's probe), 3 = done (connection served + echoed).
+/// Witness state: 0 = idle (arm the persistent listener); 1 = listening for connection #1 (poll accept);
+/// 2 = serving #1 (await its probe, echo, latch SOCK-6 OK); 3 = listening for connection #2 on the SAME
+/// persistent listener; 4 = serving #2 (echo, latch SOCK-7 OK); 5 = done.
 static WITNESS6_STATE: AtomicU32 = AtomicU32::new(0);
 /// service_net call counter — settle past SOCK-3's witness before arming.
 static WITNESS6_TICKS: AtomicU32 = AtomicU32::new(0);
-/// The listening socket-id, stored between passes (the socket lives in the persistent set, owned by the
-/// kernel `usize::MAX` row so no ring-3 teardown frees it). `usize::MAX` = none armed yet.
+/// The PERSISTENT listening socket-id, stored between passes (the socket lives in the persistent set,
+/// owned by the kernel `usize::MAX` row so no ring-3 teardown frees it). Constant across both accepts —
+/// the SOCK-7 point. `usize::MAX` = none armed yet.
 static WITNESS6_SID: AtomicUsize = AtomicUsize::new(usize::MAX);
-/// The one-shot PENDING note prints exactly once even though the listener may RE-ARM across a
+/// The PEELED connection socket-id currently being served (set by each accept). `usize::MAX` = none.
+static WITNESS7_CONN: AtomicUsize = AtomicUsize::new(usize::MAX);
+/// The one-shot PENDING notes print exactly once even though the machine may RE-ARM across a
 /// frame-stealing-lost attempt (the two RX drains — hand-rolled `poll()` and the smolnet pump — race
 /// for inbound frames; a lost handshake/probe just re-arms and retries rather than latching INCOMPLETE).
 static WITNESS6_PENDING_SHOWN: AtomicBool = AtomicBool::new(false);
 /// Warm up past SOCK-3's witness (WARMUP 40) so the boot self-test + the ICMP/UDP/TCP witnesses settle.
 const WITNESS6_WARMUP: u32 = 56;
 
-/// SOCK-6 server witness (M2), STATEFUL across `service_net` passes: arm a TCP LISTENER on
-/// `SOCK6_LISTEN_PORT`, then each pass poll `accept`; when a peer connects, receive its probe, echo it
-/// back, close, and emit the UNCOUNTED `witness OK` line. Proves the listen/accept seam carries a real
-/// inbound connection end to end. Runs on the BSP main loop AFTER the NET_DEVICE guard drops (the pumps
-/// re-lock NET_DEVICE per ring op). No-op once served / no NIC. The ring-3 `sys_listen`/`sys_accept`
-/// syscalls wrap this exact seam.
+/// SOCK-6/7 server witness (M2), STATEFUL across `service_net` passes: arm a PERSISTENT TCP LISTENER on
+/// `SOCK6_LISTEN_PORT`, accept + echo a FIRST inbound connection (SOCK-6 OK), then — the listener having
+/// survived — accept + echo a SECOND inbound connection on the SAME listener (SOCK-7 OK). Proves the
+/// persistent listen/accept seam carries repeated inbound connections. Runs on the BSP main loop AFTER
+/// the NET_DEVICE guard drops (the pumps re-lock NET_DEVICE per ring op). No-op once both served / no NIC.
+/// The ring-3 `sys_listen`/`sys_accept` syscalls wrap this exact seam.
 pub fn witness_tick6() {
     let state = WITNESS6_STATE.load(Ordering::Relaxed);
-    if state == 3 {
-        return; // a connection was already accepted, its probe echoed, and the witness latched
+    if state == 5 {
+        return; // both connections were accepted + echoed and the SOCK-7 witness latched
     }
     if WITNESS6_TICKS.fetch_add(1, Ordering::Relaxed) < WITNESS6_WARMUP {
         return;
@@ -1300,8 +1449,8 @@ pub fn witness_tick6() {
     }
 
     if state == 0 {
-        // Arm the listener. Kernel ownership (`usize::MAX`) — never a ring-3 slot, so
-        // `free_row_sockets` for a real task never frees it; it is closed explicitly below.
+        // Arm the persistent listener. Kernel ownership (`usize::MAX`) — never a ring-3 slot, so
+        // `free_row_sockets` for a real task never frees it; it is closed explicitly below on teardown.
         let Some(sid) = stack_open_tcp(usize::MAX) else {
             return; // no free slot / no NIC yet — retry next pass
         };
@@ -1311,30 +1460,36 @@ pub fn witness_tick6() {
         }
         WITNESS6_SID.store(sid, Ordering::Relaxed);
         WITNESS6_STATE.store(1, Ordering::Relaxed);
-        // Announce the armed listener exactly once (re-arms after a lost attempt stay quiet).
+        // Announce the armed persistent listener exactly once (re-arms after a lost attempt stay quiet).
         if !WITNESS6_PENDING_SHOWN.swap(true, Ordering::Relaxed) {
             serial_println!(
                 ":: SOCK-6: smoltcp tcp listen :{} armed — awaiting inbound connect (UNAOS_NET=socket injector) — witness PENDING ::",
+                SOCK6_LISTEN_PORT
+            );
+            serial_println!(
+                ":: SOCK-7: persistent listener :{} armed — awaiting a SECOND inbound connect (survives accept) — witness PENDING ::",
                 SOCK6_LISTEN_PORT
             );
         }
         return;
     }
 
-    let sid = WITNESS6_SID.load(Ordering::Relaxed);
+    let lsid = WITNESS6_SID.load(Ordering::Relaxed);
 
-    if state == 1 {
-        // Listening — poll accept (a light bounded pump per pass; the injector re-drives).
-        match stack_accept(sid) {
-            AcceptOutcome::Connected => {
-                // A peer completed the handshake — advance to SERVING (await its probe). Do NOT recv
-                // here: the probe may not have landed yet, so serving gets its own patient passes.
-                WITNESS6_STATE.store(2, Ordering::Relaxed);
+    // States 1 & 3: LISTENING — poll accept on the persistent listener (a light bounded pump per pass;
+    // the injector re-drives). Each accept peels a fresh connection socket-id; the listener survives.
+    if state == 1 || state == 3 {
+        match stack_accept(lsid) {
+            AcceptOutcome::Connected(conn_sid) => {
+                // A peer completed the handshake — remember the peeled connection + advance to SERVING.
+                // Do NOT recv here: the probe may not have landed yet, so serving gets its own passes.
+                WITNESS7_CONN.store(conn_sid, Ordering::Relaxed);
+                WITNESS6_STATE.store(if state == 1 { 2 } else { 4 }, Ordering::Relaxed);
             }
             AcceptOutcome::Pending => { /* still listening — poll again next pass */ }
             AcceptOutcome::NotListening => {
-                // The listener vanished / never armed — re-arm on the next pass.
-                stack_close(sid);
+                // The listener vanished / never armed — re-arm from scratch on the next pass.
+                stack_close(lsid);
                 WITNESS6_SID.store(usize::MAX, Ordering::Relaxed);
                 WITNESS6_STATE.store(0, Ordering::Relaxed);
             }
@@ -1342,27 +1497,39 @@ pub fn witness_tick6() {
         return;
     }
 
-    // State 2: serving — the connection is ESTABLISHED; wait (across passes) for the peer's probe,
-    // echo it, and latch OK. A clean EOF before any probe means the peer closed early — re-arm.
+    // States 2 & 4: SERVING — the peeled connection is ESTABLISHED; wait (across passes) for the peer's
+    // probe, echo it, close the CONNECTION (never the persistent listener), and latch the OK line. A clean
+    // EOF before any probe means the peer closed early — drop the connection and go back to listening.
+    let conn = WITNESS7_CONN.load(Ordering::Relaxed);
     let mut buf = [0u8; 64];
-    match stack_recv(sid, &mut buf) {
+    match stack_recv(conn, &mut buf) {
         RecvOutcome::Data(n) => {
-            let sent = stack_send(sid, &buf[..n]).unwrap_or(0);
-            stack_close(sid);
-            WITNESS6_STATE.store(3, Ordering::Relaxed);
-            serial_println!(
-                ":: SOCK-6: smoltcp tcp accept :{} — received {} bytes, echoed {} back — witness {} ::",
-                SOCK6_LISTEN_PORT, n, sent,
-                if sent == n { "OK" } else { "INCOMPLETE" }
-            );
+            let sent = stack_send(conn, &buf[..n]).unwrap_or(0);
+            stack_close(conn); // close the CONNECTION; the listener `lsid` stays armed (persistent)
+            WITNESS7_CONN.store(usize::MAX, Ordering::Relaxed);
+            if state == 2 {
+                WITNESS6_STATE.store(3, Ordering::Relaxed); // first accept done — listen for the second
+                serial_println!(
+                    ":: SOCK-6: smoltcp tcp accept :{} — received {} bytes, echoed {} back — witness {} ::",
+                    SOCK6_LISTEN_PORT, n, sent,
+                    if sent == n { "OK" } else { "INCOMPLETE" }
+                );
+            } else {
+                WITNESS6_STATE.store(5, Ordering::Relaxed); // second accept done — latch SOCK-7 OK
+                serial_println!(
+                    ":: SOCK-7: smoltcp tcp accept :{} #2 — received {} bytes, echoed {} back on a PERSISTENT listener (second inbound connection accepted after the first was consumed) — witness {} ::",
+                    SOCK6_LISTEN_PORT, n, sent,
+                    if sent == n { "OK" } else { "INCOMPLETE" }
+                );
+            }
         }
         RecvOutcome::WouldBlock => { /* connected, no probe yet — retry recv next pass */ }
         RecvOutcome::Eof => {
-            // The peer closed before sending a probe (a lost/aborted attempt) — re-arm and let the
-            // injector retry, rather than latch a false INCOMPLETE.
-            stack_close(sid);
-            WITNESS6_SID.store(usize::MAX, Ordering::Relaxed);
-            WITNESS6_STATE.store(0, Ordering::Relaxed);
+            // The peer closed before sending a probe (a lost/aborted attempt) — drop the connection and
+            // go back to LISTENING on the persistent listener, rather than latch a false INCOMPLETE.
+            stack_close(conn);
+            WITNESS7_CONN.store(usize::MAX, Ordering::Relaxed);
+            WITNESS6_STATE.store(if state == 2 { 1 } else { 3 }, Ordering::Relaxed);
         }
     }
 }

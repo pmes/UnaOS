@@ -897,6 +897,95 @@ def test_smoltcp_server(s, guest_mac, port=8080, budget_s=40.0):
     return False
 
 
+def one_connection(s, guest_mac, port, probe, deadline):
+    """SOCK-7: drive ONE full inbound connection into the guest's persistent smoltcp listener —
+    handshake (SYN retransmit until SYN-ACK) -> ACK -> probe (retransmit until the guest echoes it) ->
+    FIN. Returns True once the guest echoes `probe`, else False at the deadline. A fresh client port per
+    attempt dodges TIME_WAIT; the guest re-arms after a lost attempt, so retrying the whole exchange is
+    always safe."""
+    MASK = 0xFFFFFFFF
+    s.settimeout(0.4)
+    attempt = 0
+    while time.time() < deadline:
+        attempt += 1
+        cport = 50080 + (attempt % 4000)
+        c_isn = (0x6000 + 0x400 * attempt) & MASK
+
+        def cs(seq, ack, flags, payload=b""):
+            send_frame(s, eth(guest_mac, MY_MAC, 0x0800,
+                              ipv4(MY_IP, GUEST_IP, 6, tcp(cport, port, seq, ack, flags, 4096, MY_IP, GUEST_IP, payload))))
+
+        # Retransmit the SYN until a SYN-ACK comes back (a bare RST => no listener yet, keep trying).
+        sa = None
+        for _ in range(8):
+            cs(c_isn, 0, SYN)
+            r = recv_tcp(s, cport, timeout=0.4)
+            if r is not None and (r[0] & (SYN | ACK)) == (SYN | ACK):
+                sa = r
+                break
+            if time.time() >= deadline:
+                break
+        if sa is None:
+            continue  # no SYN-ACK this round — fresh port, retry
+        s_isn = sa[1]
+        cs((c_isn + 1) & MASK, (s_isn + 1) & MASK, ACK)          # complete the handshake
+        # Send the probe, retransmitting until the echo comes back (or this attempt gives up).
+        for _ in range(20):
+            cs((c_isn + 1) & MASK, (s_isn + 1) & MASK, PSH | ACK, probe)
+            r = recv_tcp(s, cport, timeout=0.4)
+            if r is not None and r[3] == probe:
+                nb = len(probe)
+                cs((c_isn + 1 + nb) & MASK, (s_isn + 1 + nb) & MASK, FIN | ACK)  # close our half
+                return True, attempt
+            if time.time() >= deadline:
+                break
+    return False, attempt
+
+
+def test_smoltcp_persistent(s, guest_mac, port=8080, budget_s=60.0):
+    """SOCK-7: TWO sequential inbound connections to the SAME persistent listener :port. The FIRST proves
+    basic accept still works (the guest latches its SOCK-6 witness OK); the SECOND is the entire point —
+    pre-SOCK-7 the listener was CONSUMED by the first accept, so a second connect would be refused. The
+    guest's persistent listener survives the first accept and accepts the second, latching SOCK-7 OK."""
+    print("--- SOCK-7 persistent listener: two sequential connects to %s:%d ---" % (ipstr(GUEST_IP), port))
+    deadline = time.time() + budget_s
+    ok1, a1 = one_connection(s, guest_mac, port, b"sock7-first", deadline)
+    if not ok1:
+        print("FAIL: first inbound connection to :%d never accepted + echoed" % port)
+        return False
+    print("<- connection #1 echoed on :%d (attempt %d)   [GUEST SOCK-6 ACCEPT OK]" % (port, a1))
+    ok2, a2 = one_connection(s, guest_mac, port, b"sock7-second", deadline)
+    if not ok2:
+        print("FAIL: SECOND inbound connection to :%d never accepted (listener not persistent?)" % port)
+        return False
+    print("<- connection #2 echoed on :%d (attempt %d)   [GUEST SOCK-7 PERSISTENT LISTENER OK]" % (port, a2))
+    return True
+
+
+def main_sock7():
+    """Focused SOCK-7 witness: connect to the QEMU socket netdev, resolve the guest MAC, and drive TWO
+    sequential inbound connections into the guest's PERSISTENT smoltcp listener (proving it survives the
+    first accept). Kept separate from the full hand-rolled-stack suite, like `main_sock6`."""
+    s = None
+    for _ in range(120):
+        try:
+            s = socket.create_connection((HOST, PORT), timeout=2)
+            break
+        except OSError:
+            time.sleep(0.5)
+    if s is None:
+        print("FAIL: could not connect to QEMU socket netdev at %s:%d" % (HOST, PORT))
+        return 1
+    print("connected to %s:%d" % (HOST, PORT))
+    s.settimeout(2)
+    time.sleep(3)  # let the guest bring up e1000 + arm its persistent listener
+    guest_mac = resolve_guest_mac(s)
+    if guest_mac is None:
+        print("FAIL: no ARP reply from guest (could not resolve 10.0.2.15)")
+        return 1
+    return 0 if test_smoltcp_persistent(s, guest_mac, port=8080) else 1
+
+
 def main_sock6():
     """Focused SOCK-6 witness: connect to the QEMU socket netdev, resolve the guest MAC, and drive the
     inbound smoltcp-server test. Kept separate from the full hand-rolled-stack suite so the server
@@ -1075,8 +1164,12 @@ def main():
 
 
 if __name__ == "__main__":
-    # `net-inject.py [host:port] [sock6]` — with the `sock6` mode arg, run ONLY the focused SOCK-6
-    # server witness (active-open into the guest's smoltcp listener); otherwise the full hand-rolled suite.
+    # `net-inject.py [host:port] [sock6|sock7]` — `sock6` runs ONLY the focused SOCK-6 server witness
+    # (one inbound connection); `sock7` runs the SOCK-7 persistent-listener witness (TWO sequential
+    # inbound connections to the same port — the second proves the listener survived the first accept);
+    # otherwise the full hand-rolled suite.
+    if "sock7" in sys.argv[1:]:
+        sys.exit(main_sock7())
     if "sock6" in sys.argv[1:]:
         sys.exit(main_sock6())
     sys.exit(main())

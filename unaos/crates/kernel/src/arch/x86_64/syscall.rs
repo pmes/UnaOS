@@ -2950,15 +2950,16 @@ fn sys_listen(handle: u64, port: u64) -> i64 {
 /// a listening Socket handle carrying `CAP_READ` (accepting an inbound connection is a receiving
 /// authority). NON-BLOCKING with a ring-3 poll model like `sys_connect`: pumps a bounded loop chasing an
 /// inbound handshake; `-EAGAIN` = none yet (ring 3 re-invokes accept); `-EINVAL` = the socket is not
-/// armed for listen (never listened / already closed / wrong kind). On success the listening smoltcp
-/// socket has become the ESTABLISHED connection IN PLACE, so this mints a fresh `KIND_SOCKET` handle
-/// aliasing the SAME gen-fenced socket-id (the SOCK-4 multi-handle-to-one-socket pattern). The minted
-/// rights are the INTERSECTION of `CAP_READ|CAP_WRITE|CAP_GRANT` with the LISTENER handle's current
-/// rights — accept is a derivation, not a mint-from-nothing, so an ATTENUATED listener (e.g. a
+/// armed for listen (never listened / already closed / wrong kind). SOCK-7 (PERSISTENT LISTENER): on
+/// success the established connection is PEELED into a FRESH gen-fenced socket-id and the LISTENER is
+/// re-armed in place, so the listener handle stays valid and can be `sys_accept`'d again — each call
+/// mints a `KIND_SOCKET` handle for the NEW connection socket-id (not an alias of the listener). The
+/// minted rights are the INTERSECTION of `CAP_READ|CAP_WRITE|CAP_GRANT` with the LISTENER handle's
+/// current rights — accept is a derivation, not a mint-from-nothing, so an ATTENUATED listener (e.g. a
 /// `CAP_READ`-only SOCK-4 grantee) cannot amplify itself a full-rights connection (the SOCK-4
 /// attenuation boundary: any bit the holder does not have is an amplification). A full-rights owner
-/// gets the POSIX-like full connection handle and may `SYS_XFER` it to a handler (inetd-style).
-/// Single-accept-per-listen: to accept again, open + listen a fresh socket.
+/// gets the POSIX-like full connection handle and may `SYS_XFER` it to a handler (inetd-style) while the
+/// listener keeps accepting.
 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
 fn sys_accept(handle: u64) -> i64 {
     let row = caller_row();
@@ -2967,13 +2968,14 @@ fn sys_accept(handle: u64) -> i64 {
         Err(e) => return e,
     };
     match crate::smolnet::stack_accept(sid) {
-        crate::smolnet::AcceptOutcome::Connected => {
-            // Mint a fresh handle for the now-established connection (an alias of the same gen-fenced
-            // socket-id; the gen fence keeps a later close single-owner-correct). No new registry slot /
-            // buffers are consumed — the connection rides the listener socket's in place.
+        crate::smolnet::AcceptOutcome::Connected(conn_sid) => {
+            // Mint a fresh handle for the PEELED connection (its own gen-fenced socket-id; the listener
+            // socket-id `sid` remains armed and its handle valid). The connection occupies its own reg
+            // slot + stream buffers; the listener was re-armed on a fresh buffer set inside `stack_accept`.
             let Some(h) = handle_install(row, HANDLE_RESERVING) else {
-                // No handle slot free — the connection stays reachable via the listener handle (which is
-                // now the established connection), so nothing leaks; ring 3 retries for a slot.
+                // No handle slot free — the peeled connection is owned by this row and reachable on the
+                // next accept-drained slot; ring 3 retries for a handle slot. (The connection is not lost:
+                // it lives in its reg slot until the row's teardown or an explicit close reaps it.)
                 return EAGAIN;
             };
             handle_set_kind(row, h, KIND_SOCKET);
@@ -2982,7 +2984,7 @@ fn sys_accept(handle: u64) -> i64 {
             let listener_rights =
                 HANDLE_RIGHTS[row][handle as usize].load(Ordering::Acquire);
             handle_set_rights(row, h, (CAP_READ | CAP_WRITE | CAP_GRANT) & listener_rights);
-            handle_set(row, h, sock_id_pack(sid));
+            handle_set(row, h, sock_id_pack(conn_sid));
             h as i64
         }
         crate::smolnet::AcceptOutcome::Pending => EAGAIN,

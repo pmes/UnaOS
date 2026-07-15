@@ -438,13 +438,94 @@ serial log carries the `witness OK` line.
 
 ### Residuals (ledgered)
 
-- **Single-accept-per-listen.** The listener socket becomes the connection; there is no persistent-listener
-  acceptor pool. A future arc can decouple the per-slot stream buffers from the registry slot to keep a
-  listener live across accepts (or pre-arm a listener pool on one port).
+- **Single-accept-per-listen.** ✅ **RESOLVED by SOCK-7** (below) — the listener now survives accepts.
 - **The witness is a stateful BSP-loop poll, not a ring-3 fixture.** The two syscalls are the delivered
   ring-3 surface (cap-gated, `SockKind`-tagged) and wrap the exact `stack_listen`/`stack_accept` seam the
   witness exercises over the wire; a dedicated ring-3 accept fixture is deferred.
 - **`copy_from_user` for socket buffers** remains the deferred hardening all of SOCK-2..6 carry.
+
+## SOCK-7 — persistent-listener acceptor pool (the listener survives accepts)
+
+SOCK-6's listener was **consumed** by its accept: smoltcp has no listen→child model — a completed handshake
+transitions the *listening* socket to ESTABLISHED **in place**, so the listener *became* the connection and a
+second inbound connect to the same port was refused. SOCK-7 makes `sys_listen` arm a **persistent** listener:
+each `sys_accept` hands the caller a fresh connection and the port **keeps listening**. Same knob
+(`UNAOS_SMOLNET`), x86-only, byte-identical knob-off / aarch64. **No new syscall** (the two SOCK-6 numbers
+26/27 are unchanged; next free stays **28**) and **no new ring-3 surface** — the change is behind the
+existing `sys_accept`.
+
+### The mechanism (design shape (i): decouple stream buffers from the registry slot)
+
+Two shapes were on the table: **(i)** decouple the per-slot stream buffers from the reg-slot index so an
+accepted connection can be peeled to a fresh slot while the listener slot re-arms; **(ii)** a pre-armed pool
+of N listeners on one port (accepted ones peel off, the pool re-arms). **Shape (i) was chosen** — it is the
+minimal enabling primitive, needs **no extra BSS** (the existing `NSOCK` TCP buffer sets suffice), and both
+shapes ultimately require the same decoupling (a pool socket that becomes ESTABLISHED must still hand its
+buffers to a connection while a fresh listener takes over). Shape (ii)'s reserved-slot pool would only add
+kernel-internal listener slots on top of this same primitive.
+
+The buffers were previously **pinned to the reg-slot index** (`TCP_RX_DATA`/`TCP_TX_DATA[sid]`). SOCK-7 turns
+them into a small **free-list**: `SmolStack` gains `tcp_buf_used: [bool; NSOCK]`, and a `Tcp` reg entry now
+carries the buffer-set index its socket was built from (`SockKind::Tcp(buf)`). On accept, when the listener
+socket reaches ESTABLISHED, `peel_and_rearm` (under a single `STACK`-lock hold, no pump):
+
+1. **peels** the established smoltcp socket — which keeps the buffer set it already owns — into a **fresh reg
+   slot** (the connection the caller gets a handle for); and
+2. **re-arms** the original listener slot **in place** with a brand-new smoltcp socket on a **fresh buffer
+   set**, listening again on the same port (recorded by `stack_listen` in `SmolStack.listen_port[sid]`).
+
+The listener slot keeps its **socket-id and its generation** (no bump), so the caller's listener handle stays
+valid across unbounded accepts; each accept returns a **fresh gen-fenced connection socket-id**. Bounded by
+`NSOCK`: peeling needs a free reg slot **and** a free buffer set. The invariant *used buffer sets = live TCP
+sockets ≤ used reg slots* means **whenever a reg slot is free, a buffer set is free too** — the peel never
+starves. When **neither** is free (all `NSOCK` slots busy), the completed handshake stays buffered in the
+listener socket and is peeled by a later accept once a slot frees (`Pending`/`-EAGAIN`) — never lost, and the
+listener is never consumed. `ring 3`'s `sys_accept` now mints the `KIND_SOCKET` handle for the **peeled
+connection socket-id** (not an alias of the listener), still deriving rights as the **intersection** of
+`CAP_READ|CAP_WRITE|CAP_GRANT` with the listener handle's current rights (the SOCK-4 attenuation boundary is
+unchanged).
+
+### The witness (net-inject `sock7`, `UNAOS_NET=socket`)
+
+`smolnet::witness_tick6()` is extended into a **two-accept** stateful BSP-loop machine on **one persistent
+listener** (port `8080`): it accepts + echoes a **first** inbound connection (latching the SOCK-6 line — basic
+accept still works, the regression), the listener **survives**, then accepts + echoes a **second** connection
+to the same port (latching the SOCK-7 line — the whole point). `scripts/net-inject.py sock7` drives exactly
+these two sequential connections (handshake → probe → echo-verify → close, twice). Under the **default
+(hermetic) slirp** backend no peer connects, so both honest PENDING notes print once and it keeps listening
+cheaply:
+
+```
+:: SOCK-6: smoltcp tcp listen :8080 armed — awaiting inbound connect (UNAOS_NET=socket injector) — witness PENDING ::
+:: SOCK-7: persistent listener :8080 armed — awaiting a SECOND inbound connect (survives accept) — witness PENDING ::
+```
+
+Under `UNAOS_NET=socket` with the `sock7` injector it completes and emits **both** OK lines — the second is
+the proof the listener was not consumed by the first accept:
+
+```
+:: SOCK-6: smoltcp tcp accept :8080 — received 11 bytes, echoed 11 back — witness OK ::
+:: SOCK-7: smoltcp tcp accept :8080 #2 — received 12 bytes, echoed 12 back on a PERSISTENT listener (second inbound connection accepted after the first was consumed) — witness OK ::
+```
+
+Reproduce (hermetic, both PENDING): `UNAOS_SMOLNET=1 ./arroyo test 90` — MISSION SUCCESS plus the two PENDING
+lines and the SOCK-1/2/3/5 lines intact. Reproduce (persistent round-trip, both OK): launch the builder with
+`UNAOS_NET=socket UNAOS_SMOLNET=1 UNAOS_TEST_SECS=85 ./arroyo test 90` and, concurrently,
+`python3 scripts/net-inject.py 127.0.0.1:5555 sock7` — the injector prints `GUEST SOCK-6 ACCEPT OK` then
+`GUEST SOCK-7 PERSISTENT LISTENER OK`, and the serial log carries both `witness OK` lines. (Under the socket
+netdev there is no slirp DNS/DHCP responder, so the guest-initiated SOCK-2/3/5 DNS/DHCP witnesses read
+INCOMPLETE on that medium — inherent to the injector backend, not a regression; they pass under slirp.)
+
+### Residuals (ledgered)
+
+- **The persistent listener holds one reg slot + one buffer set for its lifetime**, leaving `NSOCK − 1` for
+  concurrent connections. Adequate for the witness (one connection at a time) and small servers; a larger
+  listener/connection budget is a sizing change (grow `NSOCK` + the static buffer arrays), not a design one.
+- **NSOCK back-pressure buffers, does not queue.** When all slots are busy a completed handshake waits in the
+  listener socket until a slot frees (accept returns `-EAGAIN`); there is no separate accept backlog queue.
+- **The witness is a stateful BSP-loop poll, not a ring-3 fixture** (as SOCK-6) — a dedicated ring-3
+  persistent-accept fixture is deferred; `sys_accept` is the delivered, cap-gated ring-3 surface.
+- **`copy_from_user` for socket buffers** remains the deferred hardening all of SOCK-2..7 carry.
 
 ## The road from here
 
@@ -455,5 +536,6 @@ serial log carries the `witness OK` line.
 | SOCK-3 | TCP client sockets (`sys_connect`/`sys_send`/`sys_sock_recv`, #23–25) + gen-fenced socket handles + chunked-lock TCP pump, ring 3 gets a byte stream |
 | SOCK-4 | transferable sockets — `sys_socket` mints `CAP_GRANT`, `sys_recv` migrates socket ownership, a socket cap moves cross-row (gen-fenced, single-owner); no new syscall |
 | SOCK-5 | DHCP via smoltcp — the persistent stack leases its own address with `dhcpv4::Socket`; no new syscall, no ring-3 surface, static fallback |
-| **SOCK-6** (this) | TCP server/listen sockets (`sys_listen`/`sys_accept`, #26–27) — ring 3 accepts inbound TCP; accept mints a fresh gen-fenced socket cap; net-inject `UNAOS_NET=socket` witness |
-| SOCK-7+ | persistent-listener acceptor pool; aarch64 NIC bring-up; retire the hand-rolled shell surface + `crates/net` DHCP |
+| SOCK-6 | TCP server/listen sockets (`sys_listen`/`sys_accept`, #26–27) — ring 3 accepts inbound TCP; accept mints a fresh gen-fenced socket cap; net-inject `UNAOS_NET=socket` witness |
+| **SOCK-7** (this) | persistent-listener acceptor pool — `sys_listen` arms a listener that survives accepts; each `sys_accept` peels a fresh gen-fenced connection + re-arms the listener in place (buffer free-list, shape (i)); no new syscall; net-inject `sock7` two-connection witness |
+| SOCK-8+ | aarch64 NIC bring-up; DNS resolver / sinkhole; retire the hand-rolled shell surface + `crates/net` DHCP |
