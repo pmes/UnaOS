@@ -8432,6 +8432,11 @@ pub fn u7_launcher(demo_cpu: usize) {
     // create/delete never perturbs K3-mount's exact-two-entries `ls`. Its own uncounted
     // `:: K4-write: … PASS ::` line; an honest skip on media without a unafs partition.
     crate::fs::unafs::k4_write_selftest();
+    // K6: prove the U6 owner/grants ACL round-trips through the native unafs attribute volume (the
+    // sidecar's successor) — forward+reverse codec, write+read+clear via the coherent mount. Runs
+    // LAST, fully self-cleaning (leaves only the staged K3 fixtures). Its own uncounted
+    // `:: K6-migrate: … PASS ::` line; honest skip on media without a unafs partition.
+    k6_migrate_selftest();
 }
 
 /// F2 M3 witness worker — the `demo_cpu` half of the cross-core FAT_MUTATION stress. `fn(usize)` for
@@ -8861,6 +8866,71 @@ fn rights_native_value(rights: u32, out: &mut [u8]) -> Option<usize> {
     }
     out[..s.len()].copy_from_slice(s);
     Some(s.len())
+}
+
+// =====================================================================================================
+// K6: the REVERSE codec — native attribute STRING -> `PrincipalRecord`. The mount-time migration/rebuild
+// reads the native `owner`/`grants:*` attributes back and reconstructs the durable principals. The
+// LOAD-BEARING invariant (the 240-bit-prefix rule): reversing a projection MUST reproduce the exact
+// `PrincipalRecord` a fresh mint would produce, byte-for-byte, so a migrated owner stays re-acquirable
+// (`k4_ready_selftest`'s migration-landmine KAT + the K6 witness are the guards). Fail-closed: an
+// unparseable string yields `None` -> that owner is not installed (public), never a forged owner.
+// =====================================================================================================
+
+/// K6: one lowercase/uppercase hex nibble -> value, or `None` if not a hex digit.
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// K6: reverse of [`principal_native_string`]. `prog:<name>` -> a `PROGRAM_NAME` principal whose value
+/// is the verbatim string (identical to `PrincipalRecord::program_name(<name>)` byte-for-byte, since
+/// that mint stores `prog:<name>` in `value`). `sha256:<60 lowercase hex>` -> an `IMAGE_SHA256`
+/// principal carrying the decoded 30-byte (240-bit) digest prefix (identical to the loader's
+/// `image_of` mint, which stores the SAME 30-byte prefix). Any other/short/malformed string -> `None`.
+fn principal_from_native(s: &[u8]) -> Option<PrincipalRecord> {
+    if let Some(rest) = s.strip_prefix(b"sha256:") {
+        // Exactly 60 hex chars == the 30-byte prefix; anything else is not a native IMAGE_SHA256 owner.
+        if rest.len() != PRIN_VALUE_LEN * 2 {
+            return None;
+        }
+        let mut value = [0u8; PRIN_VALUE_LEN];
+        for (i, chunk) in rest.chunks_exact(2).enumerate() {
+            let hi = hex_nibble(chunk[0])?;
+            let lo = hex_nibble(chunk[1])?;
+            value[i] = (hi << 4) | lo;
+        }
+        return Some(PrincipalRecord { kind: PRIN_IMAGE_SHA256, len: PRIN_VALUE_LEN as u8, value });
+    }
+    if s.starts_with(b"prog:") {
+        // `program` stores the verbatim bytes (truncated to 30) with kind PROGRAM_NAME — the exact
+        // inverse of `principal_native_string`'s verbatim copy for a PROGRAM_NAME principal.
+        if s.len() > PRIN_VALUE_LEN {
+            return None; // a projected prog: string never exceeds 30 bytes; a longer one is malformed
+        }
+        return Some(PrincipalRecord::program(s));
+    }
+    None
+}
+
+/// K6: reverse of [`rights_native_value`]. `rw`->R|W, `r`->R, `w`->W; `-`/anything else -> 0 (no
+/// rights = not a live grant). Never panics.
+fn rights_from_native(s: &[u8]) -> u32 {
+    match s {
+        b"rw" => CAP_READ | CAP_WRITE,
+        b"r" => CAP_READ,
+        b"w" => CAP_WRITE,
+        _ => 0,
+    }
+}
+
+/// K6: reverse of [`grant_native_key`]. Strip the `grants:` prefix, then reverse the grantee principal.
+fn grantee_from_grant_key(key: &[u8]) -> Option<PrincipalRecord> {
+    principal_from_native(key.strip_prefix(b"grants:")?)
 }
 
 // M2.1: the launcher's principal STAMP table — the persistent PrincipalRecord assigned to each address-space
@@ -10834,6 +10904,109 @@ fn k4_ready_selftest() {
         if w == all { "PASS" } else { "FAIL" },
         w,
         all
+    );
+}
+
+// ===================================================================================================
+// K6: NATIVE-ATTR MIGRATION witness — prove the U6 owner/grants ACL round-trips through the native
+// unafs attribute volume (retiring the `UNAFS.ATR` sidecar). Runs LAST in the storage chain (after
+// `k4_write_selftest`), fully self-cleaning so the STATEFUL card never accumulates and `k3_mount`'s
+// exact-two-entries `ls` holds on the next boot. One uncounted `:: K6-migrate: … PASS [w=0x..] ::`
+// line. Honest skip on media without a unafs partition. Bits grow across the milestones: M1 = the
+// forward+reverse codec round-trip in RAM and on-disk through the native seam.
+// ===================================================================================================
+
+/// K6 synthetic scratch keys — a FAT directory-slot identity that no real fixture uses (a made-up LBA
+/// well past any staged directory), so the ACL file it writes never collides with a live owned file.
+const K6_SCRATCH_LBA: u64 = 0xC6_C600;
+const K6_SCRATCH_OFF: u32 = 0x60;
+
+/// K6 M1: does a `PrincipalRecord` survive forward-projection (`principal_native_string`) and reverse
+/// (`principal_from_native`) byte-for-byte? This is the 240-bit-prefix invariant a migrated owner rests
+/// on. Returns false on any projection failure.
+fn k6_principal_roundtrips(p: &PrincipalRecord) -> bool {
+    let mut buf = [0u8; K4_STR_MAX];
+    match principal_native_string(p, &mut buf) {
+        Some(n) => principal_from_native(&buf[..n]) == Some(*p),
+        None => false,
+    }
+}
+
+/// K6 migration + native-store witness. See the section header. Self-cleaning.
+fn k6_migrate_selftest() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if crate::fs::unafs::locate().is_err() {
+        serial_println!(":: K6-migrate: no unafs volume — skipped ::");
+        return;
+    }
+
+    let mut w = 0u32;
+
+    // A PROGRAM_NAME owner and an IMAGE_SHA256 owner — the two migratable principal kinds.
+    let prog = PrincipalRecord::program_name("K6OWN.BIN");
+    let img = PrincipalRecord::image_of(b"k6-image-bytes");
+    let grantee = PrincipalRecord::program_name("K6GRT.BIN");
+
+    // bit0: PROGRAM_NAME owner round-trips through the codec (forward + reverse == identity).
+    if k6_principal_roundtrips(&prog) {
+        w |= 1 << 0;
+    }
+    // bit1: IMAGE_SHA256 owner round-trips (the 240-bit-prefix rule — migrated == fresh mint).
+    if k6_principal_roundtrips(&img) {
+        w |= 1 << 1;
+    }
+
+    // Project an owner + one grant to native strings and write them through the native seam.
+    let mut ob = [0u8; K4_STR_MAX];
+    let mut gk = [0u8; K4_STR_MAX];
+    let mut rv = [0u8; 2];
+    let on = principal_native_string(&img, &mut ob);
+    let gn = grant_native_key(&grantee, &mut gk);
+    let rn = rights_native_value(CAP_READ, &mut rv);
+    let mut wrote = false;
+    if let (Some(on), Some(gn), Some(rn)) = (on, gn, rn) {
+        wrote = crate::fs::unafs::native_acl_write(
+            K6_SCRATCH_LBA,
+            K6_SCRATCH_OFF,
+            "K6OWN.BIN",
+            0x123,
+            &ob[..on],
+            &[(&gk[..gn], &rv[..rn])],
+        );
+    }
+    // bit2: the native write committed.
+    if wrote {
+        w |= 1 << 2;
+    }
+
+    // bit3: read the row back and reverse-project — owner == fresh mint, grant == (grantee, R),
+    // name/first_cluster preserved (proof the native store carries the durable ACL end-to-end).
+    if let Some(row) = crate::fs::unafs::native_acl_read(K6_SCRATCH_LBA, K6_SCRATCH_OFF) {
+        let owner_ok = principal_from_native(&row.owner) == Some(img);
+        let key_ok = row.name == "K6OWN.BIN" && row.first_cluster == 0x123;
+        let grant_ok = row.grants.len() == 1
+            && grantee_from_grant_key(&row.grants[0].0) == Some(grantee)
+            && rights_from_native(&row.grants[0].1) == CAP_READ;
+        if owner_ok && key_ok && grant_ok {
+            w |= 1 << 3;
+        }
+    }
+
+    // bit4: clear the row (self-clean) — the read now returns None (delete durable through the mount).
+    let cleared = crate::fs::unafs::native_acl_clear(K6_SCRATCH_LBA, K6_SCRATCH_OFF);
+    crate::fs::unafs::force_remount();
+    if cleared && crate::fs::unafs::native_acl_read(K6_SCRATCH_LBA, K6_SCRATCH_OFF).is_none() {
+        w |= 1 << 4;
+    }
+
+    let all = 0x1fu32;
+    serial_println!(
+        ":: K6-migrate: native owner/grants round-trip through the unafs attribute volume (codec forward+reverse, write+read+clear via the coherent mount) {} [w={:#04x}] ::",
+        if w == all { "PASS" } else { "FAIL" },
+        w
     );
 }
 

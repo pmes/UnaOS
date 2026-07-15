@@ -48,8 +48,11 @@
 //! `docs/SECURITY.md` §K4 for the full scope.
 
 use alloc::format;
-use alloc::string::String;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
+
+use ::unafs::inode::AttributeValue;
 
 use spin::Mutex;
 
@@ -209,6 +212,209 @@ pub fn force_remount() {
     crate::arch::without_interrupts(|| {
         *MOUNT.lock() = None;
     });
+}
+
+// =====================================================================================================
+// K6: the NATIVE ACL SEAM — the U6 owner/grants ACL stored as native unafs TYPED ATTRIBUTES, retiring
+// the FAT-bridge `UNAFS.ATR` sidecar. The unafs volume is a DEDICATED ATTRIBUTE volume this arc (VFS
+// verdict 2): the kernel is its only client, there is NO user-visible unafs namespace.
+// =====================================================================================================
+//
+// LAYOUT. Each owned FAT file has exactly one unafs file in the volume root, named `acl-<lba>-<off>`
+// (hex of its FAT directory-slot identity `(dir_lba, dir_off)` — the same runtime key the in-RAM
+// `OWNED_FILES` table uses, so a runtime persist/clear is an O(1) `resolve_path`, not a scan). The
+// file carries typed attributes:
+//   `name`  : String  — the FAT 8.3 name (the DURABLE rebuild key; a recycled slot is only a hint,
+//                       so mount re-resolves BY NAME exactly like `atr_rebuild_into_owned`);
+//   `fc`    : Int      — first_cluster (identity corroboration; 0 = unknown/0-length);
+//   `owner` : String  — the owner principal's canonical native string (`principal_native_string`);
+//   `grants:<grantee>` : String — one attribute per grant, KEY = `grant_native_key(grantee)`,
+//                                  VALUE = `rights_native_value(rights)`.
+// The owner/grant byte strings are pre-projected by the caller (`syscall.rs`, the K4-ready codec) so
+// this module stays ACL-policy-agnostic: it carries opaque `&[u8]` key/value pairs and never derives
+// a principal. The reverse projection (native string -> `PrincipalRecord`) lives with the codec.
+//
+// COHERENCE + ORDERING. Every access flows through the one process-wide, IRQ-masked [`with_unafs`]
+// mount and each attribute mutation is a journaled `set_attribute`/`remove_attribute`/`unlink` (the K4
+// write path — new-extents-first, single-block metadata swap, free-last: a power cut LEAKS, never
+// dangles). The K3 two-phase (durable-first) and K5 (ns-spanned snapshot+write) orderings are
+// PRESERVED by the caller in `syscall.rs`: those callers hold the FAT `NAMESPACE` lock across their
+// OWNED_FILES snapshot AND this native write, so the lock still fuses the two exactly as it did for the
+// sidecar; the store the write targets is immaterial to that serialization. Lock order gains one edge:
+// `NAMESPACE ⊃ MOUNT` (no path ever takes MOUNT then NAMESPACE).
+
+/// K6: the volume-root file name for the ACL row of the FAT file at `(dir_lba, dir_off)`.
+fn acl_file_name(dir_lba: u64, dir_off: u32) -> String {
+    format!("acl-{:x}-{:x}", dir_lba, dir_off)
+}
+
+/// K6: one ACL row read back from the native attribute volume. Byte strings are the on-disk native
+/// projections; the caller reverses them into principals. `name` is the durable FAT re-resolve key.
+pub struct NativeAclRow {
+    pub name: String,
+    pub first_cluster: u32,
+    pub owner: Vec<u8>,
+    /// `(grant_native_key, rights_native_value)` byte strings, one per grant.
+    pub grants: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+/// True iff `e` is the "absent" signal (a missing file/name), which the idempotent clear/read paths
+/// treat as "nothing there", distinct from a real I/O error.
+fn is_absent(e: &FileSystemError) -> bool {
+    matches!(e, FileSystemError::NotFound | FileSystemError::RootMissing)
+}
+
+/// K6: write (create-or-replace) the ACL row for `(dir_lba, dir_off)` — the `atr_persist_row` /
+/// `atr_write_grant_row_locked` native successor. Rewrites owner + grants WHOLESALE: stale `grants:*`
+/// attributes not present in `grants` are removed first, so a revoke (a narrower grant set) durably
+/// drops the revoked edge. `owner`/grant strings are the caller's pre-projected native bytes. Returns
+/// `true` iff every journaled step committed; `false` on any mount or write error (the caller treats a
+/// persist failure as non-fatal for a grow/re-persist, or fail-closed for a create).
+pub fn native_acl_write(
+    dir_lba: u64,
+    dir_off: u32,
+    name: &str,
+    first_cluster: u32,
+    owner: &[u8],
+    grants: &[(&[u8], &[u8])],
+) -> bool {
+    let owner_s = match core::str::from_utf8(owner) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    with_unafs(|fs| {
+        let root = fs.superblock.root_inode;
+        let fname = acl_file_name(dir_lba, dir_off);
+        let id = match fs.resolve_path(&format!("/{}", fname)) {
+            Ok(id) => id,
+            Err(ref e) if is_absent(e) => match fs.create_file(root, fname) {
+                Ok(id) => id,
+                Err(_) => return false,
+            },
+            Err(_) => return false,
+        };
+        // Remove any stale grant attributes no longer in the caller's set (the revoke path).
+        let stale: Vec<String> = match fs.read_inode(id) {
+            Ok(ino) => ino
+                .attributes
+                .keys()
+                .filter(|k| k.starts_with("grants:"))
+                .filter(|k| !grants.iter().any(|(gk, _)| *gk == k.as_bytes()))
+                .cloned()
+                .collect(),
+            Err(_) => return false,
+        };
+        for k in stale {
+            if fs.remove_attribute(id, &k).is_err() {
+                return false;
+            }
+        }
+        // Refresh the durable key fields + owner + the current grant set (journaled writes).
+        if fs
+            .set_attribute(id, "name".to_string(), AttributeValue::String(name.to_string()))
+            .is_err()
+            || fs
+                .set_attribute(id, "fc".to_string(), AttributeValue::Int(first_cluster as i64))
+                .is_err()
+            || fs
+                .set_attribute(id, "owner".to_string(), AttributeValue::String(owner_s.to_string()))
+                .is_err()
+        {
+            return false;
+        }
+        for (gk, rv) in grants {
+            let (ks, vs) = match (core::str::from_utf8(gk), core::str::from_utf8(rv)) {
+                (Ok(k), Ok(v)) => (k, v),
+                _ => return false,
+            };
+            if fs
+                .set_attribute(id, ks.to_string(), AttributeValue::String(vs.to_string()))
+                .is_err()
+            {
+                return false;
+            }
+        }
+        true
+    })
+    .unwrap_or(false)
+}
+
+/// K6: read back the ACL row for `(dir_lba, dir_off)`, or `None` if there is no row (public) or the
+/// mount fails. The read is pure (no metadata write-back through the coherent mount). Used by the
+/// migration read-back verify and by a native single-row lookup.
+pub fn native_acl_read(dir_lba: u64, dir_off: u32) -> Option<NativeAclRow> {
+    with_unafs(|fs| {
+        let fname = acl_file_name(dir_lba, dir_off);
+        let id = fs.resolve_path(&format!("/{}", fname)).ok()?;
+        native_acl_row_of(fs, id)
+    })
+    .ok()
+    .flatten()
+}
+
+/// K6: extract a [`NativeAclRow`] from an already-resolved ACL-file inode. A row with no `owner`
+/// attribute yields `None` (public / not an ACL). Shared by the single-row read and the list walk.
+fn native_acl_row_of(fs: &mut KernelUnaFS, id: u64) -> Option<NativeAclRow> {
+    let ino = fs.read_inode(id).ok()?;
+    let owner = match ino.attributes.get("owner") {
+        Some(AttributeValue::String(s)) => s.as_bytes().to_vec(),
+        _ => return None,
+    };
+    let name = match ino.attributes.get("name") {
+        Some(AttributeValue::String(s)) => s.clone(),
+        _ => return None,
+    };
+    let first_cluster = match ino.attributes.get("fc") {
+        Some(AttributeValue::Int(v)) => *v as u32,
+        _ => 0,
+    };
+    let mut grants: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    for (k, v) in ino.attributes.iter() {
+        if let (true, AttributeValue::String(rv)) = (k.starts_with("grants:"), v) {
+            grants.push((k.as_bytes().to_vec(), rv.as_bytes().to_vec()));
+        }
+    }
+    Some(NativeAclRow { name, first_cluster, owner, grants })
+}
+
+/// K6: clear the ACL row for `(dir_lba, dir_off)` — the `atr_clear_row` native successor. Deletes the
+/// unafs ACL file (journaled), reverting the FAT file to public. Idempotent: an absent row is already
+/// clear (`true`); only a real mount/I-O error is `false`.
+pub fn native_acl_clear(dir_lba: u64, dir_off: u32) -> bool {
+    with_unafs(|fs| {
+        let root = fs.superblock.root_inode;
+        let fname = acl_file_name(dir_lba, dir_off);
+        match fs.unlink(root, &fname) {
+            Ok(_) => true,
+            Err(ref e) if is_absent(e) => true, // already public on disk
+            Err(_) => false,
+        }
+    })
+    .unwrap_or(false)
+}
+
+/// K6: every ACL row on the volume — the mount-time rebuild source (the `atr_rebuild_into_owned`
+/// native successor reads this and re-resolves each `name` on the FAT volume). Skips non-`acl-` files
+/// and rows without an owner. On a mount error, an empty list (fail-closed: no owners installed).
+pub fn native_acl_list() -> Vec<NativeAclRow> {
+    with_unafs(|fs| {
+        let root = fs.superblock.root_inode;
+        let mut out = Vec::new();
+        let entries = match fs.ls(root) {
+            Ok(e) => e,
+            Err(_) => return out,
+        };
+        for e in entries {
+            if e.kind != ::unafs::FileKind::File || !e.name.starts_with("acl-") {
+                continue;
+            }
+            if let Some(row) = native_acl_row_of(fs, e.inode_id) {
+                out.push(row);
+            }
+        }
+        out
+    })
+    .unwrap_or_default()
 }
 
 /// The K3HELLO.TXT fixture contents, byte-pinned against what `arroyo kernel8`
