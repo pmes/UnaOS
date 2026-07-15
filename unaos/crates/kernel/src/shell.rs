@@ -1603,6 +1603,111 @@ fn split_flags<'a>(args: &[&'a str]) -> (bool, bool, bool, Vec<&'a str>) {
     (recursive, force, no_clobber, paths)
 }
 
+// ---------------------------------------------------------------------------------------------
+// JD18 — read-only TREE TOOLS: `find` (recursive glob search), `du` (subtree size tally),
+// `uptime` (seconds since boot from the arch counter). All THREE are pure reads — ZERO mutation,
+// no fat.rs edit (call-never-edit): they compose the same `read_dir` SNAPSHOT walk as JD9 `cp_tree`
+// and JD13 `rm_tree`, the JD12 `glob_match`, and (for `uptime`) the JD17 clock's additive
+// `uptime_secs()` helper. `.`/`..` are filtered at every level and recursion is bounded by the
+// shared `CP_MAX_DEPTH` (honest `-ELOOP`); a mid-walk read error stops with an honest path + errno
+// and the partial results already printed (nothing invented). FAT directory ENTRIES report size 0,
+// so only file sizes contribute real bytes to a `du` tally — a directory's size is the sum of its
+// files, recursively.
+
+/// JD18 running tally for `find`: hits printed, and directories scanned (each `read_dir` level,
+/// the root included) — the honest denominator for the closing summary.
+struct FindStats {
+    matches: u32,
+    dirs: u32,
+}
+
+/// JD18: recursively walk the directory (cluster `dir_cluster`, canonical `dir_canon`), matching each
+/// entry's 8.3 name against `pat` with the JD12 `glob_match` (case-insensitive; a literal pattern is an
+/// exact-name match). A hit prints its full canonical path — a directory with a trailing `/`. `.`/`..`
+/// are skipped; every subdirectory is recursed into (whether or not its own name matched). SNAPSHOT
+/// per level (`read_dir` before any descent — a pure read never mutates, but the idiom stays uniform
+/// with the JD9/JD13 walkers). Depth-capped at `CP_MAX_DEPTH` (honest `-ELOOP`); a read error stops
+/// with a formatted `path: reason (-EIO)` and leaves the already-printed hits standing.
+fn find_walk(
+    console: &mut Console,
+    fs: &FatFs,
+    dir_cluster: u32,
+    dir_canon: &str,
+    pat: &str,
+    depth: u32,
+    stats: &mut FindStats,
+) -> Result<(), String> {
+    if depth > CP_MAX_DEPTH {
+        return Err(alloc::format!(
+            "{}: maximum directory depth {} exceeded (-ELOOP)", dir_canon, CP_MAX_DEPTH));
+    }
+    stats.dirs += 1; // this directory level is being scanned
+    let entries = fs
+        .read_dir(dir_cluster)
+        .map_err(|e| alloc::format!("{}: read failed ({:?}, -EIO)", dir_canon, e))?;
+    for de in &entries {
+        let nm = de.name();
+        if nm == "." || nm == ".." {
+            continue;
+        }
+        let child = joined(dir_canon, nm);
+        if glob_match(pat, nm) {
+            stats.matches += 1;
+            if de.is_dir {
+                console.println(&alloc::format!("{}/", child));
+            } else {
+                console.println(&child);
+            }
+        }
+        if de.is_dir {
+            find_walk(console, fs, de.first_cluster(), &child, pat, depth + 1, stats)?;
+        }
+    }
+    Ok(())
+}
+
+/// JD18 `find <root> <pattern>`: recursively search the tree under `<root>` (a directory path;
+/// default `.` when only a pattern is given) for entries whose 8.3 name matches `<pattern>` (the JD12
+/// glob engine — `*`/`?`, case-insensitive; a literal is an exact match). Prints each hit as its full
+/// canonical path, then an honest `N match(es), M dir(s) scanned` tally. A missing root is `-ENOENT`;
+/// a FILE root degrades to a single self-match test (the POSIX shape — `find` a file tests that file);
+/// a mid-walk I/O error reports the path + errno with the partial hits/count already shown.
+fn fs_find(console: &mut Console, root_arg: &str, pat: &str) {
+    let fs = match crate::fs::fat::mount() {
+        Ok(fs) => fs,
+        Err(e) => return console.println(&alloc::format!("find: no FAT filesystem ({:?})", e)),
+    };
+    let norm = normalize_path(&cwd_path(), root_arg);
+    let mut stats = FindStats { matches: 0, dirs: 0 };
+    match resolve_path(&fs, &norm) {
+        Ok(Resolved::Root) => {
+            if let Err(msg) = find_walk(console, &fs, 0, "", pat, 1, &mut stats) {
+                console.println(&alloc::format!("find: {}", msg));
+            }
+            console.println(&alloc::format!(
+                "{} match(es), {} dir(s) scanned", stats.matches, stats.dirs));
+        }
+        Ok(Resolved::Entry(de, canon)) => {
+            if de.is_dir {
+                if let Err(msg) = find_walk(console, &fs, de.first_cluster(), &canon, pat, 1, &mut stats) {
+                    console.println(&alloc::format!("find: {}", msg));
+                }
+                console.println(&alloc::format!(
+                    "{} match(es), {} dir(s) scanned", stats.matches, stats.dirs));
+            } else {
+                // A file root: the POSIX self-match test — the root itself is the only candidate.
+                if glob_match(pat, de.name()) {
+                    console.println(&canon);
+                    stats.matches += 1;
+                }
+                console.println(&alloc::format!(
+                    "{} match(es), 0 dir(s) scanned", stats.matches));
+            }
+        }
+        Err(msg) => console.println(&alloc::format!("find: {}", msg)),
+    }
+}
+
 pub struct History {
     entries: Vec<String>,
     position: usize,
@@ -1654,6 +1759,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             console.println("FLAGS:    default is no-clobber; -f = force overwrite (rm: quiet on missing), -n = no-clobber");
             console.println("WILDCARD: * / ? in the last path component — ls/cat/rm/cp/mv expand it (e.g. rm *.TMP, cp *.TXT DOCS/)");
             console.println("          (create/edit/delete/copy/move files & dirs anywhere in the tree; sync = write-through, durable)");
+            console.println("TREE:     find [root] <pattern>  (recursive glob search over the tree)");
             #[cfg(target_arch = "aarch64")]
             console.println("UNAFS:    uls [path], ucat <path>  (native unafs volume, absolute paths)");
             #[cfg(target_arch = "aarch64")]
@@ -1803,6 +1909,17 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                     let n = args.get(1).and_then(|s| s.parse::<u32>().ok()).unwrap_or(10);
                     fs_tail(console, path, n);
                 }
+            }
+        },
+        "find" => {
+            // JD18: recursive glob search over the tree — `find <root> <pattern>` (one arg = the
+            // pattern, root defaults to `.`). Read-only walk; prints each hit's canonical path then
+            // an honest `N match(es), M dir(s) scanned` tally. Missing root → -ENOENT; a file root
+            // degrades to a self-match test; a mid-walk read error reports the partial results.
+            match args.len() {
+                0 => console.println("usage: find [root] <pattern>"),
+                1 => fs_find(console, ".", args[0]),
+                _ => fs_find(console, args[0], args[1]),
             }
         },
         #[cfg(target_arch = "aarch64")]
