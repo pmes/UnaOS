@@ -48,10 +48,15 @@ static mut SECONDARY_STACKS: [SecStack; NUM_CORES] =
     [const { SecStack([0; SEC_STACK_SIZE]) }; NUM_CORES];
 
 // The secondary entry stub. Runs with the MMU OFF at EL2 (x0-x3 = 0 per the spin-table protocol).
-// It sets SP to this core's stack top, then tail-calls the Rust entry. Position-independent absolute
-// symbol references (adrp/add, and `sym`) resolve to the correct address because the kernel is
-// identity-mapped (VA == PA). Kept out of `.text.boot` on purpose — it's reached by address, not by
-// being first in the image.
+// It reads its Aff0 into x0 and sets SP to this core's stack top, then tail-calls the Rust entry.
+// Position-independent absolute symbol references (adrp/add, and `sym`) resolve to the correct
+// address because the kernel is identity-mapped (VA == PA). Kept out of `.text.boot` on purpose —
+// it's reached by address, not by being first in the image.
+//
+// NOTE: the Aff0 passed in x0 is ADVISORY. `__secondary_rust` ignores it and re-derives the core id
+// from MPIDR_EL1 after `enable_mmu` — the MMU-off read here can be spilled to the stack and reloaded
+// stale-cacheable on >1 MiB BCM2711 images (the CORE3-SMP hazard; see arch_arm64.md §CORE3-SMP FIX).
+// The asm below is unchanged; only the id's *consumer* moved past the MMU turn-on.
 #[cfg(not(feature = "core3probe"))]
 core::arch::global_asm!(
     r#"
@@ -156,14 +161,40 @@ unsafe extern "C" {
 /// takes a spinlock), then brings up this core's private state: exception vectors, per-CPU block
 /// (TPIDR_EL2), GIC CPU interface, the IPI SGI, and IRQ unmask. It then idles in WFE, waking to
 /// service inter-processor interrupts (M3 will replace the idle with the scheduler).
+///
+/// The incoming `_advisory` argument (Aff0 that the asm stub read MMU-off) is **advisory only** and
+/// deliberately ignored: on real BCM2711 silicon, when the loaded image crosses 1 MiB the compiler's
+/// MMU-off stack spill of that argument (`stp x0,[sp,#..]`) is reloaded cacheable after `enable_mmu`
+/// and can hit a stale (zero) L2 line — the mismatched-attributes coherency hazard that produced the
+/// deterministic "phantom core 0" (id 3 → 0) regression (see §CORE3-SMP FIX, arch_arm64.md; metal
+/// probe verdict `[03E2X0]` proved delivery correct + kernel-side corruption). We re-derive the id
+/// fresh from `MPIDR_EL1` AFTER the MMU is on, so every store/load of the id is cacheable-coherent.
 #[unsafe(no_mangle)]
-extern "C" fn __secondary_rust(core_raw: u64) -> ! {
-    let core = core_raw as usize;
+extern "C" fn __secondary_rust(_advisory: u64) -> ! {
     // Drop this core EL2 -> EL1 (matching the BSP) BEFORE the MMU, so its locks/atomics run at EL1.
     // Each core must do its own drop: VMPIDR/CNTHCTL/CPTR/CPACR/SP_EL1 are all banked per-core.
     unsafe { boot::drop_to_el1() };
     // MMU on, using the L1 table the BSP already built (`enable_mmu` touches no per-core state).
     unsafe { boot::enable_mmu() };
+
+    // Re-derive this core's id from MPIDR_EL1 with the MMU ON — the structural fix for CORE3-SMP.
+    // `drop_to_el1` seeds VMPIDR_EL2 with the real MPIDR (boot.rs), so this EL1 read returns the
+    // physical Aff0. Both this `mrs` and any spill of the derived value execute cacheable, so there
+    // is no MMU-off store / MMU-on reload pair for a stale line to poison (unlike the asm stub's
+    // argument, which we ignore). Idiom mirrors gic::mpidr_affinity.
+    let mpidr: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, MPIDR_EL1", out(reg) mpidr, options(nomem, nostack, preserves_flags))
+    };
+    let core = (mpidr & 0xff) as usize;
+    // Bounds-check before indexing CORE_READY/percpu/etc. On a garbage affinity, park this core in a
+    // low-power WFE loop rather than panic through a possibly-unsound path: a parked core is exactly
+    // the pre-fix failure mode (the BSP times it out and runs on the cores it has), never worse.
+    if core >= NUM_CORES {
+        loop {
+            unsafe { core::arch::asm!("wfe", options(nomem, nostack, preserves_flags)) };
+        }
+    }
     // Per-core VBAR_EL2 so a fault on this core is caught rather than jumping to a stale vector.
     exceptions::install();
     // Per-CPU data reachable via TPIDR_EL2 (the IPI handler resolves its counter through this).

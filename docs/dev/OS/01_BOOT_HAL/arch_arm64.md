@@ -105,10 +105,14 @@ Two release mechanisms, selected by platform:
 
 #### Open investigation: core-3 bring-up vs image size (CORE3-SMP)
 
-**Status: root cause NOT established from static analysis — no code fix shipped.**
-This section records a reproducible, image-size-correlated Pi 4 metal regression and
-the analysis that rules out the kernel-side hypotheses, so the next attended bench can
-resolve it with targeted instrumentation rather than re-deriving the ground.
+**Status: ROOT CAUSE FOUND + FIX SHIPPED (QEMU-green; metal 4/4 confirmation pending the
+attended bench).** The 2026-07-15 probe bench proved core-3 delivery correct and the id-0
+corruption kernel-side; disassembly of the >1 MiB build then pinned the exact mechanism (an
+MMU-off stack spill of the core-id argument reloaded stale-cacheable after `enable_mmu`), and
+the fix re-derives the id from `MPIDR_EL1` with the MMU on. See **⚡ PROBE VERDICT** and
+**✅ FIX** below. The static-analysis narrative that follows is preserved as the record of what
+was ruled out — note hypothesis 5 ("`core_raw` is preserved") is the one the probe + codegen
+overturned.
 
 **Symptom (attended A-B-A bench, real Pi 4 / BCM2711, 2026-07-14).** With the same
 silicon, card, and power supply minutes apart (thermal/environment excluded), the
@@ -187,15 +191,56 @@ x0 = 0 — on the same boot as the phantom "core 0 online" + "core 3 did not com
 Decision-table row 1: firmware/armstub delivery of core 3 is CORRECT and `MPIDR_EL1` does
 NOT read 0. Both surviving below-kernel mechanisms are REFUTED — **the id-0 corruption is
 KERNEL-SIDE, after the asm stub**: somewhere in `__secondary_rust`/`drop_to_el1`/the
-`core_raw` argument path, a correctly-read id 3 becomes 0, only on ≥1 MiB images (a
-size-dependent spill/clobber or stack/cache interaction past the prologue — hypothesis 5
-above, "core_raw is preserved," is the one the probe overturns; the compiler-spill
-assumption is now the prime suspect and must be verified against the actual codegen of the
->1 MiB build). The fix arc re-scopes onto that path. Probe-idiom note for any multi-core
-rerun: the three secondaries write the PL011 DR unarbitrated, so racing records drop or
-corrupt (QEMU's modeled FIFO hid this; only one clean record survives per metal boot) — add
-a UART mutex or MPIDR-staggered delay if a future probe needs all three in one boot. Until
-the fix lands, core-3-down on >1 MiB images remains the expected signature (30/32).
+`core_raw` argument path, a correctly-read id 3 becomes 0, only on ≥1 MiB images. (Probe-idiom
+note for any multi-core rerun: the three secondaries write the PL011 DR unarbitrated, so racing
+records drop or corrupt — QEMU's modeled FIFO hid this, only one clean record survives per metal
+boot; add a UART mutex or MPIDR-staggered delay if a future probe needs all three in one boot.)
+
+**✅ FIX (CORE3-FIX arc, 2026-07-15 — mechanism proven by disassembly, structural fix shipped).**
+Disassembling `<__secondary_rust>` from the >1 MiB build
+(`llvm-objdump -d target/aarch64-base/release/unaos-kernel`) proved the mechanism the probe
+predicted, and overturned hypothesis 5 above. The pre-fix codegen spilled the `core_raw`
+argument to the **stack with the MMU off**, then reloaded it **cacheable after `enable_mmu`**:
+
+```
+d95e4: stp x30, x0, [sp,#0x10]   ; core_raw (x0) spilled to sp+0x18 — MMU OFF (Device/non-cacheable → DRAM)
+d95f0: bl  drop_to_el1
+d95f4–d9634: (enable_mmu inlined) ; MMU + D-cache turn ON here
+d96b4: add x9, sp, #0x18          ; serial_println! passes &core = pointer to the spill slot
+d96d8: ldr x0, [sp,#0x18]         ; RELOAD (cacheable) feeds CORE_READY[core] index + wait_and_run(core)
+d96f4: stlrb w19, [x8]            ; CORE_READY[core].store(true), x8 indexed by the reloaded value
+```
+
+The MMU-off store writes DRAM directly; the post-`enable_mmu` cacheable reloads can hit a stale
+(zero) L2 line for that stack address — the BSP runs cacheable over all RAM and can speculatively
+allocate lines in `SECONDARY_STACKS` (which `_start` zeroed). That reproduces the phantom exactly:
+percpu/GIC/timer init use a callee-saved copy (`x19` = correct id 3), but the print, `CORE_READY`
+index, and `wait_and_run` use the stale-reloaded spill (id 0). It is QEMU-invisible (TCG models no
+caches) and image-size-deterministic because stale-line residency in the 1 MiB L2 is layout-dependent.
+This is the same mismatched-attributes coherency class as the spin-table slot's `DC CVAC` note.
+Hypothesis 5's "compiler spills to a callee-saved register" was half-right — it *also* spills to the
+stack, and `serial_println!`'s Display-by-reference forces the pointer-to-slot that keeps the stack
+copy load-bearing.
+
+**The fix (`smp.rs::__secondary_rust`):** ignore the incoming argument (now `_advisory`) and
+re-derive the id from `MPIDR_EL1` **after** `drop_to_el1()` + `enable_mmu()` (`mrs`, `& 0xff`).
+`drop_to_el1` seeds `VMPIDR_EL2` with the real MPIDR, so the EL1 read returns the physical Aff0;
+and because the `mrs` and every spill of the derived value now execute with the MMU on, each
+store/load pair is cacheable-coherent — the stale-line window is deleted, not patched (no cache
+maintenance on the stack, no reliance on registers surviving `drop_to_el1`). The derived id is
+bounds-checked (`< NUM_CORES`); on garbage the core parks in a `wfe` loop (the pre-fix failure
+mode, never worse) rather than panicking through a possibly-unsound path. Post-fix disassembly
+confirms it: `d9634: mrs x8, MPIDR_EL1` sits **after** the `SCTLR_EL1` write (MMU on), the id
+spill `d9640: str x8,[sp,#0x18]` and its reload `d96ec: ldr x0,[sp,#0x18]` are both MMU-on, and
+the advisory x0 is no longer spilled at all. The asm stubs are unchanged (x0 became advisory);
+`smp_virt.rs`/`boot_virt.rs`/`boot_tegra.rs` are out of lane — the analogous virt/Tegra pattern is
+flagged upward separately.
+
+**Gate:** `./arroyo check` green both arches; `kernel8` builds clean; `kernel8-test` byte-equivalent
+(41 PASS, CAPSTONE 6/6 on APs [1,2,3], K3-mount `[w=0x1ff]` + K4-write `[w=0x7f]` + F2/F3 locked
+240000/240000, 0 forbidden); `test-arm` MISSION SUCCESS (virt untouched). **Metal 4/4 confirmation
+on a >1 MiB build is pending the attended bench** (LC-pi coordinates) — the real verdict, since QEMU
+brings up 4/4 at every size and can never reproduce the regression.
 
 **Scheduler on the `virt` path — the boot core, since JC3.** The aarch64 scheduler
 was `#[cfg(feature = "baremetal")]`-gated and coupled to EL1 (`ELR_EL1`/`SPSR_EL1`
