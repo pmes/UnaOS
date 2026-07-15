@@ -5791,13 +5791,13 @@ fn sys_write_file(asid: u64, file_id: u64, buf: u64, len: u64) -> i64 {
     FILE_CLUSTER[asid as usize][idx].store(new_first, Ordering::Release);
     FILE_SIZE[asid as usize][idx].store(new_size, Ordering::Release);
     FILE_OFFSET[asid as usize][idx].store(offset + wrote as u32, Ordering::Release);
-    // K2 M(b): a file just GREW — if it has a NAMED owner (a persisting principal), re-persist its UNAFS.ATR
-    // row's first_cluster/size so the create-time `first_cluster = 0` becomes the real chain head and the
+    // K2 M(b) / K6 M3: a file just GREW — if it has a NAMED owner (a persisting principal), re-persist its
+    // NATIVE ACL row's first_cluster so the create-time `fc = 0` becomes the real chain head and the
     // rebuild's identity cross-check engages. NO-OP with ZERO disk I/O for an anonymous owner (the whole
     // battery, incl. the u10 GROW.BIN fixture), so this path stays byte-identical. Runs AFTER the descriptor
-    // republish, OUTSIDE any inner lock (atr_persist_grow probes the owner, then snapshots + writes the single row
+    // republish, OUTSIDE any inner lock (native_persist_grow probes the owner, then snapshots + writes the row
     // under ONE ns — K5 M1). Non-fatal — losing it only weakens the out-of-scope offline-tamper corroboration.
-    let _ = atr_persist_grow(&fs, dir_lba, dir_off as u32, new_first, new_size);
+    let _ = native_persist_grow(dir_lba, dir_off as u32, new_first);
     wrote as i64
 }
 
@@ -6422,26 +6422,15 @@ fn sys_open(name_ptr: u64, name_len: u64, mode: u64) -> i64 {
     handle_set_kind(asid, h, KIND_FILE);
     handle_set_rights(asid, h, rights);
     handle_set(asid, h, file_id);
-    // K1 M2.3: WRITE-THROUGH persist of a NEW private file owned by a NAMED principal, so ownership SURVIVES
-    // REBOOT. Runs AFTER the create + owner row + handle are all committed (a fully-successful private create),
-    // OUTSIDE the namespace lock (atr_persist_row takes its own fresh ns for the single-row write; atr_ensure's
-    // create must not run under ns). Gated on `caller_ppid.kind != NONE` — the anonymous battery never reaches
-    // the disk here, so the 23-fixture path stays byte-identical. A persist failure is non-fatal: the in-RAM ACL
-    // still enforces THIS boot; only cross-reboot survival is lost (and fails closed to PUBLIC on the next mount).
+    // K1 M2.3 / K6 M3: WRITE-THROUGH persist of a NEW private file owned by a NAMED principal, so ownership
+    // SURVIVES REBOOT — now onto the NATIVE unafs attribute volume (the K4-journaled write path), not the
+    // retired UNAFS.ATR sidecar. Runs AFTER the create + owner row + handle are all committed (a fully-
+    // successful private create), OUTSIDE the caller's namespace lock (native_persist_create takes its own
+    // fresh ns for the row write). Gated on `caller_ppid.kind != NONE` — the anonymous battery never reaches
+    // the disk here, so the 23-fixture path stays byte-identical. A persist failure is non-fatal: the in-RAM
+    // ACL still enforces THIS boot; only cross-reboot survival is lost (fails closed to PUBLIC at next mount).
     if created && asid != 0 && mode & O_PUBLIC == 0 && caller_ppid.kind != PRIN_NONE {
-        if let Some(name11) = atr_name_from_str(name) {
-            let empty_grants = [(PrincipalRecord::NONE, 0u32); NFGRANT];
-            let _ = atr_persist_row(
-                &fs,
-                name11,
-                de.first_cluster(),
-                de.size,
-                dir_lba,
-                dir_off as u32,
-                caller_ppid,
-                &empty_grants,
-            );
-        }
+        let _ = native_persist_create(name, de.first_cluster(), dir_lba, dir_off as u32, caller_ppid);
     }
     h as i64
 }
@@ -6603,9 +6592,14 @@ fn sys_unlink(handle: u64) -> i64 {
     // K3 (fold): a SWALLOWED clear failure would strand a stale owner row on disk (a dead fail-closed slot a
     // future same-name file could adopt), so gate the destructive `0xE5` name delete on the durable clear
     // ACTUALLY landing — abort with `-EIO` if it did not (fail-closed: the name still resolves, the owner
-    // retries; nothing stranded). `atr_clear_row` returns true for every benign case (no store / no row /
-    // partial image), so only a real disk read/write error trips this; the anonymous battery skips it entirely.
-    if owner_ppid.kind != PRIN_NONE && !atr_clear_row(&fs, dir_lba, dir_off as u32) {
+    // retries; nothing stranded). K6 M3: the durable store is now the NATIVE attribute volume
+    // (`native_acl_clear`); the sidecar `atr_clear_row` stays as defense in depth for a stale card carrying
+    // an un-migrated legacy row of this same file (benign true when no store/row exists — the battery skips
+    // both entirely: only a real disk error trips this).
+    if owner_ppid.kind != PRIN_NONE
+        && !(crate::fs::unafs::native_acl_clear(dir_lba, dir_off as u32)
+            && atr_clear_row(&fs, dir_lba, dir_off as u32))
+    {
         return EIO;
     }
     // F3-M3: the NAMESPACE hold — the whole 0xE5 -> owned_clear -> mark-pending -> descriptor-drop sequence
@@ -6780,14 +6774,12 @@ fn sys_fgrant(file_handle: u64, child_handle: u64, rights: u64) -> i64 {
         );
     }
     let rc = owned_grant(dir_lba, dir_off, asid, asid_gen, grantee_asid, grantee_gen, rights, caller_ppid, grantee_ppid);
-    // K1 M2.3: if the ACL mutation succeeded on a NAMED-owner file, re-persist the row (owner + grants) so the
-    // grant/revoke SURVIVES REBOOT. The named-owner check is an IN-RAM read (owned_owner_ppid) taken BEFORE the
-    // mount, so an anonymous owner (the whole battery) does ZERO disk I/O here and the sys_fgrant path stays
-    // byte-identical — not even a mount().
-    if rc == 0 && owned_owner_ppid(dir_lba, dir_off).kind != PRIN_NONE {
-        if let Ok(fs) = crate::fs::fat::mount() {
-            let _ = atr_persist_grants(&fs, dir_lba, dir_off);
-        }
+    // K1 M2.3 / K6 M3: if the ACL mutation succeeded on a NAMED-owner file, re-persist the row (owner +
+    // grants) onto the NATIVE attribute volume so the grant SURVIVES REBOOT. The named-owner probe is an
+    // IN-RAM read inside native_persist_grants, so an anonymous owner (the whole battery) does ZERO disk
+    // I/O here and the sys_fgrant path stays byte-identical — no mount of either volume.
+    if rc == 0 {
+        let _ = native_persist_grants(dir_lba, dir_off);
     }
     rc
 }
@@ -6810,21 +6802,19 @@ fn sys_fgrant_revoke_2phase(
     owner_ppid: PrincipalRecord,
     grantee_ppid: PrincipalRecord,
 ) -> i64 {
-    // mount() must run OUTSIDE the namespace lock (ns is NEVER held across a mount) — take it before ns.
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(crate::fs::fat::FatError::NoDisk) => return ENODEV,
-        Err(_) => return EIO,
-    };
     // K5 M1: SPAN the whole snapshot -> disk-narrow -> in-RAM-commit under ONE namespace hold. Without it, a
-    // concurrent full-row re-persist on another core (`atr_persist_grants` / `atr_persist_grow` — both now snapshot
-    // + write under this SAME ns) could snapshot OWNED_FILES with the revoked grant STILL present (our in-RAM
-    // removal not yet committed) and write the FULL row to disk AFTER our disk-narrow, RESURRECTING the revoked
-    // grant on the next mount. The span serializes the two globally: any such re-persist runs either entirely
-    // BEFORE us (its full row is then overwritten by our narrowed write) or entirely AFTER us (it snapshots our
-    // already-narrowed in-RAM set). Legal because NAMESPACE ⊃ OWNED_FILES and `owned_snapshot_row`/`owned_grant`
-    // take-and-release OWNED_FILES WITHIN the ns hold (no inner lock is held when ns is taken → deadlock-free), and
-    // the disk op is the single-sector M1 `write_at` seam (NOT a multi-cluster grow) → the F3 ns-latency rule holds.
+    // concurrent full-row re-persist on another core (`native_persist_grants` / `native_persist_grow` — both
+    // snapshot + write under this SAME ns) could snapshot OWNED_FILES with the revoked grant STILL present (our
+    // in-RAM removal not yet committed) and write the FULL row to disk AFTER our disk-narrow, RESURRECTING the
+    // revoked grant on the next mount. The span serializes the two globally: any such re-persist runs either
+    // entirely BEFORE us (its full row is then overwritten by our narrowed write) or entirely AFTER us (it
+    // snapshots our already-narrowed in-RAM set). Legal because NAMESPACE ⊃ {OWNED_FILES, MOUNT} and
+    // `owned_snapshot_row`/`owned_grant` take-and-release OWNED_FILES WITHIN the ns hold (no inner lock is held
+    // when ns is taken → deadlock-free). K6 M3 (Option A verdict, Maestro 2026-07-15): the disk op is now the
+    // NATIVE journaled multi-sector unafs write, NOT the old single-sector `write_at` seam — the ns span is
+    // DEEPER than the F3-era bound. Accepted on the record: the K5 fusion mechanism is preserved verbatim, and
+    // the deeper IRQ-masked window is a benchable latency watch-item (the K6 bench card measures it), not a
+    // correctness risk. See the K6-M3 NS-SPAN NOTE at the native wrappers.
     let _ns = ns_lock();
     // Snapshot the current ACL and drop the target grantee (matched by its durable persistent principal — the
     // on-disk key; the snapshot carries ppids only). A vanished row (raced unlink) leaves nothing to revoke.
@@ -6836,9 +6826,9 @@ fn sys_fgrant_revoke_2phase(
             *g = (PrincipalRecord::NONE, 0);
         }
     }
-    // Phase 1 (durable-first): write the NARROWED row (the `_locked` core assumes the ns we already hold). On
-    // failure, do NOT commit in-RAM — fail closed.
-    if !atr_write_grant_row_locked(&fs, dir_lba, dir_off, row_owner, &grants) {
+    // Phase 1 (durable-first): write the NARROWED row to the NATIVE store (the `_locked` core assumes the ns we
+    // already hold). On failure, do NOT commit in-RAM — fail closed.
+    if !native_write_grant_row_locked(dir_lba, dir_off, row_owner, &grants) {
         return EIO;
     }
     // Phase 2: disk now reflects the revoke — commit the in-RAM removal (owner already validated), under the SAME ns.
@@ -9568,181 +9558,6 @@ fn atr_clear_row(fs: &crate::fs::fat::FatFs, dir_lba: u64, dir_off: u32) -> bool
     true // no matching row — already public on disk
 }
 
-/// K1 M2.3: re-persist the (owner + grants) of an existing named-owner file after an ACL change (SYS_FGRANT
-/// grant/revoke) — the grant twin of `atr_persist_row`. `sys_fgrant` has no file NAME in scope, so this recovers
-/// the durable name/first_cluster/size from the row already on disk (written at create) and rewrites it with the
-/// CURRENT owner + grant principals snapshotted from OWNED_FILES. No-op (true, ZERO disk I/O) when the owner is
-/// anonymous (NONE) — the whole battery — or when no persisted row exists yet (a create-persist that had failed;
-/// benign — the in-RAM ACL still holds this boot). UNDER ns for the single-row scan + write_at.
-fn atr_persist_grants(fs: &crate::fs::fat::FatFs, dir_lba: u64, dir_off: u32) -> bool {
-    // K5 M1: gate on the owner being NAMED with a light OWNED_FILES probe FIRST — an anonymous/public owner does
-    // ZERO disk I/O and takes NO ns, keeping the whole battery byte-identical. For a NAMED owner, take the ns and
-    // then snapshot + write the full row UNDER that ONE hold, so a concurrent two-phase revoke cannot straddle us:
-    // the snapshot that feeds the disk write is taken under the SAME ns that serializes the revoke's in-RAM
-    // commit, so we can never write a pre-revoke (grant-still-present) row after the revoke narrowed the disk.
-    if owned_owner_ppid(dir_lba, dir_off).kind == PRIN_NONE {
-        return true; // anonymous owner — nothing persists (the battery path; no disk touch, no ns)
-    }
-    let _ns = ns_lock();
-    let Some((owner_ppid, grants)) = owned_snapshot_row(dir_lba, dir_off) else {
-        return true; // row vanished (raced clear) between the probe and the ns — nothing to persist
-    };
-    // Refresh the on-disk row with the CURRENT (post-mutation) in-RAM owner + grants, still under this ns.
-    atr_write_grant_row_locked(fs, dir_lba, dir_off, owner_ppid, &grants)
-}
-
-/// K3/K5: the disk half of `atr_persist_grants`/the two-phase revoke — rewrite the on-disk UNAFS.ATR row for
-/// `(dir_lba, dir_off)` with an EXPLICIT owner + grant set (rather than re-snapshotting from OWNED_FILES), so a
-/// REVOKE can persist the NARROWED row to disk BEFORE it commits the in-RAM removal (see `sys_fgrant_revoke_2phase`).
-/// Preserves the durable name/first_cluster/size already on disk; refreshes only owner + grants. No-op (true, ZERO
-/// disk I/O) for a NONE owner (the whole battery) or when no persisted row exists yet (a create-persist that had
-/// failed — benign; the in-RAM ACL still holds this boot). **K5 M1: the caller MUST already hold the namespace
-/// lock** (`_locked`) — it fuses the OWNED_FILES snapshot the caller took, the single-row scan, and the `write_at`
-/// into one ns span so a concurrent revoke/re-persist cannot straddle the snapshot and the write (the SMP
-/// resurrection window). The disk op is the single-sector M1 seam, so holding ns across it respects the F3 rule.
-fn atr_write_grant_row_locked(
-    fs: &crate::fs::fat::FatFs,
-    dir_lba: u64,
-    dir_off: u32,
-    owner_ppid: PrincipalRecord,
-    grants: &[(PrincipalRecord, u32); NFGRANT],
-) -> bool {
-    if owner_ppid.kind == PRIN_NONE {
-        return true; // anonymous owner — nothing persists (the battery path; no disk touch)
-    }
-    // K3: test-only synthetic durable-write failure (set transiently by `k3_revoke_check`, which self-clears).
-    // Placed AFTER the NONE early-return so the anonymous battery path never observes it — byte-identical there.
-    if K3_TEST_FAIL_PERSIST.load(Ordering::Relaxed) {
-        return false;
-    }
-    let (de, _lba, _off) = match fs.find_located(ATR_NAME) {
-        Ok(t) => t,
-        Err(crate::fs::fat::FatError::NotFound) => return true, // owner was never persisted — nothing to update
-        Err(_) => return false,
-    };
-    if (de.size as usize) < ATR_FILE_LEN {
-        return true;
-    }
-    let (afc, asz) = (de.first_cluster(), de.size);
-    let mut arow_grants = [AtrGrant::EMPTY; NFGRANT];
-    for (j, &(p, r)) in grants.iter().enumerate() {
-        if r != 0 {
-            arow_grants[j] = AtrGrant { prin: p, rights: r };
-        }
-    }
-    let mut rows: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-    if fs
-        .read_at(afc, asz, ATR_HEADER_LEN as u32, &mut rows, ATR_ROW_STRIDE * ATR_ROWS)
-        .is_err()
-        || rows.len() != ATR_ROW_STRIDE * ATR_ROWS
-    {
-        return false;
-    }
-    for i in 0..ATR_ROWS {
-        let start = ATR_ROW_STRIDE * i;
-        let mut arr = [0u8; ATR_ROW_STRIDE];
-        arr.copy_from_slice(&rows[start..start + ATR_ROW_STRIDE]);
-        if let Some(existing) = atr_parse_row(&arr) {
-            if existing.dir_lba == dir_lba && existing.dir_off == dir_off {
-                // Preserve the durable name/first_cluster/size; refresh owner + grants from the caller's set.
-                let row = AtrRow {
-                    name: existing.name,
-                    first_cluster: existing.first_cluster,
-                    size: existing.size,
-                    dir_lba,
-                    dir_off,
-                    owner: owner_ppid,
-                    grants: arow_grants,
-                };
-                let bytes = atr_serialize_row(&row);
-                let off = (ATR_HEADER_LEN + ATR_ROW_STRIDE * i) as u32;
-                return fs.write_at(afc, asz, off, &bytes).unwrap_or(0) == bytes.len();
-            }
-        }
-    }
-    true // no persisted row for this file — nothing to update (create-persist may have failed; in-RAM still holds)
-}
-
-/// K2 M(b): re-persist an existing NAMED-owner file's `first_cluster`/`size` after a GROW in `sys_write` — the
-/// grow twin of `atr_persist_grants`. `sys_write` has no file NAME in scope, so this recovers the durable name
-/// from the row already on disk (written at create) and refreshes it with the file's NEW chain head + size (and
-/// the CURRENT owner + grants snapshotted from OWNED_FILES). Create-time persist writes `first_cluster = 0` (a
-/// fresh 0-length entry), and the rebuild's first_cluster cross-check is SKIPPED for a 0 row; re-persisting on
-/// grow lets that corroboration ENGAGE (a rebuilt row whose on-disk `first_cluster` no longer matches the
-/// directory entry fails closed), strengthening the out-of-scope offline-tamper / non-`sys_unlink`-delete defense.
-/// No-op (returns true, ZERO disk I/O) when the owner is anonymous (NONE) — the whole 23-fixture battery, so the
-/// u10 GROW.BIN path stays byte-identical — or when no persisted row exists yet (a create-persist that had failed;
-/// benign — the in-RAM ACL still holds this boot). K5 M1: the owner/grants snapshot + the single-row scan +
-/// `write_at` all run UNDER ONE `ns` hold (the M1 seam, `NAMESPACE ⊃ inner`), so a concurrent revoke cannot
-/// straddle them. A persist failure is non-fatal — the caller `let _ =`s it, matching every other persist site.
-fn atr_persist_grow(
-    fs: &crate::fs::fat::FatFs,
-    dir_lba: u64,
-    dir_off: u32,
-    new_first: u32,
-    new_size: u32,
-) -> bool {
-    // K5 M1: probe NAMED-ness FIRST (anonymous owner — the whole battery incl. the u10 GROW.BIN fixture — does
-    // ZERO disk I/O and takes NO ns, byte-identical). For a NAMED owner, snapshot + write under ONE ns hold so a
-    // concurrent two-phase revoke cannot straddle the snapshot/write (see `atr_persist_grants`).
-    if owned_owner_ppid(dir_lba, dir_off).kind == PRIN_NONE {
-        return true; // anonymous owner — nothing persists (the battery path; no disk touch, no ns)
-    }
-    let (de, _lba, _off) = match fs.find_located(ATR_NAME) {
-        Ok(t) => t,
-        Err(crate::fs::fat::FatError::NotFound) => return true, // owner was never persisted — nothing to update
-        Err(_) => return false,
-    };
-    if (de.size as usize) < ATR_FILE_LEN {
-        return true;
-    }
-    let (afc, asz) = (de.first_cluster(), de.size);
-    let _ns = ns_lock();
-    let Some((owner_ppid, grants)) = owned_snapshot_row(dir_lba, dir_off) else {
-        return true; // row vanished (raced clear) between the probe and the ns — nothing to persist
-    };
-    if owner_ppid.kind == PRIN_NONE {
-        return true; // owner went anonymous under the race — nothing persists
-    }
-    let mut arow_grants = [AtrGrant::EMPTY; NFGRANT];
-    for (j, &(p, r)) in grants.iter().enumerate() {
-        if r != 0 {
-            arow_grants[j] = AtrGrant { prin: p, rights: r };
-        }
-    }
-    let mut rows: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-    if fs
-        .read_at(afc, asz, ATR_HEADER_LEN as u32, &mut rows, ATR_ROW_STRIDE * ATR_ROWS)
-        .is_err()
-        || rows.len() != ATR_ROW_STRIDE * ATR_ROWS
-    {
-        return false;
-    }
-    for i in 0..ATR_ROWS {
-        let start = ATR_ROW_STRIDE * i;
-        let mut arr = [0u8; ATR_ROW_STRIDE];
-        arr.copy_from_slice(&rows[start..start + ATR_ROW_STRIDE]);
-        if let Some(existing) = atr_parse_row(&arr) {
-            if existing.dir_lba == dir_lba && existing.dir_off == dir_off {
-                // Preserve the durable name; refresh first_cluster/size (the grow) + owner/grants (live ACL).
-                let row = AtrRow {
-                    name: existing.name,
-                    first_cluster: new_first,
-                    size: new_size,
-                    dir_lba,
-                    dir_off,
-                    owner: owner_ppid,
-                    grants: arow_grants,
-                };
-                let bytes = atr_serialize_row(&row);
-                let off = (ATR_HEADER_LEN + ATR_ROW_STRIDE * i) as u32;
-                return fs.write_at(afc, asz, off, &bytes).unwrap_or(0) == bytes.len();
-            }
-        }
-    }
-    true // no persisted row for this file — nothing to update (create-persist may have failed; in-RAM still holds)
-}
-
 /// K1 M2.4: rebuild the in-RAM owner/grants ACL from `UNAFS.ATR` — the mount-time restore that makes ownership
 /// SURVIVE REBOOT. Reads + validates the header against the LIVE binding (any reject => the WHOLE volume is
 /// all-public, the fail-closed pre-U6 baseline), then for each committed named-owner row RE-RESOLVES the file
@@ -9968,6 +9783,135 @@ fn native_rebuild_into_owned(fs: &crate::fs::fat::FatFs) -> usize {
     installed
 }
 
+// =====================================================================================================
+// K6 M3: the NATIVE production persist paths — the `atr_persist_*` successors. Every wrapper preserves
+// its ATR predecessor's proven ordering discipline against the native store:
+//   * create  (`native_persist_create`)  — write-through after a fully-successful private create,
+//     outside the caller's ns; takes its OWN ns for the row write (the `atr_persist_row` shape).
+//   * grant   (`native_persist_grants`)  — NAMED-owner probe first (anonymous = zero I/O, no ns), then
+//     snapshot + write fused under ONE ns hold (the K5 anti-straddle discipline, verbatim).
+//   * revoke  (`native_write_grant_row_locked`) — the disk half of the K3 two-phase durable-first
+//     revoke; the caller (sys_fgrant_revoke_2phase) already holds ns across snapshot -> THIS write ->
+//     in-RAM commit, so the K5 lock-span property carries over unchanged.
+//   * grow    (`native_persist_grow`)    — probe, then snapshot + write under one ns.
+//   * unlink  — `native_acl_clear` (fs/unafs.rs), gated durable-first before the 0xE5 (the K1-F2 fix).
+//
+// NS-SPAN NOTE (K6 M3 verdict, Maestro 2026-07-15 — Option A). The K5 span argument used to rest on
+// "the disk op is the single-sector M1 `write_at` seam". The native write is a JOURNALED MULTI-SECTOR
+// unafs op (inode + catalog + metadata sync through `with_unafs`), so the IRQ-masked ns span is now
+// DEEPER than the F3-era bound. This is ACCEPTED by the recorded verdict: K5's anti-resurrection fusion
+// is preserved by the identical mechanism (ns spans snapshot->durable-write->in-RAM-commit, and every
+// re-persist snapshots + writes under the same ns), while the deeper masked window is a BENCHABLE
+// latency watch-item (F3 cleared this class at real card timing), not a correctness risk. The K6 bench
+// card carries the measurement line. Lock order: NAMESPACE ⊃ MOUNT (with_unafs) — no path takes MOUNT
+// then NAMESPACE, and OWNED_FILES is take-and-release inside the ns hold as before.
+// =====================================================================================================
+
+/// K6 M3: write-through persist of a NEW private file's owner onto the NATIVE attribute volume — the
+/// `atr_persist_row` successor for the create path. No-op (true, zero I/O) for a NONE owner (the whole
+/// battery). Returns false on an un-projectable owner or any native write failure — non-fatal to the
+/// caller (the in-RAM ACL still enforces this boot; cross-reboot fails closed to PUBLIC).
+fn native_persist_create(
+    name: &str,
+    first_cluster: u32,
+    dir_lba: u64,
+    dir_off: u32,
+    owner_ppid: PrincipalRecord,
+) -> bool {
+    if owner_ppid.kind == PRIN_NONE {
+        return true; // anonymous owner — nothing persists (the battery path; no disk touch)
+    }
+    let empty = [(PrincipalRecord::NONE, 0u32); NFGRANT];
+    let Some((owner_bytes, _)) = native_project_owner_grants(&owner_ppid, &empty) else {
+        return false; // un-projectable owner (reserved kind) — not persistable, fail-closed
+    };
+    let _ns = ns_lock();
+    crate::fs::unafs::native_acl_write(dir_lba, dir_off, name, first_cluster, &owner_bytes, &[])
+}
+
+/// K6 M3: the disk half of the K3 two-phase revoke / the K5-fused re-persist, against the NATIVE store —
+/// the `atr_write_grant_row_locked` successor. **The caller MUST already hold the namespace lock**: it
+/// fuses the OWNED_FILES snapshot the caller took with this journaled write exactly as the ATR version
+/// did (the K5 span; see the NS-SPAN NOTE above). Recovers the durable name/first_cluster from the
+/// EXISTING native row; no row yet -> true (create-persist had failed; in-RAM still holds — the ATR
+/// "nothing to update" semantics). The K3 fault-injection knob fires after the NONE early-return, so the
+/// anonymous battery never observes it.
+fn native_write_grant_row_locked(
+    dir_lba: u64,
+    dir_off: u32,
+    owner_ppid: PrincipalRecord,
+    grants: &[(PrincipalRecord, u32); NFGRANT],
+) -> bool {
+    if owner_ppid.kind == PRIN_NONE {
+        return true; // anonymous owner — nothing persists (the battery path; no disk touch)
+    }
+    if K3_TEST_FAIL_PERSIST.load(Ordering::Relaxed) {
+        return false; // K3: test-only synthetic durable-write failure (fixture-set, self-clearing)
+    }
+    let Some(existing) = crate::fs::unafs::native_acl_read(dir_lba, dir_off) else {
+        return true; // no persisted row — nothing to update (in-RAM still enforces this boot)
+    };
+    let Some((owner_bytes, gv)) = native_project_owner_grants(&owner_ppid, grants) else {
+        return false;
+    };
+    let grefs: alloc::vec::Vec<(&[u8], &[u8])> =
+        gv.iter().map(|(k, v)| (k.as_slice(), v.as_slice())).collect();
+    crate::fs::unafs::native_acl_write(
+        dir_lba,
+        dir_off,
+        &existing.name,
+        existing.first_cluster,
+        &owner_bytes,
+        &grefs,
+    )
+}
+
+/// K6 M3: re-persist owner + grants after an ACL widen — the `atr_persist_grants` successor. NAMED-owner
+/// probe first (anonymous = zero disk I/O, no ns — the battery path), then snapshot + write fused under
+/// ONE ns hold so a concurrent two-phase revoke cannot straddle the snapshot and the write (K5, verbatim).
+fn native_persist_grants(dir_lba: u64, dir_off: u32) -> bool {
+    if owned_owner_ppid(dir_lba, dir_off).kind == PRIN_NONE {
+        return true; // anonymous owner — nothing persists (the battery path; no disk touch, no ns)
+    }
+    let _ns = ns_lock();
+    let Some((owner_ppid, grants)) = owned_snapshot_row(dir_lba, dir_off) else {
+        return true; // row vanished (raced clear) between the probe and the ns — nothing to persist
+    };
+    native_write_grant_row_locked(dir_lba, dir_off, owner_ppid, &grants)
+}
+
+/// K6 M3: refresh a NAMED-owner file's persisted `first_cluster` after a GROW — the `atr_persist_grow`
+/// successor (K2 M(b)). Recovers the durable name from the existing native row; refreshes fc + the
+/// current owner/grants snapshot under ONE ns hold (K5 discipline). No row yet / anonymous -> no-op true.
+fn native_persist_grow(dir_lba: u64, dir_off: u32, new_first: u32) -> bool {
+    if owned_owner_ppid(dir_lba, dir_off).kind == PRIN_NONE {
+        return true; // anonymous owner — the whole battery incl. the u10 GROW.BIN fixture; zero I/O
+    }
+    let _ns = ns_lock();
+    let Some((owner_ppid, grants)) = owned_snapshot_row(dir_lba, dir_off) else {
+        return true;
+    };
+    if owner_ppid.kind == PRIN_NONE {
+        return true; // owner went anonymous under the race — nothing persists
+    }
+    let Some(existing) = crate::fs::unafs::native_acl_read(dir_lba, dir_off) else {
+        return true; // never persisted (create-persist failed) — in-RAM still holds this boot
+    };
+    let Some((owner_bytes, gv)) = native_project_owner_grants(&owner_ppid, &grants) else {
+        return false;
+    };
+    let grefs: alloc::vec::Vec<(&[u8], &[u8])> =
+        gv.iter().map(|(k, v)| (k.as_slice(), v.as_slice())).collect();
+    crate::fs::unafs::native_acl_write(
+        dir_lba,
+        dir_off,
+        &existing.name,
+        new_first,
+        &owner_bytes,
+        &grefs,
+    )
+}
+
 /// K1 M2.4 / K2 / K6: the REAL-BOOT mount-rebuild hook — restore persisted ownership before EL0 programs
 /// run. GATED on `by_name_spawn_multivalued()` (TRUE since K2). K6: first MIGRATE any committed
 /// IMAGE_SHA256 sidecar rows onto native attributes (native-before-delete), then rebuild OWNED_FILES
@@ -10176,7 +10120,8 @@ fn k1_persist_cleanup() {
     if let Ok(fs) = crate::fs::fat::mount() {
         for name in [K1P_OWNER, K1P_PUBLIC] {
             if let Ok((de, lba, off)) = fs.find_located(name) {
-                let _ = atr_clear_row(&fs, lba, off as u32);
+                let _ = crate::fs::unafs::native_acl_clear(lba, off as u32); // K6: native store
+                let _ = atr_clear_row(&fs, lba, off as u32); // legacy sidecar (stale-card defense)
                 owned_clear(lba, off as u32);
                 let _ = fs.delete_located(lba, off, de.first_cluster());
             }
@@ -10209,11 +10154,7 @@ fn k1_persist_check() -> u32 {
         w |= 1 << 0; // the stamp/read round-trip (M2.1 stamping + M2.3 slot_ppid_of)
     }
 
-    // ---- Phase 1: create a named-owner file + a public file, persist the ACL to UNAFS.ATR ----
-    let Some(name11) = atr_name_from_str(K1P_OWNER) else {
-        k1_persist_cleanup();
-        return w;
-    };
+    // ---- Phase 1: create a named-owner file + a public file, persist the ACL to the NATIVE store ----
     let (de, lba, off) = match fs.create_in_root(K1P_OWNER, 0x20) {
         Ok(t) => t,
         Err(_) => {
@@ -10232,23 +10173,25 @@ fn k1_persist_check() -> u32 {
     let gen_grt = ASID_GEN[K1P_SA_GRT as usize].load(Ordering::Acquire);
     // The real create/grant sequence in-RAM, then persist BOTH via the exact syscall persist helpers.
     owned_set_owner(lba, off as u32, K1P_SA_OWN, gen_own, p_x);
-    let empty_grants = [(PrincipalRecord::NONE, 0u32); NFGRANT];
-    // Persist matching PRODUCTION's create path FAITHFULLY: `sys_open` persists `de` AT create — a fresh
-    // 0-length entry — so the row's first_cluster/size are 0 and stay 0 (the row is NOT re-persisted on a later
+    // Persist matching PRODUCTION's create path FAITHFULLY: `sys_open` persists AT create — a fresh
+    // 0-length entry — so the native row's `fc` is 0 and stays 0 (the row is NOT re-persisted on a later
     // grow this arc). The grown chain (c_persf) exists only for the no-leak cleanup check; it is NOT persisted.
-    // The rebuild's first_cluster cross-check is therefore name-PRIMARY (skipped for a 0 row) here as in production.
+    // The rebuild's first_cluster cross-check is therefore name-PRIMARY (skipped for a 0 row) here as in
+    // production. K6 M3: both persists are the NATIVE production helpers — the same code `sys_open`/`sys_fgrant`
+    // run — so this proof now exercises the native store end-to-end.
     let _ = (c_persf, sz_persf);
-    let ok_owner = atr_persist_row(&fs, name11, 0, 0, lba, off as u32, p_x, &empty_grants);
+    let ok_owner = native_persist_create(K1P_OWNER, 0, lba, off as u32, p_x);
     owned_grant(lba, off as u32, K1P_SA_OWN, gen_own, K1P_SA_GRT, gen_grt, CAP_READ, p_x, p_z);
-    let ok_grant = atr_persist_grants(&fs, lba, off as u32);
+    let ok_grant = native_persist_grants(lba, off as u32);
     let pub_created = fs.create_in_root(K1P_PUBLIC, 0x20).is_ok();
     if !(ok_owner && ok_grant && pub_created) {
         k1_persist_cleanup();
         return w;
     }
 
-    // ---- Phase 2: simulate a reboot (drop the in-RAM ACL), remount, rebuild, enforce ----
+    // ---- Phase 2: simulate a reboot (drop the in-RAM ACL), remount BOTH volumes, rebuild, enforce ----
     owned_clear(lba, off as u32); // the in-RAM ACL is gone across a power-cycle
+    crate::fs::unafs::force_remount(); // the unafs mount is re-read from disk too (a genuine remount)
     let fs2 = match crate::fs::fat::mount() {
         Ok(f) => f,
         Err(_) => {
@@ -10256,8 +10199,8 @@ fn k1_persist_check() -> u32 {
             return w;
         }
     };
-    if atr_rebuild_into_owned(&fs2) >= 1 {
-        w |= 1 << 1; // the rebuild re-installed the persisted row
+    if native_rebuild_into_owned(&fs2) >= 1 {
+        w |= 1 << 1; // the rebuild re-installed the persisted row FROM THE NATIVE STORE (K6 M3)
     }
     let (rlba, roff) = match fs2.find_located(K1P_OWNER) {
         Ok((_, l, o)) => (l, o as u32),
@@ -10358,7 +10301,7 @@ fn k1_persist_launcher() {
     }
     let w = k1_persist_check();
     serial_println!(
-        ":: K1-persist: UNAFS.ATR owner/grants SURVIVE REBOOT — rebuild+enforce {} (owner-by-name admit+regrant+revoke; impostor+anon deny; grantee R admit/W deny; public stays public; named owner survives teardown) [w={:#06x}] ::",
+        ":: K1-persist: native unafs owner/grants SURVIVE REBOOT — rebuild+enforce {} (owner-by-name admit+regrant+revoke; impostor+anon deny; grantee R admit/W deny; public stays public; named owner survives teardown) [w={:#06x}] ::",
         if w == K1PERSIST_ALL { "PASS" } else { "FAIL" },
         w
     );
@@ -10527,7 +10470,8 @@ fn k3_revoke_cleanup() {
     K3_TEST_FAIL_PERSIST.store(false, Ordering::Relaxed); // belt-and-braces: never leave the fault knob set
     if let Ok(fs) = crate::fs::fat::mount() {
         if let Ok((de, lba, off)) = fs.find_located(K3_FILE) {
-            let _ = atr_clear_row(&fs, lba, off as u32);
+            let _ = crate::fs::unafs::native_acl_clear(lba, off as u32); // K6: native store
+            let _ = atr_clear_row(&fs, lba, off as u32); // legacy sidecar (stale-card defense)
             owned_clear(lba, off as u32);
             let _ = fs.delete_located(lba, off, de.first_cluster());
         }
@@ -10553,12 +10497,7 @@ fn k3_revoke_check() -> u32 {
     let p_own = slot_ppid_of(K3_SA_OWN);
     let p_grt = slot_ppid_of(K3_SA_GRT); // the grantee KEPT across the revoke
     let p_gr2 = slot_ppid_of(K3_SA_GR2); // the grantee REVOKED
-    let Some(name11) = atr_name_from_str(K3_FILE) else {
-        k3_revoke_cleanup();
-        return w;
-    };
-
-    // ---- Phase 1: create a named-owner file, grant BOTH grantees READ, persist the ACL ----
+    // ---- Phase 1: create a named-owner file, grant BOTH grantees READ, persist the ACL (NATIVE, K6 M3) ----
     let (de, lba, off) = match fs.create_in_root(K3_FILE, 0x20) {
         Ok(t) => t,
         Err(_) => {
@@ -10574,19 +10513,19 @@ fn k3_revoke_check() -> u32 {
     let gen_grt = ASID_GEN[K3_SA_GRT as usize].load(Ordering::Acquire);
     let gen_gr2 = ASID_GEN[K3_SA_GR2 as usize].load(Ordering::Acquire);
     owned_set_owner(lba, off as u32, K3_SA_OWN, gen_own, p_own);
-    // Persist matching production's create path (first_cluster/size = 0; name-primary rebuild).
-    let empty_grants = [(PrincipalRecord::NONE, 0u32); NFGRANT];
-    let ok_owner = atr_persist_row(&fs, name11, 0, 0, lba, off as u32, p_own, &empty_grants);
+    // Persist matching production's create path (fc = 0; name-primary rebuild) — the NATIVE helpers.
+    let ok_owner = native_persist_create(K3_FILE, 0, lba, off as u32, p_own);
     owned_grant(lba, off as u32, K3_SA_OWN, gen_own, K3_SA_GRT, gen_grt, CAP_READ, p_own, p_grt);
     owned_grant(lba, off as u32, K3_SA_OWN, gen_own, K3_SA_GR2, gen_gr2, CAP_READ, p_own, p_gr2);
-    let ok_grants = atr_persist_grants(&fs, lba, off as u32);
+    let ok_grants = native_persist_grants(lba, off as u32);
     if !(ok_owner && ok_grants) {
         k3_revoke_cleanup();
         return w;
     }
 
-    // ---- Phase 2: simulate a reboot — rebuild purely from UNAFS.ATR; BOTH grantees admitted ----
+    // ---- Phase 2: simulate a reboot — rebuild purely from the NATIVE store; BOTH grantees admitted ----
     owned_clear(lba, off as u32);
+    crate::fs::unafs::force_remount();
     let fs2 = match crate::fs::fat::mount() {
         Ok(f) => f,
         Err(_) => {
@@ -10594,7 +10533,7 @@ fn k3_revoke_check() -> u32 {
             return w;
         }
     };
-    let _ = atr_rebuild_into_owned(&fs2);
+    let _ = native_rebuild_into_owned(&fs2);
     let (rlba, roff) = match fs2.find_located(K3_FILE) {
         Ok((_, l, o)) => (l, o as u32),
         Err(_) => {
@@ -10616,6 +10555,7 @@ fn k3_revoke_check() -> u32 {
 
     // ---- Phase 4: simulate a SECOND reboot — the revoke SURVIVED (the retired fail-OPEN residual) ----
     owned_clear(rlba, roff);
+    crate::fs::unafs::force_remount();
     let fs3 = match crate::fs::fat::mount() {
         Ok(f) => f,
         Err(_) => {
@@ -10623,7 +10563,7 @@ fn k3_revoke_check() -> u32 {
             return w;
         }
     };
-    let _ = atr_rebuild_into_owned(&fs3);
+    let _ = native_rebuild_into_owned(&fs3);
     let (slba, soff) = match fs3.find_located(K3_FILE) {
         Ok((_, l, o)) => (l, o as u32),
         Err(_) => {
@@ -10698,19 +10638,22 @@ fn k5_lockspan_cleanup() {
     slot_ppid_clear(K5_SA_GR2);
     if let Ok(fs) = crate::fs::fat::mount() {
         if let Ok((de, lba, off)) = fs.find_located(K5_FILE) {
-            let _ = atr_clear_row(&fs, lba, off as u32);
+            let _ = crate::fs::unafs::native_acl_clear(lba, off as u32); // K6: native store
+            let _ = atr_clear_row(&fs, lba, off as u32); // legacy sidecar (stale-card defense)
             owned_clear(lba, off as u32);
             let _ = fs.delete_located(lba, off, de.first_cluster());
         }
     }
 }
 
-/// K5: re-mount, rebuild the in-RAM ACL purely from UNAFS.ATR, and re-resolve the scratch file — the "simulate a
-/// reboot" step the K3 proof uses. Returns the fresh `(dir_lba, dir_off)`, or `None` on any disk failure.
+/// K5: re-mount BOTH volumes, rebuild the in-RAM ACL purely from the NATIVE store (K6 M3), and re-resolve the
+/// scratch file — the "simulate a reboot" step the K3 proof uses. Returns the fresh `(dir_lba, dir_off)`,
+/// or `None` on any disk failure.
 fn k5_reboot_resolve(dir_lba: u64, dir_off: u32) -> Option<(u64, u32)> {
     owned_clear(dir_lba, dir_off);
+    crate::fs::unafs::force_remount();
     let fs = crate::fs::fat::mount().ok()?;
-    let _ = atr_rebuild_into_owned(&fs);
+    let _ = native_rebuild_into_owned(&fs);
     let (_, l, o) = fs.find_located(K5_FILE).ok()?;
     Some((l, o as u32))
 }
@@ -10729,12 +10672,7 @@ fn k5_lockspan_check() -> u32 {
     let p_own = slot_ppid_of(K5_SA_OWN);
     let p_grt = slot_ppid_of(K5_SA_GRT); // grantee KEPT across the revoke
     let p_gr2 = slot_ppid_of(K5_SA_GR2); // grantee REVOKED
-    let Some(name11) = atr_name_from_str(K5_FILE) else {
-        k5_lockspan_cleanup();
-        return w;
-    };
-
-    // ---- Setup: a named-owner file with BOTH grantees granted READ, persisted ----
+    // ---- Setup: a named-owner file with BOTH grantees granted READ, persisted (NATIVE, K6 M3) ----
     let (de, lba, off) = match fs.create_in_root(K5_FILE, 0x20) {
         Ok(t) => t,
         Err(_) => {
@@ -10750,11 +10688,10 @@ fn k5_lockspan_check() -> u32 {
     let gen_grt = ASID_GEN[K5_SA_GRT as usize].load(Ordering::Acquire);
     let gen_gr2 = ASID_GEN[K5_SA_GR2 as usize].load(Ordering::Acquire);
     owned_set_owner(lba, off as u32, K5_SA_OWN, gen_own, p_own);
-    let empty_grants = [(PrincipalRecord::NONE, 0u32); NFGRANT];
-    let ok_owner = atr_persist_row(&fs, name11, 0, 0, lba, off as u32, p_own, &empty_grants);
+    let ok_owner = native_persist_create(K5_FILE, 0, lba, off as u32, p_own);
     owned_grant(lba, off as u32, K5_SA_OWN, gen_own, K5_SA_GRT, gen_grt, CAP_READ, p_own, p_grt);
     owned_grant(lba, off as u32, K5_SA_OWN, gen_own, K5_SA_GR2, gen_gr2, CAP_READ, p_own, p_gr2);
-    let ok_grants = atr_persist_grants(&fs, lba, off as u32);
+    let ok_grants = native_persist_grants(lba, off as u32);
     if !(ok_owner && ok_grants) {
         k5_lockspan_cleanup();
         return w;
@@ -10777,12 +10714,12 @@ fn k5_lockspan_check() -> u32 {
     // OWNED_FILES before the revoke committed. Then run the production revoke (disk-narrow + in-RAM commit, now
     // fused under ns). Then let the STALE snapshot's full-row write land via the raw ns-held disk writer — the
     // exact primitive the fix now only ever calls with a FRESH under-ns snapshot. Under the OLD non-atomic code
-    // this is what a concurrent `atr_persist_grants` could do; it RESURRECTS GR2 on disk.
+    // this is what a concurrent `native_persist_grants` could do; it RESURRECTS GR2 on the NATIVE store.
     let stale = owned_snapshot_row(rlba, roff);
     let _ = sys_fgrant_revoke_2phase(rlba, roff, K5_SA_OWN, gen_own, K5_SA_GR2, gen_gr2, p_own, p_gr2);
     if let Some((so, sg)) = stale {
         let _ns = ns_lock();
-        atr_write_grant_row_locked(&fs, rlba, roff, so, &sg);
+        native_write_grant_row_locked(rlba, roff, so, &sg);
     }
     let Some((clba, coff)) = k5_reboot_resolve(rlba, roff) else {
         k5_lockspan_cleanup();
@@ -10794,10 +10731,10 @@ fn k5_lockspan_check() -> u32 {
 
     // ---- THE FIX: production revoke + production re-persist cannot resurrect ----
     // In-RAM now carries the resurrected GR2 grant again. Revoke it through the production two-phase path, THEN
-    // run the production full-row re-persist (`atr_persist_grants` — models the concurrent core B). Post-fix it
-    // re-snapshots the NARROWED in-RAM set under the SAME ns, so it writes a narrowed row: GR2 is NOT resurrected.
+    // run the production full-row re-persist (`native_persist_grants` — models the concurrent core B). Post-fix
+    // it re-snapshots the NARROWED in-RAM set under the SAME ns, so it writes a narrowed row: GR2 is NOT resurrected.
     let _ = sys_fgrant_revoke_2phase(clba, coff, K5_SA_OWN, gen_own, K5_SA_GR2, gen_gr2, p_own, p_gr2);
-    let _ = atr_persist_grants(&fs, clba, coff);
+    let _ = native_persist_grants(clba, coff);
     let Some((flba, foff)) = k5_reboot_resolve(clba, coff) else {
         k5_lockspan_cleanup();
         return w;
@@ -10836,7 +10773,7 @@ fn k5_lockspan_launcher() {
     }
     let w = k5_lockspan_check();
     serial_println!(
-        ":: K5-lockspan: UNAFS.ATR revoke/re-persist SMP window — decomposed stale-snapshot write resurrects (control); production revoke+re-persist fused under the ns-span stays narrowed; kept grant intact; create-gate not leaked {} [w={:#04x}] ::",
+        ":: K5-lockspan: native unafs revoke/re-persist SMP window — decomposed stale-snapshot write resurrects (control); production revoke+re-persist fused under the ns-span stays narrowed; kept grant intact; create-gate not leaked {} [w={:#04x}] ::",
         if w == K5_LOCKSPAN_ALL { "PASS" } else { "FAIL" },
         w
     );
@@ -11187,8 +11124,8 @@ fn k6_migrate_selftest() {
             // sidecar row is gone, and the legacy PROGRAM_NAME sidecar row STAYS (un-migrated, enforcing).
             let img_native_ok = crate::fs::unafs::native_acl_read(K6_IMG_LBA, K6_IMG_OFF)
                 .is_some_and(|r| principal_from_native(&r.owner) == Some(img_owner));
-            let img_sidecar_gone = k2_persisted_first_cluster(&fs, K6_IMG_LBA, K6_IMG_OFF).is_none();
-            let leg_sidecar_stays = k2_persisted_first_cluster(&fs, K6_LEG_LBA, K6_LEG_OFF).is_some();
+            let img_sidecar_gone = atr_row_first_cluster(&fs, K6_IMG_LBA, K6_IMG_OFF).is_none();
+            let leg_sidecar_stays = atr_row_first_cluster(&fs, K6_LEG_LBA, K6_LEG_OFF).is_some();
             if p1 && p2 && n1 == 1 && img_native_ok && img_sidecar_gone && leg_sidecar_stays {
                 w |= 1 << 5;
             }
@@ -11197,9 +11134,9 @@ fn k6_migrate_selftest() {
             // converges — migrates it again, re-clears the sidecar, native still reverse-equal (idempotent).
             let p3 = atr_persist_row(&fs, imgn, 0x55, 0, K6_IMG_LBA, K6_IMG_OFF, img_owner, &empty);
             let both_copies = crate::fs::unafs::native_acl_read(K6_IMG_LBA, K6_IMG_OFF).is_some()
-                && k2_persisted_first_cluster(&fs, K6_IMG_LBA, K6_IMG_OFF).is_some();
+                && atr_row_first_cluster(&fs, K6_IMG_LBA, K6_IMG_OFF).is_some();
             let n2 = native_migrate_from_sidecar(&fs);
-            let converged = k2_persisted_first_cluster(&fs, K6_IMG_LBA, K6_IMG_OFF).is_none()
+            let converged = atr_row_first_cluster(&fs, K6_IMG_LBA, K6_IMG_OFF).is_none()
                 && crate::fs::unafs::native_acl_read(K6_IMG_LBA, K6_IMG_OFF)
                     .is_some_and(|r| principal_from_native(&r.owner) == Some(img_owner));
             if p3 && both_copies && n2 == 1 && converged {
@@ -11208,7 +11145,7 @@ fn k6_migrate_selftest() {
             // bit7: idempotent no-op — with no IMAGE sidecar rows left, migration migrates 0 and leaves the
             // legacy PROGRAM_NAME row in place (a card re-prep, not migration, clears it).
             let n3 = native_migrate_from_sidecar(&fs);
-            if n3 == 0 && k2_persisted_first_cluster(&fs, K6_LEG_LBA, K6_LEG_OFF).is_some() {
+            if n3 == 0 && atr_row_first_cluster(&fs, K6_LEG_LBA, K6_LEG_OFF).is_some() {
                 w |= 1 << 7;
             }
             // Self-clean: drop the native scratch + the legacy sidecar row -> pristine (empty UNAFS.ATR).
@@ -11591,7 +11528,8 @@ static K2_IMP_WITNESS: AtomicU64 = AtomicU64::new(0); // K2IMP.BIN's reported wi
 static EL0_K2_DONE: AtomicU32 = AtomicU32::new(0); // count of K2 program sentinel exits (want 3 by the end)
 static EL0_K2_KILLED: AtomicU32 = AtomicU32::new(0); // any K2 program fault-killed (a real bug; must stay 0)
 
-// K3: test-only synthetic durable-write failure for `atr_write_grant_row`, set TRANSIENTLY by `k3_revoke_check`
+// K3: test-only synthetic durable-write failure for the durable grant-row write (K6 M3: now
+// `native_write_grant_row_locked`), set TRANSIENTLY by `k3_revoke_check`
 // (which self-clears) to prove the two-phase revoke fails CLOSED when the persist cannot land. Default false —
 // the production/battery path never sets it, so it is a single default-false relaxed load off the persist path.
 static K3_TEST_FAIL_PERSIST: AtomicBool = AtomicBool::new(false);
@@ -11615,7 +11553,8 @@ fn k2_report(value: u64) {
 fn k2_cleanup() {
     if let Ok(fs) = crate::fs::fat::mount() {
         if let Ok((de, lba, off)) = fs.find_located(K2_PRIV_NAME) {
-            let _ = atr_clear_row(&fs, lba, off as u32);
+            let _ = crate::fs::unafs::native_acl_clear(lba, off as u32); // K6: native store
+            let _ = atr_clear_row(&fs, lba, off as u32); // legacy sidecar (stale-card defense)
             owned_clear(lba, off as u32);
             let _ = fs.delete_located(lba, off, de.first_cluster());
         }
@@ -11641,11 +11580,22 @@ fn k2_run_program(name: &str, taskname: &'static str, demo_cpu: usize, want: u32
     Some(stamped)
 }
 
-/// K2: read the `first_cluster` persisted in a file's `UNAFS.ATR` row (None if the store or the row is
-/// absent). Used to PROVE M(b) grow-repersist actually landed the real chain head — a create-only row
-/// carries `first_cluster = 0`, so a nonzero match against the directory entry means the grow re-persisted.
-/// Read-only, no lock (the launcher is single-context here — no EL0 program runs during a rebuild step).
+/// K2: read the `first_cluster` persisted for a file — NATIVE store first (K6 M3: the production persist
+/// paths write native), falling back to a legacy `UNAFS.ATR` row (an un-migrated stale card). Used to PROVE
+/// M(b) grow-repersist actually landed the real chain head — a create-only row carries `fc = 0`, so a
+/// nonzero match against the directory entry means the grow re-persisted.
+/// Read-only (the launcher is single-context here — no EL0 program runs during a rebuild step).
 fn k2_persisted_first_cluster(fs: &crate::fs::fat::FatFs, dir_lba: u64, dir_off: u32) -> Option<u32> {
+    if let Some(row) = crate::fs::unafs::native_acl_read(dir_lba, dir_off) {
+        return Some(row.first_cluster);
+    }
+    atr_row_first_cluster(fs, dir_lba, dir_off)
+}
+
+/// K6: read the `first_cluster` of a file's LEGACY `UNAFS.ATR` sidecar row ONLY (never the native store) —
+/// the K6-migrate witness's "is the sidecar row still there" probe (native-blind by design: after a
+/// migration the native row exists, so a native-first read would mask the sidecar delete it verifies).
+fn atr_row_first_cluster(fs: &crate::fs::fat::FatFs, dir_lba: u64, dir_off: u32) -> Option<u32> {
     let (de, _l, _o) = fs.find_located(ATR_NAME).ok()?;
     if (de.size as usize) < ATR_FILE_LEN {
         return None;
@@ -11761,8 +11711,10 @@ fn k2_liveenf_launcher(demo_cpu: usize) {
         w |= 1 << 6;
     }
 
-    // ---- Phase 2: simulate a reboot — WIPE the in-RAM ACL, remount, REBUILD purely from UNAFS.ATR ----
+    // ---- Phase 2: simulate a reboot — WIPE the in-RAM ACL, remount BOTH volumes, REBUILD purely from
+    //      the NATIVE store (K6 M3: the production create/grow persists wrote native) ----
     owned_clear(priv_lba, priv_off);
+    crate::fs::unafs::force_remount();
     let fs3 = match crate::fs::fat::mount() {
         Ok(f) => f,
         Err(_) => {
@@ -11770,7 +11722,7 @@ fn k2_liveenf_launcher(demo_cpu: usize) {
             return;
         }
     };
-    if atr_rebuild_into_owned(&fs3) >= 1 {
+    if native_rebuild_into_owned(&fs3) >= 1 {
         w |= 1 << 2; // bit2: the persisted row survived to disk + rebuilt at mount
     }
     if owned_owner_ppid(priv_lba, priv_off) == p_own {
@@ -11815,7 +11767,7 @@ fn k2_liveenf_launcher(demo_cpu: usize) {
     const K2_ALL: u32 = (1 << 7) - 1; // bits 0..=6
     if w == K2_ALL && done == 3 && killed == 0 && cleaned {
         serial_println!(
-            ":: K2-liveenf: cross-reboot ACL LIVE via REAL programs — owner K2OWN.BIN re-admitted by name+IMAGE-digest after UNAFS.ATR rebuild, impostor K2IMP.BIN (distinct image) refused (-EACCES); grow-repersist landed the real chain head; self-cleaned rebuild+enforce PASS [w={:#04x}] ::",
+            ":: K2-liveenf: cross-reboot ACL LIVE via REAL programs — owner K2OWN.BIN re-admitted by name+IMAGE-digest after native-attr rebuild, impostor K2IMP.BIN (distinct image) refused (-EACCES); grow-repersist landed the real chain head; self-cleaned rebuild+enforce PASS [w={:#04x}] ::",
             w
         );
     } else {
@@ -11906,7 +11858,7 @@ fn k2_metal_leave(demo_cpu: usize) {
 }
 
 /// K2 metal BOOT-2 (feature `k2_leave`): after a real power-cycle, the LIVE `atr_maybe_boot_rebuild` (head of
-/// `u7_launcher`, gate flipped) has already reinstalled `K2PRIV.BIN`'s owner row from `UNAFS.ATR`. PROVE it
+/// `u7_launcher`, gate flipped) has already reinstalled `K2PRIV.BIN`'s owner row from the NATIVE store (K6). PROVE it
 /// SURVIVED the power-cycle: (0) the row is owned by prog:K2OWN.BIN (reinstalled by the BOOT rebuild, not this
 /// fixture — owner_asid = sentinel); (1) a fresh incarnation of the owner is re-admitted BY NAME; (2) the
 /// impostor (a distinct real principal) is refused. Then CLEAN so the card ends pristine. This is the genuine
@@ -11963,7 +11915,7 @@ fn k2_metal_verify(demo_cpu: usize) {
     const K2M_ALL: u32 = (1 << 3) - 1; // bits 0..=2
     if w == K2M_ALL && done == 2 && killed == 0 && cleaned {
         serial_println!(
-            ":: K2-metal: BOOT-2 cross-reboot SURVIVED a real power-cycle — owner prog:K2OWN.BIN re-admitted BY NAME against the LIVE-boot-rebuilt UNAFS.ATR row, impostor prog:K2IMP.BIN refused (-EACCES); self-cleaned rebuild+enforce PASS [w={:#04x}] ::",
+            ":: K2-metal: BOOT-2 cross-reboot SURVIVED a real power-cycle — owner prog:K2OWN.BIN re-admitted BY NAME against the LIVE-boot-rebuilt native-attr row, impostor prog:K2IMP.BIN refused (-EACCES); self-cleaned rebuild+enforce PASS [w={:#04x}] ::",
             w
         );
     } else {

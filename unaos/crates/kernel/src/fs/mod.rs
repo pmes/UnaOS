@@ -18,7 +18,10 @@
 //! ([`crate::drivers::block`]), so the same code runs on the x86_64 (Intel xHCI)
 //! and aarch64 (qemu-xhci) storage paths. FAT16/FAT32 with read, in-place write,
 //! grow, create/delete, and directory creation/removal (`create_dir`/`remove_dir`).
-//! BeFS-K3 adds [`unafs`]: a read-only mount of the native UnaFS volume.
+//! [`unafs`] is the native UnaFS volume: mounted read-only at BeFS-K3, read-WRITE
+//! (journaled, one coherent mount) since BeFS-K4, and since K6 the kernel's dedicated
+//! ATTRIBUTE volume — the durable home of the U6 owner/grants ACL (the FAT-bridge
+//! `UNAFS.ATR` sidecar is retired; a fixed two-mount dispatch {FAT, UnaFS}, no VFS).
 
 pub mod fat;
 #[cfg(target_arch = "aarch64")]

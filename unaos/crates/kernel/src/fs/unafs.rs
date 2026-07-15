@@ -381,7 +381,7 @@ fn native_acl_row_of(fs: &mut KernelUnaFS, id: u64) -> Option<NativeAclRow> {
 /// unafs ACL file (journaled), reverting the FAT file to public. Idempotent: an absent row is already
 /// clear (`true`); only a real mount/I-O error is `false`.
 pub fn native_acl_clear(dir_lba: u64, dir_off: u32) -> bool {
-    with_unafs(|fs| {
+    match with_unafs(|fs| {
         let root = fs.superblock.root_inode;
         let fname = acl_file_name(dir_lba, dir_off);
         match fs.unlink(root, &fname) {
@@ -389,8 +389,13 @@ pub fn native_acl_clear(dir_lba: u64, dir_off: u32) -> bool {
             Err(ref e) if is_absent(e) => true, // already public on disk
             Err(_) => false,
         }
-    })
-    .unwrap_or(false)
+    }) {
+        Ok(ok) => ok,
+        // Media without a unafs volume (or no block device) holds no native row — nothing persisted
+        // to clear (benign, like the sidecar's NotFound). Only a real mount/parse failure is an error.
+        Err(MountError::NoVolume | MountError::NoStorage | MountError::BadSectorSize(_)) => true,
+        Err(_) => false,
+    }
 }
 
 /// K6: every ACL row on the volume — the mount-time rebuild source (the `atr_rebuild_into_owned`

@@ -91,6 +91,14 @@ FORBID FATDIRS:.*FAIL
 REQUIRE FATMOVE:.*keep-chain\) PASS
 FORBID FATMOVE:.*FAIL
 
+# --- K6 native-attr migration witness (uncounted): the U6 ACL round-trips through the native unafs
+# --- attribute volume (codec forward+reverse, the 240-bit-prefix invariant) AND the sidecar migration
+# --- is native-before-delete (IMAGE row migrates+verifies+converges across a both-copies power-cut
+# --- window; legacy PROGRAM_NAME rows stay fail-closed un-migrated). Folded by the K6 arc per the
+# --- M3 lock-strategy verdict rider (Maestro, 2026-07-15); metal capture rides the K6 bench. --------
+REQUIRE K6-migrate:.*legacy PROGRAM_NAME stays\) PASS
+FORBID K6-migrate:.*FAIL
+
 # NOTE (bench operators): these five are now hard REQUIREs. On a rare no-card / hub-MSC-vid=0000
 # boot the card-dependent selftests won't emit — re-seat the data card and re-boot (that IS the
 # recovery); don't demote the spec. The 3-of-4-core CAPSTONE variance is separate (see the header).
