@@ -526,6 +526,12 @@ INCOMPLETE on that medium — inherent to the injector backend, not a regression
 - **The witness is a stateful BSP-loop poll, not a ring-3 fixture** (as SOCK-6) — a dedicated ring-3
   persistent-accept fixture is deferred; `sys_accept` is the delivered, cap-gated ring-3 surface.
 - **`copy_from_user` for socket buffers** remains the deferred hardening all of SOCK-2..7 carry.
+- **Persistence is guaranteed across a *completed* accept, not against a malicious half-open** (review
+  lens, at landing). A peer that sends SYN and withholds the final ACK parks the listener socket in
+  `SynReceived`; when smoltcp exhausts its SYN-ACK retransmits the socket goes `Closed`, the next
+  `stack_accept` reports `NotListening`, and ring 3 gets `-EINVAL` and must re-`listen`. Inherited
+  smoltcp behavior (present in SOCK-6's single-accept model too), a liveness — not memory/capability —
+  bound; a kernel-side auto-re-arm or SYN-flood mitigation is future work.
 
 ## The road from here
 
