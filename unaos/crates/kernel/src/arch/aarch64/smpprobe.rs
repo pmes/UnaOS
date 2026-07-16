@@ -382,6 +382,24 @@ pub fn run(ctx: &ProbeCtx) {
         run_5core_sequence(ctx);
         return;
     }
+    // ORIN-SMP-6 — the LAST-DIFFERENCES legs (21..23): everything the SMP-4/5 legs acquitted vs the
+    // still-faulting SMP-3 leaves exactly two differences — the REAL `_secondary_start_virt` entry
+    // (code + per-CPU stacks; vs the replica stub) and RAPID-FIRE wake concurrency (vs leg-20's
+    // park-before-next serialization). 21 = real entry × ONE core; 22 = stub entry × RAPID 5-core;
+    // 23 = real entry × rapid 5-core (SMP-3 replayed under instrumentation; runs LAST, runbook-gated
+    // on 21 AND 22 surviving). See §ORIN-SMP-6.
+    if sel == 21 {
+        run_real_entry_one(ctx);
+        return;
+    }
+    if sel == 22 {
+        run_rapid_5core_stub(ctx);
+        return;
+    }
+    if sel == 23 {
+        run_real_entry_rapid(ctx);
+        return;
+    }
     for &(v, name, f) in EXPERIMENTS {
         if v == sel {
             serial_println!(":: tegra: SMPPROBE dispatch sel={} exp={} ::", sel, name);
@@ -1282,5 +1300,473 @@ fn run_5core_sequence(ctx: &ProbeCtx) {
         ":: tegra: SMPPROBE-5 sel=20 SEQUENCE DONE — {}/{} cores reached checkpoint (box survived the \
          full 5-core wake) ::",
         survived, n_targets
+    );
+}
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// ORIN-SMP-6 — the LAST-DIFFERENCES legs (UNAOS_SMPPROBE = 21..23)
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+//
+// SMP-5 (2026-07-16 attended) acquitted every RESIDUE element: AP serial print (17), WFI tail (18),
+// cluster-1 bring-up (19), and the serialized 5-core sequence (20) — 5/5 secondaries online — while
+// SMP-3 (the real bring-up) still RAS-faulted ×2 (IOB SERR=0x12 / CBB-0x6 / ADDR
+// 0x8000000000000200) BEFORE the first CPU_ON result printed. Exactly TWO differences remain
+// between everything acquitted and the faulting SMP-3 flow, and these legs take them one at a time:
+//
+//   * leg 21 — the REAL `_secondary_start_virt` entry (its code + per-CPU `SECONDARY_STACKS`),
+//     ONE core. The probe publishes the real path's inputs through the granted publish-only API
+//     (`smp_virt::probe_publish_real_path` — the exact `start_secondaries_tegra` pre-`CPU_ON`
+//     publication; NO `CPU_ON` inside) and observes the real path's own online signal
+//     (`smp_virt::probe_core_online`, the `CORE_READY` visibility grant). The woken core runs the
+//     REAL `__secondary_rust_virt` — its ":: AARCH64 SMP: AP 1 online …" print is EXPECTED (this
+//     leg is deliberately not probe-silent; the entry shape is the variable).
+//   * leg 22 — RAPID-FIRE wake concurrency on the known-safe replica stub: leg-20's sequence with
+//     the serialization REMOVED — all five `CPU_ON`s issued back-to-back (SMP-3's order), THEN
+//     polled. Per-core checkpoint slots + per-core probe stacks (probe file only).
+//   * leg 23 — real entry × rapid 5-core: SMP-3 replayed under instrumentation (the full plan is
+//     printed BEFORE the first `CPU_ON`, the burst itself is print-free — faster than SMP-3's own
+//     print-per-`CPU_ON` loop). Runs LAST, only if 21 AND 22 both survived (runbook-gated).
+//
+// Riders as SMP-4/5: one variable per leg; DTB-`/cpus`-only presence (RIDER 5); power-fault boots
+// are DATA; every computed address is printed BSP-side pre-`CPU_ON`. Probe-only: legs 21/23 run the
+// real (probe-independent) bring-up path — exactly what the `tegrasmp` knob runs every SMP-3 boot —
+// and write no persistent state.
+
+/// Leg-22 per-core stacks: 6 slots (slot 0 unused — a secondary's linear index is never 0), selected
+/// by the woken core's PSCI context id via `madd` in the leg-22 stub. Probe file only.
+static mut PROBE_STACKS6: [ProbeStack; 6] = [const { ProbeStack([0; PROBE_STACK_SIZE]) }; 6];
+
+/// Leg-22 per-core checkpoint slots, indexed by linear core index (slot 0 unused). `Checkpoint` is
+/// `align(64)`, so every slot owns its cache line — one core's `DC CVAC` / the BSP's `DC IVAC` poll
+/// can never disturb a neighbour slot.
+static mut CHECKPOINTS6: [Checkpoint; 6] = [const { Checkpoint(0) }; 6];
+
+/// Leg-22 per-core checkpoint value: the 0x5304 family, leg 22 in the low byte, the core index in
+/// byte 1 — `0x5304_0116 .. 0x5304_0516` for cores 1..5. Distinct per core so a wrong core writing a
+/// slot (or a stale line) can never read as the right core's arrival.
+#[inline]
+fn cp22_value(idx: usize) -> u64 {
+    cp_value(22) | ((idx as u64) << 8)
+}
+
+/// Invalidate-then-read one leg-22 checkpoint slot (the per-core sibling of `read_checkpoint`).
+fn read_checkpoint6(idx: usize) -> u64 {
+    let p = unsafe { (&raw const CHECKPOINTS6).cast::<Checkpoint>().add(idx) };
+    cache::invalidate_range(p as usize, core::mem::size_of::<Checkpoint>());
+    unsafe { core::ptr::read_volatile(p as *const u64) }
+}
+
+/// Rust tail for the leg-22 stub, entered MMU-on with THIS core's stack set and `idx` = its PSCI
+/// context id (= linear index 1..=5, register-carried through the stub — never an MMU-off spill).
+/// Runs the same leg-16-shape bring-up the acquitted legs ran — per-core state only — then raises
+/// its OWN checkpoint slot and parks. Probe-silent (the woken-core UART rule; concurrency is the
+/// variable, not the console). Never returns.
+#[unsafe(no_mangle)]
+extern "C" fn __smpprobe_leg22_rust(idx: u64) -> ! {
+    let idx = (idx as usize) % 6; // defensive: a garbage ctxid must never index out of the slots
+    exceptions::install();
+    percpu::init(idx);
+    gic::init_secondary_v3();
+    gic::enable_sgi(PROBE_IPI_SGI);
+    exceptions::enable_irq();
+    let bsp = unsafe { core::ptr::read_volatile(&raw const PROBE_BSP_AFF) };
+    gic::send_sgi(bsp as usize, PROBE_IPI_SGI);
+    let slot = unsafe { (&raw mut CHECKPOINTS6).cast::<Checkpoint>().add(idx) };
+    unsafe { core::ptr::write_volatile(slot as *mut u64, cp22_value(idx)) };
+    cache::clean_range(slot as usize, core::mem::size_of::<Checkpoint>());
+    loop {
+        unsafe { core::arch::asm!("wfe", options(nomem, nostack, preserves_flags)) };
+    }
+}
+
+// The leg-22 woken-core entry stub: the leg-20 prologue with ONE change — the stack is selected
+// PER CORE from `PROBE_STACKS6` by the PSCI context id (x0), exactly how the real
+// `_secondary_start_virt` selects from `SECONDARY_STACKS`. x0 is carried in x19 (a register, never
+// an MMU-off stack spill) into the Rust tail. Wrong-EL parks without a checkpoint, as every leg.
+core::arch::global_asm!(
+    r#"
+    .globl _smpprobe_leg22
+    _smpprobe_leg22:
+        mov   x19, x0                    // x19 = PSCI context id = linear core index (1..=5)
+        adrp  x1, {stacks6}
+        add   x1, x1, #:lo12:{stacks6}
+        mov   x2, #({stack_size} >> 12)
+        lsl   x2, x2, #12
+        madd  x3, x19, x2, x1            // x3 = &PROBE_STACKS6 + idx*size
+        add   x3, x3, x2                 //   + size => top of THIS core's stack
+        mov   sp, x3
+        mrs   x7, CurrentEL
+        cmp   x7, #(2 << 2)
+        b.ne  _smpprobe_leg_wrongel_park
+        adrp  x4, {regs}
+        add   x4, x4, #:lo12:{regs}
+        ldr   x5, [x4, #{hcr_off}]
+        msr   hcr_el2, x5
+        isb
+        ldr   x6, [x4, #{cptr_off}]
+        msr   cptr_el2, x6
+        isb
+        ldr   x5, [x4, #{mair_off}]
+        msr   mair_el2, x5
+        ldr   x5, [x4, #{tcr_off}]
+        msr   tcr_el2, x5
+        ldr   x5, [x4, #{ttbr0_off}]
+        msr   ttbr0_el2, x5
+        tlbi  alle2
+        dsb   sy
+        isb
+        ldr   x5, [x4, #{sctlr_off}]
+        msr   sctlr_el2, x5
+        isb
+        mov   x0, x19
+        bl    {leg22_rust}
+    "#,
+    stacks6 = sym PROBE_STACKS6,
+    stack_size = const PROBE_STACK_SIZE,
+    regs = sym PROBE_REGS,
+    leg22_rust = sym __smpprobe_leg22_rust,
+    mair_off = const core::mem::offset_of!(ProbeRegs, mair),
+    tcr_off = const core::mem::offset_of!(ProbeRegs, tcr),
+    ttbr0_off = const core::mem::offset_of!(ProbeRegs, ttbr0),
+    sctlr_off = const core::mem::offset_of!(ProbeRegs, sctlr),
+    cptr_off = const core::mem::offset_of!(ProbeRegs, cptr),
+    hcr_off = const core::mem::offset_of!(ProbeRegs, hcr),
+);
+
+unsafe extern "C" {
+    fn _smpprobe_leg22();
+}
+
+/// Build the SMP-6 linear-index → affinity table from the DTB `/cpus` oracle (RIDER 5): BSP =
+/// index 0, every OTHER `/cpus` core = 1,2,… in DTB order — the same table `start_secondaries_tegra`
+/// builds. Returns the core count (incl. the BSP); 1 = no wakeable secondary.
+fn smp6_aff_table(ctx: &ProbeCtx, aff_by_index: &mut [u32; 8]) -> usize {
+    let bsp_aff = gic::this_affinity();
+    let mut dtb_cores = [0u32; 8];
+    let n_dtb =
+        super::fdt_tegra::cpu_affinities(ctx.dtb_addr, ctx.dtb_size, ctx.ram_gib_mask, &mut dtb_cores);
+    aff_by_index[0] = bsp_aff;
+    let mut n_cores = 1usize;
+    for &a in dtb_cores.iter().take(n_dtb) {
+        if a == bsp_aff {
+            continue;
+        }
+        if n_cores >= 8 {
+            break;
+        }
+        aff_by_index[n_cores] = a;
+        n_cores += 1;
+    }
+    n_cores
+}
+
+/// Leg 21 — the REAL `_secondary_start_virt` entry, ONE core (the SMP-2/3 target, first non-BSP
+/// `/cpus` core, expected aff 0x00000100). The ONE variable over the acquitted leg 17 is the entry
+/// shape itself: real stub code + the real per-CPU `SECONDARY_STACKS` slot + the real
+/// `__secondary_rust_virt` (MMU replay, MPIDR-derived index, full bring-up, AP-online print,
+/// CORE_READY, AP→BSP ping, WFI park). All observation is BSP-side except the real path's own
+/// expected AP print. SMP-3 died before core 1's CPU_ON result printed — this leg alone may name
+/// the wall.
+fn run_real_entry_one(ctx: &ProbeCtx) {
+    serial_println!(
+        ":: tegra: SMPPROBE-6 sel=21 — REAL-ENTRY × ONE core (see arch_arm64 §ORIN-SMP-6); the woken \
+         core runs the real __secondary_rust_virt — its AP-online print is EXPECTED; a RAS power-off \
+         is DATA ::"
+    );
+    let mut aff_by_index = [0u32; 8];
+    let n_cores = smp6_aff_table(ctx, &mut aff_by_index);
+    if n_cores < 2 {
+        serial_println!(
+            ":: tegra: SMPPROBE-6 sel=21 — DTB /cpus named no non-BSP core (BSP aff={:#010x}); STOP, \
+             no CPU_ON ::",
+            aff_by_index[0]
+        );
+        return;
+    }
+    let target = aff_by_index[1];
+
+    // The granted publish-only API: the exact `start_secondaries_tegra` pre-CPU_ON publication
+    // (BSP affinity + SGI-0 enable, EL2 ctx capture + clean, SECONDARY_STACKS clean+invalidate,
+    // AFF_BY_INDEX/N_CORES_PUB) — no CPU_ON inside. Returns the REAL entry PA.
+    let entry = super::smp_virt::probe_publish_real_path(&aff_by_index[..n_cores]);
+    serial_println!(
+        ":: tegra: SMPPROBE-6 sel=21 real path published via smp_virt::probe_publish_real_path \
+         (n_cores={}); REAL entry _secondary_start_virt={:#x} ::",
+        n_cores, entry
+    );
+    serial_println!(
+        ":: tegra: SMPPROBE-6 sel=21 BSP aff={:#010x}; target aff={:#010x} ctxid=1 — the real path's \
+         online signal is CORE_READY[1] (+ the AP 1 online print + AP -> BSP SGI) ::",
+        aff_by_index[0], target
+    );
+
+    let freq = timer::cntfrq();
+    let freq = if freq == 0 { 62_500_000 } else { freq };
+    let bsp_ipi_before = percpu::cpu(0).ipis.load(core::sync::atomic::Ordering::Acquire);
+
+    serial_println!(
+        ":: tegra: SMPPROBE-6 sel=21 issuing CPU_ON target aff={:#010x} entry={:#x} ctxid=1 — \
+         (survives => AP 1 online via the REAL path; RAS power-off => the real entry shape IS the wall) ::",
+        target, entry
+    );
+    let ret = smc(PSCI_CPU_ON, affinity_to_mpidr(target), entry, 1);
+    if ret != 0 {
+        serial_println!(
+            ":: tegra: SMPPROBE-6 sel=21 CPU_ON RETURNED ERROR ret={} — no core woken (unexpected on \
+             39.2.0); END ::",
+            ret
+        );
+        return;
+    }
+    serial_println!(
+        ":: tegra: SMPPROBE-6 sel=21 CPU_ON ret=0 (survived the call) — polling CORE_READY[1] ::"
+    );
+
+    let deadline = timer::cntpct() + freq / 2;
+    let online = wait_until(deadline, || super::smp_virt::probe_core_online(1));
+    if online {
+        let d2 = timer::cntpct() + freq / 10;
+        let ok = wait_until(d2, || {
+            percpu::cpu(0).ipis.load(core::sync::atomic::Ordering::Acquire) > bsp_ipi_before
+        });
+        let after = percpu::cpu(0).ipis.load(core::sync::atomic::Ordering::Acquire);
+        serial_println!(
+            ":: tegra: SMPPROBE-6 sel=21 CORE_READY[1] SET — leg SURVIVED: the woken core ran the \
+             REAL __secondary_rust_virt to online; AP -> BSP SGI {} (BSP ipi {} -> {}) ::",
+            if ok { "OK" } else { "TIMEOUT" },
+            bsp_ipi_before,
+            after
+        );
+    } else {
+        serial_println!(
+            ":: tegra: SMPPROBE-6 sel=21 CORE_READY[1] NOT set in ~500ms; box still up => the real \
+             path parked (wrong-EL / unknown-affinity WFE) or hung — NOT the RAS reset (that powers \
+             the box off) ::"
+        );
+    }
+    serial_println!(":: tegra: SMPPROBE-6 sel=21 leg DONE ::");
+}
+
+/// Leg 22 — RAPID 5-core wake on the known-safe replica stub: leg-20's sequence with the
+/// serialization REMOVED. The full plan (every target + entry + expected slot value) is printed
+/// FIRST; then all `CPU_ON`s are issued BACK-TO-BACK with no prints between (SMP-3's order, faster
+/// than SMP-3's own print-per-call loop); THEN the per-core checkpoint slots are polled. The ONE
+/// variable over acquitted leg 20 is wake concurrency on the fabric/firmware.
+fn run_rapid_5core_stub(ctx: &ProbeCtx) {
+    serial_println!(
+        ":: tegra: SMPPROBE-6 sel=22 — RAPID 5-core wake × replica stub (leg-16 shape, per-core \
+         stacks/slots; back-to-back CPU_ONs, poll AFTER); a RAS power-off is DATA ::"
+    );
+    let mut aff_by_index = [0u32; 8];
+    let n_cores = smp6_aff_table(ctx, &mut aff_by_index);
+    if n_cores < 2 {
+        serial_println!(
+            ":: tegra: SMPPROBE-6 sel=22 — DTB /cpus named no non-BSP core; STOP, no CPU_ON ::"
+        );
+        return;
+    }
+    let n_targets = if n_cores - 1 > 5 { 5 } else { n_cores - 1 }; // slots/stacks are sized for 5
+    let entry = _smpprobe_leg22 as *const () as usize as u64;
+
+    // Publish the probe regime/stacks/BSP-affinity, zero + clean every checkpoint slot.
+    unsafe { core::ptr::write_volatile(&raw mut PROBE_BSP_AFF, aff_by_index[0]) };
+    gic::enable_sgi(PROBE_IPI_SGI);
+    capture_probe_regs();
+    cache::clean_range(&raw const PROBE_REGS as usize, core::mem::size_of::<ProbeRegs>());
+    cache::clean_invalidate_range(
+        &raw const PROBE_STACKS6 as usize,
+        core::mem::size_of::<[ProbeStack; 6]>(),
+    );
+    cache::clean_range(&raw const PROBE_BSP_AFF as usize, core::mem::size_of::<u32>());
+    for idx in 0..6 {
+        let slot = unsafe { (&raw mut CHECKPOINTS6).cast::<Checkpoint>().add(idx) };
+        unsafe { core::ptr::write_volatile(slot as *mut u64, 0) };
+        cache::clean_range(slot as usize, core::mem::size_of::<Checkpoint>());
+    }
+
+    // The pre-registered plan — EVERY address under test printed BEFORE the first CPU_ON.
+    serial_println!(
+        ":: tegra: SMPPROBE-6 sel=22 BSP aff={:#010x}; {} target(s), entry _smpprobe_leg22={:#x}; \
+         plan (burst is print-free): ::",
+        aff_by_index[0], n_targets, entry
+    );
+    for i in 0..n_targets {
+        let idx = i + 1;
+        serial_println!(
+            ":: tegra: SMPPROBE-6 sel=22 plan [{}/{}] target aff={:#010x} ctxid={} stack=PROBE_STACKS6[{}] \
+             slot value {:#x} ::",
+            idx, n_targets, aff_by_index[idx], idx, idx, cp22_value(idx)
+        );
+    }
+
+    let freq = timer::cntfrq();
+    let freq = if freq == 0 { 62_500_000 } else { freq };
+    let bsp_ipi_before = percpu::cpu(0).ipis.load(core::sync::atomic::Ordering::Acquire);
+
+    // THE BURST — all CPU_ONs back-to-back, no serial between (a RAS power-off lands mid-burst; the
+    // plan above names every core; the rets below name how far the burst got if the box survives).
+    let mut rets = [0i64; 6];
+    for i in 0..n_targets {
+        let idx = i + 1;
+        rets[idx] = smc(PSCI_CPU_ON, affinity_to_mpidr(aff_by_index[idx]), entry, idx as u64);
+    }
+
+    serial_println!(":: tegra: SMPPROBE-6 sel=22 burst COMPLETE (box survived {} back-to-back CPU_ONs) ::", n_targets);
+    for i in 0..n_targets {
+        let idx = i + 1;
+        serial_println!(
+            ":: tegra: SMPPROBE-6 sel=22 [{}/{}] target aff={:#010x} CPU_ON ret={} ::",
+            idx, n_targets, aff_by_index[idx], rets[idx]
+        );
+    }
+
+    // NOW poll — each slot under its own bounded ~500 ms deadline.
+    let mut survived = 0usize;
+    for i in 0..n_targets {
+        let idx = i + 1;
+        if rets[idx] != 0 {
+            serial_println!(
+                ":: tegra: SMPPROBE-6 sel=22 [{}/{}] not woken (ret!=0); slot skipped ::",
+                idx, n_targets
+            );
+            continue;
+        }
+        let want = cp22_value(idx);
+        let deadline = timer::cntpct() + freq / 2;
+        let reached = wait_until(deadline, || read_checkpoint6(idx) == want);
+        if reached {
+            survived += 1;
+            serial_println!(
+                ":: tegra: SMPPROBE-6 sel=22 [{}/{}] target aff={:#010x} CHECKPOINT REACHED ({:#x}) ::",
+                idx, n_targets, aff_by_index[idx], want
+            );
+        } else {
+            let seen = read_checkpoint6(idx);
+            serial_println!(
+                ":: tegra: SMPPROBE-6 sel=22 [{}/{}] target aff={:#010x} CHECKPOINT NOT reached in \
+                 ~500ms (last read={:#x}); box up => wrong-EL park or hang ::",
+                idx, n_targets, aff_by_index[idx], seen
+            );
+        }
+    }
+
+    // AP → BSP SGIs: every online core pinged the BSP once (coalescing note as smp_virt — the
+    // verdict is "grew", not an exact count).
+    let deadline = timer::cntpct() + freq / 10;
+    let ok = wait_until(deadline, || {
+        percpu::cpu(0).ipis.load(core::sync::atomic::Ordering::Acquire) > bsp_ipi_before
+    });
+    let after = percpu::cpu(0).ipis.load(core::sync::atomic::Ordering::Acquire);
+    serial_println!(
+        ":: tegra: SMPPROBE-6 sel=22 AP -> BSP SGI {} (BSP ipi {} -> {}) ::",
+        if ok { "OK" } else { "TIMEOUT" },
+        bsp_ipi_before,
+        after
+    );
+    serial_println!(
+        ":: tegra: SMPPROBE-6 sel=22 RAPID SEQUENCE DONE — {}/{} cores reached their slot (box \
+         survived the concurrent wake) ::",
+        survived, n_targets
+    );
+}
+
+/// Leg 23 — the REAL entry × RAPID 5-core: SMP-3 replayed under instrumentation. Publication via
+/// the granted publish-only API; all `CPU_ON`s into the REAL `_secondary_start_virt` back-to-back
+/// (print-free burst — faster than SMP-3's print-per-call loop); then the real path's own
+/// `CORE_READY` signals polled per core. Runs LAST, only if legs 21 AND 22 both survived on the
+/// bench (the runbook gates its boot — the code itself is always staged).
+fn run_real_entry_rapid(ctx: &ProbeCtx) {
+    serial_println!(
+        ":: tegra: SMPPROBE-6 sel=23 — REAL-ENTRY × RAPID 5-core (SMP-3 replayed, instrumented); the \
+         woken cores run the real __secondary_rust_virt — AP-online prints are EXPECTED; a RAS \
+         power-off is DATA ::"
+    );
+    let mut aff_by_index = [0u32; 8];
+    let n_cores = smp6_aff_table(ctx, &mut aff_by_index);
+    if n_cores < 2 {
+        serial_println!(
+            ":: tegra: SMPPROBE-6 sel=23 — DTB /cpus named no non-BSP core; STOP, no CPU_ON ::"
+        );
+        return;
+    }
+    let n_targets = n_cores - 1;
+
+    let entry = super::smp_virt::probe_publish_real_path(&aff_by_index[..n_cores]);
+    serial_println!(
+        ":: tegra: SMPPROBE-6 sel=23 real path published (n_cores={}); REAL entry \
+         _secondary_start_virt={:#x}; BSP aff={:#010x}; plan (burst is print-free): ::",
+        n_cores, entry, aff_by_index[0]
+    );
+    for idx in 1..n_cores {
+        serial_println!(
+            ":: tegra: SMPPROBE-6 sel=23 plan [{}/{}] target aff={:#010x} ctxid={} — online signal \
+             CORE_READY[{}] ::",
+            idx, n_targets, aff_by_index[idx], idx, idx
+        );
+    }
+
+    let freq = timer::cntfrq();
+    let freq = if freq == 0 { 62_500_000 } else { freq };
+    let bsp_ipi_before = percpu::cpu(0).ipis.load(core::sync::atomic::Ordering::Acquire);
+
+    // THE BURST — the SMP-3 wake, minus even its per-call result prints.
+    let mut rets = [0i64; 8];
+    for idx in 1..n_cores {
+        rets[idx] = smc(PSCI_CPU_ON, affinity_to_mpidr(aff_by_index[idx]), entry, idx as u64);
+    }
+
+    serial_println!(
+        ":: tegra: SMPPROBE-6 sel=23 burst COMPLETE (box survived {} back-to-back REAL-entry CPU_ONs) ::",
+        n_targets
+    );
+    for idx in 1..n_cores {
+        serial_println!(
+            ":: tegra: SMPPROBE-6 sel=23 [{}/{}] target aff={:#010x} CPU_ON ret={} ::",
+            idx, n_targets, aff_by_index[idx], rets[idx]
+        );
+    }
+
+    let mut online = 0usize;
+    for idx in 1..n_cores {
+        if rets[idx] != 0 {
+            serial_println!(
+                ":: tegra: SMPPROBE-6 sel=23 [{}/{}] not woken (ret!=0); skipped ::",
+                idx, n_targets
+            );
+            continue;
+        }
+        let deadline = timer::cntpct() + freq / 2;
+        let up = wait_until(deadline, || super::smp_virt::probe_core_online(idx));
+        if up {
+            online += 1;
+            serial_println!(
+                ":: tegra: SMPPROBE-6 sel=23 [{}/{}] target aff={:#010x} CORE_READY[{}] SET — online \
+                 via the REAL path ::",
+                idx, n_targets, aff_by_index[idx], idx
+            );
+        } else {
+            serial_println!(
+                ":: tegra: SMPPROBE-6 sel=23 [{}/{}] target aff={:#010x} CORE_READY[{}] NOT set in \
+                 ~500ms; box up => parked or hung (not the RAS reset) ::",
+                idx, n_targets, aff_by_index[idx], idx
+            );
+        }
+    }
+
+    let deadline = timer::cntpct() + freq / 10;
+    let ok = wait_until(deadline, || {
+        percpu::cpu(0).ipis.load(core::sync::atomic::Ordering::Acquire) > bsp_ipi_before
+    });
+    let after = percpu::cpu(0).ipis.load(core::sync::atomic::Ordering::Acquire);
+    serial_println!(
+        ":: tegra: SMPPROBE-6 sel=23 AP -> BSP SGI {} (BSP ipi {} -> {}) ::",
+        if ok { "OK" } else { "TIMEOUT" },
+        bsp_ipi_before,
+        after
+    );
+    serial_println!(
+        ":: tegra: SMPPROBE-6 sel=23 RAPID REAL-ENTRY SEQUENCE DONE — {}/{} cores online via the \
+         REAL path (the SMP-3 replay survived) ::",
+        online, n_targets
     );
 }

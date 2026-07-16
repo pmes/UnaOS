@@ -3920,3 +3920,48 @@ changed source text and shifts later section file offsets — it does not reach 
 no new serial prints). QEMU cannot model the tegra timerless drop, so the verdict is the attended Orin
 bench (LC-orin + Peter): expected metal outcome = `vug` shows live fps/ms/load, the CPU meter reads
 **6** cores, and the bars move.
+### ORIN-SMP-6 — the LAST-DIFFERENCES legs (`UNAOS_SMPPROBE=21..23`, knob-gated; bench Peter-attended)
+
+The ORIN-SMP-5 sitting (2026-07-16 attended) acquitted every RESIDUE element — AP serial print (17),
+WFI tail (18), cluster-1 bring-up (19), and the serialized 5-core sequence (20; 5/5 online, every
+core on the part has run UnaOS) — while SMP-3 (the real `tegrasmp` bring-up) still RAS-faulted ×2
+(IOB SERR=0x12 / CBB-0x6 / ADDR `0x8000000000000200`) BEFORE the first `CPU_ON` result printed.
+Exactly **two differences** remain between everything acquitted and the faulting SMP-3 flow, and
+ORIN-SMP-6 takes them one variable per leg:
+
+1. the **REAL `_secondary_start_virt` entry** — the real stub code + the real per-CPU
+   `SECONDARY_STACKS` slot + the real `__secondary_rust_virt` (MMU replay, MPIDR-derived index,
+   AP-online print, `CORE_READY`, AP→BSP ping, WFI park) — vs the probe's replica stub;
+2. **RAPID-FIRE wake concurrency** — SMP-3 issues all five `CPU_ON`s in a tight loop — vs leg-20's
+   park-before-next serialization.
+
+**Lane amendment (Maestro-granted 2026-07-16).** Feeding the real entry requires the real path's
+private publication state, so `smp_virt.rs` gained EXACTLY one `smpprobe`-gated (plus `tegra`)
+publish-only API + one read accessor — `probe_publish_real_path(aff_by_index) -> entry_pa`
+(the exact `start_secondaries_tegra` pre-`CPU_ON` publication: BSP affinity + SGI-0 enable, EL2 ctx
+capture + clean-to-PoC, `SECONDARY_STACKS` clean+invalidate, `AFF_BY_INDEX`/`N_CORES_PUB` Release;
+**no `CPU_ON` inside**) and `probe_core_online(idx)` (the `CORE_READY` Acquire read). Both are
+compiled out knob-off — the default image stays byte-identical to baseline (re-proven this arc).
+
+**The legs (leg-22 slots carry the core index in byte 1 — `0x5304_0116..0x5304_0516`):**
+
+| knob | the ONE variable | evidence channel | notes |
+|---|---|---|---|
+| **21** | REAL entry × ONE core (`0x00000100`, ctxid 1) | the real path's own signals: the AP's `:: AARCH64 SMP: AP 1 online … ::` print (EXPECTED — this leg is deliberately not probe-silent), `CORE_READY[1]`, AP→BSP SGI | SMP-3 died before core 1's `CPU_ON` result printed — this leg alone may name the wall. Publication via the granted API; every address printed BSP-side pre-`CPU_ON`. |
+| **22** | RAPID 5-core burst × the known-safe replica stub (`_smpprobe_leg22`: leg-16 shape + per-core stacks `PROBE_STACKS6` + per-core checkpoint slots) | per-core slots `0x5304_01xx16` polled AFTER the burst | The full plan (every target/entry/slot value) prints BEFORE the first `CPU_ON`; the burst itself is print-free (back-to-back, faster than SMP-3's own print-per-call loop). Pure concurrency on acquitted code. |
+| **23** | REAL entry × RAPID 5-core — SMP-3 replayed under instrumentation | `CORE_READY[1..5]` polled after the print-free burst; AP-online prints expected ×5 | Runs LAST, only if 21 AND 22 both survived on the bench (runbook-gated; the image is always staged). |
+
+**Predictions (RIDER 2 — pre-registered in `scripts/orin-smp6-bench.md` BEFORE any boot).** The 2×2
+of {entry shape} × {concurrency} is fully covered by legs 20 (serialized/stub, survived), 21, 22, 23:
+whichever leg faults FIRST names the trigger axis; if 21 and 22 both survive and 23 faults, the wall
+is the *conjunction*; if all three survive, SMP-3's fault is not reproduced under instrumentation at
+all (a boot-state/ordering delta vs the `tegrasmp` flow — e.g. the kick-off's surrounding context —
+becomes the target). A leg that faults where survival was predicted = STOP the sitting.
+
+**Gate (this executor).** `./arroyo check` green (both arches, knob-off) + `UNAOS_TEGRA=1
+UNAOS_SMPPROBE=21/22/23` all compile; knob-off byte-identity re-proven post-amendment (two default
+`esp-jetson` builds hash identical, zero `SMPPROBE-6` strings knob-off); `test-arm 22` MISSION
+SUCCESS; GICv3 `test-arm 40` CAPSTONE 6/6 + 3/3 secondaries (the no-behavior-change proof for the
+`smp_virt.rs` amendment); `kernel8-test` 0-FAIL; `UNAOS_HUBSTORAGE` x86 MISSION SUCCESS; 3 armed leg
+tars + the knob-off DEFAULT staged. The metal verdict is the attended bench with LC-orin + Peter
+(runbook `scripts/orin-smp6-bench.md`).

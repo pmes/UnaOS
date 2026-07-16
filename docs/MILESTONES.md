@@ -10,6 +10,30 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## aarch64 SMP — ORIN-SMP-6: the LAST-DIFFERENCES legs (`UNAOS_SMPPROBE=21..23`) — 2026-07-16 🔬 QEMU-green, bench pending `hw-jetson`
+
+**What it does:** closes the SMP-3 discrimination space. SMP-5 acquitted every residue element while
+SMP-3 still RAS-faults; exactly two differences remain — the REAL `_secondary_start_virt` entry
+(vs the probe replica) and RAPID-FIRE wake concurrency (vs leg-20's serialization) — and these legs
+take them one at a time: **21** = REAL entry × ONE core (`0x00000100`; the woken core runs the real
+`__secondary_rust_virt` — its AP-online print is expected, observation via `CORE_READY[1]` + AP→BSP
+SGI); **22** = RAPID 5-core burst × the replica stub (per-core stacks + per-core checkpoint slots
+`0x5304_01xx16`; plan printed first, burst print-free, poll after); **23** = REAL entry × rapid
+5-core — SMP-3 replayed under instrumentation (runs LAST, runbook-gated on 21+22 surviving). Lane
+amendment (Maestro-granted): `smp_virt.rs` gained exactly one `smpprobe`-gated publish-only API
+(`probe_publish_real_path` — the `start_secondaries_tegra` pre-`CPU_ON` publication, NO `CPU_ON`) +
+`probe_core_online` (`CORE_READY` read); both compiled out knob-off.
+
+**How it was tested:** `./arroyo check` both arches knob-off + armed 21/22/23; knob-off byte-identity
+re-proven post-amendment (two default `esp-jetson` builds hash identical; zero `SMPPROBE-6` strings
+knob-off); `test-arm 22` MISSION SUCCESS; GICv3 `test-arm 40` CAPSTONE 6/6 + **3/3 secondaries** (the
+no-behavior-change proof for the `smp_virt.rs` amendment); `kernel8-test` 0 FAIL; `UNAOS_HUBSTORAGE`
+x86 25s MISSION SUCCESS. Metal: the attended sitting (runbook `unaos/scripts/orin-smp6-bench.md`,
+pre-registered predictions; staged tars in `~/unaos-bench/flash/orin/`). Detail:
+`arch_arm64.md §ORIN-SMP-6`.
+
+---
+
 ## aarch64 tegra — VUGFIX: reviving vug's meters on the timerless Orin EL1 — 2026-07-16 🔬 QEMU-green, metal pending `hw-jetson`
 
 **What it does:** fixes two tegra-only defects Peter observed poking `vug` on the Orin (blank render
