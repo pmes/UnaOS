@@ -106,6 +106,13 @@ FORBID K6-migrate:.*FAIL
 REQUIRE BANDY-CODEC:.*decode fail-closed.*PASS
 FORBID BANDY-CODEC:.*FAIL
 
+# --- BANDY-CODEC2 write-side codec witness (uncounted): the write/rm/mv request goldens frozen,
+# --- the typed WRITE [name_len][name][content] payload (empty + at-ceiling content), decode
+# --- fail-closed. A SIBLING of BANDY-CODEC (the BANDY-1 goldens stay byte-identical). BANDY-2 M1
+# --- (2026-07-16); read-only/in-RAM, runs every boot. --------------------------------------------
+REQUIRE BANDY-CODEC2:.*decode fail-closed.*PASS
+FORBID BANDY-CODEC2:.*FAIL
+
 # --- BANDY-STAMP transport witness (uncounted): principal stamping is KERNEL-only (a caller-
 # --- supplied principal field is -EINVAL, never overwritten); replies carry the RESERVED kernel
 # --- kind, fail-closed as grantee/owner/persist target; per-ASID mailboxes bounded (depth 16,
@@ -126,6 +133,19 @@ FORBID BANDY-RT:.*FAIL
 # --- both legs driven at EL0 by midden through the production paths. ----------------------------
 REQUIRE BANDY-EQ:.*both legs at EL0 through the production paths PASS
 FORBID BANDY-EQ:.*FAIL
+
+# --- BANDY-2 write-side witnesses (uncounted), driven by midden at EL0 through the production
+# --- paths + a kernel-side ACL integrity check. WR: create->cat byte-exact, truncate->cat, rm->cat
+# --- -ENOENT, mv->cat(new) byte-exact + cat(old) -ENOENT. EQ2: rm/mv/write of a foreign-owned file
+# --- denied-via-bus == denied-via-syscall (byte-same -EACCES). ACL: the denied destructive verbs
+# --- left the foreign owner row INTACT (no stale-owner strand / same-name re-adoption — the K1-F2
+# --- class), no stolen name, write-side fixtures self-cleaned. BANDY-2 M2/M4 (2026-07-16). --------
+REQUIRE BANDY-WR:.*mv->cat\(new\) byte-exact.*PASS
+FORBID BANDY-WR:.*FAIL
+REQUIRE BANDY-EQ2:.*byte-same -EACCES.*PASS
+FORBID BANDY-EQ2:.*FAIL
+REQUIRE BANDY-ACL:.*foreign owner row intact.*PASS
+FORBID BANDY-ACL:.*FAIL
 
 # NOTE (bench operators): these five are now hard REQUIREs. On a rare no-card / hub-MSC-vid=0000
 # boot the card-dependent selftests won't emit — re-seat the data card and re-boot (that IS the

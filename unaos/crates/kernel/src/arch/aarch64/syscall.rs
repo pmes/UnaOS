@@ -3915,6 +3915,28 @@ fn openfile_mark_unlink_pending_at(row: u32, first_cluster: u32) {
     }
 }
 
+/// BANDY-2: the BY-NAME twin of `openfile_mark_unlink_pending_at`, for the bus rm/write-truncate
+/// paths (which delete by NAME — they hold no open descriptor, hence no `FILE_OPENROW` index). If
+/// ANOTHER process holds the file at `(dir_lba, dir_off)` open (a LIVE, non-`unlink_pending` row),
+/// mark that row `unlink_pending` + stash the chain head so its LAST close frees the chain (the
+/// deferred-free discipline: a concurrent reader can never have its clusters freed underneath it),
+/// and return `true` (the caller must NOT free now). Return `false` when NO live open exists — the
+/// caller frees the chain immediately (the sole path holding it). Must be called under the
+/// NAMESPACE hold (the same serialization `sys_unlink` and `openfile_incref` take), so no open can
+/// race in between the caller's `0xE5` and this mark. A pending row sharing the key is a DIFFERENT
+/// file on a FAT-recycled slot (`openfile_incref`'s load-bearing exclusion) — skip it, free now.
+fn openfile_mark_pending_or_none_by_dir(dir_lba: u64, dir_off: u32, first_cluster: u32) -> bool {
+    let mut table = OPEN_FILES.lock();
+    for row in table.iter_mut() {
+        if row.refcount > 0 && !row.unlink_pending && row.dir_lba == dir_lba && row.dir_off == dir_off {
+            row.unlink_pending = true;
+            row.first_cluster = first_cluster;
+            return true; // a live opener holds it — defer the free to its last close
+        }
+    }
+    false // no live open — the caller frees the chain immediately
+}
+
 /// U11-M2: free the cluster chain of an `unlink_pending` file whose LAST descriptor just closed — the deferred
 /// half of the `sys_unlink` split, run at close time. Called ONLY from SYSCALL context (`sys_close`,
 /// `sys_unlink`, the `sys_open` unwind), where block I/O is legal; NEVER from teardown (IRQ-masked — that path
@@ -8508,6 +8530,11 @@ pub fn u7_launcher(demo_cpu: usize) {
     // decode fail-closed at the hard ceiling. Read-only, in-RAM (no disk, no card); its own
     // uncounted `:: BANDY-CODEC: … PASS ::` line. LAST in the chain.
     super::bus::bus_codec_selftest();
+    // BANDY-2 M1: the write-side codec KATs — write/rm/mv request goldens frozen, the typed WRITE
+    // [name_len][name][content] payload + empty/at-ceiling content, decode fail-closed. A SIBLING
+    // of BANDY-CODEC (the BANDY-1 goldens/witness stay byte-identical). Read-only, in-RAM; its own
+    // uncounted `:: BANDY-CODEC2: … PASS ::` line.
+    super::bus::bus_codec2_selftest();
     // BANDY-1 M5 (verdict C): the stamping witness — caller-supplied principal rejected, replies
     // stamped with the reserved kernel kind (fail-closed everywhere a grantee/owner can appear),
     // bounded per-ASID mailboxes, gen fence. Drives the PRODUCTION sys_msend_for path with
@@ -9967,6 +9994,36 @@ fn native_persist_grow(dir_lba: u64, dir_off: u32, new_first: u32) -> bool {
         )
     })
     .unwrap_or(true) // no volume / no storage: nothing durable exists to refresh (pre-K5B semantics)
+}
+
+/// BANDY-2: refresh the persisted NAME of an owned file after an in-place rename (bus mv). The FAT
+/// entry has already been renamed (same directory slot -> `(dir_lba, dir_off)` unchanged, so the
+/// in-RAM OWNED_FILES row and the native row's LOCATION key are both still valid); ONLY the native
+/// row's stored `name` attribute — the mount-rebuild's by-name re-resolution key — has gone stale.
+/// Rewrite it, preserving the owner + grants + first_cluster verbatim, under ONE `with_unafs` MOUNT
+/// hold (the K5B invariant; `ns` is NOT taken — the caller drops the NAMESPACE hold first, exactly
+/// like every other persist site). No native row yet (create-persist had failed) -> nothing to
+/// re-bind, `true` (in-RAM still enforces this boot; cross-reboot fails closed to PUBLIC). Returns
+/// `false` on a real projection/write failure — the caller then CLEARS the stale-named row so a
+/// future same-name file can never adopt it (the K1-F2 re-adoption class, fail-closed).
+fn native_persist_rename(dir_lba: u64, dir_off: u32, new_name: &str) -> bool {
+    crate::fs::unafs::with_unafs(|fs| {
+        let Some(row) = crate::fs::unafs::native_acl_read_on(fs, dir_lba, dir_off) else {
+            return true; // no persisted row — nothing to re-bind (in-RAM still enforces this boot)
+        };
+        let grefs: alloc::vec::Vec<(&[u8], &[u8])> =
+            row.grants.iter().map(|(k, v)| (k.as_slice(), v.as_slice())).collect();
+        crate::fs::unafs::native_acl_write_on(
+            fs,
+            dir_lba,
+            dir_off,
+            new_name,
+            row.first_cluster,
+            &row.owner,
+            &grefs,
+        )
+    })
+    .unwrap_or(true) // no volume / no storage: nothing durable exists to re-bind (pre-K5B semantics)
 }
 
 /// K1 M2.4 / K2 / K6 / K7: the REAL-BOOT mount-rebuild hook — restore persisted ownership before EL0
@@ -14377,6 +14434,248 @@ fn bus_cp(asid: u64, agen: u64, ppid: PrincipalRecord, src: &str, dst: &str) -> 
     0
 }
 
+// -----------------------------------------------------------------------------------------------
+// BANDY-2 (M2): the WRITE-SIDE fulfillment — write / rm / mv through the EXISTING FAT + ACL
+// machinery under the invoker's identity, every errno mirrored byte-for-byte against the direct
+// syscall paths (the equivalence witness's contract). The DESTRUCTIVE verbs inherit the K1-F2 ACL
+// discipline verbatim: the persisted (native) ACL row is cleared DURABLE-FIRST — before the `0xE5`
+// name delete — so a crash fails toward PUBLIC (a stale owner row a future same-name file could
+// adopt is the K1-F2 failure class). Native ACL persist happens AFTER the NAMESPACE hold drops
+// (the K5B rule); the durable clear runs BEFORE the hold (the sidecar `atr_clear_row` re-takes
+// `ns`, so it can never nest under it — the sys_unlink ordering, inherited exactly).
+// -----------------------------------------------------------------------------------------------
+
+/// The v1 write-content ceiling (the BUS_CP_MAX bound, shared with cp — a deliberate bound, never
+/// raised for a demo). The frame body ceiling already bounds the payload; this is the semantic cap.
+/// bus write: CREATE-OR-TRUNCATE a ROOT file under the invoker's grants with `content` (<= BUS_CP_MAX).
+///
+/// CREATE (name absent): mirrors sys_open(O_CREAT) + a single write — create_in_root -> write_grow
+/// -> owner row PRIVATE to the invoker (or PUBLIC for an anonymous/ASID-0 invoker), native persist
+/// AFTER the ns hold drops (the bus_cp create half, sourced from `content` rather than a copied file).
+///
+/// TRUNCATE (name present): OWNER-ONLY (`owned_unlink_permitted` — a public file is anyone's). It is
+/// implemented as an atomic-by-name DELETE-then-CREATE: the in-lane FAT primitives grow but never
+/// SHRINK in place, and a delete+recreate BY A GRANTEE would let a content grantee steal ownership —
+/// so, exactly like sys_unlink's owner-only delete authority, a write-truncate of an OWNED file is
+/// owner-only (a write-GRANTEE gets -EACCES; in-place grantee truncate needs a fat.rs shrink
+/// primitive, out of the v1 bus lane — HONEST SCOPE, flagged). The delete half clears the persisted
+/// ACL row DURABLE-FIRST (K1-F2), defers the old chain's free if a concurrent reader holds it open
+/// (never freeing clusters underneath a live open), then the create half re-owns the file to the
+/// invoker. A previously-owned file stays owned by its owner; a public file becomes private to the
+/// writer (the sys_open(O_CREAT) private policy, applied uniformly to create and truncate).
+fn bus_write(asid: u64, agen: u64, ppid: PrincipalRecord, name: &str, content: &[u8]) -> i64 {
+    if name.eq_ignore_ascii_case(ATR_NAME) {
+        return EACCES; // the kernel owns the ACL store — never a writable name
+    }
+    if content.len() > BUS_CP_MAX {
+        return E2BIG; // v1's honest write ceiling
+    }
+    let fs = match crate::fs::fat::mount() {
+        Ok(fs) => fs,
+        Err(crate::fs::fat::FatError::NoDisk) => return ENODEV,
+        Err(_) => return EIO,
+    };
+    // Existence check (advisory — re-verified under the ns hold below before any mutation).
+    let existing = {
+        let ns = ns_lock();
+        let r = match fs.find_located(name) {
+            Ok((de, l, o)) => Some((de.is_dir, de.first_cluster(), l, o)),
+            Err(crate::fs::fat::FatError::NotFound) => None,
+            Err(_) => return EIO,
+        };
+        drop(ns);
+        r
+    };
+    if let Some((is_dir, cluster, dir_lba, dir_off)) = existing {
+        if is_dir {
+            return EISDIR; // v1: files only, exactly as cat/cp
+        }
+        // TRUNCATE is an owner-only authority (see the doc note): a public file is anyone's.
+        if !owned_unlink_permitted(dir_lba, dir_off as u32, asid, agen, ppid) {
+            return EACCES;
+        }
+        let owner_ppid = owned_owner_ppid(dir_lba, dir_off as u32);
+        // Clear the PERSISTED ACL row DURABLE-FIRST — BEFORE the 0xE5 (K1-F2); ns-free (atr_clear_row
+        // re-takes ns, so it can never nest under the hold). A named-owner only; a public file skips
+        // this with zero disk I/O. -EIO aborts if the durable clear did not land (nothing stranded).
+        if owner_ppid.kind != PRIN_NONE
+            && !(crate::fs::unafs::native_acl_clear(dir_lba, dir_off as u32)
+                && atr_clear_row(&fs, dir_lba, dir_off as u32))
+        {
+            return EIO;
+        }
+        // The 0xE5 + owner-row drop + deferred-free arm, atomic against concurrent name ops (ns).
+        let ns = ns_lock();
+        match fs.find_located(name) {
+            // The name must still resolve to the SAME slot (no concurrent rename/recycle). A same-slot
+            // hit of the same name is our file (delete-by-name is content-agnostic — fine).
+            Ok((d2, l2, o2)) if l2 == dir_lba && o2 == dir_off && !d2.is_dir => {}
+            Ok(_) => return EIO,                                   // slot moved/recycled — refuse (already public)
+            Err(crate::fs::fat::FatError::NotFound) => return EIO, // raced-deleted between clear and hold
+            Err(_) => return EIO,
+        }
+        if fs.mark_dir_deleted(dir_lba, dir_off).is_err() {
+            return EIO;
+        }
+        owned_clear(dir_lba, dir_off as u32);
+        let deferred = openfile_mark_pending_or_none_by_dir(dir_lba, dir_off as u32, cluster);
+        drop(ns);
+        if !deferred && cluster != 0 {
+            free_orphan_chain(cluster);
+        }
+        // fall through to CREATE (the recreate half)
+    }
+    // CREATE (a fresh file, or the post-truncate recreate) — the bus_cp create half from `content`.
+    let ns = ns_lock();
+    match fs.find_located(name) {
+        Ok(_) => return EEXIST, // raced-created after our delete (a concurrent create won the slot)
+        Err(crate::fs::fat::FatError::NotFound) => {}
+        Err(_) => return EIO,
+    }
+    let (dde, d_lba, d_off) = match fs.create_in_root(name, 0x20) {
+        Ok(t) => t,
+        Err(crate::fs::fat::FatError::Unsupported) => return EINVAL, // not an 8.3 name
+        Err(crate::fs::fat::FatError::NoSpace) => return ENOSPC,
+        Err(_) => return EIO,
+    };
+    let mut new_fc = dde.first_cluster();
+    if !content.is_empty() {
+        match fs.write_grow(dde.first_cluster(), 0, d_lba, d_off, 0, content) {
+            Ok((_, _, fc)) => new_fc = fc,
+            Err(_) => {
+                let _ = fs.mark_dir_deleted(d_lba, d_off); // leak-not-dangle
+                return EIO;
+            }
+        }
+    }
+    if asid != 0 && !owned_set_owner(d_lba, d_off as u32, asid, agen, ppid) {
+        let _ = fs.mark_dir_deleted(d_lba, d_off);
+        return ENOSPC; // fail CLOSED — never a silently-public "private" file
+    }
+    drop(ns);
+    if asid != 0 && ppid.kind != PRIN_NONE {
+        let _ = native_persist_create(name, new_fc, d_lba, d_off as u32, ppid);
+    }
+    0
+}
+
+/// bus rm: UNLINK a ROOT file by name under the invoker's grants — the sys_unlink twin. DELETE is an
+/// OWNER-ONLY authority (`owned_unlink_permitted`: a content grantee gets read/write, NEVER delete —
+/// else it could unlink + recreate the name to steal ownership; a public file is anyone's). The
+/// persisted ACL row is cleared DURABLE-FIRST (before the 0xE5 — K1-F2), then the name is deleted,
+/// the owner row dropped, and the cluster chain freed (or deferred to a concurrent opener's last
+/// close). Errnos mirror sys_unlink/the cat gate: ATR deny / mount / -ENOENT / -EISDIR / -EACCES.
+fn bus_rm(asid: u64, agen: u64, ppid: PrincipalRecord, name: &str) -> i64 {
+    if name.eq_ignore_ascii_case(ATR_NAME) {
+        return EACCES;
+    }
+    let fs = match crate::fs::fat::mount() {
+        Ok(fs) => fs,
+        Err(crate::fs::fat::FatError::NoDisk) => return ENODEV,
+        Err(_) => return EIO,
+    };
+    // Locate + authorize under the ns hold (coherent), then DROP it for the durable clear (which
+    // re-takes ns), then re-take it for the destructive sequence (re-verifying the slot).
+    let (cluster, dir_lba, dir_off, owner_ppid) = {
+        let ns = ns_lock();
+        let (de, dir_lba, dir_off) = match fs.find_located(name) {
+            Ok(t) => t,
+            Err(crate::fs::fat::FatError::NotFound) => return ENOENT,
+            Err(_) => return EIO,
+        };
+        if de.is_dir {
+            return EISDIR; // v1: files only (rmdir is a later verb)
+        }
+        if !owned_unlink_permitted(dir_lba, dir_off as u32, asid, agen, ppid) {
+            return EACCES;
+        }
+        let owner_ppid = owned_owner_ppid(dir_lba, dir_off as u32);
+        drop(ns);
+        (de.first_cluster(), dir_lba, dir_off, owner_ppid)
+    };
+    // K1-F2: clear the PERSISTED row DURABLE-FIRST — ns-free (atr_clear_row re-takes ns). -EIO
+    // aborts (nothing stranded) if the durable clear did not land. A public file skips it (0 I/O).
+    if owner_ppid.kind != PRIN_NONE
+        && !(crate::fs::unafs::native_acl_clear(dir_lba, dir_off as u32)
+            && atr_clear_row(&fs, dir_lba, dir_off as u32))
+    {
+        return EIO;
+    }
+    let ns = ns_lock();
+    // TOCTOU re-verify: the name must still map to the SAME slot (no concurrent rename/recycle
+    // landed while ns was released for the clear). A same-name same-slot hit is our file.
+    match fs.find_located(name) {
+        Ok((d2, l2, o2)) if l2 == dir_lba && o2 == dir_off && !d2.is_dir => {}
+        Ok(_) => return EIO,
+        Err(crate::fs::fat::FatError::NotFound) => return ENOENT,
+        Err(_) => return EIO,
+    }
+    if fs.mark_dir_deleted(dir_lba, dir_off).is_err() {
+        return EIO;
+    }
+    owned_clear(dir_lba, dir_off as u32);
+    let deferred = openfile_mark_pending_or_none_by_dir(dir_lba, dir_off as u32, cluster);
+    drop(ns);
+    if !deferred && cluster != 0 {
+        free_orphan_chain(cluster);
+    }
+    0
+}
+
+/// bus mv: RENAME a ROOT file in place under the invoker's grants — the fat.rs `rename_entry` twin.
+/// The rename is OWNER-ONLY on an owned file (`owned_unlink_permitted` — the same owner-authority as
+/// delete: a grantee mutating the name could re-point ownership; a public file is anyone's) and
+/// CREATE-NEW-ONLY on the destination (-EEXIST). An in-place rename keeps the SAME directory slot, so
+/// the in-RAM owner row (keyed by location) is unchanged — live enforcement stays correct with no
+/// owned_* mutation; ONLY the persisted native row's stored NAME goes stale, so it is re-bound AFTER
+/// the ns hold drops (the K5B rule) via `native_persist_rename` — owner + grants preserved. On a
+/// re-bind failure the stale-named row is cleared (fail-closed against the K1-F2 re-adoption class).
+/// Errnos: ATR deny / mount / -ENOENT (src) / -EISDIR / -EACCES / -EEXIST (dst) / -EINVAL (bad name).
+fn bus_mv(asid: u64, agen: u64, ppid: PrincipalRecord, src: &str, dst: &str) -> i64 {
+    if src.eq_ignore_ascii_case(ATR_NAME) || dst.eq_ignore_ascii_case(ATR_NAME) {
+        return EACCES;
+    }
+    let fs = match crate::fs::fat::mount() {
+        Ok(fs) => fs,
+        Err(crate::fs::fat::FatError::NoDisk) => return ENODEV,
+        Err(_) => return EIO,
+    };
+    let ns = ns_lock();
+    let (sde, s_lba, s_off) = match fs.find_located(src) {
+        Ok(t) => t,
+        Err(crate::fs::fat::FatError::NotFound) => return ENOENT,
+        Err(_) => return EIO,
+    };
+    if sde.is_dir {
+        return EISDIR; // v1: files only (directory rename disturbs no `..`, but stays out of scope)
+    }
+    if !owned_unlink_permitted(s_lba, s_off as u32, asid, agen, ppid) {
+        return EACCES;
+    }
+    // Destination must be absent (create-new-only target — no silent overwrite).
+    match fs.find_located(dst) {
+        Ok(_) => return EEXIST,
+        Err(crate::fs::fat::FatError::NotFound) => {}
+        Err(_) => return EIO,
+    }
+    let owner_ppid = owned_owner_ppid(s_lba, s_off as u32);
+    // In-place rename (single dir-sector name RMW — SAME slot, so the in-RAM/native LOCATION keys
+    // stay valid). dst-exists was pre-checked, so an Unsupported here is a bad 8.3 dst name.
+    match fs.rename_entry(0, src, dst) {
+        Ok(_) => {}
+        Err(crate::fs::fat::FatError::Unsupported) => return EINVAL,
+        Err(crate::fs::fat::FatError::NotFound) => return ENOENT,
+        Err(_) => return EIO,
+    }
+    drop(ns);
+    // Re-bind the persisted NAME after the ns drop (K5B). Best-effort; a failure clears the stale
+    // row so a future same-name file can never adopt it (K1-F2). A public file: nothing persisted.
+    if owner_ppid.kind != PRIN_NONE && !native_persist_rename(s_lba, s_off as u32, dst) {
+        let _ = crate::fs::unafs::native_acl_clear(s_lba, s_off as u32);
+    }
+    0
+}
+
 /// Build + enqueue the reply frame for a fulfilled (or refused) verb: verb + corr echoed,
 /// status = the verb's errno (0 = ok), principal = the RESERVED KERNEL REPLY record (verdict C),
 /// body = the verb-typed output bytes (forced empty on error — bus.rs build_reply). The frame is
@@ -14440,6 +14739,29 @@ fn sys_msend_for(asid: u64, agen: u64, ppid: PrincipalRecord, frame: &[u8]) -> i
         super::bus::BUS_VERB_CP => match super::bus::cp_body_parse(body) {
             Ok((s, d)) => match (core::str::from_utf8(s), core::str::from_utf8(d)) {
                 (Ok(src), Ok(dst)) => bus_cp(asid, agen, ppid, src, dst),
+                _ => return EINVAL,
+            },
+            Err(_) => return EINVAL,
+        },
+        // BANDY-2: the write-side verbs. The typed-body parsers admit printable-ASCII names only, so
+        // from_utf8 cannot fail — but stay fail-closed rather than unwrap.
+        super::bus::BUS_VERB_WRITE => match super::bus::write_body_parse(body) {
+            Ok((nb, content)) => match core::str::from_utf8(nb) {
+                Ok(name) => bus_write(asid, agen, ppid, name, content),
+                Err(_) => return EINVAL,
+            },
+            Err(_) => return EINVAL,
+        },
+        super::bus::BUS_VERB_RM => match super::bus::cat_body_parse(body) {
+            Ok(nb) => match core::str::from_utf8(nb) {
+                Ok(name) => bus_rm(asid, agen, ppid, name),
+                Err(_) => return EINVAL,
+            },
+            Err(_) => return EINVAL,
+        },
+        super::bus::BUS_VERB_MV => match super::bus::cp_body_parse(body) {
+            Ok((s, d)) => match (core::str::from_utf8(s), core::str::from_utf8(d)) {
+                (Ok(src), Ok(dst)) => bus_mv(asid, agen, ppid, src, dst),
                 _ => return EINVAL,
             },
             Err(_) => return EINVAL,
@@ -14635,6 +14957,12 @@ const MIDTXT_NAME: &str = "MIDTXT.TXT";
 const MIDCPY_NAME: &str = "MIDCPY.TXT";
 const BUSPRIV_NAME: &str = "BUSPRIV.BIN";
 const MIDTXT_CONTENT: &[u8] = b"midden bus fixture\n"; // midden byte-verifies this at EL0 (bit1)
+// BANDY-2: the files midden CREATES at EL0 via the write-side verbs (write/mv round-trips). The
+// launcher cleans them pre-flight + post-run so the stateful card accumulates nothing.
+const WRT_NAME: &str = "WRT.TXT"; // written then rm'd by midden (bit6/bit7)
+const MVA_NAME: &str = "MVA.TXT"; // written then mv'd away by midden (bit8)
+const MVB_NAME: &str = "MVB.TXT"; // the mv target (midden self-cleans, launcher belt-and-braces)
+const STOLEN_NAME: &str = "STOLEN.BIN"; // the mv-of-foreign DENIED target (must never be created)
 
 static EL0_MIDDEN_DONE: AtomicU32 = AtomicU32::new(0); // midden sentinel exits (want 1)
 static BANDY_MIDDEN_WITNESS: AtomicU64 = AtomicU64::new(0); // midden's SYS_REPORT bits
@@ -14662,6 +14990,11 @@ fn bandy_cleanup() {
     bandy_cleanup_one(MIDCPY_NAME);
     bandy_cleanup_one(BUSPRIV_NAME);
     bandy_cleanup_one(MIDTXT_NAME);
+    // BANDY-2 write-side residue (present only after an interrupted run).
+    bandy_cleanup_one(WRT_NAME);
+    bandy_cleanup_one(MVA_NAME);
+    bandy_cleanup_one(MVB_NAME);
+    bandy_cleanup_one(STOLEN_NAME);
 }
 
 /// Create a root fixture file with `content` (create + grow). Returns (dir_lba, dir_off) or None.
@@ -14750,9 +15083,10 @@ fn bandy_rt_launcher(demo_cpu: usize) {
     let done = EL0_MIDDEN_DONE.load(Ordering::Acquire);
     let mw = BANDY_MIDDEN_WITNESS.load(Ordering::Acquire);
 
-    // bit0: midden's own 6-bit witness complete (ls/cat/cp round-trips + both denial legs +
-    // the EL0 equivalence comparison).
-    const MIDDEN_ALL: u64 = (1 << 6) - 1;
+    // bit0: midden's own 10-bit witness complete (BANDY-1 ls/cat/cp round-trips + both denial legs
+    // + the EL0 equivalence comparison, AND the BANDY-2 write/rm/mv round-trips + extended
+    // equivalence — bits 6..=9).
+    const MIDDEN_ALL: u64 = (1 << 10) - 1;
     if done == 1 && mw == MIDDEN_ALL {
         w |= 1 << 0;
     }
@@ -14775,6 +15109,26 @@ fn bandy_rt_launcher(demo_cpu: usize) {
             }
         }
     }
+
+    // BANDY-2 ACL INTEGRITY (before cleanup, while BUSPRIV.BIN is still staged): midden's DENIED
+    // rm/mv/write of the foreign-owned BUSPRIV.BIN must have changed NOTHING on disk — the file is
+    // still present AND still owned by the foreign principal (a stale-owner strand / same-name
+    // re-adoption would be the K1-F2 failure class), AND the denied `mv` never created STOLEN.BIN.
+    // midden also self-cleaned its OWN write-side files (WRT/MVA/MVB all gone by construction).
+    let acl_intact = match crate::fs::fat::mount() {
+        Ok(fsi) => {
+            let buspriv_foreign = matches!(
+                fsi.find_located(BUSPRIV_NAME),
+                Ok((_, lba, off)) if owned_owner_ppid(lba, off as u32) == foreign
+            );
+            buspriv_foreign
+                && matches!(fsi.find_in_root(STOLEN_NAME), Err(crate::fs::fat::FatError::NotFound))
+                && matches!(fsi.find_in_root(WRT_NAME), Err(crate::fs::fat::FatError::NotFound))
+                && matches!(fsi.find_in_root(MVA_NAME), Err(crate::fs::fat::FatError::NotFound))
+                && matches!(fsi.find_in_root(MVB_NAME), Err(crate::fs::fat::FatError::NotFound))
+        }
+        Err(_) => false,
+    };
 
     // Cleanup so the STATEFUL metal card accumulates nothing.
     bandy_cleanup();
@@ -14806,5 +15160,37 @@ fn bandy_rt_launcher(demo_cpu: usize) {
             ":: BANDY-RT: FAIL — w={:#x}/{:#x} midden_w={:#x}/{:#x} done={} ::",
             w, ALL, mw, MIDDEN_ALL, done
         );
+    }
+
+    // BANDY-2 write-side witnesses (separate lines so the spec REQUIREs them independently). All
+    // ride midden's EL0 bits (proven at EL0 through the production paths) + the kernel-side ACL check.
+    // BANDY-WR: the write/rm/mv ROUND-TRIP — write a file, cat it back byte-exact, rm it (cat -> gone),
+    // and a full mv round-trip (write -> rename -> cat new byte-exact, old gone). midden bits 6,7,8.
+    const WR_BITS: u64 = (1 << 6) | (1 << 7) | (1 << 8);
+    if done == 1 && (mw & WR_BITS) == WR_BITS {
+        serial_println!(
+            ":: BANDY-WR: write-side round-trip at EL0 — write->cat byte-exact, rm->cat -ENOENT, mv->cat(new) byte-exact + cat(old) -ENOENT, all under midden's stamped principal PASS ::"
+        );
+    } else {
+        serial_println!(":: BANDY-WR: FAIL — midden_w={:#x} want bits 6-8 done={} ::", mw, done);
+    }
+    // BANDY-EQ2: the EXTENDED equivalence — every destructive verb (rm/mv/write) on the foreign
+    // BUSPRIV.BIN DENIED -EACCES via the bus, BYTE-SAME as a direct SYS_OPEN(RW) denial. midden bit 9.
+    if done == 1 && (mw & (1 << 9)) != 0 {
+        serial_println!(
+            ":: BANDY-EQ2: write-side equivalence — rm/mv/write of a foreign-owned file denied-via-bus == denied-via-syscall (byte-same -EACCES), real EL0 legs PASS ::"
+        );
+    } else {
+        serial_println!(":: BANDY-EQ2: FAIL — midden_w={:#x} want bit 9 done={} ::", mw, done);
+    }
+    // BANDY-ACL: kernel-side integrity — the denied rm/mv/write left BUSPRIV.BIN present + STILL
+    // foreign-owned (no stale-owner strand / same-name re-adoption — the K1-F2 class), the denied mv
+    // created no STOLEN.BIN, and midden's own write-side files self-cleaned (WRT/MVA/MVB all gone).
+    if acl_intact {
+        serial_println!(
+            ":: BANDY-ACL: destructive-verb ACL integrity — denied rm/mv/write left the foreign owner row intact, no stolen name, write-side fixtures self-cleaned PASS ::"
+        );
+    } else {
+        serial_println!(":: BANDY-ACL: FAIL — foreign owner row / residue check failed ::");
     }
 }
