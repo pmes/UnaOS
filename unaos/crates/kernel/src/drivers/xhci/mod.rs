@@ -320,6 +320,13 @@ const PORT_CHANGE_BITS: u32 =
 /// left unconfigured. Bounded so a genuinely dead port cannot stall enumeration indefinitely.
 const XENUM_DESC_RETRIES: u32 = 4;
 
+/// XENUM-3 M2: how many times a hub-downstream ADDRESS_DEVICE is retried when the controller
+/// answers with a non-success completion (metal rMBP: code 17 = Context State Error on the first
+/// try behind the VIA hub) before the device is left unaddressed. Mirrors the root-port paced
+/// recovery shape (bounded attempts, escalating settle between) so a transient first-address
+/// failure no longer strands the device. Bounded so a genuinely dead port cannot loop forever.
+const XENUM_ADDR_RETRIES: u32 = 3;
+
 /// XENUM-2: how many hub-port status changes are serviced per main-loop wake. Each serviced change
 /// runs synchronous control transfers (GET_PORT_STATUS + reset/enumerate or teardown); bounding the
 /// count keeps a flapping downstream port from starving the main loop — leftover changes are
@@ -497,6 +504,21 @@ struct Ep0Pending {
     wait_trb_phys: u64,
     done: bool,
     completion_code: u8,
+    /// XENUM-3 M1: physical address of this transfer's DATA-stage TRB (0 if there is no data
+    /// stage). The residual consumer matches the event's TRB pointer against it, so only the real
+    /// DATA-stage completion is recorded — Panther Point's XHCI_SPURIOUS_SUCCESS quirk (device
+    /// 0x1e31, the 2012 rMBP's controller) can post a duplicate Success after a Short Packet for
+    /// the same TD, and an unmatched consumer would let the dup clobber a real short-read residual.
+    data_trb_phys: u64,
+    /// XENUM-3 M1: TRB Transfer Length residual (untransferred bytes) captured from the DATA-stage
+    /// transfer event of a control IN read. A short read leaves this non-zero; sync_control turns it
+    /// into the ACTUAL transferred length so the downstream enumerator can reject a partial (e.g.
+    /// 8-byte-header-only) descriptor that would otherwise pass the structural bLength/type gate.
+    /// First-write latched (see `data_seen`): a duplicate Success for the same TD cannot overwrite it.
+    data_residual: u32,
+    /// True once a DATA-stage event was observed for this transfer (so a residual of 0 is trusted
+    /// as "full read" rather than "no data event seen yet"). Doubles as the first-write latch.
+    data_seen: bool,
 }
 
 /// In-flight SYNCHRONOUS command (ENABLE_SLOT / ADDRESS_DEVICE / CONFIGURE_ENDPOINT) issued
@@ -881,6 +903,10 @@ pub struct XhciController {
 
     /// In-flight synchronous EP0 control transfer (hub bring-up). See `Ep0Pending`.
     ep0_pending: Option<Ep0Pending>,
+    /// XENUM-3 M1: bytes actually transferred by the most recent `sync_control` IN read (requested
+    /// length minus the DATA-stage residual). Only meaningful immediately after a `sync_control`
+    /// call returns Ok; the downstream enumerator reads it to detect a short descriptor read.
+    last_control_len: u32,
     /// In-flight synchronous command (hub bring-up). See `CmdPending`.
     cmd_pending: Option<CmdPending>,
     /// Slots of hubs detected during enumeration, awaiting (main-loop) bring-up.
@@ -1020,6 +1046,7 @@ impl XhciController {
             bot_tag: 1,
             bot_pending: None,
             ep0_pending: None,
+            last_control_len: 0,
             cmd_pending: None,
             hubs_pending: Vec::new(),
             hub_changes_pending: Vec::new(),
@@ -1448,6 +1475,32 @@ impl XhciController {
                                             ep.done = true;
                                         }
                                         return; // consumed by the sync EP0 pump
+                                    }
+                                    // XENUM-3 M1: this sync transfer's DATA stage, matched by the
+                                    // DATA TRB's physical address (like wait_trb_phys for Status)
+                                    // AND first-write latched on data_seen. Both guards defend
+                                    // against Panther Point's XHCI_SPURIOUS_SUCCESS quirk (device
+                                    // 0x1e31): a duplicate Success after a Short Packet for the same
+                                    // TD would otherwise overwrite a real short-read residual with 0,
+                                    // last_control_len would read full, and the zeroed-descriptor
+                                    // strand M1 exists to catch would go undetected on the exact
+                                    // target hardware. Record the residual (TRB Transfer Length
+                                    // remaining) so the enumerator learns the ACTUAL transferred
+                                    // length, then consume the event — previously it fell through to
+                                    // the async FSM and was dropped as "stale/spurious". A matching
+                                    // dup (param == data_trb_phys, data_seen already set) is consumed
+                                    // without recording; QEMU posts no dup, so gates are
+                                    // no-regression only for the latch.
+                                    if (completion_code == 1 || completion_code == 13)
+                                        && p.data_trb_phys != 0 && param == p.data_trb_phys
+                                    {
+                                        if let Some(ep) = self.ep0_pending.as_mut() {
+                                            if !ep.data_seen {
+                                                ep.data_residual = transfer_len;
+                                                ep.data_seen = true;
+                                            }
+                                        }
+                                        return; // DATA stage claimed by the sync EP0 pump
                                     }
                                 }
                             }
@@ -4031,11 +4084,17 @@ impl XhciController {
         let trt: u32 = if w_length == 0 { 0 } else if dir_in { 3 } else { 2 };
         self.push_ep0(slot_id, Trb { parameter: setup, status: 8, control: (2 << 10) | (1 << 6) | (trt << 16) });
 
-        // Data stage (if any).
-        if w_length > 0 {
+        // Data stage (if any). XENUM-3 M1: set IOC (bit 5) so the DATA stage posts its OWN transfer
+        // event carrying the TRB Transfer Length residual — without it only the Status TRB (IOC)
+        // reports, and the actual transferred length is invisible. The extra event is claimed and
+        // consumed by the sync EP0 pump (it never reaches the async FSM); the Status event still
+        // drives completion. This lets the downstream enumerator reject a short (partial) read.
+        let data_trb_phys = if w_length > 0 {
             let dir: u32 = if dir_in { 1 } else { 0 };
-            self.push_ep0(slot_id, Trb { parameter: data_phys, status: w_length as u32, control: (3 << 10) | (dir << 16) });
-        }
+            self.push_ep0(slot_id, Trb { parameter: data_phys, status: w_length as u32, control: (3 << 10) | (1 << 5) | (dir << 16) })
+        } else {
+            0
+        };
 
         // Status stage (IOC). Direction is opposite the data stage; with no data it is IN.
         let status_dir: u32 = if w_length == 0 { 1 } else if dir_in { 0 } else { 1 };
@@ -4046,13 +4105,24 @@ impl XhciController {
             base + (idx as u64) * 16
         };
 
-        self.ep0_pending = Some(Ep0Pending { slot_id, wait_trb_phys: status_phys, done: false, completion_code: 0 });
+        self.ep0_pending = Some(Ep0Pending {
+            slot_id, wait_trb_phys: status_phys, done: false, completion_code: 0,
+            data_trb_phys, data_residual: 0, data_seen: false,
+        });
         self.ring_doorbell(slot_id, 1);
 
         let pump = self.pump_until_ep0_done(2000);
         let pending = self.ep0_pending.take();
         pump?;
-        Ok(pending.ok_or(())?.completion_code)
+        let p = pending.ok_or(())?;
+        // XENUM-3 M1: surface the actual transferred length. If the DATA stage reported a residual,
+        // the read was short; with no data stage (zero-length control) the full "length" is 0.
+        self.last_control_len = if p.data_seen {
+            (w_length as u32).saturating_sub(p.data_residual)
+        } else {
+            0
+        };
+        Ok(p.completion_code)
     }
 
     /// Pump the event ring until the in-flight synchronous EP0 transfer reports done (or the
@@ -4706,7 +4776,7 @@ impl XhciController {
     /// device's tier depth (stored on the slot so a downstream hub can extend the route for its own
     /// children); `tt_hub_slot`/`tt_port` are 0 for HS/SS devices (no TT). Synchronous; returns true
     /// on success.
-    fn address_downstream(&mut self, slot_id: u8, root_hub_port: u8, route_string: u32, depth: u8, speed: u32, tt_hub_slot: u8, tt_port: u8) -> bool {
+    fn address_downstream(&mut self, slot_id: u8, root_hub_port: u8, route_string: u32, depth: u8, speed: u32, tt_hub_slot: u8, tt_port: u8, mps0_override: u32) -> bool {
         unsafe {
             let input_layout = core::alloc::Layout::from_size_align(core::mem::size_of::<InputContext>(), 64).unwrap();
             let output_layout = core::alloc::Layout::from_size_align(core::mem::size_of::<DeviceContext>(), 64).unwrap();
@@ -4754,24 +4824,79 @@ impl XhciController {
             }
 
             // EP0 control context. MPS: 8 for Low Speed; 64 otherwise (QEMU is lenient about the
-            // Full-Speed initial 8-byte read).
-            let mps0: u32 = if speed == 2 { 8 } else { 64 };
+            // Full-Speed initial 8-byte read). XENUM-3 M1: a non-zero `mps0_override` is a value
+            // LEARNED from an 8-byte-header read (the re-address after a short descriptor) — a
+            // Full-Speed device behind a HS hub whose real bMaxPacketSize0 is 8/16/32, not the 64
+            // guessed here, otherwise short-reads the full descriptor and strands with zeroed content.
+            let mps0: u32 = if mps0_override != 0 { mps0_override } else if speed == 2 { 8 } else { 64 };
             let ep0_ctx = base_ptr.add(2 * CTX_WORDS);
             ep0_ctx.add(1).write_volatile((4 << 3) | (3 << 1) | (mps0 << 16));
             ep0_ctx.add(2).write_volatile((ep0_ring_phys as u32) | 1);
             ep0_ctx.add(3).write_volatile((ep0_ring_phys >> 32) as u32);
             ep0_ctx.add(4).write_volatile(8);
         }
+        // XENUM-3 M2: bounded, paced ADDRESS_DEVICE retry. The root-port path gives a stalled device
+        // 200/400/600 ms of settle across retries; a hub-downstream device got ONE try and stranded
+        // on the first non-success (metal rMBP: code 17 = Context State Error behind the VIA hub).
+        // Re-issue the SAME input context (contexts already built above) after an escalating settle;
+        // no port re-reset between attempts — a Context State Error is a controller-side transient,
+        // not a link fault, so a cheap settle-and-retry is the right (and lane-contained) recovery.
         let trb = Trb {
             parameter: self.slots[slot_id as usize].input_context as u64,
             status: 0,
             control: (11 << 10) | ((slot_id as u32) << 24),
         };
-        match self.run_command_sync(trb) {
-            Ok((1, _)) => true,
-            Ok((c, _)) => { serial_println!("xHCI: downstream ADDRESS_DEVICE code {}", c); false }
-            Err(_) => { serial_println!("xHCI: downstream ADDRESS_DEVICE timed out"); false }
+        for attempt in 1..=XENUM_ADDR_RETRIES {
+            match self.run_command_sync(trb) {
+                Ok((1, _)) => {
+                    if attempt > 1 {
+                        serial_println!("xHCI: downstream ADDRESS_DEVICE code 1 (attempt {} of {})",
+                            attempt, XENUM_ADDR_RETRIES);
+                    }
+                    return true;
+                }
+                Ok((c, _)) => serial_println!("xHCI: downstream ADDRESS_DEVICE code {} (attempt {} of {})",
+                    c, attempt, XENUM_ADDR_RETRIES),
+                Err(_) => serial_println!("xHCI: downstream ADDRESS_DEVICE timed out (attempt {} of {})",
+                    attempt, XENUM_ADDR_RETRIES),
+            }
+            if attempt < XENUM_ADDR_RETRIES {
+                // Escalating paced settle (~200 ms per attempt at the storage-path drain cadence).
+                for _ in 0..(200 * attempt) { if !self.drain_event_ring_once() { crate::hlt(); } }
+            }
         }
+        serial_println!("xHCI: downstream ADDRESS_DEVICE failed after {} attempts", XENUM_ADDR_RETRIES);
+        false
+    }
+
+    /// XENUM-3 M2: dispose a hub-downstream slot that was ENABLE_SLOT'd (and possibly ADDRESS'd) but
+    /// never brought to a usable device — a failed address, a descriptor that never read valid, or a
+    /// mid-enumeration bail. Without this the slot stayed `active=true` with its contexts allocated
+    /// forever (a leaked active entry, and a stale DCBAA pointer the controller keeps referencing).
+    /// Mirrors the root-port recovery clean-up: clear the soft state and queue the deferred
+    /// DISABLE_SLOT (the contexts/rings are leaked, not freed, until the controller lets go — the
+    /// same use-after-free-DMA guard the root path documents). Never touch the published storage slot.
+    ///
+    /// PRECONDITION (review fold): every call site fires PRE-configuration — before any HID/MSC/FTDI
+    /// personality was bound to the slot. That is why this clears a NARROWER set than
+    /// recover_enumeration (no configuring_slot / hid_setproto_pending / ftdi_* / storage_* clears):
+    /// none of those can reference a slot that never got past the descriptor read. A future call site
+    /// on a post-configuration path must mirror recover_enumeration's fuller clear set instead.
+    fn dispose_downstream_slot(&mut self, slot_id: u8) {
+        let i = slot_id as usize;
+        if i == 0 || i >= self.slots.len() || !self.slots[i].active {
+            return;
+        }
+        if self.storage_slot == slot_id && self.storage_note == "ready" {
+            return; // paranoia: never dispose a ready storage slot
+        }
+        self.hubs_pending.retain(|s| *s != slot_id);
+        self.hub_changes_pending.retain(|(hs, _)| *hs != slot_id);
+        self.slots[i].reset_soft_state();
+        if !self.slots_to_disable.iter().any(|(s, _)| *s == slot_id) {
+            self.slots_to_disable.push((slot_id, 0));
+        }
+        serial_println!("xHCI: downstream slot {} disposed (unenumerated); queued for DISABLE_SLOT.", slot_id);
     }
 
     /// Enumerate one device behind a hub: ENABLE_SLOT, ADDRESS_DEVICE (with the accumulated route
@@ -4795,20 +4920,53 @@ impl XhciController {
         // A Low/Full-Speed child names its parent hub as the Transaction Translator (single-level
         // topology); HS/SS children pass 0 (address_downstream leaves DW2 clear for them).
         let (tt_hub_slot, tt_port) = if speed == 1 || speed == 2 { (hub_slot, port) } else { (0, 0) };
-        // ADDRESS_DEVICE with the full accumulated route string (tier `depth`).
-        if !self.address_downstream(slot_id, root_hub_port, route_string, depth, speed, tt_hub_slot, tt_port) {
+        // ADDRESS_DEVICE with the full accumulated route string (tier `depth`). M2: bounded paced
+        // retry lives inside address_downstream; a final failure disposes the slot (below) rather
+        // than leaking an active entry with a live DCBAA pointer.
+        if !self.address_downstream(slot_id, root_hub_port, route_string, depth, speed, tt_hub_slot, tt_port, 0) {
+            self.dispose_downstream_slot(slot_id as u8);
             return;
         }
         let buf = self.slots[slot_id as usize].descriptor_buffer as u64;
 
+        // XENUM-3 M1: MPS0-learn for a Full/Low-Speed device behind a High-Speed hub. address_downstream
+        // guesses bMaxPacketSize0 = 64 for anything but Low Speed, but a Full-Speed device's real MPS0
+        // can be 8/16/32 — so a full 18-byte read short-reads (only the 8-byte header arrives, the rest
+        // stays zeroed → the metal "vid=0000 / no HID interrupt endpoint" strand). Mirror the root path's
+        // MPS0-learn idiom: read the 8-byte header first, and if the device's real MPS0 differs from what
+        // we programmed, re-ADDRESS with the learned value before the full read. Confined to the
+        // downstream path; skipped for HS/SS (speed 0/3/4), whose MPS0 is unambiguous.
+        if speed == 1 || speed == 2 {
+            unsafe { core::ptr::write_bytes(buf as *mut u8, 0, 8); }
+            if self.sync_control(slot_id, 0x80, 0x06, 0x0100, 0, 8, buf, true).is_ok()
+                && self.last_control_len >= 8
+            {
+                let real_mps0 = unsafe { *(buf as *const u8).add(7) } as u32;
+                let programmed: u32 = if speed == 2 { 8 } else { 64 };
+                if (real_mps0 == 8 || real_mps0 == 16 || real_mps0 == 32 || real_mps0 == 64)
+                    && real_mps0 != programmed
+                {
+                    serial_println!(
+                        "xHCI: downstream slot {} MPS0 learned {} (programmed {}); re-addressing.",
+                        slot_id, real_mps0, programmed);
+                    if !self.address_downstream(slot_id, root_hub_port, route_string, depth, speed, tt_hub_slot, tt_port, real_mps0) {
+                        self.dispose_downstream_slot(slot_id as u8);
+                        return;
+                    }
+                }
+            }
+        }
+
         // GET device descriptor (18 bytes), with a bounded retry on an all-zero/short read.
-        // M2 (XENUM-1): a device freshly reset behind a hub sometimes answers the FIRST descriptor
-        // read with all zeros (bLength=0, vid=pid=0000) — the documented hub-downstream vid=0000
-        // intermittency (metal rMBP: a mouse behind a working, keyboard-bearing hub enumerated
-        // class=0 vid=0000 and got "no HID interrupt endpoint"). A valid device descriptor has
-        // bLength=18 and bDescriptorType=0x01; anything else is a bad read. Retry a few times with
-        // a paced settle (mirroring the storage path) before accepting it. A descriptor that never
-        // reads valid is logged and left UNCONFIGURED (honest) rather than treated as a real device.
+        // XENUM-1 M2 + XENUM-3 M1: a device freshly reset behind a hub sometimes answers the FIRST
+        // descriptor read with all zeros (bLength=0, vid=pid=0000) — the documented hub-downstream
+        // vid=0000 intermittency (metal rMBP: a mouse behind a working, keyboard-bearing hub
+        // enumerated class=0 vid=0000 and got "no HID interrupt endpoint"). A read is BAD when: it
+        // errored; the ACTUAL transferred length (last_control_len) is short of 18; the structural
+        // header is wrong (bLength<18 || type!=0x01); OR the header is structurally valid but the
+        // content is zeroed (vid==0 && pid==0) — the exact metal case that slipped the old
+        // structure-only gate. Retry a few times with a paced settle (mirroring the storage path); a
+        // descriptor that never reads valid is left UNCONFIGURED and the slot DISPOSED (honest).
         let mut desc_ok = false;
         for attempt in 1..=XENUM_DESC_RETRIES {
             unsafe { core::ptr::write_bytes(buf as *mut u8, 0, 18); } // no stale-descriptor false pass
@@ -4816,14 +4974,20 @@ impl XhciController {
                 serial_println!("xHCI: downstream slot {} device-descriptor read failed (attempt {} of {})",
                     slot_id, attempt, XENUM_DESC_RETRIES);
             } else {
-                let (blen, dtype) = unsafe { let p = buf as *const u8; (*p.add(0), *p.add(1)) };
-                if blen >= 18 && dtype == 0x01 {
+                let got = self.last_control_len;
+                let (blen, dtype, dvid, dpid) = unsafe {
+                    let p = buf as *const u8;
+                    (*p.add(0), *p.add(1),
+                     (*p.add(8) as u16) | ((*p.add(9) as u16) << 8),
+                     (*p.add(10) as u16) | ((*p.add(11) as u16) << 8))
+                };
+                if got >= 18 && blen >= 18 && dtype == 0x01 && !(dvid == 0 && dpid == 0) {
                     desc_ok = true;
                     break;
                 }
                 serial_println!(
-                    "xHCI: downstream slot {} device-descriptor all-zero/short (bLength={} type={:#x}, attempt {} of {}); retrying.",
-                    slot_id, blen, dtype, attempt, XENUM_DESC_RETRIES);
+                    "xHCI: downstream slot {} device-descriptor bad read (got {} of 18, bLength={} type={:#x} vid={:04x} pid={:04x}, attempt {} of {}); retrying.",
+                    slot_id, got, blen, dtype, dvid, dpid, attempt, XENUM_DESC_RETRIES);
             }
             // Paced settle before the retry: let the device finish its own reset-recovery.
             for _ in 0..200 { if !self.drain_event_ring_once() { crate::hlt(); } }
@@ -4832,6 +4996,7 @@ impl XhciController {
             serial_println!(
                 "xHCI: downstream slot {} device-descriptor never read valid after {} attempts; leaving unconfigured.",
                 slot_id, XENUM_DESC_RETRIES);
+            self.dispose_downstream_slot(slot_id as u8);
             return;
         }
         let (class, vid, pid) = unsafe {
