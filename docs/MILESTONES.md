@@ -36,7 +36,7 @@ warnings, zero aarch64 diffs; default `test 25` MISSION SUCCESS (usb-tablet + us
 MOUSE-1 fires, proto=0 absolute + proto=2 relative); `UNAOS_IRQSTORAGE=1 UNAOS_FATIMG=sf test 200` full
 storage chain **PASS 25 / FAIL 0**, S8-write witness intact; `UNAOS_HUBSTORAGE=1 test 90` brings up the
 hubbed device + MISSION SUCCESS, M3 trace `HUB slot 1 speed 1 (HS/FS) desc-type 0x29: 8 downstream ports`;
-`test-arm 22` MISSION SUCCESS. **Metal verdict (2026-07-16 attended rMBP sitting, log
+`test-arm 22` MISSION SUCCESS. **Metal verdict (2026-07-15 attended rMBP sitting, log
 `rmbp-xenum1-metal-2026-07-15.log`): M1 ✅ METAL-CONFIRMED (repeated live unplug→replug: slots torn down
 on each disconnect — including a 4-slot hub subtree — and every re-plug enumerated fresh; the old
 lost-until-power-cycle failure gone) · M3 ✅ METAL-CONFIRMED (`HUB slot 6 speed 4 (SS) desc-type 0x2a: 4

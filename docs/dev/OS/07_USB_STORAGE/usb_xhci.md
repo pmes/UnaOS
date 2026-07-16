@@ -223,7 +223,7 @@ deferred hot re-plug` (M1), `device-descriptor all-zero/short` /
 (M3), and the `HUB slot N speed S (SS|HS/FS) desc-type 0xNN: P downstream ports`
 line the QEMU hub path already prints.
 
-**Metal verdict (2026-07-16, attended rMBP sitting; log
+**Metal verdict (2026-07-15, attended rMBP sitting; log
 `rmbp-xenum1-metal-2026-07-15.log`):**
 
 - **M1 ✅ METAL-CONFIRMED.** Repeated live unplug→replug cycles on the real
