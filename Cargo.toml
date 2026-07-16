@@ -21,7 +21,6 @@ members = [
     "handlers/stria",
     # "handlers/vug",
     "tools/vertex",
-    "tools/bandy-golden",
     "tools/unafs",
     "tools/unafs_bench",
     "tools/sentinel",

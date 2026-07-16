@@ -106,6 +106,14 @@ FORBID K6-migrate:.*FAIL
 REQUIRE BANDY-CODEC:.*decode fail-closed.*PASS
 FORBID BANDY-CODEC:.*FAIL
 
+# --- BANDY-STAMP transport witness (uncounted): principal stamping is KERNEL-only (a caller-
+# --- supplied principal field is -EINVAL, never overwritten); replies carry the RESERVED kernel
+# --- kind, fail-closed as grantee/owner/persist target; per-ASID mailboxes bounded (depth 16,
+# --- -EAGAIN before fulfillment, no cross-ASID leverage); gen-fenced across teardown.
+# --- BANDY-1 M2/M5 (2026-07-16); drives the production sys_msend_for path with scratch ids. ----
+REQUIRE BANDY-STAMP:.*gen-fenced PASS
+FORBID BANDY-STAMP:.*FAIL
+
 # NOTE (bench operators): these five are now hard REQUIREs. On a rare no-card / hub-MSC-vid=0000
 # boot the card-dependent selftests won't emit — re-seat the data card and re-boot (that IS the
 # recovery); don't demote the spec. The 3-of-4-core CAPSTONE variance is separate (see the header).

@@ -1,22 +1,29 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 //
-// BANDY-1 (ROADMAP §3b arc 1): the on-UnaOS SMessage bus — the v1 SUBSET CODEC.
+// BANDY-1 (ROADMAP §3b arc 1): the on-UnaOS SMessage bus — the v1 CODEC.
 //
 // "Port the bus, not the binary convention." This module is the WIRE layer of the syscall-backed
-// bus transport (SYS_MSEND/SYS_MRECV live in syscall.rs): a fixed 52-byte header + typed verb
-// payloads for the first three verbs (ls / cat / cp), and the reply bodies.
+// bus transport (SYS_MSEND/SYS_MRECV live in syscall.rs): ONE coherent UnaOS-NATIVE format,
+// end-to-end — a fixed 52-byte header + typed request payloads for the first three verbs
+// (ls / cat / cp) + typed replies.
 //
-// COMPAT SURFACE (verdict A as ruled at the arc's STOP, Maestro 2026-07-16 — state it honestly):
-//   * REPLY BODIES are HOST-GOLDEN: the exact serde_json bytes the host bandy bus's `SMessage`
-//     reply subset serializes to (`{"TerminalOutput":"…"}` / `{"TerminalError":"…"}`). The
-//     goldens in `bus_codec_selftest` are CAPTURED from the real host serializer by
-//     `tools/bandy-golden` (never hand-authored); the emitters here are proven byte-compatible
-//     against those captures every boot.
-//   * The HEADER and the REQUEST payloads are UnaOS-NATIVE: host bandy is an in-process
-//     broadcast of `SMessage` values (no header, no framing, no principal) and has no ls/cat/cp
-//     request variant — there is nothing to be byte-compatible WITH. Their KATs below freeze
-//     self-authored goldens from this first commit; they are the compat anchor going forward.
+// FORMAT AUTHORITY (Peter's ruling, R17 2026-07-16, superseding the earlier host-compat
+// condition): "we're writing this OS and filesystem so we can make whatever change we need to do
+// it right." Host byte-compat is NOT a requirement; the format below is chosen on merit and is
+// the SPEC OF RECORD from this commit — the KATs in `bus_codec_selftest` freeze it (self-authored
+// goldens, the compat anchor going forward). The host bandy bus (an in-process broadcast of
+// `SMessage` values — no header, no framing, no principal) migrates to THIS format in a later
+// HOST arc, out of this lane. The host `TerminalOutput`/`TerminalError` reply types survive as
+// CONCEPTS: a success reply's body is output text to present; an error reply is its errno.
+//
+// THE MERIT CASE for the reply shape: the header already carries a machine-readable `status`
+// (the errno the equivalence witness compares byte-for-byte against the direct syscalls) and
+// echoes `verb` + `corr`, so a reply needs NO self-describing envelope — a success body is the
+// verb-typed payload bytes (ls: listing text; cat: file content; cp: empty), and an ERROR reply
+// carries NO body at all (status is the whole truth; a client renders its own message). One
+// binary layout both directions, no string-escaping layer, no second parser — the smallest
+// honest surface for a kernel-side codec that must fail closed.
 //
 // DECODE CEILINGS (verdict A, the BEFS-HARDEN lesson verbatim): a decode budget is the max FORCED
 // allocation. BUS_BODY_MAX = 4 KiB, so the largest allocation any hostile frame can force is
@@ -31,8 +38,8 @@
 // KERNEL principal kind (PRIN_KERNEL_REPLY, syscall.rs), fail-closed everywhere a grantee can
 // appear. This module treats the field as opaque bytes; policy lives at the transport.
 //
-// No heap use anywhere in this module beyond caller-provided buffers; no_std; aarch64-only
-// (declared under arch/aarch64; zero x86 surface).
+// No heap use anywhere in this module beyond caller-provided buffers (one heap staging in the
+// selftest's at-ceiling KAT); no_std; aarch64-only (declared under arch/aarch64; zero x86 surface).
 
 /// Frame magic: b"UBS1" — UnaOS Bus, wire v1.
 pub const BUS_MAGIC: [u8; 4] = *b"UBS1";
@@ -42,6 +49,9 @@ pub const BUS_VERSION: u8 = 1;
 /// Header length. Layout (little-endian):
 ///   0..4  magic  4..5 version  5..6 kind  6..7 verb  7..8 reserved(=0)
 ///   8..12 corr(u32)  12..16 status(i32)  16..48 principal(32B)  48..52 body_len(u32)
+/// REQUEST: status MUST be 0, principal MUST be all-zero (the kernel stamps it), verb ∈ {LS,CAT,CP},
+/// body = the verb's typed payload. REPLY: verb ECHOES the request verb, corr echoes, status = 0
+/// (body = the verb's typed output) or a negative errno (body MUST be empty).
 pub const BUS_HDR_LEN: usize = 52;
 /// HARD DECODE CEILING for the body — the max forced allocation per frame (see module doc).
 pub const BUS_BODY_MAX: usize = 4096;
@@ -52,7 +62,7 @@ pub const BUS_FRAME_MAX: usize = BUS_HDR_LEN + BUS_BODY_MAX;
 pub const BUS_KIND_REQUEST: u8 = 1;
 pub const BUS_KIND_REPLY: u8 = 2;
 
-/// Request verbs (the v1 subset — ROADMAP §3b's first three).
+/// Verbs (the v1 subset — ROADMAP §3b's first three). A reply echoes its request's verb.
 pub const BUS_VERB_LS: u8 = 1;
 pub const BUS_VERB_CAT: u8 = 2;
 pub const BUS_VERB_CP: u8 = 3;
@@ -75,9 +85,9 @@ pub struct BusHdr {
 /// Why a frame was refused. Every arm is FAIL-CLOSED: nothing about a refused frame is acted on.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BusDecodeErr {
-    /// Shorter than one header, or the declared body overruns the presented bytes.
+    /// Shorter than one header, or the declared body does not exactly fit the presented bytes.
     Truncated,
-    /// Bad magic / version / reserved byte / kind / verb-for-kind.
+    /// Bad magic / version / reserved byte / kind / verb / reply-shape violation.
     Malformed,
     /// body_len exceeds BUS_BODY_MAX (the hard ceiling).
     TooBig,
@@ -93,8 +103,8 @@ fn rd_u32(b: &[u8]) -> u32 {
     u32::from_le_bytes([b[0], b[1], b[2], b[3]])
 }
 
-/// Serialize a header into `out[..BUS_HDR_LEN]`. Kernel-side use only (the kernel builds replies
-/// and re-stamps validated requests); EL0 clients hand-build the same layout.
+/// Serialize a header into `out[..BUS_HDR_LEN]`. Kernel-side use (reply building) and EL0
+/// clients hand-build the same layout (midden's request builder mirrors this byte-for-byte).
 pub fn hdr_write(h: &BusHdr, out: &mut [u8]) {
     debug_assert!(out.len() >= BUS_HDR_LEN);
     out[0..4].copy_from_slice(&BUS_MAGIC);
@@ -109,10 +119,12 @@ pub fn hdr_write(h: &BusHdr, out: &mut [u8]) {
 }
 
 /// Parse + validate a frame's header against the whole presented byte range. Enforces, in order:
-/// length ≥ header; magic/version/reserved; kind ∈ {REQUEST, REPLY}; verb valid for the kind;
-/// body_len ≤ BUS_BODY_MAX (the ceiling — checked BEFORE the overrun check so an absurd length is
-/// TooBig, not Truncated); declared body exactly fits the presented bytes (no trailing slack — a
-/// frame is exact, not a prefix). Returns the header; the body is `frame[BUS_HDR_LEN..]`.
+/// length ≥ header; magic/version/reserved; kind ∈ {REQUEST, REPLY}; verb ∈ {LS, CAT, CP} (both
+/// kinds — a reply echoes its request's verb); body_len ≤ BUS_BODY_MAX (the ceiling — checked
+/// BEFORE the fit check so an absurd length is TooBig, not Truncated); the declared body exactly
+/// fits the presented bytes (no trailing slack — a frame is exact, not a prefix); a REPLY with a
+/// nonzero status carries NO body (an error is its errno, never errno-plus-bytes). Returns the
+/// header; the body is `frame[BUS_HDR_LEN..]`.
 pub fn frame_parse(frame: &[u8]) -> Result<BusHdr, BusDecodeErr> {
     if frame.len() < BUS_HDR_LEN {
         return Err(BusDecodeErr::Truncated);
@@ -122,12 +134,9 @@ pub fn frame_parse(frame: &[u8]) -> Result<BusHdr, BusDecodeErr> {
     }
     let kind = frame[5];
     let verb = frame[6];
-    let verb_ok = match kind {
-        BUS_KIND_REQUEST => matches!(verb, BUS_VERB_LS | BUS_VERB_CAT | BUS_VERB_CP),
-        BUS_KIND_REPLY => verb == 0,
-        _ => return Err(BusDecodeErr::Malformed),
-    };
-    if !verb_ok {
+    if !matches!(kind, BUS_KIND_REQUEST | BUS_KIND_REPLY)
+        || !matches!(verb, BUS_VERB_LS | BUS_VERB_CAT | BUS_VERB_CP)
+    {
         return Err(BusDecodeErr::Malformed);
     }
     let body_len = rd_u32(&frame[48..52]);
@@ -137,16 +146,13 @@ pub fn frame_parse(frame: &[u8]) -> Result<BusHdr, BusDecodeErr> {
     if frame.len() != BUS_HDR_LEN + body_len as usize {
         return Err(BusDecodeErr::Truncated);
     }
+    let status = i32::from_le_bytes([frame[12], frame[13], frame[14], frame[15]]);
+    if kind == BUS_KIND_REPLY && status != 0 && body_len != 0 {
+        return Err(BusDecodeErr::Malformed); // an error reply is its errno — never errno + bytes
+    }
     let mut principal = [0u8; 32];
     principal.copy_from_slice(&frame[16..48]);
-    Ok(BusHdr {
-        kind,
-        verb,
-        corr: rd_u32(&frame[8..12]),
-        status: i32::from_le_bytes([frame[12], frame[13], frame[14], frame[15]]),
-        principal,
-        body_len,
-    })
+    Ok(BusHdr { kind, verb, corr: rd_u32(&frame[8..12]), status, principal, body_len })
 }
 
 /// Request-side validation (verdict C): an EL0 REQUEST must carry status == 0 and an ALL-ZERO
@@ -161,9 +167,9 @@ pub fn request_validate(h: &BusHdr) -> Result<(), BusDecodeErr> {
     Ok(())
 }
 
-/// CAT body: the bare 8.3 name bytes. 1..=BUS_NAME_MAX, ASCII printable (the sys_open twin turns
-/// non-UTF-8 into -ENOENT; here a non-ASCII byte can never be a FAT 8.3 name, so it is BadBody —
-/// the transport refuses what the namespace could never match).
+/// CAT request body: the bare 8.3 name bytes. 1..=BUS_NAME_MAX, printable ASCII with no space
+/// (the sys_open twin turns non-UTF-8 into -ENOENT; here a byte that can never appear in a FAT
+/// 8.3 name is BadBody — the transport refuses what the namespace could never match).
 pub fn cat_body_parse(body: &[u8]) -> Result<&[u8], BusDecodeErr> {
     if body.is_empty() || body.len() > BUS_NAME_MAX {
         return Err(BusDecodeErr::BadBody);
@@ -174,8 +180,8 @@ pub fn cat_body_parse(body: &[u8]) -> Result<&[u8], BusDecodeErr> {
     Ok(body)
 }
 
-/// CP body: `[src_len u8][src bytes][dst bytes]` — both names under the CAT rules; the length
-/// arithmetic must consume the body EXACTLY (no slack, no overlap).
+/// CP request body: `[src_len u8][src bytes][dst bytes]` — both names under the CAT rules; the
+/// length arithmetic must consume the body EXACTLY (no slack, no overlap).
 pub fn cp_body_parse(body: &[u8]) -> Result<(&[u8], &[u8]), BusDecodeErr> {
     if body.len() < 2 {
         return Err(BusDecodeErr::BadBody);
@@ -189,143 +195,8 @@ pub fn cp_body_parse(body: &[u8]) -> Result<(&[u8], &[u8]), BusDecodeErr> {
     Ok((src, dst))
 }
 
-// ---------------------------------------------------------------------------------------------
-// Reply-body emitters — byte-compatible with the HOST serializer (serde_json) for the reply
-// subset. Proven against tools/bandy-golden captures in bus_codec_selftest, every boot.
-// ---------------------------------------------------------------------------------------------
-
-/// serde_json's string-escape rules, byte-exact (see serde_json ser.rs: `"` and `\` escaped;
-/// 0x08/0x09/0x0A/0x0C/0x0D as \b \t \n \f \r; every other byte < 0x20 as \u00xx with LOWERCASE
-/// hex; everything ≥ 0x20 — including DEL 0x7f — passes through raw). Input here is ASCII by
-/// construction (fulfillment sanitizes file content), so the ≥ 0x80 UTF-8 question never arises.
-/// Appends to `out` up to `max`; returns false (caller fails closed) if the budget would overflow.
-fn json_escape_into(s: &[u8], out: &mut [u8], pos: &mut usize, max: usize) -> bool {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    for &b in s {
-        let esc: &[u8] = match b {
-            b'"' => b"\\\"",
-            b'\\' => b"\\\\",
-            0x08 => b"\\b",
-            0x09 => b"\\t",
-            0x0a => b"\\n",
-            0x0c => b"\\f",
-            0x0d => b"\\r",
-            c if c < 0x20 => {
-                if *pos + 6 > max {
-                    return false;
-                }
-                out[*pos..*pos + 4].copy_from_slice(b"\\u00");
-                out[*pos + 4] = HEX[(c >> 4) as usize];
-                out[*pos + 5] = HEX[(c & 0xf) as usize];
-                *pos += 6;
-                continue;
-            }
-            _ => {
-                if *pos + 1 > max {
-                    return false;
-                }
-                out[*pos] = b;
-                *pos += 1;
-                continue;
-            }
-        };
-        if *pos + esc.len() > max {
-            return false;
-        }
-        out[*pos..*pos + esc.len()].copy_from_slice(esc);
-        *pos += esc.len();
-    }
-    true
-}
-
-fn json_wrap_into(variant: &[u8], text: &[u8], out: &mut [u8]) -> Option<usize> {
-    let max = out.len();
-    // {"<variant>":"<escaped>"}
-    let head_len = 1 + 1 + variant.len() + 1 + 2; // {"VARIANT":"
-    if head_len > max {
-        return None;
-    }
-    out[0] = b'{';
-    out[1] = b'"';
-    out[2..2 + variant.len()].copy_from_slice(variant);
-    let mut pos = 2 + variant.len();
-    out[pos..pos + 3].copy_from_slice(b"\":\"");
-    pos += 3;
-    if !json_escape_into(text, out, &mut pos, max) {
-        return None;
-    }
-    if pos + 2 > max {
-        return None;
-    }
-    out[pos..pos + 2].copy_from_slice(b"\"}");
-    Some(pos + 2)
-}
-
-/// `{"TerminalOutput":"<text>"}` — the host reply shape for verb output. `None` = the escaped
-/// body would exceed `out` (the caller sized `out` at BUS_BODY_MAX: fail closed, send an error
-/// reply instead — never a truncated JSON body).
-pub fn reply_output_into(text: &[u8], out: &mut [u8]) -> Option<usize> {
-    json_wrap_into(b"TerminalOutput", text, out)
-}
-
-/// `{"TerminalError":"<text>"}` — the host reply shape for a refused/failed verb.
-pub fn reply_error_into(text: &[u8], out: &mut [u8]) -> Option<usize> {
-    json_wrap_into(b"TerminalError", text, out)
-}
-
-// ---------------------------------------------------------------------------------------------
-// BANDY-CODEC selftest — the M1 KATs, run every boot (the K4-ready idiom: read-only, in-RAM,
-// no disk, no card; an uncounted `:: BANDY-CODEC: … ::` witness line).
-// ---------------------------------------------------------------------------------------------
-
-/// HOST-GOLDEN reply bodies — captured from the REAL host serializer by `tools/bandy-golden`
-/// (run of 2026-07-16, committed as tools/bandy-golden/golden-frames.txt). NEVER hand-authored;
-/// regenerate with `cargo run -p bandy-golden` and re-paste on a ruled protocol change only.
-const GOLDEN_LS: (&[u8], &[u8]) = (
-    b"HELLO.BIN 1024\nK2OWN.BIN 512\n",
-    br#"{"TerminalOutput":"HELLO.BIN 1024\nK2OWN.BIN 512\n"}"#,
-);
-const GOLDEN_ESCAPES: (&[u8], &[u8]) = (
-    b"line1\nline2\ttab\r\"quoted\" back\\slash\x08\x0c",
-    br#"{"TerminalOutput":"line1\nline2\ttab\r\"quoted\" back\\slash\b\f"}"#,
-);
-const GOLDEN_CTL: (&[u8], &[u8]) =
-    (b"ctl:\x01\x1fend", br#"{"TerminalOutput":"ctl:\u0001\u001fend"}"#);
-const GOLDEN_DEL: (&[u8], &[u8]) = (b"del:\x7fend", b"{\"TerminalOutput\":\"del:\x7fend\"}");
-const GOLDEN_EMPTY: (&[u8], &[u8]) = (b"", br#"{"TerminalOutput":""}"#);
-const GOLDEN_ERR1: (&[u8], &[u8]) = (b"cat: errno -13", br#"{"TerminalError":"cat: errno -13"}"#);
-const GOLDEN_ERR2: (&[u8], &[u8]) = (b"cp: errno -2", br#"{"TerminalError":"cp: errno -2"}"#);
-
-/// SELF-AUTHORED request goldens (frozen at the first commit — the compat anchor for the
-/// UnaOS-native header + typed payloads; there is no host frame to capture, see the module doc).
-/// A `cat GROW.BIN` request, corr = 7: header + 8-byte name body.
-const GOLDEN_REQ_CAT: &[u8] = &[
-    0x55, 0x42, 0x53, 0x31, // "UBS1"
-    0x01, // version 1
-    0x01, // kind REQUEST
-    0x02, // verb CAT
-    0x00, // reserved
-    0x07, 0x00, 0x00, 0x00, // corr = 7
-    0x00, 0x00, 0x00, 0x00, // status = 0
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // principal[0..16] = zero
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // principal[16..32] = zero
-    0x08, 0x00, 0x00, 0x00, // body_len = 8
-    b'G', b'R', b'O', b'W', b'.', b'B', b'I', b'N', // body = "GROW.BIN"
-];
-
-fn golden_reply_ok(sample: (&[u8], &[u8])) -> bool {
-    let mut buf = [0u8; BUS_BODY_MAX];
-    reply_output_into(sample.0, &mut buf) == Some(sample.1.len())
-        && &buf[..sample.1.len()] == sample.1
-}
-
-fn golden_error_ok(sample: (&[u8], &[u8])) -> bool {
-    let mut buf = [0u8; BUS_BODY_MAX];
-    reply_error_into(sample.0, &mut buf) == Some(sample.1.len())
-        && &buf[..sample.1.len()] == sample.1
-}
-
-/// Build a minimal valid request frame into `buf`; returns the frame slice length.
+/// Build a request frame into `buf`; returns the frame length. The EL0 client-side layout in
+/// kernel-testable form (midden mirrors this); also the M1/M5 fixtures' request builder.
 pub fn build_request(verb: u8, corr: u32, body: &[u8], buf: &mut [u8]) -> usize {
     let h = BusHdr {
         kind: BUS_KIND_REQUEST,
@@ -340,29 +211,85 @@ pub fn build_request(verb: u8, corr: u32, body: &[u8], buf: &mut [u8]) -> usize 
     BUS_HDR_LEN + body.len()
 }
 
-/// The M1 witness: goldens (host-captured replies + frozen native requests) + fail-closed
-/// decoding + the ceilings. Emits ONE uncounted `:: BANDY-CODEC: … PASS/FAIL … ::` line.
+/// Build a reply frame into `buf`: verb + corr echoed from the request, `status` = 0 (body =
+/// the verb-typed output bytes) or a negative errno (body forced EMPTY — the error-reply shape
+/// is structural here, not caller discipline). `principal` is the kernel-reply record's wire
+/// image (the transport supplies it — this module stays policy-free). Returns the frame length.
+pub fn build_reply(verb: u8, corr: u32, status: i32, principal: [u8; 32], body: &[u8], buf: &mut [u8]) -> usize {
+    let body = if status == 0 { body } else { &[] };
+    let h = BusHdr { kind: BUS_KIND_REPLY, verb, corr, status, principal, body_len: body.len() as u32 };
+    hdr_write(&h, buf);
+    buf[BUS_HDR_LEN..BUS_HDR_LEN + body.len()].copy_from_slice(body);
+    BUS_HDR_LEN + body.len()
+}
+
+// ---------------------------------------------------------------------------------------------
+// BANDY-CODEC selftest — the M1 KATs, run every boot (the K4-ready idiom: read-only, in-RAM,
+// no disk, no card; an uncounted `:: BANDY-CODEC: … ::` witness line).
+// ---------------------------------------------------------------------------------------------
+
+/// FROZEN NATIVE GOLDENS (self-authored at the format's first commit — the compat anchor; a
+/// mismatch = the wire moved = a protocol break to rule on, never a test to "fix up").
+/// A `cat GROW.BIN` request, corr = 7: header + 8-byte name body.
+const GOLDEN_REQ_CAT: &[u8] = &[
+    0x55, 0x42, 0x53, 0x31, // "UBS1"
+    0x01, // version 1
+    0x01, // kind REQUEST
+    0x02, // verb CAT
+    0x00, // reserved
+    0x07, 0x00, 0x00, 0x00, // corr = 7
+    0x00, 0x00, 0x00, 0x00, // status = 0
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // principal[0..16] = zero (kernel stamps)
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // principal[16..32] = zero
+    0x08, 0x00, 0x00, 0x00, // body_len = 8
+    b'G', b'R', b'O', b'W', b'.', b'B', b'I', b'N', // body = "GROW.BIN"
+];
+
+/// A successful `ls` REPLY, corr = 7, stamped with the reserved kernel-reply principal
+/// (kind 4, len 0 — syscall.rs PRIN_KERNEL_REPLY): header + 9-byte listing body.
+const GOLDEN_REP_LS: &[u8] = &[
+    0x55, 0x42, 0x53, 0x31, // "UBS1"
+    0x01, // version 1
+    0x02, // kind REPLY
+    0x01, // verb LS (echoed)
+    0x00, // reserved
+    0x07, 0x00, 0x00, 0x00, // corr = 7 (echoed)
+    0x00, 0x00, 0x00, 0x00, // status = 0
+    0x04, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // principal: kind=4 (KERNEL_REPLY), len=0
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, //            value tail = zero
+    0x09, 0x00, 0x00, 0x00, // body_len = 9
+    b'A', b'.', b'T', b'X', b'T', b' ', b'4', b'2', b'\n', // body = "A.TXT 42\n"
+];
+
+/// An error `cat` REPLY, corr = 9, status = -13 (EACCES): errno in the header, NO body.
+const GOLDEN_REP_ERR: &[u8] = &[
+    0x55, 0x42, 0x53, 0x31, // "UBS1"
+    0x01, // version 1
+    0x02, // kind REPLY
+    0x02, // verb CAT (echoed)
+    0x00, // reserved
+    0x09, 0x00, 0x00, 0x00, // corr = 9 (echoed)
+    0xf3, 0xff, 0xff, 0xff, // status = -13 (EACCES) little-endian
+    0x04, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // principal: kind=4 (KERNEL_REPLY), len=0
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0x00, 0x00, 0x00, 0x00, // body_len = 0 — an error reply is its errno, never errno + bytes
+];
+
+/// The kernel-reply principal wire image the goldens pin (kind 4, len 0, zero value).
+fn reply_principal_bytes() -> [u8; 32] {
+    let mut p = [0u8; 32];
+    p[0] = 4;
+    p
+}
+
+/// The M1 witness: frozen native goldens (request + both reply shapes) + round-trips +
+/// fail-closed decoding + the ceilings. Emits ONE uncounted `:: BANDY-CODEC: … ::` line.
 pub fn bus_codec_selftest() {
     let mut w = 0u32;
 
-    // bit0..bit2: host-golden reply bodies, byte-compat with serde_json (capture provenance above)
-    if golden_reply_ok(GOLDEN_LS) {
-        w |= 1 << 0;
-    }
-    if golden_reply_ok(GOLDEN_ESCAPES) && golden_reply_ok(GOLDEN_CTL) {
-        w |= 1 << 1;
-    }
-    if golden_reply_ok(GOLDEN_DEL)
-        && golden_reply_ok(GOLDEN_EMPTY)
-        && golden_error_ok(GOLDEN_ERR1)
-        && golden_error_ok(GOLDEN_ERR2)
-    {
-        w |= 1 << 2;
-    }
-
-    // bit3: the frozen native request golden — build_request must reproduce it byte-for-byte,
-    // and frame_parse must round-trip it field-exact.
-    let mut req = [0u8; BUS_FRAME_MAX];
+    // bit0: the frozen request golden — build_request reproduces it byte-for-byte and it
+    // round-trips field-exact through frame_parse + request_validate + the typed body parser.
+    let mut req = [0u8; 128];
     let n = build_request(BUS_VERB_CAT, 7, b"GROW.BIN", &mut req);
     if n == GOLDEN_REQ_CAT.len() && &req[..n] == GOLDEN_REQ_CAT {
         if let Ok(h) = frame_parse(&req[..n]) {
@@ -374,14 +301,43 @@ pub fn bus_codec_selftest() {
                 && request_validate(&h).is_ok()
                 && cat_body_parse(&req[BUS_HDR_LEN..n]) == Ok(b"GROW.BIN".as_slice())
             {
-                w |= 1 << 3;
+                w |= 1 << 0;
             }
         }
     }
 
-    // bit4: ls + cp round-trips (typed payloads)
+    // bit1: the frozen SUCCESS-reply golden — build_reply reproduces it and it round-trips.
+    let mut rep = [0u8; 128];
+    let rn = build_reply(BUS_VERB_LS, 7, 0, reply_principal_bytes(), b"A.TXT 42\n", &mut rep);
+    if rn == GOLDEN_REP_LS.len() && &rep[..rn] == GOLDEN_REP_LS {
+        if let Ok(h) = frame_parse(&rep[..rn]) {
+            if h.kind == BUS_KIND_REPLY
+                && h.verb == BUS_VERB_LS
+                && h.corr == 7
+                && h.status == 0
+                && &rep[BUS_HDR_LEN..rn] == b"A.TXT 42\n"
+            {
+                w |= 1 << 1;
+            }
+        }
+    }
+
+    // bit2: the frozen ERROR-reply golden — errno in the header, body forced empty (build_reply
+    // drops a body handed alongside a nonzero status — structural), and the parser refuses a
+    // hand-forged errno+body frame.
+    let mut erep = [0u8; 128];
+    let en = build_reply(BUS_VERB_CAT, 9, -13, reply_principal_bytes(), b"MUST-DROP", &mut erep);
+    let golden_ok = en == GOLDEN_REP_ERR.len() && &erep[..en] == GOLDEN_REP_ERR;
+    let mut forged = [0u8; 128];
+    let fl = build_reply(BUS_VERB_CAT, 9, 0, reply_principal_bytes(), b"X", &mut forged);
+    forged[12..16].copy_from_slice(&(-13i32).to_le_bytes()); // errno + body, hand-forged
+    if golden_ok && frame_parse(&forged[..fl]) == Err(BusDecodeErr::Malformed) {
+        w |= 1 << 2;
+    }
+
+    // bit3: ls + cp request round-trips (typed payloads)
     {
-        let mut f = [0u8; BUS_FRAME_MAX];
+        let mut f = [0u8; 128];
         let n_ls = build_request(BUS_VERB_LS, 1, b"", &mut f);
         let ls_ok = matches!(frame_parse(&f[..n_ls]), Ok(h) if h.verb == BUS_VERB_LS && h.body_len == 0);
         let mut body = [0u8; 32];
@@ -397,50 +353,50 @@ pub fn bus_codec_selftest() {
             _ => false,
         };
         if ls_ok && cp_ok {
-            w |= 1 << 4;
+            w |= 1 << 3;
         }
     }
 
-    // bit5: fail-closed decoding — every malformed class refused with the RIGHT refusal
+    // bit4: fail-closed decoding — every malformed class refused with the RIGHT refusal
     {
-        let mut f = [0u8; BUS_FRAME_MAX];
+        let mut f = [0u8; 128];
         let n = build_request(BUS_VERB_CAT, 7, b"GROW.BIN", &mut f);
-        let mut bad_magic = [0u8; BUS_FRAME_MAX];
-        bad_magic[..n].copy_from_slice(&f[..n]);
-        bad_magic[0] = b'X';
-        let mut bad_ver = [0u8; BUS_FRAME_MAX];
-        bad_ver[..n].copy_from_slice(&f[..n]);
-        bad_ver[4] = 2;
-        let mut bad_rsvd = [0u8; BUS_FRAME_MAX];
-        bad_rsvd[..n].copy_from_slice(&f[..n]);
-        bad_rsvd[7] = 1;
-        let mut bad_kind = [0u8; BUS_FRAME_MAX];
-        bad_kind[..n].copy_from_slice(&f[..n]);
-        bad_kind[5] = 9;
-        let mut bad_verb = [0u8; BUS_FRAME_MAX];
-        bad_verb[..n].copy_from_slice(&f[..n]);
-        bad_verb[6] = 9;
-        let mut bad_status = [0u8; BUS_FRAME_MAX];
-        bad_status[..n].copy_from_slice(&f[..n]);
-        bad_status[12] = 1; // nonzero status in a request
-        let mut bad_prin = [0u8; BUS_FRAME_MAX];
-        bad_prin[..n].copy_from_slice(&f[..n]);
-        bad_prin[16] = 2; // caller-supplied principal kind byte — MUST be refused, not overwritten
-        let ok = frame_parse(&bad_magic[..n]) == Err(BusDecodeErr::Malformed)
-            && frame_parse(&bad_ver[..n]) == Err(BusDecodeErr::Malformed)
-            && frame_parse(&bad_rsvd[..n]) == Err(BusDecodeErr::Malformed)
-            && frame_parse(&bad_kind[..n]) == Err(BusDecodeErr::Malformed)
-            && frame_parse(&bad_verb[..n]) == Err(BusDecodeErr::Malformed)
-            && matches!(
-                frame_parse(&bad_status[..n]).map(|h| request_validate(&h)),
-                Ok(Err(BusDecodeErr::BadPrincipal))
-            )
-            && matches!(
-                frame_parse(&bad_prin[..n]).map(|h| request_validate(&h)),
-                Ok(Err(BusDecodeErr::BadPrincipal))
-            )
+        let mut m = f;
+        m[0] = b'X'; // magic
+        let bad_magic = frame_parse(&m[..n]) == Err(BusDecodeErr::Malformed);
+        let mut m = f;
+        m[4] = 2; // version
+        let bad_ver = frame_parse(&m[..n]) == Err(BusDecodeErr::Malformed);
+        let mut m = f;
+        m[7] = 1; // reserved
+        let bad_rsvd = frame_parse(&m[..n]) == Err(BusDecodeErr::Malformed);
+        let mut m = f;
+        m[5] = 9; // kind
+        let bad_kind = frame_parse(&m[..n]) == Err(BusDecodeErr::Malformed);
+        let mut m = f;
+        m[6] = 9; // verb
+        let bad_verb = frame_parse(&m[..n]) == Err(BusDecodeErr::Malformed);
+        let mut m = f;
+        m[12] = 1; // nonzero status in a request
+        let bad_status = matches!(
+            frame_parse(&m[..n]).map(|h| request_validate(&h)),
+            Ok(Err(BusDecodeErr::BadPrincipal))
+        );
+        let mut m = f;
+        m[16] = 2; // caller-supplied principal kind byte — MUST be refused, not overwritten
+        let bad_prin = matches!(
+            frame_parse(&m[..n]).map(|h| request_validate(&h)),
+            Ok(Err(BusDecodeErr::BadPrincipal))
+        );
+        let ok = bad_magic
+            && bad_ver
+            && bad_rsvd
+            && bad_kind
+            && bad_verb
+            && bad_status
+            && bad_prin
             && frame_parse(&f[..BUS_HDR_LEN - 1]) == Err(BusDecodeErr::Truncated)
-            && frame_parse(&f[..n - 1]) == Err(BusDecodeErr::Truncated) // body shorter than declared
+            && frame_parse(&f[..n - 1]) == Err(BusDecodeErr::Truncated) // body under-fits
             && cat_body_parse(b"") == Err(BusDecodeErr::BadBody)
             && cat_body_parse(b"WAYTOOLONGNAME") == Err(BusDecodeErr::BadBody)
             && cat_body_parse(b"BAD NAME") == Err(BusDecodeErr::BadBody) // 0x20 refused
@@ -448,12 +404,12 @@ pub fn bus_codec_selftest() {
             && cp_body_parse(&[0x00, b'A', b'B']) == Err(BusDecodeErr::BadBody)
             && cp_body_parse(&[0x02, b'A', b'B']) == Err(BusDecodeErr::BadBody); // no dst bytes
         if ok {
-            w |= 1 << 5;
+            w |= 1 << 4;
         }
     }
 
-    // bit6: the HARD CEILING — body_len over BUS_BODY_MAX is TooBig (fail-closed, nothing
-    // decoded); a frame AT the ceiling parses. The ceiling is the max forced allocation.
+    // bit5: the HARD CEILING — body_len over BUS_BODY_MAX is TooBig from the HEADER ALONE (the
+    // transport never stages an over-ceiling body to find out); a frame AT the ceiling parses.
     {
         let mut hdr = [0u8; BUS_HDR_LEN];
         let h = BusHdr {
@@ -465,33 +421,21 @@ pub fn bus_codec_selftest() {
             body_len: (BUS_BODY_MAX + 1) as u32,
         };
         hdr_write(&h, &mut hdr);
-        // Present a header claiming an over-ceiling body: refused as TooBig from the HEADER ALONE
-        // (the transport never stages an over-ceiling body to find out).
         let too_big = frame_parse(&hdr) == Err(BusDecodeErr::TooBig);
-        let mut max_frame = [0u8; BUS_FRAME_MAX];
+        // At-ceiling frame: heap-stage it (a 4 KiB+ array has no business on a kernel stack).
+        let mut max_frame = alloc::vec![0u8; BUS_FRAME_MAX];
         let h2 = BusHdr { body_len: BUS_BODY_MAX as u32, verb: BUS_VERB_LS, ..h };
         hdr_write(&h2, &mut max_frame);
-        // (an LS with a max body is semantically odd but wire-legal; typed validation is later)
         let at_ceiling = frame_parse(&max_frame).is_ok();
         if too_big && at_ceiling {
-            w |= 1 << 6;
+            w |= 1 << 5;
         }
     }
 
-    // bit7: reply emitters fail CLOSED on budget overflow (never a truncated JSON body)
-    {
-        let mut tiny = [0u8; 8];
-        if reply_output_into(b"0123456789", &mut tiny).is_none()
-            && reply_error_into(b"0123456789", &mut tiny).is_none()
-        {
-            w |= 1 << 7;
-        }
-    }
-
-    const ALL: u32 = (1 << 8) - 1;
+    const ALL: u32 = (1 << 6) - 1;
     if w == ALL {
         serial_println!(
-            ":: BANDY-CODEC: v1 subset codec — reply bodies HOST-golden (serde_json byte-compat, tools/bandy-golden capture), native request header+payloads frozen, decode fail-closed (body ceiling {} B) PASS [w={:#04x}] ::",
+            ":: BANDY-CODEC: native v1 wire frozen (request+reply goldens, typed ls/cat/cp payloads, error-reply = errno-no-body), decode fail-closed (body ceiling {} B) PASS [w={:#04x}] ::",
             BUS_BODY_MAX,
             w
         );
