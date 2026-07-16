@@ -67,10 +67,12 @@ REQUIRE S4-mf2:.*refused -EACCES.*witness OK
 COUNT 2 S4-race.*witness OK
 REQUIRE S6-witness:.*locked 240000/240000 intact.*witness OK
 REQUIRE S7-openany:.*owner ACL not bypassed.*witness OK
-# --- S8 = STOR-1 S8: a RW open of an arbitrary on-disk file overwrites live (overwrite-only, MF2 intact).
+# --- S8 = STOR-1 S8: a RW open of an arbitrary on-disk file overwrites live IN PLACE (MF2 intact).
 # --- ✅ METAL-CONFIRMED 2026-07-15 (attended rMBP bench, LC-x86): fired on 3 boots (incl. a genuine
 # --- power-cut pair, both 43/43 clean, boot-5 slice-asserted standalone) — PROMOTED to REQUIRE.
-REQUIRE S8-write:.*overwrite never grows.*witness OK
+# --- (STOR-1 S9 retired S8's past-EOF-returns-0 leg — growth is now the S9-grow witness's job — so the
+# --- S8 message no longer says "overwrite never grows"; the regex tracks the in-place overwrite claim.)
+REQUIRE S8-write:.*overwrote a live 16-byte pattern in place.*witness OK
 # --- S9 = STOR-1 S9: a RW dynamic on-disk file GROWS past EOF live (bounded per-write/per-file). PENDING
 # --- until the attended rMBP bench captures it (create -> grow -> Stat-grew -> readback -> -ENOSPC ceiling);
 # --- promote PENDING -> REQUIRE after that sitting, exactly as S8-write was.

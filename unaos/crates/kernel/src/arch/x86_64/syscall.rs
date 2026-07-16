@@ -12608,11 +12608,13 @@ fn s7_openany_witness() {
 /// dynamic descriptor (CAP_WRITE, FILE_DYNLEN != 0, size 64); the kernel-buffer helper `dyn_write_live` lands a
 /// distinct 16-byte pattern at offset 8; `submit_read_file` reads it back == pattern; then it RESTORES the 0xA5
 /// seed bytes and re-verifies — so the image/card is left pristine and the witness is IDEMPOTENT across boots +
-/// power-cuts (it never depends on prior content). Negative legs: (a) `sys_open_dynamic(.., "hello.bin", 1)` —
-/// a case-variant of staged EL0 code — MUST be refused `< 0` (the MF2-under-S8 regression lock); (b) a write
-/// claim at offset == size returns 0 (overwrite never grows). Gated on the knob-on FAT path; SILENT skip
-/// otherwise (no serial line — knob-off / no-FAT chains stay byte-identical). Tears the scratch row down through
-/// the real funnel; the dynamic descriptor owns no wstage/openf, so cleanup is a plain row free.
+/// power-cuts (it never depends on prior content). Negative leg: `sys_open_dynamic(.., "hello.bin", 1)` — a
+/// case-variant of staged EL0 code — MUST be refused `< 0` (the MF2-under-S8 regression lock). (STOR-1 S9
+/// retired the former past-EOF-returns-0 leg: a past-EOF write now GROWS, witnessed by `s9_grow_witness` on a
+/// throwaway file — S8W.BIN must NOT be grown here or it would lose idempotency. This witness is now purely
+/// in-EOF overwrite.) Gated on the knob-on FAT path; SILENT skip otherwise (no serial line — knob-off / no-FAT
+/// chains stay byte-identical). Tears the scratch row down through the real funnel; the dynamic descriptor owns
+/// no wstage/openf, so cleanup is a plain row free.
 #[cfg(feature = "irqstorage")]
 fn s8_write_witness() {
     if !s4_sync_storage() {
@@ -12639,7 +12641,6 @@ fn s8_write_witness() {
     let mut wrote: i32 = -1;
     let mut readback_ok = false;
     let mut restored_ok = false;
-    let mut eof_zero_ok = false;
     if h >= 0 {
         // Resolve the handle -> descriptor through the production seam, REQUIRING CAP_WRITE (S8's new right).
         if let Ok(HandleTarget::File(file_id)) = handle_resolve(r, h as u64, CAP_WRITE) {
@@ -12668,10 +12669,9 @@ fn s8_write_witness() {
                     )
                 };
                 restored_ok = sw == 16 && vn == 16 && vbuf == [SEED; 16];
-                // (b) OVERWRITE-ONLY: a write claim at offset == size returns 0 (the clamp fires before EFAULT,
-                // so the buf is never dereferenced). Set the offset to EOF and drive the REAL sys_write_file.
-                FILE_OFFSET[r][fid].store(SIZE, Ordering::Release);
-                eof_zero_ok = sys_write_file(r, file_id, USER_BASE, 16) == 0;
+                // (STOR-1 S9 retired the past-EOF-returns-0 leg — a past-EOF write now GROWS, so driving one on
+                // S8W.BIN would grow it permanently and break idempotency. Growth is witnessed by s9_grow_witness
+                // on a throwaway file. This witness stays purely in-EOF overwrite, leaving S8W.BIN pristine.)
             }
         }
     }
@@ -12687,17 +12687,16 @@ fn s8_write_witness() {
         && size == SIZE
         && readback_ok
         && restored_ok
-        && eof_zero_ok
         && excl_ok;
     if pass {
         serial_println!(
-            ":: S8-write: a non-staged on-disk file (S8W.BIN, {} bytes) opened RW + overwrote a live 16-byte pattern off the pre-stage set, read it back, RESTORED the seed (pristine + idempotent); a past-EOF write returned 0 (overwrite never grows) and a case-variant of staged code (\"hello.bin\") RW was refused (MF2 intact) == expected — witness OK ::",
+            ":: S8-write: a non-staged on-disk file (S8W.BIN, {} bytes) opened RW + overwrote a live 16-byte pattern in place off the pre-stage set, read it back, RESTORED the seed (pristine + idempotent); a case-variant of staged code (\"hello.bin\") RW was refused (MF2 intact) == expected — witness OK ::",
             size
         );
     } else {
         serial_println!(
-            ":: S8-write FAIL — h={} is_dyn={} cap_write={} size={} readback_ok={} restored_ok={} eof_zero_ok={} excl_ok={} deny={} (want h>=0 dyn capW size={} readback restore eof0 deny<0) ::",
-            h, is_dyn, cap_write, size, readback_ok, restored_ok, eof_zero_ok, excl_ok, deny, SIZE
+            ":: S8-write FAIL — h={} is_dyn={} cap_write={} size={} readback_ok={} restored_ok={} excl_ok={} deny={} (want h>=0 dyn capW size={} readback restore deny<0) ::",
+            h, is_dyn, cap_write, size, readback_ok, restored_ok, excl_ok, deny, SIZE
         );
     }
 }
