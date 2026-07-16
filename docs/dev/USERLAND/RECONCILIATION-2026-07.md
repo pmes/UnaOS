@@ -152,7 +152,12 @@ and wrapped with host I/O by the userspace `libs/fs/unafs`.
   vaire. The real vaire is built on UnaFS: managed units live as UnaFS objects (native
   attrs, ACL principals, journaled writes — the K-line machinery), not as host-filesystem
   copies. Bolt arc 2+ and any vaire design pass must aim at the UnaFS-native shape; the
-  host routine is scaffolding to be migrated, per the do-it-right first principle.**
+  host routine is scaffolding to be migrated, per the do-it-right first principle.
+  Corollary (Peter, same day): UnaFS-native vaire is a first-class FILESYSTEM BENCHMARK —
+  a real dev-tree sync (thousands of mixed-size files, metadata, journaled writes in one
+  measured run) is the realistic load UnaFS should be instrumented under, and the natural
+  justification/vehicle for the batched-sync work that closes the ledgered ~0.7 s
+  with_unafs mask.**
 - **stria's video half** — deferred by design (the audio-only slice was the Architect's own
   first slice), not drift.
 - The kit→vessel compiler and the elessar snapshot format — future arcs; `aule` is expected
