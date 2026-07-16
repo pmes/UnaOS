@@ -4711,6 +4711,7 @@ const GROW_WRITE_MAX: usize = 512;
 /// write returns a short (page-clamped) count; the caller continues sequentially. Unlike the U10 `GROW_WRITE_MAX`
 /// (bounded by the one-page WSTAGE buffer a created/staged descriptor extends into), a dynamic descriptor owns
 /// NO wstage — its grow goes straight to the live volume — so the cap here bounds the disk work per syscall.
+#[cfg(feature = "irqstorage")]
 const DYN_GROW_MAX: usize = PAGE_SIZE as usize;
 /// STOR-1 S9: the PER-FILE growth ceiling for the dynamic path — a dynamic descriptor may never grow a file's
 /// EOF beyond this (64 KiB). A write whose target offset is at/past the ceiling is refused `-ENOSPC`; a write
@@ -4718,6 +4719,7 @@ const DYN_GROW_MAX: usize = PAGE_SIZE as usize;
 /// growth off a syscall would let any ring-3 task exhaust the volume, and because the check is absolute (not
 /// relative to the opened size) a close+reopen cannot walk a file past the ceiling. Overwrite of a file already
 /// larger than the ceiling is unaffected (S8's overwrite path never enters the grow branch).
+#[cfg(feature = "irqstorage")]
 const DYN_FILE_MAX: usize = 64 * 1024;
 /// U10 CREATE / DELETE: the runtime-created file names (absent from the staged set; the fixtures O_CREAT them).
 const U10C_NAME: &str = "FRESH.BIN";
