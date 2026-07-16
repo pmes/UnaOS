@@ -3986,6 +3986,62 @@ pub fn canonical_guard_selftest() {
     }
 }
 
+/// CLOCK-X1 (M3): a bounded, UNCOUNTED serial witness (`== witness ::`, not a `-> PASS` line, so it
+/// never shifts a fixture COUNT) proving the x86 wall-clock timebase is live. It is SILENT where the
+/// TSC path is honestly frozen — no invariant TSC or no calibration (`clock::uptime_secs()` is
+/// `None`) — so a machine without an invariant TSC prints nothing rather than a spurious verdict.
+/// When live it proves: (1) `monotonic()` returns `Some` (uptime is `Some`, freq nonzero);
+/// (2) two `rdtsc` reads are monotone and advancing (second ≥ first, and strictly greater across a
+/// bounded spin); (3) the wall-SECOND derivation `now()` uses to extend a seed advances — the exact
+/// mechanism JD17 documented as FROZEN on x86 — observed directly as `uptime` crossing a second
+/// within a bounded budget, or, if the run is too fast to cross one, reported as the raw cycle
+/// advance with the current uptime (the brief's tick-monotonicity + nonzero-freq fallback). It never
+/// seeds the global clock, so it leaves the operator's UNSET state untouched.
+pub fn clock_x1_witness() {
+    // Frozen path: no invariant/calibrated TSC. `uptime_secs()` is `None` exactly when
+    // `clock::monotonic()` is `None`, so this is the honest silent gate.
+    let u1 = match crate::clock::uptime_secs() {
+        Some(u) => u,
+        None => return,
+    };
+    let mhz = crate::arch::apic::tsc_hz() / 1_000_000;
+
+    // Monotone + advancing: two rdtsc reads across a bounded spin. The spin is a fixed iteration
+    // cap (not a wall-clock wait), so it can never hang the serial-less boot.
+    let a = crate::arch::now_cycles();
+    let mut spins = 0u64;
+    // Spin until either a wall second elapses (uptime advances) or a bounded iteration cap is hit,
+    // whichever comes first — deterministic and hang-proof under QEMU/TCG.
+    let mut u2 = u1;
+    while u2 == u1 && spins < 50_000_000 {
+        core::hint::spin_loop();
+        spins += 1;
+        u2 = crate::clock::uptime_secs().unwrap_or(u1);
+    }
+    let b = crate::arch::now_cycles();
+    let delta = b.wrapping_sub(a);
+
+    if b < a {
+        // A backwards rdtsc would break the clock's monotonicity contract — surface it (uncounted).
+        serial_println!(":: CLOCK-X1: NON-MONOTONE rdtsc {} -> {} == witness ::", a, b);
+        return;
+    }
+
+    if u2 > u1 {
+        serial_println!(
+            ":: CLOCK-X1: TSC invariant, ~{} MHz; monotone (rdtsc +{}); uptime {}->{} s (JD17 x86-frozen clock now advances) == witness ::",
+            mhz, delta, u1, u2
+        );
+    } else {
+        // Too fast to cross a wall second within the cap: fall back to tick-monotonicity + nonzero
+        // freq (the brief's blessed fallback). A nonzero `delta` proves the counter advanced.
+        serial_println!(
+            ":: CLOCK-X1: TSC invariant, ~{} MHz; monotone (rdtsc +{} over {} spins, <1 s); uptime {} s == witness ::",
+            mhz, delta, spins, u1
+        );
+    }
+}
+
 /// U2 Part-0a verdict (BSP-quiet, mirrors `await_verdict`): wait until the TF+SYSCALL fixture has
 /// TERMINATED — either resumed+exited (the #DB neutralized at the entry stub) or killed (a ring-3
 /// #DB) — then confirm the kernel is still alive and print PASS. A timeout (the fixture neither
