@@ -10,6 +10,43 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-rmbp track — 2026-07-16 (STOR-1 S9 — dynamic on-disk file GROWTH: past-EOF write extends live, bounded) 🔬
+
+**What it does.** Retires S8's overwrite-only constraint the S-chain way: a past-EOF
+write on a dynamic RW descriptor (`open_dynamic_ondisk`, non-staged / non-U10, knob-on
+`irqstorage`) now GROWS the file synchronously on the live volume instead of returning 0.
+The extend routes through a new `dyn_write_grow` → `dyn_grow_live` → the storage service
+task's existing `Grow` op (`submit_grow` → `fat::write_grow`: alloc + zero-fill + chain +
+bump the directory size LAST) — the S4 grow shape reused for a non-staged file. An in-EOF
+write keeps S8's in-place overwrite unchanged.
+
+**Growth bounds (the DoS ledger).** PER-WRITE `DYN_GROW_MAX` = one page (4096 B): one
+bounce buffer, one atomic `submit_grow`, no chunk loop; a longer write returns the
+page-clamped count. PER-FILE `DYN_FILE_MAX` = 64 KiB: an absolute EOF ceiling (a target
+offset at/past it is `-ENOSPC`, a crossing write clamps) — not opened-size relative, so a
+close+reopen cannot walk a file past it. -EIO honesty: disk written first, size-before-
+offset publish, a failed grow leaves the descriptor and the on-disk size untouched (no
+half-acknowledged extend). No `ns_lock` (S5 deadlock class stays closed). New hardening:
+`open_dynamic_ondisk` refuses a RW open on `SHARED_ROW`, so a dynamic RW descriptor is
+always a private single-writer slot (the grow's un-CAS'd offset advance races nothing;
+tightens S8's overwrite path too). S8's staged/U10 exclusion set + MF2 uppercase-canon
+refusal + public-by-default ACL are unchanged — S9 widens *how* an already-writable file
+is written, never *which* files are writable.
+
+**How it was tested.** `./arroyo check` both arches 0 new warnings, zero aarch64 diff.
+Knob-ON `UNAOS_IRQSTORAGE=1 UNAOS_FATIMG=sf test 240`: new `S9-grow … witness OK`
+(`s9_grow_witness` grows a throwaway S9G.BIN 0→96, `submit_stat` confirms the on-disk
+grow, readback matches, a write at the 64 KiB ceiling refused `-ENOSPC`, `hello.bin` RW
+still refused) — mbench **22/22, 0 forbidden**, S8-write witness intact (its obsolete
+past-EOF-returns-0 leg retired, now purely in-EOF overwrite). Knob-OFF byte-identical
+(0 S9 lines, 0 FAIL). `UNAOS_NOSTORAGE=1 test 90` clean. `test-arm 22` MISSION SUCCESS.
+Residual (ledgered, mirrors S8's user-pointer NOTE): the per-write page clamp is
+review-verified not witnessed (no user memory mappable from the launcher); the per-file
+`-ENOSPC` ceiling IS witnessed. **Metal: PENDING** — `round6-rmbp.spec` `PENDING S9-grow`
+promotes to REQUIRE after the attended rMBP bench. Commits `8788cb7` (M1 grow path),
+`549941f` (M2 witness + specs), `cb75c87` (M2 fold: S8 witness/spec). Lane:
+`arch/x86_64/syscall.rs` + specs; `fat.rs`/`irqstorage.rs` reused unchanged.
+
 ## hw-rmbp track — 2026-07-16 (R17 attended rMBP sitting — four verdicts in two cold boots)
 
 One sitting (logs `rmbp-serial-2026-07-16-114357-boot2-knobon.log` primary,
@@ -28,6 +65,13 @@ One sitting (logs `rmbp-serial-2026-07-16-114357-boot2-knobon.log` primary,
   nothing; our write is load-bearing. **Pre-registered policy triggered: routing goes
   default-ON on this platform (follow-up fold).** Internals unresponsive with the flip
   active (pre-registered negative). M0 kbd dup-guard ✅ metal-clean.
+- **PORTSW-1 default-ON fold 🔬 (evidence-gated).** The pre-registered policy landed: the
+  mask-disciplined flip (`enable_intel_xhci_ports`, unchanged) now runs BY DEFAULT on x86
+  — the compile gate inverted (`#[cfg(not(feature = "noportsw"))]`), the opt-in `portsw`
+  feature / `UNAOS_PORTSW` knob replaced by an opt-OUT `noportsw` / `UNAOS_NOPORTSW` (for
+  the never-run no-routing experiment), and the witness suffix now reads `(default-on)`.
+  QEMU-green (mask=0x0 inert read-back, MISSION SUCCESS on and off the knob); the metal
+  rationale is already ✅ (Boot 1 no-routing dropped all external USB). `usb_xhci.md` §7f.
 - **CLOCK-X1 ✅ METAL-CONFIRMED.** `clock: TSC calibrated ~2693 MHz (invariant)` + the
   witness fired live (uptime 14→15 s) — the x86 wall clock advances on silicon.
 - **EHCI-1 scout — the falsification branch fired.** Both EHCI functions halted,
