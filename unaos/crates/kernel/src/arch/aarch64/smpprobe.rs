@@ -397,7 +397,46 @@ pub fn run(ctx: &ProbeCtx) {
         return;
     }
     if sel == 23 {
-        run_real_entry_rapid(ctx);
+        run_real_entry_rapid(ctx, 23);
+        return;
+    }
+    // ORIN-SMP-6/SMP conclusion: every code-shape suspect (entry shape 21, wake concurrency 22,
+    // their conjunction 23) is acquitted on silicon; the residual SMP-3 trigger is BOOT-STATE
+    // CONTEXT — WHERE in the boot the wake fires. ORIN-SMP-7 bisects that by DISPATCH POSITION
+    // (this late, post-xHCI-takeover site vs the pre-takeover `run_pre_xhci` site), one variable.
+    //
+    // Leg 24 — the REPRO CONTROL: the real 5-core wake at THIS post-xHCI-takeover position (byte-
+    // identical to leg 23's code). Predicted to reproduce the SMP-3 wall IF post-takeover boot-state
+    // is the trigger; given leg 23's ×5 innocence here the likely actual is SURVIVE (bisect inverts).
+    if sel == 24 {
+        run_real_entry_rapid(ctx, 24);
+        return;
+    }
+    // Leg 25 — the PRE-xHCI-takeover complement — is dispatched EARLY (`run_pre_xhci`, before
+    // `jb2b_attach`), so at this late site it has already fired; nothing to wake here.
+    if sel == 25 {
+        serial_println!(
+            ":: tegra: SMPPROBE-7 sel=25 is a PRE-xHCI-takeover leg — the wake already fired at the \
+             early dispatch site (run_pre_xhci, before jb2b_attach; see §ORIN-SMP-7); boot continues ::"
+        );
+        return;
+    }
+    // Legs 26/27 — FOLDED (see §ORIN-SMP-7 + the runbook). 26 ("wake immediately after JB9i eviction,
+    // before the rest of the attach") needs an instrumentation hook INSIDE `jb2b_attach`
+    // (`xusb_tegra.rs` — the CRCR executor's file) → OUT OF LANE, flagged to LC-orin; leg 24
+    // (post-full-takeover) already brackets the post-eviction fabric. 27 ("full production post-wake
+    // path") is DEGENERATE: after any probe leg the BSP already proceeds to the JM6 EL1 drop +
+    // CAPSTONE with the APs parked in WFI — exactly the real SMP-3 post-wake path.
+    if sel == 26 || sel == 27 {
+        serial_println!(
+            ":: tegra: SMPPROBE-7 sel={} FOLDED (see §ORIN-SMP-7): {}; boot continues single-track ::",
+            sel,
+            if sel == 26 {
+                "needs an in-jb2b_attach hook (xusb_tegra.rs, out of lane) — leg 24 already brackets post-eviction"
+            } else {
+                "degenerate with leg 24 — the BSP already runs the full JM6/CAPSTONE post-wake path with APs parked"
+            }
+        );
         return;
     }
     for &(v, name, f) in EXPERIMENTS {
@@ -409,6 +448,26 @@ pub fn run(ctx: &ProbeCtx) {
         }
     }
     serial_println!(":: tegra: SMPPROBE sel={} UNKNOWN (no experiment); boot continues ::", sel);
+}
+
+/// ORIN-SMP-7 — the PRE-xHCI-takeover dispatch site. Called from `tegra_early_stop` AFTER JM4
+/// (GIC/timer/SMC/serial all live) and the heap, but BEFORE the JB2b `jb2b_attach` xHCI takeover /
+/// JB9i inherited-slot eviction. ONLY leg 25 acts here — the real 5-core wake fired into a fabric
+/// the xHCI takeover has NOT yet mutated; every other armed value is a silent no-op and wakes at the
+/// post-takeover `run` site instead. The ONE variable this site turns vs the post-takeover site is
+/// the xHCI takeover/eviction boot-state at wake time (the bit-63/carveout interplay hypothesis, the
+/// last SMP-3 suspect after §ORIN-SMP-6 acquitted every code-shape). See §ORIN-SMP-7.
+pub fn run_pre_xhci(ctx: &ProbeCtx) {
+    let sel = core::hint::black_box(SEL);
+    if sel != 25 {
+        return; // every non-25 image wakes at the post-takeover site; this site is a no-op for them
+    }
+    serial_println!(
+        ":: tegra: SMPPROBE-7 ARMED sel=25 (PRE-xHCI-takeover site — before jb2b_attach/JB9i \
+         eviction); the fabric the wake sees has NOT been through the xHCI takeover; power-fault \
+         boots are DATA ::"
+    );
+    run_real_entry_rapid(ctx, 25);
 }
 
 // ════════════════════════════════════════════════════════════════════════════════════════════════
@@ -1670,22 +1729,39 @@ fn run_rapid_5core_stub(ctx: &ProbeCtx) {
     );
 }
 
-/// Leg 23 — the REAL entry × RAPID 5-core: SMP-3 replayed under instrumentation. Publication via
-/// the granted publish-only API; all `CPU_ON`s into the REAL `_secondary_start_virt` back-to-back
+/// The REAL entry × RAPID 5-core wake: SMP-3 replayed under instrumentation. Publication via the
+/// granted publish-only API; all `CPU_ON`s into the REAL `_secondary_start_virt` back-to-back
 /// (print-free burst — faster than SMP-3's print-per-call loop); then the real path's own
-/// `CORE_READY` signals polled per core. Runs LAST, only if legs 21 AND 22 both survived on the
-/// bench (the runbook gates its boot — the code itself is always staged).
-fn run_real_entry_rapid(ctx: &ProbeCtx) {
+/// `CORE_READY` signals polled per core. `sel` selects the record grammar and, at the CALL SITE,
+/// the boot POSITION — the ONE variable the ORIN-SMP-7 boot-state-context bisect turns:
+///
+///   * **sel 23** (ORIN-SMP-6): the conjunction leg (real entry × rapid), dispatched at the
+///     post-xHCI-takeover site. Runs LAST, only if legs 21 AND 22 both survived (runbook-gated).
+///     INNOCENT on silicon (×5) — its close-out left boot-state context as the last SMP-3 suspect.
+///   * **sel 24** (ORIN-SMP-7 CONTROL): byte-identical wake, same POST-xHCI-takeover site — the
+///     repro control that should reproduce the SMP-3 wall IF post-takeover boot-state is the
+///     trigger. Given sel-23's ×5 innocence at this exact position, the pre-registered primary
+///     expectation is SURVIVE (the bisect then inverts to the leg-24-vs-real-SMP-3 delta).
+///   * **sel 25** (ORIN-SMP-7): the SAME wake dispatched at the PRE-xHCI-takeover site
+///     (`run_pre_xhci`, before `jb2b_attach`/JB9i eviction). The ONE variable vs sel 24 is the
+///     xHCI takeover/eviction fabric state at wake time (the bit-63/carveout interplay hypothesis).
+///
+/// Legs 24 and 25 use identical wake code — only the dispatch position (main.rs) differs, so the
+/// pair brackets the `jb2b_attach` takeover/eviction with no `xusb_tegra.rs` touch. See §ORIN-SMP-7.
+fn run_real_entry_rapid(ctx: &ProbeCtx, sel: u32) {
+    let tag = if sel == 23 { "SMPPROBE-6" } else { "SMPPROBE-7" };
     serial_println!(
-        ":: tegra: SMPPROBE-6 sel=23 — REAL-ENTRY × RAPID 5-core (SMP-3 replayed, instrumented); the \
+        ":: tegra: {} sel={} — REAL-ENTRY × RAPID 5-core (SMP-3 replayed, instrumented); the \
          woken cores run the real __secondary_rust_virt — AP-online prints are EXPECTED; a RAS \
-         power-off is DATA ::"
+         power-off is DATA ::",
+        tag, sel
     );
     let mut aff_by_index = [0u32; 8];
     let n_cores = smp6_aff_table(ctx, &mut aff_by_index);
     if n_cores < 2 {
         serial_println!(
-            ":: tegra: SMPPROBE-6 sel=23 — DTB /cpus named no non-BSP core; STOP, no CPU_ON ::"
+            ":: tegra: {} sel={} — DTB /cpus named no non-BSP core; STOP, no CPU_ON ::",
+            tag, sel
         );
         return;
     }
@@ -1693,15 +1769,15 @@ fn run_real_entry_rapid(ctx: &ProbeCtx) {
 
     let entry = super::smp_virt::probe_publish_real_path(&aff_by_index[..n_cores]);
     serial_println!(
-        ":: tegra: SMPPROBE-6 sel=23 real path published (n_cores={}); REAL entry \
+        ":: tegra: {} sel={} real path published (n_cores={}); REAL entry \
          _secondary_start_virt={:#x}; BSP aff={:#010x}; plan (burst is print-free): ::",
-        n_cores, entry, aff_by_index[0]
+        tag, sel, n_cores, entry, aff_by_index[0]
     );
     for idx in 1..n_cores {
         serial_println!(
-            ":: tegra: SMPPROBE-6 sel=23 plan [{}/{}] target aff={:#010x} ctxid={} — online signal \
+            ":: tegra: {} sel={} plan [{}/{}] target aff={:#010x} ctxid={} — online signal \
              CORE_READY[{}] ::",
-            idx, n_targets, aff_by_index[idx], idx, idx
+            tag, sel, idx, n_targets, aff_by_index[idx], idx, idx
         );
     }
 
@@ -1716,13 +1792,13 @@ fn run_real_entry_rapid(ctx: &ProbeCtx) {
     }
 
     serial_println!(
-        ":: tegra: SMPPROBE-6 sel=23 burst COMPLETE (box survived {} back-to-back REAL-entry CPU_ONs) ::",
-        n_targets
+        ":: tegra: {} sel={} burst COMPLETE (box survived {} back-to-back REAL-entry CPU_ONs) ::",
+        tag, sel, n_targets
     );
     for idx in 1..n_cores {
         serial_println!(
-            ":: tegra: SMPPROBE-6 sel=23 [{}/{}] target aff={:#010x} CPU_ON ret={} ::",
-            idx, n_targets, aff_by_index[idx], rets[idx]
+            ":: tegra: {} sel={} [{}/{}] target aff={:#010x} CPU_ON ret={} ::",
+            tag, sel, idx, n_targets, aff_by_index[idx], rets[idx]
         );
     }
 
@@ -1730,8 +1806,8 @@ fn run_real_entry_rapid(ctx: &ProbeCtx) {
     for idx in 1..n_cores {
         if rets[idx] != 0 {
             serial_println!(
-                ":: tegra: SMPPROBE-6 sel=23 [{}/{}] not woken (ret!=0); skipped ::",
-                idx, n_targets
+                ":: tegra: {} sel={} [{}/{}] not woken (ret!=0); skipped ::",
+                tag, sel, idx, n_targets
             );
             continue;
         }
@@ -1740,15 +1816,15 @@ fn run_real_entry_rapid(ctx: &ProbeCtx) {
         if up {
             online += 1;
             serial_println!(
-                ":: tegra: SMPPROBE-6 sel=23 [{}/{}] target aff={:#010x} CORE_READY[{}] SET — online \
+                ":: tegra: {} sel={} [{}/{}] target aff={:#010x} CORE_READY[{}] SET — online \
                  via the REAL path ::",
-                idx, n_targets, aff_by_index[idx], idx
+                tag, sel, idx, n_targets, aff_by_index[idx], idx
             );
         } else {
             serial_println!(
-                ":: tegra: SMPPROBE-6 sel=23 [{}/{}] target aff={:#010x} CORE_READY[{}] NOT set in \
+                ":: tegra: {} sel={} [{}/{}] target aff={:#010x} CORE_READY[{}] NOT set in \
                  ~500ms; box up => parked or hung (not the RAS reset) ::",
-                idx, n_targets, aff_by_index[idx], idx
+                tag, sel, idx, n_targets, aff_by_index[idx], idx
             );
         }
     }
@@ -1759,14 +1835,15 @@ fn run_real_entry_rapid(ctx: &ProbeCtx) {
     });
     let after = percpu::cpu(0).ipis.load(core::sync::atomic::Ordering::Acquire);
     serial_println!(
-        ":: tegra: SMPPROBE-6 sel=23 AP -> BSP SGI {} (BSP ipi {} -> {}) ::",
+        ":: tegra: {} sel={} AP -> BSP SGI {} (BSP ipi {} -> {}) ::",
+        tag, sel,
         if ok { "OK" } else { "TIMEOUT" },
         bsp_ipi_before,
         after
     );
     serial_println!(
-        ":: tegra: SMPPROBE-6 sel=23 RAPID REAL-ENTRY SEQUENCE DONE — {}/{} cores online via the \
+        ":: tegra: {} sel={} RAPID REAL-ENTRY SEQUENCE DONE — {}/{} cores online via the \
          REAL path (the SMP-3 replay survived) ::",
-        online, n_targets
+        tag, sel, online, n_targets
     );
 }

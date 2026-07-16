@@ -1212,6 +1212,21 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     unaos_kernel::arch::memory::init(boot_info);
     serial_println!(":: KERNEL HEAP ALLOCATED ::");
 
+    // ORIN-SMP-7 (boot-state-context bisect) — the PRE-xHCI-takeover dispatch site. With `smpprobe`
+    // armed to leg 25, the real 5-core wake fires HERE — after JM4 (GIC/timer/SMC/serial live) and
+    // the heap, but BEFORE the JB2b `jb2b_attach` takeover / JB9i eviction below — so the woken cores
+    // see a fabric the xHCI takeover has NOT yet mutated. Only leg 25 acts; every other armed value
+    // is a silent no-op here and wakes at the post-takeover `smpprobe::run` site further down. The
+    // dispatch position is the bisect's ONE variable (leg 24 = post-takeover, leg 25 = pre-takeover;
+    // the pair brackets the takeover/eviction with no xusb_tegra.rs touch). Compiled out knob-off, so
+    // the default tegra image stays byte-identical to baseline. See arch_arm64.md §ORIN-SMP-7.
+    #[cfg(feature = "smpprobe")]
+    unaos_kernel::arch::smpprobe::run_pre_xhci(&unaos_kernel::arch::smpprobe::ProbeCtx {
+        dtb_addr,
+        dtb_size,
+        ram_gib_mask: mmu.ram_gib_mask,
+    });
+
     // 3e. JB2b: platform-attach the shared xHCI driver at the XUSB block JB1c ungated, and pump
     //     the polled enumeration to a USB keyboard's armed interrupt-IN read — the Orin keyboard
     //     first-light arc. Runs HERE because it needs the heap (rings/contexts/buffers, step 3c)
@@ -1339,7 +1354,10 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     // query experiments (0/1/2/4) return and the boot proceeds to CAPSTONE unchanged; the CPU_ON
     // experiments (3/5) are the pre-registered power-fault boots (the box may RAS-fault and power off —
     // that is DATA, see the runbook `scripts/orin-smp2-bench.md`). Compiled out entirely when the
-    // feature is off, so the default tegra image is byte-identical to baseline.
+    // feature is off, so the default tegra image is byte-identical to baseline. (ORIN-SMP-7: this is
+    // ALSO the POST-xHCI-takeover dispatch site — leg 24's control wake fires here, after the JB2b
+    // takeover/JB9i eviction above; leg 25's pre-takeover complement fired at the early site. See
+    // arch_arm64.md §ORIN-SMP-7.)
     #[cfg(feature = "smpprobe")]
     unaos_kernel::arch::smpprobe::run(&unaos_kernel::arch::smpprobe::ProbeCtx {
         dtb_addr,
