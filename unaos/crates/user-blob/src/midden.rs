@@ -25,6 +25,12 @@
 //   bit4  direct SYS_OPEN(BUSPRIV.BIN, RO) DENIED: returns -13 (EACCES)
 //   bit5  EQUIVALENCE: the two denial errnos are BYTE-SAME (bit3's status == bit4's return),
 //         and the allowed legs agree (direct RO open of MIDTXT.TXT >= 0 while bus cat gave 0)
+//   BANDY-2 write-side legs:
+//   bit6  WRITE round-trip: write WRT.TXT -> cat WRT.TXT reads the content back byte-exact
+//   bit7  RM round-trip: rm WRT.TXT -> cat WRT.TXT is now -ENOENT
+//   bit8  MV round-trip: write MVA.TXT -> mv MVA.TXT MVB.TXT -> cat MVB byte-exact, cat MVA -ENOENT
+//   bit9  EXTENDED EQUIVALENCE: rm/mv/write of the foreign BUSPRIV.BIN all DENIED -EACCES via the
+//         bus, byte-same as a direct SYS_OPEN(RW) of it (-EACCES) — owner authority holds both ways
 // then SYS_EXIT(0xB5) — the midden sentinel, routed to EL0_MIDDEN_DONE.
 //
 // Build discipline (the K2OWN build-lane idiom): an extra `[[bin]]` of crates/user-blob, flat
@@ -84,6 +90,10 @@ const FRAME_MAX: usize = HDR + 4096;
 const VERB_LS: u8 = 1;
 const VERB_CAT: u8 = 2;
 const VERB_CP: u8 = 3;
+// BANDY-2 write-side verbs (mirror arch/aarch64/bus.rs).
+const VERB_WRITE: u8 = 4;
+const VERB_RM: u8 = 5;
+const VERB_MV: u8 = 6;
 
 #[inline(always)]
 unsafe fn put(p: *mut u8, i: usize, b: u8) {
@@ -210,6 +220,78 @@ fn run_command(line: &[u8], corr: u32, rep: &mut [u8; FRAME_MAX]) -> (i64, usize
             }
         }
         build_req(&mut req, VERB_CP, corr, &body[..rest.len()])
+    } else if eq(verb_tok, b"rm") {
+        // rm NAME -> bare 8.3 name (same shape as cat)
+        if rest.is_empty() || rest.len() > 12 {
+            return (i64::MIN, 0);
+        }
+        build_req(&mut req, VERB_RM, corr, rest)
+    } else if eq(verb_tok, b"mv") {
+        // mv SRC DST -> body [src_len u8][src][dst] (same shape as cp)
+        let mut sp2 = rest.len();
+        let mut j = 0;
+        while j < rest.len() {
+            if unsafe { get(rest.as_ptr(), j) } == b' ' {
+                sp2 = j;
+                break;
+            }
+            j += 1;
+        }
+        if sp2 == 0 || sp2 > 12 || sp2 + 1 >= rest.len() || rest.len() - sp2 - 1 > 12 {
+            return (i64::MIN, 0);
+        }
+        let mut body = [0u8; 26];
+        let bp = body.as_mut_ptr();
+        unsafe {
+            put(bp, 0, sp2 as u8);
+            let mut k = 0;
+            while k < rest.len() && k < 25 {
+                if k != sp2 {
+                    let dst_i = if k < sp2 { 1 + k } else { k };
+                    put(bp, dst_i, get(rest.as_ptr(), k));
+                }
+                k += 1;
+            }
+        }
+        build_req(&mut req, VERB_MV, corr, &body[..rest.len()])
+    } else if eq(verb_tok, b"write") {
+        // write NAME CONTENT -> body [name_len u8][name][content]. Split the argument tail on the
+        // FIRST space: name = up to it, content = the remainder (may itself contain spaces).
+        let mut sp2 = rest.len();
+        let mut j = 0;
+        while j < rest.len() {
+            if unsafe { get(rest.as_ptr(), j) } == b' ' {
+                sp2 = j;
+                break;
+            }
+            j += 1;
+        }
+        // name 1..=12; content bounded by the 96-byte request buffer (HDR 52 + 1 + name + content).
+        if sp2 == 0 || sp2 > 12 || sp2 >= rest.len() {
+            return (i64::MIN, 0);
+        }
+        let content_len = rest.len() - sp2 - 1;
+        if 1 + sp2 + content_len > 44 {
+            return (i64::MIN, 0);
+        }
+        let mut body = [0u8; 44];
+        let bp = body.as_mut_ptr();
+        unsafe {
+            put(bp, 0, sp2 as u8);
+            let mut k = 0;
+            // name bytes -> body[1..=sp2]
+            while k < sp2 {
+                put(bp, 1 + k, get(rest.as_ptr(), k));
+                k += 1;
+            }
+            // content bytes (after the space) -> body[1+sp2..]
+            let mut c = 0;
+            while c < content_len {
+                put(bp, 1 + sp2 + c, get(rest.as_ptr(), sp2 + 1 + c));
+                c += 1;
+            }
+        }
+        build_req(&mut req, VERB_WRITE, corr, &body[..1 + sp2 + content_len])
     } else {
         return (i64::MIN, 0);
     };
@@ -243,6 +325,13 @@ fn eq(a: &[u8], b: &[u8]) -> bool {
 /// The fixture text the launcher stages in MIDTXT.TXT — bit1 byte-verifies the cat body.
 const MIDTXT_CONTENT: &[u8] = b"midden bus fixture\n";
 const EACCES: i64 = -13;
+const ENOENT: i64 = -2;
+/// BANDY-2: the content midden WRITES (no spaces — the write parser splits name/content on the
+/// first space); the cat readback byte-verifies it. Also the mv round-trip's payload.
+const WR_CONTENT: &[u8] = b"middenwrote";
+/// The truncate-overwrite content (bit6) — a SHORTER string, so the readback proving it equals this
+/// (not the old longer content) confirms a genuine truncate, not a stale-tail overwrite-in-place.
+const WR2_CONTENT: &[u8] = b"again";
 
 #[unsafe(no_mangle)]
 extern "C" fn midden_main() -> ! {
@@ -294,6 +383,62 @@ extern "C" fn midden_main() -> ! {
     }
     if st_bus_denied == st_direct_denied && st_bus_denied == EACCES && allowed_agree {
         w |= 1 << 5;
+    }
+
+    // ===== BANDY-2 write-side legs =====================================================
+
+    // (6) WRITE round-trip: CREATE WRT.TXT, cat it back byte-exact, then TRUNCATE-overwrite it with
+    // new content and cat that back byte-exact (exercises both create and truncate-by-owner).
+    let (st_w, bl_w) = run_command(b"write WRT.TXT middenwrote", 6, &mut rep);
+    let (st_rb, bl_rb) = run_command(b"cat WRT.TXT", 7, &mut rep);
+    let create_ok =
+        st_w == 0 && bl_w == 0 && st_rb == 0 && bl_rb == WR_CONTENT.len() && eq(&rep[HDR..HDR + bl_rb], WR_CONTENT);
+    let (st_w2, bl_w2) = run_command(b"write WRT.TXT again", 18, &mut rep);
+    let (st_rb2, bl_rb2) = run_command(b"cat WRT.TXT", 19, &mut rep);
+    let trunc_ok =
+        st_w2 == 0 && bl_w2 == 0 && st_rb2 == 0 && bl_rb2 == WR2_CONTENT.len() && eq(&rep[HDR..HDR + bl_rb2], WR2_CONTENT);
+    if create_ok && trunc_ok {
+        w |= 1 << 6;
+        con_write(b"midden> write WRT.TXT (create+truncate) / cat byte-exact ok\n");
+    }
+
+    // (7) RM round-trip: delete WRT.TXT, then cat -> -ENOENT (the name is gone).
+    let (st_rm, _) = run_command(b"rm WRT.TXT", 8, &mut rep);
+    let (st_gone, _) = run_command(b"cat WRT.TXT", 9, &mut rep);
+    if st_rm == 0 && st_gone == ENOENT {
+        w |= 1 << 7;
+        con_write(b"midden> rm WRT.TXT / cat -> gone ok\n");
+    }
+
+    // (8) MV round-trip: write MVA.TXT, rename to MVB.TXT, cat MVB byte-exact, cat MVA -> gone.
+    let (st_wa, _) = run_command(b"write MVA.TXT middenwrote", 10, &mut rep);
+    let (st_mv, _) = run_command(b"mv MVA.TXT MVB.TXT", 11, &mut rep);
+    let (st_catb, bl_b) = run_command(b"cat MVB.TXT", 12, &mut rep);
+    let mvb_ok = st_catb == 0 && bl_b == WR_CONTENT.len() && eq(&rep[HDR..HDR + bl_b], WR_CONTENT);
+    let (st_cata, _) = run_command(b"cat MVA.TXT", 13, &mut rep);
+    if st_wa == 0 && st_mv == 0 && mvb_ok && st_cata == ENOENT {
+        w |= 1 << 8;
+        con_write(b"midden> mv MVA.TXT MVB.TXT / cat MVB ok / MVA gone\n");
+        let _ = run_command(b"rm MVB.TXT", 14, &mut rep); // self-clean the mv target
+    }
+
+    // (9) EXTENDED EQUIVALENCE (verdict D, write side): every DESTRUCTIVE verb on the foreign-owned
+    // BUSPRIV.BIN is DENIED -EACCES via the bus, BYTE-SAME as the direct SYS_OPEN(RW) denial — the
+    // owner-authority gate holds identically through the bus and the syscall surface.
+    let (st_rm_denied, _) = run_command(b"rm BUSPRIV.BIN", 15, &mut rep);
+    let (st_mv_denied, _) = run_command(b"mv BUSPRIV.BIN STOLEN.BIN", 16, &mut rep);
+    let (st_wr_denied, _) = run_command(b"write BUSPRIV.BIN x", 17, &mut rep);
+    // direct: opening the foreign file for WRITE (delete/truncate would need such a handle) -> EACCES.
+    // mode bit0 = RW (CAP_READ|CAP_WRITE); no O_CREAT (the file exists).
+    let bp = b"BUSPRIV.BIN";
+    const O_RW: u64 = 1;
+    let st_direct_rw = svc(SYS_OPEN, bp.as_ptr() as u64, bp.len() as u64, O_RW);
+    if st_rm_denied == EACCES
+        && st_mv_denied == EACCES
+        && st_wr_denied == EACCES
+        && st_direct_rw == EACCES
+    {
+        w |= 1 << 9;
     }
 
     let _ = svc(SYS_REPORT, w, 0, 0);

@@ -231,6 +231,25 @@ freeze it as the spec of record; **host bandy/midden migrate to this wire in
 a later HOST arc.** AI-OFF is first-class here trivially: no vein exists on
 metal, every verb is principal-attributed and ACL-checked (principle 4 held).
 
+Second arc — **🔬 LANDED (BANDY-2, 2026-07-16, QEMU-green; metal leg rides the
+next attended sitting):** the write-side verbs — `write` (create-or-truncate a
+root file), `rm` (unlink), `mv` (rename in place) — additive to the frozen v1
+wire (new verb tags + a typed `write` `[name_len][name][content]` payload;
+`rm`/`mv` reuse the `cat`/`cp` body shapes) and fulfilled in-kernel through the
+EXISTING FAT + ACL machinery under the invoker's stamped principal, every errno
+mirrored against the direct paths. The DESTRUCTIVE verbs inherit the K-line ACL
+discipline verbatim: DELETE/RENAME/TRUNCATE are OWNER-only (a content grantee
+gets read/write, never destroy — else it could steal a name); the persisted
+(native) ACL row is cleared DURABLE-FIRST before the `0xE5` (fail toward PUBLIC,
+never a stale owner row a same-name file could re-adopt — the K1-F2 class); the
+native persist/re-bind runs AFTER the NAMESPACE drop (the K5B rule); a concurrent
+reader's cluster chain is deferred-freed at its last close, never underneath it.
+midden grows the same verbs; the EL0 round-trip + the EXTENDED equivalence
+(rm/mv/write of a foreign-owned file denied-via-bus == denied-via-syscall,
+byte-same `-EACCES`) are witnessed. No new security model, no fulfiller
+registration (BANDY-3's design pass). Witnesses `BANDY-CODEC2`/`BANDY-WR`/
+`BANDY-EQ2`/`BANDY-ACL`, `pi4-regression.spec` 41/41.
+
 ## 4. TALUS — the rover (deferred until the desktop chain matures)
 
 Architecture settled 2026-07-02. The OS is the **vehicle computer between the

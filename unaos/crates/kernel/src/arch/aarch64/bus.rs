@@ -62,10 +62,30 @@ pub const BUS_FRAME_MAX: usize = BUS_HDR_LEN + BUS_BODY_MAX;
 pub const BUS_KIND_REQUEST: u8 = 1;
 pub const BUS_KIND_REPLY: u8 = 2;
 
-/// Verbs (the v1 subset — ROADMAP §3b's first three). A reply echoes its request's verb.
+/// Verbs. A reply echoes its request's verb.
+/// BANDY-1 read-side subset (ROADMAP §3b's first three):
 pub const BUS_VERB_LS: u8 = 1;
 pub const BUS_VERB_CAT: u8 = 2;
 pub const BUS_VERB_CP: u8 = 3;
+/// BANDY-2 write-side subset (ROADMAP §3b arc 2) — the DESTRUCTIVE verbs, fulfilled through the
+/// EXISTING FAT + ACL machinery under the invoker's stamped principal (syscall.rs), errno-mirrored:
+///   * WRITE — create-or-truncate a root file with a typed content payload (sys_open(O_CREAT)+write twin);
+///   * RM    — unlink a root file by name (sys_unlink twin — owner-only delete, durable ACL clear first);
+///   * MV     — rename a root file in place (the fat.rs rename_entry twin — owner-only, ACL name re-bind).
+/// ADDITIVE to the frozen v1 layout: new verb tags + typed payloads, no header/ceiling change.
+pub const BUS_VERB_WRITE: u8 = 4;
+pub const BUS_VERB_RM: u8 = 5;
+pub const BUS_VERB_MV: u8 = 6;
+
+/// The full set of valid verbs (both request and reply kinds). Kept as one predicate so the
+/// frozen `frame_parse` verb gate and the typed-body dispatch stay in lockstep.
+#[inline]
+pub fn verb_valid(verb: u8) -> bool {
+    matches!(
+        verb,
+        BUS_VERB_LS | BUS_VERB_CAT | BUS_VERB_CP | BUS_VERB_WRITE | BUS_VERB_RM | BUS_VERB_MV
+    )
+}
 
 /// 8.3 name bound — mirrors syscall.rs MAX_NAME (the sys_open bound the equivalence witness
 /// holds cat/cp to).
@@ -119,8 +139,8 @@ pub fn hdr_write(h: &BusHdr, out: &mut [u8]) {
 }
 
 /// Parse + validate a frame's header against the whole presented byte range. Enforces, in order:
-/// length ≥ header; magic/version/reserved; kind ∈ {REQUEST, REPLY}; verb ∈ {LS, CAT, CP} (both
-/// kinds — a reply echoes its request's verb); body_len ≤ BUS_BODY_MAX (the ceiling — checked
+/// length ≥ header; magic/version/reserved; kind ∈ {REQUEST, REPLY}; verb ∈ {LS, CAT, CP, WRITE,
+/// RM, MV} (both kinds — a reply echoes its request's verb); body_len ≤ BUS_BODY_MAX (the ceiling — checked
 /// BEFORE the fit check so an absurd length is TooBig, not Truncated); the declared body exactly
 /// fits the presented bytes (no trailing slack — a frame is exact, not a prefix); a REPLY with a
 /// nonzero status carries NO body (an error is its errno, never errno-plus-bytes). Returns the
@@ -134,9 +154,7 @@ pub fn frame_parse(frame: &[u8]) -> Result<BusHdr, BusDecodeErr> {
     }
     let kind = frame[5];
     let verb = frame[6];
-    if !matches!(kind, BUS_KIND_REQUEST | BUS_KIND_REPLY)
-        || !matches!(verb, BUS_VERB_LS | BUS_VERB_CAT | BUS_VERB_CP)
-    {
+    if !matches!(kind, BUS_KIND_REQUEST | BUS_KIND_REPLY) || !verb_valid(verb) {
         return Err(BusDecodeErr::Malformed);
     }
     let body_len = rd_u32(&frame[48..52]);
@@ -195,6 +213,28 @@ pub fn cp_body_parse(body: &[u8]) -> Result<(&[u8], &[u8]), BusDecodeErr> {
     Ok((src, dst))
 }
 
+/// BANDY-2 WRITE request body: `[name_len u8][name bytes][content bytes]`. The name is under the
+/// CAT rules (1..=BUS_NAME_MAX printable-ASCII 8.3 bytes); the content is the remainder — ANY bytes
+/// (a file is arbitrary content), possibly EMPTY (a 0-byte create). The frame ceiling
+/// (BUS_BODY_MAX) already bounds the whole body, so the content is bounded by construction
+/// (≤ BUS_BODY_MAX − 1 − name_len); the transport applies the semantic BUS_CP_MAX content ceiling.
+pub fn write_body_parse(body: &[u8]) -> Result<(&[u8], &[u8]), BusDecodeErr> {
+    if body.is_empty() {
+        return Err(BusDecodeErr::BadBody);
+    }
+    let name_len = body[0] as usize;
+    // The name must fit AFTER the length byte; content is whatever follows (may be empty).
+    if name_len == 0 || name_len > BUS_NAME_MAX || 1 + name_len > body.len() {
+        return Err(BusDecodeErr::BadBody);
+    }
+    let name = cat_body_parse(&body[1..1 + name_len])?;
+    let content = &body[1 + name_len..];
+    Ok((name, content))
+}
+
+/// BANDY-2 RM request body: the bare 8.3 name (identical shape to CAT — reuses `cat_body_parse`).
+/// BANDY-2 MV request body: `[src_len u8][src][dst]` (identical shape to CP — reuses `cp_body_parse`).
+///
 /// Build a request frame into `buf`; returns the frame length. The EL0 client-side layout in
 /// kernel-testable form (midden mirrors this); also the M1/M5 fixtures' request builder.
 pub fn build_request(verb: u8, corr: u32, body: &[u8], buf: &mut [u8]) -> usize {
@@ -441,5 +481,198 @@ pub fn bus_codec_selftest() {
         );
     } else {
         serial_println!(":: BANDY-CODEC: FAIL — w={:#x}/{:#x} ::", w, ALL);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// BANDY-CODEC2 selftest — the M1 write-side KATs (BANDY-2). A SIBLING of BANDY-CODEC (the
+// BANDY-1 goldens/witness are left byte-identical): frozen native goldens for the three new
+// request verbs (write/rm/mv) + round-trips + fail-closed decoding of the new typed bodies.
+// Same idiom: read-only, in-RAM, no disk; one uncounted `:: BANDY-CODEC2: … ::` line.
+// ---------------------------------------------------------------------------------------------
+
+/// FROZEN NATIVE GOLDEN — a `write NOTE.TXT "hi\n"` REQUEST, corr = 11: header + body
+/// `[name_len=8]["NOTE.TXT"]["hi\n"]` (12 body bytes). Self-authored at BANDY-2's first commit.
+const GOLDEN_REQ_WRITE: &[u8] = &[
+    0x55, 0x42, 0x53, 0x31, // "UBS1"
+    0x01, // version 1
+    0x01, // kind REQUEST
+    0x04, // verb WRITE
+    0x00, // reserved
+    0x0b, 0x00, 0x00, 0x00, // corr = 11
+    0x00, 0x00, 0x00, 0x00, // status = 0
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // principal zero (kernel stamps)
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0x0c, 0x00, 0x00, 0x00, // body_len = 12
+    0x08, // name_len = 8
+    b'N', b'O', b'T', b'E', b'.', b'T', b'X', b'T', // name
+    b'h', b'i', b'\n', // content
+];
+
+/// FROZEN NATIVE GOLDEN — an `rm NOTE.TXT` REQUEST, corr = 12: header + bare 8.3 name (8 bytes).
+const GOLDEN_REQ_RM: &[u8] = &[
+    0x55, 0x42, 0x53, 0x31, // "UBS1"
+    0x01, // version 1
+    0x01, // kind REQUEST
+    0x05, // verb RM
+    0x00, // reserved
+    0x0c, 0x00, 0x00, 0x00, // corr = 12
+    0x00, 0x00, 0x00, 0x00, // status = 0
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0x08, 0x00, 0x00, 0x00, // body_len = 8
+    b'N', b'O', b'T', b'E', b'.', b'T', b'X', b'T', // name
+];
+
+/// FROZEN NATIVE GOLDEN — a `mv NOTE.TXT DONE.TXT` REQUEST, corr = 13: header + body
+/// `[src_len=8]["NOTE.TXT"]["DONE.TXT"]` (17 body bytes).
+const GOLDEN_REQ_MV: &[u8] = &[
+    0x55, 0x42, 0x53, 0x31, // "UBS1"
+    0x01, // version 1
+    0x01, // kind REQUEST
+    0x06, // verb MV
+    0x00, // reserved
+    0x0d, 0x00, 0x00, 0x00, // corr = 13
+    0x00, 0x00, 0x00, 0x00, // status = 0
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0x11, 0x00, 0x00, 0x00, // body_len = 17
+    0x08, // src_len = 8
+    b'N', b'O', b'T', b'E', b'.', b'T', b'X', b'T', // src
+    b'D', b'O', b'N', b'E', b'.', b'T', b'X', b'T', // dst
+];
+
+/// The M1 write-side witness. Emits ONE uncounted `:: BANDY-CODEC2: … ::` line.
+pub fn bus_codec2_selftest() {
+    let mut w = 0u32;
+
+    // bit0: the frozen WRITE golden — build_request reproduces it byte-for-byte and it round-trips
+    // field-exact through frame_parse + the typed write body parser (name + content split).
+    {
+        let mut req = [0u8; 128];
+        let mut body = [0u8; 32];
+        body[0] = 8;
+        body[1..9].copy_from_slice(b"NOTE.TXT");
+        body[9..12].copy_from_slice(b"hi\n");
+        let n = build_request(BUS_VERB_WRITE, 11, &body[..12], &mut req);
+        if n == GOLDEN_REQ_WRITE.len() && &req[..n] == GOLDEN_REQ_WRITE {
+            if let Ok(h) = frame_parse(&req[..n]) {
+                if h.kind == BUS_KIND_REQUEST
+                    && h.verb == BUS_VERB_WRITE
+                    && h.corr == 11
+                    && h.body_len == 12
+                    && request_validate(&h).is_ok()
+                    && write_body_parse(&req[BUS_HDR_LEN..n])
+                        == Ok((b"NOTE.TXT".as_slice(), b"hi\n".as_slice()))
+                {
+                    w |= 1 << 0;
+                }
+            }
+        }
+    }
+
+    // bit1: the frozen RM golden — reproduces byte-for-byte; body reuses the CAT name parser.
+    {
+        let mut req = [0u8; 128];
+        let n = build_request(BUS_VERB_RM, 12, b"NOTE.TXT", &mut req);
+        if n == GOLDEN_REQ_RM.len() && &req[..n] == GOLDEN_REQ_RM {
+            if let Ok(h) = frame_parse(&req[..n]) {
+                if h.verb == BUS_VERB_RM
+                    && h.corr == 12
+                    && cat_body_parse(&req[BUS_HDR_LEN..n]) == Ok(b"NOTE.TXT".as_slice())
+                {
+                    w |= 1 << 1;
+                }
+            }
+        }
+    }
+
+    // bit2: the frozen MV golden — reproduces byte-for-byte; body reuses the CP (src,dst) parser.
+    {
+        let mut req = [0u8; 128];
+        let mut body = [0u8; 32];
+        body[0] = 8;
+        body[1..9].copy_from_slice(b"NOTE.TXT");
+        body[9..17].copy_from_slice(b"DONE.TXT");
+        let n = build_request(BUS_VERB_MV, 13, &body[..17], &mut req);
+        if n == GOLDEN_REQ_MV.len() && &req[..n] == GOLDEN_REQ_MV {
+            if let Ok(h) = frame_parse(&req[..n]) {
+                if h.verb == BUS_VERB_MV
+                    && h.corr == 13
+                    && cp_body_parse(&req[BUS_HDR_LEN..n])
+                        == Ok((b"NOTE.TXT".as_slice(), b"DONE.TXT".as_slice()))
+                {
+                    w |= 1 << 2;
+                }
+            }
+        }
+    }
+
+    // bit3: an EMPTY-content write round-trips (a 0-byte create): body = [name_len][name], no tail.
+    {
+        let mut req = [0u8; 128];
+        let mut body = [0u8; 16];
+        body[0] = 7;
+        body[1..8].copy_from_slice(b"EMP.TXT");
+        let n = build_request(BUS_VERB_WRITE, 14, &body[..8], &mut req);
+        let ok = matches!(frame_parse(&req[..n]), Ok(h) if h.verb == BUS_VERB_WRITE)
+            && write_body_parse(&req[BUS_HDR_LEN..n]) == Ok((b"EMP.TXT".as_slice(), b"".as_slice()));
+        if ok {
+            w |= 1 << 3;
+        }
+    }
+
+    // bit4: fail-closed decoding of the new typed bodies — every malformed class refused BadBody.
+    {
+        let write_ok = write_body_parse(b"") == Err(BusDecodeErr::BadBody)   // empty body
+            && write_body_parse(&[0x00, b'A']) == Err(BusDecodeErr::BadBody) // name_len 0
+            && write_body_parse(&[0x0d, b'A']) == Err(BusDecodeErr::BadBody) // name_len > NAME_MAX
+            && write_body_parse(&[0x08, b'A', b'B']) == Err(BusDecodeErr::BadBody) // name overruns body
+            && write_body_parse(&[0x02, b'A', b' ', b'x']) == Err(BusDecodeErr::BadBody); // space in name
+        // rm reuses cat_body_parse, mv reuses cp_body_parse (their fail-closed classes are proven in
+        // BANDY-CODEC bit4); re-assert the shared parsers reject the obvious bus-rm/mv abuse here.
+        let rm_ok = cat_body_parse(b"") == Err(BusDecodeErr::BadBody)
+            && cat_body_parse(b"TOOLONGABCDEF") == Err(BusDecodeErr::BadBody);
+        let mv_ok = cp_body_parse(&[0x00, b'A', b'B']) == Err(BusDecodeErr::BadBody)
+            && cp_body_parse(&[0x02, b'A', b'B']) == Err(BusDecodeErr::BadBody); // no dst
+        // a request frame carrying an UNKNOWN verb (7) is Malformed at the header (additive gate).
+        let mut f = [0u8; 128];
+        let n = build_request(BUS_VERB_RM, 12, b"NOTE.TXT", &mut f);
+        f[6] = 7; // verb 7 is not valid
+        let bad_verb = frame_parse(&f[..n]) == Err(BusDecodeErr::Malformed);
+        if write_ok && rm_ok && mv_ok && bad_verb {
+            w |= 1 << 4;
+        }
+    }
+
+    // bit5: a WRITE with a max-length content round-trips at the frame ceiling (heap-staged — a
+    // 4 KiB+ array has no business on a kernel stack). name_len=8 -> content = ceiling − 9 bytes.
+    {
+        let mut frame = alloc::vec![0u8; BUS_FRAME_MAX];
+        let content_len = BUS_BODY_MAX - 1 - 8;
+        let mut body = alloc::vec![0u8; BUS_BODY_MAX];
+        body[0] = 8;
+        body[1..9].copy_from_slice(b"BIGGG.BI"); // a valid 8-byte printable 8.3 name
+        for (i, b) in body[9..9 + content_len].iter_mut().enumerate() {
+            *b = 0x30 + (i % 10) as u8;
+        }
+        let n = build_request(BUS_VERB_WRITE, 15, &body[..BUS_BODY_MAX], &mut frame);
+        let ok = n == BUS_FRAME_MAX
+            && matches!(frame_parse(&frame[..n]), Ok(h) if h.verb == BUS_VERB_WRITE && h.body_len as usize == BUS_BODY_MAX)
+            && matches!(write_body_parse(&frame[BUS_HDR_LEN..n]), Ok((name, content))
+                if name == b"BIGGG.BI" && content.len() == content_len);
+        if ok {
+            w |= 1 << 5;
+        }
+    }
+
+    const ALL: u32 = (1 << 6) - 1;
+    if w == ALL {
+        serial_println!(
+            ":: BANDY-CODEC2: write-side wire frozen (write/rm/mv request goldens, typed write [name_len][name][content] payload, empty + at-ceiling content, decode fail-closed) PASS [w={:#04x}] ::",
+            w
+        );
+    } else {
+        serial_println!(":: BANDY-CODEC2: FAIL — w={:#x}/{:#x} ::", w, ALL);
     }
 }

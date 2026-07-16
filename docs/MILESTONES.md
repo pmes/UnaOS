@@ -10,6 +10,42 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-pi4 track — 2026-07-16 (BANDY — the on-UnaOS SMessage bus + midden, program #3)
+
+### BANDY-2 — the write-side bus verbs (write/rm/mv), kernel fulfillment + ACL discipline 🔬 QEMU-green (metal rides the next attended sitting)
+
+**What it does.** ROADMAP §3b arc 2 — the bus verb set grows to the DESTRUCTIVE side: `write`
+(create-or-truncate a root file), `rm` (unlink), `mv` (rename in place). ADDITIVE to the frozen v1
+wire — new verb tags 4/5/6 + a typed `write` `[name_len][name][content]` payload; `rm` reuses the
+`cat` name body, `mv` the `cp` `(src,dst)` body — frozen by `BANDY-CODEC2` goldens from the first
+commit (the BANDY-1 goldens/witness left byte-identical). Fulfillment (`sys_msend_for` dispatch,
+`arch/aarch64/syscall.rs`) mirrors the direct syscall paths byte-for-byte under the invoker's
+stamped principal: `bus_write` = `sys_open(O_CREAT)+write` (create private-to-invoker, or an
+owner-only truncate = delete-recreate under the same owner); `bus_rm` = `sys_unlink` by name;
+`bus_mv` = the `fat.rs rename_entry` in-place twin. **The DESTRUCTIVE-verb ACL discipline
+(inherited from the K-line):** DELETE/RENAME/TRUNCATE are OWNER-only (`owned_unlink_permitted` — a
+content grantee can read/write but never destroy); the persisted native ACL row is cleared
+DURABLE-FIRST before the `0xE5` (fail toward PUBLIC, `-EIO` abort if the clear did not land — the
+K1-F2 re-adoption class); `mv` re-binds the persisted row's stored name after the rename (owner +
+grants preserved via `native_persist_rename`, or clears it on failure); native persist/clear runs
+OUTSIDE the NAMESPACE hold (K5B); a concurrent reader's chain is deferred-freed at its last close,
+never underneath a live open (`openfile_mark_pending_or_none_by_dir` — the U11 defer taken
+by-name). midden grows the same verbs (`MIDDEN.BIN` now 3860 B) — a write→cat→truncate→rm→mv EL0
+round-trip plus the extended denial equivalence.
+
+**How it was tested.** `check` both arches; `kernel8` clean; `kernel8-test` 35 s ×2 independent
+runs = **MBENCH PASS 41/41 required, 0 forbidden** with four new REQUIREd witnesses: `BANDY-CODEC2`
+(write/rm/mv request goldens + typed write payload, empty + at-ceiling content, fail-closed decode,
+`[w=0x3f]`), `BANDY-WR` (write→cat byte-exact, truncate→cat, rm→cat `-ENOENT`, mv→cat(new)
+byte-exact + cat(old) `-ENOENT`, at EL0 under midden's stamped principal), `BANDY-EQ2` (extended
+equivalence: rm/mv/write of a foreign-owned file denied-via-bus == denied-via-syscall, byte-same
+`-EACCES`, real EL0 legs), `BANDY-ACL` (the denied destructive verbs left the foreign owner row
+INTACT, no stolen name, write-side fixtures self-cleaned). midden's own witness `mw=0x3ff` (10
+bits). `test-arm` MISSION SUCCESS; zero x86 change (all in `arch/aarch64/` + `crates/user-blob`);
+host crates untouched. Honest scope: root-directory files only, write content ≤ 4 KiB (`-E2BIG`
+above), `mv` in-place rename (cross-dir move deferred), grantee in-place truncate deferred (needs a
+`fat.rs` shrink primitive). Commits on `hw-pi4`.
+
 ## aarch64 SMP — ORIN-SMP-6: the LAST-DIFFERENCES legs (`UNAOS_SMPPROBE=21..23`) — 2026-07-16 ⚡ BENCHED SAME DAY: legs 21+22 SURVIVED (**the REAL secondary path ran to online on Orin silicon — entry shape AND wake concurrency both INNOCENT**); leg 23 blocked by a NEW image-layout-correlated xHCI-carveout wall (own arc) `hw-jetson`
 
 **Attended sitting 2026-07-16 eve (Peter + LC-orin; serial `jetson-serial-2026-07-16-smp6sitting.log`,
