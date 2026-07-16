@@ -10,6 +10,43 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-rmbp track — 2026-07-16 (CLOCK-X1 — x86 wall-clock timebase: invariant-TSC `monotonic()`, the JD17 twin)
+
+### CLOCK-X1 — x86 invariant-TSC `monotonic()` (JD17 twin) 🔬 `hw-rmbp`
+
+**What it does:** JD17 (`f251439`) built the kernel wall clock — `setdate`-seeded, extended by the
+architecture's free-running counter, stamped onto FAT mtimes — but on x86_64 `clock::monotonic()`
+returned `None`, so a set clock stayed **frozen** at its seeded second and `uptime_secs()` was `None`.
+CLOCK-X1 supplies the x86 counter. `monotonic()` now returns `Some((rdtsc, tsc_hz))` gated on two
+honesty conditions, each returning `None` (frozen clock) when unmet: the **invariant-TSC** CPUID bit
+(leaf `0x8000_0007` EDX[8], `apic::tsc_invariant()` — never serve a frequency-drifting TSC as a clock;
+max-extended-leaf checked first) and a **calibrated frequency** (`apic::tsc_hz() != 0`). Ivy Bridge
+predates CPUID leaf `0x15`/`0x16`, so the rate is measured at boot by the existing `apic::calibrate`
+against the fixed-frequency ACPI PM timer — firmware-independent, bounded, no floating point, no new
+IRQ handler, stored once in a static; `monotonic()` itself is one CPUID + one atomic load + one `rdtsc`
+(cheap, lock-free — safe on the shell-verb/FAT-stamp hot paths). With the counter live the JD17
+machinery lights up on x86 unchanged: `uptime_secs()` is `Some`, `setdate`+`date` advance, `fat_stamp()`
+stamps real times once seeded. **Additive + honest:** the aarch64 branch, `fat.rs` stamp logic and the
+verbs are untouched. M1 boot trace `clock: TSC calibrated ~NNNN MHz (invariant | NOT invariant …)`; M3
+`syscall::clock_x1_witness()` is a bounded **uncounted** boot witness, silent where the clock is frozen.
+**M2 (the CFU-1 `wstage_write_at` rider) was HELD OUT** per the Maestro ruling — not in Peter's approved
+queue; may return as its own fold.
+
+**How it was tested:** 🔬 QEMU. `./arroyo check` both arches, **no new warnings, zero aarch64 diffs**.
+`test 25` MISSION SUCCESS with the M1 trace `clock: TSC calibrated ~2399 MHz (NOT invariant — wall clock
+stays frozen)`; `UNAOS_IRQSTORAGE=1 UNAOS_FATIMG=sf test 200` storage chain **0 FAIL**, S8-write witness
+OK; `test-arm 22` MISSION SUCCESS (0 FAIL, aarch64 clock untouched); `UNAOS_NOSTORAGE=1 test 90` clean
+(0 FAIL). **QEMU/TCG limitation:** TCG cannot advertise the invariant-TSC feature
+(`TCG doesn't support requested feature: CPUID[eax=80000007h].EDX.invtsc [bit 8]`, even under `-cpu max`
+or explicit `+invtsc`), so under `./arroyo test` the CPUID bit is clear, `monotonic()` returns `None`,
+and the **witness stays silent by design** — the honest behaviour. A throwaway, uncommitted
+force-invariant probe confirmed the witness fires and is correct:
+`:: CLOCK-X1: TSC invariant, ~2399 MHz; monotone (rdtsc +1896226904); uptime 6->7 s (JD17 x86-frozen clock now advances) == witness ::`
+(a full wall-second advance observed). **Metal verdict: PENDING** — the target 2012 rMBP (Ivy Bridge)
+advertises the invariant-TSC bit, so the witness-fires line is a **metal-bench** verdict (attended rMBP
+sitting: `setdate`→`date` advances, `uptime` runs, FAT mtimes stamp real times). Detail: §4 of
+`docs/dev/OS/01_BOOT_HAL/arch_x86_64.md`.
+
 ## hw-rmbp track — 2026-07-16 (PORTSW-1 — Panther Point EHCI→xHCI port switchover: internal kbd + trackpad)
 
 ### PORTSW-1 — Panther Point EHCI→xHCI port switchover 🔬 `hw-rmbp`
