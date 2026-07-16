@@ -4345,3 +4345,32 @@ secondaries (the shared `smp_virt.rs` path is byte-untouched — the arc only RE
 MISSION SUCCESS; knob-off `.text/.rodata/.data` bit-identical + the 1-byte `.data.rel.ro` note above; 2
 armed leg tars + the knob-off DEFAULT staged. The metal verdict is the attended Orin bench with LC-orin
 + Peter (runbook `scripts/orin-smp7-bench.md`).
+
+**⚡ CRCR+SMP-7 SITTING VERDICT (2026-07-16 attended, Peter + LC-orin; serial
+`~/unaos-bench/jetson-serial-2026-07-16-crcr-smp7-sitting.log`; 6 boots / DC-cut recoveries;
+media hash-verified on-stick per boot):**
+
+- **CRCR probe (crcrq-leg23, 2 boots): `CRR-before=0` both boots — the predicted value — AND the
+  boot FAULTED IN THE QUIESCE WINDOW BOTH TIMES, deterministically:** the fault (`…dc40`, same
+  SNOC/ACI signature) landed exactly between the `CRR-before` print and the re-seat confirmation
+  print, i.e. at the **CRCR write issued while RS=1** — the FIRST pre-JB9i fault ever observed,
+  2/2 reproducible. **MECHANISM NAMED: engaging the command-ring machinery on the running
+  inherited controller is the trigger** — a CRCR write (no command, no doorbell) suffices; the
+  historical JB9i-time faults were the DOORBELL engaging the same machinery two steps later.
+  Model: firmware leaves a controller-internal latch poisoned (or not) per boot; the first
+  command-machinery engagement fires the FillWrite to the fixed address. **The quiesce lever is
+  REFUTED as a fix in the strongest form — it fires the wall EARLIER.** Boot rule of thumb until
+  fixed: do not write CRCR at RS=1 on the inherit path. The command-ring bucket is CLOSED
+  (CRR-before=0 observed ×2); the target is controller-internal state engaged by command-ring
+  operations. Next step (proposal, not spawned): firmware/NVIDIA-erratum investigation of the
+  XUSB context-save/internal-latch behavior, and/or ordering levers that avoid RS=1 CRCR writes.
+- **SMP-7 leg 24 (post-takeover control): SURVIVED** (5/5 real-path cores + CAPSTONE; first boot
+  of the image was taken by the carveout wall pre-probe — retry cleared, wall data not SMP data).
+- **SMP-7 leg 25 (PRE-takeover wake): SURVIVED** — 5/5 real-path cores online BEFORE
+  `jb2b_attach` ever ran. **The position axis is exonerated end-to-end**; with legs 21-25 all
+  innocent, **SMP-3's residual trigger = IMAGE LAYOUT** (the XCARVE through-line). Next
+  experiment (proposal): relink the real `tegrasmp` image (the SMP-3 fault build) and re-bench.
+  Bonus datum: the wall then took that same boot at JB9i with 5 secondaries online — signature
+  unchanged (`…dc40`), the wall and live APs are independent.
+- Wall fault-rate tally on the new-layout images this sitting: crcrq-leg23 2/2 (both in-window at
+  the CRCR write), smpprobe24 1/2 (JB9i-time), smpprobe25 1/1 (JB9i-time, post-verdict).
