@@ -485,6 +485,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         unaos_kernel::arch::syscall::nmi_self_fire();
         unaos_kernel::arch::syscall::canonical_guard_selftest();
 
+        // CLOCK-X1 (M3): the x86 wall-clock timebase witness. Runs after `apic::calibrate` (step
+        // 4b''') so the invariant TSC is calibrated; silent if this machine has no invariant TSC.
+        unaos_kernel::arch::syscall::clock_x1_witness();
+
         // U1a: x86 ring-3 round-trip (the aarch64 M6a equivalent). Turn scheduling on (the default
         // test build never enables the feature-gated demo below, so the APs would otherwise idle in
         // `wait_and_run`), map the ring-3 window, then drop a scheduled task to ring 3 on an AP: it
