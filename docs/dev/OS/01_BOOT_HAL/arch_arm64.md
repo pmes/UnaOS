@@ -4034,8 +4034,18 @@ a value that FAILS the guard — exactly the bit-63 pointer we hunt — is still
 the FillWrite's pointer class — an inherited per-slot device-context pointer (the eviction's context
 write rides a poisoned firmware slot pointer), a scratchpad array/entry pointer, the inherited event
 ring (ERSTBA/ring base/ERDP — a `DISABLE_SLOT` completion writeback the controller latched pre-takeover),
-or CRCR (command ring). If NO dumped pointer carries the hi-half, the target is a controller-INTERNAL
-latched pointer no register exposes — itself a finding that steers the fix. Knob-off the whole census +
+or CRCR (command ring). **Two census-coverage caveats (review lens, fold before the sitting so a null
+Boot-1 result is read correctly):** (1) per xHCI 5.4.5 a CRCR *read* returns the Command Ring Pointer
+field as ZEROS (only status bits read back) — the `JBXC: CRCR=` line cannot surface an inherited
+command-ring pointer, so a command-ring culprit falls into the controller-internal bucket below, not a
+named `JBXC:` line; (2) the census reads each device context's SLOT context only — the endpoint
+contexts that follow it (and the transfer-ring dequeue pointers inside them) are NOT walked, so a
+poisoned TR/endpoint pointer would also surface only as a null census. If NO dumped pointer carries
+the hi-half, the target is a controller-INTERNAL latched pointer, an inherited command-ring pointer
+(unreadable via CRCR), or an unwalked endpoint-context/TR pointer — still a finding that steers the
+fix (the fix step should also widen the plausibility guard's lower bound to the DRAM base
+`0x8000_0000`, lens note 2a, so a sub-DRAM inherited value is never CPU-dereferenced into the MMIO
+aperture). Knob-off the whole census +
 its call site vanish (byte-identical; zero `JBXC` strings; proven by two default `esp-jetson` builds
 hashing equal).
 
