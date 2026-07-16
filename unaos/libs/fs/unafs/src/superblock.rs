@@ -50,6 +50,14 @@ pub const RECLAIM_INODE_ID: u64 = 4;
 /// First logical inode id handed to user objects.
 pub const FIRST_USER_INODE_ID: u64 = 5;
 
+/// Largest volume the v1 map structure addresses: the refcount-map index is
+/// ONE 4096 B block of leaf pointers (512 leaves × 1024 u32 counts/leaf =
+/// 524,288 blocks = 2 GiB). Enforced at format AND mount — a bigger volume is
+/// a clean [`SuperblockError::Geometry`], never a slice panic. Growing this is
+/// a second indirect level (a format change, its own KAT-recutting arc).
+pub const MAX_BLOCK_COUNT: u64 =
+    (BLOCK_SIZE / 8) * (BLOCK_SIZE / 4); // 512 leaf ptrs × 1024 refs/leaf
+
 #[derive(Error, Debug)]
 pub enum SuperblockError {
     #[error("Invalid magic number")]
@@ -148,6 +156,14 @@ impl Superblock {
         // Superblock (0) + root area (1) + at least one tree block.
         if self.block_count < 3 {
             return Err(SuperblockError::Geometry("volume too small"));
+        }
+        // The v1 map structure (one indirect level) addresses at most
+        // MAX_BLOCK_COUNT blocks; a bigger volume must fail HERE, cleanly —
+        // the commit path would otherwise run its refmap index off one block.
+        if self.block_count > MAX_BLOCK_COUNT {
+            return Err(SuperblockError::Geometry(
+                "volume exceeds the refcount-map structure (one indirect level)",
+            ));
         }
 
         // The reserved logical ids are format constants.

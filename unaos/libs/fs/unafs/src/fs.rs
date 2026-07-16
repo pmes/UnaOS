@@ -487,6 +487,13 @@ impl<D: BlockDevice> UnaFS<D> {
         //    pure function of the volume geometry, so it cannot change under
         //    us mid-step.
         let refmap_leaves = self.refmap.leaf_count();
+        // Belt-and-braces twin of the imap guard above (and of
+        // `Superblock::validate`'s MAX_BLOCK_COUNT bound, which rejects such
+        // geometry at format/mount): the index is ONE block of leaf
+        // pointers — never run it off the buffer, error cleanly.
+        if refmap_leaves > BLOCK_SIZE / 8 {
+            return Err(FileSystemError::NoSpace);
+        }
         let ref_index_block = self.alloc_block()?;
         let mut ref_leaf_blocks = Vec::with_capacity(refmap_leaves as usize);
         for _ in 0..refmap_leaves {
@@ -509,6 +516,15 @@ impl<D: BlockDevice> UnaFS<D> {
 
         // 4. Barrier: every fresh block must be on the medium before the
         //    root flip makes them reachable.
+        //
+        //    LOAD-BEARING CONTRACT (lens B, 2026-07-16): on the kernel path
+        //    `flush()` is a NO-OP — the ordering rests entirely on every
+        //    `write_block`/`write_sector` being SYNCHRONOUS-TO-MEDIUM (the
+        //    eMMC2 CMD24 busy-wait + CMD13 status check). This flush is
+        //    decorative there (and a real fsync on host FileDevice). Any
+        //    future write-cache, write-back, or DMA-queued storage path MUST
+        //    implement a real flush at its device seam, or commit ordering
+        //    (fresh blocks before the root flip) silently breaks.
         self.device.flush()?;
 
         // 5. The atomic point: ONE 512 B write to the INACTIVE slot.
@@ -524,6 +540,9 @@ impl<D: BlockDevice> UnaFS<D> {
         };
         let slot = self.active_slot.other();
         crate::root::write_slot(&mut self.device, slot, &new_root)?;
+        // Same contract as the pre-flip barrier above: decorative where every
+        // write is already synchronous-to-medium; MANDATORY-real on any
+        // future cached/queued device.
         self.device.flush()?;
 
         // 6. The new tree is the committed tree.

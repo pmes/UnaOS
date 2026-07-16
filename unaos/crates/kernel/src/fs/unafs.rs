@@ -123,6 +123,21 @@ impl SectorDevice for SdSectorDevice {
     fn sector_count(&self) -> u64 {
         self.sectors
     }
+
+    /// LOAD-BEARING CONTRACT (K8a commit ordering — lens B, 2026-07-16):
+    /// this flush is a deliberate NO-OP because every `write_sector` above is
+    /// SYNCHRONOUS-TO-MEDIUM — the emmc2 block layer busy-waits CMD24 program
+    /// completion and checks CMD13 status before returning, so by the time
+    /// the crate's commit calls `flush()` as its pre-root-flip "barrier",
+    /// every fresh block is already on the card. The CoW guarantee ("old tree
+    /// or new tree, never a hybrid") rests on exactly this property. If a
+    /// future storage path introduces a write cache, write-back queueing, or
+    /// DMA-deferred completion, this method MUST become a real drain/flush —
+    /// otherwise the root flip can reach the medium before the tree it points
+    /// at, and commit ordering silently breaks.
+    fn flush(&mut self) -> Result<(), SectorError> {
+        Ok(())
+    }
 }
 
 /// Why a UnaFS mount attempt failed.

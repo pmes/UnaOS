@@ -128,6 +128,33 @@ fn non_reserved_catalog_inode_id_refused() {
 }
 
 #[test]
+fn oversized_volume_fails_format_cleanly_not_panic() {
+    // Lens-A fix (2026-07-16): a volume past the one-indirect-level map
+    // structure (> MAX_BLOCK_COUNT blocks = 2 GiB) used to slice-panic in
+    // the FORMAT commit's refmap-index fill; it must be a clean Err at both
+    // seams. (`migrate` sizes its target from the source, so format must
+    // fail clean on any size.)
+    use unafs::superblock::MAX_BLOCK_COUNT;
+
+    // format(): sized purely by size_mb (empty device) — 4 GiB request.
+    let empty = MemDevice::new();
+    assert!(
+        UnaFS::format(empty, 4096).is_err(),
+        "format(4096 MB) must fail cleanly, not panic"
+    );
+
+    // The boundary itself is representable arithmetic: exactly MAX is valid
+    // geometry per validate(); one past it is refused.
+    assert!(Superblock::new(MAX_BLOCK_COUNT).validate().is_ok());
+    assert!(Superblock::new(MAX_BLOCK_COUNT + 1).validate().is_err());
+
+    // mount(): the same geometry planted in a superblock is refused too.
+    let dev = valid_volume();
+    let hostile = with_corrupt_sb(&dev, |sb| sb.block_count = MAX_BLOCK_COUNT + 1);
+    assert!(UnaFS::mount(hostile).is_err());
+}
+
+#[test]
 fn tiny_volume_refused() {
     let dev = valid_volume();
     let hostile = with_corrupt_sb(&dev, |sb| sb.block_count = 2);
