@@ -31,7 +31,12 @@ write is `SELECT |= (mask & mask)` — sets only advertised bits, clears none, n
 bit; a mask that reads 0 skips the write and reports (STOP tripwire). **Knob-gated, default-OFF:**
 compiled only under the `portsw` feature (`UNAOS_PORTSW=1`, mapped in `arroyo` + `builder/src/main.rs`);
 knob-off = zero config writes = byte-identical media. Additive to the enum/HID path; no
-`syscall.rs`/`fat.rs`/`sched.rs`, no aarch64.
+`syscall.rs`/`fat.rs`/`sched.rs`, no aarch64. **⚠ Corrected metal-baseline framing (review fold):** the
+predecessor routing (`89d10b1`) ran unconditionally, and every prior rMBP metal log shows
+`XUSB2PR 0xf->0xf` — so on metal **knob-ON reproduces the register state every prior bench ran** and
+**knob-OFF is the new, never-run topology** (the byte-identity/reproducibility claim is QEMU-only).
+The internals were invisible even *with* XUSB2PR=0xf (premise substantially falsified by existing metal);
+the cold-boot XUSB2PR value was never captured — both resolved at the sitting (see usb_xhci.md §7f).
 
 **How it was tested:** 🔬 QEMU (qemu-xhci 0x1b36 doesn't model Panther-Point routing — the flip is inert
 there by design; the gate proves knob-off identity + knob-on no-regression + the witness read-back).

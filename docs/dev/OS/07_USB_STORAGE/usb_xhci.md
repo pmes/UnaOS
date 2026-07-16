@@ -382,9 +382,24 @@ mid-transaction).
 
 **Knob-gated, default-OFF.** Compiled only under the `portsw` Cargo feature
 (`UNAOS_PORTSW=1`, mapped in both `arroyo` and `builder/src/main.rs`). Knob-off: the
-routing function does not exist, **zero config-space writes**, the current
-EHCI-internal / xHCI-external topology, byte-identical media — so every prior bench
-stays reproducible and the flip is an opt-in experiment.
+routing function does not exist, **zero config-space writes**, byte-identical media.
+
+**⚠ Corrected metal-baseline framing (review fold).** The predecessor routing code
+(`89d10b1`, 2026-06-24) ran **unconditionally** on every x86 build, and every prior
+rMBP metal bench log (2026-07-08 → 07-15, incl. the mouse and XENUM-1 sittings) shows
+`Intel xHCI port routing applied (dev 0x1e31): USB3_PSSEN 0x0000000f->0x0000000f
+XUSB2PR 0x0000000f->0x0000000f`. Therefore on rMBP **metal**: **knob-ON reproduces the
+register state every prior bench ran** (XUSB2PR forced 0xf), and **knob-OFF is the
+NEW, never-run topology** — the reproducibility claim holds for QEMU only. Two open
+facts for the bench: (1) the internals were invisible even *with* XUSB2PR=0xf, so the
+arc's central hypothesis is already substantially falsified by existing metal — if the
+internal HID sits outside mask 0xf, the mask-disciplined flip cannot route it; (2) the
+**cold-boot XUSB2PR value was never captured** (the old line printed mask + post-write
+only) — if Apple EFI does not itself route the switchable ports, a knob-off boot could
+drop the *external* storage/input the regression baseline rides on. A knob-off build
+prints nothing here (the function doesn't exist), so the cold value is captured as the
+knob-ON witness's `before` field on the first flip after a genuine cold boot (or after
+knob-off boots only, which issue no writes and so preserve it).
 
 **Witness** (uncounted): `:: PORTSW-1: XUSB2PR mask=0x.. routed 0x..->0x.. +
 USB3_PSSEN mask=0x.. 0x..->0x.. (knob-on) == witness ::`. The masks + before/after
