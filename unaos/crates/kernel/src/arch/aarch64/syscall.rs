@@ -8552,6 +8552,13 @@ pub fn u7_launcher(demo_cpu: usize) {
     // create/delete never perturbs K3-mount's exact-two-entries `ls`. Its own uncounted
     // `:: K4-write: … PASS ::` line; an honest skip on media without a unafs partition.
     crate::fs::unafs::k4_write_selftest();
+    // K8a: prove the copy-on-write commit discipline on the live card — root generation advances
+    // per mutation, a power cut before the root flip (the autocommit-off crash seam + a genuine
+    // remount) converges to the OLD tree, refcounts persist across a remount, and the commit-path
+    // bench counters (CNTPCT ticks + blocks written) are live. Runs AFTER k4_write_selftest,
+    // fully self-cleaning (its scratch file is created and deleted inside the witness). Its own
+    // uncounted `:: K8a-cow: … PASS ::` line; honest skip on media without a unafs partition.
+    crate::fs::unafs::k8a_cow_selftest();
     // K6: prove the U6 owner/grants ACL round-trips through the native unafs attribute volume (the
     // sidecar's successor) — forward+reverse codec, write+read+clear via the coherent mount. Runs
     // LAST, fully self-cleaning (leaves only the staged K3 fixtures). Its own uncounted

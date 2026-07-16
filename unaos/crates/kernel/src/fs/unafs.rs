@@ -24,28 +24,29 @@
 //! `fs::fat` — it builds on the generic block layer only — though today only
 //! the Pi 4 media carries a UnaFS partition.
 //!
-//! **BeFS-K4 (writable) — the coherence keystone.** `write_sector` now routes
-//! to [`crate::drivers::block::write_block`] (emmc2 CMD24, R1/CMD13-hardened),
+//! **BeFS-K4 (writable) — the coherence keystone.** `write_sector` routes to
+//! [`crate::drivers::block::write_block`] (emmc2 CMD24, R1/CMD13-hardened),
 //! so the mount is read-write. K3 mounted per call, which is safe only while
 //! the volume is immutable; writes make a per-call mount a COHERENCE HAZARD
-//! (two live mounts = two independent in-RAM allocation bitmaps + journal
-//! cursors, so a block one frees the other can re-hand-out → corruption).
-//! Every access — read AND write — therefore flows through the single,
-//! process-wide, IRQ-masked mount [`with_unafs`] (one authoritative in-RAM
-//! bitmap/journal, all operations serialized; modelled on the F3 `NAMESPACE`
-//! lock). Keeping one mount live also means a pure read never triggers the
-//! crate's `Drop`-time `sync_metadata` write-back, so reads stay genuinely
-//! read-only.
+//! (two live mounts = two independent in-RAM allocation maps, so a block one
+//! frees the other can re-hand-out → corruption). Every access — read AND
+//! write — therefore flows through the single, process-wide, IRQ-masked
+//! mount [`with_unafs`] (one authoritative in-RAM refcount/inode map, all
+//! operations serialized; modelled on the F3 `NAMESPACE` lock). Keeping one
+//! mount live also means a pure read never triggers any drop-time write-back,
+//! so reads stay genuinely read-only.
 //!
-//! **Torn-write scope (honest).** Crash safety comes from write ORDERING
-//! inside the `unafs` crate (new-extents-first, single-block metadata swap,
-//! free-last → a power cut LEAKS blocks, never dangles a reference), NOT from
-//! journal replay: the WAL is intent-logging only (dirty detection, no
-//! rollback). The "single-block swap is atomic" claim holds at the crate's
-//! 4096 B block granularity; the medium writes 512 B sectors, so one
-//! `write_block` is eight non-atomic `write_sector`s — a swap is truly atomic
-//! only when the live record fits the first 512 B sector. See
-//! `docs/SECURITY.md` §K4 for the full scope.
+//! **K8a — copy-on-write; the torn-write class is CLOSED BY FORMAT.** The
+//! crate's write path never overwrites a committed block: every mutation
+//! writes fresh blocks, then commits by flipping ONE 512 B root sector (A/B
+//! generation-stamped slots — `unafs::root`), which
+//! [`BlockAdapter::write_sector_in_block`] lowers to a single hardened
+//! `write_sector` on the medium. The pre-K8 4096↔512 atomicity gap (one
+//! `write_block` = eight non-atomic sector writes tearing a metadata swap)
+//! no longer has a load-bearing write to tear: a power cut anywhere yields
+//! the old committed tree or the new one, never a hybrid. The WAL is gone —
+//! there is no dirty-mount state. See `docs/SECURITY.md` §K4 (ledger entry
+//! RETIRED-PENDING-METAL by K8a) and the `K8a-cow` witness below.
 
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -602,13 +603,14 @@ const K4_PAYLOAD: &[u8] = b"K4 journaled write on native UnaFS -- durable across
 ///
 /// Sequence (7 bits):
 ///   bit0 create /K4TEST.TXT + write the payload;
-///   bit1 force a real remount (fresh in-RAM bitmap/journal, re-read from disk);
+///   bit1 force a real remount (fresh in-RAM maps, re-read from disk);
 ///   bit2 resolve + read back — exact bytes match (WRITE DURABILITY);
-///   bit3 delete it, then reset the (now-clean) journal head;
+///   bit3 delete it (one atomic CoW transaction);
 ///   bit4 remount again — the name no longer resolves (DELETE DURABILITY);
 ///   bit5 a missing nested path resolves to Err (negative path);
-///   bit6 the fresh mount reports a CLEAN journal and root `ls` is back to the
-///        staged fixtures (no K4TEST leak).
+///   bit6 the fresh mount is refcount-CONSISTENT (fsck clean — the K8
+///        successor of the old clean-journal check) and root `ls` is back to
+///        the staged fixtures (no K4TEST leak).
 ///
 /// On media without a unafs partition it skips, like `k3_mount_selftest`.
 pub fn k4_write_selftest() {
@@ -660,15 +662,11 @@ pub fn k4_write_selftest() {
         w |= 1 << 2;
     }
 
-    // bit3: delete the scratch file, then reset the (now-clean) journal head so
-    // the next mount's dirty-detection is unambiguously clean. `journal.reset`
-    // and `device` are disjoint fields, so the borrow splits cleanly.
+    // bit3: delete the scratch file — under K8a one atomic CoW transaction
+    // (catalog scrub + directory rewrite + block release, one root flip).
     let deleted = with_unafs(|fs| {
         let root = fs.superblock.root_inode;
-        if fs.unlink(root, K4_NAME).is_err() {
-            return false;
-        }
-        fs.journal.reset(&mut fs.device).is_ok()
+        fs.unlink(root, K4_NAME).is_ok()
     });
     if matches!(deleted, Ok(true)) {
         w |= 1 << 3;
@@ -688,15 +686,16 @@ pub fn k4_write_selftest() {
         w |= 1 << 5;
     }
 
-    // bit6: the fresh mount is CLEAN (balanced/reset journal) and the root is
-    // back to exactly the staged fixtures — no K4TEST leak.
+    // bit6: the fresh mount is refcount-CONSISTENT (a full reachability-vs-
+    // refcount fsck dry run — the K8 successor of the clean-journal check)
+    // and the root is back to exactly the staged fixtures — no K4TEST leak.
     let clean = with_unafs(|fs| {
-        let dirty = fs.journal.check_recovery(&mut fs.device).unwrap_or(true);
+        let consistent = fs.fsck(false).map(|r| r.is_clean()).unwrap_or(false);
         let no_leak = fs
             .ls(fs.superblock.root_inode)
             .map(|entries| entries.iter().all(|d| d.name != K4_NAME))
             .unwrap_or(false);
-        !dirty && no_leak
+        consistent && no_leak
     });
     if matches!(clean, Ok(true)) {
         w |= 1 << 6;
@@ -704,9 +703,176 @@ pub fn k4_write_selftest() {
 
     let verdict = if w == 0x7f { "PASS" } else { "FAIL" };
     serial_println!(
-        ":: K4-write: create+write {} + remount byte-verify + delete + remount + negative + clean-journal {} [w={:#04x}] ::",
+        ":: K4-write: create+write {} + remount byte-verify + delete + remount + negative + clean-tree {} [w={:#04x}] ::",
         K4_PATH,
         verdict,
         w
+    );
+}
+
+/// K8a scratch fixture: created, crash-simulated, re-created, deleted — the
+/// volume is left exactly as found (self-cleaning, K2 idiom).
+const K8_NAME: &str = "K8CUT.TXT";
+const K8_PATH: &str = "/K8CUT.TXT";
+const K8_PAYLOAD: &[u8] = b"K8a copy-on-write commit -- old tree or new tree, never a hybrid.\n";
+
+/// K8a-cow witness (uncounted): prove the copy-on-write commit discipline on
+/// the live kernel mount, benchmark-instrumented (CNTPCT ticks per commit +
+/// blocks written — the vaire ruling's before/after numbers).
+///
+/// Sequence (7 bits):
+///   bit0 a mutation ADVANCES the root generation (create scratch → gen+);
+///   bit1 CoW: the old tree stays intact until the flip — a mutation with
+///        autocommit OFF (fresh blocks written, root NEVER flipped) followed
+///        by a genuine remount lands on the OLD tree: the file is absent
+///        (POWER-CUT-MID-COMMIT CONVERGENCE, the crash-simulation seam);
+///   bit2 the post-"cut" volume is refcount-consistent (fsck clean);
+///   bit3 the same mutation WITH the commit is durable across a remount
+///        (byte-verified) — new tree wins once the root flips;
+///   bit4 REFCOUNT PERSISTENCE: after the remount the freshly loaded
+///        refcount map agrees with recomputed reachability (fsck clean on
+///        the persisted map);
+///   bit5 delete + remount: gone, consistent, no leak (self-cleaning);
+///   bit6 commit stats live: commits > 0 and blocks-written > 0 recorded.
+///
+/// Skips honestly on media without a unafs partition.
+///
+/// Tick source: `CNTPCT_EL0` on aarch64; 0 on other arches (the witness is
+/// only chained on the Pi, but this module compiles on both — zero x86
+/// behavior change).
+fn bench_ticks() -> u64 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        crate::arch::timer::cntpct()
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        0
+    }
+}
+
+pub fn k8a_cow_selftest() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    if let Err(e) = locate() {
+        serial_println!(":: K8a-cow: no unafs volume ({:?}) — skipped ::", e);
+        return;
+    }
+
+    let mut w = 0u32;
+    let t0 = bench_ticks();
+
+    // bit0: generation advances on a committed mutation.
+    let gen_adv = with_unafs(|fs| {
+        let root = fs.superblock.root_inode;
+        let _ = fs.unlink(root, K8_NAME); // clear stale scratch (idempotent)
+        let g0 = fs.root_generation();
+        match fs.create_file(root, String::from(K8_NAME)) {
+            Ok(_) => fs.root_generation() > g0,
+            Err(_) => false,
+        }
+    });
+    if matches!(gen_adv, Ok(true)) {
+        w |= 1 << 0;
+    }
+    // Remove the committed scratch again so the crash-sim leg starts clean.
+    let _ = with_unafs(|fs| {
+        let root = fs.superblock.root_inode;
+        let _ = fs.unlink(root, K8_NAME);
+    });
+
+    // bit1: the crash-simulation seam — mutate with autocommit OFF (fresh
+    // blocks written to the medium, the root sector NEVER flipped), then a
+    // genuine remount. The next mount must land on the OLD tree: the file
+    // absent, nothing torn. This is a power cut between the data writes and
+    // the root flip, exercised on the real block device.
+    let _ = with_unafs(|fs| {
+        fs.set_autocommit(false);
+        let root = fs.superblock.root_inode;
+        if let Ok(id) = fs.create_file(root, String::from(K8_NAME)) {
+            let _ = fs.write_data(id, 0, K8_PAYLOAD);
+        }
+        // Deliberately NO commit: drop the mount state via force_remount.
+    });
+    force_remount();
+    let old_tree = with_unafs(|fs| fs.resolve_path(K8_PATH).is_err());
+    if matches!(old_tree, Ok(true)) {
+        w |= 1 << 1;
+    }
+
+    // bit2: the post-"cut" volume is internally consistent.
+    let consistent = with_unafs(|fs| fs.fsck(false).map(|r| r.is_clean()).unwrap_or(false));
+    if matches!(consistent, Ok(true)) {
+        w |= 1 << 2;
+    }
+
+    // bit3: the same mutation, committed, survives a remount byte-for-byte.
+    let created = with_unafs(|fs| {
+        let root = fs.superblock.root_inode;
+        match fs.create_file(root, String::from(K8_NAME)) {
+            Ok(id) => fs.write_data(id, 0, K8_PAYLOAD).is_ok(),
+            Err(_) => false,
+        }
+    });
+    force_remount();
+    let durable = with_unafs(|fs| match fs.resolve_path(K8_PATH) {
+        Ok(id) => match (fs.read_inode(id), fs.read_data(id, 0, K8_PAYLOAD.len() as u64)) {
+            (Ok(inode), Ok(data)) => inode.size == K8_PAYLOAD.len() as u64 && data == K8_PAYLOAD,
+            _ => false,
+        },
+        Err(_) => false,
+    });
+    if matches!(created, Ok(true)) && matches!(durable, Ok(true)) {
+        w |= 1 << 3;
+    }
+
+    // bit4: refcount persistence — the map the remount just loaded from disk
+    // agrees with recomputed reachability.
+    let refs_persist = with_unafs(|fs| fs.fsck(false).map(|r| r.is_clean()).unwrap_or(false));
+    if matches!(refs_persist, Ok(true)) {
+        w |= 1 << 4;
+    }
+
+    // bit5: self-clean — delete, remount, gone + consistent + no leak.
+    // Capture the commit counters HERE, from the mount instance that did the
+    // work (stats are per-instance; the remount below starts a fresh one).
+    let stats = with_unafs(|fs| {
+        let root = fs.superblock.root_inode;
+        let _ = fs.unlink(root, K8_NAME);
+        fs.commit_stats()
+    })
+    .unwrap_or_default();
+    force_remount();
+    let cleaned = with_unafs(|fs| {
+        fs.resolve_path(K8_PATH).is_err()
+            && fs.fsck(false).map(|r| r.is_clean()).unwrap_or(false)
+            && fs
+                .ls(fs.superblock.root_inode)
+                .map(|es| es.iter().all(|d| d.name != K8_NAME))
+                .unwrap_or(false)
+    });
+    if matches!(cleaned, Ok(true)) {
+        w |= 1 << 5;
+    }
+
+    // bit6 + the bench numbers (vaire ruling): CNTPCT ticks across the whole
+    // witness and the crate's commit counters captured above.
+    let ticks = bench_ticks().wrapping_sub(t0);
+    if stats.commits > 0 && stats.blocks_written > 0 {
+        w |= 1 << 6;
+    }
+
+    let verdict = if w == 0x7f { "PASS" } else { "FAIL" };
+    serial_println!(
+        ":: K8a-cow: CoW commit (gen-advance) + power-cut-mid-commit converges to OLD tree + refcounts persist + self-clean {} [w={:#04x}] bench: commits={} blocks={} last={} ticks={} ::",
+        verdict,
+        w,
+        stats.commits,
+        stats.blocks_written,
+        stats.last_commit_blocks,
+        ticks
     );
 }

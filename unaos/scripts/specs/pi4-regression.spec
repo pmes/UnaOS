@@ -64,12 +64,21 @@ REQUIRE K3-revoke:.*durable-first PASS
 # --- x5 boots, kernel 1ccd00c) -> promoted to a hard REQUIRE at that capture. ------------------
 REQUIRE K3-mount:.*byte-verified PASS
 
-# --- UNAFS-K4 journaled kernel-write witness (uncounted): create + write a scratch file through the
-# --- single coherent mount, force a genuine remount, byte-verify the durable write, delete it, remount
-# --- (delete durable), negative path, clean journal. Self-cleaning (leaves only the staged K3 fixtures).
+# --- UNAFS-K4 kernel-write witness (uncounted): create + write a scratch file through the single
+# --- coherent mount, force a genuine remount, byte-verify the durable write, delete it, remount
+# --- (delete durable), negative path, refcount-consistent tree (the K8a CoW successor of the old
+# --- clean-journal bit — the WAL is gone). Self-cleaning (leaves only the staged K3 fixtures).
 # --- QEMU-proven via if=sd write-back; the metal write->power-cycle->boot-2 byte-verify rides Peter's bench.
-REQUIRE K4-write:.*clean-journal PASS
+REQUIRE K4-write:.*clean-tree PASS
 FORBID K4-write:.*FAIL
+
+# --- UNAFS-K8a copy-on-write witness (uncounted): root generation advances per mutation; a power
+# --- cut before the 512 B root flip (autocommit-off crash seam + genuine remount) converges to the
+# --- OLD tree; refcounts persist across a remount; commit-path bench counters (CNTPCT ticks +
+# --- blocks written) live. Self-cleaning. QEMU-proven via if=sd write-back; metal rides the
+# --- attended sitting (incl. the pre-K8 card migration).
+REQUIRE K8a-cow:.*PASS
+FORBID K8a-cow:.*FAIL
 
 # --- K4-ready native-attr projection codec witness (uncounted). Pure in-RAM codec/selftest
 # --- (runs every boot, no card needed) — METAL-CONFIRMED present 2026-07-12, now REQUIRE. -----
