@@ -116,6 +116,21 @@ tegrasmp = ["tegra"]
 # esp-jetson`. See arch_arm64.md §JETSON-XCARVE and scripts/orin-xcarve-bench.md.
 xcarve = ["tegra"]
 
+# JETSON-XCARVE FIX M2: the `UNAOS_XCARVE_SCRUB=1` aimed neutralization
+# (arch/aarch64/xusb_tegra.rs::jbxc_scrub_inherited), fired at the top of `jb2b_attach` just after
+# the census, BEFORE the no-HCRST takeover and BEFORE JB9i's DISABLE_SLOT drain. It walks the same
+# inherited DRAM structures the census walks (firmware DCBAA, scratchpad array, endpoint-context TR
+# dequeue pointers) and rewrites ONLY the values that fail the plausibility test — bit-63 set, or
+# outside the DRAM window [0x8000_0000, 0x2_8000_0000) — so the carveout wall (fault ADDR
+# 0x800000027767dc80 at JB9i) has no poisoned pointer to ride. Never rewrites a sane pointer; never
+# touches the Falcon (no HCRST, no CSB). If nothing is poisoned it is a no-op (which discriminates
+# the controller-internal ambiguity bucket). Tegra-only at runtime; with this feature OFF (default)
+# the scrub + its call site vanish and the tegra image is byte-identical to baseline (zero
+# `JBXC-SCRUB` strings). Enable via `UNAOS_XCARVE_SCRUB=1 UNAOS_TEGRA=1 ./arroyo esp-jetson`
+# (combine with `UNAOS_XCARVE=1` to see the census + scrub together). See arch_arm64.md
+# §JETSON-XCARVE and scripts/orin-xcarve-bench.md.
+xcarve_scrub = ["tegra"]
+
 # JETSON-XCARVE M1: the `UNAOS_XCARVE_RELINK=1` relink-experiment pad — a `#[used]` read-only pad
 # static (arch/aarch64/xusb_tegra.rs) that trivially perturbs the image's section/symbol layout and
 # load extent with ZERO semantic change (the pad is never read). Rebuilding the layout-correlated

@@ -824,15 +824,36 @@ pub fn jb9e_low_ring_probe() {
 // can see which one carries a bit-63 / >DRAM value that a DISABLE_SLOT-driven write could ride to
 // 0x800000027767dc80. Pure CPU reads of identity-mapped, dead-but-intact post-EBS RAM (the same
 // class JB9f already dereferences) — the fault is a controller DMA WRITE, never a CPU load, so
-// reading is safe. Every dereference is plausibility-guarded (nonzero, < 1<<40, aligned); a raw
-// value that FAILS the guard is still PRINTED (that is exactly the bit-63 pointer we are hunting)
-// but never dereferenced. Stable `JBXC:` prefix, raw 64-bit hex, so boots diff cleanly.
-#[cfg(feature = "xcarve")]
+// reading is safe. Every dereference is plausibility-guarded ([0x8000_0000, 0x2_8000_0000), the
+// DRAM aperture — see jbxc_plausible); a raw value that FAILS the guard is still PRINTED (that is
+// exactly the bit-63 pointer we are hunting) but never dereferenced. Stable `JBXC:` prefix, raw
+// 64-bit hex, so boots diff cleanly. Census v2 also walks each Configured slot's ENDPOINT CONTEXTS
+// (EP state / type / TR dequeue pointer) — the class the diagnosis sitting left ambiguous.
+// JETSON-XCARVE FIX (census v2 + scrub): the plausibility window is the Orin DRAM aperture proper.
+// Lower bound WIDENED to the DRAM base 0x8000_0000 (lens note 2a): a sub-DRAM inherited value must
+// never be CPU-dereferenced into the MMIO aperture below DRAM — print it raw, never chase or scrub-
+// through it. Upper bound is the real DRAM top 0x2_8000_0000 (8 GiB window), tighter than the old
+// 40-bit ceiling and identical to the scrub's poison test so census and scrub agree exactly.
+#[cfg(any(feature = "xcarve", feature = "xcarve_scrub"))]
+const JBXC_DRAM_BASE: u64 = 0x8000_0000;
+#[cfg(any(feature = "xcarve", feature = "xcarve_scrub"))]
+const JBXC_DRAM_TOP: u64 = 0x2_8000_0000;
+
+#[cfg(any(feature = "xcarve", feature = "xcarve_scrub"))]
 fn jbxc_plausible(a: u64) -> bool {
-    // Orin DRAM is [0x8000_0000, 0x2_8000_0000) (8 GiB). A firmware structure lives in former-EBS
-    // RAM inside that window; anything with bit 63 set, above 40 bits, or null is NOT a walkable
-    // pointer — print it raw, never chase it.
-    a != 0 && a < (1u64 << 40)
+    // A firmware structure lives in former-EBS RAM inside [0x8000_0000, 0x2_8000_0000); anything
+    // with bit 63 set, above the DRAM top, or below the DRAM base is NOT a walkable pointer —
+    // print it raw, never chase it, and (in the scrub) neutralize it.
+    a >= JBXC_DRAM_BASE && a < JBXC_DRAM_TOP
+}
+
+// The controller's actual device-context / input-context stride: 64 bytes when CSZ (HCCPARAMS1
+// bit 2) is set, else 32. A wrong stride mis-addresses EVERY endpoint context past the slot
+// context, so both the census walk and the scrub read it from the live controller.
+#[cfg(any(feature = "xcarve", feature = "xcarve_scrub"))]
+fn jbxc_ctx_size() -> u64 {
+    let hccp1 = unsafe { core::ptr::read_volatile((XUSB_HOST + 0x10) as *const u32) };
+    if (hccp1 >> 2) & 1 == 1 { 64 } else { 32 }
 }
 
 #[cfg(feature = "xcarve")]
@@ -844,6 +865,7 @@ pub fn jbxc_inherited_dump(cap0: u32) {
     let hcs1 = r32(XUSB_HOST + 0x04);
     let hcs2 = r32(XUSB_HOST + 0x08);
     let maxslots = (hcs1 & 0xff) as u64;
+    let ctx_size = jbxc_ctx_size(); // 32 or 64 — the real endpoint-context stride (CSZ)
     // Max Scratchpad Buffers: HCSPARAMS2 hi = bits[25:21], lo = bits[31:27] (xHCI 5.3.4).
     let scratch_ct = (((hcs2 >> 21) & 0x1f) << 5) | ((hcs2 >> 27) & 0x1f);
     let op = XUSB_HOST + caplen;
@@ -908,14 +930,32 @@ pub fn jbxc_inherited_dump(cap0: u32) {
             }
             if jbxc_plausible(dcp & !0x3f) {
                 // Slot Context is the FIRST context in the device context: dword0 + dword3, with
-                // Slot State = dword3[31:27] (xHCI 6.2.2). Read both raw.
+                // Slot State = dword3[31:27] and Context Entries = dword0[31:27] = the last valid
+                // endpoint DCI (xHCI 6.2.2). Read both raw.
                 let sc = dcp & !0x3f;
                 let d0 = r32(sc);
                 let d3 = r32(sc + 0x0c);
+                let ctx_entries = (d0 >> 27) & 0x1f; // last valid endpoint index (DCI)
                 serial_println!(
-                    "JBXC: DCBAA[{}] devctx={:#018x}  slotctx d0={:#010x} d3={:#010x} (slot_state={})",
-                    slot, dcp, d0, d3, (d3 >> 27) & 0x1f
+                    "JBXC: DCBAA[{}] devctx={:#018x}  slotctx d0={:#010x} d3={:#010x} (slot_state={} ctx_entries={})",
+                    slot, dcp, d0, d3, (d3 >> 27) & 0x1f, ctx_entries
                 );
+                // Census v2: walk this slot's ENDPOINT CONTEXTS — the unwalked class the sitting
+                // left ambiguous. Endpoint context for DCI k sits at base + k*ctx_size (the slot
+                // context is DCI 0). EP State = EP-ctx dword0[2:0], EP Type = dword1[5:3], and the
+                // TR Dequeue Pointer is the raw 64-bit at ep-ctx offset 0x08 (bit0 = DCS). A
+                // poisoned TR dequeue pointer would surface HERE, not in the slot context.
+                for dci in 1..=ctx_entries as u64 {
+                    let ep = sc + dci * ctx_size;
+                    let e0 = r32(ep);
+                    let e1 = r32(ep + 0x04);
+                    let trdp = r64(ep + 0x08);
+                    serial_println!(
+                        "JBXC:   ep[dci={}] state={} type={} TRDeq={:#018x}{}",
+                        dci, e0 & 0x7, (e1 >> 3) & 0x7, trdp,
+                        if jbxc_plausible(trdp & !0xf) { "" } else { " <-- IMPLAUSIBLE (bit-63/out-of-DRAM)" }
+                    );
+                }
             } else {
                 serial_println!("JBXC: DCBAA[{}] devctx={:#018x} — not walkable (guard)", slot, dcp);
             }
@@ -927,6 +967,126 @@ pub fn jbxc_inherited_dump(cap0: u32) {
         serial_println!("JBXC: DCBAA base {:#018x} — not walkable (guard)", dcbaa);
     }
     serial_println!("JBXC: inherited-pointer dump complete (pre-takeover, pre-JB9i)");
+}
+
+// ---------------------------------------------------------------------------------------------
+// JETSON-XCARVE FIX M2: the least-mutating neutralization (`UNAOS_XCARVE_SCRUB=1`).
+//
+// The census (v2) records exactly what the firmware left in DRAM. The scrub walks the SAME
+// inherited structures BEFORE the no-HCRST takeover reprograms the controller (so it reads the
+// firmware's live DCBAAP/ERST from the op/runtime registers, not our replacements) and, for each
+// pointer that FAILS the plausibility test — bit-63 set, or outside [0x8000_0000, 0x2_8000_0000) —
+// writes the provably-poisoned value out of harm's way so the JB9i DISABLE_SLOT drain has no
+// carveout target to ride. It is aimable WITHOUT naming the culprit class in advance: it fires
+// ONLY on provably-invalid values (rule a: a sane pointer is NEVER rewritten), every write prints
+// a `JBXC-SCRUB:` line with the old raw value (rule b), and if nothing is poisoned it is a no-op
+// and says so (rule c). It touches ONLY DRAM structures — DCBAA entries, the scratchpad array, and
+// endpoint-context TR dequeue pointers — never the Falcon: no HCRST, no CSB, no controller-control
+// register writes (rule d). DISCLOSURE: if the poison is controller-INTERNAL (nothing visible in
+// these DRAM structures), the scrub no-ops and the wall persists — that outcome DISCRIMINATES the
+// last ambiguity bucket (a valid bench result, not a failed arc).
+#[cfg(feature = "xcarve_scrub")]
+pub fn jbxc_scrub_inherited(cap0: u32) {
+    let r32 = |a: u64| unsafe { core::ptr::read_volatile(a as *const u32) };
+    let r64 = |a: u64| unsafe { core::ptr::read_volatile(a as *const u64) };
+    let w64 = |a: u64, v: u64| unsafe { core::ptr::write_volatile(a as *mut u64, v) };
+
+    let caplen = (cap0 & 0xff) as u64;
+    let hcs1 = r32(XUSB_HOST + 0x04);
+    let hcs2 = r32(XUSB_HOST + 0x08);
+    let maxslots = (hcs1 & 0xff) as u64;
+    let scratch_ct = (((hcs2 >> 21) & 0x1f) << 5) | ((hcs2 >> 27) & 0x1f);
+    let ctx_size = jbxc_ctx_size();
+    let op = XUSB_HOST + caplen;
+    let dcbaap = r64(op + 0x30);
+
+    // A pointer with any low tag/alignment bits masked off is poisoned if it fails the DRAM-window
+    // plausibility test. NULL is not "poisoned" (an unused/empty slot) — leave zeros alone.
+    let poisoned = |raw: u64, mask: u64| -> bool {
+        let p = raw & !mask;
+        raw != 0 && !jbxc_plausible(p)
+    };
+
+    let mut scrubbed = 0u32;
+
+    // The firmware DCBAA (read from the INHERITED DCBAAP register, pre-takeover). If the base
+    // itself is poisoned we cannot safely walk it — record and stop (never dereference a bad base).
+    let dcbaa = dcbaap & !0x3f;
+    if !jbxc_plausible(dcbaa) {
+        serial_println!(
+            "JBXC-SCRUB: inherited DCBAA base {:#018x} not in DRAM window — cannot walk; no DRAM structure to scrub",
+            dcbaa
+        );
+        serial_println!("JBXC-SCRUB: complete — 0 value(s) neutralized (base unwalkable)");
+        return;
+    }
+
+    // DCBAA[0] = scratchpad buffer array pointer. If poisoned, zero the DCBAA[0] entry (the
+    // scratchpad array is unused after takeover; a poisoned array pointer must not be reachable).
+    let sp_array = r64(dcbaa);
+    if poisoned(sp_array, 0x3f) {
+        serial_println!("JBXC-SCRUB: DCBAA[0] scratchpad_array poisoned old={:#018x} -> 0 @{:#018x}", sp_array, dcbaa);
+        w64(dcbaa, 0);
+        scrubbed += 1;
+    } else if jbxc_plausible(sp_array & !0x3f) && scratch_ct != 0 && scratch_ct <= 64 {
+        // Walk the scratchpad page array; zero any poisoned page pointer in place.
+        let base = sp_array & !0x3f;
+        for i in 0..scratch_ct as u64 {
+            let e = base + i * 8;
+            let p = r64(e);
+            if poisoned(p, 0xfff) {
+                serial_println!("JBXC-SCRUB: scratchpad[{}] poisoned old={:#018x} -> 0 @{:#018x}", i, p, e);
+                w64(e, 0);
+                scrubbed += 1;
+            }
+        }
+    }
+
+    // Per-slot device-context pointers and their endpoint-context TR dequeue pointers.
+    let n = maxslots.min(64);
+    for slot in 1..=n {
+        let e = dcbaa + slot * 8;
+        let dcp = r64(e);
+        if dcp == 0 {
+            continue; // empty slot — nothing to neutralize
+        }
+        if poisoned(dcp, 0x3f) {
+            // A poisoned device-context pointer: zero the DCBAA slot entry so the DISABLE_SLOT
+            // drain has no poisoned context pointer to write through. (We do not walk endpoint
+            // contexts off a bad base.)
+            serial_println!("JBXC-SCRUB: DCBAA[{}] devctx poisoned old={:#018x} -> 0 @{:#018x}", slot, dcp, e);
+            w64(e, 0);
+            scrubbed += 1;
+            continue;
+        }
+        // Sane device-context base: walk its endpoint contexts and clamp any poisoned TR dequeue
+        // pointer. Context Entries = slot-context dword0[31:27] = last valid DCI.
+        let sc = dcp & !0x3f;
+        let ctx_entries = (r32(sc) >> 27) & 0x1f;
+        for dci in 1..=ctx_entries as u64 {
+            let ep = sc + dci * ctx_size;
+            let trdp_a = ep + 0x08;
+            let trdp = r64(trdp_a);
+            if poisoned(trdp, 0xf) {
+                // Zero the whole TR dequeue qword (pointer + DCS): a neutralized dequeue pointer
+                // has no carveout target; this endpoint is being torn down by the eviction anyway.
+                serial_println!(
+                    "JBXC-SCRUB: DCBAA[{}] ep[dci={}] TRDeq poisoned old={:#018x} -> 0 @{:#018x}",
+                    slot, dci, trdp, trdp_a
+                );
+                w64(trdp_a, 0);
+                scrubbed += 1;
+            }
+        }
+    }
+
+    if scrubbed == 0 {
+        serial_println!(
+            "JBXC-SCRUB: no poisoned inherited DRAM value found — no-op (poison is controller-internal or unreachable; wall will persist)"
+        );
+    } else {
+        serial_println!("JBXC-SCRUB: complete — {} value(s) neutralized pre-JB9i", scrubbed);
+    }
 }
 
 /// `jb9_smmu` = (NISO1 SMMU instance bases, XUSB SID) — threaded in by the caller so the JB9-B
@@ -966,6 +1126,14 @@ pub fn jb2b_attach(
     // pointers. Knob-off (`xcarve` feature absent) this whole call vanishes (byte-identical).
     #[cfg(feature = "xcarve")]
     jbxc_inherited_dump(cap0);
+
+    // JETSON-XCARVE FIX M2: the aimed neutralization. Runs pre-takeover (so it reads the firmware's
+    // live inherited DCBAAP/structures) and pre-JB9i (so the DISABLE_SLOT drain finds no poisoned
+    // pointer). Only rewrites values that FAIL the plausibility test — never a sane pointer — and
+    // touches DRAM structures only, never the Falcon. Knob-off (`xcarve_scrub` absent) the whole
+    // call vanishes (byte-identical; zero `JBXC-SCRUB` strings).
+    #[cfg(feature = "xcarve_scrub")]
+    jbxc_scrub_inherited(cap0);
 
     // The exact sequence the PCIe paths run (arch/aarch64/pci.rs), minus discovery/bus-master —
     // a platform controller has no config space; DMA mastering came with the BPMP ungate.

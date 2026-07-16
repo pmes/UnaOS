@@ -83,6 +83,13 @@ _feats=""
 # Default OFF; when unset the probe + call site vanish and the tegra image is byte-identical to
 # baseline (zero `JBXC` strings knob-off). See arch_arm64.md §JETSON-XCARVE.
 [ -n "${UNAOS_XCARVE:-}" ] && _feats="${_feats}xcarve,tegra,"
+# JETSON-XCARVE FIX M2: UNAOS_XCARVE_SCRUB=1 arms the aimed neutralization
+# (arch/aarch64/xusb_tegra.rs::jbxc_scrub_inherited), fired pre-takeover/pre-JB9i: it rewrites ONLY
+# the inherited DRAM pointers that fail the plausibility test (bit-63 / out-of-DRAM-window), never a
+# sane pointer, never the Falcon. The `xcarve_scrub` feature implies `tegra`. Default OFF; when
+# unset the scrub + call site vanish, byte-identical to baseline (zero `JBXC-SCRUB` strings).
+# Combine with UNAOS_XCARVE=1 to emit the census + scrub together. See arch_arm64.md §JETSON-XCARVE.
+[ -n "${UNAOS_XCARVE_SCRUB:-}" ] && _feats="${_feats}xcarve_scrub,tegra,"
 # JETSON-XCARVE M1: UNAOS_XCARVE_RELINK=1 arms the relink-experiment pad (a `#[used]` inert
 # read-only pad static that perturbs image layout with ZERO semantic change). Rebuilds the
 # layout-correlated leg-23 image with a different layout to test the carveout's layout correlation.

@@ -81,3 +81,49 @@ Hand the serial log to LC-orin. The `JBXC:` census + the relink verdict together
 which inherited pointer class carries `0x800000027767dc80`, and whether shifting our image's layout
 moves us off the carveout. That pair is the input to the (separate, reviewed) fix step — see
 §JETSON-XCARVE "Proposed fix direction".
+
+---
+
+## FIX-arc sitting — census v2 (endpoint contexts) + aimed scrub (attended; pre-registered)
+
+The diagnosis sitting's NULL census left the target three-way ambiguous; the FIX arc walks the unwalked
+endpoint-context / TR class AND tries an aimed DRAM-structure scrub. New images (hash-verify each on-stick
+before boot; `tegra:` count/hash, never size; scrub images carry `JBXC-SCRUB` strings, census `JBXC`):
+
+| tag | knobs | what it is |
+|---|---|---|
+| **censusv2** | `UNAOS_XCARVE=1 UNAOS_TEGRA=1` | default layout + census **v2** — endpoint contexts (EP state/type/TRDeq) now walked |
+| **censusv2-scrub** | `UNAOS_XCARVE=1 UNAOS_XCARVE_SCRUB=1 UNAOS_TEGRA=1` | census v2 + the aimed neutralization (`JBXC-SCRUB:` lines) |
+| **censusv2-scrub-leg23** | `UNAOS_XCARVE=1 UNAOS_XCARVE_SCRUB=1 UNAOS_SMPPROBE=23 UNAOS_TEGRA=1` | the historically 4/4-faulting leg-23 layout, census+scrub — the best scrub testbed |
+| **knoboff-default** | `UNAOS_TEGRA=1` | byte-identical-to-baseline control (knob-off restore) |
+
+### Boot A — censusv2 image (name/exonerate the TR class)
+**Pre-registered prediction:** the `JBXC:` block now includes, under each Configured slot, `JBXC:   ep[dci=k]
+state=… type=… TRDeq=…` lines for that slot's endpoint contexts. Even on a FAULTING boot the census prints
+pre-eviction. If ANY `TRDeq` carries hi-half `0x80000000` / is flagged `IMPLAUSIBLE`, the FillWrite target
+is a **transfer-ring dequeue pointer** — the class the diagnosis could not see (named at last). If every
+TRDeq is sane in-DRAM, the TR arm is EXONERATED and the target is controller-internal or the (CRCR-unreadable)
+command ring. Capture every `JBXC:` line.
+
+### Boot B — censusv2-scrub-leg23 image, ×2 boots (the prediction FORK)
+**Pre-registered prediction (the decisive fork):**
+- **poison FOUND + scrubbed + no fault** ⇒ **FIXED.** A `JBXC-SCRUB:` line names the exact poisoned
+  structure (DCBAA slot / scratchpad / TRDeq), then the boot passes JB9i cleanly where the old leg-23
+  layout faulted 4/4 (and, with `SMPPROBE=23`, runs on to `CORE_READY[1..5]` + CAPSTONE). Re-boot to
+  confirm the scrub is stable.
+- **nothing poisoned (`JBXC-SCRUB: … no-op`) + fault at JB9i** ⇒ **controller-internal / command-ring
+  CONFIRMED.** The poison is not in any DRAM structure the scrub can reach; the wall persists. This is a
+  VALID discriminating result — it eliminates the endpoint/TR + scratchpad + DCBAA arms and steers the
+  follow-up (a controlled command-ring / internal-latch lever that does not kill the Falcon). Record the
+  exact `JBXC-SCRUB:` no-op line + the fault ADDR.
+- Any OTHER combination (e.g. a `JBXC-SCRUB:` rewrite followed by a STILL-faulting boot at the SAME ADDR)
+  = STOP + record: the scrubbed value was not the (only) carveout target.
+
+### Boot C — knoboff-default (restore)
+**Pre-registered prediction:** clean boot, CAPSTONE 6/6, VUG live. The end-of-sitting restore to the
+byte-identical-to-baseline default image (zero `JBXC` / `JBXC-SCRUB` strings). End-restore debt paid within
+the sitting.
+
+**Best scrub testbed note:** the leg-23 layout (SMP-6 leg-23 tar, `d3ecf48` era) faulted **4/4** — the
+highest-probability faulter on record, so a scrub that clears it is the strongest positive signal; the
+censusv2-scrub-leg23 image reproduces that layout with the scrub armed.

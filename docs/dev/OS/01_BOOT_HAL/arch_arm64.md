@@ -4108,3 +4108,54 @@ SMP-3 boots: e.g. the tegrasmp kick-off's position in the boot sequence, xHCI/ev
 wake time — note SMP-3's fault signature was IOB `ADDR 0x8000000000000200`, ALSO a bit-63 address,
 now suggestive in the carveout wall's light). Next SMP arc = a boot-state-context bisect
 (proposal to Peter; do not spawn).
+
+---
+
+#### FIX arc — census v2 (endpoint contexts) + aimed neutralization (`UNAOS_XCARVE_SCRUB`)
+
+The sitting's NULL census left the FillWrite target three-way ambiguous: controller-internal latched
+pointer, inherited command-ring pointer (unreadable via CRCR per xHCI 5.4.5), or an **unwalked
+endpoint-context / transfer-ring pointer** (the diagnosis census read slot contexts only). The FIX arc
+attacks the two DRAM-visible arms of that ambiguity and disambiguates the third.
+
+**Census v2 (`UNAOS_XCARVE=1`, unchanged feature).** `jbxc_inherited_dump` now walks each Configured
+slot's ENDPOINT CONTEXTS — the class the sitting left dark. For a slot whose device-context pointer is
+plausible it reads the slot context's Context Entries (dword0[31:27] = last valid endpoint DCI), then
+for each DCI 1..=ctx_entries prints the endpoint context's EP State (dword0[2:0]), EP Type (dword1[5:3]),
+and the raw 64-bit **TR Dequeue Pointer** (ep-ctx offset 0x08), flagging any TRDeq that fails the DRAM
+window as `IMPLAUSIBLE`. The endpoint-context stride is the controller's real context size — **CSZ
+(HCCPARAMS1 bit 2): 64 bytes when set, else 32** (`jbxc_ctx_size`) — a wrong stride would mis-address
+every endpoint context. The plausibility guard's **lower bound is widened to the DRAM base
+`0x8000_0000`** (lens note 2a; window now `[0x8000_0000, 0x2_8000_0000)`), so a sub-DRAM inherited value
+is never CPU-dereferenced into the MMIO aperture — printed raw, never chased. A faulting census-v2 boot
+now NAMES or exonerates the TR class on the same log.
+
+**The aimed neutralization (`UNAOS_XCARVE_SCRUB=1`, new feature `xcarve_scrub ⇒ tegra`, default OFF).**
+`jbxc_scrub_inherited` runs at the top of `jb2b_attach` right after the census — pre-takeover (so it
+reads the firmware's live inherited DCBAAP/structures, not our replacements) and pre-JB9i (so the
+`DISABLE_SLOT` drain finds no poisoned pointer to ride). It walks the same inherited DRAM structures and
+rewrites **ONLY** the values that fail the plausibility test — bit-63 set, or outside the DRAM window:
+- a poisoned DCBAA[0] scratchpad-array pointer → zero the DCBAA[0] entry; poisoned scratchpad page
+  pointers → zeroed in place;
+- a poisoned per-slot device-context pointer → zero that DCBAA slot entry (the `DISABLE_SLOT` drain then
+  has no poisoned context to write through; that slot's endpoint contexts are not walked off a bad base);
+- for a slot with a SANE device-context base, a poisoned endpoint-context TR dequeue pointer → zero the
+  whole TRDeq qword (pointer + DCS).
+
+Rules held exactly: **(a)** only values that fail the plausibility test are ever rewritten — a sane
+pointer is NEVER touched (a poisoned base is recorded and left unwalked, never dereferenced); **(b)**
+every rewrite prints a `JBXC-SCRUB:` line naming what, where (address), and the old raw value; **(c)** if
+nothing is poisoned the scrub is a one-line no-op; **(d)** the Falcon stays untouched — the scrub writes
+DRAM structures ONLY, never HCRST, never CSB, never any controller-control register (weakening the
+takeover would be a STOP).
+
+**The no-op discriminates the last bucket.** Because the scrub fires only on provably-invalid DRAM
+values, if the poison is controller-INTERNAL (a latched pointer or the CRCR-unreadable command ring —
+nothing visible in DRAM) the scrub **no-ops and the wall persists**. That is not a failed arc: it is the
+result that CONFIRMS the controller-internal / command-ring bucket and steers the follow-up (which would
+need a different lever than a DRAM scrub — e.g. a controlled command-ring reset that does not kill the
+Falcon). Conversely, a `JBXC-SCRUB:` line followed by a clean boot through JB9i is the FIXED verdict and
+names the exact structure that carried the poison.
+
+Knob-off both features vanish (byte-identical to baseline; zero `JBXC` / `JBXC-SCRUB` strings; proven by
+two default `esp-jetson` builds hashing equal). Bench legs pre-registered in `scripts/orin-xcarve-bench.md`.
