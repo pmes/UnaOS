@@ -4384,3 +4384,73 @@ to shell on metal; the folded-default tar is flagged in the bench MANIFEST as a 
 for stick-default duty. Standing rule until the wall is fixed: a stick DEFAULT must be a layout
 with a clean multi-boot metal record — QEMU-green + fresh layout is not sufficient for the
 default slot.
+
+### ORIN-SMP-8 — the tegrasmp RELINK (the layout-axis close-out; BUILD-ONLY, `UNAOS_TEGRASMP` + `UNAOS_XCARVE_RELINK`)
+
+ORIN-SMP-7's attended sitting exonerated the wake POSITION axis end-to-end (legs 24/25 both put 5/5
+real-path cores online, pre- and post-xHCI-takeover). With legs 21–25 all innocent on silicon —
+entry shape (21), wake concurrency (22), their conjunction (23, replicated ×5), post-takeover
+position (24), pre-takeover position (25) — **the SMP-3 discrimination space is EMPTY except one
+axis: IMAGE LAYOUT.** That is the XCARVE through-line: the same knob-set rebuilt at three distinct
+layouts sampled 4/4, ~50%, and 0/4 carveout-fault rates, with the fault ADDRESS itself moving with
+layout (`…dc80` on old-layout images, `…dc40` on new-layout images). The only enumerable variable
+left standing between the surviving leg images and the original `tegrasmp` image (which RAS-faulted
+2/2 on 2026-07-15) is the build itself — feature set → image layout.
+
+**The experiment (BUILD-ONLY — no new kernel surface).** The XCARVE relink pad
+(`XCARVE_RELINK_PAD`, a `#[used]` 16 KiB inert `0xA5` static in its own `.xcarve_relink_pad` section,
+`arch/aarch64/xusb_tegra.rs`) is composed onto the REAL `UNAOS_TEGRASMP=1` image — the exact SMP-3
+kick-off (`smp_virt::start_secondaries_tegra`, the real 6-core Orin bring-up) at a shifted layout.
+Both features imply `tegra`; `arroyo` composes `tegrasmp,tegra,xcarve_relink,tegra` and cargo
+de-dups (compose verified: `./arroyo check` green both arches for `UNAOS_TEGRASMP=1` and
+`UNAOS_TEGRASMP=1 UNAOS_XCARVE_RELINK=1`; feature-echo confirms both active). No code changed — the
+pad and both features already exist from prior arcs; this arc is docs + runbook + staging only.
+
+**Compose + layout evidence (`llvm-objdump -h`, tegrasmp-original vs tegrasmp-relinked; both built
+this arc, the original is the bench control).** The pad shifts the whole image by exactly +0x4000
+with zero semantic change (the takeover + SMP code is byte-for-byte identical):
+
+| section | tegrasmp-original VMA | tegrasmp-relinked VMA | delta |
+|---|---|---|---|
+| `.rodata` | `0x3850` | `0x3850` | (unchanged — precedes the pad) |
+| `.xcarve_relink_pad` | (absent) | `0x11e40` (size `0x4000`) | new, between `.rodata` and `.text` |
+| `.text` | `0x2c000` | `0x30000` | +0x4000 (size `0x7addc` IDENTICAL — no veneer growth this build) |
+| `.data.rel.ro` | `0xb6de0` | `0xbade0` | +0x4000 |
+| `.data` | `0xca040` | `0xce040` | +0x4000 |
+| `.bss` | `0xd1000` | `0xd5000` | +0x4000 |
+
+Strings witnesses: both images carry the `AARCH64 SMP: ORIN-SMP-3` markers (11 each) and `tegra:`
+count 109; zero `JBXC` strings (no census on either); `xcarve_relink_pad` section present only in the
+relinked image. Both builds are deterministic (rebuild reproduced the ELF hashes exactly). ELF SHAs:
+tegrasmp-original `510869fd…`, tegrasmp-relinked `095b9251…` (full SHAs in the bench MANIFEST).
+
+**The two-signature discrimination (the crux of the sitting).** Two independent walls can take a
+boot on these images; the runbook demands the operator read the RAS ADDR to tell them apart — only
+one answers SMP-8:
+
+| signature | RAS ADDR | class / register set | where it fires | means |
+|---|---|---|---|---|
+| **SMP-3 fault** (the axis under test) | ends `…0200` (`0x8000000000000200`) | IOB `SERR=0x12` / CBB-`0x6` | at `start_secondaries_tegra`, BEFORE the first `CPU_ON` result prints | the SMP-3 wall — the ONLY signature that answers this arc |
+| **SNOC-Carveout / xHCI wall** (unrelated to SMP) | ends `…7767dcXX` (`…dc40`/`…dc80`) | SNOC `SERR=0xd` Illegal-address + Carveout `0x3`, ACI `SERR=0x4` FillWrite `0x9` | at the JB9i inherited-slot eviction (`DISABLE_SLOT 1..8 … drained`) | the xHCI-takeover carveout wall — WALL DATA, retry (may take any boot pre-probe) |
+
+**Pre-registered predictions (verbatim in `scripts/orin-smp8-bench.md`, written BEFORE any boot).**
+Boot A = tegrasmp-relinked ×2–3: a **clean boot to 5 real APs online** (`:: AARCH64 SMP: AP <n>
+online … ::` ×5 + CAPSTONE 6/6, panel live) ⇒ **SMP-3 trigger = LAYOUT, CONFIRMED** — the production
+6-core SMP path is CODE-COMPLETE and the SMP arc closes pending the carveout wall's real fix. A
+`…0200` fault at the kick-off instead ⇒ **layout REFUTED for this image** — the first-ever refutation
+of the layout axis (equally decisive: the SMP-3 trigger survives a +0x4000 relink, so it is not
+purely layout — record exactly, re-open the residual, STOP and report). Boot B (optional) =
+tegrasmp-original ×1: expect the historical SMP-3 fault (`…0200`) as the control that the wall still
+reproduces at the original layout (a SURVIVE is also data — it would recast the 2026-07-15 2/2 as a
+sample of a probabilistic layout-modulated wall, the XCARVE pattern). Either image may ALSO sample
+the carveout wall (`…7767dcXX` at JB9i) pre-probe on any boot — wall data, retry.
+
+**Staged media (three tars to `~/unaos-bench/flash/orin/`, MANIFEST re-hashed).**
+`tegrasmp-relinked` (the layout-axis test image), `tegrasmp-original` (the 2026-07-15 fault-repro
+control — flagged in the MANIFEST as EXPECTED to RAS at the SMP kick-off), and a `knoboff-default`
+reference (byte-identity fallback — two default `esp-jetson` builds hash equal; **NOT a stick-default
+candidate** per the ORIN-SMP-7-addendum standing rule: no clean multi-boot metal record, the stick
+default stays `cad623af…`/`d3ecf48`). Gates green: `./arroyo check` both arches × {knob-off,
+TEGRASMP, TEGRASMP+RELINK}; knob-off byte-identity re-proven; full `arroyo battery` GREEN (x86 `test
+25` MISSION, arm virt v2 MISSION, GICv3 CAPSTONE 6/6 + 3/3 secondaries, `kernel8-test` 0-FAIL,
+esp-jetson links); `UNAOS_HUBSTORAGE` x86 MISSION SUCCESS. Bench runbook: `scripts/orin-smp8-bench.md`.
