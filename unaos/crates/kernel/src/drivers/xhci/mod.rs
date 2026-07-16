@@ -1516,6 +1516,29 @@ impl XhciController {
                             return;
                         }
 
+                        // XENUM-2 review fold: an ERROR completion (STALL / txn error / ...) on a
+                        // hub's Status Change Endpoint would otherwise fall through the success gate
+                        // below and the read would never be re-armed — hot-plug on that hub silently
+                        // dead until reboot. Trace + re-arm (the TransferRing recycles; CErr=3 lets
+                        // the controller retry transient errors itself, so a persistent error here
+                        // is rare — the bounded ring keeps a wedged endpoint from looping the CPU).
+                        if completion_code != 1 && completion_code != 13
+                            && endpoint_id > 1 && slot_id > 0
+                            && (slot_id as usize) < self.slots.len()
+                        {
+                            let s = &self.slots[slot_id as usize];
+                            if s.is_hub && s.hub_int_ep != 0
+                                && endpoint_id as u8 == (s.hub_int_ep & 0x0F) * 2 + 1
+                            {
+                                serial_println!(
+                                    "xHCI: HUB slot {} status-change read error (code {}); re-arming.",
+                                    slot_id, completion_code);
+                                self.slots[slot_id as usize].hub_int_expect_phys = 0;
+                                self.queue_hub_change_read(slot_id as u8);
+                                return;
+                            }
+                        }
+
                         // UNA-19-REVEAL: If success or short packet, check buffer
                         if completion_code == 1 || completion_code == 13 {
                             // UNA-21-DEBUG: Force Transition based on Endpoint ID
@@ -2007,7 +2030,13 @@ impl XhciController {
                                             }
                                             // Bit N = downstream port N changed. Queue each for the
                                             // main-loop service_hub_changes (GET_PORT_STATUS + action).
-                                            for port in 1..=nbr_ports {
+                                            // Bound the port walk to the bits the (≤8-byte-clamped)
+                                            // buffer actually holds: nbr_ports is an UNTRUSTED u8
+                                            // from the hub descriptor, and an unbounded walk would
+                                            // index bytes[] out of range for bNbrPorts ≥ 8*len —
+                                            // a device-supplied kernel panic in event dispatch.
+                                            let max_port = nbr_ports.min((len * 8 - 1) as u8);
+                                            for port in 1..=max_port {
                                                 let bit = port as usize;
                                                 if (bytes[bit / 8] & (1 << (bit % 8))) != 0 {
                                                     serial_println!("xHCI: HUB slot {} status-change: port {}", slot_id, port);
@@ -4496,6 +4525,8 @@ impl XhciController {
         let buf = self.slots[hub_slot as usize].descriptor_buffer as u64;
         // M1: GET_PORT_STATUS (class request, bmRequestType 0xA3, wIndex = port), 4 bytes.
         if self.sync_control(hub_slot, 0xA3, 0x00, 0, port as u16, 4, buf, true).is_err() {
+            // Intentionally returns WITHOUT clearing change features: the hub keeps the change
+            // latched and re-raises it on the status-change endpoint, so this self-heals next wake.
             serial_println!("xHCI: HUB slot {} port {} GET_PORT_STATUS failed", hub_slot, port);
             return;
         }
@@ -4575,9 +4606,9 @@ impl XhciController {
     /// untouched: the match requires the port's full route-nibble prefix, so only this port's subtree
     /// qualifies. Bindings cleared, slots queued for the deferred DISABLE_SLOT drain.
     fn disconnect_hub_port(&mut self, hub_slot: u8, port: u8) {
-        let (hub_route, hub_depth) = {
+        let (hub_route, hub_depth, hub_root_port) = {
             let s = &self.slots[hub_slot as usize];
-            (s.route_string, s.route_depth)
+            (s.route_string, s.route_depth, s.port_id)
         };
         // The route prefix of this downstream port: the hub's own route with `port` placed in the
         // hub's tier nibble. A device on/below the port has depth > hub_depth and shares this prefix
@@ -4595,14 +4626,20 @@ impl XhciController {
             if !self.slots[i].active || !self.slots[i].is_downstream {
                 continue;
             }
-            // On/below this port: deeper than the hub AND the port's full nibble prefix matches.
-            let below = self.slots[i].route_depth > hub_depth
+            // On/below this port: SAME physical tree (root port match — the xHCI route string does
+            // NOT encode the root port, so two hubs on different root ports both carry route 0 and
+            // their children share route values; every slot in one tree shares the hub chain's root
+            // port_id, propagated by address_downstream), deeper than the hub, AND the port's full
+            // nibble prefix matches.
+            let below = self.slots[i].port_id == hub_root_port
+                && self.slots[i].route_depth > hub_depth
                 && (self.slots[i].route_string & prefix_mask) == (child_prefix & prefix_mask);
             if !below {
                 continue;
             }
-            // Scope assertion (traced): a matched slot must share the prefix and never be a root slot.
-            debug_assert!(self.slots[i].route_depth > hub_depth);
+            // Scope assertion (traced): a matched slot must be in THIS root port's tree, share the
+            // prefix, and never be a root slot.
+            debug_assert!(self.slots[i].port_id == hub_root_port && self.slots[i].route_depth > hub_depth);
             if self.storage_slot == i as u8 {
                 self.storage_slot = 0;
                 self.storage_pending_bringup = false;
@@ -4631,8 +4668,8 @@ impl XhciController {
             torn += 1;
         }
         serial_println!(
-            "xHCI: HUB slot {} port {} disconnect: {} slot(s) torn down (scope: route-prefix {:#x} mask {:#x}, root + sibling ports untouched).",
-            hub_slot, port, torn, child_prefix & prefix_mask, prefix_mask);
+            "xHCI: HUB slot {} port {} disconnect: {} slot(s) torn down (scope: root-port {} route-prefix {:#x} mask {:#x}, root + sibling ports + other trees untouched).",
+            hub_slot, port, torn, hub_root_port, child_prefix & prefix_mask, prefix_mask);
     }
 
     /// Address a device behind a hub: like `address_device` but the slot context carries a
