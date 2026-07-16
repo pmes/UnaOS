@@ -147,7 +147,12 @@ and wrapped with host I/O by the userspace `libs/fs/unafs`.
 ## Still open (deliberately)
 
 - **vaire scope** (The Loom vs the broader Bolt-managing workspace manager) — under the
-  Architect's active revision; untouched here.
+  Architect's active revision; untouched here. **Direction ruling (Peter, 2026-07-16):
+  Bolt's host-side sync routine is accepted as a quick solution only — it is NOT the real
+  vaire. The real vaire is built on UnaFS: managed units live as UnaFS objects (native
+  attrs, ACL principals, journaled writes — the K-line machinery), not as host-filesystem
+  copies. Bolt arc 2+ and any vaire design pass must aim at the UnaFS-native shape; the
+  host routine is scaffolding to be migrated, per the do-it-right first principle.**
 - **stria's video half** — deferred by design (the audio-only slice was the Architect's own
   first slice), not drift.
 - The kit→vessel compiler and the elessar snapshot format — future arcs; `aule` is expected
