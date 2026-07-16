@@ -248,6 +248,90 @@ line the QEMU hub path already prints.
 
 ---
 
+### 7d. Hub-downstream hot-plug (XENUM-2)
+
+**What.** Before XENUM-2, a hub's downstream ports were scanned exactly **once**,
+at `bring_up_hub` time (the `enumerate_downstream` boot sweep). A device plugged
+into a hub port *after* bring-up was never noticed, and a hub-downstream
+*disconnect* was never handled either — the metal workaround was to plug
+downstream devices before boot. XENUM-2 configures and services the hub's
+**Status Change Endpoint** (the interrupt-IN bitmap endpoint every USB hub
+exposes), so devices that appear or leave behind a hub are enumerated / torn down
+live. Root-port hot-plug was already solved (XENUM-1 M1); this closes the hub tier.
+
+**Why (the crux).** A hub reports port changes out of band on a single interrupt-IN
+endpoint whose payload is a bitmap: **bit 0 = the hub itself**, **bit N = downstream
+port N**. The controller raises a transfer-event completion when the bitmap is
+non-zero. That completion lands in the event-dispatch path, which must **not** run
+synchronous control transfers (it can be nested inside another sync pump). So the
+work is split exactly like the existing hub bring-up:
+
+- **Event dispatch (no control transfers):** decode which ports changed, trace each,
+  queue `(hub_slot, port)` into `hub_changes_pending`, and re-arm the interrupt-IN
+  read. A Panther-Point dup-Success guard (`hub_int_expect_phys`, the same idiom as
+  the pointer read) rejects a duplicated completion for an already-consumed TD.
+- **Main loop (`service_hub_changes`, drained from `service_hubs`):** for each queued
+  change, `GET_PORT_STATUS` (class request `bmRequestType 0xA3`, `wIndex = port`),
+  then act. It is **deferred while a root port is mid-enumeration** (the
+  one-port-at-a-time invariant — never interleave a downstream `ENABLE_SLOT` /
+  `ADDRESS_DEVICE` into the root FSM) and **bounded per wake** (`HUB_CHANGE_BUDGET`,
+  8) so a flapping port cannot starve the loop; leftover changes ride the next pass.
+
+**M1 — configure + service the Status Change Endpoint.** At the end of `bring_up_hub`
+(after the port count reads valid and the boot sweep runs), `configure_hub_interrupt_ep`
+reads the hub's configuration descriptor for its single interrupt-IN endpoint, issues
+one Configure-Endpoint (mirroring the HID endpoint config, preserving the Hub-marked
+slot context), allocates a dedicated change buffer + ring, and arms the first read
+(length `(nbr_ports + 1 + 7) / 8` bytes). Completions are decoded and each changed
+port is traced and `GET_PORT_STATUS`-queried. M1 alone is visibility (no enumeration
+behavior change).
+
+**M2 — downstream connect.** On `C_PORT_CONNECTION` set with `PORT_CONNECTION = 1`,
+`reset_downstream_port` clears `C_PORT_CONNECTION`, issues `SET_PORT_FEATURE(PORT_RESET)`,
+awaits `C_PORT_RESET` (the existing bounded/paced loop), clears it, and reads the
+trained speed; the device then enumerates through the **existing** `enumerate_downstream`
+machinery with the route extended for this tier (`hub_route | (port << (4 * hub_depth))`,
+depth `hub_depth + 1`, same tier-depth cap). SS hub ports force SuperSpeed (their
+HS/FS speed bits do not apply) — best-effort per the brief; the HS/FS mouse/keyboard
+path is exact.
+
+**M3 — downstream disconnect.** On `C_PORT_CONNECTION` set with `PORT_CONNECTION = 0`,
+`disconnect_hub_port` tears down every slot in the SAME physical tree (root `port_id`
+match — the xHCI route string does **not** encode the root port, so two hubs on different
+root ports carry identical child route values; the root-port check disambiguates the
+trees) whose route string carries this hub port's full nibble prefix
+(`route_depth > hub_depth` **and** the low `(hub_depth + 1)` nibbles match) — the
+route-prefix analogue of `dispose_disconnected_slots`' port-scoping, so a nested hub's
+whole subtree goes with it. Bindings are cleared, `DISABLE_SLOT` is queued via the
+existing `slots_to_disable` drain, `reset_soft_state` runs. Root-port slots, sibling hub
+ports, and other trees are provably untouched (the match requires this tree + this
+port's exact prefix);
+the summary trace asserts the scope. Every latched change feature on the port is then
+cleared (feature selectors 16..20) so the endpoint deasserts and can report the next
+change.
+
+**Bench-assertable trace substrings (attended sitting):**
+
+- M1 config: `status-change endpoint configured (ep 0xNN mps M dci D); hot-plug armed`
+- M1 change decode: `HUB slot N status-change: port P`
+- M1 status read: `HUB slot N port P status: wPortStatus=0xXXXX wPortChange=0xXXXX (SS|HS/FS)`
+- M2 connect: `HUB slot N port P connect: resetting + enumerating downstream device`
+  (then the existing `HUB downstream slot … class=… vid=… pid=…` enumeration lines)
+- M3 disconnect: `HUB slot N port P disconnect: M slot(s) torn down (scope: root-port R
+  route-prefix 0xNN mask 0xNN, root + sibling ports + other trees untouched)`
+- int-EP error recovery: `HUB slot N status-change read error (code C); re-arming.`
+- No-op change (e.g. a boot-reset `C_PORT_ENABLE`): `HUB slot N port P: no actionable
+  connection change`
+
+**Metal verdict: PENDING** (attended rMBP sitting). QEMU exercises the M1 path — the
+qemu-xhci hub delivers a status-change bitmap for its boot-present port, so the config
+trace, the `status-change: port P` decode, and the `GET_PORT_STATUS` servicing all fire
+and are asserted in the `UNAOS_HUBSTORAGE` regression — but the connect/disconnect
+timing and the SS branch are silicon-verified at the bench (topology: a mouse/keyboard
+hot-plugged behind the HS hub, SS hub as available).
+
+---
+
 ## 8. Status and limitations
 
 Implemented: controller bring-up + BIOS→OS handoff, interrupt-driven event
@@ -255,8 +339,10 @@ delivery, device enumeration (with connect debounce + bounded, paced retry
 recovery, hot-plug re-enumeration after disconnect, and a bounded retry on a
 zeroed hub-downstream descriptor read), single-tier USB hubs (HS/FS **and
 SuperSpeed** hubs; HID **and mass storage** downstream), BOT mass-storage
-read/write, and HID input. aarch64 uses a polled variant (no interrupts there
-yet). See §7c for the XENUM-1 enumeration-robustness fixes.
+read/write, and HID input, plus **hub-downstream hot-plug** (the hub Status Change
+Endpoint is configured and serviced — connect enumerates, disconnect tears down the
+route-scoped subtree). aarch64 uses a polled variant (no interrupts there yet). See
+§7c for the XENUM-1 enumeration-robustness fixes and §7d for XENUM-2 hub hot-plug.
 
 Not yet implemented: endpoint STALL recovery, multi-tier hubs, and broader class
 support. The `skip_xhci` Cargo feature (`UNAOS_SKIP_XHCI=1`) disables USB bring-up

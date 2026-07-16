@@ -320,6 +320,12 @@ const PORT_CHANGE_BITS: u32 =
 /// left unconfigured. Bounded so a genuinely dead port cannot stall enumeration indefinitely.
 const XENUM_DESC_RETRIES: u32 = 4;
 
+/// XENUM-2: how many hub-port status changes are serviced per main-loop wake. Each serviced change
+/// runs synchronous control transfers (GET_PORT_STATUS + reset/enumerate or teardown); bounding the
+/// count keeps a flapping downstream port from starving the main loop — leftover changes are
+/// re-queued and drained on the next pass (the XENUM-1 bounded/paced discipline).
+const HUB_CHANGE_BUDGET: usize = 8;
+
 pub static XHCI_CONTROLLER: spin::Mutex<Option<XhciController>> = spin::Mutex::new(None);
 
 /// Human-readable mass-storage enumeration/bring-up state, for the shell `diskinfo` command when no
@@ -657,6 +663,28 @@ pub struct DeviceSlot {
     pub scsi_data_buffer: Option<*mut u8>, // data-stage buffer (>= one block)
     pub bulk_in_ep: u8,                    // bulk IN endpoint address (e.g. 0x81)
     pub bulk_out_ep: u8,                   // bulk OUT endpoint address (e.g. 0x02)
+
+    // --- XENUM-2: hub Status Change Endpoint (hot-plug behind a hub) ---
+    /// True once this slot has been marked as a USB hub (set in `set_hub_slot_context`). Lets the
+    /// transfer-event dispatch recognise the hub's interrupt-IN Status Change Endpoint and the
+    /// disconnect path route-scope a teardown to this hub's subtree.
+    pub is_hub: bool,
+    /// Number of downstream ports this hub reported (from its hub descriptor). Governs the length of
+    /// the Status Change bitmap ((nbr_ports+1+7)/8 bytes) and the port iteration on a change.
+    pub hub_nbr_ports: u8,
+    /// The hub's interrupt-IN Status Change Endpoint address (0 = not configured). One per hub.
+    pub hub_int_ep: u8,
+    /// Max packet size of the Status Change Endpoint.
+    pub hub_int_mps: u16,
+    /// Transfer ring for the Status Change Endpoint interrupt-IN reads.
+    pub hub_int_ring: Option<TransferRing>,
+    /// DMA buffer the Status Change bitmap is read into (separate from `descriptor_buffer`, which
+    /// the hub's synchronous control transfers reuse).
+    pub hub_change_buffer: Option<*mut u8>,
+    /// Physical address of the interrupt-IN Normal TRB the change-bitmap read was last armed with
+    /// (0 = none). Matched in the transfer dispatch to reject a Panther-Point dup-Success for an
+    /// already-consumed TD — the same guard `mouse_expect_phys` applies to the pointer read.
+    pub hub_int_expect_phys: u64,
 }
 
 unsafe impl Send for DeviceSlot {}
@@ -705,6 +733,13 @@ impl DeviceSlot {
             scsi_data_buffer: None,
             bulk_in_ep: 0,
             bulk_out_ep: 0,
+            is_hub: false,
+            hub_nbr_ports: 0,
+            hub_int_ep: 0,
+            hub_int_mps: 0,
+            hub_int_ring: None,
+            hub_change_buffer: None,
+            hub_int_expect_phys: 0,
         }
     }
 
@@ -725,6 +760,15 @@ impl DeviceSlot {
         if let Some(r) = self.bulk_out_ring.take() { core::mem::forget(r); }
         if let Some(r) = self.keyboard_ring.take() { core::mem::forget(r); }
         if let Some(r) = self.mouse_ring.take() { core::mem::forget(r); }
+        // XENUM-2: hub Status Change Endpoint ring is leaked like the others (the controller may
+        // still reference it until DISABLE_SLOT completes); the change buffer is dropped (leaked).
+        if let Some(r) = self.hub_int_ring.take() { core::mem::forget(r); }
+        self.is_hub = false;
+        self.hub_nbr_ports = 0;
+        self.hub_int_ep = 0;
+        self.hub_int_mps = 0;
+        self.hub_change_buffer = None;
+        self.hub_int_expect_phys = 0;
         self.input_context = core::ptr::null_mut();
         self.output_context = core::ptr::null_mut();
         self.data_buffer = None;
@@ -827,6 +871,12 @@ pub struct XhciController {
     cmd_pending: Option<CmdPending>,
     /// Slots of hubs detected during enumeration, awaiting (main-loop) bring-up.
     hubs_pending: Vec<u8>,
+    /// XENUM-2: (hub_slot, hub_port) pairs a hub's Status Change Endpoint flagged as changed,
+    /// awaiting (main-loop, synchronous) servicing — GET_PORT_STATUS + downstream reset/enumerate
+    /// (connect) or route-scoped teardown (disconnect). Queued by the transfer-event dispatch (which
+    /// only decodes the bitmap + re-arms the read — never runs control transfers), drained by
+    /// `service_hub_changes`. Bounded per wake (`HUB_CHANGE_BUDGET`).
+    hub_changes_pending: Vec<(u8, u8)>,
     /// Slots whose HID interfaces are configured + reads armed, awaiting a (main-loop, synchronous)
     /// SET_PROTOCOL(boot). A boot-capable HID interface (bInterfaceSubClass 1) powers up in REPORT
     /// protocol, whose reports carry a report ID and a device-defined layout we don't parse; boot
@@ -958,6 +1008,7 @@ impl XhciController {
             ep0_pending: None,
             cmd_pending: None,
             hubs_pending: Vec::new(),
+            hub_changes_pending: Vec::new(),
             hid_setproto_pending: Vec::new(),
             enum_active: false,
             enumerating_port: 0,
@@ -1465,6 +1516,29 @@ impl XhciController {
                             return;
                         }
 
+                        // XENUM-2 review fold: an ERROR completion (STALL / txn error / ...) on a
+                        // hub's Status Change Endpoint would otherwise fall through the success gate
+                        // below and the read would never be re-armed — hot-plug on that hub silently
+                        // dead until reboot. Trace + re-arm (the TransferRing recycles; CErr=3 lets
+                        // the controller retry transient errors itself, so a persistent error here
+                        // is rare — the bounded ring keeps a wedged endpoint from looping the CPU).
+                        if completion_code != 1 && completion_code != 13
+                            && endpoint_id > 1 && slot_id > 0
+                            && (slot_id as usize) < self.slots.len()
+                        {
+                            let s = &self.slots[slot_id as usize];
+                            if s.is_hub && s.hub_int_ep != 0
+                                && endpoint_id as u8 == (s.hub_int_ep & 0x0F) * 2 + 1
+                            {
+                                serial_println!(
+                                    "xHCI: HUB slot {} status-change read error (code {}); re-arming.",
+                                    slot_id, completion_code);
+                                self.slots[slot_id as usize].hub_int_expect_phys = 0;
+                                self.queue_hub_change_read(slot_id as u8);
+                                return;
+                            }
+                        }
+
                         // UNA-19-REVEAL: If success or short packet, check buffer
                         if completion_code == 1 || completion_code == 13 {
                             // UNA-21-DEBUG: Force Transition based on Endpoint ID
@@ -1790,7 +1864,12 @@ impl XhciController {
                                         let dir_in = (slot.keyboard_ep & 0x80) != 0;
                                         Some((ep_num * 2) + if dir_in { 1 } else { 0 })
                                     } else { None };
-                                    
+
+                                    // XENUM-2: a hub's interrupt-IN Status Change Endpoint (always IN).
+                                    let hub_int_dci = if slot.is_hub && slot.hub_int_ep != 0 {
+                                        Some((slot.hub_int_ep & 0x0F) * 2 + 1)
+                                    } else { None };
+
                                     if mouse_dci == Some(endpoint_id as u8) {
                                         // --- POINTER (mouse / tablet) --- reads into its own buffer.
                                         // UI1-MOUSE M2: Panther-Point dup-Success guard
@@ -1929,6 +2008,47 @@ impl XhciController {
                                             
                                             self.queue_keyboard_read(slot_id as u8);
                                         }
+                                    } else if hub_int_dci == Some(endpoint_id as u8) {
+                                        // --- XENUM-2: hub Status Change Endpoint completion ---
+                                        // Panther-Point dup-Success guard (as for the pointer read):
+                                        // only the completion whose TRB matches the armed read is real.
+                                        if slot.hub_int_expect_phys != 0 && param != slot.hub_int_expect_phys {
+                                            xdbg!("xHCI: stale/spurious hub status-change event (slot {}, trb {:#x}, expected {:#x}); ignoring.",
+                                                slot_id, param, slot.hub_int_expect_phys);
+                                            return;
+                                        }
+                                        // Copy out what we need, then release the shared borrow: the
+                                        // decode + queue + re-arm below take &mut self.
+                                        let nbr_ports = slot.hub_nbr_ports;
+                                        let change_buf = slot.hub_change_buffer;
+                                        if let Some(buf_ptr) = change_buf {
+                                            let len = Self::hub_change_bitmap_len(nbr_ports);
+                                            let bytes = core::slice::from_raw_parts(buf_ptr, len);
+                                            // Bit 0 = the hub itself (over-current / local change).
+                                            if (bytes[0] & 1) != 0 {
+                                                serial_println!("xHCI: HUB slot {} status-change: hub-local (bit 0).", slot_id);
+                                            }
+                                            // Bit N = downstream port N changed. Queue each for the
+                                            // main-loop service_hub_changes (GET_PORT_STATUS + action).
+                                            // Bound the port walk to the bits the (≤8-byte-clamped)
+                                            // buffer actually holds: nbr_ports is an UNTRUSTED u8
+                                            // from the hub descriptor, and an unbounded walk would
+                                            // index bytes[] out of range for bNbrPorts ≥ 8*len —
+                                            // a device-supplied kernel panic in event dispatch.
+                                            let max_port = nbr_ports.min((len * 8 - 1) as u8);
+                                            for port in 1..=max_port {
+                                                let bit = port as usize;
+                                                if (bytes[bit / 8] & (1 << (bit % 8))) != 0 {
+                                                    serial_println!("xHCI: HUB slot {} status-change: port {}", slot_id, port);
+                                                    if !self.hub_changes_pending.iter().any(|&e| e == (slot_id as u8, port)) {
+                                                        self.hub_changes_pending.push((slot_id as u8, port));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        // Re-arm the read so the next change is delivered.
+                                        self.slots[slot_id as usize].hub_int_expect_phys = 0;
+                                        self.queue_hub_change_read(slot_id as u8);
                                     }
                                     // Bulk (mass storage) completions are handled above via
                                     // bot_pending and never reach here.
@@ -2415,6 +2535,7 @@ impl XhciController {
             }
             self.hid_setproto_pending.retain(|s| *s != i as u8);
             self.hubs_pending.retain(|s| *s != i as u8);
+            self.hub_changes_pending.retain(|(hs, _)| *hs != i as u8); // XENUM-2
             self.pending_ports.retain(|p| *p != port);
             self.slots[i].reset_soft_state();
             if !self.slots_to_disable.iter().any(|(s, _)| *s == i as u8) {
@@ -2575,6 +2696,7 @@ impl XhciController {
             }
             self.hid_setproto_pending.retain(|s| *s != i as u8);
             self.hubs_pending.retain(|s| *s != i as u8);
+            self.hub_changes_pending.retain(|(hs, _)| *hs != i as u8); // XENUM-2
             self.slots[i].reset_soft_state();
             if !self.slots_to_disable.iter().any(|(s, _)| *s == i as u8) {
                 self.slots_to_disable.push((i as u8, 0));
@@ -3980,6 +4102,8 @@ impl XhciController {
         while let Some(hub_slot) = self.hubs_pending.pop() {
             self.bring_up_hub(hub_slot);
         }
+        // XENUM-2: drain any downstream-port changes the hubs' Status Change Endpoints flagged.
+        self.service_hub_changes();
     }
 
     /// Main-loop hook: send SET_PROTOCOL(boot) to the HID interfaces of any freshly-enumerated slot,
@@ -4141,6 +4265,13 @@ impl XhciController {
                 self.enumerate_downstream(hub_slot, port, root_hub_port, child_route, child_depth, speed);
             }
         }
+
+        // XENUM-2: configure + arm the hub's interrupt-IN Status Change Endpoint so a device
+        // plugged into a downstream port AFTER this one-shot boot walk is noticed (its change
+        // bitmap raises an interrupt-IN completion, serviced by service_hub_changes). Boot-present
+        // devices were already enumerated by the walk above; this covers everything after.
+        self.configure_hub_interrupt_ep(hub_slot);
+
         serial_println!("xHCI: === HUB slot {} bring-up complete ===", hub_slot);
     }
 
@@ -4170,7 +4301,13 @@ impl XhciController {
             control: (12 << 10) | ((hub_slot as u32) << 24),
         };
         match self.run_command_sync(trb) {
-            Ok((1, _)) => serial_println!("xHCI: HUB slot {} marked as hub ({} ports)", hub_slot, nbr_ports),
+            Ok((1, _)) => {
+                // XENUM-2: record the hub identity so the Status Change Endpoint dispatch and the
+                // route-scoped disconnect teardown can recognise this slot and size its bitmap.
+                self.slots[hub_slot as usize].is_hub = true;
+                self.slots[hub_slot as usize].hub_nbr_ports = nbr_ports;
+                serial_println!("xHCI: HUB slot {} marked as hub ({} ports)", hub_slot, nbr_ports);
+            }
             Ok((c, _)) => serial_println!("xHCI: HUB slot {} configure-endpoint code {}", hub_slot, c),
             Err(_) => serial_println!("xHCI: HUB slot {} configure-endpoint timed out", hub_slot),
         }
@@ -4206,6 +4343,333 @@ impl XhciController {
         let speed = if pstatus & (1 << 9) != 0 { 2u32 } else if pstatus & (1 << 10) != 0 { 3 } else { 1 };
         serial_println!("xHCI: HUB port {} reset OK (status {:#x}, xHCI speed {})", port, pstatus, speed);
         Some(speed)
+    }
+
+    /// XENUM-2: length in bytes of a hub's Status Change bitmap: bit 0 = the hub itself, bit N = port
+    /// N, so `(nbr_ports + 1 + 7) / 8` bytes. Clamped to the change buffer size and to >= 1.
+    fn hub_change_bitmap_len(nbr_ports: u8) -> usize {
+        (((nbr_ports as usize) + 1 + 7) / 8).clamp(1, 8)
+    }
+
+    /// XENUM-2: parse a hub's configuration descriptor (in `buf`) for its single interrupt-IN Status
+    /// Change Endpoint. Returns (ep_addr, mps, interval) or None.
+    fn parse_hub_int_ep(buf: u64) -> Option<(u8, u16, u8)> {
+        unsafe {
+            let p = buf as *const u8;
+            let total = (((*p.add(2) as usize) | ((*p.add(3) as usize) << 8))).min(64);
+            let mut off = 0usize;
+            while off + 2 <= total {
+                let len = *p.add(off) as usize;
+                let dtype = *p.add(off + 1);
+                if len == 0 { break; }
+                if dtype == 0x05 && off + 7 <= total {
+                    let ep_addr = *p.add(off + 2);
+                    let attr = *p.add(off + 3);
+                    // Interrupt (attr bits 1:0 == 3) IN (address bit 7 set).
+                    if (attr & 0x03) == 0x03 && (ep_addr & 0x80) != 0 {
+                        let mps = ((*p.add(off + 4) as u16) | ((*p.add(off + 5) as u16) << 8)) & 0x07FF;
+                        return Some((ep_addr, mps, *p.add(off + 6)));
+                    }
+                }
+                off += len;
+            }
+            None
+        }
+    }
+
+    /// XENUM-2 (M1): configure the hub's interrupt-IN Status Change Endpoint (one Configure-Endpoint,
+    /// mirroring the HID endpoint config), then arm the first change-bitmap read. Reads the hub's
+    /// configuration descriptor to find the endpoint. The hub slot context (Hub bit + Number of Ports)
+    /// was already programmed by `set_hub_slot_context`; this ADDS the endpoint on top, preserving it.
+    fn configure_hub_interrupt_ep(&mut self, hub_slot: u8) {
+        if hub_slot == 0 || self.slots[hub_slot as usize].ep0_ring.is_none() {
+            return;
+        }
+        let buf = self.slots[hub_slot as usize].descriptor_buffer as u64;
+        // GET configuration descriptor (first 64 bytes) to locate the status-change endpoint.
+        if self.sync_control(hub_slot, 0x80, 0x06, 0x0200, 0, 64, buf, true).is_err() {
+            serial_println!("xHCI: HUB slot {} config-descriptor (for status-change EP) failed", hub_slot);
+            return;
+        }
+        let (ep_addr, mps, interval) = match Self::parse_hub_int_ep(buf) {
+            Some(v) => v,
+            None => {
+                serial_println!("xHCI: HUB slot {} exposes no interrupt-IN status-change endpoint; hot-plug servicing disabled for it.", hub_slot);
+                return;
+            }
+        };
+        let dci = (((ep_addr & 0x0F) * 2) + 1) as u32; // interrupt IN
+
+        let input_ctx_virt;
+        unsafe {
+            let output_ctx_virt = self.slots[hub_slot as usize].output_context;
+            let ring = ring::TransferRing::new(16);
+            let phys = ring.get_ptr();
+            self.slots[hub_slot as usize].hub_int_ring = Some(ring);
+            if self.slots[hub_slot as usize].hub_change_buffer.is_none() {
+                let l = core::alloc::Layout::from_size_align(64, 64).unwrap();
+                self.slots[hub_slot as usize].hub_change_buffer = Some(alloc::alloc::alloc_zeroed(l));
+            }
+            input_ctx_virt = self.slots[hub_slot as usize].input_context;
+            let base_ptr = input_ctx_virt as *mut u32;
+            core::ptr::write_bytes(base_ptr as *mut u8, 0, core::mem::size_of::<InputContext>());
+
+            // Interval encoding follows the hub's own speed (from its output slot context).
+            let out_dw0 = core::ptr::read_volatile((output_ctx_virt as *const u32).add(0));
+            let speed = (out_dw0 >> 20) & 0x0F;
+            let enc_interval: u32 = if speed == 3 || speed >= 4 {
+                (interval.saturating_sub(1)) as u32
+            } else if interval > 0 {
+                (31 - (interval as u32).leading_zeros()) + 3
+            } else { 0 };
+
+            // Input Control: A0 (slot) + A(dci).
+            base_ptr.add(1).write_volatile(1 | (1 << dci));
+            // Slot context copied from the (already hub-marked) output context, Context Entries raised
+            // to this endpoint's DCI.
+            let slot_ctx = base_ptr.add(CTX_WORDS);
+            for i in 0..8 {
+                slot_ctx.add(i).write_volatile(core::ptr::read_volatile((output_ctx_virt as *const u32).add(i)));
+            }
+            let old_dw0 = slot_ctx.add(0).read_volatile();
+            slot_ctx.add(0).write_volatile((old_dw0 & !(0x1F << 27)) | ((dci as u32) << 27));
+            // Endpoint context: Interrupt IN (EP Type 7), CErr 3.
+            let ep = base_ptr.add((1 + dci as usize) * CTX_WORDS);
+            ep.add(0).write_volatile((enc_interval << 16) | ((mps as u32) << 24));
+            ep.add(1).write_volatile((7 << 3) | (3 << 1) | ((mps as u32) << 16));
+            ep.add(2).write_volatile((phys as u32) | 1);
+            ep.add(3).write_volatile((phys >> 32) as u32);
+            ep.add(4).write_volatile(mps as u32);
+        }
+        let trb = Trb {
+            parameter: input_ctx_virt as u64,
+            status: 0,
+            control: (12 << 10) | ((hub_slot as u32) << 24),
+        };
+        match self.run_command_sync(trb) {
+            Ok((1, _)) => {
+                self.slots[hub_slot as usize].hub_int_ep = ep_addr;
+                self.slots[hub_slot as usize].hub_int_mps = mps;
+                serial_println!(
+                    "xHCI: HUB slot {} status-change endpoint configured (ep {:#04x} mps {} dci {}); hot-plug armed.",
+                    hub_slot, ep_addr, mps, dci);
+                self.queue_hub_change_read(hub_slot);
+            }
+            Ok((c, _)) => serial_println!("xHCI: HUB slot {} status-change Configure-Endpoint code {}", hub_slot, c),
+            Err(_) => serial_println!("xHCI: HUB slot {} status-change Configure-Endpoint timed out", hub_slot),
+        }
+    }
+
+    /// XENUM-2: (re-)arm the hub's interrupt-IN Status Change Endpoint read. Mirrors
+    /// `queue_mouse_read`: push a Normal TRB over the change buffer, record its physical address for
+    /// the dup-Success guard, ring the endpoint doorbell.
+    fn queue_hub_change_read(&mut self, hub_slot: u8) {
+        let (ep, buf, nbr_ports) = {
+            let s = &self.slots[hub_slot as usize];
+            (s.hub_int_ep, s.hub_change_buffer, s.hub_nbr_ports)
+        };
+        if ep == 0 { return; }
+        let Some(buf_ptr) = buf else { return; };
+        let dci = ((ep & 0x0F) * 2 + 1) as u32; // interrupt IN
+        let read_len = Self::hub_change_bitmap_len(nbr_ports) as u32;
+        let in_trb = Trb {
+            parameter: buf_ptr as u64,
+            status: read_len,
+            control: (1 << 10) | (1 << 5), // Normal | IOC
+        };
+        let idx = match self.slots[hub_slot as usize].hub_int_ring.as_mut() {
+            Some(r) => match r.push(in_trb) { Ok(i) => i, Err(_) => return },
+            None => return,
+        };
+        let ring_base = self.slots[hub_slot as usize].hub_int_ring.as_ref().unwrap().get_ptr();
+        self.slots[hub_slot as usize].hub_int_expect_phys =
+            ring_base + (idx as u64 * core::mem::size_of::<Trb>() as u64);
+        self.ring_doorbell(hub_slot, dci);
+    }
+
+    /// XENUM-2: main-loop hook — drain the hub-port changes the Status Change Endpoint flagged.
+    /// Deferred while a root port is mid-enumeration (the one-port-at-a-time invariant: never
+    /// interleave a downstream ENABLE_SLOT/ADDRESS_DEVICE into the root FSM); bounded per wake so a
+    /// flapping port can't starve the main loop. Left-over changes ride the next pass.
+    pub fn service_hub_changes(&mut self) {
+        if self.hub_changes_pending.is_empty() {
+            return;
+        }
+        if self.enum_active {
+            return; // a root port is enumerating — service_hubs retries once it goes idle
+        }
+        let work = core::mem::take(&mut self.hub_changes_pending);
+        for (i, (hub_slot, port)) in work.into_iter().enumerate() {
+            if i >= HUB_CHANGE_BUDGET {
+                // Storm safety: re-queue the remainder for the next wake instead of blocking here.
+                if !self.hub_changes_pending.iter().any(|&e| e == (hub_slot, port)) {
+                    self.hub_changes_pending.push((hub_slot, port));
+                }
+                continue;
+            }
+            self.service_one_hub_change(hub_slot, port);
+        }
+    }
+
+    /// XENUM-2 (M1/M2/M3): service one downstream-port change on `hub_slot` port `port`.
+    /// GET_PORT_STATUS (M1, always traced); on a connect reset + enumerate the new device through the
+    /// existing downstream machinery (M2); on a disconnect tear down the slot subtree route-scoped to
+    /// this hub port (M3). Runs only from the main loop (synchronous control transfers).
+    fn service_one_hub_change(&mut self, hub_slot: u8, port: u8) {
+        if hub_slot == 0
+            || !self.slots[hub_slot as usize].is_hub
+            || self.slots[hub_slot as usize].ep0_ring.is_none()
+        {
+            return;
+        }
+        let buf = self.slots[hub_slot as usize].descriptor_buffer as u64;
+        // M1: GET_PORT_STATUS (class request, bmRequestType 0xA3, wIndex = port), 4 bytes.
+        if self.sync_control(hub_slot, 0xA3, 0x00, 0, port as u16, 4, buf, true).is_err() {
+            // Intentionally returns WITHOUT clearing change features: the hub keeps the change
+            // latched and re-raises it on the status-change endpoint, so this self-heals next wake.
+            serial_println!("xHCI: HUB slot {} port {} GET_PORT_STATUS failed", hub_slot, port);
+            return;
+        }
+        let (wstatus, wchange) = unsafe {
+            let p = buf as *const u8;
+            (
+                (*p.add(0) as u16) | ((*p.add(1) as u16) << 8),
+                (*p.add(2) as u16) | ((*p.add(3) as u16) << 8),
+            )
+        };
+        let hub_speed = unsafe {
+            let oc = self.slots[hub_slot as usize].output_context;
+            if oc.is_null() { 0 } else { (*(oc as *const u32) >> 20) & 0xF }
+        };
+        let is_ss = hub_speed >= 4;
+        serial_println!(
+            "xHCI: HUB slot {} port {} status: wPortStatus={:#06x} wPortChange={:#06x} ({})",
+            hub_slot, port, wstatus, wchange, if is_ss { "SS" } else { "HS/FS" });
+
+        let connected = (wstatus & 0x0001) != 0;
+        let c_connection = (wchange & 0x0001) != 0;
+
+        if c_connection && connected {
+            // M2: a device appeared on this downstream port. Reset it, learn its speed, then
+            // enumerate through the existing downstream path with the route extended for this tier.
+            let (hub_route, hub_depth, root_hub_port) = {
+                let s = &self.slots[hub_slot as usize];
+                (s.route_string, s.route_depth, s.port_id)
+            };
+            if hub_depth >= 5 {
+                serial_println!(
+                    "xHCI: HUB slot {} port {} connect ignored (hub at max USB tier depth {}).",
+                    hub_slot, port, hub_depth);
+            } else {
+                serial_println!("xHCI: HUB slot {} port {} connect: resetting + enumerating downstream device.", hub_slot, port);
+                // reset_downstream_port issues CLEAR C_PORT_CONNECTION + SET PORT_RESET, awaits
+                // C_PORT_RESET (bounded/paced), clears it, and reads the trained speed.
+                if let Some(mut speed) = self.reset_downstream_port(hub_slot, port, buf) {
+                    if is_ss {
+                        // SS hub ports are always SuperSpeed (the HS/FS speed bits don't apply);
+                        // best-effort per XENUM-2 — the metal HS/FS mouse/keyboard path is exact.
+                        speed = 4;
+                        serial_println!("xHCI: HUB slot {} port {} is a SuperSpeed port (speed forced to SS).", hub_slot, port);
+                    }
+                    let child_route = hub_route | (((port as u32).min(15)) << (4 * hub_depth));
+                    let child_depth = hub_depth + 1;
+                    self.enumerate_downstream(hub_slot, port, root_hub_port, child_route, child_depth, speed);
+                } else {
+                    serial_println!("xHCI: HUB slot {} port {} did not enable after reset; leaving unconfigured.", hub_slot, port);
+                }
+            }
+        } else if c_connection && !connected {
+            // M3: the device on this downstream port left. Tear down its slot subtree.
+            self.disconnect_hub_port(hub_slot, port);
+        } else {
+            serial_println!("xHCI: HUB slot {} port {}: no actionable connection change.", hub_slot, port);
+        }
+
+        // Deassert every latched change on this port so the Status Change Endpoint can report the
+        // next change (a USB hub keeps the change bitmap bit set while any C_* feature is set). The
+        // connect path's reset already cleared C_PORT_CONNECTION/C_PORT_RESET; clearing again is a
+        // harmless no-op. Change bit index i -> feature selector 16+i (C_CONNECTION..C_RESET).
+        for i in 0..5u16 {
+            if (wchange & (1 << i)) != 0 {
+                let _ = self.sync_control(hub_slot, 0x23, 0x01, 16 + i, port as u16, 0, 0, false);
+            }
+        }
+        // Nudge the read if a previous arm failed (normally still armed from the event dispatch).
+        if self.slots[hub_slot as usize].hub_int_expect_phys == 0 {
+            self.queue_hub_change_read(hub_slot);
+        }
+    }
+
+    /// XENUM-2 (M3): tear down every slot whose route string places it ON or BELOW `hub_slot`'s
+    /// downstream `port` — the route-prefix analogue of `dispose_disconnected_slots`' port-scoping. A
+    /// nested hub's whole subtree goes with it. Root-port slots and OTHER hub ports are provably
+    /// untouched: the match requires the port's full route-nibble prefix, so only this port's subtree
+    /// qualifies. Bindings cleared, slots queued for the deferred DISABLE_SLOT drain.
+    fn disconnect_hub_port(&mut self, hub_slot: u8, port: u8) {
+        let (hub_route, hub_depth, hub_root_port) = {
+            let s = &self.slots[hub_slot as usize];
+            (s.route_string, s.route_depth, s.port_id)
+        };
+        // The route prefix of this downstream port: the hub's own route with `port` placed in the
+        // hub's tier nibble. A device on/below the port has depth > hub_depth and shares this prefix
+        // across the low (hub_depth+1) nibbles.
+        let port_nibble = ((port as u32).min(15)) << (4 * hub_depth);
+        let child_prefix = hub_route | port_nibble;
+        let prefix_mask: u32 = if hub_depth >= 5 {
+            0xFFFFF
+        } else {
+            (1u32 << (4 * (hub_depth + 1))) - 1
+        };
+
+        let mut torn = 0usize;
+        for i in 1..self.slots.len() {
+            if !self.slots[i].active || !self.slots[i].is_downstream {
+                continue;
+            }
+            // On/below this port: SAME physical tree (root port match — the xHCI route string does
+            // NOT encode the root port, so two hubs on different root ports both carry route 0 and
+            // their children share route values; every slot in one tree shares the hub chain's root
+            // port_id, propagated by address_downstream), deeper than the hub, AND the port's full
+            // nibble prefix matches.
+            let below = self.slots[i].port_id == hub_root_port
+                && self.slots[i].route_depth > hub_depth
+                && (self.slots[i].route_string & prefix_mask) == (child_prefix & prefix_mask);
+            if !below {
+                continue;
+            }
+            // Scope assertion (traced): a matched slot must be in THIS root port's tree, share the
+            // prefix, and never be a root slot.
+            debug_assert!(self.slots[i].port_id == hub_root_port && self.slots[i].route_depth > hub_depth);
+            if self.storage_slot == i as u8 {
+                self.storage_slot = 0;
+                self.storage_pending_bringup = false;
+                self.storage_note = "hub-downstream storage disconnected";
+            }
+            if self.configuring_slot == i as u8 { self.configuring_slot = 0; }
+            if self.ftdi_configuring_slot == i as u8 { self.ftdi_configuring_slot = 0; }
+            if self.ftdi_slot == i as u8 {
+                self.ftdi_slot = 0;
+                self.ftdi_pending_bringup = false;
+                self.ftdi_pending = None;
+                ftdi::set_live(false);
+            }
+            self.hid_setproto_pending.retain(|s| *s != i as u8);
+            self.hubs_pending.retain(|s| *s != i as u8);
+            // A nested hub going away takes its own queued port changes with it.
+            self.hub_changes_pending.retain(|(hs, _)| *hs != i as u8);
+            let (route, depth) = (self.slots[i].route_string, self.slots[i].route_depth);
+            self.slots[i].reset_soft_state();
+            if !self.slots_to_disable.iter().any(|(s, _)| *s == i as u8) {
+                self.slots_to_disable.push((i as u8, 0));
+            }
+            serial_println!(
+                "xHCI: HUB slot {} port {} disconnect: slot {} (route {:#x} tier {}) in subtree; queued for DISABLE_SLOT.",
+                hub_slot, port, i, route, depth);
+            torn += 1;
+        }
+        serial_println!(
+            "xHCI: HUB slot {} port {} disconnect: {} slot(s) torn down (scope: root-port {} route-prefix {:#x} mask {:#x}, root + sibling ports + other trees untouched).",
+            hub_slot, port, torn, hub_root_port, child_prefix & prefix_mask, prefix_mask);
     }
 
     /// Address a device behind a hub: like `address_device` but the slot context carries a
