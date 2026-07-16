@@ -121,7 +121,12 @@ impl RefMap {
     }
 
     /// Discard the in-flight transaction: `current = frozen` (the committed
-    /// tree). Used by the crash-simulation seam and error unwinding.
+    /// tree). NOTE: deliberately NOT used by the failed-transaction unwind —
+    /// `UnaFS::txn_unwind` reloads from the committed on-disk root instead,
+    /// because a thaw-based restore composed unsafely with residue earlier
+    /// failed writes leave in the in-RAM imap (lens A finding, 2026-07-16).
+    /// Kept as the in-RAM primitive it is; callers must know `frozen` is
+    /// consistent with every OTHER piece of in-RAM state before using it.
     pub fn thaw(&mut self) {
         self.current.copy_from_slice(&self.frozen);
     }

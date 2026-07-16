@@ -398,6 +398,72 @@ The UNAFS-K3 mount became read-WRITE at K4: `fs/unafs.rs`'s `write_sector` route
   - *Volume cap.* v3 geometry is capped at 2 GiB (`MAX_BLOCK_COUNT` = 524,288 — the
     one-indirect-level map bound); format AND mount refuse larger volumes with a clean
     Geometry error. Lifting the cap = adding an indirection level = a future format change.
+- **Retention-aware allocator + snapshot authority (K8b).** A snapshot is a RETAINED ROOT; the
+  allocator invariant is now load-bearing across multiple roots: **a block is free ⇔ it is
+  reachable from NO retained root AND not from the live root.** `snapshot_create` enforces this by
+  increfing EVERY block the committed root reaches through its inode map (the imap index + leaves,
+  each inode block, each data/spilled-attribute extent), so a block a snapshot lives on carries one
+  refcount per referencing root and can never be reallocated while any holder lives. `snapshot_drop`
+  is the exact inverse: it decrefs the identical block set (via the enqueue+drain path), freeing a
+  block iff no remaining root reaches it. The K8a security properties are UNWEAKENED — no committed
+  block is ever overwritten (allocation still requires current == frozen == 0), and the single
+  512 B root-flip stays the only in-place write; K8b only lets refcounts exceed 0/1. Crash safety:
+  the index-removal + queue-enqueue is ONE atomic commit, so a power cut mid-drop leaves the entry
+  on the persistent reclaim queue for the next mount's eager drain — no block lost, none
+  double-freed. **fsck extended (the standing STOP-class note in `fsck.rs` is discharged):** the
+  reachability walk now spans the live root AND every retained root, so a snapshot-only block is not
+  mis-reported as a leak; repair rebuilds TRUE multi-root refcounts (a flat count-of-1 rebuild would
+  under-count shared blocks, and a later drop could then free a block another root still lives on).
+  **Authority.** Snapshot drop is destructive and follows the BANDY owner-only-destructive ruling:
+  `SnapshotEntry::drop_permitted(invoker, kernel_principal)` admits the recorded creator principal
+  or the kernel. The library records the creator and exposes the decision; the enforcement point is
+  the ACL/verb layer. The only day-one drop surface is the kernel shell (`usnapdrop`), which runs at
+  kernel authority — the trivial `invoker == kernel_principal` case — so no new privileged path is
+  opened; the creator is recorded (`"kernel"` from the shell) for when a per-principal surface
+  arrives. v1 retention cap 16 is a clean policy refusal (`SnapshotCapReached`), not a format bound.
+- **Proof (K8b).** `:: K8b-snap: … PASS [w=0x7f] ::` (uncounted; REQUIREd in `pi4-regression.spec`)
+  — retain the committed tree, overwrite the live file, byte-verify the snapshot's OLD data blocks
+  still hold the OLD bytes read straight off the block device (never-overwrite + block sharing),
+  confirm a churn of fresh allocations never lands on the retained block set, drop → eager
+  reclamation frees the snapshot-only blocks (free count rises) fsck-clean and re-allocatable, and a
+  POWER CUT MID-DRAIN (the enqueue-only half + a genuine remount) converges (the queue resumes and
+  empties on the next mount). Self-cleaning. Host twins in `unafs/tests/snapshot_logic.rs` add the
+  tight-volume no-reuse pressure test, the two-snapshots-share-blocks / drop-one-keeps-the-other
+  case, the cap-16 refusal, and the owner-or-kernel authority matrix. QEMU-proven via `if=sd`
+  write-back; the metal proof rides the next attended Pi bench.
+- **K8b dual-lens review ledger (2026-07-16 — zero surviving must-fix after a THREE-PASS
+  fix-verify loop; the loop's history is itself the security story).** Lens A's initial
+  should-fix (a NoSpace-failing `snapshot_create` stranded its tree-wide increfs — in-RAM
+  mount poisoned, unrepairable in place) was fixed via `thaw()` unwind; lens A's re-verify
+  then REFUSED the fix with a reproduced MUST-FIX: entry-snapshot restore composed with the
+  K8a write path's un-unwound NoSpace residue put reachable blocks at refcount 0 in BOTH
+  views — the allocator legally reallocated live blocks (16 KiB of committed data overwritten
+  on disk in the probe; strictly worse than the pre-fix wedge). Final shape (LC ruling,
+  FIX-VERIFIED pass 3): **`txn_unwind` reloads root/imap/refmap from the COMMITTED root on
+  disk** via `load_committed` (the mount loader itself, factored — validation can never
+  drift), so unwind is committed-consistent by construction and HEALS prior write residue as
+  a side effect; a reload failure poisons the allocator CLOSED (no allocation, reads fine,
+  remount recovers). `RefMap::thaw` is dead code again by design (warning doc). Standing
+  NOTEs, each real but bounded:
+  - *K8a mutating paths still carry no unwind* (untouched — metal-confirmed code): their
+    NoSpace failure mode is the pre-existing safe WEDGE (frozen view blocks further commits;
+    remount recovers), now also healed opportunistically by the next failed snapshot txn.
+    A uniform txn discipline is future work (K8-batch territory).
+  - *fsck(false) is presence-not-magnitude* (doc caveat in fsck.rs): over-refcounts of
+    reachable blocks are invisible to the read-only scan; `repair` is the ground-truth rebuild.
+  - *fsck(true) on a poison-closed mount mid-inner-txn* is an untested edge (repair would walk
+    the mid-txn imap) — remount first is the recovery of record.
+  - *Snapshot-time vs current ACL*: a snapshot retains the OLD inode incl. its OLD K6 ACL
+    attrs. No snapshot READ path exists today (list/create/drop only), so the question is
+    dormant — **K8c must settle whether snapshot-mediated reads re-evaluate the CURRENT ACL**
+    before adding the diff-walk/read surface.
+  - *Creator stamping contract*: the library accepts an arbitrary creator string; every
+    current surface is privileged and hard-codes it. A future ring-3 snapshot surface MUST
+    stamp the kernel-authenticated principal (BANDY-STAMP discipline) and actually invoke
+    `drop_permitted` — the enforcement hook exists but is vacuous today.
+  - *Cap-16 is enforced at create only* (policy, per V1): mount/fsck accept an over-cap
+    hostile index (each entry still bounds-checked; O(n) fsck walks bounded by the 4 MiB
+    codec ceiling).
 
 ### Process & supply chain
 - [ ] Adversarial review before metal and before merge on every arc (standing rule, `CLAUDE.md`)

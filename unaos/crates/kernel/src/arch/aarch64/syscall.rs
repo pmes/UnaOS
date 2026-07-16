@@ -8559,6 +8559,14 @@ pub fn u7_launcher(demo_cpu: usize) {
     // fully self-cleaning (its scratch file is created and deleted inside the witness). Its own
     // uncounted `:: K8a-cow: … PASS ::` line; honest skip on media without a unafs partition.
     crate::fs::unafs::k8a_cow_selftest();
+    // K8b: prove retained roots (snapshots) + reclamation on the live card — snapshot the committed
+    // tree, overwrite the live file, byte-verify the snapshot's OLD blocks are untouched (never-
+    // overwrite + block sharing), confirm the retention-aware allocator never reuses a live
+    // snapshot's blocks, drop + eagerly reclaim (freeing only blocks no root still reaches), and a
+    // power-cut-mid-drain (enqueue-only + genuine remount) converges. Runs AFTER k8a_cow_selftest,
+    // fully self-cleaning (its scratch file + snapshots are dropped inside the witness). Its own
+    // uncounted `:: K8b-snap: … PASS ::` line; honest skip on media without a unafs partition.
+    crate::fs::unafs::k8b_snap_selftest();
     // K6: prove the U6 owner/grants ACL round-trips through the native unafs attribute volume (the
     // sidecar's successor) — forward+reverse codec, write+read+clear via the coherent mount. Runs
     // LAST, fully self-cleaning (leaves only the staged K3 fixtures). Its own uncounted

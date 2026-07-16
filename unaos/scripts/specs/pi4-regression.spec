@@ -80,6 +80,16 @@ FORBID K4-write:.*FAIL
 REQUIRE K8a-cow:.*PASS
 FORBID K8a-cow:.*FAIL
 
+# --- UNAFS-K8b retained-roots (snapshots) + reclamation witness (uncounted): snapshot the committed
+# --- tree, overwrite the live file, byte-verify the snapshot's OLD data blocks are untouched (the
+# --- never-overwrite + block-sharing core), confirm the retention-aware allocator never hands out a
+# --- block a live snapshot holds, drop + eager reclaim (freeing only blocks no live/retained root
+# --- still reaches), and a power-cut-mid-drain (enqueue-only + genuine remount) converges (the queue
+# --- resumes on remount). Self-cleaning. QEMU-proven via if=sd write-back; metal rides the attended
+# --- sitting.
+REQUIRE K8b-snap:.*PASS
+FORBID K8b-snap:.*FAIL
+
 # --- K4-ready native-attr projection codec witness (uncounted). Pure in-RAM codec/selftest
 # --- (runs every boot, no card needed) — METAL-CONFIRMED present 2026-07-12, now REQUIRE. -----
 REQUIRE K4-ready:.*prefix\) PASS

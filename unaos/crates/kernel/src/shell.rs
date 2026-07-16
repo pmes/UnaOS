@@ -2018,6 +2018,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             console.println("UNAFS:    uls [path], ucat <path>  (native unafs volume, absolute paths)");
             #[cfg(target_arch = "aarch64")]
             console.println("          utouch <path>, uwrite <path> <text>, umkdir <path>, urm <path>  (write-through)");
+            console.println("          usnaps, usnap <name>, usnapdrop <gen>  (retained roots / snapshots)");
             console.println("CLOCK:    date, setdate YYYY-MM-DD HH:MM[:SS]  (seeds mtime stamps; unset = honest dashes)");
             console.println("SMP:      sched (per-CPU run queues), pulse (full-screen CPU monitor)");
             console.println("TEST:     tste (in-OS self-test suite: boot-replay + live checks)");
@@ -2330,6 +2331,52 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             match args.first().copied() {
                 None => console.println("usage: urm <path>"),
                 Some(path) => console.println(&unafs_verb_rm(path)),
+            }
+        },
+        #[cfg(target_arch = "aarch64")]
+        "usnaps" => {
+            // K8b: list retained snapshots (the on-disk snapshot index) on the native unafs volume.
+            let out = crate::fs::unafs::with_unafs(|fs| match fs.snapshot_index() {
+                Ok(snaps) => {
+                    let mut lines = alloc::vec::Vec::new();
+                    if snaps.is_empty() {
+                        lines.push(String::from("  (no retained snapshots)"));
+                    } else {
+                        for s in &snaps {
+                            lines.push(alloc::format!(
+                                "  gen {:>6}  {:<16}  by {:<12}  @{}",
+                                s.generation, s.name, s.creator, s.timestamp
+                            ));
+                        }
+                        lines.push(alloc::format!("  ({} of {} snapshots)", snaps.len(),
+                            ::unafs::SNAPSHOT_CAP));
+                    }
+                    lines
+                }
+                Err(e) => alloc::vec![alloc::format!("usnaps: {:?}", e)],
+            });
+            match out {
+                Ok(lines) => for line in &lines { console.println(line); },
+                Err(e) => console.println(&alloc::format!("usnaps: no unafs volume ({:?})", e)),
+            }
+        },
+        #[cfg(target_arch = "aarch64")]
+        "usnap" => {
+            // K8b: retain the current committed tree as a snapshot (`usnap <name>`). The shell runs
+            // at kernel authority, so the creator principal recorded is "kernel" (owner-or-kernel
+            // drop authority then admits any later usnapdrop from this surface).
+            match args.first().copied() {
+                None => console.println("usage: usnap <name>"),
+                Some(name) => console.println(&unafs_verb_snap(name)),
+            }
+        },
+        #[cfg(target_arch = "aarch64")]
+        "usnapdrop" => {
+            // K8b: drop a retained snapshot by its generation stamp (`usnapdrop <generation>`).
+            // Reclamation drains eagerly; only blocks no live/retained root still reaches are freed.
+            match args.first().copied().and_then(|s| s.parse::<u64>().ok()) {
+                None => console.println("usage: usnapdrop <generation>"),
+                Some(generation) => console.println(&unafs_verb_snapdrop(generation)),
             }
         },
         "touch" => {
@@ -2876,5 +2923,36 @@ fn unafs_verb_rm(path: &str) -> String {
         Ok(Ok(())) => alloc::format!("urm: removed {}", path),
         Ok(Err(msg)) => alloc::format!("urm: {}: {}", path, msg),
         Err(e) => alloc::format!("urm: no unafs volume ({:?})", e),
+    }
+}
+
+/// `usnap <name>`: retain the current committed tree as a snapshot. The shell
+/// is a kernel-authority surface, so the creator principal is "kernel"
+/// (owner-or-kernel destructive authority — a later `usnapdrop` from this
+/// surface is always permitted). Returns the generation stamp.
+#[cfg(target_arch = "aarch64")]
+fn unafs_verb_snap(name: &str) -> String {
+    let ts = crate::arch::timer::cntpct();
+    match crate::fs::unafs::with_unafs(|fs| {
+        fs.snapshot_create(name.into(), "kernel".into(), ts)
+            .map_err(|e| alloc::format!("{:?}", e))
+    }) {
+        Ok(Ok(generation)) => alloc::format!("usnap: retained '{}' (generation {})", name, generation),
+        Ok(Err(msg)) => alloc::format!("usnap: {}: {}", name, msg),
+        Err(e) => alloc::format!("usnap: no unafs volume ({:?})", e),
+    }
+}
+
+/// `usnapdrop <generation>`: drop a retained snapshot; reclamation drains
+/// eagerly, freeing only blocks no live/retained root still reaches.
+#[cfg(target_arch = "aarch64")]
+fn unafs_verb_snapdrop(generation: u64) -> String {
+    match crate::fs::unafs::with_unafs(|fs| {
+        fs.snapshot_drop(generation)
+            .map_err(|e| alloc::format!("{:?}", e))
+    }) {
+        Ok(Ok(())) => alloc::format!("usnapdrop: dropped generation {} (blocks reclaimed)", generation),
+        Ok(Err(msg)) => alloc::format!("usnapdrop: generation {}: {}", generation, msg),
+        Err(e) => alloc::format!("usnapdrop: no unafs volume ({:?})", e),
     }
 }

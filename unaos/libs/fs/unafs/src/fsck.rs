@@ -44,10 +44,9 @@
 
 use crate::catalog::deserialize_catalog;
 use crate::fs::{FileSystemError, UnaFS};
-use crate::inode::ExtentList;
 use crate::root::ROOT_BLOCK;
 use crate::storage::{BLOCK_SIZE, BlockDevice};
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
 /// What a consistency pass found (and, in repair mode, healed).
@@ -94,6 +93,11 @@ impl<D: BlockDevice> UnaFS<D> {
     /// refcount map. With `repair == false` it only reports; with
     /// `repair == true` it scrubs catalog entries referencing dead inode ids,
     /// rewrites the refcount map to the computed truth, and commits.
+    ///
+    /// Caveat (ledgered NOTE): the read-only scan checks PRESENCE, not
+    /// MAGNITUDE — a block in-use *and* reachable reports clean even if its
+    /// stored count disagrees with the multi-root truth; only `repair == true`
+    /// (which rebuilds true per-root counts) corrects magnitude drift.
     pub fn fsck(&mut self, repair: bool) -> Result<FsckReport, FileSystemError> {
         let block_count = self.superblock.block_count;
 
@@ -142,18 +146,21 @@ impl<D: BlockDevice> UnaFS<D> {
         }
 
         // Phase 2: re-walk and rebuild the refcount map to the computed
-        // truth (K8a: every reachable block has exactly one referencing
-        // root, so count == 1; K8b's multi-root walk raises counts here).
-        let reach2 = self.reachability_walk()?;
+        // truth. K8b: a block's true refcount is the NUMBER of referencing
+        // roots — the live tree plus every retained snapshot that reaches it —
+        // so the rebuild counts multiplicities, not a flat 1 (a flat rebuild
+        // would under-count shared blocks and a later snapshot drop could then
+        // free a block another root still lives on).
+        let count_map = self.reachability_counts()?;
         let mut counts = alloc::vec![0u32; block_count as usize];
-        for &b in &reach2 {
+        for (&b, &n) in &count_map {
             if let Some(c) = counts.get_mut(b as usize) {
-                *c = 1;
+                *c = n;
             }
         }
         let mut reclaimed = 0u64;
         for block in 0..block_count {
-            if self.refmap_ref().is_used(block) && !reach2.contains(&block) {
+            if self.refmap_ref().is_used(block) && !count_map.contains_key(&block) {
                 reclaimed += 1;
             }
         }
@@ -170,40 +177,33 @@ impl<D: BlockDevice> UnaFS<D> {
         self.fsck(true)
     }
 
-    /// Add every block an extent list covers to `blocks`, bounded to the
-    /// volume span (hostile geometry marks nothing real).
-    fn mark_extent_blocks(&self, extents: &ExtentList, blocks: &mut BTreeSet<u64>) {
-        let volume = self.superblock.block_count;
-        for extent in extents {
-            let count = extent.length.div_ceil(BLOCK_SIZE);
-            for i in 0..count {
-                match extent.physical_block.checked_add(i) {
-                    Some(block) if block < volume => {
-                        blocks.insert(block);
-                    }
-                    _ => break,
-                }
-            }
-        }
+    /// The set of every block reachable from ANY of the volume's roots (the
+    /// live root and every retained snapshot). Used for leak detection: a
+    /// block counted in-use but in no root's reach is a leak. Derived from
+    /// [`reachability_counts`] (a block is reachable iff its count > 0).
+    fn reachability_walk(&mut self) -> Result<BTreeSet<u64>, FileSystemError> {
+        Ok(self.reachability_counts()?.into_keys().collect())
     }
 
-    /// Every block reachable from the volume's roots: the static system
-    /// blocks (superblock + root area), the committed inode-map and
-    /// refcount-map blocks, and the trees hanging from the reserved inodes
-    /// and the name tree. Read-only; cycle-guarded; any parse failure aborts
-    /// with `Err` so repair mode never acts on a partial walk.
-    fn reachability_walk(&mut self) -> Result<BTreeSet<u64>, FileSystemError> {
+    /// The TRUE refcount of every reachable block: how many roots reach it.
+    /// The live tree contributes the static system blocks (superblock + root
+    /// area), the committed inode-map and refcount-map blocks, and the trees
+    /// hanging from the reserved inodes and the name tree; each retained
+    /// snapshot (K8b) contributes the blocks its own root reaches through its
+    /// inode map. A block shared by N roots is counted N times — this is the
+    /// ground truth the persisted refcount map must match, and what repair
+    /// rebuilds. Read-only; any parse failure aborts with `Err` so repair
+    /// never acts on a partial walk.
+    fn reachability_counts(&mut self) -> Result<BTreeMap<u64, u32>, FileSystemError> {
         let block_count = self.superblock.block_count;
+        let mut counts: BTreeMap<u64, u32> = BTreeMap::new();
 
-        let mut blocks: BTreeSet<u64> = BTreeSet::new();
-        blocks.insert(0);
-        blocks.insert(ROOT_BLOCK);
+        // --- The live root ---
+        Self::bump_block(0, block_count, &mut counts);
+        Self::bump_block(ROOT_BLOCK, block_count, &mut counts);
         for b in self.map_blocks().collect::<Vec<_>>() {
-            if b < block_count {
-                blocks.insert(b);
-            }
+            Self::bump_block(b, block_count, &mut counts);
         }
-
         // Every ALLOCATED inode-map slot is a reference: under CoW the imap
         // is the pointer graph's spine (root → imap → inode → extents), so a
         // file with no directory name — the `create_inode` shape host
@@ -216,14 +216,54 @@ impl<D: BlockDevice> UnaFS<D> {
         for id in ids {
             let pb = self.imap_ref()[id as usize];
             let inode = self.read_inode(id)?;
-            blocks.insert(pb);
-            self.mark_extent_blocks(&inode.chunks, &mut blocks);
+            Self::bump_block(pb, block_count, &mut counts);
+            for e in &inode.chunks {
+                Self::bump_extent(e, block_count, &mut counts);
+            }
             for extents in inode.large_attributes.values() {
-                self.mark_extent_blocks(extents, &mut blocks);
+                for e in extents {
+                    Self::bump_extent(e, block_count, &mut counts);
+                }
             }
         }
 
-        Ok(blocks)
+        // --- Every retained snapshot root (K8b) ---
+        // A snapshot holds one reference to each block its inode-map tree
+        // reaches; `snapshot_blocks` enumerates exactly that set (the same set
+        // `snapshot_create` increfed and `snapshot_drop` decrefs), so bumping
+        // once per listed block reproduces the runtime refcounts precisely.
+        for snap in self.snapshot_index()? {
+            for b in self.snapshot_blocks(snap.imap_block, snap.imap_leaves)? {
+                Self::bump_block(b, block_count, &mut counts);
+            }
+        }
+
+        Ok(counts)
+    }
+
+    /// Bump one block's reachable-root count, bounded to the volume span.
+    fn bump_block(block: u64, block_count: u64, counts: &mut BTreeMap<u64, u32>) {
+        if block < block_count {
+            *counts.entry(block).or_insert(0) += 1;
+        }
+    }
+
+    /// Bump the count of every block a single extent covers (bounded to the
+    /// volume span; a hostile extent marks nothing real).
+    fn bump_extent(
+        extent: &crate::inode::Extent,
+        block_count: u64,
+        counts: &mut BTreeMap<u64, u32>,
+    ) {
+        let n = extent.length.div_ceil(BLOCK_SIZE);
+        for i in 0..n {
+            match extent.physical_block.checked_add(i) {
+                Some(block) if block < block_count => {
+                    *counts.entry(block).or_insert(0) += 1;
+                }
+                _ => break,
+            }
+        }
     }
 
     /// The set of inode ids the attribute catalog references (deduplicated).
