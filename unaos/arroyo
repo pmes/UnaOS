@@ -68,6 +68,18 @@ _feats=""
 # Default OFF; when unset the feature (and the kick-off) vanish and the tegra image is byte-identical
 # to baseline. The `tegrasmp` feature implies `tegra`. See arch_arm64.md §ORIN-SMP-3.
 [ -n "${UNAOS_TEGRASMP:-}" ] && _feats="${_feats}tegrasmp,tegra,"
+# JETSON-XCARVE M2: UNAOS_XCARVE=1 arms the inherited-xHCI-pointer instrumentation
+# (arch/aarch64/xusb_tegra.rs::jbxc_inherited_dump), fired at the top of jb2b_attach BEFORE the
+# no-HCRST takeover overwrites the inherited DCBAAP/CRCR/ERST. The `xcarve` feature implies `tegra`.
+# Default OFF; when unset the probe + call site vanish and the tegra image is byte-identical to
+# baseline (zero `JBXC` strings knob-off). See arch_arm64.md §JETSON-XCARVE.
+[ -n "${UNAOS_XCARVE:-}" ] && _feats="${_feats}xcarve,tegra,"
+# JETSON-XCARVE M1: UNAOS_XCARVE_RELINK=1 arms the relink-experiment pad (a `#[used]` inert
+# read-only pad static that perturbs image layout with ZERO semantic change). Rebuilds the
+# layout-correlated leg-23 image with a different layout to test the carveout's layout correlation.
+# The `xcarve_relink` feature implies `tegra`. Default OFF => the pad vanishes, byte-identical to
+# baseline.
+[ -n "${UNAOS_XCARVE_RELINK:-}" ] && _feats="${_feats}xcarve_relink,tegra,"
 if [ -n "$_feats" ]; then
     KERNEL_FEATURES="--features ${_feats%,}"
     echo -e "${COLOR_YELLOW}⚡ kernel features: ${_feats%,}${COLOR_RESET}"
