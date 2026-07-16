@@ -51,6 +51,12 @@ const PSCI_SYSTEM_OFF: u64 = 0x8400_0008; // queried by FEATURES only — never 
 /// ⇒ H3 warrants a proper low-trampoline follow-up.
 const LOW_ENTRY_SENTINEL: u64 = 0x8000_0000;
 
+/// The tegra UART base (UARTC, mirrors `serial::tegra::BASE` — kept local so the SMP-5 leg-17 BSP line
+/// can NAME the exact MMIO address the woken core's `serial_println!` will drive, BEFORE any `CPU_ON`,
+/// without touching `serial.rs`). Documentation-only: the AP print itself goes through the real
+/// `serial_println!` path (no new UART code); this const is never used to drive the UART.
+const TEGRA_UART_BASE_DOC: u64 = 0x0C28_0000;
+
 /// The experiment selected at compile time from `UNAOS_SMPPROBE` (default 0 = the safe control).
 pub const SEL: u32 = match option_env!("UNAOS_SMPPROBE") {
     Some(s) => parse_u32(s),
@@ -364,8 +370,16 @@ pub fn run(ctx: &ProbeCtx) {
     // ORIN-SMP-4 bisect leg family (values 10..16): the woken-core EXECUTION bisect that brackets the
     // SMP-3 RAS fault (see §ORIN-SMP-4). Dispatched separately from the SMP-2 experiment table because
     // each leg wakes ONE core into a MINIMAL entry adding exactly one variable over the previous leg.
-    if (10..=16).contains(&sel) {
+    // ORIN-SMP-5 extends it with the RESIDUE legs (17..20) — what leg 16's replica omitted vs the real
+    // flow: 17 = +AP serial print, 18 = +WFI tail, 19 = leg-16 shape on a cluster-1 core, 20 = the real
+    // 5-core wake sequence (see §ORIN-SMP-5). Legs 17..19 reuse the single-target bisect driver; leg 20
+    // has its own sequence driver.
+    if (10..=19).contains(&sel) {
         run_bisect_leg(ctx, sel);
+        return;
+    }
+    if sel == 20 {
+        run_5core_sequence(ctx);
         return;
     }
     for &(v, name, f) in EXPERIMENTS {
@@ -496,6 +510,8 @@ extern "C" fn __smpprobe_leg_rust(leg: u64) -> ! {
     // leg 16 (full-path replica): the remaining `__secondary_rust_virt` tail — per-CPU block, GICv3
     // redistributor wake + CPU interface, enable the IPI SGI + unmask IRQ, then ping the BSP. Built
     // from the same public building blocks the real path uses (so `smp_virt.rs` stays byte-untouched).
+    // Legs 17..20 all do this same full bring-up (they are "leg 16 + one variable" / leg-16 shape on a
+    // different target / the 5-core sequence).
     if leg >= 16 {
         percpu::init(PROBE_CORE_INDEX);
         gic::init_secondary_v3();
@@ -504,7 +520,27 @@ extern "C" fn __smpprobe_leg_rust(leg: u64) -> ! {
         let bsp = unsafe { core::ptr::read_volatile(&raw const PROBE_BSP_AFF) };
         gic::send_sgi(bsp as usize, PROBE_IPI_SGI);
     }
+    // leg 17 (ORIN-SMP-5) — THE VARIABLE: ONE `serial_println!` from the WOKEN CORE, i.e. the UART MMIO
+    // access + the `SERIAL_PORT` console spinlock taken BY A SECONDARY — exactly the "AP online" print the
+    // real `__secondary_rust_virt` does and the one the bisect deliberately forbade (RIDER: probe-only AP
+    // silence held for 10..16). Uses the SAME `serial_println!` path as the BSP (the bounded-THRE tegra
+    // writer in `serial.rs`) — no new UART code. If this access is the CBB-rejected one, the box RAS-powers
+    // off HERE, before the checkpoint store below → the BSP times out with the box down.
+    if leg == 17 {
+        serial_println!(
+            ":: tegra: SMPPROBE-5 sel=17 [AP] woken core online — serial_println! from the SECONDARY \
+             (UART MMIO + SERIAL_PORT spinlock; the residue variable) ::"
+        );
+    }
     set_checkpoint(leg as u32);
+    // leg 18 (ORIN-SMP-5) — THE VARIABLE: the real WFI idle tail. The replica parks in WFE; the real
+    // secondary path parks in WFI. The checkpoint is already raised (survival is recorded), so this only
+    // swaps the park instruction; the core is NOT expected to return.
+    if leg == 18 {
+        loop {
+            unsafe { core::arch::asm!("wfi", options(nomem, nostack, preserves_flags)) };
+        }
+    }
     loop {
         unsafe { core::arch::asm!("wfe", options(nomem, nostack, preserves_flags)) };
     }
@@ -714,6 +750,146 @@ core::arch::global_asm!(
         mov   x0, #16
         bl    {leg_rust}
 
+    // ── leg 17 (ORIN-SMP-5) — leg-16 shape + the AP serial print: same MMU-on prologue, tail leg=17 ──
+    .globl _smpprobe_leg17
+    _smpprobe_leg17:
+        adrp  x1, {stack}
+        add   x1, x1, #:lo12:{stack}
+        mov   x2, #({stack_size} >> 12)
+        lsl   x2, x2, #12
+        add   x3, x1, x2
+        mov   sp, x3
+        mrs   x7, CurrentEL
+        cmp   x7, #(2 << 2)
+        b.ne  _smpprobe_leg_wrongel_park
+        adrp  x4, {regs}
+        add   x4, x4, #:lo12:{regs}
+        ldr   x5, [x4, #{hcr_off}]
+        msr   hcr_el2, x5
+        isb
+        ldr   x6, [x4, #{cptr_off}]
+        msr   cptr_el2, x6
+        isb
+        ldr   x5, [x4, #{mair_off}]
+        msr   mair_el2, x5
+        ldr   x5, [x4, #{tcr_off}]
+        msr   tcr_el2, x5
+        ldr   x5, [x4, #{ttbr0_off}]
+        msr   ttbr0_el2, x5
+        tlbi  alle2
+        dsb   sy
+        isb
+        ldr   x5, [x4, #{sctlr_off}]
+        msr   sctlr_el2, x5
+        isb
+        mov   x0, #17
+        bl    {leg_rust}
+
+    // ── leg 18 (ORIN-SMP-5) — leg-16 shape + the WFI idle tail: same MMU-on prologue, tail leg=18 ──
+    .globl _smpprobe_leg18
+    _smpprobe_leg18:
+        adrp  x1, {stack}
+        add   x1, x1, #:lo12:{stack}
+        mov   x2, #({stack_size} >> 12)
+        lsl   x2, x2, #12
+        add   x3, x1, x2
+        mov   sp, x3
+        mrs   x7, CurrentEL
+        cmp   x7, #(2 << 2)
+        b.ne  _smpprobe_leg_wrongel_park
+        adrp  x4, {regs}
+        add   x4, x4, #:lo12:{regs}
+        ldr   x5, [x4, #{hcr_off}]
+        msr   hcr_el2, x5
+        isb
+        ldr   x6, [x4, #{cptr_off}]
+        msr   cptr_el2, x6
+        isb
+        ldr   x5, [x4, #{mair_off}]
+        msr   mair_el2, x5
+        ldr   x5, [x4, #{tcr_off}]
+        msr   tcr_el2, x5
+        ldr   x5, [x4, #{ttbr0_off}]
+        msr   ttbr0_el2, x5
+        tlbi  alle2
+        dsb   sy
+        isb
+        ldr   x5, [x4, #{sctlr_off}]
+        msr   sctlr_el2, x5
+        isb
+        mov   x0, #18
+        bl    {leg_rust}
+
+    // ── leg 19 (ORIN-SMP-5) — leg-16 shape on a CLUSTER-1 core: same MMU-on prologue, tail leg=19 ──
+    .globl _smpprobe_leg19
+    _smpprobe_leg19:
+        adrp  x1, {stack}
+        add   x1, x1, #:lo12:{stack}
+        mov   x2, #({stack_size} >> 12)
+        lsl   x2, x2, #12
+        add   x3, x1, x2
+        mov   sp, x3
+        mrs   x7, CurrentEL
+        cmp   x7, #(2 << 2)
+        b.ne  _smpprobe_leg_wrongel_park
+        adrp  x4, {regs}
+        add   x4, x4, #:lo12:{regs}
+        ldr   x5, [x4, #{hcr_off}]
+        msr   hcr_el2, x5
+        isb
+        ldr   x6, [x4, #{cptr_off}]
+        msr   cptr_el2, x6
+        isb
+        ldr   x5, [x4, #{mair_off}]
+        msr   mair_el2, x5
+        ldr   x5, [x4, #{tcr_off}]
+        msr   tcr_el2, x5
+        ldr   x5, [x4, #{ttbr0_off}]
+        msr   ttbr0_el2, x5
+        tlbi  alle2
+        dsb   sy
+        isb
+        ldr   x5, [x4, #{sctlr_off}]
+        msr   sctlr_el2, x5
+        isb
+        mov   x0, #19
+        bl    {leg_rust}
+
+    // ── leg 20 (ORIN-SMP-5) — leg-16 shape, reused per core by the 5-core sequence: tail leg=20 ──
+    .globl _smpprobe_leg20
+    _smpprobe_leg20:
+        adrp  x1, {stack}
+        add   x1, x1, #:lo12:{stack}
+        mov   x2, #({stack_size} >> 12)
+        lsl   x2, x2, #12
+        add   x3, x1, x2
+        mov   sp, x3
+        mrs   x7, CurrentEL
+        cmp   x7, #(2 << 2)
+        b.ne  _smpprobe_leg_wrongel_park
+        adrp  x4, {regs}
+        add   x4, x4, #:lo12:{regs}
+        ldr   x5, [x4, #{hcr_off}]
+        msr   hcr_el2, x5
+        isb
+        ldr   x6, [x4, #{cptr_off}]
+        msr   cptr_el2, x6
+        isb
+        ldr   x5, [x4, #{mair_off}]
+        msr   mair_el2, x5
+        ldr   x5, [x4, #{tcr_off}]
+        msr   tcr_el2, x5
+        ldr   x5, [x4, #{ttbr0_off}]
+        msr   ttbr0_el2, x5
+        tlbi  alle2
+        dsb   sy
+        isb
+        ldr   x5, [x4, #{sctlr_off}]
+        msr   sctlr_el2, x5
+        isb
+        mov   x0, #20
+        bl    {leg_rust}
+
     // ── shared tails ──
     .globl _smpprobe_leg_cp_park
     _smpprobe_leg_cp_park:                // x9 = CP_TAG | leg
@@ -751,6 +927,10 @@ unsafe extern "C" {
     fn _smpprobe_leg14();
     fn _smpprobe_leg15();
     fn _smpprobe_leg16();
+    fn _smpprobe_leg17();
+    fn _smpprobe_leg18();
+    fn _smpprobe_leg19();
+    fn _smpprobe_leg20();
 }
 
 /// The bisect leg entry symbol + a one-line description of the ONE variable it adds. Every fn is
@@ -763,7 +943,17 @@ static LEGS: &[(u32, unsafe extern "C" fn(), &str)] = &[
     (14, _smpprobe_leg14, "+exceptions::install() (per-core EL2 vectors)"),
     (15, _smpprobe_leg15, "+GICR: this_cpu_redistributor() + ONE GICR_WAKER read (PRIME SUSPECT)"),
     (16, _smpprobe_leg16, "full: +percpu + GICv3 secondary bring-up + IPI SGI (real-path replica)"),
+    (17, _smpprobe_leg17, "SMP-5: leg 16 + ONE serial_println! from the woken core (UART MMIO + SERIAL_PORT spinlock)"),
+    (18, _smpprobe_leg18, "SMP-5: leg 16 + the real WFI idle tail (replica parks WFE; the core is not expected to return)"),
+    (19, _smpprobe_leg19, "SMP-5: leg-16 shape on the CLUSTER-1 core (DTB aff 0x00010200)"),
+    (20, _smpprobe_leg20, "SMP-5: leg-16 shape, reused per core by the real 5-core wake sequence"),
 ];
+
+/// The cluster-1 target for leg 19 (RIDER: DTB-only presence — this must be present in `/cpus`). On
+/// Tegra234 the CCPLEX is 3 clusters × 2 cores; cluster-1 core 0 packs as {Aff2=1, Aff1=2, Aff0=0} =>
+/// `0x0001_0200` (the SMP-3 5-core sequence woke `0x10200`/`0x10300`). Leg 19 STOPs (no `CPU_ON`) if the
+/// DTB `/cpus` list does not name it.
+const CLUSTER1_AFF: u32 = 0x0001_0200;
 
 /// Bounded wait (`deadline` = a CNTPCT value) for `cond`; returns whether it held. Mirrors the SMP
 /// deadline pattern so a wedged core never hangs the boot.
@@ -820,11 +1010,30 @@ fn run_bisect_leg(ctx: &ProbeCtx, leg: u32) {
     let mut dtb_cores = [0u32; 8];
     let n_dtb =
         super::fdt_tegra::cpu_affinities(ctx.dtb_addr, ctx.dtb_size, ctx.ram_gib_mask, &mut dtb_cores);
+    // Leg 19 (ORIN-SMP-5) targets the CLUSTER-1 core specifically (DTB-only presence); every other leg
+    // takes the first non-BSP `/cpus` core (the SMP-2/3 target `0x00000100`).
     let mut target: Option<u32> = None;
-    for &a in dtb_cores.iter().take(n_dtb) {
-        if a != bsp_aff {
-            target = Some(a);
-            break;
+    if leg == 19 {
+        for &a in dtb_cores.iter().take(n_dtb) {
+            if a == CLUSTER1_AFF {
+                target = Some(a);
+                break;
+            }
+        }
+        if target.is_none() {
+            serial_println!(
+                ":: tegra: SMPPROBE-5 sel=19 — DTB /cpus does NOT name the cluster-1 core {:#010x} \
+                 (n={}, BSP aff={:#010x}); STOP, no CPU_ON ::",
+                CLUSTER1_AFF, n_dtb, bsp_aff
+            );
+            return;
+        }
+    } else {
+        for &a in dtb_cores.iter().take(n_dtb) {
+            if a != bsp_aff {
+                target = Some(a);
+                break;
+            }
         }
     }
     let target = match target {
@@ -855,6 +1064,33 @@ fn run_bisect_leg(ctx: &ProbeCtx, leg: u32) {
             None => serial_println!(
                 ":: tegra: SMPPROBE-4 sel=15 target aff={:#010x} matched NO GICR frame (walk found none); \
                  the woken core's this_cpu_redistributor() will itself STOP ::",
+                target
+            ),
+        }
+    }
+
+    // Leg 17 (ORIN-SMP-5 RIDER: name the address under test) — the woken core's `serial_println!` drives
+    // the tegra UART; PRINT its MMIO base BSP-side before any CPU_ON so the prediction can name it.
+    if leg == 17 {
+        serial_println!(
+            ":: tegra: SMPPROBE-5 sel=17 the woken core will serial_println! through tegra UART base {:#x} \
+             (UARTC; the console MMIO + SERIAL_PORT spinlock under test) ::",
+            TEGRA_UART_BASE_DOC
+        );
+    }
+
+    // Leg 19 (ORIN-SMP-5 RIDER: name the address under test) — leg-16 shape on the cluster-1 core; PRINT
+    // that core's resolved GICR frame BSP-side before any CPU_ON.
+    if leg == 19 {
+        match gic::redistributor_frame_for_affinity(target) {
+            Some(frame) => serial_println!(
+                ":: tegra: SMPPROBE-5 sel=19 cluster-1 target aff={:#010x} GICR frame={:#x}; GICR_WAKER @ {:#x} ::",
+                target,
+                frame,
+                frame + gic::GICR_WAKER_OFFSET
+            ),
+            None => serial_println!(
+                ":: tegra: SMPPROBE-5 sel=19 cluster-1 target aff={:#010x} matched NO GICR frame (walk found none) ::",
                 target
             ),
         }
@@ -908,14 +1144,16 @@ fn run_bisect_leg(ctx: &ProbeCtx, leg: u32) {
              added variable + parked) ::",
             leg, want
         );
-        if leg == 16 {
+        // Legs 16..19 all do the full leg-16 bring-up including the AP→BSP SGI ping — observe it.
+        if leg >= 16 {
             let deadline = timer::cntpct() + freq / 10;
             let ok = wait_until(deadline, || {
                 percpu::cpu(0).ipis.load(core::sync::atomic::Ordering::Acquire) > bsp_ipi_before
             });
             let after = percpu::cpu(0).ipis.load(core::sync::atomic::Ordering::Acquire);
             serial_println!(
-                ":: tegra: SMPPROBE-4 sel=16 AP -> BSP SGI {} (BSP ipi {} -> {}) — full path online ::",
+                ":: tegra: SMPPROBE-4 sel={} AP -> BSP SGI {} (BSP ipi {} -> {}) — full path online ::",
+                leg,
                 if ok { "OK" } else { "TIMEOUT" },
                 bsp_ipi_before,
                 after
@@ -930,4 +1168,119 @@ fn run_bisect_leg(ctx: &ProbeCtx, leg: u32) {
         );
     }
     serial_println!(":: tegra: SMPPROBE-4 sel={} leg DONE ::", leg);
+}
+
+/// ORIN-SMP-5 leg 20 — the real 5-core wake SEQUENCE. Wakes every non-BSP `/cpus`-named core (up to 5
+/// on Tegra234) into the leg-16-shape stub (`_smpprobe_leg20`), IN DTB ORDER, ONE AT A TIME: each core
+/// is woken, its checkpoint (`0x53040014`) polled under the bounded deadline, then the next is woken.
+/// The single `PROBE_STACK`/`CHECKPOINT`/percpu-slot are reused sequentially and safely (a woken core
+/// parks in WFE — off the stack — before the next `CPU_ON`; the checkpoint is re-zeroed each round). If
+/// the fault is driven by the multi-core sequence (SMP-3 woke five, tonight's single-core legs woke one)
+/// a RAS power-off fires mid-sequence — the pre-`CPU_ON` line names which core was under the gun. Runs
+/// LAST and only if 17..19 all survived (runbook rider). Probe-only; DTB-only presence.
+fn run_5core_sequence(ctx: &ProbeCtx) {
+    serial_println!(
+        ":: tegra: SMPPROBE-5 sel=20 — the real 5-core wake SEQUENCE (leg-16 shape per core, DTB order); \
+         a RAS power-off mid-sequence is DATA ::"
+    );
+
+    // The leg-20 stub (leg-16 shape; each core sets checkpoint 0x53040014).
+    let mut entry_fn: Option<unsafe extern "C" fn()> = None;
+    for &(v, f, _desc) in LEGS {
+        if v == 20 {
+            entry_fn = Some(f);
+        }
+    }
+    let entry = match entry_fn {
+        Some(f) => f as usize as u64,
+        None => return,
+    };
+
+    // RIDER 5 — the targets come from the DTB `/cpus` list, in order, minus the BSP.
+    let bsp_aff = gic::this_affinity();
+    let mut dtb_cores = [0u32; 8];
+    let n_dtb =
+        super::fdt_tegra::cpu_affinities(ctx.dtb_addr, ctx.dtb_size, ctx.ram_gib_mask, &mut dtb_cores);
+    let mut targets = [0u32; 8];
+    let mut n_targets = 0usize;
+    for &a in dtb_cores.iter().take(n_dtb) {
+        if a != bsp_aff {
+            targets[n_targets] = a;
+            n_targets += 1;
+        }
+    }
+    serial_println!(
+        ":: tegra: SMPPROBE-5 sel=20 BSP aff={:#010x}; {} non-BSP /cpus core(s) to wake in order ::",
+        bsp_aff, n_targets
+    );
+    if n_targets == 0 {
+        serial_println!(":: tegra: SMPPROBE-5 sel=20 — DTB /cpus named no non-BSP core; STOP, no CPU_ON ::");
+        return;
+    }
+
+    // Publish the regime/stack/BSP-affinity ONCE (reused by every woken core). Same publication the
+    // single-leg driver does.
+    unsafe { core::ptr::write_volatile(&raw mut PROBE_BSP_AFF, bsp_aff) };
+    gic::enable_sgi(PROBE_IPI_SGI);
+    capture_probe_regs();
+    cache::clean_range(&raw const PROBE_REGS as usize, core::mem::size_of::<ProbeRegs>());
+    cache::clean_invalidate_range(&raw const PROBE_STACK as usize, core::mem::size_of::<ProbeStack>());
+    cache::clean_range(&raw const PROBE_BSP_AFF as usize, core::mem::size_of::<u32>());
+
+    let freq = timer::cntfrq();
+    let freq = if freq == 0 { 62_500_000 } else { freq };
+    let want = cp_value(20);
+
+    let mut survived = 0usize;
+    for i in 0..n_targets {
+        let target = targets[i];
+
+        // Re-zero + clean the checkpoint so a previous core's raise cannot read as this core's.
+        unsafe { core::ptr::write_volatile(&raw mut CHECKPOINT as *mut u64, 0) };
+        cache::clean_range(&raw const CHECKPOINT as usize, core::mem::size_of::<Checkpoint>());
+        let bsp_ipi_before = percpu::cpu(0).ipis.load(core::sync::atomic::Ordering::Acquire);
+
+        serial_println!(
+            ":: tegra: SMPPROBE-5 sel=20 [{}/{}] issuing CPU_ON target aff={:#010x} entry={:#x} \
+             (survives => checkpoint {:#x}; RAS power-off => this core in the sequence is the wall) ::",
+            i + 1, n_targets, target, entry, want
+        );
+
+        let ret = smc(PSCI_CPU_ON, affinity_to_mpidr(target), entry, PROBE_CORE_INDEX as u64);
+        if ret != 0 {
+            serial_println!(
+                ":: tegra: SMPPROBE-5 sel=20 [{}/{}] CPU_ON RETURNED ERROR ret={} target aff={:#010x} — \
+                 not woken; continuing sequence ::",
+                i + 1, n_targets, ret, target
+            );
+            continue;
+        }
+
+        let deadline = timer::cntpct() + freq / 2;
+        let reached = wait_until(deadline, || read_checkpoint() == want);
+        if reached {
+            survived += 1;
+            let d2 = timer::cntpct() + freq / 10;
+            let ok = wait_until(d2, || {
+                percpu::cpu(0).ipis.load(core::sync::atomic::Ordering::Acquire) > bsp_ipi_before
+            });
+            serial_println!(
+                ":: tegra: SMPPROBE-5 sel=20 [{}/{}] target aff={:#010x} CHECKPOINT REACHED ({:#x}); \
+                 AP -> BSP SGI {} — core online ::",
+                i + 1, n_targets, target, want, if ok { "OK" } else { "TIMEOUT" }
+            );
+        } else {
+            let seen = read_checkpoint();
+            serial_println!(
+                ":: tegra: SMPPROBE-5 sel=20 [{}/{}] target aff={:#010x} CHECKPOINT NOT reached in ~500ms \
+                 (last read={:#x}); box up => wrong-EL park or hang (not a RAS reset); continuing ::",
+                i + 1, n_targets, target, seen
+            );
+        }
+    }
+    serial_println!(
+        ":: tegra: SMPPROBE-5 sel=20 SEQUENCE DONE — {}/{} cores reached checkpoint (box survived the \
+         full 5-core wake) ::",
+        survived, n_targets
+    );
 }
