@@ -323,12 +323,141 @@ change.
 - No-op change (e.g. a boot-reset `C_PORT_ENABLE`): `HUB slot N port P: no actionable
   connection change`
 
-**Metal verdict: PENDING** (attended rMBP sitting). QEMU exercises the M1 path — the
-qemu-xhci hub delivers a status-change bitmap for its boot-present port, so the config
-trace, the `status-change: port P` decode, and the `GET_PORT_STATUS` servicing all fire
-and are asserted in the `UNAOS_HUBSTORAGE` regression — but the connect/disconnect
-timing and the SS branch are silicon-verified at the bench (topology: a mouse/keyboard
-hot-plugged behind the HS hub, SS hub as available).
+**Metal verdict (2026-07-16, attended rMBP sitting; logs
+`rmbp-serial-2026-07-16-114357-boot2-knobon.log` primary +
+`…-113049-boot1-knoboff.log` supplement): M1+M2+M3 ✅ METAL-CONFIRMED.** Both hubs
+(HS and SS) configured + armed their Status Change Endpoints. Repeated live hub-port
+hot-plug cycles across ports 1/3/4: every disconnect tore down exactly the one
+downstream slot with the full scope trace (`root + sibling ports + other trees
+untouched`), every re-plug reset + re-enumerated the device through the existing route
+machinery, and a keyboard hot-plugged into a hub port typed immediately (single event
+per press — the §7e dup-guard also metal-clean). Storage and the FTDI mirror survived
+every cycle. A transient root-port `ADDRESS_DEVICE` code-17 during a large re-plug was
+absorbed by the pre-existing paced-retry recovery (§6) — the full stack held.
+
+**⚠ New metal findings (→ XENUM-3 seed, precisely characterized in the log):**
+(1) *A mouse behind the hub still strands* — but NOT via the condition XENUM-1's M2
+targets: the downstream device descriptor read completes **structurally valid with
+zeroed content** (`vid=0000 pid=0000`, "no HID interrupt endpoint"), so the
+`bLength/bDescriptorType` check passes and the M2 retry never fires. Likely a
+short/partial read (e.g. only the 8-byte header arrives for an FS/LS device behind the
+HS hub); the fix shape is retrying on zero vid+pid or checking the actual transfer
+length. (2) *`downstream ADDRESS_DEVICE code 17` has no retry* — the downstream
+addressing path gives up on first failure, unlike root ports' paced recovery. The same
+hub carried a working keyboard throughout, so the transport is sound; both gaps are in
+downstream-enumeration robustness.
+
+---
+
+### 7e. Keyboard interrupt-IN dup-Success guard (PORTSW-1 M0)
+
+The keyboard interrupt-IN arm had the identical latent gap the pointer path (§7a)
+already closes: a boot-keyboard report is 8 bytes, *always* shorter than the endpoint
+MPS, so it is exactly the short-packet case Panther Point's `XHCI_SPURIOUS_SUCCESS`
+quirk (device 0x1e31) fires on — the controller can post a *duplicate* Success for
+the same TD after the Short Packet. Harmless for the current external keyboard (no
+metal dup observed), but PORTSW-1 (§7f) brings the *internal* keyboard onto this exact
+path, where a dup would double-inject the keystrokes and over-arm the interrupt-IN ring.
+`queue_keyboard_read` now records the armed Normal-TRB physical address in
+`keyboard_expect_phys`, and the keyboard dispatch processes only the matching
+completion (mirroring `mouse_expect_phys`). QEMU posts no dup, so `param` always
+matches and the guard is transparent there. Metal proof: the `xHCI: KEY` /
+`USB-DEBUG: kbd report` lines stay 1-per-keypress (no doubles).
+
+### 7f. Panther Point EHCI→xHCI port switchover (PORTSW-1)
+
+The 2012 rMBP (MacBookPro10,1, Panther Point PCH, xHCI id **0x1e31**) wires the
+internal keyboard + trackpad to the **EHCI** companion controller by default; an
+xHCI-only driver never sees them. Panther Point can *re-route* its shared USB2 ports
+from EHCI to xHCI (and enable the SuperSpeed lanes) via four config registers on the
+xHCI PCI function:
+
+| off  | reg          | role                                            |
+|------|--------------|-------------------------------------------------|
+| 0xD0 | `XUSB2PR`    | USB2 routing SELECT (0 = EHCI, 1 = xHCI per port)|
+| 0xD4 | `USB2PRM`    | USB2 routing MASK (which USB2 bits are switchable)|
+| 0xD8 | `USB3_PSSEN` | SuperSpeed enable SELECT                          |
+| 0xDC | `USB3PRM`    | SuperSpeed routing MASK                           |
+
+Flipping the routable bits makes the internal devices **re-enumerate on the existing
+xHCI + HID stack** — the trackpad as a plain boot mouse via `SET_PROTOCOL(boot)` (§7a),
+the keyboard via the boot-kbd scancode map. No new HID code; this is the port flip plus
+its sequencing and witness.
+
+**Mask-read-before-write discipline.** The `*PRM` mask registers advertise which port
+bits are switchable on *this* silicon. The write is `current | (mask & mask)` —
+`SELECT |= mask` — so it sets **only advertised bits and clears none**; an unmasked /
+undefined bit is never written (writing one is undefined and can wedge the controller).
+If a mask reads 0 the silicon advertises no switchable ports of that class: the write is
+**skipped and reported**, never forced (a STOP tripwire). Ordering matches Linux
+`usb_enable_intel_xhci_ports()`: SuperSpeed enable before USB2 routing.
+
+**Sequencing.** The flip runs in `arch::x86_64::pci::init` **before** `xhci::init`
+resets and starts the controller — i.e. before enumeration, **one topology per boot,
+never re-flipped live** (re-flipping after storage enumerated could drop a block device
+mid-transaction).
+
+**Default-ON, opt-out knob (default fold, 2026-07-16).** The metal verdict below
+established that a no-routing boot drops *all* external USB on the 2012 rMBP, so per the
+pre-registered Maestro policy the flip now runs **by default** on x86. The opt-OUT is the
+`noportsw` Cargo feature (`UNAOS_NOPORTSW=1`, mapped in both `arroyo` and
+`builder/src/main.rs`), reserved for the never-run no-routing topology experiment: opted
+out, the routing function does not exist, **zero config-space writes**, byte-identical
+no-routing media. The flip logic and its mask discipline are unchanged from the M2
+opt-in — only the compile gate inverted (`#[cfg(not(feature = "noportsw"))]`) and the
+witness suffix now reads `(default-on)`.
+
+**⚠ Corrected metal-baseline framing (review fold).** The predecessor routing code
+(`89d10b1`, 2026-06-24) ran **unconditionally** on every x86 build, and every prior
+rMBP metal bench log (2026-07-08 → 07-15, incl. the mouse and XENUM-1 sittings) shows
+`Intel xHCI port routing applied (dev 0x1e31): USB3_PSSEN 0x0000000f->0x0000000f
+XUSB2PR 0x0000000f->0x0000000f`. Therefore on rMBP **metal**: **knob-ON reproduces the
+register state every prior bench ran** (XUSB2PR forced 0xf), and **knob-OFF is the
+NEW, never-run topology** — the reproducibility claim holds for QEMU only. Two open
+facts for the bench: (1) the internals were invisible even *with* XUSB2PR=0xf, so the
+arc's central hypothesis is already substantially falsified by existing metal — if the
+internal HID sits outside mask 0xf, the mask-disciplined flip cannot route it; (2) the
+**cold-boot XUSB2PR value was never captured** (the old line printed mask + post-write
+only) — if Apple EFI does not itself route the switchable ports, a knob-off boot could
+drop the *external* storage/input the regression baseline rides on. A knob-off build
+prints nothing here (the function doesn't exist), so the cold value is captured as the
+knob-ON witness's `before` field on the first flip after a genuine cold boot (or after
+knob-off boots only, which issue no writes and so preserve it).
+
+**Witness** (uncounted): `:: PORTSW-1: XUSB2PR mask=0x.. routed 0x..->0x.. +
+USB3_PSSEN mask=0x.. 0x..->0x.. (default-on) == witness ::`. The masks + before/after
+read-backs are the assertable record: after == `before | mask` confirms the mux
+toggled; a smaller value means firmware (Apple EFI) locked some shared-port bits.
+
+**QEMU is inert by design.** QEMU's qemu-xhci (0x1b36) doesn't model Panther-Point
+routing, so in the default build the code reads the register block (harmless) and prints
+the witness with `mask=0x0` / before == after (no write issued), then storage + MISSION run
+unregressed. The real verdict was the attended rMBP bench (below).
+
+**Metal verdict (2026-07-16, attended rMBP sitting, two cold boots):**
+
+- **Boot 1 (knob-OFF default) — externals DROPPED, the decisive outcome.** The kernel
+  booted (screen console + scrolling test ran) but every shared USB2 port was dead:
+  no FTDI serial, no external keyboard/mouse, storage never enumerated. Apple EFI does
+  **not** route the shared ports itself.
+- **Boot 2 (knob-ON, cold) — the first-ever cold-boot register capture:**
+  `XUSB2PR mask=0xf routed 0x0->0xf + USB3_PSSEN mask=0xf 0x0->0xf` — firmware leaves
+  **both at 0x0**. The kernel's write is the only thing putting those ports on xHCI.
+  With the flip, the full baseline returned (serial, storage chain + S8-write witness,
+  external input).
+- **Consequence (pre-registered Maestro policy, now triggered): the routing must be
+  default-ON on this platform.** Knob-OFF as a merge default is unsafe — it silences
+  serial, storage, and input at once. The default flip is a follow-up fold.
+- **Pre-registered bench findings, both answered negative:** the internal keyboard and
+  trackpad remained unresponsive with the flip active — they are NOT on the switchable
+  mask (consistent with the §7f framing analysis) — and the EHCI-1 scout (§9) read
+  **0 connected on every EHCI port** the same boot, so the internals are on neither
+  surface as read. The internal-HID line needs the deeper investigation the scout's
+  falsification branch pre-registered (both EHCI functions sat halted with
+  `CONFIGFLAG=0`, so "asleep until ownership/power setup" remains a candidate
+  explanation — analysis at the next arc boundary).
+- The M0 keyboard dup-guard held on metal: single `KEY` event per press throughout,
+  including from a keyboard hot-plugged behind the hub.
 
 ---
 
@@ -343,11 +472,70 @@ read/write, and HID input, plus **hub-downstream hot-plug** (the hub Status Chan
 Endpoint is configured and serviced — connect enumerates, disconnect tears down the
 route-scoped subtree). aarch64 uses a polled variant (no interrupts there yet). See
 §7c for the XENUM-1 enumeration-robustness fixes and §7d for XENUM-2 hub hot-plug.
+A **default-ON** Panther Point EHCI→xHCI **port switchover** (§7f, opt out with
+`UNAOS_NOPORTSW=1`, metal-gated policy) routes the 2012 rMBP shared USB2/USB3 ports onto
+xHCI before enumeration — required on that platform, where a no-routing boot drops all
+external USB (serial, storage, input).
 
 Not yet implemented: endpoint STALL recovery, multi-tier hubs, and broader class
 support. The `skip_xhci` Cargo feature (`UNAOS_SKIP_XHCI=1`) disables USB bring-up
 entirely — used on real hardware where firmware may still own the controller, so
 the video stack can come up promptly.
+
+---
+
+## 9. EHCI-1 scout — read-only EHCI reconnaissance (EHCI-1)
+
+PORTSW-1 (§7f) established from metal logs that the mask-disciplined USB2 routing write
+(`XUSB2PR = 0xf`, which ran unconditionally on every prior rMBP boot) does **not** surface
+the internal keyboard/trackpad — they sit outside the 4-port switchable mask, i.e. almost
+certainly on **EHCI-only** ports behind the Panther Point companion controllers. Before an
+EHCI driver arc is designed, the **EHCI-1 scout** answers what that driver would face,
+against real register evidence rather than assumption.
+
+**Strictly read-only (tripwire-grade).** The scout (`drivers/ehci_scout.rs`, x86_64-only)
+issues **only** PCI-config reads and MMIO reads off the EHCI BAR — zero writes to any
+controller register, PCI config register, or port. It never resets a port, never touches the
+BIOS/OS ownership semaphore or `CONFIGFLAG` (both are **read and reported**, never written),
+never changes run/stop, never rings a doorbell. A register that cannot be read without a side
+effect is skipped and reported as skipped. Each MMIO read is guarded by a page-table
+`translate()` check, so a BAR outside the firmware identity map reports honestly instead of
+taking a fault.
+
+**What it reports**, per EHCI function (class `0x0C0320`), in a bounded block bracketed by
+`:: EHCI-SCOUT: begin ::` … `:: EHCI-SCOUT: end (N controllers, M ports, K connected) ::`:
+BDF / vid:pid / BAR0 / IRQ line; PCI power state (PMCSR); the Intel RMH note (Panther Point
+EHCI ports sit behind an integrated **rate-matching hub**, so devices enumerate
+hub-downstream); the capability registers (`CAPLENGTH`, `HCIVERSION`, `HCSPARAMS` →
+N_PORTS/PPC/PRR/companion counts, `HCCPARAMS` → 64-bit-addr + EECP); the EHCI extended-cap
+`USBLEGSUP` BIOS/OS-owned semaphore state (read-only); the operational `USBCMD` (RS/run bit),
+`USBSTS` (HCHalted), `CONFIGFLAG` (CF: ports routed to EHCI vs companion); and each `PORTSC`
+(connect / enabled / reset / power / owner / line state).
+
+**Knob-gated, default-OFF.** Compiled only under the `ehciscout` Cargo feature
+(`UNAOS_EHCISCOUT=1`, mapped in both `arroyo` and `builder/src/main.rs`). Knob-off: the module
+is unlinked, no probe runs, media byte-identical.
+
+**QEMU target + result.** q35's default device set has no EHCI, so under the knob the builder
+attaches a standalone `-device usb-ehci` (harness-only, not a kernel write path). The scout
+then reports that controller: `8086:24cd`, 6 ports, `CAPLENGTH=0x20`, `HCCPARAMS` EECP=0x68,
+`USBLEGSUP` BIOS=0/OS=0, controller halted (`RS=0`, `HCHalted=1`), `CONFIGFLAG=0`
+(ports routed to the companion), all ports powered, **0 connected** — the honest QEMU
+baseline (QEMU attaches no downstream device). The real value is the attended rMBP bench: the
+`PORTSC` block there shows whether the internals sit connected on EHCI ports and who owns them.
+
+The scout's analysis, pre-registered metal expectations, and the recommended EHCI-driver-arc
+shape live in the SCOUT report (`~/.claude/plans/unaos/review/unaos-ehci1-SCOUT.md`).
+
+**Metal result (2026-07-16, attended rMBP sitting): the falsification branch fired.** Both
+Panther Point EHCI functions (`8086:1e26`, `8086:1e2d`) were surveyed on silicon: both sat
+**halted** (`RS=0`, `HCHalted=1`) with `CONFIGFLAG=0` and **0 connected across all 4 ports** —
+the internal keyboard/trackpad are visible on neither the switchable xHCI mask (§7f, flip
+active the same boot) nor the EHCI `PORTSC` blocks as read. Per the pre-registered rule, no
+EHCI driver arc proceeds on this evidence; the open question for the next investigation is
+whether the internals only appear after ownership/`CONFIGFLAG`/port-power setup (both
+controllers were asleep, so "not connected" and "not visible while unconfigured" cannot yet
+be distinguished), or whether they attach elsewhere entirely (e.g. SPI, as on later models).
 
 ---
 

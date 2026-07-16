@@ -631,6 +631,18 @@ pub struct DeviceSlot {
     pub keyboard_intf: u8,
     pub keyboard_state: u8,
     pub keyboard_ring: Option<TransferRing>,
+    /// Physical address of the interrupt-IN Normal TRB the keyboard read was last armed with
+    /// (0 = none armed). The keyboard interrupt-IN dispatch requires an exact match for the SAME
+    /// reason the pointer read does (`mouse_expect_phys`): Panther Point (Linux
+    /// XHCI_SPURIOUS_SUCCESS quirk, device 0x1e31) can post a duplicate Success event after a
+    /// Short Packet for the same TD — and a boot-keyboard report (8 bytes) is ALWAYS shorter than
+    /// the endpoint MPS, so this is exactly the periodic short-packet case the quirk fires on.
+    /// Without the match, a dup would re-decode the same report (double-injected keystrokes) AND
+    /// re-arm a second read (ring over-arm). Harmless for the current EXTERNAL keyboard (no metal
+    /// dup observed) but PORTSW-1 brings the INTERNAL keyboard onto this exact path, so the guard
+    /// mirrors the pointer path pre-emptively. Set in `queue_keyboard_read`, matched in the
+    /// interrupt-IN transfer dispatch. On QEMU (no dup) `param` always matches, so it never trips.
+    pub keyboard_expect_phys: u64,
 
     pub descriptor_buffer: *mut u8,
 
@@ -723,6 +735,7 @@ impl DeviceSlot {
             keyboard_intf: 0,
             keyboard_state: 0,
             keyboard_ring: None,
+            keyboard_expect_phys: 0,
             descriptor_buffer: desc_buffer,
             ep0_expect_phys: 0,
             is_downstream: false,
@@ -791,6 +804,7 @@ impl DeviceSlot {
         self.keyboard_interval = 0;
         self.keyboard_intf = 0;
         self.keyboard_state = 0;
+        self.keyboard_expect_phys = 0;
         self.ep0_expect_phys = 0;
         self.is_downstream = false;
         self.route_string = 0;
@@ -1968,6 +1982,19 @@ impl XhciController {
                                         }
                                     } else if keyboard_dci == Some(endpoint_id as u8) {
                                         // --- KEYBOARD ---
+                                        // Panther-Point dup-Success guard (XHCI_SPURIOUS_SUCCESS,
+                                        // device 0x1e31), identical to the pointer path: a boot-kbd
+                                        // report is ALWAYS shorter than the endpoint MPS, so the
+                                        // controller can post a duplicate Success for the SAME TD
+                                        // after the Short Packet. Only the completion whose TRB
+                                        // matches the armed read is real; a dup would double-inject
+                                        // the keystrokes and over-arm the interrupt-IN ring. On QEMU
+                                        // (no dup) `param` always matches, so this never trips.
+                                        if slot.keyboard_expect_phys != 0 && param != slot.keyboard_expect_phys {
+                                            xdbg!("xHCI: stale/spurious keyboard event (slot {}, trb {:#x}, expected {:#x}); ignoring.",
+                                                slot_id, param, slot.keyboard_expect_phys);
+                                            return;
+                                        }
                                         if let Some(data_buf_ptr) = slot.data_buffer {
                                             let report = core::slice::from_raw_parts(data_buf_ptr, 8);
                                             // Metal diagnostic: dump the raw report bytes so that if a keyboard
@@ -5473,7 +5500,13 @@ impl XhciController {
                 status: self.slots[slot_id as usize].keyboard_mps as u32,
                 control: (1 << 10) | (1 << 5), // Type 1 (Normal) | IOC
             };
-            self.slots[slot_id as usize].keyboard_ring.as_mut().unwrap().push(in_trb).unwrap();
+            let idx = self.slots[slot_id as usize].keyboard_ring.as_mut().unwrap().push(in_trb).unwrap();
+            // Record the physical address of the Normal TRB we just armed so the transfer dispatch
+            // can match a real completion against it and reject a Panther-Point dup-Success for the
+            // already-consumed TD (see `keyboard_expect_phys`). Mirrors `queue_mouse_read`.
+            let ring_base = self.slots[slot_id as usize].keyboard_ring.as_ref().unwrap().get_ptr();
+            self.slots[slot_id as usize].keyboard_expect_phys =
+                ring_base + (idx as u64 * core::mem::size_of::<Trb>() as u64);
             self.ring_doorbell(slot_id, dci as u32);
             xdbg!("xHCI: Keyboard Read Queued.");
         }

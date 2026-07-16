@@ -61,6 +61,20 @@ videobench = []
 # panic backdrop) still cover the whole real panel via an uncapped twin handle. Enable via
 # `UNAOS_VIDEOCAP=1`. Default OFF => byte-identical.
 videocap = ["videobench"]
+# PORTSW-1: Panther Point EHCI->xHCI port switchover for the 2012 rMBP internal keyboard/trackpad.
+# DEFAULT-ON (metal-gated policy 2026-07-16: the no-routing boot dropped ALL external USB on the 2012
+# rMBP). The config-space port-routing write (arch/x86_64/pci.rs::enable_intel_xhci_ports) runs by
+# default with mask-read-before-write discipline, applied before enumeration. This `noportsw` OPT-OUT
+# feature (UNAOS_NOPORTSW=1) SUPPRESSES the flip for the never-run no-routing topology experiment =>
+# zero register writes => byte-identical no-routing media. x86_64 only (the gated call site is
+# x86-only; aarch64 media are byte-identical). Inert on QEMU (non-Intel xHCI).
+noportsw = []
+# EHCI-1 scout: UNAOS_EHCISCOUT=1 arms a STRICTLY READ-ONLY EHCI reconnaissance probe (PCI-config +
+# MMIO reads only — zero writes to any register/port) that dumps the EHCI companion controllers'
+# capability/operational/PORTSC state at boot, so an EHCI driver arc can be planned against real
+# register evidence (the 2012 rMBP internal kbd/trackpad are on EHCI-only ports). x86_64-only module;
+# default OFF => module unlinked, media byte-identical. Enable via `UNAOS_EHCISCOUT=1`.
+ehciscout = []
 # SOCK-1: route the shell's ping/arp/netinfo through the mature smoltcp TCP/IP stack (ROADMAP §1b)
 # instead of the hand-rolled `net` engines. Pulls in the x86-only smoltcp optional dependency and
 # compiles the `smolnet` Device adapter over the e1000e rings (the module is additionally

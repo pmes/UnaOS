@@ -10,6 +10,113 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-rmbp track — 2026-07-16 (STOR-1 S9 — dynamic on-disk file GROWTH: past-EOF write extends live, bounded) 🔬
+
+**What it does.** Retires S8's overwrite-only constraint the S-chain way: a past-EOF
+write on a dynamic RW descriptor (`open_dynamic_ondisk`, non-staged / non-U10, knob-on
+`irqstorage`) now GROWS the file synchronously on the live volume instead of returning 0.
+The extend routes through a new `dyn_write_grow` → `dyn_grow_live` → the storage service
+task's existing `Grow` op (`submit_grow` → `fat::write_grow`: alloc + zero-fill + chain +
+bump the directory size LAST) — the S4 grow shape reused for a non-staged file. An in-EOF
+write keeps S8's in-place overwrite unchanged.
+
+**Growth bounds (the DoS ledger).** PER-WRITE `DYN_GROW_MAX` = one page (4096 B): one
+bounce buffer, one atomic `submit_grow`, no chunk loop; a longer write returns the
+page-clamped count. PER-FILE `DYN_FILE_MAX` = 64 KiB: an absolute EOF ceiling (a target
+offset at/past it is `-ENOSPC`, a crossing write clamps) — not opened-size relative, so a
+close+reopen cannot walk a file past it. -EIO honesty: disk written first, size-before-
+offset publish, a failed grow leaves the descriptor and the on-disk size untouched (no
+half-acknowledged extend). No `ns_lock` (S5 deadlock class stays closed). New hardening:
+`open_dynamic_ondisk` refuses a RW open on `SHARED_ROW`, so a dynamic RW descriptor is
+always a private single-writer slot (the grow's un-CAS'd offset advance races nothing;
+tightens S8's overwrite path too). S8's staged/U10 exclusion set + MF2 uppercase-canon
+refusal + public-by-default ACL are unchanged — S9 widens *how* an already-writable file
+is written, never *which* files are writable.
+
+**How it was tested.** `./arroyo check` both arches 0 new warnings, zero aarch64 diff.
+Knob-ON `UNAOS_IRQSTORAGE=1 UNAOS_FATIMG=sf test 240`: new `S9-grow … witness OK`
+(`s9_grow_witness` grows a throwaway S9G.BIN 0→96, `submit_stat` confirms the on-disk
+grow, readback matches, a write at the 64 KiB ceiling refused `-ENOSPC`, `hello.bin` RW
+still refused) — mbench **22/22, 0 forbidden**, S8-write witness intact (its obsolete
+past-EOF-returns-0 leg retired, now purely in-EOF overwrite). Knob-OFF byte-identical
+(0 S9 lines, 0 FAIL). `UNAOS_NOSTORAGE=1 test 90` clean. `test-arm 22` MISSION SUCCESS.
+Residual (ledgered, mirrors S8's user-pointer NOTE): the per-write page clamp is
+review-verified not witnessed (no user memory mappable from the launcher); the per-file
+`-ENOSPC` ceiling IS witnessed. **Metal: PENDING** — `round6-rmbp.spec` `PENDING S9-grow`
+promotes to REQUIRE after the attended rMBP bench. Commits `8788cb7` (M1 grow path),
+`549941f` (M2 witness + specs), `cb75c87` (M2 fold: S8 witness/spec). Lane:
+`arch/x86_64/syscall.rs` + specs; `fat.rs`/`irqstorage.rs` reused unchanged.
+
+## hw-rmbp track — 2026-07-16 (R17 attended rMBP sitting — four verdicts in two cold boots)
+
+One sitting (logs `rmbp-serial-2026-07-16-114357-boot2-knobon.log` primary,
+`…-113049-boot1-knoboff.log` supplement) settled every metal-pending x86 arc below:
+
+- **XENUM-2 ✅ METAL-CONFIRMED (M1+M2+M3).** Both hubs armed their Status Change
+  Endpoints; live hub-port hot-plug cycles on ports 1/3/4 all detected, enumerated, and
+  tore down with the exact scope trace; a keyboard hot-plugged behind the hub typed
+  immediately, single event per press. Two NEW downstream-robustness gaps precisely
+  characterized (→ XENUM-3 seed, `usb_xhci.md` §7d): a structurally-valid-but-zeroed
+  descriptor evades the M2 retry and strands a hub-downstream mouse; downstream
+  `ADDRESS_DEVICE code 17` has no retry.
+- **PORTSW-1 — the decisive topology answer.** Boot 1 (knob-off default): externals
+  DROPPED (no serial/storage/input; kernel alive on screen). Boot 2 (knob-on, cold):
+  first-ever cold capture `XUSB2PR 0x0→0xf`, `USB3_PSSEN 0x0→0xf` — Apple EFI routes
+  nothing; our write is load-bearing. **Pre-registered policy triggered: routing goes
+  default-ON on this platform (follow-up fold).** Internals unresponsive with the flip
+  active (pre-registered negative). M0 kbd dup-guard ✅ metal-clean.
+- **PORTSW-1 default-ON fold 🔬 (evidence-gated).** The pre-registered policy landed: the
+  mask-disciplined flip (`enable_intel_xhci_ports`, unchanged) now runs BY DEFAULT on x86
+  — the compile gate inverted (`#[cfg(not(feature = "noportsw"))]`), the opt-in `portsw`
+  feature / `UNAOS_PORTSW` knob replaced by an opt-OUT `noportsw` / `UNAOS_NOPORTSW` (for
+  the never-run no-routing experiment), and the witness suffix now reads `(default-on)`.
+  QEMU-green (mask=0x0 inert read-back, MISSION SUCCESS on and off the knob); the metal
+  rationale is already ✅ (Boot 1 no-routing dropped all external USB). `usb_xhci.md` §7f.
+- **CLOCK-X1 ✅ METAL-CONFIRMED.** `clock: TSC calibrated ~2693 MHz (invariant)` + the
+  witness fired live (uptime 14→15 s) — the x86 wall clock advances on silicon.
+- **EHCI-1 scout — the falsification branch fired.** Both EHCI functions halted,
+  `CONFIGFLAG=0`, 0 connected on all 4 ports: the internals are visible on neither
+  surface as read; no EHCI driver arc proceeds on this evidence (open question:
+  asleep-until-configured vs not-USB-attached).
+
+Baseline all green throughout Boot 2: storage chain + S8-write + CFU witnesses, both
+pointer/keyboard paths, FTDI mirror; one transient root-port `ADDRESS_DEVICE code 17`
+during a large re-plug absorbed by the pre-existing paced-retry recovery.
+
+## hw-rmbp track — 2026-07-16 (EHCI-1 — read-only EHCI reconnaissance scout: what an EHCI driver arc would face)
+
+### EHCI-1 — read-only EHCI reconnaissance scout 🔬 `hw-rmbp`
+
+**What it does:** PORTSW-1 established from metal logs that the mask-disciplined USB2 routing write
+(`XUSB2PR = 0xf`) does not surface the 2012 rMBP internal keyboard/trackpad — they sit outside the
+switchable mask, i.e. almost certainly on **EHCI-only** ports behind the Panther Point companion
+controllers. Before an EHCI driver arc is designed, this **scout** (`drivers/ehci_scout.rs`,
+x86_64-only) answers what it would face, against real register evidence. **Strictly read-only**
+(Maestro tripwire-grade): only PCI-config reads and MMIO reads off the EHCI BAR — **zero writes** to any
+controller register, PCI config register, or port; no port reset, no ownership handoff (the BIOS/OS
+`USBLEGSUP` semaphore and `CONFIGFLAG` are read and reported, never written), no run/stop change, no
+doorbell. Each MMIO read is guarded by a page-table `translate()` check, so a BAR outside the firmware
+identity map reports honestly instead of faulting. Per EHCI function (class `0x0C0320`) it dumps, in a
+bounded `:: EHCI-SCOUT: begin ::` … `:: EHCI-SCOUT: end (N controllers, M ports, K connected) ::` block:
+BDF/vid:pid/BAR0/IRQ, PCI power state (PMCSR), the Intel RMH note, capability regs
+(`CAPLENGTH`/`HCIVERSION`/`HCSPARAMS`/`HCCPARAMS`+EECP), the `USBLEGSUP` BIOS/OS-owned semaphore, the
+operational `USBCMD`/`USBSTS`/`CONFIGFLAG`, and each `PORTSC` (connect/enabled/reset/power/owner/line).
+**Knob-gated, default-OFF** (`UNAOS_EHCISCOUT=1`, mapped in `arroyo` + `builder/src/main.rs`); knob-off
+the module is unlinked and media byte-identical.
+
+**How it was tested:** 🔬 QEMU. `./arroyo check` both arches knob on+off, **no new warnings, zero
+aarch64 diffs**. Knob-OFF `test 25` MISSION SUCCESS with **zero EHCI lines**; `test-arm 22` MISSION
+SUCCESS. Knob-ON `test 25` MISSION SUCCESS + the EHCI-SCOUT block prints against the harness `usb-ehci`
+target (q35 has no EHCI by default, so the builder attaches `-device usb-ehci` under the knob only —
+harness-only, not a kernel write path): `8086:24cd`, 6 ports, `CAPLENGTH=0x20`, `HCCPARAMS` EECP=0x68,
+`USBLEGSUP` BIOS=0/OS=0, halted (`RS=0`/`HCHalted=1`), `CONFIGFLAG=0`, all ports powered, **0 connected**
+— the honest QEMU baseline (no downstream device attached). `UNAOS_IRQSTORAGE=1 UNAOS_FATIMG=sf test 200`
+storage chain **0 FAIL**, S8-write intact. **Metal verdict: PENDING** — the value is the attended rMBP
+bench, where the `PORTSC` block shows whether the internals sit connected on EHCI ports and who owns
+them. Analysis + pre-registered metal expectations + recommended driver-arc shape:
+`~/.claude/plans/unaos/review/unaos-ehci1-SCOUT.md`; probe detail §9 of
+`docs/dev/OS/07_USB_STORAGE/usb_xhci.md`.
+
 ## hw-pi4 track — 2026-07-16 (BANDY — the on-UnaOS SMessage bus + midden, program #3)
 
 ### BANDY-2 — the write-side bus verbs (write/rm/mv), kernel fulfillment + ACL discipline ✅✅ METAL-CONFIRMED 2026-07-16 (same-day, same boot as BANDY-1: MBENCH 42/42 + 0 forbidden off `main 49f2333`; BANDY-CODEC2/WR/EQ2/ACL + BANDY-GRANT [w=0x7f] all PASS on silicon; log `pi-serial-2026-07-16-111850.log`)
@@ -98,6 +205,45 @@ sitting: `setdate`→`date` advances, `uptime` runs, FAT mtimes stamp real times
 `docs/dev/OS/01_BOOT_HAL/arch_x86_64.md`.
 
 ## hw-rmbp track — 2026-07-16 (PORTSW-1 — Panther Point EHCI→xHCI port switchover: internal kbd + trackpad)
+
+### PORTSW-1 — Panther Point EHCI→xHCI port switchover 🔬 `hw-rmbp`
+
+**What it does:** the 2012 rMBP wires its internal keyboard + trackpad to the **EHCI** companion
+controller by default, so the xHCI-only driver never sees them (every prior bench used external USB
+input). Panther Point (PCH xHCI id 0x1e31) can re-route its shared USB2 ports EHCI→xHCI (and enable the
+SuperSpeed lanes) via four config registers on the xHCI PCI function — `XUSB2PR` @0xD0 / `USB2PRM` @0xD4
+(mask) / `USB3_PSSEN` @0xD8 / `USB3PRM` @0xDC (mask). Flipping the routable bits makes the internal
+devices **re-enumerate on the existing xHCI + HID stack** (trackpad as a boot mouse via
+`SET_PROTOCOL(boot)`, keyboard via the boot-kbd map) — no new HID code. **M0 — keyboard dup guard
+(prereq):** the keyboard interrupt-IN arm had the same latent Panther-Point `XHCI_SPURIOUS_SUCCESS`
+dup-Success gap the pointer path already closes; a boot-kbd report is always shorter than the endpoint
+MPS. Added `keyboard_expect_phys` (mirrors `mouse_expect_phys`) so a dup can't double-inject keystrokes
+or over-arm the ring — landed first so the internal keyboard is dup-safe the moment it enumerates. **The
+flip:** `arch/x86_64/pci.rs::enable_intel_xhci_ports`, run in PCI `init` **before** `xhci::init` (before
+enumeration, one topology per boot, never re-flipped live). **Mask-read-before-write discipline:** the
+write is `SELECT |= (mask & mask)` — sets only advertised bits, clears none, never touches an unmasked
+bit; a mask that reads 0 skips the write and reports (STOP tripwire). **Knob-gated, default-OFF:**
+compiled only under the `portsw` feature (`UNAOS_PORTSW=1`, mapped in `arroyo` + `builder/src/main.rs`);
+knob-off = zero config writes = byte-identical media. Additive to the enum/HID path; no
+`syscall.rs`/`fat.rs`/`sched.rs`, no aarch64. **⚠ Corrected metal-baseline framing (review fold):** the
+predecessor routing (`89d10b1`) ran unconditionally, and every prior rMBP metal log shows
+`XUSB2PR 0xf->0xf` — so on metal **knob-ON reproduces the register state every prior bench ran** and
+**knob-OFF is the new, never-run topology** (the byte-identity/reproducibility claim is QEMU-only).
+The internals were invisible even *with* XUSB2PR=0xf (premise substantially falsified by existing metal);
+the cold-boot XUSB2PR value was never captured — both resolved at the sitting (see usb_xhci.md §7f).
+
+**How it was tested:** 🔬 QEMU (qemu-xhci 0x1b36 doesn't model Panther-Point routing — the flip is inert
+there by design; the gate proves knob-off identity + knob-on no-regression + the witness read-back).
+`./arroyo check` both arches, knob on+off, no new warnings, zero aarch64 diffs. **Knob-OFF:** `test 25`
+MISSION SUCCESS with **zero PORTSW lines / zero register writes**; `UNAOS_FATIMG=sf test 200` storage
+chain 0 FAIL (U11m2 PASS); `test-arm 22` MISSION SUCCESS; `UNAOS_NOSTORAGE=1` clean (U1b PASS, kernel
+alive). **Knob-ON:** `test 25` MISSION SUCCESS + the witness prints its mask read-back —
+`:: PORTSW-1: XUSB2PR mask=0x0 routed 0x0->0x0 + USB3_PSSEN mask=0x0 0x0->0x0 (knob-on) == witness ::`
+(before == after: no write issued, inert as expected on QEMU); `UNAOS_FATIMG=sf test 200` storage chain
+0 FAIL. **Metal verdict: PENDING** (attended rMBP sitting — the flip is inert in QEMU so metal is the
+whole verdict: does the internal kbd/trackpad enumerate + honor boot protocol post-flip; runbook keeps
+one variable per boot: external-mouse boot proves the EP path, then a separate knob-on boot flips). Detail:
+§7e (M0) + §7f (switchover) of `docs/dev/OS/07_USB_STORAGE/usb_xhci.md`.
 
 ## aarch64 SMP — ORIN-SMP-6: the LAST-DIFFERENCES legs (`UNAOS_SMPPROBE=21..23`) — 2026-07-16 🔬 QEMU-green, bench pending `hw-jetson`
 

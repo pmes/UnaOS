@@ -70,21 +70,41 @@ pub unsafe fn write_config_32(bus: u8, slot: u8, func: u8, offset: u8, value: u3
     data.write(value);
 }
 
-/// Intel PCH xHCI port routing. On Intel chipsets (e.g. Panther Point in the 2012 MacBook Pro
-/// Retina) the USB2 ports are physically shared with an EHCI companion controller and default to
-/// EHCI; the SuperSpeed lanes likewise need enabling. We route every *switchable* port to xHCI by
-/// copying the routing-MASK registers (USB2PRM @ 0xD4 / USB3PRM @ 0xDC = "which ports CAN switch")
-/// into the routing-SELECT registers (XUSB2PR @ 0xD0 / USB3_PSSEN @ 0xD8). Without this the xHCI
-/// sees no devices on the shared ports. Gated to the specific Intel xHCI device ids that have an
-/// EHCI companion; a clean no-op on everything else (QEMU's qemu-xhci is vendor 0x1b36, not Intel).
+/// PORTSW-1: Intel PCH xHCI port switchover (EHCI->xHCI). On Intel chipsets (e.g. Panther Point in
+/// the 2012 MacBook Pro Retina) the USB2 ports are physically shared with an EHCI companion
+/// controller and default to EHCI — so the internal keyboard/trackpad are invisible to an xHCI-only
+/// driver — and the SuperSpeed lanes need enabling. Routing every *switchable* port to xHCI makes
+/// those devices RE-ENUMERATE on the existing xHCI+HID stack.
 ///
-/// VERIFIED BY REFERENCE against Linux `drivers/usb/host/pci-quirks.c usb_enable_intel_xhci_ports()`:
-/// the offsets (XUSB2PR 0xD0 / USB2PRM 0xD4 / USB3_PSSEN 0xD8 / USB3PRM 0xDC), the straight
-/// PRM(mask)->SELECT copy with no masking, and the order (enable SuperSpeed before routing USB2)
-/// all match. Linux applies the quirk before the controller enumerates, which this does (it runs
-/// in `init` before `xhci::init` resets+starts the controller). 0x1E31 is the Panther Point part
-/// on the MacBookPro10,1. NOT yet confirmed on metal — the config-space read-back below is what
-/// lets a real-HW boot tell whether the mux actually toggled or firmware locked the bits.
+/// The routing-MASK registers advertise which ports CAN switch on THIS silicon:
+///   XUSB2PR    @0xD0  USB2 routing SELECT  (0 = EHCI, 1 = xHCI, per port bit)
+///   USB2PRM    @0xD4  USB2 routing MASK    (which USB2 port bits are switchable)
+///   USB3_PSSEN @0xD8  SuperSpeed enable    SELECT
+///   USB3PRM    @0xDC  SuperSpeed routing MASK
+///
+/// MASK-READ-BEFORE-WRITE discipline (PORTSW-1 hard rule 1): we NEVER write a bit the mask doesn't
+/// advertise. The write is `current | (mask & mask)` == `current | mask` — it only SETS advertised
+/// bits and never clears an already-set bit, so an unmasked/undefined bit can't wedge the controller.
+/// (Linux `usb_enable_intel_xhci_ports()` copies the mask straight into the select register; the
+/// `current |` here is strictly more conservative — same routed bits, no clobber of foreign bits.)
+/// If a mask reads 0 the silicon advertises NO switchable ports of that class, so we skip its write
+/// and report — do NOT force it (PORTSW-1 STOP tripwire).
+///
+/// Ordering matches Linux: enable SuperSpeed (USB3) before routing USB2. Runs in `init` BEFORE
+/// `xhci::init` resets+starts the controller, i.e. before enumeration — ONE topology per boot, never
+/// re-flipped live (PORTSW-1 hard rule 2). Gated to Intel xHCI device ids with an EHCI companion;
+/// a clean no-op on everything else (QEMU's qemu-xhci is vendor 0x1b36 — the whole flip is inert
+/// there, which is expected: QEMU doesn't model Panther-Point routing). 0x1E31 is the Panther Point
+/// part on the MacBookPro10,1. Runs BY DEFAULT on x86 (metal-gated policy: on the 2012 rMBP the
+/// knob-off no-routing boot dropped ALL external USB — serial, storage, input — so routing is
+/// DEFAULT-ON here). Suppressed ONLY under the `noportsw` opt-out feature (UNAOS_NOPORTSW=1) for the
+/// never-run no-routing topology experiment; opted out = this function does not exist and no
+/// config-space write is issued => byte-identical no-routing media.
+///
+/// Metal-confirmed default (2026-07-16): the config-space read-backs in the witness are what let a
+/// real-HW boot tell whether the mux actually toggled or firmware (Apple EFI) locked the shared-port
+/// bits.
+#[cfg(not(feature = "noportsw"))]
 fn enable_intel_xhci_ports(bus: u8, dev: u8, func: u8) {
     const XUSB2PR: u8 = 0xD0;
     const USB2PRM: u8 = 0xD4;
@@ -102,37 +122,64 @@ fn enable_intel_xhci_ports(bus: u8, dev: u8, func: u8) {
     unsafe {
         let vendor = read_config_16(bus, dev, func, 0x00);
         let device = read_config_16(bus, dev, func, 0x02);
-        // Always log the controller's identity (and the routing decision) so a serial-less metal
-        // boot can SEE which xHCI this is and why routing did or didn't apply — the live test of
-        // whether the rMBP's Panther Point id (0x1e31) is the one we gate on.
-        serial_println!(":: xHCI PCI id {:04x}:{:04x} @ {}:{}.{} ::", vendor, device, bus, dev, func);
-        if vendor != 0x8086 {
-            serial_println!(":: xHCI not Intel — no PCH port routing applies ::");
-            return; // not Intel
-        }
-        if !SWITCHABLE.contains(&device) {
+        // Always log the controller's identity so a serial-less metal boot can SEE which xHCI this is
+        // — the live test of whether the rMBP's Panther Point id (0x1e31) is the one we gate on.
+        serial_println!(":: xHCI PCI id {:04x}:{:04x} @ {}:{}.{} (PORTSW default-on) ::", vendor, device, bus, dev, func);
+
+        // A config-space write is issued ONLY on a known Intel shared-port controller (an EHCI
+        // companion routes the USB2 ports). On anything else — notably QEMU's qemu-xhci (0x1b36) —
+        // the flip is INERT: we read the register block (harmless; PCI config reads never have side
+        // effects) purely so the witness can print its mask read-back, but we write NOTHING, so the
+        // topology is unchanged. This is the expected QEMU no-op (PORTSW-1 hard rule 4).
+        let intel_switchable = vendor == 0x8086 && SWITCHABLE.contains(&device);
+        if !intel_switchable {
             serial_println!(
-                ":: xHCI Intel {:04x} not in the shared-port list — no routing applied (firmware may \
-                 have already routed the ports, or there's no EHCI companion) ::",
-                device
+                ":: xHCI {:04x}:{:04x} not a shared-port Intel part — port switchover INERT (no config writes; e.g. QEMU, or firmware already routed / no EHCI companion) ::",
+                vendor, device
             );
-            return; // Intel, but not a shared-port xHCI
         }
 
-        let ss = read_config_32(bus, dev, func, USB3PRM);
-        write_config_32(bus, dev, func, USB3_PSSEN, ss); // enable SuperSpeed on supported ports
-        let usb2 = read_config_32(bus, dev, func, USB2PRM);
-        write_config_32(bus, dev, func, XUSB2PR, usb2); // route USB2 ports to xHCI
+        // Read masks + current SELECT for both registers (harmless on any controller).
+        let ss_mask = read_config_32(bus, dev, func, USB3PRM);
+        let ss_before = read_config_32(bus, dev, func, USB3_PSSEN);
+        let usb2_mask = read_config_32(bus, dev, func, USB2PRM);
+        let usb2_before = read_config_32(bus, dev, func, XUSB2PR);
 
-        // Read the SELECT registers back. On metal this is the proof the mux toggled: a read-back
-        // that equals the mask we wrote confirms routing took; a smaller/zero value means firmware
-        // locked some port bits (Apple EFI may pre-own or refuse to release shared ports). Linux
-        // logs the same via dev_dbg. Harmless plain reads.
-        let ss_rb = read_config_32(bus, dev, func, USB3_PSSEN);
-        let usb2_rb = read_config_32(bus, dev, func, XUSB2PR);
+        // Apply the flip ONLY on the matched Intel silicon, mask-disciplined, SuperSpeed before USB2.
+        let (ss_after, usb2_after) = if intel_switchable {
+            // --- SuperSpeed enable (USB3) ---
+            let ss_after = if ss_mask != 0 {
+                let want = ss_before | (ss_mask & ss_mask); // set only advertised bits, clear none
+                write_config_32(bus, dev, func, USB3_PSSEN, want);
+                read_config_32(bus, dev, func, USB3_PSSEN) // read-back = the metal proof
+            } else {
+                serial_println!(":: PORTSW-1: USB3PRM mask=0 — no switchable SuperSpeed ports advertised; skipping USB3_PSSEN write ::");
+                ss_before
+            };
+            // --- USB2 routing (EHCI->xHCI) ---
+            let usb2_after = if usb2_mask != 0 {
+                let want = usb2_before | (usb2_mask & usb2_mask); // set only advertised bits, clear none
+                write_config_32(bus, dev, func, XUSB2PR, want);
+                read_config_32(bus, dev, func, XUSB2PR) // read-back = the metal proof
+            } else {
+                // STOP-tripwire condition: no USB2 port advertised switchable — the internal
+                // keyboard/trackpad cannot be routed on this silicon as read. Report, don't force.
+                serial_println!(":: PORTSW-1: USB2PRM mask=0 — NO switchable USB2 ports advertised; internal kbd/trackpad NOT routable on this silicon; skipping XUSB2PR write ::");
+                usb2_before
+            };
+            (ss_after, usb2_after)
+        } else {
+            // Inert path: no write issued, so after == before by construction.
+            (ss_before, usb2_before)
+        };
+
+        // The assertable metal record: masks + before/after for both registers. On the matched
+        // Intel part a read-back that equals `before | mask` confirms the mux toggled; a smaller
+        // value means firmware locked some shared-port bits (Apple EFI may pre-own or refuse to
+        // release them). On QEMU before == after (inert). Uncounted witness (`== witness ::`).
         serial_println!(
-            ":: Intel xHCI port routing applied (dev {:#06x}): USB3_PSSEN {:#010x}->{:#010x} XUSB2PR {:#010x}->{:#010x} ::",
-            device, ss, ss_rb, usb2, usb2_rb
+            ":: PORTSW-1: XUSB2PR mask={:#x} routed {:#x}->{:#x} + USB3_PSSEN mask={:#x} {:#x}->{:#x} (default-on) == witness ::",
+            usb2_mask, usb2_before, usb2_after, ss_mask, ss_before, ss_after
         );
     }
 }
@@ -146,6 +193,15 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
         crate::video::vperf::report_fbmem();
         crate::video::vperf::pci_display_probe();
     }
+
+    // EHCI-1 scout (opt-in, UNAOS_EHCISCOUT=1): STRICTLY READ-ONLY EHCI reconnaissance — dump the
+    // EHCI companion controllers' PCI/MMIO/PORTSC state so an EHCI driver arc can be planned against
+    // real register evidence (the 2012 rMBP internal kbd/trackpad live on EHCI-only ports). Runs
+    // independently of the xHCI scan below; issues NO writes to any register or port. Knob OFF =>
+    // this call does not exist and the module is unlinked (media byte-identical).
+    #[cfg(feature = "ehciscout")]
+    crate::drivers::ehci_scout::scout();
+
     if let Some((xhci_phys_addr, bus, dev, func)) = crate::drivers::pci::PciScanner::scan() {
         serial_println!(":: x86_64 PCI Init: Found xHCI at {:#x} ::", xhci_phys_addr);
 
@@ -157,8 +213,13 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
         // Master the xHCI can never fetch command TRBs or write event TRBs.
         crate::drivers::pci::PciScanner::enable_bus_master(bus, dev, func);
 
-        // Intel PCH quirk: route USB2/USB3 ports from the EHCI companion to xHCI before the
-        // controller starts (else it sees no devices on shared ports). No-op on non-Intel (QEMU).
+        // PORTSW-1 (DEFAULT-ON, opt out with UNAOS_NOPORTSW=1): route USB2/USB3 ports from the EHCI
+        // companion to xHCI BEFORE the controller starts, so the 2012 rMBP internal keyboard/trackpad
+        // re-enumerate on the xHCI+HID stack. Mask-disciplined config-space writes; inert on non-Intel
+        // (QEMU). Metal-gated policy: on the 2012 rMBP the no-routing boot dropped ALL external USB, so
+        // routing runs by default. Opt out (UNAOS_NOPORTSW=1) => this call does not exist and no
+        // config-space write is issued (the no-routing EHCI-internal/xHCI-external topology).
+        #[cfg(not(feature = "noportsw"))]
         enable_intel_xhci_ports(bus, dev, func);
 
         // Initialize xHCI
