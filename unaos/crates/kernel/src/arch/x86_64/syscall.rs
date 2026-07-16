@@ -3324,7 +3324,11 @@ fn sys_write_file(row: usize, file_id: u64, buf: u64, len: u64) -> i64 {
                     return EIO;
                 }
                 let w = (n as usize).min(want);
-                wstage_write_at(widx, offset as usize, buf, w); // keep wstage coherent (reads serve it)
+                // CFU-1 NOTE-1: keep wstage coherent (reads serve it) through the READ seam (`w <= want`, a
+                // subrange of the range copied above — cannot fail here).
+                if let Err(e) = wstage_write_from_user(widx, offset as usize, buf, w) {
+                    return e;
+                }
                 return w as i64; // no mark_dirty — already on disk
             }
         }
@@ -3332,7 +3336,11 @@ fn sys_write_file(row: usize, file_id: u64, buf: u64, len: u64) -> i64 {
     // Pure memcpy: user bytes -> the writable staging buffer at [offset, offset+want). The ring-3 VA equals the
     // kernel VA in the live CR3 (the sys_write/sys_read discipline), and offset+want <= size <= the buffer
     // length (WSTAGE is seeded to `size` at open), so the store stays inside the descriptor's own buffer.
-    wstage_write_at(widx, offset as usize, buf, want);
+    // CFU-1 NOTE-1: the ring-3 read is the unified `copy_from_user` seam (`want` is exactly the range the
+    // CAS-claim `user_range_ok` validated above — cannot fail here).
+    if let Err(e) = wstage_write_from_user(widx, offset as usize, buf, want) {
+        return e;
+    }
     // U9x M2: mark the descriptor dirty + cover [offset, offset+want) so the task's TEARDOWN flushes exactly
     // the touched bytes to disk (a REVOKE discards them instead — see `files_free`).
     mark_dirty(row, idx, offset, offset + want as u32);
@@ -3397,7 +3405,11 @@ fn sys_write_grow(row: usize, idx: usize, widx: usize, size: u32, offset: u32, b
                 }
                 let w = (n as usize).min(want); // bytes actually persisted (== want on a full write)
                 let end2 = offset + w as u32;
-                wstage_write_at(widx, off, buf, w);
+                // CFU-1 NOTE-1: mirror the persisted grow into wstage through the READ seam (`w <= want`, a
+                // subrange of the range copied above — cannot fail here).
+                if let Err(e) = wstage_write_from_user(widx, off, buf, w) {
+                    return e;
+                }
                 wstage_set_len_at_least(widx, end2);
                 FILE_SIZE[row][idx].store(core::cmp::max(size, end2), Ordering::Release);
                 FILE_GREW[row][idx].store(true, Ordering::Release);
@@ -3408,7 +3420,11 @@ fn sys_write_grow(row: usize, idx: usize, widx: usize, size: u32, offset: u32, b
     }
     // Copy the bytes into the buffer, THEN publish the extended length + size (Release) — a reader sees the
     // appended tail only after it exists. Size before offset; mark_dirty covers exactly [offset, new_end).
-    wstage_write_at(widx, off, buf, want);
+    // CFU-1 NOTE-1: the ring-3 read is the unified `copy_from_user` seam (`want` is exactly the range the
+    // `user_range_ok` above validated — cannot fail here).
+    if let Err(e) = wstage_write_from_user(widx, off, buf, want) {
+        return e;
+    }
     wstage_set_len_at_least(widx, new_end);
     FILE_SIZE[row][idx].store(core::cmp::max(size, new_end), Ordering::Release);
     mark_dirty(row, idx, offset, new_end);
@@ -5697,6 +5713,28 @@ fn wstage_write_at(widx: usize, offset: usize, buf: u64, len: usize) {
         let dst = (&raw mut WSTAGE_BUF).cast::<u8>().add(widx * PAGE_SIZE as usize).add(offset);
         core::ptr::copy_nonoverlapping(buf as *const u8, dst, len);
     }
+}
+
+/// CFU-1 NOTE-1 rider: the USER-pointer twin of `wstage_write_at`. Overwrite writable-staging slot `widx` in
+/// place from a RING-3 source VA `buf`, routing the read through the unified `copy_from_user` seam so no raw
+/// user-pointer deref survives outside the CFU-1 boundary (the plain `wstage_write_at` stays for the ONE
+/// kernel-pointer caller — the `u11m2` in-kernel pattern seed). Every caller here has already validated
+/// `buf..buf+len` (the CAS-claim `user_range_ok`, or a prior `copy_from_user` into a bounce buffer) for a
+/// range that CONTAINS this one, so the seam's re-check cannot fail for a well-formed caller (byte-behavior
+/// unchanged); a malformed range fails `Err(EFAULT)` fail-closed — nothing copied — exactly like the other
+/// CFU-1 sites. `#[must_use]` so the verdict cannot be silently dropped.
+#[must_use]
+fn wstage_write_from_user(widx: usize, offset: usize, buf: u64, len: usize) -> Result<(), i64> {
+    debug_assert!(widx < NWSTAGE && offset + len <= PAGE_SIZE as usize, "wstage_write_from_user: out of range");
+    // A &mut view of exactly this slot's [offset, offset+len) — proven inside the slot's page by the bound
+    // above — so `copy_from_user` validates the ring-3 source window and copies into the slot, nothing else.
+    let dst = unsafe {
+        core::slice::from_raw_parts_mut(
+            (&raw mut WSTAGE_BUF).cast::<u8>().add(widx * PAGE_SIZE as usize).add(offset),
+            len,
+        )
+    };
+    copy_from_user(dst, buf)
 }
 
 /// U10: EXTEND writable-staging slot `widx`'s live length to at least `new_len` (never shrinks) — the grow twin
