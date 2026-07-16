@@ -90,6 +90,16 @@ _feats=""
 # unset the scrub + call site vanish, byte-identical to baseline (zero `JBXC-SCRUB` strings).
 # Combine with UNAOS_XCARVE=1 to emit the census + scrub together. See arch_arm64.md §JETSON-XCARVE.
 [ -n "${UNAOS_XCARVE_SCRUB:-}" ] && _feats="${_feats}xcarve_scrub,tegra,"
+# JETSON-XCARVE-CRCR M1: UNAOS_XCARVE_CRCRQ=1 arms the command-ring quiesce + re-seat
+# (arch/aarch64/xusb_tegra.rs::jbxc_crcrq_quiesce), fired after the no-HCRST takeover start()s the
+# controller but BEFORE JB9i's first command doorbell: if CRCR.CRR=1 (inherited running ring) it
+# issues a spec-clean Command Abort (CRCR.CA) and polls CRR->0, then re-seats CRCR at OUR ring so no
+# command executes on the firmware's inherited internal fetch pointer (the carveout target, by
+# elimination). CA only — never HCRST/CSB, the Falcon service loop is untouched. The `xcarve_crcrq`
+# feature implies `tegra`. Default OFF; when unset the quiesce + call site vanish, byte-identical to
+# baseline (zero `JBXC-CRCRQ` strings). Combine with UNAOS_XCARVE=1 for census + quiesce together.
+# See arch_arm64.md §JETSON-XCARVE.
+[ -n "${UNAOS_XCARVE_CRCRQ:-}" ] && _feats="${_feats}xcarve_crcrq,tegra,"
 # JETSON-XCARVE M1: UNAOS_XCARVE_RELINK=1 arms the relink-experiment pad (a `#[used]` inert
 # read-only pad static that perturbs image layout with ZERO semantic change). Rebuilds the
 # layout-correlated leg-23 image with a different layout to test the carveout's layout correlation.

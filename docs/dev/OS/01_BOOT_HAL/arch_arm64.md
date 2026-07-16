@@ -4191,3 +4191,75 @@ whole sitting):**
 - **Nit for the next probe touch (non-blocking):** the census's `IMPLAUSIBLE` flag does not
   special-case a NULL TRDeq (unused endpoint) and so flags 13 zeros per dump; the scrub
   correctly treats NULL as not-poisoned (`raw != 0` short-circuit). Cosmetic only.
+
+---
+
+#### CRCR-QUIESCE arc — the command-ring re-seat (`UNAOS_XCARVE_CRCRQ`)
+
+The FIX-sitting eliminated every DRAM-visible inherited class by direct observation (exhaustive
+census + 4× corroborating scrub no-ops): the FillWrite target is controller-INTERNAL or the
+CRCR-unreadable command ring, by elimination. This arc attacks that last bucket with a
+controller-side lever that stays inside the Falcon-safety invariant.
+
+**The mechanism (xHCI 1.2 §5.4.5 / §4.6.1.2).** The no-HCRST takeover (JB9g) preserves the
+firmware's live xHCI state. Among that state is the command ring's INTERNAL fetch pointer / dequeue
+latch — the one xHCI structure whose pointer field a CRCR *read* returns as zeros (§5.4.5), so no
+`JBXC:` census line can name it. The trap is a specific spec rule: **the controller loads the
+Command Ring Pointer field of CRCR ONLY when the ring is stopped (CRR=0); while CRR=1 a CRCR write
+moves only the CA/CS status bits and the pointer field is ignored.** `init_pointers` writes
+`CRCR = our_ring | RCS` while the controller is halted (RS=0) — but a halted controller that
+inherited a *running* command ring can still read **CRR=1**, in which case that pointer write is
+SILENTLY DROPPED and the controller keeps the firmware's internal fetch pointer. `start()` then sets
+RS=1 and JB9i rings doorbell 0 (`DISABLE_SLOT 1..8`) — the FIRST command doorbell — and the
+controller fetches from the inherited pointer: the carveout FillWrite at `…7767dc80`/`dc40`.
+
+**M1 — the quiesce + re-seat (`jbxc_crcrq_quiesce`, feature `xcarve_crcrq ⇒ tegra`, default OFF).**
+In `jb2b_attach`, placed AFTER the takeover programs the rings and `start()`s the controller but
+BEFORE the JB9i `DISABLE_SLOT` loop — provably before the first command doorbell (`start()` rings no
+doorbell; JB9i is the first). Sequence, in spec order, under a stable `JBXC-CRCRQ:` prefix:
+1. Read `CRCR.CRR` (bit 3). Print `CRR-before`.
+2. If `CRR=1` (ring inherited-live): issue Command Abort as ONE 64-bit write carrying OUR ring
+   pointer + RCS + `CA` (bit 2) — the valid-pointer compose avoids the pre-2021 Linux null-dequeue
+   abort bug (`ff0e50d3564f`) if the ring stops mid-write. Poll `CRR → 0` bounded (~200 ms); print
+   the outcome (`CRR-after`, or a flagged `CRR STILL 1` timeout).
+3. WHETHER `CRR` was 1 or already 0, program `CRCR = our_ring | RCS` — now that `CRR=0` the pointer
+   field is actually loaded. If `init_pointers`' write already took (CRR was 0), this is an
+   idempotent re-write. This leaves **NO window** where a command is issued on an un-re-seated ring.
+
+**Falcon-safety argument (the invariant is absolute).** CA (Command Abort) is a command-ring
+control op ONLY — it aborts the command ring and touches nothing else. The lever issues **no HCRST,
+no CSB write, nothing that stops the Falcon service loop** (the class JB9f/JB9e proved fatal on this
+firmware). The controller's own enumeration recovery (`abort_enum_command`, drivers/xhci/mod.rs)
+already issues this exact CA handshake on this silicon, so CA is proven non-fatal here. The only
+registers written are `CRCR` (op + 0x18) — the command-ring control register — never a Falcon /
+CSB / reset register.
+
+**M2 — event-ring re-seat ordering audit (no window; documented, no code).** The census showed the
+firmware ERDP advancing per boot, raising the question of whether the controller could write back a
+stale event to the FIRMWARE event ring after takeover. Traced ordering in `jb2b_attach`: JB9g halts
+the controller (`RS=0`); THEN the unsafe block runs `init_interrupter` (ERSTBA/ERDP/ERSTSZ ← OUR
+event ring), `init_pointers` (CRCR), `start()` (`RS=1`) — **all event-ring reprogramming happens
+while the controller is halted (RS=0)**. A halted controller generates no events and performs no
+event writeback; ERSTBA is freely writable (no CRR-style stop-gate). By the time `RS=1`, ERSTBA/ERDP
+already point at our ring, so the controller never runs with the firmware's event ring. **No window
+exists — the event-ring re-seat provably precedes the first RS=1.** No code change; if a future
+reorder ever moved `RS=1` ahead of `init_interrupter`, closing the window would be its own flagged,
+knob-gated change (not folded into M1).
+
+**Knob-off** the quiesce + its call site vanish (byte-identical to baseline; zero `JBXC-CRCRQ`
+strings; proven by two default `esp-jetson` builds hashing equal). Bench legs pre-registered in
+`scripts/orin-xcarve-bench.md`.
+
+**Bench pre-registration (the fork).** The decisive testbed is the historically-4/4-faulting leg-23
+knobs (`UNAOS_SMPPROBE=23` era) PLUS `UNAOS_XCARVE_CRCRQ=1` (+ census `UNAOS_XCARVE=1` so the boot
+documents itself). ⚠ **Disclosure:** adding the quiesce code CHANGES the image layout — the exact
+4/4 leg-23 layout cannot be byte-preserved (this is the fourth distinct layout of those knobs; the
+prior three sampled 4/4, ~50%, 0/4). The fault-rate comparison is therefore statistical; the
+`JBXC-CRCRQ:` lines are the mechanism witness either way. Pre-registered outcomes:
+- **quiesce lines showing `CRR-before=1` + CA + clean boots ×3+** on the leg-23-knobs image ⇒ strong
+  **FIXED** signal, and the mechanism is NAMED (an inherited running command ring was the target).
+- **quiesce lines + fault persists at JB9i** ⇒ the command ring is exonerated too; the target is
+  controller-internal beyond the command ring (final bucket) — a valid discriminating result.
+- **`CRR-before=0` every boot** ⇒ the inherited ring was not running; init_pointers' CRCR write
+  already took, and the command-ring-not-loaded theory is refuted (record it; the re-seat still
+  leaves no window and the wall, if it persists, is elsewhere-internal).

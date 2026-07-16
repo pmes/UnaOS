@@ -1089,6 +1089,90 @@ pub fn jbxc_scrub_inherited(cap0: u32) {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// JETSON-XCARVE-CRCR M1: the command-ring quiesce + re-seat (`UNAOS_XCARVE_CRCRQ=1`).
+//
+// The elimination verdict (§JETSON-XCARVE fix-sitting) put the FillWrite target in the ONE class
+// no DRAM scrub can reach: the controller's INTERNAL command-ring fetch state — the inherited
+// Command Ring Pointer / dequeue latch that a CRCR *read* returns as zeros (xHCI 5.4.5). The
+// no-HCRST takeover (JB9g) preserves the firmware's live xHCI state, and here is the trap: xHCI
+// 5.4.5 says the Command Ring Pointer field of CRCR is only LOADED by the controller when the
+// Command Ring is stopped (CRR=0). `init_pointers` writes CRCR = our_ring|RCS while the controller
+// is halted (RS=0) — but a halted controller that inherited a *running* command ring can still read
+// CRR=1, in which case that write is SILENTLY DROPPED (only the CA/CS bits are honored while CRR=1)
+// and the controller keeps the firmware's internal fetch pointer. JB9i's DISABLE_SLOT then rings
+// doorbell 0 and the controller fetches from that inherited pointer — the carveout FillWrite.
+//
+// The lever: BEFORE the first command doorbell (i.e. before JB9i), explicitly quiesce and re-seat
+// the command ring in spec order (xHCI 4.6.1.2 / 5.4.5):
+//   1. read CRCR.CRR. If CRR=1 (ring inherited-live), issue Command Abort (CA=1) as ONE 64-bit
+//      write carrying OUR ring pointer + RCS (so if the ring stops mid-write the loaded pointer is
+//      valid, never null — the pre-2021 Linux abort bug ff0e50d3564f), then poll CRR->0 bounded.
+//   2. WHETHER CRR was 1 or already 0, program CRCR = our_ring|RCS now that CRR=0, so the pointer
+//      field is actually loaded. This leaves NO window where a command is issued on an un-re-seated
+//      ring — if init_pointers' write already took (CRR was 0) this is an idempotent re-write.
+//
+// FALCON SAFETY (absolute): CA is a command-ring control op only — it aborts the command ring and
+// nothing else. NO HCRST, NO CSB, no write that stops the Falcon service loop (the class JB9f/JB9e
+// proved fatal). The controller's own recovery path (`abort_enum_command`) already issues this exact
+// CA handshake on this silicon during enumeration, so CA is proven non-fatal here. Every step prints
+// under a stable `JBXC-CRCRQ:` prefix (CRR-before, CA issued/skipped, CRR-after, CRCR programmed).
+#[cfg(feature = "xcarve_crcrq")]
+pub fn jbxc_crcrq_quiesce(cap0: u32, our_cmd_ring: u64) {
+    let caplen = (cap0 & 0xff) as u64;
+    let op = XUSB_HOST + caplen;
+    let crcr = op + 0x18;
+    let r64 = |a: u64| unsafe { core::ptr::read_volatile(a as *const u64) };
+    let w64 = |a: u64, v: u64| unsafe { core::ptr::write_volatile(a as *mut u64, v) };
+
+    // Our command ring, 64-byte aligned, RCS=1 (a fresh TransferRing starts at cycle 1 — the same
+    // value init_pointers programmed as `ring_phys | 1`).
+    let reseat = (our_cmd_ring & !0x3f) | 1;
+
+    let crr_before = (r64(crcr) >> 3) & 1;
+    serial_println!(
+        "JBXC-CRCRQ: pre-JB9i quiesce — CRCR={:#018x} CRR-before={} our_ring={:#018x}",
+        r64(crcr), crr_before, reseat
+    );
+
+    if crr_before == 1 {
+        // Ring inherited-live: abort it. CA=1 (bit 2) + our valid pointer + RCS in one write.
+        w64(crcr, reseat | (1 << 2));
+        serial_println!("JBXC-CRCRQ: CA issued (Command Abort, CRCR.CA=1) — polling CRR->0");
+        let deadline = cntpct().wrapping_add(cntfrq() / 5); // ~200 ms bound
+        let mut stopped = false;
+        loop {
+            if (r64(crcr) >> 3) & 1 == 0 {
+                stopped = true;
+                break;
+            }
+            if cntpct().wrapping_sub(deadline) < (1u64 << 63) {
+                break; // deadline passed (wrap-safe)
+            }
+            core::hint::spin_loop();
+        }
+        if stopped {
+            serial_println!("JBXC-CRCRQ: CRR-after={} (ring stopped by abort)", (r64(crcr) >> 3) & 1);
+        } else {
+            // CRR stuck high: the pointer-field write below will NOT be loaded (5.4.5). Report it
+            // honestly; the JB9i drain still runs (this is a knob-gated diagnostic lever, not a
+            // gate) and the serial names the stuck-abort exactly.
+            serial_println!("JBXC-CRCRQ: !!! CRR STILL 1 after abort timeout — re-seat cannot load (5.4.5); reporting !!!");
+        }
+    } else {
+        serial_println!("JBXC-CRCRQ: CRR-before=0 — no abort needed; re-seating CRCR anyway (no window)");
+    }
+
+    // Re-seat: with CRR=0 the Command Ring Pointer field is loaded. Idempotent if init_pointers'
+    // write already took. (If CRR is still 1 from a timed-out abort, this write's pointer is ignored
+    // per 5.4.5 — only the status bits move — and the JBXC-CRCRQ line above already flagged that.)
+    w64(crcr, reseat);
+    serial_println!(
+        "JBXC-CRCRQ: CRCR re-seated = {:#018x} (CRR-final={}) — command ring points at OUR ring pre-JB9i",
+        r64(crcr), (r64(crcr) >> 3) & 1
+    );
+}
+
 /// `jb9_smmu` = (NISO1 SMMU instance bases, XUSB SID) — threaded in by the caller so the JB9-B
 /// forensic captures below can dump the stream binding at enable-slot-pending time.
 pub fn jb2b_attach(
@@ -1189,6 +1273,16 @@ pub fn jb2b_attach(
         x.start();
         *xhci::XHCI_CONTROLLER.lock() = Some(x);
     }
+
+    // JETSON-XCARVE-CRCR M1: quiesce + re-seat the command ring BEFORE the first command doorbell.
+    // start() just set RS=1 but rang no doorbell, so JB9i's DISABLE_SLOT below is the FIRST command
+    // the controller fetches. If the no-HCRST takeover inherited a running command ring (CRR=1),
+    // init_pointers' CRCR pointer write was silently dropped (5.4.5) and the controller still holds
+    // the firmware's internal fetch pointer — the carveout target by elimination. Abort (CA) if
+    // live, then re-seat CRCR at OUR ring, provably before JB9i. Falcon untouched (CA only, no
+    // HCRST/CSB). Knob-off (`xcarve_crcrq` absent) this call vanishes (byte-identical to baseline).
+    #[cfg(feature = "xcarve_crcrq")]
+    jbxc_crcrq_quiesce(cap0, jb9_cmd_phys);
 
     // JB9i (bench 2026-07-08): evict UEFI's stale device slots. On the inherit path the firmware
     // still holds the slots UEFI enumerated (it was never reset), so our fresh ENABLE_SLOT
