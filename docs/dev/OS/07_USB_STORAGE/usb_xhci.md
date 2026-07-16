@@ -524,6 +524,26 @@ chain off the hubbed disk (MPS0-learn re-address exercised); `UNAOS_IRQSTORAGE=1
 UNAOS_FATIMG=sf test 200` → S-chain 0 FAIL; `test 40` → MISSION SUCCESS; `UNAOS_NOSTORAGE=1`
 clean.
 
+**Metal verdict (2026-07-16, attended rMBP sitting; log
+`rmbp-serial-2026-07-16-sitting.log`).** The M1 diagnosis is CONFIRMED with a sharper
+cause than hypothesized: the FS mouse behind the HS hub answers the 8-byte header read
+fine (`MPS0 learned 8 (programmed 64)`), i.e. the old zeroed-18-byte read was the
+wrong-MPS0 symptom, exactly the short-read family M1 targeted. But the **re-ADDRESS
+strategy is refused by real Panther Point silicon**: `ADDRESS_DEVICE` (BSR=0) on the
+already-Addressed slot completes `code 19` (Context State Error) — deterministically,
+all 3 attempts, reproduced 4× across 3 hub ports and a whole-hub replug (the §7g
+watch-item fired as predicted, code 19 rather than 17). **M2's machinery is
+metal-confirmed**: bounded paced attempts trace cleanly, and `dispose_downstream_slot`
+ran leak-clean every time (disposed slots 3/7/9/14; subsequent disconnects tore down
+`0 slot(s)` with correct scope — no active-slot leak, no wedge, keyboard/storage/FTDI
+survived every cycle; the keyboard re-enumerated cleanly on multiple ports throughout).
+**→ XENUM-4 seed:** apply the learned MPS0 via an **Evaluate Context** command (the
+standard driver approach — xHCI 4.6.7 explicitly supports updating EP0 Max Packet Size
+on an Addressed slot) instead of re-issuing ADDRESS_DEVICE; the mouse should then
+enumerate. The device descriptor bad-read path (`bad read (got G of 18…)`) never fired
+on metal — nothing reached the 18-byte read with a wrong MPS0 anymore, which is the
+mechanism working as designed upstream of it.
+
 ---
 
 ## 8. Status and limitations
@@ -677,6 +697,22 @@ attended rMBP sitting is where census B decides the two branches above.
 - The PMCSR D0 write masks `PME_Status` (bit 15, RW1C) so a pending PME isn't silently acked,
   and a real D-state transition is followed by a ~10 ms settle before the first MMIO read
   (no-op when already D0). Neither path is exercisable on QEMU (`usb-ehci` has no PM cap).
+
+**Metal verdict (2026-07-16, attended rMBP sitting; log
+`rmbp-serial-2026-07-16-sitting.log`): THE ASLEEP-UNTIL-CONFIGURED BRANCH FIRED —
+`censusA=0, censusB=2`.** Both Panther Point EHCI functions (`8086:1e2d` bdf 0:26.0,
+`8086:1e26` bdf 0:29.0; 2 ports each, `PPC=0`) walked the full wake sequence with no
+hang: already D0; `USBLEGCTLSTS pre=0xc00c0000`/`0xc00d0000` (RW1C status latched by
+firmware, **SMI enables 0**) cleared/acked cleanly; OS-own trivial (BIOS bit already 0);
+`RS=1` stuck on both. Census A (CF=0): 0 connected. After `CONFIGFLAG=1`: **each
+controller reported exactly one connected device — `PORTSC[0]=0x00001803` connect=1,
+EHCI-owned, J-state (FS/LS device present) — on both functions.** The internal
+keyboard + trackpad are therefore **real USB devices, asleep-until-configured behind
+the EHCI companions**; the SPI hypothesis is falsified. **→ the EHCI mini-driver line
+is the proposal** (enumerate through the Panther Point rate-matching-hub topology,
+periodic interrupt-IN for boot-protocol HID — reusing the existing HID decode). The
+RS=1/CF=1-before-xHCI interaction watch item was benign on metal: xHCI enumeration,
+storage, and the FTDI mirror all ran normally the same boot.
 
 ---
 

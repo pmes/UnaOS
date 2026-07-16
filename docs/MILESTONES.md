@@ -10,6 +10,27 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-rmbp track — 2026-07-16 (R18 attended rMBP sitting — the internal-input fork answered)
+
+### EHCI-2 configure-and-relook ✅ METAL — the internals ARE USB, asleep-until-configured
+- **What:** minimal knob-gated EHCI wake (D0, handoff w/ SMI-clear, RS, CONFIGFLAG, PP) +
+  dual PORTSC census, evidence-only.
+- **Metal (2012 rMBP, one cold boot):** `censusA=0 → censusB=2` — one FS/LS device per
+  Panther Point EHCI function appears only after configure. SPI hypothesis falsified;
+  the EHCI mini-driver line is the proposal. No hang; handoff discipline held
+  (`USBLEGCTLSTS` firmware-latched status cleared clean).
+
+### XENUM-3 hub-downstream robustness — M2 ✅ METAL; M1 diagnosis CONFIRMED → XENUM-4 seed
+- **Metal:** the FS-mouse strand root cause is wrong-MPS0 (8-byte header reads fine,
+  `MPS0 learned 8`); the re-ADDRESS fix is **refused by real silicon** (`code 19`
+  deterministic ×4 across 3 hub ports) — fix shape = **Evaluate Context** (XENUM-4).
+  Retry+disposal machinery metal-clean every cycle (no slot leak, no wedge); keyboard,
+  storage, FTDI survived all hot-plug churn.
+
+### Riders ✅ — S9-grow first metal (0→96 B real alloc + -ENOSPC ceiling; spec promoted
+PENDING→REQUIRE) · S8W.BIN desk byte-verify 64×0xA5 (last S8 leg closed) · full S-chain
++ capability chain re-confirmed 0 FAIL. Log `rmbp-serial-2026-07-16-sitting.log`.
+
 ## hw-pi4 track — 2026-07-16 (K8a — UnaFS goes copy-on-write)
 
 ### K8a — CoW data+metadata write path, atomic 512 B root flip, refcount allocator ✅✅ METAL-CONFIRMED 2026-07-16 (same-day attended sitting: pristine-v3 boot MBENCH 43/43 + 0 forbidden AND a real v2→v3 MIGRATED-volume boot 43/43 — migration byte-verified on silicon; the SECURITY.md 4096↔512 torn-write class formally RETIRED. Sitting facts of record: the 16 GB UNAOS card RETIRED mid-sitting — silent write drops, zero R1/CMD13, A-B proven when the morning kernel failed its own morning battery; the 32 GB card is the pi4 bench card. U9/U10 are stateful across boots — multi-boot sittings re-prep FAT fixtures file-level between boots, see unaos-hazards)

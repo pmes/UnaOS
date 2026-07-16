@@ -73,10 +73,11 @@ REQUIRE S7-openany:.*owner ACL not bypassed.*witness OK
 # --- (STOR-1 S9 retired S8's past-EOF-returns-0 leg — growth is now the S9-grow witness's job — so the
 # --- S8 message no longer says "overwrite never grows"; the regex tracks the in-place overwrite claim.)
 REQUIRE S8-write:.*overwrote a live 16-byte pattern in place.*witness OK
-# --- S9 = STOR-1 S9: a RW dynamic on-disk file GROWS past EOF live (bounded per-write/per-file). PENDING
-# --- until the attended rMBP bench captures it (create -> grow -> Stat-grew -> readback -> -ENOSPC ceiling);
-# --- promote PENDING -> REQUIRE after that sitting, exactly as S8-write was.
-PENDING S9-grow:.*extended 0 -> .* bytes.*witness OK
+# --- S9 = STOR-1 S9: a RW dynamic on-disk file GROWS past EOF live (bounded per-write/per-file).
+# --- ✅ METAL-CONFIRMED 2026-07-16 (attended rMBP sitting, LC-x86: extended 0 -> 96 bytes real
+# --- alloc+chain, readback, -ENOSPC ceiling, MF2 intact; log rmbp-serial-2026-07-16-sitting.log)
+# --- — PROMOTED to REQUIRE, exactly as S8-write was.
+REQUIRE S9-grow:.*extended 0 -> .* bytes.*witness OK
 
 # --- VPERF (this boot DECIDES VPERF-WC — all landed post-bench, never on metal) -----
 # THE DECIDER: eff=WC → VPERF-WC dead; eff=UC (or any non-WC) → VPERF-WC triggers
