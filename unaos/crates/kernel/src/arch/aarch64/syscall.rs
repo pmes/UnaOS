@@ -4621,6 +4621,38 @@ fn owned_snapshot_row(
     None
 }
 
+/// BANDY-2 lens-2 fix: snapshot the FULL grant rows (live `(asid, gen)` keys + persistent ppids +
+/// rights) of the file at `(dir_lba, dir_off)` — `None` for a public file (no row). The bus write-
+/// truncate path captures this BEFORE its destroy half so the recreate half can RESTORE the grants:
+/// the direct-syscall twin (open existing + write) mutates in place and PRESERVES grants, so the
+/// bus must too (the equivalence discipline — a truncate is a content rewrite, not a revoke).
+fn owned_snapshot_grants_full(dir_lba: u64, dir_off: u32) -> Option<[FileGrant; NFGRANT]> {
+    let _irq = IrqGuard::mask_save();
+    let t = OWNED_FILES.lock();
+    for row in t.iter() {
+        if row.dir_lba == dir_lba && row.dir_off == dir_off {
+            return Some(row.grants);
+        }
+    }
+    None
+}
+
+/// BANDY-2 lens-2 fix: re-install a snapshot of grant rows onto the (recreated) file at
+/// `(dir_lba, dir_off)` — the restore half of the bus write-truncate grant preservation. The row
+/// must already exist (`owned_set_owner` just installed it with empty grants); a missing row is a
+/// defensive no-op (the create failed — nothing to restore onto). Called under the caller's
+/// NAMESPACE hold (OWNED_FILES is an inner lock — the F3 lock order).
+fn owned_restore_grants(dir_lba: u64, dir_off: u32, grants: &[FileGrant; NFGRANT]) {
+    let _irq = IrqGuard::mask_save();
+    let mut t = OWNED_FILES.lock();
+    for row in t.iter_mut() {
+        if row.dir_lba == dir_lba && row.dir_off == dir_off {
+            row.grants = *grants;
+            return;
+        }
+    }
+}
+
 /// K1 M2.3: the persistent principal of the OWNER of `(dir_lba, dir_off)` (NONE = public / no row). The light
 /// read `sys_unlink` uses BEFORE `owned_clear` to decide whether a persisted attr row must also be cleared —
 /// a NONE owner (the whole battery) needs no disk touch, keeping the anonymous unlink path byte-identical.
@@ -8541,6 +8573,11 @@ pub fn u7_launcher(demo_cpu: usize) {
     // scratch identities; one read-only ls mount, no disk write. Its own uncounted
     // `:: BANDY-STAMP: … PASS ::` line.
     bandy_stamp_check();
+    // BANDY-2 lens-2 fix witness: bus write-TRUNCATE preserves grants (the direct twin mutates in
+    // place and never touches the grant table — the bus must reach the same state). Drives the
+    // production sys_msend_for path with scratch identities; creates + self-cleans GRNT.BIN. Its
+    // own uncounted `:: BANDY-GRANT: … PASS ::` line.
+    bandy_grant_check();
     // BANDY-1 M4/M5: the round-trip + equivalence witnesses through the REAL midden program
     // (program #3, Peter's E verdict) — ls/cat/cp parsed at EL0 into typed frames, kernel-
     // fulfilled under the stamped principal; denial equivalence (bus vs direct syscall,
@@ -14486,6 +14523,11 @@ fn bus_write(asid: u64, agen: u64, ppid: PrincipalRecord, name: &str, content: &
         drop(ns);
         r
     };
+    // BANDY-2 lens-2 fix: the grant rows to RESTORE onto the recreated file after a truncate. The
+    // direct-syscall twin (open existing + write) mutates in place and PRESERVES grants — the bus
+    // truncate must reach the same state (a content rewrite is not a revoke). None for a fresh
+    // create or a public/anonymous original (nothing to carry).
+    let mut grant_snap: Option<[FileGrant; NFGRANT]> = None;
     if let Some((is_dir, cluster, dir_lba, dir_off)) = existing {
         if is_dir {
             return EISDIR; // v1: files only, exactly as cat/cp
@@ -14495,6 +14537,9 @@ fn bus_write(asid: u64, agen: u64, ppid: PrincipalRecord, name: &str, content: &
             return EACCES;
         }
         let owner_ppid = owned_owner_ppid(dir_lba, dir_off as u32);
+        // Snapshot the FULL grant rows BEFORE the destroy half (lens-2 fix) — restored onto the
+        // recreated file below, then re-persisted. In-RAM read (an inner lock), like owner_ppid.
+        grant_snap = owned_snapshot_grants_full(dir_lba, dir_off as u32);
         // Clear the PERSISTED ACL row DURABLE-FIRST — BEFORE the 0xE5 (K1-F2); ns-free (atr_clear_row
         // re-takes ns, so it can never nest under the hold). A named-owner only; a public file skips
         // this with zero disk I/O. -EIO aborts if the durable clear did not land (nothing stranded).
@@ -14552,9 +14597,25 @@ fn bus_write(asid: u64, agen: u64, ppid: PrincipalRecord, name: &str, content: &
         let _ = fs.mark_dir_deleted(d_lba, d_off);
         return ENOSPC; // fail CLOSED — never a silently-public "private" file
     }
+    // Lens-2 fix: re-install the truncated file's grant snapshot onto the recreated row (the new
+    // slot's location — create may or may not reuse the old slot). Under the SAME ns hold as the
+    // owner install (OWNED_FILES is an inner lock); only meaningful when this create claimed the
+    // owner row above (asid != 0).
+    let had_grants = grant_snap.as_ref().is_some_and(|g| g.iter().any(|fg| fg.rights != 0));
+    if asid != 0 {
+        if let Some(snap) = grant_snap.as_ref() {
+            owned_restore_grants(d_lba, d_off as u32, snap);
+        }
+    }
     drop(ns);
     if asid != 0 && ppid.kind != PRIN_NONE {
         let _ = native_persist_create(name, new_fc, d_lba, d_off as u32, ppid);
+        // Lens-2 fix: create-persist writes an EMPTY grant set — re-persist the REAL (restored)
+        // grants so the durable row matches the in-RAM state (K5B-fused inside the persist site;
+        // AFTER the ns drop, like every persist).
+        if had_grants {
+            let _ = native_persist_grants(d_lba, d_off as u32);
+        }
     }
     0
 }
@@ -14937,6 +14998,148 @@ fn bandy_stamp_check() {
         );
     } else {
         serial_println!(":: BANDY-STAMP: FAIL — w={:#x}/{:#x} ::", w, ALL);
+    }
+}
+
+// -----------------------------------------------------------------------------------------------
+// BANDY-GRANT (lens-2 fix witness): bus write-TRUNCATE preserves grants. The direct-syscall twin
+// (open existing + write) mutates in place and never touches the grant table; the bus truncate is
+// delete-then-recreate, so without the restore it would silently REVOKE every grant. This witness
+// drives the PRODUCTION sys_msend_for path with scratch identities (the BANDY-STAMP idiom):
+// owner bus-writes a file, grants a grantee CAP_READ, bus-writes NEW content (the truncate path),
+// then proves the grantee is STILL admitted via BOTH legs — the bus (cat status 0, new content)
+// and the direct gate (owned_access_ok true) — and that the grant re-persisted durably.
+// -----------------------------------------------------------------------------------------------
+
+const GRNT_NAME: &str = "GRNT.BIN";
+
+/// Build a bus WRITE request frame for `name`+`content` into `buf`; returns the frame length.
+fn bandy_build_write(name: &str, content: &[u8], corr: u32, buf: &mut [u8]) -> usize {
+    let mut body = [0u8; 64]; // name <= 12 + small content — far under any stack hazard
+    body[0] = name.len() as u8;
+    body[1..1 + name.len()].copy_from_slice(name.as_bytes());
+    body[1 + name.len()..1 + name.len() + content.len()].copy_from_slice(content);
+    super::bus::build_request(super::bus::BUS_VERB_WRITE, corr, &body[..1 + name.len() + content.len()], buf)
+}
+
+fn bandy_grant_check() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if crate::drivers::block::info().is_none() {
+        serial_println!(":: BANDY-GRANT: no block device — truncate-grant demo skipped ::");
+        return;
+    }
+    let mut w = 0u32;
+    let owner_asid: u64 = 7; // scratch identities (the K-line fixture discipline)
+    let owner_gen = ASID_GEN[owner_asid as usize].load(Ordering::Acquire);
+    let owner = PrincipalRecord::program(b"prog:BANDYOWN");
+    let grantee_asid: u64 = 8;
+    let grantee_gen = ASID_GEN[grantee_asid as usize].load(Ordering::Acquire);
+    let grantee = PrincipalRecord::program(b"prog:BANDYGRT");
+    bus_mbox_clear(owner_asid);
+    bus_mbox_clear(grantee_asid);
+    bandy_cleanup_one(GRNT_NAME); // stale residue from an interrupted run
+
+    const C1: &[u8] = b"grant-content-one";
+    const C2: &[u8] = b"rewritten"; // SHORTER — the readback proving C2 confirms a genuine truncate
+
+    // Send one request under `(asid, gen, ppid)` and pop the reply; returns (status, body bytes).
+    fn send(asid: u64, agen: u64, ppid: PrincipalRecord, frame: &[u8]) -> (i64, alloc::vec::Vec<u8>) {
+        if sys_msend_for(asid, agen, ppid, frame) != 0 {
+            return (i64::MIN, alloc::vec::Vec::new());
+        }
+        let Some(msg) = bus_mbox_pop(asid) else {
+            return (i64::MIN, alloc::vec::Vec::new());
+        };
+        match super::bus::frame_parse(&msg.frame) {
+            Ok(h) => (h.status as i64, msg.frame[super::bus::BUS_HDR_LEN..].to_vec()),
+            Err(_) => (i64::MIN, alloc::vec::Vec::new()),
+        }
+    }
+
+    // bit0: owner bus-writes (CREATE) GRNT.BIN with C1 — status 0, and the file is owner-private.
+    let mut f = [0u8; 128];
+    let n = bandy_build_write(GRNT_NAME, C1, 1, &mut f);
+    let (st, _) = send(owner_asid, owner_gen, owner, &f[..n]);
+    let loc1 = crate::fs::fat::mount().ok().and_then(|fs| fs.find_located(GRNT_NAME).ok());
+    if st == 0 {
+        if let Some((_, l, o)) = loc1 {
+            if owned_owner_ppid(l, o as u32) == owner {
+                w |= 1 << 0;
+            }
+        }
+    }
+
+    if let Some((_, l1, o1)) = loc1 {
+        // bit1: owner grants the grantee CAP_READ (production owned_grant), and the grantee's bus
+        // cat is admitted with C1 (the pre-truncate baseline, bus leg).
+        let granted = owned_grant(l1, o1 as u32, owner_asid, owner_gen, grantee_asid, grantee_gen, CAP_READ, owner, grantee) == 0;
+        let mut cf = [0u8; 128];
+        let cn = super::bus::build_request(super::bus::BUS_VERB_CAT, 2, GRNT_NAME.as_bytes(), &mut cf);
+        let (cst, cbody) = send(grantee_asid, grantee_gen, grantee, &cf[..cn]);
+        if granted && cst == 0 && cbody.as_slice() == C1 {
+            w |= 1 << 1;
+        }
+
+        // bit2: owner bus-writes C2 over the EXISTING file — the TRUNCATE path — status 0, content
+        // is exactly C2 (shorter than C1: a genuine truncate, not a stale-tail overwrite).
+        let n2 = bandy_build_write(GRNT_NAME, C2, 3, &mut f);
+        let (st2, _) = send(owner_asid, owner_gen, owner, &f[..n2]);
+        let loc2 = crate::fs::fat::mount().ok().and_then(|fs| fs.find_located(GRNT_NAME).ok());
+        if st2 == 0 {
+            if let Some((de2, _, _)) = &loc2 {
+                if de2.size as usize == C2.len() {
+                    w |= 1 << 2;
+                }
+            }
+        }
+
+        if let Some((_, l2, o2)) = loc2 {
+            // bit3: THE FIX'S PROOF, bus leg — the grantee's cat is STILL admitted after the
+            // truncate (status 0) and reads the NEW content (the grant survived the rewrite).
+            let (cst2, cbody2) = send(grantee_asid, grantee_gen, grantee, &cf[..cn]);
+            if cst2 == 0 && cbody2.as_slice() == C2 {
+                w |= 1 << 3;
+            }
+            // bit4: the direct leg, byte-equivalent — the production ACL gate itself still admits
+            // the grantee for CAP_READ (what a direct SYS_OPEN(RO) resolves through), and BOTH
+            // legs agree (admitted <-> admitted).
+            if owned_access_ok(l2, o2 as u32, grantee_asid, grantee_gen, CAP_READ, grantee) && cst2 == 0 {
+                w |= 1 << 4;
+            }
+            // bit5: the DURABLE half — the re-persisted native row carries the restored grant
+            // (create-persist alone would have written an empty set).
+            if let Some(row) = crate::fs::unafs::native_acl_read(l2, o2 as u32) {
+                if row.grants.iter().any(|(k, _)| k.as_slice() == b"grants:prog:BANDYGRT") {
+                    w |= 1 << 5;
+                }
+            }
+        }
+    }
+
+    // bit6: self-clean — owner bus-rm's the fixture; the name is gone (no card residue).
+    let mut rf = [0u8; 128];
+    let rn = super::bus::build_request(super::bus::BUS_VERB_RM, 4, GRNT_NAME.as_bytes(), &mut rf);
+    let (rst, _) = send(owner_asid, owner_gen, owner, &rf[..rn]);
+    let gone = crate::fs::fat::mount()
+        .map(|fs| matches!(fs.find_in_root(GRNT_NAME), Err(crate::fs::fat::FatError::NotFound)))
+        .unwrap_or(false);
+    if rst == 0 && gone {
+        w |= 1 << 6;
+    }
+    bus_mbox_clear(owner_asid);
+    bus_mbox_clear(grantee_asid);
+
+    const ALL: u32 = (1 << 7) - 1;
+    if w == ALL {
+        serial_println!(
+            ":: BANDY-GRANT: bus write-truncate preserves grants — grantee still admitted via bus AND direct gate (byte-equivalent), new content read back, grant re-persisted durable, self-cleaned PASS [w={:#04x}] ::",
+            w
+        );
+    } else {
+        serial_println!(":: BANDY-GRANT: FAIL — w={:#x}/{:#x} ::", w, ALL);
     }
 }
 

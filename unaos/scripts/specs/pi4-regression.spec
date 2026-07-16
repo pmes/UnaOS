@@ -147,6 +147,14 @@ FORBID BANDY-EQ2:.*FAIL
 REQUIRE BANDY-ACL:.*foreign owner row intact.*PASS
 FORBID BANDY-ACL:.*FAIL
 
+# --- BANDY-GRANT truncate-preserves-grants witness (uncounted, the BANDY-2 lens-2 fix): the bus
+# --- write-truncate (delete-then-recreate) SNAPSHOTS + RESTORES + RE-PERSISTS the file's grant
+# --- rows — a content rewrite is not a revoke (the direct twin preserves grants in place, so the
+# --- bus must too). Grantee admitted via bus AND direct gate after the truncate, byte-equivalent;
+# --- grant durable in the native row; self-cleaned. --------------------------------------------
+REQUIRE BANDY-GRANT:.*grant re-persisted durable.*PASS
+FORBID BANDY-GRANT:.*FAIL
+
 # NOTE (bench operators): these five are now hard REQUIREs. On a rare no-card / hub-MSC-vid=0000
 # boot the card-dependent selftests won't emit — re-seat the data card and re-boot (that IS the
 # recovery); don't demote the spec. The 3-of-4-core CAPSTONE variance is separate (see the header).
