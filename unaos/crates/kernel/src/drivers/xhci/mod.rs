@@ -504,13 +504,20 @@ struct Ep0Pending {
     wait_trb_phys: u64,
     done: bool,
     completion_code: u8,
+    /// XENUM-3 M1: physical address of this transfer's DATA-stage TRB (0 if there is no data
+    /// stage). The residual consumer matches the event's TRB pointer against it, so only the real
+    /// DATA-stage completion is recorded — Panther Point's XHCI_SPURIOUS_SUCCESS quirk (device
+    /// 0x1e31, the 2012 rMBP's controller) can post a duplicate Success after a Short Packet for
+    /// the same TD, and an unmatched consumer would let the dup clobber a real short-read residual.
+    data_trb_phys: u64,
     /// XENUM-3 M1: TRB Transfer Length residual (untransferred bytes) captured from the DATA-stage
     /// transfer event of a control IN read. A short read leaves this non-zero; sync_control turns it
     /// into the ACTUAL transferred length so the downstream enumerator can reject a partial (e.g.
     /// 8-byte-header-only) descriptor that would otherwise pass the structural bLength/type gate.
+    /// First-write latched (see `data_seen`): a duplicate Success for the same TD cannot overwrite it.
     data_residual: u32,
     /// True once a DATA-stage event was observed for this transfer (so a residual of 0 is trusted
-    /// as "full read" rather than "no data event seen yet").
+    /// as "full read" rather than "no data event seen yet"). Doubles as the first-write latch.
     data_seen: bool,
 }
 
@@ -1469,15 +1476,29 @@ impl XhciController {
                                         }
                                         return; // consumed by the sync EP0 pump
                                     }
-                                    // XENUM-3 M1: a same-slot, non-Status success/short-packet event
-                                    // is this sync transfer's DATA stage. Record its residual (the
-                                    // TRB Transfer Length remaining) so the enumerator learns the
-                                    // ACTUAL transferred length, then consume it — previously it fell
-                                    // through to the async FSM and was dropped as "stale/spurious".
-                                    if completion_code == 1 || completion_code == 13 {
+                                    // XENUM-3 M1: this sync transfer's DATA stage, matched by the
+                                    // DATA TRB's physical address (like wait_trb_phys for Status)
+                                    // AND first-write latched on data_seen. Both guards defend
+                                    // against Panther Point's XHCI_SPURIOUS_SUCCESS quirk (device
+                                    // 0x1e31): a duplicate Success after a Short Packet for the same
+                                    // TD would otherwise overwrite a real short-read residual with 0,
+                                    // last_control_len would read full, and the zeroed-descriptor
+                                    // strand M1 exists to catch would go undetected on the exact
+                                    // target hardware. Record the residual (TRB Transfer Length
+                                    // remaining) so the enumerator learns the ACTUAL transferred
+                                    // length, then consume the event — previously it fell through to
+                                    // the async FSM and was dropped as "stale/spurious". A matching
+                                    // dup (param == data_trb_phys, data_seen already set) is consumed
+                                    // without recording; QEMU posts no dup, so gates are
+                                    // no-regression only for the latch.
+                                    if (completion_code == 1 || completion_code == 13)
+                                        && p.data_trb_phys != 0 && param == p.data_trb_phys
+                                    {
                                         if let Some(ep) = self.ep0_pending.as_mut() {
-                                            ep.data_residual = transfer_len;
-                                            ep.data_seen = true;
+                                            if !ep.data_seen {
+                                                ep.data_residual = transfer_len;
+                                                ep.data_seen = true;
+                                            }
                                         }
                                         return; // DATA stage claimed by the sync EP0 pump
                                     }
@@ -4068,10 +4089,12 @@ impl XhciController {
         // reports, and the actual transferred length is invisible. The extra event is claimed and
         // consumed by the sync EP0 pump (it never reaches the async FSM); the Status event still
         // drives completion. This lets the downstream enumerator reject a short (partial) read.
-        if w_length > 0 {
+        let data_trb_phys = if w_length > 0 {
             let dir: u32 = if dir_in { 1 } else { 0 };
-            self.push_ep0(slot_id, Trb { parameter: data_phys, status: w_length as u32, control: (3 << 10) | (1 << 5) | (dir << 16) });
-        }
+            self.push_ep0(slot_id, Trb { parameter: data_phys, status: w_length as u32, control: (3 << 10) | (1 << 5) | (dir << 16) })
+        } else {
+            0
+        };
 
         // Status stage (IOC). Direction is opposite the data stage; with no data it is IN.
         let status_dir: u32 = if w_length == 0 { 1 } else if dir_in { 0 } else { 1 };
@@ -4084,7 +4107,7 @@ impl XhciController {
 
         self.ep0_pending = Some(Ep0Pending {
             slot_id, wait_trb_phys: status_phys, done: false, completion_code: 0,
-            data_residual: 0, data_seen: false,
+            data_trb_phys, data_residual: 0, data_seen: false,
         });
         self.ring_doorbell(slot_id, 1);
 
@@ -4853,6 +4876,12 @@ impl XhciController {
     /// Mirrors the root-port recovery clean-up: clear the soft state and queue the deferred
     /// DISABLE_SLOT (the contexts/rings are leaked, not freed, until the controller lets go — the
     /// same use-after-free-DMA guard the root path documents). Never touch the published storage slot.
+    ///
+    /// PRECONDITION (review fold): every call site fires PRE-configuration — before any HID/MSC/FTDI
+    /// personality was bound to the slot. That is why this clears a NARROWER set than
+    /// recover_enumeration (no configuring_slot / hid_setproto_pending / ftdi_* / storage_* clears):
+    /// none of those can reference a slot that never got past the descriptor read. A future call site
+    /// on a post-configuration path must mirror recover_enumeration's fuller clear set instead.
     fn dispose_downstream_slot(&mut self, slot_id: u8) {
         let i = slot_id as usize;
         if i == 0 || i >= self.slots.len() || !self.slots[i].active {

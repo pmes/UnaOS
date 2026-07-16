@@ -491,6 +491,15 @@ mouse whose descriptor came back structurally valid but **zeroed** (`vid=0000 pi
   read. Trace: `downstream slot N MPS0 learned M (programmed P); re-addressing.` (This one
   *does* fire in QEMU: the hubbed FS storage device reports MPS0=8 and is re-addressed
   before its descriptor read — the HUBSTORAGE gate exercises the re-address code path.)
+  ⚠ Metal watch item: the re-address issues ADDRESS_DEVICE BSR=0 on an *already-Addressed*
+  slot — QEMU accepts it, but it is metal-unverified; the sitting should watch for a
+  code-17 cluster on the `re-addressing` line.
+- *Review fold (dup-Success guard).* The DATA-stage residual consumer matches the event's
+  TRB pointer against the recorded DATA TRB phys **and** first-write latches the residual:
+  Panther Point's `XHCI_SPURIOUS_SUCCESS` quirk (device 0x1e31 — this machine's controller)
+  can post a duplicate Success after a Short Packet for the same TD, and an unguarded
+  consumer would let the dup overwrite a real short-read residual with 0, masking the
+  exact strand M1 catches. QEMU posts no dup — the latch itself is metal-pending.
 
 **M2 — downstream ADDRESS_DEVICE bounded paced retry.** `address_downstream` gave up on
 the first non-success completion (metal: `code 17` = Context State Error behind the VIA

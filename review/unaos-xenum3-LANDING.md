@@ -54,6 +54,29 @@ Both fixes are **METAL-PENDING by construction** — QEMU never posts a zeroed d
 - `./arroyo test 40` — `>>> MISSION SUCCESS (BOT + CSW). TARGET ACQUIRED. <<<`.
 - `UNAOS_NOSTORAGE=1 ./arroyo test 40` — clean, 0 FAIL (U1b/U2-0a/U3/U3.5/U5x/U7x/U8x PASS).
 
+## Review fold (post-836fe0c)
+
+- **MUST-FIX (sync EP0 pump):** the DATA-stage residual consumer now matches the event's TRB
+  pointer against the recorded DATA TRB phys (`Ep0Pending.data_trb_phys`, captured from
+  `push_ep0`'s return) AND first-write latches the residual on `data_seen`. Without both, a
+  Panther Point `XHCI_SPURIOUS_SUCCESS` dup (device 0x1e31 — the target machine's controller)
+  posting a duplicate Success after a Short Packet for the same TD could overwrite a real
+  short-read residual with 0, making `last_control_len` read full and masking the exact
+  zeroed-descriptor strand M1 catches. QEMU posts no dup — the gates are a no-regression
+  check only for this latch; it is metal-pending like the rest of M1.
+- **SHOULD-FIX (dispose_downstream_slot):** precondition pinned in a doc comment — every call
+  site fires PRE-configuration, which is why it clears a narrower set than
+  `recover_enumeration` (no configuring_slot / hid_setproto_pending / ftdi_* / storage_*);
+  a future post-configuration call site must mirror the fuller clear set.
+- **NOTE (folded into §7g + here):** the MPS0-learn re-address issues ADDRESS_DEVICE BSR=0 on
+  an already-Addressed slot — QEMU-accepted but metal-unverified; the sitting should watch
+  for a code-17 cluster on the `re-addressing` trace line.
+
+Re-gate after fold: `./arroyo check` — `✅ x86_64 OK` / `✅ aarch64 OK`;
+`UNAOS_HUBSTORAGE=1 test 60` — MPS0-learn line fired + `MISSION SUCCESS`;
+`UNAOS_IRQSTORAGE=1 UNAOS_FATIMG=sf test 200` — 25 PASS / 0 FAIL, `storage_slot=1 note='ready'`;
+`test 40` — `MISSION SUCCESS`; `UNAOS_NOSTORAGE=1 test 40` — 11 PASS / 0 FAIL.
+
 ## Honest residuals
 
 - Neither M1's zeroed-descriptor case nor M2's `code 17` is reproducible in QEMU; both remain
