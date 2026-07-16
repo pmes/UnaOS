@@ -313,12 +313,43 @@ pub fn calibrate(pm: &crate::arch::acpi::PmTimer) {
     // "APIC: calibrated over ..." line above (the gate depends on that order — re-arming between the
     // stores and the print would put the armed line before the calibrated line).
     init_timer();
+
+    // CLOCK-X1 (M1): note the wall-clock timebase honestly. The invariant-TSC bit is what gates
+    // `clock::monotonic()` on x86 — with it the JD17 wall clock advances here; without it a set clock
+    // stays frozen. Emitted AFTER the re-arm so it can't disturb the calibrated→armed line ordering.
+    serial_println!(
+        "clock: TSC calibrated ~{} MHz ({})",
+        tsc_hz / 1_000_000,
+        if tsc_invariant() { "invariant" } else { "NOT invariant — wall clock stays frozen" }
+    );
 }
 
 /// Calibrated invariant-TSC frequency in Hz, or 0 if calibration has not run / failed.
 #[inline]
 pub fn tsc_hz() -> u64 {
     TSC_HZ.load(Ordering::Relaxed)
+}
+
+/// CLOCK-X1 — whether this CPU advertises an INVARIANT TSC: a `rdtsc` that ticks at a constant rate
+/// across P-/C-/T-state transitions and never stops (CPUID leaf 0x8000_0007, EDX bit 8; SDM Vol. 3A
+/// §17.17, AMD APM §13.2). Only such a TSC may back the wall clock — a non-invariant TSC would drift
+/// with the core frequency and make `now()` lie. The kernel's cycle-timing already assumes Nehalem+
+/// (`now_cycles`), but the clock's honesty contract checks the bit explicitly and returns `None`
+/// from `clock::monotonic()` when it is absent (frozen clock) rather than serving a bad reading.
+/// The extended-leaf presence is confirmed first (max extended leaf ≥ 0x8000_0007) so a CPU without
+/// the leaf reports "not invariant" honestly instead of reading an undefined EDX.
+#[inline]
+pub fn tsc_invariant() -> bool {
+    // CPUID is unprivileged with no preconditions; leaf 0x8000_0000 returns the maximum supported
+    // extended leaf, and 0x8000_0007 is architecturally defined on every 64-bit x86 that reports it.
+    // Gate on the max-leaf so an unimplemented leaf can't feed us a garbage EDX (matches the other
+    // `__cpuid` feature probes in this file, which the toolchain treats as safe on this target).
+    let max_ext = core::arch::x86_64::__cpuid(0x8000_0000).eax;
+    if max_ext < 0x8000_0007 {
+        return false;
+    }
+    let edx = core::arch::x86_64::__cpuid(0x8000_0007).edx;
+    edx & (1 << 8) != 0
 }
 
 /// Calibrated post-÷16 APIC-timer rate in Hz, or 0 if calibration has not run / failed.
