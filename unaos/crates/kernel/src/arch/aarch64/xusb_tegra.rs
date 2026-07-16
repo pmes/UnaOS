@@ -1095,13 +1095,15 @@ pub fn jbxc_scrub_inherited(cap0: u32) {
 // The elimination verdict (§JETSON-XCARVE fix-sitting) put the FillWrite target in the ONE class
 // no DRAM scrub can reach: the controller's INTERNAL command-ring fetch state — the inherited
 // Command Ring Pointer / dequeue latch that a CRCR *read* returns as zeros (xHCI 5.4.5). The
-// no-HCRST takeover (JB9g) preserves the firmware's live xHCI state, and here is the trap: xHCI
-// 5.4.5 says the Command Ring Pointer field of CRCR is only LOADED by the controller when the
-// Command Ring is stopped (CRR=0). `init_pointers` writes CRCR = our_ring|RCS while the controller
-// is halted (RS=0) — but a halted controller that inherited a *running* command ring can still read
-// CRR=1, in which case that write is SILENTLY DROPPED (only the CA/CS bits are honored while CRR=1)
-// and the controller keeps the firmware's internal fetch pointer. JB9i's DISABLE_SLOT then rings
-// doorbell 0 and the controller fetches from that inherited pointer — the carveout FillWrite.
+// no-HCRST takeover (JB9g) preserves the firmware's live xHCI state. xHCI 5.4.5 says the Command
+// Ring Pointer field of CRCR is only LOADED by the controller when the Command Ring is stopped
+// (CRR=0). REVIEW-LENS CORRECTION (pre-bench): 5.4.5 ALSO says CRR clears whenever the controller
+// halts (HCH=1) — a halted controller cannot read CRR=1 — and both sittings' censuses observed raw
+// CRCR=0x0 at HCH=1 (CRR bit 3 = 0). So `init_pointers`' halted-time write DOES latch, the
+// dropped-write theory is refuted a priori, and the CA branch below is expected DEAD on this path
+// (CRR-before=0 every boot). The lever's value is as a CONFIRMING PROBE: it closes the
+// command-ring bucket by silicon observation (and the re-seat guarantees no un-re-seated-ring
+// window regardless). CRR-before=1 here would itself be a silicon-erratum finding.
 //
 // The lever: BEFORE the first command doorbell (i.e. before JB9i), explicitly quiesce and re-seat
 // the command ring in spec order (xHCI 4.6.1.2 / 5.4.5):
@@ -1276,10 +1278,10 @@ pub fn jb2b_attach(
 
     // JETSON-XCARVE-CRCR M1: quiesce + re-seat the command ring BEFORE the first command doorbell.
     // start() just set RS=1 but rang no doorbell, so JB9i's DISABLE_SLOT below is the FIRST command
-    // the controller fetches. If the no-HCRST takeover inherited a running command ring (CRR=1),
-    // init_pointers' CRCR pointer write was silently dropped (5.4.5) and the controller still holds
-    // the firmware's internal fetch pointer — the carveout target by elimination. Abort (CA) if
-    // live, then re-seat CRCR at OUR ring, provably before JB9i. Falcon untouched (CA only, no
+    // the controller fetches. Per the review-lens correction at jbxc_crcrq_quiesce's header:
+    // CRR-before is EXPECTED 0 (spec 5.4.5 + both censuses), so this is a CONFIRMING PROBE that
+    // closes the command-ring bucket by observation — the CA branch is expected dead, and the
+    // re-seat guarantees no un-re-seated-ring window either way. Falcon untouched (CA only, no
     // HCRST/CSB). Knob-off (`xcarve_crcrq` absent) this call vanishes (byte-identical to baseline).
     #[cfg(feature = "xcarve_crcrq")]
     jbxc_crcrq_quiesce(cap0, jb9_cmd_phys);

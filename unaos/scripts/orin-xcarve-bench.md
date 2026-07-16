@@ -153,17 +153,24 @@ fault-rate comparison is therefore **statistical**, not a clean before/after on 
 `JBXC-CRCRQ:` lines (CRR-before, CA issued/skipped, CRR-after, CRCR re-seated) are the mechanism
 witness regardless of the fault outcome — capture every one.
 
-### Boot 1 — crcrq-leg23 image, ×3+ boots (the decisive fork)
+⚠ **REVIEW-LENS CORRECTION (folded pre-bench — read first):** per xHCI §5.4.5 CRR clears whenever
+the controller halts, and both prior censuses read raw `CRCR=0x0` at HCH=1 (CRR bit 3 = 0,
+observed). So **`CRR-before=0` is THE PREDICTED result**, the CA branch is expected dead, and this
+lever is a CONFIRMING PROBE (closes the command-ring bucket by silicon observation), NOT the
+likely fix. The fork below is ordered accordingly.
+
+### Boot 1 — crcrq-leg23 image, ×3+ boots (the fork, predicted-first)
 **Pre-registered prediction (the fork):**
-- **`JBXC-CRCRQ:` shows `CRR-before=1` + CA issued + CRR→0, then clean JB9i passage ×3+** ⇒ strong
-  **FIXED** signal AND the mechanism is NAMED — the inherited running command ring WAS the carveout
-  target. The boot then runs the leg-23 conjunction (5/5 cores, `CORE_READY[1..5]`, CAPSTONE 6/6).
-- **`JBXC-CRCRQ:` lines present but the fault PERSISTS at JB9i (`…dc80`/`dc40`)** ⇒ the command ring is
-  exonerated too; the target is controller-internal beyond the command ring — the FINAL bucket. Record
-  the `CRR-before` value + the fault ADDR. A valid discriminating result, not a failed arc.
-- **`CRR-before=0` every boot** ⇒ the inherited ring was NOT running; `init_pointers`' CRCR write
-  already took. The command-ring-not-loaded theory is refuted for this silicon; the re-seat still leaves
-  no window. Record it; if the wall persists it is elsewhere-internal.
+- **`CRR-before=0` every boot (PREDICTED)** ⇒ the inherited ring was not running; `init_pointers`'
+  CRCR write already took; the command-ring bucket CLOSES by observation. The re-seat still leaves
+  no window. On clean boots the leg-23 conjunction runs (5/5 cores, CAPSTONE 6/6).
+- **`JBXC-CRCRQ:` lines present but the fault PERSISTS at JB9i (`…dc80`/`dc40`)** ⇒ same conclusion
+  with the fault sampled in-window: command ring exonerated, target = controller-internal beyond
+  the command ring — the FINAL bucket. Record `CRR-before` + the fault ADDR. A valid
+  discriminating result, not a failed arc.
+- **`CRR-before=1` + CA issued + CRR→0, then clean JB9i ×3+ (would CONTRADICT §5.4.5 on this
+  silicon)** ⇒ record as BOTH a silicon-erratum finding AND a strong FIXED signal — both halves
+  matter; capture every line exactly.
 
 ### Boot 2 — crcrq-default (the quiesce on a benign layout; run if a control is wanted)
 **Pre-registered prediction:** default-class images fault ~0/19 historically, so expect a clean boot with

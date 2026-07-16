@@ -4206,12 +4206,16 @@ firmware's live xHCI state. Among that state is the command ring's INTERNAL fetc
 latch — the one xHCI structure whose pointer field a CRCR *read* returns as zeros (§5.4.5), so no
 `JBXC:` census line can name it. The trap is a specific spec rule: **the controller loads the
 Command Ring Pointer field of CRCR ONLY when the ring is stopped (CRR=0); while CRR=1 a CRCR write
-moves only the CA/CS status bits and the pointer field is ignored.** `init_pointers` writes
-`CRCR = our_ring | RCS` while the controller is halted (RS=0) — but a halted controller that
-inherited a *running* command ring can still read **CRR=1**, in which case that pointer write is
-SILENTLY DROPPED and the controller keeps the firmware's internal fetch pointer. `start()` then sets
-RS=1 and JB9i rings doorbell 0 (`DISABLE_SLOT 1..8`) — the FIRST command doorbell — and the
-controller fetches from the inherited pointer: the carveout FillWrite at `…7767dc80`/`dc40`.
+moves only the CA/CS status bits and the pointer field is ignored.** **REVIEW-LENS CORRECTION
+(spec + census, folded before any bench):** per §5.4.5 CRR is CLEARED whenever the controller
+halts (HCH=1) — a halted controller CANNOT read CRR=1 — and both prior sittings' censuses read raw
+`CRCR=0x0` at HCH=1, which (CRR = bit 3, readable) directly observes **CRR=0** on this exact
+inherited state. So `init_pointers`' halted-time CRCR write DOES latch, the dropped-write theory is
+REFUTED a priori, and the CA branch below is expected DEAD on this path (`CRR-before=0` every
+boot). **The lever's honest value is as a CONFIRMING PROBE:** it closes the command-ring bucket by
+silicon observation instead of spec argument (zero cost knob-off), and its re-seat guarantees no
+un-re-seated-ring window regardless. It is NOT the likely fix; if the wall persists past it, the
+target is controller-internal beyond the command ring (final bucket).
 
 **M1 — the quiesce + re-seat (`jbxc_crcrq_quiesce`, feature `xcarve_crcrq ⇒ tegra`, default OFF).**
 In `jb2b_attach`, placed AFTER the takeover programs the rings and `start()`s the controller but
@@ -4255,11 +4259,15 @@ knobs (`UNAOS_SMPPROBE=23` era) PLUS `UNAOS_XCARVE_CRCRQ=1` (+ census `UNAOS_XCA
 documents itself). ⚠ **Disclosure:** adding the quiesce code CHANGES the image layout — the exact
 4/4 leg-23 layout cannot be byte-preserved (this is the fourth distinct layout of those knobs; the
 prior three sampled 4/4, ~50%, 0/4). The fault-rate comparison is therefore statistical; the
-`JBXC-CRCRQ:` lines are the mechanism witness either way. Pre-registered outcomes:
-- **quiesce lines showing `CRR-before=1` + CA + clean boots ×3+** on the leg-23-knobs image ⇒ strong
-  **FIXED** signal, and the mechanism is NAMED (an inherited running command ring was the target).
-- **quiesce lines + fault persists at JB9i** ⇒ the command ring is exonerated too; the target is
-  controller-internal beyond the command ring (final bucket) — a valid discriminating result.
-- **`CRR-before=0` every boot** ⇒ the inherited ring was not running; init_pointers' CRCR write
-  already took, and the command-ring-not-loaded theory is refuted (record it; the re-seat still
-  leaves no window and the wall, if it persists, is elsewhere-internal).
+`JBXC-CRCRQ:` lines are the mechanism witness either way. Pre-registered outcomes (ordered by
+PREDICTED likelihood after the review-lens correction above):
+- **`CRR-before=0` every boot (THE PREDICTED RESULT)** ⇒ confirms on silicon what spec + census
+  already say: the inherited ring was not running, init_pointers' CRCR write already took, the
+  command-ring bucket CLOSES by observation. The re-seat still leaves no window; if the wall
+  persists on other boots, the target is controller-internal beyond the command ring (final
+  bucket).
+- **quiesce lines + fault persists at JB9i** ⇒ same conclusion with the fault sampled in-window —
+  command ring exonerated, controller-internal confirmed.
+- **`CRR-before=1` + CA + clean boots ×3+** ⇒ would CONTRADICT §5.4.5 on this silicon (halted
+  controller reading CRR=1) — treat as a silicon-erratum finding AND a strong FIXED signal;
+  record exactly, both halves matter.
