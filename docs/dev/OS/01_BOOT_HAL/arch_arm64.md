@@ -3871,3 +3871,52 @@ informative outcome, not a null. Bench-rig note for the record: two early boots 
 capture faults on the HOST side (a baud-reset garble, then two processes splitting the serial byte
 stream — kill stale readers BY DEVICE before trusting a capture); evidence starts at the clean
 RIDER-1 boot. Default image restored to the boot stick at close (`17bc4e7a…`, `tegra:` 109).
+
+### VUGFIX — reviving vug's meters on the timerless tegra EL1 (`arch::ms()` fallback + honest meter count; bench Peter-attended)
+
+Peter's post-SMP-5 shell poke (2026-07-16) showed the `vug` demo on the Orin with two defects: blank
+render **ms/fps**, flat CPU-load bars, an unthrottled spinner, and a CPU meter claiming **8 cores** on
+the 6-core part. Two independent root causes, both tegra-only.
+
+**Root cause A — timerless EL1 freezes `arch::ms()`.** By design the Orin's EL2→EL1 drop disables the
+physical timer (`CNTP_CTL=0`, JD3; `timer::set_not_live`), so the timer IRQ never fires at EL1 and
+`timer::ticks()` is frozen at 0. `arch::ms()` was `ticks()*4` → stuck at 0, so `vug`'s 200 ms readout
+window (`dt >= 200`) never elapsed (the fps/ms readout, the load fraction, AND the demo-core pulse
+fallback all sit behind that window) and the render loop had no pacing. `setdate`/JD17 is a *separate*
+clock service and was correctly disproven as the culprit.
+
+*Fix:* a `tegra`-gated `ms()` fallback. When the timer is not live (`!timer::is_live()`, always the
+case on the current tegra EL1 drop), derive ms from the free-running virtual counter,
+`CNTVCT_EL0 / (CNTFRQ_EL0/1000)` — the SAME interrupt-flag-independent timebase `now_cycles()` already
+uses to bound hardware busy-waits, so **no new hardware is touched**. `CNTFRQ==0` guards to 0. When the
+timer *is* live the heartbeat form (`ticks()*4`) is kept so the two paths agree. With `ms()` alive the
+existing 200 ms window, fps/ms readout, load fraction and demo-core fallback all revive on their own —
+no `vug` render-loop rework.
+
+**Root cause B — the meter DISPLAYED the array-headroom bound, not the real core count.**
+`sched::meter_cpu_count()` returned `percpu::NUM_CPUS`, which is `8` under `tegra` (JM5 sized the
+per-CPU array to the part's 8 GICR frames + headroom). The Orin Nano's DTB `/cpus` names **6**
+Cortex-A78AE cores (the hard-won SMP-2/SMP-3 oracle: GICR frames and `AFFINITY_INFO` both over-count;
+only `/cpus` is truthful).
+
+*Fix:* a `tegra`-gated `percpu::METER_CPU_COUNT = 6` that `meter_cpu_count()` DISPLAYS on tegra;
+`NUM_CPUS` stays the array bound everywhere (`meter_cpu_ticks` still caps at it; 6 ≤ 8 keeps every read
+in range). It is a **compile-time** count, not a runtime `/cpus` walk, because the default tegra boot is
+single-core and performs no runtime enumeration (that lives only on the `tegrasmp` probe path;
+`smp_virt::N_CORES_PUB` is 0 on the default boot), and threading the DTB pointer to the meter read path
+would need an out-of-lane boot-path change (`main.rs`) — outside this arc's lane.
+
+**Byte-identity rule (the load-bearing constraint).** The whole change is `tegra`-gated AND
+line-count-preserving in the shared files (both `cfg` folds live on a single source line; the new const
+is appended at EOF), specifically so the pi/virt binaries — and their serial-log addresses — stay
+byte-identical. Proven: the pi `kernel8.img` (objcopy flat) hashes **identical** base-vs-HEAD; the virt
+`test-arm` kernel's raw `.text`/`.rodata`/`.data` and its full objcopy `-O binary` loadable image hash
+**identical** base-vs-HEAD (the full ELF differs only in non-loaded DWARF `.debug_*`, which records the
+changed source text and shifts later section file offsets — it does not reach the running kernel).
+
+**Gate (this executor).** `./arroyo check` green (both arches, knob-off AND `UNAOS_TEGRA=1`);
+`test-arm 22` MISSION SUCCESS; GICv3 `test-arm 40` CAPSTONE 6/6 + 3/3 secondaries; `kernel8-test`
+0-FAIL (34 PASS); `UNAOS_HUBSTORAGE` x86 MISSION SUCCESS; `esp-jetson` links, `tegra:` 109 (unchanged —
+no new serial prints). QEMU cannot model the tegra timerless drop, so the verdict is the attended Orin
+bench (LC-orin + Peter): expected metal outcome = `vug` shows live fps/ms/load, the CPU meter reads
+**6** cores, and the bars move.

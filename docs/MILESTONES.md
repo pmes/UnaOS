@@ -10,6 +10,37 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## aarch64 tegra — VUGFIX: reviving vug's meters on the timerless Orin EL1 — 2026-07-16 🔬 QEMU-green, metal pending `hw-jetson`
+
+**What it does:** fixes two tegra-only defects Peter observed poking `vug` on the Orin (blank render
+ms/fps, flat CPU bars, unthrottled spinner, and "8 CPUs" on a 6-core part), both via minimal
+tegra-gated changes. **(A)** The Orin's EL2→EL1 drop disables the physical timer (`CNTP_CTL=0`, JD3),
+so the IRQ heartbeat never fires and `arch::ms()` (`ticks()*4`) was frozen at 0 → `vug`'s 200 ms
+readout window (which also gates the fps/ms readout, the load fraction, and the demo-core pulse) never
+elapsed and the loop had no pacing. Fix: a `tegra`-gated `ms()` fallback that, when the timer is not
+live, derives ms from the free-running `CNTVCT_EL0/(CNTFRQ_EL0/1000)` — the same interrupt-independent
+timebase `now_cycles()` already uses to bound HW waits (no new hardware; `CNTFRQ==0` guards to 0). With
+`ms()` alive the existing window/readout/fallback all revive — no `vug` render-loop rework. **(B)** the
+CPU meter DISPLAYED `NUM_CPUS` (= 8 under tegra, the per-CPU-array headroom matching the part's 8 GICR
+frames), not the real core count. Fix: a `tegra`-gated `percpu::METER_CPU_COUNT = 6` (the Orin Nano's
+DTB `/cpus` count — the SMP-2/SMP-3 oracle: only `/cpus` is truthful) that `meter_cpu_count()` displays;
+`NUM_CPUS` stays the array bound (6 ≤ 8 keeps every `meter_cpu_ticks` read in range). Compile-time, not
+a runtime `/cpus` walk, because the default tegra boot is single-core with no runtime enumeration and
+threading the DTB pointer to the meter would be out-of-lane (`main.rs`). `setdate`/JD17 is a separate
+clock and was correctly disproven as the cause.
+
+**How it was tested:** `./arroyo check` green both arches, knob-off AND `UNAOS_TEGRA=1`; `test-arm 22`
+MISSION SUCCESS; GICv3 `test-arm 40` CAPSTONE 6/6 + 3/3 secondaries; `kernel8-test` 0-FAIL (34 PASS);
+`UNAOS_HUBSTORAGE` x86 MISSION SUCCESS; `esp-jetson` links, `tegra:` 109 (unchanged — no new prints).
+**pi/virt byte-identity proven** — pi `kernel8.img` (objcopy flat) hashes identical base-vs-HEAD
+(`3ad89b6b…`); virt `test-arm` raw `.text`/`.rodata`/`.data` + objcopy `-O binary` loadable image hash
+identical (`6272f487…`); the full virt ELF differs only in non-loaded DWARF (records the changed source
+text). QEMU cannot model the timerless drop, so the meter verdict is the attended Orin bench (LC-orin +
+Peter): expected = live fps/ms/load, meter reads 6, bars move. `arch/aarch64/{mod,percpu,sched}.rs` +
+`arch_arm64.md §VUGFIX`.
+
+---
+
 ## hw-pi4 track — 2026-07-16 (BANDY-1 — the on-UnaOS SMessage bus + midden, program #3)
 
 ### BANDY-1 — syscall-backed bus transport, native v1 wire, ls/cat/cp kernel fulfillment 🔬 QEMU-green (metal rides the next attended sitting)
