@@ -71,6 +71,10 @@ REQUIRE S7-openany:.*owner ACL not bypassed.*witness OK
 # --- ✅ METAL-CONFIRMED 2026-07-15 (attended rMBP bench, LC-x86): fired on 3 boots (incl. a genuine
 # --- power-cut pair, both 43/43 clean, boot-5 slice-asserted standalone) — PROMOTED to REQUIRE.
 REQUIRE S8-write:.*overwrite never grows.*witness OK
+# --- S9 = STOR-1 S9: a RW dynamic on-disk file GROWS past EOF live (bounded per-write/per-file). PENDING
+# --- until the attended rMBP bench captures it (create -> grow -> Stat-grew -> readback -> -ENOSPC ceiling);
+# --- promote PENDING -> REQUIRE after that sitting, exactly as S8-write was.
+PENDING S9-grow:.*extended 0 -> .* bytes.*witness OK
 
 # --- VPERF (this boot DECIDES VPERF-WC — all landed post-bench, never on metal) -----
 # THE DECIDER: eff=WC → VPERF-WC dead; eff=UC (or any non-WC) → VPERF-WC triggers

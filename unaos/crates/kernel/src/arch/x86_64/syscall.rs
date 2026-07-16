@@ -12702,6 +12702,112 @@ fn s8_write_witness() {
     }
 }
 
+/// STOR-1 S9 witness — a RW open of a DYNAMIC on-disk file, a past-EOF write GROWS it on disk (the S8-overwrite
+/// successor). Kernel-side + knob-on (uncounted idiom, no ` PASS`/` FAIL` token, so the fixture PASS count stays
+/// byte-equivalent). The witness OWNS the file's whole lifecycle so it is idempotent by construction across boots
+/// + power-cuts (self-heal delete FIRST, delete LAST): it deletes any prior S9G.BIN, CREATEs a fresh 0-length one
+/// on the live volume, opens it RW dynamically (size 0, NOT staged, NOT a U10 name), then GROWs it in two steps
+/// via the kernel-buffer live seam `dyn_grow_live` (0->48->96) — the same route `sys_write_file`'s S9 grow branch
+/// takes (`submit_grow`) — and proves through the service task that (a) `submit_stat` reports the file GREW to 96
+/// (real on-disk alloc + chain + dir-size bump), and (b) `submit_read_file` returns the appended bytes. Bound
+/// legs: the PER-FILE ceiling is witnessed through the REAL `sys_write_file` — an offset at `DYN_FILE_MAX` is
+/// refused `-ENOSPC` (the cap fires BEFORE any user deref, so the buf is never touched, exactly as S8's eof-zero
+/// leg). The PER-WRITE page cap is a short-count clamp verified by review (like S8's user-pointer clamp NOTE — no
+/// user memory is mappable from the launcher context to drive it). Refusal leg: `sys_open_dynamic("hello.bin", 1)`
+/// — staged EL0 code — MUST still be refused `< 0` (the MF2-under-S8/S9 lock is untouched). Gated on the knob-on
+/// FAT path; SILENT skip otherwise. Tears the scratch row down through the real funnel + deletes S9G.BIN.
+#[cfg(feature = "irqstorage")]
+fn s9_grow_witness() {
+    if !s4_sync_storage() {
+        return;
+    }
+    const NAME: &str = "S9G.BIN";
+    const G1: usize = 48; // first grow: 0 -> 48 (allocates the file's first cluster from empty)
+    const G2: usize = 48; // second grow: 48 -> 96 (incremental extend)
+    const FINAL: u32 = (G1 + G2) as u32;
+    const B1: u8 = 0xE1; // first-grow filler
+    const B2: u8 = 0xE2; // second-grow filler
+    // Defensive: prove the target really exercises the DYNAMIC path (not a staged/U10 collision — it never is).
+    if staged_lookup(NAME).is_some() || u10_name_id(NAME).is_some() {
+        return;
+    }
+    let Some(r) = crate::arch::memory::alloc_user_space() else {
+        return; // no scratch address space — silent skip
+    };
+    // Self-heal any prior boot's grown copy, then CREATE a fresh 0-length file on the live volume.
+    let _ = unsafe { crate::drivers::xhci::irqstorage::submit_delete(NAME.as_bytes()) };
+    let created = unsafe { crate::drivers::xhci::irqstorage::submit_create(NAME.as_bytes()) };
+    // Open it RW dynamically (mode bit0). S9 mints a writable dynamic descriptor; size starts at 0 (fresh file).
+    let h = sys_open_dynamic(r, NAME, 1);
+    let mut is_dyn = false;
+    let mut cap_write = false;
+    let mut size0: u32 = u32::MAX;
+    let mut grew1: i32 = -1;
+    let mut grew2: i32 = -1;
+    let mut stat_grew: i32 = -1;
+    let mut readback_ok = false;
+    let mut cap_enospc = false;
+    if created == 0 && h >= 0 {
+        if let Ok(HandleTarget::File(file_id)) = handle_resolve(r, h as u64, CAP_WRITE) {
+            cap_write = true;
+            if let Some(fid) = file_desc_validate(r, file_id) {
+                is_dyn = FILE_DYNLEN[r][fid].load(Ordering::Acquire) != 0;
+                size0 = FILE_SIZE[r][fid].load(Ordering::Acquire);
+                // (1) GROW past EOF twice via the kernel-buffer live seam (the S9 grow SOURCE) — 0->48->96.
+                let mut w1 = [B1; G1];
+                grew1 = unsafe { dyn_grow_live(r, fid, 0, w1.as_mut_ptr(), G1) };
+                let mut w2 = [B2; G2];
+                grew2 = unsafe { dyn_grow_live(r, fid, G1 as u32, w2.as_mut_ptr(), G2) };
+                // (2) prove the on-disk size GREW (Stat through the service task) — a real alloc + chain + dir bump.
+                stat_grew = unsafe { crate::drivers::xhci::irqstorage::submit_stat(NAME.as_bytes()) };
+                // (3) read the whole grown file back BY NAME and match the appended bytes.
+                let mut rbuf = [0u8; G1 + G2];
+                let rn = unsafe {
+                    crate::drivers::xhci::irqstorage::submit_read_file(
+                        NAME.as_bytes(), 0, rbuf.as_mut_ptr(), G1 + G2,
+                    )
+                };
+                readback_ok = grew1 == G1 as i32
+                    && grew2 == G2 as i32
+                    && stat_grew == FINAL as i32
+                    && rn == (G1 + G2) as i32
+                    && rbuf[..G1].iter().all(|&b| b == B1)
+                    && rbuf[G1..].iter().all(|&b| b == B2);
+                // (4) PER-FILE ceiling: drive the REAL sys_write_file with the offset AT DYN_FILE_MAX — the grow
+                // branch fires (offset far past size) and `dyn_write_grow` refuses `-ENOSPC` BEFORE any user
+                // deref (so USER_BASE is never touched, exactly as S8's eof-zero leg). Witnesses the DoS bound.
+                FILE_OFFSET[r][fid].store(DYN_FILE_MAX as u32, Ordering::Release);
+                cap_enospc = sys_write_file(r, file_id, USER_BASE, 16) == ENOSPC;
+            }
+        }
+    }
+    // Refusal leg: a case-variant of staged EL0 code ("hello.bin") RW MUST still be refused (MF2 lock intact).
+    let deny = sys_open_dynamic(r, "hello.bin", 1);
+    let excl_ok = deny < 0;
+    // Teardown: release the scratch row through the real funnel, THEN delete the on-disk file (idempotent cleanup).
+    crate::arch::memory::free_user_space_by_cr3(crate::arch::memory::slot_cr3(r));
+    let _ = unsafe { crate::drivers::xhci::irqstorage::submit_delete(NAME.as_bytes()) };
+    let pass = created == 0
+        && h >= 0
+        && is_dyn
+        && cap_write
+        && size0 == 0
+        && readback_ok
+        && cap_enospc
+        && excl_ok;
+    if pass {
+        serial_println!(
+            ":: S9-grow: a dynamic on-disk file (S9G.BIN) opened RW GREW past EOF live off the pre-stage set — Stat confirms it extended 0 -> {} bytes (real alloc + chain), the appended bytes read back, a write at the {}-byte per-file ceiling was refused -ENOSPC, and staged code (\"hello.bin\") RW stayed refused (MF2 intact) == expected — witness OK ::",
+            FINAL, DYN_FILE_MAX
+        );
+    } else {
+        serial_println!(
+            ":: S9-grow FAIL — created={} h={} is_dyn={} cap_write={} size0={} grew1={} grew2={} stat_grew={} readback_ok={} cap_enospc={} excl_ok={} deny={} (want created=0 h>=0 dyn capW size0=0 grew1={} grew2={} stat={} readback enospc deny<0) ::",
+            created, h, is_dyn, cap_write, size0, grew1, grew2, stat_grew, readback_ok, cap_enospc, excl_ok, deny, G1, G2, FINAL
+        );
+    }
+}
+
 #[cfg(feature = "irqstorage")]
 fn s5_shared_backing_witness() {
     // Gate: created reads route live ONLY knob-on with a mounted FAT + the service task up. Off -> SILENT skip.
@@ -12883,6 +12989,9 @@ fn u11m2_launcher(demo_cpu: usize) {
     // STOR-1 S8: witness a RW open of an arbitrary on-disk file (S8W.BIN) overwriting live off the pre-stage set.
     #[cfg(feature = "irqstorage")]
     s8_write_witness();
+    // STOR-1 S9: witness a RW dynamic on-disk file (S9G.BIN) GROWING past EOF live (create -> grow -> stat/read).
+    #[cfg(feature = "irqstorage")]
+    s9_grow_witness();
     let Some(srow) = crate::arch::memory::alloc_user_space() else {
         serial_println!(":: U11m2: no free scratch slot — cross-process unlink demo skipped ::");
         return;
