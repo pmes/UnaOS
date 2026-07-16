@@ -332,6 +332,78 @@ hot-plugged behind the HS hub, SS hub as available).
 
 ---
 
+### 7e. Keyboard interrupt-IN dup-Success guard (PORTSW-1 M0)
+
+The keyboard interrupt-IN arm had the identical latent gap the pointer path (§7a)
+already closes: a boot-keyboard report is 8 bytes, *always* shorter than the endpoint
+MPS, so it is exactly the short-packet case Panther Point's `XHCI_SPURIOUS_SUCCESS`
+quirk (device 0x1e31) fires on — the controller can post a *duplicate* Success for
+the same TD after the Short Packet. Harmless for the current external keyboard (no
+metal dup observed), but PORTSW-1 (§7f) brings the *internal* keyboard onto this exact
+path, where a dup would double-inject the keystrokes and over-arm the interrupt-IN ring.
+`queue_keyboard_read` now records the armed Normal-TRB physical address in
+`keyboard_expect_phys`, and the keyboard dispatch processes only the matching
+completion (mirroring `mouse_expect_phys`). QEMU posts no dup, so `param` always
+matches and the guard is transparent there. Metal proof: the `xHCI: KEY` /
+`USB-DEBUG: kbd report` lines stay 1-per-keypress (no doubles).
+
+### 7f. Panther Point EHCI→xHCI port switchover (PORTSW-1)
+
+The 2012 rMBP (MacBookPro10,1, Panther Point PCH, xHCI id **0x1e31**) wires the
+internal keyboard + trackpad to the **EHCI** companion controller by default; an
+xHCI-only driver never sees them. Panther Point can *re-route* its shared USB2 ports
+from EHCI to xHCI (and enable the SuperSpeed lanes) via four config registers on the
+xHCI PCI function:
+
+| off  | reg          | role                                            |
+|------|--------------|-------------------------------------------------|
+| 0xD0 | `XUSB2PR`    | USB2 routing SELECT (0 = EHCI, 1 = xHCI per port)|
+| 0xD4 | `USB2PRM`    | USB2 routing MASK (which USB2 bits are switchable)|
+| 0xD8 | `USB3_PSSEN` | SuperSpeed enable SELECT                          |
+| 0xDC | `USB3PRM`    | SuperSpeed routing MASK                           |
+
+Flipping the routable bits makes the internal devices **re-enumerate on the existing
+xHCI + HID stack** — the trackpad as a plain boot mouse via `SET_PROTOCOL(boot)` (§7a),
+the keyboard via the boot-kbd scancode map. No new HID code; this is the port flip plus
+its sequencing and witness.
+
+**Mask-read-before-write discipline.** The `*PRM` mask registers advertise which port
+bits are switchable on *this* silicon. The write is `current | (mask & mask)` —
+`SELECT |= mask` — so it sets **only advertised bits and clears none**; an unmasked /
+undefined bit is never written (writing one is undefined and can wedge the controller).
+If a mask reads 0 the silicon advertises no switchable ports of that class: the write is
+**skipped and reported**, never forced (a STOP tripwire). Ordering matches Linux
+`usb_enable_intel_xhci_ports()`: SuperSpeed enable before USB2 routing.
+
+**Sequencing.** The flip runs in `arch::x86_64::pci::init` **before** `xhci::init`
+resets and starts the controller — i.e. before enumeration, **one topology per boot,
+never re-flipped live** (re-flipping after storage enumerated could drop a block device
+mid-transaction).
+
+**Knob-gated, default-OFF.** Compiled only under the `portsw` Cargo feature
+(`UNAOS_PORTSW=1`, mapped in both `arroyo` and `builder/src/main.rs`). Knob-off: the
+routing function does not exist, **zero config-space writes**, the current
+EHCI-internal / xHCI-external topology, byte-identical media — so every prior bench
+stays reproducible and the flip is an opt-in experiment.
+
+**Witness** (uncounted): `:: PORTSW-1: XUSB2PR mask=0x.. routed 0x..->0x.. +
+USB3_PSSEN mask=0x.. 0x..->0x.. (knob-on) == witness ::`. The masks + before/after
+read-backs are the assertable record: after == `before | mask` confirms the mux
+toggled; a smaller value means firmware (Apple EFI) locked some shared-port bits.
+
+**Two bench findings (pre-registered, metal-PENDING).** (1) *Do the Apple internal
+devices behave on xHCI after the flip?* Expected: they enumerate like external HID.
+(2) *Does the internal trackpad honor boot protocol?* Expected: `SET_PROTOCOL(boot)`
+yields proto-2 relative reports. If the trackpad is report-descriptor-only (no boot
+mode) its leg parks while the keyboard leg may still succeed — reported independently.
+
+**QEMU is inert by design.** QEMU's qemu-xhci (0x1b36) doesn't model Panther-Point
+routing, so under knob-on the code reads the register block (harmless) and prints the
+witness with `mask=0x0` / before == after (no write issued), then storage + MISSION run
+unregressed. The real verdict is the attended rMBP bench.
+
+---
+
 ## 8. Status and limitations
 
 Implemented: controller bring-up + BIOS→OS handoff, interrupt-driven event
@@ -343,6 +415,9 @@ read/write, and HID input, plus **hub-downstream hot-plug** (the hub Status Chan
 Endpoint is configured and serviced — connect enumerates, disconnect tears down the
 route-scoped subtree). aarch64 uses a polled variant (no interrupts there yet). See
 §7c for the XENUM-1 enumeration-robustness fixes and §7d for XENUM-2 hub hot-plug.
+An opt-in Panther Point EHCI→xHCI **port switchover** (§7f, `UNAOS_PORTSW=1`, QEMU-green /
+metal-PENDING) re-routes the 2012 rMBP internal keyboard + trackpad onto the xHCI+HID
+stack; default-OFF and byte-identical when unset.
 
 Not yet implemented: endpoint STALL recovery, multi-tier hubs, and broader class
 support. The `skip_xhci` Cargo feature (`UNAOS_SKIP_XHCI=1`) disables USB bring-up

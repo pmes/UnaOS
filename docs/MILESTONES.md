@@ -10,6 +10,42 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-rmbp track — 2026-07-16 (PORTSW-1 — Panther Point EHCI→xHCI port switchover: internal kbd + trackpad)
+
+### PORTSW-1 — Panther Point EHCI→xHCI port switchover 🔬 `hw-rmbp`
+
+**What it does:** the 2012 rMBP wires its internal keyboard + trackpad to the **EHCI** companion
+controller by default, so the xHCI-only driver never sees them (every prior bench used external USB
+input). Panther Point (PCH xHCI id 0x1e31) can re-route its shared USB2 ports EHCI→xHCI (and enable the
+SuperSpeed lanes) via four config registers on the xHCI PCI function — `XUSB2PR` @0xD0 / `USB2PRM` @0xD4
+(mask) / `USB3_PSSEN` @0xD8 / `USB3PRM` @0xDC (mask). Flipping the routable bits makes the internal
+devices **re-enumerate on the existing xHCI + HID stack** (trackpad as a boot mouse via
+`SET_PROTOCOL(boot)`, keyboard via the boot-kbd map) — no new HID code. **M0 — keyboard dup guard
+(prereq):** the keyboard interrupt-IN arm had the same latent Panther-Point `XHCI_SPURIOUS_SUCCESS`
+dup-Success gap the pointer path already closes; a boot-kbd report is always shorter than the endpoint
+MPS. Added `keyboard_expect_phys` (mirrors `mouse_expect_phys`) so a dup can't double-inject keystrokes
+or over-arm the ring — landed first so the internal keyboard is dup-safe the moment it enumerates. **The
+flip:** `arch/x86_64/pci.rs::enable_intel_xhci_ports`, run in PCI `init` **before** `xhci::init` (before
+enumeration, one topology per boot, never re-flipped live). **Mask-read-before-write discipline:** the
+write is `SELECT |= (mask & mask)` — sets only advertised bits, clears none, never touches an unmasked
+bit; a mask that reads 0 skips the write and reports (STOP tripwire). **Knob-gated, default-OFF:**
+compiled only under the `portsw` feature (`UNAOS_PORTSW=1`, mapped in `arroyo` + `builder/src/main.rs`);
+knob-off = zero config writes = byte-identical media. Additive to the enum/HID path; no
+`syscall.rs`/`fat.rs`/`sched.rs`, no aarch64.
+
+**How it was tested:** 🔬 QEMU (qemu-xhci 0x1b36 doesn't model Panther-Point routing — the flip is inert
+there by design; the gate proves knob-off identity + knob-on no-regression + the witness read-back).
+`./arroyo check` both arches, knob on+off, no new warnings, zero aarch64 diffs. **Knob-OFF:** `test 25`
+MISSION SUCCESS with **zero PORTSW lines / zero register writes**; `UNAOS_FATIMG=sf test 200` storage
+chain 0 FAIL (U11m2 PASS); `test-arm 22` MISSION SUCCESS; `UNAOS_NOSTORAGE=1` clean (U1b PASS, kernel
+alive). **Knob-ON:** `test 25` MISSION SUCCESS + the witness prints its mask read-back —
+`:: PORTSW-1: XUSB2PR mask=0x0 routed 0x0->0x0 + USB3_PSSEN mask=0x0 0x0->0x0 (knob-on) == witness ::`
+(before == after: no write issued, inert as expected on QEMU); `UNAOS_FATIMG=sf test 200` storage chain
+0 FAIL. **Metal verdict: PENDING** (attended rMBP sitting — the flip is inert in QEMU so metal is the
+whole verdict: does the internal kbd/trackpad enumerate + honor boot protocol post-flip; runbook keeps
+one variable per boot: external-mouse boot proves the EP path, then a separate knob-on boot flips). Detail:
+§7e (M0) + §7f (switchover) of `docs/dev/OS/07_USB_STORAGE/usb_xhci.md`.
+
 ## hw-rmbp track — 2026-07-16 (XENUM-2 — hub-downstream hot-plug: the hub Status Change Endpoint)
 
 ### XENUM-2 — hub-downstream hot-plug via the Status Change Endpoint 🔬 `hw-rmbp`
