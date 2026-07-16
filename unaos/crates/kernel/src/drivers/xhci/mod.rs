@@ -4519,16 +4519,40 @@ impl XhciController {
         let c_connection = (wchange & 0x0001) != 0;
 
         if c_connection && connected {
-            // M1: visibility only — a device appeared on this downstream port. The reset +
-            // enumerate action lands in M2.
-            serial_println!("xHCI: HUB slot {} port {} connect detected (enumeration lands in M2).", hub_slot, port);
+            // M2: a device appeared on this downstream port. Reset it, learn its speed, then
+            // enumerate through the existing downstream path with the route extended for this tier.
+            let (hub_route, hub_depth, root_hub_port) = {
+                let s = &self.slots[hub_slot as usize];
+                (s.route_string, s.route_depth, s.port_id)
+            };
+            if hub_depth >= 5 {
+                serial_println!(
+                    "xHCI: HUB slot {} port {} connect ignored (hub at max USB tier depth {}).",
+                    hub_slot, port, hub_depth);
+            } else {
+                serial_println!("xHCI: HUB slot {} port {} connect: resetting + enumerating downstream device.", hub_slot, port);
+                // reset_downstream_port issues CLEAR C_PORT_CONNECTION + SET PORT_RESET, awaits
+                // C_PORT_RESET (bounded/paced), clears it, and reads the trained speed.
+                if let Some(mut speed) = self.reset_downstream_port(hub_slot, port, buf) {
+                    if is_ss {
+                        // SS hub ports are always SuperSpeed (the HS/FS speed bits don't apply);
+                        // best-effort per XENUM-2 — the metal HS/FS mouse/keyboard path is exact.
+                        speed = 4;
+                        serial_println!("xHCI: HUB slot {} port {} is a SuperSpeed port (speed forced to SS).", hub_slot, port);
+                    }
+                    let child_route = hub_route | (((port as u32).min(15)) << (4 * hub_depth));
+                    let child_depth = hub_depth + 1;
+                    self.enumerate_downstream(hub_slot, port, root_hub_port, child_route, child_depth, speed);
+                } else {
+                    serial_println!("xHCI: HUB slot {} port {} did not enable after reset; leaving unconfigured.", hub_slot, port);
+                }
+            }
         } else if c_connection && !connected {
             // M1: visibility only — the device left. The route-scoped teardown lands in M3.
             serial_println!("xHCI: HUB slot {} port {} disconnect detected (teardown lands in M3).", hub_slot, port);
         } else {
             serial_println!("xHCI: HUB slot {} port {}: no actionable connection change.", hub_slot, port);
         }
-        let _ = is_ss;
 
         // Deassert every latched change on this port so the Status Change Endpoint can report the
         // next change (a USB hub keeps the change bitmap bit set while any C_* feature is set). The
