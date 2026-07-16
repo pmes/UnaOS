@@ -86,12 +86,22 @@ fn main() -> Result<()> {
             if device.read_block(0, &mut sb_block).is_ok() {
                 if let Ok(sb) = Superblock::from_bytes(&sb_block) {
                     let total_mb = (sb.block_count * BLOCK_SIZE) / (1024 * 1024);
-                    let free_mb = (sb.free_blocks * BLOCK_SIZE) / (1024 * 1024);
                     println!("   [PASS] Vault Signature Valid: UNAFS v{}", sb.version);
-                    println!(
-                        "   [INFO] Capacity: {} MB Total / {} MB Free",
-                        total_mb, free_mb
-                    );
+                    // Free space lives in the active root record since format v3
+                    // (the superblock no longer carries a mutable free count).
+                    match unafs::root::read_active(&mut device) {
+                        Ok(Some((root, _slot))) => {
+                            let free_mb = (root.free_blocks * BLOCK_SIZE) / (1024 * 1024);
+                            println!(
+                                "   [INFO] Capacity: {} MB Total / {} MB Free",
+                                total_mb, free_mb
+                            );
+                        }
+                        _ => println!(
+                            "   [INFO] Capacity: {} MB Total / free unknown (no valid root record)",
+                            total_mb
+                        ),
+                    }
                 } else {
                     println!("   ❌ [FAIL] Vault Superblock Corrupted.");
                     errors += 1;
