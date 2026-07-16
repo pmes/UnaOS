@@ -279,7 +279,18 @@ instrumented build (core3probe idiom) rides the next Pi arc's sitting to produce
 
 ---
 
-## aarch64 SMP — ORIN-SMP-5: the RESIDUE legs (`UNAOS_SMPPROBE=17..20`) — 2026-07-16 🔬 BUILT + QEMU-GATED, awaiting attended Orin bench `hw-jetson`
+## aarch64 SMP — ORIN-SMP-5: the RESIDUE legs (`UNAOS_SMPPROBE=17..20`) — 2026-07-16 ⚡ BENCHED SAME DAY: ALL 4 RESIDUE LEGS SURVIVED — **5/5 secondaries online in one boot; EVERY core on the part has run UnaOS code**; the SMP-3 trigger is timing/concurrency (or the real entry shape) `hw-jetson`
+
+**Attended sitting 2026-07-16 (Peter + LC-orin; serial `jetson-serial-2026-07-16-smp5sitting.log`;
+firmware `39.2.0-gcid-45755727` asserted every boot): RIDER-1 leg-16 re-confirm PASS, then legs
+17→18→19→20 ALL SURVIVED, zero RAS faults.** Leg 17 (AP `serial_println!` — the PRIME suspect):
+INNOCENT, the AP's own line arrived on the wire + checkpoint `0x53040011`. Leg 18 (WFI): benign as
+predicted. Leg 19: **first cluster-1 core online** (`0x00010200`, GICR `0xf500000`, checkpoint
+`0x53040013`). Leg 20: **SEQUENCE DONE 5/5** — `0x100`/`0x200`/`0x300`/`0x10200`/`0x10300` each
+checkpoint `0x53040014` + SGI OK in one boot. **Verdict (pre-registered "all survive" branch): no
+restored element reproduces the SMP-3 fault — the residual trigger is timing/ordering/concurrency or
+the real `_secondary_start_virt` entry shape; that's the follow-up bisect.** Full verdict:
+`arch_arm64.md §ORIN-SMP-5`.
 
 **What it does:** extends the ORIN-SMP-4 bisect with four RESIDUE legs — what leg 16's replica omitted
 vs the real `__secondary_rust_virt` flow (leg 16 SURVIVED against its predicted SMP-3 fault, so the
