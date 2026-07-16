@@ -3997,3 +3997,68 @@ kick-off. Every single-variable suspect is now acquitted on silicon. The immedia
 is the XHCI-carveout arc's relink test (a rebuilt leg-23 layout likely boots — then leg 23 answers
 in one boot).** Power-fault boots were pre-registered data; five DC-cut recoveries; nothing
 improvised.
+
+### JETSON-XCARVE — the xHCI-takeover carveout wall (diagnosis arc; `UNAOS_XCARVE` / `UNAOS_XCARVE_RELINK`)
+
+The ORIN-SMP-6 sitting surfaced a wall UNRELATED to SMP: on the no-HCRST inherit path some kernel
+images RAS-power-off the box in ordinary early boot, during the xHCI inherited-state takeover, and
+WHETHER an image faults is decided by its build LAYOUT, not by what it does. This arc is **diagnosis
+only** — it adds instrumentation and a relink experiment; no fix ships here.
+
+**The wall (do not re-derive — 11 attended boots):** RAS SNOC `SERR=0xd` "Illegal address (software
+fault)" + IERR Carveout Uncorrectable `0x3`, paired ACI `SERR=0x4` IERR FillWrite `0x9`; **FIXED fault
+ADDR `0x800000027767dc80`** (once `+0x200`); fires right after `JB9i — inherited-slot eviction:
+DISABLE_SLOT 1..8 issued + drained`. Image-layout-correlated: leg-23 image 4/4, leg-21/22 ~50%, 0/19
+across all prior sittings. Keyboard EXONERATED (boot stick alone on the bus).
+
+**What the address's shape says.** `0x800000027767dc80` decomposes as a 64-bit pointer whose HIGH dword
+is `0x80000000` and LOW dword is `0x7767dc80`. The low part alone (`0x27767dc80`, ~9.86 GiB) sits INSIDE
+the Orin DRAM window `[0x8000_0000, 0x2_8000_0000)` (2–10 GiB PA), near its top — i.e. a plausible-looking
+firmware DRAM address with bit 63 (the hi-dword's bit 31) SPURIOUSLY set. That is the fingerprint of a
+64-bit xHCI pointer assembled from a poisoned/flagged high half: the controller issues a FillWrite to
+what it thinks is a real structure, the top bit shoves it past the 40-bit PA space, and the platform's
+carveout guard kills the box as an illegal address. Because the no-HCRST takeover (JB9g) preserves the
+firmware's live xHCI state, the eviction's `DISABLE_SLOT` drain rides one of these inherited pointers.
+
+**M2 — the inherited-pointer instrumentation (`UNAOS_XCARVE=1`).** `jb2b_attach` gained a
+`#[cfg(feature = "xcarve")]` census, `jbxc_inherited_dump`, fired at attach entry BEFORE the takeover
+reprograms DCBAAP/CRCR/ERST and BEFORE JB9i — so it snapshots every pointer the firmware left, and
+prints even on a boot that then faults. It dumps, with a stable `JBXC:` prefix and raw 64-bit hex: the
+op regs (USBCMD/USBSTS/CONFIG), DCBAAP/CRCR/ERSTBA/ERDP, every ERST entry (ring base + size), the DCBAA
+base, DCBAA[0] = the scratchpad-buffer-array pointer + each scratchpad entry, and each nonzero DCBAA
+per-slot device-context pointer + that slot's context state. Reads are pure CPU loads of identity-mapped,
+dead-but-intact post-EBS RAM (the class JB9f already dereferences); the fault is a controller DMA WRITE,
+never a CPU load, so reading is safe. Every dereference is plausibility-guarded (nonzero, `< 1<<40`);
+a value that FAILS the guard — exactly the bit-63 pointer we hunt — is still PRINTED, never chased.
+**Each print discriminates:** whichever line carries hi-half `0x80000000` / lo-half `0x7767dc80` names
+the FillWrite's pointer class — an inherited per-slot device-context pointer (the eviction's context
+write rides a poisoned firmware slot pointer), a scratchpad array/entry pointer, the inherited event
+ring (ERSTBA/ring base/ERDP — a `DISABLE_SLOT` completion writeback the controller latched pre-takeover),
+or CRCR (command ring). If NO dumped pointer carries the hi-half, the target is a controller-INTERNAL
+latched pointer no register exposes — itself a finding that steers the fix. Knob-off the whole census +
+its call site vanish (byte-identical; zero `JBXC` strings; proven by two default `esp-jetson` builds
+hashing equal).
+
+**M1 — the relink experiment (`UNAOS_XCARVE_RELINK=1`).** A `#[used]` (never GC'd) inert read-only pad
+static in its own `.xcarve_relink_pad` section (16 KiB of `0xA5`, never read) shifts every downstream
+section, symbol, and the image's own load extent with ZERO semantic change — the takeover code is byte
+identical. Measured deltas (default vs relinked-default): `.text` VMA `0x2c000 → 0x30000`, `.data`
+`0xcbc80 → 0xcfc80`, `.bss` `0xd3000 → 0xd7000` — the whole image moves by `0x4000`; the pad appears
+between `.rodata` and `.text` (leg-23 image shifts identically: `.text 0x2f000 → 0x33000`, `.bss
+0xde000 → 0xe2000`). `.text` also grew 12 bytes on the shift — a linker veneer/`--fix-cortex-a53-843419`
+artifact of moved addresses, not a code change, and immaterial to the experiment (which needs only a
+layout move). Rebuilding the 4/4-faulting leg-23 image with this on tests the correlation decisively: if
+the fault VANISHES or MOVES, layout correlation is proven on one image AND leg 23 unblocks (its SMP-3
+replay answers in the same clean boot). Knob-off the pad vanishes (byte-identical to baseline).
+
+**M3 — proposed fix direction (NOT implemented; its own reviewed step).** Ranked by what the diagnosis
+would license: **(a)** once M2 names the pointer class, SCRUB that specific inherited structure before
+JB9i — e.g. zero DCBAA[0] / re-point the scratchpad array to a valid heap page, or zero the inherited
+DCBAA slot entries for 1..8 so the `DISABLE_SLOT` drain has no poisoned context pointer to write through,
+or normalize the latched ERST/ERDP (clear the bit-63 hi-half) — the least-mutating write that removes the
+carveout target while leaving the live Falcon untouched. **(b)** A full HCRST would clear all inherited
+pointers but JB9f/JB9e proved it kills the Falcon's service loop on this firmware — NOT viable on the
+inherit path. **(c)** If the relink proves pure layout correlation, a layout-pin is a fragile last
+resort (it hides the poisoned pointer rather than neutralizing it); (a) is preferred. The DONE gate for
+THIS arc is the diagnosis (M1 + M2) + this direction; the fix lands separately once a sitting names the
+pointer. Bench runbook: `scripts/orin-xcarve-bench.md` (predictions pre-registered).

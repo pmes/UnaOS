@@ -105,6 +105,25 @@ smpprobe = []
 # via `UNAOS_TEGRASMP=1 UNAOS_TEGRA=1 ./arroyo esp-jetson`. See arch_arm64.md §ORIN-SMP-3.
 tegrasmp = ["tegra"]
 
+# JETSON-XCARVE M2: the `UNAOS_XCARVE=1` inherited-xHCI-pointer instrumentation
+# (arch/aarch64/xusb_tegra.rs::jbxc_inherited_dump), fired at the top of `jb2b_attach` BEFORE the
+# no-HCRST takeover overwrites the controller's inherited DCBAAP/CRCR/ERST — so it snapshots the
+# firmware-left DCBAA + per-slot device-context pointers, scratchpad array, ERST entries, and
+# CRCR/ERDP the takeover DMA rides. Diagnostic for the xHCI-takeover carveout wall (fixed fault ADDR
+# 0x800000027767dc80 at JB9i eviction). Tegra-only at runtime; with this feature OFF (default) the
+# probe + its call site vanish and the tegra image is byte-identical to baseline (build twice,
+# compare hashes; zero `JBXC` strings knob-off). Enable via `UNAOS_XCARVE=1 UNAOS_TEGRA=1 ./arroyo
+# esp-jetson`. See arch_arm64.md §JETSON-XCARVE and scripts/orin-xcarve-bench.md.
+xcarve = ["tegra"]
+
+# JETSON-XCARVE M1: the `UNAOS_XCARVE_RELINK=1` relink-experiment pad — a `#[used]` read-only pad
+# static (arch/aarch64/xusb_tegra.rs) that trivially perturbs the image's section/symbol layout and
+# load extent with ZERO semantic change (the pad is never read). Rebuilding the layout-correlated
+# leg-23 image with this on tests whether the carveout fault vanishes/moves — proving (or refuting)
+# the layout correlation. With this feature OFF (default) the pad vanishes and the tegra image is
+# byte-identical to baseline. Enable via `UNAOS_XCARVE_RELINK=1 UNAOS_TEGRA=1 ./arroyo esp-jetson`.
+xcarve_relink = ["tegra"]
+
 # CORE3-PROBE: instrument the aarch64 secondary-core entry stub (`_secondary_start`) to raw-dump,
 # MMU-off / no-stack, each core's MPIDR_EL1 low byte, CurrentEL, and its arrival x0 to the Pi 4 PL011
 # (0xFE201000) BEFORE any Rust runs. Disambiguates the CORE3-SMP >1 MiB core-3 regression (firmware

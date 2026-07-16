@@ -120,6 +120,26 @@ const XUSB_FPCI: u64 = 0x0360_0000;
 
 const XUSB_BAR2: u64 = 0x0365_0000;
 
+// ---------------------------------------------------------------------------------------------
+// JETSON-XCARVE M1: the relink-experiment pad.
+//
+// The xHCI-takeover carveout wall (arch_arm64.md §JETSON-XCARVE) is IMAGE-LAYOUT-CORRELATED: the
+// leg-23 image faults 4/4 at the JB9i eviction step (fixed fault ADDR 0x800000027767dc80), its
+// siblings ~50% or never, 0/19 across all prior sittings — same code, different link layout. This
+// pad is the decisive cheap test: a `#[used]` (never GC'd) read-only static in its own named
+// section that trivially SHIFTS every downstream section, symbol, and the image's own load extent
+// — with ZERO semantic change (the bytes are never read; the takeover code is byte-for-byte the
+// same). Rebuild the layout-correlated leg-23 image with `UNAOS_XCARVE_RELINK=1` and re-bench: if
+// the fault vanishes or moves, layout correlation is PROVEN on one image (and leg 23 unblocks — its
+// SMP question then answers in one clean boot). Knob-off the pad vanishes entirely (byte-identical
+// to baseline). The distinct section name makes the delta trivially findable in objdump/readelf.
+// 0x4000 (16 KiB) is large enough to move the load extent well past a page and shift the kernel's
+// BSS/RODATA statics, small enough to stay inert.
+#[cfg(feature = "xcarve_relink")]
+#[used]
+#[unsafe(link_section = ".xcarve_relink_pad")]
+static XCARVE_RELINK_PAD: [u8; 0x4000] = [0xA5; 0x4000];
+
 
 /// Secondary guard for the partition-reset revival lever (bpmp_tegra::jb4_powergate_cycle, boot 2).
 /// Stays FALSE even when JB4_ENABLE is true — the seat flips it ONLY for the explicit boot-2 fork
@@ -792,6 +812,123 @@ pub fn jb9e_low_ring_probe() {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// JETSON-XCARVE M2: the inherited-xHCI-pointer instrumentation.
+//
+// The carveout wall fires a controller-side FillWrite to the FIXED bad address 0x800000027767dc80
+// (bit 63 set + ~9.86 GiB offset, beyond the 8 GiB DRAM top) right after JB9i's DISABLE_SLOT drain.
+// The no-HCRST takeover (JB9g) preserves the firmware's live xHCI state, so the controller keeps
+// DMA-ing through pointers the firmware programmed — until `jb2b_attach` reprograms DCBAAP / CRCR /
+// ERST with OUR values (init_pointers / init_interrupter, inside the unsafe block). This probe runs
+// BEFORE that overwrite: it snapshots every inherited pointer the takeover inherits, so a bench diff
+// can see which one carries a bit-63 / >DRAM value that a DISABLE_SLOT-driven write could ride to
+// 0x800000027767dc80. Pure CPU reads of identity-mapped, dead-but-intact post-EBS RAM (the same
+// class JB9f already dereferences) — the fault is a controller DMA WRITE, never a CPU load, so
+// reading is safe. Every dereference is plausibility-guarded (nonzero, < 1<<40, aligned); a raw
+// value that FAILS the guard is still PRINTED (that is exactly the bit-63 pointer we are hunting)
+// but never dereferenced. Stable `JBXC:` prefix, raw 64-bit hex, so boots diff cleanly.
+#[cfg(feature = "xcarve")]
+fn jbxc_plausible(a: u64) -> bool {
+    // Orin DRAM is [0x8000_0000, 0x2_8000_0000) (8 GiB). A firmware structure lives in former-EBS
+    // RAM inside that window; anything with bit 63 set, above 40 bits, or null is NOT a walkable
+    // pointer — print it raw, never chase it.
+    a != 0 && a < (1u64 << 40)
+}
+
+#[cfg(feature = "xcarve")]
+pub fn jbxc_inherited_dump(cap0: u32) {
+    let r32 = |a: u64| unsafe { core::ptr::read_volatile(a as *const u32) };
+    let r64 = |a: u64| unsafe { core::ptr::read_volatile(a as *const u64) };
+
+    let caplen = (cap0 & 0xff) as u64;
+    let hcs1 = r32(XUSB_HOST + 0x04);
+    let hcs2 = r32(XUSB_HOST + 0x08);
+    let maxslots = (hcs1 & 0xff) as u64;
+    // Max Scratchpad Buffers: HCSPARAMS2 hi = bits[25:21], lo = bits[31:27] (xHCI 5.3.4).
+    let scratch_ct = (((hcs2 >> 21) & 0x1f) << 5) | ((hcs2 >> 27) & 0x1f);
+    let op = XUSB_HOST + caplen;
+    let rtsoff = r32(XUSB_HOST + 0x18) & !0x1f;
+    let ir0 = XUSB_HOST + rtsoff as u64 + 0x20;
+
+    let usbcmd = r32(op);
+    let usbsts = r32(op + 0x04);
+    let config = r32(op + 0x38);
+    let crcr = r64(op + 0x18);
+    let dcbaap = r64(op + 0x30);
+    let erstsz = r32(ir0 + 0x08);
+    let erstba = r64(ir0 + 0x10);
+    let erdp = r64(ir0 + 0x18);
+
+    serial_println!(
+        "JBXC: inherited op regs — USBCMD={:#010x} USBSTS={:#010x} (HCH={} RS={}) CONFIG={:#010x} (MaxSlotsEn={}) maxslots={} scratch_ct={}",
+        usbcmd, usbsts, usbsts & 1, usbcmd & 1, config, config & 0xff, maxslots, scratch_ct
+    );
+    serial_println!(
+        "JBXC: inherited ptrs — DCBAAP={:#018x} CRCR={:#018x} ERSTBA={:#018x} ERDP={:#018x} ERSTSZ={}",
+        dcbaap, crcr, erstba, erdp, erstsz
+    );
+
+    // ERST walk: each 16-byte entry = { ring_base:u64, ring_size:u32, rsvd:u32 }. Print raw; deref
+    // the event ring base only when plausible.
+    let erstba_a = erstba & !0x3f;
+    if jbxc_plausible(erstba_a) && erstsz != 0 && erstsz <= 16 {
+        for i in 0..erstsz as u64 {
+            let e = erstba_a + i * 16;
+            let rb = r64(e);
+            let rs = r32(e + 8);
+            serial_println!("JBXC: ERST[{}] ring_base={:#018x} ring_size={}", i, rb, rs);
+        }
+    } else {
+        serial_println!("JBXC: ERST base {:#018x} (sz={}) — not walkable (guard)", erstba_a, erstsz);
+    }
+
+    // DCBAA walk: entry 0 = Scratchpad Buffer Array pointer; entries 1..=maxslots = per-slot Device
+    // Context base pointers. Print EVERY entry raw (raw is the point — a bit-63 slot pointer is the
+    // suspect); deref slot state only when the entry is plausible.
+    let dcbaa = dcbaap & !0x3f;
+    if jbxc_plausible(dcbaa) {
+        let sp_array = r64(dcbaa);
+        serial_println!("JBXC: DCBAA base={:#018x}  [0]=scratchpad_array={:#018x}", dcbaa, sp_array);
+        // Scratchpad buffer array: `scratch_ct` 64-bit page pointers.
+        if jbxc_plausible(sp_array) && scratch_ct != 0 && scratch_ct <= 64 {
+            for i in 0..scratch_ct as u64 {
+                let p = r64(sp_array + i * 8);
+                serial_println!("JBXC: scratchpad[{}] = {:#018x}", i, p);
+            }
+        } else if scratch_ct != 0 {
+            serial_println!("JBXC: scratchpad array {:#018x} (ct={}) — not walkable (guard)", sp_array, scratch_ct);
+        }
+        // Per-slot device-context pointers. Clamp the print to 64 slots (Tegra234 xHCI advertises
+        // far fewer; the clamp only bounds serial volume — note it if it ever bites).
+        let n = maxslots.min(64);
+        for slot in 1..=n {
+            let dcp = r64(dcbaa + slot * 8);
+            if dcp == 0 {
+                continue; // an unused slot — skip the noise, only nonzero inherited slots matter
+            }
+            if jbxc_plausible(dcp & !0x3f) {
+                // Slot Context is the FIRST context in the device context: dword0 + dword3, with
+                // Slot State = dword3[31:27] (xHCI 6.2.2). Read both raw.
+                let sc = dcp & !0x3f;
+                let d0 = r32(sc);
+                let d3 = r32(sc + 0x0c);
+                serial_println!(
+                    "JBXC: DCBAA[{}] devctx={:#018x}  slotctx d0={:#010x} d3={:#010x} (slot_state={})",
+                    slot, dcp, d0, d3, (d3 >> 27) & 0x1f
+                );
+            } else {
+                serial_println!("JBXC: DCBAA[{}] devctx={:#018x} — not walkable (guard)", slot, dcp);
+            }
+        }
+        if maxslots > 64 {
+            serial_println!("JBXC: (DCBAA walk clamped at 64 of {} slots)", maxslots);
+        }
+    } else {
+        serial_println!("JBXC: DCBAA base {:#018x} — not walkable (guard)", dcbaa);
+    }
+    serial_println!("JBXC: inherited-pointer dump complete (pre-takeover, pre-JB9i)");
+}
+
 /// `jb9_smmu` = (NISO1 SMMU instance bases, XUSB SID) — threaded in by the caller so the JB9-B
 /// forensic captures below can dump the stream binding at enable-slot-pending time.
 pub fn jb2b_attach(
@@ -822,6 +959,13 @@ pub fn jb2b_attach(
         ":: tegra: JB2b — attaching the shared xHCI driver @{:#x} (platform, polled, no PCIe) ::",
         XUSB_HOST
     );
+
+    // JETSON-XCARVE M2: snapshot every inherited xHCI pointer BEFORE the no-HCRST takeover below
+    // reprograms DCBAAP/CRCR/ERST — the diagnosis probe for the carveout wall (fault ADDR
+    // 0x800000027767dc80 at JB9i). Read-only; prints pre-eviction so even a faulting boot yields the
+    // pointers. Knob-off (`xcarve` feature absent) this whole call vanishes (byte-identical).
+    #[cfg(feature = "xcarve")]
+    jbxc_inherited_dump(cap0);
 
     // The exact sequence the PCIe paths run (arch/aarch64/pci.rs), minus discovery/bus-master —
     // a platform controller has no config space; DMA mastering came with the BPMP ungate.
