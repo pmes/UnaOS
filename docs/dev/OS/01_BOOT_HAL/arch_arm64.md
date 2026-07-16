@@ -3965,3 +3965,35 @@ SUCCESS; GICv3 `test-arm 40` CAPSTONE 6/6 + 3/3 secondaries (the no-behavior-cha
 `smp_virt.rs` amendment); `kernel8-test` 0-FAIL; `UNAOS_HUBSTORAGE` x86 MISSION SUCCESS; 3 armed leg
 tars + the knob-off DEFAULT staged. The metal verdict is the attended bench with LC-orin + Peter
 (runbook `scripts/orin-smp6-bench.md`).
+
+**⚡ SITTING VERDICT (2026-07-16 attended, Peter + LC-orin; serial
+`~/unaos-bench/jetson-serial-2026-07-16-smp6sitting.log`, 11 boots; firmware
+`39.2.0-gcid-45755727` asserted per boot; every image hash-verified on-stick pre-boot):**
+
+- **RIDER-1 leg-16 re-confirm: PASS** (checkpoint `0x53040010`, SGI OK).
+- **Leg 21 (REAL entry × one core): SURVIVED — the real entry shape is INNOCENT.** First run of the
+  production secondary path on Orin silicon: `CPU_ON ret=0` → the genuine `_secondary_start_virt` →
+  full `__secondary_rust_virt` → the real path's own `:: AARCH64 SMP: AP 1 online (aff=0x00000100) ::`
+  → `CORE_READY[1]` → AP→BSP SGI OK.
+- **Leg 22 (rapid 5-core burst × stub): SURVIVED — pure wake concurrency is INNOCENT.** Five
+  back-to-back `CPU_ON`s (all ret=0, box up through the print-free burst), all five per-core slots
+  reached (`0x53040116..0x53040516`), `RAPID SEQUENCE DONE — 5/5`.
+- **Leg 23 (REAL entry × rapid 5-core — the SMP-3 replay): UNANSWERED — blocked by a NEW, distinct
+  wall.** The leg-23 IMAGE faulted **4-for-4** in ordinary EARLY BOOT, before the probe ever
+  dispatched (no `sel=23` line on any attempt).
+- **NEW WALL, characterized (its own arc, not SMP):** RAS SNOC `SERR=0xd` "Illegal address
+  (software fault)" + IERR Carveout Uncorrectable `0x3`, paired ACI `SERR=0x4` IERR FillWrite `0x9`;
+  **fixed fault ADDR `0x800000027767dc80`** (once `+0x200`) — beyond the 8 GiB DRAM top — fires at
+  the xHCI `JB9i` inherited-slot-eviction step (`DISABLE_SLOT 1..8` drained is the last line).
+  **Image-layout-correlated:** leg-23 image 4/4 faults; leg-21 and leg-22 images 1/2 each (clean on
+  retry); leg-16 image 0/1; 0/19 boots across all prior sittings. **Keyboard EXONERATED** (fault
+  reproduced with nothing on the bus but the boot stick). Echoes the Pi CORE3 build-layout
+  correlation, in xHCI clothing: something layout-dependent decides whether the takeover-phase DMA
+  hits the carveout, with a deterministic bad address when it does.
+
+**SMP conclusion: the SMP-3 discrimination space is down to (a) the CONJUNCTION (real entry × rapid
+5-core — leg 23's still-open question) or (b) boot-state context around the real `tegrasmp`
+kick-off. Every single-variable suspect is now acquitted on silicon. The immediate next experiment
+is the XHCI-carveout arc's relink test (a rebuilt leg-23 layout likely boots — then leg 23 answers
+in one boot).** Power-fault boots were pre-registered data; five DC-cut recoveries; nothing
+improvised.

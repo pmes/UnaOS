@@ -10,7 +10,19 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
-## aarch64 SMP — ORIN-SMP-6: the LAST-DIFFERENCES legs (`UNAOS_SMPPROBE=21..23`) — 2026-07-16 🔬 QEMU-green, bench pending `hw-jetson`
+## aarch64 SMP — ORIN-SMP-6: the LAST-DIFFERENCES legs (`UNAOS_SMPPROBE=21..23`) — 2026-07-16 ⚡ BENCHED SAME DAY: legs 21+22 SURVIVED (**the REAL secondary path ran to online on Orin silicon — entry shape AND wake concurrency both INNOCENT**); leg 23 blocked by a NEW image-layout-correlated xHCI-carveout wall (own arc) `hw-jetson`
+
+**Attended sitting 2026-07-16 eve (Peter + LC-orin; serial `jetson-serial-2026-07-16-smp6sitting.log`,
+11 boots / 5 DC cuts, every fault pre-registered data):** RIDER-1 re-confirm PASS; **leg 21** = the
+production `_secondary_start_virt`→`__secondary_rust_virt` path ran a core to `AP 1 online` +
+`CORE_READY[1]` + SGI (first time on silicon) — real entry INNOCENT; **leg 22** = five back-to-back
+`CPU_ON`s, box up through the print-free burst, 5/5 per-core slots — concurrency INNOCENT; **leg 23**
+(SMP-3 replay) UNANSWERED: its image faulted 4/4 in EARLY BOOT pre-probe at the xHCI `JB9i`
+inherited-slot-eviction step — RAS SNOC carveout `SERR=0xd`/ACI FillWrite, fixed ADDR
+`0x800000027767dc80` (beyond DRAM top), image-layout-correlated (legs 21/22 cleared on retry, leg 16
+clean, 0/19 prior sittings), keyboard exonerated. SMP-3's wall is now cornered to the CONJUNCTION or
+boot-state context; next = the XHCI-carveout arc's relink test, then leg 23 answers in one boot.
+Verdict detail: `arch_arm64.md §ORIN-SMP-6`.
 
 **What it does:** closes the SMP-3 discrimination space. SMP-5 acquitted every residue element while
 SMP-3 still RAS-faults; exactly two differences remain — the REAL `_secondary_start_virt` entry
