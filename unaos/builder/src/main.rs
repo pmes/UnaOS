@@ -60,6 +60,11 @@ fn main() {
     // EHCI companion controllers' cap/op/PORTSC state at boot; zero writes). x86_64-only module.
     // Kept in sync with arroyo's mapping; also adds a QEMU `-device usb-ehci` test target below.
     if std::env::var("UNAOS_EHCISCOUT").is_ok() { feats.push("ehciscout"); }
+    // EHCI-2 configure-and-relook scout: UNAOS_EHCICONFIG=1 arms a knob-gated minimal EHCI wake
+    // sequence + two PORTSC censuses (before/after CONFIGFLAG=1). Implies ehciscout. Writes confined
+    // to the EHCI functions' PMCSR/USBLEGSUP-OS-own/RS/CONFIGFLAG/PORTSC-port-power. x86_64-only.
+    // Kept in sync with arroyo's mapping.
+    if std::env::var("UNAOS_EHCICONFIG").is_ok() { feats.push("ehciconfig"); }
     // VPERF M2: the fbcon viewport-cap bench lever (implies videobench). x86_64 only.
     if std::env::var("UNAOS_VIDEOCAP").is_ok() { feats.push("videocap"); }
     // SOCK-1: route the shell's ping/arp/netinfo + the boot ICMP witness through smoltcp. x86-only
@@ -280,9 +285,13 @@ fn main() {
     // device set has no EHCI, so attach a standalone `usb-ehci` PCI controller (class 0x0C0320) — no
     // downstream device, so the scout reports the controller's cap/op/PORTSC state with 0 connected
     // ports (the honest QEMU result). This is a QEMU-harness knob, not a kernel write path.
-    if std::env::var("UNAOS_EHCISCOUT").is_ok() {
+    if std::env::var("UNAOS_EHCISCOUT").is_ok() || std::env::var("UNAOS_EHCICONFIG").is_ok() {
         cmd.arg("-device").arg("usb-ehci,id=ehci");
-        println!("   UNAOS_EHCISCOUT: usb-ehci controller attached — read-only EHCI scout target");
+        if std::env::var("UNAOS_EHCICONFIG").is_ok() {
+            println!("   UNAOS_EHCICONFIG: usb-ehci controller attached — EHCI configure-and-relook scout target");
+        } else {
+            println!("   UNAOS_EHCISCOUT: usb-ehci controller attached — read-only EHCI scout target");
+        }
     }
     if nostorage {
         println!("   UNAOS_NOSTORAGE: usb-storage omitted — kernel sees no block device (metal-like no-storage path)");

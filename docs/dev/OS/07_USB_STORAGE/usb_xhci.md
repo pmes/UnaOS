@@ -602,6 +602,61 @@ whether the internals only appear after ownership/`CONFIGFLAG`/port-power setup 
 controllers were asleep, so "not connected" and "not visible while unconfigured" cannot yet
 be distinguished), or whether they attach elsewhere entirely (e.g. SPI, as on later models).
 
+### 9a. EHCI-2 — configure-and-relook scout (EHCI-2)
+
+The EHCI-1 metal survey found both EHCI functions **asleep** (`RS=0`, `HCHalted=1`,
+`CONFIGFLAG=0`). Asleep, "no device on the port" and "device not visible while the controller
+is unconfigured" are **indistinguishable**. EHCI-2 resolves that ambiguity: it runs the
+**minimal wake sequence** and re-censuses the ports **twice** — once before and once after
+`CONFIGFLAG=1` — so the connect state is read under both routings. It is **evidence only**:
+no enumeration, no transfers, no port reset, no async/periodic schedule, no driver.
+
+**Knob-gated, default-OFF, implies the scout.** Compiled only under the `ehciconfig` Cargo
+feature (`UNAOS_EHCICONFIG=1`, mapped in both `arroyo` and `builder/src/main.rs`;
+`ehciconfig = ["ehciscout"]`). Knob-off, the config path is unlinked and `ehci_scout.rs` is
+**byte-identical to the EHCI-1 read-only scout**.
+
+**Write surface (tripwire-grade).** The **only** registers written are, per EHCI function, its
+own **PMCSR** (D0 wake), its **`USBLEGSUP` OS-owned bit** (ownership handshake), **`USBCMD.RS`**
+(run), **`CONFIGFLAG`** (route ports to EHCI), and **`PORTSC` port-power** bits (PP, only when
+`HCSPARAMS.PPC=1` gives software control; PP writes mask off the RW1C bits). Nothing else — it
+never touches `XUSB2PR` / `USB3_PSSEN` / any xHCI register (PORTSW-1 owns routing), never resets
+a port, never rings a doorbell. Each MMIO write is `translate()`-guarded, so a BAR outside the
+firmware identity map is reported skipped instead of faulting.
+
+**Sequence, per EHCI function**, each step reported with before/after register values:
+1. **PMCSR → D0** if not already (transition reported).
+2. **`USBLEGSUP` OS-ownership handshake**: set OS-owned, **bounded** wait for the firmware to
+   drop BIOS-owned. A stuck BIOS bit is **not forced** — it emits a `STOP-NOTE` line and the
+   sequence continues to the census (never a panic).
+3. **`RS=1`**, bounded wait for `HCHalted=0`; then **census A** (`RS=1`, `CONFIGFLAG=0`, ports
+   routed to the companion); then **`CONFIGFLAG=1`** + **port-power** (PPC honored) + a paced
+   ~150 ms connect-debounce settle; then **census B**.
+4. The controller is left as-configured (knob-gated diagnostic boot; no teardown).
+
+**Trace substrings (sitting-assertable).** Bounded block bracketed by
+`:: EHCI-CONFIG: begin ::` … and the verdict line
+`:: EHCI-CONFIG: end (N controllers, censusA=K1 connected, censusB=K2 connected) ::`. Per
+function: `begin wake sequence`, `PMCSR D…->D0` (or `already D0` / `no PCI PM capability`),
+`USBLEGSUP@… OS-own set, BIOS-owned cleared` (or the `STOP-NOTE … BIOS-owned bit STUCK` line),
+`RS 0->1: … (running)`, `censusA = K1 connected`, `CONFIGFLAG 0->1: read-back CF=1`,
+`censusB = K2 connected`, `done — censusA=K1 connected, censusB=K2 connected`.
+
+**Pre-registered interpretation (the whole point of the arc):**
+- **Census B shows ≥1 connected on an internal-plausible port** → the internals **are
+  asleep-until-configured USB** → an EHCI mini-driver becomes the proposal (back to
+  Maestro/Peter).
+- **Both censuses 0 connected** with the controllers running and `CONFIGFLAG` exercised both
+  ways → the USB hypothesis is **falsified at the config tier** → the **SPI** hypothesis
+  becomes the line (proposal only; no SPI work starts here).
+
+**QEMU result (knob-on, `UNAOS_EHCICONFIG=1 UNAOS_EHCISCOUT=1`).** The harness `usb-ehci`
+(`8086:24cd`, 6 ports, `PPC=0`, EECP=0x68) walks the full sequence: OS-own handshake trivial
+(`USBLEGSUP` → `0x01000001`, BIOS-owned already 0), `RS=1` sticks (`HCHalted=0`, running),
+`CONFIGFLAG=1` sticks (CF read-back 1), `PPC=0` so no PP write, and **0 connected on both
+censuses** — QEMU attaches no downstream device, the honest baseline. **Metal-pending:** the
+attended rMBP sitting is where census B decides the two branches above.
+
 ---
 
 ## See also

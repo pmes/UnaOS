@@ -285,3 +285,308 @@ pub fn scout() {
         controllers, total_ports, total_connected
     );
 }
+
+// ======================================================================================
+// EHCI-2 — configure-and-relook mode (UNAOS_EHCICONFIG=1, feature `ehciconfig`).
+//
+// The EHCI-1 metal survey found both Panther Point EHCI functions ASLEEP (RS=0, HCHalted=1,
+// CONFIGFLAG=0, 0 connected). Asleep, "no device on the port" and "device not visible while the
+// controller is unconfigured" are indistinguishable. This mode runs the MINIMAL wake sequence and
+// re-censuses the ports twice (before AND after CONFIGFLAG=1), producing the evidence that
+// distinguishes asleep-until-configured USB internals from not-USB (SPI). It is EVIDENCE ONLY: no
+// enumeration, no transfers, no reset of any port, no async/periodic schedule, no driver.
+//
+// WRITE SURFACE (tripwire-grade): the ONLY registers written are, per EHCI function, its own PMCSR
+// (D0 wake), its USBLEGSUP OS-owned bit (ownership handshake — never forced past a stuck BIOS bit),
+// USBCMD.RS (run), CONFIGFLAG (route ports to EHCI), and PORTSC port-power bits (PP, only when PPC
+// honors software control). Nothing else — never XUSB2PR / USB3_PSSEN / any xHCI register.
+// ======================================================================================
+
+/// Translate-guarded 32-bit MMIO write. Returns `false` (writing nothing) if the page is not present
+/// in the live page tables, so a BAR outside the firmware identity map is reported as skipped rather
+/// than faulting. Mirrors `mmio_read32`'s guard.
+#[cfg(feature = "ehciconfig")]
+unsafe fn mmio_write32(phys: u64, val: u32) -> bool {
+    if crate::arch::x86_64::memory::translate(phys).is_none() {
+        return false;
+    }
+    core::ptr::write_volatile(phys as *mut u32, val);
+    true
+}
+
+/// Cycle count (in `now_cycles()`/rdtsc units) approximating `ms` milliseconds of wall clock. Uses
+/// the calibrated TSC rate when available; falls back to a conservative fixed estimate otherwise
+/// (~2.3 GHz Ivy Bridge base). Used for the connect-debounce settle between the two censuses.
+#[cfg(feature = "ehciconfig")]
+fn ms_cycles(ms: u64) -> u64 {
+    let hz = crate::arch::x86_64::apic::tsc_hz();
+    if hz != 0 {
+        hz.saturating_mul(ms) / 1000
+    } else {
+        2_300_000u64.saturating_mul(ms) // ~2.3e6 cycles/ms fallback
+    }
+}
+
+/// Busy-spin for approximately `ms` milliseconds against the free-running TSC (advances regardless of
+/// EFLAGS.IF). Bounded and side-effect free — no MMIO, no writes.
+#[cfg(feature = "ehciconfig")]
+fn settle_ms(ms: u64) {
+    let start = crate::arch::now_cycles();
+    let budget = ms_cycles(ms);
+    while crate::arch::now_cycles().wrapping_sub(start) < budget {
+        core::hint::spin_loop();
+    }
+}
+
+/// Spin until `pred()` is true or the hardware wait budget elapses. Returns `true` on success,
+/// `false` on timeout. Wall-clock bounded via `now_cycles()`, so a wedged status bit fails fast
+/// instead of freezing a serial-less boot. Side-effect free apart from the caller's MMIO reads.
+#[cfg(feature = "ehciconfig")]
+fn wait_bounded<F: Fn() -> bool>(pred: F) -> bool {
+    let start = crate::arch::now_cycles();
+    let budget = crate::arch::hw_wait_budget();
+    loop {
+        if pred() {
+            return true;
+        }
+        if crate::arch::now_cycles().wrapping_sub(start) >= budget {
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// Report a PORTSC census over `ports` ports off operational base `op`, tagged `label` ("A"/"B").
+/// Returns the connected count. READ ONLY.
+#[cfg(feature = "ehciconfig")]
+unsafe fn census(op: u64, ports: u32, idx: usize, label: &str) -> u32 {
+    let mut connected = 0u32;
+    for i in 0..ports {
+        let portsc = match mmio_read32(op + OP_PORTSC0 + 4 * i as u64) {
+            Some(v) => v,
+            None => break,
+        };
+        let ccs = portsc & 0x1;
+        let ped = (portsc >> 2) & 0x1;
+        let pr = (portsc >> 8) & 0x1;
+        let ls = (portsc >> 10) & 0x3;
+        let pp = (portsc >> 12) & 0x1;
+        let owner = (portsc >> 13) & 0x1;
+        if ccs != 0 {
+            connected += 1;
+        }
+        serial_println!(
+            ":: EHCI-CONFIG: [{}] census{} PORTSC[{}]={:#010x} connect={} enabled={} reset={} power={} owner={} line={} ::",
+            idx, label, i, portsc, ccs, ped, pr, pp,
+            if owner != 0 { "companion" } else { "EHCI" },
+            line_state(ls)
+        );
+    }
+    serial_println!(
+        ":: EHCI-CONFIG: [{}] census{} = {} connected ::",
+        idx, label, connected
+    );
+    connected
+}
+
+/// Run the minimal wake sequence on one EHCI function and take two PORTSC censuses (before/after
+/// CONFIGFLAG=1). Returns (censusA_connected, censusB_connected). Every write is bracketed by a
+/// before/after register report. Writes confined to this function's PMCSR / USBLEGSUP OS-own bit /
+/// USBCMD.RS / CONFIGFLAG / PORTSC PP.
+#[cfg(feature = "ehciconfig")]
+unsafe fn configure_controller(bus: u8, dev: u8, func: u8, idx: usize) -> (u32, u32) {
+    let vendor = read_config_16(bus, dev, func, 0x00);
+    let device = read_config_16(bus, dev, func, 0x02);
+    serial_println!(
+        ":: EHCI-CONFIG: [{}] bdf {}:{}.{} id {:04x}:{:04x} — begin wake sequence ::",
+        idx, bus, dev, func, vendor, device
+    );
+
+    // BAR0 (EHCI BARs are 32-bit memory BARs; decode defensively like the read-only scout).
+    let bar0_raw = read_config_32(bus, dev, func, CFG_BAR0);
+    let is_64 = (bar0_raw & 0x06) == 0x04;
+    let bar0 = if is_64 {
+        let hi = read_config_32(bus, dev, func, CFG_BAR0 + 4) as u64;
+        (bar0_raw as u64 & 0xFFFF_FFF0) | (hi << 32)
+    } else {
+        (bar0_raw & 0xFFFF_FFF0) as u64
+    };
+
+    // ---- Step 1: PCI power state -> D0 (PMCSR bits[1:0]). Report the transition honestly. ----
+    let pm_cap = find_cap(bus, dev, func, 0x01);
+    if pm_cap != 0 {
+        let pmcsr = read_config_32(bus, dev, func, pm_cap + 4);
+        let state_before = pmcsr & 0x3;
+        if state_before != 0 {
+            let new = pmcsr & !0x3; // D0
+            crate::arch::pci::write_config_32(bus, dev, func, pm_cap + 4, new);
+            let after = read_config_32(bus, dev, func, pm_cap + 4);
+            serial_println!(
+                ":: EHCI-CONFIG: [{}] PMCSR D{}->D0: wrote {:#06x} read-back {:#06x} (power-state=D{}) ::",
+                idx, state_before, new & 0xFFFF, after & 0xFFFF, after & 0x3
+            );
+        } else {
+            serial_println!(":: EHCI-CONFIG: [{}] PMCSR already D0 (no transition) ::", idx);
+        }
+    } else {
+        serial_println!(":: EHCI-CONFIG: [{}] no PCI PM capability — cannot set D0, continuing ::", idx);
+    }
+
+    // MMIO cap registers (guarded). If the BAR is unmapped we cannot configure — report + skip.
+    let caplength_word = match mmio_read32(bar0 + CAP_CAPLENGTH) {
+        Some(v) => v,
+        None => {
+            serial_println!(
+                ":: EHCI-CONFIG: [{}] BAR0 {:#x} not present in firmware identity map — SKIPPED (no writes) ::",
+                idx, bar0
+            );
+            return (0, 0);
+        }
+    };
+    let caplength = (caplength_word & 0xFF) as u64;
+    let hcsparams = mmio_read32(bar0 + CAP_HCSPARAMS).unwrap_or(0);
+    let hccparams = mmio_read32(bar0 + CAP_HCCPARAMS).unwrap_or(0);
+    let n_ports = (hcsparams & 0xF).min(15);
+    let ppc = (hcsparams >> 4) & 0x1; // Port Power Control: 1 => software controls PORTSC.PP
+    let eecp = ((hccparams >> 8) & 0xFF) as u8;
+    let op = bar0 + caplength;
+
+    // ---- Step 2: USBLEGSUP OS-ownership handshake (config-space extended cap). ----
+    // Set the OS-owned bit; wait (bounded) for the firmware to drop BIOS-owned. NEVER force past a
+    // stuck BIOS bit — a timeout is a STOP-and-report line in the trace, not a panic, and the
+    // sequence continues so the census still runs.
+    if eecp >= 0x40 {
+        let legsup = read_config_32(bus, dev, func, eecp);
+        let bios_before = (legsup >> 16) & 0x1;
+        let os_before = (legsup >> 24) & 0x1;
+        if os_before == 0 {
+            crate::arch::pci::write_config_32(bus, dev, func, eecp, legsup | (1 << 24));
+        }
+        // Bounded wait for BIOS-owned to clear.
+        let cleared = wait_bounded(|| (read_config_32(bus, dev, func, eecp) >> 16) & 0x1 == 0);
+        let after = read_config_32(bus, dev, func, eecp);
+        if cleared {
+            serial_println!(
+                ":: EHCI-CONFIG: [{}] USBLEGSUP@{:#04x}: OS-own set, BIOS-owned cleared (was BIOS={} OS={}, now {:#010x}) ::",
+                idx, eecp, bios_before, os_before, after
+            );
+        } else {
+            serial_println!(
+                ":: EHCI-CONFIG: [{}] STOP-NOTE USBLEGSUP@{:#04x}: BIOS-owned bit STUCK after OS-own+bounded-wait (now {:#010x}) — not forcing, continuing to census ::",
+                idx, eecp, after
+            );
+        }
+    } else {
+        serial_println!(
+            ":: EHCI-CONFIG: [{}] no EHCI extended-cap (EECP=0) — no BIOS/OS handoff needed ::", idx
+        );
+    }
+
+    // ---- Step 3: start the controller (RS=1), bounded wait for HCHalted=0. CF stays 0 here. ----
+    let usbcmd_before = mmio_read32(op + OP_USBCMD).unwrap_or(0);
+    let _ = mmio_write32(op + OP_USBCMD, usbcmd_before | 0x1); // RS=1
+    let running = wait_bounded(|| (mmio_read32(op + OP_USBSTS).unwrap_or(0x1000) >> 12) & 0x1 == 0);
+    let usbcmd_after = mmio_read32(op + OP_USBCMD).unwrap_or(0);
+    let usbsts_after = mmio_read32(op + OP_USBSTS).unwrap_or(0);
+    serial_println!(
+        ":: EHCI-CONFIG: [{}] RS 0->1: USBCMD {:#010x}->{:#010x} (RS={}), USBSTS={:#010x} HCHalted={} {} ::",
+        idx, usbcmd_before, usbcmd_after, usbcmd_after & 0x1, usbsts_after, (usbsts_after >> 12) & 0x1,
+        if running { "(running)" } else { "(STOP-NOTE: HCHalted did not clear within budget)" }
+    );
+
+    // ---- Census A: RS=1, CONFIGFLAG=0 (ports still routed to the companion). ----
+    let cf_before = mmio_read32(op + OP_CONFIGFLAG).unwrap_or(0) & 0x1;
+    serial_println!(
+        ":: EHCI-CONFIG: [{}] censusA context: CONFIGFLAG={} (route-to-EHCI={}), N_PORTS={} PPC={} ::",
+        idx, cf_before, cf_before, n_ports, ppc
+    );
+    let census_a = census(op, n_ports, idx, "A");
+
+    // ---- Step 3b: CONFIGFLAG=1 (route ports to this EHCI), then port-power on (PPC honored). ----
+    let _ = mmio_write32(op + OP_CONFIGFLAG, 0x1);
+    let cf_after = mmio_read32(op + OP_CONFIGFLAG).unwrap_or(0) & 0x1;
+    serial_println!(
+        ":: EHCI-CONFIG: [{}] CONFIGFLAG 0->1: read-back CF={} {} ::",
+        idx, cf_after,
+        if cf_after == 1 { "(ports routed to EHCI)" } else { "(STOP-NOTE: CF did not stick)" }
+    );
+
+    // Port power: only when PPC=1 does software control PORTSC.PP; otherwise ports are always powered
+    // and writing PP is meaningless (leave untouched). Set PP without disturbing other bits, and do
+    // NOT set PR (reset) — that would be a transaction-initiating step, out of scope.
+    if ppc == 1 {
+        for i in 0..n_ports {
+            let addr = op + OP_PORTSC0 + 4 * i as u64;
+            if let Some(portsc) = mmio_read32(addr) {
+                if (portsc >> 12) & 0x1 == 0 {
+                    // Preserve RW1C bits by not writing 1s to them: PORTSC RW1C bits are CSC(1),
+                    // PEC(3), OCC(5). Mask them off so we only add PP(12).
+                    let rw1c = (1 << 1) | (1 << 3) | (1 << 5);
+                    let _ = mmio_write32(addr, (portsc & !rw1c) | (1 << 12));
+                }
+            }
+        }
+        serial_println!(":: EHCI-CONFIG: [{}] port-power applied (PPC=1) on {} ports ::", idx, n_ports);
+    } else {
+        serial_println!(":: EHCI-CONFIG: [{}] PPC=0 — ports always-powered, no PP write ::", idx);
+    }
+
+    // Paced settle for connect debounce (~150ms) before the second census.
+    settle_ms(150);
+
+    // ---- Census B: RS=1, CONFIGFLAG=1, ports powered, after settle. ----
+    let census_b = census(op, n_ports, idx, "B");
+
+    serial_println!(
+        ":: EHCI-CONFIG: [{}] done — censusA={} connected, censusB={} connected ::",
+        idx, census_a, census_b
+    );
+    (census_a, census_b)
+}
+
+/// EHCI configure-and-relook entry point (x86_64, `ehciconfig` knob-on only). Runs after the
+/// read-only scout. Walks EHCI functions, wakes each minimally, and reports two PORTSC censuses.
+#[cfg(feature = "ehciconfig")]
+pub fn configure_and_relook() {
+    serial_println!(":: EHCI-CONFIG: begin ::");
+    serial_println!(":: EHCI-CONFIG: minimal wake + two PORTSC censuses (CF 0 then 1) — evidence only; NO enumeration/transfers/reset/driver; writes confined to EHCI PMCSR/USBLEGSUP-OS-own/RS/CONFIGFLAG/PORTSC-PP ::");
+
+    let mut controllers = 0usize;
+    let mut total_a = 0u32;
+    let mut total_b = 0u32;
+
+    for bus in 0u8..=255 {
+        for dev in 0u8..=31 {
+            let vendor = unsafe { read_config_16(bus, dev, 0, 0x00) };
+            if vendor == 0xFFFF {
+                continue;
+            }
+            let ht = ((unsafe { read_config_32(bus, dev, 0, CFG_HEADER_TYPE) } >> 16) & 0xFF) as u8;
+            let max_func = if ht & 0x80 != 0 { 7 } else { 0 };
+            for func in 0..=max_func {
+                if func != 0 && unsafe { read_config_16(bus, dev, func, 0x00) } == 0xFFFF {
+                    continue;
+                }
+                let class_reg = unsafe { read_config_32(bus, dev, func, CFG_CLASS) };
+                let class = ((class_reg >> 24) & 0xFF) as u8;
+                let subclass = ((class_reg >> 16) & 0xFF) as u8;
+                let progif = ((class_reg >> 8) & 0xFF) as u8;
+                if class == EHCI_CLASS && subclass == EHCI_SUBCLASS && progif == EHCI_PROGIF {
+                    let (a, b) = unsafe { configure_controller(bus, dev, func, controllers) };
+                    controllers += 1;
+                    total_a += a;
+                    total_b += b;
+                }
+            }
+        }
+    }
+
+    if controllers == 0 {
+        serial_println!(":: EHCI-CONFIG: no EHCI controller found (class 0x0C0320) ::");
+    }
+
+    serial_println!(
+        ":: EHCI-CONFIG: end ({} controllers, censusA={} connected, censusB={} connected) ::",
+        controllers, total_a, total_b
+    );
+}

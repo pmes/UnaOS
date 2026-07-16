@@ -202,6 +202,16 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
     #[cfg(feature = "ehciscout")]
     crate::drivers::ehci_scout::scout();
 
+    // EHCI-2 configure-and-relook (opt-in, UNAOS_EHCICONFIG=1): after the read-only census, run a
+    // MINIMAL EHCI wake sequence (PMCSR->D0, USBLEGSUP OS-ownership handshake, RS=1, CONFIGFLAG=1 +
+    // port-power) with two PORTSC censuses (before/after CONFIGFLAG=1) so the attended rMBP sitting
+    // can distinguish asleep-until-configured USB internals from not-USB. Writes are confined to the
+    // EHCI functions' own registers; it never touches xHCI routing, never enumerates, never transfers.
+    // Knob OFF => this call does not exist and the config path is unlinked (module byte-identical to
+    // the EHCI-1 read-only scout).
+    #[cfg(feature = "ehciconfig")]
+    crate::drivers::ehci_scout::configure_and_relook();
+
     if let Some((xhci_phys_addr, bus, dev, func)) = crate::drivers::pci::PciScanner::scan() {
         serial_println!(":: x86_64 PCI Init: Found xHCI at {:#x} ::", xhci_phys_addr);
 
