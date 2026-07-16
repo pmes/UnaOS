@@ -544,6 +544,52 @@ enumerate. The device descriptor bad-read path (`bad read (got G of 18…)`) nev
 on metal — nothing reached the 18-byte read with a wrong MPS0 anymore, which is the
 mechanism working as designed upstream of it.
 
+### 7g-4. MPS0 apply via Evaluate Context (XENUM-4)
+
+**What.** The XENUM-3 M1 MPS0-learn step now applies the learned `bMaxPacketSize0` with an
+**Evaluate Context** command (TRB type 13, xHCI 4.6.7) instead of a second `ADDRESS_DEVICE`.
+The 8-byte-header read and the learn predicate are unchanged; only the *apply* mechanism
+changed. `evaluate_downstream_ep0_mps` builds an input context with **A1 set (EP0 only),
+A0 clear** per 4.6.7 for an MPS-only update, copies the live EP0 context out of the existing
+output (device) context so the EP Type / CErr / TR Dequeue Pointer that `ADDRESS_DEVICE`
+established are preserved, patches MPS0 (DW1 bits 31:16), and issues the command via
+`run_command_sync`. The existing output context, EP0 ring, DCBAA pointer and slot state are
+untouched — no fresh allocations, no DCBAA rewrite, no second `ADDRESS_DEVICE`. On success
+the path continues straight into the 18-byte descriptor read (the XENUM-3 retry loop and
+bad-read predicate downstream are unchanged); on failure it traces the completion code and
+falls through to the existing `dispose_downstream_slot` bail — no retry storm (a refused
+Evaluate Context is a new fact to capture, not to blindly hammer).
+
+**Why.** Metal (§7g verdict, 2026-07-16): re-issuing `ADDRESS_DEVICE` (BSR=0) on an
+already-Addressed slot is refused by real Panther Point silicon with completion **code 19
+(Context State Error), deterministically** (3 attempts × 4 reproductions × 3 hub ports).
+Evaluate Context is the standard mechanism xHCI 4.6.7 provides for exactly this — correcting
+EP0 Max Packet Size on a slot in the Addressed state (mirrors Linux `xhci_check_maxpacket`).
+
+**Plumbing removed.** The XENUM-3 re-address path is gone: `address_downstream` no longer
+takes an `mps0_override` parameter (the only override caller was the re-address), and there
+is now a single MPS0-application path (Evaluate Context) rather than two competing ones. The
+XENUM-3 "first-attempt context-leak residual" — a re-address allocated a *second* input/output
+context/EP0 ring for the same slot, leaking the first set — disappears with the re-address:
+Evaluate Context reuses the slot's existing contexts, so no second allocation happens.
+
+**Trace substrings.**
+`downstream slot N MPS0 learned M (programmed P); Evaluate Context.` (learn + apply intent),
+`downstream slot N EP0 MPS updated via Evaluate Context (M).` (success), and the failure form
+`downstream slot N Evaluate Context code C; disposing.` The XENUM-3 `re-addressing.` line no
+longer appears.
+
+**QEMU gates (no-regression + direct functional):** `UNAOS_HUBSTORAGE=1 test 60` → the hubbed
+FS disk enumerates through the NEW path (both Evaluate Context trace lines fire, no
+`re-addressing` line) + MISSION SUCCESS + full U-arc chain, 0 FAIL — QEMU now exercises the
+changed apply path; `UNAOS_IRQSTORAGE=1 UNAOS_FATIMG=sf test 200` → 0 FAIL; `test 40` →
+MISSION SUCCESS; `UNAOS_NOSTORAGE=1` clean.
+
+**METAL-PENDING.** The code-19 wall itself can only fall on silicon — QEMU accepts both the old
+re-address and the new Evaluate Context, so the QEMU gate proves the new path *works*, not that
+it *cures* the metal strand. The rMBP sitting asserts the FS mouse behind the HS hub enumerates
+and tracks (the descriptor read completing at the learned MPS0, HID interrupt endpoint bound).
+
 ---
 
 ## 8. Status and limitations

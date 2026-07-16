@@ -4776,7 +4776,7 @@ impl XhciController {
     /// device's tier depth (stored on the slot so a downstream hub can extend the route for its own
     /// children); `tt_hub_slot`/`tt_port` are 0 for HS/SS devices (no TT). Synchronous; returns true
     /// on success.
-    fn address_downstream(&mut self, slot_id: u8, root_hub_port: u8, route_string: u32, depth: u8, speed: u32, tt_hub_slot: u8, tt_port: u8, mps0_override: u32) -> bool {
+    fn address_downstream(&mut self, slot_id: u8, root_hub_port: u8, route_string: u32, depth: u8, speed: u32, tt_hub_slot: u8, tt_port: u8) -> bool {
         unsafe {
             let input_layout = core::alloc::Layout::from_size_align(core::mem::size_of::<InputContext>(), 64).unwrap();
             let output_layout = core::alloc::Layout::from_size_align(core::mem::size_of::<DeviceContext>(), 64).unwrap();
@@ -4824,11 +4824,12 @@ impl XhciController {
             }
 
             // EP0 control context. MPS: 8 for Low Speed; 64 otherwise (QEMU is lenient about the
-            // Full-Speed initial 8-byte read). XENUM-3 M1: a non-zero `mps0_override` is a value
-            // LEARNED from an 8-byte-header read (the re-address after a short descriptor) — a
-            // Full-Speed device behind a HS hub whose real bMaxPacketSize0 is 8/16/32, not the 64
-            // guessed here, otherwise short-reads the full descriptor and strands with zeroed content.
-            let mps0: u32 = if mps0_override != 0 { mps0_override } else if speed == 2 { 8 } else { 64 };
+            // Full-Speed initial 8-byte read). A Full-Speed device behind a HS hub whose real
+            // bMaxPacketSize0 is 8/16/32 (not the 64 guessed here) would short-read the full
+            // descriptor — XENUM-3 M1 learns the real value from the 8-byte header and XENUM-4
+            // applies it in place via Evaluate Context (see enumerate_downstream), so the initial
+            // guess here need only be good enough to read that 8-byte header.
+            let mps0: u32 = if speed == 2 { 8 } else { 64 };
             let ep0_ctx = base_ptr.add(2 * CTX_WORDS);
             ep0_ctx.add(1).write_volatile((4 << 3) | (3 << 1) | (mps0 << 16));
             ep0_ctx.add(2).write_volatile((ep0_ring_phys as u32) | 1);
@@ -4899,6 +4900,62 @@ impl XhciController {
         serial_println!("xHCI: downstream slot {} disposed (unenumerated); queued for DISABLE_SLOT.", slot_id);
     }
 
+    /// XENUM-4: update a hub-downstream slot's EP0 Max Packet Size in place with an Evaluate Context
+    /// command (TRB type 13, xHCI 4.6.7) — the standard mechanism for correcting MPS0 on a slot that
+    /// is already in the Addressed state, mirroring Linux `xhci_check_maxpacket`. This replaces the
+    /// XENUM-3 re-ADDRESS strategy, which real Panther Point silicon refuses (code 19, Context State
+    /// Error) on an already-Addressed slot. Only the EP0 context is flagged (Add Context A1, A0
+    /// clear per 4.6.7 for an MPS-only update); the EP0 context is copied from the live device
+    /// (output) context so the EP Type / CErr / TR Dequeue Pointer that ADDRESS_DEVICE established are
+    /// preserved and only MPS0 changes. The output context, EP0 ring, DCBAA pointer and slot state
+    /// are all left untouched — no fresh allocations, no DCBAA rewrite, no second ADDRESS_DEVICE.
+    /// Synchronous; true on completion code 1.
+    fn evaluate_downstream_ep0_mps(&mut self, slot_id: u8, mps0: u32) -> bool {
+        unsafe {
+            let input_ctx_virt = self.slots[slot_id as usize].input_context;
+            let output_ctx_virt = self.slots[slot_id as usize].output_context;
+            if input_ctx_virt.is_null() || output_ctx_virt.is_null() {
+                serial_println!("xHCI: downstream slot {} Evaluate Context skipped (null context); disposing.", slot_id);
+                return false;
+            }
+            let base_ptr = input_ctx_virt as *mut u32;
+            core::ptr::write_bytes(base_ptr as *mut u8, 0, core::mem::size_of::<InputContext>());
+            base_ptr.add(1).write_volatile(1 << 1); // Add Context: A1 (EP0 context) only; A0 clear.
+            // Copy the live EP0 context from the OUTPUT (device) context, then patch MPS0. The output
+            // (Device) context has NO Input Control prefix — slot@0, EP0 (DCI 1)@1*CTX_WORDS; the INPUT
+            // context DOES, so its EP0 lands at 2*CTX_WORDS. Copying from the output EP0 preserves the
+            // EP Type / CErr / TR Dequeue Pointer ADDRESS_DEVICE established; only MPS0 (DW1 bits 31:16)
+            // changes. (Copying from 2*CTX_WORDS of the zeroed input would submit an EP-Type=0 / null-ring
+            // context that strict silicon rejects.)
+            let ep0_out = (output_ctx_virt as *const u32).add(CTX_WORDS);
+            let ep0_in = base_ptr.add(2 * CTX_WORDS);
+            for i in 0..8 {
+                ep0_in.add(i).write_volatile(core::ptr::read_volatile(ep0_out.add(i)));
+            }
+            let dw1 = ep0_in.add(1).read_volatile();
+            ep0_in.add(1).write_volatile((dw1 & 0x0000_FFFF) | (mps0 << 16));
+        }
+        let trb = Trb {
+            parameter: self.slots[slot_id as usize].input_context as u64,
+            status: 0,
+            control: (13 << 10) | ((slot_id as u32) << 24), // TRB type 13 = Evaluate Context
+        };
+        match self.run_command_sync(trb) {
+            Ok((1, _)) => {
+                serial_println!("xHCI: downstream slot {} EP0 MPS updated via Evaluate Context ({}).", slot_id, mps0);
+                true
+            }
+            Ok((c, _)) => {
+                serial_println!("xHCI: downstream slot {} Evaluate Context code {}; disposing.", slot_id, c);
+                false
+            }
+            Err(_) => {
+                serial_println!("xHCI: downstream slot {} Evaluate Context timed out; disposing.", slot_id);
+                false
+            }
+        }
+    }
+
     /// Enumerate one device behind a hub: ENABLE_SLOT, ADDRESS_DEVICE (with the accumulated route
     /// string + tier depth), read the device descriptor, and dispatch by class: a downstream device
     /// that is itself a hub (class 0x09) is queued into `hubs_pending` so the next `service_hubs`
@@ -4923,7 +4980,7 @@ impl XhciController {
         // ADDRESS_DEVICE with the full accumulated route string (tier `depth`). M2: bounded paced
         // retry lives inside address_downstream; a final failure disposes the slot (below) rather
         // than leaking an active entry with a live DCBAA pointer.
-        if !self.address_downstream(slot_id, root_hub_port, route_string, depth, speed, tt_hub_slot, tt_port, 0) {
+        if !self.address_downstream(slot_id, root_hub_port, route_string, depth, speed, tt_hub_slot, tt_port) {
             self.dispose_downstream_slot(slot_id as u8);
             return;
         }
@@ -4947,9 +5004,17 @@ impl XhciController {
                     && real_mps0 != programmed
                 {
                     serial_println!(
-                        "xHCI: downstream slot {} MPS0 learned {} (programmed {}); re-addressing.",
+                        "xHCI: downstream slot {} MPS0 learned {} (programmed {}); Evaluate Context.",
                         slot_id, real_mps0, programmed);
-                    if !self.address_downstream(slot_id, root_hub_port, route_string, depth, speed, tt_hub_slot, tt_port, real_mps0) {
+                    // XENUM-4: apply the learned MPS0 in place via an Evaluate Context command
+                    // (xHCI 4.6.7), NOT a second ADDRESS_DEVICE. Real Panther Point silicon refuses a
+                    // BSR=0 re-address on an already-Addressed slot with completion code 19 (Context
+                    // State Error) — deterministically (metal 2026-07-16, §7g verdict). Evaluate
+                    // Context keeps the existing output context, EP0 ring, DCBAA pointer and slot
+                    // state; only the EP0 Max Packet Size changes. On failure, dispose (no retry
+                    // storm — a refused Evaluate Context is a new fact to capture, not to blindly
+                    // hammer).
+                    if !self.evaluate_downstream_ep0_mps(slot_id, real_mps0) {
                         self.dispose_downstream_slot(slot_id as u8);
                         return;
                     }
