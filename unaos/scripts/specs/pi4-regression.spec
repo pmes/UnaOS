@@ -114,6 +114,19 @@ FORBID BANDY-CODEC:.*FAIL
 REQUIRE BANDY-STAMP:.*gen-fenced PASS
 FORBID BANDY-STAMP:.*FAIL
 
+# --- BANDY-RT round-trip witness (uncounted): MIDDEN.BIN (program #3) parses ls/cat/cp text at
+# --- EL0 into typed native frames, SYS_MSEND -> kernel fulfillment under the stamped IMAGE_SHA256
+# --- principal -> SYS_MRECV -> printed replies; the cp copy is byte-exact and private to the
+# --- invoker; fully self-cleaning (no metal-card residue). BANDY-1 M4/M5 (2026-07-16). ----------
+REQUIRE BANDY-RT:.*self-cleaned PASS
+FORBID BANDY-RT:.*FAIL
+
+# --- BANDY-EQ equivalence witness (uncounted, verdict D): a principal denied via the direct
+# --- syscall surface is denied via the bus with the BYTE-SAME errno (and allowed <-> allowed),
+# --- both legs driven at EL0 by midden through the production paths. ----------------------------
+REQUIRE BANDY-EQ:.*both legs at EL0 through the production paths PASS
+FORBID BANDY-EQ:.*FAIL
+
 # NOTE (bench operators): these five are now hard REQUIREs. On a rare no-card / hub-MSC-vid=0000
 # boot the card-dependent selftests won't emit — re-seat the data card and re-boot (that IS the
 # recovery); don't demote the spec. The 3-of-4-core CAPSTONE variance is separate (see the header).

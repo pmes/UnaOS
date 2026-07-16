@@ -510,6 +510,22 @@ kernel8() {
     done
     echo -e "${COLOR_GREEN}✅ K2 EL0 programs: owner_blob.bin ($(wc -c < "${WORKSPACE_DIR}/target/owner_blob.bin" | tr -d ' ') B) + imp_blob.bin ($(wc -c < "${WORKSPACE_DIR}/target/imp_blob.bin" | tr -d ' ') B)${COLOR_RESET}"
 
+    # BANDY-1 M4 (midden — program #3): same build lane as the K2 blobs; objcopy the `midden-blob`
+    # [[bin]] to a flat binary staged as MIDDEN.BIN. Its _start is a single `b midden_main` hop
+    # (byte 3 of a small-forward `b` is 0x14) — assert entry-first like the other blobs.
+    "$TOOLBIN/llvm-objcopy" -O binary --only-section=.text \
+      "${WORKSPACE_DIR}/crates/user-blob/target/aarch64-base/release/midden-blob" \
+      "${WORKSPACE_DIR}/target/midden_blob.bin"
+    [ -s "${WORKSPACE_DIR}/target/midden_blob.bin" ] || { echo -e "${COLOR_RED}ERROR: midden_blob.bin missing/empty — midden build failed${COLOR_RESET}"; exit 1; }
+    msz="$(wc -c < "${WORKSPACE_DIR}/target/midden_blob.bin" | tr -d ' ')"
+    [ "$msz" -le 4096 ] || { echo -e "${COLOR_RED}ERROR: midden_blob.bin ${msz} bytes > USER_CODE_SIZE (4096)${COLOR_RESET}"; exit 1; }
+    mb4="$(head -c 4 "${WORKSPACE_DIR}/target/midden_blob.bin" | od -An -tx1 | tr -d ' \n')"
+    case "$mb4" in
+        ??????14) : ;;
+        *) echo -e "${COLOR_RED}ERROR: midden_blob.bin does not start with _start's 'b' hop; first 4 bytes = ${mb4}${COLOR_RESET}"; exit 1 ;;
+    esac
+    echo -e "${COLOR_GREEN}✅ midden EL0 program: midden_blob.bin (${msz} B)${COLOR_RESET}"
+
     # K2 metal money-shot: UNAOS_K2_LEAVE=1 adds the `k2_leave` feature — k2_liveenf becomes a two-boot
     # cross-reboot power-cycle proof (boot-1 leaves a persisted owned file; boot-2 verifies the live boot
     # rebuild). OFF => the normal same-boot battery (byte-identical). For the ATTENDED Pi bench only.
@@ -567,6 +583,11 @@ kernel8() {
     # NEVER collide with HELLO.BIN/SCRATCH.BIN/GROW.BIN (other fixtures load/mutate those).
     cp "${WORKSPACE_DIR}/target/owner_blob.bin" "$KERNEL8_DIR/K2OWN.BIN"
     cp "${WORKSPACE_DIR}/target/imp_blob.bin" "$KERNEL8_DIR/K2IMP.BIN"
+
+    # BANDY-1 M4: carry midden (program #3) onto the boot media as MIDDEN.BIN — the bandy_rt
+    # launcher spawns it for the round-trip + equivalence witnesses. Distinct 8.3 name => its own
+    # IMAGE_SHA256 principal via the sole mint path.
+    cp "${WORKSPACE_DIR}/target/midden_blob.bin" "$KERNEL8_DIR/MIDDEN.BIN"
 
     # U9: plant a DEDICATED writable scratch file (NEVER HELLO.BIN — other fixtures load that as EL0 code).
     # 1 KiB (> 512 so fat::probe_once never cats it) of a known 0xEE filler; the u9 File-write demo opens it

@@ -5454,6 +5454,7 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
             u11reap_report(a0);
             uowner_report(a0);
             k2_report(a0);
+            bandy_report(a0);
             0
         }
         SYS_YIELD => sys_yield(),
@@ -5535,6 +5536,23 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
             // short-circuit. Neither has a launcher-planted Proc entry (no cross-program grants), so the
             // mark is a no-op for them; they ride this arm only to route the sentinel to EL0_K2_DONE (the
             // launcher's bounded wait gates on it) rather than the generic child-reap path.
+            // BANDY-1 M4: midden (program #3) exits by NAME, same discipline as the K2 programs —
+            // route its sentinel to EL0_MIDDEN_DONE (the bandy_rt launcher's bounded wait gates on
+            // it) rather than the generic child-reap path.
+            {
+                let nm = super::sched::current_name();
+                if nm == Some("el0-midden") {
+                    if a0 == MIDDEN_EXIT_STATUS {
+                        EL0_MIDDEN_DONE.fetch_add(1, Ordering::AcqRel);
+                    }
+                    if let Some(id) = super::sched::current_id() {
+                        if let Some(i) = proc_find_running(id) {
+                            PROCS[i].state.store(PEXITED, Ordering::Release);
+                        }
+                    }
+                    super::sched::exit(); // never returns
+                }
+            }
             {
                 let nm = super::sched::current_name();
                 if nm == Some("el0-k2own") || nm == Some("el0-k2imp") {
@@ -8496,6 +8514,12 @@ pub fn u7_launcher(demo_cpu: usize) {
     // scratch identities; one read-only ls mount, no disk write. Its own uncounted
     // `:: BANDY-STAMP: … PASS ::` line.
     bandy_stamp_check();
+    // BANDY-1 M4/M5: the round-trip + equivalence witnesses through the REAL midden program
+    // (program #3, Peter's E verdict) — ls/cat/cp parsed at EL0 into typed frames, kernel-
+    // fulfilled under the stamped principal; denial equivalence (bus vs direct syscall,
+    // byte-same errno) proven at EL0. Self-cleaning; its own uncounted `:: BANDY-RT: … ::`
+    // + `:: BANDY-EQ: … ::` lines. LAST in the chain.
+    bandy_rt_launcher(demo_cpu);
 }
 
 /// F2 M3 witness worker — the `demo_cpu` half of the cross-core FAT_MUTATION stress. `fn(usize)` for
@@ -14591,5 +14615,196 @@ fn bandy_stamp_check() {
         );
     } else {
         serial_println!(":: BANDY-STAMP: FAIL — w={:#x}/{:#x} ::", w, ALL);
+    }
+}
+
+// -----------------------------------------------------------------------------------------------
+// BANDY-RT + BANDY-EQ (M4/M5): the round-trip and equivalence witnesses, through the REAL midden
+// program. The launcher stages two fixtures on the live volume — a PUBLIC MIDTXT.TXT and a
+// FOREIGN-owned BUSPRIV.BIN (owner = a persisted-sentinel principal midden can never match) —
+// then spawns MIDDEN.BIN (the K2 real-program idiom). Midden, at EL0, parses ls/cat/cp text into
+// typed frames, round-trips them (send -> kernel fulfill -> reply -> print), and drives BOTH
+// denial legs itself: bus cat BUSPRIV.BIN vs direct SYS_OPEN — the equivalence witness's
+// byte-same-errno comparison happens at EL0 through the production paths (verdict D). The
+// launcher verifies the cp's copy BYTE-EXACT kernel-side and self-cleans (no metal-card residue).
+// -----------------------------------------------------------------------------------------------
+
+const MIDDEN_NAME: &str = "MIDDEN.BIN";
+const MIDDEN_EXIT_STATUS: u64 = 0xB5; // midden's sentinel exit -> EL0_MIDDEN_DONE
+const MIDTXT_NAME: &str = "MIDTXT.TXT";
+const MIDCPY_NAME: &str = "MIDCPY.TXT";
+const BUSPRIV_NAME: &str = "BUSPRIV.BIN";
+const MIDTXT_CONTENT: &[u8] = b"midden bus fixture\n"; // midden byte-verifies this at EL0 (bit1)
+
+static EL0_MIDDEN_DONE: AtomicU32 = AtomicU32::new(0); // midden sentinel exits (want 1)
+static BANDY_MIDDEN_WITNESS: AtomicU64 = AtomicU64::new(0); // midden's SYS_REPORT bits
+
+/// SYS_REPORT router for midden (the k2_report idiom — keyed on the task name).
+fn bandy_report(value: u64) {
+    if super::sched::current_name() == Some("el0-midden") {
+        BANDY_MIDDEN_WITNESS.store(value, Ordering::Release);
+    }
+}
+
+/// Delete one bandy fixture file + its ACL rows (native + legacy sidecar + in-RAM). Idempotent.
+fn bandy_cleanup_one(name: &str) {
+    if let Ok(fs) = crate::fs::fat::mount() {
+        if let Ok((de, lba, off)) = fs.find_located(name) {
+            let _ = crate::fs::unafs::native_acl_clear(lba, off as u32);
+            let _ = atr_clear_row(&fs, lba, off as u32);
+            owned_clear(lba, off as u32);
+            let _ = fs.delete_located(lba, off, de.first_cluster());
+        }
+    }
+}
+
+fn bandy_cleanup() {
+    bandy_cleanup_one(MIDCPY_NAME);
+    bandy_cleanup_one(BUSPRIV_NAME);
+    bandy_cleanup_one(MIDTXT_NAME);
+}
+
+/// Create a root fixture file with `content` (create + grow). Returns (dir_lba, dir_off) or None.
+fn bandy_create_file(fs: &crate::fs::fat::FatFs, name: &str, content: &[u8]) -> Option<(u64, u32)> {
+    let (de, lba, off) = fs.create_in_root(name, 0x20).ok()?;
+    if !content.is_empty() {
+        fs.write_grow(de.first_cluster(), 0, lba, off, 0, content).ok()?;
+    }
+    Some((lba, off as u32))
+}
+
+fn bandy_rt_launcher(demo_cpu: usize) {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if crate::drivers::block::info().is_none() {
+        return; // no SD -> the proof loads/creates real files; skip silently
+    }
+    // Pre-flight: midden must be on the card; stale fixtures from an interrupted run cleaned
+    // FIRST (the K2 lesson: clean before any presence early-return, so nothing is stranded).
+    bandy_cleanup();
+    let fs = match crate::fs::fat::mount() {
+        Ok(fs) => fs,
+        Err(_) => return,
+    };
+    if fs.find_in_root(MIDDEN_NAME).is_err() {
+        serial_println!(":: BANDY-RT: MIDDEN.BIN not on card — bus round-trip demo skipped ::");
+        return;
+    }
+
+    let mut w = 0u32;
+
+    // Stage the fixtures: PUBLIC MIDTXT.TXT (no owner row) + FOREIGN-owned BUSPRIV.BIN. The
+    // foreign owner is a PERSISTED-sentinel row (owner_asid = OWNER_ASID_PERSISTED, a by-name
+    // owner that can never live-match) under a PROGRAM_NAME principal midden's IMAGE_SHA256
+    // stamp can never equal — so midden is denied by construction, not by accident.
+    if bandy_create_file(&fs, MIDTXT_NAME, MIDTXT_CONTENT).is_none() {
+        serial_println!(":: BANDY-RT: fixture staging failed — demo aborted ::");
+        bandy_cleanup();
+        return;
+    }
+    let foreign = PrincipalRecord::program(b"prog:BUSOWNER");
+    match bandy_create_file(&fs, BUSPRIV_NAME, b"private bytes") {
+        Some((lba, off)) => {
+            if !owned_set_owner(lba, off, OWNER_ASID_PERSISTED, 0, foreign) {
+                serial_println!(":: BANDY-RT: owner staging failed — demo aborted ::");
+                bandy_cleanup();
+                return;
+            }
+        }
+        None => {
+            serial_println!(":: BANDY-RT: fixture staging failed — demo aborted ::");
+            bandy_cleanup();
+            return;
+        }
+    }
+
+    // Spawn the REAL program (the k2_run_program idiom) and wait for its sentinel exit.
+    EL0_MIDDEN_DONE.store(0, Ordering::Release);
+    BANDY_MIDDEN_WITNESS.store(0, Ordering::Release);
+    let stamped = match load_program_into_slot(MIDDEN_NAME) {
+        Ok(loaded) => {
+            let asid = loaded.ttbr0 >> 48;
+            let s = slot_ppid_of(asid);
+            // midden PRINTS its replies (the §3b interface seam) — endow the reserved console
+            // write cap (fd 1), exactly like the other printing spawners.
+            install_console_cap(asid);
+            super::sched::spawn_user_slot("el0-midden", loaded.base, loaded.sp, loaded.ttbr0, demo_cpu);
+            let start = super::timer::cntpct();
+            let deadline = 5 * super::timer::cntfrq();
+            while EL0_MIDDEN_DONE.load(Ordering::Acquire) < 1
+                && super::timer::cntpct().wrapping_sub(start) <= deadline
+            {
+                super::sched::yield_now();
+            }
+            Some(s)
+        }
+        Err(_) => None,
+    };
+    let Some(stamped) = stamped else {
+        serial_println!(":: BANDY-RT: midden failed to load — demo aborted ::");
+        bandy_cleanup();
+        return;
+    };
+    let done = EL0_MIDDEN_DONE.load(Ordering::Acquire);
+    let mw = BANDY_MIDDEN_WITNESS.load(Ordering::Acquire);
+
+    // bit0: midden's own 6-bit witness complete (ls/cat/cp round-trips + both denial legs +
+    // the EL0 equivalence comparison).
+    const MIDDEN_ALL: u64 = (1 << 6) - 1;
+    if done == 1 && mw == MIDDEN_ALL {
+        w |= 1 << 0;
+    }
+    // bit1: midden ran under a REAL IMAGE_SHA256 principal (the K-line mint — the stamp the bus
+    // wrote into its requests).
+    if stamped.kind == PRIN_IMAGE_SHA256 {
+        w |= 1 << 1;
+    }
+    // bit2: the bus cp landed a BYTE-EXACT copy (kernel-side verify of MIDCPY.TXT), and it is
+    // PRIVATE to midden's stamped principal (the owner row the bus create recorded).
+    if let Ok(fs2) = crate::fs::fat::mount() {
+        if let Ok((de, lba, off)) = fs2.find_located(MIDCPY_NAME) {
+            let mut back: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+            if de.size as usize == MIDTXT_CONTENT.len()
+                && fs2.read_at(de.first_cluster(), de.size, 0, &mut back, MIDTXT_CONTENT.len()).is_ok()
+                && back.as_slice() == MIDTXT_CONTENT
+                && owned_owner_ppid(lba, off as u32) == stamped
+            {
+                w |= 1 << 2;
+            }
+        }
+    }
+
+    // Cleanup so the STATEFUL metal card accumulates nothing.
+    bandy_cleanup();
+    let cleaned = match crate::fs::fat::mount() {
+        Ok(fs3) => {
+            matches!(fs3.find_in_root(MIDCPY_NAME), Err(crate::fs::fat::FatError::NotFound))
+                && matches!(fs3.find_in_root(BUSPRIV_NAME), Err(crate::fs::fat::FatError::NotFound))
+                && matches!(fs3.find_in_root(MIDTXT_NAME), Err(crate::fs::fat::FatError::NotFound))
+        }
+        Err(_) => false,
+    };
+    if cleaned {
+        w |= 1 << 3;
+    }
+
+    const ALL: u32 = (1 << 4) - 1;
+    if w == ALL {
+        serial_println!(
+            ":: BANDY-RT: midden (program #3) round-trip — ls/cat/cp parsed at EL0 into typed frames, kernel-fulfilled under the stamped IMAGE_SHA256 principal, replies printed; cp copy byte-exact + private-to-invoker; self-cleaned PASS [w={:#03x}/mw={:#04x}] ::",
+            w, mw
+        );
+        // The equivalence verdict rides midden's EL0 bits (3: bus denied -EACCES, 4: direct
+        // denied -EACCES, 5: byte-same + allowed==allowed) — gate a dedicated line on them.
+        serial_println!(
+            ":: BANDY-EQ: equivalence — denied-via-bus == denied-via-syscall (byte-same -EACCES) and allowed == allowed, both legs at EL0 through the production paths PASS ::"
+        );
+    } else {
+        serial_println!(
+            ":: BANDY-RT: FAIL — w={:#x}/{:#x} midden_w={:#x}/{:#x} done={} ::",
+            w, ALL, mw, MIDDEN_ALL, done
+        );
     }
 }

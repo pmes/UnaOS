@@ -34,6 +34,13 @@ path = "src/owner.rs"
 name = "imp-blob"
 path = "src/imp.rs"
 
+# BANDY-1 M4 (Peter's E verdict): midden — program #3, the first real (non-fixture) on-UnaOS
+# program. Parses ls/cat/cp text into typed native bus frames (SYS_MSEND/SYS_MRECV) and prints
+# the replies; carries the EL0 equivalence-witness legs. Staged as MIDDEN.BIN by `arroyo kernel8`.
+[[bin]]
+name = "midden-blob"
+path = "src/midden.rs"
+
 # opt-level "s" (size) per the M6c brief: a tiny flat blob. panic=abort (no unwinder in a no_std EL0
 # program); lto folds the single routine. No dependencies.
 [profile.release]
