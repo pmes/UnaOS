@@ -14,24 +14,23 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! UNAFS-F1 recovery KATs: the fsck-scavenger and the dirty-mount replay path.
+//! K8a crash-safety KATs: the copy-on-write commit discipline.
 //!
-//! Each test crafts one of the crash-window residues the F2 mutation engine is
-//! *documented* to leave on a program-order power cut — a leaked block, a
-//! leaked inode+extents, a query-orphaned inode, a dirty journal — and asserts
-//! the scavenger reclaims/heals it to a consistent, remount-clean volume while
-//! leaving live data untouched.
+//! Each test models a power cut at a specific point in the commit sequence
+//! and asserts the "old tree or new tree, never a hybrid" contract:
 //!
-//! The torn states are built with the crate's own public surface (the pub
-//! `bitmap`/`superblock`/`journal`/`device` fields plus `unafs::codec`), which
-//! reproduces exactly the on-disk shape a crash inside `unlink`/`rename` would
-//! leave: an inode unhooked from its directory (a single-block directory
-//! rewrite that landed) with its blocks not yet freed, or its catalog entries
-//! not yet scrubbed.
+//! * **Before the root flip** (`set_autocommit(false)` writes every fresh
+//!   block but never flips): the next mount lands on the OLD tree, whole,
+//!   refcount-consistent, with none of the transaction visible.
+//! * **A torn root-sector write** (the A/B discipline): corrupting the
+//!   just-written slot falls back to the other slot's tree.
+//! * **The reclaim queue**: enqueue is durable; a mount drains a pending
+//!   queue to empty (the eager v1 policy) and reclaims the blocks.
+//! * **fsck**: detects and repairs refcount drift injected as raw media
+//!   corruption (the one residue class CoW itself cannot produce).
 
-use unafs::{
-    AttributeValue, BLOCK_SIZE, BlockDevice, DirEntry, Journal, JournalOp, MemDevice, UnaFS,
-};
+use unafs::root::{ROOT_BLOCK, ROOT_SECTOR_SIZE};
+use unafs::{BLOCK_SIZE, BlockDevice, MemDevice, ReclaimEntry, RootRecord, UnaFS};
 
 /// Format a fresh in-memory volume of `block_count` blocks.
 fn fresh_fs(block_count: u64) -> UnaFS<MemDevice> {
@@ -43,260 +42,299 @@ fn fresh_fs(block_count: u64) -> UnaFS<MemDevice> {
     UnaFS::format(device, 20).expect("Format failed")
 }
 
-/// Rewrite directory `dir_id`'s on-disk entry list to exactly `entries` — the
-/// crash-ordered directory-rewrite step, in isolation, WITHOUT the block frees
-/// or catalog scrub that would follow it in a completed mutation. Reproduces
-/// the "directory rewrite landed, crash before the frees" torn state.
-fn craft_dir_listing(fs: &mut UnaFS<MemDevice>, dir_id: u64, entries: &[DirEntry]) {
-    let bytes = unafs::codec::serialize(&entries.to_vec()).expect("serialize dir entries");
-    // The replacement list is never longer than the original (we only drop an
-    // entry), so an in-place overwrite at offset 0 is sound: `ls` reads the
-    // Vec length prefix and stops, ignoring the stale tail.
-    fs.write_data(dir_id, 0, &bytes).expect("rewrite directory");
-}
-
-// --- F1.A: a bare leaked block ---------------------------------------------
+// --- R1: power cut BEFORE the root flip → the old tree, whole ---------------
 
 #[test]
-fn fsck_reclaims_a_leaked_block() {
-    let mut fs = fresh_fs(5000);
-
-    // Model a rewrite that allocated a block then crashed before any inode
-    // adopted it: the bitmap bit is set and free_blocks was decremented, but
-    // no inode references it.
-    let victim = fs.bitmap.allocate().expect("allocate a block to leak");
-    fs.superblock.free_blocks -= 1;
-    fs.sync_metadata().unwrap();
-    let free_leaked = fs.superblock.free_blocks;
-    assert!(fs.bitmap.is_used(victim));
-
-    // Dry run first: it must SEE the leak and touch nothing.
-    let dry = fs.fsck(false).unwrap();
-    assert_eq!(dry.leaked_blocks, vec![victim]);
-    assert_eq!(dry.reclaimed_blocks, 0);
-    assert!(fs.bitmap.is_used(victim), "dry run must not free anything");
-    assert_eq!(fs.superblock.free_blocks, free_leaked);
-
-    // Repair: the block comes back, free space round-trips.
-    let repaired = fs.fsck(true).unwrap();
-    assert_eq!(repaired.reclaimed_blocks, 1);
-    assert!(!fs.bitmap.is_used(victim));
-    assert_eq!(fs.superblock.free_blocks, free_leaked + 1);
-
-    // Idempotent: a second pass finds a clean volume.
-    let again = fs.fsck(true).unwrap();
-    assert!(again.is_clean());
-    assert_eq!(again.reclaimed_blocks, 0);
-}
-
-// --- F1.B: unlink window — inode + extents leaked, no name, no catalog ------
-
-#[test]
-fn fsck_reclaims_an_unhooked_inode_and_its_extents() {
+fn uncommitted_transaction_converges_to_the_old_tree() {
     let mut fs = fresh_fs(5000);
     let root = fs.superblock.root_inode;
 
-    // A doomed file with two data blocks and NO attributes (so it leaves no
-    // catalog entry — a pure name-tree leak, not a query-orphan).
-    let ghost = fs.create_file(root, "ghost.txt".to_string()).unwrap();
-    fs.write_data(ghost, 0, &vec![0xEEu8; 2 * BLOCK_SIZE as usize])
-        .unwrap();
-    let survivor = fs.create_file(root, "survivor.txt".to_string()).unwrap();
-    fs.write_data(survivor, 0, b"still here").unwrap();
+    // Committed baseline: one file with known bytes.
+    let keep = fs.create_file(root, "keep.txt".into()).unwrap();
+    fs.write_data(keep, 0, b"the committed tree").unwrap();
+    let committed_gen = fs.root_generation();
+    let committed_free = fs.free_blocks();
 
-    // Footprint of the doomed file: its inode block + every data block.
-    let ghost_inode = fs.read_inode(ghost).unwrap();
-    let mut ghost_blocks = vec![ghost];
-    for extent in &ghost_inode.chunks {
-        let n = extent.length.div_ceil(BLOCK_SIZE);
-        for i in 0..n {
-            ghost_blocks.push(extent.physical_block + i);
+    // The crash-simulation seam: fresh blocks land, the root NEVER flips.
+    fs.set_autocommit(false);
+    let doomed = fs.create_file(root, "doomed.txt".into()).unwrap();
+    fs.write_data(doomed, 0, &vec![0xEE; 3 * BLOCK_SIZE as usize])
+        .unwrap();
+    fs.write_data(keep, 0, b"OVERWRITTEN IN THE DOOMED TXN").unwrap();
+
+    // Power cut: drop the instance mid-transaction, remount from raw bytes.
+    let device = fs.device.clone();
+    drop(fs);
+    let mut fs2 = UnaFS::mount(device).expect("mount after simulated power cut");
+
+    // The OLD tree, exactly: same generation, the new file absent, the
+    // keeper's ORIGINAL bytes intact (CoW never touched its old blocks).
+    assert_eq!(fs2.root_generation(), committed_gen);
+    assert!(fs2.resolve_path("/doomed.txt").is_err());
+    let inode = fs2.read_inode(keep).unwrap();
+    assert_eq!(
+        fs2.read_data(keep, 0, inode.size).unwrap(),
+        b"the committed tree"
+    );
+
+    // Nothing leaked: the aborted transaction's blocks were never committed
+    // as allocated, so free space and refcount consistency both hold.
+    assert_eq!(fs2.free_blocks(), committed_free);
+    let report = fs2.fsck(false).unwrap();
+    assert!(report.is_clean(), "old tree must be clean: {report:?}");
+
+    // And the volume is fully writable again after the "crash".
+    let reborn = fs2.create_file(root, "doomed.txt".into()).unwrap();
+    fs2.write_data(reborn, 0, b"second life").unwrap();
+    assert_eq!(fs2.resolve_path("/doomed.txt").unwrap(), reborn);
+}
+
+// --- R2: the A/B root slots --------------------------------------------------
+
+#[test]
+fn commits_alternate_slots_and_generations_are_monotone() {
+    let mut fs = fresh_fs(5000);
+    let root = fs.superblock.root_inode;
+
+    let g0 = fs.root_generation();
+    fs.create_file(root, "a.txt".into()).unwrap();
+    let g1 = fs.root_generation();
+    fs.create_file(root, "b.txt".into()).unwrap();
+    let g2 = fs.root_generation();
+    assert!(g0 < g1 && g1 < g2, "generations must be monotone");
+
+    // Both slots hold VALID records one generation apart (A/B alternation).
+    let mut block = vec![0u8; BLOCK_SIZE as usize];
+    fs.device.read_block(ROOT_BLOCK, &mut block).unwrap();
+    let a = RootRecord::from_sector(&block[0..ROOT_SECTOR_SIZE]).expect("slot A valid");
+    let b = RootRecord::from_sector(&block[ROOT_SECTOR_SIZE..2 * ROOT_SECTOR_SIZE])
+        .expect("slot B valid");
+    let (newer, older) = if a.generation > b.generation { (a, b) } else { (b, a) };
+    assert_eq!(newer.generation, g2);
+    assert_eq!(older.generation, g2 - 1);
+}
+
+#[test]
+fn torn_root_sector_falls_back_to_the_previous_tree() {
+    let mut fs = fresh_fs(5000);
+    let root = fs.superblock.root_inode;
+
+    fs.create_file(root, "old.txt".into()).unwrap();
+    let old_gen = fs.root_generation();
+    fs.create_file(root, "new.txt".into()).unwrap();
+    let new_gen = fs.root_generation();
+
+    // Tear the NEWEST root sector (the slot the last commit wrote) — the
+    // exact failure a power cut inside the 512 B root write produces.
+    let mut device = fs.device.clone();
+    drop(fs);
+    let mut block = vec![0u8; BLOCK_SIZE as usize];
+    device.read_block(ROOT_BLOCK, &mut block).unwrap();
+    let a = RootRecord::from_sector(&block[0..ROOT_SECTOR_SIZE]);
+    let b = RootRecord::from_sector(&block[ROOT_SECTOR_SIZE..2 * ROOT_SECTOR_SIZE]);
+    let newest_is_a = match (a, b) {
+        (Some(ra), Some(rb)) => ra.generation > rb.generation,
+        _ => panic!("both slots must be valid after two commits"),
+    };
+    let torn_range = if newest_is_a {
+        0..ROOT_SECTOR_SIZE
+    } else {
+        ROOT_SECTOR_SIZE..2 * ROOT_SECTOR_SIZE
+    };
+    for byte in &mut block[torn_range] {
+        *byte ^= 0xA5; // garbage — checksum cannot survive
+    }
+    device.write_block(ROOT_BLOCK, &block).unwrap();
+
+    // Mount falls back to the OTHER slot: the previous committed tree.
+    let mut fs2 = UnaFS::mount(device).expect("mount must survive a torn root slot");
+    assert_eq!(fs2.root_generation(), old_gen);
+    assert!(new_gen > old_gen);
+    assert!(fs2.resolve_path("/old.txt").is_ok());
+    assert!(fs2.resolve_path("/new.txt").is_err(), "the torn commit is gone");
+    assert!(fs2.fsck(false).unwrap().is_clean());
+}
+
+#[test]
+fn volume_with_no_valid_root_refuses_to_mount() {
+    let fs = fresh_fs(5000);
+    let mut device = fs.device.clone();
+    drop(fs);
+    let zero = vec![0u8; BLOCK_SIZE as usize];
+    device.write_block(ROOT_BLOCK, &zero).unwrap();
+    assert!(UnaFS::mount(device).is_err());
+}
+
+// --- R3: the persistent reclaim queue ----------------------------------------
+
+#[test]
+fn reclaim_queue_enqueue_is_durable_and_mount_drains_it() {
+    let mut fs = fresh_fs(5000);
+    let root = fs.superblock.root_inode;
+
+    // Model a dropped root's residue the way K8b's drop path will: blocks
+    // whose only remaining holder is the queue entry. Here: a file's blocks,
+    // unlinked (tree reference gone) — the queue entry then carries them.
+    // Drain's decref saturates at 0, so the mechanism under test is the
+    // DURABILITY of the enqueue and the DRAIN-TO-EMPTY mount policy.
+    let f = fs.create_file(root, "snapdata.bin".into()).unwrap();
+    fs.write_data(f, 0, &vec![0x5A; 2 * BLOCK_SIZE as usize])
+        .unwrap();
+    let inode = fs.read_inode(f).unwrap();
+    let mut blocks: Vec<u64> = Vec::new();
+    for e in &inode.chunks {
+        for i in 0..e.length.div_ceil(BLOCK_SIZE) {
+            blocks.push(e.physical_block + i);
         }
     }
-    assert!(ghost_blocks.len() >= 3, "inode + 2 data blocks expected");
-    for &b in &ghost_blocks {
-        assert!(fs.bitmap.is_used(b));
-    }
+    assert_eq!(blocks.len(), 2);
+    fs.unlink(root, "snapdata.bin").unwrap();
 
-    // Craft the torn state: the directory rewrite that removed ghost landed,
-    // but the block frees never ran.
-    let survivors: Vec<DirEntry> = fs
-        .ls(root)
-        .unwrap()
-        .into_iter()
-        .filter(|e| e.name != "ghost.txt")
-        .collect();
-    craft_dir_listing(&mut fs, root, &survivors);
-    let free_torn = fs.superblock.free_blocks;
+    let generation = fs.root_generation();
+    fs.reclaim_enqueue(ReclaimEntry { generation, blocks }).unwrap();
 
-    // Now ghost is reachable by no name and no query.
-    assert!(fs.resolve_path("/ghost.txt").is_err());
-
-    let report = fs.recover().unwrap();
-    assert_eq!(report.reclaimed_blocks, ghost_blocks.len() as u64);
-    assert!(report.orphan_inodes.is_empty());
-
-    // Every ghost block returned; free space round-trips exactly.
-    for &b in &ghost_blocks {
-        assert!(!fs.bitmap.is_used(b), "block {b} must be reclaimed");
-    }
-    assert_eq!(fs.superblock.free_blocks, free_torn + ghost_blocks.len() as u64);
-
-    // The survivor is entirely untouched.
-    assert_eq!(fs.resolve_path("/survivor.txt").unwrap(), survivor);
-    let sinode = fs.read_inode(survivor).unwrap();
-    assert_eq!(fs.read_data(survivor, 0, sinode.size).unwrap(), b"still here");
-
-    // And the volume remounts clean.
+    // The enqueue is durable — visible through a fresh read of the object —
+    // and a remount finds the pending queue and DRAINS it (eager v1).
+    assert_eq!(fs.reclaim_queue().unwrap().len(), 1);
+    let free_before_drain = fs.free_blocks();
     let device = fs.device.clone();
     drop(fs);
-    let mut probe = device.clone();
-    assert!(!Journal::new().check_recovery(&mut probe).unwrap());
-    let mut fs2 = UnaFS::mount(device).unwrap();
+    let mut fs2 = UnaFS::mount(device).expect("mount with pending queue");
+    assert!(
+        fs2.reclaim_queue().unwrap().is_empty(),
+        "mount must drain the reclaim queue to empty (eager v1)"
+    );
+    // Draining freed the queue object's old data blocks and nothing dangles.
+    assert!(fs2.free_blocks() >= free_before_drain);
     assert!(fs2.fsck(false).unwrap().is_clean());
+
+    // Idempotent: a second remount finds nothing to drain.
+    let device2 = fs2.device.clone();
+    drop(fs2);
+    let mut fs3 = UnaFS::mount(device2).unwrap();
+    assert!(fs3.reclaim_queue().unwrap().is_empty());
+    assert!(fs3.fsck(false).unwrap().is_clean());
 }
 
-// --- F1.C: cross-dir rename window — query-orphan (name gone, catalog kept) -
+#[test]
+fn reclaim_queue_is_empty_on_a_fresh_volume() {
+    let mut fs = fresh_fs(5000);
+    assert!(fs.reclaim_queue().unwrap().is_empty());
+    assert!(fs.snapshot_index().unwrap().is_empty());
+}
+
+// --- R4: fsck against injected refcount drift ---------------------------------
 
 #[test]
-fn fsck_heals_a_query_orphaned_inode() {
+fn fsck_detects_and_repairs_injected_refcount_drift() {
     let mut fs = fresh_fs(5000);
     let root = fs.superblock.root_inode;
-    let inbox = fs.mkdir(root, "inbox".to_string()).unwrap();
+    let f = fs.create_file(root, "real.txt".into()).unwrap();
+    fs.write_data(f, 0, b"real data").unwrap();
 
-    let memo = fs.create_file(inbox, "memo.txt".to_string()).unwrap();
-    fs.write_data(memo, 0, b"in flight").unwrap();
-    fs.set_attribute(
-        memo,
-        "kind".to_string(),
-        AttributeValue::String("memo".to_string()),
-    )
-    .unwrap();
+    // Clean baseline.
+    assert!(fs.fsck(false).unwrap().is_clean());
+    let free_before = fs.free_blocks();
 
-    // Before: reachable by both name and query.
-    assert_eq!(fs.resolve_path("/inbox/memo.txt").unwrap(), memo);
-    assert_eq!(fs.query("kind == \"memo\"").unwrap().len(), 1);
-
-    // Craft the cross-directory rename window: the entry LEFT the source
-    // directory (that single-block rewrite landed) but never joined a
-    // destination, and the catalog — which keys on the inode id — is untouched.
-    craft_dir_listing(&mut fs, inbox, &[]);
-
-    // The residue is exactly a query-orphan: no name, but query still finds it.
-    assert!(fs.resolve_path("/inbox/memo.txt").is_err());
-    assert_eq!(fs.query("kind == \"memo\"").unwrap().len(), 1);
-
-    // Dry run identifies the orphan without touching it.
-    let dry = fs.fsck(false).unwrap();
-    assert_eq!(dry.orphan_inodes, vec![memo]);
-    assert_eq!(fs.query("kind == \"memo\"").unwrap().len(), 1);
-
-    let free_torn = fs.superblock.free_blocks;
-
-    // Repair: scrub the catalog (so no query dangles) and reclaim the blocks.
-    let report = fs.fsck(true).unwrap();
-    assert_eq!(report.orphan_inodes, vec![memo]);
-    assert!(report.scrubbed_catalog_entries >= 1);
-    assert!(report.reclaimed_blocks >= 1);
-
-    // Gone from query AND the inode block is freed.
-    assert!(fs.query("kind == \"memo\"").unwrap().is_empty());
-    assert!(!fs.bitmap.is_used(memo));
-    assert!(fs.superblock.free_blocks > free_torn);
-
-    // Remounts clean and consistent.
-    let device = fs.device.clone();
+    // Inject drift the way media corruption would: mark a genuinely FREE
+    // block as allocated in the persisted refcount map, then remount. Find
+    // the persisted map through the on-disk root record (public parser).
+    let mut device = fs.device.clone();
     drop(fs);
-    let mut fs2 = UnaFS::mount(device).unwrap();
-    assert!(fs2.fsck(false).unwrap().is_clean());
-    assert!(fs2.query("kind == \"memo\"").unwrap().is_empty());
-    assert!(fs2.ls(inbox).unwrap().is_empty());
+    let (rr, _) = unafs::root::read_active(&mut device).unwrap().unwrap();
+    let mut index = vec![0u8; BLOCK_SIZE as usize];
+    device.read_block(rr.refmap_block, &mut index).unwrap();
+    let leaf0 = u64::from_le_bytes(index[0..8].try_into().unwrap());
+    let mut leaf = vec![0u8; BLOCK_SIZE as usize];
+    device.read_block(leaf0, &mut leaf).unwrap();
+    // Find a zero count in the first leaf and corrupt it to 1.
+    let mut victim = None;
+    for i in 0..(BLOCK_SIZE as usize / 4) {
+        let c = u32::from_le_bytes(leaf[i * 4..i * 4 + 4].try_into().unwrap());
+        if c == 0 {
+            leaf[i * 4..i * 4 + 4].copy_from_slice(&1u32.to_le_bytes());
+            victim = Some(i as u64);
+            break;
+        }
+    }
+    let victim = victim.expect("a free block must exist");
+    device.write_block(leaf0, &leaf).unwrap();
+
+    let mut fs2 = UnaFS::mount(device).expect("mount");
+    assert_eq!(fs2.free_blocks(), free_before - 1, "drift visible after mount");
+
+    // Dry run sees exactly the injected leak and touches nothing.
+    let dry = fs2.fsck(false).unwrap();
+    assert_eq!(dry.leaked_blocks, vec![victim]);
+    assert!(!dry.is_clean());
+    assert_eq!(fs2.free_blocks(), free_before - 1);
+
+    // Repair reclaims it and the repaired state is durable.
+    let repaired = fs2.fsck(true).unwrap();
+    assert_eq!(repaired.reclaimed_blocks, 1);
+    assert_eq!(fs2.free_blocks(), free_before);
+    let device2 = fs2.device.clone();
+    drop(fs2);
+    let mut fs3 = UnaFS::mount(device2).unwrap();
+    assert!(fs3.fsck(false).unwrap().is_clean());
+    // Live data untouched by the repair.
+    let inode = fs3.read_inode(f).unwrap();
+    assert_eq!(fs3.read_data(f, 0, inode.size).unwrap(), b"real data");
 }
 
-// --- F1.D: recover() clears a dirty journal while reclaiming ----------------
+// --- R5: CoW never overwrites a committed block --------------------------------
 
 #[test]
-fn recover_clears_dirty_journal_and_reclaims() {
+fn committed_blocks_are_never_overwritten_within_the_next_transaction() {
     let mut fs = fresh_fs(5000);
     let root = fs.superblock.root_inode;
-    fs.create_file(root, "keep.txt".to_string()).unwrap();
 
-    // A leaked block...
-    let victim = fs.bitmap.allocate().expect("allocate a block to leak");
-    fs.superblock.free_blocks -= 1;
-    fs.sync_metadata().unwrap();
+    let f = fs.create_file(root, "gold.txt".into()).unwrap();
+    fs.write_data(f, 0, b"generation one bytes").unwrap();
 
-    // ...plus a torn transaction in the journal (a BeginOp with no EndOp),
-    // exactly what a power cut mid-mutation leaves behind.
-    fs.journal
-        .append(&mut fs.device, JournalOp::BeginOp {
-            op_id: 42,
-            desc: "torn mutation".to_string(),
-        })
-        .unwrap();
-    assert!(fs.is_dirty().unwrap(), "test premise: journal must read dirty");
+    // Snapshot the file's committed physical block and its raw contents.
+    let inode = fs.read_inode(f).unwrap();
+    let old_block = inode.chunks[0].physical_block;
+    let mut before = vec![0u8; BLOCK_SIZE as usize];
+    fs.device.read_block(old_block, &mut before).unwrap();
 
-    let report = fs.recover().unwrap();
-    assert!(report.dirty_journal, "recover must report the torn journal");
-    assert_eq!(report.reclaimed_blocks, 1);
+    // Overwrite the file. CoW: the data must land on a DIFFERENT block and
+    // the old block's raw bytes must be untouched by this transaction.
+    fs.write_data(f, 0, b"generation two bytes").unwrap();
+    let inode2 = fs.read_inode(f).unwrap();
+    let new_block = inode2.chunks[0].physical_block;
+    assert_ne!(new_block, old_block, "CoW must allocate a fresh block");
 
-    // The dirty flag is cleared: a fresh scan reads clean.
-    assert!(!fs.is_dirty().unwrap());
-    assert!(!fs.bitmap.is_used(victim));
+    let mut after = vec![0u8; BLOCK_SIZE as usize];
+    fs.device.read_block(old_block, &mut after).unwrap();
+    assert_eq!(before, after, "the committed block must not be overwritten");
 
-    // keep.txt survived the whole recovery.
-    assert!(fs.resolve_path("/keep.txt").is_ok());
+    // The inode itself also moved (its block is CoW'd too).
+    // (Reading through the new tree returns the new bytes, of course.)
+    assert_eq!(
+        fs.read_data(f, 0, inode2.size).unwrap(),
+        b"generation two bytes"
+    );
 
-    // Remount witnesses a clean journal.
-    let device = fs.device.clone();
-    drop(fs);
-    let mut probe = device.clone();
-    assert!(!Journal::new().check_recovery(&mut probe).unwrap());
+    // AFTER the commit retired the old tree, the old block is reusable —
+    // free space reflects the release.
+    assert!(fs.fsck(false).unwrap().is_clean());
 }
 
-// --- F1.E: the scavenger never eats a live, healthy volume ------------------
+// --- R6: commit stats exist (the bench instrumentation) ------------------------
 
 #[test]
-fn fsck_leaves_a_clean_volume_untouched() {
-    let mut fs = fresh_fs(6000);
+fn commit_stats_count_commits_and_blocks() {
+    let mut fs = fresh_fs(5000);
     let root = fs.superblock.root_inode;
+    let s0 = fs.commit_stats();
+    assert!(s0.commits >= 1, "format itself commits");
 
-    // Build a small live world: nested dirs, files with data, inline + spilled
-    // attributes, and a query index over all of it.
-    let docs = fs.mkdir(root, "docs".to_string()).unwrap();
-    let sub = fs.mkdir(docs, "sub".to_string()).unwrap();
-    let a = fs.create_file(docs, "a.txt".to_string()).unwrap();
-    fs.write_data(a, 0, &vec![0x11u8; 3 * BLOCK_SIZE as usize])
-        .unwrap();
-    fs.set_attribute(a, "tag".to_string(), AttributeValue::String("alpha".into()))
-        .unwrap();
-    let b = fs.create_file(sub, "b.bin".to_string()).unwrap();
-    let big: Vec<f32> = (0..200).map(|i| i as f32 * 0.5).collect();
-    fs.set_attribute(b, "embedding".to_string(), AttributeValue::Vector(big))
-        .unwrap();
-    fs.set_attribute(b, "tag".to_string(), AttributeValue::String("beta".into()))
-        .unwrap();
+    let f = fs.create_file(root, "bench.txt".into()).unwrap();
+    fs.write_data(f, 0, &vec![0x11; 2 * BLOCK_SIZE as usize]).unwrap();
 
-    let free_before = fs.superblock.free_blocks;
-    let in_use_before = fs.fsck(false).unwrap().blocks_in_use;
-
-    // A clean volume: zero leaks, zero orphans — and in repair mode it frees
-    // NOTHING (the critical "don't eat live data" property).
-    let dry = fs.fsck(false).unwrap();
-    assert!(dry.is_clean(), "healthy volume must scan clean: {dry:?}");
-    assert!(dry.leaked_blocks.is_empty());
-    assert!(dry.orphan_inodes.is_empty());
-    assert_eq!(dry.reachable_blocks, in_use_before, "every used block is reachable");
-
-    let repaired = fs.fsck(true).unwrap();
-    assert_eq!(repaired.reclaimed_blocks, 0, "repair on a clean volume frees nothing");
-    assert_eq!(fs.superblock.free_blocks, free_before);
-
-    // Everything still resolves, reads, and queries after the pass.
-    assert_eq!(fs.resolve_path("/docs/a.txt").unwrap(), a);
-    assert_eq!(fs.resolve_path("/docs/sub/b.bin").unwrap(), b);
-    let ai = fs.read_inode(a).unwrap();
-    assert_eq!(fs.read_data(a, 0, ai.size).unwrap(), vec![0x11u8; 3 * BLOCK_SIZE as usize]);
-    assert_eq!(fs.query("tag == \"alpha\"").unwrap().len(), 1);
-    assert_eq!(fs.query("tag == \"beta\"").unwrap().len(), 1);
+    let s1 = fs.commit_stats();
+    assert!(s1.commits >= s0.commits + 2, "each op commits");
+    assert!(s1.blocks_written > s0.blocks_written);
+    assert!(s1.last_commit_blocks > 0);
 }

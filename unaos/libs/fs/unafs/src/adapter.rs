@@ -226,6 +226,32 @@ impl<S: SectorDevice> BlockDevice for BlockAdapter<S> {
     fn flush(&mut self) -> Result<(), StorageError> {
         self.dev.flush().map_err(map_sector_err)
     }
+
+    /// K8a root-flip primitive: ONE real 512 B sector write to the medium —
+    /// this override is what makes the commit's root flip genuinely atomic
+    /// at the device's own write granularity (the trait default would
+    /// read-modify-write all eight sectors of the block).
+    fn write_sector_in_block(
+        &mut self,
+        id: u64,
+        sector: usize,
+        buf: &[u8],
+    ) -> Result<(), StorageError> {
+        if buf.len() as u64 != SECTOR_SIZE {
+            return Err(StorageError::BadBlockSize(buf.len(), SECTOR_SIZE));
+        }
+        if sector as u64 >= SECTORS_PER_BLOCK {
+            return Err(StorageError::OutOfBounds(id));
+        }
+        if id >= self.block_count {
+            return Err(StorageError::OutOfBounds(id));
+        }
+        let lba = self
+            .first_lba(id)?
+            .checked_add(sector as u64)
+            .ok_or(StorageError::OutOfBounds(id))?;
+        self.dev.write_sector(lba, buf).map_err(map_sector_err)
+    }
 }
 
 // ---------------------------------------------------------------------------

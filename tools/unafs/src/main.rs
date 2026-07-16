@@ -101,15 +101,27 @@ enum Commands {
         #[arg(short, long, default_value = "unafs.img")]
         img: String,
     },
-    /// Scan for crash-window residue — leaked blocks and query-orphaned inodes.
-    /// With --repair, reclaim them and clear a dirty journal (dirty-mount
-    /// recovery).
+    /// Check refcount consistency (K8 CoW: recompute reachability and diff
+    /// against the persisted refcount map). With --repair, rebuild the map
+    /// and scrub stale catalog entries.
     Fsck {
         #[arg(short, long, default_value = "unafs.img")]
         img: String,
-        /// Actually reclaim leaks, heal orphans, and reset a dirty journal.
+        /// Actually rebuild the refcount map and scrub stale index entries.
         #[arg(long)]
         repair: bool,
+    },
+    /// One-way migration of a pre-K8 (version 2) volume into the K8
+    /// copy-on-write format: walks the old tree read-only and replays it
+    /// (names, data, attributes) into a freshly formatted K8 image.
+    Migrate {
+        /// The pre-K8 (v2) source image (opened read-only, never written).
+        from: String,
+        /// The K8 target image (created/overwritten, freshly formatted).
+        to: String,
+        /// Target size in MB (default: sized like the source volume).
+        #[arg(short, long)]
+        size_mb: Option<u64>,
     },
 }
 
@@ -330,15 +342,11 @@ async fn main() -> Result<()> {
                 let report = fs
                     .recover()
                     .map_err(|e| anyhow::anyhow!("fsck --repair failed: {:?}", e))?;
-                println!("🔧 [FSCK] recovery complete on '{}'", img);
-                println!("  dirty journal        : {}", report.dirty_journal);
-                println!("  query-orphans healed : {}", report.orphan_inodes.len());
+                println!("🔧 [FSCK] refcount rebuild complete on '{}'", img);
+                println!("  stale index inodes   : {}", report.orphan_inodes.len());
                 println!("  catalog entries scrubbed: {}", report.scrubbed_catalog_entries);
                 println!("  blocks reclaimed     : {}", report.reclaimed_blocks);
             } else {
-                let dirty = fs
-                    .is_dirty()
-                    .map_err(|e| anyhow::anyhow!("fsck failed: {:?}", e))?;
                 let report = fs
                     .fsck(false)
                     .map_err(|e| anyhow::anyhow!("fsck failed: {:?}", e))?;
@@ -346,15 +354,52 @@ async fn main() -> Result<()> {
                     "🔍 [FSCK] scan of '{}' (dry run — pass --repair to heal)",
                     img
                 );
-                println!("  dirty journal        : {}", dirty);
+                println!("  root generation      : {}", fs.root_generation());
                 println!("  blocks in use        : {}", report.blocks_in_use);
                 println!("  reachable blocks     : {}", report.reachable_blocks);
                 println!("  leaked blocks        : {}", report.leaked_blocks.len());
-                println!("  query-orphaned inodes: {}", report.orphan_inodes.len());
-                if report.leaked_blocks.is_empty() && report.orphan_inodes.is_empty() && !dirty {
+                println!("  stale index inodes   : {}", report.orphan_inodes.len());
+                if report.is_clean() {
                     println!("  ✅ volume is clean");
                 }
             }
+        }
+        Commands::Migrate { from, to, size_mb } => {
+            println!("⚡ [OPERATOR] Migrating pre-K8 vault '{}' → K8 '{}'...", from, to);
+
+            let old_dev = FileDevice::open_read_only(from)
+                .context("Failed to open source image read-only")?;
+            let mut old = unafs::legacy::LegacyVolume::open(old_dev)
+                .map_err(|e| anyhow::anyhow!("source is not a pre-K8 (v2) volume: {:?}", e))?;
+
+            // Size the target like the source unless told otherwise.
+            let src_mb = (old.superblock.block_count * unafs::BLOCK_SIZE).div_ceil(1024 * 1024);
+            let target_mb = size_mb.unwrap_or(src_mb.max(1));
+
+            let file = std::fs::File::create(to).context("Failed to create target file")?;
+            file.set_len(target_mb * 1024 * 1024)
+                .context("Failed to size target file")?;
+            let new_dev = FileDevice::open(to).context("Failed to open target device")?;
+            let mut new = FileSystem::format(new_dev, target_mb)
+                .map_err(|e| anyhow::anyhow!("failed to format K8 target: {:?}", e))?;
+
+            let report = unafs::legacy::migrate_into(&mut old, &mut new)
+                .map_err(|e| anyhow::anyhow!("migration failed: {:?}", e))?;
+
+            // Belt-and-braces: the migrated volume must be consistent.
+            let check = new
+                .fsck(false)
+                .map_err(|e| anyhow::anyhow!("post-migration fsck failed: {:?}", e))?;
+            anyhow::ensure!(check.is_clean(), "post-migration fsck not clean: {check:?}");
+
+            println!(
+                "✅ [OPERATOR] Migrated {} files, {} directories, {} bytes → '{}' (v3, gen {}) — fsck clean",
+                report.files,
+                report.directories,
+                report.bytes,
+                to,
+                new.root_generation()
+            );
         }
     }
 

@@ -35,7 +35,6 @@
 extern crate alloc;
 
 pub mod adapter;
-pub mod bitmap;
 pub mod catalog;
 pub mod codec;
 pub mod fs;
@@ -44,10 +43,12 @@ pub mod hash;
 pub mod inode;
 #[cfg(feature = "std")]
 pub mod io;
+pub mod legacy;
 pub mod query;
+pub mod refmap;
+pub mod root;
 pub mod storage;
 pub mod superblock;
-pub mod wal;
 pub mod warnlog;
 
 pub use adapter::{
@@ -55,15 +56,15 @@ pub use adapter::{
     SECTOR_SIZE, SECTORS_PER_BLOCK, SectorDevice, SectorError, locate_unafs, parse_partitions,
 };
 pub use catalog::{CatalogEntry, deserialize_catalog, serialize_catalog};
-pub use fs::{DirEntry, UnaFS, cosine_similarity};
+pub use fs::{CommitStats, DirEntry, ReclaimEntry, SnapshotEntry, UnaFS, cosine_similarity};
 pub use fsck::FsckReport;
 pub use inode::{AttributeValue, Extent, ExtentList, FileKind, Inode, InodeError};
 pub use query::{Query, QueryOp, parse_value};
+pub use root::{ROOT_RECORD_SIZE, RootRecord, RootSlot};
 #[cfg(feature = "std")]
 pub use storage::FileDevice;
 pub use storage::{BLOCK_SIZE, BlockDevice, MemDevice};
 pub use superblock::Superblock;
-pub use wal::{Journal, JournalOp};
 
 /// The default FileSystem type backed by a host file.
 #[cfg(feature = "std")]

@@ -71,6 +71,32 @@ pub trait BlockDevice {
 
     /// Flush any buffered data to the underlying storage.
     fn flush(&mut self) -> Result<(), Error>;
+
+    /// Write ONE 512 B sector inside block `id` (`sector` in `0..8`), leaving
+    /// the block's other sectors untouched. This is the K8a root-flip
+    /// primitive: the commit's atomic point must be a single-sector device
+    /// write, not an 8-sector block rewrite. The default is a read-modify-
+    /// write of the whole block (correct for host/test backends, which have
+    /// no sector-tear model); the kernel's sector adapter overrides it with a
+    /// true single-sector write to the medium.
+    fn write_sector_in_block(
+        &mut self,
+        id: u64,
+        sector: usize,
+        buf: &[u8],
+    ) -> Result<(), Error> {
+        const SECTOR: usize = 512;
+        if buf.len() != SECTOR {
+            return Err(Error::BadBlockSize(buf.len(), SECTOR as u64));
+        }
+        if sector >= (BLOCK_SIZE as usize) / SECTOR {
+            return Err(Error::OutOfBounds(id));
+        }
+        let mut block = alloc::vec![0u8; BLOCK_SIZE as usize];
+        self.read_block(id, &mut block)?;
+        block[sector * SECTOR..(sector + 1) * SECTOR].copy_from_slice(buf);
+        self.write_block(id, &block)
+    }
 }
 
 /// A block device backed by a file on the host OS.

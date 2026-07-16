@@ -14,153 +14,105 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! UNAFS-F1: crash-recovery — the fsck-scavenger and the dirty-mount replay
-//! path.
+//! K8a: the refcount-consistency checker (fsck) for the copy-on-write format.
 //!
 //! ## What crash recovery has to do here (and what it deliberately does not)
 //!
-//! The mutation engine (`fs.rs`, F2) is crash-**ordered**, not
-//! crash-**atomic**: every `unlink` / `rename` / `remove_attribute` /
-//! attribute-rewrite is sequenced so that no intermediate on-disk state ever
-//! references a freed block. The only residue an ill-timed power cut can leave
-//! is therefore bounded and structurally sound:
+//! Under CoW there is no torn-transaction concept to detect: every mutation
+//! becomes visible in ONE atomic 512 B root-sector flip, so a power cut
+//! yields the previous committed tree — whole, internally consistent, with
+//! its own persisted refcount map. Blocks a crashed transaction wrote before
+//! its flip are, by construction, blocks the committed refcount map calls
+//! FREE, so they are reclaimed by the next allocation with no scavenging at
+//! all. The pre-K8 dirty-journal/leak/query-orphan machinery is gone.
 //!
-//! * **Leaked blocks** — allocated in the bitmap but reachable from no inode
-//!   (a rewrite that wrote new extents but crashed before/at the single-block
-//!   inode swap that adopts them, or an op that unhooked an inode but crashed
-//!   before freeing its blocks). Never a dangling reference; just space the
-//!   allocator can't hand out.
-//! * **Query-orphaned inodes** — the one cross-directory `rename` window where
-//!   an inode is reachable by query (its catalog entries key on the inode id,
-//!   which is untouched) but by no name (it left the source directory before
-//!   joining the destination). Its blocks are not leaked in the dangling
-//!   sense — the catalog references them — but the file has no path.
-//!
-//! Because the volume is never torn, recovery does not need — and this arc
-//! does not add — a redo/undo journal. The write-ahead log (`wal.rs`) records
-//! only the begin/end of each op (no before/after block images), so a classic
-//! log replay is not even expressible in the current on-disk format; growing
-//! that format is a separate, KAT-recutting arc. What F1 adds is the pass that
-//! actually reclaims the residue the crash-ordered design was designed to be
-//! reclaimable: a mark-and-sweep scavenger that walks the volume from its
-//! roots, and a [`UnaFS::recover`] entry point that runs it on a dirty mount
-//! and clears the journal's dirty flag afterwards.
-//!
-//! ## Honest boundary: reordering write-back caches
-//!
-//! Everything above assumes writes hit the medium in **program order**. unafs
-//! issues no write barriers, so a reordering write-back cache CAN land a later
-//! write before an earlier one and, on power-cut, dangle a pointer the ordered
-//! design never would. The scavenger is best-effort under that failure mode:
-//! it reclaims leaks and heals query-orphans on a program-order volume; it is
-//! not a general fsck for arbitrary corruption (the on-disk parser is hardened
-//! separately — see `tests/hostile_volume.rs`), and the write-barrier question
-//! is future work.
+//! What remains for fsck is INVARIANT CHECKING against media corruption or
+//! implementation bugs: recompute the reachable-block set from the live root
+//! (and, from K8b on, every retained root) and compare it with the persisted
+//! refcount map. `repair == true` rewrites the map to the computed truth and
+//! scrubs catalog entries that reference unallocated inode ids. Safe to run
+//! on a clean volume: it finds nothing and (in repair mode) commits nothing
+//! beyond a no-op root advance.
 //!
 //! ## Load-bearing invariant: liveness == name-reachability
 //!
-//! Repair's "never eat live data" guarantee rests entirely on the invariant
-//! that every live inode is reachable through the name tree, and the catalog
-//! is a purely secondary index — so an inode that is catalog-reachable but
-//! nameless is, by definition, crash residue. That holds today (inode id ==
-//! block id, one namespace, no hard links, no link count). Any future feature
-//! that legitimately makes an inode catalog-only-reachable — hard links, a
-//! second namespace, a catalog-anchored object with no directory entry —
-//! would make [`UnaFS::fsck`]`(true)` / [`UnaFS::recover`] scrub-and-free
-//! LIVE files. Such an arc is a STOP tripwire: it must rework this walk's
-//! root set before it lands.
+//! Repair's "never eat live data" guarantee rests on every live inode being
+//! reachable through the name tree or a reserved system id (root, catalog,
+//! snapshot index, reclaim queue); the catalog is a purely secondary index.
+//! K8b's retained roots ADD roots to this walk — that arc must extend
+//! [`UnaFS::fsck`]'s root set before it lands (standing STOP-class note).
 
 use crate::catalog::deserialize_catalog;
 use crate::fs::{FileSystemError, UnaFS};
-use crate::inode::{ExtentList, FileKind};
+use crate::inode::ExtentList;
+use crate::root::ROOT_BLOCK;
 use crate::storage::{BLOCK_SIZE, BlockDevice};
 use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 
-/// What a scavenger pass found (and, in repair mode, healed).
-///
-/// A volume is [`clean`](FsckReport::is_clean) when it has no leaked blocks,
-/// no query-orphaned inodes, and no dirty journal.
+/// What a consistency pass found (and, in repair mode, healed).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FsckReport {
-    /// The journal carried an unterminated transaction at recovery time.
-    /// Only set by [`UnaFS::recover`] (a bare [`UnaFS::fsck`] does not consult
-    /// the journal).
+    /// Always `false` under CoW (kept for report-shape compatibility: there
+    /// is no journal to be dirty).
     pub dirty_journal: bool,
-    /// Blocks marked used in the bitmap across the volume span.
+    /// Blocks with refcount > 0 in the persisted/current map.
     pub blocks_in_use: u64,
-    /// Distinct blocks reachable from the roots (system + name tree + catalog).
+    /// Distinct blocks reachable from the roots (system set + name tree).
     pub reachable_blocks: u64,
-    /// Blocks allocated but reachable from no inode — detected before any
-    /// repair. A query-orphan's own blocks appear here too (they have no name
-    /// path); [`orphan_inodes`](FsckReport::orphan_inodes) names the subset
-    /// that also needs a catalog scrub.
+    /// Blocks counted in-use but reachable from no root (media corruption or
+    /// an implementation bug — the CoW commit cannot produce these).
     pub leaked_blocks: Vec<u64>,
-    /// Inodes reachable by query (catalog) but by no name — the cross-directory
-    /// `rename` crash window.
+    /// Inode ids the catalog references whose inode-map slot is empty.
     pub orphan_inodes: Vec<u64>,
     /// Blocks returned to the free pool (repair mode only).
     pub reclaimed_blocks: u64,
-    /// Catalog index entries scrubbed while healing orphans (repair mode only).
+    /// Catalog index entries scrubbed while healing orphans (repair only).
     pub scrubbed_catalog_entries: usize,
     /// Whether this pass was allowed to mutate the volume.
     pub repaired: bool,
 }
 
 impl FsckReport {
-    /// True when the scan found nothing to reclaim, heal, or roll forward.
+    /// True when the scan found nothing inconsistent.
     pub fn is_clean(&self) -> bool {
         self.leaked_blocks.is_empty() && self.orphan_inodes.is_empty() && !self.dirty_journal
     }
 }
 
-/// The read-only result of a reachability walk.
-struct Reachable {
-    /// Every block reachable from a root.
-    blocks: BTreeSet<u64>,
-    /// Every inode reachable by name (plus the system inodes root + catalog).
-    named: BTreeSet<u64>,
-}
-
 impl<D: BlockDevice> UnaFS<D> {
-    /// Report whether the journal carries an unterminated transaction (a torn
-    /// mutation from a crash). Read-only; does not repair.
+    /// CoW volumes are never "dirty": a mount always lands on a committed
+    /// tree. Kept for API compatibility with pre-K8 callers.
     pub fn is_dirty(&mut self) -> Result<bool, FileSystemError> {
-        Ok(self.journal.check_recovery(&mut self.device)?)
+        Ok(false)
     }
 
-    /// Mark-and-sweep scavenger.
+    /// Refcount-consistency check.
     ///
-    /// Walks the volume from its roots (superblock system blocks, the name
-    /// tree rooted at the root inode, and the attribute catalog), then diffs
-    /// the reachable-block set against the allocation bitmap. With
-    /// `repair == false` it only reports; with `repair == true` it heals
-    /// query-orphaned inodes (scrubbing their catalog entries, crash-ordered)
-    /// and returns every leaked block to the free pool.
-    ///
-    /// Does not consult the journal — [`recover`](UnaFS::recover) is the
-    /// dirty-mount entry point that also clears the dirty flag. Safe to run on
-    /// a clean volume: it reclaims nothing and leaves free-space accounting
-    /// untouched.
+    /// Recomputes the reachable-block set (system blocks + the trees hanging
+    /// from every reserved and name-reachable inode) and diffs it against the
+    /// refcount map. With `repair == false` it only reports; with
+    /// `repair == true` it scrubs catalog entries referencing dead inode ids,
+    /// rewrites the refcount map to the computed truth, and commits.
     pub fn fsck(&mut self, repair: bool) -> Result<FsckReport, FileSystemError> {
         let block_count = self.superblock.block_count;
 
         // Phase 0: read-only reachability + orphan detection.
-        let reach = self.scavenge_walk()?;
+        let reach = self.reachability_walk()?;
         let catalog_ids = self.catalog_inode_ids()?;
 
         let orphan_inodes: Vec<u64> = catalog_ids
             .iter()
             .copied()
-            .filter(|id| *id != 0 && *id < block_count && !reach.named.contains(id))
+            .filter(|&id| self.imap_ref().get(id as usize).copied().unwrap_or(0) == 0)
             .collect();
 
         let mut leaked_blocks = Vec::new();
         let mut blocks_in_use = 0u64;
         for block in 0..block_count {
-            if self.bitmap.is_used(block) {
+            if self.refmap_ref().is_used(block) {
                 blocks_in_use += 1;
-                if !reach.blocks.contains(&block) {
+                if !reach.contains(&block) {
                     leaked_blocks.push(block);
                 }
             }
@@ -169,7 +121,7 @@ impl<D: BlockDevice> UnaFS<D> {
         let mut report = FsckReport {
             dirty_journal: false,
             blocks_in_use,
-            reachable_blocks: reach.blocks.len() as u64,
+            reachable_blocks: reach.len() as u64,
             leaked_blocks,
             orphan_inodes: orphan_inodes.clone(),
             reclaimed_blocks: 0,
@@ -181,61 +133,45 @@ impl<D: BlockDevice> UnaFS<D> {
             return Ok(report);
         }
 
-        // Phase 1: heal query-orphans. Scrub their catalog entries FIRST — via
-        // the crash-ordered rewrite path — so that when their blocks are freed
-        // below, no query reference is left dangling. (The rewrite reshapes the
-        // catalog's own extents, which is exactly why phase 2 re-walks rather
-        // than trusting the phase-0 leak list.)
+        // Phase 1: scrub catalog entries pointing at dead inode ids (their
+        // rewrite reshapes the catalog's blocks, hence the re-walk below).
         if !orphan_inodes.is_empty() {
             let orphan_set: BTreeSet<u64> = orphan_inodes.iter().copied().collect();
             report.scrubbed_catalog_entries = self.count_catalog_entries(&orphan_set)?;
             self.remove_catalog_entries(|e| orphan_set.contains(&e.inode_id))?;
         }
 
-        // Phase 2: re-walk (the catalog scrub moved blocks around) and sweep
-        // every still-leaked block back to the free pool.
-        let reach2 = self.scavenge_walk()?;
+        // Phase 2: re-walk and rebuild the refcount map to the computed
+        // truth (K8a: every reachable block has exactly one referencing
+        // root, so count == 1; K8b's multi-root walk raises counts here).
+        let reach2 = self.reachability_walk()?;
+        let mut counts = alloc::vec![0u32; block_count as usize];
+        for &b in &reach2 {
+            if let Some(c) = counts.get_mut(b as usize) {
+                *c = 1;
+            }
+        }
         let mut reclaimed = 0u64;
         for block in 0..block_count {
-            if self.bitmap.is_used(block) && !reach2.blocks.contains(&block) {
-                self.free_block(block);
+            if self.refmap_ref().is_used(block) && !reach2.contains(&block) {
                 reclaimed += 1;
             }
         }
-        if reclaimed > 0 || report.scrubbed_catalog_entries > 0 {
-            self.sync_metadata()?;
-        }
+        self.refmap_mut().set_counts(&counts);
         report.reclaimed_blocks = reclaimed;
+        self.commit()?;
 
         Ok(report)
     }
 
-    /// Dirty-mount recovery: the host-side replay path.
-    ///
-    /// Detects whether the journal carries a torn transaction, runs the
-    /// scavenger in repair mode to bring the volume to a consistent state
-    /// (leaks reclaimed, query-orphans healed), and — if the journal was
-    /// dirty — resets it, clearing the dirty flag so the next mount is clean.
-    ///
-    /// This is "replay" in the sense the crash-ordered format supports:
-    /// reconciliation to a consistent state, not redo/undo of logged block
-    /// images (which the format does not carry — see the module docs). Intended
-    /// for host (`std`) mounts; the kernel's read-only mount must never call it
-    /// (it would attempt writes the RO seam refuses).
+    /// Consistency recovery entry point (host tools' `fsck --repair`). Under
+    /// CoW there is no journal to replay or reset — this is `fsck(true)`.
     pub fn recover(&mut self) -> Result<FsckReport, FileSystemError> {
-        let dirty = self.is_dirty()?;
-        let mut report = self.fsck(true)?;
-        report.dirty_journal = dirty;
-        if dirty {
-            self.journal.reset(&mut self.device)?;
-        }
-        Ok(report)
+        self.fsck(true)
     }
 
-    /// Add every block an extent list covers to `blocks`, bounded to the volume
-    /// span. Mirrors `free_extents`' hostile-geometry discipline: `checked_add`
-    /// on the block address, and the run stops at the volume edge so a corrupt
-    /// `length` can neither wrap nor spin for 2^64 iterations.
+    /// Add every block an extent list covers to `blocks`, bounded to the
+    /// volume span (hostile geometry marks nothing real).
     fn mark_extent_blocks(&self, extents: &ExtentList, blocks: &mut BTreeSet<u64>) {
         let volume = self.superblock.block_count;
         for extent in extents {
@@ -251,77 +187,43 @@ impl<D: BlockDevice> UnaFS<D> {
         }
     }
 
-    /// Walk the volume from its roots, collecting every reachable block and
-    /// every name-reachable inode. Read-only. Cycle-guarded (a corrupt
-    /// directory cannot spin the walk) and bounded (inode ids and extent runs
-    /// are clamped to the volume span). Any parse failure aborts the whole walk
-    /// with `Err`, so a caller in repair mode frees nothing on a walk it could
-    /// not complete.
-    fn scavenge_walk(&mut self) -> Result<Reachable, FileSystemError> {
+    /// Every block reachable from the volume's roots: the static system
+    /// blocks (superblock + root area), the committed inode-map and
+    /// refcount-map blocks, and the trees hanging from the reserved inodes
+    /// and the name tree. Read-only; cycle-guarded; any parse failure aborts
+    /// with `Err` so repair mode never acts on a partial walk.
+    fn reachability_walk(&mut self) -> Result<BTreeSet<u64>, FileSystemError> {
         let block_count = self.superblock.block_count;
-        let root = self.superblock.root_inode;
-        let catalog = self.superblock.catalog_inode;
-        let bitmap_start = self.superblock.bitmap_start;
-        let bitmap_blocks = self.superblock.bitmap_blocks;
-        let journal_start = self.superblock.journal_start;
-        let journal_blocks = self.superblock.journal_blocks;
 
-        let mut blocks = BTreeSet::new();
-        let mut named = BTreeSet::new();
-
-        // System blocks: superblock, journal region, bitmap region.
-        blocks.insert(0u64);
-        for i in 0..journal_blocks {
-            if let Some(b) = journal_start.checked_add(i) {
-                if b < block_count {
-                    blocks.insert(b);
-                }
-            }
-        }
-        for i in 0..bitmap_blocks {
-            if let Some(b) = bitmap_start.checked_add(i) {
-                if b < block_count {
-                    blocks.insert(b);
-                }
+        let mut blocks: BTreeSet<u64> = BTreeSet::new();
+        blocks.insert(0);
+        blocks.insert(ROOT_BLOCK);
+        for b in self.map_blocks().collect::<Vec<_>>() {
+            if b < block_count {
+                blocks.insert(b);
             }
         }
 
-        // Name tree: DFS from the root over directories.
-        let mut stack = alloc::vec![root];
-        while let Some(id) = stack.pop() {
-            if id == 0 || id >= block_count {
-                continue;
-            }
-            if !named.insert(id) {
-                continue; // already visited — cycle guard
-            }
+        // Every ALLOCATED inode-map slot is a reference: under CoW the imap
+        // is the pointer graph's spine (root → imap → inode → extents), so a
+        // file with no directory name — the `create_inode` shape host
+        // embedders use — is still live. (Directory entries and the catalog
+        // both resolve THROUGH the imap, so walking the slots covers every
+        // name- and query-reachable inode too.)
+        let ids: Vec<u64> = (1..self.imap_ref().len() as u64)
+            .filter(|&id| self.imap_ref().get(id as usize).copied().unwrap_or(0) != 0)
+            .collect();
+        for id in ids {
+            let pb = self.imap_ref()[id as usize];
             let inode = self.read_inode(id)?;
-            blocks.insert(id);
-            self.mark_extent_blocks(&inode.chunks, &mut blocks);
-            for extents in inode.large_attributes.values() {
-                self.mark_extent_blocks(extents, &mut blocks);
-            }
-            if inode.kind == FileKind::Directory {
-                for entry in self.ls(id)? {
-                    if entry.inode_id != 0 && entry.inode_id < block_count {
-                        stack.push(entry.inode_id);
-                    }
-                }
-            }
-        }
-
-        // The attribute catalog (a System inode, reachable only via the
-        // superblock, never a directory child).
-        if catalog != 0 && catalog < block_count && named.insert(catalog) {
-            let inode = self.read_inode(catalog)?;
-            blocks.insert(catalog);
+            blocks.insert(pb);
             self.mark_extent_blocks(&inode.chunks, &mut blocks);
             for extents in inode.large_attributes.values() {
                 self.mark_extent_blocks(extents, &mut blocks);
             }
         }
 
-        Ok(Reachable { blocks, named })
+        Ok(blocks)
     }
 
     /// The set of inode ids the attribute catalog references (deduplicated).
