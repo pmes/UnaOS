@@ -802,3 +802,53 @@ pub fn start_secondaries_tegra(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64
         n_secondaries
     );
 }
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// ORIN-SMP-6 probe support (lane amendment, Maestro-granted 2026-07-16)
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+//
+// The SMP-6 legs 21/23 wake cores into the REAL `_secondary_start_virt` entry (the last untested
+// difference vs the acquitted `smpprobe.rs` replica). The real path consumes this module's private
+// publication state (`SEC_CTX`, `SECONDARY_STACKS`, `AFF_BY_INDEX`/`N_CORES_PUB`, `BSP_AFFINITY`)
+// and reports online via the private `CORE_READY` — so the probe needs EXACTLY two things from this
+// module: (a) a publish-only entry that performs the same pre-`CPU_ON` publication
+// `start_secondaries_tegra` does (ctx capture + table publication + cache maintenance — it issues
+// NO `CPU_ON`), and (b) read visibility on the online signal. Both are `smpprobe`-gated (plus
+// `tegra`), so the knob-off image — and every non-probe build — is byte-identical to baseline.
+
+/// Publish everything a REAL-entry secondary consumes, exactly as `start_secondaries_tegra` does
+/// before its `CPU_ON` loop, and return the real entry PA (`_secondary_start_virt`). Publish-only:
+/// this function issues NO `CPU_ON` — the caller (`smpprobe.rs`) owns the wake and its record.
+///
+/// `aff_by_index[0]` must be the BSP's packed affinity; `aff_by_index[1..]` the `CPU_ON` targets in
+/// linear-index order (the probe sources them from the DTB `/cpus` oracle, RIDER 5). Mirrors the
+/// `start_secondaries_tegra` publication protocol line-for-line: BSP affinity + SGI-0 receive
+/// enable, EL2 regime capture + clean to PoC, secondary-stack clean+invalidate, then the
+/// linear-index table with the `N_CORES_PUB` Release fence.
+#[cfg(all(feature = "tegra", feature = "smpprobe"))]
+pub fn probe_publish_real_path(aff_by_index: &[u32]) -> u64 {
+    let n_cores = aff_by_index.len().min(MAX_CORES);
+    if n_cores > 0 {
+        BSP_AFFINITY.store(aff_by_index[0], Ordering::Release);
+    }
+    gic::enable_sgi(IPI_SGI);
+    capture_secondary_ctx();
+    cache::clean_range(&raw const SEC_CTX as usize, core::mem::size_of::<SecondaryCtx>());
+    cache::clean_invalidate_range(
+        &raw const SECONDARY_STACKS as usize,
+        core::mem::size_of::<[SecStack; MAX_CORES]>(),
+    );
+    for (idx, &aff) in aff_by_index.iter().take(n_cores).enumerate() {
+        AFF_BY_INDEX[idx].store(aff, Ordering::Relaxed);
+    }
+    N_CORES_PUB.store(n_cores as u32, Ordering::Release);
+    _secondary_start_virt as *const () as usize as u64
+}
+
+/// Read accessor for the real path's online signal: has the secondary at linear index `idx` run the
+/// full `__secondary_rust_virt` bring-up and published `CORE_READY` (Acquire pairs with its
+/// Release)? Out-of-range indices read false.
+#[cfg(all(feature = "tegra", feature = "smpprobe"))]
+pub fn probe_core_online(idx: usize) -> bool {
+    idx < MAX_CORES && CORE_READY[idx].load(Ordering::Acquire)
+}
