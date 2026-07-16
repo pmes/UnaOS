@@ -4072,3 +4072,39 @@ inherit path. **(c)** If the relink proves pure layout correlation, a layout-pin
 resort (it hides the poisoned pointer rather than neutralizing it); (a) is preferred. The DONE gate for
 THIS arc is the diagnosis (M1 + M2) + this direction; the fix lands separately once a sitting names the
 pointer. Bench runbook: `scripts/orin-xcarve-bench.md` (predictions pre-registered).
+
+**⚡ SITTING VERDICT (2026-07-16 attended, Peter + LC-orin; serial
+`~/unaos-bench/jetson-serial-2026-07-16-xcarvesitting.log`; 4 boots, media hash-verified on-stick
+per boot; firmware `39.2.0-gcid-45755727`):**
+
+- **Boot 1 (instrumented, faulted = full-value):** the `JBXC:` census printed completely
+  pre-eviction, then the boot died at the wall. **NULL CENSUS** — no inherited pointer carries the
+  poisoned hi-half; every dumped value sane in-DRAM (~`0x2_5f2a_x000` region): DCBAA, 3 scratchpads,
+  ERST/event ring, 8 firmware slots all slot_state=3 (Configured). CRCR read `0x0` exactly per the
+  5.4.5 caveat. Per the folded coverage caveats the target is THREE-WAY AMBIGUOUS: controller-internal
+  latched pointer, inherited command-ring pointer (unreadable via CRCR), or an unwalked
+  endpoint-context/transfer-ring pointer. **NEW FACT: the fault ADDR MOVED — `0x800000027767dc40`
+  (−0x40, one context stride) on this new-layout image vs the SMP-6 era's fixed `…dc80`.**
+- **Boot 2 (relinked leg-23): CLEAN through JB9i where the old layout faulted 4/4** — then the full
+  leg-23 conjunction ran: 5 back-to-back real-entry `CPU_ON`s, **5/5 cores online via the REAL path**
+  (both clusters, `CORE_READY[1..5]`, AP→BSP SGI OK, `RAPID REAL-ENTRY SEQUENCE DONE`), EL1 drop,
+  CAPSTONE 6/6 PASS, panel live (~145–160 fps observed).
+- **Boot 3 (same stick, repro sample): FAULTED at JB9i, ADDR `…dc40`** — the relink turned the
+  4/4-faulter into a **~50%er**, the sibling-image pattern. **LAYOUT CORRELATION PROVEN IN BOTH
+  DIMENSIONS: layout modulates the fault PROBABILITY (4/4 → ~50%) and the fault TARGET ADDRESS
+  (`dc80` on all old-layout images, `dc40` on both new-layout images).** The relink does NOT
+  eliminate the wall — layout-pin (M3c) is confirmed non-viable; the fix must neutralize the pointer.
+- **Boot 4 (restored knob-off default `83035a8f…`): clean boot, CAPSTONE 6/6; VUG METAL WITNESS
+  PASS** — live climbing fps (145→160+), meter reads 6 cores, `VUG: crystal live — 24 faces`.
+  ⚠ Recorded artifact: ALL 6 load bars read pinned — parked cores (2..5, never scheduled on the
+  default image) accrue no idle ticks so a busy/idle meter reads them 100%. Display-honesty
+  follow-up candidate (show parked cores idle/absent), not a VUGFIX regression (fps/ms chain is the
+  witness and it is live). End-restore debt paid within the sitting.
+
+**LEG 23 VERDICT (SMP-3 close-out): the conjunction is INNOCENT.** Every code-shape suspect —
+entry shape (leg 21), wake concurrency (leg 22), their conjunction (leg 23) — is now acquitted on
+silicon. **SMP-3's residual trigger = boot-state context** (whatever differed on the original
+SMP-3 boots: e.g. the tegrasmp kick-off's position in the boot sequence, xHCI/eviction state at
+wake time — note SMP-3's fault signature was IOB `ADDR 0x8000000000000200`, ALSO a bit-63 address,
+now suggestive in the carveout wall's light). Next SMP arc = a boot-state-context bisect
+(proposal to Peter; do not spawn).
