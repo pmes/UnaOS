@@ -48,8 +48,12 @@ pre-takeover / pre-JB9i. **Among the inherited pointers, expect exactly one whos
 `0x800000027767dc80`** (or a class carrying hi-half `0x80000000` / lo-half `0x7767dc80`) — that pointer
 NAMES the FillWrite target. The inherited pointers are firmware-set, so they appear whether or not THIS
 image itself goes on to fault. Capture EVERY `JBXC:` line. If NO pointer carries the `0x80000000`
-hi-half, the FillWrite target is not a directly-inherited pointer we dump (it is a controller-internal
-latched pointer) — record that and note it for the fix step.
+hi-half, the FillWrite target is not a directly-inherited pointer we dump — per the §JETSON-XCARVE
+coverage caveats that means a controller-internal latched pointer, an inherited command-ring pointer
+(a CRCR read returns the pointer field as ZEROS per xHCI 5.4.5 — the `JBXC: CRCR=` line cannot name
+it), or an unwalked endpoint-context/transfer-ring pointer (the census reads slot contexts only).
+A null census is therefore three-way ambiguous, NOT proof of "controller-internal" — record it
+exactly and note it for the fix step.
 
 ### Boot 2 — relinked-leg23 image (the decisive layout test)
 **Pre-registered prediction:** the +16 KiB relink shifts the entire image (`.text`/`.data`/`.bss` all
