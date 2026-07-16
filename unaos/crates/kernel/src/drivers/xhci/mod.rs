@@ -4548,8 +4548,8 @@ impl XhciController {
                 }
             }
         } else if c_connection && !connected {
-            // M1: visibility only — the device left. The route-scoped teardown lands in M3.
-            serial_println!("xHCI: HUB slot {} port {} disconnect detected (teardown lands in M3).", hub_slot, port);
+            // M3: the device on this downstream port left. Tear down its slot subtree.
+            self.disconnect_hub_port(hub_slot, port);
         } else {
             serial_println!("xHCI: HUB slot {} port {}: no actionable connection change.", hub_slot, port);
         }
@@ -4567,6 +4567,72 @@ impl XhciController {
         if self.slots[hub_slot as usize].hub_int_expect_phys == 0 {
             self.queue_hub_change_read(hub_slot);
         }
+    }
+
+    /// XENUM-2 (M3): tear down every slot whose route string places it ON or BELOW `hub_slot`'s
+    /// downstream `port` — the route-prefix analogue of `dispose_disconnected_slots`' port-scoping. A
+    /// nested hub's whole subtree goes with it. Root-port slots and OTHER hub ports are provably
+    /// untouched: the match requires the port's full route-nibble prefix, so only this port's subtree
+    /// qualifies. Bindings cleared, slots queued for the deferred DISABLE_SLOT drain.
+    fn disconnect_hub_port(&mut self, hub_slot: u8, port: u8) {
+        let (hub_route, hub_depth) = {
+            let s = &self.slots[hub_slot as usize];
+            (s.route_string, s.route_depth)
+        };
+        // The route prefix of this downstream port: the hub's own route with `port` placed in the
+        // hub's tier nibble. A device on/below the port has depth > hub_depth and shares this prefix
+        // across the low (hub_depth+1) nibbles.
+        let port_nibble = ((port as u32).min(15)) << (4 * hub_depth);
+        let child_prefix = hub_route | port_nibble;
+        let prefix_mask: u32 = if hub_depth >= 5 {
+            0xFFFFF
+        } else {
+            (1u32 << (4 * (hub_depth + 1))) - 1
+        };
+
+        let mut torn = 0usize;
+        for i in 1..self.slots.len() {
+            if !self.slots[i].active || !self.slots[i].is_downstream {
+                continue;
+            }
+            // On/below this port: deeper than the hub AND the port's full nibble prefix matches.
+            let below = self.slots[i].route_depth > hub_depth
+                && (self.slots[i].route_string & prefix_mask) == (child_prefix & prefix_mask);
+            if !below {
+                continue;
+            }
+            // Scope assertion (traced): a matched slot must share the prefix and never be a root slot.
+            debug_assert!(self.slots[i].route_depth > hub_depth);
+            if self.storage_slot == i as u8 {
+                self.storage_slot = 0;
+                self.storage_pending_bringup = false;
+                self.storage_note = "hub-downstream storage disconnected";
+            }
+            if self.configuring_slot == i as u8 { self.configuring_slot = 0; }
+            if self.ftdi_configuring_slot == i as u8 { self.ftdi_configuring_slot = 0; }
+            if self.ftdi_slot == i as u8 {
+                self.ftdi_slot = 0;
+                self.ftdi_pending_bringup = false;
+                self.ftdi_pending = None;
+                ftdi::set_live(false);
+            }
+            self.hid_setproto_pending.retain(|s| *s != i as u8);
+            self.hubs_pending.retain(|s| *s != i as u8);
+            // A nested hub going away takes its own queued port changes with it.
+            self.hub_changes_pending.retain(|(hs, _)| *hs != i as u8);
+            let (route, depth) = (self.slots[i].route_string, self.slots[i].route_depth);
+            self.slots[i].reset_soft_state();
+            if !self.slots_to_disable.iter().any(|(s, _)| *s == i as u8) {
+                self.slots_to_disable.push((i as u8, 0));
+            }
+            serial_println!(
+                "xHCI: HUB slot {} port {} disconnect: slot {} (route {:#x} tier {}) in subtree; queued for DISABLE_SLOT.",
+                hub_slot, port, i, route, depth);
+            torn += 1;
+        }
+        serial_println!(
+            "xHCI: HUB slot {} port {} disconnect: {} slot(s) torn down (scope: route-prefix {:#x} mask {:#x}, root + sibling ports untouched).",
+            hub_slot, port, torn, child_prefix & prefix_mask, prefix_mask);
     }
 
     /// Address a device behind a hub: like `address_device` but the slot context carries a
