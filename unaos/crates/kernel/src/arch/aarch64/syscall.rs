@@ -8454,6 +8454,11 @@ pub fn u7_launcher(demo_cpu: usize) {
     // LAST, fully self-cleaning (leaves only the staged K3 fixtures). Its own uncounted
     // `:: K6-migrate: … PASS ::` line; honest skip on media without a unafs partition.
     k6_migrate_selftest();
+    // BANDY-1 M1: the bus v1 subset codec KATs — reply bodies proven byte-compatible with the
+    // HOST serializer (tools/bandy-golden captures), native request header+payloads frozen,
+    // decode fail-closed at the hard ceiling. Read-only, in-RAM (no disk, no card); its own
+    // uncounted `:: BANDY-CODEC: … PASS ::` line. LAST in the chain.
+    super::bus::bus_codec_selftest();
 }
 
 /// F2 M3 witness worker — the `demo_cpu` half of the cross-core FAT_MUTATION stress. `fn(usize)` for

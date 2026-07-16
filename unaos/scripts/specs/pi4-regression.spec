@@ -99,6 +99,13 @@ FORBID FATMOVE:.*FAIL
 REQUIRE K6-migrate:.*legacy PROGRAM_NAME stays\) PASS
 FORBID K6-migrate:.*FAIL
 
+# --- BANDY-CODEC bus v1 subset codec witness (uncounted): reply bodies byte-compatible with the
+# --- HOST serializer (tools/bandy-golden captures — never hand-authored), the UnaOS-native request
+# --- header + typed ls/cat/cp payloads frozen, decoding fail-closed at the 4 KiB body ceiling.
+# --- BANDY-1 M1 (2026-07-16); read-only/in-RAM, runs every boot. ---------------------------------
+REQUIRE BANDY-CODEC:.*decode fail-closed.*PASS
+FORBID BANDY-CODEC:.*FAIL
+
 # NOTE (bench operators): these five are now hard REQUIREs. On a rare no-card / hub-MSC-vid=0000
 # boot the card-dependent selftests won't emit — re-seat the data card and re-boot (that IS the
 # recovery); don't demote the spec. The 3-of-4-core CAPSTONE variance is separate (see the header).

@@ -41,6 +41,10 @@ pub mod boot_tegra;
 pub mod sched;
 #[cfg(feature = "baremetal")]
 pub mod syscall;
+// BANDY-1 (ROADMAP §3b arc 1): the on-UnaOS SMessage bus — v1 subset codec (wire layer of the
+// SYS_MSEND/SYS_MRECV transport in syscall.rs). Baremetal-gated like syscall.rs (Pi 4 lane).
+#[cfg(feature = "baremetal")]
+pub mod bus;
 // JM3: Jetson Orin Nano (Tegra234) kernel-owned MMU. The tegra/UEFI build maps RAM Normal-WB + the
 // Tegra device windows Device-nGnRE before touching any peripheral MMIO (the R4 UARTC-fault fix).
 #[cfg(feature = "tegra")]

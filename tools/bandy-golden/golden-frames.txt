@@ -1,0 +1,7 @@
+ls_listing	{"TerminalOutput":"HELLO.BIN 1024\nK2OWN.BIN 512\n"}
+escapes	{"TerminalOutput":"line1\nline2\ttab\r\"quoted\" back\\slash\b\f"}
+control_byte	{"TerminalOutput":"ctl:\u0001\u001fend"}
+del_byte	{"TerminalOutput":"del:end"}
+empty	{"TerminalOutput":""}
+err_eacces	{"TerminalError":"cat: errno -13"}
+err_enoent	{"TerminalError":"cp: errno -2"}
