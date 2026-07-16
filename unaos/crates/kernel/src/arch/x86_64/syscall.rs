@@ -3156,15 +3156,16 @@ fn sys_write_file(row: usize, file_id: u64, buf: u64, len: u64) -> i64 {
     let Some(idx) = file_desc_validate(row, file_id) else {
         return EACCES;
     };
-    // STOR-1 S8 (irqstorage): a DYNAMIC on-disk descriptor (`open_dynamic_ondisk` — a pre-existing file neither
-    // staged nor a U10 name) opened RW writes THROUGH to the LIVE volume BY its stored NAME, synchronously and
-    // strictly OVERWRITE-ONLY. Keyed on `FILE_DYNLEN != 0` (set ONLY knob-on, so a knob-off build never enters
-    // this branch). A dynamic descriptor owns NO wstage (FILE_WSTAGE == 0), so it MUST resolve here — BEFORE the
-    // `FILE_WSTAGE == 0 -> EIO` guard below, which would otherwise reject it. Overwrite-only: `want` clamps to
-    // `[offset, EOF)`; a write AT/PAST EOF is a clean `return 0` (never grows — `write_at` by contract does not
-    // allocate clusters or touch the directory, so the on-disk SIZE stays == the descriptor's captured
-    // FILE_SIZE for the boot even as CONTENT changes). No `ns_lock` (a dynamic name is outside the U10 mutation
-    // namespace — the S5 deadlock class stays closed).
+    // STOR-1 S8/S9 (irqstorage): a DYNAMIC on-disk descriptor (`open_dynamic_ondisk` — a pre-existing file
+    // neither staged nor a U10 name) opened RW writes THROUGH to the LIVE volume BY its stored NAME,
+    // synchronously. Keyed on `FILE_DYNLEN != 0` (set ONLY knob-on, so a knob-off build never enters this
+    // branch). A dynamic descriptor owns NO wstage (FILE_WSTAGE == 0), so it MUST resolve here — BEFORE the
+    // `FILE_WSTAGE == 0 -> EIO` guard below, which would otherwise reject it. TWO regimes: an IN-EOF write
+    // (`offset + len <= size`) is the S8 OVERWRITE path — `want` clamps to `[offset, EOF)` and `write_at`
+    // (by contract no alloc, no directory touch) persists it in place; a write that extends PAST EOF is the
+    // S9 GROW path (`dyn_write_grow`), which allocates + chains + bumps the on-disk size via `write_grow`,
+    // bounded per-write (`DYN_GROW_MAX`) and per-file (`DYN_FILE_MAX`). No `ns_lock` EITHER way (a dynamic name
+    // is outside the U10 mutation namespace — the S5 deadlock class stays closed).
     #[cfg(feature = "irqstorage")]
     if FILE_DYNLEN[row][idx].load(Ordering::Acquire) != 0 {
         // Only ever created knob-on with the service up; fail closed defensively if the service is somehow not
@@ -3173,6 +3174,16 @@ fn sys_write_file(row: usize, file_id: u64, buf: u64, len: u64) -> i64 {
             return EIO;
         }
         let size = FILE_SIZE[row][idx].load(Ordering::Acquire);
+        // STOR-1 S9: a write that extends PAST EOF now GROWS the file synchronously (S8 returned 0 here — the
+        // overwrite-only constraint this arc retires). A dynamic RW descriptor lives only in a PRIVATE
+        // single-writer slot (`open_dynamic_ondisk` refuses RW on SHARED_ROW, mirroring `sys_open_staged`), so
+        // the offset load races nothing and the grow needs no CAS. `dyn_write_grow` bounds + persists it live
+        // (whole-op-or-error); a NON-growing write (`offset + len <= size`) falls through to the UNCHANGED S8
+        // overwrite path below. u64 math: `len` is the raw syscall arg; `offset`/`size` are u32.
+        let cur = FILE_OFFSET[row][idx].load(Ordering::Acquire);
+        if cur as u64 + len > size as u64 {
+            return dyn_write_grow(row, idx, cur, size, buf, len);
+        }
         // CAS-claim `[offset, offset+want)` exactly as `sys_read`/the in-place write below: clamp `want` to the
         // bytes left to EOF (overwrite-only — a past-EOF write is 0, never a grow), and validate the WHOLE
         // source range BEFORE the claim (a bad buffer is -EFAULT with NO claim, no copy, no offset move; the
@@ -3431,6 +3442,66 @@ fn sys_write_grow(row: usize, idx: usize, widx: usize, size: u32, offset: u32, b
     FILE_GREW[row][idx].store(true, Ordering::Release);
     FILE_OFFSET[row][idx].store(new_end, Ordering::Release); // offset LAST (size-before-offset)
     want as i64
+}
+
+/// STOR-1 S9: the GROWTH half of a DYNAMIC on-disk write — a past-EOF write on a dynamic RW descriptor
+/// (`FILE_DYNLEN != 0`) extends the file on the LIVE volume SYNCHRONOUSLY, through the storage service task's
+/// `Grow` op (`submit_grow` -> `service_grow_file` -> `fat::write_grow`: alloc + zero-fill + chain new clusters,
+/// RMW the data, bump the directory size LAST). This is the S4 `submit_grow` shape reused for a NON-staged file
+/// — a dynamic descriptor owns no wstage, so unlike `sys_write_grow` (which extends the one-page staging buffer
+/// and DEFERS the disk work) the extend lands straight on disk here.
+///
+/// GROWTH BOUNDS (both explicit + defended — unbounded growth off a syscall is a DoS surface):
+///  * PER-WRITE: `want` clamps to `DYN_GROW_MAX` (one page). ONE bounce buffer, ONE `submit_grow` — no chunk
+///    loop, so the persist is a single atomic op (see -EIO honesty below). A longer write returns the page-
+///    clamped count; the caller continues sequentially.
+///  * PER-FILE: the new EOF may not exceed `DYN_FILE_MAX` (64 KiB). An offset at/past the ceiling is `-ENOSPC`;
+///    a write that would cross it is clamped so `offset + want <= DYN_FILE_MAX`. Absolute (not opened-size
+///    relative), so a close+reopen cannot walk a file past the ceiling.
+///
+/// -EIO HONESTY (whole-op-or-error, mirroring S2/S3/S8): the grow is a SINGLE `submit_grow`; disk is written
+/// FIRST and only on success (`n >= 0`) are `FILE_SIZE` then `FILE_OFFSET` published (size-before-offset, so
+/// `FILE_OFFSET <= FILE_SIZE` is never even transiently violated). A failed grow returns `-EIO` with the
+/// descriptor UNTOUCHED (offset/size unchanged, never CAS-advanced) and the on-disk size unchanged — `write_grow`
+/// bumps the visible directory size LAST, so a mid-op failure leaves no half-acknowledged extend. A bad source
+/// buffer is `-EFAULT` with no copy, no size/offset move. No `ns_lock` (the dynamic path stays outside the U10
+/// namespace — the S5 deadlock class stays closed). Single-writer: a dynamic RW descriptor is never on
+/// SHARED_ROW (the open refuses it), so the un-CAS'd offset load in the caller races nothing.
+#[cfg(feature = "irqstorage")]
+fn dyn_write_grow(row: usize, idx: usize, offset: u32, size: u32, buf: u64, len: u64) -> i64 {
+    let off = offset as usize;
+    // PER-FILE ceiling: refuse an offset already at/past the cap (no room to grow), else the room left below it.
+    if off >= DYN_FILE_MAX {
+        return ENOSPC;
+    }
+    // PER-WRITE cap (one page) AND per-file room — `want` is the smaller. `want == 0` only if `off == DYN_FILE_MAX`
+    // (excluded above), so a legit grow always has room for at least one byte.
+    let mut want = core::cmp::min(len as usize, DYN_GROW_MAX);
+    want = core::cmp::min(want, DYN_FILE_MAX - off);
+    if want == 0 {
+        return ENOSPC;
+    }
+    // Validate the WHOLE (clamped) source READABLE in the window BEFORE any copy — a bad buffer is -EFAULT with
+    // no copy, no size/offset move (the code page is a legal RX source, so `UserAccess::Read` is the bound).
+    if let Err(e) = user_range_ok(buf, want as u64, UserAccess::Read) {
+        return e;
+    }
+    // Bounce the ring-3 source into a kernel-stack buffer the service task can reach (`want <= PAGE_SIZE` by the
+    // per-write cap), then GROW live. Persist to DISK FIRST; only on success mirror the new EOF into the
+    // descriptor (never in-memory-ahead-of-disk).
+    let mut kbuf = [0u8; PAGE_SIZE as usize];
+    if let Err(e) = copy_from_user(&mut kbuf[..want], buf) {
+        return e;
+    }
+    let n = unsafe { dyn_grow_live(row, idx, offset, kbuf.as_mut_ptr(), want) };
+    if n < 0 {
+        return EIO; // disk grow failed -> descriptor + on-disk size UNTOUCHED
+    }
+    let w = (n as usize).min(want); // bytes actually persisted (== want on a full write)
+    let new_end = offset + w as u32;
+    FILE_SIZE[row][idx].store(core::cmp::max(size, new_end), Ordering::Release);
+    FILE_OFFSET[row][idx].store(new_end, Ordering::Release); // offset LAST (size-before-offset)
+    w as i64
 }
 
 /// SYS_SEEK(handle, offset) -> the new absolute offset, or a negative errno (U9x; the aarch64 pi4 U9 twin).
@@ -4634,6 +4705,20 @@ static GROW_CLUSTER: AtomicU32 = AtomicU32::new(0);
 /// U10 GROW: the cap on a single growing write's in-memory extend (bounds the wstage span per call; the file
 /// stays within the one-page staging buffer). A longer write returns a short count. The demo appends 16 bytes.
 const GROW_WRITE_MAX: usize = 512;
+/// STOR-1 S9: the PER-WRITE growth cap for a DYNAMIC on-disk descriptor (`open_dynamic_ondisk` RW, past-EOF).
+/// A single `sys_write_file` grow persists at most one PAGE (4096 B) through ONE kernel bounce buffer and ONE
+/// atomic `submit_grow` — no chunk loop, so a failed grow is whole-op `-EIO` (never a masked partial). A longer
+/// write returns a short (page-clamped) count; the caller continues sequentially. Unlike the U10 `GROW_WRITE_MAX`
+/// (bounded by the one-page WSTAGE buffer a created/staged descriptor extends into), a dynamic descriptor owns
+/// NO wstage — its grow goes straight to the live volume — so the cap here bounds the disk work per syscall.
+const DYN_GROW_MAX: usize = PAGE_SIZE as usize;
+/// STOR-1 S9: the PER-FILE growth ceiling for the dynamic path — a dynamic descriptor may never grow a file's
+/// EOF beyond this (64 KiB). A write whose target offset is at/past the ceiling is refused `-ENOSPC`; a write
+/// that would cross it is clamped so `offset + want <= DYN_FILE_MAX`. This is the real DoS bound: unbounded
+/// growth off a syscall would let any ring-3 task exhaust the volume, and because the check is absolute (not
+/// relative to the opened size) a close+reopen cannot walk a file past the ceiling. Overwrite of a file already
+/// larger than the ceiling is unaffected (S8's overwrite path never enters the grow branch).
+const DYN_FILE_MAX: usize = 64 * 1024;
 /// U10 CREATE / DELETE: the runtime-created file names (absent from the staged set; the fixtures O_CREAT them).
 const U10C_NAME: &str = "FRESH.BIN";
 const U10D_NAME: &str = "DELME.BIN";
@@ -6373,6 +6458,14 @@ fn open_dynamic_ondisk(row: usize, name: &str, mode: u64) -> i64 {
     // in `sys_write_file`); RO keeps the S7 read-only cap. No wstage EITHER way — a dynamic descriptor never
     // stages (FILE_WSTAGE stays 0); its writes go straight to the live volume, its reads straight off it.
     let rw = mode & 1 != 0;
+    // STOR-1 S9: a RW dynamic descriptor must be a PRIVATE single-writer slot (mirroring `sys_open_staged`'s
+    // SHARED_ROW refusal) — the S9 grow path advances the offset un-CAS'd on the single-writer assumption, and
+    // SHARED_ROW is the multi-tenant kernel window where two tasks could race one writable descriptor. No
+    // fixture opens a dynamic file RW on SHARED_ROW; defensive, and it hardens the S8 overwrite path too (its
+    // CAS claim was the only guard before). RO dynamic opens (S7) are unaffected.
+    if rw && row == SHARED_ROW {
+        return EACCES;
+    }
     // Resolve on the LIVE volume via the service task (blocks — the caller is a scheduled AP task, exactly as
     // `sys_read`/`sys_write_file` already block). Returns the on-disk size (`>= 0`) or a negative errno.
     let rc = unsafe { crate::drivers::xhci::irqstorage::submit_stat(name.as_bytes()) };
@@ -6551,6 +6644,25 @@ unsafe fn dyn_write_live(row: usize, idx: usize, offset: u32, kbuf: *mut u8, len
         return EIO as i32; // FILE_DYNLEN said dynamic but the name is empty — a kernel bug; fail closed
     }
     unsafe { crate::drivers::xhci::irqstorage::submit_write_file(&namebuf[..nl], offset, kbuf, len) }
+}
+
+/// STOR-1 S9: the GROW twin of `dyn_write_live` for a DYNAMIC on-disk descriptor — resolve its stored 8.3 name
+/// (`FILE_DYNLEN`/`FILE_DYNNAME` via `dyn_name_get`) and `submit_grow` `[kbuf, kbuf+len)` at `offset` on the LIVE
+/// volume, EXTENDING the file (alloc + chain) when the write runs past EOF. This is the past-EOF write SOURCE
+/// `sys_write_file` routes a RW dynamic descriptor to knob-on (via `dyn_write_grow`), and the exact seam the S9
+/// grow witness drives with a kernel buffer. Returns the byte count written (`>= 0`) or `-EIO`. An empty name
+/// (`FILE_DYNLEN == 0` — the caller already gated on it being non-zero) is a kernel bug: fail closed `-EIO`
+/// rather than submitting an empty name. The PER-WRITE / PER-FILE growth CLAMPS live in the `dyn_write_grow`
+/// caller; `write_grow` grows from the file's live on-disk size. SAFETY: `kbuf` is a live kernel buffer of `>=
+/// len` bytes on the caller's stack; the caller is a scheduled task (so `submit_grow` can block on the service).
+#[cfg(feature = "irqstorage")]
+unsafe fn dyn_grow_live(row: usize, idx: usize, offset: u32, kbuf: *mut u8, len: usize) -> i32 {
+    let mut namebuf = [0u8; MAX_NAME];
+    let nl = dyn_name_get(row, idx, &mut namebuf);
+    if nl == 0 {
+        return EIO as i32; // FILE_DYNLEN said dynamic but the name is empty — a kernel bug; fail closed
+    }
+    unsafe { crate::drivers::xhci::irqstorage::submit_grow(&namebuf[..nl], offset, kbuf, len) }
 }
 
 /// SYS_READ(handle, buf, len) -> the byte count (`0` = EOF), or a negative errno. The object table's
