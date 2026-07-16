@@ -14,6 +14,16 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+//! The K8 (version 3) superblock: STATIC volume identity, written once at
+//! format time and never rewritten.
+//!
+//! Under the copy-on-write format every mutable fact about the volume (the
+//! live tree, allocation state, free-space count) lives in the tree reached
+//! from the [`root record`](crate::root::RootRecord) — block 0 carries only
+//! what never changes: the magic, the version, the geometry, and the two
+//! reserved logical inode ids. Commit never touches block 0, so the one
+//! at-rest mutation point of the whole volume is the 512 B root-sector flip.
+
 use crate::storage::{BLOCK_SIZE, Error as StorageError};
 use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
@@ -21,8 +31,24 @@ use thiserror::Error;
 
 /// The Magic Number for UnaFS: "UNAFS" in ASCII.
 pub const MAGIC: [u8; 5] = *b"UNAFS";
-/// The current version of the filesystem.
-pub const VERSION: u32 = 2; // Bumped version for Attribute Engine
+/// The current version of the filesystem (3 = the K8 copy-on-write format).
+pub const VERSION: u32 = 3;
+
+/// Reserved logical inode ids (stable across every mutation — Fork-1 verdict:
+/// inode ids are LOGICAL; the inode map carries id → current physical block).
+pub const ROOT_INODE_ID: u64 = 1;
+/// The attribute catalog (a `System` inode).
+pub const CATALOG_INODE_ID: u64 = 2;
+/// The snapshot index — itself a UnaFS object (a `System` inode whose data is
+/// the serialized snapshot entry list). v1 policy caps it at
+/// [`SNAPSHOT_CAP`](crate::fs::SNAPSHOT_CAP) entries; the cap is policy, not
+/// structure.
+pub const SNAP_INDEX_INODE_ID: u64 = 3;
+/// The persistent reclaim queue — a UnaFS object (a `System` inode whose data
+/// is the serialized queue). Dropped roots enqueue here; v1 drains eagerly.
+pub const RECLAIM_INODE_ID: u64 = 4;
+/// First logical inode id handed to user objects.
+pub const FIRST_USER_INODE_ID: u64 = 5;
 
 #[derive(Error, Debug)]
 pub enum SuperblockError {
@@ -42,7 +68,9 @@ pub enum SuperblockError {
     Geometry(&'static str),
 }
 
-/// The Superblock resides at Block 0 and describes the filesystem layout.
+/// The Superblock resides at Block 0 and identifies the volume. Static: every
+/// field is fixed at format time (BEFS-HARDEN validation still applies — the
+/// volume is untrusted input and `block_count` bounds every later access).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct Superblock {
     /// Magic number to identify the filesystem.
@@ -53,60 +81,22 @@ pub struct Superblock {
     pub block_size: u32,
     /// Total number of blocks in the device.
     pub block_count: u64,
-    /// The block ID of the root inode.
+    /// The LOGICAL inode id of the root directory (always [`ROOT_INODE_ID`]).
     pub root_inode: u64,
-    /// Number of free blocks available.
-    pub free_blocks: u64,
-    /// The starting block of the allocation bitmap.
-    pub bitmap_start: u64,
-    /// The number of blocks occupied by the bitmap.
-    pub bitmap_blocks: u64,
-
-    // --- UNAFS 2.0: The Semantic Vault ---
-    /// The starting block of the Write-Ahead Log (WAL).
-    pub journal_start: u64,
-    /// The number of blocks reserved for the WAL.
-    pub journal_blocks: u64,
-
-    /// The Inode ID of the Attribute Catalog (System File).
+    /// The LOGICAL inode id of the attribute catalog ([`CATALOG_INODE_ID`]).
     pub catalog_inode: u64,
 }
 
 impl Superblock {
     /// Create a new Superblock for a device with the given block count.
-    /// Calculates the bitmap size and placement automatically.
     pub fn new(block_count: u64) -> Self {
-        // Calculate bitmap size.
-        let bitmap_bytes = block_count.div_ceil(8);
-        let bitmap_blocks = bitmap_bytes.div_ceil(BLOCK_SIZE);
-
-        // Layout:
-        // Block 0: Superblock
-        // Block 1..11: Journal (10 blocks)
-        // Block 11..(11+bitmap_blocks): Bitmap
-
-        let journal_start = 1;
-        let journal_blocks = 10;
-
-        let bitmap_start = journal_start + journal_blocks;
-
-        // Total used blocks initially: Superblock (1) + Journal (10) + Bitmap blocks.
-        // Root inode and Catalog inode will be allocated later.
-        let initial_used = 1 + journal_blocks + bitmap_blocks;
-        let free_blocks = block_count.saturating_sub(initial_used);
-
         Self {
             magic: MAGIC,
             version: VERSION,
             block_size: BLOCK_SIZE as u32,
             block_count,
-            root_inode: 0, // Will be set after allocation
-            free_blocks,
-            bitmap_start,
-            bitmap_blocks,
-            journal_start,
-            journal_blocks,
-            catalog_inode: 0, // Will be set after allocation
+            root_inode: ROOT_INODE_ID,
+            catalog_inode: CATALOG_INODE_ID,
         }
     }
 
@@ -127,8 +117,6 @@ impl Superblock {
         if sb.magic != MAGIC {
             return Err(SuperblockError::InvalidMagic);
         }
-        // Backward compatibility: If we were really maintaining it, we would check version.
-        // But for this exercise, we are upgrading the format entirely.
         if sb.version != VERSION {
             return Err(SuperblockError::InvalidVersion(sb.version));
         }
@@ -144,15 +132,11 @@ impl Superblock {
         Ok(sb)
     }
 
-    /// Bound every on-disk-derived block-count/offset field against the
-    /// volume span the superblock itself declares (BEFS-HARDEN).
-    ///
-    /// The volume is untrusted input: a physically swapped or corrupted card
-    /// reaches this parser in-kernel (BeFS-K3), so any field that later
-    /// drives an allocation or a block address must be rejected here — at
-    /// the boundary — rather than trusted downstream. Validation only: every
-    /// volume `format()` has ever produced passes unchanged (the golden KATs
-    /// pin this).
+    /// Bound every on-disk-derived field against the volume span the
+    /// superblock itself declares (BEFS-HARDEN). The volume is untrusted
+    /// input: a physically swapped or corrupted card reaches this parser
+    /// in-kernel, so anything that later drives an allocation or a block
+    /// address is rejected here, at the boundary.
     pub fn validate(&self) -> Result<(), SuperblockError> {
         // The volume byte size must be representable, since read paths bound
         // lengths against `block_count * BLOCK_SIZE`.
@@ -161,54 +145,21 @@ impl Superblock {
             .checked_mul(BLOCK_SIZE)
             .ok_or(SuperblockError::Geometry("volume byte size overflows"))?;
 
-        // The WAL addresses the journal via its compile-time layout constants
-        // (`wal::JOURNAL_START`/`JOURNAL_BLOCKS`); a superblock declaring any
-        // other journal placement describes a volume this code never wrote.
-        if self.journal_start != crate::wal::JOURNAL_START
-            || self.journal_blocks != crate::wal::JOURNAL_BLOCKS
-        {
-            return Err(SuperblockError::Geometry("journal layout mismatch"));
-        }
-        let journal_end = self
-            .journal_start
-            .checked_add(self.journal_blocks)
-            .ok_or(SuperblockError::Geometry("journal span overflows"))?;
-        if journal_end > self.block_count {
-            return Err(SuperblockError::Geometry("journal exceeds volume"));
+        // Superblock (0) + root area (1) + at least one tree block.
+        if self.block_count < 3 {
+            return Err(SuperblockError::Geometry("volume too small"));
         }
 
-        // The bitmap must be exactly the size the declared block count
-        // implies (what `Superblock::new` computes), and must lie after the
-        // superblock and inside the volume. `bitmap_blocks` sizes the mount-
-        // time bitmap allocation, so this is the K3-PARSE-1 bound.
-        let expected_bitmap_blocks = self.block_count.div_ceil(8).div_ceil(BLOCK_SIZE);
-        if self.bitmap_blocks != expected_bitmap_blocks {
+        // The reserved logical ids are format constants.
+        if self.root_inode != ROOT_INODE_ID {
             return Err(SuperblockError::Geometry(
-                "bitmap size inconsistent with block count",
+                "root inode id not the reserved id",
             ));
         }
-        if self.bitmap_start == 0 {
-            return Err(SuperblockError::Geometry("bitmap overlaps superblock"));
-        }
-        let bitmap_end = self
-            .bitmap_start
-            .checked_add(self.bitmap_blocks)
-            .ok_or(SuperblockError::Geometry("bitmap span overflows"))?;
-        if bitmap_end > self.block_count {
-            return Err(SuperblockError::Geometry("bitmap exceeds volume"));
-        }
-
-        // Inode ids are used directly as block addresses.
-        if self.root_inode == 0 || self.root_inode >= self.block_count {
-            return Err(SuperblockError::Geometry("root inode out of bounds"));
-        }
-        // `catalog_inode == 0` means "no catalog" (checked at every use).
-        if self.catalog_inode >= self.block_count {
-            return Err(SuperblockError::Geometry("catalog inode out of bounds"));
-        }
-
-        if self.free_blocks > self.block_count {
-            return Err(SuperblockError::Geometry("free blocks exceed volume"));
+        if self.catalog_inode != CATALOG_INODE_ID {
+            return Err(SuperblockError::Geometry(
+                "catalog inode id not the reserved id",
+            ));
         }
 
         Ok(())

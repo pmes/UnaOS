@@ -14,19 +14,20 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! BEFS-HARDEN: hostile/corrupt volume fixtures for the on-disk parser.
+//! BEFS-HARDEN: hostile/corrupt volume fixtures for the on-disk parser —
+//! K8 (v3) edition: the superblock is static identity, the mutable geometry
+//! lives in the ROOT RECORD, and the inode map is disk-derived input too.
 //!
 //! Every test crafts a volume a physically swapped or corrupted card could
-//! present (the parser is kernel-reachable via the BeFS-K3 RO mount) and
-//! asserts the library answers with a graceful `Err` — never a panic, a
-//! capacity overflow, or an OOM abort. `#[should_panic]` is deliberately
-//! absent: a panic IS the defect class under test.
+//! present (the parser is kernel-reachable via the kernel mount) and asserts
+//! the library answers with a graceful `Err` — never a panic, a capacity
+//! overflow, or an OOM abort.
 
-use unafs::bitmap::SpaceMap;
 use unafs::fs::FileSystemError;
-use unafs::storage::Error as StorageError;
+use unafs::root::{ROOT_BLOCK, ROOT_SECTOR_SIZE};
 use unafs::{
-    AttributeValue, BLOCK_SIZE, BlockDevice, Extent, Inode, MemDevice, Superblock, UnaFS,
+    AttributeValue, BLOCK_SIZE, BlockDevice, Extent, Inode, MemDevice, RootRecord, Superblock,
+    UnaFS,
 };
 
 /// A pre-sized in-memory device (MemDevice grows on write; reads past the
@@ -44,8 +45,7 @@ fn formatted(size_mb: u64) -> UnaFS<MemDevice> {
     UnaFS::format(sized_device(size_mb), size_mb).expect("format must succeed")
 }
 
-/// Format a small valid volume and hand back the raw device (post-format,
-/// superblock synced).
+/// Format a small valid volume and hand back the raw device.
 fn valid_volume() -> MemDevice {
     formatted(16).device.clone()
 }
@@ -64,6 +64,34 @@ fn with_corrupt_sb(dev: &MemDevice, mutate: impl FnOnce(&mut Superblock)) -> Mem
     dev
 }
 
+/// Clone `dev` and rewrite its ACTIVE root record (checksummed, so the
+/// hostile record PARSES — the field bounds are what must refuse it).
+fn with_corrupt_root(dev: &MemDevice, mutate: impl FnOnce(&mut RootRecord)) -> MemDevice {
+    let mut dev = dev.clone();
+    let mut block = vec![0u8; BLOCK_SIZE as usize];
+    dev.read_block(ROOT_BLOCK, &mut block).expect("read root block");
+    let a = RootRecord::from_sector(&block[0..ROOT_SECTOR_SIZE]);
+    let b = RootRecord::from_sector(&block[ROOT_SECTOR_SIZE..2 * ROOT_SECTOR_SIZE]);
+    let (mut rec, slot_a) = match (a, b) {
+        (Some(ra), Some(rb)) => {
+            if ra.generation >= rb.generation {
+                (ra, true)
+            } else {
+                (rb, false)
+            }
+        }
+        (Some(ra), None) => (ra, true),
+        (None, Some(rb)) => (rb, false),
+        (None, None) => panic!("valid volume must carry a root record"),
+    };
+    mutate(&mut rec);
+    let bytes = rec.to_bytes();
+    let off = if slot_a { 0 } else { ROOT_SECTOR_SIZE };
+    block[off..off + bytes.len()].copy_from_slice(&bytes);
+    dev.write_block(ROOT_BLOCK, &block).expect("write root block");
+    dev
+}
+
 #[test]
 fn pristine_volume_still_mounts_and_lists() {
     // Positive control: hardening must not reject a valid volume.
@@ -74,39 +102,7 @@ fn pristine_volume_still_mounts_and_lists() {
     assert!(entries.is_empty());
 }
 
-#[test]
-fn oversized_bitmap_blocks_refused_at_mount() {
-    // K3-PARSE-1: bitmap_blocks ~12289 drove a ~50 MiB mount-time allocation.
-    // The geometry bound now refuses it before any allocation happens.
-    let dev = valid_volume();
-    let hostile = with_corrupt_sb(&dev, |sb| sb.bitmap_blocks = 12289);
-    assert!(UnaFS::mount(hostile).is_err());
-}
-
-#[test]
-fn absurd_bitmap_blocks_refused_not_capacity_panic() {
-    // K3-PARSE-1: 2^51 bitmap blocks used to be a capacity-overflow panic.
-    let dev = valid_volume();
-    let hostile = with_corrupt_sb(&dev, |sb| sb.bitmap_blocks = 1 << 51);
-    assert!(UnaFS::mount(hostile).is_err());
-}
-
-#[test]
-fn spacemap_load_with_absurd_count_is_graceful() {
-    // Defense in depth below the superblock bound: even a direct load with a
-    // hostile count must fail with AllocRefused, not abort/panic.
-    let mut dev = valid_volume();
-    match SpaceMap::load(&mut dev, 11, 1 << 51) {
-        Err(StorageError::AllocRefused(_)) => {}
-        Err(other) => panic!("expected AllocRefused, got {other:?}"),
-        Ok(_) => panic!("hostile bitmap count must not load"),
-    }
-    // And the multiplication-overflow flavor (count * BLOCK_SIZE wraps).
-    assert!(matches!(
-        SpaceMap::load(&mut dev, 11, u64::MAX / 8),
-        Err(StorageError::AllocRefused(_))
-    ));
-}
+// --- Superblock (static identity) bounds -------------------------------------
 
 #[test]
 fn block_count_overflowing_volume_bytes_refused() {
@@ -116,63 +112,125 @@ fn block_count_overflowing_volume_bytes_refused() {
 }
 
 #[test]
-fn root_inode_out_of_bounds_refused() {
+fn non_reserved_root_inode_id_refused() {
     let dev = valid_volume();
-    let past_end = with_corrupt_sb(&dev, |sb| sb.root_inode = sb.block_count + 5);
-    assert!(UnaFS::mount(past_end).is_err());
-
+    let wrong = with_corrupt_sb(&dev, |sb| sb.root_inode = 9);
+    assert!(UnaFS::mount(wrong).is_err());
     let zero = with_corrupt_sb(&dev, |sb| sb.root_inode = 0);
     assert!(UnaFS::mount(zero).is_err());
 }
 
 #[test]
-fn catalog_inode_out_of_bounds_refused() {
+fn non_reserved_catalog_inode_id_refused() {
     let dev = valid_volume();
-    let hostile = with_corrupt_sb(&dev, |sb| sb.catalog_inode = sb.block_count);
+    let hostile = with_corrupt_sb(&dev, |sb| sb.catalog_inode = 40);
     assert!(UnaFS::mount(hostile).is_err());
 }
 
 #[test]
-fn bitmap_span_past_volume_end_refused() {
+fn tiny_volume_refused() {
     let dev = valid_volume();
-    // Keep bitmap_blocks self-consistent but push the span off the end.
-    let hostile = with_corrupt_sb(&dev, |sb| sb.bitmap_start = sb.block_count);
+    let hostile = with_corrupt_sb(&dev, |sb| sb.block_count = 2);
     assert!(UnaFS::mount(hostile).is_err());
+}
 
-    // And the wrapping flavor.
-    let wrapping = with_corrupt_sb(&dev, |sb| sb.bitmap_start = u64::MAX);
-    assert!(UnaFS::mount(wrapping).is_err());
+// --- Root-record (mutable geometry) bounds — K3-PARSE-1's K8 successor -------
+
+#[test]
+fn hostile_imap_leaf_count_refused_at_mount() {
+    let dev = valid_volume();
+    // Zero leaves: structurally impossible (the reserved inodes exist).
+    let zero = with_corrupt_root(&dev, |r| r.imap_leaves = 0);
+    assert!(UnaFS::mount(zero).is_err());
+    // A leaf count past the one-indirect-block structure.
+    let huge = with_corrupt_root(&dev, |r| r.imap_leaves = (BLOCK_SIZE / 8) + 1);
+    assert!(UnaFS::mount(huge).is_err());
+    // An absurd count that would demand a giant allocation.
+    let absurd = with_corrupt_root(&dev, |r| {
+        r.imap_leaves = u64::MAX / 8;
+        r.next_inode = u64::MAX / 16;
+    });
+    assert!(UnaFS::mount(absurd).is_err());
 }
 
 #[test]
-fn journal_layout_mismatch_refused() {
-    // The WAL addresses the journal via compile-time constants; a superblock
-    // declaring any other placement describes a volume this code never wrote.
+fn hostile_next_inode_refused_at_mount() {
     let dev = valid_volume();
-    let moved = with_corrupt_sb(&dev, |sb| sb.journal_start = 2);
-    assert!(UnaFS::mount(moved).is_err());
-
-    let resized = with_corrupt_sb(&dev, |sb| sb.journal_blocks = 1 << 40);
-    assert!(UnaFS::mount(resized).is_err());
+    // next_inode beyond what the declared leaves can hold: refused before
+    // any allocation is sized from it.
+    let hostile = with_corrupt_root(&dev, |r| r.next_inode = r.imap_leaves * (BLOCK_SIZE / 8) + 1);
+    assert!(UnaFS::mount(hostile).is_err());
+    let zero = with_corrupt_root(&dev, |r| r.next_inode = 0);
+    assert!(UnaFS::mount(zero).is_err());
 }
 
 #[test]
-fn free_blocks_exceeding_volume_refused() {
+fn imap_index_out_of_bounds_refused() {
     let dev = valid_volume();
-    let hostile = with_corrupt_sb(&dev, |sb| sb.free_blocks = sb.block_count + 1);
+    let past = with_corrupt_root(&dev, |r| r.imap_block = u64::MAX - 5);
+    assert!(UnaFS::mount(past).is_err());
+    let zero = with_corrupt_root(&dev, |r| r.imap_block = 0);
+    assert!(UnaFS::mount(zero).is_err());
+}
+
+#[test]
+fn refmap_size_mismatch_refused() {
+    // The refcount map's leaf count is a pure function of the volume
+    // geometry; any other declaration describes a volume this code never
+    // wrote (the old "bitmap size inconsistent" bound, reborn).
+    let dev = valid_volume();
+    let hostile = with_corrupt_root(&dev, |r| r.refmap_leaves += 1);
     assert!(UnaFS::mount(hostile).is_err());
+    let oob = with_corrupt_root(&dev, |r| r.refmap_block = u64::MAX - 5);
+    assert!(UnaFS::mount(oob).is_err());
+}
+
+#[test]
+fn imap_leaf_pointer_out_of_bounds_refused() {
+    // Corrupt the imap INDEX block: leaf pointer 0 → past the volume.
+    let fs = formatted(16);
+    let mut dev = fs.device.clone();
+    let block_count = fs.superblock.block_count;
+    drop(fs);
+    let (rr, _) = unafs::root::read_active(&mut dev).unwrap().unwrap();
+    let mut index = vec![0u8; BLOCK_SIZE as usize];
+    dev.read_block(rr.imap_block, &mut index).unwrap();
+    index[0..8].copy_from_slice(&(block_count + 100).to_le_bytes());
+    dev.write_block(rr.imap_block, &index).unwrap();
+    assert!(UnaFS::mount(dev).is_err());
+}
+
+#[test]
+fn imap_entry_out_of_bounds_refused() {
+    // Corrupt an imap LEAF: point a logical id past the volume.
+    let fs = formatted(16);
+    let mut dev = fs.device.clone();
+    let block_count = fs.superblock.block_count;
+    drop(fs);
+    let (rr, _) = unafs::root::read_active(&mut dev).unwrap().unwrap();
+    let mut index = vec![0u8; BLOCK_SIZE as usize];
+    dev.read_block(rr.imap_block, &mut index).unwrap();
+    let leaf0 = u64::from_le_bytes(index[0..8].try_into().unwrap());
+    let mut leaf = vec![0u8; BLOCK_SIZE as usize];
+    dev.read_block(leaf0, &mut leaf).unwrap();
+    // Entry for logical id 1 (the root directory).
+    leaf[8..16].copy_from_slice(&(block_count + 7).to_le_bytes());
+    dev.write_block(leaf0, &leaf).unwrap();
+    assert!(UnaFS::mount(dev).is_err());
 }
 
 // --- Read-path hardening (K3-PARSE-2/4 + the QSIM-flagged query surface) ---
 
-/// Rewrite inode `id` on the live filesystem's device after applying `mutate`.
+/// Rewrite inode `id`'s CURRENT block on the live filesystem's device after
+/// applying `mutate` — raw media corruption, bypassing the CoW path.
 fn corrupt_inode(fs: &mut UnaFS<MemDevice>, id: u64, mutate: impl FnOnce(&mut Inode)) {
+    let pb = fs.inode_block(id).expect("inode allocated before corruption");
     let mut inode = fs.read_inode(id).expect("inode readable before corruption");
     mutate(&mut inode);
     let bytes = inode.to_bytes().expect("hostile inode still serializes");
     let mut block = vec![0u8; BLOCK_SIZE as usize];
     block[..bytes.len()].copy_from_slice(&bytes);
-    fs.device.write_block(id, &block).expect("write inode block");
+    fs.device.write_block(pb, &block).expect("write inode block");
 }
 
 #[test]
@@ -227,6 +285,9 @@ fn overflowing_extent_span_read_is_graceful() {
         fs.read_data(id, 0, 5),
         Err(FileSystemError::CorruptVolume(_))
     ));
+    // The CoW WRITE path materializes the same disk-derived extents — it
+    // must refuse the same geometry, not wrap.
+    assert!(fs.write_data(id, 0, b"x").is_err());
 }
 
 #[test]
@@ -244,6 +305,7 @@ fn extent_pointing_past_volume_read_is_graceful() {
         fs.read_data(id, 0, 5),
         Err(FileSystemError::CorruptVolume(_))
     ));
+    assert!(fs.write_data(id, 0, b"x").is_err());
 
     // And the wrapping flavor: physical_block + block_idx overflows.
     corrupt_inode(&mut fs, id, |inode| {
@@ -273,6 +335,20 @@ fn sparse_hole_read_stays_bounded_and_bulk() {
     let data = fs.read_data(id, 0, size).expect("sparse read succeeds");
     assert_eq!(data.len() as u64, size);
     assert!(data.iter().all(|&b| b == 0));
+}
+
+#[test]
+fn inode_id_mismatch_refused() {
+    // A block whose decoded inode claims a DIFFERENT logical id than the
+    // map slot that reached it: cross-linked map corruption, refused.
+    let mut fs = formatted(16);
+    let root = fs.superblock.root_inode;
+    let id = fs.create_file(root, "victim".into()).unwrap();
+    corrupt_inode(&mut fs, id, |inode| inode.id += 1000);
+    assert!(matches!(
+        fs.read_inode(id),
+        Err(FileSystemError::CorruptVolume(_))
+    ));
 }
 
 #[test]
@@ -316,22 +392,15 @@ fn hostile_spilled_attribute_extents_fail_query_not_panic() {
 }
 
 // --- Codec-level hardening (K3-PARSE-3: hostile bincode length prefixes) ---
-//
-// bincode's owned-bytes decode (String / Vec<u8>) allocates from the CLAIMED
-// length before reading any payload; under the old no-limit config a crafted
-// prefix drove an unbounded infallible allocation. The budgeted decodes must
-// refuse the claim instead.
 
 #[test]
 fn hostile_string_prefix_in_inode_block_refused() {
     // A 4 KiB inode block whose attribute-key length claims ~2^62 bytes.
     let mut inode = Inode::new(12, unafs::FileKind::File);
-    inode
-        .attributes
-        .insert("kk".into(), AttributeValue::Int(7));
+    inode.attributes.insert("kk".into(), AttributeValue::Int(7));
     let mut bytes = inode.to_bytes().unwrap();
 
-    // Legacy layout: id u64 | kind u32 | size u64 | chunks len u64 |
+    // Layout: id u64 | kind u32 | size u64 | chunks len u64 |
     // attributes len u64 | first key len u64 | ...
     let key_len_off = 8 + 4 + 8 + 8 + 8;
     assert_eq!(

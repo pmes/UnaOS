@@ -21,7 +21,7 @@
 
 use unafs::fs::FileSystemError;
 use unafs::inode::FileKind;
-use unafs::{AttributeValue, BLOCK_SIZE, BlockDevice, Journal, MemDevice, UnaFS};
+use unafs::{AttributeValue, BLOCK_SIZE, BlockDevice, MemDevice, UnaFS};
 
 /// Format a fresh in-memory volume of `block_count` blocks.
 fn fresh_fs(block_count: u64) -> UnaFS<MemDevice> {
@@ -120,7 +120,7 @@ fn unlink_free_space_round_trips_and_blocks_reuse() {
     )
     .unwrap();
 
-    let free_before = fs.superblock.free_blocks;
+    let free_before = fs.free_blocks();
 
     // Doomed file: inode block + 2 data blocks + spilled attribute extents.
     let doomed_id = fs.create_file(root_id, "bulky.bin".to_string()).unwrap();
@@ -134,12 +134,13 @@ fn unlink_free_space_round_trips_and_blocks_reuse() {
     )
     .unwrap();
 
-    let free_during = fs.superblock.free_blocks;
+    let free_during = fs.free_blocks();
     assert!(free_during < free_before, "creation must consume blocks");
 
-    // Track the doomed footprint for the reuse witness below.
+    // Track the doomed PHYSICAL footprint for the reuse witness below
+    // (inode ids are logical under K8 — the reuse question is about blocks).
     let doomed_inode = fs.read_inode(doomed_id).unwrap();
-    let mut max_freed = doomed_id;
+    let mut max_freed = fs.inode_block(doomed_id).unwrap();
     for extent in doomed_inode
         .chunks
         .iter()
@@ -154,17 +155,22 @@ fn unlink_free_space_round_trips_and_blocks_reuse() {
     // Exact free-space round-trip: every block the file consumed (inode,
     // data, spill) came back, and the catalog/directory rewrites netted out.
     assert_eq!(
-        fs.superblock.free_blocks, free_before,
+        fs.free_blocks(),
+        free_before,
         "free-space accounting must round-trip across create+unlink"
     );
 
-    // Reuse witness: the first-fit allocator hands the next inode a block
-    // from the freed pool (at or below the doomed file's high-water mark).
+    // Reuse witness: after the unlink's COMMIT retired the old tree, the
+    // first-fit allocator hands the next inode a PHYSICAL block from the
+    // freed pool (at or below the doomed file's high-water mark). The
+    // logical id, by contrast, is never recycled.
     let reborn_id = fs.create_file(root_id, "reborn.txt".to_string()).unwrap();
+    assert!(reborn_id > doomed_id, "logical ids must never be recycled");
+    let reborn_block = fs.inode_block(reborn_id).unwrap();
     assert!(
-        reborn_id <= max_freed,
+        reborn_block <= max_freed,
         "expected first-fit reuse of a freed block: got {} > {}",
-        reborn_id,
+        reborn_block,
         max_freed
     );
 
@@ -197,7 +203,7 @@ fn rename_same_directory_old_gone_new_found_content_identical() {
     )
     .unwrap();
 
-    let free_before = fs.superblock.free_blocks;
+    let free_before = fs.free_blocks();
     fs.rename(root_id, "draft.txt", root_id, "final.txt")
         .expect("rename failed");
 
@@ -223,7 +229,7 @@ fn rename_same_directory_old_gone_new_found_content_identical() {
     assert_eq!(results[0].0.id, file_id);
 
     // A pure rename allocates nothing net (directory rewrite nets to zero).
-    assert_eq!(fs.superblock.free_blocks, free_before);
+    assert_eq!(fs.free_blocks(), free_before);
 }
 
 #[test]
@@ -365,7 +371,7 @@ fn remove_attribute_spilled_frees_extents() {
     fs.set_attribute(file_id, "kept".to_string(), AttributeValue::Int(1))
         .unwrap();
 
-    let free_before = fs.superblock.free_blocks;
+    let free_before = fs.free_blocks();
 
     // 200 floats: over the 64-float inline threshold, spills to extents.
     let big: Vec<f32> = (0..200).map(|i| i as f32 * 0.5).collect();
@@ -382,7 +388,7 @@ fn remove_attribute_spilled_frees_extents() {
             .contains_key("embedding"),
         "test premise: the vector must have spilled"
     );
-    assert!(fs.superblock.free_blocks < free_before);
+    assert!(fs.free_blocks() < free_before);
 
     fs.remove_attribute(file_id, "embedding")
         .expect("remove_attribute failed");
@@ -397,7 +403,7 @@ fn remove_attribute_spilled_frees_extents() {
 
     // The spilled extents came back: free space round-trips exactly.
     assert_eq!(
-        fs.superblock.free_blocks, free_before,
+        fs.free_blocks(), free_before,
         "spilled-attribute extents must be freed"
     );
 
@@ -452,15 +458,15 @@ fn mutated_volume_remounts_clean() {
     let device = fs.device.clone();
     drop(fs);
 
-    // The journal witness: every mutation closed its transaction, so a
-    // fresh recovery scan must report the volume CLEAN.
-    let mut probe = device.clone();
-    let dirty = Journal::new()
-        .check_recovery(&mut probe)
-        .expect("recovery scan failed");
-    assert!(!dirty, "mutated volume must re-mount clean, not dirty");
-
     let mut fs2 = UnaFS::mount(device).expect("re-mount failed");
+
+    // The CoW cleanliness witness: every mutation committed atomically, so
+    // the remounted volume is refcount-consistent with nothing leaked.
+    let report = fs2.fsck(false).expect("fsck");
+    assert!(
+        report.is_clean(),
+        "mutated volume must re-mount clean: {report:?}"
+    );
 
     // Structure survived: the junk is gone everywhere, the treasure moved.
     assert!(fs2.resolve_path("/docs/junk.txt").is_err());

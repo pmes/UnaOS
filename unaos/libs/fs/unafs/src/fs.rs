@@ -14,12 +14,40 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use crate::bitmap::SpaceMap;
+//! K8a: the COPY-ON-WRITE UnaFS core.
+//!
+//! Every mutation allocates fresh blocks — nothing reachable from the last
+//! committed root is EVER overwritten in place. Each public mutating
+//! operation is one transaction: CoW the affected data/metadata to fresh
+//! blocks, then [`commit`](UnaFS::commit) — persist the inode map and the
+//! refcount map (themselves CoW), barrier, and flip ONE 512 B root sector
+//! (A/B generation-stamped slots, `root.rs`). A power cut at any point yields
+//! the old tree or the new tree, never a hybrid; the WAL is gone — atomicity
+//! is structural, not logged.
+//!
+//! * **Inode identity (Fork-1 verdict):** inode ids are STABLE LOGICAL
+//!   numbers; the inode map (`imap`, a CoW'd on-disk object) carries
+//!   id → current physical block. Directory entries, catalog entries, and
+//!   the kernel's K6 ACL keys survive every mutation unchanged.
+//! * **Allocation:** a refcount map ([`crate::refmap::RefMap`]) — free ⇔
+//!   reachable from no retained root. Its two-view (`current`/`frozen`)
+//!   allocate discipline is what enforces never-overwrite-in-place.
+//! * **Future shape, day one:** the root reaches a SNAPSHOT INDEX and a
+//!   persistent RECLAIM QUEUE, both ordinary UnaFS objects (`System` inodes
+//!   at reserved logical ids). v1 policy: snapshot cap 16 ([`SNAPSHOT_CAP`]),
+//!   reclaim drains eagerly (a non-empty queue found at mount is drained
+//!   before the mount returns — a half-drained queue is crash-safe because
+//!   the drain itself is one commit).
+
 use crate::catalog::{CatalogEntry, deserialize_catalog, serialize_catalog};
 use crate::inode::{AttributeValue, Extent, ExtentList, FileKind, Inode, InodeError};
+use crate::refmap::RefMap;
+use crate::root::{ROOT_BLOCK, RootRecord, RootSlot};
 use crate::storage::{BLOCK_SIZE, BlockDevice, Error as StorageError};
-use crate::superblock::{Superblock, SuperblockError};
-use crate::wal::{Journal, JournalOp};
+use crate::superblock::{
+    CATALOG_INODE_ID, RECLAIM_INODE_ID, ROOT_INODE_ID, SNAP_INDEX_INODE_ID, Superblock,
+    SuperblockError,
+};
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -31,6 +59,15 @@ use crate::hash::hash_bytes;
 use crate::query::{Query, QueryOp};
 #[cfg(feature = "std")]
 use bandy::{BandyMember, SMessage};
+
+/// Inode-map entries (u64 physical-block pointers) per 4096 B leaf block.
+pub const IMAP_ENTRIES_PER_LEAF: u64 = BLOCK_SIZE / 8;
+/// Leaf pointers per index block — bounds the map at one indirect level.
+pub const IMAP_MAX_LEAVES: u64 = BLOCK_SIZE / 8;
+
+/// v1 snapshot-retention POLICY cap (the structure is unbounded: the index is
+/// an ordinary growable UnaFS object; lifting the cap is a constant change).
+pub const SNAPSHOT_CAP: usize = 16;
 
 #[derive(Error, Debug)]
 pub enum FileSystemError {
@@ -52,8 +89,6 @@ pub enum FileSystemError {
     FileExists,
     #[error("Attribute too large for inline storage")]
     AttributeTooLarge,
-    #[error("Journal error: {0}")]
-    Journal(#[from] crate::wal::JournalError),
     #[error("Invalid Attribute Data")]
     InvalidAttributeData,
     #[error("Query error: {0}")]
@@ -70,7 +105,7 @@ pub enum FileSystemError {
     CorruptVolume(&'static str),
 }
 
-/// A directory entry pointing to an inode.
+/// A directory entry pointing to an inode (by stable LOGICAL id).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, PartialOrd)]
 pub struct DirEntry {
     pub name: String,
@@ -78,191 +113,612 @@ pub struct DirEntry {
     pub kind: FileKind,
 }
 
+/// One retained root in the snapshot index (K8b populates these; the on-disk
+/// object exists — empty — from format time, so retention is a code change,
+/// never a format migration).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct SnapshotEntry {
+    /// The commit generation this snapshot retains.
+    pub generation: u64,
+    /// The retained root's inode-map index block + leaf count (everything a
+    /// two-root diff walk needs).
+    pub imap_block: u64,
+    pub imap_leaves: u64,
+    /// K6 typed attributes ride the entry: name, creator principal, timestamp.
+    pub name: String,
+    pub creator: String,
+    pub timestamp: u64,
+}
+
+/// One dropped root awaiting reclamation. Drop NEVER frees blocks directly —
+/// it enqueues; the drain decrefs. v1 drains eagerly (to empty before the
+/// dropping call returns / before a mount completes); background mode later
+/// is the same queue drained by a worker. Crash-safe: the whole drain is one
+/// commit, so a power cut mid-drain resumes from the full queue on next mount.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ReclaimEntry {
+    /// The dropped root's generation (provenance).
+    pub generation: u64,
+    /// The blocks the dropped root held the last reference to.
+    pub blocks: Vec<u64>,
+}
+
+/// Commit-path benchmark counters (vaire ruling: the numbers must exist).
+/// The kernel witness prints these next to a CNTPCT tick delta; the host
+/// bench reads them directly.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CommitStats {
+    /// Root flips since mount/format.
+    pub commits: u64,
+    /// Total blocks written through the CoW path (data + metadata + maps).
+    pub blocks_written: u64,
+    /// Blocks written by the most recent transaction (including its commit).
+    pub last_commit_blocks: u64,
+}
+
 pub struct UnaFS<D: BlockDevice> {
     pub device: D,
     pub superblock: Superblock,
-    pub bitmap: SpaceMap,
-    pub journal: Journal,
+    /// The refcount allocator (current vs frozen views — `refmap.rs`).
+    refmap: RefMap,
+    /// Logical inode id → current physical block (0 = unallocated id).
+    imap: Vec<u64>,
+    /// The last COMMITTED root record and the slot holding it.
+    root: RootRecord,
+    active_slot: RootSlot,
+    /// Blocks (index + leaves) holding the last committed inode map /
+    /// refcount map — decref'd when the next commit writes fresh ones.
+    imap_blocks: Vec<u64>,
+    refmap_blocks: Vec<u64>,
+    /// Commit automatically at the end of each public mutating op (default).
+    /// The crash-simulation seam (`set_autocommit(false)`) leaves fresh
+    /// blocks written but the root un-flipped — exactly a power cut before
+    /// the atomic point.
+    autocommit: bool,
+    stats: CommitStats,
+    /// Blocks written by the in-flight transaction.
+    txn_blocks: u64,
 }
 
 impl<D: BlockDevice> UnaFS<D> {
-    /// Format the device with a new UnaFS filesystem.
+    // =====================================================================
+    // Lifecycle
+    // =====================================================================
+
+    /// Format the device with a new (K8, version 3) UnaFS filesystem.
     pub fn format(mut device: D, size_mb: u64) -> Result<Self, FileSystemError> {
-        // Use provided size if device is empty or for initialization
         let blocks_from_size = (size_mb * 1024 * 1024) / BLOCK_SIZE;
         let mut block_count = device.block_count();
-
         if block_count == 0 {
             block_count = blocks_from_size;
         }
 
-        let mut superblock = Superblock::new(block_count);
-        let mut bitmap = SpaceMap::new(block_count);
-        let mut journal = Journal::new();
+        let superblock = Superblock::new(block_count);
+        superblock.validate()?;
 
-        // 1. Mark System Blocks as Used
-        // Superblock
-        bitmap.mark_used(0);
-
-        // Journal Blocks
-        for i in 0..superblock.journal_blocks {
-            bitmap.mark_used(superblock.journal_start + i);
-        }
-
-        // Bitmap Blocks
-        for i in 0..superblock.bitmap_blocks {
-            bitmap.mark_used(superblock.bitmap_start + i);
-        }
-
-        // Initialize Journal on disk
-        journal.reset(&mut device)?;
-
-        // 2. Allocate Root Inode (Should be ID after bitmap, effectively)
-        let root_id = bitmap.allocate().ok_or(FileSystemError::NoSpace)?;
-        superblock.root_inode = root_id;
-        if superblock.free_blocks > 0 {
-            superblock.free_blocks -= 1;
-        }
-
-        let root_inode = Inode::new(root_id, FileKind::Directory);
-        let root_bytes = root_inode.to_bytes()?;
-        let mut root_block = vec![0u8; BLOCK_SIZE as usize];
-        root_block[..root_bytes.len()].copy_from_slice(&root_bytes);
-        device.write_block(root_id, &root_block)?;
-
-        // 3. Allocate Attribute Catalog Inode (System File)
-        let catalog_id = bitmap.allocate().ok_or(FileSystemError::NoSpace)?;
-        superblock.catalog_inode = catalog_id;
-        if superblock.free_blocks > 0 {
-            superblock.free_blocks -= 1;
-        }
-
-        let catalog_inode = Inode::new(catalog_id, FileKind::System);
-        let catalog_bytes = catalog_inode.to_bytes()?;
-        let mut catalog_block = vec![0u8; BLOCK_SIZE as usize];
-        catalog_block[..catalog_bytes.len()].copy_from_slice(&catalog_bytes);
-        device.write_block(catalog_id, &catalog_block)?;
-
-        // 4. Save Metadata
-        bitmap.save(&mut device, superblock.bitmap_start)?;
-
+        // Static identity: block 0, written once.
         let sb_bytes = superblock.to_bytes()?;
-        let mut sb_block = vec![0u8; BLOCK_SIZE as usize];
+        let mut sb_block = alloc::vec![0u8; BLOCK_SIZE as usize];
         sb_block[..sb_bytes.len()].copy_from_slice(&sb_bytes);
         device.write_block(0, &sb_block)?;
 
-        Ok(Self {
+        // Zero the root area so neither slot parses as valid until the format
+        // commit writes generation 1.
+        let zero = alloc::vec![0u8; BLOCK_SIZE as usize];
+        device.write_block(ROOT_BLOCK, &zero)?;
+
+        let mut refmap = RefMap::new(block_count);
+        // Pin the static blocks: superblock + root area.
+        refmap.incref(0);
+        refmap.incref(ROOT_BLOCK);
+
+        let mut fs = Self {
             device,
             superblock,
-            bitmap,
-            journal,
-        })
+            refmap,
+            imap: alloc::vec![0u64; 1], // id 0 reserved/invalid
+            root: RootRecord {
+                generation: 0,
+                imap_block: 0,
+                imap_leaves: 0,
+                next_inode: 1,
+                refmap_block: 0,
+                refmap_leaves: 0,
+                free_blocks: 0,
+                flags: 0,
+            },
+            // Dummy: the format commit writes `other()` == slot A.
+            active_slot: RootSlot::B,
+            imap_blocks: Vec::new(),
+            refmap_blocks: Vec::new(),
+            autocommit: true,
+            stats: CommitStats::default(),
+            txn_blocks: 0,
+        };
+
+        // The reserved system objects, in id order (1..=4).
+        let root_id = fs.create_inode_inner(FileKind::Directory, BTreeMap::new())?;
+        debug_assert_eq!(root_id, ROOT_INODE_ID);
+        let catalog_id = fs.create_inode_inner(FileKind::System, BTreeMap::new())?;
+        debug_assert_eq!(catalog_id, CATALOG_INODE_ID);
+        let snap_id = fs.create_inode_inner(FileKind::System, BTreeMap::new())?;
+        debug_assert_eq!(snap_id, SNAP_INDEX_INODE_ID);
+        let empty_snaps: Vec<SnapshotEntry> = Vec::new();
+        let bytes = crate::codec::serialize(&empty_snaps)?;
+        fs.rewrite_data_inner(snap_id, &bytes)?;
+        let reclaim_id = fs.create_inode_inner(FileKind::System, BTreeMap::new())?;
+        debug_assert_eq!(reclaim_id, RECLAIM_INODE_ID);
+        let empty_queue: Vec<ReclaimEntry> = Vec::new();
+        let bytes = crate::codec::serialize(&empty_queue)?;
+        fs.rewrite_data_inner(reclaim_id, &bytes)?;
+
+        // Generation 1: the format commit.
+        fs.commit()?;
+        Ok(fs)
     }
 
-    /// Mount an existing UnaFS filesystem.
+    /// Mount an existing UnaFS (K8) filesystem: read the static superblock,
+    /// pick the newer valid root slot, load the inode map and refcount map
+    /// the root points at, and drain any pending reclaim-queue entries.
     pub fn mount(mut device: D) -> Result<Self, FileSystemError> {
-        let mut sb_block = vec![0u8; BLOCK_SIZE as usize];
+        let mut sb_block = alloc::vec![0u8; BLOCK_SIZE as usize];
         device.read_block(0, &mut sb_block)?;
         let superblock = Superblock::from_bytes(&sb_block)?;
+        let block_count = superblock.block_count;
 
-        let bitmap = SpaceMap::load(
-            &mut device,
-            superblock.bitmap_start,
-            superblock.bitmap_blocks,
-        )?;
-        let mut journal = Journal::new();
+        let (root, active_slot) = crate::root::read_active(&mut device)?
+            .ok_or(FileSystemError::CorruptVolume("no valid root record"))?;
 
-        // Check for recovery (Log only for now)
-        if journal.check_recovery(&mut device)? {
-            #[cfg(feature = "std")]
-            println!("[WARNING] :: DIRTY MOUNT DETECTED. TORN TRANSACTION IN JOURNAL.");
-            // K3 observability seam: also surface the warning through the no_std
-            // hook, so a kernel (no println) mount is not silent about a torn journal.
-            crate::warnlog::warn("[WARNING] :: DIRTY MOUNT DETECTED. TORN TRANSACTION IN JOURNAL.");
+        // ---- Inode map (bounded: the volume is untrusted input) ----
+        if root.imap_leaves == 0 || root.imap_leaves > IMAP_MAX_LEAVES {
+            return Err(FileSystemError::CorruptVolume(
+                "imap leaf count out of range",
+            ));
+        }
+        if root.next_inode == 0 || root.next_inode > root.imap_leaves * IMAP_ENTRIES_PER_LEAF {
+            return Err(FileSystemError::CorruptVolume("next inode out of range"));
+        }
+        if root.imap_block == 0 || root.imap_block >= block_count {
+            return Err(FileSystemError::CorruptVolume("imap index out of bounds"));
+        }
+        let mut imap_blocks = alloc::vec![root.imap_block];
+        let mut index = alloc::vec![0u8; BLOCK_SIZE as usize];
+        device.read_block(root.imap_block, &mut index)?;
+        let imap_cap = usize::try_from(root.next_inode)
+            .map_err(|_| StorageError::AllocRefused(root.next_inode))?;
+        let mut imap: Vec<u64> = Vec::new();
+        imap.try_reserve_exact(imap_cap)
+            .map_err(|_| StorageError::AllocRefused(root.next_inode))?;
+        let mut leaf = alloc::vec![0u8; BLOCK_SIZE as usize];
+        for l in 0..root.imap_leaves {
+            let ptr = u64::from_le_bytes(
+                index[(l * 8) as usize..(l * 8 + 8) as usize]
+                    .try_into()
+                    .unwrap(),
+            );
+            if ptr == 0 || ptr >= block_count {
+                return Err(FileSystemError::CorruptVolume("imap leaf out of bounds"));
+            }
+            imap_blocks.push(ptr);
+            device.read_block(ptr, &mut leaf)?;
+            for e in 0..IMAP_ENTRIES_PER_LEAF {
+                if imap.len() as u64 >= root.next_inode {
+                    break;
+                }
+                let entry = u64::from_le_bytes(
+                    leaf[(e * 8) as usize..(e * 8 + 8) as usize]
+                        .try_into()
+                        .unwrap(),
+                );
+                if entry >= block_count {
+                    return Err(FileSystemError::CorruptVolume("imap entry out of bounds"));
+                }
+                imap.push(entry);
+            }
         }
 
-        Ok(Self {
+        // ---- Refcount map ----
+        let expected_leaves = block_count.div_ceil(crate::refmap::REFS_PER_LEAF);
+        if root.refmap_leaves != expected_leaves {
+            return Err(FileSystemError::CorruptVolume(
+                "refmap size inconsistent with block count",
+            ));
+        }
+        if root.refmap_block == 0 || root.refmap_block >= block_count {
+            return Err(FileSystemError::CorruptVolume("refmap index out of bounds"));
+        }
+        if root.refmap_leaves > BLOCK_SIZE / 8 {
+            return Err(FileSystemError::CorruptVolume("refmap leaf count too large"));
+        }
+        let mut refmap_blocks = alloc::vec![root.refmap_block];
+        device.read_block(root.refmap_block, &mut index)?;
+        let count_cap =
+            usize::try_from(block_count).map_err(|_| StorageError::AllocRefused(block_count))?;
+        let mut counts: Vec<u32> = Vec::new();
+        counts
+            .try_reserve_exact(count_cap)
+            .map_err(|_| StorageError::AllocRefused(block_count))?;
+        for l in 0..root.refmap_leaves {
+            let ptr = u64::from_le_bytes(
+                index[(l * 8) as usize..(l * 8 + 8) as usize]
+                    .try_into()
+                    .unwrap(),
+            );
+            if ptr == 0 || ptr >= block_count {
+                return Err(FileSystemError::CorruptVolume("refmap leaf out of bounds"));
+            }
+            refmap_blocks.push(ptr);
+            device.read_block(ptr, &mut leaf)?;
+            for e in 0..crate::refmap::REFS_PER_LEAF {
+                if counts.len() >= count_cap {
+                    break;
+                }
+                let c = u32::from_le_bytes(
+                    leaf[(e * 4) as usize..(e * 4 + 4) as usize]
+                        .try_into()
+                        .unwrap(),
+                );
+                counts.push(c);
+            }
+        }
+        let refmap = RefMap::from_counts(counts, block_count);
+
+        let mut fs = Self {
             device,
             superblock,
-            bitmap,
-            journal,
-        })
+            refmap,
+            imap,
+            root,
+            active_slot,
+            imap_blocks,
+            refmap_blocks,
+            autocommit: true,
+            stats: CommitStats::default(),
+            txn_blocks: 0,
+        };
+
+        // Persistent reclaim queue: v1 drains eagerly on mount (crash-safe —
+        // the drain is one commit; a power cut mid-drain resumes here).
+        fs.reclaim_drain()?;
+
+        Ok(fs)
     }
 
-    /// Read an Inode by ID.
-    pub fn read_inode(&mut self, id: u64) -> Result<Inode, FileSystemError> {
-        let mut block = vec![0u8; BLOCK_SIZE as usize];
-        self.device.read_block(id, &mut block)?;
-        let inode = Inode::from_bytes(&block)?;
-        Ok(inode)
+    // =====================================================================
+    // Transaction core
+    // =====================================================================
+
+    /// Toggle per-op auto-commit. `false` is the crash-simulation seam:
+    /// mutations write fresh blocks but the root never flips, so dropping
+    /// the instance models a power cut mid-commit (the next mount sees the
+    /// old tree, whole and valid).
+    pub fn set_autocommit(&mut self, on: bool) {
+        self.autocommit = on;
     }
 
-    /// Write an Inode to disk.
-    fn write_inode(&mut self, inode: &Inode) -> Result<(), FileSystemError> {
-        let bytes = inode.to_bytes()?;
-        let mut block = vec![0u8; BLOCK_SIZE as usize];
-        block[..bytes.len()].copy_from_slice(&bytes);
-        self.device.write_block(inode.id, &block)?;
+    /// The last committed root generation.
+    pub fn root_generation(&self) -> u64 {
+        self.root.generation
+    }
+
+    /// Free blocks in the current (in-flight) view.
+    pub fn free_blocks(&self) -> u64 {
+        self.refmap.free_blocks()
+    }
+
+    /// Commit-path benchmark counters.
+    pub fn commit_stats(&self) -> CommitStats {
+        self.stats
+    }
+
+    /// Blocks (index + leaves) holding the last committed inode map and
+    /// refcount map — part of the fsck walk's system set.
+    pub(crate) fn map_blocks(&self) -> impl Iterator<Item = u64> + '_ {
+        self.imap_blocks
+            .iter()
+            .chain(self.refmap_blocks.iter())
+            .copied()
+    }
+
+    pub(crate) fn refmap_ref(&self) -> &RefMap {
+        &self.refmap
+    }
+
+    pub(crate) fn refmap_mut(&mut self) -> &mut RefMap {
+        &mut self.refmap
+    }
+
+    pub(crate) fn imap_ref(&self) -> &[u64] {
+        &self.imap
+    }
+
+    pub(crate) fn imap_clear(&mut self, id: u64) {
+        if let Some(e) = self.imap.get_mut(id as usize) {
+            *e = 0;
+        }
+    }
+
+    fn maybe_commit(&mut self) -> Result<(), FileSystemError> {
+        if self.autocommit {
+            self.commit()?;
+        }
         Ok(())
     }
 
-    /// Create a new Inode with given attributes and kind.
-    fn create_inode_internal(
+    /// COMMIT: persist the inode map and refcount map to fresh blocks
+    /// (CoW, like everything else), barrier, then flip ONE 512 B root
+    /// sector — the transaction's single atomic point.
+    pub fn commit(&mut self) -> Result<(), FileSystemError> {
+        // 1. Retire the previously committed maps (their blocks stay
+        //    protected by the frozen view until after the flip).
+        for b in core::mem::take(&mut self.imap_blocks) {
+            self.refmap.decref(b);
+        }
+        for b in core::mem::take(&mut self.refmap_blocks) {
+            self.refmap.decref(b);
+        }
+
+        // 2. Inode map → fresh leaves + fresh index block.
+        let next_inode = self.imap.len() as u64;
+        let imap_leaves = next_inode.div_ceil(IMAP_ENTRIES_PER_LEAF).max(1);
+        if imap_leaves > IMAP_MAX_LEAVES {
+            return Err(FileSystemError::NoSpace);
+        }
+        let mut new_imap_blocks = Vec::new();
+        let index_block = self.alloc_block()?;
+        let mut index = alloc::vec![0u8; BLOCK_SIZE as usize];
+        for l in 0..imap_leaves {
+            let leaf_block = self.alloc_block()?;
+            index[(l * 8) as usize..(l * 8 + 8) as usize]
+                .copy_from_slice(&leaf_block.to_le_bytes());
+            let mut leaf = alloc::vec![0u8; BLOCK_SIZE as usize];
+            let base = (l * IMAP_ENTRIES_PER_LEAF) as usize;
+            for e in 0..IMAP_ENTRIES_PER_LEAF as usize {
+                if let Some(&entry) = self.imap.get(base + e) {
+                    leaf[e * 8..e * 8 + 8].copy_from_slice(&entry.to_le_bytes());
+                }
+            }
+            self.write_fresh(leaf_block, &leaf)?;
+            new_imap_blocks.push(leaf_block);
+        }
+
+        // 3. Refcount map: allocate ALL its blocks first (allocation mutates
+        //    the counts being persisted), then serialize. The leaf count is a
+        //    pure function of the volume geometry, so it cannot change under
+        //    us mid-step.
+        let refmap_leaves = self.refmap.leaf_count();
+        let ref_index_block = self.alloc_block()?;
+        let mut ref_leaf_blocks = Vec::with_capacity(refmap_leaves as usize);
+        for _ in 0..refmap_leaves {
+            ref_leaf_blocks.push(self.alloc_block()?);
+        }
+        // Every allocation is done: the counts are final. Serialize.
+        let mut ref_index = alloc::vec![0u8; BLOCK_SIZE as usize];
+        for (l, &leaf_block) in ref_leaf_blocks.iter().enumerate() {
+            ref_index[l * 8..l * 8 + 8].copy_from_slice(&leaf_block.to_le_bytes());
+            let leaf = self.refmap.leaf_bytes(l as u64);
+            self.write_fresh(leaf_block, &leaf)?;
+        }
+        self.write_fresh(ref_index_block, &ref_index)?;
+        // (Written last among the fresh blocks so everything lands before
+        //  the barrier; order among fresh blocks is immaterial — none are
+        //  reachable until the flip.)
+        self.write_fresh(index_block, &index)?;
+
+        let free_blocks = self.refmap.free_blocks();
+
+        // 4. Barrier: every fresh block must be on the medium before the
+        //    root flip makes them reachable.
+        self.device.flush()?;
+
+        // 5. The atomic point: ONE 512 B write to the INACTIVE slot.
+        let new_root = RootRecord {
+            generation: self.root.generation + 1,
+            imap_block: index_block,
+            imap_leaves,
+            next_inode,
+            refmap_block: ref_index_block,
+            refmap_leaves,
+            free_blocks,
+            flags: 0,
+        };
+        let slot = self.active_slot.other();
+        crate::root::write_slot(&mut self.device, slot, &new_root)?;
+        self.device.flush()?;
+
+        // 6. The new tree is the committed tree.
+        self.root = new_root;
+        self.active_slot = slot;
+        let mut blocks = new_imap_blocks;
+        blocks.insert(0, index_block);
+        self.imap_blocks = blocks;
+        let mut rblocks = ref_leaf_blocks;
+        rblocks.insert(0, ref_index_block);
+        self.refmap_blocks = rblocks;
+        self.refmap.freeze();
+
+        self.stats.commits += 1;
+        self.stats.last_commit_blocks = self.txn_blocks;
+        self.txn_blocks = 0;
+        Ok(())
+    }
+
+    /// Historical name for "make everything durable" — under CoW that is a
+    /// commit. Kept for API compatibility (host tools call it).
+    pub fn sync_metadata(&mut self) -> Result<(), FileSystemError> {
+        self.commit()
+    }
+
+    fn alloc_block(&mut self) -> Result<u64, FileSystemError> {
+        self.refmap.allocate().ok_or(FileSystemError::NoSpace)
+    }
+
+    /// Write a freshly allocated block, counting it for the bench.
+    fn write_fresh(&mut self, block: u64, buf: &[u8]) -> Result<(), FileSystemError> {
+        self.device.write_block(block, buf)?;
+        self.txn_blocks += 1;
+        self.stats.blocks_written += 1;
+        Ok(())
+    }
+
+    // =====================================================================
+    // Inode primitives (logical ids through the inode map)
+    // =====================================================================
+
+    /// The CURRENT physical block an inode lives at (moves on every CoW
+    /// write). `None` for unallocated ids. Exposed for consistency witnesses
+    /// and corruption fixtures — never store it across a mutation.
+    pub fn inode_block(&self, id: u64) -> Option<u64> {
+        match self.imap.get(id as usize).copied().unwrap_or(0) {
+            0 => None,
+            pb => Some(pb),
+        }
+    }
+
+    /// Read an Inode by LOGICAL id.
+    pub fn read_inode(&mut self, id: u64) -> Result<Inode, FileSystemError> {
+        let pb = self.imap.get(id as usize).copied().unwrap_or(0);
+        if pb == 0 {
+            return Err(FileSystemError::NotFound);
+        }
+        let mut block = alloc::vec![0u8; BLOCK_SIZE as usize];
+        self.device.read_block(pb, &mut block)?;
+        let inode = Inode::from_bytes(&block)?;
+        if inode.id != id {
+            return Err(FileSystemError::CorruptVolume("inode id mismatch"));
+        }
+        Ok(inode)
+    }
+
+    /// CoW-write an Inode: fresh block, remap, release the old block.
+    fn write_inode(&mut self, inode: &Inode) -> Result<(), FileSystemError> {
+        let bytes = inode.to_bytes()?;
+        let mut block = alloc::vec![0u8; BLOCK_SIZE as usize];
+        block[..bytes.len()].copy_from_slice(&bytes);
+        let nb = self.alloc_block()?;
+        self.write_fresh(nb, &block)?;
+        let idx = inode.id as usize;
+        if idx >= self.imap.len() {
+            return Err(FileSystemError::CorruptVolume("inode id beyond map"));
+        }
+        let old = self.imap[idx];
+        if old != 0 {
+            self.refmap.decref(old);
+        }
+        self.imap[idx] = nb;
+        Ok(())
+    }
+
+    /// Allocate the next logical inode id and CoW-write a fresh inode there.
+    fn create_inode_inner(
         &mut self,
         kind: FileKind,
         attributes: BTreeMap<String, AttributeValue>,
     ) -> Result<u64, FileSystemError> {
-        let inode_id = self.allocate_inode_block()?;
-
-        // Log generic creation intent
-        self.journal.log(
-            &mut self.device,
-            JournalOp::BeginCreate {
-                parent_inode: 0,
-                name: "unknown".into(),
-            },
-        )?;
-
-        let mut inode = Inode::new(inode_id, kind);
+        let id = self.imap.len() as u64;
+        if (id + 1).div_ceil(IMAP_ENTRIES_PER_LEAF) > IMAP_MAX_LEAVES {
+            return Err(FileSystemError::NoSpace);
+        }
+        self.imap.push(0);
+        let mut inode = Inode::new(id, kind);
         inode.attributes = attributes;
-
         self.write_inode(&inode)?;
-        self.sync_metadata()?;
-
-        self.journal
-            .log(&mut self.device, JournalOp::EndCreate { inode_id })?;
-
-        Ok(inode_id)
+        Ok(id)
     }
 
+    /// Create a bare File inode (public API; one transaction).
     pub fn create_inode(
         &mut self,
         attributes: BTreeMap<String, AttributeValue>,
     ) -> Result<u64, FileSystemError> {
-        self.create_inode_internal(FileKind::File, attributes)
+        let id = self.create_inode_inner(FileKind::File, attributes)?;
+        self.maybe_commit()?;
+        Ok(id)
     }
 
-    fn allocate_inode_block(&mut self) -> Result<u64, FileSystemError> {
-        let block_id = self.bitmap.allocate().ok_or(FileSystemError::NoSpace)?;
-        if self.superblock.free_blocks > 0 {
-            self.superblock.free_blocks -= 1;
+    // =====================================================================
+    // Data path (CoW)
+    // =====================================================================
+
+    /// The volume's byte span, per its own superblock — the bound every
+    /// disk-derived size/offset must respect (BEFS-HARDEN).
+    fn volume_bytes(&self) -> u64 {
+        self.superblock.block_count.saturating_mul(BLOCK_SIZE)
+    }
+
+    /// Materialize a file's logical-block → physical-block map from its
+    /// extent list (bounded against the volume span; hostile geometry errs).
+    fn file_block_map(&self, inode: &Inode, blocks: u64) -> Result<Vec<u64>, FileSystemError> {
+        let cap = usize::try_from(blocks).map_err(|_| StorageError::AllocRefused(blocks))?;
+        if blocks > self.superblock.block_count {
+            return Err(FileSystemError::CorruptVolume("file exceeds volume"));
         }
-        Ok(block_id)
+        let mut map = Vec::new();
+        map.try_reserve_exact(cap)
+            .map_err(|_| StorageError::AllocRefused(blocks))?;
+        map.resize(cap, 0u64);
+        for extent in &inode.chunks {
+            let end = extent
+                .logical_offset
+                .checked_add(extent.length)
+                .ok_or(FileSystemError::CorruptVolume("extent span overflows"))?;
+            if extent.logical_offset % BLOCK_SIZE != 0 {
+                return Err(FileSystemError::CorruptVolume("unaligned extent"));
+            }
+            let first = extent.logical_offset / BLOCK_SIZE;
+            let count = end.div_ceil(BLOCK_SIZE).saturating_sub(first);
+            for i in 0..count {
+                let idx = first + i;
+                if idx >= blocks {
+                    break;
+                }
+                let pb = extent
+                    .physical_block
+                    .checked_add(i)
+                    .ok_or(FileSystemError::CorruptVolume("extent target overflows"))?;
+                if pb >= self.superblock.block_count {
+                    return Err(FileSystemError::CorruptVolume("extent points past volume"));
+                }
+                map[idx as usize] = pb;
+            }
+        }
+        Ok(map)
     }
 
-    pub fn sync_metadata(&mut self) -> Result<(), FileSystemError> {
-        self.bitmap
-            .save(&mut self.device, self.superblock.bitmap_start)?;
-
-        let sb_bytes = self.superblock.to_bytes()?;
-        let mut sb_block = vec![0u8; BLOCK_SIZE as usize];
-        sb_block[..sb_bytes.len()].copy_from_slice(&sb_bytes);
-        self.device.write_block(0, &sb_block)?;
-        Ok(())
+    /// Re-emit a coalesced extent list from a block map. Interior extents are
+    /// whole blocks; the extent covering the file tail is trimmed so extent
+    /// lengths sum to exactly `size` for a hole-free file (the spilled-
+    /// attribute read path derives the value length from that sum).
+    fn emit_extents(map: &[u64], size: u64) -> ExtentList {
+        let mut out: ExtentList = Vec::new();
+        for (idx, &pb) in map.iter().enumerate() {
+            if pb == 0 {
+                continue; // hole
+            }
+            let logical = idx as u64 * BLOCK_SIZE;
+            let len = core::cmp::min(BLOCK_SIZE, size.saturating_sub(logical));
+            if len == 0 {
+                break;
+            }
+            match out.last_mut() {
+                Some(last)
+                    if last.length % BLOCK_SIZE == 0
+                        && last.logical_offset + last.length == logical
+                        && last.physical_block + last.length / BLOCK_SIZE == pb =>
+                {
+                    last.length += len;
+                }
+                _ => out.push(Extent {
+                    logical_offset: logical,
+                    physical_block: pb,
+                    length: len,
+                }),
+            }
+        }
+        out
     }
 
-    /// Write data to an Inode.
-    pub fn write_data(
+    fn write_data_inner(
         &mut self,
         inode_id: u64,
         offset: u64,
@@ -271,113 +727,59 @@ impl<D: BlockDevice> UnaFS<D> {
         if data.is_empty() {
             return Ok(());
         }
-
-        self.journal
-            .log(&mut self.device, JournalOp::BeginWrite { inode_id })?;
-
         let mut inode = self.read_inode(inode_id)?;
-        let mut current_offset = offset;
-        let mut data_written = 0;
+        let end = offset
+            .checked_add(data.len() as u64)
+            .ok_or(FileSystemError::CorruptVolume("write span overflows"))?;
+        let new_size = core::cmp::max(inode.size, end);
+        if new_size > self.volume_bytes() {
+            return Err(FileSystemError::NoSpace);
+        }
+        let blocks = new_size.div_ceil(BLOCK_SIZE);
+        let mut map = self.file_block_map(&inode, blocks)?;
 
-        while data_written < data.len() {
-            let block_offset = (current_offset % BLOCK_SIZE) as usize;
-            let to_write = core::cmp::min(
-                BLOCK_SIZE as usize - block_offset,
-                data.len() - data_written,
-            );
-
-            let mut physical_block = 0;
-            let mut extent_found = false;
-
-            for extent in inode.chunks.iter() {
-                // Disk-derived extent geometry: checked, like the read path.
-                let extent_end = extent
-                    .logical_offset
-                    .checked_add(extent.length)
-                    .ok_or(FileSystemError::CorruptVolume("extent span overflows"))?;
-                if current_offset >= extent.logical_offset && current_offset < extent_end {
-                    let offset_in_extent = current_offset - extent.logical_offset;
-                    let block_offset_in_extent = offset_in_extent / BLOCK_SIZE;
-                    physical_block = extent
-                        .physical_block
-                        .checked_add(block_offset_in_extent)
-                        .ok_or(FileSystemError::CorruptVolume("extent target overflows"))?;
-                    extent_found = true;
-                    break;
-                }
+        let first_touched = offset / BLOCK_SIZE;
+        let last_touched = (end - 1) / BLOCK_SIZE;
+        let mut buf = alloc::vec![0u8; BLOCK_SIZE as usize];
+        for idx in first_touched..=last_touched {
+            let old = map[idx as usize];
+            if old != 0 {
+                self.device.read_block(old, &mut buf)?;
+            } else {
+                buf.fill(0);
             }
+            // Overlay the slice of `data` covering this block.
+            let block_start = idx * BLOCK_SIZE;
+            let from = core::cmp::max(offset, block_start);
+            let to = core::cmp::min(end, block_start + BLOCK_SIZE);
+            let src = &data[(from - offset) as usize..(to - offset) as usize];
+            buf[(from - block_start) as usize..(to - block_start) as usize].copy_from_slice(src);
 
-            if !extent_found {
-                let new_block = self.bitmap.allocate().ok_or(FileSystemError::NoSpace)?;
-                if self.superblock.free_blocks > 0 {
-                    self.superblock.free_blocks -= 1;
-                }
-
-                let mut merged = false;
-                if let Some(last) = inode.chunks.last_mut() {
-                    // Checked merge probe: hostile extent geometry simply
-                    // fails to merge instead of wrapping (debug) or aliasing.
-                    let last_block_count = last.length.div_ceil(BLOCK_SIZE);
-                    let last_physical_end = last
-                        .physical_block
-                        .checked_add(last_block_count)
-                        .filter(|_| last_block_count > 0);
-                    let last_logical_end = last.logical_offset.checked_add(last.length);
-
-                    if let (Some(physical_end), Some(logical_end)) =
-                        (last_physical_end, last_logical_end)
-                    {
-                        if logical_end <= current_offset
-                            && last.length % BLOCK_SIZE == 0
-                            && physical_end == new_block
-                        {
-                            last.length += BLOCK_SIZE;
-                            merged = true;
-                            physical_block = new_block;
-                        }
-                    }
-                }
-
-                if !merged {
-                    let aligned_logical = (current_offset / BLOCK_SIZE) * BLOCK_SIZE;
-                    let new_extent = Extent {
-                        logical_offset: aligned_logical,
-                        physical_block: new_block,
-                        length: BLOCK_SIZE,
-                    };
-                    inode.chunks.push(new_extent);
-                    physical_block = new_block;
-                }
+            // NEVER overwrite in place: fresh block, release the old one.
+            let nb = self.alloc_block()?;
+            self.write_fresh(nb, &buf)?;
+            if old != 0 {
+                self.refmap.decref(old);
             }
-
-            let mut block_buf = vec![0u8; BLOCK_SIZE as usize];
-            self.device.read_block(physical_block, &mut block_buf)?;
-            block_buf[block_offset..block_offset + to_write]
-                .copy_from_slice(&data[data_written..data_written + to_write]);
-            self.device.write_block(physical_block, &block_buf)?;
-
-            data_written += to_write;
-            current_offset += to_write as u64;
+            map[idx as usize] = nb;
         }
 
-        if current_offset > inode.size {
-            inode.size = current_offset;
-        }
-
-        // Persist the allocation bitmap BEFORE the inode that references any newly
-        // allocated block. A power cut in this window must LEAK (a block marked used but
-        // unreferenced), never DANGLE (an inode referencing a block the persisted bitmap
-        // still calls free — which mount() does NOT fsck away, so the next allocation
-        // first-fit-reuses it → silent cross-file corruption). This mirrors the
-        // mutation-engine ordering (`allocate_and_write_extents` syncs before the inode
-        // swap) and upholds the §K4 "never dangles a reference" guarantee.
-        self.sync_metadata()?;
+        inode.chunks = Self::emit_extents(&map, new_size);
+        inode.size = new_size;
         self.write_inode(&inode)?;
-
-        self.journal
-            .log(&mut self.device, JournalOp::EndWrite { inode_id })?;
-
         Ok(())
+    }
+
+    /// Write data to an Inode (grow-only size semantics, like the pre-K8
+    /// path). One transaction.
+    pub fn write_data(
+        &mut self,
+        inode_id: u64,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<(), FileSystemError> {
+        self.write_data_inner(inode_id, offset, data)?;
+        self.maybe_commit()
     }
 
     /// Read data from an Inode.
@@ -391,23 +793,13 @@ impl<D: BlockDevice> UnaFS<D> {
         self.read_from_extents(&inode.chunks, offset, length, inode.size)
     }
 
-    /// The volume's byte span, per its own superblock — the bound every
-    /// disk-derived size/offset must respect (BEFS-HARDEN). `block_count *
-    /// BLOCK_SIZE` is overflow-checked at mount (`Superblock::validate`);
-    /// saturating here keeps `format()`-fresh instances safe too.
-    fn volume_bytes(&self) -> u64 {
-        self.superblock.block_count.saturating_mul(BLOCK_SIZE)
-    }
-
     /// Internal helper to read data from a specific ExtentList.
     ///
-    /// `total_size` and the extent geometry are disk-derived (an inode's
-    /// `size`/`chunks` or a spilled attribute's extents), so everything here
-    /// is bounded (BEFS-HARDEN, K3-PARSE-2/4): `total_size` against the
-    /// volume span, the output allocation via `try_reserve_exact` (graceful
-    /// `Err`, never a capacity panic or OOM abort), extent arithmetic via
-    /// `checked_add` (profile-independent), extent targets against the
-    /// volume, and hole fills in bulk runs rather than a byte-at-a-time push.
+    /// `total_size` and the extent geometry are disk-derived, so everything
+    /// here is bounded (BEFS-HARDEN): `total_size` against the volume span,
+    /// the output allocation via `try_reserve_exact`, extent arithmetic via
+    /// `checked_add`, extent targets against the volume, and hole fills in
+    /// bulk runs.
     fn read_from_extents(
         &mut self,
         chunks: &ExtentList,
@@ -435,7 +827,6 @@ impl<D: BlockDevice> UnaFS<D> {
         while read_so_far < to_read_total {
             let mut physical_block = 0;
             let mut found = false;
-            // Nearest extent start beyond the cursor: bounds the hole run.
             let mut next_start = u64::MAX;
 
             for extent in chunks {
@@ -459,11 +850,8 @@ impl<D: BlockDevice> UnaFS<D> {
             }
 
             if !found {
-                // A hole: zero-fill in one run, up to the next extent start
-                // (or the end of the read). Capacity is already reserved.
                 let remaining = to_read_total - read_so_far;
-                let gap =
-                    core::cmp::min(remaining, next_start.saturating_sub(current_offset));
+                let gap = core::cmp::min(remaining, next_start.saturating_sub(current_offset));
                 buffer.resize(buffer.len() + gap as usize, 0);
                 read_so_far += gap;
                 current_offset += gap;
@@ -480,7 +868,7 @@ impl<D: BlockDevice> UnaFS<D> {
                 (to_read_total - read_so_far) as usize,
             );
 
-            let mut block_buf = vec![0u8; BLOCK_SIZE as usize];
+            let mut block_buf = alloc::vec![0u8; BLOCK_SIZE as usize];
             self.device.read_block(physical_block, &mut block_buf)?;
 
             buffer.extend_from_slice(&block_buf[block_offset..block_offset + to_read]);
@@ -491,6 +879,10 @@ impl<D: BlockDevice> UnaFS<D> {
 
         Ok(buffer)
     }
+
+    // =====================================================================
+    // Namespace
+    // =====================================================================
 
     pub fn ls(&mut self, inode_id: u64) -> Result<Vec<DirEntry>, FileSystemError> {
         let inode = self.read_inode(inode_id)?;
@@ -532,13 +924,16 @@ impl<D: BlockDevice> UnaFS<D> {
             let entry = entries
                 .into_iter()
                 .find(|e| e.name == part)
-                .ok_or(FileSystemError::RootMissing)?; // TODO: specific error
+                .ok_or(FileSystemError::RootMissing)?;
             current_id = entry.inode_id;
         }
 
         Ok(current_id)
     }
 
+    /// Create a named child (file or directory) under `parent_id` — the new
+    /// inode AND the parent-directory rewrite land in ONE transaction, so a
+    /// power cut leaves both or neither.
     fn add_entry(
         &mut self,
         parent_id: u64,
@@ -560,7 +955,7 @@ impl<D: BlockDevice> UnaFS<D> {
             return Err(FileSystemError::FileExists);
         }
 
-        let new_id = self.create_inode_internal(kind, BTreeMap::new())?;
+        let new_id = self.create_inode_inner(kind, BTreeMap::new())?;
 
         entries.push(DirEntry {
             name,
@@ -570,12 +965,15 @@ impl<D: BlockDevice> UnaFS<D> {
         entries.sort_by(|a, b| a.name.cmp(&b.name));
 
         let data = crate::codec::serialize(&entries)?;
-        self.write_data(parent_id, 0, &data)?;
+        self.rewrite_data_inner(parent_id, &data)?;
+        self.maybe_commit()?;
 
         Ok(new_id)
     }
 
-    // --- ATTRIBUTE ENGINE (The Soul) ---
+    // =====================================================================
+    // Attribute engine
+    // =====================================================================
 
     pub fn set_attribute(
         &mut self,
@@ -583,18 +981,10 @@ impl<D: BlockDevice> UnaFS<D> {
         key: String,
         value: AttributeValue,
     ) -> Result<(), FileSystemError> {
-        self.journal.log(
-            &mut self.device,
-            JournalOp::BeginOp {
-                op_id: inode_id,
-                desc: format!("SetAttr: {}", key),
-            },
-        )?;
-
         let mut inode = self.read_inode(inode_id)?;
 
         if let Some(extents) = inode.large_attributes.remove(&key) {
-            self.free_extents(&extents)?;
+            self.decref_extents(&extents);
         }
 
         let is_large = match &value {
@@ -615,9 +1005,7 @@ impl<D: BlockDevice> UnaFS<D> {
 
         self.write_inode(&inode)?;
         self.update_catalog(&key, &value, inode_id)?;
-        self.sync_metadata()?;
-        self.journal
-            .log(&mut self.device, JournalOp::EndOp { op_id: inode_id })?;
+        self.maybe_commit()?;
 
         #[cfg(feature = "std")]
         {
@@ -645,51 +1033,35 @@ impl<D: BlockDevice> UnaFS<D> {
         if let Some(extents) = inode.large_attributes.get(key) {
             let total_size = checked_extent_total(extents)?;
             let data = self.read_from_extents(extents, 0, total_size, total_size)?;
-            let val: AttributeValue =
-                crate::codec::deserialize(&data).map_err(|_| FileSystemError::InvalidAttributeData)?;
+            let val: AttributeValue = crate::codec::deserialize(&data)
+                .map_err(|_| FileSystemError::InvalidAttributeData)?;
             return Ok(Some(val));
         }
 
         Ok(None)
     }
 
-    // --- MUTATION ENGINE (unlink / rename / remove_attribute) ---
-    //
-    // Crash-window honesty: there is NO journal replay — the WAL detects a
-    // torn operation on the next mount, it does not roll it back. Every op
-    // below is therefore ordered so that no intermediate on-disk state ever
-    // references a freed block: the failure mode of an ill-timed power cut
-    // is a LEAK (allocated-but-unreachable blocks, reclaimable only by a
-    // future fsck/scavenger arc), never a dangling reference. The concrete
-    // windows are documented on each method.
+    // =====================================================================
+    // Mutation engine — under CoW every op below is ONE transaction: all of
+    // its rewrites become visible at a single root flip, or none do. The
+    // pre-K8 crash windows (unindexed-but-named, named-in-neither-directory,
+    // leaked extents) are gone by construction.
+    // =====================================================================
 
     /// Remove `name` from directory `parent_id`: the directory entry, every
-    /// attribute-catalog index entry pointing at the inode, the inode's data
-    /// extents, its spilled attribute extents, and the inode block itself
-    /// all go. After completion the file is unreachable by name AND by
-    /// query. Returns the freed inode id.
+    /// catalog index entry for the inode, the inode's data and spilled-
+    /// attribute blocks, its inode block, and its inode-map slot all go —
+    /// atomically, at the transaction's root flip. Returns the freed
+    /// (logical) inode id.
     ///
     /// Only `File` and `Symlink` entries can be unlinked; a directory is
     /// refused with [`FileSystemError::IsADirectory`].
     ///
     /// # Open-handle semantics (honest note)
-    /// unafs has no open-file table — callers address files by raw inode id.
-    /// `unlink` invalidates the id immediately: a caller that keeps the id
-    /// and calls `read_data`/`write_data` afterwards touches freed (and
-    /// possibly reallocated) blocks. That is the caller's problem, by
-    /// design; a host library cannot know who still holds an id.
-    ///
-    /// # Crash windows (no journal replay; ordered leak-not-dangle)
-    /// 1. After the catalog rewrite, before the directory rewrite: the file
-    ///    is still reachable by name but invisible to queries (unindexed).
-    /// 2. After the directory rewrite, before the frees: the inode and all
-    ///    its blocks are leaked (allocated, unreachable by name or query).
-    /// 3. The catalog and directory rewrites each write new extents first
-    ///    and swap the inode last (a single-block write), so each is
-    ///    old-or-new, never torn; an interrupted rewrite leaks the freshly
-    ///    written extents.
-    /// A power cut anywhere inside the op additionally leaves an unmatched
-    /// `BeginOp` in the journal, reported as a dirty mount.
+    /// unafs has no open-file table — callers address files by inode id.
+    /// `unlink` invalidates the id immediately: later calls with the stale id
+    /// fail with `NotFound` (the map slot is cleared; logical ids are never
+    /// recycled, so a stale id can never alias a NEW file).
     pub fn unlink(&mut self, parent_id: u64, name: &str) -> Result<u64, FileSystemError> {
         let mut entries = self.ls(parent_id)?;
         let pos = entries
@@ -701,40 +1073,30 @@ impl<D: BlockDevice> UnaFS<D> {
         }
         let inode_id = entries[pos].inode_id;
 
-        self.journal.log(
-            &mut self.device,
-            JournalOp::BeginOp {
-                op_id: inode_id,
-                desc: format!("Unlink: {}", name),
-            },
-        )?;
-
-        // Read the doomed inode up front; its extents are freed at the end.
+        // Read the doomed inode up front.
         let inode = self.read_inode(inode_id)?;
 
-        // 1. Scrub the attribute index: every catalog entry pointing at this
-        //    inode goes. (`set_attribute` appends on re-set, so duplicate
-        //    entries for one key are expected — all of them are removed.)
-        self.remove_catalog_entries(|e| e.inode_id == inode_id)?;
+        // 1. Scrub the attribute index.
+        self.remove_catalog_entries_inner(|e| e.inode_id == inode_id)?;
 
-        // 2. Make the name unreachable.
+        // 2. Unhook the name.
         entries.remove(pos);
         let dir_data = crate::codec::serialize(&entries)?;
-        self.rewrite_data(parent_id, &dir_data)?;
+        self.rewrite_data_inner(parent_id, &dir_data)?;
 
-        // 3. Free everything the inode owned: spilled attribute extents,
-        //    data extents, then the inode block itself. The block contents
-        //    are not zeroed — the blocks are simply marked free and will be
-        //    reused by the first-fit allocator.
+        // 3. Release everything the inode owned. The frozen view keeps the
+        //    old tree intact until the flip.
         for extents in inode.large_attributes.values() {
-            self.free_extents(extents)?;
+            self.decref_extents(extents);
         }
-        self.free_extents(&inode.chunks)?;
-        self.free_block(inode_id);
-        self.sync_metadata()?;
+        self.decref_extents(&inode.chunks);
+        let pb = self.imap.get(inode_id as usize).copied().unwrap_or(0);
+        if pb != 0 {
+            self.refmap.decref(pb);
+        }
+        self.imap_clear(inode_id);
 
-        self.journal
-            .log(&mut self.device, JournalOp::EndOp { op_id: inode_id })?;
+        self.maybe_commit()?;
 
         #[cfg(feature = "std")]
         {
@@ -750,31 +1112,15 @@ impl<D: BlockDevice> UnaFS<D> {
 
     /// Rename `old_name` in `parent_id` to `new_name` in `new_parent_id` —
     /// a same-directory rename when the parents match, a cross-directory
-    /// move otherwise. The inode, its data extents, and its attributes are
-    /// untouched: only directory entries change, and the attribute catalog
-    /// keys on inode id (names are not indexed), so the catalog is
-    /// consistent by construction — queries return the renamed file
-    /// unchanged. The format already models a move this way: directories
-    /// are independent serialized entry lists, and an entry simply switches
-    /// lists. No new format structure is invented.
+    /// move otherwise. Only directory entries change; the inode, its data,
+    /// and the catalog (which keys on the stable logical id) are untouched.
+    /// Both directory rewrites land in ONE transaction, so the pre-K8
+    /// "in neither directory" crash window no longer exists.
     ///
-    /// `new_name` must not already exist — this refuses with `FileExists`
-    /// rather than implicitly unlinking the target (a deliberate divergence
-    /// from POSIX rename's overwrite). Renaming an entry to its own name in
-    /// the same directory is a no-op `Ok`. Moving a DIRECTORY into itself
-    /// or one of its descendants is refused with `DirectoryLoop`: the tree
-    /// has no parent pointers, so a cycle would orphan the whole subtree.
-    ///
-    /// # Crash windows (no journal replay)
-    /// * Same-directory: one crash-ordered directory rewrite — old-or-new,
-    ///   never torn.
-    /// * Cross-directory: the entry leaves the source directory FIRST, then
-    ///   joins the destination. A power cut between the two leaves the file
-    ///   in NEITHER directory — the inode and its blocks are leaked (still
-    ///   allocated, still query-reachable via the catalog, unreachable by
-    ///   name). The reverse order was rejected deliberately: it would
-    ///   briefly give one inode TWO names, and unlinking either name would
-    ///   free blocks the other still references.
+    /// `new_name` must not already exist (`FileExists`; deliberate divergence
+    /// from POSIX overwrite). Renaming an entry to its own name is a no-op
+    /// `Ok`. Moving a DIRECTORY into itself or a descendant is refused with
+    /// `DirectoryLoop`.
     pub fn rename(
         &mut self,
         parent_id: u64,
@@ -812,24 +1158,15 @@ impl<D: BlockDevice> UnaFS<D> {
             }
         }
 
-        self.journal.log(
-            &mut self.device,
-            JournalOp::BeginOp {
-                op_id: moved.inode_id,
-                desc: format!("Rename: {} -> {}", old_name, new_name),
-            },
-        )?;
-
         if same_dir {
             src_entries[pos].name = new_name.into();
             src_entries.sort_by(|a, b| a.name.cmp(&b.name));
             let data = crate::codec::serialize(&src_entries)?;
-            self.rewrite_data(parent_id, &data)?;
+            self.rewrite_data_inner(parent_id, &data)?;
         } else {
-            // Remove-then-add: see the crash-window note above.
             src_entries.remove(pos);
             let src_data = crate::codec::serialize(&src_entries)?;
-            self.rewrite_data(parent_id, &src_data)?;
+            self.rewrite_data_inner(parent_id, &src_data)?;
 
             let mut dst_entries = self.ls(new_parent_id)?;
             dst_entries.push(DirEntry {
@@ -839,15 +1176,10 @@ impl<D: BlockDevice> UnaFS<D> {
             });
             dst_entries.sort_by(|a, b| a.name.cmp(&b.name));
             let dst_data = crate::codec::serialize(&dst_entries)?;
-            self.rewrite_data(new_parent_id, &dst_data)?;
+            self.rewrite_data_inner(new_parent_id, &dst_data)?;
         }
 
-        self.journal.log(
-            &mut self.device,
-            JournalOp::EndOp {
-                op_id: moved.inode_id,
-            },
-        )?;
+        self.maybe_commit()?;
 
         #[cfg(feature = "std")]
         {
@@ -861,62 +1193,26 @@ impl<D: BlockDevice> UnaFS<D> {
         Ok(())
     }
 
-    /// Remove attribute `key` from `inode_id`: the inline value or the
-    /// spilled extent-backed value goes, and every catalog index entry for
-    /// this (inode, key) pair is scrubbed — including the duplicates that
-    /// `set_attribute` appends on re-set. After completion the attribute is
-    /// gone from `get_attribute` AND from `query`; a spilled value frees
-    /// its extents back to the bitmap. Other attributes on the inode are
-    /// untouched.
-    ///
-    /// Returns [`FileSystemError::AttributeNotFound`] if the inode carries
-    /// no such attribute.
-    ///
-    /// (Catalog entries are matched by 64-bit FNV-1a key hash — the same
-    /// assumption the query engine's candidate selection already rests on.)
-    ///
-    /// # Crash windows (no journal replay; ordered leak-not-dangle)
-    /// 1. After the catalog rewrite, before the inode write: the attribute
-    ///    is still on the inode (`get_attribute` sees it) but invisible to
-    ///    queries — unindexed, not inconsistent.
-    /// 2. After the inode write, before the frees: a spilled value's
-    ///    extents are leaked (allocated, unreferenced).
-    /// The catalog rewrite itself is new-extents-then-inode-swap (old-or-
-    /// new, never torn), and a torn op is reported as a dirty mount.
+    /// Remove attribute `key` from `inode_id`: the inline or spilled value
+    /// and every catalog entry for the (inode, key) pair go, atomically.
     pub fn remove_attribute(&mut self, inode_id: u64, key: &str) -> Result<(), FileSystemError> {
         let mut inode = self.read_inode(inode_id)?;
         if !inode.attributes.contains_key(key) && !inode.large_attributes.contains_key(key) {
             return Err(FileSystemError::AttributeNotFound);
         }
 
-        self.journal.log(
-            &mut self.device,
-            JournalOp::BeginOp {
-                op_id: inode_id,
-                desc: format!("RemoveAttr: {}", key),
-            },
-        )?;
-
-        // 1. Scrub the index first (see the crash-window note): every entry
-        //    for this inode + key hash, whatever value it recorded.
         let key_hash = hash_bytes(key.as_bytes());
-        self.remove_catalog_entries(|e| e.inode_id == inode_id && e.key_hash == key_hash)?;
+        self.remove_catalog_entries_inner(|e| e.inode_id == inode_id && e.key_hash == key_hash)?;
 
-        // 2. Drop the attribute from the inode — a single-block write.
         inode.attributes.remove(key);
         let spilled = inode.large_attributes.remove(key);
         self.write_inode(&inode)?;
 
-        // 3. Free a spilled value's extents, now that nothing references
-        //    them.
         if let Some(extents) = spilled {
-            self.free_extents(&extents)?;
-        } else {
-            self.sync_metadata()?;
+            self.decref_extents(&extents);
         }
 
-        self.journal
-            .log(&mut self.device, JournalOp::EndOp { op_id: inode_id })?;
+        self.maybe_commit()?;
 
         #[cfg(feature = "std")]
         {
@@ -930,13 +1226,74 @@ impl<D: BlockDevice> UnaFS<D> {
         Ok(())
     }
 
-    // --- QUERY ENGINE ---
+    // =====================================================================
+    // Snapshot index + reclaim queue (the future shape, on disk today)
+    // =====================================================================
+
+    /// The snapshot index (empty until K8b retains roots). v1 policy cap:
+    /// [`SNAPSHOT_CAP`].
+    pub fn snapshot_index(&mut self) -> Result<Vec<SnapshotEntry>, FileSystemError> {
+        let inode = self.read_inode(SNAP_INDEX_INODE_ID)?;
+        let data = self.read_data(SNAP_INDEX_INODE_ID, 0, inode.size)?;
+        if data.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(crate::codec::deserialize(&data)?)
+    }
+
+    /// The persistent reclaim queue's current entries.
+    pub fn reclaim_queue(&mut self) -> Result<Vec<ReclaimEntry>, FileSystemError> {
+        let inode = self.read_inode(RECLAIM_INODE_ID)?;
+        let data = self.read_data(RECLAIM_INODE_ID, 0, inode.size)?;
+        if data.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(crate::codec::deserialize(&data)?)
+    }
+
+    /// Enqueue a dropped root's blocks for reclamation, durably (one
+    /// transaction), WITHOUT freeing anything. K8b's snapshot-drop calls
+    /// this; the eager drain then runs immediately (v1 policy). Public so
+    /// the host suite can prove the crash-safe drain independently.
+    pub fn reclaim_enqueue(&mut self, entry: ReclaimEntry) -> Result<(), FileSystemError> {
+        let mut queue = self.reclaim_queue()?;
+        queue.push(entry);
+        let bytes = crate::codec::serialize(&queue)?;
+        self.rewrite_data_inner(RECLAIM_INODE_ID, &bytes)?;
+        self.maybe_commit()
+    }
+
+    /// Drain the reclaim queue to empty (v1 eager policy): decref every
+    /// enqueued block, empty the queue, ONE commit. Crash-safe: a power cut
+    /// before the flip leaves the full queue for the next mount.
+    pub fn reclaim_drain(&mut self) -> Result<(), FileSystemError> {
+        let queue = self.reclaim_queue()?;
+        if queue.is_empty() {
+            return Ok(());
+        }
+        crate::warnlog::warn("[UNAFS] :: pending reclaim queue found — draining (eager v1)");
+        for entry in &queue {
+            for &b in &entry.blocks {
+                if b > ROOT_BLOCK && b < self.superblock.block_count {
+                    self.refmap.decref(b);
+                }
+            }
+        }
+        let empty: Vec<ReclaimEntry> = Vec::new();
+        let bytes = crate::codec::serialize(&empty)?;
+        self.rewrite_data_inner(RECLAIM_INODE_ID, &bytes)?;
+        self.commit()
+    }
+
+    // =====================================================================
+    // Query engine
+    // =====================================================================
 
     /// Semantic query engine. no_std-capable: the similarity path routes its
     /// floating-point `sqrt` through `libm`, so kernel (`no_std`) and host
     /// (`std`) builds score along the same code path.
     pub fn query(&mut self, query_str: &str) -> Result<Vec<(Inode, f32)>, FileSystemError> {
-        let query = Query::parse(query_str).map_err(|e| FileSystemError::Query(e))?;
+        let query = Query::parse(query_str).map_err(FileSystemError::Query)?;
 
         let catalog_id = self.superblock.catalog_inode;
         let mut candidates = Vec::new();
@@ -946,7 +1303,6 @@ impl<D: BlockDevice> UnaFS<D> {
             let data = self.read_data(catalog_id, 0, inode.size)?;
             let entries = deserialize_catalog(&data)?;
 
-            // Use Stable Hasher
             let target_key_hash = hash_bytes(query.key.as_bytes());
 
             let target_val_hash = if let QueryOp::Eq = query.op {
@@ -973,7 +1329,11 @@ impl<D: BlockDevice> UnaFS<D> {
 
         let mut results = Vec::new();
         for id in candidates {
-            let inode = self.read_inode(id)?;
+            let inode = match self.read_inode(id) {
+                Ok(i) => i,
+                Err(FileSystemError::NotFound) => continue, // stale index entry
+                Err(e) => return Err(e),
+            };
 
             let mut val_opt = None;
             if let Some(v) = inode.attributes.get(&query.key) {
@@ -1015,60 +1375,46 @@ impl<D: BlockDevice> UnaFS<D> {
         Ok(results)
     }
 
-    // --- HELPERS ---
+    // =====================================================================
+    // Helpers
+    // =====================================================================
 
-    /// Return a single block to the free pool (in-memory; callers persist
-    /// via `sync_metadata`).
-    pub(crate) fn free_block(&mut self, block_id: u64) {
-        self.bitmap.free(block_id);
-        if self.superblock.free_blocks < self.superblock.block_count {
-            self.superblock.free_blocks += 1;
-        }
-    }
-
-    fn free_extents(&mut self, extents: &ExtentList) -> Result<(), FileSystemError> {
+    /// Release every block an extent list covers (decref — the frozen view
+    /// keeps the committed tree's blocks unallocatable until the next flip).
+    /// Bounded like the read path: hostile extents release nothing real.
+    pub(crate) fn decref_extents(&mut self, extents: &ExtentList) {
         for extent in extents {
-            // `length` is disk-derived: bound the walk to the volume so a
-            // hostile extent can neither wrap the block address nor spin the
-            // loop for 2^64 iterations (BEFS-HARDEN). Out-of-volume blocks
-            // have no bitmap bits — skipping them frees nothing real.
             let blocks = extent.length.div_ceil(BLOCK_SIZE);
             for i in 0..blocks {
                 let block = match extent.physical_block.checked_add(i) {
                     Some(b) if b < self.superblock.block_count => b,
                     _ => break,
                 };
-                self.free_block(block);
+                self.refmap.decref(block);
             }
         }
-        self.sync_metadata()?;
-        Ok(())
     }
 
-    /// Replace an inode's entire data contents, crash-ordered: the new bytes
-    /// are written to freshly allocated extents FIRST, then the inode is
-    /// swapped to point at them (a single-block write — the atomic point),
-    /// and only then are the old extents freed. A power cut leaves the
-    /// inode's data old-or-new, never torn; an interrupted rewrite leaks
-    /// blocks, never dangles. Unlike `write_data`, the logical size shrinks
-    /// to exactly `data.len()`.
-    fn rewrite_data(&mut self, inode_id: u64, data: &[u8]) -> Result<(), FileSystemError> {
+    /// Replace an inode's entire data contents (CoW): fresh extents for the
+    /// new bytes, remap the inode, release the old extents. Part of the
+    /// caller's transaction — becomes visible only at the root flip. Unlike
+    /// `write_data`, the logical size shrinks to exactly `data.len()`.
+    fn rewrite_data_inner(&mut self, inode_id: u64, data: &[u8]) -> Result<(), FileSystemError> {
         let new_chunks = if data.is_empty() {
             Vec::new()
         } else {
-            coalesce_extents(self.allocate_and_write_extents(data)?)
+            self.allocate_and_write_extents(data)?
         };
         let mut inode = self.read_inode(inode_id)?;
         let old_chunks = core::mem::replace(&mut inode.chunks, new_chunks);
         inode.size = data.len() as u64;
         self.write_inode(&inode)?;
-        self.free_extents(&old_chunks)?;
+        self.decref_extents(&old_chunks);
         Ok(())
     }
 
     /// Depth-first walk: does directory `dir_id` live anywhere inside the
-    /// subtree rooted at `root_id`? Used by `rename` to refuse moving a
-    /// directory into itself or its descendants.
+    /// subtree rooted at `root_id`?
     fn is_descendant_of(&mut self, dir_id: u64, root_id: u64) -> Result<bool, FileSystemError> {
         let mut stack = alloc::vec![root_id];
         while let Some(id) = stack.pop() {
@@ -1085,8 +1431,8 @@ impl<D: BlockDevice> UnaFS<D> {
     }
 
     /// Rewrite the attribute catalog with every entry matching `pred`
-    /// removed. No-op (and no rewrite) when nothing matches.
-    pub(crate) fn remove_catalog_entries<F: Fn(&CatalogEntry) -> bool>(
+    /// removed, inside the caller's transaction.
+    fn remove_catalog_entries_inner<F: Fn(&CatalogEntry) -> bool>(
         &mut self,
         pred: F,
     ) -> Result<(), FileSystemError> {
@@ -1103,38 +1449,54 @@ impl<D: BlockDevice> UnaFS<D> {
             return Ok(());
         }
         let new_data = serialize_catalog(&entries)?;
-        self.rewrite_data(catalog_id, &new_data)?;
+        self.rewrite_data_inner(catalog_id, &new_data)?;
         Ok(())
     }
 
+    /// Public catalog scrub (its own transaction) — the fsck repair path
+    /// uses it.
+    pub(crate) fn remove_catalog_entries<F: Fn(&CatalogEntry) -> bool>(
+        &mut self,
+        pred: F,
+    ) -> Result<(), FileSystemError> {
+        self.remove_catalog_entries_inner(pred)?;
+        self.maybe_commit()
+    }
+
+    /// Write `data` to freshly allocated extents (always fresh — this IS the
+    /// CoW allocation primitive), coalescing contiguous runs.
     fn allocate_and_write_extents(&mut self, data: &[u8]) -> Result<ExtentList, FileSystemError> {
-        let mut extents = Vec::new();
+        let mut extents: ExtentList = Vec::new();
         let mut data_written = 0;
         let mut current_logical = 0;
 
         while data_written < data.len() {
-            let block_id = self.bitmap.allocate().ok_or(FileSystemError::NoSpace)?;
-            if self.superblock.free_blocks > 0 {
-                self.superblock.free_blocks -= 1;
-            }
-
+            let block_id = self.alloc_block()?;
             let to_write = core::cmp::min(BLOCK_SIZE as usize, data.len() - data_written);
 
-            let mut block = vec![0u8; BLOCK_SIZE as usize];
+            let mut block = alloc::vec![0u8; BLOCK_SIZE as usize];
             block[..to_write].copy_from_slice(&data[data_written..data_written + to_write]);
-            self.device.write_block(block_id, &block)?;
+            self.write_fresh(block_id, &block)?;
 
-            extents.push(Extent {
-                logical_offset: current_logical,
-                physical_block: block_id,
-                length: to_write as u64,
-            });
+            match extents.last_mut() {
+                Some(last)
+                    if last.length % BLOCK_SIZE == 0
+                        && last.logical_offset + last.length == current_logical
+                        && last.physical_block + last.length / BLOCK_SIZE == block_id =>
+                {
+                    last.length += to_write as u64;
+                }
+                _ => extents.push(Extent {
+                    logical_offset: current_logical,
+                    physical_block: block_id,
+                    length: to_write as u64,
+                }),
+            }
 
             data_written += to_write;
             current_logical += to_write as u64;
         }
 
-        self.sync_metadata()?;
         Ok(extents)
     }
 
@@ -1156,7 +1518,7 @@ impl<D: BlockDevice> UnaFS<D> {
         entries.push(CatalogEntry::new(key, value, inode_id));
 
         let new_data = serialize_catalog(&entries)?;
-        self.write_data(catalog_id, 0, &new_data)?;
+        self.rewrite_data_inner(catalog_id, &new_data)?;
 
         Ok(())
     }
@@ -1164,7 +1526,9 @@ impl<D: BlockDevice> UnaFS<D> {
 
 impl<D: BlockDevice> Drop for UnaFS<D> {
     fn drop(&mut self) {
-        let _ = self.sync_metadata();
+        // Under CoW every completed public op has already committed (unless
+        // the caller disabled autocommit — the crash-simulation seam, whose
+        // whole point is that dropping models a power cut). Just flush.
         let _ = self.device.flush();
     }
 }
@@ -1209,27 +1573,6 @@ fn checked_extent_total(extents: &ExtentList) -> Result<u64, FileSystemError> {
         .iter()
         .try_fold(0u64, |acc, e| acc.checked_add(e.length))
         .ok_or(FileSystemError::CorruptVolume("extent lengths overflow"))
-}
-
-/// Merge logically and physically contiguous extents into single runs, so a
-/// rewritten catalog or directory keeps its extent list (and therefore its
-/// inode, which must fit in one block) small. This is purely an in-memory
-/// shaping of extent VALUES — the on-disk `Extent` encoding is untouched.
-fn coalesce_extents(extents: ExtentList) -> ExtentList {
-    let mut merged: ExtentList = Vec::with_capacity(extents.len());
-    for e in extents {
-        match merged.last_mut() {
-            Some(last)
-                if last.length % BLOCK_SIZE == 0
-                    && last.logical_offset + last.length == e.logical_offset
-                    && last.physical_block + last.length / BLOCK_SIZE == e.physical_block =>
-            {
-                last.length += e.length;
-            }
-            _ => merged.push(e),
-        }
-    }
-    merged
 }
 
 fn check_condition(val: &AttributeValue, op: &QueryOp, target: &AttributeValue) -> Option<f32> {

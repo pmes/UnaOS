@@ -6,42 +6,44 @@
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-//! Known-Answer Tests (KATs) — the on-disk byte-layout contract for UnaFS.
+//! Known-Answer Tests (KATs) — the on-disk byte-layout contract for UnaFS,
+//! version 3 (the K8 copy-on-write format).
 //!
 //! Every struct that reaches disk is serialized here with representative and
 //! boundary values and asserted BYTE-FOR-BYTE against golden vectors baked in
-//! as hex literals. These vectors were generated from the reference bincode
-//! 1.3.3 encoding (little-endian, fixed-int, no length limit) and MUST NOT
-//! change: the on-disk format is frozen. When the crate migrates to bincode
-//! 2.x, only the `enc`/`dec` seam below flips — every golden constant stays
-//! identical, which is exactly the proof the migration preserves the format.
+//! as hex literals. The K8 arc lifted the pre-K8 format freeze (design pass,
+//! 2026-07-16) and pinned NEW goldens for the structures the CoW format
+//! changed or added; the record encodings the format KEPT (Inode, Extent,
+//! AttributeValue, FileKind, CatalogEntry, DirEntry) retain their ORIGINAL
+//! bincode-1.3.3-frozen golden bytes — proof the K8 migration touched only
+//! what it claimed to.
 //!
-//! On-disk structs covered (all bincode-serialized paths in the crate):
-//!   * Superblock            (block 0; superblock.rs to_bytes)
-//!   * FileKind   (enum)     (nested in Inode / DirEntry)
-//!   * Extent                (nested in Inode.chunks / large_attributes)
-//!   * AttributeValue (enum) (nested in Inode; standalone for large_attributes)
-//!   * Inode                 (inode blocks; inode.rs to_bytes)
-//!   * CatalogEntry + list   (catalog.rs serialize_catalog)
-//!   * JournalOp  (enum)     (wal.rs journal log)
-//!   * DirEntry   + list     (fs.rs directory data)
+//! On-disk structs covered:
+//!   * Superblock (v3)       (block 0; static identity)
+//!   * RootRecord            (block 1, A/B 512 B slots; HAND-PACKED layout —
+//!                            the root-fits-one-sector KAT lives here)
+//!   * SnapshotEntry list    (the snapshot-index object's data)
+//!   * ReclaimEntry list     (the reclaim-queue object's data)
+//!   * FileKind   (enum)     (nested in Inode / DirEntry)      [unchanged]
+//!   * Extent                (nested in Inode)                 [unchanged]
+//!   * AttributeValue (enum) (nested in Inode; spilled values) [unchanged]
+//!   * Inode                 (inode blocks)                    [unchanged]
+//!   * CatalogEntry + list   (catalog.rs serialize_catalog)    [unchanged]
+//!   * DirEntry   + list     (fs.rs directory data)            [unchanged]
 //!
-//! Bitmap/SpaceMap reaches disk as RAW bytes (not bincode) and so is out of
-//! scope for the codec KATs.
+//! The inode-map and refcount-map leaves reach disk as RAW little-endian
+//! u64/u32 arrays (not bincode) and are covered by the recovery suite's
+//! remount round-trips.
 
-use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
-use unafs::catalog::{serialize_catalog, CatalogEntry};
+use std::collections::BTreeMap;
+use unafs::catalog::{CatalogEntry, serialize_catalog};
 use unafs::inode::{AttributeValue, Extent, FileKind, Inode};
+use unafs::root::{ROOT_RECORD_SIZE, ROOT_SECTOR_SIZE};
 use unafs::superblock::Superblock;
-use unafs::wal::JournalOp;
-use unafs::DirEntry;
+use unafs::{DirEntry, ReclaimEntry, RootRecord, SnapshotEntry};
 
-// ---- migration seam -------------------------------------------------------
-// This routes through the crate's codec (bincode 2.x, legacy() config). The
-// golden constants below were frozen from the reference bincode 1.3.3 encoding
-// and MUST remain byte-identical: that equality is the proof the bincode 2.x
-// migration preserves the on-disk format.
+// ---- codec seam -----------------------------------------------------------
 fn enc<T: Serialize + ?Sized>(v: &T) -> Vec<u8> {
     unafs::codec::serialize(v).expect("serialize")
 }
@@ -76,36 +78,119 @@ where
     );
 }
 
+// =============================================================================
+// NEW K8 (v3) structures
+// =============================================================================
+
 #[test]
-fn kat_superblock() {
-    let mut sb = Superblock::new(4096);
-    sb.root_inode = 12;
-    sb.catalog_inode = 13;
+fn kat_superblock_v3() {
+    let sb = Superblock::new(4096);
     kat(
         &sb,
-        "554e414653020000000010000000100000000000000c00000000000000f40f0000000000000b00000000000000010000000000000001000000000000000a000000000000000d00000000000000",
+        "554e4146530300000000100000001000000000000001000000000000000200000000000000",
     );
     // The real disk write path (to_bytes) must equal the golden too.
     assert_eq!(sb.to_bytes().unwrap(), enc(&sb));
 
-    let sb_b = Superblock {
-        magic: *b"UNAFS",
-        version: 2,
-        block_size: 4096,
-        block_count: u64::MAX,
-        root_inode: u64::MAX,
-        free_blocks: 0,
-        bitmap_start: u64::MAX,
-        bitmap_blocks: u64::MAX,
-        journal_start: u64::MAX,
-        journal_blocks: u64::MAX,
-        catalog_inode: u64::MAX,
-    };
+    // Boundary flavor: the largest representable volume.
+    let sb_b = Superblock::new(u64::MAX / 4096);
     kat(
         &sb_b,
-        "554e4146530200000000100000ffffffffffffffffffffffffffffffff0000000000000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "554e4146530300000000100000ffffffffffff0f0001000000000000000200000000000000",
     );
 }
+
+/// THE root-fits-one-sector KAT (brief §1): the packed root record is a
+/// fixed-size layout that must fit ONE 512 B sector — asserted here on the
+/// real bytes (the compile-time `const` assert in `root.rs` covers the
+/// constant; this covers the encoder).
+#[test]
+fn kat_root_record_fits_one_sector() {
+    let rr = RootRecord {
+        generation: 7,
+        imap_block: 12,
+        imap_leaves: 1,
+        next_inode: 5,
+        refmap_block: 14,
+        refmap_leaves: 1,
+        free_blocks: 4000,
+        flags: 0,
+    };
+    let bytes = rr.to_bytes();
+    assert_eq!(bytes.len(), ROOT_RECORD_SIZE);
+    assert!(
+        bytes.len() <= ROOT_SECTOR_SIZE,
+        "root record must fit one 512 B sector"
+    );
+    // Golden vector: magic + 8 LE u64 fields + FNV-1a checksum.
+    assert_eq!(
+        bytes.to_vec(),
+        h("554e41465352543107000000000000000c000000000000000100000000000000\
+           05000000000000000e000000000000000100000000000000a00f000000000000\
+           00000000000000004e03df1b00fa8d69")
+    );
+
+    // Roundtrip through the sector parser (with sector padding).
+    let mut sector = vec![0u8; ROOT_SECTOR_SIZE];
+    sector[..ROOT_RECORD_SIZE].copy_from_slice(&bytes);
+    let back = RootRecord::from_sector(&sector).expect("valid record parses");
+    assert_eq!(back, rr);
+
+    // A flipped byte breaks the checksum → the slot reads as absent/torn.
+    let mut torn = sector.clone();
+    torn[20] ^= 0xFF;
+    assert!(RootRecord::from_sector(&torn).is_none());
+    // Generation 0 is never valid (the zeroed-slot signature).
+    let zeroed = vec![0u8; ROOT_SECTOR_SIZE];
+    assert!(RootRecord::from_sector(&zeroed).is_none());
+}
+
+#[test]
+fn kat_snapshot_entry() {
+    let se = SnapshotEntry {
+        generation: 9,
+        imap_block: 77,
+        imap_leaves: 1,
+        name: "alpha".to_string(),
+        creator: "root".to_string(),
+        timestamp: 1234567890,
+    };
+    let list = vec![se];
+    assert_eq!(
+        enc(&list),
+        h("010000000000000009000000000000004d000000000000000100000000000000\
+           0500000000000000616c7068610400000000000000726f6f74d2029649000000\
+           00")
+    );
+    let back: Vec<SnapshotEntry> = dec(&enc(&list));
+    assert_eq!(back, list);
+    // The freshly formatted snapshot index: an EMPTY list (bare zero count).
+    let empty: Vec<SnapshotEntry> = Vec::new();
+    assert_eq!(enc(&empty), h("0000000000000000"));
+}
+
+#[test]
+fn kat_reclaim_entry() {
+    let re = ReclaimEntry {
+        generation: 9,
+        blocks: vec![10, 11, 12],
+    };
+    let list = vec![re];
+    assert_eq!(
+        enc(&list),
+        h("0100000000000000090000000000000003000000000000000a00000000000000\
+           0b000000000000000c00000000000000")
+    );
+    let back: Vec<ReclaimEntry> = dec(&enc(&list));
+    assert_eq!(back, list);
+    // The freshly formatted reclaim queue: an EMPTY list.
+    let empty: Vec<ReclaimEntry> = Vec::new();
+    assert_eq!(enc(&empty), h("0000000000000000"));
+}
+
+// =============================================================================
+// KEPT structures — original frozen goldens, byte-identical across K8
+// =============================================================================
 
 #[test]
 fn kat_filekind() {
@@ -188,22 +273,6 @@ fn kat_catalog() {
 }
 
 #[test]
-fn kat_journal_op() {
-    kat(
-        &JournalOp::BeginOp { op_id: 5, desc: "SetAttr: x".to_string() },
-        "0000000005000000000000000a00000000000000536574417474723a2078",
-    );
-    kat(&JournalOp::EndOp { op_id: 5 }, "010000000500000000000000");
-    kat(
-        &JournalOp::BeginCreate { parent_inode: 0, name: "unknown".to_string() },
-        "0200000000000000000000000700000000000000756e6b6e6f776e",
-    );
-    kat(&JournalOp::EndCreate { inode_id: 14 }, "030000000e00000000000000");
-    kat(&JournalOp::BeginWrite { inode_id: 14 }, "040000000e00000000000000");
-    kat(&JournalOp::EndWrite { inode_id: 14 }, "050000000e00000000000000");
-}
-
-#[test]
 fn kat_direntry() {
     let de = DirEntry { name: "manifesto.txt".to_string(), inode_id: 14, kind: FileKind::File };
     kat(&de, "0d000000000000006d616e69666573746f2e7478740e0000000000000000000000");
@@ -217,7 +286,6 @@ fn kat_direntry() {
     );
 
     // Empty directory: an empty Vec<DirEntry> is a bare u64 length prefix of 0.
-    // This is the on-disk representation of a freshly created (empty) directory.
     let empty: Vec<DirEntry> = Vec::new();
     assert_eq!(enc(&empty), h("0000000000000000"));
     let decoded: Vec<DirEntry> = dec(&h("0000000000000000"));

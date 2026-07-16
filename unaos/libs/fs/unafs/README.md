@@ -7,7 +7,8 @@ queryable data.
 ## What it does
 
 `unafs` is a self-contained filesystem implementation that lays out an entire
-on-disk volume (superblock, journal, free-space bitmap, inodes, and data) over a
+on-disk volume (superblock, A/B root sectors, inode map, refcount map, inodes,
+and data) over a
 simple block-device abstraction. Beyond plain file storage it provides:
 
 - **Semantic metadata.** Every inode carries a typed attribute map
@@ -19,12 +20,15 @@ simple block-device abstraction. Beyond plain file storage it provides:
   (e.g. `similarity(embedding, [..]) > 0.8`), with optional secondary `AND`
   filters. A hash-indexed attribute catalog narrows the candidate set before
   full evaluation.
-- **Crash-consistency.** A write-ahead journal records the begin/end of each
-  mutating operation; on mount, an unterminated transaction is detected and
-  reported as a dirty volume. A mark-and-sweep **fsck-scavenger** (`fsck.rs`)
-  reclaims the crash-window residue the crash-ordered mutation engine leaves —
-  leaked blocks and query-orphaned inodes — and `UnaFS::recover` runs it on a
-  dirty host mount and clears the dirty flag.
+- **Crash-consistency by construction (K8a, copy-on-write).** Every mutation
+  allocates fresh blocks — nothing reachable from the last committed root is
+  ever overwritten. Each public operation is one transaction, committed by an
+  atomic 512 B root-sector flip (A/B generation-stamped, checksummed slots in
+  block 1; mount picks the newer valid one). A power cut anywhere — including
+  a tear inside the root write itself — yields the old committed tree or the
+  new one, never a hybrid. There is no journal: atomicity is structural. An
+  **fsck** (`fsck.rs`) recomputes reachability and diffs it against the
+  persisted refcount map (media-corruption defense; `UnaFS::recover` repairs).
 - **Extent-based data layout.** File data is mapped through extents (logical
   offset to physical block runs), with contiguous appends coalesced into a
   single extent.
@@ -45,10 +49,17 @@ The crate root (`lib.rs`) re-exports the primary surface:
   (in-memory, for tests).
 - **`Inode`, `FileKind`, `AttributeValue`, `Extent`, `ExtentList`**
   (`inode.rs`) — the on-disk metadata record and its attribute/data types.
-- **`Superblock`** (`superblock.rs`) — volume header at block 0, describing the
-  layout (journal, bitmap, root inode, attribute catalog).
-- **`Journal` / `JournalOp`** (`wal.rs`) — the write-ahead log and its operation
-  records.
+- **`Superblock`** (`superblock.rs`) — the STATIC volume identity at block 0
+  (magic, version, geometry, the reserved logical inode ids); written once at
+  format, never rewritten.
+- **`RootRecord` / `RootSlot`** (`root.rs`) — the 512 B root record and the A/B
+  slot discipline: the single atomically-flipped sector the live tree hangs
+  from (`ROOT_RECORD_SIZE` ≤ 512 is compile-time asserted and KAT-pinned).
+- **`RefMap`** (`refmap.rs`) — the refcount allocator (current/frozen views).
+- **`SnapshotEntry` / `ReclaimEntry`** (`fs.rs`) — the snapshot-index and
+  reclaim-queue object payloads (the K8b/K8c future shape, on disk today).
+- **`legacy`** (`legacy.rs`) — the read-only pre-K8 (v2) walker +
+  `migrate_into`, feeding `tools/unafs migrate`.
 - **`Query` / `QueryOp` / `parse_value`** (`query.rs`) — the query parser and
   operators, plus `cosine_similarity` (in `fs.rs`, re-exported at the crate
   root) for vector scoring.
@@ -73,55 +84,60 @@ surfaced to other handlers through Bandy (`SMessage` / `Synapse`).
 
 ## Status
 
-Implemented and functional as a host-native library: format, mount, directory
-and file operations, journaled writes, inline and spilled attributes, the
+Implemented and functional: format, mount, directory and file operations,
+copy-on-write transactional writes, inline and spilled attributes, the
 mutation set (`unlink`, `rename`, `remove_attribute` — each with full
 attribute-catalog cleanup, so a deleted file or attribute can never be
-returned by a query), crash-recovery (the **fsck-scavenger** and the
-dirty-mount `recover` path), and the attribute/similarity query engine all
-work over `FileDevice` and `MemDevice`. Some areas are early-stage: the WAL is
-a dirty-detector, not a redo/undo log — recovery reconciles the volume rather
-than replaying logged block images (see below) — and the attribute catalog is
-append-only on `set_attribute` (mutations scrub it). The crate runs as an
-ordinary host process today and is converging onto the UnaOS kernel: the
-**`no_std` core port (BeFS-K1) has landed** (see below).
+returned by a query), refcount-consistency fsck, a one-way pre-K8 migration
+reader, and the attribute/similarity query engine, over `FileDevice` and
+`MemDevice`, host and kernel (`no_std`) alike. The attribute catalog is still
+append-only on `set_attribute` (mutations scrub it) — the F4 index arc's
+target.
 
-### Mutation crash windows and recovery (honest note)
+### The K8a copy-on-write core (format v3)
 
-The mutation operations are crash-**ordered**, not crash-**atomic**. The WAL
-detects a torn operation on the next mount and reports a dirty volume; it does
-**not** carry redo/undo block images, so a classic log replay is not
-expressible in the current on-disk format (growing that format is a separate,
-KAT-recutting arc). Instead, every mutation is sequenced so that no
-intermediate on-disk state ever references a freed block — catalog and
-directory rewrites go new-extents-first with a single-block inode swap last
-(each rewrite is old-or-new, never torn), and block frees come last of all.
-The only residue an ill-timed power cut can leave is therefore bounded and
-structurally sound: a **leak** (allocated-but-unreachable blocks), plus in one
-cross-directory `rename` window a **query-orphan** (a file reachable by query
-but by no name) — never a dangling reference and never a torn structure. The
-concrete per-operation windows are documented on `unlink`, `rename`, and
-`remove_attribute` in `fs.rs`.
+Everything mutable hangs from a single **root record** that fits ONE 512 B
+sector (a compile-time assert and a golden KAT both enforce it): commit =
+write all fresh blocks → barrier → write the *inactive* of two A/B
+generation-stamped, checksummed root slots (block 1) → barrier. Mount reads
+both slots and follows the newer valid one, so even a torn root write costs
+only the crashed commit. Key pieces:
 
-**Recovery (F1).** The fsck-scavenger (`fsck.rs`, `UnaFS::fsck`) walks the
-volume from its roots (system blocks, the name tree, the catalog), diffs the
-reachable-block set against the allocation bitmap, and — in repair mode —
-heals query-orphans (scrubbing their catalog entries via the same crash-ordered
-rewrite path, so nothing dangles) and returns every leaked block to the free
-pool. `UnaFS::recover` is the host-side dirty-mount entry point: it runs the
-scavenger in repair mode and, if the journal was dirty, resets it, clearing the
-flag so the next mount is clean. Both are exposed on the `unafs` CLI as
-`fsck [--repair]`. The kernel's K3 mount is read-only and never calls them. A
-run on a healthy volume reclaims nothing and leaves free-space accounting
-untouched (a KAT pins this). This recovery is **best-effort under program-order
-writes**: unafs issues no write barriers, so a reordering write-back cache can
-still dangle a pointer the ordered design never would — the scavenger is not a
-general fsck for arbitrary corruption (the on-disk parser is hardened
-separately), and the barrier question is future work.
+- **Stable logical inode ids** (Fork-1 verdict): `DirEntry.inode_id`,
+  `CatalogEntry.inode_id`, and the kernel's ACL keys never change across
+  mutations. The **inode map** (`imap`: id → current physical block, itself
+  CoW'd — raw u64 leaves + one index block) is the pointer graph's spine;
+  ids are never recycled, so a stale id fails `NotFound` instead of aliasing
+  a new file.
+- **Refcount allocator** (`refmap.rs`): free ⇔ reachable from no retained
+  root. Two views — `current` (in-flight transaction) and `frozen` (as of the
+  last commit); allocation requires BOTH zero, which structurally forbids
+  overwriting any block the on-disk tree still reaches. Counts persist CoW
+  (raw u32 leaves + index block) each commit.
+- **The future shape, on disk today**: the root reaches a **snapshot index**
+  and a **persistent reclaim queue**, both ordinary UnaFS objects (`System`
+  inodes at reserved ids 3 and 4). v1 policy: snapshot cap 16 (policy, not
+  structure); drop never frees directly — it enqueues, and the drain is eager
+  and crash-safe (one commit; a mount that finds a pending queue drains it).
+- **Bench counters** (`CommitStats`): commits, blocks written, blocks per
+  last commit — read via `commit_stats()`; the kernel witness pairs them with
+  CNTPCT ticks.
+- **Crash-simulation seam**: `set_autocommit(false)` performs mutations
+  without ever flipping the root — dropping the instance then models a power
+  cut mid-commit exactly (the recovery suite and the kernel `K8a-cow` witness
+  are built on it).
 
-Open-handle semantics are equally honest: there is no open-file table, so a
-caller that keeps a raw inode id across `unlink` touches freed (possibly
-reallocated) blocks — the caller's problem, by design.
+Open-handle semantics stay honest: there is no open-file table, but under
+stable logical ids a caller that keeps an id across `unlink` now gets
+`NotFound` — never another file's data.
+
+### Migration from the pre-K8 format (v2)
+
+Per the do-it-right principle there is **no runtime compatibility** with our
+own old format: `UnaFS::mount` refuses a v2 volume. `legacy.rs` is a read-only
+v2 walker, and `tools/unafs migrate --from old.img --to new.img` replays the
+whole tree (names, data, inline + spilled attributes) into a freshly formatted
+v3 image, verifying the result with a post-migration fsck.
 
 ## no_std and the feature matrix
 
@@ -132,7 +148,7 @@ depend on it with `default-features = false`.
 
 | Surface | `std` (default) | `no_std` (`--no-default-features`) |
 | :--- | :---: | :---: |
-| On-disk types (`Superblock`, `Inode`, `Extent`, `AttributeValue`, `FileKind`, `DirEntry`, `CatalogEntry`, `JournalOp`) | ✅ | ✅ |
+| On-disk types (`Superblock`, `RootRecord`, `Inode`, `Extent`, `AttributeValue`, `FileKind`, `DirEntry`, `CatalogEntry`, `SnapshotEntry`, `ReclaimEntry`) | ✅ | ✅ |
 | `codec` (bincode 2.x `legacy()` serialization seam) | ✅ | ✅ |
 | `BlockDevice` trait + `MemDevice` | ✅ | ✅ |
 | `adapter` (512↔4096 `BlockAdapter` over `SectorDevice`; GPT/MBR parse; `MemSectorDevice`) | ✅ | ✅ |
@@ -141,7 +157,8 @@ depend on it with `default-features = false`.
 | Mutations: `unlink` (full catalog scrub + extent frees) | ✅ | ✅ |
 | Mutations: `rename` (same-dir and cross-dir; refuses overwrite and directory loops) | ✅ | ✅ |
 | Mutations: `remove_attribute` (inline and spilled; index entries scrubbed) | ✅ | ✅ |
-| Recovery: `fsck` scavenger + `recover` (leak reclamation, query-orphan heal, dirty-flag clear) | ✅ | ✅ |
+| Recovery: `fsck` + `recover` (refcount-consistency check/rebuild, stale-index scrub) | ✅ | ✅ |
+| `legacy` (read-only pre-K8 v2 walker + `migrate_into`) | ✅ | ✅ |
 | `FileDevice` (host file backend) | ✅ | — |
 | `io::MappedFile` (memmap reader) | ✅ | — |
 | bandy `BandyMember` events on attribute change | ✅ | — |
@@ -194,10 +211,16 @@ frozen on-disk format (and its KATs) are unaffected.
 
 ## On-disk format and the KAT contract
 
-The on-disk byte layout is **frozen**. Serialization is bincode 2.x in its
-`legacy()` configuration (little-endian, fixed-int width, no length limit),
-which reproduces the historical bincode 1.3.3 encoding byte-for-byte, routed
-through the single `codec` seam so every write path agrees.
+The on-disk byte layout (format **v3**, the K8 CoW format) is **frozen**. The
+K8 design pass lifted the pre-K8 freeze once — deliberately, with new goldens
+cut the same arc — and re-froze: the superblock (static identity), the
+hand-packed 512 B root record (the root-fits-one-sector KAT), and the
+snapshot/reclaim entry lists are pinned alongside the record encodings the
+format KEPT byte-identical (`Inode`, `Extent`, `AttributeValue`, `FileKind`,
+`DirEntry`, `CatalogEntry` retain their ORIGINAL bincode-1.3.3-frozen
+goldens). Serialization is bincode 2.x in its `legacy()` configuration, routed
+through the single `codec` seam so every write path agrees; the inode-map and
+refcount-map leaves are raw little-endian arrays.
 
 `tests/kat_vectors.rs` holds golden-vector known-answer tests: every struct that
 reaches disk is serialized with representative and boundary values and asserted
@@ -221,25 +244,22 @@ address:
 - The attribute catalog is a flat, hash-bucketed list, (de)serialized whole:
   every non-equality query scans it, and **every `set_attribute` rewrites the
   entire catalog** — O(n), a scaling cliff rather than an index.
-- Journal recovery **reconciles, it does not replay**: the WAL detects a dirty
-  mount, and the fsck-scavenger (F1, landed) reclaims the resulting leaks and
-  heals query-orphans — but there is no redo/undo of logged block images, so
-  recovery is best-effort under program-order writes (see the crash-window and
-  recovery note above), not crash-atomic mutation.
-- Directories are flat serialized vectors; no checksums anywhere; extents are
-  a flat inline list (large-file depth limit).
+- Directories are flat serialized vectors; data blocks are unchecksummed (the
+  root record is checksummed); extents are a flat inline list (large-file
+  depth limit).
 
 Planned arcs (sequencing in [`docs/ROADMAP.md`](../../docs/ROADMAP.md) §2):
 
 | Arc | Content |
 | :--- | :--- |
-| F1 | Dirty-mount recovery: fsck-scavenger + `recover` — **✅ landed** (mark-and-sweep leak reclamation + query-orphan heal; reconciliation, not redo/undo replay — see the recovery note) |
-| F2 | `unlink` / `rename` / `remove_attribute` + catalog removal — **✅ landed** (crash-ordered, no replay; see the crash-window note) |
+| F1 | ~~Journal rollback/replay~~ — **superseded by K8a** (commit is one atomic root flip; there is no torn state to roll back) |
+| F2 | `unlink` / `rename` / `remove_attribute` + catalog removal — **✅ landed** (now each a single atomic CoW transaction) |
 | F3 | Generic on-disk B+tree (shared by indexes and directories, as BeFS did) |
 | F4 | Per-attribute B+tree indexes: log-time equality, true range queries |
 | F5 | **Live queries** — delta-emitting persistent queries published over bandy (the query-driven spatial UI, now including similarity) |
 | F6–F8 | B+tree directories; metadata checksums; extent trees |
-| K1–K4 | Kernel convergence: **`no_std` core (K1, ✅ landed)** → **512↔4096 block adapter + partitions (K2, ✅ landed)** → **read-only kernel mount of a real volume (K3, ✅ landed)** → journaled kernel writes |
+| K1–K4 | Kernel convergence: **`no_std` core (K1, ✅)** → **512↔4096 block adapter + partitions (K2, ✅)** → **read-only kernel mount (K3, ✅)** → **kernel writes (K4, ✅)** |
+| K8a–K8c | **Copy-on-write (K8a, ✅ landed — this format)** → retained roots/snapshots + reclamation (K8b) → the two-root diff walk + vaire/Bolt surface (K8c) |
 
 The capability model (see [`docs/SECURITY.md`](../../docs/SECURITY.md)) stores
 principals and grants as ordinary typed attributes (`owner`, `grants:*`), so
