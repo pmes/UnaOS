@@ -12,7 +12,7 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ## hw-pi4 track — 2026-07-16 (BANDY — the on-UnaOS SMessage bus + midden, program #3)
 
-### BANDY-2 — the write-side bus verbs (write/rm/mv), kernel fulfillment + ACL discipline 🔬 QEMU-green (metal rides the next attended sitting)
+### BANDY-2 — the write-side bus verbs (write/rm/mv), kernel fulfillment + ACL discipline ✅✅ METAL-CONFIRMED 2026-07-16 (same-day, same boot as BANDY-1: MBENCH 42/42 + 0 forbidden off `main 49f2333`; BANDY-CODEC2/WR/EQ2/ACL + BANDY-GRANT [w=0x7f] all PASS on silicon; log `pi-serial-2026-07-16-111850.log`)
 
 **What it does.** ROADMAP §3b arc 2 — the bus verb set grows to the DESTRUCTIVE side: `write`
 (create-or-truncate a root file), `rm` (unlink), `mv` (rename in place). ADDITIVE to the frozen v1
@@ -156,7 +156,7 @@ Peter): expected = live fps/ms/load, meter reads 6, bars move. `arch/aarch64/{mo
 
 ## hw-pi4 track — 2026-07-16 (BANDY-1 — the on-UnaOS SMessage bus + midden, program #3)
 
-### BANDY-1 — syscall-backed bus transport, native v1 wire, ls/cat/cp kernel fulfillment 🔬 QEMU-green (metal rides the next attended sitting)
+### BANDY-1 — syscall-backed bus transport, native v1 wire, ls/cat/cp kernel fulfillment ✅✅ METAL-CONFIRMED 2026-07-16 (one attended boot off `main 49f2333`, MBENCH 42/42 + 0 forbidden, CAPSTONE 6/6 4/4 cores; BANDY-CODEC/STAMP/RT/EQ all PASS on silicon — midden (program #3) round-tripped the bus on real hardware, a UnaOS first; log `pi-serial-2026-07-16-111850.log`)
 
 **What it does.** ROADMAP §3b arc 1 — "port the bus, not the binary convention." A new
 `arch/aarch64/bus.rs` defines ONE coherent UnaOS-NATIVE v1 frame both directions (52-byte header:
