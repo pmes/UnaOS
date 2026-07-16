@@ -9,9 +9,12 @@
 //! on-disk value §JD16's `ls -l` already renders as the dashed placeholder. The kernel never
 //! fabricates a reading.
 //!
-//! On x86_64 there is no calibrated invariant-frequency counter plumbed in this kernel (the TSC
-//! frequency is not measured anywhere), so a set clock is honestly FROZEN at its seeded value
-//! (elapsed = 0). No x86 caller sets the clock today; the verbs merely compile there.
+//! CLOCK-X1 lights the x86_64 twin: the invariant TSC (`rdtsc`), calibrated once at boot against
+//! the ACPI PM timer (`apic::calibrate` → `apic::tsc_hz`), is the free-running counter here, gated
+//! on CPUID's invariant-TSC bit (`apic::tsc_invariant`, leaf 0x8000_0007 EDX[8]). Where the CPU
+//! does NOT advertise an invariant TSC, or calibration never ran / was rejected, `monotonic()`
+//! returns `None` and a set clock stays honestly FROZEN at its seeded value (the pre-CLOCK-X1
+//! behaviour) — the kernel never serves a non-invariant or uncalibrated TSC as a clock.
 //!
 //! Range and resolution follow FAT's on-disk format (the consumer this arc serves): years
 //! 1980..=2107, 2-second mtime resolution (the packing truncates the low second bit). Internally
@@ -26,7 +29,8 @@ use spin::Mutex;
 struct Anchor {
     /// Seconds since 1980-01-01 00:00:00 at the moment of `set`.
     base_secs: u64,
-    /// The architectural counter at the moment of `set` (0 where no counter exists — x86).
+    /// The architectural counter at the moment of `set` (0 where no counter is available — a
+    /// non-invariant or uncalibrated x86 TSC, where `monotonic()` is `None`).
     anchor_ticks: u64,
 }
 
@@ -34,7 +38,8 @@ static ANCHOR: Mutex<Option<Anchor>> = Mutex::new(None);
 
 /// The free-running monotonic counter and its frequency, where the architecture provides one.
 /// aarch64: `CNTPCT_EL0`/`CNTFRQ_EL0` (EL-independent, never stops — the JD3 mechanism).
-/// x86_64: none plumbed — returns `None`, and a set clock stays frozen at its seeded second.
+/// x86_64: the invariant TSC (`rdtsc`) at its boot-calibrated frequency, gated on the CPUID
+/// invariant-TSC bit and a successful calibration; `None` otherwise (honest frozen clock).
 #[cfg(target_arch = "aarch64")]
 fn monotonic() -> Option<(u64, u64)> {
     let f = crate::arch::timer::cntfrq();
@@ -44,7 +49,25 @@ fn monotonic() -> Option<(u64, u64)> {
     Some((crate::arch::timer::cntpct(), f))
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+/// CLOCK-X1 — the x86 twin. `rdtsc` is only served as a clock when the CPU advertises an INVARIANT
+/// TSC (constant rate across P-/C-/T-states, never stops — CPUID leaf 0x8000_0007 EDX[8]) AND the
+/// boot calibration against the ACPI PM timer produced a frequency (`apic::tsc_hz() != 0`). Either
+/// missing → `None`, i.e. the clock stays frozen at its seed rather than run on an untrustworthy or
+/// unscaled counter. Cheap and lock-free (one CPUID + one atomic load + one `rdtsc`), so it is safe
+/// on the shell-verb and FAT-stamp hot paths.
+#[cfg(target_arch = "x86_64")]
+fn monotonic() -> Option<(u64, u64)> {
+    if !crate::arch::apic::tsc_invariant() {
+        return None; // non-invariant TSC: never serve it as a clock
+    }
+    let hz = crate::arch::apic::tsc_hz();
+    if hz == 0 {
+        return None; // calibration never ran or was rejected — stay honestly frozen
+    }
+    Some((crate::arch::now_cycles(), hz))
+}
+
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 fn monotonic() -> Option<(u64, u64)> {
     None
 }
@@ -155,9 +178,9 @@ pub fn set(t: WallTime) -> Result<(), ()> {
 
 /// JD18: whole seconds since boot from the free-running architectural counter, INDEPENDENT of
 /// whether the wall clock has been seeded. aarch64: `CNTPCT_EL0 / CNTFRQ_EL0` (the counter resets to
-/// 0 at boot and never stops — the same JD3 mechanism `now()` extends from). x86_64: no calibrated
-/// invariant counter is plumbed in this kernel → `None`, and the `uptime` verb prints an honest
-/// "no calibrated counter on this arch". Purely additive: it reads the same `monotonic()` source but
+/// 0 at boot and never stops — the same JD3 mechanism `now()` extends from). x86_64 (CLOCK-X1): the
+/// boot-calibrated invariant TSC / `tsc_hz` → `Some` once calibrated, else `None` and the `uptime`
+/// verb prints an honest "no calibrated counter on this arch". Purely additive: it reads the same `monotonic()` source but
 /// touches neither the seed anchor nor the `now()`/`fat_stamp()` logic.
 pub fn uptime_secs() -> Option<u64> {
     monotonic().map(|(ticks, freq)| ticks / freq)
@@ -170,7 +193,7 @@ pub fn now() -> Option<WallTime> {
     let a = guard.as_ref()?;
     let elapsed = match monotonic() {
         Some((p, f)) => p.wrapping_sub(a.anchor_ticks) / f,
-        None => 0, // x86: frozen at the seeded value, documented above
+        None => 0, // no invariant/calibrated counter: frozen at the seeded value, documented above
     };
     Some(WallTime::from_secs(a.base_secs.saturating_add(elapsed)))
 }
