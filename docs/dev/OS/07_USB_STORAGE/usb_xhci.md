@@ -323,12 +323,29 @@ change.
 - No-op change (e.g. a boot-reset `C_PORT_ENABLE`): `HUB slot N port P: no actionable
   connection change`
 
-**Metal verdict: PENDING** (attended rMBP sitting). QEMU exercises the M1 path — the
-qemu-xhci hub delivers a status-change bitmap for its boot-present port, so the config
-trace, the `status-change: port P` decode, and the `GET_PORT_STATUS` servicing all fire
-and are asserted in the `UNAOS_HUBSTORAGE` regression — but the connect/disconnect
-timing and the SS branch are silicon-verified at the bench (topology: a mouse/keyboard
-hot-plugged behind the HS hub, SS hub as available).
+**Metal verdict (2026-07-16, attended rMBP sitting; logs
+`rmbp-serial-2026-07-16-114357-boot2-knobon.log` primary +
+`…-113049-boot1-knoboff.log` supplement): M1+M2+M3 ✅ METAL-CONFIRMED.** Both hubs
+(HS and SS) configured + armed their Status Change Endpoints. Repeated live hub-port
+hot-plug cycles across ports 1/3/4: every disconnect tore down exactly the one
+downstream slot with the full scope trace (`root + sibling ports + other trees
+untouched`), every re-plug reset + re-enumerated the device through the existing route
+machinery, and a keyboard hot-plugged into a hub port typed immediately (single event
+per press — the §7e dup-guard also metal-clean). Storage and the FTDI mirror survived
+every cycle. A transient root-port `ADDRESS_DEVICE` code-17 during a large re-plug was
+absorbed by the pre-existing paced-retry recovery (§6) — the full stack held.
+
+**⚠ New metal findings (→ XENUM-3 seed, precisely characterized in the log):**
+(1) *A mouse behind the hub still strands* — but NOT via the condition XENUM-1's M2
+targets: the downstream device descriptor read completes **structurally valid with
+zeroed content** (`vid=0000 pid=0000`, "no HID interrupt endpoint"), so the
+`bLength/bDescriptorType` check passes and the M2 retry never fires. Likely a
+short/partial read (e.g. only the 8-byte header arrives for an FS/LS device behind the
+HS hub); the fix shape is retrying on zero vid+pid or checking the actual transfer
+length. (2) *`downstream ADDRESS_DEVICE code 17` has no retry* — the downstream
+addressing path gives up on first failure, unlike root ports' paced recovery. The same
+hub carried a working keyboard throughout, so the transport is sound; both gaps are in
+downstream-enumeration robustness.
 
 ---
 
@@ -406,16 +423,35 @@ USB3_PSSEN mask=0x.. 0x..->0x.. (knob-on) == witness ::`. The masks + before/aft
 read-backs are the assertable record: after == `before | mask` confirms the mux
 toggled; a smaller value means firmware (Apple EFI) locked some shared-port bits.
 
-**Two bench findings (pre-registered, metal-PENDING).** (1) *Do the Apple internal
-devices behave on xHCI after the flip?* Expected: they enumerate like external HID.
-(2) *Does the internal trackpad honor boot protocol?* Expected: `SET_PROTOCOL(boot)`
-yields proto-2 relative reports. If the trackpad is report-descriptor-only (no boot
-mode) its leg parks while the keyboard leg may still succeed — reported independently.
-
 **QEMU is inert by design.** QEMU's qemu-xhci (0x1b36) doesn't model Panther-Point
 routing, so under knob-on the code reads the register block (harmless) and prints the
 witness with `mask=0x0` / before == after (no write issued), then storage + MISSION run
 unregressed. The real verdict is the attended rMBP bench.
+
+**Metal verdict (2026-07-16, attended rMBP sitting, two cold boots):**
+
+- **Boot 1 (knob-OFF default) — externals DROPPED, the decisive outcome.** The kernel
+  booted (screen console + scrolling test ran) but every shared USB2 port was dead:
+  no FTDI serial, no external keyboard/mouse, storage never enumerated. Apple EFI does
+  **not** route the shared ports itself.
+- **Boot 2 (knob-ON, cold) — the first-ever cold-boot register capture:**
+  `XUSB2PR mask=0xf routed 0x0->0xf + USB3_PSSEN mask=0xf 0x0->0xf` — firmware leaves
+  **both at 0x0**. The kernel's write is the only thing putting those ports on xHCI.
+  With the flip, the full baseline returned (serial, storage chain + S8-write witness,
+  external input).
+- **Consequence (pre-registered Maestro policy, now triggered): the routing must be
+  default-ON on this platform.** Knob-OFF as a merge default is unsafe — it silences
+  serial, storage, and input at once. The default flip is a follow-up fold.
+- **Pre-registered bench findings, both answered negative:** the internal keyboard and
+  trackpad remained unresponsive with the flip active — they are NOT on the switchable
+  mask (consistent with the §7f framing analysis) — and the EHCI-1 scout (§9) read
+  **0 connected on every EHCI port** the same boot, so the internals are on neither
+  surface as read. The internal-HID line needs the deeper investigation the scout's
+  falsification branch pre-registered (both EHCI functions sat halted with
+  `CONFIGFLAG=0`, so "asleep until ownership/power setup" remains a candidate
+  explanation — analysis at the next arc boundary).
+- The M0 keyboard dup-guard held on metal: single `KEY` event per press throughout,
+  including from a keyboard hot-plugged behind the hub.
 
 ---
 
@@ -483,6 +519,16 @@ baseline (QEMU attaches no downstream device). The real value is the attended rM
 
 The scout's analysis, pre-registered metal expectations, and the recommended EHCI-driver-arc
 shape live in the SCOUT report (`~/.claude/plans/unaos/review/unaos-ehci1-SCOUT.md`).
+
+**Metal result (2026-07-16, attended rMBP sitting): the falsification branch fired.** Both
+Panther Point EHCI functions (`8086:1e26`, `8086:1e2d`) were surveyed on silicon: both sat
+**halted** (`RS=0`, `HCHalted=1`) with `CONFIGFLAG=0` and **0 connected across all 4 ports** —
+the internal keyboard/trackpad are visible on neither the switchable xHCI mask (§7f, flip
+active the same boot) nor the EHCI `PORTSC` blocks as read. Per the pre-registered rule, no
+EHCI driver arc proceeds on this evidence; the open question for the next investigation is
+whether the internals only appear after ownership/`CONFIGFLAG`/port-power setup (both
+controllers were asleep, so "not connected" and "not visible while unconfigured" cannot yet
+be distinguished), or whether they attach elsewhere entirely (e.g. SPI, as on later models).
 
 ---
 

@@ -65,3 +65,12 @@ design (the boot trace reads `(NOT invariant — wall clock stays frozen)`). The
 reachable only on invariant-TSC silicon; the target 2012 rMBP (Ivy Bridge) advertises it, so the witness
 is a **metal-bench** line. The firing behaviour above was reproduced under QEMU only with a throwaway,
 uncommitted force-invariant probe to exercise the M3 logic.
+
+**Metal verdict (2026-07-16, attended rMBP sitting; log
+`rmbp-serial-2026-07-16-114357-boot2-knobon.log`): ✅ METAL-CONFIRMED.** The 2012 rMBP's
+Ivy Bridge advertises the invariant-TSC bit as predicted: boot trace
+`clock: TSC calibrated ~2693 MHz (invariant)`, then the witness fired live —
+`:: CLOCK-X1: TSC invariant, ~2693 MHz; monotone (rdtsc +956725972); uptime 14->15 s
+(JD17 x86-frozen clock now advances) == witness ::` — a genuine wall-second advance on
+silicon. The x86 half of the JD17 wall clock is live: `uptime` counts, and a seeded
+clock advances instead of freezing.

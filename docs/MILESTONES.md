@@ -10,6 +10,35 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-rmbp track — 2026-07-16 (R17 attended rMBP sitting — four verdicts in two cold boots)
+
+One sitting (logs `rmbp-serial-2026-07-16-114357-boot2-knobon.log` primary,
+`…-113049-boot1-knoboff.log` supplement) settled every metal-pending x86 arc below:
+
+- **XENUM-2 ✅ METAL-CONFIRMED (M1+M2+M3).** Both hubs armed their Status Change
+  Endpoints; live hub-port hot-plug cycles on ports 1/3/4 all detected, enumerated, and
+  tore down with the exact scope trace; a keyboard hot-plugged behind the hub typed
+  immediately, single event per press. Two NEW downstream-robustness gaps precisely
+  characterized (→ XENUM-3 seed, `usb_xhci.md` §7d): a structurally-valid-but-zeroed
+  descriptor evades the M2 retry and strands a hub-downstream mouse; downstream
+  `ADDRESS_DEVICE code 17` has no retry.
+- **PORTSW-1 — the decisive topology answer.** Boot 1 (knob-off default): externals
+  DROPPED (no serial/storage/input; kernel alive on screen). Boot 2 (knob-on, cold):
+  first-ever cold capture `XUSB2PR 0x0→0xf`, `USB3_PSSEN 0x0→0xf` — Apple EFI routes
+  nothing; our write is load-bearing. **Pre-registered policy triggered: routing goes
+  default-ON on this platform (follow-up fold).** Internals unresponsive with the flip
+  active (pre-registered negative). M0 kbd dup-guard ✅ metal-clean.
+- **CLOCK-X1 ✅ METAL-CONFIRMED.** `clock: TSC calibrated ~2693 MHz (invariant)` + the
+  witness fired live (uptime 14→15 s) — the x86 wall clock advances on silicon.
+- **EHCI-1 scout — the falsification branch fired.** Both EHCI functions halted,
+  `CONFIGFLAG=0`, 0 connected on all 4 ports: the internals are visible on neither
+  surface as read; no EHCI driver arc proceeds on this evidence (open question:
+  asleep-until-configured vs not-USB-attached).
+
+Baseline all green throughout Boot 2: storage chain + S8-write + CFU witnesses, both
+pointer/keyboard paths, FTDI mirror; one transient root-port `ADDRESS_DEVICE code 17`
+during a large re-plug absorbed by the pre-existing paced-retry recovery.
+
 ## hw-rmbp track — 2026-07-16 (EHCI-1 — read-only EHCI reconnaissance scout: what an EHCI driver arc would face)
 
 ### EHCI-1 — read-only EHCI reconnaissance scout 🔬 `hw-rmbp`
