@@ -4271,3 +4271,77 @@ PREDICTED likelihood after the review-lens correction above):
 - **`CRR-before=1` + CA + clean boots ×3+** ⇒ would CONTRADICT §5.4.5 on this silicon (halted
   controller reading CRR=1) — treat as a silicon-erratum finding AND a strong FIXED signal;
   record exactly, both halves matter.
+
+---
+
+### ORIN-SMP-7 — the BOOT-STATE-CONTEXT bisect (`UNAOS_SMPPROBE=24..27`, knob-gated; bench Peter-attended)
+
+§ORIN-SMP-6 + the XCARVE leg-23 close-out acquitted every code-shape suspect for the SMP-3 wall on
+silicon — entry shape (leg 21), wake concurrency (leg 22), their conjunction (leg 23, replicated ×5).
+What remains is BOOT-STATE CONTEXT: the original SMP-3 fault (IOB `SERR=0x12` / CBB-`0x6`, ADDR
+`0x8000000000000200` — a bit-63 address, suggestive next to the XCARVE carveout wall's bit-63
+`0x800000027767dc80`) fired from the real `UNAOS_TEGRASMP=1` kick-off at its production position,
+while every surviving probe ran from the `smpprobe` dispatch point. This arc bisects WHERE in the boot
+the wake happens — specifically, relative to the JB2b `jb2b_attach` xHCI takeover / JB9i
+inherited-slot eviction (the XCARVE-suspect step, and the interplay the bit-63 echo suggests).
+
+**The boot-ordering audit (the leg→position mapping, with code evidence).** In `tegra_early_stop`
+(`main.rs`) the relevant order is: JB1c BPMP ungate + JB5/JB9f raw-handoff witnesses → JM4 (GIC-600 +
+generic timer, `percpu::init(0)`) → global heap → **JB2b `jb2b_attach` xHCI takeover (incl. JB9i
+eviction)** → the `smpprobe::run` dispatch (`main.rs`) → the `tegrasmp` `start_secondaries_tegra`
+kick-off → JM6. Two facts fall out of that audit and shape the legs:
+
+1. **The `smpprobe::run` dispatch (leg 23's site) and the `start_secondaries_tegra` kick-off are
+   adjacent and BOTH post-xHCI-takeover** — nothing executable sits between them. So position is NOT
+   what differed between leg 23 and the real SMP-3 run; and the code delta is also ~nil (leg 23's
+   `run_real_entry_rapid` publishes via `smp_virt::probe_publish_real_path`, the line-for-line twin of
+   `start_secondaries_tegra`'s pre-`CPU_ON` publication, then bursts the same `CPU_ON`s into the same
+   real `_secondary_start_virt`; the only difference — a print-free burst vs SMP-3's print-per-call
+   loop — was itself acquitted by legs 20/22). The residual enumerable delta reduces to the build
+   FEATURE / image LAYOUT (`tegrasmp` vs `smpprobe`), which the XCARVE arc proved decides fabric
+   exposure — the through-line to pursue.
+2. **The one boot-state variable that is both in-lane and cleanly togglable is the wake's position
+   relative to the xHCI takeover.** The earliest point at which the real-entry rapid wake can run
+   (GIC + timer + SMC + serial all live, `percpu::init(0)` done) is immediately after JM4 + the heap,
+   which is BEFORE `jb2b_attach`. So a second, PRE-takeover dispatch site (`smpprobe::run_pre_xhci`,
+   placed right after `:: KERNEL HEAP ALLOCATED ::`) brackets the takeover against the existing
+   post-takeover site, with ZERO `xusb_tegra.rs` touch.
+
+**The legs (one variable per leg; pre-registered predictions; probe-only).** Legs 24 and 25 run the
+IDENTICAL wake code (`run_real_entry_rapid`, the leg-23 real-entry × rapid 5-core path — publication
+via the granted `probe_publish_real_path`, real `_secondary_start_virt`, `CORE_READY` online signal);
+they differ ONLY in dispatch POSITION, so the pair isolates exactly one variable — the
+takeover/eviction fabric state at wake time.
+
+| knob | the ONE variable (position) | dispatch site | prediction |
+|---|---|---|---|
+| **24** | REAL entry × rapid 5-core at the **POST-xHCI-takeover** position (leg-23's site) — the REPRO CONTROL | `smpprobe::run`, after `jb2b_attach` | Per the boot-state hypothesis: FAULT (IOB `…0200`). Given leg 23's ×5 innocence at this exact position, the likely actual is **SURVIVE** — then the bisect INVERTS and the finding is the leg-24-vs-real-SMP-3 delta (audit point 1: image layout / build feature). |
+| **25** | the SAME wake at the **PRE-xHCI-takeover** position — before `jb2b_attach`/JB9i eviction | `smpprobe::run_pre_xhci`, after JM4+heap | If leg 24 FAULTS and 25 SURVIVES → the takeover/eviction fabric state IS the trigger (the wall is created by the xHCI takeover, and a wake into the pre-takeover fabric is clean). If BOTH survive → the takeover-state axis is also acquitted; the residual is the build-layout delta (audit point 1), a non-probe follow-up. |
+
+**Legs 26/27 — FOLDED (documented, not built).** Leg 26 ("wake immediately AFTER JB9i eviction, before
+the rest of `jb2b_attach`") would need an instrumentation hook INSIDE `jb2b_attach` (`xusb_tegra.rs` —
+another executor's file) → **OUT OF LANE, flagged to LC-orin**; and leg 24 (post-FULL-takeover) already
+brackets the post-eviction fabric, so the coarse before/after bracket (25 vs 24) captures the
+takeover-state question without it. Leg 27 ("full production post-wake path") is **DEGENERATE**: after
+any probe leg returns, the BSP already proceeds to the JM6 EL1 drop + CAPSTONE with the woken APs parked
+in WFI — exactly the real SMP-3 post-wake path (leg 23/24's APs run the real `__secondary_rust_virt` to
+its WFI park). Both fold-reasons print a self-documenting line if 26/27 are ever armed; three legs (24,
+25, and the acquitted-baseline leg 23 re-run) suffice. See `scripts/orin-smp7-bench.md`.
+
+**Byte-identity note.** Knob-off, the whole `smpprobe` module and BOTH `main.rs` dispatch calls
+(`run` and the new `run_pre_xhci`) are `#[cfg(feature = "smpprobe")]`-compiled-out; zero `SMPPROBE-7`
+strings, `tegra:` count 109. The default tegra kernel's `.text` / `.rodata` / `.data` are BIT-identical
+base-vs-HEAD; the loadable image differs by exactly **one byte** — a panic `Location` line-number
+constant in `.data.rel.ro`, shifted by the new (compiled-out) `run_pre_xhci` dispatch site in `main.rs`
+(the unavoidable source-line-number consequence of any new main.rs call site, cf. the SMP-3 kick-off
+addition; no behavioral effect, running code unchanged). The armed images 24/25 are distinct kernels
+carrying `SMPPROBE-7` strings; validate by ELF hash + `strings | grep SMPPROBE-7` + the live `sel=<n>`
+on the first serial line.
+
+**Gate (this executor).** `./arroyo check` green (both arches, knob-off) + `UNAOS_TEGRA=1
+UNAOS_SMPPROBE=24/25` compile; `test-arm 22` MISSION SUCCESS; GICv3 `test-arm 40` CAPSTONE 6/6 + 3/3
+secondaries (the shared `smp_virt.rs` path is byte-untouched — the arc only READS via the SMP-6-granted
+`probe_publish_real_path`/`probe_core_online`); `kernel8-test` CAPSTONE COMPLETE (0 FAIL); x86 `test 25`
+MISSION SUCCESS; knob-off `.text/.rodata/.data` bit-identical + the 1-byte `.data.rel.ro` note above; 2
+armed leg tars + the knob-off DEFAULT staged. The metal verdict is the attended Orin bench with LC-orin
++ Peter (runbook `scripts/orin-smp7-bench.md`).
