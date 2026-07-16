@@ -296,12 +296,16 @@ HS/FS speed bits do not apply) — best-effort per the brief; the HS/FS mouse/ke
 path is exact.
 
 **M3 — downstream disconnect.** On `C_PORT_CONNECTION` set with `PORT_CONNECTION = 0`,
-`disconnect_hub_port` tears down every slot whose route string carries this hub port's
-full nibble prefix (`route_depth > hub_depth` **and** the low `(hub_depth + 1)` nibbles
-match) — the route-prefix analogue of `dispose_disconnected_slots`' port-scoping, so a
-nested hub's whole subtree goes with it. Bindings are cleared, `DISABLE_SLOT` is queued
-via the existing `slots_to_disable` drain, `reset_soft_state` runs. Root-port slots and
-sibling hub ports are provably untouched (the match requires this port's exact prefix);
+`disconnect_hub_port` tears down every slot in the SAME physical tree (root `port_id`
+match — the xHCI route string does **not** encode the root port, so two hubs on different
+root ports carry identical child route values; the root-port check disambiguates the
+trees) whose route string carries this hub port's full nibble prefix
+(`route_depth > hub_depth` **and** the low `(hub_depth + 1)` nibbles match) — the
+route-prefix analogue of `dispose_disconnected_slots`' port-scoping, so a nested hub's
+whole subtree goes with it. Bindings are cleared, `DISABLE_SLOT` is queued via the
+existing `slots_to_disable` drain, `reset_soft_state` runs. Root-port slots, sibling hub
+ports, and other trees are provably untouched (the match requires this tree + this
+port's exact prefix);
 the summary trace asserts the scope. Every latched change feature on the port is then
 cleared (feature selectors 16..20) so the endpoint deasserts and can report the next
 change.
@@ -313,8 +317,9 @@ change.
 - M1 status read: `HUB slot N port P status: wPortStatus=0xXXXX wPortChange=0xXXXX (SS|HS/FS)`
 - M2 connect: `HUB slot N port P connect: resetting + enumerating downstream device`
   (then the existing `HUB downstream slot … class=… vid=… pid=…` enumeration lines)
-- M3 disconnect: `HUB slot N port P disconnect: M slot(s) torn down (scope: route-prefix
-  0xNN mask 0xNN, root + sibling ports untouched)`
+- M3 disconnect: `HUB slot N port P disconnect: M slot(s) torn down (scope: root-port R
+  route-prefix 0xNN mask 0xNN, root + sibling ports + other trees untouched)`
+- int-EP error recovery: `HUB slot N status-change read error (code C); re-arming.`
 - No-op change (e.g. a boot-reset `C_PORT_ENABLE`): `HUB slot N port P: no actionable
   connection change`
 
