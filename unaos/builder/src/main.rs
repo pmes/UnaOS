@@ -62,7 +62,7 @@ fn main() {
     if std::env::var("UNAOS_EHCISCOUT").is_ok() { feats.push("ehciscout"); }
     // EHCI-2 configure-and-relook scout: UNAOS_EHCICONFIG=1 arms a knob-gated minimal EHCI wake
     // sequence + two PORTSC censuses (before/after CONFIGFLAG=1). Implies ehciscout. Writes confined
-    // to the EHCI functions' PMCSR/USBLEGSUP-OS-own/RS/CONFIGFLAG/PORTSC-port-power. x86_64-only.
+    // to the EHCI functions' PMCSR/USBLEGSUP-OS-own/USBLEGCTLSTS/RS/CONFIGFLAG/PORTSC-port-power. x86_64-only.
     // Kept in sync with arroyo's mapping.
     if std::env::var("UNAOS_EHCICONFIG").is_ok() { feats.push("ehciconfig"); }
     // VPERF M2: the fbcon viewport-cap bench lever (implies videobench). x86_64 only.

@@ -617,7 +617,10 @@ feature (`UNAOS_EHCICONFIG=1`, mapped in both `arroyo` and `builder/src/main.rs`
 **byte-identical to the EHCI-1 read-only scout**.
 
 **Write surface (tripwire-grade).** The **only** registers written are, per EHCI function, its
-own **PMCSR** (D0 wake), its **`USBLEGSUP` OS-owned bit** (ownership handshake), **`USBCMD.RS`**
+own **PMCSR** (D0 wake, `PME_Status` masked), its **`USBLEGSUP` OS-owned bit** (ownership
+handshake), its **`USBLEGCTLSTS`** (eecp+4: SMI-enable mask cleared + RW1C status acked after
+OS ownership — a Maestro-granted write-surface extension, one register inside the same extended
+capability, the standard `quirk_usb_handoff_ehci` discipline), **`USBCMD.RS`**
 (run), **`CONFIGFLAG`** (route ports to EHCI), and **`PORTSC` port-power** bits (PP, only when
 `HCSPARAMS.PPC=1` gives software control; PP writes mask off the RW1C bits). Nothing else — it
 never touches `XUSB2PR` / `USB3_PSSEN` / any xHCI register (PORTSW-1 owns routing), never resets
@@ -628,7 +631,13 @@ firmware identity map is reported skipped instead of faulting.
 1. **PMCSR → D0** if not already (transition reported).
 2. **`USBLEGSUP` OS-ownership handshake**: set OS-owned, **bounded** wait for the firmware to
    drop BIOS-owned. A stuck BIOS bit is **not forced** — it emits a `STOP-NOTE` line and the
-   sequence continues to the census (never a panic).
+   sequence continues to the census (never a panic). The adjacent **`USBLEGCTLSTS`** (eecp+4,
+   the SMI enable/status register) is read before the OS-own write and after it, then — with OS
+   ownership held — its **SMI-enable mask is cleared and RW1C status bits acked**
+   (`quirk_usb_handoff_ehci` discipline; otherwise firmware-left SMI enables can raise SMIs into
+   a BIOS handler on the OS-own/RS/CF/PP writes — the classic EHCI BIOS-handoff hang), and the
+   final value read back: three reported values,
+   `USBLEGCTLSTS@…: pre=… post-own=… cleared->…`.
 3. **`RS=1`**, bounded wait for `HCHalted=0`; then **census A** (`RS=1`, `CONFIGFLAG=0`, ports
    routed to the companion); then **`CONFIGFLAG=1`** + **port-power** (PPC honored) + a paced
    ~150 ms connect-debounce settle; then **census B**.
@@ -638,6 +647,7 @@ firmware identity map is reported skipped instead of faulting.
 `:: EHCI-CONFIG: begin ::` … and the verdict line
 `:: EHCI-CONFIG: end (N controllers, censusA=K1 connected, censusB=K2 connected) ::`. Per
 function: `begin wake sequence`, `PMCSR D…->D0` (or `already D0` / `no PCI PM capability`),
+`USBLEGCTLSTS@…: pre=… post-own=… cleared->…`,
 `USBLEGSUP@… OS-own set, BIOS-owned cleared` (or the `STOP-NOTE … BIOS-owned bit STUCK` line),
 `RS 0->1: … (running)`, `censusA = K1 connected`, `CONFIGFLAG 0->1: read-back CF=1`,
 `censusB = K2 connected`, `done — censusA=K1 connected, censusB=K2 connected`.
@@ -656,6 +666,17 @@ function: `begin wake sequence`, `PMCSR D…->D0` (or `already D0` / `no PCI PM 
 `CONFIGFLAG=1` sticks (CF read-back 1), `PPC=0` so no PP write, and **0 connected on both
 censuses** — QEMU attaches no downstream device, the honest baseline. **Metal-pending:** the
 attended rMBP sitting is where census B decides the two branches above.
+
+**Known residuals / watch items.**
+- **`USBLEGCTLSTS` SMI-clear is QEMU-trivial.** QEMU's `usb-ehci` exposes no set SMI enables
+  (pre/post-own read `0xc0000000`, enables `0x0000`), so the clear+ack path is only truly
+  exercised on metal, where the firmware may have left enables set. The three-value evidence
+  line records what was found and what remained after the clear.
+- On this diagnostic boot the controllers are left with `RS=1`/`CONFIGFLAG=1` **before xHCI
+  init runs** — an interaction unverified on metal, acceptable for a knob-gated evidence boot.
+- The PMCSR D0 write masks `PME_Status` (bit 15, RW1C) so a pending PME isn't silently acked,
+  and a real D-state transition is followed by a ~10 ms settle before the first MMIO read
+  (no-op when already D0). Neither path is exercisable on QEMU (`usb-ehci` has no PM cap).
 
 ---
 

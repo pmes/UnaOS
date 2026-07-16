@@ -297,9 +297,11 @@ pub fn scout() {
 // enumeration, no transfers, no reset of any port, no async/periodic schedule, no driver.
 //
 // WRITE SURFACE (tripwire-grade): the ONLY registers written are, per EHCI function, its own PMCSR
-// (D0 wake), its USBLEGSUP OS-owned bit (ownership handshake — never forced past a stuck BIOS bit),
-// USBCMD.RS (run), CONFIGFLAG (route ports to EHCI), and PORTSC port-power bits (PP, only when PPC
-// honors software control). Nothing else — never XUSB2PR / USB3_PSSEN / any xHCI register.
+// (D0 wake, PME_Status masked), its USBLEGSUP OS-owned bit (ownership handshake — never forced past
+// a stuck BIOS bit), its USBLEGCTLSTS (eecp+4: SMI enables cleared + RW1C status acked after OS
+// ownership — Maestro-granted extension, quirk_usb_handoff_ehci discipline), USBCMD.RS (run),
+// CONFIGFLAG (route ports to EHCI), and PORTSC port-power bits (PP, only when PPC honors software
+// control). Nothing else — never XUSB2PR / USB3_PSSEN / any xHCI register.
 // ======================================================================================
 
 /// Translate-guarded 32-bit MMIO write. Returns `false` (writing nothing) if the page is not present
@@ -392,7 +394,7 @@ unsafe fn census(op: u64, ports: u32, idx: usize, label: &str) -> u32 {
 /// Run the minimal wake sequence on one EHCI function and take two PORTSC censuses (before/after
 /// CONFIGFLAG=1). Returns (censusA_connected, censusB_connected). Every write is bracketed by a
 /// before/after register report. Writes confined to this function's PMCSR / USBLEGSUP OS-own bit /
-/// USBCMD.RS / CONFIGFLAG / PORTSC PP.
+/// USBLEGCTLSTS (SMI-enable clear + status ack) / USBCMD.RS / CONFIGFLAG / PORTSC PP.
 #[cfg(feature = "ehciconfig")]
 unsafe fn configure_controller(bus: u8, dev: u8, func: u8, idx: usize) -> (u32, u32) {
     let vendor = read_config_16(bus, dev, func, 0x00);
@@ -418,13 +420,18 @@ unsafe fn configure_controller(bus: u8, dev: u8, func: u8, idx: usize) -> (u32, 
         let pmcsr = read_config_32(bus, dev, func, pm_cap + 4);
         let state_before = pmcsr & 0x3;
         if state_before != 0 {
-            let new = pmcsr & !0x3; // D0
+            // D0, masking PME_Status (bit 15, RW1C) so a pending PME event isn't silently acked
+            // by the write-back of the read value.
+            let new = pmcsr & !0x3 & !(1 << 15);
             crate::arch::pci::write_config_32(bus, dev, func, pm_cap + 4, new);
             let after = read_config_32(bus, dev, func, pm_cap + 4);
             serial_println!(
                 ":: EHCI-CONFIG: [{}] PMCSR D{}->D0: wrote {:#06x} read-back {:#06x} (power-state=D{}) ::",
                 idx, state_before, new & 0xFFFF, after & 0xFFFF, after & 0x3
             );
+            // A real D-state transition needs recovery time before the function's MMIO is
+            // trustworthy (PCI PM spec allows up to 10ms for D3hot->D0). No-op when already D0.
+            settle_ms(10);
         } else {
             serial_println!(":: EHCI-CONFIG: [{}] PMCSR already D0 (no transition) ::", idx);
         }
@@ -459,12 +466,29 @@ unsafe fn configure_controller(bus: u8, dev: u8, func: u8, idx: usize) -> (u32, 
         let legsup = read_config_32(bus, dev, func, eecp);
         let bios_before = (legsup >> 16) & 0x1;
         let os_before = (legsup >> 24) & 0x1;
+        // USBLEGCTLSTS (eecp+4) — the SMI enable/status register. If the firmware left SMI
+        // enables set, the OS-own write (and the later RS/CF/PP writes) can raise SMIs into a
+        // BIOS handler — the classic EHCI BIOS-handoff hang. Per the Maestro-granted write-
+        // surface extension (one register, inside the same extended cap as the handshake), the
+        // standard quirk_usb_handoff_ehci discipline applies AFTER acquiring OS ownership:
+        // clear the SMI-enable mask (write 0s to the enable half) and ACK the RW1C status bits
+        // (bits 31:29, write-1-to-clear). Three reported values: pre (before OS-own),
+        // post-own (after the semaphore write), cleared (after the enable-clear+ack).
+        let legctl_pre = read_config_32(bus, dev, func, eecp + 4);
         if os_before == 0 {
             crate::arch::pci::write_config_32(bus, dev, func, eecp, legsup | (1 << 24));
         }
         // Bounded wait for BIOS-owned to clear.
         let cleared = wait_bounded(|| (read_config_32(bus, dev, func, eecp) >> 16) & 0x1 == 0);
         let after = read_config_32(bus, dev, func, eecp);
+        let legctl_post_own = read_config_32(bus, dev, func, eecp + 4);
+        // Enables = 0 (all SMI sources off), RW1C status (31:29) = 1s to acknowledge.
+        crate::arch::pci::write_config_32(bus, dev, func, eecp + 4, 0xE000_0000);
+        let legctl_cleared = read_config_32(bus, dev, func, eecp + 4);
+        serial_println!(
+            ":: EHCI-CONFIG: [{}] USBLEGCTLSTS@{:#04x}: pre={:#010x} post-own={:#010x} cleared->{:#010x} (SMI enables off + RW1C status acked, quirk_usb_handoff_ehci discipline) ::",
+            idx, eecp + 4, legctl_pre, legctl_post_own, legctl_cleared
+        );
         if cleared {
             serial_println!(
                 ":: EHCI-CONFIG: [{}] USBLEGSUP@{:#04x}: OS-own set, BIOS-owned cleared (was BIOS={} OS={}, now {:#010x}) ::",
@@ -549,7 +573,7 @@ unsafe fn configure_controller(bus: u8, dev: u8, func: u8, idx: usize) -> (u32, 
 #[cfg(feature = "ehciconfig")]
 pub fn configure_and_relook() {
     serial_println!(":: EHCI-CONFIG: begin ::");
-    serial_println!(":: EHCI-CONFIG: minimal wake + two PORTSC censuses (CF 0 then 1) — evidence only; NO enumeration/transfers/reset/driver; writes confined to EHCI PMCSR/USBLEGSUP-OS-own/RS/CONFIGFLAG/PORTSC-PP ::");
+    serial_println!(":: EHCI-CONFIG: minimal wake + two PORTSC censuses (CF 0 then 1) — evidence only; NO enumeration/transfers/reset/driver; writes confined to EHCI PMCSR/USBLEGSUP-OS-own/USBLEGCTLSTS/RS/CONFIGFLAG/PORTSC-PP ::");
 
     let mut controllers = 0usize;
     let mut total_a = 0u32;

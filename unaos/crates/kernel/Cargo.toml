@@ -79,7 +79,8 @@ ehciscout = []
 # (PMCSR->D0, USBLEGSUP OS-ownership handshake, RS=1, then CONFIGFLAG=1 + port-power) with two PORTSC
 # censuses (before/after CONFIGFLAG=1) so the attended rMBP sitting can distinguish
 # asleep-until-configured USB internals from not-USB (SPI). Writes are confined to the EHCI functions'
-# PMCSR / USBLEGSUP OS-own bit / USBCMD.RS / CONFIGFLAG / PORTSC port-power bits — NO enumeration, NO
+# PMCSR / USBLEGSUP OS-own bit / USBLEGCTLSTS (SMI-enable clear + status ack after OS ownership) /
+# USBCMD.RS / CONFIGFLAG / PORTSC port-power bits — NO enumeration, NO
 # transfers, NO driver, and nothing touching xHCI routing. Implies `ehciscout`; default OFF => the
 # config path is unlinked and the module is byte-identical to the EHCI-1 read-only scout.
 ehciconfig = ["ehciscout"]
