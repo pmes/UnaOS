@@ -36,9 +36,14 @@ warnings, zero aarch64 diffs; default `test 25` MISSION SUCCESS (usb-tablet + us
 MOUSE-1 fires, proto=0 absolute + proto=2 relative); `UNAOS_IRQSTORAGE=1 UNAOS_FATIMG=sf test 200` full
 storage chain **PASS 25 / FAIL 0**, S8-write witness intact; `UNAOS_HUBSTORAGE=1 test 90` brings up the
 hubbed device + MISSION SUCCESS, M3 trace `HUB slot 1 speed 1 (HS/FS) desc-type 0x29: 8 downstream ports`;
-`test-arm 22` MISSION SUCCESS. **Metal PENDING** — attended rMBP bench (real hot-plug + hub + SS hub,
-LC-x86 coordinates); bench-assertable trace strings in the landing report. Commits `2228e0e` (M1) /
-`197a837` (M2) / `d8ab967` (M3). Unblocks PORTSW-1.
+`test-arm 22` MISSION SUCCESS. **Metal verdict (2026-07-15 attended rMBP sitting, log
+`rmbp-xenum1-metal-2026-07-15.log`): M1 ✅ METAL-CONFIRMED (repeated live unplug→replug: slots torn down
+on each disconnect — including a 4-slot hub subtree — and every re-plug enumerated fresh; the old
+lost-until-power-cycle failure gone) · M3 ✅ METAL-CONFIRMED (`HUB slot 6 speed 4 (SS) desc-type 0x2a: 4
+downstream ports` — the hub that read 0 ports now reads 4; HS hub unregressed on 0x29) · M2 LATENT-HONEST
+(the all-zero read did not reproduce; one vid=0000 downstream had a structurally VALID descriptor, a
+distinct condition M2 deliberately does not reject — retry + traces remain armed for a future sitting).**
+Commits `2228e0e` (M1) / `197a837` (M2) / `d8ab967` (M3) + fold `1ea612d`. Unblocks PORTSW-1.
 
 ## hw-pi4 track — 2026-07-15 (K5B — the NAMESPACE-unfreeze: MOUNT-fused ACL persist)
 

@@ -223,6 +223,29 @@ deferred hot re-plug` (M1), `device-descriptor all-zero/short` /
 (M3), and the `HUB slot N speed S (SS|HS/FS) desc-type 0xNN: P downstream ports`
 line the QEMU hub path already prints.
 
+**Metal verdict (2026-07-15, attended rMBP sitting; log
+`rmbp-xenum1-metal-2026-07-15.log`):**
+
+- **M1 ✅ METAL-CONFIRMED.** Repeated live unplug→replug cycles on the real
+  Panther Point xHCI: each disconnect edge tore down the port's slots
+  (`slot N torn down on disconnect; queued for DISABLE_SLOT`, including a full
+  hub subtree of four slots at once) and each re-plug logged
+  `device connected (hot-plug); queuing for enumeration` and enumerated fresh —
+  the mouse re-enumerated and reported after every re-plug. The old failure
+  (`not re-queuing`, device lost until power-cycle) did not occur.
+- **M3 ✅ METAL-CONFIRMED.** The USB3 hub that previously read 0 ports now
+  trains SS and reads its descriptor correctly:
+  `HUB slot 6 speed 4 (SS) desc-type 0x2a: 4 downstream ports (characteristics
+  0x0009)`; the HS hub still takes the 0x29 branch
+  (`speed 3 (HS/FS) desc-type 0x29: 4 downstream ports`). No 0-port abort fired.
+- **M2 — LATENT (honest).** The all-zero/short descriptor condition did not
+  reproduce at this sitting, so the retry never fired. One downstream device did
+  read `vid=0000 pid=0000` but with a *structurally valid* descriptor
+  (`bLength ≥ 18`, type 0x01), which M2's structural check deliberately does not
+  reject — a distinct condition from the all-zero read M2 targets. The fix
+  remains in place with its assertable traces; a future sitting that reproduces
+  the zeroed read is the confirming evidence.
+
 ---
 
 ## 8. Status and limitations
