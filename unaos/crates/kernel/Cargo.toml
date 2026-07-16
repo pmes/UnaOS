@@ -61,6 +61,12 @@ videobench = []
 # panic backdrop) still cover the whole real panel via an uncapped twin handle. Enable via
 # `UNAOS_VIDEOCAP=1`. Default OFF => byte-identical.
 videocap = ["videobench"]
+# PORTSW-1: Panther Point EHCI->xHCI port switchover for the 2012 rMBP internal keyboard/trackpad.
+# Gates the config-space port-routing write (arch/x86_64/pci.rs::enable_intel_xhci_ports) so it runs
+# ONLY when opted in; applied before enumeration with mask-read-before-write discipline. Enable via
+# `UNAOS_PORTSW=1`. Default OFF => zero register writes => byte-identical media. x86_64 only (the
+# gated call site is x86-only; aarch64 media are byte-identical). Inert on QEMU (non-Intel xHCI).
+portsw = []
 # SOCK-1: route the shell's ping/arp/netinfo through the mature smoltcp TCP/IP stack (ROADMAP §1b)
 # instead of the hand-rolled `net` engines. Pulls in the x86-only smoltcp optional dependency and
 # compiles the `smolnet` Device adapter over the e1000e rings (the module is additionally

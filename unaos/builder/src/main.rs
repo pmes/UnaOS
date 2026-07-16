@@ -51,6 +51,10 @@ fn main() {
     // VPERF: x86 video-path bench instrumentation (scroll/VRAM-read counters, fbmem readout,
     // display-BAR probe, scripted scroll scenario). x86_64-only module; default OFF.
     if std::env::var("UNAOS_VIDEOBENCH").is_ok() { feats.push("videobench"); }
+    // PORTSW-1: UNAOS_PORTSW=1 opts into the Panther Point EHCI->xHCI port switchover (the 2012 rMBP
+    // internal keyboard/trackpad). Default OFF => zero config-space writes, byte-identical media;
+    // inert on QEMU (non-Intel xHCI). x86_64 only. Kept in sync with arroyo's mapping.
+    if std::env::var("UNAOS_PORTSW").is_ok() { feats.push("portsw"); }
     // VPERF M2: the fbcon viewport-cap bench lever (implies videobench). x86_64 only.
     if std::env::var("UNAOS_VIDEOCAP").is_ok() { feats.push("videocap"); }
     // SOCK-1: route the shell's ping/arp/netinfo + the boot ICMP witness through smoltcp. x86-only

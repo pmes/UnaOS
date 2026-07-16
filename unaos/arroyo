@@ -50,6 +50,12 @@ _feats=""
 # readout, display-BAR probe, scripted scroll scenario). x86_64-only module — aarch64 media are
 # byte-identical with this on or off.
 [ -n "${UNAOS_VIDEOBENCH:-}" ] && _feats="${_feats}videobench,"
+# PORTSW-1: opt-in Panther Point EHCI->xHCI port switchover (route the shared USB2 ports + enable
+# SuperSpeed) so the 2012 rMBP internal keyboard/trackpad re-enumerate on the xHCI+HID stack.
+# Applied BEFORE enumeration with mask-read-before-write discipline (writes only advertised bits).
+# Default OFF => zero config-space writes => the current EHCI-internal/xHCI-external topology,
+# byte-identical. Inert on QEMU (non-Intel xHCI). x86_64 only; aarch64 media byte-identical.
+[ -n "${UNAOS_PORTSW:-}" ] && _feats="${_feats}portsw,"
 # SOCK-1: route the shell's ping/arp/netinfo + a boot ICMP witness through the smoltcp stack
 # (ROADMAP §1b). x86-only optional dep + x86-gated module — enabling it on the aarch64 `check`
 # invocation is a no-op (smoltcp isn't pulled for that target), so aarch64 stays byte-identical.
