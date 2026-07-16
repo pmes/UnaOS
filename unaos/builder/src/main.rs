@@ -51,10 +51,11 @@ fn main() {
     // VPERF: x86 video-path bench instrumentation (scroll/VRAM-read counters, fbmem readout,
     // display-BAR probe, scripted scroll scenario). x86_64-only module; default OFF.
     if std::env::var("UNAOS_VIDEOBENCH").is_ok() { feats.push("videobench"); }
-    // PORTSW-1: UNAOS_PORTSW=1 opts into the Panther Point EHCI->xHCI port switchover (the 2012 rMBP
-    // internal keyboard/trackpad). Default OFF => zero config-space writes, byte-identical media;
-    // inert on QEMU (non-Intel xHCI). x86_64 only. Kept in sync with arroyo's mapping.
-    if std::env::var("UNAOS_PORTSW").is_ok() { feats.push("portsw"); }
+    // PORTSW-1: the Panther Point EHCI->xHCI port switchover runs BY DEFAULT (metal-gated policy
+    // 2026-07-16: the no-routing boot dropped ALL external USB on the 2012 rMBP). UNAOS_NOPORTSW=1
+    // OPTS OUT (never-run no-routing experiment) => zero config-space writes, byte-identical no-routing
+    // media; inert on QEMU (non-Intel xHCI). x86_64 only. Kept in sync with arroyo's mapping.
+    if std::env::var("UNAOS_NOPORTSW").is_ok() { feats.push("noportsw"); }
     // EHCI-1 scout: UNAOS_EHCISCOUT=1 arms a STRICTLY READ-ONLY EHCI reconnaissance probe (dumps the
     // EHCI companion controllers' cap/op/PORTSC state at boot; zero writes). x86_64-only module.
     // Kept in sync with arroyo's mapping; also adds a QEMU `-device usb-ehci` test target below.

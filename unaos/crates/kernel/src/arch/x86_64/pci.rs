@@ -95,12 +95,16 @@ pub unsafe fn write_config_32(bus: u8, slot: u8, func: u8, offset: u8, value: u3
 /// re-flipped live (PORTSW-1 hard rule 2). Gated to Intel xHCI device ids with an EHCI companion;
 /// a clean no-op on everything else (QEMU's qemu-xhci is vendor 0x1b36 — the whole flip is inert
 /// there, which is expected: QEMU doesn't model Panther-Point routing). 0x1E31 is the Panther Point
-/// part on the MacBookPro10,1. Compiled ONLY under the `portsw` feature (UNAOS_PORTSW=1); knob-off =
-/// this function does not exist and no config-space write is issued => byte-identical media.
+/// part on the MacBookPro10,1. Runs BY DEFAULT on x86 (metal-gated policy: on the 2012 rMBP the
+/// knob-off no-routing boot dropped ALL external USB — serial, storage, input — so routing is
+/// DEFAULT-ON here). Suppressed ONLY under the `noportsw` opt-out feature (UNAOS_NOPORTSW=1) for the
+/// never-run no-routing topology experiment; opted out = this function does not exist and no
+/// config-space write is issued => byte-identical no-routing media.
 ///
-/// NOT yet confirmed on metal — the config-space read-backs in the witness are what let a real-HW
-/// boot tell whether the mux actually toggled or firmware (Apple EFI) locked the shared-port bits.
-#[cfg(feature = "portsw")]
+/// Metal-confirmed default (2026-07-16): the config-space read-backs in the witness are what let a
+/// real-HW boot tell whether the mux actually toggled or firmware (Apple EFI) locked the shared-port
+/// bits.
+#[cfg(not(feature = "noportsw"))]
 fn enable_intel_xhci_ports(bus: u8, dev: u8, func: u8) {
     const XUSB2PR: u8 = 0xD0;
     const USB2PRM: u8 = 0xD4;
@@ -120,7 +124,7 @@ fn enable_intel_xhci_ports(bus: u8, dev: u8, func: u8) {
         let device = read_config_16(bus, dev, func, 0x02);
         // Always log the controller's identity so a serial-less metal boot can SEE which xHCI this is
         // — the live test of whether the rMBP's Panther Point id (0x1e31) is the one we gate on.
-        serial_println!(":: xHCI PCI id {:04x}:{:04x} @ {}:{}.{} (PORTSW knob-on) ::", vendor, device, bus, dev, func);
+        serial_println!(":: xHCI PCI id {:04x}:{:04x} @ {}:{}.{} (PORTSW default-on) ::", vendor, device, bus, dev, func);
 
         // A config-space write is issued ONLY on a known Intel shared-port controller (an EHCI
         // companion routes the USB2 ports). On anything else — notably QEMU's qemu-xhci (0x1b36) —
@@ -174,7 +178,7 @@ fn enable_intel_xhci_ports(bus: u8, dev: u8, func: u8) {
         // value means firmware locked some shared-port bits (Apple EFI may pre-own or refuse to
         // release them). On QEMU before == after (inert). Uncounted witness (`== witness ::`).
         serial_println!(
-            ":: PORTSW-1: XUSB2PR mask={:#x} routed {:#x}->{:#x} + USB3_PSSEN mask={:#x} {:#x}->{:#x} (knob-on) == witness ::",
+            ":: PORTSW-1: XUSB2PR mask={:#x} routed {:#x}->{:#x} + USB3_PSSEN mask={:#x} {:#x}->{:#x} (default-on) == witness ::",
             usb2_mask, usb2_before, usb2_after, ss_mask, ss_before, ss_after
         );
     }
@@ -209,12 +213,13 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
         // Master the xHCI can never fetch command TRBs or write event TRBs.
         crate::drivers::pci::PciScanner::enable_bus_master(bus, dev, func);
 
-        // PORTSW-1 (opt-in, UNAOS_PORTSW=1): route USB2/USB3 ports from the EHCI companion to xHCI
-        // BEFORE the controller starts, so the 2012 rMBP internal keyboard/trackpad re-enumerate on
-        // the xHCI+HID stack. Mask-disciplined config-space writes; inert on non-Intel (QEMU). Knob
-        // OFF (default) => this call does not exist and no config-space write is issued (the current
-        // EHCI-internal/xHCI-external topology, byte-identical).
-        #[cfg(feature = "portsw")]
+        // PORTSW-1 (DEFAULT-ON, opt out with UNAOS_NOPORTSW=1): route USB2/USB3 ports from the EHCI
+        // companion to xHCI BEFORE the controller starts, so the 2012 rMBP internal keyboard/trackpad
+        // re-enumerate on the xHCI+HID stack. Mask-disciplined config-space writes; inert on non-Intel
+        // (QEMU). Metal-gated policy: on the 2012 rMBP the no-routing boot dropped ALL external USB, so
+        // routing runs by default. Opt out (UNAOS_NOPORTSW=1) => this call does not exist and no
+        // config-space write is issued (the no-routing EHCI-internal/xHCI-external topology).
+        #[cfg(not(feature = "noportsw"))]
         enable_intel_xhci_ports(bus, dev, func);
 
         // Initialize xHCI

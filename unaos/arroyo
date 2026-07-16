@@ -50,12 +50,13 @@ _feats=""
 # readout, display-BAR probe, scripted scroll scenario). x86_64-only module — aarch64 media are
 # byte-identical with this on or off.
 [ -n "${UNAOS_VIDEOBENCH:-}" ] && _feats="${_feats}videobench,"
-# PORTSW-1: opt-in Panther Point EHCI->xHCI port switchover (route the shared USB2 ports + enable
-# SuperSpeed) so the 2012 rMBP internal keyboard/trackpad re-enumerate on the xHCI+HID stack.
-# Applied BEFORE enumeration with mask-read-before-write discipline (writes only advertised bits).
-# Default OFF => zero config-space writes => the current EHCI-internal/xHCI-external topology,
-# byte-identical. Inert on QEMU (non-Intel xHCI). x86_64 only; aarch64 media byte-identical.
-[ -n "${UNAOS_PORTSW:-}" ] && _feats="${_feats}portsw,"
+# PORTSW-1: DEFAULT-ON Panther Point EHCI->xHCI port switchover (route the shared USB2 ports + enable
+# SuperSpeed) so the 2012 rMBP internal keyboard/trackpad re-enumerate on the xHCI+HID stack. Applied
+# BEFORE enumeration with mask-read-before-write discipline (writes only advertised bits). Metal-gated
+# policy (2026-07-16): the no-routing boot dropped ALL external USB on the 2012 rMBP, so routing runs
+# by default. UNAOS_NOPORTSW=1 OPTS OUT (never-run no-routing experiment) => zero config-space writes
+# => byte-identical no-routing media. Inert on QEMU (non-Intel xHCI). x86_64 only; aarch64 identical.
+[ -n "${UNAOS_NOPORTSW:-}" ] && _feats="${_feats}noportsw,"
 # EHCI-1 scout: read-only EHCI reconnaissance probe (x86_64). Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_EHCISCOUT:-}" ] && _feats="${_feats}ehciscout,"
 # SOCK-1: route the shell's ping/arp/netinfo + a boot ICMP witness through the smoltcp stack

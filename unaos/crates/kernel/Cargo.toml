@@ -62,11 +62,13 @@ videobench = []
 # `UNAOS_VIDEOCAP=1`. Default OFF => byte-identical.
 videocap = ["videobench"]
 # PORTSW-1: Panther Point EHCI->xHCI port switchover for the 2012 rMBP internal keyboard/trackpad.
-# Gates the config-space port-routing write (arch/x86_64/pci.rs::enable_intel_xhci_ports) so it runs
-# ONLY when opted in; applied before enumeration with mask-read-before-write discipline. Enable via
-# `UNAOS_PORTSW=1`. Default OFF => zero register writes => byte-identical media. x86_64 only (the
-# gated call site is x86-only; aarch64 media are byte-identical). Inert on QEMU (non-Intel xHCI).
-portsw = []
+# DEFAULT-ON (metal-gated policy 2026-07-16: the no-routing boot dropped ALL external USB on the 2012
+# rMBP). The config-space port-routing write (arch/x86_64/pci.rs::enable_intel_xhci_ports) runs by
+# default with mask-read-before-write discipline, applied before enumeration. This `noportsw` OPT-OUT
+# feature (UNAOS_NOPORTSW=1) SUPPRESSES the flip for the never-run no-routing topology experiment =>
+# zero register writes => byte-identical no-routing media. x86_64 only (the gated call site is
+# x86-only; aarch64 media are byte-identical). Inert on QEMU (non-Intel xHCI).
+noportsw = []
 # EHCI-1 scout: UNAOS_EHCISCOUT=1 arms a STRICTLY READ-ONLY EHCI reconnaissance probe (PCI-config +
 # MMIO reads only — zero writes to any register/port) that dumps the EHCI companion controllers'
 # capability/operational/PORTSC state at boot, so an EHCI driver arc can be planned against real

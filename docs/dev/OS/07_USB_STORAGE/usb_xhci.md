@@ -397,9 +397,15 @@ resets and starts the controller — i.e. before enumeration, **one topology per
 never re-flipped live** (re-flipping after storage enumerated could drop a block device
 mid-transaction).
 
-**Knob-gated, default-OFF.** Compiled only under the `portsw` Cargo feature
-(`UNAOS_PORTSW=1`, mapped in both `arroyo` and `builder/src/main.rs`). Knob-off: the
-routing function does not exist, **zero config-space writes**, byte-identical media.
+**Default-ON, opt-out knob (default fold, 2026-07-16).** The metal verdict below
+established that a no-routing boot drops *all* external USB on the 2012 rMBP, so per the
+pre-registered Maestro policy the flip now runs **by default** on x86. The opt-OUT is the
+`noportsw` Cargo feature (`UNAOS_NOPORTSW=1`, mapped in both `arroyo` and
+`builder/src/main.rs`), reserved for the never-run no-routing topology experiment: opted
+out, the routing function does not exist, **zero config-space writes**, byte-identical
+no-routing media. The flip logic and its mask discipline are unchanged from the M2
+opt-in — only the compile gate inverted (`#[cfg(not(feature = "noportsw"))]`) and the
+witness suffix now reads `(default-on)`.
 
 **⚠ Corrected metal-baseline framing (review fold).** The predecessor routing code
 (`89d10b1`, 2026-06-24) ran **unconditionally** on every x86 build, and every prior
@@ -419,14 +425,14 @@ knob-ON witness's `before` field on the first flip after a genuine cold boot (or
 knob-off boots only, which issue no writes and so preserve it).
 
 **Witness** (uncounted): `:: PORTSW-1: XUSB2PR mask=0x.. routed 0x..->0x.. +
-USB3_PSSEN mask=0x.. 0x..->0x.. (knob-on) == witness ::`. The masks + before/after
+USB3_PSSEN mask=0x.. 0x..->0x.. (default-on) == witness ::`. The masks + before/after
 read-backs are the assertable record: after == `before | mask` confirms the mux
 toggled; a smaller value means firmware (Apple EFI) locked some shared-port bits.
 
 **QEMU is inert by design.** QEMU's qemu-xhci (0x1b36) doesn't model Panther-Point
-routing, so under knob-on the code reads the register block (harmless) and prints the
-witness with `mask=0x0` / before == after (no write issued), then storage + MISSION run
-unregressed. The real verdict is the attended rMBP bench.
+routing, so in the default build the code reads the register block (harmless) and prints
+the witness with `mask=0x0` / before == after (no write issued), then storage + MISSION run
+unregressed. The real verdict was the attended rMBP bench (below).
 
 **Metal verdict (2026-07-16, attended rMBP sitting, two cold boots):**
 
@@ -466,9 +472,10 @@ read/write, and HID input, plus **hub-downstream hot-plug** (the hub Status Chan
 Endpoint is configured and serviced — connect enumerates, disconnect tears down the
 route-scoped subtree). aarch64 uses a polled variant (no interrupts there yet). See
 §7c for the XENUM-1 enumeration-robustness fixes and §7d for XENUM-2 hub hot-plug.
-An opt-in Panther Point EHCI→xHCI **port switchover** (§7f, `UNAOS_PORTSW=1`, QEMU-green /
-metal-PENDING) re-routes the 2012 rMBP internal keyboard + trackpad onto the xHCI+HID
-stack; default-OFF and byte-identical when unset.
+A **default-ON** Panther Point EHCI→xHCI **port switchover** (§7f, opt out with
+`UNAOS_NOPORTSW=1`, metal-gated policy) routes the 2012 rMBP shared USB2/USB3 ports onto
+xHCI before enumeration — required on that platform, where a no-routing boot drops all
+external USB (serial, storage, input).
 
 Not yet implemented: endpoint STALL recovery, multi-tier hubs, and broader class
 support. The `skip_xhci` Cargo feature (`UNAOS_SKIP_XHCI=1`) disables USB bring-up
