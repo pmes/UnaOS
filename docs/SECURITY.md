@@ -322,34 +322,55 @@ The UNAFS-K3 mount became read-WRITE at K4: `fs/unafs.rs`'s `write_sector` route
 `drivers::block::write_block` (emmc2 CMD24 + R1/CMD13 status checks). Stated honestly:
 
 - **Coherence.** Writes make a per-call mount a corruption hazard — two live mounts hold two
-  independent in-RAM allocation bitmaps + journal cursors, so a block one frees the other can
-  re-hand-out. Closed structurally: exactly ONE process-wide, IRQ-masked mount (`with_unafs`,
-  the F3 `NAMESPACE`-lock discipline) is the sole path for read AND write, so there is one
-  authoritative in-RAM bitmap/journal and every operation is serialized. A pure read never
-  mutates, so it never triggers the crate's `Drop`-time metadata write-back — reads stay
-  genuinely read-only, even against a dirty volume.
-- **Torn-write safety is by ORDERING, not by journal replay.** The `unaos/libs/fs/unafs` WAL is
-  **intent-logging only**: it records BeginOp/EndOp markers to DETECT a torn transaction on the
-  next mount (a dirty warning), it does NOT store undo/redo data and there is NO replay or
-  rollback ("Log only for now"). Crash safety comes from the crate's per-mutation ordering
-  (new-extents-first, single-block metadata swap, free-last), so the failure mode of an ill-timed
-  power cut is a LEAK (allocated-but-unreachable blocks, reclaimable by a future fsck/scavenger
-  arc), never a dangling reference to a freed block. Recovery on a dirty mount does NOT write —
-  it warns — so a read-only consumer can still mount-and-warn safely.
-- **The 4096↔512 atomicity gap (residual, ledgered).** The crate's "single-block metadata swap
-  is the atomic point" holds only at its 4096 B block granularity. The medium is 512 B sectors,
-  and `BlockAdapter::write_block` is eight sequential, individually-non-atomic `write_sector`s,
-  so a power cut mid-block tears the 4096 B block across sector boundaries. The swap is therefore
-  truly atomic ONLY when the live record fits the FIRST 512 B sector (inode ≤ 512 B, directory
-  data ≤ 512 B) — true for small files/directories (the K4-write witness's case), NOT guaranteed
-  for a large inode or directory that spans multiple sectors. Closing this needs sector-level
-  journaling or a format change — deferred; the frozen on-disk format + KATs are LOCKED and were
-  NOT touched (the journal is partial *by design*, not a gap this arc fixes).
-- **Proof.** `:: K4-write: … PASS [w=0x7f] ::` (uncounted) — create + write a scratch file, force
-  a genuine remount (fresh in-RAM bitmap/journal re-read from disk), byte-verify the durable
-  write, delete, remount (delete durable), negative path, clean journal. Self-cleaning. Proven
-  under `kernel8-test` via `if=sd` write-back (the K2 M(e) same-image technique). The metal
-  write→REAL power-cycle→boot-2 byte-verify rides the next attended Pi bench (not attempted here).
+  independent in-RAM allocation state (the refcount map + inode map since K8a; bitmap + journal
+  cursor before it), so a block one frees the other can re-hand-out. Closed structurally: exactly
+  ONE process-wide, IRQ-masked mount (`with_unafs`, the F3 `NAMESPACE`-lock discipline) is the
+  sole path for read AND write, so there is one authoritative in-RAM state and every operation is
+  serialized. A pure read never mutates, so it never triggers any drop-time write-back — reads
+  stay genuinely read-only.
+- **Torn-write safety (as landed at K4, superseded at K8a).** At K4, crash safety was by write
+  ORDERING, not journal replay: the WAL was intent-logging only (dirty detection, no rollback),
+  and per-mutation ordering (new-extents-first, single-block metadata swap, free-last) bounded a
+  power cut to a LEAK, never a dangling reference. **K8a replaced this whole mechanism:** every
+  mutation is now one copy-on-write transaction made visible by a single atomic 512 B root-sector
+  flip — a power cut yields the old committed tree or the new one, never a hybrid, and there are
+  no leak windows (an uncommitted transaction's blocks were never committed as allocated). The
+  WAL is deleted from the format; there is no dirty-mount state to detect.
+- **The 4096↔512 atomicity gap — ⏳ RETIRED-PENDING-METAL by K8a (2026-07-16; formally retires
+  the day K8a lands metal).** The residual as ledgered at K4: the crate's "single-block metadata
+  swap is the atomic point" held only at 4096 B granularity, while the medium writes 512 B
+  sectors — one `write_block` = eight sequential, individually-non-atomic `write_sector`s, so a
+  power cut mid-block could tear a metadata swap unless the record fit the first sector. **K8a
+  dissolves the class BY FORMAT (the design-doc motive):** the copy-on-write path never
+  overwrites a committed block — every mutation writes FRESH blocks, and the only load-bearing
+  in-place write left on the volume is the commit's root flip, which is ONE 512 B sector
+  (compile-time assert + golden KAT pin the root record ≤ 512 B; `BlockAdapter::
+  write_sector_in_block` lowers it to a single hardened device sector write). Even a tear inside
+  THAT sector is survivable: A/B generation-stamped, checksummed root slots — a commit writes the
+  INACTIVE slot, mount picks the newer VALID one, so a torn root write costs the crashed commit,
+  never the volume. The old ordering discipline (leak-not-dangle) and the WAL are both
+  superseded: there is no dirty-mount state; a power cut anywhere yields the previous committed
+  tree, whole and refcount-consistent. Sector-level "journaling or a format change" was the named
+  closure — the format change happened (v3; the K8 design pass LIFTED the KAT freeze and pinned
+  new goldens). Remaining honest bound: the flip's atomicity now rests on the medium's own
+  512 B-sector write atomicity (the SD/eMMC contract), which is exactly the atomicity unit of
+  record the design fixed.
+- **Proof (K4, retained).** `:: K4-write: … PASS [w=0x7f] ::` (uncounted) — create + write a
+  scratch file, force a genuine remount, byte-verify the durable write, delete, remount (delete
+  durable), negative path, refcount-consistent tree (bit6 was "clean journal" pre-K8; the WAL is
+  gone, the bit now proves fsck-clean). Metal-confirmed 2026-07-14 pre-K8 (3 cold boots, genuine
+  power-cuts); re-proof on the K8 format rides the K8a sitting.
+- **Proof (K8a).** `:: K8a-cow: … PASS [w=0x7f] ::` (uncounted; REQUIREd in
+  `pi4-regression.spec`) — root generation advances per mutation; a POWER CUT BEFORE THE ROOT
+  FLIP (the crate's autocommit-off crash seam: fresh blocks written to the real block device,
+  root never flipped, then a genuine remount) converges to the OLD tree, fsck-clean; the
+  committed twin of the same mutation is byte-durable across a remount; the freshly loaded
+  refcount map agrees with recomputed reachability (REFCOUNT PERSISTENCE); self-cleaning; and
+  the commit-path bench counters are live (CNTPCT ticks + blocks written per commit — the vaire
+  benchmark ruling). Host twins in `unafs/tests/recovery_logic.rs` additionally prove the TORN
+  ROOT SECTOR fallback (garbage the newest slot → mount lands on the previous tree) and the
+  crash-safe reclaim-queue drain. QEMU-proven via `if=sd` write-back; the metal power-cut proof
+  (incl. the pre-K8 card migration via `tools/unafs migrate`) rides the next attended Pi bench.
 
 ### Process & supply chain
 - [ ] Adversarial review before metal and before merge on every arc (standing rule, `CLAUDE.md`)

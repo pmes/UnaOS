@@ -10,6 +10,44 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-pi4 track — 2026-07-16 (K8a — UnaFS goes copy-on-write)
+
+### K8a — CoW data+metadata write path, atomic 512 B root flip, refcount allocator 🔬 QEMU-green 2026-07-16 (MBENCH 43/43 + 0 forbidden; metal + the pre-K8 card migration ride the next attended Pi sitting)
+
+**What it does.** ROADMAP §2 K8 line, arc 1 (design authority: the K8 CoW design pass, Peter's
+verdicts closed 2026-07-16, incl. the two execution verdicts — Fork 1: stable LOGICAL inode ids
+through a CoW'd on-disk inode map; Fork 2: A/B double-buffered, generation-stamped 512 B root
+sectors in block 1). UnaFS format v3: every mutation allocates FRESH blocks — nothing reachable
+from the last committed root is ever overwritten; each public op is one transaction committed by
+writing the INACTIVE root slot (checksummed, generation-stamped; mount picks the newer valid
+slot), lowered by `BlockAdapter::write_sector_in_block` to a single hardened device sector write.
+Power cut anywhere — including a tear inside the root write itself — yields the old tree or the
+new tree, never a hybrid; the WAL is deleted (atomicity is structural; ROADMAP F1 superseded).
+The allocator is a refcount map (free ⇔ reachable from no retained root) with a two-view
+current/frozen discipline that structurally forbids reusing any committed block before the flip.
+The format speaks the FUTURE shape day one: a snapshot index and a persistent reclaim queue are
+ordinary UnaFS objects at reserved logical ids (v1 policy: cap 16; drop enqueues, the drain is
+eager and crash-safe — one commit). Pre-K8 volumes migrate one-way via `tools/unafs migrate`
+(read-only `unafs::legacy` walker → replay into a fresh v3 image; do-it-right: no runtime compat
+with our own old format). Kernel: the `with_unafs` keystone, K4 shell verbs, the K6 native ACL
+store, and the whole BANDY family ride the new write path unchanged; commit-path bench counters
+(CNTPCT ticks + blocks written per commit) land per the vaire benchmark ruling. SECURITY.md's
+4096↔512 torn-write ledger entry → RETIRED-PENDING-METAL.
+
+**How it was tested.** Host: the full crate suite green including NEW v3 golden-vector KATs
+(root-fits-one-sector KAT + compile-time assert; kept record encodings pinned to their ORIGINAL
+goldens), CoW crash-safety KATs (uncommitted-transaction convergence, torn-root-slot fallback,
+A/B alternation, reclaim-queue durability + drain, injected-refcount-drift fsck repair,
+committed-block-never-overwritten), hostile-volume hardening re-cut for v3 (root-record bounds,
+imap bounds, id-mismatch), and an end-to-end v2→v3 migration test. `check` green both arches;
+`kernel8` clean; `kernel8-test` = **MBENCH PASS 43/43 required, 0 forbidden** — K4-write re-proven
+through the CoW path (`clean-tree [w=0x7f]`), K1/K2/K3/K5/K6/BANDY families all hold, plus the new
+uncounted REQUIREd `K8a-cow [w=0x7f]` witness (gen-advance; power-cut-mid-commit converges to the
+OLD tree on the real block device; refcount persistence across remount; self-cleaning; live bench
+counters). `test-arm` MISSION SUCCESS; zero x86 behavior change (aarch64-only witness chaining).
+
+---
+
 ## hw-pi4 track — 2026-07-16 (BANDY — the on-UnaOS SMessage bus + midden, program #3)
 
 ### BANDY-2 — the write-side bus verbs (write/rm/mv), kernel fulfillment + ACL discipline ✅✅ METAL-CONFIRMED 2026-07-16 (same-day, same boot as BANDY-1: MBENCH 42/42 + 0 forbidden off `main 49f2333`; BANDY-CODEC2/WR/EQ2/ACL + BANDY-GRANT [w=0x7f] all PASS on silicon; log `pi-serial-2026-07-16-111850.log`)
