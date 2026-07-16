@@ -891,3 +891,253 @@ pub fn k8a_cow_selftest() {
         ticks
     );
 }
+
+/// K8b scratch fixture: a file the witness snapshots, overwrites, and finally
+/// deletes — the volume is left exactly as found (self-cleaning, K2 idiom), so
+/// the STATEFUL card never accumulates residue and `K3-mount`'s fixture `ls`
+/// still holds next boot.
+const K8B_NAME: &str = "K8BSNAP.TXT";
+const K8B_PATH: &str = "/K8BSNAP.TXT";
+/// Two payloads that each span multiple 4096 B blocks (real data extents to
+/// share and to reclaim). OLD = what the snapshot must keep reading; NEW = the
+/// live overwrite.
+const K8B_OLD: &[u8] = &[0xA1u8; 3 * 4096];
+const K8B_NEW: &[u8] = &[0xB2u8; 3 * 4096];
+
+/// The physical data blocks a file's extents currently occupy (heap-staged
+/// Vec — no large kernel-stack array; the >4 KiB-array wild-jump hazard).
+fn k8b_data_blocks(fs: &mut KernelUnaFS, id: u64) -> alloc::vec::Vec<u64> {
+    let mut out = alloc::vec::Vec::new();
+    if let Ok(inode) = fs.read_inode(id) {
+        for e in &inode.chunks {
+            for i in 0..e.length.div_ceil(::unafs::BLOCK_SIZE) {
+                out.push(e.physical_block + i);
+            }
+        }
+    }
+    out
+}
+
+/// K8b-snap witness (uncounted): prove retained roots (snapshots) + reclamation
+/// on the live kernel mount, benchmark-instrumented (CNTPCT ticks + the crate's
+/// snapshot counters).
+///
+/// Sequence (7 bits):
+///   bit0 `snapshot_create` retains the committed tree (index gains the entry);
+///   bit1 after overwriting the LIVE file with NEW bytes, the snapshot's OLD
+///        data blocks STILL hold the OLD bytes (read raw off the device — the
+///        never-overwrite + block-sharing core) AND the live file reads NEW;
+///   bit2 the two-root volume is refcount-consistent (fsck clean);
+///   bit3 the allocator never hands out a block the live snapshot holds — a
+///        churn of fresh allocations avoids the retained block set entirely;
+///   bit4 drop → reclamation drains eagerly to empty, freeing the snapshot-
+///        only blocks (free count rises), fsck clean, the freed blocks are
+///        re-allocatable;
+///   bit5 POWER-CUT-MID-DRAIN: a second snapshot dropped via the enqueue-only
+///        half + a genuine remount — the mount's eager drain RESUMES and
+///        converges (queue empty, fsck clean);
+///   bit6 self-clean (delete + remount: gone, consistent, no leak) AND the
+///        snapshot bench counters are live (created > 0 and dropped > 0).
+///
+/// Skips honestly on media without a unafs partition. Self-cleaning.
+pub fn k8b_snap_selftest() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    if let Err(e) = locate() {
+        serial_println!(":: K8b-snap: no unafs volume ({:?}) — skipped ::", e);
+        return;
+    }
+
+    let mut w = 0u32;
+    let t0 = bench_ticks();
+
+    // Start clean: drop any stray snapshots and scratch from a prior run.
+    let _ = with_unafs(|fs| {
+        while let Ok(snaps) = fs.snapshot_index() {
+            match snaps.first() {
+                Some(s) => {
+                    let _ = fs.snapshot_drop(s.generation);
+                }
+                None => break,
+            }
+        }
+        let root = fs.superblock.root_inode;
+        let _ = fs.unlink(root, K8B_NAME);
+    });
+
+    // bit0: create the scratch file with OLD bytes + retain it.
+    let (created_gen, old_blocks) = with_unafs(|fs| {
+        let root = fs.superblock.root_inode;
+        let id = match fs.create_file(root, String::from(K8B_NAME)) {
+            Ok(id) => id,
+            Err(_) => return (None, alloc::vec::Vec::new()),
+        };
+        if fs.write_data(id, 0, K8B_OLD).is_err() {
+            return (None, alloc::vec::Vec::new());
+        }
+        let blocks = k8b_data_blocks(fs, id);
+        match fs.snapshot_create(String::from("k8b-before"), String::from("kernel"), bench_ticks()) {
+            Ok(g) => (Some(g), blocks),
+            Err(_) => (None, alloc::vec::Vec::new()),
+        }
+    })
+    .unwrap_or((None, alloc::vec::Vec::new()));
+    let snap_gen = match created_gen {
+        Some(g) => g,
+        None => {
+            serial_println!(":: K8b-snap: setup failed (create/retain) FAIL [w=0x00] ::");
+            return;
+        }
+    };
+    let has_entry = with_unafs(|fs| {
+        fs.snapshot_index()
+            .map(|s| s.iter().any(|e| e.generation == snap_gen))
+            .unwrap_or(false)
+    })
+    .unwrap_or(false);
+    if has_entry && !old_blocks.is_empty() {
+        w |= 1 << 0;
+    }
+
+    // bit1: overwrite the LIVE file with NEW bytes; the snapshot's OLD blocks
+    // must be untouched (read them raw), and the live file must read NEW.
+    let old_intact_and_live_new = with_unafs(|fs| {
+        let root = fs.superblock.root_inode;
+        let id = match fs.resolve_path(K8B_PATH) {
+            Ok(id) => id,
+            Err(_) => return false,
+        };
+        let _ = root;
+        if fs.write_data(id, 0, K8B_NEW).is_err() {
+            return false;
+        }
+        // The snapshot's OLD blocks still hold the OLD bytes (never-overwrite).
+        let mut block = alloc::vec![0u8; ::unafs::BLOCK_SIZE as usize];
+        for (i, &pb) in old_blocks.iter().enumerate() {
+            if <_ as ::unafs::BlockDevice>::read_block(&mut fs.device, pb, &mut block).is_err() {
+                return false;
+            }
+            let base = i * ::unafs::BLOCK_SIZE as usize;
+            let want = &K8B_OLD[base..base + ::unafs::BLOCK_SIZE as usize];
+            if block[..] != want[..] {
+                return false;
+            }
+        }
+        // And the LIVE file reads the NEW bytes.
+        matches!(fs.read_data(id, 0, K8B_NEW.len() as u64), Ok(d) if d == K8B_NEW)
+    })
+    .unwrap_or(false);
+    if old_intact_and_live_new {
+        w |= 1 << 1;
+    }
+
+    // bit2: two-root refcount consistency.
+    let consistent = with_unafs(|fs| fs.fsck(false).map(|r| r.is_clean()).unwrap_or(false));
+    if matches!(consistent, Ok(true)) {
+        w |= 1 << 2;
+    }
+
+    // bit3: the allocator never reuses a retained snapshot's blocks. Churn a
+    // few fresh allocations and confirm none land on the old set.
+    let no_reuse = with_unafs(|fs| {
+        let root = fs.superblock.root_inode;
+        let mut clean = true;
+        for i in 0..4u8 {
+            let name = alloc::format!("K8BCHURN{}.BIN", i);
+            if let Ok(cid) = fs.create_file(root, name.clone()) {
+                let _ = fs.write_data(cid, 0, &alloc::vec![i; 2 * 4096]);
+                for b in k8b_data_blocks(fs, cid) {
+                    if old_blocks.contains(&b) {
+                        clean = false;
+                    }
+                }
+                let _ = fs.unlink(root, &name);
+            }
+        }
+        clean
+    })
+    .unwrap_or(false);
+    if no_reuse {
+        w |= 1 << 3;
+    }
+
+    // bit4: drop → eager reclamation frees the snapshot-only blocks and the
+    // freed blocks re-allocate; fsck clean.
+    let reclaimed = with_unafs(|fs| {
+        let free_before = fs.free_blocks();
+        if fs.snapshot_drop(snap_gen).is_err() {
+            return false;
+        }
+        let drained = fs.reclaim_queue().map(|q| q.is_empty()).unwrap_or(false);
+        let freed = fs.free_blocks() > free_before;
+        let clean = fs.fsck(false).map(|r| r.is_clean()).unwrap_or(false);
+        drained && freed && clean
+    })
+    .unwrap_or(false);
+    if reclaimed {
+        w |= 1 << 4;
+    }
+
+    // bit5: power-cut-mid-drain. Retain again, enqueue the drop WITHOUT
+    // draining, then a genuine remount — the mount's eager drain must resume.
+    // Capture the bench counters HERE, from the working instance (the counters
+    // are per-instance and reset on the remount below), after this instance has
+    // done its create (bit0) + drop (bit4) + this create + enqueue.
+    let (enq, stats) = with_unafs(|fs| {
+        let ok = match fs.snapshot_create(
+            String::from("k8b-cut"),
+            String::from("kernel"),
+            bench_ticks(),
+        ) {
+            Ok(g) => fs.snapshot_drop_enqueue(g).is_ok(),
+            Err(_) => false,
+        };
+        (ok, fs.commit_stats())
+    })
+    .unwrap_or((false, Default::default()));
+    force_remount();
+    let resumed = with_unafs(|fs| {
+        fs.reclaim_queue().map(|q| q.is_empty()).unwrap_or(false)
+            && fs.snapshot_index().map(|s| s.is_empty()).unwrap_or(false)
+            && fs.fsck(false).map(|r| r.is_clean()).unwrap_or(false)
+    })
+    .unwrap_or(false);
+    if enq && resumed {
+        w |= 1 << 5;
+    }
+
+    // bit6: self-clean. Delete the scratch + remount and confirm no leak.
+    let _ = with_unafs(|fs| {
+        let root = fs.superblock.root_inode;
+        let _ = fs.unlink(root, K8B_NAME);
+    });
+    force_remount();
+    let cleaned = with_unafs(|fs| {
+        fs.resolve_path(K8B_PATH).is_err()
+            && fs.snapshot_index().map(|s| s.is_empty()).unwrap_or(false)
+            && fs.fsck(false).map(|r| r.is_clean()).unwrap_or(false)
+            && fs
+                .ls(fs.superblock.root_inode)
+                .map(|es| es.iter().all(|d| d.name != K8B_NAME))
+                .unwrap_or(false)
+    })
+    .unwrap_or(false);
+    if cleaned && stats.snapshots_created > 0 && stats.snapshots_dropped > 0 {
+        w |= 1 << 6;
+    }
+
+    let ticks = bench_ticks().wrapping_sub(t0);
+    let verdict = if w == 0x7f { "PASS" } else { "FAIL" };
+    serial_println!(
+        ":: K8b-snap: retain+overwrite -> snapshot reads OLD bytes + retention-safe alloc + drop reclaims + power-cut-mid-drain converges + self-clean {} [w={:#04x}] bench: snaps_created={} snaps_dropped={} blocks={} ticks={} ::",
+        verdict,
+        w,
+        stats.snapshots_created,
+        stats.snapshots_dropped,
+        stats.blocks_written,
+        ticks
+    );
+}

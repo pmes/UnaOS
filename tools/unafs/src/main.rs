@@ -111,6 +111,27 @@ enum Commands {
         #[arg(long)]
         repair: bool,
     },
+    /// List retained snapshots (the on-disk snapshot index).
+    Snaps {
+        #[arg(short, long, default_value = "unafs.img")]
+        img: String,
+    },
+    /// Retain the current committed tree as a snapshot (a retained root). The
+    /// snapshot shares blocks with the live tree until they diverge.
+    Snap {
+        /// A human name for the snapshot (a K6 typed attribute on the entry).
+        name: String,
+        #[arg(short, long, default_value = "unafs.img")]
+        img: String,
+    },
+    /// Drop a retained snapshot by its generation stamp (see `snaps`). Frees
+    /// only blocks no live/retained root still reaches (eager reclamation).
+    Snapdrop {
+        /// The snapshot's generation stamp.
+        generation: u64,
+        #[arg(short, long, default_value = "unafs.img")]
+        img: String,
+    },
     /// One-way migration of a pre-K8 (version 2) volume into the K8
     /// copy-on-write format: walks the old tree read-only and replays it
     /// (names, data, attributes) into a freshly formatted K8 image.
@@ -363,6 +384,50 @@ async fn main() -> Result<()> {
                     println!("  ✅ volume is clean");
                 }
             }
+        }
+        Commands::Snaps { img } => {
+            let device = FileDevice::open(img).context("Failed to open device")?;
+            let mut fs = FileSystem::mount(device).context("Failed to mount filesystem")?;
+            let snaps = fs
+                .snapshot_index()
+                .map_err(|e| anyhow::anyhow!("Failed to read snapshot index: {:?}", e))?;
+            if snaps.is_empty() {
+                println!("📷 [OPERATOR] no retained snapshots on '{}'", img);
+            } else {
+                println!("📷 [OPERATOR] {} retained snapshot(s) on '{}':", snaps.len(), img);
+                println!("  {:>10}  {:<20}  {:<16}  gen", "created@", "name", "creator");
+                for s in &snaps {
+                    println!(
+                        "  {:>10}  {:<20}  {:<16}  {}",
+                        s.timestamp, s.name, s.creator, s.generation
+                    );
+                }
+            }
+        }
+        Commands::Snap { name, img } => {
+            let device = FileDevice::open(img).context("Failed to open device")?;
+            let mut fs = FileSystem::mount(device).context("Failed to mount filesystem")?;
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let generation = fs
+                .snapshot_create(name.clone(), "operator".into(), ts)
+                .map_err(|e| anyhow::anyhow!("Failed to create snapshot '{}': {:?}", name, e))?;
+            println!(
+                "✅ [OPERATOR] retained snapshot '{}' (generation {}) on '{}'",
+                name, generation, img
+            );
+        }
+        Commands::Snapdrop { generation, img } => {
+            let device = FileDevice::open(img).context("Failed to open device")?;
+            let mut fs = FileSystem::mount(device).context("Failed to mount filesystem")?;
+            fs.snapshot_drop(*generation)
+                .map_err(|e| anyhow::anyhow!("Failed to drop snapshot {}: {:?}", generation, e))?;
+            println!(
+                "✅ [OPERATOR] dropped snapshot generation {} (blocks reclaimed) on '{}'",
+                generation, img
+            );
         }
         Commands::Migrate { from, to, size_mb } => {
             println!("⚡ [OPERATOR] Migrating pre-K8 vault '{}' → K8 '{}'...", from, to);

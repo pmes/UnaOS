@@ -56,7 +56,9 @@ pub use adapter::{
     SECTOR_SIZE, SECTORS_PER_BLOCK, SectorDevice, SectorError, locate_unafs, parse_partitions,
 };
 pub use catalog::{CatalogEntry, deserialize_catalog, serialize_catalog};
-pub use fs::{CommitStats, DirEntry, ReclaimEntry, SnapshotEntry, UnaFS, cosine_similarity};
+pub use fs::{
+    CommitStats, DirEntry, ReclaimEntry, SNAPSHOT_CAP, SnapshotEntry, UnaFS, cosine_similarity,
+};
 pub use fsck::FsckReport;
 pub use inode::{AttributeValue, Extent, ExtentList, FileKind, Inode, InodeError};
 pub use query::{Query, QueryOp, parse_value};

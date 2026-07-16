@@ -57,7 +57,9 @@ The crate root (`lib.rs`) re-exports the primary surface:
   from (`ROOT_RECORD_SIZE` ≤ 512 is compile-time asserted and KAT-pinned).
 - **`RefMap`** (`refmap.rs`) — the refcount allocator (current/frozen views).
 - **`SnapshotEntry` / `ReclaimEntry`** (`fs.rs`) — the snapshot-index and
-  reclaim-queue object payloads (the K8b/K8c future shape, on disk today).
+  reclaim-queue object payloads; `SnapshotEntry::drop_permitted` is the
+  owner-or-kernel drop-authority decision. Retention verbs live on `UnaFS`:
+  `snapshot_create` / `snapshot_drop` / `snapshot_index`.
 - **`legacy`** (`legacy.rs`) — the read-only pre-K8 (v2) walker +
   `migrate_into`, feeding `tools/unafs migrate`.
 - **`Query` / `QueryOp` / `parse_value`** (`query.rs`) — the query parser and
@@ -88,9 +90,10 @@ Implemented and functional: format, mount, directory and file operations,
 copy-on-write transactional writes, inline and spilled attributes, the
 mutation set (`unlink`, `rename`, `remove_attribute` — each with full
 attribute-catalog cleanup, so a deleted file or attribute can never be
-returned by a query), refcount-consistency fsck, a one-way pre-K8 migration
-reader, and the attribute/similarity query engine, over `FileDevice` and
-`MemDevice`, host and kernel (`no_std`) alike. The attribute catalog is still
+returned by a query), retained roots / snapshots with eager crash-safe
+reclamation (K8b), refcount-consistency fsck (multi-root aware), a one-way
+pre-K8 migration reader, and the attribute/similarity query engine, over
+`FileDevice` and `MemDevice`, host and kernel (`no_std`) alike. The attribute catalog is still
 append-only on `set_attribute` (mutations scrub it) — the F4 index arc's
 target.
 
@@ -114,11 +117,10 @@ only the crashed commit. Key pieces:
   last commit); allocation requires BOTH zero, which structurally forbids
   overwriting any block the on-disk tree still reaches. Counts persist CoW
   (raw u32 leaves + index block) each commit.
-- **The future shape, on disk today**: the root reaches a **snapshot index**
+- **Retained roots / snapshots (K8b)**: the root reaches a **snapshot index**
   and a **persistent reclaim queue**, both ordinary UnaFS objects (`System`
-  inodes at reserved ids 3 and 4). v1 policy: snapshot cap 16 (policy, not
-  structure); drop never frees directly — it enqueues, and the drain is eager
-  and crash-safe (one commit; a mount that finds a pending queue drains it).
+  inodes at reserved ids 3 and 4). A snapshot is a retained root — see the
+  dedicated section below.
 - **Bench counters** (`CommitStats`): commits, blocks written, blocks per
   last commit — read via `commit_stats()`; the kernel witness pairs them with
   CNTPCT ticks.
@@ -130,6 +132,41 @@ only the crashed commit. Key pieces:
 Open-handle semantics stay honest: there is no open-file table, but under
 stable logical ids a caller that keeps an id across `unlink` now gets
 `NotFound` — never another file's data.
+
+### Snapshots: retained roots + reclamation (K8b)
+
+A snapshot is a **retained root** — an O(1), block-sharing point-in-time image
+of the whole volume, the substrate for UnaFS-native versioning and the two-root
+diff (K8c).
+
+- **`snapshot_create(name, creator, timestamp)`** retains the current committed
+  tree: it records a generation-stamped `SnapshotEntry` (the `name`, `creator`
+  principal, and `timestamp` are K6 typed attributes) in the on-disk snapshot
+  index, and increfs **every block the retained root reaches** through its inode
+  map. This is the security core of retention: the allocator invariant is
+  *free ⇔ reachable from no retained root*, so a block a snapshot lives on
+  carries one refcount per referencing root and can never be reallocated while
+  the snapshot lives. Nothing is copied — the snapshot and the live tree share
+  every block until a mutation forces the live tree onto fresh blocks (the
+  ordinary CoW write path). Returns the snapshot's **generation stamp** (its
+  unique, never-recycled id). v1 policy caps retention at `SNAPSHOT_CAP` (16),
+  refused cleanly with `SnapshotCapReached` — the index is an unbounded growable
+  object, so lifting the cap is a constant change, not a format migration.
+- **`snapshot_drop(generation)`** never frees blocks directly: it removes the
+  index entry and enqueues the snapshot's block set on the persistent reclaim
+  queue in **one atomic commit**, then drains eagerly — decrefing each block,
+  which frees it iff no live or retained root still reaches it. A power cut
+  mid-drain is crash-safe: the entry stays on the queue and the next mount's
+  eager drain resumes and converges (`snapshot_drop_enqueue` exposes the
+  enqueue-only half for exercising exactly that seam). Drop is destructive and
+  authorized owner-or-kernel (`SnapshotEntry::drop_permitted`).
+- **`snapshot_index()`** lists the retained roots; **`reclaim_queue()`** the
+  pending drops. `fsck` walks the live root *and* every retained root, and its
+  repair rebuilds true multi-root refcounts.
+- **Bench counters** (`CommitStats`): `snapshots_created` / `snapshots_dropped`.
+
+The shell verbs `usnap` / `usnaps` / `usnapdrop` and the host `unafs snap` /
+`snaps` / `snapdrop` subcommands drive this surface directly.
 
 ### Migration from the pre-K8 format (v2)
 
@@ -259,7 +296,7 @@ Planned arcs (sequencing in [`docs/ROADMAP.md`](../../docs/ROADMAP.md) §2):
 | F5 | **Live queries** — delta-emitting persistent queries published over bandy (the query-driven spatial UI, now including similarity) |
 | F6–F8 | B+tree directories; metadata checksums; extent trees |
 | K1–K4 | Kernel convergence: **`no_std` core (K1, ✅)** → **512↔4096 block adapter + partitions (K2, ✅)** → **read-only kernel mount (K3, ✅)** → **kernel writes (K4, ✅)** |
-| K8a–K8c | **Copy-on-write (K8a, ✅ landed — this format)** → retained roots/snapshots + reclamation (K8b) → the two-root diff walk + vaire/Bolt surface (K8c) |
+| K8a–K8c | **Copy-on-write (K8a, ✅ landed — this format)** → **retained roots/snapshots + reclamation (K8b, ✅ landed)** → the two-root diff walk + vaire/Bolt surface (K8c) |
 
 The capability model (see [`docs/SECURITY.md`](../../docs/SECURITY.md)) stores
 principals and grants as ordinary typed attributes (`owner`, `grants:*`), so

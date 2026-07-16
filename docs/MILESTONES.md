@@ -10,6 +10,46 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-pi4 track — 2026-07-16 (K8b — retained roots / snapshots + reclamation) 🔬
+
+### K8b — snapshots (retained roots) + eager reclamation 🔬 QEMU-green (MBENCH 44/44, 0 forbidden), metal pending
+
+**What it does.** ROADMAP §2 K8 line, arc 2 (design authority: the K8 CoW design pass, Peter's
+verdicts V1–V3). A snapshot is a RETAINED ROOT: `snapshot_create` records a generation-stamped
+entry (name + creator principal + timestamp, K6 typed attrs) in the on-disk snapshot index K8a
+already carried, and — the security core — increfs EVERY block the committed root reaches through
+its inode map. The allocator invariant (free ⇔ reachable from no retained root) now has teeth: a
+block a snapshot lives on carries an extra refcount per referencing root, so no later live mutation
+can reallocate it while the snapshot lives. The two-view current/frozen discipline, never-overwrite,
+and single-sector root-flip atomicity are all preserved; only the refcounts rise above 0/1. v1
+policy caps retention at 16 entries (refused cleanly with `SnapshotCapReached` — the index is an
+unbounded growable object; the cap is policy, no format change). `snapshot_drop` never frees
+directly (V2): it removes the index entry AND enqueues the snapshot's block set in ONE atomic
+commit, then eagerly drains (decref — a block survives iff another live/retained root still reaches
+it); a power cut mid-drain leaves the entry on the persistent reclaim queue for the next mount's
+eager drain. fsck's reachability walk now spans every retained root, and repair rebuilds TRUE
+multi-root refcounts (a flat rebuild would under-count shared blocks and a later drop could free a
+block another root still lives on). User-visible day one (V3): shell verbs `usnap`/`usnaps`/
+`usnapdrop` and host `unafs snap`/`snaps`/`snapdrop`; drop authority is owner-or-kernel
+(`SnapshotEntry::drop_permitted`, the BANDY owner-only-destructive ruling — the kernel shell runs
+at kernel authority, so its drops always pass). Bench counters: snapshots created/dropped (vaire
+ruling).
+
+**How it was tested.** Host: the full crate suite green — existing v3 KATs unchanged (the
+SnapshotEntry/ReclaimEntry goldens preserved byte-identical), plus a new `snapshot_logic` suite
+(9 tests): snapshot-reads-OLD-bytes-while-live-tree-moves-on, drop-reclaims-only-unreached-blocks-
+then-reuses-them, blocks-never-reallocated-while-the-snapshot-lives (tight-volume allocation
+pressure), two-snapshots-share-blocks-drop-of-one-keeps-the-other, snapshot-survives-remount,
+power-cut-mid-drain-resumes-on-next-mount, cap-16 clean refusal, missing-generation error, and
+owner-or-kernel drop authority; host `unafs snap/snaps/snapdrop` exercised end-to-end. `check`
+green both arches; `kernel8` clean; `kernel8-test` = **MBENCH PASS 44/44 required, 0 forbidden** —
+all K8a-cow / K4-write / K/BANDY families hold, plus the new uncounted REQUIREd `K8b-snap [w=0x7f]`
+witness (retain → overwrite → the snapshot's OLD data blocks still read the OLD bytes off the
+device → retention-safe allocation → drop reclaims + frees → power-cut-mid-drain converges on
+remount; self-cleaning; live snapshot bench counters). `test-arm` MISSION SUCCESS; zero x86
+behavior change (aarch64-only witness chaining + verbs).
+
+---
 ## hw-pi4 track — 2026-07-16 (K8a — UnaFS goes copy-on-write)
 
 ### K8a — CoW data+metadata write path, atomic 512 B root flip, refcount allocator ✅✅ METAL-CONFIRMED 2026-07-16 (same-day attended sitting: pristine-v3 boot MBENCH 43/43 + 0 forbidden AND a real v2→v3 MIGRATED-volume boot 43/43 — migration byte-verified on silicon; the SECURITY.md 4096↔512 torn-write class formally RETIRED. Sitting facts of record: the 16 GB UNAOS card RETIRED mid-sitting — silent write drops, zero R1/CMD13, A-B proven when the morning kernel failed its own morning battery; the 32 GB card is the pi4 bench card. U9/U10 are stateful across boots — multi-boot sittings re-prep FAT fixtures file-level between boots, see unaos-hazards)

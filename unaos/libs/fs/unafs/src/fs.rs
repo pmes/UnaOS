@@ -103,6 +103,10 @@ pub enum FileSystemError {
     DirectoryLoop,
     #[error("Corrupt volume: {0}")]
     CorruptVolume(&'static str),
+    #[error("Snapshot retention cap reached ({0} max)")]
+    SnapshotCapReached(usize),
+    #[error("Snapshot not found (generation {0})")]
+    SnapshotNotFound(u64),
 }
 
 /// A directory entry pointing to an inode (by stable LOGICAL id).
@@ -130,6 +134,20 @@ pub struct SnapshotEntry {
     pub timestamp: u64,
 }
 
+impl SnapshotEntry {
+    /// Owner-or-kernel destructive authority (K8b §4, the BANDY
+    /// owner-only-destructive ruling applied to snapshots): dropping a retained
+    /// root is permitted iff the `invoker` principal is this snapshot's
+    /// `creator` or the `kernel_principal`. The library records the creator and
+    /// exposes this decision; the actual enforcement point is the ACL/verb
+    /// layer (the kernel shell runs at kernel authority, so its drops always
+    /// pass — the trivial `invoker == kernel_principal` case). Pure, so host
+    /// twins can exercise owner/other/kernel without a mount.
+    pub fn drop_permitted(&self, invoker: &str, kernel_principal: &str) -> bool {
+        invoker == kernel_principal || invoker == self.creator
+    }
+}
+
 /// One dropped root awaiting reclamation. Drop NEVER frees blocks directly —
 /// it enqueues; the drain decrefs. v1 drains eagerly (to empty before the
 /// dropping call returns / before a mount completes); background mode later
@@ -154,6 +172,12 @@ pub struct CommitStats {
     pub blocks_written: u64,
     /// Blocks written by the most recent transaction (including its commit).
     pub last_commit_blocks: u64,
+    /// Snapshots retained since mount/format (K8b: `snapshot_create` calls that
+    /// committed a new retained root).
+    pub snapshots_created: u64,
+    /// Snapshots dropped since mount/format (K8b: `snapshot_drop` calls that
+    /// enqueued + drained a retained root).
+    pub snapshots_dropped: u64,
 }
 
 pub struct UnaFS<D: BlockDevice> {
@@ -1249,8 +1273,7 @@ impl<D: BlockDevice> UnaFS<D> {
     // Snapshot index + reclaim queue (the future shape, on disk today)
     // =====================================================================
 
-    /// The snapshot index (empty until K8b retains roots). v1 policy cap:
-    /// [`SNAPSHOT_CAP`].
+    /// The snapshot index (retained roots). v1 policy cap: [`SNAPSHOT_CAP`].
     pub fn snapshot_index(&mut self) -> Result<Vec<SnapshotEntry>, FileSystemError> {
         let inode = self.read_inode(SNAP_INDEX_INODE_ID)?;
         let data = self.read_data(SNAP_INDEX_INODE_ID, 0, inode.size)?;
@@ -1258,6 +1281,210 @@ impl<D: BlockDevice> UnaFS<D> {
             return Ok(Vec::new());
         }
         Ok(crate::codec::deserialize(&data)?)
+    }
+
+    /// Every block a root reaches THROUGH ITS INODE MAP: the imap index block,
+    /// its leaf blocks, and — for every allocated inode — the inode block plus
+    /// every data/spilled-attribute extent block it owns. This is the exact
+    /// set a retained snapshot holds a reference to; refcount correctness under
+    /// retention rests on [`snapshot_create`] increfing precisely this set and
+    /// [`snapshot_drop`]'s drain decrefing precisely this set (perfect
+    /// symmetry — a block shared by the live tree and/or other snapshots keeps
+    /// exactly one refcount per referencing root, so drop frees a block iff no
+    /// remaining root reaches it). Refcount- and refmap-map blocks are NOT
+    /// included: a snapshot retains the DATA tree, not the allocator (the live
+    /// refmap is rewritten every commit and is never snapshotted).
+    ///
+    /// Bounded against the volume span (the on-disk imap is untrusted input);
+    /// a pointer out of range is a `CorruptVolume` error, never a slice panic,
+    /// so a partial walk never drives an incref/decref.
+    pub(crate) fn snapshot_blocks(
+        &mut self,
+        imap_block: u64,
+        imap_leaves: u64,
+    ) -> Result<Vec<u64>, FileSystemError> {
+        let block_count = self.superblock.block_count;
+        if imap_block == 0 || imap_block >= block_count {
+            return Err(FileSystemError::CorruptVolume("snapshot imap index out of bounds"));
+        }
+        if imap_leaves == 0 || imap_leaves > IMAP_MAX_LEAVES {
+            return Err(FileSystemError::CorruptVolume("snapshot imap leaf count out of range"));
+        }
+        let mut blocks = Vec::new();
+        blocks.push(imap_block);
+        let mut index = alloc::vec![0u8; BLOCK_SIZE as usize];
+        self.device.read_block(imap_block, &mut index)?;
+        let mut leaf = alloc::vec![0u8; BLOCK_SIZE as usize];
+        for l in 0..imap_leaves {
+            let ptr = u64::from_le_bytes(
+                index[(l * 8) as usize..(l * 8 + 8) as usize]
+                    .try_into()
+                    .unwrap(),
+            );
+            if ptr == 0 || ptr >= block_count {
+                return Err(FileSystemError::CorruptVolume("snapshot imap leaf out of bounds"));
+            }
+            blocks.push(ptr);
+            self.device.read_block(ptr, &mut leaf)?;
+            for e in 0..IMAP_ENTRIES_PER_LEAF {
+                let inode_pb = u64::from_le_bytes(
+                    leaf[(e * 8) as usize..(e * 8 + 8) as usize]
+                        .try_into()
+                        .unwrap(),
+                );
+                // Unallocated inode-map slots are zero (imap leaves are
+                // zero-filled beyond the last live id) — nothing to reach.
+                if inode_pb == 0 {
+                    continue;
+                }
+                if inode_pb >= block_count {
+                    return Err(FileSystemError::CorruptVolume(
+                        "snapshot imap entry out of bounds",
+                    ));
+                }
+                blocks.push(inode_pb);
+                let mut ib = alloc::vec![0u8; BLOCK_SIZE as usize];
+                self.device.read_block(inode_pb, &mut ib)?;
+                let inode = Inode::from_bytes(&ib)?;
+                Self::push_extent_blocks(&inode.chunks, block_count, &mut blocks)?;
+                for extents in inode.large_attributes.values() {
+                    Self::push_extent_blocks(extents, block_count, &mut blocks)?;
+                }
+            }
+        }
+        Ok(blocks)
+    }
+
+    /// Append every block an extent list covers to `out`, bounded to the
+    /// volume span (a hostile extent errs rather than pointing past the disk).
+    fn push_extent_blocks(
+        extents: &ExtentList,
+        block_count: u64,
+        out: &mut Vec<u64>,
+    ) -> Result<(), FileSystemError> {
+        for extent in extents {
+            let count = extent.length.div_ceil(BLOCK_SIZE);
+            for i in 0..count {
+                let pb = extent
+                    .physical_block
+                    .checked_add(i)
+                    .ok_or(FileSystemError::CorruptVolume("snapshot extent overflows"))?;
+                if pb >= block_count {
+                    return Err(FileSystemError::CorruptVolume(
+                        "snapshot extent points past volume",
+                    ));
+                }
+                out.push(pb);
+            }
+        }
+        Ok(())
+    }
+
+    /// Retain the CURRENT committed root as a snapshot (design V1): record a
+    /// generation-stamped [`SnapshotEntry`] (name + creator principal +
+    /// timestamp, K6 typed attrs) in the on-disk snapshot index, and — the
+    /// security core — incref EVERY block the retained root reaches so no
+    /// later mutation can reallocate a block the snapshot still lives on. The
+    /// incref and the index write land in ONE commit (atomic: a crash yields
+    /// the volume with or without the snapshot, never a half-retained tree).
+    ///
+    /// v1 policy caps retention at [`SNAPSHOT_CAP`] entries — refused cleanly
+    /// with [`FileSystemError::SnapshotCapReached`], no format change (the
+    /// index is an unbounded growable object; the cap is policy).
+    ///
+    /// Returns the snapshot's generation stamp — its unique, never-recycled id
+    /// (monotone commit generation), the key [`snapshot_drop`] takes.
+    pub fn snapshot_create(
+        &mut self,
+        name: String,
+        creator: String,
+        timestamp: u64,
+    ) -> Result<u64, FileSystemError> {
+        let mut index = self.snapshot_index()?;
+        if index.len() >= SNAPSHOT_CAP {
+            return Err(FileSystemError::SnapshotCapReached(SNAPSHOT_CAP));
+        }
+
+        // Capture the committed root (on disk in full right now — autocommit
+        // leaves no in-flight txn between public ops).
+        let generation = self.root.generation;
+        let imap_block = self.root.imap_block;
+        let imap_leaves = self.root.imap_leaves;
+
+        // The security core: pin every block the retained root reaches. Walk
+        // and incref BEFORE the index write so the commit that persists this
+        // snapshot (which decrefs the old live imap blocks) leaves the shared
+        // blocks at a refcount the snapshot still holds.
+        let blocks = self.snapshot_blocks(imap_block, imap_leaves)?;
+        for &b in &blocks {
+            self.refmap.incref(b);
+        }
+
+        index.push(SnapshotEntry {
+            generation,
+            imap_block,
+            imap_leaves,
+            name,
+            creator,
+            timestamp,
+        });
+        let bytes = crate::codec::serialize(&index)?;
+        self.rewrite_data_inner(SNAP_INDEX_INODE_ID, &bytes)?;
+        self.commit()?;
+
+        self.stats.snapshots_created += 1;
+        Ok(generation)
+    }
+
+    /// Drop a retained snapshot by its `generation` stamp (design V2): remove
+    /// the index entry and enqueue the snapshot's block set onto the persistent
+    /// reclaim queue in ONE commit, then eagerly drain (v1 policy). Dropping
+    /// NEVER frees a block directly — the drain decrefs, and a block survives
+    /// iff the live root or another retained root still reaches it.
+    ///
+    /// Crash-safe: the index-removal + enqueue is one atomic transaction, so a
+    /// power cut leaves either the intact snapshot or the entry safely on the
+    /// queue for the next mount's drain (no block is lost, none double-freed).
+    ///
+    /// This is the destructive MECHANISM; owner-or-kernel authority
+    /// ([`SnapshotEntry::drop_permitted`]) is enforced by the calling verb.
+    pub fn snapshot_drop(&mut self, generation: u64) -> Result<(), FileSystemError> {
+        self.snapshot_drop_enqueue(generation)?;
+        // Eager drain (v1): decref the enqueued blocks, empty the queue, commit.
+        self.reclaim_drain()
+    }
+
+    /// The FIRST, atomic half of [`snapshot_drop`]: remove the index entry and
+    /// enqueue its block set in ONE commit, WITHOUT draining. After this
+    /// returns the snapshot is gone from the index and its blocks sit on the
+    /// persistent reclaim queue, still ref-held — exactly the crash state a
+    /// power cut mid-drop leaves. Public so the crash-mid-drain path can be
+    /// exercised directly (drop the mount here → the next mount's eager drain
+    /// resumes and converges). Bumps the drop counter (the drain that follows,
+    /// whether eager or on a later mount, does the freeing).
+    pub fn snapshot_drop_enqueue(&mut self, generation: u64) -> Result<(), FileSystemError> {
+        let mut index = self.snapshot_index()?;
+        let pos = index
+            .iter()
+            .position(|e| e.generation == generation)
+            .ok_or(FileSystemError::SnapshotNotFound(generation))?;
+        let entry = index.remove(pos);
+
+        // The blocks the snapshot referenced (identical set to the create-time
+        // incref — symmetry is the safety property).
+        let blocks = self.snapshot_blocks(entry.imap_block, entry.imap_leaves)?;
+
+        // Atomic: index loses the entry AND the queue gains it, one root flip.
+        let index_bytes = crate::codec::serialize(&index)?;
+        self.rewrite_data_inner(SNAP_INDEX_INODE_ID, &index_bytes)?;
+        let mut queue = self.reclaim_queue()?;
+        queue.push(ReclaimEntry { generation, blocks });
+        let queue_bytes = crate::codec::serialize(&queue)?;
+        self.rewrite_data_inner(RECLAIM_INODE_ID, &queue_bytes)?;
+        self.commit()?;
+
+        self.stats.snapshots_dropped += 1;
+        Ok(())
     }
 
     /// The persistent reclaim queue's current entries.

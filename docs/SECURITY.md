@@ -398,6 +398,39 @@ The UNAFS-K3 mount became read-WRITE at K4: `fs/unafs.rs`'s `write_sector` route
   - *Volume cap.* v3 geometry is capped at 2 GiB (`MAX_BLOCK_COUNT` = 524,288 — the
     one-indirect-level map bound); format AND mount refuse larger volumes with a clean
     Geometry error. Lifting the cap = adding an indirection level = a future format change.
+- **Retention-aware allocator + snapshot authority (K8b).** A snapshot is a RETAINED ROOT; the
+  allocator invariant is now load-bearing across multiple roots: **a block is free ⇔ it is
+  reachable from NO retained root AND not from the live root.** `snapshot_create` enforces this by
+  increfing EVERY block the committed root reaches through its inode map (the imap index + leaves,
+  each inode block, each data/spilled-attribute extent), so a block a snapshot lives on carries one
+  refcount per referencing root and can never be reallocated while any holder lives. `snapshot_drop`
+  is the exact inverse: it decrefs the identical block set (via the enqueue+drain path), freeing a
+  block iff no remaining root reaches it. The K8a security properties are UNWEAKENED — no committed
+  block is ever overwritten (allocation still requires current == frozen == 0), and the single
+  512 B root-flip stays the only in-place write; K8b only lets refcounts exceed 0/1. Crash safety:
+  the index-removal + queue-enqueue is ONE atomic commit, so a power cut mid-drop leaves the entry
+  on the persistent reclaim queue for the next mount's eager drain — no block lost, none
+  double-freed. **fsck extended (the standing STOP-class note in `fsck.rs` is discharged):** the
+  reachability walk now spans the live root AND every retained root, so a snapshot-only block is not
+  mis-reported as a leak; repair rebuilds TRUE multi-root refcounts (a flat count-of-1 rebuild would
+  under-count shared blocks, and a later drop could then free a block another root still lives on).
+  **Authority.** Snapshot drop is destructive and follows the BANDY owner-only-destructive ruling:
+  `SnapshotEntry::drop_permitted(invoker, kernel_principal)` admits the recorded creator principal
+  or the kernel. The library records the creator and exposes the decision; the enforcement point is
+  the ACL/verb layer. The only day-one drop surface is the kernel shell (`usnapdrop`), which runs at
+  kernel authority — the trivial `invoker == kernel_principal` case — so no new privileged path is
+  opened; the creator is recorded (`"kernel"` from the shell) for when a per-principal surface
+  arrives. v1 retention cap 16 is a clean policy refusal (`SnapshotCapReached`), not a format bound.
+- **Proof (K8b).** `:: K8b-snap: … PASS [w=0x7f] ::` (uncounted; REQUIREd in `pi4-regression.spec`)
+  — retain the committed tree, overwrite the live file, byte-verify the snapshot's OLD data blocks
+  still hold the OLD bytes read straight off the block device (never-overwrite + block sharing),
+  confirm a churn of fresh allocations never lands on the retained block set, drop → eager
+  reclamation frees the snapshot-only blocks (free count rises) fsck-clean and re-allocatable, and a
+  POWER CUT MID-DRAIN (the enqueue-only half + a genuine remount) converges (the queue resumes and
+  empties on the next mount). Self-cleaning. Host twins in `unafs/tests/snapshot_logic.rs` add the
+  tight-volume no-reuse pressure test, the two-snapshots-share-blocks / drop-one-keeps-the-other
+  case, the cap-16 refusal, and the owner-or-kernel authority matrix. QEMU-proven via `if=sd`
+  write-back; the metal proof rides the next attended Pi bench.
 
 ### Process & supply chain
 - [ ] Adversarial review before metal and before merge on every arc (standing rule, `CLAUDE.md`)
