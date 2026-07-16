@@ -462,3 +462,66 @@ fn read_extents(fs: &mut UnaFS<MemDevice>, inode: &unafs::Inode) -> Vec<u8> {
     out.truncate(inode.size as usize);
     out
 }
+
+// =============================================================================
+// Lens A fix: a FAILED snapshot_create must not strand its increfs
+// =============================================================================
+
+#[test]
+fn failed_snapshot_create_unwinds_cleanly_on_a_full_volume() {
+    // A tight volume driven near-full with SUCCESSFUL ops only, so the only
+    // failing operation under test is the snapshot_create itself.
+    let mut fs = fresh_fs(64);
+    let root = fs.superblock.root_inode;
+    let f = fs.create_file(root, "fill.bin".into()).unwrap();
+    let marker = vec![0x5Au8; BLOCK_SIZE as usize];
+    fs.write_data(f, 0, &marker).unwrap();
+
+    // Retention itself consumes space: each retained snapshot pins its whole
+    // tree while later commits move the live maps/index to fresh blocks, so
+    // repeated snapshot_create alone exhausts the tight volume — only
+    // successful ops run before the one failing call under test.
+    let mut retained = 0usize;
+    let mut failed_err = None;
+    for i in 0..SNAPSHOT_CAP as u64 {
+        match fs.snapshot_create(format!("s{i}"), "alice".into(), i) {
+            Ok(_) => retained += 1,
+            Err(e) => {
+                failed_err = Some(e);
+                break;
+            }
+        }
+    }
+    let err = failed_err.expect("the tight volume must refuse a snapshot before the cap");
+    assert!(
+        matches!(err, unafs::fs::FileSystemError::NoSpace),
+        "expected NoSpace, got {err:?}"
+    );
+
+    // The disk was never touched in a reachable way and the in-RAM state
+    // unwound: exactly the successful snapshots recorded, no stranded increfs
+    // (free count equals a fresh-from-disk mount's view), fsck clean, and the
+    // mount is USABLE.
+    assert_eq!(fs.snapshot_index().unwrap().len(), retained);
+    let free_after_fail = fs.free_blocks();
+    assert!(
+        fs.fsck(false).unwrap().is_clean(),
+        "a failed snapshot_create must leave the refcount map consistent"
+    );
+    let data_id = fs.resolve_path("/fill.bin").unwrap();
+    assert_eq!(fs.read_data(data_id, 0, BLOCK_SIZE).unwrap(), marker);
+
+    // A remount (ground truth from disk) agrees exactly on the free count —
+    // proof nothing was stranded in RAM or leaked on disk.
+    let device = fs.device.clone();
+    drop(fs);
+    let mut fs2 = UnaFS::mount(device).unwrap();
+    assert_eq!(fs2.free_blocks(), free_after_fail);
+    assert!(fs2.fsck(false).unwrap().is_clean());
+    // And retrying the same snapshot on the remount fails the same clean way.
+    assert!(matches!(
+        fs2.snapshot_create("retry".into(), "alice".into(), 999),
+        Err(unafs::fs::FileSystemError::NoSpace)
+    ));
+    assert!(fs2.fsck(false).unwrap().is_clean());
+}

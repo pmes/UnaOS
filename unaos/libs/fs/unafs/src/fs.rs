@@ -1394,7 +1394,34 @@ impl<D: BlockDevice> UnaFS<D> {
     ///
     /// Returns the snapshot's generation stamp — its unique, never-recycled id
     /// (monotone commit generation), the key [`snapshot_drop`] takes.
+    ///
+    /// **Failure is clean (lens A fix):** on ANY error after the tree-wide
+    /// incref (e.g. `NoSpace` persisting the index or committing on a tight
+    /// volume — a supported regime) the whole in-RAM transaction is unwound
+    /// via [`Self::txn_unwind`]: the refmap thaws back to the committed view
+    /// (no stranded increfs) and the imap/map-block state is restored. The
+    /// disk was never touched in a reachable way (the root never flipped), so
+    /// the mount stays refcount-consistent and fully usable.
     pub fn snapshot_create(
+        &mut self,
+        name: String,
+        creator: String,
+        timestamp: u64,
+    ) -> Result<u64, FileSystemError> {
+        let saved = self.txn_save();
+        match self.snapshot_create_inner(name, creator, timestamp) {
+            Ok(generation) => {
+                self.stats.snapshots_created += 1;
+                Ok(generation)
+            }
+            Err(e) => {
+                self.txn_unwind(saved);
+                Err(e)
+            }
+        }
+    }
+
+    fn snapshot_create_inner(
         &mut self,
         name: String,
         creator: String,
@@ -1431,9 +1458,34 @@ impl<D: BlockDevice> UnaFS<D> {
         let bytes = crate::codec::serialize(&index)?;
         self.rewrite_data_inner(SNAP_INDEX_INODE_ID, &bytes)?;
         self.commit()?;
-
-        self.stats.snapshots_created += 1;
         Ok(generation)
+    }
+
+    /// The in-RAM state a snapshot/reclaim transaction mutates before its
+    /// commit: the imap and the committed-map block lists (the refmap needs no
+    /// copy — [`RefMap::thaw`] restores it from its own frozen view).
+    fn txn_save(&self) -> (Vec<u64>, Vec<u64>, Vec<u64>) {
+        (
+            self.imap.clone(),
+            self.imap_blocks.clone(),
+            self.refmap_blocks.clone(),
+        )
+    }
+
+    /// Unwind a FAILED (uncommitted) transaction to the last committed state:
+    /// thaw the refmap (`current = frozen` — discarding every incref/decref
+    /// and allocation the failed transaction made, the exact inverse of the
+    /// tree-wide incref) and restore the saved imap/map-block state (a failed
+    /// `rewrite_data_inner`/`commit` can leave the in-RAM imap pointing at
+    /// fresh, now-unreferenced blocks). Only valid when the root did NOT flip
+    /// — every caller bails before its commit succeeded, so the frozen view
+    /// IS the on-disk truth.
+    fn txn_unwind(&mut self, saved: (Vec<u64>, Vec<u64>, Vec<u64>)) {
+        self.refmap.thaw();
+        self.imap = saved.0;
+        self.imap_blocks = saved.1;
+        self.refmap_blocks = saved.2;
+        self.txn_blocks = 0;
     }
 
     /// Drop a retained snapshot by its `generation` stamp (design V2): remove
@@ -1462,7 +1514,25 @@ impl<D: BlockDevice> UnaFS<D> {
     /// exercised directly (drop the mount here → the next mount's eager drain
     /// resumes and converges). Bumps the drop counter (the drain that follows,
     /// whether eager or on a later mount, does the freeing).
+    ///
+    /// Failure is clean: any error before the commit unwinds the in-RAM
+    /// transaction ([`Self::txn_unwind`]) — same discipline as
+    /// [`snapshot_create`](Self::snapshot_create).
     pub fn snapshot_drop_enqueue(&mut self, generation: u64) -> Result<(), FileSystemError> {
+        let saved = self.txn_save();
+        match self.snapshot_drop_enqueue_inner(generation) {
+            Ok(()) => {
+                self.stats.snapshots_dropped += 1;
+                Ok(())
+            }
+            Err(e) => {
+                self.txn_unwind(saved);
+                Err(e)
+            }
+        }
+    }
+
+    fn snapshot_drop_enqueue_inner(&mut self, generation: u64) -> Result<(), FileSystemError> {
         let mut index = self.snapshot_index()?;
         let pos = index
             .iter()
@@ -1482,8 +1552,6 @@ impl<D: BlockDevice> UnaFS<D> {
         let queue_bytes = crate::codec::serialize(&queue)?;
         self.rewrite_data_inner(RECLAIM_INODE_ID, &queue_bytes)?;
         self.commit()?;
-
-        self.stats.snapshots_dropped += 1;
         Ok(())
     }
 
@@ -1512,7 +1580,21 @@ impl<D: BlockDevice> UnaFS<D> {
     /// Drain the reclaim queue to empty (v1 eager policy): decref every
     /// enqueued block, empty the queue, ONE commit. Crash-safe: a power cut
     /// before the flip leaves the full queue for the next mount.
+    ///
+    /// Failure is clean: any error before the commit unwinds the in-RAM
+    /// transaction ([`Self::txn_unwind`]) — the decrefs are discarded and the
+    /// queue stays intact (on disk AND in the thawed refmap) for a retry or
+    /// the next mount.
     pub fn reclaim_drain(&mut self) -> Result<(), FileSystemError> {
+        let saved = self.txn_save();
+        let r = self.reclaim_drain_inner();
+        if r.is_err() {
+            self.txn_unwind(saved);
+        }
+        r
+    }
+
+    fn reclaim_drain_inner(&mut self) -> Result<(), FileSystemError> {
         let queue = self.reclaim_queue()?;
         if queue.is_empty() {
             return Ok(());

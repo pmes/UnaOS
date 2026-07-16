@@ -93,6 +93,11 @@ impl<D: BlockDevice> UnaFS<D> {
     /// refcount map. With `repair == false` it only reports; with
     /// `repair == true` it scrubs catalog entries referencing dead inode ids,
     /// rewrites the refcount map to the computed truth, and commits.
+    ///
+    /// Caveat (ledgered NOTE): the read-only scan checks PRESENCE, not
+    /// MAGNITUDE — a block in-use *and* reachable reports clean even if its
+    /// stored count disagrees with the multi-root truth; only `repair == true`
+    /// (which rebuilds true per-root counts) corrects magnitude drift.
     pub fn fsck(&mut self, repair: bool) -> Result<FsckReport, FileSystemError> {
         let block_count = self.superblock.block_count;
 

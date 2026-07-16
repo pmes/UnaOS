@@ -525,3 +525,95 @@ fn hostile_prefix_just_under_budget_stays_bounded() {
     hostile.extend_from_slice(&((unafs::codec::MAX_RECORD_BYTES as u64) + 1).to_le_bytes());
     assert!(unafs::codec::deserialize::<AttributeValue>(&hostile).is_err());
 }
+
+// =============================================================================
+// K8b: hostile SNAPSHOT INDEX / reclaim queue (lens B coverage)
+// =============================================================================
+
+/// Plant a hostile serialized snapshot-entry list in the on-disk snapshot
+/// index object of an otherwise-valid volume (what a corrupted or crafted
+/// card could present), returning the raw device.
+fn with_hostile_snapshot_index(entries: Vec<unafs::SnapshotEntry>) -> MemDevice {
+    let mut fs = formatted(16);
+    let bytes = unafs::codec::serialize(&entries).expect("hostile index serializes");
+    fs.write_data(unafs::superblock::SNAP_INDEX_INODE_ID, 0, &bytes)
+        .expect("planting the hostile index");
+    fs.device.clone()
+}
+
+#[test]
+fn snapshot_entry_with_out_of_range_imap_block_fails_closed() {
+    let device = with_hostile_snapshot_index(vec![unafs::SnapshotEntry {
+        generation: 7,
+        imap_block: u64::MAX - 5, // far past any volume
+        imap_leaves: 1,
+        name: "evil".into(),
+        creator: "evil".into(),
+        timestamp: 0,
+    }]);
+
+    // Mount itself succeeds (the index is not walked at mount) …
+    let mut fs = UnaFS::mount(device).expect("mount survives a hostile index");
+    // … but every path that WALKS the hostile root fails with a clean Err —
+    // never a panic, and repair refuses to act on a partial walk.
+    assert!(matches!(fs.fsck(false), Err(FileSystemError::CorruptVolume(_))));
+    assert!(matches!(fs.fsck(true), Err(FileSystemError::CorruptVolume(_))));
+    assert!(matches!(fs.snapshot_drop(7), Err(FileSystemError::CorruptVolume(_))));
+    // The volume stays otherwise usable (reads unaffected).
+    let root = fs.superblock.root_inode;
+    assert!(fs.ls(root).is_ok());
+}
+
+#[test]
+fn snapshot_entry_with_garbage_leaf_pointers_fails_closed() {
+    // A block full of 0xFF: every "leaf pointer" decodes wildly out of range.
+    let mut fs = formatted(16);
+    let root = fs.superblock.root_inode;
+    let f = fs.create_file(root, "garbage.bin".into()).unwrap();
+    fs.write_data(f, 0, &vec![0xFFu8; BLOCK_SIZE as usize]).unwrap();
+    let garbage_block = fs.read_inode(f).unwrap().chunks[0].physical_block;
+    let bytes = unafs::codec::serialize(&vec![unafs::SnapshotEntry {
+        generation: 9,
+        imap_block: garbage_block, // in range, but its CONTENT is garbage
+        imap_leaves: 1,
+        name: "evil".into(),
+        creator: "evil".into(),
+        timestamp: 0,
+    }])
+    .unwrap();
+    fs.write_data(unafs::superblock::SNAP_INDEX_INODE_ID, 0, &bytes)
+        .unwrap();
+    let device = fs.device.clone();
+    drop(fs);
+
+    let mut fs = UnaFS::mount(device).expect("mount survives");
+    assert!(matches!(fs.fsck(false), Err(FileSystemError::CorruptVolume(_))));
+    assert!(matches!(fs.fsck(true), Err(FileSystemError::CorruptVolume(_))));
+    assert!(matches!(fs.snapshot_drop(9), Err(FileSystemError::CorruptVolume(_))));
+}
+
+#[test]
+fn snapshot_index_over_the_cap_fails_closed() {
+    // 17 entries (> SNAPSHOT_CAP), each hostile. Listing is bounded and fine;
+    // create refuses at the cap; the walkers fail closed.
+    let entries: Vec<unafs::SnapshotEntry> = (0..17)
+        .map(|i| unafs::SnapshotEntry {
+            generation: 100 + i,
+            imap_block: u64::MAX - i,
+            imap_leaves: 1,
+            name: format!("evil{i}"),
+            creator: "evil".into(),
+            timestamp: i,
+        })
+        .collect();
+    let device = with_hostile_snapshot_index(entries);
+
+    let mut fs = UnaFS::mount(device).expect("mount survives");
+    assert_eq!(fs.snapshot_index().unwrap().len(), 17);
+    assert!(matches!(
+        fs.snapshot_create("one-more".into(), "x".into(), 0),
+        Err(FileSystemError::SnapshotCapReached(_))
+    ));
+    assert!(matches!(fs.fsck(false), Err(FileSystemError::CorruptVolume(_))));
+    assert!(matches!(fs.fsck(true), Err(FileSystemError::CorruptVolume(_))));
+}
