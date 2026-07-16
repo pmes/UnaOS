@@ -10,6 +10,41 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-rmbp track — 2026-07-16 (XENUM-2 — hub-downstream hot-plug: the hub Status Change Endpoint)
+
+### XENUM-2 — hub-downstream hot-plug via the Status Change Endpoint 🔬 `hw-rmbp`
+
+**What it does:** closes the remaining hot-plug gap after XENUM-1 (root-port hot-plug). A hub's
+downstream ports were scanned exactly once, at `bring_up_hub` time — a device plugged into a hub port
+after bring-up was never noticed and a hub-downstream disconnect was never handled (metal workaround:
+plug downstream devices before boot). XENUM-2 configures and services the hub's **interrupt-IN Status
+Change Endpoint** (the change-bitmap endpoint every hub exposes: bit 0 = hub, bit N = port N). All in
+`drivers/xhci/mod.rs`, additive to the enum/hub path; no `syscall.rs`/`irqstorage.rs`/`fat.rs`/`sched.rs`,
+no aarch64 files. **M1 — configure + service:** `configure_hub_interrupt_ep` (end of `bring_up_hub`)
+reads the hub config descriptor, issues one Configure-Endpoint (preserving the Hub-marked slot context),
+arms the change read; the transfer-event dispatch decodes the bitmap, traces each changed port, queues
+`(hub_slot, port)` into `hub_changes_pending` + re-arms (Panther-Point dup-Success guard), and
+`service_hub_changes` (drained from `service_hubs`) runs `GET_PORT_STATUS` — deferred while a root port
+enumerates (one-port-at-a-time), bounded per wake (`HUB_CHANGE_BUDGET`). **M2 — connect:**
+`reset_downstream_port` (reuse) + `enumerate_downstream` (reuse) with the route extended for the tier;
+SS ports force SuperSpeed (best-effort). **M3 — disconnect:** `disconnect_hub_port` tears down every
+slot carrying the port's full route-nibble prefix (a nested hub's whole subtree included); root + sibling
+ports are provably untouched (the summary trace asserts the scope), `DISABLE_SLOT` queued via the
+existing `slots_to_disable` drain, then every latched change feature cleared so the endpoint deasserts.
+
+**How it was tested:** 🔬 QEMU (QEMU models none of the silicon hot-plug timing — the gate is no
+regression + the trace fires where reachable): `./arroyo check` both arches, no new warnings, zero
+aarch64 diffs; default `test 25` MISSION SUCCESS + MOUSE-1 (usb-tablet enumerates); `UNAOS_HUBSTORAGE=1
+test 90` brings up the hubbed device + MISSION SUCCESS and the **M1 path fires in QEMU** —
+`HUB slot 1 status-change endpoint configured (ep 0x81 mps 2 dci 3); hot-plug armed`, then
+`HUB slot 1 status-change: port 1` and `HUB slot 1 port 1 status: wPortStatus=0x0103 wPortChange=0x0002
+(HS/FS)` serviced as a boot-reset `C_PORT_ENABLE` (`no actionable connection change`, cleared) — storage
+slot intact; `UNAOS_IRQSTORAGE=1 UNAOS_FATIMG=sf test 200` full storage chain 0 FAIL, S8-write witness
+intact; `test-arm 22` MISSION SUCCESS. **Metal verdict: PENDING** (attended rMBP sitting — connect/
+disconnect timing + the SS branch are silicon-verified; topology: a mouse/keyboard hot-plugged behind the
+HS hub, SS hub as available). Commits `bf9b075` (M1) / `199295f` (M2) / M3 + docs fold. Detail: §7d of
+`docs/dev/OS/07_USB_STORAGE/usb_xhci.md`.
+
 ## hw-rmbp track — 2026-07-15 (XENUM-1 — xHCI enumeration robustness: hot-plug / hub-downstream / SS-hub)
 
 ### XENUM-1 — three metal-observed enumeration/hub gaps closed additively 🔬 `hw-rmbp`
