@@ -141,3 +141,16 @@ pub fn cpu(index: usize) -> &'static PerCpuData {
 pub fn count_ipi() {
     this_cpu().ipis.fetch_add(1, Ordering::Relaxed);
 }
+
+/// Meter DISPLAY core count on tegra (VUGFIX). `NUM_CPUS` (8) is a BSS-sizing headroom bound matching
+/// the part's 8 GICR frames — NOT the real core count. The Orin Nano's DTB `/cpus` node names **6**
+/// Cortex-A78AE cores (the hard-won SMP-2/SMP-3 oracle: the redistributor-frame walk and
+/// `AFFINITY_INFO` both over-count the die's slots; only `/cpus` is truthful). `meter_cpu_count()`
+/// DISPLAYS this so `vug` stops claiming 8 CPUs on a 6-core part. It is a compile-time count, not a
+/// runtime `/cpus` walk, because the DEFAULT tegra boot is single-core and does no runtime enumeration
+/// (that lives only on the `tegrasmp` probe path; `smp_virt::N_CORES_PUB` is 0 on the default boot),
+/// and threading the DTB pointer to the meter read path would need an out-of-lane boot-path change.
+/// `NUM_CPUS` stays the array bound everywhere — this changes only what the meter DISPLAYS, no array
+/// size. Placed at EOF and `tegra`-gated so pi/virt line numbers and binaries stay byte-identical.
+#[cfg(feature = "tegra")]
+pub const METER_CPU_COUNT: usize = 6;

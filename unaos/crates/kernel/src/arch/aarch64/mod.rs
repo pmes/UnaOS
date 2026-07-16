@@ -174,11 +174,11 @@ pub fn ticks() -> u64 {
     timer::ticks()
 }
 
-/// Milliseconds since boot. Arch-neutral mirror of x86_64's `ms`, derived from the generic-timer
-/// heartbeat: `ticks()` advances at `timer::TICK_HZ` (250 Hz = 4 ms/tick), so ms = ticks * 4.
+/// Milliseconds since boot. pi/virt: generic-timer heartbeat (ticks()*4 at 250 Hz). tegra (VUGFIX):
+/// see §VUGFIX — timerless EL1 falls back to CNTVCT/(CNTFRQ/1000); cfg on one line keeps pi/virt byte-identical.
 #[inline]
 pub fn ms() -> u64 {
-    ticks() * 4
+    { #[cfg(not(feature = "tegra"))] { ticks() * 4 } #[cfg(feature = "tegra")] { if timer::is_live() { ticks() * 4 } else { let khz = timer::cntfrq() / 1000; if khz == 0 { 0 } else { now_cycles() / khz } } } }
 }
 
 /// Free-running virtual cycle counter (CNTVCT_EL0). Monotonic and interrupt-flag-independent, like
