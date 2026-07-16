@@ -12,7 +12,7 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ## hw-pi4 track — 2026-07-16 (K8a — UnaFS goes copy-on-write)
 
-### K8a — CoW data+metadata write path, atomic 512 B root flip, refcount allocator 🔬 QEMU-green 2026-07-16 (MBENCH 43/43 + 0 forbidden; metal + the pre-K8 card migration ride the next attended Pi sitting)
+### K8a — CoW data+metadata write path, atomic 512 B root flip, refcount allocator ✅✅ METAL-CONFIRMED 2026-07-16 (same-day attended sitting: pristine-v3 boot MBENCH 43/43 + 0 forbidden AND a real v2→v3 MIGRATED-volume boot 43/43 — migration byte-verified on silicon; the SECURITY.md 4096↔512 torn-write class formally RETIRED. Sitting facts of record: the 16 GB UNAOS card RETIRED mid-sitting — silent write drops, zero R1/CMD13, A-B proven when the morning kernel failed its own morning battery; the 32 GB card is the pi4 bench card. U9/U10 are stateful across boots — multi-boot sittings re-prep FAT fixtures file-level between boots, see unaos-hazards)
 
 **What it does.** ROADMAP §2 K8 line, arc 1 (design authority: the K8 CoW design pass, Peter's
 verdicts closed 2026-07-16, incl. the two execution verdicts — Fork 1: stable LOGICAL inode ids
