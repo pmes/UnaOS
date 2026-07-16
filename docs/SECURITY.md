@@ -431,6 +431,39 @@ The UNAFS-K3 mount became read-WRITE at K4: `fs/unafs.rs`'s `write_sector` route
   tight-volume no-reuse pressure test, the two-snapshots-share-blocks / drop-one-keeps-the-other
   case, the cap-16 refusal, and the owner-or-kernel authority matrix. QEMU-proven via `if=sd`
   write-back; the metal proof rides the next attended Pi bench.
+- **K8b dual-lens review ledger (2026-07-16 — zero surviving must-fix after a THREE-PASS
+  fix-verify loop; the loop's history is itself the security story).** Lens A's initial
+  should-fix (a NoSpace-failing `snapshot_create` stranded its tree-wide increfs — in-RAM
+  mount poisoned, unrepairable in place) was fixed via `thaw()` unwind; lens A's re-verify
+  then REFUSED the fix with a reproduced MUST-FIX: entry-snapshot restore composed with the
+  K8a write path's un-unwound NoSpace residue put reachable blocks at refcount 0 in BOTH
+  views — the allocator legally reallocated live blocks (16 KiB of committed data overwritten
+  on disk in the probe; strictly worse than the pre-fix wedge). Final shape (LC ruling,
+  FIX-VERIFIED pass 3): **`txn_unwind` reloads root/imap/refmap from the COMMITTED root on
+  disk** via `load_committed` (the mount loader itself, factored — validation can never
+  drift), so unwind is committed-consistent by construction and HEALS prior write residue as
+  a side effect; a reload failure poisons the allocator CLOSED (no allocation, reads fine,
+  remount recovers). `RefMap::thaw` is dead code again by design (warning doc). Standing
+  NOTEs, each real but bounded:
+  - *K8a mutating paths still carry no unwind* (untouched — metal-confirmed code): their
+    NoSpace failure mode is the pre-existing safe WEDGE (frozen view blocks further commits;
+    remount recovers), now also healed opportunistically by the next failed snapshot txn.
+    A uniform txn discipline is future work (K8-batch territory).
+  - *fsck(false) is presence-not-magnitude* (doc caveat in fsck.rs): over-refcounts of
+    reachable blocks are invisible to the read-only scan; `repair` is the ground-truth rebuild.
+  - *fsck(true) on a poison-closed mount mid-inner-txn* is an untested edge (repair would walk
+    the mid-txn imap) — remount first is the recovery of record.
+  - *Snapshot-time vs current ACL*: a snapshot retains the OLD inode incl. its OLD K6 ACL
+    attrs. No snapshot READ path exists today (list/create/drop only), so the question is
+    dormant — **K8c must settle whether snapshot-mediated reads re-evaluate the CURRENT ACL**
+    before adding the diff-walk/read surface.
+  - *Creator stamping contract*: the library accepts an arbitrary creator string; every
+    current surface is privileged and hard-codes it. A future ring-3 snapshot surface MUST
+    stamp the kernel-authenticated principal (BANDY-STAMP discipline) and actually invoke
+    `drop_permitted` — the enforcement hook exists but is vacuous today.
+  - *Cap-16 is enforced at create only* (policy, per V1): mount/fsck accept an over-cap
+    hostile index (each entry still bounds-checked; O(n) fsck walks bounded by the 4 MiB
+    codec ceiling).
 
 ### Process & supply chain
 - [ ] Adversarial review before metal and before merge on every arc (standing rule, `CLAUDE.md`)
