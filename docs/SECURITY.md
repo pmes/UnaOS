@@ -336,8 +336,10 @@ The UNAFS-K3 mount became read-WRITE at K4: `fs/unafs.rs`'s `write_sector` route
   flip — a power cut yields the old committed tree or the new one, never a hybrid, and there are
   no leak windows (an uncommitted transaction's blocks were never committed as allocated). The
   WAL is deleted from the format; there is no dirty-mount state to detect.
-- **The 4096↔512 atomicity gap — ⏳ RETIRED-PENDING-METAL by K8a (2026-07-16; formally retires
-  the day K8a lands metal).** The residual as ledgered at K4: the crate's "single-block metadata
+- **The 4096↔512 atomicity gap — ✅✅ FORMALLY RETIRED (2026-07-16 attended sitting: K8a
+  METAL-CONFIRMED — pristine-v3 boot MBENCH 43/43 + 0 forbidden AND a real v2→v3 MIGRATED
+  volume boot 43/43, K8a-cow power-cut-before-flip convergence + refcount persistence proven
+  on silicon both boots; log `pi-serial-2026-07-16-k8a-sitting.log`).** The residual as ledgered at K4: the crate's "single-block metadata
   swap is the atomic point" held only at 4096 B granularity, while the medium writes 512 B
   sectors — one `write_block` = eight sequential, individually-non-atomic `write_sector`s, so a
   power cut mid-block could tear a metadata swap unless the record fit the first sector. **K8a
