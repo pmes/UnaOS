@@ -345,7 +345,7 @@ HS hub); the fix shape is retrying on zero vid+pid or checking the actual transf
 length. (2) *`downstream ADDRESS_DEVICE code 17` has no retry* — the downstream
 addressing path gives up on first failure, unlike root ports' paced recovery. The same
 hub carried a working keyboard throughout, so the transport is sound; both gaps are in
-downstream-enumeration robustness.
+downstream-enumeration robustness. **Both addressed in §7g (XENUM-3), metal-pending.**
 
 ---
 
@@ -458,6 +458,62 @@ unregressed. The real verdict was the attended rMBP bench (below).
   explanation — analysis at the next arc boundary).
 - The M0 keyboard dup-guard held on metal: single `KEY` event per press throughout,
   including from a keyboard hot-plugged behind the hub.
+
+---
+
+### 7g. Hub-downstream enumeration robustness (XENUM-3)
+
+Two additive fixes to the behind-a-hub enumeration path (`enumerate_downstream` /
+`address_downstream`), closing the two gaps the §7d "New metal findings" characterized.
+Both are **METAL-PENDING by construction**: QEMU never posts a zeroed descriptor or a
+`code 17`, so the QEMU gates prove only *no regression* — the fixes exercise on the metal
+rMBP behind the VIA hub.
+
+**M1 — descriptor-content + short-read validation.** The old device-descriptor gate
+accepted any read with `bLength >= 18 && bDescriptorType == 0x01`, so the metal case — a
+mouse whose descriptor came back structurally valid but **zeroed** (`vid=0000 pid=0000`,
+"no HID interrupt endpoint") — passed and the paced retry never fired. Two additions:
+
+- *Actual transferred length.* `sync_control` now sets IOC on the DATA-stage TRB so the
+  controller posts a data transfer event carrying the TRB Transfer Length residual; the
+  sync EP0 pump claims and consumes that event (it never reaches the async FSM) and
+  records the transferred byte count in `last_control_len`. A read shorter than the
+  requested 18 bytes is now detectable.
+- *Bad-read predicate.* The retry loop treats a read as BAD (→ the existing bounded paced
+  retry, then leave-unconfigured + slot dispose) when it errored, `last_control_len < 18`,
+  the structural header is wrong, **or** the header is valid but `vid==0 && pid==0`. Trace:
+  `downstream slot N device-descriptor bad read (got G of 18, bLength=… type=… vid=… pid=…, attempt A of 4)`.
+- *MPS0-learn for FS/LS behind a HS hub.* A Full-Speed device's real `bMaxPacketSize0`
+  can be 8/16/32, not the 64 `address_downstream` guesses — so the full read short-reads
+  and strands with zeroed content. Mirroring the root path's MPS0-learn idiom, the
+  downstream path now reads the 8-byte header first, and if the device's real MPS0 differs
+  from what was programmed, re-issues ADDRESS_DEVICE with the learned value before the full
+  read. Trace: `downstream slot N MPS0 learned M (programmed P); re-addressing.` (This one
+  *does* fire in QEMU: the hubbed FS storage device reports MPS0=8 and is re-addressed
+  before its descriptor read — the HUBSTORAGE gate exercises the re-address code path.)
+
+**M2 — downstream ADDRESS_DEVICE bounded paced retry.** `address_downstream` gave up on
+the first non-success completion (metal: `code 17` = Context State Error behind the VIA
+hub), where root ports have 200/400/600 ms paced recovery. It now retries the same input
+context up to `XENUM_ADDR_RETRIES` (3) times with an escalating settle between attempts
+(no port re-reset — a Context State Error is a controller-side transient, not a link
+fault). Trace per attempt: `downstream ADDRESS_DEVICE code C (attempt A of N)` and, on
+exhaustion, `downstream ADDRESS_DEVICE failed after N attempts`.
+
+**Honest slot cleanup.** A downstream slot that was ENABLE_SLOT'd but never brought to a
+usable device (failed address, descriptor never valid) previously stayed `active=true`
+with contexts allocated and a live DCBAA pointer — a leaked active entry. `enumerate_
+downstream` now calls `dispose_downstream_slot` on those bail paths, mirroring the
+root-port recovery clean-up (soft-state reset + deferred DISABLE_SLOT; rings/contexts
+leaked-not-freed until the controller releases them). Trace:
+`downstream slot N disposed (unenumerated); queued for DISABLE_SLOT.` (A genuinely
+addressed device of an unsupported class is left as-is — it is a real device, not a
+failed address.)
+
+QEMU gates (no-regression): `UNAOS_HUBSTORAGE=1 test 60` → MISSION SUCCESS + full U-arc
+chain off the hubbed disk (MPS0-learn re-address exercised); `UNAOS_IRQSTORAGE=1
+UNAOS_FATIMG=sf test 200` → S-chain 0 FAIL; `test 40` → MISSION SUCCESS; `UNAOS_NOSTORAGE=1`
+clean.
 
 ---
 
