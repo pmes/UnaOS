@@ -4374,3 +4374,13 @@ media hash-verified on-stick per boot):**
   unchanged (`…dc40`), the wall and live APs are independent.
 - Wall fault-rate tally on the new-layout images this sitting: crcrq-leg23 2/2 (both in-window at
   the CRCR write), smpprobe24 1/2 (JB9i-time), smpprobe25 1/1 (JB9i-time, post-verdict).
+
+**Post-sitting addendum (same evening):** the freshly-staged folded-default layout (`63e90f8`
+knob-off) proved to be a WALL-FAULTER on metal — 2/2 boots RAS'd at JB9i (`…dc40`), presenting on
+the panel as a "lockup" (the RAS power-off freezes the scanout). Wall data, not a regression: the
+fourth-through-sixth new layouts built today have now ALL sampled the wall. Stick default
+therefore restored to the metal-validated `cad623af…` (`d3ecf48` era, 20+ clean boots), verified
+to shell on metal; the folded-default tar is flagged in the bench MANIFEST as a faulter, unfit
+for stick-default duty. Standing rule until the wall is fixed: a stick DEFAULT must be a layout
+with a clean multi-boot metal record — QEMU-green + fresh layout is not sufficient for the
+default slot.
