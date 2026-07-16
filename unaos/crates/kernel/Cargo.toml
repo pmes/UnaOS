@@ -75,6 +75,15 @@ noportsw = []
 # register evidence (the 2012 rMBP internal kbd/trackpad are on EHCI-only ports). x86_64-only module;
 # default OFF => module unlinked, media byte-identical. Enable via `UNAOS_EHCISCOUT=1`.
 ehciscout = []
+# EHCI-2 configure-and-relook scout: UNAOS_EHCICONFIG=1 arms a knob-gated, minimal EHCI WAKE sequence
+# (PMCSR->D0, USBLEGSUP OS-ownership handshake, RS=1, then CONFIGFLAG=1 + port-power) with two PORTSC
+# censuses (before/after CONFIGFLAG=1) so the attended rMBP sitting can distinguish
+# asleep-until-configured USB internals from not-USB (SPI). Writes are confined to the EHCI functions'
+# PMCSR / USBLEGSUP OS-own bit / USBLEGCTLSTS (SMI-enable clear + status ack after OS ownership) /
+# USBCMD.RS / CONFIGFLAG / PORTSC port-power bits — NO enumeration, NO
+# transfers, NO driver, and nothing touching xHCI routing. Implies `ehciscout`; default OFF => the
+# config path is unlinked and the module is byte-identical to the EHCI-1 read-only scout.
+ehciconfig = ["ehciscout"]
 # SOCK-1: route the shell's ping/arp/netinfo through the mature smoltcp TCP/IP stack (ROADMAP §1b)
 # instead of the hand-rolled `net` engines. Pulls in the x86-only smoltcp optional dependency and
 # compiles the `smolnet` Device adapter over the e1000e rings (the module is additionally
