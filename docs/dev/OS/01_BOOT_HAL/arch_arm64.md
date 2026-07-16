@@ -3804,3 +3804,41 @@ CAPSTONE 6/6 + 3/3 secondaries (the shared `smp_virt` path is byte-untouched); `
 (34 PASS); `UNAOS_HUBSTORAGE` x86 MISSION SUCCESS; knob-off byte-identity proven (two default builds hash
 identical, `tegra:` 109); 7 armed leg tars staged. The metal verdict is the attended bench with LC-orin
 + Peter (runbook `scripts/orin-smp4-bench.md`).
+
+### ORIN-SMP-5 — the RESIDUE legs (`UNAOS_SMPPROBE=17..20`, knob-gated; bench Peter-attended)
+
+The ORIN-SMP-4 sitting (2026-07-15 attended) came back **7/7 legs survived**: legs 10..15 matched
+their predictions EXACTLY (leg 15's `GICR_WAKER @ 0xf460014` read survived — the prime suspect was
+INNOCENT), and **leg 16's full-path replica survived AGAINST its prediction** — checkpoint
+`0x53040010`, `AP -> BSP SGI OK (BSP ipi 1 -> 2)`: the first live UnaOS AP on Orin silicon. The
+SMP-3 fault was therefore **NOT reproduced** by the replica. So the SMP-3 trigger lives in what leg 16
+deliberately **omitted** vs the real `__secondary_rust_virt` flow. ORIN-SMP-5 adds four RESIDUE legs,
+each still "leg-16 shape + exactly one restored real-path element," in the same self-contained
+`smpprobe.rs` machinery (same stack / regime / checkpoint / entry-stub idiom; `smp_virt.rs` stays
+byte-untouched).
+
+**The residue legs (checkpoint tag continues the `0x5304_00<leg>` family — leg 17 = `0x53040011`):**
+
+| knob | residue element restored over leg 16 | checkpoint | notes |
+|---|---|---|---|
+| **17** | +ONE `serial_println!` from the WOKEN CORE (UART MMIO + `SERIAL_PORT` console spinlock from a secondary) — the "AP online" print the bisect deliberately forbade | `0x53040011` | PRIME residue suspect. The print runs BEFORE the checkpoint store, so a rejected UART/spinlock access RAS-powers-off before `0x53040011`. The AP uses the SAME bounded-TXFF `serial_println!` path as the BSP (no new UART code); the BSP names the UARTC base `0x0C28_0000` before `CPU_ON`. |
+| **18** | +the real **WFI** idle tail (the replica parks in WFE; the real secondary parks in WFI) | `0x53040012` | Checkpoint is raised BEFORE the WFI, so survival is recorded regardless; the core is not expected to return. |
+| **19** | leg-16 shape on a **CLUSTER-1** core (DTB aff `0x0001_0200`) instead of `0x00000100` | `0x53040013` | Crosses a CCPLEX cluster boundary (per-cluster MCE/BPMP coordination). STOPs with no `CPU_ON` if `/cpus` does not name `0x00010200` (RIDER 5 — DTB-only presence). BSP prints the resolved cluster-1 GICR frame before `CPU_ON`. |
+| **20** | the real **5-core wake SEQUENCE** — every non-BSP `/cpus` core woken leg-16-shape, IN DTB ORDER, one at a time | `0x53040014` (per core) | Runs LAST and only if 17..19 all survived. Tests whether the fault is driven by multi-core concurrency (SMP-3 woke five; the single-core legs woke one). A RAS power-off mid-sequence — the pre-`CPU_ON` line names which core was under the gun — is the verdict. |
+
+**Predictions (RIDER 2 — written BEFORE any boot; a contradicted prediction STOPs the sitting).** The
+first residue leg to RAS-power-off NAMES the residual trigger and STOPs the sitting there (that fault
+IS the located wall). If all four survive, the SMP-3 fault is not reproduced by any single restored
+element — pointing to timing/ordering/concurrency, a follow-up arc. Leg 17 is the leading fault
+candidate (the secondary's console access). Legs 18 (WFI) is expected benign. Leg 19 (cluster-1) and
+leg 20 (5-core sequence) are the two remaining fault candidates if 17 survives. Full pre-registered
+prediction table + the schedule live in `scripts/orin-smp5-bench.md`.
+
+**Gate (this executor).** `./arroyo check` green (both arches, knob-off) + `UNAOS_TEGRA=1
+UNAOS_SMPPROBE=17..20` all compile; knob-off byte-identity proven (two default `esp-jetson` builds hash
+identical `17bc4e7a…`, `tegra:` 109, zero `SMPPROBE-5` strings); armed images 17..20 are distinct
+kernels carrying `SMPPROBE-5` strings (validate by ELF hash + `strings | grep SMPPROBE-5` + the LIVE
+`sel=<n>` on the first serial line); `test-arm 22` MISSION SUCCESS; GICv3 `test-arm 40` CAPSTONE 6/6 +
+3/3 secondaries (shared `smp_virt` byte-untouched); `kernel8-test` 0-FAIL (34 PASS); `UNAOS_HUBSTORAGE`
+x86 MISSION SUCCESS; 4 armed leg tars + the knob-off DEFAULT staged. The metal verdict is the attended
+bench with LC-orin + Peter (runbook `scripts/orin-smp5-bench.md`).

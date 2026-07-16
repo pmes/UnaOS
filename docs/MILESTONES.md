@@ -244,6 +244,35 @@ instrumented build (core3probe idiom) rides the next Pi arc's sitting to produce
 
 ---
 
+## aarch64 SMP — ORIN-SMP-5: the RESIDUE legs (`UNAOS_SMPPROBE=17..20`) — 2026-07-16 🔬 BUILT + QEMU-GATED, awaiting attended Orin bench `hw-jetson`
+
+**What it does:** extends the ORIN-SMP-4 bisect with four RESIDUE legs — what leg 16's replica omitted
+vs the real `__secondary_rust_virt` flow (leg 16 SURVIVED against its predicted SMP-3 fault, so the
+trigger lives in the omissions). Each is "leg-16 shape + exactly ONE restored real-path element," in the
+same self-contained `smpprobe.rs` machinery (own stack / regime / checkpoint / entry stub; `smp_virt.rs`
+byte-untouched): **17** = +ONE `serial_println!` from the WOKEN CORE (UART MMIO + `SERIAL_PORT` console
+spinlock from a secondary — the PRIME residue suspect; the AP-print runs before the checkpoint store so a
+rejected console access RAS-powers-off before `0x53040011`; same bounded-TXFF path as the BSP, no new
+UART code); **18** = +the real WFI idle tail (checkpoint `0x53040012` raised before the WFI); **19** =
+leg-16 shape on the CLUSTER-1 core (DTB aff `0x0001_0200`, crosses a CCPLEX cluster boundary; STOPs with
+no `CPU_ON` if `/cpus` omits it); **20** = the real 5-core wake SEQUENCE (every non-BSP `/cpus` core,
+leg-16 shape, DTB order, one at a time; runs LAST only if 17..19 survived — tests multi-core concurrency).
+Every address under test (leg 17 UARTC base `0x0C28_0000`, leg 19 cluster-1 GICR frame) is COMPUTED +
+PRINTED BSP-side before any `CPU_ON`. Same riders as SMP-4: one variable per leg · pre-registered
+predictions (the first RAS-fault names the residual trigger; STOP there) · probe-only · DTB-only presence.
+
+**How it was tested:** `./arroyo check` green both arches (knob-off) + `UNAOS_TEGRA=1 UNAOS_SMPPROBE=17..20`
+all compile; **knob-off byte-identity proven** — two default `esp-jetson` builds hash identical
+`17bc4e7a…`, `tegra:` 109, ZERO `SMPPROBE-5` strings; armed images 17..20 are distinct kernels carrying
+`SMPPROBE-5` strings (13 each; validate by ELF hash + `strings | grep SMPPROBE-5` + the LIVE `sel=<n>`);
+`test-arm 22` MISSION SUCCESS; GICv3 `test-arm 40` CAPSTONE 6/6 + 3/3 secondaries (shared `smp_virt`
+byte-untouched); `kernel8-test` 0-FAIL (34 PASS); `UNAOS_HUBSTORAGE` x86 MISSION SUCCESS. Four armed leg
+tars + the knob-off DEFAULT staged. QEMU cannot model the Tegra machine, so the metal verdict is the
+attended Orin bench (LC-orin + Peter) per `unaos/scripts/orin-smp5-bench.md`. `arch/aarch64/smpprobe.rs`
++ `arch_arm64.md §ORIN-SMP-5`.
+
+---
+
 ## aarch64 SMP — ORIN-SMP-4: the woken core's EXECUTION BISECT (`UNAOS_SMPPROBE=10..16`) — 2026-07-15 ⚡ BENCHED: ALL 7 LEGS SURVIVED — **first UnaOS AP ONLINE on Orin silicon**; the fault residue is 3 named suspects `hw-jetson`
 
 **Attended bisect sitting 2026-07-15 (serial `jetson-serial-2026-07-15-smp4bisect.log`): legs 10–16, 7
