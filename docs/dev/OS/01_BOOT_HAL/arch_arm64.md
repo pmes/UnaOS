@@ -4159,3 +4159,35 @@ names the exact structure that carried the poison.
 
 Knob-off both features vanish (byte-identical to baseline; zero `JBXC` / `JBXC-SCRUB` strings; proven by
 two default `esp-jetson` builds hashing equal). Bench legs pre-registered in `scripts/orin-xcarve-bench.md`.
+
+**⚡ FIX-SITTING VERDICT (2026-07-16 attended, Peter + LC-orin; serial
+`~/unaos-bench/jetson-serial-2026-07-16-xcarvefix-sitting.log`; 5 boots — census v2 boot A + 4
+boots of the census+scrub-leg23 image; media hash-verified on-stick per boot; 0 RAS faults in the
+whole sitting):**
+
+- **Boot A (census v2, default layout): the TRANSFER-RING ARM IS EXONERATED.** All ~30 nonzero
+  TR dequeue pointers across the 8 inherited Configured slots are sane in-DRAM (`0x2_5f19–5f2f`
+  region); the only `IMPLAUSIBLE`-flagged entries are NULL (unused endpoints — a census
+  display-noise nit, see note below). Clean boot, CAPSTONE 6/6.
+- **Boots B1/B2 + 2 extra cuts (census+scrub on the historically-4/4 leg-23 knobs): scrub NO-OP
+  4/4** ("no poisoned inherited DRAM value found"), then a clean JB9i passage EVERY boot — **0
+  faults in 4 boots on this (third distinct) layout.** The confirming no-op-then-fault sample
+  never arrived, so the verdict is stated at its honest strength: **every DRAM-visible inherited
+  class is eliminated by direct observation (exhaustive census + 4× corroborating no-ops); the
+  FillWrite target is controller-INTERNAL or the CRCR-unreadable command ring, BY ELIMINATION.**
+  The DRAM-scrub lever, though verified safe on silicon, cannot reach this wall — the next fix
+  proposal must target controller-side state (e.g. quiesce/normalize the inherited command ring
+  by programming CRCR before the eviction, or a controller-internal-state investigation), and
+  goes to Peter as a proposal.
+- **Layout correlation, third angle:** three distinct layouts of the same leg-23 knobs now
+  sample 4/4 (original), ~50% (relink), and 0/4 (census+scrub build) fault rates — reinforcing
+  that layout decides exposure while the poisoned value itself lives outside DRAM view.
+- **Incidental SMP replication:** leg 23 (real entry × rapid 5-core) ran on all 4 scrub-image
+  boots — 5/5 cores online via the real path + CAPSTONE 6/6 every time. With the prior sitting,
+  the SMP-3 conjunction's innocence is now replicated ×5 on silicon.
+- **Census firmware-determinism confirmed:** the inherited-pointer census is bit-identical
+  across all 5 boots except ERDP (the firmware event-ring dequeue advances a few entries per
+  boot — expected).
+- **Nit for the next probe touch (non-blocking):** the census's `IMPLAUSIBLE` flag does not
+  special-case a NULL TRDeq (unused endpoint) and so flags 13 zeros per dump; the scrub
+  correctly treats NULL as not-poisoned (`raw != 0` short-circuit). Cosmetic only.
