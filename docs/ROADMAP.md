@@ -214,11 +214,22 @@ Principles, in force for every arc that touches this seam:
    weight of apps": the desktop becomes a scene of live capabilities viewed
    over the bus, not a window manager for monoliths.
 
-First concrete arc (when sequenced): define the on-UnaOS `SMessage` transport
-seam — syscall-backed send/receive, principal-stamped, same wire shape bandy
-uses — and round-trip midden's first verbs (`ls`, `cat`, `cp`) through kernel
-fulfillment in QEMU. K2's named programs supply the principal stamping. Midden
-becomes program #3 — the first real (non-fixture) on-UnaOS program.
+First concrete arc — **🔬 LANDED (BANDY-1, 2026-07-16, QEMU-green; metal leg
+rides the next attended sitting):** the on-UnaOS `SMessage` transport seam is
+live — `SYS_MSEND`/`SYS_MRECV` (bounded per-ASID mailboxes, blocking recv),
+every request KERNEL-stamped with the sender's IMAGE_SHA256 principal (a
+caller-supplied principal is `-EINVAL`, never overwritten), and `ls`/`cat`/`cp`
+round-trip from **midden — program #3, the first real (non-fixture) on-UnaOS
+program (`MIDDEN.BIN`)** — through kernel fulfillment under the *invoker's*
+grants (equivalence witnessed: denied-via-bus == denied-via-syscall,
+byte-same errno). **Wire format (Peter's ruling at this arc):** ONE coherent
+UnaOS-NATIVE v1 frame both directions (`arch/aarch64/bus.rs` — 52-byte header
+with principal + status + typed verb bodies; error replies are errno-only),
+chosen on merit rather than host byte-compat — "we're writing this OS and
+filesystem so we can make whatever change we need to do it right." The KATs
+freeze it as the spec of record; **host bandy/midden migrate to this wire in
+a later HOST arc.** AI-OFF is first-class here trivially: no vein exists on
+metal, every verb is principal-attributed and ACL-checked (principle 4 held).
 
 ## 4. TALUS — the rover (deferred until the desktop chain matures)
 

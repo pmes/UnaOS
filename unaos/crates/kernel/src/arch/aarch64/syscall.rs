@@ -122,6 +122,16 @@ const SYS_CLOSE: u64 = 17;
 /// handle a grantee already holds survives a revoke (the ACL gates ACQUISITION, not held caps). See `sys_fgrant`.
 const SYS_FGRANT: u64 = 18;
 
+/// BANDY-1 M2: the on-UnaOS SMessage bus transport (ROADMAP §3b arc 1). SYS_MSEND(frame_ptr,
+/// frame_len) submits ONE v1 request frame (arch/aarch64/bus.rs wire layout); the kernel
+/// validates it fail-closed, STAMPS the sender's principal into the header (verdict C — a
+/// caller-supplied principal is -EINVAL, never overwritten), fulfills the verb through the
+/// EXISTING FAT/ACL machinery under the invoker's grants (verdict D — no impersonation, no new
+/// model), and enqueues the reply into the SENDER's bounded mailbox. SYS_MRECV(buf_ptr, buf_len)
+/// dequeues the next reply, blocking on the sys_wait Semaphore idiom while the mailbox is empty.
+const SYS_MSEND: u64 = 19;
+const SYS_MRECV: u64 = 20;
+
 /// M6e demo: the sentinel `sys_exit` status the preemption spinner uses so its exit is accounted to
 /// `EL0_SPIN_DONE` and never perturbs the M6b `exited/killed` counters. Demo-only — there is no real
 /// userspace yet, so overloading one status value for demo bookkeeping is safe and documented here.
@@ -3404,6 +3414,10 @@ pub fn clear_handle_row(asid: u64) {
     // or retractor never double-frees; a sender racing this teardown re-checks its recipient AFTER depositing
     // (the sys_xfer post-check) and retracts, closing the deposit-into-a-dead-asid path from its side.
     clear_xfer_inbox_row(asid);
+    // BANDY-1 M2: drain this ASID's bus mailbox alongside its handles/inbox — undelivered replies
+    // die with their tenant (the boxes free here), and the gen bump above already makes any reply
+    // enqueued in a race dead-on-arrival for the next tenant (bus_mrecv verifies the stamp).
+    bus_mbox_clear(asid);
     // U7: DISOWN any still-live transfer this dying ASID sent (SENDER -> u64::MAX, never a real ASID):
     // revoke authority dies with the sender, so the ASID's next tenant can neither revoke nor be blamed
     // for the old tenant's transfers (txids are monotonic and were returned to EL0 — without this, a
@@ -4251,6 +4265,12 @@ fn owned_install_persisted(
 /// caller BEFORE this lock — SLOT_PPID must not be taken under OWNED_FILES). NONE for an anonymous/inline
 /// creator; a NONE owner never persists (the syscall handler's persist step is gated on `kind != NONE`).
 fn owned_set_owner(dir_lba: u64, dir_off: u32, owner_asid: u64, owner_gen: u64, owner_ppid: PrincipalRecord) -> bool {
+    // BANDY-1 (verdict C): the reserved KERNEL-REPLY principal can never be adopted as an owner —
+    // fail closed before any table mutation. No live path constructs such a record outside the bus
+    // reply stamp; this is the defense-in-depth gate the BANDY-STAMP witness proves.
+    if owner_ppid.kind == PRIN_KERNEL_REPLY {
+        return false;
+    }
     let _irq = IrqGuard::mask_save();
     let mut t = OWNED_FILES.lock();
     for row in t.iter_mut() {
@@ -4303,7 +4323,9 @@ fn owned_access_ok(
             // K1 M2.4: cross-reboot admission by PERSISTENT principal. A re-spawned named program re-acquires
             // ITS OWN persisted file (owner-by-name = full authority); a named grantee re-acquires its granted
             // access (rights-checked). NONE never matches NONE, so anonymous callers fall straight through.
-            if caller_ppid.kind != PRIN_NONE {
+            // BANDY-1 (verdict C): the reserved KERNEL-REPLY kind is excluded — it can never be admitted
+            // by-name even if a row somehow carried it (fail-closed twin of the owned_set_owner/owned_grant gates).
+            if caller_ppid.kind != PRIN_NONE && caller_ppid.kind != PRIN_KERNEL_REPLY {
                 if row.owner_ppid.kind != PRIN_NONE && row.owner_ppid == caller_ppid {
                     return true;
                 }
@@ -4483,6 +4505,11 @@ fn owned_grant(
     owner_ppid: PrincipalRecord, // K1 M2.4: the CALLER's persistent principal (for by-name owner authority)
     grantee_ppid: PrincipalRecord, // K1 M2.3: grantee's persistent principal (captured by the caller pre-lock)
 ) -> i64 {
+    // BANDY-1 (verdict C): the reserved KERNEL-REPLY principal can never be GRANTED rights (nor
+    // wield owner authority) — refuse before any table read. Defense in depth; see PRIN_KERNEL_REPLY.
+    if grantee_ppid.kind == PRIN_KERNEL_REPLY || owner_ppid.kind == PRIN_KERNEL_REPLY {
+        return EACCES;
+    }
     let _irq = IrqGuard::mask_save();
     let mut t = OWNED_FILES.lock();
     for row in t.iter_mut() {
@@ -5427,6 +5454,7 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
             u11reap_report(a0);
             uowner_report(a0);
             k2_report(a0);
+            bandy_report(a0);
             0
         }
         SYS_YIELD => sys_yield(),
@@ -5444,6 +5472,8 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
         SYS_XFER => sys_xfer(a0, a1, a2),
         SYS_RECV => sys_recv(),
         SYS_FGRANT => sys_fgrant(a0, a1, a2),
+        SYS_MSEND => sys_msend(a0, a1),
+        SYS_MRECV => sys_mrecv(a0, a1),
         SYS_EXIT => {
             // Demo accounting BEFORE the no-return exit. The sentinel statuses are routed to their own
             // counters so the M6b (`exited=1 killed=3`) and M6e (`completed=1`) verdicts stay byte-
@@ -5506,6 +5536,23 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
             // short-circuit. Neither has a launcher-planted Proc entry (no cross-program grants), so the
             // mark is a no-op for them; they ride this arm only to route the sentinel to EL0_K2_DONE (the
             // launcher's bounded wait gates on it) rather than the generic child-reap path.
+            // BANDY-1 M4: midden (program #3) exits by NAME, same discipline as the K2 programs —
+            // route its sentinel to EL0_MIDDEN_DONE (the bandy_rt launcher's bounded wait gates on
+            // it) rather than the generic child-reap path.
+            {
+                let nm = super::sched::current_name();
+                if nm == Some("el0-midden") {
+                    if a0 == MIDDEN_EXIT_STATUS {
+                        EL0_MIDDEN_DONE.fetch_add(1, Ordering::AcqRel);
+                    }
+                    if let Some(id) = super::sched::current_id() {
+                        if let Some(i) = proc_find_running(id) {
+                            PROCS[i].state.store(PEXITED, Ordering::Release);
+                        }
+                    }
+                    super::sched::exit(); // never returns
+                }
+            }
             {
                 let nm = super::sched::current_name();
                 if nm == Some("el0-k2own") || nm == Some("el0-k2imp") {
@@ -5923,6 +5970,8 @@ const EISDIR: i64 = -21; // sys_open: the named entry is a directory, not a file
 const ENFILE: i64 = -23; // U11-M2: the GLOBAL cross-process open-file table is full (a new file identity, no row)
 const EMFILE: i64 = -24; // sys_open: the caller's open-file (or handle) table is full
 const ENOSPC: i64 = -28; // U10: no free cluster (volume full) / no free root-dir slot (grow/create)
+const EEXIST: i64 = -17; // BANDY-1: bus cp refuses an existing destination (create-new-only in v1)
+const EMSGSIZE: i64 = -90; // BANDY-1: SYS_MRECV buffer smaller than BUS_FRAME_MAX (whole-frame contract)
 
 /// A program successfully loaded into a fresh per-task slot: the EL0 entry VA, the initial SP_EL0, the
 /// slot's TTBR0, and (for the M6g loader's log line) the slot id, byte length, and FAT kind.
@@ -8454,6 +8503,23 @@ pub fn u7_launcher(demo_cpu: usize) {
     // LAST, fully self-cleaning (leaves only the staged K3 fixtures). Its own uncounted
     // `:: K6-migrate: … PASS ::` line; honest skip on media without a unafs partition.
     k6_migrate_selftest();
+    // BANDY-1 M1: the bus v1 subset codec KATs — reply bodies proven byte-compatible with the
+    // HOST serializer (tools/bandy-golden captures), native request header+payloads frozen,
+    // decode fail-closed at the hard ceiling. Read-only, in-RAM (no disk, no card); its own
+    // uncounted `:: BANDY-CODEC: … PASS ::` line. LAST in the chain.
+    super::bus::bus_codec_selftest();
+    // BANDY-1 M5 (verdict C): the stamping witness — caller-supplied principal rejected, replies
+    // stamped with the reserved kernel kind (fail-closed everywhere a grantee/owner can appear),
+    // bounded per-ASID mailboxes, gen fence. Drives the PRODUCTION sys_msend_for path with
+    // scratch identities; one read-only ls mount, no disk write. Its own uncounted
+    // `:: BANDY-STAMP: … PASS ::` line.
+    bandy_stamp_check();
+    // BANDY-1 M4/M5: the round-trip + equivalence witnesses through the REAL midden program
+    // (program #3, Peter's E verdict) — ls/cat/cp parsed at EL0 into typed frames, kernel-
+    // fulfilled under the stamped principal; denial equivalence (bus vs direct syscall,
+    // byte-same errno) proven at EL0. Self-cleaning; its own uncounted `:: BANDY-RT: … ::`
+    // + `:: BANDY-EQ: … ::` lines. LAST in the chain.
+    bandy_rt_launcher(demo_cpu);
 }
 
 /// F2 M3 witness worker — the `demo_cpu` half of the cross-core FAT_MUTATION stress. `fn(usize)` for
@@ -8670,6 +8736,13 @@ const PRIN_PROGRAM_NAME: u8 = 1; // "prog:<name>" — the pre-code-signing defau
 const PRIN_IMAGE_SHA256: u8 = 2; // "sha256:<hex>" — the code-signing principal; the loader mints THIS since IMG-SIG
 #[allow(dead_code)]
 const PRIN_KERNEL_PID: u8 = 3; // reserved: launcher-minted "pid:<hex>"
+// BANDY-1 (verdict C): the RESERVED KERNEL principal kind stamped on bus REPLY frames — the kernel
+// speaking as fulfiller, NOT a grantable identity. FAIL-CLOSED everywhere a grantee/owner can
+// appear: `owned_set_owner`/`owned_grant`/`owned_access_ok` refuse it explicitly; the native
+// projection (`principal_native_string`/`native_project_owner_grants`) has no arm for it (None →
+// un-persistable); the reverse codec can never mint it (it parses `prog:`/`sha256:` forms only).
+// Proven by the BANDY-STAMP witness.
+const PRIN_KERNEL_REPLY: u8 = 4;
 const PRIN_VALUE_LEN: usize = 30;
 
 /// K1: a 32-byte kind-tagged persistent principal — the PROPOSED durable owner/grantee identity. Opaque to
@@ -13978,4 +14051,760 @@ fn nsspan_report() {
         NSSPAN_GROW.load(Ordering::Relaxed),
         super::timer::cntfrq(),
     );
+}
+
+
+// =====================================================================================================
+// BANDY-1 (ROADMAP §3b arc 1): the on-UnaOS SMessage bus — TRANSPORT (M2) + KERNEL FULFILLMENT (M3).
+// =====================================================================================================
+//
+// "Port the bus, not the binary convention." The wire layer (frame layout, decode ceilings, the
+// frozen native goldens) lives in arch/aarch64/bus.rs; THIS section is the syscall transport and
+// the kernel-side fulfiller for the v1 verbs (ls / cat / cp).
+//
+// Shape (design verdicts Maestro-closed 2026-07-15/16 + Peter's native-format ruling, do not
+// re-derive):
+//  * SYS_MSEND(frame_ptr, frame_len): copy the request in through the validated seam, parse it
+//    FAIL-CLOSED (bus.rs), require the principal field ALL-ZERO (-EINVAL otherwise — verdict C:
+//    reject, never overwrite), STAMP the sender's kernel-held PrincipalRecord (the K-line
+//    IMAGE_SHA256 mint) into the header, fulfill the verb SYNCHRONOUSLY in the caller's own
+//    syscall context through the EXISTING FAT/ACL machinery (verdict D: the invoker's grants —
+//    fulfillment runs with the caller's live (asid, gen) AND its stamped principal, exactly like
+//    the direct syscalls; no impersonation primitive exists), and enqueue the reply frame into
+//    the SENDER's mailbox. Returns 0, or a negative errno (transport errors only — a verb that
+//    FAILS still returns 0 with the errno in the reply's status field, body empty).
+//  * SYS_MRECV(buf_ptr, buf_len): dequeue the oldest reply into the caller's buffer, BLOCKING on
+//    the sys_wait Semaphore idiom while the mailbox is empty. buf_len must be >= BUS_FRAME_MAX
+//    (whole-frame contract, -EMSGSIZE) so no partial-delivery state exists.
+//  * Mailboxes: per-ASID, DEPTH 16 (BUS_MBOX_DEPTH — a deliberate bounded cap, the USER_SLOTS
+//    discipline: never raise it to satisfy a demo; a full mailbox refuses the SEND fail-closed
+//    with -EAGAIN BEFORE the verb runs, so no side effect can lose its reply). Each queued reply
+//    is one heap box of exactly its frame's length (<= BUS_FRAME_MAX = the max forced allocation
+//    per message); the aggregate ceiling is (USER_SLOTS+1) * 16 * 4148 B ≈ 600 KiB, far under
+//    the 48 MiB heap. All bus staging buffers are HEAP-allocated (never >4 KiB kernel-stack
+//    arrays — SVC stacks are small).
+//  * Replies are stamped with the RESERVED KERNEL principal kind (PRIN_KERNEL_REPLY, verdict C),
+//    fail-closed as grantee/owner everywhere (see the guards at owned_set_owner / owned_grant /
+//    owned_access_ok and the BANDY-STAMP witness).
+//  * Teardown: clear_handle_row drains the dying ASID's mailbox; every queued reply carries the
+//    recipient's gen stamp and bus_mrecv discards a stale-gen frame, so a recycled ASID's next
+//    tenant can never read its predecessor's replies.
+
+/// Mailbox depth per ASID — a deliberate bounded cap (STOP-tripwired like USER_SLOTS).
+const BUS_MBOX_DEPTH: usize = 16;
+
+/// One queued reply frame: the recipient-gen stamp + the heap-boxed frame bytes (exact length).
+struct BusMsg {
+    agen: u64,
+    frame: alloc::boxed::Box<[u8]>,
+}
+
+/// A bounded FIFO of queued replies. Guarded by its SpinMutex row in BUS_MBOX; count <= DEPTH.
+struct BusMbox {
+    head: usize,
+    count: usize,
+    slots: [Option<BusMsg>; BUS_MBOX_DEPTH],
+}
+
+impl BusMbox {
+    const EMPTY: Self = BusMbox { head: 0, count: 0, slots: [const { None }; BUS_MBOX_DEPTH] };
+}
+
+/// Per-ASID reply mailboxes (row = ASID, like HANDLES). Static table of Options — the frames
+/// themselves are heap boxes, so the static footprint is pointers only.
+static BUS_MBOX: [SpinMutex<BusMbox>; super::boot::USER_SLOTS + 1] =
+    [const { SpinMutex::new(BusMbox::EMPTY) }; super::boot::USER_SLOTS + 1];
+
+/// Per-ASID "replies pending" semaphores — the MRECV blocking primitive (the sys_wait idiom:
+/// Semaphore::wait parks the task; every enqueue posts). Lazily init()'d once (waiter-capacity
+/// reservation) before first use.
+static BUS_SEM: [super::sched::Semaphore; super::boot::USER_SLOTS + 1] =
+    [const { super::sched::Semaphore::new(0) }; super::boot::USER_SLOTS + 1];
+static BUS_SEM_INIT: AtomicU8 = AtomicU8::new(0); // 0 = untouched, 1 = initializing, 2 = ready
+
+/// One-shot waiter-capacity reservation for BUS_SEM (Semaphore::init's contract: reserve before
+/// any task can block). Gate-and-spin so a second core entering mid-init waits it out.
+fn bus_sem_init_once() {
+    match BUS_SEM_INIT.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => {
+            for s in &BUS_SEM {
+                s.init();
+            }
+            BUS_SEM_INIT.store(2, Ordering::Release);
+        }
+        Err(_) => {
+            while BUS_SEM_INIT.load(Ordering::Acquire) != 2 {
+                core::hint::spin_loop();
+            }
+        }
+    }
+}
+
+/// Teardown drain (called from clear_handle_row, after the gen bump): free every queued reply
+/// box. The semaphore's stray permits are harmless — bus_mrecv re-checks the queue after every
+/// wake and loops back to wait on empty.
+fn bus_mbox_clear(asid: u64) {
+    if (asid as usize) >= BUS_MBOX.len() {
+        return;
+    }
+    let _irq = IrqGuard::mask_save();
+    let mut mb = BUS_MBOX[asid as usize].lock();
+    mb.head = 0;
+    mb.count = 0;
+    for s in mb.slots.iter_mut() {
+        *s = None; // drops the box
+    }
+}
+
+/// Enqueue a reply for `asid` (gen-stamped). false = mailbox full (the caller already reserved
+/// space via bus_mbox_has_room BEFORE fulfilling, so this only fails under a racing enqueue —
+/// impossible for a single-threaded sender, defensively handled as EAGAIN).
+fn bus_mbox_push(asid: u64, agen: u64, frame: alloc::boxed::Box<[u8]>) -> bool {
+    let _irq = IrqGuard::mask_save();
+    let mut mb = BUS_MBOX[asid as usize].lock();
+    if mb.count >= BUS_MBOX_DEPTH {
+        return false;
+    }
+    let tail = (mb.head + mb.count) % BUS_MBOX_DEPTH;
+    mb.slots[tail] = Some(BusMsg { agen, frame });
+    mb.count += 1;
+    true
+}
+
+/// Capacity pre-check — SYS_MSEND refuses BEFORE fulfilling when the reply could not be queued,
+/// so a verb with side effects (cp) can never run and then lose its reply.
+fn bus_mbox_has_room(asid: u64) -> bool {
+    let _irq = IrqGuard::mask_save();
+    let mb = BUS_MBOX[asid as usize].lock();
+    mb.count < BUS_MBOX_DEPTH
+}
+
+/// Non-blocking dequeue for `asid`: pop the oldest frame whose gen stamp matches the ASID's
+/// CURRENT gen; stale-gen frames (a predecessor tenant's) are discarded in the same pass.
+fn bus_mbox_pop(asid: u64) -> Option<BusMsg> {
+    let cur_gen = ASID_GEN[asid as usize].load(Ordering::Acquire);
+    let _irq = IrqGuard::mask_save();
+    let mut mb = BUS_MBOX[asid as usize].lock();
+    while mb.count > 0 {
+        let head = mb.head;
+        let msg = mb.slots[head].take();
+        mb.head = (head + 1) % BUS_MBOX_DEPTH;
+        mb.count -= 1;
+        match msg {
+            Some(m) if m.agen == cur_gen => return Some(m),
+            _ => continue, // stale-gen (or defensively empty) — discard, keep scanning
+        }
+    }
+    None
+}
+
+// -----------------------------------------------------------------------------------------------
+// M3: kernel fulfillment — ls / cat / cp through the EXISTING FAT + ACL machinery, under the
+// invoker's identity (its live (asid, gen) and its stamped principal). Every errno mirrors the
+// direct-syscall path byte-for-byte (the equivalence witness's contract): the cat gate below is
+// the sys_open existing-file sequence — same checks, same order, same errnos.
+// -----------------------------------------------------------------------------------------------
+
+/// v1 content ceilings (documented honest scope, not protocol constants): cat returns the FIRST
+/// 512 bytes of a file (sanitized to printable ASCII + \n\r\t); cp copies files up to 4096 bytes
+/// (-E2BIG above — bounded work under the namespace hold); ls truncates its listing at ~3800
+/// bytes. All keep the reply body under BUS_BODY_MAX by construction.
+const BUS_CAT_MAX: usize = 512;
+const BUS_CP_MAX: usize = 4096;
+const BUS_LS_TEXT_MAX: usize = 3800;
+
+/// Sanitize file-content bytes for a text reply body: printable ASCII and \n \r \t pass, every
+/// other byte becomes '.' — terminal-safe output (midden writes the body verbatim to the
+/// console; a raw control byte could mangle the serial witness stream).
+fn bus_sanitize(b: u8) -> u8 {
+    match b {
+        0x20..=0x7e | b'\n' | b'\r' | b'\t' => b,
+        _ => b'.',
+    }
+}
+
+/// ls: list the FAT root (name + size per line, directories marked with a trailing '/'). No
+/// denial leg — FAT root listing is public exactly as the in-kernel shell's ls is (names are not
+/// ACL-protected; content is, at cat/open). Truncates honestly at BUS_LS_TEXT_MAX.
+fn bus_ls(text: &mut alloc::vec::Vec<u8>) -> i64 {
+    let fs = match crate::fs::fat::mount() {
+        Ok(fs) => fs,
+        Err(crate::fs::fat::FatError::NoDisk) => return ENODEV,
+        Err(_) => return EIO,
+    };
+    let entries = match fs.read_root() {
+        Ok(e) => e,
+        Err(_) => return EIO,
+    };
+    for de in entries.iter() {
+        let name = de.name();
+        // budget: name + '/' + ' ' + u32 digits (<=10) + '\n'
+        if text.len() + name.len() + 13 > BUS_LS_TEXT_MAX {
+            text.extend_from_slice(b"...\n");
+            break;
+        }
+        text.extend_from_slice(name.as_bytes());
+        if de.is_dir {
+            text.push(b'/');
+        }
+        text.push(b' ');
+        let mut numbuf = [0u8; 10];
+        let mut n = de.size;
+        let mut i = numbuf.len();
+        loop {
+            i -= 1;
+            numbuf[i] = b'0' + (n % 10) as u8;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        text.extend_from_slice(&numbuf[i..]);
+        text.push(b'\n');
+    }
+    0
+}
+
+/// cat: read the first BUS_CAT_MAX bytes of a root file under the INVOKER's grants. The check
+/// sequence below is the sys_open existing-file gate VERBATIM (same checks, same order, same
+/// errnos — the equivalence witness's contract): UNAFS.ATR deny -> mount errnos -> NAMESPACE
+/// hold -> find (-ENOENT) -> -EISDIR -> owned_access_ok(CAP_READ) (-EACCES). The bounded read
+/// (<= 512 B, one chain hop) stays under the ns hold so a concurrent unlink cannot free the
+/// chain mid-read (the F3 bounded-span rule; cat claims no descriptor to defer against).
+fn bus_cat(asid: u64, agen: u64, ppid: PrincipalRecord, name: &str, text: &mut alloc::vec::Vec<u8>) -> i64 {
+    if name.eq_ignore_ascii_case(ATR_NAME) {
+        return EACCES; // the kernel owns the ACL store — mirror sys_open's outright deny
+    }
+    let fs = match crate::fs::fat::mount() {
+        Ok(fs) => fs,
+        Err(crate::fs::fat::FatError::NoDisk) => return ENODEV,
+        Err(_) => return EIO,
+    };
+    let ns = ns_lock();
+    let (de, dir_lba, dir_off) = match fs.find_located(name) {
+        Ok(t) => t,
+        Err(crate::fs::fat::FatError::NotFound) => return ENOENT,
+        Err(_) => return EIO,
+    };
+    if de.is_dir {
+        return EISDIR;
+    }
+    if !owned_access_ok(dir_lba, dir_off as u32, asid, agen, CAP_READ, ppid) {
+        return EACCES;
+    }
+    let mut raw: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    if fs.read_at(de.first_cluster(), de.size, 0, &mut raw, BUS_CAT_MAX).is_err() {
+        return EIO;
+    }
+    drop(ns);
+    text.reserve(raw.len());
+    for &b in raw.iter() {
+        text.push(bus_sanitize(b));
+    }
+    0
+}
+
+/// cp: copy a root file to a NEW root name under the INVOKER's grants. Source side = the cat
+/// gate (same errnos); destination is CREATE-NEW-ONLY in v1 (-EEXIST on an existing name — no
+/// overwrite semantics to get wrong). The created copy is PRIVATE to the invoker exactly as a
+/// direct sys_open(O_CREAT) is (owner row + native persist, the same fail-closed -ENOSPC undo),
+/// or PUBLIC for an anonymous/ASID-0 invoker — verdict D: the bus mints nothing the direct path
+/// would not. The whole find->create->copy->own sequence runs under ONE namespace hold (bounded:
+/// <= 4 KiB, the F3 span rule) so a concurrent unlink/create cannot interleave; the native ACL
+/// persist runs AFTER the hold drops (the K5B discipline, exactly like sys_open). A successful
+/// cp's reply body is EMPTY (status 0 is the whole truth — the native error-reply symmetry).
+fn bus_cp(asid: u64, agen: u64, ppid: PrincipalRecord, src: &str, dst: &str) -> i64 {
+    if src.eq_ignore_ascii_case(ATR_NAME) || dst.eq_ignore_ascii_case(ATR_NAME) {
+        return EACCES;
+    }
+    let fs = match crate::fs::fat::mount() {
+        Ok(fs) => fs,
+        Err(crate::fs::fat::FatError::NoDisk) => return ENODEV,
+        Err(_) => return EIO,
+    };
+    let ns = ns_lock();
+    let (sde, s_lba, s_off) = match fs.find_located(src) {
+        Ok(t) => t,
+        Err(crate::fs::fat::FatError::NotFound) => return ENOENT,
+        Err(_) => return EIO,
+    };
+    if sde.is_dir {
+        return EISDIR;
+    }
+    if !owned_access_ok(s_lba, s_off as u32, asid, agen, CAP_READ, ppid) {
+        return EACCES;
+    }
+    if sde.size as usize > BUS_CP_MAX {
+        return E2BIG; // bounded work under the ns hold — v1's honest copy ceiling
+    }
+    match fs.find_located(dst) {
+        Ok(_) => return EEXIST, // create-new-only in v1
+        Err(crate::fs::fat::FatError::NotFound) => {}
+        Err(_) => return EIO,
+    }
+    // Read the whole (bounded) source, then create + write the destination.
+    let mut data: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    if fs.read_at(sde.first_cluster(), sde.size, 0, &mut data, BUS_CP_MAX).is_err() {
+        return EIO;
+    }
+    let (dde, d_lba, d_off) = match fs.create_in_root(dst, 0x20) {
+        Ok(t) => t,
+        Err(crate::fs::fat::FatError::Unsupported) => return EINVAL, // not an 8.3 name
+        Err(crate::fs::fat::FatError::NoSpace) => return ENOSPC,
+        Err(_) => return EIO,
+    };
+    let mut new_fc = dde.first_cluster();
+    if !data.is_empty() {
+        match fs.write_grow(dde.first_cluster(), 0, d_lba, d_off, 0, &data) {
+            Ok((_, _, fc)) => new_fc = fc,
+            Err(_) => {
+                // Undo the fresh entry (leak-not-dangle: a failed grow may leave allocated
+                // clusters to the reaper, but never a live name over a torn copy).
+                let _ = fs.mark_dir_deleted(d_lba, d_off);
+                return EIO;
+            }
+        }
+    }
+    // Ownership: mirror sys_open's O_CREAT-private policy under the invoker's identity.
+    if asid != 0 && !owned_set_owner(d_lba, d_off as u32, asid, agen, ppid) {
+        let _ = fs.mark_dir_deleted(d_lba, d_off);
+        return ENOSPC; // fail CLOSED — never a silently-public "private" copy
+    }
+    drop(ns);
+    if asid != 0 && ppid.kind != PRIN_NONE {
+        let _ = native_persist_create(dst, new_fc, d_lba, d_off as u32, ppid);
+    }
+    0
+}
+
+/// Build + enqueue the reply frame for a fulfilled (or refused) verb: verb + corr echoed,
+/// status = the verb's errno (0 = ok), principal = the RESERVED KERNEL REPLY record (verdict C),
+/// body = the verb-typed output bytes (forced empty on error — bus.rs build_reply). The frame is
+/// heap-staged at its exact final size.
+fn bus_reply_enqueue(asid: u64, corr: u32, verb: u8, status: i64, text: &[u8]) -> i64 {
+    let reply_prin = PrincipalRecord { kind: PRIN_KERNEL_REPLY, len: 0, value: [0u8; PRIN_VALUE_LEN] };
+    let mut prin_bytes = [0u8; 32];
+    reply_prin.write(&mut prin_bytes);
+    let body: &[u8] = if status == 0 { text } else { &[] };
+    debug_assert!(body.len() <= super::bus::BUS_BODY_MAX, "bus reply over the body ceiling (kernel bug)");
+    if body.len() > super::bus::BUS_BODY_MAX {
+        return EIO; // fail closed (ls/cat/cp budgets make this unreachable)
+    }
+    let mut frame = alloc::vec![0u8; super::bus::BUS_HDR_LEN + body.len()];
+    let n = super::bus::build_reply(verb, corr, status as i32, prin_bytes, body, &mut frame);
+    debug_assert!(n == frame.len());
+    let agen = ASID_GEN[asid as usize].load(Ordering::Acquire);
+    if !bus_mbox_push(asid, agen, frame.into_boxed_slice()) {
+        return EAGAIN; // defensively unreachable (capacity pre-checked; single-threaded sender)
+    }
+    if BUS_SEM_INIT.load(Ordering::Acquire) == 2 {
+        BUS_SEM[asid as usize].post();
+    }
+    0
+}
+
+/// The SYS_MSEND body, parameterized on the sender's identity — the SVC arm passes the caller's
+/// live (asid, gen) + its kernel-held principal; the M5 fixtures drive the SAME path with scratch
+/// identities (the sys_recv_for idiom, no duplicate logic). `frame` is already in kernel memory.
+fn sys_msend_for(asid: u64, agen: u64, ppid: PrincipalRecord, frame: &[u8]) -> i64 {
+    // Parse + typed validation, all FAIL-CLOSED (bus.rs). Errno mapping: every refused frame —
+    // ceiling, truncation, malformed, caller-supplied principal (verdict C) — is -EINVAL.
+    let hdr = match super::bus::frame_parse(frame) {
+        Ok(h) => h,
+        Err(_) => return EINVAL,
+    };
+    if hdr.kind != super::bus::BUS_KIND_REQUEST || super::bus::request_validate(&hdr).is_err() {
+        return EINVAL; // a REPLY frame, nonzero status, or CALLER-SUPPLIED PRINCIPAL — rejected
+    }
+    let body = &frame[super::bus::BUS_HDR_LEN..];
+    // Capacity BEFORE fulfillment — a verb with side effects must never run and lose its reply.
+    if (asid as usize) >= BUS_MBOX.len() || !bus_mbox_has_room(asid) {
+        return EAGAIN;
+    }
+    // THE STAMP (verdict C): the sender's kernel-held principal, written INSIDE the kernel — the
+    // EL0 bytes for this field were required zero above, and fulfillment below receives `ppid`
+    // (the stamped identity) directly; hdr.principal is never read again.
+    // Fulfill under the INVOKER's identity (verdict D) — synchronously, in this SVC context.
+    let mut text: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    let status = match hdr.verb {
+        super::bus::BUS_VERB_LS => bus_ls(&mut text),
+        super::bus::BUS_VERB_CAT => match super::bus::cat_body_parse(body) {
+            // cat_body_parse admits printable ASCII only, so from_utf8 cannot fail — but stay
+            // fail-closed rather than unwrap.
+            Ok(nb) => match core::str::from_utf8(nb) {
+                Ok(name) => bus_cat(asid, agen, ppid, name, &mut text),
+                Err(_) => return EINVAL,
+            },
+            Err(_) => return EINVAL,
+        },
+        super::bus::BUS_VERB_CP => match super::bus::cp_body_parse(body) {
+            Ok((s, d)) => match (core::str::from_utf8(s), core::str::from_utf8(d)) {
+                (Ok(src), Ok(dst)) => bus_cp(asid, agen, ppid, src, dst),
+                _ => return EINVAL,
+            },
+            Err(_) => return EINVAL,
+        },
+        _ => return EINVAL, // unreachable (frame_parse validated the verb) — fail closed
+    };
+    bus_reply_enqueue(asid, hdr.corr, hdr.verb, status, &text)
+}
+
+/// SYS_MSEND(frame_ptr, frame_len) — the EL0 arm: validated copy-in (the CFU-1-style predicate
+/// discipline: length ceiling BEFORE any copy, whole-range user validation, no partial decode),
+/// then the parameterized body under the caller's own identity. The staging buffer is HEAP-
+/// allocated at the exact request length (max forced staging = 4148 B; never a big stack array).
+fn sys_msend(frame_ptr: u64, frame_len: u64) -> i64 {
+    bus_sem_init_once();
+    let len = frame_len as usize;
+    if len < super::bus::BUS_HDR_LEN || len > super::bus::BUS_FRAME_MAX {
+        return EINVAL; // the whole-frame ceiling gates the copy itself
+    }
+    let mut frame = alloc::vec![0u8; len];
+    if copy_from_user(&mut frame, frame_ptr, len).is_err() {
+        return EFAULT;
+    }
+    let asid = current_asid();
+    let agen = ASID_GEN[asid as usize].load(Ordering::Acquire);
+    let ppid = current_principal();
+    sys_msend_for(asid, agen, ppid, &frame)
+}
+
+/// SYS_MRECV(buf_ptr, buf_len) — dequeue the oldest reply (blocking while empty). buf_len must
+/// cover a whole frame (>= BUS_FRAME_MAX, else -EMSGSIZE) so no partial-delivery state exists;
+/// the frame's exact length is the return value. Blocking rides the sys_wait Semaphore idiom
+/// (park + cross-core wake); off a scheduled task (kernel fixture context) it degrades to a
+/// non-blocking poll returning -EAGAIN.
+fn sys_mrecv(buf_ptr: u64, buf_len: u64) -> i64 {
+    bus_sem_init_once();
+    if (buf_len as usize) < super::bus::BUS_FRAME_MAX {
+        return EMSGSIZE;
+    }
+    let asid = current_asid();
+    if (asid as usize) >= BUS_MBOX.len() {
+        return EAGAIN;
+    }
+    // Validate the destination ONCE up front (whole-frame window), so a bad buffer is -EFAULT
+    // before any dequeue — a popped frame is never lost to a copy failure.
+    if !user_range_ok(buf_ptr, super::bus::BUS_FRAME_MAX, true) {
+        return EFAULT;
+    }
+    loop {
+        if let Some(msg) = bus_mbox_pop(asid) {
+            // Range validated above; copy the exact frame.
+            if copy_to_user(buf_ptr, &msg.frame, msg.frame.len()).is_err() {
+                return EFAULT; // unreachable after the up-front check; fail closed
+            }
+            return msg.frame.len() as i64;
+        }
+        // Empty: park on the semaphore (posted by every enqueue). A spurious permit (teardown
+        // drain raced an enqueue) just loops back around to wait.
+        if !BUS_SEM[asid as usize].wait() {
+            return EAGAIN; // off a scheduled task — the kernel-fixture poll path
+        }
+        remask_irq(); // the sys_wait discipline: epilogue must run IRQ-masked
+    }
+}
+
+// -----------------------------------------------------------------------------------------------
+// BANDY-STAMP (M5, verdict C): the stamping witness — caller-supplied principal REJECTED; replies
+// stamped with the RESERVED KERNEL kind; that kind fail-closed as grantee/owner and
+// un-projectable to the native store. Kernel-side (the k1_persist idiom: scratch identities, the
+// PRODUCTION code path, no EL0 detour); in-RAM except two ls fulfillments (read-only mount).
+// -----------------------------------------------------------------------------------------------
+
+fn bandy_stamp_check() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let mut w = 0u32;
+    let asid: u64 = 7; // scratch (the K-line fixture discipline; EL0 fixtures are done by now)
+    let agen = ASID_GEN[asid as usize].load(Ordering::Acquire);
+    let ppid = PrincipalRecord::program(b"prog:BANDYSTMP");
+    bus_mbox_clear(asid);
+
+    // bit0: a caller-supplied principal is REJECTED -EINVAL — and nothing was fulfilled/queued.
+    let mut f = [0u8; 64];
+    let n = super::bus::build_request(super::bus::BUS_VERB_LS, 1, b"", &mut f);
+    let mut forged = f;
+    forged[16] = PRIN_IMAGE_SHA256; // nonzero principal kind byte from "EL0"
+    if sys_msend_for(asid, agen, ppid, &forged[..n]) == EINVAL && bus_mbox_pop(asid).is_none() {
+        w |= 1 << 0;
+    }
+
+    // bit1+bit2: a clean LS round-trips; the reply echoes verb+corr with status 0 — and is
+    // stamped with the RESERVED KERNEL kind (PRIN_KERNEL_REPLY), KERNEL-written (the request
+    // carried zeros).
+    if sys_msend_for(asid, agen, ppid, &f[..n]) == 0 {
+        if let Some(msg) = bus_mbox_pop(asid) {
+            if let Ok(h) = super::bus::frame_parse(&msg.frame) {
+                let rp = PrincipalRecord::read(&h.principal);
+                if h.kind == super::bus::BUS_KIND_REPLY
+                    && h.verb == super::bus::BUS_VERB_LS
+                    && h.corr == 1
+                    && h.status == 0
+                {
+                    w |= 1 << 1;
+                }
+                if rp.kind == PRIN_KERNEL_REPLY {
+                    w |= 1 << 2;
+                }
+            }
+        }
+    }
+
+    // bit3: the reply kind can never be adopted as an OWNER (owned_set_owner refuses it).
+    let reply_prin = PrincipalRecord { kind: PRIN_KERNEL_REPLY, len: 0, value: [0u8; PRIN_VALUE_LEN] };
+    if !owned_set_owner(0xB0DE, 0xB0, asid, agen, reply_prin) {
+        w |= 1 << 3;
+    }
+
+    // bit4: ...nor GRANTED rights (owned_grant refuses a reply-kind grantee outright), proven
+    // against a REAL row owned by the scratch principal.
+    if owned_set_owner(0xB0DE, 0xB0, asid, agen, ppid) {
+        let r = owned_grant(0xB0DE, 0xB0, asid, agen, 8, 0, CAP_READ, ppid, reply_prin);
+        if r == EACCES {
+            w |= 1 << 4;
+        }
+        owned_clear(0xB0DE, 0xB0); // scratch row out of the bounded table
+    }
+
+    // bit5: the reply kind is UN-PERSISTABLE — no native projection exists (fail-closed None),
+    // so it can never reach the durable store to be rebuilt as an identity.
+    let mut sbuf = [0u8; K4_STR_MAX];
+    if principal_native_string(&reply_prin, &mut sbuf).is_none() {
+        w |= 1 << 5;
+    }
+
+    // bit6: mailbox exhaustion is FAIL-CLOSED and per-ASID: 16 queued replies fill asid 7 (the
+    // 17th send refuses -EAGAIN BEFORE fulfilling), while asid 8's mailbox is unaffected (no
+    // cross-ASID starvation leverage).
+    let mut filled = true;
+    for _ in 0..BUS_MBOX_DEPTH {
+        if sys_msend_for(asid, agen, ppid, &f[..n]) != 0 {
+            filled = false;
+            break;
+        }
+    }
+    let other_asid: u64 = 8;
+    let other_gen = ASID_GEN[other_asid as usize].load(Ordering::Acquire);
+    bus_mbox_clear(other_asid);
+    if filled
+        && sys_msend_for(asid, agen, ppid, &f[..n]) == EAGAIN
+        && sys_msend_for(other_asid, other_gen, ppid, &f[..n]) == 0
+    {
+        w |= 1 << 6;
+    }
+    bus_mbox_clear(other_asid);
+
+    // bit7: the teardown/gen fence — a queued reply stamped under an OLD gen is discarded, never
+    // delivered to the "next tenant" (simulated by bumping the scratch ASID's gen, exactly what
+    // clear_handle_row does first).
+    ASID_GEN[asid as usize].fetch_add(1, Ordering::AcqRel);
+    let fenced = bus_mbox_pop(asid).is_none();
+    bus_mbox_clear(asid);
+    if fenced {
+        w |= 1 << 7;
+    }
+
+    const ALL: u32 = (1 << 8) - 1;
+    if w == ALL {
+        serial_println!(
+            ":: BANDY-STAMP: kernel-written principal — caller-supplied REJECTED (-EINVAL), replies stamped RESERVED-KERNEL kind (ungrantable, unadoptable, unpersistable), mailbox bounded per-ASID fail-closed, gen-fenced PASS [w={:#04x}] ::",
+            w
+        );
+    } else {
+        serial_println!(":: BANDY-STAMP: FAIL — w={:#x}/{:#x} ::", w, ALL);
+    }
+}
+
+// -----------------------------------------------------------------------------------------------
+// BANDY-RT + BANDY-EQ (M4/M5): the round-trip and equivalence witnesses, through the REAL midden
+// program. The launcher stages two fixtures on the live volume — a PUBLIC MIDTXT.TXT and a
+// FOREIGN-owned BUSPRIV.BIN (owner = a persisted-sentinel principal midden can never match) —
+// then spawns MIDDEN.BIN (the K2 real-program idiom). Midden, at EL0, parses ls/cat/cp text into
+// typed frames, round-trips them (send -> kernel fulfill -> reply -> print), and drives BOTH
+// denial legs itself: bus cat BUSPRIV.BIN vs direct SYS_OPEN — the equivalence witness's
+// byte-same-errno comparison happens at EL0 through the production paths (verdict D). The
+// launcher verifies the cp's copy BYTE-EXACT kernel-side and self-cleans (no metal-card residue).
+// -----------------------------------------------------------------------------------------------
+
+const MIDDEN_NAME: &str = "MIDDEN.BIN";
+const MIDDEN_EXIT_STATUS: u64 = 0xB5; // midden's sentinel exit -> EL0_MIDDEN_DONE
+const MIDTXT_NAME: &str = "MIDTXT.TXT";
+const MIDCPY_NAME: &str = "MIDCPY.TXT";
+const BUSPRIV_NAME: &str = "BUSPRIV.BIN";
+const MIDTXT_CONTENT: &[u8] = b"midden bus fixture\n"; // midden byte-verifies this at EL0 (bit1)
+
+static EL0_MIDDEN_DONE: AtomicU32 = AtomicU32::new(0); // midden sentinel exits (want 1)
+static BANDY_MIDDEN_WITNESS: AtomicU64 = AtomicU64::new(0); // midden's SYS_REPORT bits
+
+/// SYS_REPORT router for midden (the k2_report idiom — keyed on the task name).
+fn bandy_report(value: u64) {
+    if super::sched::current_name() == Some("el0-midden") {
+        BANDY_MIDDEN_WITNESS.store(value, Ordering::Release);
+    }
+}
+
+/// Delete one bandy fixture file + its ACL rows (native + legacy sidecar + in-RAM). Idempotent.
+fn bandy_cleanup_one(name: &str) {
+    if let Ok(fs) = crate::fs::fat::mount() {
+        if let Ok((de, lba, off)) = fs.find_located(name) {
+            let _ = crate::fs::unafs::native_acl_clear(lba, off as u32);
+            let _ = atr_clear_row(&fs, lba, off as u32);
+            owned_clear(lba, off as u32);
+            let _ = fs.delete_located(lba, off, de.first_cluster());
+        }
+    }
+}
+
+fn bandy_cleanup() {
+    bandy_cleanup_one(MIDCPY_NAME);
+    bandy_cleanup_one(BUSPRIV_NAME);
+    bandy_cleanup_one(MIDTXT_NAME);
+}
+
+/// Create a root fixture file with `content` (create + grow). Returns (dir_lba, dir_off) or None.
+fn bandy_create_file(fs: &crate::fs::fat::FatFs, name: &str, content: &[u8]) -> Option<(u64, u32)> {
+    let (de, lba, off) = fs.create_in_root(name, 0x20).ok()?;
+    if !content.is_empty() {
+        fs.write_grow(de.first_cluster(), 0, lba, off, 0, content).ok()?;
+    }
+    Some((lba, off as u32))
+}
+
+fn bandy_rt_launcher(demo_cpu: usize) {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if crate::drivers::block::info().is_none() {
+        return; // no SD -> the proof loads/creates real files; skip silently
+    }
+    // Pre-flight: midden must be on the card; stale fixtures from an interrupted run cleaned
+    // FIRST (the K2 lesson: clean before any presence early-return, so nothing is stranded).
+    bandy_cleanup();
+    let fs = match crate::fs::fat::mount() {
+        Ok(fs) => fs,
+        Err(_) => return,
+    };
+    if fs.find_in_root(MIDDEN_NAME).is_err() {
+        serial_println!(":: BANDY-RT: MIDDEN.BIN not on card — bus round-trip demo skipped ::");
+        return;
+    }
+
+    let mut w = 0u32;
+
+    // Stage the fixtures: PUBLIC MIDTXT.TXT (no owner row) + FOREIGN-owned BUSPRIV.BIN. The
+    // foreign owner is a PERSISTED-sentinel row (owner_asid = OWNER_ASID_PERSISTED, a by-name
+    // owner that can never live-match) under a PROGRAM_NAME principal midden's IMAGE_SHA256
+    // stamp can never equal — so midden is denied by construction, not by accident.
+    if bandy_create_file(&fs, MIDTXT_NAME, MIDTXT_CONTENT).is_none() {
+        serial_println!(":: BANDY-RT: fixture staging failed — demo aborted ::");
+        bandy_cleanup();
+        return;
+    }
+    let foreign = PrincipalRecord::program(b"prog:BUSOWNER");
+    match bandy_create_file(&fs, BUSPRIV_NAME, b"private bytes") {
+        Some((lba, off)) => {
+            if !owned_set_owner(lba, off, OWNER_ASID_PERSISTED, 0, foreign) {
+                serial_println!(":: BANDY-RT: owner staging failed — demo aborted ::");
+                bandy_cleanup();
+                return;
+            }
+        }
+        None => {
+            serial_println!(":: BANDY-RT: fixture staging failed — demo aborted ::");
+            bandy_cleanup();
+            return;
+        }
+    }
+
+    // Spawn the REAL program (the k2_run_program idiom) and wait for its sentinel exit.
+    EL0_MIDDEN_DONE.store(0, Ordering::Release);
+    BANDY_MIDDEN_WITNESS.store(0, Ordering::Release);
+    let stamped = match load_program_into_slot(MIDDEN_NAME) {
+        Ok(loaded) => {
+            let asid = loaded.ttbr0 >> 48;
+            let s = slot_ppid_of(asid);
+            // midden PRINTS its replies (the §3b interface seam) — endow the reserved console
+            // write cap (fd 1), exactly like the other printing spawners.
+            install_console_cap(asid);
+            super::sched::spawn_user_slot("el0-midden", loaded.base, loaded.sp, loaded.ttbr0, demo_cpu);
+            let start = super::timer::cntpct();
+            let deadline = 5 * super::timer::cntfrq();
+            while EL0_MIDDEN_DONE.load(Ordering::Acquire) < 1
+                && super::timer::cntpct().wrapping_sub(start) <= deadline
+            {
+                super::sched::yield_now();
+            }
+            Some(s)
+        }
+        Err(_) => None,
+    };
+    let Some(stamped) = stamped else {
+        serial_println!(":: BANDY-RT: midden failed to load — demo aborted ::");
+        bandy_cleanup();
+        return;
+    };
+    let done = EL0_MIDDEN_DONE.load(Ordering::Acquire);
+    let mw = BANDY_MIDDEN_WITNESS.load(Ordering::Acquire);
+
+    // bit0: midden's own 6-bit witness complete (ls/cat/cp round-trips + both denial legs +
+    // the EL0 equivalence comparison).
+    const MIDDEN_ALL: u64 = (1 << 6) - 1;
+    if done == 1 && mw == MIDDEN_ALL {
+        w |= 1 << 0;
+    }
+    // bit1: midden ran under a REAL IMAGE_SHA256 principal (the K-line mint — the stamp the bus
+    // wrote into its requests).
+    if stamped.kind == PRIN_IMAGE_SHA256 {
+        w |= 1 << 1;
+    }
+    // bit2: the bus cp landed a BYTE-EXACT copy (kernel-side verify of MIDCPY.TXT), and it is
+    // PRIVATE to midden's stamped principal (the owner row the bus create recorded).
+    if let Ok(fs2) = crate::fs::fat::mount() {
+        if let Ok((de, lba, off)) = fs2.find_located(MIDCPY_NAME) {
+            let mut back: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+            if de.size as usize == MIDTXT_CONTENT.len()
+                && fs2.read_at(de.first_cluster(), de.size, 0, &mut back, MIDTXT_CONTENT.len()).is_ok()
+                && back.as_slice() == MIDTXT_CONTENT
+                && owned_owner_ppid(lba, off as u32) == stamped
+            {
+                w |= 1 << 2;
+            }
+        }
+    }
+
+    // Cleanup so the STATEFUL metal card accumulates nothing.
+    bandy_cleanup();
+    let cleaned = match crate::fs::fat::mount() {
+        Ok(fs3) => {
+            matches!(fs3.find_in_root(MIDCPY_NAME), Err(crate::fs::fat::FatError::NotFound))
+                && matches!(fs3.find_in_root(BUSPRIV_NAME), Err(crate::fs::fat::FatError::NotFound))
+                && matches!(fs3.find_in_root(MIDTXT_NAME), Err(crate::fs::fat::FatError::NotFound))
+        }
+        Err(_) => false,
+    };
+    if cleaned {
+        w |= 1 << 3;
+    }
+
+    const ALL: u32 = (1 << 4) - 1;
+    if w == ALL {
+        serial_println!(
+            ":: BANDY-RT: midden (program #3) round-trip — ls/cat/cp parsed at EL0 into typed frames, kernel-fulfilled under the stamped IMAGE_SHA256 principal, replies printed; cp copy byte-exact + private-to-invoker; self-cleaned PASS [w={:#03x}/mw={:#04x}] ::",
+            w, mw
+        );
+        // The equivalence verdict rides midden's EL0 bits (3: bus denied -EACCES, 4: direct
+        // denied -EACCES, 5: byte-same + allowed==allowed) — gate a dedicated line on them.
+        serial_println!(
+            ":: BANDY-EQ: equivalence — denied-via-bus == denied-via-syscall (byte-same -EACCES) and allowed == allowed, both legs at EL0 through the production paths PASS ::"
+        );
+    } else {
+        serial_println!(
+            ":: BANDY-RT: FAIL — w={:#x}/{:#x} midden_w={:#x}/{:#x} done={} ::",
+            w, ALL, mw, MIDDEN_ALL, done
+        );
+    }
 }

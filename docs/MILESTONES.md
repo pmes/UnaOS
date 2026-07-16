@@ -10,6 +10,39 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-pi4 track — 2026-07-16 (BANDY-1 — the on-UnaOS SMessage bus + midden, program #3)
+
+### BANDY-1 — syscall-backed bus transport, native v1 wire, ls/cat/cp kernel fulfillment 🔬 QEMU-green (metal rides the next attended sitting)
+
+**What it does.** ROADMAP §3b arc 1 — "port the bus, not the binary convention." A new
+`arch/aarch64/bus.rs` defines ONE coherent UnaOS-NATIVE v1 frame both directions (52-byte header:
+magic/version/kind/verb/corr/status/32-byte principal/body_len + typed verb bodies; an error reply
+is errno-only, no body) — **Peter's in-arc ruling dropped host byte-compat** ("we're writing this
+OS and filesystem so we can make whatever change we need to do it right"); the KATs freeze this
+wire as the spec of record and host bandy/midden migrate to it in a later HOST arc. Transport:
+`SYS_MSEND` (validated heap-staged copy-in, fail-closed parse, KERNEL principal stamp — a
+caller-supplied principal is `-EINVAL`, never overwritten — synchronous fulfillment, reply into
+the sender's bounded per-ASID mailbox, depth 16, `-EAGAIN` before side effects) + `SYS_MRECV`
+(whole-frame contract, blocking on the sys_wait Semaphore idiom, generation-fenced across
+teardown). Fulfillment re-enters the EXISTING FAT/ACL gates under the INVOKER's grants — `bus_cat`
+is the `sys_open` gate verbatim; `bus_cp` creates private-to-invoker exactly as `O_CREAT`. Replies
+carry the RESERVED kernel principal kind (`PRIN_KERNEL_REPLY`), fail-closed as grantee/owner/
+persist-target everywhere. **midden (program #3, Peter-named)** — the first real (non-fixture)
+on-UnaOS program, `MIDDEN.BIN` (2178 B flat blob, panic-free Rust) — parses `ls`/`cat`/`cp` text
+at EL0 into typed frames and prints the replies.
+
+**How it was tested.** `check` both arches; `kernel8` clean; `kernel8-test` 35 s = **MBENCH PASS
+37/37 required, 0 forbidden** (23 PASS + CAPSTONE 6/6 byte-equivalent) with four new REQUIREd
+witnesses: `BANDY-CODEC` (frozen request+reply goldens, typed payloads, fail-closed decode at the
+4 KiB ceiling, `[w=0x3f]`), `BANDY-STAMP` (caller-supplied principal rejected + nothing queued;
+reply kind ungrantable/unadoptable/unpersistable; mailbox exhaustion fail-closed per-ASID; gen
+fence, `[w=0xff]`), `BANDY-RT` (the full EL0 round-trip through the real midden under a real
+IMAGE_SHA256 stamp; cp copy byte-exact + private; self-cleaned, `[w=0xf/mw=0x3f]`), and `BANDY-EQ`
+(verdict D's equivalence: denied-via-bus == denied-via-syscall, BYTE-SAME `-EACCES`, both legs at
+EL0). `test-arm` MISSION SUCCESS; zero x86 change; host crates untouched. Hard-won: >4 KiB
+kernel-stack staging arrays die as EC=0 wild-jumps — all bus staging is heap-allocated.
+Commits `4a333ee` → `f0e9802` → `8110d85` on `hw-pi4`.
+
 ## hw-rmbp track — 2026-07-16 (XENUM-2 — hub-downstream hot-plug: the hub Status Change Endpoint)
 
 ### XENUM-2 — hub-downstream hot-plug via the Status Change Endpoint 🔬 `hw-rmbp`
