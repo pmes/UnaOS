@@ -189,6 +189,15 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
         crate::video::vperf::report_fbmem();
         crate::video::vperf::pci_display_probe();
     }
+
+    // EHCI-1 scout (opt-in, UNAOS_EHCISCOUT=1): STRICTLY READ-ONLY EHCI reconnaissance — dump the
+    // EHCI companion controllers' PCI/MMIO/PORTSC state so an EHCI driver arc can be planned against
+    // real register evidence (the 2012 rMBP internal kbd/trackpad live on EHCI-only ports). Runs
+    // independently of the xHCI scan below; issues NO writes to any register or port. Knob OFF =>
+    // this call does not exist and the module is unlinked (media byte-identical).
+    #[cfg(feature = "ehciscout")]
+    crate::drivers::ehci_scout::scout();
+
     if let Some((xhci_phys_addr, bus, dev, func)) = crate::drivers::pci::PciScanner::scan() {
         serial_println!(":: x86_64 PCI Init: Found xHCI at {:#x} ::", xhci_phys_addr);
 

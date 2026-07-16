@@ -10,6 +10,40 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-rmbp track — 2026-07-16 (EHCI-1 — read-only EHCI reconnaissance scout: what an EHCI driver arc would face)
+
+### EHCI-1 — read-only EHCI reconnaissance scout 🔬 `hw-rmbp`
+
+**What it does:** PORTSW-1 established from metal logs that the mask-disciplined USB2 routing write
+(`XUSB2PR = 0xf`) does not surface the 2012 rMBP internal keyboard/trackpad — they sit outside the
+switchable mask, i.e. almost certainly on **EHCI-only** ports behind the Panther Point companion
+controllers. Before an EHCI driver arc is designed, this **scout** (`drivers/ehci_scout.rs`,
+x86_64-only) answers what it would face, against real register evidence. **Strictly read-only**
+(Maestro tripwire-grade): only PCI-config reads and MMIO reads off the EHCI BAR — **zero writes** to any
+controller register, PCI config register, or port; no port reset, no ownership handoff (the BIOS/OS
+`USBLEGSUP` semaphore and `CONFIGFLAG` are read and reported, never written), no run/stop change, no
+doorbell. Each MMIO read is guarded by a page-table `translate()` check, so a BAR outside the firmware
+identity map reports honestly instead of faulting. Per EHCI function (class `0x0C0320`) it dumps, in a
+bounded `:: EHCI-SCOUT: begin ::` … `:: EHCI-SCOUT: end (N controllers, M ports, K connected) ::` block:
+BDF/vid:pid/BAR0/IRQ, PCI power state (PMCSR), the Intel RMH note, capability regs
+(`CAPLENGTH`/`HCIVERSION`/`HCSPARAMS`/`HCCPARAMS`+EECP), the `USBLEGSUP` BIOS/OS-owned semaphore, the
+operational `USBCMD`/`USBSTS`/`CONFIGFLAG`, and each `PORTSC` (connect/enabled/reset/power/owner/line).
+**Knob-gated, default-OFF** (`UNAOS_EHCISCOUT=1`, mapped in `arroyo` + `builder/src/main.rs`); knob-off
+the module is unlinked and media byte-identical.
+
+**How it was tested:** 🔬 QEMU. `./arroyo check` both arches knob on+off, **no new warnings, zero
+aarch64 diffs**. Knob-OFF `test 25` MISSION SUCCESS with **zero EHCI lines**; `test-arm 22` MISSION
+SUCCESS. Knob-ON `test 25` MISSION SUCCESS + the EHCI-SCOUT block prints against the harness `usb-ehci`
+target (q35 has no EHCI by default, so the builder attaches `-device usb-ehci` under the knob only —
+harness-only, not a kernel write path): `8086:24cd`, 6 ports, `CAPLENGTH=0x20`, `HCCPARAMS` EECP=0x68,
+`USBLEGSUP` BIOS=0/OS=0, halted (`RS=0`/`HCHalted=1`), `CONFIGFLAG=0`, all ports powered, **0 connected**
+— the honest QEMU baseline (no downstream device attached). `UNAOS_IRQSTORAGE=1 UNAOS_FATIMG=sf test 200`
+storage chain **0 FAIL**, S8-write intact. **Metal verdict: PENDING** — the value is the attended rMBP
+bench, where the `PORTSC` block shows whether the internals sit connected on EHCI ports and who owns
+them. Analysis + pre-registered metal expectations + recommended driver-arc shape:
+`~/.claude/plans/unaos/review/unaos-ehci1-SCOUT.md`; probe detail §9 of
+`docs/dev/OS/07_USB_STORAGE/usb_xhci.md`.
+
 ## hw-rmbp track — 2026-07-16 (CLOCK-X1 — x86 wall-clock timebase: invariant-TSC `monotonic()`, the JD17 twin)
 
 ### CLOCK-X1 — x86 invariant-TSC `monotonic()` (JD17 twin) 🔬 `hw-rmbp`

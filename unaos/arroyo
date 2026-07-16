@@ -56,6 +56,8 @@ _feats=""
 # Default OFF => zero config-space writes => the current EHCI-internal/xHCI-external topology,
 # byte-identical. Inert on QEMU (non-Intel xHCI). x86_64 only; aarch64 media byte-identical.
 [ -n "${UNAOS_PORTSW:-}" ] && _feats="${_feats}portsw,"
+# EHCI-1 scout: read-only EHCI reconnaissance probe (x86_64). Kept in sync with builder/src/main.rs.
+[ -n "${UNAOS_EHCISCOUT:-}" ] && _feats="${_feats}ehciscout,"
 # SOCK-1: route the shell's ping/arp/netinfo + a boot ICMP witness through the smoltcp stack
 # (ROADMAP §1b). x86-only optional dep + x86-gated module — enabling it on the aarch64 `check`
 # invocation is a no-op (smoltcp isn't pulled for that target), so aarch64 stays byte-identical.

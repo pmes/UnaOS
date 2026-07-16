@@ -55,6 +55,10 @@ fn main() {
     // internal keyboard/trackpad). Default OFF => zero config-space writes, byte-identical media;
     // inert on QEMU (non-Intel xHCI). x86_64 only. Kept in sync with arroyo's mapping.
     if std::env::var("UNAOS_PORTSW").is_ok() { feats.push("portsw"); }
+    // EHCI-1 scout: UNAOS_EHCISCOUT=1 arms a STRICTLY READ-ONLY EHCI reconnaissance probe (dumps the
+    // EHCI companion controllers' cap/op/PORTSC state at boot; zero writes). x86_64-only module.
+    // Kept in sync with arroyo's mapping; also adds a QEMU `-device usb-ehci` test target below.
+    if std::env::var("UNAOS_EHCISCOUT").is_ok() { feats.push("ehciscout"); }
     // VPERF M2: the fbcon viewport-cap bench lever (implies videobench). x86_64 only.
     if std::env::var("UNAOS_VIDEOCAP").is_ok() { feats.push("videocap"); }
     // SOCK-1: route the shell's ping/arp/netinfo + the boot ICMP witness through smoltcp. x86-only
@@ -271,6 +275,14 @@ fn main() {
        .arg("-device").arg("ide-hd,drive=esp,bootindex=0")
        .arg("-device").arg("isa-debug-exit,iobase=0xf4,iosize=0x04")
        .arg("-device").arg(xhci_dev);
+    // EHCI-1 scout (UNAOS_EHCISCOUT=1): give the read-only EHCI probe a QEMU target. q35's default
+    // device set has no EHCI, so attach a standalone `usb-ehci` PCI controller (class 0x0C0320) — no
+    // downstream device, so the scout reports the controller's cap/op/PORTSC state with 0 connected
+    // ports (the honest QEMU result). This is a QEMU-harness knob, not a kernel write path.
+    if std::env::var("UNAOS_EHCISCOUT").is_ok() {
+        cmd.arg("-device").arg("usb-ehci,id=ehci");
+        println!("   UNAOS_EHCISCOUT: usb-ehci controller attached — read-only EHCI scout target");
+    }
     if nostorage {
         println!("   UNAOS_NOSTORAGE: usb-storage omitted — kernel sees no block device (metal-like no-storage path)");
     } else if hubstorage {

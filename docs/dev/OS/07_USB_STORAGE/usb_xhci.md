@@ -441,6 +441,51 @@ the video stack can come up promptly.
 
 ---
 
+## 9. EHCI-1 scout — read-only EHCI reconnaissance (EHCI-1)
+
+PORTSW-1 (§7f) established from metal logs that the mask-disciplined USB2 routing write
+(`XUSB2PR = 0xf`, which ran unconditionally on every prior rMBP boot) does **not** surface
+the internal keyboard/trackpad — they sit outside the 4-port switchable mask, i.e. almost
+certainly on **EHCI-only** ports behind the Panther Point companion controllers. Before an
+EHCI driver arc is designed, the **EHCI-1 scout** answers what that driver would face,
+against real register evidence rather than assumption.
+
+**Strictly read-only (tripwire-grade).** The scout (`drivers/ehci_scout.rs`, x86_64-only)
+issues **only** PCI-config reads and MMIO reads off the EHCI BAR — zero writes to any
+controller register, PCI config register, or port. It never resets a port, never touches the
+BIOS/OS ownership semaphore or `CONFIGFLAG` (both are **read and reported**, never written),
+never changes run/stop, never rings a doorbell. A register that cannot be read without a side
+effect is skipped and reported as skipped. Each MMIO read is guarded by a page-table
+`translate()` check, so a BAR outside the firmware identity map reports honestly instead of
+taking a fault.
+
+**What it reports**, per EHCI function (class `0x0C0320`), in a bounded block bracketed by
+`:: EHCI-SCOUT: begin ::` … `:: EHCI-SCOUT: end (N controllers, M ports, K connected) ::`:
+BDF / vid:pid / BAR0 / IRQ line; PCI power state (PMCSR); the Intel RMH note (Panther Point
+EHCI ports sit behind an integrated **rate-matching hub**, so devices enumerate
+hub-downstream); the capability registers (`CAPLENGTH`, `HCIVERSION`, `HCSPARAMS` →
+N_PORTS/PPC/PRR/companion counts, `HCCPARAMS` → 64-bit-addr + EECP); the EHCI extended-cap
+`USBLEGSUP` BIOS/OS-owned semaphore state (read-only); the operational `USBCMD` (RS/run bit),
+`USBSTS` (HCHalted), `CONFIGFLAG` (CF: ports routed to EHCI vs companion); and each `PORTSC`
+(connect / enabled / reset / power / owner / line state).
+
+**Knob-gated, default-OFF.** Compiled only under the `ehciscout` Cargo feature
+(`UNAOS_EHCISCOUT=1`, mapped in both `arroyo` and `builder/src/main.rs`). Knob-off: the module
+is unlinked, no probe runs, media byte-identical.
+
+**QEMU target + result.** q35's default device set has no EHCI, so under the knob the builder
+attaches a standalone `-device usb-ehci` (harness-only, not a kernel write path). The scout
+then reports that controller: `8086:24cd`, 6 ports, `CAPLENGTH=0x20`, `HCCPARAMS` EECP=0x68,
+`USBLEGSUP` BIOS=0/OS=0, controller halted (`RS=0`, `HCHalted=1`), `CONFIGFLAG=0`
+(ports routed to the companion), all ports powered, **0 connected** — the honest QEMU
+baseline (QEMU attaches no downstream device). The real value is the attended rMBP bench: the
+`PORTSC` block there shows whether the internals sit connected on EHCI ports and who owns them.
+
+The scout's analysis, pre-registered metal expectations, and the recommended EHCI-driver-arc
+shape live in the SCOUT report (`~/.claude/plans/unaos/review/unaos-ehci1-SCOUT.md`).
+
+---
+
 ## See also
 - `unaos/crates/kernel/src/drivers/xhci/`, `drivers/block.rs` — the implementation.
 - [`scheduler.md`](../02_KERNEL_CORE/scheduler.md) — why the lock-free MSI handler and the main-loop service split matter under a live scheduler.
