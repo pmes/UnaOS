@@ -3842,3 +3842,32 @@ kernels carrying `SMPPROBE-5` strings (validate by ELF hash + `strings | grep SM
 3/3 secondaries (shared `smp_virt` byte-untouched); `kernel8-test` 0-FAIL (34 PASS); `UNAOS_HUBSTORAGE`
 x86 MISSION SUCCESS; 4 armed leg tars + the knob-off DEFAULT staged. The metal verdict is the attended
 bench with LC-orin + Peter (runbook `scripts/orin-smp5-bench.md`).
+
+**⚡ SITTING VERDICT (2026-07-16 attended, Peter + LC-orin; serial
+`~/unaos-bench/jetson-serial-2026-07-16-smp5sitting.log`; firmware precondition `t23x_general
+39.2.0-gcid-45755727` asserted on every boot; all boots flashed from the staged tars, on-stick ELF
+hash verified against the MANIFEST before each boot): ALL FOUR RESIDUE LEGS SURVIVED — the sitting
+ran the full schedule with ZERO RAS faults.**
+
+- **RIDER-1 re-confirm (leg 16):** survived byte-perfect — `CPU_ON ret=0` on `0x00000100`,
+  `CHECKPOINT REACHED (0x53040010)`, `AP -> BSP SGI OK (BSP ipi 1 -> 2)`.
+- **Leg 17 (AP print — the PRIME suspect): SURVIVED, suspect INNOCENT.** The woken core's own
+  `:: … sel=17 [AP] woken core online … ::` line arrived intact on the wire, then checkpoint
+  `0x53040011` + SGI OK. The secondary's console access (UART MMIO + `SERIAL_PORT` spinlock) is not
+  the wall.
+- **Leg 18 (WFI tail): SURVIVED as predicted** — checkpoint `0x53040012`, SGI OK, box up.
+- **Leg 19 (cluster-1): SURVIVED — the first cluster-1 core ever online.** BSP named GICR frame
+  `0xf500000` (`GICR_WAKER @ 0xf500014`) pre-`CPU_ON`; `ret=0` on `0x00010200`, checkpoint
+  `0x53040013`, SGI OK across the cluster boundary.
+- **Leg 20 (the real 5-core sequence): SEQUENCE DONE — 5/5.** All five DTB secondaries
+  (`0x100`, `0x200`, `0x300`, `0x10200`, `0x10300`) each reached checkpoint `0x53040014` + SGI OK,
+  in order, one boot. **Every core on the part has now run UnaOS code.**
+
+**Verdict per the pre-registered decision table: the SMP-3 fault is reproduced by NO restored
+element, singly or (leg 20) sequentially combined. The residual trigger is
+timing/ordering/concurrency — or the real `_secondary_start_virt` entry shape itself — and that is
+the follow-up arc's bisect target.** This is the table's "all four survive" branch: a real,
+informative outcome, not a null. Bench-rig note for the record: two early boots were discarded for
+capture faults on the HOST side (a baud-reset garble, then two processes splitting the serial byte
+stream — kill stale readers BY DEVICE before trusting a capture); evidence starts at the clean
+RIDER-1 boot. Default image restored to the boot stick at close (`17bc4e7a…`, `tegra:` 109).
