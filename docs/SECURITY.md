@@ -371,6 +371,31 @@ The UNAFS-K3 mount became read-WRITE at K4: `fs/unafs.rs`'s `write_sector` route
   ROOT SECTOR fallback (garbage the newest slot → mount lands on the previous tree) and the
   crash-safe reclaim-queue drain. QEMU-proven via `if=sd` write-back; the metal power-cut proof
   (incl. the pre-K8 card migration via `tools/unafs migrate`) rides the next attended Pi bench.
+- **K8a dual-lens review ledger (2026-07-16 — zero must-fix; the one should-fix [>2 GiB format
+  slice-panic] and the flush-contract pin were fixed in-arc `6dd2501` + lens re-verified).
+  Standing NOTEs, each real but bounded:**
+  - *Refmap write amplification (leaning should-fix; the delta-refmap is the named closure).*
+    Every commit rewrites the ENTIRE refcount map (all leaves + a fresh index), so blocks
+    written per commit is LINEAR in volume size (≈ block_count/1024 + ~6: measured 10 blocks
+    at 16 MB, 70 at 256 MB, 262 at 1 GB). The K6 ACL persist path multiplies it — 4+ commits
+    per row (create + 3 attrs + one per grant), all inside ONE IRQ-masked `with_unafs` hold of
+    synchronous per-sector eMMC writes. Correct today (the staged volume is ≤ 8 MB); a
+    delta/dirty-leaf refmap persist collapses it. Same family as the K5B ~0.7 s mask residual.
+  - *fsck double-reference blindness.* The reachability walk dedups into a set, so a HOSTILE
+    v3 image with two inodes' extents over one physical block reports clean; a later CoW
+    write decrefs the shared block to 0 while the other inode still points at it. Within the
+    accepted attacker-owns-the-medium boundary; unreachable via any API (the allocator never
+    shares); ledgered as an fsck-scope limit, not a defect.
+  - *Frozen-view same-transaction NoSpace edge.* Blocks freed earlier in a transaction stay
+    unallocatable until that commit's freeze, so a free-then-realloc op on a near-full volume
+    can spuriously `NoSpace` despite sufficient net free space. Inherent to single-generation
+    CoW; documented behavior.
+  - *Witness tear-case scope.* The kernel `K8a-cow` power-cut leg proves UNFLIPPED-ROOT
+    convergence on the real block device; the intra-root-sector TEAR fallback is proven only
+    by the host KAT (acceptable: an intra-sector tear can only damage the inactive slot).
+  - *Volume cap.* v3 geometry is capped at 2 GiB (`MAX_BLOCK_COUNT` = 524,288 — the
+    one-indirect-level map bound); format AND mount refuse larger volumes with a clean
+    Geometry error. Lifting the cap = adding an indirection level = a future format change.
 
 ### Process & supply chain
 - [ ] Adversarial review before metal and before merge on every arc (standing rule, `CLAUDE.md`)
