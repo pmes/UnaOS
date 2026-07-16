@@ -140,6 +140,24 @@ xcarve = ["tegra"]
 # §JETSON-XCARVE and scripts/orin-xcarve-bench.md.
 xcarve_scrub = ["tegra"]
 
+# JETSON-XCARVE-CRCR M1: the `UNAOS_XCARVE_CRCRQ=1` command-ring quiesce + re-seat
+# (arch/aarch64/xusb_tegra.rs::jbxc_crcrq_quiesce), fired in `jb2b_attach` AFTER the no-HCRST
+# takeover programs the rings and start()s the controller, but BEFORE JB9i's DISABLE_SLOT drain —
+# i.e. provably before the FIRST command doorbell. The elimination verdict put the carveout wall's
+# FillWrite target (fault ADDR 0x800000027767dc80/dc40 at JB9i) in the controller-internal command
+# ring: per xHCI 5.4.5 the CRCR pointer field is only loaded when CRR=0, so if the takeover
+# inherited a RUNNING command ring (CRR=1) init_pointers' CRCR write was silently dropped and the
+# controller kept the firmware's poisoned internal fetch pointer. This lever reads CRCR.CRR; if 1,
+# issues a spec-clean Command Abort (CRCR.CA, xHCI 4.6.1.2) and polls CRR->0; then (either way)
+# re-programs CRCR with OUR ring pointer + RCS so no command is ever issued on an un-re-seated ring.
+# CA is a command-ring control op ONLY — never HCRST, never CSB, the Falcon service loop is
+# untouched (Falcon-safety invariant). Every step prints under a stable `JBXC-CRCRQ:` prefix.
+# Tegra-only at runtime; with this feature OFF (default) the quiesce + its call site vanish and the
+# tegra image is byte-identical to baseline (zero `JBXC-CRCRQ` strings). Enable via
+# `UNAOS_XCARVE_CRCRQ=1 UNAOS_TEGRA=1 ./arroyo esp-jetson` (combine with `UNAOS_XCARVE=1` to see the
+# census + quiesce together). See arch_arm64.md §JETSON-XCARVE and scripts/orin-xcarve-bench.md.
+xcarve_crcrq = ["tegra"]
+
 # JETSON-XCARVE M1: the `UNAOS_XCARVE_RELINK=1` relink-experiment pad — a `#[used]` read-only pad
 # static (arch/aarch64/xusb_tegra.rs) that trivially perturbs the image's section/symbol layout and
 # load extent with ZERO semantic change (the pad is never read). Rebuilding the layout-correlated

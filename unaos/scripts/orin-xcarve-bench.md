@@ -127,3 +127,61 @@ the sitting.
 **Best scrub testbed note:** the leg-23 layout (SMP-6 leg-23 tar, `d3ecf48` era) faulted **4/4** — the
 highest-probability faulter on record, so a scrub that clears it is the strongest positive signal; the
 censusv2-scrub-leg23 image reproduces that layout with the scrub armed.
+
+---
+
+## CRCR-QUIESCE sitting — the command-ring re-seat (`UNAOS_XCARVE_CRCRQ`; attended; pre-registered)
+
+The scrub no-op'd 4/4 (every DRAM-visible inherited class exonerated), leaving the FillWrite target
+controller-INTERNAL or in the CRCR-unreadable command ring. This sitting fires a controller-side lever
+that stays inside the Falcon-safety invariant: quiesce and re-seat the inherited command ring (CA if
+`CRR=1`, then re-program CRCR at OUR ring) BEFORE the first command doorbell (JB9i). Full mechanism +
+Falcon-safety argument + ordering proof: `arch_arm64.md` §JETSON-XCARVE "CRCR-QUIESCE arc". New images
+(hash-verify each on-stick before boot; `tegra:` count/hash, never size; quiesce images carry
+`JBXC-CRCRQ` strings, census `JBXC`):
+
+| tag | knobs | what it is |
+|---|---|---|
+| **crcrq-leg23** | `UNAOS_XCARVE_CRCRQ=1 UNAOS_XCARVE=1 UNAOS_SMPPROBE=23 UNAOS_TEGRA=1` | the historically-4/4 leg-23 knobs + census + command-ring quiesce — the decisive testbed |
+| **crcrq-default** | `UNAOS_XCARVE_CRCRQ=1 UNAOS_XCARVE=1 UNAOS_TEGRA=1` | default layout + census + quiesce (the quiesce on a low-fault layout) |
+| **knoboff-default** | `UNAOS_TEGRA=1` | byte-identical-to-baseline control (zero `JBXC` / `JBXC-CRCRQ` strings) |
+
+⚠ **Layout disclosure (read before pre-registering the fork).** Adding the quiesce code CHANGES the
+image layout — the exact 4/4 leg-23 layout CANNOT be byte-preserved. This is the FOURTH distinct layout
+of the leg-23 knobs; the prior three sampled 4/4 (original), ~50% (relink), 0/4 (census+scrub). The
+fault-rate comparison is therefore **statistical**, not a clean before/after on one image. The
+`JBXC-CRCRQ:` lines (CRR-before, CA issued/skipped, CRR-after, CRCR re-seated) are the mechanism
+witness regardless of the fault outcome — capture every one.
+
+⚠ **REVIEW-LENS CORRECTION (folded pre-bench — read first):** per xHCI §5.4.5 CRR clears whenever
+the controller halts, and both prior censuses read raw `CRCR=0x0` at HCH=1 (CRR bit 3 = 0,
+observed). So **`CRR-before=0` is THE PREDICTED result**, the CA branch is expected dead, and this
+lever is a CONFIRMING PROBE (closes the command-ring bucket by silicon observation), NOT the
+likely fix. The fork below is ordered accordingly.
+
+### Boot 1 — crcrq-leg23 image, ×3+ boots (the fork, predicted-first)
+**Pre-registered prediction (the fork):**
+- **`CRR-before=0` every boot (PREDICTED)** ⇒ the inherited ring was not running; `init_pointers`'
+  CRCR write already took; the command-ring bucket CLOSES by observation. The re-seat still leaves
+  no window. On clean boots the leg-23 conjunction runs (5/5 cores, CAPSTONE 6/6).
+- **`JBXC-CRCRQ:` lines present but the fault PERSISTS at JB9i (`…dc80`/`dc40`)** ⇒ same conclusion
+  with the fault sampled in-window: command ring exonerated, target = controller-internal beyond
+  the command ring — the FINAL bucket. Record `CRR-before` + the fault ADDR. A valid
+  discriminating result, not a failed arc.
+- **`CRR-before=1` + CA issued + CRR→0, then clean JB9i ×3+ (would CONTRADICT §5.4.5 on this
+  silicon)** ⇒ record as BOTH a silicon-erratum finding AND a strong FIXED signal — both halves
+  matter; capture every line exactly.
+
+### Boot 2 — crcrq-default (the quiesce on a benign layout; run if a control is wanted)
+**Pre-registered prediction:** default-class images fault ~0/19 historically, so expect a clean boot with
+the `JBXC-CRCRQ:` witness lines present (whatever `CRR-before` reads). Confirms the quiesce is benign on a
+non-faulting layout (no regression) and shows the `CRR-before` value the firmware leaves on the default path.
+
+### Boot 3 — knoboff-default (restore)
+**Pre-registered prediction:** clean boot, CAPSTONE 6/6, VUG live; zero `JBXC` / `JBXC-CRCRQ` strings.
+End-of-sitting restore to the byte-identical-to-baseline default image. End-restore debt paid within the sitting.
+
+**Falcon-safety reminder (absolute):** the quiesce writes ONLY `CRCR` (command-ring control). If any boot
+shows the Falcon service loop stopping (no post-takeover FW-alive line, controller dead for commands beyond
+the CA handshake), STOP the sitting and record — that would violate the invariant and is not expected (CA is
+the same handshake `abort_enum_command` runs during normal enumeration).
