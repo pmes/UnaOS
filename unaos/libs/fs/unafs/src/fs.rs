@@ -180,6 +180,18 @@ pub struct CommitStats {
     pub snapshots_dropped: u64,
 }
 
+/// The committed in-RAM state [`UnaFS::load_committed`] reads off the device —
+/// the root record and the maps it reaches. Shared by mount and the failed-
+/// transaction unwind (which re-derives ground truth from the disk).
+struct LoadedState {
+    root: RootRecord,
+    active_slot: RootSlot,
+    imap: Vec<u64>,
+    imap_blocks: Vec<u64>,
+    refmap_blocks: Vec<u64>,
+    refmap: RefMap,
+}
+
 pub struct UnaFS<D: BlockDevice> {
     pub device: D,
     pub superblock: Superblock,
@@ -288,9 +300,41 @@ impl<D: BlockDevice> UnaFS<D> {
         let mut sb_block = alloc::vec![0u8; BLOCK_SIZE as usize];
         device.read_block(0, &mut sb_block)?;
         let superblock = Superblock::from_bytes(&sb_block)?;
+
+        let loaded = Self::load_committed(&mut device, &superblock)?;
+
+        let mut fs = Self {
+            device,
+            superblock,
+            refmap: loaded.refmap,
+            imap: loaded.imap,
+            root: loaded.root,
+            active_slot: loaded.active_slot,
+            imap_blocks: loaded.imap_blocks,
+            refmap_blocks: loaded.refmap_blocks,
+            autocommit: true,
+            stats: CommitStats::default(),
+            txn_blocks: 0,
+        };
+
+        // Persistent reclaim queue: v1 drains eagerly on mount (crash-safe —
+        // the drain is one commit; a power cut mid-drain resumes here).
+        fs.reclaim_drain()?;
+
+        Ok(fs)
+    }
+
+    /// Load the COMMITTED in-RAM state (root record + inode map + refcount
+    /// map) from the device — the shared body of [`mount`](Self::mount) and
+    /// [`txn_unwind`](Self::txn_unwind). Reads only; validates everything the
+    /// way mount always has (the volume is untrusted input).
+    fn load_committed(
+        device: &mut D,
+        superblock: &Superblock,
+    ) -> Result<LoadedState, FileSystemError> {
         let block_count = superblock.block_count;
 
-        let (root, active_slot) = crate::root::read_active(&mut device)?
+        let (root, active_slot) = crate::root::read_active(device)?
             .ok_or(FileSystemError::CorruptVolume("no valid root record"))?;
 
         // ---- Inode map (bounded: the volume is untrusted input) ----
@@ -387,25 +431,14 @@ impl<D: BlockDevice> UnaFS<D> {
         }
         let refmap = RefMap::from_counts(counts, block_count);
 
-        let mut fs = Self {
-            device,
-            superblock,
-            refmap,
-            imap,
+        Ok(LoadedState {
             root,
             active_slot,
+            imap,
             imap_blocks,
             refmap_blocks,
-            autocommit: true,
-            stats: CommitStats::default(),
-            txn_blocks: 0,
-        };
-
-        // Persistent reclaim queue: v1 drains eagerly on mount (crash-safe —
-        // the drain is one commit; a power cut mid-drain resumes here).
-        fs.reclaim_drain()?;
-
-        Ok(fs)
+            refmap,
+        })
     }
 
     // =====================================================================
@@ -1398,24 +1431,23 @@ impl<D: BlockDevice> UnaFS<D> {
     /// **Failure is clean (lens A fix):** on ANY error after the tree-wide
     /// incref (e.g. `NoSpace` persisting the index or committing on a tight
     /// volume — a supported regime) the whole in-RAM transaction is unwound
-    /// via [`Self::txn_unwind`]: the refmap thaws back to the committed view
-    /// (no stranded increfs) and the imap/map-block state is restored. The
-    /// disk was never touched in a reachable way (the root never flipped), so
-    /// the mount stays refcount-consistent and fully usable.
+    /// via [`Self::txn_unwind`], which RELOADS the imap/refmap/map-block state
+    /// from the committed root on disk (ground truth — the root never flipped
+    /// on the failing path), so the mount stays refcount-consistent and fully
+    /// usable regardless of any prior in-RAM residue.
     pub fn snapshot_create(
         &mut self,
         name: String,
         creator: String,
         timestamp: u64,
     ) -> Result<u64, FileSystemError> {
-        let saved = self.txn_save();
         match self.snapshot_create_inner(name, creator, timestamp) {
             Ok(generation) => {
                 self.stats.snapshots_created += 1;
                 Ok(generation)
             }
             Err(e) => {
-                self.txn_unwind(saved);
+                self.txn_unwind();
                 Err(e)
             }
         }
@@ -1461,30 +1493,45 @@ impl<D: BlockDevice> UnaFS<D> {
         Ok(generation)
     }
 
-    /// The in-RAM state a snapshot/reclaim transaction mutates before its
-    /// commit: the imap and the committed-map block lists (the refmap needs no
-    /// copy — [`RefMap::thaw`] restores it from its own frozen view).
-    fn txn_save(&self) -> (Vec<u64>, Vec<u64>, Vec<u64>) {
-        (
-            self.imap.clone(),
-            self.imap_blocks.clone(),
-            self.refmap_blocks.clone(),
-        )
-    }
-
-    /// Unwind a FAILED (uncommitted) transaction to the last committed state:
-    /// thaw the refmap (`current = frozen` — discarding every incref/decref
-    /// and allocation the failed transaction made, the exact inverse of the
-    /// tree-wide incref) and restore the saved imap/map-block state (a failed
-    /// `rewrite_data_inner`/`commit` can leave the in-RAM imap pointing at
-    /// fresh, now-unreferenced blocks). Only valid when the root did NOT flip
-    /// — every caller bails before its commit succeeded, so the frozen view
-    /// IS the on-disk truth.
-    fn txn_unwind(&mut self, saved: (Vec<u64>, Vec<u64>, Vec<u64>)) {
-        self.refmap.thaw();
-        self.imap = saved.0;
-        self.imap_blocks = saved.1;
-        self.refmap_blocks = saved.2;
+    /// Unwind a FAILED (uncommitted) transaction by RELOADING the in-RAM
+    /// state (root record, inode map, refcount map, map-block lists) from the
+    /// COMMITTED root on disk. The root never flipped on any failing path, so
+    /// the on-disk committed tree is ground truth BY DEFINITION — this makes
+    /// the unwind correct regardless of any residue prior operations left in
+    /// RAM, structurally rather than by discipline.
+    ///
+    /// **Rejected alternative (lens A composition finding, 2026-07-16):** an
+    /// entry-snapshot restore (save imap/map-blocks at txn entry + `thaw()`)
+    /// was strictly WORSE when composed with an earlier un-unwound failed
+    /// write (K8a residue: in-RAM imap pointing at fresh blocks backed only by
+    /// `current` refcounts). Restoring that contaminated entry state while
+    /// thaw discarded the backing refcounts left reachable blocks at refcount
+    /// 0 in BOTH views — the allocator could then legally hand out live
+    /// blocks and overwrite committed data. Reloading from disk cannot
+    /// reproduce that class: it never trusts anything in RAM.
+    ///
+    /// If even the reload fails (device error mid-unwind), the mount is
+    /// poisoned: fail closed by keeping the refmap fully thawed AND marking
+    /// every block used in the current view, so no further allocation can hand
+    /// out anything — reads still work, a remount recovers.
+    fn txn_unwind(&mut self) {
+        match Self::load_committed(&mut self.device, &self.superblock) {
+            Ok(loaded) => {
+                self.root = loaded.root;
+                self.active_slot = loaded.active_slot;
+                self.imap = loaded.imap;
+                self.imap_blocks = loaded.imap_blocks;
+                self.refmap_blocks = loaded.refmap_blocks;
+                self.refmap = loaded.refmap;
+            }
+            Err(_) => {
+                crate::warnlog::warn(
+                    "[UNAFS] :: txn unwind reload failed — allocator poisoned closed until remount",
+                );
+                let all_used = alloc::vec![u32::MAX; self.superblock.block_count as usize];
+                self.refmap.set_counts(&all_used);
+            }
+        }
         self.txn_blocks = 0;
     }
 
@@ -1519,14 +1566,13 @@ impl<D: BlockDevice> UnaFS<D> {
     /// transaction ([`Self::txn_unwind`]) — same discipline as
     /// [`snapshot_create`](Self::snapshot_create).
     pub fn snapshot_drop_enqueue(&mut self, generation: u64) -> Result<(), FileSystemError> {
-        let saved = self.txn_save();
         match self.snapshot_drop_enqueue_inner(generation) {
             Ok(()) => {
                 self.stats.snapshots_dropped += 1;
                 Ok(())
             }
             Err(e) => {
-                self.txn_unwind(saved);
+                self.txn_unwind();
                 Err(e)
             }
         }
@@ -1582,14 +1628,13 @@ impl<D: BlockDevice> UnaFS<D> {
     /// before the flip leaves the full queue for the next mount.
     ///
     /// Failure is clean: any error before the commit unwinds the in-RAM
-    /// transaction ([`Self::txn_unwind`]) — the decrefs are discarded and the
-    /// queue stays intact (on disk AND in the thawed refmap) for a retry or
-    /// the next mount.
+    /// transaction ([`Self::txn_unwind`] reloads from the committed root) —
+    /// the decrefs are discarded and the queue stays intact on disk and in
+    /// RAM for a retry or the next mount.
     pub fn reclaim_drain(&mut self) -> Result<(), FileSystemError> {
-        let saved = self.txn_save();
         let r = self.reclaim_drain_inner();
         if r.is_err() {
-            self.txn_unwind(saved);
+            self.txn_unwind();
         }
         r
     }

@@ -525,3 +525,79 @@ fn failed_snapshot_create_unwinds_cleanly_on_a_full_volume() {
     ));
     assert!(fs2.fsck(false).unwrap().is_clean());
 }
+
+#[test]
+fn failed_snapshot_create_after_failed_write_residue_never_corrupts_data() {
+    // Lens A composition repro (2026-07-16, pinned): a failed write_data
+    // (K8a residue — the inner rewrite succeeds, commit hits NoSpace, and the
+    // in-RAM imap is left pointing at fresh blocks backed only by `current`
+    // refcounts) followed by a failed snapshot_create. An entry-snapshot
+    // unwind restored that CONTAMINATED imap while discarding its backing
+    // refcounts: reachable blocks hit refcount 0 in both views, the allocator
+    // legally handed them out, and committed file data was overwritten ON
+    // DISK. The reload-from-committed-root unwind must make the sequence
+    // harmless: committed data intact byte-for-byte, fsck clean, further
+    // writes safe.
+    let mut fs = fresh_fs(600);
+    let root = fs.superblock.root_inode;
+
+    // Committed baseline that must SURVIVE everything below.
+    let keep = fs.create_file(root, "keep.txt".into()).unwrap();
+    let keep_bytes = vec![0xC3u8; 4 * BLOCK_SIZE as usize];
+    fs.write_data(keep, 0, &keep_bytes).unwrap();
+
+    // Grow a second file one block at a time until a write FAILS — the
+    // failing write is the K8a residue injector (no unwind on that path).
+    let grow = fs.create_file(root, "grow.bin".into()).unwrap();
+    let block = vec![0x77u8; BLOCK_SIZE as usize];
+    let mut grown = 0u64;
+    loop {
+        match fs.write_data(grow, grown * BLOCK_SIZE, &block) {
+            Ok(()) => grown += 1,
+            Err(_) => break, // residue now sits in the in-RAM state
+        }
+        assert!(grown < 600, "the tight volume must fill");
+    }
+
+    // The failed snapshot_create: its unwind must reload ground truth from
+    // the committed root — NOT trust the contaminated in-RAM state.
+    let create_result = fs.snapshot_create("s".into(), "alice".into(), 1);
+    assert!(create_result.is_err(), "no room for a snapshot on a full volume");
+
+    // The unwind healed the mount to the committed truth: fsck clean NOW.
+    assert!(
+        fs.fsck(false).unwrap().is_clean(),
+        "post-unwind state must agree with the committed tree"
+    );
+
+    // ~40 more one-block writes: every successful allocation must come from
+    // genuinely free blocks — never from under committed data. (These target
+    // fresh names; failures are legal on a full volume, corruption is not.)
+    for i in 0..40u64 {
+        let name = format!("w{i}.bin");
+        if let Ok(id) = fs.create_file(root, name) {
+            let _ = fs.write_data(id, 0, &block);
+        }
+    }
+
+    // The committed baseline is intact byte-for-byte, in RAM and from disk.
+    assert_eq!(
+        fs.read_data(keep, 0, keep_bytes.len() as u64).unwrap(),
+        keep_bytes,
+        "committed data must never be overwritten by post-unwind allocations"
+    );
+    let device = fs.device.clone();
+    drop(fs);
+    let mut fs2 = UnaFS::mount(device).expect("remount");
+    assert!(fs2.fsck(false).unwrap().is_clean(), "remount-fsck must be clean");
+    let keep2 = fs2.resolve_path("/keep.txt").unwrap();
+    assert_eq!(
+        fs2.read_data(keep2, 0, keep_bytes.len() as u64).unwrap(),
+        keep_bytes
+    );
+    // The grow file's COMMITTED prefix also survived (the failed tail write
+    // was discarded whole — old tree, never a hybrid).
+    let grow2 = fs2.resolve_path("/grow.bin").unwrap();
+    let grow_data = fs2.read_data(grow2, 0, grown * BLOCK_SIZE).unwrap();
+    assert!(grow_data.iter().all(|&b| b == 0x77));
+}
