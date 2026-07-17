@@ -1113,6 +1113,32 @@ pub fn init() {
                             let _ = mmio_write32(h.op + OP_USBSTS, sts & STS_RW1C);
                         }
                     }
+                    // Probe-6 discriminator: enable ONLY the periodic schedule over the
+                    // all-Terminate frame list for ~5 ms. The controller then fetches one
+                    // frame-list dword per frame and nothing else — the simplest possible
+                    // upstream read this function can issue. Clean => the master abort is
+                    // async-engine-specific; HSE => ALL upstream reads from this function
+                    // abort (points at PCH-level gating, not schedule programming).
+                    {
+                        let cmd = mmio_read32(h.op + OP_USBCMD).unwrap_or(0);
+                        let _ = mmio_write32(h.op + OP_USBCMD, cmd | CMD_PSE);
+                        ehci_scout::settle_ms(5);
+                        let sts = mmio_read32(h.op + OP_USBSTS).unwrap_or(0);
+                        let _ = mmio_write32(h.op + OP_USBCMD, cmd & !CMD_PSE);
+                        let _ = wait_bounded(|| {
+                            mmio_read32(h.op + OP_USBSTS).unwrap_or(0) & (1 << 14) == 0
+                        });
+                        serial_println!(
+                            ":: EHCI-HID: [{}] periodic DMA smoke (empty frame list, 5ms): USBSTS={:#010x} HSE={} HCHalted={} == witness ::",
+                            idx, sts, (sts >> 4) & 1, (sts >> 12) & 1
+                        );
+                        if sts & STS_HSE != 0 {
+                            // Ack + re-run/restart so the port loop still reports honestly.
+                            let _ = mmio_write32(h.op + OP_USBSTS, sts & STS_RW1C);
+                            let cmd2 = mmio_read32(h.op + OP_USBCMD).unwrap_or(0);
+                            let _ = mmio_write32(h.op + OP_USBCMD, (cmd2 & !CMD_PSE) | CMD_RS);
+                        }
+                    }
                     for port in 0..h.n_ports {
                         let portsc = mmio_read32(h.op + OP_PORTSC0 + 4 * port as u64).unwrap_or(0);
                         if portsc & PORT_CCS == 0 || portsc & PORT_OWNER != 0 {
@@ -1137,6 +1163,31 @@ pub fn init() {
     // comparison against the 7-series datasheet. Read-only.
     for c in ctrls.iter() {
         unsafe { pci_evidence(c.bus, c.dev, c.func, c.idx) };
+    }
+    unsafe {
+        // Working-DMA reference: the xHCI function's config space (progIF 0x30), tagged [90+].
+        for dev in 0u8..=31 {
+            let class_reg = read_config_32(0, dev, 0, 0x08);
+            if class_reg >> 8 == 0x0C0330 {
+                pci_evidence(0, dev, 0, 90 + dev as usize);
+            }
+        }
+        // PCH RCBA window, READ-ONLY: Function Disable / Backed-Up Control / clock gating —
+        // the registers Apple EFI is most likely to have left gating the EHCI DMA engines.
+        // RCBA base from the LPC bridge (0:31.0) config 0xF0 (bit 0 = enable).
+        let rcba_reg = read_config_32(0, 31, 0, 0xF0);
+        let rcba = (rcba_reg as u64) & !0x3FFF;
+        serial_println!(
+            ":: EHCI-HID: RCBA reg={:#010x} base={:#x} en={} ::",
+            rcba_reg, rcba, rcba_reg & 1
+        );
+        if rcba_reg & 1 == 1 && rcba != 0 {
+            for off in [0x3400u64, 0x3404, 0x3410, 0x3414, 0x3418, 0x341C, 0x3420, 0x3428, 0x342C, 0x3430, 0x3434] {
+                if let Some(v) = mmio_read32(rcba + off) {
+                    serial_println!(":: EHCI-HID: RCBA+{:#06x} = {:#010x} ::", off, v);
+                }
+            }
+        }
     }
 
     let n = ctrls.len();
