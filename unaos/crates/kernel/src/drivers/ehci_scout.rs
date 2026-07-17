@@ -43,18 +43,19 @@ const CAP_HCIVERSION: u64 = 0x02; // u16
 const CAP_HCSPARAMS: u64 = 0x04; // u32
 const CAP_HCCPARAMS: u64 = 0x08; // u32
 
-/// EHCI operational-register offsets off (BAR0 + CAPLENGTH).
-const OP_USBCMD: u64 = 0x00;
-const OP_USBSTS: u64 = 0x04;
-const OP_CONFIGFLAG: u64 = 0x40;
-const OP_PORTSC0: u64 = 0x44;
+/// EHCI operational-register offsets off (BAR0 + CAPLENGTH). pub(crate): the EHCI-3 driver layer
+/// (`drivers/ehci`) programs the same operational block the scout reads.
+pub(crate) const OP_USBCMD: u64 = 0x00;
+pub(crate) const OP_USBSTS: u64 = 0x04;
+pub(crate) const OP_CONFIGFLAG: u64 = 0x40;
+pub(crate) const OP_PORTSC0: u64 = 0x44;
 
 /// Read a u32 from an identity-mapped MMIO physical address, but ONLY after proving the page is
 /// present in the live page tables (firmware identity map). Returns `None` if unmapped — so a metal
 /// boot where the EHCI BAR is outside the firmware identity map reports honestly instead of taking
 /// an unhandled #PF. Read-only: `read_volatile` of device MMIO has no side effect on EHCI cap/op
 /// status registers we touch here.
-unsafe fn mmio_read32(phys: u64) -> Option<u32> {
+pub(crate) unsafe fn mmio_read32(phys: u64) -> Option<u32> {
     // translate() walks CR3 and honors huge leaves; None => not present on the path.
     if crate::arch::x86_64::memory::translate(phys).is_none() {
         return None;
@@ -308,7 +309,7 @@ pub fn scout() {
 /// in the live page tables, so a BAR outside the firmware identity map is reported as skipped rather
 /// than faulting. Mirrors `mmio_read32`'s guard.
 #[cfg(feature = "ehciconfig")]
-unsafe fn mmio_write32(phys: u64, val: u32) -> bool {
+pub(crate) unsafe fn mmio_write32(phys: u64, val: u32) -> bool {
     if crate::arch::x86_64::memory::translate(phys).is_none() {
         return false;
     }
@@ -332,7 +333,7 @@ fn ms_cycles(ms: u64) -> u64 {
 /// Busy-spin for approximately `ms` milliseconds against the free-running TSC (advances regardless of
 /// EFLAGS.IF). Bounded and side-effect free — no MMIO, no writes.
 #[cfg(feature = "ehciconfig")]
-fn settle_ms(ms: u64) {
+pub(crate) fn settle_ms(ms: u64) {
     let start = crate::arch::now_cycles();
     let budget = ms_cycles(ms);
     while crate::arch::now_cycles().wrapping_sub(start) < budget {
@@ -344,7 +345,7 @@ fn settle_ms(ms: u64) {
 /// `false` on timeout. Wall-clock bounded via `now_cycles()`, so a wedged status bit fails fast
 /// instead of freezing a serial-less boot. Side-effect free apart from the caller's MMIO reads.
 #[cfg(feature = "ehciconfig")]
-fn wait_bounded<F: Fn() -> bool>(pred: F) -> bool {
+pub(crate) fn wait_bounded<F: Fn() -> bool>(pred: F) -> bool {
     let start = crate::arch::now_cycles();
     let budget = crate::arch::hw_wait_budget();
     loop {
@@ -391,12 +392,31 @@ unsafe fn census(op: u64, ports: u32, idx: usize, label: &str) -> u32 {
     connected
 }
 
-/// Run the minimal wake sequence on one EHCI function and take two PORTSC censuses (before/after
-/// CONFIGFLAG=1). Returns (censusA_connected, censusB_connected). Every write is bracketed by a
-/// before/after register report. Writes confined to this function's PMCSR / USBLEGSUP OS-own bit /
-/// USBLEGCTLSTS (SMI-enable clear + status ack) / USBCMD.RS / CONFIGFLAG / PORTSC PP.
+/// One woken EHCI function, as returned by `wake_run`: everything a caller needs to reach the
+/// operational registers and ports. Shared between the EHCI-2 evidence mode (census between the
+/// two wake halves) and the EHCI-3 driver (`drivers/ehci`) — ONE wake path, not two (EHCI-3 N3).
 #[cfg(feature = "ehciconfig")]
-unsafe fn configure_controller(bus: u8, dev: u8, func: u8, idx: usize) -> (u32, u32) {
+pub(crate) struct EhciFnHandle {
+    pub bus: u8,
+    pub dev: u8,
+    pub func: u8,
+    /// Operational-register base (BAR0 + CAPLENGTH), translate()-proven present.
+    pub op: u64,
+    pub n_ports: u32,
+    /// HCSPARAMS.PPC — 1 => software controls PORTSC.PP.
+    pub ppc: u32,
+    /// HCCPARAMS bit0 — 64-bit addressing capability (0 on Panther Point: DMA must be < 4 GiB).
+    pub addr64: u32,
+}
+
+/// Shared wake, first half: PMCSR->D0, USBLEGSUP OS-ownership handshake + USBLEGCTLSTS SMI
+/// clear/ack, USBCMD.RS=1. Returns `None` (having written nothing to MMIO) when BAR0 is outside
+/// the firmware identity map. Trace lines keep the `EHCI-CONFIG` tag — this IS the EHCI-2
+/// metal-clean wake path, whichever layer calls it (EHCI-2 evidence mode or the EHCI-3 driver);
+/// keeping the exact lines is what makes the EHCI-2-unchanged refactor gate assertable.
+/// Idempotent: on an already-woken function every step reads as done and re-writes are no-ops.
+#[cfg(feature = "ehciconfig")]
+pub(crate) unsafe fn wake_run(bus: u8, dev: u8, func: u8, idx: usize) -> Option<EhciFnHandle> {
     let vendor = read_config_16(bus, dev, func, 0x00);
     let device = read_config_16(bus, dev, func, 0x02);
     serial_println!(
@@ -447,7 +467,7 @@ unsafe fn configure_controller(bus: u8, dev: u8, func: u8, idx: usize) -> (u32, 
                 ":: EHCI-CONFIG: [{}] BAR0 {:#x} not present in firmware identity map — SKIPPED (no writes) ::",
                 idx, bar0
             );
-            return (0, 0);
+            return None;
         }
     };
     let caplength = (caplength_word & 0xFF) as u64;
@@ -518,14 +538,15 @@ unsafe fn configure_controller(bus: u8, dev: u8, func: u8, idx: usize) -> (u32, 
         if running { "(running)" } else { "(STOP-NOTE: HCHalted did not clear within budget)" }
     );
 
-    // ---- Census A: RS=1, CONFIGFLAG=0 (ports still routed to the companion). ----
-    let cf_before = mmio_read32(op + OP_CONFIGFLAG).unwrap_or(0) & 0x1;
-    serial_println!(
-        ":: EHCI-CONFIG: [{}] censusA context: CONFIGFLAG={} (route-to-EHCI={}), N_PORTS={} PPC={} ::",
-        idx, cf_before, cf_before, n_ports, ppc
-    );
-    let census_a = census(op, n_ports, idx, "A");
+    Some(EhciFnHandle { bus, dev, func, op, n_ports, ppc, addr64: hccparams & 0x1 })
+}
 
+/// Shared wake, second half: CONFIGFLAG=1 (route ports to this EHCI), port-power where PPC honors
+/// software control, then the ~150 ms connect-debounce settle. Same one-wake-path property as
+/// `wake_run`; the split exists so the EHCI-2 evidence mode can census between RS=1 and CF=1.
+#[cfg(feature = "ehciconfig")]
+pub(crate) unsafe fn wake_route(h: &EhciFnHandle, idx: usize) {
+    let (op, n_ports, ppc) = (h.op, h.n_ports, h.ppc);
     // ---- Step 3b: CONFIGFLAG=1 (route ports to this EHCI), then port-power on (PPC honored). ----
     let _ = mmio_write32(op + OP_CONFIGFLAG, 0x1);
     let cf_after = mmio_read32(op + OP_CONFIGFLAG).unwrap_or(0) & 0x1;
@@ -555,8 +576,30 @@ unsafe fn configure_controller(bus: u8, dev: u8, func: u8, idx: usize) -> (u32, 
         serial_println!(":: EHCI-CONFIG: [{}] PPC=0 — ports always-powered, no PP write ::", idx);
     }
 
-    // Paced settle for connect debounce (~150ms) before the second census.
+    // Paced settle for connect debounce (~150ms) before the caller's next look at the ports.
     settle_ms(150);
+}
+
+/// EHCI-2 evidence mode for one function: the shared wake with the two PORTSC censuses around the
+/// routing flip. Returns (censusA_connected, censusB_connected). Writes confined to this function's
+/// PMCSR / USBLEGSUP OS-own bit / USBLEGCTLSTS (SMI-enable clear + status ack) / USBCMD.RS /
+/// CONFIGFLAG / PORTSC PP — all inside `wake_run`/`wake_route`, the one shared wake path.
+#[cfg(feature = "ehciconfig")]
+unsafe fn configure_controller(bus: u8, dev: u8, func: u8, idx: usize) -> (u32, u32) {
+    let Some(h) = wake_run(bus, dev, func, idx) else {
+        return (0, 0);
+    };
+    let (op, n_ports, ppc) = (h.op, h.n_ports, h.ppc);
+
+    // ---- Census A: RS=1, CONFIGFLAG=0 (ports still routed to the companion). ----
+    let cf_before = mmio_read32(op + OP_CONFIGFLAG).unwrap_or(0) & 0x1;
+    serial_println!(
+        ":: EHCI-CONFIG: [{}] censusA context: CONFIGFLAG={} (route-to-EHCI={}), N_PORTS={} PPC={} ::",
+        idx, cf_before, cf_before, n_ports, ppc
+    );
+    let census_a = census(op, n_ports, idx, "A");
+
+    wake_route(&h, idx);
 
     // ---- Census B: RS=1, CONFIGFLAG=1, ports powered, after settle. ----
     let census_b = census(op, n_ports, idx, "B");
