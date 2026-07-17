@@ -998,7 +998,7 @@ gate to find. EHCI-5 closes this **decoder gap** so a **single finger drives the
 motion). Multitouch gestures are explicitly **out of scope** — only finger[0] is decoded.
 
 **M1 — recognize + capture.** After the standard X/Y gate finds nothing, `parse_report_descriptor`
-runs a vendor-multitouch recognition pass: an opaque **variable** Input on the vendor page
+runs a vendor-multitouch recognition pass: an opaque **non-Constant** Input on the vendor page
 (`UP_VENDOR = 0xFF00`) carrying a Report ID and a non-trivial bit size (`≥ VMT_MIN_VENDOR_BITS`,
 64 bits) yields `ReportLayout{ vendor_mt: true, report_id, .. }` instead of `None`. Because this
 branch runs **only** when `has_xy` is false, a real Generic Desktop pointer is never diverted onto
@@ -1038,6 +1038,24 @@ A → B, one negative coordinate) and asserts the first-finger decode + relative
 report reads absent, and a too-short report decodes to `None` (M2 mechanics + bounds safety). This
 proves the **mechanics**; correctness on the real `0262` is a **metal-verified hypothesis**, a later
 attended leg — **not** DONE for this arc.
+
+**EHCI-5-fix — the arming-order bug (Array vs Variable).** The 2026-07-17 rMBP 3-leg sitting proved
+EHCI-5's recognizer **never fired on metal**: the internal `05ac:0262` intf1 was still logged
+`… has no X/Y pointer field … not a cursor device; skipped`, so its endpoint was **never armed** and
+touching produced **zero** reports. Root cause was **not** the offset hypothesis (execution never
+reached the finger bytes) — it was an **arming-order/shape** gap in `parse_report_descriptor`. The
+captured 27-byte descriptor is
+`06 00 ff 09 01 a1 03 06 00 ff 09 01 15 00 26 ff 00 85 44 75 08 96 ff 01 81 00 c0`: its Input main
+item is `81 00` = **Input (Data, Array, Absolute)** — an **Array**, not a Variable. The pre-fix
+vendor-recognition sat **inside** the field-mapping block gated on `is_var`, so an Array Input never
+set `saw_vendor_input` and the descriptor fell through to `None`. The fix moves the vendor-page
+signature test **out** of the `is_var` block: any **non-Constant** Input on `UP_VENDOR` (Array **or**
+Variable) now accumulates `vendor_bits` and, past the X/Y gate, yields `vendor_mt`. The standard
+`has_xy` path is untouched and still wins first; the `MAX_REPORT_FIELDS` clamp and every bounds check
+are unchanged. `vendor_multitouch_selftest` now also feeds the **real captured Array descriptor** and
+asserts `vendor_mt` recognition — the witness gains `real-array-descriptor recognized=true`. The
+finger DECODE offsets (`VMT_FINGER_*`) remain the unchanged metal hypothesis for the next sitting;
+this arc only fixes recognition/arming.
 
 **Buffer/packet ceiling (metal-decided).** `IntSlot.buf` is `Buf64` and interrupt reads cap at
 `min(mps, 64)` — one ≤ 64 B packet. A full Apple MT report is ~430 B; header (~30 B) + finger[0]

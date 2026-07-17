@@ -1475,12 +1475,17 @@ unsafe fn parse_report_descriptor(desc: &[u8]) -> Option<ReportLayout> {
                         l.btn_off = bit_off;
                         l.btn_count = report_count.min(32) as u8;
                     }
-                    // EHCI-5: an opaque variable Input on the vendor page is the Apple multitouch
-                    // signature. Accumulate its bit size (clamped count already applied above).
-                    if usage_page == UP_VENDOR {
-                        saw_vendor_input = true;
-                        vendor_bits = vendor_bits.saturating_add(report_size.saturating_mul(count));
-                    }
+                }
+                // EHCI-5-fix: the Apple vendor-multitouch Input on the real 05ac:0262 intf1 is
+                // declared as an ARRAY (`81 00`), not a Variable — so the field-mapping block above
+                // (gated on `is_var`) never sees it, and the interface was mis-skipped as
+                // "no X/Y → not a cursor device". Recognize the vendor-page (0xFF00) signature for
+                // ANY non-Constant Input (Array OR Variable) so the endpoint is ARMED, not skipped.
+                // A Constant (padding) item is excluded; the standard X/Y gate still wins first, so
+                // no real pointer is ever diverted onto the vendor path.
+                if !is_const && usage_page == UP_VENDOR {
+                    saw_vendor_input = true;
+                    vendor_bits = vendor_bits.saturating_add(report_size.saturating_mul(count));
                 }
                 // Advance by the CLAMPED count (and saturate the u16) so a hostile Report Count
                 // neither loops nor overflows the running bit offset.
@@ -1704,9 +1709,27 @@ unsafe fn vendor_multitouch_selftest() {
         && dx == -150
         && dy == 5800;
 
+    // EHCI-5-fix M1': the REAL 05ac:0262 intf1 descriptor captured on metal (2026-07-17 rMBP
+    // 3-leg sitting). Note the Input is an ARRAY (`81 00`), not a Variable — the exact shape that
+    // the pre-fix `is_var`-gated recognizer skipped. This must now recognize as `vendor_mt`
+    // (id 0x44, no X/Y), proving the arming-order fix reaches the ARM path in the real path.
+    //   06 00 ff  Usage Page (Vendor 0xFF00)     26 ff 00  Logical Maximum 255
+    //   09 01     Usage 0x01                      85 44     Report ID 0x44
+    //   a1 03     Collection (Report)             75 08     Report Size 8
+    //   06 00 ff  Usage Page (Vendor 0xFF00)      96 ff 01  Report Count 511
+    //   09 01     Usage 0x01                       81 00     Input (Data,Array,Abs)  <-- ARRAY
+    //   15 00     Logical Minimum 0               c0        End Collection
+    let real_desc: [u8; 27] = [
+        0x06, 0x00, 0xFF, 0x09, 0x01, 0xA1, 0x03, 0x06, 0x00, 0xFF, 0x09, 0x01, 0x15, 0x00,
+        0x26, 0xFF, 0x00, 0x85, 0x44, 0x75, 0x08, 0x96, 0xFF, 0x01, 0x81, 0x00, 0xC0,
+    ];
+    let real_ok = parse_report_descriptor(&real_desc)
+        .map(|l| l.vendor_mt && !l.has_xy && l.report_id == 0x44)
+        .unwrap_or(false);
+
     serial_println!(
-        ":: EHCI-HID: vendor-multitouch self-test: recognized={} (id={:#04x}, min-bits={}), first-finger decode dx={} dy={} ok={} == witness ::",
-        vendor_ok, id, VMT_MIN_VENDOR_BITS, dx, dy, decode_ok
+        ":: EHCI-HID: vendor-multitouch self-test: recognized={} (id={:#04x}, min-bits={}), real-array-descriptor recognized={}, first-finger decode dx={} dy={} ok={} == witness ::",
+        vendor_ok, id, VMT_MIN_VENDOR_BITS, real_ok, dx, dy, decode_ok
     );
 }
 
