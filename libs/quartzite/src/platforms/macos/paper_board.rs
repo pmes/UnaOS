@@ -391,6 +391,35 @@ fn bitmap_rep(
 }
 
 // ---------------------------------------------------------------------------
+// tests — the taste-gate provenance
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::surface::GATED_PAPER;
+
+    /// The API default (`GATED_PAPER`) is EXACTLY the board's laid/medium cell —
+    /// the cell Peter picked at the 2026-07-17 taste-gate. If the board's seed
+    /// scheme or the laid parameters drift, this catches it: the default must
+    /// keep meaning the gated pixels.
+    #[test]
+    fn gated_default_is_the_laid_medium_cell() {
+        let (row, col) = (1usize, 2usize); // laid row, medium column
+        let (amp, level) = LEVELS[col - 1];
+        assert_eq!(level, "medium");
+        let cell = PaperParams {
+            algo: PaperAlgo::Laid,
+            amplitude: amp,
+            scale: algo_scale(PaperAlgo::Laid),
+            octaves: algo_octaves(PaperAlgo::Laid),
+            seed: SEED_BASE.wrapping_add(cell_seed(row, col)),
+        };
+        assert_eq!(cell, GATED_PAPER);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // BOOTSTRAP — the sample-board host seam
 // ---------------------------------------------------------------------------
 

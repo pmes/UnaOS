@@ -10,9 +10,9 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
-## hw-jetson track — 2026-07-17 (SURFACE-1 — the quartzite Surface primitive + the paper taste-gate) 🎨 parked at M1
+## hw-jetson track — 2026-07-17 (SURFACE-1 — the quartzite Surface primitive + the paper taste-gate) 🎨 TASTE-GATE PASSED, full arc (M1+M2)
 
-### SURFACE-1 — procedural paper surfaces + the sample board 🎨 host-native (quartzite; 6 new surface tests; zero kernel surface)
+### SURFACE-1 — procedural paper surfaces + the sample board + `Surface::Paper` 🎨 host-native (quartzite; 8 new tests; zero kernel surface)
 
 **What it does.** Introduces the **Surface** primitive to quartzite: a material
 layer owned by a region, content composited on top. Ships the platform-agnostic
@@ -25,20 +25,28 @@ antialiasing untouched, Retina scale-2 correct) and a runnable sample-board host
 (`cargo run -p quartzite --example paper_board`): a grid of real text views, rows
 = the three algorithms, columns = control (no texture) · subtle ±1.0 % · medium
 ±2.0 % · strong ±3.5 %, each cell labelled with its exact parameters,
-deterministic (no shimmer). **The aesthetic is not chosen here** — the arc parks
-at M1 for Peter's attended taste-gate (his eyes on the real pixels); no surface
-is folded into the API default and adoption stays OFF everywhere.
+deterministic (no shimmer). **Taste-gate PASSED (attended, 2026-07-17):**
+Peter's pick = the **laid / medium** cell (amp 2.0 %, scale 4 px, oct 3, seed
+`0xFBB6_0E9F`); his words: "lets default to this for now and we'll put in
+sliders to play with later so people can dial it in or turn it off." M2 folds
+the pick into the API: `quartzite::Surface` (`None` = universal default /
+`Paper`), with `Surface::Paper`'s no-params default = the gated parameters
+exactly (`GATED_PAPER`, one parametric place a future theming layer addresses).
+Views still opt in explicitly — no view/vessel rewiring; adoption stays OFF
+until each view-owner's arc. SURFACE-2 candidate scope pre-registered in the
+doc (per-user sliders + off switch), not built.
 
-**How it was tested.** `cargo test -p quartzite` → **10 passed** (6 new:
+**How it was tested.** `cargo test -p quartzite` → **12 passed** (8 new:
 determinism of field + raster, field bounded to [-1,1], seed decorrelation,
-texture-present, and the contrast budget **measured** from the rendered raster
-vs the declared amplitude). The example host launches and renders without panic
-on macOS 26.5.2 (visual judgment is Peter's, by design). Mac-native consumers
-(`facet`/`lumen`/`pulse`/`phonolite`, all `default-features = false`) `cargo
-check` clean. `./arroyo check` ✅ x86_64 / ✅ aarch64 (zero kernel surface). Full
-contract in `docs/dev/USERLAND/SURFACE.md`; landing report
-`review/unaos-surface1-LANDING.md`. **Taste-gate pending; M2 (folding the pick
-into `Surface::Paper`) deferred to a resumed run.**
+texture-present, the contrast budget **measured** from the rendered raster vs
+the declared amplitude, the default = the gated params exactly, and the default
+= the board's laid/medium cell byte-for-byte). The example host launches and
+renders without panic on macOS 26.5.2 (visual judgment was Peter's, at the
+gate). Mac-native consumers (`facet`/`lumen`/`pulse`/`phonolite`, all
+`default-features = false`) `cargo check` clean. `./arroyo check` ✅ x86_64 /
+✅ aarch64 (zero kernel surface). Full contract + taste-gate record in
+`docs/dev/USERLAND/SURFACE.md`; landing report
+`review/unaos-surface1-LANDING.md`.
 
 ---
 

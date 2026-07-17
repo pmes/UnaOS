@@ -129,9 +129,8 @@ impl PaperParams {
 
 /// A paper surface: a base colour with a procedural field laid over it.
 ///
-/// This is the shape [`crate`]'s future `Surface::Paper` variant wraps (M2):
-/// a region declares it, content composites on top. Default adoption stays OFF
-/// everywhere until a view-owner opts in.
+/// This is the shape [`Surface::Paper`] wraps: a region declares it, content
+/// composites on top. Adoption stays OFF everywhere until a view-owner opts in.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Paper {
     /// Linear-ish sRGB base stock colour, 0..1 per channel. A warm off-white is
@@ -142,6 +141,82 @@ pub struct Paper {
 
 /// The canonical warm paper-stock base colour (sRGB, 0..1).
 pub const PAPER_STOCK: [f32; 3] = [0.960, 0.949, 0.918];
+
+// ---------------------------------------------------------------------------
+// The taste-gated default (M2)
+// ---------------------------------------------------------------------------
+
+/// The parameters Peter picked at the attended taste-gate (2026-07-17): the
+/// **laid** algorithm at the board's **medium** cell — amp 2.0 %, scale 4 px,
+/// the board's laid octaves and that cell's exact seed. His words: "lets
+/// default to this for now and we'll put in sliders to play with later so
+/// people can dial it in or turn it off."
+///
+/// This is what `Surface::Paper` (via `Paper::default()` /
+/// `PaperParams::default()`) means with no explicit parameters. It stays fully
+/// parametric — a future settings layer (SURFACE-2 candidate: per-user dial-in
+/// + off switch) addresses exactly this one place.
+pub const GATED_PAPER: PaperParams = PaperParams {
+    algo: PaperAlgo::Laid,
+    amplitude: 0.020,
+    scale: 4.0,
+    octaves: 3,
+    // The sample board's laid/medium cell seed — SEED_BASE (0x51A7_0000) +
+    // cell_seed(row 1, col 2) — so the default IS the gated pixels, bit for bit.
+    seed: 0xFBB6_0E9F,
+};
+
+impl Default for PaperParams {
+    /// The taste-gated pick — see [`GATED_PAPER`].
+    fn default() -> Self {
+        GATED_PAPER
+    }
+}
+
+impl Default for Paper {
+    /// The gated paper on the canonical stock.
+    fn default() -> Self {
+        Paper { base_rgb: PAPER_STOCK, params: GATED_PAPER }
+    }
+}
+
+/// The Surface a quartzite region declares — the M2 capability.
+///
+/// A region (panel / window / text area) opts in **explicitly**; content
+/// composites on top; widgets inherit the material they sit on. The default
+/// everywhere remains [`Surface::None`] — adopting paper in tabula/midden/etc.
+/// is a future arc per view-owner. `Surface::Paper(Paper::default())` (or
+/// [`Surface::paper()`]) is the taste-gated look; future materials (brushed
+/// metal, glass, sci-fi panel) are further variants when their arcs come.
+///
+/// A backend that cannot render a surface well MUST render it as
+/// [`Surface::None`] (clean flat) — never a bad approximation.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum Surface {
+    /// No material — clean flat (the honest zero, and the universal default).
+    #[default]
+    None,
+    /// Procedural paper under the content. `Paper::default()` is the
+    /// taste-gated pick ([`GATED_PAPER`] on [`PAPER_STOCK`]).
+    Paper(Paper),
+}
+
+impl Surface {
+    /// The taste-gated paper — what a view gets when it declares paper with no
+    /// explicit parameters.
+    pub fn paper() -> Self {
+        Surface::Paper(Paper::default())
+    }
+
+    /// The RGBA8 raster of this surface across `w × h` device pixels, or `None`
+    /// for [`Surface::None`] (the backend paints its clean flat and moves on).
+    pub fn render_rgba8(&self, w: u32, h: u32) -> Option<Vec<u8>> {
+        match self {
+            Surface::None => None,
+            Surface::Paper(p) => Some(render_rgba8(p, w, h)),
+        }
+    }
+}
 
 /// Rec.709 luminance weights (the perceptual channel the budget is measured in).
 const LUMA: [f32; 3] = [0.2126, 0.7152, 0.0722];
@@ -437,6 +512,35 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The `Surface::Paper` default IS the taste-gated pick, exactly — the
+    /// laid algorithm at the board's medium cell (amp 2.0 %, scale 4 px, oct 3,
+    /// the cell's seed), on the canonical stock. Peter, 2026-07-17.
+    #[test]
+    fn default_params_are_the_gated_pick() {
+        let expected = PaperParams {
+            algo: PaperAlgo::Laid,
+            amplitude: 0.020,
+            scale: 4.0,
+            octaves: 3,
+            // The board's laid/medium cell: SEED_BASE + cell_seed(row 1, col 2)
+            // = 0x51A7_0000 + (1·0x9E37_79B1 + 2·0x85EB_CA77) mod 2^32.
+            seed: 0x51A7_0000u32
+                .wrapping_add(1u32.wrapping_mul(0x9E37_79B1))
+                .wrapping_add(2u32.wrapping_mul(0x85EB_CA77)),
+        };
+        assert_eq!(expected.seed, 0xFBB6_0E9F, "gated seed formula drifted");
+        assert_eq!(GATED_PAPER, expected);
+        assert_eq!(PaperParams::default(), expected);
+        let Surface::Paper(p) = Surface::paper() else {
+            panic!("Surface::paper() is not Paper");
+        };
+        assert_eq!(p.params, expected);
+        assert_eq!(p.base_rgb, PAPER_STOCK);
+        // And the universal default stays honest zero.
+        assert_eq!(Surface::default(), Surface::None);
+        assert!(Surface::None.render_rgba8(8, 8).is_none());
     }
 
     /// A textured raster must actually deviate from flat — the board's cells are

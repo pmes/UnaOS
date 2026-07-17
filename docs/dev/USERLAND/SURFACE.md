@@ -1,8 +1,9 @@
 # Surface — the material layer beneath quartzite content
 
-*Status: SURFACE-1 landed at M1 (the sample board). The paper aesthetic is
-**not yet chosen** — the attended taste-gate is pending Peter's eyes on the real
-pixels. See "Taste-gate record" below.*
+*Status: SURFACE-1 complete through M2. The taste-gate **PASSED 2026-07-17**;
+the picked paper is the `Surface::Paper` default (see "Taste-gate record").
+Views still opt in explicitly — adoption stays OFF everywhere until a
+view-owner's arc.*
 
 ## What a Surface is
 
@@ -111,17 +112,46 @@ cargo run -p quartzite --example paper_board
 
 ## Taste-gate record
 
-**PENDING.** The board is runnable; Peter's attended pick (algorithm +
-parameters, in his words) will be recorded here. Until then the arc is parked at
-M1 — a valid landing (the gate is his availability, never a reason to
-self-approve). No surface is folded into the quartzite API default, and adoption
-stays OFF everywhere.
+**PASSED — 2026-07-17, attended (Peter + Maestro).**
 
-## M2 (after the pick) — the capability
+The winner: the **laid** algorithm at the board's **medium** cell —
+**amp 2.0 %, scale 4 px**, the board's laid octaves (3) and that cell's exact
+seed (`0xFBB6_0E9F` = `SEED_BASE + cell_seed(row 1, col 2)`).
 
-The picked surface becomes `Surface::Paper` in the quartzite API: views opt in
-declaratively, the text-widget path renders it under content, and the parameters
-live in one place a future theming/kit layer (retro-kits thread 2) can address.
-Default stays OFF; adopting it in tabula / midden / the chat view is a future
-arc per view-owner. Not built in this run.
+Peter's words, verbatim:
+
+> "lets default to this for now and we'll put in sliders to play with later so
+> people can dial it in or turn it off."
+
+## M2 — the capability (landed)
+
+The gated pick is encoded once, as `quartzite::surface::GATED_PAPER`:
+
+```rust
+PaperParams { algo: Laid, amplitude: 0.020, scale: 4.0, octaves: 3, seed: 0xFBB6_0E9F }
+```
+
+- **`Surface`** (re-exported as `quartzite::Surface`) is what a region declares:
+  `Surface::None` (the universal default — clean flat, the honest zero) or
+  `Surface::Paper(Paper)`.
+- **`Surface::Paper` with no explicit params IS the gated look**:
+  `Paper::default()` / `PaperParams::default()` / the `Surface::paper()`
+  shorthand all resolve to `GATED_PAPER` on the canonical `PAPER_STOCK`. Tested
+  exactly (`surface::tests::default_params_are_the_gated_pick`), and tied to the
+  board's laid/medium cell byte-for-byte
+  (`paper_board::tests::gated_default_is_the_laid_medium_cell`) so the default
+  keeps meaning the gated pixels if anything drifts.
+- **Views still opt in explicitly.** No view or vessel was rewired in this arc;
+  adopting paper in tabula / midden / the chat view is a future arc per
+  view-owner. A backend renders a declared surface via
+  `Surface::render_rgba8(w, h)` (`None` for `Surface::None` — paint clean flat).
+- **Everything stays parametric in one place** (`PaperParams`) — the hook a
+  future theming/kit layer (retro-kits thread 2) addresses.
+
+## SURFACE-2 (candidate scope — pre-registered, NOT built)
+
+Peter's "sliders to play with later", named here as the follow-on arc:
+**per-user surface settings** — dial-in controls for the paper parameters
+(amplitude/scale at minimum) **plus an off switch**, addressing `PaperParams` /
+`GATED_PAPER` as the single source. Do not build ahead of its own brief.
 

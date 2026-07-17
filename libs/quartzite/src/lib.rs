@@ -32,6 +32,7 @@ pub mod widgets;
 // Re-export specific logic types that UI might need directly
 pub use bandy::ontology::Shard;
 pub use spline::{Spline, BootstrapPayload};
+pub use surface::Surface;
 
 // -----------------------------------------------------------------------------
 // THE DIPLOMAT'S BRIDGE: NATIVE ABSTRACTIONS
