@@ -203,6 +203,16 @@ core3probe = ["pi"]
 # kernel8`. aarch64 only.
 nsspan = []
 
+# BATMON-1: the Apple SMC battery monitor (UNAOS_SMC=1). Arms the polled SMC key/value driver
+# (drivers/smc.rs) — an M1 boot scout that dumps the SMC key inventory over serial (so the first
+# attended 2012 rMBP sitting yields the real battery-key list) plus the M2 battery snapshot feeding
+# the on-screen meter. Port I/O confined to 0x300 (data) / 0x304 (command) with bounded handshakes;
+# no value-mutating WRITE_CMD. QEMU's isa-applesmc (attached by the builder under this knob) gates
+# the protocol machinery via a known-key read; battery keys are metal-first by construction.
+# x86_64-only module; default OFF => the module + every call site are unlinked and the media is
+# byte-identical. See unaos/docs/dev/OS/09_PLATFORM/smc_battery.md.
+smc = []
+
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage
 lazy_static = { version = "1.5.0", features = ["spin_no_std"] }
