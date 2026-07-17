@@ -183,11 +183,17 @@ impl Controller {
         // that (SETUP qTD stayed Active, zero error bits, wake clean). QEMU re-walks every
         // frame and masked it. So the async schedule is enabled per transfer, with bounded
         // USBSTS.ASS handshakes — the Linux ehci-hcd idiom.
+        // Probe-4 evidence line: prove the identity-map contract (virt == translate(virt)) for
+        // the QH the controller will fetch, and read back CTRLDSSEGMENT — the two mundane
+        // suspects for the probe-3 master-abort, killed or confirmed on a serial line.
+        let qh_phys = crate::arch::x86_64::memory::translate(qh as u64);
         serial_println!(
-            ":: EHCI-HID: [{}] schedules armed: framelist={:#x} asyncQH={:#x} (ASE per-transfer, PSE deferred to first HID endpoint) ::",
+            ":: EHCI-HID: [{}] schedules armed: framelist={:#x} asyncQH={:#x} translate(QH)={:#x} CTRLDSSEGMENT={:#x} (ASE per-transfer, PSE deferred to first HID endpoint) ::",
             self.idx,
             self.frame_list,
-            qh as u64
+            qh as u64,
+            qh_phys.unwrap_or(u64::MAX),
+            mmio_read32(self.op + OP_CTRLDSSEGMENT).unwrap_or(u32::MAX)
         );
     }
 
@@ -831,6 +837,72 @@ unsafe fn decode_boot_keyboard(report: &[u8]) {
     }
 }
 
+/// Probe-3/4 evidence: dump VT-d (DMAR) state, READ-ONLY. Probe 3 showed both EHCI functions'
+/// first DMA fetch master-aborting (USBSTS HSE + halt) on a freshly HCRESET controller while
+/// xHCI DMAs the same heap fine — the signature of per-function DMA blocking, i.e. an IOMMU
+/// left translating by Apple EFI (which drove the pre-boot keyboard over these very
+/// functions). This dump answers it with registers instead of a theory: DMAR present? each
+/// DRHD's translation-enable (GSTS.TES), fault status (FSTS), and any latched fault-recording
+/// entries — which name the faulting source BDF, reason, and address. Zero writes.
+unsafe fn dmar_report() {
+    let Some(dmar) = crate::arch::x86_64::acpi::find_acpi_table(b"DMAR") else {
+        serial_println!(":: EHCI-HID: DMAR: no ACPI DMAR table — VT-d not described; IOMMU theory falsified ::");
+        return;
+    };
+    let len = mmio_read32(dmar + 4).unwrap_or(0) as u64; // SDT header length
+    let haw = mmio_read32(dmar + 36).unwrap_or(0);
+    serial_println!(
+        ":: EHCI-HID: DMAR present @ {:#x} len={} host-addr-width={} flags={:#04x} ::",
+        dmar, len, (haw & 0xFF) + 1, (haw >> 8) & 0xFF
+    );
+    // Remapping structures start at offset 48: u16 type, u16 length; type 0 = DRHD with the
+    // remapping-unit register base at +8.
+    let mut off = 48u64;
+    let mut unit = 0;
+    while off + 4 <= len {
+        let head = mmio_read32(dmar + off).unwrap_or(0);
+        let (typ, slen) = (head & 0xFFFF, (head >> 16) & 0xFFFF);
+        if slen == 0 {
+            break;
+        }
+        if typ == 0 {
+            let base = (mmio_read32(dmar + off + 8).unwrap_or(0) as u64)
+                | ((mmio_read32(dmar + off + 12).unwrap_or(0) as u64) << 32);
+            let cap_lo = mmio_read32(base + 0x08).unwrap_or(0);
+            let cap_hi = mmio_read32(base + 0x0C).unwrap_or(0);
+            let gsts = mmio_read32(base + 0x1C).unwrap_or(0);
+            let fsts = mmio_read32(base + 0x34).unwrap_or(0);
+            let cap = (cap_lo as u64) | ((cap_hi as u64) << 32);
+            let fro = ((cap >> 24) & 0x3FF) * 16; // fault-recording offset, 128-bit units
+            let nfr = ((cap >> 40) & 0xFF) + 1;
+            serial_println!(
+                ":: EHCI-HID: DMAR DRHD[{}] base={:#x} GSTS={:#010x} (TES={}) FSTS={:#010x} CAP={:#018x} NFR={} ::",
+                unit, base, gsts, (gsts >> 31) & 1, fsts, cap, nfr
+            );
+            for i in 0..nfr.min(4) {
+                let fr = base + fro + i * 16;
+                let lo = (mmio_read32(fr).unwrap_or(0) as u64)
+                    | ((mmio_read32(fr + 4).unwrap_or(0) as u64) << 32);
+                let hi = (mmio_read32(fr + 8).unwrap_or(0) as u64)
+                    | ((mmio_read32(fr + 12).unwrap_or(0) as u64) << 32);
+                if hi >> 63 != 0 {
+                    let sid = hi & 0xFFFF;
+                    serial_println!(
+                        ":: EHCI-HID: DMAR DRHD[{}] FAULT[{}]: source {:02x}:{:02x}.{} reason={:#04x} addr={:#x} == witness ::",
+                        unit, i, (sid >> 8) & 0xFF, (sid >> 3) & 0x1F, sid & 0x7,
+                        (hi >> 32) & 0xFF, lo & !0xFFF
+                    );
+                }
+            }
+            unit += 1;
+        }
+        off += slen as u64;
+    }
+    if unit == 0 {
+        serial_println!(":: EHCI-HID: DMAR table has no DRHD units ::");
+    }
+}
+
 /// EHCI-3 bring-up: walk PCI for EHCI functions, run the SHARED EHCI-2 wake on each (one wake
 /// path — wake_run + wake_route from ehci_scout), arm schedules, reset + enumerate the
 /// connected root ports. Runs at PCI-init time, after the scout modes and BEFORE the PORTSW
@@ -930,6 +1002,10 @@ pub fn init() {
             }
         }
     }
+
+    // Probe-4 evidence dump: VT-d state AFTER the enumeration attempts, so any DMA fault our
+    // transfers raised is latched in the fault-recording registers (read-only).
+    unsafe { dmar_report() };
 
     let n = ctrls.len();
     let armed: usize = ctrls.iter().map(|c| c.int_eps.len()).sum();
