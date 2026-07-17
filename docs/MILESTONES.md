@@ -10,6 +10,28 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## us-videonext track — 2026-07-17 (VWIT — headless witness for the damage-tracked render path) 🔬 QEMU-green `us-videonext`
+
+### VWIT — the `Screen` present path gets an automated regression
+
+**What it does.** The video feature stack is landed + metal-confirmed, but the
+steady-state on-screen renderer — `Screen`'s damage tracking, its `flush`
+present, and `FrameBuffer`'s pixel-format encoder — had no automated regression:
+the `tste` `video.geometry` check only exercised the trait-default primitives on
+an `OffscreenPal`, and the `Screen` override was verified only *visually* by
+`vug`/the GUI console (attended). New `video/witness.rs` builds a `Screen` over a
+heap-backed offscreen `FrameBuffer` and asserts the real present path: Bgr
+byte-order decode, damage-LIMITED blit (a sentinel outside the draw bbox survives
+the flush), idempotent no-op flush, and clip safety for signed off-screen
+geometry. Registered as the `video.present` tste row; arch-neutral. Detail:
+`dev/OS/08_VIDEO/engine.md` §7.
+
+**Tested — QEMU (headless, both arches).** `./arroyo check` green x86_64 +
+aarch64. Headless x86 boot driven via `scripts/qmp_type.py --text tste` →
+`:: VWIT: render present — format=Bgr damage=OK noop=OK clip=OK ::` +
+`:: TSTE: video.present -> PASS ::` in serial.log, MISSION SUCCESS intact, 0 TSTE
+FAIL. `d9ae8ce`.
+
 ## hw-jetson track — 2026-07-17 (ORIN-SMP idle-heartbeat — parked-core pinned-bar fix) 🔬 QEMU-green, metal vug witness accruing `hw-jetson`
 
 ### ORIN-SMP idle-heartbeat — a parked-online core reads idle, not pinned

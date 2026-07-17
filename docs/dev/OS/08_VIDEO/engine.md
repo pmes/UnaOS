@@ -377,3 +377,40 @@ raw_print constraints preserved (try_lock-only, never the FBCON lock; QEMU logs 
 the UART leg already reaches `serial.log` and the ring is not replayed there). **The lesson: QEMU-visible
 ≠ metal-visible — a diagnostic must assert the console PATH it will actually reach on the target, not
 merely that its code path ran.**
+
+## 7. Headless render-path witnesses (VWIT)
+
+The two drawing primitives (§1) reach the framebuffer by two different paths, and each has its own
+`tste` regression check (`unaos/crates/kernel/src/selftest.rs`; arch-neutral, so both fire on the x86
+and aarch64 headless boots when `tste` is typed):
+
+| tste row | path exercised | where |
+|---|---|---|
+| `video.geometry` | the **trait-default** `draw_line`/`fill_triangle` (Bresenham / scanline) via `GneissPal::draw_pixel` | `OffscreenPal` (a raw heap pixel buffer) |
+| `video.present` | the **damage-tracked `Screen`** override: `mark` bbox accumulation, the `flush` present, and `FrameBuffer`'s pixel-format encoder | `video/witness.rs` (a `Screen` over a heap-backed offscreen `FrameBuffer`) |
+
+`video.present` (VWIT) exists because the `Screen`/`TargetPal` override — the **steady-state on-screen
+renderer** — was previously verified only *visually* by `vug` and the GUI console (attended). It builds
+a `Screen` over a `Vec<u8>` (passed as the surface's raw base — `FrameBuffer` holds its base as `usize`
+to stay `Send`) and asserts the real present path:
+
+- **Format decode** — a known three-distinct-channel colour lands in `Bgr` byte order (`[B,G,R,0]`) in
+  the front buffer; a raw byte-order spot-check catches an Rgb/Bgr swap the round-trip word alone would
+  hide. (The `OffscreenPal` path bypasses this encoder.)
+- **Damage-limited present** (the load-bearing assertion) — a sentinel poked into the front buffer
+  *outside* the next draw's bbox **survives** the `flush`; a disjoint `fill_rect` is presented. Proves
+  `mark`/`flush` blit only the damage rectangle, not the whole surface — the invariant `video.geometry`
+  cannot observe.
+- **No-op flush** — a second `flush` with no new damage leaves the front byte-stable (idempotent).
+- **Clip safety** — signed off-screen `draw_line`/`fill_triangle` endpoints clip in-bounds without
+  panic/overrun; the clipped line paints the on-screen span, the triangle fills a bounded interior.
+
+Serial evidence (headless-gate visible; drive `tste` with `scripts/qmp_type.py --text tste --enter`):
+
+```
+:: VWIT: render present — format=Bgr damage=OK noop=OK clip=OK ::
+:: TSTE: video.present -> PASS ::
+```
+
+These are QEMU-provable regressions only — a real GPU/present is not involved; on metal the same rows
+run under `tste` and mirror to whatever console the target exposes (§4/§6 console-path rule applies).
