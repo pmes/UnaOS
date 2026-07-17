@@ -32,6 +32,10 @@ use bandy::SMessage;
 /// The dev-tree Bolt (BOLT-1): STATUS / SNAP / SYNC of a source tree that must
 /// exist coherently on two drives, without the live-copy flip (SWITCH is arc 2).
 pub mod devtree;
+/// UnaFS-native sync (VAIRE-2): the dev-tree woven into a UnaFS v3 image as
+/// native objects (typed attrs + retained-root snapshots), instrumented as the
+/// first-class UnaFS baseline benchmark. See the module docs.
+pub mod usync;
 #[cfg(feature = "gtk4")]
 use gtk4::prelude::*;
 #[cfg(feature = "gtk4")]

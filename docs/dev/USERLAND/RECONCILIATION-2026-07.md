@@ -158,6 +158,23 @@ and wrapped with host I/O by the userspace `libs/fs/unafs`.
   measured run) is the realistic load UnaFS should be instrumented under, and the natural
   justification/vehicle for the batched-sync work that closes the ledgered ~0.7 s
   with_unafs mask.**
+
+  **arc-2 landed (VAIRE-2, hw-jetson).** The UnaFS-native Loom is implemented:
+  `vaire usync` weaves the manifest-bounded penumbra into a UnaFS v3 image as
+  native objects (K6 typed attrs per file + unit-root attrs, a `snapshot_create`
+  per completed sync, incremental size+mtime skip), and `vaire ustatus` reads it
+  back — all alongside the untouched Bolt-1 host verbs, carrying the Bolt-1
+  invariants verbatim (live tree read-only / default-deny credential floor /
+  every skip reported / symlinks never followed / dry-run default). The corollary
+  is delivered: `usync` is instrumented with the NSSPAN pattern (host-ported) and
+  its first real run IS the baseline mixed-load FS benchmark — the cold sync of
+  `~/.claude/plans/unaos` (239 files) shows the `commit` phase at 97 % of the
+  wall across 241 per-file root flips, the concrete evidence base for the
+  crate-side batched-sync work. Batched-sync finding for the ledger: whole-sync
+  single-transaction batching needs **no new UnaFS API** (autocommit-off +
+  `commit()`), but there is **no vectored/bulk write-or-create API** to cut the
+  per-object inode/dir metadata churn. Full table + finding in
+  `handlers/vaire/README.md`.
 - **stria's video half** — deferred by design (the audio-only slice was the Architect's own
   first slice), not drift.
 - The kit→vessel compiler and the elessar snapshot format — future arcs; `aule` is expected

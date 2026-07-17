@@ -99,6 +99,107 @@ the local source of truth becomes the UnaFS database, while still pushing and
 pulling to standard Git remotes for collaboration. This is multi-arc work
 sequenced behind UnaFS's own maturation (UNAFS-F1).
 
+## The UnaFS-native Loom (VAIRE-2) — `usync` / `ustatus`
+
+The Bolt-1 `sync` above is the direction ruling's *quick solution*: git mirrors
+plus penumbra copies onto another host volume. The **real** vaire
+(RECONCILIATION-2026-07, the vaire ruling) stores the managed tree as **native
+UnaFS objects** on the K-line CoW machinery — not host-fs copies. The `usync`
+verb family is that destination, running alongside the Bolt-1 host verbs (which
+stay untouched and working).
+
+- **`vaire usync [<image>] [--apply] [--size-mb <n>]`** — weave the
+  manifest-bounded penumbra (same manifest, same `ExcludeRules` default-deny
+  floor) into a UnaFS **v3** image as native objects:
+  - dirs → `mkdir`, files → `create_file` + `write_data`;
+  - **K6 typed attrs** per file: `vaire.size` (`Int`), `vaire.mtime` (`Int`),
+    `vaire.src` (`String`), `vaire.sync` (run stamp, `String`); unit-root attrs
+    (`vaire.unit` = manifest name, `vaire.githead`, `vaire.run`) plus one
+    `vaire.summary.<stamp>` per run — so **runs accrue in the image itself**;
+  - **one `snapshot_create(name=UTCstamp, creator="vaire")` at the end of every
+    completed sync** — the retained root IS the SNAP concept, natively;
+  - **incremental** on re-run: files whose `vaire.size` + `vaire.mtime` attrs
+    match the live file are skipped and counted; a changed file is unlinked and
+    rewritten CoW (grow-only `write_data` cannot shrink in place, so the rewrite
+    is exact). Reported `written / skipped / excluded`, like Bolt-1's rows.
+    One honest blind spot (the standard size+mtime limitation): mtime is stored
+    at 1-second granularity, so a size-preserving edit made within the same
+    second as the stored mtime is silently skipped on the next run.
+- **`vaire ustatus [<image>]`** — read-only: unit attrs, the snapshot index,
+  last-sync stamp, and object/byte counts vs the live tree. The image is opened
+  read-only; its bytes are never touched.
+
+**Invariants carried verbatim from Bolt-1.** The live tree is **read-only** —
+the only write surface is the UnaFS image handle; no constructor accepts a
+live-tree write path (proven by a `0o555` byte-compare test). The exclusion
+floor is the **same default-deny**: `usync` walks the penumbra through the same
+`walk_penumbra`, so credential patterns, junk pruning, and
+reported-never-followed symlinks all apply identically; every skip is counted
+and reported, never silent. **Dry-run is the DEFAULT** for `usync`; `--apply`
+is required to write. The image is an explicit argument (never a shared/fixed
+path — never `bench_vault.img`); it defaults under `~/unaos-bench/vaire/`. The
+snapshot cap (16, policy) is honored honestly: a full index is **refused** with
+a message naming the drop verb — `usync` never auto-drops a retained root. The
+cap is checked up front, before any write, so a refused run is a true no-op on
+the image (byte-identical, test-pinned).
+
+### Measured from birth — the baseline UnaFS benchmark
+
+The vaire ruling's corollary: a real dev-tree sync (hundreds of mixed-size files
++ typed metadata + journaled CoW writes in ONE measured run) is the first-class
+UnaFS baseline benchmark, and the per-phase costs are the evidence base for the
+crate-side batched-sync work that closes the ledgered ~0.7 s `with_unafs` mask
+(SECURITY.md). `usync` is instrumented with the **NSSPAN pattern** (host-ported
+from the kernel `NsSpanProbe`): per-phase `AtomicU64` accumulators folded by an
+RAII `Instant` probe over `scan / lookup / read / write / attrs / commit /
+snapshot`, plus UnaFS's own `CommitStats`. Every `usync` ends with the one-line
+benchmark ledger, persisted per run as a typed attr on the unit root.
+
+**Baseline run — `~/.claude/plans/unaos` → a fresh v3 image (239 files, 12
+dirs, 4,161,266 B; 1 junk skip).** Host context (an uncontextualized baseline is
+uninterpretable later): **MacBookPro16,1**, **macOS 26.5.2 (build 25F84)**,
+internal **APFS** volume on a **PCI-Express SSD**. Release build; run SOLO (one
+unafs-image user on the machine). Times are per-phase totals in ms.
+
+| Run | written | skipped | scan | lookup | read | write | attrs | commit | snapshot | commits | blocks | wall* |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| **cold** (fresh format) | 239 | 0 | 4.38 | 15.84 | 43.28 | 49.34 | 157.57 | 10949.77 | 46.05 | 242 | 23484 | ~11.3 s |
+| **warm** (incremental) | 0 | 239 | 6.46 | 7.48 | 0.00 | 0.00 | 19.29 | 89.29 | 47.01 | 3 | 235 | ~0.17 s |
+
+*wall = sum of the measured phases (the CLI prints the exact `BENCHMARK:`
+line). Phase coverage: `scan` = live-tree walk; `lookup` = image-side lookups
+(per-file incremental `ls`/attr reads + directory-chain resolution, which on a
+cold run folds in the fresh `mkdir`s); `write` = `create_file` + `write_data`
+(+ any stale-object unlink); `commit` = every explicit root flip, including the
+final summary commit; the reported `commits`/`blocks` cover the whole run. The
+one figure the *persisted* per-run attr cannot include is the commit that
+persists it (inherent); the CLI's `commit_stats` are refreshed after it.
+
+The headline: on the cold run the **`commit` phase is 97 % of the wall**
+(10.95 s of ~11.3 s) across **242 root flips** — one per file, the current
+batched regime (`set_autocommit(false)` + an explicit `commit()` per file).
+This is the concrete motivation for the crate-side batched-sync work: all other
+phases together are ~0.3 s; the cost is entirely the many small root-flip
+transactions. See the finding below. The warm run confirms the incremental path
+is cheap (all-skip, ~0.17 s): its measured cost is the snapshot incref walk +
+the two root flips, with the per-file image lookups (`lookup` = 7.5 ms for 239
+files) staying negligible.
+
+### Finding: batched multi-file commit vs the missing bulk-write API
+
+`usync` already batches within a file — `create_file` + `write_data` + four
+`set_attribute`s land in ONE root flip (autocommit off, one `commit()` per
+file). A whole-sync single transaction is likewise reachable today by committing
+once at the end instead of per file; **no new UnaFS API is needed** for that
+coarser batching. What does **not** exist (and is the honest batched-sync
+finding for the ledger, not a blocker for this arc) is a **vectored / bulk write
+or bulk-create API**: each file still costs an individual `create_inode` +
+`write_data` + per-attr inode rewrite, each rewriting the full inode block and
+re-serializing the parent directory. The commit-phase dominance above is a
+root-flip-count cost that whole-sync batching would collapse; a bulk API would
+additionally cut the per-object metadata churn. Neither is required to ship
+`usync` — recorded here as the evidence the corollary asked for.
+
 ## What is implemented today (STATUS / Crystal)
 
 - **The Bolt manifest** — `Manifest` registers managed units declaratively
