@@ -142,7 +142,9 @@ fn parse(rsdp_addr: u64) -> Topology {
             (rsdt_addr as u64, 4)
         };
         // Retain the root SDT so later subsystems can look up other tables by signature
-        // (read-only; first user: the EHCI-3 DMAR/VT-d evidence probe).
+        // (read-only; first user: the EHCI-3 DMAR/VT-d evidence probe). Cfg-gated so the
+        // knob-off kernel stays byte-identical to a pre-EHCI-3 build.
+        #[cfg(feature = "ehcihid")]
         SDT_ROOT.call_once(|| (sdt_addr, entry_size));
 
         match find_table(sdt_addr, entry_size, b"APIC") {
@@ -155,10 +157,12 @@ fn parse(rsdp_addr: u64) -> Topology {
     }
 }
 
+#[cfg(feature = "ehcihid")]
 static SDT_ROOT: spin::Once<(u64, usize)> = spin::Once::new();
 
 /// Find any ACPI table by 4-byte signature (after `init` has run). Read-only walk; `None`
 /// when discovery never ran or the table is absent.
+#[cfg(feature = "ehcihid")]
 pub fn find_acpi_table(sig: &[u8; 4]) -> Option<u64> {
     SDT_ROOT.get().and_then(|&(addr, sz)| unsafe { find_table(addr, sz, sig) })
 }
