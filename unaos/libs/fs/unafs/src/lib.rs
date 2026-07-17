@@ -57,7 +57,8 @@ pub use adapter::{
 };
 pub use catalog::{CatalogEntry, deserialize_catalog, serialize_catalog};
 pub use fs::{
-    CommitStats, DirEntry, ReclaimEntry, SNAPSHOT_CAP, SnapshotEntry, UnaFS, cosine_similarity,
+    BatchFile, CommitStats, DirEntry, ReclaimEntry, SNAPSHOT_CAP, SnapshotEntry, UnaFS,
+    cosine_similarity,
 };
 pub use fsck::FsckReport;
 pub use inode::{AttributeValue, Extent, ExtentList, FileKind, Inode, InodeError};

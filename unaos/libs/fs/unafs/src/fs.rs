@@ -117,6 +117,21 @@ pub struct DirEntry {
     pub kind: FileKind,
 }
 
+/// A file staged for the bulk create+write path
+/// ([`UnaFS::create_files_batch`]). Carries everything one `create_file` +
+/// `write_data` + N × `set_attribute` would, so the batch can fold them into
+/// ONE inode write per file and a single parent-directory + catalog rewrite for
+/// the whole set.
+pub struct BatchFile {
+    /// The child name under the batch's parent directory.
+    pub name: String,
+    /// The file's initial contents (empty for a zero-length file).
+    pub data: Vec<u8>,
+    /// Typed attributes to attach, indexed in the catalog exactly as
+    /// `set_attribute` would.
+    pub attributes: BTreeMap<String, AttributeValue>,
+}
+
 /// One retained root in the snapshot index (K8b populates these; the on-disk
 /// object exists — empty — from format time, so retention is a code change,
 /// never a format migration).
@@ -979,6 +994,179 @@ impl<D: BlockDevice> UnaFS<D> {
 
     pub fn create_file(&mut self, parent_id: u64, name: String) -> Result<u64, FileSystemError> {
         self.add_entry(parent_id, name, FileKind::File)
+    }
+
+    /// Bulk create+write path: stage many new files under ONE parent
+    /// directory and land them in a SINGLE transaction. This is the vectored
+    /// create/write API the VAIRE-2 baseline found missing. Where N individual
+    /// `create_file` + `write_data` + M × `set_attribute` calls each
+    /// re-serialize the parent directory and the attribute catalog and flip the
+    /// root once per file (the 242-flip cold-sync regime — 97 % of the wall),
+    /// this reads the parent directory once, folds every file's attributes into
+    /// its creation inode write, appends all catalog entries in one pass, and
+    /// rewrites the parent directory and catalog exactly ONCE.
+    ///
+    /// **Transaction shape.** Every staged create/write becomes visible
+    /// together at the batch's single commit, or none does. With autocommit ON
+    /// (default) the whole batch is one root flip; with autocommit OFF the batch
+    /// stages into the caller's larger transaction and does not commit — the way
+    /// a whole-tree sync drives many `create_files_batch` calls (one per
+    /// directory) under a single outer [`commit`](Self::commit). Either way a
+    /// power cut between staging and the flip leaves the mounted image at
+    /// exactly the last committed root.
+    ///
+    /// **Failure = unwind to the committed root.** On ANY error mid-batch (a
+    /// name collision, a full volume, an oversized inode) the whole batch is
+    /// unwound via [`Self::txn_unwind`], which reloads ground truth from the
+    /// committed root on disk — no partial file, name, or catalog entry
+    /// survives, and the allocator is poison-closed if even the reload fails
+    /// (the K8b thaw-unwind precedent). NOTE: with autocommit OFF this unwinds
+    /// the caller's ENTIRE outer transaction — everything staged since the last
+    /// commit is discarded, not just this batch. There is no partial-commit-
+    /// then-recover; a whole-tree sync that fails mid-way restarts from the
+    /// last committed root by design. A name already present in the parent, or
+    /// duplicated WITHIN the batch, fails closed with
+    /// [`FileSystemError::FileExists`]; the mounted image is a true no-op.
+    ///
+    /// **Snapshots compose.** A `snapshot_create` taken AFTER a batch retains
+    /// the whole batch (one commit = one atomic root); refcount/reclaim
+    /// accounting is identical to the per-op path because the batch drives the
+    /// same CoW primitives (`create_inode` / `write_data` / directory + catalog
+    /// rewrites) — only the transaction boundary and metadata-churn are batched.
+    ///
+    /// Every child is a `File`. Returns the new logical inode ids in the order
+    /// the files were supplied.
+    pub fn create_files_batch(
+        &mut self,
+        parent_id: u64,
+        files: Vec<BatchFile>,
+    ) -> Result<Vec<u64>, FileSystemError> {
+        let ids = match self.create_files_batch_inner(parent_id, files) {
+            Ok(ids) => ids,
+            Err(e) => {
+                self.txn_unwind();
+                return Err(e);
+            }
+        };
+        // An empty batch stages nothing — a true no-op, no root flip.
+        if ids.is_empty() {
+            return Ok(ids);
+        }
+        if let Err(e) = self.maybe_commit() {
+            self.txn_unwind();
+            return Err(e);
+        }
+        Ok(ids)
+    }
+
+    /// Stage the batch into the current transaction WITHOUT committing or
+    /// unwinding — the fallible body of [`create_files_batch`](Self::create_files_batch),
+    /// which owns the commit/unwind envelope.
+    fn create_files_batch_inner(
+        &mut self,
+        parent_id: u64,
+        files: Vec<BatchFile>,
+    ) -> Result<Vec<u64>, FileSystemError> {
+        let parent_inode = self.read_inode(parent_id)?;
+        if parent_inode.kind != FileKind::Directory {
+            return Err(FileSystemError::NotADirectory);
+        }
+
+        if files.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut entries = if parent_inode.size > 0 {
+            self.ls(parent_id)?
+        } else {
+            Vec::new()
+        };
+
+        // Read the attribute catalog ONCE; every file's attrs append to it and
+        // it is rewritten a single time below (vs the per-op path's full
+        // re-serialize per attribute).
+        let catalog_id = self.superblock.catalog_inode;
+        let mut catalog = if catalog_id != 0 {
+            let cinode = self.read_inode(catalog_id)?;
+            let cdata = self.read_data(catalog_id, 0, cinode.size)?;
+            deserialize_catalog(&cdata)?
+        } else {
+            Vec::new()
+        };
+
+        let mut new_ids = Vec::with_capacity(files.len());
+        for f in files {
+            // Collision check covers both existing names and earlier files in
+            // THIS batch (already pushed into `entries`); a hit unwinds to a
+            // true no-op via the caller.
+            if entries.iter().any(|e| e.name == f.name) {
+                return Err(FileSystemError::FileExists);
+            }
+            let id =
+                self.create_file_with_attrs_inner(&f.attributes, catalog_id, &mut catalog)?;
+            if !f.data.is_empty() {
+                self.write_data_inner(id, 0, &f.data)?;
+            }
+            entries.push(DirEntry {
+                name: f.name,
+                inode_id: id,
+                kind: FileKind::File,
+            });
+            new_ids.push(id);
+        }
+
+        // ONE parent-directory rewrite for the whole batch.
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        let dir_data = crate::codec::serialize(&entries)?;
+        self.rewrite_data_inner(parent_id, &dir_data)?;
+
+        // ONE catalog rewrite for the whole batch.
+        if catalog_id != 0 {
+            let cat_data = serialize_catalog(&catalog)?;
+            self.rewrite_data_inner(catalog_id, &cat_data)?;
+        }
+
+        Ok(new_ids)
+    }
+
+    /// Create one `File` inode with its attributes folded into a SINGLE inode
+    /// write, appending each attribute's catalog entry to `catalog` (which the
+    /// batch rewrites once). Small attributes ride inline; large ones spill to
+    /// fresh extents — the same split [`set_attribute`](Self::set_attribute)
+    /// makes. Stages only; the caller commits.
+    fn create_file_with_attrs_inner(
+        &mut self,
+        attributes: &BTreeMap<String, AttributeValue>,
+        catalog_id: u64,
+        catalog: &mut Vec<CatalogEntry>,
+    ) -> Result<u64, FileSystemError> {
+        let id = self.imap.len() as u64;
+        if (id + 1).div_ceil(IMAP_ENTRIES_PER_LEAF) > IMAP_MAX_LEAVES {
+            return Err(FileSystemError::NoSpace);
+        }
+        self.imap.push(0);
+
+        let mut inode = Inode::new(id, FileKind::File);
+        for (key, value) in attributes {
+            let is_large = match value {
+                AttributeValue::Vector(v) => v.len() > 64, // > 256 bytes
+                AttributeValue::Blob(b) => b.len() > 256,
+                AttributeValue::String(s) => s.len() > 256,
+                _ => false,
+            };
+            if is_large {
+                let data = crate::codec::serialize(value)?;
+                let extents = self.allocate_and_write_extents(&data)?;
+                inode.large_attributes.insert(key.clone(), extents);
+            } else {
+                inode.attributes.insert(key.clone(), value.clone());
+            }
+            if catalog_id != 0 {
+                catalog.push(CatalogEntry::new(key, value, id));
+            }
+        }
+        self.write_inode(&inode)?;
+        Ok(id)
     }
 
     /// Resolves a path string to an Inode ID.

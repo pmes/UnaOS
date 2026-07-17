@@ -17,8 +17,10 @@
 use anyhow::{Context, Result};
 use bandy::{BandyMember, SMessage};
 use clap::{Parser, Subcommand};
+use std::collections::BTreeMap;
 use std::path::Path;
-use unafs::{FileDevice, FileSystem, parse_value};
+use std::time::Instant;
+use unafs::{AttributeValue, BatchFile, FileDevice, FileSystem, parse_value};
 
 #[derive(Parser)]
 #[command(name = "unafs")]
@@ -132,6 +134,24 @@ enum Commands {
         #[arg(short, long, default_value = "unafs.img")]
         img: String,
     },
+    /// UNAFS-BATCH before/after: sync a real directory tree TWO ways into
+    /// fresh throwaway v3 images — the per-op regime (vaire's control: one
+    /// root flip per file) and the bulk create+write path
+    /// (`create_files_batch`, one flip for the whole tree) — and print the
+    /// per-phase / flip-count / wall table for each, cold then warm. Isolates
+    /// the single variable (per-op vs batch) on identical hardware and load.
+    /// The two images are throwaway and use caller-supplied paths (never a
+    /// shared/fixed bench image).
+    BenchBatch {
+        /// The source directory tree to sync (a real mixed-file load).
+        source: String,
+        /// Directory to write the two throwaway bench images into.
+        #[arg(long, default_value = ".")]
+        out_dir: String,
+        /// Size of each throwaway image, MB.
+        #[arg(long, default_value = "512")]
+        size_mb: u64,
+    },
     /// One-way migration of a pre-K8 (version 2) volume into the K8
     /// copy-on-write format: walks the old tree read-only and replays it
     /// (names, data, attributes) into a freshly formatted K8 image.
@@ -144,6 +164,364 @@ enum Commands {
         #[arg(short, long)]
         size_mb: Option<u64>,
     },
+}
+
+// =============================================================================
+// UNAFS-BATCH before/after harness (bench-batch)
+// =============================================================================
+
+/// One file to sync: its name, bytes, and the size/mtime the incremental
+/// (warm) path keys on.
+struct FilePlan {
+    name: String,
+    data: Vec<u8>,
+    size: i64,
+    mtime: i64,
+    src: String,
+}
+
+/// One directory in the plan: its path components relative to the sync root
+/// (empty == the root itself) and the files directly inside it. Parent-first
+/// order is guaranteed by the scan so a directory's parent always exists first.
+struct DirPlan {
+    path: Vec<String>,
+    files: Vec<FilePlan>,
+}
+
+/// Coarse per-phase wall (ms) for one sync run, plus the flip/block ledger.
+#[derive(Default)]
+struct RunReport {
+    files: usize,
+    dirs: usize,
+    scan_ms: f64,
+    build_ms: f64,
+    commit_ms: f64,
+    commits: u64,
+    blocks: u64,
+    wall_ms: f64,
+}
+
+fn ms(d: std::time::Duration) -> f64 {
+    d.as_secs_f64() * 1000.0
+}
+
+/// Walk `root` into a parent-first `Vec<DirPlan>`. Symlinks are not followed
+/// (mirrors the vaire penumbra rule); this is a benchmark load, not a security
+/// boundary, so no exclusion floor — the caller points it at a clean tree.
+fn scan_tree(root: &Path) -> Result<Vec<DirPlan>> {
+    let mut out: Vec<DirPlan> = Vec::new();
+    // BFS keeps parents strictly before children.
+    let mut queue: std::collections::VecDeque<(std::path::PathBuf, Vec<String>)> =
+        std::collections::VecDeque::new();
+    queue.push_back((root.to_path_buf(), Vec::new()));
+
+    while let Some((host_dir, rel)) = queue.pop_front() {
+        let mut files = Vec::new();
+        let mut subdirs = Vec::new();
+        for entry in std::fs::read_dir(&host_dir)
+            .with_context(|| format!("read_dir {}", host_dir.display()))?
+        {
+            let entry = entry?;
+            let ft = entry.file_type()?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            if ft.is_symlink() {
+                continue; // never followed
+            }
+            let path = entry.path();
+            if ft.is_dir() {
+                let mut child_rel = rel.clone();
+                child_rel.push(name);
+                subdirs.push((path, child_rel));
+            } else if ft.is_file() {
+                let meta = std::fs::metadata(&path)?;
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                let data = std::fs::read(&path)?;
+                files.push(FilePlan {
+                    name,
+                    size: data.len() as i64,
+                    mtime,
+                    src: path.to_string_lossy().to_string(),
+                    data,
+                });
+            }
+        }
+        files.sort_by(|a, b| a.name.cmp(&b.name));
+        out.push(DirPlan {
+            path: rel,
+            files,
+        });
+        subdirs.sort_by(|a, b| a.1.cmp(&b.1));
+        for s in subdirs {
+            queue.push_back(s);
+        }
+    }
+    Ok(out)
+}
+
+/// The four K6 typed attrs vaire attaches per file (the per-op cost the batch
+/// path folds into one inode write).
+fn file_attrs(f: &FilePlan, stamp: &str) -> Vec<(String, AttributeValue)> {
+    vec![
+        ("vaire.size".to_string(), AttributeValue::Int(f.size)),
+        ("vaire.mtime".to_string(), AttributeValue::Int(f.mtime)),
+        (
+            "vaire.src".to_string(),
+            AttributeValue::String(f.src.clone()),
+        ),
+        (
+            "vaire.sync".to_string(),
+            AttributeValue::String(stamp.to_string()),
+        ),
+    ]
+}
+
+/// Create the throwaway image file and format a fresh v3 filesystem on it.
+fn fresh_image(path: &Path, size_mb: u64) -> Result<FileSystem> {
+    let file = std::fs::File::create(path)
+        .with_context(|| format!("create bench image {}", path.display()))?;
+    file.set_len(size_mb * 1024 * 1024)?;
+    let device = FileDevice::open(path).context("open bench device")?;
+    let fs = FileSystem::format(device, size_mb).context("format bench image")?;
+    Ok(fs)
+}
+
+/// Resolve a directory plan's parent id from a path→id map (parent-first order
+/// guarantees the parent is present).
+fn dir_ids_for<'a>(plan: &'a DirPlan, ids: &BTreeMap<Vec<String>, u64>) -> (u64, &'a str) {
+    if plan.path.is_empty() {
+        return (0, ""); // handled specially by the caller (root)
+    }
+    let parent = &plan.path[..plan.path.len() - 1];
+    let parent_id = *ids.get(parent).expect("parent created first");
+    (parent_id, plan.path.last().unwrap())
+}
+
+/// COLD sync via the per-op regime (the control): every directory is its own
+/// commit, and every file is create+write+4×set_attribute in ONE commit
+/// (autocommit off + one explicit commit per file) — vaire's current 242-flip
+/// regime.
+fn sync_cold_perop(fs: &mut FileSystem, plan: &[DirPlan], stamp: &str) -> Result<RunReport> {
+    let mut r = RunReport::default();
+    let root_id = fs.superblock.root_inode;
+    let mut ids: BTreeMap<Vec<String>, u64> = BTreeMap::new();
+    ids.insert(Vec::new(), root_id);
+    fs.set_autocommit(false);
+    let wall = Instant::now();
+
+    for dir in plan {
+        let dir_id = if dir.path.is_empty() {
+            root_id
+        } else {
+            let (parent_id, name) = dir_ids_for(dir, &ids);
+            let t = Instant::now();
+            let id = fs.mkdir(parent_id, name.to_string())?;
+            r.build_ms += ms(t.elapsed());
+            let t = Instant::now();
+            fs.commit()?;
+            r.commit_ms += ms(t.elapsed());
+            r.dirs += 1;
+            id
+        };
+        ids.insert(dir.path.clone(), dir_id);
+
+        for f in &dir.files {
+            let t = Instant::now();
+            let fid = fs.create_file(dir_id, f.name.clone())?;
+            if !f.data.is_empty() {
+                fs.write_data(fid, 0, &f.data)?;
+            }
+            for (k, v) in file_attrs(f, stamp) {
+                fs.set_attribute(fid, k, v)?;
+            }
+            r.build_ms += ms(t.elapsed());
+            let t = Instant::now();
+            fs.commit()?;
+            r.commit_ms += ms(t.elapsed());
+            r.files += 1;
+        }
+    }
+
+    fs.set_autocommit(true);
+    r.wall_ms = ms(wall.elapsed());
+    let cs = fs.commit_stats();
+    r.commits = cs.commits;
+    r.blocks = cs.blocks_written;
+    Ok(r)
+}
+
+/// COLD sync via the bulk create+write path: the whole tree is staged
+/// (autocommit off — every mkdir and `create_files_batch` stages only) and
+/// committed ONCE at the end. One root flip for the entire tree.
+fn sync_cold_batch(fs: &mut FileSystem, plan: &[DirPlan], stamp: &str) -> Result<RunReport> {
+    let mut r = RunReport::default();
+    let root_id = fs.superblock.root_inode;
+    let mut ids: BTreeMap<Vec<String>, u64> = BTreeMap::new();
+    ids.insert(Vec::new(), root_id);
+    fs.set_autocommit(false);
+    let wall = Instant::now();
+
+    for dir in plan {
+        let dir_id = if dir.path.is_empty() {
+            root_id
+        } else {
+            let (parent_id, name) = dir_ids_for(dir, &ids);
+            let t = Instant::now();
+            let id = fs.mkdir(parent_id, name.to_string())?;
+            r.build_ms += ms(t.elapsed());
+            r.dirs += 1;
+            id
+        };
+        ids.insert(dir.path.clone(), dir_id);
+
+        if dir.files.is_empty() {
+            continue;
+        }
+        let batch: Vec<BatchFile> = dir
+            .files
+            .iter()
+            .map(|f| BatchFile {
+                name: f.name.clone(),
+                data: f.data.clone(),
+                attributes: file_attrs(f, stamp).into_iter().collect(),
+            })
+            .collect();
+        r.files += batch.len();
+        let t = Instant::now();
+        fs.create_files_batch(dir_id, batch)?;
+        r.build_ms += ms(t.elapsed());
+    }
+
+    // The single whole-tree flip.
+    let t = Instant::now();
+    fs.commit()?;
+    r.commit_ms += ms(t.elapsed());
+    fs.set_autocommit(true);
+    r.wall_ms = ms(wall.elapsed());
+    let cs = fs.commit_stats();
+    r.commits = cs.commits;
+    r.blocks = cs.blocks_written;
+    Ok(r)
+}
+
+/// WARM (incremental) re-sync: re-mount the just-built image and re-walk the
+/// plan, skipping every file whose stored `vaire.size` + `vaire.mtime` still
+/// match the live file (the all-skip case that dominates a real warm run).
+/// Measures the lookup-bound incremental cost + one final commit.
+fn sync_warm(fs: &mut FileSystem, plan: &[DirPlan]) -> Result<(RunReport, usize)> {
+    let mut r = RunReport::default();
+    let mut skipped = 0usize;
+    fs.set_autocommit(false);
+    let wall = Instant::now();
+
+    for dir in plan {
+        let prefix = if dir.path.is_empty() {
+            String::from("/")
+        } else {
+            format!("/{}", dir.path.join("/"))
+        };
+        for f in &dir.files {
+            let vault_path = if prefix == "/" {
+                format!("/{}", f.name)
+            } else {
+                format!("{}/{}", prefix, f.name)
+            };
+            let t = Instant::now();
+            let id = fs.resolve_path(&vault_path)?;
+            let size = fs.get_attribute(id, "vaire.size")?;
+            let mtime = fs.get_attribute(id, "vaire.mtime")?;
+            r.build_ms += ms(t.elapsed());
+            if size == Some(AttributeValue::Int(f.size))
+                && mtime == Some(AttributeValue::Int(f.mtime))
+            {
+                skipped += 1;
+            }
+            r.files += 1;
+        }
+    }
+    let t = Instant::now();
+    fs.commit()?;
+    r.commit_ms += ms(t.elapsed());
+    fs.set_autocommit(true);
+    r.wall_ms = ms(wall.elapsed());
+    let cs = fs.commit_stats();
+    r.commits = cs.commits;
+    r.blocks = cs.blocks_written;
+    Ok((r, skipped))
+}
+
+fn print_report(label: &str, r: &RunReport) {
+    println!(
+        "  {:<22} files={:<5} dirs={:<4} scan={:>8.2} build={:>9.2} commit={:>10.2} \
+         flips={:<6} blocks={:<7} wall={:>10.2}",
+        label, r.files, r.dirs, r.scan_ms, r.build_ms, r.commit_ms, r.commits, r.blocks, r.wall_ms
+    );
+}
+
+fn run_bench_batch(source: &str, out_dir: &str, size_mb: u64) -> Result<()> {
+    let root = Path::new(source);
+    anyhow::ensure!(root.is_dir(), "source '{}' is not a directory", source);
+    let out = Path::new(out_dir);
+    std::fs::create_dir_all(out).context("create out_dir")?;
+    let perop_img = out.join("bench-batch-perop.img");
+    let batch_img = out.join("bench-batch-batch.img");
+    let stamp = "bench-batch-run";
+
+    // Shared scan (one walk of the tree; both modes sync the same plan).
+    let t = Instant::now();
+    let plan = scan_tree(root)?;
+    let scan_ms = ms(t.elapsed());
+    let n_files: usize = plan.iter().map(|d| d.files.len()).sum();
+    let n_dirs = plan.iter().filter(|d| !d.path.is_empty()).count();
+    let n_bytes: usize = plan.iter().flat_map(|d| &d.files).map(|f| f.data.len()).sum();
+
+    println!("UNAFS-BATCH before/after — source '{}'", source);
+    println!(
+        "  load: {} files, {} dirs, {} bytes; images {} MB each (throwaway)",
+        n_files, n_dirs, n_bytes, size_mb
+    );
+    println!("  scan (shared): {:.2} ms\n", scan_ms);
+
+    // --- COLD, per-op control ---
+    let mut fp = fresh_image(&perop_img, size_mb)?;
+    let mut rp = sync_cold_perop(&mut fp, &plan, stamp)?;
+    rp.scan_ms = scan_ms;
+    anyhow::ensure!(fp.fsck(false)?.is_clean(), "per-op cold image not fsck-clean");
+
+    // --- COLD, batch ---
+    let mut fb = fresh_image(&batch_img, size_mb)?;
+    let mut rb = sync_cold_batch(&mut fb, &plan, stamp)?;
+    rb.scan_ms = scan_ms;
+    anyhow::ensure!(fb.fsck(false)?.is_clean(), "batch cold image not fsck-clean");
+
+    println!("COLD (fresh format):");
+    print_report("per-op (control)", &rp);
+    print_report("batch", &rb);
+
+    // --- WARM (incremental all-skip) on each just-built image ---
+    drop(fp);
+    drop(fb);
+    let mut fp2 = FileSystem::mount(FileDevice::open(&perop_img)?)?;
+    let (rp_warm, sp) = sync_warm(&mut fp2, &plan)?;
+    anyhow::ensure!(fp2.fsck(false)?.is_clean(), "per-op warm image not fsck-clean");
+    let mut fb2 = FileSystem::mount(FileDevice::open(&batch_img)?)?;
+    let (rb_warm, sb) = sync_warm(&mut fb2, &plan)?;
+    anyhow::ensure!(fb2.fsck(false)?.is_clean(), "batch warm image not fsck-clean");
+
+    println!("\nWARM (incremental, all-skip):");
+    print_report(&format!("per-op ({sp} skip)"), &rp_warm);
+    print_report(&format!("batch ({sb} skip)"), &rb_warm);
+
+    println!(
+        "\nHeadline: cold commit-phase {:.0} ms across {} flips (per-op) -> {:.0} ms across {} flips (batch).",
+        rp.commit_ms, rp.commits, rb.commit_ms, rb.commits
+    );
+    println!("Images left at:\n  {}\n  {}", perop_img.display(), batch_img.display());
+    Ok(())
 }
 
 /// Split a vault path into (parent path, entry name). "/a/b/c" -> ("/a/b", "c").
@@ -428,6 +806,13 @@ async fn main() -> Result<()> {
                 "✅ [OPERATOR] dropped snapshot generation {} (blocks reclaimed) on '{}'",
                 generation, img
             );
+        }
+        Commands::BenchBatch {
+            source,
+            out_dir,
+            size_mb,
+        } => {
+            run_bench_batch(source, out_dir, *size_mb)?;
         }
         Commands::Migrate { from, to, size_mb } => {
             println!("⚡ [OPERATOR] Migrating pre-K8 vault '{}' → K8 '{}'...", from, to);
