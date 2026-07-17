@@ -48,7 +48,7 @@ SUCCESS ✅. Full table + finding in `handlers/vaire/README.md`. Commit(s) on hw
 
 ## hw-pi4 track — 2026-07-16 (K8b — retained roots / snapshots + reclamation) 🔬
 
-### K8b — snapshots (retained roots) + eager reclamation 🔬 QEMU-green (MBENCH 44/44, 0 forbidden), metal pending
+### K8b — snapshots (retained roots) + eager reclamation ✅✅ METAL-CONFIRMED 2026-07-17 (attended sitting, single boot, 32 GB card: MBENCH 44/44 + 0 forbidden on silicon — K8b-snap [w=0x7f] snapshot isolation byte-verified after live overwrite, retention-safe alloc, drop reclaims, power-cut-mid-drain converges; K8a-cow re-held; log pi-serial-2026-07-17-k8b-sitting.log)
 
 **What it does.** ROADMAP §2 K8 line, arc 2 (design authority: the K8 CoW design pass, Peter's
 verdicts V1–V3). A snapshot is a RETAINED ROOT: `snapshot_create` records a generation-stamped

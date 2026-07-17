@@ -429,8 +429,9 @@ The UNAFS-K3 mount became read-WRITE at K4: `fs/unafs.rs`'s `write_sector` route
   POWER CUT MID-DRAIN (the enqueue-only half + a genuine remount) converges (the queue resumes and
   empties on the next mount). Self-cleaning. Host twins in `unafs/tests/snapshot_logic.rs` add the
   tight-volume no-reuse pressure test, the two-snapshots-share-blocks / drop-one-keeps-the-other
-  case, the cap-16 refusal, and the owner-or-kernel authority matrix. QEMU-proven via `if=sd`
-  write-back; the metal proof rides the next attended Pi bench.
+  case, the cap-16 refusal, and the owner-or-kernel authority matrix. ✅✅ METAL-CONFIRMED
+  2026-07-17 (attended sitting, single boot: 44/44 + 0 forbidden on silicon, K8b-snap
+  [w=0x7f] incl. the power-cut-mid-drain convergence leg).
 - **K8b dual-lens review ledger (2026-07-16 — zero surviving must-fix after a THREE-PASS
   fix-verify loop; the loop's history is itself the security story).** Lens A's initial
   should-fix (a NoSpace-failing `snapshot_create` stranded its tree-wide increfs — in-RAM
