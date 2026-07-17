@@ -4676,6 +4676,48 @@ test-arm 40` = 3/3 secondaries + idle + busy heartbeat PASS + **VUG-HONESTY witn
 compiles the shared `refresh`; `vug` runs only on the GUI, so headless x86 is untouched).
 ---
 
+### ORIN-SMP-DEFAULT — the 6-core bring-up is now the tegra DEFAULT (`UNAOS_NOTEGRASMP` opt-out)
+
+Three rounds of SMP work — §ORIN-SMP-1..8 (entry shape, concurrency, wake position, image layout,
+idle/busy heartbeats, count-based determinism) — are all proven, yet the shipping Orin image ran
+workers on the boot core only because the real kick-off was gated behind the opt-*in*
+`UNAOS_TEGRASMP=1`. This arc promotes the kick-off to the tegra **default** and turns the knob into an
+opt-*out*, mirroring the PORTSW-1/SMOLNET default-ON/negative-knob policy.
+
+**What changed — build scripts only; no kernel source, no scheduler logic.** The `tegrasmp` cfg
+already fully gates the kick-off (`smp_virt.rs::start_secondaries_tegra` + the `fdt_tegra` `/cpus`
+enumerator, §ORIN-SMP-3), so the promotion is entirely a matter of *which features the build pushes*:
+
+- **`unaos/arroyo`.** Any tegra build now arms `tegrasmp` by default: the `esp-jetson` target (which
+  force-adds `tegra`) also force-adds `tegrasmp` unless opted out, and a `UNAOS_TEGRA=1` build adds
+  `tegrasmp` unless opted out. `UNAOS_NOTEGRASMP=1` suppresses the push → the tegra image runs
+  boot-core-only, byte-identical to the pre-flip baseline. `UNAOS_TEGRASMP=1` still arms it explicitly
+  (back-compat; byte-identical to the new default).
+- **`unaos/builder/src/main.rs`.** Parity mapping only — the x86_64 builder never produces aarch64
+  tegra media (arroyo's `esp-jetson` does), so it maps the explicit `UNAOS_TEGRASMP=1` knob for
+  sync-completeness; `UNAOS_NOTEGRASMP` is a no-op there.
+- **`unaos/crates/kernel/Cargo.toml`.** `tegrasmp = ["tegra"]` unchanged; the doc comment records the
+  default-on policy.
+
+**Byte-identity (proven, not claimed).** Because the change only remaps env→features and the kernel
+source is untouched, the new default's ELF is byte-identical to a pre-arc `UNAOS_TEGRASMP=1` build, and
+the `UNAOS_NOTEGRASMP=1` opt-out is byte-identical to the pre-arc default. Verified in-tree at this
+arc: default `esp-jetson` and explicit `UNAOS_TEGRASMP=1 esp-jetson` produce the same `kernel.elf`
+(`sha256 bde59b4f…`); the `UNAOS_NOTEGRASMP=1` opt-out is the distinct boot-core-only baseline
+(`sha256 cb7df0a4…`), `tegra:` count 109, zero `ORIN-SMP-3` strings.
+
+**Gates green:** `./arroyo check` both arches × {default, `UNAOS_NOTEGRASMP=1`, `UNAOS_TEGRA=1`};
+`./arroyo test-arm` MISSION SUCCESS (virt unaffected — tegrasmp is tegra-only, never on the virt
+board); `UNAOS_GICV3=1 ./arroyo test-arm` CAPSTONE 6/6 + idle + busy heartbeat PASS + VUG-HONESTY
+witness PASS (workers on the real virt secondaries by default, independent of the tegra flip);
+`./arroyo kernel8-test` 43 PASS / 0 FAIL (Pi unaffected — a tegra-only default flip).
+
+**Not the stick default yet.** Per the §ORIN-SMP-7-addendum standing rule, a tegra image becomes the
+metal boot-stick default only after a clean multi-boot metal record. The staged candidate is a
+`DEFAULT-CANDIDATE pending metal record`; this arc ends at staging + the sitting note, and does **not**
+declare it the stick default. (The xHCI-takeover wall of §JETSON-XCARVE is image-layout-sensitive; a
+new default layout may sample it — that is expected wall data, not an arc failure. QEMU cannot fire it.)
+
 ## PI-V3D — VideoCore VI (V3D 4.2) GPU foundation on the Pi 4 (Arc PI-V3D-1)
 
 The first GPU silicon UnaOS touches. The target is **not** a triangle: it proves the full

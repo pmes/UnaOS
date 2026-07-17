@@ -99,11 +99,16 @@ _feats=""
 # image — the record echoes the live SEL so the operator can verify which experiment ran. Default
 # OFF; when unset the feature vanishes and the tegra image is byte-identical to baseline.
 [ -n "${UNAOS_SMPPROBE:-}" ] && _feats="${_feats}smpprobe,"
-# ORIN-SMP-3: UNAOS_TEGRASMP=1 arms the real 6-core Orin SMP kick-off (tegra-only;
-# arch/aarch64/smp_virt.rs::start_secondaries_tegra + the fdt_tegra `/cpus` presence enumerator).
-# Default OFF; when unset the feature (and the kick-off) vanish and the tegra image is byte-identical
-# to baseline. The `tegrasmp` feature implies `tegra`. See arch_arm64.md §ORIN-SMP-3.
+# ORIN-SMP-DEFAULT: the real 6-core Orin SMP kick-off (arch/aarch64/smp_virt.rs::start_secondaries_tegra
+# + the fdt_tegra `/cpus` presence enumerator) is DEFAULT-ON for tegra builds — metal-proven across
+# SMP-1..8 (entry shape, concurrency, position, image layout, idle/busy heartbeats, count-based
+# determinism). Any tegra build (UNAOS_TEGRA=1, or the `esp-jetson` target which forces tegra) arms
+# `tegrasmp` UNLESS opted out with UNAOS_NOTEGRASMP=1, which drops the kick-off => the tegra image runs
+# workers on the boot core only, byte-identical to the pre-flip baseline. UNAOS_TEGRASMP=1 still arms it
+# explicitly (back-compat, byte-identical to the new default). The `tegrasmp` feature implies `tegra`.
+# Mirrors the PORTSW-1/SMOLNET default-ON/negative-knob policy. See arch_arm64.md §ORIN-SMP.
 [ -n "${UNAOS_TEGRASMP:-}" ] && _feats="${_feats}tegrasmp,tegra,"
+[ -n "${UNAOS_TEGRA:-}" ] && [ -z "${UNAOS_NOTEGRASMP:-}" ] && _feats="${_feats}tegrasmp,tegra,"
 # JETSON-XCARVE M2: UNAOS_XCARVE=1 arms the inherited-xHCI-pointer instrumentation
 # (arch/aarch64/xusb_tegra.rs::jbxc_inherited_dump), fired at the top of jb2b_attach BEFORE the
 # no-HCRST takeover overwrites the inherited DCBAAP/CRCR/ERST. The `xcarve` feature implies `tegra`.
@@ -558,6 +563,14 @@ esp_jetson() {
         *",tegra,"*) ;;
         *) _feats="${_feats}tegra,"; KERNEL_FEATURES="--features ${_feats%,}" ;;
     esac
+    # ORIN-SMP-DEFAULT: the 6-core SMP kick-off is default-on for the jetson image (opt out with
+    # UNAOS_NOTEGRASMP=1 => boot-core-only, byte-identical to the pre-flip baseline). Idempotent.
+    if [ -z "${UNAOS_NOTEGRASMP:-}" ]; then
+        case ",${_feats}" in
+            *",tegrasmp,"*) ;;
+            *) _feats="${_feats}tegrasmp,"; KERNEL_FEATURES="--features ${_feats%,}" ;;
+        esac
+    fi
     echo -e "${COLOR_YELLOW}⚡ kernel features (jetson): ${_feats%,}${COLOR_RESET}"
     prepare_aarch64
     echo -e "${COLOR_GREEN}✅ Jetson ESP (tegra): ${ESP_DIR_ARM}${COLOR_RESET}"

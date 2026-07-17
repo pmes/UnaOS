@@ -99,6 +99,12 @@ fn main() {
     // aarch64; the numeric value selects the experiment via option_env). Mapped here for parity with
     // arroyo's feature list, though this x86_64 builder never produces the aarch64 tegra media.
     if std::env::var("UNAOS_SMPPROBE").is_ok() { feats.push("smpprobe"); }
+    // ORIN-SMP-DEFAULT: the real 6-core Orin SMP kick-off is DEFAULT-ON for tegra builds (opt out with
+    // UNAOS_NOTEGRASMP=1). `tegrasmp` implies the aarch64 `tegra` board feature; this x86_64 builder
+    // never produces aarch64 tegra media (arroyo's esp-jetson does, where the default-on lives), so this
+    // maps the EXPLICIT UNAOS_TEGRASMP=1 knob for parity only. UNAOS_NOTEGRASMP is a no-op here (nothing
+    // to suppress on x86 media). Kept in sync with arroyo's mapping.
+    if std::env::var("UNAOS_TEGRASMP").is_ok() { feats.push("tegrasmp"); }
     if !feats.is_empty() {
         let list = feats.join(",");
         kernel_cmd.arg("--features").arg(&list);
