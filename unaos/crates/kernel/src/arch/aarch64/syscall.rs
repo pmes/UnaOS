@@ -14167,6 +14167,14 @@ fn nsspan_report() {
         NSSPAN_GROW.load(Ordering::Relaxed),
         super::timer::cntfrq(),
     );
+    // K9-MASKCUT: the QEMU-provable half — root FLIPS and BLOCKS written by a SINGLE ACL row persist
+    // (worst across the K3/K5 fixtures). Staged-batch adoption drops flips to 1 per persist; the pre-K9
+    // per-op regime flipped once per attribute. Unlike the tick span (TCG-blind), this count is exact.
+    serial_println!(
+        ":: NS-SPAN-K9: single ACL row persist (staged batch) worst flips={} blocks={} — one root flip per persist vs the pre-K9 per-attribute regime ::",
+        crate::fs::unafs::ACL_PERSIST_FLIPS.load(Ordering::Relaxed),
+        crate::fs::unafs::ACL_PERSIST_BLOCKS.load(Ordering::Relaxed),
+    );
 }
 
 
