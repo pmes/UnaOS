@@ -53,6 +53,11 @@ const CMD_GET_KEY_BY_INDEX: u8 = 0x12;
 const ST_MASK: u8 = 0x0f;
 const ST_CMD_DONE: u8 = 0x00;
 const ST_DATA_READY: u8 = 0x01;
+/// BUSY (0x02): the real Apple SMC raises this while it shifts the next value byte into the 0x300
+/// data register — DATA_READY momentarily de-asserts under it. The inter-byte drain waits for BUSY
+/// to clear before re-inspecting DATA_READY (GAP-1 fix). QEMU's `isa-applesmc` never sets it, so the
+/// wait is a no-op there and the emulated drain is byte-identical.
+const ST_BUSY: u8 = 0x02;
 const ST_ACK: u8 = 0x04;
 const ST_NEW_CMD: u8 = 0x08;
 /// Expected status after a command byte: NEW_CMD|ACK.
@@ -116,10 +121,56 @@ fn wait_status(want: u8, step: u8) -> Result<(), SmcError> {
     }
 }
 
+/// Wait (bounded) until BUSY clears between value bytes (GAP-1 fix). On the real Apple SMC the
+/// controller raises BUSY (0x02) while it shifts the next value byte into 0x300, momentarily
+/// de-asserting DATA_READY; the inter-byte drain must let BUSY settle before it re-reads DATA_READY,
+/// otherwise it mistakes the shift gap for end-of-value and truncates. QEMU never sets BUSY, so this
+/// returns on the first status read there — the emulated drain is byte-identical. Bounded by the
+/// same `rdtsc` budget as every other handshake; a genuine per-byte wedge yields `Stuck(step)`.
+fn wait_busy_clear(step: u8) -> Result<(), SmcError> {
+    let start = crate::arch::now_cycles();
+    loop {
+        if read_status() & ST_BUSY == 0 {
+            return Ok(());
+        }
+        if crate::arch::now_cycles().wrapping_sub(start) >= SMC_WAIT_CYCLES {
+            return Err(SmcError::Stuck(step));
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// Belt-and-suspenders idle-guard (GAP-2 fix, M2). M1's full inter-byte drain already leaves the SMC
+/// idle (status = CMD_DONE) between transactions, so a fresh command's step-0 `NEW_CMD|ACK` wait
+/// starts clean. As defence-in-depth against any residue left by an interrupted or truncated prior
+/// read, this runs before each command byte: while the status still shows DATA_READY or BUSY set (a
+/// stale partial read), it drains one leftover data byte at a time — a read of 0x300, the read
+/// protocol's own cursor-advance, not a new write surface — under the bounded `rdtsc` budget, then
+/// returns. On an idle SMC — always the case on QEMU between transactions — the very first status
+/// read shows neither bit set, the loop body never runs, and no data byte is read: byte-behaviour-
+/// identical (no port write, no extra data read). The deadline keeps it finite even if a wedged SMC
+/// never settled; the command's own step-0 wait remains the real guard past that.
+fn settle_before_command() {
+    let start = crate::arch::now_cycles();
+    while read_status() & (ST_DATA_READY | ST_BUSY) != 0 {
+        if read_status() & ST_DATA_READY != 0 {
+            let _ = read_data(); // drain a stale value byte to unstick the previous transaction
+        }
+        if crate::arch::now_cycles().wrapping_sub(start) >= SMC_WAIT_CYCLES {
+            break; // bounded — never spin forever; step-0's NEW_CMD|ACK wait still guards
+        }
+        core::hint::spin_loop();
+    }
+}
+
 /// Read the value of a 4-character key into `out`, returning the number of bytes read (up to
 /// `out.len()`). The classic Apple SMC READ handshake: command 0x10, four key bytes, one length
 /// byte, then value bytes while `DATA_READY` holds.
 pub fn read_key(key: &[u8; 4], out: &mut [u8]) -> Result<usize, SmcError> {
+    // 0) settle any residue from a prior (interrupted) transaction so step-0 starts clean (M2
+    //    idle-guard). No-op on an idle SMC — byte-identical on QEMU.
+    settle_before_command();
+
     // 1) command byte -> expect NEW_CMD|ACK.
     write_cmd(CMD_READ);
     wait_status(ST_AFTER_CMD, 0)?;
@@ -147,11 +198,19 @@ pub fn read_key(key: &[u8; 4], out: &mut [u8]) -> Result<usize, SmcError> {
         core::hint::spin_loop();
     }
 
-    // 4) drain value bytes while DATA_READY holds (the SMC clears it after the last byte).
+    // 4) drain value bytes (GAP-1 fix). Between bytes the real SMC momentarily de-asserts
+    //    DATA_READY and raises BUSY while it shifts the next byte into 0x300, so per byte we first
+    //    wait for BUSY to clear, then inspect DATA_READY: set => one more value byte; clear => the
+    //    SMC has signalled end-of-value. Termination comes from the SMC's done-signal, NOT
+    //    `out.len()`, so an oversized buffer (REV into `present`'s buf[8], the 32-byte scout buffer)
+    //    still returns the true length (6 for REV) with no spurious Stuck. `out.len()` is only the
+    //    safety cap that prevents writing past the caller's buffer. QEMU never raises BUSY and holds
+    //    DATA_READY across all `len` bytes, so this drains byte-identically there.
     let mut n = 0;
     while n < out.len() {
+        wait_busy_clear(3)?;
         if read_status() & ST_DATA_READY == 0 {
-            break; // SMC returned fewer bytes than requested (real key length < out.len())
+            break; // end-of-value signalled by the SMC (real key length < out.len())
         }
         out[n] = read_data();
         n += 1;
@@ -168,6 +227,9 @@ pub fn present() -> bool {
 /// Read one key at `index` via GET_KEY_BY_INDEX (0x12). Metal-only: QEMU does not implement 0x12,
 /// so this returns `Stuck`/`Absent` there (bounded) and the scout reports enumeration unavailable.
 fn read_key_by_index(index: u32, name: &mut [u8; 4]) -> Result<(), SmcError> {
+    // 0) settle any residue from a prior transaction (M2 idle-guard; no-op on an idle SMC).
+    settle_before_command();
+
     write_cmd(CMD_GET_KEY_BY_INDEX);
     wait_status(ST_AFTER_CMD, 0)?;
     for b in index.to_be_bytes() {
@@ -190,7 +252,11 @@ fn read_key_by_index(index: u32, name: &mut [u8; 4]) -> Result<(), SmcError> {
         }
         core::hint::spin_loop();
     }
+    // A key name is exactly 4 bytes; mirror read_key's per-byte BUSY-then-DATA_READY handshake
+    // (GAP-1 fix). Unlike a value read an early DATA_READY-clear here IS an error (a 4-byte name
+    // must fully drain), so it stays Stuck(3) rather than a clean stop.
     for slot in name.iter_mut() {
+        wait_busy_clear(3)?;
         if read_status() & ST_DATA_READY == 0 {
             return Err(SmcError::Stuck(3));
         }
