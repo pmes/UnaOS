@@ -432,6 +432,32 @@ The UNAFS-K3 mount became read-WRITE at K4: `fs/unafs.rs`'s `write_sector` route
   case, the cap-16 refusal, and the owner-or-kernel authority matrix. ✅✅ METAL-CONFIRMED
   2026-07-17 (attended sitting, single boot: 44/44 + 0 forbidden on silicon, K8b-snap
   [w=0x7f] incl. the power-cut-mid-drain convergence leg).
+- **Snapshot reads inherit the live ACL — revocation reaches the past (K8c).** K8b proved the
+  retained bytes SURVIVE; K8c governs who may READ them. Ruling of record (Peter, 2026-07-16, "we
+  want high security"): a snapshot read is authorized by the **LIVE object's CURRENT ACL**,
+  re-evaluated at read time — NOT by the ACL that was in force when the snapshot was taken.
+  Snapshots preserve bytes, never authority. There is ONE enforcement predicate
+  (`read_authz(fs, live_id, principal)` in `fs/unafs.rs`), and BOTH a live read and a snapshot read
+  defer to it, keyed on the same stable logical inode id — no parallel permission logic. Consequences,
+  each proven by the witness: **(a)** a principal who cannot read the live object cannot read any
+  snapshot of it; **(b)** dropping a grant (or changing the owner) on the live object *retroactively*
+  closes every retained copy to that principal — revocation is total and reaches the past; **(c)** an
+  object DELETED from the live tree has no live ACL row, so the current-ACL check **fails closed for
+  EVERY principal**, the owner and kernel authority included (`DenyNoLiveObject`, traced) — the
+  retained bytes remain on disk but are unreadable through the enforced path. The crate `SnapshotView`
+  carries no policy (read-only is a property of the type, not a check); it is the verb/ACL seam that
+  enforces, exactly as the live read does. No K8a/K8b property is weakened: reads mutate nothing (no
+  refcount, no reclaim queue, no root flip).
+- **Proof (K8c).** `:: K8c-snapread: … PASS [w=0x7f] ::` (uncounted; REQUIREd in
+  `pi4-regression.spec`) — set an owner + a grant on a native object, retain it, overwrite the live
+  file, then read the SNAPSHOT as several principals: owner and grantee read the OLD bytes; an
+  impostor is refused from the snapshot by the SAME predicate that refuses the live read; dropping the
+  grant retroactively refuses the previously-permitted grantee; and after the live object is deleted
+  even its owner is refused (fail-closed, traced). Self-cleaning. Host twins in
+  `unafs/tests/snapshot_read.rs` cover the crate view (old bytes after overwrite AND after delete,
+  attrs as-of-snapshot, frozen-to-post-snapshot-changes, reads leave the free ledger / reclaim queue /
+  root generation intact + fsck clean, dropped-snapshot view fails closed). Metal rides the next Pi
+  sitting.
 - **K8b dual-lens review ledger (2026-07-16 — zero surviving must-fix after a THREE-PASS
   fix-verify loop; the loop's history is itself the security story).** Lens A's initial
   should-fix (a NoSpace-failing `snapshot_create` stranded its tree-wide increfs — in-RAM

@@ -135,6 +135,47 @@ remount; self-cleaning; live snapshot bench counters). `test-arm` MISSION SUCCES
 behavior change (aarch64-only witness chaining + verbs).
 
 ---
+
+## hw-pi4 track — 2026-07-16 (K8c — snapshot reads under current-ACL) 🔬
+
+### K8c — the snapshot READ path under CURRENT-ACL enforcement 🔬 (metal rides the next Pi sitting)
+
+**What it does.** ROADMAP §2 K8 line, arc 3. K8b proved retained bytes SURVIVE; K8c completes the
+feature — READING a file as it existed in a retained root, governed by the object's present-day
+authority. Crate side: `open_snapshot(gen) -> SnapshotView`, a strictly READ-ONLY handle
+(`resolve_path`/`ls`/`read_data`/`read_inode`/`get_attribute` served through the snapshot's frozen
+inode map). Read-only is a property of the type — the view has no mutating method — not a runtime
+check. The view shares ONE read code path with the live mount: the read primitives are refactored
+into `*_via` associated functions keyed on an explicit inode map, and the live methods and the view
+both delegate (live = `self.imap`, view = the snapshot's map). Reads perturb nothing — no refcount,
+no reclaim queue, no root flip. FORMAT LOCKED (API addition only). Enforcement side (the ruling of
+record, Peter 2026-07-16, "we want high security"): a snapshot read is authorized by the **LIVE
+object's CURRENT ACL**, re-evaluated at read time. ONE predicate, `read_authz(fs, live_id,
+principal)` in `fs/unafs.rs`, is the single point a live read and a snapshot read both defer to —
+no parallel permission logic. Revocation is total and reaches the past: a principal who cannot read
+the live object cannot read any snapshot of it, and dropping a grant retroactively closes every
+retained copy. The deleted-object edge (the brief's explicit consequence): an object deleted from
+the live tree has no live ACL row, so the current-ACL check **fails closed for every principal**
+(`DenyNoLiveObject`, traced) — even the owner and kernel authority. Verbs `usnapcat <gen> <path>` /
+`usnapls <gen> [path]` and host `unafs snapcat --as <principal>` drive the surface.
+
+**How it was tested.** Host: crate suite 107 → **113** (a new `snapshot_read` suite: old bytes after
+live overwrite AND after live delete, attrs as-of-snapshot incl. spilled large attr, view frozen to
+post-snapshot changes, reads leave the free ledger / reclaim queue / root generation intact + fsck
+clean, dropped-snapshot view fails closed). `check` green both arches; no_std build green.
+`kernel8-test 30` = the new uncounted REQUIREd **`K8c-snapread [w=0x7f]`** witness PASS (owner +
+grantee read the OLD bytes; impostor refused live⇔snapshot by the same predicate; grant-drop
+retroactively refuses; live-deleted object fails closed for its owner — traced; self-cleaning), with
+**COUNT 23 → PASS intact, 0 FAIL, 0 forbidden**. `test-arm 22` MISSION SUCCESS; x86 `test 40`
+MISSION SUCCESS (zero x86 change — aarch64-gated). fsck clean on every gate image. Metal MBENCH
+re-proof rides the next Pi sitting (accrues with the owed K8b boot).
+
+**Flagged.** The deleted-object handling follows the K8c brief's explicit *fail-closed refuse (no
+row = refuse)* ruling. The K8 CoW DESIGN doc's phrasing ("Files absent from the live tree:
+owner-only fallback") describes a WEAKER alternative — reconcile the design doc if owner-only-fallback
+is later preferred over the strict high-security reading implemented here.
+
+---
 ## hw-rmbp track — 2026-07-16 (R18 attended rMBP sitting — the internal-input fork answered)
 
 ### EHCI-2 configure-and-relook ✅ METAL — the internals ARE USB, asleep-until-configured

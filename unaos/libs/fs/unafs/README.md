@@ -168,6 +168,44 @@ diff (K8c).
 The shell verbs `usnap` / `usnaps` / `usnapdrop` and the host `unafs snap` /
 `snaps` / `snapdrop` subcommands drive this surface directly.
 
+### Snapshot reads: the read path under current-ACL (K8c)
+
+`open_snapshot(generation) -> SnapshotView` opens a retained root for **reading**.
+The view resolves paths, lists directories, reads data, and reads attributes **as
+they were at snapshot time** — `resolve_path` / `ls` / `read_data` / `read_inode`
+/ `get_attribute`, keyed through the snapshot's frozen inode map. It is
+**read-only by construction**: `SnapshotView` exposes no mutating method, so "a
+snapshot cannot be written" is a property of the type, not a runtime policy check.
+Reads share the *same* bounded primitives the live mount uses (the crate's
+`*_via` read functions), and they touch **nothing** mutable — no refcount, no
+reclaim queue, no root flip; the view holds its own map and issues only block
+reads. A view of a dropped or unknown generation fails closed
+(`SnapshotNotFound`), so a dangling read handle is unrepresentable.
+
+**Authority is not in the crate.** The `SnapshotView` is pure bytes; it applies
+no access control. The *governing rule* (Peter, 2026-07-16, "we want high
+security") is that a snapshot read is authorized by the **live object's CURRENT
+ACL**, re-evaluated at read time — enforced one layer up, at the kernel verb /
+ACL seam ([`fs/unafs.rs`](../../../crates/kernel/src/fs/unafs.rs), `read_authz` /
+`snapshot_read`), so there is exactly one enforcement path and the snapshot read
+defers to it:
+
+- **Revocation is total, and it reaches the past.** A principal that cannot read
+  the live object cannot read *any* snapshot of it. Snapshots preserve bytes,
+  never authority — dropping a grant retroactively closes every retained copy to
+  that principal.
+- **Deleted-from-live fails closed (documented consequence).** An object deleted
+  from the live tree still has its bytes on disk (a retained root pins them), but
+  it has **no live ACL row** — so the current-ACL check refuses it for *every*
+  principal, the owner and kernel authority included. Deletion is the ultimate
+  revocation; the refusal is traced honestly (`DenyNoLiveObject`), never silent.
+  (This is the strict reading of the high-security ruling: the retained bytes are
+  unreadable through the enforced path once the live object is gone.)
+
+The kernel verbs `usnapcat <gen> <path>` (read a file under current-ACL) and
+`usnapls <gen> [path]` (list a snapshot directory), and the host
+`unafs snapcat <gen> <path> --as <principal>`, drive this surface.
+
 ### The bulk create+write path (UNAFS-BATCH)
 
 **`create_files_batch(parent_id, Vec<BatchFile>) -> Result<Vec<u64>>`** is the
