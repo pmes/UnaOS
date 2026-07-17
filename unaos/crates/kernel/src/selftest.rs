@@ -344,6 +344,20 @@ pub fn run(console: &mut Console, pal: &mut TargetPal) {
     report(&mut pager, console, pal, &mut tally, "sched.introspection", test_sched_introspection());
     report(&mut pager, console, pal, &mut tally, "heap.roundtrip", test_heap_roundtrip());
     report(&mut pager, console, pal, &mut tally, "video.geometry", test_video_geometry());
+    // VWIT: the damage-tracked `Screen` present path (format decode, damage-limited blit, no-op
+    // flush, clip safety) — the on-screen renderer `video.geometry` cannot reach. Logic lives in
+    // `video/witness.rs`; here we only map its Result into the tste table.
+    report(
+        &mut pager,
+        console,
+        pal,
+        &mut tally,
+        "video.present",
+        match crate::video::witness::run() {
+            Ok(()) => Outcome::Pass,
+            Err(why) => Outcome::Fail(why),
+        },
+    );
 
     // M2 — the six sync primitives, re-verified with fresh worker tasks.
     run_sync_section(&mut pager, console, pal, &mut tally);

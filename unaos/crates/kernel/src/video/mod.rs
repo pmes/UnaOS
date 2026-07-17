@@ -31,6 +31,9 @@
 pub mod fbcon;
 pub mod framebuffer;
 pub mod screen;
+// VWIT: headless regression witness for the damage-tracked `Screen` present path (arch-neutral;
+// runs only when the `tste` self-test is invoked). See `docs/dev/OS/08_VIDEO/engine.md` §7.
+pub mod witness;
 // VPERF instrumentation (counters, fbmem readout, PCI display probe, scripted scroll scenario).
 // x86-only AND knob-gated: with the feature off — or on aarch64 regardless — nothing here
 // compiles, so those artifacts stay byte-identical.
