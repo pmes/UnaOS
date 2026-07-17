@@ -463,11 +463,14 @@ vm_image() {
     echo -e "${COLOR_GREEN}✅ VM image: ${img}${COLOR_RESET}"
     echo -e "   size: $(wc -c < "$img" | tr -d ' ') bytes"
     [ -n "$sha" ] && echo -e "   sha256: ${sha}"
-    echo -e "   Boot it (stock QEMU+OVMF, no arroyo harness):"
+    echo -e "   Boot it (stock QEMU+OVMF, no arroyo harness; disk attached over USB so the boot"
+    echo -e "   log is saved back to UNAOS.LOG on the image — the kernel drives USB storage, not SATA):"
     echo -e "     qemu-system-x86_64 -machine q35 -m 1G \\"
     echo -e "       -drive if=pflash,format=raw,readonly=on,file=<OVMF_CODE.fd> \\"
-    echo -e "       -drive format=raw,file=${img} -serial stdio"
-    echo -e "   (README-VM.txt inside the image has the UTM / VirtualBox / VMware paths.)"
+    echo -e "       -drive if=none,id=unastick,format=raw,file=${img} \\"
+    echo -e "       -device qemu-xhci -device usb-storage,drive=unastick,bootindex=0 -serial stdio"
+    echo -e "   After shutdown, attach the .img and copy UNAOS.LOG off it (that is the boot log to"
+    echo -e "   send back). README-VM.txt inside the image has the UTM / VirtualBox / VMware paths."
 }
 
 # Build the FAT32 test image(s) the kernel's read-only FAT reader parses (ls/cat). Ensures the x86

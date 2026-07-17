@@ -180,13 +180,22 @@ UnaOS tooling on the consumer's machine**:
 ```
 qemu-system-x86_64 -machine q35 -m 1G \
   -drive if=pflash,format=raw,readonly=on,file=<OVMF_CODE.fd> \
-  -drive format=raw,file=target/vm/unaos-x86-<git7>.img \
+  -drive if=none,id=unastick,format=raw,file=target/vm/unaos-x86-<git7>.img \
+  -device qemu-xhci -device usb-storage,drive=unastick,bootindex=0 \
   -serial stdio
 ```
 
+The disk is attached over **USB** on purpose: UnaOS then writes its whole boot
+log to a plain file, **`UNAOS.LOG`**, in the root of the image while it runs (the
+"flight recorder" — the kernel drives USB storage but not IDE/SATA, so the log is
+written back only over a USB attachment; any attachment still boots). After the VM
+shuts down, mount the `.img` and copy `UNAOS.LOG` off it — that is the boot log to
+send back, with no serial capture on the tester's side.
+
 `README-VM.txt` inside the image has the UTM (macOS), VirtualBox, and VMware
-click-paths (enable EFI, attach the disk). The boot log appears on the serial
-console; the shell appears in the VM's graphical window.
+click-paths (enable EFI, attach the disk — as a USB disk to capture `UNAOS.LOG`).
+The boot log appears on the serial console and is saved to `UNAOS.LOG`; the shell
+appears in the VM's graphical window.
 
 ---
 

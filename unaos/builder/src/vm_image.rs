@@ -239,19 +239,31 @@ demo files hello.txt/HELLO.BIN). It needs a\n\
 UEFI/EFI virtual machine — enable EFI, attach this .img as the disk, and boot. No UnaOS\n\
 tooling is required on your machine.\n\
 \n\
-QEMU (with OVMF UEFI firmware) — one command:\n\
+** The boot log is saved onto the image: UNAOS.LOG **\n\
+If you attach this .img as a USB disk (see the QEMU command below), UnaOS writes its\n\
+whole boot log to a plain file, UNAOS.LOG, in the root of the image while it runs. After\n\
+you shut the VM down, mount the image on your machine and copy UNAOS.LOG off — that file\n\
+is what to send back, no serial capture needed. (UnaOS drives USB storage but not\n\
+IDE/SATA, so the log is written ONLY when the disk is attached over USB. Any attachment\n\
+still BOOTS; USB is what lets the log be written back.)\n\
+\n\
+QEMU (with OVMF UEFI firmware) — one command (disk attached as USB so UNAOS.LOG is saved):\n\
   qemu-system-x86_64 -machine q35 -m 1G \\\n\
     -drive if=pflash,format=raw,readonly=on,file=/path/to/OVMF_CODE.fd \\\n\
-    -drive format=raw,file=unaos-x86-{git7}.img \\\n\
+    -drive if=none,id=unastick,format=raw,file=unaos-x86-{git7}.img \\\n\
+    -device qemu-xhci -device usb-storage,drive=unastick,bootindex=0 \\\n\
     -serial stdio\n\
   (OVMF ships with QEMU. On Homebrew it is usually\n\
    /usr/local/share/qemu/edk2-x86_64-code.fd or the /opt/homebrew equivalent; on Linux\n\
-   /usr/share/OVMF/OVMF_CODE.fd. The boot log appears on the serial console; the shell\n\
-   appears in the QEMU graphical window.)\n\
+   /usr/share/OVMF/OVMF_CODE.fd; split-firmware builds also want the matching writable\n\
+   OVMF_VARS.fd as a second '-drive if=pflash,...' unit. The boot log appears on the serial\n\
+   console AND is saved to UNAOS.LOG on the image; the shell appears in the graphical window.)\n\
+  To recover the log afterward: attach the .img (loopback/hdiutil) and copy UNAOS.LOG.\n\
 \n\
 UTM (macOS):\n\
   1. New VM -> Emulate -> Other. Architecture x86_64, and turn ON \"UEFI Boot\".\n\
-  2. Remove the default drive; Import Drive and select unaos-x86-{git7}.img (raw).\n\
+  2. Remove the default drive; Import Drive and select unaos-x86-{git7}.img (raw). To get\n\
+     UNAOS.LOG written back, set that drive's Interface to USB.\n\
   3. Save, then run. UnaOS boots to its shell.\n\
 \n\
 VirtualBox / VMware:\n\
@@ -259,12 +271,14 @@ VirtualBox / VMware:\n\
        VBoxManage convertfromraw unaos-x86-{git7}.img unaos.vdi --format VDI\n\
   2. New VM, type \"Other/Unknown (64-bit)\". In Settings -> System, ENABLE EFI\n\
      (\"Enable EFI (special OSes only)\" in VirtualBox; \"firmware = efi\" in VMware).\n\
-  3. Attach the disk (the .vdi, or the raw .img in VMware) and boot.\n\
+  3. Attach the disk (the .vdi, or the raw .img in VMware). Attach it to the USB controller\n\
+     (VirtualBox: add a USB disk; VMware: a USB-attached virtual disk) if you want UNAOS.LOG.\n\
 \n\
 What you should see: the UEFI firmware loads EFI/BOOT/BOOTX64.EFI, which loads the\n\
-kernel; UnaOS prints its boot log and drops to an interactive shell.\n\
+kernel; UnaOS prints its boot log and drops to an interactive shell, and (over USB)\n\
+saves that boot log to UNAOS.LOG on the image.\n\
 \n\
-Report results back to whoever gave you this image — include your VM (QEMU/UTM/\n\
-VirtualBox/VMware), its version, and the last boot-log lines you saw.\n"
+Report results back to whoever gave you this image — attach UNAOS.LOG if you have it, and\n\
+include your VM (QEMU/UTM/VirtualBox/VMware) and its version.\n"
     )
 }
