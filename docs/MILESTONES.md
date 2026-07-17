@@ -109,12 +109,38 @@ grow=11812625` → `revoke=10398500 grants=9939438 grow=9640188` @62.5 MHz (~25�
 rides the next Pi sitting — NOT this arc's gate. Ledger + numbers in
 [`SECURITY.md`](SECURITY.md) §K1 K9; landing report `review/unaos-k9-maskcut-LANDING.md`.
 
-**Flagged.** A pre-existing (not introduced) residual: a mid-op I/O/`NoSpace` failure leaves
-uncommitted in-flight blocks on the shared cached mount — the crate has no PUBLIC in-place unwind
-(`txn_unwind` private; `create_files_batch` cannot express create-or-replace-with-removal), so the
-batch's "reload from committed root" is not expressible from this raw-op composition. The pre-K9
-autocommit-ON path shares this exact class; the true closure is a crate-side public rollback
-primitive, out of the pi lane (drop-box).
+**Flagged (now CLOSED by K9-PARITY — see below).** A pre-existing (not introduced) residual: a
+mid-op I/O/`NoSpace` failure leaves uncommitted in-flight blocks on the shared cached mount — the
+crate has no PUBLIC in-place unwind (`txn_unwind` private; `create_files_batch` cannot express
+create-or-replace-with-removal), so the batch's "reload from committed root" is not expressible from
+this raw-op composition. The pre-K9 autocommit-ON path shares this exact class; the closure is the
+in-lane discard landed in K9-PARITY (a crate-side public rollback remains a drop-box, no longer
+needed for correctness).
+
+### K9-PARITY — mid-staging-failure discard: the K9 lens-B residual closed in-lane 🔬 (metal rides the next Pi sitting)
+
+**What it does.** Closes the K9-MASKCUT residual above WITHOUT touching `libs/fs/unafs`. On any
+failure of the staging wrapper `native_acl_write_on` (staging aborted OR the single `commit()`
+errored) it calls `request_mount_discard()`; `with_unafs` consumes that module-static flag AFTER the
+closure returns but BEFORE releasing the MOUNT lock and drops the cached mount (`*guard = None`) — so
+the dirty in-flight transaction is discarded ATOMICALLY within the same serialized hold that ran the
+failing op (no SMP window in which another core could commit the residue — a bare post-hold
+`force_remount()` would race there). The next `with_unafs` re-mounts fresh from the committed root.
+Safe by CoW construction: the root never flipped on the failing path (K3 durable-first — nothing
+durable changed), so the orphaned blocks are a power-cut-equivalent LEAK, never a dangle. The K4
+IRQ-mask keystone, the K5B fusion, and the mask itself are untouched — the discard only reloads the
+committed root, exactly as the existing `force_remount` primitive already does.
+
+**How it was tested.** New witness `k9_parity_check` → `:: K9-parity: … PASS [w=0x7f] ::` (7 bits;
+REQUIREd + FORBID-FAIL in `pi4-regression.spec`), driving a real mid-staging failure via a test-only
+`TEST_FAIL_MIDSTAGE` knob that aborts `native_acl_stage_row` after the inode + name/fc/owner have
+staged (worst-case near-complete residue). It proves a clean control row commits, the mid-staged
+persist fails closed, a subsequent real commit lands, and after a simulated reboot the control row is
+intact while the failed file has NO durable row (bit 4 — the discriminator that fails pre-fix, where
+the later commit would flush the residue) and a clean re-persist recovers the volume. `./arroyo check`
+✅ both arches; `test-arm 22` MISSION; `kernel8-test` MBENCH (K1..K8c PASS unchanged + the new
+`K9-parity` line). `libs/fs/unafs` READ-ONLY (untouched). Ledger in [`SECURITY.md`](SECURITY.md) §K1
+K9-PARITY; landing report `review/unaos-k9parity-LANDING.md`.
 
 ---
 
@@ -314,10 +340,10 @@ object fails closed for its owner — traced; self-cleaning), with
 MISSION SUCCESS (zero x86 change — aarch64-gated). fsck clean on every gate image. Metal MBENCH
 re-proof rides the next Pi sitting (accrues with the owed K8b boot).
 
-**Flagged.** The deleted-object handling follows the K8c brief's explicit *fail-closed refuse (no
-row = refuse)* ruling. The K8 CoW DESIGN doc's phrasing ("Files absent from the live tree:
-owner-only fallback") describes a WEAKER alternative — reconcile the design doc if owner-only-fallback
-is later preferred over the strict high-security reading implemented here.
+**Deleted-object ruling — FINAL (Peter, 2026-07-17).** Deleted-object snapshot read is RULED
+fail-closed (no live row = refuse for every principal, owner + kernel included) — no longer an open
+question. The K8 CoW DESIGN doc's weaker "owner-only fallback" phrasing is SUPERSEDED, not a pending
+alternative; the strict high-security reading implemented here stands.
 
 ---
 ## hw-rmbp track — 2026-07-16 (R18 attended rMBP sitting — the internal-input fork answered)

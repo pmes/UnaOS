@@ -214,9 +214,46 @@ pub fn with_unafs<R>(f: impl FnOnce(&mut KernelUnaFS) -> R) -> Result<R, MountEr
         if guard.is_none() {
             *guard = Some(mount()?);
         }
-        Ok(f(guard.as_mut().expect("mount just populated")))
+        let r = f(guard.as_mut().expect("mount just populated"));
+        // K9-PARITY: mid-staging FAILURE discard (SECURITY.md §K1 K9). A staged ACL persist that
+        // fails partway (`native_acl_write_on` -> `request_mount_discard`) leaves UNCOMMITTED in-flight
+        // transaction state on this shared, cached mount — the root never flipped (K3 durable-first: the
+        // committed tree is untouched), but a LATER persist's `commit()` would otherwise flush that
+        // orphaned residue alongside its own row. Drop the cached mount HERE, still inside the same
+        // uninterrupted MOUNT hold that ran the failing op, so the discard is atomic w.r.t. every other
+        // persister (no SMP window in which another core could observe or commit the dirty mount — a
+        // discard AFTER releasing the hold, e.g. a bare `force_remount`, would race). The next
+        // `with_unafs` re-mounts fresh from the committed root; under CoW the orphaned blocks are a
+        // power-cut-equivalent LEAK (never a dangle), the same residue class a real power cut mid-persist
+        // would leave. This is the in-lane closure of the K9 lens-B deferred residual; it touches neither
+        // the K5B fusion, the K4 IRQ-mask keystone, nor any committed durable state.
+        if MOUNT_DISCARD.swap(false, core::sync::atomic::Ordering::Relaxed) {
+            *guard = None;
+        }
+        Ok(r)
     })
 }
+
+/// K9-PARITY: a staged ACL persist under an already-held [`with_unafs`] mount sets this to ask the
+/// enclosing hold to DISCARD the cached mount (drop the dirty in-flight transaction, re-mount fresh from
+/// the committed root on the next access). Set only on the FAILURE path of [`native_acl_write_on`]; the
+/// enclosing [`with_unafs`] consumes it before releasing the lock, so it is set and cleared strictly
+/// within one serialized hold and can never leak into a later or read-only hold.
+static MOUNT_DISCARD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// K9-PARITY: request the enclosing [`with_unafs`] hold discard the cached mount (see [`MOUNT_DISCARD`]).
+fn request_mount_discard() {
+    MOUNT_DISCARD.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// K9-PARITY (test only): when set, [`native_acl_stage_row`] aborts PARTWAY through a row — after the
+/// inode + name/fc/owner attributes have staged but before the grants — to exercise the mid-staging-
+/// failure discard path. Default off, set transiently by the `k9_parity_check` witness only; NO
+/// production caller touches it (an always-false atomic load in the staging body, the K3_TEST_FAIL_PERSIST
+/// idiom).
+#[doc(hidden)]
+pub static TEST_FAIL_MIDSTAGE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 /// Drop the cached live mount so the next [`with_unafs`] re-reads the volume
 /// from disk with a fresh in-RAM bitmap/journal — a genuine remount, not a
@@ -346,6 +383,13 @@ pub fn native_acl_write_on(
     let staged = native_acl_stage_row(fs, dir_lba, dir_off, name, first_cluster, owner, grants);
     // Commit ONLY on full staging success: a failed stage flips no root (durable-first — old row intact).
     let ok = staged && fs.commit().is_ok();
+    // K9-PARITY: on FAILURE (staging aborted OR the single commit errored) the mount carries uncommitted
+    // in-flight blocks — ask the enclosing `with_unafs` hold to discard the cached mount so no later
+    // persist's commit flushes this orphaned residue. The root never flipped, so nothing durable changed
+    // (K3); this only reloads the committed root. See `with_unafs` and SECURITY.md §K1 K9.
+    if !ok {
+        request_mount_discard();
+    }
     fs.set_autocommit(true); #[cfg(feature = "nsspan")] { let cs1 = fs.commit_stats(); ACL_PERSIST_FLIPS.fetch_max(cs1.commits.wrapping_sub(_cs0.commits), core::sync::atomic::Ordering::Relaxed); ACL_PERSIST_BLOCKS.fetch_max(cs1.blocks_written.wrapping_sub(_cs0.blocks_written), core::sync::atomic::Ordering::Relaxed); }
     ok
 }
@@ -406,6 +450,13 @@ fn native_acl_stage_row(
                 .set_attribute(id, "owner".to_string(), AttributeValue::String(owner_s.to_string()))
                 .is_err()
         {
+            return false;
+        }
+        // K9-PARITY (test only): mid-staging failure injection. Fires HERE — after a fresh inode + the
+        // name/fc/owner attributes have already staged into the autocommit-OFF transaction — so the abort
+        // leaves a near-complete, UNCOMMITTED row (the worst-case residue the discard must swallow). Never
+        // set in production; the `k9_parity_check` witness sets it transiently. See `with_unafs`.
+        if TEST_FAIL_MIDSTAGE.load(core::sync::atomic::Ordering::Relaxed) {
             return false;
         }
         for (gk, rv) in grants {
