@@ -6,6 +6,32 @@ A hand-written, dependency-free TCP/IP stack for the UnaOS kernel.
 `cargo test` so the estimator unit tests run on the host. No external
 dependencies.
 
+## Status: RETIRED AS THE DEFAULT — live, and available for resumption
+
+As of **SMOLNET-DEFAULT** (2026-07-17, Peter's ruling) the x86 kernel's default
+TCP/IP path is the mature [smoltcp](https://github.com/smoltcp-rs/smoltcp) stack
+(`crates/kernel/src/smolnet.rs`); this hand-rolled crate is **no longer the
+default**. It was **not** trashed and **not** removed — the code is correct on its
+own terms, and per the project's never-trash-code rule it is an asset kept in
+tree, catalogued here, and **available for reuse/resumption**.
+
+It is also still **live**, regardless of the knob: the e1000/e1000e driver's
+main-loop `service_net()` poll, the boot connectivity self-test, the DHCP client,
+the TCP echo listener, the shell's `connect`/`fetch`/`udpsend` commands, and the
+`net::arp::learn` reuse the smoltcp `Device` snoops for MAC surfacing all depend
+on this crate unconditionally. smoltcp has not yet replaced those surfaces
+(SOCK-8+ future work), so retirement here is a **default + status** change, not a
+code removal.
+
+- **Resume hand-rolling / run this stack as the whole net path:** build with
+  `UNAOS_NOSMOLNET=1` (e.g. `UNAOS_NOSMOLNET=1 ./arroyo test 40`). That drops the
+  `smolnet` cargo feature, and this crate serves `ping`/`arp`/`netinfo` too (not
+  just connect/fetch/udpsend). The opt-out x86 build is byte-identical to the
+  pre-flip default.
+- **Doc of record for the live default stack:** `unaos/docs/dev/OS/08_NET/networking.md`.
+- **This crate's own architecture doc:** `docs/dev/OS/06_NETWORK_STACK/network_stack.md`
+  (carries a retired-line banner pointing back here and at 08_NET).
+
 ## Layers
 - `ethernet`, `arp`, `ipv4`, `icmp`, `udp`, `dhcp` — L2–L4 framing and the
   stateless services.

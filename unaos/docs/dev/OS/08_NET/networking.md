@@ -1,42 +1,68 @@
-# Networking — the smoltcp adoption (SOCK-1)
+# Networking — the smoltcp stack (DEFAULT since SMOLNET-DEFAULT)
 
-Direction: [`ROADMAP.md` §1b](../../../../../docs/ROADMAP.md). This document describes the
-networking stack as of **SOCK-1** (round 9, 2026-07-12): the first arc of the migration from the
-hand-rolled `crates/net` protocol line onto the mature [smoltcp](https://github.com/smoltcp-rs/smoltcp)
-crate (0.13.1, 0BSD, `#![no_std]`, heap-optional).
+Direction: [`ROADMAP.md` §1b](../../../../../docs/ROADMAP.md). This is the **doc of record** for
+UnaOS networking. As of **SMOLNET-DEFAULT** (2026-07-17, Peter's ruling — "make smoltcp the default,
+retire the hand-rolled line but don't shut out the possibility we resume hand-rolling our own") the
+mature [smoltcp](https://github.com/smoltcp-rs/smoltcp) crate (0.13.1, 0BSD, `#![no_std]`,
+heap-optional) is the **default** x86 TCP/IP stack. It got here through the SOCK-1..7 + zeolite arcs
+(round 9 onward, from 2026-07-12), each documented in full below.
 
-## Today's two-stack reality
+## Today's stack (smoltcp default, hand-rolled opt-out)
 
-SOCK-1 does **not** remove anything. It adds a second, feature-gated path and leaves the existing
-stack byte-identical when the knob is off:
+smoltcp owns the shell's `ping`/`arp`/`netinfo`, the ring-3 socket syscall family (SOCK-2..7), the
+DNS sinkhole (zeolite), and the boot connectivity witnesses — **by default**. The hand-rolled
+`crates/net` line is **retired as the default** but stays in tree, live, and resumable (see
+[The retired hand-rolled line](#the-retired-hand-rolled-line-resumable) below).
 
-| | Knob **off** (default) | Knob **on** (`UNAOS_SMOLNET=1`) |
+| | Default (smoltcp) | Opt-out (`UNAOS_NOSMOLNET=1`) |
 | :--- | :--- | :--- |
-| `ping` / `arp` / `netinfo` | hand-rolled `net::` engines (`drivers/e1000.rs`) | **smoltcp** ICMP socket + interface (`smolnet.rs`) |
-| `connect` / `fetch` / `udpsend` | hand-rolled `net::tcp` / `net::udp` | hand-rolled (unchanged — SOCK-2/3 own the socket rewrite) |
-| DHCP, TCP echo listener, boot self-test | hand-rolled | hand-rolled (still runs) |
-| aarch64 | no wired NIC — `e1000`/`net` compile but are inert | **smoltcp is never compiled** (x86-only dep) |
+| `ping` / `arp` / `netinfo` | **smoltcp** ICMP socket + interface (`smolnet.rs`) | hand-rolled `net::` engines (`drivers/e1000.rs`) |
+| ring-3 socket syscalls (SOCK-2..7) + zeolite | **smoltcp** (persistent `STACK`) | absent (feature not compiled) |
+| `connect` / `fetch` / `udpsend` | hand-rolled `net::tcp` / `net::udp` (smoltcp has no shell equivalent yet — SOCK-8+) | hand-rolled |
+| DHCP, TCP echo listener, boot connectivity self-test | hand-rolled (still runs alongside smoltcp) | hand-rolled |
+| aarch64 | **smoltcp is never compiled** (x86-only dep + arm_features strip) | identical — hand-rolled only |
 
-The hand-rolled `crates/net` crate (ARP / ICMP / UDP / DHCP + the Go-Back-N TCP engine) stays in
-tree as reference and remains the live stack knob-off. It is **not touched** by this arc.
+Note the hand-rolled `crates/net` crate is a **live dependency regardless of the knob**: even when
+smoltcp is the default, the driver's `service_net()` poll, the boot self-test, DHCP, the TCP echo
+listener, `connect`/`fetch`/`udpsend`, and the `net::arp::learn` reuse the smoltcp `Device` snoops for
+MAC surfacing all run through it. The `smolnet` feature is purely **additive**.
 
 ## The knob
 
-`UNAOS_SMOLNET=1` selects the kernel crate's `smolnet` cargo feature. That feature activates an
-**x86-only optional dependency** on `smoltcp` (declared in `crates/kernel/Cargo.toml` under
-`[target.'cfg(target_arch = "x86_64")'.dependencies]`), so:
+`smolnet` is the kernel crate's cargo feature; it activates an **x86-only optional dependency** on
+`smoltcp` (declared in `crates/kernel/Cargo.toml` under `[target.'cfg(target_arch = "x86_64")'.dependencies]`)
+and its module + every call site are additionally `#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]`.
+It is **pushed by default** on x86; `UNAOS_NOSMOLNET=1` opts out (the negative-knob idiom mirroring
+PORTSW-1/EHCI-4). So:
 
-- **Knob off** → the feature is inactive, smoltcp is never pulled, and the binary is byte-identical
-  to the pre-SOCK-1 base (both arches).
-- **Knob on, x86** → smoltcp compiles; `smolnet.rs` and the shell/witness call sites compile in.
-- **Knob on, aarch64** → the `smolnet = ["dep:smoltcp"]` feature resolves to a no-op (the optional
-  dep does not exist for that target), so aarch64 never compiles smoltcp. The `smolnet` module and
-  every call site are additionally `#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]`, so
-  aarch64 is byte-identical knob-on too.
+- **Default, x86** → `smolnet` compiles; `smolnet.rs` and the shell/witness/socket call sites compile in.
+- **Opt-out (`UNAOS_NOSMOLNET=1`), x86** → the feature is dropped, smoltcp is never pulled, and the
+  binary is byte-identical to the pre-flip x86 default (the hand-rolled stack is the whole net path).
+- **aarch64 (either way)** → **byte-identical**, enforced at build. smoltcp is x86-only (the optional
+  dep does not exist for aarch64, and every call site is `target_arch = "x86_64"`-gated), so the
+  aarch64 compiler never emits one byte of smoltcp code. But cargo hashes the *enabled-feature set*
+  into each crate's `-Cmetadata` fingerprint, so merely *listing* `smolnet` in the aarch64 feature set
+  would shift the aarch64 binary's bytes (same code, same size, different symbol manglings). To keep
+  the aarch64 (jetson/pi) media hash unperturbed, `unaos/arroyo`'s `arm_features` helper **strips
+  `smolnet`** from the two shared aarch64 kernel compiles (`build_kernel_aarch64`, `check_both`'s
+  aarch64 leg). Proven: the aarch64 kernel is byte-identical (default == opt-out == pre-flip
+  `ehcihid` baseline). Pi `kernel8` builds from its own curated `K8_FEATS` (never carried smolnet).
 
 The knob is plumbed in **two** places that must stay in sync (both rebuild the x86 kernel):
-`unaos/arroyo` (the feature map) and `unaos/builder/src/main.rs` (the builder rebuilds the kernel
-before launching QEMU, so it maps `UNAOS_SMOLNET` → `smolnet` independently).
+`unaos/arroyo` (the feature map — pushes `smolnet` unless `UNAOS_NOSMOLNET` is set; strips it for
+aarch64 via `arm_features`) and `unaos/builder/src/main.rs` (the builder rebuilds the x86 kernel
+before launching QEMU, so it maps `UNAOS_NOSMOLNET` → drop `smolnet` independently; it produces only
+x86 media, so no aarch64 strip is needed there).
+
+## The retired hand-rolled line (resumable)
+
+The hand-rolled `crates/net` stack (ARP / ICMP / UDP / DHCP + the Go-Back-N TCP engine) is **retired
+as the default**, not removed. Per never-trash-code it stays in tree — catalogued in
+[`crates/net/README.md`](../../../../crates/net/), architecture in
+[`06_NETWORK_STACK/network_stack.md`](../../../../../docs/dev/OS/06_NETWORK_STACK/network_stack.md) —
+and remains **live** (it backs the surfaces smoltcp has not replaced, listed in the table above). To
+**resume hand-rolling our own** — or to run the hand-rolled stack as the whole net path — build with
+`UNAOS_NOSMOLNET=1`; that opt-out x86 build is byte-identical to the pre-flip default.
 
 ## The Device seam
 
@@ -88,12 +114,12 @@ through the smoltcp interface and emits the uncounted witness line:
 :: SOCK-1: smoltcp icmp echo 10.0.2.2 4/4 replies — witness OK ::
 ```
 
-Reproduce: `UNAOS_SMOLNET=1 ./arroyo test 60` (MISSION SUCCESS + the line above).
+Reproduce: `./arroyo test 60` (MISSION SUCCESS + the line above).
 
 ## SOCK-2 — the UDP socket syscall family (ring 3 reaches the network)
 
 SOCK-2 adds the first four **socket syscalls** and the persistent smoltcp state they need. It is the
-same knob (`UNAOS_SMOLNET`), x86-only, byte-identical knob-off / aarch64.
+same `smolnet` feature (default-on), x86-only, byte-identical knob-off / aarch64.
 
 ### The persistent stack
 
@@ -166,7 +192,7 @@ with a real UDP datagram, so a genuine send→receive round-trip works under the
   frame-stealing residual, now cross-CPU) is simply retried, and each `recvfrom`'s own IF-masked
   bounded pump is where a fresh reply is captured.
 
-Reproduce: `UNAOS_SMOLNET=1 ./arroyo test 60` — MISSION SUCCESS plus both lines above.
+Reproduce: `./arroyo test 60` — MISSION SUCCESS plus both lines above.
 
 ## Security surface
 
@@ -179,7 +205,7 @@ bound-checked window; `recvfrom` cannot block the IF-masked handler.
 
 ## SOCK-3 — TCP client sockets (ring 3 gets a byte stream)
 
-SOCK-3 adds **TCP client sockets** on the same persistent stack, same knob (`UNAOS_SMOLNET`), x86-only,
+SOCK-3 adds **TCP client sockets** on the same persistent stack, same `smolnet` feature (default-on), x86-only,
 byte-identical knob-off / aarch64. A TCP socket rides the existing `STACK` singleton + `reg` registry —
 a slot now carries a `SockKind` tag (`Udp` / `Tcp`) and, for TCP, its own static stream ring buffers
 (`TCP_RX_DATA` / `TCP_TX_DATA`, 2 KiB each, BSS). The UDP and TCP sockets share one id space and one
@@ -243,13 +269,13 @@ no netdev change. Two witnesses fire knob-on:
   5-bit witness (socket/connect-established/send/recv-bytes/real-DNS-reply). Its launcher prints
   `:: SOCK-3: ring-3 tcp round-trip — socket/connect/send OK, recv returned a byte stream FROM 10.0.2.3:53, socket teardown clean -> PASS ::`.
 
-Reproduce: `UNAOS_SMOLNET=1 ./arroyo test 90` — MISSION SUCCESS plus both lines. The `sock3-tcp` fixture
+Reproduce: `./arroyo test 90` — MISSION SUCCESS plus both lines. The `sock3-tcp` fixture
 runs on an AP; a stolen segment is handled by the same non-blocking poll/retry discipline SOCK-2 uses.
 
 ## SOCK-4 — transferable sockets (a socket cap moves across processes)
 
 SOCK-4 (scope B) makes a socket **capability movable to another process** — the socket analogue of the
-U7x/U8x console-cap transfer. Same knob (`UNAOS_SMOLNET`), x86-only, byte-identical knob-off / aarch64. It
+U7x/U8x console-cap transfer. Same `smolnet` feature (default-on), x86-only, byte-identical knob-off / aarch64. It
 adds **no new syscall** (next free number stays **26**): a socket rides the existing `SYS_XFER` (13) /
 `SYS_RECV` (14) transfer machinery, which already special-cased `KIND_SOCKET` — this arc makes that path
 actually *work* and proves it safe.
@@ -302,7 +328,7 @@ Both fire knob-on, chained after the SOCK-3 verdict:
   snapshot (the deposit is pending while the grantee's row is still untouched) + teardown-clear round it out:
   `:: SOCK-4: transferable sockets — grantee received + round-tripped the moved socket, grantor's migrated-away handle -EACCES, gen-rebind rejected, teardown clean -> PASS ::`.
 
-Reproduce: `UNAOS_SMOLNET=1 ./arroyo test 90` — MISSION SUCCESS plus the SOCK-4 PASS line (and the SOCK-1/2/3
+Reproduce: `./arroyo test 90` — MISSION SUCCESS plus the SOCK-4 PASS line (and the SOCK-1/2/3
 witnesses intact). The demo needs a NIC + three APs; it skips cleanly otherwise.
 
 ### Residuals (ledgered)
@@ -329,7 +355,7 @@ SOCK-5 (scope B) retires the persistent stack's **knob-on dependency on the hand
 Before this arc, the persistent smoltcp interface was configured with a *static* address copied from
 `e1000::hw_addr()` — an address the **hand-rolled** `crates/net` DHCP client had obtained. SOCK-5 gives
 the smoltcp stack **its own** `dhcpv4::Socket`, so knob-on it acquires and applies its lease
-autonomously. Same knob (`UNAOS_SMOLNET`), x86-only, byte-identical knob-off / aarch64. **No new
+autonomously. Same `smolnet` feature (default-on), x86-only, byte-identical knob-off / aarch64. **No new
 syscall** (next free number stays **26**) and **no new ring-3 surface**: DHCP is a kernel-internal
 interface-configuration function, not a capability ring 3 can invoke.
 
@@ -369,7 +395,7 @@ UDP-DNS, SOCK-3 TCP-DNS, and SOCK-4 transfer round-trips **all still pass on tha
 address**, confirming the whole socket family now runs on a lease smoltcp obtained itself. (A silent
 server would instead print `… no offer — fell back to static … — witness INCOMPLETE ::`.)
 
-Reproduce: `UNAOS_SMOLNET=1 ./arroyo test 90` — MISSION SUCCESS plus the SOCK-5 witness line and the
+Reproduce: `./arroyo test 90` — MISSION SUCCESS plus the SOCK-5 witness line and the
 SOCK-1/2/3/4 lines intact.
 
 ### Residuals (ledgered)
@@ -378,15 +404,15 @@ SOCK-1/2/3/4 lines intact.
   smoltcp's DHCP renew/rebind timers are not driven past that (the persistent stack keeps the lease for
   the session — adequate under slirp's effectively-infinite lease, and the fallback covers a silent
   server). A future arc can keep the DHCP socket pumping in `service_net` for renewal.
-- **The hand-rolled DHCP still runs in the driver knob-off** (it is the live stack when `UNAOS_SMOLNET`
-  is off) and, knob-on, still leases the driver's own `hw_addr` — the two DHCP clients share the NIC's
+- **The hand-rolled DHCP still runs in the driver** (it is the live stack under `UNAOS_NOSMOLNET=1`)
+  and, with smoltcp default-on, still leases the driver's own `hw_addr` — the two DHCP clients share the NIC's
   single MAC, so slirp hands them the same address. Fully retiring the hand-rolled `crates/net` DHCP is
   part of the eventual "retire the hand-rolled stack" arc, not this one.
 
 ## SOCK-6 — TCP server / listen sockets (ring 3 accepts inbound)
 
 SOCK-6 (scope A) gives ring 3 the **server side** of TCP: a socket can be armed as a passive listener and
-accept an inbound connection. Same knob (`UNAOS_SMOLNET`), x86-only, byte-identical knob-off / aarch64. It
+accept an inbound connection. Same `smolnet` feature (default-on), x86-only, byte-identical knob-off / aarch64. It
 adds **two syscalls** over the persistent stack:
 
 | # | Syscall | Gate | Returns |
@@ -430,9 +456,9 @@ Under `UNAOS_NET=socket` with the injector it completes and emits:
 :: SOCK-6: smoltcp tcp accept :8080 — received 11 bytes, echoed 11 back — witness OK ::
 ```
 
-Reproduce (hermetic, PENDING): `UNAOS_SMOLNET=1 ./arroyo test 90` — MISSION SUCCESS plus the PENDING line
+Reproduce (hermetic, PENDING): `./arroyo test 90` — MISSION SUCCESS plus the PENDING line
 and the SOCK-1/2/3/5 lines intact. Reproduce (server round-trip, OK): launch the builder with
-`UNAOS_NET=socket UNAOS_SMOLNET=1 UNAOS_SERIAL_LOG=<log> UNAOS_TEST_SECS=60` and, concurrently,
+`UNAOS_NET=socket UNAOS_SERIAL_LOG=<log> UNAOS_TEST_SECS=60` and, concurrently,
 `python3 scripts/net-inject.py 127.0.0.1:5555 sock6` — the injector prints `GUEST SOCK-6 SERVER OK` and the
 serial log carries the `witness OK` line.
 
@@ -449,8 +475,8 @@ serial log carries the `witness OK` line.
 SOCK-6's listener was **consumed** by its accept: smoltcp has no listen→child model — a completed handshake
 transitions the *listening* socket to ESTABLISHED **in place**, so the listener *became* the connection and a
 second inbound connect to the same port was refused. SOCK-7 makes `sys_listen` arm a **persistent** listener:
-each `sys_accept` hands the caller a fresh connection and the port **keeps listening**. Same knob
-(`UNAOS_SMOLNET`), x86-only, byte-identical knob-off / aarch64. **No new syscall** (the two SOCK-6 numbers
+each `sys_accept` hands the caller a fresh connection and the port **keeps listening**. Same `smolnet` feature
+(default-on), x86-only, byte-identical knob-off / aarch64. **No new syscall** (the two SOCK-6 numbers
 26/27 are unchanged; next free stays **28**) and **no new ring-3 surface** — the change is behind the
 existing `sys_accept`.
 
@@ -508,9 +534,9 @@ the proof the listener was not consumed by the first accept:
 :: SOCK-7: smoltcp tcp accept :8080 #2 — received 12 bytes, echoed 12 back on a PERSISTENT listener (second inbound connection accepted after the first was consumed) — witness OK ::
 ```
 
-Reproduce (hermetic, both PENDING): `UNAOS_SMOLNET=1 ./arroyo test 90` — MISSION SUCCESS plus the two PENDING
+Reproduce (hermetic, both PENDING): `./arroyo test 90` — MISSION SUCCESS plus the two PENDING
 lines and the SOCK-1/2/3/5 lines intact. Reproduce (persistent round-trip, both OK): launch the builder with
-`UNAOS_NET=socket UNAOS_SMOLNET=1 UNAOS_TEST_SECS=85 ./arroyo test 90` and, concurrently,
+`UNAOS_NET=socket UNAOS_TEST_SECS=85 ./arroyo test 90` and, concurrently,
 `python3 scripts/net-inject.py 127.0.0.1:5555 sock7` — the injector prints `GUEST SOCK-6 ACCEPT OK` then
 `GUEST SOCK-7 PERSISTENT LISTENER OK`, and the serial log carries both `witness OK` lines. (Under the socket
 netdev there is no slirp DNS/DHCP responder, so the guest-initiated SOCK-2/3/5 DNS/DHCP witnesses read
@@ -537,7 +563,7 @@ INCOMPLETE on that medium — inherent to the injector backend, not a regression
 
 SINKHOLE-1 is the first slice of the UnaOS DNS sinkhole ("the Pi-hole concept, done the UnaOS way"): a
 **ring-3 resolver** that binds UDP `:53`, answers BLOCKED names with `0.0.0.0` (the sinkhole), and
-FORWARDS everything else to the upstream resolver. Same knob (`UNAOS_SMOLNET`), x86-only, byte-identical
+FORWARDS everything else to the upstream resolver. Same `smolnet` feature (default-on), x86-only, byte-identical
 knob-off / aarch64. It adds **no new syscall** (next free stays **28**) and **no new ring-3 surface** — the
 resolver is a ring-3 fixture (`zeolite-resolver`, the sock2 inline-blob idiom) composed entirely from the
 already-landed capabilities: the SOCK-2 UDP syscalls (`sys_socket`/`bind`/`sendto`/`recvfrom`) for serve +
@@ -554,7 +580,7 @@ the S7 dynamic-open path (`sys_open("BLOCK.TXT")` → not staged → `open_dynam
 read) and `sys_read`s it into a ring-3 buffer — a genuine cross-subsystem composition witness (STOR feeds
 NET). The S7 path needs `UNAOS_IRQSTORAGE=1` + a mounted FAT (`UNAOS_FATIMG=sf`); with **no** FAT the open
 fails and the resolver falls back to a tiny **builtin list** (same entries, same format) and prints an
-honest `builtin list (no FAT)` marker, so the pure-net legs still witness under `UNAOS_SMOLNET=1` alone.
+honest `builtin list (no FAT)` marker, so the pure-net legs still witness under the default (smolnet) alone.
 
 ### The witness-medium decision (resolved: split legs)
 
@@ -563,7 +589,7 @@ via a second ring-3 client — was **probed and ruled out**: smoltcp on a single
 **not** deliver a datagram socket-to-socket to the guest's own address (there is no loopback medium; a probe
 sending to `own-ip:5353` from a second socket got nothing back). So the proof is medium **(b), split legs**:
 
-- **The FORWARD + composition leg proves hermetically** (`UNAOS_SMOLNET=1`, and fully under
+- **The FORWARD + composition leg proves hermetically** (under the default, and fully under
   `+IRQSTORAGE +FATIMG`). The resolver runs two self-tests through its **hardened parser**: it parses an
   inline query for `ADS.EXAMPLE`, matches the blocklist (BLOCKED), and **builds a well-formed `0.0.0.0`
   A-answer** (the sinkhole decision + response construction, proven without a peer); then it parses an
@@ -581,9 +607,12 @@ sending to `own-ip:5353` from a second socket got nothing back). So the proof is
   `:: zeolite: resolver bound :53 — awaiting an inbound query (UNAOS_NET=socket net-inject dns) — witness PENDING ::`
   → under the injector: `:: zeolite: served an inbound query on :53 — blocked name sinkholed to 0.0.0.0 over the wire — witness OK ::`.
 
-Reproduce (hermetic, forward OK + serve PENDING): `UNAOS_SMOLNET=1 ./arroyo test 90`. Full composition
-(blocklist from FAT): `UNAOS_SMOLNET=1 UNAOS_IRQSTORAGE=1 UNAOS_FATIMG=sf ./arroyo test 200`. Over-the-wire
-sinkhole: launch `UNAOS_NET=socket UNAOS_SMOLNET=1 UNAOS_TEST_SECS=150 ./arroyo test 155` and concurrently
+Reproduce (hermetic, forward OK + serve PENDING): `./arroyo test 90`. Full composition
+(blocklist from FAT): rebuild a **fresh** superfloppy first (`bash scripts/make-fat-img.sh sf`, or use
+`./arroyo test-fat sf` which rebuilds it), then `UNAOS_IRQSTORAGE=1 UNAOS_FATIMG=sf ./arroyo test 200`
+— `./arroyo test` reuses `builder/fat-sf.img` as-is, and a STALE one whose GROW.BIN was already grown
+by a prior run trips U10/S4 with `grew_ok=false` (the stateful-fixture trap, not a regression).
+Over-the-wire sinkhole: launch `UNAOS_NET=socket UNAOS_TEST_SECS=150 ./arroyo test 155` and concurrently
 `python3 scripts/net-inject.py 127.0.0.1:5555 dns`.
 
 ### Hostile-payload parse hygiene
@@ -677,8 +706,8 @@ The leg-1 witness line now folds in the ingest + suffix proof:
 :: zeolite: hosts-format blocklist from BLOCK.TXT via S7 dynamic-open, blocked ADS.EXAMPLE -> 0.0.0.0 (answer built), subdomain WWW.ADS.EXAMPLE sinkholed + NOTADS.EXAMPLE not over-blocked, forwarded una.os -> 10.0.2.3:53 real answer relayed — witness OK ::
 ```
 
-Reproduce (hermetic, forward+suffix+metrics OK, serve PENDING): `UNAOS_SMOLNET=1 ./arroyo test 90`. Full
-composition (hosts-format blocklist from FAT): `UNAOS_SMOLNET=1 UNAOS_IRQSTORAGE=1 UNAOS_FATIMG=sf ./arroyo
+Reproduce (hermetic, forward+suffix+metrics OK, serve PENDING): `./arroyo test 90`. Full
+composition (hosts-format blocklist from FAT): `UNAOS_IRQSTORAGE=1 UNAOS_FATIMG=sf ./arroyo
 test 200`. The over-the-wire serve leg is unchanged from SINKHOLE-1 (injector-driven; PENDING hermetically).
 
 ## The road from here

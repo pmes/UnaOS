@@ -121,7 +121,8 @@ const SYS_FGRANT: u64 = 18;
 // `[dst_ip[4]][dst_port u16 LE][pad u16]` followed by the payload; RECVFROM(handle, buf_ptr, buf_len)
 // writes that same header shape (source addr) + payload and returns the total, or `-EAGAIN` when empty
 // (NON-BLOCKING — the IF-masked handler cannot block; smolnet drives a bounded poll pump). x86-only,
-// knob-on (`UNAOS_SMOLNET`); aarch64 / knob-off never compile these arms (byte-identical).
+// `smolnet` feature (DEFAULT-ON since SMOLNET-DEFAULT; dropped under `UNAOS_NOSMOLNET=1`); aarch64 /
+// opt-out never compile these arms (byte-identical).
 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
 const SYS_SOCKET: u64 = 19;
 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]

@@ -83,9 +83,12 @@ fn main() {
     if std::env::var("UNAOS_SMC").is_ok() { feats.push("smc"); }
     // VPERF M2: the fbcon viewport-cap bench lever (implies videobench). x86_64 only.
     if std::env::var("UNAOS_VIDEOCAP").is_ok() { feats.push("videocap"); }
-    // SOCK-1: route the shell's ping/arp/netinfo + the boot ICMP witness through smoltcp. x86-only
-    // optional dep + module. (The builder rebuilds the kernel, so this MUST mirror arroyo's mapping.)
-    if std::env::var("UNAOS_SMOLNET").is_ok() { feats.push("smolnet"); }
+    // SMOLNET-DEFAULT: smoltcp is the DEFAULT x86 net stack (2026-07-17). Push `smolnet` (shell
+    // ping/arp/netinfo + socket syscalls + boot witnesses) UNLESS opted out with UNAOS_NOSMOLNET=1,
+    // which drops the feature => the hand-rolled `net` crate is the whole net path, byte-identical to
+    // the pre-flip default (PORTSW-1/EHCI-4 default-ON/negative-knob policy). x86-only optional dep +
+    // module. (The builder rebuilds the kernel, so this MUST mirror arroyo's mapping.)
+    if std::env::var("UNAOS_NOSMOLNET").is_err() { feats.push("smolnet"); }
     // `tegra` (Jetson Orin / Tegra234 UART) is an aarch64 board feature; mapped here for parity with
     // the `pi` knob, though this x86_64 builder never produces aarch64 media (the `arroyo` script does).
     if std::env::var("UNAOS_TEGRA").is_ok() { feats.push("tegra"); }

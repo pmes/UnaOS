@@ -77,10 +77,16 @@ _feats=""
 # the protocol machinery is gated by a known-key read; battery keys are metal-first. Default OFF =>
 # module + call sites unlinked, media byte-identical. Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_SMC:-}" ] && _feats="${_feats}smc,"
-# SOCK-1: route the shell's ping/arp/netinfo + a boot ICMP witness through the smoltcp stack
-# (ROADMAP §1b). x86-only optional dep + x86-gated module — enabling it on the aarch64 `check`
-# invocation is a no-op (smoltcp isn't pulled for that target), so aarch64 stays byte-identical.
-[ -n "${UNAOS_SMOLNET:-}" ] && _feats="${_feats}smolnet,"
+# SMOLNET-DEFAULT: smoltcp is the DEFAULT x86 net stack (2026-07-17, Peter's ruling). The mature
+# smoltcp TCP/IP stack (ROADMAP §1b) carries the shell's ping/arp/netinfo + the socket syscalls + the
+# boot witnesses; the hand-rolled `net` crate is RETIRED as the default (kept in tree, live, resumable
+# — it still backs connect/fetch/udpsend, the TCP echo listener, and driver DHCP). UNAOS_NOSMOLNET=1
+# OPTS OUT => `smolnet` not pushed => the hand-rolled stack is the whole net path, byte-identical to
+# the pre-flip default. Mirrors the PORTSW-1/EHCI-4 default-ON/negative-knob policy. x86-only optional
+# dep + x86-gated module; the aarch64 kernel compiles STRIP it via `arm_features` (below) so aarch64
+# media is byte-identical to the pre-flip default whichever way this knob points. Kept in sync with
+# builder/src/main.rs (which produces only x86 media, so it pushes `smolnet` unconditionally-by-default).
+[ -z "${UNAOS_NOSMOLNET:-}" ] && _feats="${_feats}smolnet,"
 # VPERF M2: the fbcon viewport-cap bench lever (implies videobench). x86_64 only.
 [ -n "${UNAOS_VIDEOCAP:-}" ] && _feats="${_feats}videocap,"
 [ -n "${UNAOS_TEGRA:-}" ] && _feats="${_feats}tegra,"
@@ -128,6 +134,28 @@ if [ -n "$_feats" ]; then
     KERNEL_FEATURES="--features ${_feats%,}"
     echo -e "${COLOR_YELLOW}⚡ kernel features: ${_feats%,}${COLOR_RESET}"
 fi
+
+# SMOLNET-DEFAULT: `smolnet` is an x86-only feature — its optional smoltcp dep is x86-gated
+# (`[target.'cfg(target_arch="x86_64")'.dependencies]`) and its module + EVERY call site are
+# `#[cfg(all(feature="smolnet", target_arch="x86_64"))]`, so the aarch64 compiler never sees one byte
+# of it. Feeding it to an aarch64 cargo invocation is a no-op for the emitted CODE, but it shifts the
+# crate's cargo `-Cmetadata` fingerprint (the enabled-feature set is hashed into symbol manglings),
+# which would perturb the jetson media hash for zero observable change. `arm_features` echoes
+# $KERNEL_FEATURES with `smolnet` stripped, so every aarch64 kernel compile gets media BYTE-IDENTICAL
+# whether smolnet is default-on or opted out (the aarch64 byte-identity contract, enforced at build,
+# not merely claimed). x86 builds keep the full $KERNEL_FEATURES. (Pi `kernel8` builds from its own
+# curated K8_FEATS, which never carries smolnet, so it needs no strip.) Always exits 0.
+arm_features() {
+    case "$KERNEL_FEATURES" in
+        --features\ *) ;;
+        *) printf '%s' "$KERNEL_FEATURES"; return 0 ;;
+    esac
+    local f=",${KERNEL_FEATURES#--features },"
+    f="${f//,smolnet,/,}"
+    f="${f#,}"; f="${f%,}"
+    if [ -n "$f" ]; then printf -- '--features %s' "$f"; fi
+    return 0
+}
 
 # UNAOS_BOOTDIAG=1 turns on the BOOTLOADER's `bootdiag` feature — an additive UEFI boot-time
 # diagnostics block (firmware vendor/rev, GOP handle count, ConOut device path, DTB stdout-path +
@@ -222,9 +250,13 @@ build_user_hello_x86() {
 build_kernel_aarch64() {
     echo -e "${COLOR_YELLOW}⚡ Building aarch64 Kernel...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/kernel"
+    local _af; _af="$(arm_features)"
+    # Surface the effective aarch64 feature set when it differs from the (x86) banner — makes the
+    # SMOLNET-DEFAULT strip visible so an operator doesn't read `smolnet` off the banner for aarch64.
+    [ "$_af" != "$KERNEL_FEATURES" ] && echo -e "${COLOR_YELLOW}⚡ aarch64 effective features: ${_af#--features }${COLOR_RESET}"
     cargo +nightly build --release \
       --target ../../aarch64-unaos.json \
-      $NIGHTLY_FLAGS $KERNEL_FEATURES
+      $NIGHTLY_FLAGS $_af
     cd "$WORKSPACE_DIR"
     echo -e "${COLOR_GREEN}✅ aarch64 Kernel Built.${COLOR_RESET}"
 }
@@ -410,7 +442,7 @@ check_both() {
     echo -e "${COLOR_YELLOW}⚡ Syntax Check: aarch64...${COLOR_RESET}"
     cargo +nightly check --release \
       --target ../../aarch64-unaos.json \
-      $NIGHTLY_FLAGS $KERNEL_FEATURES
+      $NIGHTLY_FLAGS $(arm_features)
     cd "$WORKSPACE_DIR"
     echo -e "${COLOR_GREEN}✅ aarch64 OK${COLOR_RESET}"
 }
