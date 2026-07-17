@@ -4572,8 +4572,9 @@ cooperative pass** over a finite, BSP-pre-staged queue, then parks idle as befor
   spins (IRQ unmasked — the BSP→AP ping still lands) until released, then `run_until_empty(core)` drains
   its queue (real `dispatch_next` dispatches, each bumping `CPU_BUSY[core]`), then sets a per-core
   `SECWORK_DONE` flag.
-* BSP waits (bounded, ~200 ms ceiling) on every online `secondary_work_done(cpu)` before reading the
-  meter — so the busy witness never races an un-run core.
+* BSP waits on the completion **count** (`secondary_work_done == expected`) with a generous finite
+  backstop (~2 s) before reading the meter — so the busy witness never races an un-run core, and never
+  flakes when the host is loaded (a fixed short ceiling did; see Shared-tail safety below).
 * Run queues are per-CPU; a secondary drains **its own** queue and never contends the boot core's
   (which runs the JC3 CAPSTONE). No scheduling-path change; no counter altered; the idle-heartbeat
   seam and the deferred timer-stretch invariant are untouched.
@@ -4589,11 +4590,15 @@ unchanged.
 
 **Shared-tail safety (metal + probe).** `__secondary_rust_virt` is the *shared* real-entry tail for
 the `virt` `start_secondaries`, the real Orin `start_secondaries_tegra`, AND the SMP-probe legs — but
-only the `virt` BSP stages work and calls `secondary_work_go`. So `run_secondary_work`'s release wait
-is **bounded** (~20 ms one-shot ceiling): the `virt` release lands in microseconds (no added latency
-there), while the tegra/probe paths — which never stage — simply elapse the ceiling once at bring-up
-and park exactly as before (an empty-queue drain is a no-op). This can never hang a core, the failure
-mode an unbounded spin would introduce on every non-`virt` caller. **Consequence:** on real Orin today
+only the `virt` BSP arms the work (`SECWORK_ARMED`, set once before any `CPU_ON`) and calls
+`secondary_work_go`. So `run_secondary_work` returns immediately on the tegra/probe paths (not armed →
+**no wait at all**), while an armed `virt` secondary waits on `secondary_work_go` under a generous
+finite backstop (~1 s). Every wait is a finite safety backstop, not the normal-case timing (which
+completes in microseconds when the host is idle) — so the witness stays **deterministic even under
+heavy host load** (proven at 8× CPU oversaturation), where the earlier fixed ~20 ms one-shot ceiling
+flaked (slow-to-arrive secondaries missed the window and parked idle → spurious `busy=0` FAIL). No
+path can hang a core, the failure mode an unbounded spin would introduce on every non-`virt` caller.
+**Consequence:** on real Orin today
 the secondaries still park *idle* (the tegra path stages no work), so metal shows the idle bar, not a
 busy one. A **live vug busy bar on a metal secondary** requires the tegra bring-up to also stage +
 release cooperative work — a small, attended follow-up (staging cooperative EL2 work on real Orin
