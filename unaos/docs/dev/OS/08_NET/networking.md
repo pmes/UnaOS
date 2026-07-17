@@ -547,13 +547,14 @@ descriptor — capability-scoped by construction, with no web-stack bloat.
 
 ### The blocklist is a FILE (STOR feeds NET)
 
-The blocklist lives on the FAT volume as `BLOCK.TXT` (planted by `make-fat-img.sh`: one UPPERCASE name per
-line, ASCII, LF-terminated — `ADS.EXAMPLE` + `TRACK.EXAMPLE`). At start the resolver opens it via the S7
-dynamic-open path (`sys_open("BLOCK.TXT")` → not staged → `open_dynamic_ondisk` → a real on-disk read) and
-`sys_read`s it into a ring-3 buffer — a genuine cross-subsystem composition witness (STOR feeds NET). The
-S7 path needs `UNAOS_IRQSTORAGE=1` + a mounted FAT (`UNAOS_FATIMG=sf`); with **no** FAT the open fails and
-the resolver falls back to a tiny **builtin list** (the same two names) and prints an honest `builtin list
-(no FAT)` marker, so the pure-net legs still witness under `UNAOS_SMOLNET=1` alone.
+The blocklist lives on the FAT volume as `BLOCK.TXT` (planted by `make-fat-img.sh`). As of **ZEOLITE-2**
+(below) it is **real hosts-file format** — the format actual sinkhole lists ship in (see the ZEOLITE-2
+section); SINKHOLE-1 shipped a toy format (one UPPERCASE name per line). At start the resolver opens it via
+the S7 dynamic-open path (`sys_open("BLOCK.TXT")` → not staged → `open_dynamic_ondisk` → a real on-disk
+read) and `sys_read`s it into a ring-3 buffer — a genuine cross-subsystem composition witness (STOR feeds
+NET). The S7 path needs `UNAOS_IRQSTORAGE=1` + a mounted FAT (`UNAOS_FATIMG=sf`); with **no** FAT the open
+fails and the resolver falls back to a tiny **builtin list** (same entries, same format) and prints an
+honest `builtin list (no FAT)` marker, so the pure-net legs still witness under `UNAOS_SMOLNET=1` alone.
 
 ### The witness-medium decision (resolved: split legs)
 
@@ -607,9 +608,78 @@ to the copied question — no attacker-controlled length feeds any arithmetic.
   committed hermetic gate carries the PENDING line, as SOCK-6/7 do.
 - **Single in-flight forward, no cache, no query log, single question / A-record only, fail-`malformed`**
   (a packet the parser rejects is neither sinkholed nor forwarded — the conservative choice for a hostile
-  payload). All per the first-slice scope; the appliance story (aarch64/GENET NIC, ingest, logging, stats
-  view, kit) is future work.
+  payload). All per the first-slice scope. (Blocklist **ingest**, subdomain **matching**, and **metrics**
+  were the next slice — see ZEOLITE-2 below; cache, query log, and multi-in-flight forwarding remain future
+  work, along with the aarch64/GENET NIC and the kit.)
 - **`copy_from_user`** for socket/name buffers remains the deferred hardening all of SOCK-2..7 carry.
+
+## ZEOLITE-2 (zeolite) — real blocklist ingest, subdomain matching, metrics
+
+ZEOLITE-2 is the honest second slice: it makes the resolver's list handling **real** without adding a
+syscall, a ring-3 surface, or a kernel-net change (all still `#[cfg(all(feature = "smolnet", target_arch =
+"x86_64"))]` — aarch64 and the knob-off path stay byte-identical). Three milestones, all inside the
+`zeolite-resolver` blob + its launcher.
+
+### M1 — hosts-format blocklist ingest
+
+SINKHOLE-1's blocklist was a toy format (one bare `UPPERCASE` name per line, exact whole-name compare).
+ZEOLITE-2 parses **real hosts-file format** — what Steven Black hosts, AdAway, and friends actually ship:
+an IP redirect target (`0.0.0.0` / `127.0.0.1`) followed by whitespace and the domain, with `#`/`;`
+comments (whole-line and trailing) and blank lines tolerated. Per line the `FILEBUF` walk in
+`zdns_parse_and_match` now: skips leading whitespace; drops blank + `#`/`;` comment lines; takes the
+**domain** as field-2 when a second whitespace-delimited field exists (the `0.0.0.0 domain` form) else
+field-1 (bare `domain`, back-compat); compares the domain to the queried name case-insensitively. The
+planted `BLOCK.TXT` and the builtin fallback both adopt the format:
+
+```
+# zeolite DNS sinkhole blocklist (hosts format)
+0.0.0.0 ads.example
+0.0.0.0 track.example   # inline comment tolerated
+
+; semicolon comments and blank lines are skipped
+127.0.0.1 telemetry.example
+```
+
+The parser stays **hostile-input-hardened**: a blocklist file is untrusted input exactly like a packet, so
+every byte access is bounds-checked against `file_len` — a truncated IP field, a line with no domain, a
+2048-byte line, an all-comment file, or embedded control bytes can never read past the buffer or crash; a
+malformed line simply matches nothing and is skipped.
+
+### M2 — label-boundary suffix (subdomain) matching
+
+A blocked base domain now sinkholes its subdomains, the way a real sinkhole does: with `ads.example` on the
+list, a query for `www.ads.example` is **BLOCKED**, but `notads.example` — which shares the *string* suffix
+`ads.example` yet not on a **label boundary** — is **NOT**. The compare matches the blocklist domain against
+the tail of the queried name and blocks iff `name == domain` OR `name` ends with `"." + domain` (the byte
+before the tail must be `.`). Bounds are unchanged: the tail offset is `namelen − domainlen` with
+`domainlen ≤ namelen` enforced first, so no read crosses the name buffer. Two inline self-tests witness both
+directions (`WWW.ADS.EXAMPLE` → BLOCKED, `NOTADS.EXAMPLE` → not over-blocked).
+
+### M3 — resolver metrics (the honest source for a stats view)
+
+The resolver counts its own activity — **queries seen**, **blocked (sinkholed)**, **forwarded upstream** —
+and reports it in a verdict line:
+
+```
+:: zeolite: metrics — 4 queries seen, 2 blocked (sinkholed), 1 forwarded upstream ::
+```
+
+This is the pitch's stats/admin-panel **honest data source** — a future quartzite/Surface widget reads
+these numbers rather than fabricating them. It carries out with **no new syscall**: the three counts
+saturate at 63 and pack into the spare high bits of the single witness/exit word (seen → bits `[10:16]`,
+blocked → `[16:22]`, forwarded → `[22:28]`, all clear of the `bit0..9` decision flags); the launcher decodes
+and prints them. Hermetically the tally is deterministic (the fixed self-tests give 4 / 2 / 1), so the
+regression asserts it; over the wire the serve loop bumps seen/blocked per real query.
+
+The leg-1 witness line now folds in the ingest + suffix proof:
+
+```
+:: zeolite: hosts-format blocklist from BLOCK.TXT via S7 dynamic-open, blocked ADS.EXAMPLE -> 0.0.0.0 (answer built), subdomain WWW.ADS.EXAMPLE sinkholed + NOTADS.EXAMPLE not over-blocked, forwarded una.os -> 10.0.2.3:53 real answer relayed — witness OK ::
+```
+
+Reproduce (hermetic, forward+suffix+metrics OK, serve PENDING): `UNAOS_SMOLNET=1 ./arroyo test 90`. Full
+composition (hosts-format blocklist from FAT): `UNAOS_SMOLNET=1 UNAOS_IRQSTORAGE=1 UNAOS_FATIMG=sf ./arroyo
+test 200`. The over-the-wire serve leg is unchanged from SINKHOLE-1 (injector-driven; PENDING hermetically).
 
 ## The road from here
 
@@ -622,5 +692,6 @@ to the copied question — no attacker-controlled length feeds any arithmetic.
 | SOCK-5 | DHCP via smoltcp — the persistent stack leases its own address with `dhcpv4::Socket`; no new syscall, no ring-3 surface, static fallback |
 | SOCK-6 | TCP server/listen sockets (`sys_listen`/`sys_accept`, #26–27) — ring 3 accepts inbound TCP; accept mints a fresh gen-fenced socket cap; net-inject `UNAOS_NET=socket` witness |
 | SOCK-7 | persistent-listener acceptor pool — `sys_listen` arms a listener that survives accepts; each `sys_accept` peels a fresh gen-fenced connection + re-arms the listener in place (buffer free-list, shape (i)); no new syscall; net-inject `sock7` two-connection witness |
-| **SINKHOLE-1** (zeolite, this) | ring-3 DNS resolver/sinkhole — binds `:53`, blocks names from `BLOCK.TXT` (read via the S7 dynamic-open path) with `0.0.0.0`, forwards the rest to `10.0.2.3:53`; hardened hostile-payload parser; no new syscall; net-inject `dns` sinkhole witness |
-| SOCK-8+ | aarch64 NIC bring-up (Pi GENET); the DNS appliance (ingest, cache, query log, stats view, kit); retire the hand-rolled shell surface + `crates/net` DHCP |
+| SINKHOLE-1 (zeolite) | ring-3 DNS resolver/sinkhole — binds `:53`, blocks names from `BLOCK.TXT` (read via the S7 dynamic-open path) with `0.0.0.0`, forwards the rest to `10.0.2.3:53`; hardened hostile-payload parser; no new syscall; net-inject `dns` sinkhole witness |
+| **ZEOLITE-2** (zeolite, this) | real hosts-file blocklist ingest (IP + domain, `#`/`;` comments, blank lines — hostile-input-hardened); label-boundary suffix matching (a blocked base domain sinkholes its subdomains); resolver metrics (queries seen / blocked / forwarded — the honest source for a stats view); no new syscall |
+| SOCK-8+ | aarch64 NIC bring-up (Pi GENET); the rest of the DNS appliance (cache, query log, stats view, kit); retire the hand-rolled shell surface + `crates/net` DHCP |
