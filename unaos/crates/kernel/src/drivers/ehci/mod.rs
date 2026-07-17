@@ -310,18 +310,20 @@ impl Controller {
         // continuous). HS targets get S-mask 0xFF (every µframe → ~1 ms per control transfer);
         // FS/LS-behind-TT keep the split masks (SSPLIT µframe 0, CSPLITs 2-4). The async ring
         // stays programmed-but-disabled (ASE is never set).
+        // Periodic-QH discipline (probe-14c: RL must be 0 on periodic QHs — the RL=4 async
+        // idiom made the QH invisible to the periodic scheduler; S-mask 0x01 is the exact
+        // shape every passing smoke used).
         let qh = self.async_qh;
         let mut chars = (t.addr as u32)
             | t.eps
             | QH_DTC
-            | (4 << 28)
             | ((t.mps0 as u32) << QH_MPS_SHIFT);
         if t.eps != QH_EPS_HIGH {
             chars |= QH_CTL_EP;
         }
         (*qh).ep_chars = chars;
         let masks = if t.eps == QH_EPS_HIGH {
-            0xFF << QH_SMASK_SHIFT
+            0x01 << QH_SMASK_SHIFT
         } else {
             (0x01 << QH_SMASK_SHIFT) | (0x1C << QH_CMASK_SHIFT)
         };
