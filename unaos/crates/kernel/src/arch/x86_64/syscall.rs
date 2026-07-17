@@ -10812,70 +10812,157 @@ zdns_noup:
     jnz zdns_copy_lbl
     jmp zdns_lbl_loop
 zdns_name_done:
-    // Match NAMEBUF[0..r11] (uppercase) against the blocklist lines in FILEBUF.
+    // Match NAMEBUF[0..r11] (uppercase) against a hosts-format blocklist in FILEBUF (ZEOLITE-2 M1).
+    // Real sinkhole lists ship in hosts form: "<ip> <domain>  [# comment]", plus '#'/';' comment lines
+    // and blank lines. Per line: skip leading whitespace (SP/TAB); drop blank + '#'/';' comment lines;
+    // the DOMAIN is field-2 when a second whitespace-delimited field exists (the "0.0.0.0 domain" form),
+    // else field-1 (bare "domain"); the domain is compared to NAMEBUF case-insensitively. Every byte
+    // access is bounds-checked against fend (r9) — a hostile BLOCK.TXT can never read past file_len or
+    // crash; a malformed line simply matches nothing and is skipped. Preserves r10 (NAMEBUF), r11 (len).
     test r11, r11
     jz zdns_not_blocked                       // empty (root) name matches nothing
-    lea r8, [r14 + 0x000]                     // fp = FILEBUF
-    mov rcx, [r14 + 0xD00]                    // file_len
-    mov r9, r8
-    add r9, rcx                               // fend
+    lea r8, [r14 + 0x000]                     // r8 = line cursor, = FILEBUF
+    mov rax, [r14 + 0xD00]                    // file_len
+    lea r9, [r14 + rax]                       // r9 = fend = FILEBUF + file_len
 zdns_line_start:
     cmp r8, r9
     jae zdns_not_blocked
-    xor rcx, rcx                              // idx into NAMEBUF
-    mov rdx, r8                               // p = line cursor
-zdns_cmp_char:
-    cmp rdx, r9
-    jae zdns_line_end                         // EOF ends the line
-    mov al, byte ptr [rdx]
-    cmp al, 0x0A                              // '\n'
-    je zdns_line_end
-    cmp al, 0x0D                              // '\r'
-    je zdns_line_end
-    cmp rcx, r11
-    jae zdns_line_nomatch                     // line longer than the name -> no match
-    cmp al, 0x61
-    jb zdns_lnoup
-    cmp al, 0x7A
-    ja zdns_lnoup
-    sub al, 0x20
-zdns_lnoup:
-    cmp al, byte ptr [r10 + rcx]
-    jne zdns_line_nomatch
-    inc rcx
-    inc rdx
-    jmp zdns_cmp_char
-zdns_line_end:
-    cmp rcx, r11                              // whole name consumed AND line ended -> exact match
-    je zdns_blocked
-    mov r8, rdx
-    jmp zdns_skip_eol
-zdns_line_nomatch:
-    // scan rdx forward to the end of this line, then advance past the EOL
-zdns_scan_eol:
-    cmp rdx, r9
-    jae zdns_adv
-    mov al, byte ptr [rdx]
-    cmp al, 0x0A
-    je zdns_adv
+zdns_skip_ws1:                                // skip leading whitespace (SP/TAB)
+    cmp r8, r9
+    jae zdns_not_blocked
+    mov al, byte ptr [r8]
+    cmp al, 0x20
+    je zdns_ws1_inc
+    cmp al, 0x09
+    je zdns_ws1_inc
+    jmp zdns_after_ws1
+zdns_ws1_inc:
+    inc r8
+    jmp zdns_skip_ws1
+zdns_after_ws1:
+    cmp al, 0x0A                              // blank line (EOL right away) -> next line
+    je zdns_eol_adv
     cmp al, 0x0D
-    je zdns_adv
+    je zdns_eol_adv
+    cmp al, 0x23                              // '#' comment line
+    je zdns_toeol
+    cmp al, 0x3B                              // ';' comment line
+    je zdns_toeol
+    // FIELD1: [rsi, rdi) = a run of non-whitespace, non-comment, non-EOL bytes.
+    mov rsi, r8                               // field1 start
+    mov rdi, r8                               // scan cursor
+zdns_f1_scan:
+    cmp rdi, r9
+    jae zdns_f1_end
+    mov al, byte ptr [rdi]
+    cmp al, 0x20
+    je zdns_f1_end
+    cmp al, 0x09
+    je zdns_f1_end
+    cmp al, 0x0A
+    je zdns_f1_end
+    cmp al, 0x0D
+    je zdns_f1_end
+    cmp al, 0x23
+    je zdns_f1_end
+    cmp al, 0x3B
+    je zdns_f1_end
+    inc rdi
+    jmp zdns_f1_scan
+zdns_f1_end:
+    // Default domain = field1 [rsi, rdi). Look for a second field after whitespace.
+    mov rdx, rsi                              // rdx = domain start (default field1)
+    mov rcx, rdi                              // rcx = domain end   (default field1)
+    mov r8, rdi                               // advance line cursor past field1
+zdns_skip_ws2:
+    cmp r8, r9
+    jae zdns_have_domain                      // EOF after field1 -> bare-name form
+    mov al, byte ptr [r8]
+    cmp al, 0x20
+    je zdns_ws2_inc
+    cmp al, 0x09
+    je zdns_ws2_inc
+    jmp zdns_after_ws2
+zdns_ws2_inc:
+    inc r8
+    jmp zdns_skip_ws2
+zdns_after_ws2:
+    cmp al, 0x0A                              // EOL/comment after field1 -> no field2 (bare-name form)
+    je zdns_have_domain
+    cmp al, 0x0D
+    je zdns_have_domain
+    cmp al, 0x23
+    je zdns_have_domain
+    cmp al, 0x3B
+    je zdns_have_domain
+    // There IS a field2 -> the DOMAIN is field2 (the "0.0.0.0 domain" hosts form).
+    mov rdx, r8                               // domain start = field2 start
+    mov rdi, r8
+zdns_f2_scan:
+    cmp rdi, r9
+    jae zdns_f2_end
+    mov al, byte ptr [rdi]
+    cmp al, 0x20
+    je zdns_f2_end
+    cmp al, 0x09
+    je zdns_f2_end
+    cmp al, 0x0A
+    je zdns_f2_end
+    cmp al, 0x0D
+    je zdns_f2_end
+    cmp al, 0x23
+    je zdns_f2_end
+    cmp al, 0x3B
+    je zdns_f2_end
+    inc rdi
+    jmp zdns_f2_scan
+zdns_f2_end:
+    mov rcx, rdi                              // domain end = field2 end
+    mov r8, rdi                               // line cursor past field2
+zdns_have_domain:
+    // Domain field = [rdx, rcx). Compare to NAMEBUF[0..r11] (uppercase), EXACT (M1).
+    mov rax, rcx
+    sub rax, rdx                              // rax = domain length
+    cmp rax, r11
+    jne zdns_toeol                            // length mismatch -> not this line, skip to EOL
+    xor rdi, rdi                              // NAMEBUF idx
+zdns_dom_cmp:
+    cmp rdx, rcx
+    jae zdns_blocked                          // whole domain consumed, lengths equal -> exact match
+    mov al, byte ptr [rdx]
+    cmp al, 0x61                              // upper-case the file side
+    jb zdns_dcu
+    cmp al, 0x7A
+    ja zdns_dcu
+    sub al, 0x20
+zdns_dcu:
+    cmp al, byte ptr [r10 + rdi]
+    jne zdns_toeol                            // mismatch -> skip to EOL, next line
     inc rdx
-    jmp zdns_scan_eol
-zdns_adv:
-    mov r8, rdx
-zdns_skip_eol:
+    inc rdi
+    jmp zdns_dom_cmp
+zdns_toeol:                                   // scan r8 to end-of-line, then advance past the EOL bytes
     cmp r8, r9
     jae zdns_not_blocked
     mov al, byte ptr [r8]
     cmp al, 0x0A
-    je zdns_skip_inc
+    je zdns_eol_adv
     cmp al, 0x0D
-    je zdns_skip_inc
-    jmp zdns_line_start
-zdns_skip_inc:
+    je zdns_eol_adv
     inc r8
-    jmp zdns_skip_eol
+    jmp zdns_toeol
+zdns_eol_adv:
+    cmp r8, r9
+    jae zdns_not_blocked
+    mov al, byte ptr [r8]
+    cmp al, 0x0A
+    je zdns_eol_adv_inc
+    cmp al, 0x0D
+    je zdns_eol_adv_inc
+    jmp zdns_line_start
+zdns_eol_adv_inc:
+    inc r8
+    jmp zdns_eol_adv
 zdns_blocked:
     mov rax, 1
     ret
@@ -10925,7 +11012,11 @@ zdns_blockname_end:
 zdns_builtinlen:
     .quad zdns_builtinlist_end - zdns_builtinlist
 zdns_builtinlist:
-    .ascii "ADS.EXAMPLE\nTRACK.EXAMPLE\n"
+    // Builtin fallback in the SAME hosts-file format as BLOCK.TXT (lowercase domains — the parser
+    // upper-cases the file side, so this also exercises case-insensitive ingest).
+    // (Leading newline is deliberate: a hash immediately after the opening quote would read as the
+    // enclosing Rust raw-string terminator. The blank first line is skipped by the parser.)
+    .ascii "\n# zeolite builtin blocklist (hosts format)\n0.0.0.0 ads.example\n0.0.0.0 track.example\n"
 zdns_builtinlist_end:
     // Inline DNS query for ADS.EXAMPLE (header + QNAME + QTYPE A + QCLASS IN). txn id 0x5A44 = "ZD".
     .balign 8
