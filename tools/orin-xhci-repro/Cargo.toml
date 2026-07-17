@@ -1,0 +1,21 @@
+[package]
+name = "orin-xhci-repro"
+version = "0.1.0"
+edition = "2024"
+description = "Standalone UEFI reproducer for the Tegra234/Orin xHCI-takeover RAS carveout fault (NVIDIA developer forum topic 377113)."
+
+# Deliberately its OWN cargo workspace root (this table is what makes that so) — this crate
+# lives inside the UnaOS repo tree for cataloging, but is meant to be handed to a third party
+# (NVIDIA) and built with nothing but `cargo` + the `aarch64-unknown-uefi` target + `rust-src`.
+# It must never need the rest of the UnaOS workspace to resolve or build. See README.md.
+[workspace]
+
+[[bin]]
+name = "orin-xhci-repro"
+path = "src/main.rs"
+
+[dependencies]
+# Same `uefi` crate + version the UnaOS bootloader already uses
+# (unaos/crates/bootloader/Cargo.toml) — no exotic pin, just pinned for reproducibility.
+uefi = { version = "0.38.0", features = ["logger", "panic_handler"] }
+log = "0.4.21"
