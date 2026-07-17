@@ -16,8 +16,11 @@
 //
 // SOCK-1 (ROADMAP §1b): the smoltcp 0.13 adapter. A `smoltcp::phy::Device` over the e1000e RX/TX
 // rings + an `Interface` (10.0.2.15/24, gw 10.0.2.2) that carries the shell's `ping`/`arp`/`netinfo`
-// and the boot connectivity witness through the mature stack, KNOB-ON (`UNAOS_SMOLNET=1`). The
-// hand-rolled `net` engines stay compiled and still own `connect`/`fetch`/`udpsend` this arc.
+// and the boot connectivity witness through the mature stack. As of SMOLNET-DEFAULT (2026-07-17)
+// smoltcp is the DEFAULT x86 net stack; this module compiles by default and is dropped only under
+// `UNAOS_NOSMOLNET=1` (the opt-out to the hand-rolled stack). The hand-rolled `net` engines stay
+// compiled and live regardless and still own `connect`/`fetch`/`udpsend`, the TCP echo listener, and
+// driver DHCP.
 //
 // Design (see docs/dev/OS/08_NET/networking.md):
 //  * Everything is STATIC / stack-local — no heap growth. Each blocking op (`ping`/`arp`/witness)
