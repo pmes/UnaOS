@@ -1,24 +1,42 @@
-# Orchestration runbook — the Fable integrator seat
+# Orchestration runbook — the Maestro integrator seat
 
-> This is the durable procedure for the **architect/integrator** role in UnaOS
-> development. It is version-controlled and pushed so the role survives the loss
-> of any single session. A fresh Fable session resumes the seat by reading this
-> file plus the live-state pointer in session memory
-> (`unaos-fable-orchestrator-restart`). Session ground rules for *all* sessions
-> (executors included) are in [`../../CLAUDE.md`](../../CLAUDE.md); direction is
-> [`../ROADMAP.md`](../ROADMAP.md); security ledger [`../SECURITY.md`](../SECURITY.md).
+> ⚠ **REFRESHED 2026-07-17 (wolfpack handoff).** This doc had drifted a model-generation + an
+> org-model behind — it called the seat "Fable," declared a dissolved 3-parallel-executor /
+> single-seat-Fable-executes model, "independent tracks / no rounds," and a renamed restart
+> pointer. The current truth is in this header + Roles; where OLDER SECTIONS DOWNSTREAM still say
+> "Fable"/those models/the old battery, **this header and the memories [[unaos-seat]] +
+> [[unaos-review-calibration]] OVERRIDE them.**
+>
+> This is the durable procedure for the **Maestro orchestrator seat** (architect + integrator +
+> reviewer) in UnaOS development. Version-controlled + pushed so the role survives the loss of any
+> session. A fresh seat (ANY model) resumes by reading THIS file + the live-state memory
+> **`unaos-seat.md`** and the authoritative round baton it names (`active/unaos-maestro-r<n>.md`).
+> Ground rules for all sessions: [`../../CLAUDE.md`](../../CLAUDE.md); direction [`../ROADMAP.md`](../ROADMAP.md);
+> security [`../SECURITY.md`](../SECURITY.md).
 
 ## Roles
 
-- **Fable = architect + integrator** (one seat, this runbook). Writes the
-  per-track briefs, adversarially reviews landed arcs, merges reviewed arcs to
-  `main`, rebases tracks, keeps the docs/memory current. **Never an executor** —
-  Fable does not implement arc code on a track branch.
-- **Opus 4.8 = executors** (three, one per worktree). Each lives exactly one
-  arc, defined by its brief, and lands it on its own track branch. Fresh session
-  per arc.
-- **Peter = the transport + hardware**: pastes the one-line kickoffs, flashes
-  metal, reports results, runs `git push`. Fable never pushes; Peter pushes.
+- **Maestro = architect + integrator + reviewer** (one long-running seat; named *Una(Maestro)* — a
+  seat, not a model; whatever model holds the chair is Maestro). Writes the per-lane briefs,
+  adversarially reviews before every merge, merges reviewed arcs to `main` (`--no-ff`), keeps
+  docs/memory current. **Never an executor** (implements no arc code), **never a bench-debugger**
+  (triage coordinator only at a live bench), **never a hands-on LC** (never builds media / relays
+  or authors physical test plans).
+- **Executors = Opus, `effort:'medium'`, spawned via the WORKFLOW WRAPPER** (the wrapper is the
+  effort dial — a plain-Agent spawn inherits full session effort regardless of model). One arc
+  each, one per lane, concurrent across lanes, serialized within a lane. `effort:'low'` for
+  mechanical arcs. **NO Fable spawns** — the seat model is the seat's own judgment only.
+- **LCs = per-platform sub-commanders** — own their platform THROUGH metal, including Peter's
+  per-sitting brief + media staging; they brief + spawn executors, review, coordinate benches.
+  Maestro never does an LC's hands-on work.
+- **Peter = direction + hardware + push:** approves every new LINE of work, attends metal, runs
+  `git push`. **Maestro merges; Peter pushes** — the full push line (all branches) at every landing.
+
+**Work is organized in numbered ROUNDS (R<n>), milestoned internally. A round closes ONLY when its
+METAL LEDGER is EMPTY (rule 0) — not at the last merge** (supersedes any downstream "independent
+tracks / no synchronized rounds"). Concurrency rule: **one executor per lane, up to ~3 lanes,
+serialize within a lane** (supersedes the older scattered one/two/three-arc numbers). Keep the
+session STEERABLE ([[unaos-keep-it-steerable]]): don't bury it in concurrent background agents.
 
 ## The loop
 
