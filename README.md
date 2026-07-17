@@ -160,6 +160,34 @@ cargo test -p net       # network-stack host unit tests
 
 The host-native userspace builds with a normal `cargo build` from the repo root.
 
+## Try UnaOS in a VM
+
+`./arroyo vm-image` (from `unaos/`) packages the same x86 boot products the
+`esp-x86` path proves into **one self-contained, distributable disk image**:
+
+```
+./arroyo vm-image       # -> target/vm/unaos-x86-<git7>.img  (+ printed sha256)
+```
+
+The `.img` is a GPT disk with a FAT32 EFI System Partition carrying the boot
+tree (`EFI/BOOT/BOOTX64.EFI` + `kernel.elf`) and a `README-VM.txt`. It builds in
+pure Rust (the [`fatfs`](https://crates.io/crates/fatfs) crate for the
+filesystem, a hand-written GPT + protective MBR in `builder/src/vm_image.rs`) —
+no `mkfs.vfat`/`hdiutil`, and the disk/partition GUIDs are derived
+deterministically from the git hash. It boots on any UEFI/EFI VM with **zero
+UnaOS tooling on the consumer's machine**:
+
+```
+qemu-system-x86_64 -machine q35 -m 1G \
+  -drive if=pflash,format=raw,readonly=on,file=<OVMF_CODE.fd> \
+  -drive format=raw,file=target/vm/unaos-x86-<git7>.img \
+  -serial stdio
+```
+
+`README-VM.txt` inside the image has the UTM (macOS), VirtualBox, and VMware
+click-paths (enable EFI, attach the disk). The boot log appears on the serial
+console; the shell appears in the VM's graphical window.
+
 ---
 
 *Est. 2026 — The Architect & Una*

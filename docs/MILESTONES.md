@@ -10,6 +10,36 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-jetson track — 2026-07-17 (VMIMAGE-1 — `arroyo vm-image`: a shareable bootable disk image) 📦 host lane, full arc (M1–M3), zero kernel surface
+
+### VMIMAGE-1 — `./arroyo vm-image` → one self-contained GPT+FAT32 `.img` 📦 pure-Rust packaging (fatfs + hand-written GPT; no host mkfs/hdiutil)
+
+**What it does.** Adds `./arroyo vm-image`, which packages the SAME x86 build
+products the `esp-x86` path proves (kernel + bootloader + the boot tree) into
+**one distributable disk image** — `target/vm/unaos-x86-<git7>.img` — a GPT disk
+carrying a single FAT32 EFI System Partition with `EFI/BOOT/BOOTX64.EFI` +
+`kernel.elf` + a `README-VM.txt`. It boots in stock QEMU+OVMF, UTM, and
+VirtualBox/VMware with EFI enabled, with **zero UnaOS tooling on the consumer's
+machine**. No parallel build logic: the builder gains a `UNAOS_VM_IMAGE` mode
+(`builder/src/vm_image.rs`) that runs AFTER the existing kernel/bootloader/ESP
+packaging and only packages what was just built. The FAT32 filesystem is written
+with the pure-Rust `fatfs` crate; the GPT + protective MBR are hand-written so
+the disk/partition GUIDs are **deterministic from the git hash** (reproducible
+partition table). Writes only to `target/vm/` (never disturbs the `target/`
+state the test harness uses) and prints the image path + sha256. `README-VM.txt`
+inside the image carries the QEMU/UTM/VirtualBox/VMware boot recipes.
+
+**How it was tested.** M1 image checks: GPT primary header valid (`EFI PART`,
+rev 1.0, size 92), protective-MBR type `0xEE`, the FAT32 volume mounts host-side,
+and `BOOTX64.EFI` + `kernel.elf` are byte-identical (`cmp`) to the build
+products. M2: booted the image in **stock QEMU+OVMF without the arroyo harness
+flags** (the consumer's exact command) — OVMF's BdsDxe loaded Boot0001 off the
+image's ESP, the UnaOS bootloader + kernel came up through VUG init /
+framebuffer / self-tests (serial evidence in the landing report). DONE gates:
+`./arroyo check` ✅ x86_64 / ✅ aarch64 (proves zero kernel surface); `./arroyo
+test 40` → **MISSION SUCCESS** (existing x86 QEMU suite unbroken). Landing report
+`review/unaos-vmimage-LANDING.md`.
+
 ## hw-jetson track — 2026-07-17 (SURFACE-1 — the quartzite Surface primitive + the paper taste-gate) 🎨 TASTE-GATE PASSED, full arc (M1+M2)
 
 ### SURFACE-1 — procedural paper surfaces + the sample board + `Surface::Paper` 🎨 host-native (quartzite; 8 new tests; zero kernel surface)
