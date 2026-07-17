@@ -44,10 +44,13 @@ pub mod selftest;
 #[cfg(target_arch = "x86_64")]
 pub mod flight_recorder;
 
-// RAST-1: the `rast` software-rasterizer demo (spinning flat-shaded cube through the panel
-// framebuffer path). x86/virt-only + `rast`-feature-gated (UNAOS_RAST=1), so aarch64 and knob-off
-// builds never link it (byte-identical). See docs/dev/OS/08_VIDEO/rasterizer.md.
-#[cfg(all(feature = "rast", target_arch = "x86_64"))]
+// RAST-1 / RAST-TEGRA: the `rast` software-rasterizer demo (spinning flat-shaded cube through the
+// panel framebuffer path). The module is platform-neutral by construction — it draws only through
+// the public `Screen` API — so it is `rast`-feature-gated (UNAOS_RAST=1) but NOT arch-gated: x86/virt
+// (RAST-1), aarch64/virt (the QEMU-witnessable panel path), and aarch64/tegra (RAST-TEGRA, the Orin
+// panel) all link the same code. Knob-off builds never link it (byte-identical, both arches). See
+// docs/dev/OS/08_VIDEO/rasterizer.md.
+#[cfg(feature = "rast")]
 pub mod rast_demo;
 
 pub mod pal;

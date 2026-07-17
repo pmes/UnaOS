@@ -838,10 +838,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let front_fb = *unaos_kernel::video::WRITER.lock();
     let mut screen = unaos_kernel::video::Screen::new(front_fb);
 
-    // RAST-1 (x86/virt, `rast` knob): run the software-rasterizer spinning-cube demo through the
-    // panel `Screen` (call-never-edit), then hand the panel back to the shell below. Bounded frame
-    // count so boot never hangs. Feature-gated: knob-off builds are byte-identical (module unlinked).
-    #[cfg(all(target_arch = "x86_64", feature = "rast"))]
+    // RAST-1/RAST-TEGRA (x86/virt + aarch64/virt, `rast` knob): run the software-rasterizer cube demo
+    // through the panel `Screen` (call-never-edit), then hand the panel back. QEMU-witnessable path —
+    // GICv2 virt + ramfb reaches here (Orin panel is wired in `tegra_early_stop`). Byte-identical off.
+    #[cfg(all(feature = "rast", not(feature = "pi"), not(feature = "tegra")))]
     {
         unaos_kernel::video::fbcon::detach();
         unaos_kernel::rast_demo::run(&mut screen);
@@ -1501,7 +1501,7 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     }
     unaos_kernel::arch::percpu::init(0);
     unaos_kernel::arch::exceptions::install();
-    unaos_kernel::arch::sched::run_capstone_boot_core(0);
+    tegra_rast_demo_maybe(); unaos_kernel::arch::sched::run_capstone_boot_core(0); // RAST-TEGRA demo (no-op unless UNAOS_RAST=1) on the same line as the terminus so the wire-in adds ZERO source lines before any panic Location — the tegra knob-off byte-identity constraint (PI-V3D-1 bisect-proven). Helper defined at file tail.
 }
 
 /// Handle one keyboard byte against the console: printable ASCII extends the input line, backspace
@@ -1786,3 +1786,36 @@ fn panic(info: &PanicInfo) -> ! {
     serial_println!("{}", info);
     unaos_kernel::arch::hlt_loop();
 }
+
+// ── RAST-TEGRA ──────────────────────────────────────────────────────────────────────────────────
+// The Orin-panel wire-in of the `rast` software rasterizer. Called from the tail of `tegra_early_stop`
+// (post-drop, at EL1, right before `run_capstone_boot_core`) so the spinning cube draws through the
+// JD1-inherited scanout as the last panel content of the boot. Kept HERE at the file tail — and called
+// on the SAME source line as the terminus above — so the whole wire-in adds zero source lines ahead of
+// any panic `Location` literal: the tegra knob-off kernel is byte-identical to baseline (the panic-line
+// byte-identity constraint, PI-V3D-1 bisect-proven). Same `Screen` present path RAST-1 proved on x86,
+// call-never-edit on the shared surface. Panel comes off `video::WRITER` (seeded by JD1 in
+// `tegra_early_stop`, mapped into BOTH translation tables so it is reachable post-drop at EL1); the
+// back buffer and depth buffer come off the live 48 MiB heap. `crate::arch::ms()` reads CNTVCT on the
+// timerless post-drop core (the VUGFIX tegra fallback), so the honest fps line still ticks.
+#[cfg(all(feature = "tegra", feature = "rast", target_arch = "aarch64"))]
+fn tegra_rast_demo_maybe() {
+    let front_fb = *unaos_kernel::video::WRITER.lock();
+    // Headless boot (no JD1 scanout → WRITER never seeded): nothing to draw on, stay silent-ish.
+    if front_fb.info().width == 0 {
+        serial_println!(":: RAST: tegra headless (no JD1 scanout) — cube demo skipped ::");
+        return;
+    }
+    // Detach fbcon's serial mirror first so a CAPSTONE straggler line can't paint over the demo
+    // frames (serial output is unaffected). Mirrors the x86/virt wire-in and the JD2 phase-2 takeover.
+    unaos_kernel::video::fbcon::detach();
+    serial_println!(":: RAST: tegra — first 3D pixels on the Orin panel (inherited scanout) ::");
+    let mut screen = unaos_kernel::video::Screen::new(front_fb);
+    unaos_kernel::rast_demo::run(&mut screen);
+}
+
+// Knob-off / non-rast tegra build: the wire-in compiles to nothing. `#[inline(always)]` on an empty
+// body means the call above emits zero instructions, so the tegra image stays byte-identical.
+#[cfg(all(feature = "tegra", not(feature = "rast"), target_arch = "aarch64"))]
+#[inline(always)]
+fn tegra_rast_demo_maybe() {}

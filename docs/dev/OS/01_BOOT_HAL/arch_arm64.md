@@ -3095,6 +3095,29 @@ Two read-only inspection verbs that expose the on-disk truth of a FAT entry — 
 forensic view exact on silicon: attr/cluster/entry-LBA+slot surfaced, host mtime to the second, root/
 missing/dir/past-EOF all honest (bench card `unaos/scripts/jd19-bench.md`).
 
+### RAST-TEGRA — first 3D pixels on the Orin panel (`UNAOS_RAST=1`, ⏳ METAL-PENDING)
+
+The platform-neutral software rasterizer (RAST-1) wired to the JD1 panel. With the `rast` knob
+armed, `tegra_early_stop` runs the spinning flat-shaded z-buffered cube demo through the **inherited
+scanout** — no mode-set, no scanout reprogramming — as the last panel content before CAPSTONE. The
+call is `tegra_rast_demo_maybe()` at the EL1 tail (post-drop, right before `run_capstone_boot_core`):
+it builds a `Screen` over `video::WRITER` (seeded by JD1, mapped into both translation tables so the
+carveout is reachable at EL1), detaches fbcon's mirror, then calls the shared, arch-neutral
+`rast_demo::run()` — **call-never-edit** on the panel surface (the same present path RAST-1 proved on
+x86). `crate::arch::ms()` reads `CNTVCT` on the timerless post-drop core (the VUGFIX fallback), so the
+honest fps line still ticks. Design + full detail: [rasterizer.md §4](../08_VIDEO/rasterizer.md).
+
+**Byte-identity.** The wire-in adds zero source lines ahead of any panic `Location` literal — the
+runner sits at the file tail and is called on the *same source line* as the terminus, with an
+`#[inline(always)]` empty knob-off twin (the PI-V3D-1 panic-line constraint). Verified: the tegra
+knob-off kernel is byte-identical to base — `.text a2ce1599…`, `.rodata 5d1f7604…`, `.data 4f1fe11e…`,
+`.data.rel.ro e17e3b13…`, 0 `rast` symbols.
+
+**Witness.** QEMU never builds `tegra`, so the on-panel cube rides the attended Orin bench; the honest
+QEMU proof of the identical arch-neutral render is the aarch64/**virt** path (GICv2 + `ramfb`):
+`UNAOS_RAST=1 ./arroyo test-arm` prints `:: RAST: … spinning cube … ::` + the fps line, and the boot
+still reaches `MISSION SUCCESS`.
+
 ## 4. Jetson Orin Nano headless bring-up (Arc JM2)
 
 The Orin is brought up **headless over serial**. The only console that has ever
