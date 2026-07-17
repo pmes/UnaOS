@@ -80,3 +80,46 @@ Two families stay boot-sequenced and are only *replayed*, not re-run, by `tste`:
 
 Making these re-runnable on demand needs a launcher refactor — **TSTE-2**. `tste`'s output footer
 says so explicitly.
+
+## 5. Native midden M1 — the framebuffer console is the x86 interactive shell
+
+**The default x86 GUI build is the interactive path.** Historically the media flashed to the 2012
+rMBP was the `usbdebug` build (`UNAOS_USBDEBUG=1`), which attaches the framebuffer console to the
+serial log and then **loops forever** — it never reaches the interactive `Console` loop. Native
+midden M1 makes the **default** GUI build (no `usbdebug`, no `bootlog`; `ehcihid` default-on) the
+flashed shape: it paints a first frame, drops to the framebuffer prompt, and dispatches commands
+typed on the internal EHCI keyboard. The interactive loop and the `Console` widget already existed
+and were already reachable in the default build; M1 proves that boot mode is reachable and sound and
+lands one command (`batmon`) on it. There is **no compositor, no `View`/`Scene`/`Sink`, no
+`TerminalView`, no seam machinery** — those are M2+ and out of scope.
+
+**COEXIST, with the x86 nuance.** The serial stream stays the debug/log diagnostic surface; the
+framebuffer `Console` is the interactive view. On x86 there is **no second interactive shell** — the
+framebuffer `Console` *is* the x86 interactive shell, and serial remains the debug/log stream.
+"Coexist" here means the serial diagnostic surface stays alongside the interactive framebuffer view,
+**not** that two interactive shells run. The `usbdebug` build remains available purely as the
+debug/log view. Structurally M1 is a no-op: it reuses the existing x86 GUI loop
+(`main.rs`, drain-until-None then present-once) and the existing `Console` widget unchanged.
+
+**Bounded pre-first-frame path.** The rMBP has no serial console, so a hang before the first
+`pal.render()` would leave a silent black screen. The default-build path from `kernel_main` to the
+first frame is audited bounded: the known long pole is xHCI bring-up in `pci::init` (its timeouts are
+`rdtsc`-bounded; `UNAOS_SKIP_XHCI=1` is the documented escape hatch), and nothing else on the default
+path spins unbounded before the first frame.
+
+### `batmon` — the honest SMC battery line
+
+`batmon` prints one line summarising the SMC battery snapshot. It is a one-shot human command, so it
+does a **fresh** port-I/O read (`smc::battery::snapshot()`, unthrottled) rather than the cached
+boot-time snapshot the shell never refreshes — the reading reflects the battery *now*. A fresh read
+once per keypress on the single-threaded BSP is safe.
+
+**Honesty rule.** Every field on `BatterySnapshot` is an `Option`; an absent key renders the `-`
+sentinel and a `None` **never** renders as a number a reader could mistake for a real value (0 mA is a
+plausible amperage, so absence must not read as zero). The line mirrors the M2 witness sentinel shape.
+`batmon` prints and returns — it leaves the console visible, takes no screen, does no seam work.
+
+The command is gated `#[cfg(all(target_arch = "x86_64", feature = "smc"))]` (the SMC driver is x86
+`UNAOS_SMC=1` only); every other target compiles an honest fallback that says so. Under QEMU's
+key-less `isa-applesmc` all battery keys are honestly absent, so `batmon` prints the all-`-` line —
+the bounded-Absent proof. The real battery is read only on the physical rMBP at an attended sitting.

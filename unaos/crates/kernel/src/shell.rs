@@ -2023,6 +2023,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             console.println("          usnapls <gen> [path], usnapcat <gen> <path>  (read a snapshot; current-ACL enforced)");
             console.println("CLOCK:    date, setdate YYYY-MM-DD HH:MM[:SS]  (seeds mtime stamps; unset = honest dashes)");
             console.println("SMP:      sched (per-CPU run queues), pulse (full-screen CPU monitor)");
+            console.println("POWER:    batmon (SMC battery snapshot; x86 UNAOS_SMC=1 only)");
             console.println("TEST:     tste (in-OS self-test suite: boot-replay + live checks)");
             console.println("NETWORK:  netinfo, ping <ip> [count], arp <ip>");
             console.println("          connect <ip> <port> [message], udpsend <ip> <port> [message]");
@@ -2779,6 +2780,32 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             }
             #[cfg(not(target_arch = "x86_64"))]
             console.println("sched: x86_64 only");
+        },
+        "batmon" => {
+            // NATIVE-MIDDEN M1b: one honest SMC battery line. A one-shot human command, so it does a
+            // FRESH port-I/O read (snapshot(), unthrottled) rather than the cached boot-time snapshot
+            // the shell never refreshes. Prints and returns — takes no screen, does no seam work.
+            #[cfg(all(target_arch = "x86_64", feature = "smc"))]
+            {
+                // Honesty rule: every absent field prints the "-" sentinel; a `None` must NEVER render
+                // as a number a reader could mistake for a real value (0 mA is a plausible amperage).
+                // Mirrors the M2 witness sentinel shape at smc.rs:498-499.
+                let snap = crate::drivers::smc::battery::snapshot();
+                let fu = |o: Option<u16>| o.map(|v| alloc::format!("{}", v)).unwrap_or_else(|| "-".into());
+                let fi = |o: Option<i16>| o.map(|v| alloc::format!("{}", v)).unwrap_or_else(|| "-".into());
+                console.println(&alloc::format!(
+                    "batt: present={} soc={}% volt={}mV amp={}mA full={}mAh rem={}mAh ac={}",
+                    snap.present,
+                    fu(snap.soc_pct),
+                    fu(snap.volt_mv),
+                    fi(snap.amp_ma),
+                    fu(snap.full_mah),
+                    fu(snap.rem_mah),
+                    match snap.ac_present { Some(true) => "yes", Some(false) => "no", None => "-" },
+                ));
+            }
+            #[cfg(not(all(target_arch = "x86_64", feature = "smc")))]
+            console.println("batmon: SMC battery monitor is x86 UNAOS_SMC=1 only");
         },
         "shutdown" | "off" => {
              // TODO: Create arch::shutdown()
