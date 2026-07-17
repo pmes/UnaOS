@@ -5041,32 +5041,15 @@ impl XhciController {
             }
             return;
         }
-        match self.parse_hid_config(buf) {
-            Some((is_kbd, is_rel, ep_addr, mps, interval, intf_num)) => {
-                serial_println!("xHCI: HUB downstream slot {} is {} (ep {:#x} mps {} iface {})",
-                    slot_id,
-                    if is_kbd { "KEYBOARD" } else if is_rel { "MOUSE (relative)" } else { "TABLET (absolute)" },
-                    ep_addr, mps, intf_num);
-                if is_kbd {
-                    self.slots[slot_id as usize].is_keyboard = true;
-                    self.slots[slot_id as usize].keyboard_ep = ep_addr;
-                    self.slots[slot_id as usize].keyboard_mps = mps;
-                    self.slots[slot_id as usize].keyboard_interval = interval;
-                    self.slots[slot_id as usize].keyboard_intf = intf_num;
-                } else {
-                    self.slots[slot_id as usize].is_mouse = true;
-                    self.slots[slot_id as usize].mouse_is_relative = is_rel;
-                    self.slots[slot_id as usize].mouse_ep = ep_addr;
-                    self.slots[slot_id as usize].mouse_mps = mps;
-                    self.slots[slot_id as usize].mouse_interval = interval;
-                    self.slots[slot_id as usize].mouse_intf = intf_num;
-                }
-                // Configure the (single, behind-a-hub) HID endpoint via the shared path.
-                // parse_hid_config surfaces one interface, so this arms exactly that endpoint;
-                // a composite device behind a hub keeps the single-interface limitation for now.
-                self.configure_hid_endpoints(slot_id, false);
-            }
-            None => serial_println!("xHCI: HUB downstream slot {}: no HID interrupt endpoint", slot_id),
+        // Arm EVERY HID interrupt-IN interface behind the hub via the SAME shared walk the
+        // root-port path uses — keyboard AND mouse, so a composite receiver (e.g. a wireless
+        // kbd+mouse dongle: keyboard on iface0, mouse on iface1) that lands behind a hub arms
+        // both, not just the first interface. Then configure them together in one
+        // Configure-Endpoint (root_fsm = false: this is the hub-downstream FSM).
+        if self.record_hid_interfaces(slot_id, buf) {
+            self.configure_hid_endpoints(slot_id, false);
+        } else {
+            serial_println!("xHCI: HUB downstream slot {}: no HID interrupt endpoint", slot_id);
         }
     }
 
@@ -5205,46 +5188,6 @@ impl XhciController {
             }
         }
         found_hid_ep
-    }
-
-    /// Parse a configuration descriptor (in `buf`) for the first HID interrupt-IN endpoint.
-    /// Returns (is_keyboard, is_relative_mouse, ep_addr, max_packet_size, interval, intf_number) or
-    /// None. `is_relative_mouse` = bInterfaceProtocol == 2 (HID boot mouse; relative deltas) vs an
-    /// absolute pointer (protocol 0). Only meaningful when `is_keyboard` is false. `intf_number` is
-    /// the owning bInterfaceNumber (SET_PROTOCOL wIndex) — must NOT be assumed 0.
-    fn parse_hid_config(&self, buf: u64) -> Option<(bool, bool, u8, u16, u8, u8)> {
-        unsafe {
-            let p = buf as *const u8;
-            let total = (((*p.add(2) as usize) | ((*p.add(3) as usize) << 8))).min(64);
-            let mut off = 0usize;
-            let mut in_hid = false;
-            let mut is_kbd = false;
-            let mut is_rel = false;
-            let mut intf_num = 0u8;
-            while off + 2 <= total {
-                let len = *p.add(off) as usize;
-                let dtype = *p.add(off + 1);
-                if len == 0 { break; }
-                if dtype == 0x04 && off + 8 <= total {
-                    // Interface descriptor: number at +2, class at +5, protocol at +7. HID = 0x03;
-                    // proto 1 = boot keyboard, proto 2 = boot mouse (relative).
-                    intf_num = *p.add(off + 2);
-                    in_hid = *p.add(off + 5) == 0x03;
-                    is_kbd = *p.add(off + 7) == 1;
-                    is_rel = *p.add(off + 7) == 2;
-                } else if dtype == 0x05 && in_hid && off + 7 <= total {
-                    // Endpoint descriptor: address +2, attributes +3, MPS +4..6, interval +6.
-                    let ep_addr = *p.add(off + 2);
-                    let attr = *p.add(off + 3);
-                    if (ep_addr & 0x80) != 0 && (attr & 0x3) == 3 {
-                        let mps = ((*p.add(off + 4) as u16) | ((*p.add(off + 5) as u16) << 8)) & 0x7FF;
-                        return Some((is_kbd, is_rel, ep_addr, mps, *p.add(off + 6), intf_num));
-                    }
-                }
-                off += len;
-            }
-            None
-        }
     }
 
     pub fn send_scsi_read(&mut self, slot_id: u8) {
