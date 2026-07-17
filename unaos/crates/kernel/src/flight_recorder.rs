@@ -216,11 +216,22 @@ pub fn service() {
             }
         }
         Err(e) => {
+            use crate::fs::fat::FatError;
             // Do not spin retrying a broken volume: mark this length flushed so we only retry once the
             // log grows further. One honest witness (once) — never a panic.
             LAST_FLUSHED.store(len, Ordering::Relaxed);
-            if !ANNOUNCED.swap(true, Ordering::Relaxed) {
-                serial_println!(":: FLIGHTREC: flush to {} FAILED ({:?}) ::", LOG_NAME, e);
+            match e {
+                // No FAT boot volume here (a raw/non-FAT stick, or no disk). This is the NORMAL case
+                // for the default `test` (raw usb.img) and any non-FAT medium — there is simply
+                // nowhere to record to, not an error. Skip silently (no scary witness line).
+                FatError::NotFat | FatError::NoDisk => {}
+                // A real write error (I/O stall, full volume, bad chain) AFTER a successful mount —
+                // one honest witness, once.
+                _ => {
+                    if !ANNOUNCED.swap(true, Ordering::Relaxed) {
+                        serial_println!(":: FLIGHTREC: flush to {} write error ({:?}) ::", LOG_NAME, e);
+                    }
+                }
             }
         }
     }
