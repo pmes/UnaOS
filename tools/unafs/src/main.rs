@@ -134,6 +134,23 @@ enum Commands {
         #[arg(short, long, default_value = "unafs.img")]
         img: String,
     },
+    /// Read a file from a retained snapshot (K8c) under the LIVE object's
+    /// CURRENT ACL — the host mirror of the kernel `usnapcat` verb. The bytes
+    /// are served AS OF the snapshot, but authority is re-evaluated against the
+    /// live object of the same logical id: a principal that cannot read it live
+    /// cannot read the snapshot, and a live-DELETED object fails closed.
+    Snapcat {
+        /// The snapshot's generation stamp (see `snaps`).
+        generation: u64,
+        /// The path within the snapshot (absolute, e.g. `/notes.txt`).
+        path: String,
+        /// The reading principal. `kernel` is authority (reads any LIVE object);
+        /// otherwise the live object's `owner` / `grants:<principal>` decide.
+        #[arg(long, default_value = "operator")]
+        as_principal: String,
+        #[arg(short, long, default_value = "unafs.img")]
+        img: String,
+    },
     /// UNAFS-BATCH before/after: sync a real directory tree TWO ways into
     /// fresh throwaway v3 images — the per-op regime (vaire's control: one
     /// root flip per file) and the bulk create+write path
@@ -806,6 +823,77 @@ async fn main() -> Result<()> {
                 "✅ [OPERATOR] dropped snapshot generation {} (blocks reclaimed) on '{}'",
                 generation, img
             );
+        }
+        Commands::Snapcat {
+            generation,
+            path,
+            as_principal,
+            img,
+        } => {
+            let device = FileDevice::open(img).context("Failed to open device")?;
+            let mut fs = FileSystem::mount(device).context("Failed to mount filesystem")?;
+
+            // Phase 1: resolve the object's logical id in the SNAPSHOT.
+            let sid = {
+                let mut view = fs.open_snapshot(*generation).map_err(|e| {
+                    anyhow::anyhow!("no such snapshot generation {} ({:?})", generation, e)
+                })?;
+                view.resolve_path(path)
+                    .map_err(|_| anyhow::anyhow!("{}: not in snapshot gen {}", path, generation))?
+            };
+
+            // Phase 2: CURRENT-ACL — authorize against the LIVE object of that id.
+            // This mirrors the kernel `read_authz`: a live object gone from the
+            // tree fails closed (no current ACL row); kernel authority permits;
+            // a public object (no owner) permits; else owner / grants:<p> decide.
+            match fs.read_inode(sid) {
+                Err(_) => {
+                    anyhow::bail!(
+                        "{}: refused — object deleted from live tree (no current ACL; fail-closed)",
+                        path
+                    );
+                }
+                Ok(live) => {
+                    if as_principal != "kernel" {
+                        if let Some(unafs::AttributeValue::String(owner)) =
+                            live.attributes.get("owner")
+                        {
+                            let granted = live
+                                .attributes
+                                .contains_key(&format!("grants:{}", as_principal));
+                            if as_principal != owner && !granted {
+                                anyhow::bail!(
+                                    "{}: refused — current ACL denies principal '{}'",
+                                    path,
+                                    as_principal
+                                );
+                            }
+                        }
+                        // No `owner` attribute → public live object → permitted.
+                    }
+                }
+            }
+
+            // Phase 3: permitted — hand back the retained bytes.
+            let mut view = fs
+                .open_snapshot(*generation)
+                .map_err(|e| anyhow::anyhow!("reopen snapshot {} failed: {:?}", generation, e))?;
+            let size = view
+                .read_inode(sid)
+                .map_err(|e| anyhow::anyhow!("read snapshot inode failed: {:?}", e))?
+                .size;
+            let bytes = view
+                .read_data(sid, 0, size)
+                .map_err(|e| anyhow::anyhow!("read snapshot data failed: {:?}", e))?;
+            match std::str::from_utf8(&bytes) {
+                Ok(s) => print!("{}", s),
+                Err(_) => eprintln!(
+                    "📷 [OPERATOR] gen {} {} — {} bytes (binary, not printed)",
+                    generation,
+                    path,
+                    bytes.len()
+                ),
+            }
         }
         Commands::BenchBatch {
             source,

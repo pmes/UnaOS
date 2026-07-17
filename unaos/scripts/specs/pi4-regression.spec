@@ -90,6 +90,15 @@ FORBID K8a-cow:.*FAIL
 REQUIRE K8b-snap:.*PASS
 FORBID K8b-snap:.*FAIL
 
+# --- UNAFS-K8c snapshot-read current-ACL witness (uncounted): the snapshot READ path enforces the
+# --- LIVE object's CURRENT ACL (the "high security" ruling — revocation reaches the past). Owner +
+# --- grantee read the OLD retained bytes; an impostor is refused from the snapshot by the SAME
+# --- predicate that refuses the live read; dropping a grant retroactively refuses the snapshot; and a
+# --- live-DELETED object fails closed (no current ACL row) even for its owner — the deleted-object
+# --- edge, traced. Self-cleaning. QEMU-proven via if=sd write-back; metal rides the next Pi sitting.
+REQUIRE K8c-snapread:.*PASS
+FORBID K8c-snapread:.*FAIL
+
 # --- K4-ready native-attr projection codec witness (uncounted). Pure in-RAM codec/selftest
 # --- (runs every boot, no card needed) — METAL-CONFIRMED present 2026-07-12, now REQUIRE. -----
 REQUIRE K4-ready:.*prefix\) PASS
