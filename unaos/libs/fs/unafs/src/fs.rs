@@ -1020,7 +1020,11 @@ impl<D: BlockDevice> UnaFS<D> {
     /// unwound via [`Self::txn_unwind`], which reloads ground truth from the
     /// committed root on disk — no partial file, name, or catalog entry
     /// survives, and the allocator is poison-closed if even the reload fails
-    /// (the K8b thaw-unwind precedent). A name already present in the parent, or
+    /// (the K8b thaw-unwind precedent). NOTE: with autocommit OFF this unwinds
+    /// the caller's ENTIRE outer transaction — everything staged since the last
+    /// commit is discarded, not just this batch. There is no partial-commit-
+    /// then-recover; a whole-tree sync that fails mid-way restarts from the
+    /// last committed root by design. A name already present in the parent, or
     /// duplicated WITHIN the batch, fails closed with
     /// [`FileSystemError::FileExists`]; the mounted image is a true no-op.
     ///

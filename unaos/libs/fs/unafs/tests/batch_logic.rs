@@ -482,3 +482,92 @@ fn batch_merges_into_a_directory_with_prior_contents() {
     assert_eq!(names, vec!["aaa_new.txt", "mmm_new.txt", "sub", "zzz_pre.txt"]);
     assert!(fs.fsck(false).unwrap().is_clean());
 }
+
+// =============================================================================
+// Review-lens folds (R20 dual-lens): the two named coverage gaps.
+// =============================================================================
+
+// Lens A SHOULD-FIX / lens B NOTE: the batch path's LARGE-attribute spill branch
+// (is_large → allocate_and_write_extents → large_attributes) had no batch-entry
+// coverage — every prior KAT used inline-sized attrs. Batch a >256-byte blob
+// through create_files_batch and prove round-trip + spill + fsck.
+#[test]
+fn large_attr_batch_spills_and_round_trips() {
+    let mut fs = fresh_fs(5000);
+    let root = fs.superblock.root_inode;
+
+    let blob = "x".repeat(1000); // > the 256 B inline threshold: forces the spill
+    let ids = fs
+        .create_files_batch(
+            root,
+            vec![file_attrs(
+                "spill.dat",
+                vec![0xAB; 128],
+                &[
+                    ("blob", AttributeValue::String(blob.clone())),
+                    ("small", AttributeValue::Int(7)),
+                ],
+            )],
+        )
+        .unwrap();
+
+    // Round-trip: the spilled attr reads back whole; the inline one beside it too.
+    assert_eq!(
+        fs.get_attribute(ids[0], "blob").unwrap(),
+        Some(AttributeValue::String(blob))
+    );
+    assert_eq!(
+        fs.get_attribute(ids[0], "small").unwrap(),
+        Some(AttributeValue::Int(7))
+    );
+    assert!(fs.fsck(false).unwrap().is_clean());
+
+    // And it survives a remount (the spill extents were committed, not RAM-only).
+    let device = fs.device.clone();
+    drop(fs);
+    let mut fs2 = UnaFS::mount(device).unwrap();
+    let id = fs2.resolve_path("/spill.dat").unwrap();
+    assert_eq!(
+        fs2.get_attribute(id, "blob").unwrap(),
+        Some(AttributeValue::String("x".repeat(1000)))
+    );
+}
+
+// Lens B NOTE: the crash-simulation seam only exercised the per-op path. Stage a
+// whole batch autocommit-off, power-cut (drop) BEFORE commit, remount from raw
+// bytes: the committed root, exactly, and fsck-clean — the brief's crash contract
+// proven for the batch path end-to-end, not just via the in-RAM unwind.
+#[test]
+fn uncommitted_batch_converges_to_the_old_tree_on_remount() {
+    let mut fs = fresh_fs(5000);
+    let root = fs.superblock.root_inode;
+
+    let keep = fs.create_file(root, "keep.txt".into()).unwrap();
+    fs.write_data(keep, 0, b"the committed tree").unwrap();
+    let committed_gen = fs.root_generation();
+    let committed_free = fs.free_blocks();
+
+    // Stage a full batch (data + attrs, several files) with NO root flip.
+    fs.set_autocommit(false);
+    let files: Vec<BatchFile> = (0..12)
+        .map(|i| {
+            file_attrs(
+                &format!("doomed{i:02}.dat"),
+                vec![i as u8; 300],
+                &[("n", AttributeValue::Int(i as i64))],
+            )
+        })
+        .collect();
+    fs.create_files_batch(root, files).unwrap();
+
+    // Power cut mid-transaction: drop uncommitted, remount from raw bytes.
+    let device = fs.device.clone();
+    drop(fs);
+    let mut fs2 = UnaFS::mount(device).expect("mount after simulated power cut");
+
+    assert_eq!(fs2.root_generation(), committed_gen, "old root, exactly");
+    assert!(fs2.resolve_path("/doomed00.dat").is_err());
+    assert_eq!(fs2.ls(root).unwrap().len(), 1, "only the committed file");
+    assert_eq!(fs2.free_blocks(), committed_free, "no leaked blocks");
+    assert!(fs2.fsck(false).unwrap().is_clean());
+}
