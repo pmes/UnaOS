@@ -19,6 +19,7 @@ use std::cell::RefCell;
 pub mod gpu_view;
 pub mod image_view;
 pub mod meter;
+pub mod paper_board;
 pub mod spline;
 pub mod tone_panel;
 pub mod window_chrome;
