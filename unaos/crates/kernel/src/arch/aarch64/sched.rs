@@ -76,11 +76,19 @@ static SCHED_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Releases the APs from their wait loop into `run()`. Set once the AP run queues are populated.
 static SCHED_GO: AtomicBool = AtomicBool::new(false);
 
-/// SCHED-NEXT (virt busy-heartbeat): gates the secondaries' one-shot cooperative drain until the BSP
-/// has staged their run queues. The `virt` secondaries run at EL2 and never enter the full `run()`
-/// loop (no per-core timer — see the module header + `smp_virt`); this flag instead releases a
-/// single bounded cooperative pass (`run_secondary_work`) so an online core publishes honest BUSY
-/// telemetry — the other half of the idle-heartbeat (which proved only that a parked core reads idle).
+/// SCHED-NEXT (virt busy-heartbeat): the `virt` BSP sets this ONCE, BEFORE `CPU_ON`, to declare "I
+/// will stage cooperative work — secondaries, wait for my release." It is the clean discriminator
+/// between the paths that share `__secondary_rust_virt`: only `virt` (`start_secondaries`) arms it;
+/// the real Orin (`start_secondaries_tegra`) and the SMP-probe legs stage no work and never arm, so
+/// their secondaries skip the wait entirely and park as before (no added latency, and — the point —
+/// no hang). Set before `CPU_ON` so every secondary that comes online is guaranteed to observe it.
+static SECWORK_ARMED: AtomicBool = AtomicBool::new(false);
+/// Released by the BSP once every secondary's run queue is staged. An armed secondary waits on this
+/// (with a GENEROUS finite backstop, NOT a tight timing ceiling — the fragile 20 ms ceiling flaked
+/// under host load) so it drains REAL work; a non-armed secondary never reads it. The `virt`
+/// secondaries run at EL2 and never enter the full `run()` loop (no per-core timer — see the module
+/// header + `smp_virt`); this flag releases a single cooperative pass (`run_secondary_work`) so an
+/// online core publishes honest BUSY telemetry — the other half of the idle-heartbeat.
 static SECWORK_GO: AtomicBool = AtomicBool::new(false);
 /// Per-core "cooperative pass drained" flag, set by each secondary after `run_secondary_work` empties
 /// its queue; the BSP waits on it before reading the busy-heartbeat witness so it never races an
@@ -944,6 +952,14 @@ fn secondary_probe_body(arg: usize) {
     serial_println!(":: SCHED: core {} cooperative probe ran (busy telemetry) ::", core);
 }
 
+/// BSP-side: declare that this boot WILL stage cooperative secondary work — call ONCE, BEFORE
+/// `CPU_ON`, so every secondary that comes online observes it and waits for the release. Only the
+/// `virt` `start_secondaries` calls this; the tegra/probe paths that share `__secondary_rust_virt`
+/// never do, so their secondaries skip the wait (see `run_secondary_work`).
+pub fn arm_secondary_work() {
+    SECWORK_ARMED.store(true, Ordering::Release);
+}
+
 /// BSP-side: stage `n` cooperative probe tasks onto secondary `cpu`'s run queue. Call BEFORE
 /// `secondary_work_go`; the target core drains them in `run_secondary_work`. Pinned to `cpu` (like
 /// every task) so they dispatch on that core and its `CPU_BUSY` is what moves.
@@ -964,25 +980,33 @@ pub fn secondary_work_done(cpu: usize) -> bool {
     cpu < NUM_CPUS && SECWORK_DONE[cpu].load(Ordering::Acquire)
 }
 
-/// Secondary-side: wait (BOUNDED) for the BSP's release, then drain THIS core's staged cooperative
-/// queue to completion and mark done. Called by `__secondary_rust_virt` once, BEFORE its idle park.
-/// The queue is finite and pre-staged, so `run_until_empty` drains it and returns (no timer / no
-/// WFI); `dispatch_next` bumps `CPU_BUSY[cpu]` per dispatch. The spin waits with IRQ unmasked (the
-/// caller's state), so a BSP→AP SGI landing during the wait is still serviced.
+/// Secondary-side: if this boot staged cooperative work (armed), wait for the BSP's release then
+/// drain THIS core's staged queue to completion and mark done; otherwise return immediately. Called
+/// by `__secondary_rust_virt` once, BEFORE its idle park. The queue is finite and pre-staged, so
+/// `run_until_empty` drains it and returns (no timer / no WFI); `dispatch_next` bumps `CPU_BUSY[cpu]`
+/// per dispatch. The wait spins with IRQ unmasked (the caller's state), so a BSP→AP SGI landing during
+/// it is still serviced.
 ///
-/// BOUNDED because `__secondary_rust_virt` is the shared real-entry tail for the `virt`
-/// (`start_secondaries`), the real Orin (`start_secondaries_tegra`), AND the SMP-probe legs — but
-/// ONLY the `virt` path stages work and calls `secondary_work_go`, and it does so within microseconds
-/// of this spin starting, so the common path never hits the ceiling. On the tegra/probe paths nobody
-/// releases; there the ~20 ms one-shot ceiling simply elapses and the core proceeds to its idle park
-/// exactly as before (draining an empty queue is a no-op — one idle bump). The ceiling is small and
-/// happens once at bring-up, before the core parks for good, so it perturbs neither metal boot nor
-/// probe timing, and it can NEVER hang a core (the failure mode an unbounded spin would introduce on
-/// every non-`virt` caller).
+/// TWO clean paths (both provably non-hanging), keyed off `SECWORK_ARMED` — which the BSP sets before
+/// `CPU_ON`, so a secondary always observes the true value:
+///   * NOT armed → the tegra (`start_secondaries_tegra`) and SMP-probe callers of this shared tail
+///     stage no work: return at once, no wait, no drain. Park exactly as before — zero added latency,
+///     zero hang risk.
+///   * armed → the `virt` `start_secondaries` WILL stage + release. Wait for `SECWORK_GO` with a
+///     GENEROUS finite backstop (~1 s). This is deterministic under host load: the release lands in
+///     microseconds when idle and still well inside the backstop when the host is saturated (the BSP's
+///     ping proofs — which run between arming and release — are themselves bounded to a few hundred ms
+///     of guest time). The backstop is a SAFETY net (a release that never comes = a BSP bug), never
+///     the normal-case timing, so it can never hang and never flakes. This replaces the original
+///     ~20 ms one-shot ceiling, which doubled as the timing bound and spuriously FAILed the busy
+///     witness under load (APs that hadn't reached this pass before 20 ms parked idle with `busy=0`).
 pub fn run_secondary_work(cpu: usize) {
+    if !SECWORK_ARMED.load(Ordering::Acquire) {
+        return; // tegra / probe: no work staged, no wait, park as before
+    }
     let freq = timer::cntfrq();
     let freq = if freq == 0 { 62_500_000 } else { freq };
-    let deadline = timer::cntpct() + freq / 50; // ~20 ms one-shot ceiling
+    let deadline = timer::cntpct() + freq; // ~1 s generous backstop (never the normal path)
     while !SECWORK_GO.load(Ordering::Acquire) && timer::cntpct() < deadline {
         core::hint::spin_loop();
     }

@@ -68,3 +68,49 @@ No remaining MUST/SHOULD-FIX.
   cooperative work — a small **attended** follow-up (staging cooperative EL2 work on real Orin
   secondaries wants a metal sitting to confirm). Optional refinement: an early `secondary_work_go()`
   in `start_secondaries_tegra` would zero the ~20 ms bounded-wait on the metal path.
+
+---
+
+## FOLLOW-UP (R20) — determinism: the fixed 20 ms ceiling flaked under host load
+
+The MUST-FIX above bounded the release wait at a fixed **~20 ms one-shot ceiling** that doubled as
+BOTH the anti-hang backstop AND the normal-case timing bound. That conflation was the flaw: on a
+loaded host the 20 ms elapses **before** a slow-to-arrive secondary reaches its cooperative pass, so
+the AP parks idle with `busy=0` and the busy witness FAILs (observed: 1 of 3 APs busy under load).
+
+**Fix — separate the timing from the backstop; make virt wait on the actual completion COUNT.**
+- New `SECWORK_ARMED` flag: the `virt` BSP (`start_secondaries`) sets it ONCE **before any `CPU_ON`**
+  (`arm_secondary_work()`), declaring "I will stage cooperative work." `start_secondaries_tegra` and
+  the smpprobe legs never arm it.
+- `run_secondary_work` now **returns immediately if not armed** → tegra/probe secondaries do **no
+  wait at all** (strictly better than the old path, which spun the full 20 ms before parking) and can
+  never hang. This is the whole no-hang property for the shared tail: it no longer depends on a
+  ceiling elapsing.
+- Armed (virt only) secondaries wait on `SECWORK_GO` with a **~1 s generous finite backstop** (was
+  `freq/50`, now `freq`); the BSP waits on the **completion count** `secondary_work_done == expected`
+  with a **~2 s finite backstop** (`2*freq`), not a fixed per-core 20 ms. The backstops are a SAFETY
+  net for a genuine BSP bug (a release that never comes fails the witness loud, never hangs), NOT the
+  normal-case timing — the release lands in microseconds of guest time whether the host is idle or
+  saturated (the guest clock `cntpct` also slows under host descheduling, so the wall-clock budget is
+  effectively even more generous under load).
+
+**Determinism evidence (R20, 2026-07-17):**
+- Idle host, `UNAOS_GICV3=1 ./arroyo test-arm 40` ×3 — every run: AP {1,2,3} `pulse (busy=8, idle=2)`,
+  `per-core busy heartbeat PASS`.
+- **Loaded host** (48 `yes` generators on a 16-CPU host, `loadavg` climbing to **124** — ~8×
+  oversaturation — during the QEMU run), same command:
+  - `:: AARCH64 SMP: AP 1 pulse (busy=8, idle=2) ran+idle ::`
+  - `:: AARCH64 SMP: AP 2 pulse (busy=8, idle=2) ran+idle ::`
+  - `:: AARCH64 SMP: AP 3 pulse (busy=8, idle=2) ran+idle ::`
+  - `:: AARCH64 SMP: per-core busy heartbeat PASS — 3 online APs ran cooperative scheduled work ::`
+  Same on 8× and 14× load. The old fixed-20 ms ceiling flaked under exactly this contention.
+
+**Full gate (R20):** `./arroyo check` both arches OK; `UNAOS_TEGRA=1 ./arroyo check` both arches OK;
+`./arroyo test-arm 22` → `MISSION SUCCESS (BOT + CSW)`; `./arroyo kernel8-test` → **43 PASS / 0 FAIL**
+(shared sched.rs unregressed on Pi).
+
+**Lens (ONE, at landing) — PASS, 0 MUST-FIX.** The wait is genuinely bounded on ALL paths: tegra/probe
+never arm, so they skip the wait entirely (no hang, and no longer even a ceiling to elapse); virt
+secondary + BSP waits both carry finite backstops (~1 s / ~2 s) that are safety nets, not timing. Virt
+is deterministic under proven 8× host oversaturation. The old ledger note about zeroing the "~20 ms
+bounded-wait on the metal path" is now MOOT — the metal path performs no wait.
