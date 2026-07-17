@@ -353,16 +353,10 @@ impl Controller {
         // an HSE'd chain transfer flips the controller to overlay-direct permanently and
         // retries (the failed SETUP never reached the wire — clean retry).
         if !self.overlay_mode {
-            match self.chain_txn(t, bm_req, b_req, w_length, dir_in) {
-                Err("hse") => {
-                    self.overlay_mode = true;
-                    serial_println!(
-                        ":: EHCI-HID: [{}] qTD-fetch HSE — switching to OVERLAY-DIRECT transactions (probe-14 silicon finding: burst-write overlay load aborts; software-primed overlays proven clean) ::",
-                        self.idx
-                    );
-                }
-                other => return other,
-            }
+            // Chain mode; an HSE propagates to the caller, which must FULLY re-init the
+            // controller (HCRESET — an HSE'd controller is wedged; RS alone does not
+            // recover it, probe-14 finding) and set overlay_mode before retrying.
+            return self.chain_txn(t, bm_req, b_req, w_length, dir_in);
         }
 
         // Three overlay-direct stages. DT: SETUP=0, DATA starts 1 (controller maintains the
@@ -1475,27 +1469,40 @@ pub fn init() {
                             continue;
                         }
                         if c.reset_root_port(port) {
-                            // Probe-13 (a): the pass-3 smoke, now with THIS port enabled.
-                            let mut hse = c.live_port_smoke("port-enabled");
-                            if hse && !cg_cleared && rcba != 0 {
-                                // Probe-13 (b), Peter-approved surface extension: clear the
-                                // PCH dynamic clock gating register once, traced, and retest.
-                                let before = mmio_read32(rcba + 0x341C).unwrap_or(0);
-                                let _ = mmio_write32(rcba + 0x341C, 0);
-                                let after = mmio_read32(rcba + 0x341C).unwrap_or(0);
-                                cg_cleared = true;
-                                serial_println!(
-                                    ":: EHCI-HID: RCBA CG clear (Peter-approved): {:#010x} -> {:#010x} == witness ::",
-                                    before, after
-                                );
-                                hse = c.live_port_smoke("post-CG-clear");
+                            // Transport probe (probe-14): one bare chain-mode GET_DESCRIPTOR(8)
+                            // to addr 0. An HSE means this silicon aborts the qTD-fetch burst
+                            // write — flip to OVERLAY-DIRECT and FULLY re-init (an HSE'd
+                            // controller is wedged; HCRESET, bases, RS, CF, port — all redone).
+                            if !c.overlay_mode {
+                                let probe_t = Target {
+                                    addr: 0, mps0: 64, eps: QH_EPS_HIGH, hub_addr: 0, hub_port: 0,
+                                };
+                                if let Err("hse") = c.control(&probe_t, 0x80, 6, 0x0100, 0, 8, true) {
+                                    c.overlay_mode = true;
+                                    serial_println!(
+                                        ":: EHCI-HID: [{}] qTD-fetch HSE — OVERLAY-DIRECT mode + full HCRESET re-init (probe-14 silicon finding) ::",
+                                        idx
+                                    );
+                                    let _ = c.quiesce_if_firmware_stale(); // HSE latched -> resets
+                                    c.init_schedules();
+                                    let cmd = mmio_read32(h.op + OP_USBCMD).unwrap_or(0);
+                                    let _ = mmio_write32(h.op + OP_USBCMD, cmd | CMD_RS);
+                                    let _ = wait_bounded(|| {
+                                        mmio_read32(h.op + OP_USBSTS).unwrap_or(STS_HCHALTED)
+                                            & STS_HCHALTED == 0
+                                    });
+                                    ehci_scout::wake_route(&h, idx);
+                                    if let Some(sts) = mmio_read32(h.op + OP_USBSTS) {
+                                        if sts & STS_RW1C != 0 {
+                                            let _ = mmio_write32(h.op + OP_USBSTS, sts & STS_RW1C);
+                                        }
+                                    }
+                                    if !c.reset_root_port(port) {
+                                        continue;
+                                    }
+                                }
                             }
-                            if hse {
-                                serial_println!(
-                                    ":: EHCI-HID: [{}] STOP-NOTE live-port DMA still HSEs — enumeration attempted anyway for the trace ::",
-                                    idx
-                                );
-                            }
+                            let _ = (&cg_cleared, rcba); // probe-13 levers retired (smokes all passed)
                             c.enumerate_at_zero(QH_EPS_HIGH, 0, 0, 0);
                         }
                     }
