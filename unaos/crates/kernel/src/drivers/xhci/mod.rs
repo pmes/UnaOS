@@ -45,7 +45,9 @@ macro_rules! xdbg {
 /// USB HID Boot Keyboard Scancode to ASCII mapping.
 /// Index is the HID usage ID (0x00..0x67). Returns (unshifted, shifted).
 /// 0 means no printable character.
-const HID_SCANCODE_TO_ASCII: [(u8, u8); 104] = [
+// pub(crate): the EHCI-3 HID path (drivers/ehci) decodes boot-keyboard reports through this same
+// table so a key is a key whichever controller carried it (visibility-only change, EHCI-3 arc).
+pub(crate) const HID_SCANCODE_TO_ASCII: [(u8, u8); 104] = [
     (0, 0),       // 0x00: Reserved
     (0, 0),       // 0x01: ErrorRollOver
     (0, 0),       // 0x02: POSTFail

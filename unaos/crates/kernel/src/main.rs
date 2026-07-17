@@ -679,6 +679,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 xhci.service_slot_disposal();
                 xhci.service_enum();
             }
+            // EHCI-3 (x86, ehcihid knob): poll the EHCI HID interrupt endpoints — the internal
+            // rMBP keyboard/trackpad path. Same polled-service spot as the xHCI hooks above.
+            #[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]
+            unaos_kernel::drivers::ehci::service_ehci_hid();
             // STOR-1 (x86, irqstorage knob): storage service task + `bx-blockreq` self-test, so the
             // interrupt-driven path is exercised on the serial-less metal boot too. One-shot, gated on
             // storage; a no-op without the knob.
@@ -840,6 +844,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             xhci.service_slot_disposal();
             xhci.service_enum();
         }
+        // EHCI-3 (x86, ehcihid knob): poll the EHCI HID interrupt endpoints (internal rMBP
+        // keyboard/trackpad). Same polled-service spot as the xHCI hooks above.
+        #[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]
+        unaos_kernel::drivers::ehci::service_ehci_hid();
 
         // STOR-1 (x86, irqstorage knob): bring up the interrupt-driven storage service task once a
         // block device is present (before the storage fixtures submit through it), then run the

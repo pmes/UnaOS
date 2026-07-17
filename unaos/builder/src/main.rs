@@ -65,6 +65,10 @@ fn main() {
     // to the EHCI functions' PMCSR/USBLEGSUP-OS-own/USBLEGCTLSTS/RS/CONFIGFLAG/PORTSC-port-power. x86_64-only.
     // Kept in sync with arroyo's mapping.
     if std::env::var("UNAOS_EHCICONFIG").is_ok() { feats.push("ehciconfig"); }
+    // EHCI-3 driver: UNAOS_EHCIHID=1 arms the minimal EHCI HID driver (rMBP internal keyboard/
+    // trackpad). Implies ehciconfig. Also moves the QEMU usb-kbd onto the harness ehci bus below
+    // so the driver has a direct-path (Topology B) HID target. Kept in sync with arroyo's mapping.
+    if std::env::var("UNAOS_EHCIHID").is_ok() { feats.push("ehcihid"); }
     // VPERF M2: the fbcon viewport-cap bench lever (implies videobench). x86_64 only.
     if std::env::var("UNAOS_VIDEOCAP").is_ok() { feats.push("videocap"); }
     // SOCK-1: route the shell's ping/arp/netinfo + the boot ICMP witness through smoltcp. x86-only
@@ -285,9 +289,12 @@ fn main() {
     // device set has no EHCI, so attach a standalone `usb-ehci` PCI controller (class 0x0C0320) — no
     // downstream device, so the scout reports the controller's cap/op/PORTSC state with 0 connected
     // ports (the honest QEMU result). This is a QEMU-harness knob, not a kernel write path.
-    if std::env::var("UNAOS_EHCISCOUT").is_ok() || std::env::var("UNAOS_EHCICONFIG").is_ok() {
+    let ehcihid = std::env::var("UNAOS_EHCIHID").is_ok();
+    if std::env::var("UNAOS_EHCISCOUT").is_ok() || std::env::var("UNAOS_EHCICONFIG").is_ok() || ehcihid {
         cmd.arg("-device").arg("usb-ehci,id=ehci");
-        if std::env::var("UNAOS_EHCICONFIG").is_ok() {
+        if ehcihid {
+            println!("   UNAOS_EHCIHID: usb-ehci controller attached — EHCI HID driver target (usb-kbd rides the ehci bus)");
+        } else if std::env::var("UNAOS_EHCICONFIG").is_ok() {
             println!("   UNAOS_EHCICONFIG: usb-ehci controller attached — EHCI configure-and-relook scout target");
         } else {
             println!("   UNAOS_EHCISCOUT: usb-ehci controller attached — read-only EHCI scout target");
@@ -304,8 +311,18 @@ fn main() {
         cmd.arg("-drive").arg(format!("if=none,id=stick,format=raw,file={}", stick_image.display()))
            .arg("-device").arg("usb-storage,bus=xhci.0,drive=stick,bootindex=1");
     }
-    cmd.arg("-device").arg("usb-kbd,bus=xhci.0")
-       .arg("-device").arg("usb-tablet,bus=xhci.0")
+    // EHCI-3 harness: with UNAOS_EHCIHID the keyboard rides the EHCI bus (QEMU's usb-kbd is
+    // HS-capable, so it trains directly on the EHCI root port — Topology B). It REPLACES the
+    // xHCI keyboard in this mode so QMP `send-key` routes deterministically to the EHCI device
+    // (two keyboards would leave the routing to QEMU's whim). QEMU cannot model the RMH hub
+    // tier: its only hub is full-speed and wedges the machine at firmware if placed on the EHCI
+    // bus — Topology A (hub walk + splits) is metal-first by construction.
+    if ehcihid {
+        cmd.arg("-device").arg("usb-kbd,bus=ehci.0");
+    } else {
+        cmd.arg("-device").arg("usb-kbd,bus=xhci.0");
+    }
+    cmd.arg("-device").arg("usb-tablet,bus=xhci.0")
        .arg("-m").arg("1G");
 
     // U2.5 (UNAOS_USBSERIAL): attach an FTDI FT232 usb-serial device on the xHCI bus. QEMU's
