@@ -828,6 +828,14 @@ pub fn meter_cpu_ticks(cpu: usize) -> (u64, u64) {
     (CPU_BUSY[cpu].load(Ordering::Relaxed), CPU_IDLE[cpu].load(Ordering::Relaxed))
 }
 
+/// VUG-HONESTY: the linear index of the core CALLING this — the "demo core" the vug/pulse render loop
+/// runs on. The CPU-pulse display credits its own render load ONLY to this core; every other core whose
+/// counters are frozen this window is parked (reads parked, never the demo core's load). Introspection
+/// only — a `TPIDR_EL1/EL2` self-lookup, no scheduling-path effect.
+pub fn meter_current_cpu() -> usize {
+    percpu::this_cpu().cpu_index as usize
+}
+
 /// VUG-1 M3b: register `cpu` as idle for the CPU-pulse meter — the seam a core that parks WITHOUT
 /// running this scheduler (`smp_virt::__secondary_rust_virt`'s WFI park: comes online, publishes
 /// `CORE_READY`, never calls `dispatch_next`) uses to bump its own `CPU_IDLE`. Without it such a core
@@ -1927,6 +1935,10 @@ pub fn run_capstone_boot_core(cpu: usize) -> ! {
         ":: AARCH64 SCHED (virt): boot core {} at EL1 — running the full M4 CAPSTONE cooperatively ::",
         cpu
     );
+    // VUG-HONESTY: witness the parked-core display rule on this virt boot (deterministic, no framebuffer)
+    // — a frozen non-demo core reads PARKED, never the demo core's fabricated load. The GICv3/test-arm
+    // capture proves the display-honesty fix that completes the merged idle/busy-heartbeat counters.
+    let _ = crate::vug::parked_display_witness();
     spawn("capstone", capstone_body, 0, cpu);
     SCHED_GO.store(true, Ordering::Release); // harmless (no APs on this path)
     // Cooperative dispatch loop: drain the run queue, then busy-poll (never WFI). `dispatch_next` returns

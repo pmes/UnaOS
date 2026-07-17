@@ -1902,6 +1902,14 @@ pub fn meter_cpu_ticks(cpu: usize) -> (u64, u64) {
     (CPU_BUSY[cpu].load(Ordering::Relaxed), CPU_IDLE[cpu].load(Ordering::Relaxed))
 }
 
+/// VUG-HONESTY: linear index of the calling core (the vug/pulse "demo core"). Arch-neutral mirror of
+/// the aarch64 accessor, same `gs:[0]` self-lookup shape as `current_name`. The shared `vug` CPU-pulse
+/// display credits its render load only to this core; other frozen-counter cores read parked, never a
+/// fabricated bar. Introspection only — no scheduling-path effect.
+pub fn meter_current_cpu() -> usize {
+    percpu::this_cpu().cpu_index as usize
+}
+
 /// Name of the task currently running on THIS CPU, or `None` if the CPU is idle. `name` is a
 /// `&'static str`, so it stays valid even after the Box is reclaimed. Used by the U1b ring-3
 /// fault-kill log (`interrupts::ring3_fault_kill`), which runs on this CPU with GS already
