@@ -148,6 +148,16 @@ PaperParams { algo: Laid, amplitude: 0.020, scale: 4.0, octaves: 3, seed: 0xFBB6
 - **Everything stays parametric in one place** (`PaperParams`) — the hook a
   future theming/kit layer (retro-kits thread 2) addresses.
 
+- **Adopter contract (lens fold, R20):** `render_rgba8` regenerates every pixel per
+  call. Adopters MUST cache the rendered raster and regenerate only on resize or
+  parameter change — never per draw/frame (a full-window Retina region is ~5M px;
+  per-frame regeneration is a visible scroll-jank trap). The render is a pure function
+  of (params, w, h), so caching is trivially correct.
+- **Determinism caveat (lens fold, R20):** "same params, same pixels" holds PER
+  PLATFORM (same-run/same-host stability — the no-shimmer guarantee). `f32::sin`/libm
+  differences mean cross-platform or cross-backend (future euclase GPU path) rasters
+  need not match bit-for-bit; no arc may rely on cross-backend pixel identity.
+
 ## SURFACE-2 (candidate scope — pre-registered, NOT built)
 
 Peter's "sliders to play with later", named here as the follow-on arc:
