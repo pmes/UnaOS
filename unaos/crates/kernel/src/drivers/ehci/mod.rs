@@ -485,24 +485,24 @@ impl Controller {
             &mut (*qh).overlay[2],
             QTD_ACTIVE | QTD_CERR3 | (len << QTD_TOTAL_SHIFT) | pid_dt | QTD_IOC,
         );
-        let old_head = core::ptr::read_volatile(self.frame_list);
-        (*qh).horiz = old_head;
-        for i in 0..1024 {
-            core::ptr::write_volatile(self.frame_list.add(i), (self.qh_phys as u32) | PTR_TYPE_QH);
-        }
-        let pss_on = self.set_periodic_schedule(true);
+        // Probe-14e: overlay-direct rides the ASYNC engine — the periodic engine skips
+        // SETUP-PID overlays on this silicon (14d), and async only ever died at the qTD
+        // fetch, which overlay-direct never performs. The work QH is already ring-linked
+        // behind the dummy head; ASE is toggled per stage (bounded ASS handshakes).
+        (*qh).horiz = (self.head_phys as u32) | PTR_TYPE_QH;
+        let cmd = mmio_read32(self.op + OP_USBCMD).unwrap_or(0);
+        let _ = mmio_write32(self.op + OP_USBCMD, cmd | CMD_ASE);
+        let pss_on = wait_bounded(|| {
+            mmio_read32(self.op + OP_USBSTS).unwrap_or(0) & (1 << 15) != 0
+        });
         let done = wait_bounded(|| {
             core::ptr::read_volatile(&(*qh).overlay[2]) & QTD_ACTIVE == 0
         });
-        for i in 0..1024 {
-            core::ptr::write_volatile(self.frame_list.add(i), old_head);
-        }
-        let pss_off = if self.periodic_on {
-            true // interrupt endpoints own the periodic schedule — leave it running
-        } else {
-            self.set_periodic_schedule(false)
-        };
-        (*qh).horiz = PTR_TERMINATE;
+        let cmd2 = mmio_read32(self.op + OP_USBCMD).unwrap_or(0);
+        let _ = mmio_write32(self.op + OP_USBCMD, cmd2 & !CMD_ASE);
+        let pss_off = wait_bounded(|| {
+            mmio_read32(self.op + OP_USBSTS).unwrap_or(0) & (1 << 15) == 0
+        });
         let tok = core::ptr::read_volatile(&(*qh).overlay[2]);
 
         if !done {
