@@ -397,9 +397,6 @@ unsafe fn census(op: u64, ports: u32, idx: usize, label: &str) -> u32 {
 /// two wake halves) and the EHCI-3 driver (`drivers/ehci`) — ONE wake path, not two (EHCI-3 N3).
 #[cfg(feature = "ehciconfig")]
 pub(crate) struct EhciFnHandle {
-    pub bus: u8,
-    pub dev: u8,
-    pub func: u8,
     /// Operational-register base (BAR0 + CAPLENGTH), translate()-proven present.
     pub op: u64,
     pub n_ports: u32,
@@ -538,7 +535,7 @@ pub(crate) unsafe fn wake_run(bus: u8, dev: u8, func: u8, idx: usize) -> Option<
         if running { "(running)" } else { "(STOP-NOTE: HCHalted did not clear within budget)" }
     );
 
-    Some(EhciFnHandle { bus, dev, func, op, n_ports, ppc, addr64: hccparams & 0x1 })
+    Some(EhciFnHandle { op, n_ports, ppc, addr64: hccparams & 0x1 })
 }
 
 /// Shared wake, second half: CONFIGFLAG=1 (route ports to this EHCI), port-power where PPC honors
