@@ -10,6 +10,42 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-jetson track — 2026-07-16 (VAIRE-2 — UnaFS-native Loom + baseline FS benchmark) 🔬
+
+### VAIRE-2 — `usync`/`ustatus`: the dev-tree as native UnaFS objects, measured from birth 🔬 host-native (33/33 vaire tests, fsck-clean baseline image), no kernel surface
+
+**What it does.** The direction ruling's *real* vaire (RECONCILIATION-2026-07, the vaire ruling):
+the managed dev-tree is stored as **native UnaFS v3 objects** on the K-line CoW machinery, not
+host-fs copies. New `vaire usync [<image>] [--apply]` weaves the manifest-bounded penumbra (the same
+Bolt-1 manifest + `ExcludeRules` default-deny floor) into a UnaFS image — dirs `mkdir`, files
+`create_file`+`write_data`, K6 typed attrs per file (`vaire.size`/`vaire.mtime`/`vaire.src`/
+`vaire.sync`) and per unit root (`vaire.unit`/`vaire.githead`/`vaire.run` + a `vaire.summary.<stamp>`
+per run, so runs accrue in the image) — and ends every completed sync in one
+`snapshot_create(creator="vaire")` (the retained root IS the SNAP concept, natively). Re-runs are
+incremental: size+mtime attr match → skip+count; changed → unlink+CoW-rewrite. `vaire ustatus`
+reads it back read-only (unit attrs, snapshot index, object/byte counts vs live). All Bolt-1
+invariants carry verbatim (live tree read-only via a `0o555` byte-compare; every skip reported;
+symlinks never followed; dry-run default; the 16-snapshot cap refused honestly, never auto-dropped).
+The Bolt-1 host verbs are untouched. Per the benchmark corollary, `usync` is instrumented with the
+NSSPAN pattern host-ported from the kernel `NsSpanProbe` (per-phase `AtomicU64` + RAII `Instant`
+probe over scan/read/write/attrs/commit/snapshot, plus UnaFS `CommitStats`): the first native sync
+IS the baseline mixed-load FS benchmark.
+
+**How it was tested.** Host: `cargo test -p vaire` — 25 existing + 8 new fixture tests, 33/33
+(tempdir live tree + temp image; dry-run-writes-nothing, weave+content+attrs+snapshot, incremental
+skip/rewrite, exclusions-never-woven, live-tree-never-written, ustatus, snapshot-cap-refused, ledger
+line). Baseline SOLO run of `~/.claude/plans/unaos` (239 files, 12 dirs, 4,161,366 B) into a fresh
+image on a MacBookPro16,1 / macOS 26.5.2 (25F84) / APFS-on-PCIe-SSD: cold sync ~11.6 s (commit phase
+97 % across 241 per-file root flips), warm incremental ~0.18 s (all-skip); resulting image
+`unafs-cli fsck` clean (0 leaked/0 stale) with 2 retained `vaire` snapshots. Batched-sync finding
+for the ledger: whole-sync single-transaction batching needs no new UnaFS API, but there is no
+vectored/bulk write-or-create API to cut per-object metadata churn. Regression floor (nothing here
+touches the kernel — these prove it): `./arroyo check` both arches ✅, `./arroyo test-arm 22` MISSION
+SUCCESS ✅. Full table + finding in `handlers/vaire/README.md`. Commit(s) on hw-jetson; metal N/A
+(host-native Ring-3). 🔬
+
+---
+
 ## hw-pi4 track — 2026-07-16 (K8b — retained roots / snapshots + reclamation) 🔬
 
 ### K8b — snapshots (retained roots) + eager reclamation 🔬 QEMU-green (MBENCH 44/44, 0 forbidden), metal pending

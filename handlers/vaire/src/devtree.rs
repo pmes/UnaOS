@@ -799,7 +799,12 @@ pub fn apply_sync(m: &DevManifest) -> Result<(SnapReport, SyncPlan)> {
 /// Walk a penumbra root, invoking `f(rel, class)` for every file: `class =
 /// Some(..)` for an excluded file (subtree pruned for excluded dirs), `None`
 /// for a file to consider. Read-only.
-fn walk_penumbra(
+///
+/// Shared with the UnaFS-native sync engine ([`crate::usync`]): it walks the
+/// same manifest-bounded, exclusion-filtered penumbra so the native `usync`
+/// honors byte-for-byte the same default-deny credential floor, junk pruning,
+/// and reported-never-followed symlink handling as the Bolt-1 host `sync`.
+pub(crate) fn walk_penumbra(
     root: &Path,
     rules: &ExcludeRules,
     f: &mut dyn FnMut(&Path, Option<ExcludeClass>),
