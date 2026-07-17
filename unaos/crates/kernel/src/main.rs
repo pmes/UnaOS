@@ -837,6 +837,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // back buffer; render() flushes only the damaged region to the (slow) framebuffer.
     let front_fb = *unaos_kernel::video::WRITER.lock();
     let mut screen = unaos_kernel::video::Screen::new(front_fb);
+
+    // RAST-1 (x86/virt, `rast` knob): run the software-rasterizer spinning-cube demo through the
+    // panel `Screen` (call-never-edit), then hand the panel back to the shell below. Bounded frame
+    // count so boot never hangs. Feature-gated: knob-off builds are byte-identical (module unlinked).
+    #[cfg(all(target_arch = "x86_64", feature = "rast"))]
+    {
+        unaos_kernel::video::fbcon::detach();
+        unaos_kernel::rast_demo::run(&mut screen);
+    }
+
     let mut pal = unaos_kernel::pal::TargetPal::new(&mut screen);
 
     console.draw(&mut pal);

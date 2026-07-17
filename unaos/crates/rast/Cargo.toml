@@ -1,0 +1,17 @@
+[package]
+name = "rast"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "UnaOS software rasterizer: the platform-neutral 3D target layer and V3D pixel-exact oracle."
+
+[dependencies]
+# Deterministic float math. `libm` is pure-Rust and correctly-rounded, so `sqrtf`/`floorf`/
+# `sinf`/`cosf` are byte-identical on x86_64 and aarch64 — the same kernel/host bit-identity
+# guarantee `libs/fs/unafs` already relies on. This is what makes "same scene ⇒ same pixels
+# on both arches" hold: core's own float intrinsics are std-only in `no_std` anyway, and
+# platform libm implementations are not correctly-rounded (they diverge).
+libm = { version = "0.2", default-features = false }
+
+# The crate is `#![no_std]` for every cross-compiled (kernel) build; `std` links only under
+# `cargo test` so the host golden-image oracle can run with a plain `cargo test`.
