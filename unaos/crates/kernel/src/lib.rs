@@ -44,6 +44,12 @@ pub mod selftest;
 #[cfg(target_arch = "x86_64")]
 pub mod flight_recorder;
 
+// RAST-1: the `rast` software-rasterizer demo (spinning flat-shaded cube through the panel
+// framebuffer path). x86/virt-only + `rast`-feature-gated (UNAOS_RAST=1), so aarch64 and knob-off
+// builds never link it (byte-identical). See docs/dev/OS/08_VIDEO/rasterizer.md.
+#[cfg(all(feature = "rast", target_arch = "x86_64"))]
+pub mod rast_demo;
+
 pub mod pal;
 pub mod ui;
 pub mod video;

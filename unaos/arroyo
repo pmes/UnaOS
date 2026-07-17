@@ -50,6 +50,9 @@ _feats=""
 # readout, display-BAR probe, scripted scroll scenario). x86_64-only module — aarch64 media are
 # byte-identical with this on or off.
 [ -n "${UNAOS_VIDEOBENCH:-}" ] && _feats="${_feats}videobench,"
+# RAST-1: software-rasterizer spinning-cube demo through the x86/virt panel path (UNAOS_RAST=1).
+# x86_64-only knob; aarch64 media byte-identical on or off, and x86 knob-off is byte-identical too.
+[ -n "${UNAOS_RAST:-}" ] && _feats="${_feats}rast,"
 # PORTSW-1: DEFAULT-ON Panther Point EHCI->xHCI port switchover (route the shared USB2 ports + enable
 # SuperSpeed) so the 2012 rMBP internal keyboard/trackpad re-enumerate on the xHCI+HID stack. Applied
 # BEFORE enumeration with mask-read-before-write discipline (writes only advertised bits). Metal-gated

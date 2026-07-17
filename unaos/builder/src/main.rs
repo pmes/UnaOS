@@ -53,6 +53,9 @@ fn main() {
     // VPERF: x86 video-path bench instrumentation (scroll/VRAM-read counters, fbmem readout,
     // display-BAR probe, scripted scroll scenario). x86_64-only module; default OFF.
     if std::env::var("UNAOS_VIDEOBENCH").is_ok() { feats.push("videobench"); }
+    // RAST-1: software-rasterizer spinning-cube demo through the x86/virt panel path. x86_64-only
+    // knob; default OFF => byte-identical media (the `rast` dep + demo module are unlinked).
+    if std::env::var("UNAOS_RAST").is_ok() { feats.push("rast"); }
     // PORTSW-1: the Panther Point EHCI->xHCI port switchover runs BY DEFAULT (metal-gated policy
     // 2026-07-16: the no-routing boot dropped ALL external USB on the 2012 rMBP). UNAOS_NOPORTSW=1
     // OPTS OUT (never-run no-routing experiment) => zero config-space writes, byte-identical no-routing

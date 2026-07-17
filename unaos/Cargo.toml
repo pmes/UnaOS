@@ -3,6 +3,7 @@ members = [
     "builder", "crates/boot-info", "crates/bootloader",
     "crates/kernel",
     "crates/net",
+    "crates/rast",
 ]
 # The Ring-0-embeddable cores under `libs/` (e.g. `libs/sys/helm`) are members of
 # the root host workspace, not the kernel workspace — the kernel pulls them as
