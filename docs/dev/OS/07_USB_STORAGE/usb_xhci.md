@@ -306,9 +306,9 @@ whole subtree goes with it. Bindings are cleared, `DISABLE_SLOT` is queued via t
 existing `slots_to_disable` drain, `reset_soft_state` runs. Root-port slots, sibling hub
 ports, and other trees are provably untouched (the match requires this tree + this
 port's exact prefix);
-the summary trace asserts the scope. Every latched change feature on the port is then
-cleared (feature selectors 16..20) so the endpoint deasserts and can report the next
-change.
+the summary trace asserts the scope. After servicing (connect or disconnect or a no-op
+change), **every set change bit in `wPortChange`** is acknowledged with `ClearPortFeature`
+so the endpoint deasserts and can report the next change — see §7h for the full-word ack.
 
 **Bench-assertable trace substrings (attended sitting):**
 
@@ -589,6 +589,43 @@ MISSION SUCCESS; `UNAOS_NOSTORAGE=1` clean.
 re-address and the new Evaluate Context, so the QEMU gate proves the new path *works*, not that
 it *cures* the metal strand. The rMBP sitting asserts the FS mouse behind the HS hub enumerates
 and tracks (the descriptor read completing at the learned MPS0, HID interrupt endpoint bound).
+
+---
+
+### 7h. Full-word downstream change acknowledgement (XHUB-SS-linkstate)
+
+**Metal finding (2026-07-17, attended rMBP sitting).** Plugging/unplugging a
+**card-reader-with-no-card on the SuperSpeed hub** (slot 9) left a downstream port with
+`wPortChange = 0x0040` (**C_PORT_LINK_STATE**) **unacknowledged**. The hub keeps its
+change-bitmap bit set while any C_* feature stays set, so its interrupt-IN Status Change
+Endpoint **kept re-firing** (observed **1158+×**), pegging the CPU until the reader was
+physically pulled — the "angry Mac" storm.
+
+**Root cause.** `service_one_hub_change` serviced the *connection* change (M2 enumerate /
+M3 teardown) but acked the change word with a loop over change bits 0..4 mapping bit `i` to
+ClearPortFeature selector `16 + i`. That contiguity holds **only for USB 2.0 hubs**
+(connection/enable/suspend/over-current/reset → 16..20). On a **SuperSpeed** hub the
+non-connection selectors are relocated and the loop never reached bits 5..7:
+`C_BH_PORT_RESET` = bit 5 → selector **29**, `C_PORT_LINK_STATE` = bit 6 → selector **25**,
+`C_PORT_CONFIG_ERROR` = bit 7 → selector **26** (USB 3.x §10.14.2.6, Tables 10‑8/10‑11).
+So an SS link-state change was structurally impossible to ack and stormed forever.
+
+**Fix (additive; connection semantics unchanged).** After `GET_PORT_STATUS`,
+`service_one_hub_change` now acks **every set change bit** in `wPortChange`, mapping each
+bit to its real selector via `hub_port_change_feature_selector(bit, is_ss)` (reserved bits
+skipped). The M2 connect enumerate / M3 disconnect teardown path is untouched; only the
+missing non-connection acks are added. Bounded: at most 16 `ClearPortFeature` transfers
+(one 16-bit word), no new unbounded loop; the per-wake `HUB_CHANGE_BUDGET` cap still stands.
+
+**Witness (bench-assertable):**
+- `HUB slot N port P acked change bits 0xAAAA of wPortChange 0xCCCC (SS|HS/FS) — Status
+  Change Endpoint quiesced.` — the `acked` mask equals the set change bits (reserved bits
+  excepted); a residual `wchange & !acked` on a selectable bit would be the storm signature.
+
+**⚠ METAL-PENDING.** QEMU does not model the SS-no-card link-state edge trigger, so the
+storm cannot be reproduced headless; the ack-completeness is verifiable in code and the
+connection hot-plug/teardown path stays green (§7d witnesses unchanged). The cure — the
+reader-with-no-card plug/unplug no longer storms — rides the next rMBP sitting.
 
 ---
 

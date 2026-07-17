@@ -335,6 +335,32 @@ const XENUM_ADDR_RETRIES: u32 = 3;
 /// re-queued and drained on the next pass (the XENUM-1 bounded/paced discipline).
 const HUB_CHANGE_BUDGET: usize = 8;
 
+/// Map a hub downstream-port `wPortChange` bit index to its ClearPortFeature selector, or `None`
+/// for a reserved bit. Acking the FULL change word (not just C_PORT_CONNECTION) is load-bearing on
+/// real hardware: a USB hub keeps a change-bitmap bit set — and its interrupt-IN Status Change
+/// Endpoint re-firing — while ANY C_* feature stays set (USB 2.0 §11.24.2.7 / USB 3.x §10.14.2.6).
+///
+/// The selectors are NOT simply `16 + bit`. USB 2.0 hubs use contiguous C_PORT_* selectors 16..20
+/// for change bits 0..4 (connection/enable/suspend/over-current/reset). SuperSpeed hubs keep bits
+/// 0/3/4 (connection/over-current/reset → 16/19/20) but relocate the rest: bit 5 = C_BH_PORT_RESET
+/// (29), bit 6 = C_PORT_LINK_STATE (25), bit 7 = C_PORT_CONFIG_ERROR (26); bits 1/2 are reserved.
+/// The old `16 + i` loop never reached bits 5..7, so an SS non-connection change — metal rMBP: a
+/// card-reader-with-no-card raising C_PORT_LINK_STATE (`wPortChange=0x0040`) — was never acked and
+/// the SS hub's Status Change Endpoint stormed the interrupt-IN forever (observed 1158+×).
+fn hub_port_change_feature_selector(bit: u16, is_ss: bool) -> Option<u16> {
+    match (bit, is_ss) {
+        (0, _) => Some(16),     // C_PORT_CONNECTION
+        (1, false) => Some(17), // C_PORT_ENABLE     (USB 2.0 only)
+        (2, false) => Some(18), // C_PORT_SUSPEND    (USB 2.0 only)
+        (3, _) => Some(19),     // C_PORT_OVER_CURRENT
+        (4, _) => Some(20),     // C_PORT_RESET
+        (5, true) => Some(29),  // C_BH_PORT_RESET   (SuperSpeed)
+        (6, true) => Some(25),  // C_PORT_LINK_STATE (SuperSpeed)
+        (7, true) => Some(26),  // C_PORT_CONFIG_ERROR (SuperSpeed)
+        _ => None,
+    }
+}
+
 pub static XHCI_CONTROLLER: spin::Mutex<Option<XhciController>> = spin::Mutex::new(None);
 
 /// Human-readable mass-storage enumeration/bring-up state, for the shell `diskinfo` command when no
@@ -4618,13 +4644,29 @@ impl XhciController {
         }
 
         // Deassert every latched change on this port so the Status Change Endpoint can report the
-        // next change (a USB hub keeps the change bitmap bit set while any C_* feature is set). The
+        // next change (a USB hub keeps the change bitmap bit set — and its interrupt-IN re-firing —
+        // while any C_* feature is set). Ack the FULL wPortChange word, not just connection: a
+        // non-connection change (metal rMBP: SS C_PORT_LINK_STATE=0x0040 from a card reader with no
+        // card) left latched storms the endpoint forever. The ClearPortFeature selector for a change
+        // bit is NOT `16 + bit` on SuperSpeed hubs — see hub_port_change_feature_selector. The
         // connect path's reset already cleared C_PORT_CONNECTION/C_PORT_RESET; clearing again is a
-        // harmless no-op. Change bit index i -> feature selector 16+i (C_CONNECTION..C_RESET).
-        for i in 0..5u16 {
-            if (wchange & (1 << i)) != 0 {
-                let _ = self.sync_control(hub_slot, 0x23, 0x01, 16 + i, port as u16, 0, 0, false);
+        // harmless no-op. Reserved bits (no selector) are skipped. Bounded: max 16 acks (one word).
+        let mut acked = 0u16;
+        for bit in 0..16u16 {
+            if (wchange & (1 << bit)) != 0 {
+                if let Some(sel) = hub_port_change_feature_selector(bit, is_ss) {
+                    let _ = self.sync_control(hub_slot, 0x23, 0x01, sel, port as u16, 0, 0, false);
+                    acked |= 1 << bit;
+                }
             }
+        }
+        if wchange != 0 {
+            // Witness: prove the full change word was acknowledged (acked mask == set change bits,
+            // reserved bits excepted) so the Status Change Endpoint can quiesce. A residual
+            // (wchange & !acked & known-selectable) would be the storm signature.
+            serial_println!(
+                "xHCI: HUB slot {} port {} acked change bits {:#06x} of wPortChange {:#06x} ({}) — Status Change Endpoint quiesced.",
+                hub_slot, port, acked, wchange, if is_ss { "SS" } else { "HS/FS" });
         }
         // Nudge the read if a previous arm failed (normally still armed from the event dispatch).
         if self.slots[hub_slot as usize].hub_int_expect_phys == 0 {
