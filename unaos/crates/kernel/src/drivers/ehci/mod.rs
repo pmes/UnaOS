@@ -463,6 +463,47 @@ impl Controller {
         false
     }
 
+    /// Probe-13: the pass-3 smoke shape (pre-loaded 0-length IN to a bogus address — pure
+    /// pipeline + write-back, no real listener) re-run while a port is ENABLED. Every
+    /// pre-enable smoke passed and every live-port transfer HSE'd; this isolates "DMA while a
+    /// port is active" as the failing ingredient. Returns whether HSE fired (and restores
+    /// running state if it did).
+    unsafe fn live_port_smoke(&mut self, tag: &str) -> bool {
+        let qh = self.async_qh;
+        (*qh).horiz = PTR_TERMINATE;
+        (*qh).ep_chars = 42 | (1 << 8) | QH_DTC | QH_EPS_HIGH | (8 << QH_MPS_SHIFT);
+        (*qh).ep_caps = QH_MULT1 | 0x01;
+        (*qh).overlay[0] = PTR_TERMINATE;
+        (*qh).overlay[1] = PTR_TERMINATE;
+        core::ptr::write_volatile(&mut (*qh).overlay[2], QTD_ACTIVE | (1 << 10) | QTD_PID_IN);
+        for i in 0..1024 {
+            core::ptr::write_volatile(self.frame_list.add(i), (self.qh_phys as u32) | PTR_TYPE_QH);
+        }
+        let _ = self.set_periodic_schedule(true);
+        settle_ms(5);
+        let sts = mmio_read32(self.op + OP_USBSTS).unwrap_or(0);
+        let _ = self.set_periodic_schedule(false);
+        for i in 0..1024 {
+            core::ptr::write_volatile(self.frame_list.add(i), PTR_TERMINATE);
+        }
+        let tok = core::ptr::read_volatile(&(*qh).overlay[2]);
+        (*qh).overlay[0] = PTR_TERMINATE;
+        serial_println!(
+            ":: EHCI-HID: [{}] live-port smoke ({}): USBSTS={:#010x} HSE={} HCHalted={} post-token={:#010x} == witness ::",
+            self.idx, tag, sts, (sts >> 4) & 1, (sts >> 12) & 1, tok
+        );
+        let hse = sts & STS_HSE != 0;
+        if hse {
+            let _ = mmio_write32(self.op + OP_USBSTS, sts & STS_RW1C);
+            let cmd = mmio_read32(self.op + OP_USBCMD).unwrap_or(0);
+            let _ = mmio_write32(self.op + OP_USBCMD, (cmd & !CMD_PSE) | CMD_RS);
+            let _ = wait_bounded(|| {
+                mmio_read32(self.op + OP_USBSTS).unwrap_or(STS_HCHALTED) & STS_HCHALTED == 0
+            });
+        }
+        hse
+    }
+
     /// N2 address allocation. The failure paths after this call BURN the address by
     /// construction: `next_addr` is monotonic and nothing ever hands an address back.
     fn alloc_addr(&mut self) -> Option<u8> {
@@ -1063,6 +1104,10 @@ unsafe fn pci_evidence(bus: u8, dev: u8, func: u8, idx: usize) {
 pub fn init() {
     serial_println!(":: EHCI-HID: begin (EHCI-3 driver, polling model, knob-gated) ::");
     let mut ctrls: Vec<Controller> = Vec::new();
+    // Probe-13 (b), Peter-approved 2026-07-17: the RCBA CG (clock gating) base + a one-shot
+    // flag — the clear fires only if the live-port smoke actually HSEs.
+    let rcba = unsafe { (read_config_32(0, 31, 0, 0xF0) as u64) & !0x3FFF };
+    let mut cg_cleared = false;
 
     for bus in 0u8..=255 {
         for dev in 0u8..=31 {
@@ -1280,6 +1325,27 @@ pub fn init() {
                             continue;
                         }
                         if c.reset_root_port(port) {
+                            // Probe-13 (a): the pass-3 smoke, now with THIS port enabled.
+                            let mut hse = c.live_port_smoke("port-enabled");
+                            if hse && !cg_cleared && rcba != 0 {
+                                // Probe-13 (b), Peter-approved surface extension: clear the
+                                // PCH dynamic clock gating register once, traced, and retest.
+                                let before = mmio_read32(rcba + 0x341C).unwrap_or(0);
+                                let _ = mmio_write32(rcba + 0x341C, 0);
+                                let after = mmio_read32(rcba + 0x341C).unwrap_or(0);
+                                cg_cleared = true;
+                                serial_println!(
+                                    ":: EHCI-HID: RCBA CG clear (Peter-approved): {:#010x} -> {:#010x} == witness ::",
+                                    before, after
+                                );
+                                hse = c.live_port_smoke("post-CG-clear");
+                            }
+                            if hse {
+                                serial_println!(
+                                    ":: EHCI-HID: [{}] STOP-NOTE live-port DMA still HSEs — enumeration attempted anyway for the trace ::",
+                                    idx
+                                );
+                            }
                             c.enumerate_at_zero(QH_EPS_HIGH, 0, 0, 0);
                         }
                     }
