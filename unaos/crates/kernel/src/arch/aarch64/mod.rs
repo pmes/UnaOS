@@ -75,6 +75,14 @@ pub mod display_tegra;
 #[cfg(all(feature = "tegra", feature = "smpprobe"))]
 pub mod smpprobe;
 
+// PI-V3D-1: the VideoCore VI (V3D 4.2) GPU foundation — firmware power/clock, MMIO probe, the
+// V3D-private MMU, and a minimal GPU buffer-clear. Pi bare-metal AND `v3d`-gated, so it is compiled
+// out of every default image (the `v3d`-off kernel8 binary stays byte-identical to baseline). QEMU
+// raspi4b does not model V3D: the probe detects absence and degrades gracefully; all positive
+// verification is attended metal. Enable via `UNAOS_V3D=1 UNAOS_PI=1 ./arroyo kernel8`.
+#[cfg(all(feature = "baremetal", feature = "v3d"))]
+pub mod v3d;
+
 pub fn init() {
     serial_println!(":: AARCH64 Core Hardware Init ::");
     boot_diagnostics();

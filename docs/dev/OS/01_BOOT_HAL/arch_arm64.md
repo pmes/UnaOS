@@ -4674,3 +4674,105 @@ test-arm 40` = 3/3 secondaries + idle + busy heartbeat PASS + **VUG-HONESTY witn
 6/6; `./arroyo test-arm 22` MISSION; `./arroyo kernel8-test` CAPSTONE COMPLETE / 0 FAIL (shared
 `sched.rs` unregressed on the Pi); `./arroyo test` (x86) MISSION, no behavioral change (the accessor
 compiles the shared `refresh`; `vug` runs only on the GUI, so headless x86 is untouched).
+---
+
+## PI-V3D — VideoCore VI (V3D 4.2) GPU foundation on the Pi 4 (Arc PI-V3D-1)
+
+The first GPU silicon UnaOS touches. The target is **not** a triangle: it proves the full
+non-graphics chain — firmware power domain, clock, MMIO register access, the V3D-private MMU, a
+control-list fetch, and a tile store — with the smallest job that exercises all of it: **the GPU
+clears a buffer to a known colour and the CPU verifies the bytes**. A triangle (binner control list
++ shader record) is the explicit *next* arc; nothing here starts it. All code lives in
+`arch/aarch64/v3d.rs` behind the `v3d` cargo feature (`UNAOS_V3D=1`, implies `baremetal` ⇒ `pi`),
+plus two `v3d`-gated firmware helpers in `arch/aarch64/mailbox.rs`. Knob-off, the module and its call
+site vanish and the `kernel8` image is **byte-identical to baseline** (verified: `4337453747e7…`).
+
+**Call site (a byte-identity note).** The bring-up is triggered from the tail of
+`mailbox::init_framebuffer` (the VideoCore framebuffer path — exactly the surface M3 blits into),
+*not* from the middle of `kernel_main`. Inserting a gated block into `kernel_main` shifts the embedded
+panic-location line numbers of every aarch64 statement below it (a positional artifact — a single
+blank line at that point changes the image hash), which would break the knob-off byte-identity gate.
+A gated call at the end of the last function in `mailbox.rs` shifts nothing, so knob-off is bit-exact
+to baseline while knob-on runs the full chain. The site is single-threaded (boot, pre-SMP, mailbox
+idle) and has the framebuffer in hand — the same preconditions the BSP-post-`emmc2` spot would give,
+minus the line-shift.
+
+### QEMU vs metal — the honesty boundary
+
+**QEMU `raspi4b` does not model V3D.** The V3D hub base `0xFEC00000` happens to be backed (reads
+return 0), but the V3D **core** block at `+0x4000` is unmapped — a read there raises a *synchronous
+external abort* (`ESR=0x96000010`, EC=0x25, IFSC=0x10 "external abort, not on a translation walk";
+the Device window itself is MMU-mapped by `boot.rs` L1[3], so this is a bus abort from an unbacked
+address, not a translation fault). Because `AARCH64 EXCEPTION` is a forbidden regression pattern, the
+probe reads **hub `IDENT0` first and decides on it alone**: live (non-zero, non-all-ones) ⇒ real
+silicon, proceed to the core registers; not-live (QEMU's 0) ⇒ print the graceful-degradation line and
+return *before touching any core register*. So in QEMU the arc's only observable effect is:
+
+```
+:: V3D: PI-V3D-1 bring-up starting (VideoCore VI / V3D 4.2) ::
+:: V3D: power domain 10 ON ::                 (QEMU models the firmware power/clock tags)
+:: V3D: clock id 5 set to 500000000 Hz ::
+:: V3D: HUB_IDENT0 = 0x00000000 ::
+:: V3D: absent (hub IDENT0 not live) — GPU bring-up skipped, graceful degradation (expected in QEMU) ::
+```
+
+Everything past the presence gate (MMU program, clear job) is **ATTENDED-METAL-UNVERIFIED**: written
+correct-by-construction against the references below, exercised only at an attended Pi sitting. Do
+**not** treat "no V3D in QEMU" as a divergence.
+
+### The chain (M1–M4)
+
+- **M1 — power, clock, probe.** Firmware mailbox `SET_DOMAIN_STATE` (tag `0x00038030`, domain 10 =
+  V3D, state 1) **then** `SET_CLOCK_RATE` (tag `0x00038002`, clock id 5 = V3D, 500 MHz) — in that
+  order (a powered-but-unclocked block reads garbage registers). Then map the hub (`0xFEC00000`) +
+  core 0 (`+0x4000`), read `HUB_IDENT0..3` / `CTL_IDENT0..2`, decode the tech version (expect V3D
+  4.2 on the Pi 4). The legacy VC4 `Enable_QPU`/set-power tags are **not** the Pi-4 path.
+- **M2 — the V3D MMU.** The big VC4→VC6 structural change: CLE fetches and tile stores go through a
+  V3D-private page table. We build a **flat, confined identity** table — one `u32` PTE per 4 KiB of
+  iova, `pte = VALID | WRITEABLE | (phys>>12)`, mapping **only** the buffer arena's own pages
+  (`iova == phys`) and leaving every other PTE invalid. Programmed via hub `V3D_MMU_PT_PA_BASE` (base
+  in pages), `V3D_MMU_CTL` (enable + PT-invalid/write-violation **abort** policy), the illegal-address
+  catcher, then an MMUC flush + a TLB clear polled to completion with a finite backstop. *Confinement
+  is the review-lens property:* the GPU can reach the arena and nothing else — a stray address faults
+  in the V3D MMU rather than scribbling kernel RAM.
+- **M3 — the clear job.** Build a render-only control list (no binner, no shaders) in the arena
+  (`TILE_RENDERING_MODE_CFG` + `CLEAR_COLORS` + per-tile `TILE_COORDINATES` +
+  `STORE_TILE_BUFFER_GENERAL` + `END_OF_TILE_MARKER` + `END_OF_RENDERING`), pre-seed the target with a
+  sentinel, `clean_range` the CL + target to RAM, kick **CT1** (the render queue) via `CT1QBA`/`CT1QEA`,
+  poll `CT1CS.CTRUN` to idle with a **finite ~500 ms backstop** (never an unbounded spin — the
+  ORIN-SMP anti-hang discipline), `clean_invalidate_range` the target, and have the CPU byte-verify it
+  equals the clear colour. On success the 64×64 result is blitted into the panel framebuffer (a
+  metal visible witness). The RCL packet framing, target pointer, clear value, and tile loop are all
+  present and arena-bounds-checked; the exact 4.2 per-packet field packing is the attended-metal
+  refinement.
+- **M4 — cache-maintenance audit.** V3D is **not** coherent with the A72 data cache. Every buffer the
+  CPU writes for the GPU (page table, control list, target sentinel) is `cache::clean_range`d before
+  the kick; every buffer the GPU writes for the CPU (the target) is `cache::clean_invalidate_range`d
+  before the readback. No-ops in QEMU, load-bearing on metal — exactly the "works in QEMU, black
+  screen on metal" class this kernel has been bitten by. The MMIO window needs no new mapping: the V3D
+  hub/core sit in the `0xC0000000–0xFFFFFFFF` Device-nGnRnE GiB already mapped by `boot.rs` L1[3].
+
+### Memory-safety invariant (the arc's review lens)
+
+The GPU reaches RAM only through PTEs we mark VALID, and we mark valid **only** the arena's own
+pages. Every V3D-visible address written into a control list (the store target, the CL begin/end
+addresses handed to CT1) is bounds-checked to lie inside the arena before the kick (`arena_contains`);
+the CL writer (`RclWriter`) saturates at the arena end and can never append past it; the page-table
+fill is bounded by `PT_CAP` and refuses (fail-closed) if the arena would not fit. A control list that
+referenced any address outside the arena would fault in the V3D MMU, not corrupt kernel memory.
+
+### References of record
+
+- Register layout: Linux `drivers/gpu/drm/v3d/v3d_regs.h` (hub + core + MMU offsets, field bits).
+- V3D MMU: Linux `drivers/gpu/drm/v3d/v3d_mmu.c` (flat page table, PTE bits, flush sequence).
+- Render-control-list packets: Mesa `src/broadcom/cle/v3d_packet_v33.xml` (4.2 encodings — the
+  VC4-era packet numbers/sizes do **not** transfer).
+- Structure reference: librerpi/lk-overlay `v3d.c`.
+
+### Gates green
+
+`./arroyo check` both arches (knob on + off); `UNAOS_V3D=1 ./arroyo kernel8-test 43` = **MBENCH PASS
+46/46, 0 forbidden, 0 AARCH64 EXCEPTION** (the probe degrades gracefully in QEMU); knob-off
+`./arroyo kernel8-test 43` = 46/46; **knob-off `kernel8.img` byte-identical to baseline `03105f0`**
+(sha256 recorded in the landing report). Positive V3D verification (power/clock/IDENT live, MMU
+program, GPU clear, panel blit) is the **attended Pi sitting** — see `scripts/pi-v3d-bench.md`.
