@@ -301,6 +301,14 @@ extern "C" fn __secondary_rust_virt(_advisory: u64) -> ! {
     // confirm the reverse direction.
     gic::send_sgi(BSP_AFFINITY.load(Ordering::Acquire) as usize, IPI_SGI);
 
+    // SCHED-NEXT busy-heartbeat: before parking idle, run ONE bounded cooperative pass over a queue the
+    // BSP staged for this core (released via `secondary_work_go`). This publishes honest BUSY telemetry
+    // (`CPU_BUSY[core] > 0`) — the other half of the idle-heartbeat below, which alone only proves a
+    // parked core reads idle. Cooperative (yield/exit tasks, no timer, no WFI) so it is safe on this
+    // EL2 secondary; the pass drains a finite pre-staged queue and returns, then the core parks as
+    // before. The spin-for-release inside waits with IRQ unmasked, so the BSP→AP ping still lands.
+    sched::run_secondary_work(core);
+
     // Honest idle heartbeat (VUG-1 M3b): this core is online but parks WITHOUT running the scheduler,
     // so it never calls `dispatch_next` and its CPU-pulse counters would stay (0,0) — a pinned/undefined
     // meter bar for a demonstrably-online-idle core. Register it as idle so the bar reads honest 0% busy.
@@ -626,33 +634,75 @@ pub fn start_secondaries(dtb_addr: u64, dtb_size: usize) {
         n_startable
     );
 
-    // Per-core idle-heartbeat witness (VUG-1 M3b honesty): each online secondary parked in
-    // `__secondary_rust_virt` and bumped its own CPU_IDLE via `sched::note_core_idle` at park entry —
-    // strictly after publishing CORE_READY, and the BSP has since completed a full BSP→AP ping round
-    // trip + AP→BSP verdict above, so every online AP has run its park-entry heartbeat by now. Read the
-    // CPU-pulse counters back: an online-idle core must read `busy + idle > 0`, NOT the pinned `(0,0)`
-    // that would render an undefined/frozen meter bar. This is the QEMU-provable half of the fix; the
-    // real Orin vug pixels are the accruing metal witness.
-    let mut all_heartbeat = true;
+    // SCHED-NEXT busy-heartbeat: stage a small cooperative queue for each online secondary and release
+    // them. Each secondary is spinning in `sched::run_secondary_work` (reached right after it published
+    // CORE_READY + pinged, so before its idle park); the release lets it drain the staged queue — real
+    // task dispatch that bumps CPU_BUSY — then park idle. Staging happens AFTER the ping proofs above so
+    // those observe the same responsive-spinning secondary as before (IRQ unmasked in the spin).
+    const SECWORK_TASKS: usize = 2; // >= 2 so busy telemetry is unambiguous (each yields 3x)
+    for idx in 1..n_cores {
+        if startable[idx] && CORE_READY[idx].load(Ordering::Acquire) {
+            sched::stage_secondary_work(idx, SECWORK_TASKS);
+        }
+    }
+    sched::secondary_work_go();
+    // Wait (bounded) for every online secondary to finish its cooperative pass before reading the
+    // meter, so the busy witness never races an un-run core. Cooperative drain of a handful of
+    // yield/exit tasks is sub-millisecond; give it a generous ~200 ms ceiling.
+    for idx in 1..n_cores {
+        if startable[idx] && CORE_READY[idx].load(Ordering::Acquire) {
+            let deadline = timer::cntpct() + freq / 5;
+            if !wait_until(deadline, || sched::secondary_work_done(idx)) {
+                serial_println!(
+                    ":: AARCH64 SMP: WARNING AP {} cooperative work pass did not complete ::",
+                    idx
+                );
+            }
+        }
+    }
+
+    // Per-core heartbeat witness (VUG-1 M3b honesty): each online secondary ran a cooperative work
+    // pass (`run_secondary_work` → CPU_BUSY) and THEN parked idle (`note_core_idle` → CPU_IDLE). Read
+    // both counters back: an online secondary must now read `busy > 0` (it ran real scheduled work)
+    // AND `idle > 0` (it parked honestly) — the pinned `(0,0)` would render an undefined/frozen meter
+    // bar and a bare `busy == 0` would be the parked-only state the idle-heartbeat proved. This is the
+    // QEMU-provable half; the real Orin vug pixels (a live busy bar on a secondary) are the accruing
+    // metal witness.
+    let mut all_idle = true;
+    let mut all_busy = true;
     for idx in 1..n_cores {
         if !(startable[idx] && CORE_READY[idx].load(Ordering::Acquire)) {
             continue;
         }
         let (busy, idle) = sched::meter_cpu_ticks(idx);
-        if busy + idle == 0 {
-            all_heartbeat = false;
+        if idle == 0 {
+            all_idle = false;
+        }
+        if busy == 0 {
+            all_busy = false;
         }
         serial_println!(
             ":: AARCH64 SMP: AP {} pulse (busy={}, idle={}) {} ::",
             idx,
             busy,
             idle,
-            if busy + idle > 0 { "idle" } else { "PINNED" }
+            if busy > 0 && idle > 0 {
+                "ran+idle"
+            } else if busy + idle > 0 {
+                "idle"
+            } else {
+                "PINNED"
+            }
         );
     }
     serial_println!(
         ":: AARCH64 SMP: per-core idle heartbeat {} — {} online APs report idle (not pinned) ::",
-        if all_heartbeat { "PASS" } else { "FAIL" },
+        if all_idle { "PASS" } else { "FAIL" },
+        online
+    );
+    serial_println!(
+        ":: AARCH64 SMP: per-core busy heartbeat {} — {} online APs ran cooperative scheduled work ::",
+        if all_busy { "PASS" } else { "FAIL" },
         online
     );
 }
