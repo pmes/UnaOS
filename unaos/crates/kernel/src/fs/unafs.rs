@@ -459,6 +459,196 @@ pub fn native_acl_list() -> Vec<NativeAclRow> {
     .unwrap_or_default()
 }
 
+// =====================================================================
+// K8c: the snapshot READ path under CURRENT-ACL enforcement.
+//
+// Ruling of record (Peter, 2026-07-16, "we want high security"): snapshot
+// reads are governed by the LIVE object's CURRENT ACL, re-evaluated at read
+// time. Revocation is total — a principal that cannot read the live object
+// cannot read ANY snapshot of it. Snapshots preserve bytes, never authority.
+//
+// ONE evaluator at this layer ([`read_authz`]): every snapshot-read surface
+// (`usnapcat`, `usnapls`, [`snapshot_read`]) defers to it, keyed on the LIVE
+// inode identity. HONESTY NOTE (lens A fold, 2026-07-16): this enforces the
+// same SEMANTICS as the live syscall path — current-ACL, CAP_READ-equivalent
+// grant rights (ONE decoder, [`rights_from_native`] below, which the syscall
+// layer's grant machinery delegates to; the bit is const-asserted equal to
+// CAP_READ — never a lookalike), fail-closed on a deleted object — but it is a
+// kernel-verb-layer evaluator DISTINCT from the syscall layer's
+// OwnedFile/FileGrant machinery. Unifying the two evaluators is a ledgered
+// follow-up (SECURITY.md K8c entry). A native unafs object carries its ACL as
+// its own typed attributes — `owner` (String) and one `grants:<principal>` per
+// grantee holding an `rw`/`r`/`w` rights value (the K6 convention
+// `rights_native_value` writes).
+// =====================================================================
+
+/// The principal a kernel-authority surface (the shell) presents. Kernel
+/// authority reads any LIVE object; it is NOT a bypass of the deleted-object
+/// fail-closed edge (see [`read_authz`]).
+pub const KERNEL_PRINCIPAL: &str = "kernel";
+
+/// The READ right bit of the capability model — BY DEFINITION equal to the
+/// syscall layer's `CAP_READ` (1 << 0), const-asserted there so the two can
+/// never drift (this module compiles in every aarch64 config; the syscall
+/// layer is baremetal-gated, hence the bit lives here and the assert there).
+pub(crate) const RIGHT_READ: u32 = 1 << 0;
+/// The WRITE right bit — equal to the syscall layer's `CAP_WRITE` (1 << 1),
+/// const-asserted there.
+pub(crate) const RIGHT_WRITE: u32 = 1 << 1;
+
+/// THE canonical decoder for a grant's native rights value (the K6 `rw`/`r`/
+/// `w`/`-` encoding `rights_native_value` writes): `rw`->R|W, `r`->R, `w`->W;
+/// anything else -> 0 (no rights = not a live grant). ONE implementation:
+/// the syscall layer's mount-time ACL rebuild (`rights_from_native` in
+/// `arch/aarch64/syscall.rs`) DELEGATES here, so the verb-layer authz and the
+/// syscall-layer grant machinery decode rights through the same function.
+pub(crate) fn rights_from_native(s: &[u8]) -> u32 {
+    match s {
+        b"rw" => RIGHT_READ | RIGHT_WRITE,
+        b"r" => RIGHT_READ,
+        b"w" => RIGHT_WRITE,
+        _ => 0,
+    }
+}
+
+/// A current-ACL read decision, traced honestly on the serial log so the
+/// deleted-from-live fail-closed edge is visible, never silent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadAuthz {
+    /// The principal may read (owner, grantee, kernel authority, or a public
+    /// live object with no owner row).
+    Permit,
+    /// The live object exists but its current ACL admits neither this principal
+    /// nor kernel authority — revocation of a formerly-granted principal lands
+    /// here, and it withholds the snapshot bytes too (revocation reaches the past).
+    DenyAcl,
+    /// The live object is GONE (deleted from the live tree): there is no live
+    /// ACL row, so the fail-closed default refuses — for EVERY principal,
+    /// kernel authority included. Deletion is the ultimate revocation; the
+    /// retained bytes survive on disk but no one reads them through this path.
+    DenyNoLiveObject,
+}
+
+/// The current-ACL READ evaluator every snapshot-read surface defers to (K8c).
+/// It consults ONLY the LIVE inode `live_id` (its `owner` + `grants:<principal>`
+/// attributes), never a snapshot's, so a snapshot read inherits exactly the live
+/// object's present-day authority. Same SEMANTICS as the syscall layer's live
+/// read check; a distinct evaluator (see the section note above).
+///
+/// Order matters: the deleted-object check comes FIRST, before the kernel-
+/// authority shortcut, so a deleted live object fails closed uniformly (the
+/// brief's explicit ruling — no owner row = refuse; documented consequence:
+/// even the kernel shell cannot read a snapshot of a deleted object through
+/// this path). Then kernel authority permits; then a public object (no `owner`)
+/// permits; then the owner permits; then a `grants:<principal>` row permits
+/// ONLY if its rights value carries the READ right — decoded by
+/// [`rights_from_native`], the ONE decoder the syscall layer's grant machinery
+/// also uses (it delegates here), tested against [`RIGHT_READ`] == the syscall
+/// layer's `CAP_READ` bit, const-asserted (lens A fix: a write-only `w` grant
+/// reads NEITHER live NOR snapshot — the grant model's exact CAP_READ
+/// semantics, not key-presence). Else DenyAcl.
+pub fn read_authz(fs: &mut KernelUnaFS, live_id: u64, principal: &str) -> ReadAuthz {
+    // Fail closed on a live object that no longer exists — checked before the
+    // kernel shortcut so deletion is a total, uniform revocation.
+    let ino = match fs.read_inode(live_id) {
+        Ok(i) => i,
+        Err(_) => return ReadAuthz::DenyNoLiveObject,
+    };
+    if principal == KERNEL_PRINCIPAL {
+        return ReadAuthz::Permit;
+    }
+    let owner = match ino.attributes.get("owner") {
+        Some(AttributeValue::String(s)) => s.clone(),
+        // No owner row: a public live object, readable by all (unchanged public
+        // semantics). Only ABSENCE OF THE OBJECT (above) fails closed.
+        _ => return ReadAuthz::Permit,
+    };
+    if principal == owner {
+        return ReadAuthz::Permit;
+    }
+    if let Some(AttributeValue::String(rights)) = ino
+        .attributes
+        .get(&alloc::format!("grants:{}", principal))
+    {
+        // Rights-aware (lens A): the grant admits a READ iff it carries the
+        // read right — the same decoder + bit (CAP_READ, const-asserted) the
+        // syscall layer uses.
+        if rights_from_native(rights.as_bytes()) & RIGHT_READ != 0 {
+            return ReadAuthz::Permit;
+        }
+    }
+    ReadAuthz::DenyAcl
+}
+
+/// The result of a current-ACL snapshot read.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SnapReadResult {
+    /// Permitted — the retained bytes AS OF the snapshot.
+    Ok(Vec<u8>),
+    /// The path does not resolve within the snapshot (never existed there).
+    NotInSnapshot,
+    /// The current ACL refused the read; the decision (`DenyAcl` /
+    /// `DenyNoLiveObject`) is carried so the caller can trace WHY.
+    Refused(ReadAuthz),
+    /// No retained root carries this generation (dropped or never taken).
+    SnapshotMissing,
+}
+
+/// Read a file from a retained root under CURRENT-ACL enforcement (K8c). The
+/// object is resolved in the SNAPSHOT (frozen bytes), but the authority is the
+/// LIVE object of the same stable logical id, decided by [`read_authz`]
+/// (live-read semantics: current-ACL, CAP_READ grant rights, fail-closed on a
+/// deleted object). Permitted → the snapshot's bytes; refused → the traced
+/// reason (an impostor or rights-lacking grantee is `DenyAcl`, a live-deleted
+/// object is `DenyNoLiveObject`, fail-closed).
+pub fn snapshot_read(
+    generation: u64,
+    path: &str,
+    principal: &str,
+) -> Result<SnapReadResult, MountError> {
+    with_unafs(|fs| {
+        // Phase 1: resolve the object's logical id in the snapshot (frozen view
+        // borrows fs; scope it so the ACL check below can re-borrow fs).
+        let sid = {
+            let mut view = match fs.open_snapshot(generation) {
+                Ok(v) => v,
+                Err(FileSystemError::SnapshotNotFound(_)) => {
+                    return SnapReadResult::SnapshotMissing
+                }
+                Err(_) => return SnapReadResult::NotInSnapshot,
+            };
+            match view.resolve_path(path) {
+                Ok(id) => id,
+                Err(_) => return SnapReadResult::NotInSnapshot,
+            }
+        };
+
+        // Phase 2: CURRENT-ACL — authorize against the LIVE inode of that id.
+        match read_authz(fs, sid, principal) {
+            ReadAuthz::Permit => {}
+            deny => return SnapReadResult::Refused(deny),
+        }
+
+        // Phase 3: permitted — hand back the retained bytes (reopen the view;
+        // the phase-1 borrow is released).
+        let mut view = match fs.open_snapshot(generation) {
+            Ok(v) => v,
+            Err(FileSystemError::SnapshotNotFound(_)) => {
+                return SnapReadResult::SnapshotMissing
+            }
+            Err(_) => return SnapReadResult::NotInSnapshot,
+        };
+        let size = match view.read_inode(sid) {
+            Ok(i) => i.size,
+            Err(_) => return SnapReadResult::NotInSnapshot,
+        };
+        match view.read_data(sid, 0, size) {
+            Ok(bytes) => SnapReadResult::Ok(bytes),
+            Err(_) => SnapReadResult::NotInSnapshot,
+        }
+    })
+}
+
 /// The K3HELLO.TXT fixture contents, byte-pinned against what `arroyo kernel8`
 /// stages into the unafs volume.
 const K3_HELLO: &[u8] = b"Hello from native UnaFS on the Pi 4!\n";
@@ -1138,6 +1328,225 @@ pub fn k8b_snap_selftest() {
         stats.snapshots_created,
         stats.snapshots_dropped,
         stats.blocks_written,
+        ticks
+    );
+}
+
+/// K8c scratch fixture — an OWNED native object the witness snapshots, revokes,
+/// and deletes; self-cleaning (K2 idiom) so the STATEFUL card never accrues.
+const K8C_NAME: &str = "K8CSNAP.TXT";
+const K8C_PATH: &str = "/K8CSNAP.TXT";
+/// Multi-block payloads: OLD is what the snapshot must keep serving to the
+/// permitted principals; NEW is the live divergence the snapshot never shows.
+const K8C_OLD: &[u8] = &[0xC3u8; 3 * 4096];
+const K8C_NEW: &[u8] = &[0xD4u8; 3 * 4096];
+
+/// K8c-snapread witness (uncounted): prove the snapshot READ path enforces the
+/// LIVE object's CURRENT ACL — the "high security" ruling (revocation reaches
+/// the past). Snapshots preserve bytes, never authority.
+///
+/// A native object carries its ACL as its own attributes (`owner` + one
+/// `grants:<p>` per grantee holding an `rw`/`r`/`w` rights value). The witness
+/// sets owner=alice, grants bob `r` and carol `w` (write-only), retains the
+/// tree, overwrites the live file, then reads the SNAPSHOT as several
+/// principals — every decision routed through the SAME [`read_authz`] every
+/// snapshot-read surface uses.
+///
+/// Sequence (8 bits):
+///   bit0 setup: create the owned scratch (owner=alice, grants:bob=r,
+///        grants:carol=w) with OLD bytes, retain it, overwrite the LIVE file
+///        with NEW — snapshot present;
+///   bit1 the OWNER (alice) reads the snapshot -> the OLD bytes (permit + faithful);
+///   bit2 the READ-GRANTEE (bob) reads the snapshot -> the OLD bytes (grant honored);
+///   bit3 an IMPOSTOR (mallory) is REFUSED from the snapshot (DenyAcl) AND
+///        refused the LIVE object by the same evaluator (refused live <=> refused snapshot);
+///   bit4 RIGHTS-AWARE (lens A): the WRITE-ONLY grantee (carol, `w`) is REFUSED
+///        the snapshot read (DenyAcl) AND refused live — a grant without the
+///        READ right (CAP_READ) reads neither, matching the syscall layer;
+///   bit5 REVOCATION: drop bob's live grant; bob now REFUSED from the snapshot
+///        he could read a moment ago (DenyAcl) — the money line: revocation
+///        reaches the past;
+///   bit6 DELETED-OBJECT EDGE: unlink the live object; even the OWNER (alice)
+///        is REFUSED (DenyNoLiveObject) — no live ACL row, fail closed, traced;
+///   bit7 self-clean: drop the snapshot + remount, no leak, fsck clean.
+///
+/// Skips honestly on media without a unafs partition. Self-cleaning.
+pub fn k8c_snapread_selftest() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    if let Err(e) = locate() {
+        serial_println!(":: K8c-snapread: no unafs volume ({:?}) — skipped ::", e);
+        return;
+    }
+
+    let mut w = 0u32;
+    let t0 = bench_ticks();
+
+    // Start clean: drop stray snapshots + scratch from a prior run.
+    let _ = with_unafs(|fs| {
+        while let Ok(snaps) = fs.snapshot_index() {
+            match snaps.first() {
+                Some(s) => {
+                    let _ = fs.snapshot_drop(s.generation);
+                }
+                None => break,
+            }
+        }
+        let root = fs.superblock.root_inode;
+        let _ = fs.unlink(root, K8C_NAME);
+    });
+
+    // bit0: create the owned scratch (owner=alice, grants:bob) with OLD bytes,
+    // retain, then diverge the live file to NEW.
+    let (created_gen, live_id) = with_unafs(|fs| {
+        let root = fs.superblock.root_inode;
+        let id = match fs.create_file(root, String::from(K8C_NAME)) {
+            Ok(id) => id,
+            Err(_) => return (None, 0),
+        };
+        if fs.write_data(id, 0, K8C_OLD).is_err() {
+            return (None, 0);
+        }
+        if fs
+            .set_attribute(id, String::from("owner"), AttributeValue::String(String::from("alice")))
+            .is_err()
+        {
+            return (None, 0);
+        }
+        if fs
+            .set_attribute(id, String::from("grants:bob"), AttributeValue::String(String::from("r")))
+            .is_err()
+        {
+            return (None, 0);
+        }
+        // carol: WRITE-ONLY grant — the rights-aware negative (bit4).
+        if fs
+            .set_attribute(id, String::from("grants:carol"), AttributeValue::String(String::from("w")))
+            .is_err()
+        {
+            return (None, 0);
+        }
+        let g = match fs.snapshot_create(String::from("k8c-before"), String::from("alice"), bench_ticks()) {
+            Ok(g) => g,
+            Err(_) => return (None, 0),
+        };
+        if fs.write_data(id, 0, K8C_NEW).is_err() {
+            return (None, 0);
+        }
+        (Some(g), id)
+    })
+    .unwrap_or((None, 0));
+    let snap_gen = match created_gen {
+        Some(g) => g,
+        None => {
+            serial_println!(":: K8c-snapread: setup failed (create/own/retain) FAIL [w=0x00] ::");
+            return;
+        }
+    };
+    if with_unafs(|fs| {
+        fs.snapshot_index()
+            .map(|s| s.iter().any(|e| e.generation == snap_gen))
+            .unwrap_or(false)
+    })
+    .unwrap_or(false)
+    {
+        w |= 1 << 0;
+    }
+
+    // bit1: the OWNER reads the snapshot -> OLD bytes.
+    if matches!(
+        snapshot_read(snap_gen, K8C_PATH, "alice"),
+        Ok(SnapReadResult::Ok(ref b)) if b.as_slice() == K8C_OLD
+    ) {
+        w |= 1 << 1;
+    }
+
+    // bit2: the GRANTEE reads the snapshot -> OLD bytes.
+    if matches!(
+        snapshot_read(snap_gen, K8C_PATH, "bob"),
+        Ok(SnapReadResult::Ok(ref b)) if b.as_slice() == K8C_OLD
+    ) {
+        w |= 1 << 2;
+    }
+
+    // bit3: an IMPOSTOR is refused from the snapshot AND refused the LIVE object
+    // by the same predicate (refused live <=> refused snapshot).
+    let refused_snapshot = matches!(
+        snapshot_read(snap_gen, K8C_PATH, "mallory"),
+        Ok(SnapReadResult::Refused(ReadAuthz::DenyAcl))
+    );
+    let refused_live = with_unafs(|fs| read_authz(fs, live_id, "mallory") == ReadAuthz::DenyAcl)
+        .unwrap_or(false);
+    if refused_snapshot && refused_live {
+        w |= 1 << 3;
+    }
+
+    // bit4: RIGHTS-AWARE (lens A fix) — the WRITE-ONLY grantee (carol, `w`)
+    // holds a grant row but NOT the READ right: refused from the snapshot AND
+    // refused live, by the same evaluator (CAP_READ semantics, not key-presence).
+    let carol_refused_snapshot = matches!(
+        snapshot_read(snap_gen, K8C_PATH, "carol"),
+        Ok(SnapReadResult::Refused(ReadAuthz::DenyAcl))
+    );
+    let carol_refused_live = with_unafs(|fs| read_authz(fs, live_id, "carol") == ReadAuthz::DenyAcl)
+        .unwrap_or(false);
+    if carol_refused_snapshot && carol_refused_live {
+        w |= 1 << 4;
+    }
+
+    // bit5: REVOCATION reaches the past — drop bob's live grant; bob, who read
+    // the snapshot at bit2, is now refused from the very same snapshot.
+    let revoked = with_unafs(|fs| fs.remove_attribute(live_id, "grants:bob").is_ok())
+        .unwrap_or(false);
+    if revoked
+        && matches!(
+            snapshot_read(snap_gen, K8C_PATH, "bob"),
+            Ok(SnapReadResult::Refused(ReadAuthz::DenyAcl))
+        )
+    {
+        w |= 1 << 5;
+    }
+
+    // bit6: DELETED-OBJECT EDGE — unlink the live object; even the OWNER is
+    // refused (no live ACL row -> DenyNoLiveObject, fail closed, traced).
+    let deleted = with_unafs(|fs| {
+        let root = fs.superblock.root_inode;
+        fs.unlink(root, K8C_NAME).is_ok()
+    })
+    .unwrap_or(false);
+    let owner_refused_after_delete = matches!(
+        snapshot_read(snap_gen, K8C_PATH, "alice"),
+        Ok(SnapReadResult::Refused(ReadAuthz::DenyNoLiveObject))
+    );
+    if deleted && owner_refused_after_delete {
+        w |= 1 << 6;
+    } else if deleted {
+        // Trace the edge honestly whether or not it scored.
+        serial_println!(":: K8c-snapread: deleted-object edge did not fail closed as expected ::");
+    }
+
+    // bit7: self-clean — drop the snapshot + remount; no leak, fsck clean.
+    let _ = with_unafs(|fs| fs.snapshot_drop(snap_gen));
+    force_remount();
+    let cleaned = with_unafs(|fs| {
+        fs.resolve_path(K8C_PATH).is_err()
+            && fs.snapshot_index().map(|s| s.is_empty()).unwrap_or(false)
+            && fs.fsck(false).map(|r| r.is_clean()).unwrap_or(false)
+    })
+    .unwrap_or(false);
+    if cleaned {
+        w |= 1 << 7;
+    }
+
+    let ticks = bench_ticks().wrapping_sub(t0);
+    let verdict = if w == 0xff { "PASS" } else { "FAIL" };
+    serial_println!(
+        ":: K8c-snapread: current-ACL snapshot reads (owner+grantee read OLD, impostor refused live<->snap, write-only grant refused, revocation reaches the past, deleted-object fails closed) + self-clean {} [w={:#04x}] ticks={} ::",
+        verdict,
+        w,
         ticks
     );
 }

@@ -2019,6 +2019,8 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             #[cfg(target_arch = "aarch64")]
             console.println("          utouch <path>, uwrite <path> <text>, umkdir <path>, urm <path>  (write-through)");
             console.println("          usnaps, usnap <name>, usnapdrop <gen>  (retained roots / snapshots)");
+            #[cfg(target_arch = "aarch64")]
+            console.println("          usnapls <gen> [path], usnapcat <gen> <path>  (read a snapshot; current-ACL enforced)");
             console.println("CLOCK:    date, setdate YYYY-MM-DD HH:MM[:SS]  (seeds mtime stamps; unset = honest dashes)");
             console.println("SMP:      sched (per-CPU run queues), pulse (full-screen CPU monitor)");
             console.println("TEST:     tste (in-OS self-test suite: boot-replay + live checks)");
@@ -2377,6 +2379,33 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             match args.first().copied().and_then(|s| s.parse::<u64>().ok()) {
                 None => console.println("usage: usnapdrop <generation>"),
                 Some(generation) => console.println(&unafs_verb_snapdrop(generation)),
+            }
+        },
+        #[cfg(target_arch = "aarch64")]
+        "usnapls" => {
+            // K8c: list a retained snapshot's directory AS OF the snapshot (`usnapls <gen> [path]`).
+            match args.first().copied().and_then(|s| s.parse::<u64>().ok()) {
+                None => console.println("usage: usnapls <generation> [path]"),
+                Some(generation) => {
+                    let path = args.get(1).copied().unwrap_or("/");
+                    for line in &unafs_verb_snapls(generation, path) {
+                        console.println(line);
+                    }
+                }
+            }
+        },
+        #[cfg(target_arch = "aarch64")]
+        "usnapcat" => {
+            // K8c: read a file from a retained snapshot under the LIVE object's CURRENT ACL
+            // (`usnapcat <gen> <path>`). The shell is a kernel-authority surface, so it reads any
+            // LIVE object — but a file DELETED from the live tree fails closed (no current ACL row),
+            // the deleted-object edge of the high-security ruling.
+            match args.first().copied().and_then(|s| s.parse::<u64>().ok()) {
+                None => console.println("usage: usnapcat <generation> <path>"),
+                Some(generation) => match args.get(1).copied() {
+                    None => console.println("usage: usnapcat <generation> <path>"),
+                    Some(path) => console.println(&unafs_verb_snapcat(generation, path)),
+                },
             }
         },
         "touch" => {
@@ -2954,5 +2983,106 @@ fn unafs_verb_snapdrop(generation: u64) -> String {
         Ok(Ok(())) => alloc::format!("usnapdrop: dropped generation {} (blocks reclaimed)", generation),
         Ok(Err(msg)) => alloc::format!("usnapdrop: generation {}: {}", generation, msg),
         Err(e) => alloc::format!("usnapdrop: no unafs volume ({:?})", e),
+    }
+}
+
+/// `usnapls <gen> [path]`: list a retained snapshot's directory AS OF the
+/// snapshot (K8c) — a read-only [`SnapshotView`] listing; never perturbs the
+/// live tree, refcounts, or the reclaim queue. Gated by the SAME current-ACL
+/// evaluator as `usnapcat` ([`read_authz`] on the target directory's live id) —
+/// no snapshot-read surface bypasses it: a directory deleted from the live tree
+/// fails closed, symmetrically with the file read (lens A fold).
+#[cfg(target_arch = "aarch64")]
+fn unafs_verb_snapls(generation: u64, path: &str) -> alloc::vec::Vec<String> {
+    use crate::fs::unafs::{read_authz, ReadAuthz, KERNEL_PRINCIPAL};
+    let out = crate::fs::unafs::with_unafs(|fs| {
+        // Resolve the directory's logical id in the snapshot (scoped: the view
+        // borrows fs; release it so the ACL check can re-borrow).
+        let dir_id = {
+            let mut view = match fs.open_snapshot(generation) {
+                Ok(v) => v,
+                Err(::unafs::fs::FileSystemError::SnapshotNotFound(_)) => {
+                    return alloc::vec![alloc::format!("usnapls: no such snapshot generation {}", generation)];
+                }
+                Err(e) => return alloc::vec![alloc::format!("usnapls: {:?}", e)],
+            };
+            match view.resolve_path(path) {
+                Ok(id) => id,
+                Err(_) => return alloc::vec![alloc::format!("usnapls: {}: not in snapshot", path)],
+            }
+        };
+        // CURRENT-ACL on the live directory — the same evaluator as usnapcat.
+        match read_authz(fs, dir_id, KERNEL_PRINCIPAL) {
+            ReadAuthz::Permit => {}
+            ReadAuthz::DenyNoLiveObject => {
+                return alloc::vec![alloc::format!(
+                    "usnapls: {}: refused — directory deleted from live tree (no current ACL; fail-closed)",
+                    path
+                )];
+            }
+            ReadAuthz::DenyAcl => {
+                return alloc::vec![alloc::format!(
+                    "usnapls: {}: refused — current ACL denies this principal",
+                    path
+                )];
+            }
+        }
+        let mut view = match fs.open_snapshot(generation) {
+            Ok(v) => v,
+            Err(e) => return alloc::vec![alloc::format!("usnapls: {:?}", e)],
+        };
+        match view.ls(dir_id) {
+            Ok(entries) => {
+                let mut lines = alloc::vec![alloc::format!("snapshot gen {} : {}", generation, path)];
+                for e in &entries {
+                    lines.push(alloc::format!("  {:<24}  id {:>5}  {:?}", e.name, e.inode_id, e.kind));
+                }
+                if entries.is_empty() {
+                    lines.push(String::from("  (empty)"));
+                }
+                lines
+            }
+            Err(e) => alloc::vec![alloc::format!("usnapls: {:?}", e)],
+        }
+    });
+    match out {
+        Ok(lines) => lines,
+        Err(e) => alloc::vec![alloc::format!("usnapls: no unafs volume ({:?})", e)],
+    }
+}
+
+/// `usnapcat <gen> <path>`: read a file from a retained snapshot under the LIVE
+/// object's CURRENT ACL (K8c high-security ruling). The shell runs at kernel
+/// authority, so it reads any LIVE object — but a file DELETED from the live
+/// tree fails closed (no current ACL row), and that refusal is reported plainly.
+#[cfg(target_arch = "aarch64")]
+fn unafs_verb_snapcat(generation: u64, path: &str) -> String {
+    use crate::fs::unafs::{ReadAuthz, SnapReadResult, KERNEL_PRINCIPAL};
+    match crate::fs::unafs::snapshot_read(generation, path, KERNEL_PRINCIPAL) {
+        Ok(SnapReadResult::Ok(bytes)) => {
+            // Print the retained bytes as UTF-8 where possible, else a byte count.
+            match core::str::from_utf8(&bytes) {
+                Ok(s) => alloc::format!("usnapcat: gen {} {} ({} bytes)\n{}", generation, path, bytes.len(), s),
+                Err(_) => alloc::format!("usnapcat: gen {} {} ({} bytes, binary)", generation, path, bytes.len()),
+            }
+        }
+        Ok(SnapReadResult::NotInSnapshot) => {
+            alloc::format!("usnapcat: {}: not in snapshot gen {}", path, generation)
+        }
+        Ok(SnapReadResult::SnapshotMissing) => {
+            alloc::format!("usnapcat: no such snapshot generation {}", generation)
+        }
+        Ok(SnapReadResult::Refused(ReadAuthz::DenyNoLiveObject)) => alloc::format!(
+            "usnapcat: {}: refused — object deleted from live tree (no current ACL; fail-closed)",
+            path
+        ),
+        Ok(SnapReadResult::Refused(ReadAuthz::DenyAcl)) => {
+            alloc::format!("usnapcat: {}: refused — current ACL denies this principal", path)
+        }
+        Ok(SnapReadResult::Refused(ReadAuthz::Permit)) => {
+            // Unreachable (Permit is not a refusal) — reported rather than panicked.
+            alloc::format!("usnapcat: {}: internal: permit reported as refusal", path)
+        }
+        Err(e) => alloc::format!("usnapcat: no unafs volume ({:?})", e),
     }
 }

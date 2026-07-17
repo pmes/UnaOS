@@ -3165,7 +3165,7 @@ static HANDLES: [[AtomicU64; NHANDLE]; super::boot::USER_SLOTS + 1] =
 /// `CAP_WRITE` gates `sys_write`; `CAP_GRANT` gates minting attenuated copies; `CAP_READ`/`CAP_EXEC`/
 /// `CAP_REVOKE` round out the model (CAP_REVOKE is reserved for cross-process revocation — U6; U5 revoke is
 /// ownership-based). The values are stable across arches (documented in the permission-model doc).
-const CAP_READ: u32 = 1 << 0; // 0x01
+const CAP_READ: u32 = 1 << 0; // 0x01 (== fs::unafs::RIGHT_READ, const-asserted at rights_from_native)
 const CAP_WRITE: u32 = 1 << 1; // 0x02
 const CAP_EXEC: u32 = 1 << 2; // 0x04
 const CAP_GRANT: u32 = 1 << 3; // 0x08
@@ -8567,6 +8567,13 @@ pub fn u7_launcher(demo_cpu: usize) {
     // fully self-cleaning (its scratch file + snapshots are dropped inside the witness). Its own
     // uncounted `:: K8b-snap: … PASS ::` line; honest skip on media without a unafs partition.
     crate::fs::unafs::k8b_snap_selftest();
+    // K8c: prove the snapshot READ path enforces the LIVE object's CURRENT ACL (the "high security"
+    // ruling — revocation reaches the past). Owner + grantee read the OLD retained bytes; an impostor
+    // is refused from the snapshot by the SAME predicate that refuses the live read; dropping a grant
+    // retroactively refuses the snapshot; and a live-deleted object fails closed (no current ACL row)
+    // even for its owner. Runs AFTER k8b_snap_selftest, fully self-cleaning. Its own uncounted
+    // `:: K8c-snapread: … PASS ::` line; honest skip on media without a unafs partition.
+    crate::fs::unafs::k8c_snapread_selftest();
     // K6: prove the U6 owner/grants ACL round-trips through the native unafs attribute volume (the
     // sidecar's successor) — forward+reverse codec, write+read+clear via the coherent mount. Runs
     // LAST, fully self-cleaning (leaves only the staged K3 fixtures). Its own uncounted
@@ -9087,14 +9094,14 @@ fn principal_from_native(s: &[u8]) -> Option<PrincipalRecord> {
 }
 
 /// K6: reverse of [`rights_native_value`]. `rw`->R|W, `r`->R, `w`->W; `-`/anything else -> 0 (no
-/// rights = not a live grant). Never panics.
+/// rights = not a live grant). Never panics. K8c fold: DELEGATES to the ONE canonical decoder in
+/// `fs/unafs.rs` (which the snapshot-read `read_authz` also uses — the same function, so the
+/// verb-layer authz and the syscall-layer grant machinery can never drift), with the bit equality
+/// pinned by const asserts.
+const _: () = assert!(crate::fs::unafs::RIGHT_READ == CAP_READ);
+const _: () = assert!(crate::fs::unafs::RIGHT_WRITE == CAP_WRITE);
 fn rights_from_native(s: &[u8]) -> u32 {
-    match s {
-        b"rw" => CAP_READ | CAP_WRITE,
-        b"r" => CAP_READ,
-        b"w" => CAP_WRITE,
-        _ => 0,
-    }
+    crate::fs::unafs::rights_from_native(s)
 }
 
 /// K6: reverse of [`grant_native_key`]. Strip the `grants:` prefix, then reverse the grantee principal.
