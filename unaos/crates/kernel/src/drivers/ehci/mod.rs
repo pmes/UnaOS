@@ -116,6 +116,9 @@ pub struct Controller {
     bus: u8,
     dev: u8,
     func: u8,
+    /// Dummy async head (H=1, permanently inactive) + the work QH transfers run on.
+    async_head: *mut Qh,
+    head_phys: u64,
     async_qh: *mut Qh,
     qh_phys: u64,
     /// The three reusable control-transfer qTDs (SETUP/DATA/STATUS) + their buffers. One
@@ -188,14 +191,24 @@ impl Controller {
         }
         let _ = mmio_write32(self.op + OP_PERIODICLISTBASE, self.frame_list_phys as u32);
 
+        // Linux-shaped async ring: inactive dummy HEAD (H=1) -> work QH -> head. The head
+        // carries the reclamation bit and NEVER a transfer (probe-7 metal finding: an active
+        // self-linked H-QH master-aborts Panther Point's async engine; QEMU tolerated it).
+        let head = self.async_head;
+        (*head).horiz = (self.qh_phys as u32) | PTR_TYPE_QH;
+        (*head).ep_chars = QH_HEAD | QH_DTC | QH_EPS_HIGH | (64 << QH_MPS_SHIFT);
+        (*head).ep_caps = QH_MULT1;
+        (*head).overlay[0] = PTR_TERMINATE;
+        (*head).overlay[1] = PTR_TERMINATE;
+        (*head).overlay[2] = QTD_HALTED; // permanently idle (Linux marks its dummy head halted)
         let qh = self.async_qh;
-        (*qh).horiz = (self.qh_phys as u32) | PTR_TYPE_QH; // single-QH circular async list
-        (*qh).ep_chars = QH_HEAD | QH_DTC | QH_EPS_HIGH | (64 << QH_MPS_SHIFT); // rewritten per target
+        (*qh).horiz = (self.head_phys as u32) | PTR_TYPE_QH;
+        (*qh).ep_chars = QH_DTC | QH_EPS_HIGH | (64 << QH_MPS_SHIFT); // rewritten per target
         (*qh).ep_caps = QH_MULT1;
         (*qh).overlay[0] = PTR_TERMINATE;
         (*qh).overlay[1] = PTR_TERMINATE;
         (*qh).overlay[2] = 0; // inactive token — controller skips until a transfer is primed
-        let _ = mmio_write32(self.op + OP_ASYNCLISTADDR, self.qh_phys as u32);
+        let _ = mmio_write32(self.op + OP_ASYNCLISTADDR, self.head_phys as u32);
 
         // ASE is NOT set here. Real Intel EHCI parks async traversal on an empty schedule
         // (EHCI 4.8.3 empty-schedule detection: one H-bit QH with an inactive overlay) and
@@ -206,11 +219,10 @@ impl Controller {
         // Evidence line: virt AND page-table-resolved phys of the QH the controller will
         // fetch (probe-5: static-pool DMA, low physical), + CTRLDSSEGMENT read-back.
         serial_println!(
-            ":: EHCI-HID: [{}] schedules armed (static pool): framelist virt={:#x} phys={:#x} asyncQH virt={:#x} phys={:#x} CTRLDSSEGMENT={:#x} (ASE per-transfer, PSE deferred) ::",
+            ":: EHCI-HID: [{}] schedules armed (static pool): framelist phys={:#x} async head={:#x} work QH={:#x} CTRLDSSEGMENT={:#x} (dummy-head ring, ASE per-transfer, PSE deferred) ::",
             self.idx,
-            self.frame_list as u64,
             self.frame_list_phys,
-            qh as u64,
+            self.head_phys,
             self.qh_phys,
             mmio_read32(self.op + OP_CTRLDSSEGMENT).unwrap_or(u32::MAX)
         );
@@ -287,10 +299,11 @@ impl Controller {
         // what makes the controller drive the SSPLIT/CSPLIT control dance through the TT named
         // by hub_addr/hub_port on Topology A; both fields stay 0 on Topology B.
         let qh = self.async_qh;
+        // Work QH only — never the H-bit head. RL=4 (NAK reload) matches Linux's async QHs.
         let mut chars = (t.addr as u32)
             | t.eps
             | QH_DTC
-            | QH_HEAD
+            | (4 << 28)
             | ((t.mps0 as u32) << QH_MPS_SHIFT);
         if t.eps != QH_EPS_HIGH {
             chars |= QH_CTL_EP;
@@ -1037,6 +1050,7 @@ pub fn init() {
                     let pool = &mut DMA_POOLS[idx];
                     let (
                         Some(fl_phys),
+                        Some(head_phys),
                         Some(qh_phys),
                         Some(su_phys),
                         Some(da_phys),
@@ -1045,6 +1059,7 @@ pub fn init() {
                         Some(db_phys),
                     ) = (
                         phys_of(pool.frame_list.as_ptr(), 4096),
+                        phys_of(&pool.qh_head, 32),
                         phys_of(&pool.qh_ctrl, 32),
                         phys_of(&pool.qtd_setup, 32),
                         phys_of(&pool.qtd_data, 32),
@@ -1065,6 +1080,8 @@ pub fn init() {
                         bus,
                         dev,
                         func,
+                        async_head: &mut pool.qh_head as *mut Qh,
+                        head_phys,
                         async_qh: &mut pool.qh_ctrl as *mut Qh,
                         qh_phys,
                         qtd_setup: &mut pool.qtd_setup as *mut Qtd,

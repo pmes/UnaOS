@@ -109,6 +109,12 @@ pub struct IntSlot {
 #[repr(C, align(4096))]
 pub struct DmaPool {
     pub frame_list: [u32; 1024], // 4 KiB, 4 KiB-aligned (leads the struct)
+    /// The async reclamation-list HEAD (H=1): a permanently-INACTIVE dummy, exactly as Linux/
+    /// EDK2 shape it. Probe-7 metal finding: executing transfers ON the self-linked H-QH
+    /// (spec-legal, QEMU-tolerated) master-aborts Panther Point's async engine — the H-QH is
+    /// load-bearing for its empty-list reclamation logic and must stay idle.
+    pub qh_head: Qh,
+    /// The work QH the EP0 transfers actually run on, linked behind the head.
     pub qh_ctrl: Qh,
     pub qtd_setup: Qtd,
     pub qtd_data: Qtd,
