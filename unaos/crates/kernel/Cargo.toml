@@ -196,6 +196,15 @@ xcarve_relink = ["tegra"]
 # kernel8`. See unaos/scripts/core3-probe-bench.md and docs .../arch_arm64.md §CORE3-SMP.
 core3probe = ["pi"]
 
+# PI-V3D-1: the VideoCore VI (V3D 4.2) GPU foundation (arch/aarch64/v3d.rs) — firmware power/clock,
+# MMIO probe, the V3D-private MMU, and a minimal GPU buffer-clear, wired into the Pi bare-metal BSP
+# bring-up after emmc2::probe. Implies `baremetal` (which implies `pi`) — the whole chain is Pi-4
+# specific. With this feature OFF (default) the module + its call site vanish and the kernel8 image
+# is byte-identical to baseline (build twice, compare hashes). QEMU raspi4b does not model V3D: the
+# probe detects absence and degrades gracefully. Enable via `UNAOS_V3D=1 UNAOS_PI=1 ./arroyo
+# kernel8`. See arch_arm64.md §PI-V3D and scripts/pi-v3d-bench.md.
+v3d = ["baremetal"]
+
 # NS-SPAN (K7 WATCH rider): instrument the IRQ-masked namespace-lock hold at the three fused K6/K3/K5
 # persist sites (`sys_fgrant_revoke_2phase`, `native_persist_grants`, `native_persist_grow`) — read
 # CNTPCT at ns-take and ns-release, track the per-site WORST-CASE hold in ticks, and emit ONE serial line

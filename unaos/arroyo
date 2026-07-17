@@ -676,6 +676,14 @@ kernel8() {
         K8_FEATS="${K8_FEATS},nsspan"
         echo -e "${COLOR_YELLOW}  • UNAOS_NSSPAN: instrument the ns-lock hold at revoke/grants/grow, emit :: NS-SPAN: … ::${COLOR_RESET}"
     fi
+    # PI-V3D-1: UNAOS_V3D=1 adds the `v3d` feature — the VideoCore VI GPU foundation (power/clock/probe,
+    # V3D MMU, minimal buffer-clear) wired into the Pi bare-metal BSP bring-up. OFF => the module + call
+    # site vanish and kernel8 is byte-identical to baseline. QEMU raspi4b does not model V3D (probe
+    # degrades gracefully); positive verification is attended metal. See scripts/pi-v3d-bench.md.
+    if [ -n "${UNAOS_V3D:-}" ]; then
+        K8_FEATS="${K8_FEATS},v3d"
+        echo -e "${COLOR_YELLOW}  • UNAOS_V3D: V3D GPU foundation bring-up (probe/MMU/clear; attended-metal for positive verify)${COLOR_RESET}"
+    fi
     echo -e "${COLOR_YELLOW}⚡ Building bare-metal kernel8.img (Pi 4, microSD-slot boot)...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/kernel"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/kernel/pi-baremetal.ld" \

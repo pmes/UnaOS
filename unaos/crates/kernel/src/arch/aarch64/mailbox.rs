@@ -58,7 +58,21 @@ const TAG_SET_PIXEL_ORDER: u32 = 0x0004_8006;
 const TAG_ALLOCATE_FB: u32 = 0x0004_0001;
 const TAG_GET_PITCH: u32 = 0x0004_0008;
 const TAG_GET_CLOCK_RATE: u32 = 0x0003_0002; // M6g: query a clock's current rate (value buffer {id, rate})
+// PI-V3D-1: firmware property tags for powering + clocking the VideoCore VI (V3D) block. These are
+// the Pi-4/VC6 path (the legacy VC4 `Enable_QPU`/set-power tags are NOT used here). See
+// arch_arm64.md §PI-V3D and the scout research of record. `v3d`-gated so a knob-off kernel8 is
+// byte-identical to baseline (these are additive, not called on any default path).
+#[cfg(feature = "v3d")]
+const TAG_SET_DOMAIN_STATE: u32 = 0x0003_8030; // set a power-domain's on/off state (value {domain, state})
+#[cfg(feature = "v3d")]
+const TAG_SET_CLOCK_RATE: u32 = 0x0003_8002; // set a clock's rate (value {clock_id, rate_hz, skip_turbo})
 const TAG_END: u32 = 0x0000_0000;
+
+// PI-V3D-1 identifiers for the two calls above (RPi firmware mailbox interface).
+#[cfg(feature = "v3d")]
+pub const POWER_DOMAIN_V3D: u32 = 10; // firmware power-domain index for the V3D block
+#[cfg(feature = "v3d")]
+pub const CLOCK_ID_V3D: u32 = 5; // firmware clock id for V3D
 
 const PIXEL_ORDER_BGR: u32 = 0; // firmware: 0 = BGR, 1 = RGB. We request BGR to match the rest of
                                 // the stack's default (and the GOP path's observed Bgr); put_pixel
@@ -238,6 +252,50 @@ pub fn get_clock_rate(clock_id: u32) -> Option<u32> {
     if rate == 0 { None } else { Some(rate) }
 }
 
+/// PI-V3D-1: turn a firmware power domain on (`state = 1`) or off (`0`). Returns the state the
+/// firmware reports back (it echoes the achieved state in the reply's `state` word), or `None` on a
+/// mailbox failure. Used to power the V3D block (`POWER_DOMAIN_V3D`) before touching its registers —
+/// with the domain off, V3D MMIO reads garbage. Single-user `MBOX` like the other calls: the V3D
+/// bring-up runs single-threaded on the BSP after the boot framebuffer call is long done.
+#[cfg(feature = "v3d")]
+pub fn set_power_domain(domain: u32, state: u32) -> Option<u32> {
+    request(0, 8 * 4); // total size (8 words used)
+    request(1, 0); // request
+    request(2, TAG_SET_DOMAIN_STATE);
+    request(3, 8); // value buffer size (2 words: domain, state)
+    request(4, 0); // request code
+    request(5, domain);
+    request(6, state); // reply preserves/echoes the achieved state
+    request(7, TAG_END);
+    if !mbox_call(8) {
+        return None;
+    }
+    Some(reply(6))
+}
+
+/// PI-V3D-1: set a firmware-managed clock's rate in Hz. Returns the rate the firmware actually
+/// programmed (it may clamp to the clock's min/max), or `None` on a mailbox failure. Trap closed by
+/// the caller: a V3D domain that is powered but whose clock was never set reads garbage registers —
+/// always power THEN clock, in that order. `skip_turbo = 0` lets the firmware raise other clocks as
+/// needed.
+#[cfg(feature = "v3d")]
+pub fn set_clock_rate(clock_id: u32, rate_hz: u32) -> Option<u32> {
+    request(0, 9 * 4); // total size (9 words used)
+    request(1, 0); // request
+    request(2, TAG_SET_CLOCK_RATE);
+    request(3, 12); // value buffer size (3 words: clock_id, rate, skip_turbo)
+    request(4, 0); // request code
+    request(5, clock_id);
+    request(6, rate_hz); // reply: the rate actually set
+    request(7, 0); // skip_turbo = 0
+    request(8, TAG_END);
+    if !mbox_call(9) {
+        return None;
+    }
+    let set = reply(6);
+    if set == 0 { None } else { Some(set) }
+}
+
 /// Bring up the VideoCore framebuffer: pick a resolution (the firmware's current mode if sane,
 /// else 1920×1080), then set size/depth/pixel-order, allocate the buffer, and read back its base
 /// and pitch. Returns the ARM-physical framebuffer for BootInfo, or `None` on any failure (the
@@ -334,5 +392,25 @@ pub fn init_framebuffer() -> Option<FbAlloc> {
         ":: MAILBOX: framebuffer {}x{} pitch={}B stride={}px base={:#x} size={} ::",
         width, height, pitch, stride_px, base, fb_size
     );
+
+    // PI-V3D-1: with the framebuffer resolved, bring up the V3D (VideoCore VI) GPU — probe → MMU →
+    // clear job — and blit the CPU-verified clear into THIS framebuffer as a visible witness. This is
+    // the byte-identity-preserving call site: the trigger lives here (in the VideoCore mailbox driver,
+    // at the tail of the last function) rather than in `main.rs`, because inserting a gated block into
+    // the middle of `kernel_main` shifts the embedded panic-location line numbers of the aarch64 code
+    // below it (a positional artifact that breaks the knob-off byte-identity gate); a gated call at the
+    // end of this file shifts nothing. Single-threaded here (boot, pre-SMP, mailbox idle); the probe
+    // degrades gracefully when V3D is absent (QEMU). `v3d`-gated: knob-off this call + the whole v3d
+    // module vanish and `kernel8` is byte-identical to baseline. See arch_arm64.md §PI-V3D.
+    #[cfg(feature = "v3d")]
+    super::v3d::bringup(Some(super::v3d::FbTarget {
+        base,
+        size: fb_size as usize,
+        width: info.width,
+        height: info.height,
+        stride_px: info.stride,
+        bytes_per_pixel: info.bytes_per_pixel,
+    }));
+
     Some(FbAlloc { base, size: fb_size as usize, info })
 }
