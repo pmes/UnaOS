@@ -608,8 +608,11 @@ sending to `own-ip:5353` from a second socket got nothing back). So the proof is
   → under the injector: `:: zeolite: served an inbound query on :53 — blocked name sinkholed to 0.0.0.0 over the wire — witness OK ::`.
 
 Reproduce (hermetic, forward OK + serve PENDING): `./arroyo test 90`. Full composition
-(blocklist from FAT): `UNAOS_IRQSTORAGE=1 UNAOS_FATIMG=sf ./arroyo test 200`. Over-the-wire
-sinkhole: launch `UNAOS_NET=socket UNAOS_TEST_SECS=150 ./arroyo test 155` and concurrently
+(blocklist from FAT): rebuild a **fresh** superfloppy first (`bash scripts/make-fat-img.sh sf`, or use
+`./arroyo test-fat sf` which rebuilds it), then `UNAOS_IRQSTORAGE=1 UNAOS_FATIMG=sf ./arroyo test 200`
+— `./arroyo test` reuses `builder/fat-sf.img` as-is, and a STALE one whose GROW.BIN was already grown
+by a prior run trips U10/S4 with `grew_ok=false` (the stateful-fixture trap, not a regression).
+Over-the-wire sinkhole: launch `UNAOS_NET=socket UNAOS_TEST_SECS=150 ./arroyo test 155` and concurrently
 `python3 scripts/net-inject.py 127.0.0.1:5555 dns`.
 
 ### Hostile-payload parse hygiene

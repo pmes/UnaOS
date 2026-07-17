@@ -250,9 +250,13 @@ build_user_hello_x86() {
 build_kernel_aarch64() {
     echo -e "${COLOR_YELLOW}⚡ Building aarch64 Kernel...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/kernel"
+    local _af; _af="$(arm_features)"
+    # Surface the effective aarch64 feature set when it differs from the (x86) banner — makes the
+    # SMOLNET-DEFAULT strip visible so an operator doesn't read `smolnet` off the banner for aarch64.
+    [ "$_af" != "$KERNEL_FEATURES" ] && echo -e "${COLOR_YELLOW}⚡ aarch64 effective features: ${_af#--features }${COLOR_RESET}"
     cargo +nightly build --release \
       --target ../../aarch64-unaos.json \
-      $NIGHTLY_FLAGS $(arm_features)
+      $NIGHTLY_FLAGS $_af
     cd "$WORKSPACE_DIR"
     echo -e "${COLOR_GREEN}✅ aarch64 Kernel Built.${COLOR_RESET}"
 }
