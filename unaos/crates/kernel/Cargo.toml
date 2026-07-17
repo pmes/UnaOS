@@ -227,12 +227,13 @@ nsspan = []
 # byte-identical. See unaos/docs/dev/OS/09_PLATFORM/smc_battery.md.
 smc = []
 
-# RAST-1: the `rast` software-rasterizer demo (UNAOS_RAST=1). Pulls in the platform-neutral `rast`
-# crate and links the x86/virt-only knob-gated spinning-cube demo (rast_demo.rs), presented through
-# the existing panel `Screen` path (call-never-edit). The module + dep are additionally
-# target_arch="x86_64"-gated, so aarch64 media are byte-identical whether or not the feature is
-# pushed; x86 knob-off is byte-identical too (the dep is unlinked). See
-# docs/dev/OS/08_VIDEO/rasterizer.md.
+# RAST-1 / RAST-TEGRA: the `rast` software-rasterizer demo (UNAOS_RAST=1). Pulls in the
+# platform-neutral `rast` crate and links the knob-gated spinning-cube demo (rast_demo.rs), presented
+# through the existing panel `Screen` path (call-never-edit). The `rast` crate is no_std and arch-
+# neutral, so both the dep and the module are `rast`-feature-gated but NOT arch-gated: x86/virt
+# (RAST-1), aarch64/virt (QEMU panel witness), and aarch64/tegra (RAST-TEGRA, the Orin panel) share
+# one code path. Knob-off builds unlink the dep + module, so media stay byte-identical on BOTH arches.
+# See docs/dev/OS/08_VIDEO/rasterizer.md.
 rast = ["dep:rast"]
 
 [dependencies]
@@ -248,6 +249,10 @@ cfg-if = "1.0.0"
 unaos-boot-info = { path = "../boot-info" }
 net = { path = "../net" }
 fdt = "0.1.5"
+# RAST-1 / RAST-TEGRA: platform-neutral (no_std, arch-agnostic) software rasterizer. `optional` so
+# knob-off builds on BOTH arches never compile it (byte-identical). Lives in the shared [dependencies]
+# (not an arch-gated block) because the demo now targets x86/virt AND aarch64/virt AND aarch64/tegra.
+rast = { path = "../rast", optional = true }
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]
 # BeFS-K3: the native UnaFS filesystem, no_std core only (on-disk types, codec,
@@ -258,9 +263,6 @@ fdt = "0.1.5"
 unafs = { path = "../../libs/fs/unafs", default-features = false }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
-# RAST-1: platform-neutral software rasterizer, x86/virt demo only + optional so aarch64 and
-# knob-off x86 builds never compile it (byte-identical).
-rast = { path = "../rast", optional = true }
 x86_64 = "0.15.4"
 uart_16550 = "0.6.0"
 # SOCK-1: mature TCP/IP stack (0BSD, #![no_std], heap-optional). x86-only + optional so aarch64 and

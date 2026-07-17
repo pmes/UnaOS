@@ -104,27 +104,54 @@ Coverage (`unaos/crates/rast/tests/golden.rs`):
 
 That pinned digest is exactly the artifact future V3D output is diffed against.
 
-## 4. The x86/virt demo (`UNAOS_RAST=1`)
+## 4. The demo (`UNAOS_RAST=1`)
 
 A knob-gated demo (`rast` Cargo feature → `unaos/crates/kernel/src/rast_demo.rs`)
 renders a spinning, flat-shaded, z-buffered cube through the panel `Screen`. It is
 **call-never-edit** with respect to the shared video path: it renders into its own
 heap-owned RGBA8 back buffer (the double buffer), then presents each frame through
 the public `Screen::put_pixel` / `Screen::flush` API — it touches no shared surface
-code. The demo renders at a fixed 320×240 and blits centered on the panel (a full
-1280×800 per-pixel present is far too slow to witness), runs a bounded 90 frames,
-then hands the panel back to the shell, emitting one honest fps line:
+code. The demo renders at a fixed 320×240 and blits centered on the panel (a full-
+panel per-pixel present is far too slow to witness), runs a bounded 90 frames, then
+hands the panel back to the shell, emitting one honest fps line:
 
 ```
 :: RAST: software rasterizer demo — 320x240 spinning cube centered on 1280x800 panel, 90 frames ::
 :: RAST: 90 frames in 4115 ms — 21.871 fps (software rasterizer, panel present) ::
 ```
 
+`rast_demo::run()` is arch-neutral (it drives only `Screen` + `crate::arch::ms()`),
+so the same code serves three panels; the wire-in differs per platform:
+
+- **x86/virt** (RAST-1) and **aarch64/virt** (RAST-TEGRA): the shared GUI setup in
+  `kernel_main` runs the demo just before handing the panel to the shell. The GICv2
+  `virt` boot reaches that path with a `ramfb` framebuffer, so a headless QEMU run
+  witnesses the demo — `UNAOS_RAST=1 ./arroyo test-arm` prints the two `RAST:` lines
+  on aarch64 (a smaller ramfb panel, e.g. 800×600, and a much higher fps).
+- **aarch64/tegra — the Jetson Orin Nano panel** (RAST-TEGRA): wired at the tail of
+  `tegra_early_stop` (`tegra_rast_demo_maybe`), post-drop at EL1, right before
+  `run_capstone_boot_core`. It draws the cube through the **JD1-inherited scanout**
+  — no mode-set, no scanout reprogramming; it builds a `Screen` over `video::WRITER`
+  (seeded by JD1, mapped into both translation tables so it is reachable at EL1) and
+  presents through the same public API. `crate::arch::ms()` reads `CNTVCT` on the
+  timerless post-drop core (the VUGFIX tegra fallback), so the fps line still ticks.
+  This is the **first 3D pixels drawn on Orin silicon**. QEMU never builds `tegra`,
+  so the on-panel cube is verified on the attended Orin bench; the aarch64/virt path
+  above is the honest QEMU proof of the same arch-neutral render.
+
+  **Byte-identity wire-in note.** The tegra call is made on the *same source line* as
+  the `run_capstone_boot_core` terminus, and the runner itself lives at the file tail
+  (with an `#[inline(always)]` empty knob-off twin). This adds zero source lines ahead
+  of any panic `Location` literal — the panic-line byte-identity constraint
+  (PI-V3D-1 bisect-proven): a stray gated block mid-`kernel_main` shifts embedded line
+  numbers and perturbs `.rodata` even knob-off.
+
 With the feature off the whole module + the `rast` dependency are unlinked and the
-kernel image is byte-identical to baseline (RAST-1 verified `.text` / `.rodata` /
-`.data` / `.data.rel.ro` all byte-identical vs the pre-arc commit). The demo is
-x86/virt only for now; the Pi 4 / Orin wire-ins come after this arc and the
-concurrent V3D arc merge.
+kernel image is byte-identical to baseline on **both arches** — RAST-1 verified the
+x86 sections; RAST-TEGRA re-verified x86 (`.text 9cd6…`→unchanged) and the aarch64
+`tegra` kernel (`.text a2ce1599…`, `.rodata 5d1f7604…`, `.data 4f1fe11e…`,
+`.data.rel.ro e17e3b13…` all byte-identical vs the pre-arc base), 0 `rast` symbols
+knob-off.
 
 ## See also
 - `unaos/crates/rast/` — the crate.
