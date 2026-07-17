@@ -234,7 +234,8 @@ fn readme_text(git7: &str) -> String {
 Build: {git7}   Image: unaos-x86-{git7}.img\n\
 \n\
 This is a self-contained bootable disk image: a GPT disk with a FAT32 EFI System\n\
-Partition holding the UnaOS boot tree (EFI/BOOT/BOOTX64.EFI + kernel.elf). It needs a\n\
+Partition holding the UnaOS boot tree (EFI/BOOT/BOOTX64.EFI + kernel.elf, plus small\n\
+demo files hello.txt/HELLO.BIN). It needs a\n\
 UEFI/EFI virtual machine — enable EFI, attach this .img as the disk, and boot. No UnaOS\n\
 tooling is required on your machine.\n\
 \n\
@@ -263,7 +264,7 @@ VirtualBox / VMware:\n\
 What you should see: the UEFI firmware loads EFI/BOOT/BOOTX64.EFI, which loads the\n\
 kernel; UnaOS prints its boot log and drops to an interactive shell.\n\
 \n\
-Report results: https://github.com/ (UnaOS project) — include your VM (QEMU/UTM/\n\
+Report results back to whoever gave you this image — include your VM (QEMU/UTM/\n\
 VirtualBox/VMware), its version, and the last boot-log lines you saw.\n"
     )
 }
