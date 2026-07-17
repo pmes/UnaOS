@@ -10,6 +10,30 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-jetson track — 2026-07-17 (ORIN-SMP idle-heartbeat — parked-core pinned-bar fix) 🔬 QEMU-green, metal vug witness accruing `hw-jetson`
+
+### ORIN-SMP idle-heartbeat — a parked-online core reads idle, not pinned
+
+**What it does.** Closes the SMP-6-vug follow-up flag (*"parked cores' bars read
+PINNED"*). A secondary brought up on the GICv3 path (`smp_virt::__secondary_rust_virt`)
+comes online, publishes `CORE_READY`, then parks in a bare `loop { wfi }` — it never
+runs `sched::run()`/`dispatch_next`, so its VUG CPU-pulse counters `(CPU_BUSY, CPU_IDLE)`
+stay `(0,0)` and the pulse meter shows a pinned/undefined bar for a demonstrably-online-idle
+core. New `sched::note_core_idle(cpu)` (bounds-checked, lock-free-relaxed, same
+introspection-only contract as the other pulse counters) is called at park entry and on
+every WFI wake, so the core registers honest **0% busy** instead of pinned. Purely additive:
+no scheduling-path change. **Numbering:** the spawn labelled it "SMP-6", but SMP-6/7/8 are
+merged (SMP-8 closed bring-up); by sequence this is the SMP-9 telemetry-honesty step.
+
+**How it was tested.** `UNAOS_GICV3=1 ./arroyo test-arm` — the `virt` path runs the *same*
+park, so the BSP reads each secondary's counters back after `3/3 secondaries online` and emits
+`per-core idle heartbeat PASS — 3 online APs report idle (not pinned)` (each `busy=0, idle=2`);
+CAPSTONE 6/6 unchanged. `./arroyo test-arm` virt v2 MISSION; `./arroyo check` both arches ×
+{knob-off, TEGRA}; `./arroyo kernel8-test` 0-FAIL (shared-`sched.rs` regression gate);
+`esp-jetson` links, `tegra:` 109. **Metal:** the live Orin vug (parked APs' bars now idle, not
+pinned — the real 6-core path parks through the identical `__secondary_rust_virt`) accrues to the
+next attended Orin sitting. `smp_virt.rs` + `sched.rs` + `arch_arm64.md §ORIN-SMP idle-heartbeat`.
+
 ## hw-jetson track — 2026-07-17 (VMIMAGE-1 — `arroyo vm-image`: a shareable bootable disk image) 📦 host lane, full arc (M1–M3), zero kernel surface
 
 ### VMIMAGE-1 — `./arroyo vm-image` → one self-contained GPT+FAT32 `.img` 📦 pure-Rust packaging (fatfs + hand-written GPT; no host mkfs/hdiutil)
