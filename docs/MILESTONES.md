@@ -2268,6 +2268,40 @@ Spec promotions committed here; the granular arc detail is in each arc's own ent
   `copy_from_user` still deferred. **Metal-pending** (no wired NIC on any current board — QEMU slirp / the
   socket-netdev injector is the honest gate).
 
+### ZEOLITE-2 — real hosts-format ingest + subdomain matching + resolver metrics 🔬 `us-zeolite2`
+- **What:** the honest second slice — [ROADMAP §1b](ROADMAP.md) / `plans/unaos/future/unaos-dns-sinkhole.md`.
+  Makes the SINKHOLE-1 resolver's list handling real without a new syscall, a new ring-3 surface, or a
+  kernel-net change (all still `#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]`; aarch64 + knob-off
+  byte-identical). Three milestones, all inside the `zeolite-resolver` blob + its launcher.
+- **M1 — hosts-format blocklist ingest:** SINKHOLE-1's list was a toy format (one bare `UPPERCASE` name per
+  line). ZEOLITE-2 parses **real hosts-file format** — what Steven Black hosts / AdAway ship: `0.0.0.0 domain`
+  / `127.0.0.1 domain`, with `#`/`;` comments (whole-line + trailing) and blank lines. The `FILEBUF` walk in
+  `zdns_parse_and_match` skips the leading IP field to the DOMAIN (field-2 if present, else field-1 bare-name),
+  compares case-insensitively. **Hostile-input-hardened:** `BLOCK.TXT` is untrusted input like a packet, so
+  every byte access is bounds-checked against `file_len` — a truncated IP field, a no-domain line, a 2048-byte
+  line, an all-comment / CRLF-only file, or embedded control/NUL bytes can never read past the buffer or crash;
+  a malformed line matches nothing and is skipped (fail-safe under-block, never over-block or crash).
+- **M2 — label-boundary suffix (subdomain) matching:** a blocked base domain sinkholes its subdomains — listed
+  `ads.example` blocks `www.ads.example` but NOT `notads.example` (the byte before the tail match must be `.`).
+  Two inline self-tests witness both directions; bounds unchanged (`domainlen ≤ namelen` enforced first).
+- **M3 — resolver metrics:** the resolver counts queries seen / blocked / forwarded and prints
+  `:: zeolite: metrics — 4 queries seen, 2 blocked (sinkholed), 1 forwarded upstream ::` — the honest source a
+  future stats view reads. No new syscall: the counts saturate at 63 and pack into the spare high bits
+  (`[10:28]`) of the single witness/exit word, clear of the `bit0..9` decision flags.
+- **Evidence:** hermetic `UNAOS_SMOLNET=1 ./arroyo test 90` (builtin hosts-format list) + full composition
+  `UNAOS_SMOLNET=1 UNAOS_IRQSTORAGE=1 UNAOS_FATIMG=sf ./arroyo test 200` (hosts-format `BLOCK.TXT` from FAT via
+  S7) both →
+  `:: zeolite: hosts-format blocklist from BLOCK.TXT via S7 dynamic-open, blocked ADS.EXAMPLE -> 0.0.0.0 (answer built), subdomain WWW.ADS.EXAMPLE sinkholed + NOTADS.EXAMPLE not over-blocked, forwarded una.os -> 10.0.2.3:53 real answer relayed — witness OK ::`
+  + the metrics line, serve PENDING, STOR chain 0 FAIL. The over-the-wire serve leg is unchanged from
+  SINKHOLE-1 (injector-driven; PENDING hermetically).
+- **Gates:** knob-off `./arroyo test 40` / `test-arm 22` MISSION with NO zeolite line (byte-identical both
+  arches); `check` both arches on+off, no new warnings. **Lane:** `arch/x86_64/syscall.rs` (the blob + launcher)
+  + `scripts/make-fat-img.sh` (`BLOCK.TXT`) + docs (`08_NET/networking.md`, `SECURITY.md`, this); the packet
+  parser's bounds, the compression-pointer refusal, and the `0.0.0.0` builder are unchanged from SINKHOLE-1;
+  `smolnet.rs`/`crates/net`/`fat.rs`/`sched.rs`/`builder`/`Cargo.toml` untouched; **zero aarch64.**
+- **Residuals:** cache, query log, and multi-in-flight forwarding remain the appliance arcs (with aarch64/GENET
+  + the kit); `copy_from_user` still deferred. **Metal-pending** (QEMU slirp is the honest gate).
+
 ---
 
 ## net-sock1 track — 2026-07-14 (SOCK-5 scope B — DHCP via smoltcp: the persistent stack leases its own address)

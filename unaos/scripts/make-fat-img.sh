@@ -145,14 +145,24 @@ echo "    added GROW.BIN (512 bytes of 0xC1) for the U10 file-growth demo"
 head -c 64 /dev/zero | tr '\000' '\245' > "${MNT}/S8W.BIN"
 echo "    added S8W.BIN (64 bytes of 0xA5) for the STOR-1 S8 dynamic-write witness"
 
-# SINKHOLE-1 (zeolite): the DNS resolver's blocklist. One UPPERCASE name per line, ASCII, LF-terminated
-# (the fixture matches case-insensitively but the file is stored canonical-uppercase so the on-the-wire
-# match is a straight per-line compare). The zeolite resolver fixture opens this via the S7 dynamic-open
-# path (ring-3 SYS_OPEN RO + SYS_READ) — a genuine STOR-feeds-NET composition. ADS.EXAMPLE is the blocked
-# name the sinkhole witness answers with 0.0.0.0; TRACK.EXAMPLE is the required second entry. "una.os"
-# (the forward self-test name) is deliberately ABSENT so it is forwarded upstream, not sinkholed.
-printf 'ADS.EXAMPLE\nTRACK.EXAMPLE\n' > "${MNT}/BLOCK.TXT"
-echo "    added BLOCK.TXT (zeolite DNS sinkhole blocklist: ADS.EXAMPLE, TRACK.EXAMPLE)"
+# SINKHOLE-1/ZEOLITE-2 (zeolite): the DNS resolver's blocklist, in real hosts-file format — the format
+# actual sinkhole lists ship in (Steven Black hosts, AdAway, etc.): an IP redirect target (0.0.0.0 or
+# 127.0.0.1) followed by whitespace and the domain, with '#'/';' comments and blank lines tolerated. The
+# resolver's hardened hosts-format parser (ZEOLITE-2 M1) skips the leading IP field to the DOMAIN, ignores
+# comments/blank lines, matches case-insensitively, and does label-boundary SUFFIX matching (M2, so a
+# blocked base domain sinkholes its subdomains). The fixture opens this via the S7 dynamic-open path
+# (ring-3 SYS_OPEN RO + SYS_READ) — a genuine STOR-feeds-NET composition. ads.example is the blocked name
+# the sinkhole witness answers with 0.0.0.0; track.example is the required second entry. "una.os" (the
+# forward self-test name) is deliberately ABSENT so it is forwarded upstream, not sinkholed.
+cat > "${MNT}/BLOCK.TXT" <<'EOF'
+# zeolite DNS sinkhole blocklist (hosts format)
+0.0.0.0 ads.example
+0.0.0.0 track.example   # inline comment tolerated
+
+; semicolon comments and blank lines are skipped
+127.0.0.1 telemetry.example
+EOF
+echo "    added BLOCK.TXT (zeolite hosts-format blocklist: ads.example, track.example, telemetry.example)"
 
 # Strip macOS metadata (AppleDouble ._ files, Spotlight/fseventsd) so `ls` shows a clean tree.
 sync

@@ -10562,7 +10562,11 @@ fn sock4_launcher(demo_cpu: usize) {
 //   bit0 list loaded · bit1 list from FAT (else builtin) · bit2 ADS.EXAMPLE matched blocklist ·
 //   bit3 built a well-formed 0.0.0.0 answer · bit4 una.os NOT blocked (forward decision) ·
 //   bit5 forwarded una.os -> got a real answer from 10.0.2.3:53 · bit6 served an inbound query on :53 ·
-//   bit7 sinkholed the served query to 0.0.0.0 over the wire.
+//   bit7 sinkholed the served query to 0.0.0.0 over the wire ·
+//   bit8 (M2) a SUBDOMAIN of a blocked base name was sinkholed (label-boundary suffix match) ·
+//   bit9 (M2) a near-miss (string suffix, NOT a label boundary) was correctly NOT blocked.
+// The blocklist parser (M1) reads real hosts-file format (IP + domain, '#'/';' comments, blank lines);
+// the match (M2) is label-boundary suffix (a blocked base domain sinkholes its subdomains).
 // =============================================================================
 
 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
@@ -10620,9 +10624,11 @@ zdns_have_list:
     lea rsi, [rip + zdns_blockedquery]
     mov rcx, [rip + zdns_blockedquerylen]
     call zdns_parse_and_match                 // rax: 0 ok/not-blocked, 1 blocked, 2 malformed
+    inc qword ptr [r14 + 0xD10]               // metric: queries seen++ (ADS.EXAMPLE)
     cmp rax, 1
     jne zdns_st2                              // not blocked (unexpected) -> skip bit2/3
     or r12, 4                                 // bit2: ADS.EXAMPLE matched the blocklist
+    inc qword ptr [r14 + 0xD18]               // metric: blocked (sinkholed)++
     lea rsi, [rip + zdns_blockedquery]
     mov rcx, [rip + zdns_blockedquerylen]
     lea rdi, [r14 + 0x1008]                   // RESPBUF DNS area (dst-addr hdr occupies +0x1000..+0x1008)
@@ -10637,11 +10643,32 @@ zdns_have_list:
     jne zdns_st2
     or r12, 8                                 // bit3: built a well-formed 0.0.0.0 answer
 
+zdns_m2:
+    // --- (1b) M2 SELF-TESTS: label-boundary suffix matching ---
+    // A subdomain of a blocked base name MUST be sinkholed; a mere-string near-miss MUST NOT.
+    lea rsi, [rip + zdns_subquery]            // WWW.ADS.EXAMPLE -> expect BLOCKED (subdomain)
+    mov rcx, [rip + zdns_subquerylen]
+    call zdns_parse_and_match
+    inc qword ptr [r14 + 0xD10]               // metric: queries seen++ (WWW.ADS.EXAMPLE)
+    cmp rax, 1
+    jne zdns_m2_near
+    or r12, 256                               // bit8: subdomain of a blocked base was sinkholed
+    inc qword ptr [r14 + 0xD18]               // metric: blocked (sinkholed)++
+zdns_m2_near:
+    lea rsi, [rip + zdns_nearquery]           // NOTADS.EXAMPLE -> expect NOT blocked (not a boundary)
+    mov rcx, [rip + zdns_nearquerylen]
+    call zdns_parse_and_match
+    inc qword ptr [r14 + 0xD10]               // metric: queries seen++ (NOTADS.EXAMPLE, allowed)
+    test rax, rax                             // 0 = not blocked (the correct, safe answer)
+    jnz zdns_st2                              // blocked/malformed -> over-block bug, skip bit9
+    or r12, 512                               // bit9: near-miss correctly NOT blocked (no over-block)
+
 zdns_st2:
     // --- (2) SELF-TEST #2 / FORWARD: parse+match una.os -> NOT blocked, forward upstream 10.0.2.3:53 ---
     lea rsi, [rip + zdns_realquery]
     mov rcx, [rip + zdns_realquerylen]
     call zdns_parse_and_match
+    inc qword ptr [r14 + 0xD10]               // metric: queries seen++ (una.os)
     test rax, rax
     jnz zdns_serve                            // blocked(1) / malformed(2) -> unexpected, skip forward
     or r12, 16                                // bit4: una.os NOT blocked (forward decision)
@@ -10688,6 +10715,7 @@ zdns_fwd_loop:
     cmp byte ptr [r14 + 0x1405], 0
     jne zdns_fwd_retry
     or r12, 32                                // bit5: forwarded + real answer relayed from upstream
+    inc qword ptr [r14 + 0xD20]               // metric: forwarded upstream++ (relayed)
     jmp zdns_fwd_done
 zdns_fwd_retry:
     dec r15
@@ -10726,6 +10754,7 @@ zdns_serve_loop:
     cmp rax, 20                               // >= 8 hdr + 12 DNS header -> a plausible query
     jl zdns_serve_next
     or r12, 64                                // bit6: served an inbound datagram on :53
+    inc qword ptr [r14 + 0xD10]               // metric: queries seen++ (an over-the-wire query)
     mov rcx, rax
     sub rcx, 8                                // DNS message length
     mov [r14 + 0xD08], rcx                    // stash it (parse clobbers rcx)
@@ -10747,12 +10776,37 @@ zdns_serve_loop:
     lea rsi, [r14 + 0x1000]
     syscall
     or r12, 128                               // bit7: sinkholed the served query over the wire (latched)
+    inc qword ptr [r14 + 0xD18]               // metric: blocked (sinkholed)++
     jmp zdns_serve_next                        // keep serving across the window (answer every blocked query),
                                               // so an over-the-wire injector reliably rendezvouses with an answer
 zdns_serve_next:
     dec r15
     jnz zdns_serve_loop
 zdns_exit:
+    // --- (4) METRICS (M3): pack the three counters into the spare high bits of the witness word so the
+    // launcher can print them (the honest source a future stats view reads) — no new syscall. Each count
+    // saturates at 63: seen -> bits[10:16], blocked -> bits[16:22], forwarded -> bits[22:28].
+    mov rax, [r14 + 0xD10]                    // queries seen
+    cmp rax, 63
+    jbe zdns_pk_seen
+    mov rax, 63
+zdns_pk_seen:
+    shl rax, 10
+    or r12, rax
+    mov rax, [r14 + 0xD18]                    // blocked (sinkholed)
+    cmp rax, 63
+    jbe zdns_pk_blk
+    mov rax, 63
+zdns_pk_blk:
+    shl rax, 16
+    or r12, rax
+    mov rax, [r14 + 0xD20]                    // forwarded upstream
+    cmp rax, 63
+    jbe zdns_pk_fwd
+    mov rax, 63
+zdns_pk_fwd:
+    shl rax, 22
+    or r12, rax
     mov rax, 2                                // SYS_EXIT(witness) -> routed by name into ZEOLITE_WITNESS
     mov rdi, r12
     syscall
@@ -10812,70 +10866,168 @@ zdns_noup:
     jnz zdns_copy_lbl
     jmp zdns_lbl_loop
 zdns_name_done:
-    // Match NAMEBUF[0..r11] (uppercase) against the blocklist lines in FILEBUF.
+    // Match NAMEBUF[0..r11] (uppercase) against a hosts-format blocklist in FILEBUF (ZEOLITE-2 M1).
+    // Real sinkhole lists ship in hosts form: "<ip> <domain>  [# comment]", plus '#'/';' comment lines
+    // and blank lines. Per line: skip leading whitespace (SP/TAB); drop blank + '#'/';' comment lines;
+    // the DOMAIN is field-2 when a second whitespace-delimited field exists (the "0.0.0.0 domain" form),
+    // else field-1 (bare "domain"); the domain is compared to NAMEBUF case-insensitively. Every byte
+    // access is bounds-checked against fend (r9) — a hostile BLOCK.TXT can never read past file_len or
+    // crash; a malformed line simply matches nothing and is skipped. Preserves r10 (NAMEBUF), r11 (len).
     test r11, r11
     jz zdns_not_blocked                       // empty (root) name matches nothing
-    lea r8, [r14 + 0x000]                     // fp = FILEBUF
-    mov rcx, [r14 + 0xD00]                    // file_len
-    mov r9, r8
-    add r9, rcx                               // fend
+    lea r8, [r14 + 0x000]                     // r8 = line cursor, = FILEBUF
+    mov rax, [r14 + 0xD00]                    // file_len
+    lea r9, [r14 + rax]                       // r9 = fend = FILEBUF + file_len
 zdns_line_start:
     cmp r8, r9
     jae zdns_not_blocked
-    xor rcx, rcx                              // idx into NAMEBUF
-    mov rdx, r8                               // p = line cursor
-zdns_cmp_char:
-    cmp rdx, r9
-    jae zdns_line_end                         // EOF ends the line
-    mov al, byte ptr [rdx]
-    cmp al, 0x0A                              // '\n'
-    je zdns_line_end
-    cmp al, 0x0D                              // '\r'
-    je zdns_line_end
-    cmp rcx, r11
-    jae zdns_line_nomatch                     // line longer than the name -> no match
-    cmp al, 0x61
-    jb zdns_lnoup
-    cmp al, 0x7A
-    ja zdns_lnoup
-    sub al, 0x20
-zdns_lnoup:
-    cmp al, byte ptr [r10 + rcx]
-    jne zdns_line_nomatch
-    inc rcx
-    inc rdx
-    jmp zdns_cmp_char
-zdns_line_end:
-    cmp rcx, r11                              // whole name consumed AND line ended -> exact match
-    je zdns_blocked
-    mov r8, rdx
-    jmp zdns_skip_eol
-zdns_line_nomatch:
-    // scan rdx forward to the end of this line, then advance past the EOL
-zdns_scan_eol:
-    cmp rdx, r9
-    jae zdns_adv
-    mov al, byte ptr [rdx]
-    cmp al, 0x0A
-    je zdns_adv
+zdns_skip_ws1:                                // skip leading whitespace (SP/TAB)
+    cmp r8, r9
+    jae zdns_not_blocked
+    mov al, byte ptr [r8]
+    cmp al, 0x20
+    je zdns_ws1_inc
+    cmp al, 0x09
+    je zdns_ws1_inc
+    jmp zdns_after_ws1
+zdns_ws1_inc:
+    inc r8
+    jmp zdns_skip_ws1
+zdns_after_ws1:
+    cmp al, 0x0A                              // blank line (EOL right away) -> next line
+    je zdns_eol_adv
     cmp al, 0x0D
-    je zdns_adv
+    je zdns_eol_adv
+    cmp al, 0x23                              // '#' comment line
+    je zdns_toeol
+    cmp al, 0x3B                              // ';' comment line
+    je zdns_toeol
+    // FIELD1: [rsi, rdi) = a run of non-whitespace, non-comment, non-EOL bytes.
+    mov rsi, r8                               // field1 start
+    mov rdi, r8                               // scan cursor
+zdns_f1_scan:
+    cmp rdi, r9
+    jae zdns_f1_end
+    mov al, byte ptr [rdi]
+    cmp al, 0x20
+    je zdns_f1_end
+    cmp al, 0x09
+    je zdns_f1_end
+    cmp al, 0x0A
+    je zdns_f1_end
+    cmp al, 0x0D
+    je zdns_f1_end
+    cmp al, 0x23
+    je zdns_f1_end
+    cmp al, 0x3B
+    je zdns_f1_end
+    inc rdi
+    jmp zdns_f1_scan
+zdns_f1_end:
+    // Default domain = field1 [rsi, rdi). Look for a second field after whitespace.
+    mov rdx, rsi                              // rdx = domain start (default field1)
+    mov rcx, rdi                              // rcx = domain end   (default field1)
+    mov r8, rdi                               // advance line cursor past field1
+zdns_skip_ws2:
+    cmp r8, r9
+    jae zdns_have_domain                      // EOF after field1 -> bare-name form
+    mov al, byte ptr [r8]
+    cmp al, 0x20
+    je zdns_ws2_inc
+    cmp al, 0x09
+    je zdns_ws2_inc
+    jmp zdns_after_ws2
+zdns_ws2_inc:
+    inc r8
+    jmp zdns_skip_ws2
+zdns_after_ws2:
+    cmp al, 0x0A                              // EOL/comment after field1 -> no field2 (bare-name form)
+    je zdns_have_domain
+    cmp al, 0x0D
+    je zdns_have_domain
+    cmp al, 0x23
+    je zdns_have_domain
+    cmp al, 0x3B
+    je zdns_have_domain
+    // There IS a field2 -> the DOMAIN is field2 (the "0.0.0.0 domain" hosts form).
+    mov rdx, r8                               // domain start = field2 start
+    mov rdi, r8
+zdns_f2_scan:
+    cmp rdi, r9
+    jae zdns_f2_end
+    mov al, byte ptr [rdi]
+    cmp al, 0x20
+    je zdns_f2_end
+    cmp al, 0x09
+    je zdns_f2_end
+    cmp al, 0x0A
+    je zdns_f2_end
+    cmp al, 0x0D
+    je zdns_f2_end
+    cmp al, 0x23
+    je zdns_f2_end
+    cmp al, 0x3B
+    je zdns_f2_end
+    inc rdi
+    jmp zdns_f2_scan
+zdns_f2_end:
+    mov rcx, rdi                              // domain end = field2 end
+    mov r8, rdi                               // line cursor past field2
+zdns_have_domain:
+    // Domain field = [rdx, rcx). BLOCK if it equals NAMEBUF, OR is a label-boundary SUFFIX of it —
+    // i.e. NAMEBUF ends with "." + domain (ZEOLITE-2 M2). So a blocked base domain (ads.example)
+    // sinkholes its subdomains (www.ads.example) but NOT a mere string suffix (notads.example — the
+    // char before the tail must be a dot). Compare is against the TAIL of NAMEBUF, case-insensitive.
+    mov rax, rcx
+    sub rax, rdx                              // rax = domain length L
+    test rax, rax
+    jz zdns_toeol                             // empty domain field -> matches nothing
+    cmp rax, r11
+    ja zdns_toeol                             // domain longer than the queried name -> cannot match
+    mov rdi, r11
+    sub rdi, rax                              // rdi = offset = r11 - L (tail start in NAMEBUF)
+    test rdi, rdi
+    jz zdns_dom_cmp                           // offset 0 -> exact-length case (no boundary dot needed)
+    mov sil, byte ptr [r10 + rdi - 1]         // label-boundary guard: char before the tail must be '.'
+    cmp sil, 0x2E
+    jne zdns_toeol                            // suffix not on a label boundary -> no match
+zdns_dom_cmp:
+    cmp rdx, rcx
+    jae zdns_blocked                          // whole domain matched at the tail -> BLOCKED
+    mov al, byte ptr [rdx]
+    cmp al, 0x61                              // upper-case the file side
+    jb zdns_dcu
+    cmp al, 0x7A
+    ja zdns_dcu
+    sub al, 0x20
+zdns_dcu:
+    cmp al, byte ptr [r10 + rdi]
+    jne zdns_toeol                            // mismatch -> skip to EOL, next line
     inc rdx
-    jmp zdns_scan_eol
-zdns_adv:
-    mov r8, rdx
-zdns_skip_eol:
+    inc rdi
+    jmp zdns_dom_cmp
+zdns_toeol:                                   // scan r8 to end-of-line, then advance past the EOL bytes
     cmp r8, r9
     jae zdns_not_blocked
     mov al, byte ptr [r8]
     cmp al, 0x0A
-    je zdns_skip_inc
+    je zdns_eol_adv
     cmp al, 0x0D
-    je zdns_skip_inc
-    jmp zdns_line_start
-zdns_skip_inc:
+    je zdns_eol_adv
     inc r8
-    jmp zdns_skip_eol
+    jmp zdns_toeol
+zdns_eol_adv:
+    cmp r8, r9
+    jae zdns_not_blocked
+    mov al, byte ptr [r8]
+    cmp al, 0x0A
+    je zdns_eol_adv_inc
+    cmp al, 0x0D
+    je zdns_eol_adv_inc
+    jmp zdns_line_start
+zdns_eol_adv_inc:
+    inc r8
+    jmp zdns_eol_adv
 zdns_blocked:
     mov rax, 1
     ret
@@ -10925,7 +11077,11 @@ zdns_blockname_end:
 zdns_builtinlen:
     .quad zdns_builtinlist_end - zdns_builtinlist
 zdns_builtinlist:
-    .ascii "ADS.EXAMPLE\nTRACK.EXAMPLE\n"
+    // Builtin fallback in the SAME hosts-file format as BLOCK.TXT (lowercase domains — the parser
+    // upper-cases the file side, so this also exercises case-insensitive ingest).
+    // (Leading newline is deliberate: a hash immediately after the opening quote would read as the
+    // enclosing Rust raw-string terminator. The blank first line is skipped by the parser.)
+    .ascii "\n# zeolite builtin blocklist (hosts format)\n0.0.0.0 ads.example\n0.0.0.0 track.example\n"
 zdns_builtinlist_end:
     // Inline DNS query for ADS.EXAMPLE (header + QNAME + QTYPE A + QCLASS IN). txn id 0x5A44 = "ZD".
     .balign 8
@@ -10945,6 +11101,26 @@ zdns_realquery:
     .byte 0x03, 0x75, 0x6E, 0x61, 0x02, 0x6F, 0x73, 0x00
     .byte 0x00, 0x01, 0x00, 0x01
 zdns_realquery_end:
+    // M2 self-test A: inline query for "www.ads.example" — a SUBDOMAIN of the blocked base ads.example;
+    // must be sinkholed by the label-boundary suffix rule. (labels: www / ads / example)
+    .balign 8
+zdns_subquerylen:
+    .quad zdns_subquery_end - zdns_subquery
+zdns_subquery:
+    .byte 0x5A, 0x53, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    .byte 0x03, 0x77, 0x77, 0x77, 0x03, 0x61, 0x64, 0x73, 0x07, 0x65, 0x78, 0x41, 0x4D, 0x50, 0x4C, 0x45, 0x00
+    .byte 0x00, 0x01, 0x00, 0x01
+zdns_subquery_end:
+    // M2 self-test B: inline query for "notads.example" — shares the string suffix "ads.example" but NOT
+    // on a label boundary; must NOT be blocked (guards the suffix rule against a naive substring bug).
+    .balign 8
+zdns_nearquerylen:
+    .quad zdns_nearquery_end - zdns_nearquery
+zdns_nearquery:
+    .byte 0x5A, 0x4E, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    .byte 0x06, 0x6E, 0x6F, 0x74, 0x61, 0x64, 0x73, 0x07, 0x65, 0x78, 0x61, 0x6D, 0x70, 0x6C, 0x65, 0x00
+    .byte 0x00, 0x01, 0x00, 0x01
+zdns_nearquery_end:
     // SYS_SENDTO message for the upstream forward: 8-byte addr header [10.0.2.3][53 LE][pad] + the
     // una.os DNS payload (the same 24 bytes as zdns_realquery).
     .balign 8
@@ -11045,15 +11221,23 @@ fn zeolite_launcher(demo_cpu: usize) {
     let fwd_decided = w & 16 != 0;
     let fwd_relayed = w & 32 != 0;
     let served = w & 64 != 0 && w & 128 != 0;
+    let subdomain_ok = w & 256 != 0; // M2: a subdomain of a blocked base was sinkholed
+    let nearmiss_ok = w & 512 != 0; // M2: a near-miss (not a label boundary) was NOT over-blocked
+    let suffix_ok = subdomain_ok && nearmiss_ok;
+    // M3 metrics: the resolver's own counters, packed into the witness word's spare high bits (saturating
+    // 63). The honest data source a future stats view/widget reads — query counts, blocked counts.
+    let seen_ct = (w >> 10) & 0x3F;
+    let blocked_ct = (w >> 16) & 0x3F;
+    let forwarded_ct = (w >> 22) & 0x3F;
     let list_src = if from_fat { "BLOCK.TXT via S7 dynamic-open" } else { "builtin list (no FAT)" };
 
-    // Leg 1: the STOR-feeds-NET composition + hostile-parse + forward, all hermetic.
-    if list_loaded && blocked_ok && fwd_decided && fwd_relayed && killed == 0 {
+    // Leg 1: the STOR-feeds-NET composition + hosts-format ingest + suffix-match + hostile-parse + forward.
+    if list_loaded && blocked_ok && suffix_ok && fwd_decided && fwd_relayed && killed == 0 {
         serial_println!(
-            ":: zeolite: blocklist from {}, blocked ADS.EXAMPLE -> 0.0.0.0 (answer built), forwarded una.os -> 10.0.2.3:53 real answer relayed — witness OK ::",
+            ":: zeolite: hosts-format blocklist from {}, blocked ADS.EXAMPLE -> 0.0.0.0 (answer built), subdomain WWW.ADS.EXAMPLE sinkholed + NOTADS.EXAMPLE not over-blocked, forwarded una.os -> 10.0.2.3:53 real answer relayed — witness OK ::",
             list_src
         );
-    } else if list_loaded && blocked_ok && fwd_decided && !fwd_relayed && killed == 0 {
+    } else if list_loaded && blocked_ok && suffix_ok && fwd_decided && !fwd_relayed && killed == 0 {
         // The forward leg's upstream is unreachable on this medium (the UNAOS_NET=socket injector has
         // no slirp resolver) — the sinkhole DECISION + build proved; the upstream relay is INCOMPLETE here.
         serial_println!(
@@ -11062,11 +11246,17 @@ fn zeolite_launcher(demo_cpu: usize) {
         );
     } else {
         serial_println!(
-            ":: zeolite: DNS sinkhole FAIL — witness={:#x} (list={} fat={} blocked+built={} fwd_decided={} fwd_relayed={}) cleared={} killed={} done={} ::",
-            w, list_loaded, from_fat, blocked_ok, fwd_decided, fwd_relayed, cleared, killed,
+            ":: zeolite: DNS sinkhole FAIL — witness={:#x} (list={} fat={} blocked+built={} subdomain={} nearmiss_ok={} fwd_decided={} fwd_relayed={}) cleared={} killed={} done={} ::",
+            w, list_loaded, from_fat, blocked_ok, subdomain_ok, nearmiss_ok, fwd_decided, fwd_relayed, cleared, killed,
             ZEOLITE_DONE.load(Ordering::Acquire)
         );
     }
+
+    // Metrics (M3): the resolver's own tally — the honest source a future stats view reads.
+    serial_println!(
+        ":: zeolite: metrics — {} queries seen, {} blocked (sinkholed), {} forwarded upstream ::",
+        seen_ct, blocked_ct, forwarded_ct
+    );
 
     // Leg 2: the over-the-wire sinkhole serve — needs the UNAOS_NET=socket `dns` injector.
     if served {
