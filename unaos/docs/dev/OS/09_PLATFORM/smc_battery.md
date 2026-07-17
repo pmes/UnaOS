@@ -1,7 +1,8 @@
 # BATMON-1 — Apple SMC battery monitor (x86, `UNAOS_SMC=1`)
 
-Status: M1 code-complete + QEMU-gated; M2 read/render path landed (provisional key set);
-M3 (metal tracking) is the attended 2012 rMBP sitting, not a build gate.
+Status: scout + battery read/render path code-complete + QEMU-gated (provisional key set); the
+data-phase fix from the 2026-07-17 sitting — full multi-byte drain (GAP 1) + step-0 idle-guard
+(GAP 2) — landed. Metal battery-tracking is the attended 2012 rMBP sitting, not a build gate.
 
 Peter's end goal: run the 2012 MacBook Pro off its battery with an on-screen battery monitor —
 "one less set of cords all over the place." This note records the protocol, the write surface, the
@@ -32,7 +33,17 @@ The classic Apple SMC READ handshake, matched byte-for-byte by QEMU's `isa-apple
 3. Write one length byte to **0x300**. The SMC looks the key up:
    * found ⇒ status sets `DATA_READY` (bit 0);
    * missing ⇒ status settles to `CMD_DONE` (0x00) — a *clean* "no such key".
-4. Read value bytes from **0x300** while `DATA_READY` holds; the SMC clears it after the last byte.
+4. Read value bytes from **0x300**, one per handshake. On the real Apple SMC the controller raises
+   `BUSY` (0x02) while it shifts the next byte into 0x300 — `DATA_READY` de-asserts under it — so per
+   byte the driver **waits for `BUSY` to clear, then inspects `DATA_READY`**: set ⇒ read one value
+   byte from 0x300 and repeat; clear ⇒ the SMC has signalled end-of-value → stop and return the count.
+   **Termination is the SMC's done-signal, not the caller's buffer length**, so an oversized buffer
+   (`REV ` into an 8-byte buffer, the 32-byte scout buffer) still returns the true value length (6 for
+   `REV `) with no spurious `Stuck`; the buffer length is only the safety cap that prevents writing
+   past the caller. (QEMU's `isa-applesmc` never raises `BUSY` and holds `DATA_READY` continuously
+   across all `len` bytes, clearing it once after the last — the same loop drains it byte-identically,
+   which is exactly why the metal `len=1` truncation was invisible on QEMU. See the GAP 1 → GAP 2
+   section below.)
 
 Status bits (low nibble): `DATA_READY`=0x01, `BUSY`=0x02, `ACK`=0x04, `NEW_CMD`=0x08.
 
@@ -98,14 +109,73 @@ a tiny key set: `REV ` (6 bytes, `01 13 0f 00 00 03`), `OSK0`/`OSK1`, and a few 
 
 Battery keys and key enumeration are metal-first by construction.
 
-## Metal-pending (the M3 sitting — Peter's, not a build gate)
+## Metal data-phase defects — the GAP 1 → GAP 2 causal chain (2026-07-17 sitting)
 
-Assertable at the attended 2012 rMBP sitting (`UNAOS_SMC=1` media):
+The first attended 2012 rMBP sitting exposed two defects **invisible on QEMU** (QEMU's `isa-applesmc`
+returns proper lengths and never wedges, masking both). Both are fixed by the data-length drain +
+step-0 idle-guard landed in this note's driver.
+
+- **GAP 1 — every responding key read back `len=1`.** The old value-drain loop read the 0x304 status
+  once per byte and broke the instant `DATA_READY` was clear. On the real SMC `DATA_READY` de-asserts
+  momentarily between value bytes while the controller raises `BUSY` (0x02) and shifts the next byte
+  into 0x300, so after byte 0 the loop saw `DATA_READY` clear and exited with `n=1`. Every multi-byte
+  value collapsed to its first byte; `battery::read_u16` (needs `Ok(2)`) returned `None`, so
+  `present(battery)=false`, found=10/18. QEMU holds `DATA_READY` set continuously across all `len`
+  bytes, so the identical loop drained fully there — which is why the bug was masked.
+- **GAP 2 — 8/18 keys wedged at handshake "step 0"** (bounded, never forced): `REV ` `#KEY` `B0AC`
+  `B0FC` `B0St` `CHBI` `AC-W` `BC2V`. **This is downstream of GAP 1, not independent.** A truncated
+  read left the remaining value bytes undrained and the READ transaction incomplete (`DATA_READY`
+  still pending inside the SMC); with no flush before the next command, the following key's
+  `write_cmd(READ)` was issued into a still-busy SMC and its step-0 `NEW_CMD|ACK` wait timed out →
+  `Stuck(0)`. The metal inventory proves it exactly: each wedge key was immediately preceded in
+  `PROBE_KEYS` order by a **multi-byte** key (`REV `←prior REV, `#KEY`←OSK0, `B0AC`←BRSC, `B0FC`←B0AV,
+  `B0St`←B0RM, `CHBI`←B0TF, `AC-W`←CHBV, `BC2V`←BC1V), while every key preceded by a genuine 1-byte key
+  (`BSIn`←BNum) or by a wedged key (which wrote no key bytes and left no residue) read fine — a perfect
+  wedge/fine alternation past the BNum/BSIn pair. The ~0.1–0.25 s `Stuck` wait outlasts the SMC's own
+  transaction timeout, so the SMC self-heals during each wedge and the next key starts clean, which is
+  why exactly *every other* key wedged instead of the whole sweep cascading.
+
+**The fix.**
+- *Data-length drain.* The value-drain loop now runs the per-byte `BUSY`-then-`DATA_READY` handshake
+  of read-protocol step 4 above (new `ST_BUSY = 0x02` const + a bounded `wait_busy_clear` helper on the
+  same `rdtsc` budget; a genuine per-byte timeout yields `Stuck(3)`, never an unbounded spin). Full
+  multi-byte values come back and each transaction completes cleanly. The same handshake is mirrored in
+  `read_key_by_index`'s 4-byte name drain (there an early `DATA_READY`-clear stays an error — a name
+  must fully drain).
+- *Step-0 idle-guard.* `settle_before_command()` runs before every `write_cmd`: if the status still
+  shows `DATA_READY`/`BUSY` (a stale partial read) it drains leftover data bytes under the bounded
+  budget before issuing the command. It is a **no-op on an idle SMC** (always the case on QEMU between
+  transactions), so QEMU behaviour is byte-identical; on metal it is belt-and-suspenders against any
+  residue the clean drain does not already remove.
+
+Because a clean drain completes each transaction, the data-length drain is expected to eliminate GAP 2
+on its own; the idle-guard is defence-in-depth. Both fixes are **no-ops on the emulated path by
+construction** — QEMU returns full lengths and never wedges — so the QEMU gate is unchanged (`REV `
+len=6 `bytes=[01 13 0f 00 00 03]`, `SMC-BATT present=false`). The metal correctness (full multi-byte
+values; the 8 keys no longer wedging) is provable only at the attended sitting.
+
+## Metal-pending (the attended rMBP sitting — Peter's, not a build gate)
+
+Assertable at the attended 2012 rMBP sitting (`UNAOS_SMC=1` media). Items 1–5 were the original scout
+gate; items 6–8 confirm the GAP 1 / GAP 2 data-phase fix (see the section above) on silicon:
 
 1. `:: SMC-SCOUT: key REV present … ::` on real silicon (protocol works on the metal SMC).
+   ✅ 2026-07-17 (SMC alive; real drifting telemetry across boots).
 2. The `SMC-SCOUT` battery block: which of the curated keys the real SMC carries + their payloads —
    **the machine's true battery inventory** (records the M2 key set + the per-cell fork verdict).
+   ✅ 2026-07-17 (found=10/18 present, per-cell fork observed) — but truncated to `len=1` (GAP 1);
+   re-run under the fix records the full payloads.
 3. `#KEY` present ⇒ the index walk emits the full key list.
 4. `:: SMC-BATT: present=true soc=… volt=… ::` tracks reality: **unplug ⇒ discharge (amp < 0, soc
-   falls), plug ⇒ charge (amp > 0)**; the on-screen "BATT" bar follows.
+   falls), plug ⇒ charge (amp > 0)**; the on-screen "BATT" bar follows. The battery-tracking sub-leg —
+   a later METAL leg, **explicitly not** part of the data-phase-fix build gate.
 5. No handshake STOP-NOTE on the metal SMC (bounded waits sized correctly for real timing).
+6. **Full multi-byte values (GAP 1 fixed).** Multi-byte keys report `len>1` — voltages `B0AV`/`BC1V`/
+   `CHBV`, capacities `B0RM`/`BSIn`, the 6-byte `REV `, the 32-byte `OSK0` — not the pre-fix `len=1`
+   truncation; and `:: SMC-BATT: present=true … ::` (with `B0AV`/`B0RM`/`BRSC` decoding to plausible
+   values) replaces the pre-fix `present=false`.
+7. **No step-0 wedge (GAP 2 fixed).** All 18 `PROBE_KEYS` respond (present or clean-absent); the
+   pre-fix 8/18 `STOP-NOTE handshake stuck at step 0` list (`REV ` `#KEY` `B0AC` `B0FC` `B0St` `CHBI`
+   `AC-W` `BC2V`) is gone once the clean drain leaves the SMC idle between transactions.
+8. The idle-guard (`settle_before_command`) never has to drain residue on a healthy SMC — an honest
+   check that GAP 2 was truly downstream of GAP 1 and not a second independent defect.
