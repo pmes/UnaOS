@@ -304,9 +304,10 @@ extern "C" fn __secondary_rust_virt(_advisory: u64) -> ! {
     // Honest idle heartbeat (VUG-1 M3b): this core is online but parks WITHOUT running the scheduler,
     // so it never calls `dispatch_next` and its CPU-pulse counters would stay (0,0) — a pinned/undefined
     // meter bar for a demonstrably-online-idle core. Register it as idle so the bar reads honest 0% busy.
-    // Bump BEFORE the first WFI (deterministic: the BSP's bring-up summary can then witness idle > 0),
-    // and on every wake so the heartbeat tracks the core staying parked-idle. Introspection-only,
-    // lock-free relaxed — no scheduling-path effect.
+    // Bump once at park entry AND on every WFI wake — the wake bump is the load-bearing one (the BSP's
+    // witness reads busy+idle>0, which each re-park guarantees; the entry bump just seeds it). IRQs are
+    // already unmasked, so the BSP→AP ping is itself such a wake. Introspection-only, lock-free relaxed
+    // — no scheduling-path effect.
     sched::note_core_idle(core);
     // Park: IRQs unmasked, so a BSP → AP SGI wakes this WFI, is serviced (handle_irq_v3 counts it), and
     // the core re-parks. No scheduler on this path (see the module header).

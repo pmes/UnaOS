@@ -4523,11 +4523,17 @@ witness `idle > 0` deterministically) and again on **every wake**, so the bar tr
 parked-idle. No scheduling-path change; no counter removed; a core that later runs the scheduler still
 accrues busy/idle normally through `dispatch_next`.
 
-**Determinism.** The park-entry bump happens strictly after the core publishes `CORE_READY`; the BSP,
-before it formats its `N/N secondaries online` summary, has since completed a full BSP→AP ping round
-trip and the AP→BSP verdict — so every online AP has executed its heartbeat by the witness point. A
-`(0,0)` read at the witness would be an ordering finding (STOP + report), never something to paper over
-with a sleep.
+**Determinism.** The park-entry bump happens strictly after the core publishes `CORE_READY`, and the
+BSP formats its summary only after a full BSP→AP ping round trip + the AP→BSP verdict — a multi-ms
+wall-clock gap. Note the precise ordering: IRQs are unmasked (`exceptions::enable_irq`) *before* both
+`CORE_READY` (Release) and the park-entry `note_core_idle`, so the AP→BSP synchronization edge (the
+SGI the BSP waits on) can in principle be established at a program point *before* the first `CPU_IDLE`
+bump; the witness's `Relaxed` load is therefore not *memory-model-guaranteed* to observe that first
+bump. The load-bearing guarantee is instead the **in-loop re-park bump** — each WFI wake (the BSP→AP
+ping is exactly such a wake) bumps `CPU_IDLE` again inside the loop, and every real Orin/vug window
+sees many such wakes. So `busy + idle > 0` is what the witness asserts, not an exact count. A `(0,0)`
+read would be an ordering finding — **fail-loud (`FAIL`) + STOP + report**, never papered over with a
+sleep; the fail-loud stance is what keeps the (theoretical) relaxed-load race safe.
 
 **The QEMU gate (not metal-only).** The `virt` GICv3 path runs the *same* `__secondary_rust_virt`
 park, so `UNAOS_GICV3=1 ./arroyo test-arm` proves the fix: after `3/3 secondaries online`, the BSP
