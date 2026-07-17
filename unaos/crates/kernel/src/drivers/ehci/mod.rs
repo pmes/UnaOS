@@ -426,13 +426,8 @@ impl Controller {
 
         let sts = mmio_read32(self.op + OP_USBSTS).unwrap_or(0);
         if sts & STS_HSE != 0 {
-            // Recover the halted controller (ack RW1C, PSE off, RS back on) for the retry.
-            let _ = mmio_write32(self.op + OP_USBSTS, sts & STS_RW1C);
-            let cmd = mmio_read32(self.op + OP_USBCMD).unwrap_or(0);
-            let _ = mmio_write32(self.op + OP_USBCMD, (cmd & !CMD_PSE) | CMD_RS);
-            let _ = wait_bounded(|| {
-                mmio_read32(self.op + OP_USBSTS).unwrap_or(STS_HCHALTED) & STS_HCHALTED == 0
-            });
+            // Leave the HSE LATCHED: the caller's quiesce path keys its full HCRESET off it
+            // (probe-14b: acking here left the controller wedged and the re-reset PR stuck).
             return Err("hse");
         }
         if !done {
