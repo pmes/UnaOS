@@ -187,13 +187,22 @@ no access control. The *governing rule* (Peter, 2026-07-16, "we want high
 security") is that a snapshot read is authorized by the **live object's CURRENT
 ACL**, re-evaluated at read time — enforced one layer up, at the kernel verb /
 ACL seam ([`fs/unafs.rs`](../../../crates/kernel/src/fs/unafs.rs), `read_authz` /
-`snapshot_read`), so there is exactly one enforcement path and the snapshot read
-defers to it:
+`snapshot_read`). Every snapshot-read surface (`usnapcat`, `usnapls`, the host
+mirror) defers to that ONE evaluator. Honest scoping: `read_authz` enforces the
+same *semantics* as the live syscall path — current-ACL, CAP_READ-equivalent
+grant rights, fail-closed on a deleted object — but it is a kernel-verb-layer
+evaluator distinct from the syscall layer's OwnedFile/FileGrant machinery;
+unifying the two evaluators is a ledgered follow-up (SECURITY.md K8c entry).
 
 - **Revocation is total, and it reaches the past.** A principal that cannot read
   the live object cannot read *any* snapshot of it. Snapshots preserve bytes,
   never authority — dropping a grant retroactively closes every retained copy to
   that principal.
+- **Grant rights are honored, not just grant presence.** A `grants:<principal>`
+  row admits a snapshot read only if its `rw`/`r`/`w` rights value carries the
+  READ right — decoded by the syscall layer's own `rights_from_native` and tested
+  against its `CAP_READ` bit, so a write-only grantee reads neither the live
+  object nor any snapshot of it.
 - **Deleted-from-live fails closed (documented consequence).** An object deleted
   from the live tree still has its bytes on disk (a retained root pins them), but
   it has **no live ACL row** — so the current-ACL check refuses it for *every*

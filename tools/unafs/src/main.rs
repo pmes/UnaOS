@@ -843,9 +843,13 @@ async fn main() -> Result<()> {
             };
 
             // Phase 2: CURRENT-ACL — authorize against the LIVE object of that id.
-            // This mirrors the kernel `read_authz`: a live object gone from the
-            // tree fails closed (no current ACL row); kernel authority permits;
-            // a public object (no owner) permits; else owner / grants:<p> decide.
+            // This mirrors the kernel `read_authz` faithfully (lens A fold): a live
+            // object gone from the tree fails closed (no current ACL row); kernel
+            // authority permits; a public object (no owner) permits; the owner
+            // permits; a grant permits ONLY if its rights value carries the READ
+            // right — the K6 `rw`/`r`/`w` encoding, the same mapping the kernel's
+            // `rights_from_native` decodes and tests against CAP_READ (a write-only
+            // `w` grant is refused, matching the live syscall path).
             match fs.read_inode(sid) {
                 Err(_) => {
                     anyhow::bail!(
@@ -858,12 +862,15 @@ async fn main() -> Result<()> {
                         if let Some(unafs::AttributeValue::String(owner)) =
                             live.attributes.get("owner")
                         {
-                            let granted = live
-                                .attributes
-                                .contains_key(&format!("grants:{}", as_principal));
-                            if as_principal != owner && !granted {
+                            // Rights-aware: only `rw`/`r` carry the read right
+                            // (rights_from_native: rw->R|W, r->R, w->W, else 0).
+                            let grant_reads = matches!(
+                                live.attributes.get(&format!("grants:{}", as_principal)),
+                                Some(unafs::AttributeValue::String(r)) if r == "rw" || r == "r"
+                            );
+                            if as_principal != owner && !grant_reads {
                                 anyhow::bail!(
-                                    "{}: refused — current ACL denies principal '{}'",
+                                    "{}: refused — current ACL denies principal '{}' (no read right)",
                                     path,
                                     as_principal
                                 );

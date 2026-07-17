@@ -2988,20 +2988,48 @@ fn unafs_verb_snapdrop(generation: u64) -> String {
 
 /// `usnapls <gen> [path]`: list a retained snapshot's directory AS OF the
 /// snapshot (K8c) — a read-only [`SnapshotView`] listing; never perturbs the
-/// live tree, refcounts, or the reclaim queue.
+/// live tree, refcounts, or the reclaim queue. Gated by the SAME current-ACL
+/// evaluator as `usnapcat` ([`read_authz`] on the target directory's live id) —
+/// no snapshot-read surface bypasses it: a directory deleted from the live tree
+/// fails closed, symmetrically with the file read (lens A fold).
 #[cfg(target_arch = "aarch64")]
 fn unafs_verb_snapls(generation: u64, path: &str) -> alloc::vec::Vec<String> {
+    use crate::fs::unafs::{read_authz, ReadAuthz, KERNEL_PRINCIPAL};
     let out = crate::fs::unafs::with_unafs(|fs| {
+        // Resolve the directory's logical id in the snapshot (scoped: the view
+        // borrows fs; release it so the ACL check can re-borrow).
+        let dir_id = {
+            let mut view = match fs.open_snapshot(generation) {
+                Ok(v) => v,
+                Err(::unafs::fs::FileSystemError::SnapshotNotFound(_)) => {
+                    return alloc::vec![alloc::format!("usnapls: no such snapshot generation {}", generation)];
+                }
+                Err(e) => return alloc::vec![alloc::format!("usnapls: {:?}", e)],
+            };
+            match view.resolve_path(path) {
+                Ok(id) => id,
+                Err(_) => return alloc::vec![alloc::format!("usnapls: {}: not in snapshot", path)],
+            }
+        };
+        // CURRENT-ACL on the live directory — the same evaluator as usnapcat.
+        match read_authz(fs, dir_id, KERNEL_PRINCIPAL) {
+            ReadAuthz::Permit => {}
+            ReadAuthz::DenyNoLiveObject => {
+                return alloc::vec![alloc::format!(
+                    "usnapls: {}: refused — directory deleted from live tree (no current ACL; fail-closed)",
+                    path
+                )];
+            }
+            ReadAuthz::DenyAcl => {
+                return alloc::vec![alloc::format!(
+                    "usnapls: {}: refused — current ACL denies this principal",
+                    path
+                )];
+            }
+        }
         let mut view = match fs.open_snapshot(generation) {
             Ok(v) => v,
-            Err(::unafs::fs::FileSystemError::SnapshotNotFound(_)) => {
-                return alloc::vec![alloc::format!("usnapls: no such snapshot generation {}", generation)];
-            }
             Err(e) => return alloc::vec![alloc::format!("usnapls: {:?}", e)],
-        };
-        let dir_id = match view.resolve_path(path) {
-            Ok(id) => id,
-            Err(_) => return alloc::vec![alloc::format!("usnapls: {}: not in snapshot", path)],
         };
         match view.ls(dir_id) {
             Ok(entries) => {

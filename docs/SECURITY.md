@@ -436,24 +436,33 @@ The UNAFS-K3 mount became read-WRITE at K4: `fs/unafs.rs`'s `write_sector` route
   retained bytes SURVIVE; K8c governs who may READ them. Ruling of record (Peter, 2026-07-16, "we
   want high security"): a snapshot read is authorized by the **LIVE object's CURRENT ACL**,
   re-evaluated at read time — NOT by the ACL that was in force when the snapshot was taken.
-  Snapshots preserve bytes, never authority. There is ONE enforcement predicate
-  (`read_authz(fs, live_id, principal)` in `fs/unafs.rs`), and BOTH a live read and a snapshot read
-  defer to it, keyed on the same stable logical inode id — no parallel permission logic. Consequences,
-  each proven by the witness: **(a)** a principal who cannot read the live object cannot read any
-  snapshot of it; **(b)** dropping a grant (or changing the owner) on the live object *retroactively*
-  closes every retained copy to that principal — revocation is total and reaches the past; **(c)** an
-  object DELETED from the live tree has no live ACL row, so the current-ACL check **fails closed for
-  EVERY principal**, the owner and kernel authority included (`DenyNoLiveObject`, traced) — the
-  retained bytes remain on disk but are unreadable through the enforced path. The crate `SnapshotView`
-  carries no policy (read-only is a property of the type, not a check); it is the verb/ACL seam that
-  enforces, exactly as the live read does. No K8a/K8b property is weakened: reads mutate nothing (no
-  refcount, no reclaim queue, no root flip).
-- **Proof (K8c).** `:: K8c-snapread: … PASS [w=0x7f] ::` (uncounted; REQUIREd in
-  `pi4-regression.spec`) — set an owner + a grant on a native object, retain it, overwrite the live
-  file, then read the SNAPSHOT as several principals: owner and grantee read the OLD bytes; an
-  impostor is refused from the snapshot by the SAME predicate that refuses the live read; dropping the
-  grant retroactively refuses the previously-permitted grantee; and after the live object is deleted
-  even its owner is refused (fail-closed, traced). Self-cleaning. Host twins in
+  Snapshots preserve bytes, never authority. ONE evaluator at the verb layer
+  (`read_authz(fs, live_id, principal)` in `fs/unafs.rs`): EVERY snapshot-read surface (`usnapcat`,
+  `usnapls`, `snapshot_read`, the host mirror) defers to it, keyed on the stable logical inode id of
+  the LIVE object. **Honest scoping (lens A fold, 2026-07-16):** `read_authz` enforces the same
+  SEMANTICS as the live syscall path — current-ACL; grant rights honored, not just grant presence (a
+  `grants:<p>` row admits a read only if its `rw`/`r`/`w` value carries the READ right, decoded by
+  the syscall layer's own `rights_from_native` and tested against its `CAP_READ` bit — a write-only
+  grantee reads neither live nor snapshot); fail-closed on a deleted object — but it is a
+  kernel-verb-layer evaluator DISTINCT from the syscall layer's OwnedFile/FileGrant machinery.
+  **Ledgered follow-up: unify the two evaluators** so the verb layer and the syscall layer share one
+  implementation, not two implementations of one ruleset. Consequences, each proven by the witness:
+  **(a)** a principal who cannot read the live object cannot read any snapshot of it — including a
+  grantee whose grant lacks the read right; **(b)** dropping a grant (or changing the owner) on the
+  live object *retroactively* closes every retained copy to that principal — revocation is total and
+  reaches the past; **(c)** an object DELETED from the live tree has no live ACL row, so the
+  current-ACL check **fails closed for EVERY principal**, the owner and kernel authority included
+  (`DenyNoLiveObject`, traced) — the retained bytes remain on disk but are unreadable through the
+  enforced path. The crate `SnapshotView` carries no policy (read-only is a property of the type,
+  not a check); enforcement lives at the verb/ACL seam. No K8a/K8b property is weakened: reads
+  mutate nothing (no refcount, no reclaim queue, no root flip).
+- **Proof (K8c).** `:: K8c-snapread: … PASS [w=0xff] ::` (uncounted; REQUIREd in
+  `pi4-regression.spec`) — set an owner + a read grant (`r`) + a WRITE-ONLY grant (`w`) on a native
+  object, retain it, overwrite the live file, then read the SNAPSHOT as several principals: owner and
+  read-grantee read the OLD bytes; an impostor is refused from the snapshot by the SAME evaluator that
+  refuses the live read; the write-only grantee is refused both live and snapshot (rights-aware);
+  dropping the read grant retroactively refuses the previously-permitted grantee; and after the live
+  object is deleted even its owner is refused (fail-closed, traced). Self-cleaning. Host twins in
   `unafs/tests/snapshot_read.rs` cover the crate view (old bytes after overwrite AND after delete,
   attrs as-of-snapshot, frozen-to-post-snapshot-changes, reads leave the free ledger / reclaim queue /
   root generation intact + fsck clean, dropped-snapshot view fails closed). Metal rides the next Pi

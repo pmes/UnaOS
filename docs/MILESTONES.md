@@ -150,22 +150,30 @@ into `*_via` associated functions keyed on an explicit inode map, and the live m
 both delegate (live = `self.imap`, view = the snapshot's map). Reads perturb nothing — no refcount,
 no reclaim queue, no root flip. FORMAT LOCKED (API addition only). Enforcement side (the ruling of
 record, Peter 2026-07-16, "we want high security"): a snapshot read is authorized by the **LIVE
-object's CURRENT ACL**, re-evaluated at read time. ONE predicate, `read_authz(fs, live_id,
-principal)` in `fs/unafs.rs`, is the single point a live read and a snapshot read both defer to —
-no parallel permission logic. Revocation is total and reaches the past: a principal who cannot read
+object's CURRENT ACL**, re-evaluated at read time. ONE evaluator at the verb layer,
+`read_authz(fs, live_id, principal)` in `fs/unafs.rs`, that every snapshot-read surface (`usnapcat`,
+`usnapls`, the host mirror) defers to. Honest scoping (lens A fold): same SEMANTICS as the live
+syscall path — current-ACL; grant rights honored, not just presence (a grant admits a read only if
+its `rw`/`r`/`w` value carries the READ right, decoded by the syscall layer's own
+`rights_from_native` against its `CAP_READ` bit, so a write-only grantee reads neither live nor
+snapshot); fail-closed on a deleted object — enforced by a kernel-verb-layer evaluator distinct
+from the syscall layer's OwnedFile/FileGrant machinery (unifying the two = a ledgered follow-up in
+SECURITY.md). Revocation is total and reaches the past: a principal who cannot read
 the live object cannot read any snapshot of it, and dropping a grant retroactively closes every
 retained copy. The deleted-object edge (the brief's explicit consequence): an object deleted from
 the live tree has no live ACL row, so the current-ACL check **fails closed for every principal**
 (`DenyNoLiveObject`, traced) — even the owner and kernel authority. Verbs `usnapcat <gen> <path>` /
-`usnapls <gen> [path]` and host `unafs snapcat --as <principal>` drive the surface.
+`usnapls <gen> [path]` (both gated by the same evaluator) and host
+`unafs snapcat --as <principal>` drive the surface.
 
 **How it was tested.** Host: crate suite 107 → **113** (a new `snapshot_read` suite: old bytes after
 live overwrite AND after live delete, attrs as-of-snapshot incl. spilled large attr, view frozen to
 post-snapshot changes, reads leave the free ledger / reclaim queue / root generation intact + fsck
 clean, dropped-snapshot view fails closed). `check` green both arches; no_std build green.
-`kernel8-test 30` = the new uncounted REQUIREd **`K8c-snapread [w=0x7f]`** witness PASS (owner +
-grantee read the OLD bytes; impostor refused live⇔snapshot by the same predicate; grant-drop
-retroactively refuses; live-deleted object fails closed for its owner — traced; self-cleaning), with
+`kernel8-test 30` = the new uncounted REQUIREd **`K8c-snapread [w=0xff]`** witness PASS (owner +
+read-grantee read the OLD bytes; impostor refused live⇔snapshot by the same evaluator; WRITE-ONLY
+grantee refused — rights-aware, the lens A fold; grant-drop retroactively refuses; live-deleted
+object fails closed for its owner — traced; self-cleaning), with
 **COUNT 23 → PASS intact, 0 FAIL, 0 forbidden**. `test-arm 22` MISSION SUCCESS; x86 `test 40`
 MISSION SUCCESS (zero x86 change — aarch64-gated). fsck clean on every gate image. Metal MBENCH
 re-proof rides the next Pi sitting (accrues with the owed K8b boot).
