@@ -114,33 +114,34 @@ pub fn capture(args: fmt::Arguments) {
     // serial lock the caller already holds, so contention here is rare.
 }
 
-/// Current number of captured bytes (for the flush's grow-detection). Cheap `try_lock`.
-fn captured_len() -> usize {
-    RING.try_lock().map(|r| r.len).unwrap_or(0)
+/// Current number of captured bytes (for the flush's grow-detection). Cheap `try_lock`; `None` if the
+/// ring is momentarily locked by a concurrent `capture` (retry next iteration).
+fn captured_len() -> Option<usize> {
+    RING.try_lock().map(|r| r.len)
 }
 
 /// Snapshot the captured bytes into a heap `Vec` (the flush runs at IF=1 in the main loop, so alloc
-/// is fine) and release the ring lock before the slow block I/O of the write. Appends a short trailer
-/// noting any dropped bytes so a truncated log is self-describing.
-fn snapshot() -> alloc::vec::Vec<u8> {
-    let mut out = alloc::vec::Vec::new();
+/// is fine), releasing the ring lock before the slow block I/O of the write. Returns the file bytes
+/// AND the captured length under the SAME lock, so the caller records exactly what it wrote — never
+/// a truncated snapshot marked as a full flush. `None` if the ring is momentarily locked (retry).
+/// The `dropped` trailer keeps a full-ring log self-describing.
+fn snapshot() -> Option<(alloc::vec::Vec<u8>, usize)> {
+    let ring = RING.try_lock()?;
+    let mut out = alloc::vec::Vec::with_capacity(ring.len + 128);
     // A self-identifying header IN THE FILE only (never emitted on the live serial stream, so the boot
     // output is byte-unchanged). Gives the tester a clear "this is a UnaOS boot log" marker and a
     // stable grep target — the bootloader's own banner runs in a separate UEFI binary before the
     // kernel's serial tap exists, so it is not in the captured ring.
     out.extend_from_slice(b":: UnaOS flight-recorder boot log (UNAOS.LOG) ::\n");
-    if let Some(ring) = RING.try_lock() {
-        out.extend_from_slice(&ring.buf[..ring.len]);
-        if ring.dropped > 0 {
-            // Alloc-free-in-lock would be nicer, but we already own the heap here.
-            let note = alloc::format!(
-                "\n:: FLIGHTREC: {} byte(s) dropped (ring full / contended) ::\n",
-                ring.dropped
-            );
-            out.extend_from_slice(note.as_bytes());
-        }
+    out.extend_from_slice(&ring.buf[..ring.len]);
+    if ring.dropped > 0 {
+        let note = alloc::format!(
+            "\n:: FLIGHTREC: {} byte(s) dropped (ring full / contended) ::\n",
+            ring.dropped
+        );
+        out.extend_from_slice(note.as_bytes());
     }
-    out
+    Some((out, ring.len))
 }
 
 const LOG_NAME: &str = "UNAOS.LOG";
@@ -188,13 +189,17 @@ pub fn service() {
     }
 
     let last = LAST_FLUSHED.load(Ordering::Relaxed);
-    let len = captured_len();
     let first_time = last == usize::MAX;
 
+    // Cheap growth gate first (a bare length read) so we don't allocate a snapshot every iteration.
+    let cur = match captured_len() {
+        Some(l) => l,
+        None => return, // ring momentarily locked by a concurrent print — retry next iteration
+    };
     if !first_time {
         // Only re-flush when there are NEW bytes, and only every FLUSH_EVERY_ITERS iterations so a
         // chatty kernel does not churn the FAT.
-        if len <= last {
+        if cur <= last {
             return;
         }
         let n = ITERS.fetch_add(1, Ordering::Relaxed) as u32;
@@ -203,7 +208,12 @@ pub fn service() {
         }
     }
 
-    let data = snapshot();
+    // Take the file bytes AND their captured length under ONE lock — so LAST_FLUSHED records exactly
+    // what we wrote, never a contention-truncated snapshot marked as a full flush.
+    let (data, len) = match snapshot() {
+        Some(pair) => pair,
+        None => return, // contended at the snapshot moment — retry next iteration, marker unchanged
+    };
     match write_log(&data) {
         Ok(written) => {
             LAST_FLUSHED.store(len, Ordering::Relaxed);
