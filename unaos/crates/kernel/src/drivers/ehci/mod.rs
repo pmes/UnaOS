@@ -70,6 +70,8 @@ const PORT_RW1C: u32 = (1 << 1) | (1 << 3) | (1 << 5);
 /// USBSTS RW1C status bits acked during polling (USBINT/ERR/port-change/rollover/host-error/
 /// async-advance). Ack-only — USBINTR is never written (polling model).
 const STS_RW1C: u32 = 0x3F;
+/// USBSTS Async Schedule Status (read-only; tracks USBCMD.ASE with a lag).
+const STS_ASS: u32 = 1 << 15;
 
 /// One endpoint-addressing tuple for the shared control QH: everything dword 1/2 of a QH needs.
 /// `hub_addr`/`hub_port` are the TT fields — zero on Topology B / high-speed targets, the RMH's
@@ -171,14 +173,31 @@ impl Controller {
         (*qh).overlay[2] = 0; // inactive token — controller skips until a transfer is primed
         let _ = mmio_write32(self.op + OP_ASYNCLISTADDR, qh as u32);
 
-        let cmd = mmio_read32(self.op + OP_USBCMD).unwrap_or(0);
-        let _ = mmio_write32(self.op + OP_USBCMD, cmd | CMD_ASE);
+        // ASE is NOT set here. Real Intel EHCI parks async traversal on an empty schedule
+        // (EHCI 4.8.3 empty-schedule detection: one H-bit QH with an inactive overlay) and
+        // never re-walks when a transfer is later primed — the first rMBP probe showed exactly
+        // that (SETUP qTD stayed Active, zero error bits, wake clean). QEMU re-walks every
+        // frame and masked it. So the async schedule is enabled per transfer, with bounded
+        // USBSTS.ASS handshakes — the Linux ehci-hcd idiom.
         serial_println!(
-            ":: EHCI-HID: [{}] schedules armed: framelist={:#x} asyncQH={:#x} ASE=1 (PSE deferred to first HID endpoint) ::",
+            ":: EHCI-HID: [{}] schedules armed: framelist={:#x} asyncQH={:#x} (ASE per-transfer, PSE deferred to first HID endpoint) ::",
             self.idx,
             self.frame_list,
             qh as u64
         );
+    }
+
+    /// Enable/disable the async schedule with a bounded wait for USBSTS.ASS (bit 15) to agree
+    /// with USBCMD.ASE (EHCI 4.8: software must not modify schedule state while the two
+    /// disagree). Returns whether the status bit reached the requested state.
+    unsafe fn set_async_schedule(&mut self, on: bool) -> bool {
+        let cmd = mmio_read32(self.op + OP_USBCMD).unwrap_or(0);
+        let want = if on { cmd | CMD_ASE } else { cmd & !CMD_ASE };
+        let _ = mmio_write32(self.op + OP_USBCMD, want);
+        wait_bounded(|| {
+            let sts = mmio_read32(self.op + OP_USBSTS).unwrap_or(0);
+            ((sts & STS_ASS) != 0) == on
+        })
     }
 
     /// One synchronous EP0 control transfer through the shared QH (the EHCI analogue of xHCI's
@@ -236,11 +255,13 @@ impl Controller {
         };
         write_qtd(setup, first_after_setup, QTD_PID_SETUP, 8, self.setup_buf as u64);
 
-        // Prime the QH overlay and let the async traversal pick it up (EHCI has no doorbell:
-        // the controller polls the list while ASE=1).
+        // Prime the QH overlay, THEN enable the async schedule for this transfer (the schedule
+        // must transition empty→non-empty while enabled-off, or real silicon's empty-schedule
+        // park never sees the work — see init_schedules). Disabled again after completion.
         (*qh).overlay[1] = PTR_TERMINATE;
         core::ptr::write_volatile(&mut (*qh).overlay[2], 0);
         core::ptr::write_volatile(&mut (*qh).overlay[0], setup as u32);
+        let ass_on = self.set_async_schedule(true);
 
         // Bounded completion wait on the terminating qTD, failing fast on any halted qTD.
         let done = wait_bounded(|| {
@@ -251,13 +272,19 @@ impl Controller {
             (core::ptr::read_volatile(&(*setup).token) & QTD_HALTED != 0)
                 || (w_length > 0 && core::ptr::read_volatile(&(*data).token) & QTD_HALTED != 0)
         });
-        // Quiesce the QH again whatever happened.
+        // Quiesce: schedule off (bounded ASS handshake), then park the overlay.
+        let ass_off = self.set_async_schedule(false);
         core::ptr::write_volatile(&mut (*qh).overlay[0], PTR_TERMINATE);
 
         if !done {
             serial_println!(
-                ":: EHCI-HID: [{}] STOP-NOTE EP0 timeout addr={} req={:#04x}/{:#04x} (setup token {:#010x}) — not forced ::",
-                self.idx, t.addr, bm_req, b_req, core::ptr::read_volatile(&(*setup).token)
+                ":: EHCI-HID: [{}] STOP-NOTE EP0 timeout addr={} req={:#04x}/{:#04x} setup-token={:#010x} USBCMD={:#010x} USBSTS={:#010x} ASYNCLISTADDR={:#010x} ASS-handshakes on={} off={} — not forced ::",
+                self.idx, t.addr, bm_req, b_req,
+                core::ptr::read_volatile(&(*setup).token),
+                mmio_read32(self.op + OP_USBCMD).unwrap_or(0),
+                mmio_read32(self.op + OP_USBSTS).unwrap_or(0),
+                mmio_read32(self.op + OP_ASYNCLISTADDR).unwrap_or(0),
+                ass_on, ass_off
             );
             return Err("timeout");
         }
