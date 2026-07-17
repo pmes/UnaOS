@@ -139,6 +139,14 @@ _feats=""
 # The `xcarve_relink` feature implies `tegra`. Default OFF => the pad vanishes, byte-identical to
 # baseline.
 [ -n "${UNAOS_XCARVE_RELINK:-}" ] && _feats="${_feats}xcarve_relink,tegra,"
+# ORIN-NET-1: UNAOS_PCIEPROBE=1 arms the read-only PCIe root-complex + NIC recon census
+# (arch/aarch64/pcie_probe.rs). Standalone feature (does NOT imply tegra, mirroring smpprobe) so the
+# census runs on BOTH the metal tegra path (combine with UNAOS_TEGRA=1) and the QEMU virt GICv3 path
+# (UNAOS_GICV3=1 test-arm — witnesses the graceful skip: virt has a generic ecam, no Tegra234 RC).
+# Read-only: DTB census + a poison-rejecting, already-mapped-only config-space liveness read; no
+# fabric/config/BAR/power write, no new mapping. Default OFF => module + call sites vanish, every
+# image byte-identical to baseline. See arch_arm64.md §ORIN-NET-1.
+[ -n "${UNAOS_PCIEPROBE:-}" ] && _feats="${_feats}pcieprobe,"
 if [ -n "$_feats" ]; then
     KERNEL_FEATURES="--features ${_feats%,}"
     echo -e "${COLOR_YELLOW}⚡ kernel features: ${_feats%,}${COLOR_RESET}"
