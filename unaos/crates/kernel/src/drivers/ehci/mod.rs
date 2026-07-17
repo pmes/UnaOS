@@ -73,7 +73,7 @@ const PORT_RW1C: u32 = (1 << 1) | (1 << 3) | (1 << 5);
 /// async-advance). Ack-only — USBINTR is never written (polling model).
 const STS_RW1C: u32 = 0x3F;
 /// USBSTS Async Schedule Status (read-only; tracks USBCMD.ASE with a lag).
-const STS_ASS: u32 = 1 << 15;
+const STS_PSS: u32 = 1 << 14;
 const STS_HCHALTED: u32 = 1 << 12;
 const STS_HSE: u32 = 1 << 4; // Host System Error (DMA master/target abort) — halts the HC
 
@@ -269,16 +269,15 @@ impl Controller {
         true
     }
 
-    /// Enable/disable the async schedule with a bounded wait for USBSTS.ASS (bit 15) to agree
-    /// with USBCMD.ASE (EHCI 4.8: software must not modify schedule state while the two
-    /// disagree). Returns whether the status bit reached the requested state.
-    unsafe fn set_async_schedule(&mut self, on: bool) -> bool {
+    /// Enable/disable the periodic schedule with a bounded wait for USBSTS.PSS (bit 14) to
+    /// agree with USBCMD.PSE (EHCI 4.8 discipline). Returns whether the status bit followed.
+    unsafe fn set_periodic_schedule(&mut self, on: bool) -> bool {
         let cmd = mmio_read32(self.op + OP_USBCMD).unwrap_or(0);
-        let want = if on { cmd | CMD_ASE } else { cmd & !CMD_ASE };
+        let want = if on { cmd | CMD_PSE } else { cmd & !CMD_PSE };
         let _ = mmio_write32(self.op + OP_USBCMD, want);
         wait_bounded(|| {
             let sts = mmio_read32(self.op + OP_USBSTS).unwrap_or(0);
-            ((sts & STS_ASS) != 0) == on
+            ((sts & STS_PSS) != 0) == on
         })
     }
 
@@ -298,8 +297,16 @@ impl Controller {
         // Retarget the shared QH. C-bit (control-endpoint) only for FS/LS targets — that is
         // what makes the controller drive the SSPLIT/CSPLIT control dance through the TT named
         // by hub_addr/hub_port on Topology A; both fields stay 0 on Topology B.
+        // PROBE-8 / metal finding: EP0 control transfers run on the PERIODIC engine. The async
+        // engine on this Panther Point master-aborts its very first schedule fetch in every
+        // configuration tried (heap + static DMA, active-H-QH + Linux-shaped dummy-head ring,
+        // post-HCRESET, VT-d off, BME on — probes 1-7), while the periodic engine DMAs the same
+        // pool cleanly. EHCI QHs are engine-agnostic (4.10) — a control QH executes identically
+        // from the frame list; only the service cadence differs (S-mask-paced instead of
+        // continuous). HS targets get S-mask 0xFF (every µframe → ~1 ms per control transfer);
+        // FS/LS-behind-TT keep the split masks (SSPLIT µframe 0, CSPLITs 2-4). The async ring
+        // stays programmed-but-disabled (ASE is never set).
         let qh = self.async_qh;
-        // Work QH only — never the H-bit head. RL=4 (NAK reload) matches Linux's async QHs.
         let mut chars = (t.addr as u32)
             | t.eps
             | QH_DTC
@@ -309,7 +316,13 @@ impl Controller {
             chars |= QH_CTL_EP;
         }
         (*qh).ep_chars = chars;
+        let masks = if t.eps == QH_EPS_HIGH {
+            0xFF << QH_SMASK_SHIFT
+        } else {
+            (0x01 << QH_SMASK_SHIFT) | (0x1C << QH_CMASK_SHIFT)
+        };
         (*qh).ep_caps = QH_MULT1
+            | masks
             | ((t.hub_addr as u32) << QH_HUBADDR_SHIFT)
             | ((t.hub_port as u32) << QH_PORT_SHIFT);
 
@@ -338,13 +351,17 @@ impl Controller {
         };
         write_qtd(setup, first_after_setup, QTD_PID_SETUP, 8, self.setup_buf_phys);
 
-        // Prime the QH overlay, THEN enable the async schedule for this transfer (the schedule
-        // must transition empty→non-empty while enabled-off, or real silicon's empty-schedule
-        // park never sees the work — see init_schedules). Disabled again after completion.
+        // Prime the QH overlay, splice the work QH in front of the frame-list chain (any armed
+        // interrupt QHs stay serviced behind it), then run the periodic engine for the transfer.
         (*qh).overlay[1] = PTR_TERMINATE;
         core::ptr::write_volatile(&mut (*qh).overlay[2], 0);
         core::ptr::write_volatile(&mut (*qh).overlay[0], self.qtd_setup_phys as u32);
-        let ass_on = self.set_async_schedule(true);
+        let old_head = core::ptr::read_volatile(self.frame_list);
+        (*qh).horiz = old_head;
+        for i in 0..1024 {
+            core::ptr::write_volatile(self.frame_list.add(i), (self.qh_phys as u32) | PTR_TYPE_QH);
+        }
+        let pss_on = self.set_periodic_schedule(true);
 
         // Bounded completion wait on the terminating qTD, failing fast on any halted qTD.
         let done = wait_bounded(|| {
@@ -355,19 +372,27 @@ impl Controller {
             (core::ptr::read_volatile(&(*setup).token) & QTD_HALTED != 0)
                 || (w_length > 0 && core::ptr::read_volatile(&(*data).token) & QTD_HALTED != 0)
         });
-        // Quiesce: schedule off (bounded ASS handshake), then park the overlay.
-        let ass_off = self.set_async_schedule(false);
+        // Unsplice: restore the frame list, drop PSE only if no interrupt endpoint needs it,
+        // then park the overlay.
+        for i in 0..1024 {
+            core::ptr::write_volatile(self.frame_list.add(i), old_head);
+        }
+        let pss_off = if self.periodic_on {
+            true // interrupt endpoints own the periodic schedule — leave it running
+        } else {
+            self.set_periodic_schedule(false)
+        };
+        (*qh).horiz = PTR_TERMINATE;
         core::ptr::write_volatile(&mut (*qh).overlay[0], PTR_TERMINATE);
 
         if !done {
             serial_println!(
-                ":: EHCI-HID: [{}] STOP-NOTE EP0 timeout addr={} req={:#04x}/{:#04x} setup-token={:#010x} USBCMD={:#010x} USBSTS={:#010x} ASYNCLISTADDR={:#010x} ASS-handshakes on={} off={} — not forced ::",
+                ":: EHCI-HID: [{}] STOP-NOTE EP0 timeout addr={} req={:#04x}/{:#04x} setup-token={:#010x} USBCMD={:#010x} USBSTS={:#010x} PSS-handshakes on={} off={} — not forced ::",
                 self.idx, t.addr, bm_req, b_req,
                 core::ptr::read_volatile(&(*setup).token),
                 mmio_read32(self.op + OP_USBCMD).unwrap_or(0),
                 mmio_read32(self.op + OP_USBSTS).unwrap_or(0),
-                mmio_read32(self.op + OP_ASYNCLISTADDR).unwrap_or(0),
-                ass_on, ass_off
+                pss_on, pss_off
             );
             return Err("timeout");
         }
