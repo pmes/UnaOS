@@ -4400,6 +4400,19 @@ for stick-default duty. Standing rule until the wall is fixed: a stick DEFAULT m
 with a clean multi-boot metal record — QEMU-green + fresh layout is not sufficient for the
 default slot.
 
+**⚡ NVIDIA-facing reproducer (R20, 2026-07-17, Peter's direct ask):** NVIDIA asked, on the
+upstream forum report (topic 377113), for a way to reproduce this fault on their own bench.
+`tools/orin-xhci-repro/` is a standalone `#![no_std]` UEFI Rust app (own Cargo workspace, no
+UnaOS tooling required to build or run) that reads USBCMD/USBSTS/CONFIG/CRCR, confirms RS=1,
+then — gated behind an operator keypress and a loud warning banner — issues exactly one
+content-free echo write to CRCR (read the register, write the same value back), tracing the
+exact trigger this sitting named above: a CRCR write while RS=1. Builds clean for
+`aarch64-unknown-uefi`; QEMU cannot model the fault, so the actual reproduction is an
+attended metal run, not exercised in this repo's CI. Draft forum reply:
+`~/.claude/plans/unaos/review/unaos-orin-repro-REPLY.md` (Peter's call whether/when to post
+and whether to offer the reproducer source). Landing checklist:
+`~/.claude/plans/unaos/review/unaos-orin-repro-LANDING.md`.
+
 ### ORIN-SMP-8 — the tegrasmp RELINK (the layout-axis close-out; BUILD-ONLY, `UNAOS_TEGRASMP` + `UNAOS_XCARVE_RELINK`)
 
 ORIN-SMP-7's attended sitting exonerated the wake POSITION axis end-to-end (legs 24/25 both put 5/5
