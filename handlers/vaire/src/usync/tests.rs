@@ -260,11 +260,23 @@ fn snapshot_cap_is_refused_not_auto_dropped() {
     assert_eq!(fs.snapshot_index().unwrap().len(), unafs::SNAPSHOT_CAP);
     drop(fs);
 
-    // The next sync must REFUSE (naming the drop verb), not silently drop.
+    // Change a live file so a run would have something to write, then take the
+    // image's before-state fingerprint: a refused run must be a TRUE NO-OP.
+    fs::write(live.path().join("a.txt"), b"changed-after-cap\n").unwrap();
+    let before_bytes = fs::read(&img).unwrap();
+
+    // The next sync must REFUSE (naming the drop verb), not silently drop —
+    // and must refuse BEFORE writing anything (cap checked up front).
     let err = usync(&m, &img, true, 32).unwrap_err();
     let msg = format!("{err:#}");
     assert!(msg.contains("snapshot index full"), "clear cap message: {msg}");
     assert!(msg.contains("snapdrop"), "names the drop verb: {msg}");
+    assert_eq!(
+        fs::read(&img).unwrap(),
+        before_bytes,
+        "a cap-refused run must leave the image byte-identical (no writes, \
+         no commits, no vaire.run stamp)"
+    );
 }
 
 // -- the benchmark ledger line is well-formed -------------------------------
@@ -281,6 +293,7 @@ fn ledger_line_carries_phase_and_commit_figures() {
     let line = r.ledger_line();
     assert!(line.contains("written=3"));
     assert!(line.contains("scan="));
+    assert!(line.contains("lookup="));
     assert!(line.contains("snapshot="));
     assert!(line.contains("blocks_written="));
     assert!(r.commit_stats.snapshots_created >= 1);

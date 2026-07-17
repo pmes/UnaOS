@@ -67,6 +67,12 @@ const CREATOR: &str = "vaire";
 pub struct PhaseLedger {
     /// Walking the live penumbra tree (dir reads, metadata, classification).
     pub scan: AtomicU64,
+    /// IMAGE-side lookups: the per-file incremental check (`ls`/attr reads
+    /// against the stored object) plus directory-chain resolution
+    /// (`ensure_dir` — which on a cold run also folds in the fresh `mkdir`s
+    /// it performs on first touch of each directory). On a warm run this is
+    /// almost pure read-path lookup cost — exactly the batched-sync evidence.
+    pub lookup: AtomicU64,
     /// Host file reads ([`std::fs::read`] of each woven file).
     pub read: AtomicU64,
     /// `write_data` into the image (the CoW data path).
@@ -155,7 +161,7 @@ impl SyncReport {
         let l = &self.ledger;
         format!(
             "written={} skipped={} excluded={} dirs={} bytes={} | \
-             scan={:.3}ms read={:.3}ms write={:.3}ms attrs={:.3}ms commit={:.3}ms snapshot={:.3}ms | \
+             scan={:.3}ms lookup={:.3}ms read={:.3}ms write={:.3}ms attrs={:.3}ms commit={:.3}ms snapshot={:.3}ms | \
              commits={} blocks_written={} snapshots_created={}",
             self.files_written,
             self.files_skipped,
@@ -163,6 +169,7 @@ impl SyncReport {
             self.dirs_created,
             self.bytes_written,
             ms(PhaseLedger::ns(&l.scan)),
+            ms(PhaseLedger::ns(&l.lookup)),
             ms(PhaseLedger::ns(&l.read)),
             ms(PhaseLedger::ns(&l.write)),
             ms(PhaseLedger::ns(&l.attrs)),
@@ -306,6 +313,23 @@ pub fn usync(m: &DevManifest, image: &Path, apply: bool, size_mb: u64) -> Result
     let device = FileDevice::open(image).context("open image device")?;
     let mut fs = FileSystem::mount(device).map_err(|e| anyhow::anyhow!("mount image: {e:?}"))?;
 
+    // Honor the snapshot cap UP FRONT, before any write: a completed sync must
+    // end in a retained root, so if the index is already full the whole run is
+    // refused as a true no-op on the image (nothing written, nothing committed,
+    // no half-synced tree stamped without its snapshot). Never auto-drops.
+    let index = fs
+        .snapshot_index()
+        .map_err(|e| anyhow::anyhow!("read snapshot index: {e:?}"))?;
+    if index.len() >= SNAPSHOT_CAP {
+        bail!(
+            "snapshot index full ({}/{} retained roots): drop one first with \
+             `vaire usnapdrop`/`unafs snapdrop` — usync never auto-drops a retained root \
+             (nothing was written)",
+            index.len(),
+            SNAPSHOT_CAP
+        );
+    }
+
     // Batched-commit regime: every op is CoW, but with autocommit OFF we flip
     // the root ONCE per file (create+write+attrs in one transaction) instead of
     // once per sub-op. This is the natural measured unit for the benchmark and
@@ -324,23 +348,34 @@ pub fn usync(m: &DevManifest, image: &Path, apply: bool, size_mb: u64) -> Result
 
     for item in &items {
         let parent_rel = item.rel.parent().unwrap_or(Path::new(""));
-        let parent_id = ensure_dir(&mut fs, &mut dir_cache, parent_rel, &mut dirs_created)?;
+        let parent_id = {
+            let _p = ledger.probe(&ledger.lookup);
+            ensure_dir(&mut fs, &mut dir_cache, parent_rel, &mut dirs_created)?
+        };
         let name = file_name_str(&item.rel)?;
 
         // Incremental: an existing object with matching size+mtime attrs is
-        // skipped and counted (never silently).
-        if let Some(existing) = find_child(&mut fs, parent_id, name)? {
-            if attrs_match(&mut fs, existing, item)? {
-                files_skipped += 1;
-                rows.push(FileRow {
-                    rel: item.rel.clone(),
-                    bytes: item.size,
-                    disposition: FileDisposition::Skipped,
-                });
-                continue;
+        // skipped and counted (never silently). The ls/attr reads against the
+        // stored object are the `lookup` phase — the warm run's dominant cost.
+        let existing = {
+            let _p = ledger.probe(&ledger.lookup);
+            match find_child(&mut fs, parent_id, name)? {
+                Some(id) if attrs_match(&mut fs, id, item)? => {
+                    files_skipped += 1;
+                    rows.push(FileRow {
+                        rel: item.rel.clone(),
+                        bytes: item.size,
+                        disposition: FileDisposition::Skipped,
+                    });
+                    continue;
+                }
+                other => other,
             }
+        };
+        if existing.is_some() {
             // Changed: unlink the stale object so the rewrite is exact (the
             // grow-only write_data cannot shrink a file in place).
+            let _p = ledger.probe(&ledger.write);
             fs.unlink(parent_id, name)
                 .map_err(|e| anyhow::anyhow!("unlink stale {}: {e:?}", item.rel.display()))?;
         }
@@ -350,14 +385,17 @@ pub fn usync(m: &DevManifest, image: &Path, apply: bool, size_mb: u64) -> Result
             std::fs::read(&item.abs)
                 .with_context(|| format!("read live file {}", item.abs.display()))?
         };
-        let fid = fs
-            .create_file(parent_id, name.to_string())
-            .map_err(|e| anyhow::anyhow!("create_file {}: {e:?}", item.rel.display()))?;
-        {
+        let fid = {
+            // create_file (inode + parent-dir rewrite) and write_data are both
+            // image writes: one `write` phase.
             let _p = ledger.probe(&ledger.write);
+            let fid = fs
+                .create_file(parent_id, name.to_string())
+                .map_err(|e| anyhow::anyhow!("create_file {}: {e:?}", item.rel.display()))?;
             fs.write_data(fid, 0, &data)
                 .map_err(|e| anyhow::anyhow!("write_data {}: {e:?}", item.rel.display()))?;
-        }
+            fid
+        };
         {
             let _p = ledger.probe(&ledger.attrs);
             set_file_attrs(&mut fs, fid, item, &run_stamp)?;
@@ -377,10 +415,12 @@ pub fn usync(m: &DevManifest, image: &Path, apply: bool, size_mb: u64) -> Result
     }
 
     // Unit-root attrs + this run's summary (accrues per run in the image).
+    // The ledger line itself is built AFTER the snapshot probe folds, so both
+    // the persisted attr and the CLI block include the snapshot phase; the one
+    // thing the persisted line cannot include is the commit that persists it
+    // (inherent — the report's commit_stats ARE refreshed after that commit,
+    // so the CLI figures cover every root flip of the run).
     let summary_key = format!("vaire.summary.{run_stamp}");
-    // Build a provisional summary now; the ledger's snapshot phase is folded
-    // after, so the persisted line's snapshot figure is this run's writes only
-    // (the snapshot cost itself is reported live in the CLI block).
     for root in &m.penumbra {
         let root_name = root
             .file_name()
@@ -398,18 +438,8 @@ pub fn usync(m: &DevManifest, image: &Path, apply: bool, size_mb: u64) -> Result
         fs.commit().map_err(|e| anyhow::anyhow!("commit unit attrs: {e:?}"))?;
     }
 
-    // The retained root — one snapshot per completed sync. Honor the cap.
-    let index = fs
-        .snapshot_index()
-        .map_err(|e| anyhow::anyhow!("read snapshot index: {e:?}"))?;
-    if index.len() >= SNAPSHOT_CAP {
-        bail!(
-            "snapshot index full ({}/{} retained roots): drop one first with \
-             `vaire usnapdrop`/`unafs snapdrop` — usync never auto-drops a retained root",
-            index.len(),
-            SNAPSHOT_CAP
-        );
-    }
+    // The retained root — one snapshot per completed sync (cap already
+    // checked, up front, before any write).
     let generation = {
         let _p = ledger.probe(&ledger.snapshot);
         fs.snapshot_create(run_stamp.clone(), CREATOR.to_string(), now_secs())
@@ -418,7 +448,7 @@ pub fn usync(m: &DevManifest, image: &Path, apply: bool, size_mb: u64) -> Result
 
     // Persist this run's ledger line as a typed attr on each unit root.
     let commit_stats = fs.commit_stats();
-    let report = SyncReport {
+    let mut report = SyncReport {
         image: image.to_path_buf(),
         applied: true,
         formatted,
@@ -440,11 +470,18 @@ pub fn usync(m: &DevManifest, image: &Path, apply: bool, size_mb: u64) -> Result
             .and_then(|s| s.to_str())
             .unwrap_or("penumbra");
         if let Some(&unit_id) = dir_cache.get(Path::new(root_name)) {
+            let _p = report.ledger.probe(&report.ledger.attrs);
             set_str(&mut fs, unit_id, &summary_key, &line)?;
         }
     }
-    fs.commit()
-        .map_err(|e| anyhow::anyhow!("commit run summary: {e:?}"))?;
+    {
+        let _p = report.ledger.probe(&report.ledger.commit);
+        fs.commit()
+            .map_err(|e| anyhow::anyhow!("commit run summary: {e:?}"))?;
+    }
+    // Refresh so the CLI's figures cover the summary commit too (the persisted
+    // attr line inherently predates it — see the comment above).
+    report.commit_stats = fs.commit_stats();
 
     Ok(report)
 }
