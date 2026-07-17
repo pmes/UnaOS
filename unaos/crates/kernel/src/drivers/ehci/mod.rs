@@ -110,6 +110,13 @@ struct IntEp {
     layout: Option<ReportLayout>,
     reports: u32,
     dead: bool,
+    /// EHCI-5 (vendor multitouch): last decoded first-finger absolute position and whether a
+    /// finger is currently down. Relative motion is `cur - last` between consecutive touching
+    /// reports; finger-DOWN seeds these without emitting (no jump from stale coords); finger-UP
+    /// clears `touching`. Unused (0/false) for keyboard / boot-mouse / standard-pointer endpoints.
+    last_x: i32,
+    last_y: i32,
+    touching: bool,
 }
 
 /// EHCI-4 M2 — the minimal field map a HID **pointer** report exposes, extracted by
@@ -1119,6 +1126,9 @@ impl Controller {
             layout,
             reports: 0,
             dead: false,
+            last_x: 0,
+            last_y: 0,
+            touching: false,
         });
     }
 
@@ -1167,12 +1177,39 @@ impl Controller {
                 e.reports = e.reports.wrapping_add(1);
                 if let Some(l) = e.layout {
                     if l.vendor_mt {
-                        // EHCI-5 M1 vendor-multitouch path. The 0x44 descriptor is opaque, so DUMP
-                        // the raw report body verbatim (first + every 32nd) — the sitting's
+                        // EHCI-5 vendor-multitouch path. The 0x44 descriptor is opaque, so KEEP
+                        // dumping the raw report body verbatim (first + every 32nd) — the sitting's
                         // reverse-engineering evidence that confirms/corrects the finger offsets.
-                        // NO pointer event yet (M2 adds the first-finger decode).
                         if e.reports == 1 || e.reports % 32 == 0 {
                             dump_vendor_report(idx, e.reports, report);
+                        }
+                        // M2: decode the FIRST finger only (gestures OUT OF SCOPE) into RELATIVE
+                        // motion — a single finger drives the pointer. abs_x/abs_y are signed le16
+                        // at the HYPOTHESIS offsets; presence is the touch field. Finger-DOWN
+                        // (false->true) seeds last_x/last_y WITHOUT emitting (no jump from stale
+                        // coords); while touching, emit push_event(Mouse{cur-last}) then update
+                        // last; finger-UP clears touching. A short/malformed report decodes to None
+                        // (bounds-checked) => no event, state untouched.
+                        if let Some((present, cur_x, cur_y)) =
+                            decode_vendor_first_finger(report, l.report_id)
+                        {
+                            if present {
+                                if e.touching {
+                                    let (dx, dy) = (cur_x - e.last_x, cur_y - e.last_y);
+                                    if dx != 0 || dy != 0 {
+                                        crate::pal::push_event(crate::pal::Event::Mouse {
+                                            x: dx,
+                                            y: dy,
+                                        });
+                                    }
+                                } else {
+                                    e.touching = true; // finger DOWN: seed below, no emit
+                                }
+                                e.last_x = cur_x;
+                                e.last_y = cur_y;
+                            } else {
+                                e.touching = false; // finger UP
+                            }
                         }
                     } else {
                         // M2 report-pointer path: decode X/Y/buttons from the parsed field map.
@@ -1514,6 +1551,36 @@ fn decode_report_pointer(report: &[u8], l: &ReportLayout) -> (i32, i32, u8, u8) 
     (x, y, buttons, fingers)
 }
 
+/// Read a little-endian `u16` at BYTE offset `off`, or `None` if the two bytes are not fully
+/// present — a short/malformed report can never read out of bounds.
+fn read_le16(data: &[u8], off: usize) -> Option<u16> {
+    let b = data.get(off..off + 2)?;
+    Some(u16::from_le_bytes([b[0], b[1]]))
+}
+
+/// EHCI-5: decode the FIRST finger of an Apple vendor-multitouch (`0x44`) report at the HYPOTHESIS
+/// offsets. Returns `(present, abs_x, abs_y)` where `present` is the touch field being non-zero and
+/// abs_x/abs_y are the signed le16 finger coordinates. Returns `None` if the report is too short to
+/// reach the finger record (every read is bounds-checked — a short/malformed 0x44 report never
+/// reads out of bounds or emits garbage motion). Only the first finger is decoded; further finger
+/// records are IGNORED (multitouch gestures are out of scope). The leading `report_id` prefix byte
+/// is stripped first, mirroring `decode_report_pointer`. The offset VALUES are a metal-verified
+/// hypothesis (bcm5974 TYPE2 lead); this function's MECHANICS are exercised by the self-test.
+fn decode_vendor_first_finger(report: &[u8], report_id: u8) -> Option<(bool, i32, i32)> {
+    let body: &[u8] = if report_id != 0 {
+        if report.is_empty() || report[0] != report_id {
+            return None;
+        }
+        &report[1..]
+    } else {
+        report
+    };
+    let present = read_le16(body, VMT_FINGER_TOUCH)? != 0;
+    let abs_x = read_le16(body, VMT_FINGER_ABS_X)? as i16 as i32;
+    let abs_y = read_le16(body, VMT_FINGER_ABS_Y)? as i16 as i32;
+    Some((present, abs_x, abs_y))
+}
+
 /// Verbatim (bounded) hex dump of a report descriptor — the doc's 0262 capture slot. Prints the
 /// first up-to-48 bytes on one serial line (enough to reconstruct the pointer field map); the
 /// declared length is stated so a truncated read is obvious.
@@ -1584,14 +1651,16 @@ unsafe fn parser_selftest() {
 }
 
 /// EHCI-5 self-test (runs once at driver init). The ONLY QEMU-provable witness for the vendor
-/// path — QEMU has no Apple trackpad, so a synthetic Apple-style vendor descriptor stands in.
-/// Asserts RECOGNITION (M1): a vendor-page (0xFF00) opaque variable Input with a Report ID and
-/// non-trivial size parses to a `vendor_mt` layout (NOT `None`, NOT the standard X/Y path). The
-/// OFFSET VALUES the layout implies remain a metal-verified hypothesis; this proves only that the
-/// signature is recognized.
+/// path — QEMU has no Apple trackpad, so synthetic Apple-style data stands in. Asserts both
+/// milestones: RECOGNITION (M1) — a vendor-page (0xFF00) opaque variable Input with a Report ID
+/// and non-trivial size parses to a `vendor_mt` layout (NOT `None`, NOT the standard X/Y path);
+/// and DECODE (M2) — two synthetic 0x44 reports (finger A -> B, one negative coordinate) decode
+/// to the expected first-finger positions and relative delta, a finger-up report reads absent, and
+/// a too-short report decodes to `None` (bounds-safe). This proves the decode MECHANICS; the OFFSET
+/// VALUES the layout/decode use remain a metal-verified hypothesis (`VMT_FINGER_*`).
 unsafe fn vendor_multitouch_selftest() {
-    // Usage Page(Vendor 0xFF00), Usage(0x01), Report ID(0x44), Report Size(8), Report Count(64),
-    // Input(Data,Var,Abs) — the Apple vendor-multitouch signature (512-bit opaque blob, no X/Y).
+    // M1 recognition. Usage Page(Vendor 0xFF00), Usage(0x01), Report ID(0x44), Report Size(8),
+    // Report Count(64), Input(Data,Var,Abs) — the signature (512-bit opaque blob, no X/Y).
     let vendor_desc: [u8; 13] = [
         0x06, 0x00, 0xFF, 0x09, 0x01, 0x85, 0x44, 0x75, 0x08, 0x95, 0x40, 0x81, 0x02,
     ];
@@ -1600,9 +1669,44 @@ unsafe fn vendor_multitouch_selftest() {
     let vendor_ok = recognized
         .map(|l| l.vendor_mt && !l.has_xy && l.report_id == 0x44)
         .unwrap_or(false);
+
+    // M2 decode. Two synthetic 0x44 reports built AT the hypothesis offsets (so the test tracks
+    // the same `VMT_FINGER_*` constants the decoder uses). Finger A -> B, with B's abs_x negative
+    // to exercise signed le16. Body = report[1..]; write at `1 + VMT_FINGER_*`.
+    let mut ra = [0u8; 49];
+    ra[0] = 0x44;
+    ra[1 + VMT_FINGER_ABS_X..1 + VMT_FINGER_ABS_X + 2].copy_from_slice(&100i16.to_le_bytes());
+    ra[1 + VMT_FINGER_ABS_Y..1 + VMT_FINGER_ABS_Y + 2].copy_from_slice(&200i16.to_le_bytes());
+    ra[1 + VMT_FINGER_TOUCH..1 + VMT_FINGER_TOUCH + 2].copy_from_slice(&10u16.to_le_bytes());
+    let mut rb = [0u8; 49];
+    rb[0] = 0x44;
+    rb[1 + VMT_FINGER_ABS_X..1 + VMT_FINGER_ABS_X + 2].copy_from_slice(&(-50i16).to_le_bytes());
+    rb[1 + VMT_FINGER_ABS_Y..1 + VMT_FINGER_ABS_Y + 2].copy_from_slice(&6000i16.to_le_bytes());
+    rb[1 + VMT_FINGER_TOUCH..1 + VMT_FINGER_TOUCH + 2].copy_from_slice(&10u16.to_le_bytes());
+    // Finger-UP: B's coords with the touch field cleared → present must read false.
+    let mut ru = rb;
+    ru[1 + VMT_FINGER_TOUCH..1 + VMT_FINGER_TOUCH + 2].copy_from_slice(&0u16.to_le_bytes());
+    // Too-short/malformed report: must decode to None (bounds-safe, never OOB).
+    let short = [0x44u8; 10];
+
+    let da = decode_vendor_first_finger(&ra, 0x44);
+    let db = decode_vendor_first_finger(&rb, 0x44);
+    let du = decode_vendor_first_finger(&ru, 0x44);
+    let ds = decode_vendor_first_finger(&short, 0x44);
+    let (dx, dy) = match (da, db) {
+        (Some((_, ax, ay)), Some((_, bx, by))) => (bx - ax, by - ay),
+        _ => (0, 0),
+    };
+    let decode_ok = da == Some((true, 100, 200))
+        && db == Some((true, -50, 6000))
+        && matches!(du, Some((false, _, _)))
+        && ds.is_none()
+        && dx == -150
+        && dy == 5800;
+
     serial_println!(
-        ":: EHCI-HID: vendor-multitouch self-test: recognized={} (id={:#04x}, min-bits={}) == witness ::",
-        vendor_ok, id, VMT_MIN_VENDOR_BITS
+        ":: EHCI-HID: vendor-multitouch self-test: recognized={} (id={:#04x}, min-bits={}), first-finger decode dx={} dy={} ok={} == witness ::",
+        vendor_ok, id, VMT_MIN_VENDOR_BITS, dx, dy, decode_ok
     );
 }
 

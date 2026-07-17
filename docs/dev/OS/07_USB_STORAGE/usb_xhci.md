@@ -986,6 +986,86 @@ buffer is behaviour-neutral for the ≤ 64 B enumeration reads.
 
 ---
 
+### 10c. EHCI-5 — the internal trackpad is Apple vendor multitouch (Report ID 0x44)
+
+The 2026-07-17 six-knob rMBP sitting typed on the internal **keyboard** (§10) but the internal
+**trackpad** moved no cursor: its interface 1 is not a standard pointer. It is Apple
+**vendor-defined multitouch** — **Report ID `0x44`**, usage page **`0xFF00`**, a 27-byte report
+descriptor with **no** Generic Desktop X/Y field. The §10b report-descriptor parser correctly
+classified it "not a cursor device; skipped" (the honest-skip discipline): the descriptor gives the
+report's total size, not which bytes are a finger's X/Y, so there is nothing for the standard X/Y
+gate to find. EHCI-5 closes this **decoder gap** so a **single finger drives the pointer** (relative
+motion). Multitouch gestures are explicitly **out of scope** — only finger[0] is decoded.
+
+**M1 — recognize + capture.** After the standard X/Y gate finds nothing, `parse_report_descriptor`
+runs a vendor-multitouch recognition pass: an opaque **variable** Input on the vendor page
+(`UP_VENDOR = 0xFF00`) carrying a Report ID and a non-trivial bit size (`≥ VMT_MIN_VENDOR_BITS`,
+64 bits) yields `ReportLayout{ vendor_mt: true, report_id, .. }` instead of `None`. Because this
+branch runs **only** when `has_xy` is false, a real Generic Desktop pointer is never diverted onto
+it (proven in QEMU: `UNAOS_EHCITABLET=1` still arms the `usb-tablet` with the unchanged layout
+`X@8/16b Y@24/16b`). `configure_report_pointer` then **arms** the endpoint (rather than skipping)
+with a distinct witness naming the hypothesis offsets, and `service` **dumps the raw `0x44` report
+body verbatim** (`dump_vendor_report`, first + every 32nd report) — the reverse-engineering evidence
+the sitting reads to confirm or correct the finger layout.
+
+**M2 — decode → relative motion (single finger).** For a `vendor_mt` endpoint, `service` decodes the
+**first finger only** via `decode_vendor_first_finger`: strip the `0x44` Report ID prefix, then read
+`abs_x` / `abs_y` as **signed le16** at the hypothesis byte offsets and read presence from the touch
+field. Finger-**DOWN** (false→true) seeds `last_x/last_y` **without emitting** (so the cursor never
+jumps from stale coordinates); while touching, it emits
+`pal::Event::Mouse { x: cur_x - last_x, y: cur_y - last_y }` — the **same** relative pointer event
+the boot-mouse and xHCI paths deliver — then updates `last`; finger-**UP** clears `touching`. Every
+field read is bounds-checked (`read_le16` returns `None` past the slice), so a short or malformed
+`0x44` report never reads out of bounds or emits garbage motion; it simply yields no event and leaves
+the touch state untouched.
+
+**The hypothesis (KNOWN vs must-reverse-engineer).** **KNOWN at metal:** interface 1 is Apple vendor
+multitouch — Report ID `0x44`, usage page `0xFF00`, 27-byte descriptor, no standard X/Y. **LEAD (the
+public bcm5974 TYPE2 finger record — a hint, not a fact):** le16 fields `abs_x@+2, abs_y@+4 (signed),
+touch_major@+16, pressure@+24` inside a finger record that a ~30-byte header precedes. The offsets in
+code (`VMT_HDR_LEN = 30`, `VMT_FINGER_ABS_X/ABS_Y/TOUCH`) are written as clearly-labelled
+`HYPOTHESIS` constants so a sitting adjusts one line each. **The caveat that matters:** bcm5974 reads
+a **separate raw** USB interface with **no** Report ID; this is a HID interface with a `0x44` prefix
+byte (stripped first, as `decode_report_pointer` does). So the header size, the touch/contact field
+location, and whether the finger record is byte-identical are **all unconfirmed** — the M1 raw-byte
+capture at the sitting is what confirms/corrects them.
+
+**QEMU is the whole gate here BY CONSTRUCTION.** QEMU has no Apple trackpad, so the vendor path never
+arms in QEMU and the offset VALUES cannot be QEMU-proven. The **only** QEMU-provable witness is the
+driver-init **self-test** (`vendor_multitouch_selftest`): it feeds a synthetic Apple-style vendor
+descriptor and asserts `vendor_mt` recognition (M1), then feeds two synthetic `0x44` reports (finger
+A → B, one negative coordinate) and asserts the first-finger decode + relative delta, a finger-up
+report reads absent, and a too-short report decodes to `None` (M2 mechanics + bounds safety). This
+proves the **mechanics**; correctness on the real `0262` is a **metal-verified hypothesis**, a later
+attended leg — **not** DONE for this arc.
+
+**Buffer/packet ceiling (metal-decided).** `IntSlot.buf` is `Buf64` and interrupt reads cap at
+`min(mps, 64)` — one ≤ 64 B packet. A full Apple MT report is ~430 B; header (~30 B) + finger[0]
+(through `pressure@+24`, i.e. body byte ~54) fits a single 64 B read, but only just. **First sitting
+check:** capture the raw `0x44` body and confirm `abs_x`/`abs_y` land within the 64 B read. If the
+metal capture shows them beyond 64 B, growing `Buf64` + the two `min(64)` caps is **in-lane**
+(`ehci/qh.rs` + `ehci/mod.rs`) but was deliberately **not** pre-sized in this QEMU-only arc.
+
+**Sitting-assertable trace list (EHCI-5, rMBP serial bridge armed).** On the default-ON build:
+1. `:: EHCI-HID: … vendor-multitouch self-test: recognized=true (id=0x44 …), first-finger decode
+   dx=-150 dy=5800 ok=true == witness ::` — fires **every boot** (QEMU included); the mechanics gate.
+2. `:: EHCI-HID: [i] M1 armed vendor-multitouch addr=N ep=INx … id=0x44 … (capture; hypothesis
+   X@.. Y@.. le16, touch@..) == witness ::` — the trackpad interface was recognized and armed.
+3. `:: EHCI-HID: [i] vendor-multitouch raw report #k (M B): <hex> == witness ::` — **capture these
+   bytes**: they are the evidence that confirms or corrects `VMT_HDR_LEN` / `VMT_FINGER_*`. Note the
+   report length `M` (is it truncated at the 64 B read?).
+4. **Move one finger** → the cursor moves via `pal::Event::Mouse` (relative). If it moves the wrong
+   direction or the wrong distance, adjust the `VMT_FINGER_*` offsets one line each from the raw
+   capture and re-run.
+
+**Gates (EHCI-5).** `./arroyo check` green both arches. `./arroyo test 40` MISSION SUCCESS with the
+vendor self-test witness present (`recognized=true`, decode `ok=true`) and keyboard/storage
+unregressed. `UNAOS_EHCITABLET=1 test 40`: the standard `usb-tablet` report-pointer still arms and
+decodes with the unchanged layout (vendor recognition does not perturb the standard path).
+`UNAOS_IRQSTORAGE=1 UNAOS_FATIMG=sf test 200` 0 FAIL / 0 PANIC with the EHCI-5 code compiled in.
+
+---
+
 ## See also
 - `unaos/crates/kernel/src/drivers/xhci/`, `drivers/block.rs` — the implementation.
 - `unaos/crates/kernel/src/drivers/ehci/`, `drivers/ehci_scout.rs` — the EHCI-3 HID driver (§10) and the EHCI-1/2 scout + shared wake (§9/§9a).
