@@ -4020,6 +4020,21 @@ what it thinks is a real structure, the top bit shoves it past the 40-bit PA spa
 carveout guard kills the box as an illegal address. Because the no-HCRST takeover (JB9g) preserves the
 firmware's live xHCI state, the eviction's `DISABLE_SLOT` drain rides one of these inherited pointers.
 
+> **⚠ SUPERSESSION (2026-07-16, R19 erratum research — the paragraph above is retained as the
+> sitting-era reading; do not cite it as current):** external Tegra234 RAS records refute the
+> bit-63-poisoned-pointer premise — **every published Tegra234 RAS ADDR carries the
+> `0x80000000_xxxxxxxx` prefix** (NVIDIA's own XUSB-carveout bug records, edk2-nvidia issue #111:
+> `0x8000000472f02820`/`0x8000000272f02820`; IOB records `0x8000000003270000`,
+> `0x8000000003f300c0`). Bit 63 is a **record-format artifact** (address-valid flag class), not a
+> pointer high half. Current reading: the fault ADDR low bits `0x2_7767_dc80/…dc40` sit in
+> carveout territory near the 8 GiB DRAM top, adjacent to the Orin NX XUSB-FW carveout in the
+> #111 record, and the signature pair (SNOC Illegal-address `0xd` + Carveout `0x3` + ACI
+> FillWrite `0x9`) is the platform's canonical "protected carveout was touched" record. The
+> in-DRAM census/scrub null results stand unchanged; the poisoned state remains
+> controller/firmware-internal. Full evidence + decode:
+> `~/.claude/plans/unaos/review/unaos-orin-erratum-DRAFT.md` §3–§4.5; reported upstream as
+> NVIDIA forum topic 377113.
+
 **M2 — the inherited-pointer instrumentation (`UNAOS_XCARVE=1`).** `jb2b_attach` gained a
 `#[cfg(feature = "xcarve")]` census, `jbxc_inherited_dump`, fired at attach entry BEFORE the takeover
 reprograms DCBAAP/CRCR/ERST and BEFORE JB9i — so it snapshots every pointer the firmware left, and
