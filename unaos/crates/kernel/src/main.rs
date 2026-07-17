@@ -143,6 +143,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     unaos_kernel::arch::memory::init(boot_info);
     serial_println!(":: KERNEL HEAP ALLOCATED ::");
 
+    // VPERF M3 EARLY-ATTACH (bench QoL, Peter's word 2026-07-16): usbdebug builds attach the
+    // fbcon cached-RAM shadow the moment the heap exists, so the ENTIRE boot log scrolls in
+    // cached RAM instead of read-modify-write uncached VRAM (the pre-shadow scroll dominated
+    // sitting wall-clock on the rMBP). GUI builds still never attach — the Screen back buffer
+    // owns the heap budget there — and the original post-heap attach site below remains as an
+    // idempotent no-op.
+    #[cfg(all(target_arch = "x86_64", feature = "usbdebug"))]
+    unaos_kernel::video::fbcon::attach_shadow();
+
     // 4a. aarch64 SMP (bare-metal Pi 4): release the 3 parked Cortex-A72 secondary cores from the
     // firmware spin-table. Each brings up its own MMU + exception vectors and (Milestone 1) reports
     // in over serial, then idles. The BSP continues below as the hardware-service core.
