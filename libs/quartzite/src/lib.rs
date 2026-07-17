@@ -23,6 +23,7 @@
 
 pub mod platforms;
 pub mod spline;
+pub mod surface;
 
 pub mod text;
 pub mod tetra;

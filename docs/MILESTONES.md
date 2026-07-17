@@ -10,6 +10,38 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-jetson track — 2026-07-17 (SURFACE-1 — the quartzite Surface primitive + the paper taste-gate) 🎨 parked at M1
+
+### SURFACE-1 — procedural paper surfaces + the sample board 🎨 host-native (quartzite; 6 new surface tests; zero kernel surface)
+
+**What it does.** Introduces the **Surface** primitive to quartzite: a material
+layer owned by a region, content composited on top. Ships the platform-agnostic
+core `quartzite::surface` — three procedural, parametric, tile-free paper
+algorithms (`grain` micro-relief emboss, `laid` wire+chain fibre lines, `blotch`
+low-frequency stock cloudiness), each bounded to a declared **contrast budget**
+(max relative luminance deviation) by construction — plus the macOS/AppKit
+`paper_board` view that composites a paper raster **under native text** (glyph
+antialiasing untouched, Retina scale-2 correct) and a runnable sample-board host
+(`cargo run -p quartzite --example paper_board`): a grid of real text views, rows
+= the three algorithms, columns = control (no texture) · subtle ±1.0 % · medium
+±2.0 % · strong ±3.5 %, each cell labelled with its exact parameters,
+deterministic (no shimmer). **The aesthetic is not chosen here** — the arc parks
+at M1 for Peter's attended taste-gate (his eyes on the real pixels); no surface
+is folded into the API default and adoption stays OFF everywhere.
+
+**How it was tested.** `cargo test -p quartzite` → **10 passed** (6 new:
+determinism of field + raster, field bounded to [-1,1], seed decorrelation,
+texture-present, and the contrast budget **measured** from the rendered raster
+vs the declared amplitude). The example host launches and renders without panic
+on macOS 26.5.2 (visual judgment is Peter's, by design). Mac-native consumers
+(`facet`/`lumen`/`pulse`/`phonolite`, all `default-features = false`) `cargo
+check` clean. `./arroyo check` ✅ x86_64 / ✅ aarch64 (zero kernel surface). Full
+contract in `docs/dev/USERLAND/SURFACE.md`; landing report
+`review/unaos-surface1-LANDING.md`. **Taste-gate pending; M2 (folding the pick
+into `Surface::Paper`) deferred to a resumed run.**
+
+---
+
 ## hw-jetson track — 2026-07-17 (VAIRE-3 — vaire adopts the one-flip batch path) 🔬
 
 ### VAIRE-3 — `usync` on `create_files_batch`: the native sync in one root flip 🔬 host-native (33→36 vaire tests, fsck-clean after-image), zero kernel surface
