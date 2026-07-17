@@ -10624,9 +10624,11 @@ zdns_have_list:
     lea rsi, [rip + zdns_blockedquery]
     mov rcx, [rip + zdns_blockedquerylen]
     call zdns_parse_and_match                 // rax: 0 ok/not-blocked, 1 blocked, 2 malformed
+    inc qword ptr [r14 + 0xD10]               // metric: queries seen++ (ADS.EXAMPLE)
     cmp rax, 1
     jne zdns_st2                              // not blocked (unexpected) -> skip bit2/3
     or r12, 4                                 // bit2: ADS.EXAMPLE matched the blocklist
+    inc qword ptr [r14 + 0xD18]               // metric: blocked (sinkholed)++
     lea rsi, [rip + zdns_blockedquery]
     mov rcx, [rip + zdns_blockedquerylen]
     lea rdi, [r14 + 0x1008]                   // RESPBUF DNS area (dst-addr hdr occupies +0x1000..+0x1008)
@@ -10647,13 +10649,16 @@ zdns_m2:
     lea rsi, [rip + zdns_subquery]            // WWW.ADS.EXAMPLE -> expect BLOCKED (subdomain)
     mov rcx, [rip + zdns_subquerylen]
     call zdns_parse_and_match
+    inc qword ptr [r14 + 0xD10]               // metric: queries seen++ (WWW.ADS.EXAMPLE)
     cmp rax, 1
     jne zdns_m2_near
     or r12, 256                               // bit8: subdomain of a blocked base was sinkholed
+    inc qword ptr [r14 + 0xD18]               // metric: blocked (sinkholed)++
 zdns_m2_near:
     lea rsi, [rip + zdns_nearquery]           // NOTADS.EXAMPLE -> expect NOT blocked (not a boundary)
     mov rcx, [rip + zdns_nearquerylen]
     call zdns_parse_and_match
+    inc qword ptr [r14 + 0xD10]               // metric: queries seen++ (NOTADS.EXAMPLE, allowed)
     test rax, rax                             // 0 = not blocked (the correct, safe answer)
     jnz zdns_st2                              // blocked/malformed -> over-block bug, skip bit9
     or r12, 512                               // bit9: near-miss correctly NOT blocked (no over-block)
@@ -10663,6 +10668,7 @@ zdns_st2:
     lea rsi, [rip + zdns_realquery]
     mov rcx, [rip + zdns_realquerylen]
     call zdns_parse_and_match
+    inc qword ptr [r14 + 0xD10]               // metric: queries seen++ (una.os)
     test rax, rax
     jnz zdns_serve                            // blocked(1) / malformed(2) -> unexpected, skip forward
     or r12, 16                                // bit4: una.os NOT blocked (forward decision)
@@ -10709,6 +10715,7 @@ zdns_fwd_loop:
     cmp byte ptr [r14 + 0x1405], 0
     jne zdns_fwd_retry
     or r12, 32                                // bit5: forwarded + real answer relayed from upstream
+    inc qword ptr [r14 + 0xD20]               // metric: forwarded upstream++ (relayed)
     jmp zdns_fwd_done
 zdns_fwd_retry:
     dec r15
@@ -10747,6 +10754,7 @@ zdns_serve_loop:
     cmp rax, 20                               // >= 8 hdr + 12 DNS header -> a plausible query
     jl zdns_serve_next
     or r12, 64                                // bit6: served an inbound datagram on :53
+    inc qword ptr [r14 + 0xD10]               // metric: queries seen++ (an over-the-wire query)
     mov rcx, rax
     sub rcx, 8                                // DNS message length
     mov [r14 + 0xD08], rcx                    // stash it (parse clobbers rcx)
@@ -10768,12 +10776,37 @@ zdns_serve_loop:
     lea rsi, [r14 + 0x1000]
     syscall
     or r12, 128                               // bit7: sinkholed the served query over the wire (latched)
+    inc qword ptr [r14 + 0xD18]               // metric: blocked (sinkholed)++
     jmp zdns_serve_next                        // keep serving across the window (answer every blocked query),
                                               // so an over-the-wire injector reliably rendezvouses with an answer
 zdns_serve_next:
     dec r15
     jnz zdns_serve_loop
 zdns_exit:
+    // --- (4) METRICS (M3): pack the three counters into the spare high bits of the witness word so the
+    // launcher can print them (the honest source a future stats view reads) — no new syscall. Each count
+    // saturates at 63: seen -> bits[10:16], blocked -> bits[16:22], forwarded -> bits[22:28].
+    mov rax, [r14 + 0xD10]                    // queries seen
+    cmp rax, 63
+    jbe zdns_pk_seen
+    mov rax, 63
+zdns_pk_seen:
+    shl rax, 10
+    or r12, rax
+    mov rax, [r14 + 0xD18]                    // blocked (sinkholed)
+    cmp rax, 63
+    jbe zdns_pk_blk
+    mov rax, 63
+zdns_pk_blk:
+    shl rax, 16
+    or r12, rax
+    mov rax, [r14 + 0xD20]                    // forwarded upstream
+    cmp rax, 63
+    jbe zdns_pk_fwd
+    mov rax, 63
+zdns_pk_fwd:
+    shl rax, 22
+    or r12, rax
     mov rax, 2                                // SYS_EXIT(witness) -> routed by name into ZEOLITE_WITNESS
     mov rdi, r12
     syscall
@@ -11191,6 +11224,11 @@ fn zeolite_launcher(demo_cpu: usize) {
     let subdomain_ok = w & 256 != 0; // M2: a subdomain of a blocked base was sinkholed
     let nearmiss_ok = w & 512 != 0; // M2: a near-miss (not a label boundary) was NOT over-blocked
     let suffix_ok = subdomain_ok && nearmiss_ok;
+    // M3 metrics: the resolver's own counters, packed into the witness word's spare high bits (saturating
+    // 63). The honest data source a future stats view/widget reads — query counts, blocked counts.
+    let seen_ct = (w >> 10) & 0x3F;
+    let blocked_ct = (w >> 16) & 0x3F;
+    let forwarded_ct = (w >> 22) & 0x3F;
     let list_src = if from_fat { "BLOCK.TXT via S7 dynamic-open" } else { "builtin list (no FAT)" };
 
     // Leg 1: the STOR-feeds-NET composition + hosts-format ingest + suffix-match + hostile-parse + forward.
@@ -11213,6 +11251,12 @@ fn zeolite_launcher(demo_cpu: usize) {
             ZEOLITE_DONE.load(Ordering::Acquire)
         );
     }
+
+    // Metrics (M3): the resolver's own tally — the honest source a future stats view reads.
+    serial_println!(
+        ":: zeolite: metrics — {} queries seen, {} blocked (sinkholed), {} forwarded upstream ::",
+        seen_ct, blocked_ct, forwarded_ct
+    );
 
     // Leg 2: the over-the-wire sinkhole serve — needs the UNAOS_NET=socket `dns` injector.
     if served {
