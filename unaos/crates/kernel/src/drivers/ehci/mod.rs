@@ -965,6 +965,38 @@ unsafe fn dmar_report() {
                 ":: EHCI-HID: DMAR DRHD[{}] base={:#x} GSTS={:#010x} (TES={}) FSTS={:#010x} CAP={:#018x} NFR={} ::",
                 unit, base, gsts, (gsts >> 31) & 1, fsts, cap, nfr
             );
+            // Probe-9: Protected Memory Regions — the one DMA gate that operates with
+            // translation OFF (VT-d 10.4.16-20). PMEN.EPM=1 with PLMR/PHMR covering DRAM
+            // blocks device DMA exactly like the observed master aborts; every OS clears it
+            // at IOMMU handoff. Read-only dump: enable/status + both regions' bounds.
+            let pmen = mmio_read32(base + 0x64).unwrap_or(0);
+            serial_println!(
+                ":: EHCI-HID: DMAR DRHD[{}] PMEN={:#010x} (EPM={} PRS={}) PLMR {:#010x}..{:#010x} PHMR {:#010x}_{:08x}..{:#010x}_{:08x} == witness ::",
+                unit, pmen, (pmen >> 31) & 1, pmen & 1,
+                mmio_read32(base + 0x68).unwrap_or(0),
+                mmio_read32(base + 0x6C).unwrap_or(0),
+                mmio_read32(base + 0x74).unwrap_or(0),
+                mmio_read32(base + 0x70).unwrap_or(0),
+                mmio_read32(base + 0x7C).unwrap_or(0),
+                mmio_read32(base + 0x78).unwrap_or(0)
+            );
+            // Device scopes: which BDFs this unit owns (why xHCI may be exempt). Raw bytes of
+            // the DRHD structure past the 16-byte header: scope entries are (type, len, rsvd,
+            // enum-id, start-bus, path pairs...).
+            let mut soff = off + 16;
+            while soff < off + slen as u64 {
+                let d0 = mmio_read32(dmar + soff).unwrap_or(0);
+                let d1 = mmio_read32(dmar + soff + 4).unwrap_or(0);
+                let slen2 = (d0 >> 8) & 0xFF;
+                serial_println!(
+                    ":: EHCI-HID: DMAR DRHD[{}] scope: type={} len={} start-bus={} path[0]={:#04x},{:#04x} ::",
+                    unit, d0 & 0xFF, slen2, (d0 >> 24) & 0xFF, d1 & 0xFF, (d1 >> 8) & 0xFF
+                );
+                if slen2 == 0 {
+                    break;
+                }
+                soff += slen2 as u64;
+            }
             for i in 0..nfr.min(4) {
                 let fr = base + fro + i * 16;
                 let lo = (mmio_read32(fr).unwrap_or(0) as u64)
