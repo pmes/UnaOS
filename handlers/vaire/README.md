@@ -200,6 +200,74 @@ root-flip-count cost that whole-sync batching would collapse; a bulk API would
 additionally cut the per-object metadata churn. Neither is required to ship
 `usync` — recorded here as the evidence the corollary asked for.
 
+## The one-flip native sync (VAIRE-3) — the batch path adopted
+
+The bulk-create API the finding above named as missing landed crate-side in
+**UNAFS-BATCH** (`UnaFS::create_files_batch(parent_id, Vec<BatchFile>)`, API
+addition only — the v3 format is unchanged). VAIRE-3 adopts it, and the
+adoption is exactly the shape UNAFS-BATCH predicted: autocommit is turned off
+once for the whole run, the write set is grouped by parent directory and each
+group is landed with a single `create_files_batch` (the four `vaire.*` K6 attrs
+ride each `BatchFile`, folded into its one creation inode write), and **ONE**
+`commit()` flips the whole staged tree — every `mkdir`, every batched file, and
+the unit-root attrs — as a single atomic root, followed by the
+`snapshot_create` and the ledger-summary persist. All Bolt-1/VAIRE-2 invariants
+carry verbatim: live tree read-only, dry-run default, incremental size+mtime
+skip, stale-object unlink for an exact rewrite, one snapshot per completed sync,
+cap-16 up-front refusal. A mid-sync failure unwinds the **whole** outer
+transaction (the `create_files_batch` fold-documented semantics): `usync`
+reports the failure and the mounted image is left at the last committed root —
+no partial tree, no snapshot. (CoW may leave orphaned data blocks physically on
+disk for reclamation; the logical root never moves, and `fsck` stays clean.)
+
+**Phase-column note (columns kept comparable to the VAIRE-2 table).** The names
+are unchanged, but two meanings shifted with the batch shape: `write` now covers
+stale-object unlinks **plus** the `create_files_batch` staging (the former
+per-file `create_file`/`write_data`), and each file's four attrs fold into the
+batch creation inode — so the `attrs` phase now measures only the unit-root +
+per-run-summary attrs, not per-file attrs. `commit` collapses from one flip per
+file to the run's handful of flips.
+
+### After — the measured one-flip run (same protocol, same host)
+
+Re-run of the exact VAIRE-2 protocol, SOLO, into a **fresh v3 image** (own
+scratchpad path — never `baseline.img`). Same host context: **MacBookPro16,1**,
+**macOS 26.5.2 (build 25F84)**, internal **APFS** on a **PCI-Express SSD**;
+release build. Source = the live `~/.claude/plans/unaos` tree at run time — it
+had grown since the baseline scan (**247 files, 12 dirs, 4,211,657 B; 1 junk
+skip** vs the baseline's 239 files / 4,161,266 B), so compare the *regime*, not
+a file-for-file delta. Times are per-phase totals in ms.
+
+| Run | written | skipped | scan | lookup | read | write | attrs | commit | snapshot | commits | blocks | wall* |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| **VAIRE-2 cold** (per-file flips) | 239 | 0 | 4.38 | 15.84 | 43.28 | 49.34 | 157.57 | 10949.77 | 46.05 | 242 | 23484 | ~11.3 s |
+| **VAIRE-3 cold** (one-flip batch) | 247 | 0 | 6.79 | 4.12 | 15.05 | 25.31 | 25.20 | 92.58 | 44.28 | 3 | 1989 | **~0.213 s** |
+| **VAIRE-2 warm** (incremental) | 0 | 239 | 6.46 | 7.48 | 0.00 | 0.00 | 19.29 | 89.29 | 47.01 | 3 | 235 | ~0.17 s |
+| **VAIRE-3 warm** (incremental) | 0 | 247 | 8.02 | 10.39 | 0.00 | 0.00 | 23.27 | 87.44 | 45.69 | 3 | 235 | ~0.175 s |
+
+*wall = sum of the measured phases (the CLI's exact `BENCHMARK:` line).
+
+**Headline:** the cold `commit` phase collapses from **10.95 s across 242 root
+flips to 92.58 ms across 3**, and the whole cold wall from **~11.3 s to ~0.213 s
+(≈ 53×)**. Blocks written for the cold sync drop **23,484 → 1,989** (the same
+per-object metadata-churn collapse UNAFS-BATCH measured: one parent-directory +
+catalog rewrite per group and one folded inode write per file, instead of a full
+inode + directory + catalog rewrite per attribute). `fsck` is clean (0 leaked, 0
+stale) and the snapshot index shows the retained roots.
+
+**Finding — the cold commit sits at ~93 ms, not the harness's ~50 ms, and that
+is expected, not a shortfall.** The `tools/unafs bench-batch` harness measured
+~49.9 ms across **2** flips (format commit + one whole-tree commit). `usync`
+inherently carries **three** flips per run: the whole-tree sync commit, the
+`snapshot_create` commit (one retained root per completed sync — a VAIRE-2
+invariant), and the per-run ledger-summary persist commit (the benchmark line is
+recorded into the image itself). Those two extra inherent flips — the snapshot
+and the self-recorded summary — are the difference; the win is *above*, not
+below, the prediction for the raw two-flip tree write, and the per-flip cost
+(~30 ms) is consistent with the harness. Nothing is hidden here: the surplus over
+the bare harness is vaire's snapshot-per-sync + measured-from-birth design, both
+carried verbatim.
+
 ## What is implemented today (STATUS / Crystal)
 
 - **The Bolt manifest** — `Manifest` registers managed units declaratively
