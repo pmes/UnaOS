@@ -75,6 +75,13 @@ noportsw = []
 # register evidence (the 2012 rMBP internal kbd/trackpad are on EHCI-only ports). x86_64-only module;
 # default OFF => module unlinked, media byte-identical. Enable via `UNAOS_EHCISCOUT=1`.
 ehciscout = []
+# EHCI-4 M1 decouple: `ehciscout`/`ehciconfig` are now COMPILE features (the scout module + shared
+# wake are built by default, because the default-ON EHCI-3 driver depends on them). These `*_run`
+# features gate only the diagnostic CALL SITES (pci.rs) so a default boot builds the module but runs
+# NEITHER the read-only census NOR the configure-and-relook evidence — only the driver. UNAOS_EHCISCOUT
+# =1 / UNAOS_EHCICONFIG=1 arm the probes; pair with UNAOS_NOEHCIHID=1 for probe-without-driver.
+ehciscout_run = ["ehciscout"]
+ehciconfig_run = ["ehciconfig"]
 # EHCI-2 configure-and-relook scout: UNAOS_EHCICONFIG=1 arms a knob-gated, minimal EHCI WAKE sequence
 # (PMCSR->D0, USBLEGSUP OS-ownership handshake, RS=1, then CONFIGFLAG=1 + port-power) with two PORTSC
 # censuses (before/after CONFIGFLAG=1) so the attended rMBP sitting can distinguish
@@ -89,9 +96,11 @@ ehciconfig = ["ehciscout"]
 # device), periodic interrupt-IN QHs, and boot keyboard/mouse reports decoded to pal::Events in a
 # main-loop poll (no interrupts). For the 2012 rMBP internal keyboard/trackpad on the
 # non-switchable EHCI-only ports; runs permanently alongside xHCI (disjoint ports, PORTSW-1 §7f),
-# never touching an xHCI register. Implies `ehciconfig` (the wake layer it builds on). Default OFF
-# => module + call sites unlinked, media byte-identical; stays OFF until the keyboard is
-# metal-proven (the PORTSW default-ON pattern, Peter's word 2026-07-16).
+# never touching an xHCI register. Implies `ehciconfig` (the wake layer it builds on).
+# EHCI-4 M1 (2026-07-17): now DEFAULT-ON on x86 — the internal keyboard is metal-proven to TYPE
+# (usb_xhci.md §10 metal verdict). The plumbing (arroyo/builder) pushes `ehcihid` by default and
+# suppresses it under UNAOS_NOEHCIHID=1 (the PORTSW-1 negative-knob policy). Opt-out => this feature
+# is not enabled => module + every call site unlinked => byte-identical to the pre-fold no-EHCI media.
 ehcihid = ["ehciconfig"]
 # SOCK-1: route the shell's ping/arp/netinfo through the mature smoltcp TCP/IP stack (ROADMAP §1b)
 # instead of the hand-rolled `net` engines. Pulls in the x86-only smoltcp optional dependency and

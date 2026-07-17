@@ -861,6 +861,129 @@ broken only by panic-`Location` line-number metadata (`.data.rel.ro`) + symbol t
 shifting from the cfg-gated insertions in shared files — code-free drift, stated here
 rather than hand-waved.
 
+### 10a. EHCI-4 M1 — the default-ON fold
+
+The EHCI-3 metal verdict above (M3, the internal keyboard TYPES) is the evidence gate the
+pre-registered default-ON fold (Peter item (b), the PORTSW-1 pattern) waited on. So on x86
+the EHCI HID driver now runs **by default**; `UNAOS_NOEHCIHID=1` **opts out**.
+
+**Mechanism (and why it differs mechanically from PORTSW-1).** PORTSW is one self-contained
+`pci.rs` function, so its fold was a literal cfg inversion (`#[cfg(not(feature = "noportsw"))]`).
+The EHCI driver instead sits on a deep positive-feature implication chain
+(`ehcihid` → `ehciconfig` → `ehciscout`, plus the ACPI-root retention in `acpi.rs` and the
+`service_ehci_hid` main-loop hook) — inverting every gate would churn a byte-identity-proven
+shared module (`ehci_scout`) and a second subsystem (`acpi`). The fold instead flips the
+**plumbing**: `arroyo`/`builder` push `ehcihid` **by default** and suppress it under
+`UNAOS_NOEHCIHID=1`. Every existing `#[cfg(feature = "ehcihid" | "ehciconfig" | "ehciscout")]`
+gate is unchanged and now resolves on-by-default; opting out enables none of them, so the
+module + all call sites unlink and the kernel is **byte-identical to the pre-fold no-EHCI
+media** (proven: opt-out `.text`/`.rodata` SHA256 == the pre-fold default build,
+`7bbde326…` / `f939e27d…`). The user-facing contract is the PORTSW negative-knob idiom;
+the compile topology is preserved intact.
+
+**Diagnostic decouple.** `ehciscout`/`ehciconfig` are now *compile* features (the scout
+module + shared wake are built by default because the driver depends on them). The read-only
+census (`scout()`) and the configure-and-relook evidence pass (`configure_and_relook()`) are
+gated at their `pci.rs` call sites on new **`ehciscout_run`/`ehciconfig_run`** features, so a
+default boot builds the module but runs **only the driver** — neither evidence probe fires
+(no census spam, no redundant pre-init wake). `UNAOS_EHCISCOUT=1`/`UNAOS_EHCICONFIG=1` still
+arm the probes; pair either with `UNAOS_NOEHCIHID=1` for probe-without-driver (the old
+pure-evidence mode). QEMU-confirmed: the default boot enumerates the harness EHCI HID
+(`M1 … TOPOLOGY B`, `M2 armed keyboard`) with **zero** `EHCI-CONFIG census` lines.
+
+**Gates (M1).** Knob-matrix `./arroyo check` green both arches for default, `UNAOS_NOEHCIHID=1`,
+`UNAOS_EHCISCOUT=1 UNAOS_EHCICONFIG=1`, and `UNAOS_NOEHCIHID=1 UNAOS_EHCICONFIG=1`
+(pure-evidence). Default `test 40` MISSION SUCCESS with the driver enumerating on the same
+boot; `UNAOS_NOSTORAGE=1` clean; `UNAOS_IRQSTORAGE=1 UNAOS_FATIMG=sf test 200` 0 FAIL / 0
+PANIC with the storage service task + real FAT writes (S3/S4/S5/S8) unregressed under the
+default-active driver (the R6 coexistence proof now runs as the DEFAULT config). Opt-out
+byte-identity proven as above. The harness moves the QEMU `usb-kbd` onto the EHCI bus **by
+default** now (was `UNAOS_EHCIHID`-gated); `UNAOS_NOEHCIHID=1` restores the pre-fold harness
+(kbd on xHCI, no EHCI controller unless a scout knob asks).
+
+### 10b. EHCI-4 M2 — the internal trackpad (report-protocol pointer path)
+
+The keyboard is a **boot** HID (proto 1) — a fixed 8-byte report. The Apple internal trackpad
+(`05ac:0262`, EHCI-3 metal verdict) is a **non-boot** HID (proto 0): it exposes its report
+format only through its **HID report descriptor**, so `SET_PROTOCOL(boot)` does not apply and
+the fixed boot-mouse layout cannot decode it. M2 adds that path: the last internal input device
+moves the cursor.
+
+**Sequence** (`configure_report_pointer`). For a proto-0 HID interface the driver:
+1. reads the interface's HID class descriptor length (captured in the config-descriptor walk),
+2. issues **GET_DESCRIPTOR(Report)** — `bmRequestType 0x81` (in | standard | **interface**
+   recipient), `bRequest 6`, `wValue 0x2200`, `wIndex = interface` — into the 256-byte control
+   buffer (`Buf256`, up from 64 B so a full report descriptor fits and can be dumped verbatim),
+3. **parses** the descriptor (`parse_report_descriptor`) into the pointer field map,
+4. leaves the interface in its native **report** protocol (no `SET_PROTOCOL` — report is the
+   default after `SET_CONFIGURATION`; the boot request is not sent),
+5. arms one periodic interrupt-IN QH (the same `arm_interrupt_ep` machinery) carrying the parsed
+   layout, and
+6. decodes each report through that layout in `service_ehci_hid` → `pal::Event::MouseAbsolute`
+   (absolute axes: a tablet / the trackpad) or `pal::Event::Mouse` (relative: a mouse) — the
+   **same** pointer-event path the xHCI HID stack delivers.
+
+**Report-parser contract (what subset, why safe).** `parse_report_descriptor` is deliberately
+**not** a general HID stack. It walks the short-item stream (HID 1.11 §6.2.2.2) tracking only
+Usage Page / Report Size / Report Count / Report ID and the queued local Usages, and extracts
+exactly the fields a pointer report needs: the Generic Desktop **X** (usage 0x30) and **Y**
+(0x31) variable Input fields — their bit offset, bit size, and relative-vs-absolute flag — the
+**Button** bitfield (usage page 0x09), and, as a witness only, the Digitizer **Contact Count**
+(0x0D:0x54). Everything else is skipped. Safety: it never trusts the device to be a pointer —
+if no variable X/Y field is found it returns `None` and the endpoint is **skipped with an honest
+trace, never mis-armed**; long items (`0xFE`) and any tail past the read bytes end the walk
+cleanly (a truncated read is bounded, not a fault); bit extraction is length-checked against the
+report buffer, so a malformed descriptor cannot make the decoder read out of bounds. It assumes a
+single pointer report (a new Report ID restarts the body offset); deep multitouch (multiple
+report IDs, per-finger records) is the metal follow-up below.
+
+**Verbatim descriptor slot (the 0262 is metal-first).** The exact `05ac:0262` report descriptor
+is captured on serial at the attended sitting (`dump_report_descriptor` prints it as hex with the
+declared vs read length, so a > 256 B descriptor is visibly truncated). **QEMU stand-in
+(captured):** `usb-tablet` is a proto-0 **absolute** pointer — the same mechanics — and its 74-byte
+descriptor parses to `X@8/16b Y@24/16b btn@0×5 id=0 body=48b` (buttons in byte 0, X in bytes 1–2,
+Y in bytes 3–4, 16-bit little-endian 0..32767):
+
+```
+05 01 09 02 a1 01 09 01 a1 00 05 09 19 01 29 05 15 00 25 01 95 05 75 01 81 02
+95 01 75 03 81 01 05 01 09 30 09 31 15 00 26 ff 7f 35 00 46 ff 7f 75 10 95 02 81 02 ...
+```
+
+`<< 05ac:0262 internal trackpad report descriptor — capture verbatim here at the M3 sitting >>`
+
+**QEMU gate (honest).** `UNAOS_EHCITABLET=1` moves the harness `usb-tablet` onto the EHCI bus;
+the driver enumerates it as a second root-port device, reads + parses its report descriptor, arms
+the report-pointer QH, and — driven by QMP `input-send-event` absolute moves — decodes reports to
+`MouseAbsolute` with the parsed offsets, matching the injected coordinates exactly (witness:
+`report-pointer 1 reports … abs x=1000 y=800`, `32 reports … abs x=22700 y=13200`). The keyboard
+still arms and storage MISSION SUCCESS on the same boot (M1 unregressed). **What QEMU does NOT
+cover:** the real 0262 is FS **behind the RMH's TT** (split transactions — metal-only, §10) and is
+likely a **multitouch** digitizer with Report IDs and a descriptor that may exceed the 256-byte
+read cap; the parser decodes its primary pointer report, and the full multitouch decode + any
+larger-buffer read is a metal follow-up decided at the sitting by the verbatim capture.
+
+**Sitting-assertable trace list (M2, rMBP serial bridge armed).** On the default-ON build, after
+the M1 keyboard lines (§10 trace list):
+1. `:: EHCI-HID: [i] addr N intf M report descriptor (K of L B)[ …truncated]: <hex> ::` — the
+   verbatim 0262 descriptor (capture it for the slot above; note if `K < L`).
+2. `:: EHCI-HID: [i] M2 armed report-pointer addr=N ep=INx mps=.. interval=.. (absolute; X@../..b
+   Y@../..b btn@..x.. id=.. body=..b[, multitouch]) == witness ::` — the parsed field map.
+   - If instead `… report descriptor has no X/Y pointer field … skipped` ⇒ the 0262's primary
+     interface is not a plain pointer (multitouch-only); report the descriptor as-is.
+3. **Move the trackpad** → `:: EHCI-HID: [i] report-pointer N reports, last abs x=.. y=..
+   buttons=.. fingers=.. == witness ::` (first + every 32nd) and the cursor moves via
+   `pal::Event::MouseAbsolute`. `fingers>0` confirms a Contact-Count field was found.
+4. STOP-NOTE lines (`GET_DESCRIPTOR(Report) failed`, `no report-descriptor length`, interrupt-EP
+   halt) are the honest failure reports — relay verbatim, never forced.
+
+**Gates (M2).** Knob-matrix `./arroyo check` green both arches. `UNAOS_EHCITABLET=1 test 40`:
+the tablet enumerates on the EHCI bus, GET_DESCRIPTOR(Report) reads the full 74 B, the parser
+derives the exact layout, the report-pointer QH arms, QMP-injected moves decode to `MouseAbsolute`
+matching the injected coordinates, keyboard armed + storage MISSION SUCCESS same boot. Default
+`test 40` (no tablet) MISSION SUCCESS with the trackpad path dormant; `UNAOS_IRQSTORAGE=1
+UNAOS_FATIMG=sf test 200` 0 FAIL / 0 PANIC with the M2 code compiled in. The 256-byte control
+buffer is behaviour-neutral for the ≤ 64 B enumeration reads.
+
 ---
 
 ## See also

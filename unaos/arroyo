@@ -57,14 +57,20 @@ _feats=""
 # by default. UNAOS_NOPORTSW=1 OPTS OUT (never-run no-routing experiment) => zero config-space writes
 # => byte-identical no-routing media. Inert on QEMU (non-Intel xHCI). x86_64 only; aarch64 identical.
 [ -n "${UNAOS_NOPORTSW:-}" ] && _feats="${_feats}noportsw,"
-# EHCI-1 scout: read-only EHCI reconnaissance probe (x86_64). Kept in sync with builder/src/main.rs.
-[ -n "${UNAOS_EHCISCOUT:-}" ] && _feats="${_feats}ehciscout,"
-# EHCI-2 configure-and-relook: knob-gated minimal EHCI wake + two PORTSC censuses (x86_64). Implies
-# ehciscout. Kept in sync with builder/src/main.rs.
-[ -n "${UNAOS_EHCICONFIG:-}" ] && _feats="${_feats}ehciconfig,"
-# EHCI-3 driver: minimal EHCI HID driver (rMBP internal keyboard/trackpad; x86_64). Implies
-# ehciconfig. Kept in sync with builder/src/main.rs.
-[ -n "${UNAOS_EHCIHID:-}" ] && _feats="${_feats}ehcihid,"
+# EHCI-1 scout: read-only EHCI reconnaissance probe (x86_64). UNAOS_EHCISCOUT=1 fires the read-only
+# census probe (call site gated `ehciscout_run`); the scout MODULE itself is compiled by default now
+# (the EHCI-3 driver, default-ON below, is built from it). Kept in sync with builder/src/main.rs.
+[ -n "${UNAOS_EHCISCOUT:-}" ] && _feats="${_feats}ehciscout_run,"
+# EHCI-2 configure-and-relook: knob-gated minimal EHCI wake + two PORTSC censuses (x86_64). The
+# evidence PROBE call site is gated `ehciconfig_run` (implies ehciconfig for the wake it shares with
+# the driver). Pair with UNAOS_NOEHCIHID=1 for pure evidence (no driver). Kept in sync with builder.
+[ -n "${UNAOS_EHCICONFIG:-}" ] && _feats="${_feats}ehciconfig_run,"
+# EHCI-4 M1: the EHCI-3 minimal HID driver is now DEFAULT-ON on x86 (metal-gated 2026-07-17: the
+# internal keyboard TYPES on the 2012 rMBP). The driver + its shared wake + ACPI-root retention are
+# compiled by default via `ehcihid` (implies ehciconfig->ehciscout). UNAOS_NOEHCIHID=1 OPTS OUT =>
+# feature not pushed => module + all call sites unlinked => byte-identical to the pre-fold no-EHCI
+# default. Mirrors the PORTSW-1 default-ON/negative-knob policy. x86_64 only; aarch64 identical.
+[ -z "${UNAOS_NOEHCIHID:-}" ] && _feats="${_feats}ehcihid,"
 # SOCK-1: route the shell's ping/arp/netinfo + a boot ICMP witness through the smoltcp stack
 # (ROADMAP §1b). x86-only optional dep + x86-gated module — enabling it on the aarch64 `check`
 # invocation is a no-op (smoltcp isn't pulled for that target), so aarch64 stays byte-identical.

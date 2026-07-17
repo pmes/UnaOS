@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 
-//! EHCI-3 — a minimal, polling-first EHCI HID driver (UNAOS_EHCIHID=1, feature `ehcihid`).
+//! EHCI-3 — a minimal, polling-first EHCI HID driver (feature `ehcihid`). EHCI-4 M1: DEFAULT-ON
+//! on x86 (the internal keyboard is metal-proven to type; usb_xhci.md §10a); `UNAOS_NOEHCIHID=1`
+//! opts out => this module + every call site unlink, byte-identical to the pre-fold no-EHCI media.
 //!
 //! Purpose: the 2012 rMBP's internal keyboard + trackpad are real USB devices asleep behind the
 //! Panther Point EHCI companions on NON-switchable ports (EHCI-2 metal census: censusB = one
@@ -102,8 +104,39 @@ struct IntEp {
     toggle: bool,
     is_kbd: bool,
     is_rel_mouse: bool,
+    /// EHCI-4 M2: Some for a report-protocol pointer (the trackpad path) — the field map parsed
+    /// from the interface's HID report descriptor. `is_kbd`/`is_rel_mouse` are false then; the
+    /// service loop decodes X/Y/buttons from this layout instead of a fixed boot-report offset.
+    layout: Option<ReportLayout>,
     reports: u32,
     dead: bool,
+}
+
+/// EHCI-4 M2 — the minimal field map a HID **pointer** report exposes, extracted by
+/// `parse_report_descriptor`. NOT a general HID stack: it captures exactly what a mouse / tablet /
+/// trackpad report needs to move a cursor — the X and Y axes (Generic Desktop usages 0x30/0x31:
+/// bit offset + size + relative-vs-absolute), the button bitfield, an optional Report ID prefix,
+/// and (as a witness only) any Digitizer contact-count / finger field. Everything else in the
+/// descriptor is skipped.
+#[derive(Clone, Copy, Default)]
+struct ReportLayout {
+    /// 0 => reports carry no Report ID prefix byte; else the ID this layout decodes.
+    report_id: u8,
+    /// X/Y came from a Relative Input item (a mouse) → signed deltas → `pal::Event::Mouse`;
+    /// false = Absolute (a tablet / the Apple trackpad) → `pal::Event::MouseAbsolute`.
+    relative: bool,
+    has_xy: bool,
+    x_off: u16,
+    x_size: u8,
+    y_off: u16,
+    y_size: u8,
+    btn_off: u16,
+    btn_count: u8,
+    /// Digitizer finger/contact-count field (usage 0x0D:0x54), witness-only. 0 size => absent.
+    finger_off: u16,
+    finger_size: u8,
+    /// Total report body bits seen (after any Report ID byte) — a sanity witness.
+    total_bits: u16,
 }
 
 /// One woken, schedule-bearing EHCI function. All DMA structures live in the static
@@ -826,9 +859,12 @@ impl Controller {
         // collecting EVERY HID interrupt-IN endpoint: the Apple internal keyboard+trackpad are
         // one composite device with multiple HID interfaces.
         let cfg = core::slice::from_raw_parts(self.data_buf, total as usize);
-        let mut found: [Option<(u8, u8, u16, u8, u8)>; 4] = [None; 4]; // (proto, ep, mps, interval, intf)
+        // (proto, ep, mps, interval, intf, report_desc_len) — report_desc_len from the interface's
+        // HID class descriptor (0x21), needed to GET_DESCRIPTOR(Report) on the non-boot path (M2).
+        let mut found: [Option<(u8, u8, u16, u8, u8, u16)>; 4] = [None; 4];
         let mut nfound = 0;
         let (mut off, mut in_hid, mut proto, mut intf) = (0usize, false, 0u8, 0u8);
+        let mut report_len = 0u16; // pending HID report-descriptor length for the current interface
         while off + 2 <= cfg.len() {
             let len = cfg[off] as usize;
             if len == 0 {
@@ -839,12 +875,19 @@ impl Controller {
                     intf = cfg[off + 2];
                     in_hid = cfg[off + 5] == 0x03;
                     proto = cfg[off + 7];
+                    report_len = 0;
+                }
+                // HID class descriptor (0x21): its first subordinate descriptor is the Report
+                // descriptor (type 0x22); wDescriptorLength (bytes 7..8) is what we read on the M2
+                // non-boot path. Guard the type byte so a vendor layout can't mis-seed the length.
+                0x21 if in_hid && off + 9 <= cfg.len() && cfg[off + 6] == 0x22 => {
+                    report_len = (cfg[off + 7] as u16) | ((cfg[off + 8] as u16) << 8);
                 }
                 0x05 if in_hid && off + 7 <= cfg.len() => {
                     let ep = cfg[off + 2];
                     if ep & 0x80 != 0 && cfg[off + 3] & 0x3 == 3 && nfound < 4 {
                         let mps = ((cfg[off + 4] as u16) | ((cfg[off + 5] as u16) << 8)) & 0x7FF;
-                        found[nfound] = Some((proto, ep & 0xF, mps, cfg[off + 6], intf));
+                        found[nfound] = Some((proto, ep & 0xF, mps, cfg[off + 6], intf, report_len));
                         nfound += 1;
                     }
                 }
@@ -865,15 +908,13 @@ impl Controller {
         }
 
         for slot in found.iter().flatten() {
-            let (proto, ep, mps, interval, intf) = *slot;
-            // Only boot interfaces accept SET_PROTOCOL (proto 1 = keyboard, 2 = mouse). A
-            // report-protocol/vendor interface (proto 0 — the likely Apple trackpad case, R3)
-            // is skipped with an honest line; the keyboard still gates M3.
+            let (proto, ep, mps, interval, intf, report_len) = *slot;
+            // Boot interfaces (proto 1 = keyboard, 2 = mouse) take SET_PROTOCOL(boot) and decode
+            // through the fixed boot-report layout. A non-boot interface (proto 0 — the Apple
+            // trackpad, and QEMU's usb-tablet) is a REPORT-protocol pointer: read + parse its HID
+            // report descriptor (M2) and decode X/Y/buttons from the parsed field map instead.
             if proto != 1 && proto != 2 {
-                serial_println!(
-                    ":: EHCI-HID: [{}] addr {} intf {} is non-boot HID (proto {}) — needs a report-descriptor parser, out of this arc; skipped ::",
-                    self.idx, t.addr, intf, proto
-                );
+                self.configure_report_pointer(t, ep, mps, interval, intf, report_len);
                 continue;
             }
             // SET_PROTOCOL(boot): bmRequestType 0x21, bRequest 0x0B, wValue 0 (=Boot), wIndex =
@@ -885,7 +926,7 @@ impl Controller {
                 );
                 continue;
             }
-            self.arm_interrupt_ep(t, ep, mps.min(64), proto == 1, proto == 2);
+            self.arm_interrupt_ep(t, ep, mps.min(64), proto == 1, proto == 2, None);
             serial_println!(
                 ":: EHCI-HID: [{}] M2 armed {} addr={} ep=IN{} mps={} interval={} (boot protocol) == witness ::",
                 self.idx,
@@ -893,6 +934,63 @@ impl Controller {
                 t.addr, ep, mps, interval
             );
         }
+    }
+
+    /// M2 — the trackpad (report-protocol pointer) path. A non-boot HID interface exposes its
+    /// report format only through its HID **report descriptor**, so: GET_DESCRIPTOR(Report),
+    /// parse it for the X/Y/buttons field map (`parse_report_descriptor`), leave the interface in
+    /// its native **report** protocol (no SET_PROTOCOL(boot) — that is the boot-only request), and
+    /// arm the interrupt-IN QH with the parsed layout. The verbatim descriptor bytes are dumped on
+    /// serial (the doc's 0262 capture slot; QEMU's usb-tablet stands in for the mechanics). If no
+    /// X/Y variable field is found the endpoint is skipped with an honest trace, never mis-armed.
+    unsafe fn configure_report_pointer(
+        &mut self,
+        t: &Target,
+        ep: u8,
+        mps: u16,
+        interval: u8,
+        intf: u8,
+        report_len: u16,
+    ) {
+        if report_len == 0 {
+            serial_println!(
+                ":: EHCI-HID: [{}] addr {} intf {} non-boot HID but no report-descriptor length in the HID descriptor — skipped ::",
+                self.idx, t.addr, intf
+            );
+            return;
+        }
+        // GET_DESCRIPTOR(Report): bmRequestType 0x81 (in | standard | INTERFACE recipient),
+        // bRequest 6, wValue 0x2200 (type 0x22 Report, index 0), wIndex = interface. Bounded by the
+        // 256-byte control buffer (Buf256) — a longer descriptor is read short and traced.
+        let want = report_len.min(256);
+        let Ok(got) = self.control(t, 0x81, 6, 0x2200, intf as u16, want, true) else {
+            serial_println!(
+                ":: EHCI-HID: [{}] addr {} intf {} GET_DESCRIPTOR(Report) failed — skipped ::",
+                self.idx, t.addr, intf
+            );
+            return;
+        };
+        let n = (got as usize).min(want as usize).min(256);
+        let desc = core::slice::from_raw_parts(self.data_buf, n);
+        // Verbatim capture for the doc (the exact 0262 report descriptor is metal-first). Bounded
+        // dump: the leading bytes, hex, on one line — enough to reconstruct the field map.
+        dump_report_descriptor(self.idx, t.addr, intf, report_len, desc);
+        let Some(layout) = parse_report_descriptor(desc) else {
+            serial_println!(
+                ":: EHCI-HID: [{}] addr {} intf {} report descriptor has no X/Y pointer field (parsed {} of {} B) — not a cursor device; skipped ::",
+                self.idx, t.addr, intf, n, report_len
+            );
+            return;
+        };
+        self.arm_interrupt_ep(t, ep, mps.min(64), false, false, Some(layout));
+        serial_println!(
+            ":: EHCI-HID: [{}] M2 armed report-pointer addr={} ep=IN{} mps={} interval={} ({}; X@{}/{}b Y@{}/{}b btn@{}x{} id={} body={}b{}) == witness ::",
+            self.idx, t.addr, ep, mps, interval,
+            if layout.relative { "relative" } else { "absolute" },
+            layout.x_off, layout.x_size, layout.y_off, layout.y_size,
+            layout.btn_off, layout.btn_count, layout.report_id, layout.total_bits,
+            if layout.finger_size != 0 { ", multitouch" } else { "" },
+        );
     }
 
     /// Build + link one periodic interrupt QH and arm its first qTD.
@@ -906,7 +1004,15 @@ impl Controller {
     /// endpoint (Topology B) C-mask must be zero and S-mask alone paces one transaction per
     /// frame. The simplification is deliberate and verified against 4.12.2, not inherited
     /// silently; bInterval striding is a later refinement (design R8) if TT load ever demands.
-    unsafe fn arm_interrupt_ep(&mut self, t: &Target, ep: u8, mps: u16, is_kbd: bool, is_rel: bool) {
+    unsafe fn arm_interrupt_ep(
+        &mut self,
+        t: &Target,
+        ep: u8,
+        mps: u16,
+        is_kbd: bool,
+        is_rel: bool,
+        layout: Option<ReportLayout>,
+    ) {
         if self.int_next >= MAX_INT_EPS {
             serial_println!(
                 ":: EHCI-HID: [{}] static int-EP pool exhausted ({}) — endpoint skipped ::",
@@ -993,6 +1099,7 @@ impl Controller {
             toggle: false,
             is_kbd,
             is_rel_mouse: is_rel,
+            layout,
             reports: 0,
             dead: false,
         });
@@ -1036,9 +1143,32 @@ impl Controller {
             }
             let len = (e.mps as u32).saturating_sub((tok >> QTD_TOTAL_SHIFT) & 0x7FFF) as usize;
             if len > 0 {
-                let report = core::slice::from_raw_parts(e.buf, len.min(8));
+                // Boot reports are ≤ 8 B; a parsed report-pointer report can be longer (the
+                // buffer is 64 B), so cap by kind.
+                let cap = if e.layout.is_some() { len.min(64) } else { len.min(8) };
+                let report = core::slice::from_raw_parts(e.buf, cap);
                 e.reports = e.reports.wrapping_add(1);
-                if e.is_kbd {
+                if let Some(l) = e.layout {
+                    // M2 trackpad path: decode X/Y/buttons from the parsed field map. Relative
+                    // axes (a mouse) → pal::Event::Mouse; absolute (tablet / trackpad) →
+                    // MouseAbsolute — the SAME pointer-event path the xHCI HID stack delivers.
+                    let (x, y, buttons, fingers) = decode_report_pointer(report, &l);
+                    if l.relative {
+                        if x != 0 || y != 0 {
+                            crate::pal::push_event(crate::pal::Event::Mouse { x, y });
+                        }
+                    } else if x != 0 || y != 0 {
+                        crate::pal::push_event(crate::pal::Event::MouseAbsolute { x, y });
+                    }
+                    if e.reports == 1 || e.reports % 32 == 0 {
+                        serial_println!(
+                            ":: EHCI-HID: [{}] report-pointer {} reports, last {} x={} y={} buttons={:#04x} fingers={} == witness ::",
+                            idx, e.reports,
+                            if l.relative { "rel" } else { "abs" },
+                            x, y, buttons, fingers
+                        );
+                    }
+                } else if e.is_kbd {
                     decode_boot_keyboard(report);
                     if e.reports == 1 || e.reports % 32 == 0 {
                         serial_println!(
@@ -1104,6 +1234,263 @@ unsafe fn decode_boot_keyboard(report: &[u8]) {
             }
         }
     }
+}
+
+// ======================================================================================
+// M2 — HID report-descriptor parsing for the trackpad (report-protocol pointer) path.
+// A DELIBERATELY minimal parser: it walks the short-item stream (HID 1.11 §6.2.2.2) tracking
+// only the state needed to place a pointer report's X/Y axes, button bitfield, optional Report
+// ID, and a Digitizer contact-count field. Long items (0xFE) and anything that is not a Generic
+// Desktop X/Y / Button / Digitizer-count Input field are skipped — this is not a general HID
+// stack, it is exactly enough to move a cursor from what a mouse / tablet / trackpad reports.
+// ======================================================================================
+
+/// HID usage pages we key on.
+const UP_GENERIC_DESKTOP: u16 = 0x01;
+const UP_BUTTON: u16 = 0x09;
+const UP_DIGITIZER: u16 = 0x0D;
+
+/// Hard cap on the per-Input-item field-loop trip count (HARDENING — the driver is default-ON, so
+/// this parser runs on ANY plugged USB device's descriptor). `Report Count` is a global item read
+/// VERBATIM from the descriptor and its 4-byte form (0x97) can carry up to 0xFFFF_FFFF; an
+/// unclamped `for j in 0..report_count` lets an ~11-byte hostile descriptor drive a multi-billion-
+/// iteration loop during enumeration → boot stall (DoS). A report is delivered into the 64-byte
+/// interrupt buffer (`Buf64` = 512 bits), so a *legitimate* Input item packs at most 512 one-bit
+/// fields; anything larger cannot fit a real report and is a malformed/hostile descriptor. We cap
+/// the loop (and the bit-offset advance) at this bound — the field map for a real pointer is
+/// unaffected, a hostile count is clamped and the device is decoded on what actually fits (or
+/// skipped as non-pointer). Mirrors the existing `report_count.min(32)` button clamp.
+const MAX_REPORT_FIELDS: u32 = 512;
+
+/// Read `size` bits little-endian (LSB-first, HID packing) starting at bit `off` from `data`.
+fn extract_bits(data: &[u8], off: u16, size: u8) -> u32 {
+    let mut v = 0u32;
+    for i in 0..(size as u16).min(32) {
+        let bit = off + i;
+        let byte = (bit / 8) as usize;
+        if byte >= data.len() {
+            break;
+        }
+        if data[byte] & (1 << (bit % 8)) != 0 {
+            v |= 1 << i;
+        }
+    }
+    v
+}
+
+/// Sign-extend a `size`-bit field to i32 (for a Relative axis; Absolute axes stay unsigned).
+fn sign_extend(v: u32, size: u8) -> i32 {
+    if size > 0 && size < 32 && v & (1 << (size - 1)) != 0 {
+        (v | (!0u32 << size)) as i32
+    } else {
+        v as i32
+    }
+}
+
+/// Parse a HID report descriptor into the pointer field map (`ReportLayout`). Returns `None` if
+/// no variable X/Y field is present (i.e. not a cursor device). Fields past whatever bytes we were
+/// handed (the 256-byte control-read cap) are simply not seen — a truncated tail ends the walk
+/// cleanly. Single-report assumption: on a new Report ID the body bit-offset restarts (a
+/// multi-report multitouch descriptor decodes its first pointer report; deeper multitouch is a
+/// metal follow-up, flagged in usb_xhci.md §10b).
+unsafe fn parse_report_descriptor(desc: &[u8]) -> Option<ReportLayout> {
+    let mut l = ReportLayout::default();
+    let mut usage_page = 0u16;
+    let mut report_size = 0u32;
+    let mut report_count = 0u32;
+    // Local usages queued for the next Main item (we only ever need a handful).
+    let mut usages: [u16; 16] = [0; 16];
+    let mut nusg = 0usize;
+    let mut usage_min = 0u16;
+    let mut usage_max = 0u16;
+    let mut bit_off: u16 = 0;
+    let mut i = 0usize;
+    while i < desc.len() {
+        let b = desc[i];
+        if b == 0xFE {
+            break; // long item — not used by these devices
+        }
+        let size = match b & 0x03 {
+            3 => 4,
+            s => s as usize,
+        };
+        if i + 1 + size > desc.len() {
+            break; // truncated (the read cap) — stop cleanly
+        }
+        let mut data: u32 = 0;
+        for k in 0..size {
+            data |= (desc[i + 1 + k] as u32) << (8 * k);
+        }
+        match b & 0xFC {
+            // ---- Global items ----
+            0x04 => usage_page = data as u16,                 // Usage Page
+            0x74 => report_size = data,                       // Report Size
+            0x94 => report_count = data,                      // Report Count
+            0x84 => {
+                l.report_id = data as u8; // Report ID — a report body follows the ID byte
+                bit_off = 0;
+            }
+            // ---- Local items ----
+            0x08 => {
+                if nusg < usages.len() {
+                    usages[nusg] = data as u16;
+                    nusg += 1;
+                }
+            }
+            0x18 => usage_min = data as u16, // Usage Minimum
+            0x28 => usage_max = data as u16, // Usage Maximum
+            // ---- Main: Input ----
+            0x80 => {
+                let is_const = data & 0x01 != 0; // Constant (padding) — reserve space, no field
+                let is_var = data & 0x02 != 0;
+                let is_rel = data & 0x04 != 0;
+                // HARDENING: clamp the field-loop trip count against a hostile Report Count (see
+                // MAX_REPORT_FIELDS) — an unclamped 0..report_count is a plug-in DoS on the
+                // default-ON driver. The bit-offset advance below uses the same clamped count.
+                let count = report_count.min(MAX_REPORT_FIELDS);
+                if !is_const && is_var {
+                    for j in 0..count {
+                        let usage = if (j as usize) < nusg {
+                            usages[j as usize]
+                        } else if nusg > 0 {
+                            usages[nusg - 1]
+                        } else if usage_max >= usage_min {
+                            usage_min.wrapping_add(j as u16)
+                        } else {
+                            0
+                        };
+                        let f_off = bit_off + (j as u16) * (report_size as u16);
+                        match (usage_page, usage) {
+                            (UP_GENERIC_DESKTOP, 0x30) => {
+                                l.has_xy = true;
+                                l.relative = is_rel;
+                                l.x_off = f_off;
+                                l.x_size = report_size as u8;
+                            }
+                            (UP_GENERIC_DESKTOP, 0x31) => {
+                                l.y_off = f_off;
+                                l.y_size = report_size as u8;
+                            }
+                            (UP_DIGITIZER, 0x54) => {
+                                // Contact Count (finger count) — witness only.
+                                l.finger_off = f_off;
+                                l.finger_size = report_size as u8;
+                            }
+                            _ => {}
+                        }
+                    }
+                    // Buttons: a variable Input on the Button page, one bit per button.
+                    if usage_page == UP_BUTTON && l.btn_count == 0 {
+                        l.btn_off = bit_off;
+                        l.btn_count = report_count.min(32) as u8;
+                    }
+                }
+                // Advance by the CLAMPED count (and saturate the u16) so a hostile Report Count
+                // neither loops nor overflows the running bit offset.
+                let advance = (report_size.min(u16::MAX as u32) as u16)
+                    .saturating_mul(count.min(u16::MAX as u32) as u16);
+                bit_off = bit_off.saturating_add(advance);
+                l.total_bits = l.total_bits.max(bit_off);
+                // Local state is cleared after every Main item (HID 1.11 §6.2.2.8).
+                nusg = 0;
+                usage_min = 0;
+                usage_max = 0;
+            }
+            // Output / Feature main items also clear locals and advance nothing we track.
+            0x90 | 0xB0 => {
+                nusg = 0;
+                usage_min = 0;
+                usage_max = 0;
+            }
+            _ => {}
+        }
+        i += 1 + size;
+    }
+    if l.has_xy && l.x_size > 0 && l.y_size > 0 {
+        Some(l)
+    } else {
+        None
+    }
+}
+
+/// Decode one report through a parsed `ReportLayout`. Returns (x, y, buttons, fingers): X/Y are
+/// sign-extended for a Relative layout (a mouse's deltas) and unsigned for Absolute (a tablet /
+/// trackpad's coordinates). A report whose leading ID byte does not match this layout's Report ID
+/// is ignored (returns zeros).
+fn decode_report_pointer(report: &[u8], l: &ReportLayout) -> (i32, i32, u8, u8) {
+    let body: &[u8] = if l.report_id != 0 {
+        if report.is_empty() || report[0] != l.report_id {
+            return (0, 0, 0, 0);
+        }
+        &report[1..]
+    } else {
+        report
+    };
+    let x_raw = extract_bits(body, l.x_off, l.x_size);
+    let y_raw = extract_bits(body, l.y_off, l.y_size);
+    let (x, y) = if l.relative {
+        (sign_extend(x_raw, l.x_size), sign_extend(y_raw, l.y_size))
+    } else {
+        (x_raw as i32, y_raw as i32)
+    };
+    let buttons = if l.btn_count > 0 {
+        extract_bits(body, l.btn_off, l.btn_count) as u8
+    } else {
+        0
+    };
+    let fingers = if l.finger_size > 0 {
+        extract_bits(body, l.finger_off, l.finger_size) as u8
+    } else {
+        0
+    };
+    (x, y, buttons, fingers)
+}
+
+/// Verbatim (bounded) hex dump of a report descriptor — the doc's 0262 capture slot. Prints the
+/// first up-to-48 bytes on one serial line (enough to reconstruct the pointer field map); the
+/// declared length is stated so a truncated read is obvious.
+unsafe fn dump_report_descriptor(idx: usize, addr: u8, intf: u8, report_len: u16, desc: &[u8]) {
+    let mut hex = alloc::string::String::new();
+    for (k, b) in desc.iter().take(48).enumerate() {
+        if k > 0 {
+            hex.push(' ');
+        }
+        let hi = b >> 4;
+        let lo = b & 0xF;
+        hex.push(char::from_digit(hi as u32, 16).unwrap());
+        hex.push(char::from_digit(lo as u32, 16).unwrap());
+    }
+    serial_println!(
+        ":: EHCI-HID: [{}] addr {} intf {} report descriptor ({} of {} B){}: {} ::",
+        idx, addr, intf, desc.len(), report_len,
+        if desc.len() < report_len as usize { " [truncated at read cap]" } else { "" },
+        hex
+    );
+}
+
+/// Parser hardening self-test (runs once at driver init, since the driver is default-ON). Feeds
+/// the report parser a HOSTILE descriptor — `Report Count = 0xFFFF_FFFF` (4-byte form 0x97) on an
+/// X field — and asserts it returns *bounded* instead of spinning a multi-billion-iteration loop.
+/// PRE-FIX this call never returns (the boot hangs); POST-FIX (MAX_REPORT_FIELDS clamp) it returns
+/// immediately as `None` (only X, no Y → not a pointer). A legit X/Y descriptor is parsed alongside
+/// to prove the clamp does not break the real path. One serial witness line either way.
+unsafe fn parser_selftest() {
+    // Usage Page(Generic Desktop), Usage(X), Report Size(8), Report Count(0xFFFFFFFF), Input(Var).
+    let hostile: [u8; 13] = [
+        0x05, 0x01, 0x09, 0x30, 0x75, 0x08, 0x97, 0xFF, 0xFF, 0xFF, 0xFF, 0x81, 0x02,
+    ];
+    let hostile_bounded = parse_report_descriptor(&hostile).is_none();
+    // Usage Page(GD), Usage(X), Usage(Y), Report Size(16), Report Count(2), Input(Var).
+    let legit: [u8; 12] = [
+        0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x75, 0x10, 0x95, 0x02, 0x81, 0x02,
+    ];
+    let legit_ok = parse_report_descriptor(&legit)
+        .map(|l| l.has_xy && l.x_size == 16 && l.y_size == 16 && l.x_off == 0 && l.y_off == 16)
+        .unwrap_or(false);
+    serial_println!(
+        ":: EHCI-HID: report-parser self-test: hostile report_count clamped (bounded={}, cap={}), legit X/Y parse ok={} == witness ::",
+        hostile_bounded, MAX_REPORT_FIELDS, legit_ok
+    );
 }
 
 /// Probe-3/4 evidence: dump VT-d (DMAR) state, READ-ONLY. Probe 3 showed both EHCI functions'
@@ -1245,6 +1632,9 @@ unsafe fn pci_evidence(bus: u8, dev: u8, func: u8, idx: usize) {
 /// stacks' port sets are disjoint by hardware — PORTSW-1 §7f).
 pub fn init() {
     serial_println!(":: EHCI-HID: begin (EHCI-3 driver, polling model, knob-gated) ::");
+    // Hardening self-test up front (default-ON driver parses ANY device's descriptor): proves the
+    // report-parser is bounded against a hostile Report Count before we enumerate anything.
+    unsafe { parser_selftest() };
     let mut ctrls: Vec<Controller> = Vec::new();
     // Probe-13 (b), Peter-approved 2026-07-17: the RCBA CG (clock gating) base + a one-shot
     // flag — the clear fires only if the live-port smoke actually HSEs.
