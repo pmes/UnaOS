@@ -42,7 +42,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use unafs::{AttributeValue, CommitStats, FileDevice, FileSystem, SNAPSHOT_CAP};
+use unafs::{AttributeValue, BatchFile, CommitStats, FileDevice, FileSystem, SNAPSHOT_CAP};
 
 use crate::devtree::{self, DevManifest, ExcludedEntry};
 
@@ -330,11 +330,21 @@ pub fn usync(m: &DevManifest, image: &Path, apply: bool, size_mb: u64) -> Result
         );
     }
 
-    // Batched-commit regime: every op is CoW, but with autocommit OFF we flip
-    // the root ONCE per file (create+write+attrs in one transaction) instead of
-    // once per sub-op. This is the natural measured unit for the benchmark and
-    // isolates a distinct `commit` phase (see the batched-sync finding in the
-    // README). snapshot_create commits unconditionally regardless of this flag.
+    // The one-flip regime (VAIRE-3 — UNAFS-BATCH adoption). Every op is CoW,
+    // but autocommit is turned OFF once for the whole run: the ancestor `mkdir`s
+    // and each directory's WRITE set stage into ONE transaction, landed by a
+    // single `commit()` below (the unit-root-attr commit IS that one flip).
+    // The per-directory write set goes through `create_files_batch` — one
+    // folded inode write per file (its four `vaire.*` attrs ride the creation
+    // inode) and ONE parent-directory + catalog rewrite for the whole group,
+    // instead of the former per-file create_file/write_data/4×set_attribute/
+    // commit. This collapses the commit phase (formerly 97 % of the cold wall
+    // across one root flip per file) to the single outer flip; the `write`
+    // phase now covers stale-object unlinks plus the batch staging, and file
+    // attrs no longer appear under the `attrs` phase (they fold into the batch).
+    // Skipped/written/excluded row meanings are unchanged; the incremental skip
+    // and stale-object unlink paths are untouched. snapshot_create still commits
+    // unconditionally regardless of this flag.
     fs.set_autocommit(false);
 
     let root_id = fs.root_inode();
@@ -345,6 +355,10 @@ pub fn usync(m: &DevManifest, image: &Path, apply: bool, size_mb: u64) -> Result
     let mut files_written = 0usize;
     let mut files_skipped = 0usize;
     let mut bytes_written = 0u64;
+
+    // The WRITE set, grouped by parent-dir inode: one `create_files_batch` per
+    // group. A BTreeMap keeps the staging order deterministic.
+    let mut batches: BTreeMap<u64, Vec<BatchFile>> = BTreeMap::new();
 
     for item in &items {
         let parent_rel = item.rel.parent().unwrap_or(Path::new(""));
@@ -373,8 +387,9 @@ pub fn usync(m: &DevManifest, image: &Path, apply: bool, size_mb: u64) -> Result
             }
         };
         if existing.is_some() {
-            // Changed: unlink the stale object so the rewrite is exact (the
-            // grow-only write_data cannot shrink a file in place).
+            // Changed: unlink the stale object so the batch name is free and the
+            // rewrite is exact (the grow-only write_data cannot shrink a file in
+            // place). The unlink stages into the same outer transaction.
             let _p = ledger.probe(&ledger.write);
             fs.unlink(parent_id, name)
                 .map_err(|e| anyhow::anyhow!("unlink stale {}: {e:?}", item.rel.display()))?;
@@ -385,26 +400,31 @@ pub fn usync(m: &DevManifest, image: &Path, apply: bool, size_mb: u64) -> Result
             std::fs::read(&item.abs)
                 .with_context(|| format!("read live file {}", item.abs.display()))?
         };
-        let fid = {
-            // create_file (inode + parent-dir rewrite) and write_data are both
-            // image writes: one `write` phase.
-            let _p = ledger.probe(&ledger.write);
-            let fid = fs
-                .create_file(parent_id, name.to_string())
-                .map_err(|e| anyhow::anyhow!("create_file {}: {e:?}", item.rel.display()))?;
-            fs.write_data(fid, 0, &data)
-                .map_err(|e| anyhow::anyhow!("write_data {}: {e:?}", item.rel.display()))?;
-            fid
-        };
-        {
-            let _p = ledger.probe(&ledger.attrs);
-            set_file_attrs(&mut fs, fid, item, &run_stamp)?;
-        }
-        {
-            let _p = ledger.probe(&ledger.commit);
-            fs.commit()
-                .map_err(|e| anyhow::anyhow!("commit {}: {e:?}", item.rel.display()))?;
-        }
+        // The four `vaire.*` K6 attrs ride the BatchFile map — exactly what the
+        // per-op path set with four `set_attribute` calls, folded into the
+        // file's single creation inode write.
+        let mut attributes = BTreeMap::new();
+        attributes.insert(
+            "vaire.size".to_string(),
+            AttributeValue::Int(item.size as i64),
+        );
+        attributes.insert(
+            "vaire.mtime".to_string(),
+            AttributeValue::Int(item.mtime as i64),
+        );
+        attributes.insert(
+            "vaire.src".to_string(),
+            AttributeValue::String(item.abs.to_string_lossy().to_string()),
+        );
+        attributes.insert(
+            "vaire.sync".to_string(),
+            AttributeValue::String(run_stamp.clone()),
+        );
+        batches.entry(parent_id).or_default().push(BatchFile {
+            name: name.to_string(),
+            data,
+            attributes,
+        });
         files_written += 1;
         bytes_written += item.size;
         rows.push(FileRow {
@@ -412,6 +432,17 @@ pub fn usync(m: &DevManifest, image: &Path, apply: bool, size_mb: u64) -> Result
             bytes: item.size,
             disposition: FileDisposition::Written,
         });
+    }
+
+    // Land each directory's write set with one batch call — all staged into the
+    // single outer transaction (autocommit off), committed by the flip below.
+    {
+        let _p = ledger.probe(&ledger.write);
+        for (parent_id, files) in batches {
+            fs.create_files_batch(parent_id, files).map_err(|e| {
+                anyhow::anyhow!("create_files_batch under dir {parent_id}: {e:?}")
+            })?;
+        }
     }
 
     // Unit-root attrs + this run's summary (accrues per run in the image).
@@ -433,9 +464,15 @@ pub fn usync(m: &DevManifest, image: &Path, apply: bool, size_mb: u64) -> Result
             set_str(&mut fs, unit_id, "vaire.run", &run_stamp)?;
         }
     }
+    // THE one flip: this single commit lands the whole staged tree — every
+    // `mkdir`, every batched file+attrs, and these unit-root attrs — as one
+    // atomic root. (A failed sync therefore never leaves a partial tree: any
+    // error above unwinds the whole outer transaction to the last committed
+    // root; nothing is committed and no snapshot is taken.)
     {
         let _p = ledger.probe(&ledger.commit);
-        fs.commit().map_err(|e| anyhow::anyhow!("commit unit attrs: {e:?}"))?;
+        fs.commit()
+            .map_err(|e| anyhow::anyhow!("commit sync transaction: {e:?}"))?;
     }
 
     // The retained root — one snapshot per completed sync (cap already
@@ -710,19 +747,6 @@ fn object_attrs_match(fs: &mut FileSystem, rel: &Path, item: &FileItem) -> Resul
         }
     }
     attrs_match(fs, id, item)
-}
-
-fn set_file_attrs(fs: &mut FileSystem, id: u64, item: &FileItem, run_stamp: &str) -> Result<()> {
-    set_int(fs, id, "vaire.size", item.size as i64)?;
-    set_int(fs, id, "vaire.mtime", item.mtime as i64)?;
-    set_str(fs, id, "vaire.src", &item.abs.to_string_lossy())?;
-    set_str(fs, id, "vaire.sync", run_stamp)?;
-    Ok(())
-}
-
-fn set_int(fs: &mut FileSystem, id: u64, key: &str, v: i64) -> Result<()> {
-    fs.set_attribute(id, key.to_string(), AttributeValue::Int(v))
-        .map_err(|e| anyhow::anyhow!("set_attribute {key}: {e:?}"))
 }
 
 fn set_str(fs: &mut FileSystem, id: u64, key: &str, v: &str) -> Result<()> {
