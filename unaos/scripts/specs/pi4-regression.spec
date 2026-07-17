@@ -58,6 +58,14 @@ REQUIRE K2-liveenf:.*rebuild\+enforce PASS
 # --- (real Pi 4, kernel a834b8f); promoted from ledger to a hard REQUIRE at that capture. -----
 REQUIRE K3-revoke:.*durable-first PASS
 
+# --- K9-PARITY mid-staging-failure discard witness (uncounted, 7 bits, PASS = w=0x7f): a staged ACL
+# --- persist that fails PARTWAY leaves no partial-durable row (K3) AND its uncommitted residue can no
+# --- longer be flushed by a later persist's commit — closes the K9 lens-B deferred residual in-lane
+# --- (with_unafs discards the dirty mount inside the serialized hold). QEMU-proven; metal rides the
+# --- next Pi sitting. ---------------------------------------------------------------------------------
+REQUIRE K9-parity:.*discarded residue PASS
+FORBID K9-parity:.*discarded residue FAIL
+
 # --- UNAFS-K3 RO kernel mount witness (uncounted): the native unafs volume is located by magic,
 # --- superblock mounted RO, ls/cat byte-verified against the staged fixture [w=0x1ff]. The BeFS
 # --- storage chain reaches silicon (K1/K2 ACL + K3 mount). METAL-CONFIRMED 2026-07-12 (real Pi 4,

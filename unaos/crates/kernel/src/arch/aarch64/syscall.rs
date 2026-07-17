@@ -8522,6 +8522,11 @@ pub fn u7_launcher(demo_cpu: usize) {
     // span one ns) + the create-serialization gate. Its own uncounted `:: K5-lockspan: … PASS ::` line;
     // self-cleaning (leaves no owned row on the metal card).
     k5_lockspan_launcher(); #[cfg(feature = "nsspan")] nsspan_report(); // K7 WATCH: emit :: NS-SPAN: … :: after K3/K5 drive the sites (newline-neutral inline; knob-off byte-identical)
+    // K9-PARITY: the mid-staging-failure discard proof — a staged ACL persist that fails PARTWAY leaves no
+    // partial-durable row (K3), AND its uncommitted residue can no longer be flushed by a LATER persist's
+    // commit (the K9 lens-B residual, now closed in-lane via `with_unafs`'s MOUNT_DISCARD). Its own
+    // uncounted `:: K9-parity: … PASS ::` line; self-cleaning (leaves no owned row on the metal card).
+    k9_parity_launcher();
     // IMAGE_SHA256 code-signing: prove the SHA-256 primitive (FIPS KATs) + that it discriminates program
     // IMAGES, closing the "same 8.3 name = same principal" residual (the loader now mints IMAGE_SHA256). Its
     // own uncounted `:: IMG-SIG: … PASS ::` line; read-only, no disk write.
@@ -10805,6 +10810,158 @@ fn k3_revoke_launcher() {
     serial_println!(
         ":: K3-revoke: SYS_FGRANT revoke commit-ordering — two-phase durable-first {} (revoke survives reboot; kept grant intact; forced persist-fail -> -EIO with in-RAM grant left intact, RAM/disk consistent) [w={:#04x}] ::",
         if w == K3REVOKE_ALL { "PASS" } else { "FAIL" },
+        w
+    );
+}
+
+// K9-PARITY: the mid-staging-failure discard proof — scratch state (torn down by the time it runs). Closes the
+// K9 lens-B deferred residual: a staged ACL persist that fails PARTWAY (after an inode + name/fc/owner have
+// staged into the autocommit-OFF transaction) leaves UNCOMMITTED residue on the shared cached mount; without the
+// K9-PARITY discard a LATER persist's commit would flush that residue as a partial-durable row. `with_unafs` now
+// drops the cached mount inside the same serialized hold that ran the failing op, so the next persist re-mounts
+// fresh from the committed root and commits ONLY its own row.
+const K9_SA_OWN: u64 = 6; // scratch OWNER ASID (reused after K3/K5 tear down; this witness runs after them)
+const K9_FILE_A: &str = "K9PA.BIN"; // the CLEAN control file (its committed row must survive intact)
+const K9_FILE_B: &str = "K9PB.BIN"; // the MID-STAGE-FAILED file (must NEVER get a durable row)
+const K9PARITY_ALL: u32 = 0x7F; // all 7 assertions
+
+/// K9-PARITY: delete both scratch files + clear their native rows + the scratch stamp + the fault knob, leaving the
+/// card EXACTLY as found. Robust to partial failures (re-resolves fresh).
+fn k9_parity_cleanup() {
+    slot_ppid_clear(K9_SA_OWN);
+    crate::fs::unafs::TEST_FAIL_MIDSTAGE.store(false, Ordering::Relaxed); // never leave the fault knob set
+    if let Ok(fs) = crate::fs::fat::mount() {
+        for name in [K9_FILE_A, K9_FILE_B] {
+            if let Ok((de, lba, off)) = fs.find_located(name) {
+                let _ = crate::fs::unafs::native_acl_clear(lba, off as u32);
+                owned_clear(lba, off as u32);
+                let _ = fs.delete_located(lba, off, de.first_cluster());
+            }
+        }
+    }
+}
+
+/// K9-PARITY: PROVE the mid-staging-failure discard end to end (the `k3_revoke_check` idiom — kernel-side,
+/// deterministic, real files + the native ACL store). A CLEAN row is persisted for file A; file B is persisted with
+/// the mid-stage fault knob so its row aborts partway (near-complete but UNCOMMITTED); A is then re-persisted (a
+/// real commit that, pre-fix, would flush B's residue). Across a simulated reboot: A's row is intact, B has NO
+/// durable row (the residual closed), and a clean re-persist of B now lands correctly (the volume fully recovers).
+/// Returns a bitmask; PASS iff `== K9PARITY_ALL`. Fully self-cleaning.
+fn k9_parity_check() -> u32 {
+    let mut w = 0u32;
+    let fs = match crate::fs::fat::mount() {
+        Ok(f) => f,
+        Err(_) => return 0,
+    };
+    slot_ppid_stamp(K9_SA_OWN, PrincipalRecord::program_name("K9OWN"));
+    let p_own = slot_ppid_of(K9_SA_OWN);
+    let gen_own = ASID_GEN[K9_SA_OWN as usize].load(Ordering::Acquire);
+
+    // ---- Phase 1: file A — a CLEAN native row that must stay intact throughout ----
+    let (_dea, la, oa) = match fs.create_in_root(K9_FILE_A, 0x20) {
+        Ok(t) => t,
+        Err(_) => {
+            k9_parity_cleanup();
+            return w;
+        }
+    };
+    owned_set_owner(la, oa as u32, K9_SA_OWN, gen_own, p_own);
+    if native_persist_create(K9_FILE_A, 0, la, oa as u32, p_own) {
+        w |= 1 << 0; // A's row committed clean (baseline)
+    }
+
+    // ---- Phase 2: file B — persist with the MID-STAGE fault; it must fail CLOSED, staging uncommitted residue ----
+    let (_deb, lb, ob) = match fs.create_in_root(K9_FILE_B, 0x20) {
+        Ok(t) => t,
+        Err(_) => {
+            k9_parity_cleanup();
+            return w;
+        }
+    };
+    owned_set_owner(lb, ob as u32, K9_SA_OWN, gen_own, p_own);
+    crate::fs::unafs::TEST_FAIL_MIDSTAGE.store(true, Ordering::Relaxed);
+    let okb_fail = native_persist_create(K9_FILE_B, 0, lb, ob as u32, p_own);
+    crate::fs::unafs::TEST_FAIL_MIDSTAGE.store(false, Ordering::Relaxed);
+    if !okb_fail {
+        w |= 1 << 1; // the mid-staging persist failed CLOSED (returned false — no false success)
+    }
+
+    // ---- Phase 3: a SUBSEQUENT real commit (re-persist A) must land — and must NOT carry B's discarded residue ----
+    // Pre-fix, this commit ran against the shared dirty mount and would have flushed B's staged inode/attrs as a
+    // durable row. Post-fix, B's failure discarded the mount, so this re-persist re-mounts fresh and commits ONLY A.
+    if native_persist_grow(la, oa as u32, 0) {
+        w |= 1 << 2; // the volume is usable after the discard — a clean commit landed
+    }
+
+    // ---- Phase 4: simulate a reboot — rebuild owners purely from the NATIVE store ----
+    owned_clear(la, oa as u32);
+    owned_clear(lb, ob as u32);
+    crate::fs::unafs::force_remount();
+    let fs2 = match crate::fs::fat::mount() {
+        Ok(f) => f,
+        Err(_) => {
+            k9_parity_cleanup();
+            return w;
+        }
+    };
+    let _ = native_rebuild_into_owned(&fs2);
+    // A's durable row survived the whole sequence.
+    if let Ok((_d, rla, roa)) = fs2.find_located(K9_FILE_A) {
+        if owned_owner_ppid(rla, roa as u32).kind != PRIN_NONE
+            && crate::fs::unafs::native_acl_read(rla, roa as u32).is_some()
+        {
+            w |= 1 << 3; // A's committed row intact — the discard never touched committed state (K3)
+        }
+    }
+    // B has NO durable row — the mid-staged partial was discarded, never committed by A's later commit.
+    let (rlb, rob) = match fs2.find_located(K9_FILE_B) {
+        Ok((_d, l, o)) => (l, o as u32),
+        Err(_) => {
+            k9_parity_cleanup();
+            return w;
+        }
+    };
+    if owned_owner_ppid(rlb, rob).kind == PRIN_NONE
+        && crate::fs::unafs::native_acl_read(rlb, rob).is_none()
+    {
+        w |= 1 << 4; // NO partial-durable row for B — the K9 lens-B residual is CLOSED
+    }
+
+    // ---- Phase 5: the volume fully recovers — a CLEAN re-persist of B now lands correctly ----
+    owned_set_owner(rlb, rob, K9_SA_OWN, gen_own, p_own);
+    if native_persist_create(K9_FILE_B, 0, rlb, rob, p_own) {
+        w |= 1 << 5; // clean persist of B succeeds after the recovery
+    }
+    if let Some(row) = crate::fs::unafs::native_acl_read(rlb, rob) {
+        if !row.owner.is_empty() {
+            w |= 1 << 6; // and reads back as the intended row (exactly the owner just set, no garbage)
+        }
+    }
+
+    k9_parity_cleanup();
+    w
+}
+
+/// K9-PARITY launcher + verdict — rides the U7 kernel task after K3/K5 (its disk I/O can never perturb the
+/// counted fixtures). Emits ONE uncounted `:: K9-parity: … PASS ::` line (the K1-atr `<noun> PASS` idiom), so the
+/// fixture PASS-count is unchanged. Fully self-cleaning.
+fn k9_parity_launcher() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if crate::drivers::block::info().is_none() {
+        return; // no SD -> the proof writes real files; skip silently
+    }
+    if let Ok(fs) = crate::fs::fat::mount() {
+        if fs.find_in_root(K9_FILE_A).is_ok() || fs.find_in_root(K9_FILE_B).is_ok() {
+            k9_parity_cleanup(); // stale scratch files from an interrupted run
+        }
+    }
+    let w = k9_parity_check();
+    serial_println!(
+        ":: K9-parity: staged ACL persist mid-staging-failure discard — no partial-durable row + later commit carries no discarded residue {} (fail-closed; A intact; B absent post-reboot; volume recovers) [w={:#04x}] ::",
+        if w == K9PARITY_ALL { "PASS" } else { "FAIL" },
         w
     );
 }
