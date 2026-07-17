@@ -5,3 +5,8 @@ edition = "2024"
 license = "GPL-3.0-or-later"
 
 [dependencies]
+# VMIMAGE-1: pure-Rust image packaging. `fatfs` formats + populates the FAT32 ESP;
+# `crc32fast` computes the GPT header/entry-array CRC-32s. The GPT + protective MBR are
+# hand-written (vm_image.rs) so the disk/partition GUIDs are DETERMINISTIC from the git hash.
+fatfs = { version = "0.3", default-features = false, features = ["std", "alloc"] }
+crc32fast = "1"

@@ -428,6 +428,42 @@ esp_x86() {
     echo -e "   Copy its contents to a FAT32 USB root, then boot the Mac holding ⌥ Option → 'EFI Boot'."
 }
 
+# VMIMAGE-1: emit ONE self-contained, distributable bootable disk image — a GPT disk with a FAT32
+# ESP carrying the SAME boot tree esp-x86 proves (EFI/BOOT/BOOTX64.EFI + kernel.elf + companions) +
+# a README-VM.txt. Boots in stock QEMU+OVMF / UTM / VirtualBox/VMware with EFI on, with zero UnaOS
+# tooling on the consumer's machine. The builder packages it in pure Rust (fatfs + hand-written GPT,
+# builder/src/vm_image.rs); no host mkfs/hdiutil. Writes ONLY to target/vm/ (never disturbs the
+# target/ state the test harness uses) and prints the image path + sha256.
+vm_image() {
+    local git7; git7="$(cd "$WORKSPACE_DIR" && git rev-parse --short=7 HEAD 2>/dev/null || echo 0000000)"
+    echo -e "${COLOR_CYAN}⚡ Building x86 boot products + packaging VM image (unaos-x86-${git7}.img)...${COLOR_RESET}"
+    build_user_hello_x86   # U2: target/hello.bin — the builder copies it into the ESP as HELLO.BIN
+    cd "$WORKSPACE_DIR/builder"
+    UNAOS_VM_IMAGE=1 UNAOS_VM_GIT7="$git7" cargo +nightly run --release
+    cd "$WORKSPACE_DIR"
+    local img="${WORKSPACE_DIR}/target/vm/unaos-x86-${git7}.img"
+    if [ ! -f "$img" ]; then
+        echo -e "${COLOR_RED}ERROR: expected image ${img} was not produced${COLOR_RESET}"; exit 1
+    fi
+    # sha256: prefer shasum (macOS) then sha256sum (Linux); fail honestly if neither exists.
+    local sha=""
+    if command -v shasum >/dev/null 2>&1; then
+        sha="$(shasum -a 256 "$img" | awk '{print $1}')"
+    elif command -v sha256sum >/dev/null 2>&1; then
+        sha="$(sha256sum "$img" | awk '{print $1}')"
+    else
+        echo -e "${COLOR_YELLOW}⚠ neither shasum nor sha256sum found — skipping checksum${COLOR_RESET}"
+    fi
+    echo -e "${COLOR_GREEN}✅ VM image: ${img}${COLOR_RESET}"
+    echo -e "   size: $(wc -c < "$img" | tr -d ' ') bytes"
+    [ -n "$sha" ] && echo -e "   sha256: ${sha}"
+    echo -e "   Boot it (stock QEMU+OVMF, no arroyo harness):"
+    echo -e "     qemu-system-x86_64 -machine q35 -m 1G \\"
+    echo -e "       -drive if=pflash,format=raw,readonly=on,file=<OVMF_CODE.fd> \\"
+    echo -e "       -drive format=raw,file=${img} -serial stdio"
+    echo -e "   (README-VM.txt inside the image has the UTM / VirtualBox / VMware paths.)"
+}
+
 # Build the FAT32 test image(s) the kernel's read-only FAT reader parses (ls/cat). Ensures the x86
 # ESP is packaged first (so EFI/ + kernel.elf populate the volume), then builds a partitioned image
 # (MBR@LBA0 -> BPB) and a superfloppy (BPB@LBA0). Test with `UNAOS_FATIMG=1 ./arroyo test`.
@@ -890,6 +926,9 @@ case "${1:-}" in
     esp-jetson|esp_jetson|jetson)
         esp_jetson
         ;;
+    vm-image|vm_image|vmimage|vm)
+        vm_image
+        ;;
     fat-img|fat_img|fatimg)
         fat_img
         ;;
@@ -925,7 +964,7 @@ case "${1:-}" in
         ;;
     *)
         echo -e "${COLOR_RED}Unknown command: $1${COLOR_RESET}"
-        echo "Usage: ./arroyo [x86|arm|test [secs]|test-arm [secs]|check|build|esp-x86|esp-arm|esp-jetson|fat-img|test-fat [part|gpt|p16|sf] [secs]|kernel8|kernel8-run|kernel8-test [secs]|battery|clean]"
+        echo "Usage: ./arroyo [x86|arm|test [secs]|test-arm [secs]|check|build|esp-x86|esp-arm|esp-jetson|vm-image|fat-img|test-fat [part|gpt|p16|sf] [secs]|kernel8|kernel8-run|kernel8-test [secs]|battery|clean]"
         exit 1
         ;;
 esac

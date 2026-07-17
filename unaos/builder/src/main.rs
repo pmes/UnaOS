@@ -16,6 +16,8 @@
 
 use std::process::{Command, Stdio};
 
+mod vm_image;
+
 fn main() {
     let workspace_dir = std::fs::canonicalize("..").unwrap();
     let target_dir = workspace_dir.join("target");
@@ -144,6 +146,17 @@ fn main() {
         println!("   U2: copied HELLO.BIN onto the ESP");
     } else {
         println!("   U2: target/hello.bin absent — ESP has no HELLO.BIN (run via ./arroyo esp-x86)");
+    }
+
+    // VMIMAGE-1: package the just-built ESP tree into ONE self-contained GPT+FAT32 disk image
+    // (target/vm/unaos-x86-<git7>.img) and stop — no QEMU. Reuses the SAME build products packed
+    // above; the image builder never rebuilds. UNAOS_VM_GIT7 carries the short git hash (identity
+    // + deterministic-GUID seed); arroyo's `vm-image` sets it. See builder/src/vm_image.rs.
+    if std::env::var("UNAOS_VM_IMAGE").is_ok() {
+        let git7 = std::env::var("UNAOS_VM_GIT7").unwrap_or_else(|_| "0000000".into());
+        let img = vm_image::build(&target_dir, &esp_dir, &git7);
+        println!("✅ VM image packaged at {}", img.display());
+        return;
     }
 
     // Package-only mode: build + pack the ESP, then stop (no QEMU). Used to produce real-hardware
