@@ -4411,7 +4411,33 @@ exact trigger this sitting named above: a CRCR write while RS=1. Builds clean fo
 attended metal run, not exercised in this repo's CI. Draft forum reply:
 `~/.claude/plans/unaos/review/unaos-orin-repro-REPLY.md` (Peter's call whether/when to post
 and whether to offer the reproducer source). Landing checklist:
-`~/.claude/plans/unaos/review/unaos-orin-repro-LANDING.md`.
+`~/.claude/plans/unaos/review/unaos-orin-repro-LANDING.md`. (Correction of record: the
+"echo write" described above was the original design; the independent review lens changed the
+one gated write to a synthetic, non-null, 64-byte-aligned pointer with RCS=1 —
+`0x2_0000_0000 | 1` — matching the shape of the kernel's validated trigger write, since an
+echo would load a NULL ring pointer per xHCI §5.4.5, an untested variant. `a412320`.)
+
+**⚡ ATTENDED RESULT (2026-07-17, Peter, 26+ runs): NO REPRODUCTION.** The standalone
+reproducer was run 26+ times across BOTH boot sticks (new official + old) and never fired the
+fault. This is the pre-registered non-repro branch of the landing report, and it is a finding,
+not a tool failure. Two hypotheses remain, unseparated:
+1. **The bare CRCR write on the untouched UEFI-inherited controller is NOT the sufficient
+   trigger** — the kernel's fuller takeover sequence (halt, reprogram DCBAAP/ERST/CONFIG,
+   restart RS, THEN the quiesce write) does something necessary to reach the poisoned
+   condition that a single direct register write does not.
+2. **No boot in the window was poisoned** (the box-state-over-time axis) — the session had no
+   positive control: a known wall-faulter kernel layout was not booted in the same window to
+   confirm the box was in a faulting state at all. Precedent: the July-15 2/2-deterministic
+   IOB faulter binary went 3/3 clean the next day unchanged.
+Discriminating experiment (when a bench window opens): pair boots in ONE session — the known
+wall-faulter layout vs. the reproducer, interleaved. Faulter fires + reproducer doesn't ⇒
+hypothesis 1 confirmed (revise the reproducer toward the full takeover sequence). Neither
+fires ⇒ hypothesis 2 (box not poisoned; result inconclusive, retry another day). **The
+staged forum reply (`unaos-orin-repro-REPLY.md`) must NOT be posted as-is** — its reproducer
+section describes a tool now known not to reproduce at n=26+; per the landing report's own
+pre-registration, the reply's trigger framing needs revision first. The repo copy of the
+tool's README was removed from the working tree (Peter, 2026-07-17) to avoid automated-scanner
+friction; the tool itself stays cataloged here.
 
 ### ORIN-SMP-8 — the tegrasmp RELINK (the layout-axis close-out; BUILD-ONLY, `UNAOS_TEGRASMP` + `UNAOS_XCARVE_RELINK`)
 
