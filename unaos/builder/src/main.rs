@@ -56,19 +56,25 @@ fn main() {
     // OPTS OUT (never-run no-routing experiment) => zero config-space writes, byte-identical no-routing
     // media; inert on QEMU (non-Intel xHCI). x86_64 only. Kept in sync with arroyo's mapping.
     if std::env::var("UNAOS_NOPORTSW").is_ok() { feats.push("noportsw"); }
-    // EHCI-1 scout: UNAOS_EHCISCOUT=1 arms a STRICTLY READ-ONLY EHCI reconnaissance probe (dumps the
-    // EHCI companion controllers' cap/op/PORTSC state at boot; zero writes). x86_64-only module.
-    // Kept in sync with arroyo's mapping; also adds a QEMU `-device usb-ehci` test target below.
-    if std::env::var("UNAOS_EHCISCOUT").is_ok() { feats.push("ehciscout"); }
-    // EHCI-2 configure-and-relook scout: UNAOS_EHCICONFIG=1 arms a knob-gated minimal EHCI wake
-    // sequence + two PORTSC censuses (before/after CONFIGFLAG=1). Implies ehciscout. Writes confined
-    // to the EHCI functions' PMCSR/USBLEGSUP-OS-own/USBLEGCTLSTS/RS/CONFIGFLAG/PORTSC-port-power. x86_64-only.
-    // Kept in sync with arroyo's mapping.
-    if std::env::var("UNAOS_EHCICONFIG").is_ok() { feats.push("ehciconfig"); }
-    // EHCI-3 driver: UNAOS_EHCIHID=1 arms the minimal EHCI HID driver (rMBP internal keyboard/
-    // trackpad). Implies ehciconfig. Also moves the QEMU usb-kbd onto the harness ehci bus below
-    // so the driver has a direct-path (Topology B) HID target. Kept in sync with arroyo's mapping.
-    if std::env::var("UNAOS_EHCIHID").is_ok() { feats.push("ehcihid"); }
+    // EHCI-1 scout: UNAOS_EHCISCOUT=1 fires the STRICTLY READ-ONLY EHCI reconnaissance census probe
+    // (dumps the EHCI companion controllers' cap/op/PORTSC state at boot; zero writes). `ehciscout_run`
+    // gates only the pci.rs call site — the scout MODULE is compiled by default (the EHCI-3 driver
+    // below is built from it). x86_64-only. Kept in sync with arroyo; also adds a QEMU `-device
+    // usb-ehci` test target below.
+    if std::env::var("UNAOS_EHCISCOUT").is_ok() { feats.push("ehciscout_run"); }
+    // EHCI-2 configure-and-relook scout: UNAOS_EHCICONFIG=1 fires a knob-gated minimal EHCI wake
+    // sequence + two PORTSC censuses (before/after CONFIGFLAG=1). `ehciconfig_run` gates only the call
+    // site (implies ehciconfig for the wake it shares with the driver). Writes confined to the EHCI
+    // functions' PMCSR/USBLEGSUP-OS-own/USBLEGCTLSTS/RS/CONFIGFLAG/PORTSC-port-power. Pair with
+    // UNAOS_NOEHCIHID=1 for pure evidence (no driver). x86_64-only. Kept in sync with arroyo.
+    if std::env::var("UNAOS_EHCICONFIG").is_ok() { feats.push("ehciconfig_run"); }
+    // EHCI-4 M1: the EHCI-3 minimal HID driver (rMBP internal keyboard/trackpad) is now DEFAULT-ON on
+    // x86 — metal-proven to type (usb_xhci.md §10). Push `ehcihid` (implies ehciconfig->ehciscout, and
+    // the ACPI-root retention it uses) UNLESS opted out with UNAOS_NOEHCIHID=1, which unlinks the
+    // module + every call site => byte-identical to the pre-fold no-EHCI media (PORTSW-1 policy).
+    // Also moves the QEMU usb-kbd onto the harness ehci bus below by default so the driver has a
+    // direct-path (Topology B) HID target. Kept in sync with arroyo's mapping.
+    if std::env::var("UNAOS_NOEHCIHID").is_err() { feats.push("ehcihid"); }
     // VPERF M2: the fbcon viewport-cap bench lever (implies videobench). x86_64 only.
     if std::env::var("UNAOS_VIDEOCAP").is_ok() { feats.push("videocap"); }
     // SOCK-1: route the shell's ping/arp/netinfo + the boot ICMP witness through smoltcp. x86-only
@@ -289,11 +295,14 @@ fn main() {
     // device set has no EHCI, so attach a standalone `usb-ehci` PCI controller (class 0x0C0320) — no
     // downstream device, so the scout reports the controller's cap/op/PORTSC state with 0 connected
     // ports (the honest QEMU result). This is a QEMU-harness knob, not a kernel write path.
-    let ehcihid = std::env::var("UNAOS_EHCIHID").is_ok();
+    // EHCI-4 M1: the driver is DEFAULT-ON, so the harness usb-ehci controller + the usb-kbd-on-ehci
+    // routing ride by default; UNAOS_NOEHCIHID=1 restores the pre-fold harness (kbd on xHCI, no EHCI
+    // controller unless a scout knob asks for one).
+    let ehcihid = std::env::var("UNAOS_NOEHCIHID").is_err();
     if std::env::var("UNAOS_EHCISCOUT").is_ok() || std::env::var("UNAOS_EHCICONFIG").is_ok() || ehcihid {
         cmd.arg("-device").arg("usb-ehci,id=ehci");
         if ehcihid {
-            println!("   UNAOS_EHCIHID: usb-ehci controller attached — EHCI HID driver target (usb-kbd rides the ehci bus)");
+            println!("   EHCI-HID (default-on): usb-ehci controller attached — EHCI HID driver target (usb-kbd rides the ehci bus; UNAOS_NOEHCIHID=1 to opt out)");
         } else if std::env::var("UNAOS_EHCICONFIG").is_ok() {
             println!("   UNAOS_EHCICONFIG: usb-ehci controller attached — EHCI configure-and-relook scout target");
         } else {
@@ -311,7 +320,7 @@ fn main() {
         cmd.arg("-drive").arg(format!("if=none,id=stick,format=raw,file={}", stick_image.display()))
            .arg("-device").arg("usb-storage,bus=xhci.0,drive=stick,bootindex=1");
     }
-    // EHCI-3 harness: with UNAOS_EHCIHID the keyboard rides the EHCI bus (QEMU's usb-kbd is
+    // EHCI-3 harness: by default (EHCI-4 M1 driver on) the keyboard rides the EHCI bus (QEMU's usb-kbd is
     // HS-capable, so it trains directly on the EHCI root port — Topology B). It REPLACES the
     // xHCI keyboard in this mode so QMP `send-key` routes deterministically to the EHCI device
     // (two keyboards would leave the routing to QEMU's whim). QEMU cannot model the RMH hub

@@ -861,6 +861,46 @@ broken only by panic-`Location` line-number metadata (`.data.rel.ro`) + symbol t
 shifting from the cfg-gated insertions in shared files — code-free drift, stated here
 rather than hand-waved.
 
+### 10a. EHCI-4 M1 — the default-ON fold
+
+The EHCI-3 metal verdict above (M3, the internal keyboard TYPES) is the evidence gate the
+pre-registered default-ON fold (Peter item (b), the PORTSW-1 pattern) waited on. So on x86
+the EHCI HID driver now runs **by default**; `UNAOS_NOEHCIHID=1` **opts out**.
+
+**Mechanism (and why it differs mechanically from PORTSW-1).** PORTSW is one self-contained
+`pci.rs` function, so its fold was a literal cfg inversion (`#[cfg(not(feature = "noportsw"))]`).
+The EHCI driver instead sits on a deep positive-feature implication chain
+(`ehcihid` → `ehciconfig` → `ehciscout`, plus the ACPI-root retention in `acpi.rs` and the
+`service_ehci_hid` main-loop hook) — inverting every gate would churn a byte-identity-proven
+shared module (`ehci_scout`) and a second subsystem (`acpi`). The fold instead flips the
+**plumbing**: `arroyo`/`builder` push `ehcihid` **by default** and suppress it under
+`UNAOS_NOEHCIHID=1`. Every existing `#[cfg(feature = "ehcihid" | "ehciconfig" | "ehciscout")]`
+gate is unchanged and now resolves on-by-default; opting out enables none of them, so the
+module + all call sites unlink and the kernel is **byte-identical to the pre-fold no-EHCI
+media** (proven: opt-out `.text`/`.rodata` SHA256 == the pre-fold default build,
+`7bbde326…` / `f939e27d…`). The user-facing contract is the PORTSW negative-knob idiom;
+the compile topology is preserved intact.
+
+**Diagnostic decouple.** `ehciscout`/`ehciconfig` are now *compile* features (the scout
+module + shared wake are built by default because the driver depends on them). The read-only
+census (`scout()`) and the configure-and-relook evidence pass (`configure_and_relook()`) are
+gated at their `pci.rs` call sites on new **`ehciscout_run`/`ehciconfig_run`** features, so a
+default boot builds the module but runs **only the driver** — neither evidence probe fires
+(no census spam, no redundant pre-init wake). `UNAOS_EHCISCOUT=1`/`UNAOS_EHCICONFIG=1` still
+arm the probes; pair either with `UNAOS_NOEHCIHID=1` for probe-without-driver (the old
+pure-evidence mode). QEMU-confirmed: the default boot enumerates the harness EHCI HID
+(`M1 … TOPOLOGY B`, `M2 armed keyboard`) with **zero** `EHCI-CONFIG census` lines.
+
+**Gates (M1).** Knob-matrix `./arroyo check` green both arches for default, `UNAOS_NOEHCIHID=1`,
+`UNAOS_EHCISCOUT=1 UNAOS_EHCICONFIG=1`, and `UNAOS_NOEHCIHID=1 UNAOS_EHCICONFIG=1`
+(pure-evidence). Default `test 40` MISSION SUCCESS with the driver enumerating on the same
+boot; `UNAOS_NOSTORAGE=1` clean; `UNAOS_IRQSTORAGE=1 UNAOS_FATIMG=sf test 200` 0 FAIL / 0
+PANIC with the storage service task + real FAT writes (S3/S4/S5/S8) unregressed under the
+default-active driver (the R6 coexistence proof now runs as the DEFAULT config). Opt-out
+byte-identity proven as above. The harness moves the QEMU `usb-kbd` onto the EHCI bus **by
+default** now (was `UNAOS_EHCIHID`-gated); `UNAOS_NOEHCIHID=1` restores the pre-fold harness
+(kbd on xHCI, no EHCI controller unless a scout knob asks).
+
 ---
 
 ## See also

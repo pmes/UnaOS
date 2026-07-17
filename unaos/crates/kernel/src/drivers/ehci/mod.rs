@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 
-//! EHCI-3 — a minimal, polling-first EHCI HID driver (UNAOS_EHCIHID=1, feature `ehcihid`).
+//! EHCI-3 — a minimal, polling-first EHCI HID driver (feature `ehcihid`). EHCI-4 M1: DEFAULT-ON
+//! on x86 (the internal keyboard is metal-proven to type; usb_xhci.md §10a); `UNAOS_NOEHCIHID=1`
+//! opts out => this module + every call site unlink, byte-identical to the pre-fold no-EHCI media.
 //!
 //! Purpose: the 2012 rMBP's internal keyboard + trackpad are real USB devices asleep behind the
 //! Panther Point EHCI companions on NON-switchable ports (EHCI-2 metal census: censusB = one

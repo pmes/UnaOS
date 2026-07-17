@@ -194,30 +194,30 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
         crate::video::vperf::pci_display_probe();
     }
 
-    // EHCI-1 scout (opt-in, UNAOS_EHCISCOUT=1): STRICTLY READ-ONLY EHCI reconnaissance — dump the
+    // EHCI-1 scout (opt-in probe, UNAOS_EHCISCOUT=1 -> `ehciscout_run`): STRICTLY READ-ONLY EHCI reconnaissance — dump the
     // EHCI companion controllers' PCI/MMIO/PORTSC state so an EHCI driver arc can be planned against
     // real register evidence (the 2012 rMBP internal kbd/trackpad live on EHCI-only ports). Runs
     // independently of the xHCI scan below; issues NO writes to any register or port. Knob OFF =>
     // this call does not exist and the module is unlinked (media byte-identical).
-    #[cfg(feature = "ehciscout")]
+    #[cfg(feature = "ehciscout_run")]
     crate::drivers::ehci_scout::scout();
 
-    // EHCI-2 configure-and-relook (opt-in, UNAOS_EHCICONFIG=1): after the read-only census, run a
+    // EHCI-2 configure-and-relook (opt-in probe, UNAOS_EHCICONFIG=1 -> `ehciconfig_run`): after the read-only census, run a
     // MINIMAL EHCI wake sequence (PMCSR->D0, USBLEGSUP OS-ownership handshake, RS=1, CONFIGFLAG=1 +
     // port-power) with two PORTSC censuses (before/after CONFIGFLAG=1) so the attended rMBP sitting
     // can distinguish asleep-until-configured USB internals from not-USB. Writes are confined to the
     // EHCI functions' own registers; it never touches xHCI routing, never enumerates, never transfers.
     // Knob OFF => this call does not exist and the config path is unlinked (module byte-identical to
     // the EHCI-1 read-only scout).
-    #[cfg(feature = "ehciconfig")]
+    #[cfg(feature = "ehciconfig_run")]
     crate::drivers::ehci_scout::configure_and_relook();
 
-    // EHCI-3 driver (opt-in, UNAOS_EHCIHID=1): the minimal EHCI HID driver — shared EHCI-2 wake,
-    // port reset, synchronous EP0 enumeration (M1 topology-fork witness), periodic interrupt-IN
-    // QHs feeding boot reports to the main-loop service_ehci_hid() poll. Runs BEFORE the PORTSW
-    // flip + xhci::init below: the internal HID sit on NON-switchable EHCI-only ports (PORTSW-1
-    // §7f), so the port sets are disjoint by hardware and the two stacks coexist permanently.
-    // Never touches an xHCI register. Knob OFF => this call and the module do not exist.
+    // EHCI-3 driver (EHCI-4 M1: DEFAULT-ON, opt out with UNAOS_NOEHCIHID=1): the minimal EHCI HID
+    // driver — shared EHCI-2 wake, port reset, synchronous EP0 enumeration (M1 topology-fork
+    // witness), periodic interrupt-IN QHs feeding boot reports to the main-loop service_ehci_hid()
+    // poll. Runs BEFORE the PORTSW flip + xhci::init below: the internal HID sit on NON-switchable
+    // EHCI-only ports (PORTSW-1 §7f), so the port sets are disjoint by hardware and the two stacks
+    // coexist permanently. Never touches an xHCI register. Opt-out => this call + the module unlink.
     #[cfg(feature = "ehcihid")]
     crate::drivers::ehci::init();
 
