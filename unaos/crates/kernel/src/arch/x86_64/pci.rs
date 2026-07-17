@@ -212,6 +212,15 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
     #[cfg(feature = "ehciconfig")]
     crate::drivers::ehci_scout::configure_and_relook();
 
+    // EHCI-3 driver (opt-in, UNAOS_EHCIHID=1): the minimal EHCI HID driver — shared EHCI-2 wake,
+    // port reset, synchronous EP0 enumeration (M1 topology-fork witness), periodic interrupt-IN
+    // QHs feeding boot reports to the main-loop service_ehci_hid() poll. Runs BEFORE the PORTSW
+    // flip + xhci::init below: the internal HID sit on NON-switchable EHCI-only ports (PORTSW-1
+    // §7f), so the port sets are disjoint by hardware and the two stacks coexist permanently.
+    // Never touches an xHCI register. Knob OFF => this call and the module do not exist.
+    #[cfg(feature = "ehcihid")]
+    crate::drivers::ehci::init();
+
     if let Some((xhci_phys_addr, bus, dev, func)) = crate::drivers::pci::PciScanner::scan() {
         serial_println!(":: x86_64 PCI Init: Found xHCI at {:#x} ::", xhci_phys_addr);
 

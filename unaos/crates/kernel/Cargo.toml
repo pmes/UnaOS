@@ -84,6 +84,15 @@ ehciscout = []
 # transfers, NO driver, and nothing touching xHCI routing. Implies `ehciscout`; default OFF => the
 # config path is unlinked and the module is byte-identical to the EHCI-1 read-only scout.
 ehciconfig = ["ehciscout"]
+# EHCI-3 driver: UNAOS_EHCIHID=1 arms the minimal EHCI HID driver — the shared EHCI-2 wake, port
+# reset, synchronous EP0 enumeration with the M1 topology-fork witness (RMH hub tier vs direct
+# device), periodic interrupt-IN QHs, and boot keyboard/mouse reports decoded to pal::Events in a
+# main-loop poll (no interrupts). For the 2012 rMBP internal keyboard/trackpad on the
+# non-switchable EHCI-only ports; runs permanently alongside xHCI (disjoint ports, PORTSW-1 §7f),
+# never touching an xHCI register. Implies `ehciconfig` (the wake layer it builds on). Default OFF
+# => module + call sites unlinked, media byte-identical; stays OFF until the keyboard is
+# metal-proven (the PORTSW default-ON pattern, Peter's word 2026-07-16).
+ehcihid = ["ehciconfig"]
 # SOCK-1: route the shell's ping/arp/netinfo through the mature smoltcp TCP/IP stack (ROADMAP §1b)
 # instead of the hand-rolled `net` engines. Pulls in the x86-only smoltcp optional dependency and
 # compiles the `smolnet` Device adapter over the e1000e rings (the module is additionally
