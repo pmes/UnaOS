@@ -1,5 +1,21 @@
 # UnaOS Kernel Network Stack
 
+> **RETIRED AS THE DEFAULT (SMOLNET-DEFAULT, 2026-07-17).** This document describes
+> the **hand-rolled** `net` crate, which is **no longer the x86 kernel's default
+> TCP/IP stack** — as of Peter's 2026-07-17 ruling the default is the mature
+> [smoltcp](https://github.com/smoltcp-rs/smoltcp) stack. The **doc of record** for
+> the live networking stack is
+> [`unaos/docs/dev/OS/08_NET/networking.md`](../../../../unaos/docs/dev/OS/08_NET/networking.md).
+>
+> The hand-rolled code was **not** trashed and **not** removed (never-trash-code):
+> it remains in tree at [`unaos/crates/net`](../../../../unaos/crates/net/) (see its
+> `README.md` for the catalog entry), is **still live** (it backs the driver's
+> `service_net()` poll, DHCP, the TCP echo listener, and the shell's
+> `connect`/`fetch`/`udpsend`), and is the **complete opt-out stack** under
+> `UNAOS_NOSMOLNET=1` — **available for resumption** if we choose to resume
+> hand-rolling our own. Build with `UNAOS_NOSMOLNET=1` to run everything below as
+> the whole net path. The material in this document remains accurate for that crate.
+
 The network stack is a hand-written, dependency-free TCP/IP implementation in
 the `net` crate (`unaos/crates/net`). It is `#![no_std]` for kernel builds and
 uses only `core`; `std` is linked solely under `cargo test` so the estimator
