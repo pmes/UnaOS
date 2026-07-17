@@ -4439,6 +4439,24 @@ pre-registration, the reply's trigger framing needs revision first. The repo cop
 tool's README was removed from the working tree (Peter, 2026-07-17) to avoid automated-scanner
 friction; the tool itself stays cataloged here.
 
+**⚡⚡ SAME-WINDOW DISCRIMINATION (2026-07-17 R21 attended sitting — the hypothesis-1 answer):**
+serial of record `~/unaos-bench/jetson-serial-2026-07-17-r21-sitting.log`. The fresh merged-main
+default candidate (`af1af39`, kernel `80475a57…`, tegra:109) went 2 clean boots (boot A fully
+captured: CAPSTONE 6/6, zero RAS, **VUG-HONESTY parked-core witness PASS on silicon**; boot B
+attested-unlogged) then **wall-faulted on boot 3** at USB enumeration — the exact carveout
+signature (SNOC `0xec00030d`/SERR `0xd`/Carveout `0x3` + ACI FillWrite `0x9`, ADDR `…dc40`),
+panel "lockup" = the RAS power-off freezing scanout. Candidate therefore **DISQUALIFIED for
+default duty** (defaults rule); stick restored to validated `cad623af…` and the restore **proven
+to shell** (third captured boot, CAPSTONE 6/6, clean). Then the decisive leg: **the standalone
+reproducer ran 13-for-13 SILENT minutes after the kernel fault, same box, same window** (28
+pre/post write lines on serial), on top of the morning's 26-run silence. **Verdict: hypothesis 1
+CONFIRMED — the bare register write is NOT the sufficient trigger; the kernel's fuller takeover
+sequence is required to reach the poisoned condition.** Hypothesis 2 (box not poisoned) is dead
+for this window — the kernel path faulted minutes earlier. Consequences: (a) the NVIDIA reply
+revision is UNBLOCKED with this framing (tool = honest negative + the takeover sequence as the
+real trigger; Peter posts); (b) the wall remains live on current firmware; (c) the af1af39-era
+layout joins the faulter ledger (~1-in-3 observed, small sample).
+
 ### ORIN-SMP-8 — the tegrasmp RELINK (the layout-axis close-out; BUILD-ONLY, `UNAOS_TEGRASMP` + `UNAOS_XCARVE_RELINK`)
 
 ORIN-SMP-7's attended sitting exonerated the wake POSITION axis end-to-end (legs 24/25 both put 5/5
