@@ -71,6 +71,12 @@ _feats=""
 # feature not pushed => module + all call sites unlinked => byte-identical to the pre-fold no-EHCI
 # default. Mirrors the PORTSW-1 default-ON/negative-knob policy. x86_64 only; aarch64 identical.
 [ -z "${UNAOS_NOEHCIHID:-}" ] && _feats="${_feats}ehcihid,"
+# BATMON-1: the Apple SMC battery monitor (x86_64). UNAOS_SMC=1 arms the polled SMC key/value driver
+# (boot key-inventory scout + battery snapshot for the on-screen meter). Port I/O confined to
+# 0x300/0x304; no value-mutating writes. The builder attaches QEMU's isa-applesmc under this knob so
+# the protocol machinery is gated by a known-key read; battery keys are metal-first. Default OFF =>
+# module + call sites unlinked, media byte-identical. Kept in sync with builder/src/main.rs.
+[ -n "${UNAOS_SMC:-}" ] && _feats="${_feats}smc,"
 # SOCK-1: route the shell's ping/arp/netinfo + a boot ICMP witness through the smoltcp stack
 # (ROADMAP §1b). x86-only optional dep + x86-gated module — enabling it on the aarch64 `check`
 # invocation is a no-op (smoltcp isn't pulled for that target), so aarch64 stays byte-identical.

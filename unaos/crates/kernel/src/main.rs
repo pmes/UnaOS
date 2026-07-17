@@ -692,6 +692,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // rMBP keyboard/trackpad path. Same polled-service spot as the xHCI hooks above.
             #[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]
             unaos_kernel::drivers::ehci::service_ehci_hid();
+            // BATMON-1 (x86, smc knob): refresh the battery snapshot (throttled internally to ~1 s)
+            // and emit the `:: SMC-BATT: ... ::` witness. This is the serial-less metal-sitting view
+            // (fbcon mirrors serial to the screen), so the battery readout is on-screen here too.
+            #[cfg(all(target_arch = "x86_64", feature = "smc"))]
+            unaos_kernel::drivers::smc::battery::refresh_if_due();
             // STOR-1 (x86, irqstorage knob): storage service task + `bx-blockreq` self-test, so the
             // interrupt-driven path is exercised on the serial-less metal boot too. One-shot, gated on
             // storage; a no-op without the knob.

@@ -489,6 +489,10 @@ pub fn run_crystal(pal: &mut TargetPal, mode: Mode) {
             };
             // Per-core CPU-pulse load — the honest two-source pick lives in `CpuPulse::refresh`.
             cpu.refresh(m.load);
+            // BATMON-1 (x86, smc knob): refresh the cached battery snapshot on the same steady
+            // cadence the meters redraw on (internally throttled to ~1 s of actual SMC port I/O).
+            #[cfg(all(target_arch = "x86_64", feature = "smc"))]
+            crate::drivers::smc::battery::refresh_if_due();
             win_ms = now_ms;
             win_frames = 0;
             work_acc = 0;
@@ -572,6 +576,38 @@ fn draw_meters(pal: &mut TargetPal, m: &RenderStats, cpu: &CpuPulse, h: i32) {
         x += mt.text_w(num.len()) + 2 * gap;
         x = draw_pulse_bar(pal, x, y, seg_w, seg_h, gap, cpu.load[c], METER_PURPLE);
         x += mt.cell_w; // inter-core air
+    }
+
+    // --- BATMON-1 battery meter (x86, smc knob) -------------------------------------------
+    // An honest on-screen battery bar fed by the cached SMC snapshot (no port I/O on this
+    // per-frame path — `battery::cached()` is a cheap lock read; the main loop / the 200 ms meter
+    // cadence own the refresh). When no SMC battery answers (QEMU, or a machine without one) it
+    // renders an explicit empty state — never a fabricated number. Two text pitches above RENDER.
+    #[cfg(all(target_arch = "x86_64", feature = "smc"))]
+    {
+        let snap = crate::drivers::smc::battery::cached();
+        let by = base.saturating_sub(2 * mt.line_h);
+        pal.draw_text(x0, by, "BATT", METER_LABEL);
+        let bx = x0 + mt.text_w(5);
+        let bw = mt.text_w(10);
+        pal.draw_rect(bx, by, bw, mt.cell_h, METER_DIM);
+        if let Some(soc) = snap.soc_pct {
+            let fill = (soc.min(100) as usize * bw) / 100;
+            pal.draw_rect(bx, by, fill, mt.cell_h, METER_LILAC);
+        }
+        let line = if snap.present {
+            let soc = snap.soc_pct.map(|v| v as i32).unwrap_or(-1);
+            let mv = snap.volt_mv.map(|v| v as i32).unwrap_or(-1);
+            let flow = match snap.amp_ma {
+                Some(a) if a > 0 => "chg",
+                Some(a) if a < 0 => "dis",
+                _ => "--",
+            };
+            alloc::format!("{}%  {}mV  {}", soc, mv, flow)
+        } else {
+            alloc::string::String::from("no SMC battery data")
+        };
+        pal.draw_text(x0, by + mt.line_h, &line, METER_LABEL);
     }
 }
 

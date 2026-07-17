@@ -8,6 +8,10 @@ pub mod ehci_scout;
 // trackpad live on non-switchable EHCI-only ports. Knob off => unlinked, media byte-identical.
 #[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]
 pub mod ehci;
+// BATMON-1: Apple SMC polled key/value driver (UNAOS_SMC=1) — the 2012 rMBP battery monitor.
+// x86_64-only; knob off => the module is unlinked and media byte-identical.
+#[cfg(all(target_arch = "x86_64", feature = "smc"))]
+pub mod smc;
 pub mod block;
 pub mod e1000;
 // M6g: the BCM2711 EMMC2/SDHCI microSD driver backing the block layer on the bare-metal Pi 4.

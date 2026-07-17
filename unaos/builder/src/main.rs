@@ -77,6 +77,10 @@ fn main() {
     // Also moves the QEMU usb-kbd onto the harness ehci bus below by default so the driver has a
     // direct-path (Topology B) HID target. Kept in sync with arroyo's mapping.
     if std::env::var("UNAOS_NOEHCIHID").is_err() { feats.push("ehcihid"); }
+    // BATMON-1: the Apple SMC battery monitor (x86_64). UNAOS_SMC=1 arms the polled SMC key/value
+    // driver; the QEMU isa-applesmc device is attached below under the same knob so the protocol
+    // machinery is gated by a known-key read. Kept in sync with arroyo's mapping.
+    if std::env::var("UNAOS_SMC").is_ok() { feats.push("smc"); }
     // VPERF M2: the fbcon viewport-cap bench lever (implies videobench). x86_64 only.
     if std::env::var("UNAOS_VIDEOCAP").is_ok() { feats.push("videocap"); }
     // SOCK-1: route the shell's ping/arp/netinfo + the boot ICMP witness through smoltcp. x86-only
@@ -356,6 +360,19 @@ fn main() {
         println!("   UNAOS_EHCITABLET: usb-tablet on the EHCI bus — EHCI-4 M2 report-pointer path target");
     } else {
         cmd.arg("-device").arg("usb-tablet,bus=xhci.0");
+    }
+    // BATMON-1 (UNAOS_SMC=1): attach QEMU's ISA AppleSMC so the SMC driver has a protocol target.
+    // The emulated device answers the polled key/value protocol on iobase 0x300 with a tiny key set
+    // (REV/OSK0/OSK1 + a few status keys) — enough to gate the read-key machinery via a known-key
+    // read. It carries NO battery keys and implements neither #KEY nor GET_KEY_BY_INDEX, so those
+    // stay metal-first (the driver reports them cleanly absent on QEMU). The `osk` here is a
+    // deliberately fake placeholder (not Apple's key) — irrelevant to reading REV, and this harness
+    // never boots macOS. Only attached under the knob, so default media/QEMU runs are unchanged.
+    if std::env::var("UNAOS_SMC").is_ok() {
+        cmd.arg("-device").arg(
+            "isa-applesmc,osk=UNAOSisNOTaMACplaceholderOSKxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        );
+        println!("   UNAOS_SMC: isa-applesmc attached (iobase 0x300) — SMC protocol/read-key target");
     }
     cmd.arg("-m").arg("1G");
 

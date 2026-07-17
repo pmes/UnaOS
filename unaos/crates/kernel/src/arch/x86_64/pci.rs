@@ -221,6 +221,19 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
     #[cfg(feature = "ehcihid")]
     crate::drivers::ehci::init();
 
+    // BATMON-1 (UNAOS_SMC=1): fire the Apple SMC key-inventory scout once, here at the early x86
+    // bring-up point (like the EHCI scout above) so its `:: SMC-SCOUT: ... ::` lines land once in
+    // every knob-ON boot log. Read-only w.r.t. SMC state (port I/O confined to 0x300/0x304, no
+    // value-mutating WRITE_CMD). Knob OFF => this call does not exist and the module is unlinked.
+    #[cfg(feature = "smc")]
+    {
+        crate::drivers::smc::scout();
+        // M2: take one battery reading at boot so every knob-ON boot log carries a `:: SMC-BATT: ::`
+        // witness proving the snapshot read path ran (honest `present=false` on QEMU / a machine
+        // without a battery). The main loops + the vug meter cadence keep refreshing it live.
+        crate::drivers::smc::battery::refresh_if_due();
+    }
+
     if let Some((xhci_phys_addr, bus, dev, func)) = crate::drivers::pci::PciScanner::scan() {
         serial_println!(":: x86_64 PCI Init: Found xHCI at {:#x} ::", xhci_phys_addr);
 
