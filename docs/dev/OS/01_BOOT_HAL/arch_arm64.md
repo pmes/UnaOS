@@ -4454,3 +4454,33 @@ default stays `cad623af…`/`d3ecf48`). Gates green: `./arroyo check` both arche
 TEGRASMP, TEGRASMP+RELINK}; knob-off byte-identity re-proven; full `arroyo battery` GREEN (x86 `test
 25` MISSION, arm virt v2 MISSION, GICv3 CAPSTONE 6/6 + 3/3 secondaries, `kernel8-test` 0-FAIL,
 esp-jetson links); `UNAOS_HUBSTORAGE` x86 MISSION SUCCESS. Bench runbook: `scripts/orin-smp8-bench.md`.
+
+**⚡⚡ SMP-8 SITTING VERDICT (2026-07-16 attended, Peter + LC-orin; serial
+`~/unaos-bench/jetson-serial-2026-07-16-smp8-sitting.log`; 8 boots, 0 faults, both walls silent):**
+
+- **Relinked tegrasmp (2/2 CLEAN): the production SMP path is CODE-COMPLETE on Orin silicon** —
+  full boots to 5 real APs online + CAPSTONE 6/6 + live 6-core shell, twice.
+- **Today-original-layout tegrasmp (1/1 clean):** the pre-registered fault prediction VIOLATED
+  (STOP recorded) — but today's "original knobs" is itself a new layout at today's base.
+- **THE TRUE CONTROL — the LITERAL July-15 2/2-faulting binary (`915249a6…`): 3/3 CLEAN today**,
+  on the new stick ×2 AND the original shared stick ×1. **The layout axis is REFUTED as the
+  sufficient explanation, and the stick/device axis is REFUTED too: the fault-determining state
+  is BOX-STATE OVER TIME** (persistent firmware/fabric state that changed between 2026-07-15 and
+  tonight — candidates: cumulative DC-cut history, firmware-internal latches; NOT image, NOT
+  device, NOT code). This also retro-reads the carveout wall's "layout correlation": layout
+  modulated the odds within a session, but the underlying poisoned-latch state is temporal.
+- **SMP-3 CLOSES:** the fault was never the SMP code (legs 21–25 + tonight's 8 = every axis
+  acquitted); the production 6-core bring-up runs end-to-end. The residual mystery (what box
+  state loaded the dice on July-15) merges into the xHCI-wall/firmware-erratum investigation —
+  one combined proposal to Peter, not two.
+- Sitting-4 media provenance: relinked `095b9251…` / today-original `510869fd…` / July-15 binary
+  `915249a6…` all hash-verified on-stick per boot; new official Orin stick commissioned mid-
+  sitting (full ESP prep from staged tar; no more rMBP sharing). ⚠ Process note (cost one wasted
+  boot): a mid-sitting "old stick" control ran on the NEW stick — caught by CONTENT-signature
+  identity check (old stick carries HELLO.BIN/hello.txt), re-run correctly; media identity
+  checks by content, not by operator memory, are now part of the flash discipline.
+- **Bolt-1 attended window: SATISFIED, GREEN** (same evening, host-side): STATUS honest-AMBER →
+  dry-run reviewed → attended `--apply` (SNAP-first) → all 5 mirrors coherent, penumbra 235/0/0,
+  narino untouched. The reframed UnaFS-NATIVE vaire arc-2 proposal is UNBLOCKED (per the R18
+  baton: UnaFS objects on the K-line machinery + NSSPAN-pattern per-phase ticks so the first
+  native sync IS the baseline FS benchmark).
