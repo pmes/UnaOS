@@ -1194,15 +1194,31 @@ pub fn init() {
                     //      forces the 32/48-byte burst QH fetch but requires ZERO write-back.
                     //      Clean => burst reads fine, the wall is DMA WRITES; HSE => burst
                     //      reads themselves are gated (4-byte reads pass regardless).
-                    for (pass, arm_qh) in [(1u32, false), (2, true)] {
+                    // Pass 3 (probe-11): the WRITE discriminator. The QH's overlay is
+                    // PRE-LOADED with an active zero-length interrupt-IN to a nonexistent
+                    // address (no qTD fetch, no overlay load) — the controller executes the
+                    // wire transaction (nobody answers, XactErr) and must then WRITE the
+                    // token back. HSE here = upstream DMA writes are gated, QED (probes 1-10
+                    // proved every read class passes). A written-back token instead would
+                    // falsify the write theory on the spot.
+                    for (pass, arm_qh) in [(1u32, false), (2, true), (3, true)] {
                         if arm_qh {
                             let qh = c.async_qh; // idle work QH, reused as the inert target
                             (*qh).horiz = PTR_TERMINATE;
-                            (*qh).ep_chars = QH_DTC | QH_EPS_HIGH | (64 << QH_MPS_SHIFT);
+                            (*qh).ep_chars = (42) // bogus device address, EP 1
+                                | (1 << 8)
+                                | QH_DTC
+                                | QH_EPS_HIGH
+                                | (8 << QH_MPS_SHIFT);
                             (*qh).ep_caps = QH_MULT1 | 0x01; // S-mask µframe 0
                             (*qh).overlay[0] = PTR_TERMINATE;
                             (*qh).overlay[1] = PTR_TERMINATE;
-                            (*qh).overlay[2] = QTD_HALTED; // inactive — fetch, no work, no write
+                            (*qh).overlay[2] = if pass == 2 {
+                                QTD_HALTED // inactive — fetch, no work, no write
+                            } else {
+                                // Pre-loaded active token: IN, CERR=1 (fail fast), 0 bytes.
+                                QTD_ACTIVE | (1 << 10) | QTD_PID_IN
+                            };
                             for i in 0..1024 {
                                 core::ptr::write_volatile(
                                     c.frame_list.add(i),
@@ -1219,10 +1235,15 @@ pub fn init() {
                             mmio_read32(h.op + OP_USBSTS).unwrap_or(0) & (1 << 14) == 0
                         });
                         serial_println!(
-                            ":: EHCI-HID: [{}] periodic DMA smoke pass {} ({}): USBSTS={:#010x} HSE={} HCHalted={} == witness ::",
+                            ":: EHCI-HID: [{}] periodic DMA smoke pass {} ({}): USBSTS={:#010x} HSE={} HCHalted={} post-token={:#010x} == witness ::",
                             idx, pass,
-                            if arm_qh { "inactive-QH burst fetch, zero writeback" } else { "empty frame list" },
-                            sts, (sts >> 4) & 1, (sts >> 12) & 1
+                            match pass {
+                                1 => "empty frame list",
+                                2 => "inactive-QH burst fetch, zero writeback",
+                                _ => "preloaded active IN to bogus addr -> forced token WRITE-back",
+                            },
+                            sts, (sts >> 4) & 1, (sts >> 12) & 1,
+                            core::ptr::read_volatile(&(*c.async_qh).overlay[2])
                         );
                         if arm_qh {
                             for i in 0..1024 {
@@ -1282,6 +1303,13 @@ pub fn init() {
             rcba_reg, rcba, rcba_reg & 1
         );
         if rcba_reg & 1 == 1 && rcba != 0 {
+            // Probe-11: the chipset-config VIRTUAL CHANNEL block (V0/V1/VCp at the RCBA head)
+            // — a misconfigured isoch/private channel would abort device WRITES specifically.
+            for off in [0x0000u64, 0x0014, 0x0018, 0x001C, 0x0020, 0x0024, 0x0028, 0x0030] {
+                if let Some(v) = mmio_read32(rcba + off) {
+                    serial_println!(":: EHCI-HID: RCBA+{:#06x} = {:#010x} ::", off, v);
+                }
+            }
             for off in [0x3400u64, 0x3404, 0x3410, 0x3414, 0x3418, 0x341C, 0x3420, 0x3428, 0x342C, 0x3430, 0x3434] {
                 if let Some(v) = mmio_read32(rcba + off) {
                     serial_println!(":: EHCI-HID: RCBA+{:#06x} = {:#010x} ::", off, v);
