@@ -1250,6 +1250,18 @@ const UP_GENERIC_DESKTOP: u16 = 0x01;
 const UP_BUTTON: u16 = 0x09;
 const UP_DIGITIZER: u16 = 0x0D;
 
+/// Hard cap on the per-Input-item field-loop trip count (HARDENING — the driver is default-ON, so
+/// this parser runs on ANY plugged USB device's descriptor). `Report Count` is a global item read
+/// VERBATIM from the descriptor and its 4-byte form (0x97) can carry up to 0xFFFF_FFFF; an
+/// unclamped `for j in 0..report_count` lets an ~11-byte hostile descriptor drive a multi-billion-
+/// iteration loop during enumeration → boot stall (DoS). A report is delivered into the 64-byte
+/// interrupt buffer (`Buf64` = 512 bits), so a *legitimate* Input item packs at most 512 one-bit
+/// fields; anything larger cannot fit a real report and is a malformed/hostile descriptor. We cap
+/// the loop (and the bit-offset advance) at this bound — the field map for a real pointer is
+/// unaffected, a hostile count is clamped and the device is decoded on what actually fits (or
+/// skipped as non-pointer). Mirrors the existing `report_count.min(32)` button clamp.
+const MAX_REPORT_FIELDS: u32 = 512;
+
 /// Read `size` bits little-endian (LSB-first, HID packing) starting at bit `off` from `data`.
 fn extract_bits(data: &[u8], off: u16, size: u8) -> u32 {
     let mut v = 0u32;
@@ -1332,8 +1344,12 @@ unsafe fn parse_report_descriptor(desc: &[u8]) -> Option<ReportLayout> {
                 let is_const = data & 0x01 != 0; // Constant (padding) — reserve space, no field
                 let is_var = data & 0x02 != 0;
                 let is_rel = data & 0x04 != 0;
+                // HARDENING: clamp the field-loop trip count against a hostile Report Count (see
+                // MAX_REPORT_FIELDS) — an unclamped 0..report_count is a plug-in DoS on the
+                // default-ON driver. The bit-offset advance below uses the same clamped count.
+                let count = report_count.min(MAX_REPORT_FIELDS);
                 if !is_const && is_var {
-                    for j in 0..report_count {
+                    for j in 0..count {
                         let usage = if (j as usize) < nusg {
                             usages[j as usize]
                         } else if nusg > 0 {
@@ -1369,7 +1385,11 @@ unsafe fn parse_report_descriptor(desc: &[u8]) -> Option<ReportLayout> {
                         l.btn_count = report_count.min(32) as u8;
                     }
                 }
-                bit_off = bit_off.saturating_add((report_size as u16) * (report_count as u16));
+                // Advance by the CLAMPED count (and saturate the u16) so a hostile Report Count
+                // neither loops nor overflows the running bit offset.
+                let advance = (report_size.min(u16::MAX as u32) as u16)
+                    .saturating_mul(count.min(u16::MAX as u32) as u16);
+                bit_off = bit_off.saturating_add(advance);
                 l.total_bits = l.total_bits.max(bit_off);
                 // Local state is cleared after every Main item (HID 1.11 §6.2.2.8).
                 nusg = 0;
@@ -1445,6 +1465,31 @@ unsafe fn dump_report_descriptor(idx: usize, addr: u8, intf: u8, report_len: u16
         idx, addr, intf, desc.len(), report_len,
         if desc.len() < report_len as usize { " [truncated at read cap]" } else { "" },
         hex
+    );
+}
+
+/// Parser hardening self-test (runs once at driver init, since the driver is default-ON). Feeds
+/// the report parser a HOSTILE descriptor — `Report Count = 0xFFFF_FFFF` (4-byte form 0x97) on an
+/// X field — and asserts it returns *bounded* instead of spinning a multi-billion-iteration loop.
+/// PRE-FIX this call never returns (the boot hangs); POST-FIX (MAX_REPORT_FIELDS clamp) it returns
+/// immediately as `None` (only X, no Y → not a pointer). A legit X/Y descriptor is parsed alongside
+/// to prove the clamp does not break the real path. One serial witness line either way.
+unsafe fn parser_selftest() {
+    // Usage Page(Generic Desktop), Usage(X), Report Size(8), Report Count(0xFFFFFFFF), Input(Var).
+    let hostile: [u8; 13] = [
+        0x05, 0x01, 0x09, 0x30, 0x75, 0x08, 0x97, 0xFF, 0xFF, 0xFF, 0xFF, 0x81, 0x02,
+    ];
+    let hostile_bounded = parse_report_descriptor(&hostile).is_none();
+    // Usage Page(GD), Usage(X), Usage(Y), Report Size(16), Report Count(2), Input(Var).
+    let legit: [u8; 12] = [
+        0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x75, 0x10, 0x95, 0x02, 0x81, 0x02,
+    ];
+    let legit_ok = parse_report_descriptor(&legit)
+        .map(|l| l.has_xy && l.x_size == 16 && l.y_size == 16 && l.x_off == 0 && l.y_off == 16)
+        .unwrap_or(false);
+    serial_println!(
+        ":: EHCI-HID: report-parser self-test: hostile report_count clamped (bounded={}, cap={}), legit X/Y parse ok={} == witness ::",
+        hostile_bounded, MAX_REPORT_FIELDS, legit_ok
     );
 }
 
@@ -1587,6 +1632,9 @@ unsafe fn pci_evidence(bus: u8, dev: u8, func: u8, idx: usize) {
 /// stacks' port sets are disjoint by hardware — PORTSW-1 §7f).
 pub fn init() {
     serial_println!(":: EHCI-HID: begin (EHCI-3 driver, polling model, knob-gated) ::");
+    // Hardening self-test up front (default-ON driver parses ANY device's descriptor): proves the
+    // report-parser is bounded against a hostile Report Count before we enumerate anything.
+    unsafe { parser_selftest() };
     let mut ctrls: Vec<Controller> = Vec::new();
     // Probe-13 (b), Peter-approved 2026-07-17: the RCBA CG (clock gating) base + a one-shot
     // flag — the clear fires only if the live-port smoke actually HSEs.
