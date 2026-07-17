@@ -1201,9 +1201,16 @@ pub fn init() {
                     // token back. HSE here = upstream DMA writes are gated, QED (probes 1-10
                     // proved every read class passes). A written-back token instead would
                     // falsify the write theory on the spot.
-                    for (pass, arm_qh) in [(1u32, false), (2, true), (3, true)] {
+                    // Passes 4/5 (probe-12): payload-read isolation. 4 = zero-length OUT to
+                    // the bogus address (controls for OUT direction, still no buffer);
+                    // 5 = 8-byte OUT (forces the controller to READ the payload buffer to
+                    // transmit — the ONE access class every failing SETUP starts with and
+                    // pass 3 never exercised). HSE on 5 alone names the wall: payload-read
+                    // DMA gated while structure reads/writes + wire transactions all pass.
+                    for (pass, arm_qh) in [(1u32, false), (2, true), (3, true), (4, true), (5, true)] {
                         if arm_qh {
                             let qh = c.async_qh; // idle work QH, reused as the inert target
+                            let self_buf = c.setup_buf_phys as u32;
                             (*qh).horiz = PTR_TERMINATE;
                             (*qh).ep_chars = (42) // bogus device address, EP 1
                                 | (1 << 8)
@@ -1213,11 +1220,16 @@ pub fn init() {
                             (*qh).ep_caps = QH_MULT1 | 0x01; // S-mask µframe 0
                             (*qh).overlay[0] = PTR_TERMINATE;
                             (*qh).overlay[1] = PTR_TERMINATE;
-                            (*qh).overlay[2] = if pass == 2 {
-                                QTD_HALTED // inactive — fetch, no work, no write
-                            } else {
-                                // Pre-loaded active token: IN, CERR=1 (fail fast), 0 bytes.
-                                QTD_ACTIVE | (1 << 10) | QTD_PID_IN
+                            (*qh).overlay[2] = match pass {
+                                2 => QTD_HALTED, // inactive — fetch, no work, no write
+                                // Pre-loaded active tokens, CERR=1 (fail fast), bogus addr:
+                                3 => QTD_ACTIVE | (1 << 10) | QTD_PID_IN, // 0-len IN
+                                4 => QTD_ACTIVE | (1 << 10) | QTD_PID_OUT, // 0-len OUT, no buffer
+                                _ => {
+                                    // 8-byte OUT — forces the payload buffer READ.
+                                    (*qh).overlay[3] = self_buf; // buffer page 0 = setup_buf
+                                    QTD_ACTIVE | (1 << 10) | QTD_PID_OUT | (8 << QTD_TOTAL_SHIFT)
+                                }
                             };
                             for i in 0..1024 {
                                 core::ptr::write_volatile(
@@ -1240,7 +1252,9 @@ pub fn init() {
                             match pass {
                                 1 => "empty frame list",
                                 2 => "inactive-QH burst fetch, zero writeback",
-                                _ => "preloaded active IN to bogus addr -> forced token WRITE-back",
+                                3 => "preloaded 0-len IN bogus -> forced token WRITE-back",
+                                4 => "preloaded 0-len OUT bogus (no buffer)",
+                                _ => "preloaded 8-byte OUT bogus -> forced PAYLOAD READ",
                             },
                             sts, (sts >> 4) & 1, (sts >> 12) & 1,
                             core::ptr::read_volatile(&(*c.async_qh).overlay[2])
