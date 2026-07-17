@@ -46,7 +46,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use super::{cache, exceptions, gic, percpu, timer};
+use super::{cache, exceptions, gic, percpu, sched, timer};
 
 /// Per-core slot cap for the static arrays (stacks, `CORE_READY`, the enumeration buffer). The Orin
 /// build sizes it to 8 (covers the Nano's 6 cores + headroom, matching `percpu::NUM_CPUS`); QEMU `virt`
@@ -301,10 +301,18 @@ extern "C" fn __secondary_rust_virt(_advisory: u64) -> ! {
     // confirm the reverse direction.
     gic::send_sgi(BSP_AFFINITY.load(Ordering::Acquire) as usize, IPI_SGI);
 
+    // Honest idle heartbeat (VUG-1 M3b): this core is online but parks WITHOUT running the scheduler,
+    // so it never calls `dispatch_next` and its CPU-pulse counters would stay (0,0) — a pinned/undefined
+    // meter bar for a demonstrably-online-idle core. Register it as idle so the bar reads honest 0% busy.
+    // Bump BEFORE the first WFI (deterministic: the BSP's bring-up summary can then witness idle > 0),
+    // and on every wake so the heartbeat tracks the core staying parked-idle. Introspection-only,
+    // lock-free relaxed — no scheduling-path effect.
+    sched::note_core_idle(core);
     // Park: IRQs unmasked, so a BSP → AP SGI wakes this WFI, is serviced (handle_irq_v3 counts it), and
     // the core re-parks. No scheduler on this path (see the module header).
     loop {
         unsafe { core::arch::asm!("wfi", options(nomem, nostack, preserves_flags)) };
+        sched::note_core_idle(core);
     }
 }
 
