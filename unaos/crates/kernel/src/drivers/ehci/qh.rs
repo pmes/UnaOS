@@ -93,6 +93,14 @@ pub fn phys_of<T>(p: *const T, align: u64) -> Option<u64> {
 #[repr(C, align(64))]
 pub struct Buf64(pub [u8; 64]);
 
+/// A 256-byte, 64-byte-aligned control-DATA buffer (EHCI-4 M2). The EP0 data stage reads into
+/// this: enumeration descriptors stay ≤ 64 B (unchanged), but a HID **report descriptor**
+/// (the trackpad path) is routinely larger — this holds one so the report parser sees the whole
+/// thing and the doc can capture it verbatim. Still < one 4 KiB page from the page-aligned pool,
+/// so a single qTD buffer-page pointer covers it (buf[1..5] stay zero); < 4 GiB by construction.
+#[repr(C, align(64))]
+pub struct Buf256(pub [u8; 256]);
+
 /// One statically-allocated interrupt-endpoint slot (QH + single re-armed qTD + report buffer).
 #[repr(C)]
 pub struct IntSlot {
@@ -120,7 +128,10 @@ pub struct DmaPool {
     pub qtd_data: Qtd,
     pub qtd_status: Qtd,
     pub setup_buf: Buf64,
-    pub data_buf: Buf64,
+    /// EHCI-4 M2: 256 B so the EP0 data stage can read a full HID report descriptor (the trackpad
+    /// report path), not just the ≤ 64 B enumeration descriptors. Behaviour-neutral for the small
+    /// reads — they simply do not use the extra room.
+    pub data_buf: Buf256,
     pub int_slots: [IntSlot; 4],
 }
 

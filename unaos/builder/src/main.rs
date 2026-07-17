@@ -331,8 +331,20 @@ fn main() {
     } else {
         cmd.arg("-device").arg("usb-kbd,bus=xhci.0");
     }
-    cmd.arg("-device").arg("usb-tablet,bus=xhci.0")
-       .arg("-m").arg("1G");
+    // EHCI-4 M2 gate (UNAOS_EHCITABLET=1): move the usb-tablet onto the EHCI bus so the driver's
+    // report-protocol POINTER path is exercised end-to-end — QEMU's usb-tablet is a non-boot
+    // (proto 0) absolute pointer, exactly the trackpad shape, so the driver reads + parses its HID
+    // report descriptor (GET_DESCRIPTOR(Report)), arms a report-protocol interrupt-IN QH, and
+    // decodes X/Y/buttons to pal::Event::MouseAbsolute. Default: tablet stays on xHCI (the xHCI HID
+    // tests keep their pointer). Only meaningful with the driver active (ignored under NOEHCIHID).
+    let ehci_tablet = ehcihid && std::env::var("UNAOS_EHCITABLET").is_ok();
+    if ehci_tablet {
+        cmd.arg("-device").arg("usb-tablet,bus=ehci.0");
+        println!("   UNAOS_EHCITABLET: usb-tablet on the EHCI bus — EHCI-4 M2 report-pointer path target");
+    } else {
+        cmd.arg("-device").arg("usb-tablet,bus=xhci.0");
+    }
+    cmd.arg("-m").arg("1G");
 
     // U2.5 (UNAOS_USBSERIAL): attach an FTDI FT232 usb-serial device on the xHCI bus. QEMU's
     // `-device usb-serial` emulates an FT232 (VID 0x0403 PID 0x6001, bulk IN 0x81 / OUT 0x02); its
