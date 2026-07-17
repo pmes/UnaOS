@@ -703,14 +703,16 @@ impl Controller {
         }
 
         if class == 0x09 {
-            if depth >= 1 {
+            // Metal (probe-14e): the internal keyboard/trackpad sit behind an SMSC 0424:2512
+            // hub which itself hangs off the RMH — depth 2 is the real internal topology.
+            if depth >= 2 {
                 serial_println!(
-                    ":: EHCI-HID: [{}] hub behind hub (addr {}) — beyond the RMH tier, out of this arc's scope; skipped ::",
-                    self.idx, addr
+                    ":: EHCI-HID: [{}] hub at depth {} (addr {}) — beyond the internal tier; skipped ::",
+                    self.idx, depth, addr
                 );
                 return;
             }
-            self.bring_up_hub(&t);
+            self.bring_up_hub(&t, depth);
         } else {
             self.configure_hid(&t);
         }
@@ -718,7 +720,7 @@ impl Controller {
 
     /// Topology A: enumerate the hub (the RMH on metal), walk its downstream ports, and
     /// enumerate each connected child through the hub's TT.
-    unsafe fn bring_up_hub(&mut self, hub: &Target) {
+    unsafe fn bring_up_hub(&mut self, hub: &Target, depth: u8) {
         if self.control(hub, 0x00, 9, 1, 0, 0, false).is_err() {
             serial_println!(":: EHCI-HID: [{}] hub addr {} SET_CONFIGURATION failed ::", self.idx, hub.addr);
             return;
@@ -799,7 +801,7 @@ impl Controller {
             // port. A HS child needs no TT (fields stay zero).
             let (ha, hp) = if child_eps == QH_EPS_HIGH { (0, 0) } else { (hub.addr, port as u8) };
             settle_ms(10);
-            self.enumerate_at_zero(child_eps, ha, hp, 1);
+            self.enumerate_at_zero(child_eps, ha, hp, depth + 1);
         }
     }
 
