@@ -57,6 +57,10 @@ pub fn _print(args: ::core::fmt::Arguments) {
     // `tste` can replay them. Additive, alloc-free, `try_lock` only; safe from this IRQ-masked
     // context; zero change to what is printed above.
     crate::selftest::capture(args);
+    // FLIGHT-RECORDER: capture the exact serial line bytes into the boot-log ring so `service()` can
+    // later flush the whole boot log to UNAOS.LOG on the FAT volume. Same discipline as the taps
+    // above — additive, alloc-free, `try_lock` only, drop-on-full; zero change to what is printed.
+    crate::flight_recorder::capture(args);
 }
 
 #[macro_export]

@@ -38,6 +38,12 @@ pub mod allocator;
 pub mod shell;
 pub mod selftest;
 
+// FLIGHT-RECORDER: capture the serial boot log into a bounded ring and flush it to UNAOS.LOG on the
+// FAT boot volume, so a consumer who boots the vm-image with no serial capture can copy the log off
+// the image afterward. x86-only (the capture tap lives in arch/x86_64/serial.rs); aarch64 unaffected.
+#[cfg(target_arch = "x86_64")]
+pub mod flight_recorder;
+
 pub mod pal;
 pub mod ui;
 pub mod video;

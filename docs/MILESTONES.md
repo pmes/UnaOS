@@ -10,6 +10,49 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-rmbp track — 2026-07-17 (FLIGHT-RECORDER — the vm-image boot log lands on the image as UNAOS.LOG) 🔬 QEMU-green (stock QEMU+OVMF), pairs with VMIMAGE-1 `hw-rmbp`
+
+### FLIGHT-RECORDER — capture the boot log in-kernel and flush it to `UNAOS.LOG`
+
+**What it does.** Closes the loop VMIMAGE-1 opened: a remote tester who boots the
+shareable `vm-image` in stock QEMU/UTM/VirtualBox/VMware has no way to capture the
+serial console (that needs harness flags a consumer won't have). Now the kernel
+records its own boot log and writes it to a plain file, `UNAOS.LOG`, at the root of
+the FAT boot volume — the tester shuts down, mounts the image, copies `UNAOS.LOG`
+off, and sends it back. Two x86-only halves: **(M1)** a bounded 64 KiB static ring
+captures the exact serial line bytes via a THIRD additive tap on the single serial
+print seam (`arch/x86_64/serial.rs::_print`, alongside `ftdi::mirror` /
+`selftest::capture`) — alloc-free, `try_lock` only, drop-on-full, safe from the
+IRQ-masked print context, on by default (no knob — a consumer needs no flags).
+**(M2)** `flight_recorder::service()` runs from the x86 main loop after
+`fat::probe_once`; once a block device is up it writes the ring to `/UNAOS.LOG` via
+the SAME public `fat.rs` entry points the shell's `write` uses (`find_located` /
+`create_in_root` / `delete_located` / `write_grow` — call-never-edit; no `fat.rs`
+change, no format change). Write-through + bounded (a stalled USB write is
+`FatError::Io`, never a hang); re-flushes on growth (throttled) so late lines reach
+the disk before a hard power-off; honest-and-silent on error (a non-FAT/absent
+volume is a quiet skip, a real write error is one witness line), never a panic,
+never blocks boot. The file carries a self-identifying header line (in the file
+only; the live serial stream is unchanged). **Storage fact:** the kernel drives USB
+mass storage (xHCI BOT) but not IDE/SATA, so the vm-image must be attached over USB
+for the log to be written back — the VM-image consumer docs (`README-VM.txt`, root
+README, `arroyo vm-image`) now recommend the usb-storage attachment.
+
+**How it was tested.** `./arroyo check` both arches OK (aarch64 byte-untouched —
+module + tap + main-loop calls all x86-cfg-gated). Full x86 regression:
+`UNAOS_IRQSTORAGE=1 UNAOS_FATIMG=sf ./arroyo test 200` = 0 FAIL / 23 PASS +
+`FLIGHTREC … -> PASS`; `./arroyo test 40` MISSION SUCCESS, 0 FAIL (raw non-FAT
+usb.img → flush self-skips silently); `UNAOS_NOSTORAGE=1 ./arroyo test 40` 11 PASS
+0 FAIL (no block device → service self-skips). **End-to-end (M3):** built
+`./arroyo vm-image`, booted the `.img` in STOCK QEMU+OVMF as a usb-storage device
+with NO harness flags → `UnaOS UEFI Bootloader Started` + `FS: FAT mounted: FAT32`
++ `FLIGHTREC: boot log -> UNAOS.LOG … -> PASS`; powered off, host-mounted the
+`.img`, and read `UNAOS.LOG` at the image root — the self-identifying header + the
+kernel boot log + `-> PASS` witnesses. `crates/kernel/src/flight_recorder.rs` (new)
++ the `_print` tap + the main-loop wiring + the vm-image consumer docs. **Metal:**
+not required for this arc (the `target/vm/` `.img` is the QEMU proof; no flash
+media staged).
+
 ## us-videonext track — 2026-07-17 (VWIT — headless witness for the damage-tracked render path) 🔬 QEMU-green `us-videonext`
 
 ### VWIT — the `Screen` present path gets an automated regression
@@ -31,6 +74,48 @@ aarch64. Headless x86 boot driven via `scripts/qmp_type.py --text tste` →
 `:: VWIT: render present — format=Bgr damage=OK noop=OK clip=OK ::` +
 `:: TSTE: video.present -> PASS ::` in serial.log, MISSION SUCCESS intact, 0 TSTE
 FAIL. `d9ae8ce`.
+## hw-rmbp track — 2026-07-17 (FLIGHT-RECORDER — the vm-image boot log lands on the image as UNAOS.LOG) 🔬 QEMU-green (stock QEMU+OVMF), pairs with VMIMAGE-1 `hw-rmbp`
+
+### FLIGHT-RECORDER — capture the boot log in-kernel and flush it to `UNAOS.LOG`
+
+**What it does.** Closes the loop VMIMAGE-1 opened: a remote tester who boots the
+shareable `vm-image` in stock QEMU/UTM/VirtualBox/VMware has no way to capture the
+serial console (that needs harness flags a consumer won't have). Now the kernel
+records its own boot log and writes it to a plain file, `UNAOS.LOG`, at the root of
+the FAT boot volume — the tester shuts down, mounts the image, copies `UNAOS.LOG`
+off, and sends it back. Two x86-only halves: **(M1)** a bounded 64 KiB static ring
+captures the exact serial line bytes via a THIRD additive tap on the single serial
+print seam (`arch/x86_64/serial.rs::_print`, alongside `ftdi::mirror` /
+`selftest::capture`) — alloc-free, `try_lock` only, drop-on-full, safe from the
+IRQ-masked print context, on by default (no knob — a consumer needs no flags).
+**(M2)** `flight_recorder::service()` runs from the x86 main loop after
+`fat::probe_once`; once a block device is up it writes the ring to `/UNAOS.LOG` via
+the SAME public `fat.rs` entry points the shell's `write` uses (`find_located` /
+`create_in_root` / `delete_located` / `write_grow` — call-never-edit; no `fat.rs`
+change, no format change). Write-through + bounded (a stalled USB write is
+`FatError::Io`, never a hang); re-flushes on growth (throttled) so late lines reach
+the disk before a hard power-off; honest-and-silent on error (a non-FAT/absent
+volume is a quiet skip, a real write error is one witness line), never a panic,
+never blocks boot. The file carries a self-identifying header line (in the file
+only; the live serial stream is unchanged). **Storage fact:** the kernel drives USB
+mass storage (xHCI BOT) but not IDE/SATA, so the vm-image must be attached over USB
+for the log to be written back — the VM-image consumer docs (`README-VM.txt`, root
+README, `arroyo vm-image`) now recommend the usb-storage attachment.
+
+**How it was tested.** `./arroyo check` both arches OK (aarch64 byte-untouched —
+module + tap + main-loop calls all x86-cfg-gated). Full x86 regression:
+`UNAOS_IRQSTORAGE=1 UNAOS_FATIMG=sf ./arroyo test 200` = 0 FAIL / 23 PASS +
+`FLIGHTREC … -> PASS`; `./arroyo test 40` MISSION SUCCESS, 0 FAIL (raw non-FAT
+usb.img → flush self-skips silently); `UNAOS_NOSTORAGE=1 ./arroyo test 40` 11 PASS
+0 FAIL (no block device → service self-skips). **End-to-end (M3):** built
+`./arroyo vm-image`, booted the `.img` in STOCK QEMU+OVMF as a usb-storage device
+with NO harness flags → `UnaOS UEFI Bootloader Started` + `FS: FAT mounted: FAT32`
++ `FLIGHTREC: boot log -> UNAOS.LOG … -> PASS`; powered off, host-mounted the
+`.img`, and read `UNAOS.LOG` at the image root — the self-identifying header + the
+kernel boot log + `-> PASS` witnesses. `crates/kernel/src/flight_recorder.rs` (new)
++ the `_print` tap + the main-loop wiring + the vm-image consumer docs. **Metal:**
+not required for this arc (the `target/vm/` `.img` is the QEMU proof; no flash
+media staged).
 
 ## hw-jetson track — 2026-07-17 (ORIN-SMP idle-heartbeat — parked-core pinned-bar fix) 🔬 QEMU-green, metal vug witness accruing `hw-jetson`
 

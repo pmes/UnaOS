@@ -707,6 +707,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             }
             // Once storage is up, mount + log the FAT volume geometry (one-shot).
             unaos_kernel::fs::fat::probe_once();
+            // FLIGHT-RECORDER (x86): flush the captured serial boot log to UNAOS.LOG (usbdebug metal
+            // boot benefits from an on-disk log too). Gated on storage; throttled; never blocks boot.
+            #[cfg(target_arch = "x86_64")]
+            unaos_kernel::flight_recorder::service();
             // U2 (x86): also run the FAT loader HERE so its lines are VISIBLE on the serial-less
             // metal boot — the usbdebug view keeps fbcon attached (unlike the GUI loop, which detaches
             // it before U2 runs). Same one-shot gate; loads HELLO.BIN + prints `hello from disk` + the
@@ -874,6 +878,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // Once storage is up, mount + log the FAT volume geometry (one-shot). Runs with the xHCI
         // lock released; read_block re-locks it briefly, so there is no nested-lock hazard.
         unaos_kernel::fs::fat::probe_once();
+        // FLIGHT-RECORDER (x86): flush the captured serial boot log to UNAOS.LOG on the FAT volume so
+        // a consumer who booted the vm-image (no serial capture) can copy the log off afterward.
+        // Gated on storage internally; re-flushes on growth, throttled; never blocks boot.
+        #[cfg(target_arch = "x86_64")]
+        unaos_kernel::flight_recorder::service();
         // U2 (x86): once a block device is present, load HELLO.BIN off the FAT volume and run it in
         // ring 3 (one-shot, gated like probe_once). Must live HERE, in the main loop — not with the
         // pre-xHCI U1a/U1b demo — because `fat::mount()` needs the usb-storage block device that
