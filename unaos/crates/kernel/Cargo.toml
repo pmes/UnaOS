@@ -127,12 +127,14 @@ tegra = []
 # const). Enable via `UNAOS_SMPPROBE=<n> UNAOS_TEGRA=1 ./arroyo esp-jetson`.
 smpprobe = []
 
-# ORIN-SMP-3: the `UNAOS_TEGRASMP=1` real 6-core Orin SMP kick-off (arch/aarch64 smp_virt.rs
+# ORIN-SMP-DEFAULT: the real 6-core Orin SMP kick-off (arch/aarch64 smp_virt.rs
 # `start_secondaries_tegra` + the fdt_tegra `/cpus` presence enumerator), wired into
-# `tegra_early_stop` after JM4 and BEFORE the JM6 drop. Tegra-only. With this feature OFF (default)
-# the kick-off + its `/cpus` enumerator vanish and the tegra image is byte-identical to baseline
-# (build twice, compare hashes). The DTB `/cpus` node is the ONLY presence oracle (RIDER 1). Enable
-# via `UNAOS_TEGRASMP=1 UNAOS_TEGRA=1 ./arroyo esp-jetson`. See arch_arm64.md §ORIN-SMP-3.
+# `tegra_early_stop` after JM4 and BEFORE the JM6 drop. Tegra-only. As of ORIN-SMP-DEFAULT this
+# feature is DEFAULT-ON for tegra builds (the build scripts push it for any tegra image unless
+# UNAOS_NOTEGRASMP=1 opts out) — metal-proven across SMP-1..8. With the feature OFF (UNAOS_NOTEGRASMP=1)
+# the kick-off + its `/cpus` enumerator vanish and the tegra image runs workers on the boot core only,
+# byte-identical to the pre-flip baseline (build twice, compare hashes). The DTB `/cpus` node is the
+# ONLY presence oracle (RIDER 1). See arch_arm64.md §ORIN-SMP.
 tegrasmp = ["tegra"]
 
 # JETSON-XCARVE M2: the `UNAOS_XCARVE=1` inherited-xHCI-pointer instrumentation

@@ -10,6 +10,33 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-jetson track — 2026-07-17 (ORIN-SMP-DEFAULT — the 6-core bring-up becomes the tegra default) 🔬 QEMU-green, DEFAULT-CANDIDATE pending metal record `hw-jetson`
+
+### ORIN-SMP-DEFAULT — tegrasmp default-on, `UNAOS_NOTEGRASMP` opt-out
+
+**What it does.** Promotes the real 6-core Orin SMP kick-off (§ORIN-SMP-3's
+`smp_virt::start_secondaries_tegra` + `/cpus` enumerator) from the opt-*in*
+`UNAOS_TEGRASMP=1` to the tegra **default**, with a new opt-*out* `UNAOS_NOTEGRASMP=1`
+(PORTSW-1/SMOLNET default-ON/negative-knob policy). Build-scripts only — no kernel
+source, no scheduler logic: the `tegrasmp` cfg already fully gates the kick-off, so
+the flip is purely which features the build pushes. `unaos/arroyo` arms `tegrasmp`
+for any tegra build (`esp-jetson` force-adds it; `UNAOS_TEGRA=1` adds it) unless
+`UNAOS_NOTEGRASMP=1`; `unaos/builder/src/main.rs` maps the explicit knob for parity
+(never builds tegra media); `Cargo.toml` `tegrasmp = ["tegra"]` unchanged.
+
+**How it was tested.** `./arroyo check` both arches × {default, `UNAOS_NOTEGRASMP=1`,
+`UNAOS_TEGRA=1`}. **Byte-identity proven:** default `esp-jetson` ≡ explicit
+`UNAOS_TEGRASMP=1` `esp-jetson` (`kernel.elf` sha256 `bde59b4f…`, both tegrasmp-on);
+`UNAOS_NOTEGRASMP=1` is the distinct boot-core-only baseline (`cb7df0a4…`, `tegra:` 109,
+zero `ORIN-SMP-3` strings) ≡ the pre-arc default (source unchanged). `./arroyo test-arm`
+MISSION SUCCESS; `UNAOS_GICV3=1 ./arroyo test-arm` CAPSTONE 6/6 + idle + busy heartbeat
+PASS + VUG-HONESTY witness PASS (virt secondaries unaffected — tegra-only flip);
+`./arroyo kernel8-test` 43 PASS / 0 FAIL (Pi unaffected). **Metal:** staged
+DEFAULT-CANDIDATE, **pending a clean multi-boot metal record** before it becomes the
+stick default (§ORIN-SMP-7-addendum rule; the §JETSON-XCARVE wall is layout-sensitive
+and a new default layout may sample it — expected wall data). `arroyo` +
+`builder/src/main.rs` + `Cargo.toml` + `arch_arm64.md §ORIN-SMP-DEFAULT`.
+
 ## hw-rmbp track — 2026-07-17 (FLIGHT-RECORDER — the vm-image boot log lands on the image as UNAOS.LOG) 🔬 QEMU-green (stock QEMU+OVMF), pairs with VMIMAGE-1 `hw-rmbp`
 
 ### FLIGHT-RECORDER — capture the boot log in-kernel and flush it to `UNAOS.LOG`
