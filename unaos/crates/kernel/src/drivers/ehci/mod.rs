@@ -1187,13 +1187,29 @@ pub fn init() {
                             let _ = mmio_write32(h.op + OP_USBSTS, sts & STS_RW1C);
                         }
                     }
-                    // Probe-6 discriminator: enable ONLY the periodic schedule over the
-                    // all-Terminate frame list for ~5 ms. The controller then fetches one
-                    // frame-list dword per frame and nothing else — the simplest possible
-                    // upstream read this function can issue. Clean => the master abort is
-                    // async-engine-specific; HSE => ALL upstream reads from this function
-                    // abort (points at PCH-level gating, not schedule programming).
-                    {
+                    // Probe-6/10 discriminators, two 5 ms periodic smoke passes:
+                    //  (1) all-Terminate frame list — one 4-byte frame-list read per frame,
+                    //      the simplest upstream read (probe-6: PASSED on metal).
+                    //  (2) frame list -> one INACTIVE QH (halted token, nothing to execute) —
+                    //      forces the 32/48-byte burst QH fetch but requires ZERO write-back.
+                    //      Clean => burst reads fine, the wall is DMA WRITES; HSE => burst
+                    //      reads themselves are gated (4-byte reads pass regardless).
+                    for (pass, arm_qh) in [(1u32, false), (2, true)] {
+                        if arm_qh {
+                            let qh = c.async_qh; // idle work QH, reused as the inert target
+                            (*qh).horiz = PTR_TERMINATE;
+                            (*qh).ep_chars = QH_DTC | QH_EPS_HIGH | (64 << QH_MPS_SHIFT);
+                            (*qh).ep_caps = QH_MULT1 | 0x01; // S-mask µframe 0
+                            (*qh).overlay[0] = PTR_TERMINATE;
+                            (*qh).overlay[1] = PTR_TERMINATE;
+                            (*qh).overlay[2] = QTD_HALTED; // inactive — fetch, no work, no write
+                            for i in 0..1024 {
+                                core::ptr::write_volatile(
+                                    c.frame_list.add(i),
+                                    (c.qh_phys as u32) | PTR_TYPE_QH,
+                                );
+                            }
+                        }
                         let cmd = mmio_read32(h.op + OP_USBCMD).unwrap_or(0);
                         let _ = mmio_write32(h.op + OP_USBCMD, cmd | CMD_PSE);
                         ehci_scout::settle_ms(5);
@@ -1203,14 +1219,24 @@ pub fn init() {
                             mmio_read32(h.op + OP_USBSTS).unwrap_or(0) & (1 << 14) == 0
                         });
                         serial_println!(
-                            ":: EHCI-HID: [{}] periodic DMA smoke (empty frame list, 5ms): USBSTS={:#010x} HSE={} HCHalted={} == witness ::",
-                            idx, sts, (sts >> 4) & 1, (sts >> 12) & 1
+                            ":: EHCI-HID: [{}] periodic DMA smoke pass {} ({}): USBSTS={:#010x} HSE={} HCHalted={} == witness ::",
+                            idx, pass,
+                            if arm_qh { "inactive-QH burst fetch, zero writeback" } else { "empty frame list" },
+                            sts, (sts >> 4) & 1, (sts >> 12) & 1
                         );
+                        if arm_qh {
+                            for i in 0..1024 {
+                                core::ptr::write_volatile(c.frame_list.add(i), PTR_TERMINATE);
+                            }
+                        }
                         if sts & STS_HSE != 0 {
-                            // Ack + re-run/restart so the port loop still reports honestly.
+                            // Ack + restart so later steps still report honestly.
                             let _ = mmio_write32(h.op + OP_USBSTS, sts & STS_RW1C);
                             let cmd2 = mmio_read32(h.op + OP_USBCMD).unwrap_or(0);
                             let _ = mmio_write32(h.op + OP_USBCMD, (cmd2 & !CMD_PSE) | CMD_RS);
+                            let _ = wait_bounded(|| {
+                                mmio_read32(h.op + OP_USBSTS).unwrap_or(STS_HCHALTED) & STS_HCHALTED == 0
+                            });
                         }
                     }
                     for port in 0..h.n_ports {
