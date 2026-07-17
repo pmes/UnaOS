@@ -46,7 +46,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use super::{cache, exceptions, gic, percpu, timer};
+use super::{cache, exceptions, gic, percpu, sched, timer};
 
 /// Per-core slot cap for the static arrays (stacks, `CORE_READY`, the enumeration buffer). The Orin
 /// build sizes it to 8 (covers the Nano's 6 cores + headroom, matching `percpu::NUM_CPUS`); QEMU `virt`
@@ -301,10 +301,19 @@ extern "C" fn __secondary_rust_virt(_advisory: u64) -> ! {
     // confirm the reverse direction.
     gic::send_sgi(BSP_AFFINITY.load(Ordering::Acquire) as usize, IPI_SGI);
 
+    // Honest idle heartbeat (VUG-1 M3b): this core is online but parks WITHOUT running the scheduler,
+    // so it never calls `dispatch_next` and its CPU-pulse counters would stay (0,0) — a pinned/undefined
+    // meter bar for a demonstrably-online-idle core. Register it as idle so the bar reads honest 0% busy.
+    // Bump once at park entry AND on every WFI wake — the wake bump is the load-bearing one (the BSP's
+    // witness reads busy+idle>0, which each re-park guarantees; the entry bump just seeds it). IRQs are
+    // already unmasked, so the BSP→AP ping is itself such a wake. Introspection-only, lock-free relaxed
+    // — no scheduling-path effect.
+    sched::note_core_idle(core);
     // Park: IRQs unmasked, so a BSP → AP SGI wakes this WFI, is serviced (handle_irq_v3 counts it), and
     // the core re-parks. No scheduler on this path (see the module header).
     loop {
         unsafe { core::arch::asm!("wfi", options(nomem, nostack, preserves_flags)) };
+        sched::note_core_idle(core);
     }
 }
 
@@ -615,6 +624,36 @@ pub fn start_secondaries(dtb_addr: u64, dtb_size: usize) {
         ":: AARCH64 SMP: {}/{} secondaries online via PSCI CPU_ON on the GICv3 path ::",
         online,
         n_startable
+    );
+
+    // Per-core idle-heartbeat witness (VUG-1 M3b honesty): each online secondary parked in
+    // `__secondary_rust_virt` and bumped its own CPU_IDLE via `sched::note_core_idle` at park entry —
+    // strictly after publishing CORE_READY, and the BSP has since completed a full BSP→AP ping round
+    // trip + AP→BSP verdict above, so every online AP has run its park-entry heartbeat by now. Read the
+    // CPU-pulse counters back: an online-idle core must read `busy + idle > 0`, NOT the pinned `(0,0)`
+    // that would render an undefined/frozen meter bar. This is the QEMU-provable half of the fix; the
+    // real Orin vug pixels are the accruing metal witness.
+    let mut all_heartbeat = true;
+    for idx in 1..n_cores {
+        if !(startable[idx] && CORE_READY[idx].load(Ordering::Acquire)) {
+            continue;
+        }
+        let (busy, idle) = sched::meter_cpu_ticks(idx);
+        if busy + idle == 0 {
+            all_heartbeat = false;
+        }
+        serial_println!(
+            ":: AARCH64 SMP: AP {} pulse (busy={}, idle={}) {} ::",
+            idx,
+            busy,
+            idle,
+            if busy + idle > 0 { "idle" } else { "PINNED" }
+        );
+    }
+    serial_println!(
+        ":: AARCH64 SMP: per-core idle heartbeat {} — {} online APs report idle (not pinned) ::",
+        if all_heartbeat { "PASS" } else { "FAIL" },
+        online
     );
 }
 

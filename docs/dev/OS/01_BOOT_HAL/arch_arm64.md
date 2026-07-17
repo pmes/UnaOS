@@ -4499,3 +4499,53 @@ esp-jetson links); `UNAOS_HUBSTORAGE` x86 MISSION SUCCESS. Bench runbook: `scrip
   narino untouched. The reframed UnaFS-NATIVE vaire arc-2 proposal is UNBLOCKED (per the R18
   baton: UnaFS objects on the K-line machinery + NSSPAN-pattern per-phase ticks so the first
   native sync IS the baseline FS benchmark).
+
+### ORIN-SMP idle-heartbeat — the parked-core pinned-bar fix (per-core telemetry honesty)
+
+> Numbering note: the spawning round labelled this arc "SMP-6", but SMP-6/7/8 are already merged
+> (SMP-8 closed the SMP-3 bring-up mystery — the production 6-core path is code-complete). By the
+> real sequence this is the SMP-**9** step: bring-up is done, so the next in-lane SMP work is making
+> the now-complete multi-core telemetry honest. Filed under the spawn's label for continuity.
+
+**The gap.** The VUG-1 CPU-pulse meter reads `sched::meter_cpu_ticks(cpu) -> (CPU_BUSY, CPU_IDLE)`
+and shows `busy/(busy+idle)` per core. Those counters are bumped **only inside `dispatch_next`**
+(idle on an empty run queue, busy on a dispatch). A secondary brought up on the GICv3 path
+(`smp_virt::__secondary_rust_virt`) comes online, publishes `CORE_READY`, then **parks in a bare
+`loop { wfi }`** — it never enters `sched::run()`, so it never calls `dispatch_next`, so its
+`(CPU_BUSY, CPU_IDLE)` stay `(0, 0)` forever. `(0,0)` renders a **pinned/undefined** meter bar for a
+demonstrably-online-idle core: online-idle is indistinguishable from wedged/never-ran. This is the
+follow-up flagged at the SMP-6 vug metal witness (*"parked cores' bars read PINNED"*).
+
+**The fix (additive, in-lane).** `sched::note_core_idle(cpu)` — a bounds-checked, lock-free-relaxed
+seam (same introspection-only contract as the existing pulse counters) that bumps `CPU_IDLE[cpu]`.
+`__secondary_rust_virt` calls it once **before** the first `WFI` (so the BSP's bring-up summary can
+witness `idle > 0` deterministically) and again on **every wake**, so the bar tracks the core staying
+parked-idle. No scheduling-path change; no counter removed; a core that later runs the scheduler still
+accrues busy/idle normally through `dispatch_next`.
+
+**Determinism.** The park-entry bump happens strictly after the core publishes `CORE_READY`, and the
+BSP formats its summary only after a full BSP→AP ping round trip + the AP→BSP verdict — a multi-ms
+wall-clock gap. Note the precise ordering: IRQs are unmasked (`exceptions::enable_irq`) *before* both
+`CORE_READY` (Release) and the park-entry `note_core_idle`, so the AP→BSP synchronization edge (the
+SGI the BSP waits on) can in principle be established at a program point *before* the first `CPU_IDLE`
+bump; the witness's `Relaxed` load is therefore not *memory-model-guaranteed* to observe that first
+bump. The load-bearing guarantee is instead the **in-loop re-park bump** — each WFI wake (the BSP→AP
+ping is exactly such a wake) bumps `CPU_IDLE` again inside the loop, and every real Orin/vug window
+sees many such wakes. So `busy + idle > 0` is what the witness asserts, not an exact count. A `(0,0)`
+read would be an ordering finding — **fail-loud (`FAIL`) + STOP + report**, never papered over with a
+sleep; the fail-loud stance is what keeps the (theoretical) relaxed-load race safe.
+
+**The QEMU gate (not metal-only).** The `virt` GICv3 path runs the *same* `__secondary_rust_virt`
+park, so `UNAOS_GICV3=1 ./arroyo test-arm` proves the fix: after `3/3 secondaries online`, the BSP
+reads each secondary's pulse counters back and emits
+`:: AARCH64 SMP: per-core idle heartbeat PASS — 3 online APs report idle (not pinned) ::` with a
+per-AP `busy=0, idle=N` breakdown (observed `idle=2`: park-entry bump + one BSP→AP-SGI wake). CAPSTONE
+6/6 and the 3/3 secondary bring-up are unchanged. The real Orin `start_secondaries_tegra` 6-core path
+parks through the identical `__secondary_rust_virt`, so the same honesty holds on metal — the live vug
+pixels (parked APs' bars reading idle/0% busy instead of pinned) are the **accruing metal witness**,
+not this arc's gate.
+
+**Gates green:** `./arroyo check` both arches × {knob-off, `UNAOS_TEGRA=1`}; `UNAOS_GICV3=1
+./arroyo test-arm` CAPSTONE 6/6 + 3/3 secondaries + heartbeat PASS; `./arroyo test-arm` virt v2
+MISSION; `./arroyo kernel8-test` 0-FAIL (the shared-`sched.rs` regression gate; `check` skips
+baremetal); `esp-jetson` links, `tegra:` count 109.

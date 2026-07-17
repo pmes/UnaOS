@@ -809,6 +809,19 @@ pub fn meter_cpu_ticks(cpu: usize) -> (u64, u64) {
     (CPU_BUSY[cpu].load(Ordering::Relaxed), CPU_IDLE[cpu].load(Ordering::Relaxed))
 }
 
+/// VUG-1 M3b: register `cpu` as idle for the CPU-pulse meter — the seam a core that parks WITHOUT
+/// running this scheduler (`smp_virt::__secondary_rust_virt`'s WFI park: comes online, publishes
+/// `CORE_READY`, never calls `dispatch_next`) uses to bump its own `CPU_IDLE`. Without it such a core
+/// stays `(CPU_BUSY, CPU_IDLE) == (0, 0)` and the meter shows a pinned/undefined bar for a
+/// demonstrably-online-idle core; one heartbeat makes it read honest 0% busy. Same contract as the
+/// other pulse counters: introspection only, lock-free relaxed, never read on any scheduling path.
+pub fn note_core_idle(cpu: usize) {
+    if cpu >= NUM_CPUS {
+        return;
+    }
+    CPU_IDLE[cpu].fetch_add(1, Ordering::Relaxed);
+}
+
 /// Park a task that switched back BLOCKED, per the action it set before switching. Runs in the
 /// scheduler context with IRQ masked and owns `task`.
 fn park_blocked(cpu: usize, park: u8, task: Box<Task>) {
