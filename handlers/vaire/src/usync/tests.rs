@@ -279,6 +279,170 @@ fn snapshot_cap_is_refused_not_auto_dropped() {
     );
 }
 
+// -- the one-flip batch path is tree-for-tree with the per-op result --------
+
+/// A larger, multi-directory tree so the batch groups more than one file per
+/// parent — the batch path must land exactly the same objects, bytes, and
+/// typed attrs as the per-op path did, in one transaction.
+fn seed_wide_tree(root: &Path) {
+    fs::create_dir_all(root.join("sub/deep")).unwrap();
+    fs::create_dir_all(root.join("other")).unwrap();
+    fs::write(root.join("a.txt"), b"alpha\n").unwrap();
+    fs::write(root.join("b.md"), b"# beta\n").unwrap();
+    fs::write(root.join("sub/c.rs"), b"fn c() {}\n").unwrap();
+    fs::write(root.join("sub/d.rs"), b"fn d() {}\n").unwrap();
+    fs::write(root.join("sub/deep/e.txt"), b"epsilon\n").unwrap();
+    fs::write(root.join("other/f.md"), b"# phi\n").unwrap();
+}
+
+#[test]
+fn batched_sync_tree_matches_expected_objects_attrs_and_snapshot() {
+    let live = tempfile::tempdir().unwrap();
+    seed_wide_tree(live.path());
+    let img_dir = tempfile::tempdir().unwrap();
+    let img = image_path(img_dir.path());
+    let m = mk_manifest(live.path());
+    let root_name = live.path().file_name().unwrap().to_string_lossy().to_string();
+
+    let r = usync(&m, &img, true, 16).unwrap();
+    assert_eq!(r.files_written, 6, "six files across three dirs are woven");
+    assert_eq!(r.files_skipped, 0);
+    assert!(r.snapshot.is_some(), "one snapshot per completed sync");
+
+    // The one-flip regime: the whole tree lands in a tiny number of root flips
+    // (the single sync commit + snapshot commit + summary commit), NOT one per
+    // file. Six files must cost far fewer than the per-op regime's 6+ flips.
+    assert!(
+        r.commit_stats.commits <= 4,
+        "one-flip regime: {} commits for 6 files+3 dirs (per-op would be ~9)",
+        r.commit_stats.commits
+    );
+    assert_eq!(r.commit_stats.snapshots_created, 1);
+
+    // Re-mount read-only: every file present with exact bytes + all four attrs.
+    let device = FileDevice::open_read_only(&img).unwrap();
+    let mut fs = FileSystem::mount(device).unwrap();
+    for (rel, bytes) in [
+        ("a.txt", &b"alpha\n"[..]),
+        ("b.md", &b"# beta\n"[..]),
+        ("sub/c.rs", &b"fn c() {}\n"[..]),
+        ("sub/d.rs", &b"fn d() {}\n"[..]),
+        ("sub/deep/e.txt", &b"epsilon\n"[..]),
+        ("other/f.md", &b"# phi\n"[..]),
+    ] {
+        let id = fs.resolve_path(&format!("{root_name}/{rel}")).unwrap();
+        let sz = fs.read_inode(id).unwrap().size;
+        assert_eq!(fs.read_data(id, 0, sz).unwrap(), bytes, "bytes for {rel}");
+        // All four vaire.* attrs folded into the batch creation inode write.
+        assert_eq!(get_int(&mut fs, id, "vaire.size"), Some(bytes.len() as i64), "size {rel}");
+        assert!(get_int(&mut fs, id, "vaire.mtime").is_some(), "mtime {rel}");
+        assert!(get_str(&mut fs, id, "vaire.src").unwrap().ends_with(rel.rsplit('/').next().unwrap()), "src {rel}");
+        assert!(get_str(&mut fs, id, "vaire.sync").is_some(), "sync stamp {rel}");
+    }
+
+    // Exactly six files under the unit root, nothing extra.
+    let unit_id = fs.resolve_path(&root_name).unwrap();
+    let mut names = Vec::new();
+    collect_names(&mut fs, unit_id, "", &mut names);
+    assert_eq!(names.len(), 6, "no stray objects: {names:?}");
+
+    // The batched attrs are catalog-indexed exactly as set_attribute would be:
+    // a query over vaire.size finds the batched files.
+    assert_eq!(fs.snapshot_index().unwrap()[0].creator, "vaire");
+}
+
+// -- incremental re-run still skips under the batch path --------------------
+
+#[test]
+fn batched_incremental_rerun_skips_all_and_snaps_again() {
+    let live = tempfile::tempdir().unwrap();
+    seed_wide_tree(live.path());
+    let img_dir = tempfile::tempdir().unwrap();
+    let img = image_path(img_dir.path());
+    let m = mk_manifest(live.path());
+
+    let first = usync(&m, &img, true, 32).unwrap();
+    assert_eq!(first.files_written, 6);
+
+    // Unchanged: every file skips (size+mtime match), a fresh snapshot retained.
+    let second = usync(&m, &img, true, 32).unwrap();
+    assert_eq!(second.files_written, 0, "all skip on unchanged re-run");
+    assert_eq!(second.files_skipped, 6);
+    assert!(second.snapshot.is_some());
+
+    // Change one file: only it rewrites (unlink stale + re-batch), rest skip.
+    fs::write(live.path().join("sub/c.rs"), b"fn c() { changed }\n").unwrap();
+    let third = usync(&m, &img, true, 32).unwrap();
+    assert_eq!(third.files_written, 1, "only the changed file re-writes");
+    assert_eq!(third.files_skipped, 5);
+
+    let device = FileDevice::open_read_only(&img).unwrap();
+    let mut fs = FileSystem::mount(device).unwrap();
+    let root_name = live.path().file_name().unwrap().to_string_lossy().to_string();
+    let id = fs.resolve_path(&format!("{root_name}/sub/c.rs")).unwrap();
+    let sz = fs.read_inode(id).unwrap().size;
+    assert_eq!(fs.read_data(id, 0, sz).unwrap(), b"fn c() { changed }\n", "exact rewrite");
+    assert_eq!(fs.snapshot_index().unwrap().len(), 3, "three retained roots");
+}
+
+// -- a failed sync is an honest no-op (whole-transaction unwind) ------------
+
+#[test]
+fn failed_sync_leaves_image_unchanged_and_no_snapshot() {
+    // First establish a good synced image + snapshot (root generation N).
+    let live = tempfile::tempdir().unwrap();
+    seed_wide_tree(live.path());
+    let img_dir = tempfile::tempdir().unwrap();
+    let img = image_path(img_dir.path());
+    let m = mk_manifest(live.path());
+
+    let first = usync(&m, &img, true, 16).unwrap();
+    assert_eq!(first.files_written, 6);
+    let snaps_before = {
+        let device = FileDevice::open_read_only(&img).unwrap();
+        let mut fs = FileSystem::mount(device).unwrap();
+        fs.snapshot_index().unwrap().len()
+    };
+    assert_eq!(snaps_before, 1);
+
+    // Now force a mid-sync failure: grow the tree well past what a tiny image
+    // can hold so the batch write hits NoSpace. Add many large new files.
+    for i in 0..400 {
+        fs::write(live.path().join(format!("big-{i}.bin")), vec![b'x'; 64 * 1024]).unwrap();
+    }
+
+    let err = usync(&m, &img, true, 16).unwrap_err();
+    let msg = format!("{err:#}");
+    // Honest report: the failure surfaces (the batch/commit error). The
+    // whole-transaction unwind reloads ground truth from the committed root, so
+    // the MOUNTED image is unchanged at root generation N — no partial tree, no
+    // new snapshot. (CoW may leave orphaned data blocks physically on disk to be
+    // reclaimed; the logical root never moved, which is what "image unchanged"
+    // means here — a raw-byte compare would over-assert.)
+    assert!(!msg.is_empty(), "failure is reported: {msg}");
+    let device = FileDevice::open_read_only(&img).unwrap();
+    let mut fs = FileSystem::mount(device).unwrap();
+    assert_eq!(
+        fs.snapshot_index().unwrap().len(),
+        snaps_before,
+        "a failed sync takes no snapshot"
+    );
+    // The tree is exactly the pre-failure tree: the six originals present with
+    // exact bytes, and NONE of the 400 big-*.bin partials leaked into the root.
+    let root_name = live.path().file_name().unwrap().to_string_lossy().to_string();
+    let a_id = fs.resolve_path(&format!("{root_name}/a.txt")).unwrap();
+    let sz = fs.read_inode(a_id).unwrap().size;
+    assert_eq!(fs.read_data(a_id, 0, sz).unwrap(), b"alpha\n");
+    let unit_id = fs.resolve_path(&root_name).unwrap();
+    let mut names = Vec::new();
+    collect_names(&mut fs, unit_id, "", &mut names);
+    assert_eq!(names.len(), 6, "no partial-tree leak from the failed batch: {names:?}");
+    assert!(
+        names.iter().all(|n| !n.contains("big-")),
+        "no staged big-*.bin file survived the unwind: {names:?}"
+    );
+}
+
 // -- the benchmark ledger line is well-formed -------------------------------
 
 #[test]

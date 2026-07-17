@@ -175,6 +175,14 @@ and wrapped with host I/O by the userspace `libs/fs/unafs`.
   `commit()`), but there is **no vectored/bulk write-or-create API** to cut the
   per-object inode/dir metadata churn. Full table + finding in
   `handlers/vaire/README.md`.
+
+  **vaire is one-flip native (VAIRE-3, hw-jetson).** The bulk-create API the
+  finding named landed crate-side (UNAFS-BATCH, `create_files_batch`), and
+  `usync` adopted it: autocommit off once, the write set batched per directory,
+  ONE `commit()` for the whole staged tree, then the snapshot — collapsing the
+  cold sync's `commit` phase from ~10.95 s across 242 root flips to ~93 ms across
+  3, and the cold wall ~11.3 s → ~0.213 s (≈ 53×), with all invariants and the
+  whole-transaction-unwind honesty carried verbatim. After-table in the README.
 - **stria's video half** — deferred by design (the audio-only slice was the Architect's own
   first slice), not drift.
 - The kit→vessel compiler and the elessar snapshot format — future arcs; `aule` is expected

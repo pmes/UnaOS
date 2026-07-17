@@ -10,6 +10,34 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-jetson track — 2026-07-17 (VAIRE-3 — vaire adopts the one-flip batch path) 🔬
+
+### VAIRE-3 — `usync` on `create_files_batch`: the native sync in one root flip 🔬 host-native (33→36 vaire tests, fsck-clean after-image), zero kernel surface
+
+**What it does.** Adopts the UNAFS-BATCH bulk create+write path in vaire's `usync`, realizing the
+one-flip native sync the VAIRE-2 baseline predicted. `usync` now turns autocommit off once for the
+run, groups the write set by parent directory and lands each group with a single
+`create_files_batch` (the four `vaire.*` K6 attrs ride each `BatchFile`, folded into its one creation
+inode write), and flips the whole staged tree — every `mkdir`, every batched file, and the unit-root
+attrs — with **one** `commit()`, then the `snapshot_create` and the ledger-summary persist. All
+Bolt-1/VAIRE-2 invariants carry verbatim (live tree read-only, dry-run default, incremental
+size+mtime skip, stale-object unlink for exact rewrite, one snapshot per completed sync, cap-16
+up-front refusal). A mid-sync failure unwinds the whole outer transaction: `usync` reports it and the
+mounted image stays at the last committed root — no partial tree, no snapshot.
+
+**How it was tested.** `cargo test -p vaire` → **36 passed** (33 existing + 3 new: batched
+tree-for-tree with exact objects/attrs/snapshot + one-flip commit count, batched incremental re-run
+skips, failed-batch honest no-op with logical root unmoved and no leak). Measured re-run of the exact
+VAIRE-2 protocol, SOLO, into a fresh v3 image (MacBookPro16,1 · macOS 26.5.2 25F84 · APFS/PCIe-SSD ·
+release): the cold `commit` phase collapses from **10.95 s across 242 root flips to 92.58 ms across
+3**, the cold wall **~11.3 s → ~0.213 s (≈ 53×)**, blocks written **23,484 → 1,989**; `fsck` clean
+(0 leaked, 0 stale), 2 retained snapshots. Cold commit sits ~93 ms not the raw harness's ~50 ms
+because `usync` inherently carries two extra flips (snapshot-per-sync + the self-recorded summary) —
+above, not below, the prediction; explained in the README. `./arroyo check` ✅ x86_64 / ✅ aarch64
+(zero kernel surface). After-table + finding in `handlers/vaire/README.md`.
+
+---
+
 ## hw-pi4 track — 2026-07-16 (UNAFS-BATCH — the bulk create+write path) 🔬
 
 ### UNAFS-BATCH — `create_files_batch`: whole-tree sync in one root flip 🔬 host-native (unafs 94→105 KATs), zero kernel surface
