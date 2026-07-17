@@ -4549,3 +4549,61 @@ not this arc's gate.
 ./arroyo test-arm` CAPSTONE 6/6 + 3/3 secondaries + heartbeat PASS; `./arroyo test-arm` virt v2
 MISSION; `./arroyo kernel8-test` 0-FAIL (the shared-`sched.rs` regression gate; `check` skips
 baremetal); `esp-jetson` links, `tegra:` count 109.
+
+### ORIN-SMP busy-heartbeat — cooperative scheduled work on the virt secondaries (the idle-heartbeat's other half)
+
+The idle-heartbeat above proved only that a *parked* online secondary reads honest **idle**
+(`busy=0, idle>0`, not the pinned `(0,0)`). Its complement — that an online secondary can actually
+**run scheduled work and read busy** — is the QEMU-testable slice of *"SMP scheduling on `virt`"* (long
+named a later step: the secondaries are brought up but otherwise only park). This arc lands that slice.
+
+**Cooperative only — and why that is the honest QEMU half.** A `virt` secondary runs at **EL2** and has
+no per-core generic-timer tick (arming one would double-count the shared `TICKS` clock — deferred, see
+above). So preemptive multi-core scheduling stays the **metal-only** proof. But *cooperative*
+scheduling needs no timer and no IRQ: `switch_context` is EL-neutral (callee-saved + SP, no `eret`),
+and a run-to-completion task (yield/exit only) never blocks or sleeps. This is exactly how the boot-core
+CAPSTONE and the Pi CAPSTONE already run cooperatively under QEMU. So each secondary runs **one bounded
+cooperative pass** over a finite, BSP-pre-staged queue, then parks idle as before.
+
+**Mechanism (additive, in-lane; `sched.rs` + `smp_virt.rs`).**
+* BSP, after the ping proofs: `sched::stage_secondary_work(cpu, n)` spawns `n` cooperative probe tasks
+  pinned to each online secondary's run queue, then `sched::secondary_work_go()` releases them.
+* Secondary, right after its AP→BSP ping and **before** the idle park: `sched::run_secondary_work(core)`
+  spins (IRQ unmasked — the BSP→AP ping still lands) until released, then `run_until_empty(core)` drains
+  its queue (real `dispatch_next` dispatches, each bumping `CPU_BUSY[core]`), then sets a per-core
+  `SECWORK_DONE` flag.
+* BSP waits (bounded, ~200 ms ceiling) on every online `secondary_work_done(cpu)` before reading the
+  meter — so the busy witness never races an un-run core.
+* Run queues are per-CPU; a secondary drains **its own** queue and never contends the boot core's
+  (which runs the JC3 CAPSTONE). No scheduling-path change; no counter altered; the idle-heartbeat
+  seam and the deferred timer-stretch invariant are untouched.
+
+**The QEMU gate.** `UNAOS_GICV3=1 ./arroyo test-arm` now emits, per online AP,
+`AP <n> pulse (busy=8, idle=2) ran+idle` (`busy=8` = 2 probe tasks × 4 dispatches each: 1 initial +
+3 yields) and both witness lines:
+`:: AARCH64 SMP: per-core idle heartbeat PASS ...` **and**
+`:: AARCH64 SMP: per-core busy heartbeat PASS — 3 online APs ran cooperative scheduled work ::`.
+The idle-heartbeat asserts `idle > 0`; the busy-heartbeat asserts `busy > 0`; a `(0,0)` or bare
+`busy=0` read fails **loud** (`FAIL`), never papered over. CAPSTONE 6/6 and the 3/3 bring-up are
+unchanged.
+
+**Shared-tail safety (metal + probe).** `__secondary_rust_virt` is the *shared* real-entry tail for
+the `virt` `start_secondaries`, the real Orin `start_secondaries_tegra`, AND the SMP-probe legs — but
+only the `virt` BSP stages work and calls `secondary_work_go`. So `run_secondary_work`'s release wait
+is **bounded** (~20 ms one-shot ceiling): the `virt` release lands in microseconds (no added latency
+there), while the tegra/probe paths — which never stage — simply elapse the ceiling once at bring-up
+and park exactly as before (an empty-queue drain is a no-op). This can never hang a core, the failure
+mode an unbounded spin would introduce on every non-`virt` caller. **Consequence:** on real Orin today
+the secondaries still park *idle* (the tegra path stages no work), so metal shows the idle bar, not a
+busy one. A **live vug busy bar on a metal secondary** requires the tegra bring-up to also stage +
+release cooperative work — a small, attended follow-up (staging cooperative EL2 work on real Orin
+secondaries wants a metal sitting to confirm), NOT claimed done here.
+
+**Deferred (unchanged by this arc):** preemptive multi-core scheduling on the secondaries (per-core
+timer tick + IRQ-driven `timer_preempt`) remains the metal-only step; it lands with a per-core-only
+tick path in `timer.rs` (the shared-`TICKS` double-count containment named above), outside this lane.
+
+**Gates green:** `./arroyo check` both arches; `UNAOS_GICV3=1 ./arroyo test-arm 40` = 3/3 secondaries
++ idle-heartbeat PASS + **busy-heartbeat PASS** + CAPSTONE 6/6; `./arroyo test-arm 22` MISSION;
+`./arroyo kernel8-test` 44 PASS / 0 FAIL (shared-`sched.rs` unregressed on the Pi — its APs run the
+full `run()` loop via `start_aps`, an untouched path).
