@@ -14,14 +14,25 @@
 //! boots have a controller-internal "poisoned" latch such that the FIRST time anything
 //! engages the xHCI command-ring register machinery on the UEFI-inherited, still-RUNNING
 //! (USBCMD.RS=1) controller, the platform's SNOC/ACI fabric issues a FillWrite into a
-//! protected carveout and the box RAS-power-offs. UnaOS's own bench work (2026-07-16,
-//! the "CRCR+SMP-7" sitting) isolated this to a single 64-bit write to the CRCR register
-//! (xHCI operational-register offset 0x18) issued while RS=1 — fired 2/2 deterministic,
-//! with the write's CONTENT irrelevant (CRR-before=0 was observed both times, closing the
-//! command-ring-pointer-value theory: it is the register WRITE ITSELF that engages the
-//! poisoned machinery, not what is written). This app reproduces exactly that: read
-//! CRCR, then write the SAME value straight back — a content-free "echo" write — after an
-//! explicit operator confirmation.
+//! protected carveout and the box RAS-power-offs. UnaOS's own bench work isolated this to
+//! a single 64-bit write to the CRCR register (xHCI operational-register offset 0x18)
+//! issued while RS=1 — fired 2/2 deterministic on the boots where it was tested this way.
+//! That validated trigger write carried a real, non-null, freshly-allocated 64-bit command
+//! ring pointer with RCS=1 set (the shape `ring_address | 1`) — never a null/zero pointer.
+//! The same underlying fault has also fired historically at a later point in the boot (a
+//! doorbell ring, a different register entirely) across many different builds with
+//! different heap layouts and therefore different ring addresses, which is why the working
+//! theory is "engaging the command-ring register machinery, not one specific pointer
+//! value" — but that theory has NOT been tested against a NULL-pointer write specifically.
+//! This app reproduces the VALIDATED shape as closely as a standalone tool can: it writes a
+//! synthetic,
+//! plausible-looking, 64-byte-aligned, non-null pointer (with RCS=1 set) to CRCR — chosen
+//! to match the shape of the validated trigger writes, not an echo of the always-reads-
+//! zero register (per xHCI 5.4.5 a CRCR read never returns the pointer field, so echoing
+//! the read value back would write a NULL pointer — a real, if inert, state change, and a
+//! materially different write than either validated instance). This app never rings a
+//! doorbell, so the synthetic pointer is never dereferenced by the controller; only its
+//! bit pattern in the register is exercised.
 //!
 //! WHAT THIS APP DELIBERATELY DOES NOT DO: it does not take over the controller, does not
 //! halt it, does not reprogram DCBAAP/ERST/CONFIG, does not build a command ring, and
@@ -30,12 +41,14 @@
 //! named trigger is the bare register write on the controller AS UEFI ITSELF LEFT IT
 //! running — no takeover should be necessary to observe it. If NVIDIA's engineers find
 //! that the fault does NOT reproduce without the fuller takeover sequence, that is itself
-//! important data — see the accompanying reply draft for exactly what to report either way.
+//! important data worth reporting back.
 //!
 //! EXPECTED RESULT ON AN AFFECTED/POISONED BOOT: an immediate RAS power-off. QEMU cannot
 //! model this fault (there is no Tegra234 RAS/SNOC/ACI model) — this app has only ever
 //! been exercised by inspection and compilation, never fault-observed in the loop; the
-//! actual fault observation is an attended metal run.
+//! actual fault observation is an attended metal run, and as of this writing that run has
+//! not yet happened. Treat this exact tool as an unverified-on-hardware best effort until
+//! that first metal run confirms or corrects it.
 
 use core::time::Duration;
 use log::{error, info, warn};
@@ -218,22 +231,28 @@ fn main() -> Status {
     warn!("Operator confirmed -- issuing the single gated CRCR write in 1 second...");
     boot::stall(Duration::from_secs(1));
 
-    // THE ONE MUTATION. Read CRCR, then write the SAME 64-bit value straight back. The
-    // pointer field of a CRCR read is always zero per xHCI 5.4.5 (only RCS/CS/CA/CRR are
-    // meaningful on read), so this is a content-free echo: it does not install a ring
-    // pointer, does not abort anything (CA bit not set), and changes no observable
-    // controller state. The only thing it does is perform a genuine MMIO write to the
-    // CRCR register while RS=1 -- i.e. engage the command-ring register write path on the
-    // running inherited controller. UnaOS's own bench trigger (a DIFFERENT, real ring
-    // pointer written to this same register in this same RS=1 state) produced the
-    // identical fault signature, which is why the write's content is not expected to
-    // matter -- see the reply draft for the full discrimination.
-    let echo = unsafe { r64(crcr_addr) };
-    unsafe { w64(crcr_addr, echo) };
+    // THE ONE MUTATION: a single 64-bit write to CRCR, matching the SHAPE of the validated
+    // trigger write as closely as a standalone tool (no ring, no takeover) can.
+    //
+    // We deliberately do NOT echo the value read back. A CRCR read always returns the
+    // pointer field as zero (xHCI 5.4.5); since RS=1 implies the ring was left stopped by
+    // UEFI's own driver (CRR=0 is the expected/observed state here), an echo write would
+    // LOAD that zero as a real Command Ring Pointer -- a NULL pointer is a genuine, if
+    // inert, state change, and NOT the shape of the write UnaOS's own bench validated as
+    // the trigger (which always carried a real, non-null, freshly-allocated ring pointer
+    // with RCS=1 set). So instead this writes a SYNTHETIC pointer of that same shape: a
+    // plausible, 64-byte-aligned, non-null address inside the Orin DRAM window
+    // (2 GiB - 10 GiB PA) with RCS=1 (bit 0) set -- `synthetic_ring_ptr | 1`, mirroring the
+    // kernel's own `our_ring | 1` construction. This program never rings a doorbell, so the
+    // controller has no occasion to dereference this address; only the register write
+    // itself -- a CRCR write while RS=1 -- is exercised, which is the trigger under test.
+    const SYNTHETIC_RING_PTR: u64 = 0x2_0000_0000; // 8 GiB PA: inside the DRAM window, 64-byte aligned, never dereferenced (no doorbell rung)
+    let crcr_write_val = SYNTHETIC_RING_PTR | 1; // RCS=1
+    unsafe { w64(crcr_addr, crcr_write_val) };
 
     warn!(
-        "CRCR write issued: echoed {:#018x} back to {:#010x}.",
-        echo, crcr_addr
+        "CRCR write issued: {:#018x} written to {:#010x} (synthetic non-null pointer, RCS=1 -- never dereferenced).",
+        crcr_write_val, crcr_addr
     );
     warn!(
         "If this boot is poisoned, a RAS power-off should already be in flight. If you are \

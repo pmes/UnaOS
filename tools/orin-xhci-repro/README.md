@@ -24,16 +24,26 @@ It runs entirely read-only except for one explicitly gated register write:
 2. Reads and prints USBCMD, USBSTS, CONFIG, and CRCR, and confirms USBCMD.RS=1 (the
    controller is UEFI-inherited and running — the fault's stated precondition).
 3. Prints a loud multi-line warning banner and waits for an explicit `Y` keypress.
-4. On confirmation, issues exactly one 64-bit write to CRCR: it reads the register and
-   writes the *same* value straight back (content-free — the pointer field of a CRCR read
-   is always zero per xHCI 5.4.5, so this changes no controller state). On an
-   affected/"poisoned" boot this alone is expected to trigger an immediate RAS power-off.
+4. On confirmation, issues exactly one 64-bit write to CRCR: a synthetic, plausible,
+   non-null, 64-byte-aligned pointer with RCS=1 set — matching the *shape* of the write
+   UnaOS's own bench validated as the trigger (a real, non-null ring pointer with RCS=1),
+   deliberately NOT an echo of the always-reads-zero register value (which per xHCI 5.4.5
+   would load a NULL pointer — a different, untested write shape). No doorbell is ever
+   rung, so this pointer is never dereferenced; only the register write itself is
+   exercised. On an affected/"poisoned" boot this alone is expected to trigger an
+   immediate RAS power-off.
 
 See the doc comments at the top of `src/main.rs` for the full provenance of the register
 sequence — it is traced directly from `unaos/crates/kernel/src/arch/aarch64/xusb_tegra.rs`
 (the `jbxc_crcrq_quiesce` function and its call site in `jb2b_attach`), which is where
-UnaOS's own bench work (the 2026-07-16 "CRCR+SMP-7" sitting) named this exact write as the
-2/2-deterministic trigger.
+UnaOS's own bench work named this exact write, issued while the controller is running, as
+a 2/2-deterministic trigger.
+
+**Important caveat:** this exact standalone tool has not yet been run on real Orin
+hardware. Its register-level design is traced with high confidence from UnaOS's own kernel
+source and bench findings (see above), but the first attended run against real hardware
+known to exhibit the fault has not happened yet as of this writing. Treat it as an
+unverified-on-metal best effort until that run confirms (or corrects) it.
 
 ## Building
 
@@ -68,10 +78,10 @@ See the accompanying reply draft (`~/.claude/plans/unaos/review/unaos-orin-repro
 in the UnaOS repo's planning tree, or ask the UnaOS maintainer who is providing this
 tool) for the full reliability characterization: the fault is a **per-boot coin flip**, not
 a guaranteed-every-time repro. UnaOS's own bench observed the CRCR-write trigger fire
-**2/2** boots on the layout it was tested on, and Line-A faults generally at rates from 0/4
-to 4/4 depending on kernel/firmware image layout on UnaOS's own builds — budget several
-boots on an affected unit, expect the fault within the first few if the unit is affected at
-all.
+**2/2** boots on the build it was tested against, and this fault generally reproduces at
+rates from 0-of-4 to 4-of-4 boots depending on the exact link layout of the software that
+inherits the controller — budget several boots on an affected unit, expect the fault
+within the first few if the unit is affected at all.
 
 QEMU cannot model this fault (there is no Tegra234 RAS/SNOC/ACI implementation in QEMU's
 Tegra support) — this tool has only ever been verified to compile and to read the correct
