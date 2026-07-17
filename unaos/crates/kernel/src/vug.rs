@@ -223,6 +223,57 @@ const METER_DIM: u32 = 0x00_2A2432;
 const METER_LILAC: u32 = 0x00_B36BFF;
 const METER_PURPLE: u32 = 0x00_9B59B6;
 const METER_LABEL: u32 = 0x00_8A8296;
+/// Parked dash colour — cooler/dimmer than `METER_DIM` so a broken track reads as "not participating".
+const METER_PARKED: u32 = 0x00_3A3550;
+
+/// VUG-HONESTY parked-core marker (a load-array sentinel, disjoint from the 0..=100 percent range). A
+/// core whose pulse counters are frozen this window AND that is NOT the demo core is parked /
+/// never-scheduled: the display must not fabricate load for it. `load[c] == PARKED` selects a distinct
+/// DASHED bar (see [`draw_pulse_bar`]) — visually separable from an idle 0% bar (a solid dim track) so
+/// "idle" and "never woken" never read alike, and `run_pulse` prints `park` instead of a percent.
+const PARKED: u32 = u32::MAX;
+
+/// VUG-HONESTY — the pure per-core display decision. Given one core's per-window busy/idle tick deltas
+/// (`db`/`di`), whether it is the *demo core* (the core executing this render loop), and that loop's own
+/// measured render busy% (`own_load`), return the load to display (0..=100) or [`PARKED`]:
+///   * `db + di > 0`  → the scheduler accounted this core this window: honest busy fraction.
+///   * frozen + demo  → the demo core runs OUTSIDE the scheduler, so its own counters freeze; credit its
+///                      measured render load — the honest number for the core doing the drawing.
+///   * frozen + other → a core with no scheduling activity this window that is NOT drawing: parked /
+///                      never-woken. NEVER fabricate load. (The pre-fix code credited `own_load` to
+///                      EVERY frozen core, so a parked AP mirrored the busy demo core and read PINNED —
+///                      the display-honesty defect this arc closes. The merged idle/busy-heartbeats made
+///                      the *counters* honest and passed the one-shot boot witness, but the LIVE meter
+///                      samples per-window deltas: a parked EL2 secondary gets no periodic wake, so its
+///                      counters are frozen between windows and this fallback still fabricated.) Report
+///                      PARKED instead.
+fn classify_load(db: u64, di: u64, is_demo: bool, own_load: u32) -> u32 {
+    if db + di > 0 {
+        ((db * 100) / (db + di)) as u32
+    } else if is_demo {
+        own_load
+    } else {
+        PARKED
+    }
+}
+
+/// VUG-HONESTY witness — deterministic, arch-neutral, framebuffer-free. Exercises [`classify_load`]
+/// over the cases the honesty rule must separate and emits one PASS/FAIL serial line. Wired into the
+/// `virt` CAPSTONE boot (`arch::sched::run_capstone_boot_core`), so `test-arm` and the GICv3 suite
+/// witness a parked core reading PARKED rather than a fabricated pinned bar. Returns true on PASS.
+pub fn parked_display_witness() -> bool {
+    let busy = classify_load(8, 0, false, 99) == 100; // scheduled + fully busy
+    let idle = classify_load(0, 2, false, 99) == 0; // scheduled + idle → honest 0%, NOT own_load
+    let half = classify_load(1, 1, false, 0) == 50; // scheduled + half busy
+    let demo = classify_load(0, 0, true, 42) == 42; // frozen demo core → its own render load
+    let park = classify_load(0, 0, false, 99) == PARKED; // frozen non-demo core → PARKED, not fabricated
+    let pass = busy && idle && half && demo && park;
+    serial_println!(
+        ":: VUG-HONESTY: parked-core display witness {} — a frozen non-demo core reads PARKED (never the demo core's load); scheduled cores read their busy fraction, the demo core its render load ::",
+        if pass { "PASS" } else { "FAIL" }
+    );
+    pass
+}
 
 /// The per-core CPU load sampler — shared by the vug corner meter and the `pulse` full-screen
 /// monitor (UI1-M2/M3). Holds the previous `(busy, idle)` tick snapshot per core and the last
@@ -260,19 +311,19 @@ impl CpuPulse {
     ///     number the RENDER meter shows for the core actually doing the work. That core IS
     ///     the demo core (the current CPU); log it once so the label is truthful.
     fn refresh(&mut self, own_load: u32) {
+        // VUG-HONESTY: the demo core is whichever core is running THIS render loop right now (the loop
+        // is cooperative and single-core, but read it live so a future migration can't mislabel). ONLY
+        // that core takes the render-load fallback when its counters are frozen; every OTHER frozen-
+        // counter core is parked / never-scheduled and reads PARKED — no fabricated load.
+        let demo = crate::arch::sched::meter_current_cpu();
         for c in 0..self.ncpu {
             let (b, i) = crate::arch::sched::meter_cpu_ticks(c);
             let db = b.wrapping_sub(self.prev[c].0);
             let di = i.wrapping_sub(self.prev[c].1);
-            if db + di > 0 {
-                self.load[c] = ((db * 100) / (db + di)) as u32;
-            } else {
-                // Unscheduled executing core → this is the demo core; show its real render load.
-                self.load[c] = own_load;
-                if !self.demo_core_logged {
-                    serial_println!(":: {}: CPU meter — core {} is the demo core (unscheduled render loop, load from render busy%) ::", self.tag, c);
-                    self.demo_core_logged = true;
-                }
+            self.load[c] = classify_load(db, di, c == demo, own_load);
+            if c == demo && db + di == 0 && !self.demo_core_logged {
+                serial_println!(":: {}: CPU meter — core {} is the demo core (unscheduled render loop, load from render busy%) ::", self.tag, c);
+                self.demo_core_logged = true;
             }
             self.prev[c] = (b, i);
         }
@@ -293,6 +344,19 @@ fn draw_pulse_bar(
     load: u32,
     fill_color: u32,
 ) -> usize {
+    // VUG-HONESTY: a parked / never-woken core draws a DASHED, cooler track (every other segment lit
+    // METER_PARKED, the rest bare background) — visually distinct from an idle core's solid-dim track,
+    // so "never woken" never reads like "idle 0%".
+    if load == PARKED {
+        let mut bx = x;
+        for s in 0..PULSE_SEGS {
+            if s % 2 == 0 {
+                pal.draw_rect(bx, y, seg_w, seg_h, METER_PARKED);
+            }
+            bx += seg_w + gap;
+        }
+        return bx;
+    }
     let filled = if load == 0 {
         0
     } else {
@@ -663,7 +727,12 @@ pub fn run_pulse(pal: &mut TargetPal) {
             pal.draw_text(mt.margin, y + label_y_off, &label, METER_LABEL);
             let bar_x = mt.margin + mt.text_w(7);
             let end_x = draw_pulse_bar(pal, bar_x, y, seg_w, seg_h, gap, cpu.load[c], METER_PURPLE);
-            let pct = alloc::format!("{:>3}%", cpu.load[c]);
+            // VUG-HONESTY: a parked core prints `park`, not a fabricated percent.
+            let pct = if cpu.load[c] == PARKED {
+                alloc::string::String::from("park")
+            } else {
+                alloc::format!("{:>3}%", cpu.load[c])
+            };
             pal.draw_text(end_x + mt.cell_w, y + label_y_off, &pct, METER_LABEL);
             y += row_pitch;
         }

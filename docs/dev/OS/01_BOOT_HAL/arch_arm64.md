@@ -4625,3 +4625,52 @@ tick path in `timer.rs` (the shared-`TICKS` double-count containment named above
 + idle-heartbeat PASS + **busy-heartbeat PASS** + CAPSTONE 6/6; `./arroyo test-arm 22` MISSION;
 `./arroyo kernel8-test` 44 PASS / 0 FAIL (shared-`sched.rs` unregressed on the Pi — its APs run the
 full `run()` loop via `start_aps`, an untouched path).
+
+### VUG-HONESTY — the parked-core *display* completion (the heartbeats' third leg)
+
+The two heartbeats above made the *counters* honest: a parked online secondary reads `idle > 0`, and
+one that ran cooperative work reads `busy > 0`, so the BSP's one-shot boot witness never sees the
+pinned `(0, 0)`. But that is not the whole story the **live** meter tells. `vug`'s CPU-pulse meter
+(`CpuPulse::refresh` in `vug.rs`) does not read the cumulative counters — it samples their **per-window
+deltas** (~5×/sec) and shows `db/(db+di)` per core. And there sat a residual display-honesty defect the
+counter fixes did not reach:
+
+**The residual.** `refresh`'s fallback branch read: *"`db + di == 0` this window ⇒ this is the demo
+core executing outside the scheduler ⇒ credit it the render loop's own busy%."* That is right for **one**
+core — the core actually running the render loop, whose own counters freeze while it draws. It is wrong
+for **every other** core with frozen counters. A parked EL2 `virt`/Orin secondary gets **no periodic
+wake** (no per-core timer; `note_core_idle` bumps only at park-entry and on the rare BSP→AP SGI), so
+between two 200 ms windows its counters do not move — `db + di == 0` — and the old code credited it
+`own_load` too. Result: while the crystal spins at a high render busy%, *all* parked cores mirrored the
+busy demo core and read **PINNED** — fabricated load on cores doing nothing. A never-online core `(0,0)`
+read the same. This is the exact defect the R18 XCARVE metal witness flagged (*"parked cores' bars read
+PINNED"*), surviving *below* the counter layer the heartbeats fixed.
+
+**The fix (display-layer only; `vug.rs` + one additive accessor).** The pure decision now lives in
+`vug::classify_load(db, di, is_demo, own_load)`:
+* `db + di > 0` → honest busy fraction (unchanged — the scheduled path, incl. every x86 AP; never
+  regressed).
+* frozen **and** the demo core → its measured render load (the one legitimate `own_load` case).
+* frozen **and not** the demo core → **`PARKED`** — a load-array sentinel, never a fabricated number.
+
+The demo core is identified live via a new introspection accessor `sched::meter_current_cpu()` (a
+`TPIDR_EL1/EL2` self-index on aarch64, the mirror `gs:[0]` self-index on x86 — same additive,
+lock-free, no-scheduling-effect contract as `meter_cpu_count`/`meter_cpu_ticks`). A `PARKED` core draws
+a **dashed, cooler track** (`draw_pulse_bar`) — deliberately distinct from an idle core's solid-dim
+track, so *"idle 0%"* and *"never woken"* never read alike (the JD16/JD17 unset-≠-invent doctrine); the
+`pulse` full-screen view prints `park` in place of a percent. No scheduler logic, no counter, and no
+`note_core_idle` seam changed — this builds strictly **on** the merged heartbeats.
+
+**The QEMU witness (deterministic, framebuffer-free).** `vug::parked_display_witness()` exercises
+`classify_load` over the separating cases (busy, idle→0%, half, frozen-demo→render load,
+frozen-non-demo→`PARKED`) and emits one line; it is wired into the `virt` CAPSTONE boot
+(`run_capstone_boot_core`), so `test-arm` / the GICv3 suite print
+`:: VUG-HONESTY: parked-core display witness PASS ... a frozen non-demo core reads PARKED (never the
+demo core's load) ::`. The live parked-bar pixels on a real multi-core Orin panel are the accruing
+**metal** witness, as before.
+
+**Gates green:** `./arroyo check` both arches × {knob-off, `UNAOS_TEGRA=1`}; `UNAOS_GICV3=1 ./arroyo
+test-arm 40` = 3/3 secondaries + idle + busy heartbeat PASS + **VUG-HONESTY witness PASS** + CAPSTONE
+6/6; `./arroyo test-arm 22` MISSION; `./arroyo kernel8-test` CAPSTONE COMPLETE / 0 FAIL (shared
+`sched.rs` unregressed on the Pi); `./arroyo test` (x86) MISSION, no behavioral change (the accessor
+compiles the shared `refresh`; `vug` runs only on the GUI, so headless x86 is untouched).
