@@ -10562,7 +10562,11 @@ fn sock4_launcher(demo_cpu: usize) {
 //   bit0 list loaded · bit1 list from FAT (else builtin) · bit2 ADS.EXAMPLE matched blocklist ·
 //   bit3 built a well-formed 0.0.0.0 answer · bit4 una.os NOT blocked (forward decision) ·
 //   bit5 forwarded una.os -> got a real answer from 10.0.2.3:53 · bit6 served an inbound query on :53 ·
-//   bit7 sinkholed the served query to 0.0.0.0 over the wire.
+//   bit7 sinkholed the served query to 0.0.0.0 over the wire ·
+//   bit8 (M2) a SUBDOMAIN of a blocked base name was sinkholed (label-boundary suffix match) ·
+//   bit9 (M2) a near-miss (string suffix, NOT a label boundary) was correctly NOT blocked.
+// The blocklist parser (M1) reads real hosts-file format (IP + domain, '#'/';' comments, blank lines);
+// the match (M2) is label-boundary suffix (a blocked base domain sinkholes its subdomains).
 // =============================================================================
 
 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
@@ -10636,6 +10640,23 @@ zdns_have_list:
     cmp dword ptr [r9], 0
     jne zdns_st2
     or r12, 8                                 // bit3: built a well-formed 0.0.0.0 answer
+
+zdns_m2:
+    // --- (1b) M2 SELF-TESTS: label-boundary suffix matching ---
+    // A subdomain of a blocked base name MUST be sinkholed; a mere-string near-miss MUST NOT.
+    lea rsi, [rip + zdns_subquery]            // WWW.ADS.EXAMPLE -> expect BLOCKED (subdomain)
+    mov rcx, [rip + zdns_subquerylen]
+    call zdns_parse_and_match
+    cmp rax, 1
+    jne zdns_m2_near
+    or r12, 256                               // bit8: subdomain of a blocked base was sinkholed
+zdns_m2_near:
+    lea rsi, [rip + zdns_nearquery]           // NOTADS.EXAMPLE -> expect NOT blocked (not a boundary)
+    mov rcx, [rip + zdns_nearquerylen]
+    call zdns_parse_and_match
+    test rax, rax                             // 0 = not blocked (the correct, safe answer)
+    jnz zdns_st2                              // blocked/malformed -> over-block bug, skip bit9
+    or r12, 512                               // bit9: near-miss correctly NOT blocked (no over-block)
 
 zdns_st2:
     // --- (2) SELF-TEST #2 / FORWARD: parse+match una.os -> NOT blocked, forward upstream 10.0.2.3:53 ---
@@ -10920,15 +10941,26 @@ zdns_f2_end:
     mov rcx, rdi                              // domain end = field2 end
     mov r8, rdi                               // line cursor past field2
 zdns_have_domain:
-    // Domain field = [rdx, rcx). Compare to NAMEBUF[0..r11] (uppercase), EXACT (M1).
+    // Domain field = [rdx, rcx). BLOCK if it equals NAMEBUF, OR is a label-boundary SUFFIX of it —
+    // i.e. NAMEBUF ends with "." + domain (ZEOLITE-2 M2). So a blocked base domain (ads.example)
+    // sinkholes its subdomains (www.ads.example) but NOT a mere string suffix (notads.example — the
+    // char before the tail must be a dot). Compare is against the TAIL of NAMEBUF, case-insensitive.
     mov rax, rcx
-    sub rax, rdx                              // rax = domain length
+    sub rax, rdx                              // rax = domain length L
+    test rax, rax
+    jz zdns_toeol                             // empty domain field -> matches nothing
     cmp rax, r11
-    jne zdns_toeol                            // length mismatch -> not this line, skip to EOL
-    xor rdi, rdi                              // NAMEBUF idx
+    ja zdns_toeol                             // domain longer than the queried name -> cannot match
+    mov rdi, r11
+    sub rdi, rax                              // rdi = offset = r11 - L (tail start in NAMEBUF)
+    test rdi, rdi
+    jz zdns_dom_cmp                           // offset 0 -> exact-length case (no boundary dot needed)
+    mov sil, byte ptr [r10 + rdi - 1]         // label-boundary guard: char before the tail must be '.'
+    cmp sil, 0x2E
+    jne zdns_toeol                            // suffix not on a label boundary -> no match
 zdns_dom_cmp:
     cmp rdx, rcx
-    jae zdns_blocked                          // whole domain consumed, lengths equal -> exact match
+    jae zdns_blocked                          // whole domain matched at the tail -> BLOCKED
     mov al, byte ptr [rdx]
     cmp al, 0x61                              // upper-case the file side
     jb zdns_dcu
@@ -11036,6 +11068,26 @@ zdns_realquery:
     .byte 0x03, 0x75, 0x6E, 0x61, 0x02, 0x6F, 0x73, 0x00
     .byte 0x00, 0x01, 0x00, 0x01
 zdns_realquery_end:
+    // M2 self-test A: inline query for "www.ads.example" — a SUBDOMAIN of the blocked base ads.example;
+    // must be sinkholed by the label-boundary suffix rule. (labels: www / ads / example)
+    .balign 8
+zdns_subquerylen:
+    .quad zdns_subquery_end - zdns_subquery
+zdns_subquery:
+    .byte 0x5A, 0x53, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    .byte 0x03, 0x77, 0x77, 0x77, 0x03, 0x61, 0x64, 0x73, 0x07, 0x65, 0x78, 0x41, 0x4D, 0x50, 0x4C, 0x45, 0x00
+    .byte 0x00, 0x01, 0x00, 0x01
+zdns_subquery_end:
+    // M2 self-test B: inline query for "notads.example" — shares the string suffix "ads.example" but NOT
+    // on a label boundary; must NOT be blocked (guards the suffix rule against a naive substring bug).
+    .balign 8
+zdns_nearquerylen:
+    .quad zdns_nearquery_end - zdns_nearquery
+zdns_nearquery:
+    .byte 0x5A, 0x4E, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    .byte 0x06, 0x6E, 0x6F, 0x74, 0x61, 0x64, 0x73, 0x07, 0x65, 0x78, 0x61, 0x6D, 0x70, 0x6C, 0x65, 0x00
+    .byte 0x00, 0x01, 0x00, 0x01
+zdns_nearquery_end:
     // SYS_SENDTO message for the upstream forward: 8-byte addr header [10.0.2.3][53 LE][pad] + the
     // una.os DNS payload (the same 24 bytes as zdns_realquery).
     .balign 8
@@ -11136,15 +11188,18 @@ fn zeolite_launcher(demo_cpu: usize) {
     let fwd_decided = w & 16 != 0;
     let fwd_relayed = w & 32 != 0;
     let served = w & 64 != 0 && w & 128 != 0;
+    let subdomain_ok = w & 256 != 0; // M2: a subdomain of a blocked base was sinkholed
+    let nearmiss_ok = w & 512 != 0; // M2: a near-miss (not a label boundary) was NOT over-blocked
+    let suffix_ok = subdomain_ok && nearmiss_ok;
     let list_src = if from_fat { "BLOCK.TXT via S7 dynamic-open" } else { "builtin list (no FAT)" };
 
-    // Leg 1: the STOR-feeds-NET composition + hostile-parse + forward, all hermetic.
-    if list_loaded && blocked_ok && fwd_decided && fwd_relayed && killed == 0 {
+    // Leg 1: the STOR-feeds-NET composition + hosts-format ingest + suffix-match + hostile-parse + forward.
+    if list_loaded && blocked_ok && suffix_ok && fwd_decided && fwd_relayed && killed == 0 {
         serial_println!(
-            ":: zeolite: blocklist from {}, blocked ADS.EXAMPLE -> 0.0.0.0 (answer built), forwarded una.os -> 10.0.2.3:53 real answer relayed — witness OK ::",
+            ":: zeolite: hosts-format blocklist from {}, blocked ADS.EXAMPLE -> 0.0.0.0 (answer built), subdomain WWW.ADS.EXAMPLE sinkholed + NOTADS.EXAMPLE not over-blocked, forwarded una.os -> 10.0.2.3:53 real answer relayed — witness OK ::",
             list_src
         );
-    } else if list_loaded && blocked_ok && fwd_decided && !fwd_relayed && killed == 0 {
+    } else if list_loaded && blocked_ok && suffix_ok && fwd_decided && !fwd_relayed && killed == 0 {
         // The forward leg's upstream is unreachable on this medium (the UNAOS_NET=socket injector has
         // no slirp resolver) — the sinkhole DECISION + build proved; the upstream relay is INCOMPLETE here.
         serial_println!(
@@ -11153,8 +11208,8 @@ fn zeolite_launcher(demo_cpu: usize) {
         );
     } else {
         serial_println!(
-            ":: zeolite: DNS sinkhole FAIL — witness={:#x} (list={} fat={} blocked+built={} fwd_decided={} fwd_relayed={}) cleared={} killed={} done={} ::",
-            w, list_loaded, from_fat, blocked_ok, fwd_decided, fwd_relayed, cleared, killed,
+            ":: zeolite: DNS sinkhole FAIL — witness={:#x} (list={} fat={} blocked+built={} subdomain={} nearmiss_ok={} fwd_decided={} fwd_relayed={}) cleared={} killed={} done={} ::",
+            w, list_loaded, from_fat, blocked_ok, subdomain_ok, nearmiss_ok, fwd_decided, fwd_relayed, cleared, killed,
             ZEOLITE_DONE.load(Ordering::Acquire)
         );
     }
