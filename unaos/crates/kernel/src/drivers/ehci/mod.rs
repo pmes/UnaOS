@@ -54,7 +54,9 @@ const OP_CTRLDSSEGMENT: u64 = 0x10;
 const OP_PERIODICLISTBASE: u64 = 0x14;
 const OP_ASYNCLISTADDR: u64 = 0x18;
 
-/// USBCMD schedule enables.
+/// USBCMD bits.
+const CMD_RS: u32 = 1 << 0;
+const CMD_HCRESET: u32 = 1 << 1;
 const CMD_PSE: u32 = 1 << 4;
 const CMD_ASE: u32 = 1 << 5;
 
@@ -72,6 +74,8 @@ const PORT_RW1C: u32 = (1 << 1) | (1 << 3) | (1 << 5);
 const STS_RW1C: u32 = 0x3F;
 /// USBSTS Async Schedule Status (read-only; tracks USBCMD.ASE with a lag).
 const STS_ASS: u32 = 1 << 15;
+const STS_HCHALTED: u32 = 1 << 12;
+const STS_HSE: u32 = 1 << 4; // Host System Error (DMA master/target abort) — halts the HC
 
 /// One endpoint-addressing tuple for the shared control QH: everything dword 1/2 of a QH needs.
 /// `hub_addr`/`hub_port` are the TT fields — zero on Topology B / high-speed targets, the RMH's
@@ -185,6 +189,47 @@ impl Controller {
             self.frame_list,
             qh as u64
         );
+    }
+
+    /// Probe-2 metal finding (2026-07-16): Apple EFI drives the internal keyboard over these
+    /// EHCI functions pre-boot and leaves USBCMD.PSE=1 behind — the shared wake's RS=1 then set
+    /// the controller fetching firmware's STALE frame list (its memory long reclaimed) →
+    /// garbage pointers → USBSTS Host System Error → HCHalted, RS dropped, every transfer
+    /// timed out (USBSTS=0x0000f01e/f01f, both functions). This is exactly the pre-approved
+    /// HCRESET trigger (Peter item (c): reset only on M1-observed inconsistent state, tracing
+    /// the inconsistency). Detect stale schedule enables / a latched HSE, trace them verbatim,
+    /// then stop + HCRESET so the controller is programmed from its true default state.
+    /// Returns true when a reset was performed (caller must re-start RS and re-route CF —
+    /// HCRESET clears both). A clean controller (QEMU; a warm re-init) is left untouched.
+    unsafe fn quiesce_if_firmware_stale(&mut self) -> bool {
+        let cmd = mmio_read32(self.op + OP_USBCMD).unwrap_or(0);
+        let sts = mmio_read32(self.op + OP_USBSTS).unwrap_or(0);
+        let stale = cmd & (CMD_PSE | CMD_ASE) != 0 || sts & STS_HSE != 0;
+        if !stale {
+            return false;
+        }
+        serial_println!(
+            ":: EHCI-HID: [{}] firmware-stale controller state: USBCMD={:#010x} (PSE={} ASE={}) USBSTS={:#010x} (HSE={}) — pre-approved HCRESET path (traced inconsistency) ::",
+            self.idx, cmd,
+            (cmd >> 4) & 1, (cmd >> 5) & 1, sts, (sts >> 4) & 1
+        );
+        // Stop first (RS=0 + schedule enables off), bounded wait for halt (no-op if HSE
+        // already halted it), then reset and wait for HCRESET to self-clear.
+        let _ = mmio_write32(self.op + OP_USBCMD, cmd & !(CMD_RS | CMD_PSE | CMD_ASE));
+        let halted = wait_bounded(|| {
+            mmio_read32(self.op + OP_USBSTS).unwrap_or(0) & STS_HCHALTED != 0
+        });
+        let _ = mmio_write32(self.op + OP_USBCMD, CMD_HCRESET);
+        let reset_done = wait_bounded(|| {
+            mmio_read32(self.op + OP_USBCMD).unwrap_or(CMD_HCRESET) & CMD_HCRESET == 0
+        });
+        serial_println!(
+            ":: EHCI-HID: [{}] HCRESET: halted={} reset-cleared={} USBCMD={:#010x} USBSTS={:#010x} (defaults; RS + CONFIGFLAG re-applied next) ::",
+            self.idx, halted, reset_done,
+            mmio_read32(self.op + OP_USBCMD).unwrap_or(0),
+            mmio_read32(self.op + OP_USBSTS).unwrap_or(0)
+        );
+        true
     }
 
     /// Enable/disable the async schedule with a bounded wait for USBSTS.ASS (bit 15) to agree
@@ -822,7 +867,6 @@ pub fn init() {
                     else {
                         continue;
                     };
-                    ehci_scout::wake_route(&h, idx);
                     if h.addr64 != 0 {
                         serial_println!(
                             ":: EHCI-HID: [{}] note: controller advertises 64-bit addressing; CTRLDSSEGMENT pinned to 0 (all DMA < 4 GiB) ::",
@@ -843,7 +887,35 @@ pub fn init() {
                         next_addr: 1,
                         int_eps: Vec::new(),
                     };
+                    // Firmware-stale detection BEFORE any schedule programming: probe 2 showed
+                    // Apple EFI leaves PSE=1 behind (its pre-boot keyboard), which HSE-halts
+                    // the controller once RS runs over the reclaimed frame list. After the
+                    // pre-approved HCRESET the controller is at defaults (halted, CF=0) — the
+                    // bases are then programmed in the halted state (textbook), RS re-started,
+                    // and CF re-routed via the shared wake_route.
+                    let did_reset = c.quiesce_if_firmware_stale();
                     c.init_schedules();
+                    if did_reset {
+                        let cmd = mmio_read32(h.op + OP_USBCMD).unwrap_or(0);
+                        let _ = mmio_write32(h.op + OP_USBCMD, cmd | CMD_RS);
+                        let running = wait_bounded(|| {
+                            mmio_read32(h.op + OP_USBSTS).unwrap_or(STS_HCHALTED)
+                                & STS_HCHALTED
+                                == 0
+                        });
+                        serial_println!(
+                            ":: EHCI-HID: [{}] post-HCRESET restart: RS=1 running={} ::",
+                            idx, running
+                        );
+                    }
+                    ehci_scout::wake_route(&h, idx);
+                    // Clear any latched RW1C status (incl. a pre-existing HSE) before the
+                    // first transfer, so a fresh error is unambiguously ours.
+                    if let Some(sts) = mmio_read32(h.op + OP_USBSTS) {
+                        if sts & STS_RW1C != 0 {
+                            let _ = mmio_write32(h.op + OP_USBSTS, sts & STS_RW1C);
+                        }
+                    }
                     for port in 0..h.n_ports {
                         let portsc = mmio_read32(h.op + OP_PORTSC0 + 4 * port as u64).unwrap_or(0);
                         if portsc & PORT_CCS == 0 || portsc & PORT_OWNER != 0 {
