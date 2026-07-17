@@ -305,7 +305,57 @@ pub fn native_acl_write(
 /// and the in-RAM commit all under one MOUNT hold (the K5B invariant) — so they must not re-enter
 /// `with_unafs` (the MOUNT spinlock is non-reentrant). Same contract as the wrapper: `true` iff every
 /// journaled step committed.
+///
+/// K9-MASKCUT (SECURITY.md §K1 K9): adopt the UNAFS-BATCH staged-transaction shape at this ACL-persist
+/// choke point — stage the ENTIRE row (create/resolve + stale-grant removal + name/fc/owner/grant
+/// rewrites) with autocommit OFF and land it in ONE root flip, instead of one flip per attribute. This
+/// cuts the sector/flip count inside the K5B per-core IRQ-masked `with_unafs` window (the crate's own
+/// batched-sync win, applied to the kernel ACL path). No change to WHAT is written, nor to the K5B fusion:
+/// the caller's snapshot -> THIS write -> in-RAM commit still all run under the one MOUNT hold; only this
+/// write's internal flip count shrinks. All three fused persist sites (`sys_fgrant_revoke_2phase`,
+/// `native_persist_grants`, `native_persist_grow`, plus create/rename) funnel through here, so the cut is
+/// uniform.
+///
+/// SCOPE-GUARD (the M1 requirement): the staging body ([`native_acl_stage_row`]) owns every early return;
+/// this wrapper has NO early return between `set_autocommit(false)` and the unconditional
+/// `set_autocommit(true)`, so a staging failure can never leak the autocommit-OFF state onto the
+/// process-wide cached mount (which would silently drop a later writer's commit). Production always enters
+/// autocommit-ON (the K8a witness is the only other toggler and never nests a persist inside its hold), so
+/// restoring to ON is the invariant, not a guess.
+///
+/// DURABLE-FIRST (K3, preserved — strengthened on the success path): on staging success we commit ONCE, so
+/// a crash lands EITHER the old row OR the whole new row, never a partial row (as the per-op path could).
+/// On staging FAILURE we do NOT commit — no root flip, nothing durable changes, the old row stands, the
+/// caller sees `false` -> `-EIO`, in-RAM intact. RESIDUAL (pre-existing and equal to the autocommit-ON
+/// path, documented not introduced): a mid-op I/O/`NoSpace` failure leaves uncommitted in-flight blocks on
+/// the shared cached mount that a later persist's commit would flush — the crate exposes no PUBLIC in-place
+/// unwind (`txn_unwind` is private; `create_files_batch` cannot express create-or-replace-with-removal), so
+/// the brief's "reload from committed root" is not expressible here. The autocommit-ON path shares this
+/// exact class (a failed op's writes are also left uncommitted-in-flight). True closure = a crate-side
+/// public rollback, out of the pi lane (see SECURITY.md §K1 K9 and the landing report).
 pub fn native_acl_write_on(
+    fs: &mut KernelUnaFS,
+    dir_lba: u64,
+    dir_off: u32,
+    name: &str,
+    first_cluster: u32,
+    owner: &[u8],
+    grants: &[(&[u8], &[u8])],
+) -> bool {
+    #[cfg(feature = "nsspan")] let _cs0 = fs.commit_stats(); fs.set_autocommit(false);
+    let staged = native_acl_stage_row(fs, dir_lba, dir_off, name, first_cluster, owner, grants);
+    // Commit ONLY on full staging success: a failed stage flips no root (durable-first — old row intact).
+    let ok = staged && fs.commit().is_ok();
+    fs.set_autocommit(true); #[cfg(feature = "nsspan")] { let cs1 = fs.commit_stats(); ACL_PERSIST_FLIPS.fetch_max(cs1.commits.wrapping_sub(_cs0.commits), core::sync::atomic::Ordering::Relaxed); ACL_PERSIST_BLOCKS.fetch_max(cs1.blocks_written.wrapping_sub(_cs0.blocks_written), core::sync::atomic::Ordering::Relaxed); }
+    ok
+}
+
+/// K9-MASKCUT: the STAGING body — create-or-resolve the ACL file and (re)write its typed attributes as a
+/// sequence of journaled `set_attribute`/`remove_attribute` ops. The caller ([`native_acl_write_on`]) holds
+/// autocommit OFF around this and issues the SINGLE commit, so these ops stage into one transaction (one
+/// root flip) rather than one flip apiece. Owns every early return; returns `true` iff every op staged
+/// cleanly. Body is the pre-K9 `native_acl_write_on` verbatim — no change to what is written.
+fn native_acl_stage_row(
     fs: &mut KernelUnaFS,
     dir_lba: u64,
     dir_off: u32,
@@ -1550,3 +1600,13 @@ pub fn k8c_snapread_selftest() {
         ticks
     );
 }
+
+// K9-MASKCUT WATCH (nsspan-gated, EOF so knob-off adds/moves nothing above): worst-case flip + block
+// count of a SINGLE ACL row persist through `native_acl_write_on`, captured across the K3/K5 fixtures.
+// `nsspan_report` (syscall.rs) emits these next to the per-site tick spans. Post-K9 `flips` = 1 (the
+// staged batch's one commit) vs the pre-K9 per-op regime's ~(4 + stale + grants) flips — the sector/flip
+// reduction the arc exists to prove, QEMU-observable (unlike the TCG-blind tick number). No lock, no heap.
+#[cfg(feature = "nsspan")]
+pub static ACL_PERSIST_FLIPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "nsspan")]
+pub static ACL_PERSIST_BLOCKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
