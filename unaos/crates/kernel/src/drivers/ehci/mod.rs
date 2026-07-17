@@ -138,6 +138,10 @@ pub struct Controller {
     frame_list_phys: u64,
     int_next: usize,
     periodic_on: bool,
+    /// Probe-14 self-adaptation: false = standard qTD-chain transfers (QEMU's model requires
+    /// fetched qTDs); true = overlay-direct (this metal HSEs on the qTD-fetch burst write —
+    /// flipped automatically on the first chain HSE, permanent for the controller's lifetime).
+    overlay_mode: bool,
     /// N2: driver-owned address allocator — EHCI has no controller slot model. Monotonic;
     /// a failed enumeration BURNS its address (never reused for a possibly-half-addressed
     /// device — mirror of dispose_downstream_slot's honesty). The 7-bit space bounds this at
@@ -326,6 +330,13 @@ impl Controller {
             | ((t.hub_addr as u32) << QH_HUBADDR_SHIFT)
             | ((t.hub_port as u32) << QH_PORT_SHIFT);
 
+        // PROBE-14 / metal finding: OVERLAY-DIRECT transactions. Across 13 metal probes the
+        // one operation never seen to succeed — and present in every failure — is the qTD
+        // fetch → overlay load, the controller's only multi-dword BURST WRITE (burst reads,
+        // dword token write-backs, payload reads, and live-port transactions all passed the
+        // smoke battery). So no qTD is ever handed to the controller: software pre-loads the
+        // QH overlay with each stage's token/buffer (exactly the shape every passing smoke
+        // used) and runs SETUP / DATA / STATUS as three sequential overlay transactions.
         // Setup packet.
         let sb = self.setup_buf;
         sb.write(bm_req);
@@ -337,8 +348,49 @@ impl Controller {
         sb.add(6).write(w_length as u8);
         sb.add(7).write((w_length >> 8) as u8);
 
-        // qTD chain: SETUP (DT0) -> [DATA (DT1, controller advances the toggle across packets
-        // within the qTD)] -> STATUS (opposite direction, DT1, IOC). Data <= 64 B by contract.
+        // Mode selection: QEMU's hcd-ehci only executes fetched qTDs (it ignores software-
+        // primed overlays), while this metal HSEs on the qTD fetch. Chain mode runs first;
+        // an HSE'd chain transfer flips the controller to overlay-direct permanently and
+        // retries (the failed SETUP never reached the wire — clean retry).
+        if !self.overlay_mode {
+            match self.chain_txn(t, bm_req, b_req, w_length, dir_in) {
+                Err("hse") => {
+                    self.overlay_mode = true;
+                    serial_println!(
+                        ":: EHCI-HID: [{}] qTD-fetch HSE — switching to OVERLAY-DIRECT transactions (probe-14 silicon finding: burst-write overlay load aborts; software-primed overlays proven clean) ::",
+                        self.idx
+                    );
+                }
+                other => return other,
+            }
+        }
+
+        // Three overlay-direct stages. DT: SETUP=0, DATA starts 1 (controller maintains the
+        // toggle in the overlay token across packets within a stage), STATUS=1 opposite PID.
+        self.overlay_txn(bm_req, b_req, "SETUP", QTD_PID_SETUP, 8, self.setup_buf_phys, t.addr)?;
+        let mut got = 0u32;
+        if w_length > 0 {
+            let data_pid = if dir_in { QTD_PID_IN } else { QTD_PID_OUT };
+            got = self.overlay_txn(
+                bm_req, b_req, "DATA", data_pid | QTD_DT, w_length as u32, self.data_buf_phys, t.addr,
+            )?;
+        }
+        let status_pid = if w_length == 0 || !dir_in { QTD_PID_IN } else { QTD_PID_OUT };
+        self.overlay_txn(bm_req, b_req, "STATUS", status_pid | QTD_DT, 0, 0, t.addr)?;
+        Ok(got)
+    }
+
+    /// Chain-mode EP0 transfer (the standard qTD-chain shape; QEMU's model requires it). On a
+    /// Host System Error the caller switches to overlay-direct. Returns bytes transferred.
+    unsafe fn chain_txn(
+        &mut self,
+        t: &Target,
+        bm_req: u8,
+        b_req: u8,
+        w_length: u16,
+        dir_in: bool,
+    ) -> Result<u32, &'static str> {
+        let qh = self.async_qh;
         let (setup, data, status) = (self.qtd_setup, self.qtd_data, self.qtd_status);
         let status_pid = if w_length == 0 || !dir_in { QTD_PID_IN } else { QTD_PID_OUT };
         write_qtd(status, PTR_TERMINATE, status_pid | QTD_DT | QTD_IOC, 0, 0);
@@ -351,8 +403,6 @@ impl Controller {
         };
         write_qtd(setup, first_after_setup, QTD_PID_SETUP, 8, self.setup_buf_phys);
 
-        // Prime the QH overlay, splice the work QH in front of the frame-list chain (any armed
-        // interrupt QHs stay serviced behind it), then run the periodic engine for the transfer.
         (*qh).overlay[1] = PTR_TERMINATE;
         core::ptr::write_volatile(&mut (*qh).overlay[2], 0);
         core::ptr::write_volatile(&mut (*qh).overlay[0], self.qtd_setup_phys as u32);
@@ -361,38 +411,41 @@ impl Controller {
         for i in 0..1024 {
             core::ptr::write_volatile(self.frame_list.add(i), (self.qh_phys as u32) | PTR_TYPE_QH);
         }
-        let pss_on = self.set_periodic_schedule(true);
-
-        // Bounded completion wait on the terminating qTD, failing fast on any halted qTD.
+        let _ = self.set_periodic_schedule(true);
         let done = wait_bounded(|| {
             let st = core::ptr::read_volatile(&(*status).token);
             if st & QTD_ACTIVE == 0 {
                 return true;
             }
-            (core::ptr::read_volatile(&(*setup).token) & QTD_HALTED != 0)
+            let hse = mmio_read32(self.op + OP_USBSTS).unwrap_or(0) & STS_HSE != 0;
+            hse || (core::ptr::read_volatile(&(*setup).token) & QTD_HALTED != 0)
                 || (w_length > 0 && core::ptr::read_volatile(&(*data).token) & QTD_HALTED != 0)
         });
-        // Unsplice: restore the frame list, drop PSE only if no interrupt endpoint needs it,
-        // then park the overlay.
         for i in 0..1024 {
             core::ptr::write_volatile(self.frame_list.add(i), old_head);
         }
-        let pss_off = if self.periodic_on {
-            true // interrupt endpoints own the periodic schedule — leave it running
-        } else {
-            self.set_periodic_schedule(false)
-        };
+        if !self.periodic_on {
+            let _ = self.set_periodic_schedule(false);
+        }
         (*qh).horiz = PTR_TERMINATE;
         core::ptr::write_volatile(&mut (*qh).overlay[0], PTR_TERMINATE);
 
+        let sts = mmio_read32(self.op + OP_USBSTS).unwrap_or(0);
+        if sts & STS_HSE != 0 {
+            // Recover the halted controller (ack RW1C, PSE off, RS back on) for the retry.
+            let _ = mmio_write32(self.op + OP_USBSTS, sts & STS_RW1C);
+            let cmd = mmio_read32(self.op + OP_USBCMD).unwrap_or(0);
+            let _ = mmio_write32(self.op + OP_USBCMD, (cmd & !CMD_PSE) | CMD_RS);
+            let _ = wait_bounded(|| {
+                mmio_read32(self.op + OP_USBSTS).unwrap_or(STS_HCHALTED) & STS_HCHALTED == 0
+            });
+            return Err("hse");
+        }
         if !done {
             serial_println!(
-                ":: EHCI-HID: [{}] STOP-NOTE EP0 timeout addr={} req={:#04x}/{:#04x} setup-token={:#010x} USBCMD={:#010x} USBSTS={:#010x} PSS-handshakes on={} off={} — not forced ::",
+                ":: EHCI-HID: [{}] STOP-NOTE EP0 chain timeout addr={} req={:#04x}/{:#04x} setup-token={:#010x} — not forced ::",
                 self.idx, t.addr, bm_req, b_req,
-                core::ptr::read_volatile(&(*setup).token),
-                mmio_read32(self.op + OP_USBCMD).unwrap_or(0),
-                mmio_read32(self.op + OP_USBSTS).unwrap_or(0),
-                pss_on, pss_off
+                core::ptr::read_volatile(&(*setup).token)
             );
             return Err("timeout");
         }
@@ -403,7 +456,7 @@ impl Controller {
             let tok = core::ptr::read_volatile(&(*q).token);
             if tok & QTD_ERR_MASK != 0 {
                 serial_println!(
-                    ":: EHCI-HID: [{}] EP0 {} error addr={} req={:#04x}/{:#04x} token={:#010x} (halted/xact — likely STALL) ::",
+                    ":: EHCI-HID: [{}] EP0 chain {} error addr={} req={:#04x}/{:#04x} token={:#010x} (halted/xact — likely STALL) ::",
                     self.idx, name, t.addr, bm_req, b_req, tok
                 );
                 return Err("stall");
@@ -415,6 +468,70 @@ impl Controller {
             0
         };
         Ok((w_length as u32).saturating_sub(residual))
+    }
+
+    /// One overlay-direct transaction stage on the (already retargeted) work QH: software
+    /// writes the token/buffer straight into the overlay — the controller never fetches a qTD
+    /// (the burst-write class 13 metal probes indicted). Splices the QH into the frame list,
+    /// runs the periodic engine, bounded-waits on the token, unsplices. Returns bytes done.
+    unsafe fn overlay_txn(
+        &mut self,
+        bm_req: u8,
+        b_req: u8,
+        stage: &str,
+        pid_dt: u32,
+        len: u32,
+        buf_phys: u64,
+        addr: u8,
+    ) -> Result<u32, &'static str> {
+        let qh = self.async_qh;
+        (*qh).current_qtd = 0;
+        (*qh).overlay[0] = PTR_TERMINATE;
+        (*qh).overlay[1] = PTR_TERMINATE;
+        (*qh).overlay[3] = buf_phys as u32;
+        (*qh).overlay[4] = 0;
+        core::ptr::write_volatile(
+            &mut (*qh).overlay[2],
+            QTD_ACTIVE | QTD_CERR3 | (len << QTD_TOTAL_SHIFT) | pid_dt | QTD_IOC,
+        );
+        let old_head = core::ptr::read_volatile(self.frame_list);
+        (*qh).horiz = old_head;
+        for i in 0..1024 {
+            core::ptr::write_volatile(self.frame_list.add(i), (self.qh_phys as u32) | PTR_TYPE_QH);
+        }
+        let pss_on = self.set_periodic_schedule(true);
+        let done = wait_bounded(|| {
+            core::ptr::read_volatile(&(*qh).overlay[2]) & QTD_ACTIVE == 0
+        });
+        for i in 0..1024 {
+            core::ptr::write_volatile(self.frame_list.add(i), old_head);
+        }
+        let pss_off = if self.periodic_on {
+            true // interrupt endpoints own the periodic schedule — leave it running
+        } else {
+            self.set_periodic_schedule(false)
+        };
+        (*qh).horiz = PTR_TERMINATE;
+        let tok = core::ptr::read_volatile(&(*qh).overlay[2]);
+
+        if !done {
+            serial_println!(
+                ":: EHCI-HID: [{}] STOP-NOTE EP0 {} timeout addr={} req={:#04x}/{:#04x} token={:#010x} USBCMD={:#010x} USBSTS={:#010x} PSS on={} off={} — not forced ::",
+                self.idx, stage, addr, bm_req, b_req, tok,
+                mmio_read32(self.op + OP_USBCMD).unwrap_or(0),
+                mmio_read32(self.op + OP_USBSTS).unwrap_or(0),
+                pss_on, pss_off
+            );
+            return Err("timeout");
+        }
+        if tok & QTD_ERR_MASK != 0 {
+            serial_println!(
+                ":: EHCI-HID: [{}] EP0 {} error addr={} req={:#04x}/{:#04x} token={:#010x} (halted/xact — likely STALL) ::",
+                self.idx, stage, addr, bm_req, b_req, tok
+            );
+            return Err("stall");
+        }
+        Ok(len.saturating_sub((tok >> QTD_TOTAL_SHIFT) & 0x7FFF))
     }
 
     /// Debounce + reset + enable one root port. Returns true when the port enabled on EHCI
@@ -837,11 +954,26 @@ impl Controller {
         };
         (*qh).ep_caps = QH_MULT1 | (0x01 << QH_SMASK_SHIFT) | split;
 
-        // First transfer of a freshly-configured interrupt endpoint is DATA0.
-        write_qtd(qtd, PTR_TERMINATE, QTD_PID_IN | QTD_IOC, mps as u32, buf_phys);
-        (*qh).overlay[1] = PTR_TERMINATE;
-        (*qh).overlay[2] = 0;
-        (*qh).overlay[0] = qtd_phys as u32;
+        // First transfer of a freshly-configured interrupt endpoint is DATA0, armed in
+        // whichever mode enumeration settled on (overlay-direct on this metal, qTD-chain on
+        // QEMU — see Controller::overlay_mode).
+        if self.overlay_mode {
+            let _ = (qtd, qtd_phys); // slot storage retained; the controller never sees it
+            (*qh).current_qtd = 0;
+            (*qh).overlay[0] = PTR_TERMINATE;
+            (*qh).overlay[1] = PTR_TERMINATE;
+            (*qh).overlay[3] = buf_phys as u32;
+            (*qh).overlay[4] = 0;
+            core::ptr::write_volatile(
+                &mut (*qh).overlay[2],
+                QTD_ACTIVE | QTD_CERR3 | ((mps as u32) << QTD_TOTAL_SHIFT) | QTD_PID_IN | QTD_IOC,
+            );
+        } else {
+            write_qtd(qtd, PTR_TERMINATE, QTD_PID_IN | QTD_IOC, mps as u32, buf_phys);
+            (*qh).overlay[1] = PTR_TERMINATE;
+            (*qh).overlay[2] = 0;
+            (*qh).overlay[0] = qtd_phys as u32;
+        }
 
         // Link: new QH points at the current chain head, then every frame-list entry points at
         // the new QH (entries were Terminate or the old head — both cases are one word).
@@ -888,11 +1020,16 @@ impl Controller {
             }
         }
         let idx = self.idx;
+        let om = self.overlay_mode;
         for e in self.int_eps.iter_mut() {
             if e.dead {
                 continue;
             }
-            let tok = core::ptr::read_volatile(&(*e.qtd).token);
+            let tok = if om {
+                core::ptr::read_volatile(&(*e.qh).overlay[2])
+            } else {
+                core::ptr::read_volatile(&(*e.qtd).token)
+            };
             if tok & QTD_ACTIVE != 0 {
                 continue;
             }
@@ -929,14 +1066,26 @@ impl Controller {
                     }
                 }
             }
-            // Re-arm: flip the software toggle (QH_DTC — the toggle lives here, not in the QH),
-            // refresh the qTD, re-prime the overlay.
+            // Re-arm in the controller's transfer mode: flip the software toggle (QH_DTC —
+            // the toggle lives here), then either rewrite the overlay in place
+            // (overlay-direct; no qTD fetch — this metal) or refresh + point at the qTD.
             e.toggle = !e.toggle;
             let dt = if e.toggle { QTD_DT } else { 0 };
-            write_qtd(e.qtd, PTR_TERMINATE, QTD_PID_IN | QTD_IOC | dt, e.mps as u32, e.buf_phys);
-            (*e.qh).overlay[1] = PTR_TERMINATE;
-            core::ptr::write_volatile(&mut (*e.qh).overlay[2], 0);
-            core::ptr::write_volatile(&mut (*e.qh).overlay[0], e.qtd_phys as u32);
+            if om {
+                (*e.qh).overlay[0] = PTR_TERMINATE;
+                (*e.qh).overlay[1] = PTR_TERMINATE;
+                (*e.qh).overlay[3] = e.buf_phys as u32;
+                (*e.qh).overlay[4] = 0;
+                core::ptr::write_volatile(
+                    &mut (*e.qh).overlay[2],
+                    QTD_ACTIVE | QTD_CERR3 | ((e.mps as u32) << QTD_TOTAL_SHIFT) | QTD_PID_IN | QTD_IOC | dt,
+                );
+            } else {
+                write_qtd(e.qtd, PTR_TERMINATE, QTD_PID_IN | QTD_IOC | dt, e.mps as u32, e.buf_phys);
+                (*e.qh).overlay[1] = PTR_TERMINATE;
+                core::ptr::write_volatile(&mut (*e.qh).overlay[2], 0);
+                core::ptr::write_volatile(&mut (*e.qh).overlay[0], e.qtd_phys as u32);
+            }
         }
     }
 }
@@ -1200,6 +1349,7 @@ pub fn init() {
                         frame_list_phys: fl_phys,
                         int_next: 0,
                         periodic_on: false,
+                        overlay_mode: false,
                         next_addr: 1,
                         int_eps: Vec::new(),
                     };
