@@ -175,6 +175,19 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     if unaos_kernel::arch::gic::is_v3() {
         unaos_kernel::arch::smp_virt::start_secondaries(dtb_addr, dtb_size);
 
+        // ORIN-NET-1 (QEMU graceful-skip WITNESS, `UNAOS_PCIEPROBE=1`): run the SAME read-only PCIe
+        // census on the virt GICv3 path so the arc has a runnable QEMU gate. The QEMU virt DTB has a
+        // generic `pci-host-ecam-generic` node but NO Tegra234 root complex, so the census dumps the
+        // generic controller and reports "no Tegra234 PCIe RC (graceful)" for the config gate — then
+        // CAPSTONE completes below. Metal RAM map is the JC3 mask. Compiled out knob-off, so the
+        // default virt regression is byte-identical to baseline. See arch_arm64.md §ORIN-NET-1.
+        #[cfg(feature = "pcieprobe")]
+        unaos_kernel::arch::pcie_probe::census(&unaos_kernel::arch::pcie_probe::PcieCtx {
+            dtb_addr,
+            dtb_size,
+            ram_gib_mask: jc3_ram_gib_mask,
+        });
+
         // JC3: with the JC2 SMP proof complete (the secondaries are parked at EL2 in their WFI loop), drop
         // the BOOT CORE EL2 -> EL1 and run the scheduler + full M4 CAPSTONE there — the QEMU-testable proof
         // that the scheduler and all six sync primitives run at EL1 on the GICv3 `virt` path. Sequenced
@@ -1252,6 +1265,20 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     let (dtb_addr, dtb_size) = (boot_info.dtb_addr, boot_info.dtb_size);
     unaos_kernel::arch::memory::init(boot_info);
     serial_println!(":: KERNEL HEAP ALLOCATED ::");
+
+    // ORIN-NET-1 (read-only PCIe/NIC census, `UNAOS_PCIEPROBE=1`): with the `pcieprobe` feature
+    // armed, run the census HERE on the metal Orin — after JM4 (serial/heap live) and the mmu is up
+    // (its RAM-GiB map gates the DTB deref), and BEFORE any of the JB2b xHCI work below (the census
+    // is PCIe-only, independent of XUSB). Read-only: DTB census of every `pcie@` controller + a
+    // guarded, poison-rejecting config-space liveness read for firmware-ENABLED controllers whose
+    // aperture is already mapped (no new mapping, no fabric/config write). Compiled out knob-off, so
+    // the default tegra image stays byte-identical to baseline. See arch_arm64.md §ORIN-NET-1.
+    #[cfg(feature = "pcieprobe")]
+    unaos_kernel::arch::pcie_probe::census(&unaos_kernel::arch::pcie_probe::PcieCtx {
+        dtb_addr,
+        dtb_size,
+        ram_gib_mask: mmu.ram_gib_mask,
+    });
 
     // ORIN-SMP-7 (boot-state-context bisect) — the PRE-xHCI-takeover dispatch site. With `smpprobe`
     // armed to leg 25, the real 5-core wake fires HERE — after JM4 (GIC/timer/SMC/serial live) and

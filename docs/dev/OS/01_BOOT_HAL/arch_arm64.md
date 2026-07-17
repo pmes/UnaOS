@@ -4513,6 +4513,86 @@ esp-jetson links); `UNAOS_HUBSTORAGE` x86 MISSION SUCCESS. Bench runbook: `scrip
   baton: UnaFS objects on the K-line machinery + NSSPAN-pattern per-phase ticks so the first
   native sync IS the baseline FS benchmark).
 
+### ORIN-NET-1 — read-only PCIe root-complex + NIC recon (`UNAOS_PCIEPROBE`, knob-gated; census-before-touch)
+
+Orin has no network path. The Jetson Orin Nano devkit's NIC sits behind the Tegra234 PCIe root
+complex, so networking begins with knowing **exactly what the firmware (NVIDIA UEFI / L4T 39.2.0)
+left us** at ExitBootServices — the SMP-2-style read-only census that scopes the real bring-up chain
+(PCIe RC → NIC → smoltcp, already in-tree). This arc writes NOTHING to fabric or config space beyond
+what reading requires: no BAR writes, no bus-master/command-register writes, no link retraining, no
+power-domain state changes, and **no new page-table mapping** (a mapping is a write — the STOP
+tripwire). The wall (JETSON-XCARVE) taught this track to census before it touches.
+
+All code lives in `arch/aarch64/pcie_probe.rs` behind the `pcieprobe` cargo feature
+(`UNAOS_PCIEPROBE=1`). The feature is **standalone** (it does NOT imply `tegra`, mirroring the
+`smpprobe` pattern) so the same census can run on BOTH the metal tegra path and the QEMU `virt` GICv3
+path — the metal build combines it with `UNAOS_TEGRA=1`. Knob-off, the module and its two call sites
+vanish and every image (tegra AND virt) is **byte-identical to baseline** (verified: knob-off tegra
+`esp-jetson` kernel ELF has zero `PCIE:` strings, `tegra:` count unchanged at 109, and the same-path
+rebuild against base `45a06b2` hashes equal).
+
+**Two layers, in strict order of trust.**
+
+1. **DTB census (ALWAYS).** Walk the firmware's own device tree READ-ONLY (the same bounded
+   big-endian token scan `fdt_tegra::Fdt`/`for_each_prop` already uses — a malformed blob degrades to
+   a printed "not found", never a fault) and dump every `pcie@` controller: `compatible`,
+   `device_type`, `status`, `reg`/`reg-names`, `ranges`, `interrupts`/`interrupt-map` (presence +
+   size), `num-lanes`/`phy-names`, `power-domains`, `linux,pci-domain`. This alone names which
+   controllers exist, which the firmware left **ENABLED** (`status = "okay"`), and — from the RC's
+   `ranges`/child nodes — where the NIC lives. It is the deliverable's spine and is zero-MMIO-risk.
+
+2. **Config-space liveness read (GATED, conservative).** ONLY for a controller the firmware left
+   ENABLED (`status = "okay"`) AND whose config/appl aperture (`reg-names` = `"config"`, else
+   `"dbi"`/`"appl"`) resolves **inside the already-mapped GiB-0 Device-nGnRE window** (`mmu_tegra`
+   maps GiB 0 + RAM; it does NOT map the high Tegra234 PCIe config apertures). No new mapping is made.
+   The read decodes vendor/device, class/subclass/prog-if/rev, header type, and BAR0..5 — all
+   read-only, no config write. If the aperture is out of the mapped window (the expected Tegra234
+   case — its `config` regions live high, e.g. the C-controller `0x2e…` range), the probe **records
+   the blocker and leaves that controller un-walked**: NET-2 must map it Device-nGnRE first. A partial
+   map with honest gaps beats a touched fabric.
+
+**The poison-rejection rule (PI-V3D-1, cited in the probe's liveness comments).** PI-V3D-1's attended
+Pi sitting found the V3D core block never decoded — every read returned the firmware's `0xdeadbeef`
+fill — yet the probe's liveness gate FALSE-PASSED it (it treated the non-zero word as "present"). A
+gate that only rejects zero is not a liveness gate. Here `is_poison()` rejects BOTH `0xffffffff` (the
+PCIe master-abort / unclaimed-config return) AND `0xdeadbeef` (firmware fill): either is **ABSENT
+DECODE, never "present"**. A live config space returns a plausible vendor id (not `0x0000`, not
+`0xffff`) whose word is not a poison fill.
+
+**Read-only invariant (the arc's review lens).** Every access is a `read_volatile` or a DTB byte
+read — no `write_volatile`, no config/BAR/command write, no `SET_*` MRQ, no `CPU_ON`, no link
+retrain. The DTB `status` is the enable oracle, gating the only MMIO the arc would ever touch to a
+block the firmware itself declares enabled (the JX1 lesson: a gated Tegra block is an EL3-fatal touch,
+unguardable — so we touch only `status = "okay"` apertures that are already mapped).
+
+**Call sites (two, both `pcieprobe`-gated).**
+- `tegra_early_stop` (main.rs), just after `:: KERNEL HEAP ALLOCATED ::` and before any JB2b xHCI work
+  (the census is PCIe-only, independent of XUSB) — the **metal Orin census**.
+- The virt GICv3 `is_v3()` block (main.rs), after `smp_virt::start_secondaries` and before the EL2→EL1
+  drop — the **QEMU graceful-skip witness**.
+
+**QEMU vs metal — the honesty boundary.** QEMU `virt` has no Tegra234 root complex (a generic
+`pci-host-ecam-generic` at most), and on the GICv3 divergence path the UEFI handoff leaves
+`boot_info.dtb_addr = 0`. So the census's only observable QEMU effect is the graceful-skip line, then
+CAPSTONE completes unchanged:
+
+```
+:: PCIE: ORIN-NET-1 read-only PCIe/NIC census (DTB @0x0 size=0x0) ::
+:: PCIE: no DTB handed off — census SKIPPED (graceful) ::
+```
+
+Everything past the DTB census (the config-space liveness read, the NIC identity/BAR/link-state map)
+is **ATTENDED-METAL-PENDING**: the Orin devkit's live DTB is only present on real silicon. The census
+is staged as a tar for an attended sitting (`scripts/orin-net1-bench.md`); the map's device columns
+(which controller hosts the NIC, its vendor/device/class, link state as-left-by-firmware, the SCOPED
+NET-2 chain) fill in from that boot.
+
+**Gates green.** `./arroyo check` both arches × {knob-off, `PCIEPROBE`, `PCIEPROBE`+`TEGRA`}; knob-off
+byte-identity re-proven (same-path rebuild vs base `45a06b2` hashes equal; zero `PCIE:` strings;
+`tegra:` 109 unchanged); `test-arm 22` MISSION SUCCESS; `UNAOS_GICV3=1 test-arm 40` CAPSTONE 6/6 (both
+knob-off AND knob-on — the knob-on run witnesses the graceful skip); `kernel8-test 35` 0-FAIL (29
+PASS); `esp-jetson` links. Bench runbook: `scripts/orin-net1-bench.md`.
+
 ### ORIN-SMP idle-heartbeat — the parked-core pinned-bar fix (per-core telemetry honesty)
 
 > Numbering note: the spawning round labelled this arc "SMP-6", but SMP-6/7/8 are already merged

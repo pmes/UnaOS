@@ -187,6 +187,18 @@ xcarve_crcrq = ["tegra"]
 # byte-identical to baseline. Enable via `UNAOS_XCARVE_RELINK=1 UNAOS_TEGRA=1 ./arroyo esp-jetson`.
 xcarve_relink = ["tegra"]
 
+# ORIN-NET-1: the `UNAOS_PCIEPROBE=1` read-only PCIe root-complex + NIC recon census
+# (arch/aarch64/pcie_probe.rs), wired into `tegra_early_stop` (the metal Orin census) AND the virt
+# GICv3 path (so `UNAOS_PCIEPROBE=1 UNAOS_GICV3=1 ./arroyo test-arm 40` witnesses the graceful skip
+# against the QEMU virt DTB, which has a generic ecam but no Tegra234 RC). Standalone (does NOT imply
+# `tegra`, mirroring the `smpprobe` pattern) so the census can run on BOTH the tegra and the virt
+# builds; the metal build combines it with `UNAOS_TEGRA=1`. Read-only: DTB census + a
+# poison-rejecting, already-mapped-only config-space liveness read; no fabric/config/BAR/power write,
+# no new page-table mapping (STOP tripwire). With this feature OFF (default) the module + both call
+# sites vanish and every image (tegra AND virt) is byte-identical to baseline. See arch_arm64.md
+# §ORIN-NET-1 and scripts/orin-net1-bench.md.
+pcieprobe = []
+
 # CORE3-PROBE: instrument the aarch64 secondary-core entry stub (`_secondary_start`) to raw-dump,
 # MMU-off / no-stack, each core's MPIDR_EL1 low byte, CurrentEL, and its arrival x0 to the Pi 4 PL011
 # (0xFE201000) BEFORE any Rust runs. Disambiguates the CORE3-SMP >1 MiB core-3 regression (firmware
