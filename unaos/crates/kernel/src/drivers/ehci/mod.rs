@@ -95,7 +95,9 @@ struct Target {
 struct IntEp {
     qh: *mut Qh,
     qtd: *mut Qtd,
+    qtd_phys: u64,
     buf: *mut u8,
+    buf_phys: u64,
     mps: u16,
     toggle: bool,
     is_kbd: bool,
@@ -104,20 +106,34 @@ struct IntEp {
     dead: bool,
 }
 
-/// One woken, schedule-bearing EHCI function.
+/// One woken, schedule-bearing EHCI function. All DMA structures live in the static
+/// `qh::DMA_POOLS` (kernel image, low physical); every `*_phys` field is the page-table-
+/// resolved physical address the controller is actually programmed with (probe-5 discipline —
+/// never the heap virt==phys shortcut).
 pub struct Controller {
     idx: usize,
     op: u64,
+    bus: u8,
+    dev: u8,
+    func: u8,
     async_qh: *mut Qh,
+    qh_phys: u64,
     /// The three reusable control-transfer qTDs (SETUP/DATA/STATUS) + their buffers. One
     /// synchronous transfer at a time — enumeration is strictly one-device-at-a-time (the same
     /// invariant the xHCI enum FSM enforces), so reuse is safe by construction.
     qtd_setup: *mut Qtd,
+    qtd_setup_phys: u64,
     qtd_data: *mut Qtd,
+    qtd_data_phys: u64,
     qtd_status: *mut Qtd,
+    qtd_status_phys: u64,
     setup_buf: *mut u8,
+    setup_buf_phys: u64,
     data_buf: *mut u8,
-    frame_list: u64,
+    data_buf_phys: u64,
+    frame_list: *mut u32,
+    frame_list_phys: u64,
+    int_next: usize,
     periodic_on: bool,
     /// N2: driver-owned address allocator — EHCI has no controller slot model. Monotonic;
     /// a failed enumeration BURNS its address (never reused for a possibly-half-addressed
@@ -166,16 +182,20 @@ impl Controller {
     /// interrupt endpoint exists (an empty periodic walk buys nothing).
     unsafe fn init_schedules(&mut self) {
         let _ = mmio_write32(self.op + OP_CTRLDSSEGMENT, 0);
-        let _ = mmio_write32(self.op + OP_PERIODICLISTBASE, self.frame_list as u32);
+        // Static pools are zeroed at link time — set every frame-list entry to Terminate.
+        for i in 0..1024 {
+            core::ptr::write_volatile(self.frame_list.add(i), PTR_TERMINATE);
+        }
+        let _ = mmio_write32(self.op + OP_PERIODICLISTBASE, self.frame_list_phys as u32);
 
         let qh = self.async_qh;
-        (*qh).horiz = (qh as u32) | PTR_TYPE_QH; // single-QH circular async list
+        (*qh).horiz = (self.qh_phys as u32) | PTR_TYPE_QH; // single-QH circular async list
         (*qh).ep_chars = QH_HEAD | QH_DTC | QH_EPS_HIGH | (64 << QH_MPS_SHIFT); // rewritten per target
         (*qh).ep_caps = QH_MULT1;
         (*qh).overlay[0] = PTR_TERMINATE;
         (*qh).overlay[1] = PTR_TERMINATE;
         (*qh).overlay[2] = 0; // inactive token — controller skips until a transfer is primed
-        let _ = mmio_write32(self.op + OP_ASYNCLISTADDR, qh as u32);
+        let _ = mmio_write32(self.op + OP_ASYNCLISTADDR, self.qh_phys as u32);
 
         // ASE is NOT set here. Real Intel EHCI parks async traversal on an empty schedule
         // (EHCI 4.8.3 empty-schedule detection: one H-bit QH with an inactive overlay) and
@@ -183,16 +203,15 @@ impl Controller {
         // that (SETUP qTD stayed Active, zero error bits, wake clean). QEMU re-walks every
         // frame and masked it. So the async schedule is enabled per transfer, with bounded
         // USBSTS.ASS handshakes — the Linux ehci-hcd idiom.
-        // Probe-4 evidence line: prove the identity-map contract (virt == translate(virt)) for
-        // the QH the controller will fetch, and read back CTRLDSSEGMENT — the two mundane
-        // suspects for the probe-3 master-abort, killed or confirmed on a serial line.
-        let qh_phys = crate::arch::x86_64::memory::translate(qh as u64);
+        // Evidence line: virt AND page-table-resolved phys of the QH the controller will
+        // fetch (probe-5: static-pool DMA, low physical), + CTRLDSSEGMENT read-back.
         serial_println!(
-            ":: EHCI-HID: [{}] schedules armed: framelist={:#x} asyncQH={:#x} translate(QH)={:#x} CTRLDSSEGMENT={:#x} (ASE per-transfer, PSE deferred to first HID endpoint) ::",
+            ":: EHCI-HID: [{}] schedules armed (static pool): framelist virt={:#x} phys={:#x} asyncQH virt={:#x} phys={:#x} CTRLDSSEGMENT={:#x} (ASE per-transfer, PSE deferred) ::",
             self.idx,
-            self.frame_list,
+            self.frame_list as u64,
+            self.frame_list_phys,
             qh as u64,
-            qh_phys.unwrap_or(u64::MAX),
+            self.qh_phys,
             mmio_read32(self.op + OP_CTRLDSSEGMENT).unwrap_or(u32::MAX)
         );
     }
@@ -299,19 +318,19 @@ impl Controller {
         write_qtd(status, PTR_TERMINATE, status_pid | QTD_DT | QTD_IOC, 0, 0);
         let first_after_setup = if w_length > 0 {
             let data_pid = if dir_in { QTD_PID_IN } else { QTD_PID_OUT };
-            write_qtd(data, status as u32, data_pid | QTD_DT, w_length as u32, self.data_buf as u64);
-            data as u32
+            write_qtd(data, self.qtd_status_phys as u32, data_pid | QTD_DT, w_length as u32, self.data_buf_phys);
+            self.qtd_data_phys as u32
         } else {
-            status as u32
+            self.qtd_status_phys as u32
         };
-        write_qtd(setup, first_after_setup, QTD_PID_SETUP, 8, self.setup_buf as u64);
+        write_qtd(setup, first_after_setup, QTD_PID_SETUP, 8, self.setup_buf_phys);
 
         // Prime the QH overlay, THEN enable the async schedule for this transfer (the schedule
         // must transition empty→non-empty while enabled-off, or real silicon's empty-schedule
         // park never sees the work — see init_schedules). Disabled again after completion.
         (*qh).overlay[1] = PTR_TERMINATE;
         core::ptr::write_volatile(&mut (*qh).overlay[2], 0);
-        core::ptr::write_volatile(&mut (*qh).overlay[0], setup as u32);
+        core::ptr::write_volatile(&mut (*qh).overlay[0], self.qtd_setup_phys as u32);
         let ass_on = self.set_async_schedule(true);
 
         // Bounded completion wait on the terminating qTD, failing fast on any halted qTD.
@@ -699,9 +718,31 @@ impl Controller {
     /// frame. The simplification is deliberate and verified against 4.12.2, not inherited
     /// silently; bInterval striding is a later refinement (design R8) if TT load ever demands.
     unsafe fn arm_interrupt_ep(&mut self, t: &Target, ep: u8, mps: u16, is_kbd: bool, is_rel: bool) {
-        let qh = alloc_qh();
-        let qtd = alloc_qtd();
-        let buf = alloc_buf64();
+        if self.int_next >= MAX_INT_EPS {
+            serial_println!(
+                ":: EHCI-HID: [{}] static int-EP pool exhausted ({}) — endpoint skipped ::",
+                self.idx, MAX_INT_EPS
+            );
+            return;
+        }
+        let slot = &mut (*self.pool()).int_slots[self.int_next];
+        let (qh, qtd, buf) = (
+            &mut slot.qh as *mut Qh,
+            &mut slot.qtd as *mut Qtd,
+            slot.buf.0.as_mut_ptr(),
+        );
+        let (Some(qh_phys), Some(qtd_phys), Some(buf_phys)) = (
+            phys_of(qh, 32),
+            phys_of(qtd, 32),
+            phys_of(buf, 64),
+        ) else {
+            serial_println!(
+                ":: EHCI-HID: [{}] STOP-NOTE int-EP slot failed the phys/alignment contract — endpoint skipped ::",
+                self.idx
+            );
+            return;
+        };
+        self.int_next += 1;
 
         (*qh).ep_chars = (t.addr as u32)
             | ((ep as u32) << 8)
@@ -718,18 +759,18 @@ impl Controller {
         (*qh).ep_caps = QH_MULT1 | (0x01 << QH_SMASK_SHIFT) | split;
 
         // First transfer of a freshly-configured interrupt endpoint is DATA0.
-        write_qtd(qtd, PTR_TERMINATE, QTD_PID_IN | QTD_IOC, mps as u32, buf as u64);
+        write_qtd(qtd, PTR_TERMINATE, QTD_PID_IN | QTD_IOC, mps as u32, buf_phys);
         (*qh).overlay[1] = PTR_TERMINATE;
         (*qh).overlay[2] = 0;
-        (*qh).overlay[0] = qtd as u32;
+        (*qh).overlay[0] = qtd_phys as u32;
 
         // Link: new QH points at the current chain head, then every frame-list entry points at
         // the new QH (entries were Terminate or the old head — both cases are one word).
-        let fl = self.frame_list as *mut u32;
+        let fl = self.frame_list;
         let old_head = core::ptr::read_volatile(fl);
         (*qh).horiz = old_head;
         for i in 0..1024 {
-            core::ptr::write_volatile(fl.add(i), (qh as u32) | PTR_TYPE_QH);
+            core::ptr::write_volatile(fl.add(i), (qh_phys as u32) | PTR_TYPE_QH);
         }
 
         if !self.periodic_on {
@@ -741,7 +782,9 @@ impl Controller {
         self.int_eps.push(IntEp {
             qh,
             qtd,
+            qtd_phys,
             buf,
+            buf_phys,
             mps,
             toggle: false,
             is_kbd,
@@ -749,6 +792,11 @@ impl Controller {
             reports: 0,
             dead: false,
         });
+    }
+
+    /// The controller's static DMA pool (index-bound checked at construction).
+    fn pool(&self) -> *mut qh::DmaPool {
+        unsafe { &mut DMA_POOLS[self.idx] as *mut qh::DmaPool }
     }
 
     /// Main-loop poll: ack USBSTS, then for each armed endpoint consume a completed report,
@@ -806,10 +854,10 @@ impl Controller {
             // refresh the qTD, re-prime the overlay.
             e.toggle = !e.toggle;
             let dt = if e.toggle { QTD_DT } else { 0 };
-            write_qtd(e.qtd, PTR_TERMINATE, QTD_PID_IN | QTD_IOC | dt, e.mps as u32, e.buf as u64);
+            write_qtd(e.qtd, PTR_TERMINATE, QTD_PID_IN | QTD_IOC | dt, e.mps as u32, e.buf_phys);
             (*e.qh).overlay[1] = PTR_TERMINATE;
             core::ptr::write_volatile(&mut (*e.qh).overlay[2], 0);
-            core::ptr::write_volatile(&mut (*e.qh).overlay[0], e.qtd as u32);
+            core::ptr::write_volatile(&mut (*e.qh).overlay[0], e.qtd_phys as u32);
         }
     }
 }
@@ -903,6 +951,40 @@ unsafe fn dmar_report() {
     }
 }
 
+/// Probe-5 evidence, read-only: decode the function's PCI STATUS error bits (Received Master
+/// Abort / Received Target Abort / Signaled Target Abort / parity) — these name what the
+/// fabric did to the controller's DMA request — then dump all 64 config dwords for offline
+/// analysis against the Intel 7-series datasheet.
+unsafe fn pci_evidence(bus: u8, dev: u8, func: u8, idx: usize) {
+    let sc = read_config_32(bus, dev, func, 0x04);
+    let status = (sc >> 16) as u16;
+    serial_println!(
+        ":: EHCI-HID: [{}] PCI STATUS={:#06x} RMA={} RTA={} STA={} SSE={} DPE={} MDPE={} == witness ::",
+        idx, status,
+        (status >> 13) & 1, // Received Master Abort
+        (status >> 12) & 1, // Received Target Abort
+        (status >> 11) & 1, // Signaled Target Abort
+        (status >> 14) & 1, // Signaled System Error
+        (status >> 15) & 1, // Detected Parity Error
+        (status >> 8) & 1   // Master Data Parity Error
+    );
+    for row in 0..8u8 {
+        let base = row * 32;
+        serial_println!(
+            ":: EHCI-HID: [{}] CFG {:#04x}: {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} ::",
+            idx, base,
+            read_config_32(bus, dev, func, base),
+            read_config_32(bus, dev, func, base + 4),
+            read_config_32(bus, dev, func, base + 8),
+            read_config_32(bus, dev, func, base + 12),
+            read_config_32(bus, dev, func, base + 16),
+            read_config_32(bus, dev, func, base + 20),
+            read_config_32(bus, dev, func, base + 24),
+            read_config_32(bus, dev, func, base + 28)
+        );
+    }
+}
+
 /// EHCI-3 bring-up: walk PCI for EHCI functions, run the SHARED EHCI-2 wake on each (one wake
 /// path — wake_run + wake_route from ehci_scout), arm schedules, reset + enumerate the
 /// connected root ports. Runs at PCI-init time, after the scout modes and BEFORE the PORTSW
@@ -945,16 +1027,59 @@ pub fn init() {
                             idx
                         );
                     }
+                    if idx >= MAX_CONTROLLERS {
+                        serial_println!(
+                            ":: EHCI-HID: [{}] more EHCI functions than static DMA pools ({}) — skipped ::",
+                            idx, MAX_CONTROLLERS
+                        );
+                        continue;
+                    }
+                    let pool = &mut DMA_POOLS[idx];
+                    let (
+                        Some(fl_phys),
+                        Some(qh_phys),
+                        Some(su_phys),
+                        Some(da_phys),
+                        Some(st_phys),
+                        Some(sb_phys),
+                        Some(db_phys),
+                    ) = (
+                        phys_of(pool.frame_list.as_ptr(), 4096),
+                        phys_of(&pool.qh_ctrl, 32),
+                        phys_of(&pool.qtd_setup, 32),
+                        phys_of(&pool.qtd_data, 32),
+                        phys_of(&pool.qtd_status, 32),
+                        phys_of(&pool.setup_buf, 64),
+                        phys_of(&pool.data_buf, 64),
+                    )
+                    else {
+                        serial_println!(
+                            ":: EHCI-HID: [{}] STOP-NOTE static DMA pool failed the phys/alignment contract — controller skipped ::",
+                            idx
+                        );
+                        continue;
+                    };
                     let mut c = Controller {
                         idx,
                         op: h.op,
-                        async_qh: alloc_qh(),
-                        qtd_setup: alloc_qtd(),
-                        qtd_data: alloc_qtd(),
-                        qtd_status: alloc_qtd(),
-                        setup_buf: alloc_buf64(),
-                        data_buf: alloc_buf64(),
-                        frame_list: alloc_frame_list(),
+                        bus,
+                        dev,
+                        func,
+                        async_qh: &mut pool.qh_ctrl as *mut Qh,
+                        qh_phys,
+                        qtd_setup: &mut pool.qtd_setup as *mut Qtd,
+                        qtd_setup_phys: su_phys,
+                        qtd_data: &mut pool.qtd_data as *mut Qtd,
+                        qtd_data_phys: da_phys,
+                        qtd_status: &mut pool.qtd_status as *mut Qtd,
+                        qtd_status_phys: st_phys,
+                        setup_buf: pool.setup_buf.0.as_mut_ptr(),
+                        setup_buf_phys: sb_phys,
+                        data_buf: pool.data_buf.0.as_mut_ptr(),
+                        data_buf_phys: db_phys,
+                        frame_list: pool.frame_list.as_mut_ptr(),
+                        frame_list_phys: fl_phys,
+                        int_next: 0,
                         periodic_on: false,
                         next_addr: 1,
                         int_eps: Vec::new(),
@@ -1006,6 +1131,13 @@ pub fn init() {
     // Probe-4 evidence dump: VT-d state AFTER the enumeration attempts, so any DMA fault our
     // transfers raised is latched in the fault-recording registers (read-only).
     unsafe { dmar_report() };
+
+    // Probe-5 evidence: PCI STATUS decode (received/signaled abort bits name the failure class
+    // at the fabric level) + full config-space dump of each EHCI function for offline
+    // comparison against the 7-series datasheet. Read-only.
+    for c in ctrls.iter() {
+        unsafe { pci_evidence(c.bus, c.dev, c.func, c.idx) };
+    }
 
     let n = ctrls.len();
     let armed: usize = ctrls.iter().map(|c| c.int_eps.len()).sum();

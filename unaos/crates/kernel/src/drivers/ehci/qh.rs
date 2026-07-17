@@ -2,14 +2,13 @@
 // Copyright (C) 2026 The Architect & Una
 
 //! EHCI-3 schedule structures — Queue Heads, qTDs, the periodic frame list, and small DMA
-//! buffers. All controller-visible memory comes off the kernel heap, which is identity-mapped
-//! (the virtual address returned by the allocator IS the physical/bus address — the same
-//! invariant the xHCI driver relies on, xhci ring.rs), so the `as u64` cast of an allocation is
-//! exactly the pointer programmed into the controller. Panther Point advertises 32-bit
-//! addressing only (HCCPARAMS.64bit=0, EHCI-1 metal evidence); the heap already lands < 4 GiB,
-//! and `assert_dma32` makes the assumption crash-proof at bring-up instead of silently corrupt.
-
-use alloc::alloc::{alloc_zeroed, Layout};
+//! buffers. All controller-visible memory lives in STATIC pools inside the kernel image (the
+//! driver's DMA needs are small and fixed), and every pointer handed to the controller is
+//! resolved through the live page tables (`phys_of` → translate()) — never the heap's
+//! virt==phys shortcut. Probe-3/5 history: heap-resident schedules at ~538 MB HSE-master-
+//! aborted on the metal Panther Point EHCI (while xHCI DMA'd the same region fine); the
+//! kernel-image pools also probe the low-physical range firmware's own EHCI DMA used. All
+//! addresses are enforced < 4 GiB (CTRLDSSEGMENT is pinned to 0).
 
 /// Terminate bit for horizontal/next pointers (bit 0).
 pub const PTR_TERMINATE: u32 = 1;
@@ -77,59 +76,54 @@ pub struct Qh {
     pub overlay: [u32; 8], // next qTD, alt next, token, 5 buffer pointers
 }
 
-/// Assert the identity-map + 32-bit-addressing contract for one DMA allocation. A violation is
-/// a bring-up STOP (R9 in the design's pre-registration): panic loudly rather than hand the
-/// controller a pointer it will truncate.
-fn assert_dma32(phys: u64, align: u64, what: &str) {
-    assert!(
-        phys != 0 && phys < 0x1_0000_0000 && phys % align == 0,
-        "EHCI-HID: {} DMA allocation violates 32-bit/alignment contract: {:#x} (align {})",
-        what,
-        phys,
-        align
-    );
+/// Resolve one DMA object's PHYSICAL address via the live page tables and enforce the
+/// 32-bit + alignment contract (Panther Point DMA must be < 4 GiB; CTRLDSSEGMENT=0). Returns
+/// `None` (caller traces + skips, R9 discipline) instead of handing the controller a pointer
+/// it would truncate or that isn't mapped. Objects are <= 4 KiB and suitably aligned, so a
+/// single translate of the base covers the whole object (nothing straddles a page).
+pub fn phys_of<T>(p: *const T, align: u64) -> Option<u64> {
+    let phys = crate::arch::x86_64::memory::translate(p as u64)?;
+    if phys == 0 || phys >= 0x1_0000_0000 || phys % align != 0 {
+        return None;
+    }
+    Some(phys)
 }
 
-/// Allocate the 4 KiB periodic frame list (1024 entries), every entry pre-set to Terminate.
-/// Returns the physical (== virtual) base.
-pub fn alloc_frame_list() -> u64 {
-    unsafe {
-        let p = alloc_zeroed(Layout::from_size_align(4096, 4096).unwrap()) as *mut u32;
-        assert_dma32(p as u64, 4096, "frame list");
-        for i in 0..1024 {
-            core::ptr::write_volatile(p.add(i), PTR_TERMINATE);
-        }
-        p as u64
-    }
+/// A 64-byte-aligned transfer buffer for the static pool.
+#[repr(C, align(64))]
+pub struct Buf64(pub [u8; 64]);
+
+/// One statically-allocated interrupt-endpoint slot (QH + single re-armed qTD + report buffer).
+#[repr(C)]
+pub struct IntSlot {
+    pub qh: Qh,
+    pub qtd: Qtd,
+    pub buf: Buf64,
 }
 
-/// Allocate one zeroed QH (rounded to 64 B so consecutive QHs never share a cache line).
-pub fn alloc_qh() -> *mut Qh {
-    unsafe {
-        let p = alloc_zeroed(Layout::from_size_align(64, 32).unwrap()) as *mut Qh;
-        assert_dma32(p as u64, 32, "QH");
-        p
-    }
+/// Static DMA pool for one controller — probe-5 metal experiment AND the permanent shape: the
+/// driver's DMA needs are small and fixed, so they live in the kernel image (low physical
+/// memory, where firmware's own EHCI DMA demonstrably worked) instead of the heap. All
+/// controller-visible pointers are derived via translate() rather than the heap's virt==phys
+/// shortcut, so this is correct under any kernel mapping.
+#[repr(C, align(4096))]
+pub struct DmaPool {
+    pub frame_list: [u32; 1024], // 4 KiB, 4 KiB-aligned (leads the struct)
+    pub qh_ctrl: Qh,
+    pub qtd_setup: Qtd,
+    pub qtd_data: Qtd,
+    pub qtd_status: Qtd,
+    pub setup_buf: Buf64,
+    pub data_buf: Buf64,
+    pub int_slots: [IntSlot; 4],
 }
 
-/// Allocate one zeroed qTD.
-pub fn alloc_qtd() -> *mut Qtd {
-    unsafe {
-        let p = alloc_zeroed(Layout::from_size_align(32, 32).unwrap()) as *mut Qtd;
-        assert_dma32(p as u64, 32, "qTD");
-        p
-    }
-}
+pub const MAX_CONTROLLERS: usize = 2;
+pub const MAX_INT_EPS: usize = 4;
 
-/// Allocate a 64-byte transfer buffer (setup packets, descriptors, HID reports — the same
-/// 64-byte buffer class the xHCI driver uses).
-pub fn alloc_buf64() -> *mut u8 {
-    unsafe {
-        let p = alloc_zeroed(Layout::from_size_align(64, 64).unwrap());
-        assert_dma32(p as u64, 64, "buffer");
-        p
-    }
-}
+/// The pools (one per EHCI function; the 2012 rMBP has exactly two). Extra functions beyond
+/// MAX_CONTROLLERS are skipped with a trace by the caller.
+pub static mut DMA_POOLS: [DmaPool; MAX_CONTROLLERS] = unsafe { core::mem::zeroed() };
 
 /// Fill one qTD in place: `total` bytes at `buf_phys` (0 for a zero-length status stage), PID +
 /// data-toggle + IOC from `flags`, next pointer chained or terminated. Marks it Active.
