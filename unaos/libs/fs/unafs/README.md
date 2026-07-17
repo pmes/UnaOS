@@ -168,6 +168,71 @@ diff (K8c).
 The shell verbs `usnap` / `usnaps` / `usnapdrop` and the host `unafs snap` /
 `snaps` / `snapdrop` subcommands drive this surface directly.
 
+### The bulk create+write path (UNAFS-BATCH)
+
+**`create_files_batch(parent_id, Vec<BatchFile>) -> Result<Vec<u64>>`** is the
+vectored create/write API. It stages many new files under one parent directory
+and lands them together, because the per-op path (`create_file` + `write_data`
++ N × `set_attribute`, each its own root flip) made a whole-tree sync pay one
+root flip *per file*: the VAIRE-2 baseline measured the cold native sync at
+~11.3 s with **97 % of the wall in the commit phase** across 242 root flips.
+Each `BatchFile` carries a `name`, its `data`, and a typed-attribute map; every
+child is created as a `File` and the returned ids are in supplied order.
+
+For the whole set the batch reads the parent directory **once** and rewrites it
+**once** (vs once per file), folds every file's attributes into its **single
+creation inode write** (small inline, large spilled — the same split
+`set_attribute` makes), appends every attribute's catalog entry in one pass and
+rewrites the catalog **once** (so batched attributes are query-indexed
+identically), and commits **once**.
+
+- **Transaction shape.** With autocommit on the whole batch is one root flip.
+  With autocommit **off** the batch stages into the caller's larger transaction
+  and does not commit — the whole-tree single-transaction shape: a sync drives
+  `set_autocommit(false)`, then many `mkdir` + `create_files_batch` (one per
+  directory), then a single `commit()`, so the **entire tree lands in one
+  flip**. An empty batch is a true no-op (no flip).
+- **Unwind (fail closed).** On *any* error mid-batch — a name collision (an
+  existing entry or a duplicate *within* the batch, both `FileExists`), a full
+  volume (`NoSpace`), an oversized inode — the whole batch unwinds via
+  `txn_unwind`, reloading ground truth from the committed root: no partial
+  file, name, catalog entry, or leaked block survives, and the allocator is
+  poison-closed if even the reload fails (the K8b thaw-unwind precedent). Under
+  autocommit-off composition the unwind reloads the committed root, so a
+  failure anywhere in a multi-batch whole-tree transaction discards the *entire*
+  staged tree — the safe outcome.
+- **Snapshot composition.** One batch is one commit, so a `snapshot_create`
+  taken *after* a batch retains the whole batch or nothing; refcount/reclaim
+  accounting is identical to the per-op path (same CoW primitives — only the
+  transaction boundary and metadata churn are batched), proven block-for-block
+  by `batched_reclaim_matches_the_per_op_path_block_for_block`.
+
+**Measured before/after.** `tools/unafs bench-batch <dir>` syncs a real
+directory tree two ways into fresh throwaway v3 images (the per-op regime — the
+control — and the batch path) from one shared scan, isolating the single
+variable. Run on the tree the VAIRE-2 baseline used (`~/.claude/plans/unaos`),
+**245 files / 11 dirs / 4,212,921 B**, 512 MB images. Host: **MacBookPro16,1**,
+**macOS 26.5.2 (25F84)**, internal **APFS** on a **PCI-Express SSD**; release;
+**solo**. Per-phase totals in ms; `flips` = root flips since format (the
+batch's `2` = the format commit + the one whole-tree commit).
+
+| Run | mode | files | dirs | scan | build | commit | flips | blocks | wall |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| **COLD** | per-op (control) | 245 | 11 | 16.14 | 161.90 | 11779.62 | 257 | 41172 | 11941.74 |
+| **COLD** | batch | 245 | 11 | 16.14 | 20.07 | 49.90 | 2 | 2018 | 72.48 |
+| **WARM** | per-op (245 skip) | 245 | 0 | — | 11.56 | 44.05 | 1 | 131 | 55.77 |
+| **WARM** | batch (245 skip) | 245 | 0 | — | 11.33 | 43.32 | 1 | 131 | 54.81 |
+
+The cold commit phase — 98.6 % of the per-op wall — collapses from **~11.8 s
+across 257 flips to ~50 ms across 2**: a **165× wall speedup**, exactly the
+VAIRE-2 prediction. The `blocks` column shows the second win — 41,172 blocks
+written by the per-op path (each attr rewrites the full inode and
+re-serializes the parent directory + catalog) drop to 2,018 for the same tree.
+The warm all-skip run is lookup-bound and identical for both paths. This path
+is the concrete substrate for closing the ledgered ~0.7 s `with_unafs` IRQ mask
+([`docs/SECURITY.md`](../../docs/SECURITY.md)); the kernel-side adoption is a
+future arc.
+
 ### Migration from the pre-K8 format (v2)
 
 Per the do-it-right principle there is **no runtime compatibility** with our
@@ -280,7 +345,9 @@ address:
 
 - The attribute catalog is a flat, hash-bucketed list, (de)serialized whole:
   every non-equality query scans it, and **every `set_attribute` rewrites the
-  entire catalog** — O(n), a scaling cliff rather than an index.
+  entire catalog** — O(n), a scaling cliff rather than an index. (The bulk
+  create+write path amortizes this across a batch — one catalog rewrite for the
+  whole set — but the per-op single-attribute cost is still O(n) until F4.)
 - Directories are flat serialized vectors; data blocks are unchecksummed (the
   root record is checksummed); extents are a flat inline list (large-file
   depth limit).

@@ -10,6 +10,55 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-pi4 track — 2026-07-16 (UNAFS-BATCH — the bulk create+write path) 🔬
+
+### UNAFS-BATCH — `create_files_batch`: whole-tree sync in one root flip 🔬 host-native (unafs 94→105 KATs), zero kernel surface
+
+**What it does.** The crate-side answer to the VAIRE-2 batched-sync finding. The VAIRE-2 baseline
+measured the cold native sync at ~11.3 s with **97 % of the wall in the commit phase across 242
+per-file root flips** — the per-op path (`create_file` + `write_data` + N × `set_attribute`, each
+its own root flip) makes a whole-tree sync pay one flip *per file*. New
+`UnaFS::create_files_batch(parent_id, Vec<BatchFile>)` is the vectored create/write API that
+collapses that: it stages many files under one parent and lands them together, reading the parent
+directory **once** and rewriting it **once**, folding every file's attributes into its **single
+creation inode write** (small inline / large spilled, the same split `set_attribute` makes),
+appending all catalog entries in one pass and rewriting the catalog **once** (batched attrs are
+query-indexed identically), and committing **once**. With autocommit OFF the batch stages into the
+caller's larger transaction, so a sync drives `set_autocommit(false)` + many `mkdir` +
+`create_files_batch` (one per dir) + a single `commit()` — the **entire tree in one root flip**. On
+any error mid-batch the whole batch unwinds to the last committed root via `txn_unwind`
+(poison-closed on reload failure, the K8b thaw-unwind precedent), so a refused batch is a true
+no-op; snapshots compose (one commit = one atomic root), refcount/reclaim accounting identical to
+the per-op path. **API addition only — the v3 on-disk FORMAT is unchanged**; every existing caller
+compiles untouched. This is the concrete substrate for closing the ledgered ~0.7 s `with_unafs` IRQ
+mask (`docs/SECURITY.md`); the kernel-side adoption is a future arc.
+
+**How it was tested.** Host: the full unafs spec suite **94 → 105** (+11 `batch_logic` KATs —
+staging, one-flip commit, whole-tree single transaction, name-collision + full-volume unwind,
+intra-batch duplicate fail-closed, catalog indexing, snapshot composition, and block-for-block
+refcount parity with the per-op path), all green; existing KAT/golden count intact. Before/after
+via the new `tools/unafs bench-batch` verb (syncs a real tree two ways from one shared scan,
+isolating the single variable) on the same tree the VAIRE-2 baseline used
+(`~/.claude/plans/unaos`, 245 files / 11 dirs / 4,212,921 B), MacBookPro16,1 / macOS 26.5.2 (25F84)
+/ APFS-on-PCIe-SSD, release, solo:
+
+| Run | mode | commit (ms) | flips | blocks | wall (ms) |
+| --- | --- | --- | --- | --- | --- |
+| COLD | per-op (control) | 11779.62 | 257 | 41172 | 11941.74 |
+| COLD | batch | 49.90 | 2 | 2018 | 72.48 |
+| WARM | per-op (all-skip) | 44.05 | 1 | 131 | 55.77 |
+| WARM | batch (all-skip) | 43.32 | 1 | 131 | 54.81 |
+
+The cold commit phase collapses from ~11.8 s across 257 flips to ~50 ms across 2 (format + one
+whole-tree flip): a **165× wall speedup**, and blocks written drop 41172 → 2018 for the same tree.
+All four bench images `fsck` clean. Regression floor (nothing here touches the kernel — these prove
+it): `./arroyo check` both arches ✅; `./arroyo kernel8-test 30` reached CAPSTONE COMPLETE with
+`K8a-cow` and `K8b-snap` (the CoW/snapshot core this crate drives) PASS and zero FAIL/forbidden;
+`./arroyo test-arm 22` MISSION SUCCESS; x86 `./arroyo test 40` MISSION SUCCESS. Commit(s) on hw-pi4;
+metal MBENCH re-proof rides the next Pi sitting (accrues with the owed K8b boot). 🔬
+
+---
+
 ## hw-jetson track — 2026-07-16 (VAIRE-2 — UnaFS-native Loom + baseline FS benchmark) 🔬
 
 ### VAIRE-2 — `usync`/`ustatus`: the dev-tree as native UnaFS objects, measured from birth 🔬 host-native (33/33 vaire tests, fsck-clean baseline image), no kernel surface
