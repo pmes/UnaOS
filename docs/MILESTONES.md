@@ -10,6 +10,47 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-pi4 track — 2026-07-17 (K9-MASKCUT — the ACL persist adopts the one-flip staged batch) 🔬
+
+### K9-MASKCUT — staged-batch adoption at the fused ACL persist sites 🔬 (metal rides the next Pi sitting)
+
+**What it does.** Closes the named route of the K5B ~0.7 s per-core IRQ-masked residual by adopting
+the UNAFS-BATCH staged-transaction shape at the kernel ACL-persist choke point. All three fused sites
+(`sys_fgrant_revoke_2phase`, `native_persist_grants`, `native_persist_grow`, plus create/rename)
+funnel through `native_acl_write_on`, which rewrote a row as create + N `remove_attribute` +
+`name`/`fc`/`owner` + M `set_attribute` — each its OWN root flip inside the K5B masked `with_unafs`
+window. It now stages the whole row with `set_autocommit(false)` and lands it in ONE `commit()`,
+cutting the sector/flip count inside the mask (not the mask itself — the IRQ mask is `with_unafs`'s
+K4 keystone, untouched, and the write is still polled/synchronous). The K5B invariant holds verbatim:
+staging lives entirely inside the caller's single MOUNT hold (snapshot → staged write → in-RAM commit
+unchanged); WHAT is written is byte-identical (the staging body is the pre-K9 write body verbatim).
+K3 durable-first is preserved and strengthened on the success path — one commit = an atomic row (old
+row OR whole new row, never a per-attribute partial); a staging failure flips no root, so the old row
+stands and the caller gets `-EIO`, in-RAM intact. A scope-guard shape (staging body owns every early
+return; the wrapper has no early return between the autocommit toggle and its unconditional restore)
+prevents a failure from leaking autocommit-OFF onto the shared cached mount.
+
+**How it was tested.** `./arroyo check` ✅ x86_64 / ✅ aarch64; `test-arm 22` MISSION SUCCESS;
+`kernel8-test 30` MBENCH **45/45, 0 forbidden** — K1-persist / K2-liveenf / K3-revoke (incl. the
+forced-fail `-EIO` leg) / K5-lockspan (control+fix) / K6-migrate / K8a / K8b / K8c all PASS UNCHANGED
+(their PASS lines are the invariant proof; the spec count did not drop). QEMU before/after under the
+`UNAOS_NSSPAN=1` knob (TCG — NOT the verdict; the new `NS-SPAN-K9` line carries worst flips/blocks per
+single ACL row persist): pre-K9 per-op `flips=5 blocks=35` → post-K9 staged **`flips=1 blocks=19`**
+(5× fewer root flips, ~1.8× fewer blocks); masked-window ticks `revoke=13941875 grants=14525438
+grow=11812625` → `revoke=10398500 grants=9939438 grow=9640188` @62.5 MHz (~25–30 % even under TCG).
+`libs/fs/unafs` READ-ONLY (untouched). Metal (the real-SD masked-window number vs K5B's before-pair)
+rides the next Pi sitting — NOT this arc's gate. Ledger + numbers in
+[`SECURITY.md`](SECURITY.md) §K1 K9; landing report `review/unaos-k9-maskcut-LANDING.md`.
+
+**Flagged.** A pre-existing (not introduced) residual: a mid-op I/O/`NoSpace` failure leaves
+uncommitted in-flight blocks on the shared cached mount — the crate has no PUBLIC in-place unwind
+(`txn_unwind` private; `create_files_batch` cannot express create-or-replace-with-removal), so the
+batch's "reload from committed root" is not expressible from this raw-op composition. The pre-K9
+autocommit-ON path shares this exact class; the true closure is a crate-side public rollback
+primitive, out of the pi lane (drop-box).
+
+---
+
 ## hw-jetson track — 2026-07-17 (VAIRE-3 — vaire adopts the one-flip batch path) 🔬
 
 ### VAIRE-3 — `usync` on `create_files_batch`: the native sync in one root flip 🔬 host-native (33→36 vaire tests, fsck-clean after-image), zero kernel surface
