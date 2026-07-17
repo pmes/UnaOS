@@ -668,12 +668,22 @@ impl<D: BlockDevice> UnaFS<D> {
 
     /// Read an Inode by LOGICAL id.
     pub fn read_inode(&mut self, id: u64) -> Result<Inode, FileSystemError> {
-        let pb = self.imap.get(id as usize).copied().unwrap_or(0);
+        Self::read_inode_via(&mut self.device, &self.imap, id)
+    }
+
+    /// Read an Inode by LOGICAL id, resolving the id through an EXPLICIT inode
+    /// map rather than `self.imap`. The single physical read primitive shared by
+    /// the live mount (`imap == self.imap`) and a retained-root
+    /// [`SnapshotView`] (`imap` == the snapshot's frozen map) — one code path,
+    /// no parallel read logic. `device`/`imap` are borrowed as disjoint fields
+    /// so a `&mut self` caller can pass `&mut self.device` and `&self.imap`.
+    fn read_inode_via(device: &mut D, imap: &[u64], id: u64) -> Result<Inode, FileSystemError> {
+        let pb = imap.get(id as usize).copied().unwrap_or(0);
         if pb == 0 {
             return Err(FileSystemError::NotFound);
         }
         let mut block = alloc::vec![0u8; BLOCK_SIZE as usize];
-        self.device.read_block(pb, &mut block)?;
+        device.read_block(pb, &mut block)?;
         let inode = Inode::from_bytes(&block)?;
         if inode.id != id {
             return Err(FileSystemError::CorruptVolume("inode id mismatch"));
@@ -880,8 +890,30 @@ impl<D: BlockDevice> UnaFS<D> {
         offset: u64,
         length: u64,
     ) -> Result<Vec<u8>, FileSystemError> {
-        let inode = self.read_inode(inode_id)?;
-        self.read_from_extents(&inode.chunks, offset, length, inode.size)
+        Self::read_data_via(
+            &mut self.device,
+            self.superblock.block_count,
+            &self.imap,
+            inode_id,
+            offset,
+            length,
+        )
+    }
+
+    /// Read data from a logical inode resolved through an EXPLICIT inode map —
+    /// the shared body of the live [`read_data`](Self::read_data) and a
+    /// [`SnapshotView`] read. Reads only; `imap == self.imap` gives the live
+    /// object, a snapshot's frozen map gives the retained bytes.
+    fn read_data_via(
+        device: &mut D,
+        block_count: u64,
+        imap: &[u64],
+        inode_id: u64,
+        offset: u64,
+        length: u64,
+    ) -> Result<Vec<u8>, FileSystemError> {
+        let inode = Self::read_inode_via(device, imap, inode_id)?;
+        Self::read_from_extents_via(device, block_count, &inode.chunks, offset, length, inode.size)
     }
 
     /// Internal helper to read data from a specific ExtentList.
@@ -898,7 +930,29 @@ impl<D: BlockDevice> UnaFS<D> {
         length: u64,
         total_size: u64,
     ) -> Result<Vec<u8>, FileSystemError> {
-        if total_size > self.volume_bytes() {
+        Self::read_from_extents_via(
+            &mut self.device,
+            self.superblock.block_count,
+            chunks,
+            offset,
+            length,
+            total_size,
+        )
+    }
+
+    /// The extent-walking read body, parameterized on the device and volume
+    /// span rather than `&self` — so a [`SnapshotView`] reuses the exact same
+    /// bounded reader (BEFS-HARDEN bounds are on `block_count`, disk-derived).
+    fn read_from_extents_via(
+        device: &mut D,
+        block_count: u64,
+        chunks: &ExtentList,
+        offset: u64,
+        length: u64,
+        total_size: u64,
+    ) -> Result<Vec<u8>, FileSystemError> {
+        let volume_bytes = block_count.saturating_mul(BLOCK_SIZE);
+        if total_size > volume_bytes {
             return Err(FileSystemError::CorruptVolume("data size exceeds volume"));
         }
 
@@ -949,7 +1003,7 @@ impl<D: BlockDevice> UnaFS<D> {
                 continue;
             }
 
-            if physical_block >= self.superblock.block_count {
+            if physical_block >= block_count {
                 return Err(FileSystemError::CorruptVolume("extent points past volume"));
             }
 
@@ -960,7 +1014,7 @@ impl<D: BlockDevice> UnaFS<D> {
             );
 
             let mut block_buf = alloc::vec![0u8; BLOCK_SIZE as usize];
-            self.device.read_block(physical_block, &mut block_buf)?;
+            device.read_block(physical_block, &mut block_buf)?;
 
             buffer.extend_from_slice(&block_buf[block_offset..block_offset + to_read]);
 
@@ -976,14 +1030,30 @@ impl<D: BlockDevice> UnaFS<D> {
     // =====================================================================
 
     pub fn ls(&mut self, inode_id: u64) -> Result<Vec<DirEntry>, FileSystemError> {
-        let inode = self.read_inode(inode_id)?;
+        Self::ls_via(
+            &mut self.device,
+            self.superblock.block_count,
+            &self.imap,
+            inode_id,
+        )
+    }
+
+    /// List a directory resolved through an EXPLICIT inode map — the shared
+    /// body of live [`ls`](Self::ls) and a [`SnapshotView`] listing.
+    fn ls_via(
+        device: &mut D,
+        block_count: u64,
+        imap: &[u64],
+        inode_id: u64,
+    ) -> Result<Vec<DirEntry>, FileSystemError> {
+        let inode = Self::read_inode_via(device, imap, inode_id)?;
         if inode.kind != FileKind::Directory {
             return Err(FileSystemError::NotADirectory);
         }
         if inode.size == 0 {
             return Ok(Vec::new());
         }
-        let data = self.read_data(inode_id, 0, inode.size)?;
+        let data = Self::read_data_via(device, block_count, imap, inode_id, 0, inode.size)?;
         let entries: Vec<DirEntry> = crate::codec::deserialize(&data)?;
         Ok(entries)
     }
@@ -1171,20 +1241,38 @@ impl<D: BlockDevice> UnaFS<D> {
 
     /// Resolves a path string to an Inode ID.
     pub fn resolve_path(&mut self, path: &str) -> Result<u64, FileSystemError> {
+        Self::resolve_path_via(
+            &mut self.device,
+            self.superblock.block_count,
+            &self.imap,
+            self.superblock.root_inode,
+            path,
+        )
+    }
+
+    /// Resolve a path through an EXPLICIT inode map — the shared body of live
+    /// [`resolve_path`](Self::resolve_path) and a [`SnapshotView`] lookup.
+    fn resolve_path_via(
+        device: &mut D,
+        block_count: u64,
+        imap: &[u64],
+        root_inode: u64,
+        path: &str,
+    ) -> Result<u64, FileSystemError> {
         let path = path.trim_start_matches('/');
         if path.is_empty() {
-            return Ok(self.superblock.root_inode);
+            return Ok(root_inode);
         }
 
         let parts: Vec<&str> = path.split('/').collect();
-        let mut current_id = self.superblock.root_inode;
+        let mut current_id = root_inode;
 
         for part in parts {
             if part.is_empty() {
                 continue;
             }
 
-            let entries = self.ls(current_id)?;
+            let entries = Self::ls_via(device, block_count, imap, current_id)?;
             let entry = entries
                 .into_iter()
                 .find(|e| e.name == part)
@@ -1288,7 +1376,26 @@ impl<D: BlockDevice> UnaFS<D> {
         inode_id: u64,
         key: &str,
     ) -> Result<Option<AttributeValue>, FileSystemError> {
-        let inode = self.read_inode(inode_id)?;
+        Self::get_attribute_via(
+            &mut self.device,
+            self.superblock.block_count,
+            &self.imap,
+            inode_id,
+            key,
+        )
+    }
+
+    /// Read one attribute of an inode resolved through an EXPLICIT inode map —
+    /// the shared body of live [`get_attribute`](Self::get_attribute) and a
+    /// [`SnapshotView`] attribute read (attrs AS-OF the snapshot).
+    fn get_attribute_via(
+        device: &mut D,
+        block_count: u64,
+        imap: &[u64],
+        inode_id: u64,
+        key: &str,
+    ) -> Result<Option<AttributeValue>, FileSystemError> {
+        let inode = Self::read_inode_via(device, imap, inode_id)?;
 
         if let Some(val) = inode.attributes.get(key) {
             return Ok(Some(val.clone()));
@@ -1296,7 +1403,7 @@ impl<D: BlockDevice> UnaFS<D> {
 
         if let Some(extents) = inode.large_attributes.get(key) {
             let total_size = checked_extent_total(extents)?;
-            let data = self.read_from_extents(extents, 0, total_size, total_size)?;
+            let data = Self::read_from_extents_via(device, block_count, extents, 0, total_size, total_size)?;
             let val: AttributeValue = crate::codec::deserialize(&data)
                 .map_err(|_| FileSystemError::InvalidAttributeData)?;
             return Ok(Some(val));
@@ -1502,6 +1609,106 @@ impl<D: BlockDevice> UnaFS<D> {
             return Ok(Vec::new());
         }
         Ok(crate::codec::deserialize(&data)?)
+    }
+
+    /// Load a retained root's INODE MAP (logical id → physical inode block) into
+    /// RAM, exactly as [`load_committed`](Self::load_committed) loads the live
+    /// map, but from a snapshot's `(imap_block, imap_leaves)` rather than the
+    /// active root. The returned vector is indexed by logical inode id;
+    /// unallocated slots are `0` (imap leaves are zero-filled beyond the last
+    /// retained id, so trailing zeros are harmless — a lookup there resolves to
+    /// `NotFound`). Every pointer is bounded against the volume span (the
+    /// on-disk imap is untrusted input): an out-of-range pointer is a
+    /// `CorruptVolume` error, never a slice panic.
+    fn snapshot_imap(
+        &mut self,
+        imap_block: u64,
+        imap_leaves: u64,
+    ) -> Result<Vec<u64>, FileSystemError> {
+        let block_count = self.superblock.block_count;
+        if imap_block == 0 || imap_block >= block_count {
+            return Err(FileSystemError::CorruptVolume("snapshot imap index out of bounds"));
+        }
+        if imap_leaves == 0 || imap_leaves > IMAP_MAX_LEAVES {
+            return Err(FileSystemError::CorruptVolume(
+                "snapshot imap leaf count out of range",
+            ));
+        }
+        let cap = usize::try_from(imap_leaves.saturating_mul(IMAP_ENTRIES_PER_LEAF))
+            .map_err(|_| StorageError::AllocRefused(imap_leaves))?;
+        let mut imap: Vec<u64> = Vec::new();
+        imap.try_reserve_exact(cap)
+            .map_err(|_| StorageError::AllocRefused(imap_leaves))?;
+
+        let mut index = alloc::vec![0u8; BLOCK_SIZE as usize];
+        self.device.read_block(imap_block, &mut index)?;
+        let mut leaf = alloc::vec![0u8; BLOCK_SIZE as usize];
+        for l in 0..imap_leaves {
+            let ptr = u64::from_le_bytes(
+                index[(l * 8) as usize..(l * 8 + 8) as usize]
+                    .try_into()
+                    .unwrap(),
+            );
+            if ptr == 0 || ptr >= block_count {
+                return Err(FileSystemError::CorruptVolume("snapshot imap leaf out of bounds"));
+            }
+            self.device.read_block(ptr, &mut leaf)?;
+            for e in 0..IMAP_ENTRIES_PER_LEAF {
+                let entry = u64::from_le_bytes(
+                    leaf[(e * 8) as usize..(e * 8 + 8) as usize]
+                        .try_into()
+                        .unwrap(),
+                );
+                if entry >= block_count {
+                    return Err(FileSystemError::CorruptVolume("snapshot imap entry out of bounds"));
+                }
+                imap.push(entry);
+            }
+        }
+        Ok(imap)
+    }
+
+    /// Open a retained root (snapshot) by its `generation` stamp for READING —
+    /// the K8c read path. Returns a [`SnapshotView`], a strictly read-only
+    /// handle: it resolves paths, lists directories, reads data, and reads
+    /// attributes AS THEY WERE when the snapshot was taken, and it has NO write
+    /// method at all — read-only is a property of the type, not a runtime check.
+    ///
+    /// The view borrows the mount for its lifetime and reads through the
+    /// snapshot's frozen inode map (loaded once here), sharing the exact same
+    /// bounded read primitives (`read_inode_via`/`ls_via`/`read_data_via`/…) the
+    /// live mount uses — one read code path, live and frozen. Reading a snapshot
+    /// NEVER touches refcounts, the reclaim queue, or the live root: the view
+    /// holds its own map and only issues `read_block`s.
+    ///
+    /// # Authority (K8c ruling, not enforced here)
+    /// The crate view is pure bytes — it applies NO access control. The K8c
+    /// current-ACL rule ("a principal that cannot read the live object cannot
+    /// read any snapshot of it; revocation reaches the past") is enforced one
+    /// layer up, at the kernel verb / ACL seam, by checking the LIVE object's
+    /// current ACL before handing bytes out. Keeping policy out of the crate is
+    /// deliberate: there is exactly one enforcement path (the live one), and the
+    /// snapshot read defers to it.
+    ///
+    /// Fails with [`FileSystemError::SnapshotNotFound`] if no retained root
+    /// carries that generation (e.g. it was dropped) — a dangling view is
+    /// unrepresentable.
+    pub fn open_snapshot(&mut self, generation: u64) -> Result<SnapshotView<'_, D>, FileSystemError> {
+        let index = self.snapshot_index()?;
+        let entry = index
+            .into_iter()
+            .find(|e| e.generation == generation)
+            .ok_or(FileSystemError::SnapshotNotFound(generation))?;
+        let imap = self.snapshot_imap(entry.imap_block, entry.imap_leaves)?;
+        let block_count = self.superblock.block_count;
+        let root_inode = self.superblock.root_inode;
+        Ok(SnapshotView {
+            device: &mut self.device,
+            block_count,
+            root_inode,
+            imap,
+            generation,
+        })
     }
 
     /// Every block a root reaches THROUGH ITS INODE MAP: the imap index block,
@@ -2091,6 +2298,91 @@ impl<D: BlockDevice> Drop for UnaFS<D> {
         // the caller disabled autocommit — the crash-simulation seam, whose
         // whole point is that dropping models a power cut). Just flush.
         let _ = self.device.flush();
+    }
+}
+
+/// A strictly READ-ONLY handle onto a retained root (snapshot), obtained from
+/// [`UnaFS::open_snapshot`]. It reads paths, directories, data, and attributes
+/// AS THEY WERE at snapshot time, through the snapshot's frozen inode map — and
+/// it exposes NO mutating method, so "a snapshot cannot be written" is a fact of
+/// the type, not a runtime policy check (the K8c read-only constraint made
+/// unrepresentable).
+///
+/// The view borrows the mount (`&mut UnaFS`, via its device) for its lifetime,
+/// carrying its own frozen `imap`; every read routes through the SAME bounded
+/// primitives the live mount uses (`UnaFS::*_via`). Reads never touch the
+/// refcount map, the reclaim queue, or the live/active root — the view only
+/// issues `read_block`s against blocks the snapshot pins.
+///
+/// Access control lives one layer up (the kernel verb / ACL seam enforces the
+/// K8c current-ACL rule against the LIVE object); this handle is pure bytes.
+pub struct SnapshotView<'a, D: BlockDevice> {
+    device: &'a mut D,
+    block_count: u64,
+    root_inode: u64,
+    /// The snapshot's frozen inode map (logical id → physical inode block).
+    imap: Vec<u64>,
+    generation: u64,
+}
+
+impl<'a, D: BlockDevice> SnapshotView<'a, D> {
+    /// The generation stamp of the retained root this view reads.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Resolve a path to a logical inode id AS OF the snapshot.
+    pub fn resolve_path(&mut self, path: &str) -> Result<u64, FileSystemError> {
+        UnaFS::<D>::resolve_path_via(
+            self.device,
+            self.block_count,
+            &self.imap,
+            self.root_inode,
+            path,
+        )
+    }
+
+    /// Read an inode AS OF the snapshot (size, kind, attributes at snapshot time).
+    pub fn read_inode(&mut self, inode_id: u64) -> Result<Inode, FileSystemError> {
+        UnaFS::<D>::read_inode_via(self.device, &self.imap, inode_id)
+    }
+
+    /// List a directory AS OF the snapshot.
+    pub fn ls(&mut self, inode_id: u64) -> Result<Vec<DirEntry>, FileSystemError> {
+        UnaFS::<D>::ls_via(self.device, self.block_count, &self.imap, inode_id)
+    }
+
+    /// Read file data AS OF the snapshot — the OLD bytes, even after the live
+    /// object was overwritten or deleted (block-sharing + never-overwrite).
+    pub fn read_data(
+        &mut self,
+        inode_id: u64,
+        offset: u64,
+        length: u64,
+    ) -> Result<Vec<u8>, FileSystemError> {
+        UnaFS::<D>::read_data_via(
+            self.device,
+            self.block_count,
+            &self.imap,
+            inode_id,
+            offset,
+            length,
+        )
+    }
+
+    /// Read one attribute of an inode AS OF the snapshot.
+    pub fn get_attribute(
+        &mut self,
+        inode_id: u64,
+        key: &str,
+    ) -> Result<Option<AttributeValue>, FileSystemError> {
+        UnaFS::<D>::get_attribute_via(
+            self.device,
+            self.block_count,
+            &self.imap,
+            inode_id,
+            key,
+        )
     }
 }
 
