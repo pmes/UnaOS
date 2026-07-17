@@ -76,6 +76,17 @@ static SCHED_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Releases the APs from their wait loop into `run()`. Set once the AP run queues are populated.
 static SCHED_GO: AtomicBool = AtomicBool::new(false);
 
+/// SCHED-NEXT (virt busy-heartbeat): gates the secondaries' one-shot cooperative drain until the BSP
+/// has staged their run queues. The `virt` secondaries run at EL2 and never enter the full `run()`
+/// loop (no per-core timer — see the module header + `smp_virt`); this flag instead releases a
+/// single bounded cooperative pass (`run_secondary_work`) so an online core publishes honest BUSY
+/// telemetry — the other half of the idle-heartbeat (which proved only that a parked core reads idle).
+static SECWORK_GO: AtomicBool = AtomicBool::new(false);
+/// Per-core "cooperative pass drained" flag, set by each secondary after `run_secondary_work` empties
+/// its queue; the BSP waits on it before reading the busy-heartbeat witness so it never races an
+/// un-run core. Introspection/handshake only — never read on a scheduling path.
+static SECWORK_DONE: [AtomicBool; NUM_CPUS] = [const { AtomicBool::new(false) }; NUM_CPUS];
+
 /// Monotonic task-id source.
 static NEXT_TID: AtomicU64 = AtomicU64::new(1);
 
@@ -908,6 +919,77 @@ pub fn wait_and_run(cpu: usize) -> ! {
         crate::arch::hlt();
     }
     run(cpu)
+}
+
+// ---------------------------------------------------------------------------------------------
+// SCHED-NEXT — one-shot cooperative scheduled work on the `virt` GICv3 secondaries (busy-heartbeat)
+// ---------------------------------------------------------------------------------------------
+//
+// The idle-heartbeat proved a parked-online secondary reads honest *idle*. This proves its other
+// half: an online secondary can actually RUN scheduled work and read *busy*. It is the QEMU-testable
+// (cooperative) slice of "SMP scheduling on virt" — preemptive multi-core stays the metal-only proof.
+// A `virt` secondary runs at EL2 and has no per-core timer, so this is a single bounded pass over a
+// finite pre-staged queue of run-to-completion tasks (yield/exit only): `run_until_empty` needs no
+// timer and never WFIs, and `switch_context` is EL-neutral — exactly how the boot-core CAPSTONE runs
+// cooperatively at EL2/EL1 under QEMU. Each dispatch bumps `CPU_BUSY[cpu]` (the busy telemetry).
+
+/// Cooperative secondary-probe body: yield a few times, then return (freeing the task). Every
+/// dispatch/redispatch of it bumps `CPU_BUSY[cpu]` via `dispatch_next`, so a secondary that drains a
+/// small queue of these publishes non-zero busy telemetry. `arg` = the core id (for the log line).
+fn secondary_probe_body(arg: usize) {
+    let core = arg;
+    for _ in 0..3 {
+        yield_now();
+    }
+    serial_println!(":: SCHED: core {} cooperative probe ran (busy telemetry) ::", core);
+}
+
+/// BSP-side: stage `n` cooperative probe tasks onto secondary `cpu`'s run queue. Call BEFORE
+/// `secondary_work_go`; the target core drains them in `run_secondary_work`. Pinned to `cpu` (like
+/// every task) so they dispatch on that core and its `CPU_BUSY` is what moves.
+pub fn stage_secondary_work(cpu: usize, n: usize) {
+    for _ in 0..n {
+        spawn("sec-probe", secondary_probe_body, cpu, cpu);
+    }
+}
+
+/// BSP-side: release every secondary spinning in `run_secondary_work` to drain its staged queue.
+pub fn secondary_work_go() {
+    SECWORK_GO.store(true, Ordering::Release);
+}
+
+/// BSP-side: has secondary `cpu` finished its cooperative drain pass? (The busy-heartbeat completion
+/// gate — the BSP waits on this before reading `meter_cpu_ticks`.)
+pub fn secondary_work_done(cpu: usize) -> bool {
+    cpu < NUM_CPUS && SECWORK_DONE[cpu].load(Ordering::Acquire)
+}
+
+/// Secondary-side: wait (BOUNDED) for the BSP's release, then drain THIS core's staged cooperative
+/// queue to completion and mark done. Called by `__secondary_rust_virt` once, BEFORE its idle park.
+/// The queue is finite and pre-staged, so `run_until_empty` drains it and returns (no timer / no
+/// WFI); `dispatch_next` bumps `CPU_BUSY[cpu]` per dispatch. The spin waits with IRQ unmasked (the
+/// caller's state), so a BSP→AP SGI landing during the wait is still serviced.
+///
+/// BOUNDED because `__secondary_rust_virt` is the shared real-entry tail for the `virt`
+/// (`start_secondaries`), the real Orin (`start_secondaries_tegra`), AND the SMP-probe legs — but
+/// ONLY the `virt` path stages work and calls `secondary_work_go`, and it does so within microseconds
+/// of this spin starting, so the common path never hits the ceiling. On the tegra/probe paths nobody
+/// releases; there the ~20 ms one-shot ceiling simply elapses and the core proceeds to its idle park
+/// exactly as before (draining an empty queue is a no-op — one idle bump). The ceiling is small and
+/// happens once at bring-up, before the core parks for good, so it perturbs neither metal boot nor
+/// probe timing, and it can NEVER hang a core (the failure mode an unbounded spin would introduce on
+/// every non-`virt` caller).
+pub fn run_secondary_work(cpu: usize) {
+    let freq = timer::cntfrq();
+    let freq = if freq == 0 { 62_500_000 } else { freq };
+    let deadline = timer::cntpct() + freq / 50; // ~20 ms one-shot ceiling
+    while !SECWORK_GO.load(Ordering::Acquire) && timer::cntpct() < deadline {
+        core::hint::spin_loop();
+    }
+    run_until_empty(cpu);
+    if cpu < NUM_CPUS {
+        SECWORK_DONE[cpu].store(true, Ordering::Release);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
