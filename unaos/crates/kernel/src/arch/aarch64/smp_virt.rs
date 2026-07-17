@@ -624,6 +624,36 @@ pub fn start_secondaries(dtb_addr: u64, dtb_size: usize) {
         online,
         n_startable
     );
+
+    // Per-core idle-heartbeat witness (VUG-1 M3b honesty): each online secondary parked in
+    // `__secondary_rust_virt` and bumped its own CPU_IDLE via `sched::note_core_idle` at park entry —
+    // strictly after publishing CORE_READY, and the BSP has since completed a full BSP→AP ping round
+    // trip + AP→BSP verdict above, so every online AP has run its park-entry heartbeat by now. Read the
+    // CPU-pulse counters back: an online-idle core must read `busy + idle > 0`, NOT the pinned `(0,0)`
+    // that would render an undefined/frozen meter bar. This is the QEMU-provable half of the fix; the
+    // real Orin vug pixels are the accruing metal witness.
+    let mut all_heartbeat = true;
+    for idx in 1..n_cores {
+        if !(startable[idx] && CORE_READY[idx].load(Ordering::Acquire)) {
+            continue;
+        }
+        let (busy, idle) = sched::meter_cpu_ticks(idx);
+        if busy + idle == 0 {
+            all_heartbeat = false;
+        }
+        serial_println!(
+            ":: AARCH64 SMP: AP {} pulse (busy={}, idle={}) {} ::",
+            idx,
+            busy,
+            idle,
+            if busy + idle > 0 { "idle" } else { "PINNED" }
+        );
+    }
+    serial_println!(
+        ":: AARCH64 SMP: per-core idle heartbeat {} — {} online APs report idle (not pinned) ::",
+        if all_heartbeat { "PASS" } else { "FAIL" },
+        online
+    );
 }
 
 /// ORIN-SMP-3 — the real 6-core Orin bring-up kick-off (`tegra` + `tegrasmp` gated). Called from
