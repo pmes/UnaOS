@@ -837,6 +837,24 @@ at the sitting by the M1 witness line. `UNAOS_EHCIHID` stays **default-OFF until
 internal keyboard types on metal** (M3), then a pre-registered PORTSW-style default-ON fold
 (a separate arc — Peter item (b)).
 
+**METAL VERDICT (2026-07-17 sitting, 15-probe live debug loop): M1+M2+M3 CONFIRMED — the
+internal keyboard TYPES.** The probe ledger, each step register-witnessed on serial:
+firmware leaves PSE=1 (stale periodic schedule → HSE; cured by the pre-approved HCRESET);
+this silicon master-aborts the **qTD-fetch overlay-load burst write** (PCI STATUS RMA=1) while
+every other DMA class passes (frame-list reads, QH burst reads, dword token write-backs,
+payload reads, live-port transactions — proven by a five-pass smoke battery); VT-d/PMR/FD/CG
+all falsified with registers; an HSE'd controller is WEDGED until HCRESET; the periodic
+engine skips SETUP-PID overlays; the **async engine executes software-primed overlays
+cleanly**. The driver therefore self-adapts: chain mode (QEMU's model requires fetched qTDs)
+→ first chain HSE flips the controller permanently to **OVERLAY-DIRECT** (software pre-loads
+the QH overlay per stage; no qTD is ever handed to the controller) with a full HCRESET
+re-init. Real topology: RMH `8087:0024` per function; fn0 → FaceTime camera `05ac:8510`;
+fn1 → FTDI `0403:6001` (FS through the RMH's TT — splits work) + SMSC hub `0424:2512` →
+Broadcom BT `0a5c:4500` + **Apple Internal Keyboard/Trackpad `05ac:0262`** (depth-2 tier;
+keyboard boot-protocol armed ep=IN3 mps=10; trackpad = non-boot proto 0, the R3 follow-on).
+Physical keystrokes decode end-to-end (`EHCI-HID: KEY` + pal events). Sitting log:
+`~/unaos-bench/rmbp-serial-2026-07-17-ehci3-M3-sitting.log`.
+
 **Knob-off identity.** The `ehci/` module and every call site are `#[cfg]`-compiled out;
 `.text`/`.rodata` are byte-identical knob-off (ELF section compare). Whole-file identity is
 broken only by panic-`Location` line-number metadata (`.data.rel.ro`) + symbol tables
