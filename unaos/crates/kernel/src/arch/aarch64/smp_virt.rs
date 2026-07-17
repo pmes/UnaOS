@@ -538,6 +538,12 @@ pub fn start_secondaries(dtb_addr: u64, dtb_size: usize) {
     let freq = if freq == 0 { 62_500_000 } else { freq };
     let bsp_ipi_before = percpu::cpu(0).ipis.load(Ordering::Acquire);
 
+    // SCHED-NEXT busy-heartbeat: arm cooperative secondary work BEFORE any CPU_ON, so every secondary
+    // that comes online observes it and waits (generously) for our staged-work release rather than
+    // parking idle. This is the `virt`-only path; `start_secondaries_tegra` never arms, so real Orin
+    // secondaries skip the wait entirely (see `sched::run_secondary_work`).
+    sched::arm_secondary_work();
+
     // Start each PRESENT secondary. Target = its real MPIDR affinity; context id = its linear index
     // (delivered in x0, used by the entry stub for the stack + as the per-CPU index). Entry PA = the stub
     // symbol (identity-mapped). A CPU_ON error → log + skip, never hang.
@@ -640,25 +646,37 @@ pub fn start_secondaries(dtb_addr: u64, dtb_size: usize) {
     // task dispatch that bumps CPU_BUSY — then park idle. Staging happens AFTER the ping proofs above so
     // those observe the same responsive-spinning secondary as before (IRQ unmasked in the spin).
     const SECWORK_TASKS: usize = 2; // >= 2 so busy telemetry is unambiguous (each yields 3x)
+    let mut expected = 0usize;
     for idx in 1..n_cores {
         if startable[idx] && CORE_READY[idx].load(Ordering::Acquire) {
             sched::stage_secondary_work(idx, SECWORK_TASKS);
+            expected += 1;
         }
     }
     sched::secondary_work_go();
-    // Wait (bounded) for every online secondary to finish its cooperative pass before reading the
-    // meter, so the busy witness never races an un-run core. Cooperative drain of a handful of
-    // yield/exit tasks is sub-millisecond; give it a generous ~200 ms ceiling.
-    for idx in 1..n_cores {
-        if startable[idx] && CORE_READY[idx].load(Ordering::Acquire) {
-            let deadline = timer::cntpct() + freq / 5;
-            if !wait_until(deadline, || sched::secondary_work_done(idx)) {
-                serial_println!(
-                    ":: AARCH64 SMP: WARNING AP {} cooperative work pass did not complete ::",
-                    idx
-                );
-            }
-        }
+    // Wait for the ACTUAL completion COUNT to reach `expected` before reading the meter, so the busy
+    // witness never races an un-run core. The ceiling is a GENEROUS finite backstop (~2 s), NOT a
+    // timing bound: each secondary catches the release (armed before CPU_ON) and drains a handful of
+    // yield/exit tasks in microseconds of guest time, so the count is reached near-instantly even
+    // under heavy host load — the earlier tight per-core ceiling is what flaked the witness. Finite so
+    // a genuinely stuck secondary (a bug) can never hang the boot; a shortfall fails the witness loud.
+    let deadline = timer::cntpct() + 2 * freq;
+    let all_done = wait_until(deadline, || {
+        (1..n_cores)
+            .filter(|&idx| startable[idx] && CORE_READY[idx].load(Ordering::Acquire))
+            .filter(|&idx| sched::secondary_work_done(idx))
+            .count()
+            == expected
+    });
+    if !all_done {
+        serial_println!(
+            ":: AARCH64 SMP: WARNING — cooperative work pass incomplete ({} of {} secondaries done) ::",
+            (1..n_cores)
+                .filter(|&idx| startable[idx] && CORE_READY[idx].load(Ordering::Acquire))
+                .filter(|&idx| sched::secondary_work_done(idx))
+                .count(),
+            expected
+        );
     }
 
     // Per-core heartbeat witness (VUG-1 M3b honesty): each online secondary ran a cooperative work
