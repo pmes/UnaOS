@@ -762,6 +762,90 @@ storage, and the FTDI mirror all ran normally the same boot.
 
 ---
 
+## 10. EHCI-3 — the minimal EHCI HID driver
+
+The driver the §9/§9a evidence arcs were run for: `drivers/ehci/` (`mod.rs` driver +
+`qh.rs` schedule structures), armed by `UNAOS_EHCIHID=1` (feature `ehcihid`, implies
+`ehciconfig`). Goal: the 2012 rMBP's **internal keyboard and trackpad** — real USB devices
+asleep behind the Panther Point EHCI companions on **non-switchable** ports (§9a censusB).
+Because PORTSW (§7f) moves only the *switchable* shared ports to xHCI, the two stacks own
+**disjoint port sets by hardware**: EHCI-3 runs as a permanently-active second
+host-controller stack alongside xHCI (Peter-confirmed end state) and never reads or writes
+an xHCI register.
+
+**One wake path.** The EHCI-2 wake was refactored into shared halves
+(`ehci_scout::wake_run` — PMCSR→D0, `USBLEGSUP` handshake + `USBLEGCTLSTS` SMI clear/ack,
+`USBCMD.RS=1` — and `wake_route` — `CONFIGFLAG=1`, port power, settle). The §9a evidence
+mode calls them with its censusA in between; the driver calls the same two functions.
+Refactor gates held: all-knobs-OFF kernel byte-identical, §9a trace line-for-line unchanged.
+
+**Transfer machinery (polling-first, no interrupts).** One reusable head-of-reclamation
+control QH on a self-linked async list runs all EP0 enumeration synchronously in main-loop
+context (the `sync_control` idiom); a 4 KiB periodic frame list points every entry at one
+interrupt QH per HID endpoint, each with a single re-armed qTD (the `queue_keyboard_read`
+idiom, software-tracked data toggle via DTC=1). `service_ehci_hid()` polls from the same
+main-loop spot as the xHCI service hooks; no `USBINTR` write, no IDT vector, no MSI. All
+DMA structures come off the identity-mapped heap, 32-bit-checked at allocation
+(`CTRLDSSEGMENT=0`; Panther Point is 32-bit-only per §9).
+
+**The topology fork (M1 evidence gate).** The first `GET_DESCRIPTOR` on the root-port
+device decides on a serial line — `:: EHCI-HID: [i] M1 root device … -> TOPOLOGY A|B ==
+witness ::`. Class `0x09` ⇒ **A**: the device is the integrated Rate-Matching Hub; the
+driver enumerates it as a hub (hub descriptor, port power, downstream reset,
+`GET_PORT_STATUS` speed learn) and reaches the FS/LS HID children through the RMH's TT via
+split transactions. Anything else ⇒ **B**: direct device, no splits. The QH builder
+parameterizes hub-addr/port/S-mask/C-mask (zero on B), so both branches share every other
+line of machinery. **Split-mask note (design review N1):** S/C-masks are *microframe* masks
+evaluated in each frame the QH is reached (EHCI 4.12.2), so the every-frame frame-list
+simplification stays split-correct — S-mask 0x01 (SSPLIT µframe 0), C-mask 0x1C
+(CSPLITs µframes 2–4), a 1 ms service rate that over-serves the 8 ms boot-HID interval
+harmlessly. Deliberate, not inherited.
+
+**Enumeration robustness (§6 lessons, transport-independent):** 100 ms connect debounce,
+paced reset retries (200/400/600 ms), MPS0 header-learn before the full descriptor read
+(the XENUM-3 short-read trap), one-device-at-a-time. **Driver-owned addressing (review
+N2):** EHCI has no slot model, so a monotonic allocator owns the 7-bit address space; a
+failed enumeration **burns** its address (never reused for a possibly-half-addressed
+device), traced `address N BURNED`. With 2 root ports + a ≤ 8-port RMH tier and no hot-plug
+rescan this arc, exhaustion (127/boot) is unreachable and traced if hit. Boot reports
+decode through the **same scancode table and layout logic as the xHCI HID path**
+(`HID_SCANCODE_TO_ASCII`, pub(crate)) into `pal::Event::Key`/`Mouse`; non-boot HID
+interfaces (the likely Apple-trackpad case, R3) are skipped with an honest trace — the
+keyboard gates M3, the trackpad splits to a follow-on if non-boot.
+
+**Write surface (tripwire-grade).** The §9a wake surface plus, declared: `PORTSC.PR` (RW1C
+change bits masked), `USBCMD.ASE/PSE`, `PERIODICLISTBASE`/`ASYNCLISTADDR`/`CTRLDSSEGMENT=0`,
+`USBSTS` RW1C acks, the driver's own frame-list/QH/qTD/buffer DMA memory, EP0 device + hub-
+class requests, and — a Peter-approved extension (2026-07-16) the design doc omitted — the
+EHCI functions' **own PCI COMMAND** Memory-Space + Bus-Master enables (a DMA precondition;
+read-checked, set only if clear, traced before/after). Never any xHCI register, never a
+switchable-mask port. Every MMIO access translate()-guarded; every wait bounded; stuck
+handshakes are traced STOP-NOTEs, never forced. `HCRESET` is not used (Peter item (c):
+build on the metal-clean wake; reset only if M1 ever finds inconsistent port state — it has
+not).
+
+**QEMU gates (honest).** QEMU's `usb-kbd` is HS-capable and trains directly on the harness
+`usb-ehci` root port, so QEMU proves **Topology B end-to-end**: wake, reset (PED=1), M1
+witness, `SET_PROTOCOL(boot)`, periodic interrupt-IN, QMP `send-key` typing decoded to
+`EHCI-HID: KEY` + `pal::Event` with bounded report witnesses (first, then every 32nd).
+Under the knob the harness moves the QEMU keyboard from the xHCI bus to the EHCI bus
+(deterministic `send-key` routing); knob-off the harness is unchanged. **QEMU cannot run
+the hub tier at all**: its only hub model is full-speed, and a FS hub on the EHCI bus (no
+companion, no TT model) wedges the machine before firmware prints a byte — measured, not
+assumed. So **Topology A (RMH hub walk + splits) is metal-first by construction**, decided
+at the sitting by the M1 witness line. `UNAOS_EHCIHID` stays **default-OFF until the
+internal keyboard types on metal** (M3), then a pre-registered PORTSW-style default-ON fold
+(a separate arc — Peter item (b)).
+
+**Knob-off identity.** The `ehci/` module and every call site are `#[cfg]`-compiled out;
+`.text`/`.rodata` are byte-identical knob-off (ELF section compare). Whole-file identity is
+broken only by panic-`Location` line-number metadata (`.data.rel.ro`) + symbol tables
+shifting from the cfg-gated insertions in shared files — code-free drift, stated here
+rather than hand-waved.
+
+---
+
 ## See also
 - `unaos/crates/kernel/src/drivers/xhci/`, `drivers/block.rs` — the implementation.
+- `unaos/crates/kernel/src/drivers/ehci/`, `drivers/ehci_scout.rs` — the EHCI-3 HID driver (§10) and the EHCI-1/2 scout + shared wake (§9/§9a).
 - [`scheduler.md`](../02_KERNEL_CORE/scheduler.md) — why the lock-free MSI handler and the main-loop service split matter under a live scheduler.
