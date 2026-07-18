@@ -4434,7 +4434,73 @@ exact trigger this sitting named above: a CRCR write while RS=1. Builds clean fo
 attended metal run, not exercised in this repo's CI. Draft forum reply:
 `~/.claude/plans/unaos/review/unaos-orin-repro-REPLY.md` (Peter's call whether/when to post
 and whether to offer the reproducer source). Landing checklist:
-`~/.claude/plans/unaos/review/unaos-orin-repro-LANDING.md`.
+`~/.claude/plans/unaos/review/unaos-orin-repro-LANDING.md`. (Correction of record: the
+"echo write" described above was the original design; the independent review lens changed the
+one gated write to a synthetic, non-null, 64-byte-aligned pointer with RCS=1 —
+`0x2_0000_0000 | 1` — matching the shape of the kernel's validated trigger write, since an
+echo would load a NULL ring pointer per xHCI §5.4.5, an untested variant. `a412320`.)
+
+**⚡ ATTENDED RESULT (2026-07-17, Peter, 26+ runs): NO REPRODUCTION.** The standalone
+reproducer was run 26+ times across BOTH boot sticks (new official + old) and never fired the
+fault. This is the pre-registered non-repro branch of the landing report, and it is a finding,
+not a tool failure. Two hypotheses remain, unseparated:
+1. **The bare CRCR write on the untouched UEFI-inherited controller is NOT the sufficient
+   trigger** — the kernel's fuller takeover sequence (halt, reprogram DCBAAP/ERST/CONFIG,
+   restart RS, THEN the quiesce write) does something necessary to reach the poisoned
+   condition that a single direct register write does not.
+2. **No boot in the window was poisoned** (the box-state-over-time axis) — the session had no
+   positive control: a known wall-faulter kernel layout was not booted in the same window to
+   confirm the box was in a faulting state at all. Precedent: the July-15 2/2-deterministic
+   IOB faulter binary went 3/3 clean the next day unchanged.
+Discriminating experiment (when a bench window opens): pair boots in ONE session — the known
+wall-faulter layout vs. the reproducer, interleaved. Faulter fires + reproducer doesn't ⇒
+hypothesis 1 confirmed (revise the reproducer toward the full takeover sequence). Neither
+fires ⇒ hypothesis 2 (box not poisoned; result inconclusive, retry another day). **The
+staged forum reply (`unaos-orin-repro-REPLY.md`) must NOT be posted as-is** — its reproducer
+section describes a tool now known not to reproduce at n=26+; per the landing report's own
+pre-registration, the reply's trigger framing needs revision first. The repo copy of the
+tool's README was removed from the working tree (Peter, 2026-07-17) to avoid automated-scanner
+friction; the tool itself stays cataloged here.
+
+**⚡⚡ SAME-WINDOW DISCRIMINATION (2026-07-17 R21 attended sitting — the hypothesis-1 answer):**
+serial of record `~/unaos-bench/jetson-serial-2026-07-17-r21-sitting.log`. The fresh merged-main
+default candidate (`af1af39`, kernel `80475a57…`, tegra:109) went 2 clean boots (boot A fully
+captured: CAPSTONE 6/6, zero RAS, **VUG-HONESTY parked-core witness PASS on silicon**; boot B
+attested-unlogged) then **wall-faulted on boot 3** at USB enumeration — the exact carveout
+signature (SNOC `0xec00030d`/SERR `0xd`/Carveout `0x3` + ACI FillWrite `0x9`, ADDR `…dc40`),
+panel "lockup" = the RAS power-off freezing scanout. Candidate therefore **DISQUALIFIED for
+default duty** (defaults rule); stick restored to validated `cad623af…` and the restore **proven
+to shell** (third captured boot, CAPSTONE 6/6, clean). Then the decisive leg: **the standalone
+reproducer ran 13-for-13 SILENT minutes after the kernel fault, same box, same window** (28
+pre/post write lines on serial), on top of the morning's 26-run silence. **Verdict: hypothesis 1
+CONFIRMED — the bare register write is NOT the sufficient trigger; the kernel's fuller takeover
+sequence is required to reach the poisoned condition.** Hypothesis 2 (box not poisoned) is dead
+for this window — the kernel path faulted minutes earlier. Consequences: (a) the NVIDIA reply
+revision is UNBLOCKED with this framing (tool = honest negative + the takeover sequence as the
+real trigger; Peter posts); (b) the wall remains live on current firmware; (c) the af1af39-era
+layout joins the faulter ledger (~1-in-3 observed, small sample).
+
+**⚡⚡ R21 CONSOLIDATED SITTING (2026-07-17 night; serial
+`~/unaos-bench/jetson-serial-2026-07-17-r21b-sitting.log`; merged main `3338d55` media):**
+- **ORIN-SMP-DEFAULT candidate (pure default build, kernel `922ab1ce…`): 1 fault / 2 clean.**
+  Boot 1 fired the SMP-3-class IOB record (`0x…0200`, CBB `0x6` + ACI FillWrite) at the
+  tegrasmp kick-off — the historical SMP-3 signature re-sampled by the new layout,
+  probabilistic not deterministic here. Boots 2 and 3: **5/5 secondaries online on BOTH
+  clusters, SGIs clean, VUG-HONESTY witness PASS, CAPSTONE COMPLETE, interactive shell — the
+  first default-path 6-core UnaOS shells on Orin silicon.** Candidate NOT promoted (defaults
+  rule: the record must be fault-free); stick default remains `cad623af…` (restored at close,
+  content-verified). The SMP code itself is exonerated again — the kick-off fault is the
+  known layout/box-state residual, now observed probabilistic on this layout.
+- **RAST-TEGRA: FIRST 3D PIXELS ON THE ORIN PANEL** — witness build (kernel `b41989d0…`)
+  rendered the cube on the real 1920×1200 inherited scanout: `90 frames in 91 ms — 989.010
+  fps` (attended visual confirm: the animation completes in ~0.1 s and presents as a blue
+  flash/square — frame PACING is a follow-up nit, the render itself is proven; contrast x86's
+  21.9 fps per-pixel present). CAPSTONE COMPLETE same boot, zero faults.
+- **ORIN-NET-1 census on real firmware: 8 Tegra234 PCIe controllers found and walked
+  read-only** (controller 0 `pcie@140a0000` domain 8 status=okay with full
+  appl/config/atu_dma/dbi/ecam reg map + ranges captured; controllers 1–7 enumerated; full
+  detail in the serial log). The NET-2 scoping data now exists on the record; fold into
+  §ORIN-NET-1's metal columns at the next docs pass on the merged tree.
 
 ### ORIN-SMP-8 — the tegrasmp RELINK (the layout-axis close-out; BUILD-ONLY, `UNAOS_TEGRASMP` + `UNAOS_XCARVE_RELINK`)
 
