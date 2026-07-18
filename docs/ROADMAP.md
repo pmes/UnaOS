@@ -84,8 +84,9 @@ driver (`drivers/e1000.rs` — PCI, MSI RX on vector 0x41, DMA rings) is the
 device layer smoltcp binds to; the hand-rolled `crates/net` protocol crate
 (ARP/ICMP/UDP/DHCP + the Go-Back-N TCP engine) keeps working knob-off and
 remains in-tree as reference until the smoltcp line fully replaces its shell
-surface. There is **no net syscall surface yet** (ring 3 cannot reach the
-network); the socket syscall family opened at number 19 (SOCK-2 landed 19–22, SOCK-3 landed 23–25; SOCK-4 added no syscall — a socket rides the existing `SYS_XFER`/`SYS_RECV`; next free number: 26).
+surface. The socket syscall family opened at number 19 (SOCK-2 landed 19–22, SOCK-3 landed 23–25; SOCK-4 added no syscall — a socket rides the existing `SYS_XFER`/`SYS_RECV`).
+**Status update (R21, 2026-07-17): smoltcp is now the x86 network DEFAULT** (SMOLNET-DEFAULT,
+`03105f0` — opt-out knob `UNAOS_NOSMOLNET`); the knob-on framing above is historical.
 
 | Arc | Content | Track |
 | :--- | :--- | :--- |
@@ -307,7 +308,7 @@ and follow-me demos feeding the drive service's AUTO mode.
 
 | Gap | Note | Size |
 | :--- | :--- | :--- |
-| aarch64 networking | Pi: PCIe RC + VL805 xHCI (unlocks all Pi USB) or GENET MAC driver | M–L |
+| aarch64 networking | Pi: PCIe RC + VL805 xHCI (unlocks all Pi USB) or GENET MAC driver. **Orin: line OPEN and moving (R21)** — NET-1 census (8 Tegra234 PCIe RCs, read-only) + NET-2 DBI-aperture link recon LANDED; NET-3 (TCR PS widen 36→40-bit + controller-0 link bring-up) in flight; NET-4 = NIC claim + smoltcp bind | M–L |
 | Pi runtime storage | SD/EMMC driver (needed for loadable programs from disk on Pi) | S–M |
 | RTC + NTP | Cheap and load-bearing — land before UnaFS kernel writes (real mtimes) | S |
 | Entropy | RDRAND/jitter; prerequisite for any TLS/WPA future | S |
