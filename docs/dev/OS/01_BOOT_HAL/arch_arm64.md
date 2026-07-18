@@ -273,6 +273,51 @@ scheduled work (SMP scheduling on `virt` remains a later step). The per-core
 generic-timer tick is likewise still deferred: arming it on a secondary would
 double-count the shared `ticks()` clock the xHCI/e1000 timeout budgets read.
 
+### Fixed-priority multilevel run queues + anti-starvation aging (AARCH64-PRIO)
+
+The run queue is no longer flat round-robin. Each CPU's `RUN_QUEUES` entry is a
+`RunQueue` of `NUM_PRIORITIES = 4` FIFO levels (`PRIO_LOW`=0, `PRIO_NORMAL`=1,
+`PRIO_HIGH`=2, `PRIO_RT`=3). A dispatch always pops the front of the **highest
+non-empty** level (strict priority; round-robin within a level). This ports the
+proven x86 design (`arch/x86_64/sched.rs`) to this module's own structures.
+
+- **Spawn API.** `spawn`/`spawn_user`/`spawn_joinable` are unchanged and land every
+  task at the default `PRIO_NORMAL` — a single level, so those (many) call sites stay
+  behaviourally identical to the pre-priority flat round-robin. A new
+  `spawn_prio(name, entry, arg, cpu, priority)` picks a level explicitly.
+- **Aging (anti-starvation).** A ready task carries a lock-protected, owning-CPU-only
+  `wait_ticks`. `RunQueue::push` (ENQUEUE) re-bases a task to its base-priority level
+  and zeroes the clock; a periodic sweep (`RunQueue::age`, run under the same run-queue
+  lock as the pop, HIGH→LOW so a promotion is visited at most once) RELOCATES any task
+  that has waited `AGE_TICKS` one level UP via a raw `VecDeque` move — its base
+  `priority` is untouched, so a promoted-then-dispatched task re-bases on its next
+  enqueue. A low task under continuous higher-priority load thus climbs to parity, runs,
+  and drops back — starvation is bounded to ~`AGE_TICKS` per level climbed.
+- **Aging clock = dispatch passes, not timer ticks (the aarch64 adaptation).** x86 ages
+  in its always-live LVT `percpu.ticks`. The aarch64 *cooperative* dispatch paths (the
+  BSP demo, the `virt` secondaries, the `virt` CAPSTONE driver, and QEMU raspi4b) have
+  **no live periodic tick** — QEMU delivers no Group-1 timer IRQ, so `percpu.ticks` is
+  frozen at 0. So aging advances one unit per `dispatch_next` pass on the owning CPU
+  (`SchedCpu::age_passes` / `age_last_sweep`), which ticks on *every* path (cooperative
+  and preemptive, QEMU and metal). A pass **is** the starvation measure — it counts each
+  time the core dispatched someone else while a waiter sat.
+- **Contract preservation.** The per-CPU run-queue spinlock ownership, the CPU pulse
+  telemetry (`CPU_BUSY`/`CPU_IDLE`, still bumped only on real dispatch/idle in
+  `dispatch_next`), and the `virt` busy/idle-heartbeat witness are unchanged: the
+  secondary probe tasks are all `PRIO_NORMAL`, so the busy count stays `busy=8`. The
+  aging relocate's `push_back` may allocate under the run-queue lock; that is benign
+  exactly as at `spawn` — the heap lock is always innermost (run-queue → heap, never
+  inverted).
+
+**M3 witness (`priority_aging_witness`).** A self-checking, bounded cooperative pass run
+on the `virt` GICv3 boot core (inside `run_capstone_boot_core`, before the CAPSTONE):
+`PRIO_HIGH` loaders keep the top level continuously non-empty while one `PRIO_LOW`
+candidate must be aged up to run. It asserts the low task completed **while high load was
+still active** (only possible via aging) and prints
+`:: AARCH64 SCHED: priority+aging PASS ::`. It never hangs — every task does finite work
+and the low task never yields, so a broken aging path FAILs loudly instead of wedging the
+core. Captured by `UNAOS_GICV3=1 ./arroyo test-arm 40`.
+
 ### Build knob
 
 `UNAOS_GICV3=1 ./arroyo {arm,test-arm}` appends `-machine gic-version=3` to the

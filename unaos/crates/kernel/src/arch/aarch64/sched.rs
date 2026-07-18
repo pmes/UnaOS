@@ -41,6 +41,38 @@ const TASK_STACK_SIZE: usize = 16 * 1024;
 /// Timer ticks a task runs before preemption (~4 ms/tick × 3 = 12 ms quantum).
 const QUANTUM_TICKS: u32 = 3;
 
+/// AARCH64-PRIO — fixed-priority multilevel run queues. A CPU always runs a ready task of the HIGHEST
+/// non-empty level; within a level scheduling is round-robin (FIFO). Higher number = more urgent.
+/// This mirrors the proven x86 design (`arch/x86_64/sched.rs`), adapted to this module's structures.
+pub const NUM_PRIORITIES: usize = 4;
+/// Convenience priority levels (any `0..NUM_PRIORITIES` is valid; out-of-range is clamped by `push`).
+pub const PRIO_LOW: u8 = 0;
+/// The DEFAULT level every existing caller lands at (`spawn`/`spawn_user`/`spawn_joinable`) — a single
+/// level, so those paths stay byte-identical to the pre-priority flat round-robin.
+pub const PRIO_NORMAL: u8 = 1;
+pub const PRIO_HIGH: u8 = 2;
+pub const PRIO_RT: u8 = 3;
+
+/// AARCH64-PRIO — anti-starvation aging. A ready task that has WAITED in a run queue this many aging
+/// units without being dispatched is RELOCATED one effective level UP (its BASE `priority` is
+/// unchanged); repeated, a low task under continuous higher-priority load climbs to parity, runs, then
+/// re-bases on its next enqueue — bounding starvation to ~`AGE_TICKS` per level it must climb.
+///
+/// UNIT NOTE (the aarch64 adaptation): x86 measures the wait in its always-live LVT `percpu.ticks`.
+/// The aarch64 cooperative dispatch paths (BSP `demo_cooperative`, the `virt` secondaries, the `virt`
+/// CAPSTONE driver, QEMU raspi4b) have NO live periodic tick — QEMU delivers no Group-1 timer IRQ, so
+/// `percpu.ticks` is frozen at 0 there. So this module ages by SCHEDULER ACTIVITY — one unit per
+/// `dispatch_next` pass on the owning CPU (see `SchedCpu::age_passes`) — which advances on EVERY path
+/// (cooperative and preemptive, QEMU and metal). A pass IS the starvation measure: it counts every
+/// time this core dispatched SOMEONE ELSE while a waiter sat. Every other aging invariant (owning-CPU-
+/// only `wait_ticks`, ENQUEUE zeroes, RELOCATE promotes via a raw HIGH→LOW move, the sweep under the
+/// same run-queue lock as the pop, promoted-then-dispatched runs at base) matches x86 exactly.
+const AGE_TICKS: u32 = 16;
+/// How often the aging sweep runs, in dispatch passes. Kept well below `AGE_TICKS` so the
+/// one-promotion-per-sweep cap never binds; a sweep accrues elapsed credit and carries any surplus
+/// past `AGE_TICKS` to the next sweep, so a coarse/late sweep loses no credit.
+const AGING_INTERVAL: u64 = 4;
+
 // Task lifecycle. A `u8` behind an atomic: the running task writes it (yield/exit/preempt) and the
 // scheduler reads it after the switch-back to decide requeue-vs-free.
 const STATE_READY: u8 = 0;
@@ -116,6 +148,16 @@ pub struct Task {
     /// this core's run queue — which keeps its TPIDR_EL2 (per-CPU) view correct on resume, exactly
     /// as x86 relies on the GS base staying put. Read by `make_ready` when re-readying a woken task.
     cpu: u32,
+    /// AARCH64-PRIO — BASE scheduling priority (`0..NUM_PRIORITIES`, higher = more urgent). IMMUTABLE
+    /// after spawn, so it is safe to read lock-free from any CPU. Aging never touches this — it only
+    /// transiently raises the *level* a task sits in (see `wait_ticks`); a promoted task re-bases here
+    /// on its next enqueue.
+    priority: u8,
+    /// AARCH64-PRIO — aging units this task has WAITED in a run queue since its last enqueue. Touched
+    /// ONLY under the owning CPU's run-queue spinlock (zeroed by `RunQueue::push` on every enqueue,
+    /// accrued + consumed by `RunQueue::age` on that CPU). NEVER read cross-CPU — unlike `priority` it
+    /// is mutable and lock-protected, so it must not be read off the owning CPU.
+    wait_ticks: u32,
     /// Completion signal for `join()`, or `None` for a fire-and-forget task. A joinable task carries
     /// a clone of the same `Arc<Semaphore>` (0 permits) held by its `JoinHandle`; the trampoline
     /// `post()`s it after `entry` returns. The Arc — not a `'static` lifetime — keeps the semaphore
@@ -160,6 +202,12 @@ struct SchedCpu {
     /// PARK_WAITQ: the wait queue's `*const AtomicBool` lock (the scheduler releases it AFTER the
     /// push — the lock-handoff that makes the wakeup lost-proof).
     park_lock: AtomicU64,
+    /// AARCH64-PRIO — monotonic count of `dispatch_next` passes on this CPU; the aging clock (see
+    /// `AGE_TICKS`). Touched ONLY by this CPU's scheduler loop (sequential), so `Relaxed` suffices.
+    age_passes: AtomicU64,
+    /// AARCH64-PRIO — `age_passes` value at the last aging sweep; the elapsed since is what
+    /// `RunQueue::age` accrues. Owning-CPU-only, `Relaxed`.
+    age_last_sweep: AtomicU64,
 }
 
 impl SchedCpu {
@@ -172,6 +220,8 @@ impl SchedCpu {
             park_deadline: AtomicU64::new(0),
             park_waiters: AtomicU64::new(0),
             park_lock: AtomicU64::new(0),
+            age_passes: AtomicU64::new(0),
+            age_last_sweep: AtomicU64::new(0),
         }
     }
 }
@@ -186,10 +236,78 @@ static SCHED: [SchedCpu; NUM_CPUS] = [const { SchedCpu::new() }; NUM_CPUS];
 static CPU_BUSY: [AtomicU64; NUM_CPUS] = [const { AtomicU64::new(0) }; NUM_CPUS];
 static CPU_IDLE: [AtomicU64; NUM_CPUS] = [const { AtomicU64::new(0) }; NUM_CPUS];
 
-/// Per-CPU ready queues. `VecDeque::new` is const, so no lazy_static; a `push` may allocate, but
-/// only at `spawn` (never under the switch), so the brief lock is realloc-free in the hot path.
-static RUN_QUEUES: [SpinMutex<VecDeque<Box<Task>>>; NUM_CPUS] =
-    [const { SpinMutex::new(VecDeque::new()) }; NUM_CPUS];
+/// AARCH64-PRIO — a CPU's ready tasks, bucketed by EFFECTIVE level. A task normally sits at its base
+/// `priority` level, but the aging sweep (`age`) may transiently lift a long-waiting task to a higher
+/// level so strict priority does not starve it; on its next enqueue it re-bases. One spinlock (in
+/// `RUN_QUEUES`) guards all levels; held only briefly (push/pop are O(NUM_PRIORITIES); `age` is
+/// O(ready tasks)) and always with IRQ masked.
+///
+/// Two distinct placement operations share these levels: ENQUEUE (`push`) re-bases a task to its
+/// base-priority level and ZEROES its aging clock; RELOCATE (`age`) moves a task one level UP without
+/// touching its base priority. They must not be confused (relocating via `push` would be a no-op
+/// promotion that leaves starvation intact).
+struct RunQueue {
+    levels: [VecDeque<Box<Task>>; NUM_PRIORITIES],
+}
+
+impl RunQueue {
+    /// `const` (each level a const-`new` `VecDeque`) so `RUN_QUEUES` stays a plain const static, no
+    /// lazy_static — matching this module's existing run-queue construction.
+    const fn new() -> Self {
+        RunQueue { levels: [const { VecDeque::new() }; NUM_PRIORITIES] }
+    }
+    /// ENQUEUE a task at its BASE priority level (FIFO within the level), clamped in range, and reset
+    /// its aging clock — every enqueue (spawn / wake / re-enqueue after preempt/yield) zeroes
+    /// `wait_ticks`, so a task only ages while it sits WAITING and re-bases the moment it is requeued.
+    fn push(&mut self, mut task: Box<Task>) {
+        task.wait_ticks = 0;
+        let level = (task.priority as usize).min(NUM_PRIORITIES - 1);
+        self.levels[level].push_back(task);
+    }
+    /// Dequeue the front of the HIGHEST non-empty level (strict priority over the effective level,
+    /// round-robin within).
+    fn pop_highest(&mut self) -> Option<Box<Task>> {
+        for level in self.levels.iter_mut().rev() {
+            if let Some(task) = level.pop_front() {
+                return Some(task);
+            }
+        }
+        None
+    }
+    /// Priority-aging sweep (anti-starvation): RELOCATE every ready task that has now waited at least
+    /// `AGE_TICKS` one level UP, carrying any surplus credit to the next sweep. `elapsed` is the aging
+    /// units (dispatch passes) since the previous sweep. Run on the OWNING CPU under the run-queue lock.
+    ///
+    /// Iterating HIGH→LOW is load-bearing: a task promoted from `level` into `level + 1` lands in a
+    /// level that was ALREADY processed this sweep, so it is never revisited (exactly-once per sweep,
+    /// no runaway multi-level jump). Within a level, popping exactly `n = len()` from the front and
+    /// pushing kept tasks to the back rotates the deque full-circle, preserving FIFO. Relocation is a
+    /// raw `VecDeque` move that leaves `priority` (base) untouched — NOT `push`. A `push_back` into
+    /// `level + 1` may reallocate under the run-queue lock; that is benign here exactly as at `spawn`
+    /// (the heap lock is always innermost — run-queue → heap is the only ordering, never inverted).
+    fn age(&mut self, elapsed: u32) {
+        for level in (0..NUM_PRIORITIES - 1).rev() {
+            let n = self.levels[level].len();
+            for _ in 0..n {
+                let mut task = self.levels[level].pop_front().expect("age: len/pop mismatch");
+                task.wait_ticks = task.wait_ticks.saturating_add(elapsed);
+                if task.wait_ticks >= AGE_TICKS {
+                    task.wait_ticks -= AGE_TICKS; // carry surplus credit, don't discard it
+                    debug_assert!(level + 1 < NUM_PRIORITIES, "age: promotion above top level");
+                    self.levels[level + 1].push_back(task); // RELOCATE up one level (base unchanged)
+                } else {
+                    self.levels[level].push_back(task);
+                }
+            }
+        }
+    }
+}
+
+/// Per-CPU ready queues. `RunQueue::new` is const, so no lazy_static; a `push` may allocate, but only
+/// at `spawn` / an aging relocate (never under the switch), so the brief lock is realloc-free on the
+/// switch hot path.
+static RUN_QUEUES: [SpinMutex<RunQueue>; NUM_CPUS] =
+    [const { SpinMutex::new(RunQueue::new()) }; NUM_CPUS];
 
 /// Per-CPU sleeper lists: tasks blocked in `sleep_ticks`, tagged with their wake deadline (this
 /// CPU's `percpu.ticks`). Touched ONLY by the scheduler on the OWNING CPU (parked there on the
@@ -418,6 +536,7 @@ fn spawn_inner(
     entry: fn(usize),
     arg: usize,
     cpu: usize,
+    priority: u8,
     done_sem: Option<Arc<Semaphore>>,
 ) -> u64 {
     assert!(cpu < NUM_CPUS, "spawn: cpu out of range");
@@ -433,22 +552,32 @@ fn spawn_inner(
         entry,
         arg,
         cpu: cpu as u32,
+        priority,
+        wait_ticks: 0, // re-zeroed by RunQueue::push on every enqueue; satisfies the struct literal
         done_sem,
         user_entry: 0,
         user_sp: 0,
         user_ttbr0: 0, // kernel task: no root switch (kernel mappings are Global in every root)
     });
-    RUN_QUEUES[cpu].lock().push_back(task);
+    RUN_QUEUES[cpu].lock().push(task);
     // Wake the target if it's a different, possibly-idle core (same-core needs no poke).
     poke_cpu(cpu);
     id
 }
 
-/// Create a ready, fire-and-forget kernel thread on `cpu`'s run queue: it runs `entry(arg)` and is
-/// freed when `entry` returns, with no way to wait for it (use `spawn_joinable` for that). Returns
-/// the task id.
+/// Create a ready, fire-and-forget kernel thread on `cpu`'s run queue at the DEFAULT priority
+/// (`PRIO_NORMAL` — the single level, so this stays behaviourally identical to the pre-priority flat
+/// round-robin): it runs `entry(arg)` and is freed when `entry` returns, with no way to wait for it
+/// (use `spawn_joinable` for that). Returns the task id. Use `spawn_prio` to pick a level.
 pub fn spawn(name: &'static str, entry: fn(usize), arg: usize, cpu: usize) -> u64 {
-    spawn_inner(name, entry, arg, cpu, None)
+    spawn_inner(name, entry, arg, cpu, PRIO_NORMAL, None)
+}
+
+/// Like `spawn`, but at an explicit scheduling `priority` (`0..NUM_PRIORITIES`; higher = more urgent,
+/// clamped in range). The CPU always runs a ready task of the highest non-empty level; a lower task
+/// is protected from indefinite starvation by aging (see `AGE_TICKS`). Returns the task id.
+pub fn spawn_prio(name: &'static str, entry: fn(usize), arg: usize, cpu: usize, priority: u8) -> u64 {
+    spawn_inner(name, entry, arg, cpu, priority, None)
 }
 
 /// Create a ready EL0 (user-mode) task on `cpu`'s run queue (M6a): when dispatched it drops to EL0 at
@@ -509,12 +638,14 @@ fn spawn_user_inner(
         entry: user_never, // never called — the user trampoline erets to EL0 instead
         arg: 0,
         cpu: cpu as u32,
+        priority: PRIO_NORMAL, // EL0 tasks run at the default level (unchanged from the pre-priority path)
+        wait_ticks: 0,
         done_sem: None,
         user_entry,
         user_sp,
         user_ttbr0,
     });
-    RUN_QUEUES[cpu].lock().push_back(task);
+    RUN_QUEUES[cpu].lock().push(task);
     poke_cpu(cpu);
     id
 }
@@ -526,7 +657,7 @@ fn spawn_user_inner(
 pub fn spawn_joinable(name: &'static str, entry: fn(usize), arg: usize, cpu: usize) -> JoinHandle {
     let done = Arc::new(Semaphore::new(0));
     done.init(); // reserve the waiter list BEFORE the task can run + post (alloc-free park)
-    let id = spawn_inner(name, entry, arg, cpu, Some(done.clone()));
+    let id = spawn_inner(name, entry, arg, cpu, PRIO_NORMAL, Some(done.clone()));
     JoinHandle { done, id }
 }
 
@@ -609,7 +740,7 @@ fn make_ready(task: Box<Task>) {
     let target = task.cpu as usize;
     debug_assert!(target < NUM_CPUS, "make_ready: cpu out of range");
     task.state.store(STATE_READY, Ordering::Release);
-    RUN_QUEUES[target].lock().push_back(task);
+    RUN_QUEUES[target].lock().push(task);
     poke_cpu(target);
 }
 
@@ -753,7 +884,22 @@ pub fn timer_preempt() {
 /// scheduler on its own stack); on an empty queue IRQ is left UNMASKED for the caller to idle.
 fn dispatch_next(cpu: usize) -> bool {
     mask_irq();
-    let Some(task) = RUN_QUEUES[cpu].lock().pop_front() else {
+    // AARCH64-PRIO — age then pick, under ONE run-queue lock acquisition. Count this dispatch pass
+    // (the aging clock) and, ~every AGING_INTERVAL passes, run the anti-starvation sweep BEFORE the
+    // pop so a long-waiting task cannot be dispatched before it is aged in the same pass. The sweep
+    // and pop share the lock; `age` carries surplus credit past `AGE_TICKS`, so a coarse cadence loses
+    // nothing. Owning-CPU-only counters (Relaxed). See `AGE_TICKS` for why the clock is passes, not ticks.
+    let next = {
+        let mut q = RUN_QUEUES[cpu].lock();
+        let passes = SCHED[cpu].age_passes.fetch_add(1, Ordering::Relaxed) + 1;
+        let elapsed = passes - SCHED[cpu].age_last_sweep.load(Ordering::Relaxed);
+        if elapsed >= AGING_INTERVAL {
+            q.age(elapsed.min(u32::MAX as u64) as u32);
+            SCHED[cpu].age_last_sweep.store(passes, Ordering::Relaxed);
+        }
+        q.pop_highest() // highest-priority ready task; lock dropped here
+    };
+    let Some(task) = next else {
         CPU_IDLE[cpu].fetch_add(1, Ordering::Relaxed); // M3b CPU-pulse meter (introspection)
         unmask_irq();
         return false;
@@ -805,10 +951,11 @@ fn dispatch_next(cpu: usize) -> bool {
         STATE_FINISHED => drop(task), // free the stack
         STATE_BLOCKED => park_blocked(cpu, park, task), // sleeper list / (M4b) a wait queue
         _ => {
-            // READY (yielded or preempted): rotate to the back of the run queue.
+            // READY (yielded or preempted): re-enqueue at its BASE priority level (round-robin within),
+            // which also re-zeroes its aging clock — a task only ages while it sits WAITING.
             debug_assert_eq!(park, PARK_NONE, "non-blocked task carried a park action");
             task.state.store(STATE_READY, Ordering::Release);
-            RUN_QUEUES[cpu].lock().push_back(task);
+            RUN_QUEUES[cpu].lock().push(task);
         }
     }
     true
@@ -1899,6 +2046,79 @@ pub fn start_aps(online: &[usize]) {
     );
 }
 
+// ---------------------------------------------------------------------------------------------
+// AARCH64-PRIO M3 — priority + anti-starvation aging witness (cooperative, self-checking, bounded)
+// ---------------------------------------------------------------------------------------------
+//
+// Proves the two halves of the multilevel scheduler in one cooperative pass on a single core:
+//   1. FIXED PRIORITY — a CPU runs the highest non-empty level first (a low task is NOT picked while
+//      higher-priority work is ready).
+//   2. AGING — that low task is nonetheless NOT starved: under CONTINUOUS high-priority load it is
+//      relocated up, level by level, until it becomes dispatchable, and runs BEFORE the load drains.
+//
+// The load is `PW_HIGH_TASKS` PRIO_HIGH tasks that each yield `PW_HIGH_ITERS` times (so PRIO_HIGH is
+// continuously non-empty for many dispatch passes), plus ONE PRIO_LOW task that runs to completion in
+// a single dispatch (no yield — so once aging lifts it into a dispatchable level it finishes at once,
+// without re-basing). WITHOUT aging the low task could only run after every high task exited; the
+// witness asserts it ran WHILE at least one high task was still active (`PW_LOW_UNDER_LOAD`), which is
+// only possible via aging. BOUNDED + never hangs: every task does finite work and the low task never
+// yields, so `run_until_empty` always drains — a broken aging path FAILs loudly (low runs after the
+// load drained → `under_load == false`), it never wedges the core. All cooperative (yield/exit only),
+// so it needs no timer and runs identically on the `virt` GICv3 boot core (test-arm 40) and on metal.
+const PW_HIGH_TASKS: usize = 2;
+const PW_HIGH_ITERS: usize = 40;
+static PW_HIGH_ACTIVE: AtomicU32 = AtomicU32::new(0);
+static PW_LOW_RAN: AtomicBool = AtomicBool::new(false);
+static PW_LOW_UNDER_LOAD: AtomicBool = AtomicBool::new(false);
+
+/// High-priority load: yield many times (keeping PRIO_HIGH continuously ready), then retire.
+fn pw_high_body(_: usize) {
+    for _ in 0..PW_HIGH_ITERS {
+        yield_now();
+    }
+    PW_HIGH_ACTIVE.fetch_sub(1, Ordering::Relaxed);
+}
+
+/// The starvation candidate: runs to completion in ONE dispatch (no yield). Records that it ran and
+/// whether high-priority load was still active at that moment — the aging proof.
+fn pw_low_body(_: usize) {
+    PW_LOW_RAN.store(true, Ordering::Relaxed);
+    if PW_HIGH_ACTIVE.load(Ordering::Relaxed) > 0 {
+        PW_LOW_UNDER_LOAD.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Run the AARCH64-PRIO M3 witness cooperatively on `cpu` and print the PASS/FAIL line. Self-contained:
+/// it stages its own tasks and drains them via `run_until_empty`, leaving the queue empty for the
+/// caller. Emits `:: AARCH64 SCHED: priority+aging PASS ::` on success.
+pub fn priority_aging_witness(cpu: usize) {
+    PW_HIGH_ACTIVE.store(PW_HIGH_TASKS as u32, Ordering::Relaxed);
+    PW_LOW_RAN.store(false, Ordering::Relaxed);
+    PW_LOW_UNDER_LOAD.store(false, Ordering::Relaxed);
+    serial_println!(
+        ":: AARCH64 SCHED: priority+aging witness — {} PRIO_HIGH loaders vs 1 PRIO_LOW candidate on cpu {} ::",
+        PW_HIGH_TASKS,
+        cpu
+    );
+    // Stage the load first (ahead of the candidate in FIFO), then the low candidate.
+    for _ in 0..PW_HIGH_TASKS {
+        spawn_prio("pw-high", pw_high_body, 0, cpu, PRIO_HIGH);
+    }
+    spawn_prio("pw-low", pw_low_body, 0, cpu, PRIO_LOW);
+    run_until_empty(cpu);
+    let ran = PW_LOW_RAN.load(Ordering::Relaxed);
+    let under_load = PW_LOW_UNDER_LOAD.load(Ordering::Relaxed);
+    if ran && under_load {
+        serial_println!(":: AARCH64 SCHED: priority+aging PASS ::");
+    } else {
+        serial_println!(
+            ":: AARCH64 SCHED: priority+aging FAIL (low_ran={}, under_load={}) ::",
+            ran,
+            under_load
+        );
+    }
+}
+
 /// JC3: run the M4 CAPSTONE on the `virt` boot core ALONE, cooperatively, and never return. Called by
 /// `main.rs` right after the boot core drops EL2 -> EL1 (`boot_virt::drop_to_el1`) with its per-CPU
 /// (TPIDR_EL1) and EL1 vectors installed. This is the QEMU-testable proof that the scheduler + all six
@@ -1939,6 +2159,10 @@ pub fn run_capstone_boot_core(cpu: usize) -> ! {
     // — a frozen non-demo core reads PARKED, never the demo core's fabricated load. The GICv3/test-arm
     // capture proves the display-honesty fix that completes the merged idle/busy-heartbeat counters.
     let _ = crate::vug::parked_display_witness();
+    // AARCH64-PRIO M3: prove fixed-priority + anti-starvation aging before the CAPSTONE. Self-contained
+    // and bounded (stages its own tasks, drains them, leaves the queue empty), so it never perturbs the
+    // CAPSTONE that follows — it just adds the `priority+aging PASS` line to this cooperative boot.
+    priority_aging_witness(cpu);
     spawn("capstone", capstone_body, 0, cpu);
     SCHED_GO.store(true, Ordering::Release); // harmless (no APs on this path)
     // Cooperative dispatch loop: drain the run queue, then busy-poll (never WFI). `dispatch_next` returns
