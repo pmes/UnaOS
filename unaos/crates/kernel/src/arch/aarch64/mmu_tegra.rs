@@ -78,6 +78,23 @@ const TCR_EL1_VAL: u64 = 25            // T0SZ  [5:0]
     | (0b10 << 30)                     // TG1   = 4 KiB (legal encoding; TTBR1 unused)
     | (0b001 << 32);                   // IPS   = 36-bit / 64 GiB, at [34:32]
 
+// ORIN-NET-3 (M1, `pcie3`): the PS/IPS *output-address* field, widened from 0b001 (36-bit / 64 GiB)
+// to 0b010 (40-bit / 1 TiB), knob-gated. NET-2 proved controller-0's ECAM (`0x2e_2000_0000`, ~184 GiB)
+// and MMIO `ranges` (~200 GiB) sit ABOVE the 36-bit output ceiling, so `map_mmio_window` refused them;
+// widening PS lets the MMU EMIT those output addresses (they still fall inside the 512-GiB / 39-bit VA
+// the L1 table already spans — M1 flips ONLY the output field, not T0SZ, so no new table level is
+// needed). At EL2 (non-VHE short format) PS is [18:16]; at EL1&0 IPS is [34:32]. The active values
+// below are the ONLY thing the switch programs, so with `pcie3` OFF they fold to the exact NET-2
+// literals and the emitted code (and the `mmu-regs` banner's `tcr=`) is byte-identical to baseline.
+#[cfg(feature = "pcie3")]
+const TCR_EL2_ACTIVE: u64 = (TCR_EL2_VAL & !(0b111 << 16)) | (0b010 << 16);
+#[cfg(not(feature = "pcie3"))]
+const TCR_EL2_ACTIVE: u64 = TCR_EL2_VAL;
+#[cfg(feature = "pcie3")]
+const TCR_EL1_ACTIVE: u64 = (TCR_EL1_VAL & !(0b111 << 32)) | (0b010 << 32);
+#[cfg(not(feature = "pcie3"))]
+const TCR_EL1_ACTIVE: u64 = TCR_EL1_VAL;
+
 // SCTLR bits we toggle. We RMW the firmware's SCTLR (UEFI initialised it, RES1 bits already set) — bic
 // M|C to turn the MMU + data cache OFF for the reprogram window, then orr M|C|I to turn MMU + data +
 // instruction caches back on. Passed to the asm in registers, not as bitmask immediates (0x5 / 0x1005
@@ -160,8 +177,8 @@ fn current_el() -> u64 {
 pub fn init(boot_info: &BootInfo) -> MmuInfo {
     let el = current_el();
     let (tcr, mair) = match el {
-        2 => (TCR_EL2_VAL, MAIR_VAL),
-        1 => (TCR_EL1_VAL, MAIR_VAL),
+        2 => (TCR_EL2_ACTIVE, MAIR_VAL),
+        1 => (TCR_EL1_ACTIVE, MAIR_VAL),
         // STOP tripwire (b): CurrentEL is neither 1 nor 2. We cannot safely program a translation
         // regime for an EL we do not understand, and we cannot report it (UARTC is unmapped until we
         // switch). Spin so the operator sees a dark hang that maps to "CurrentEL neither 1 nor 2"
@@ -352,7 +369,7 @@ unsafe fn enable_el2(ttbr0: u64) -> (u64, u64) {
             mc = in(reg) SCTLR_M | SCTLR_C,
             mci = in(reg) SCTLR_M | SCTLR_C | SCTLR_I,
             mair = in(reg) MAIR_VAL,
-            tcr = in(reg) TCR_EL2_VAL,
+            tcr = in(reg) TCR_EL2_ACTIVE,
             ttbr = in(reg) ttbr0,
             options(nostack, preserves_flags),
         );
@@ -389,7 +406,7 @@ unsafe fn enable_el1(ttbr0: u64) -> (u64, u64) {
             mc = in(reg) SCTLR_M | SCTLR_C,
             mci = in(reg) SCTLR_M | SCTLR_C | SCTLR_I,
             mair = in(reg) MAIR_VAL,
-            tcr = in(reg) TCR_EL1_VAL,
+            tcr = in(reg) TCR_EL1_ACTIVE,
             ttbr = in(reg) ttbr0,
             options(nostack, preserves_flags),
         );
@@ -530,18 +547,31 @@ pub enum MmioMap {
     AlreadyMapped,
     /// A new Device-nGnRE 1 GiB block was installed in both live tables to reach the aperture.
     Mapped,
-    /// The aperture's PA is at/above the tegra regime's output-address ceiling (TCR_EL2.PS = 0b001 =
-    /// 36-bit / 64 GiB — see `TCR_EL2_VAL`): a block descriptor there would raise an address-size
-    /// fault. Reaching it needs a **TCR_EL2.PS widen** — a translation-regime change beyond a
-    /// page-table write (a STOP tripwire for a read-only recon arc). Left un-walked; NET-3 territory.
+    /// The aperture's PA is at/above the tegra regime's reachable ceiling and cannot be mapped by an
+    /// L1 block. Two limits bound reachability (see `map_mmio_window`): the **TCR PS/IPS output
+    /// ceiling** (NET-2: 0b001 = 36-bit / 64 GiB; NET-3 `pcie3` widens it to 0b010 = 40-bit / 1 TiB)
+    /// and the **L1 table's VA extent** (512 entries × 1 GiB = 512 GiB, unchanged by the PS widen).
+    /// A base at/above the tighter of the two would raise an address-size fault or index past the
+    /// table, so `map_mmio_window` refuses it (no descriptor written). Un-walked; caller records it.
     BeyondPsCeiling,
 }
 
-/// The tegra regime maps PA via 1 GiB L1 blocks with TCR_EL2.PS = 0b001 (36-bit / 64 GiB — the value
-/// encoded in `TCR_EL2_VAL` [18:16]). A block whose output PA is at or above 64 GiB cannot be produced
-/// by this regime; it is the ceiling `map_mmio_window` refuses at.
+/// The tegra regime's TCR PS/IPS *output-address* ceiling in GiB. NET-2: 0b001 = 36-bit = 64 GiB.
+/// NET-3 (`pcie3`, M1) widens PS to 0b010 = 40-bit = 1 TiB so the MMU may EMIT controller-0's ECAM /
+/// MMIO output addresses (~184–212 GiB). Kept in lock-step with `TCR_EL2_ACTIVE` [18:16] / the EL1
+/// twin's IPS [34:32]; with `pcie3` OFF it stays 64, so a `pcie2`-only build refuses exactly what
+/// NET-2 refused (no behaviour change).
 #[cfg(feature = "pcie2")]
-const PS_GIB_CEILING: u64 = 64;
+const PS_OUTPUT_CEILING_GIB: u64 = if cfg!(feature = "pcie3") { 1024 } else { 64 };
+
+/// The L1 translation table's VA reach: 512 entries × 1 GiB (T0SZ=25, 39-bit VA — see `TCR_EL2_VAL`).
+/// The M1 PS widen flips only the *output* field, NOT T0SZ, so the table still spans 512 GiB and
+/// `l1.add(gi)` is only in bounds for `gi < 512`. This is the ARRAY-SAFETY guard: `map_mmio_window`
+/// must refuse `gib >= 512` regardless of the (wider) PS output ceiling, or it would index past the
+/// static table. Every controller-0 aperture (ECAM ~184 GiB, MMIO ~200–212 GiB) sits below it, so
+/// after the widen the 512-GiB extent — not the 1-TiB PS ceiling — is the binding limit in practice.
+#[cfg(feature = "pcie2")]
+const L1_GIB_EXTENT: u64 = 512;
 
 /// ORIN-NET-2 (`pcie2`): reach an MMIO aperture `[pa, pa+size)` for a **READ-ONLY** walk, mapped
 /// Device-nGnRE, via the EXISTING kernel page-table path — the same L1-block mechanism `map_fb_region`
@@ -564,8 +594,13 @@ pub fn map_mmio_window(pa: u64, size: usize) -> MmioMap {
     }
     let g_lo = pa >> 30;
     let g_hi = (pa + size as u64 - 1) >> 30;
-    // Above the 36-bit PS output ceiling: refuse (do NOT widen the regime here — STOP tripwire).
-    if g_hi >= PS_GIB_CEILING {
+    // Refuse anything the regime cannot reach: at/above the TCR PS/IPS output ceiling (an L1 block
+    // there raises an address-size fault) OR at/above the 512-entry L1 table's VA extent (indexing
+    // there walks past the static table). `L1_GIB_EXTENT` is the load-bearing array-safety guard —
+    // the M1 PS widen raises the OUTPUT ceiling to 1 TiB but leaves the table at 512 GiB, so 512 is
+    // the binding limit after the widen (and every controller-0 aperture is below it). With `pcie3`
+    // OFF the output ceiling is 64 GiB, so a `pcie2`-only build refuses exactly what NET-2 refused.
+    if g_hi >= PS_OUTPUT_CEILING_GIB || g_hi >= L1_GIB_EXTENT {
         return MmioMap::BeyondPsCeiling;
     }
     let el = current_el();

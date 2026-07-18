@@ -215,6 +215,20 @@ pcieprobe = []
 # arch_arm64.md §ORIN-NET-2 and scripts/orin-net2-bench.md.
 pcie2 = []
 
+# ORIN-NET-3: the `UNAOS_PCIE3=1` PS-widen + controller-0 link bring-up + device enumeration recon
+# (arch/aarch64/pcie_probe.rs `census2` pcie3 blocks + mmu_tegra PS widen). This is the lane's FIRST
+# DELIBERATE FABRIC WRITE arc, in exactly three write classes: (M1) widen the tegra regime's TCR
+# PS/IPS 36->40-bit so `map_mmio_window` can reach controller-0's ECAM (`0x2e_2000_0000`, ~184 GiB,
+# above the NET-2 36-bit / 64 GiB ceiling); (M2) the appl LTSSM enable sequence on controller 0 ONLY
+# (Linux pcie-tegra194 = the sequence's documentation of record), polling DLL-active with a finite
+# backstop; (M3) the all-ones/readback BAR-sizing ritual on the enumerated device's BARs, restoring
+# each original immediately. Every fabric write is logged loudly before issue. Builds on the `pcie2`
+# machinery (implies it); the metal M2/M3 writes are additionally `tegra`-gated, so a `pcie3`-standalone
+# virt build performs no MMIO and only witnesses the PS-widen mapping decision + graceful skip. OFF
+# (default) => the module blocks + call sites vanish, byte-identical to baseline modulo the ratified
+# 1-byte Location class. See arch_arm64.md §ORIN-NET-3 and scripts/orin-net3-bench.md.
+pcie3 = ["pcie2"]
+
 # CORE3-PROBE: instrument the aarch64 secondary-core entry stub (`_secondary_start`) to raw-dump,
 # MMU-off / no-stack, each core's MPIDR_EL1 low byte, CurrentEL, and its arrival x0 to the Pi 4 PL011
 # (0xFE201000) BEFORE any Rust runs. Disambiguates the CORE3-SMP >1 MiB core-3 regression (firmware

@@ -4716,6 +4716,112 @@ secondaries + idle/busy heartbeat + VUG-HONESTY PASS (both knob-off AND `PCIE2`-
 witnesses the graceful skip); `kernel8-test` 0-FAIL; `esp-jetson` (+`UNAOS_PCIE2=1`) links. Bench
 runbook: `scripts/orin-net2-bench.md`.
 
+### ORIN-NET-3 — PS widen + controller-0 link bring-up + device enumeration (`UNAOS_PCIE3`, knob-gated; the lane's first fabric writes)
+
+NET-2 named the exact blockers: controller-0's ECAM (`0x2e_2000_0000`, ~184 GiB) and MMIO `ranges`
+(~200–212 GiB) sit **above** the tegra regime's 36-bit PS output ceiling, and the link is expected DOWN
+as firmware leaves it. NET-3 removes the ceiling, brings the link up, and identifies what is behind it —
+the last step before a NIC driver arc. It is the lane's **first deliberate fabric-write arc**, and it
+performs writes in **exactly three classes**, each announced on serial *before* it is issued:
+
+| # | write class | where | what |
+|---|---|---|---|
+| M1 | **TCR PS/IPS widen 36→40-bit** | `mmu_tegra` (EL2 + EL1 fallback) + `boot_tegra` (post-drop EL1) | one system-register field (PS `0b001→0b010`) programmed at MMU-enable, knob-gated; lets `map_mmio_window` reach the ECAM |
+| M2 | **appl LTSSM enable** | controller 0 `appl` block, `APPL_CTRL` bit 7 | one read-modify-write to set `LTSSM_EN`, then poll DLL-active (finite backstop) |
+| M3 | **BAR sizing ritual** | the enumerated device's BARs (via ECAM) | per BAR: all-ones probe → readback → **restore original immediately** |
+
+Everything else stays read-only: **no** driver bind, **no** bus-master/MEM decode enable, **no** MSI, **no**
+DMA, **no** writes to any other controller, **no** PERST/PHY reprogramming beyond the LTSSM enable. Recon
+stops at "device identified, BARs sized, link state recorded." Poison-rejection (PI-V3D-1) guards every
+identity read. Any RAS/SError raised by a write lands in the `mmu_tegra` Part-C / healed `exceptions.rs`
+vectors (recorded syndrome + spin) — that IS the STOP-record for an unexpected fabric fault. All code is
+behind the `pcie3` cargo feature (`UNAOS_PCIE3=1`), which **implies `pcie2`** (it builds on NET-2's
+`census2` / `map_mmio_window` machinery); the metal M2/M3 writes are additionally `tegra`-gated.
+
+**M1 — the PS widen, and the two ceilings.** The tegra regime maps PA via 1 GiB L1 blocks. NET-2's
+`TCR_EL2` PS field was `0b001` = 36-bit = **64 GiB output ceiling**, so a block descriptor for the ECAM
+(~184 GiB output) raised an address-size fault and `map_mmio_window` **refused** it (`BeyondPsCeiling`).
+NET-3 widens PS to `0b010` = 40-bit = **1 TiB output ceiling** (`TCR_EL2_ACTIVE` / `TCR_EL1_ACTIVE`,
+knob-gated), so the MMU may *emit* the 38-bit output addresses. Crucially the widen flips **only the
+output field, not `T0SZ`** — the L1 table still spans **512 GiB** (512 entries × 1 GiB, 39-bit VA), and
+that is enough VA to identity-map every controller-0 aperture (max ~212 GiB). So after the widen there are
+**two** reachability limits, and `map_mmio_window` enforces both:
+
+- **PS output ceiling** — `PS_OUTPUT_CEILING_GIB` (64 knob-off, **1024** under `pcie3`).
+- **L1 table VA extent** — `L1_GIB_EXTENT = 512` (the array-safety guard: `l1.add(gi)` is only in
+  bounds for `gi < 512`, regardless of the wider PS ceiling).
+
+The tighter of the two binds: after the widen it is the **512-GiB table extent**, comfortably above every
+controller-0 aperture. The audit of the old 64-GiB constant (`grep PS_GIB_CEILING`) confirmed the only
+MMIO-ceiling site was `map_mmio_window`; the remaining `< 64` bounds (`build_l1`'s `ram_gib_mask`,
+`map_fb_region`'s DRAM bound, `gib_mapped`) are RAM/framebuffer data-structure widths (Orin RAM/scanout ≤
+~10 GiB), independent of the MMIO output ceiling — deliberately unchanged.
+
+Applied to controller 0 under `pcie3`:
+
+| region | base | NET-2 reach (36-bit) | NET-3 reach (40-bit) |
+|---|---|---|---|
+| `appl` / `config` / `dbi` | `0x140a_0000` / `0x2a00_0000` / `0x2a08_0000` | AlreadyMapped (GiB-0) | AlreadyMapped |
+| `ecam` | `0x2e_2000_0000` (256 MiB, ~184 GiB) | **BeyondPsCeiling** | **Mapped** (new Device-nGnRE block) |
+
+**M2 — link bring-up (controller 0 only).** With the link left down by firmware, NET-3 runs the `appl`
+LTSSM-enable sequence — **Linux `drivers/pci/controller/dwc/pcie-tegra194.c` is the documentation of
+record**. The single write sets `APPL_CTRL.LTSSM_EN` (bit 7); we then poll **DLL-active** via the RP's DBI
+PCIe-capability Link Status (the NET-2 read path) *and* the appl-side `APPL_LINK_STATUS.RDLH_LINK_UP`
+mirror, with a bounded spin backstop, and record the `APPL_DEBUG` LTSSM state (`0x11` = L0) either way. A
+still-down link after a correct enable is an **honest hardware result** — recorded, not improvised;
+further bring-up (PERST deassert / PHY retrain) is beyond the M2 enable sequence and this arc's three write
+classes.
+
+**M3 — enumerate + BAR sizing.** With the link up, NET-3 enumerates the downstream device through the
+**now-mapped ECAM** (`ecam_base + (1<<20)` = bus1:dev0:fn0 — the direct hardware config window M1
+unlocked, so **no iATU CFG-region fabric write** is needed, the blocker NET-2 flagged), poison-rejecting
+the identity read. It then runs the standard **all-ones/readback BAR-sizing ritual** on that device's
+BARs — writing `0xffffffff`, reading the size mask, and **restoring the original immediately** — handling
+32- and 64-bit memory BARs, per-BAR write announced. No decode-enable, no driver bind.
+
+**QEMU vs metal — the honesty boundary.** QEMU `virt` models **no Tegra234 RC**, so — exactly as NET-2 —
+all link/device answers are **attended-metal**. The tegra TCR widen is only programmed on the metal boot;
+QEMU's gates are two: (1) `census2`'s **graceful skip** (`dtb_addr = 0` on the GICv3 handoff), and (2) a
+dedicated **PS-widen mapping witness** (`ps_widen_witness`, on the GICv3 virt path) that exercises the real
+`map_mmio_window` reach ceiling and **inverts NET-2's regression** — the ECAM that NET-2 refused is now
+reachable, and refusal persists above the reachable range:
+
+```
+:: PCIE3: ORIN-NET-3 PS-widen mapping witness (QEMU virt; the tegra TCR widen itself is metal-only) ::
+:: PCIE3:   ECAM 0x2e20000000 (+0x10000000, GiB 184): REACHABLE (NET-2 BeyondPsCeiling refusal INVERTED by the 40-bit widen) ::
+:: PCIE3:   refusal preserved: @512GiB(table-extent)=true @1TiB(>40-bit)=true ::
+:: PCIE3: ORIN-NET-3 PS-widen witness: PASS ::
+```
+
+On `virt` the `mmu_tegra` L1 statics are **not** the active regime (the boot core translates through
+`boot_virt`'s table), so the descriptor the witness writes into the inert static is functionally invisible
+— it observes only the returned reach classification. Everything past that (the appl LTSSM enable, the
+downstream device identity, the BAR sizes) is **ATTENDED-METAL-PENDING**; the recon is staged as a tar for
+a consolidated sitting (`scripts/orin-net3-bench.md`).
+
+**The fabric-write ledger (every deliberate write this arc adds).** (M1) `TCR_EL2`/`TCR_EL1` PS/IPS
+`0b001→0b010` at MMU-enable (system-register, knob-gated) + the Device-nGnRE **page-table descriptor** for
+the ECAM GiB that `map_mmio_window` now installs. (M2) one `APPL_CTRL |= LTSSM_EN` read-modify-write on
+controller 0. (M3) per enumerated BAR, an all-ones probe write **and** an immediate restore write (≤ 2 per
+32-bit BAR, ≤ 4 for a 64-bit pair). That is the complete set; nothing else touches fabric, config, or
+system registers.
+
+**Byte-identity (knob-off) — the ratified 1-byte Location class.** Knob-off (`pcie3` and `pcie2` both off)
+the module blocks + all call sites are compiled out. The `TCR_*_ACTIVE` constants fold to the exact NET-2
+literals (so `enable_el2`/`enable_el1`/the drop program identical values and the `mmu-regs` banner is
+unchanged), and the added `#[cfg]` source lines shift the `#[track_caller]` Location `line` field of the
+`jb2b_attach` call below them — the same ratified 1-byte class NET-1/NET-2 disclosed. Verified per-section
+against baseline `3fe218a` (knob-off `esp-jetson kernel.elf`): **`.text` (538896 B), `.rodata`, `.data`,
+`.got` byte-identical**; **`.data.rel.ro` differs by exactly one byte** — a single `core::panic::Location`
+`line` low byte `0x7a → 0x87` (the `#[cfg(pcie3)]`/comment lines added before the `jb2b_attach` site shift
+its `#[track_caller]` line number). The loadable image is unchanged but for that one Location literal.
+
+**Gates green.** `./arroyo check` both arches × {knob-off, `PCIE3`, `PCIE3`+`TEGRA`} (zero net-new
+warnings on every combo); `test-arm 22` MISSION SUCCESS; `UNAOS_GICV3=1 test-arm 40` CAPSTONE 6/6 +
+VUG-HONESTY PASS (knob-off **and** `PCIE3`-on — the on run witnesses the census2 graceful skip **and** the
+PS-widen witness PASS); `kernel8-test` 0-FAIL. Bench runbook: `scripts/orin-net3-bench.md`.
+
 ### ORIN-SMP idle-heartbeat — the parked-core pinned-bar fix (per-core telemetry honesty)
 
 > Numbering note: the spawning round labelled this arc "SMP-6", but SMP-6/7/8 are already merged

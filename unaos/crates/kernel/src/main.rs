@@ -199,6 +199,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             ram_gib_mask: jc3_ram_gib_mask,
         });
 
+        // ORIN-NET-3 (QEMU PS-widen mapping WITNESS, `UNAOS_PCIE3=1`): the metal TCR widen is only
+        // programmed on the tegra boot, but the DECISION it changes — `map_mmio_window`'s reach
+        // ceiling — is exercised here. The witness inverts NET-2's regression: the controller-0 ECAM
+        // (~184 GiB) that NET-2 refused must now be REACHABLE, and refusal must persist above the
+        // reachable range. Prints `ORIN-NET-3 PS-widen witness: PASS`. Compiled out knob-off. See
+        // arch_arm64.md §ORIN-NET-3.
+        #[cfg(feature = "pcie3")]
+        unaos_kernel::arch::pcie_probe::ps_widen_witness();
+
         // JC3: with the JC2 SMP proof complete (the secondaries are parked at EL2 in their WFI loop), drop
         // the BOOT CORE EL2 -> EL1 and run the scheduler + full M4 CAPSTONE there — the QEMU-testable proof
         // that the scheduler and all six sync primitives run at EL1 on the GICv3 `virt` path. Sequenced
@@ -1297,6 +1306,10 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     // JB2b xHCI work. Reads controller-0 link state from the RP's DBI config space and, for a live link,
     // walks one level below; the ONLY writes are Device-nGnRE page-table mappings. Compiled out
     // knob-off, so the default tegra image stays byte-identical to baseline. See arch_arm64.md §ORIN-NET-2.
+    //
+    // ORIN-NET-3 (`UNAOS_PCIE3=1`, implies `pcie2`) extends this SAME `census2` call in place: the M1 PS
+    // widen makes the ECAM reachable, and the metal `net3_*` path then performs the arc's three
+    // fabric-write classes (appl LTSSM enable + BAR sizing, each logged before issue). See §ORIN-NET-3.
     #[cfg(feature = "pcie2")]
     unaos_kernel::arch::pcie_probe::census2(&unaos_kernel::arch::pcie_probe::PcieCtx {
         dtb_addr,
