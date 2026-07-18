@@ -65,6 +65,8 @@ const TAG_GET_CLOCK_RATE: u32 = 0x0003_0002; // M6g: query a clock's current rat
 #[cfg(feature = "v3d")]
 const TAG_SET_DOMAIN_STATE: u32 = 0x0003_8030; // set a power-domain's on/off state (value {domain, state})
 #[cfg(feature = "v3d")]
+const TAG_SET_CLOCK_STATE: u32 = 0x0003_8001; // enable/disable a clock's GATE (value {clock_id, state})
+#[cfg(feature = "v3d")]
 const TAG_SET_CLOCK_RATE: u32 = 0x0003_8002; // set a clock's rate (value {clock_id, rate_hz, skip_turbo})
 const TAG_END: u32 = 0x0000_0000;
 
@@ -271,6 +273,34 @@ pub fn set_power_domain(domain: u32, state: u32) -> Option<u32> {
         return None;
     }
     Some(reply(6))
+}
+
+/// PI-V3D-2: enable or disable a firmware-managed clock's GATE (RPi firmware property tag
+/// `SET_CLOCK_STATE`, `0x00038001`). Distinct from `set_clock_rate`, which programs the *frequency*
+/// but does NOT touch the enable gate — the firmware treats rate and state independently, so a clock
+/// can have a rate set while still gated OFF. In that state the block it feeds is powered-but-unclocked
+/// and its registers read open-bus poison (`0xdeadbeef`): exactly the PI-V3D-1 metal false-pass, where
+/// power + rate both ACKed yet the V3D never decoded. Reply `state`: bit0 = clock active, bit1 = clock
+/// not present. Returns `Some(true)` if the firmware reports the clock present AND active,
+/// `Some(false)` if present-but-off, `None` on a mailbox failure or an absent clock.
+#[cfg(feature = "v3d")]
+pub fn set_clock_state(clock_id: u32, on: bool) -> Option<bool> {
+    request(0, 8 * 4); // total size (8 words used)
+    request(1, 0); // request
+    request(2, TAG_SET_CLOCK_STATE);
+    request(3, 8); // value buffer size (2 words: clock_id, state)
+    request(4, 0); // request code
+    request(5, clock_id);
+    request(6, if on { 1 } else { 0 }); // reply: achieved state (bit0 active, bit1 not-present)
+    request(7, TAG_END);
+    if !mbox_call(8) {
+        return None;
+    }
+    let state = reply(6);
+    if state & 0x2 != 0 {
+        return None; // firmware reports the clock not present
+    }
+    Some(state & 0x1 != 0)
 }
 
 /// PI-V3D-1: set a firmware-managed clock's rate in Hz. Returns the rate the firmware actually

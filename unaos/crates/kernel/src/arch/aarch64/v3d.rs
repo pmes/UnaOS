@@ -176,31 +176,65 @@ pub fn bringup(fb: Option<FbTarget>) {
         }
     }
     match mailbox::set_clock_rate(mailbox::CLOCK_ID_V3D, 500_000_000) {
-        Some(hz) => serial_println!(":: V3D: clock id {} set to {} Hz ::", mailbox::CLOCK_ID_V3D, hz),
+        Some(hz) => serial_println!(":: V3D: clock id {} rate set to {} Hz ::", mailbox::CLOCK_ID_V3D, hz),
         None => {
-            serial_println!(":: V3D: clock set FAILED — skipping GPU bring-up ::");
+            serial_println!(":: V3D: clock rate set FAILED — skipping GPU bring-up ::");
+            return;
+        }
+    }
+    // Open the clock GATE. `set_clock_rate` above programs the *frequency* but the RPi firmware treats
+    // rate and enable-state independently: a rate-set-but-gated clock leaves V3D powered-but-unclocked,
+    // and its registers then read open-bus poison (0xdeadbeef). THIS is the PI-V3D-1 metal false-pass
+    // gap — power + rate both ACKed, yet the block never decoded. Open the gate explicitly and require
+    // the firmware to confirm the clock present AND active.
+    match mailbox::set_clock_state(mailbox::CLOCK_ID_V3D, true) {
+        Some(true) => serial_println!(":: V3D: clock id {} gate ENABLED (active) ::", mailbox::CLOCK_ID_V3D),
+        other => {
+            serial_println!(
+                ":: V3D: clock gate did not report active (got {:?}) — skipping GPU bring-up ::",
+                other
+            );
             return;
         }
     }
 
-    // Presence gate — the SOLE V3D thing QEMU raspi4b exercises, and it MUST NOT fault. We read the
-    // HUB IDENT0 register FIRST and decide on it alone. Empirically, QEMU raspi4b responds at the hub
-    // base 0xFEC00000 (returns a non-live 0) but the V3D CORE block at +0x4000 is UNMAPPED and a read
-    // there raises a synchronous external abort (EC=0x25). Since `AARCH64 EXCEPTION` is a forbidden
-    // regression pattern, we never touch a core register until the hub IDENT proves a live block. On
-    // metal the hub IDENT is live and we proceed; in QEMU it reads not-live and we skip cleanly,
-    // before any core access. (The Device window is MMU-mapped by boot.rs, so this is a bus/external
-    // abort from an unbacked address, not a translation fault — only a real V3D backs 0xFEC04000.)
-    let hub0 = mmio_read(V3D_HUB_BASE, V3D_HUB_IDENT0);
-    serial_println!(":: V3D: HUB_IDENT0 = {:#010x} ::", hub0);
-    if !ident_looks_live(hub0) {
-        serial_println!(
-            ":: V3D: absent (hub IDENT0 not live) — GPU bring-up skipped, graceful degradation (expected in QEMU) ::"
-        );
-        return;
+    // Let the freshly powered + clocked block settle before its first register read (a bounded
+    // wall-clock delay off CNTPCT — finite by construction, never an unbounded spin).
+    settle_ms(2);
+
+    // Poison-honest presence gate — the SOLE V3D thing QEMU raspi4b exercises, and it MUST NOT fault.
+    // We read HUB IDENT0 FIRST and decide on it alone, because a core-register read on an absent block
+    // raises a synchronous external abort (EC=0x25) — and `AARCH64 EXCEPTION` is a forbidden regression
+    // pattern. The probe discriminates THREE fail-safe verdicts (PI-V3D-1's false-pass was a gate that
+    // only rejected zero and so accepted the 0xdeadbeef firmware fill as "present"):
+    //   * BLOCK-UP   — a live, non-poison identity word  → proceed to the core registers.
+    //   * BLOCK-DOWN — 0x00000000 (absent/unpowered; QEMU raspi4b's hub-base read) → skip cleanly.
+    //   * BUS-POISON — 0xdeadbeef / 0xffffffff open-bus/firmware fill, NOT a live register → skip
+    //                  (fail-closed). This is the value that false-PASSED on metal.
+    // BLOCK-DOWN and BUS-POISON both return BEFORE any core-register access, so neither can fault.
+    // (The Device window is MMU-mapped by boot.rs, so an absent read is a bus/external abort from an
+    // unbacked address, not a translation fault — only a real V3D backs 0xFEC04000.)
+    match probe_hub_ident0() {
+        V3dPresence::Up(v) => serial_println!(
+            ":: V3D: probe verdict BLOCK-UP — hub IDENT0 = {:#010x} (live V3D identity) ::",
+            v
+        ),
+        V3dPresence::Down => {
+            serial_println!(
+                ":: V3D: probe verdict BLOCK-DOWN — hub IDENT0 = 0x00000000 (block absent/unpowered; expected in QEMU raspi4b) — GPU bring-up skipped, graceful degradation ::"
+            );
+            return;
+        }
+        V3dPresence::Poison(v) => {
+            serial_println!(
+                ":: V3D: probe verdict BUS-POISON — hub IDENT0 = {:#010x} (open-bus/firmware fill, NOT a live register — the powered+clocked path did not bring the block up) — GPU bring-up skipped, fail-closed ::",
+                v
+            );
+            return;
+        }
     }
 
-    // Hub is live → this is real silicon. Now the rest of the IDENT block + the core registers are
+    // Verdict BLOCK-UP → this is real silicon. Now the rest of the IDENT block + the core registers are
     // safe to read (they are backed on metal).
     let hub1 = mmio_read(V3D_HUB_BASE, V3D_HUB_IDENT1);
     let hub2 = mmio_read(V3D_HUB_BASE, V3D_HUB_IDENT2);
@@ -239,10 +273,58 @@ pub fn bringup(fb: Option<FbTarget>) {
     }
 }
 
-/// True if the hub IDENT0 register looks like a live V3D rather than QEMU's zero / bus-error read. A
-/// live block reports a non-zero, non-all-ones value; QEMU raspi4b returns 0 here.
-fn ident_looks_live(hub0: u32) -> bool {
-    hub0 != 0x0000_0000 && hub0 != 0xFFFF_FFFF
+/// The three discriminated outcomes of the V3D presence probe. Only `Up` proceeds past the gate.
+enum V3dPresence {
+    /// A live, non-poison hub identity word — real silicon with the block up.
+    Up(u32),
+    /// Hub IDENT0 reads 0x00000000 — block absent / unpowered (QEMU raspi4b's hub-base read).
+    Down,
+    /// Hub IDENT0 reads an open-bus / firmware-fill poison signature (`0xffffffff` / `0xdeadbeef`) —
+    /// NOT a live register. Carries the offending word for the metal log.
+    Poison(u32),
+}
+
+/// Open-bus / firmware-fill poison signatures on the BCM2711. NEITHER is ever live data:
+///   * `0xffffffff` — the classic unbacked-read / all-ones bus return.
+///   * `0xdeadbeef` — the VideoCore firmware's register/DRAM fill; the exact value the V3D core block
+///     returned at the PI-V3D-1 attended sitting, which the old zero-only gate FALSE-PASSED as live.
+/// (Mirrors `pcie_probe::is_poison`; kept local so the V3D lane owns its own liveness rule.)
+#[inline]
+fn is_poison(v: u32) -> bool {
+    v == 0xFFFF_FFFF || v == 0xDEAD_BEEF
+}
+
+/// Poison-honest presence probe: read HUB IDENT0 and classify it into one of the three verdicts.
+///
+/// A freshly powered/clocked block can take a moment to answer, so a poison read is retried within a
+/// short bounded settle window (never an unbounded spin) before it is called BUS-POISON — but a `0`
+/// read is a definitive BLOCK-DOWN (the QEMU-absent / unpowered signature) and returns at once. Any
+/// non-zero, non-poison word is a live identity → BLOCK-UP.
+fn probe_hub_ident0() -> V3dPresence {
+    // ~50 ms settle budget for a poison→live transition; finite off CNTPCT.
+    let deadline = super::timer::cntpct() + super::timer::cntfrq() / 20;
+    loop {
+        let v = mmio_read(V3D_HUB_BASE, V3D_HUB_IDENT0);
+        if v == 0x0000_0000 {
+            return V3dPresence::Down;
+        }
+        if !is_poison(v) {
+            return V3dPresence::Up(v);
+        }
+        if super::timer::cntpct() >= deadline {
+            return V3dPresence::Poison(v);
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// Busy-wait a bounded ~`ms` milliseconds off the free-running CNTPCT — a settling delay for a freshly
+/// powered/clocked block before its first register read. Finite by construction (the anti-hang rule).
+fn settle_ms(ms: u64) {
+    let deadline = super::timer::cntpct() + (super::timer::cntfrq() * ms) / 1000;
+    while super::timer::cntpct() < deadline {
+        core::hint::spin_loop();
+    }
 }
 
 /// M2: build a flat V3D page table that identity-maps ONLY the arena (every other PTE invalid), then
