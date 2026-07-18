@@ -112,6 +112,34 @@ pub enum SMessage {
         records: Vec<DispatchRecord>,
     },
 
+    // --- EDITOR (The Code Pane) ---
+    /// Load a document into the active editor pane. Fired when a file is
+    /// selected for editing; the macOS `MacOSSpline` router pushes `content`
+    /// into the editor `NSTextView` via `setString`. `path`/`language` let the
+    /// view label + (later) syntax-highlight the buffer.
+    EditorLoad {
+        path: Option<String>,
+        content: String,
+        language: String,
+    },
+    /// View → brain: the editor buffer changed (fired by the macOS
+    /// `EditorDelegate`'s `textDidChange`). Carries the full current buffer so
+    /// the brain can hold the live document without a separate read-back.
+    EditorEdited {
+        content: String,
+    },
+    /// View → brain: the user asked to save the active editor buffer (Cmd+S /
+    /// menu Save). The brain owns the actual write (path + persistence); this is
+    /// just the request signal.
+    EditorSaveRequest,
+
+    // --- CONSOLE (The Bottom Pane) ---
+    /// Brain → view: append one line to the read-only console output pane.
+    ConsoleAppend(String),
+    /// View → brain: the user submitted a line in the console input field
+    /// (Enter). The brain routes/executes it (e.g. into `midden`).
+    ConsoleInput(String),
+
     // --- MIDDEN (The Terminal) ---
     NoOp,
     TerminalOutput(String),

@@ -6,6 +6,7 @@ license = "LGPL-3.0-or-later"
 
 [features]
 default = []
+gtk = ["dep:gtk4", "dep:glib"]
 
 [[bin]]
 name = "vaire"
@@ -23,8 +24,6 @@ toml = "0.9"
 gix = { version = "0.80", default-features = false, features = ["parallel", "revision", "blob-diff", "status"] }
 # The vault-probe rides UnaFS's fail-closed mount check (read-only, host-native).
 unafs = { path = "../../unaos/libs/fs/unafs" }
-# elexar uses glib/gtk by default, we need to disable that if we are testing in isolation
-elessar = { path = "../../libs/elessar", default-features = false }
 gtk4 = { version = "0.10.3", features = ["v4_12"], optional = true }
 glib = { version = "0.21", optional = true }
 

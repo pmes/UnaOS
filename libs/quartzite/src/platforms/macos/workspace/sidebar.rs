@@ -29,6 +29,11 @@ pub struct UnaMatrixNodeIvars {
     pub label: RefCell<String>,
     pub children: RefCell<Vec<Retained<UnaMatrixNode>>>,
     pub is_expanded: RefCell<bool>,
+    /// True when `node_id` is a directory on disk. Topology rebroadcasts carry
+    /// only *visible* rows, so a collapsed directory arrives childless —
+    /// expandability must come from the filesystem, not from loaded children,
+    /// or chevrons vanish after every rebuild.
+    pub is_dir: RefCell<bool>,
 }
 
 define_class!(
@@ -45,11 +50,26 @@ define_class!(
                 label: RefCell::new(String::new()),
                 children: RefCell::new(Vec::new()),
                 is_expanded: RefCell::new(false),
+                is_dir: RefCell::new(false),
             });
             unsafe { msg_send![super(this), init] }
         }
     }
 );
+
+/// Recursively re-apply expansion state after a `reloadData` (which collapses
+/// everything). Only descends into expanded nodes — collapsed subtrees keep
+/// their native default.
+pub fn restore_expansion(outline_view: &NSOutlineView, node: &Retained<UnaMatrixNode>) {
+    if *node.ivars().is_expanded.borrow() {
+        unsafe {
+            let _: () = msg_send![outline_view, expandItem: &**node];
+        }
+        for child in node.ivars().children.borrow().iter() {
+            restore_expansion(outline_view, child);
+        }
+    }
+}
 
 impl UnaMatrixNode {
     pub fn build_from(rust_node: &TopologyNode) -> Retained<Self> {
@@ -59,6 +79,9 @@ impl UnaMatrixNode {
         *node.ivars().node_id.borrow_mut() = rust_node.id.clone();
         *node.ivars().label.borrow_mut() = rust_node.label.clone();
         *node.ivars().is_expanded.borrow_mut() = rust_node.is_expanded;
+        *node.ivars().is_dir.borrow_mut() = std::fs::metadata(&rust_node.id)
+            .map(|m| m.is_dir())
+            .unwrap_or(false);
 
         let mut children = Vec::new();
         for child in &rust_node.children {
@@ -76,6 +99,23 @@ impl UnaMatrixNode {
 pub struct SidebarDelegateIvars {
     pub roots: RefCell<Vec<Retained<UnaMatrixNode>>>,
     pub outline_view: RefCell<Option<Retained<NSOutlineView>>>,
+    /// UI → brain sender. Selection changes fire `ToggleMatrixNode(id)` so the
+    /// brain sees file activations (the GTK/Qt sidebars already do this; the
+    /// macOS outline handled expand/collapse natively and never reported
+    /// clicks until now).
+    pub tx_event: RefCell<Option<async_channel::Sender<bandy::SMessage>>>,
+    /// True while `restore_expansion` re-applies expansion after a reload;
+    /// programmatic expandItem/collapseItem fire the same DidExpand/DidCollapse
+    /// notifications as user chevron clicks, and echoing those back to the
+    /// brain would toggle its state right back (feedback loop).
+    pub suppress_expand_events: RefCell<bool>,
+    /// Collapse-burst root. AppKit consults shouldCollapseItem for the user's
+    /// item FIRST, then for each expanded descendant (trace-verified
+    /// 2026-07-18); only the first may reach the brain — reporting descendants
+    /// erases the nested expansion state that restores the shape on reopen.
+    /// Set on the burst's first shouldCollapse, cleared by the root's own
+    /// DidCollapse (which fires last, deepest-first order).
+    pub collapse_burst_root: RefCell<Option<String>>,
 }
 
 define_class!(
@@ -90,6 +130,9 @@ define_class!(
             let this = this.set_ivars(SidebarDelegateIvars {
                 roots: RefCell::new(Vec::new()),
                 outline_view: RefCell::new(None),
+                tx_event: RefCell::new(None),
+                suppress_expand_events: RefCell::new(false),
+                collapse_burst_root: RefCell::new(None),
             });
             unsafe { msg_send![super(this), init] }
         }
@@ -120,10 +163,13 @@ define_class!(
             item: &AnyObject,
         ) -> objc2::runtime::Bool {
             let node = unsafe { Retained::cast_unchecked::<UnaMatrixNode>(Retained::retain(item as *const AnyObject as *mut AnyObject).unwrap()) };
-            if node.ivars().children.borrow().is_empty() {
-                objc2::runtime::Bool::NO
-            } else {
+            // Directories are always expandable even when a rebuild delivered
+            // them childless (collapsed dirs carry no children in the
+            // visible-rows broadcast); their children arrive on expand.
+            if !node.ivars().children.borrow().is_empty() || *node.ivars().is_dir.borrow() {
                 objc2::runtime::Bool::YES
+            } else {
+                objc2::runtime::Bool::NO
             }
         }
 
@@ -163,6 +209,42 @@ define_class!(
 
     // --- Outline View Delegate ---
     unsafe impl NSOutlineViewDelegate for SidebarDelegate {
+        /// Fires on every selection change (single click). Reports the selected
+        /// node's id to the brain as `ToggleMatrixNode` — the brain decides what
+        /// a click means (file → editor load, directory → topology bookkeeping).
+        #[unsafe(method(outlineViewSelectionDidChange:))]
+        fn outline_view_selection_did_change(&self, _notification: &objc2_foundation::NSNotification) {
+            // reloadData can move selection; don't echo synthetic selection
+            // changes back to the brain (same guard as DidExpand/DidCollapse).
+            if *self.ivars().suppress_expand_events.borrow() {
+                return;
+            }
+            let Some(outline_view) = self.ivars().outline_view.borrow().clone() else { return };
+            let row: NSInteger = unsafe { msg_send![&*outline_view, selectedRow] };
+            if row < 0 {
+                return;
+            }
+            let item: *mut AnyObject = unsafe { msg_send![&*outline_view, itemAtRow: row] };
+            if item.is_null() {
+                return;
+            }
+            let node = unsafe {
+                Retained::cast_unchecked::<UnaMatrixNode>(Retained::retain(item).unwrap())
+            };
+            // Selection is a *focus* gesture and only files report it (the
+            // brain routes it to the editor). Directories must NOT fire here:
+            // collapsing a parent moves selection onto it, and reporting that
+            // as a toggle re-expanded the brain's node and reset the tree.
+            // Directory expansion is the chevron handlers' job alone.
+            if *node.ivars().is_dir.borrow() {
+                return;
+            }
+            let id = node.ivars().node_id.borrow().clone();
+            if let Some(tx) = self.ivars().tx_event.borrow().as_ref() {
+                let _ = tx.try_send(bandy::SMessage::ToggleMatrixNode(id));
+            }
+        }
+
         #[unsafe(method_id(outlineView:viewForTableColumn:item:))]
         fn outline_view_view_for_table_column_item(
             &self,
@@ -238,6 +320,49 @@ define_class!(
             Some(unsafe { Retained::cast_unchecked::<NSView>(cell) })
         }
 
+        /// Consulted only for the item the *user* targets (not for the
+        /// DidCollapse cascade AppKit fires for expanded descendants, and not
+        /// for programmatic expandItem during restore) — so this, not
+        /// DidExpand/DidCollapse, is where the brain gets told. Trace evidence
+        /// 2026-07-18: the cascade fires deepest-first with rows still live,
+        /// so no Did*-side filter can distinguish the user's click.
+        #[unsafe(method(outlineView:shouldExpandItem:))]
+        fn outline_view_should_expand_item(
+            &self,
+            _outline_view: &NSOutlineView,
+            item: &AnyObject,
+        ) -> objc2::runtime::Bool {
+            let node = unsafe { Retained::cast_unchecked::<UnaMatrixNode>(Retained::retain(item as *const AnyObject as *mut AnyObject).unwrap()) };
+            if !*self.ivars().suppress_expand_events.borrow() {
+                let id = node.ivars().node_id.borrow().clone();
+                if let Some(tx) = self.ivars().tx_event.borrow().as_ref() {
+                    let _ = tx.try_send(bandy::SMessage::ToggleMatrixNode(id));
+                }
+            }
+            objc2::runtime::Bool::YES
+        }
+
+        #[unsafe(method(outlineView:shouldCollapseItem:))]
+        fn outline_view_should_collapse_item(
+            &self,
+            _outline_view: &NSOutlineView,
+            item: &AnyObject,
+        ) -> objc2::runtime::Bool {
+            let node = unsafe { Retained::cast_unchecked::<UnaMatrixNode>(Retained::retain(item as *const AnyObject as *mut AnyObject).unwrap()) };
+            let id = node.ivars().node_id.borrow().clone();
+            if !*self.ivars().suppress_expand_events.borrow() {
+                let is_cascade = self.ivars().collapse_burst_root.borrow().as_ref()
+                    .is_some_and(|root| id.starts_with(&format!("{root}/")));
+                if !is_cascade {
+                    *self.ivars().collapse_burst_root.borrow_mut() = Some(id.clone());
+                    if let Some(tx) = self.ivars().tx_event.borrow().as_ref() {
+                        let _ = tx.try_send(bandy::SMessage::ToggleMatrixNode(id));
+                    }
+                }
+            }
+            objc2::runtime::Bool::YES
+        }
+
         #[unsafe(method(outlineViewItemDidExpand:))]
         fn outline_view_item_did_expand(&self, notification: &objc2_foundation::NSNotification) {
             unsafe {
@@ -247,6 +372,8 @@ define_class!(
 
                     if !item.is_null() {
                         let node = Retained::cast_unchecked::<UnaMatrixNode>(Retained::retain(item).unwrap());
+                        // Bookkeeping only — the brain is told in
+                        // shouldExpandItem (user-targeted items only).
                         *node.ivars().is_expanded.borrow_mut() = true;
                     }
                 }
@@ -262,7 +389,16 @@ define_class!(
 
                     if !item.is_null() {
                         let node = Retained::cast_unchecked::<UnaMatrixNode>(Retained::retain(item).unwrap());
-                        *node.ivars().is_expanded.borrow_mut() = false;
+                        // Bookkeeping is deliberately NOT done here: the
+                        // DidCollapse cascade covers expanded descendants whose
+                        // is_expanded must survive (it restores the shape when
+                        // the parent reopens). The burst root's own DidCollapse
+                        // fires last — it closes the burst window.
+                        let id = node.ivars().node_id.borrow().clone();
+                        let mut burst = self.ivars().collapse_burst_root.borrow_mut();
+                        if burst.as_deref() == Some(id.as_str()) {
+                            *burst = None;
+                        }
                     }
                 }
             }
@@ -276,10 +412,15 @@ unsafe impl NSControlTextEditingDelegate for SidebarDelegate {}
 // -----------------------------------------------------------------------------
 // ASSEMBLY
 // -----------------------------------------------------------------------------
-pub fn create_sidebar(_mtm: MainThreadMarker, workspace_state: &bandy::state::WorkspaceState) -> (Retained<NSView>, Retained<SidebarDelegate>) {
+pub fn create_sidebar(
+    _mtm: MainThreadMarker,
+    workspace_state: &bandy::state::WorkspaceState,
+    tx_event: async_channel::Sender<bandy::SMessage>,
+) -> (Retained<NSView>, Retained<SidebarDelegate>) {
     // 1. Instantiate the delegate
     let delegate: Allocated<SidebarDelegate> = unsafe { msg_send![SidebarDelegate::class(), alloc] };
     let delegate: Retained<SidebarDelegate> = unsafe { msg_send![delegate, init] };
+    *delegate.ivars().tx_event.borrow_mut() = Some(tx_event);
 
     // 1.5 Synchronous Initial Data Population
     if let bandy::state::ViewEntity::Topology(matrix_state) = &workspace_state.left_pane {

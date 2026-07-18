@@ -12,7 +12,7 @@ use tokio::sync::broadcast::Receiver as BroadcastReceiver;
 use bandy::state::AppState;
 use bandy::SMessage;
 use objc2_app_kit::{
-    NSSplitViewController, NSSplitViewItem, NSViewController
+    NSSplitViewController, NSSplitViewItem, NSViewController, NSSplitView, NSView,
 };
 use objc2_foundation::MainThreadMarker;
 use objc2::{msg_send, ClassType, DefinedClass};
@@ -21,6 +21,8 @@ use objc2::rc::{Retained, Allocated};
 
 use super::workspace::sidebar;
 use super::workspace::comms;
+use super::workspace::editor;
+use super::workspace::console;
 
 // -----------------------------------------------------------------------------
 // MAC OS SPLINE
@@ -53,7 +55,9 @@ impl MacOSSpline {
     ) -> (
         NativeView,
         Retained<sidebar::SidebarDelegate>,
-        Retained<comms::CommsDelegate>,
+        Option<Retained<comms::CommsDelegate>>,
+        Option<Retained<editor::EditorDelegate>>,
+        Option<Retained<console::ConsoleDelegate>>,
     ) {
         // 1. Build the UI
         let mtm = MainThreadMarker::new().unwrap();
@@ -69,7 +73,8 @@ impl MacOSSpline {
         }
 
         // --- Lumen Left Pane (Sidebar) ---
-        let (sidebar_view, sidebar_delegate) = sidebar::create_sidebar(mtm, _workspace_tetra);
+        let (sidebar_view, sidebar_delegate) =
+            sidebar::create_sidebar(mtm, _workspace_tetra, tx_event.clone());
         let sidebar_vc: Allocated<NSViewController> = unsafe { msg_send![NSViewController::class(), alloc] };
         let sidebar_vc: Retained<NSViewController> = unsafe { msg_send![sidebar_vc, init] };
         sidebar_vc.setView(&sidebar_view);
@@ -82,18 +87,58 @@ impl MacOSSpline {
             let _: () = msg_send![&sidebar_item, setMinimumThickness: 250.0f64];
         }
 
-        // --- Reactor Right Pane (Comms) ---
-        let (comms_view, comms_delegate) = comms::create_comms(mtm, &_app_state);
-        let comms_vc: Allocated<NSViewController> = unsafe { msg_send![NSViewController::class(), alloc] };
-        let comms_vc: Retained<NSViewController> = unsafe { msg_send![comms_vc, init] };
-        comms_vc.setView(&comms_view);
+        // --- Right Pane: Editor (Code layout) or Comms (Comms layout) ---
+        // The workspace's right pane selects which delegate we build; exactly one
+        // of `comms_delegate`/`editor_delegate` ends up `Some`. The editor gets
+        // the UI → brain sender so it can emit EditorEdited/EditorSaveRequest.
+        let (right_pane_view, comms_delegate, editor_delegate) = match &_workspace_tetra.right_pane {
+            bandy::state::ViewEntity::Editor(editor_state) => {
+                let (editor_view, editor_delegate) = editor::create_editor(mtm, editor_state, tx_event.clone());
+                (editor_view, None, Some(editor_delegate))
+            }
+            _ => {
+                let (comms_view, comms_delegate) = comms::create_comms(mtm, &_app_state);
+                (comms_view, Some(comms_delegate), None)
+            }
+        };
+
+        // --- Optional Bottom Pane: Console ---
+        // When the workspace requests a bottom pane, build the console and stack
+        // it *under* the right pane in a vertical split (horizontal divider). The
+        // console's input field gets its own clone of the UI → brain sender.
+        let (right_view, console_delegate): (Retained<NSView>, Option<Retained<console::ConsoleDelegate>>) =
+            if _workspace_tetra.bottom_pane.is_some() {
+                let (console_view, console_delegate) = console::create_console(mtm, tx_event.clone());
+
+                let stack: Allocated<NSSplitView> = unsafe { msg_send![NSSplitView::class(), alloc] };
+                let stack: Retained<NSSplitView> = unsafe { msg_send![stack, init] };
+                stack.setVertical(false); // horizontal divider → panes stack vertically
+                unsafe {
+                    let _: () = msg_send![&stack, setTranslatesAutoresizingMaskIntoConstraints: objc2::runtime::Bool::NO];
+                }
+                stack.addSubview(&right_pane_view);
+                stack.addSubview(&console_view);
+                unsafe {
+                    // Editor/comms takes the growth; console holds its size.
+                    let _: () = msg_send![&stack, setHoldingPriority: 250.0f32, forSubviewAtIndex: 0isize];
+                    let _: () = msg_send![&stack, setHoldingPriority: 750.0f32, forSubviewAtIndex: 1isize];
+                }
+                let stack_view = unsafe { Retained::cast_unchecked::<NSView>(stack) };
+                (stack_view, Some(console_delegate))
+            } else {
+                (right_pane_view, None)
+            };
+
+        let right_vc: Allocated<NSViewController> = unsafe { msg_send![NSViewController::class(), alloc] };
+        let right_vc: Retained<NSViewController> = unsafe { msg_send![right_vc, init] };
+        right_vc.setView(&right_view);
 
         // Define as main content item
-        let comms_item: Retained<NSSplitViewItem> = unsafe { msg_send![NSSplitViewItem::class(), splitViewItemWithViewController: &*comms_vc] };
+        let right_item: Retained<NSSplitViewItem> = unsafe { msg_send![NSSplitViewItem::class(), splitViewItemWithViewController: &*right_vc] };
 
         // Assemble the split view controller
         svc.addSplitViewItem(&sidebar_item);
-        svc.addSplitViewItem(&comms_item);
+        svc.addSplitViewItem(&right_item);
 
         // Prevent AppKit components from deallocation by attaching them to the root Window/run loop.
         // Anchor split_view_controller
@@ -110,7 +155,17 @@ impl MacOSSpline {
         // main-queue closures below run their UI work. This replaces the previous
         // `Retained::into_raw` → `usize` → `Retained::retain`/`cast_unchecked` round-trip
         // (which leaked a retain and reconstituted the object from a raw pointer each message).
-        let comms_bound = Arc::new(MainThreadBound::new(comms_delegate.clone(), mtm));
+        // The comms/editor delegates are mutually exclusive (one is `None`); bind
+        // whichever exists so the router can address it from the tokio task.
+        let comms_bound = comms_delegate
+            .as_ref()
+            .map(|d| Arc::new(MainThreadBound::new(d.clone(), mtm)));
+        let editor_bound = editor_delegate
+            .as_ref()
+            .map(|d| Arc::new(MainThreadBound::new(d.clone(), mtm)));
+        let console_bound = console_delegate
+            .as_ref()
+            .map(|d| Arc::new(MainThreadBound::new(d.clone(), mtm)));
         let sidebar_bound = Arc::new(MainThreadBound::new(sidebar_delegate.clone(), mtm));
 
         tokio::spawn(async move {
@@ -121,7 +176,7 @@ impl MacOSSpline {
                     Ok(msg) => {
                         match msg {
                             SMessage::StorageLoadPagedResult { records, .. } => {
-                                let comms_bound = comms_bound.clone();
+                                let Some(comms_bound) = comms_bound.clone() else { continue };
                                 dispatch2::DispatchQueue::main().exec_async(move || {
                                     let mtm = MainThreadMarker::new().unwrap();
                                     let comms_delegate = comms_bound.get(mtm);
@@ -153,7 +208,7 @@ impl MacOSSpline {
                                 });
                             },
                             SMessage::AiToken(token_string) => {
-                                let comms_bound = comms_bound.clone();
+                                let Some(comms_bound) = comms_bound.clone() else { continue };
                                 dispatch2::DispatchQueue::main().exec_async(move || {
                                     let mtm = MainThreadMarker::new().unwrap();
                                     let comms_delegate = comms_bound.get(mtm);
@@ -174,6 +229,22 @@ impl MacOSSpline {
                                     }
                                 });
                             },
+                            SMessage::EditorLoad { content, .. } => {
+                                let Some(editor_bound) = editor_bound.clone() else { continue };
+                                dispatch2::DispatchQueue::main().exec_async(move || {
+                                    let mtm = MainThreadMarker::new().unwrap();
+                                    let editor_delegate = editor_bound.get(mtm);
+                                    editor_delegate.set_content(&content);
+                                });
+                            },
+                            SMessage::ConsoleAppend(line) => {
+                                let Some(console_bound) = console_bound.clone() else { continue };
+                                dispatch2::DispatchQueue::main().exec_async(move || {
+                                    let mtm = MainThreadMarker::new().unwrap();
+                                    let console_delegate = console_bound.get(mtm);
+                                    console_delegate.append_line(&line);
+                                });
+                            },
                             SMessage::NetworkLog(_) => {
                                 dispatch2::DispatchQueue::main().exec_async(move || {
                                     // SMessage::NetworkLog routed to main thread.
@@ -188,34 +259,48 @@ impl MacOSSpline {
 
                                     match matrix_event {
                                         bandy::MatrixEvent::TopologyMutated(flat_tree) => {
-                                            use std::collections::HashMap;
                                             use bandy::state::TopologyNode;
 
-                                            // Reconstruct tree from flat list
-                                            let _nodes_by_depth: HashMap<usize, Vec<TopologyNode>> = HashMap::new();
-                                            let mut root_nodes = Vec::new();
+                                            // Reconstruct the tree from the flattened pre-order
+                                            // (id, label, depth) list. A node's children follow it
+                                            // with depth+1; the flat list only contains *visible*
+                                            // rows, so any node that arrives with children was
+                                            // expanded — mark it so expansion survives the reload.
+                                            fn attach(
+                                                node: TopologyNode,
+                                                stack: &mut Vec<(usize, TopologyNode)>,
+                                                roots: &mut Vec<TopologyNode>,
+                                            ) {
+                                                let mut node = node;
+                                                node.is_expanded = !node.children.is_empty();
+                                                match stack.last_mut() {
+                                                    Some((_, parent)) => parent.children.push(node),
+                                                    None => roots.push(node),
+                                                }
+                                            }
 
-                                            // Note: In a real implementation this reconstruction logic would be robust.
-                                            // Since we only have a flat representation here, we rebuild a simple list
-                                            // or correctly parsed tree if depth info is available. For demonstration,
-                                            // we will just populate the roots.
-
+                                            let mut root_nodes: Vec<TopologyNode> = Vec::new();
+                                            let mut stack: Vec<(usize, TopologyNode)> = Vec::new();
                                             for (id, label, depth) in flat_tree {
+                                                while stack.last().is_some_and(|(d, _)| *d >= depth) {
+                                                    let (_, done) = stack.pop().unwrap();
+                                                    attach(done, &mut stack, &mut root_nodes);
+                                                }
                                                 let node = TopologyNode {
                                                     id,
                                                     label,
                                                     children: Vec::new(),
                                                     is_expanded: false,
                                                 };
-                                                if depth == 0 {
-                                                    root_nodes.push(node);
-                                                } else {
-                                                    // Simple flat fallback for non-roots
-                                                    root_nodes.push(node);
-                                                }
+                                                stack.push((depth, node));
+                                            }
+                                            while let Some((_, done)) = stack.pop() {
+                                                attach(done, &mut stack, &mut root_nodes);
                                             }
 
-                                            use crate::platforms::macos::workspace::sidebar::UnaMatrixNode;
+                                            use crate::platforms::macos::workspace::sidebar::{
+                                                restore_expansion, UnaMatrixNode,
+                                            };
 
                                             let mut new_roots = Vec::new();
                                             for root in &root_nodes {
@@ -225,9 +310,17 @@ impl MacOSSpline {
                                             *sidebar_delegate.ivars().roots.borrow_mut() = new_roots;
 
                                             if let Some(outline_view) = sidebar_delegate.ivars().outline_view.borrow().as_ref() {
+                                                // Programmatic reload + re-expansion fires the same
+                                                // DidExpand/DidCollapse notifications as user clicks;
+                                                // suppress the brain echo for the duration.
+                                                *sidebar_delegate.ivars().suppress_expand_events.borrow_mut() = true;
                                                 unsafe {
                                                     let _: () = objc2::msg_send![&**outline_view, reloadData];
                                                 }
+                                                for root in sidebar_delegate.ivars().roots.borrow().iter() {
+                                                    restore_expansion(outline_view, root);
+                                                }
+                                                *sidebar_delegate.ivars().suppress_expand_events.borrow_mut() = false;
                                             }
                                         }
                                         _ => {}
@@ -244,6 +337,6 @@ impl MacOSSpline {
             }
         });
 
-        (root_view, sidebar_delegate, comms_delegate)
+        (root_view, sidebar_delegate, comms_delegate, editor_delegate, console_delegate)
     }
 }

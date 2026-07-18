@@ -348,10 +348,32 @@ impl Default for StreamState {
     }
 }
 
+/// Backing state for an editable text pane (the "Editor" ViewEntity).
+/// `path` is the file the buffer was loaded from (None = scratch buffer),
+/// `content` the current buffer text, `language` a syntax hint (e.g. "rust",
+/// "plaintext"). Serializable so it can ride the workspace snapshot.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EditorState {
+    pub path: Option<String>,
+    pub content: String,
+    pub language: String,
+}
+
+impl Default for EditorState {
+    fn default() -> Self {
+        Self {
+            path: None,
+            content: String::new(),
+            language: "plaintext".to_string(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ViewEntity {
     Topology(TopologyState),
     Stream(StreamState),
+    Editor(EditorState),
     Empty,
 }
 
@@ -360,6 +382,13 @@ pub struct WorkspaceState {
     pub left_pane: ViewEntity,
     pub right_pane: ViewEntity,
     pub split_ratio: f32,
+    /// Optional bottom pane, stacked *under* the right pane in a vertical split.
+    /// `None` = no bottom pane (the historical two-pane layout). `Some(_)` asks
+    /// the platform backend to build the bottom **console** pane (read-only
+    /// output + one-line input); the macOS `MacOSSpline` reads this at bootstrap.
+    /// Reuses `ViewEntity` for forward-compatibility; today any `Some` requests
+    /// the console.
+    pub bottom_pane: Option<ViewEntity>,
 }
 
 impl Default for WorkspaceState {
@@ -368,6 +397,7 @@ impl Default for WorkspaceState {
             left_pane: ViewEntity::Topology(TopologyState::default()),
             right_pane: ViewEntity::Stream(StreamState::default()),
             split_ratio: 0.25,
+            bottom_pane: None,
         }
     }
 }

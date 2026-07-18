@@ -115,6 +115,7 @@ fn main() {
         left_pane: bandy::state::ViewEntity::Topology(bandy::state::TopologyState::new(genesis_roots)),
         right_pane: bandy::state::ViewEntity::Stream(bandy::state::StreamState::default()),
         split_ratio: 0.25,
+        bottom_pane: None,
     };
 
     let workspace_state_clone = workspace_state.clone();

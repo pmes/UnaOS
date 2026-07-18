@@ -4,10 +4,14 @@ version = "0.1.0"
 edition = "2024"
 license = "LGPL-3.0-or-later"
 
+[features]
+# GTK console view is off by default so the portable `Midden` core builds on macOS.
+gtk = ["dep:gtk4", "dep:glib"]
+
 [dependencies]
 elessar = { path = "../../libs/elessar" }
 bandy = { path = "../../libs/bandy" }
 unafs = { path = "../../unaos/libs/fs/unafs" }
 anyhow = "1.0"
-gtk4 = { version = "0.10.3", features = ["v4_12"] }
-glib = "0.21"
+gtk4 = { version = "0.10.3", features = ["v4_12"], optional = true }
+glib = { version = "0.21", optional = true }
