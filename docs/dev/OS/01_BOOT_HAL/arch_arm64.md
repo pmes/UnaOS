@@ -5514,6 +5514,53 @@ discipline, and the no-alloc poll paths are the exact code the drivers carried. 
 CAPSTONE 6/6; `./arroyo test 22` still fires all x86 `SOCK-1..7`/`smolnet` witnesses (SOCK-1 ICMP 4/4 —
 the ARP-snoop path); `check` green across the full net4/tegra/vnet/smolnet feature matrix on both arches.
 
+### NET-DHCP — a shared DHCPv4 bring-up helper on the smoltcp seam (`crate::net_phy::dhcp_or_static`)
+
+Both aarch64 NIC seams originally bound their `Interface` to a **hard-coded static address** (VNET the
+slirp `10.0.2.15/24`; NET-4 the `192.168.1.2/24` placeholder flagged at the NET-4 landing as wrong,
+because "the link's real subnet is a metal input"). **NET-DHCP** is the do-it-right fix: a shared,
+arch-neutral helper — `net_phy::dhcp_or_static(prefix, iface, dev, now_ms, timeout_ms, static_ip,
+static_prefix, static_gw) -> NetConfig` — that runs smoltcp's `dhcpv4::Socket` over an already-built
+`Interface` until a lease is acquired or a bounded timeout elapses, then configures the interface **in
+place** and returns the settled `NetConfig { leased, ip, prefix_len, gw }` for the caller's witness.
+
+* **On lease** it applies the leased address + default route and emits
+  `NET: DHCP lease ip=<ip>/<prefix> gw=<gw> (server <srv>) => PASS`.
+* **On timeout** it emits an honest `NET: no lease within <n> ms — falling back to static <ip>/…` line
+  and applies the caller's static values — **the fallback is preserved**, so a link with no DHCP server
+  still comes up (the pre-DHCP behaviour is the honest last resort, not deleted).
+
+**Arch-neutral by construction.** The caller supplies a monotonic **millisecond clock** (`now_ms`) that
+drives *both* the smoltcp `Instant` fed to `poll` *and* the wall-clock timeout — so the bound is real
+time, not iteration count (VNET reads `CNTPCT` via its `now_us()/1000`; NET-4 metal reads `CNTPCT`
+directly in a module-local `now_ms()`, both at EL2 before the JC3 drop). The DHCP socket's storage is a
+single-slot `SocketSet` scoped to the call — entirely stack-local (no heap growth), dropped on return
+before the caller builds its own ICMP socket set. The socket-buffer-less `dhcpv4::Socket::new()` needs
+`socket-dhcpv4`, already in every smoltcp feature set the kernel declares. **x86 `smolnet` is untouched
+this arc** — the helper is trivially reusable there (a future fold: `smolnet` would call the same
+`dhcp_or_static` in place of its static bind).
+
+**VNET (M2, QEMU-proven).** `bind_and_ping` now calls `dhcp_or_static` first (3 s bound), then pings the
+gateway of whichever config it settled on. slirp's built-in DHCP server hands out the exact static
+values, so a healthy run **leases** them rather than falling back:
+
+```text
+:: AARCH64 VNET: NET: DHCP discover (timeout 3000 ms) ::
+:: AARCH64 VNET: NET: DHCP lease ip=10.0.2.15/24 gw=10.0.2.2 (server 10.0.2.2) => PASS ::
+:: AARCH64 VNET: ping 10.0.2.2 RTT 4248 us (4/4 sent, 4/4 replies) [dhcp] => PASS ::
+```
+
+Gate of record: `UNAOS_VNET=1 UNAOS_GICV3=1 ./arroyo test-arm 40` — DHCP lease PASS + ping 4/4 `[dhcp]`
+PASS + CAPSTONE 6/6, no `FAIL`.
+
+**NET-4 metal (M3, compile-tested off metal).** `bind_smoltcp` runs `dhcp_or_static` first (5 s bound)
+before the bounded bind-witness poll; the static `192.168.1.2/24` is now the fallback, not the primary.
+QEMU models no Tegra234 RC so this metal path never runs on virt — correctness is `check` across the
+net4/tegra matrix + the RTL8168/slirp seam equivalence VNET proves. The bench runbook's expected serial
+chain (`scripts/orin-net4-bench.md`) now carries the DHCP lines before the ring/ping expectations. On a
+devkit link with a DHCP server the witness line reports `[dhcp]`; on a DHCP-less link it reports
+`[static]` after the bounded fallback.
+
 ## PI-V3D — VideoCore VI (V3D 4.2) GPU foundation on the Pi 4 (Arc PI-V3D-1)
 
 The first GPU silicon UnaOS touches. The target is **not** a triangle: it proves the full

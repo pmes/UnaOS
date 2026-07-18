@@ -1028,12 +1028,29 @@ mod metal {
     /// `NET_DEVICE` registry; the smoltcp Device adapter reaches the rings through it.
     pub static NET4_DEVICE: spin::Mutex<Option<Rtl8168>> = spin::Mutex::new(None);
 
-    // ── Static bring-up addressing (no DHCP server on the devkit's link pre-config) ──
-    // The Orin devkit's NIC has no DHCP lease pre-metal; a static bring-up address lets the smoltcp
-    // interface bind and (on metal) exercise ARP/ICMP against the link. Placeholder values, revisited
-    // once the metal link's real subnet is known (documented in arch_arm64.md §ORIN-NET-4).
+    // ── Static FALLBACK addressing (used only if DHCP does not lease within the bounded timeout) ──
+    // NET-DHCP made the link's real subnet a DHCP input (the do-it-right fix for the NET-4-landing
+    // placeholder): `bind_smoltcp` runs a DHCPv4 client first and only falls back to these values if no
+    // lease arrives. They remain here as the honest last resort for a metal link with no DHCP server —
+    // the interface still comes up. Documented in arch_arm64.md §ORIN-NET-4.
     const OUR_IP: [u8; 4] = [192, 168, 1, 2];
     const GATEWAY_IP: [u8; 4] = [192, 168, 1, 1];
+    /// Bounded DHCP-lease timeout (ms). On a devkit link with a DHCP server the lease lands far inside
+    /// this; the bound caps how long a DHCP-less link stalls before the static fallback. The clock is
+    /// real time (CNTPCT), so this is non-hanging by construction.
+    const DHCP_TIMEOUT_MS: i64 = 5_000;
+
+    /// Monotonic millisecond clock from the free-running counter (CNTPCT). Readable at EL2, where
+    /// `net4_bringup` runs (before the JC3 EL2→EL1 drop); drives both smoltcp time and the DHCP timeout.
+    #[inline]
+    fn now_ms() -> i64 {
+        let (cnt, frq): (u64, u64);
+        unsafe {
+            core::arch::asm!("mrs {}, cntpct_el0", out(reg) cnt, options(nomem, nostack, preserves_flags));
+            core::arch::asm!("mrs {}, cntfrq_el0", out(reg) frq, options(nomem, nostack, preserves_flags));
+        }
+        if frq == 0 { 0 } else { (cnt.wrapping_mul(1_000) / frq) as i64 }
+    }
 
     // ── Raw L2 accessors over the NET4_DEVICE registry (the shared smoltcp Device seam) ──
 
@@ -1072,9 +1089,7 @@ mod metal {
     use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage};
     use smoltcp::socket::icmp;
     use smoltcp::time::Instant;
-    use smoltcp::wire::{
-        EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address,
-    };
+    use smoltcp::wire::{EthernetAddress, HardwareAddress};
 
     /// Bind a smoltcp `Interface` over the RTL8168 Device and poll it a bounded number of times — the
     /// x86 e1000/smolnet seam, transposed to aarch64/tegra. This PROVES the bind end-to-end (Device +
@@ -1087,21 +1102,19 @@ mod metal {
             serial_println!("{}   smoltcp bind SKIPPED — no NIC registered ::", P4);
             return;
         };
-        let our_ip = OUR_IP;
         let up = link_up();
         let mut dev = SmoltcpPhy::<Rtl8168Nic>::new();
         let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
         config.random_seed = 0x4e45_5434; // ASCII "NET4"
         let mut iface = Interface::new(config, &mut dev, Instant::from_millis(0));
-        iface.update_ip_addrs(|addrs| {
-            let _ = addrs.push(IpCidr::new(
-                IpAddress::v4(our_ip[0], our_ip[1], our_ip[2], our_ip[3]),
-                24,
-            ));
-        });
-        let _ = iface.routes_mut().add_default_ipv4_route(Ipv4Address::new(
-            GATEWAY_IP[0], GATEWAY_IP[1], GATEWAY_IP[2], GATEWAY_IP[3],
-        ));
+
+        // ── DHCP first: acquire a lease for the link's real subnet, else fall back to the static
+        //    placeholder (NET-DHCP — the do-it-right fix for the NET-4-landing static bring-up IP). The
+        //    helper configures the interface in place; the bounded witness poll below then exercises the
+        //    seam against whichever config it settled on. ──
+        let netcfg = crate::net_phy::dhcp_or_static(
+            P4, &mut iface, &mut dev, &now_ms, DHCP_TIMEOUT_MS, OUR_IP, 24, GATEWAY_IP,
+        );
 
         // One ICMP socket, so the poll has a real socket set to service (proves the full seam binds).
         let mut rx_meta = [icmp::PacketMetadata::EMPTY; 4];
@@ -1124,10 +1137,11 @@ mod metal {
             iface.poll(Instant::from_millis(clock), &mut dev, &mut sockets);
         }
         serial_println!(
-            "{}   smoltcp 0.13 Interface BOUND over RTL8168: MAC set, {}.{}.{}.{}/24 + default gw {}.{}.{}.{}, medium=ethernet, polled OK; link {} — live ICMP/ARP is attended-metal ::",
+            "{}   smoltcp 0.13 Interface BOUND over RTL8168: MAC set, {}.{}.{}.{}/{} + default gw {}.{}.{}.{} [{}], medium=ethernet, polled OK; link {} — live ICMP/ARP is attended-metal ::",
             P4,
-            our_ip[0], our_ip[1], our_ip[2], our_ip[3],
-            GATEWAY_IP[0], GATEWAY_IP[1], GATEWAY_IP[2], GATEWAY_IP[3],
+            netcfg.ip[0], netcfg.ip[1], netcfg.ip[2], netcfg.ip[3], netcfg.prefix_len,
+            netcfg.gw[0], netcfg.gw[1], netcfg.gw[2], netcfg.gw[3],
+            if netcfg.leased { "dhcp" } else { "static" },
             if up { "UP" } else { "DOWN" }
         );
     }

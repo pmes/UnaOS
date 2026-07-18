@@ -177,6 +177,123 @@ impl<N: RawNic, O: RxObserver> Device for SmoltcpPhy<N, O> {
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════════
+// NET-DHCP — a shared, arch-neutral DHCPv4 bring-up helper on the smoltcp seam.
+// ══════════════════════════════════════════════════════════════════════════════════════════════════
+//
+// Both aarch64 NIC seams (virtio-net under QEMU, RTL8168 on Orin metal) previously bound their smoltcp
+// `Interface` to a hard-coded STATIC address. That is wrong for a real link whose subnet is a metal
+// input (flagged at the ORIN-NET-4 landing). This helper runs smoltcp's `dhcpv4` socket over an already-
+// built `Interface` until a lease is acquired or a bounded timeout elapses, then configures the interface
+// in place — DHCP-leased on success, the caller's static values on timeout (fallback PRESERVED, so a
+// link with no DHCP server still comes up). It is arch-neutral: the caller supplies a monotonic
+// millisecond clock (which drives BOTH smoltcp's notion of time and the timeout) and the static
+// fallback. x86 `smolnet` could reuse this too (a future fold — it is not wired here).
+
+use smoltcp::iface::{Interface, SocketSet, SocketStorage};
+use smoltcp::socket::dhcpv4;
+use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address};
+
+/// The IPv4 configuration a [`dhcp_or_static`] bring-up settled on — either DHCP-leased or the static
+/// fallback. The caller reads it to drive its own witness (e.g. ping the gateway) against whichever
+/// config the interface actually took.
+#[derive(Clone, Copy)]
+pub struct NetConfig {
+    /// `true` if these values came from a DHCP lease; `false` if the static fallback was applied.
+    pub leased: bool,
+    /// The configured interface address.
+    pub ip: [u8; 4],
+    /// The configured prefix length (e.g. 24).
+    pub prefix_len: u8,
+    /// The default gateway / router.
+    pub gw: [u8; 4],
+}
+
+/// Apply an IPv4 address + default route to `iface` in place (replacing any prior config). Shared by
+/// both the DHCP-lease and the static-fallback paths so they configure the interface identically.
+fn apply_ipv4(iface: &mut Interface, ip: [u8; 4], prefix_len: u8, gw: [u8; 4]) {
+    iface.update_ip_addrs(|addrs| {
+        addrs.clear();
+        let _ = addrs.push(IpCidr::new(IpAddress::v4(ip[0], ip[1], ip[2], ip[3]), prefix_len));
+    });
+    iface.routes_mut().remove_default_ipv4_route();
+    let _ = iface
+        .routes_mut()
+        .add_default_ipv4_route(Ipv4Address::new(gw[0], gw[1], gw[2], gw[3]));
+}
+
+/// Run a DHCPv4 client over `iface`/`dev` until a lease is acquired or `timeout_ms` elapses, then
+/// configure the interface in place and return the settled [`NetConfig`].
+///
+/// * On lease: applies the leased address + default route, emits
+///   `<prefix> NET: DHCP lease ip=<ip>/<prefix> gw=<gw> (server <srv>) => PASS`, returns `leased=true`.
+/// * On timeout: emits an honest `no lease within <n>ms — falling back to static <ip>` line, applies
+///   the static config (the pre-DHCP behaviour — a DHCP-less link still comes up), returns `leased=false`.
+///
+/// `now_ms` is a monotonic millisecond clock supplied by the caller (each arch has its own time source);
+/// it drives BOTH the smoltcp `Instant` fed to `poll` and the wall-clock timeout, so the bound is real
+/// time, not iteration count. The DHCP socket's storage is entirely stack-local (no heap growth): a
+/// single-slot `SocketSet` scoped to this call, dropped on return before the caller builds its own.
+pub fn dhcp_or_static<D: Device>(
+    prefix: &str,
+    iface: &mut Interface,
+    dev: &mut D,
+    now_ms: &dyn Fn() -> i64,
+    timeout_ms: i64,
+    static_ip: [u8; 4],
+    static_prefix: u8,
+    static_gw: [u8; 4],
+) -> NetConfig {
+    let mut storage: [SocketStorage; 1] = Default::default();
+    let mut sockets = SocketSet::new(&mut storage[..]);
+    let handle = sockets.add(dhcpv4::Socket::new());
+
+    serial_println!("{} NET: DHCP discover (timeout {} ms) ::", prefix, timeout_ms);
+    let start = now_ms();
+    loop {
+        let t = now_ms();
+        iface.poll(Instant::from_millis(t), dev, &mut sockets);
+
+        match sockets.get_mut::<dhcpv4::Socket>(handle).poll() {
+            Some(dhcpv4::Event::Configured(cfg)) => {
+                let ip = cfg.address.address().octets();
+                let prefix_len = cfg.address.prefix_len();
+                // A lease without a router is honoured, but our witnesses need a gateway; fall back to
+                // the static gateway if the server offered none (rare, but keeps the route sane).
+                let gw = cfg.router.map(|r| r.octets()).unwrap_or(static_gw);
+                let srv = cfg.server.address.octets();
+                apply_ipv4(iface, ip, prefix_len, gw);
+                serial_println!(
+                    "{} NET: DHCP lease ip={}.{}.{}.{}/{} gw={}.{}.{}.{} (server {}.{}.{}.{}) => PASS ::",
+                    prefix,
+                    ip[0], ip[1], ip[2], ip[3], prefix_len,
+                    gw[0], gw[1], gw[2], gw[3],
+                    srv[0], srv[1], srv[2], srv[3],
+                );
+                return NetConfig { leased: true, ip, prefix_len, gw };
+            }
+            Some(dhcpv4::Event::Deconfigured) => {}
+            None => {}
+        }
+
+        if now_ms().saturating_sub(start) >= timeout_ms {
+            apply_ipv4(iface, static_ip, static_prefix, static_gw);
+            serial_println!(
+                "{} NET: no lease within {} ms — falling back to static {}.{}.{}.{}/{} gw {}.{}.{}.{} ::",
+                prefix, timeout_ms,
+                static_ip[0], static_ip[1], static_ip[2], static_ip[3], static_prefix,
+                static_gw[0], static_gw[1], static_gw[2], static_gw[3],
+            );
+            return NetConfig {
+                leased: false,
+                ip: static_ip,
+                prefix_len: static_prefix,
+                gw: static_gw,
+            };
+        }
+    }
+}
+
 /// Format a MAC as `xx:xx:xx:xx:xx:xx` for the boot log (no heap — a fixed stack buffer). Shared by the
 /// net drivers' bring-up witnesses.
 pub fn fmt_mac(mac: &[u8; 6]) -> [u8; 17] {
