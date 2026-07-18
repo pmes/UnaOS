@@ -128,6 +128,8 @@ mod metal {
     // ── INTERRUPT (0x30) bits (W1C). ──
     const INT_CMD_DONE: u32 = 1 << 0;
     const INT_DATA_DONE: u32 = 1 << 1;
+    #[cfg(feature = "sdmmc_arm")]
+    const INT_WRITE_RDY: u32 = 1 << 4; // Buffer Write Ready (host may push the PIO FIFO)
     const INT_READ_RDY: u32 = 1 << 5;
     const INT_ERR: u32 = 1 << 15;
     /// Any error: the error-summary bit OR any of the error-status bits [31:16].
@@ -618,14 +620,93 @@ mod metal {
         }
     }
 
+    /// Write one arbitrary block `lba` via polled single-block CMD24 (WRITE_SINGLE_BLOCK). Host->card
+    /// direction (DAT_DIR clear). Returns whether the block was written AND the card left the programming
+    /// (busy) state cleanly. The ONLY card-write primitive in the driver — reachable only from the ladder,
+    /// only under `sdmmc_arm`, only against a stashed scratch region.
+    #[cfg(feature = "sdmmc_arm")]
+    fn write_block_at(base: u64, card: &Card, lba: u64, buf: &[u8; 512]) -> bool {
+        let arg = if card.block_addressing { lba as u32 } else { (lba * 512) as u32 };
+        write32(base, INTERRUPT, 0xffff_ffff);
+        write32(base, BLKSIZECNT, (1 << 16) | 512);
+        // CMD24 WRITE_SINGLE_BLOCK: R1 + data present, host->card (DAT_DIR_READ clear).
+        if send_command(
+            base,
+            cmd(24) | CMD_RESP_48 | CMD_CRCCHK | CMD_IXCHK | CMD_ISDATA,
+            arg,
+        )
+        .is_err()
+        {
+            serial_println!("{}   ladder: CMD24 (WRITE LBA {}) failed at the link layer ::", PS, lba);
+            return false;
+        }
+        let r1 = read32(base, RESP0);
+        if r1 & R1_ERROR_MASK != 0 {
+            serial_println!("{}   ladder: CMD24 (LBA {}) R1 error status {:#010x} ::", PS, lba, r1);
+            return false;
+        }
+        if !wait_set(base, INTERRUPT, INT_WRITE_RDY, DATA_TIMEOUT_MS) {
+            serial_println!("{}   ladder: write buffer never became ready (LBA {}) ::", PS, lba);
+            return false;
+        }
+        write32(base, INTERRUPT, INT_WRITE_RDY);
+        for i in 0..128usize {
+            let off = i * 4;
+            let word = u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
+            write32(base, DATA, word);
+        }
+        // Transfer-complete: the card has accepted the block off the FIFO.
+        if !wait_set(base, INTERRUPT, INT_DATA_DONE | INT_ERR_ANY, DATA_TIMEOUT_MS) {
+            serial_println!("{}   ladder: transfer-complete timeout writing LBA {} ::", PS, lba);
+            return false;
+        }
+        let int = read32(base, INTERRUPT);
+        write32(base, INTERRUPT, int);
+        if int & INT_ERR_ANY != 0 {
+            serial_println!("{}   ladder: data error {:#010x} writing LBA {} ::", PS, int, lba);
+            return false;
+        }
+        // The card asserts DAT0 busy while it programs the flash; wait for it to release before we treat the
+        // write as durable (a following read would otherwise race the internal programming). `send_command`
+        // already waits DAT_INHIBIT on the next command, but the ladder verifies immediately, so wait here.
+        if !wait_clear(base, STATUS, ST_DAT_INHIBIT, DATA_TIMEOUT_MS) {
+            serial_println!("{}   ladder: card stayed busy (DAT0) after writing LBA {} — programming did not complete ::", PS, lba);
+            return false;
+        }
+        true
+    }
+
+    /// Emergency restore after a mid-ladder fault (a write may have partially landed): re-write the stash
+    /// and verify it. If the restore itself cannot be verified, dump the stashed original as hex so the
+    /// data is never silently lost. Returns whether the original was provably put back.
+    #[cfg(feature = "sdmmc_arm")]
+    fn restore_or_dump(base: u64, card: &Card, lba: u64, stash: &[u8; 512]) -> bool {
+        serial_println!("{}   ladder: emergency RESTORE of LBA {} after a mid-ladder fault ::", PS, lba);
+        if write_block_at(base, card, lba, stash) {
+            let mut chk = [0u8; 512];
+            if read_block_at(base, card, lba, &mut chk) && chk == *stash {
+                serial_println!("{}   ladder: emergency restore verified — original data preserved ::", PS);
+                return true;
+            }
+        }
+        serial_println!("{}   ladder: EMERGENCY RESTORE FAILED — original {}-byte stash below as hex so it is never lost ::", PS, 512);
+        dump_hex(stash);
+        false
+    }
+
     /// The paranoia ladder (ORIN-SDMMC-2). Announced-before-issue, bounded, and RESTORE-by-construction:
     ///  1. re-run the rung-1 read census (sector 0) and confirm it is stable;
     ///  2. pick the SCRATCH REGION — the last `SCRATCH_BLOCKS` block(s) of the card, ONLY IF sector 0 shows
     ///     no GPT (a GPT backup header lives in the last LBA — with GPT present we REFUSE scratch writes this
     ///     arc and say so);
-    ///  3. read + stash the scratch region's current contents.
-    /// ORIN-SDMMC-2 M2 will extend this with steps 4-7 (write / verify / restore / verify). Until then this
-    /// M1 body performs ZERO card writes — it establishes the safe scratch region and stash only.
+    ///  3. read + stash the scratch region's current contents;
+    ///  4. single-block CMD24 write of a stamped pattern;
+    ///  5. read-back + byte-compare (the write verified);
+    ///  6. RESTORE the stashed original contents;
+    ///  7. read-back + byte-compare the restoration.
+    /// Emits `:: SDMMC: write ladder — write/verify/restore/verify => PASS ::` only if EVERY step verified.
+    /// Any mismatch = a distinct FAIL line naming the step; if a write landed, an emergency restore runs,
+    /// and if the restore itself cannot be verified the stashed original is dumped as hex.
     #[cfg(feature = "sdmmc_arm")]
     fn write_ladder(base: u64, card: &Card, sec0: &[u8; 512]) {
         serial_println!(
@@ -679,12 +760,69 @@ mod metal {
             stash[0], stash[1], stash[2], stash[3], stash[4], stash[5], stash[6], stash[7]
         );
 
-        // ── Steps 4-7 (write / verify / restore / verify) land in ORIN-SDMMC-2 M2. ──
-        let _ = &stash;
-        serial_println!(
-            "{} ORIN-SDMMC-2 M1 — scratch region + stash established at LBA {}; write steps (4-7) are the M2 commit; ZERO card writes performed ::",
-            PS, scratch_lba
-        );
+        // ── Step 4/7: single-block CMD24 write of a stamped pattern ──
+        let mut pattern = [0u8; 512];
+        make_pattern(&mut pattern, scratch_lba);
+        serial_println!("{}   ladder step 4/7: CMD24 single-block WRITE of stamped pattern to LBA {} ::", PS, scratch_lba);
+        if !write_block_at(base, card, scratch_lba, &pattern) {
+            serial_println!("{}   ladder FAIL step 4 (write): CMD24 write to LBA {} failed ::", PS, scratch_lba);
+            // The write may have partially landed — attempt to put the original back.
+            restore_or_dump(base, card, scratch_lba, &stash);
+            return;
+        }
+
+        // ── Step 5/7: read-back + byte-compare against the stamped pattern ──
+        serial_println!("{}   ladder step 5/7: reading back LBA {} + byte-comparing to the stamped pattern ::", PS, scratch_lba);
+        let mut readback = [0u8; 512];
+        if !read_block_at(base, card, scratch_lba, &mut readback) {
+            serial_println!("{}   ladder FAIL step 5 (verify read): read-back of LBA {} failed ::", PS, scratch_lba);
+            restore_or_dump(base, card, scratch_lba, &stash);
+            return;
+        }
+        if readback != pattern {
+            serial_println!("{}   ladder FAIL step 5 (verify): read-back != written pattern at LBA {} ::", PS, scratch_lba);
+            restore_or_dump(base, card, scratch_lba, &stash);
+            return;
+        }
+        serial_println!("{}   ladder step 5: write verified (read-back byte-identical to the stamped pattern) ::", PS);
+
+        // ── Step 6/7: RESTORE the stashed original contents ──
+        serial_println!("{}   ladder step 6/7: RESTORING original stashed contents to LBA {} ::", PS, scratch_lba);
+        if !write_block_at(base, card, scratch_lba, &stash) {
+            serial_println!("{}   ladder FAIL step 6 (restore write): CMD24 restore to LBA {} FAILED — original {}-byte data below as hex so it is never lost ::", PS, scratch_lba, 512);
+            dump_hex(&stash);
+            return;
+        }
+
+        // ── Step 7/7: read-back + byte-compare the restoration ──
+        serial_println!("{}   ladder step 7/7: reading back LBA {} + byte-comparing to the stash (restore verify) ::", PS, scratch_lba);
+        let mut restored = [0u8; 512];
+        if !read_block_at(base, card, scratch_lba, &mut restored) {
+            serial_println!("{}   ladder FAIL step 7 (restore verify read): read-back of LBA {} failed — original data below as hex ::", PS, scratch_lba);
+            dump_hex(&stash);
+            return;
+        }
+        if restored != stash {
+            serial_println!("{}   ladder FAIL step 7 (restore verify): restored contents != stash at LBA {} — original data below as hex ::", PS, scratch_lba);
+            dump_hex(&stash);
+            return;
+        }
+        serial_println!("{}   ladder step 7: restore verified (LBA {} byte-identical to the original stash) ::", PS, scratch_lba);
+
+        // Every step verified — the scratch region is provably back to its original contents.
+        serial_println!("{} write ladder — write/verify/restore/verify => PASS ::", PS);
+    }
+
+    /// Build the stamped scratch pattern: a recognisable ASCII marker + the target LBA + a byte-position
+    /// sweep, so a stuck-bit, a wrong-LBA landing, or a partial write all fail the byte-compare loudly.
+    #[cfg(feature = "sdmmc_arm")]
+    fn make_pattern(buf: &mut [u8; 512], lba: u64) {
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = (i as u8) ^ 0x5a;
+        }
+        const MARK: &[u8] = b"UNAOS-SDMMC2-SCRATCH";
+        buf[..MARK.len()].copy_from_slice(MARK);
+        buf[32..40].copy_from_slice(&lba.to_le_bytes());
     }
 
     // ── M1: FDT census — enumerate SDMMC-compatible nodes, pick the enabled removable microSD slot ──
