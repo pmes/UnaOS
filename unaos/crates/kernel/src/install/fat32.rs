@@ -241,6 +241,189 @@ pub fn write_payload_file<T: InstallTarget>(
     Ok(extents)
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════════
+// INSTALL-2 — the real-payload tree writer (multi-file / multi-cluster / subdirectory), ADDITIVE to the
+// single-file `write_payload_file` above (which the x86 engine witness still drives unchanged). This is
+// the "copy the running system's real boot payload" path: the Orin installer mounts the USB boot stick's
+// ESP, walks its directory tree, and mirrors it onto the freshly-formatted microSD ESP through this
+// writer. Three capabilities `write_payload_file` lacked, all confined here:
+//   * a running FREE-CLUSTER cursor, so many files (and subdirectories) allocate distinct chains;
+//   * FAT chains that span MANY FAT sectors — the INSTALL-1 single-FAT-sector bound (≤125 clusters,
+//     ~64 KiB) is LIFTED: `set_fat_run` read-modify-writes every FAT sector a run touches, in both FAT
+//     copies (so a multi-MB kernel image links correctly), with the SAME verify discipline downstream
+//     (the caller sha-extent-verifies every file the writer records);
+//   * directory clusters built WHOLLY in memory then written once, so a possibly-stale data cluster on a
+//     non-blank card never leaks bytes into a directory (the blank-precondition zero pass covers only the
+//     reserved+FAT region; data clusters are not pre-zeroed).
+// The tree is assumed small enough that each directory fits in one cluster (the boot ESP's
+// root + EFI/ + EFI/BOOT/ layout does); a directory that would overflow one cluster is an honest error,
+// not silent truncation.
+// ══════════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Short-name directory-entry attribute bytes.
+pub const ATTR_ARCHIVE: u8 = 0x20;
+pub const ATTR_DIR: u8 = 0x10;
+
+/// Directory entries that fit in one 512-byte cluster (16 × 32-byte slots).
+pub const DIR_SLOTS_PER_CLUSTER: usize = SECTOR / 32;
+
+/// A multi-file / multi-cluster / subdirectory writer over an `InstallTarget`, driven by the Orin
+/// INSTALL-2 flow. Holds a running free-cluster cursor; the target must be a freshly `format_esp`'d ESP
+/// (so allocation is a simple contiguous bump from cluster 3, and the reserved FAT entries are in place).
+pub struct TreeWriter<'a, T: InstallTarget> {
+    t: &'a mut T,
+    geom: FatGeom,
+    next_free: u32,
+}
+
+impl<'a, T: InstallTarget> TreeWriter<'a, T> {
+    /// Bind a writer to a freshly-formatted ESP. Allocation starts at the first file cluster (3); the
+    /// root directory (cluster 2) is filled by the caller and written via `write_dir_cluster`.
+    pub fn new(t: &'a mut T, geom: FatGeom) -> Self {
+        Self { t, geom, next_free: FIRST_FILE_CLUSTER }
+    }
+
+    /// The root directory's cluster (2).
+    pub fn root_cluster(&self) -> u32 {
+        ROOT_CLUSTER
+    }
+
+    /// Number of clusters allocated so far (for the install summary).
+    pub fn clusters_used(&self) -> u32 {
+        self.next_free - FIRST_FILE_CLUSTER
+    }
+
+    /// Allocate `n` contiguous data clusters, linking them as one EOC-terminated chain across whatever
+    /// FAT sectors the run spans (both FAT copies). Returns the first cluster. `NoSpace` if the run would
+    /// exceed the volume's cluster count.
+    fn alloc_chain(&mut self, n: u32) -> Result<u32, InstallError> {
+        if n == 0 {
+            return Err(InstallError::BadArg);
+        }
+        let first = self.next_free;
+        let last = first.checked_add(n - 1).ok_or(InstallError::NoSpace)?;
+        // count_of_clusters counts data clusters starting at cluster 2, so the last valid cluster
+        // number is count_of_clusters + 1.
+        if last > self.geom.count_of_clusters + 1 {
+            return Err(InstallError::NoSpace);
+        }
+        self.set_fat_run(first, n)?;
+        self.next_free = last + 1;
+        Ok(first)
+    }
+
+    /// Link clusters `[first .. first+n)` as a chain (each → next, last → EOC), RMW-ing each FAT sector
+    /// the run touches ONCE per copy. This is the multi-FAT-sector extension: a run that crosses a
+    /// 128-entry sector boundary updates every sector it lands in, so a payload of any size links
+    /// correctly (INSTALL-1 refused anything past FAT sector 0).
+    fn set_fat_run(&mut self, first: u32, n: u32) -> Result<(), InstallError> {
+        const EPS: u32 = (SECTOR / 4) as u32; // FAT32 entries per sector = 128
+        let last = first + n - 1;
+        let mut c = first;
+        while c <= last {
+            let sec_idx = c / EPS; // FAT-sector index within one copy (volume-relative to fat_start)
+            let sec_base = sec_idx * EPS; // first cluster number this sector holds
+            let sec_end = sec_base + EPS - 1; // last cluster number this sector holds
+            let hi = core::cmp::min(last, sec_end);
+            for copy in 0..NUM_FATS {
+                let abs = self.geom.abs(self.geom.fat_start + copy * self.geom.fat_sz + sec_idx);
+                let mut buf = [0u8; SECTOR];
+                self.t.read_sectors(abs, &mut buf)?;
+                let mut cc = c;
+                while cc <= hi {
+                    let value = if cc == last { 0x0FFF_FFFFu32 } else { cc + 1 };
+                    let o = ((cc - sec_base) * 4) as usize;
+                    buf[o..o + 4].copy_from_slice(&value.to_le_bytes());
+                    cc += 1;
+                }
+                self.t.write_sectors(abs, &buf)?;
+            }
+            c = hi + 1;
+        }
+        Ok(())
+    }
+
+    /// Absolute LBA of the first sector of `cluster`.
+    fn cluster_lba(&self, cluster: u32) -> u64 {
+        self.geom.cluster_lba(cluster)
+    }
+
+    /// Allocate one fresh cluster for a subdirectory. Its 512-byte content is written later (built in
+    /// memory by the caller, then handed to `write_dir_cluster`).
+    pub fn alloc_dir_cluster(&mut self) -> Result<u32, InstallError> {
+        self.alloc_chain(1)
+    }
+
+    /// Write a directory's full 512-byte cluster buffer (built in memory so no stale bytes leak).
+    pub fn write_dir_cluster(&mut self, cluster: u32, buf: &[u8; SECTOR]) -> Result<(), InstallError> {
+        self.t.write_sectors(self.cluster_lba(cluster), buf)
+    }
+
+    /// Allocate a fresh contiguous chain and write `payload` across it, zero-padding the final sector.
+    /// Returns `(first_cluster, extents)`; an empty payload stores no cluster (`(0, [])`). The extents
+    /// are exactly what `super::verify_extents` re-reads and SHA-checks.
+    pub fn write_file(&mut self, payload: &[u8]) -> Result<(u32, Vec<Extent>), InstallError> {
+        if payload.is_empty() {
+            return Ok((0, Vec::new()));
+        }
+        let n = ((payload.len() + SECTOR - 1) / SECTOR) as u32;
+        let first = self.alloc_chain(n)?;
+        let mut extents = Vec::with_capacity(n as usize);
+        let mut off = 0usize;
+        for i in 0..n {
+            let take = core::cmp::min(SECTOR, payload.len() - off);
+            let mut sec = [0u8; SECTOR];
+            sec[..take].copy_from_slice(&payload[off..off + take]);
+            let lba = self.cluster_lba(first + i);
+            self.t.write_sectors(lba, &sec)?;
+            extents.push(Extent { lba, len: take });
+            off += take;
+        }
+        Ok((first, extents))
+    }
+}
+
+/// Format one 32-byte 8.3 directory entry into `dir[slot]`. Handles the `.`/`..` self/parent entries a
+/// subdirectory needs (their on-disk names are `.` and `..` space-padded, which the general 8.3 encoder
+/// rejects). Returns false for an unrepresentable name or an out-of-range slot — the caller turns either
+/// into an honest error rather than a silent corruption.
+pub fn put_dir_entry(
+    dir: &mut [u8; SECTOR],
+    slot: usize,
+    name: &str,
+    attr: u8,
+    first_cluster: u32,
+    size: u32,
+) -> bool {
+    let raw = if name == "." {
+        let mut r = [b' '; 11];
+        r[0] = b'.';
+        r
+    } else if name == ".." {
+        let mut r = [b' '; 11];
+        r[0] = b'.';
+        r[1] = b'.';
+        r
+    } else {
+        match format_83(name) {
+            Some(r) => r,
+            None => return false,
+        }
+    };
+    let o = slot * 32;
+    if o + 32 > SECTOR {
+        return false;
+    }
+    dir[o..o + 11].copy_from_slice(&raw);
+    dir[o + 11] = attr;
+    let hi = (first_cluster >> 16) as u16;
+    let lo = (first_cluster & 0xFFFF) as u16;
+    dir[o + 20..o + 22].copy_from_slice(&hi.to_le_bytes());
+    dir[o + 26..o + 28].copy_from_slice(&lo.to_le_bytes());
+    dir[o + 28..o + 32].copy_from_slice(&size.to_le_bytes());
+    true
+}
+
 /// Encode an 8.3 name into the 11-byte on-disk form (uppercase, space-padded). Returns None for a
 /// name that is not representable as a short name.
 fn format_83(name: &str) -> Option<[u8; 11]> {

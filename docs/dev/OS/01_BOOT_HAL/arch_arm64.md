@@ -5495,6 +5495,66 @@ MMIO) records the flow is compiled-present but has no Tegra234 SDMMC to install 
 execution is the attended Orin sitting** (runbook `scripts/orin-sdmmc1-bench.md`, install leg). Landing:
 `review/unaos-install1-LANDING.md`.
 
+#### ORIN-INSTALL-2 — the self-clone: the installer copies the running system's real boot payload (`UNAOS_INSTALL_TARGET_SD`)
+
+**What it is.** INSTALL-1's payload was honest but synthetic — a generated `UNAOS.IMG` marker, because at its
+pre-JB2b census site the USB boot stick was not yet a block device. INSTALL-2 completes the clone-thyself
+design: the installer reads the **running system's own boot payload off the USB stick's ESP** and mirrors it
+onto the freshly-formatted microSD ESP, every copied file sha-extent-verified. Same three-gate ladder, same
+about-to-destroy announcement, same engine — this arc adds the reposition, the real payload read, and the
+engine's multi-file/multi-cluster/subdirectory writer.
+
+**The position adjudication (the named blocker, resolved).** The install act is **split in two**. The
+read-only `sdmmc_census` still runs at the pre-JB2b EL2 site (`main.rs` ~1396) and now **stashes** the card
+identity (`base` + `Card` + `sector 0`) into `PENDING_INSTALL` instead of installing. The **destructive
+install is deferred** to `sdmmc_install_from_usb`, called from the boot sequence **immediately after the JB2b
+pump window** (`main.rs`, just after the `if xusb_alive { … }` block, ~line 1522) — the earliest position
+where all three constraints hold:
+- **(a) the stick is readable** — the JB2b pump's `service_storage` publishes `drivers::block::BLOCK_DEVICE`
+  in its settle window, so `drivers::block::info()` is now `Some` (the tegra build is not `baremetal`, so
+  `drivers::block` routes to the xHCI USB-MSC path, never the Pi `emmc2` SD backend — no backend conflict with
+  the directly-driven `SdInstallTarget`);
+- **(b) the SDMMC MMIO is still usable** — the census mapped the controller window (GiB-0 Device-nGnRE), which
+  persists; and the core is **still at EL2** here (the JM6 drop is further down), so the SD path's bounded
+  `hlt()` waits still have the JM4 timer as their wake source;
+- **(c) nothing later is perturbed** — the JD2 console shell reads `drivers::block` (the USB stick), not the SD;
+  the SMP wake touches neither. The microSD is repartitioned in isolation.
+
+If the census never identified a card, or the stick did not enumerate (`drivers::block::info()` is `None` —
+no self to clone), the deferred site prints an honest SKIP and does nothing destructive.
+
+**The payload = the real thing.** `install_flow` mounts the USB stick through the in-tree FAT reader
+(`fs::fat::mount()`, which reads `drivers::block`) and **walks its whole boot tree**, mirroring it onto the SD
+ESP: the esp-jetson layout is `/EFI/BOOT/BOOTAA64.EFI` + `/kernel.elf`, so the copy recreates the `EFI/` and
+`EFI/BOOT/` subdirectories (with well-formed `.`/`..`) and both files — nothing hardcoded; whatever the stick
+carries is enumerated and cloned. Each file is read whole (bounded by a 32 MiB per-file cap against the 48 MiB
+heap), its clusters allocated and written, and its record kept for verify.
+
+**The engine extension (the flagged single-FAT-sector bound, lifted).** INSTALL-1's `write_payload_file`
+required the whole file chain to fit in **FAT sector 0** (≤125 clusters ≈ 64 KiB) — far too small for a real
+`kernel.elf`. INSTALL-2 adds, **additively**, a `TreeWriter` to `install/fat32.rs` (the x86 witness's
+`write_payload_file` is untouched): a running free-cluster cursor, a `set_fat_run` that RMWs **every FAT
+sector a run touches, in both FAT copies** (multi-MB files link correctly), and directory clusters built
+**wholly in memory** then written once (so a stale data cluster on a non-blank card never leaks bytes into a
+directory). Directories are assumed to fit one cluster (the boot tree does); an overflow is an honest error,
+not truncation. Same verify discipline downstream: every file is re-read off the card and SHA-checked through
+the engine's own `verify_extents`.
+
+**The flow** (each step a serial line; any engine/read error is a single named `FAIL`):
+GPT (parse-back verified) → zero the ESP metadata region → FAT32 format → **mount the USB stick + clone its
+boot tree file-by-file** → **per-file `sha256=… VERIFIED`** manifest (the real manifest replacing INSTALL-1's
+single `UNAOS.IMG`) → `ORIN-INSTALL-2 SD install — gpt+zero+fat32+clone(N files) verify => PASS`.
+
+**Byte-identity.** Every INSTALL-2 line — including the `Card` `Clone`/`Copy` derive and the stash — is
+`install_target`-gated (`fat32.rs`'s additions live in the `install` module, itself compiled only under
+`installdemo`/`install_target`), so an `sdmmc_arm`-without-`install_target` build is byte-identical to the
+merged rung-2 ladder (**string-identity: the `sdmmc_arm` jetson binary contains zero `ORIN-INSTALL` strings
+and rebuilds byte-for-byte; the `install_target` binary contains them**).
+
+**Virt witness:** unchanged in shape — one honest metal-only line (no Tegra234 SDMMC in QEMU). The full
+self-clone's **first execution is the attended Orin sitting** (runbook `scripts/orin-sdmmc1-bench.md`, install
+leg). Landing: `review/unaos-install2-LANDING.md`.
+
 ## AARCH64-VNET — virtio-net-mmio driver + smoltcp bind on QEMU `virt` (`UNAOS_VNET`, knob-gated)
 
 **Purpose: a pre-metal, QEMU-testable proof of the aarch64 smoltcp seam that ORIN-NET-4 built.** NET-4's

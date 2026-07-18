@@ -122,49 +122,64 @@ The virt witness (no metal, for reference — `UNAOS_SDMMC=1 UNAOS_SDMMC_ARM=1 U
 :: SDMMC: ORIN-SDMMC-2 write ladder ARMED (UNAOS_SDMMC_ARM=1) but metal-only — no Tegra234 SDMMC on this build (QEMU virt); zero card writes here ::
 ```
 
-## Install leg (ORIN-INSTALL-1) — the THIRD, destructive gate
+## Install leg (ORIN-INSTALL-2) — the THIRD, destructive gate, now a real self-clone
 
-**⚠ This leg REPARTITIONS AND REFORMATS the entire seated microSD. It is destructive by design — it installs
-UnaOS onto the card.** It runs only behind a THIRD gate on top of the armed ladder, and only on a card you are
-willing to erase. Do **not** run it on a card whose contents matter.
+**⚠ This leg REPARTITIONS AND REFORMATS the entire seated microSD. It is destructive by design — it clones the
+running UnaOS boot payload onto the card.** It runs only behind a THIRD gate on top of the armed ladder, and
+only on a card you are willing to erase. Do **not** run it on a card whose contents matter.
 
 - **Image:** `UNAOS_INSTALL_TARGET_SD=1 UNAOS_TEGRA=1 ./arroyo esp-jetson` (the knob pulls `install_target`
   ⇒ `sdmmc_arm` ⇒ `sdmmc`). A plain `UNAOS_SDMMC_ARM=1` image (the armed-ladder image above) does **not**
-  contain the installer — string-identity: zero `ORIN-INSTALL` / `ABOUT TO DESTROY` strings in it.
+  contain the installer — string-identity: zero `ORIN-INSTALL` strings in it, and it rebuilds byte-for-byte.
 - **The three-gate ladder:** gate 1 = `sdmmc` census OK; gate 2 = `sdmmc_arm` write path; gate 3 =
-  `install_target` destructive-confirm. The flow runs AFTER the read census + the rung-2 scratch ladder, so the
-  write path is proven on a stashed-and-restored block *before* the installer touches the whole card.
+  `install_target` destructive-confirm.
+- **The install is DEFERRED (INSTALL-2).** The read-only census runs pre-JB2b as before but only **stashes** the
+  card identity; the destructive install runs **after the JB2b USB pump**, once the boot stick has enumerated as
+  a block device — the position where the running boot payload is readable so the installer can clone *the real
+  files*, not a synthetic marker. So the install lines appear on the wire AFTER the JB2b keyboard/storage lines,
+  not right after the census.
 - **Before the first write it ANNOUNCES what it will destroy** — the sector-0 classification, capacity, and the
   card CID identity. Read that line and confirm it is the card you intend to erase before letting the boot
   proceed.
 
-**Expected on the wire (grep `INSTALL`), on a card the install proceeds on:**
+**Expected on the wire (grep `INSTALL`), on a card the install proceeds on** (the `EFI/BOOT/BOOTAA64.EFI` +
+`kernel.elf` boot tree is illustrative — the flow clones whatever the stick's ESP actually carries):
 
 ```
-:: SDMMC: ORIN-INSTALL-1 THIRD GATE (UNAOS_INSTALL_TARGET_SD=1) — installing UnaOS onto the SEATED microSD ::
+:: SDMMC: ORIN-INSTALL-2 card identity stashed; destructive install DEFERRED to the post-JB2b USB-enumerated site (self-clone needs the boot stick readable) ::
+   … (JB2b keyboard/storage enumeration lines) …
+:: SDMMC: ORIN-INSTALL-2 THIRD GATE (UNAOS_INSTALL_TARGET_SD=1) — cloning the running boot payload onto the SEATED microSD ::
 :: SDMMC:   gates: [1] sdmmc census OK · [2] sdmmc_arm write path armed · [3] install_target destructive-confirm — all satisfied ::
 :: SDMMC:   ABOUT TO DESTROY: microSD sector-0 = <class> · capacity <N> blocks (<M> MiB) — the entire card is about to be repartitioned ::
 :: SDMMC:   M2: CID manufacturer(MID)=… product(PNM)='…' serial(PSN)=… date=…/… ::
 :: SDMMC:   INSTALL: GPT written + parse-back verified — ESP LBA 2048..… , data LBA …..… of <N> sectors ::
 :: SDMMC:   INSTALL: zeroed <K> ESP metadata sectors (reserved + both FATs) to re-establish the blank-precondition ::
 :: SDMMC:   INSTALL: ESP formatted FAT32 — fat_sz=…sec clusters=… data@vol+… ::
-:: SDMMC:   INSTALL: copied UNAOS.IMG (4096 bytes, 8 extents) ::
-:: SDMMC:   INSTALL: extent sha-verify (re-read every written extent off the card) => PASS ::
-:: SDMMC: ORIN-INSTALL-1 SD install — gpt+zero+fat32+copy verify => PASS ::
+:: SDMMC:   INSTALL: mounted USB boot stick — <fs describe> ::
+:: SDMMC:   INSTALL: cloned <F> files (<C> data clusters) from the boot tree ::
+:: SDMMC:   INSTALL: kernel.elf (<B> B, <E> extents) sha256=<64-hex> => VERIFIED ::
+:: SDMMC:   INSTALL: EFI/BOOT/BOOTAA64.EFI (<B> B, <E> extents) sha256=<64-hex> => VERIFIED ::
+:: SDMMC:   INSTALL: all <F> cloned files re-read off the card + sha-verified => PASS ::
+:: SDMMC: ORIN-INSTALL-2 SD install — gpt+zero+fat32+clone(<F> files) verify => PASS ::
 ```
 
-The final `=> PASS` line is the only success; any engine error is a single `ORIN-INSTALL-1 SD install => FAIL
-(<Reason>)` line naming the cause (no write is left unaccounted — the GPT/format/verify each fail closed).
+The final `=> PASS` line is the only success; any engine/read error is a single `ORIN-INSTALL-2 SD install =>
+FAIL (<Reason>)` line naming the cause (GPT/format/read/clone/verify each fail closed, no partial write left
+unaccounted). A **verify-FAIL** shape is `INSTALL: <path> extent sha-verify => FAIL` immediately followed by the
+`… SD install => FAIL (VerifyFailed)` verdict — the card's content did not match what was read off the stick.
+Honest **SKIP** shapes (no destruction): `ORIN-INSTALL-2 deferred install SKIPPED — no card identity stashed`
+(census found no controller/card) or `… SKIPPED — the USB boot stick did not enumerate as a block device (no
+self to clone)`.
 
-**Note (payload):** v1 writes a generated `UNAOS.IMG` marker, NOT a clone of the running boot volume — at this
-pre-xHCI-takeover install site the boot stick is not yet a block device (self-clone is the named follow-up,
-INSTALL-2). Verify-by-content here is the SD extent sha-verify, not an `fs::fat::mount()` read-back.
+**Note (payload):** INSTALL-2 clones the RUNNING system's real boot payload read off the USB stick's ESP
+(`fs::fat::mount()` over the JB2b-enumerated block device), each file sha-extent-verified on the card. This
+replaces INSTALL-1's generated `UNAOS.IMG` marker. Verify-by-content is the per-file SD extent sha-verify.
 
 **Virt witness** (no metal — `UNAOS_INSTALL_TARGET_SD=1 UNAOS_GICV3=1 ./arroyo test-arm`), after the two SDMMC
 witness lines:
 
 ```
-:: SDMMC: ORIN-INSTALL-1 third gate (UNAOS_INSTALL_TARGET_SD=1) compiled-present but metal-only — no Tegra234 SDMMC on this build (QEMU virt); no install here ::
+:: SDMMC: ORIN-INSTALL-2 third gate (UNAOS_INSTALL_TARGET_SD=1) compiled-present but metal-only — no Tegra234 SDMMC on this build (QEMU virt); no install here ::
 ```
 
 ### The failure shapes (armed) — each a distinct honest line, record verbatim
@@ -190,8 +205,10 @@ witness lines:
   200 MHz assumption kicked in.
 - **(Armed)** the scratch LBA, whether the ladder reached `PASS` or `REFUSED (GPT)`, and any `FAIL`/hex rows.
 - **(Install leg)** the ABOUT-TO-DESTROY line (class + capacity + CID), the ESP/data LBAs, the zeroed-metadata
-  sector count, and whether the flow reached `ORIN-INSTALL-1 SD install … => PASS` or a named `FAIL`. After a
-  PASS, re-seat the card and confirm a host reader sees a `UNAOS-ESP` FAT32 volume with `UNAOS.IMG`.
+  sector count, the mounted-stick describe line, the per-file `sha256=… VERIFIED` manifest, and whether the flow
+  reached `ORIN-INSTALL-2 SD install … => PASS` or a named `FAIL`/`SKIP`. After a PASS, re-seat the card and
+  confirm a host reader sees a `UNAOS` FAT32 ESP carrying the cloned boot tree (`/EFI/BOOT/BOOTAA64.EFI` +
+  `/kernel.elf`) — and, ideally, that each file's host-side sha256 matches the serial manifest.
 
 The box proceeds to CAPSTONE (JM6) exactly as a normal tegra boot — the recon/ladder is a prologue. Restore
 the boot-stick default at the end of the sitting per the standing rule.
