@@ -41,6 +41,11 @@ fn main() {
     // this list in sync with arroyo's feature mapping — the builder rebuilds the kernel, so a knob
     // missing here is silently dropped even if arroyo set it.
     let mut feats: Vec<&str> = Vec::new();
+    // DEFAULT-QUIET: UNAOS_WITNESS=1 arms the `witness` fixture-battery feature so a headless `test`/`test-fat`
+    // run re-proves the full x86 fixture set (nmi-self-fire/canonical-guard + U1a/U1b/U2-0a/U3/U3.5 + the
+    // U2/U4x..U6bx storage chain that cascades U7x..U6gx). Default OFF => a default boot reaches the shell with
+    // the boot-honesty lines only. arroyo auto-sets + EXPORTS it for the battery commands; kept in sync with arroyo.
+    if std::env::var("UNAOS_WITNESS").is_ok() { feats.push("witness"); }
     if std::env::var("UNAOS_SKIP_XHCI").is_ok() { feats.push("skip_xhci"); }
     if std::env::var("UNAOS_BOOTLOG").is_ok() { feats.push("bootlog"); }
     if std::env::var("UNAOS_PI").is_ok() { feats.push("pi"); }

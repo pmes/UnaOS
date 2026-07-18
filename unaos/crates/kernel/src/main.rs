@@ -284,6 +284,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // the demo core's TLB with the OLD mapping (so a broken broadcast TLBI is deterministically
         // visible on metal instead of silently passing) -> protect (the kernel's first live
         // page-table update + TLBI) -> spawn. All synchronous exceptions: fully QEMU-verifiable.
+        //
+        // DEFAULT-QUIET: the whole M6b/M6e/M6d/M6f/M6g + U4/U5/U6/U6b/U7 EL0 fixture flow (U7 in turn
+        // cascades U9/U10/U10c/U10d/U11/U11-defer/U11-reap + the K*/F2/F3/BANDY/unafs selftests) re-proves
+        // long-metal-confirmed facts on every kernel8 boot — behind the `witness` battery knob. The APs
+        // (start_aps above) + the boot-honesty CAPSTONE workload + emmc2 probe stay unconditional, so a
+        // quiet default boot reaches the shell with CAPSTONE + device lines only.
+        #[cfg(feature = "witness")]
         if let Some(&cpu) = online.first() {
             let demo = unaos_kernel::arch::syscall::setup();
             unaos_kernel::arch::sched::spawn(
@@ -544,8 +551,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // IPI path and confirm it was taken on the dedicated NMI IST stack (the honest B3 evidence),
         // and unit-exercise the canonical-`rcx` guard's refusal logic. Both need only the local APIC
         // + IDT/GDT (all up by now), not the scheduler, so they run here before the ring-3 demos.
-        unaos_kernel::arch::syscall::nmi_self_fire();
-        unaos_kernel::arch::syscall::canonical_guard_selftest();
+        // DEFAULT-QUIET: re-proofs of metal-confirmed facts — behind the `witness` battery knob.
+        #[cfg(feature = "witness")]
+        {
+            unaos_kernel::arch::syscall::nmi_self_fire();
+            unaos_kernel::arch::syscall::canonical_guard_selftest();
+        }
 
         // CLOCK-X1 (M3): the x86 wall-clock timebase witness. Runs after `apic::calibrate` (step
         // 4b''') so the invariant TSC is calibrated; silent if this machine has no invariant TSC.
@@ -560,6 +571,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // SYSCALL/hello lines reach the (serial-less) framebuffer console uncontended and the demo
         // lands contiguously in the photographed boot log. All synchronous + QEMU-verifiable; metal
         // verification is a later arc boundary.
+        // DEFAULT-QUIET: the whole U1a/U1b/U2-0a/U3/U3.5 ring-3 fixture flow re-proves metal-confirmed
+        // facts every boot — behind the `witness` battery knob. (`sched::enable()` lives inside this
+        // block; the opt-in `sched_demo` path self-enables via `start_demo`, so a quiet default boot
+        // simply leaves the APs idle.)
+        #[cfg(feature = "witness")]
         {
             let online = unaos_kernel::arch::smp::online_aps();
             if let Some(&cpu) = online.first() {
@@ -768,29 +784,29 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // metal boot — the usbdebug view keeps fbcon attached (unlike the GUI loop, which detaches
             // it before U2 runs). Same one-shot gate; loads HELLO.BIN + prints `hello from disk` + the
             // U2 PASS line onto the framebuffer.
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(all(target_arch = "x86_64", feature = "witness"))]
             unaos_kernel::arch::syscall::u2_probe_once();
             // U4x (x86): the process model — sys_spawn (returns a HANDLE) + sys_wait (reaps by handle).
             // One-shot, gated on storage like U2; it pre-stages HELLO.BIN here (IF=1) then runs a parent
             // that spawns + reaps 2 children by handle, plus an orphan whose sys_wait(0) -> -ECHILD.
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(all(target_arch = "x86_64", feature = "witness"))]
             unaos_kernel::arch::syscall::u4x_probe_once();
             // U5x (x86): handles as CAPABILITIES — rights + the enforcement CHECK + grant/attenuate/revoke
             // + routed sys_write + teardown-clear. One-shot, gated on storage + after U4x; the fixture is
             // an inline blob (no FAT I/O).
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(all(target_arch = "x86_64", feature = "witness"))]
             unaos_kernel::arch::syscall::u5x_probe_once();
             // U6x (x86): the general OBJECT TABLE — (kind, target, rights) descriptors + first-free
             // allocation for ALL kinds, killing U5x's fixed CONSOLE_FD pin. One-shot, gated on storage +
             // after U5x; a printing spawner both prints AND spawns 2 children off the reserved console index
             // (the case U5x couldn't serve), plus kernel-side File/Socket-kind resolves.
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(all(target_arch = "x86_64", feature = "witness"))]
             unaos_kernel::arch::syscall::u6x_probe_once();
             // U6bx (x86): REAL File handles — SYS_OPEN mints a File capability from the BSP-staged set and
             // SYS_READ serves bytes through it gated by CAP_READ (the pi4 U6b twin; the staged source is
             // the honest x86 divergence — the IF-masked handler can't pump the hlt()-ing xHCI BOT read).
             // One-shot, gated on storage + after U6x.
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(all(target_arch = "x86_64", feature = "witness"))]
             unaos_kernel::arch::syscall::u6bx_probe_once();
             unaos_kernel::drivers::xhci::log_summary_once();
             // VPERF (videobench knob, x86 only): the deterministic scripted scroll scenario —
@@ -950,29 +966,29 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // ring 3 (one-shot, gated like probe_once). Must live HERE, in the main loop — not with the
         // pre-xHCI U1a/U1b demo — because `fat::mount()` needs the usb-storage block device that
         // enumerates asynchronously above. No-op on aarch64 / when no FAT volume is present.
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", feature = "witness"))]
         unaos_kernel::arch::syscall::u2_probe_once();
         // U4x (x86): the process model — sys_spawn (returns a HANDLE) + sys_wait (reaps by handle).
         // One-shot, gated on storage like U2; pre-stages HELLO.BIN here (IF=1 — the syscall handler is
         // IF-masked and the xHCI BOT pump hlt()s), then runs a parent that spawns + reaps 2 children by
         // handle, plus an orphan whose sys_wait(0) -> -ECHILD (per-process handle tables).
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", feature = "witness"))]
         unaos_kernel::arch::syscall::u4x_probe_once();
         // U5x (x86): handles as CAPABILITIES — rights + the enforcement CHECK + grant/attenuate/revoke +
         // routed sys_write + teardown-clear. One-shot, gated on storage + after U4x; inline-blob fixture.
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", feature = "witness"))]
         unaos_kernel::arch::syscall::u5x_probe_once();
         // U6x (x86): the general OBJECT TABLE — (kind, target, rights) descriptors + first-free allocation
         // for ALL kinds, closing U5x's fixed CONSOLE_FD collision. One-shot, gated on storage + after U5x;
         // a printing spawner both prints AND spawns 2 children off the reserved console index (the case U5x
         // couldn't serve), plus a kernel-side File/Socket-kind + no-collision proof.
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", feature = "witness"))]
         unaos_kernel::arch::syscall::u6x_probe_once();
         // U6bx (x86): REAL File handles — SYS_OPEN mints a File capability from the BSP-staged set and
         // SYS_READ serves bytes through it gated by CAP_READ (the pi4 U6b twin; the staged source is the
         // honest x86 divergence — the IF-masked handler can't pump the hlt()-ing xHCI BOT read). One-shot,
         // gated on storage + after U6x.
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", feature = "witness"))]
         unaos_kernel::arch::syscall::u6bx_probe_once();
         // One-shot USB topology dump to serial (enumeration diagnosis; `usbinfo` shows it live).
         unaos_kernel::drivers::xhci::log_summary_once();

@@ -6,6 +6,16 @@ license = "GPL-3.0-or-later"
 
 [features]
 default = []
+# DEFAULT-QUIET (witness): gate the battery of EL0/kernel fixtures that RE-PROVE long-metal-confirmed
+# facts on every boot (x86: nmi-self-fire + canonical-guard + U1a/U1b/U2-0a/U3/U3.5 + the
+# U2/U4x/U5x/U6x/U6bx storage chain that cascades U7x..U6gx; aarch64 baremetal: the M6b/M6e/M6d/M6f/M6g
+# + U4..U7 chain that cascades U9/U10/U10c/U10d/U11/U11-defer/U11-reap + the K*/F2/F3/BANDY/unafs
+# selftests). DEFAULT OFF => those call sites vanish and a default boot reaches the shell with the
+# boot-honesty lines only (device/link/calibration/MISSION/CAPSTONE). The regression BATTERIES arm it
+# (arroyo/builder push `witness` for `test`/`test-fat`/`test-arm`/`kernel8-test` via UNAOS_WITNESS=1)
+# so witness coverage is unchanged-green; the boot/media builds (`x86`/`arm`/`esp-*`/`kernel8`) leave it
+# off. Gates CALL SITES only — never the fixture bodies. See review/unaos-default-quiet-LANDING.md.
+witness = []
 # Skip xHCI/USB bring-up entirely (`pci::init`). For real-hardware video bring-up where the
 # firmware/SMM may still own the xHCI controller (this branch has no BIOS->OS handoff) and wedge
 # its reset handshake — the controller's status bits never flip, so the bounded-but-slow timeout

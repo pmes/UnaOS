@@ -10,6 +10,32 @@ is for **on-silicon** bring-up, where the hard, QEMU-invisible bugs live.
 Common shape across all three: build boot media with an `./arroyo` target,
 capture a console from byte 0, compare against the QEMU log for the same build.
 
+> **Default-quiet boots vs. the fixture battery (`witness`).** A *default* boot
+> — every media/boot target (`x86`/`arm`/`esp-x86`/`esp-arm`/`esp-jetson`/
+> `kernel8`/`vm-image`) — reaches the shell with **boot-honesty lines only**:
+> live hardware state discovered *this* boot (device found, link state, the APIC
+> calibration line, the SD-card census, `MISSION SUCCESS`, the `CAPSTONE`
+> scheduler terminus, the net-stack liveness witnesses). The battery of EL0/kernel
+> **fixtures that re-prove long-metal-confirmed facts** on every boot (x86:
+> `U2-0c` self-NMI/canonical-guard + `U1a`/`U1b`/`U2-0a`/`U3`/`U3.5` + the
+> `U2`/`U4x`..`U6bx` storage chain that cascades `U7x`..`U6gx` + the ring-3
+> `SOCK-*` syscall fixtures; aarch64 bare-metal: `M6b`/`M6e`/`M6d`/`M6f`/`M6g`
+> + `U4`..`U7`, which cascades `U9`/`U10`/`U10c`/`U10d`/`U11`/`U11-defer`/
+> `U11-reap` + the `K*`/`F2`/`F3`/`BANDY`/`unafs` selftests) is gated behind the
+> kernel's **`witness`** cargo feature, **default OFF**. The QEMU regression
+> commands **auto-arm it**: `./arroyo test` / `test-fat` / `test-arm` /
+> `kernel8-test` export `UNAOS_WITNESS=1` (which arroyo turns into the `witness`
+> feature, and the x86 `builder` re-derives the same from the env), so their
+> witness coverage is identical to before — same `-> PASS` tally, same `CAPSTONE
+> COMPLETE`, `0 FAIL`. To arm the fixtures on a *boot/media* build (e.g. to watch
+> the whole battery on metal), set `UNAOS_WITNESS=1` explicitly:
+> `UNAOS_WITNESS=1 ./arroyo kernel8`. On aarch64 `virt`/`tegra` the `witness`
+> feature gates nothing (all its call sites are x86- or bare-metal-scoped), so
+> arming it for `test-arm` / leaving it off for `esp-jetson` are both no-ops for
+> the emitted code — the jetson media stays witness-free by construction. Gates
+> **call sites only**, never fixture bodies. See
+> `review/unaos-default-quiet-LANDING.md`.
+
 ---
 
 ## `hw-rmbp` — 2012 MacBook Pro (x86_64)

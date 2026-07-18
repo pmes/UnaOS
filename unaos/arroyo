@@ -24,6 +24,19 @@ COLOR_RED="\033[0;31m"
 
 WORKSPACE_DIR="$(cd "$(dirname "$0")" && pwd)"
 
+# DEFAULT-QUIET (witness): the regression BATTERIES re-prove the full fixture set, so arm the kernel's
+# `witness` cargo feature for exactly the battery commands — `test`/`test-fat` (x86, via the builder),
+# `test-arm` (aarch64 virt), `kernel8-test` (Pi bare-metal). The boot/media commands (`x86`/`arm`/
+# `esp-x86`/`esp-arm`/`esp-jetson`/`kernel8`/`vm-image`) leave it OFF so a default boot reaches the shell
+# with the boot-honesty lines only. EXPORTED so the `builder` subprocess (which rebuilds the x86 kernel
+# from its OWN env-driven feature list) also pushes it. `battery` is deliberately NOT armed here: each of
+# its sub-invocations (`"$0" test`, `"$0" test-arm`, `"$0" kernel8-test`) re-enters this case and self-arms,
+# while its `"$0" esp-jetson` sub-invocation does NOT — keeping the jetson media witness-free (byte-identity).
+case "${1:-}" in
+    test|test-x86|test_x86|test-fat|test_fat|test-arm|test-aarch64|kernel8-test|test-pi)
+        export UNAOS_WITNESS="${UNAOS_WITNESS:-1}" ;;
+esac
+
 # Build flags shared by both targets
 NIGHTLY_FLAGS="-Z build-std=core,compiler_builtins,alloc -Z build-std-features=compiler-builtins-mem -Z json-target-spec"
 
@@ -38,6 +51,11 @@ NIGHTLY_FLAGS="-Z build-std=core,compiler_builtins,alloc -Z build-std-features=c
 # semantics — an EMPTY value counts as SET.
 KERNEL_FEATURES=""
 _feats=""
+# DEFAULT-QUIET: UNAOS_WITNESS=1 arms the `witness` fixture-battery feature (auto-set above for the battery
+# commands; default OFF for boot/media builds). On x86 the builder re-derives features from env, so this
+# also flows through UNAOS_WITNESS there; on aarch64 virt/tegra `witness` gates nothing (all its call sites
+# are x86- or baremetal-scoped), so arming it for test-arm is a functional no-op that only reflects intent.
+[ -n "${UNAOS_WITNESS:-}" ] && _feats="${_feats}witness,"
 [ -n "${UNAOS_SKIP_XHCI:-}" ] && _feats="${_feats}skip_xhci,"
 [ -n "${UNAOS_BOOTLOG:-}" ] && _feats="${_feats}bootlog,"
 [ -n "${UNAOS_PI:-}" ] && _feats="${_feats}pi,"
@@ -734,6 +752,13 @@ kernel8() {
     # cross-reboot power-cycle proof (boot-1 leaves a persisted owned file; boot-2 verifies the live boot
     # rebuild). OFF => the normal same-boot battery (byte-identical). For the ATTENDED Pi bench only.
     local K8_FEATS="baremetal,skip_xhci"
+    # DEFAULT-QUIET: `kernel8-test` (the battery) arms UNAOS_WITNESS so the Pi bare-metal image carries the
+    # M6b..U7 fixture cascade (CAPSTONE + all -> PASS lines). The plain `kernel8` media build leaves it unset,
+    # so the flashed image is quiet — reaches the shell with CAPSTONE + device honesty lines only.
+    if [ -n "${UNAOS_WITNESS:-}" ]; then
+        K8_FEATS="${K8_FEATS},witness"
+        echo -e "${COLOR_YELLOW}  • UNAOS_WITNESS: kernel8 carries the M6b..U7 fixture battery (CAPSTONE + PASS lines)${COLOR_RESET}"
+    fi
     if [ -n "${UNAOS_K2_LEAVE:-}" ]; then
         K8_FEATS="${K8_FEATS},k2_leave"
         echo -e "${COLOR_YELLOW}  • UNAOS_K2_LEAVE: k2_liveenf → two-boot money-shot mode (boot-1 leaves K2PRIV.BIN; power-cycle; boot-2 verifies)${COLOR_RESET}"
