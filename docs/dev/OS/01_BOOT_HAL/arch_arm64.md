@@ -4923,7 +4923,11 @@ for RAM, so — exactly as the x86 e1000 relies on UEFI's 1:1 tables — a heap 
 pointer used verbatim as the descriptor/buffer physical address. The one unknown QEMU cannot settle:
 whether the **SMMU** (`smmu_tegra`) is translating or bypassing controller-0's PCIe stream IDs. NET-4
 programs the identity-physical addresses and documents the SMMU-bypass assumption; an attended sitting
-confirms it. This is why the arc is **code-complete-prior-to-metal by design**.
+confirms it. This is why the arc is **code-complete-prior-to-metal by design**. The **second** unknown
+(review-lens fold): **cache coherency** — rings/buffers are Normal cacheable RAM handed over with
+`dsb sy` only (ordering, not clean/invalidate); correctness assumes Tegra234 controller-0 PCIe is
+I/O-coherent toward DRAM. Metal signature if it isn't: rings never advance / torn or zero frames on a
+live link; the fix is clean-before-OWN + invalidate-before-read, never a weakened OWN protocol.
 
 **Poison-honesty (the PI-V3D-1 lane law) throughout.** The device-identity read rejects `0xffffffff` /
 `0xdeadbeef` as absent decode; the ring init does a **poison-honest `TCR` readback** and *fails the

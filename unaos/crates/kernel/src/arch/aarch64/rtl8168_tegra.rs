@@ -32,6 +32,14 @@
 // rings with the identity-physical addresses and documents the SMMU-bypass assumption; an attended
 // sitting confirms it (see arch_arm64.md §ORIN-NET-4).
 //
+// The SECOND metal-pending unknown (review-lens fold): CACHE COHERENCY. Rings and buffers live in
+// Normal cacheable RAM and are handed over with `dsb sy` only — `dsb` orders visibility for
+// COHERENT observers, it cleans/invalidates nothing. The x86 e1000 seam gets coherent DMA from the
+// architecture; aarch64 does not promise it. Correctness therefore assumes Tegra234 controller-0
+// is I/O-coherent (ACE-lite) toward DRAM. If metal shows stale descriptors/payloads (rings never
+// advance, or torn/zero frames, on a live link), the fix is clean-before-OWN / invalidate-before-
+// read on rings + buffers — do NOT weaken the OWN protocol to compensate.
+//
 // ## Write discipline
 //
 // The driver, being a driver, DOES the fabric writes NET-3 refused: it enables the device's
