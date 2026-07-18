@@ -55,7 +55,10 @@ pub mod selftest;
 // this same arch-neutral module, so either feature brings it in (its `run_demo` x86 witness stays
 // `installdemo`-only; on an `install_target`-only build the module is compiled and driven from
 // `arch::sdmmc_tegra`, no x86 witness call site).
-#[cfg(any(feature = "installdemo", feature = "install_target"))]
+// INSTALL-PI (`piinstall`) also needs the engine: the Pi 4 emmc2 microSD installer flow (crate::install::pi)
+// drives this same arch-neutral module onto the seated card via `drivers::emmc2`, gated by the three-gate
+// UNAOS_PIINSTALL family and reached from the aarch64 bare-metal boot path (no x86 witness call site).
+#[cfg(any(feature = "installdemo", feature = "install_target", feature = "piinstall"))]
 pub mod install;
 
 // FLIGHT-RECORDER: capture the serial boot log into a bounded ring and flush it to UNAOS.LOG on the

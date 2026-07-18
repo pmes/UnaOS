@@ -29,6 +29,11 @@ pub mod fat32;
 pub mod gpt;
 pub mod hash;
 
+// INSTALL-PI: the Pi 4 emmc2 microSD installer flow (three-gate escalation), driving this same engine
+// onto the seated card via `drivers::emmc2`. `piinstall`-gated (⇒ baremetal); compiled out otherwise.
+#[cfg(feature = "piinstall")]
+pub mod pi;
+
 use crate::drivers::block;
 
 const SECTOR: usize = 512;

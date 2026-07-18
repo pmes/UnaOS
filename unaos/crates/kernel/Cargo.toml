@@ -374,6 +374,24 @@ rast = ["dep:rast"]
 # baseline. See docs/dev/OS/10_INSTALL/installer_engine.md.
 installdemo = []
 
+# INSTALL-PI: the `UNAOS_PIINSTALL` family — the installer engine's first LIVE end-to-end execution, on
+# the Pi 4 emmc2 microSD target (crates/kernel/src/install/pi.rs), provable in QEMU raspi4b (which models
+# the SD controller + attaches a real emulated card image). Three-gate escalation mirroring the Orin
+# sdmmc/sdmmc_arm/install_target ladder, each feature implying the previous (⇒ `baremetal`, the Pi
+# bare-metal target where emmc2 lives):
+#   piinstall         — Gate 1: census the seated card (read-only) + announce identity. No write.
+#   piinstall_arm     — Gate 2: arm the write path — a non-destructive scratch write/verify/restore ladder
+#                       on the card's LAST block (stashed + restored; refused if a GPT is present).
+#   piinstall_confirm — Gate 3: the DESTRUCTIVE confirm — the about-to-destroy line, then the full
+#                       GPT → zero-ESP-metadata → FAT32 → payload → sha extent-verify install.
+# `piinstall` also pulls the arch-neutral `install` engine (see lib.rs). Default OFF => the module + call
+# site + engine vanish and every kernel8 image is byte-identical to baseline. The QEMU-live witness is
+# `UNAOS_PIINSTALL_CONFIRM=1 ./arroyo kernel8-install` against a DEDICATED BLANK scratch image (never the
+# kernel8-test battery fixture). See docs/dev/OS/10_INSTALL/installer_engine.md §INSTALL-PI.
+piinstall = ["baremetal"]
+piinstall_arm = ["piinstall"]
+piinstall_confirm = ["piinstall_arm"]
+
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage
 lazy_static = { version = "1.5.0", features = ["spin_no_std"] }
