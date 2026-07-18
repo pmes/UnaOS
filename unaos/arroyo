@@ -147,6 +147,15 @@ _feats=""
 # fabric/config/BAR/power write, no new mapping. Default OFF => module + call sites vanish, every
 # image byte-identical to baseline. See arch_arm64.md §ORIN-NET-1.
 [ -n "${UNAOS_PCIEPROBE:-}" ] && _feats="${_feats}pcieprobe,"
+# ORIN-NET-2: UNAOS_PCIE2=1 arms the controller-0 link + device-enumeration recon
+# (arch/aarch64/pcie_probe.rs, census2). Reads link state from the root port's DBI config space (the
+# PCIe-capability Link Status, read-only) and reaches controller-0's config/ECAM aperture for a
+# bus-0/bus-1 walk via the existing kernel MMIO-mapping path (mmu_tegra::map_mmio_window, kernel page
+# tables only). Standalone (does NOT imply tegra, mirroring pcieprobe): runs on the metal tegra path
+# (combine with UNAOS_TEGRA=1) and the QEMU virt GICv3 path (graceful skip — no Tegra234 RC). Read-only
+# beyond kernel page tables: no fabric/config/BAR write, no link retrain. Default OFF => module + call
+# sites vanish, byte-identical to baseline. See arch_arm64.md §ORIN-NET-2.
+[ -n "${UNAOS_PCIE2:-}" ] && _feats="${_feats}pcie2,"
 if [ -n "$_feats" ]; then
     KERNEL_FEATURES="--features ${_feats%,}"
     echo -e "${COLOR_YELLOW}⚡ kernel features: ${_feats%,}${COLOR_RESET}"

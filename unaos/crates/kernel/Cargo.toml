@@ -201,6 +201,20 @@ xcarve_relink = ["tegra"]
 # §ORIN-NET-1 and scripts/orin-net1-bench.md.
 pcieprobe = []
 
+# ORIN-NET-2: the `UNAOS_PCIE2=1` controller-0 link + device-enumeration recon
+# (arch/aarch64/pcie_probe.rs, `census2`). Extends ORIN-NET-1's census with the last recon step before
+# a real driver arc: it reads controller-0's LINK STATE from the root port's DBI config space (the
+# PCIe-capability Link Status register — read-only, always valid regardless of link state, unlike the
+# downstream config window NET-1 read which returns all-Fs when the link is down) and, via the EXISTING
+# kernel MMIO-mapping path (`mmu_tegra::map_mmio_window`, kernel page tables only), reaches the
+# config/ECAM aperture for a bus-0/bus-1 walk. Standalone (does NOT imply `tegra`, mirroring
+# `pcieprobe`) so the recon runs on BOTH the metal tegra build (combine with `UNAOS_TEGRA=1`) and the
+# virt witness build (graceful skip — no Tegra234 RC). Read-only beyond kernel page tables: no
+# fabric/config/BAR write, no link retrain, no BAR sizing; the ONLY writes are Device-nGnRE page-table
+# mappings. OFF (default) => module + both call sites vanish, byte-identical to baseline. See
+# arch_arm64.md §ORIN-NET-2 and scripts/orin-net2-bench.md.
+pcie2 = []
+
 # CORE3-PROBE: instrument the aarch64 secondary-core entry stub (`_secondary_start`) to raw-dump,
 # MMU-off / no-stack, each core's MPIDR_EL1 low byte, CurrentEL, and its arrival x0 to the Pi 4 PL011
 # (0xFE201000) BEFORE any Rust runs. Disambiguates the CORE3-SMP >1 MiB core-3 regression (firmware

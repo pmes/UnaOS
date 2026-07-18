@@ -514,6 +514,108 @@ pub fn map_fb_region(pa: u64, size: usize) -> bool {
     all_ok
 }
 
+/// A valid Device-nGnRE 1 GiB block: bits[1:0]=0b01 (block) AND AttrIdx (bits[4:2]) == 1 (MAIR Device).
+#[cfg(feature = "pcie2")]
+#[inline]
+fn is_device_block(desc: u64) -> bool {
+    desc & 0b11 == DESC_BLOCK && desc & (0b111 << 2) == ATTR_DEVICE
+}
+
+/// ORIN-NET-2 (`pcie2`): the outcome of trying to reach an MMIO aperture at EL2 for a read-only walk.
+#[cfg(feature = "pcie2")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum MmioMap {
+    /// The aperture's GiB(s) are already Device-nGnRE (the GiB-0 low peripheral window or the GiB-1
+    /// SYSRAM/peripheral window filled at `init`) — no descriptor written; read directly.
+    AlreadyMapped,
+    /// A new Device-nGnRE 1 GiB block was installed in both live tables to reach the aperture.
+    Mapped,
+    /// The aperture's PA is at/above the tegra regime's output-address ceiling (TCR_EL2.PS = 0b001 =
+    /// 36-bit / 64 GiB — see `TCR_EL2_VAL`): a block descriptor there would raise an address-size
+    /// fault. Reaching it needs a **TCR_EL2.PS widen** — a translation-regime change beyond a
+    /// page-table write (a STOP tripwire for a read-only recon arc). Left un-walked; NET-3 territory.
+    BeyondPsCeiling,
+}
+
+/// The tegra regime maps PA via 1 GiB L1 blocks with TCR_EL2.PS = 0b001 (36-bit / 64 GiB — the value
+/// encoded in `TCR_EL2_VAL` [18:16]). A block whose output PA is at or above 64 GiB cannot be produced
+/// by this regime; it is the ceiling `map_mmio_window` refuses at.
+#[cfg(feature = "pcie2")]
+const PS_GIB_CEILING: u64 = 64;
+
+/// ORIN-NET-2 (`pcie2`): reach an MMIO aperture `[pa, pa+size)` for a **READ-ONLY** walk, mapped
+/// Device-nGnRE, via the EXISTING kernel page-table path — the same L1-block mechanism `map_fb_region`
+/// uses, but Device instead of Normal-WB and idempotent against the already-mapped peripheral windows.
+/// This is the ONLY write ORIN-NET-2 performs, and it is only ever a page-table descriptor: no fabric,
+/// config, BAR, or system-register write (a TCR.PS widen would be needed for a beyond-ceiling aperture,
+/// and this function REFUSES that rather than perform it — see `BeyondPsCeiling`).
+///
+/// Whole-GiB granularity (the L1 block size): a small aperture just marks its containing GiB Device.
+/// Device memory is non-speculative, so marking the GiB only enables EXPLICIT accesses — the caller
+/// reads solely the bounded aperture it asked for. Patches BOTH the live EL2 `L1` and the EL1-precise
+/// twin `L1_EL1` (like `map_fb_region`) so the window survives a later JM6 EL2→EL1 drop, then flushes
+/// the ACTIVE regime's TLB. Idempotent: a GiB already Device (GiB-0/1) returns `AlreadyMapped` without
+/// touching the tables. On the EL1-fallback path `L1` itself carries the EL1 recipe (no separate twin).
+#[cfg(feature = "pcie2")]
+pub fn map_mmio_window(pa: u64, size: usize) -> MmioMap {
+    if pa == 0 || size == 0 {
+        // A zero base/size is an absent or unresolvable aperture, not a mappable window.
+        return MmioMap::BeyondPsCeiling;
+    }
+    let g_lo = pa >> 30;
+    let g_hi = (pa + size as u64 - 1) >> 30;
+    // Above the 36-bit PS output ceiling: refuse (do NOT widen the regime here — STOP tripwire).
+    if g_hi >= PS_GIB_CEILING {
+        return MmioMap::BeyondPsCeiling;
+    }
+    let el = current_el();
+    let l1 = &raw mut L1 as *mut u64;
+    // The EL1 twin only exists on the EL2-primary path; on the EL1 fallback `L1` doubles as both.
+    let patch_twin = el == 2;
+    let l1_el1 = &raw mut L1_EL1 as *mut u64;
+    let mut changed = false;
+    let mut all_already = true;
+    for g in g_lo..=g_hi {
+        let gi = g as usize;
+        let cur = unsafe { l1.add(gi).read_volatile() };
+        if !is_device_block(cur) {
+            unsafe {
+                l1.add(gi).write_volatile(device_block(g << 30, el));
+                clean_desc(l1.add(gi) as u64);
+            }
+            changed = true;
+            all_already = false;
+        }
+        if patch_twin {
+            let cur1 = unsafe { l1_el1.add(gi).read_volatile() };
+            if !is_device_block(cur1) {
+                unsafe {
+                    l1_el1.add(gi).write_volatile(device_block(g << 30, 1));
+                    clean_desc(l1_el1.add(gi) as u64);
+                }
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        // Publish the new descriptors + drop stale TLB state for the ACTIVE regime (the `dsb sy` also
+        // orders the `dc cvac`s above). The EL1 twin needs no TLBI here — the JM6 drop's own
+        // `tlbi vmalle1` flushes EL1&0 before that regime is armed. Mirrors `map_fb_region`.
+        unsafe {
+            if el == 2 {
+                core::arch::asm!("dsb sy", "tlbi alle2", "dsb sy", "isb", options(nostack, preserves_flags));
+            } else {
+                core::arch::asm!("dsb sy", "tlbi vmalle1", "dsb sy", "isb", options(nostack, preserves_flags));
+            }
+        }
+    }
+    if all_already {
+        MmioMap::AlreadyMapped
+    } else {
+        MmioMap::Mapped
+    }
+}
+
 // ── Part C: bounded fault visibility ────────────────────────────────────────────────────────────────
 //
 // A minimal, inert-until-it-fires EL2/EL1 vector table. Two 2 KiB-aligned tables (16 entries each, at

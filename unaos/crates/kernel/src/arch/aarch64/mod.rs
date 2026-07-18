@@ -51,9 +51,9 @@ pub mod bus;
 pub mod mmu_tegra;
 // JB1a: bounded read-only FDT walker — prints the BPMP IPC geometry (shmem/mboxes/reserved-memory)
 // from the firmware DTB, the verified starting line for the BPMP IVC arc (JB1).
-// (ORIN-NET-1 also reuses this walker's `Fdt`/`for_each_prop` for its read-only PCIe census, so it
-// is compiled for the `pcieprobe` virt witness build as well as every tegra build.)
-#[cfg(any(feature = "tegra", feature = "pcieprobe"))]
+// (ORIN-NET-1/-2 also reuse this walker's `Fdt`/`for_each_prop` for their read-only PCIe census, so it
+// is compiled for the `pcieprobe`/`pcie2` virt witness builds as well as every tegra build.)
+#[cfg(any(feature = "tegra", feature = "pcieprobe", feature = "pcie2"))]
 pub mod fdt_tegra;
 // JB1b: the BPMP IVC command channel (shmem queues + HSP doorbell) — first light is MRQ_PING; the
 // transport every partition-ungate MRQ (XUSB, nvdisplay) rides on.
@@ -85,14 +85,15 @@ pub mod smpprobe;
 #[cfg(all(feature = "baremetal", feature = "v3d"))]
 pub mod v3d;
 
-// ORIN-NET-1: the `UNAOS_PCIEPROBE=1` read-only PCIe root-complex + NIC recon census
-// (arch/aarch64/pcie_probe.rs). DTB census of every `pcie@` controller + a guarded, poison-rejecting
-// config-space liveness read for firmware-ENABLED controllers whose aperture is already mapped.
-// Wired into `tegra_early_stop` (metal census) and the virt GICv3 path (QEMU graceful-skip witness).
-// `pcieprobe`-gated only — NOT tegra-runtime-gated — so the module compiles for both the tegra and
-// the `virt` builds (the QEMU witness needs it on the virt path). With the knob OFF (default) the
-// module + both call sites vanish and every image is byte-identical to baseline.
-#[cfg(feature = "pcieprobe")]
+// ORIN-NET-1 (`UNAOS_PCIEPROBE=1`) + ORIN-NET-2 (`UNAOS_PCIE2=1`): read-only PCIe root-complex + NIC
+// recon (arch/aarch64/pcie_probe.rs). NET-1 = DTB census of every `pcie@` controller + a guarded,
+// poison-rejecting config-space liveness read for firmware-ENABLED, already-mapped controllers. NET-2
+// = controller-0 link state (DBI PCIe-capability Link Status) + config/ECAM aperture mapping (the
+// existing kernel page-table path) + bus-0/bus-1 walk. Both wired into `tegra_early_stop` (metal) and
+// the virt GICv3 path (QEMU graceful-skip witness). Feature-gated only — NOT tegra-runtime-gated — so
+// the module compiles for both the tegra and the `virt` builds. With BOTH knobs OFF (default) the
+// module + all call sites vanish and every image is byte-identical to baseline.
+#[cfg(any(feature = "pcieprobe", feature = "pcie2"))]
 pub mod pcie_probe;
 
 pub fn init() {
