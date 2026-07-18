@@ -760,6 +760,13 @@ const K3_PAT_LEN: u64 = 12288;
 /// K3-mount witness (locate + mount + superblock sanity + seam bound-check;
 /// root `ls` + byte-verified reads through resolve/extent walking).
 ///
+/// bit5 (root `ls`) requires the two staged fixture files present + readable and
+/// every other root entry to be a legitimate native ACL row file (`acl-*`, the
+/// on-disk sidecar successor that boot migration + `native_acl_write` place in
+/// this root) — NOT an exact count of two, which dropped the bit (`w=0x1df`) on
+/// any metal card carrying a live owner row. A leaked scratch fixture still fails
+/// the bit, so the self-clean discipline stays protected.
+///
 /// Called at the tail of the aarch64 `u7_launcher` fixture chain (the
 /// `k4_ready_selftest` idiom): one-shot, read-only, and its serial evidence is
 /// the uncounted `:: K3-mount: … ::` line — never a `-> PASS` fixture line, so
@@ -814,7 +821,19 @@ pub fn k3_mount_selftest() {
             r |= 1 << 3;
         }
 
-        // bit5: `ls /` sees exactly the two staged fixture FILES.
+        // bit5: `ls /` finds the two staged fixture FILES, and every OTHER root entry
+        // is a legitimate native ACL row file (`acl-<lba>-<off>`, see `acl_file_name`).
+        //
+        // The native ACL store — the sidecar's on-disk successor (K6/K7) — writes its
+        // rows AS FILES into THIS root: boot-time `native_migrate_from_sidecar` (run at
+        // the head of `u7_launcher`, BEFORE this witness) materialises a real owned
+        // file's committed row into an `acl-*` file the moment a metal card carries one.
+        // That row is durable, by-design security state (never residue), so an exact
+        // `entries.len() == 2` was over-strict against legitimate volumes and dropped
+        // this bit (`w=0x1df`) on any card with a live owner row. The honest assertion:
+        // both fixtures present + readable, and no UNEXPECTED entry — a leaked scratch
+        // fixture (K4TEST/K8CUT/…, none `acl-`-prefixed) still fails this bit, so the
+        // fixtures' self-clean discipline stays genuinely protected.
         if let Ok(entries) = fs.ls(fs.superblock.root_inode) {
             let hello = entries
                 .iter()
@@ -822,7 +841,10 @@ pub fn k3_mount_selftest() {
             let pat = entries
                 .iter()
                 .find(|e| e.name == "K3PAT.BIN" && e.kind == ::unafs::FileKind::File);
-            if entries.len() == 2 && hello.is_some() && pat.is_some() {
+            let only_fixtures_and_acl = entries.iter().all(|e| {
+                e.name == "K3HELLO.TXT" || e.name == "K3PAT.BIN" || e.name.starts_with("acl-")
+            });
+            if hello.is_some() && pat.is_some() && only_fixtures_and_acl {
                 r |= 1 << 5;
             }
         }
