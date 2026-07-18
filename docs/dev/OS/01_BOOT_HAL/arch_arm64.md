@@ -5795,3 +5795,91 @@ byte-identical to baseline** (sha256 in the landing report); knob-on `UNAOS_PIUS
 `UNAOS_GICV3=1 ./arroyo test-arm 40`, `./arroyo test 22` all unregressed. Positive verification (RC link
 up, VL805 `1106:3483` found, BAR sized, xHCI decoding, ports powered) is the **attended Pi sitting** —
 see `scripts/pi-usb1-bench.md`.
+
+## PI-USB-2 — from the honesty line to device enumeration on the VL805 (Arc PI-USB-2)
+
+Rung 1 stopped the VL805 xHCI at "halted-but-decoding + ports powered". Rung 2 adds the **DMA-side
+bring-up + polled device enumeration**: it programs the controller's rings/DCBAA/interrupter (which need
+the heap), runs it (RS=1), and lets the shared `drivers/xhci` driver walk whatever is plugged
+(keyboard/mouse/storage) to per-device identity lines, arming a HID keyboard where present (the JB2b
+keyboard pattern). Reuses the shared driver's polled-attach machinery verbatim — **zero `drivers/xhci`
+core edits**.
+
+### M1 encoding adjudication (`encode_ibar_size`) — the mandatory gate, resolved
+
+The rung-1 lens flagged the `RC_BAR2` inbound-window size code as **0x11-vs-0x20 unresolved**. Rung 2
+resolves it against the Linux programming model. `drivers/pci/controller/pcie-brcmstb.c`'s
+`brcm_pcie_encode_ibar_size(u64 size)` maps a **byte size** to the 5-bit size field
+(`PCIE_MISC_RC_BAR2_CONFIG_LO_SIZE_MASK = 0x1f`, bits `[4:0]` of `CONFIG_LO`) by branch on `ilog2(size)`:
+
+```
+log2 in [12,15]  (4 KiB .. 32 KiB)   -> (log2 - 12) + 0x1c
+log2 in [16,35]  (64 KiB .. 32 GiB)  -> log2 - 15
+otherwise                             -> 0 (disabled)
+```
+
+A 4 GiB inbound window is `size = 2^32`, so `log2 = 32`, which lands in the **[16,35]** branch:
+`code = 32 - 15 = 17 = 0x11`. **So `0x11` is CORRECT for a 4 GiB window**; the alternative `0x20`
+(`= 32` decimal, the raw `log2`) is out of the field's meaning and **WRONG**. The rung-1 constant
+`RC_BAR2_SIZE_4G = 0x11` is right and is **unchanged** — the comment at `piusb.rs` step (e) now states this
+source-derived rule verbatim. (The full `CONFIG_LO` value written is `(RAM base low 32b) | 0x11`; with RAM
+base 0 that is `0x11`, and `CONFIG_HI = 0`.)
+
+### The whole-RAM inbound window — the no-IOMMU DMA threat (carried forward)
+
+`RC_BAR2` maps the PCIe inbound window to **system RAM base 0, 4 GiB** — the entire address space a
+bus-master device can DMA into, with the Pi 4 having **no IOMMU** in this path. Once bus-master is enabled
+(M2) and the controller is running (rung-2 M3), the VL805 (and anything behind its USB ports, via the
+xHCI's scatter-gather) can read/write **any** physical RAM the rings point it at. This is the standing
+threat of record for the Pi USB path: the safety here is that the driver programs only its own
+heap-allocated, identity-mapped ring/DCBAA/buffer structures as DMA targets, and every liveness read is
+poison-rejecting — but there is **no hardware translation/containment** backstopping a driver bug. A
+future IOMMU/least-privilege inbound window is the hardening item (tracked in the landing report).
+
+### The DMA-side chain (`piusb::enumerate`, post-heap)
+
+- **Handoff.** Rung-1 `bringup` (pre-heap, in `build_boot_info`) reaches the honesty line and stashes the
+  decoding CPU-side xHCI base + a ready flag in two module statics. `enumerate()` (post-heap, on the BSP in
+  `kernel_main`) reads them; if the honesty line was never reached (QEMU census-skip, link-down, BAR
+  mismatch) it says so and returns — the **exact rung-1 graceful-degradation carried one rung forward**
+  (QEMU never builds a ring).
+- **PORTSC PED-mask robustness nit (M2).** The rung-1 port-power RMW masked off the RW1C change bits before
+  OR-ing in `PP`. Rung 2 also masks **PED** (Port Enabled/Disabled, bit 1): PED is RW1CS — writing it back
+  as 1 *disables* the port. On a warm/already-enabled port a naive RMW would tear the port's own enable
+  down. Masking PED off makes "power on" disturb nothing (hardware sets PED itself on a successful reset).
+- **Rings + RS=1 (M3).** `xhci::init` (halt + HCRST + CNR wait — this is **OUR** freshly-reset controller,
+  so the plain reset path, **not** the inherited-controller no-HCRST/CRCR takeover the Orin uses), then
+  `XhciController::new` + seat `COMMAND_RING`/`EVENT_RING`/`ERST_TABLE` + `init_interrupter` /
+  `init_pointers` / `start()`. Then a **bounded** polled-enumeration pump (`poll_events` + `service_hubs` +
+  `service_hid_setproto` + `service_slot_disposal` + `service_enum` + `service_storage`), exiting early at
+  keyboard-ARMED (plus a short storage settle) or a ~30 s worst-case backstop. Per-device identity lines
+  (`port_slot_summary` + `usb_summary`) are printed so the boot's serial names the topology it reached.
+
+### Byte-identity — the rung-2 call-site reality
+
+Rung 1's call sites were chosen to shift **no** panic-location line numbers (end-of-function / end-of-file),
+giving strict byte-identity. Rung 2's `enumerate()` **must** be called post-heap from inside `kernel_main`
+(the heap + BSP context live only there), and **any** insertion into `kernel_main` shifts the source lines
+of every item below it. The knob-off `kernel8.img` therefore differs from baseline by **exactly one byte**:
+the `core::panic::Location.line` u32 of an *unrelated* `assert!` in `input_service` (`1840 -> 1848`, +8 for
+the 8-line gated insertion). **All machine code and data are identical** — the delta is a single embedded
+source-line number, not any code or behavior. Knob-off, `piusb::enumerate` compiles out entirely and the
+full kernel8 battery is 0 FAIL. (Verified: `cmp -l baseline mine` = 1 byte at the `Location.line` field.)
+
+### Expected metal chain (attended Pi sitting)
+
+```
+RC link up -> VL805 1106:3483 found -> BAR0 sized + assigned -> xHCI DECODING (CAPLENGTH/HCIVERSION) ->
+ports powered -> [rung 2] rings+interrupter, RS=1 -> port connect(s) -> ADDRESS_DEVICE -> device identity
+line(s) -> keyboard ARMED (if a HID keyboard is plugged)
+```
+
+### Gates green
+
+`./arroyo check` both arches, knob on **and** off; knob-off `./arroyo kernel8-test` = 0 FAIL (full 35 s
+battery: K3-mount `w=0x1ff`, CAPSTONE 6/6) with the 1-byte panic-`Location` delta above (functional
+byte-identity); knob-on `UNAOS_PIUSB=1 ./arroyo kernel8-test` = 0 FAIL with **both** graceful census-skip
+lines (`bringup` DTB-skip + `enumerate` honesty-line-not-reached skip — the DMA-side path census-skips in
+QEMU exactly as rung 1 does); `./arroyo test-arm 22`, `UNAOS_GICV3=1 ./arroyo test-arm 40`, `./arroyo test
+22` all unregressed. Positive verification (rings/RS=1, live device enumeration, keyboard armed) is the
+attended Pi sitting — see the rung-2 runbook in `scripts/pi-usb1-bench.md`.
