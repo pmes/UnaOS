@@ -98,11 +98,12 @@ mod metal {
     const CR_RST: u8 = 1 << 4;
     const CR_RE: u8 = 1 << 3;
     const CR_TE: u8 = 1 << 2;
-    /// TPPoll: kick the normal-priority TX queue (NPQ) after posting a descriptor. (M3 `transmit`.)
-    #[allow(dead_code)]
+    /// TPPoll: kick the normal-priority TX queue (NPQ) after posting a descriptor.
     const REG_TPPOLL: u64 = 0x38;
-    #[allow(dead_code)]
     const TPPOLL_NPQ: u8 = 1 << 6;
+    /// PHYstatus (8-bit): LinkSts (bit 1) — 1 = link up.
+    const REG_PHYSTATUS: u64 = 0x6c;
+    const PHYSTATUS_LINKSTS: u8 = 1 << 1;
     /// IMR / ISR: interrupt Mask / Status (16-bit). Polled bring-up ⇒ IMR = 0, ISR write-1-to-clear.
     const REG_IMR: u64 = 0x3c;
     const REG_ISR: u64 = 0x3e;
@@ -154,10 +155,8 @@ mod metal {
     const DESC_OWN: u32 = 1 << 31;
     /// EOR: End Of Ring — set on the last descriptor so the NIC wraps to descriptor 0.
     const DESC_EOR: u32 = 1 << 30;
-    /// FS / LS: First / Last Segment (a single-buffer frame sets both). TX only. (M3 `transmit`.)
-    #[allow(dead_code)]
+    /// FS / LS: First / Last Segment (a single-buffer frame sets both). TX only.
     const DESC_FS: u32 = 1 << 29;
-    #[allow(dead_code)]
     const DESC_LS: u32 = 1 << 28;
     /// Frame-length / buffer-size field, bits [13:0].
     const DESC_LEN_MASK: u32 = 0x3fff;
@@ -191,16 +190,11 @@ mod metal {
         mac: [u8; 6],
         rx_ring: *mut Desc,
         rx_buffers: *mut u8,
-        // The ring cursors + counters are advanced by the M3 raw_rx/transmit poll path.
-        #[allow(dead_code)]
         rx_cur: usize,
-        #[allow(dead_code)]
         rx_count: u64,
         tx_ring: *mut Desc,
         tx_buffers: *mut u8,
-        #[allow(dead_code)]
         tx_cur: usize,
-        #[allow(dead_code)]
         tx_count: u64,
     }
 
@@ -371,6 +365,83 @@ mod metal {
                 P4, rx_phys, NUM_RX, tx_phys, NUM_TX, tcr_rb
             );
             true
+        }
+
+        /// Link state from PHYstatus.LinkSts (bit 1).
+        fn link_up(&self) -> bool {
+            self.r8(REG_PHYSTATUS) & PHYSTATUS_LINKSTS != 0
+        }
+
+        /// Transmit one raw Ethernet frame (smoltcp builds the full L2 frame): copy it into the next
+        /// TX buffer, post an OWN|FS|LS descriptor, kick the normal-priority queue (TPPoll.NPQ), and
+        /// wait (bounded) for the NIC to clear OWN. A stalled link leaves OWN set — surfaced, not
+        /// silently counted. Mirrors the e1000 `transmit` head/tail discipline.
+        fn transmit(&mut self, frame: &[u8]) {
+            let i = self.tx_cur;
+            let len = frame.len().min(TX_BUF_SIZE);
+            let buf = unsafe { self.tx_buffers.add(i * TX_BUF_SIZE) };
+            unsafe { core::ptr::copy_nonoverlapping(frame.as_ptr(), buf, len) };
+            let eor = if i == NUM_TX - 1 { DESC_EOR } else { 0 };
+            let d = Desc {
+                opts1: DESC_OWN | DESC_FS | DESC_LS | eor | (len as u32 & DESC_LEN_MASK),
+                opts2: 0,
+                addr: (self.tx_buffers as u64) + (i * TX_BUF_SIZE) as u64,
+            };
+            unsafe { write_volatile(self.tx_ring.add(i), d) };
+            // Publish the descriptor + buffer before poking the doorbell.
+            unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
+            self.w8(REG_TPPOLL, TPPOLL_NPQ);
+            self.tx_cur = (i + 1) % NUM_TX;
+
+            // Wait (bounded) for the descriptor to be handed back (OWN cleared by the NIC).
+            let mut done = false;
+            for _ in 0..1_000_000 {
+                let dd = unsafe { read_volatile(self.tx_ring.add(i)) };
+                if dd.opts1 & DESC_OWN == 0 {
+                    done = true;
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+            if done {
+                self.tx_count += 1;
+            } else {
+                serial_println!("{}   [tx] descriptor {} never completed (OWN still set — link stalled?) ::", P4, i);
+            }
+        }
+
+        /// Pop one completed RX descriptor's raw Ethernet frame into `out` and recycle the descriptor
+        /// (re-arm OWN + buffer size), advancing the ring cursor. Returns the copied length, or `None`
+        /// if the current descriptor is still NIC-owned (ring empty). The C+ analog of the e1000
+        /// `rx_frame_raw` — no responder dispatch, smoltcp owns the stack.
+        fn rx_frame_raw(&mut self, out: &mut [u8]) -> Option<usize> {
+            let d = unsafe { read_volatile(self.rx_ring.add(self.rx_cur)) };
+            // OWN set ⇒ still owned by the NIC (not yet filled) ⇒ ring empty.
+            if d.opts1 & DESC_OWN != 0 {
+                return None;
+            }
+            // Hardware wrote the received length into the length field; clamp so a misbehaving NIC can
+            // never make us build an out-of-bounds slice.
+            let len = (d.opts1 & DESC_LEN_MASK) as usize;
+            let len = len.min(RX_BUF_SIZE).min(out.len());
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    self.rx_buffers.add(self.rx_cur * RX_BUF_SIZE),
+                    out.as_mut_ptr(),
+                    len,
+                );
+            }
+            self.rx_count += 1;
+            // Recycle: re-arm this descriptor for the NIC (OWN + buffer size + EOR on the last slot).
+            let eor = if self.rx_cur == NUM_RX - 1 { DESC_EOR } else { 0 };
+            let nd = Desc {
+                opts1: DESC_OWN | eor | (RX_BUF_SIZE as u32 & DESC_LEN_MASK),
+                opts2: 0,
+                addr: (self.rx_buffers as u64) + (self.rx_cur * RX_BUF_SIZE) as u64,
+            };
+            unsafe { write_volatile(self.rx_ring.add(self.rx_cur), nd) };
+            self.rx_cur = (self.rx_cur + 1) % NUM_RX;
+            Some(len)
         }
     }
 
@@ -625,15 +696,166 @@ mod metal {
             return;
         }
 
-        // Register the driver so the smoltcp bind (M3) + any poll path can reach it.
+        // Register the driver so the smoltcp bind + any poll path can reach it.
+        let link = nic.link_up();
         *NET4_DEVICE.lock() = Some(nic);
         serial_println!(
-            "{} ORIN-NET-4 M2 DONE — RTL8168 @ BAR2 {:#x}, MAC read, C+ rings up + RX/TX enabled (smoltcp bind = M3) ::",
-            P4, bar_base
+            "{}   RTL8168 @ BAR2 {:#x}, MAC read, C+ rings up + RX/TX enabled; PHY link {} ::",
+            P4, bar_base, if link { "UP" } else { "DOWN" }
         );
+
+        // ── M3: bind a smoltcp phy::Device over the rings (the e1000/smolnet seam) ──
+        bind_smoltcp();
+        serial_println!("{} ORIN-NET-4 DONE — RTL8168 driver up + smoltcp bound (live traffic = attended metal) ::", P4);
     }
 
     /// The one registered RTL8168 NIC (populated by [`net4_bringup`]). Mirrors the x86 e1000
-    /// `NET_DEVICE` registry; the smoltcp Device adapter (M3) reaches the rings through it.
+    /// `NET_DEVICE` registry; the smoltcp Device adapter reaches the rings through it.
     pub static NET4_DEVICE: spin::Mutex<Option<Rtl8168>> = spin::Mutex::new(None);
+
+    // ── Static bring-up addressing (no DHCP server on the devkit's link pre-config) ──
+    // The Orin devkit's NIC has no DHCP lease pre-metal; a static bring-up address lets the smoltcp
+    // interface bind and (on metal) exercise ARP/ICMP against the link. Placeholder values, revisited
+    // once the metal link's real subnet is known (documented in arch_arm64.md §ORIN-NET-4).
+    const OUR_IP: [u8; 4] = [192, 168, 1, 2];
+    const GATEWAY_IP: [u8; 4] = [192, 168, 1, 1];
+    /// A full Ethernet frame fits (RX_BUF_SIZE is 2048); the Device scratch is stack/struct-local.
+    const FRAME_CAP: usize = 1536;
+
+    // ── Raw L2 accessors over the NET4_DEVICE registry (the smoltcp Device seam) ──
+
+    /// Pop one raw RX frame for the smoltcp Device. Short-locks NET4_DEVICE per ring op (the poll must
+    /// not hold the lock across a transmit) — the e1000 `raw_rx` discipline.
+    fn raw_rx(out: &mut [u8]) -> Option<usize> {
+        NET4_DEVICE.lock().as_mut().and_then(|n| n.rx_frame_raw(out))
+    }
+    /// Transmit one raw L2 frame from the smoltcp Device. Short-locks NET4_DEVICE.
+    fn raw_tx(frame: &[u8]) {
+        if let Some(n) = NET4_DEVICE.lock().as_mut() {
+            n.transmit(frame);
+        }
+    }
+    /// `(MAC, our IP, link-up)` for the interface config. `None` if the NIC never came up.
+    fn hw_addr() -> Option<([u8; 6], [u8; 4], bool)> {
+        NET4_DEVICE.lock().as_ref().map(|n| (n.mac, OUR_IP, n.link_up()))
+    }
+
+    // ── The smoltcp phy::Device over the RTL8168 rings (the x86 e1000/smolnet seam, transposed) ──
+
+    use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage};
+    use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
+    use smoltcp::socket::icmp;
+    use smoltcp::time::Instant;
+    use smoltcp::wire::{
+        EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address,
+    };
+
+    /// A `smoltcp::phy::Device` backed by the RTL8168. Owns RX/TX scratch so the tokens can borrow
+    /// disjoint fields (smoltcp hands out both from one `receive()` to build a reply in place).
+    struct Rtl8168Phy {
+        rx: [u8; FRAME_CAP],
+        rlen: usize,
+        tx: [u8; FRAME_CAP],
+    }
+    impl Rtl8168Phy {
+        fn new() -> Self {
+            Rtl8168Phy { rx: [0; FRAME_CAP], rlen: 0, tx: [0; FRAME_CAP] }
+        }
+    }
+
+    struct PhyRxToken<'a> {
+        buf: &'a [u8],
+    }
+    struct PhyTxToken<'a> {
+        buf: &'a mut [u8],
+    }
+    impl RxToken for PhyRxToken<'_> {
+        fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R {
+            f(self.buf)
+        }
+    }
+    impl TxToken for PhyTxToken<'_> {
+        fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
+            let n = len.min(self.buf.len());
+            let r = f(&mut self.buf[..n]);
+            raw_tx(&self.buf[..n]);
+            r
+        }
+    }
+    impl Device for Rtl8168Phy {
+        type RxToken<'a> = PhyRxToken<'a>;
+        type TxToken<'a> = PhyTxToken<'a>;
+
+        fn receive(&mut self, _t: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+            let len = raw_rx(&mut self.rx)?;
+            self.rlen = len;
+            let Rtl8168Phy { rx, rlen, tx } = self;
+            Some((PhyRxToken { buf: &rx[..*rlen] }, PhyTxToken { buf: tx }))
+        }
+
+        fn transmit(&mut self, _t: Instant) -> Option<Self::TxToken<'_>> {
+            Some(PhyTxToken { buf: &mut self.tx })
+        }
+
+        fn capabilities(&self) -> DeviceCapabilities {
+            let mut caps = DeviceCapabilities::default();
+            caps.medium = Medium::Ethernet;
+            caps.max_transmission_unit = 1500;
+            caps
+        }
+    }
+
+    /// Bind a smoltcp `Interface` over the RTL8168 Device and poll it a bounded number of times — the
+    /// x86 e1000/smolnet seam, transposed to aarch64/tegra. This PROVES the bind end-to-end (Device +
+    /// Interface + ICMP socket construct and poll without fault); on real Orin silicon it drives ARP
+    /// for the gateway. In QEMU there is no Tegra234 RC (so this metal path is never reached on virt),
+    /// and on metal-pre-subnet-config the poll simply finds an empty ring — the honest pre-metal state.
+    /// All storage is stack-local (no heap growth), mirroring `smolnet::pump`.
+    fn bind_smoltcp() {
+        let Some((mac, our_ip, up)) = hw_addr() else {
+            serial_println!("{}   smoltcp bind SKIPPED — no NIC registered ::", P4);
+            return;
+        };
+        let mut dev = Rtl8168Phy::new();
+        let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
+        config.random_seed = 0x4e45_5434; // ASCII "NET4"
+        let mut iface = Interface::new(config, &mut dev, Instant::from_millis(0));
+        iface.update_ip_addrs(|addrs| {
+            let _ = addrs.push(IpCidr::new(
+                IpAddress::v4(our_ip[0], our_ip[1], our_ip[2], our_ip[3]),
+                24,
+            ));
+        });
+        let _ = iface.routes_mut().add_default_ipv4_route(Ipv4Address::new(
+            GATEWAY_IP[0], GATEWAY_IP[1], GATEWAY_IP[2], GATEWAY_IP[3],
+        ));
+
+        // One ICMP socket, so the poll has a real socket set to service (proves the full seam binds).
+        let mut rx_meta = [icmp::PacketMetadata::EMPTY; 4];
+        let mut rx_payload = [0u8; 256];
+        let mut tx_meta = [icmp::PacketMetadata::EMPTY; 4];
+        let mut tx_payload = [0u8; 256];
+        let rx_buffer = icmp::PacketBuffer::new(&mut rx_meta[..], &mut rx_payload[..]);
+        let tx_buffer = icmp::PacketBuffer::new(&mut tx_meta[..], &mut tx_payload[..]);
+        let socket = icmp::Socket::new(rx_buffer, tx_buffer);
+        let mut storage: [SocketStorage; 1] = Default::default();
+        let mut sockets = SocketSet::new(&mut storage[..]);
+        let _handle = sockets.add(socket);
+
+        // Bounded poll — on metal this pumps ARP for the gateway; pre-subnet / empty-ring it is a
+        // no-op. Kept small (this is a bind witness, not a traffic test): the attended sitting drives
+        // real ICMP once the link's subnet is known.
+        let mut clock: i64 = 0;
+        while clock < 4096 {
+            clock += 1;
+            iface.poll(Instant::from_millis(clock), &mut dev, &mut sockets);
+        }
+        serial_println!(
+            "{}   smoltcp 0.13 Interface BOUND over RTL8168: MAC set, {}.{}.{}.{}/24 + default gw {}.{}.{}.{}, medium=ethernet, polled OK; link {} — live ICMP/ARP is attended-metal ::",
+            P4,
+            our_ip[0], our_ip[1], our_ip[2], our_ip[3],
+            GATEWAY_IP[0], GATEWAY_IP[1], GATEWAY_IP[2], GATEWAY_IP[3],
+            if up { "UP" } else { "DOWN" }
+        );
+    }
 }
