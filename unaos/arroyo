@@ -242,6 +242,17 @@ _feats=""
 # `-netdev user -device virtio-net-device` QEMU args below (VNET_ARG); knob-off leaves BOTH the feature
 # and the QEMU invocation byte-identical to baseline. See arch_arm64.md §AARCH64-VNET.
 [ -n "${UNAOS_VNET:-}" ] && _feats="${_feats}vnet,"
+# PI-GENET: UNAOS_GENET=1 arms the BCM2711 on-board Gigabit Ethernet (Broadcom GENET v5) driver +
+# smoltcp bind — the Pi's FIRST network path (arch/aarch64/genet.rs). DTB-resolves the GENET register
+# base, poison-honest probes SYS_REV_CTRL to classify whether the build models GENET, brings up UMAC +
+# external RGMII PHY + TDMA/RDMA rings, reads the station MAC (DTB local-mac-address, else UMAC regs),
+# and binds a smoltcp phy::Device + DHCP/ping over the rings (the shared net_phy seam vnet/net4 ride).
+# Standalone (does NOT imply baremetal, mirroring net4/tegra): the MMIO/DMA metal half is
+# all(baremetal, aarch64)-gated, so this `check`-path arm compiles only the honest witness half (no
+# MMIO); the actual bring-up is the kernel8() build below (which sets baremetal). Pulls dep:smoltcp on
+# aarch64. Default OFF => module + call site vanish, smoltcp not pulled, byte-identical. See
+# arch_arm64.md §PI-GENET and scripts/pi-genet-bench.md.
+[ -n "${UNAOS_GENET:-}" ] && _feats="${_feats}genet,"
 if [ -n "$_feats" ]; then
     KERNEL_FEATURES="--features ${_feats%,}"
     echo -e "${COLOR_YELLOW}⚡ kernel features: ${_feats%,}${COLOR_RESET}"
@@ -834,6 +845,17 @@ kernel8() {
     if [ -n "${UNAOS_PIUSB:-}" ]; then
         K8_FEATS="${K8_FEATS},piusb"
         echo -e "${COLOR_YELLOW}  • UNAOS_PIUSB: BCM2711 PCIe RC + VL805 xHCI attach (attended-metal for positive verify)${COLOR_RESET}"
+    fi
+    # PI-GENET: UNAOS_GENET=1 adds the `genet` feature — the BCM2711 on-board Gigabit Ethernet (Broadcom
+    # GENET v5) driver + smoltcp bind (arch/aarch64/genet.rs), the Pi's FIRST network path. DTB-resolves
+    # the register base, poison-honest probes SYS_REV_CTRL (M1's platform-classifying read — QEMU raspi4b
+    # MAY model GENET; the boot log states which regime it took), brings up UMAC + external PHY +
+    # TDMA/RDMA rings, and binds smoltcp + DHCP/ping. OFF => the module + call site vanish and kernel8 is
+    # byte-identical to baseline (smoltcp not pulled). On QEMU the probe classifies honestly; positive
+    # link/DHCP verification is attended metal. See scripts/pi-genet-bench.md.
+    if [ -n "${UNAOS_GENET:-}" ]; then
+        K8_FEATS="${K8_FEATS},genet"
+        echo -e "${COLOR_YELLOW}  • UNAOS_GENET: BCM2711 GENET v5 GbE + smoltcp bind (M1 probe classifies QEMU modelling; attended-metal for link/DHCP)${COLOR_RESET}"
     fi
     echo -e "${COLOR_YELLOW}⚡ Building bare-metal kernel8.img (Pi 4, microSD-slot boot)...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/kernel"

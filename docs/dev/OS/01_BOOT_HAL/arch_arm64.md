@@ -6087,3 +6087,89 @@ lines (`bringup` DTB-skip + `enumerate` honesty-line-not-reached skip — the DM
 QEMU exactly as rung 1 does); `./arroyo test-arm 22`, `UNAOS_GICV3=1 ./arroyo test-arm 40`, `./arroyo test
 22` all unregressed. Positive verification (rings/RS=1, live device enumeration, keyboard armed) is the
 attended Pi sitting — see the rung-2 runbook in `scripts/pi-usb1-bench.md`.
+
+## PI-GENET — BCM2711 on-board Gigabit Ethernet (Broadcom GENET v5) + smoltcp bind (Arc PI-GENET)
+
+The Pi's **first network path.** The BCM2711 integrates a Broadcom "GENET" v5 unimac Ethernet
+controller (`ethernet@7d580000`, `brcm,bcm2711-genet-v5`) driving an external BCM54213PE RGMII PHY.
+`UNAOS_GENET=1` (the `genet` cargo feature, default OFF) arms `arch/aarch64/genet.rs`: it DTB-resolves
+the register base, poison-honest classifies the platform, brings up the UMAC + PHY + TDMA/RDMA
+descriptor rings per the Linux `bcmgenet` v5 programming model, reads the station MAC, and binds a
+`smoltcp::phy::Device` over the rings through the shared `net_phy` seam (the third rider, after
+AARCH64-VNET and ORIN-NET-4). It is **code-complete-prior-to-metal** (like ORIN-NET-4): positive
+link/DHCP verification is the attended Pi-4 sitting.
+
+### The load-bearing finding — QEMU 11.0.1 raspi4b does NOT model GENET
+
+The M1 empirical question ("does QEMU model GENET?") is settled on the bench, not assumed. QEMU
+`raspi4b` (bcm2838 SoC) does **not** model the GENET block, and — unlike an x86 open-bus read — an
+access to the unmodeled register window at ARM-physical `0xFD58_0000` raises a **synchronous external
+Data Abort** (`ESR=0x96000010`, EC=0x25, DFSC=0x10, `FAR=0xfd580000`), NOT a poison read. QEMU also
+hands `-kernel` boots **no usable DTB** (x0=`0x100`, size 0), so there is no `ethernet@7d580000` node
+to resolve either.
+
+Because an unmodeled read *faults* (it does not return `0xffffffff`), the classification is **DTB-gated
+before any MMIO**, the exact discipline **PI-USB** uses (piusb's `dtb_has_pcie` guard — QEMU raspi4b
+models no PCIe RC either, and touching `RC_BASE` blind would fault). M1 resolves the GENET node from
+the live firmware DTB and touches the register window **only** if the DTB actually describes one; a
+poison-honest `SYS_REV_CTRL` read then guards against a link-down/absent decode on real metal (the
+standing "read before the first write" law — the PI-V3D-1 / FAULT-AT-M1 lesson). On QEMU (no DTB node)
+the driver records an honest compiled-present line and returns **before any MMIO** — it never
+dereferences an unmodeled window. First metal run of the fault-forward path (the original
+documented-fallback probe *did* fault the BSP at `0xFD58_0000`; the DTB-gate fixed it in-arc).
+
+### MAC source
+
+The station MAC comes from the DTB `local-mac-address` property of the GENET node (the RPi firmware
+fills it) when present; otherwise the driver falls back to reading the UMAC `MAC0`/`MAC1` registers
+(the firmware programs them at boot). The boot log states which source it used.
+
+### Register / datapath model (Linux `bcmgenet` v5)
+
+Sub-blocks in the 64 KiB window: SYS (`0x0000`), EXT (`0x0080`), RBUF (`0x0300`), UMAC (`0x0800`),
+RDMA descriptors (`0x2000`) + ring/global regs (`0x2C00`), TDMA descriptors (`0x4000`) + ring/global
+regs (`0x4C00`). The driver uses the default descriptor ring index 16 (`DESC_INDEX`) for both RX and
+TX, exactly as `bcmgenet_init_dma`. The datapath is a **producer/consumer-index** ring (not the RTL8168
+per-descriptor OWN handoff): the driver advances the TX producer index after posting and the RX
+consumer index after draining; hardware advances the mirror index. Bring-up order follows
+`bcmgenet_open` / `init_umac` / `init_dma`: SYS port mode → UMAC soft reset + RBUF/TBUF flush → MAC +
+max-frame-len → MIB reset → RBUF 64B/align → RGMII OOB → RX/TX rings → `UMAC_CMD` TX/RX enable at
+gigabit + promiscuous bring-up filter. Interrupts masked (polled). Every register write is announced on
+serial before issue. The GENET register window lands in the `0xC000_0000..0xFFFF_FFFF` Device GiB
+`boot::build_l1` already maps, so — unlike piusb's outbound window / NET-4's iATU — no new page-table
+write is needed once resolved.
+
+### DMA / identity-map + coherency
+
+Rings + buffers are heap-allocated; the Pi bare-metal MMU maps RAM identity (VA==PA), so the pointer
+doubles as the DMA physical address (the x86 e1000 / NET-4 / VNET invariant). Published with `dsb sy`.
+The BCM2711 GENET is I/O-coherent toward DRAM; if attended metal ever shows stale descriptors on a live
+link, the fix is clean-before-own / invalidate-before-read on the rings + buffers — **not** a weakening
+of the index protocol.
+
+### Serial witness
+
+```
+:: PI-GENET: BCM GENET v5 GbE bring-up (DTB @<x0> size=<sz>) ::
+# QEMU raspi4b (the classification, fault-free):
+:: PI-GENET:   no DTB handed off (x0=0x100, size=0x0) — no GENET node to resolve ::
+:: PI-GENET:   GENET driver compiled-present; no GENET node in the DTB (QEMU raspi4b models no GENET,
+               or a DTB-less boot) — bring-up SKIPPED before any MMIO ... ::
+# Real Pi-4 metal (attended, expected chain):
+::   DTB GENET node reg child base 0x7d580000 -> ARM-physical 0xfd580000 (SoC ranges +0x80000000) ::
+::   SYS_REV_CTRL = 0x.......6 — LIVE GENET v5 ...; this build MODELS the block ::
+::   station MAC = <mac> (source: dtb local-mac-address | umac-reg readback) ::
+::   M2 bring-up ... rings up: RX/TX ring 16 (32 desc each); UMAC_CMD readback ... (live) ::
+::   external PHY (MDIO addr 1) link UP ::
+:: PI-GENET ping <gw> (4/4 sent, N/4 replies) [dhcp] link UP => PASS ::
+```
+
+### Gates green
+
+`./arroyo check` both arches, knob on **and** off; knob-off `./arroyo kernel8-test` = 0 FAIL with
+functional byte-identity to baseline (text/data/bss sizes identical; symbol tables identical after
+stripping build-path-dependent `.llvm.<hash>` suffixes — the PI-USB-2 build-path-metadata precedent);
+knob-on `UNAOS_GENET=1 ./arroyo kernel8-test` = 0 FAIL with the honest DTB-gated skip (BSP survives to
+the shell, CAPSTONE 6/6, no exception); `./arroyo test-arm 22`, `UNAOS_GICV3=1 ./arroyo test-arm 40`,
+`./arroyo test 22` all unregressed. Positive verification (live link autoneg → MAC → DHCP lease on the
+bench LAN → ping) is the attended Pi sitting — see `scripts/pi-genet-bench.md`.

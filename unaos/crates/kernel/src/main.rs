@@ -289,6 +289,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         #[cfg(feature = "piusb")]
         unaos_kernel::arch::piusb::enumerate();
 
+        // PI-GENET: the BCM2711 on-board Gigabit Ethernet (GENET v5) + smoltcp bind — the Pi's FIRST
+        // network path. DTB-resolves the register base, poison-honest probes SYS_REV_CTRL to classify
+        // whether this build models GENET (QEMU raspi4b MAY), brings up UMAC + PHY + TDMA/RDMA rings,
+        // and binds a smoltcp Device + DHCP/ping. Post-heap on the BSP (rings need the heap). Graceful
+        // skip on an absent decode. Default OFF => this call + the module vanish (byte-identical).
+        #[cfg(feature = "genet")]
+        unaos_kernel::arch::genet::genet_bringup(dtb_addr, dtb_size);
+
         // M6b: EL0 fault isolation + per-page user permissions. Four EL0 programs on one AP (never
         // the unscheduled BSP): hello (must still work — the code page is EL0-RX), then three that
         // each provoke a specific fault the kernel must answer by KILLING THE TASK, not halting —
