@@ -216,6 +216,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         #[cfg(all(feature = "net4", not(feature = "tegra")))]
         unaos_kernel::arch::rtl8168_tegra::net4_bringup(dtb_addr, dtb_size, jc3_ram_gib_mask);
 
+        // ORIN-SDMMC-1 (QEMU witness, `UNAOS_SDMMC=1` without `UNAOS_TEGRA=1`): QEMU models no Tegra234
+        // SDMMC controller, so the microSD recon has nothing to census. The `not(tegra)` build of
+        // `sdmmc_census` prints one honest compiled-present line and returns before any MMIO — keeping the
+        // GICv3 regression run unperturbed. Compiled out knob-off. See arch_arm64.md §ORIN-SDMMC.
+        #[cfg(all(feature = "sdmmc", not(feature = "tegra")))]
+        unaos_kernel::arch::sdmmc_tegra::sdmmc_census(dtb_addr, dtb_size, jc3_ram_gib_mask);
+
         // AARCH64-VNET (QEMU witness, `UNAOS_VNET=1`): drive a `virtio-net-device` on the `virt`
         // machine's virtio-mmio bus end-to-end — the QEMU-testable proof of the aarch64 smoltcp seam
         // NET-4 built (identical ring → phy::Device → Interface → ICMP-echo shape, with REAL packets
@@ -1361,6 +1368,15 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     // no Tegra234 RC). Compiled out knob-off => byte-identical to baseline. See arch_arm64.md §ORIN-NET-4.
     #[cfg(all(feature = "net4", feature = "tegra"))]
     unaos_kernel::arch::rtl8168_tegra::net4_bringup(dtb_addr, dtb_size, mmu.ram_gib_mask);
+
+    // ORIN-SDMMC-1 (`UNAOS_SDMMC=1`): the Tegra234 microSD-slot READ-ONLY recon on the metal Orin — the
+    // installer line's first rung. Resolves the SDMMC controller from the live DTB, maps its window,
+    // poison-honest CAPS probe, runs the SDHCI identification ladder (CID/CSD/capacity), and reads
+    // sector 0 (CMD17) to classify MBR/GPT/FAT. READ-ONLY to the card by construction. Metal + tegra-gated
+    // (QEMU models no Tegra234 SDMMC). Compiled out knob-off => byte-identical to baseline. See
+    // arch_arm64.md §ORIN-SDMMC and scripts/orin-sdmmc1-bench.md.
+    #[cfg(all(feature = "sdmmc", feature = "tegra"))]
+    unaos_kernel::arch::sdmmc_tegra::sdmmc_census(dtb_addr, dtb_size, mmu.ram_gib_mask);
 
     // ORIN-SMP-7 (boot-state-context bisect) — the PRE-xHCI-takeover dispatch site. With `smpprobe`
     // armed to leg 25, the real 5-core wake fires HERE — after JM4 (GIC/timer/SMC/serial live) and
