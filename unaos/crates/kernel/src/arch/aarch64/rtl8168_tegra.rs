@@ -42,22 +42,9 @@
 
 #![cfg(feature = "net4")]
 
-use super::fdt_tegra::Fdt;
-
 /// Stable serial prefix so the operator (and `mbench`) can grep the whole NET-4 bring-up as one block.
+/// (Used by both the witness half below and — via `use super::P4` — the tegra `metal` driver.)
 const P4: &str = ":: PCIE4:";
-
-/// The Realtek vendor id and the RTL8168/8111 device id the NET-3 metal enumeration found.
-const REALTEK_VENDOR: u16 = 0x10ec;
-const RTL8168_DEVICE: u16 = 0x8168;
-
-/// Poison patterns that mean ABSENT DECODE, never "present" (the PI-V3D-1 false-PASS lesson, shared
-/// with the NET-1/2/3 recon): `0xffffffff` = master-abort / unclaimed config; `0xdeadbeef` = firmware
-/// register/DRAM fill. A live config/register read is neither.
-#[inline]
-fn is_poison(v: u32) -> bool {
-    v == 0xffff_ffff || v == 0xdead_beef
-}
 
 // ── The witness half (virt / non-tegra build): one honest line, zero MMIO ──────────────────────────
 
@@ -82,10 +69,23 @@ pub use metal::net4_bringup;
 
 #[cfg(feature = "tegra")]
 mod metal {
-    use super::{is_poison, Fdt, P4, REALTEK_VENDOR, RTL8168_DEVICE};
+    use super::P4;
+    use crate::arch::aarch64::fdt_tegra::Fdt;
     use crate::arch::aarch64::mmu_tegra::{map_mmio_window, MmioMap};
     use core::alloc::Layout;
     use core::ptr::{read_volatile, write_volatile};
+
+    /// The Realtek vendor id and the RTL8168/8111 device id the NET-3 metal enumeration found.
+    const REALTEK_VENDOR: u16 = 0x10ec;
+    const RTL8168_DEVICE: u16 = 0x8168;
+
+    /// Poison patterns that mean ABSENT DECODE, never "present" (the PI-V3D-1 false-PASS lesson, shared
+    /// with the NET-1/2/3 recon): `0xffffffff` = master-abort / unclaimed config; `0xdeadbeef` =
+    /// firmware register/DRAM fill. A live config/register read is neither.
+    #[inline]
+    fn is_poison(v: u32) -> bool {
+        v == 0xffff_ffff || v == 0xdead_beef
+    }
 
     // ── RTL8168/8111 register offsets (bytes from the BAR2 MMIO window) ──
     /// IDR0..5: the six station-MAC bytes (offsets 0x00..0x05).
