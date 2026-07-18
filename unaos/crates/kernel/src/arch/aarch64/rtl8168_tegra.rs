@@ -80,6 +80,7 @@ mod metal {
     use super::P4;
     use crate::arch::aarch64::fdt_tegra::Fdt;
     use crate::arch::aarch64::mmu_tegra::{map_mmio_window, MmioMap};
+    use crate::arch::aarch64::net_phy::{fmt_mac, RawNic, SmoltcpPhy};
     use core::alloc::Layout;
     use core::ptr::{read_volatile, write_volatile};
 
@@ -453,17 +454,6 @@ mod metal {
         }
     }
 
-    /// Format a MAC as `xx:xx:xx:xx:xx:xx` for the boot log (no heap — a fixed stack buffer).
-    fn fmt_mac(mac: &[u8; 6]) -> [u8; 17] {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        let mut out = [b':'; 17];
-        for i in 0..6 {
-            out[i * 3] = HEX[(mac[i] >> 4) as usize];
-            out[i * 3 + 1] = HEX[(mac[i] & 0xf) as usize];
-        }
-        out
-    }
-
     // ── Controller-0 aperture resolution (a lean, self-contained DTB walk) ──
 
     /// Resolve controller-0's `ecam` region base from the live DTB: find the first `pcie@` node, then
@@ -727,10 +717,8 @@ mod metal {
     // once the metal link's real subnet is known (documented in arch_arm64.md §ORIN-NET-4).
     const OUR_IP: [u8; 4] = [192, 168, 1, 2];
     const GATEWAY_IP: [u8; 4] = [192, 168, 1, 1];
-    /// A full Ethernet frame fits (RX_BUF_SIZE is 2048); the Device scratch is stack/struct-local.
-    const FRAME_CAP: usize = 1536;
 
-    // ── Raw L2 accessors over the NET4_DEVICE registry (the smoltcp Device seam) ──
+    // ── Raw L2 accessors over the NET4_DEVICE registry (the shared smoltcp Device seam) ──
 
     /// Pop one raw RX frame for the smoltcp Device. Short-locks NET4_DEVICE per ring op (the poll must
     /// not hold the lock across a transmit) — the e1000 `raw_rx` discipline.
@@ -743,75 +731,33 @@ mod metal {
             n.transmit(frame);
         }
     }
-    /// `(MAC, our IP, link-up)` for the interface config. `None` if the NIC never came up.
-    fn hw_addr() -> Option<([u8; 6], [u8; 4], bool)> {
-        NET4_DEVICE.lock().as_ref().map(|n| (n.mac, OUR_IP, n.link_up()))
+    /// Link-up snapshot for the interface witness. `false` if the NIC never came up.
+    fn link_up() -> bool {
+        NET4_DEVICE.lock().as_ref().map(|n| n.link_up()).unwrap_or(false)
     }
 
-    // ── The smoltcp phy::Device over the RTL8168 rings (the x86 e1000/smolnet seam, transposed) ──
+    // ── The RawNic seam: the shared `net_phy::SmoltcpPhy` moves L2 frames through these ──
+    struct Rtl8168Nic;
+    impl RawNic for Rtl8168Nic {
+        fn rx_frame_raw(out: &mut [u8]) -> Option<usize> {
+            raw_rx(out)
+        }
+        fn transmit(frame: &[u8]) {
+            raw_tx(frame)
+        }
+        fn mac() -> Option<[u8; 6]> {
+            NET4_DEVICE.lock().as_ref().map(|n| n.mac)
+        }
+    }
+
+    // ── smoltcp interface plumbing (the phy::Device itself is the shared `net_phy::SmoltcpPhy`) ──
 
     use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage};
-    use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
     use smoltcp::socket::icmp;
     use smoltcp::time::Instant;
     use smoltcp::wire::{
         EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address,
     };
-
-    /// A `smoltcp::phy::Device` backed by the RTL8168. Owns RX/TX scratch so the tokens can borrow
-    /// disjoint fields (smoltcp hands out both from one `receive()` to build a reply in place).
-    struct Rtl8168Phy {
-        rx: [u8; FRAME_CAP],
-        rlen: usize,
-        tx: [u8; FRAME_CAP],
-    }
-    impl Rtl8168Phy {
-        fn new() -> Self {
-            Rtl8168Phy { rx: [0; FRAME_CAP], rlen: 0, tx: [0; FRAME_CAP] }
-        }
-    }
-
-    struct PhyRxToken<'a> {
-        buf: &'a [u8],
-    }
-    struct PhyTxToken<'a> {
-        buf: &'a mut [u8],
-    }
-    impl RxToken for PhyRxToken<'_> {
-        fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R {
-            f(self.buf)
-        }
-    }
-    impl TxToken for PhyTxToken<'_> {
-        fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
-            let n = len.min(self.buf.len());
-            let r = f(&mut self.buf[..n]);
-            raw_tx(&self.buf[..n]);
-            r
-        }
-    }
-    impl Device for Rtl8168Phy {
-        type RxToken<'a> = PhyRxToken<'a>;
-        type TxToken<'a> = PhyTxToken<'a>;
-
-        fn receive(&mut self, _t: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-            let len = raw_rx(&mut self.rx)?;
-            self.rlen = len;
-            let Rtl8168Phy { rx, rlen, tx } = self;
-            Some((PhyRxToken { buf: &rx[..*rlen] }, PhyTxToken { buf: tx }))
-        }
-
-        fn transmit(&mut self, _t: Instant) -> Option<Self::TxToken<'_>> {
-            Some(PhyTxToken { buf: &mut self.tx })
-        }
-
-        fn capabilities(&self) -> DeviceCapabilities {
-            let mut caps = DeviceCapabilities::default();
-            caps.medium = Medium::Ethernet;
-            caps.max_transmission_unit = 1500;
-            caps
-        }
-    }
 
     /// Bind a smoltcp `Interface` over the RTL8168 Device and poll it a bounded number of times — the
     /// x86 e1000/smolnet seam, transposed to aarch64/tegra. This PROVES the bind end-to-end (Device +
@@ -820,11 +766,13 @@ mod metal {
     /// and on metal-pre-subnet-config the poll simply finds an empty ring — the honest pre-metal state.
     /// All storage is stack-local (no heap growth), mirroring `smolnet::pump`.
     fn bind_smoltcp() {
-        let Some((mac, our_ip, up)) = hw_addr() else {
+        let Some(mac) = Rtl8168Nic::mac() else {
             serial_println!("{}   smoltcp bind SKIPPED — no NIC registered ::", P4);
             return;
         };
-        let mut dev = Rtl8168Phy::new();
+        let our_ip = OUR_IP;
+        let up = link_up();
+        let mut dev = SmoltcpPhy::<Rtl8168Nic>::new();
         let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
         config.random_seed = 0x4e45_5434; // ASCII "NET4"
         let mut iface = Interface::new(config, &mut dev, Instant::from_millis(0));
