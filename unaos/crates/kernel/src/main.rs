@@ -118,6 +118,21 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     #[cfg(target_arch = "x86_64")]
     let rsdp_addr = boot_info.rsdp_addr;
 
+    // SPLASH-1 (x86 GUI builds only): paint the ray-traced prism boot splash NOW — before the
+    // slow bring-up (ACPI, SMP, xHCI enumeration) — replacing the blank pre-GUI panel while boot
+    // works. Allocation-free (pre-heap by design); one background fill + the traced rays, so it
+    // does not slow boot measurably. fbcon's QUIET-PANEL milestone lines paint over it (they stay
+    // the boot witness surface); the GUI's background paint replaces it at handoff. Never on
+    // usbdebug/witness/bootlog builds — their panels carry the boot log, and the test/bench
+    // batteries stay byte-identical.
+    #[cfg(all(
+        target_arch = "x86_64",
+        not(any(feature = "usbdebug", feature = "bootlog", feature = "witness"))
+    ))]
+    if framebuffer_addr != 0 {
+        unaos_kernel::vug::boot_splash(framebuffer_addr as usize, framebuffer_size, info);
+    }
+
     // EDID/mode-selection diagnostics (read before memory::init consumes boot_info); only the
     // bootlog build uses them, so gate the extraction to avoid unused-field warnings elsewhere.
     #[cfg(feature = "bootlog")]
@@ -578,6 +593,17 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     {
         unaos_kernel::arch::sched::init();
 
+        // PULSE-NCPU (metal defect fix): turn scheduling on UNCONDITIONALLY — a quiet (non-witness,
+        // non-sched_demo) GUI boot previously never called `enable()`, so the APs stayed parked in
+        // `wait_and_run`, their busy/idle counters stayed frozen forever, and the vug/pulse CPU
+        // meter honestly rendered 7 of 8 cores as PARKED dashes — reading on the panel as "1 CPU"
+        // while a battery build's serial said "scheduling enabled on 7 AP(s)". Enabling is the
+        // default-quiet law's shape — enable the feature, don't gate it behind a test knob: the APs
+        // idle inside `run()` (sti;hlt), the idle counters tick, and pulse reflects every online
+        // CPU. Prints nothing; the witness/demo paths below still call enable()/start_demo()
+        // idempotently.
+        unaos_kernel::arch::sched::enable();
+
         // U2 Part-0c: kernel-side boundary fixtures (no ring 3). Fire a self-NMI through the real
         // IPI path and confirm it was taken on the dedicated NMI IST stack (the honest B3 evidence),
         // and unit-exercise the canonical-`rcx` guard's refusal logic. Both need only the local APIC
@@ -953,22 +979,28 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     let mut pal = unaos_kernel::pal::TargetPal::new(&mut screen);
 
-    console.draw(&mut pal);
-    pal.render();
-
     // GUI-WITNESS: the last milestone — the GUI is about to take the panel. Record it BEFORE the
     // detach so the ring captures the exact moment fbcon stops mirroring serial to the screen; from
     // here the `bootlog` shell verb is the operator's only witness surface (serial is silent on GUI
     // builds and the boot log is now painted over).
+    //
+    // HANDOFF-CLEAN (metal defect fix): record + detach STRICTLY BEFORE the first console paint.
+    // The old order painted the console, then recorded this milestone — whose QUIET-PANEL on-panel
+    // leg drew a text line straight onto the front framebuffer OVER the just-rendered prompt (the
+    // "flash of text that garbles the prompt" Peter saw at the end of boot). Now the milestone
+    // paints on the pre-GUI panel, detach flips GUI_ACTIVE, and NOTHING may paint behind the GUI
+    // after this point (a panic still re-attaches).
     unaos_kernel::bootlog::record("gui:handoff");
 
     // The GUI now owns the screen — stop fbcon mirroring serial output onto the framebuffer
-    // (a panic re-enables it). Boot diagnostics up to this first frame stay on screen until now.
+    // (a panic re-enables it). Boot diagnostics up to this point stay on screen until the first
+    // console frame below repaints.
     unaos_kernel::video::fbcon::detach();
 
+    console.draw(&mut pal);
+    pal.render();
+
     use unaos_kernel::pal::GneissPal;
-    let mut mouse_px: i32 = (pal.width() / 2) as i32;
-    let mut mouse_py: i32 = (pal.height() / 2) as i32;
 
     loop {
         // Poll xHCI Controller, then run any deferred storage work (synchronous BOT
@@ -1084,39 +1116,27 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 }
                 unaos_kernel::pal::Event::Mouse { x, y } => {
                     had_event = true;
-                    // Erase old cursor (draw background color over it)
-                    pal.draw_rect(mouse_px as usize, mouse_py as usize, 10, 10, 0x1E1E1E);
-
-                    // Update position with deltas
-                    mouse_px += x;
-                    mouse_py += y;
-
-                    // Clamp to screen bounds
-                    if mouse_px < 0 { mouse_px = 0; }
-                    if mouse_py < 0 { mouse_py = 0; }
-                    if mouse_px as u32 >= pal.width() { mouse_px = pal.width() as i32 - 10; }
-                    if mouse_py as u32 >= pal.height() { mouse_py = pal.height() as i32 - 10; }
-
-                    // Draw new cursor (a bright red 10x10 square)
-                    pal.draw_rect(mouse_px as usize, mouse_py as usize, 10, 10, 0xFF0000);
+                    // CURSOR-VIS: the shared metrics-scaled arrow sprite (pal::cursor) replaces
+                    // the old unscaled 10×10 square — near-invisible at Retina pixel density.
+                    // Erase-at-old, move, draw-at-new (the console loop repaints nothing else).
+                    unaos_kernel::pal::cursor::erase(&mut pal, 0x001E1E1E);
+                    unaos_kernel::pal::cursor::move_rel(
+                        x, y,
+                        pal.width() as i32,
+                        pal.height() as i32,
+                    );
+                    unaos_kernel::pal::cursor::draw(&mut pal);
                 }
                 unaos_kernel::pal::Event::MouseAbsolute { x, y } => {
                     had_event = true;
-                    // Erase old cursor
-                    pal.draw_rect(mouse_px as usize, mouse_py as usize, 10, 10, 0x1E1E1E);
-
-                    // Scale 0-32767 coordinate space to screen bounds
-                    mouse_px = ((x as i64 * pal.width() as i64) / 32767) as i32;
-                    mouse_py = ((y as i64 * pal.height() as i64) / 32767) as i32;
-
-                    // Clamp just in case
-                    if mouse_px < 0 { mouse_px = 0; }
-                    if mouse_py < 0 { mouse_py = 0; }
-                    if mouse_px as u32 >= pal.width() { mouse_px = pal.width() as i32 - 10; }
-                    if mouse_py as u32 >= pal.height() { mouse_py = pal.height() as i32 - 10; }
-
-                    // Draw new cursor
-                    pal.draw_rect(mouse_px as usize, mouse_py as usize, 10, 10, 0xFF0000);
+                    // CURSOR-VIS: absolute report (0..=32767 HID space), same shared sprite.
+                    unaos_kernel::pal::cursor::erase(&mut pal, 0x001E1E1E);
+                    unaos_kernel::pal::cursor::set_abs(
+                        x, y,
+                        pal.width() as i32,
+                        pal.height() as i32,
+                    );
+                    unaos_kernel::pal::cursor::draw(&mut pal);
                 }
                 // Timer / Unknown: nothing to do.
                 _ => {}

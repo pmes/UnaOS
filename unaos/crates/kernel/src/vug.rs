@@ -49,6 +49,220 @@ pub fn init(base: usize, len: usize, info: FrameBufferInfo) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// SPLASH-1 — the ray-traced prism boot splash (x86 GUI builds only; called pre-heap from
+// main.rs, so everything here is allocation-free and draws straight to the front framebuffer).
+// ---------------------------------------------------------------------------------------------
+
+#[cfg(target_arch = "x86_64")]
+/// Splash backdrop — near-black, so the beam and spectrum carry the frame.
+const SPLASH_BG: u32 = 0x0006_0608;
+#[cfg(target_arch = "x86_64")]
+/// Prism edge line — faint cool grey, drawn last so the glass reads over the rays.
+const SPLASH_EDGE: u32 = 0x004A_4658;
+#[cfg(target_arch = "x86_64")]
+/// The white beam (pre-prism).
+const SPLASH_BEAM: u32 = 0x00F2_F2EE;
+
+#[cfg(target_arch = "x86_64")]
+/// Spectrum sample count and colours, red → violet.
+const NRAYS: usize = 7;
+#[cfg(target_arch = "x86_64")]
+const SPECTRUM: [u32; NRAYS] = [
+    0x00E0_1818, // red
+    0x00F0_7010, // orange
+    0x00F0_D010, // yellow
+    0x0028_C828, // green
+    0x0018_B8C8, // cyan
+    0x0028_50E0, // blue
+    0x0088_20C8, // violet
+];
+#[cfg(target_arch = "x86_64")]
+/// Per-sample refractive index, Q16.16. Physically red bends least; the spread is exaggerated
+/// (1.35 → ~1.69) so the fan reads at panel size. External standard bound: Snell's law only.
+const IOR_BASE: i64 = 88474; // 1.35
+#[cfg(target_arch = "x86_64")]
+const IOR_STEP: i64 = 3745; // ~0.057 per sample
+
+#[cfg(target_arch = "x86_64")]
+/// Q16.16 in i64 (positions are pixels · 65536; 2880-px panels overflow i32 products).
+const ONE64: i64 = 1 << 16;
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn fmul64(a: i64, b: i64) -> i64 {
+    (a * b) >> 16
+}
+
+#[cfg(target_arch = "x86_64")]
+/// sqrt of a Q16.16 value, in Q16.16.
+#[inline]
+fn sqrt_fx(a: i64) -> i64 {
+    isqrt(a << 16)
+}
+
+#[cfg(target_arch = "x86_64")]
+/// Normalize a Q16.16 vector to unit length (Q16.16). Returns (0,0) untouched.
+fn norm2(x: i64, y: i64) -> (i64, i64) {
+    let len = isqrt(fmul64(x, x) + fmul64(y, y)).max(1) << 8; // sqrt halves the shift: restore Q16
+    // isqrt(Q16*Q16>>16 = Q16) yields Q8; <<8 gives Q16 length.
+    ((x << 16) / len, (y << 16) / len)
+}
+
+/// SPLASH-1 — "pink-floyd-esque ray-tracing boot" (Peter's words, generic physics only): a white
+/// beam enters a triangular glass prism and disperses into a spectrum, traced by actual refraction
+/// — each wavelength sample marches as a ray and bends at every face crossing by Snell's law with
+/// its own refractive index (Q16.16 fixed point, no float). Drawn ONCE, directly onto the front
+/// framebuffer, before the slow bring-up (ACPI/SMP/xHCI) so the panel shows it while boot works;
+/// cost is one background fill plus a few thousand small rect plots — it does not slow boot
+/// measurably. fbcon's QUIET-PANEL milestone lines paint over it (they are the witness surface);
+/// the GUI's own background paint replaces it at handoff. GUI builds only — main.rs gates the call
+/// off usbdebug/bootlog/witness builds, so test/bench media stay byte-identical.
+#[cfg(target_arch = "x86_64")]
+pub fn boot_splash(base: usize, len: usize, info: FrameBufferInfo) {
+    let mut fb = FrameBuffer::new();
+    fb.init(base, len, info);
+    if !fb.is_ready() {
+        return;
+    }
+    let w = fb.width() as i64;
+    let h = fb.height() as i64;
+    fb.fill_screen(SPLASH_BG);
+
+    // --- the prism: an equilateral triangle, apex up, centred right of frame centre ----------
+    let side = (w.min(h) * 45) / 100; // px
+    let circ = (side * 37837) >> 16; // circumradius = side/√3
+    let cx = (w * 56) / 100;
+    let cy = h / 2;
+    // Vertices in Q16.16 pixels: apex, base-left, base-right.
+    let va = ((cx) << 16, (cy - circ) << 16);
+    let vb = ((cx - side / 2) << 16, (cy + circ / 2) << 16);
+    let vc = ((cx + side / 2) << 16, (cy + circ / 2) << 16);
+    let edges = [(va, vb), (vb, vc), (vc, va)];
+
+    // Signed edge function e_i(p) = cross(p2-p1, p-p1) (Q16.16·px scale); `inside` means every
+    // e_i has the centroid's sign.
+    let cent = ((va.0 + vb.0 + vc.0) / 3, (va.1 + vb.1 + vc.1) / 3);
+    let edge_fn = |i: usize, px: i64, py: i64| -> i64 {
+        let (p1, p2) = edges[i];
+        fmul64(p2.0 - p1.0, py - p1.1) - fmul64(p2.1 - p1.1, px - p1.0)
+    };
+    let mut csign = [0i64; 3];
+    for i in 0..3 {
+        csign[i] = if edge_fn(i, cent.0, cent.1) >= 0 { 1 } else { -1 };
+    }
+    let inside_at = |px: i64, py: i64, csign: &[i64; 3]| -> [bool; 3] {
+        let mut s = [false; 3];
+        for i in 0..3 {
+            s[i] = edge_fn(i, px, py) * csign[i] >= 0;
+        }
+        s
+    };
+
+    // --- the beam: from the left edge, slightly rising, aimed at the left face ---------------
+    let start = (0i64, ((h * 66) / 100) << 16);
+    // Aim point: 55% down the left face (apex → base-left).
+    let aim = (va.0 + ((vb.0 - va.0) * 55) / 100, va.1 + ((vb.1 - va.1) * 55) / 100);
+    let (dx0, dy0) = norm2(aim.0 - start.0, aim.1 - start.1);
+
+    let th = ((h / 240).max(2)) as usize; // beam thickness in px
+    let max_steps = (3 * (w + h)) as usize;
+
+    for k in 0..NRAYS {
+        let ior = IOR_BASE + IOR_STEP * (k as i64);
+        let (mut px, mut py) = start;
+        let (mut dx, mut dy) = (dx0, dy0);
+        let mut in_glass = false;
+        let mut entered = false;
+        let mut was_in = inside_at(px, py, &csign);
+
+        for _ in 0..max_steps {
+            px += dx;
+            py += dy;
+            if px < -(32 << 16) || px > (w + 32) << 16 || py < -(32 << 16) || py > (h + 32) << 16 {
+                break;
+            }
+            let now_in = inside_at(px, py, &csign);
+            let inside_now = now_in.iter().all(|&b| b);
+            if inside_now != in_glass {
+                // Crossed a face: which edge flipped?
+                let mut ei = 0;
+                for i in 0..3 {
+                    if now_in[i] != was_in[i] {
+                        ei = i;
+                        break;
+                    }
+                }
+                // Face normal (unit, Q16.16), oriented against the ray (n·d < 0).
+                let (p1, p2) = edges[ei];
+                let (mut nx, mut ny) = norm2(p2.1 - p1.1, -(p2.0 - p1.0));
+                if fmul64(nx, dx) + fmul64(ny, dy) > 0 {
+                    nx = -nx;
+                    ny = -ny;
+                }
+                // Snell: eta = n1/n2 for this crossing.
+                let eta = if inside_now { (ONE64 << 16) / ior } else { ior };
+                let cosi = -(fmul64(nx, dx) + fmul64(ny, dy));
+                let kk = ONE64 - fmul64(fmul64(eta, eta), ONE64 - fmul64(cosi, cosi));
+                if kk < 0 {
+                    // Total internal reflection: bounce, stay on this side of the face.
+                    dx += 2 * fmul64(cosi, nx);
+                    dy += 2 * fmul64(cosi, ny);
+                    let (ndx, ndy) = norm2(dx, dy);
+                    dx = ndx;
+                    dy = ndy;
+                    was_in = inside_at(px, py, &csign);
+                    continue;
+                }
+                let t = fmul64(eta, cosi) - sqrt_fx(kk);
+                dx = fmul64(eta, dx) + fmul64(t, nx);
+                dy = fmul64(eta, dy) + fmul64(t, ny);
+                let (ndx, ndy) = norm2(dx, dy);
+                dx = ndx;
+                dy = ndy;
+                in_glass = inside_now;
+                if in_glass {
+                    entered = true;
+                }
+            }
+            was_in = now_in;
+
+            // Plot: the shared pre-entry beam once (k == 0, white); every sample after entry in
+            // its own colour (inside the glass the samples already diverge slightly — the fan).
+            if entered {
+                fb.fill_rect(
+                    (px >> 16).max(0) as usize,
+                    (py >> 16).max(0) as usize,
+                    th,
+                    th,
+                    SPECTRUM[k],
+                );
+            } else if k == 0 {
+                fb.fill_rect(
+                    (px >> 16).max(0) as usize,
+                    (py >> 16).max(0) as usize,
+                    th,
+                    th,
+                    SPLASH_BEAM,
+                );
+            }
+        }
+    }
+
+    // The glass itself: faint edges over the rays.
+    for &(p1, p2) in edges.iter() {
+        fb.draw_line(
+            (p1.0 >> 16) as i32,
+            (p1.1 >> 16) as i32,
+            (p2.0 >> 16) as i32,
+            (p2.1 >> 16) as i32,
+            SPLASH_EDGE,
+        );
+    }
+
+    serial_println!(":: SPLASH: prism traced — {} spectrum rays ::", NRAYS);
+}
+
+// ---------------------------------------------------------------------------------------------
 // Fixed-point maths (Q16.16). No float in the kernel.
 // ---------------------------------------------------------------------------------------------
 
@@ -383,6 +597,24 @@ struct RenderStats {
     px: u64,
 }
 
+/// CURSOR-VIS — the full-screen demos' shared input pump: drain EVERY queued event this frame
+/// (`pump_and_poll` until empty), returning `true` when a key was pressed (exit). Mouse motion
+/// routes into the shared `pal::cursor` position, so the sprite the render loop draws each frame
+/// tracks the trackpad. Before this, the demos popped ONE event per frame and matched only `Key` —
+/// mouse reports backed up and the cursor was never drawn (the metal invisible-cursor defect).
+fn drain_input(pal: &mut TargetPal) -> bool {
+    let (w, h) = (pal.width() as i32, pal.height() as i32);
+    while let Some(e) = crate::pal::pump_and_poll() {
+        match e {
+            Event::Key(_) => return true,
+            Event::Mouse { x, y } => crate::pal::cursor::move_rel(x, y, w, h),
+            Event::MouseAbsolute { x, y } => crate::pal::cursor::set_abs(x, y, w, h),
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Run the rotating crystal until any key is pressed. `mode` selects solid facets or wireframe.
 /// The loop owns the pump: it drives input itself (via `pal::pump_and_poll`) so a keystroke exits
 /// cleanly, presents exactly one frame per iteration, and `yield_now`s between frames (never
@@ -429,8 +661,11 @@ pub fn run_crystal(pal: &mut TargetPal, mode: Mode) {
 
     loop {
         let top = crate::arch::now_cycles();
-        // --- input: exit on any key ------------------------------------------------------
-        if let Some(Event::Key(_)) = crate::pal::pump_and_poll() {
+        // --- input: exit on any key; track the mouse (CURSOR-VIS) ------------------------
+        // Drain ALL pending events this frame (a burst of trackpad reports must not back up
+        // one-per-frame), routing mouse motion into the shared cursor so the sprite drawn below
+        // tracks it — the metal defect was this loop consuming MOUSE events with no sprite.
+        if drain_input(pal) {
             break;
         }
 
@@ -530,6 +765,9 @@ pub fn run_crystal(pal: &mut TargetPal, mode: Mode) {
         m.px = est_px;
         draw_stats(pal, frame, n as u32, solid, w, h);
         draw_meters(pal, &m, &cpu, h);
+        // CURSOR-VIS: the cursor draws LAST, over everything, every frame (the frame was cleared
+        // above, so no erase pass is needed).
+        crate::pal::cursor::draw(pal);
 
         pal.render(); // present ONCE per frame
 
@@ -649,7 +887,13 @@ fn draw_meters(pal: &mut TargetPal, m: &RenderStats, cpu: &CpuPulse, h: i32) {
     // renders an explicit empty state — never a fabricated number. Two text pitches above RENDER.
     #[cfg(all(target_arch = "x86_64", feature = "smc"))]
     {
-        let snap = crate::drivers::smc::battery::cached();
+        // BATMON-HOLD: `cached()` now returns the last GOOD snapshot plus its age — a failed SMC
+        // sweep no longer clobbers the cache (the metal intermittency defect), so the widget holds
+        // the last good reading and annotates its staleness instead of going dark.
+        let (snap, age_ms) = crate::drivers::smc::battery::cached();
+        /// A reading older than this (a few refresh periods) is flagged stale on the meter.
+        const STALE_MS: u64 = 3000;
+        let stale = snap.present && age_ms >= STALE_MS;
         let by = base.saturating_sub(2 * mt.line_h);
         pal.draw_text(x0, by, "BATT", METER_LABEL);
         let bx = x0 + mt.text_w(5);
@@ -657,7 +901,9 @@ fn draw_meters(pal: &mut TargetPal, m: &RenderStats, cpu: &CpuPulse, h: i32) {
         pal.draw_rect(bx, by, bw, mt.cell_h, METER_DIM);
         if let Some(soc) = snap.soc_pct {
             let fill = (soc.min(100) as usize * bw) / 100;
-            pal.draw_rect(bx, by, fill, mt.cell_h, METER_LILAC);
+            // A stale bar renders in the label grey, not the live lilac — held, not fresh.
+            let color = if stale { METER_LABEL } else { METER_LILAC };
+            pal.draw_rect(bx, by, fill, mt.cell_h, color);
         }
         let line = if snap.present {
             let soc = snap.soc_pct.map(|v| v as i32).unwrap_or(-1);
@@ -667,7 +913,11 @@ fn draw_meters(pal: &mut TargetPal, m: &RenderStats, cpu: &CpuPulse, h: i32) {
                 Some(a) if a < 0 => "dis",
                 _ => "--",
             };
-            alloc::format!("{}%  {}mV  {}", soc, mv, flow)
+            if stale {
+                alloc::format!("{}%  {}mV  {}  stale {}s", soc, mv, flow, age_ms / 1000)
+            } else {
+                alloc::format!("{}%  {}mV  {}", soc, mv, flow)
+            }
         } else {
             alloc::string::String::from("no SMC battery data")
         };
@@ -710,8 +960,8 @@ pub fn run_pulse(pal: &mut TargetPal) {
 
     loop {
         let top = crate::arch::now_cycles();
-        // --- input: exit on any key ------------------------------------------------------
-        if let Some(Event::Key(_)) = crate::pal::pump_and_poll() {
+        // --- input: exit on any key; track the mouse (CURSOR-VIS, the crystal's idiom) ----
+        if drain_input(pal) {
             break;
         }
 
@@ -755,6 +1005,9 @@ pub fn run_pulse(pal: &mut TargetPal) {
             fps_x10 % 10
         );
         pal.draw_text(mt.margin, y, &line, METER_LABEL);
+
+        // CURSOR-VIS: cursor last, over everything (frame cleared above; no erase needed).
+        crate::pal::cursor::draw(pal);
 
         pal.render(); // present ONCE per frame
 

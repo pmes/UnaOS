@@ -107,6 +107,22 @@ fn read_data() -> u8 {
     unsafe { Port::<u8>::new(SMC_DATA_PORT).read() }
 }
 
+/// Bounded inter-poll pause (~15 µs at 2.3 GHz) between status reads (BATMON-HOLD hardening).
+/// The real Apple SMC misbehaves when the host hammers the status port back-to-back — the known
+/// applesmc timing discipline is to space the polls out (Linux paces them ≥16 µs apart). The first
+/// status check in every wait happens BEFORE any pause, so QEMU's instantly-ready model sees the
+/// identical port-access sequence; only a not-yet-ready metal handshake gets the pacing. Pure
+/// cycle-bounded spin — no timer, no sleep, and it does not extend the outer `SMC_WAIT_CYCLES`
+/// deadline.
+const SMC_POLL_PAUSE_CYCLES: u64 = 35_000;
+
+fn poll_pause() {
+    let start = crate::arch::now_cycles();
+    while crate::arch::now_cycles().wrapping_sub(start) < SMC_POLL_PAUSE_CYCLES {
+        core::hint::spin_loop();
+    }
+}
+
 /// Poll the status port until its low nibble equals `want`, bounded by the cycle budget.
 fn wait_status(want: u8, step: u8) -> Result<(), SmcError> {
     let start = crate::arch::now_cycles();
@@ -117,7 +133,7 @@ fn wait_status(want: u8, step: u8) -> Result<(), SmcError> {
         if crate::arch::now_cycles().wrapping_sub(start) >= SMC_WAIT_CYCLES {
             return Err(SmcError::Stuck(step));
         }
-        core::hint::spin_loop();
+        poll_pause();
     }
 }
 
@@ -136,7 +152,7 @@ fn wait_busy_clear(step: u8) -> Result<(), SmcError> {
         if crate::arch::now_cycles().wrapping_sub(start) >= SMC_WAIT_CYCLES {
             return Err(SmcError::Stuck(step));
         }
-        core::hint::spin_loop();
+        poll_pause();
     }
 }
 
@@ -159,7 +175,7 @@ fn settle_before_command() {
         if crate::arch::now_cycles().wrapping_sub(start) >= SMC_WAIT_CYCLES {
             break; // bounded — never spin forever; step-0's NEW_CMD|ACK wait still guards
         }
-        core::hint::spin_loop();
+        poll_pause();
     }
 }
 
@@ -195,7 +211,7 @@ pub fn read_key(key: &[u8; 4], out: &mut [u8]) -> Result<usize, SmcError> {
         if crate::arch::now_cycles().wrapping_sub(start) >= SMC_WAIT_CYCLES {
             return Err(SmcError::Stuck(2));
         }
-        core::hint::spin_loop();
+        poll_pause();
     }
 
     // 4) drain value bytes (GAP-1 fix). Between bytes the real SMC momentarily de-asserts
@@ -250,7 +266,7 @@ fn read_key_by_index(index: u32, name: &mut [u8; 4]) -> Result<(), SmcError> {
         if crate::arch::now_cycles().wrapping_sub(start) >= SMC_WAIT_CYCLES {
             return Err(SmcError::Stuck(2));
         }
-        core::hint::spin_loop();
+        poll_pause();
     }
     // A key name is exactly 4 bytes; mirror read_key's per-byte BUSY-then-DATA_READY handshake
     // (GAP-1 fix). Unlike a value read an early DATA_READY-clear here IS an error (a 4-byte name
@@ -429,17 +445,34 @@ pub mod battery {
     });
     /// Last refresh time (ms); 0 = never. Throttles the port I/O off the per-frame path.
     static LAST_MS: Mutex<u64> = Mutex::new(0);
+    /// Time (ms) of the last GOOD reading (`present=true`); 0 = never. `CACHE` holds that reading
+    /// until a newer good one lands (BATMON-HOLD), so the widget's staleness is `now - GOOD_MS`.
+    static GOOD_MS: Mutex<u64> = Mutex::new(0);
     /// Whether the boot witness line has fired (once, when the first real reading lands).
     static WITNESSED: Mutex<bool> = Mutex::new(false);
+    /// One-per-transition serial note for a failed refresh while a good reading is held
+    /// (BATMON-HOLD evidence line; cleared when a good reading returns).
+    static HOLDING: Mutex<bool> = Mutex::new(false);
 
     const REFRESH_MS: u64 = 1000;
+    /// Per-key bounded retry budget (BATMON-HOLD hardening). Metal evidence (2026-07-18 sitting:
+    /// Boot A `present=true soc=51%`, Boot B minutes later `present=false full=9962mAh`) shows
+    /// individual key reads failing intermittently on the real SMC while others succeed in the same
+    /// sweep. Each attempt is already deadline-bounded (`SMC_WAIT_CYCLES`), so retrying a Stuck /
+    /// short read a couple of times is bounded total work — never a busy-loop. A clean `Absent`
+    /// (the SMC looked the key up and said no) is NOT retried.
+    const READ_ATTEMPTS: u32 = 3;
 
     fn read_u16(key: &[u8; 4]) -> Option<u16> {
-        let mut b = [0u8; 2];
-        match read_key(key, &mut b) {
-            Ok(2) => Some(((b[0] as u16) << 8) | b[1] as u16),
-            _ => None,
+        for _ in 0..READ_ATTEMPTS {
+            let mut b = [0u8; 2];
+            match read_key(key, &mut b) {
+                Ok(2) => return Some(((b[0] as u16) << 8) | b[1] as u16),
+                Err(SmcError::Absent) => return None, // clean absence — no retry
+                _ => {} // Stuck / short read: bounded retry (each attempt itself deadline-bounded)
+            }
         }
+        None
     }
 
     fn read_i16(key: &[u8; 4]) -> Option<i16> {
@@ -484,7 +517,32 @@ pub mod battery {
             *last = now;
         }
         let s = snapshot();
-        *CACHE.lock() = s;
+        // BATMON-HOLD: a failed sweep (present=false) must NOT clobber a previous good reading —
+        // the metal SMC read is intermittent (2026-07-18 sitting evidence), and a widget that goes
+        // dark on one bad sweep is worse than one that holds the last good number with an honest
+        // staleness age. A good sweep replaces the cache and stamps GOOD_MS; a bad sweep leaves the
+        // cache alone (the widget reads it plus its age via `cached()`). If there has never been a
+        // good reading the honest empty state stays cached.
+        if s.present {
+            *CACHE.lock() = s;
+            *GOOD_MS.lock() = now;
+            let mut h = HOLDING.lock();
+            if *h {
+                *h = false;
+                serial_println!(":: SMC-BATT: good reading returned — hold released ::");
+            }
+        } else if *GOOD_MS.lock() != 0 {
+            let mut h = HOLDING.lock();
+            if !*h {
+                *h = true;
+                serial_println!(
+                    ":: SMC-BATT: sweep failed (present=false) — holding last good reading (age {} ms) ::",
+                    now.wrapping_sub(*GOOD_MS.lock())
+                );
+            }
+        } else {
+            *CACHE.lock() = s;
+        }
 
         // Fire the witness on the FIRST refresh (proves the M2 read path ran — the honest
         // `present=false` line on QEMU / a battery-less machine), then on the ~1 s cadence whenever
@@ -510,8 +568,14 @@ pub mod battery {
         }
     }
 
-    /// The last cached snapshot, for the vug meter hook (cheap; no port I/O).
-    pub fn cached() -> BatterySnapshot {
-        *CACHE.lock()
+    /// The last cached snapshot plus its age in ms (0 when fresh-ish or never-good), for the vug
+    /// meter hook (cheap; no port I/O). The age is `now - GOOD_MS` when the cache holds a good
+    /// reading — the widget shows a staleness note once it grows past a few refresh periods
+    /// (BATMON-HOLD), instead of going dark.
+    pub fn cached() -> (BatterySnapshot, u64) {
+        let s = *CACHE.lock();
+        let good = *GOOD_MS.lock();
+        let age = if s.present && good != 0 { crate::arch::ms().wrapping_sub(good) } else { 0 };
+        (s, age)
     }
 }

@@ -132,6 +132,101 @@ pub trait GneissPal {
     }
 }
 
+// --- CURSOR ---------------------------------------------------------------------------------
+//
+// CURSOR-VIS (metal defect fix): the one shared mouse-cursor sprite + position. Before this, the
+// GUI console loop drew a bare 10×10 unscaled square and the full-screen views (vug crystal /
+// pulse) drew NOTHING — they clear the frame every iteration and consumed mouse events without a
+// sprite, so on metal the trackpad decoded (serial MOUSE dx/dy) while no cursor was ever visible.
+// Now every screen-owning loop shares this position and draws the same metrics-scaled arrow.
+pub mod cursor {
+    use super::GneissPal;
+    use spin::Mutex;
+
+    /// 8×8 arrow mask, MSB = leftmost pixel.
+    const ARROW: [u8; 8] = [
+        0b1000_0000,
+        0b1100_0000,
+        0b1110_0000,
+        0b1111_0000,
+        0b1111_1000,
+        0b1111_1100,
+        0b1101_1000,
+        0b1000_1100,
+    ];
+    const FILL: u32 = 0x00FF_FFFF; // white arrow
+    const SHADOW: u32 = 0x0010_1014; // near-black drop shadow — visible on any light content
+
+    /// Hot-spot position (arrow tip), lazily centred on first use. One shared position: the
+    /// console loop and the full-screen demos all move/draw the same cursor.
+    static POS: Mutex<Option<(i32, i32)>> = Mutex::new(None);
+
+    /// Sprite magnification: one step above the text scale so the cursor reads at a glance
+    /// (16 px at the 480p QEMU panel, 24 px on the 2880×1800 Retina).
+    fn sprite_scale(pal: &impl GneissPal) -> usize {
+        pal.metrics().scale + 1
+    }
+
+    /// The cursor's bounding square in pixels (for erase).
+    pub fn extent(pal: &impl GneissPal) -> usize {
+        8 * sprite_scale(pal)
+    }
+
+    /// Current position, centring on first use.
+    pub fn pos(w: i32, h: i32) -> (i32, i32) {
+        *POS.lock().get_or_insert((w / 2, h / 2))
+    }
+
+    /// Apply a relative motion report (trackpad/mouse dx,dy), clamped to the panel.
+    pub fn move_rel(dx: i32, dy: i32, w: i32, h: i32) {
+        let (x, y) = pos(w, h);
+        set_clamped(x + dx, y + dy, w, h);
+    }
+
+    /// Apply an absolute report in the 0..=32767 HID coordinate space, scaled to the panel.
+    pub fn set_abs(ax: i32, ay: i32, w: i32, h: i32) {
+        let x = ((ax as i64 * w as i64) / 32767) as i32;
+        let y = ((ay as i64 * h as i64) / 32767) as i32;
+        set_clamped(x, y, w, h);
+    }
+
+    fn set_clamped(x: i32, y: i32, w: i32, h: i32) {
+        let cx = x.clamp(0, (w - 1).max(0));
+        let cy = y.clamp(0, (h - 1).max(0));
+        *POS.lock() = Some((cx, cy));
+    }
+
+    /// Paint `color` over the sprite's bounding box (the console loop's erase-before-move; the
+    /// full-screen demos clear every frame and never need it).
+    pub fn erase(pal: &mut impl GneissPal, color: u32) {
+        let (x, y) = pos(pal.width() as i32, pal.height() as i32);
+        let e = extent(pal);
+        pal.draw_rect(x as usize, y as usize, e, e, color);
+    }
+
+    /// Draw the arrow sprite at the current position: a one-block-offset drop shadow first, then
+    /// the white fill — visible over dark and light content alike.
+    pub fn draw(pal: &mut impl GneissPal) {
+        let (x, y) = pos(pal.width() as i32, pal.height() as i32);
+        let s = sprite_scale(pal);
+        for &(ox, oy, color) in &[(s, s, SHADOW), (0, 0, FILL)] {
+            for (row, bits) in ARROW.iter().enumerate() {
+                for col in 0..8 {
+                    if bits & (0x80 >> col) != 0 {
+                        pal.draw_rect(
+                            (x as usize) + col * s + ox,
+                            (y as usize) + row * s + oy,
+                            s,
+                            s,
+                            color,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 // --- EVENT QUEUE ---
 const QUEUE_SIZE: usize = 64;
 
