@@ -729,6 +729,16 @@ kernel8() {
         K8_FEATS="${K8_FEATS},v3d"
         echo -e "${COLOR_YELLOW}  • UNAOS_V3D: V3D GPU foundation bring-up (probe/MMU/clear; attended-metal for positive verify)${COLOR_RESET}"
     fi
+    # PI-USB-1: UNAOS_PIUSB=1 adds the `piusb` feature — the BCM2711 PCIe root complex + VL805 xHCI attach
+    # (RC bridge reset / link-up / MEM-window, VL805 1106:3483 enumeration + BAR sizing, NOTIFY_XHCI_RESET
+    # mailbox, polled shared-xHCI attach to the halted-but-decoding + ports-powered honesty line). The VL805
+    # owns ALL four Pi USB-A ports. OFF => the module + call site vanish and kernel8 is byte-identical to
+    # baseline. QEMU raspi4b models no PCIe RC (bring-up degrades gracefully); positive verification is
+    # attended metal. See scripts/pi-usb1-bench.md.
+    if [ -n "${UNAOS_PIUSB:-}" ]; then
+        K8_FEATS="${K8_FEATS},piusb"
+        echo -e "${COLOR_YELLOW}  • UNAOS_PIUSB: BCM2711 PCIe RC + VL805 xHCI attach (attended-metal for positive verify)${COLOR_RESET}"
+    fi
     echo -e "${COLOR_YELLOW}⚡ Building bare-metal kernel8.img (Pi 4, microSD-slot boot)...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/kernel"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/kernel/pi-baremetal.ld" \

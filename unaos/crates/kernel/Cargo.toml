@@ -247,6 +247,17 @@ core3probe = ["pi"]
 # kernel8`. See arch_arm64.md §PI-V3D and scripts/pi-v3d-bench.md.
 v3d = ["baremetal"]
 
+# PI-USB-1: the BCM2711 PCIe root complex + VL805 xHCI attach (arch/aarch64/piusb.rs) — brcmstb RC
+# bridge reset / link-up / MEM-window + inbound-BAR config, VL805 (1106:3483) enumeration + BAR sizing,
+# the NOTIFY_XHCI_RESET mailbox, and the polled shared-xHCI attach to the "controller halted-but-decoding
+# + ports powered" honesty line. The VL805 owns ALL four Pi USB-A ports, so this is the unlock for every
+# Pi USB device. Implies `baremetal` (which implies `pi`) — the whole chain is BCM2711-specific. With
+# this feature OFF (default) the module + its call site vanish and the kernel8 image is byte-identical to
+# baseline (build twice, compare hashes). QEMU raspi4b does NOT model the PCIe RC: the bring-up detects
+# absence and degrades gracefully; positive verification is attended metal. Enable via `UNAOS_PIUSB=1
+# UNAOS_PI=1 ./arroyo kernel8`. See arch_arm64.md §PI-USB and scripts/pi-usb1-bench.md.
+piusb = ["baremetal"]
+
 # NS-SPAN (K7 WATCH rider): instrument the IRQ-masked namespace-lock hold at the three fused K6/K3/K5
 # persist sites (`sys_fgrant_revoke_2phase`, `native_persist_grants`, `native_persist_grow`) — read
 # CNTPCT at ns-take and ns-release, track the per-site WORST-CASE hold in ticks, and emit ONE serial line
