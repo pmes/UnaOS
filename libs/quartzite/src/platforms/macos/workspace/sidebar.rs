@@ -51,6 +51,20 @@ define_class!(
     }
 );
 
+/// Recursively re-apply expansion state after a `reloadData` (which collapses
+/// everything). Only descends into expanded nodes — collapsed subtrees keep
+/// their native default.
+pub fn restore_expansion(outline_view: &NSOutlineView, node: &Retained<UnaMatrixNode>) {
+    if *node.ivars().is_expanded.borrow() {
+        unsafe {
+            let _: () = msg_send![outline_view, expandItem: &**node];
+        }
+        for child in node.ivars().children.borrow().iter() {
+            restore_expansion(outline_view, child);
+        }
+    }
+}
+
 impl UnaMatrixNode {
     pub fn build_from(rust_node: &TopologyNode) -> Retained<Self> {
         let node: Allocated<UnaMatrixNode> = unsafe { msg_send![UnaMatrixNode::class(), alloc] };

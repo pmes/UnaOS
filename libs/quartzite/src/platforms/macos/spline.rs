@@ -259,34 +259,48 @@ impl MacOSSpline {
 
                                     match matrix_event {
                                         bandy::MatrixEvent::TopologyMutated(flat_tree) => {
-                                            use std::collections::HashMap;
                                             use bandy::state::TopologyNode;
 
-                                            // Reconstruct tree from flat list
-                                            let _nodes_by_depth: HashMap<usize, Vec<TopologyNode>> = HashMap::new();
-                                            let mut root_nodes = Vec::new();
+                                            // Reconstruct the tree from the flattened pre-order
+                                            // (id, label, depth) list. A node's children follow it
+                                            // with depth+1; the flat list only contains *visible*
+                                            // rows, so any node that arrives with children was
+                                            // expanded — mark it so expansion survives the reload.
+                                            fn attach(
+                                                node: TopologyNode,
+                                                stack: &mut Vec<(usize, TopologyNode)>,
+                                                roots: &mut Vec<TopologyNode>,
+                                            ) {
+                                                let mut node = node;
+                                                node.is_expanded = !node.children.is_empty();
+                                                match stack.last_mut() {
+                                                    Some((_, parent)) => parent.children.push(node),
+                                                    None => roots.push(node),
+                                                }
+                                            }
 
-                                            // Note: In a real implementation this reconstruction logic would be robust.
-                                            // Since we only have a flat representation here, we rebuild a simple list
-                                            // or correctly parsed tree if depth info is available. For demonstration,
-                                            // we will just populate the roots.
-
+                                            let mut root_nodes: Vec<TopologyNode> = Vec::new();
+                                            let mut stack: Vec<(usize, TopologyNode)> = Vec::new();
                                             for (id, label, depth) in flat_tree {
+                                                while stack.last().is_some_and(|(d, _)| *d >= depth) {
+                                                    let (_, done) = stack.pop().unwrap();
+                                                    attach(done, &mut stack, &mut root_nodes);
+                                                }
                                                 let node = TopologyNode {
                                                     id,
                                                     label,
                                                     children: Vec::new(),
                                                     is_expanded: false,
                                                 };
-                                                if depth == 0 {
-                                                    root_nodes.push(node);
-                                                } else {
-                                                    // Simple flat fallback for non-roots
-                                                    root_nodes.push(node);
-                                                }
+                                                stack.push((depth, node));
+                                            }
+                                            while let Some((_, done)) = stack.pop() {
+                                                attach(done, &mut stack, &mut root_nodes);
                                             }
 
-                                            use crate::platforms::macos::workspace::sidebar::UnaMatrixNode;
+                                            use crate::platforms::macos::workspace::sidebar::{
+                                                restore_expansion, UnaMatrixNode,
+                                            };
 
                                             let mut new_roots = Vec::new();
                                             for root in &root_nodes {
@@ -298,6 +312,11 @@ impl MacOSSpline {
                                             if let Some(outline_view) = sidebar_delegate.ivars().outline_view.borrow().as_ref() {
                                                 unsafe {
                                                     let _: () = objc2::msg_send![&**outline_view, reloadData];
+                                                }
+                                                // reloadData collapses everything; re-apply the
+                                                // expansion state carried by the rebuilt nodes.
+                                                for root in sidebar_delegate.ivars().roots.borrow().iter() {
+                                                    restore_expansion(outline_view, root);
                                                 }
                                             }
                                         }
