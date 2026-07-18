@@ -90,11 +90,20 @@ impl Aule {
             Spline::Void => return Ok(()),                           // Nothing to build
         };
 
+        Self::stream_command(program, &args, tx)
+    }
+
+    /// The toolkit-free heart of `forge_streamed`: spawn `program args`, send the
+    /// forge banner, and stream each stdout/stderr line on `tx`. Split out from
+    /// the spline→command mapping so it can be exercised in tests against a
+    /// trivial command (`cargo --version`-class) without kicking off a full
+    /// `cargo build`. The public `forge`/`forge_streamed` API is unchanged.
+    fn stream_command(program: &str, args: &[&str], tx: mpsc::Sender<String>) -> Result<()> {
         let _ = tx.send(format!("[AULE] Forging with: {} {:?}", program, args));
 
         // J15 SPECIALTY: Process Management
         let mut child = Command::new(program)
-            .args(&args)
+            .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -128,5 +137,66 @@ impl BandyMember for Aule {
     fn publish(&self, topic: &str, msg: SMessage) -> Result<()> {
         println!("[AULE] {} -> {:?}", topic, msg);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `stream_command` should send the forge banner and then relay the
+    /// process's output lines. We drive it with `cargo --version` — cheap,
+    /// deterministic, and present wherever this crate builds — instead of a
+    /// real `cargo build`. Draining `rx` to completion also proves every
+    /// sender (banner + both reader threads) is dropped when the child exits.
+    #[test]
+    fn stream_command_relays_banner_and_output() {
+        let (tx, rx) = mpsc::channel::<String>();
+        Aule::stream_command("cargo", &["--version"], tx).expect("spawn cargo --version");
+
+        let lines: Vec<String> = rx.iter().collect();
+
+        // First line is always the banner, echoing program + args.
+        assert!(
+            lines[0].starts_with("[AULE] Forging with: cargo"),
+            "unexpected banner: {:?}",
+            lines[0]
+        );
+        assert!(lines[0].contains("--version"), "banner omits args: {:?}", lines[0]);
+
+        // `cargo --version` prints a line like "cargo 1.xx.x (...)" on stdout.
+        assert!(
+            lines.iter().any(|l| l.contains("cargo")),
+            "expected a cargo version line, got: {:?}",
+            lines
+        );
+    }
+
+    /// A `Void` context has nothing to build: `forge_streamed` must return
+    /// `Ok(())` without spawning anything or emitting a banner.
+    #[test]
+    fn void_spline_streams_nothing() {
+        let dir = std::env::temp_dir().join(format!("aule_void_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create empty void dir");
+
+        let aule = Aule::new(&dir);
+        assert_eq!(aule.context.spline, Spline::Void);
+
+        let (tx, rx) = mpsc::channel::<String>();
+        aule.forge_streamed(tx).expect("void forge is a no-op ok");
+        let lines: Vec<String> = rx.iter().collect();
+        assert!(lines.is_empty(), "void forge should emit nothing, got: {:?}", lines);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A failed spawn (nonexistent program) surfaces as an `Err`, not a panic
+    /// or a silent hang. The banner is best-effort and may still be sent.
+    #[test]
+    fn stream_command_missing_program_errors() {
+        let (tx, _rx) = mpsc::channel::<String>();
+        let result = Aule::stream_command("aule_no_such_program_xyz", &[], tx);
+        assert!(result.is_err(), "missing program should error");
     }
 }

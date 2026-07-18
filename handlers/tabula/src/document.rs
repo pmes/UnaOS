@@ -142,4 +142,124 @@ mod tests {
 
         let _ = fs::remove_file(&path);
     }
+
+    /// No `tempfile` crate is in the workspace, so tests own their scratch
+    /// paths: a per-test basename plus the process id keeps parallel runs and
+    /// concurrent test binaries from colliding. Callers must clean up.
+    fn scratch_path(name: &str) -> PathBuf {
+        // pid goes *before* `name` so `name`'s extension stays trailing and
+        // language detection sees the real suffix.
+        std::env::temp_dir().join(format!("tabula_{}_{}", std::process::id(), name))
+    }
+
+    #[test]
+    fn language_for_edge_cases() {
+        // Every mapped extension resolves to its language id.
+        assert_eq!(TabulaDocument::language_for("toml"), "toml");
+        assert_eq!(TabulaDocument::language_for("md"), "markdown");
+        assert_eq!(TabulaDocument::language_for("py"), "python");
+        assert_eq!(TabulaDocument::language_for("js"), "javascript");
+        assert_eq!(TabulaDocument::language_for("json"), "json");
+        assert_eq!(TabulaDocument::language_for("h"), "c");
+
+        // Unknown and empty extensions fall back to the plain-text id.
+        assert_eq!(TabulaDocument::language_for("unknownext"), "txt");
+        assert_eq!(TabulaDocument::language_for(""), "txt");
+        // Case sensitivity is intentional: only lowercase ids are mapped.
+        assert_eq!(TabulaDocument::language_for("RS"), "txt");
+    }
+
+    #[test]
+    fn load_file_without_extension_is_txt() {
+        let path = scratch_path("noext");
+        let _ = fs::remove_file(&path);
+        fs::write(&path, b"plain body, no extension\n").unwrap();
+
+        let doc = TabulaDocument::load(&path).unwrap();
+        assert_eq!(doc.language, "txt");
+        assert_eq!(doc.buffer, "plain body, no extension\n");
+        assert_eq!(doc.path.as_deref(), Some(path.as_path()));
+        assert!(!doc.dirty);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_file_with_unknown_extension_is_txt() {
+        let path = scratch_path("weird.zzz");
+        let _ = fs::remove_file(&path);
+        fs::write(&path, b"content").unwrap();
+
+        let doc = TabulaDocument::load(&path).unwrap();
+        assert_eq!(doc.language, "txt");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_missing_file_errors() {
+        let path = scratch_path("does_not_exist.rs");
+        let _ = fs::remove_file(&path);
+        assert!(TabulaDocument::load(&path).is_err());
+    }
+
+    #[test]
+    fn save_roundtrip_via_tempdir() {
+        let path = scratch_path("roundtrip.toml");
+        let _ = fs::remove_file(&path);
+
+        let mut doc = TabulaDocument::new();
+        doc.path = Some(path.clone());
+        doc.set_buffer("[package]\nname = \"x\"\n");
+        assert!(doc.dirty);
+        doc.save().unwrap();
+        assert!(!doc.dirty, "save clears the dirty flag");
+
+        let reloaded = TabulaDocument::load(&path).unwrap();
+        assert_eq!(reloaded.buffer, "[package]\nname = \"x\"\n");
+        assert_eq!(reloaded.language, "toml");
+        assert!(!reloaded.dirty);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn dirty_flag_transitions() {
+        // Fresh and freshly-loaded documents are clean.
+        let mut doc = TabulaDocument::new();
+        assert!(!doc.dirty);
+
+        // set_buffer dirties.
+        doc.set_buffer("a");
+        assert!(doc.dirty);
+
+        // Re-setting keeps it dirty (there is no equality short-circuit).
+        doc.set_buffer("a");
+        assert!(doc.dirty);
+
+        // A failed save (no path) must NOT clear the dirty flag.
+        assert!(doc.path.is_none());
+        assert!(doc.save().is_err());
+        assert!(doc.dirty, "failed save leaves the document dirty");
+
+        // A successful save clears it.
+        let path = scratch_path("transitions.txt");
+        let _ = fs::remove_file(&path);
+        doc.path = Some(path.clone());
+        doc.save().unwrap();
+        assert!(!doc.dirty);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_with_no_path_errors() {
+        let mut doc = TabulaDocument::new();
+        doc.set_buffer("orphan buffer");
+        let err = doc.save().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        // The buffer and dirty flag are untouched by the failed save.
+        assert_eq!(doc.buffer, "orphan buffer");
+        assert!(doc.dirty);
+    }
 }
