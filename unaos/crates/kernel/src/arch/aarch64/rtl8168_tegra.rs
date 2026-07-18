@@ -90,10 +90,12 @@ mod metal {
 
     /// Poison patterns that mean ABSENT DECODE, never "present" (the PI-V3D-1 false-PASS lesson, shared
     /// with the NET-1/2/3 recon): `0xffffffff` = master-abort / unclaimed config; `0xdeadbeef` =
-    /// firmware register/DRAM fill. A live config/register read is neither.
+    /// firmware register/DRAM fill; `0xa5a5a5a5` = the Tegra CARVEOUT poison fill the NET-4 M1 metal
+    /// FAULT left behind (a raw PCIe BAR value deref'd as a CPU PA into a protected carveout — the exact
+    /// class this fix-forward closes; see the outbound-iATU block below). A live register read is none.
     #[inline]
     fn is_poison(v: u32) -> bool {
-        v == 0xffff_ffff || v == 0xdead_beef
+        v == 0xffff_ffff || v == 0xdead_beef || v == 0xa5a5_a5a5
     }
 
     // ── RTL8168/8111 register offsets (bytes from the BAR2 MMIO window) ──
@@ -256,6 +258,25 @@ mod metal {
             }
             serial_println!("{}   CR.RST STILL set after {} spins — reset did not complete (honest HW result) ::", P4, MAX_SPINS);
             false
+        }
+
+        /// Poison-honest liveness probe through the (freshly mapped) register window, done BEFORE any
+        /// write — the M3 guard transposed from the V3D-2 lesson: every new MMIO window gets a probe
+        /// read before its first write. Reads TCR (0x40), whose chip-version bits ([30:23]) are a
+        /// stable RO datum a live RTL8168 always returns (`r8169` reads exactly this to identify the
+        /// MAC), and rejects the poison fills — open-bus `0xffffffff`, firmware `0xdeadbeef`, and the
+        /// carveout `0xa5a5a5a5` that the M1 metal FAULT left. Returns the value on a live decode, or
+        /// `None` on absent decode (so the caller REFUSES rather than issuing the first register write
+        /// blind — the fault-at-first-write can never recur). This read is safe: it targets the CPU
+        /// aperture the outbound iATU forwards to PCIe, so a mistranslation/link-down returns UR
+        /// (all-ones), never a carveout — unlike the raw-BAR deref this fix retired.
+        fn probe_alive(&self) -> Option<u32> {
+            let tcr = self.r32(REG_TCR);
+            if is_poison(tcr) {
+                None
+            } else {
+                Some(tcr)
+            }
         }
 
         /// Read the six station-MAC bytes from IDR0..5 (the RTL8168 loads them from its EEPROM/eFuse at
@@ -556,6 +577,244 @@ mod metal {
         None
     }
 
+    // ══════════════════════════════════════════════════════════════════════════════════════════════
+    // DWC outbound iATU — the fix-forward for the ORIN-NET-4 M1 metal FAULT-AT-M1.
+    // ══════════════════════════════════════════════════════════════════════════════════════════════
+    //
+    // ## The fault of record (adjudicated; NOT re-litigated)
+    //
+    // The NET-4 driver reached the RTL8168 (config reads/writes via the ECAM fine, twice-confirmed),
+    // then the FIRST BAR-register write (CR soft reset) raised a RAS Uncorrectable — SNOC "Illegal
+    // address (software fault)" / Carveout, `a5a5a5a5` poison fill; recovery needed a DC cut. The
+    // adjudication: BAR2 read back `0x4000_4000` — a PCIe BUS address (firmware assigned the device's
+    // BARs inside controller-0's PCIe MEM window, whose PCI base is `0x4000_0000`). With the DWC iATU
+    // UNPROGRAMMED (the NET-2 finding), there is NO outbound CPU->PCIe MEM translation, so a PCIe bus
+    // address is meaningless as a CPU physical address. The old path mapped `0x4000_4000` as a CPU PA —
+    // it falls in the GiB-1 SYSRAM/BPMP carveout that `mmu_tegra::fill_table` maps Device-nGnRE, so
+    // `map_mmio_window` even returned `AlreadyMapped` without complaint — and the first register write
+    // (`0x4000_4000 + CR`) hit a protected Tegra carveout. The bench observation was RIGHT.
+    //
+    // ## The fix (DWC / pcie-tegra194 sequence-of-record)
+    //
+    // Program an OUTBOUND iATU region mapping a CPU aperture window (taken from controller-0's DT
+    // `ranges`) to the PCIe MEM window, then access the CPU-SIDE aperture address
+    // (`cpu_base + (bar_pci - pci_base)`), NEVER the raw BAR value. Firmware's BAR assignment is KEPT
+    // (it already sits inside the ranges-described window NET-3 sized it in) and merely TRANSLATED — no
+    // BAR reassignment. That is fewer fabric writes and it is the Linux DWC host model of record
+    // (`dw_pcie_prog_outbound_atu` walks `ranges` and leaves enumerated BARs in place).
+    //
+    // ## DWC unrolled-iATU register model
+    //
+    // Linux `drivers/pci/controller/dwc/pcie-designware.h`. Outbound region N lives at
+    // `atu_base + N*0x200`; `atu_base` = controller-0's `atu_dma` reg region (from the DTB), with the
+    // DWC-core `dbi + 0x30_0000` fallback documented for a controller that ships no dedicated ATU
+    // region. Every iATU register write is announced on serial before issue (the lane's write
+    // discipline). These writes target the controller's OWN internal register block (GiB-0 device
+    // window, always decoding on a powered RC — NET-2/3 read dbi/appl/ecam there) — NOT a carveout, so
+    // they carry none of the M1 fault's risk.
+    const ATU_REGION_STRIDE: u64 = 0x200;
+    const ATU_UNR_REGION_CTRL1: u64 = 0x00;
+    const ATU_UNR_REGION_CTRL2: u64 = 0x04;
+    const ATU_UNR_LOWER_BASE: u64 = 0x08;
+    const ATU_UNR_UPPER_BASE: u64 = 0x0c;
+    const ATU_UNR_LOWER_LIMIT: u64 = 0x10;
+    const ATU_UNR_LOWER_TARGET: u64 = 0x14;
+    const ATU_UNR_UPPER_TARGET: u64 = 0x18;
+    const ATU_UNR_UPPER_LIMIT: u64 = 0x20;
+    /// CTRL1 TYPE field: memory outbound = 0x0. CTRL2: region-enable = bit31; increase-region-size =
+    /// bit13 (makes LIMIT the full 64-bit UPPER|LOWER pair — required here, the CPU aperture base sits
+    /// ~200 GiB up, well beyond 32 bits).
+    const ATU_TYPE_MEM: u32 = 0x0;
+    const ATU_ENABLE: u32 = 1 << 31;
+    const ATU_INCREASE_REGION_SIZE: u32 = 1 << 13;
+    /// The DWC-core fallback ATU offset when a controller exposes no dedicated ATU reg region.
+    const ATU_DBI_FALLBACK_OFF: u64 = 0x30_0000;
+
+    /// A `ranges` MEM window: its PCIe base, the CPU aperture base it maps to, and its size.
+    #[derive(Clone, Copy)]
+    struct MemWindow {
+        pci_base: u64,
+        cpu_base: u64,
+        size: u64,
+    }
+
+    /// Program one DWC OUTBOUND iATU region `[cpu_base, cpu_base+size)` -> PCIe `[pci_base, …)`, type
+    /// MEM, and enable it. `atu_base` must already be reachable (GiB-0 device window; the caller
+    /// idempotent-maps it). Base/limit/target are published (`dsb sy`) before the region is armed.
+    fn program_outbound_atu(atu_base: u64, index: u64, win: &MemWindow) {
+        let region = atu_base + index * ATU_REGION_STRIDE;
+        let limit = win.cpu_base + win.size - 1;
+        let w = |off: u64, v: u32| unsafe { write_volatile((region + off) as *mut u32, v) };
+        serial_println!(
+            "{}   M1-fix: outbound iATU region {} @ {:#x} — CPU [{:#x}..{:#x}] -> PCIe {:#x} (type MEM) ::",
+            P4, index, region, win.cpu_base, limit, win.pci_base
+        );
+        serial_println!(
+            "{}   >>> ATU WRITE (M1-fix): BASE lo/hi = {:#010x}/{:#010x} ::",
+            P4, win.cpu_base as u32, (win.cpu_base >> 32) as u32
+        );
+        w(ATU_UNR_LOWER_BASE, win.cpu_base as u32);
+        w(ATU_UNR_UPPER_BASE, (win.cpu_base >> 32) as u32);
+        serial_println!(
+            "{}   >>> ATU WRITE (M1-fix): LIMIT lo/hi = {:#010x}/{:#010x} ::",
+            P4, limit as u32, (limit >> 32) as u32
+        );
+        w(ATU_UNR_LOWER_LIMIT, limit as u32);
+        w(ATU_UNR_UPPER_LIMIT, (limit >> 32) as u32);
+        serial_println!(
+            "{}   >>> ATU WRITE (M1-fix): TARGET lo/hi = {:#010x}/{:#010x} ::",
+            P4, win.pci_base as u32, (win.pci_base >> 32) as u32
+        );
+        w(ATU_UNR_LOWER_TARGET, win.pci_base as u32);
+        w(ATU_UNR_UPPER_TARGET, (win.pci_base >> 32) as u32);
+        serial_println!("{}   >>> ATU WRITE (M1-fix): REGION_CTRL1 = TYPE_MEM ::", P4);
+        w(ATU_UNR_REGION_CTRL1, ATU_TYPE_MEM);
+        // Publish base/limit/target BEFORE the region goes live.
+        unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
+        serial_println!(
+            "{}   >>> ATU WRITE (M1-fix): REGION_CTRL2 = ENABLE|INCREASE_REGION_SIZE — arming region ::",
+            P4
+        );
+        w(ATU_UNR_REGION_CTRL2, ATU_ENABLE | ATU_INCREASE_REGION_SIZE);
+        unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
+    }
+
+    /// Resolve, from the live DTB, controller-0's `atu_dma` ATU base (with the `dbi + 0x30_0000` DWC
+    /// fallback) and the `ranges` MEM window that CONTAINS `bar_pci`. READ-ONLY parse, poison-honest:
+    /// a missing/foreign/disabled DTB, an unreachable DTB GiB, or a BAR that no MEM window covers all
+    /// return `None`, and the caller REFUSES (clean skip) rather than deref a raw PCIe BAR. Mirrors
+    /// `resolve_ecam_base`'s walk (first `pcie@` node, tegra-RC + firmware-`okay` gated).
+    fn resolve_atu_and_window(
+        dtb_addr: u64,
+        dtb_size: usize,
+        ram_gib_mask: u64,
+        bar_pci: u64,
+    ) -> Option<(u64, MemWindow)> {
+        if dtb_addr == 0 || dtb_size == 0 {
+            return None;
+        }
+        let g_lo = dtb_addr >> 30;
+        let g_hi = (dtb_addr + dtb_size as u64 - 1) >> 30;
+        let mapped = |g: u64| g == 0 || (g < 64 && (ram_gib_mask >> g) & 1 != 0);
+        if !mapped(g_lo) || !mapped(g_hi) {
+            return None;
+        }
+        let blob = unsafe { core::slice::from_raw_parts(dtb_addr as *const u8, dtb_size) };
+        let fdt = Fdt::new(blob)?;
+
+        // First `pcie@` node's path.
+        const PATH_CAP: usize = 160;
+        let mut path0 = [0u8; PATH_CAP];
+        let mut plen0 = 0usize;
+        let mut found = false;
+        fdt.for_each_prop(|e| {
+            if found {
+                return;
+            }
+            let leaf = match e.path.iter().rposition(|&b| b == b'/') {
+                Some(i) => &e.path[i + 1..],
+                None => e.path,
+            };
+            if leaf.starts_with(b"pcie@") {
+                let l = e.path.len().min(PATH_CAP);
+                path0[..l].copy_from_slice(&e.path[..l]);
+                plen0 = l;
+                found = true;
+            }
+        });
+        if !found {
+            return None;
+        }
+        let path = &path0[..plen0];
+
+        let mut compatible: Option<&[u8]> = None;
+        let mut status: Option<&[u8]> = None;
+        let mut reg: Option<&[u8]> = None;
+        let mut reg_names: Option<&[u8]> = None;
+        let mut ranges: Option<&[u8]> = None;
+        fdt.for_each_prop(|e| {
+            if e.path != path {
+                return;
+            }
+            let val = &blob[e.val_off..e.val_off + e.val_len];
+            match e.name {
+                b"compatible" => compatible = Some(val),
+                b"status" => status = Some(val),
+                b"reg" => reg = Some(val),
+                b"reg-names" => reg_names = Some(val),
+                b"ranges" => ranges = Some(val),
+                _ => {}
+            }
+        });
+
+        // Tegra DesignWare RC + firmware-enabled? (same gate as resolve_ecam_base.)
+        let is_tegra_rc = compatible
+            .map(|c| {
+                let has = |n: &[u8]| c.windows(n.len()).any(|w| w == n);
+                has(b"tegra234-pcie") || has(b"tegra194-pcie") || has(b"snps,dw-pcie")
+            })
+            .unwrap_or(false);
+        if !is_tegra_rc {
+            return None;
+        }
+        let okay = match status {
+            None => true,
+            Some(s) => s.split(|&b| b == 0).any(|item| item == b"okay" || item == b"ok"),
+        };
+        if !okay {
+            return None;
+        }
+
+        // reg/reg-names region base by name (4 cells = addr:2 + size:2 per region, big-endian).
+        let (reg, names) = (reg?, reg_names?);
+        let region_base = |want: &[u8]| -> Option<u64> {
+            let mut idx = 0usize;
+            for item in names.split(|&b| b == 0) {
+                if item.is_empty() {
+                    continue;
+                }
+                if item == want {
+                    let off = idx * 16;
+                    let b = reg.get(off..off + 8)?;
+                    let hi = u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as u64;
+                    let lo = u32::from_be_bytes([b[4], b[5], b[6], b[7]]) as u64;
+                    return Some((hi << 32) | lo);
+                }
+                idx += 1;
+            }
+            None
+        };
+        // Prefer the dedicated ATU region; fall back to the DWC-core dbi + 0x30_0000 offset.
+        let atu_base = region_base(b"atu_dma")
+            .or_else(|| region_base(b"atu"))
+            .or_else(|| region_base(b"dbi").map(|d| d + ATU_DBI_FALLBACK_OFF))?;
+
+        // Walk `ranges`: rows of 7 cells (child PCI addr:3, parent CPU addr:2, size:2 = 28 bytes).
+        // The child cell-0 high byte's space code ((>>24)&3): 2 = 32-bit MEM, 3 = 64-bit MEM (1 = I/O,
+        // skipped). Return the first MEM window whose [pci_base, pci_base+size) contains `bar_pci`.
+        let ranges = ranges?;
+        let cell = |b: &[u8], i: usize| -> u64 {
+            u32::from_be_bytes([b[i * 4], b[i * 4 + 1], b[i * 4 + 2], b[i * 4 + 3]]) as u64
+        };
+        let mut off = 0usize;
+        while off + 28 <= ranges.len() {
+            let row = &ranges[off..off + 28];
+            let space = (cell(row, 0) >> 24) & 0x3;
+            let pci_base = (cell(row, 1) << 32) | cell(row, 2);
+            let cpu_base = (cell(row, 3) << 32) | cell(row, 4);
+            let size = (cell(row, 5) << 32) | cell(row, 6);
+            if (space == 2 || space == 3)
+                && size != 0
+                && bar_pci >= pci_base
+                && bar_pci < pci_base + size
+            {
+                return Some((atu_base, MemWindow { pci_base, cpu_base, size }));
+            }
+            off += 28;
+        }
+        None
+    }
+
     /// ORIN-NET-4 entry point (metal): claim controller-0's downstream RTL8168, map its register BAR,
     /// reset the MAC, and read the station MAC. Rings + init (M2) and the smoltcp bind (M3) land in
     /// later milestones. Graceful on any missing/foreign DTB or absent decode (records and returns).
@@ -642,31 +901,70 @@ mod metal {
         } else {
             base_lo
         };
+        // BAR2 is firmware's assignment: a PCIe BUS address (the M1 FAULT's root fact). NOT a CPU PA.
+        let bar_pci = bar_base;
         serial_println!(
-            "{}   register BAR2 = {:#x} ({}-bit {}) ::",
-            P4, bar_base, if is_64bit { "64" } else { "32" },
+            "{}   register BAR2 = {:#x} ({}-bit {}) — this is a PCIe BUS address (needs outbound iATU translation) ::",
+            P4, bar_pci, if is_64bit { "64" } else { "32" },
             if (bar2 >> 3) & 1 == 1 { "prefetchable mem" } else { "mem" }
         );
-        if bar_base == 0 {
+        if bar_pci == 0 {
             serial_println!("{}   BAR2 base is 0 (firmware left it unassigned) — bring-up SKIPPED ::", P4);
             return;
         }
-        // Map the 4 KiB register window (BAR2 sized to 0x1000). The Tegra MMIO ranges live ~200 GiB,
-        // within the PS-widened 40-bit / 512-GiB-table reach.
         let bar_size = 0x1000usize;
-        match map_mmio_window(bar_base, bar_size) {
+
+        // ── M1-FIX: outbound iATU + PCIe->CPU aperture translation (the fault-forward for FAULT-AT-M1) ──
+        // The old path mapped `bar_pci` as a CPU PA and wrote the first register there — into a Tegra
+        // carveout (RAS Uncorrectable). Instead: resolve controller-0's `ranges` MEM window + `atu_dma`
+        // ATU base from the DTB, program an outbound iATU region for that window, then access the
+        // CPU-SIDE aperture address. REFUSE (clean skip) on any unresolved piece — never deref the raw
+        // BAR again.
+        let Some((atu_base, win)) = resolve_atu_and_window(dtb_addr, dtb_size, ram_gib_mask, bar_pci) else {
+            serial_println!(
+                "{}   M1-fix: no `ranges` MEM window / `atu_dma` base covers BAR2 {:#x} in the DTB — bring-up SKIPPED (REFUSE: will NOT deref a raw PCIe BAR as a CPU address, the FAULT-AT-M1 class) ::",
+                P4, bar_pci
+            );
+            return;
+        };
+        serial_println!(
+            "{}   M1-fix: BAR2 {:#x} in ranges MEM window PCIe [{:#x}..{:#x}) -> CPU base {:#x}; ATU base {:#x} ::",
+            P4, bar_pci, win.pci_base, win.pci_base + win.size, win.cpu_base, atu_base
+        );
+        // The ATU register block is GiB-0 (already mapped); idempotent-map it Device-nGnRE to be safe.
+        match map_mmio_window(atu_base, 0x1000) {
+            MmioMap::Mapped | MmioMap::AlreadyMapped => {}
+            MmioMap::BeyondPsCeiling => {
+                serial_println!("{}   M1-fix: ATU base {:#x} unmappable — bring-up SKIPPED ::", P4, atu_base);
+                return;
+            }
+        }
+        // Program outbound region 0 for the whole MEM window (announced writes; enabled last).
+        program_outbound_atu(atu_base, 0, &win);
+
+        // The CPU-side aperture address for BAR2 = cpu_base + (bar_pci - pci_base). This — NOT bar_pci —
+        // is what the CPU dereferences; the iATU forwards it to PCIe. It sits ~200 GiB up, inside the
+        // PS-widened 40-bit / 512-GiB-table reach.
+        let cpu_addr = win.cpu_base + (bar_pci - win.pci_base);
+        match map_mmio_window(cpu_addr, bar_size) {
             MmioMap::Mapped | MmioMap::AlreadyMapped => {
-                serial_println!("{}   BAR2 {:#x} (+{:#x}) mapped Device-nGnRE — registers reachable ::", P4, bar_base, bar_size);
+                serial_println!(
+                    "{}   BAR2 CPU aperture {:#x} (+{:#x}) mapped Device-nGnRE — registers reachable via iATU ::",
+                    P4, cpu_addr, bar_size
+                );
             }
             MmioMap::BeyondPsCeiling => {
-                serial_println!("{}   BAR2 {:#x} BEYOND the PS ceiling — cannot map register window; bring-up SKIPPED ::", P4, bar_base);
+                serial_println!(
+                    "{}   BAR2 CPU aperture {:#x} BEYOND the PS ceiling — cannot map register window; bring-up SKIPPED ::",
+                    P4, cpu_addr
+                );
                 return;
             }
         }
 
-        // ── Construct the driver, reset the MAC, read the station MAC (M1) ──
+        // ── Construct the driver at the CPU aperture (never the raw BAR value) ──
         let mut nic = Rtl8168 {
-            mmio_base: bar_base,
+            mmio_base: cpu_addr,
             mac: [0; 6],
             rx_ring: core::ptr::null_mut(),
             rx_buffers: core::ptr::null_mut(),
@@ -677,6 +975,25 @@ mod metal {
             tx_cur: 0,
             tx_count: 0,
         };
+
+        // ── M2/M3 GUARD: poison-honest readback through the NEW window BEFORE any register write ──
+        // The lesson of FAULT-AT-M1 (and V3D-2) made law: every new MMIO window earns a probe READ
+        // before its first WRITE. A live RTL8168 returns a plausible TCR (chip-version bits); poison
+        // (open-bus / carveout `a5a5a5a5` / firmware fill) means the iATU/link is not delivering — so
+        // we REFUSE cleanly, and the next sitting can never fault on the first write again.
+        let Some(tcr_probe) = nic.probe_alive() else {
+            serial_println!(
+                "{}   M1-fix readback: TCR through the iATU aperture = POISON (open-bus/carveout/absent) — the register window is NOT live; bring-up REFUSED before any write (no first-write fault) ::",
+                P4
+            );
+            return;
+        };
+        serial_println!(
+            "{}   M1-fix readback: TCR = {:#010x} (live, non-poison) — register window confirmed; first write is now safe ::",
+            P4, tcr_probe
+        );
+
+        // ── Reset the MAC, read the station MAC (M1) ──
         if !nic.soft_reset() {
             serial_println!("{}   MAC reset did not complete — continuing to read MAC (may be stale) ::", P4);
         }
@@ -698,8 +1015,8 @@ mod metal {
         let link = nic.link_up();
         *NET4_DEVICE.lock() = Some(nic);
         serial_println!(
-            "{}   RTL8168 @ BAR2 {:#x}, MAC read, C+ rings up + RX/TX enabled; PHY link {} ::",
-            P4, bar_base, if link { "UP" } else { "DOWN" }
+            "{}   RTL8168 @ BAR2 PCIe {:#x} (CPU aperture {:#x}), MAC read, C+ rings up + RX/TX enabled; PHY link {} ::",
+            P4, bar_pci, cpu_addr, if link { "UP" } else { "DOWN" }
         );
 
         // ── M3: bind a smoltcp phy::Device over the rings (the e1000/smolnet seam) ──

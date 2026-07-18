@@ -8,6 +8,14 @@ bus-master, map BAR2, reset the MAC, bring up the C+ RX/TX descriptor rings, rea
 a smoltcp `phy::Device` over the rings. QEMU models no Tegra234 RC, so the whole MMIO/DMA + smoltcp layer is
 **attended-metal** — this sitting.
 
+**NET-4b (fix-forward) is folded in.** The first NET-4 sitting FAULTED at the first BAR register write:
+BAR2 read back `0x4000_4000` — a **PCIe bus address** — and the driver deref'd it as a CPU physical address,
+hitting a Tegra carveout (RAS Uncorrectable, `a5a5a5a5` poison, DC-cut recovery). NET-4b programs an
+**outbound iATU region** from controller-0's DT `ranges` and drives the **CPU-side aperture** address
+(`cpu_base + (bar_pci − pci_base)`), never the raw BAR value, and gates the first write behind a
+**poison-honest TCR readback** through the new window. See arch_arm64.md §ORIN-NET-4b for the adjudication
+and the ATU design.
+
 See `arch/aarch64/rtl8168_tegra.rs` (the driver + smoltcp adapter), `arch/aarch64/pcie_probe.rs` (the NET-3
 `census2`/`net3_*` recon this runs after), `arch/aarch64/mmu_tegra.rs` (`map_mmio_window` + the PS widen),
 and arch_arm64.md §ORIN-NET-4 for the design, the programming model, the DMA identity-map invariant, and the
@@ -58,8 +66,16 @@ lines then take over:
 :: PCIE4:   ecam 0x2e20000000 mapped Device-nGnRE (via the PS-widened regime) ::
 :: PCIE4:   bus1:dev0:fn0 vendor=0x10ec device=0x8168 ::
 :: PCIE4:   >>> CONFIG WRITE (M1): COMMAND[0x4] 0x……… -> 0x……… (set MEM-space + bus-master) — issuing ::
-:: PCIE4:   register BAR2 = 0x……… (64-bit prefetchable mem) ::
-:: PCIE4:   BAR2 0x……… (+0x1000) mapped Device-nGnRE — registers reachable ::
+:: PCIE4:   register BAR2 = 0x40004000 (32-bit mem) — this is a PCIe BUS address (needs outbound iATU translation) ::
+:: PCIE4:   M1-fix: BAR2 0x40004000 in ranges MEM window PCIe [0x40000000..0x50000000) -> CPU base 0x32… ; ATU base 0x2a04… ::
+:: PCIE4:   M1-fix: outbound iATU region 0 @ 0x2a04… — CPU [0x32…..0x32…] -> PCIe 0x40000000 (type MEM) ::
+:: PCIE4:   >>> ATU WRITE (M1-fix): BASE lo/hi = 0x…/0x… ::
+:: PCIE4:   >>> ATU WRITE (M1-fix): LIMIT lo/hi = 0x…/0x… ::
+:: PCIE4:   >>> ATU WRITE (M1-fix): TARGET lo/hi = 0x40000000/0x00000000 ::
+:: PCIE4:   >>> ATU WRITE (M1-fix): REGION_CTRL1 = TYPE_MEM ::
+:: PCIE4:   >>> ATU WRITE (M1-fix): REGION_CTRL2 = ENABLE|INCREASE_REGION_SIZE — arming region ::
+:: PCIE4:   BAR2 CPU aperture 0x32… (+0x1000) mapped Device-nGnRE — registers reachable via iATU ::
+:: PCIE4:   M1-fix readback: TCR = 0x……… (live, non-poison) — register window confirmed; first write is now safe ::
 :: PCIE4:   >>> REG WRITE (M1): CR[0x37] |= RST (soft reset) — issuing ::
 :: PCIE4:   CR.RST cleared after N spins — reset complete ::
 :: PCIE4:   station MAC = xx:xx:xx:xx:xx:xx ::
@@ -73,7 +89,7 @@ lines then take over:
 :: PCIE4:   >>> REG WRITE (M2): CR[0x37] = 0x0c (RxEnb | TxEnb) ::
 :: PCIE4:   >>> REG WRITE (M2): RCR[0x44] = 0x……… (promiscuous bring-up) ::
 :: PCIE4:   rings up: RX @ 0x……… (32 desc) TX @ 0x……… (8 desc); TCR readback 0x……… (live) ::
-:: PCIE4:   RTL8168 @ BAR2 0x………, MAC read, C+ rings up + RX/TX enabled; PHY link UP/DOWN ::
+:: PCIE4:   RTL8168 @ BAR2 PCIe 0x40004000 (CPU aperture 0x32…), MAC read, C+ rings up + RX/TX enabled; PHY link UP/DOWN ::
 :: PCIE4:   smoltcp 0.13 Interface BOUND over RTL8168: MAC set, 192.168.1.2/24 + default gw 192.168.1.1, medium=ethernet, polled OK; link … — live ICMP/ARP is attended-metal ::
 :: PCIE4: ORIN-NET-4 DONE — RTL8168 driver up + smoltcp bound (live traffic = attended metal) ::
 ```
@@ -97,6 +113,11 @@ lines then take over:
   and any ARP reply. First Orin network I/O.
 - **Rings never advance despite a live link** — the **SMMU-bypass finding**; scope the next arc (program an
   SMMU identity/bypass stream mapping for controller-0).
+- **`M1-fix readback: TCR … = POISON … bring-up REFUSED before any write`** — the register window is not
+  live through the iATU (mistranslation, link down, or the device quiesced). This is the guard doing its
+  job: an **honest clean refusal, no fault**, not a bug to work around. Record the `ranges`/ATU/CPU-aperture
+  values printed just above it (they scope whether the `ranges` resolution or the iATU program is at fault)
+  and report — do **not** improvise a raw-BAR fallback (that is the retired FAULT-AT-M1 path).
 
 The box proceeds to CAPSTONE (JM6) exactly as a normal tegra boot — the bring-up is a prologue. Restore the
 boot-stick default at the end of the sitting per the standing rule.
