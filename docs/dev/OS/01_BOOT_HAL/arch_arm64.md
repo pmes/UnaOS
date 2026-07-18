@@ -4457,6 +4457,28 @@ revision is UNBLOCKED with this framing (tool = honest negative + the takeover s
 real trigger; Peter posts); (b) the wall remains live on current firmware; (c) the af1af39-era
 layout joins the faulter ledger (~1-in-3 observed, small sample).
 
+**⚡⚡ R21 CONSOLIDATED SITTING (2026-07-17 night; serial
+`~/unaos-bench/jetson-serial-2026-07-17-r21b-sitting.log`; merged main `3338d55` media):**
+- **ORIN-SMP-DEFAULT candidate (pure default build, kernel `922ab1ce…`): 1 fault / 2 clean.**
+  Boot 1 fired the SMP-3-class IOB record (`0x…0200`, CBB `0x6` + ACI FillWrite) at the
+  tegrasmp kick-off — the historical SMP-3 signature re-sampled by the new layout,
+  probabilistic not deterministic here. Boots 2 and 3: **5/5 secondaries online on BOTH
+  clusters, SGIs clean, VUG-HONESTY witness PASS, CAPSTONE COMPLETE, interactive shell — the
+  first default-path 6-core UnaOS shells on Orin silicon.** Candidate NOT promoted (defaults
+  rule: the record must be fault-free); stick default remains `cad623af…` (restored at close,
+  content-verified). The SMP code itself is exonerated again — the kick-off fault is the
+  known layout/box-state residual, now observed probabilistic on this layout.
+- **RAST-TEGRA: FIRST 3D PIXELS ON THE ORIN PANEL** — witness build (kernel `b41989d0…`)
+  rendered the cube on the real 1920×1200 inherited scanout: `90 frames in 91 ms — 989.010
+  fps` (attended visual confirm: the animation completes in ~0.1 s and presents as a blue
+  flash/square — frame PACING is a follow-up nit, the render itself is proven; contrast x86's
+  21.9 fps per-pixel present). CAPSTONE COMPLETE same boot, zero faults.
+- **ORIN-NET-1 census on real firmware: 8 Tegra234 PCIe controllers found and walked
+  read-only** (controller 0 `pcie@140a0000` domain 8 status=okay with full
+  appl/config/atu_dma/dbi/ecam reg map + ranges captured; controllers 1–7 enumerated; full
+  detail in the serial log). The NET-2 scoping data now exists on the record; fold into
+  §ORIN-NET-1's metal columns at the next docs pass on the merged tree.
+
 ### ORIN-SMP-8 — the tegrasmp RELINK (the layout-axis close-out; BUILD-ONLY, `UNAOS_TEGRASMP` + `UNAOS_XCARVE_RELINK`)
 
 ORIN-SMP-7's attended sitting exonerated the wake POSITION axis end-to-end (legs 24/25 both put 5/5
