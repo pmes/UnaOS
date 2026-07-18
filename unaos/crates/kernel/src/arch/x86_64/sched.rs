@@ -51,6 +51,23 @@
 // invariants above are touched. A timed-out joiner drops its handle while the joined task may still
 // hold its own `done_sem` `Arc` clone, so a later `post()` into an empty waiter list stays sound
 // (bumps the count on a soon-to-be-freed semaphore; no dangle, no leak).
+//
+// SCHED-POLISH layer (two §4 refinements, invariants above untouched):
+//   * `effective_level` aging refinement (M1). A ready task carries a transient EFFECTIVE level
+//     (`priority..NUM_PRIORITIES`) and always occupies `levels[effective_level]`. A FRESH enqueue
+//     (`RunQueue::push`: spawn / wake) re-bases it to `priority`; the aging sweep (`RunQueue::age`)
+//     bumps it up one on promotion; a RE-ENQUEUE after a dispatch (`RunQueue::requeue`: yield /
+//     preempt) DECAYS it toward base by ONE level instead of resetting. So a task dispatched while
+//     climbing under bursty load re-climbs at most one level, holding the starvation bound at
+//     ~`AGE_TICKS` per level even when intermediate levels drain (the pre-refinement blow-up). The
+//     field is owning-CPU-only + lock-protected exactly like `wait_ticks`; base `priority` stays the
+//     immutable lock-free read for `poke_for`/`make_ready`/the dispatch publish.
+//   * `Condvar::init_with_capacity(n)` (M2). The `WAIT_CAPACITY` (32) waiter-list reservation is now
+//     per-`Condvar` (a `capacity` field, default 32, still exactly reserved by `init()`); `wait()`'s
+//     alloc-free-park assert tracks the per-instance value. `RwLock::init_with_reader_capacity(n)`
+//     threads it to the reader condvar (the writer queue + inner mutex keep the default), so a
+//     `>32`-simultaneously-blocked-reader `RwLock` is constructible. `Condvar::new()` / `RwLock::new`
+//     / `init()` behaviour is byte-identical to before.
 
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
@@ -79,9 +96,11 @@ const QUANTUM_TICKS: u32 = 4;
 /// Priority aging (anti-starvation). A ready task that has WAITED in the run queue this many local
 /// ticks without being dispatched is promoted one effective level toward the top (its base priority
 /// is unchanged). Repeated, a low task under continuous higher-priority load climbs to parity with
-/// the load and runs, then drops back to base on dispatch — bounding starvation to ~`AGE_TICKS` per
-/// level it must climb. (Bound is exact when no level between base and the contended level drains;
-/// finite-but-larger under bursty mixed load, since a dispatch at an intermediate level re-bases.)
+/// the load and runs; on dispatch it DECAYS one effective level (not all the way to base — the
+/// `current_level`/`effective_level` refinement, see `RunQueue::requeue`/`age`), so it re-climbs at
+/// most one level per turn. This holds the starvation bound at ~`AGE_TICKS` per level the task must
+/// climb EVEN under bursty mixed load where intermediate levels drain (before the refinement a
+/// dispatch at an intermediate level re-based the whole climb, making the bound finite-but-larger).
 const AGE_TICKS: u32 = 16;
 
 /// How often the scheduler runs the aging sweep, in local ticks. Kept well below `AGE_TICKS` so the
@@ -204,10 +223,20 @@ pub struct Task {
     /// Aging never touches this — it only transiently raises the *level* a task sits in (below).
     priority: u8,
     /// Ticks this task has WAITED in a run queue since its last enqueue, for priority aging. Touched
-    /// ONLY under the owning CPU's run-queue spinlock (zeroed by `RunQueue::push` on every enqueue,
-    /// accrued + consumed by `RunQueue::age` on that CPU). NEVER read cross-CPU — unlike `priority`,
-    /// it is mutable and lock-protected, so it must not be read off the owning CPU.
+    /// ONLY under the owning CPU's run-queue spinlock (zeroed by `RunQueue::push`/`requeue` on every
+    /// enqueue, accrued + consumed by `RunQueue::age` on that CPU). NEVER read cross-CPU — unlike
+    /// `priority`, it is mutable and lock-protected, so it must not be read off the owning CPU.
     wait_ticks: u32,
+    /// Transient EFFECTIVE level this task currently sits at in the run queue (`priority..NUM_PRIORITIES`).
+    /// The refinement over plain reset-on-dispatch aging: a task always occupies `levels[effective_level]`,
+    /// and the run-queue placement operations keep this field == that index. A FRESH enqueue
+    /// (`RunQueue::push`, i.e. spawn / wake) re-bases it to `priority`; the aging sweep (`RunQueue::age`)
+    /// bumps it up one on promotion; a RE-ENQUEUE after a dispatch (`RunQueue::requeue`, i.e. yield /
+    /// preempt) DECAYS it toward base by one level rather than all the way — so an intermediate dispatch
+    /// no longer erases a multi-level promotion, tightening the starvation bound (see `RunQueue::age`).
+    /// Same discipline as `wait_ticks`: lock-protected, owning-CPU-only, NEVER read cross-CPU (the base
+    /// `priority` — not this — is what `poke_for`/`make_ready`/the dispatch publish read lock-free).
+    effective_level: u8,
     /// Completion signal for `join()`, or `None` for a fire-and-forget task. A joinable task carries
     /// a clone of the same `Arc<Semaphore>` (0 permits) held by its `JoinHandle`; the trampoline
     /// `post()`s it after `entry` returns. The Arc — not a `'static` lifetime — keeps the semaphore
@@ -329,12 +358,32 @@ impl RunQueue {
     fn with_capacity(cap: usize) -> Self {
         RunQueue { levels: core::array::from_fn(|_| VecDeque::with_capacity(cap)) }
     }
-    /// ENQUEUE a task at its BASE priority level (FIFO within the level), clamped in range, and
-    /// reset its aging clock — every enqueue (spawn / wake / re-enqueue after preempt/yield) zeroes
-    /// `wait_ticks`, so a task only ages while it sits WAITING and re-bases the moment it is requeued.
+    /// FRESH ENQUEUE at the task's BASE priority level (FIFO within the level), clamped in range, and
+    /// reset its aging state. Used on spawn and on WAKE (`make_ready`) — a task that just became
+    /// runnable (newly created, or unblocked after doing its work) starts over at base, so strict
+    /// priority is preserved for genuinely new work. Zeroes `wait_ticks` (it only ages while WAITING)
+    /// and re-bases `effective_level` to the base level. NOT used for a mere yield/preempt re-enqueue
+    /// (that is `requeue`, which preserves promotion progress).
     fn push(&mut self, mut task: Box<Task>) {
         task.wait_ticks = 0;
         let level = (task.priority as usize).min(NUM_PRIORITIES - 1);
+        task.effective_level = level as u8;
+        self.levels[level].push_back(task);
+    }
+    /// RE-ENQUEUE a task that switched back READY from a DISPATCH (yield or timer preempt), decaying
+    /// its transient effective level by ONE toward base rather than resetting all the way (as `push`
+    /// would). This is the `current_level` refinement: an intermediate dispatch — the task got a slice
+    /// while climbing, e.g. because a contended level momentarily drained under bursty load — no longer
+    /// erases a multi-level promotion, so the task re-climbs at most one level instead of from base.
+    /// Base `priority` is untouched (immutable); the new level is clamped to `>= base`, so a task never
+    /// decays below its own priority and, absent contention, settles back at base within a few
+    /// dispatches (strict priority restored). Resets the aging clock for the new level.
+    fn requeue(&mut self, mut task: Box<Task>) {
+        let base = (task.priority as usize).min(NUM_PRIORITIES - 1);
+        let cur = (task.effective_level as usize).min(NUM_PRIORITIES - 1);
+        let level = cur.saturating_sub(1).max(base);
+        task.wait_ticks = 0;
+        task.effective_level = level as u8;
         self.levels[level].push_back(task);
     }
     /// Dequeue the front of the HIGHEST non-empty level (strict priority over the effective level,
@@ -356,6 +405,14 @@ impl RunQueue {
     /// sweep, no runaway multi-level jump). Within a level, popping exactly `n = len()` from the
     /// front and pushing kept tasks to the back rotates the deque full-circle, preserving FIFO.
     /// Relocation is a raw `VecDeque` move that leaves `priority` (base) untouched — NOT `push`.
+    ///
+    /// `effective_level` is kept == the level the task actually occupies (bumped on promotion), so a
+    /// later `requeue` after a dispatch can decay it by ONE level instead of dropping it to base. This
+    /// is the refinement: without it, reset-on-dispatch made the starvation bound `~2*AGE_TICKS` per
+    /// level only when NO intermediate level drains, blowing up under bursty mixed load (a dispatch at
+    /// an intermediate level re-based the climb); preserving the level across a dispatch caps the
+    /// re-climb at one level, so the bound holds at `~2*AGE_TICKS` per level regardless of intermediate
+    /// drains.
     fn age(&mut self, elapsed: u32) {
         for level in (0..NUM_PRIORITIES - 1).rev() {
             let n = self.levels[level].len();
@@ -365,8 +422,13 @@ impl RunQueue {
                 if task.wait_ticks >= AGE_TICKS {
                     task.wait_ticks -= AGE_TICKS; // carry surplus credit, don't discard it
                     debug_assert!(level + 1 < NUM_PRIORITIES, "age: promotion above top level");
+                    task.effective_level = (level + 1) as u8; // track the RELOCATE destination
                     self.levels[level + 1].push_back(task); // RELOCATE up one level (base unchanged)
                 } else {
+                    debug_assert_eq!(
+                        task.effective_level as usize, level,
+                        "age: effective_level out of sync with occupied level"
+                    );
                     self.levels[level].push_back(task);
                 }
             }
@@ -534,6 +596,7 @@ fn spawn_inner(
         cpu: target_cpu as u32,
         priority,
         wait_ticks: 0, // re-zeroed by push() on every enqueue; this satisfies the struct literal
+        effective_level: 0, // re-based to `priority` by push() on enqueue (just below)
         done_sem,
         user_entry: 0,
         user_rsp: 0,
@@ -726,6 +789,7 @@ fn spawn_user_inner(
         cpu: target_cpu as u32,
         priority: PRIO_NORMAL,
         wait_ticks: 0,
+        effective_level: 0, // re-based to `priority` by push() on enqueue (just below)
         done_sem: None,
         user_entry,
         user_rsp,
@@ -1304,9 +1368,15 @@ pub struct Condvar {
     /// Raw spinlock guarding `waiters`. Acquire on lock, Release on unlock. Same role as
     /// `Semaphore::locked`; there is no count (notifications are not stored).
     locked: AtomicBool,
-    /// FIFO waiter list; touched only under `locked`. Pre-reserved to `WAIT_CAPACITY` by `init()`
-    /// so the scheduler's park-side `push_back` never reallocates under the held lock.
+    /// FIFO waiter list; touched only under `locked`. Pre-reserved to `capacity` by `init()` /
+    /// `init_with_capacity()` so the scheduler's park-side `push_back` never reallocates under the
+    /// held lock.
     waiters: UnsafeCell<VecDeque<Box<Task>>>,
+    /// Per-instance waiter-list reservation (the number `wait()` asserts the queue never reaches).
+    /// Defaults to `WAIT_CAPACITY`; `init_with_capacity(n)` raises it so a `>WAIT_CAPACITY`-reader
+    /// `RwLock` is possible (see `RwLock::init_with_reader_capacity`). Set ONCE at init before any
+    /// task can block, then only read — `Relaxed` suffices.
+    capacity: AtomicUsize,
 }
 
 // SAFETY: every access to `waiters` is serialized by `locked`; the park-side push happens while the
@@ -1315,19 +1385,34 @@ pub struct Condvar {
 unsafe impl Sync for Condvar {}
 
 impl Condvar {
-    /// Construct an empty condition variable. `const` so it can initialise a `static`.
+    /// Construct an empty condition variable with the default `WAIT_CAPACITY` waiter reservation.
+    /// `const` so it can initialise a `static`. Behaviour is unchanged from before the capacity
+    /// parameter existed — `new()` + `init()` still reserves exactly `WAIT_CAPACITY`.
     pub const fn new() -> Self {
         Condvar {
             locked: AtomicBool::new(false),
             waiters: UnsafeCell::new(VecDeque::new()),
+            capacity: AtomicUsize::new(WAIT_CAPACITY),
         }
     }
 
-    /// Reserve the waiter list's capacity so the scheduler's park-side push never reallocates under
-    /// the held lock. Call once on the BSP before any task can block on this condvar.
+    /// Reserve the default `WAIT_CAPACITY` waiter slots so the scheduler's park-side push never
+    /// reallocates under the held lock. Call once on the BSP before any task can block on this condvar.
     pub fn init(&self) {
+        self.init_with_capacity(WAIT_CAPACITY);
+    }
+
+    /// Reserve `capacity` waiter slots (in place of the default `WAIT_CAPACITY`) and record that
+    /// reservation so `wait()`'s alloc-free-park assert tracks THIS instance's real ceiling. Lifts the
+    /// 32-waiter cap for a condvar that must hold more blocked tasks — e.g. the reader queue of a
+    /// `>WAIT_CAPACITY`-reader `RwLock`. Call once on the BSP before any task can block. `capacity`
+    /// MUST be `>= WAIT_CAPACITY` is NOT required, but it must be `>= 1` and large enough for the peak
+    /// simultaneous blocked population, or `wait()` will assert.
+    pub fn init_with_capacity(&self, capacity: usize) {
+        debug_assert!(capacity >= 1, "Condvar capacity must be >= 1");
+        self.capacity.store(capacity, Ordering::Relaxed);
         self.lock_raw();
-        unsafe { (*self.waiters.get()).reserve(WAIT_CAPACITY) };
+        unsafe { (*self.waiters.get()).reserve(capacity) };
         self.unlock_raw();
     }
 
@@ -1378,8 +1463,8 @@ impl Condvar {
         // (e) Prove the park-side push stays allocation-free: the lock is held continuously through
         //     the switch, so this length cannot change before park_blocked pushes.
         assert!(
-            unsafe { (*self.waiters.get()).len() } < WAIT_CAPACITY,
-            "Condvar waiter overflow (raise WAIT_CAPACITY)"
+            unsafe { (*self.waiters.get()).len() } < self.capacity.load(Ordering::Relaxed),
+            "Condvar waiter overflow (raise this condvar's init_with_capacity)"
         );
 
         unsafe {
@@ -1557,12 +1642,14 @@ struct RwState {
 ///
 /// MUST be `'static` (or Arc-kept-alive) like its parts; call `init()` once on the BSP before use.
 ///
-/// PRECONDITION (load-bearing): at most `WAIT_CAPACITY` (32) tasks may be simultaneously blocked on
-/// the reader condvar — or on the writer condvar — of a single `RwLock`. The underlying `Condvar`
-/// asserts its waiter list never exceeds that and PANICS otherwise. Unlike the other primitives
-/// (whose waiter counts are naturally bounded by producer/consumer/holder count), an `RwLock`'s
-/// reader queue is unbounded BY DESIGN, so a caller MUST bound its concurrent-reader population. A
-/// lock needing >32 simultaneous blocked readers would require a larger-capacity Condvar (not here).
+/// PRECONDITION (load-bearing): at most a condvar's reserved capacity of tasks may be simultaneously
+/// blocked on the reader condvar — or on the writer condvar — of a single `RwLock`. The underlying
+/// `Condvar` asserts its waiter list never reaches that reservation and PANICS otherwise. Unlike the
+/// other primitives (whose waiter counts are naturally bounded by producer/consumer/holder count), an
+/// `RwLock`'s reader queue is unbounded BY DESIGN, so a caller MUST bound its concurrent-reader
+/// population. With `init()` both queues reserve the default `WAIT_CAPACITY` (32); a lock needing >32
+/// simultaneously-blocked readers is constructed by reserving the reader queue for more via
+/// `init_with_reader_capacity(n)` (the writer queue stays at the default).
 ///
 /// NOT REENTRANT. A task must hold AT MOST ONE guard (read or write) on a given `RwLock` at a time,
 /// and must never call `read()`/`write()` while already holding a guard on it. All four re-entries
@@ -1601,10 +1688,23 @@ impl<T> RwLock<T> {
         }
     }
 
-    /// Reserve all three sub-primitives' waiter capacity. Call once on the BSP before use.
+    /// Reserve all three sub-primitives' waiter capacity at the default `WAIT_CAPACITY` (32). Call
+    /// once on the BSP before use. Behaviour is unchanged from before the capacity parameter existed.
     pub fn init(&self) {
         self.inner.init();
         self.readers_ok.init();
+        self.writer_ok.init();
+    }
+
+    /// Like `init`, but reserve the READER condvar for up to `readers` simultaneously-blocked readers
+    /// instead of the default 32 — the way to build a `>WAIT_CAPACITY`-reader `RwLock` (the reader
+    /// queue is unbounded by design; the writer queue stays at the default, bounded by the writer
+    /// population). Call once on the BSP before use. The inner mutex keeps the default reservation:
+    /// tasks pass through it only transiently (they end up blocked on a condvar, not the mutex), and
+    /// CPU-pinning serialises per-core contenders, so at most ~one-per-CPU ever parks on it at once.
+    pub fn init_with_reader_capacity(&self, readers: usize) {
+        self.inner.init();
+        self.readers_ok.init_with_capacity(readers);
         self.writer_ok.init();
     }
 
@@ -1898,9 +1998,11 @@ fn run() -> ! {
                             }
                             drop(task); // frees the kstack; the interrupt frame on it is abandoned
                         } else {
-                            // Rotate to the back of its priority level.
+                            // Rotate to the back of its (decayed) effective level: `requeue` steps the
+                            // transient promotion down by one toward base rather than re-basing, so a
+                            // task dispatched mid-climb re-climbs at most one level (the aging refinement).
                             task.state.store(STATE_READY, Ordering::Release);
-                            RUN_QUEUES[cpu].lock().push(task);
+                            RUN_QUEUES[cpu].lock().requeue(task);
                         }
                     }
                 }
@@ -2138,6 +2240,42 @@ pub fn start_demo(online_aps: &[usize]) {
     } else {
         serial_println!("RWLOCK: SKIPPED (needs >=2 APs; have {})", online_aps.len());
     }
+
+    // AGEREF (M1): witness that the `effective_level` refinement tightens the aging bound. One LOW
+    // victim runs the SAME work twice under continuous HIGH-priority load on one AP: phase CTL blocks
+    // between iterations (wake re-enqueues at BASE — the old reset-on-dispatch behavior), phase REF
+    // yields between iterations (re-enqueue DECAYS one level — the refinement). The refined phase must
+    // be measurably faster (re-climbs one level, not from base). Self-calibrating (both phases share
+    // the same load/jitter), so it is robust to QEMU timing; a verifier bounds it (watchdog). Pinned
+    // to a NON-clock AP so it never perturbs the SLEEPMS/JOINTMO wall-clock witnesses: the middle AP
+    // when >=3 exist (only the blocked-heavy RwLock tasks live there — delaying them is watchdog-safe),
+    // else the busy AP (its round-robin regression has no timing assert).
+    let ageref_ap = if online_aps.len() >= 3 { online_aps[1] } else { online_aps[0] };
+    let ageref_verify_ap = online_aps[online_aps.len() - 1];
+    for i in 0..AGEREF_LOAD {
+        spawn("ageref-load", demo_ageref_load, i, ageref_ap, PRIO_HIGH);
+    }
+    spawn("ageref-victim", demo_ageref_victim, 0, ageref_ap, PRIO_LOW);
+    spawn("ageref-verify", demo_ageref_verifier, ageref_verify_ap, ageref_verify_ap, PRIO_NORMAL);
+
+    // CVCAP (M2): witness a >WAIT_CAPACITY (32) reader RwLock. A writer holds the write lock while
+    // CV_READERS (40) readers all pile up blocked on the reader condvar — only possible because the
+    // lock reserved its reader queue past 32 via `init_with_reader_capacity`. When the writer releases,
+    // notify_all wakes them all; PASS = all finish, no torn read, and the high-water blocked-reader
+    // count exceeded 32 (proving the raised capacity was genuinely exercised). Needs >=2 APs.
+    if online_aps.len() >= 2 {
+        RWL2.init_with_reader_capacity(CV_READER_CAP);
+        let n = online_aps.len();
+        let cpu_cv = online_aps[n - 1];
+        spawn("cv-writer", demo_cvcap_writer, 0, cpu_cv, PRIO_NORMAL);
+        for i in 0..CV_READERS {
+            let cpu_r = online_aps[i % n]; // spread the 40 readers across every AP
+            spawn("cv-reader", demo_cvcap_reader, i, cpu_r, PRIO_NORMAL);
+        }
+        spawn("cv-verify", demo_cvcap_verifier, cpu_cv, cpu_cv, PRIO_NORMAL);
+    } else {
+        serial_println!("CVCAP: SKIPPED (needs >=2 APs; have {})", online_aps.len());
+    }
 }
 
 /// Pack a (cpu, tag-letter) pair into the single `usize` arg the task entry receives.
@@ -2237,6 +2375,212 @@ fn demo_rw_verifier(cpu: usize) {
         maxr,
         if pass { "PASS" } else { "FAIL" },
         witness
+    );
+    DEMO_DONE.fetch_add(1, Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------------------------
+// AGEREF demo witness (M1: the `effective_level` aging refinement)
+// ---------------------------------------------------------------------------------------------
+
+/// Number of continuous HIGH-priority load tasks that starve the LOW victim on the AGEREF AP.
+const AGEREF_LOAD: usize = 2;
+/// Iterations the victim runs per phase. Each iteration it gives up the CPU (block in CTL, yield in
+/// REF) and must age back up to be redispatched — so this many aging climbs are timed per phase.
+const AGEREF_ITERS: u32 = 12;
+/// Safety cap (local ticks) on the load spinners, in case the victim ever wedged — they self-stop so
+/// the AP is never held forever even if `AGEREF_STOP` were somehow never set.
+const AGEREF_LOAD_MAX_TICKS: u64 = 20_000;
+/// PASS threshold: the refined (yield/decay) phase must be at most this percent of the control
+/// (block/reset) phase. Well below 100 (the refinement roughly halves the re-climb), yet clear of the
+/// few-tick block-vs-yield overhead that would make CTL trivially slower even with no refinement.
+const AGEREF_MAX_PCT: u64 = 75;
+
+/// Set by the victim when both phases are measured; the load spinners exit and the verifier proceeds.
+static AGEREF_STOP: AtomicBool = AtomicBool::new(false);
+/// Ticks the CONTROL phase took (block-between-iters → wake re-enqueues at BASE = the old behavior).
+static AGEREF_CTL_ELAPSED: AtomicU64 = AtomicU64::new(0);
+/// Ticks the REFINED phase took (yield-between-iters → re-enqueue DECAYS one level = the refinement).
+static AGEREF_REF_ELAPSED: AtomicU64 = AtomicU64::new(0);
+/// Set once the victim has recorded both elapsed measurements (distinguishes "done" from a timeout).
+static AGEREF_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Continuous HIGH-priority load: spin so the LOW victim only ever runs by aging up to parity. Never
+/// sleeps/yields (that would relieve the starvation pressure); the timer preempts it and `requeue`
+/// keeps it at its base HIGH level. Exits when the victim signals `AGEREF_STOP` (or a safety cap).
+fn demo_ageref_load(_idx: usize) {
+    let start = percpu::this_cpu().ticks.load(Ordering::Relaxed);
+    let mut acc: u64 = 0;
+    while !AGEREF_STOP.load(Ordering::Acquire) {
+        for i in 0..200_000u64 {
+            acc = acc.wrapping_add(i);
+        }
+        core::hint::black_box(acc);
+        if percpu::this_cpu().ticks.load(Ordering::Relaxed).wrapping_sub(start) > AGEREF_LOAD_MAX_TICKS {
+            break; // safety: never hold the AP forever
+        }
+    }
+    DEMO_DONE.fetch_add(1, Ordering::Relaxed);
+}
+
+/// AGEREF victim (PRIO_LOW). Runs the same tiny workload twice under the HIGH load, differing only in
+/// how it yields the CPU between iterations — which selects the re-enqueue path being compared:
+///   * CONTROL: `sleep_ticks(0)` → the task BLOCKS and is woken via `make_ready`/`push` → re-enqueued
+///     at BASE (level 0). Each iteration it must re-climb the FULL distance to parity (the old
+///     reset-on-dispatch behavior).
+///   * REFINED: `yield_now()` → the task re-enqueues via `requeue` → its effective level DECAYS by one
+///     rather than resetting, so it re-climbs at most one level (the refinement).
+/// Both phases run back-to-back under identical load, so absolute QEMU timing jitter cancels in the
+/// ratio; the refined phase should be markedly faster. Local ticks (this task is CPU-pinned) time each
+/// phase. Aging guarantees progress, so it cannot hang — but the verifier still watchdogs it in case a
+/// regression broke aging entirely (then it would starve and never set `AGEREF_DONE`).
+fn demo_ageref_victim(_arg: usize) {
+    let cpu = percpu::this_cpu().cpu_index as usize;
+
+    // CONTROL phase: block between iterations (re-base to base on each wake).
+    let t0 = percpu::this_cpu().ticks.load(Ordering::Relaxed);
+    for _ in 0..AGEREF_ITERS {
+        core::hint::black_box(cpu);
+        sleep_ticks(0); // block + immediate wake → push() re-bases to level 0
+    }
+    let ctl = percpu::this_cpu().ticks.load(Ordering::Relaxed).wrapping_sub(t0);
+
+    // REFINED phase: yield between iterations (decay one level per dispatch).
+    let t1 = percpu::this_cpu().ticks.load(Ordering::Relaxed);
+    for _ in 0..AGEREF_ITERS {
+        core::hint::black_box(cpu);
+        yield_now(); // re-enqueue via requeue() → effective_level decays by one
+    }
+    let refined = percpu::this_cpu().ticks.load(Ordering::Relaxed).wrapping_sub(t1);
+
+    AGEREF_CTL_ELAPSED.store(ctl, Ordering::Release);
+    AGEREF_REF_ELAPSED.store(refined, Ordering::Release);
+    AGEREF_DONE.store(true, Ordering::Release);
+    AGEREF_STOP.store(true, Ordering::Release); // release the load spinners
+    DEMO_DONE.fetch_add(1, Ordering::Relaxed);
+}
+
+/// AGEREF verifier: poll until the victim finishes both phases (or a generous timeout = the watchdog),
+/// then print one self-checking line. PASS = the victim finished AND the refined phase was <=
+/// `AGEREF_MAX_PCT`% of the control phase (the refinement measurably tightened the re-climb). A
+/// timeout (aging broke → the LOW victim starved forever) => FAIL.
+fn demo_ageref_verifier(cpu: usize) {
+    let mut waited = 0u64;
+    while !AGEREF_DONE.load(Ordering::Acquire) && waited < 12_000 {
+        sleep_ticks(16);
+        waited += 16;
+    }
+    let done = AGEREF_DONE.load(Ordering::Acquire);
+    let ctl = AGEREF_CTL_ELAPSED.load(Ordering::Acquire);
+    let refined = AGEREF_REF_ELAPSED.load(Ordering::Acquire);
+    // Refined must be at most AGEREF_MAX_PCT% of control (guard against ctl==0 divide/degenerate).
+    let pass = done && ctl > 0 && refined > 0 && refined * 100 <= ctl * AGEREF_MAX_PCT;
+    serial_println!(
+        "AGEREF: [cpu{}] refined={} ctl={} ticks (refined<={}% ctl), done={} => {}",
+        cpu,
+        refined,
+        ctl,
+        AGEREF_MAX_PCT,
+        done,
+        if pass { "PASS" } else { "FAIL" }
+    );
+    DEMO_DONE.fetch_add(1, Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------------------------
+// CVCAP demo witness (M2: Condvar::init_with_capacity → a >32-reader RwLock)
+// ---------------------------------------------------------------------------------------------
+
+/// Reader tasks that pile up blocked on ONE RwLock's reader condvar simultaneously — chosen > the
+/// default `WAIT_CAPACITY` (32) so the run REQUIRES the raised reservation (else `Condvar::wait`
+/// asserts). The whole point of `init_with_capacity`.
+const CV_READERS: usize = 40;
+/// Reader-condvar reservation for `RWL2` (> `CV_READERS`, since `wait()` asserts `len < capacity`).
+const CV_READER_CAP: usize = 48;
+
+/// A second RwLock, reserved past 32 readers via `init_with_reader_capacity`. Same torn-read invariant
+/// as `RWL`: `.0 == .1` under the write lock.
+static RWL2: RwLock<(u64, u64)> = RwLock::new((0, 0));
+/// Set true if any reader saw a torn (.0 != .1) value.
+static CV_TORN: AtomicBool = AtomicBool::new(false);
+/// Readers that have begun their `read()` attempt (the writer waits for all of them before releasing).
+static CV_STARTED: AtomicUsize = AtomicUsize::new(0);
+/// Readers currently INSIDE `read()` (i.e. blocked on the reader condvar while the writer holds it).
+static CV_WAITING: AtomicUsize = AtomicUsize::new(0);
+/// High-water mark of `CV_WAITING` — the witness that >32 readers were simultaneously blocked.
+static CV_MAX_WAITING: AtomicUsize = AtomicUsize::new(0);
+/// Readers that have finished (the verifier waits for all of them).
+static CV_DONE: AtomicUsize = AtomicUsize::new(0);
+/// Set by the writer once it HOLDS the write lock — readers wait for this so they are guaranteed to
+/// block (rather than racing in before the writer and never contributing to the blocked high-water).
+static CV_WRITER_READY: AtomicBool = AtomicBool::new(false);
+
+/// CVCAP writer: take the write lock, publish `CV_WRITER_READY`, then HOLD it (sleeping, so it never
+/// hogs a core) until every reader has piled up blocked on the reader condvar — at which point >32 are
+/// parked on one condvar, which only the raised reservation permits. Releasing wakes them all at once.
+fn demo_cvcap_writer(_arg: usize) {
+    let cpu = percpu::this_cpu().cpu_index as usize;
+    let mut g = RWL2.write();
+    g.0 = 1;
+    g.1 = 1; // a consistent value; any torn read a reader sees would mean the lock failed
+    CV_WRITER_READY.store(true, Ordering::Release);
+    // Hold until all readers have entered read() (bounded, so a lost reader can't hang the writer).
+    let mut waited = 0u64;
+    while CV_STARTED.load(Ordering::Acquire) < CV_READERS && waited < 8_000 {
+        sleep_ticks(4);
+        waited += 4;
+    }
+    sleep_ticks(24); // settle: let the last few readers actually park on the condvar
+    drop(g); // release the write lock → notify_all wakes every parked reader
+    serial_println!("SCHED: [cpu{} cv-writer] released; {} readers started", cpu, CV_STARTED.load(Ordering::Acquire));
+    DEMO_DONE.fetch_add(1, Ordering::Relaxed);
+}
+
+/// CVCAP reader: wait for the writer to hold the lock, then take a read lock — which BLOCKS on the
+/// reader condvar until the writer releases. `CV_WAITING` tracks how many are blocked at once (its
+/// high-water is the >32 witness). On wake, check the value is not torn, then finish.
+fn demo_cvcap_reader(_idx: usize) {
+    // Wait until the writer holds the lock so we are guaranteed to block (bounded).
+    let mut waited = 0u64;
+    while !CV_WRITER_READY.load(Ordering::Acquire) && waited < 8_000 {
+        sleep_ticks(2);
+        waited += 2;
+    }
+    CV_STARTED.fetch_add(1, Ordering::AcqRel);
+    let cur = CV_WAITING.fetch_add(1, Ordering::AcqRel) + 1;
+    CV_MAX_WAITING.fetch_max(cur, Ordering::AcqRel);
+    let g = RWL2.read(); // blocks on the reader condvar until the writer releases
+    CV_WAITING.fetch_sub(1, Ordering::AcqRel);
+    if g.0 != g.1 {
+        CV_TORN.store(true, Ordering::Release);
+    }
+    drop(g);
+    CV_DONE.fetch_add(1, Ordering::Release);
+}
+
+/// CVCAP verifier: poll until all readers finish (or a generous timeout = the watchdog), then print
+/// one self-checking line. PASS = all readers finished AND no torn read AND the blocked high-water
+/// exceeded 32 (proving the >WAIT_CAPACITY reservation was actually exercised). A timeout => FAIL.
+fn demo_cvcap_verifier(cpu: usize) {
+    let mut waited = 0u64;
+    while CV_DONE.load(Ordering::Acquire) < CV_READERS && waited < 12_000 {
+        sleep_ticks(16);
+        waited += 16;
+    }
+    let done = CV_DONE.load(Ordering::Acquire);
+    let torn = CV_TORN.load(Ordering::Acquire);
+    let maxw = CV_MAX_WAITING.load(Ordering::Acquire);
+    let pass = done == CV_READERS && !torn && maxw > WAIT_CAPACITY;
+    serial_println!(
+        "CVCAP: [cpu{}] done {}/{}, torn={}, max_blocked_readers={} (cap {}, need >{}) => {}",
+        cpu,
+        done,
+        CV_READERS,
+        torn,
+        maxw,
+        CV_READER_CAP,
+        WAIT_CAPACITY,
+        if pass { "PASS" } else { "FAIL" }
     );
     DEMO_DONE.fetch_add(1, Ordering::Relaxed);
 }
