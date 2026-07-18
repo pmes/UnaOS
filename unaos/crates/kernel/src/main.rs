@@ -997,6 +997,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // gated on storage + after U6x.
         #[cfg(all(target_arch = "x86_64", feature = "witness"))]
         unaos_kernel::arch::syscall::u6bx_probe_once();
+        // INSTALL-CORE (x86, installdemo knob): once the block device (the armed BLANK scratch disk
+        // the builder attaches under UNAOS_INSTALLDEMO=1) is present, run the installer engine
+        // end-to-end — blank-check, GPT write + parse-back verify, FAT32 format, copy-and-verify a
+        // payload by re-reading every extent, the in-tree FAT read-back interop check, the negative
+        // (1-byte-corruption-caught) test, and the post-write refusal guard — emitting the
+        // `:: INSTALL: gpt+fat32+copy verify => PASS ::` witness. One-shot + gated on storage. No-op
+        // (module absent) without the feature; never touches the boot ESP (a separate ide-hd).
+        #[cfg(all(target_arch = "x86_64", feature = "installdemo"))]
+        unaos_kernel::install::install_probe_once();
         // One-shot USB topology dump to serial (enumeration diagnosis; `usbinfo` shows it live).
         unaos_kernel::drivers::xhci::log_summary_once();
 
