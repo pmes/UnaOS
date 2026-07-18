@@ -40,7 +40,7 @@ default-members = [
     "vessels/pulse",
     "vessels/phonolite",
     "vessels/facet",
-    # "vessels/una",   # PARKED — see GUI-API consolidation
+    "vessels/una",
     "tools/vertex",
     "tools/unafs",
     "tools/unafs_bench",

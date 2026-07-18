@@ -26,9 +26,9 @@ rustls = { version = "0.23", features = ["ring"] }
 # Handlers
 matrix = { path = "../../handlers/matrix" }
 tabula = { path = "../../handlers/tabula" }   # de-GTK'd (528c213); default features are GTK-free
-# midden = { path = "../../handlers/midden" }
+midden = { path = "../../handlers/midden" }   # console core (default features GTK-free)
+aule = { path = "../../handlers/aule" }       # forge streamer (String lines over mpsc)
 # vaire = { path = "../../handlers/vaire" }
-# aule = { path = "../../handlers/aule" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk4 = { version = "0.10.3", features = ["v4_14"] }

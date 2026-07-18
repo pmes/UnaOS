@@ -84,8 +84,10 @@ fn main() {
     });
 
     // 4. Shared app state (no cortex — just the anchored root).
-    let mut default_state = bandy::state::AppState::default();
-    default_state.absolute_workspace_root = absolute_workspace_root_arc.clone();
+    let default_state = bandy::state::AppState {
+        absolute_workspace_root: absolute_workspace_root_arc.clone(),
+        ..Default::default()
+    };
     let app_state = Arc::new(RwLock::new(default_state));
 
     // Channels for UI events (Spline -> brain loop).
@@ -101,7 +103,13 @@ fn main() {
     let context = elessar::Context::new(&absolute_workspace_root_arc);
     let layout = context.layout();
     println!("[UNA] Context Spline: {:?} → Layout: {:?}", context.spline, layout);
-    let workspace_state = elessar::workspace_for(layout, genesis_roots);
+    let mut workspace_state = elessar::workspace_for(layout, genesis_roots);
+    // A Code layout gets the console bottom pane (opt-in per elessar's seam):
+    // an Empty ViewEntity requests the console; quartzite builds it, and the
+    // brain loop feeds it via ConsoleAppend / drains it via ConsoleInput.
+    if matches!(layout, elessar::Layout::Code) {
+        workspace_state.bottom_pane = Some(bandy::state::ViewEntity::Empty);
+    }
     let workspace_state_clone = workspace_state.clone();
 
     // 6. The Brain Loop — minimal (no Vein). Serves structural signals:
@@ -109,10 +117,16 @@ fn main() {
     //    and — when the right pane is an Editor — live file loading.
     let synapse_event_loop = synapse.clone();
     let shutdown_rx_brain = shutdown_tx.subscribe();
+    let brain_root = absolute_workspace_root_arc.clone();
     let brain_loop_handle = rt.spawn(async move {
         let mut shutdown_rx = shutdown_rx_brain;
         let mut workspace_state = workspace_state_clone;
         let mut synapse_rx = synapse_event_loop.subscribe();
+
+        // Console back-ends, rooted at the workspace: `midden` runs shell
+        // commands (its cwd mutates on `cd`), `aule` streams build output.
+        let mut midden = midden::Midden::new_at(brain_root.as_ref().clone());
+        let aule = aule::Aule::new(brain_root.as_path());
 
         // The live editor document. Empty until a file is activated. Only
         // meaningful when the right pane is an Editor (Layout::Code); harmless
@@ -187,6 +201,67 @@ fn main() {
                                     }
                                 }
                             }
+                            // Editor round-trip. The view fires EditorEdited on
+                            // every text change; we mirror it into the held
+                            // document (which marks it dirty).
+                            bandy::SMessage::EditorEdited { content } => {
+                                document.set_buffer(content);
+                            }
+                            // Cmd+S: persist the buffer and echo the outcome to
+                            // the console so saves are visible. With no file
+                            // loaded `save()` returns an error rather than
+                            // panicking — that surfaces as a console line.
+                            bandy::SMessage::EditorSaveRequest => {
+                                let line = match document.save() {
+                                    Ok(()) => {
+                                        let name = document.path.as_ref()
+                                            .map(|p| p.display().to_string())
+                                            .unwrap_or_else(|| "<untitled>".to_string());
+                                        format!("[una] saved {}", name)
+                                    }
+                                    Err(e) => format!("[una] save failed: {}", e),
+                                };
+                                synapse_event_loop.fire(bandy::SMessage::ConsoleAppend(line));
+                            }
+                            // Console input. Built-ins first (`forge` → aule),
+                            // everything else → midden (the held shell).
+                            bandy::SMessage::ConsoleInput(raw) => {
+                                let line = raw.trim();
+                                if line.is_empty() {
+                                    // nothing to run
+                                } else if line == "forge" {
+                                    let (ftx, frx) = std::sync::mpsc::channel::<String>();
+                                    match aule.forge_streamed(ftx) {
+                                        Ok(()) => {
+                                            // aule's reader threads feed `frx`;
+                                            // bridge each line onto the synapse
+                                            // as a ConsoleAppend.
+                                            let syn = synapse_event_loop.clone();
+                                            std::thread::spawn(move || {
+                                                for out in frx {
+                                                    syn.fire(bandy::SMessage::ConsoleAppend(out));
+                                                }
+                                            });
+                                        }
+                                        Err(e) => {
+                                            synapse_event_loop.fire(bandy::SMessage::ConsoleAppend(
+                                                format!("[una] forge failed: {}", e)));
+                                        }
+                                    }
+                                } else {
+                                    let out = midden.execute(line);
+                                    for l in out.stdout.lines() {
+                                        synapse_event_loop.fire(bandy::SMessage::ConsoleAppend(l.to_string()));
+                                    }
+                                    for l in out.stderr.lines() {
+                                        synapse_event_loop.fire(bandy::SMessage::ConsoleAppend(l.to_string()));
+                                    }
+                                    if out.exit_status != 0 {
+                                        synapse_event_loop.fire(bandy::SMessage::ConsoleAppend(
+                                            format!("[exit {}]", out.exit_status)));
+                                    }
+                                }
+                            }
                             // No Vein: every other UI impulse is a no-op for now.
                             _ => {}
                         }
@@ -196,16 +271,15 @@ fn main() {
                 }
                 // Matrix events that mutate UI structure are grafted locally.
                 msg = synapse_rx.recv() => {
-                    if let Ok(bandy::SMessage::Matrix(bandy::MatrixEvent::GraftTopology { target_id, payload })) = msg {
-                        if let bandy::state::ViewEntity::Topology(ref mut matrix) = workspace_state.left_pane {
-                            if matrix::graft::apply_graft(&mut matrix.tree.roots, &target_id, &payload) {
-                                let flat_tree = matrix.tree.flatten();
-                                let mapped_tree: Vec<(String, String, usize)> = flat_tree.into_iter().map(|(n, depth)| {
-                                    (n.id.clone(), n.label.clone(), depth)
-                                }).collect();
-                                synapse_event_loop.fire(bandy::SMessage::Matrix(bandy::MatrixEvent::TopologyMutated(mapped_tree)));
-                            }
-                        }
+                    if let Ok(bandy::SMessage::Matrix(bandy::MatrixEvent::GraftTopology { target_id, payload })) = msg
+                        && let bandy::state::ViewEntity::Topology(ref mut matrix) = workspace_state.left_pane
+                        && matrix::graft::apply_graft(&mut matrix.tree.roots, &target_id, &payload)
+                    {
+                        let flat_tree = matrix.tree.flatten();
+                        let mapped_tree: Vec<(String, String, usize)> = flat_tree.into_iter().map(|(n, depth)| {
+                            (n.id.clone(), n.label.clone(), depth)
+                        }).collect();
+                        synapse_event_loop.fire(bandy::SMessage::Matrix(bandy::MatrixEvent::TopologyMutated(mapped_tree)));
                     }
                 }
             }
