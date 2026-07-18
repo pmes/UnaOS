@@ -110,13 +110,6 @@ struct IntEp {
     layout: Option<ReportLayout>,
     reports: u32,
     dead: bool,
-    /// EHCI-5 (vendor multitouch): last decoded first-finger absolute position and whether a
-    /// finger is currently down. Relative motion is `cur - last` between consecutive touching
-    /// reports; finger-DOWN seeds these without emitting (no jump from stale coords); finger-UP
-    /// clears `touching`. Unused (0/false) for keyboard / boot-mouse / standard-pointer endpoints.
-    last_x: i32,
-    last_y: i32,
-    touching: bool,
 }
 
 /// EHCI-4 M2 — the minimal field map a HID **pointer** report exposes, extracted by
@@ -1191,9 +1184,6 @@ impl Controller {
             layout,
             reports: 0,
             dead: false,
-            last_x: 0,
-            last_y: 0,
-            touching: false,
         });
     }
 
@@ -1242,39 +1232,41 @@ impl Controller {
                 e.reports = e.reports.wrapping_add(1);
                 if let Some(l) = e.layout {
                     if l.vendor_mt {
-                        // EHCI-5 vendor-multitouch path. The 0x44 descriptor is opaque, so KEEP
-                        // dumping the raw report body verbatim (first + every 32nd) — the sitting's
-                        // reverse-engineering evidence that confirms/corrects the finger offsets.
-                        if e.reports == 1 || e.reports % 32 == 0 {
+                        // M1 (RMBP-FIX, 2026-07-18): the raw-report dump exists ONLY to capture the
+                        // opaque stream's byte layout, and that characterization is COMPLETE. Bound it
+                        // hard — usbdebug builds only, first 4 reports total per device — so it can
+                        // never flood the framebuffer console (~100+ heap-allocating lines/sec under
+                        // touch, the "machine appears hung" defect). Its `String` alloc is off the
+                        // default hot path ENTIRELY: on a GUI/default build this whole `#[cfg]` block
+                        // (and `dump_vendor_report`) is compiled out — zero dumps, zero allocation.
+                        #[cfg(feature = "usbdebug")]
+                        if e.reports <= 4 {
                             dump_vendor_report(idx, e.reports, report);
                         }
-                        // M2: decode the FIRST finger only (gestures OUT OF SCOPE) into RELATIVE
-                        // motion — a single finger drives the pointer. abs_x/abs_y are signed le16
-                        // at the HYPOTHESIS offsets; presence is the touch field. Finger-DOWN
-                        // (false->true) seeds last_x/last_y WITHOUT emitting (no jump from stale
-                        // coords); while touching, emit push_event(Mouse{cur-last}) then update
-                        // last; finger-UP clears touching. A short/malformed report decodes to None
-                        // (bounds-checked) => no event, state untouched.
-                        if let Some((present, cur_x, cur_y)) =
-                            decode_vendor_first_finger(report, l.report_id)
-                        {
-                            if present {
-                                if e.touching {
-                                    let (dx, dy) = (cur_x - e.last_x, cur_y - e.last_y);
-                                    if dx != 0 || dy != 0 {
-                                        crate::pal::push_event(crate::pal::Event::Mouse {
-                                            x: dx,
-                                            y: dy,
-                                        });
-                                    }
-                                } else {
-                                    e.touching = true; // finger DOWN: seed below, no emit
-                                }
-                                e.last_x = cur_x;
-                                e.last_y = cur_y;
-                            } else {
-                                e.touching = false; // finger UP
+                        // M2 (RMBP-FIX silicon retarget): after the bcm5974 mode switch the internal
+                        // trackpad does NOT stream the descriptor's opaque 0x44 / 511-byte multitouch
+                        // frame — that hypothesis is REFUTED on this device path (the decode it drove,
+                        // `decode_vendor_first_finger` + `VMT_FINGER_*`, is KEPT below as documented
+                        // history + self-test, never as the live path). Ground truth from silicon: it
+                        // streams 8-byte Report ID 0x02 reports — [0]=id, [1]=buttons (0x00 up /
+                        // 0x01 down), [2]=dx i8, [3]=dy i8, [4..8] zero/unknown. Decode those straight
+                        // into the RELATIVE pointer path (the same `pal::Event::Mouse` seam the
+                        // boot-mouse path uses). Length-checked + ID-gated inside `decode_trackpad_rel`:
+                        // a short or non-0x02 report yields None → no event, no state change.
+                        if let Some((buttons, dx, dy)) = decode_trackpad_rel(report) {
+                            // Bounded one-line format witness on the first decoded report.
+                            if e.reports == 1 {
+                                serial_println!(
+                                    ":: EHCI-HID: [{}] trackpad format witness: 8-byte id=0x02 rel — buttons={:#04x} dx={} dy={} == witness ::",
+                                    idx, buttons, dx, dy
+                                );
                             }
+                            if dx != 0 || dy != 0 {
+                                crate::pal::push_event(crate::pal::Event::Mouse { x: dx, y: dy });
+                            }
+                            // `buttons` is decoded + witnessed; the relative pointer-event path carries
+                            // no click today (parity with the `is_rel_mouse` boot-mouse path below),
+                            // so no button event is emitted here.
                         }
                     } else {
                         // M2 report-pointer path: decode X/Y/buttons from the parsed field map.
@@ -1644,8 +1636,32 @@ fn read_le16(data: &[u8], off: usize) -> Option<u16> {
     Some(u16::from_le_bytes([b[0], b[1]]))
 }
 
-/// EHCI-5: decode the FIRST finger of an Apple vendor-multitouch (`0x44`) report at the HYPOTHESIS
-/// offsets. Returns `(present, abs_x, abs_y)` where `present` is the touch field being non-zero and
+/// RMBP-FIX (2026-07-18): the LIVE trackpad decoder. After the bcm5974 mode switch, the internal
+/// trackpad on this device path streams 8-byte **Report ID 0x02** relative reports (characterized on
+/// silicon — 736+ reports observed): `[0]` = report id (0x02), `[1]` = buttons (`0x00` up / `0x01`
+/// down, confirmed via a held press), `[2]` = dx int8, `[3]` = dy int8, `[4..=5]` zero, `[6..=7]`
+/// unknown. Returns `(buttons, dx, dy)` with dx/dy sign-extended from int8, or `None` if the report
+/// is shorter than 4 bytes OR its id byte is not `0x02` (tolerant: a stray/other-format report is
+/// ignored — no event, no state change). This SUPERSEDES the refuted `decode_vendor_first_finger`
+/// 0x44/multitouch hypothesis below.
+const TRACKPAD_REPORT_ID: u8 = 0x02;
+fn decode_trackpad_rel(report: &[u8]) -> Option<(u8, i32, i32)> {
+    if report.len() < 4 || report[0] != TRACKPAD_REPORT_ID {
+        return None;
+    }
+    let buttons = report[1];
+    let dx = report[2] as i8 as i32;
+    let dy = report[3] as i8 as i32;
+    Some((buttons, dx, dy))
+}
+
+/// EHCI-5 (REFUTED-HYPOTHESIS HISTORY — kept per the never-trash rule, exercised by
+/// `vendor_multitouch_selftest`, NO LONGER the live decode path): decode the FIRST finger of an
+/// Apple vendor-multitouch (`0x44`) report at the HYPOTHESIS offsets. The 0x44 / 511-byte
+/// multitouch-frame model was REFUTED on the metal rMBP trackpad path (RMBP-FIX, 2026-07-18) — the
+/// device streams 8-byte Report ID 0x02 relative reports instead (see `decode_trackpad_rel`). This
+/// function and its `VMT_FINGER_*` constants remain as the documented reverse-engineering trail.
+/// Returns `(present, abs_x, abs_y)` where `present` is the touch field being non-zero and
 /// abs_x/abs_y are the signed le16 finger coordinates. Returns `None` if the report is too short to
 /// reach the finger record (every read is bounds-checked — a short/malformed 0x44 report never
 /// reads out of bounds or emits garbage motion). Only the first finger is decoded; further finger
@@ -1694,7 +1710,10 @@ unsafe fn dump_report_descriptor(idx: usize, addr: u8, intf: u8, report_len: u16
 /// not describe which bytes are the finger's X/Y), so the sitting reads THESE bytes to confirm or
 /// correct the `VMT_FINGER_*` HYPOTHESIS offsets. Dumps the whole captured slice (≤ 64 B, one
 /// interrupt packet) so the finger record near byte ~30+ is visible. Same hex idiom as
-/// `dump_report_descriptor`.
+/// `dump_report_descriptor`. RMBP-FIX (2026-07-18): gated to the `usbdebug` build and called only for
+/// the first 4 reports per device — the byte characterization is complete, so on a default/GUI build
+/// this (heap-allocating) dump is compiled out entirely and never touches the hot path.
+#[cfg(feature = "usbdebug")]
 fn dump_vendor_report(idx: usize, count: u32, report: &[u8]) {
     let mut hex = alloc::string::String::new();
     for (k, b) in report.iter().enumerate() {

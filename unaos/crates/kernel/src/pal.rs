@@ -200,6 +200,14 @@ pub fn pump_and_poll() -> Option<Event> {
     if let Some(x) = crate::drivers::xhci::XHCI_CONTROLLER.lock().as_mut() {
         x.poll_events();
     }
+    // RMBP-FIX M3 (x86 EHCI): the internal rMBP keyboard/trackpad ride the EHCI HID path, not xHCI.
+    // The outer console loop services them beside the xHCI hooks, but a full-screen demo (vug/pulse)
+    // runs its OWN loop inside a shell command and blocks that service — so poll the EHCI HID
+    // endpoints HERE too (same call the main loops make), or the built-in keyboard can never post the
+    // keystroke that exits the demo. Harmless no-op in QEMU (xHCI-only): with no EHCI HID controller
+    // armed the service returns immediately. Same feature gate as the main-loop call sites.
+    #[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]
+    crate::drivers::ehci::service_ehci_hid();
     #[cfg(target_arch = "aarch64")]
     while let Some(byte) = crate::arch::poll_input() {
         push_event(Event::Key(byte));
