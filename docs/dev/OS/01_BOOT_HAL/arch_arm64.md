@@ -5436,6 +5436,65 @@ this arc — the witness is single-block only.
 records the ladder is compiled-present but has no Tegra234 SDMMC to write. Bench runbook (both rungs):
 `scripts/orin-sdmmc1-bench.md`. Landing: `review/unaos-orin-sdmmc2-LANDING.md`.
 
+#### ORIN-INSTALL-1 — the first real installer flow (`UNAOS_INSTALL_TARGET_SD`, the THIRD destructive gate)
+
+**What it is.** The installer line's rung-3 wired to silicon: boot from the USB stick and install UnaOS onto
+the SEATED microSD *from inside UnaOS*. It drives the arch-neutral installer **engine** (`crate::install` —
+the GPT writer + FAT32 formatter + sha extent-verify proven pre-silicon by `UNAOS_INSTALLDEMO`, see
+`docs/dev/OS/10_INSTALL/installer_engine.md`) over a new `InstallTarget` that speaks the rung-2 armed SD write
+path. The SD-specific glue lives in `arch/aarch64/sdmmc_tegra.rs` (`SdInstallTarget` + `install_to_sd`); the
+engine's verified write/verify semantics are **untouched** — this arc only supplies the block target, a
+metadata-zeroing pass, and the destructive announcement.
+
+**The three-gate escalation ladder.** A real install is the most destructive act in the tree, so it stands
+behind three independent gates (each a separate cargo feature / knob), and even fully gated it announces
+before it writes:
+
+| gate | feature / knob | meaning |
+|---|---|---|
+| 1 | `sdmmc` / `UNAOS_SDMMC` | the controller is up and the card **census succeeded** (we hold a `Card`) |
+| 2 | `sdmmc_arm` / `UNAOS_SDMMC_ARM` | the rung-2 armed CMD24 write path is compiled in |
+| 3 | `install_target` / `UNAOS_INSTALL_TARGET_SD` | the explicit **destructive-confirmation** gate (this arc a knob; on metal the future UX asks the operator) |
+
+Under gate 3 the flow prints **exactly what it is about to destroy** — the sector-0 classification, the card's
+capacity, and its **CID identity** (re-decoded from the retained CMD2 response) — *before* the first write.
+
+**Non-blank cards (do-it-right beyond the demo's blank-only law).** The engine's `blank_check` refuses a
+non-blank scratch disk; an *installer* must instead handle a card that already carries a partition table. It
+does **not** refuse — it announces, then re-establishes the FAT formatter's blank-precondition by zeroing
+**exactly** the ESP metadata region (`fat32::blank_region_sectors` = reserved + both FAT copies; no more — the
+data area's free clusters may hold stale bytes harmlessly — and no less — a stale FAT entry would forge an
+allocation). The GPT writer overwrites its own structures, so it needs no pre-zero.
+
+**The flow** (each step a serial line; any engine error is a single named `FAIL`):
+GPT (protective MBR + primary/backup + ESP + data, parse-back verified) → zero the ESP metadata region →
+FAT32 format the ESP → copy the payload → **sha extent-verify** (re-read every written extent off the card) →
+`ORIN-INSTALL-1 SD install — gpt+zero+fat32+copy verify => PASS`.
+
+**The payload (M2), answered honestly.** The installer's intended v1 payload is the *running system's own boot
+volume* (the seed's clone-thyself design). But `install_to_sd` runs at the **pre-JB2b-takeover EL2 census
+site** (`sdmmc_census`, `main.rs` before the xHCI takeover), where the USB boot stick is **not yet enumerated
+as a block device** (`drivers::block::info()` is `None`), so self-read is unreachable this arc. Rather than
+fake a clone, v1 writes a small **generated marker payload** (`UNAOS.IMG`) that the in-tree FAT reader can
+find, and the **self-clone is flagged as the named follow-up (INSTALL-2)**. (The in-tree `fs::fat::mount()`
+interop self-check the x86 witness runs is likewise skipped here — `mount()` reads the USB block layer, not
+this armed SD target; the by-content SD extent-verify is the proof.)
+
+**Single-block, by choice.** `SdInstallTarget` loops the proven rung-2 single-block CMD24/CMD17 primitives —
+no multi-block CMD25/CMD18 was added: the engine needs correctness, not throughput, and single-block is the
+path rung-2 verified on metal. The bounded metadata-zero pass (~2064 sectors for a 64 MiB ESP) is the only
+sizable write; CMD25 batching is a named perf follow-up, not a correctness gap.
+
+**Byte-identity.** Every installer line — including the `cid` field added to `Card` — is `install_target`-gated,
+so an `sdmmc_arm`-without-`install_target` build is byte-identical in behavior to the merged rung-2 ladder
+(**string-identity evidence: the tegra `sdmmc_arm` binary contains zero `ORIN-INSTALL` / `ABOUT TO DESTROY`
+strings; the `install_target` binary contains them**).
+
+**Virt witness (third gate):** on an `install_target` build without `tegra`, one honest metal-only line (zero
+MMIO) records the flow is compiled-present but has no Tegra234 SDMMC to install onto. The full flow's **first
+execution is the attended Orin sitting** (runbook `scripts/orin-sdmmc1-bench.md`, install leg). Landing:
+`review/unaos-install1-LANDING.md`.
+
 ## AARCH64-VNET — virtio-net-mmio driver + smoltcp bind on QEMU `virt` (`UNAOS_VNET`, knob-gated)
 
 **Purpose: a pre-metal, QEMU-testable proof of the aarch64 smoltcp seam that ORIN-NET-4 built.** NET-4's

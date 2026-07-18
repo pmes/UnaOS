@@ -278,6 +278,20 @@ sdmmc = []
 # scripts/orin-sdmmc1-bench.md.
 sdmmc_arm = ["sdmmc"]
 
+# ORIN-INSTALL-1: the `UNAOS_INSTALL_TARGET_SD=1` THIRD (destructive-confirmation) gate. On top of
+# `sdmmc_arm` (⇒ `sdmmc`) it compiles in the first real installer flow — an `InstallTarget` over the
+# rung-2 armed SD write path that drives the arch-neutral installer engine (`install::` GPT + FAT32 +
+# sha extent-verify) onto the SEATED microSD (arch/aarch64/sdmmc_tegra.rs::install_to_sd). Three-gate
+# ladder: `sdmmc` census OK + `sdmmc_arm` write path + THIS flag's destructive confirm; the flow prints
+# the sector-0 classification + card CID it is about to destroy before the first write, and handles a
+# non-blank card by zeroing exactly the ESP metadata region (the engine's write/verify semantics are
+# untouched). EVERY installer line is gated on this feature, so an `sdmmc_arm`-without-`install_target`
+# build is byte-identical to the merged rung-2 ladder. The Tegra234 SDMMC MMIO is `tegra`-gated (QEMU
+# models no controller), so a virt build prints one honest compiled-present-metal-only line and does
+# zero MMIO; the full flow's first execution is the attended Orin sitting. See arch_arm64.md
+# §ORIN-INSTALL-1 and scripts/orin-sdmmc1-bench.md.
+install_target = ["sdmmc_arm"]
+
 # AARCH64-VNET: the `UNAOS_VNET=1` virtio-net-mmio driver on the QEMU `virt` machine + smoltcp bind
 # (arch/aarch64/virtio_net.rs) — the QEMU-testable proof of the aarch64 smoltcp seam NET-4 built. NET-4's
 # driver is `tegra`-gated (QEMU models no Tegra234 RC), so it is only ever COMPILE-tested off metal; this
