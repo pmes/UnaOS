@@ -348,10 +348,32 @@ impl Default for StreamState {
     }
 }
 
+/// Backing state for an editable text pane (the "Editor" ViewEntity).
+/// `path` is the file the buffer was loaded from (None = scratch buffer),
+/// `content` the current buffer text, `language` a syntax hint (e.g. "rust",
+/// "plaintext"). Serializable so it can ride the workspace snapshot.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EditorState {
+    pub path: Option<String>,
+    pub content: String,
+    pub language: String,
+}
+
+impl Default for EditorState {
+    fn default() -> Self {
+        Self {
+            path: None,
+            content: String::new(),
+            language: "plaintext".to_string(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ViewEntity {
     Topology(TopologyState),
     Stream(StreamState),
+    Editor(EditorState),
     Empty,
 }
 

@@ -21,6 +21,7 @@ use objc2::rc::{Retained, Allocated};
 
 use super::workspace::sidebar;
 use super::workspace::comms;
+use super::workspace::editor;
 
 // -----------------------------------------------------------------------------
 // MAC OS SPLINE
@@ -53,7 +54,8 @@ impl MacOSSpline {
     ) -> (
         NativeView,
         Retained<sidebar::SidebarDelegate>,
-        Retained<comms::CommsDelegate>,
+        Option<Retained<comms::CommsDelegate>>,
+        Option<Retained<editor::EditorDelegate>>,
     ) {
         // 1. Build the UI
         let mtm = MainThreadMarker::new().unwrap();
@@ -82,18 +84,30 @@ impl MacOSSpline {
             let _: () = msg_send![&sidebar_item, setMinimumThickness: 250.0f64];
         }
 
-        // --- Reactor Right Pane (Comms) ---
-        let (comms_view, comms_delegate) = comms::create_comms(mtm, &_app_state);
-        let comms_vc: Allocated<NSViewController> = unsafe { msg_send![NSViewController::class(), alloc] };
-        let comms_vc: Retained<NSViewController> = unsafe { msg_send![comms_vc, init] };
-        comms_vc.setView(&comms_view);
+        // --- Right Pane: Editor (Code layout) or Comms (Comms layout) ---
+        // The workspace's right pane selects which delegate we build; exactly one
+        // of `comms_delegate`/`editor_delegate` ends up `Some`.
+        let (right_view, comms_delegate, editor_delegate) = match &_workspace_tetra.right_pane {
+            bandy::state::ViewEntity::Editor(editor_state) => {
+                let (editor_view, editor_delegate) = editor::create_editor(mtm, editor_state);
+                (editor_view, None, Some(editor_delegate))
+            }
+            _ => {
+                let (comms_view, comms_delegate) = comms::create_comms(mtm, &_app_state);
+                (comms_view, Some(comms_delegate), None)
+            }
+        };
+
+        let right_vc: Allocated<NSViewController> = unsafe { msg_send![NSViewController::class(), alloc] };
+        let right_vc: Retained<NSViewController> = unsafe { msg_send![right_vc, init] };
+        right_vc.setView(&right_view);
 
         // Define as main content item
-        let comms_item: Retained<NSSplitViewItem> = unsafe { msg_send![NSSplitViewItem::class(), splitViewItemWithViewController: &*comms_vc] };
+        let right_item: Retained<NSSplitViewItem> = unsafe { msg_send![NSSplitViewItem::class(), splitViewItemWithViewController: &*right_vc] };
 
         // Assemble the split view controller
         svc.addSplitViewItem(&sidebar_item);
-        svc.addSplitViewItem(&comms_item);
+        svc.addSplitViewItem(&right_item);
 
         // Prevent AppKit components from deallocation by attaching them to the root Window/run loop.
         // Anchor split_view_controller
@@ -110,7 +124,14 @@ impl MacOSSpline {
         // main-queue closures below run their UI work. This replaces the previous
         // `Retained::into_raw` → `usize` → `Retained::retain`/`cast_unchecked` round-trip
         // (which leaked a retain and reconstituted the object from a raw pointer each message).
-        let comms_bound = Arc::new(MainThreadBound::new(comms_delegate.clone(), mtm));
+        // The comms/editor delegates are mutually exclusive (one is `None`); bind
+        // whichever exists so the router can address it from the tokio task.
+        let comms_bound = comms_delegate
+            .as_ref()
+            .map(|d| Arc::new(MainThreadBound::new(d.clone(), mtm)));
+        let editor_bound = editor_delegate
+            .as_ref()
+            .map(|d| Arc::new(MainThreadBound::new(d.clone(), mtm)));
         let sidebar_bound = Arc::new(MainThreadBound::new(sidebar_delegate.clone(), mtm));
 
         tokio::spawn(async move {
@@ -121,7 +142,7 @@ impl MacOSSpline {
                     Ok(msg) => {
                         match msg {
                             SMessage::StorageLoadPagedResult { records, .. } => {
-                                let comms_bound = comms_bound.clone();
+                                let Some(comms_bound) = comms_bound.clone() else { continue };
                                 dispatch2::DispatchQueue::main().exec_async(move || {
                                     let mtm = MainThreadMarker::new().unwrap();
                                     let comms_delegate = comms_bound.get(mtm);
@@ -153,7 +174,7 @@ impl MacOSSpline {
                                 });
                             },
                             SMessage::AiToken(token_string) => {
-                                let comms_bound = comms_bound.clone();
+                                let Some(comms_bound) = comms_bound.clone() else { continue };
                                 dispatch2::DispatchQueue::main().exec_async(move || {
                                     let mtm = MainThreadMarker::new().unwrap();
                                     let comms_delegate = comms_bound.get(mtm);
@@ -172,6 +193,14 @@ impl MacOSSpline {
                                             chat_manager.append_stream_token(&token_string);
                                         }
                                     }
+                                });
+                            },
+                            SMessage::EditorLoad { content, .. } => {
+                                let Some(editor_bound) = editor_bound.clone() else { continue };
+                                dispatch2::DispatchQueue::main().exec_async(move || {
+                                    let mtm = MainThreadMarker::new().unwrap();
+                                    let editor_delegate = editor_bound.get(mtm);
+                                    editor_delegate.set_content(&content);
                                 });
                             },
                             SMessage::NetworkLog(_) => {
@@ -244,6 +273,6 @@ impl MacOSSpline {
             }
         });
 
-        (root_view, sidebar_delegate, comms_delegate)
+        (root_view, sidebar_delegate, comms_delegate, editor_delegate)
     }
 }

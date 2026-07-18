@@ -77,6 +77,17 @@ pub fn find_workspace_root() -> std::path::PathBuf {
 }
 
 
+/// The intended workspace shape for a context. Distinct from `Spline` (what a
+/// directory *is*): `Layout` is what the UI should *do* with it.
+///
+/// - `Code`  — a recognized project: Topology sidebar + editable **Editor** pane.
+/// - `Comms` — unrecognized territory (the Void): Topology sidebar + chat **Stream**.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum Layout {
+    Code,
+    Comms,
+}
+
 /// The Context holds the spatial and structural awareness of our current environment.
 pub struct Context {
     pub path: std::path::PathBuf,
@@ -92,6 +103,44 @@ impl Context {
             path: path.to_path_buf(),
             spline,
         }
+    }
+
+    /// Maps this context's `Spline` to the `Layout` the workspace should adopt.
+    /// Any recognized project (UnaOS/Rust/Web/Python) opens in `Code` (editor
+    /// on the right); the `Void` falls back to `Comms` (chat on the right).
+    pub fn layout(&self) -> Layout {
+        match self.spline {
+            Spline::UnaOS | Spline::Rust | Spline::Web | Spline::Python => Layout::Code,
+            Spline::Void => Layout::Comms,
+        }
+    }
+}
+
+/// Builds a `bandy::state::WorkspaceState` for a given `Layout`, with `roots`
+/// as the left Topology tree (the genesis tree the caller already scanned).
+///
+/// - `Layout::Code`  → Topology (left) + **Editor** (right)
+/// - `Layout::Comms` → Topology (left) + **Stream** (right)
+///
+/// This is the seam that realizes "Context::Code": a vessel resolves a
+/// `Context`, calls `.layout()`, and hands the result here to get a ready
+/// `WorkspaceState` for `quartzite::Spline::bootstrap`.
+pub fn workspace_for(
+    layout: Layout,
+    roots: Vec<bandy::state::TopologyNode>,
+) -> bandy::state::WorkspaceState {
+    use bandy::state::{EditorState, StreamState, TopologyState, ViewEntity, WorkspaceState};
+
+    let left_pane = ViewEntity::Topology(TopologyState::new(roots));
+    let right_pane = match layout {
+        Layout::Code => ViewEntity::Editor(EditorState::default()),
+        Layout::Comms => ViewEntity::Stream(StreamState::default()),
+    };
+
+    WorkspaceState {
+        left_pane,
+        right_pane,
+        split_ratio: 0.25,
     }
 }
 

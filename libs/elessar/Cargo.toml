@@ -9,5 +9,6 @@ default = []
 
 [dependencies]
 gneiss_pal = { path = "../gneiss_pal" }
+bandy = { path = "../bandy" }
 log = "0.4"
 async-channel = "2.5"

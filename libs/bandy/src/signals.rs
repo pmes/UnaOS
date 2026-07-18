@@ -112,6 +112,17 @@ pub enum SMessage {
         records: Vec<DispatchRecord>,
     },
 
+    // --- EDITOR (The Code Pane) ---
+    /// Load a document into the active editor pane. Fired when a file is
+    /// selected for editing; the macOS `MacOSSpline` router pushes `content`
+    /// into the editor `NSTextView` via `setString`. `path`/`language` let the
+    /// view label + (later) syntax-highlight the buffer.
+    EditorLoad {
+        path: Option<String>,
+        content: String,
+        language: String,
+    },
+
     // --- MIDDEN (The Terminal) ---
     NoOp,
     TerminalOutput(String),

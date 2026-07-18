@@ -36,7 +36,8 @@ type BootstrapFn = Box<
     ) -> (
         Retained<NSView>,
         Retained<workspace::sidebar::SidebarDelegate>,
-        Retained<workspace::comms::CommsDelegate>,
+        Option<Retained<workspace::comms::CommsDelegate>>,
+        Option<Retained<workspace::editor::EditorDelegate>>,
     ) + 'static,
 >;
 
@@ -71,6 +72,7 @@ struct AppDelegateIvars {
     toolbar_delegate: RefCell<Option<Retained<window_chrome::ToolbarDelegate>>>,
     sidebar_delegate: RefCell<Option<Retained<workspace::sidebar::SidebarDelegate>>>,
     comms_delegate: RefCell<Option<Retained<workspace::comms::CommsDelegate>>>,
+    editor_delegate: RefCell<Option<Retained<workspace::editor::EditorDelegate>>>,
 }
 
 define_class!(
@@ -97,6 +99,7 @@ define_class!(
                 toolbar_delegate: RefCell::new(None),
                 sidebar_delegate: RefCell::new(None),
                 comms_delegate: RefCell::new(None),
+                editor_delegate: RefCell::new(None),
             });
             unsafe { msg_send![super(this), init] }
         }
@@ -205,7 +208,7 @@ define_class!(
                 let rx_synapse = self.ivars().rx_synapse.borrow_mut().take().expect("rx_synapse missing");
                 let workspace_state = self.ivars().workspace_state.borrow_mut().take().expect("workspace_state missing");
 
-                let (root_view, sidebar_delegate, comms_delegate) = bootstrap_fn(
+                let (root_view, sidebar_delegate, comms_delegate, editor_delegate) = bootstrap_fn(
                     &window,
                     tx_event,
                     app_state,
@@ -214,9 +217,11 @@ define_class!(
                 );
                 window.setContentView(Some(&root_view));
 
-                // Store the internal UI delegates to prevent them from dropping
+                // Store the internal UI delegates to prevent them from dropping.
+                // Exactly one of comms/editor is populated (the active right pane).
                 *self.ivars().sidebar_delegate.borrow_mut() = Some(sidebar_delegate);
-                *self.ivars().comms_delegate.borrow_mut() = Some(comms_delegate);
+                *self.ivars().comms_delegate.borrow_mut() = comms_delegate;
+                *self.ivars().editor_delegate.borrow_mut() = editor_delegate;
             }
 
             // 3. Keep references alive
@@ -269,7 +274,8 @@ impl Backend {
         ) -> (
             Retained<NSView>,
             Retained<workspace::sidebar::SidebarDelegate>,
-            Retained<workspace::comms::CommsDelegate>,
+            Option<Retained<workspace::comms::CommsDelegate>>,
+            Option<Retained<workspace::editor::EditorDelegate>>,
         ) + 'static,
     {
         // Allocate and initialize the custom delegate

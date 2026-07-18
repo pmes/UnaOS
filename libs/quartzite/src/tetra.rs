@@ -79,6 +79,9 @@ impl WorkspaceTetra {
                     bandy::state::StreamAlign::Center => StreamAlign::Center,
                 },
             }),
+            // The Qt tetra bridge has no editor node yet; a code pane collapses
+            // to Empty here (the macOS AppKit backend renders it directly).
+            bandy::state::ViewEntity::Editor(_) => TetraNode::Empty,
             bandy::state::ViewEntity::Empty => TetraNode::Empty,
         };
 
@@ -99,6 +102,9 @@ impl WorkspaceTetra {
                     bandy::state::StreamAlign::Center => StreamAlign::Center,
                 },
             }),
+            // The Qt tetra bridge has no editor node yet; a code pane collapses
+            // to Empty here (the macOS AppKit backend renders it directly).
+            bandy::state::ViewEntity::Editor(_) => TetraNode::Empty,
             bandy::state::ViewEntity::Empty => TetraNode::Empty,
         };
 

@@ -9,3 +9,4 @@
 pub mod sidebar;
 pub mod comms;
 pub mod chat_manager;
+pub mod editor;
