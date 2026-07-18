@@ -15,17 +15,21 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use anyhow::{Context as AnyhowContext, Result};
-use async_channel::Sender;
 use bandy::{BandyMember, SMessage};
 use elessar::{Context, Spline};
-use gneiss_pal::Event;
-use gtk4::prelude::*;
-use gtk4::{Box, Button, Orientation, Widget};
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::thread;
 
-pub fn create_view(tx: Sender<Event>) -> Widget {
+#[cfg(feature = "gtk")]
+use async_channel::Sender;
+#[cfg(feature = "gtk")]
+use gtk4::prelude::*;
+#[cfg(feature = "gtk")]
+use gtk4::{Box, Button, Orientation, Widget};
+
+#[cfg(feature = "gtk")]
+pub fn create_view(tx: Sender<SMessage>) -> Widget {
     let aule_box = Box::new(Orientation::Vertical, 10);
     aule_box.set_margin_top(20);
 
@@ -35,7 +39,7 @@ pub fn create_view(tx: Sender<Event>) -> Widget {
 
     let tx_clone = tx.clone();
     ignite_btn.connect_clicked(move |_| {
-        let _ = tx_clone.send_blocking(Event::AuleIgnite);
+        let _ = tx_clone.send_blocking(SMessage::AuleIgnite);
     });
 
     aule_box.append(&ignite_btn);

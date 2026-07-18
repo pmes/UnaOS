@@ -14,11 +14,20 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+pub mod document;
+pub use document::TabulaDocument;
+
+#[cfg(feature = "gtk")]
 use gtk4::prelude::*;
+#[cfg(feature = "gtk")]
 use gtk4::{ScrolledWindow, Widget};
+#[cfg(feature = "gtk")]
 use sourceview5::prelude::*;
+#[cfg(feature = "gtk")]
 use sourceview5::{LanguageManager, View as SourceView};
+#[cfg(feature = "gtk")]
 use std::fs;
+#[cfg(feature = "gtk")]
 use std::path::Path;
 
 #[derive(Debug, Clone)]
@@ -28,11 +37,13 @@ pub enum EditorMode {
     Log,
 }
 
+#[cfg(feature = "gtk")]
 pub struct TabulaView {
     pub view: SourceView,
     container: ScrolledWindow,
 }
 
+#[cfg(feature = "gtk")]
 impl TabulaView {
     pub fn new(mode: EditorMode) -> Self {
         let view = SourceView::builder().auto_indent(true).build();
