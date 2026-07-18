@@ -156,8 +156,10 @@ pub fn init() {
 }
 
 /// Target heartbeat rate: 1000 Hz => one tick per millisecond, so `ticks()`/`sleep_ticks` become
-/// real wall-clock once the timer is calibrated.
-const TICK_HZ: u64 = 1000;
+/// real wall-clock once the timer is calibrated. Public so `arch::ms_to_ticks` (the basis of
+/// `sched::sleep_ms`) derives the ms<->tick conversion from the ONE rate the timer is armed at,
+/// rather than hard-coding "1 tick == 1 ms" a second time.
+pub const TICK_HZ: u64 = 1000;
 
 /// Fixed fallback initial count, used before/without calibration (steady but ~0.8 ms/tick on QEMU,
 /// unknown on metal — the original empirical value).

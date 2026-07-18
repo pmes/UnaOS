@@ -71,6 +71,18 @@ pub fn ms() -> u64 {
     apic::ticks()
 }
 
+/// Convert a millisecond duration to local-APIC timer ticks for `sched::sleep_ms`. The heartbeat is
+/// calibrated to `apic::TICK_HZ` (1000 Hz), so one tick is one millisecond and this is `ms *
+/// TICK_HZ / 1000`. Deriving it from `TICK_HZ` (rather than returning `ms` outright) keeps the
+/// conversion honest if the tick rate is ever retuned, and localises the ms<->tick relationship to
+/// one place. Before calibration the tick is ~0.8 ms under QEMU, so a `sleep_ms` runs proportionally
+/// short — the same graceful degradation `ms()`/`ticks()` already carry. (x86-only, alongside the
+/// scheduler it serves; aarch64 has no scheduler yet.)
+#[inline]
+pub fn ms_to_ticks(ms: u64) -> u64 {
+    ms.saturating_mul(apic::TICK_HZ) / 1000
+}
+
 /// Free-running CPU cycle counter (rdtsc). Invariant on Nehalem and later (incl. the Ivy Bridge
 /// MacBookPro10,1): a constant rate across P-/C-/T-states, and — unlike `ticks()` — it advances
 /// regardless of EFLAGS.IF or whether the APIC-timer ISR runs. `apic::calibrate` measures its
