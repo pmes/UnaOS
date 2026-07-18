@@ -34,6 +34,23 @@ const FRAMES: u32 = 90;
 const DEMO_W: usize = 320;
 const DEMO_H: usize = 240;
 
+/// Target wall-clock frame interval for honest pacing. Without it the render+present
+/// loop runs as fast as the platform allows — on the Orin panel all 90 frames land in
+/// ~91 ms (989 fps), so the "spinning cube" presents as a ~0.1 s blue flash. Holding
+/// each frame to a fixed cadence makes the spin visible and platform-consistent.
+/// 33 ms ≈ 30 fps. Pacing only ever DELAYS a frame that finished early; a platform
+/// whose present is already SLOWER than this (x86 panel present at ~22 fps) never
+/// waits and runs at its own speed. The emitted fps line reports MEASURED time, so it
+/// stays honest either way (~30 fps when paced, present-bound fps when not).
+const FRAME_MS: u64 = 33;
+
+/// Finite backstop for the pace busy-wait: never poll `ms()` more than this many times
+/// waiting for one frame slot. On real hardware the monotonic clock reaches the slot
+/// deadline long before this cap; the cap only guards against a stuck/degenerate clock
+/// (e.g. a timerless fallback returning a constant) so the demo can never hang and QEMU
+/// still boots straight through to the interactive path.
+const PACE_POLL_CAP: u64 = 200_000_000;
+
 /// The unit cube: 8 corners, 12 outward-wound triangles (front = CCW-on-screen,
 /// see `rast::raster::Target::triangle`).
 fn cube() -> ([Vec3; 8], [u32; 36]) {
@@ -142,6 +159,19 @@ pub fn run(screen: &mut crate::video::Screen) {
             }
         }
         screen.flush();
+
+        // Pace: hold this frame until its wall-clock slot so the spin is visible at a
+        // steady cadence. Pure delay — the slot deadline is measured from `t_start`, so
+        // if this frame's render+present already overran the slot (slow present, e.g.
+        // x86) the loop condition is false immediately and we never wait. Fast platforms
+        // slow to the target; slow ones run at their own present speed. `PACE_POLL_CAP`
+        // is the finite backstop (never an unbounded spin).
+        let slot = t_start + (frame as u64 + 1) * FRAME_MS;
+        let mut polls = 0u64;
+        while crate::arch::ms() < slot && polls < PACE_POLL_CAP {
+            polls += 1;
+            core::hint::spin_loop();
+        }
     }
 
     let elapsed = crate::arch::ms().saturating_sub(t_start).max(1);

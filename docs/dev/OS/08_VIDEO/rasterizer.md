@@ -120,6 +120,19 @@ hands the panel back to the shell, emitting one honest fps line:
 :: RAST: 90 frames in 4115 ms — 21.871 fps (software rasterizer, panel present) ::
 ```
 
+**Frame pacing (RAST-PACE).** Each frame is held to a target wall-clock interval
+(`FRAME_MS = 33`, ≈ 30 fps) so the spin is *visible and platform-consistent* rather than
+flashing past. Without pacing the Orin panel finished all 90 frames in ~91 ms (989 fps) —
+a ~0.1 s blue flash. The pace is a **pure delay**: the slot deadline for frame *n* is
+`t_start + (n+1)·FRAME_MS`, and the loop busy-waits on `crate::arch::ms()` only while the
+current wall clock is *behind* that deadline, so a platform whose present is already
+slower than the target (x86 panel present at ~22 fps above) never waits and runs at its
+own speed — pacing only ever DELAYS, never skips. The busy-wait is bounded by a finite
+`PACE_POLL_CAP` poll backstop (never an unbounded spin; a stuck/degenerate clock can't
+hang the demo, and QEMU still boots straight through). The emitted fps line reports
+MEASURED elapsed time, so it stays honest: ≈ 30 fps where pacing binds, present-bound fps
+where the platform is the slower one.
+
 `rast_demo::run()` is arch-neutral (it drives only `Screen` + `crate::arch::ms()`),
 so the same code serves three panels; the wire-in differs per platform:
 
