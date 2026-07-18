@@ -379,10 +379,13 @@ pub fn pci_display_probe() {
 /// Lines the scenario prints. Enough to scroll the frame several times over at any plausible
 /// mode (2880x1800 -> 225 text rows; QEMU GOP modes are far smaller).
 const SCENARIO_LINES: usize = 400;
-/// Boot-relative start time: late enough that every one-shot storage/syscall fixture in the
-/// usbdebug loop has fired and gone quiet, so the post-scenario screen content is exactly the
-/// scenario's own tail — deterministic across runs, which is what the screendump compare needs.
-const SCENARIO_START_MS: u64 = 15_000;
+/// Boot-relative start time. Fires EARLY (right after fbcon is up) so the attended metal bench
+/// sees the fast WC-accelerated scroll near the top of boot instead of buried 15 s deep behind the
+/// one-shot fixtures — the behaviour the rMBP sitting wants. Trade-off: the post-scenario screen no
+/// longer settles on the scenario's own tail (later fixture/SMC output scrolls in after), so the
+/// deterministic screendump-compare gate must key on the `:: vperf: scenario … ::` serial lines,
+/// not a final-frame capture. (Was 15_000; that value only ever served the screendump-tail compare.)
+const SCENARIO_START_MS: u64 = 1_000;
 
 static SCENARIO_DONE: AtomicBool = AtomicBool::new(false);
 
