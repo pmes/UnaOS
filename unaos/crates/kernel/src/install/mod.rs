@@ -370,5 +370,125 @@ fn run_demo_inner() -> Result<(), InstallError> {
         }
     }
 
+    // 8) MULTI-CLUSTER DIRECTORY proof (ORIN-SDMMC-3 M2): the `TreeWriter` builds a subdirectory holding
+    //    more than 16 entries — spanning more than one 512-byte cluster — then the in-tree FAT reader
+    //    mounts the volume, follows the directory's cluster chain, and re-reads + sha-verifies every entry.
+    //    This exercises the lifted single-cluster/>16-entry bound on the SAME engine the SD installer uses.
+    demo_multicluster_dir(&mut t, &layout)?;
+
+    Ok(())
+}
+
+/// ORIN-SDMMC-3 M2 witness: prove the multi-cluster directory `TreeWriter` path end-to-end on the x86
+/// scratch target. Re-establishes the FAT blank-precondition, re-formats the ESP, then builds a tree whose
+/// subdirectory `SUB/` holds `N > 16` files (so its directory image spans >1 cluster), writing each file
+/// through `TreeWriter::write_file`. Finally the in-tree FAT reader mounts the volume, walks `SUB/` across
+/// its cluster chain, and content-verifies every file by SHA — a genuine multi-cluster directory read.
+fn demo_multicluster_dir<T: InstallTarget>(
+    t: &mut T,
+    layout: &gpt::GptLayout,
+) -> Result<(), InstallError> {
+    use fat32::{dir_clusters_for_slots, put_dir_entry, TreeWriter, ATTR_ARCHIVE, ATTR_DIR};
+
+    // 20 files + `.`/`..` = 22 slots > 16 => the SUB/ directory needs 2 clusters.
+    const N: usize = 20;
+
+    // Re-establish the blank-precondition: the volume still carries PAYLOAD.BIN's FAT chain, so zero the
+    // reserved+FAT region before re-formatting (a stale FAT entry would forge an allocation).
+    let esp_sectors = layout.esp_last_lba - layout.esp_first_lba + 1;
+    let blank = fat32::blank_region_sectors(esp_sectors)?;
+    let zero = [0u8; SECTOR];
+    for s in 0..blank {
+        t.write_sectors(layout.esp_first_lba + s, &zero)?;
+    }
+    let geom = fat32::format_esp(t, layout.esp_first_lba, esp_sectors)?;
+
+    // Build the tree: root -> SUB/ -> F00.BIN .. F19.BIN. Record each file's sha for the read-back verify.
+    let mut files: alloc::vec::Vec<(alloc::string::String, [u8; 32], usize)> = alloc::vec::Vec::new();
+    let sub_clusters = dir_clusters_for_slots(N + 2);
+    {
+        let mut w = TreeWriter::new(t, geom);
+        // root: one entry (SUB) => one cluster.
+        let root = w.reserve_root(dir_clusters_for_slots(1))?;
+        let sub = w.alloc_dir_clusters(sub_clusters)?;
+
+        // The SUB/ directory image, built wholly in memory across its cluster chain.
+        let mut sub_img = alloc::vec![0u8; sub_clusters as usize * SECTOR];
+        let mut slot = 0usize;
+        if !put_dir_entry(&mut sub_img, slot, ".", ATTR_DIR, sub, 0)
+            || !put_dir_entry(&mut sub_img, slot + 1, "..", ATTR_DIR, 0, 0)
+        {
+            return Err(InstallError::BadArg);
+        }
+        slot += 2;
+        for i in 0..N {
+            let name = alloc::format!("F{:02}.BIN", i);
+            // Distinct, non-degenerate content per file (varying length exercises padding + extents).
+            let mut content = alloc::vec::Vec::new();
+            content.extend_from_slice(alloc::format!("multicluster demo file {}\n", i).as_bytes());
+            let mut k: usize = 0;
+            let target = 200 + i * 17;
+            while content.len() < target {
+                content.push(((k.wrapping_mul(29).wrapping_add(i)) & 0xFF) as u8);
+                k += 1;
+            }
+            let sha = hash::sha256(&content);
+            let (first, _extents) = w.write_file(&content)?;
+            if !put_dir_entry(&mut sub_img, slot, &name, ATTR_ARCHIVE, first, content.len() as u32) {
+                return Err(InstallError::BadArg);
+            }
+            slot += 1;
+            files.push((name, sha, content.len()));
+        }
+        w.write_dir_image(sub, &sub_img)?;
+
+        // The root directory image: a single SUB/ entry.
+        let mut root_img = alloc::vec![0u8; SECTOR];
+        if !put_dir_entry(&mut root_img, 0, "SUB", ATTR_DIR, sub, 0) {
+            return Err(InstallError::BadArg);
+        }
+        w.write_dir_image(root, &root_img)?;
+    }
+    serial_println!(
+        ":: INSTALL: multi-cluster dir — wrote SUB/ with {} files across {} clusters (>1) ::",
+        N,
+        sub_clusters
+    );
+
+    // Read it back through the in-tree FAT reader: mount, find SUB/, walk its cluster chain, verify each.
+    let fs = crate::fs::fat::mount().map_err(|_| InstallError::VerifyFailed)?;
+    let sub_de = fs.find_in_root("SUB").map_err(|_| InstallError::VerifyFailed)?;
+    if !sub_de.is_dir {
+        serial_println!(":: INSTALL: multi-cluster dir — SUB is not a directory => FAIL ::");
+        return Err(InstallError::VerifyFailed);
+    }
+    let entries = fs.read_dir(sub_de.first_cluster()).map_err(|_| InstallError::VerifyFailed)?;
+    let mut verified = 0usize;
+    for (name, sha, size) in &files {
+        let de = entries
+            .iter()
+            .find(|e| !e.is_dir && e.name() == name.as_str())
+            .ok_or(InstallError::VerifyFailed)?;
+        let mut back = alloc::vec::Vec::new();
+        fs.read_file(de, &mut back, *size).map_err(|_| InstallError::VerifyFailed)?;
+        if back.len() != *size || &hash::sha256(&back) != sha {
+            serial_println!(":: INSTALL: multi-cluster dir — {} read-back mismatch => FAIL ::", name);
+            return Err(InstallError::VerifyFailed);
+        }
+        verified += 1;
+    }
+    if verified != N {
+        serial_println!(
+            ":: INSTALL: multi-cluster dir — only {}/{} files verified => FAIL ::",
+            verified,
+            N
+        );
+        return Err(InstallError::VerifyFailed);
+    }
+    serial_println!(
+        ":: INSTALL: multi-cluster dir — SUB/ {} entries across {} clusters, all re-read + sha-verified (dirs=1) => PASS ::",
+        N,
+        sub_clusters
+    );
     Ok(())
 }
