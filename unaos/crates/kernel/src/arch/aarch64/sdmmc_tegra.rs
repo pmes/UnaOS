@@ -74,6 +74,14 @@ pub fn sdmmc_census(_dtb_addr: u64, _dtb_size: usize, _ram_gib_mask: u64) {
         "{} ORIN-SDMMC-1 Tegra234 microSD recon compiled; no Tegra234 SDMMC on this build (QEMU virt) — recon is metal-only (UNAOS_SDMMC=1 UNAOS_TEGRA=1) ::",
         PS
     );
+    // ORIN-SDMMC-2: when the write ARM is compiled in on a virt build, one honest metal-only line — the
+    // paranoia ladder touches a real Tegra234 SDMMC controller QEMU does not model, so there is nothing to
+    // write here and we do zero MMIO. Mirrors the census witness above.
+    #[cfg(feature = "sdmmc_arm")]
+    serial_println!(
+        "{} ORIN-SDMMC-2 write ladder ARMED (UNAOS_SDMMC_ARM=1) but metal-only — no Tegra234 SDMMC on this build (QEMU virt); zero card writes here ::",
+        PS
+    );
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════════
@@ -120,6 +128,8 @@ mod metal {
     // ── INTERRUPT (0x30) bits (W1C). ──
     const INT_CMD_DONE: u32 = 1 << 0;
     const INT_DATA_DONE: u32 = 1 << 1;
+    #[cfg(feature = "sdmmc_arm")]
+    const INT_WRITE_RDY: u32 = 1 << 4; // Buffer Write Ready (host may push the PIO FIFO)
     const INT_READ_RDY: u32 = 1 << 5;
     const INT_ERR: u32 = 1 << 15;
     /// Any error: the error-summary bit OR any of the error-status bits [31:16].
@@ -529,6 +539,292 @@ mod metal {
         "unknown (no recognised signature)"
     }
 
+    // ══════════════════════════════════════════════════════════════════════════════════════════════════
+    // ORIN-SDMMC-2 — the WRITE path behind the paranoia ladder (`sdmmc_arm`-gated: EVERY line below this
+    // marker is compiled out unless UNAOS_SDMMC_ARM=1, keeping a plain `sdmmc` build byte-identical to the
+    // merged ORIN-SDMMC-1 recon). Law: THE SEATED CARD IS SACRED — no card write happens without BOTH the
+    // `sdmmc` feature AND this explicit arm, and even armed, the ladder only ever writes a scratch region
+    // that it stashed first and restores after, verifying every step.
+    // ══════════════════════════════════════════════════════════════════════════════════════════════════
+
+    /// Single scratch block — the witness writes ONE block (CMD24) this arc (multi-block CMD25 is not used).
+    #[cfg(feature = "sdmmc_arm")]
+    const SCRATCH_BLOCKS: u64 = 1;
+
+    /// Read one arbitrary block `lba` via polled single-block CMD17 (the generalised `read_sector0`, kept
+    /// arm-gated so the rung-1 read path is untouched). READ-ONLY. Returns whether the block was read.
+    #[cfg(feature = "sdmmc_arm")]
+    fn read_block_at(base: u64, card: &Card, lba: u64, buf: &mut [u8; 512]) -> bool {
+        let arg = if card.block_addressing { lba as u32 } else { (lba * 512) as u32 };
+        write32(base, INTERRUPT, 0xffff_ffff);
+        write32(base, BLKSIZECNT, (1 << 16) | 512);
+        if send_command(
+            base,
+            cmd(17) | CMD_RESP_48 | CMD_CRCCHK | CMD_IXCHK | CMD_ISDATA | CMD_DAT_DIR_READ,
+            arg,
+        )
+        .is_err()
+        {
+            serial_println!("{}   ladder: CMD17 (READ LBA {}) failed at the link layer ::", PS, lba);
+            return false;
+        }
+        let r1 = read32(base, RESP0);
+        if r1 & R1_ERROR_MASK != 0 {
+            serial_println!("{}   ladder: CMD17 (LBA {}) R1 error status {:#010x} ::", PS, lba, r1);
+            return false;
+        }
+        if !wait_set(base, INTERRUPT, INT_READ_RDY, DATA_TIMEOUT_MS) {
+            serial_println!("{}   ladder: read buffer never became ready (LBA {}) ::", PS, lba);
+            return false;
+        }
+        write32(base, INTERRUPT, INT_READ_RDY);
+        for i in 0..128usize {
+            let word = read32(base, DATA);
+            let off = i * 4;
+            buf[off..off + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        if !wait_set(base, INTERRUPT, INT_DATA_DONE | INT_ERR_ANY, DATA_TIMEOUT_MS) {
+            serial_println!("{}   ladder: transfer-complete timeout reading LBA {} ::", PS, lba);
+            return false;
+        }
+        let int = read32(base, INTERRUPT);
+        write32(base, INTERRUPT, int);
+        if int & INT_ERR_ANY != 0 {
+            serial_println!("{}   ladder: data error {:#010x} reading LBA {} ::", PS, int, lba);
+            return false;
+        }
+        true
+    }
+
+    /// Dump a 512-byte buffer as 32 rows of 16 hex bytes (offset-labelled) so a stashed original is never
+    /// silently lost when a restore step fails. No allocation — a stack line buffer per row.
+    #[cfg(feature = "sdmmc_arm")]
+    fn dump_hex(buf: &[u8; 512]) {
+        const HEXD: &[u8; 16] = b"0123456789abcdef";
+        for row in 0..32usize {
+            let mut line = [0u8; 16 * 3];
+            let mut p = 0usize;
+            for col in 0..16usize {
+                let b = buf[row * 16 + col];
+                line[p] = HEXD[(b >> 4) as usize];
+                line[p + 1] = HEXD[(b & 0xf) as usize];
+                line[p + 2] = b' ';
+                p += 3;
+            }
+            serial_println!(
+                "{}   stash[{:03x}]: {} ::",
+                PS,
+                row * 16,
+                core::str::from_utf8(&line[..p]).unwrap_or("?")
+            );
+        }
+    }
+
+    /// Write one arbitrary block `lba` via polled single-block CMD24 (WRITE_SINGLE_BLOCK). Host->card
+    /// direction (DAT_DIR clear). Returns whether the block was written AND the card left the programming
+    /// (busy) state cleanly. The ONLY card-write primitive in the driver — reachable only from the ladder,
+    /// only under `sdmmc_arm`, only against a stashed scratch region.
+    #[cfg(feature = "sdmmc_arm")]
+    fn write_block_at(base: u64, card: &Card, lba: u64, buf: &[u8; 512]) -> bool {
+        let arg = if card.block_addressing { lba as u32 } else { (lba * 512) as u32 };
+        write32(base, INTERRUPT, 0xffff_ffff);
+        write32(base, BLKSIZECNT, (1 << 16) | 512);
+        // CMD24 WRITE_SINGLE_BLOCK: R1 + data present, host->card (DAT_DIR_READ clear).
+        if send_command(
+            base,
+            cmd(24) | CMD_RESP_48 | CMD_CRCCHK | CMD_IXCHK | CMD_ISDATA,
+            arg,
+        )
+        .is_err()
+        {
+            serial_println!("{}   ladder: CMD24 (WRITE LBA {}) failed at the link layer ::", PS, lba);
+            return false;
+        }
+        let r1 = read32(base, RESP0);
+        if r1 & R1_ERROR_MASK != 0 {
+            serial_println!("{}   ladder: CMD24 (LBA {}) R1 error status {:#010x} ::", PS, lba, r1);
+            return false;
+        }
+        if !wait_set(base, INTERRUPT, INT_WRITE_RDY, DATA_TIMEOUT_MS) {
+            serial_println!("{}   ladder: write buffer never became ready (LBA {}) ::", PS, lba);
+            return false;
+        }
+        write32(base, INTERRUPT, INT_WRITE_RDY);
+        for i in 0..128usize {
+            let off = i * 4;
+            let word = u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
+            write32(base, DATA, word);
+        }
+        // Transfer-complete: the card has accepted the block off the FIFO.
+        if !wait_set(base, INTERRUPT, INT_DATA_DONE | INT_ERR_ANY, DATA_TIMEOUT_MS) {
+            serial_println!("{}   ladder: transfer-complete timeout writing LBA {} ::", PS, lba);
+            return false;
+        }
+        let int = read32(base, INTERRUPT);
+        write32(base, INTERRUPT, int);
+        if int & INT_ERR_ANY != 0 {
+            serial_println!("{}   ladder: data error {:#010x} writing LBA {} ::", PS, int, lba);
+            return false;
+        }
+        // The card asserts DAT0 busy while it programs the flash; wait for it to release before we treat the
+        // write as durable (a following read would otherwise race the internal programming). `send_command`
+        // already waits DAT_INHIBIT on the next command, but the ladder verifies immediately, so wait here.
+        if !wait_clear(base, STATUS, ST_DAT_INHIBIT, DATA_TIMEOUT_MS) {
+            serial_println!("{}   ladder: card stayed busy (DAT0) after writing LBA {} — programming did not complete ::", PS, lba);
+            return false;
+        }
+        true
+    }
+
+    /// Emergency restore after a mid-ladder fault (a write may have partially landed): re-write the stash
+    /// and verify it. If the restore itself cannot be verified, dump the stashed original as hex so the
+    /// data is never silently lost. Returns whether the original was provably put back.
+    #[cfg(feature = "sdmmc_arm")]
+    fn restore_or_dump(base: u64, card: &Card, lba: u64, stash: &[u8; 512]) -> bool {
+        serial_println!("{}   ladder: emergency RESTORE of LBA {} after a mid-ladder fault ::", PS, lba);
+        if write_block_at(base, card, lba, stash) {
+            let mut chk = [0u8; 512];
+            if read_block_at(base, card, lba, &mut chk) && chk == *stash {
+                serial_println!("{}   ladder: emergency restore verified — original data preserved ::", PS);
+                return true;
+            }
+        }
+        serial_println!("{}   ladder: EMERGENCY RESTORE FAILED — original {}-byte stash below as hex so it is never lost ::", PS, 512);
+        dump_hex(stash);
+        false
+    }
+
+    /// The paranoia ladder (ORIN-SDMMC-2). Announced-before-issue, bounded, and RESTORE-by-construction:
+    ///  1. re-run the rung-1 read census (sector 0) and confirm it is stable;
+    ///  2. pick the SCRATCH REGION — the last `SCRATCH_BLOCKS` block(s) of the card, ONLY IF sector 0 shows
+    ///     no GPT (a GPT backup header lives in the last LBA — with GPT present we REFUSE scratch writes this
+    ///     arc and say so);
+    ///  3. read + stash the scratch region's current contents;
+    ///  4. single-block CMD24 write of a stamped pattern;
+    ///  5. read-back + byte-compare (the write verified);
+    ///  6. RESTORE the stashed original contents;
+    ///  7. read-back + byte-compare the restoration.
+    /// Emits `:: SDMMC: write ladder — write/verify/restore/verify => PASS ::` only if EVERY step verified.
+    /// Any mismatch = a distinct FAIL line naming the step; if a write landed, an emergency restore runs,
+    /// and if the restore itself cannot be verified the stashed original is dumped as hex.
+    #[cfg(feature = "sdmmc_arm")]
+    fn write_ladder(base: u64, card: &Card, sec0: &[u8; 512]) {
+        serial_println!(
+            "{} ORIN-SDMMC-2 ARMED (UNAOS_SDMMC_ARM=1) — paranoia write ladder on the SEATED card (scratch region, stashed + restored) ::",
+            PS
+        );
+
+        // ── Step 1/7: re-run the rung-1 read census and confirm it is stable ──
+        serial_println!("{}   ladder step 1/7: re-reading sector 0 (rung-1 read census) before any write ::", PS);
+        let mut recensus = [0u8; 512];
+        if !read_block_at(base, card, 0, &mut recensus) {
+            serial_println!("{}   ladder FAIL step 1 (re-census): sector-0 re-read failed — REFUSING to proceed ::", PS);
+            return;
+        }
+        if recensus != *sec0 {
+            serial_println!("{}   ladder FAIL step 1 (re-census): sector 0 changed since the census read — REFUSING to proceed ::", PS);
+            return;
+        }
+        serial_println!("{}   ladder step 1: read census stable (sector 0 re-read byte-identical) ::", PS);
+
+        // ── Step 2/7: pick the scratch region (the GPT-refusal rule) ──
+        let class = classify_sector0(sec0);
+        if class.starts_with("GPT") {
+            serial_println!(
+                "{}   ladder step 2/7: sector 0 is {} — a GPT BACKUP header lives in the card's LAST LBA, exactly where our scratch region sits; REFUSING all scratch writes this arc (no provably-safe region) ::",
+                PS, class
+            );
+            serial_println!("{} ORIN-SDMMC-2 write ladder REFUSED (GPT present — the seated card is sacred; no write) ::", PS);
+            return;
+        }
+        if card.num_blocks < SCRATCH_BLOCKS {
+            serial_println!("{}   ladder step 2/7: card too small ({} blocks) for a {}-block scratch region — REFUSING ::", PS, card.num_blocks, SCRATCH_BLOCKS);
+            return;
+        }
+        let scratch_lba = card.num_blocks - SCRATCH_BLOCKS;
+        serial_println!(
+            "{}   ladder step 2/7: no GPT (sector 0 = {}) — scratch region = the last {} block(s), LBA {} (card's last LBA) ::",
+            PS, class, SCRATCH_BLOCKS, scratch_lba
+        );
+
+        // ── Step 3/7: read + stash the scratch region's current contents ──
+        serial_println!("{}   ladder step 3/7: reading + stashing scratch LBA {} current contents ::", PS, scratch_lba);
+        let mut stash = [0u8; 512];
+        if !read_block_at(base, card, scratch_lba, &mut stash) {
+            serial_println!("{}   ladder FAIL step 3 (stash read): could not read scratch LBA {} — REFUSING to write (nothing to restore from) ::", PS, scratch_lba);
+            return;
+        }
+        serial_println!(
+            "{}   ladder step 3: stashed 512 bytes from LBA {} (first 8: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}) ::",
+            PS, scratch_lba,
+            stash[0], stash[1], stash[2], stash[3], stash[4], stash[5], stash[6], stash[7]
+        );
+
+        // ── Step 4/7: single-block CMD24 write of a stamped pattern ──
+        let mut pattern = [0u8; 512];
+        make_pattern(&mut pattern, scratch_lba);
+        serial_println!("{}   ladder step 4/7: CMD24 single-block WRITE of stamped pattern to LBA {} ::", PS, scratch_lba);
+        if !write_block_at(base, card, scratch_lba, &pattern) {
+            serial_println!("{}   ladder FAIL step 4 (write): CMD24 write to LBA {} failed ::", PS, scratch_lba);
+            // The write may have partially landed — attempt to put the original back.
+            restore_or_dump(base, card, scratch_lba, &stash);
+            return;
+        }
+
+        // ── Step 5/7: read-back + byte-compare against the stamped pattern ──
+        serial_println!("{}   ladder step 5/7: reading back LBA {} + byte-comparing to the stamped pattern ::", PS, scratch_lba);
+        let mut readback = [0u8; 512];
+        if !read_block_at(base, card, scratch_lba, &mut readback) {
+            serial_println!("{}   ladder FAIL step 5 (verify read): read-back of LBA {} failed ::", PS, scratch_lba);
+            restore_or_dump(base, card, scratch_lba, &stash);
+            return;
+        }
+        if readback != pattern {
+            serial_println!("{}   ladder FAIL step 5 (verify): read-back != written pattern at LBA {} ::", PS, scratch_lba);
+            restore_or_dump(base, card, scratch_lba, &stash);
+            return;
+        }
+        serial_println!("{}   ladder step 5: write verified (read-back byte-identical to the stamped pattern) ::", PS);
+
+        // ── Step 6/7: RESTORE the stashed original contents ──
+        serial_println!("{}   ladder step 6/7: RESTORING original stashed contents to LBA {} ::", PS, scratch_lba);
+        if !write_block_at(base, card, scratch_lba, &stash) {
+            serial_println!("{}   ladder FAIL step 6 (restore write): CMD24 restore to LBA {} FAILED — original {}-byte data below as hex so it is never lost ::", PS, scratch_lba, 512);
+            dump_hex(&stash);
+            return;
+        }
+
+        // ── Step 7/7: read-back + byte-compare the restoration ──
+        serial_println!("{}   ladder step 7/7: reading back LBA {} + byte-comparing to the stash (restore verify) ::", PS, scratch_lba);
+        let mut restored = [0u8; 512];
+        if !read_block_at(base, card, scratch_lba, &mut restored) {
+            serial_println!("{}   ladder FAIL step 7 (restore verify read): read-back of LBA {} failed — original data below as hex ::", PS, scratch_lba);
+            dump_hex(&stash);
+            return;
+        }
+        if restored != stash {
+            serial_println!("{}   ladder FAIL step 7 (restore verify): restored contents != stash at LBA {} — original data below as hex ::", PS, scratch_lba);
+            dump_hex(&stash);
+            return;
+        }
+        serial_println!("{}   ladder step 7: restore verified (LBA {} byte-identical to the original stash) ::", PS, scratch_lba);
+
+        // Every step verified — the scratch region is provably back to its original contents.
+        serial_println!("{} write ladder — write/verify/restore/verify => PASS ::", PS);
+    }
+
+    /// Build the stamped scratch pattern: a recognisable ASCII marker + the target LBA + a byte-position
+    /// sweep, so a stuck-bit, a wrong-LBA landing, or a partial write all fail the byte-compare loudly.
+    #[cfg(feature = "sdmmc_arm")]
+    fn make_pattern(buf: &mut [u8; 512], lba: u64) {
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = (i as u8) ^ 0x5a;
+        }
+        const MARK: &[u8] = b"UNAOS-SDMMC2-SCRATCH";
+        buf[..MARK.len()].copy_from_slice(MARK);
+        buf[32..40].copy_from_slice(&lba.to_le_bytes());
+    }
+
     // ── M1: FDT census — enumerate SDMMC-compatible nodes, pick the enabled removable microSD slot ──
 
     const MAX_CAND: usize = 8;
@@ -809,5 +1105,10 @@ mod metal {
             "{} ORIN-SDMMC-1 DONE — microSD censused: {} blocks ({} MiB, CSD v{}), sector-0 {} (READ-ONLY; no card write) ::",
             PS, card.num_blocks, card.num_blocks * 512 / (1024 * 1024), card.csd_version, class
         );
+
+        // ── ORIN-SDMMC-2: the paranoia write ladder (only with UNAOS_SDMMC_ARM=1; compiled out otherwise, so
+        //    a plain UNAOS_SDMMC=1 build ends exactly here, byte-identical to the merged recon). ──
+        #[cfg(feature = "sdmmc_arm")]
+        write_ladder(base, &card, &sec0);
     }
 }
