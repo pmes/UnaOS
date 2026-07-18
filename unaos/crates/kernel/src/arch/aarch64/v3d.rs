@@ -42,6 +42,44 @@ use super::mailbox;
 const V3D_HUB_BASE: usize = 0xFEC0_0000; // ARM PA of the V3D hub (VC bus 0x7EC0_0000)
 const V3D_CORE0_BASE: usize = V3D_HUB_BASE + 0x4000; // core 0 register block
 
+// ─── PI-V3D-3: the PM / ASB (AXI async bridge) enable step. ───────────────────────────────────────
+// PI-V3D-2's metal verdict (2026-07-18, non-relitigable): firmware power domain 10 ACKed ON, clock id
+// 5 rate 500 MHz ACKed, clock GATE ACKed active — yet the V3D hub STILL reads 0xdeadbeef (BUS-POISON,
+// probe fail-closed correctly). Conclusion of record: the RPi firmware property-tag power+clock path
+// is NOT sufficient to decode the V3D block on BCM2711.
+//
+// Adjudication (Linux `drivers/soc/bcm/bcm2835-power.c` + `arch/arm/boot/dts/bcm2711.dtsi`, rpi-6.1.y):
+// on BCM2711 the V3D power domain (`BCM2835_POWER_DOMAIN_GRAFX_V3D`) is brought up by
+// `bcm2835_asb_power_on(PM_GRAFX, ASB_V3D_M_CTRL, ASB_V3D_S_CTRL, PM_V3DRSTN)`. Two of its steps are
+// DISTINCT from the firmware power-domain path and are the missing piece:
+//   (1) deassert the V3D reset — set PM_V3DRSTN (bit 6) in PM_GRAFX, written with the PM password.
+//   (2) release the two async AXI bridges — clear ASB_REQ_STOP in ASB_V3D_M_CTRL then ASB_V3D_S_CTRL
+//       (each written with the PM password) and wait for ASB_ACK to clear.
+// The V3D ASB registers live in the `rpivid_asb` reg block, NOT the legacy `asb` block: in the DT the
+// `pm` node's third reg range is `<0x7ec11000 0x20>` "rpivid_asb", and `bcm2835_asb_control` routes
+// ASB_V3D_{S,M}_CTRL to `power->rpivid_asb` when present (always, on BCM2711). The PM_POWUP/inrush/
+// memory-repair sequence (`bcm2835_power_power_on`) is SKIPPED on BCM2711 (`if (power->rpivid_asb)
+// return 0`) — the firmware already did it, which is why our mailbox SET_DOMAIN_STATE domain 10 ACKs.
+// So we KEEP the firmware power/rate/gate steps (ACKed-working, still necessary) and ADD only the
+// reset-deassert + ASB-release step, sequenced after them.
+//
+// Both bases are ARM PAs inside the 0xC000_0000–0xFFFF_FFFF Device-nGnRnE window already mapped by
+// boot.rs L1[3] — no new MMU mapping. QEMU raspi4b models neither the rpivid_asb block nor V3D, so
+// every read/write here is poison/absent-tolerant and every wait is a finite CNTPCT backstop: on QEMU
+// the ASB regs are unbacked (read 0, ACK already clear → no wait, no fault), and the IDENT0 probe that
+// follows still lands on the honest BLOCK-DOWN. On metal the discriminating expectation becomes
+// BLOCK-UP.
+const PM_BASE: usize = 0xFE10_0000; // ARM PA of the PM block (VC bus 0x7E10_0000, DT "pm")
+const PM_GRAFX: usize = 0x010C; // graphics power-domain control register
+const PM_V3DRSTN: u32 = 1 << 6; // deassert = V3D out of reset (bcm2835-power PM_V3DRSTN)
+const PM_PASSWORD: u32 = 0x5A00_0000; // every PM (and ASB) write must carry this in the top byte
+
+const RPIVID_ASB_BASE: usize = 0xFEC1_1000; // ARM PA of the rpivid_asb block (VC bus 0x7EC1_1000)
+const ASB_V3D_S_CTRL: usize = 0x08; // V3D slave AXI bridge control
+const ASB_V3D_M_CTRL: usize = 0x0C; // V3D master AXI bridge control
+const ASB_REQ_STOP: u32 = 1 << 0; // request the bridge stopped (clear to release)
+const ASB_ACK: u32 = 1 << 1; // bridge stopped acknowledge (clears when released)
+
 // ─── Hub registers (offset from V3D_HUB_BASE), per v3d_regs.h. ───
 const V3D_HUB_IDENT0: usize = 0x0008;
 const V3D_HUB_IDENT1: usize = 0x000C;
@@ -198,8 +236,16 @@ pub fn bringup(fb: Option<FbTarget>) {
         }
     }
 
-    // Let the freshly powered + clocked block settle before its first register read (a bounded
-    // wall-clock delay off CNTPCT — finite by construction, never an unbounded spin).
+    // PI-V3D-3: the PM / ASB enable step — the piece the firmware power+clock path leaves undone on
+    // BCM2711 (PI-V3D-2's metal verdict). Deassert the V3D reset in PM_GRAFX, then release the two
+    // async AXI bridges (master, slave). Sequenced AFTER the firmware power/rate/gate steps above and
+    // BEFORE the probe, so the probe reads a (hopefully) decoded block. Best-effort + poison-honest:
+    // on QEMU these registers are absent and every wait is a finite backstop, so the run still lands
+    // on the honest BLOCK-DOWN below; on metal this is what turns BUS-POISON into BLOCK-UP.
+    enable_pm_asb();
+
+    // Let the freshly powered + clocked + bridged block settle before its first register read (a
+    // bounded wall-clock delay off CNTPCT — finite by construction, never an unbounded spin).
     settle_ms(2);
 
     // Poison-honest presence gate — the SOLE V3D thing QEMU raspi4b exercises, and it MUST NOT fault.
@@ -325,6 +371,61 @@ fn settle_ms(ms: u64) {
     while super::timer::cntpct() < deadline {
         core::hint::spin_loop();
     }
+}
+
+/// PI-V3D-3: the PM / ASB enable step. On BCM2711 the firmware property-tag power+clock path leaves
+/// the V3D held in reset with its async AXI bridges stopped (PI-V3D-2 metal: powered+clocked yet
+/// 0xdeadbeef). Mirror the two BCM2711-relevant steps of Linux `bcm2835_asb_power_on` for the
+/// GRAFX_V3D domain: (1) deassert PM_V3DRSTN in PM_GRAFX, (2) release ASB_V3D_M_CTRL then
+/// ASB_V3D_S_CTRL. Every PM/ASB write carries the PM password. Best-effort: a bridge that never ACKs
+/// (or reads poison) is logged and we proceed — the IDENT0 probe that follows is the real verdict
+/// gate (it BUS-POISONs honestly if the block still did not decode). Announced-before-issue writes,
+/// poison-honest readbacks, bounded settles — nothing here can fault or hang (QEMU-safe).
+fn enable_pm_asb() {
+    // (1) Deassert the V3D reset in PM_GRAFX (bit PM_V3DRSTN), preserving the other bits, PM password
+    // in the top byte. Read-modify-write via the Device window; the read is poison-tolerant (we only
+    // OR in our bit and re-stamp the password, so any bus value is harmless).
+    let grafx = mmio_read(PM_BASE, PM_GRAFX);
+    serial_println!(
+        ":: V3D: PM/ASB deassert V3D reset — PM_GRAFX {:#010x} -> set PM_V3DRSTN (pw) ::",
+        grafx
+    );
+    mmio_write(PM_BASE, PM_GRAFX, PM_PASSWORD | (grafx | PM_V3DRSTN));
+    let grafx_rb = mmio_read(PM_BASE, PM_GRAFX);
+    serial_println!(
+        ":: V3D: PM_GRAFX readback {:#010x}{} ::",
+        grafx_rb,
+        if is_poison(grafx_rb) { " (poison/absent — QEMU or block-down)" } else { "" }
+    );
+
+    // (2) Release the two async AXI bridges: master first, then slave (Linux order). Clear ASB_REQ_STOP
+    // and wait for ASB_ACK to clear, bounded.
+    asb_release("V3D master (ASB_V3D_M_CTRL)", ASB_V3D_M_CTRL);
+    asb_release("V3D slave  (ASB_V3D_S_CTRL)", ASB_V3D_S_CTRL);
+}
+
+/// Release one V3D async AXI bridge in the rpivid_asb block: clear ASB_REQ_STOP (with the PM password)
+/// and wait, with a finite CNTPCT backstop, for ASB_ACK to clear. Announced-before-issue; poison-honest
+/// readback. Never fatal — a bridge that will not release is logged and the caller proceeds to let the
+/// IDENT0 probe deliver the honest verdict.
+fn asb_release(what: &str, reg: usize) {
+    let cur = mmio_read(RPIVID_ASB_BASE, reg);
+    serial_println!(
+        ":: V3D: PM/ASB release {} — cur {:#010x} -> clear ASB_REQ_STOP (pw) ::",
+        what, cur
+    );
+    mmio_write(RPIVID_ASB_BASE, reg, PM_PASSWORD | (cur & !ASB_REQ_STOP));
+    // Wait ~5 ms for ACK to clear (Linux uses 1 µs on real silicon; we are generous). On QEMU the
+    // register is unbacked/reads 0, so ACK is already clear and this returns at once.
+    let released = wait_bit_clear(RPIVID_ASB_BASE, reg, ASB_ACK, what);
+    let rb = mmio_read(RPIVID_ASB_BASE, reg);
+    serial_println!(
+        ":: V3D: PM/ASB {} readback {:#010x} — {}{} ::",
+        what,
+        rb,
+        if released { "ACK clear (bridge released)" } else { "ACK still set (backstop hit — proceeding)" },
+        if is_poison(rb) { ", poison/absent (QEMU or block-down)" } else { "" }
+    );
 }
 
 /// M2: build a flat V3D page table that identity-maps ONLY the arena (every other PTE invalid), then

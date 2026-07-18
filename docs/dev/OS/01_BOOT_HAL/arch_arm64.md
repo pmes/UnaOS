@@ -5542,6 +5542,64 @@ the next attended Pi sitting** (this is a QEMU/metal divergence class by constru
 tags and reports BLOCK-DOWN). Knob-off byte-identity to baseline is preserved: every change is inside
 `#[cfg(feature = "v3d")]`-gated code.
 
+### PI-V3D-3 — the PM / ASB enable step (the enable-sequence refinement after V3D-2's metal refutation)
+
+**The V3D-2 metal verdict (2026-07-18, LC-metal R22, non-relitigable ground truth).** One boot,
+`~/unaos-bench/pi-serial-2026-07-18-r22-v3d2.log`:
+```
+:: V3D: power domain 10 ON ::
+:: V3D: clock id 5 rate set to 500000000 Hz ::
+:: V3D: clock id 5 gate ENABLED (active) ::
+:: V3D: probe verdict BUS-POISON — hub IDENT0 = 0xdeadbeef (open-bus/firmware fill, NOT a live
+   register — the powered+clocked path did not bring the block up) — GPU bring-up skipped, fail-closed ::
+```
+Leg 1 (the poison-honest probe) **CONFIRMED** — `0xdeadbeef` is now correctly named open-bus and
+fail-closes cleanly (no MMU-backstop halt, no exception, boot continues). Leg 2 (the clock-gate as the
+enable fix) **REFUTED**: `set_clock_state` demonstrably worked (gate ENABLED/active) and the block still
+did not decode. **Conclusion of record: the RPi firmware property-channel power+clock path is NOT
+sufficient to decode the V3D block on BCM2711.**
+
+**The ASB adjudication (Linux `drivers/soc/bcm/bcm2835-power.c` + `bcm2711.dtsi`, rpi-6.1.y).** On
+BCM2711 the V3D power domain (`BCM2835_POWER_DOMAIN_GRAFX_V3D`) is brought up by
+`bcm2835_asb_power_on(PM_GRAFX, ASB_V3D_M_CTRL, ASB_V3D_S_CTRL, PM_V3DRSTN)`. The PM_POWUP / inrush /
+memory-repair core sequence (`bcm2835_power_power_on`) is **skipped on BCM2711** (`if (power->rpivid_asb)
+return 0`) — the firmware already does it, which is why our mailbox `SET_DOMAIN_STATE` domain 10 ACKs.
+What the firmware property path does **not** do, and what `bcm2835_asb_power_on` still runs on BCM2711,
+is the missing piece:
+  1. **Deassert the V3D reset** — set `PM_V3DRSTN` (bit 6) in `PM_GRAFX` (offset `0x10c` in the PM block
+     at ARM PA `0xFE10_0000`), written with the **PM password** `0x5A000000` in the top byte.
+  2. **Release the two async AXI bridges** — clear `ASB_REQ_STOP` (bit 0) in `ASB_V3D_M_CTRL` (offset
+     `0x0c`) then `ASB_V3D_S_CTRL` (offset `0x08`), each written with the PM password, and wait for
+     `ASB_ACK` (bit 1) to clear. **The V3D ASB registers live in the `rpivid_asb` block, not the legacy
+     `asb` block** — in the DT the `pm` node's third reg range is `<0x7ec11000 0x20>` "rpivid_asb", and
+     `bcm2835_asb_control` routes `ASB_V3D_{S,M}_CTRL` to `power->rpivid_asb` on BCM2711 (ARM PA
+     `0xFEC1_1000`).
+
+Both bases are inside the `boot.rs` L1[3] Device-nGnRnE window (`0xC000_0000–0xFFFF_FFFF`) — no new MMU
+mapping. **The firmware power/rate/gate steps are KEPT** (ACKed-working, still necessary — they stand in
+for the skipped PM_POWUP sequence); the PM/ASB step is **added after them**, before the probe.
+
+**Implementation (`v3d.rs::enable_pm_asb`).** Announced-before-issue writes, PM-password discipline,
+poison-honest readbacks at each stage, a finite CNTPCT backstop on each ASB `ACK`-clear wait. Best-effort
+by design: a bridge that never ACKs (or reads poison) is logged and bring-up proceeds — the `IDENT0`
+probe that follows is the real verdict gate (it BUS-POISONs honestly if the block still did not decode).
+Nothing here can fault or hang, so QEMU (which models neither `rpivid_asb` nor V3D) stays on the honest
+**BLOCK-DOWN**: the ASB reads return 0, `ACK` is already clear, no wait fires. **On metal the
+discriminating expectation becomes BLOCK-UP** (a live V3D identity); if it still reads poison the probe
+fail-closes with `BUS-POISON` and the raw IDENT word feeds the next refinement — that is honest data, not
+a STOP.
+
+The new QEMU chain (verbatim), between the gate-enable and the probe:
+```
+:: V3D: PM/ASB deassert V3D reset — PM_GRAFX 0x00000000 -> set PM_V3DRSTN (pw) ::
+:: V3D: PM_GRAFX readback 0x00000000 ::
+:: V3D: PM/ASB release V3D master (ASB_V3D_M_CTRL) — cur 0x00000000 -> clear ASB_REQ_STOP (pw) ::
+:: V3D: PM/ASB V3D master (ASB_V3D_M_CTRL) readback 0x00000000 — ACK clear (bridge released) ::
+:: V3D: PM/ASB release V3D slave  (ASB_V3D_S_CTRL) — cur 0x00000000 -> clear ASB_REQ_STOP (pw) ::
+:: V3D: PM/ASB V3D slave  (ASB_V3D_S_CTRL) readback 0x00000000 — ACK clear (bridge released) ::
+:: V3D: probe verdict BLOCK-DOWN — hub IDENT0 = 0x00000000 (block absent/unpowered; expected in QEMU raspi4b) ...
+```
+
 ### References of record
 
 - Register layout: Linux `drivers/gpu/drm/v3d/v3d_regs.h` (hub + core + MMU offsets, field bits).
@@ -5549,6 +5607,9 @@ tags and reports BLOCK-DOWN). Knob-off byte-identity to baseline is preserved: e
 - Render-control-list packets: Mesa `src/broadcom/cle/v3d_packet_v33.xml` (4.2 encodings — the
   VC4-era packet numbers/sizes do **not** transfer).
 - Structure reference: librerpi/lk-overlay `v3d.c`.
+- PM / ASB power sequence (PI-V3D-3): Linux `drivers/soc/bcm/bcm2835-power.c` (`bcm2835_asb_power_on`,
+  `bcm2835_asb_control`; `PM_GRAFX`/`PM_V3DRSTN`/`PM_PASSWORD`, `ASB_V3D_{S,M}_CTRL`/`ASB_REQ_STOP`/
+  `ASB_ACK`) + `arch/arm/boot/dts/bcm2711.dtsi` (the `pm` node's `pm`/`asb`/`rpivid_asb` reg ranges).
 
 ### Gates green
 
