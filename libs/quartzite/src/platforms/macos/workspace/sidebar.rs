@@ -29,6 +29,11 @@ pub struct UnaMatrixNodeIvars {
     pub label: RefCell<String>,
     pub children: RefCell<Vec<Retained<UnaMatrixNode>>>,
     pub is_expanded: RefCell<bool>,
+    /// True when `node_id` is a directory on disk. Topology rebroadcasts carry
+    /// only *visible* rows, so a collapsed directory arrives childless —
+    /// expandability must come from the filesystem, not from loaded children,
+    /// or chevrons vanish after every rebuild.
+    pub is_dir: RefCell<bool>,
 }
 
 define_class!(
@@ -45,6 +50,7 @@ define_class!(
                 label: RefCell::new(String::new()),
                 children: RefCell::new(Vec::new()),
                 is_expanded: RefCell::new(false),
+                is_dir: RefCell::new(false),
             });
             unsafe { msg_send![super(this), init] }
         }
@@ -73,6 +79,9 @@ impl UnaMatrixNode {
         *node.ivars().node_id.borrow_mut() = rust_node.id.clone();
         *node.ivars().label.borrow_mut() = rust_node.label.clone();
         *node.ivars().is_expanded.borrow_mut() = rust_node.is_expanded;
+        *node.ivars().is_dir.borrow_mut() = std::fs::metadata(&rust_node.id)
+            .map(|m| m.is_dir())
+            .unwrap_or(false);
 
         let mut children = Vec::new();
         for child in &rust_node.children {
@@ -146,10 +155,13 @@ define_class!(
             item: &AnyObject,
         ) -> objc2::runtime::Bool {
             let node = unsafe { Retained::cast_unchecked::<UnaMatrixNode>(Retained::retain(item as *const AnyObject as *mut AnyObject).unwrap()) };
-            if node.ivars().children.borrow().is_empty() {
-                objc2::runtime::Bool::NO
-            } else {
+            // Directories are always expandable even when a rebuild delivered
+            // them childless (collapsed dirs carry no children in the
+            // visible-rows broadcast); their children arrive on expand.
+            if !node.ivars().children.borrow().is_empty() || *node.ivars().is_dir.borrow() {
                 objc2::runtime::Bool::YES
+            } else {
+                objc2::runtime::Bool::NO
             }
         }
 
