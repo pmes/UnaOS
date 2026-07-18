@@ -73,7 +73,8 @@ impl MacOSSpline {
         }
 
         // --- Lumen Left Pane (Sidebar) ---
-        let (sidebar_view, sidebar_delegate) = sidebar::create_sidebar(mtm, _workspace_tetra);
+        let (sidebar_view, sidebar_delegate) =
+            sidebar::create_sidebar(mtm, _workspace_tetra, tx_event.clone());
         let sidebar_vc: Allocated<NSViewController> = unsafe { msg_send![NSViewController::class(), alloc] };
         let sidebar_vc: Retained<NSViewController> = unsafe { msg_send![sidebar_vc, init] };
         sidebar_vc.setView(&sidebar_view);

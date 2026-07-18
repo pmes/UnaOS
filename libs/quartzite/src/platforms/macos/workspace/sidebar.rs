@@ -76,6 +76,11 @@ impl UnaMatrixNode {
 pub struct SidebarDelegateIvars {
     pub roots: RefCell<Vec<Retained<UnaMatrixNode>>>,
     pub outline_view: RefCell<Option<Retained<NSOutlineView>>>,
+    /// UI → brain sender. Selection changes fire `ToggleMatrixNode(id)` so the
+    /// brain sees file activations (the GTK/Qt sidebars already do this; the
+    /// macOS outline handled expand/collapse natively and never reported
+    /// clicks until now).
+    pub tx_event: RefCell<Option<async_channel::Sender<bandy::SMessage>>>,
 }
 
 define_class!(
@@ -90,6 +95,7 @@ define_class!(
             let this = this.set_ivars(SidebarDelegateIvars {
                 roots: RefCell::new(Vec::new()),
                 outline_view: RefCell::new(None),
+                tx_event: RefCell::new(None),
             });
             unsafe { msg_send![super(this), init] }
         }
@@ -163,6 +169,29 @@ define_class!(
 
     // --- Outline View Delegate ---
     unsafe impl NSOutlineViewDelegate for SidebarDelegate {
+        /// Fires on every selection change (single click). Reports the selected
+        /// node's id to the brain as `ToggleMatrixNode` — the brain decides what
+        /// a click means (file → editor load, directory → topology bookkeeping).
+        #[unsafe(method(outlineViewSelectionDidChange:))]
+        fn outline_view_selection_did_change(&self, _notification: &objc2_foundation::NSNotification) {
+            let Some(outline_view) = self.ivars().outline_view.borrow().clone() else { return };
+            let row: NSInteger = unsafe { msg_send![&*outline_view, selectedRow] };
+            if row < 0 {
+                return;
+            }
+            let item: *mut AnyObject = unsafe { msg_send![&*outline_view, itemAtRow: row] };
+            if item.is_null() {
+                return;
+            }
+            let node = unsafe {
+                Retained::cast_unchecked::<UnaMatrixNode>(Retained::retain(item).unwrap())
+            };
+            let id = node.ivars().node_id.borrow().clone();
+            if let Some(tx) = self.ivars().tx_event.borrow().as_ref() {
+                let _ = tx.try_send(bandy::SMessage::ToggleMatrixNode(id));
+            }
+        }
+
         #[unsafe(method_id(outlineView:viewForTableColumn:item:))]
         fn outline_view_view_for_table_column_item(
             &self,
@@ -276,10 +305,15 @@ unsafe impl NSControlTextEditingDelegate for SidebarDelegate {}
 // -----------------------------------------------------------------------------
 // ASSEMBLY
 // -----------------------------------------------------------------------------
-pub fn create_sidebar(_mtm: MainThreadMarker, workspace_state: &bandy::state::WorkspaceState) -> (Retained<NSView>, Retained<SidebarDelegate>) {
+pub fn create_sidebar(
+    _mtm: MainThreadMarker,
+    workspace_state: &bandy::state::WorkspaceState,
+    tx_event: async_channel::Sender<bandy::SMessage>,
+) -> (Retained<NSView>, Retained<SidebarDelegate>) {
     // 1. Instantiate the delegate
     let delegate: Allocated<SidebarDelegate> = unsafe { msg_send![SidebarDelegate::class(), alloc] };
     let delegate: Retained<SidebarDelegate> = unsafe { msg_send![delegate, init] };
+    *delegate.ivars().tx_event.borrow_mut() = Some(tx_event);
 
     // 1.5 Synchronous Initial Data Population
     if let bandy::state::ViewEntity::Topology(matrix_state) = &workspace_state.left_pane {
