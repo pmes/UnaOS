@@ -41,6 +41,16 @@
 //     lock). `notify_one`/`notify_all` must NOT add a second such nesting: they pop a waiter under
 //     the condvar lock but call `make_ready` only AFTER releasing it (the `Semaphore::post`
 //     discipline), so `notify_all` drains one waiter per lock acquisition.
+//
+// KERNEL-CLOCK layer (wall-clock timing): once `apic::calibrate` arms the local-APIC heartbeat at a
+// real 1 kHz (`apic::TICK_HZ`), a tick is a millisecond, so `sleep_ms` is just `sleep_ticks` fed
+// through `arch::ms_to_ticks`, and `JoinHandle::join_timeout` bounds a join by polling the
+// completion `Semaphore` with the new non-blocking `Semaphore::try_wait` between `sleep_ticks` naps.
+// `join_timeout` deliberately reuses ONLY the existing sleeper machinery (each nap is an ordinary
+// `sleep_ticks`) — it adds no new park kind, no dual-deadline, and no lock-handoff, so none of the
+// invariants above are touched. A timed-out joiner drops its handle while the joined task may still
+// hold its own `done_sem` `Arc` clone, so a later `post()` into an empty waiter list stays sound
+// (bumps the count on a soon-to-be-freed semaphore; no dangle, no leak).
 
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
@@ -754,6 +764,18 @@ pub fn spawn_joinable(
     JoinHandle { done, id }
 }
 
+/// Outcome of `JoinHandle::join_timeout`: the joined task finished within the deadline, or the
+/// deadline elapsed first (the joiner gave up; the task may still be running).
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[must_use]
+pub enum JoinResult {
+    /// The joined task's trampoline posted its completion permit before the deadline.
+    Completed,
+    /// The deadline elapsed with the task still unfinished. The handle is consumed either way, but
+    /// the joined task keeps running (and will free normally when it eventually returns).
+    TimedOut,
+}
+
 /// A handle to wait for a `spawn_joinable` task to finish. Holds a clone of the task's completion
 /// `Arc<Semaphore>`; `join()` blocks until the task's trampoline posts it. Single-shot: `join`
 /// consumes the handle (one join per task), and the handle is intentionally NOT `Clone` (the
@@ -787,6 +809,53 @@ impl JoinHandle {
             self.done.wait(),
             "JoinHandle::join() must be called from a scheduled task"
         );
+    }
+
+    /// Bounded join: block the current task until the joined task finishes OR `timeout_ticks` of this
+    /// CPU's local-APIC timer elapse, whichever comes first. Unlike `join`, a hung or never-returning
+    /// task can NOT trap the joiner forever — the deadline always releases it (`TimedOut`).
+    ///
+    /// Implementation: poll the completion `Semaphore` with `try_wait` between short `sleep_ticks`
+    /// naps, rather than parking on the semaphore's waiter list. This is what lets it be time-bounded
+    /// at all — a `wait()`-parked joiner has no deadline — and it deliberately reuses ONLY the
+    /// existing, invariant-preserving sleeper machinery (each nap is an ordinary `sleep_ticks`), so
+    /// it introduces no new park kind, no dual-deadline, and no lock-handoff. The trade is a wake
+    /// every `JOIN_POLL_TICKS` ticks while waiting; joins are rare and the timeout paths short, so the
+    /// cost is negligible. Poll granularity (and thus worst-case overshoot past a just-missed
+    /// completion) is one `JOIN_POLL_TICKS` window.
+    ///
+    /// MUST be called from a scheduled task, like `join`: it relies on `sleep_ticks` actually
+    /// blocking to advance the deadline. The assert rejects a call off the scheduler (e.g. the
+    /// unscheduled BSP) loudly — there `sleep_ticks` is a no-op, which would busy-spin the poll.
+    ///
+    /// `self` stays bound for the whole body: its `Arc` clone is what keeps the completion semaphore
+    /// alive while we poll it, exactly as `join` keeps it alive across the park. On `TimedOut` the
+    /// handle is dropped while the task may still hold its own `done_sem` clone — the semaphore stays
+    /// live until the task finishes and drops it, so a later `post()` into an empty waiter list is
+    /// sound (it just bumps the count on a soon-to-be-freed semaphore); no dangle, no leak.
+    #[must_use]
+    pub fn join_timeout(self, timeout_ticks: u64) -> JoinResult {
+        /// Poll cadence: how many ticks the joiner sleeps between completion checks.
+        const JOIN_POLL_TICKS: u64 = 2;
+
+        let cpu = percpu::this_cpu().cpu_index as usize;
+        assert!(
+            SCHED[cpu].current.load(Ordering::Acquire) != 0,
+            "JoinHandle::join_timeout() must be called from a scheduled task"
+        );
+
+        let mut remaining = timeout_ticks;
+        loop {
+            if self.done.try_wait() {
+                return JoinResult::Completed;
+            }
+            if remaining == 0 {
+                return JoinResult::TimedOut; // final check above already ran, so this is authoritative
+            }
+            let nap = JOIN_POLL_TICKS.min(remaining);
+            sleep_ticks(nap);
+            remaining -= nap;
+        }
     }
 }
 
@@ -937,6 +1006,16 @@ pub fn sleep_ticks(ticks: u64) {
     }
 }
 
+/// Block the current task for approximately `ms` milliseconds — `sleep_ticks` expressed in real time
+/// via the calibrated timebase. The local-APIC heartbeat is armed at `apic::TICK_HZ` (1 kHz once
+/// `apic::calibrate` has run), so `arch::ms_to_ticks` maps ms to ticks and the wake lands within one
+/// tick of the requested wall-clock delay on any machine. Before calibration the tick is ~0.8 ms
+/// under QEMU, so the sleep runs proportionally short (documented degradation, not a bug). Like
+/// `sleep_ticks`, a no-op outside a scheduled task.
+pub fn sleep_ms(ms: u64) {
+    sleep_ticks(crate::arch::ms_to_ticks(ms));
+}
+
 // ---------------------------------------------------------------------------------------------
 // Semaphore — the inter-thread blocking primitive (counting; FIFO waiters)
 // ---------------------------------------------------------------------------------------------
@@ -1064,6 +1143,28 @@ impl Semaphore {
             x86_64::instructions::interrupts::enable();
         }
         true
+    }
+
+    /// Non-blocking permit acquire: take a permit and return `true` if one is available RIGHT NOW,
+    /// else return `false` without blocking. This is exactly `wait()`'s fast path with the park
+    /// removed, so it is safe from ANY context (scheduled task, BSP, idle) — it never switches. Used
+    /// by `JoinHandle::join_timeout` to poll a completion semaphore between timed sleeps.
+    #[must_use]
+    pub fn try_wait(&self) -> bool {
+        let was_enabled = x86_64::instructions::interrupts::are_enabled();
+        x86_64::instructions::interrupts::disable();
+        self.lock_raw();
+        let got = if self.count.load(Ordering::Relaxed) > 0 {
+            self.count.fetch_sub(1, Ordering::Relaxed);
+            true
+        } else {
+            false
+        };
+        self.unlock_raw();
+        if was_enabled {
+            x86_64::instructions::interrupts::enable();
+        }
+        got
     }
 
     /// Release a permit: wake one FIFO waiter if any, else increment the count. Wakes across CPUs.
@@ -2007,6 +2108,14 @@ pub fn start_demo(online_aps: &[usize]) {
     spawn("busy-A", demo_busy, encode(cpu_busy, b'A'), cpu_busy, PRIO_NORMAL);
     spawn("busy-B", demo_busy, encode(cpu_busy, b'B'), cpu_busy, PRIO_NORMAL);
 
+    // KERNEL-CLOCK witnesses (M2 sleep_ms, M3 join_timeout). Both are sleep-driven and self-checking,
+    // so they run on ANY topology (even a single AP — unlike the RwLock showcase). Pinned to the LAST
+    // AP to keep them off the busy pair on AP[0], so the busy tasks don't perturb the ms measurement;
+    // with one AP they share it, which the 2x tolerance absorbs.
+    let cpu_clock = online_aps[online_aps.len() - 1];
+    spawn("sleep-ms", demo_sleep_ms, 0, cpu_clock, PRIO_NORMAL);
+    spawn("join-tmo", demo_join_timeout, 0, cpu_clock, PRIO_NORMAL);
+
     // RwLock (writer-preferring, composed from Mutex + 2 Condvars): a writer bumps a shared (u64,u64)
     // non-atomically while RW_READERS readers read-share it and assert the two halves match. A torn
     // read would prove the lock let a reader in during a write. Each reader holds the read section
@@ -2128,6 +2237,95 @@ fn demo_rw_verifier(cpu: usize) {
         maxr,
         if pass { "PASS" } else { "FAIL" },
         witness
+    );
+    DEMO_DONE.fetch_add(1, Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------------------------
+// KERNEL-CLOCK demo witnesses (M2 sleep_ms, M3 join_timeout)
+// ---------------------------------------------------------------------------------------------
+
+/// M2 target: sleep this many ms and measure the actual delay against the invariant TSC.
+const SLEEP_MS_TARGET: u64 = 100;
+
+/// M2 self-test: sleep a known wall-clock interval via `sleep_ms`, measure the ACTUAL elapsed time
+/// against an INDEPENDENT reference (the invariant TSC, read with `now_cycles`, which advances
+/// regardless of interrupt delivery), and print a self-checking `=> PASS/FAIL`. The TSC is the right
+/// reference precisely because it does NOT derive from the APIC-timer ISR the sleep depends on, so a
+/// broken calibration (wrong tick rate) or a lost wake shows up as a wildly wrong measured duration.
+///
+/// Tolerance is a generous 2x band: under QEMU/TCG the timer-delivery cadence is loose, but a gross
+/// miss (uncalibrated tick ~0.8 ms, or a hang) falls well outside it. Cannot hang — the `sleep_ms`
+/// bounds it — so no watchdog is needed. If the TSC never calibrated (no PM timer), there is no wall
+/// reference, so it reports SKIPPED rather than a meaningless verdict.
+fn demo_sleep_ms(_arg: usize) {
+    let cpu = percpu::this_cpu().cpu_index as usize;
+    let hz = apic::tsc_hz();
+    if hz == 0 {
+        serial_println!("SLEEPMS: [cpu{}] SKIPPED (TSC uncalibrated; no wall-clock reference)", cpu);
+        DEMO_DONE.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    let t0 = crate::arch::now_cycles();
+    sleep_ms(SLEEP_MS_TARGET);
+    let elapsed_ms = (crate::arch::now_cycles().wrapping_sub(t0) as u128 * 1000 / hz as u128) as u64;
+    let (lo, hi) = (SLEEP_MS_TARGET / 2, SLEEP_MS_TARGET * 2);
+    let pass = (lo..=hi).contains(&elapsed_ms);
+    serial_println!(
+        "SLEEPMS: [cpu{}] slept {} ms (target {}, tol [{},{}], TSC ref) => {}",
+        cpu,
+        elapsed_ms,
+        SLEEP_MS_TARGET,
+        lo,
+        hi,
+        if pass { "PASS" } else { "FAIL" }
+    );
+    DEMO_DONE.fetch_add(1, Ordering::Relaxed);
+}
+
+// M3 (join_timeout) demo tuning. A "hung" stand-in sleeps far past the joiner's short timeout (so the
+// joiner must give up => TimedOut); a "quick" task finishes well within a long timeout (=> Completed).
+const JT_TIMEOUT_MS: u64 = 40; // joiner's patience for the hung task
+const JT_HANG_MS: u64 = 400; // hung task's lifetime (>> JT_TIMEOUT_MS, so the joiner times out)
+const JT_WAIT_MS: u64 = 400; // joiner's patience for the quick task (>> JT_QUICK_MS)
+const JT_QUICK_MS: u64 = 15; // quick task's lifetime (<< JT_WAIT_MS, so the joiner sees Completed)
+
+/// A stand-in for a hung / never-returning task: it simply outlives the joiner's timeout. (It does
+/// eventually return so it frees within the test window rather than truly leaking — the join side has
+/// already observed `TimedOut` long before.)
+fn demo_jt_hung(_arg: usize) {
+    sleep_ms(JT_HANG_MS);
+}
+
+/// A task that finishes promptly, so a join with a generous timeout observes `Completed`.
+fn demo_jt_quick(_arg: usize) {
+    sleep_ms(JT_QUICK_MS);
+}
+
+/// M3 self-test: exercise BOTH `join_timeout` outcomes from one coordinator task. (a) join a hung
+/// task with a short timeout — must return `TimedOut` (the whole point: a hung task can't trap the
+/// joiner). (b) join a quick task with a generous timeout — must return `Completed`. Both joined
+/// tasks are pinned to this CPU, so the coordinator's timed sleeps yield the core to them and the
+/// scheduler interleaves all three. PASS = TimedOut AND Completed, exactly. Bounded by both timeouts,
+/// so it cannot hang — no watchdog needed.
+fn demo_join_timeout(_arg: usize) {
+    let cpu = percpu::this_cpu().cpu_index as usize;
+
+    let hung = spawn_joinable("jt-hung", demo_jt_hung, 0, cpu, PRIO_NORMAL);
+    let r_hung = hung.join_timeout(crate::arch::ms_to_ticks(JT_TIMEOUT_MS));
+
+    let quick = spawn_joinable("jt-quick", demo_jt_quick, 0, cpu, PRIO_NORMAL);
+    let r_quick = quick.join_timeout(crate::arch::ms_to_ticks(JT_WAIT_MS));
+
+    let pass = r_hung == JoinResult::TimedOut && r_quick == JoinResult::Completed;
+    serial_println!(
+        "JOINTMO: [cpu{}] hung(t/o {}ms)=>{:?}, quick(t/o {}ms)=>{:?} => {}",
+        cpu,
+        JT_TIMEOUT_MS,
+        r_hung,
+        JT_WAIT_MS,
+        r_quick,
+        if pass { "PASS" } else { "FAIL" }
     );
     DEMO_DONE.fetch_add(1, Ordering::Relaxed);
 }
