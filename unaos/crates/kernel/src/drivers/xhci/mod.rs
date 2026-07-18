@@ -3770,6 +3770,9 @@ impl XhciController {
         *crate::drivers::block::BLOCK_DEVICE.lock() = Some(crate::drivers::block::BlockDeviceInfo {
             slot_id: slot, block_size, num_blocks, vendor, product,
         });
+        // GUI-WITNESS: the USB block device is up (geometry published). One of the "did storage come
+        // up?" milestones a silent boot otherwise can't answer on-panel.
+        crate::bootlog::record("block:up");
         self.storage_note = "ready";
         Ok(())
     }
@@ -3889,6 +3892,9 @@ impl XhciController {
                 Ok(1) => {}
                 other => {
                     serial_println!(":: U2.5: FTDI setup failed (SET_CONFIGURATION {:?}) ::", other);
+                    // GUI-WITNESS: the console path was reached but bring-up FAILED — the whole point
+                    // of the ring is to split "console never armed" from "armed but TX never left."
+                    crate::bootlog::record("ftdi:failed");
                     return;
                 }
             }
@@ -3905,11 +3911,17 @@ impl XhciController {
                     Ok(1) => {}
                     other => {
                         serial_println!(":: U2.5: FTDI setup failed ({} {:?}) ::", name, other);
+                        // GUI-WITNESS: reached the console path, vendor setup FAILED.
+                        crate::bootlog::record("ftdi:failed");
                         return;
                     }
                 }
             }
             serial_println!(":: U2.5: FTDI console up (0403:6001, 115200 8N1) ::");
+            // GUI-WITNESS: the FTDI console reported UP. If the panel shows this but a second host
+            // sees no bytes, the silence is post-arm TX, not a bring-up failure. That split is the
+            // bench ask this ring exists to answer.
+            crate::bootlog::record("ftdi:console-up");
             ftdi::set_live(true);
         }
         self.drain_ftdi();

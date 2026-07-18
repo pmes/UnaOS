@@ -783,6 +783,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             }
             // Once storage is up, mount + log the FAT volume geometry (one-shot).
             unaos_kernel::fs::fat::probe_once();
+            // GUI-WITNESS M3: re-dump the boot-milestone ring to serial on growth. A usbdebug-class
+            // run surfaces the exact recorder ring via serial (M3 proof path), including the FTDI/block
+            // milestones recorded from inside this loop. Serial-only + bounded.
+            unaos_kernel::bootlog::service_serial_dump();
             // FLIGHT-RECORDER (x86): flush the captured serial boot log to UNAOS.LOG (usbdebug metal
             // boot benefits from an on-disk log too). Gated on storage; throttled; never blocks boot.
             #[cfg(target_arch = "x86_64")]
@@ -928,6 +932,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     console.draw(&mut pal);
     pal.render();
 
+    // GUI-WITNESS: the last milestone — the GUI is about to take the panel. Record it BEFORE the
+    // detach so the ring captures the exact moment fbcon stops mirroring serial to the screen; from
+    // here the `bootlog` shell verb is the operator's only witness surface (serial is silent on GUI
+    // builds and the boot log is now painted over).
+    unaos_kernel::bootlog::record("gui:handoff");
+
     // The GUI now owns the screen — stop fbcon mirroring serial output onto the framebuffer
     // (a panic re-enables it). Boot diagnostics up to this first frame stay on screen until now.
     unaos_kernel::video::fbcon::detach();
@@ -964,6 +974,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // Once storage is up, mount + log the FAT volume geometry (one-shot). Runs with the xHCI
         // lock released; read_block re-locks it briefly, so there is no nested-lock hazard.
         unaos_kernel::fs::fat::probe_once();
+        // GUI-WITNESS M3 (witness knob): re-dump the boot-milestone ring to serial whenever it grows.
+        // On QEMU (serial live) this makes the recorded ring — including the FTDI/block milestones that
+        // land from inside this loop — verifiable in serial.log without keyboard input, the M3 proof
+        // path. Absent from a real metal GUI build (not witness); there the `bootlog` shell verb reads
+        // the same ring on-panel. Serial-only + bounded (one print per new milestone).
+        #[cfg(feature = "witness")]
+        unaos_kernel::bootlog::service_serial_dump();
         // FLIGHT-RECORDER (x86): flush the captured serial boot log to UNAOS.LOG on the FAT volume so
         // a consumer who booted the vm-image (no serial capture) can copy the log off afterward.
         // Gated on storage internally; re-flushes on growth, throttled; never blocks boot.

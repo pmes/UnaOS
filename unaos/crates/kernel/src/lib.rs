@@ -69,6 +69,12 @@ pub mod flight_recorder;
 #[cfg(feature = "rast")]
 pub mod rast_demo;
 
+// GUI-WITNESS M1: the boot-milestone recorder — a lock-light, heap-free ring of short milestone
+// tags stamped with arch::ms(), written from existing milestone call sites and surfaced on GUI
+// builds (where serial is silent and fbcon detaches) via the `bootlog` shell verb. Always linked;
+// its record() calls are additive at each site.
+pub mod bootlog;
+
 pub mod pal;
 pub mod ui;
 pub mod video;
