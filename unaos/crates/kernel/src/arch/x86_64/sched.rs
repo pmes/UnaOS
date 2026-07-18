@@ -79,9 +79,11 @@ const QUANTUM_TICKS: u32 = 4;
 /// Priority aging (anti-starvation). A ready task that has WAITED in the run queue this many local
 /// ticks without being dispatched is promoted one effective level toward the top (its base priority
 /// is unchanged). Repeated, a low task under continuous higher-priority load climbs to parity with
-/// the load and runs, then drops back to base on dispatch — bounding starvation to ~`AGE_TICKS` per
-/// level it must climb. (Bound is exact when no level between base and the contended level drains;
-/// finite-but-larger under bursty mixed load, since a dispatch at an intermediate level re-bases.)
+/// the load and runs; on dispatch it DECAYS one effective level (not all the way to base — the
+/// `current_level`/`effective_level` refinement, see `RunQueue::requeue`/`age`), so it re-climbs at
+/// most one level per turn. This holds the starvation bound at ~`AGE_TICKS` per level the task must
+/// climb EVEN under bursty mixed load where intermediate levels drain (before the refinement a
+/// dispatch at an intermediate level re-based the whole climb, making the bound finite-but-larger).
 const AGE_TICKS: u32 = 16;
 
 /// How often the scheduler runs the aging sweep, in local ticks. Kept well below `AGE_TICKS` so the
@@ -204,10 +206,20 @@ pub struct Task {
     /// Aging never touches this — it only transiently raises the *level* a task sits in (below).
     priority: u8,
     /// Ticks this task has WAITED in a run queue since its last enqueue, for priority aging. Touched
-    /// ONLY under the owning CPU's run-queue spinlock (zeroed by `RunQueue::push` on every enqueue,
-    /// accrued + consumed by `RunQueue::age` on that CPU). NEVER read cross-CPU — unlike `priority`,
-    /// it is mutable and lock-protected, so it must not be read off the owning CPU.
+    /// ONLY under the owning CPU's run-queue spinlock (zeroed by `RunQueue::push`/`requeue` on every
+    /// enqueue, accrued + consumed by `RunQueue::age` on that CPU). NEVER read cross-CPU — unlike
+    /// `priority`, it is mutable and lock-protected, so it must not be read off the owning CPU.
     wait_ticks: u32,
+    /// Transient EFFECTIVE level this task currently sits at in the run queue (`priority..NUM_PRIORITIES`).
+    /// The refinement over plain reset-on-dispatch aging: a task always occupies `levels[effective_level]`,
+    /// and the run-queue placement operations keep this field == that index. A FRESH enqueue
+    /// (`RunQueue::push`, i.e. spawn / wake) re-bases it to `priority`; the aging sweep (`RunQueue::age`)
+    /// bumps it up one on promotion; a RE-ENQUEUE after a dispatch (`RunQueue::requeue`, i.e. yield /
+    /// preempt) DECAYS it toward base by one level rather than all the way — so an intermediate dispatch
+    /// no longer erases a multi-level promotion, tightening the starvation bound (see `RunQueue::age`).
+    /// Same discipline as `wait_ticks`: lock-protected, owning-CPU-only, NEVER read cross-CPU (the base
+    /// `priority` — not this — is what `poke_for`/`make_ready`/the dispatch publish read lock-free).
+    effective_level: u8,
     /// Completion signal for `join()`, or `None` for a fire-and-forget task. A joinable task carries
     /// a clone of the same `Arc<Semaphore>` (0 permits) held by its `JoinHandle`; the trampoline
     /// `post()`s it after `entry` returns. The Arc — not a `'static` lifetime — keeps the semaphore
@@ -329,12 +341,32 @@ impl RunQueue {
     fn with_capacity(cap: usize) -> Self {
         RunQueue { levels: core::array::from_fn(|_| VecDeque::with_capacity(cap)) }
     }
-    /// ENQUEUE a task at its BASE priority level (FIFO within the level), clamped in range, and
-    /// reset its aging clock — every enqueue (spawn / wake / re-enqueue after preempt/yield) zeroes
-    /// `wait_ticks`, so a task only ages while it sits WAITING and re-bases the moment it is requeued.
+    /// FRESH ENQUEUE at the task's BASE priority level (FIFO within the level), clamped in range, and
+    /// reset its aging state. Used on spawn and on WAKE (`make_ready`) — a task that just became
+    /// runnable (newly created, or unblocked after doing its work) starts over at base, so strict
+    /// priority is preserved for genuinely new work. Zeroes `wait_ticks` (it only ages while WAITING)
+    /// and re-bases `effective_level` to the base level. NOT used for a mere yield/preempt re-enqueue
+    /// (that is `requeue`, which preserves promotion progress).
     fn push(&mut self, mut task: Box<Task>) {
         task.wait_ticks = 0;
         let level = (task.priority as usize).min(NUM_PRIORITIES - 1);
+        task.effective_level = level as u8;
+        self.levels[level].push_back(task);
+    }
+    /// RE-ENQUEUE a task that switched back READY from a DISPATCH (yield or timer preempt), decaying
+    /// its transient effective level by ONE toward base rather than resetting all the way (as `push`
+    /// would). This is the `current_level` refinement: an intermediate dispatch — the task got a slice
+    /// while climbing, e.g. because a contended level momentarily drained under bursty load — no longer
+    /// erases a multi-level promotion, so the task re-climbs at most one level instead of from base.
+    /// Base `priority` is untouched (immutable); the new level is clamped to `>= base`, so a task never
+    /// decays below its own priority and, absent contention, settles back at base within a few
+    /// dispatches (strict priority restored). Resets the aging clock for the new level.
+    fn requeue(&mut self, mut task: Box<Task>) {
+        let base = (task.priority as usize).min(NUM_PRIORITIES - 1);
+        let cur = (task.effective_level as usize).min(NUM_PRIORITIES - 1);
+        let level = cur.saturating_sub(1).max(base);
+        task.wait_ticks = 0;
+        task.effective_level = level as u8;
         self.levels[level].push_back(task);
     }
     /// Dequeue the front of the HIGHEST non-empty level (strict priority over the effective level,
@@ -356,6 +388,14 @@ impl RunQueue {
     /// sweep, no runaway multi-level jump). Within a level, popping exactly `n = len()` from the
     /// front and pushing kept tasks to the back rotates the deque full-circle, preserving FIFO.
     /// Relocation is a raw `VecDeque` move that leaves `priority` (base) untouched — NOT `push`.
+    ///
+    /// `effective_level` is kept == the level the task actually occupies (bumped on promotion), so a
+    /// later `requeue` after a dispatch can decay it by ONE level instead of dropping it to base. This
+    /// is the refinement: without it, reset-on-dispatch made the starvation bound `~2*AGE_TICKS` per
+    /// level only when NO intermediate level drains, blowing up under bursty mixed load (a dispatch at
+    /// an intermediate level re-based the climb); preserving the level across a dispatch caps the
+    /// re-climb at one level, so the bound holds at `~2*AGE_TICKS` per level regardless of intermediate
+    /// drains.
     fn age(&mut self, elapsed: u32) {
         for level in (0..NUM_PRIORITIES - 1).rev() {
             let n = self.levels[level].len();
@@ -365,8 +405,13 @@ impl RunQueue {
                 if task.wait_ticks >= AGE_TICKS {
                     task.wait_ticks -= AGE_TICKS; // carry surplus credit, don't discard it
                     debug_assert!(level + 1 < NUM_PRIORITIES, "age: promotion above top level");
+                    task.effective_level = (level + 1) as u8; // track the RELOCATE destination
                     self.levels[level + 1].push_back(task); // RELOCATE up one level (base unchanged)
                 } else {
+                    debug_assert_eq!(
+                        task.effective_level as usize, level,
+                        "age: effective_level out of sync with occupied level"
+                    );
                     self.levels[level].push_back(task);
                 }
             }
@@ -534,6 +579,7 @@ fn spawn_inner(
         cpu: target_cpu as u32,
         priority,
         wait_ticks: 0, // re-zeroed by push() on every enqueue; this satisfies the struct literal
+        effective_level: 0, // re-based to `priority` by push() on enqueue (just below)
         done_sem,
         user_entry: 0,
         user_rsp: 0,
@@ -726,6 +772,7 @@ fn spawn_user_inner(
         cpu: target_cpu as u32,
         priority: PRIO_NORMAL,
         wait_ticks: 0,
+        effective_level: 0, // re-based to `priority` by push() on enqueue (just below)
         done_sem: None,
         user_entry,
         user_rsp,
@@ -1898,9 +1945,11 @@ fn run() -> ! {
                             }
                             drop(task); // frees the kstack; the interrupt frame on it is abandoned
                         } else {
-                            // Rotate to the back of its priority level.
+                            // Rotate to the back of its (decayed) effective level: `requeue` steps the
+                            // transient promotion down by one toward base rather than re-basing, so a
+                            // task dispatched mid-climb re-climbs at most one level (the aging refinement).
                             task.state.store(STATE_READY, Ordering::Release);
-                            RUN_QUEUES[cpu].lock().push(task);
+                            RUN_QUEUES[cpu].lock().requeue(task);
                         }
                     }
                 }
