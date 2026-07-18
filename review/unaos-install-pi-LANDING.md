@@ -78,7 +78,9 @@ HOST-VERIFY: PASS
 - `./arroyo check` both arches — GREEN (default, no piinstall).
 - Knob matrix (`piinstall` / `piinstall_arm` / `piinstall_confirm`) — all compile clean on aarch64.
 - Knob-off `./arroyo kernel8-test 35` — **0 FAIL**, `CAPSTONE COMPLETE — all 6 sync primitives verified`.
-  Functional identity: `piinstall*` default OFF ⇒ the module + call site + engine all compile out.
+  Functional identity: `piinstall*` default OFF ⇒ the module + call site + engine all compile out; all machine
+  code + data unchanged. As with PI-USB, the only possible delta from baseline is embedded panic-`Location.line`
+  u32s shifted by the 8-line gated `kernel_main` insertion — a source-line number, never code or behavior.
 - M3 live witness — in-kernel PASS + host-side `HOST-VERIFY: PASS` (above).
 - `./arroyo test-arm 22` (exit 0) + `UNAOS_GICV3=1 ./arroyo test-arm 40` — **0 FAIL**, CAPSTONE 6/6.
 - `./arroyo test 22` (x86) — **0 FAIL**.

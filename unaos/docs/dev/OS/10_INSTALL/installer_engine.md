@@ -226,8 +226,9 @@ about-to-destroy announcement are exactly the guard for that; a metal install le
 card, never the boot card.
 
 **Knob-off identity.** `piinstall*` default OFF ⇒ the `install/pi` module, the `main.rs` call site, and the
-arch-neutral engine all vanish; the `kernel8` image is byte-identical to baseline and the `kernel8-test`
-battery is functionally unchanged (0 FAIL).
+arch-neutral engine all compile out; all machine code + data are unchanged and the `kernel8-test` battery is
+0 FAIL. As with PI-USB, the only possible delta from baseline is embedded panic-`Location.line` u32s shifted
+by the 8-line gated insertion in `kernel_main` — a source-line number, never code or behavior.
 
 ## What later rungs still owe
 

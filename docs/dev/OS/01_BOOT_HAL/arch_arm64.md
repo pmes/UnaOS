@@ -6063,8 +6063,10 @@ mirroring `sdmmc / sdmmc_arm / install_target`, plus an ABOUT-TO-DESTROY announc
 - **Gate 3 `piinstall_confirm`** — the destructive-confirm gate: the about-to-destroy line, then
   GPT → zero-ESP-metadata → FAT32 → payload → sha extent-verify → `:: INSTALL: pi emmc2 gpt+fat32+copy verify => PASS ::`.
 
-Each feature implies the previous; a plain build compiles NONE of it and the `kernel8` image is byte-identical
-to baseline (module + call site + engine all vanish).
+Each feature implies the previous; a plain build compiles NONE of it (module + call site + engine all vanish),
+so all machine code + data are unchanged — the only possible delta from baseline is embedded
+panic-`Location.line` u32s shifted by the 8-line gated insertion in `kernel_main` (the PI-USB precedent), never
+code or behavior.
 
 ### QEMU-live witness + host-side verification
 
