@@ -995,6 +995,14 @@ impl Controller {
             );
             return;
         };
+        // EHCI-TRACKPAD M1: the Apple vendor-multitouch interface stays silent until the bcm5974
+        // "Wellspring" mode switch. Fire it BEFORE arming so the first polls catch the stream. The
+        // switch is gated on `vendor_mt` (Report ID 0x44 + vendor page 0xFF00) — QEMU's usb-tablet
+        // is a standard absolute pointer, never `vendor_mt`, so QEMU never takes this path. A
+        // STALL/timeout on any stage is non-fatal (traced, then arm regardless).
+        if layout.vendor_mt {
+            self.bcm5974_mode_switch(t, intf);
+        }
         self.arm_interrupt_ep(t, ep, mps.min(64), false, false, Some(layout));
         if layout.vendor_mt {
             // EHCI-5 M1: the Apple vendor-multitouch interface (Report ID 0x44, page 0xFF00). The
@@ -1014,6 +1022,63 @@ impl Controller {
                 layout.btn_off, layout.btn_count, layout.report_id, layout.total_bits,
                 if layout.finger_size != 0 { ", multitouch" } else { "" },
             );
+        }
+    }
+
+    /// EHCI-TRACKPAD M1 — the bcm5974 "Wellspring" vendor mode switch. Mirrors the Linux bcm5974
+    /// driver's `bcm5974_wellspring_mode(on=true)`, run over EP0 through the same overlay-direct /
+    /// chain-mode control path every other request uses:
+    ///   1. GET_REPORT(Feature): bmRequestType 0xA1 (IN|CLASS|INTERFACE), bRequest 0x01,
+    ///      wValue 0x0300 (Feature report, id 0), wIndex 0, read 8 bytes into `data_buf`.
+    ///   2. `data_buf[0] = 0x01` (VENDOR/wellspring mode; 0x08 is the NORMAL single-touch mode).
+    ///   3. SET_REPORT(Feature): bmRequestType 0x21 (OUT|CLASS|INTERFACE), bRequest 0x09,
+    ///      wValue 0x0300, wIndex 0, write the same 8 bytes back.
+    /// Each stage's status is logged. Any stall/timeout is NON-FATAL: a firmware that already
+    /// streams needs no switch, so a failed handshake must not un-arm the endpoint — we trace and
+    /// let the caller arm regardless. Only ever called on a recognised `vendor_mt` interface, so
+    /// QEMU (whose usb-tablet is a standard absolute pointer) never reaches this code.
+    unsafe fn bcm5974_mode_switch(&mut self, t: &Target, intf: u8) {
+        // Stage 1 — read the current feature report.
+        let read = self.control(
+            t, 0xA1, BCM5974_MODE_READ_REQ, BCM5974_MODE_REQ_VALUE, BCM5974_MODE_REQ_INDEX,
+            BCM5974_MODE_LEN, true,
+        );
+        match read {
+            Ok(got) => {
+                let n = (got as usize).min(BCM5974_MODE_LEN as usize);
+                let cur = if n > 0 { *self.data_buf } else { 0 };
+                serial_println!(
+                    ":: EHCI-HID: [{}] M1 bcm5974 GET_REPORT(feature) addr={} intf={} got={}b byte0={:#04x} == witness ::",
+                    self.idx, t.addr, intf, got, cur
+                );
+            }
+            Err(e) => {
+                // A device may not answer the read yet still accept the write (Linux ignores a
+                // short/failed read too). Seed the buffer to a known state and press on.
+                serial_println!(
+                    ":: EHCI-HID: [{}] M1 bcm5974 GET_REPORT(feature) addr={} intf={} FAILED ({}) — writing anyway ::",
+                    self.idx, t.addr, intf, e
+                );
+                for k in 0..BCM5974_MODE_LEN as usize {
+                    self.data_buf.add(k).write(0);
+                }
+            }
+        }
+        // Stage 2 — flip byte 0 to the raw-multitouch selector.
+        self.data_buf.write(BCM5974_MODE_VENDOR);
+        // Stage 3 — write the report back (SET_REPORT, class, interface recipient).
+        match self.control(
+            t, 0x21, BCM5974_MODE_WRITE_REQ, BCM5974_MODE_REQ_VALUE, BCM5974_MODE_REQ_INDEX,
+            BCM5974_MODE_LEN, false,
+        ) {
+            Ok(_) => serial_println!(
+                ":: EHCI-HID: [{}] M1 bcm5974 SET_REPORT(feature) addr={} intf={} mode={:#04x} — multitouch stream requested == witness ::",
+                self.idx, t.addr, intf, BCM5974_MODE_VENDOR
+            ),
+            Err(e) => serial_println!(
+                ":: EHCI-HID: [{}] M1 bcm5974 SET_REPORT(feature) addr={} intf={} FAILED ({}) — endpoint armed, stream may stay silent ::",
+                self.idx, t.addr, intf, e
+            ),
         }
     }
 
@@ -1322,6 +1387,22 @@ const UP_VENDOR: u16 = 0xFF00;
 /// Least opaque-vendor Input size (bits) that counts as a real multitouch blob rather than a
 /// stray one-byte vendor field — 8 bytes. Below this we do NOT claim the interface is a trackpad.
 const VMT_MIN_VENDOR_BITS: u32 = 64;
+
+// EHCI-TRACKPAD M1 — the bcm5974 "Wellspring" vendor mode switch (CONFIRM AT METAL).
+// The Apple internal trackpad (05ac:0262) enumerates and ARMS, but its vendor-multitouch
+// interface stays SILENT until this class feature-report handshake flips it out of the
+// single-touch compatibility mode into the raw multitouch stream. The constants are the Linux
+// bcm5974 driver's (`bcm5974_wellspring_mode`): read the feature report, overwrite byte 0 with
+// the mode selector, write it back. wIndex is the driver's REQUEST_INDEX (0) verbatim — the
+// value proven on real MacBooks; the interface number is logged alongside so a sitting can
+// retry with `intf` if index 0 STALLs on this exact 0262.
+const BCM5974_MODE_READ_REQ: u8 = 0x01; // HID class GET_REPORT
+const BCM5974_MODE_WRITE_REQ: u8 = 0x09; // HID class SET_REPORT
+const BCM5974_MODE_REQ_VALUE: u16 = 0x0300; // wValue: report type 3 (Feature), report id 0
+const BCM5974_MODE_REQ_INDEX: u16 = 0x0000; // wIndex: bcm5974 REQUEST_INDEX (NOT the intf number)
+const BCM5974_MODE_LEN: u16 = 8; // feature report length
+const BCM5974_MODE_VENDOR: u8 = 0x01; // byte 0 = raw multitouch (wellspring) mode
+                                      // (0x08 would be the NORMAL single-touch compatibility mode)
 
 // EHCI-5 vendor-multitouch decode HYPOTHESIS (bcm5974 TYPE2 lead — CONFIRM AT METAL).
 // The Apple 0x44 report is opaque: its HID descriptor gives the total report size, not which
