@@ -153,7 +153,7 @@ pub fn create_vessel_window(
     (window, window_delegate)
 }
 
-pub fn create_window(mtm: MainThreadMarker) -> (Retained<NSWindow>, Retained<WindowDelegate>, Retained<ToolbarDelegate>) {
+pub fn create_window(mtm: MainThreadMarker, title: &str) -> (Retained<NSWindow>, Retained<WindowDelegate>, Retained<ToolbarDelegate>) {
     // 1. Allocate and initialize the Window Delegate
     let window_delegate: Allocated<WindowDelegate> = unsafe { msg_send![WindowDelegate::class(), alloc] };
     let window_delegate: Retained<WindowDelegate> = unsafe { msg_send![window_delegate, init] };
@@ -176,7 +176,7 @@ pub fn create_window(mtm: MainThreadMarker) -> (Retained<NSWindow>, Retained<Win
         )
     };
 
-    window.setTitle(&NSString::from_str("UnaOS: Lumen"));
+    window.setTitle(&NSString::from_str(title));
     window.setTitlebarAppearsTransparent(true);
     window.setDelegate(Some(ProtocolObject::from_ref(&*window_delegate)));
 

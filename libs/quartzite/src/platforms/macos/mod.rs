@@ -67,6 +67,10 @@ struct AppDelegateIvars {
     vessel: RefCell<Option<VesselConfig>>,
     vessel_view: RefCell<Option<Retained<NSView>>>,
 
+    // Workspace-window title, derived from the vessel's app id in `Backend::new`
+    // (e.g. "org.unaos.lumen" → "UnaOS: Lumen").
+    window_title: RefCell<String>,
+
     window: RefCell<Option<Retained<NSWindow>>>,
     // Holding the delegate to prevent dropping
     window_delegate: RefCell<Option<Retained<window_chrome::WindowDelegate>>>,
@@ -98,6 +102,8 @@ define_class!(
 
                 vessel: RefCell::new(None),
                 vessel_view: RefCell::new(None),
+
+                window_title: RefCell::new(String::from("UnaOS")),
 
                 window: RefCell::new(None),
                 window_delegate: RefCell::new(None),
@@ -221,7 +227,8 @@ define_class!(
             }
 
             // 1. Create the native window through our chrome abstraction
-            let (window, window_delegate, toolbar_delegate) = window_chrome::create_window(mtm);
+            let (window, window_delegate, toolbar_delegate) =
+                window_chrome::create_window(mtm, &self.ivars().window_title.borrow());
 
             // 2. Invoke the bootstrap closure to get the root view
             if let Some(bootstrap_fn) = self.ivars().bootstrap.borrow_mut().take() {
@@ -268,6 +275,10 @@ define_class!(
             // 4. Show the window
             window.makeKeyAndOrderFront(None::<&AnyObject>);
             unsafe {
+                // Installing the split-view content view lets AppKit shrink the
+                // window to the panes' minimal fitting size ("opens collapsed").
+                // Re-assert the intended workspace size before centering.
+                let _: () = msg_send![&window, setContentSize: objc2_foundation::NSSize::new(1200.0, 800.0)];
                 let _: () = msg_send![&window, center];
                 // Same burial hazard as the vessel path above: launched from a
                 // terminal shell there is no active app, so order-front alone
@@ -323,6 +334,16 @@ impl Backend {
         // Allocate and initialize the custom delegate
         let delegate: Allocated<AppDelegate> = unsafe { msg_send![AppDelegate::class(), alloc] };
         let delegate: Retained<AppDelegate> = unsafe { msg_send![delegate, init] };
+
+        // Derive the window title from the app id's last segment, first letter
+        // uppercased ("org.unaos.lumen" → "UnaOS: Lumen").
+        let seg = _app_id.rsplit('.').next().unwrap_or(_app_id);
+        let mut chars = seg.chars();
+        let title = match chars.next() {
+            Some(c) => format!("UnaOS: {}{}", c.to_uppercase(), chars.as_str()),
+            None => String::from("UnaOS"),
+        };
+        *delegate.ivars().window_title.borrow_mut() = title;
 
         // Attach the bootstrap closure and dependencies
         *delegate.ivars().bootstrap.borrow_mut() = Some(Box::new(bootstrap));
