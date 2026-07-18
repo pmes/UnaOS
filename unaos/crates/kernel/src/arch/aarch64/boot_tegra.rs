@@ -59,6 +59,18 @@ const TCR_EL1_VAL: u64 = 25            // T0SZ  [5:0]
     | (0b10 << 30)                     // TG1   = 4 KiB (legal encoding; TTBR1 unused)
     | (0b001 << 32);                   // IPS   = 36-bit / 64 GiB, at [34:32]
 
+// ORIN-NET-3 (M1, `pcie3`): keep the post-drop EL1 regime's IPS in lock-step with the widened EL2
+// output ceiling. `mmu_tegra::map_mmio_window` patches BOTH the live EL2 `L1` and the EL1-precise twin
+// `L1_EL1` (twin-table discipline), so a controller-0 aperture mapped at ~184 GiB now survives the JM6
+// EL2->EL1 drop; the recon itself runs at EL2 BEFORE the drop, but arming EL1 with a 36-bit IPS while
+// the twin holds a 40-bit output descriptor would trap any FUTURE EL1 access to it. Widening IPS only
+// expands the legal output range — every existing EL1 mapping (RAM <=10 GiB, device GiB-0/1) is
+// unaffected. IPS is [34:32] in the EL1&0 format. Knob-off => byte-identical to the NET-2 literal.
+#[cfg(feature = "pcie3")]
+const TCR_EL1_ACTIVE: u64 = (TCR_EL1_VAL & !(0b111 << 32)) | (0b010 << 32);
+#[cfg(not(feature = "pcie3"))]
+const TCR_EL1_ACTIVE: u64 = TCR_EL1_VAL;
+
 // SCTLR_EL1 as an ABSOLUTE value (NOT an RMW). On tegra the firmware (NVIDIA UEFI) runs the kernel at
 // EL2 and never initialises SCTLR_EL1, which resets architecturally UNKNOWN — an RMW could read the RES1
 // bits as 0 and leave them cleared (CONSTRAINED UNPREDICTABLE). So OR the Armv8.0 SCTLR_EL1 RES1 mask
@@ -94,7 +106,7 @@ unsafe fn enable_el1_regime(l1_pa: u64) {
             "msr SCTLR_EL1, {sctlr}", // absolute M|C|I|RES1 (SCTLR_EL1 resets UNKNOWN on tegra — no RMW)
             "isb",
             mair = in(reg) MAIR_VAL,
-            tcr = in(reg) TCR_EL1_VAL,
+            tcr = in(reg) TCR_EL1_ACTIVE,
             ttbr0 = in(reg) l1_pa,
             sctlr = in(reg) SCTLR_EL1_VAL,
             options(nostack, preserves_flags),

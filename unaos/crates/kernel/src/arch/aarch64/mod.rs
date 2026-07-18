@@ -47,7 +47,9 @@ pub mod syscall;
 pub mod bus;
 // JM3: Jetson Orin Nano (Tegra234) kernel-owned MMU. The tegra/UEFI build maps RAM Normal-WB + the
 // Tegra device windows Device-nGnRE before touching any peripheral MMIO (the R4 UARTC-fault fix).
-#[cfg(feature = "tegra")]
+// (ORIN-NET-3 also compiles it for the `pcie3` virt witness — `ps_widen_witness` exercises the real
+// `map_mmio_window` reach ceiling there; on virt the L1 statics are inert, not the active regime.)
+#[cfg(any(feature = "tegra", feature = "pcie3"))]
 pub mod mmu_tegra;
 // JB1a: bounded read-only FDT walker — prints the BPMP IPC geometry (shmem/mboxes/reserved-memory)
 // from the firmware DTB, the verified starting line for the BPMP IVC arc (JB1).
