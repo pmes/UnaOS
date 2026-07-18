@@ -108,6 +108,16 @@ pub mod pcie_probe;
 #[cfg(feature = "net4")]
 pub mod rtl8168_tegra;
 
+// AARCH64-VNET (`UNAOS_VNET=1`): a virtio-net-mmio driver on the QEMU `virt` machine + smoltcp bind
+// (arch/aarch64/virtio_net.rs). The QEMU-testable proof of the aarch64 smoltcp seam NET-4 built — the
+// identical ring → phy::Device → Interface → ICMP-echo shape, driven with REAL packets over QEMU
+// user-mode networking (slirp) against a device QEMU actually models (unlike the Tegra234 RC NET-4
+// needs). Scans the fixed virtio-mmio window, drives the LEGACY transport, and runs an ICMP-ping
+// witness. Feature-gated only. Default OFF => module + call site vanish, smoltcp not pulled,
+// byte-identical to baseline. See arch_arm64.md §AARCH64-VNET.
+#[cfg(feature = "vnet")]
+pub mod virtio_net;
+
 pub fn init() {
     serial_println!(":: AARCH64 Core Hardware Init ::");
     boot_diagnostics();

@@ -5210,6 +5210,76 @@ metal boot-stick default only after a clean multi-boot metal record. The staged 
 declare it the stick default. (The xHCI-takeover wall of §JETSON-XCARVE is image-layout-sensitive; a
 new default layout may sample it — that is expected wall data, not an arc failure. QEMU cannot fire it.)
 
+## AARCH64-VNET — virtio-net-mmio driver + smoltcp bind on QEMU `virt` (`UNAOS_VNET`, knob-gated)
+
+**Purpose: a pre-metal, QEMU-testable proof of the aarch64 smoltcp seam that ORIN-NET-4 built.** NET-4's
+RTL8168 driver (`arch/aarch64/rtl8168_tegra.rs`) is `tegra`-gated because QEMU models no Tegra234 root
+complex, so its ring → `smoltcp::phy::Device` → `Interface` → ICMP path was only ever *compile*-tested off
+metal (a `net4`/virt build prints one honest witness line and does no MMIO). AARCH64-VNET exercises the
+**identical seam shape** against a device QEMU *does* model — a `virtio-net-device` on the `virt` machine's
+virtio-mmio bus — driven end-to-end with **real packets** over QEMU user-mode networking (slirp). It is the
+confidence, before the Orin sitting, that the ring mechanics and the smoltcp adapter are correct. It does
+**not** touch NET-4's code or behaviour; it is a parallel, self-contained aarch64 net module
+(`arch/aarch64/virtio_net.rs`).
+
+**Relationship to NET-4.** Same invariants, different transport:
+
+| | ORIN-NET-4 (`rtl8168_tegra.rs`) | AARCH64-VNET (`virtio_net.rs`) |
+|---|---|---|
+| device | Realtek RTL8168/8111 (PCIe, Tegra234 RC) | virtio-net (virtio-mmio, QEMU `virt`) |
+| discovery | DTB walk → PS-widened ECAM → config claim | fixed virtio-mmio window scan (`0x0a00_0000`, ×32) |
+| rings | RTL8168 C+ descriptor rings | legacy split virtqueues (RX q0 / TX q1) |
+| DMA | identity map (`mmu_tegra`), SMMU-bypass *unknown* | identity map (virt EL2/EL1), **no SMMU** (unmediated) |
+| smoltcp | `phy::Device` + `Interface` + ICMP, poll | *same shape*, + a live ICMP-echo witness |
+| QEMU | metal-only (no RC modelled) | **runs, end-to-end, with slirp packets** |
+
+**Transport: LEGACY virtio-mmio (QEMU's default).** QEMU's `virtio-mmio` bus defaults to
+`force-legacy=true`, so the 32 transports (base `0x0a00_0000`, stride `0x200`, in the low-1-GiB Device
+window both the EL2 firmware map and the JC3 EL1 drop cover) present the **version-1 / legacy** interface: a
+single `QueuePFN` register + `GuestPageSize`, the legacy split-virtqueue layout, and a fixed 10-byte
+`virtio_net_hdr` (no `num_buffers` — `MRG_RXBUF` is *not* negotiated). The driver reads the `Version`
+register and reports it; a version-2 (modern) transport is reported and skipped honestly rather than
+mis-driven.
+
+**Feature negotiation (minimal).** Of the offered device features (`0x39bf8064` on QEMU 11) the driver
+accepts **only `VIRTIO_NET_F_MAC` (bit 5, `0x20`)** — enough to read the station MAC from config space — and
+nothing else: no checksum/GSO offload, no mergeable RX buffers. That keeps the header 10 bytes and the
+datapath a plain copy.
+
+**Bring-up sequence.** Scan for a live virtio-net transport (magic `virt`, device-id 1); status handshake
+reset → ACKNOWLEDGE → DRIVER; negotiate features; set `GuestPageSize = 4096`; set up the RX/TX virtqueues
+(`QueueSel`/`QueueNum`/`QueueAlign`/`QueuePFN = region >> 12`, each ring a page-aligned `alloc_zeroed`
+region whose identity-physical base is the device's DMA target); pre-post every RX descriptor
+(device-writable, full buffer); read the MAC; set DRIVER_OK. Then bind a `smoltcp::phy::Device` over the
+rings (the NET-4 / e1000 adapter shape) and drive an ICMP echo to the slirp gateway.
+
+**Where it runs.** On the QEMU `virt` **GICv3** path, at EL2 *before* the JC3 EL2→EL1 drop — the heap is up
+and the virtio-mmio window is mapped. The bounded ICMP-ping witness (≤ `PUMP_ITERS` poll iterations,
+non-hanging) completes synchronously, then CAPSTONE runs unchanged. Static bring-up addressing is the slirp
+subnet: guest `10.0.2.15/24`, gateway `10.0.2.2` (slirp answers ARP + ICMP for it; no DHCP needed).
+
+**Witness (self-checking):**
+
+```
+:: AARCH64 VNET: virtio-net-mmio bring-up (QEMU virt, legacy transport) ::
+:: AARCH64 VNET:   found virtio-net at slot 31 (0xa003e00) version 1 ::
+:: AARCH64 VNET:   device features 0x39bf8064; accepted 0x00000020 (F_MAC=yes) ::
+:: AARCH64 VNET:   virtio-net up: station MAC 52:54:00:12:34:56, RX/TX virtqueues armed (16 desc each) ::
+:: AARCH64 VNET: ping 10.0.2.2 RTT 4374 us (4/4 sent, 4/4 replies) => PASS ::
+:: AARCH64 VNET: AARCH64-VNET DONE — virtio-net driver up + smoltcp bound ::
+```
+
+**How to run.** `UNAOS_VNET=1 UNAOS_GICV3=1 ./arroyo test-arm`. The knob adds both the `vnet` kernel feature
+and the QEMU `-netdev user,id=unet -device virtio-net-device,netdev=unet` args (arroyo `VNET_ARG`).
+
+**Gates green:** `./arroyo check` both arches × {default, `UNAOS_VNET=1`}; knob-off `./arroyo test-arm`
+MISSION SUCCESS + `UNAOS_GICV3=1 ./arroyo test-arm` CAPSTONE 6/6 + priority+aging PASS + VUG-HONESTY PASS
+(unregressed); knob-on `UNAOS_VNET=1 UNAOS_GICV3=1 ./arroyo test-arm` fires the `AARCH64 VNET … => PASS`
+witness (4/4 slirp replies) **and** CAPSTONE still 6/6; `./arroyo kernel8-test` 0 FAIL; `./arroyo test`
+MISSION SUCCESS (x86 unaffected — `vnet` is aarch64-virt-only). Default OFF ⇒ the module + call site vanish
+and the smoltcp dep is not pulled ⇒ byte-identical to baseline, and the QEMU invocation is byte-identical
+(empty `VNET_ARG`).
+
 ## PI-V3D — VideoCore VI (V3D 4.2) GPU foundation on the Pi 4 (Arc PI-V3D-1)
 
 The first GPU silicon UnaOS touches. The target is **not** a triangle: it proves the full

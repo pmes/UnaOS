@@ -216,6 +216,18 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         #[cfg(all(feature = "net4", not(feature = "tegra")))]
         unaos_kernel::arch::rtl8168_tegra::net4_bringup(dtb_addr, dtb_size, jc3_ram_gib_mask);
 
+        // AARCH64-VNET (QEMU witness, `UNAOS_VNET=1`): drive a `virtio-net-device` on the `virt`
+        // machine's virtio-mmio bus end-to-end — the QEMU-testable proof of the aarch64 smoltcp seam
+        // NET-4 built (identical ring → phy::Device → Interface → ICMP-echo shape, with REAL packets
+        // over slirp). Runs HERE, at EL2 before the JC3 drop, where the heap is up and the virtio-mmio
+        // window (0x0a00_0000, low-1-GiB Device map) is reachable; the bounded ICMP-ping witness
+        // completes synchronously and emits a self-checking PASS/FAIL line. Needs `UNAOS_VNET=1`'s
+        // `-netdev user -device virtio-net-device` QEMU args (added in arroyo behind the same knob).
+        // Compiled out knob-off => the GICv3 regression run is byte-identical. See arch_arm64.md
+        // §AARCH64-VNET.
+        #[cfg(feature = "vnet")]
+        unaos_kernel::arch::virtio_net::vnet_bringup();
+
         // JC3: with the JC2 SMP proof complete (the secondaries are parked at EL2 in their WFI loop), drop
         // the BOOT CORE EL2 -> EL1 and run the scheduler + full M4 CAPSTONE there — the QEMU-testable proof
         // that the scheduler and all six sync primitives run at EL1 on the GICv3 `virt` path. Sequenced
