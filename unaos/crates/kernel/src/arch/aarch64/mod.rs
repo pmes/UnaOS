@@ -98,6 +98,16 @@ pub mod v3d;
 #[cfg(any(feature = "pcieprobe", feature = "pcie2"))]
 pub mod pcie_probe;
 
+// ORIN-NET-4 (`UNAOS_NET4=1`, implies `pcie3`): the Realtek RTL8168/8111 GbE driver + smoltcp bind —
+// the Orin's first network path (arch/aarch64/rtl8168_tegra.rs). Claims controller-0's downstream
+// device (bus1:dev0:fn0 = 0x10ec:0x8168) through NET-3's PS-widened ECAM, maps its register BAR,
+// drives the C+ RX/TX descriptor rings, reads the MAC, and binds a smoltcp phy::Device. The
+// MMIO/DMA + smoltcp adapter are additionally `tegra`-gated (QEMU models no Tegra234 RC); a net4/virt
+// build only prints one witness line. Feature-gated only — compiles for both builds. Default OFF =>
+// module + call sites vanish, byte-identical to baseline.
+#[cfg(feature = "net4")]
+pub mod rtl8168_tegra;
+
 pub fn init() {
     serial_println!(":: AARCH64 Core Hardware Init ::");
     boot_diagnostics();

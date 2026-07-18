@@ -208,6 +208,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         #[cfg(feature = "pcie3")]
         unaos_kernel::arch::pcie_probe::ps_widen_witness();
 
+        // ORIN-NET-4 (QEMU witness, `UNAOS_NET4=1` without `UNAOS_TEGRA=1`): QEMU virt models no
+        // Tegra234 RC, so the RTL8168 driver has no device to claim. The `not(tegra)` build of
+        // `net4_bringup` prints one honest line recording that the driver is compiled-present but its
+        // bring-up is metal-only, and returns before any MMIO — keeping the GICv3 regression run
+        // unperturbed. Compiled out knob-off. See arch_arm64.md §ORIN-NET-4.
+        #[cfg(all(feature = "net4", not(feature = "tegra")))]
+        unaos_kernel::arch::rtl8168_tegra::net4_bringup(dtb_addr, dtb_size, jc3_ram_gib_mask);
+
         // JC3: with the JC2 SMP proof complete (the secondaries are parked at EL2 in their WFI loop), drop
         // the BOOT CORE EL2 -> EL1 and run the scheduler + full M4 CAPSTONE there — the QEMU-testable proof
         // that the scheduler and all six sync primitives run at EL1 on the GICv3 `virt` path. Sequenced
@@ -1316,6 +1324,15 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
         dtb_size,
         ram_gib_mask: mmu.ram_gib_mask,
     });
+
+    // ORIN-NET-4 (RTL8168/8111 GbE driver + smoltcp bind, `UNAOS_NET4=1`): with `net4` armed (implies
+    // `pcie3`), run the driver bring-up HERE on the metal Orin — AFTER the NET-3 `census2` above has
+    // widened the regime, enabled controller-0's LTSSM, and enumerated bus1:dev0:fn0. Claims the
+    // Realtek device through the now-mapped ECAM, maps its register BAR, resets the MAC, brings up the
+    // C+ RX/TX rings, reads the MAC, and binds a smoltcp phy::Device. Metal + tegra-gated (QEMU models
+    // no Tegra234 RC). Compiled out knob-off => byte-identical to baseline. See arch_arm64.md §ORIN-NET-4.
+    #[cfg(all(feature = "net4", feature = "tegra"))]
+    unaos_kernel::arch::rtl8168_tegra::net4_bringup(dtb_addr, dtb_size, mmu.ram_gib_mask);
 
     // ORIN-SMP-7 (boot-state-context bisect) — the PRE-xHCI-takeover dispatch site. With `smpprobe`
     // armed to leg 25, the real 5-core wake fires HERE — after JM4 (GIC/timer/SMC/serial live) and
