@@ -323,9 +323,6 @@ const U10D_WITNESS_ALL: u64 = 0x1F;
 /// U10-delete demo: the self-contained file the fixture creates, writes, and DELETES (it does not exist in the
 /// planted image). 9 chars (<= `MAX_NAME`); the `mov x1, #(9f-8f)` in the blob matches.
 const U10D_NAME: &str = "DELME.BIN";
-/// U10-delete demo: the 16-byte pattern the fixture writes before deleting (so the file owns a real data
-/// cluster, whose freeing the launcher then verifies).
-const U10D_PATTERN: [u8; 16] = *b"U10-DELETE-OK-42";
 
 /// U11 demo: the sentinel `sys_exit` status the open-file-lifecycle fixture (`el0-u11close`) uses so ITS exit
 /// lands in `EL0_U11_DONE`. Distinct from every prior sentinel (…0x7D) and 0.
