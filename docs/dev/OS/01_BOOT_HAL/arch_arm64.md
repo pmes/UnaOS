@@ -4989,7 +4989,7 @@ NET-3 `census2` has widened the regime, enabled the LTSSM, and enumerated bus1:d
 | **BAR map** | resolve BAR2 (64-bit-BAR aware) and map its 4 KiB register window Device-nGnRE via the same PS-widened path |
 | **reset + MAC** | soft-reset the MAC (`CR.RST`, finite backstop), read the station MAC from `IDR0..5` |
 | **rings** | allocate the C+ **RX (32) / TX (8) descriptor rings** + DMA buffers, program `RDSAR`/`TNPDS`, `RMS`/`MTPS`/`TCR`/`RCR`, enable `CR = RxEnb\|TxEnb` (RTL8168 programming-guide / `r8169` `rtl_hw_start` order) |
-| **bind** | build a **smoltcp 0.13 `phy::Device`** over the rings (the x86 e1000/`smolnet` seam, transposed) + an `Interface` (MAC, static bring-up CIDR, default route) and poll it. The `phy::Device`/`RxToken`/`TxToken` boilerplate is the **shared `arch/aarch64/net_phy.rs`** adapter (`SmoltcpPhy<N>` over the small `RawNic` trait — `transmit`/`rx_frame_raw`/`mac`); NET-4 implements `RawNic` for its `NET4_DEVICE` registry. See **§NET-PHY**. |
+| **bind** | build a **smoltcp 0.13 `phy::Device`** over the rings (the x86 e1000/`smolnet` seam, now literally shared) + an `Interface` (MAC, static bring-up CIDR, default route) and poll it. The `phy::Device`/`RxToken`/`TxToken` boilerplate is the **shared `crate::net_phy`** adapter (`SmoltcpPhy<N, O>` over the small `RawNic` trait — `transmit`/`rx_frame_raw`/`mac`); NET-4 implements `RawNic` for its `NET4_DEVICE` registry. See **§NET-PHY**. |
 
 **DMA / identity-map invariant (and its one metal risk).** `mmu_tegra` builds an **identity map (VA==PA)**
 for RAM, so — exactly as the x86 e1000 relies on UEFI's 1:1 tables — a heap allocation's virtual pointer
@@ -5262,7 +5262,7 @@ confidence, before the Orin sitting, that the ring mechanics and the smoltcp ada
 | smoltcp | `phy::Device` + `Interface` + ICMP, poll | *same shape*, + a live ICMP-echo witness |
 | QEMU | metal-only (no RC modelled) | **runs, end-to-end, with slirp packets** |
 
-The "same shape" is now literally shared code: both drivers bind over **`arch/aarch64/net_phy.rs`** — see **§NET-PHY**. VNET implements `RawNic` for its `VNET_DEVICE` registry.
+The "same shape" is now literally shared code: every driver — both aarch64 nets and the x86 e1000e — binds over **`crate::net_phy`** — see **§NET-PHY**. VNET implements `RawNic` for its `VNET_DEVICE` registry.
 
 **Transport: LEGACY virtio-mmio (QEMU's default).** QEMU's `virtio-mmio` bus defaults to
 `force-legacy=true`, so the 32 transports (base `0x0a00_0000`, stride `0x200`, in the low-1-GiB Device
@@ -5311,14 +5311,14 @@ MISSION SUCCESS (x86 unaffected — `vnet` is aarch64-virt-only). Default OFF �
 and the smoltcp dep is not pulled ⇒ byte-identical to baseline, and the QEMU invocation is byte-identical
 (empty `VNET_ARG`).
 
-### NET-PHY — the shared aarch64 smoltcp `phy::Device` adapter (`arch/aarch64/net_phy.rs`)
+### NET-PHY — the shared, arch-neutral smoltcp `phy::Device` adapter (`crate::net_phy`, `crates/kernel/src/net_phy.rs`)
 
-Both aarch64 net drivers bind smoltcp the same way — a `phy::Device` whose `receive`/`transmit` shuttle
-raw L2 frames to/from the driver's rings, with a `RxToken` that hands smoltcp the received buffer and a
-`TxToken` that copies the built reply back out. NET-4 and VNET each carried a near-identical copy of that
-boilerplate (the VNET landing flagged the duplication for an integrator-scoped fold). **NET-PHY** hosts it
-**once**: `SmoltcpPhy<N>` — owning the struct-local RX/TX scratch (`FRAME_CAP = 1536`, no heap) — is
-generic over a small trait
+Every NIC seam binds smoltcp the same way — a `phy::Device` whose `receive`/`transmit` shuttle raw L2
+frames to/from the driver's rings, with a `RxToken` that hands smoltcp the received buffer and a `TxToken`
+that copies the built reply back out. The two aarch64 net drivers (NET-4, VNET) **and** the x86 default net
+stack (`smolnet.rs`, the e1000e — SOCK-1..7) each carried a near-identical copy of that boilerplate.
+**NET-PHY** hosts it **once**: `SmoltcpPhy<N, O>` — owning the struct-local RX/TX scratch (`FRAME_CAP =
+1536`, no heap) — is generic over a small trait
 
 ```rust
 pub trait RawNic {
@@ -5329,18 +5329,31 @@ pub trait RawNic {
 ```
 
 The three methods are **associated functions** (no `self`): each driver reaches its one registered NIC
-through a module-static registry (`NET4_DEVICE` / `VNET_DEVICE`) behind a short-held lock — the e1000
-`raw_rx`/`raw_tx` discipline (never hold the registry lock across a smoltcp poll). `rtl8168_tegra.rs`
-implements `RawNic` for `Rtl8168Nic`, `virtio_net.rs` for `VnetNic`; each bind constructs
-`SmoltcpPhy::<_>::new()` and drives its own `Interface`/socket loop (NET-4 a bounded bind-witness poll,
-VNET a live ICMP echo — those stay per-driver). `fmt_mac` (the boot-log MAC formatter) is shared here too.
+through a module-static registry (`NET_DEVICE` / `NET4_DEVICE` / `VNET_DEVICE`) behind a short-held lock —
+the e1000 `raw_rx`/`raw_tx` discipline (never hold the registry lock across a smoltcp poll).
+`rtl8168_tegra.rs` implements `RawNic` for `Rtl8168Nic`, `virtio_net.rs` for `VnetNic`, and `smolnet.rs`
+for `E1000Nic`; each bind constructs its phy and drives its own `Interface`/socket loop (NET-4 a bounded
+bind-witness poll, VNET a live ICMP echo, x86 the full SOCK-1..7 stack — those stay per-driver). `fmt_mac`
+(the boot-log MAC formatter) is shared here too.
 
-The module is gated `#[cfg(any(feature = "net4", feature = "vnet"))]`, so it compiles under net4-only,
-vnet-only, both, and neither (with neither, it and the smoltcp dep vanish). **Zero behavior change**: the
-factoring is a pure code move — witness lines, feature gates, lock discipline, and the no-alloc poll paths
-are the exact code the two drivers carried. Gate-confirmed: `UNAOS_VNET=1 UNAOS_GICV3=1 ./arroyo test-arm`
-still fires the `AARCH64 VNET … => PASS` witness (4/4 slirp replies) + CAPSTONE 6/6, `check` green across
-the full net4/tegra/vnet feature matrix on both arches.
+**The RX observer seam (`O`).** x86 `smolnet` additionally snoops inbound ARP replies as they cross
+`receive()` (smoltcp hides the resolved neighbor MAC, which the `arp`/`ping` shell commands recover by
+watching the wire); the aarch64 drivers do not. `SmoltcpPhy<N, O: RxObserver = ()>` is therefore generic
+over an RX observer whose `observe` runs on every received frame before the tokens are minted. aarch64 uses
+`O = ()` (a zero-cost no-op via `SmoltcpPhy::<_>::new()`, compiling to the exact pre-share datapath); x86
+supplies an ARP-snooping observer via `SmoltcpPhy::with_observer(..)`, reproducing its old `receive()`
+byte-for-byte.
+
+**Home.** The module lives at the **crate root** (`crates/kernel/src/net_phy.rs`), not under `arch/`,
+because it is shared across arches. It cannot live in a module named `net`: the kernel depends on an
+**extern crate** `net` (`net::ethernet` / `net::arp`), which a `crate::net` module would shadow inside this
+crate. It is gated `#[cfg(any(feature = "net4", feature = "vnet", feature = "smolnet"))]` — each pulls the
+optional `smoltcp` dep — so it compiles under any combination and vanishes (with `smoltcp`) when all three
+are off. **Zero behavior change**: the factoring is a pure code move — witness lines, feature gates, lock
+discipline, and the no-alloc poll paths are the exact code the drivers carried. Gate-confirmed:
+`UNAOS_VNET=1 UNAOS_GICV3=1 ./arroyo test-arm` still fires `AARCH64 VNET … => PASS` (4/4 slirp replies) +
+CAPSTONE 6/6; `./arroyo test 22` still fires all x86 `SOCK-1..7`/`smolnet` witnesses (SOCK-1 ICMP 4/4 —
+the ARP-snoop path); `check` green across the full net4/tegra/vnet/smolnet feature matrix on both arches.
 
 ## PI-V3D — VideoCore VI (V3D 4.2) GPU foundation on the Pi 4 (Arc PI-V3D-1)
 

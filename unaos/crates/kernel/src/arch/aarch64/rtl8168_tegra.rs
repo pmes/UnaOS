@@ -80,7 +80,7 @@ mod metal {
     use super::P4;
     use crate::arch::aarch64::fdt_tegra::Fdt;
     use crate::arch::aarch64::mmu_tegra::{map_mmio_window, MmioMap};
-    use crate::arch::aarch64::net_phy::{fmt_mac, RawNic, SmoltcpPhy};
+    use crate::net_phy::{fmt_mac, RawNic, SmoltcpPhy};
     use core::alloc::Layout;
     use core::ptr::{read_volatile, write_volatile};
 

@@ -428,7 +428,7 @@ impl RawNic for VnetNic {
 
 // ── smoltcp interface plumbing (the phy::Device itself is the shared `net_phy::SmoltcpPhy`) ──
 
-use crate::arch::aarch64::net_phy::{fmt_mac, RawNic, SmoltcpPhy};
+use crate::net_phy::{fmt_mac, RawNic, SmoltcpPhy};
 use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage};
 use smoltcp::phy::Device; // for `dev.capabilities()` in the ping loop
 use smoltcp::socket::icmp;
