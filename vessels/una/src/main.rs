@@ -18,11 +18,18 @@
 //!
 //! This is the "lumen-lite" wiring: the same declarative `WorkspaceState` +
 //! `Synapse` broadcast bus + macOS `Backend`/`Spline` seam that lumen uses, but
-//! with no Vein/AI cortex. The brain loop serves only the two structural
-//! signals a bare workspace needs — `UiReady` (first-frame topology render) and
-//! `ToggleMatrixNode` (expand/collapse + focus). Left pane is the Matrix
-//! topology of the cwd; right pane is a Stream. Tabula (the editor view) is
-//! GTK-locked on macOS and returns in a later arc.
+//! with no Vein/AI cortex. The brain loop serves the structural signals a bare
+//! workspace needs — `UiReady` (first-frame topology render) and
+//! `ToggleMatrixNode` (expand/collapse + focus) — plus live editor loading.
+//!
+//! The workspace shape is no longer hand-rolled: `elessar::Context` reads the
+//! cwd, `.layout()` maps it to a `Layout`, and `elessar::workspace_for` builds
+//! the `WorkspaceState`. In this repo the cwd resolves to a recognized project
+//! (`Layout::Code`) → left pane Matrix topology, right pane **Editor**. An
+//! unrecognized directory (the Void → `Layout::Comms`) falls back to a Stream
+//! on the right. When a sidebar *file* is activated, the brain loop loads it
+//! through `tabula::TabulaDocument` and broadcasts `SMessage::EditorLoad` so
+//! quartzite's editor pane renders it.
 
 #[allow(unused_imports)]
 use bandy::{SMessage, Synapse};
@@ -84,26 +91,35 @@ fn main() {
     // Channels for UI events (Spline -> brain loop).
     let (event_tx, event_rx) = async_channel::unbounded::<bandy::SMessage>();
 
-    // 5. Declarative workspace layout: Topology (left) + Stream (right).
+    // 5. Declarative workspace layout, resolved through elessar's Context.
+    //    The genesis tree the matrix mapper scans becomes the left Topology;
+    //    the cwd's Layout decides the right pane (Code → Editor, Comms → Stream).
     let genesis_roots = matrix::MatrixScanner::build_genesis_tree(
         &absolute_workspace_root_arc,
         &absolute_workspace_root_arc,
     );
-    let workspace_state = bandy::state::WorkspaceState {
-        left_pane: bandy::state::ViewEntity::Topology(bandy::state::TopologyState::new(genesis_roots)),
-        right_pane: bandy::state::ViewEntity::Stream(bandy::state::StreamState::default()),
-        split_ratio: 0.25,
-    };
+    let context = elessar::Context::new(&absolute_workspace_root_arc);
+    let layout = context.layout();
+    println!("[UNA] Context Spline: {:?} → Layout: {:?}", context.spline, layout);
+    let workspace_state = elessar::workspace_for(layout, genesis_roots);
     let workspace_state_clone = workspace_state.clone();
 
-    // 6. The Brain Loop — minimal (no Vein). Serves structural signals only:
-    //    UiReady (first render) and ToggleMatrixNode (expand/collapse + focus).
+    // 6. The Brain Loop — minimal (no Vein). Serves structural signals:
+    //    UiReady (first render), ToggleMatrixNode (expand/collapse + focus),
+    //    and — when the right pane is an Editor — live file loading.
     let synapse_event_loop = synapse.clone();
     let shutdown_rx_brain = shutdown_tx.subscribe();
     let brain_loop_handle = rt.spawn(async move {
         let mut shutdown_rx = shutdown_rx_brain;
         let mut workspace_state = workspace_state_clone;
         let mut synapse_rx = synapse_event_loop.subscribe();
+
+        // The live editor document. Empty until a file is activated. Only
+        // meaningful when the right pane is an Editor (Layout::Code); harmless
+        // otherwise.
+        let editor_active =
+            matches!(workspace_state.right_pane, bandy::state::ViewEntity::Editor(_));
+        let mut document = tabula::TabulaDocument::new();
 
         loop {
             tokio::select! {
@@ -122,6 +138,16 @@ fn main() {
                                     }).collect();
                                     synapse_event_loop.fire(bandy::SMessage::Matrix(bandy::MatrixEvent::TopologyMutated(mapped_tree)));
                                 }
+                                // Seed a live Editor pane with the held (empty)
+                                // document so it starts in a known state before
+                                // any file is activated.
+                                if editor_active {
+                                    synapse_event_loop.fire(bandy::SMessage::EditorLoad {
+                                        path: document.path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+                                        content: document.buffer.clone(),
+                                        language: document.language.clone(),
+                                    });
+                                }
                             }
                             bandy::SMessage::ToggleMatrixNode(id) => {
                                 if let bandy::state::ViewEntity::Topology(ref mut matrix) = workspace_state.left_pane {
@@ -132,10 +158,32 @@ fn main() {
                                     }).collect();
                                     synapse_event_loop.fire(bandy::SMessage::Matrix(bandy::MatrixEvent::TopologyMutated(mapped_tree)));
 
-                                    // Only fire the AST Matrix scan if the ID looks like a file.
+                                    // A leaf whose id resolves to a real file is
+                                    // a file *activation* (lumen's discrimination).
                                     let is_file = std::fs::metadata(&id).map(|m| m.is_file()).unwrap_or(false);
                                     if is_file {
-                                        synapse_event_loop.fire(bandy::SMessage::Matrix(bandy::MatrixEvent::FocusSector(id)));
+                                        // (a) Ask the matrix mapper to graft this
+                                        //     file's symbols into the topology.
+                                        synapse_event_loop.fire(bandy::SMessage::Matrix(bandy::MatrixEvent::FocusSector(id.clone())));
+
+                                        // (b) When an Editor pane is live, load the
+                                        //     file through the portable Tabula core
+                                        //     and broadcast it for quartzite to render.
+                                        if editor_active {
+                                            match tabula::TabulaDocument::load(&id) {
+                                                Ok(doc) => {
+                                                    document = doc;
+                                                    synapse_event_loop.fire(bandy::SMessage::EditorLoad {
+                                                        path: document.path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+                                                        content: document.buffer.clone(),
+                                                        language: document.language.clone(),
+                                                    });
+                                                }
+                                                Err(e) => {
+                                                    eprintln!("[UNA] editor load failed for {:?}: {}", id, e);
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
