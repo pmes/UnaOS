@@ -20,11 +20,12 @@ elessar = { path = "../../libs/elessar" }
 
 # Host UI & System
 async-channel = "2.5"
-tokio = { version = "1.49", features = ["sync", "rt", "rt-multi-thread", "macros"] }
+tokio = { version = "1.49", features = ["sync", "rt", "rt-multi-thread", "macros", "signal"] }
+rustls = { version = "0.23", features = ["ring"] }
 
 # Handlers
 matrix = { path = "../../handlers/matrix" }
-tabula = { path = "../../handlers/tabula" }
+# tabula = { path = "../../handlers/tabula" }   # GTK-locked on macOS; returns in a later arc
 # midden = { path = "../../handlers/midden" }
 # vaire = { path = "../../handlers/vaire" }
 # aule = { path = "../../handlers/aule" }

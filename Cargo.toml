@@ -28,7 +28,7 @@ members = [
     "vessels/pulse",
     "vessels/phonolite",
     "vessels/facet",
-    # "vessels/una",   # PARKED — IDE vessel; excluded during GUI-API consolidation
+    "vessels/una",
     "libs/lux"
 ]
 
