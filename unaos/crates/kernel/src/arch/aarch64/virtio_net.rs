@@ -399,9 +399,15 @@ fn probe_and_init() -> Option<VirtioNet> {
 /// / the x86 e1000 `NET_DEVICE` registry; the smoltcp Device adapter reaches the rings through it.
 pub static VNET_DEVICE: spin::Mutex<Option<VirtioNet>> = spin::Mutex::new(None);
 
-// ── Static bring-up addressing: the slirp subnet (guest is 10.0.2.15; gateway/ping target 10.0.2.2) ──
+// ── Static fallback addressing: the slirp subnet (guest is 10.0.2.15; gateway/ping target 10.0.2.2).
+//    Used only if DHCP fails to lease within the timeout — slirp's DHCP server hands out these exact
+//    values, so a healthy run leases them rather than falling back. ──
 const OUR_IP: [u8; 4] = [10, 0, 2, 15];
 const GATEWAY_IP: [u8; 4] = [10, 0, 2, 2];
+/// Bounded DHCP-lease timeout (ms of the free-running counter). Slirp answers a DISCOVER in a handful
+/// of poll iterations, so a healthy run leases far inside this; the bound only caps how long a DHCP-less
+/// link stalls before the static fallback. Non-hanging by construction (the clock is real time).
+const DHCP_TIMEOUT_MS: i64 = 3_000;
 
 // ── Raw L2 accessors over the VNET_DEVICE registry (the smoltcp Device seam; NET-4 `raw_rx`/`raw_tx`) ──
 fn raw_rx(out: &mut [u8]) -> Option<usize> {
@@ -434,7 +440,7 @@ use smoltcp::phy::Device; // for `dev.capabilities()` in the ping loop
 use smoltcp::socket::icmp;
 use smoltcp::time::Instant;
 use smoltcp::wire::{
-    EthernetAddress, HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, Ipv4Address,
+    EthernetAddress, HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress,
 };
 
 /// ICMP identifier stamped on the echo requests we originate. ASCII "VN".
@@ -470,15 +476,15 @@ fn bind_and_ping() {
     let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
     config.random_seed = 0x564e_4554; // ASCII "VNET"
     let mut iface = Interface::new(config, &mut dev, Instant::from_millis(0));
-    iface.update_ip_addrs(|addrs| {
-        let _ = addrs.push(IpCidr::new(
-            IpAddress::v4(OUR_IP[0], OUR_IP[1], OUR_IP[2], OUR_IP[3]),
-            24,
-        ));
-    });
-    let _ = iface.routes_mut().add_default_ipv4_route(Ipv4Address::new(
-        GATEWAY_IP[0], GATEWAY_IP[1], GATEWAY_IP[2], GATEWAY_IP[3],
-    ));
+
+    // ── DHCP first: acquire a lease (slirp serves 10.0.2.15/24 gw 10.0.2.2), else fall back to the
+    //    static bring-up addressing. The helper configures the interface in place; we ping the gateway
+    //    of whichever config it settled on. ──
+    let now_ms = || (now_us() / 1000) as i64;
+    let netcfg = crate::net_phy::dhcp_or_static(
+        PV, &mut iface, &mut dev, &now_ms, DHCP_TIMEOUT_MS, OUR_IP, 24, GATEWAY_IP,
+    );
+    let gw = netcfg.gw;
 
     let mut rx_meta = [icmp::PacketMetadata::EMPTY; 8];
     let mut rx_payload = [0u8; 512];
@@ -500,7 +506,7 @@ fn bind_and_ping() {
     }
 
     const COUNT: u16 = 4;
-    let remote = IpAddress::v4(GATEWAY_IP[0], GATEWAY_IP[1], GATEWAY_IP[2], GATEWAY_IP[3]);
+    let remote = IpAddress::v4(gw[0], gw[1], gw[2], gw[3]);
     let mut sent = 0u16;
     let mut received = 0u16;
     let mut seq = 0u16;
@@ -543,10 +549,11 @@ fn bind_and_ping() {
 
     let pass = received > 0;
     serial_println!(
-        "{} ping {}.{}.{}.{} RTT {} us ({}/{} sent, {}/{} replies) => {} ::",
+        "{} ping {}.{}.{}.{} RTT {} us ({}/{} sent, {}/{} replies) [{}] => {} ::",
         PV,
-        GATEWAY_IP[0], GATEWAY_IP[1], GATEWAY_IP[2], GATEWAY_IP[3],
+        gw[0], gw[1], gw[2], gw[3],
         first_reply_us, sent, COUNT, received, COUNT,
+        if netcfg.leased { "dhcp" } else { "static" },
         if pass { "PASS" } else { "FAIL" }
     );
 }

@@ -90,9 +90,21 @@ lines then take over:
 :: PCIE4:   >>> REG WRITE (M2): RCR[0x44] = 0x……… (promiscuous bring-up) ::
 :: PCIE4:   rings up: RX @ 0x……… (32 desc) TX @ 0x……… (8 desc); TCR readback 0x……… (live) ::
 :: PCIE4:   RTL8168 @ BAR2 PCIe 0x40004000 (CPU aperture 0x32…), MAC read, C+ rings up + RX/TX enabled; PHY link UP/DOWN ::
-:: PCIE4:   smoltcp 0.13 Interface BOUND over RTL8168: MAC set, 192.168.1.2/24 + default gw 192.168.1.1, medium=ethernet, polled OK; link … — live ICMP/ARP is attended-metal ::
+:: PCIE4: NET: DHCP discover (timeout 5000 ms) ::
+:: PCIE4: NET: DHCP lease ip=….…/… gw=….… (server ….…) => PASS ::         # link HAS a DHCP server
+   — or, on a DHCP-less link, the honest bounded fallback:
+:: PCIE4: NET: no lease within 5000 ms — falling back to static 192.168.1.2/24 gw 192.168.1.1 ::
+:: PCIE4:   smoltcp 0.13 Interface BOUND over RTL8168: MAC set, ….…/… + default gw ….… [dhcp|static], medium=ethernet, polled OK; link … — live ICMP/ARP is attended-metal ::
 :: PCIE4: ORIN-NET-4 DONE — RTL8168 driver up + smoltcp bound (live traffic = attended metal) ::
 ```
+
+**NET-DHCP note (M3).** As of the NET-DHCP arc the driver runs a DHCPv4 client (`net_phy::dhcp_or_static`,
+5 s bounded) BEFORE the bind witness. On a devkit link with a DHCP server the `DHCP lease … => PASS` line
+appears and the interface takes the leased subnet (the `BOUND` line reports `[dhcp]` + the leased addr);
+on a DHCP-less link the bounded `no lease … falling back to static` line appears and the old
+`192.168.1.2/24` placeholder is the honest fallback (`[static]`). Record **which path fired** and, when
+leased, the leased ip/gw/server — that is the link's real subnet, the metal input the NET-4 landing
+flagged.
 
 ### What to record
 
