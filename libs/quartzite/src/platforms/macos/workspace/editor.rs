@@ -22,15 +22,22 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{
     NSObjectProtocol, NSRect, NSPoint, NSSize, MainThreadMarker, NSString,
+    NSNotification,
 };
 use std::cell::RefCell;
 use bandy::state::EditorState;
+use bandy::SMessage;
 
 // -----------------------------------------------------------------------------
 // EDITOR DELEGATE (CODE PANE)
 // -----------------------------------------------------------------------------
 pub struct EditorDelegateIvars {
     pub text_view: RefCell<Option<Retained<NSTextView>>>,
+    /// UI → brain sender. The editor fires `EditorEdited` on every text change
+    /// and `EditorSaveRequest` on Cmd+S / menu Save. Mirrors how the other
+    /// delegates receive `tx_event` at construction (threaded in via
+    /// `create_editor`).
+    pub tx_event: RefCell<Option<async_channel::Sender<SMessage>>>,
 }
 
 define_class!(
@@ -44,8 +51,17 @@ define_class!(
         fn init(this: Allocated<Self>) -> Retained<Self> {
             let this = this.set_ivars(EditorDelegateIvars {
                 text_view: RefCell::new(None),
+                tx_event: RefCell::new(None),
             });
             unsafe { msg_send![super(this), init] }
+        }
+
+        /// Menu / Cmd+S action target. Wired by the main-menu "Save" item, whose
+        /// target is set to this delegate after bootstrap. Fires `EditorSaveRequest`
+        /// so the brain performs the actual write.
+        #[unsafe(method(saveDocument:))]
+        fn save_document(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.fire(SMessage::EditorSaveRequest);
         }
     }
 
@@ -60,6 +76,23 @@ define_class!(
             // Let the text view handle every command itself (default editing).
             objc2::runtime::Bool::NO
         }
+
+        /// Fires on every buffer edit. We forward the full current buffer to the
+        /// brain as `EditorEdited` so it can hold the live document.
+        #[unsafe(method(textDidChange:))]
+        fn text_did_change(&self, _notification: &NSNotification) {
+            let content = self
+                .ivars()
+                .text_view
+                .borrow()
+                .as_ref()
+                .map(|tv| {
+                    let s: Retained<NSString> = unsafe { msg_send![&**tv, string] };
+                    s.to_string()
+                })
+                .unwrap_or_default();
+            self.fire(SMessage::EditorEdited { content });
+        }
     }
 );
 
@@ -67,6 +100,15 @@ unsafe impl NSObjectProtocol for EditorDelegate {}
 unsafe impl NSTextDelegate for EditorDelegate {}
 
 impl EditorDelegate {
+    /// Send a UI → brain message on the stored `tx_event`, if present.
+    /// Non-blocking (`try_send`): a full/closed channel drops the event rather
+    /// than stalling the main thread.
+    fn fire(&self, msg: SMessage) {
+        if let Some(tx) = self.ivars().tx_event.borrow().as_ref() {
+            let _ = tx.try_send(msg);
+        }
+    }
+
     /// Replace the editor buffer with `text`. Must run on the main thread
     /// (the `MacOSSpline` router dispatches `EditorLoad` here via the main queue).
     pub fn set_content(&self, text: &str) {
@@ -83,13 +125,17 @@ impl EditorDelegate {
 // ASSEMBLY
 // -----------------------------------------------------------------------------
 /// Build the editor pane view + its delegate, seeded from `editor_state.content`.
+/// `tx_event` is the UI → brain sender the delegate uses to emit `EditorEdited`
+/// / `EditorSaveRequest`.
 pub fn create_editor(
     _mtm: MainThreadMarker,
     editor_state: &EditorState,
+    tx_event: async_channel::Sender<SMessage>,
 ) -> (Retained<NSView>, Retained<EditorDelegate>) {
     // 1. Instantiate the delegate.
     let delegate: Allocated<EditorDelegate> = unsafe { msg_send![EditorDelegate::class(), alloc] };
     let delegate: Retained<EditorDelegate> = unsafe { msg_send![delegate, init] };
+    *delegate.ivars().tx_event.borrow_mut() = Some(tx_event);
 
     let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(774.0, 768.0));
 

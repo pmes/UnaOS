@@ -141,6 +141,9 @@ pub fn workspace_for(
         left_pane,
         right_pane,
         split_ratio: 0.25,
+        // The console bottom pane is opt-in; a vessel sets this after
+        // `workspace_for` when it wants the console (e.g. a Code layout).
+        bottom_pane: None,
     }
 }
 

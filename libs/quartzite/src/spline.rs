@@ -20,14 +20,17 @@ use objc2::rc::Retained;
 /// The macOS bootstrap payload. Element order: root view, the sidebar delegate,
 /// then the two mutually-exclusive right-pane delegates — exactly one of
 /// `comms`/`editor` is `Some`, selected by the workspace's `right_pane`
-/// (`ViewEntity::Stream` → comms, `ViewEntity::Editor` → editor). Callers that
-/// don't inspect the payload (e.g. lumen) are unaffected by the widening.
+/// (`ViewEntity::Stream` → comms, `ViewEntity::Editor` → editor) — and finally
+/// the optional bottom-pane `console` delegate, `Some` when the workspace's
+/// `bottom_pane` is set. Callers that don't inspect the payload (e.g. lumen)
+/// are unaffected by the widening.
 #[cfg(target_os = "macos")]
 pub type BootstrapPayload = (
     NativeView,
     Retained<crate::platforms::macos::workspace::sidebar::SidebarDelegate>,
     Option<Retained<crate::platforms::macos::workspace::comms::CommsDelegate>>,
     Option<Retained<crate::platforms::macos::workspace::editor::EditorDelegate>>,
+    Option<Retained<crate::platforms::macos::workspace::console::ConsoleDelegate>>,
 );
 
 #[cfg(not(target_os = "macos"))]

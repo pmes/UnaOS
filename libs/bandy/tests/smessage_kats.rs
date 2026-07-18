@@ -236,6 +236,37 @@ kat!(
     r#"{"StorageLoadPagedResult":{"receipt_id":9,"records":[{"id":"d-1","origin":{"LocalUser":"peter"},"display_name":"Peter","subject":"greeting","timestamp":"2026-07-13T00:00:00Z","content":"hello","is_chat":true}]}}"#
 );
 
+// --- EDITOR (The Code Pane) ---
+
+kat!(
+    kat_editor_load,
+    SMessage::EditorLoad {
+        path: Some("/una/x.rs".to_string()),
+        content: "fn main(){}".to_string(),
+        language: "rust".to_string(),
+    },
+    r#"{"EditorLoad":{"path":"/una/x.rs","content":"fn main(){}","language":"rust"}}"#
+);
+kat!(
+    kat_editor_edited,
+    SMessage::EditorEdited { content: "edited".to_string() },
+    r#"{"EditorEdited":{"content":"edited"}}"#
+);
+kat!(kat_editor_save_request, SMessage::EditorSaveRequest, r#""EditorSaveRequest""#);
+
+// --- CONSOLE (The Bottom Pane) ---
+
+kat!(
+    kat_console_append,
+    SMessage::ConsoleAppend("out".to_string()),
+    r#"{"ConsoleAppend":"out"}"#
+);
+kat!(
+    kat_console_input,
+    SMessage::ConsoleInput("ls -la".to_string()),
+    r#"{"ConsoleInput":"ls -la"}"#
+);
+
 // --- MIDDEN (The Terminal) ---
 
 kat!(kat_no_op, SMessage::NoOp, r#""NoOp""#);
@@ -428,6 +459,11 @@ fn smessage_variant_name(m: &SMessage) -> &'static str {
         SMessage::StorageSaveResult { .. } => "StorageSaveResult",
         SMessage::StorageLoadPaged { .. } => "StorageLoadPaged",
         SMessage::StorageLoadPagedResult { .. } => "StorageLoadPagedResult",
+        SMessage::EditorLoad { .. } => "EditorLoad",
+        SMessage::EditorEdited { .. } => "EditorEdited",
+        SMessage::EditorSaveRequest => "EditorSaveRequest",
+        SMessage::ConsoleAppend(_) => "ConsoleAppend",
+        SMessage::ConsoleInput(_) => "ConsoleInput",
         SMessage::NoOp => "NoOp",
         SMessage::TerminalOutput(_) => "TerminalOutput",
         SMessage::TerminalError(_) => "TerminalError",

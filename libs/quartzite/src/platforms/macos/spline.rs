@@ -12,7 +12,7 @@ use tokio::sync::broadcast::Receiver as BroadcastReceiver;
 use bandy::state::AppState;
 use bandy::SMessage;
 use objc2_app_kit::{
-    NSSplitViewController, NSSplitViewItem, NSViewController
+    NSSplitViewController, NSSplitViewItem, NSViewController, NSSplitView, NSView,
 };
 use objc2_foundation::MainThreadMarker;
 use objc2::{msg_send, ClassType, DefinedClass};
@@ -22,6 +22,7 @@ use objc2::rc::{Retained, Allocated};
 use super::workspace::sidebar;
 use super::workspace::comms;
 use super::workspace::editor;
+use super::workspace::console;
 
 // -----------------------------------------------------------------------------
 // MAC OS SPLINE
@@ -56,6 +57,7 @@ impl MacOSSpline {
         Retained<sidebar::SidebarDelegate>,
         Option<Retained<comms::CommsDelegate>>,
         Option<Retained<editor::EditorDelegate>>,
+        Option<Retained<console::ConsoleDelegate>>,
     ) {
         // 1. Build the UI
         let mtm = MainThreadMarker::new().unwrap();
@@ -86,10 +88,11 @@ impl MacOSSpline {
 
         // --- Right Pane: Editor (Code layout) or Comms (Comms layout) ---
         // The workspace's right pane selects which delegate we build; exactly one
-        // of `comms_delegate`/`editor_delegate` ends up `Some`.
-        let (right_view, comms_delegate, editor_delegate) = match &_workspace_tetra.right_pane {
+        // of `comms_delegate`/`editor_delegate` ends up `Some`. The editor gets
+        // the UI → brain sender so it can emit EditorEdited/EditorSaveRequest.
+        let (right_pane_view, comms_delegate, editor_delegate) = match &_workspace_tetra.right_pane {
             bandy::state::ViewEntity::Editor(editor_state) => {
-                let (editor_view, editor_delegate) = editor::create_editor(mtm, editor_state);
+                let (editor_view, editor_delegate) = editor::create_editor(mtm, editor_state, tx_event.clone());
                 (editor_view, None, Some(editor_delegate))
             }
             _ => {
@@ -97,6 +100,33 @@ impl MacOSSpline {
                 (comms_view, Some(comms_delegate), None)
             }
         };
+
+        // --- Optional Bottom Pane: Console ---
+        // When the workspace requests a bottom pane, build the console and stack
+        // it *under* the right pane in a vertical split (horizontal divider). The
+        // console's input field gets its own clone of the UI → brain sender.
+        let (right_view, console_delegate): (Retained<NSView>, Option<Retained<console::ConsoleDelegate>>) =
+            if _workspace_tetra.bottom_pane.is_some() {
+                let (console_view, console_delegate) = console::create_console(mtm, tx_event.clone());
+
+                let stack: Allocated<NSSplitView> = unsafe { msg_send![NSSplitView::class(), alloc] };
+                let stack: Retained<NSSplitView> = unsafe { msg_send![stack, init] };
+                stack.setVertical(false); // horizontal divider → panes stack vertically
+                unsafe {
+                    let _: () = msg_send![&stack, setTranslatesAutoresizingMaskIntoConstraints: objc2::runtime::Bool::NO];
+                }
+                stack.addSubview(&right_pane_view);
+                stack.addSubview(&console_view);
+                unsafe {
+                    // Editor/comms takes the growth; console holds its size.
+                    let _: () = msg_send![&stack, setHoldingPriority: 250.0f32, forSubviewAtIndex: 0isize];
+                    let _: () = msg_send![&stack, setHoldingPriority: 750.0f32, forSubviewAtIndex: 1isize];
+                }
+                let stack_view = unsafe { Retained::cast_unchecked::<NSView>(stack) };
+                (stack_view, Some(console_delegate))
+            } else {
+                (right_pane_view, None)
+            };
 
         let right_vc: Allocated<NSViewController> = unsafe { msg_send![NSViewController::class(), alloc] };
         let right_vc: Retained<NSViewController> = unsafe { msg_send![right_vc, init] };
@@ -130,6 +160,9 @@ impl MacOSSpline {
             .as_ref()
             .map(|d| Arc::new(MainThreadBound::new(d.clone(), mtm)));
         let editor_bound = editor_delegate
+            .as_ref()
+            .map(|d| Arc::new(MainThreadBound::new(d.clone(), mtm)));
+        let console_bound = console_delegate
             .as_ref()
             .map(|d| Arc::new(MainThreadBound::new(d.clone(), mtm)));
         let sidebar_bound = Arc::new(MainThreadBound::new(sidebar_delegate.clone(), mtm));
@@ -203,6 +236,14 @@ impl MacOSSpline {
                                     editor_delegate.set_content(&content);
                                 });
                             },
+                            SMessage::ConsoleAppend(line) => {
+                                let Some(console_bound) = console_bound.clone() else { continue };
+                                dispatch2::DispatchQueue::main().exec_async(move || {
+                                    let mtm = MainThreadMarker::new().unwrap();
+                                    let console_delegate = console_bound.get(mtm);
+                                    console_delegate.append_line(&line);
+                                });
+                            },
                             SMessage::NetworkLog(_) => {
                                 dispatch2::DispatchQueue::main().exec_async(move || {
                                     // SMessage::NetworkLog routed to main thread.
@@ -273,6 +314,6 @@ impl MacOSSpline {
             }
         });
 
-        (root_view, sidebar_delegate, comms_delegate, editor_delegate)
+        (root_view, sidebar_delegate, comms_delegate, editor_delegate, console_delegate)
     }
 }

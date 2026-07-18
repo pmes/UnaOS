@@ -382,6 +382,13 @@ pub struct WorkspaceState {
     pub left_pane: ViewEntity,
     pub right_pane: ViewEntity,
     pub split_ratio: f32,
+    /// Optional bottom pane, stacked *under* the right pane in a vertical split.
+    /// `None` = no bottom pane (the historical two-pane layout). `Some(_)` asks
+    /// the platform backend to build the bottom **console** pane (read-only
+    /// output + one-line input); the macOS `MacOSSpline` reads this at bootstrap.
+    /// Reuses `ViewEntity` for forward-compatibility; today any `Some` requests
+    /// the console.
+    pub bottom_pane: Option<ViewEntity>,
 }
 
 impl Default for WorkspaceState {
@@ -390,6 +397,7 @@ impl Default for WorkspaceState {
             left_pane: ViewEntity::Topology(TopologyState::default()),
             right_pane: ViewEntity::Stream(StreamState::default()),
             split_ratio: 0.25,
+            bottom_pane: None,
         }
     }
 }

@@ -38,6 +38,7 @@ type BootstrapFn = Box<
         Retained<workspace::sidebar::SidebarDelegate>,
         Option<Retained<workspace::comms::CommsDelegate>>,
         Option<Retained<workspace::editor::EditorDelegate>>,
+        Option<Retained<workspace::console::ConsoleDelegate>>,
     ) + 'static,
 >;
 
@@ -73,6 +74,10 @@ struct AppDelegateIvars {
     sidebar_delegate: RefCell<Option<Retained<workspace::sidebar::SidebarDelegate>>>,
     comms_delegate: RefCell<Option<Retained<workspace::comms::CommsDelegate>>>,
     editor_delegate: RefCell<Option<Retained<workspace::editor::EditorDelegate>>>,
+    console_delegate: RefCell<Option<Retained<workspace::console::ConsoleDelegate>>>,
+    // The "Save" menu item (Cmd+S). Its target is wired to the editor delegate
+    // after bootstrap, so Cmd+S fires `EditorSaveRequest`.
+    save_menu_item: RefCell<Option<Retained<objc2_app_kit::NSMenuItem>>>,
 }
 
 define_class!(
@@ -100,6 +105,8 @@ define_class!(
                 sidebar_delegate: RefCell::new(None),
                 comms_delegate: RefCell::new(None),
                 editor_delegate: RefCell::new(None),
+                console_delegate: RefCell::new(None),
+                save_menu_item: RefCell::new(None),
             });
             unsafe { msg_send![super(this), init] }
         }
@@ -133,6 +140,21 @@ define_class!(
 
                 let _: () = msg_send![&app_menu_item, setSubmenu: &*app_menu];
                 main_menu.addItem(&app_menu_item);
+
+                // File Menu — holds Save (Cmd+S). Target is wired to the editor
+                // delegate after bootstrap so Cmd+S fires `EditorSaveRequest`.
+                let file_menu_item: Allocated<NSMenuItem> = msg_send![NSMenuItem::class(), alloc];
+                let file_menu_item: Retained<NSMenuItem> = msg_send![file_menu_item, initWithTitle: &*NSString::from_str("File"), action: None::<objc2::runtime::Sel>, keyEquivalent: &*NSString::from_str("")];
+                let file_menu: Allocated<NSMenu> = msg_send![NSMenu::class(), alloc];
+                let file_menu: Retained<NSMenu> = msg_send![file_menu, initWithTitle: &*NSString::from_str("File")];
+
+                let save_item: Allocated<NSMenuItem> = msg_send![NSMenuItem::class(), alloc];
+                let save_item: Retained<NSMenuItem> = msg_send![save_item, initWithTitle: &*NSString::from_str("Save"), action: Some(objc2::sel!(saveDocument:)), keyEquivalent: &*NSString::from_str("s")];
+                file_menu.addItem(&save_item);
+                *self.ivars().save_menu_item.borrow_mut() = Some(save_item.clone());
+
+                let _: () = msg_send![&file_menu_item, setSubmenu: &*file_menu];
+                main_menu.addItem(&file_menu_item);
 
                 // Edit Menu
                 let edit_menu_item: Allocated<NSMenuItem> = msg_send![NSMenuItem::class(), alloc];
@@ -208,7 +230,7 @@ define_class!(
                 let rx_synapse = self.ivars().rx_synapse.borrow_mut().take().expect("rx_synapse missing");
                 let workspace_state = self.ivars().workspace_state.borrow_mut().take().expect("workspace_state missing");
 
-                let (root_view, sidebar_delegate, comms_delegate, editor_delegate) = bootstrap_fn(
+                let (root_view, sidebar_delegate, comms_delegate, editor_delegate, console_delegate) = bootstrap_fn(
                     &window,
                     tx_event,
                     app_state,
@@ -217,11 +239,25 @@ define_class!(
                 );
                 window.setContentView(Some(&root_view));
 
+                // Wire the "Save" menu item (Cmd+S) to the editor delegate, if the
+                // active layout has an editor. With an explicit target the action
+                // reaches the delegate directly (it is not otherwise in the
+                // responder chain).
+                if let (Some(save_item), Some(editor)) =
+                    (self.ivars().save_menu_item.borrow().as_ref(), editor_delegate.as_ref())
+                {
+                    unsafe {
+                        let _: () = msg_send![&**save_item, setTarget: &**editor];
+                    }
+                }
+
                 // Store the internal UI delegates to prevent them from dropping.
-                // Exactly one of comms/editor is populated (the active right pane).
+                // Exactly one of comms/editor is populated (the active right pane);
+                // console is populated when the workspace requested a bottom pane.
                 *self.ivars().sidebar_delegate.borrow_mut() = Some(sidebar_delegate);
                 *self.ivars().comms_delegate.borrow_mut() = comms_delegate;
                 *self.ivars().editor_delegate.borrow_mut() = editor_delegate;
+                *self.ivars().console_delegate.borrow_mut() = console_delegate;
             }
 
             // 3. Keep references alive
@@ -276,6 +312,7 @@ impl Backend {
             Retained<workspace::sidebar::SidebarDelegate>,
             Option<Retained<workspace::comms::CommsDelegate>>,
             Option<Retained<workspace::editor::EditorDelegate>>,
+            Option<Retained<workspace::console::ConsoleDelegate>>,
         ) + 'static,
     {
         // Allocate and initialize the custom delegate
