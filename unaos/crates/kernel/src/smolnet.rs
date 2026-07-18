@@ -39,7 +39,7 @@
 use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicUsize, Ordering};
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage};
-use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
+use smoltcp::phy::Device; // the phy::Device impl itself lives in the shared `crate::net_phy` adapter
 use smoltcp::socket::{dhcpv4, icmp, tcp, udp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{
@@ -49,6 +49,7 @@ use smoltcp::wire::{
 use spin::Mutex as SpinMutex;
 
 use crate::drivers::e1000::{self, PingOutcome};
+use crate::net_phy::{RawNic, RxObserver, SmoltcpPhy};
 
 /// slirp's virtual gateway (the default route + the witness's ICMP target). Mirrors `e1000.rs`.
 const GATEWAY_IP: [u8; 4] = [10, 0, 2, 2];
@@ -57,8 +58,6 @@ const GATEWAY_IP: [u8; 4] = [10, 0, 2, 2];
 const PING_IDENT: u16 = 0x554E;
 /// Payload carried in the echo requests we originate.
 const PING_PAYLOAD: &[u8] = b"unaos-ping";
-/// A full Ethernet frame fits (RX_BUF_SIZE in the driver is 2048); the scratch is stack-local.
-const FRAME_CAP: usize = 1536;
 /// ICMP socket ring capacities (packets / payload bytes). Our echoes are ~18 bytes; 512 is ample.
 const ICMP_META: usize = 8;
 const ICMP_PAYLOAD: usize = 512;
@@ -67,25 +66,56 @@ const ICMP_PAYLOAD: usize = 512;
 /// an unreachable target stalls the caller. Mirrors the hand-rolled `PUMP_ITERS`.
 const PUMP_ITERS: i64 = 2_000_000;
 
-// --- the Device adapter over the e1000e rings ---
+// --- the Device adapter over the e1000e rings (the shared `crate::net_phy` adapter) ---
 
-/// A `smoltcp::phy::Device` backed by the e1000e. Owns its RX/TX scratch (so the RX/TX tokens can
-/// borrow disjoint fields — smoltcp hands out both from one `receive()` to build a reply in place).
-struct E1000Phy {
-    rx: [u8; FRAME_CAP],
-    rlen: usize,
-    tx: [u8; FRAME_CAP],
+// The `phy::Device` / `RxToken` / `TxToken` boilerplate now lives ONCE in `crate::net_phy::SmoltcpPhy`
+// (shared with the aarch64 net drivers). x86 supplies the two pieces that were e1000-specific: the
+// `RawNic` seam over the e1000e ring accessors, and an ARP-snooping `RxObserver` that reproduces the old
+// `E1000Phy::receive`'s per-frame ARP snoop. `SmolPhy` is the concrete phy type this module binds — the
+// shared adapter parameterized over both. ZERO behavior change from the pre-share `E1000Phy`.
+
+/// The e1000e implementation of the shared [`RawNic`] seam: the ring accessors `crate::net_phy` moves L2
+/// frames through. Each briefly locks `NET_DEVICE` (the `raw_rx`/`raw_tx` discipline — never held across a
+/// smoltcp poll).
+struct E1000Nic;
+impl RawNic for E1000Nic {
+    fn rx_frame_raw(out: &mut [u8]) -> Option<usize> {
+        e1000::raw_rx(out)
+    }
+    fn transmit(frame: &[u8]) {
+        e1000::raw_tx(frame)
+    }
+    fn mac() -> Option<[u8; 6]> {
+        e1000::hw_addr().map(|(mac, _, _)| mac)
+    }
+}
+
+/// The x86 RX observer: snoop an inbound ARP reply for `target`, recording the sender's MAC. smoltcp
+/// hides the resolved neighbor MAC, so the `arp`/`ping` shell commands recover it by watching the wire —
+/// this observer runs on every received frame (exactly where the pre-share `E1000Phy::receive` snooped).
+/// The persistent stack builds it with `target = [0; 4]` (matches no real peer — snoop stays inert), so
+/// only the blocking `pump` (which sets a real target and reads back `obs.snoop`) surfaces a MAC.
+struct ArpSnoop {
     /// The IP whose ARP reply we want to surface as a MAC (`arp`/`ping` peer).
     target: [u8; 4],
     /// The snooped target MAC, once an ARP reply for `target` is seen on the wire.
     snoop: Option<[u8; 6]>,
 }
 
-impl E1000Phy {
+impl ArpSnoop {
     fn new(target: [u8; 4]) -> Self {
-        E1000Phy { rx: [0; FRAME_CAP], rlen: 0, tx: [0; FRAME_CAP], target, snoop: None }
+        ArpSnoop { target, snoop: None }
     }
 }
+
+impl RxObserver for ArpSnoop {
+    fn observe(&mut self, frame: &[u8]) {
+        snoop_arp(frame, self.target, &mut self.snoop);
+    }
+}
+
+/// The concrete phy this module binds: the shared adapter over the e1000e `RawNic` + the ARP-snoop observer.
+type SmolPhy = SmoltcpPhy<E1000Nic, ArpSnoop>;
 
 /// Snoop an inbound ARP reply for `target`, recording the sender's MAC. Reuses `net::arp::learn`
 /// (read-only) so the parse matches the hand-rolled stack exactly; the `net` crate is untouched.
@@ -98,53 +128,6 @@ fn snoop_arp(frame: &[u8], target: [u8; 4], out: &mut Option<[u8; 6]>) {
                 }
             }
         }
-    }
-}
-
-struct PhyRxToken<'a> {
-    buf: &'a [u8],
-}
-struct PhyTxToken<'a> {
-    buf: &'a mut [u8],
-}
-
-impl RxToken for PhyRxToken<'_> {
-    fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R {
-        f(self.buf)
-    }
-}
-
-impl TxToken for PhyTxToken<'_> {
-    fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
-        let n = len.min(self.buf.len());
-        let r = f(&mut self.buf[..n]);
-        e1000::raw_tx(&self.buf[..n]);
-        r
-    }
-}
-
-impl Device for E1000Phy {
-    type RxToken<'a> = PhyRxToken<'a>;
-    type TxToken<'a> = PhyTxToken<'a>;
-
-    fn receive(&mut self, _t: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        let len = e1000::raw_rx(&mut self.rx)?;
-        snoop_arp(&self.rx[..len], self.target, &mut self.snoop);
-        self.rlen = len;
-        // Split the borrow into disjoint fields so both tokens can be handed out at once.
-        let E1000Phy { rx, rlen, tx, .. } = self;
-        Some((PhyRxToken { buf: &rx[..*rlen] }, PhyTxToken { buf: tx }))
-    }
-
-    fn transmit(&mut self, _t: Instant) -> Option<Self::TxToken<'_>> {
-        Some(PhyTxToken { buf: &mut self.tx })
-    }
-
-    fn capabilities(&self) -> DeviceCapabilities {
-        let mut caps = DeviceCapabilities::default();
-        caps.medium = Medium::Ethernet;
-        caps.max_transmission_unit = 1500;
-        caps
     }
 }
 
@@ -162,7 +145,7 @@ struct PumpResult {
 /// which doesn't care about the echo reply); otherwise it returns once `count` replies land. All
 /// storage is stack-local — no heap growth.
 fn pump(mac: [u8; 6], our_ip: [u8; 4], target: [u8; 4], count: u16, stop_on_arp: bool) -> PumpResult {
-    let mut dev = E1000Phy::new(target);
+    let mut dev = SmolPhy::with_observer(ArpSnoop::new(target));
 
     let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
     // A fixed seed is fine: ICMP has no port/sequence collision concern (SOCK-2's TCP will want a
@@ -211,7 +194,7 @@ fn pump(mac: [u8; 6], our_ip: [u8; 4], target: [u8; 4], count: u16, stop_on_arp:
         clock += 1;
         iface.poll(Instant::from_millis(clock), &mut dev, &mut sockets);
 
-        if stop_on_arp && dev.snoop.is_some() {
+        if stop_on_arp && dev.obs.snoop.is_some() {
             break;
         }
 
@@ -241,7 +224,7 @@ fn pump(mac: [u8; 6], our_ip: [u8; 4], target: [u8; 4], count: u16, stop_on_arp:
         }
     }
 
-    PumpResult { mac: dev.snoop, sent, received }
+    PumpResult { mac: dev.obs.snoop, sent, received }
 }
 
 // --- public entry points (called from the shell net-command region + service_net) ---
@@ -452,7 +435,7 @@ enum SockKind {
 struct SmolStack {
     iface: Interface,
     sockets: SocketSet<'static>,
-    dev: E1000Phy,
+    dev: SmolPhy,
     /// socket-id (index) → (smoltcp handle, owning HANDLES row, transport kind). `None` = free slot.
     reg: [Option<(SocketHandle, usize, SockKind)>; NSOCK],
     /// SOCK-7: which TCP stream-buffer sets are in use. Decoupled from the reg-slot index so a
@@ -482,7 +465,7 @@ fn ensure_stack(guard: &mut Option<SmolStack>) -> bool {
     let Some((mac, our_ip, _up)) = e1000::hw_addr() else {
         return false;
     };
-    let mut dev = E1000Phy::new([0; 4]);
+    let mut dev = SmolPhy::with_observer(ArpSnoop::new([0; 4]));
     let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
     config.random_seed = 0x5343_4B32; // "SCK2"
     let iface = Interface::new(config, &mut dev, Instant::from_millis(0));
