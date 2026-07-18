@@ -5398,6 +5398,44 @@ arches; knob-off `UNAOS_GICV3=1 ./arroyo test-arm 40` CAPSTONE 6/6, `./arroyo te
 22` + `./arroyo kernel8-test` 0 FAIL; knob-on `UNAOS_SDMMC=1 UNAOS_GICV3=1 ./arroyo test-arm 40` prints the
 witness line + CAPSTONE 6/6 intact. Landing: `review/unaos-orin-sdmmc1-LANDING.md`.
 
+#### ORIN-SDMMC-2 — the write path behind the paranoia ladder (`UNAOS_SDMMC_ARM`, a SEPARATE arm on top of `UNAOS_SDMMC`)
+
+**Double-gating (the seated card is sacred).** The write path is gated on a **second, separate** explicit arm
+on top of the `sdmmc` recon feature: a `sdmmc_arm` cargo feature (which `requires` `sdmmc`), wired to
+`UNAOS_SDMMC_ARM=1`. A card write happens only when BOTH are present — the recon knob (`UNAOS_SDMMC=1`) alone
+never writes the card. **Every line of the write path is `sdmmc_arm`-gated**, so a plain `UNAOS_SDMMC=1` build
+is byte-identical in behavior to the merged ORIN-SDMMC-1 recon: the unarmed kernel contains **zero** SDMMC-2 /
+`ladder` strings (the whole-file binary hash differs only in Cargo's feature-fingerprint metadata, which the
+compiler embeds in symbol hashes once the feature exists — the active code is unchanged).
+
+**The paranoia ladder** (announced-before-issue, bounded, RESTORE-by-construction). After the read census
+(M1–M3), when armed, the driver runs seven verified steps against the SEATED card:
+1. **re-run the rung-1 read census** (sector 0) and confirm it is byte-stable since the census read;
+2. **pick the SCRATCH REGION** — the card's **last block** (LBA `capacity-1`), **only if sector 0 shows no
+   GPT**. This is the scratch-region rule: a GPT **backup** header lives in the card's last LBA, exactly where
+   the scratch region sits, so **with GPT present the ladder REFUSES all scratch writes this arc** and says so
+   honestly (`write ladder REFUSED (GPT present …)`). Without GPT there is no end-of-device structure to
+   endanger, and the write is stashed-then-restored regardless, so a power loss mid-ladder can only corrupt an
+   end-of-device block that held no partition/backup structure — the justification for the rule;
+3. **read + stash** the scratch block's current contents;
+4. **single-block CMD24 WRITE** of a stamped pattern (ASCII marker + LBA + a byte-position sweep);
+5. **read-back + byte-compare** against the pattern (the write verified);
+6. **RESTORE** the stashed original;
+7. **read-back + byte-compare** the restoration.
+
+`:: SDMMC: write ladder — write/verify/restore/verify => PASS ::` is emitted **only if every step verified**.
+Any mismatch is a **distinct `ladder FAIL step N (…)` line naming the step**. If a write may have landed
+(steps 4/5), an **emergency restore** of the stash runs; and if a restore step (6/7) or the emergency restore
+**cannot be verified**, the driver **dumps the stashed original as 32 `stash[0xNN]:` hex rows** so the data is
+never silently lost. The CMD24 primitive is the driver's **only** card-write, reachable only from the ladder,
+only under `sdmmc_arm`, only against a stashed scratch block; it waits for transfer-complete **and** DAT0-busy
+release so a following read never races the card's internal programming. Multi-block (CMD25/CMD18) is not used
+this arc — the witness is single-block only.
+
+**Virt witness (armed):** on a `sdmmc_arm` build without `tegra`, one extra honest metal-only line (zero MMIO)
+records the ladder is compiled-present but has no Tegra234 SDMMC to write. Bench runbook (both rungs):
+`scripts/orin-sdmmc1-bench.md`. Landing: `review/unaos-orin-sdmmc2-LANDING.md`.
+
 ## AARCH64-VNET — virtio-net-mmio driver + smoltcp bind on QEMU `virt` (`UNAOS_VNET`, knob-gated)
 
 **Purpose: a pre-metal, QEMU-testable proof of the aarch64 smoltcp seam that ORIN-NET-4 built.** NET-4's

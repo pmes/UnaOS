@@ -275,7 +275,7 @@ sdmmc = []
 # verify -> restore -> verify) after the read census. EVERY line of the write path is gated on this
 # feature, so an `sdmmc`-without-`sdmmc_arm` build is byte-identical to the merged ORIN-SDMMC-1 recon
 # (zero card writes, unchanged serial output). See arch_arm64.md §ORIN-SDMMC and
-# scripts/orin-sdmmc-bench.md.
+# scripts/orin-sdmmc1-bench.md.
 sdmmc_arm = ["sdmmc"]
 
 # AARCH64-VNET: the `UNAOS_VNET=1` virtio-net-mmio driver on the QEMU `virt` machine + smoltcp bind

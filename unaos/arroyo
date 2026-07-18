@@ -213,7 +213,7 @@ _feats=""
 # stamped pattern -> verify -> restore -> verify), announced-before-issue and bounded. On virt it prints a
 # metal-only ARMED witness line (zero MMIO); on metal (combine with UNAOS_TEGRA=1) it runs the ladder after
 # the read census. UNAOS_SDMMC=1 WITHOUT this is byte-identical to the ORIN-SDMMC-1 recon. See
-# arch_arm64.md §ORIN-SDMMC and scripts/orin-sdmmc-bench.md.
+# arch_arm64.md §ORIN-SDMMC and scripts/orin-sdmmc1-bench.md.
 [ -n "${UNAOS_SDMMC_ARM:-}" ] && _feats="${_feats}sdmmc_arm,sdmmc,"
 # AARCH64-VNET: UNAOS_VNET=1 arms the virtio-net-mmio driver + smoltcp bind on the QEMU `virt` machine
 # (arch/aarch64/virtio_net.rs) — the QEMU-testable proof of the aarch64 smoltcp seam NET-4 built. Scans
