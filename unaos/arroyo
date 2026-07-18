@@ -195,6 +195,17 @@ _feats=""
 # UNAOS_TEGRA=1. Default OFF => module + call sites vanish, smoltcp not pulled, byte-identical to
 # baseline. See arch_arm64.md §ORIN-NET-4 and scripts/orin-net4-bench.md.
 [ -n "${UNAOS_NET4:-}" ] && _feats="${_feats}net4,pcie3,pcie2,"
+# ORIN-SDMMC-1: UNAOS_SDMMC=1 arms the Tegra234 microSD-slot SDMMC controller READ-ONLY recon — the
+# installer line's first rung (arch/aarch64/sdmmc_tegra.rs). Resolves the controller from the live DTB
+# (compatible/name match, no hardcoded base; the enabled removable instance = the microSD slot), maps
+# its register window, does a poison-honest CAPS/version probe (NET-4b law: read before any write), runs
+# the SDHCI identification ladder to CID/CSD/capacity, and reads sector 0 (CMD17) to classify MBR/GPT/FAT.
+# READ-ONLY to the card by construction (no CMD24/write path). Standalone (does NOT imply tegra, mirroring
+# pcieprobe): the recon runs on BOTH the metal tegra path (combine with UNAOS_TEGRA=1) and the QEMU virt
+# GICv3 path, where — QEMU modelling no Tegra234 SDMMC — the tegra-gated MMIO is compiled out and it prints
+# one honest compiled-present witness line (zero MMIO). Default OFF => module + call sites vanish,
+# byte-identical to baseline. See arch_arm64.md §ORIN-SDMMC and scripts/orin-sdmmc1-bench.md.
+[ -n "${UNAOS_SDMMC:-}" ] && _feats="${_feats}sdmmc,"
 # AARCH64-VNET: UNAOS_VNET=1 arms the virtio-net-mmio driver + smoltcp bind on the QEMU `virt` machine
 # (arch/aarch64/virtio_net.rs) — the QEMU-testable proof of the aarch64 smoltcp seam NET-4 built. Scans
 # the fixed virtio-mmio window, drives the LEGACY transport, and runs an ICMP-ping witness against the

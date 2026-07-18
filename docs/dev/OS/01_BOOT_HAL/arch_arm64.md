@@ -5300,6 +5300,104 @@ metal boot-stick default only after a clean multi-boot metal record. The staged 
 declare it the stick default. (The xHCI-takeover wall of §JETSON-XCARVE is image-layout-sensitive; a
 new default layout may sample it — that is expected wall data, not an arc failure. QEMU cannot fire it.)
 
+### ORIN-SDMMC — Tegra234 microSD-slot SDMMC controller READ-ONLY recon (`UNAOS_SDMMC`, knob-gated; the installer line's first rung)
+
+**Context — the installer line.** The Orin devkit is the "mule" for a UnaOS-native installer: it has the
+microSD slot, and the goal (a later arc) is to write the card **from a booted UnaOS** (boot the validated
+USB stick → flash the card in place → verify by content → reboot). An installer is storage-target bring-up
++ partition/format + payload write + verify. ORIN-SDMMC-1 is the **first rung**: the NET-1 house pattern of
+**read-only census before any touch**. It resolves the SDMMC controller, brings the SDHCI engine up to
+card-identification, reads CID/CSD/capacity, and reads sector 0 — and **writes nothing to the card**. The
+write path (a scratch-region → readback → real-write paranoia ladder) is a separate arc (SDMMC-2) behind
+its own arm flag; the seated card is sacred until then.
+
+**Driver:** `arch/aarch64/sdmmc_tegra.rs`, `sdmmc`-feature-gated, tegra-gated at the MMIO layer (the net4
+witness pattern). Mirrors the proven Pi 4 `drivers::emmc2` SDHCI register/bit model — the BCM2711 "32-bit
+view" register names ARE the standard SDHCI block (BLKSIZECNT 0x04, ARG1 0x08, CMDTM 0x0C, RESP 0x10.., DATA
+0x20, PRESENT-STATE 0x24, CONTROL0 0x28, CONTROL1 0x2C, INTERRUPT 0x30, CAPS 0x40), which Tegra234 serves
+identically. Mirrored, not copied: the base is DTB-resolved (no hardcode), and the Tegra vendor quirks are
+documented rather than assumed away.
+
+**The census design (M1–M3).**
+- **M1 — FDT census + poison-honest probe.** A read-only DTB walk enumerates every SDMMC/SDHCI-compatible
+  node (compatible `nvidia,tegra234-sdhci` / a `mmc@`/`sdhci@` node name), logging each candidate's `reg`
+  base/size, `status`, `non-removable`/`cd-gpios` flags, and a bounded `compatible` ASCII view. The picked
+  instance is the **enabled removable** one (the microSD slot; the on-module eMMC is `non-removable`), with
+  the first-enabled instance as a documented fallback. No hardcoded base — the DTB decides. The controller
+  window sits in the GiB-0 device window `mmu_tegra` already maps Device-nGnRE at boot (sdmmc1 @
+  `0x0340_0000` « `0x4000_0000`), so it is reached without the pcie2 `map_mmio_window` path — guarded by a
+  mapped-GiB check (never deref an unmapped address). Then, **before any write** (the NET-4b law), the
+  `CAPABILITIES`/Host-Version registers are read and poison-checked (`0xffffffff`/`0xdeadbeef`/`0xa5a5a5a5`
+  ⇒ absent decode ⇒ **honest refusal**, no reset, no writes).
+- **M2 — SDHCI identification (READ-ONLY).** Reset, status-latch, 3.3 V bus power, card-detect (Present
+  State bit 16; absent ⇒ an honest "no card seated" line, never a hang), 400 kHz identification clock, then
+  the ladder CMD0 → CMD8 → CMD55/ACMD41 → CMD2 (CID) → CMD3 (RCA) → CMD9 (CSD) → CMD7 → CMD16, raising to
+  the 25 MHz default-speed transfer clock. Prints the **CID** (manufacturer/OEM/product/revision/serial/
+  date), the **CSD-derived capacity** (blocks + MiB, CSD v1/v2), and the negotiated **bus width/speed**
+  (1-bit, default-speed). Every wait is CNTPCT-bounded.
+- **M3 — sector-0 read census.** A single-block CMD17 READ into a 512-byte stack buffer, then the first 16
+  bytes hex + a signature classification: **GPT-protective MBR** (0x55AA + first-partition type 0xEE),
+  **FAT boot sector** (jump opcode + "FAT" type string), **MBR** (0x55AA), or **unknown**.
+
+**Read-only by construction.** The module issues ONLY the identification ladder + CMD17 single-block READ.
+There is no `cmd(24)`/WRITE_SINGLE_BLOCK, no CMD25, no ACMD6 bus-width write, no erase, no CMD6 switch — a
+`grep` of the source for `WRITE`/`write_block`/`cmd(24)` finds nothing targeting card storage. The
+controller-register writes it does make (SRST, clock, power, command issue) are the SDHCI machinery every
+read needs; none is a write to the card's storage.
+
+**Tegra vendor-quirk assumptions (documented; metal-pending).** (1) The firmware/BPMP already enabled the
+sdmmc1 module clock + pad power (the bootloader read the card to boot); we drive only the standard SDHCI
+internal-clock divider, never the CAR/BPMP clock or the Tegra vendor pad registers (≥ 0x100). If the
+internal clock never stabilises, the diagnosis is "input clock gated" (a BPMP-clock MRQ, a later arc) —
+surfaced, never worked around. (2) If `CAPABILITIES[15:8]` reads 0, a documented 200 MHz base is assumed
+(logged); identification runs at 400 kHz then 25 MHz, so an inexact base only changes the divider. (3)
+4-bit / high-speed negotiation is deferred (not needed to census the card).
+
+**QEMU vs metal.** QEMU models no Tegra234 SDMMC controller, so the whole MMIO path is `tegra`-gated: a
+`sdmmc`-standalone (virt) build does **zero MMIO** and prints one honest compiled-present witness line; only
+`UNAOS_SDMMC=1 UNAOS_TEGRA=1` on real Orin silicon touches the controller. Correctness off-metal comes from
+`arroyo check`, the QEMU regression non-regression (the tegra code is compiled out on virt), and faithful
+adherence to the SD Physical Layer / SDHCI spec. Metal leg: census whatever card is seated (bench runbook
+`scripts/orin-sdmmc1-bench.md`).
+
+**Expected metal serial chain** (grep `SDMMC`):
+```
+:: SDMMC: ORIN-SDMMC-1 Tegra234 microSD READ-ONLY recon (DTB @0x… size=0x…) ::
+:: SDMMC:   M1: candidate /bus@0/mmc@3400000 reg=0x03400000(size 0x10000) status=okay removable cd-gpios compat='nvidia,tegra234-sdhci|' ::
+:: SDMMC:   M1: picked /bus@0/mmc@3400000 @ 0x03400000 (size 0x10000) as the microSD slot ::
+:: SDMMC:   M1: controller window 0x03400000(+0x10000) is in the GiB-0 device window (already Device-nGnRE) ::
+:: SDMMC:   M1: live SDHCI — CAPABILITIES=0x……… (base-clk … MHz, 8-bit=…, ADMA2=…), spec-version reg=0x… (SDHCI 4.0) ::
+:: SDMMC:   M2: card detected (Present State 0x………) ::
+:: SDMMC:   M2: CID manufacturer(MID)=0x… OEM(OID)='..' product(PNM)='.....' rev=0x. serial(PSN)=0x……… date=M/YYYY ::
+:: SDMMC:   M2: capacity … blocks (… MiB, CSD v2), addressing block (SDHC/SDXC), v2 (CMD8 ok) ::
+:: SDMMC:   M2: identified — RCA 0x…, bus 1-bit, default-speed (<=25 MHz) [4-bit/HS negotiation deferred] ::
+:: SDMMC:   M3: sector 0 first 16 bytes = xx xx … ::
+:: SDMMC:   M3: sector-0 signature = GPT-protective MBR (…) ::
+:: SDMMC: ORIN-SDMMC-1 DONE — microSD censused: … blocks (… MiB, CSD v2), sector-0 … (READ-ONLY; no card write) ::
+```
+
+**Refusal / no-card signatures (all honest, all bounded — none is a bug to work around):**
+- `M1: CAPABILITIES[…] = 0x… — POISON … recon REFUSED (no reset, no writes)` — the window is not a live
+  SDHCI (open bus / carveout / firmware fill); the NET-4b read-before-write guard doing its job.
+- `M2: no card seated (Present State …, Card-Inserted clear) — census done, nothing to identify` — an empty
+  slot, the honest terminal state.
+- `M2: internal clock never stabilised … the input clock is gated (BPMP-clock diagnosis)` — the vendor-quirk
+  (1) fallback; scope a BPMP-clock arc, do not touch the CAR.
+- `M1: no SDMMC/SDHCI-compatible node found` / `M1: controller window … outside the already-mapped GiB
+  windows` — DTB resolution or reach refusal.
+
+**STOP for the bench:** any RAS/SError line, or any `>>> … WRITE` announcing a card-storage write (there
+must be **none** — this rung is read-only). See `scripts/orin-sdmmc1-bench.md`.
+
+**Byte-identity.** `sdmmc`-off, the module + both call sites vanish; the tegra image is byte-identical to
+baseline (zero `SDMMC` strings knob-off). Standalone feature — does not imply `tegra`/`pcie2`, so it runs on
+both the metal tegra build (`UNAOS_SDMMC=1 UNAOS_TEGRA=1`) and the virt witness build (`UNAOS_SDMMC=1`).
+
+**Gates green.** `./arroyo check` default + `UNAOS_SDMMC=1 UNAOS_TEGRA=1` + `UNAOS_SDMMC=1` (virt) all both
+arches; knob-off `UNAOS_GICV3=1 ./arroyo test-arm 40` CAPSTONE 6/6, `./arroyo test-arm 22` + `./arroyo test
+22` + `./arroyo kernel8-test` 0 FAIL; knob-on `UNAOS_SDMMC=1 UNAOS_GICV3=1 ./arroyo test-arm 40` prints the
+witness line + CAPSTONE 6/6 intact. Landing: `review/unaos-orin-sdmmc1-LANDING.md`.
+
 ## AARCH64-VNET — virtio-net-mmio driver + smoltcp bind on QEMU `virt` (`UNAOS_VNET`, knob-gated)
 
 **Purpose: a pre-metal, QEMU-testable proof of the aarch64 smoltcp seam that ORIN-NET-4 built.** NET-4's

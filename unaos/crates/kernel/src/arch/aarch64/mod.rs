@@ -121,6 +121,15 @@ pub mod pcie_probe;
 #[cfg(feature = "net4")]
 pub mod rtl8168_tegra;
 
+// ORIN-SDMMC-1 (`UNAOS_SDMMC=1`): the Tegra234 microSD-slot SDMMC controller READ-ONLY recon
+// (arch/aarch64/sdmmc_tegra.rs) — the installer line's first rung. Resolves the controller from the live
+// DTB, poison-honest CAPS probe, SDHCI identification ladder (CID/CSD/capacity), and a sector-0 read to
+// classify MBR/GPT/FAT — no card write anywhere. The controller MMIO is additionally `tegra`-gated (QEMU
+// models no Tegra234 SDMMC); a sdmmc/virt build only prints one honest compiled-present witness line.
+// Feature-gated only — compiles for both builds. Default OFF => module + call sites vanish, byte-identical.
+#[cfg(feature = "sdmmc")]
+pub mod sdmmc_tegra;
+
 // AARCH64-VNET (`UNAOS_VNET=1`): a virtio-net-mmio driver on the QEMU `virt` machine + smoltcp bind
 // (arch/aarch64/virtio_net.rs). The QEMU-testable proof of the aarch64 smoltcp seam NET-4 built — the
 // identical ring → phy::Device → Interface → ICMP-echo shape, driven with REAL packets over QEMU
