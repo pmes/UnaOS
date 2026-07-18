@@ -337,6 +337,22 @@ define_class!(
 
                     if !item.is_null() {
                         let node = Retained::cast_unchecked::<UnaMatrixNode>(Retained::retain(item).unwrap());
+                        // Collapsing a parent makes AppKit fire DidCollapse for
+                        // its expanded descendants too. Those cascade victims are
+                        // already hidden (rowForItem == -1); only a directly
+                        // user-collapsed item is still visible. Don't report the
+                        // cascade to the brain — its nested expansion state is
+                        // exactly what lets a reopened parent restore its shape.
+                        let row: NSInteger = {
+                            let ov = self.ivars().outline_view.borrow();
+                            match ov.as_ref() {
+                                Some(ov) => msg_send![&**ov, rowForItem: &*node],
+                                None => -1,
+                            }
+                        };
+                        if row < 0 {
+                            return;
+                        }
                         *node.ivars().is_expanded.borrow_mut() = false;
                         if !*self.ivars().suppress_expand_events.borrow() {
                             let id = node.ivars().node_id.borrow().clone();
