@@ -36,9 +36,9 @@ pub mod devtree;
 /// native objects (typed attrs + retained-root snapshots), instrumented as the
 /// first-class UnaFS baseline benchmark. See the module docs.
 pub mod usync;
-#[cfg(feature = "gtk4")]
+#[cfg(feature = "gtk")]
 use gtk4::prelude::*;
-#[cfg(feature = "gtk4")]
+#[cfg(feature = "gtk")]
 use gtk4::{Align, Box, Label, Orientation, Widget};
 
 // Gix (Gitoxide) Imports
@@ -49,7 +49,7 @@ use gix::object::tree::diff::Change;
 // UnaFS: the vault-probe rides its fail-closed mount check (read-only).
 use unafs::{FileDevice, UnaFS};
 
-#[cfg(feature = "gtk4")]
+#[cfg(feature = "gtk")]
 pub fn create_view() -> Widget {
     let vaire_box = Box::new(Orientation::Vertical, 10);
     vaire_box.set_valign(Align::Center);

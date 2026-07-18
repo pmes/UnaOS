@@ -5851,6 +5851,7 @@ dependencies = [
  "matrix",
  "quartzite",
  "rustls",
+ "tabula",
  "tokio",
 ]
 
@@ -5989,7 +5990,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bandy",
- "elessar",
  "gix",
  "glib 0.21.5",
  "gtk4",
