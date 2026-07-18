@@ -1171,6 +1171,49 @@ keyboard + vendor self-test unregressed, **zero** mode-switch lines (QEMU never 
 (the switch actually starts the stream and the cursor moves) is **deferred** to the next attended
 sitting — no flash media staged, no ESP rebuilt.
 
+### 10e. RMBP-FIX — the stream is 8-byte Report ID 0x02 (the 0x44 multitouch model is REFUTED)
+
+The 2026-07-18 attended sitting proved the mode switch (§10d) works: the internal trackpad **streams**
+after the merged mode switch — **736+ reports observed**. But the reports are **NOT** the descriptor's
+opaque `0x44` / 511-byte multitouch frame the §10c hypothesis modeled. Ground truth from silicon: the
+reports are **8 bytes, Report ID `0x02`** — `[0]` = id (`0x02`), `[1]` = buttons (`0x00` up / `0x01`
+down, confirmed via a held press), `[2]` = dx int8, `[3]` = dy int8, `[4..=5]` zero, `[6..=7]` unknown.
+This is a plain **relative** pointer stream. The old `0x44`/multitouch-frame model is **refuted on this
+device path** and must not be re-litigated.
+
+**M1 — bound the raw dump.** `service`'s `vendor_mt` branch used to call `dump_vendor_report` on the
+first + every 32nd report; under touch that is ~100+ **heap-allocating** serial lines/sec, which floods
+the framebuffer console until the machine appears hung. The byte characterization it existed to capture
+is now **complete**, so the dump is bounded **hard**: gated to the `usbdebug` build **and** the first
+**4** reports per device (`#[cfg(feature = "usbdebug")] if e.reports <= 4`). On a default/GUI build the
+whole block — and `dump_vendor_report` itself — is **compiled out**: zero dumps, zero `String` alloc on
+the hot path.
+
+**M2 — retarget the decoder (`decode_trackpad_rel`).** The live path now length-checks the report
+(`len >= 4`), gates on `report[0] == 0x02` (`TRACKPAD_REPORT_ID`; a short or non-`0x02` report yields
+`None` → no event, no state change), and reads `buttons`, `dx` (int8), `dy` (int8) straight into the
+relative `pal::Event::Mouse` seam — the same path the boot-mouse uses. A bounded one-line **format
+witness** prints on the first decoded report. `buttons` is decoded and witnessed but no click event is
+emitted (parity with the `is_rel_mouse` boot-mouse path — the relative pointer seam carries no button
+today). The refuted `decode_vendor_first_finger` + `VMT_FINGER_*` constants + `vendor_multitouch_selftest`
+are **kept as documented reverse-engineering history** (per the never-trash rule) — the self-test still
+runs and passes at init, exercising that decode's mechanics; it is simply no longer the live path.
+
+**M3 — EHCI keyboard in `pal::pump_and_poll`.** The internal keyboard rides EHCI, but `pump_and_poll`
+(the input pump a full-screen demo like `vug`/`pulse` runs inside its own loop) only serviced xHCI, so
+the built-in keyboard could never post the keystroke to exit the demo. It now also calls
+`ehci::service_ehci_hid()` under `#[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]` — a harmless
+no-op in QEMU (xHCI-only; no EHCI HID controller armed) and on aarch64 (compiled out).
+
+**QEMU vs metal honesty.** All three are **metal-behavior** fixes on the real `05ac:0262` trackpad /
+internal keyboard. QEMU's `usb-tablet` never sets `vendor_mt` and QEMU has no EHCI HID, so QEMU proves
+only **non-regression**; the metal verdict (cursor moves from the retargeted decode; keyboard exits a
+demo) accrues to the next attended sitting.
+
+**Gates (RMBP-FIX).** `./arroyo check` green both arches. `./arroyo test 22` + `UNAOS_CPU=qemu64 test 22`
+MISSION SUCCESS, keyboard + vendor self-test unregressed, 0 FAIL. `UNAOS_EHCITABLET=1 test 22` MISSION
+SUCCESS, the `usb-tablet` report-pointer path arms unchanged. `./arroyo test-arm 22` 0 FAIL / 0 PANIC.
+
 ---
 
 ## See also
