@@ -46,6 +46,14 @@ pub mod allocator;
 pub mod shell;
 pub mod selftest;
 
+// INSTALL-CORE: the storage-agnostic installer engine (GPT writer + FAT32 formatter + extent
+// content-verify) over the arch-neutral `InstallTarget` trait. The engine is arch-neutral and
+// compiles on both arches under `installdemo` (UNAOS_INSTALLDEMO=1); its witness `run_demo` is invoked
+// only from the x86_64 boot path this arc (the QEMU scratch disk is x86). Default OFF => the module +
+// its call site vanish and every image is byte-identical to baseline. See docs/dev/OS/10_INSTALL/.
+#[cfg(feature = "installdemo")]
+pub mod install;
+
 // FLIGHT-RECORDER: capture the serial boot log into a bounded ring and flush it to UNAOS.LOG on the
 // FAT boot volume, so a consumer who boots the vm-image with no serial capture can copy the log off
 // the image afterward. x86-only (the capture tap lives in arch/x86_64/serial.rs); aarch64 unaffected.

@@ -325,6 +325,17 @@ smc = []
 # See docs/dev/OS/08_VIDEO/rasterizer.md.
 rast = ["dep:rast"]
 
+# INSTALL-CORE: the `UNAOS_INSTALLDEMO=1` storage-agnostic installer engine + its boot witness
+# (crates/kernel/src/install/). Arms a GPT writer + FAT32 formatter + extent content-verify against a
+# dedicated BLANK scratch disk the builder attaches over the usb-storage slot (the boot ESP is a
+# separate ide-hd, never touched). The engine is arch-neutral — it drives only `drivers::block` — so
+# it COMPILES on both arches under this feature (its pub API raises no dead-code warning on aarch64);
+# the witness `install::run_demo` call site is x86_64-only (the QEMU scratch disk is x86 this arc).
+# The engine refuses to write unless the target's leading sectors are blank (never-touch-a-seated-card
+# discipline). Default OFF => the module + call site vanish and every image is byte-identical to
+# baseline. See docs/dev/OS/10_INSTALL/installer_engine.md.
+installdemo = []
+
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage
 lazy_static = { version = "1.5.0", features = ["spin_no_std"] }

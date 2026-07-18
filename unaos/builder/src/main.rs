@@ -89,6 +89,11 @@ fn main() {
     // driver; the QEMU isa-applesmc device is attached below under the same knob so the protocol
     // machinery is gated by a known-key read. Kept in sync with arroyo's mapping.
     if std::env::var("UNAOS_SMC").is_ok() { feats.push("smc"); }
+    // INSTALL-CORE: UNAOS_INSTALLDEMO=1 arms the installer engine + its x86 boot witness (GPT writer
+    // + FAT32 formatter + extent content-verify) against the blank scratch disk attached below under
+    // the same knob. Kept in sync with arroyo's mapping. (The builder rebuilds the kernel, so this
+    // MUST be here or the feature never reaches the kernel binary.)
+    if std::env::var("UNAOS_INSTALLDEMO").is_ok() { feats.push("installdemo"); }
     // VPERF M2: the fbcon viewport-cap bench lever (implies videobench). x86_64 only.
     if std::env::var("UNAOS_VIDEOCAP").is_ok() { feats.push("videocap"); }
     // SMOLNET-DEFAULT: smoltcp is the DEFAULT x86 net stack (2026-07-17). Push `smolnet` (shell
@@ -251,6 +256,25 @@ fn main() {
         Some("p16") => workspace_dir.join("builder/fat16.img"),
         Some("sf") => workspace_dir.join("builder/fat-sf.img"),
         Some(path) => std::path::PathBuf::from(path),
+    };
+    // INSTALL-CORE (UNAOS_INSTALLDEMO=1): the installer engine's target is a DEDICATED BLANK scratch
+    // disk — NOT usb.img and NOT any FAT image. Create a fresh, all-zero 128 MiB image in target/ each
+    // run (truncated to zero length first, so it is provably blank for the engine's blank-check
+    // guard), and back the usb-storage slot with it. The boot ESP stays on the separate ide-hd, so
+    // the engine writes ONLY this scratch disk. This OVERRIDES UNAOS_FATIMG (the two are exclusive:
+    // the installer demo owns the block device). Not a genuinely-second drive because the block layer
+    // is single-device (a second usb-storage would need xHCI multi-device support, out of this arc's
+    // lane); reusing the usb-storage slot as the scratch keeps the boot ESP cleanly separate.
+    let installdemo = std::env::var("UNAOS_INSTALLDEMO").is_ok();
+    let stick_image = if installdemo {
+        let scratch = target_dir.join("installscratch.img");
+        let f = std::fs::File::create(&scratch).unwrap(); // create truncates -> all-zero sparse file
+        f.set_len(128 * 1024 * 1024).unwrap(); // 128 MiB blank scratch
+        drop(f);
+        println!("   UNAOS_INSTALLDEMO: fresh BLANK 128 MiB scratch disk -> {}", scratch.display());
+        scratch
+    } else {
+        stick_image
     };
     if stick_image != usb_image && !stick_image.exists() {
         panic!("UNAOS_FATIMG set but {} is missing — run `./arroyo fat-img` first",

@@ -99,6 +99,15 @@ _feats=""
 # the protocol machinery is gated by a known-key read; battery keys are metal-first. Default OFF =>
 # module + call sites unlinked, media byte-identical. Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_SMC:-}" ] && _feats="${_feats}smc,"
+# INSTALL-CORE: UNAOS_INSTALLDEMO=1 arms the installer engine + its x86 boot witness (GPT writer +
+# FAT32 formatter + extent content-verify). The builder attaches a dedicated BLANK scratch disk over
+# the usb-storage slot under this knob (see builder/src/main.rs), against which the engine writes a
+# GPT + FAT32 ESP + a payload file and content-verifies it (incl. a 1-byte-corruption negative test),
+# emitting `:: INSTALL: gpt+fat32+copy verify => PASS ::`. The engine refuses any target whose leading
+# sectors are not blank. Arch-neutral engine (compiles both arches under the feature); witness is
+# x86-only. Default OFF => module + call site vanish, media byte-identical. Kept in sync with
+# builder/src/main.rs.
+[ -n "${UNAOS_INSTALLDEMO:-}" ] && _feats="${_feats}installdemo,"
 # SMOLNET-DEFAULT: smoltcp is the DEFAULT x86 net stack (2026-07-17, Peter's ruling). The mature
 # smoltcp TCP/IP stack (ROADMAP §1b) carries the shell's ping/arp/netinfo + the socket syscalls + the
 # boot witnesses; the hand-rolled `net` crate is RETIRED as the default (kept in tree, live, resumable
