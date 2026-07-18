@@ -281,6 +281,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
         unaos_kernel::drivers::emmc2::probe();
 
+        // INSTALL-PI: the installer engine's first LIVE end-to-end execution — GPT → FAT32 → payload copy
+        // → sha extent-verify onto the emmc2 microSD just censused above. Three-gate escalation (census /
+        // scratch-ladder / destructive-confirm), all `piinstall*`-gated, so a default build compiles NONE
+        // of this and this call site vanishes. In QEMU `raspi4b` the SD slot carries a DEDICATED BLANK
+        // scratch image (the `./arroyo kernel8-install` witness), never the battery fixture.
+        #[cfg(feature = "piinstall")]
+        unaos_kernel::install::pi::run();
+
         // PI-USB-2: the DMA-side xHCI bring-up + device enumeration on the VL805, post-heap on the BSP.
         // `piusb::bringup` (pre-heap, in build_boot_info) already reached the honesty line (RC link +
         // VL805 found + BAR sized + xHCI decoding + ports powered); this reads its handoff, programs

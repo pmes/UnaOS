@@ -857,6 +857,23 @@ kernel8() {
         K8_FEATS="${K8_FEATS},genet"
         echo -e "${COLOR_YELLOW}  • UNAOS_GENET: BCM2711 GENET v5 GbE + smoltcp bind (M1 probe classifies QEMU modelling; attended-metal for link/DHCP)${COLOR_RESET}"
     fi
+    # INSTALL-PI: the UNAOS_PIINSTALL family — the installer engine's first LIVE end-to-end execution on the
+    # Pi emmc2 microSD (install/pi.rs). Three-gate escalation; each knob adds the next feature (cargo also
+    # implies the previous). OFF => the module + call site + engine vanish, byte-identical to baseline. The
+    # QEMU-live witness is `./arroyo kernel8-install` (below), which arms _CONFIRM against a BLANK scratch
+    # image — NEVER the battery fixture. See docs/dev/OS/10_INSTALL/installer_engine.md §INSTALL-PI.
+    if [ -n "${UNAOS_PIINSTALL:-}" ]; then
+        K8_FEATS="${K8_FEATS},piinstall"
+        echo -e "${COLOR_YELLOW}  • UNAOS_PIINSTALL: Gate 1 — emmc2 microSD read-only census + announce${COLOR_RESET}"
+    fi
+    if [ -n "${UNAOS_PIINSTALL_ARM:-}" ]; then
+        K8_FEATS="${K8_FEATS},piinstall_arm"
+        echo -e "${COLOR_YELLOW}  • UNAOS_PIINSTALL_ARM: Gate 2 — non-destructive scratch write/verify/restore ladder${COLOR_RESET}"
+    fi
+    if [ -n "${UNAOS_PIINSTALL_CONFIRM:-}" ]; then
+        K8_FEATS="${K8_FEATS},piinstall_confirm"
+        echo -e "${COLOR_YELLOW}  • UNAOS_PIINSTALL_CONFIRM: Gate 3 — DESTRUCTIVE install (GPT→FAT32→payload→verify)${COLOR_RESET}"
+    fi
     echo -e "${COLOR_YELLOW}⚡ Building bare-metal kernel8.img (Pi 4, microSD-slot boot)...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/kernel"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/kernel/pi-baremetal.ld" \
@@ -986,6 +1003,92 @@ test_kernel8() {
     kill "$qpid" 2>/dev/null || true
     wait "$qpid" 2>/dev/null || true
     echo -e "${COLOR_GREEN}✅ Serial:${COLOR_RESET} ${logf}    ${COLOR_GREEN}Screen:${COLOR_RESET} ${png}"
+}
+
+# INSTALL-PI live witness: the installer engine's FIRST full end-to-end execution that needs no bench.
+# Builds kernel8.img with the three install gates armed (UNAOS_PIINSTALL_CONFIRM ⇒ arm ⇒ piinstall),
+# boots raspi4b with a DEDICATED BLANK SCRATCH SD image in the (single) slot — NEVER the kernel8-test
+# battery fixture — so the full flow (GPT → FAT32 → payload copy → sha extent-verify) runs against a real
+# emulated card and emits `:: INSTALL: pi emmc2 gpt+fat32+copy verify => PASS ::`. Then re-reads the
+# scratch image ON THE HOST (GPT signature + protective-MBR + FAT32 boot-sector label bytes at known
+# offsets) — the installer's claim verified from OUTSIDE the kernel. See installer_engine.md §INSTALL-PI.
+install_pi() {
+    local secs="${1:-12}"
+    # Arm the three gates (cargo implies the lower two, but exporting all three makes the build log list
+    # every gate). Deliberately do NOT arm UNAOS_WITNESS — the scratch card is BLANK, so the fixture
+    # battery (which reads HELLO.BIN / the unafs volume back) must not run.
+    export UNAOS_PIINSTALL=1 UNAOS_PIINSTALL_ARM=1 UNAOS_PIINSTALL_CONFIRM=1
+    local scratch="${WORKSPACE_DIR}/target/pi-install-scratch.img"
+    local logf="${WORKSPACE_DIR}/target/serial-pi-install.log"
+    local scratch_mib="${UNAOS_PIINSTALL_MIB:-128}"
+
+    kernel8 # rebuild kernel8.img from current source with the install gates armed
+
+    # A PRISTINE all-zero scratch card every run (blank => the installer's blank-check + its own
+    # zero-ESP-metadata pass both apply; nothing of the boot media is ever at risk — the kernel boots via
+    # QEMU -kernel, and this card is a throwaway).
+    echo -e "${COLOR_CYAN}⚡ Generating blank ${scratch_mib} MiB scratch SD image -> ${scratch}${COLOR_RESET}"
+    rm -f "$scratch"
+    dd if=/dev/zero of="$scratch" bs=1048576 count="$scratch_mib" 2>/dev/null
+
+    rm -f "$logf"
+    echo -e "${COLOR_CYAN}⚡ INSTALL-PI live witness (${secs}s). Serial -> ${logf}${COLOR_RESET}"
+    local qmp_port="${UNAOS_QMP_PORT:-4465}"
+    while lsof -iTCP:"$qmp_port" -sTCP:LISTEN >/dev/null 2>&1; do qmp_port=$((qmp_port + 1)); done
+    qemu-system-aarch64 \
+        -machine raspi4b \
+        -kernel "$KERNEL8_DIR/kernel8.img" \
+        -serial "file:${logf}" -serial null -display none \
+        -drive if=sd,format=raw,file="${scratch}" \
+        -qmp tcp:127.0.0.1:${qmp_port},server,nowait \
+        ${UNAOS_QEMU_EXTRA:-} &
+    local qpid=$!
+    sleep "$secs"
+    kill "$qpid" 2>/dev/null || true
+    wait "$qpid" 2>/dev/null || true
+
+    # ── In-kernel verdict ──
+    echo -e "${COLOR_YELLOW}── INSTALL-PI serial verdict ──${COLOR_RESET}"
+    awk '/PIINSTALL|:: INSTALL:/' "$logf" || true
+    if awk '/:: INSTALL: pi emmc2 gpt\+fat32\+copy verify => PASS ::/' "$logf" | grep -q .; then
+        echo -e "${COLOR_GREEN}✅ in-kernel: install PASS line present${COLOR_RESET}"
+    else
+        echo -e "${COLOR_RED}❌ in-kernel: install PASS line MISSING${COLOR_RESET}"
+    fi
+
+    # ── Host-side verification: read the scratch image back from OUTSIDE the kernel ──
+    echo -e "${COLOR_YELLOW}── INSTALL-PI host-side verification (${scratch}) ──${COLOR_RESET}"
+    python3 - "$scratch" <<'PY'
+import sys
+img = sys.argv[1]
+SEC = 512
+ESP_LBA = 2048  # gpt::ESP_LBA_START
+with open(img, "rb") as f:
+    lba0 = f.read(SEC)
+    lba1 = f.read(SEC)
+    f.seek(ESP_LBA * SEC)
+    bs = f.read(SEC)
+ok = True
+def check(name, cond):
+    global ok
+    ok = ok and cond
+    print(("  PASS " if cond else "  FAIL ") + name)
+check("protective MBR 0x55AA signature", lba0[510:512] == b"\x55\xaa")
+check("protective MBR 0xEE GPT partition type @450", lba0[450] == 0xEE)
+check('primary GPT header "EFI PART" @LBA1', lba1[0:8] == b"EFI PART")
+check("GPT header revision 1.0", lba1[8:12] == bytes([0,0,1,0]))
+check('FAT32 boot sector "FAT32" fs-type @ESP+82', bs[82:87] == b"FAT32")
+check('FAT32 volume label "UNAOS" @ESP+71', bs[71:76] == b"UNAOS")
+check("FAT32 boot sector 0x55AA @ESP+510", bs[510:512] == b"\x55\xaa")
+print("HOST-VERIFY: " + ("PASS" if ok else "FAIL"))
+sys.exit(0 if ok else 1)
+PY
+    local hv=$?
+    if [ "$hv" -eq 0 ]; then
+        echo -e "${COLOR_GREEN}✅ host-side: GPT + FAT32 structures verified off the scratch image${COLOR_RESET}"
+    else
+        echo -e "${COLOR_RED}❌ host-side: verification FAILED${COLOR_RESET}"
+    fi
 }
 
 clean_all() {
@@ -1166,6 +1269,9 @@ case "${1:-}" in
     kernel8-test|test-pi)
         test_kernel8 "${2:-8}"
         ;;
+    kernel8-install|install-pi)
+        install_pi "${2:-12}"
+        ;;
     battery)
         battery
         ;;
@@ -1186,7 +1292,7 @@ case "${1:-}" in
         ;;
     *)
         echo -e "${COLOR_RED}Unknown command: $1${COLOR_RESET}"
-        echo "Usage: ./arroyo [x86|arm|test [secs]|test-arm [secs]|check|build|esp-x86|esp-arm|esp-jetson|vm-image|fat-img|test-fat [part|gpt|p16|sf] [secs]|kernel8|kernel8-run|kernel8-test [secs]|battery|clean]"
+        echo "Usage: ./arroyo [x86|arm|test [secs]|test-arm [secs]|check|build|esp-x86|esp-arm|esp-jetson|vm-image|fat-img|test-fat [part|gpt|p16|sf] [secs]|kernel8|kernel8-run|kernel8-test [secs]|kernel8-install [secs]|battery|clean]"
         exit 1
         ;;
 esac
