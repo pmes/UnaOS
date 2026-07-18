@@ -68,6 +68,13 @@ const TAG_SET_DOMAIN_STATE: u32 = 0x0003_8030; // set a power-domain's on/off st
 const TAG_SET_CLOCK_STATE: u32 = 0x0003_8001; // enable/disable a clock's GATE (value {clock_id, state})
 #[cfg(feature = "v3d")]
 const TAG_SET_CLOCK_RATE: u32 = 0x0003_8002; // set a clock's rate (value {clock_id, rate_hz, skip_turbo})
+// PI-USB-1: notify the VideoCore firmware to reset (and reload the SPI-EEPROM firmware into) the VIA
+// VL805 xHCI behind the BCM2711 PCIe RC. The RPi bootloader normally loads the VL805 firmware at power-on;
+// this tag re-issues that reset for an OS bringing the controller up itself. Value buffer = one u32, the
+// VL805's PCI device address `(bus<<20)|(dev<<15)|(fn<<12)` (bus 1, dev 0, fn 0 => 0x0010_0000).
+// `piusb`-gated so a knob-off kernel8 is byte-identical to baseline (additive, not on any default path).
+#[cfg(feature = "piusb")]
+const TAG_NOTIFY_XHCI_RESET: u32 = 0x0003_0058;
 const TAG_END: u32 = 0x0000_0000;
 
 // PI-V3D-1 identifiers for the two calls above (RPi firmware mailbox interface).
@@ -324,6 +331,24 @@ pub fn set_clock_rate(clock_id: u32, rate_hz: u32) -> Option<u32> {
     }
     let set = reply(6);
     if set == 0 { None } else { Some(set) }
+}
+
+/// PI-USB-1: ask the VideoCore firmware to reset the VL805 xHCI (RPi firmware property tag
+/// `NOTIFY_XHCI_RESET`, `0x00030058`). `dev_addr` is the VL805's PCI device address
+/// `(bus<<20)|(dev<<15)|(fn<<12)` — `0x0010_0000` for bus 1, dev 0, fn 0. The firmware re-runs the
+/// VL805 reset/firmware-load it does at cold boot; a bringing-up OS issues it after enumerating the
+/// controller and before attaching the xHCI driver. Returns whether the mailbox reported success.
+/// Single-user `MBOX` like the other calls (boot-time, single-threaded, framebuffer call long done).
+#[cfg(feature = "piusb")]
+pub fn notify_xhci_reset(dev_addr: u32) -> bool {
+    request(0, 7 * 4); // total size (7 words used)
+    request(1, 0); // request
+    request(2, TAG_NOTIFY_XHCI_RESET);
+    request(3, 4); // value buffer size (1 word: the PCI device address)
+    request(4, 0); // request code
+    request(5, dev_addr);
+    request(6, TAG_END);
+    mbox_call(7)
 }
 
 /// Bring up the VideoCore framebuffer: pick a resolution (the firmware's current mode if sane,

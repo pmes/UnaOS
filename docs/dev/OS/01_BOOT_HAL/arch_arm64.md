@@ -5421,3 +5421,82 @@ tags and reports BLOCK-DOWN). Knob-off byte-identity to baseline is preserved: e
 `./arroyo kernel8-test 43` = 46/46; **knob-off `kernel8.img` byte-identical to baseline `03105f0`**
 (sha256 recorded in the landing report). Positive V3D verification (power/clock/IDENT live, MMU
 program, GPU clear, panel blit) is the **attended Pi sitting** — see `scripts/pi-v3d-bench.md`.
+
+## PI-USB — BCM2711 PCIe root complex + VL805 xHCI attach on the Pi 4 (Arc PI-USB-1)
+
+Every USB-A port on the Raspberry Pi 4 hangs off **one** endpoint: the VIA **VL805** xHCI (PCI
+`1106:3483`), which sits behind the BCM2711's single PCIe root complex (`pcie@7d500000`,
+ARM-physical `0xFD50_0000` in low-peripheral mode). Bringing USB up therefore means bringing PCIe
+up first. `arch/aarch64/piusb.rs` (feature `piusb`, implies `baremetal`) does the whole chain to a
+**halted-but-decoding + ports-powered honesty line**; full device enumeration (rings, `ADDRESS_DEVICE`,
+HID/storage) is the attended-metal follow-on.
+
+### QEMU can't model this (the by-construction caveat)
+
+QEMU's `raspi4b` machine models **no PCIe root complex**. Everything past the RC identity read runs
+**only on real silicon**. The bring-up is therefore correct-**by-construction** against the Linux
+references below (the same discipline as **PI-V3D-1** and **ORIN-NET-3**), not QEMU-exercised. Do **not**
+treat "no RC in QEMU" as a divergence.
+
+**Census-before-touch (the anti-abort gate).** `build_boot_info` runs in `__rust_boot`, *before*
+`kernel_main` installs the exception vectors. The BCM2711 RC aperture (`0xFD50_0000`) is inside the
+`boot.rs` L1[3] Device window, so an **absent** read there is an *external abort*, not a translation
+fault — and with no vectors installed that abort would kill the boot. (This is why the V3D probe, which
+reads `0xFEC0_0000` — a *modeled* container that returns `0` in QEMU — survives, but a bare RC read does
+not.) So `piusb::bringup` first does a minimal, self-bounded **flat-device-tree scan** for a `pcie@`
+node and returns *before any RC MMIO* if none is present. QEMU raspi4b's DTB has no `pcie@` node → clean
+skip; the Pi firmware DTB has `pcie@7d500000` → proceed. The scan touches only the DTB blob (RAM), never
+the RC.
+
+### The bring-up chain (`piusb.rs`)
+
+- **M1 — brcmstb RC bring-up.** Absent-RC gate (`RGR1_SW_INIT_1` reads `0`/all-ones ⇒ skip), then the
+  Linux `pcie-brcmstb.c` sequence: assert bridge core reset + PERST (`PCIE_RGR1_SW_INIT_1` bits
+  INIT_GENERIC|PERST), release the bridge core, power up the serdes (clear `HARD_DEBUG.SERDES_IDDQ`),
+  program the **inbound DMA BAR** (`RC_BAR2` → RAM base 0, 4 GiB) and the **outbound MEM window**
+  (`CPU_2_PCIE_MEM_WIN0_*`: CPU `0x6_0000_0000` decodes PCIe `0xC000_0000`, 1 GiB — the canonical Pi 4
+  `ranges`), deassert PERST, and **poll link-up** (`PCIE_MISC_PCIE_STATUS` PHYLINKUP|DL_ACTIVE) with a
+  finite ~100 ms backstop. An honest link-DOWN says so and returns — never a hang. Reads the root-port
+  identity (expect Broadcom `0x14e4`) from RC config space.
+- **M2 — VL805 enumeration.** Child config via the brcmstb `EXT_CFG_INDEX`/`EXT_CFG_DATA` window (bus 1,
+  dev 0, fn 0): verify identity `1106:3483` (poison-rejecting), read class (expect `0c/03/30` USB xHCI),
+  run the **BAR-sizing ritual** on BAR0 (all-ones probe + **immediate restore** — the ORIN-NET-3 pattern),
+  assign BAR0 to the outbound window's PCIe base, enable MEM decode + bus-master, and issue the
+  **`NOTIFY_XHCI_RESET`** mailbox (tag `0x00030058`, `dev_addr = 0x0010_0000`) so the VideoCore firmware
+  (re)loads the VL805 firmware — the RPi bootloader normally does this from SPI EEPROM at power-on; an OS
+  bringing the controller up itself re-issues it.
+- **M3 — xHCI attach.** Map the outbound window Device-nGnRnE via `boot::map_device_1gib` (one L1 block
+  for CPU `0x6_0000_0000`; the **only** new page-table write this arc makes — outside `build_l1`'s fixed
+  0–4 GiB map, reachable under the 36-bit IPS / 39-bit VA). Read `CAPLENGTH`/`HCIVERSION`/`HCSPARAMS1`
+  (poison-rejecting), attach the shared `drivers/xhci` in **polled** mode (`xhci::init` = halt + HCRST +
+  CNR wait — heap-free, no ring allocation), set `PORTSC.PP` on each root port, and **stop** at the
+  honesty line. This is the JB2b platform-attach pattern (`xusb_tegra.rs`) adapted to a PCIe-BAR base.
+
+**Write discipline (the review lens).** The arc's writes are confined to the BCM2711 RC register block
+and the VL805's own config/BAR; every BAR-sizing probe restores its original immediately; no other
+device is touched. Every liveness read rejects both `0xffffffff` (PCIe master-abort / open-bus) and
+`0xdeadbeef` (firmware fill) as ABSENT DECODE — the **PI-V3D-1 poison-rejection rule**.
+
+### Byte-identity call sites
+
+`piusb::bringup(dtb)` is called at the **end of `build_boot_info`** (with the DTB in hand); the map
+helper is at **end-of-`boot.rs`**; the mailbox `NOTIFY_XHCI_RESET` tag/fn are gated additions. Each
+sits where its gated insertion shifts **no** panic-location line numbers in baseline code — the knob-off
+byte-identity guarantee (the V3D-call-site lesson).
+
+### References of record
+
+- brcmstb PCIe RC: Linux `drivers/pci/controller/pcie-brcmstb.c` (bridge sw-init/reset, `HARD_DEBUG`
+  serdes power-up, `PCIE_MISC_PCIE_STATUS` link bits, `CPU_2_PCIE_MEM_WIN0` outbound window, `RC_BAR2`
+  inbound window, `EXT_CFG_INDEX`/`EXT_CFG_DATA` child config). BCM2711 register offsets.
+- VL805 firmware reset: the RPi firmware `NOTIFY_XHCI_RESET` mailbox tag (`0x00030058`).
+- xHCI attach: the shared `drivers/xhci`, polled-aarch64 (the JB2b pattern, `arch/aarch64/xusb_tegra.rs`).
+
+### Gates green
+
+`./arroyo check` both arches; knob-off `./arroyo kernel8-test` = 0 FAIL and **`kernel8.img`
+byte-identical to baseline** (sha256 in the landing report); knob-on `UNAOS_PIUSB=1 ./arroyo kernel8-test`
+= 0 FAIL, DTB-census graceful skip, full suite reached (no pre-vector abort); `./arroyo test-arm 22`,
+`UNAOS_GICV3=1 ./arroyo test-arm 40`, `./arroyo test 22` all unregressed. Positive verification (RC link
+up, VL805 `1106:3483` found, BAR sized, xHCI decoding, ports powered) is the **attended Pi sitting** —
+see `scripts/pi-usb1-bench.md`.

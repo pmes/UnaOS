@@ -87,6 +87,15 @@ pub mod smpprobe;
 #[cfg(all(feature = "baremetal", feature = "v3d"))]
 pub mod v3d;
 
+// PI-USB-1: the BCM2711 PCIe root complex + VL805 xHCI attach — the RC that hosts ALL four Pi USB-A
+// ports (via the single VIA VL805 endpoint, 1106:3483). Pi bare-metal AND `piusb`-gated, so the module
+// + its call site (mailbox.rs tail) vanish knob-off and the kernel8 binary stays byte-identical to
+// baseline. QEMU raspi4b does NOT model the PCIe RC: the bring-up detects absence (poison/all-ones RC
+// identity) and degrades gracefully; positive verification is attended metal. Enable via
+// `UNAOS_PIUSB=1 UNAOS_PI=1 ./arroyo kernel8`. See arch_arm64.md §PI-USB.
+#[cfg(all(feature = "baremetal", feature = "piusb"))]
+pub mod piusb;
+
 // ORIN-NET-1 (`UNAOS_PCIEPROBE=1`) + ORIN-NET-2 (`UNAOS_PCIE2=1`): read-only PCIe root-complex + NIC
 // recon (arch/aarch64/pcie_probe.rs). NET-1 = DTB census of every `pcie@` controller + a guarded,
 // poison-rejecting config-space liveness read for firmware-ENABLED, already-mapped controllers. NET-2

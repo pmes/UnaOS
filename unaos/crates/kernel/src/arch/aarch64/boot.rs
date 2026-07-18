@@ -703,6 +703,58 @@ pub fn build_boot_info(dtb: u64) -> &'static mut BootInfo {
             (*bi).framebuffer_size = fb.size;
             (*bi).framebuffer_info = fb.info;
         }
+
+        // PI-USB-1: bring up the BCM2711 PCIe root complex + the VL805 xHCI behind it. Placed HERE (end
+        // of build_boot_info, with the DTB in hand) rather than mid-`kernel_main` so its gated insertion
+        // shifts NO panic-location line numbers in baseline code — only the `piusb`-gated helper below
+        // it moves (the knob-off byte-identity guarantee). Single-threaded (pre-SMP) and heap-free (the
+        // honesty-line attach allocates no rings). CENSUS-BEFORE-TOUCH: it reads the firmware DTB for a
+        // `pcie@` node FIRST and returns before ANY RC MMIO if none is present — so QEMU raspi4b (which
+        // models no PCIe RC and whose DTB has no `pcie@` node) skips cleanly, never reading the unbacked
+        // RC aperture (which would external-abort with the exception vectors not yet installed at this
+        // pre-`kernel_main` point). `piusb`-gated: knob-off this call + the whole module vanish and
+        // kernel8 is byte-identical to baseline. See arch_arm64.md §PI-USB.
+        #[cfg(feature = "piusb")]
+        super::piusb::bringup(dtb);
+
         &mut *bi
     }
+}
+
+/// PI-USB-1: map a single 1 GiB Device-nGnRnE identity block into the live EL1&0 translation regime,
+/// for an MMIO window that lies OUTSIDE the fixed 0–4 GiB map `build_l1` installs. The BCM2711 PCIe
+/// root complex's outbound MEM window (where the VL805 xHCI's BAR is decoded to the CPU) is placed by
+/// firmware/DT at CPU-physical `0x6_0000_0000` (24 GiB) — reachable within TCR IPS=36-bit / VA=39-bit,
+/// but not in the four blocks `build_l1` fills. This installs `L1[pa>>30] = device_block(...)` for the
+/// 1 GiB block containing `pa`, then does the canonical set-descriptor maintenance (dsb ishst + a
+/// broadcast TLBI for the block's VA + dsb ish + isb) so the mapping is live before the caller's first
+/// MMIO read. Idempotent: a block already mapped Device is rewritten to the same value.
+///
+/// Placed at end-of-file (like the V3D call site in mailbox.rs) so its gated insertion shifts NO
+/// panic-location line numbers in the code above it — the knob-off byte-identity guarantee.
+///
+/// SAFETY / SCOPE: `piusb`-gated (knob-off it and every call site vanish — the kernel8 image stays
+/// byte-identical to baseline). Writes ONE L1 entry for a `pa` the caller controls (the RC outbound
+/// window). NEVER runs in QEMU (the caller reaches it only after a live BCM2711 RC brings its link up;
+/// QEMU models no RC, so the bring-up bails at the identity read long before here). The block is XN at
+/// both ELs (peripheral memory is never executable). Single-threaded boot-time use (pre-SMP), so no
+/// cross-core BBM concern; the broadcast TLBI is belt-and-suspenders.
+#[cfg(feature = "piusb")]
+pub unsafe fn map_device_1gib(pa: u64) {
+    let gib = (pa >> 30) as usize;
+    // 512-entry L1; a >= 512 GiB base is unreachable under the 39-bit VA — refuse rather than index OOB.
+    if gib >= 512 {
+        return;
+    }
+    let block_pa = (gib as u64) << 30;
+    let l1 = &raw mut L1 as *mut u64;
+    l1.add(gib).write_volatile(device_block(block_pa));
+    core::arch::asm!(
+        "dsb ishst",
+        "tlbi vaae1is, {va}",   // invalidate the block's VA for all ASIDs (VA[55:12] in bits[43:0])
+        "dsb ish",
+        "isb",
+        va = in(reg) block_pa >> 12,
+        options(nostack, preserves_flags),
+    );
 }
