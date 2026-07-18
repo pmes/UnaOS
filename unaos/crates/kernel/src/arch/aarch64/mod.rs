@@ -55,7 +55,9 @@ pub mod mmu_tegra;
 // from the firmware DTB, the verified starting line for the BPMP IVC arc (JB1).
 // (ORIN-NET-1/-2 also reuse this walker's `Fdt`/`for_each_prop` for their read-only PCIe census, so it
 // is compiled for the `pcieprobe`/`pcie2` virt witness builds as well as every tegra build.)
-#[cfg(any(feature = "tegra", feature = "pcieprobe", feature = "pcie2"))]
+// (PI-GENET reuses this walker's `Fdt`/`for_each_prop` to DTB-resolve the GENET register base on the
+// Pi bare-metal build, so it is compiled for `genet` too.)
+#[cfg(any(feature = "tegra", feature = "pcieprobe", feature = "pcie2", feature = "genet"))]
 pub mod fdt_tegra;
 // JB1b: the BPMP IVC command channel (shmem queues + HSP doorbell) — first light is MRQ_PING; the
 // transport every partition-ungate MRQ (XUSB, nvdisplay) rides on.
@@ -139,6 +141,16 @@ pub mod sdmmc_tegra;
 // byte-identical to baseline. See arch_arm64.md §AARCH64-VNET.
 #[cfg(feature = "vnet")]
 pub mod virtio_net;
+
+// PI-GENET (`UNAOS_GENET=1`): the BCM2711 on-board Gigabit Ethernet (Broadcom GENET v5) driver +
+// smoltcp bind (arch/aarch64/genet.rs) — the Pi's FIRST network path, riding the shared net_phy seam
+// vnet/net4 already use. DTB-resolves the register base, poison-honest probes SYS_REV_CTRL to classify
+// whether the build models GENET, brings up UMAC + external RGMII PHY + TDMA/RDMA rings, and binds a
+// smoltcp Device + DHCP/ping. The MMIO/DMA metal half is additionally `all(baremetal, aarch64)`-gated,
+// so a genet/non-baremetal build compiles only an honest witness line. Feature-gated only. Default
+// OFF => module + call site vanish, smoltcp not pulled, byte-identical. See arch_arm64.md §PI-GENET.
+#[cfg(feature = "genet")]
+pub mod genet;
 
 pub fn init() {
     serial_println!(":: AARCH64 Core Hardware Init ::");

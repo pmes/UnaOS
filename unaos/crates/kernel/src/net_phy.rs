@@ -42,7 +42,7 @@
 // remains additionally gated on its own feature (and, for smolnet, `target_arch = "x86_64"`), so this
 // module compiles under any combination without dead-code warnings.
 
-#![cfg(any(feature = "net4", feature = "vnet", feature = "smolnet"))]
+#![cfg(any(feature = "net4", feature = "vnet", feature = "smolnet", feature = "genet"))]
 
 use core::marker::PhantomData;
 

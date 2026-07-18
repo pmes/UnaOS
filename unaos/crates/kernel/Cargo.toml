@@ -320,6 +320,22 @@ v3d = ["baremetal"]
 # UNAOS_PI=1 ./arroyo kernel8`. See arch_arm64.md §PI-USB and scripts/pi-usb1-bench.md.
 piusb = ["baremetal"]
 
+# PI-GENET: the BCM2711 on-board Gigabit Ethernet (Broadcom GENET v5) driver + smoltcp bind
+# (arch/aarch64/genet.rs) — the Pi's FIRST network path. DTB-resolves the `ethernet@7d580000` register
+# base (SoC ranges -> ARM-physical 0xFD58_0000, in the already-mapped Device GiB), poison-honest probes
+# SYS_REV_CTRL to classify whether the build models GENET, brings up UMAC + the external RGMII PHY +
+# TDMA/RDMA descriptor rings (the Linux bcmgenet v5 programming model), reads the station MAC (DTB
+# local-mac-address, else UMAC MAC0/MAC1), and binds a `smoltcp::phy::Device` over the rings (the shared
+# net_phy seam vnet/net4 already ride). Pulls the smoltcp dep (added to the aarch64 target deps as
+# optional). Does NOT imply `baremetal` (mirroring net4/`tegra`): the module's MMIO/DMA metal half is
+# `#[cfg(all(feature = "baremetal", target_arch = "aarch64"))]`-gated, so a `genet`-standalone check
+# build compiles only the honest witness half (no MMIO); only a `baremetal` kernel8 build with the knob
+# on drives the rings. Default OFF => the module + its call site vanish and the smoltcp dep is not pulled,
+# so the kernel8 image is byte-identical to baseline. Enable via `UNAOS_GENET=1 UNAOS_PI=1 ./arroyo
+# kernel8`. QEMU raspi4b MAY model GENET (M1 probes and reports honestly). See arch_arm64.md §PI-GENET and
+# scripts/pi-genet-bench.md.
+genet = ["dep:smoltcp"]
+
 # NS-SPAN (K7 WATCH rider): instrument the IRQ-masked namespace-lock hold at the three fused K6/K3/K5
 # persist sites (`sys_fgrant_revoke_2phase`, `native_persist_grants`, `native_persist_grow`) — read
 # CNTPCT at ns-take and ns-release, track the per-site WORST-CASE hold in ticks, and emit ONE serial line
