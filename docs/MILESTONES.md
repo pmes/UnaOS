@@ -10,6 +10,40 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## R21 merge window — 2026-07-18 (post-sitting follow-ups + the metal verdicts of record)
+
+### ORIN-NET-2 — controller-0 link + device recon via the DBI aperture (`UNAOS_PCIE2`) 🔬
+
+**What it does.** Names the right register window: NET-1's all-Fs config reads were the
+ATU-routed downstream window with the link down — RP identity and Link Status live in **DBI**
+(`0x2a080000`). Census2 reads them there and only walks downstream if DLL-active. Also names
+NET-3's blocker: controller-0's ECAM (~184 GiB) / MMIO (~200 GiB) sit above the tegra 36-bit
+PS ceiling — `map_mmio_window` refuses (fail-closed; the only write in the arc is page-table
+descriptors). **Tested:** GICv2+GICv3 test-arm green, knob-off byte-identity; LC lens PASS
+zero must-fix. Metal (link-down + DBI identity) staged. Merge `3fe218a`.
+
+### RAST-PACE — honest 33 ms frame pacing for the cube demo 🔬
+
+**What it does.** The Orin sitting proved the render (989 fps) but it presented as a 0.1 s
+flash; FRAME_MS=33 pure-delay pacing makes the spin visible without ever skipping or delaying
+a present-bound platform; measured-fps line stays honest. **Tested:** virt 30.28 fps +
+MISSION; x86 21.7 unregressed; knob-off byte-identity. Metal (visible spin) staged. Merge
+`6c6a801`.
+
+### Metal verdicts of record (2026-07-17/18 sittings, folds `88757f1` + rMBP landing)
+
+- **NATIVE-MIDDEN M1 ✅ metal-confirmed** — the 2012 rMBP booted the default GUI to an
+  interactive shell; `batmon` showed the real battery.
+- **XHUB-SS-linkstate ✅ metal-confirmed** — the SuperSpeed status-change storm quiesces.
+- **EHCI-5-fix: arming ✅ / streaming ✖** — the 0x44 endpoint arms on metal, but bcm5974
+  needs a vendor SET_REPORT mode-switch to stream → follow-on arc proposed.
+- **RAST-TEGRA ✅ metal-confirmed** — first 3D pixels on the Orin panel.
+- **ORIN-SMP-DEFAULT candidate: 1 fault / 2 clean** — NOT promoted (defaults rule), but
+  boots 2–3 were the **first default-path 6-core UnaOS shells on Orin silicon**.
+- **ORIN-NET-1 ✅ metal-confirmed** — 8 Tegra234 PCIe controllers walked read-only on real
+  firmware.
+- vperf scroll scenario fires at 1 s (sitting regression fix, `03d6ddb`).
+
 ## hw-jetson track — 2026-07-17 (ORIN-SMP-DEFAULT — the 6-core bring-up becomes the tegra default) 🔬 QEMU-green, DEFAULT-CANDIDATE pending metal record `hw-jetson`
 
 ### ORIN-SMP-DEFAULT — tegrasmp default-on, `UNAOS_NOTEGRASMP` opt-out
