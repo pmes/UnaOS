@@ -1,7 +1,8 @@
 # INSTALL-CORE — the storage-agnostic installer engine
 
 Status: QEMU-proven on a scratch block device (x86_64), 2026-07-18. Arc INSTALL-CORE.
-Wired to the Orin microSD (metal-pending) by **INSTALL-1** (§INSTALL-1 below; `UNAOS_INSTALL_TARGET_SD=1`).
+Wired to the Orin microSD (metal-pending) by **INSTALL-1**, made a real self-clone by **INSTALL-2**
+(§INSTALL-1 / §INSTALL-2 below; `UNAOS_INSTALL_TARGET_SD=1`).
 Knob: `UNAOS_INSTALLDEMO=1` (feature `installdemo`), default OFF. Module: `crates/kernel/src/install/`.
 
 ## What it is
@@ -182,10 +183,47 @@ self-read of the running boot volume is unreachable this arc; v1 writes a genera
 the attended Orin sitting** (runbook `scripts/orin-sdmmc1-bench.md`, install leg; landing
 `review/unaos-install1-LANDING.md`).
 
+## §INSTALL-2 — the self-clone: the installer copies the running system's real boot payload
+
+**Landed 2026-07-18** (aarch64/tegra; metal-pending). Same `UNAOS_INSTALL_TARGET_SD=1` gate. Glue:
+`sdmmc_tegra.rs` (`sdmmc_install_from_usb` + the rewritten `install_to_sd`/`install_flow` + `copy_dir`);
+engine: a new `TreeWriter` in `install/fat32.rs`. Full aarch64 detail: `arch_arm64.md` §ORIN-INSTALL-2.
+
+INSTALL-2 replaces INSTALL-1's synthetic `UNAOS.IMG` marker with the **real thing**: the installer mounts the
+USB boot stick's own ESP and mirrors its boot tree onto the microSD ESP, every file sha-extent-verified.
+
+**Position adjudication (INSTALL-1's named blocker, resolved).** The install act is split: the read-only
+census still runs pre-JB2b and now **stashes** the card identity; the destructive install is **deferred** to
+`sdmmc_install_from_usb`, called from the boot sequence right after the JB2b pump window — the earliest
+position where the USB stick is a block device (`drivers::block::info()` is `Some`), the SDMMC MMIO is still
+mapped, and the core is still at EL2 (timer live for the SD bounded waits). No self to clone (no card stashed,
+or stick not enumerated) → honest SKIP, nothing destructive. See §ORIN-INSTALL-2 for the full constraint proof.
+
+**Additive engine change — the single-FAT-sector bound lifted.** INSTALL-1's `write_payload_file` (kept
+verbatim; still the x86 witness's path) capped a file chain at FAT sector 0 (≤125 clusters ≈ 64 KiB). INSTALL-2
+adds a `TreeWriter` (additive):
+- a running **free-cluster cursor** (many files/subdirectories allocate distinct chains);
+- `set_fat_run` links a chain across **every FAT sector it touches, in both FAT copies** — a multi-MB
+  `kernel.elf` links correctly (multi-FAT-sector chains, the flagged extension, implemented additively);
+- **directory clusters built wholly in memory** then written once, so a stale data cluster on a non-blank card
+  never leaks bytes into a directory (each dir assumed ≤ one cluster — the boot tree is; overflow = honest
+  error, not truncation).
+
+Verify discipline is unchanged: every copied file is re-read off the card and SHA-checked through
+`verify_extents`, and the flow prints a **per-file `sha256=… VERIFIED` manifest** — the installer's
+content-verify IS the bench's content-verify, now native.
+
+**Flow:** GPT → zero-ESP-metadata → FAT32 → **mount USB stick + clone its boot tree file-by-file** → per-file
+sha manifest → `ORIN-INSTALL-2 SD install — gpt+zero+fat32+clone(N files) verify => PASS`.
+
+**Witness.** Virt: one honest metal-only line (both arches). x86 `UNAOS_INSTALLDEMO` still covers the engine
+end-to-end (the `TreeWriter` additions do not perturb it — `write_payload_file` is unchanged). First execution
+is the attended Orin sitting (runbook install leg; landing `review/unaos-install2-LANDING.md`).
+
 ## What later rungs still owe
 
-- **INSTALL-2 (self-clone):** copy the running system's own boot volume as the payload (needs the boot media
-  readable as a block device at the install site — a post-takeover install position or a second block backend).
-- **Cross-platform:** the same `InstallTarget` generalizes to Pi `emmc2` and an x86 USB stick (installer_engine
-  line seed rung 4).
-- **Throughput:** multi-block CMD25/CMD18 on the SD path (single-block is correct but slower on the zero pass).
+- **Bootability:** the cloned card carries a faithful `/EFI/BOOT/BOOTAA64.EFI` + `/kernel.elf` tree; making the
+  Orin actually boot from it (GPT ESP type/attributes, firmware boot-order) is the next rung's metal question.
+- **Cross-platform:** the same `InstallTarget`/`TreeWriter` generalizes to Pi `emmc2` and an x86 USB stick.
+- **Throughput:** multi-block CMD25/CMD18 on the SD path (single-block is correct but slower on the zero pass
+  and the per-cluster payload writes).

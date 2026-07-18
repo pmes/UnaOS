@@ -82,13 +82,14 @@ pub fn sdmmc_census(_dtb_addr: u64, _dtb_size: usize, _ram_gib_mask: u64) {
         "{} ORIN-SDMMC-2 write ladder ARMED (UNAOS_SDMMC_ARM=1) but metal-only — no Tegra234 SDMMC on this build (QEMU virt); zero card writes here ::",
         PS
     );
-    // ORIN-INSTALL-1: when the third destructive gate is compiled in on a virt build, one honest
-    // metal-only line — the installer flow drives a real Tegra234 SDMMC controller QEMU does not model, so
-    // there is nothing to install here and we do zero MMIO. The engine itself is proven on x86 (the
-    // UNAOS_INSTALLDEMO witness); the full SD flow's first execution is the attended Orin sitting.
+    // ORIN-INSTALL-2: when the third destructive gate is compiled in on a virt build, one honest
+    // metal-only line — the self-clone install drives a real Tegra234 SDMMC controller QEMU does not
+    // model (and needs the USB boot stick as a block device), so there is nothing to install here and we
+    // do zero MMIO. The engine itself is proven on x86 (the UNAOS_INSTALLDEMO witness); the full SD flow's
+    // first execution is the attended Orin sitting.
     #[cfg(feature = "install_target")]
     serial_println!(
-        "{} ORIN-INSTALL-1 third gate (UNAOS_INSTALL_TARGET_SD=1) compiled-present but metal-only — no Tegra234 SDMMC on this build (QEMU virt); no install here ::",
+        "{} ORIN-INSTALL-2 third gate (UNAOS_INSTALL_TARGET_SD=1) compiled-present but metal-only — no Tegra234 SDMMC on this build (QEMU virt); no install here ::",
         PS
     );
 }
@@ -99,6 +100,11 @@ pub fn sdmmc_census(_dtb_addr: u64, _dtb_size: usize, _ram_gib_mask: u64) {
 
 #[cfg(feature = "tegra")]
 pub use metal::sdmmc_census;
+
+// ORIN-INSTALL-2: the deferred self-clone install entry, called from the boot sequence AFTER the JB2b
+// pump has enumerated the USB boot stick as a block device (see the module install section header).
+#[cfg(all(feature = "tegra", feature = "install_target"))]
+pub use metal::sdmmc_install_from_usb;
 
 #[cfg(feature = "tegra")]
 mod metal {
@@ -315,6 +321,10 @@ mod metal {
     }
 
     /// The identified card, learned by the M2 ladder — enough to census + read sector 0.
+    // INSTALL-2: `Clone`+`Copy` under `install_target` so the census can stash the identity into
+    // `PENDING_INSTALL` and the deferred post-USB install site can consume it. `cfg_attr`-gated so a
+    // plain `sdmmc`/`sdmmc_arm` build carries no derive and stays byte-identical to the merged recon.
+    #[cfg_attr(feature = "install_target", derive(Clone, Copy))]
     struct Card {
         block_addressing: bool, // ccs: true = SDHC/SDXC block addressing, false = SDSC byte
         num_blocks: u64,
@@ -846,11 +856,12 @@ mod metal {
     }
 
     // ══════════════════════════════════════════════════════════════════════════════════════════════════
-    // ORIN-INSTALL-1 — the first real installer flow: drive the arch-neutral installer ENGINE
-    // (`crate::install`: GPT writer + FAT32 formatter + sha extent-verify) onto the SEATED microSD via the
-    // rung-2 armed single-block write primitives. `install_target`-gated (implies `sdmmc_arm` ⇒ `sdmmc`):
-    // EVERY line below this marker is compiled out unless UNAOS_INSTALL_TARGET_SD=1, so a plain
-    // `sdmmc`/`sdmmc_arm` build is byte-identical to the merged recon/ladder.
+    // ORIN-INSTALL-2 — the self-clone: the installer copies the RUNNING system's real boot payload. Drive
+    // the arch-neutral installer ENGINE (`crate::install`: GPT writer + FAT32 formatter + the INSTALL-2
+    // `TreeWriter` + sha extent-verify) onto the SEATED microSD via the rung-2 armed single-block write
+    // primitives, with the payload READ FROM the USB boot stick's own ESP (the `fs::fat` mount/read path).
+    // `install_target`-gated (implies `sdmmc_arm` ⇒ `sdmmc`): EVERY line below this marker is compiled out
+    // unless UNAOS_INSTALL_TARGET_SD=1, so a plain `sdmmc`/`sdmmc_arm` build is byte-identical to the recon.
     //
     // THE THREE-GATE ESCALATION LADDER (the seated card is sacred; a real install is the most destructive
     // act in the tree, so it stands behind three independent gates):
@@ -863,8 +874,22 @@ mod metal {
     // Unlike the engine's blank-only demo law, an installer must handle a NON-blank card: we do not refuse
     // it — we announce it, then re-establish the FAT blank-precondition by zeroing exactly the ESP metadata
     // region (`fat32::blank_region_sectors`) before formatting. The engine's verified write/verify
-    // semantics are untouched — this module only supplies the block target + the zero pass + the announce.
+    // semantics are untouched — this module supplies the block target, the zero pass, the announce, and the
+    // USB→SD tree copy; every copied file is sha-extent-verified through the engine's own `verify_extents`.
+    //
+    // THE INSTALL-1 BLOCKER, RESOLVED (the position adjudication): INSTALL-1 ran at the pre-JB2b census
+    // site where `drivers::block::info()` is None (the stick is not yet enumerated), so it fell back to a
+    // synthetic marker. INSTALL-2 DEFERS the destructive install to `sdmmc_install_from_usb`, called from
+    // the boot sequence AFTER the JB2b pump enumerated the stick — the earliest position where the payload
+    // is readable, the SDMMC MMIO is still mapped, and the core is still at EL2 (pre-JM6 drop, timer live
+    // for the SD bounded waits). The census stashes the read-only identity into `PENDING_INSTALL`.
     // ══════════════════════════════════════════════════════════════════════════════════════════════════
+
+    /// The card identity the census stashes for the deferred post-JB2b install (see the block header). A
+    /// `None` at the deferred site means the census never identified a card (no controller / no card), so
+    /// the install site prints an honest skip and does nothing.
+    #[cfg(feature = "install_target")]
+    static PENDING_INSTALL: spin::Mutex<Option<(u64, Card, [u8; 512])>> = spin::Mutex::new(None);
 
     /// An `InstallTarget` over the rung-2 armed single-block SD write path. Sector granularity; every
     /// method loops the proven `read_block_at` / `write_block_at` CMD17/CMD24 primitives (no multi-block
@@ -916,36 +941,46 @@ mod metal {
         }
     }
 
-    /// The built-in v1 payload (M2 fallback): a small, self-describing marker blob. HONEST BY DESIGN — the
-    /// installer's intended v1 payload is the RUNNING system's own boot volume (clone-thyself), but at this
-    /// call site (the pre-JB2b-takeover EL2 census point) the USB boot stick is NOT yet enumerated as a
-    /// block device (`drivers::block::info()` is None here), so self-read is unreachable this arc. Rather
-    /// than fake a clone, we write a marker the in-tree FAT reader can later find, and FLAG the self-clone
-    /// as the named follow-up (INSTALL-2). Spans several sectors so the extent machinery is exercised.
+    /// The DEFERRED install entry point (ORIN-INSTALL-2). Called from the boot sequence AFTER the JB2b
+    /// pump window has enumerated the USB boot stick as a block device — the position where the running
+    /// system's real boot payload is readable (`drivers::block::info()` is Some). Consumes the card
+    /// identity the census stashed. Honest no-op if the census never identified a card, or if the stick
+    /// did not enumerate (no `drivers::block` device) — in either case the flow needs a self to clone, so
+    /// it prints the honest cause and does nothing destructive. On metal (tegra) only; QEMU virt has no
+    /// Tegra234 SDMMC and never stashes.
     #[cfg(feature = "install_target")]
-    fn installer_marker_payload() -> alloc::vec::Vec<u8> {
-        let mut v = alloc::vec::Vec::with_capacity(4096);
-        v.extend_from_slice(
-            b"UNAOS-INSTALL-1 marker payload v1\n\
-              Written by the booted UnaOS installer onto the seated microSD.\n\
-              The v1 self-clone (copy the running boot volume) is INSTALL-2.\n",
-        );
-        let mut i: usize = 0;
-        while v.len() < 4096 {
-            v.push(((i.wrapping_mul(37).wrapping_add(13)) & 0xFF) as u8);
-            i += 1;
+    pub fn sdmmc_install_from_usb() {
+        let ctx = PENDING_INSTALL.lock().take();
+        let (base, card, sec0) = match ctx {
+            Some(c) => c,
+            None => {
+                serial_println!(
+                    "{} ORIN-INSTALL-2 deferred install SKIPPED — no card identity stashed (census found no controller/card) ::",
+                    PS
+                );
+                return;
+            }
+        };
+        // The self must be readable: the USB boot stick must have enumerated as a block device in the
+        // JB2b pump window. If it did not, there is no running boot payload to clone — honest skip.
+        if crate::drivers::block::info().is_none() {
+            serial_println!(
+                "{} ORIN-INSTALL-2 deferred install SKIPPED — the USB boot stick did not enumerate as a block device (no self to clone) ::",
+                PS
+            );
+            return;
         }
-        v
+        install_to_sd(base, &card, &sec0);
     }
 
-    /// ORIN-INSTALL-1: run the installer engine end-to-end against the seated microSD. Called only from
-    /// `sdmmc_census` (metal), only under the third gate, after the census has produced `card` + `sec0`.
-    /// The flow: announce → GPT → zero ESP metadata (blank-precondition) → FAT32 format → payload copy →
-    /// sha extent-verify → the INSTALL PASS line. Any engine error is a named FAIL line (no panic).
+    /// ORIN-INSTALL-2: run the installer engine end-to-end against the seated microSD, cloning the USB
+    /// boot stick's real ESP payload. The flow: announce → GPT → zero ESP metadata (blank-precondition) →
+    /// FAT32 format → mount the stick + copy its boot tree file-by-file (each sha-extent-verified) →
+    /// per-file sha manifest → the INSTALL PASS line. Any engine/read error is a named FAIL line (no panic).
     #[cfg(feature = "install_target")]
     fn install_to_sd(base: u64, card: &Card, sec0: &[u8; 512]) {
         serial_println!(
-            "{} ORIN-INSTALL-1 THIRD GATE (UNAOS_INSTALL_TARGET_SD=1) — installing UnaOS onto the SEATED microSD ::",
+            "{} ORIN-INSTALL-2 THIRD GATE (UNAOS_INSTALL_TARGET_SD=1) — cloning the running boot payload onto the SEATED microSD ::",
             PS
         );
         serial_println!(
@@ -963,18 +998,32 @@ mod metal {
 
         let mut t = SdInstallTarget { base, card };
         match install_flow(&mut t) {
-            Ok(()) => serial_println!("{} ORIN-INSTALL-1 SD install — gpt+zero+fat32+copy verify => PASS ::", PS),
-            Err(e) => serial_println!("{} ORIN-INSTALL-1 SD install => FAIL ({:?}) ::", PS, e),
+            Ok(n) => serial_println!(
+                "{} ORIN-INSTALL-2 SD install — gpt+zero+fat32+clone({} files) verify => PASS ::",
+                PS, n
+            ),
+            Err(e) => serial_println!("{} ORIN-INSTALL-2 SD install => FAIL ({:?}) ::", PS, e),
         }
     }
 
-    /// The engine driver, factored out so `?` early-returns land on the single FAIL line above.
+    /// A copied file's verification record: its path on the boot tree, content SHA-256, and the exact
+    /// device extents the writer recorded (what `verify_extents` re-reads off the card).
     #[cfg(feature = "install_target")]
-    fn install_flow(t: &mut SdInstallTarget) -> Result<(), crate::install::InstallError> {
-        use crate::install::{fat32, gpt, hash, verify_extents, InstallTarget};
+    struct FileRec {
+        path: alloc::string::String,
+        sha: [u8; 32],
+        extents: alloc::vec::Vec<crate::install::fat32::Extent>,
+        size: usize,
+    }
+
+    /// The engine driver: returns the number of files cloned (so `?` early-returns land on the single
+    /// FAIL line above). Mounts the USB boot stick and mirrors its ESP tree onto the freshly-formatted
+    /// microSD ESP, sha-extent-verifying every copied file.
+    #[cfg(feature = "install_target")]
+    fn install_flow(t: &mut SdInstallTarget) -> Result<usize, crate::install::InstallError> {
+        use crate::install::{fat32, gpt, verify_extents, InstallError, InstallTarget};
 
         // 1) GPT: protective MBR + primary/backup + ESP + data, with the engine's own parse-back verify.
-        //    The writer overwrites its own structures, so no blank-precondition is needed here.
         let layout = gpt::write_gpt(t)?;
         serial_println!(
             "{}   INSTALL: GPT written + parse-back verified — ESP LBA {}..{}, data LBA {}..{} of {} sectors ::",
@@ -983,8 +1032,8 @@ mod metal {
         );
 
         // 2) Re-establish the FAT blank-precondition: zero exactly the ESP reserved+FAT region (the card
-        //    may be non-blank; a stale FAT entry would forge an allocation). Data-area free clusters are
-        //    left as-is (harmless). This is the installer's do-it-right beyond the blank-only demo law.
+        //    may be non-blank; a stale FAT entry would forge an allocation). Data-area directory clusters
+        //    are built wholly in memory by the TreeWriter, so no data-area pre-zero is needed.
         let esp_sectors = layout.esp_last_lba - layout.esp_first_lba + 1;
         let blank_sectors = fat32::blank_region_sectors(esp_sectors)?;
         let zero = [0u8; 512];
@@ -1003,23 +1052,157 @@ mod metal {
             PS, geom.fat_sz, geom.count_of_clusters, geom.data_start
         );
 
-        // 4) Copy the v1 marker payload (M2 fallback), recording extents; then content-verify by re-read.
-        let payload = installer_marker_payload();
-        let payload_sha = hash::sha256(&payload);
-        let extents = fat32::write_payload_file(t, &geom, "UNAOS.IMG", &payload)?;
-        serial_println!(
-            "{}   INSTALL: copied UNAOS.IMG ({} bytes, {} extents) ::",
-            PS, payload.len(), extents.len()
-        );
-        if !verify_extents(t, &extents, &payload_sha)? {
-            serial_println!("{}   INSTALL: extent sha-verify => FAIL ::", PS);
-            return Err(crate::install::InstallError::VerifyFailed);
+        // 4) THE SELF-CLONE: mount the USB boot stick's own ESP through the in-tree FAT reader and mirror
+        //    its whole boot tree onto the microSD ESP. `fs::fat::mount()` reads `drivers::block` — the USB
+        //    path — which the JB2b pump populated before this deferred site ran.
+        let src = crate::fs::fat::mount().map_err(|_| InstallError::NotReady)?;
+        serial_println!("{}   INSTALL: mounted USB boot stick — {} ::", PS, src.describe());
+
+        let mut recs: alloc::vec::Vec<FileRec> = alloc::vec::Vec::new();
+        {
+            let mut w = fat32::TreeWriter::new(t, geom);
+            let root_cluster = w.root_cluster();
+            let root_entries = src.read_root().map_err(|_| InstallError::Io)?;
+            copy_dir(&mut w, &src, &root_entries, root_cluster, 0, true, "", &mut recs, 0)?;
+            serial_println!(
+                "{}   INSTALL: cloned {} files ({} data clusters) from the boot tree ::",
+                PS, recs.len(), w.clusters_used()
+            );
         }
-        serial_println!("{}   INSTALL: extent sha-verify (re-read every written extent off the card) => PASS ::", PS);
-        // NOTE: the in-tree `fs::fat::mount()` interop self-check the x86 engine witness runs is NOT run
-        // here — `mount()` reads `drivers::block` (the USB path), not this armed SD target, and at this
-        // pre-takeover site no block device is up. The SD content-verify above IS the by-content proof.
+        if recs.is_empty() {
+            // A boot stick with no files is not a self to clone — refuse rather than "PASS" a hollow card.
+            serial_println!("{}   INSTALL: the USB boot stick carried no files to clone => FAIL ::", PS);
+            return Err(InstallError::BadArg);
+        }
+
+        // 5) Content-verify EVERY copied file by re-reading its extents off the card and SHA-checking — the
+        //    installer's content-verify IS the bench's content-verify, now native. Print the per-file sha
+        //    manifest (the real manifest that replaces INSTALL-1's single UNAOS.IMG marker).
+        for r in &recs {
+            if !verify_extents(t, &r.extents, &r.sha)? {
+                serial_println!("{}   INSTALL: {} extent sha-verify => FAIL ::", PS, r.path);
+                return Err(InstallError::VerifyFailed);
+            }
+            serial_println!(
+                "{}   INSTALL: {} ({} B, {} extents) sha256={} => VERIFIED ::",
+                PS, r.path, r.size, r.extents.len(), sha_hex(&r.sha)
+            );
+        }
+        serial_println!(
+            "{}   INSTALL: all {} cloned files re-read off the card + sha-verified => PASS ::",
+            PS, recs.len()
+        );
+        // NOTE: the in-tree `fs::fat::mount()` interop self-check the x86 engine witness runs on ITS target
+        // is not run on the SD here — `mount()` reads `drivers::block` (the USB source), not this armed SD
+        // target. The per-file SD content-verify above IS the by-content proof.
+        Ok(recs.len())
+    }
+
+    /// Depth-first mirror of a source directory onto the SD `TreeWriter`. Builds THIS directory's cluster
+    /// wholly in memory (so a stale data cluster never leaks bytes), recursing into subdirectories before
+    /// writing their parent entry (children must exist to know their first cluster). Skips `.`/`..`; every
+    /// file is read whole off the stick, its clusters allocated + written, and its record pushed for the
+    /// caller's sha-extent verify. `is_root` selects whether `.`/`..` are emitted and whether a child's
+    /// `..` points at cluster 0 (the FAT convention for a subdirectory of the root).
+    #[cfg(feature = "install_target")]
+    #[allow(clippy::too_many_arguments)]
+    fn copy_dir(
+        w: &mut crate::install::fat32::TreeWriter<'_, SdInstallTarget<'_>>,
+        src: &crate::fs::fat::FatFs,
+        entries: &[crate::fs::fat::DirEntry],
+        this_cluster: u32,
+        parent_cluster: u32,
+        is_root: bool,
+        path_prefix: &str,
+        recs: &mut alloc::vec::Vec<FileRec>,
+        depth: u32,
+    ) -> Result<(), crate::install::InstallError> {
+        use crate::install::fat32::{put_dir_entry, ATTR_ARCHIVE, ATTR_DIR, DIR_SLOTS_PER_CLUSTER};
+        use crate::install::InstallError;
+
+        // A sane recursion bound (the boot ESP tree is 2 levels: root → EFI → BOOT); refuse a pathological
+        // or looping source tree rather than blow the kernel stack.
+        const MAX_DEPTH: u32 = 8;
+        if depth > MAX_DEPTH {
+            return Err(InstallError::BadArg);
+        }
+        // Per-file size cap — the boot payload is a few MB; refuse an implausibly large file rather than
+        // exhaust the 48 MiB kernel heap reading it whole.
+        const MAX_FILE_BYTES: usize = 32 * 1024 * 1024;
+
+        let mut dir = [0u8; 512];
+        let mut slot = 0usize;
+        if !is_root {
+            if !put_dir_entry(&mut dir, slot, ".", ATTR_DIR, this_cluster, 0) {
+                return Err(InstallError::BadArg);
+            }
+            slot += 1;
+            if !put_dir_entry(&mut dir, slot, "..", ATTR_DIR, parent_cluster, 0) {
+                return Err(InstallError::BadArg);
+            }
+            slot += 1;
+        }
+        for e in entries {
+            let name = e.name();
+            if name == "." || name == ".." {
+                continue;
+            }
+            if slot >= DIR_SLOTS_PER_CLUSTER {
+                // The directory overflows one cluster (out of this arc's scope — the boot tree does not).
+                return Err(InstallError::NoSpace);
+            }
+            if e.is_dir {
+                let child = w.alloc_dir_cluster()?;
+                let child_entries = src.read_dir(e.first_cluster()).map_err(|_| InstallError::Io)?;
+                let child_prefix = alloc::format!("{}{}/", path_prefix, name);
+                let child_dotdot = if is_root { 0 } else { this_cluster };
+                copy_dir(w, src, &child_entries, child, child_dotdot, false, &child_prefix, recs, depth + 1)?;
+                if !put_dir_entry(&mut dir, slot, name, ATTR_DIR, child, 0) {
+                    return Err(InstallError::BadArg);
+                }
+                slot += 1;
+            } else {
+                let size = e.size as usize;
+                if size > MAX_FILE_BYTES {
+                    serial_println!(
+                        "{}   INSTALL: {}{} is {} B (> {} B cap) — refusing => FAIL ::",
+                        PS, path_prefix, name, size, MAX_FILE_BYTES
+                    );
+                    return Err(InstallError::BadArg);
+                }
+                let mut data: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+                src.read_file(e, &mut data, size).map_err(|_| InstallError::Io)?;
+                if data.len() != size {
+                    // Short read (chain ended before de.size) — the source is malformed; do not clone it.
+                    return Err(InstallError::Io);
+                }
+                let sha = crate::install::hash::sha256(&data);
+                let (first, extents) = w.write_file(&data)?;
+                if !put_dir_entry(&mut dir, slot, name, ATTR_ARCHIVE, first, size as u32) {
+                    return Err(InstallError::BadArg);
+                }
+                slot += 1;
+                recs.push(FileRec {
+                    path: alloc::format!("{}{}", path_prefix, name),
+                    sha,
+                    extents,
+                    size,
+                });
+            }
+        }
+        w.write_dir_cluster(this_cluster, &dir)?;
         Ok(())
+    }
+
+    /// Lower-hex a 32-byte digest for the per-file manifest line.
+    #[cfg(feature = "install_target")]
+    fn sha_hex(d: &[u8; 32]) -> alloc::string::String {
+        let mut s = alloc::string::String::with_capacity(64);
+        for b in d {
+            s.push(core::char::from_digit((b >> 4) as u32, 16).unwrap());
+            s.push(core::char::from_digit((b & 0xf) as u32, 16).unwrap());
+        }
+        s
     }
 
     // ── M1: FDT census — enumerate SDMMC-compatible nodes, pick the enabled removable microSD slot ──
@@ -1308,12 +1491,22 @@ mod metal {
         #[cfg(feature = "sdmmc_arm")]
         write_ladder(base, &card, &sec0);
 
-        // ── ORIN-INSTALL-1: the first real installer flow (only with UNAOS_INSTALL_TARGET_SD=1, the third
+        // ── ORIN-INSTALL-2: the self-clone installer flow (only with UNAOS_INSTALL_TARGET_SD=1, the third
         //    destructive gate; compiled out otherwise, so a plain UNAOS_SDMMC_ARM=1 build ends at the ladder
-        //    above, byte-identical to the merged rung-2). Drives the arch-neutral installer engine onto the
-        //    seated card. Runs AFTER the ladder's scratch write/restore proof — the write path is exercised
-        //    on a stashed region before the installer repartitions the whole card. ──
+        //    above, byte-identical to the merged rung-2). INSTALL-1 ran the install HERE and had to fall
+        //    back to a synthetic marker payload — at this pre-JB2b-takeover site the USB boot stick is not
+        //    yet a block device, so the running system's real boot payload is unreadable. INSTALL-2 splits
+        //    the act in two: the census STASHES the read-only card identity here, and the destructive
+        //    install is DEFERRED to `sdmmc_install_from_usb` — called from the boot sequence AFTER the JB2b
+        //    pump window has enumerated the stick as a block device, where the real payload IS readable.
+        //    See arch_arm64.md §ORIN-INSTALL-2. ──
         #[cfg(feature = "install_target")]
-        install_to_sd(base, &card, &sec0);
+        {
+            *PENDING_INSTALL.lock() = Some((base, card, sec0));
+            serial_println!(
+                "{} ORIN-INSTALL-2 card identity stashed; destructive install DEFERRED to the post-JB2b USB-enumerated site (self-clone needs the boot stick readable) ::",
+                PS
+            );
+        }
     }
 }

@@ -1537,6 +1537,19 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
         serial_println!(":: tegra: JB2b — SKIPPED (XUSB not ungated/alive this boot) ::");
     }
 
+    // ORIN-INSTALL-2 (`UNAOS_INSTALL_TARGET_SD=1`): the self-clone install runs HERE — AFTER the JB2b
+    // pump window above enumerated the USB boot stick as a block device (`drivers::block::info()` is now
+    // Some), so the installer can read the RUNNING system's real boot payload off the stick's ESP and
+    // clone it onto the freshly-formatted microSD ESP. This is the DEFERRED half of the act INSTALL-1's
+    // pre-JB2b census site could not complete (the stick was not yet a block device there → synthetic
+    // marker). The read-only census at `sdmmc_census` above (line ~1396) stashed the card identity; this
+    // consumes it. Earliest safe position: the stick is readable, the SDMMC MMIO the census mapped is
+    // still live, and the core is still at EL2 (the JM6 drop is BELOW), so the SD path's bounded `hlt()`
+    // waits still have the JM4 timer as their wake source. Metal + tegra-gated; compiled out knob-off =>
+    // byte-identical to baseline. See arch_arm64.md §ORIN-INSTALL-2 and scripts/orin-sdmmc1-bench.md.
+    #[cfg(all(feature = "install_target", feature = "tegra"))]
+    unaos_kernel::arch::sdmmc_tegra::sdmmc_install_from_usb();
+
     // 3d. JX1 RESULT (probe removed — metal-answered 2026-07-06, capture serial-orin-jx1.log): the
     //     Tegra234 XUSB host block @ 0x0361_0000 is NOT accessible after ExitBootServices. The
     //     probe's first read fired an SError (ESR 0xbe000011, EC=0x2F/ISS=0x11) fatal to EL3 —
