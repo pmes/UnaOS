@@ -84,17 +84,92 @@ pub use metal::net4_bringup;
 mod metal {
     use super::{is_poison, Fdt, P4, REALTEK_VENDOR, RTL8168_DEVICE};
     use crate::arch::aarch64::mmu_tegra::{map_mmio_window, MmioMap};
+    use core::alloc::Layout;
+    use core::ptr::{read_volatile, write_volatile};
 
     // ── RTL8168/8111 register offsets (bytes from the BAR2 MMIO window) ──
     /// IDR0..5: the six station-MAC bytes (offsets 0x00..0x05).
     const REG_IDR0: u64 = 0x00;
+    /// TNPDS: Transmit Normal-Priority Descriptor Start Address (64-bit; low @ 0x20, high @ 0x24).
+    /// The ring base MUST be 256-byte aligned.
+    const REG_TNPDS: u64 = 0x20;
     /// ChipCmd (CR): RST (soft reset, self-clearing), RxEnb (RE), TxEnb (TE).
     const REG_CR: u64 = 0x37;
     const CR_RST: u8 = 1 << 4;
-    #[allow(dead_code)]
     const CR_RE: u8 = 1 << 3;
-    #[allow(dead_code)]
     const CR_TE: u8 = 1 << 2;
+    /// TPPoll: kick the normal-priority TX queue (NPQ) after posting a descriptor. (M3 `transmit`.)
+    #[allow(dead_code)]
+    const REG_TPPOLL: u64 = 0x38;
+    #[allow(dead_code)]
+    const TPPOLL_NPQ: u8 = 1 << 6;
+    /// IMR / ISR: interrupt Mask / Status (16-bit). Polled bring-up ⇒ IMR = 0, ISR write-1-to-clear.
+    const REG_IMR: u64 = 0x3c;
+    const REG_ISR: u64 = 0x3e;
+    /// TCR / RCR: Transmit / Receive Configuration (32-bit).
+    const REG_TCR: u64 = 0x40;
+    const REG_RCR: u64 = 0x44;
+    /// CFG9346 (93C46 command): 0xC0 unlocks the config/registers for write, 0x00 re-locks.
+    const REG_CFG9346: u64 = 0x50;
+    const CFG9346_UNLOCK: u8 = 0xc0;
+    const CFG9346_LOCK: u8 = 0x00;
+    /// RMS: Receive packet Max Size (16-bit) — the largest frame the NIC will DMA into a buffer.
+    const REG_RMS: u64 = 0xda;
+    /// CPlusCmd: the C+ command register (enables the C+ descriptor-ring receive/transmit engine).
+    const REG_CPLUSCMD: u64 = 0xe0;
+    /// RDSAR: Receive Descriptor Start Address (64-bit; low @ 0xE4, high @ 0xE8). 256-byte aligned.
+    const REG_RDSAR: u64 = 0xe4;
+    /// MTPS: Max Transmit Packet Size (8-bit, units of 128 bytes).
+    const REG_MTPS: u64 = 0xec;
+
+    // ── RCR / TCR field values (datasheet-standard bring-up) ──
+    /// RCR: accept-all-packets (promiscuous, for bring-up — mirrors the e1000 driver's promiscuous
+    /// bring-up), physical-match, multicast, broadcast; MXDMA unlimited; RX FIFO threshold none.
+    const RCR_AAP: u32 = 1 << 0;
+    const RCR_APM: u32 = 1 << 1;
+    const RCR_AM: u32 = 1 << 2;
+    const RCR_AB: u32 = 1 << 3;
+    const RCR_MXDMA_UNLIMITED: u32 = 0x7 << 8;
+    const RCR_RXFTH_NONE: u32 = 0x7 << 13;
+    /// TCR: MXDMA unlimited + the standard IEEE inter-frame gap.
+    const TCR_MXDMA_UNLIMITED: u32 = 0x7 << 8;
+    const TCR_IFG_STD: u32 = 0x3 << 24;
+    /// MTPS ~ 7.5 KiB (0x3B × 128) — well above a 1522-byte frame; matches the r8169 default.
+    const MTPS_DEFAULT: u8 = 0x3b;
+
+    // ── C+ descriptor (16 bytes). Written by hardware via DMA, so every access is a whole-struct
+    //    volatile read/write on a `packed` copy (a field reference would be unaligned UB). ──
+    #[repr(C, packed)]
+    #[derive(Clone, Copy)]
+    struct Desc {
+        /// OWN(31) | EOR(30) | FS(29) | LS(28) | … | frame-length[13:0]. For RX the length field is
+        /// the buffer size we advertise; hardware overwrites it with the received length on completion.
+        opts1: u32,
+        /// VLAN / offload flags — unused in this bring-up (0).
+        opts2: u32,
+        /// Buffer physical address (identity map ⇒ the allocation's virtual pointer). 64-bit.
+        addr: u64,
+    }
+    /// OWN: 1 = owned by the NIC (RX: ready to receive / TX: ready to send); 0 = owned by the host.
+    const DESC_OWN: u32 = 1 << 31;
+    /// EOR: End Of Ring — set on the last descriptor so the NIC wraps to descriptor 0.
+    const DESC_EOR: u32 = 1 << 30;
+    /// FS / LS: First / Last Segment (a single-buffer frame sets both). TX only. (M3 `transmit`.)
+    #[allow(dead_code)]
+    const DESC_FS: u32 = 1 << 29;
+    #[allow(dead_code)]
+    const DESC_LS: u32 = 1 << 28;
+    /// Frame-length / buffer-size field, bits [13:0].
+    const DESC_LEN_MASK: u32 = 0x3fff;
+
+    /// RX ring depth (each descriptor 16 bytes; the ring base is 256-byte aligned). 32 mirrors the
+    /// e1000 driver's depth.
+    const NUM_RX: usize = 32;
+    /// TX ring depth.
+    const NUM_TX: usize = 8;
+    /// Per-descriptor buffer size (one full Ethernet frame fits; fits the 14-bit length field).
+    const RX_BUF_SIZE: usize = 2048;
+    const TX_BUF_SIZE: usize = 2048;
 
     // ── PCI config-space offsets (in the ECAM, at bus1:dev0:fn0) ──
     const CFG_VENDOR: u64 = 0x00;
@@ -108,20 +183,55 @@ mod metal {
     /// Downstream device config base = ECAM base + bus1:dev0:fn0 offset (`bus<<20 | dev<<15 | fn<<12`).
     const BUS1_DEV0_FN0: u64 = 1 << 20;
 
-    /// The claimed NIC: its register-BAR MMIO base and the station MAC. (Rings land here in M2.)
+    /// The claimed NIC: its register-BAR MMIO base, the station MAC, and the C+ RX/TX descriptor
+    /// rings + DMA buffers. The rings are allocated from the kernel heap (identity map ⇒ the pointer
+    /// doubles as the physical address the NIC DMAs against, exactly like the x86 e1000 driver).
     pub struct Rtl8168 {
         mmio_base: u64,
         mac: [u8; 6],
+        rx_ring: *mut Desc,
+        rx_buffers: *mut u8,
+        // The ring cursors + counters are advanced by the M3 raw_rx/transmit poll path.
+        #[allow(dead_code)]
+        rx_cur: usize,
+        #[allow(dead_code)]
+        rx_count: u64,
+        tx_ring: *mut Desc,
+        tx_buffers: *mut u8,
+        #[allow(dead_code)]
+        tx_cur: usize,
+        #[allow(dead_code)]
+        tx_count: u64,
     }
+
+    // The driver owns raw DMA pointers; on the single-CPU main-loop/poll discipline it is only ever
+    // touched behind the `NET4_DEVICE` mutex, so sharing across contexts is sound.
+    unsafe impl Send for Rtl8168 {}
 
     impl Rtl8168 {
         #[inline]
         fn r8(&self, off: u64) -> u8 {
-            unsafe { core::ptr::read_volatile((self.mmio_base + off) as *const u8) }
+            unsafe { read_volatile((self.mmio_base + off) as *const u8) }
         }
         #[inline]
         fn w8(&self, off: u64, v: u8) {
-            unsafe { core::ptr::write_volatile((self.mmio_base + off) as *mut u8, v) }
+            unsafe { write_volatile((self.mmio_base + off) as *mut u8, v) }
+        }
+        #[inline]
+        fn w16(&self, off: u64, v: u16) {
+            unsafe { write_volatile((self.mmio_base + off) as *mut u16, v) }
+        }
+        #[inline]
+        fn r32(&self, off: u64) -> u32 {
+            unsafe { read_volatile((self.mmio_base + off) as *const u32) }
+        }
+        #[inline]
+        fn w32(&self, off: u64, v: u32) {
+            unsafe { write_volatile((self.mmio_base + off) as *mut u32, v) }
+        }
+        #[inline]
+        fn r16(&self, off: u64) -> u16 {
+            unsafe { read_volatile((self.mmio_base + off) as *const u16) }
         }
 
         /// Soft-reset the MAC: set CR.RST and poll (finite backstop) until the controller clears it.
@@ -153,6 +263,114 @@ mod metal {
                 *b = self.r8(REG_IDR0 + i as u64);
             }
             mac
+        }
+
+        /// Allocate the RX descriptor ring (256-byte aligned) + contiguous packet buffers, and point
+        /// each descriptor at its buffer with OWN set (ready for the NIC to fill) and the buffer size
+        /// in the length field. The `alloc_zeroed` pointer doubles as the physical address (identity
+        /// map), matching the x86 e1000 ring allocation. EOR marks the last descriptor.
+        fn alloc_rx(&mut self) {
+            let ring_layout = Layout::from_size_align(NUM_RX * core::mem::size_of::<Desc>(), 256).unwrap();
+            let buf_layout = Layout::from_size_align(NUM_RX * RX_BUF_SIZE, 4096).unwrap();
+            self.rx_ring = unsafe { alloc::alloc::alloc_zeroed(ring_layout) as *mut Desc };
+            self.rx_buffers = unsafe { alloc::alloc::alloc_zeroed(buf_layout) };
+            for i in 0..NUM_RX {
+                let buf_phys = (self.rx_buffers as u64) + (i * RX_BUF_SIZE) as u64;
+                let eor = if i == NUM_RX - 1 { DESC_EOR } else { 0 };
+                let d = Desc {
+                    opts1: DESC_OWN | eor | (RX_BUF_SIZE as u32 & DESC_LEN_MASK),
+                    opts2: 0,
+                    addr: buf_phys,
+                };
+                unsafe { write_volatile(self.rx_ring.add(i), d) };
+            }
+        }
+
+        /// Allocate the TX descriptor ring (256-byte aligned) + frame buffers. Descriptors start
+        /// host-owned (OWN clear) so `transmit` can post into them; EOR marks the last descriptor.
+        fn alloc_tx(&mut self) {
+            let ring_layout = Layout::from_size_align(NUM_TX * core::mem::size_of::<Desc>(), 256).unwrap();
+            let buf_layout = Layout::from_size_align(NUM_TX * TX_BUF_SIZE, 4096).unwrap();
+            self.tx_ring = unsafe { alloc::alloc::alloc_zeroed(ring_layout) as *mut Desc };
+            self.tx_buffers = unsafe { alloc::alloc::alloc_zeroed(buf_layout) };
+            for i in 0..NUM_TX {
+                let eor = if i == NUM_TX - 1 { DESC_EOR } else { 0 };
+                let d = Desc { opts1: eor, opts2: 0, addr: 0 };
+                unsafe { write_volatile(self.tx_ring.add(i), d) };
+            }
+        }
+
+        /// Bring up the C+ descriptor-ring engine after the M1 soft reset: unlock the config
+        /// registers, allocate + program the RX/TX rings, set the packet-size / DMA-burst / RX-filter
+        /// configuration, enable RX+TX, re-lock the config, and mask interrupts (polled bring-up).
+        /// The register-write ORDER follows the RTL8168 programming guide / Linux `r8169` `rtl_hw_start`.
+        /// Returns true if a poison-honest readback confirms the device is still answering. Every
+        /// register write is announced before issue (they are fabric-visible controller writes).
+        fn init_rings(&mut self) -> bool {
+            serial_println!("{}   M2 ring bring-up (C+ mode; RTL8168 programming-guide order) ::", P4);
+            // Unlock the config/registers for write (93C46 command = 0xC0).
+            serial_println!("{}   >>> REG WRITE (M2): CFG9346[{:#x}] = {:#04x} (unlock config) ::", P4, REG_CFG9346, CFG9346_UNLOCK);
+            self.w8(REG_CFG9346, CFG9346_UNLOCK);
+
+            // C+ command register: read + log the current value (the reset default already selects the
+            // C+ descriptor engine on the RTL8168; we preserve it rather than force reserved bits).
+            let cpc = self.r16(REG_CPLUSCMD);
+            serial_println!("{}   CPlusCmd[{:#x}] = {:#06x} (C+ engine) ::", P4, REG_CPLUSCMD, cpc);
+
+            // Allocate + program the descriptor rings (256-byte-aligned physical bases).
+            self.alloc_rx();
+            self.alloc_tx();
+            let rx_phys = self.rx_ring as u64;
+            let tx_phys = self.tx_ring as u64;
+            serial_println!("{}   >>> REG WRITE (M2): RDSAR[{:#x}] = {:#x} (RX ring, {} desc) ::", P4, REG_RDSAR, rx_phys, NUM_RX);
+            self.w32(REG_RDSAR, rx_phys as u32);
+            self.w32(REG_RDSAR + 4, (rx_phys >> 32) as u32);
+            serial_println!("{}   >>> REG WRITE (M2): TNPDS[{:#x}] = {:#x} (TX ring, {} desc) ::", P4, REG_TNPDS, tx_phys, NUM_TX);
+            self.w32(REG_TNPDS, tx_phys as u32);
+            self.w32(REG_TNPDS + 4, (tx_phys >> 32) as u32);
+
+            // Receive max size + max TX packet size.
+            serial_println!("{}   >>> REG WRITE (M2): RMS[{:#x}] = {:#06x}; MTPS[{:#x}] = {:#04x} ::", P4, REG_RMS, RX_BUF_SIZE as u16, REG_MTPS, MTPS_DEFAULT);
+            self.w16(REG_RMS, RX_BUF_SIZE as u16);
+            self.w8(REG_MTPS, MTPS_DEFAULT);
+
+            // Transmit config (MXDMA unlimited + standard IFG).
+            let tcr = TCR_MXDMA_UNLIMITED | TCR_IFG_STD;
+            serial_println!("{}   >>> REG WRITE (M2): TCR[{:#x}] = {:#010x} ::", P4, REG_TCR, tcr);
+            self.w32(REG_TCR, tcr);
+
+            // Publish the ring descriptors before the engine starts fetching them.
+            unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
+
+            // Enable RX + TX in the ChipCmd register.
+            serial_println!("{}   >>> REG WRITE (M2): CR[{:#x}] = {:#04x} (RxEnb | TxEnb) ::", P4, REG_CR, CR_RE | CR_TE);
+            self.w8(REG_CR, CR_RE | CR_TE);
+
+            // Receive config LAST (this arms reception): promiscuous bring-up filter + MXDMA/RXFTH.
+            let rcr = RCR_AAP | RCR_APM | RCR_AM | RCR_AB | RCR_MXDMA_UNLIMITED | RCR_RXFTH_NONE;
+            serial_println!("{}   >>> REG WRITE (M2): RCR[{:#x}] = {:#010x} (promiscuous bring-up) ::", P4, REG_RCR, rcr);
+            self.w32(REG_RCR, rcr);
+
+            // Re-lock the config registers.
+            self.w8(REG_CFG9346, CFG9346_LOCK);
+
+            // Polled bring-up: mask every interrupt source, clear any latched status (write-1-to-clear).
+            self.w16(REG_IMR, 0);
+            self.w16(REG_ISR, 0xffff);
+            unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
+
+            // Poison-honest readback: a live controller returns a plausible TCR (our written value's
+            // MXDMA/IFG bits, not an open-bus all-ones). Reject 0xffffffff / 0xdeadbeef as absent decode.
+            let tcr_rb = self.r32(REG_TCR);
+            if is_poison(tcr_rb) {
+                serial_println!("{}   TCR readback = {:#010x} — POISON (open bus / device stopped answering); ring bring-up FAILED ::", P4, tcr_rb);
+                return false;
+            }
+            serial_println!(
+                "{}   rings up: RX @ {:#x} ({} desc) TX @ {:#x} ({} desc); TCR readback {:#010x} (live) ::",
+                P4, rx_phys, NUM_RX, tx_phys, NUM_TX, tcr_rb
+            );
+            true
         }
     }
 
@@ -377,23 +595,45 @@ mod metal {
             }
         }
 
-        // ── Construct the driver, reset the MAC, read + print the station MAC (M1 deliverable) ──
-        let nic = Rtl8168 { mmio_base: bar_base, mac: [0; 6] };
+        // ── Construct the driver, reset the MAC, read the station MAC (M1) ──
+        let mut nic = Rtl8168 {
+            mmio_base: bar_base,
+            mac: [0; 6],
+            rx_ring: core::ptr::null_mut(),
+            rx_buffers: core::ptr::null_mut(),
+            rx_cur: 0,
+            rx_count: 0,
+            tx_ring: core::ptr::null_mut(),
+            tx_buffers: core::ptr::null_mut(),
+            tx_cur: 0,
+            tx_count: 0,
+        };
         if !nic.soft_reset() {
             serial_println!("{}   MAC reset did not complete — continuing to read MAC (may be stale) ::", P4);
         }
-        let mac = nic.read_mac();
-        let macs = fmt_mac(&mac);
+        nic.mac = nic.read_mac();
+        let macs = fmt_mac(&nic.mac);
         serial_println!(
             "{}   station MAC = {} ::",
             P4,
             core::str::from_utf8(&macs).unwrap_or("<mac>")
         );
+
+        // ── M2: bring up the C+ RX/TX descriptor rings + init sequence ──
+        if !nic.init_rings() {
+            serial_println!("{} ORIN-NET-4 bring-up STOPPED after ring init failed (device stopped answering) ::", P4);
+            return;
+        }
+
+        // Register the driver so the smoltcp bind (M3) + any poll path can reach it.
+        *NET4_DEVICE.lock() = Some(nic);
         serial_println!(
-            "{} ORIN-NET-4 M1 DONE — RTL8168 claimed @ BAR2 {:#x}, MAC read (rings + smoltcp bind = M2/M3) ::",
+            "{} ORIN-NET-4 M2 DONE — RTL8168 @ BAR2 {:#x}, MAC read, C+ rings up + RX/TX enabled (smoltcp bind = M3) ::",
             P4, bar_base
         );
-        // M2/M3 (rings + init + smoltcp bind) consume `nic`; silence the unused warning until then.
-        let _ = nic.mac;
     }
+
+    /// The one registered RTL8168 NIC (populated by [`net4_bringup`]). Mirrors the x86 e1000
+    /// `NET_DEVICE` registry; the smoltcp Device adapter (M3) reaches the rings through it.
+    pub static NET4_DEVICE: spin::Mutex<Option<Rtl8168>> = spin::Mutex::new(None);
 }
