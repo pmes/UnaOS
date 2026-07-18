@@ -4888,6 +4888,78 @@ warnings on every combo); `test-arm 22` MISSION SUCCESS; `UNAOS_GICV3=1 test-arm
 VUG-HONESTY PASS (knob-off **and** `PCIE3`-on — the on run witnesses the census2 graceful skip **and** the
 PS-widen witness PASS); `kernel8-test` 0-FAIL. Bench runbook: `scripts/orin-net3-bench.md`.
 
+### ORIN-NET-4 — RTL8168/8111 GbE driver + smoltcp bind (`UNAOS_NET4`, knob-gated; the Orin's first network path)
+
+**The metal facts NET-4 stands on (the NET-1/2/3 recon ground truth, not re-litigated).** The consolidated
+NET-3 sitting resolved the two questions the recon existed to answer, and they are **load-bearing** for the
+driver:
+
+- **The device is a Realtek RTL8168/8111 GbE controller** — `vendor 0x10ec`, `device 0x8168`, at
+  controller-0 bus1:dev0:fn0 (reached through the PS-widened ECAM). This fixes the *programming model*:
+  the datasheet-standard **C+ command / descriptor-ring** interface (Realtek + Linux `r8169`).
+- **The link was observed UP (gen1 x1) — the `LINK-UP-pre-LTSSM` observation.** The RP's DBI PCIe-capability
+  Link Status read DLL-active before the M2 `APPL_CTRL.LTSSM_EN` write even landed (firmware left the link
+  trained), so a device answered below the root port and the ECAM enumeration succeeded. NET-4 therefore
+  does not re-fight link bring-up (NET-3 owns that); it *claims the device NET-3 found*.
+- **The BARs sized:** BAR0 I/O `0x100`, **BAR2 mem `0x1000`** (the 4 KiB register window — the driver's
+  MMIO), BAR4 mem `0x4000` (MSI-X). NET-4 drives **BAR2**.
+
+**What NET-4 is.** The Orin's first *network path*: the driver that turns "device identified" into "packets
+move." It builds directly on NET-3 (`net4` **implies `pcie3`**) and runs on the metal Orin **after** the
+NET-3 `census2` has widened the regime, enabled the LTSSM, and enumerated bus1:dev0:fn0. In one bring-up it:
+
+| step | what |
+|---|---|
+| **claim** | resolve controller-0's `ecam` from the live DTB (tegra-RC + firmware-`okay` gated), map it via the PS-widened `map_mmio_window`, read bus1:dev0:fn0, poison-reject the identity, and **confirm it is the RTL8168** (`0x10ec:0x8168`) before touching anything |
+| **decode-enable** | set the device's `COMMAND` register **MEM-space + bus-master** — the config write NET-3 deliberately *refused* (a driver's job), so the BARs decode and the NIC can master DMA |
+| **BAR map** | resolve BAR2 (64-bit-BAR aware) and map its 4 KiB register window Device-nGnRE via the same PS-widened path |
+| **reset + MAC** | soft-reset the MAC (`CR.RST`, finite backstop), read the station MAC from `IDR0..5` |
+| **rings** | allocate the C+ **RX (32) / TX (8) descriptor rings** + DMA buffers, program `RDSAR`/`TNPDS`, `RMS`/`MTPS`/`TCR`/`RCR`, enable `CR = RxEnb\|TxEnb` (RTL8168 programming-guide / `r8169` `rtl_hw_start` order) |
+| **bind** | build a **smoltcp 0.13 `phy::Device`** over the rings (the x86 e1000/`smolnet` seam, transposed) + an `Interface` (MAC, static bring-up CIDR, default route) and poll it |
+
+**DMA / identity-map invariant (and its one metal risk).** `mmu_tegra` builds an **identity map (VA==PA)**
+for RAM, so — exactly as the x86 e1000 relies on UEFI's 1:1 tables — a heap allocation's virtual pointer
+*is* the physical address the NIC DMAs against. The rings are `alloc_zeroed` (256-byte-aligned bases), the
+pointer used verbatim as the descriptor/buffer physical address. The one unknown QEMU cannot settle:
+whether the **SMMU** (`smmu_tegra`) is translating or bypassing controller-0's PCIe stream IDs. NET-4
+programs the identity-physical addresses and documents the SMMU-bypass assumption; an attended sitting
+confirms it. This is why the arc is **code-complete-prior-to-metal by design**. The **second** unknown
+(review-lens fold): **cache coherency** — rings/buffers are Normal cacheable RAM handed over with
+`dsb sy` only (ordering, not clean/invalidate); correctness assumes Tegra234 controller-0 PCIe is
+I/O-coherent toward DRAM. Metal signature if it isn't: rings never advance / torn or zero frames on a
+live link; the fix is clean-before-OWN + invalidate-before-read, never a weakened OWN protocol.
+
+**Poison-honesty (the PI-V3D-1 lane law) throughout.** The device-identity read rejects `0xffffffff` /
+`0xdeadbeef` as absent decode; the ring init does a **poison-honest `TCR` readback** and *fails the
+bring-up* (rather than trusting a dead controller) if the register space returns open-bus.
+
+**Write discipline.** NET-4, being a driver, does the writes NET-3 refused — the `COMMAND` decode-enable and
+the RTL8168 control/ring register program — each **announced on serial before issue**. It touches only
+controller-0's downstream device and that device's own BAR2: no other controller, no MSI/MSI-X, no PERST/PHY.
+
+**QEMU vs metal — the honesty boundary.** QEMU `virt` models **no Tegra234 RC**, so the whole MMIO/DMA +
+smoltcp layer is additionally **`tegra`-gated**. A `net4`-standalone (virt) build prints **one honest
+witness line** and returns before any MMIO — the GICv3 regression run is unperturbed:
+
+```
+:: PCIE4: ORIN-NET-4 RTL8168 driver compiled; no Tegra234 RC on this build (QEMU virt) — bring-up is metal-only (UNAOS_NET4=1 UNAOS_TEGRA=1) ::
+```
+
+On metal (`UNAOS_NET4=1 UNAOS_TEGRA=1`) the full claim → rings → bind sequence runs; live ICMP/ARP over the
+bound interface is **attended-metal** (the devkit link has no DHCP lease pre-config, so a static bring-up
+address lets the interface bind and exercise ARP once the link's real subnet is known).
+
+**Byte-identity (knob-off).** `net4` is default-OFF and armed only by `UNAOS_NET4=1`; with it off the module
++ both call sites are compiled out **and the smoltcp dep is not pulled** (it is declared optional under
+`net4`), so the default tegra/virt media are byte-identical to baseline. `net4` is *not* stripped by
+`arm_features` (unlike the x86-only `smolnet`) — it is a real aarch64 feature.
+
+**Gates green (pre-metal).** `UNAOS_NET4=1 UNAOS_TEGRA=1 ./arroyo check` both arches (zero net-new
+warnings), `net4`/virt + default-off both arches; `test-arm 22` MISSION SUCCESS; `UNAOS_GICV3=1 test-arm 40`
+CAPSTONE 6/6 + VUG-HONESTY PASS (knob-off **and** `net4`-on — the on run fires the `PCIE4` witness line and
+still completes CAPSTONE 6/6, i.e. the net4 virt build does not perturb the GICv3 run). Metal verification is
+deferred to an attended sitting. Bench runbook: `scripts/orin-net4-bench.md`.
+
 ### ORIN-SMP idle-heartbeat — the parked-core pinned-bar fix (per-core telemetry honesty)
 
 > Numbering note: the spawning round labelled this arc "SMP-6", but SMP-6/7/8 are already merged

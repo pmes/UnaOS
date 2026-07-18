@@ -167,6 +167,16 @@ _feats=""
 # decision + graceful skip (UNAOS_GICV3=1 test-arm). Default OFF => module blocks + call sites vanish,
 # byte-identical to baseline modulo the ratified 1-byte Location class. See arch_arm64.md §ORIN-NET-3.
 [ -n "${UNAOS_PCIE3:-}" ] && _feats="${_feats}pcie3,pcie2,"
+# ORIN-NET-4: UNAOS_NET4=1 arms the Realtek RTL8168/8111 GbE driver + smoltcp bind — the Orin's FIRST
+# network path (arch/aarch64/rtl8168_tegra.rs). Builds on NET-3 (implies pcie3,pcie2): claims
+# controller-0's downstream device (bus1:dev0:fn0 = 0x10ec:0x8168), maps its register BAR via the
+# PS-widened map_mmio_window, resets the MAC, brings up the C+ RX/TX descriptor rings, reads the MAC,
+# and binds a smoltcp phy::Device over the rings. Pulls the smoltcp dep on aarch64 (dep:smoltcp). The
+# driver MMIO/DMA + the smoltcp adapter are additionally tegra-gated (QEMU models no Tegra234 RC), so a
+# net4-standalone virt build only prints one honest witness line; the metal build combines
+# UNAOS_TEGRA=1. Default OFF => module + call sites vanish, smoltcp not pulled, byte-identical to
+# baseline. See arch_arm64.md §ORIN-NET-4 and scripts/orin-net4-bench.md.
+[ -n "${UNAOS_NET4:-}" ] && _feats="${_feats}net4,pcie3,pcie2,"
 if [ -n "$_feats" ]; then
     KERNEL_FEATURES="--features ${_feats%,}"
     echo -e "${COLOR_YELLOW}⚡ kernel features: ${_feats%,}${COLOR_RESET}"

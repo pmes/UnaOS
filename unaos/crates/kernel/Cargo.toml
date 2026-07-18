@@ -229,6 +229,21 @@ pcie2 = []
 # 1-byte Location class. See arch_arm64.md §ORIN-NET-3 and scripts/orin-net3-bench.md.
 pcie3 = ["pcie2"]
 
+# ORIN-NET-4: the `UNAOS_NET4=1` Realtek RTL8168/8111 GbE driver + smoltcp bind — the Orin's FIRST
+# network path (arch/aarch64/rtl8168_tegra.rs). Builds on NET-3's PS-widen + link bring-up + ECAM
+# enumeration (implies `pcie3`): claims controller-0's downstream device (bus1:dev0:fn0 = Realtek
+# 0x10ec:0x8168, the metal-identified NIC), maps its register BAR via the established PS-widened
+# `map_mmio_window` path, resets the MAC, brings up the C+ command/descriptor RX/TX rings (datasheet
+# programming model), reads the station MAC, and binds a `smoltcp::phy::Device` over the rings
+# (the x86 e1000/smolnet seam, transposed to aarch64/tegra). Pulls the smoltcp dep on aarch64 (added
+# to the aarch64 target deps as optional). The driver's MMIO/DMA + the smoltcp adapter are additionally
+# `tegra`-gated (QEMU models no Tegra234 RC), so a `net4`-standalone virt build performs no MMIO and
+# only prints one honest witness line; the metal build combines `UNAOS_NET4=1 UNAOS_TEGRA=1`. Every
+# config/fabric write (command-register MEM+BME decode-enable, then the reset/ring register program)
+# is logged before issue. Default OFF => the module + call sites vanish and the smoltcp dep is not
+# pulled, byte-identical to baseline. See arch_arm64.md §ORIN-NET-4 and scripts/orin-net4-bench.md.
+net4 = ["pcie3", "dep:smoltcp"]
+
 # CORE3-PROBE: instrument the aarch64 secondary-core entry stub (`_secondary_start`) to raw-dump,
 # MMU-off / no-stack, each core's MPIDR_EL1 low byte, CurrentEL, and its arrival x0 to the Pi 4 PL011
 # (0xFE201000) BEFORE any Rust runs. Disambiguates the CORE3-SMP >1 MiB core-3 regression (firmware
@@ -301,6 +316,10 @@ rast = { path = "../rast", optional = true }
 # aarch64-only (K3-N1): only the Pi media carries a unafs partition; keeping it
 # out of the x86 kernel protects the tight usbdebug-esp size band.
 unafs = { path = "../../libs/fs/unafs", default-features = false }
+# ORIN-NET-4: the mature TCP/IP stack for the aarch64/tegra NIC bind — the same crate/version/feature
+# set the x86 `smolnet` uses, declared here (aarch64) as optional so it is pulled ONLY under the
+# `net4` feature (via `dep:smoltcp`). Default-OFF net4 => not compiled => aarch64 media byte-identical.
+smoltcp = { version = "=0.13.1", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-icmp", "socket-udp", "socket-tcp", "socket-dhcpv4"], optional = true }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 x86_64 = "0.15.4"
