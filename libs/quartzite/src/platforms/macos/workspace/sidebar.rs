@@ -109,6 +109,13 @@ pub struct SidebarDelegateIvars {
     /// notifications as user chevron clicks, and echoing those back to the
     /// brain would toggle its state right back (feedback loop).
     pub suppress_expand_events: RefCell<bool>,
+    /// Collapse-burst root. AppKit consults shouldCollapseItem for the user's
+    /// item FIRST, then for each expanded descendant (trace-verified
+    /// 2026-07-18); only the first may reach the brain — reporting descendants
+    /// erases the nested expansion state that restores the shape on reopen.
+    /// Set on the burst's first shouldCollapse, cleared by the root's own
+    /// DidCollapse (which fires last, deepest-first order).
+    pub collapse_burst_root: RefCell<Option<String>>,
 }
 
 define_class!(
@@ -125,6 +132,7 @@ define_class!(
                 outline_view: RefCell::new(None),
                 tx_event: RefCell::new(None),
                 suppress_expand_events: RefCell::new(false),
+                collapse_burst_root: RefCell::new(None),
             });
             unsafe { msg_send![super(this), init] }
         }
@@ -312,6 +320,49 @@ define_class!(
             Some(unsafe { Retained::cast_unchecked::<NSView>(cell) })
         }
 
+        /// Consulted only for the item the *user* targets (not for the
+        /// DidCollapse cascade AppKit fires for expanded descendants, and not
+        /// for programmatic expandItem during restore) — so this, not
+        /// DidExpand/DidCollapse, is where the brain gets told. Trace evidence
+        /// 2026-07-18: the cascade fires deepest-first with rows still live,
+        /// so no Did*-side filter can distinguish the user's click.
+        #[unsafe(method(outlineView:shouldExpandItem:))]
+        fn outline_view_should_expand_item(
+            &self,
+            _outline_view: &NSOutlineView,
+            item: &AnyObject,
+        ) -> objc2::runtime::Bool {
+            let node = unsafe { Retained::cast_unchecked::<UnaMatrixNode>(Retained::retain(item as *const AnyObject as *mut AnyObject).unwrap()) };
+            if !*self.ivars().suppress_expand_events.borrow() {
+                let id = node.ivars().node_id.borrow().clone();
+                if let Some(tx) = self.ivars().tx_event.borrow().as_ref() {
+                    let _ = tx.try_send(bandy::SMessage::ToggleMatrixNode(id));
+                }
+            }
+            objc2::runtime::Bool::YES
+        }
+
+        #[unsafe(method(outlineView:shouldCollapseItem:))]
+        fn outline_view_should_collapse_item(
+            &self,
+            _outline_view: &NSOutlineView,
+            item: &AnyObject,
+        ) -> objc2::runtime::Bool {
+            let node = unsafe { Retained::cast_unchecked::<UnaMatrixNode>(Retained::retain(item as *const AnyObject as *mut AnyObject).unwrap()) };
+            let id = node.ivars().node_id.borrow().clone();
+            if !*self.ivars().suppress_expand_events.borrow() {
+                let is_cascade = self.ivars().collapse_burst_root.borrow().as_ref()
+                    .is_some_and(|root| id.starts_with(&format!("{root}/")));
+                if !is_cascade {
+                    *self.ivars().collapse_burst_root.borrow_mut() = Some(id.clone());
+                    if let Some(tx) = self.ivars().tx_event.borrow().as_ref() {
+                        let _ = tx.try_send(bandy::SMessage::ToggleMatrixNode(id));
+                    }
+                }
+            }
+            objc2::runtime::Bool::YES
+        }
+
         #[unsafe(method(outlineViewItemDidExpand:))]
         fn outline_view_item_did_expand(&self, notification: &objc2_foundation::NSNotification) {
             unsafe {
@@ -321,16 +372,9 @@ define_class!(
 
                     if !item.is_null() {
                         let node = Retained::cast_unchecked::<UnaMatrixNode>(Retained::retain(item).unwrap());
+                        // Bookkeeping only — the brain is told in
+                        // shouldExpandItem (user-targeted items only).
                         *node.ivars().is_expanded.borrow_mut() = true;
-                        // Report user chevron expansion to the brain so its
-                        // topology tracks the UI (first-click tree resets came
-                        // from the brain holding a stale collapsed tree).
-                        if !*self.ivars().suppress_expand_events.borrow() {
-                            let id = node.ivars().node_id.borrow().clone();
-                            if let Some(tx) = self.ivars().tx_event.borrow().as_ref() {
-                                let _ = tx.try_send(bandy::SMessage::ToggleMatrixNode(id));
-                            }
-                        }
                     }
                 }
             }
@@ -345,28 +389,15 @@ define_class!(
 
                     if !item.is_null() {
                         let node = Retained::cast_unchecked::<UnaMatrixNode>(Retained::retain(item).unwrap());
-                        // Collapsing a parent makes AppKit fire DidCollapse for
-                        // its expanded descendants too. Those cascade victims are
-                        // already hidden (rowForItem == -1); only a directly
-                        // user-collapsed item is still visible. Don't report the
-                        // cascade to the brain — its nested expansion state is
-                        // exactly what lets a reopened parent restore its shape.
-                        let row: NSInteger = {
-                            let ov = self.ivars().outline_view.borrow();
-                            match ov.as_ref() {
-                                Some(ov) => msg_send![&**ov, rowForItem: &*node],
-                                None => -1,
-                            }
-                        };
-                        if row < 0 {
-                            return;
-                        }
-                        *node.ivars().is_expanded.borrow_mut() = false;
-                        if !*self.ivars().suppress_expand_events.borrow() {
-                            let id = node.ivars().node_id.borrow().clone();
-                            if let Some(tx) = self.ivars().tx_event.borrow().as_ref() {
-                                let _ = tx.try_send(bandy::SMessage::ToggleMatrixNode(id));
-                            }
+                        // Bookkeeping is deliberately NOT done here: the
+                        // DidCollapse cascade covers expanded descendants whose
+                        // is_expanded must survive (it restores the shape when
+                        // the parent reopens). The burst root's own DidCollapse
+                        // fires last — it closes the burst window.
+                        let id = node.ivars().node_id.borrow().clone();
+                        let mut burst = self.ivars().collapse_burst_root.borrow_mut();
+                        if burst.as_deref() == Some(id.as_str()) {
+                            *burst = None;
                         }
                     }
                 }
