@@ -244,6 +244,19 @@ pcie3 = ["pcie2"]
 # pulled, byte-identical to baseline. See arch_arm64.md §ORIN-NET-4 and scripts/orin-net4-bench.md.
 net4 = ["pcie3", "dep:smoltcp"]
 
+# AARCH64-VNET: the `UNAOS_VNET=1` virtio-net-mmio driver on the QEMU `virt` machine + smoltcp bind
+# (arch/aarch64/virtio_net.rs) — the QEMU-testable proof of the aarch64 smoltcp seam NET-4 built. NET-4's
+# driver is `tegra`-gated (QEMU models no Tegra234 RC), so it is only ever COMPILE-tested off metal; this
+# arc exercises the IDENTICAL seam shape (ring → `smoltcp::phy::Device` → `Interface` → ICMP echo) against
+# a `virtio-net-device` QEMU DOES model, driven end-to-end with real packets over QEMU user-mode
+# networking (slirp). Scans the fixed virtio-mmio window (`0x0a00_0000`), drives the LEGACY transport
+# (QEMU's default), negotiates a minimal feature set (F_MAC only), sets up the RX/TX virtqueues, and runs
+# a bounded ICMP-ping witness to the slirp gateway (`10.0.2.2`) that emits a self-checking PASS/FAIL line.
+# Pulls the smoltcp dep on aarch64 (same optional dep NET-4 uses). Default OFF => the module + call site
+# vanish and the smoltcp dep is not pulled, byte-identical to baseline. Run with
+# `UNAOS_VNET=1 UNAOS_GICV3=1 ./arroyo test-arm`. See arch_arm64.md §AARCH64-VNET.
+vnet = ["dep:smoltcp"]
+
 # CORE3-PROBE: instrument the aarch64 secondary-core entry stub (`_secondary_start`) to raw-dump,
 # MMU-off / no-stack, each core's MPIDR_EL1 low byte, CurrentEL, and its arrival x0 to the Pi 4 PL011
 # (0xFE201000) BEFORE any Rust runs. Disambiguates the CORE3-SMP >1 MiB core-3 regression (firmware
