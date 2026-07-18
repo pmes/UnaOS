@@ -76,7 +76,13 @@ define_class!(
             // Let the text view handle every command itself (default editing).
             objc2::runtime::Bool::NO
         }
+    }
 
+    // --- NSTextDelegate ---
+    // `textDidChange:` is declared on NSTextDelegate (NSTextViewDelegate's
+    // parent protocol); objc2 verifies the selector against the protocol the
+    // impl block names, so it must live here, not in NSTextViewDelegate.
+    unsafe impl NSTextDelegate for EditorDelegate {
         /// Fires on every buffer edit. We forward the full current buffer to the
         /// brain as `EditorEdited` so it can hold the live document.
         #[unsafe(method(textDidChange:))]
@@ -97,7 +103,6 @@ define_class!(
 );
 
 unsafe impl NSObjectProtocol for EditorDelegate {}
-unsafe impl NSTextDelegate for EditorDelegate {}
 
 impl EditorDelegate {
     /// Send a UI → brain message on the stored `tx_event`, if present.
