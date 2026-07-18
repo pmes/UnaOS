@@ -1831,6 +1831,15 @@ pub fn demo_cooperative() {
     }
     run_until_empty(0);
     serial_println!(":: AARCH64 SCHED: cooperative demo complete (context switch + round-robin OK) ::");
+
+    // PRIO-MIX M1 (the Pi kernel8-battery accrual the AARCH64-PRIO landing deferred): run the dedicated
+    // priority-mix stress witness here on the boot core, still COOPERATIVELY — this runs BEFORE
+    // `start_aps` flips `SCHED_ACTIVE`, so preemption is provably off and the strict-ordering sub-scenario
+    // is validly asserted (its aged-rescue half is a bounded-rescue claim that also stays honest once
+    // preemption is on). Self-contained + bounded, so it leaves the queue empty for the workload below.
+    // On the `virt`/Orin paths the boot core diverges into `run_capstone_boot_core` before reaching here,
+    // so those get the witness there instead (no double run).
+    prio_mix_witness(0);
 }
 
 /// Busy-wait `ms` milliseconds off the free-running CNTPCT (works even where the timer IRQ isn't
@@ -2119,6 +2128,128 @@ pub fn priority_aging_witness(cpu: usize) {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// PRIO-MIX M1 — dedicated priority-mix stress witness (cooperative, self-checking, bounded)
+// ---------------------------------------------------------------------------------------------
+//
+// The AARCH64-PRIO landing proved priority + aging in ONE combined scenario (`priority_aging_witness`)
+// and DEFERRED a dedicated *mix* witness (the Pi metal ledger records it as "mix witness deferred").
+// This closes it. Under a genuine mixed-priority load it proves BOTH halves of the multilevel
+// scheduler on one core, back to back, and reports each half INDEPENDENTLY:
+//
+//   * STRICT — from a DRAINED queue seeded with `PM_STRICT_HIGH` PRIO_HIGH short tasks (each runs to
+//     completion in one dispatch, no yield) + 1 PRIO_LOW short task, the CPU dispatches the whole
+//     PRIO_HIGH level before the PRIO_LOW task. A monotonic completion-ORDER counter records the
+//     finish order: strict holds iff every high task finished before the low one (the low task's
+//     completion index is last). This is an ORDERING claim — valid ONLY on a cooperative drained
+//     start, which is how the witness ALWAYS runs (both call sites run it before preemption is on);
+//     it is deliberately NOT asserted under preemption.
+//   * AGED-RESCUE — from a drained queue seeded with `PM_AGE_HIGH` PRIO_HIGH loaders that each yield
+//     `PM_AGE_ITERS` times (keeping PRIO_HIGH continuously ready) + 1 PRIO_LOW no-yield canary, the
+//     low task is nonetheless rescued by aging and completes WHILE high load is still active
+//     (`under_load`) — the anti-starvation proof. This is a BOUNDED-RESCUE claim (the low task
+//     completes before the finite load drains), NOT an ordering claim, so it stays honest under real
+//     preemption on Pi metal: the aging clock is dispatch-PASSES (`SchedCpu::age_passes` — it advances
+//     on cooperative AND preemptive dispatch alike), so a rescued-before-drain low is bounded in either
+//     regime. Same 2-loaders x 40-iters shape as the proven `priority_aging_witness`.
+//
+// BOUNDED + never hangs a battery: every task does finite work and NEITHER low task ever yields, so
+// `run_until_empty` always drains — a broken scheduler FAILs loudly (strict: low not last;
+// aged-rescue: low ran only after the load drained), it never wedges the core. That finite-work
+// guarantee IS the watchdog bound; no timer is needed, so it runs identically on the `virt` GICv3
+// boot core (test-arm 40) and in the Pi kernel8 battery (`demo_cooperative`, before preemption).
+// Telemetry statics are lock-free relaxed (owning-core-only within a cooperative drain).
+const PM_STRICT_HIGH: usize = 3;
+const PM_AGE_HIGH: usize = 2;
+const PM_AGE_ITERS: usize = 40;
+
+// STRICT sub-scenario: a monotonic completion-order source + the low task's finish index + a done count.
+static PM_SEQ: AtomicU32 = AtomicU32::new(0);
+static PM_LOW_ORDER: AtomicU32 = AtomicU32::new(0);
+static PM_HIGH_DONE: AtomicU32 = AtomicU32::new(0);
+// AGED-RESCUE sub-scenario: live loader count + the canary's ran/under-load flags (mirrors the proven
+// `priority_aging_witness` discriminator).
+static PM_AGE_ACTIVE: AtomicU32 = AtomicU32::new(0);
+static PM_AGE_LOW_RAN: AtomicBool = AtomicBool::new(false);
+static PM_AGE_LOW_UNDER_LOAD: AtomicBool = AtomicBool::new(false);
+
+/// STRICT high task: run to completion in one dispatch (no yield), stamping its completion order.
+fn pm_strict_high_body(_: usize) {
+    let _ = PM_SEQ.fetch_add(1, Ordering::Relaxed);
+    PM_HIGH_DONE.fetch_add(1, Ordering::Relaxed);
+}
+
+/// STRICT low task: run to completion in one dispatch (no yield), recording its completion order. It
+/// must be the LAST to finish (index == `PM_STRICT_HIGH`) for strict priority to hold.
+fn pm_strict_low_body(_: usize) {
+    let order = PM_SEQ.fetch_add(1, Ordering::Relaxed);
+    PM_LOW_ORDER.store(order, Ordering::Relaxed);
+}
+
+/// AGED-RESCUE loader: yield many times (keeping PRIO_HIGH continuously ready), then retire.
+fn pm_age_high_body(_: usize) {
+    for _ in 0..PM_AGE_ITERS {
+        yield_now();
+    }
+    PM_AGE_ACTIVE.fetch_sub(1, Ordering::Relaxed);
+}
+
+/// AGED-RESCUE canary: run to completion in ONE dispatch (no yield). Records that it ran and whether
+/// high load was still active at that moment — the aging (bounded-rescue) proof.
+fn pm_age_low_body(_: usize) {
+    PM_AGE_LOW_RAN.store(true, Ordering::Relaxed);
+    if PM_AGE_ACTIVE.load(Ordering::Relaxed) > 0 {
+        PM_AGE_LOW_UNDER_LOAD.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Run the PRIO-MIX M1 witness cooperatively on `cpu` and print the self-checking line. Two bounded,
+/// self-contained sub-scenarios drained via `run_until_empty` (each leaves the queue empty for the
+/// caller). Emits `:: AARCH64 SCHED: prio-mix witness (strict=..., aged-rescue=...) => PASS/FAIL ::`.
+pub fn prio_mix_witness(cpu: usize) {
+    serial_println!(
+        ":: AARCH64 SCHED: prio-mix witness — {} PRIO_HIGH short + 1 PRIO_LOW (strict), then {} PRIO_HIGH loaders + 1 PRIO_LOW (aged-rescue) on cpu {} ::",
+        PM_STRICT_HIGH,
+        PM_AGE_HIGH,
+        cpu
+    );
+
+    // --- Sub-scenario 1: STRICT priority from a drained queue. Load first (ahead in FIFO), then low. ---
+    PM_SEQ.store(0, Ordering::Relaxed);
+    PM_LOW_ORDER.store(0, Ordering::Relaxed);
+    PM_HIGH_DONE.store(0, Ordering::Relaxed);
+    for _ in 0..PM_STRICT_HIGH {
+        spawn_prio("pm-hi", pm_strict_high_body, 0, cpu, PRIO_HIGH);
+    }
+    spawn_prio("pm-lo", pm_strict_low_body, 0, cpu, PRIO_LOW);
+    run_until_empty(cpu);
+    let high_done = PM_HIGH_DONE.load(Ordering::Relaxed) as usize;
+    let low_order = PM_LOW_ORDER.load(Ordering::Relaxed);
+    // Every high task finished AND the low task finished last (its completion index == the high count).
+    let strict = high_done == PM_STRICT_HIGH && low_order == PM_STRICT_HIGH as u32;
+
+    // --- Sub-scenario 2: AGED-RESCUE under sustained high-priority pressure (drained queue). ---
+    PM_AGE_ACTIVE.store(PM_AGE_HIGH as u32, Ordering::Relaxed);
+    PM_AGE_LOW_RAN.store(false, Ordering::Relaxed);
+    PM_AGE_LOW_UNDER_LOAD.store(false, Ordering::Relaxed);
+    for _ in 0..PM_AGE_HIGH {
+        spawn_prio("pm-load", pm_age_high_body, 0, cpu, PRIO_HIGH);
+    }
+    spawn_prio("pm-canary", pm_age_low_body, 0, cpu, PRIO_LOW);
+    run_until_empty(cpu);
+    // Bounded rescue: the canary ran WHILE the finite load was still active (only possible via aging).
+    let aged_rescue =
+        PM_AGE_LOW_RAN.load(Ordering::Relaxed) && PM_AGE_LOW_UNDER_LOAD.load(Ordering::Relaxed);
+
+    let pass = strict && aged_rescue;
+    serial_println!(
+        ":: AARCH64 SCHED: prio-mix witness (strict={}, aged-rescue={}) => {} ::",
+        if strict { "PASS" } else { "FAIL" },
+        if aged_rescue { "PASS" } else { "FAIL" },
+        if pass { "PASS" } else { "FAIL" }
+    );
+}
+
 /// JC3: run the M4 CAPSTONE on the `virt` boot core ALONE, cooperatively, and never return. Called by
 /// `main.rs` right after the boot core drops EL2 -> EL1 (`boot_virt::drop_to_el1`) with its per-CPU
 /// (TPIDR_EL1) and EL1 vectors installed. This is the QEMU-testable proof that the scheduler + all six
@@ -2163,6 +2294,10 @@ pub fn run_capstone_boot_core(cpu: usize) -> ! {
     // and bounded (stages its own tasks, drains them, leaves the queue empty), so it never perturbs the
     // CAPSTONE that follows — it just adds the `priority+aging PASS` line to this cooperative boot.
     priority_aging_witness(cpu);
+    // PRIO-MIX M1: the dedicated priority-mix stress witness (strict ordering + aged rescue), reported
+    // alongside the line above. Equally self-contained + bounded (stages, drains, leaves the queue
+    // empty), so it too never perturbs the CAPSTONE. (The AARCH64-PRIO landing deferred this one.)
+    prio_mix_witness(cpu);
     spawn("capstone", capstone_body, 0, cpu);
     SCHED_GO.store(true, Ordering::Release); // harmless (no APs on this path)
     // Cooperative dispatch loop: drain the run queue, then busy-poll (never WFI). `dispatch_next` returns

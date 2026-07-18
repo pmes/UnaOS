@@ -318,6 +318,35 @@ still active** (only possible via aging) and prints
 and the low task never yields, so a broken aging path FAILs loudly instead of wedging the
 core. Captured by `UNAOS_GICV3=1 ./arroyo test-arm 40`.
 
+**PRIO-MIX witness (`prio_mix_witness`).** The dedicated priority-mix stress witness the
+AARCH64-PRIO landing deferred (the Pi metal ledger recorded it as "mix witness deferred").
+Under a genuine mixed-priority load it proves **both** halves of the multilevel scheduler on
+one core, back to back, and reports each independently on one line:
+
+- **strict** — from a *drained* queue seeded with `PM_STRICT_HIGH`=3 `PRIO_HIGH` short tasks
+  (each runs to completion in one dispatch, no yield) + 1 `PRIO_LOW` short task, a monotonic
+  completion-order counter proves the whole high level finished before the low task (its
+  finish index is last). This is an **ordering** claim — valid only on a cooperative drained
+  start, which is how the witness always runs (both call sites run it before preemption is
+  enabled), so it is deliberately *not* asserted under preemption.
+- **aged-rescue** — from a drained queue seeded with `PM_AGE_HIGH`=2 `PRIO_HIGH` loaders that
+  each yield 40 times (keeping the top level continuously ready) + 1 `PRIO_LOW` no-yield
+  canary, the canary is rescued by aging and completes **while high load is still active** —
+  the anti-starvation proof. This is a **bounded-rescue** claim (completion before the finite
+  load drains), *not* an ordering claim, so it stays honest under real preemption on Pi metal:
+  the aging clock is dispatch passes (`SchedCpu::age_passes`), which advance on cooperative and
+  preemptive dispatch alike, so a rescued-before-drain low is bounded in either regime.
+
+It emits `:: AARCH64 SCHED: prio-mix witness (strict=..., aged-rescue=...) => PASS/FAIL ::`.
+Bounded and never hangs a battery — every task does finite work and neither low task yields,
+so `run_until_empty` always drains and a broken scheduler FAILs loudly. It is wired into
+**both** witness paths: alongside `priority_aging_witness` on the `virt` GICv3 boot core
+(`run_capstone_boot_core`, captured by `UNAOS_GICV3=1 ./arroyo test-arm 40`) and into the Pi
+`kernel8` battery (end of `demo_cooperative`, before `start_aps` enables preemption — the
+deferred Pi accrual, captured by `./arroyo kernel8-test 35`). On the `virt`/Orin paths the
+boot core diverges into `run_capstone_boot_core` before reaching `demo_cooperative`, so each
+platform runs the witness exactly once.
+
 ### Build knob
 
 `UNAOS_GICV3=1 ./arroyo {arm,test-arm}` appends `-machine gic-version=3` to the
