@@ -310,14 +310,17 @@ impl MacOSSpline {
                                             *sidebar_delegate.ivars().roots.borrow_mut() = new_roots;
 
                                             if let Some(outline_view) = sidebar_delegate.ivars().outline_view.borrow().as_ref() {
+                                                // Programmatic reload + re-expansion fires the same
+                                                // DidExpand/DidCollapse notifications as user clicks;
+                                                // suppress the brain echo for the duration.
+                                                *sidebar_delegate.ivars().suppress_expand_events.borrow_mut() = true;
                                                 unsafe {
                                                     let _: () = objc2::msg_send![&**outline_view, reloadData];
                                                 }
-                                                // reloadData collapses everything; re-apply the
-                                                // expansion state carried by the rebuilt nodes.
                                                 for root in sidebar_delegate.ivars().roots.borrow().iter() {
                                                     restore_expansion(outline_view, root);
                                                 }
+                                                *sidebar_delegate.ivars().suppress_expand_events.borrow_mut() = false;
                                             }
                                         }
                                         _ => {}

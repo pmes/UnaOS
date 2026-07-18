@@ -95,6 +95,11 @@ pub struct SidebarDelegateIvars {
     /// macOS outline handled expand/collapse natively and never reported
     /// clicks until now).
     pub tx_event: RefCell<Option<async_channel::Sender<bandy::SMessage>>>,
+    /// True while `restore_expansion` re-applies expansion after a reload;
+    /// programmatic expandItem/collapseItem fire the same DidExpand/DidCollapse
+    /// notifications as user chevron clicks, and echoing those back to the
+    /// brain would toggle its state right back (feedback loop).
+    pub suppress_expand_events: RefCell<bool>,
 }
 
 define_class!(
@@ -110,6 +115,7 @@ define_class!(
                 roots: RefCell::new(Vec::new()),
                 outline_view: RefCell::new(None),
                 tx_event: RefCell::new(None),
+                suppress_expand_events: RefCell::new(false),
             });
             unsafe { msg_send![super(this), init] }
         }
@@ -188,6 +194,11 @@ define_class!(
         /// a click means (file → editor load, directory → topology bookkeeping).
         #[unsafe(method(outlineViewSelectionDidChange:))]
         fn outline_view_selection_did_change(&self, _notification: &objc2_foundation::NSNotification) {
+            // reloadData can move selection; don't echo synthetic selection
+            // changes back to the brain (same guard as DidExpand/DidCollapse).
+            if *self.ivars().suppress_expand_events.borrow() {
+                return;
+            }
             let Some(outline_view) = self.ivars().outline_view.borrow().clone() else { return };
             let row: NSInteger = unsafe { msg_send![&*outline_view, selectedRow] };
             if row < 0 {
@@ -291,6 +302,15 @@ define_class!(
                     if !item.is_null() {
                         let node = Retained::cast_unchecked::<UnaMatrixNode>(Retained::retain(item).unwrap());
                         *node.ivars().is_expanded.borrow_mut() = true;
+                        // Report user chevron expansion to the brain so its
+                        // topology tracks the UI (first-click tree resets came
+                        // from the brain holding a stale collapsed tree).
+                        if !*self.ivars().suppress_expand_events.borrow() {
+                            let id = node.ivars().node_id.borrow().clone();
+                            if let Some(tx) = self.ivars().tx_event.borrow().as_ref() {
+                                let _ = tx.try_send(bandy::SMessage::ToggleMatrixNode(id));
+                            }
+                        }
                     }
                 }
             }
@@ -306,6 +326,12 @@ define_class!(
                     if !item.is_null() {
                         let node = Retained::cast_unchecked::<UnaMatrixNode>(Retained::retain(item).unwrap());
                         *node.ivars().is_expanded.borrow_mut() = false;
+                        if !*self.ivars().suppress_expand_events.borrow() {
+                            let id = node.ivars().node_id.borrow().clone();
+                            if let Some(tx) = self.ivars().tx_event.borrow().as_ref() {
+                                let _ = tx.try_send(bandy::SMessage::ToggleMatrixNode(id));
+                            }
+                        }
                     }
                 }
             }
