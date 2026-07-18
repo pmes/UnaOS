@@ -60,6 +60,10 @@ static RING: Mutex<Ring> = Mutex::new(Ring::new());
 pub fn record(tag: &'static str) {
     let ms = crate::arch::ms();
     RING.lock().record(ms, tag);
+    // QUIET-PANEL on-panel leg: paint the milestone line. On a quiet GUI boot these are the ONLY
+    // lines the panel shows before the handoff; a no-op on headless/test builds and after the
+    // handoff. Called OUTSIDE the ring lock (fbcon takes its own).
+    crate::video::fbcon::milestone(ms, tag);
 }
 
 /// Copy the buffered milestones (oldest→newest) into `out`, returning how many were written.

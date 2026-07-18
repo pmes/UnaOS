@@ -7,9 +7,11 @@
 // UART at I/O port 0x3F8 (x86) / the PL011 (aarch64). Real laptops (the 2012 MacBook Retina,
 // the Zenbook S16) and the Pi 4 over HDMI have NO serial port there, so on metal that output —
 // including panics and the double-fault handler — vanishes and you debug blind. This module
-// mirrors that same output onto the UEFI/mailbox framebuffer: a tiny scrolling text terminal
-// (8x8 font) drawn through the shared `FrameBuffer` surface, so boot diagnostics and panics are
-// visible on screen.
+// can mirror that output onto the UEFI/mailbox framebuffer: a tiny wrap-around text terminal
+// (8x8 font, never scrolls, never reads the surface back) drawn through the shared `FrameBuffer`
+// surface. QUIET-PANEL policy (x86): headless/test builds paint nothing (serial is the witness),
+// GUI boots paint only the boot-milestone lines until the handoff, the `bootlog` build keeps the
+// full mirror, and panics force the mirror back on. aarch64 keeps the full mirror.
 //
 // It owns its own `FrameBuffer` handle (addressed by physical address, so the state is `Send`)
 // and renders with the same font8x8 glyphs the GUI console uses. It is initialised as early as
@@ -30,6 +32,15 @@ use unaos_boot_info::FrameBufferInfo;
 /// flush would not repaint over them. Set by `detach()`; cleared by `panic_screen()` so a panic
 /// is still drawn on hardware with no serial port. Serial output itself is unaffected.
 static GUI_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// QUIET-PANEL (x86): the full serial stream no longer mirrors onto the panel by default —
+/// headless/test builds (usbdebug, the witness batteries) paint nothing (serial carries the
+/// evidence) and GUI boots paint only the boot-milestone lines (`milestone`, fed by
+/// `bootlog::record`) until the handoff. This flag is the panic override: `panic_screen` sets it
+/// so the panic text that `serial_println!` emits next still lands on the red backdrop on
+/// serial-less metal, whatever the build.
+#[cfg(target_arch = "x86_64")]
+static PANIC_MIRROR: AtomicBool = AtomicBool::new(false);
 
 const CELL_W: usize = 8;
 const CELL_H: usize = 8;
@@ -191,21 +202,23 @@ impl FbCon {
         }
     }
 
-    /// Scroll the whole (draw-surface) frame up by one text row and clear the freed bottom row.
-    /// With the M3 shadow attached the memmove runs in cached RAM; the following `flush_dirty`
-    /// presents the viewport to VRAM write-only. Without it, this is the direct-VRAM memmove.
-    fn scroll(&mut self) {
-        self.draw_fb().scroll_up(CELL_H, self.bg);
-        // A scroll moves the entire surface — the whole visible frame is now dirty.
-        self.mark_rows(0, self.fb.info().height);
-    }
-
+    /// Advance to the next line — WRAP-AROUND rendering, never a scroll. At the bottom row the
+    /// cursor wraps back to the top and overwrites the old pass line by line; the line AFTER the
+    /// cursor is kept blank as the moving marker separating fresh text from the previous pass.
+    /// Each newline costs two one-line band fills and the new glyphs — nothing moves, and the
+    /// framebuffer is never read back (the WC/uncached readback of the old full-frame scroll was
+    /// the rMBP's pixel-by-pixel boot killer).
     fn newline(&mut self) {
         self.col = 0;
-        self.row += 1;
-        if self.row >= self.rows {
-            self.scroll();
-            self.row = self.rows.saturating_sub(1);
+        self.row = if self.row + 1 >= self.rows { 0 } else { self.row + 1 };
+        let next = if self.row + 1 >= self.rows { 0 } else { self.row + 1 };
+        let y = self.row * CELL_H;
+        self.draw_fb().fill_rows(y, y + CELL_H, self.bg);
+        self.mark_rows(y, y + CELL_H);
+        if next != self.row {
+            let ny = next * CELL_H;
+            self.draw_fb().fill_rows(ny, ny + CELL_H, self.bg);
+            self.mark_rows(ny, ny + CELL_H);
         }
     }
 
@@ -290,6 +303,14 @@ pub fn _print(args: core::fmt::Arguments) {
     if GUI_ACTIVE.load(Ordering::Relaxed) {
         return;
     }
+    // QUIET-PANEL (x86): no full-stream mirroring. Headless/test builds paint nothing at all;
+    // GUI boots paint only milestone lines (see `milestone`). The `bootlog` build keeps the full
+    // mirror — holding the whole log on the panel is its entire purpose — and a panic re-enables
+    // it so the panic text lands on the red backdrop.
+    #[cfg(all(target_arch = "x86_64", not(feature = "bootlog")))]
+    if !PANIC_MIRROR.load(Ordering::Relaxed) {
+        return;
+    }
     crate::arch::without_interrupts(|| {
         if let Some(mut c) = FBCON.try_lock() {
             if c.ready {
@@ -301,6 +322,33 @@ pub fn _print(args: core::fmt::Arguments) {
             }
         }
     });
+}
+
+/// GUI-WITNESS on-panel milestone (QUIET-PANEL companion): paint ONE short line for a recorded
+/// boot milestone. On a quiet GUI boot these lines are the ONLY thing the panel shows before the
+/// handoff — the bench witness channel the full-log mirror used to provide, at a per-milestone
+/// cost instead of a per-serial-line cost. No-op on headless/test builds (usbdebug/witness —
+/// nothing paints there), after the GUI handoff, and off x86 (aarch64 keeps its full mirror).
+pub fn milestone(ms: u64, tag: &str) {
+    #[cfg(all(target_arch = "x86_64", not(any(feature = "usbdebug", feature = "witness"))))]
+    {
+        if GUI_ACTIVE.load(Ordering::Relaxed) {
+            return;
+        }
+        crate::arch::without_interrupts(|| {
+            if let Some(mut c) = FBCON.try_lock() {
+                if c.ready {
+                    let _ = core::fmt::Write::write_fmt(
+                        &mut Sink { con: &mut c },
+                        format_args!(":: [{:>8} ms] {} ::\n", ms, tag),
+                    );
+                    c.flush_dirty();
+                }
+            }
+        });
+    }
+    #[cfg(not(all(target_arch = "x86_64", not(any(feature = "usbdebug", feature = "witness")))))]
+    let _ = (ms, tag);
 }
 
 struct Sink<'a> {
@@ -367,6 +415,12 @@ pub fn clear() {
 /// belt-and-braces GUI_ACTIVE check keeps it a no-op even if one did. Idempotent.
 #[cfg(target_arch = "x86_64")]
 pub fn attach_shadow() {
+    // QUIET-PANEL: headless/test builds never paint the boot log any more, so don't spend
+    // ~28 MiB of heap on a shadow nothing draws to. (And with wrap-around rendering the console
+    // never reads the surface anyway — the shadow's original reason has retired with the scroll.)
+    if cfg!(all(any(feature = "usbdebug", feature = "witness"), not(feature = "bootlog"))) {
+        return;
+    }
     let mut attached = false;
     crate::arch::without_interrupts(|| {
         if let Some(mut c) = FBCON.try_lock() {
@@ -405,6 +459,9 @@ pub fn attach_shadow() {
 /// it) so the panic text that `serial_println!` emits next lands on this red backdrop.
 pub fn panic_screen() {
     GUI_ACTIVE.store(false, Ordering::Relaxed);
+    // Re-arm the full mirror on quiet-panel builds: the panic text must paint whatever the build.
+    #[cfg(target_arch = "x86_64")]
+    PANIC_MIRROR.store(true, Ordering::Relaxed);
     crate::arch::without_interrupts(|| {
         if let Some(mut c) = FBCON.try_lock() {
             if c.ready {
