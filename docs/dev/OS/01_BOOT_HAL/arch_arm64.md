@@ -5034,6 +5034,67 @@ CAPSTONE 6/6 + VUG-HONESTY PASS (knob-off **and** `net4`-on — the on run fires
 still completes CAPSTONE 6/6, i.e. the net4 virt build does not perturb the GICv3 run). Metal verification is
 deferred to an attended sitting. Bench runbook: `scripts/orin-net4-bench.md`.
 
+### ORIN-NET-4b — the outbound-iATU fix-forward (FAULT-AT-M1: raw PCIe BAR deref'd as a CPU address)
+
+**The fault of record (verbatim brief; the silicon record, NOT re-litigated).** The NET-4 driver reached
+the RTL8168 (config reads/writes via ECAM fine, the NET-3 recon preamble twice-confirmed), then the
+**FIRST BAR-register write** (CR soft reset at the BAR2-mapped address) raised a **RAS Uncorrectable** —
+SNOC *"Illegal address (software fault)"* / Carveout, ADDR body `a5a5a5a5a5a5` poison fill; recovery needed
+a **DC cut**. Bench observation to adjudicate: **BAR2 read back `0x4000_4000`** — a PCIe BUS address; with
+the iATU unprogrammed there is no outbound CPU→PCIe MEM translation, and the driver mapped the raw BAR value
+as a CPU physical address and dereferenced it.
+
+**Adjudication — the bench observation was RIGHT.** Firmware assigns the device's BARs inside controller-0's
+PCIe MEM window (PCI base `0x4000_0000`), so `0x4000_4000` is a *PCIe bus* address. The old path
+(`bar_base = bar2 & !0xf`) treated it as a CPU PA and called `map_mmio_window(0x4000_4000, …)`. `0x4000_4000`
+falls in **GiB 1** — the SYSRAM/BPMP carveout window `mmu_tegra::fill_table` maps Device-nGnRE — so
+`map_mmio_window` even returned `AlreadyMapped` without complaint. The first register write
+(`0x4000_4000 + CR`) then hit a protected Tegra carveout → the SNOC illegal-address RAS fault + `a5a5…`
+poison. The shape fully explains the fault; nothing else needed.
+
+**The ATU design (DWC / `pcie-tegra194` sequence-of-record).** The DesignWare host model reaches a PCIe MEM
+address from the CPU through an **outbound iATU region**: the DT `ranges` property gives the CPU
+aperture ↔ PCIe-address windows, and each outbound region maps `[cpu_base, cpu_base+size) → PCIe target`.
+The fix:
+
+1. **Resolve** controller-0's `ranges` from the live DTB and pick the MEM window (space code 2/3) whose
+   `[pci_base, pci_base+size)` **contains** the firmware BAR2 value; resolve the `atu_dma` reg region as the
+   ATU base (DWC-core `dbi + 0x30_0000` fallback documented).
+2. **Program** DWC outbound iATU **region 0** for that whole window (unrolled registers at
+   `atu_base + N*0x200`: LOWER/UPPER BASE, LIMIT, TARGET, CTRL1 = TYPE_MEM, CTRL2 =
+   `ENABLE|INCREASE_REGION_SIZE`) — every write announced before issue, region enabled last.
+3. **Translate, do not reassign.** Keep firmware's BAR assignment (it already sits inside the
+   ranges-described window NET-3 sized it in) and compute the **CPU-side aperture** address
+   `cpu_addr = cpu_base + (bar_pci − pci_base)` (~200 GiB up, inside the PS-widened 40-bit / 512-GiB-table
+   reach). Map **that** Device-nGnRE and drive the registers there — never the raw BAR value. Reassigning
+   the BAR would mean more fabric writes for no gain and diverge from the Linux DWC model (which programs
+   outbound ATU from `ranges` and leaves enumerated BARs in place). **Choice: keep + translate.**
+
+**Why reads through the CPU aperture are safe where the raw BAR was fatal.** `cpu_addr` targets the RC's own
+outbound MEM aperture (RC-owned MMIO); a mistranslation or a down link returns **UR / all-ones**, never a
+carveout. The raw BAR value aliased DRAM/SYSRAM — a *write* there is fatal. So the fix both (a) routes
+accesses through the aperture and (b) earns a pre-write probe.
+
+**The M2/M3 guard — poison-honest readback before the first write (V3D-2 lesson, made law).** After mapping
+the CPU aperture and **before any register write**, the driver reads **TCR** (`0x40`, whose chip-version bits
+a live RTL8168 always returns — `r8169` reads exactly this to identify the MAC) and rejects the poison fills
+— open-bus `0xffffffff`, firmware `0xdeadbeef`, and now the **carveout `0xa5a5a5a5`** the M1 fault left
+(added to `is_poison`). A poison readback ⇒ the register window is not live ⇒ the bring-up is **REFUSED**
+cleanly, before any write, so the first-write fault can never recur. This guard is the general rule for the
+driver flow: **every new MMIO window earns a probe read before its first write.**
+
+**Write discipline unchanged, plus the ATU class.** The iATU writes target the controller's own internal
+register block (GiB-0 device window, always decoding on a powered RC — NET-2/3 read `dbi`/`appl`/`ecam`
+there), not a carveout, so they carry none of the M1 fault's risk. Each is announced `>>> ATU WRITE
+(M1-fix): …`. The COMMAND decode-enable and RTL8168 control/ring program are unchanged.
+
+**Gates green (pre-metal; QEMU models no Tegra234 RC, so the metal path is unexercised by construction).**
+`./arroyo check` default + `UNAOS_NET4=1 UNAOS_TEGRA=1` + `UNAOS_VNET=1` both arches (zero net-new
+warnings); `UNAOS_GICV3=1 test-arm 40` CAPSTONE 6/6; `UNAOS_NET4=1 UNAOS_GICV3=1 test-arm 40` `PCIE4`
+witness + CAPSTONE 6/6; `test-arm 22` MISSION SUCCESS; `test 22` unregressed; `kernel8-test` 0 FAIL. Metal
+verification (the real first-write, now guarded) is the next attended sitting. Bench:
+`scripts/orin-net4-bench.md`.
+
 ### ORIN-SMP idle-heartbeat — the parked-core pinned-bar fix (per-core telemetry honesty)
 
 > Numbering note: the spawning round labelled this arc "SMP-6", but SMP-6/7/8 are already merged
