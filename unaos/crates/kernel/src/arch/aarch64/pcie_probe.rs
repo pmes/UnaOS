@@ -135,7 +135,7 @@ fn dump_words(name: &str, val: &[u8]) {
     // Build into a small stack string via repeated prints (no heap; this is a boot diagnostic).
     // One line: "<name> = <c0> <c1> … (Ncells[, LEN bytes])".
     // We can't format a variable-length list in one `serial_println!` without alloc, so emit the
-    // header then the cells inline using a fold over a fixed writer is overkill — print per-line.
+    // header, then print the cells one per line.
     serial_println!("{} {} = [{} cells, {} bytes]", P, name, cells, val.len());
     let mut i = 0;
     while i < shown {
@@ -770,7 +770,7 @@ pub fn census2(ctx: &PcieCtx) {
         dump_words("interrupts", v);
     }
     if let Some(v) = props.interrupt_map {
-        serial_println!("{}   interrupt-map = present ({} bytes) ::", P, v.len());
+        serial_println!("{}   interrupt-map = present ({} bytes) ::", P2, v.len());
     }
 
     let is_tegra_rc = props
