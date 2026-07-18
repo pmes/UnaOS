@@ -4742,9 +4742,6 @@ const U6GX_NAME: &str = "OWNED.BIN";
 const U10C_PATTERN: [u8; 16] = *b"U10x-CREATE-OK99";
 /// U10 CREATE: the created file's size after the write (== the pattern length) — the launcher's on-disk check.
 const U10C_WRITTEN: u32 = 16;
-/// U10 DELETE: the 16-byte pattern the delete fixture writes into DELME.BIN before unlinking it (so the file
-/// owns a real data cluster the delete then frees). The `.ascii` in the fixture MUST match. 16 chars.
-const U10D_PATTERN: [u8; 16] = *b"U10x-DELETE-OK42";
 /// U10 CREATE/DELETE: the `FILE_STAGED` sentinel a runtime-created descriptor carries — it is NOT backed by any
 /// staged blob (it always owns a wstage buffer, so `sys_read` serves from that and never consults `FILE_STAGED`);
 /// `staged_bytes(u32::MAX)` is `None`, so even a mis-read fails closed. Distinguishes a created descriptor's

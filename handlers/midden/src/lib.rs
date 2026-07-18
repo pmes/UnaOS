@@ -22,8 +22,6 @@ use std::process::Command;
 use gtk4::prelude::*;
 #[cfg(feature = "gtk")]
 use gtk4::{ScrolledWindow, TextBuffer, TextView, Widget};
-#[allow(unused_imports)]
-use unafs::FileSystem;
 
 #[cfg(feature = "gtk")]
 pub fn create_view() -> (Widget, TextBuffer) {

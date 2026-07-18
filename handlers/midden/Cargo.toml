@@ -11,7 +11,6 @@ gtk = ["dep:gtk4", "dep:glib"]
 [dependencies]
 elessar = { path = "../../libs/elessar" }
 bandy = { path = "../../libs/bandy" }
-unafs = { path = "../../unaos/libs/fs/unafs" }
 anyhow = "1.0"
 gtk4 = { version = "0.10.3", features = ["v4_12"], optional = true }
 glib = { version = "0.21", optional = true }
