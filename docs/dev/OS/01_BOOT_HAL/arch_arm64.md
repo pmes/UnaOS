@@ -5127,11 +5127,14 @@ return *before touching any core register*. So in QEMU the arc's only observable
 
 ```
 :: V3D: PI-V3D-1 bring-up starting (VideoCore VI / V3D 4.2) ::
-:: V3D: power domain 10 ON ::                 (QEMU models the firmware power/clock tags)
-:: V3D: clock id 5 set to 500000000 Hz ::
-:: V3D: HUB_IDENT0 = 0x00000000 ::
-:: V3D: absent (hub IDENT0 not live) — GPU bring-up skipped, graceful degradation (expected in QEMU) ::
+:: V3D: power domain 10 ON ::                 (QEMU models the firmware power/clock/clock-state tags)
+:: V3D: clock id 5 rate set to 500000000 Hz ::
+:: V3D: clock id 5 gate ENABLED (active) ::   (PI-V3D-2: SET_CLOCK_STATE opens the gate)
+:: V3D: probe verdict BLOCK-DOWN — hub IDENT0 = 0x00000000 (block absent/unpowered; expected in QEMU raspi4b) — GPU bring-up skipped, graceful degradation ::
 ```
+
+On metal, the corrected enable sequence is expected to yield `BLOCK-UP` with a live identity word; the
+PI-V3D-1 false-pass value (`0xdeadbeef`) now yields the distinct `BUS-POISON` verdict, fail-closed.
 
 Everything past the presence gate (MMU program, clear job) is **ATTENDED-METAL-UNVERIFIED**: written
 correct-by-construction against the references below, exercised only at an attended Pi sitting. Do
@@ -5140,10 +5143,14 @@ correct-by-construction against the references below, exercised only at an atten
 ### The chain (M1–M4)
 
 - **M1 — power, clock, probe.** Firmware mailbox `SET_DOMAIN_STATE` (tag `0x00038030`, domain 10 =
-  V3D, state 1) **then** `SET_CLOCK_RATE` (tag `0x00038002`, clock id 5 = V3D, 500 MHz) — in that
-  order (a powered-but-unclocked block reads garbage registers). Then map the hub (`0xFEC00000`) +
-  core 0 (`+0x4000`), read `HUB_IDENT0..3` / `CTL_IDENT0..2`, decode the tech version (expect V3D
-  4.2 on the Pi 4). The legacy VC4 `Enable_QPU`/set-power tags are **not** the Pi-4 path.
+  V3D, state 1) **then** `SET_CLOCK_RATE` (tag `0x00038002`, clock id 5 = V3D, 500 MHz) **then**
+  `SET_CLOCK_STATE` (tag `0x00038001`, clock id 5, on) — in that order (a powered-but-unclocked block
+  reads garbage registers). The `SET_CLOCK_STATE` gate-enable is the **PI-V3D-2** addition: the RPi
+  firmware treats a clock's rate and its enable gate *independently*, so `SET_CLOCK_RATE` alone
+  programs the frequency but leaves the gate closed — the block stays powered-but-unclocked and its
+  registers read open-bus poison. After a bounded settle, map the hub (`0xFEC00000`) + core 0
+  (`+0x4000`), read `HUB_IDENT0..3` / `CTL_IDENT0..2`, decode the tech version (expect V3D 4.2 on the
+  Pi 4). The legacy VC4 `Enable_QPU`/set-power tags are **not** the Pi-4 path.
 - **M2 — the V3D MMU.** The big VC4→VC6 structural change: CLE fetches and tile stores go through a
   V3D-private page table. We build a **flat, confined identity** table — one `u32` PTE per 4 KiB of
   iova, `pte = VALID | WRITEABLE | (phys>>12)`, mapping **only** the buffer arena's own pages
@@ -5177,6 +5184,40 @@ addresses handed to CT1) is bounds-checked to lie inside the arena before the ki
 the CL writer (`RclWriter`) saturates at the arena end and can never append past it; the page-table
 fill is bounded by `PT_CAP` and refuses (fail-closed) if the arena would not fit. A control list that
 referenced any address outside the arena would fault in the V3D MMU, not corrupt kernel memory.
+
+### PI-V3D-2 — the poison-honest probe + the enable-sequence fix (fix-forward)
+
+PI-V3D-1's probe **false-PASSED on metal.** The attended Pi sitting (2026-07-17) found every V3D
+IDENT register reading `0xdeadbeef` — open-bus firmware fill, the block never decoded — yet the
+liveness gate (`ident_looks_live`: reject only `0` and `0xffffffff`) treated the non-zero word as
+"present" and proceeded, until the V3D MMU backstop caught reality and fail-closed cleanly. QEMU's
+`raspi4b` does not model V3D, so nothing past the probe had ever run anywhere; the gate's blind spot
+was invisible until silicon. Peter's ruling: **leave PI-V3D-1 merged, fix-forward as V3D-2.** Two
+legs, both landed here:
+
+**Leg 1 — poison-honest probe (`v3d.rs`).** The gate now discriminates **three** verdicts, each with
+a distinct serial line, and only one proceeds:
+  * **BLOCK-UP** — a live, non-zero, non-poison identity word → proceed to the core registers.
+  * **BLOCK-DOWN** — `HUB_IDENT0 == 0x00000000` (absent / unpowered; QEMU raspi4b's hub-base read) →
+    skip cleanly, graceful degradation.
+  * **BUS-POISON** — `HUB_IDENT0` matches an open-bus / firmware-fill signature (`0xffffffff` or
+    `0xdeadbeef`) → skip, **fail-closed**. This is the exact PI-V3D-1 metal value; it is now an
+    ABSENT-DECODE verdict, never "present."
+`is_poison()` mirrors `pcie_probe::is_poison` (the poison-rejection rule, cited above). Both BLOCK-DOWN
+and BUS-POISON return **before any core-register access**, so neither can raise the forbidden
+`AARCH64 EXCEPTION`. The probe retries a poison read within a short bounded settle window (finite off
+CNTPCT) before declaring BUS-POISON, to allow a freshly powered block a moment to answer.
+
+**Leg 2 — the enable-sequence gap (`mailbox.rs` + `v3d.rs`).** Root cause of the metal false-pass:
+power (`SET_DOMAIN_STATE`) and rate (`SET_CLOCK_RATE`) both ACKed, but the V3D clock **gate was never
+opened** — the RPi firmware treats rate and enable-state as independent, and `SET_CLOCK_RATE` does not
+enable a gated clock. A new `mailbox::set_clock_state` (tag `SET_CLOCK_STATE`, `0x00038001`) opens the
+gate explicitly and requires the firmware to confirm the clock **present AND active** before the probe
+runs; a bounded settle then precedes the first register read. On metal the corrected sequence is
+expected to read a real V3D identity (BLOCK-UP) instead of poison — **metal verification is deferred to
+the next attended Pi sitting** (this is a QEMU/metal divergence class by construction; QEMU models the
+tags and reports BLOCK-DOWN). Knob-off byte-identity to baseline is preserved: every change is inside
+`#[cfg(feature = "v3d")]`-gated code.
 
 ### References of record
 
