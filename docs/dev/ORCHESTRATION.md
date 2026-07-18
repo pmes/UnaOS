@@ -38,6 +38,37 @@ tracks / no synchronized rounds"). Concurrency rule: **one executor per lane, up
 serialize within a lane** (supersedes the older scattered one/two/three-arc numbers). Keep the
 session STEERABLE ([[unaos-keep-it-steerable]]): don't bury it in concurrent background agents.
 
+## Seat hardening — zero-slippage guards (adversarial self-review, 2026-07-17)
+
+Peter's directive: no room for slippage from model drops, full contexts, or prototype-pace
+engineering. The R21 session exhibited all three (a mid-session Fable→Opus drop, a context
+fill forcing a wolfpack handoff, and repeated push-rule violations). These guards are
+**mechanical** — designed to hold even when the seat is a weaker model or degraded context:
+
+1. **The push interlock.** The seat never composes a git command that mutates origin. Before
+   running ANY `git` command, if the line contains `push` — stop; that line belongs in the
+   report to Peter, not in a Bash call. No pressure exception: "Peter is waiting" and "it's
+   just docs" were exactly the conditions under which the rule broke.
+2. **Verify-before-claim, and READ the output.** Every state claim in a Peter-facing message
+   (push owed, item pending, file stale) must be backed by a command run in THIS session —
+   and the seat must actually read the result before claiming (R21 incident: the seat claimed
+   a push owed while its own freshly-fetched output showed origin level). On a fresh start:
+   fetch immediately, read carefully, claim only what the output says.
+3. **Externalize continuously, not at handoff.** The baton is refreshed at every merge
+   window; the start-page (verde face) is regenerated at every landing. A wolfpack handoff
+   then loses nothing because nothing lived only in context. Write the mid-session baton
+   BEFORE quality degrades, not after.
+4. **Model-drop re-arm.** The role must be executable at low effort: the baton's
+   WHO-YOU-ARE hard-boundary list is the whole contract — short, mechanical, judgment-free
+   where possible. On noticing a model or effort change mid-session, re-read that list
+   before the next state-changing action.
+5. **Metal currency (the anti-laissez-faire rule).** The ledgers stay DIVIDED per platform
+   (`plans/unaos/metal/unaos-metal-{rmbp,pi4,orin}.md` — Peter's call; one page was
+   overwhelming). The discipline is currency, not consolidation: **a merge is not "landed"
+   until its lane's metal file carries the accrual line** (or an explicit "nothing owed").
+   The LC writes the line at landing; the Maestro verifies it exists at merge — a merge
+   message for a metal-bearing arc that can't point at its ledger line doesn't merge.
+
 ## The loop
 
 ```
