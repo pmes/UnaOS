@@ -33,12 +33,12 @@ pub mod fs;
 // phy::Device / RxToken / TxToken boilerplate ONCE for every NIC seam — x86 smolnet (e1000e), aarch64
 // net4 (RTL8168), aarch64 vnet (virtio-net). Lives at the crate root (NOT under a `net` module: the
 // extern crate `net` would be shadowed). Gated on any net feature => vanishes with its smoltcp dep when
-// all are off. See net_phy.rs / docs/dev/OS/08_NET/networking.md.
+// all are off. See net_phy.rs / unaos/docs/dev/OS/08_NET/networking.md.
 #[cfg(any(feature = "net4", feature = "vnet", feature = "smolnet"))]
 pub mod net_phy;
 
 // SOCK-1: the smoltcp Device adapter over the e1000e. x86-only + feature-gated so aarch64 and
-// knob-off builds never see it (byte-identical). See smolnet.rs / docs/dev/OS/08_NET/networking.md.
+// knob-off builds never see it (byte-identical). See smolnet.rs / unaos/docs/dev/OS/08_NET/networking.md.
 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
 pub mod smolnet;
 

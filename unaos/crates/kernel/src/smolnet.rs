@@ -22,7 +22,7 @@
 // compiled and live regardless and still own `connect`/`fetch`/`udpsend`, the TCP echo listener, and
 // driver DHCP.
 //
-// Design (see docs/dev/OS/08_NET/networking.md):
+// Design (see unaos/docs/dev/OS/08_NET/networking.md):
 //  * Everything is STATIC / stack-local — no heap growth. Each blocking op (`ping`/`arp`/witness)
 //    builds a throwaway `Interface` + one ICMP socket on its own stack, pumps a bounded poll loop,
 //    and drops it. smoltcp's neighbor cache re-ARPs per op (that IS the "ARP-triggering poll").
