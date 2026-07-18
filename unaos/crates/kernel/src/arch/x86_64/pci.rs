@@ -181,6 +181,11 @@ fn enable_intel_xhci_ports(bus: u8, dev: u8, func: u8) {
             ":: PORTSW-1: XUSB2PR mask={:#x} routed {:#x}->{:#x} + USB3_PSSEN mask={:#x} {:#x}->{:#x} (default-on) == witness ::",
             usb2_mask, usb2_before, usb2_after, ss_mask, ss_before, ss_after
         );
+        // GUI-WITNESS: record the mux flip as a boot milestone. "flip" = a real XUSB2PR write on
+        // matched Intel silicon (the rMBP metal path); "inert" = the no-op read-only case (QEMU, or
+        // no EHCI companion). Distinguishing the two on-panel tells a silent-serial bench whether the
+        // internal kbd/trackpad were routed to xHCI at all.
+        crate::bootlog::record(if intel_switchable { "portsw:flip" } else { "portsw:inert" });
     }
 }
 

@@ -123,3 +123,50 @@ The command is gated `#[cfg(all(target_arch = "x86_64", feature = "smc"))]` (the
 `UNAOS_SMC=1` only); every other target compiles an honest fallback that says so. Under QEMU's
 key-less `isa-applesmc` all battery keys are honestly absent, so `batmon` prints the all-`-` line —
 the bounded-Absent proof. The real battery is read only on the physical rMBP at an attended sitting.
+
+### `bootlog` — the boot-milestone witness (GUI-WITNESS)
+
+**The problem.** A GUI (non-`usbdebug`) boot emits **zero serial** (cause under separate
+investigation), and it detaches `fbcon` at the GUI handoff so the boot log is painted over. When
+something goes wrong after handoff there is then **no witness surface at all** — serial cannot
+witness its own silence, and the on-panel boot log is gone. `bootlog` is that surface.
+
+**The recorder (`crate::bootlog`, M1).** A lock-light, heap-free ring (a `static` with an inline
+array, like the FTDI capture ring) of short `&'static` milestone tags, each stamped with
+`arch::ms()`. It is written from the **existing** milestone call sites, additively — recording a
+milestone changes nothing about the milestone itself:
+
+| Tag | Site | Meaning |
+|-----|------|---------|
+| `portsw:flip` / `portsw:inert` | `arch/x86_64/pci.rs` | XUSB2PR mux write on matched Intel silicon (`flip`) vs. the read-only no-op (`inert`, e.g. QEMU) |
+| `ehci:kbd-armed` / `ehci:mouse-armed` | `drivers/ehci/mod.rs` | an internal boot-protocol HID interrupt endpoint armed (the rMBP keyboard path) |
+| `ehci:trackpad-armed` | `drivers/ehci/mod.rs` | the report-protocol pointer / Apple vendor-multitouch interface armed (the trackpad path) |
+| `ftdi:console-up` / `ftdi:failed` | `drivers/xhci/mod.rs` | the FTDI console bring-up reported success vs. a SET_CONFIG / vendor-setup failure |
+| `block:up` | `drivers/xhci/mod.rs` | the USB block device enumerated and its geometry published |
+| `gui:handoff` | `main.rs` | the last milestone before `fbcon::detach()` — the GUI is taking the panel |
+
+The `ftdi:console-up` vs. `ftdi:failed` split is the whole point of the ring: it separates **"console
+never armed"** from **"armed but TX never left the wire,"** the exact fork the bench needs to localize
+the GUI-serial silence.
+
+**On-panel during boot (M2a).** No change was needed here: `fbcon` (unshadowed) mirrors every
+`serial_println!` to the framebuffer from `fbcon::init` at the top of `kernel_main` all the way to the
+GUI handoff `detach()` — so the early milestone lines are already visible on-panel during boot. GUI
+builds never `attach_shadow` (the `Screen` back buffer owns the heap budget); the `detach()` at the
+first frame is where the boot log stops.
+
+**After handoff (M2b) — the `bootlog` verb.** Once the GUI owns the screen, `bootlog` prints the
+milestone ring with `arch::ms()` timestamps (oldest first) to the `Console` — the operator's eyes at
+the bench, matching the `batmon` pattern (snapshot under the ring lock, release, then print; no I/O
+under the lock). It is **not** gated by arch or feature: it reads the same ring on any build, and
+prints `bootlog: no boot milestones recorded` when the ring is empty.
+
+**Serial proof path (M3).** On a build where serial *is* live (QEMU, or a `usbdebug` metal boot),
+`bootlog::service_serial_dump()` is called each main-loop iteration and re-prints the full ring
+**only when it has grown** (`:: BOOTLOG: … ::` lines). Because `block:up` and the FTDI milestones are
+recorded from *inside* the loop, a single one-shot dump would race them; dumping on growth guarantees
+the last dump in `serial.log` is the complete ring, bounded to one print per milestone. In the GUI
+loop this service is `witness`-gated (so it is absent from a real metal GUI build, where the shell
+verb is the witness); in the `usbdebug` loop it is unconditional. A default `./arroyo test` boot lands
+`ehci:kbd-armed`, `portsw:inert`, `gui:handoff`, then `block:up` in the ring — verifiable in
+`target/serial.log`.

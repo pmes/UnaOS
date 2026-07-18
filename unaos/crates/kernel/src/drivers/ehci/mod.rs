@@ -939,6 +939,10 @@ impl Controller {
                 if proto == 1 { "keyboard" } else { "boot-mouse" },
                 t.addr, ep, mps, interval
             );
+            // GUI-WITNESS: an internal-HID interrupt endpoint is armed. On the rMBP this is the
+            // keyboard/trackpad-input path; a silent boot otherwise can't tell on-panel whether input
+            // ever came up.
+            crate::bootlog::record(if proto == 1 { "ehci:kbd-armed" } else { "ehci:mouse-armed" });
         }
     }
 
@@ -997,6 +1001,9 @@ impl Controller {
             self.bcm5974_mode_switch(t, intf);
         }
         self.arm_interrupt_ep(t, ep, mps.min(64), false, false, Some(layout));
+        // GUI-WITNESS: the report-protocol pointer (the rMBP trackpad, incl. the Apple
+        // vendor-multitouch interface) is armed — the trackpad-input milestone.
+        crate::bootlog::record("ehci:trackpad-armed");
         if layout.vendor_mt {
             // EHCI-5 M1: the Apple vendor-multitouch interface (Report ID 0x44, page 0xFF00). The
             // descriptor does not describe the finger layout — arm to CAPTURE the raw body and

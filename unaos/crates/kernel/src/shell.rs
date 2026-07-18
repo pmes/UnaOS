@@ -2024,6 +2024,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             console.println("CLOCK:    date, setdate YYYY-MM-DD HH:MM[:SS]  (seeds mtime stamps; unset = honest dashes)");
             console.println("SMP:      sched (per-CPU run queues), pulse (full-screen CPU monitor)");
             console.println("POWER:    batmon (SMC battery snapshot; x86 UNAOS_SMC=1 only)");
+            console.println("WITNESS:  bootlog (boot-milestone ring: PORTSW / FTDI console / EHCI HID / block / GUI handoff)");
             console.println("TEST:     tste (in-OS self-test suite: boot-replay + live checks)");
             console.println("NETWORK:  netinfo, ping <ip> [count], arp <ip>");
             console.println("          connect <ip> <port> [message], udpsend <ip> <port> [message]");
@@ -2806,6 +2807,24 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             }
             #[cfg(not(all(target_arch = "x86_64", feature = "smc")))]
             console.println("batmon: SMC battery monitor is x86 UNAOS_SMC=1 only");
+        },
+        "bootlog" => {
+            // GUI-WITNESS M2b: print the boot-milestone ring with timestamps — the operator's eyes at
+            // the bench. On a GUI (non-usbdebug) build serial is silent and fbcon detached at the GUI
+            // handoff, so this verb is the ONLY witness surface for whether PORTSW flipped, the FTDI
+            // console armed (vs. failed), the EHCI HID / trackpad armed, and the block device came up.
+            // Reads the same ring the serial dump shows. Snapshots under the ring lock then prints, so
+            // console I/O never runs while the ring is held.
+            let mut buf = [(0u64, ""); 32]; // matches bootlog::capacity()
+            let n = crate::bootlog::snapshot(&mut buf);
+            if n == 0 {
+                console.println("bootlog: no boot milestones recorded");
+            } else {
+                console.println(&alloc::format!("bootlog: {} milestone(s) (oldest first):", n));
+                for (ms, tag) in &buf[..n] {
+                    console.println(&alloc::format!("  [{:>8} ms] {}", ms, tag));
+                }
+            }
         },
         "shutdown" | "off" => {
              // TODO: Create arch::shutdown()
