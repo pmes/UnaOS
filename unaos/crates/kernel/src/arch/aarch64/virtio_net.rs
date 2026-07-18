@@ -402,8 +402,6 @@ pub static VNET_DEVICE: spin::Mutex<Option<VirtioNet>> = spin::Mutex::new(None);
 // ── Static bring-up addressing: the slirp subnet (guest is 10.0.2.15; gateway/ping target 10.0.2.2) ──
 const OUR_IP: [u8; 4] = [10, 0, 2, 15];
 const GATEWAY_IP: [u8; 4] = [10, 0, 2, 2];
-/// A full Ethernet frame fits (BUF_SIZE is 2048); the Device scratch is struct-local.
-const FRAME_CAP: usize = 1536;
 
 // ── Raw L2 accessors over the VNET_DEVICE registry (the smoltcp Device seam; NET-4 `raw_rx`/`raw_tx`) ──
 fn raw_rx(out: &mut [u8]) -> Option<usize> {
@@ -414,25 +412,25 @@ fn raw_tx(frame: &[u8]) {
         n.transmit(frame);
     }
 }
-fn hw_addr() -> Option<[u8; 6]> {
-    VNET_DEVICE.lock().as_ref().map(|n| n.mac)
-}
-
-/// Format a MAC as `xx:xx:xx:xx:xx:xx` for the boot log (no heap — a fixed stack buffer). NET-4 shape.
-fn fmt_mac(mac: &[u8; 6]) -> [u8; 17] {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = [b':'; 17];
-    for i in 0..6 {
-        out[i * 3] = HEX[(mac[i] >> 4) as usize];
-        out[i * 3 + 1] = HEX[(mac[i] & 0xf) as usize];
+// ── The RawNic seam: the shared `net_phy::SmoltcpPhy` moves L2 frames through these ──
+struct VnetNic;
+impl RawNic for VnetNic {
+    fn rx_frame_raw(out: &mut [u8]) -> Option<usize> {
+        raw_rx(out)
     }
-    out
+    fn transmit(frame: &[u8]) {
+        raw_tx(frame)
+    }
+    fn mac() -> Option<[u8; 6]> {
+        VNET_DEVICE.lock().as_ref().map(|n| n.mac)
+    }
 }
 
-// ── The smoltcp phy::Device over the virtio-net rings (the x86 e1000/smolnet + NET-4 seam) ──
+// ── smoltcp interface plumbing (the phy::Device itself is the shared `net_phy::SmoltcpPhy`) ──
 
+use crate::arch::aarch64::net_phy::{fmt_mac, RawNic, SmoltcpPhy};
 use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage};
-use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
+use smoltcp::phy::Device; // for `dev.capabilities()` in the ping loop
 use smoltcp::socket::icmp;
 use smoltcp::time::Instant;
 use smoltcp::wire::{
@@ -446,58 +444,6 @@ const PING_PAYLOAD: &[u8] = b"unaos-vnet";
 /// the local link lands in a handful of iterations, so this only caps how long an unreachable target
 /// stalls the boot). Non-hanging by construction. Mirrors smolnet's `PUMP_ITERS` spirit, smaller.
 const PUMP_ITERS: i64 = 200_000;
-
-/// A `smoltcp::phy::Device` backed by the virtio-net rings. Owns RX/TX scratch so the tokens can borrow
-/// disjoint fields (smoltcp hands out both from one `receive()` to build a reply in place). NET-4 shape.
-struct VirtioPhy {
-    rx: [u8; FRAME_CAP],
-    rlen: usize,
-    tx: [u8; FRAME_CAP],
-}
-impl VirtioPhy {
-    fn new() -> Self {
-        VirtioPhy { rx: [0; FRAME_CAP], rlen: 0, tx: [0; FRAME_CAP] }
-    }
-}
-struct PhyRxToken<'a> {
-    buf: &'a [u8],
-}
-struct PhyTxToken<'a> {
-    buf: &'a mut [u8],
-}
-impl RxToken for PhyRxToken<'_> {
-    fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R {
-        f(self.buf)
-    }
-}
-impl TxToken for PhyTxToken<'_> {
-    fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
-        let n = len.min(self.buf.len());
-        let r = f(&mut self.buf[..n]);
-        raw_tx(&self.buf[..n]);
-        r
-    }
-}
-impl Device for VirtioPhy {
-    type RxToken<'a> = PhyRxToken<'a>;
-    type TxToken<'a> = PhyTxToken<'a>;
-
-    fn receive(&mut self, _t: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        let len = raw_rx(&mut self.rx)?;
-        self.rlen = len;
-        let VirtioPhy { rx, rlen, tx } = self;
-        Some((PhyRxToken { buf: &rx[..*rlen] }, PhyTxToken { buf: tx }))
-    }
-    fn transmit(&mut self, _t: Instant) -> Option<Self::TxToken<'_>> {
-        Some(PhyTxToken { buf: &mut self.tx })
-    }
-    fn capabilities(&self) -> DeviceCapabilities {
-        let mut caps = DeviceCapabilities::default();
-        caps.medium = Medium::Ethernet;
-        caps.max_transmission_unit = 1500;
-        caps
-    }
-}
 
 /// Read the free-running counter (µs) for the RTT measurement. Readable at EL2 (the witness runs before
 /// the JC3 EL2→EL1 drop); `busy_delay_ms`/CAPSTONE already depend on CNTPCT being live here.
@@ -516,11 +462,11 @@ fn now_us() -> u64 {
 /// bounded poll loop; reports the round-trip time and a self-checking PASS/FAIL witness line. All
 /// storage is stack-local (no heap growth), mirroring `smolnet::pump` / NET-4's `bind_smoltcp`.
 fn bind_and_ping() {
-    let Some(mac) = hw_addr() else {
+    let Some(mac) = VnetNic::mac() else {
         serial_println!("{}   smoltcp bind SKIPPED — no NIC registered ::", PV);
         return;
     };
-    let mut dev = VirtioPhy::new();
+    let mut dev = SmoltcpPhy::<VnetNic>::new();
     let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
     config.random_seed = 0x564e_4554; // ASCII "VNET"
     let mut iface = Interface::new(config, &mut dev, Instant::from_millis(0));

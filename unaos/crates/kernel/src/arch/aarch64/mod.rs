@@ -114,6 +114,13 @@ pub mod pcie_probe;
 // MMIO/DMA + smoltcp adapter are additionally `tegra`-gated (QEMU models no Tegra234 RC); a net4/virt
 // build only prints one witness line. Feature-gated only — compiles for both builds. Default OFF =>
 // module + call sites vanish, byte-identical to baseline.
+// NET-PHY: the shared aarch64 smoltcp phy::Device adapter (arch/aarch64/net_phy.rs). Hosts the
+// phy::Device / RxToken / TxToken boilerplate ONCE, parameterized over a small RawNic trait
+// (transmit/rx_frame_raw/mac); both rtl8168_tegra.rs (net4) and virtio_net.rs (vnet) bind over it.
+// Gated on either net feature => vanishes (with its smoltcp dep) when both are off.
+#[cfg(any(feature = "net4", feature = "vnet"))]
+pub mod net_phy;
+
 #[cfg(feature = "net4")]
 pub mod rtl8168_tegra;
 
