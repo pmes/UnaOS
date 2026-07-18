@@ -1,8 +1,9 @@
 # INSTALL-CORE — the storage-agnostic installer engine
 
 Status: QEMU-proven on a scratch block device (x86_64), 2026-07-18. Arc INSTALL-CORE.
-Wired to the Orin microSD (metal-pending) by **INSTALL-1**, made a real self-clone by **INSTALL-2**
-(§INSTALL-1 / §INSTALL-2 below; `UNAOS_INSTALL_TARGET_SD=1`).
+Wired to the Orin microSD (metal-pending) by **INSTALL-1**, made a real self-clone by **INSTALL-2**, and given
+multi-block SD transfers + multi-cluster directories by **ORIN-SDMMC-3**
+(§INSTALL-1 / §INSTALL-2 / §ORIN-SDMMC-3 below; `UNAOS_INSTALL_TARGET_SD=1`).
 Knob: `UNAOS_INSTALLDEMO=1` (feature `installdemo`), default OFF. Module: `crates/kernel/src/install/`.
 
 ## What it is
@@ -220,6 +221,32 @@ sha manifest → `ORIN-INSTALL-2 SD install — gpt+zero+fat32+clone(N files) ve
 end-to-end (the `TreeWriter` additions do not perturb it — `write_payload_file` is unchanged). First execution
 is the attended Orin sitting (runbook install leg; landing `review/unaos-install2-LANDING.md`).
 
+## §ORIN-SDMMC-3 — multi-block SD transfers + multi-cluster directories (INSTALL-2's perf/size follow-ups)
+
+**Landed 2026-07-18** (aarch64/tegra SD path metal-pending; the multi-cluster-directory logic proven on the x86
+`installdemo` witness). Same `UNAOS_INSTALL_TARGET_SD=1` gate. Glue: `sdmmc_tegra.rs` (multi-block primitives +
+`copy_dir`); engine: additive `TreeWriter` methods in `install/fat32.rs`. Full aarch64 detail: `arch_arm64.md`
+§ORIN-SDMMC-3. Closes two INSTALL-2 follow-ups:
+
+- **Throughput — multi-block CMD18/CMD25.** New `read_blocks_at`/`write_blocks_at` move a run of contiguous
+  blocks in one command (block-count in `BLKSIZECNT[31:16]`, Transfer-Mode Block-Count + Multi-Block bits,
+  **auto-CMD12** completion — the controller issues STOP itself, no second round-trip). `SdInstallTarget` loops
+  a **bounded 64-block (32 KiB) chunk**, keeping single-block CMD17/CMD24 as the 1-block/metadata fallback.
+  `TreeWriter::write_file` writes each file's contiguous chain in **one multi-sector call**, so a real
+  `kernel.elf` copies as a few CMD25 bursts, not one CMD24 per 512 bytes. The **rung-2 witness ladder stays
+  single-block** — its metal-verified semantics are unchanged.
+- **Size — multi-cluster directories.** `TreeWriter` gains `alloc_dir_clusters`/`write_dir_image`/`reserve_root`
+  and `dir_clusters_for_slots`; a directory's image is built wholly in memory across its whole (contiguous)
+  cluster chain and written once. The INSTALL-2 >16-entry `NoSpace` is lifted — `NoSpace` now means the volume
+  is genuinely full. `put_dir_entry` takes a `&mut [u8]` slice (the whole image).
+
+**Witness (x86 `UNAOS_INSTALLDEMO`).** A final step builds a `SUB/` directory of 20 files (22 slots → 2
+clusters) through the `TreeWriter`, then the in-tree FAT reader mounts, walks `SUB/`'s cluster chain, and
+re-reads + SHA-verifies every file: `:: INSTALL: multi-cluster dir — SUB/ 20 entries across 2 clusters, all
+re-read + sha-verified (dirs=1) => PASS ::`. Byte-identity: the `sdmmc_arm` binary carries zero
+`ORIN-SDMMC-3`/`mb: CMD18`/`mb: CMD25` strings and rebuilds identical; the `install_target` binary carries
+them. Landing: `review/unaos-orin-sdmmc3-LANDING.md`.
+
 ## What later rungs still owe
 
 - **Bootability:** the cloned card carries a faithful `/EFI/BOOT/BOOTAA64.EFI` + `/kernel.elf` tree; making the
@@ -283,3 +310,5 @@ by the 8-line gated insertion in `kernel_main` — a source-line number, never c
 - **Cross-platform:** the same `InstallTarget` generalizes to the x86 USB stick (installer_engine
   line seed rung 4); the Pi `emmc2` rung landed as §INSTALL-PI.
 - **Throughput:** multi-block CMD25/CMD18 on the SD path (single-block is correct but slower on the zero pass).
+- **Metal SD throughput:** the multi-block CMD18/CMD25 path is compiled + verified off-metal (QEMU models no
+  Tegra234 SDMMC); its first metal exercise is the attended Orin sitting.

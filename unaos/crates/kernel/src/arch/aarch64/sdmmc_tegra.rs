@@ -891,10 +891,167 @@ mod metal {
     #[cfg(feature = "install_target")]
     static PENDING_INSTALL: spin::Mutex<Option<(u64, Card, [u8; 512])>> = spin::Mutex::new(None);
 
-    /// An `InstallTarget` over the rung-2 armed single-block SD write path. Sector granularity; every
-    /// method loops the proven `read_block_at` / `write_block_at` CMD17/CMD24 primitives (no multi-block
-    /// CMD18/CMD25 — see the M2 note in the flow; the engine needs correctness, not throughput, and the
-    /// single-block primitives are the ones rung-2 verified on metal).
+    // ── ORIN-SDMMC-3: multi-block transfer primitives (CMD18 READ_MULTIPLE / CMD25 WRITE_MULTIPLE) ──
+    //
+    // The rung-1/rung-2 ladder moves one 512-byte block per command (CMD17/CMD24); a multi-MB kernel.elf
+    // is thousands of single-block commands. These primitives collapse a run of contiguous blocks into a
+    // single command with a block count, per the SDHCI multi-block model:
+    //   * BLKSIZECNT carries the block COUNT in [31:16] (with block size 512 in [15:0]);
+    //   * the Transfer-Mode field (CMDTM[15:0]) sets Block-Count-Enable + Multi-Block-Select;
+    //   * COMPLETION uses **auto-CMD12**: the host controller issues STOP_TRANSMISSION itself at the end
+    //     of the counted transfer. We choose auto-CMD12 over an explicit CMD12 so there is no second
+    //     command round-trip and no separate CMD12 error-handling path — the controller closes the
+    //     open-ended read/write for us, and normal transfer-complete (INT_DATA_DONE) still fires.
+    // Both are `install_target`-gated (⇒ sdmmc_arm ⇒ sdmmc), so a plain `sdmmc`/`sdmmc_arm` build carries
+    // NEITHER and stays byte-for-byte identical to the merged recon/ladder. The multi-block WRITE therefore
+    // exists only behind the armed (sdmmc_arm) gate as the arc requires; the rung-2 witness ladder is left
+    // entirely on single-block CMD24 (its metal-verified semantics unchanged).
+
+    /// Transfer-Mode bits inside CMDTM[15:0] (standard SDHCI; distinct from the command bits [16:31]).
+    #[cfg(feature = "install_target")]
+    const TM_BLKCNT_EN: u32 = 1 << 1; // Block Count Enable — BLKSIZECNT[31:16] is a valid count
+    #[cfg(feature = "install_target")]
+    const TM_AUTO_CMD12: u32 = 1 << 2; // Auto CMD12 Enable — controller issues STOP at transfer end
+    #[cfg(feature = "install_target")]
+    const TM_MULTI_BLK: u32 = 1 << 5; // Multi/Single Block Select — 1 = multi-block
+
+    /// Bounded multi-block chunk: the most 512-byte blocks a single CMD18/CMD25 transfer moves. 64 blocks
+    /// (32 KiB) keeps one transfer's PIO drain + bounded-wait budget modest while collapsing a run into
+    /// ~1/64 the command count of the single-block path. `SdInstallTarget` loops this bound (and drops to
+    /// the single-block CMD17/CMD24 primitive for a 1-block tail — the retained fallback).
+    #[cfg(feature = "install_target")]
+    const MULTIBLOCK_CHUNK_BLOCKS: u32 = 64;
+
+    /// Read `count` contiguous blocks starting at `lba` via a polled CMD18 READ_MULTIPLE_BLOCK with
+    /// block-count + auto-CMD12. `buf` must be exactly `count * 512` bytes. READ-ONLY. Returns whether the
+    /// whole run was read. Generalises `read_block_at` to a counted transfer.
+    #[cfg(feature = "install_target")]
+    fn read_blocks_at(base: u64, card: &Card, lba: u64, buf: &mut [u8], count: u32) -> bool {
+        debug_assert!(buf.len() == count as usize * 512);
+        let arg = if card.block_addressing { lba as u32 } else { (lba * 512) as u32 };
+        write32(base, INTERRUPT, 0xffff_ffff);
+        write32(base, BLKSIZECNT, (count << 16) | 512);
+        if send_command(
+            base,
+            cmd(18)
+                | CMD_RESP_48
+                | CMD_CRCCHK
+                | CMD_IXCHK
+                | CMD_ISDATA
+                | CMD_DAT_DIR_READ
+                | TM_BLKCNT_EN
+                | TM_MULTI_BLK
+                | TM_AUTO_CMD12,
+            arg,
+        )
+        .is_err()
+        {
+            serial_println!("{}   mb: CMD18 (READ {} blk @LBA {}) failed at the link layer ::", PS, count, lba);
+            return false;
+        }
+        let r1 = read32(base, RESP0);
+        if r1 & R1_ERROR_MASK != 0 {
+            serial_println!("{}   mb: CMD18 (LBA {}) R1 error status {:#010x} ::", PS, lba, r1);
+            return false;
+        }
+        for blk in 0..count as usize {
+            if !wait_set(base, INTERRUPT, INT_READ_RDY, DATA_TIMEOUT_MS) {
+                serial_println!("{}   mb: read buffer never ready (block {} of {} @LBA {}) ::", PS, blk, count, lba);
+                return false;
+            }
+            write32(base, INTERRUPT, INT_READ_RDY); // W1C, re-arm for the next block
+            let bo = blk * 512;
+            for i in 0..128usize {
+                let word = read32(base, DATA);
+                let off = bo + i * 4;
+                buf[off..off + 4].copy_from_slice(&word.to_le_bytes());
+            }
+        }
+        // Transfer-complete: the controller's auto-CMD12 has closed the read.
+        if !wait_set(base, INTERRUPT, INT_DATA_DONE | INT_ERR_ANY, DATA_TIMEOUT_MS) {
+            serial_println!("{}   mb: transfer-complete timeout after {} blocks @LBA {} ::", PS, count, lba);
+            return false;
+        }
+        let int = read32(base, INTERRUPT);
+        write32(base, INTERRUPT, int);
+        if int & INT_ERR_ANY != 0 {
+            serial_println!("{}   mb: data error {:#010x} reading {} blocks @LBA {} ::", PS, int, count, lba);
+            return false;
+        }
+        true
+    }
+
+    /// Write `count` contiguous blocks starting at `lba` via a polled CMD25 WRITE_MULTIPLE_BLOCK with
+    /// block-count + auto-CMD12. `buf` must be exactly `count * 512` bytes. The multi-block card-write —
+    /// reachable only under `install_target` (⇒ `sdmmc_arm`), only from `SdInstallTarget`. Returns whether
+    /// the whole run was written AND the card left the programming (busy) state cleanly.
+    #[cfg(feature = "install_target")]
+    fn write_blocks_at(base: u64, card: &Card, lba: u64, buf: &[u8], count: u32) -> bool {
+        debug_assert!(buf.len() == count as usize * 512);
+        let arg = if card.block_addressing { lba as u32 } else { (lba * 512) as u32 };
+        write32(base, INTERRUPT, 0xffff_ffff);
+        write32(base, BLKSIZECNT, (count << 16) | 512);
+        // CMD25 WRITE_MULTIPLE_BLOCK: host->card (DAT_DIR_READ clear) + block-count + multi-block + auto-CMD12.
+        if send_command(
+            base,
+            cmd(25)
+                | CMD_RESP_48
+                | CMD_CRCCHK
+                | CMD_IXCHK
+                | CMD_ISDATA
+                | TM_BLKCNT_EN
+                | TM_MULTI_BLK
+                | TM_AUTO_CMD12,
+            arg,
+        )
+        .is_err()
+        {
+            serial_println!("{}   mb: CMD25 (WRITE {} blk @LBA {}) failed at the link layer ::", PS, count, lba);
+            return false;
+        }
+        let r1 = read32(base, RESP0);
+        if r1 & R1_ERROR_MASK != 0 {
+            serial_println!("{}   mb: CMD25 (LBA {}) R1 error status {:#010x} ::", PS, lba, r1);
+            return false;
+        }
+        for blk in 0..count as usize {
+            if !wait_set(base, INTERRUPT, INT_WRITE_RDY, DATA_TIMEOUT_MS) {
+                serial_println!("{}   mb: write buffer never ready (block {} of {} @LBA {}) ::", PS, blk, count, lba);
+                return false;
+            }
+            write32(base, INTERRUPT, INT_WRITE_RDY); // W1C, re-arm for the next block
+            let bo = blk * 512;
+            for i in 0..128usize {
+                let off = bo + i * 4;
+                let word = u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
+                write32(base, DATA, word);
+            }
+        }
+        // Transfer-complete: the controller's auto-CMD12 has closed the write.
+        if !wait_set(base, INTERRUPT, INT_DATA_DONE | INT_ERR_ANY, DATA_TIMEOUT_MS) {
+            serial_println!("{}   mb: transfer-complete timeout after {} blocks @LBA {} ::", PS, count, lba);
+            return false;
+        }
+        let int = read32(base, INTERRUPT);
+        write32(base, INTERRUPT, int);
+        if int & INT_ERR_ANY != 0 {
+            serial_println!("{}   mb: data error {:#010x} writing {} blocks @LBA {} ::", PS, int, count, lba);
+            return false;
+        }
+        // The card asserts DAT0 busy while it programs the run's flash; wait for release before treating
+        // the write as durable (a following read would otherwise race the internal programming).
+        if !wait_clear(base, STATUS, ST_DAT_INHIBIT, DATA_TIMEOUT_MS) {
+            serial_println!("{}   mb: card stayed busy (DAT0) after writing {} blocks @LBA {} — programming did not complete ::", PS, count, lba);
+            return false;
+        }
+        true
+    }
+
+    /// An `InstallTarget` over the SD write path. Sector granularity; `read_sectors`/`write_sectors` move
+    /// the bulk of a multi-sector buffer with the ORIN-SDMMC-3 multi-block CMD18/CMD25 primitives (bounded
+    /// to `MULTIBLOCK_CHUNK_BLOCKS` per transfer) and drop to the rung-2 single-block CMD17/CMD24 primitives
+    /// for a 1-block tail (retained fallback). A 512-byte call (the FAT-metadata path) is therefore always
+    /// a single-block command; a whole-file write (the batched `TreeWriter::write_file`) rides multi-block.
     #[cfg(feature = "install_target")]
     struct SdInstallTarget<'a> {
         base: u64,
@@ -918,24 +1075,49 @@ mod metal {
 
         fn read_sectors(&self, lba: u64, buf: &mut [u8]) -> Result<(), crate::install::InstallError> {
             debug_assert!(buf.len() % 512 == 0);
-            for (i, chunk) in buf.chunks_mut(512).enumerate() {
-                let mut sec = [0u8; 512];
-                if !read_block_at(self.base, self.card, lba + i as u64, &mut sec) {
+            let total = (buf.len() / 512) as u64;
+            let mut done: u64 = 0;
+            while done < total {
+                let n = core::cmp::min(MULTIBLOCK_CHUNK_BLOCKS as u64, total - done) as u32;
+                let region = &mut buf[done as usize * 512..(done as usize + n as usize) * 512];
+                let ok = if n == 1 {
+                    // Single-block tail (and the 512-byte metadata path): the retained CMD17 fallback.
+                    let mut sec = [0u8; 512];
+                    let r = read_block_at(self.base, self.card, lba + done, &mut sec);
+                    if r {
+                        region.copy_from_slice(&sec);
+                    }
+                    r
+                } else {
+                    read_blocks_at(self.base, self.card, lba + done, region, n)
+                };
+                if !ok {
                     return Err(crate::install::InstallError::Io);
                 }
-                chunk.copy_from_slice(&sec);
+                done += n as u64;
             }
             Ok(())
         }
 
         fn write_sectors(&mut self, lba: u64, buf: &[u8]) -> Result<(), crate::install::InstallError> {
             debug_assert!(buf.len() % 512 == 0);
-            for (i, chunk) in buf.chunks(512).enumerate() {
-                let mut sec = [0u8; 512];
-                sec.copy_from_slice(chunk);
-                if !write_block_at(self.base, self.card, lba + i as u64, &sec) {
+            let total = (buf.len() / 512) as u64;
+            let mut done: u64 = 0;
+            while done < total {
+                let n = core::cmp::min(MULTIBLOCK_CHUNK_BLOCKS as u64, total - done) as u32;
+                let region = &buf[done as usize * 512..(done as usize + n as usize) * 512];
+                let ok = if n == 1 {
+                    // Single-block tail (and the 512-byte metadata path): the retained CMD24 fallback.
+                    let mut sec = [0u8; 512];
+                    sec.copy_from_slice(region);
+                    write_block_at(self.base, self.card, lba + done, &sec)
+                } else {
+                    write_blocks_at(self.base, self.card, lba + done, region, n)
+                };
+                if !ok {
                     return Err(crate::install::InstallError::Io);
                 }
+                done += n as u64;
             }
             Ok(())
         }
@@ -1061,9 +1243,13 @@ mod metal {
         let mut recs: alloc::vec::Vec<FileRec> = alloc::vec::Vec::new();
         {
             let mut w = fat32::TreeWriter::new(t, geom);
-            let root_cluster = w.root_cluster();
             let root_entries = src.read_root().map_err(|_| InstallError::Io)?;
-            copy_dir(&mut w, &src, &root_entries, root_cluster, 0, true, "", &mut recs, 0)?;
+            // Size the root directory to its entry count (multi-cluster if >16 entries) and reserve its
+            // cluster chain BEFORE any file/subdir allocation (so cluster 2's chain stays contiguous).
+            let root_slots = count_nondot(&root_entries);
+            let root_clusters = fat32::dir_clusters_for_slots(root_slots);
+            let root_cluster = w.reserve_root(root_clusters)?;
+            copy_dir(&mut w, &src, &root_entries, root_cluster, 0, true, "", &mut recs, 0, root_clusters)?;
             serial_println!(
                 "{}   INSTALL: cloned {} files ({} data clusters) from the boot tree ::",
                 PS, recs.len(), w.clusters_used()
@@ -1104,6 +1290,19 @@ mod metal {
     /// file is read whole off the stick, its clusters allocated + written, and its record pushed for the
     /// caller's sha-extent verify. `is_root` selects whether `.`/`..` are emitted and whether a child's
     /// `..` points at cluster 0 (the FAT convention for a subdirectory of the root).
+    /// Count the entries in a source directory that are neither `.` nor `..` (the slots a mirrored copy of
+    /// it must hold beyond its own `.`/`..`). Used to size a directory's cluster chain up front.
+    #[cfg(feature = "install_target")]
+    fn count_nondot(entries: &[crate::fs::fat::DirEntry]) -> usize {
+        entries
+            .iter()
+            .filter(|e| {
+                let n = e.name();
+                n != "." && n != ".."
+            })
+            .count()
+    }
+
     #[cfg(feature = "install_target")]
     #[allow(clippy::too_many_arguments)]
     fn copy_dir(
@@ -1116,8 +1315,11 @@ mod metal {
         path_prefix: &str,
         recs: &mut alloc::vec::Vec<FileRec>,
         depth: u32,
+        this_clusters: u32,
     ) -> Result<(), crate::install::InstallError> {
-        use crate::install::fat32::{put_dir_entry, ATTR_ARCHIVE, ATTR_DIR, DIR_SLOTS_PER_CLUSTER};
+        use crate::install::fat32::{
+            dir_clusters_for_slots, put_dir_entry, ATTR_ARCHIVE, ATTR_DIR, DIR_SLOTS_PER_CLUSTER,
+        };
         use crate::install::InstallError;
 
         // A sane recursion bound (the boot ESP tree is 2 levels: root → EFI → BOOT); refuse a pathological
@@ -1130,7 +1332,11 @@ mod metal {
         // exhaust the 48 MiB kernel heap reading it whole.
         const MAX_FILE_BYTES: usize = 32 * 1024 * 1024;
 
-        let mut dir = [0u8; 512];
+        // The directory image is built WHOLLY in memory (no stale-byte leak) across its whole cluster
+        // chain, then written once. `this_clusters` was sized by the caller from this dir's entry count, so
+        // a directory with >16 entries spans >1 cluster — the lifted single-cluster bound.
+        let capacity = this_clusters as usize * DIR_SLOTS_PER_CLUSTER;
+        let mut dir = alloc::vec![0u8; this_clusters as usize * 512];
         let mut slot = 0usize;
         if !is_root {
             if !put_dir_entry(&mut dir, slot, ".", ATTR_DIR, this_cluster, 0) {
@@ -1147,16 +1353,19 @@ mod metal {
             if name == "." || name == ".." {
                 continue;
             }
-            if slot >= DIR_SLOTS_PER_CLUSTER {
-                // The directory overflows one cluster (out of this arc's scope — the boot tree does not).
+            if slot >= capacity {
+                // Sized from the entry count up front, so this is a genuine overflow (e.g. a source dir
+                // that changed under us) — honest NoSpace, never silent truncation.
                 return Err(InstallError::NoSpace);
             }
             if e.is_dir {
-                let child = w.alloc_dir_cluster()?;
                 let child_entries = src.read_dir(e.first_cluster()).map_err(|_| InstallError::Io)?;
+                // Size the child (its own `.`/`..` + its non-dot entries) and allocate its chain.
+                let child_clusters = dir_clusters_for_slots(2 + count_nondot(&child_entries));
+                let child = w.alloc_dir_clusters(child_clusters)?;
                 let child_prefix = alloc::format!("{}{}/", path_prefix, name);
                 let child_dotdot = if is_root { 0 } else { this_cluster };
-                copy_dir(w, src, &child_entries, child, child_dotdot, false, &child_prefix, recs, depth + 1)?;
+                copy_dir(w, src, &child_entries, child, child_dotdot, false, &child_prefix, recs, depth + 1, child_clusters)?;
                 if !put_dir_entry(&mut dir, slot, name, ATTR_DIR, child, 0) {
                     return Err(InstallError::BadArg);
                 }
@@ -1190,7 +1399,7 @@ mod metal {
                 });
             }
         }
-        w.write_dir_cluster(this_cluster, &dir)?;
+        w.write_dir_image(this_cluster, &dir)?;
         Ok(())
     }
 

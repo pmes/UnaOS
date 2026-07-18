@@ -5480,10 +5480,10 @@ find, and the **self-clone is flagged as the named follow-up (INSTALL-2)**. (The
 interop self-check the x86 witness runs is likewise skipped here — `mount()` reads the USB block layer, not
 this armed SD target; the by-content SD extent-verify is the proof.)
 
-**Single-block, by choice.** `SdInstallTarget` loops the proven rung-2 single-block CMD24/CMD17 primitives —
-no multi-block CMD25/CMD18 was added: the engine needs correctness, not throughput, and single-block is the
-path rung-2 verified on metal. The bounded metadata-zero pass (~2064 sectors for a 64 MiB ESP) is the only
-sizable write; CMD25 batching is a named perf follow-up, not a correctness gap.
+**Transfer primitives.** INSTALL-1/2 looped the proven rung-2 single-block CMD24/CMD17 primitives; ORIN-SDMMC-3
+(below) adds bounded multi-block CMD25/CMD18 that `SdInstallTarget` now uses for whole-file writes, with the
+single-block path retained as the 1-block/metadata fallback. The bounded metadata-zero pass (~2064 sectors for
+a 64 MiB ESP) rides the same multi-sector path.
 
 **Byte-identity.** Every installer line — including the `cid` field added to `Card` — is `install_target`-gated,
 so an `sdmmc_arm`-without-`install_target` build is byte-identical in behavior to the merged rung-2 ladder
@@ -5536,9 +5536,9 @@ required the whole file chain to fit in **FAT sector 0** (≤125 clusters ≈ 64
 `write_payload_file` is untouched): a running free-cluster cursor, a `set_fat_run` that RMWs **every FAT
 sector a run touches, in both FAT copies** (multi-MB files link correctly), and directory clusters built
 **wholly in memory** then written once (so a stale data cluster on a non-blank card never leaks bytes into a
-directory). Directories are assumed to fit one cluster (the boot tree does); an overflow is an honest error,
-not truncation. Same verify discipline downstream: every file is re-read off the card and SHA-checked through
-the engine's own `verify_extents`.
+directory). INSTALL-2 assumed each directory fit one cluster (the boot tree does); ORIN-SDMMC-3 (below) lifts
+that to multi-cluster directories. Same verify discipline downstream: every file is re-read off the card and
+SHA-checked through the engine's own `verify_extents`.
 
 **The flow** (each step a serial line; any engine/read error is a single named `FAIL`):
 GPT (parse-back verified) → zero the ESP metadata region → FAT32 format → **mount the USB stick + clone its
@@ -5554,6 +5554,50 @@ and rebuilds byte-for-byte; the `install_target` binary contains them**).
 **Virt witness:** unchanged in shape — one honest metal-only line (no Tegra234 SDMMC in QEMU). The full
 self-clone's **first execution is the attended Orin sitting** (runbook `scripts/orin-sdmmc1-bench.md`, install
 leg). Landing: `review/unaos-install2-LANDING.md`.
+
+#### ORIN-SDMMC-3 — multi-block SD transfers + multi-cluster directories (the INSTALL-2 perf/size follow-ups)
+
+**What it is.** INSTALL-2 flagged two follow-ups: single-block-only SD transfers (a multi-MB `kernel.elf` is
+thousands of CMD24s) and single-cluster directories (a directory of >16 entries hit an honest `NoSpace`).
+ORIN-SDMMC-3 closes both. Both are `install_target`-gated (⇒ `sdmmc_arm` ⇒ `sdmmc`), so a plain
+`sdmmc`/`sdmmc_arm` build is byte-for-byte identical to the merged recon/ladder.
+
+**Multi-block CMD18/CMD25 (the SDHCI multi-block model).** Two new primitives in `sdmmc_tegra.rs` move a run
+of contiguous blocks in one command: `BLKSIZECNT` carries the block count in `[31:16]`, the Transfer-Mode
+field (`CMDTM[15:0]`) sets Block-Count-Enable + Multi-Block-Select, and **completion uses auto-CMD12** — the
+host controller issues `STOP_TRANSMISSION` itself at the counted transfer's end. Auto-CMD12 was chosen over an
+explicit CMD12 so there is no second command round-trip and no separate CMD12 error path; normal
+transfer-complete (`INT_DATA_DONE`) still fires. `read_blocks_at` (CMD18 READ_MULTIPLE) is available on the
+read side; `write_blocks_at` (CMD25 WRITE_MULTIPLE) is the armed multi-block card-write. `SdInstallTarget`'s
+`read_sectors`/`write_sectors` loop a **bounded 64-block (32 KiB) chunk** and drop to the retained single-block
+CMD17/CMD24 primitive for a 1-block tail (so the 512-byte FAT-metadata path stays single-block, a whole-file
+write rides multi-block). The **rung-2 witness ladder is untouched — still single-block CMD24** — so its
+metal-verified semantics do not shift.
+
+`TreeWriter::write_file` now writes each file's contiguous data chain in **one multi-sector `write_sectors`
+call** (recording per-cluster extents unchanged for verify granularity), so a real `kernel.elf` copies as a
+handful of CMD25 bursts instead of one CMD24 per 512 bytes.
+
+**Multi-cluster directories (the >16-entry bound, lifted).** `TreeWriter` gains `alloc_dir_clusters`,
+`write_dir_image`, and `reserve_root`; a new `dir_clusters_for_slots` sizes a directory's cluster chain from
+its entry count. A directory's image is built **wholly in memory across its whole (contiguous) cluster chain**
+then written once — the same no-stale-byte discipline, now spanning >1 cluster. `copy_dir` sizes each
+directory (root included, via `reserve_root` before any file allocation so cluster 2's chain stays contiguous)
+up front from the source entry count. `NoSpace` now means the *volume* is genuinely full, not a 16-entry
+directory. `put_dir_entry` operates on a `&mut [u8]` slice (the whole image) rather than a single 512-byte
+cluster.
+
+**Witness (x86 `installdemo`).** `run_demo_inner` gains a final step: it re-establishes the blank-precondition,
+re-formats, and builds a tree whose `SUB/` directory holds **20 files (22 slots → 2 clusters)** through the
+`TreeWriter`, then the in-tree FAT reader mounts the volume, follows `SUB/`'s cluster chain, and re-reads +
+SHA-verifies every file — a genuine multi-cluster directory read on the same engine the SD installer uses:
+`:: INSTALL: multi-cluster dir — SUB/ 20 entries across 2 clusters, all re-read + sha-verified (dirs=1) => PASS ::`.
+
+**Byte-identity.** The multi-block primitives and their strings are `install_target`-gated; string-identity
+evidence: the tegra `sdmmc_arm` binary contains **zero** `ORIN-SDMMC-3` / `mb: CMD18` / `mb: CMD25` strings and
+**rebuilds byte-for-byte identical**; the `install_target` binary contains them. Metal exercise of the
+multi-block SD path is part of the attended Orin sitting (QEMU models no Tegra234 SDMMC). Landing:
+`review/unaos-orin-sdmmc3-LANDING.md`.
 
 ## AARCH64-VNET — virtio-net-mmio driver + smoltcp bind on QEMU `virt` (`UNAOS_VNET`, knob-gated)
 
