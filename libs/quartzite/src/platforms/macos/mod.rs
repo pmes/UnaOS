@@ -269,6 +269,11 @@ define_class!(
             window.makeKeyAndOrderFront(None::<&AnyObject>);
             unsafe {
                 let _: () = msg_send![&window, center];
+                // Same burial hazard as the vessel path above: launched from a
+                // terminal shell there is no active app, so order-front alone
+                // leaves the window behind whatever had focus.
+                let app = NSApplication::sharedApplication(mtm);
+                let _: () = msg_send![&app, activateIgnoringOtherApps: true];
             }
         }
 
