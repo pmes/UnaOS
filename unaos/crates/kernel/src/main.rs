@@ -281,6 +281,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
         unaos_kernel::drivers::emmc2::probe();
 
+        // PI-USB-2: the DMA-side xHCI bring-up + device enumeration on the VL805, post-heap on the BSP.
+        // `piusb::bringup` (pre-heap, in build_boot_info) already reached the honesty line (RC link +
+        // VL805 found + BAR sized + xHCI decoding + ports powered); this reads its handoff, programs
+        // rings/interrupter (needs the heap), RS=1, and walks whatever is plugged. QEMU raspi4b models
+        // no PCIe RC/VL805, so the honesty line was never reached and this returns after one skip line.
+        #[cfg(feature = "piusb")]
+        unaos_kernel::arch::piusb::enumerate();
+
         // M6b: EL0 fault isolation + per-page user permissions. Four EL0 programs on one AP (never
         // the unscheduled BSP): hello (must still work — the code page is EL0-RX), then three that
         // each provoke a specific fault the kernel must answer by KILLING THE TASK, not halting —

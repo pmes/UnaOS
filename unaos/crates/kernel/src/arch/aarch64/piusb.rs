@@ -44,9 +44,18 @@
 
 use super::mailbox;
 use crate::drivers::xhci;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Stable serial prefix so the operator (and `mbench`) can grep the whole bring-up as one block.
 const P: &str = ":: PIUSB:";
+
+// ─── PI-USB-2 handoff: the honesty line (`bringup`, pre-heap in `build_boot_info`) reaches "VL805
+// xHCI halted-but-decoding + ports powered"; the DMA-side enumeration (`enumerate`, post-heap in
+// kernel_main — rings/DCBAA/interrupter need the heap) picks up from there. These two statics carry
+// the CPU-side xHCI base + a ready flag across that gap. Single-writer (the BSP, pre-SMP) so plain
+// atomics suffice; knob-off the whole module (and both statics) vanish. ───
+static XHCI_CPU_BASE: AtomicU64 = AtomicU64::new(0);
+static XHCI_READY: AtomicBool = AtomicBool::new(false);
 
 // ─── BCM2711 PCIe RC register block (ARM-physical; inside the 0xC000_0000–0xFFFF_FFFF Device-nGnRnE
 // window `boot.rs` L1[3] already maps — no new mapping needed to reach ANY of the RC registers or the
@@ -334,11 +343,25 @@ fn m1_rc_bringup() -> bool {
     serial_println!("{}   MISC_CTRL = {:#010x} (firmware default retained) ::", P, r(RC_BASE + PCIE_MISC_MISC_CTRL));
 
     // (e) Inbound DMA BAR (RC_BAR2): map the PCIe inbound window to system RAM base 0 so a bus-master
-    //     device can DMA into RAM. Encoding (brcmstb): [LO] = RAM base | size-code in low bits; we set
-    //     base 0 with the 4 GiB size code (0x11 in the low field per pcie-brcmstb `encode_ibar_size`).
+    //     device can DMA into RAM. Encoding (brcmstb): CONFIG_LO = (RAM base low 32b) | size-code in
+    //     bits [4:0] (PCIE_MISC_RC_BAR2_CONFIG_LO_SIZE_MASK = 0x1f); CONFIG_HI = RAM base high 32b.
+    //
+    //     ── PI-USB-2 M1 ADJUDICATION (encode_ibar_size, the mandatory gate) ─────────────────────────
+    //     The size-code is NOT log2(size). Linux `drivers/pci/controller/pcie-brcmstb.c`
+    //     `brcm_pcie_encode_ibar_size(u64 size)` maps a byte size to the 5-bit field by branch on
+    //     `ilog2(size)`:
+    //         * log2 in [12,15]  (4 KiB .. 32 KiB)   -> (log2 - 12) + 0x1c
+    //         * log2 in [16,35]  (64 KiB .. 32 GiB)  -> log2 - 15
+    //         * otherwise                             -> 0 (disabled)
+    //     A 4 GiB inbound window is size = 2^32, so log2 = 32, which lands in the [16,35] branch:
+    //         code = 32 - 15 = 17 = 0x11.
+    //     So 0x11 is CORRECT for 4 GiB; the alternative 0x20 (= 32 decimal, the raw log2) would be the
+    //     32 EiB / out-of-range value and is WRONG. The lens caveat (0x11-vs-0x20) is hereby resolved to
+    //     0x11 by the encode_ibar_size programming model — constant unchanged.
+    //
     //     We stop at the honesty line (no DMA yet), but the inbound BAR is part of the RC sequence of
     //     record, so program + log it for correctness-by-construction.
-    const RC_BAR2_SIZE_4G: u32 = 0x11; // brcmstb size code for a 4 GiB inbound window
+    const RC_BAR2_SIZE_4G: u32 = 0x11; // encode_ibar_size(4 GiB) = log2(2^32) - 15 = 32 - 15 = 0x11
     serial_println!("{}   >>> WRITE: RC_BAR2 inbound window = RAM@0 size=4GiB (DMA) ::", P);
     w(RC_BASE + PCIE_MISC_RC_BAR2_CONFIG_LO, RC_BAR2_SIZE_4G);
     w(RC_BASE + PCIE_MISC_RC_BAR2_CONFIG_HI, 0);
@@ -522,15 +545,174 @@ fn m3_attach_xhci(_bar0_pcie: u64) {
         }
         // Preserve everything except the RW1C change bits (do not clear/ack them here) and OR in PP.
         // Mask off the change/RW1C bits so we don't accidentally clear a latched change: PP is bit 9.
+        //
+        // PI-USB-2 M2 robustness nit: PED (Port Enabled/Disabled, bit 1) is RW1CS — writing it back as
+        // 1 DISABLES the port. On a warm/inherited controller PED can read 1 for an already-enabled
+        // port, so a naive RMW that only masked the RW1C change bits would write PED=1 and tear the
+        // port's own enable down. Mask PED off alongside the change bits (hardware sets PED itself on a
+        // successful reset; we never assert it): PP-set becomes a clean "power on, disturb nothing".
         const PORTSC_PP: u32 = 1 << 9;
+        const PORTSC_PED: u32 = 1 << 1; // RW1CS: write-1 clears (disables) the port — must mask off
         const PORTSC_RW1C: u32 = (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20) | (1 << 21) | (1 << 22) | (1 << 23);
-        w(portsc_addr, (portsc & !PORTSC_RW1C) | PORTSC_PP);
+        w(portsc_addr, (portsc & !(PORTSC_RW1C | PORTSC_PED)) | PORTSC_PP);
     }
     dsb();
     settle_ms(20); // let port power stabilize before the honesty read
+
+    // PI-USB-2 handoff: record the decoding xHCI base + arm the DMA-side entry. `enumerate()` (called
+    // post-heap from kernel_main) picks up here to program rings/interrupter and walk the ports. If we
+    // never reach this line (QEMU census-skip, no link, BAR mismatch), XHCI_READY stays false and
+    // `enumerate()` cleanly reports "honesty line not reached" and returns.
+    XHCI_CPU_BASE.store(OUTBOUND_CPU_BASE, Ordering::Release);
+    XHCI_READY.store(true, Ordering::Release);
+
     serial_println!("{} M3: {} root port(s) powered (PORTSC.PP set); controller halted-but-decoding — HONESTY LINE reached ::", P, ports);
     serial_println!(
-        "{}   NEXT (attended metal): program rings + interrupter (needs heap), pump port connects, ADDRESS_DEVICE, HID/storage enumeration ::",
+        "{}   NEXT (post-heap, this arc): `piusb::enumerate()` programs rings + interrupter, RS=1, pumps port connects, ADDRESS_DEVICE, HID/storage enumeration ::",
         P
     );
+}
+
+/// Mirror of the shared driver's keyboard-armed predicate (the JB2b pattern, `xusb_tegra.rs`): a slot
+/// is an armed HID keyboard once it is active, typed as a keyboard, and its interrupt-IN read FSM has
+/// reached the armed state (3). Returns `(slot, root_port)` for the first such slot.
+fn keyboard_armed(x: &xhci::XhciController) -> Option<(u8, u8)> {
+    for (i, s) in x.slots.iter().enumerate() {
+        if s.active && s.is_keyboard && s.keyboard_state == 3 {
+            return Some((i as u8, s.port_id));
+        }
+    }
+    None
+}
+
+/// PI-USB-2 M3 — the DMA-side bring-up + device enumeration on the VL805. Called ONCE on the BSP,
+/// post-heap (kernel_main), after `bringup` reached the honesty line pre-heap. Reuses the shared xHCI
+/// driver's polled-attach machinery verbatim (the JB2b pattern, `xusb_tegra::jb2b_attach`) with ZERO
+/// xhci-core edits: `xhci::init` (halt+HCRST+CNR — this is OUR freshly-reset controller, so the plain
+/// reset path, NOT the inherited-controller no-HCRST/CRCR takeover), then rings/DCBAA/interrupter via
+/// `XhciController::new` + `COMMAND_RING`/`EVENT_RING`/`ERST_TABLE` + `init_interrupter`/`init_pointers`,
+/// `start()` (RS=1), then a bounded polled-enumeration pump. Stops at keyboard-ARMED (or the bounded
+/// window), dumping per-device identity lines. Heap-free paths only outside the rings.
+///
+/// Graceful degradation: if the honesty line was never reached this boot (QEMU raspi4b census-skip,
+/// link-down, or a BAR/window mismatch), `XHCI_READY` is false — we say so and return. This is the
+/// exact QEMU behaviour of rung 1 carried one rung forward: QEMU never builds a ring here.
+pub fn enumerate() {
+    if !XHCI_READY.load(Ordering::Acquire) {
+        serial_println!(
+            "{} enumerate: honesty line not reached this boot (no VL805 xHCI decoding — expected in QEMU raspi4b: models no PCIe RC/VL805) — DMA-side enumeration skipped, graceful degradation ::",
+            P
+        );
+        return;
+    }
+    let base = XHCI_CPU_BASE.load(Ordering::Acquire);
+
+    // Re-confirm the BAR still decodes before we build rings against it (poison-rejecting — the
+    // PI-V3D-1 false-pass rule). A window/BAR regression since the honesty line = fail-closed here.
+    let cap0 = r(base);
+    if is_poison(cap0) || cap0 == 0 {
+        serial_println!(
+            "{} enumerate: xHCI CAP reads {:#010x} @ {:#x} — no longer decoding; enumeration SKIPPED, fail-closed ::",
+            P, cap0, base
+        );
+        return;
+    }
+    let cap_length = (cap0 & 0xff) as u64;
+    serial_println!("{} enumerate: DMA-side bring-up @ {:#x} (CAPLENGTH={}) — OUR controller, fresh reset + RS=1 ::", P, base, cap_length);
+
+    // (1) Halt + HCRST + CNR-wait: a clean freshly-reset controller immediately before we seat rings
+    //     (the JB2b ordering; idempotent even though `bringup` reset it pre-heap — the intervening
+    //     heap/AP/emmc bring-up leaves the halted controller untouched, but a defensive reset here
+    //     guarantees the RS=1 below rides a known state).
+    xhci::init(base);
+
+    // (2) Rings / DCBAA / interrupter via the driver's existing init paths (heap-backed). Exactly the
+    //     JB2b sequence: construct the controller, seat the command + event rings, point the
+    //     interrupter's ERST at the event ring, seat the command-ring pointer, then RS=1.
+    unsafe {
+        let mut x = xhci::XhciController::new(base as usize);
+        let (event_ring_phys, command_ring_phys) = {
+            let mut cmd_ring_guard = xhci::COMMAND_RING.lock();
+            let mut evt_ring_guard = xhci::EVENT_RING.lock();
+            *cmd_ring_guard = Some(xhci::ring::TransferRing::new(256));
+            *evt_ring_guard = Some(xhci::event::EventRing::new());
+            (
+                evt_ring_guard.as_mut().unwrap().get_ptr(),
+                cmd_ring_guard.as_mut().unwrap().get_ptr(),
+            )
+        };
+        let erst_table_phys = &raw mut xhci::ERST_TABLE as u64;
+        serial_println!("{}   programming interrupter + rings (runtime regs), then RS=1 ::", P);
+        x.init_interrupter(event_ring_phys, erst_table_phys);
+        x.init_pointers(command_ring_phys);
+        x.start();
+        *xhci::XHCI_CONTROLLER.lock() = Some(x);
+    }
+
+    // (3) Bounded polled-enumeration pump (the JB2b pump, minus the Jetson SMMU/SID forensics). Only a
+    //     metal boot with a live controller reaches here (QEMU returned at the READY gate), so a device
+    //     that never enumerates pays the full window ONCE, honestly, with the driver's stage lines
+    //     keeping the console alive; a keyboard exits early at ARMED, storage after a short settle.
+    let pump_start = super::timer::cntpct();
+    let freq = super::timer::cntfrq();
+    let deadline = pump_start.wrapping_add(freq.saturating_mul(30)); // 30 s worst-case backstop
+    let storage_settle = freq.saturating_mul(6); // keyboard-up: let a hubbed MSC settle, then stop
+    let mut armed: Option<(u8, u8)> = None;
+    let mut armed_at: u64 = 0;
+    loop {
+        let (armed_now, storage_slot, storage_ready) = {
+            let mut guard = xhci::XHCI_CONTROLLER.lock();
+            let x = guard.as_mut().unwrap();
+            x.poll_events();
+            x.service_hubs();
+            x.service_hid_setproto();
+            x.service_slot_disposal();
+            x.service_enum();
+            x.service_storage();
+            (
+                keyboard_armed(x),
+                x.storage_slot,
+                x.storage_slot != 0 && x.storage_note == "ready",
+            )
+        };
+        if armed.is_none() {
+            if let Some((slot, port)) = armed_now {
+                serial_println!("{} enumerate: keyboard ARMED (slot {}, root port {}) -> PASS ::", P, slot, port);
+                armed = Some((slot, port));
+                armed_at = super::timer::cntpct();
+            }
+        }
+        if armed.is_some() {
+            if storage_ready {
+                serial_println!("{} enumerate: mass storage ready (slot {}) ::", P, storage_slot);
+                break;
+            }
+            if super::timer::cntpct().wrapping_sub(armed_at) >= storage_settle {
+                break; // keyboard up, no disk within the settle window — stop
+            }
+        }
+        // Wrap-safe deadline test (the ORIN pattern): elapsed past deadline once (now - deadline)
+        // stays in the low half.
+        if super::timer::cntpct().wrapping_sub(deadline) < (1u64 << 63) {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+
+    // (4) Per-device identity lines — whatever the polled walk enumerated (kbd/mouse/storage), one
+    //     line each, so the boot's serial names the topology it reached (honest even on a no-device or
+    //     deadline exit).
+    serial_println!("{} enumerate: device topology after the polled walk: ::", P);
+    if let Some(x) = xhci::XHCI_CONTROLLER.lock().as_ref() {
+        for line in x.port_slot_summary() {
+            serial_println!("{}   {} ::", P, line);
+        }
+    }
+    for line in xhci::usb_summary() {
+        serial_println!("{}   {} ::", P, line);
+    }
+    match armed {
+        Some((slot, port)) => serial_println!("{} enumerate: DONE — keyboard armed (slot {}, port {}); enumeration + HID arming complete ::", P, slot, port),
+        None => serial_println!("{} enumerate: DONE — no keyboard armed within the bounded window (honest result; see topology above) ::", P),
+    }
 }
