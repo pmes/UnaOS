@@ -3648,7 +3648,6 @@ dependencies = [
  "elessar",
  "glib 0.21.5",
  "gtk4",
- "unafs",
 ]
 
 [[package]]
