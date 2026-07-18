@@ -188,6 +188,17 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             ram_gib_mask: jc3_ram_gib_mask,
         });
 
+        // ORIN-NET-2 (QEMU graceful-skip WITNESS, `UNAOS_PCIE2=1`): same read-only recon on the virt
+        // GICv3 path. The GICv3 handoff leaves dtb_addr=0, so census2 hits its "no DTB handed off —
+        // recon SKIPPED (graceful)" line and returns before any MMIO; CAPSTONE completes below.
+        // Compiled out knob-off. See arch_arm64.md §ORIN-NET-2.
+        #[cfg(feature = "pcie2")]
+        unaos_kernel::arch::pcie_probe::census2(&unaos_kernel::arch::pcie_probe::PcieCtx {
+            dtb_addr,
+            dtb_size,
+            ram_gib_mask: jc3_ram_gib_mask,
+        });
+
         // JC3: with the JC2 SMP proof complete (the secondaries are parked at EL2 in their WFI loop), drop
         // the BOOT CORE EL2 -> EL1 and run the scheduler + full M4 CAPSTONE there — the QEMU-testable proof
         // that the scheduler and all six sync primitives run at EL1 on the GICv3 `virt` path. Sequenced
@@ -1275,6 +1286,19 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     // the default tegra image stays byte-identical to baseline. See arch_arm64.md §ORIN-NET-1.
     #[cfg(feature = "pcieprobe")]
     unaos_kernel::arch::pcie_probe::census(&unaos_kernel::arch::pcie_probe::PcieCtx {
+        dtb_addr,
+        dtb_size,
+        ram_gib_mask: mmu.ram_gib_mask,
+    });
+
+    // ORIN-NET-2 (controller-0 link + device recon, `UNAOS_PCIE2=1`): with the `pcie2` feature armed,
+    // run the recon HERE on the metal Orin — same preconditions as the NET-1 census (JM4 serial/heap
+    // live, mmu up so the DTB deref and the `map_mmio_window` page-table patches are valid), before the
+    // JB2b xHCI work. Reads controller-0 link state from the RP's DBI config space and, for a live link,
+    // walks one level below; the ONLY writes are Device-nGnRE page-table mappings. Compiled out
+    // knob-off, so the default tegra image stays byte-identical to baseline. See arch_arm64.md §ORIN-NET-2.
+    #[cfg(feature = "pcie2")]
+    unaos_kernel::arch::pcie_probe::census2(&unaos_kernel::arch::pcie_probe::PcieCtx {
         dtb_addr,
         dtb_size,
         ram_gib_mask: mmu.ram_gib_mask,

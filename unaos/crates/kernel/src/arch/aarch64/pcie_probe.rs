@@ -54,13 +54,18 @@ const P: &str = ":: PCIE:";
 
 /// The top of the `mmu_tegra` GiB-0 Device-nGnRE window (0x0..0x4000_0000). A config/appl aperture
 /// below this is already mapped and readable at EL2; at or above it is UNMAPPED (the high Tegra234
-/// PCIe config apertures live here) — reading it would need a page-table write, which this arc will
-/// not do (STOP tripwire). See `mmu_tegra::init` (`L1[0]` = the low-1-GiB Device window).
+/// PCIe config apertures live here) — reading it would need a page-table write, which the NET-1 census
+/// will not do (STOP tripwire; NET-2 lifts this via `mmu_tegra::map_mmio_window`). See `mmu_tegra::init`
+/// (`L1[0]` = the low-1-GiB Device window).
+#[cfg(feature = "pcieprobe")]
 const GIB0_DEVICE_TOP: u64 = 0x4000_0000;
 
 /// Poison patterns that mean ABSENT DECODE, never "present" (PI-V3D-1 false-PASS lesson).
 ///  - `0xffffffff`: the PCIe master-abort / unclaimed-config return (no responder at that BDF).
 ///  - `0xdeadbeef`: firmware register/DRAM fill (the exact V3D false-PASS value).
+// Used by the NET-1 config read (`pcieprobe`) and the NET-2 metal link/device read (`pcie2`+`tegra`);
+// a `pcie2`-standalone virt-witness build does no MMIO, so it is compiled out there.
+#[cfg(any(feature = "pcieprobe", all(feature = "pcie2", feature = "tegra")))]
 #[inline]
 fn is_poison(v: u32) -> bool {
     v == 0xffff_ffff || v == 0xdead_beef
@@ -69,6 +74,7 @@ fn is_poison(v: u32) -> bool {
 /// A config-space `vendor:device` word is LIVE only if it is neither a poison fill nor the two
 /// all-decode-boundary values (`0x0000_0000` = powered-off/no responder, `0xffff_????` vendor =
 /// unclaimed). Returns `Some((vendor, device))` on a live decode, `None` on absent decode.
+#[cfg(any(feature = "pcieprobe", all(feature = "pcie2", feature = "tegra")))]
 #[inline]
 fn live_vendor_device(w: u32) -> Option<(u16, u16)> {
     if is_poison(w) {
@@ -206,6 +212,7 @@ impl<'a> CtrlProps<'a> {
 }
 
 /// Firmware-left state (`status = "okay"` and the config aperture) needed to gate the config read.
+#[cfg(feature = "pcieprobe")]
 struct EnabledDecode {
     okay: bool,
     /// The base of the `reg` region named "config" (or the DW `dbi` fallback), if resolvable.
@@ -215,6 +222,7 @@ struct EnabledDecode {
 
 /// Resolve whether the firmware left this controller ENABLED and where its config aperture sits.
 /// READ-ONLY: `status` string test + a `reg`/`reg-names` index lookup. Never touches MMIO.
+#[cfg(feature = "pcieprobe")]
 fn decode_enabled(p: &CtrlProps<'_>) -> EnabledDecode {
     // status absent defaults to "okay" per the DT spec, but for a bring-up census we are
     // conservative: only an explicit "okay" (or absent) counts as enabled; "disabled"/anything else
@@ -280,6 +288,7 @@ fn decode_enabled(p: &CtrlProps<'_>) -> EnabledDecode {
 /// Safety: `base` MUST have passed `gib_mapped(base>>30, ..)==true` (GiB-0 device window) — the
 /// caller enforces this. We still only read; a gated block would fault EL3-fatal (the JX1 lesson),
 /// which is why the caller gates on the firmware's own `status = "okay"` (the enable oracle) first.
+#[cfg(feature = "pcieprobe")]
 fn config_liveness_read(base: u64, kind: &str) {
     // BDF(0,0,0) offset 0 = [device:16 | vendor:16].
     let vd = unsafe { core::ptr::read_volatile(base as *const u32) };
@@ -340,6 +349,7 @@ fn config_liveness_read(base: u64, kind: &str) {
 /// The census entry point. Walk the DTB, dump every `pcie@` controller, and — for enabled
 /// controllers whose config aperture is already mapped — do a guarded, poison-rejecting liveness
 /// read. Graceful on any missing/foreign DTB (QEMU `virt` has a generic ecam, no Tegra234 RC).
+#[cfg(feature = "pcieprobe")]
 pub fn census(ctx: &PcieCtx) {
     serial_println!(
         "{} ORIN-NET-1 read-only PCIe/NIC census (DTB @{:#x} size={:#x}) ::",
@@ -519,4 +529,445 @@ pub fn census(ctx: &PcieCtx) {
     }
 
     serial_println!("{} ORIN-NET-1 census DONE (read-only; metal columns attended-pending) ::", P);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════════
+// ORIN-NET-2 — controller-0 link state + device enumeration (the `pcie2` feature).
+// ══════════════════════════════════════════════════════════════════════════════════════════════════
+//
+// NET-1's census named controller 0 (`/bus@0/pcie@140a0000`, domain 8) firmware-ENABLED with a full
+// `appl|config|atu_dma|dbi|ecam` reg map, then read the DOWNSTREAM `config` window (0x2a00_0000) and got
+// `0xffffffff` — an ABSENT DECODE meaning "nothing is answering below the root port", i.e. the link is
+// most likely DOWN. NET-2 answers the two questions that scope the real driver arc (NET-3): (1) is the
+// link up, and (2) WHAT DEVICE is behind it. Read-only, with ONE class of write permitted — kernel
+// page-table mappings — and poison-rejecting liveness on every read.
+//
+// **The NET-1 lesson corrected.** The downstream `config` window routes to the first downstream bus via
+// the controller's internal ATU and returns all-Fs when the link is down (or the CFG ATU region is
+// unset). The ROOT PORT'S OWN identity and LINK STATE do NOT live there — they live in the `dbi`
+// aperture (0x2a08_0000), the DesignWare RP's local config space, valid regardless of link state. So
+// NET-2 reads link state from DBI (the PCIe-capability Link Status register), not the downstream window.
+//
+// **The aperture map (metal census, r21b sitting).** appl `0x140a_0000`, config `0x2a00_0000`,
+// atu_dma `0x2a04_0000`, dbi `0x2a08_0000` all sit in the already-mapped GiB-0 device window; the
+// `ecam` whole-domain enumeration window (Tegra234: `0x2e_2000_0000`, 256 MiB) and the MMIO `ranges`
+// (`0x32_/0x35_…`, ~200 GiB) live ABOVE the tegra regime's 36-bit PS ceiling (64 GiB). Reaching the
+// ECAM for a full multi-bus enumeration is therefore the concrete NET-3 blocker `map_mmio_window`
+// reports (it needs a TCR_EL2.PS widen to 40-bit — a translation-regime change beyond a page-table
+// write, which a read-only recon arc records rather than performs). The scoped NET-2 walk (RP link
+// state via DBI + one level below via the already-mapped `config` window) needs no beyond-ceiling map.
+
+/// NET-2 serial prefix (still matches an `awk '/PCIE/'` sweep, but tags the link/device verdict as its
+/// own sub-block so the operator can separate it from the NET-1 census dump). The shared `dump_*`
+/// formatters keep the `:: PCIE:` prefix; only NET-2's own verdict lines carry `:: PCIE2:`.
+#[cfg(feature = "pcie2")]
+const P2: &str = ":: PCIE2:";
+
+/// Read a controller's `status` the NET-1 way, standalone (no `EnabledDecode`): absent or "okay"/"ok"
+/// ⇒ enabled; "disabled"/anything else ⇒ NOT enabled (no MMIO touch on a disabled controller).
+#[cfg(feature = "pcie2")]
+fn status_okay(p: &CtrlProps<'_>) -> bool {
+    match p.status {
+        None => true,
+        Some(s) => stringlist_has(s, b"okay") || stringlist_has(s, b"ok"),
+    }
+}
+
+/// Resolve the `[base, size)` of the `reg` region named `want` (e.g. `b"dbi"`) by walking `reg-names`
+/// in order and indexing `reg` (4 cells = addr:2 + size:2 per region, big-endian). READ-ONLY DTB decode.
+#[cfg(feature = "pcie2")]
+fn region_by_name(p: &CtrlProps<'_>, want: &[u8]) -> Option<(u64, u64)> {
+    let (reg, names) = (p.reg?, p.reg_names?);
+    let mut idx = 0usize;
+    for item in names.split(|&b| b == 0) {
+        if item.is_empty() {
+            continue;
+        }
+        if item == want {
+            let off = idx * 16;
+            let b = reg.get(off..off + 16)?;
+            let a_hi = u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as u64;
+            let a_lo = u32::from_be_bytes([b[4], b[5], b[6], b[7]]) as u64;
+            let s_hi = u32::from_be_bytes([b[8], b[9], b[10], b[11]]) as u64;
+            let s_lo = u32::from_be_bytes([b[12], b[13], b[14], b[15]]) as u64;
+            return Some(((a_hi << 32) | a_lo, (s_hi << 32) | s_lo));
+        }
+        idx += 1;
+    }
+    None
+}
+
+/// ORIN-NET-2 entry point. Focuses on CONTROLLER 0 (the first `pcie@` node — `pcie@140a0000` on the
+/// Orin devkit): dump its DTB reg map, reach its config/ECAM aperture via the kernel page-table path,
+/// read link state from DBI, and — if the link is up — walk bus 0 dev 0 and one level below. Graceful
+/// on any missing/foreign DTB (the QEMU `virt` witness: `dtb_addr=0` on the GICv3 path, or a generic
+/// ecam with no Tegra234 RC ⇒ skip before any MMIO).
+#[cfg(feature = "pcie2")]
+pub fn census2(ctx: &PcieCtx) {
+    serial_println!(
+        "{} ORIN-NET-2 controller-0 link + device recon (DTB @{:#x} size={:#x}) ::",
+        P2, ctx.dtb_addr, ctx.dtb_size
+    );
+    if ctx.dtb_addr == 0 || ctx.dtb_size == 0 {
+        serial_println!("{} no DTB handed off — recon SKIPPED (graceful) ::", P2);
+        return;
+    }
+    let g_lo = ctx.dtb_addr >> 30;
+    let g_hi = (ctx.dtb_addr + ctx.dtb_size as u64 - 1) >> 30;
+    if !gib_mapped(g_lo, ctx.ram_gib_mask) || !gib_mapped(g_hi, ctx.ram_gib_mask) {
+        serial_println!("{} DTB in an unmapped GiB — recon SKIPPED (graceful) ::", P2);
+        return;
+    }
+    let blob = unsafe { core::slice::from_raw_parts(ctx.dtb_addr as *const u8, ctx.dtb_size) };
+    let Some(fdt) = Fdt::new(blob) else {
+        serial_println!("{} DTB header invalid — recon SKIPPED (graceful) ::", P2);
+        return;
+    };
+
+    // Controller 0 = the FIRST `pcie@` node (dedup not needed — we stop at the first).
+    const PATH_CAP: usize = 160;
+    let mut path0 = [0u8; PATH_CAP];
+    let mut plen0 = 0usize;
+    let mut found = false;
+    fdt.for_each_prop(|e| {
+        if found || !leaf(e.path).starts_with(b"pcie@") {
+            return;
+        }
+        let l = e.path.len().min(PATH_CAP);
+        path0[..l].copy_from_slice(&e.path[..l]);
+        plen0 = l;
+        found = true;
+    });
+    if !found {
+        serial_println!(
+            "{} no `pcie@` controllers in the DTB — no Tegra234 PCIe RC (graceful; QEMU virt / no-net) ::",
+            P2
+        );
+        return;
+    }
+    let path = &path0[..plen0];
+    serial_println!(
+        "{} controller 0: /{} ::",
+        P2,
+        core::str::from_utf8(&path[1..]).unwrap_or("<non-utf8>")
+    );
+
+    // Capture its props in one walk (full dump, mirroring the NET-1 census fields).
+    let mut props = CtrlProps::empty();
+    fdt.for_each_prop(|e| {
+        if e.path != path {
+            return;
+        }
+        let val = &blob[e.val_off..e.val_off + e.val_len];
+        match e.name {
+            b"compatible" => props.compatible = Some(val),
+            b"device_type" => props.device_type = Some(val),
+            b"status" => props.status = Some(val),
+            b"reg" => props.reg = Some(val),
+            b"reg-names" => props.reg_names = Some(val),
+            b"ranges" => props.ranges = Some(val),
+            b"interrupt-map" => props.interrupt_map = Some(val),
+            b"interrupts" => props.interrupts = Some(val),
+            b"num-lanes" => props.num_lanes = Some(val),
+            b"phy-names" => props.phy_names = Some(val),
+            b"power-domains" => props.power_domains = Some(val),
+            b"linux,pci-domain" => props.linux_pci_domain = Some(val),
+            _ => {}
+        }
+    });
+
+    if let Some(v) = props.compatible {
+        dump_str_or_words("compatible", v);
+    }
+    if let Some(v) = props.device_type {
+        dump_str_or_words("device_type", v);
+    }
+    if let Some(v) = props.linux_pci_domain {
+        dump_words("linux,pci-domain", v);
+    }
+    if let Some(v) = props.status {
+        dump_str_or_words("status", v);
+    } else {
+        serial_println!("{}   status = (absent => \"okay\" per DT spec) ::", P2);
+    }
+    if let Some(v) = props.reg_names {
+        dump_str_or_words("reg-names", v);
+    }
+    if let Some(v) = props.reg {
+        dump_words("reg", v);
+    }
+    if let Some(v) = props.ranges {
+        dump_words("ranges", v);
+    }
+    if let Some(v) = props.num_lanes {
+        dump_words("num-lanes", v);
+    }
+    if let Some(v) = props.phy_names {
+        dump_str_or_words("phy-names", v);
+    }
+    if let Some(v) = props.power_domains {
+        dump_words("power-domains", v);
+    }
+    if let Some(v) = props.interrupts {
+        dump_words("interrupts", v);
+    }
+    if let Some(v) = props.interrupt_map {
+        serial_println!("{}   interrupt-map = present ({} bytes) ::", P, v.len());
+    }
+
+    let is_tegra_rc = props
+        .compatible
+        .map(|c| {
+            contains(c, b"tegra234-pcie")
+                || contains(c, b"tegra194-pcie")
+                || contains(c, b"snps,dw-pcie")
+        })
+        .unwrap_or(false);
+    let okay = status_okay(&props);
+    serial_println!("{}   enabled(firmware)={} tegra-RC={} ::", P2, okay, is_tegra_rc);
+    if !is_tegra_rc {
+        serial_println!(
+            "{}   controller 0 is not a Tegra234 DesignWare RC (generic ecam / foreign) — link/device recon SKIPPED (graceful; QEMU virt) ::",
+            P2
+        );
+        return;
+    }
+    if !okay {
+        serial_println!(
+            "{}   controller 0 left DISABLED by firmware — no link/device recon (bringing it up is a power/enable write => NET-3) ::",
+            P2
+        );
+        return;
+    }
+
+    let dbi = region_by_name(&props, b"dbi");
+    let cfg = region_by_name(&props, b"config");
+    let ecam = region_by_name(&props, b"ecam");
+    let appl = region_by_name(&props, b"appl");
+    if let Some((b, s)) = appl {
+        serial_println!("{}   region appl   = {:#x} (+{:#x}) ::", P2, b, s);
+    }
+    if let Some((b, s)) = dbi {
+        serial_println!("{}   region dbi    = {:#x} (+{:#x}) ::", P2, b, s);
+    }
+    if let Some((b, s)) = cfg {
+        serial_println!("{}   region config = {:#x} (+{:#x}) ::", P2, b, s);
+    }
+    if let Some((b, s)) = ecam {
+        serial_println!("{}   region ecam   = {:#x} (+{:#x}) ::", P2, b, s);
+    }
+
+    // The MMIO mapping + reads are real Tegra hardware touches — tegra build only. On the virt witness
+    // build we never reach here (the generic ecam is not a tegra-RC), so the block is compiled out.
+    #[cfg(feature = "tegra")]
+    net2_link_and_device(dbi, cfg, ecam);
+    #[cfg(not(feature = "tegra"))]
+    {
+        let _ = (dbi, cfg, ecam);
+        serial_println!(
+            "{}   (non-tegra build: MMIO link/device recon not compiled — DTB scope only) ::",
+            P2
+        );
+    }
+
+    serial_println!(
+        "{} ORIN-NET-2 controller-0 recon DONE (read-only; page-table mappings the only writes) ::",
+        P2
+    );
+}
+
+/// The metal half of NET-2 (tegra build only): map/reach controller-0's apertures via the kernel
+/// page-table path (M1), read link state from the RP's DBI config space (M2), and — if the link is up —
+/// walk the downstream device one level below (M2b). Every read is poison-rejecting; the ONLY writes are
+/// the Device-nGnRE page-table descriptors `map_mmio_window` installs. No fabric/config/BAR write, no
+/// link retrain, no BAR sizing.
+#[cfg(all(feature = "pcie2", feature = "tegra"))]
+fn net2_link_and_device(
+    dbi: Option<(u64, u64)>,
+    cfg: Option<(u64, u64)>,
+    ecam: Option<(u64, u64)>,
+) {
+    use super::mmu_tegra::{map_mmio_window, MmioMap};
+
+    // ── M1: reach the config/ECAM apertures via the EXISTING kernel page-table path ──
+    let report_map = |name: &str, region: Option<(u64, u64)>| -> Option<u64> {
+        let (base, size) = region?;
+        match map_mmio_window(base, size as usize) {
+            MmioMap::AlreadyMapped => {
+                serial_println!(
+                    "{}   map {} {:#x} (+{:#x}): ALREADY MAPPED (GiB-0/1 device window) — readable ::",
+                    P2, name, base, size
+                );
+                Some(base)
+            }
+            MmioMap::Mapped => {
+                serial_println!(
+                    "{}   map {} {:#x} (+{:#x}): MAPPED Device-nGnRE (new page-table block) — readable ::",
+                    P2, name, base, size
+                );
+                Some(base)
+            }
+            MmioMap::BeyondPsCeiling => {
+                serial_println!(
+                    "{}   map {} {:#x} (+{:#x}): BEYOND the 36-bit PS ceiling (GiB {} >= 64) — reaching it needs a TCR_EL2.PS widen to 40-bit, beyond a page-table write (STOP tripwire) => NET-3 must widen the tegra regime first ::",
+                    P2, name, base, size, base >> 30
+                );
+                None
+            }
+        }
+    };
+    let dbi_base = report_map("dbi", dbi);
+    let cfg_base = report_map("config", cfg);
+    let _ecam_base = report_map("ecam", ecam);
+
+    // ── M2: link state from the RP's DBI config space (READ-ONLY, always valid regardless of link) ──
+    let Some(dbi_base) = dbi_base else {
+        serial_println!("{}   no reachable dbi aperture — link state UNREAD (NET-3) ::", P2);
+        return;
+    };
+    // BDF(0,0,0) at the RP = DBI base. Poison-reject the identity word first (PI-V3D-1 rule).
+    let vd = unsafe { core::ptr::read_volatile(dbi_base as *const u32) };
+    serial_println!("{}   RP dbi[0x00] = {:#010x} ::", P2, vd);
+    let Some((vendor, device)) = live_vendor_device(vd) else {
+        serial_println!(
+            "{}   RP ABSENT DECODE (poison/unclaimed) — controller powered down post-UEFI? link state UNREAD; STOP-record (RAS-safe: no further touch) ::",
+            P2
+        );
+        return;
+    };
+    serial_println!("{}   RP LIVE: vendor={:#06x} device={:#06x} ::", P2, vendor, device);
+    let cr = unsafe { core::ptr::read_volatile((dbi_base + 0x08) as *const u32) };
+    if !is_poison(cr) {
+        serial_println!(
+            "{}   RP class={:#04x} subclass={:#04x} progif={:#04x} rev={:#04x} ::",
+            P2,
+            (cr >> 24) & 0xff,
+            (cr >> 16) & 0xff,
+            (cr >> 8) & 0xff,
+            cr & 0xff
+        );
+    }
+    let ht = unsafe { core::ptr::read_volatile((dbi_base + 0x0c) as *const u32) };
+    if !is_poison(ht) {
+        serial_println!(
+            "{}   RP header-type={:#04x} (bit7=multifn; low7: 1=bridge) ::",
+            P2,
+            (ht >> 16) & 0xff
+        );
+    }
+
+    // Walk the RP capability list to the PCIe capability (id 0x10) and read Link Status.
+    let statusw = unsafe { core::ptr::read_volatile((dbi_base + 0x04) as *const u32) };
+    let has_caps = (statusw >> 16) & (1 << 4) != 0; // Status.CapabilitiesList = bit 4 of the 16-bit status
+    let mut ptr = if has_caps {
+        (unsafe { core::ptr::read_volatile((dbi_base + 0x34) as *const u32) } & 0xff) as u64
+    } else {
+        0
+    };
+    let mut pcie_cap: u64 = 0;
+    let mut hops = 0;
+    while has_caps && ptr >= 0x40 && ptr < 0x100 && hops < 48 {
+        let h = unsafe { core::ptr::read_volatile((dbi_base + ptr) as *const u32) };
+        if is_poison(h) {
+            break;
+        }
+        let id = h & 0xff;
+        let next = (h >> 8) & 0xff;
+        if id == 0x10 {
+            pcie_cap = ptr;
+            break;
+        }
+        if next == 0 || next as u64 == ptr {
+            break;
+        }
+        ptr = next as u64;
+        hops += 1;
+    }
+
+    let mut link_up = false;
+    if pcie_cap != 0 {
+        let linkcap = unsafe { core::ptr::read_volatile((dbi_base + pcie_cap + 0x0c) as *const u32) };
+        let linkctlsta = unsafe { core::ptr::read_volatile((dbi_base + pcie_cap + 0x10) as *const u32) };
+        if !is_poison(linkctlsta) {
+            let lsta = linkctlsta >> 16; // Link Status is the high 16 bits of the Link Control/Status dword
+            let cur_speed = lsta & 0xf;
+            let cur_width = (lsta >> 4) & 0x3f;
+            let dllla = (lsta >> 13) & 1; // Data Link Layer Link Active
+            let max_speed = linkcap & 0xf;
+            let max_width = (linkcap >> 4) & 0x3f;
+            link_up = dllla == 1;
+            serial_println!(
+                "{}   PCIe cap @ {:#x}: LinkCap max(gen{},x{}) LinkStatus cur(gen{},x{}) DLL-active={} => LINK {} ::",
+                P2, pcie_cap, max_speed, max_width, cur_speed, cur_width, dllla,
+                if link_up { "UP" } else { "DOWN" }
+            );
+        } else {
+            serial_println!("{}   PCIe cap Link Status read poison — link state INDETERMINATE ::", P2);
+        }
+    } else {
+        serial_println!("{}   no PCIe capability in RP config space — link state UNREAD ::", P2);
+    }
+
+    // ── M2b: one level below — only if the link is up ──
+    if !link_up {
+        serial_println!(
+            "{}   link DOWN as-left-by-firmware => NO device enumerable below the root port. NET-3 scope: bring up / retrain the link (appl + PHY / LTSSM), then enumerate. ::",
+            P2
+        );
+        return;
+    }
+    // Link up: the downstream device (bus1:dev0:fn0) is reachable through the `config` window (the
+    // controller's iATU routes it) IF firmware left the CFG ATU region set. Poison-reject the read.
+    let Some(cfg_base) = cfg_base else {
+        serial_println!(
+            "{}   link UP but no reachable config window — downstream walk needs the ECAM (NET-3) ::",
+            P2
+        );
+        return;
+    };
+    let dv = unsafe { core::ptr::read_volatile(cfg_base as *const u32) };
+    serial_println!("{}   bus1:dev0:fn0 config[0x00] = {:#010x} ::", P2, dv);
+    let Some((dvendor, ddevice)) = live_vendor_device(dv) else {
+        serial_println!(
+            "{}   downstream ABSENT DECODE — no device answering (or the iATU CFG region is unset; programming it is a fabric write => NET-3) ::",
+            P2
+        );
+        return;
+    };
+    serial_println!(
+        "{}   DEVICE FOUND below RP: vendor={:#06x} device={:#06x} ::",
+        P2, dvendor, ddevice
+    );
+    let dcr = unsafe { core::ptr::read_volatile((cfg_base + 0x08) as *const u32) };
+    if !is_poison(dcr) {
+        serial_println!(
+            "{}   device class={:#04x} subclass={:#04x} progif={:#04x} rev={:#04x} ::",
+            P2,
+            (dcr >> 24) & 0xff,
+            (dcr >> 16) & 0xff,
+            (dcr >> 8) & 0xff,
+            dcr & 0xff
+        );
+    }
+    let dht = unsafe { core::ptr::read_volatile((cfg_base + 0x0c) as *const u32) };
+    if !is_poison(dht) {
+        serial_println!("{}   device header-type={:#04x} ::", P2, (dht >> 16) & 0xff);
+    }
+    // BAR0..5 raw (READ only; sizes UNKNOWN — the BAR-sizing write ritual is NET-3 territory).
+    let mut bar = 0x10u64;
+    let mut i = 0;
+    while i < 6 {
+        let v = unsafe { core::ptr::read_volatile((cfg_base + bar) as *const u32) };
+        serial_println!(
+            "{}   device BAR{} [{:#04x}] = {:#010x} (size UNKNOWN — no BAR sizing write){} ::",
+            P2, i, bar, v,
+            if is_poison(v) { " (poison/unimpl)" } else { "" }
+        );
+        bar += 4;
+        i += 1;
+    }
+    serial_println!(
+        "{}   downstream device identified read-only; BAR sizing + driver bind = NET-3 ::",
+        P2
+    );
 }

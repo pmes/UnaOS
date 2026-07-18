@@ -4616,6 +4616,106 @@ byte-identity re-proven (same-path rebuild vs base `45a06b2` hashes equal; zero 
 knob-off AND knob-on — the knob-on run witnesses the graceful skip); `kernel8-test 35` 0-FAIL (29
 PASS); `esp-jetson` links. Bench runbook: `scripts/orin-net1-bench.md`.
 
+### ORIN-NET-2 — controller-0 link + device enumeration (`UNAOS_PCIE2`, knob-gated; the last recon before a driver)
+
+NET-1's census named **controller 0** (`/bus@0/pcie@140a0000`, domain 8) firmware-ENABLED with a full
+`appl|config|atu_dma|dbi|ecam` reg map, then read the downstream `config` window (`0x2a00_0000`) and got
+`0xffffffff` — an ABSENT DECODE. NET-2 answers the two questions that scope the real driver arc (NET-3):
+**is the link up, and WHAT DEVICE is behind it** (the NIC hypothesis). It is read-mostly recon: the ONLY
+writes it performs are kernel page-table mappings; no fabric/config/BAR writes, no link retraining, no
+BAR sizing, no device programming — with poison-rejecting liveness on every read.
+
+All code extends `arch/aarch64/pcie_probe.rs` behind the `pcie2` cargo feature (`UNAOS_PCIE2=1`),
+standalone (does NOT imply `tegra`, mirroring `pcieprobe`) so the recon runs on BOTH the metal tegra path
+(`+UNAOS_TEGRA=1`) and the QEMU `virt` GICv3 witness. Two knob-gated call sites (`census2`) sit exactly
+where NET-1's do: `tegra_early_stop` (metal, after the heap + MMU, before the JB2b xHCI work) and the
+virt GICv3 block (witness). Knob-off, the module + both sites vanish (see the byte-identity note below).
+
+**The NET-1 lesson corrected — read link state from DBI, not the downstream window.** On the DesignWare
+Tegra234 root complex the downstream `config` window routes to the first downstream bus via the
+controller's internal ATU and returns all-Fs when the link is down (or the CFG ATU region is unset) —
+which is exactly what NET-1 saw. The **root port's own identity and link state do not live there**; they
+live in the **`dbi`** aperture (`0x2a08_0000`), the RP's local config space, valid regardless of link
+state. So NET-2 reads link state from DBI: it walks the RP capability list to the **PCIe capability**
+(id `0x10`) and decodes **Link Status** — negotiated speed/width and the **Data-Link-Layer-Link-Active**
+bit — the definitive "is the link up" answer, plus Link Capabilities (max speed/width) and the RP's
+vendor/device/class/header-type. If DLL-active (link up), it then reads one level below (bus1:dev0:fn0
+through the already-mapped `config` window), poison-rejecting, decoding vendor/device/class/header-type
+and BAR0..5 **raw** (sizes reported UNKNOWN — the BAR-sizing write ritual is NET-3 territory).
+
+**M1 — the Device-nGnRE MMIO mapper, and the PS-ceiling finding.** `mmu_tegra::map_mmio_window(pa, size)`
+reaches an aperture for a read-only walk via the EXISTING kernel page-table path — the same L1-block
+mechanism `map_fb_region` uses, but Device-nGnRE and idempotent against the already-mapped peripheral
+windows, patching BOTH the live EL2 `L1` and the EL1-precise twin so the window survives a JM6 drop. It
+returns `AlreadyMapped` / `Mapped` / `BeyondPsCeiling`. Applied to controller 0's apertures (metal reg
+values from the r21b sitting):
+
+| region | base | in GiB-0 device window? | reach |
+|---|---|---|---|
+| `appl` | `0x140a_0000` | yes | AlreadyMapped |
+| `config` | `0x2a00_0000` | yes | AlreadyMapped |
+| `atu_dma` | `0x2a04_0000` | yes | AlreadyMapped |
+| `dbi` | `0x2a08_0000` | yes | AlreadyMapped |
+| `ecam` | `0x2e_2000_0000` (Tegra234, 256 MiB) | **no — ~184 GiB** | **BeyondPsCeiling** |
+
+The scoped NET-2 walk (RP link state via `dbi` + one level below via `config`) needs **no new mapping** —
+all four low apertures fall inside the GiB-0 Device window `L1[0]` already maps. The **ECAM** whole-domain
+enumeration window, and the MMIO `ranges` (`0x32_/0x35_…`, ~200–213 GiB), live **above the tegra regime's
+36-bit PS output ceiling** (`TCR_EL2_VAL` PS = `0b001` = 64 GiB). A block descriptor there raises an
+address-size fault, and reaching it needs a **TCR_EL2.PS widen to 40-bit** — a translation-regime change
+**beyond a page-table write**. Per the arc's STOP tripwire, `map_mmio_window` **refuses** that (returns
+`BeyondPsCeiling`, no descriptor written) and records it as the concrete NET-3 prerequisite rather than
+performing it. So the mapper's writes-permitted budget is a ceiling, not a requirement: on controller 0
+it installs **zero** new descriptors (low apertures already mapped, ECAM refused) — an honest, in-scope
+outcome.
+
+**The poison-rejection rule (PI-V3D-1)** carries over unchanged: `is_poison()` rejects both `0xffffffff`
+and `0xdeadbeef` on every DBI/config read; an absent RP decode is a STOP-record (RAS-safe: no further
+touch), never a false "present".
+
+**Read-only invariant (the arc's review lens).** Every access is a `read_volatile` (DBI/config space) or
+a DTB byte read; the only writes are the Device-nGnRE page-table descriptors `map_mmio_window` would
+install (and on controller 0 it installs none). No config/BAR/command write, no `SET_*` MRQ, no link
+retrain, no BAR sizing. Any RAS/SError, or any step that would need a write beyond kernel page tables
+(the PS widen), is a STOP-record + leave-un-walked, not a workaround.
+
+**QEMU vs metal — the honesty boundary.** On the `virt` GICv3 path the UEFI handoff leaves
+`boot_info.dtb_addr = 0`, so `census2`'s only observable QEMU effect is the graceful-skip line, then
+CAPSTONE completes unchanged (witnessed):
+
+```
+:: PCIE2: ORIN-NET-2 controller-0 link + device recon (DTB @0x0 size=0x0) ::
+:: PCIE2: no DTB handed off — recon SKIPPED (graceful) ::
+```
+
+Everything past the DTB scope (the DBI link-status read, the RP identity, the device below) is
+**ATTENDED-METAL-PENDING** — controller 0's live registers exist only on real Orin silicon, and NET-1's
+metal evidence (`config` = all-Fs) strongly predicts the link is **DOWN** as-left-by-firmware, i.e. the
+expected metal verdict is "link down, RP = ⟨vendor/device⟩, no device enumerable below." The recon is
+staged as a tar for an attended sitting (`scripts/orin-net2-bench.md`).
+
+**The NET-3 scope this implies.** (1) **Widen the tegra translation regime's PS to 40-bit** so the ECAM
+(`0x2e_2000_0000`) and the MMIO `ranges` (~200 GiB) become mappable — the prerequisite for any
+multi-bus enumeration or BAR assignment. (2) If the link is down, **bring it up / retrain** (appl + PHY
+programming, LTSSM) — the first *write* to the fabric, which this read-only arc does not do. (3) Then
+enumerate, size BARs, and bind a driver.
+
+**Byte-identity (knob-off) — the ratified 1-byte Location class, objcopy-verified + disclosed.** Knob-off
+the `pcie2` module + both call sites are compiled out, but the two gated `#[cfg]` blocks in `main.rs`
+occupy source lines, shifting the `#[track_caller]` Location line number of the `jb2b_attach` call below
+them by +24 (the count of inserted lines). Verified per-section against baseline `922ab1ce` (knob-off
+`esp-jetson kernel.elf`): `.text`, `.rodata`, `.data`, `.got` are **byte-identical**; `.data.rel.ro`
+differs by **exactly one byte** — a single `core::panic::Location` `line` field, `1378 → 1402`
+(low byte `0x62 → 0x7a`). The rest of the ELF delta is non-loaded DWARF line info. The **loadable,
+executable image is unchanged** but for that one Location literal; `tegra:` count 109, zero `PCIE2`
+strings knob-off.
+
+**Gates green.** `./arroyo check` both arches × {knob-off, `PCIE2`, `PCIE2`+`TEGRA`} (zero net-new
+warnings on every combo); `test-arm 22` MISSION SUCCESS; `UNAOS_GICV3=1 test-arm 40` CAPSTONE 6/6 + 3/3
+secondaries + idle/busy heartbeat + VUG-HONESTY PASS (both knob-off AND `PCIE2`-on — the knob-on run
+witnesses the graceful skip); `kernel8-test` 0-FAIL; `esp-jetson` (+`UNAOS_PCIE2=1`) links. Bench
+runbook: `scripts/orin-net2-bench.md`.
+
 ### ORIN-SMP idle-heartbeat — the parked-core pinned-bar fix (per-core telemetry honesty)
 
 > Numbering note: the spawning round labelled this arc "SMP-6", but SMP-6/7/8 are already merged
