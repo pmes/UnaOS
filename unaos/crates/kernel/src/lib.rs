@@ -51,7 +51,11 @@ pub mod selftest;
 // compiles on both arches under `installdemo` (UNAOS_INSTALLDEMO=1); its witness `run_demo` is invoked
 // only from the x86_64 boot path this arc (the QEMU scratch disk is x86). Default OFF => the module +
 // its call site vanish and every image is byte-identical to baseline. See docs/dev/OS/10_INSTALL/.
-#[cfg(feature = "installdemo")]
+// ORIN-INSTALL-1 (`install_target`) also needs the engine: the aarch64 microSD installer flow drives
+// this same arch-neutral module, so either feature brings it in (its `run_demo` x86 witness stays
+// `installdemo`-only; on an `install_target`-only build the module is compiled and driven from
+// `arch::sdmmc_tegra`, no x86 witness call site).
+#[cfg(any(feature = "installdemo", feature = "install_target"))]
 pub mod install;
 
 // FLIGHT-RECORDER: capture the serial boot log into a bounded ring and flush it to UNAOS.LOG on the

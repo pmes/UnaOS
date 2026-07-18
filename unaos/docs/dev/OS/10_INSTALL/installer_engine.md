@@ -1,6 +1,7 @@
 # INSTALL-CORE — the storage-agnostic installer engine
 
 Status: QEMU-proven on a scratch block device (x86_64), 2026-07-18. Arc INSTALL-CORE.
+Wired to the Orin microSD (metal-pending) by **INSTALL-1** (§INSTALL-1 below; `UNAOS_INSTALL_TARGET_SD=1`).
 Knob: `UNAOS_INSTALLDEMO=1` (feature `installdemo`), default OFF. Module: `crates/kernel/src/install/`.
 
 ## What it is
@@ -150,9 +151,41 @@ purpose: this point is a serial burst boundary — the first prints after the bl
 where the console reliably drops the second of two back-to-back, pre-I/O writes; every later `INSTALL`
 line is separated from the previous by real block I/O, which spaces them safely.)
 
-## What this arc did NOT do (next rungs)
+## §INSTALL-1 — the engine wired to the Orin microSD (the first real installer flow)
 
-- No real-hardware write path (Orin SDMMC / Pi emmc2 / x86 USB stick) — the engine is target-agnostic
-  and proven; wiring a real `InstallTarget` and cloning an actual boot volume is the next rung.
-- The scratch disk is the *only* device the engine touches; it never clones the running system's boot
-  tree yet (that is INSTALL-1 in the line seed).
+**Landed 2026-07-18** (aarch64/tegra; metal-pending). `UNAOS_INSTALL_TARGET_SD=1` (feature `install_target`,
+⇒ `sdmmc_arm` ⇒ `sdmmc`), default OFF. Glue: `crates/kernel/src/arch/aarch64/sdmmc_tegra.rs`
+(`SdInstallTarget` + `install_to_sd`). Full aarch64 detail: `arch_arm64.md` §ORIN-INSTALL-1.
+
+INSTALL-1 points the (unchanged) engine at a REAL card for the first time: boot from the USB stick, install
+UnaOS onto the seated microSD from inside UnaOS. The engine's `InstallTarget` trait is the whole seam — the SD
+side implements it over the rung-2 armed single-block CMD24/CMD17 path, and the engine's `write_gpt` /
+`format_esp` / `write_payload_file` / `verify_extents` run verbatim.
+
+**Additive-only engine changes** (write/verify semantics untouched):
+- `verify_extents` is now `pub` so the SD flow verifies through the SAME primitive the x86 witness trusts.
+- `fat32::blank_region_sectors(esp_sectors)` — a new pub helper returning the exact leading-ESP sector count
+  (reserved + both FAT copies) the formatter's blank-precondition requires to be zero. The demo target is
+  always blank so it never zeroes; a real (possibly non-blank) card must zero exactly this region first.
+
+**Escalation ladder (three gates).** Unlike the engine demo's blank-only `blank_check` refusal, an installer
+handles a non-blank card: it does not refuse, it **announces what it will destroy** (sector-0 class + card
+CID) behind a third `install_target` destructive-confirmation gate, then zeroes the metadata region and runs
+the flow: GPT → zero-ESP-metadata → FAT32 → payload copy → sha extent-verify → `SD install … => PASS`.
+
+**Payload (M2).** At the pre-xHCI-takeover install site the USB boot stick is not yet a block device, so
+self-read of the running boot volume is unreachable this arc; v1 writes a generated `UNAOS.IMG` marker and the
+**self-clone is the named follow-up, INSTALL-2**.
+
+**Witness.** On virt (both arches) the flow is compiled-present-metal-only (one honest line). On x86 the
+`UNAOS_INSTALLDEMO` witness above still covers the engine end-to-end. The tegra flow's **first execution is
+the attended Orin sitting** (runbook `scripts/orin-sdmmc1-bench.md`, install leg; landing
+`review/unaos-install1-LANDING.md`).
+
+## What later rungs still owe
+
+- **INSTALL-2 (self-clone):** copy the running system's own boot volume as the payload (needs the boot media
+  readable as a block device at the install site — a post-takeover install position or a second block backend).
+- **Cross-platform:** the same `InstallTarget` generalizes to Pi `emmc2` and an x86 USB stick (installer_engine
+  line seed rung 4).
+- **Throughput:** multi-block CMD25/CMD18 on the SD path (single-block is correct but slower on the zero pass).

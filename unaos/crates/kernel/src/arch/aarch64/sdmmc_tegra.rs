@@ -82,6 +82,15 @@ pub fn sdmmc_census(_dtb_addr: u64, _dtb_size: usize, _ram_gib_mask: u64) {
         "{} ORIN-SDMMC-2 write ladder ARMED (UNAOS_SDMMC_ARM=1) but metal-only — no Tegra234 SDMMC on this build (QEMU virt); zero card writes here ::",
         PS
     );
+    // ORIN-INSTALL-1: when the third destructive gate is compiled in on a virt build, one honest
+    // metal-only line — the installer flow drives a real Tegra234 SDMMC controller QEMU does not model, so
+    // there is nothing to install here and we do zero MMIO. The engine itself is proven on x86 (the
+    // UNAOS_INSTALLDEMO witness); the full SD flow's first execution is the attended Orin sitting.
+    #[cfg(feature = "install_target")]
+    serial_println!(
+        "{} ORIN-INSTALL-1 third gate (UNAOS_INSTALL_TARGET_SD=1) compiled-present but metal-only — no Tegra234 SDMMC on this build (QEMU virt); no install here ::",
+        PS
+    );
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════════
@@ -310,6 +319,11 @@ mod metal {
         block_addressing: bool, // ccs: true = SDHC/SDXC block addressing, false = SDSC byte
         num_blocks: u64,
         csd_version: u8,
+        // The raw CMD2 R2 response, retained so the installer can re-announce the identity in its
+        // about-to-destroy line. `install_target`-gated so a plain `sdmmc`/`sdmmc_arm` build stores no
+        // extra field and stays byte-identical to the merged rung-1/rung-2 recon.
+        #[cfg(feature = "install_target")]
+        cid: [u32; 4],
     }
 
     /// M2: run the SDHCI identification ladder (READ-ONLY to the card) against `base`, learning the CID,
@@ -433,7 +447,13 @@ mod metal {
             PS, rca
         );
 
-        Some(Card { block_addressing, num_blocks, csd_version })
+        Some(Card {
+            block_addressing,
+            num_blocks,
+            csd_version,
+            #[cfg(feature = "install_target")]
+            cid,
+        })
     }
 
     /// Decode + print the CID (SD Physical Layer §5.1): MID (manufacturer), OID (2 ASCII), PNM (5 ASCII
@@ -825,6 +845,183 @@ mod metal {
         buf[32..40].copy_from_slice(&lba.to_le_bytes());
     }
 
+    // ══════════════════════════════════════════════════════════════════════════════════════════════════
+    // ORIN-INSTALL-1 — the first real installer flow: drive the arch-neutral installer ENGINE
+    // (`crate::install`: GPT writer + FAT32 formatter + sha extent-verify) onto the SEATED microSD via the
+    // rung-2 armed single-block write primitives. `install_target`-gated (implies `sdmmc_arm` ⇒ `sdmmc`):
+    // EVERY line below this marker is compiled out unless UNAOS_INSTALL_TARGET_SD=1, so a plain
+    // `sdmmc`/`sdmmc_arm` build is byte-identical to the merged recon/ladder.
+    //
+    // THE THREE-GATE ESCALATION LADDER (the seated card is sacred; a real install is the most destructive
+    // act in the tree, so it stands behind three independent gates):
+    //   Gate 1 — `sdmmc`         : the controller is up and the card CENSUS succeeded (we hold a `Card`).
+    //   Gate 2 — `sdmmc_arm`     : the rung-2 armed write path (CMD24) is compiled in.
+    //   Gate 3 — `install_target`: THIS flag, the explicit DESTRUCTIVE-CONFIRMATION gate. On metal the
+    //                              future UX asks the operator; this arc the knob stands in for that, and
+    //                              the flow prints exactly what it is about to destroy (sector-0
+    //                              classification + the card's CID identity) BEFORE the first write.
+    // Unlike the engine's blank-only demo law, an installer must handle a NON-blank card: we do not refuse
+    // it — we announce it, then re-establish the FAT blank-precondition by zeroing exactly the ESP metadata
+    // region (`fat32::blank_region_sectors`) before formatting. The engine's verified write/verify
+    // semantics are untouched — this module only supplies the block target + the zero pass + the announce.
+    // ══════════════════════════════════════════════════════════════════════════════════════════════════
+
+    /// An `InstallTarget` over the rung-2 armed single-block SD write path. Sector granularity; every
+    /// method loops the proven `read_block_at` / `write_block_at` CMD17/CMD24 primitives (no multi-block
+    /// CMD18/CMD25 — see the M2 note in the flow; the engine needs correctness, not throughput, and the
+    /// single-block primitives are the ones rung-2 verified on metal).
+    #[cfg(feature = "install_target")]
+    struct SdInstallTarget<'a> {
+        base: u64,
+        card: &'a Card,
+    }
+
+    #[cfg(feature = "install_target")]
+    impl crate::install::InstallTarget for SdInstallTarget<'_> {
+        fn capacity_sectors(&self) -> u64 {
+            self.card.num_blocks
+        }
+
+        fn id(&self) -> alloc::string::String {
+            let mid = r2_bits(&self.card.cid, 127, 120) as u8;
+            let psn = r2_bits(&self.card.cid, 55, 24) as u32;
+            alloc::format!(
+                "Orin microSD (MID {:#04x}, serial {:#010x}, {} x 512B sectors)",
+                mid, psn, self.card.num_blocks
+            )
+        }
+
+        fn read_sectors(&self, lba: u64, buf: &mut [u8]) -> Result<(), crate::install::InstallError> {
+            debug_assert!(buf.len() % 512 == 0);
+            for (i, chunk) in buf.chunks_mut(512).enumerate() {
+                let mut sec = [0u8; 512];
+                if !read_block_at(self.base, self.card, lba + i as u64, &mut sec) {
+                    return Err(crate::install::InstallError::Io);
+                }
+                chunk.copy_from_slice(&sec);
+            }
+            Ok(())
+        }
+
+        fn write_sectors(&mut self, lba: u64, buf: &[u8]) -> Result<(), crate::install::InstallError> {
+            debug_assert!(buf.len() % 512 == 0);
+            for (i, chunk) in buf.chunks(512).enumerate() {
+                let mut sec = [0u8; 512];
+                sec.copy_from_slice(chunk);
+                if !write_block_at(self.base, self.card, lba + i as u64, &sec) {
+                    return Err(crate::install::InstallError::Io);
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// The built-in v1 payload (M2 fallback): a small, self-describing marker blob. HONEST BY DESIGN — the
+    /// installer's intended v1 payload is the RUNNING system's own boot volume (clone-thyself), but at this
+    /// call site (the pre-JB2b-takeover EL2 census point) the USB boot stick is NOT yet enumerated as a
+    /// block device (`drivers::block::info()` is None here), so self-read is unreachable this arc. Rather
+    /// than fake a clone, we write a marker the in-tree FAT reader can later find, and FLAG the self-clone
+    /// as the named follow-up (INSTALL-2). Spans several sectors so the extent machinery is exercised.
+    #[cfg(feature = "install_target")]
+    fn installer_marker_payload() -> alloc::vec::Vec<u8> {
+        let mut v = alloc::vec::Vec::with_capacity(4096);
+        v.extend_from_slice(
+            b"UNAOS-INSTALL-1 marker payload v1\n\
+              Written by the booted UnaOS installer onto the seated microSD.\n\
+              The v1 self-clone (copy the running boot volume) is INSTALL-2.\n",
+        );
+        let mut i: usize = 0;
+        while v.len() < 4096 {
+            v.push(((i.wrapping_mul(37).wrapping_add(13)) & 0xFF) as u8);
+            i += 1;
+        }
+        v
+    }
+
+    /// ORIN-INSTALL-1: run the installer engine end-to-end against the seated microSD. Called only from
+    /// `sdmmc_census` (metal), only under the third gate, after the census has produced `card` + `sec0`.
+    /// The flow: announce → GPT → zero ESP metadata (blank-precondition) → FAT32 format → payload copy →
+    /// sha extent-verify → the INSTALL PASS line. Any engine error is a named FAIL line (no panic).
+    #[cfg(feature = "install_target")]
+    fn install_to_sd(base: u64, card: &Card, sec0: &[u8; 512]) {
+        serial_println!(
+            "{} ORIN-INSTALL-1 THIRD GATE (UNAOS_INSTALL_TARGET_SD=1) — installing UnaOS onto the SEATED microSD ::",
+            PS
+        );
+        serial_println!(
+            "{}   gates: [1] sdmmc census OK · [2] sdmmc_arm write path armed · [3] install_target destructive-confirm — all satisfied ::",
+            PS
+        );
+
+        // ── About-to-destroy announcement: classify sector 0 + re-print the card CID identity. ──
+        let class = classify_sector0(sec0);
+        serial_println!(
+            "{}   ABOUT TO DESTROY: microSD sector-0 = {} · capacity {} blocks ({} MiB) — the entire card is about to be repartitioned ::",
+            PS, class, card.num_blocks, card.num_blocks * 512 / (1024 * 1024)
+        );
+        print_cid(&card.cid);
+
+        let mut t = SdInstallTarget { base, card };
+        match install_flow(&mut t) {
+            Ok(()) => serial_println!("{} ORIN-INSTALL-1 SD install — gpt+zero+fat32+copy verify => PASS ::", PS),
+            Err(e) => serial_println!("{} ORIN-INSTALL-1 SD install => FAIL ({:?}) ::", PS, e),
+        }
+    }
+
+    /// The engine driver, factored out so `?` early-returns land on the single FAIL line above.
+    #[cfg(feature = "install_target")]
+    fn install_flow(t: &mut SdInstallTarget) -> Result<(), crate::install::InstallError> {
+        use crate::install::{fat32, gpt, hash, verify_extents, InstallTarget};
+
+        // 1) GPT: protective MBR + primary/backup + ESP + data, with the engine's own parse-back verify.
+        //    The writer overwrites its own structures, so no blank-precondition is needed here.
+        let layout = gpt::write_gpt(t)?;
+        serial_println!(
+            "{}   INSTALL: GPT written + parse-back verified — ESP LBA {}..{}, data LBA {}..{} of {} sectors ::",
+            PS, layout.esp_first_lba, layout.esp_last_lba, layout.data_first_lba, layout.data_last_lba,
+            layout.total_sectors
+        );
+
+        // 2) Re-establish the FAT blank-precondition: zero exactly the ESP reserved+FAT region (the card
+        //    may be non-blank; a stale FAT entry would forge an allocation). Data-area free clusters are
+        //    left as-is (harmless). This is the installer's do-it-right beyond the blank-only demo law.
+        let esp_sectors = layout.esp_last_lba - layout.esp_first_lba + 1;
+        let blank_sectors = fat32::blank_region_sectors(esp_sectors)?;
+        let zero = [0u8; 512];
+        for s in 0..blank_sectors {
+            t.write_sectors(layout.esp_first_lba + s, &zero)?;
+        }
+        serial_println!(
+            "{}   INSTALL: zeroed {} ESP metadata sectors (reserved + both FATs) to re-establish the blank-precondition ::",
+            PS, blank_sectors
+        );
+
+        // 3) FAT32 format the ESP.
+        let geom = fat32::format_esp(t, layout.esp_first_lba, esp_sectors)?;
+        serial_println!(
+            "{}   INSTALL: ESP formatted FAT32 — fat_sz={}sec clusters={} data@vol+{} ::",
+            PS, geom.fat_sz, geom.count_of_clusters, geom.data_start
+        );
+
+        // 4) Copy the v1 marker payload (M2 fallback), recording extents; then content-verify by re-read.
+        let payload = installer_marker_payload();
+        let payload_sha = hash::sha256(&payload);
+        let extents = fat32::write_payload_file(t, &geom, "UNAOS.IMG", &payload)?;
+        serial_println!(
+            "{}   INSTALL: copied UNAOS.IMG ({} bytes, {} extents) ::",
+            PS, payload.len(), extents.len()
+        );
+        if !verify_extents(t, &extents, &payload_sha)? {
+            serial_println!("{}   INSTALL: extent sha-verify => FAIL ::", PS);
+            return Err(crate::install::InstallError::VerifyFailed);
+        }
+        serial_println!("{}   INSTALL: extent sha-verify (re-read every written extent off the card) => PASS ::", PS);
+        // NOTE: the in-tree `fs::fat::mount()` interop self-check the x86 engine witness runs is NOT run
+        // here — `mount()` reads `drivers::block` (the USB path), not this armed SD target, and at this
+        // pre-takeover site no block device is up. The SD content-verify above IS the by-content proof.
+        Ok(())
+    }
+
     // ── M1: FDT census — enumerate SDMMC-compatible nodes, pick the enabled removable microSD slot ──
 
     const MAX_CAND: usize = 8;
@@ -1110,5 +1307,13 @@ mod metal {
         //    a plain UNAOS_SDMMC=1 build ends exactly here, byte-identical to the merged recon). ──
         #[cfg(feature = "sdmmc_arm")]
         write_ladder(base, &card, &sec0);
+
+        // ── ORIN-INSTALL-1: the first real installer flow (only with UNAOS_INSTALL_TARGET_SD=1, the third
+        //    destructive gate; compiled out otherwise, so a plain UNAOS_SDMMC_ARM=1 build ends at the ladder
+        //    above, byte-identical to the merged rung-2). Drives the arch-neutral installer engine onto the
+        //    seated card. Runs AFTER the ladder's scratch write/restore proof — the write path is exercised
+        //    on a stashed region before the installer repartitions the whole card. ──
+        #[cfg(feature = "install_target")]
+        install_to_sd(base, &card, &sec0);
     }
 }

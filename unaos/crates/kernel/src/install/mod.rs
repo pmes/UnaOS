@@ -171,8 +171,9 @@ fn test_payload() -> alloc::vec::Vec<u8> {
 }
 
 /// Re-read every recorded extent off the device and SHA-256 the reassembled bytes. Content-verify:
-/// the digest must equal `expect`.
-fn verify_extents<T: InstallTarget>(
+/// the digest must equal `expect`. Public so the arch-specific installer flows (e.g. the Orin microSD
+/// path in `arch::sdmmc_tegra`) verify through the SAME primitive the x86 engine witness trusts.
+pub fn verify_extents<T: InstallTarget>(
     t: &T,
     extents: &[fat32::Extent],
     expect: &[u8; 32],

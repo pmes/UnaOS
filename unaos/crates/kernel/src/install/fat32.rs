@@ -62,6 +62,25 @@ fn compute_fat_sz(tot_sec: u32) -> u32 {
     (tmpval1 + (tmpval2 - 1)) / tmpval2
 }
 
+/// The count of leading ESP sectors `format_esp` requires to be ZERO for its blank-precondition
+/// optimization to hold: the reserved region + both FAT copies (an empty FAT is all-free = 0). The
+/// engine's demo target is always blank, so it never zeroes; a REAL installer target (a possibly
+/// non-blank microSD) must zero exactly this region — no more (the data area's free clusters may hold
+/// stale bytes harmlessly) and no less (a stale FAT entry would forge an allocation). Same
+/// `compute_fat_sz` math the formatter uses, so the two never diverge. Returns `TooSmall` if the ESP
+/// cannot hold a FAT32 layout.
+pub fn blank_region_sectors(esp_sectors: u64) -> Result<u64, InstallError> {
+    if esp_sectors > u32::MAX as u64 {
+        return Err(InstallError::TooSmall);
+    }
+    let tot_sec = esp_sectors as u32;
+    if tot_sec <= RESERVED {
+        return Err(InstallError::TooSmall);
+    }
+    let fat_sz = compute_fat_sz(tot_sec);
+    Ok((RESERVED + NUM_FATS * fat_sz) as u64)
+}
+
 /// Format the ESP `[esp_first .. esp_first+esp_sectors)` as FAT32. Returns the geometry the payload
 /// writer + verifier use. `esp_sectors` must be large enough for a FAT32 volume (>= 65525 clusters);
 /// the GPT writer sizes the ESP so this always holds.

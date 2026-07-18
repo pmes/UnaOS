@@ -224,6 +224,16 @@ _feats=""
 # the read census. UNAOS_SDMMC=1 WITHOUT this is byte-identical to the ORIN-SDMMC-1 recon. See
 # arch_arm64.md §ORIN-SDMMC and scripts/orin-sdmmc1-bench.md.
 [ -n "${UNAOS_SDMMC_ARM:-}" ] && _feats="${_feats}sdmmc_arm,sdmmc,"
+# ORIN-INSTALL-1: UNAOS_INSTALL_TARGET_SD=1 is the THIRD (destructive-confirmation) gate on top of the
+# double-arm above — it compiles in the first real installer flow (an InstallTarget over the rung-2 armed
+# SD write path driving the install:: engine's GPT + FAT32 + sha extent-verify onto the SEATED microSD;
+# arch/aarch64/sdmmc_tegra.rs::install_to_sd). Pulls `install_target` (⇒ sdmmc_arm ⇒ sdmmc, all added here
+# for a lone knob). The flow announces the sector-0 classification + card CID it is about to destroy before
+# the first write and zeroes the ESP metadata region to handle a non-blank card. On virt it prints one
+# honest compiled-present-metal-only line (zero MMIO); on metal (combine with UNAOS_TEGRA=1) it runs the
+# full install after the read census + rung-2 ladder. UNAOS_SDMMC_ARM=1 WITHOUT this is byte-identical to
+# the merged rung-2 ladder. See arch_arm64.md §ORIN-INSTALL-1 and scripts/orin-sdmmc1-bench.md.
+[ -n "${UNAOS_INSTALL_TARGET_SD:-}" ] && _feats="${_feats}install_target,sdmmc_arm,sdmmc,"
 # AARCH64-VNET: UNAOS_VNET=1 arms the virtio-net-mmio driver + smoltcp bind on the QEMU `virt` machine
 # (arch/aarch64/virtio_net.rs) — the QEMU-testable proof of the aarch64 smoltcp seam NET-4 built. Scans
 # the fixed virtio-mmio window, drives the LEGACY transport, and runs an ICMP-ping witness against the
