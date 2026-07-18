@@ -1119,6 +1119,58 @@ unregressed. `UNAOS_EHCITABLET=1 test 40`: the standard `usb-tablet` report-poin
 decodes with the unchanged layout (vendor recognition does not perturb the standard path).
 `UNAOS_IRQSTORAGE=1 UNAOS_FATIMG=sf test 200` 0 FAIL / 0 PANIC with the EHCI-5 code compiled in.
 
+### 10d. EHCI-TRACKPAD — the bcm5974 mode switch (start the multitouch stream)
+
+EHCI-5(-fix) proved the internal trackpad's vendor-multitouch interface is now **recognized and
+armed**, but on metal the stream never starts: the Apple trackpad (`05ac:0262`) ships in a
+**single-touch compatibility mode** and emits **no** `0x44` multitouch frames until it is told to. The
+Linux `bcm5974` driver flips it with a class **feature-report** handshake (`bcm5974_wellspring_mode`);
+this arc ports that handshake into `configure_report_pointer`, fired **once, before arming**, whenever
+a `vendor_mt` interface is recognized.
+
+**M1 — the mode switch (`bcm5974_mode_switch`).** Three EP0 control transfers, run through the same
+overlay-direct / chain-mode `control()` path every other request uses:
+1. **GET_REPORT(Feature)** — `bmRequestType 0xA1` (IN | CLASS | INTERFACE), `bRequest 0x01`,
+   `wValue 0x0300` (report type 3 = Feature, report id 0), `wIndex 0`, `wLength 8`. Reads the current
+   feature report into `data_buf`; byte 0 + length are logged.
+2. **Flip byte 0** — `data_buf[0] = 0x01` (`BCM5974_MODE_VENDOR`, raw multitouch; `0x08` would be the
+   NORMAL single-touch mode). The remaining 7 bytes are echoed back as read.
+3. **SET_REPORT(Feature)** — `bmRequestType 0x21` (OUT | CLASS | INTERFACE), `bRequest 0x09`,
+   `wValue 0x0300`, `wIndex 0`, `wLength 8`. Writes the modified report back — the request that starts
+   the stream.
+
+`wValue`/`wIndex`/`wLength`/request-ids/mode byte are the **bcm5974 driver constants verbatim**
+(`BCM5974_MODE_*`). One nuance carried from the reference: `wIndex` is the driver's `REQUEST_INDEX`
+(**0**), **not** the interface number — the value proven on real MacBooks; the interface number is
+logged alongside so a sitting can retry with `intf` if index 0 STALLs on this exact `0262`. Every stage
+logs its status, and **any stall/timeout is non-fatal**: a firmware that already streams needs no
+switch, so a failed handshake never un-arms the endpoint — it traces and the caller arms regardless.
+
+**M2 — decode.** Unchanged from §10c: once frames arrive, `service` decodes the first finger via
+`decode_vendor_first_finger` into the same relative `pal::Event::Mouse` path (the XENUM FS-mouse seam).
+The switch only makes the frames *arrive*; the `VMT_FINGER_*` offsets remain the metal hypothesis.
+
+**QEMU unchanged by construction.** The switch is gated on `vendor_mt`, which QEMU's `usb-tablet`
+(a standard absolute pointer) never sets, so `bcm5974_mode_switch` is never reached in QEMU — verified:
+`test 22` and `UNAOS_EHCITABLET=1 test 22` both MISSION SUCCESS with **no** `bcm5974 GET_REPORT` /
+`SET_REPORT` line, and the keyboard (`M2 armed keyboard`) and tablet (`M2 armed report-pointer`) paths
+arm exactly as before.
+
+**Sitting-assertable trace (metal, deferred).** On the real `0262`, after the §10c recognition lines:
+1. `:: EHCI-HID: [i] M1 bcm5974 GET_REPORT(feature) addr=N intf=M got=8b byte0=0xXX == witness ::`
+   — the device answered the read (or the FAILED variant if it STALLs; the write still follows).
+2. `:: EHCI-HID: [i] M1 bcm5974 SET_REPORT(feature) addr=N intf=M mode=0x01 — multitouch stream
+   requested == witness ::` — the switch was accepted. If instead the FAILED variant prints, try
+   `wIndex = intf` (see the nuance above) or confirm the recipient interface.
+3. Then the §10c `vendor-multitouch raw report #k` dumps should begin **on touch** — the proof the
+   stream started. Cursor motion from the trackpad is the metal verdict for this arc's next sitting.
+
+**Gates (EHCI-TRACKPAD).** `./arroyo check` green both arches. `./arroyo test 22` MISSION SUCCESS,
+keyboard + vendor self-test unregressed, **zero** mode-switch lines (QEMU never `vendor_mt`).
+`UNAOS_EHCITABLET=1 test 22` MISSION SUCCESS, `usb-tablet` report-pointer path unchanged. Metal
+(the switch actually starts the stream and the cursor moves) is **deferred** to the next attended
+sitting — no flash media staged, no ESP rebuilt.
+
 ---
 
 ## See also
