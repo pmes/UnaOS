@@ -268,6 +268,16 @@ net4 = ["pcie3", "dep:smoltcp"]
 # scripts/orin-sdmmc1-bench.md.
 sdmmc = []
 
+# ORIN-SDMMC-2: the `UNAOS_SDMMC_ARM=1` write-path ARM. A SEPARATE explicit gate on top of `sdmmc`
+# (double-gating: writes require BOTH `sdmmc` AND this arm) so the seated card is never written by the
+# recon knob alone — "THE SEATED CARD IS SACRED". Arming adds the CMD24 single-block write helper and the
+# paranoia ladder (re-census -> pick a GPT-safe scratch region -> stash -> write stamped pattern ->
+# verify -> restore -> verify) after the read census. EVERY line of the write path is gated on this
+# feature, so an `sdmmc`-without-`sdmmc_arm` build is byte-identical to the merged ORIN-SDMMC-1 recon
+# (zero card writes, unchanged serial output). See arch_arm64.md §ORIN-SDMMC and
+# scripts/orin-sdmmc-bench.md.
+sdmmc_arm = ["sdmmc"]
+
 # AARCH64-VNET: the `UNAOS_VNET=1` virtio-net-mmio driver on the QEMU `virt` machine + smoltcp bind
 # (arch/aarch64/virtio_net.rs) — the QEMU-testable proof of the aarch64 smoltcp seam NET-4 built. NET-4's
 # driver is `tegra`-gated (QEMU models no Tegra234 RC), so it is only ever COMPILE-tested off metal; this
