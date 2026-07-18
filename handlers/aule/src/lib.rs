@@ -19,6 +19,7 @@ use bandy::{BandyMember, SMessage};
 use elessar::{Context, Spline};
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 
 #[cfg(feature = "gtk")]
@@ -58,8 +59,30 @@ impl Aule {
 
     /// The core function: Spawns a build process based on the Spline.
     /// Returns immediately; the process runs in a background thread.
-    /// Output is streamed via Bandy.
+    /// Output is streamed to stdout (legacy behavior, preserved).
     pub fn forge(&self) -> Result<()> {
+        let (tx, rx) = mpsc::channel::<String>();
+        self.forge_streamed(tx)?;
+        // Drain the stream to stdout so the historical println-based API keeps
+        // working for callers that have no channel of their own.
+        thread::spawn(move || {
+            for line in rx {
+                println!("{}", line);
+            }
+        });
+        Ok(())
+    }
+
+    /// Streaming variant of [`Aule::forge`]: spawns the same build process, but
+    /// emits each stdout/stderr line (and the initial forge banner) as a plain
+    /// `String` on `tx` instead of printing. Returns immediately; the process
+    /// and its two reader threads run in the background. The vessel wraps these
+    /// lines into whatever signal it routes.
+    ///
+    /// `std::sync::mpsc::Sender<String>` is used deliberately: it matches aule's
+    /// existing `std::thread` reader structure with no async runtime. stdout and
+    /// stderr lines are interleaved on the one channel in arrival order.
+    pub fn forge_streamed(&self, tx: mpsc::Sender<String>) -> Result<()> {
         let (program, args) = match self.context.spline {
             Spline::UnaOS | Spline::Rust => ("cargo", vec!["build"]),
             Spline::Web => ("npm", vec!["run", "build"]),
@@ -67,7 +90,7 @@ impl Aule {
             Spline::Void => return Ok(()),                           // Nothing to build
         };
 
-        println!("[AULE] Forging with: {} {:?}", program, args);
+        let _ = tx.send(format!("[AULE] Forging with: {} {:?}", program, args));
 
         // J15 SPECIALTY: Process Management
         let mut child = Command::new(program)
@@ -81,23 +104,19 @@ impl Aule {
         let stderr = child.stderr.take().unwrap();
 
         // Spawn thread to stream STDOUT
+        let tx_out = tx.clone();
         thread::spawn(move || {
             let reader = BufReader::new(stdout);
-            for line in reader.lines() {
-                if let Ok(l) = line {
-                    // In a real system, we'd emit this to Bandy
-                    println!("[BUILD::OUT] {}", l);
-                }
+            for line in reader.lines().map_while(|l| l.ok()) {
+                let _ = tx_out.send(line);
             }
         });
 
         // Spawn thread to stream STDERR
         thread::spawn(move || {
             let reader = BufReader::new(stderr);
-            for line in reader.lines() {
-                if let Ok(l) = line {
-                    println!("[BUILD::ERR] {}", l);
-                }
+            for line in reader.lines().map_while(|l| l.ok()) {
+                let _ = tx.send(line);
             }
         });
 
