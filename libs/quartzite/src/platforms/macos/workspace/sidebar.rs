@@ -223,6 +223,14 @@ define_class!(
             let node = unsafe {
                 Retained::cast_unchecked::<UnaMatrixNode>(Retained::retain(item).unwrap())
             };
+            // Selection is a *focus* gesture and only files report it (the
+            // brain routes it to the editor). Directories must NOT fire here:
+            // collapsing a parent moves selection onto it, and reporting that
+            // as a toggle re-expanded the brain's node and reset the tree.
+            // Directory expansion is the chevron handlers' job alone.
+            if *node.ivars().is_dir.borrow() {
+                return;
+            }
             let id = node.ivars().node_id.borrow().clone();
             if let Some(tx) = self.ivars().tx_event.borrow().as_ref() {
                 let _ = tx.try_send(bandy::SMessage::ToggleMatrixNode(id));
