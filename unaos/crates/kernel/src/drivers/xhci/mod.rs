@@ -4357,7 +4357,7 @@ impl XhciController {
                 continue; // nothing connected
             }
             serial_println!("xHCI: HUB slot {} port {}: device connected; enumerating...", hub_slot, port);
-            if let Some(mut speed) = self.reset_downstream_port(hub_slot, port, buf) {
+            if let Some(mut speed) = self.reset_downstream_port(hub_slot, port, buf, is_ss) {
                 // ORIN-USB-FIX (R22 sitting-2): a SuperSpeed hub's wPortStatus does NOT carry
                 // the USB2 LS/HS speed bits — bit 9 is PORT_POWER on an SS hub, which
                 // reset_downstream_port's USB2 decode misread as Low Speed (status 0x100203 ->
@@ -4432,9 +4432,24 @@ impl XhciController {
     /// Reset a downstream hub port; return the attached device's xHCI speed code (1=FS, 2=LS, 3=HS)
     /// or None if the port did not enable. Uses hub-class port requests (CLEAR/SET_FEATURE,
     /// GET_STATUS).
-    fn reset_downstream_port(&mut self, hub_slot: u8, port: u8, buf: u64) -> Option<u32> {
+    fn reset_downstream_port(&mut self, hub_slot: u8, port: u8, buf: u64, is_ss: bool) -> Option<u32> {
         let _ = self.sync_control(hub_slot, 0x23, 0x01, 16, port as u16, 0, 0, false); // CLEAR C_PORT_CONNECTION
-        let _ = self.sync_control(hub_slot, 0x23, 0x03, 4, port as u16, 0, 0, false); // SET PORT_RESET
+        // ORIN-USB-FIX-2: a SuperSpeed hub downstream port must be reset with a WARM (BH) reset, not
+        // a USB2-style hot reset. On the Realtek 0bda:0489 SS hub carrying the Orin boot stick, a hot
+        // reset (SET_FEATURE PORT_RESET=4) completes at the link layer — the port reads Enabled/U0
+        // (wPortStatus 0x0203, so the R22 forced-SS + MPS0-512 slot context is well-formed) — yet the
+        // device never reaches an addressable Default state, so ADDRESS_DEVICE's internal SET_ADDRESS
+        // draws no handshake and the command completes with code 4 (USB Transaction Error) on every
+        // retry (metal Orin: "downstream ADDRESS_DEVICE code 4 ×3"). A warm reset (SET_FEATURE
+        // BH_PORT_RESET=28) re-trains the link AND resets the device to Default (USB 3.2 §10.14.2.5,
+        // §10.3.1.9) — this is the same reset the ROOT-port SS path already relies on (issue_enum_reset
+        // escalates USB3 links to a warm reset, and the SAME stick enumerates on the x86 root port with
+        // it). Completion is signalled by C_BH_PORT_RESET (change bit 5 → word bit 21), NOT C_PORT_RESET.
+        // USB2 hub ports keep the hot reset: the same physical hub's USB2 half (keyboard/pointer) uses
+        // it and enumerates cleanly, and QEMU's downstream devices are USB2 — this branch leaves the
+        // HS/FS/LS path byte-identical.
+        let (reset_sel, done_bit) = if is_ss { (28u16, 1u32 << 21) } else { (4u16, 1u32 << 20) };
+        let _ = self.sync_control(hub_slot, 0x23, 0x03, reset_sel, port as u16, 0, 0, false); // SET (BH_)PORT_RESET
 
         let mut pstatus = 0u32;
         for _ in 0..50 {
@@ -4447,17 +4462,35 @@ impl XhciController {
                 (*p.add(0) as u32) | ((*p.add(1) as u32) << 8)
                     | ((*p.add(2) as u32) << 16) | ((*p.add(3) as u32) << 24)
             };
-            if pstatus & (1 << 20) != 0 { break; } // C_PORT_RESET set
+            // Reset complete when the matching change bit latches: C_BH_PORT_RESET (bit 21) for a warm
+            // reset, C_PORT_RESET (bit 20) for a hot one. Some SS hubs assert C_PORT_RESET on a warm
+            // reset too, so accept either on the SS path rather than spin past a genuine completion.
+            if pstatus & done_bit != 0 || (is_ss && pstatus & (1 << 20) != 0) { break; }
         }
+        // Deassert every reset-related change this reset latched so the hub's Status Change Endpoint
+        // can quiesce later: C_PORT_RESET always; on SS additionally C_BH_PORT_RESET (asserted by the
+        // warm reset) and C_PORT_LINK_STATE (the warm reset drives the link U0→Recovery→U0). Leaving
+        // C_PORT_LINK_STATE latched storms the SCE — the same class of defect the hot-plug ack path
+        // (service_one_hub_change) already guards, mirrored here for the one-shot boot walk.
         let _ = self.sync_control(hub_slot, 0x23, 0x01, 20, port as u16, 0, 0, false); // CLEAR C_PORT_RESET
+        if is_ss {
+            let _ = self.sync_control(hub_slot, 0x23, 0x01, 29, port as u16, 0, 0, false); // CLEAR C_BH_PORT_RESET
+            let _ = self.sync_control(hub_slot, 0x23, 0x01, 25, port as u16, 0, 0, false); // CLEAR C_PORT_LINK_STATE
+        }
 
         if pstatus & (1 << 1) == 0 {
             serial_println!("xHCI: HUB port {} did not enable after reset (status {:#x})", port, pstatus);
             return None;
         }
-        // Hub port status: bit 9 = Low Speed, bit 10 = High Speed; otherwise Full Speed.
-        let speed = if pstatus & (1 << 9) != 0 { 2u32 } else if pstatus & (1 << 10) != 0 { 3 } else { 1 };
-        serial_println!("xHCI: HUB port {} reset OK (status {:#x}, xHCI speed {})", port, pstatus, speed);
+        // Hub port status speed decode is USB2-only: bit 9 = Low Speed, bit 10 = High Speed, else Full
+        // Speed. On an SS hub these bits carry other meaning (bit 9 = PORT_POWER — the R22 mis-decode
+        // that read "xHCI speed 2"); the caller forces SS speed 4, so return 4 here to keep the trace
+        // honest rather than emit a bogus USB2 speed.
+        let speed = if is_ss {
+            4
+        } else if pstatus & (1 << 9) != 0 { 2u32 } else if pstatus & (1 << 10) != 0 { 3 } else { 1 };
+        serial_println!("xHCI: HUB port {} reset OK (status {:#x}, {} reset, xHCI speed {})",
+            port, pstatus, if is_ss { "warm" } else { "hot" }, speed);
         Some(speed)
     }
 
@@ -4680,7 +4713,7 @@ impl XhciController {
                 serial_println!("xHCI: HUB slot {} port {} connect: resetting + enumerating downstream device.", hub_slot, port);
                 // reset_downstream_port issues CLEAR C_PORT_CONNECTION + SET PORT_RESET, awaits
                 // C_PORT_RESET (bounded/paced), clears it, and reads the trained speed.
-                if let Some(mut speed) = self.reset_downstream_port(hub_slot, port, buf) {
+                if let Some(mut speed) = self.reset_downstream_port(hub_slot, port, buf, is_ss) {
                     if is_ss {
                         // SS hub ports are always SuperSpeed (the HS/FS speed bits don't apply);
                         // best-effort per XENUM-2 — the metal HS/FS mouse/keyboard path is exact.
