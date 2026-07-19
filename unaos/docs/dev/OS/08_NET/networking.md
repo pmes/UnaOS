@@ -710,6 +710,52 @@ Reproduce (hermetic, forward+suffix+metrics OK, serve PENDING): `./arroyo test 9
 composition (hosts-format blocklist from FAT): `UNAOS_IRQSTORAGE=1 UNAOS_FATIMG=sf ./arroyo
 test 200`. The over-the-wire serve leg is unchanged from SINKHOLE-1 (injector-driven; PENDING hermetically).
 
+## NET-4j — the Orin DHCP no-lease, localized above the driver (smoltcp gate probe + reproducer)
+
+On the Jetson Orin (aarch64, RTL8168 GbE), the `net4` seam's `dhcp_or_static` bring-up
+(`crates/kernel/src/net_phy.rs`) repeatedly fell back to the static address despite the RTL8168
+driver observing a valid unicast DHCP OFFER on the wire. The R23s1 boot-11 capture showed the OFFER
+matching the DISCOVER's transaction id, addressed to our station MAC, carrying a valid `yiaddr` — it
+"passed ALL driver-visible checks" — yet no lease followed. The prior `[net4d]` probe only inspected
+three fields (xid, destination MAC, `yiaddr`), so that line was misleading: the smoltcp `dhcpv4`
+socket applies **four further gates** the driver never checked.
+
+**Root cause (proven, not hardware-dependent).** The smoltcp integration path is correct. A host and
+QEMU reproducer (`net_phy::net4j_repro`) drives the *same* `smoltcp::socket::dhcpv4::Socket` over a
+fake `phy::Device` carrying the seam's exact `DeviceCapabilities` (medium Ethernet, MTU 1500, default
+checksum caps), polls once to emit the DISCOVER, then injects a synthesized OFFER echoing its xid.
+Because the seams use a fixed `random_seed` (`0x4e455434`), the DISCOVER's transaction id is
+deterministically `0x51fb1e94` — **identical to the metal boot-11 xid**, so the reproducer replays
+the real exchange rather than an analogue. It asserts the integration contract:
+
+- a **well-formed** OFFER (valid IPv4/UDP checksums, BOOTP `chaddr == station MAC`, DHCP option 54
+  *server identifier* present) drives the socket Discovering → Requesting and **emits a REQUEST**;
+- an OFFER identical but for a **missing option-54 server identifier** is **silently dropped** — no
+  REQUEST — because `dhcpv4::Socket::process` returns early on `missing server_identifier`.
+
+The metal no-lease is therefore an OFFER that fails one of these smoltcp-strict gates the driver
+probe never inspected (per smoltcp 0.13.1 `iface/interface/ipv4.rs` + `socket/dhcpv4.rs::process`):
+**(1)** IPv4 header checksum verification (default RX checksum caps), **(2)** UDP checksum
+verification (a zero checksum is legal and accepted per RFC 768), **(3)** BOOTP `chaddr` equal to the
+station MAC, **(4)** option-54 server identifier present.
+
+**The fix (do-it-right diagnostic + regression).**
+- `net4d_offer_check` (`arch/aarch64/rtl8168_tegra.rs`) now computes each of the four smoltcp gates
+  over the raw OFFER frame (`smoltcp_offer_gate`, read-only, fully bounds-checked) and emits a
+  `[net4j] smoltcp REJECT at gate N/4 …` or `[net4j] smoltcp ACCEPT …` line, so a **single** metal
+  boot names the exact failing field instead of guessing (each guess previously cost a boot).
+- `net4j_repro::run` is a witness-gated, self-contained regression (no `-netdev` needed) that runs on
+  the aarch64 vnet QEMU gate: `UNAOS_WITNESS=1 UNAOS_VNET=1 ./arroyo test-arm`. It prints
+  `NET-4j reproducer: DISCOVER xid=0x51fb1e94 | well-formed OFFER => REQUEST=true | OFFER w/o
+  server-id => REQUEST=false | PASS ::`, locking the contract against smoltcp regressions.
+
+Refuted along the way (each formerly a metal-boot cost): UDP/IPv4 checksum *capabilities* mismatch
+(reproducer passes with default caps; zero-checksum and trailing-FCS variants both accepted), a
+frozen `Instant`/clock (CNTPCT advances — it drives the 5 s timeout that *did* fire), and
+broadcast-vs-unicast handling (smoltcp intercepts a unicast OFFER to `yiaddr` *before* the interface
+address check, so an address-less interface still receives it). Weakening smoltcp's RX checksum
+verification was explicitly rejected (a protection, not a bug).
+
 ## The road from here
 
 | Arc | Content |

@@ -323,6 +323,126 @@ mod metal {
         Some(DhcpInfo { sport, dport, sip, dip, op, mtype, xid, yiaddr })
     }
 
+    /// NET-4j: the exact smoltcp-dhcpv4 accept verdict for an inbound OFFER — the gates smoltcp applies
+    /// ABOVE the three the driver checked (xid + dst-MAC + yiaddr-unicast). Read-only, fully bounds-checked.
+    /// Reproduced from smoltcp 0.13.1 `iface/interface/ipv4.rs` + `socket/dhcpv4.rs::process`:
+    ///   1. IPv4 header checksum verifies (default `ChecksumCapabilities` verify on RX);
+    ///   2. UDP checksum verifies (a zero checksum is legal/accepted per RFC 768);
+    ///   3. BOOTP chaddr (client hardware address) equals our station MAC;
+    ///   4. DHCP option 54 (server identifier) is present — smoltcp DROPS an OFFER without it.
+    /// The transaction-id gate (5) is already reported by `net4d_offer_check`. The NET-4j reproducer
+    /// (net_phy.rs, witness-gated) proves a frame passing all of these yields a REQUEST; this probe names
+    /// the FIRST gate a real metal OFFER fails so a single boot localizes the drop instead of guessing.
+    struct SmoltcpGate {
+        ipv4_csum_ok: bool,
+        udp_csum_ok: bool,
+        udp_csum_zero: bool,
+        chaddr_ok: bool,
+        server_id: Option<[u8; 4]>,
+    }
+
+    /// Fold a running ones-complement 16-bit sum and return the (un-complemented) folded value.
+    #[inline]
+    fn csum_fold(mut sum: u32) -> u16 {
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        sum as u16
+    }
+
+    /// Ones-complement 16-bit sum over `data` (big-endian words; a trailing odd byte is high-padded),
+    /// added to `initial`. Returns the folded sum; a valid checksum makes the folded sum `0xffff`.
+    fn csum_words(data: &[u8], initial: u32) -> u16 {
+        let mut sum = initial;
+        let mut i = 0;
+        while i + 1 < data.len() {
+            sum += u16::from_be_bytes([data[i], data[i + 1]]) as u32;
+            i += 2;
+        }
+        if i < data.len() {
+            sum += (data[i] as u32) << 8;
+        }
+        csum_fold(sum)
+    }
+
+    /// Compute smoltcp's OFFER accept gates over a raw RX frame (Eth/IPv4/UDP/BOOTP). `None` if the frame
+    /// is not a decodable IPv4/UDP/BOOTP frame. `our_mac` is the station MAC (the chaddr comparison).
+    fn smoltcp_offer_gate(frame: &[u8], our_mac: &[u8; 6]) -> Option<SmoltcpGate> {
+        if frame.len() < 14 || u16::from_be_bytes([frame[12], frame[13]]) != 0x0800 {
+            return None;
+        }
+        let ip = frame.get(14..)?;
+        if ip.len() < 20 || (ip[0] >> 4) != 4 {
+            return None;
+        }
+        let ihl = ((ip[0] & 0x0f) as usize) * 4;
+        // IPv4 total length bounds the L3 payload — trailing Ethernet FCS/padding is excluded from both
+        // checksums (smoltcp bounds by the header/length fields, so we must too).
+        let total_len = u16::from_be_bytes([ip[2], ip[3]]) as usize;
+        if ihl < 20 || total_len < ihl || ip.len() < total_len || ip[9] != 17 {
+            return None;
+        }
+        let ipv4_csum_ok = csum_fold(csum_words(&ip[..ihl], 0) as u32) == 0xffff;
+
+        let udp = &ip[ihl..total_len];
+        if udp.len() < 8 {
+            return None;
+        }
+        let udp_len = u16::from_be_bytes([udp[4], udp[5]]) as usize;
+        let udp_csum = u16::from_be_bytes([udp[6], udp[7]]);
+        let udp_csum_zero = udp_csum == 0;
+        // UDP pseudo-header: src ip (ip[12..16]) + dst ip (ip[16..20]) + zero + proto(17) + udp length.
+        let udp_csum_ok = if udp_csum_zero {
+            true // RFC 768: a zero transmitted checksum means "not computed" — accepted.
+        } else if udp.len() >= udp_len && udp_len >= 8 {
+            let mut init = (ip[12] as u32) << 8 | ip[13] as u32;
+            init += (ip[14] as u32) << 8 | ip[15] as u32;
+            init += (ip[16] as u32) << 8 | ip[17] as u32;
+            init += (ip[18] as u32) << 8 | ip[19] as u32;
+            init += 17u32; // protocol
+            init += udp_len as u32;
+            csum_fold(csum_words(&udp[..udp_len], init) as u32) == 0xffff
+        } else {
+            false
+        };
+
+        let bootp = udp.get(8..)?;
+        if bootp.len() < 240 {
+            return None;
+        }
+        // chaddr occupies BOOTP bytes 28..44 (16 bytes); the first 6 are the client Ethernet MAC.
+        let chaddr_ok = bootp[28..34] == our_mac[..];
+        // Scan options for tag 54 (server identifier), the field smoltcp requires and the driver's
+        // original probe never inspected.
+        let mut server_id: Option<[u8; 4]> = None;
+        if bootp[236] == 0x63 && bootp[237] == 0x82 && bootp[238] == 0x53 && bootp[239] == 0x63 {
+            let opts = &bootp[240..];
+            let mut i = 0usize;
+            while i < opts.len() {
+                let tag = opts[i];
+                if tag == 0xff {
+                    break;
+                }
+                if tag == 0x00 {
+                    i += 1;
+                    continue;
+                }
+                if i + 1 >= opts.len() {
+                    break;
+                }
+                let l = opts[i + 1] as usize;
+                if i + 2 + l > opts.len() {
+                    break;
+                }
+                if tag == 54 && l == 4 {
+                    server_id = Some([opts[i + 2], opts[i + 3], opts[i + 4], opts[i + 5]]);
+                }
+                i += 2 + l;
+            }
+        }
+        Some(SmoltcpGate { ipv4_csum_ok, udp_csum_ok, udp_csum_zero, chaddr_ok, server_id })
+    }
+
     // ── PCI config-space offsets (in the ECAM, at bus1:dev0:fn0) ──
     const CFG_VENDOR: u64 = 0x00;
     const CFG_COMMAND: u64 = 0x04;
@@ -736,9 +856,10 @@ mod metal {
                     di.op, di.mtype, dhcp_mtype_name(di.mtype), di.xid, xexp, xtok,
                     di.yiaddr[0], di.yiaddr[1], di.yiaddr[2], di.yiaddr[3]
                 );
-                // Item 3: an OFFER that a lease never followed — name the driver-visible check.
+                // Item 3: an OFFER that a lease never followed — name the driver-visible check AND
+                // (NET-4j) the exact smoltcp accept gate the frame passes or fails.
                 if di.mtype == 2 {
-                    self.net4d_offer_check(&di, d);
+                    self.net4d_offer_check(&di, d, frame);
                 }
                 return;
             }
@@ -786,7 +907,7 @@ mod metal {
         /// condition it fails — the xid must equal the DISCOVER's, and the destination MAC must be our
         /// station MAC or broadcast. If it passes both, the drop is ABOVE the driver (the smoltcp
         /// dhcpv4 socket), and we say so explicitly rather than blame the wire. Read-only.
-        fn net4d_offer_check(&self, di: &DhcpInfo, dst: &[u8]) {
+        fn net4d_offer_check(&self, di: &DhcpInfo, dst: &[u8], frame: &[u8]) {
             let xid_ok = self.d_xid == Some(di.xid);
             let is_bcast = dst.iter().all(|&b| b == 0xff);
             let is_ours = dst == &self.mac[..];
@@ -795,16 +916,53 @@ mod metal {
                     "{}   [net4d] OFFER xid {:#010x} != DISCOVER xid {:#010x} — driver-visible REJECT: wrong transaction ::",
                     P4, di.xid, self.d_xid.unwrap_or(0)
                 );
-            } else if !(is_bcast || is_ours) {
+                return;
+            }
+            if !(is_bcast || is_ours) {
                 serial_println!(
                     "{}   [net4d] OFFER xid matches but dst MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} is neither our station MAC nor broadcast — driver-visible REJECT: addressed elsewhere ::",
                     P4, dst[0], dst[1], dst[2], dst[3], dst[4], dst[5]
                 );
-            } else {
+                return;
+            }
+            serial_println!(
+                "{}   [net4d] OFFER xid matches DISCOVER + addressed to us ({}) yiaddr={}.{}.{}.{} — passes the 3 driver-visible checks ::",
+                P4, if is_bcast { "broadcast" } else { "unicast" },
+                di.yiaddr[0], di.yiaddr[1], di.yiaddr[2], di.yiaddr[3]
+            );
+            // NET-4j: the smoltcp dhcpv4 socket applies gates ABOVE the driver's three. Compute each and
+            // name the FIRST one this frame fails — the definitive localization the boot-11 "passes ALL
+            // driver-visible checks" line could not give (it never inspected these). The NET-4j reproducer
+            // proves a frame passing all of these deterministically emits a REQUEST.
+            let Some(g) = smoltcp_offer_gate(frame, &self.mac) else {
                 serial_println!(
-                    "{}   [net4d] OFFER xid matches DISCOVER + addressed to us ({}) yiaddr={}.{}.{}.{} — passes ALL driver-visible checks; if no lease followed, the drop is ABOVE the driver (smoltcp dhcpv4 socket) ::",
-                    P4, if is_bcast { "broadcast" } else { "unicast" },
-                    di.yiaddr[0], di.yiaddr[1], di.yiaddr[2], di.yiaddr[3]
+                    "{}   [net4j] OFFER not re-decodable for the smoltcp gate check (unexpected) — cannot localize ::", P4
+                );
+                return;
+            };
+            if !g.ipv4_csum_ok {
+                serial_println!(
+                    "{}   [net4j] smoltcp REJECT at gate 1/4: IPv4 header checksum fails verification — smoltcp drops the packet in Ipv4Repr::parse (default RX checksum caps) ::", P4
+                );
+            } else if !g.udp_csum_ok {
+                serial_println!(
+                    "{}   [net4j] smoltcp REJECT at gate 2/4: UDP checksum fails verification (non-zero, mismatched) — smoltcp drops it in UdpRepr::parse before the DHCP socket sees it ::", P4
+                );
+            } else if !g.chaddr_ok {
+                serial_println!(
+                    "{}   [net4j] smoltcp REJECT at gate 3/4: BOOTP chaddr != our station MAC — dhcpv4::Socket::process returns early (client_hardware_address mismatch) ::", P4
+                );
+            } else if g.server_id.is_none() {
+                serial_println!(
+                    "{}   [net4j] smoltcp REJECT at gate 4/4: DHCP option 54 (server identifier) ABSENT — dhcpv4::Socket::process drops the OFFER (missing server_identifier); no Request is emitted ::", P4
+                );
+            } else {
+                let sid = g.server_id.unwrap();
+                serial_println!(
+                    "{}   [net4j] smoltcp ACCEPT: IPv4 csum OK, UDP csum {} , chaddr==MAC, server-id={}.{}.{}.{} — the OFFER passes every smoltcp gate; a REQUEST must follow. If none did, the drop is NOT frame content (see reproducer + poll-cadence) ::",
+                    P4,
+                    if g.udp_csum_zero { "ZERO(accepted)" } else { "OK" },
+                    sid[0], sid[1], sid[2], sid[3]
                 );
             }
         }
