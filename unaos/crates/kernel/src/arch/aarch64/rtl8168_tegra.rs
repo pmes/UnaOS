@@ -204,6 +204,10 @@ mod metal {
     const RX_BUF_SIZE: usize = 2048;
     const TX_BUF_SIZE: usize = 2048;
 
+    /// NET-4g: how many leading RX descriptors the window-close dump prints (one line each). Eight
+    /// covers the metal signature (rx[0] real, rx[1..] real-length/zero-payload) without flooding.
+    const NET4G_DUMP_N: usize = 8;
+
     // ── NET-4d: RX-window frame classification (the DHCP no-lease RX-side proof) ──
     // Bounds the per-frame serial noise: a full L2/L3/L4 line for the first NET4D_FULL_LINES popped
     // frames, ALWAYS a full line for any BOOTP/DHCP (UDP port 67/68) frame, and a per-category tally
@@ -651,6 +655,41 @@ mod metal {
                 P4, label, self.tx_count, self.tx_stalled, last_tx, d_opts1, (d_opts1 >> 31) & 1,
                 isr, isr & 1, (isr >> 1) & 1, (isr >> 2) & 1, (isr >> 3) & 1,
                 self.rx_count, rx_filled, NUM_RX);
+        }
+
+        /// NET-4g: the decisive RX descriptor-ring dump — the riddle-breaker for "only the FIRST
+        /// popped frame ever carries real bytes; every later frame has a real DESCRIPTOR length but an
+        /// all-ZERO payload." Everything statically checkable in this driver is correct: `alloc_rx`
+        /// programs each slot with a DISTINCT `rx_buffers + i*RX_BUF_SIZE`, `rx_frame_raw` reads the
+        /// matching buffer, the arena is one contiguous DRAM region (Orin DRAM base `0x8000_0000`, so
+        /// every buffer is equally NIC-reachable — no partial inbound window), and the ring is provably
+        /// coherent (the CPU observes the NIC's per-slot length write-backs). The one thing only metal
+        /// can answer: what does `desc[i].addr` actually hold after the NIC ran? The C+ RX engine
+        /// PRESERVES `addr` across completion (it writes back only opts1/opts2), so for each of the
+        /// first `NET4G_DUMP_N` slots this prints the raw post-completion descriptor next to the address
+        /// the driver PROGRAMMED. An `ADDR-MISMATCH` proves in-driver corruption / a descriptor-format
+        /// or ring-stride mismatch (hypotheses 1 & 2 — an in-file fix); an all-MATCH proves the
+        /// descriptors are correct and the payload-to-nowhere is a DMA-write reachability question
+        /// (SMMU / inbound iATU) BELOW the driver's lane. Reads only; writes no register.
+        fn net4g_desc_dump(&self) {
+            serial_println!(
+                "{}   [net4g] RX descriptor dump (post-window): ring @ {:#x}, buffers @ {:#x}, stride {} B, {} slots — addr is NIC-preserved across RX completion ::",
+                P4, self.rx_ring as u64, self.rx_buffers as u64, RX_BUF_SIZE, NUM_RX
+            );
+            for i in 0..NET4G_DUMP_N.min(NUM_RX) {
+                let d = unsafe { read_volatile(self.rx_ring.add(i)) };
+                // Copy packed fields BY VALUE before formatting: a format arg takes `&field`, which on a
+                // `repr(packed)` struct would be a misaligned reference (a hard error). Mirrors net4c.
+                let opts1 = d.opts1;
+                let opts2 = d.opts2;
+                let addr = d.addr;
+                let expect = (self.rx_buffers as u64) + (i * RX_BUF_SIZE) as u64;
+                serial_println!(
+                    "{}   [net4g] rx-desc[{}] opts1={:#010x} (OWN={} EOR={} len={}) opts2={:#010x} addr={:#x} programmed={:#x} [{}] ::",
+                    P4, i, opts1, (opts1 >> 31) & 1, (opts1 >> 30) & 1, opts1 & DESC_LEN_MASK, opts2,
+                    addr, expect, if addr == expect { "MATCH" } else { "ADDR-MISMATCH" }
+                );
+            }
         }
 
         /// NET-4d: classify one popped RX frame during the DHCP discover window and emit a bounded,
@@ -1535,6 +1574,13 @@ mod metal {
         // for the no-lease — did the OFFER arrive, and did the driver-visible accept path take it?).
         if let Some(n) = NET4_DEVICE.lock().as_mut() {
             n.net4d_window_close();
+        }
+        // NET-4g: decisive RX descriptor dump — is desc[i].addr what the driver programmed? This is the
+        // riddle-breaker for "first popped frame real, rest real-length/zero-payload"; the code is
+        // statically correct, so only the metal descriptors can discriminate corruption (in-file fix)
+        // from writes-to-nowhere (SMMU/inbound iATU, below the driver). Read-only.
+        if let Some(n) = NET4_DEVICE.lock().as_ref() {
+            n.net4g_desc_dump();
         }
 
         // One ICMP socket, so the poll has a real socket set to service (proves the full seam binds).

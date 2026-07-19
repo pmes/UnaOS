@@ -6386,3 +6386,32 @@ arches green. `./arroyo test-arm 30` 0 FAIL; `UNAOS_GICV3=1 ./arroyo test-arm 30
 brief's `UNAOS_TEGRA=1 … test-arm` combination wedges at the UEFI→kernel handoff on QEMU virt at every
 commit tested back to pre-SDMMC-3 (pre-existing; tegra builds are metal-only and historically gate
 `check`, never `test-arm`).
+
+### NET-4d → 4g — the RX no-lease investigation (rtl8168_tegra.rs)
+
+The instrumented boots turned the DHCP no-lease into a precise, still-open RX riddle. Each step is
+bounded, read-only, and keeps every prior witness:
+
+- **NET-4d** — RX-window frame classification (`net4d_classify` / `net4d_window_close`): a full L2/L3/L4
+  line for the first frames and always for any BOOTP/DHCP, per-category tally at window close, plus a
+  driver-visible OFFER accept-check (xid vs. the captured DISCOVER, dst-MAC). Metal: the DHCP **OFFER
+  arrives** (len 346, perfect bytes) — the wire/server side is exonerated.
+- **NET-4e** — a `dsb ld` DMA read barrier between the OWN-clear check and the buffer copy (the
+  observation-ordering theory). Refuted on metal: barrier live, later frames still all-zero payload.
+- **NET-4f** — non-coherent-DMA cache maintenance: `dc ivac` invalidate-before-read on RX (at alloc, at
+  recycle, and `[buf,buf+len)` after OWN-clear) + `dc cvac` clean on TX. Refuted on metal: with the
+  invalidate live on every read the signature is **identical** — `rx[0]` real, `rx[1..]` carry a real
+  DESCRIPTOR length (346/531/551/64…) but an ALL-ZERO payload; popped counts reach the full 32-slot ring.
+- **NET-4g** — the riddle-breaker dump (`net4g_desc_dump`, at window close). Code-reading refutes an
+  in-driver defect: `alloc_rx` programs each slot with a distinct `rx_buffers + i*RX_BUF_SIZE`,
+  `rx_frame_raw` reads the matching buffer, the arena is one contiguous DRAM region (Orin DRAM base
+  `0x8000_0000`, so every buffer is equally NIC-reachable — no partial inbound window), and the ring is
+  provably coherent (the CPU observes the NIC's per-slot length write-backs, so the buffers are coherent
+  too). That leaves exactly one metal-only unknown: does `desc[i].addr` hold what the driver programmed?
+  The C+ RX engine PRESERVES `addr` across completion, so the dump prints raw `opts1/opts2/addr` next to
+  the programmed address for the first `NET4G_DUMP_N` (8) slots with a MATCH / ADDR-MISMATCH verdict.
+
+**Metal-owed (decisive):** one instrumented `[net4g]` boot. An **ADDR-MISMATCH** localizes the defect to
+the descriptor semantics (format/stride — an in-file fix). **All-MATCH** proves the descriptors are
+correct and the payload-to-nowhere is a DMA-write reachability question (SMMU / inbound iATU) **below the
+NET-4 driver's lane** — a STOP-and-report boundary for a follow-up arc.
