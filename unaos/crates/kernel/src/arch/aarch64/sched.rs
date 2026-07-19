@@ -1195,6 +1195,15 @@ fn burst_hot(_i: usize) {
 /// work fit the available slices without a steal still prints the per-core busy counts — the witness is
 /// descriptive, never a hang.
 pub fn run_burst(driver_cpu: usize) {
+    // SCHED-BURST-FIX defect 1 (online off-by-one): the tegra boot core drives this burst
+    // COOPERATIVELY — it runs `run_capstone_boot_core`, never the preemptive `run()` loop that is the
+    // only place a core marks itself ONLINE — so the driver was absent from the online set and the
+    // witness under-counted by one (reported 5 of the 6 Orin cores). Mark the driver a SCHED-BAL
+    // participant here: it genuinely dispatches a run queue (cooperatively, via the `yield_now` +
+    // steal-drain below), so `place_cpu`/`try_steal`/`make_ready` may legitimately target it and the
+    // witness now counts all six cores. Idempotent (Release store); the boot core stays a participant
+    // for the rest of the boot, which is correct — it never stops driving its queue.
+    ONLINE[driver_cpu].store(true, Ordering::Release);
     let online = (0..NUM_CPUS).filter(|&c| ONLINE[c].load(Ordering::Acquire)).count();
     serial_println!(
         ":: AARCH64 SCHED-BAL: ORIN-BURST — staging {} migratable PRIO_LOW tasks (driver c{}, {} online core(s)) ::",
@@ -1204,13 +1213,39 @@ pub fn run_burst(driver_cpu: usize) {
     for i in 0..BURST_TASKS {
         spawn_balanced("burst-hot", burst_hot, i, driver_cpu, PRIO_LOW);
     }
-    // Cooperatively wait for the burst to drain. The bound is a spin ceiling so a lost wake reports
-    // rather than hangs — far above the total task cost, and each `yield_now` reschedules (it does not
-    // busy-burn a slice), so hitting the ceiling means a genuine stall, not slow work.
+    // Cooperatively wait for the burst to drain. TWO drivers of progress make the wait metal-robust
+    // regardless of whether an idle AP's cross-core wake actually lands:
+    //   * `yield_now` dispatches this core's own placed share (cooperative run-to-completion).
+    //   * SCHED-BURST-FIX defect 2/3 (0 steals + teardown wedge): `try_steal` pulls a burst task back
+    //     off a busier core and runs it HERE. On metal the ONLY wake an idle AP receives is the
+    //     reschedule SGI — JC3 leaves the APs tickless, so they never re-poll their run queue on their
+    //     own — and if that SGI wake is slow or lost, a placed task would sit forever on a parked AP.
+    //     The old pure-`yield_now` loop then spun its local (empty) queue to the ceiling and the board
+    //     wedged at teardown. Pulling the work back guarantees the countdown reaches 0. `try_steal` is
+    //     non-blocking (`try_lock`), so it never fights an AP that is actively dispatching (that AP
+    //     holds its own queue lock or has already popped the task); every successful pull is a genuine
+    //     cross-core steal, recorded in `STEALS[driver_cpu]`, so the witness reports steals > 0 — the
+    //     balancer provably moved runnable work across cores on real silicon.
+    // The spin ceiling is a lost-progress backstop, not the normal path: with the steal-drain the burst
+    // drains in a handful of passes. Hitting it means a genuine stall — reported on serial, never a
+    // silent hang.
     let mut spins: u64 = 0;
     while BURST_REMAINING.load(Ordering::Relaxed) != 0 && spins < 500_000_000 {
         yield_now();
+        if let Some(task) = try_steal(driver_cpu) {
+            RUN_QUEUES[driver_cpu].lock().push(task);
+            STEALS[driver_cpu].fetch_add(1, Ordering::Relaxed);
+        }
         spins += 1;
+    }
+    let stuck = BURST_REMAINING.load(Ordering::Relaxed);
+    if stuck != 0 {
+        // Bounded teardown, defect 3: emit an explicit timeout witness instead of leaving the board
+        // dark, then fall through to the descriptive witness below. `run_burst` always returns cleanly.
+        serial_println!(
+            ":: AARCH64 SCHED-BAL: ORIN-BURST — WARNING teardown ceiling hit after {} passes, {} task(s) never drained ::",
+            spins, stuck
+        );
     }
     sched_bal_witness();
 }

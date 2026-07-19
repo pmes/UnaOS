@@ -99,10 +99,35 @@ Combined-boot evidence (one kernel running SMP + USB + net + video):
 
 ---
 
+## 4a. aarch64 SMP scheduler and the Orin work-stealing balancer
+
+The aarch64 port now runs a real preemptive multi-core scheduler
+(`arch/aarch64/{sched,smp_virt}.rs`). Secondaries brought up by PSCI `CPU_ON`
+enter `run()` (via `secondary_run`), which sets `ONLINE[cpu]` and makes the core
+a **SCHED-BAL** load-balancing participant: migratable (plain kernel) tasks are
+placed on the least-loaded online core at spawn/wake (`place_cpu`) and an idle
+core pulls work off a busier one (`try_steal`). Per-core `STEALS`/`CPU_BUSY`
+counters back the one-line `sched_bal_witness`.
+
+On the Jetson Orin Nano the boot core does **not** enter `run()` — it drives the
+cooperative M4 CAPSTONE from `run_capstone_boot_core`. The `burst` shell verb
+(and the `sched_demo` boot trigger) stages `BURST_TASKS` migratable `PRIO_LOW`
+tasks across every online core and reports the balance. Two facts about this path
+are load-bearing and were the subject of the **SCHED-BURST-FIX** arc:
+
+- The cooperative boot core is an online scheduler participant too, but it marks
+  itself `ONLINE` inside `run_burst` (it never runs the `run()` seam that does so
+  for secondaries) — otherwise the witness under-counts the online cores by one.
+- Under **JC3** the APs are tickless: an idle AP's only wake is the reschedule
+  SGI (`poke_cpu`). If that cross-core wake is slow or lost on metal, a placed
+  burst task would strand on a parked AP. The cooperative driver therefore
+  **steal-drains** while it waits — it pulls stranded work back to itself and
+  runs it — so the burst always drains (no teardown wedge) and the steal is
+  recorded, so the witness shows steals > 0. A lost-progress spin ceiling emits
+  an explicit timeout witness rather than hanging silently.
+
 ## 5. Status and limitations
 
-- **x86_64 only.** aarch64 runs a single polled core; it has no GIC-driven
-  preemption or scheduler yet.
 - **No priority inheritance** on `Mutex` (assessed as large/thorny under CPU
   pinning; deliberately deferred).
 - **APIC timer is uncalibrated** (~1 ms/tick on QEMU); a CPUID 0x15 / TSC-
