@@ -130,7 +130,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         not(any(feature = "usbdebug", feature = "bootlog", feature = "witness"))
     ))]
     if framebuffer_addr != 0 {
-        unaos_kernel::vug::boot_splash(framebuffer_addr as usize, framebuffer_size, info);
+        unaos_kernel::splash::boot_splash(framebuffer_addr as usize, framebuffer_size, info);
     }
 
     // EDID/mode-selection diagnostics (read before memory::init consumes boot_info); only the
