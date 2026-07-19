@@ -83,11 +83,28 @@ const P4: &str = ":: PCIE4:";
 /// that the driver is compiled-present but its bring-up is metal-only, and return. This keeps the
 /// GICv3 virt regression runs unperturbed (no MMIO, no ring alloc). Mirrors the `census2` graceful skip.
 #[cfg(not(feature = "tegra"))]
-pub fn net4_bringup(_dtb_addr: u64, _dtb_size: usize, _ram_gib_mask: u64) {
+pub fn net4_bringup(dtb_addr: u64, dtb_size: usize, _ram_gib_mask: u64) {
     serial_println!(
         "{} ORIN-NET-4 RTL8168 driver compiled; no Tegra234 RC on this build (QEMU virt) — bring-up is metal-only (UNAOS_NET4=1 UNAOS_TEGRA=1) ::",
         P4
     );
+    // ORIN-DMA-WINDOW (virt witness): exercise the `dma-ranges` derivation against the live DTB. QEMU
+    // virt exposes a generic (non-Tegra) `pcie@`, so the Tegra-RC-gated parse yields 0 windows and the
+    // heap-guard degrades to the RAS-2 highest-clean heuristic — this line witnesses that fallback path
+    // in QEMU (the no-dma-ranges case) without touching MMIO. See `select_heap_region` (mmu_tegra.rs).
+    let mut win = [(0u64, 0u64); 8];
+    let nd = crate::arch::aarch64::fdt_tegra::pcie_dma_windows(dtb_addr, dtb_size, &mut win);
+    if nd == 0 {
+        serial_println!(
+            "{}   [dmawin] no Tegra PCIe dma-ranges in this DTB — inbound-DMA window NOT derivable; heap-guard degrades to the highest-clean heuristic (QEMU-virt fallback path) ::",
+            P4
+        );
+    } else {
+        serial_println!(
+            "{}   [dmawin] derived {} inbound-DMA window(s) from dma-ranges; window[0] = [{:#x}, {:#x}) ::",
+            P4, nd, win[0].0, win[0].0.wrapping_add(win[0].1)
+        );
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════════
@@ -1316,6 +1333,54 @@ mod metal {
         unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
     }
 
+    /// ORIN-DMA-WINDOW — one-shot READ-ONLY probe (UNAOS_DMAWIN): dump the inbound-DMA window DERIVED
+    /// from the RC's `dma-ranges`, read BACK the just-programmed inbound iATU region-0 registers, and
+    /// cross-check both against the `ram_gib_mask`-derived identity window NET-4h armed. This closes the
+    /// loop the heap-guard opened: the next metal boot confirms the derivation (`pcie_dma_windows`,
+    /// which `select_heap_region` now constrains the heap to) matches the hardware the NIC actually
+    /// DMAs through. Reads only — no register write; the region was already armed above.
+    fn dmawin_probe(dtb_addr: u64, dtb_size: usize, atu_base: u64, dram_base: u64, dram_size: u64) {
+        // 1. The firmware-declared inbound window(s) from dma-ranges.
+        let mut win = [(0u64, 0u64); 8];
+        let nd = crate::arch::aarch64::fdt_tegra::pcie_dma_windows(dtb_addr, dtb_size, &mut win);
+        if nd == 0 {
+            serial_println!(
+                "{}   [dmawin] no PCIe dma-ranges derivable from DTB — inbound window is UNVERIFIED against firmware; iATU armed from ram_gib_mask identity only ::",
+                P4
+            );
+        } else {
+            for i in 0..nd {
+                serial_println!(
+                    "{}   [dmawin] derived inbound window[{}] = [{:#x}, {:#x}) ({} MiB) — the firmware-declared bus->CPU DMA reach ::",
+                    P4, i, win[i].0, win[i].0.wrapping_add(win[i].1), win[i].1 >> 20
+                );
+            }
+        }
+        // 2. Read back inbound region 0's live registers (BASE/LIMIT/TARGET/CTRL2).
+        let region = atu_base + ATU_INBOUND_DIR_OFF;
+        let r = |off: u64| -> u32 { unsafe { read_volatile((region + off) as *const u32) } };
+        let base = ((r(ATU_UNR_UPPER_BASE) as u64) << 32) | r(ATU_UNR_LOWER_BASE) as u64;
+        let limit = ((r(ATU_UNR_UPPER_LIMIT) as u64) << 32) | r(ATU_UNR_LOWER_LIMIT) as u64;
+        let target = ((r(ATU_UNR_UPPER_TARGET) as u64) << 32) | r(ATU_UNR_LOWER_TARGET) as u64;
+        let ctrl2 = r(ATU_UNR_REGION_CTRL2);
+        serial_println!(
+            "{}   [dmawin] inbound iATU region0 @ {:#x} readback: BASE={:#x} LIMIT={:#x} TARGET={:#x} CTRL2={:#010x} (enabled={}) ::",
+            P4, region, base, limit, target, ctrl2, (ctrl2 >> 31) & 1
+        );
+        // 3. Cross-check the programmed identity window vs the derivation.
+        let prog_lo = dram_base;
+        let prog_hi = dram_base.wrapping_add(dram_size);
+        let inside_derived = (0..nd).any(|i| prog_lo >= win[i].0 && prog_hi <= win[i].0.wrapping_add(win[i].1));
+        serial_println!(
+            "{}   [dmawin] programmed identity DRAM window [{:#x}, {:#x}) {} the {} derived dma-ranges window(s); readback BASE/TARGET {} the programmed base ::",
+            P4,
+            prog_lo, prog_hi,
+            if nd == 0 { "UNVERIFIED against" } else if inside_derived { "is INSIDE" } else { "DIVERGES from" },
+            nd,
+            if base == prog_lo && target == prog_lo { "MATCH" } else { "MISMATCH" }
+        );
+    }
+
     /// NET-4h — the identity DRAM window the inbound iATU must cover, derived from `ram_gib_mask` (bit
     /// `g` set ⇒ GiB `g` is RAM). Returns `[lowest RAM GiB .. highest RAM GiB]` as `(base, size)` so a
     /// single inbound region reaches every buffer the kernel heap can hand the NIC (on Orin the arena
@@ -1617,6 +1682,14 @@ mod metal {
             P4, ram_gib_mask, dram_base, dram_base + dram_size, dram_size >> 30
         );
         program_inbound_atu(atu_base, 0, dram_base, dram_size);
+
+        // ── ORIN-DMA-WINDOW (UNAOS_DMAWIN probe): one-shot confirmation that the DERIVED inbound window
+        //    (from the RC's dma-ranges) agrees with what NET-4h just programmed. Read-only + knob-gated
+        //    (default-quiet law); the next metal boot cross-checks the heap-guard's derivation against
+        //    the live iATU registers. Compiled in always (net4-gated already) but silent unless armed. ──
+        if option_env!("UNAOS_DMAWIN").is_some() {
+            dmawin_probe(dtb_addr, dtb_size, atu_base, dram_base, dram_size);
+        }
 
         // ── NET-4i: the SMMU stream for PCIe controller-0 — the layer BELOW the inbound iATU ─────────
         // The inbound iATU (above) is the DWC controller's internal PCIe↔fabric translation. AFTER it,

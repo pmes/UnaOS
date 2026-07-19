@@ -635,6 +635,115 @@ pub fn reserved_carveouts(dtb_addr: u64, dtb_size: usize, out: &mut [(u64, u64)]
     n
 }
 
+/// ORIN-DMA-WINDOW — derive the PCIe controller's INBOUND-DMA window(s) from the DTB `dma-ranges`.
+///
+/// The RAS-2 class (heap seated below the inbound-DMA window ⇒ the fabric translated the NIC's ring
+/// writebacks to ~0x0..0x200 ⇒ SNOC/IOB RAS Uncorrectable, cores off) was patched with a HEURISTIC
+/// (`select_heap_region` prefers the highest clean window). The real boundary is DERIVABLE, not
+/// folklore: a DesignWare/Tegra234 PCIe root complex declares its inbound bus→CPU windows in
+/// `dma-ranges`. Each row on THIS hardware (child #address-cells=3, parent #address-cells=2,
+/// #size-cells=2 ⇒ 3+2+2 = 7 cells = 28 bytes — the same stride the node's `ranges` uses, walked
+/// identically in `rtl8168_tegra::resolve_atu_and_window`) maps an incoming PCIe address to a PARENT
+/// (CPU/DRAM) address for `size` bytes; the parent side `[cpu_base, cpu_base+size)` is the window a
+/// bus-master write must land in to reach DRAM — below it is the RAS-2 fabric-error class. Writes each
+/// `(cpu_base, size)` into `out` and returns the count. READ-ONLY (the dtb is Normal-WB-mapped by the
+/// time `memory::init`/the NIC bring-up run).
+///
+/// Gated to the first firmware-`okay` Tegra DesignWare RC node (`tegra234/194-pcie` / `snps,dw-pcie`)
+/// — the SAME gate `resolve_ecam_base`/`resolve_atu_and_window` apply — so a QEMU-virt DTB (a generic
+/// `pcie@` that is not Tegra-compatible) yields 0 windows and the caller degrades to the highest-clean
+/// heuristic with a witness. A missing node, an absent `dma-ranges`, or a foreign DTB all return 0.
+/// (`nvidia,dma-*` props observed on Tegra234 are booleans — e.g. `dma-coherent` — not address
+/// windows; `dma-ranges` is the sole inbound-window source, so this parses exactly that.)
+pub fn pcie_dma_windows(dtb_addr: u64, dtb_size: usize, out: &mut [(u64, u64)]) -> usize {
+    if dtb_addr == 0 || dtb_size == 0 || dtb_size > 4 * 1024 * 1024 || out.is_empty() {
+        return 0;
+    }
+    let blob = unsafe { core::slice::from_raw_parts(dtb_addr as *const u8, dtb_size) };
+    let Some(fdt) = Fdt::new(blob) else { return 0 };
+
+    // First `pcie@` node's path (mirrors resolve_atu_and_window's walk).
+    let mut path0 = [0u8; MAX_PATH];
+    let mut plen0 = 0usize;
+    let mut found = false;
+    fdt.for_each_prop(|e| {
+        if found {
+            return;
+        }
+        let leaf = match e.path.iter().rposition(|&b| b == b'/') {
+            Some(i) => &e.path[i + 1..],
+            None => e.path,
+        };
+        if leaf.starts_with(b"pcie@") {
+            let l = e.path.len().min(MAX_PATH);
+            path0[..l].copy_from_slice(&e.path[..l]);
+            plen0 = l;
+            found = true;
+        }
+    });
+    if !found {
+        return 0;
+    }
+    let path = &path0[..plen0];
+
+    // compatible / status / dma-ranges of that node.
+    let mut compatible: Option<&[u8]> = None;
+    let mut status: Option<&[u8]> = None;
+    let mut dma_ranges: Option<&[u8]> = None;
+    fdt.for_each_prop(|e| {
+        if e.path != path {
+            return;
+        }
+        let val = &blob[e.val_off..e.val_off + e.val_len];
+        match e.name {
+            b"compatible" => compatible = Some(val),
+            b"status" => status = Some(val),
+            b"dma-ranges" => dma_ranges = Some(val),
+            _ => {}
+        }
+    });
+
+    // Tegra DesignWare RC + firmware-enabled? (same gate as resolve_atu_and_window / resolve_ecam_base.)
+    let is_tegra_rc = compatible
+        .map(|c| {
+            let has = |n: &[u8]| c.windows(n.len()).any(|w| w == n);
+            has(b"tegra234-pcie") || has(b"tegra194-pcie") || has(b"snps,dw-pcie")
+        })
+        .unwrap_or(false);
+    if !is_tegra_rc {
+        return 0;
+    }
+    let okay = match status {
+        None => true,
+        Some(s) => s.split(|&b| b == 0).any(|item| item == b"okay" || item == b"ok"),
+    };
+    if !okay {
+        return 0;
+    }
+
+    let Some(dma_ranges) = dma_ranges else {
+        return 0;
+    };
+    let cell = |b: &[u8], i: usize| -> u64 {
+        u32::from_be_bytes([b[i * 4], b[i * 4 + 1], b[i * 4 + 2], b[i * 4 + 3]]) as u64
+    };
+    let mut n = 0usize;
+    let mut off = 0usize;
+    while off + 28 <= dma_ranges.len() && n < out.len() {
+        let row = &dma_ranges[off..off + 28];
+        // child 3 cells (0=phys.hi/space, 1/2=PCI addr — inbound, identity on Tegra); parent 2 cells
+        // (3/4 = CPU/DRAM base); size 2 cells (5/6). The parent side is the inbound-DMA window.
+        let cpu_base = (cell(row, 3) << 32) | cell(row, 4);
+        let size = (cell(row, 5) << 32) | cell(row, 6);
+        if size != 0 {
+            out[n] = (cpu_base, size);
+            n += 1;
+        }
+        off += 28;
+    }
+    n
+}
+
 /// JB3 boot-6: census of EVERY smmu/iommu node the firmware DTB knows — name, compatible,
 /// first reg base. Boot-5's verdict (v2 pair open + fault-free, DMA still dead) means a second
 /// killer sits downstream; Tegra234 carries SMMUv3 instances alongside the MMU-500 pairs, and

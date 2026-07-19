@@ -632,6 +632,53 @@ Fix (tegra-gated; every other aarch64 target keeps the original selection byte-f
 places the heap clear of `0xbe000000` and the RAS no longer fires. QEMU cannot exercise this (tegra
 is metal-only; `virt`/`test-arm` prove only that the non-tegra path is unchanged).
 
+### ORIN-RAS-2 → ORIN-DMA-WINDOW — the heap-guard learns the REAL inbound-DMA window — **code fix, metal-owed**
+
+Boot-5 metal found a *second* RAS class one level up from the carveout fix: seating the heap at the
+DRAM base (`0x8000_0000`) put the NIC's DMA rings **below** the PCIe inbound-DMA window, so the fabric
+translated ring writebacks to ~`0x0..0x200` and returned *"Error response from slave"* (RAS
+Uncorrectable in the IOB, cores off). The interim fix (**ORIN-RAS-2**) made `select_heap_region` prefer
+the **highest** clean window rather than the first — data-justified (R22 sitting-2 proved the rings DMA
+correctly from a high-DRAM heap ~GiB 9), but the boundary was **folklore**, not derived.
+
+**ORIN-DMA-WINDOW** removes the folklore. The inbound window is DERIVABLE: a DesignWare/Tegra234 PCIe
+root complex declares its inbound bus→CPU windows in the DTB `dma-ranges` property.
+
+- `fdt_tegra::pcie_dma_windows` parses the first firmware-`okay` Tegra RC node's `dma-ranges` (rows of
+  3 child + 2 parent + 2 size cells = 28 bytes, the same stride the node's `ranges` uses) into the
+  parent-side `(cpu_base, size)` inbound window(s). READ-ONLY. Gated to the Tegra-compatible RC
+  (`tegra234/194-pcie` / `snps,dw-pcie`) — the same gate `resolve_ecam_base`/`resolve_atu_and_window`
+  use — so a foreign/QEMU-virt DTB yields 0 windows. (`nvidia,dma-*` props on Tegra234 are booleans
+  like `dma-coherent`, not address windows, so `dma-ranges` is the sole window source.)
+- `mmu_tegra::select_heap_region` now applies a **hard constraint**: when windows are derived, the
+  chosen heap base must fall fully **inside** one. It computes the highest carveout-clean base
+  intersected with the derived windows; a clean base that lies *outside* every window is refused
+  (**fail loud**), naming the best out-of-window base so the divergence is diagnosable rather than a
+  silent bad placement. Carveout exclusion + fail-closed-on-no-window are otherwise unchanged.
+- **Graceful degrade:** no `dma-ranges` / foreign DTB / QEMU-virt ⇒ 0 windows ⇒ the selector falls
+  back to the ORIN-RAS-2 highest-clean heuristic and witnesses the degrade
+  (`… RAS-2 heuristic — NO PCIe dma-ranges in DTB … degraded …`).
+- **Read-only probe** (`UNAOS_DMAWIN`, default-quiet): at NIC init `rtl8168_tegra::dmawin_probe`
+  dumps the derived window(s), reads BACK the just-programmed inbound iATU region-0
+  BASE/LIMIT/TARGET/CTRL2, and cross-checks the `ram_gib_mask`-derived identity window NET-4h armed
+  against the derivation — so the next metal boot confirms `select_heap_region`'s derivation matches
+  the hardware the NIC actually DMAs through.
+
+**Expected serial (metal, `UNAOS_NET4=1 UNAOS_TEGRA=1 UNAOS_DMAWIN=1`):**
+- `:: tegra: HEAP-GUARD — derived N PCIe inbound-DMA window(s) from dma-ranges; window[0] = [lo, hi) … ::`
+- `:: tegra: HEAP-GUARD — kernel heap [lo, hi) … highest clean window INSIDE the derived PCIe inbound-DMA window(s) (RAS-2 boundary now DERIVED, not folklore) … ::`
+- `:: PCIE4:   [dmawin] derived inbound window[0] = [lo, hi) … ::`
+- `:: PCIE4:   [dmawin] inbound iATU region0 @ … readback: BASE=… LIMIT=… TARGET=… CTRL2=… (enabled=1) ::`
+- `:: PCIE4:   [dmawin] programmed identity DRAM window [lo, hi) is INSIDE the N derived dma-ranges window(s); readback BASE/TARGET MATCH the programmed base ::`
+
+**QEMU (no-dma-ranges fallback, `UNAOS_GICV3=1 UNAOS_NET4=1 ./arroyo test-arm`):**
+- `:: PCIE4:   [dmawin] no Tegra PCIe dma-ranges in this DTB — inbound-DMA window NOT derivable; heap-guard degrades to the highest-clean heuristic (QEMU-virt fallback path) ::`
+followed by `:: CAPSTONE COMPLETE …`.
+
+**Metal-owed:** confirm on the Orin that the derived `dma-ranges` window contains the HEAP-GUARD heap
+placement and matches the NET-4h iATU readback (`UNAOS_DMAWIN=1`); QEMU exercises only the fallback +
+the non-tegra derivation (tegra is metal-only).
+
 ### JX1 result — XUSB first light (⛔ **the block is EL3-fatal to touch post-EBS; BPMP ungate required first**)
 
 The one-boot probe (a guarded read of the xHCI capability block @ `0x0361_0000`, the Linux DT

@@ -820,6 +820,14 @@ pub fn a78ae_errata_probe() {
 /// exclusion and fail-closed behavior exactly as-is. Per region we scan DOWN from
 /// `region_end - need`, sliding below overlapping carveouts (O(carveouts), not O(region/4K)), and
 /// return the highest clean base across all usable regions.
+///
+/// ORIN-DMA-WINDOW — stop trusting "highest clean" as a proxy for reachability; DERIVE the real
+/// inbound-DMA window. `fdt_tegra::pcie_dma_windows` parses the PCIe RC's `dma-ranges` into the
+/// firmware-declared bus→CPU inbound window(s). When windows are derived, the chosen heap base must
+/// fall fully INSIDE one — otherwise we fail closed (naming the best out-of-window base) rather than
+/// silently seat a DMA heap the fabric will reject (the RAS-2 class). When none are derivable (QEMU
+/// virt / foreign DTB / no `dma-ranges`) the selector degrades to the RAS-2 highest-clean heuristic
+/// and witnesses the degrade. Carveout exclusion + fail-closed behavior are otherwise unchanged.
 #[cfg(feature = "tegra")]
 pub fn select_heap_region(
     regions: &[MemoryRegion],
@@ -865,48 +873,102 @@ pub fn select_heap_region(
         hit
     };
 
-    // Highest clean window across ALL usable regions. Per region: scan DOWN from the top so the
-    // first clean base found is that region's highest; keep the greatest across regions.
-    let mut best: Option<u64> = None;
+    // ORIN-DMA-WINDOW — derive the REAL inbound-DMA window(s) from the PCIe RC's `dma-ranges` (not
+    // the RAS-2 "highest clean" folklore boundary). The kernel heap backs the NIC's RX/TX rings +
+    // buffers; those DMA-touched allocations MUST fall inside a declared inbound window or a
+    // bus-master writeback translates below it → the RAS-2 IOB/SNOC fabric-error class. An empty
+    // derivation (QEMU-virt / foreign DTB / no `dma-ranges`) means the window is not derivable on this
+    // boot ⇒ degrade to the RAS-2 highest-clean heuristic, but SAY SO on serial (fail loud, not silent).
+    let mut win = [(0u64, 0u64); 8];
+    let nd = super::fdt_tegra::pcie_dma_windows(dtb_addr, dtb_size, &mut win);
+    let windows = &win[..nd];
+
+    // Highest carveout-clean page-aligned base for a `need`-byte window inside `[lo, hi)`, or None.
+    // Scans DOWN from `hi - need`, sliding strictly below the highest overlapping carveout each step
+    // (O(carveouts), terminating — each slide strictly decreases `s`). Shared by the unconstrained
+    // (heuristic) and the window-constrained searches below.
+    let highest_clean_in = |lo: u64, hi: u64| -> Option<u64> {
+        if hi < need || hi - need < lo {
+            return None; // range can't hold a window
+        }
+        let mut s = (hi - need) & !(PAGE - 1);
+        loop {
+            if s < lo {
+                return None;
+            }
+            match overlap_max_base(s, s + need) {
+                None => return Some(s),
+                Some(cb) => {
+                    if cb < need {
+                        return None;
+                    }
+                    let next = (cb - need) & !(PAGE - 1);
+                    if next >= s {
+                        return None; // no downward progress (guard; shouldn't happen)
+                    }
+                    s = next;
+                }
+            }
+        }
+    };
+
+    // best_uncon: highest clean base across ALL usable regions (the RAS-2 heuristic — the fallback and
+    // the "what we'd have picked" diagnostic). best_in_win: the highest clean base that ALSO lies
+    // fully inside a derived inbound window (the intersection of each usable region with each window).
+    let mut best_uncon: Option<u64> = None;
+    let mut best_in_win: Option<u64> = None;
     for r in regions {
         if r.kind != MemoryRegionKind::Usable {
             continue;
         }
         let region_end = r.phys_start.wrapping_add((r.page_count * 4096) as u64);
         let region_base = (r.phys_start + PAGE - 1) & !(PAGE - 1);
-        if region_end < need || region_end - need < region_base {
-            continue; // region can't hold a window
+        if let Some(s) = highest_clean_in(region_base, region_end) {
+            best_uncon = Some(best_uncon.map_or(s, |b| b.max(s)));
         }
-        // Top candidate: highest page-aligned base with s + need <= region_end.
-        let mut s = (region_end - need) & !(PAGE - 1);
-        loop {
-            if s < region_base {
-                break; // no clean window in this region
+        for &(wb, ws) in windows {
+            let lo = region_base.max(wb);
+            let hi = region_end.min(wb.wrapping_add(ws));
+            if hi <= lo {
+                continue;
             }
-            match overlap_max_base(s, s + need) {
-                None => {
-                    best = Some(best.map_or(s, |b| b.max(s)));
-                    break;
-                }
-                Some(cb) => {
-                    // Slide the window strictly below the highest overlapping carveout, page-aligned
-                    // down; re-check clears any lower carveouts now spanned.
-                    if cb < need {
-                        break; // nothing fits below this carveout
-                    }
-                    let next = (cb - need) & !(PAGE - 1);
-                    if next >= s {
-                        break; // no downward progress possible (shouldn't happen; guard anyway)
-                    }
-                    s = next;
-                }
+            if let Some(s) = highest_clean_in(lo, hi) {
+                best_in_win = Some(best_in_win.map_or(s, |b| b.max(s)));
             }
         }
     }
 
-    if let Some(s) = best {
+    if nd == 0 {
+        // No derivable inbound window: keep the RAS-2 highest-clean heuristic, but witness the degrade.
+        if let Some(s) = best_uncon {
+            serial_println!(
+                ":: tegra: HEAP-GUARD — kernel heap [{:#x}, {:#x}) ({} MiB), highest clean window (RAS-2 heuristic — NO PCIe dma-ranges in DTB, inbound-DMA window NOT derivable; degraded), clear of {} carveout range(s) (UEFI-reserved + DTB /reserved-memory) ::",
+                s,
+                s + need,
+                need >> 20,
+                nc
+            );
+            return Some((s as usize, need as usize));
+        }
         serial_println!(
-            ":: tegra: HEAP-GUARD — kernel heap [{:#x}, {:#x}) ({} MiB), highest clean window (PCIe inbound-DMA reachability, RAS-2), clear of {} carveout range(s) (UEFI-reserved + DTB /reserved-memory) ::",
+            ":: tegra: HEAP-GUARD — FAIL-CLOSED: no {} MiB DRAM window clear of {} carveout(s) ::",
+            need >> 20,
+            nc
+        );
+        return None;
+    }
+
+    // Derived window(s) in hand — name the derivation, then require containment (fail loud otherwise).
+    serial_println!(
+        ":: tegra: HEAP-GUARD — derived {} PCIe inbound-DMA window(s) from dma-ranges; window[0] = [{:#x}, {:#x}) ({} MiB) ::",
+        nd,
+        windows[0].0,
+        windows[0].0.wrapping_add(windows[0].1),
+        windows[0].1 >> 20
+    );
+    if let Some(s) = best_in_win {
+        serial_println!(
+            ":: tegra: HEAP-GUARD — kernel heap [{:#x}, {:#x}) ({} MiB), highest clean window INSIDE the derived PCIe inbound-DMA window(s) (RAS-2 boundary now DERIVED, not folklore), clear of {} carveout range(s) (UEFI-reserved + DTB /reserved-memory) ::",
             s,
             s + need,
             need >> 20,
@@ -915,10 +977,14 @@ pub fn select_heap_region(
         return Some((s as usize, need as usize));
     }
 
+    // A carveout-clean window exists but NONE inside the derived inbound window ⇒ any pick would
+    // re-arm the RAS-2 fabric-error class. Refuse, naming the best out-of-window base we would have
+    // taken so the divergence is diagnosable rather than a silent bad placement.
     serial_println!(
-        ":: tegra: HEAP-GUARD — FAIL-CLOSED: no {} MiB DRAM window clear of {} carveout(s) ::",
+        ":: tegra: HEAP-GUARD — FAIL-CLOSED: no {} MiB carveout-clean window falls inside the {} derived PCIe inbound-DMA window(s); best clean-but-out-of-window base = {:#x} — REFUSING (would re-arm the RAS-2 inbound fabric-error class) ::",
         need >> 20,
-        nc
+        nd,
+        best_uncon.unwrap_or(0)
     );
     None
 }
