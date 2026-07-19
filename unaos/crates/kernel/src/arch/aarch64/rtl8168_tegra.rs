@@ -181,6 +181,121 @@ mod metal {
     const RX_BUF_SIZE: usize = 2048;
     const TX_BUF_SIZE: usize = 2048;
 
+    // ── NET-4d: RX-window frame classification (the DHCP no-lease RX-side proof) ──
+    // Bounds the per-frame serial noise: a full L2/L3/L4 line for the first NET4D_FULL_LINES popped
+    // frames, ALWAYS a full line for any BOOTP/DHCP (UDP port 67/68) frame, and a per-category tally
+    // for a single window-close summary. Reads frame bytes only; writes no device register.
+    const NET4D_FULL_LINES: u64 = 8;
+    const RXCAT_N: usize = 6;
+    const RXCAT_ARP: usize = 0;
+    const RXCAT_DHCP: usize = 1;
+    const RXCAT_UDP_OTHER: usize = 2;
+    const RXCAT_IPV4_OTHER: usize = 3;
+    const RXCAT_IPV6: usize = 4;
+    const RXCAT_OTHER: usize = 5;
+
+    /// A decoded IPv4/UDP/BOOTP view of a frame — the fields the DHCP no-lease investigation needs.
+    #[derive(Clone, Copy)]
+    struct DhcpInfo {
+        sport: u16,
+        dport: u16,
+        sip: [u8; 4],
+        dip: [u8; 4],
+        /// BOOTP op (1 = BOOTREQUEST from client, 2 = BOOTREPLY from server).
+        op: u8,
+        /// DHCP message type (option 53): 1 DISCOVER, 2 OFFER, 3 REQUEST, 5 ACK, 6 NAK, … 0 = none.
+        mtype: u8,
+        /// BOOTP transaction id — the DISCOVER/OFFER correlation the no-lease proof turns on.
+        xid: u32,
+        /// "your" IP address the server offers (BOOTP yiaddr).
+        yiaddr: [u8; 4],
+    }
+
+    /// The human name of a DHCP message type (option 53) for the classification lines.
+    fn dhcp_mtype_name(t: u8) -> &'static str {
+        match t {
+            1 => "DISCOVER",
+            2 => "OFFER",
+            3 => "REQUEST",
+            4 => "DECLINE",
+            5 => "ACK",
+            6 => "NAK",
+            7 => "RELEASE",
+            8 => "INFORM",
+            _ => "none/?",
+        }
+    }
+
+    /// Decode `frame` as Ethernet/IPv4/UDP/BOOTP, returning the [`DhcpInfo`] view iff it is a UDP frame
+    /// on the BOOTP port pair (67/68). READ-ONLY and fully bounds-checked at every step — a malformed or
+    /// truncated frame returns `None`, never a panic or an out-of-bounds read. Shared by the TX-time
+    /// DISCOVER-xid capture and the RX-window classifier.
+    fn decode_dhcp(frame: &[u8]) -> Option<DhcpInfo> {
+        if frame.len() < 14 {
+            return None;
+        }
+        // EtherType must be IPv4 (0x0800).
+        if u16::from_be_bytes([frame[12], frame[13]]) != 0x0800 {
+            return None;
+        }
+        let ip = frame.get(14..)?;
+        if ip.len() < 20 || (ip[0] >> 4) != 4 {
+            return None;
+        }
+        let ihl = ((ip[0] & 0x0f) as usize) * 4;
+        if ihl < 20 || ip.len() < ihl + 8 {
+            return None;
+        }
+        // Protocol 17 = UDP.
+        if ip[9] != 17 {
+            return None;
+        }
+        let sip = [ip[12], ip[13], ip[14], ip[15]];
+        let dip = [ip[16], ip[17], ip[18], ip[19]];
+        let udp = &ip[ihl..];
+        let sport = u16::from_be_bytes([udp[0], udp[1]]);
+        let dport = u16::from_be_bytes([udp[2], udp[3]]);
+        if !matches!(sport, 67 | 68) && !matches!(dport, 67 | 68) {
+            return None;
+        }
+        // BOOTP fixed header (236 bytes) + the 4-byte DHCP magic cookie.
+        let bootp = udp.get(8..)?;
+        if bootp.len() < 240 {
+            return None;
+        }
+        let op = bootp[0];
+        let xid = u32::from_be_bytes([bootp[4], bootp[5], bootp[6], bootp[7]]);
+        let yiaddr = [bootp[16], bootp[17], bootp[18], bootp[19]];
+        // DHCP message type (option 53) — only if the magic cookie is present and the options parse.
+        let mut mtype = 0u8;
+        if bootp[236] == 0x63 && bootp[237] == 0x82 && bootp[238] == 0x53 && bootp[239] == 0x63 {
+            let opts = &bootp[240..];
+            let mut i = 0usize;
+            while i < opts.len() {
+                let tag = opts[i];
+                if tag == 0xff {
+                    break; // End option.
+                }
+                if tag == 0x00 {
+                    i += 1; // Pad option (no length byte).
+                    continue;
+                }
+                if i + 1 >= opts.len() {
+                    break;
+                }
+                let l = opts[i + 1] as usize;
+                if i + 2 + l > opts.len() {
+                    break;
+                }
+                if tag == 53 && l >= 1 {
+                    mtype = opts[i + 2];
+                }
+                i += 2 + l;
+            }
+        }
+        Some(DhcpInfo { sport, dport, sip, dip, op, mtype, xid, yiaddr })
+    }
+
     // ── PCI config-space offsets (in the ECAM, at bus1:dev0:fn0) ──
     const CFG_VENDOR: u64 = 0x00;
     const CFG_COMMAND: u64 = 0x04;
@@ -210,6 +325,17 @@ mod metal {
         /// NET-4c: TX descriptors the NIC never handed back (OWN stayed set) — the
         /// did-a-frame-ever-LEAVE-the-NIC counter for the DHCP no-lease investigation.
         tx_stalled: u64,
+        /// NET-4d: the DHCP DISCOVER's BOOTP transaction id, captured at TX time, so RX-side DHCP
+        /// frames can be matched/mismatched against it explicitly. `None` until the DISCOVER is sent.
+        d_xid: Option<u32>,
+        /// NET-4d: RX frames given a full classification line so far — bounds the per-frame noise to
+        /// the first `NET4D_FULL_LINES` popped frames (BOOTP/DHCP frames always print regardless).
+        rxcls_full: u64,
+        /// NET-4d: per-category RX frame tallies for the single window-close summary.
+        rxcat: [u64; RXCAT_N],
+        /// NET-4d: classification is live only across the DHCP discover window; closed at window end
+        /// so the post-window bounded ICMP poll does not re-classify.
+        rxcls_active: bool,
     }
 
     // The driver owns raw DMA pointers; on the single-CPU main-loop/poll discipline it is only ever
@@ -410,6 +536,19 @@ mod metal {
         /// wait (bounded) for the NIC to clear OWN. A stalled link leaves OWN set — surfaced, not
         /// silently counted. Mirrors the e1000 `transmit` head/tail discipline.
         fn transmit(&mut self, frame: &[u8]) {
+            // NET-4d: capture the DHCP DISCOVER's transaction id the first time we send one, so the
+            // RX-window classifier can match/mismatch inbound OFFERs against it. Read-only parse.
+            if self.d_xid.is_none() {
+                if let Some(di) = decode_dhcp(frame) {
+                    if di.op == 1 && di.mtype == 1 {
+                        self.d_xid = Some(di.xid);
+                        serial_println!(
+                            "{}   [net4d] TX DHCP DISCOVER xid={:#010x} (udp {}->{}, {} bytes) — captured for RX xid-match ::",
+                            P4, di.xid, di.sport, di.dport, frame.len()
+                        );
+                    }
+                }
+            }
             let i = self.tx_cur;
             let len = frame.len().min(TX_BUF_SIZE);
             let buf = unsafe { self.tx_buffers.add(i * TX_BUF_SIZE) };
@@ -477,6 +616,141 @@ mod metal {
                 self.rx_count, rx_filled, NUM_RX);
         }
 
+        /// NET-4d: classify one popped RX frame during the DHCP discover window and emit a bounded,
+        /// read-only evidence line (the RX-side proof for the no-lease: does the OFFER arrive, and if
+        /// so does the driver-visible accept path take it?). A full L2/L3/L4 line for the first
+        /// `NET4D_FULL_LINES` frames and ALWAYS for any BOOTP/DHCP (UDP 67/68) frame; every frame is
+        /// tallied by category for the window-close summary. For a DHCP frame the BOOTP op / message
+        /// type / xid / yiaddr are decoded and the xid is matched against the captured DISCOVER xid;
+        /// an OFFER is additionally checked against the driver-visible accept conditions. Read-only.
+        fn net4d_classify(&mut self, frame: &[u8]) {
+            if !self.rxcls_active {
+                return;
+            }
+            let idx = self.rx_count;
+            let len = frame.len();
+            if len < 14 {
+                self.rxcat[RXCAT_OTHER] += 1;
+                if self.rxcls_full < NET4D_FULL_LINES {
+                    self.rxcls_full += 1;
+                    serial_println!("{}   [net4d] rx[{}] len={} runt(<14) — class=other ::", P4, idx, len);
+                }
+                return;
+            }
+            let d = &frame[0..6];
+            let s = &frame[6..12];
+            let et = u16::from_be_bytes([frame[12], frame[13]]);
+
+            // BOOTP/DHCP: full line ALWAYS (unbounded), the frame the investigation is about.
+            if let Some(di) = decode_dhcp(frame) {
+                self.rxcat[RXCAT_DHCP] += 1;
+                self.rxcls_full = self.rxcls_full.saturating_add(1);
+                let (xtok, xexp) = match self.d_xid {
+                    Some(x) if x == di.xid => ("MATCH", x),
+                    Some(x) => ("MISMATCH", x),
+                    None => ("no-DISCOVER-xid-seen", 0),
+                };
+                serial_println!(
+                    "{}   [net4d] rx[{}] len={} dst={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} src={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} DHCP {}.{}.{}.{}:{}->{}.{}.{}.{}:{} op={} type={}({}) xid={:#010x} vs-DISCOVER {:#010x} [{}] yiaddr={}.{}.{}.{} ::",
+                    P4, idx, len,
+                    d[0], d[1], d[2], d[3], d[4], d[5],
+                    s[0], s[1], s[2], s[3], s[4], s[5],
+                    di.sip[0], di.sip[1], di.sip[2], di.sip[3], di.sport,
+                    di.dip[0], di.dip[1], di.dip[2], di.dip[3], di.dport,
+                    di.op, di.mtype, dhcp_mtype_name(di.mtype), di.xid, xexp, xtok,
+                    di.yiaddr[0], di.yiaddr[1], di.yiaddr[2], di.yiaddr[3]
+                );
+                // Item 3: an OFFER that a lease never followed — name the driver-visible check.
+                if di.mtype == 2 {
+                    self.net4d_offer_check(&di, d);
+                }
+                return;
+            }
+
+            // Non-DHCP: categorize (for the summary) and print a full L2 line only within the bound.
+            let cat = match et {
+                0x0806 => RXCAT_ARP,
+                0x86dd => RXCAT_IPV6,
+                0x0800 => {
+                    let ip = &frame[14..];
+                    if ip.len() >= 20 && (ip[0] >> 4) == 4 {
+                        let ihl = ((ip[0] & 0x0f) as usize) * 4;
+                        if ihl >= 20 && ip.len() >= ihl + 4 && ip[9] == 17 {
+                            RXCAT_UDP_OTHER
+                        } else {
+                            RXCAT_IPV4_OTHER
+                        }
+                    } else {
+                        RXCAT_IPV4_OTHER
+                    }
+                }
+                _ => RXCAT_OTHER,
+            };
+            self.rxcat[cat] += 1;
+            if self.rxcls_full < NET4D_FULL_LINES {
+                self.rxcls_full += 1;
+                let name = match cat {
+                    RXCAT_ARP => "arp",
+                    RXCAT_UDP_OTHER => "udp-other",
+                    RXCAT_IPV4_OTHER => "ipv4-other",
+                    RXCAT_IPV6 => "ipv6",
+                    _ => "other",
+                };
+                serial_println!(
+                    "{}   [net4d] rx[{}] len={} dst={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} src={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} et={:#06x} class={} ::",
+                    P4, idx, len,
+                    d[0], d[1], d[2], d[3], d[4], d[5],
+                    s[0], s[1], s[2], s[3], s[4], s[5],
+                    et, name
+                );
+            }
+        }
+
+        /// NET-4d: for an inbound DHCP OFFER (message type 2), name the FIRST driver-visible accept
+        /// condition it fails — the xid must equal the DISCOVER's, and the destination MAC must be our
+        /// station MAC or broadcast. If it passes both, the drop is ABOVE the driver (the smoltcp
+        /// dhcpv4 socket), and we say so explicitly rather than blame the wire. Read-only.
+        fn net4d_offer_check(&self, di: &DhcpInfo, dst: &[u8]) {
+            let xid_ok = self.d_xid == Some(di.xid);
+            let is_bcast = dst.iter().all(|&b| b == 0xff);
+            let is_ours = dst == &self.mac[..];
+            if !xid_ok {
+                serial_println!(
+                    "{}   [net4d] OFFER xid {:#010x} != DISCOVER xid {:#010x} — driver-visible REJECT: wrong transaction ::",
+                    P4, di.xid, self.d_xid.unwrap_or(0)
+                );
+            } else if !(is_bcast || is_ours) {
+                serial_println!(
+                    "{}   [net4d] OFFER xid matches but dst MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} is neither our station MAC nor broadcast — driver-visible REJECT: addressed elsewhere ::",
+                    P4, dst[0], dst[1], dst[2], dst[3], dst[4], dst[5]
+                );
+            } else {
+                serial_println!(
+                    "{}   [net4d] OFFER xid matches DISCOVER + addressed to us ({}) yiaddr={}.{}.{}.{} — passes ALL driver-visible checks; if no lease followed, the drop is ABOVE the driver (smoltcp dhcpv4 socket) ::",
+                    P4, if is_bcast { "broadcast" } else { "unicast" },
+                    di.yiaddr[0], di.yiaddr[1], di.yiaddr[2], di.yiaddr[3]
+                );
+            }
+        }
+
+        /// NET-4d: close the classification window — emit the per-category RX summary once and stop
+        /// classifying (so the post-window bounded ICMP poll does not re-classify). Read-only.
+        fn net4d_window_close(&mut self) {
+            self.rxcls_active = false;
+            let xid = match self.d_xid {
+                Some(x) => x,
+                None => 0,
+            };
+            serial_println!(
+                "{}   [net4d window-close] RX by category: arp={} dhcp={} udp-other={} ipv4-other={} ipv6={} other={} (total popped={}); DISCOVER xid={:#010x} ({}) ::",
+                P4,
+                self.rxcat[RXCAT_ARP], self.rxcat[RXCAT_DHCP], self.rxcat[RXCAT_UDP_OTHER],
+                self.rxcat[RXCAT_IPV4_OTHER], self.rxcat[RXCAT_IPV6], self.rxcat[RXCAT_OTHER],
+                self.rx_count, xid,
+                if self.d_xid.is_some() { "sent" } else { "NEVER SENT" }
+            );
+        }
+
         /// Pop one completed RX descriptor's raw Ethernet frame into `out` and recycle the descriptor
         /// (re-arm OWN + buffer size), advancing the ring cursor. Returns the copied length, or `None`
         /// if the current descriptor is still NIC-owned (ring empty). The C+ analog of the e1000
@@ -499,6 +773,9 @@ mod metal {
                 );
             }
             self.rx_count += 1;
+            // NET-4d: classify this frame (bounded, read-only) while the DHCP discover window is live.
+            // Borrows `out` (not `self`), so the &mut self counter updates do not alias.
+            self.net4d_classify(&out[..len]);
             // Recycle: re-arm this descriptor for the NIC (OWN + buffer size + EOR on the last slot).
             let eor = if self.rx_cur == NUM_RX - 1 { DESC_EOR } else { 0 };
             let nd = Desc {
@@ -1012,6 +1289,10 @@ mod metal {
             tx_cur: 0,
             tx_count: 0,
             tx_stalled: 0,
+            d_xid: None,
+            rxcls_full: 0,
+            rxcat: [0; RXCAT_N],
+            rxcls_active: true,
         };
 
         // ── M2/M3 GUARD: poison-honest readback through the NEW window BEFORE any register write ──
@@ -1183,6 +1464,11 @@ mod metal {
         // the same evidence shape.
         if let Some(n) = NET4_DEVICE.lock().as_ref() {
             n.net4c_evidence("post-discover-window");
+        }
+        // NET-4d: close the RX-window classifier and emit the per-category summary (the RX-side proof
+        // for the no-lease — did the OFFER arrive, and did the driver-visible accept path take it?).
+        if let Some(n) = NET4_DEVICE.lock().as_mut() {
+            n.net4d_window_close();
         }
 
         // One ICMP socket, so the poll has a real socket set to service (proves the full seam binds).
