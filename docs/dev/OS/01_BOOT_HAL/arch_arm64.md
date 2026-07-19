@@ -5946,6 +5946,59 @@ The new QEMU chain (verbatim), between the gate-enable and the probe:
 :: V3D: probe verdict BLOCK-DOWN — hub IDENT0 = 0x00000000 (block absent/unpowered; expected in QEMU raspi4b) ...
 ```
 
+### PI-V3D-4 — the M2 MMU program that read back zero (fabricated register constants)
+
+**The V3D-3 metal verdict (2026-07-18, LC-metal R22 sitting-2, non-relitigable ground truth).** The
+PM/ASB step landed: the probe now reaches **BLOCK-UP** on silicon with a live V3D identity, and the
+hub + core IDENT windows all read real values:
+```
+:: V3D: probe verdict BLOCK-UP — hub IDENT0 = 0x42554856 (live V3D identity) ::
+:: V3D: HUB_IDENT1..3 = 0x000e1124 0x00000100 0x00000e00 ::
+:: V3D: CTL_IDENT0..2 = 0x04443356 0x81001422 0x40078121 ::
+:: V3D: MMU CTL=0x00000000 VIO_ADDR=0x00000000 DEBUG=0x00000000 (mapped 64 arena pages @ 0x154000) ::
+:: V3D: M2 MMU program FAILED — halting bring-up (fail-closed) ::
+```
+So the block is powered, clocked, out of reset, bridged, and decoding — every IDENT is live — yet the
+MMU register window at hub `+0x1200` reads all-zero after programming, and the enable-verify fails
+closed.
+
+**Root cause: the `V3D_MMU_CTL_*` bit constants and two MMU offsets in `v3d.rs` were fabricated, not
+transcribed from `v3d_regs.h`.** The old constants placed the control bits at the *top* of the word
+(`ENABLE=1<<31`, `PT_INVALID_ENABLE=1<<30`, `PT_INVALID_ABORT=1<<29`, `WRITE_VIOLATION_ABORT=1<<21`,
+`TLB_CLEAR=1<<3`, `TLB_CLEARING=1<<2`). The real hardware layout is at the *bottom*:
+`ENABLE=BIT(0)`, `PT_INVALID_ENABLE=BIT(16)`, `PT_INVALID_ABORT=BIT(19)`,
+`WRITE_VIOLATION_ABORT=BIT(11)`, `TLB_CLEAR=BIT(2)`, `TLB_CLEARING=BIT(7)`. Consequences, exactly
+matching the capture:
+  1. The "enable" write (`0xE0200000`) set only **reserved** bits — real `ENABLE` (bit 0) stayed
+     clear, so the MMU was **never enabled**.
+  2. Reserved/undefined bits do not latch, so the `V3D_MMU_CTL` readback returns `0x00000000`.
+  3. The verify `ctl & ENABLE(=1<<31)` reads zero → `program_mmu` fail-closes and halts M2. This is the
+     verbatim `MMU CTL=0x00000000 … M2 MMU program FAILED` line — a pure software constants bug, not a
+     silicon or bring-up defect.
+
+Two register **offsets** were also off by a slot: `VIO_ADDR` pointed at `V3D_MMU_HIT` (`0x1208`) and
+`DEBUG_INFO` at `V3D_MMU_VIO_ADDR` (`0x1234`). Corrected to the `v3d_regs.h` map
+(`0x1230 ILLEGAL_ADDR · 0x1234 VIO_ADDR · 0x1238 DEBUG_INFO`). (The PTE bits `VALID=BIT(28)` /
+`WRITEABLE=BIT(29)`, the `MMUC_CONTROL` bits, and `ILLEGAL_ADDR_ENABLE=BIT(31)` were already correct
+and are unchanged.)
+
+**Fix (`v3d.rs`).** The constants are now transcribed verbatim from `torvalds/linux`
+`drivers/gpu/drm/v3d/v3d_regs.h` (with a comment recording the corrected slot map). `program_mmu` now
+(a) prints the values it is about to program (`PT_PA_BASE`, `CTL`, `ILLEGAL_ADDR`), (b) issues a
+`dsb sy` between the programming writes and the readback so the program→verify handoff across the async
+AXI bridge is explicit, and (c) prints a single richer readback line — `CTL`, decoded `ENABLE=`,
+`PT_PA_BASE`, `VIO_ADDR`, `DEBUG` — so the next metal verdict is one line. Fail-closed posture is
+unchanged: if `CTL.ENABLE` still does not latch, M2 halts exactly as before and the SError-drain runs.
+
+New witness lines (metal — QEMU stays BLOCK-DOWN and never reaches M2):
+```
+:: V3D: MMU program — PT_PA_BASE<=0x000000NN (pt@0xNNNNN) CTL<=0x00090801 ILLEGAL_ADDR<=0x800000NN ::
+:: V3D: MMU readback CTL=0x000NNNNN (ENABLE=1) PT_PA_BASE=0x000000NN VIO_ADDR=0x00000000 DEBUG=0x00NNNNNN (mapped 64 arena pages @ 0x154000) ::
+```
+The programmed `CTL` value is now `0x00090801` = `ENABLE(0) | WRITE_VIOLATION_ABORT(11) |
+PT_INVALID_ENABLE(16) | PT_INVALID_ABORT(19)`. **Metal-owed:** confirm `ENABLE=1` on the readback and
+that `DEBUG_INFO` decodes a plausible VA/PA width + MMU version (M2 PASS), then M3.
+
 ### References of record
 
 - Register layout: Linux `drivers/gpu/drm/v3d/v3d_regs.h` (hub + core + MMU offsets, field bits).

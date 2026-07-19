@@ -86,23 +86,32 @@ const V3D_HUB_IDENT1: usize = 0x000C;
 const V3D_HUB_IDENT2: usize = 0x0010;
 const V3D_HUB_IDENT3: usize = 0x0014;
 
-// V3D MMU (in the hub), per v3d_regs.h / v3d_mmu.c.
+// V3D MMU (in the hub), per v3d_regs.h / v3d_mmu.c. The register OFFSETS and the V3D_MMU_CTL BIT
+// FIELDS below are transcribed verbatim from Linux `drivers/gpu/drm/v3d/v3d_regs.h` (torvalds/linux
+// master). PI-V3D-4 root cause: the earlier constants here were fabricated. V3D_MMU_VIO_ADDR/
+// DEBUG_INFO pointed at V3D_MMU_HIT (0x1208) / VIO_ADDR (0x1234) instead of the real slots, and —
+// fatally — the CTL bit fields were invented at the *top* of the word (ENABLE=1<<31 …). The real
+// ENABLE is BIT(0): the enable write therefore set only reserved bits, so the MMU never enabled and
+// the readback (undefined/reserved bits do not latch) came back 0x00000000 — precisely the "M2 MMU
+// program writes read back zero" metal symptom (R22 sitting-2). Correct layout:
+//   0x1204 PT_PA_BASE · 0x1208 HIT · 0x120c MISSES · 0x1210 STALLS · 0x1214 ADDR_CAP ·
+//   0x122c VIO_ID · 0x1230 ILLEGAL_ADDR · 0x1234 VIO_ADDR · 0x1238 DEBUG_INFO.
 const V3D_MMUC_CONTROL: usize = 0x1000;
 const V3D_MMU_CTL: usize = 0x1200;
 const V3D_MMU_PT_PA_BASE: usize = 0x1204;
-const V3D_MMU_VIO_ADDR: usize = 0x1208;
 const V3D_MMU_ILLEGAL_ADDR: usize = 0x1230;
-const V3D_MMU_DEBUG_INFO: usize = 0x1234;
+const V3D_MMU_VIO_ADDR: usize = 0x1234;
+const V3D_MMU_DEBUG_INFO: usize = 0x1238;
 
 const V3D_MMUC_CONTROL_ENABLE: u32 = 1 << 0;
 const V3D_MMUC_CONTROL_FLUSH: u32 = 1 << 1;
 
-const V3D_MMU_CTL_ENABLE: u32 = 1 << 31;
-const V3D_MMU_CTL_PT_INVALID_ENABLE: u32 = 1 << 30;
-const V3D_MMU_CTL_PT_INVALID_ABORT: u32 = 1 << 29;
-const V3D_MMU_CTL_WRITE_VIOLATION_ABORT: u32 = 1 << 21;
-const V3D_MMU_CTL_TLB_CLEAR: u32 = 1 << 3;
-const V3D_MMU_CTL_TLB_CLEARING: u32 = 1 << 2;
+const V3D_MMU_CTL_ENABLE: u32 = 1 << 0;
+const V3D_MMU_CTL_PT_INVALID_ENABLE: u32 = 1 << 16;
+const V3D_MMU_CTL_PT_INVALID_ABORT: u32 = 1 << 19;
+const V3D_MMU_CTL_WRITE_VIOLATION_ABORT: u32 = 1 << 11;
+const V3D_MMU_CTL_TLB_CLEAR: u32 = 1 << 2;
+const V3D_MMU_CTL_TLB_CLEARING: u32 = 1 << 7;
 const V3D_MMU_ILLEGAL_ADDR_ENABLE: u32 = 1 << 31;
 
 // V3D MMU PTE bits (v3d_mmu.c). The page-number field is phys >> 12.
@@ -154,6 +163,13 @@ fn mmio_read(base: usize, off: usize) -> u32 {
 #[inline]
 fn mmio_write(base: usize, off: usize, val: u32) {
     unsafe { core::ptr::write_volatile((base + off) as *mut u32, val) }
+}
+/// Full system barrier — ensure prior Device-nGnRnE register writes have reached the endpoint before
+/// the following readback observes their effect. Device memory is already strongly ordered, but the
+/// V3D hub sits behind the async AXI bridge; a `dsb sy` makes the program→verify handoff explicit.
+#[inline]
+fn dsb() {
+    unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
 }
 
 /// ARM physical base of the arena (== its VA under the identity map).
@@ -481,22 +497,21 @@ fn program_mmu() -> bool {
 
     // Program the MMU: table base (in pages), fault-abort policy, illegal-address catcher, enable +
     // flush. Sequence per v3d_mmu.c::v3d_mmu_set_page_table + v3d_mmu_flush_all.
-    mmio_write(V3D_HUB_BASE, V3D_MMU_PT_PA_BASE, (pt_phys() >> V3D_MMU_PAGE_SHIFT) as u32);
-    mmio_write(
-        V3D_HUB_BASE,
-        V3D_MMU_CTL,
-        V3D_MMU_CTL_ENABLE
-            | V3D_MMU_CTL_PT_INVALID_ENABLE
-            | V3D_MMU_CTL_PT_INVALID_ABORT
-            | V3D_MMU_CTL_WRITE_VIOLATION_ABORT,
+    let pt_base_pages = (pt_phys() >> V3D_MMU_PAGE_SHIFT) as u32;
+    let ctl_want = V3D_MMU_CTL_ENABLE
+        | V3D_MMU_CTL_PT_INVALID_ENABLE
+        | V3D_MMU_CTL_PT_INVALID_ABORT
+        | V3D_MMU_CTL_WRITE_VIOLATION_ABORT;
+    let illegal_want = ((base >> V3D_MMU_PAGE_SHIFT) as u32) | V3D_MMU_ILLEGAL_ADDR_ENABLE;
+    serial_println!(
+        ":: V3D: MMU program — PT_PA_BASE<={:#010x} (pt@{:#x}) CTL<={:#010x} ILLEGAL_ADDR<={:#010x} ::",
+        pt_base_pages, pt_phys(), ctl_want, illegal_want
     );
+    mmio_write(V3D_HUB_BASE, V3D_MMU_PT_PA_BASE, pt_base_pages);
+    mmio_write(V3D_HUB_BASE, V3D_MMU_CTL, ctl_want);
     // Illegal-address trap points at arena page 0 (a benign in-arena page) with the enable bit; a
     // stray access lands there instead of undefined RAM.
-    mmio_write(
-        V3D_HUB_BASE,
-        V3D_MMU_ILLEGAL_ADDR,
-        ((base >> V3D_MMU_PAGE_SHIFT) as u32) | V3D_MMU_ILLEGAL_ADDR_ENABLE,
-    );
+    mmio_write(V3D_HUB_BASE, V3D_MMU_ILLEGAL_ADDR, illegal_want);
 
     // Flush the MMU cache + TLB. Finite backstop on the TLB-clearing bit (never an unbounded spin).
     mmio_write(V3D_HUB_BASE, V3D_MMUC_CONTROL, V3D_MMUC_CONTROL_FLUSH | V3D_MMUC_CONTROL_ENABLE);
@@ -505,15 +520,22 @@ fn program_mmu() -> bool {
         return false;
     }
 
-    // Verify: MMU reports enabled, no violation address latched.
+    // Ensure the programming writes have landed at the hub before we read the state back.
+    dsb();
+
+    // Verify: MMU reports enabled (CTL.ENABLE=bit0 latched), no violation address latched. The
+    // readback is now against the CORRECT offsets/bits — a live block echoes ENABLE|PT_INVALID_ENABLE|
+    // aborts; the all-zero readback that fail-closed on metal was the fabricated-constants bug.
     let ctl = mmio_read(V3D_HUB_BASE, V3D_MMU_CTL);
+    let ptb = mmio_read(V3D_HUB_BASE, V3D_MMU_PT_PA_BASE);
     let vio = mmio_read(V3D_HUB_BASE, V3D_MMU_VIO_ADDR);
     let dbg = mmio_read(V3D_HUB_BASE, V3D_MMU_DEBUG_INFO);
+    let enabled = ctl & V3D_MMU_CTL_ENABLE != 0;
     serial_println!(
-        ":: V3D: MMU CTL={:#010x} VIO_ADDR={:#010x} DEBUG={:#010x} (mapped {} arena pages @ {:#x}) ::",
-        ctl, vio, dbg, ARENA_PAGES, base
+        ":: V3D: MMU readback CTL={:#010x} (ENABLE={}) PT_PA_BASE={:#010x} VIO_ADDR={:#010x} DEBUG={:#010x} (mapped {} arena pages @ {:#x}) ::",
+        ctl, enabled as u32, ptb, vio, dbg, ARENA_PAGES, base
     );
-    ctl & V3D_MMU_CTL_ENABLE != 0
+    enabled
 }
 
 /// M3: build a minimal render control list (RCL) that clears the tile buffer to CLEAR_RGBA and stores
