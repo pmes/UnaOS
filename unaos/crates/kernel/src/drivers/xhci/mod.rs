@@ -4317,7 +4317,12 @@ impl XhciController {
         }
 
         let root_hub_port = self.slots[hub_slot as usize].port_id;
-        let ttt = ((characteristics >> 5) & 0x3) as u32; // TT Think Time (wHubCharacteristics bits 5-6)
+        // TT Think Time (USB2 Hub Descriptor wHubCharacteristics bits 5-6). A SuperSpeed hub has NO
+        // Transaction Translator, and its SS Hub Descriptor (0x2A) wHubCharacteristics does NOT define
+        // bits 5-6 as TTT (reserved / device-defined). Feeding those bits into the slot context's TTT
+        // field would submit a garbage TTT for the SS hub; force 0 for SS (spec-correct for a TT-less
+        // hub). USB2 hubs keep the real decoded value, so their path is byte-identical.
+        let ttt = if is_ss { 0 } else { ((characteristics >> 5) & 0x3) as u32 };
         // This hub's own Route String + tier depth (0 for a hub sitting on a root port). Children
         // extend it: a device on downstream port P gets `hub_route | (P << (4*hub_depth))` at depth
         // hub_depth+1 — 4 bits per tier, so nibble `hub_depth` carries P (see DeviceSlot.route_*).
@@ -4334,8 +4339,21 @@ impl XhciController {
         }
 
         // 3. Mark the slot as a hub (Hub bit + Number of Ports + TTT) so the controller will route
-        //    transactions through it to downstream devices.
-        self.set_hub_slot_context(hub_slot, nbr_ports, ttt);
+        //    transactions through it to downstream devices. ORIN-USB-FIX-4: this MUST succeed before
+        //    any downstream port work. If the xHC rejects the hub's Configure-Endpoint (metal Orin:
+        //    the Tegra XUSB FW appears to refuse the SS hub's slot-context update), the hub is NOT
+        //    marked in the controller's view — every downstream ADDRESS_DEVICE then targets a device
+        //    the xHC cannot route to and fails with code 4 (USB Transaction Error), exactly the Orin
+        //    stick-behind-SS-hub strand. Previously this failure was printed and IGNORED, and the walk
+        //    barrelled on into the doomed enumeration. Now fail closed: log honestly (the summary +
+        //    slot-state dump live in set_hub_slot_context) and stop the bring-up here.
+        if !self.set_hub_slot_context(hub_slot, nbr_ports, ttt, is_ss) {
+            serial_println!(
+                "xHCI: HUB slot {} could not be configured as a hub; downstream bring-up ABORTED (fail-closed).",
+                hub_slot);
+            serial_println!("xHCI: === HUB slot {} bring-up complete (aborted) ===", hub_slot);
+            return;
+        }
 
         // 4. Power on every downstream port (SET_FEATURE PORT_POWER = feature 8), then settle.
         for port in 1..=nbr_ports {
@@ -4394,8 +4412,15 @@ impl XhciController {
     /// Mark a slot as a USB hub in its slot context (Hub bit, Number of Ports, TT Think Time) via
     /// a Configure-Endpoint command updating only the slot context. Required before the controller
     /// will route to the hub's downstream devices.
-    fn set_hub_slot_context(&mut self, hub_slot: u8, nbr_ports: u8, ttt: u32) {
-        unsafe {
+    ///
+    /// ORIN-USB-FIX-4: returns `true` only on a `code 1` completion. The caller (`bring_up_hub`) fails
+    /// closed on `false` — an un-marked hub cannot route downstream traffic, so continuing would strand
+    /// every device behind it on a code-4 ADDRESS_DEVICE. On success a one-line input-context summary is
+    /// printed (route / speed / ports / hub-bit / ttt) so a metal verdict reads in one line; on failure
+    /// the completion code, the input Add-Context flags, and the hub's live output Slot State are dumped
+    /// (a code-17 Context State Error means the xHC disagrees with our slot state — the dump names which).
+    fn set_hub_slot_context(&mut self, hub_slot: u8, nbr_ports: u8, ttt: u32, is_ss: bool) -> bool {
+        let (add_flags, hub_route, hub_speed) = unsafe {
             let input_ctx_virt = self.slots[hub_slot as usize].input_context;
             let output_ctx_virt = self.slots[hub_slot as usize].output_context;
             let base_ptr = input_ctx_virt as *mut u32;
@@ -4410,7 +4435,13 @@ impl XhciController {
             slot_ctx.add(0).write_volatile(slot_ctx.add(0).read_volatile() | (1 << 26));
             slot_ctx.add(1).write_volatile((slot_ctx.add(1).read_volatile() & 0x00FF_FFFF) | ((nbr_ports as u32) << 24));
             slot_ctx.add(2).write_volatile((slot_ctx.add(2).read_volatile() & !(0x3 << 16)) | (ttt << 16));
-        }
+            let dw0 = slot_ctx.add(0).read_volatile();
+            (base_ptr.add(1).read_volatile(), dw0 & 0xFFFFF, (dw0 >> 20) & 0xF)
+        };
+        // One-line input-context summary of what we are about to submit (metal verdict aid).
+        serial_println!(
+            "xHCI: HUB slot {} configure-input: route {:#x} speed {} ({}) ports {} hub-bit 1 ttt {} add-flags {:#x}",
+            hub_slot, hub_route, hub_speed, if is_ss { "SS" } else { "HS/FS" }, nbr_ports, ttt, add_flags);
         let trb = Trb {
             parameter: self.slots[hub_slot as usize].input_context as u64,
             status: 0,
@@ -4423,9 +4454,25 @@ impl XhciController {
                 self.slots[hub_slot as usize].is_hub = true;
                 self.slots[hub_slot as usize].hub_nbr_ports = nbr_ports;
                 serial_println!("xHCI: HUB slot {} marked as hub ({} ports)", hub_slot, nbr_ports);
+                true
             }
-            Ok((c, _)) => serial_println!("xHCI: HUB slot {} configure-endpoint code {}", hub_slot, c),
-            Err(_) => serial_println!("xHCI: HUB slot {} configure-endpoint timed out", hub_slot),
+            Ok((c, _)) => {
+                // Dump WHY: the input Add-Context flags we submitted and the hub's live output Slot
+                // State (output-context DW3 bits 31:27). Code 17 = Context State Error → the xHC's
+                // notion of the slot state disagrees with an A0-only Configure Endpoint from here.
+                let slot_state = unsafe {
+                    let oc = self.slots[hub_slot as usize].output_context as *const u32;
+                    if oc.is_null() { 0xFF } else { (core::ptr::read_volatile(oc.add(3)) >> 27) & 0x1F }
+                };
+                serial_println!(
+                    "xHCI: HUB slot {} configure-endpoint FAILED code {} (add-flags {:#x}, output Slot State {}); hub NOT marked.",
+                    hub_slot, c, add_flags, slot_state);
+                false
+            }
+            Err(_) => {
+                serial_println!("xHCI: HUB slot {} configure-endpoint timed out; hub NOT marked.", hub_slot);
+                false
+            }
         }
     }
 
