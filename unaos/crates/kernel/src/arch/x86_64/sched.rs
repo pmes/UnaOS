@@ -265,6 +265,19 @@ pub struct Task {
     /// + drop + mark reaped) instead of requeuing. An `Arc` (like `done_sem`) so the requester's clone
     /// keeps it alive after the Box is dropped.
     kill: Option<Arc<KillSwitch>>,
+    /// SCHED-BAL — affinity. `true` PINS this task to `cpu`: it never migrates (load balancing skips it —
+    /// no wake-time re-placement, never stolen). `false` makes it MIGRATABLE: an idle core may STEAL it
+    /// from a busy core's run queue, and `make_ready` may place a woken one on a less-loaded online core.
+    /// ONLY plain kernel threads are ever migratable; every user/ring-3 task (private CR3, per-core TSS
+    /// RSP0 / syscall kernel rsp anchors installed at dispatch) and every placement-sensitive fixture is
+    /// pinned, so migration can never disturb per-core state or a placement-dependent proof. On migration
+    /// `cpu` is RETARGETED to the new core under its run-queue lock, so the owning-CPU asserts in
+    /// yield/sleep/exit stay valid and the task's per-CPU (GS-base) view is read fresh from the new core.
+    /// FPU/SSE + full register context lives in the task's own stack frame (`switch_context` saves the
+    /// callee-saved set; the preempt path banks the full frame on the task's kstack), so it travels with
+    /// the Box across a migration. Immutable for pinned tasks; for migratable tasks only the balancer
+    /// writes it, always while it owns the task (off every queue, or under the destination run-queue lock).
+    pinned: bool,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -327,6 +340,16 @@ static SCHED: [SchedCpu; MAX_CPUS] = [const { SchedCpu::new() }; MAX_CPUS];
 /// SEAM a real per-core utilization feed would replace.
 static CPU_BUSY: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 static CPU_IDLE: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+/// SCHED-BAL — set by a core when it enters its scheduler `run()` loop, i.e. the cores that actually
+/// dispatch a run queue and so may participate in load balancing. The balancer places/steals ONLY onto
+/// cores marked here, so a migratable task is never stranded on a core that never runs the scheduler
+/// (the unscheduled BSP). Lock-free, Acquire/Release.
+static ONLINE: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+/// SCHED-BAL — per-core count of tasks this core has STOLEN from a busier core's run queue while idle.
+/// The one-line balancing witness: a non-zero steal count on formerly-idle cores proves runnable work
+/// spread. Introspection only, lock-free relaxed; never read on a scheduling decision.
+static STEALS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 
 /// True once the BSP has finished SMP verification and turned scheduling on. Gates the timer
 /// handler's preempt branch so the pre-scheduler smoke test (`smp::verify_smp`) is provably
@@ -392,6 +415,22 @@ impl RunQueue {
         for level in self.levels.iter_mut().rev() {
             if let Some(task) = level.pop_front() {
                 return Some(task);
+            }
+        }
+        None
+    }
+    /// SCHED-BAL — remove and return one MIGRATABLE (unpinned) ready task for an idle core to steal, or
+    /// None if every ready task is pinned. Scans LOW→HIGH effective level (leave the hottest-priority work
+    /// near its core) and, within a level, takes from the BACK — the victim keeps dispatching its front
+    /// task, so we steal the coldest waiter. A pinned task is skipped in place (never removed). Removing
+    /// from the middle is O(level len) but this runs only on an idle core's steal attempt, never on the
+    /// hot switch path.
+    fn pop_stealable(&mut self) -> Option<Box<Task>> {
+        for level in self.levels.iter_mut() {
+            for i in (0..level.len()).rev() {
+                if !level[i].pinned {
+                    return level.remove(i);
+                }
             }
         }
         None
@@ -578,6 +617,7 @@ fn spawn_inner(
     target_cpu: usize,
     priority: u8,
     done_sem: Option<Arc<Semaphore>>,
+    pinned: bool,
 ) -> u64 {
     assert!(target_cpu < MAX_CPUS, "spawn: target_cpu out of range");
 
@@ -603,17 +643,33 @@ fn spawn_inner(
         user_cr3: 0,
         preemptible: false,
         kill: None,
+        pinned,
     });
 
-    RUN_QUEUES[target_cpu].lock().push(task);
-    poke_for(target_cpu, priority);
+    // SCHED-BAL — a migratable task may be PLACED on a less-loaded online core at spawn (spread new work
+    // off a hot spawner); a pinned task always lands on its requested `target_cpu`. `place_cpu` keeps the
+    // preferred core when it is best or when no other core is online yet (stealing then picks up residual).
+    let mut task = task;
+    let target = if pinned { target_cpu } else { place_cpu(target_cpu) };
+    task.cpu = target as u32;
+    RUN_QUEUES[target].lock().push(task);
+    poke_for(target, priority);
     id
 }
 
 /// Create a fire-and-forget kernel thread at `priority` on `target_cpu`. The task runs `entry(arg)`
 /// and is freed when `entry` returns; there is no way to wait for it (use `spawn_joinable` for that).
 pub fn spawn(name: &'static str, entry: fn(usize), arg: usize, target_cpu: usize, priority: u8) {
-    spawn_inner(name, entry, arg, target_cpu, priority, None);
+    spawn_inner(name, entry, arg, target_cpu, priority, None, true);
+}
+
+/// SCHED-BAL — like `spawn`, but the task is MIGRATABLE: it may be placed on a less-loaded online core at
+/// spawn and STOLEN by an idle core later, so a burst of these spreads across the cores instead of
+/// serialising on one. `target_cpu` is the PREFERRED core (used verbatim if it is the least-loaded, or
+/// until other cores come online). Migration is safe only for plain kernel threads, which is all this
+/// makes; user/ring-3 tasks and placement-sensitive fixtures use the pinned `spawn`/`spawn_user`.
+pub fn spawn_balanced(name: &'static str, entry: fn(usize), arg: usize, target_cpu: usize, priority: u8) {
+    spawn_inner(name, entry, arg, target_cpu, priority, None, false);
 }
 
 /// Placeholder `entry` for ring-3 tasks: `spawn_user` stores this in `Task.entry`, but
@@ -796,6 +852,7 @@ fn spawn_user_inner(
         user_cr3,
         preemptible,
         kill,
+        pinned: true, // SCHED-BAL — ring-3 tasks carry per-core CR3 + TSS/syscall stack anchors; never migrate
     });
     RUN_QUEUES[target_cpu].lock().push(task);
     poke_for(target_cpu, PRIO_NORMAL);
@@ -824,7 +881,7 @@ pub fn spawn_joinable(
 ) -> JoinHandle {
     let done = Arc::new(Semaphore::new(0));
     done.init(); // reserve the waiter list BEFORE the task can run + post (alloc-free park)
-    let id = spawn_inner(name, entry, arg, target_cpu, priority, Some(done.clone()));
+    let id = spawn_inner(name, entry, arg, target_cpu, priority, Some(done.clone()), true);
     JoinHandle { done, id }
 }
 
@@ -973,13 +1030,76 @@ fn poke_for(target: usize, prio: u8) {
 /// (waking it or preempting a lower-priority task). Used by the sleeper drain (same CPU) and
 /// `Semaphore::post` (cross-CPU wake). The task always returns to `task.cpu`, so its GS base stays
 /// correct on resume (tasks don't migrate). Caller runs with IF=0.
-fn make_ready(task: Box<Task>) {
-    let target = task.cpu as usize;
+fn make_ready(mut task: Box<Task>) {
+    // SCHED-BAL — a woken MIGRATABLE task may be placed on a less-loaded online core (spread wakeups off a
+    // hot waker); a PINNED task always returns to its own `cpu` (its GS-base view, and — for ring-3 tasks
+    // — its per-core CR3/TSS anchors, must stay put). On migration retarget `cpu` under the destination's
+    // run-queue lock (below), so the owning-CPU asserts and the GS-base view stay valid on the new core.
+    let target = if task.pinned { task.cpu as usize } else { place_cpu(task.cpu as usize) };
     let prio = task.priority;
     debug_assert!(target < MAX_CPUS, "make_ready: cpu out of range");
+    task.cpu = target as u32;
     task.state.store(STATE_READY, Ordering::Release);
     RUN_QUEUES[target].lock().push(task);
     poke_for(target, prio);
+}
+
+/// SCHED-BAL — a core's instantaneous load: ready-queue depth plus 1 if a task is currently running
+/// there. `try_lock` keeps this non-blocking on the balancing path (a contended queue is treated as
+/// "busy", `usize::MAX`, so we never wait and never prefer a core we could not even peek). Introspection.
+fn core_load(cpu: usize) -> usize {
+    let running = if SCHED[cpu].current.load(Ordering::Relaxed) != 0 { 1 } else { 0 };
+    match RUN_QUEUES[cpu].try_lock() {
+        Some(q) => running + q.len(),
+        None => usize::MAX,
+    }
+}
+
+/// SCHED-BAL — choose the core a migratable task should land on, preferring `preferred` and only ever
+/// returning an ONLINE (scheduler-participating) core so the task is never stranded. If no other online
+/// core is strictly less loaded than `preferred`, `preferred` is kept. When `preferred` itself is not yet
+/// online (e.g. the BSP staging work before the APs enter `run()`), the least-loaded online core wins —
+/// or, if none is online at all, `preferred` is returned unchanged and a later idle-core steal moves it.
+fn place_cpu(preferred: usize) -> usize {
+    let mut best = preferred;
+    let mut best_load = if ONLINE[preferred].load(Ordering::Acquire) {
+        core_load(preferred)
+    } else {
+        usize::MAX
+    };
+    for c in 0..MAX_CPUS {
+        if c == preferred || !ONLINE[c].load(Ordering::Acquire) {
+            continue;
+        }
+        let l = core_load(c);
+        if l < best_load {
+            best = c;
+            best_load = l;
+        }
+    }
+    best
+}
+
+/// SCHED-BAL — an idle core's attempt to pull one MIGRATABLE task off a busier ONLINE core's run queue.
+/// Deadlock-free by construction: the thief holds NO lock on entry (it is in `run()`'s empty-queue idle
+/// branch), locks exactly ONE victim queue at a time via `try_lock` (never blocking — two idle cores
+/// stealing from each other cannot deadlock; one simply fails the `try_lock` and moves on), and releases
+/// it before returning. The caller then pushes onto its OWN queue, so two run-queue locks are never held
+/// at once — the run-queue → heap ordering (`push` may realloc) is never inverted. Returns the retargeted
+/// task (its `cpu` set to `thief`) or None if every online core's ready work is pinned/absent.
+fn try_steal(thief: usize) -> Option<Box<Task>> {
+    for victim in 0..MAX_CPUS {
+        if victim == thief || !ONLINE[victim].load(Ordering::Acquire) {
+            continue;
+        }
+        if let Some(mut q) = RUN_QUEUES[victim].try_lock() {
+            if let Some(mut task) = q.pop_stealable() {
+                task.cpu = thief as u32; // retarget affinity to the stealing core
+                return Some(task);
+            }
+        }
+    }
+    None
 }
 
 /// Cooperatively give up the CPU. The current task is marked ready and rotated to the back of its
@@ -1879,6 +1999,9 @@ pub fn wait_and_run() -> ! {
 /// when the queue is empty.
 fn run() -> ! {
     let cpu = percpu::this_cpu().cpu_index as usize;
+    // SCHED-BAL — announce this core as a load-balancing participant: it now dispatches a run queue, so
+    // the balancer may place woken/spawned migratable tasks here and this core may steal when idle.
+    ONLINE[cpu].store(true, Ordering::Release);
     // Aging sweep cadence, kept as a stack local (run() is `-> !`, entered once per CPU, so this
     // survives the CPU's whole lifetime — no SchedCpu field needed). Seed from the LIVE tick count:
     // by now the AP burned ticks in `wait_and_run`'s hlt loop / the BSP during verify_smp, so a 0
@@ -2008,6 +2131,15 @@ fn run() -> ! {
                 }
             }
             None => {
+                // SCHED-BAL — empty run queue. Before idling, try to pull one migratable task off a
+                // busier core (we are IF=0 here, so the brief remote `try_lock` is preempt-safe). On
+                // success push it onto our own queue and count the steal, then loop back to dispatch it;
+                // on failure idle exactly as before.
+                if let Some(task) = try_steal(cpu) {
+                    RUN_QUEUES[cpu].lock().push(task);
+                    STEALS[cpu].fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
                 // Nothing to run: sleep until an interrupt (timer or a `spawn`/wake IPI). The `sti;
                 // hlt` pair is atomic — an interrupt latched before the `sti` still fires and
                 // returns past the `hlt`, so a wake that arrived in the empty-check window is not
@@ -2089,6 +2221,34 @@ pub fn run_queue_len(cpu: usize) -> usize {
         return 0;
     }
     RUN_QUEUES[cpu].lock().len()
+}
+
+/// SCHED-BAL — tasks core `cpu` has stolen from busier cores while idle (the load-balancing witness).
+pub fn steal_count(cpu: usize) -> u64 {
+    if cpu >= MAX_CPUS { 0 } else { STEALS[cpu].load(Ordering::Relaxed) }
+}
+
+/// SCHED-BAL — emit the one-line balancing witness: per-core steal counts and how many cores ran work.
+/// A non-zero steal total with work on more than one core is the proof that a single-core burst spread.
+pub fn sched_bal_witness() {
+    let n = meter_cpu_count().min(MAX_CPUS);
+    let total: u64 = (0..n).map(|c| STEALS[c].load(Ordering::Relaxed)).sum();
+    let busy_cores = (0..n)
+        .filter(|&c| CPU_BUSY[c].load(Ordering::Relaxed) > 0 || STEALS[c].load(Ordering::Relaxed) > 0)
+        .count();
+    let online = (0..n).filter(|&c| ONLINE[c].load(Ordering::Relaxed)).count();
+    serial_println!(
+        "SCHED-BAL: work-stealing witness — {} steals total across {} online cores, {} core(s) ran work",
+        total, online, busy_cores
+    );
+    for c in 0..n {
+        serial_println!(
+            "SCHED-BAL: cpu{} busy={} steals={}",
+            c,
+            CPU_BUSY[c].load(Ordering::Relaxed),
+            STEALS[c].load(Ordering::Relaxed)
+        );
+    }
 }
 
 /// VUG-1 M3b: number of CPUs the "CPU pulse" meter should show (online cores, capped at MAX_CPUS).
@@ -2275,6 +2435,70 @@ pub fn start_demo(online_aps: &[usize]) {
         spawn("cv-verify", demo_cvcap_verifier, cpu_cv, cpu_cv, PRIO_NORMAL);
     } else {
         serial_println!("CVCAP: SKIPPED (needs >=2 APs; have {})", online_aps.len());
+    }
+
+    // SCHED-BAL (M-bal): multi-hot-thread load balancing. Stage BAL_TASKS MIGRATABLE CPU-bound threads
+    // that all PREFER the first AP; as the APs come online (right after this call flips SCHED_GO) the
+    // idle ones STEAL the backlog off that hot core, so the burst spreads across every AP instead of
+    // serialising on one. A verifier on the last AP waits (bounded) for the burst to drain, then prints
+    // the one-line witness with the per-core steal counts. Self-checking + non-fatal: a run where the
+    // work happened to fit the hot core's slices prints "no steals" rather than failing. Needs >=2 APs
+    // to have anywhere to spread to. This is the in-gate exercise of the balancer (real preemptive
+    // multi-core under QEMU x86, unlike the ARM `virt`/raspi4b paths where stealing is metal-only).
+    if online_aps.len() >= 2 {
+        BAL_REMAINING.store(BAL_TASKS, Ordering::Relaxed);
+        let hot = online_aps[0];
+        for i in 0..BAL_TASKS {
+            spawn_balanced("bal-hot", demo_bal_hot, i, hot, PRIO_NORMAL);
+        }
+        let cpu_v = online_aps[online_aps.len() - 1];
+        spawn("bal-verify", demo_bal_verifier, 0, cpu_v, PRIO_NORMAL);
+    } else {
+        serial_println!("SCHED-BAL: SKIPPED (needs >=2 APs; have {})", online_aps.len());
+    }
+}
+
+/// SCHED-BAL demo — number of migratable CPU-bound threads staged on one core to be spread by stealing.
+const BAL_TASKS: usize = 6;
+/// SCHED-BAL demo — countdown of `demo_bal_hot` tasks still running; the verifier waits for it to hit 0.
+static BAL_REMAINING: AtomicUsize = AtomicUsize::new(0);
+
+/// SCHED-BAL demo — a CPU-bound thread spanning several quanta (so it stays runnable long enough to be
+/// stolen and to actually load a core), then retires by decrementing the shared countdown.
+fn demo_bal_hot(_i: usize) {
+    let mut acc: u64 = 0;
+    for r in 0..3u64 {
+        for k in 0..25_000_000u64 {
+            acc = acc.wrapping_add(k ^ r);
+        }
+        core::hint::black_box(acc);
+    }
+    BAL_REMAINING.fetch_sub(1, Ordering::Relaxed);
+}
+
+/// SCHED-BAL demo — bounded verifier: wait for the burst to finish (timeout then report, never hang),
+/// print the witness, and state whether idle cores stole work off the hot core.
+fn demo_bal_verifier(_: usize) {
+    for _ in 0..4000 {
+        if BAL_REMAINING.load(Ordering::Relaxed) == 0 {
+            break;
+        }
+        sleep_ticks(1);
+    }
+    let n = meter_cpu_count();
+    let stolen: u64 = (0..n).map(steal_count).sum();
+    // A single-core-preferred burst is BALANCED when its work ends up spread across more than one core —
+    // whether that happened at spawn/wake (placement onto a less-loaded online core) or later (an idle
+    // core stealing the backlog). Count cores that actually dispatched work; PASS iff more than one did.
+    let spread_cores = (0..n).filter(|&c| meter_cpu_ticks(c).0 > 0).count();
+    sched_bal_witness();
+    if spread_cores > 1 {
+        serial_println!(
+            "SCHED-BAL: PASS (a 1-core burst spread across {} cores; {} via steal, rest via placement)",
+            spread_cores, stolen
+        );
+    } else {
+        serial_println!("SCHED-BAL: FAIL (work stayed on one core; spread={}, steals={})", spread_cores, stolen);
     }
 }
 
