@@ -88,6 +88,7 @@ pub mod video;
 pub mod clock;
 pub mod console;
 pub mod user;
+pub mod splash;
 pub mod vug;
 
 pub fn init() {
