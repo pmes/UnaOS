@@ -6296,3 +6296,58 @@ knob-off `./arroyo kernel8-test 35` = 0 FAIL (CAPSTONE 6/6 — functionally byte
 out); the `./arroyo kernel8-install` live witness = in-kernel PASS + host-side `HOST-VERIFY: PASS`;
 `./arroyo test-arm 22`, `UNAOS_GICV3=1 ./arroyo test-arm 40`, `./arroyo test 22`, and the `UNAOS_INSTALLDEMO`
 engine witness all unregressed. Landing: `review/unaos-install-pi-LANDING.md`.
+
+## ORIN-USB-FIX + NET-4c — sitting-2 verdict fixes (R22)
+
+### ORIN-USB-FIX — why the boot stick never became a block device (and the fix)
+
+**The evidence overturned the Code-11 suspicion.** The R22 sitting-2 capture
+(`~/unaos-bench/capture/orin-r22s2/`) shows the JB9i eviction completing cleanly: DISABLE_SLOT 1..8
+returns code 1 for the four UEFI-owned slots and code 11 (Slot Not Enabled) for the four that were
+never enabled — both the expected outcomes of a blind sweep. Port 1 then enumerates normally and is a
+**SuperSpeed hub** (0bda:0489); the boot stick sits BEHIND it. The stick was stranded downstream:
+`reset_downstream_port` decoded the SS hub's wPortStatus with USB2 rules, where **bit 9 means
+PORT_POWER on a USB3 hub, not Low Speed** (status `0x100203` → "xHCI speed 2"). The slot context then
+carried speed 2 / MPS0 8 for an SS device and `ADDRESS_DEVICE` failed with code 4 three times —
+`downstream slot disposed (unenumerated)`, no block device, honest install SKIP.
+
+**Fixes (drivers/xhci/mod.rs + arch/aarch64/xusb_tegra.rs):**
+
+- **Boot-walk SS forcing** — `bring_up_hub`'s downstream walk now forces xHCI speed 4 behind an SS
+  hub, exactly as the hot-plug path (`service_hub_changes`) already did; the two paths agree.
+- **SS MPS0** — `address_downstream` programs EP0 MPS0 = **512** for speed ≥ 4 (USB3 9.6.6), mirroring
+  the root path; previously every non-LS downstream device got 64.
+- **Eviction completions claimed by address** — JB9i records each DISABLE_SLOT TRB's physical address
+  in `evict_pending`; the event dispatch consumes those completions quietly (code 1 = reclaimed,
+  code 11 = was not enabled). They no longer print `>>> COMMAND FAILED <<<` nor fall into the
+  untracked-completion branch, which had been re-queueing DISABLE_SLOTs for already-evicted slots.
+  Claims that outlive the drain window are retired (the command ring wraps). Non-tegra paths never
+  populate the array — inert.
+
+The install refusal itself is correct behavior and unchanged. **Metal-owed:** the stick actually
+enumerating behind the 0bda hub on Orin silicon, then the INSTALL-2 self-clone. (Separate observation,
+not addressed here: port 7's FS device 13d3:3549 loops at dev-desc watchdog ×3.)
+
+### NET-4c — TX-proof instrumentation for the DHCP no-lease (rtl8168_tegra.rs)
+
+NET-4b passed on metal but the 5 s DISCOVER got no lease from a live server, and nothing proved a frame
+ever left the NIC. NET-4c adds bounded, read-only evidence:
+
+- **First-TX one-shot proof** in `transmit`: when the first frame of the boot (the DISCOVER on the
+  armed path) has its descriptor handed back, print OWN-cleared + the latched ISR (TOK/TER).
+- **`net4c_evidence` snapshot** after the discover window (lease or not): TX consumed vs stalled
+  counts, last descriptor's OWN bit, latched ISR (ROK/RER/TOK/TER — nothing clears ISR after
+  bring-up), RX frames popped and ring slots filled-unread. Reads only.
+- **Knob-tunable window**: `UNAOS_NET4_DHCP_MS=<millis>` at build time; unset default stays 5000.
+
+**Metal-owed:** the instrumented no-lease boot — TOK=0 indicts the TX path/descriptor DMA, TOK=1 with
+an empty RX ring moves the question to the wire/server side.
+
+### Gates (2026-07-18)
+
+`./arroyo check` and `UNAOS_NET4=1 UNAOS_SDMMC=1 UNAOS_TEGRA=1 UNAOS_GICV3=1 ./arroyo check` — both
+arches green. `./arroyo test-arm 30` 0 FAIL; `UNAOS_GICV3=1 ./arroyo test-arm 30` CAPSTONE COMPLETE,
+0 FAIL; `./arroyo test 22` (shared xHCI touched) MISSION SUCCESS, 0 FAIL. **Divergence recorded:** the
+brief's `UNAOS_TEGRA=1 … test-arm` combination wedges at the UEFI→kernel handoff on QEMU virt at every
+commit tested back to pre-SDMMC-3 (pre-existing; tegra builds are metal-only and historically gate
+`check`, never `test-arm`).

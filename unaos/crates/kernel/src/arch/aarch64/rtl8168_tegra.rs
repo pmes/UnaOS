@@ -207,6 +207,9 @@ mod metal {
         tx_buffers: *mut u8,
         tx_cur: usize,
         tx_count: u64,
+        /// NET-4c: TX descriptors the NIC never handed back (OWN stayed set) — the
+        /// did-a-frame-ever-LEAVE-the-NIC counter for the DHCP no-lease investigation.
+        tx_stalled: u64,
     }
 
     // The driver owns raw DMA pointers; on the single-CPU main-loop/poll discipline it is only ever
@@ -435,9 +438,43 @@ mod metal {
             }
             if done {
                 self.tx_count += 1;
+                // NET-4c: one-shot TX proof on the FIRST consumed frame of the boot (on the
+                // armed path that frame is the DHCP DISCOVER). OWN handed back + latched
+                // ISR.TOK is NIC-level evidence the frame left the MAC — precisely what the
+                // R22 sitting-2 no-lease left unproven.
+                if self.tx_count == 1 {
+                    let isr = self.r16(REG_ISR);
+                    serial_println!(
+                        "{}   [net4c] first TX frame ({} bytes) CONSUMED: OWN handed back, ISR={:#06x} (TOK={} TER={}) ::",
+                        P4, len, isr, (isr >> 2) & 1, (isr >> 3) & 1);
+                }
             } else {
+                self.tx_stalled += 1;
                 serial_println!("{}   [tx] descriptor {} never completed (OWN still set — link stalled?) ::", P4, i);
             }
+        }
+
+        /// NET-4c: bounded, read-only TX/RX evidence snapshot for the DHCP no-lease
+        /// investigation — printed after the discover window. TX side: consumed vs stalled
+        /// descriptor counts, the last-posted descriptor's OWN bit, and the latched ISR
+        /// (TOK/TER/ROK/RER — nothing has cleared ISR since bring-up, so these are
+        /// since-bring-up latches). RX side: frames popped plus how many ring slots the NIC
+        /// has filled and handed back unread. Reads only; no register is written.
+        fn net4c_evidence(&self, label: &str) {
+            let isr = self.r16(REG_ISR);
+            let last_tx = if self.tx_cur == 0 { NUM_TX - 1 } else { self.tx_cur - 1 };
+            let d_opts1 = unsafe { read_volatile(self.tx_ring.add(last_tx)) }.opts1;
+            let mut rx_filled = 0usize;
+            for i in 0..NUM_RX {
+                if unsafe { read_volatile(self.rx_ring.add(i)) }.opts1 & DESC_OWN == 0 {
+                    rx_filled += 1;
+                }
+            }
+            serial_println!(
+                "{}   [net4c {}] TX consumed={} stalled={} last-desc[{}] opts1={:#010x} (OWN={}) | ISR={:#06x} (ROK={} RER={} TOK={} TER={}) | RX popped={} filled-unread={}/{} ::",
+                P4, label, self.tx_count, self.tx_stalled, last_tx, d_opts1, (d_opts1 >> 31) & 1,
+                isr, isr & 1, (isr >> 1) & 1, (isr >> 2) & 1, (isr >> 3) & 1,
+                self.rx_count, rx_filled, NUM_RX);
         }
 
         /// Pop one completed RX descriptor's raw Ethernet frame into `out` and recycle the descriptor
@@ -974,6 +1011,7 @@ mod metal {
             tx_buffers: core::ptr::null_mut(),
             tx_cur: 0,
             tx_count: 0,
+            tx_stalled: 0,
         };
 
         // ── M2/M3 GUARD: poison-honest readback through the NEW window BEFORE any register write ──
@@ -1039,6 +1077,29 @@ mod metal {
     /// this; the bound caps how long a DHCP-less link stalls before the static fallback. The clock is
     /// real time (CNTPCT), so this is non-hanging by construction.
     const DHCP_TIMEOUT_MS: i64 = 5_000;
+
+    /// NET-4c: the discover window is knob-tunable — `UNAOS_NET4_DHCP_MS=<millis>` at build time
+    /// widens (or narrows) it for an attended sitting; unset, the default 5 s stands unchanged.
+    /// Invalid or zero values fall back to the default (never a hang, never a zero window).
+    fn dhcp_timeout_ms() -> i64 {
+        if let Some(s) = option_env!("UNAOS_NET4_DHCP_MS") {
+            let mut v: i64 = 0;
+            let mut any = false;
+            for b in s.bytes() {
+                if b.is_ascii_digit() && v < 3_600_000 {
+                    v = v * 10 + (b - b'0') as i64;
+                    any = true;
+                } else {
+                    any = false;
+                    break;
+                }
+            }
+            if any && v > 0 {
+                return v;
+            }
+        }
+        DHCP_TIMEOUT_MS
+    }
 
     /// Monotonic millisecond clock from the free-running counter (CNTPCT). Readable at EL2, where
     /// `net4_bringup` runs (before the JC3 EL2→EL1 drop); drives both smoltcp time and the DHCP timeout.
@@ -1113,8 +1174,16 @@ mod metal {
         //    helper configures the interface in place; the bounded witness poll below then exercises the
         //    seam against whichever config it settled on. ──
         let netcfg = crate::net_phy::dhcp_or_static(
-            P4, &mut iface, &mut dev, &now_ms, DHCP_TIMEOUT_MS, OUR_IP, 24, GATEWAY_IP,
+            P4, &mut iface, &mut dev, &now_ms, dhcp_timeout_ms(), OUR_IP, 24, GATEWAY_IP,
         );
+
+        // NET-4c: evidence snapshot right after the discover window — did the DISCOVER
+        // actually LEAVE the NIC (TX consumed / ISR.TOK), and did anything at all land in the
+        // RX ring during the window? Read-only; printed lease-or-not so both outcomes carry
+        // the same evidence shape.
+        if let Some(n) = NET4_DEVICE.lock().as_ref() {
+            n.net4c_evidence("post-discover-window");
+        }
 
         // One ICMP socket, so the poll has a real socket set to service (proves the full seam binds).
         let mut rx_meta = [icmp::PacketMetadata::EMPTY; 4];
