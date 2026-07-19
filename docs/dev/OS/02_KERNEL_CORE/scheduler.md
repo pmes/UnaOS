@@ -132,6 +132,22 @@ are load-bearing and were the subject of the **SCHED-BURST-FIX** arc:
   (`:: AARCH64 SMP: cN timer PPI live (tick 1) ::`), quiet after. The tick does
   not preempt on this EL2 `run()` path (`SCHED_ACTIVE` stays false; `handle_irq_v3`
   calls only `on_tick`) — it just breaks the idle WFI so the loop re-polls.
+- **HID-REGRESS-B12 — a ticking AP must WFI, not busy-spin, when idle.** `arch::hlt`
+  chooses WFI-park vs. poll-spin from `timer::is_live()`, which tracks the **boot
+  core's** timer. On the Jetson the JM6 EL2->EL1 drop disables that timer
+  (`set_not_live`), so post-drop `is_live()` is false and `hlt` poll-spins — correct
+  for the timerless boot core, which owns the cooperative xHCI HID poll. But a JC3
+  secondary has its OWN live tick, so post-drop it would fall into the same poll-spin
+  branch and **busy-spin its `run()` steal loop** between ticks instead of parking.
+  Five secondaries hammering the shared run-queue spinlocks/`ONLINE` atomics saturate
+  the interconnect and starve the boot core's HID poll — armed keyboards/pointers
+  deliver ZERO events (boot-12). Fix: `hlt` also parks on
+  `timer::this_core_has_local_tick()` (this core's `AP_LOCAL_TICK` bit), so a
+  self-ticking AP WFI-parks bounded to one ~4 ms tick — still self-scheduling, but
+  idle-quiet, so input coexists. The boot core is never in `AP_LOCAL_TICK` (its
+  poll-spin is unchanged); on QEMU `virt` the APs' tick is delivery-confirmed so
+  `is_live()` is already true (the new term is redundant, no behaviour change); Pi
+  (GICv2, no `AP_LOCAL_TICK`) reads false and is byte-identical.
 - **SGI audit (JC3).** The reschedule poke (`poke_cpu`) targeted `gic::send_sgi`
   with the LINEAR core index, but the GICv3 CPU interface routes SGIs by MPIDR
   **affinity** (`ICC_SGI1R_EL1`). On QEMU `virt` affinity == index so it worked;

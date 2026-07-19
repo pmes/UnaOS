@@ -227,7 +227,12 @@ pub fn hlt() {
     // an untested GIC path where the PPI never reaches the CPU — WFI would have no wake source and
     // sleep forever, freezing the polled main loop; fall back to a light poll-spin so input keeps
     // being serviced (the pre-interrupt behavior, trading idle power for liveness).
-    if timer::is_live() {
+    //
+    // HID-REGRESS-B12: `is_live()` tracks the BOOT CORE's timer, which the Jetson JM6 EL2->EL1 drop
+    // disables (`set_not_live`). A GICv3 SECONDARY that armed its OWN local tick (JC3) still has a live
+    // per-core wake source, so it too may WFI (bounded to one ~4 ms tick) — otherwise it busy-spins its
+    // `run()` steal loop post-drop and the shared-lock churn starves the boot core's xHCI HID poll.
+    if timer::is_live() || timer::this_core_has_local_tick() {
         unsafe { core::arch::asm!("wfi", options(nomem, nostack, preserves_flags)) };
     } else {
         core::hint::spin_loop();

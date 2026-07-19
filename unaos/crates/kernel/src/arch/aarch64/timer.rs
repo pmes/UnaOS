@@ -172,6 +172,33 @@ pub fn is_live() -> bool {
     LIVE.load(Ordering::Relaxed)
 }
 
+/// HID-REGRESS-B12 — does THIS core have its OWN periodic timer PPI armed (JC3 `arm_this_core_ap`)?
+///
+/// The global `LIVE` flag reflects the BOOT CORE's timer only: the Jetson JM6 EL2->EL1 drop clears it
+/// (`set_not_live`) because the boot core's physical timer is switched off there. But a GICv3 SECONDARY
+/// that armed its own local-only tick (registered in `AP_LOCAL_TICK`) still has a live 250 Hz wake
+/// source of its OWN, independent of the boot core. Without this distinction such a secondary falls into
+/// the `LIVE == false` poll-spin branch of `arch::hlt` post-drop and BUSY-SPINS its `run()` idle loop
+/// (re-attempting a work-steal every iteration) instead of parking in WFI until its next tick — and five
+/// cores hammering the shared run-queue spinlocks/atomics saturate the interconnect, starving the boot
+/// core's cooperative xHCI HID poll (the boot-12 "keyboard+mouse armed but ZERO deliveries" regression).
+/// Reporting the local tick here lets `hlt` WFI-park such a core (bounded to one ~4 ms tick), so it stays
+/// self-scheduling yet idle-quiet, and input coexists. The boot core is never in `AP_LOCAL_TICK`, so its
+/// timerless post-drop poll-spin is unchanged. Pi (GICv2, no `AP_LOCAL_TICK`) always reads false — the
+/// Pi idle path is byte-identical.
+#[inline]
+pub fn this_core_has_local_tick() -> bool {
+    #[cfg(not(feature = "pi"))]
+    {
+        let cpu = super::percpu::this_cpu().cpu_index;
+        cpu < 32 && (AP_LOCAL_TICK.load(Ordering::Relaxed) & (1 << cpu)) != 0
+    }
+    #[cfg(feature = "pi")]
+    {
+        false
+    }
+}
+
 /// Clear the liveness flag. Used by the Jetson (tegra) EL2->EL1 drop, which disables the physical
 /// timer (CNTP_CTL=0) but leaves the core with no interrupt source at EL1 — so from there
 /// `arch::hlt()` must fall back to a busy spin instead of a wake-less WFI-park (`verify_live` set
