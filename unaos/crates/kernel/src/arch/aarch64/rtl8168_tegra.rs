@@ -1460,6 +1460,31 @@ mod metal {
         );
         program_inbound_atu(atu_base, 0, dram_base, dram_size);
 
+        // ── NET-4i: the SMMU stream for PCIe controller-0 — the layer BELOW the inbound iATU ─────────
+        // The inbound iATU (above) is the DWC controller's internal PCIe↔fabric translation. AFTER it,
+        // an inbound write TLP is presented to the Tegra234 ARM MMU-500 (SMMUv2) carrying controller-0's
+        // stream id (from the DTB `iommu-map`). NET-4h armed the iATU and the RX payload blackhole
+        // survived — the signature (writebacks + first payload land, rest vanish silently) is exactly a
+        // stale/partial firmware SMMU context. Recon the live stream state, then arm per-stream BYPASS
+        // (identity DMA: PCIe addr == DRAM PA) so the NIC's writes reach the heap buffers untranslated.
+        // Fully data-driven off the DTB; fail-closed on poison. Non-fatal — a resolve miss leaves the
+        // SMMU as firmware left it and the bring-up proceeds (recon lines say what was — or wasn't —
+        // seen), so this never regresses the NET-4h path.
+        match crate::arch::aarch64::fdt_tegra::pcie_iommu(dtb_addr, dtb_size, ram_gib_mask) {
+            Some(iom) => {
+                let sm = &iom.bases[..iom.n_bases];
+                crate::arch::aarch64::smmu_tegra::net4i_recon(sm, iom.sid, "pre-fix");
+                crate::arch::aarch64::smmu_tegra::net4i_bypass(sm, iom.sid);
+                crate::arch::aarch64::smmu_tegra::net4i_recon(sm, iom.sid, "post-fix");
+            }
+            None => {
+                serial_println!(
+                    "{}   [net4i] PCIe controller-0 SMMU stream unresolved in DTB — SMMU left as firmware set it; NET-4h inbound-iATU path unchanged ::",
+                    P4
+                );
+            }
+        }
+
         // The CPU-side aperture address for BAR2 = cpu_base + (bar_pci - pci_base). This — NOT bar_pci —
         // is what the CPU dereferences; the iATU forwards it to PCIe. It sits ~200 GiB up, inside the
         // PS-widened 40-bit / 512-GiB-table reach.

@@ -247,6 +247,222 @@ pub fn jb9_stream_dump(bases: &[u64], xusb_sid: u32, tag: &str) {
     );
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// NET-4i — the SMMU stream for PCIe controller-0 (the last suspect for the RX payload blackhole)
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+//
+// NET-4h armed the DWC INBOUND iATU (the controller-internal PCIe↔fabric translation) and STILL the
+// RTL8168's descriptor writebacks + the FIRST RX payload land while every later payload write
+// vanishes — the classic "some IOVAs translate, the rest abort silently" signature of a stale/partial
+// firmware SMMU context. On Tegra234 an inbound PCIe write TLP, after the DWC iATU, is presented to
+// the ARM MMU-500 (SMMUv2) carrying controller-0's stream id (from the DTB `iommu-map`); the SMMU is
+// the layer BELOW the iATU and has never been examined for the PCIe stream (the NET-4b note "rings
+// functioned dma-coherent" concluded nothing about it). This block: (1) reads the live SMMU state for
+// that stream (read-only recon, `[net4i]` witnesses), then (2) applies the honest minimal fix —
+// per-stream BYPASS, matching the driver's identity-DMA contract (PCIe addr == DRAM PA). Every write
+// is announced before issue. Fail-closed: if the SMMU registers read poison, state is left untouched
+// and the current NET-4h behaviour continues.
+//
+// Bypass-first is deliberate and testable: the XUSB-era verdict that this fabric refuses UNTRANSLATED
+// traffic ("SMMU external bypass disable") was established for the NISO1 XUSB stream, not for the PCIe
+// client — a different SMMU instance and fabric master. Arming per-stream bypass for PCIe C0 is the
+// minimal, in-lane experiment; if the metal sitting shows the RX blackhole survives bypass (the XUSB
+// signature repeating), THAT result is what promotes the fallback (a minimal identity translation
+// context, the JB3_IDMAP machinery above) — the brief's ordered logic, gated on a metal result we do
+// not yet have.
+
+fn wr(base: u64, off: u64, val: u32) {
+    unsafe {
+        core::ptr::write_volatile((base + off) as *mut u32, val);
+        core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+    }
+}
+
+/// A read that means "this SMMU register file is not answering": all-ones (unclaimed / powered-off
+/// fabric decode) is the poison we fail-closed on. sCR0 is never legitimately 0xffffffff (reserved
+/// bits read 0), so this is a safe liveness gate before any write.
+#[inline]
+fn smmu_poison(v: u32) -> bool {
+    v == 0xffff_ffff
+}
+
+/// NET-4i recon: read-only dump of the PCIe-C0 stream's binding on every SMMU instance the DTB
+/// named. Per instance: sCR0 (with CLIENTPD/USFCFG decoded), the SMR that matches the stream and its
+/// S2CR routing (bypass/translate/fault), the context bank + "is TTBR0 our identity map?" verdict for
+/// a translate route, and the global fault latch. Emits `[net4i]` witness lines sufficient to verdict
+/// what the SMMU is doing to controller-0's inbound DMA. Touches no register with a write.
+pub fn net4i_recon(bases: &[u64], sid: u32, tag: &str) {
+    let ours = &JB3_IDMAP as *const _ as u64;
+    serial_println!(
+        ":: tegra: [net4i] {} — PCIe-C0 SMMU stream {:#x} binding across {} instance(s) ::",
+        tag, sid, bases.len()
+    );
+    for (i, &base) in bases.iter().enumerate() {
+        let scr0 = rd(base, SCR0);
+        if smmu_poison(scr0) {
+            serial_println!(
+                ":: tegra: [net4i] {} — inst{} @ {:#010x}: sCR0=0xffffffff (POISON / not answering) — instance skipped ::",
+                tag, i, base
+            );
+            continue;
+        }
+        let n = (rd(base, IDR0) & 0xff).min(MAX_SMRG);
+        serial_println!(
+            ":: tegra: [net4i] {} — inst{} @ {:#010x}: sCR0={:#010x} (CLIENTPD={} USFCFG={}) NUMSMRG={} ::",
+            tag, i, base, scr0, scr0 & 1, (scr0 >> 10) & 1, n
+        );
+        let mut matched = false;
+        for s in 0..n {
+            let smr = rd(base, SMR_BASE + 4 * s as u64);
+            if smr & (1 << 31) == 0 {
+                continue;
+            }
+            let (id, mask) = (smr & 0x7fff, (smr >> 16) & 0x7fff);
+            if (sid ^ id) & !mask & 0x7fff != 0 {
+                continue;
+            }
+            matched = true;
+            let s2cr = rd(base, S2CR_BASE + 4 * s as u64);
+            let (s2type, cbndx) = ((s2cr >> 16) & 0b11, (s2cr & 0xff) as u64);
+            let tname = match s2type {
+                0 => "translate",
+                1 => "bypass",
+                _ => "fault",
+            };
+            serial_println!(
+                ":: tegra: [net4i] {} — inst{} SMR[{}]={:#010x} matches sid {:#x} -> S2CR={:#010x} (type={} cbndx={}) ::",
+                tag, i, s, smr, sid, s2cr, tname, cbndx
+            );
+            if s2type == 0 {
+                let cb = base + CB0_OFF + cbndx * 0x10000;
+                let (ttbr_lo, ttbr_hi) = (rd(cb, 0x20), rd(cb, 0x24));
+                let ttbr = ((ttbr_hi as u64) << 32 | ttbr_lo as u64) & 0xffff_ffff_ffff;
+                serial_println!(
+                    ":: tegra: [net4i] {} — inst{} CB{}: SCTLR={:#010x} TTBR0={:#x} ({}) TCR={:#010x} FSR={:#010x} FAR={:#x}_{:08x} ::",
+                    tag, i, cbndx,
+                    rd(cb, 0x0),
+                    ttbr,
+                    if ttbr == ours { "OURS-identity" } else { "foreign/stale table (IOVA≠PA risk)" },
+                    rd(cb, 0x30),
+                    rd(cb, 0x58),
+                    rd(cb, 0x64),
+                    rd(cb, 0x60)
+                );
+            }
+        }
+        if !matched {
+            serial_println!(
+                ":: tegra: [net4i] {} — inst{}: NO valid SMR matches sid {:#x} (unmatched-stream {} governs) ::",
+                tag, i, sid,
+                if (scr0 >> 10) & 1 == 1 { "ABORT (USFCFG=1)" } else { "BYPASS (USFCFG=0)" }
+            );
+        }
+        jb3_fault_line(i, base, tag);
+    }
+}
+
+/// NET-4i fix: force PCIe-C0's stream to BYPASS on every named SMMU instance — the honest minimal
+/// map matching the driver's identity-DMA design (an inbound PCIe write reaches the DRAM PA it
+/// targets, untranslated). Per instance, in order of preference:
+///   * sCR0 poison            → fail-closed, leave untouched (recon already logged it).
+///   * CLIENTPD=1 (SMMU off)  → every stream already bypasses; nothing to arm.
+///   * an SMR already matches  → flip that S2CR to type=bypass (unless it already is).
+///   * no match               → claim a free SMR (VALID clear), set its S2CR=bypass, then VALIDate it.
+///   * no free SMR            → fail-closed (cannot arm without clobbering another master's stream).
+/// Every register write is announced before issue. Returns the number of instances armed.
+pub fn net4i_bypass(bases: &[u64], sid: u32) -> usize {
+    const S2CR_BYPASS: u32 = 0b01 << 16; // TYPE[17:16] = 0b01
+    let mut armed = 0usize;
+    serial_println!(
+        ":: tegra: [net4i] FIX — arming per-stream BYPASS for PCIe-C0 sid {:#x} across {} instance(s) ::",
+        sid, bases.len()
+    );
+    for (i, &base) in bases.iter().enumerate() {
+        let scr0 = rd(base, SCR0);
+        if smmu_poison(scr0) {
+            serial_println!(
+                ":: tegra: [net4i] FIX — inst{}: sCR0 POISON — FAIL-CLOSED, SMMU left untouched ::",
+                i
+            );
+            continue;
+        }
+        if scr0 & 1 == 1 {
+            serial_println!(
+                ":: tegra: [net4i] FIX — inst{}: CLIENTPD=1 (SMMU globally bypassing) — stream already untranslated; nothing to arm ::",
+                i
+            );
+            continue;
+        }
+        let n = (rd(base, IDR0) & 0xff).min(MAX_SMRG);
+        // Pass 1: an SMR already matching the stream — reroute it to bypass in place.
+        let mut done = false;
+        for s in 0..n {
+            let smr = rd(base, SMR_BASE + 4 * s as u64);
+            if smr & (1 << 31) == 0 {
+                continue;
+            }
+            let (id, mask) = (smr & 0x7fff, (smr >> 16) & 0x7fff);
+            if (sid ^ id) & !mask & 0x7fff != 0 {
+                continue;
+            }
+            let s2cr = rd(base, S2CR_BASE + 4 * s as u64);
+            if (s2cr >> 16) & 0b11 == 0b01 {
+                serial_println!(
+                    ":: tegra: [net4i] FIX — inst{} SMR[{}] already S2CR=bypass — nothing to change ::",
+                    i, s
+                );
+            } else {
+                let new = (s2cr & !(0b11 << 16)) | S2CR_BYPASS;
+                serial_println!(
+                    ":: tegra: [net4i] FIX — inst{} >>> WRITE S2CR[{}] {:#010x} -> {:#010x} (type -> bypass) ::",
+                    i, s, s2cr, new
+                );
+                wr(base, S2CR_BASE + 4 * s as u64, new);
+                armed += 1;
+            }
+            done = true;
+            break;
+        }
+        if done {
+            continue;
+        }
+        // Pass 2: unmatched — claim a free SMR (VALID clear), bypass-route it, then validate.
+        let mut placed = false;
+        for s in 0..n {
+            let smr = rd(base, SMR_BASE + 4 * s as u64);
+            if smr & (1 << 31) != 0 {
+                continue;
+            }
+            // Program S2CR to bypass BEFORE validating the SMR, so no transaction can transiently
+            // hit a matched stream routed to a stale/zero context.
+            let s2cr = rd(base, S2CR_BASE + 4 * s as u64);
+            let new_s2cr = (s2cr & !(0b11 << 16)) | S2CR_BYPASS;
+            serial_println!(
+                ":: tegra: [net4i] FIX — inst{} >>> WRITE S2CR[{}] {:#010x} -> {:#010x} (free slot -> bypass) ::",
+                i, s, s2cr, new_s2cr
+            );
+            wr(base, S2CR_BASE + 4 * s as u64, new_s2cr);
+            let new_smr = (1u32 << 31) | (sid & 0x7fff); // VALID, mask=0 (exact match)
+            serial_println!(
+                ":: tegra: [net4i] FIX — inst{} >>> WRITE SMR[{}] {:#010x} -> {:#010x} (VALID, exact sid {:#x}) ::",
+                i, s, smr, new_smr, sid
+            );
+            wr(base, SMR_BASE + 4 * s as u64, new_smr);
+            armed += 1;
+            placed = true;
+            break;
+        }
+        if !placed {
+            serial_println!(
+                ":: tegra: [net4i] FIX — inst{}: no free SMR slot (all {} valid) — FAIL-CLOSED, cannot arm without clobbering another stream ::",
+                i, n
+            );
+        }
+    }
+    serial_println!(":: tegra: [net4i] FIX — done: {} instance(s) armed to bypass ::", armed);
+    armed
+}
+
 fn jb3_fault_line(i: usize, base: u64, tag: &str) {
     let gfsr = rd(base, SGFSR);
     let far_lo = rd(base, SGFAR_LO);

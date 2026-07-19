@@ -822,6 +822,130 @@ pub fn xusb_iommu(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Option<X
     Some(out)
 }
 
+/// NET-4i: PCIe controller-0's SMMU binding, resolved off the LIVE firmware DTB — the SMMU
+/// instance base(s) plus the stream id that controller-0's DMA emits. Parallel to [`xusb_iommu`],
+/// but a PCIe root complex declares its stream via `iommu-map` (an RID→streamid map:
+/// `<rid-base &smmu sid-base length>` 4-tuples) rather than the point-to-point `iommus` XUSB uses.
+/// A downstream single-function device (bus1:dev0:fn0, the NET-4 RTL8168) has RID 0, so the FIRST
+/// tuple's `sid-base` is the stream id it presents to the SMMU. Falls back to a plain `iommus`
+/// binding if the node uses that form. Same first-`pcie@`-node selection as `resolve_ecam_base`
+/// (controller-0 = `/bus@0/pcie@140a0000`). READ-ONLY RAM walk; `None` on any uncooperative tree.
+pub struct PcieIommu {
+    pub sid: u32,
+    pub bases: [u64; 2],
+    pub n_bases: usize,
+}
+
+pub fn pcie_iommu(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Option<PcieIommu> {
+    if dtb_addr == 0 || dtb_size == 0 {
+        return None;
+    }
+    let g_lo = dtb_addr >> 30;
+    let g_hi = (dtb_addr + dtb_size as u64 - 1) >> 30;
+    let mapped = |g: u64| g == 0 || (g < 64 && (ram_gib_mask >> g) & 1 != 0);
+    if !mapped(g_lo) || !mapped(g_hi) {
+        return None;
+    }
+    let blob = unsafe { core::slice::from_raw_parts(dtb_addr as *const u8, dtb_size) };
+    let fdt = Fdt::new(blob)?;
+
+    // First `pcie@` node (controller-0), the same node `resolve_ecam_base` drives.
+    let mut path = [0u8; MAX_PATH];
+    let mut plen = 0usize;
+    fdt.for_each_prop(|e| {
+        if plen != 0 {
+            return;
+        }
+        let leaf = match e.path.iter().rposition(|&b| b == b'/') {
+            Some(i) => &e.path[i + 1..],
+            None => e.path,
+        };
+        if leaf.starts_with(b"pcie@") {
+            let l = e.path.len().min(MAX_PATH);
+            path[..l].copy_from_slice(&e.path[..l]);
+            plen = l;
+        }
+    });
+    if plen == 0 {
+        serial_println!(":: tegra: [net4i] no pcie@ node in DTB — cannot resolve PCIe SMMU stream ::");
+        return None;
+    }
+
+    // `iommu-map` (RID→streamid) preferred; RID 0's tuple is [rid-base, phandle, sid-base, length].
+    // Some node revisions carry a plain `iommus = <&smmu sid>`; accept that too.
+    let map = fdt.prop_at(&path[..plen], b"iommu-map");
+    let (ph, sid, form) = if map.found && map.n >= 3 {
+        (map.words[1], map.words[2], "iommu-map")
+    } else {
+        let it = fdt.prop_at(&path[..plen], b"iommus");
+        if it.found && it.n >= 2 {
+            (it.words[0], it.words[1], "iommus")
+        } else {
+            serial_println!(
+                ":: tegra: [net4i] {} has no iommu-map/iommus prop — PCIe SMMU stream unknown ::",
+                core::str::from_utf8(&path[..plen]).unwrap_or("pcie@")
+            );
+            return None;
+        }
+    };
+
+    let mut spath = [0u8; MAX_PATH];
+    let slen = fdt.path_of_phandle(ph, &mut spath);
+    if slen == 0 {
+        serial_println!(
+            ":: tegra: [net4i] SMMU phandle {:#x} unresolved (sid={:#x}, via {}) ::",
+            ph, sid, form
+        );
+        return None;
+    }
+    let snode = &spath[..slen];
+    // Dual MMU-500: #address-cells=2/#size-cells=2, so reg is [addr-hi addr-lo size-hi size-lo]
+    // per mirrored instance (same shape xusb_iommu decodes).
+    let reg = fdt.prop_at(snode, b"reg");
+    let mut out = PcieIommu {
+        sid,
+        bases: [0; 2],
+        n_bases: 0,
+    };
+    let mut w = 0usize;
+    while w + 3 < reg.n && out.n_bases < 2 {
+        out.bases[out.n_bases] = ((reg.words[w] as u64) << 32) | reg.words[w + 1] as u64;
+        out.n_bases += 1;
+        w += 4;
+    }
+    let compat = fdt.prop_at(snode, b"compatible");
+    let mut cbuf = [b' '; 44];
+    let mut cl = 0usize;
+    'fill: for wi in 0..compat.n {
+        for b in compat.words[wi].to_be_bytes() {
+            if cl >= cbuf.len() {
+                break 'fill;
+            }
+            cbuf[cl] = match b {
+                0 => b'|',
+                b if b.is_ascii_graphic() => b,
+                _ => b'?',
+            };
+            cl += 1;
+        }
+    }
+    serial_println!(
+        ":: tegra: [net4i] DTB: {} sid={:#x} (via {}) -> {} reg0={:#010x} reg1={:#010x} ({} inst) compat='{}' ::",
+        core::str::from_utf8(&path[..plen]).unwrap_or("pcie@"),
+        sid,
+        form,
+        core::str::from_utf8(snode).unwrap_or("?"),
+        out.bases[0],
+        out.bases[1],
+        out.n_bases,
+        core::str::from_utf8(&cbuf[..cl]).unwrap_or("?")
+    );
+    if out.n_bases == 0 {
+        return None;
+    }
+    Some(out)
+}
+
 /// JD1 (video): the firmware's live scanout framebuffer, taken from the DTB `simple-framebuffer`
 /// handoff — the SIMPLEFB display-handoff the JetPack UEFI uses (edk2-nvidia
 /// `DisplayDeviceTreeHelperLib`). The GOP is `BltOnly` precisely *because* the firmware hands the
