@@ -809,6 +809,17 @@ pub fn a78ae_errata_probe() {
 /// `/reserved-memory` carveouts, prints one witness line naming the guarded range and the carveout
 /// count, and returns `None` (caller fails closed) when no clean window exists. No protection is
 /// weakened — this only *narrows* what the heap may claim. Returns `(heap_start, HEAP_SIZE)`.
+///
+/// ORIN-RAS-2 — prefer the HIGHEST clean window, not the first. Boot-5 metal proved that seating
+/// the heap at the DRAM base (0x8000_0000) put the NIC's DMA rings BELOW the PCIe inbound-DMA
+/// window: the fabric translated ring writebacks to ~0x0..0x200 and returned "Error response from
+/// slave" (RAS Uncorrectable in IOB, cores powered off). The exact inbound-window boundary is not
+/// derivable from code — but R22 sitting-2 PROVED the rings DMA correctly with the old high-DRAM
+/// heap placement (heap around GiB 9 / the image region). So the highest clean window is the
+/// data-justified placement: it restores that proven DMA reachability while keeping the carveout
+/// exclusion and fail-closed behavior exactly as-is. Per region we scan DOWN from
+/// `region_end - need`, sliding below overlapping carveouts (O(carveouts), not O(region/4K)), and
+/// return the highest clean base across all usable regions.
 #[cfg(feature = "tegra")]
 pub fn select_heap_region(
     regions: &[MemoryRegion],
@@ -839,47 +850,69 @@ pub fn select_heap_region(
     }
     let carveouts = &carve[..nc];
 
-    // The lowest carveout END that overlaps [s, s+need), if any — the caller slides the window past
-    // it. Overlaps are re-checked after each slide, so a window straddling several carveouts walks
-    // past all of them (each slide strictly advances `s`, so this terminates).
-    let overlap_end = |s: u64, e: u64| -> Option<u64> {
+    // The greatest carveout BASE that overlaps [s, s+need), if any — the scan-down loop slides the
+    // window strictly below it (`s <= cb - need`). Taking the *max* overlapping base is safe: the
+    // re-check after each slide catches any lower carveouts, and each slide strictly decreases `s`
+    // (an overlap means `s + need > cb`, so `cb - need < s`), so the loop terminates in O(carveouts).
+    let overlap_max_base = |s: u64, e: u64| -> Option<u64> {
         let mut hit: Option<u64> = None;
         for &(cb, cs) in carveouts {
             let ce = cb.wrapping_add(cs);
             if cs != 0 && s < ce && cb < e {
-                // Advance to the smallest overlapping carveout end so a usable gap between two
-                // carveouts is never skipped; re-checking after the slide clears the rest.
-                hit = Some(hit.map_or(ce, |h| h.min(ce)));
+                hit = Some(hit.map_or(cb, |h| h.max(cb)));
             }
         }
         hit
     };
 
+    // Highest clean window across ALL usable regions. Per region: scan DOWN from the top so the
+    // first clean base found is that region's highest; keep the greatest across regions.
+    let mut best: Option<u64> = None;
     for r in regions {
         if r.kind != MemoryRegionKind::Usable {
             continue;
         }
         let region_end = r.phys_start.wrapping_add((r.page_count * 4096) as u64);
-        // Page-align the window base up into the region.
-        let mut s = (r.phys_start + PAGE - 1) & !(PAGE - 1);
-        while s.wrapping_add(need) <= region_end {
-            match overlap_end(s, s + need) {
+        let region_base = (r.phys_start + PAGE - 1) & !(PAGE - 1);
+        if region_end < need || region_end - need < region_base {
+            continue; // region can't hold a window
+        }
+        // Top candidate: highest page-aligned base with s + need <= region_end.
+        let mut s = (region_end - need) & !(PAGE - 1);
+        loop {
+            if s < region_base {
+                break; // no clean window in this region
+            }
+            match overlap_max_base(s, s + need) {
                 None => {
-                    serial_println!(
-                        ":: tegra: HEAP-GUARD — kernel heap [{:#x}, {:#x}) ({} MiB), clear of {} carveout range(s) (UEFI-reserved + DTB /reserved-memory) ::",
-                        s,
-                        s + need,
-                        need >> 20,
-                        nc
-                    );
-                    return Some((s as usize, need as usize));
+                    best = Some(best.map_or(s, |b| b.max(s)));
+                    break;
                 }
-                Some(ce) => {
-                    // Slide past the carveout, page-aligned; re-check for further overlaps.
-                    s = (ce + PAGE - 1) & !(PAGE - 1);
+                Some(cb) => {
+                    // Slide the window strictly below the highest overlapping carveout, page-aligned
+                    // down; re-check clears any lower carveouts now spanned.
+                    if cb < need {
+                        break; // nothing fits below this carveout
+                    }
+                    let next = (cb - need) & !(PAGE - 1);
+                    if next >= s {
+                        break; // no downward progress possible (shouldn't happen; guard anyway)
+                    }
+                    s = next;
                 }
             }
         }
+    }
+
+    if let Some(s) = best {
+        serial_println!(
+            ":: tegra: HEAP-GUARD — kernel heap [{:#x}, {:#x}) ({} MiB), highest clean window (PCIe inbound-DMA reachability, RAS-2), clear of {} carveout range(s) (UEFI-reserved + DTB /reserved-memory) ::",
+            s,
+            s + need,
+            need >> 20,
+            nc
+        );
+        return Some((s as usize, need as usize));
     }
 
     serial_println!(
