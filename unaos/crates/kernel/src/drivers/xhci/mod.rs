@@ -1910,6 +1910,26 @@ impl XhciController {
                                                 }
                                             }
                                         }
+                                    } else if desc_data[1] == 0x01 {
+                                        // ORIN-P7: a DEVICE descriptor whose class we have no driver
+                                        // for (e.g. 0xE0 Wireless Controller — the AzureWave 13d3:3549
+                                        // BT combo on Orin port 7). The full descriptor read SUCCEEDED
+                                        // (VID/PID above prove bytes 8..11 arrived), but none of the
+                                        // handled-class arms nor the config-descriptor arm matched, so
+                                        // without this the FSM would linger in 'dev-desc' until its
+                                        // watchdog fired a spurious "watchdog-timeout code 0" and
+                                        // re-enumerated — the ×2-3 recovery storm seen every boot. The
+                                        // device enumerated cleanly; we simply have no driver, so
+                                        // release the port and advance instead of parking. (Downstream
+                                        // slots never drive the root port queue — see the HID path.)
+                                        serial_println!(
+                                            "xHCI: no driver for device class {:#x} (slot {}, {:04x}:{:04x}); releasing port.",
+                                            class_code, slot_id,
+                                            self.slots[slot_id as usize].vid,
+                                            self.slots[slot_id as usize].pid);
+                                        if !self.slots[slot_id as usize].is_downstream {
+                                            self.start_next_port();
+                                        }
                                     }
                                 }
                                 }
