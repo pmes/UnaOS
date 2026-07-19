@@ -672,6 +672,12 @@ pub struct DeviceSlot {
     /// Count of REAL (non-dup) pointer reports serviced since arming — drives the bounded serial
     /// mouse-witness (first report + every Nth), never one-line-per-report.
     pub mouse_report_count: u32,
+    /// CLICK-1: the pointer button bitmask from the PREVIOUS report, so the decode can emit a
+    /// `pal::Event::Button` on a 0→1 down-edge (per button) and stay silent on release/hold. Byte 0
+    /// of every HID pointer report (boot mouse AND usb-tablet) carries the same button bits, so this
+    /// is shared by both decode paths. The EHCI (rMBP) path already edge-detects Button; this brings
+    /// the xHCI pointer to parity so an external USB mouse / absolute tablet click reaches the queue.
+    pub mouse_last_buttons: u8,
 
     pub is_keyboard: bool,
     pub keyboard_ep: u8,
@@ -778,6 +784,7 @@ impl DeviceSlot {
             mouse_ring: None,
             mouse_expect_phys: 0,
             mouse_report_count: 0,
+            mouse_last_buttons: 0,
             is_keyboard: false,
             keyboard_ep: 0,
             keyboard_mps: 0,
@@ -2003,8 +2010,19 @@ impl XhciController {
                                                 }
                                                 (x as i32, y as i32)
                                             };
+                                            // CLICK-1: emit a Button DOWN-edge (per button bit) exactly
+                                            // once per press. Byte 0 is the button bitmask in both the
+                                            // boot-mouse and usb-tablet report layouts. Compare against the
+                                            // previous report's mask so a held button stays silent and a
+                                            // release emits nothing (matches the EHCI/rMBP Button contract).
+                                            let prev_buttons = slot.mouse_last_buttons;
+                                            let down_edges = buttons & !prev_buttons;
+                                            if down_edges != 0 {
+                                                crate::pal::push_event(crate::pal::Event::Button(down_edges));
+                                            }
                                             // `slot` (the shared borrow) is no longer read past here;
                                             // the &mut self accesses below are the count bump + re-arm.
+                                            self.slots[slot_id as usize].mouse_last_buttons = buttons;
 
                                             // UI1-MOUSE M1: bounded serial mouse-witness — first report
                                             // + every 32nd thereafter, NEVER one-per-report (that would

@@ -1863,29 +1863,88 @@ fn jd2_console_pump(_arg: usize) {
         ),
     }
 
+    // JD20 (ORIN-POINTER): the composite pointer behind the HS hub already streams reports — the
+    // shared xHCI decoder pushes Mouse/MouseAbsolute/Button onto the PAL queue (built for the x86
+    // midden GUI; nothing consumed them on the Orin until now). This loop is the tegra-side pump:
+    // it drains those events alongside keys and composites the SHARED `pal::cursor` sprite onto the
+    // console's Screen back buffer via the R22 save-under machinery (stash the pixels under the
+    // sprite, restore before any repaint), so the arrow never corrupts console text and survives
+    // console redraws. The cursor self-gates on `visible()` (starts hidden, auto-hides ~1.5 s after
+    // the last report), so a keyboard-only boot is byte-identical — no knob needed.
+    use unaos_kernel::pal::cursor;
+    let mut announced = false;
     loop {
         if let Some(x) = unaos_kernel::drivers::xhci::XHCI_CONTROLLER.lock().as_mut() {
             x.poll_events();
         }
-        let mut keyed = false;
+        let cursor_was_visible = cursor::visible();
+        let mut needs_render = false;
+        // A key repaints the console into the back buffer; when that happens the cursor was erased
+        // first (restore, below) and must be re-composited on top after the drain.
+        let mut key_repainted = false;
         while let Some(ev) = unaos_kernel::pal::next_event() {
-            if let Event::Key(c) = ev {
-                // Serial echo: the bench evidence line (panel + serial must agree).
-                if (32..=126).contains(&c) {
-                    serial_println!(":: tegra: JD2 — KEY '{}' ::", c as char);
-                } else {
-                    serial_println!(":: tegra: JD2 — KEY {:#04x} ::", c);
+            match ev {
+                Event::Key(c) => {
+                    // Erase the cursor BEFORE the console repaints, so the save-under stash never
+                    // captures cursor pixels and a later restore can't paint stale glyphs back.
+                    cursor::restore(&mut pal);
+                    // Serial echo: the bench evidence line (panel + serial must agree).
+                    if (32..=126).contains(&c) {
+                        serial_println!(":: tegra: JD2 — KEY '{}' ::", c as char);
+                    } else {
+                        serial_println!(":: tegra: JD2 — KEY {:#04x} ::", c);
+                    }
+                    needs_render = true;
+                    key_repainted = true;
+                    if handle_key(c, &mut console, &mut pal) {
+                        // A command took the whole screen (e.g. `gneiss`): stop draining this frame
+                        // so a queued keystroke can't paint the console back over it (the shared
+                        // drain-loop rule from the x86 GUI path).
+                        break;
+                    }
                 }
-                keyed = true;
-                if handle_key(c, &mut console, &mut pal) {
-                    // A command took the whole screen (e.g. `gneiss`): stop draining this frame
-                    // so a queued keystroke can't paint the console back over it (the shared
-                    // drain-loop rule from the x86 GUI path).
-                    break;
+                Event::Mouse { x, y } => {
+                    if !announced {
+                        serial_println!(
+                            ":: tegra: JD20 — pointer live (relative mouse, cursor on scanout) ::"
+                        );
+                        announced = true;
+                    }
+                    cursor::restore(&mut pal);
+                    cursor::move_rel(x, y, pal.width() as i32, pal.height() as i32);
+                    cursor::draw_over(&mut pal);
+                    needs_render = true;
                 }
+                Event::MouseAbsolute { x, y } => {
+                    if !announced {
+                        serial_println!(
+                            ":: tegra: JD20 — pointer live (absolute tablet, cursor on scanout) ::"
+                        );
+                        announced = true;
+                    }
+                    // Absolute tablet coords are raw HID 0..=32767; `set_abs` scales to the panel.
+                    cursor::restore(&mut pal);
+                    cursor::set_abs(x, y, pal.width() as i32, pal.height() as i32);
+                    cursor::draw_over(&mut pal);
+                    needs_render = true;
+                }
+                Event::Button(mask) => {
+                    // Log clicks as a JD2 line for now (no UI action wired yet).
+                    serial_println!(":: tegra: JD20 — pointer BUTTON {:#04x} (down) ::", mask);
+                }
+                _ => {}
             }
         }
-        if keyed {
+        // A key repaint erased the cursor and redrew the console; put the arrow back on top.
+        if key_repainted && cursor::visible() {
+            cursor::draw_over(&mut pal);
+        }
+        // Auto-hide swept the cursor off this frame: erase it once so no arrow is left parked.
+        if cursor_was_visible && !cursor::visible() {
+            cursor::restore(&mut pal);
+            needs_render = true;
+        }
+        if needs_render {
             pal.render();
         }
         unaos_kernel::arch::sched::yield_now();

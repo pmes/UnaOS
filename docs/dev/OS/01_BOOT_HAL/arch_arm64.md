@@ -3227,6 +3227,46 @@ QEMU proof of the identical arch-neutral render is the aarch64/**virt** path (GI
 `UNAOS_RAST=1 ./arroyo test-arm` prints `:: RAST: … spinning cube … ::` + the fps line, and the boot
 still reaches `MISSION SUCCESS`.
 
+### JD20 — a visible mouse cursor on the panel (ORIN-POINTER, ⏳ METAL-PENDING)
+
+The composite HID device behind the HS hub enumerates a pointer interrupt-IN endpoint
+(`>>> POINTER INTERRUPT IN EP FOUND: 0x82 … ABSOLUTE tablet (proto 0) <<<`), and the shared xHCI
+driver has always polled its reports into the dedicated `mouse_data_buffer` and pushed
+`pal::Event::Mouse` / `MouseAbsolute` onto the PAL queue (built for the x86 midden GUI). On the Orin
+nothing consumed them — the JD2 console owns the panel and only drained `Event::Key`. JD20 wires the
+tegra-side pump: the `jd2_console_pump` shell loop (`main.rs`) now drains the pointer events alongside
+keys and composites the **shared** `pal::cursor` arrow onto the console's `Screen` back buffer via the
+R22 save-under machinery — **`pal::cursor` and `Screen`/`framebuffer.rs` are call-never-edit here**.
+
+**Compositing (save-under, trail-free).** An absolute-tablet report scales raw HID `0..=32767` to the
+1920×1200 panel in `cursor::set_abs`; a relative report accumulates via `cursor::move_rel`. Each pointer
+event runs the shared triad `restore → move/set_abs → draw_over`: `draw_over` stashes the back-buffer
+pixels under the sprite's full bbox (through `TargetPal::read_pixel` → `Screen::read_back_pixel`, cached
+RAM — the WC scanout stays write-only) and paints the arrow; `restore` repaints the stash before any
+move. **A keystroke erases the cursor first** (`restore`) so the console repaint never captures cursor
+pixels into the stash, then the arrow is re-composited on top after the drain — so the cursor survives
+console scroll/redraw and never corrupts text. The cursor self-gates on `cursor::visible()` (starts
+hidden, auto-hides ~1.5 s after the last report and is swept off that frame), so a keyboard-only boot is
+behaviourally unchanged — **no knob**.
+
+**Clicks.** Byte 0 of every pointer report is the button bitmask; the xHCI decoder now edge-detects it
+against the previous report (`DeviceSlot::mouse_last_buttons`) and pushes `pal::Event::Button(mask)` on a
+0→1 down-edge (release/hold stay silent), bringing the xHCI pointer to parity with the EHCI/rMBP path
+which already emitted `Button`. The pump logs each press as a `:: tegra: JD20 — pointer BUTTON … ::`
+line; no UI action is wired to clicks yet.
+
+**Shared-file flag (rmbp-lane review).** Two shared files changed and were re-gated on x86:
+`drivers/xhci/mod.rs` (additive: one `DeviceSlot` field + button edge-detect + `Button` push — this now
+fires for an external USB mouse on x86 too, which `vug`/`pulse` already consume to exit) and `main.rs`
+(the tegra-only `jd2_console_pump` loop). `pal::cursor`, `Screen`, and `framebuffer.rs` are untouched.
+
+**Witness / gate (QEMU).** `./arroyo check` + `UNAOS_TEGRA=1 ./arroyo check` green both arches;
+`UNAOS_GICV3=1 ./arroyo test-arm 30` → CAPSTONE clean, no `FAIL`/`SERROR`/`PANIC`; `./arroyo test 30`
+→ x86 `MISSION SUCCESS` (shared xHCI/GUI guard). QEMU-virt has no pointer, so the cursor rides the
+attended Orin bench: on silicon, moving the tablet should paint a white drop-shadowed arrow that tracks
+the pointer over the shell without smearing text, and a click should print the JD20 BUTTON line — the
+first `:: tegra: JD20 — pointer live … ::` line marks the first consumed report. **METAL-PENDING.**
+
 ## 4. Jetson Orin Nano headless bring-up (Arc JM2)
 
 The Orin is brought up **headless over serial**. The only console that has ever
