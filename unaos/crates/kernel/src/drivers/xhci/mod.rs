@@ -1003,6 +1003,14 @@ pub struct XhciController {
     /// (a doorbell on a stopped ring restarts it AT the wedged TRB) — mirrors Linux's
     /// CMD_RING_STATE gating.
     cmd_ring_stopped: bool,
+    /// ORIN-USB-FIX: physical addresses of in-flight JB9i inherited-slot-eviction DISABLE_SLOT
+    /// TRBs (tegra no-HCRST takeover). Their completions are claimed early in the type-33
+    /// dispatch: success (1) = a UEFI-owned slot reclaimed, code 11 (Slot Not Enabled) = the
+    /// slot was never enabled — both EXPECTED, neither may print `>>> COMMAND FAILED <<<` nor
+    /// fall into the untracked-completion branch (which re-queued a DISABLE_SLOT for the
+    /// already-evicted slot on the R22 sitting-2 Orin boots). All-zero (inert) except during
+    /// the tegra eviction window; non-tegra paths never populate it.
+    pub evict_pending: [u64; 8],
     /// Per-root-port learned EP0 MPS for Full-Speed devices: false = first-guess 8, true = the
     /// port babbled at dev-desc (device's real bMaxPacketSize0 > 8) and retries use 64.
     fs_ep0_mps64: [bool; 32],
@@ -1092,6 +1100,7 @@ impl XhciController {
             stall_count: 0,
             slots_to_disable: Vec::new(),
             cmd_ring_stopped: false,
+            evict_pending: [0; 8],
             fs_ep0_mps64: [false; 32],
         }
     }
@@ -1329,6 +1338,29 @@ impl XhciController {
                         // pushed TRB's address). The abort machinery owns the restart.
                         if completion_code == 24 {
                             serial_println!("xHCI: [Event] Command Ring Stopped (dequeue={:#x}).", command_ptr);
+                            return;
+                        }
+
+                        // ORIN-USB-FIX: a JB9i eviction DISABLE_SLOT claims its own completion
+                        // here, matched by TRB address. Both success (slot reclaimed) and code
+                        // 11 (Slot Not Enabled — the slot was never in use) are the expected
+                        // outcomes of evicting slots 1..8 blind; consume them quietly so they
+                        // neither alarm (`COMMAND FAILED`) nor mis-queue a redundant
+                        // DISABLE_SLOT via the untracked-completion branch below.
+                        if self.evict_pending.iter().any(|&p| p != 0 && p == command_ptr) {
+                            for p in self.evict_pending.iter_mut() {
+                                if *p == command_ptr {
+                                    *p = 0;
+                                }
+                            }
+                            serial_println!(
+                                "xHCI: JB9i eviction completion: slot {} code {} ({}).",
+                                slot_id, completion_code,
+                                match completion_code {
+                                    1 => "reclaimed",
+                                    11 => "was not enabled — fine",
+                                    _ => "tolerated",
+                                });
                             return;
                         }
 
@@ -4325,7 +4357,21 @@ impl XhciController {
                 continue; // nothing connected
             }
             serial_println!("xHCI: HUB slot {} port {}: device connected; enumerating...", hub_slot, port);
-            if let Some(speed) = self.reset_downstream_port(hub_slot, port, buf) {
+            if let Some(mut speed) = self.reset_downstream_port(hub_slot, port, buf) {
+                // ORIN-USB-FIX (R22 sitting-2): a SuperSpeed hub's wPortStatus does NOT carry
+                // the USB2 LS/HS speed bits — bit 9 is PORT_POWER on an SS hub, which
+                // reset_downstream_port's USB2 decode misread as Low Speed (status 0x100203 ->
+                // "xHCI speed 2"). The slot context then carried speed 2 / MPS0 8 for an SS
+                // device and ADDRESS_DEVICE failed with code 4 three times — stranding the
+                // Orin boot stick behind its 0bda:0489 hub. Devices on an SS hub port are
+                // always SuperSpeed: force xHCI speed 4, exactly as the hot-plug path
+                // (service_hub_changes) already does. Boot-walk / hot-plug now agree.
+                if is_ss {
+                    speed = 4;
+                    serial_println!(
+                        "xHCI: HUB slot {} port {} is a SuperSpeed port (speed forced to SS).",
+                        hub_slot, port);
+                }
                 // Each route-string nibble is 4 bits. Clamp a hub port > 15 to 15 (as Linux does)
                 // so it stays a valid downstream-port nibble instead of aliasing onto 0 (= the hub
                 // itself) or a sibling. Hubs with > 15 ports are rare; the target VIA hub has ≤ 4,
@@ -4818,7 +4864,11 @@ impl XhciController {
             // descriptor — XENUM-3 M1 learns the real value from the 8-byte header and XENUM-4
             // applies it in place via Evaluate Context (see enumerate_downstream), so the initial
             // guess here need only be good enough to read that 8-byte header.
-            let mps0: u32 = if speed == 2 { 8 } else { 64 };
+            // ORIN-USB-FIX: a SuperSpeed device's MPS0 is fixed at 512 by spec (USB3 9.6.6) —
+            // 64 in the slot's EP0 context is a Parameter/Transaction error waiting to happen.
+            // The root path already programs 512 for SS (speed >= 4); mirror it here now that
+            // the SS-hub walk can actually deliver speed-4 children.
+            let mps0: u32 = if speed == 2 { 8 } else if speed >= 4 { 512 } else { 64 };
             let ep0_ctx = base_ptr.add(2 * CTX_WORDS);
             ep0_ctx.add(1).write_volatile((4 << 3) | (3 << 1) | (mps0 << 16));
             ep0_ctx.add(2).write_volatile((ep0_ring_phys as u32) | 1);

@@ -1300,7 +1300,16 @@ pub fn jb2b_attach(
                     status: 0,
                     control: (10 << 10) | ((slot as u32) << 24), // TRB type 10 = Disable Slot
                 };
-                let _ = x.send_command(trb);
+                // ORIN-USB-FIX: record each eviction TRB's physical address so the event
+                // dispatch claims its completion by address — success (reclaimed) and code 11
+                // (Slot Not Enabled) are both the expected outcome of this blind 1..8 sweep,
+                // and must not read as `COMMAND FAILED` or be re-queued as untracked slots
+                // (both happened verbatim on the R22 sitting-2 Orin boots).
+                match x.send_command(trb) {
+                    Ok(phys) => x.evict_pending[(slot - 1) as usize] = phys,
+                    Err(e) => serial_println!(
+                        ":: tegra: JB9i — DISABLE_SLOT {} not issued ({}) ::", slot, e),
+                }
             }
             // Drain the eight completions (bounded ~100 ms) before enumeration starts, so no
             // stale completion aliases against the enum FSM's own commands.
@@ -1308,6 +1317,16 @@ pub fn jb2b_attach(
             while cntpct().wrapping_sub(deadline) >= (1u64 << 63) {
                 x.poll_events();
                 core::hint::spin_loop();
+            }
+            // ORIN-USB-FIX: retire any claim that never saw its completion inside the drain
+            // window — the command ring wraps, so a stale physical address left armed could
+            // one day claim an unrelated command's completion. Honest count on the way out.
+            let unanswered = x.evict_pending.iter().filter(|&&p| p != 0).count();
+            if unanswered != 0 {
+                serial_println!(
+                    ":: tegra: JB9i — {} eviction completion(s) unanswered within the drain window (claims retired) ::",
+                    unanswered);
+                x.evict_pending = [0; 8];
             }
             serial_println!(":: tegra: JB9i — inherited-slot eviction: DISABLE_SLOT 1..8 issued + drained ::");
         }
