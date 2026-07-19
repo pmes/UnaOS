@@ -4278,7 +4278,16 @@ impl XhciController {
                 continue;
             }
             if kbd {
-                self.set_hid_boot_protocol(slot, kbd_intf, "keyboard");
+                if self.set_hid_boot_protocol(slot, kbd_intf, "keyboard") {
+                    // USB-HID-MULTI: SET_IDLE(0) — report ONLY on change (HID 1.11 §7.2.4). A boot
+                    // keyboard powers up with a device-chosen idle rate; some composite keyboards
+                    // (the Orin tablet-combo among them) default to an idle that never spontaneously
+                    // reports a key edge on our poll cadence, so the shell saw "zero keys ever" while
+                    // a sibling keyboard that tolerates the missing SET_IDLE worked. Duration 0 =
+                    // indefinite (change-only), report id 0 = all reports. Sent LAST on this EP0: a
+                    // STALL here (device lacks SET_IDLE) halts EP0 harmlessly — no request follows.
+                    self.set_hid_idle(slot, kbd_intf, "keyboard");
+                }
             }
         }
     }
@@ -4305,6 +4314,54 @@ impl XhciController {
                 false
             }
         }
+    }
+
+    /// HID class request SET_IDLE for one interface: bmRequestType 0x21 (host->device, class,
+    /// interface recipient), bRequest 0x0A, wValue = (duration<<8)|reportId — here 0x0000 =
+    /// duration 0 (indefinite: report only when the report changes) for report id 0 (all reports),
+    /// wIndex = the interface number, no data stage. A STALL/timeout is tolerated (best-effort): a
+    /// device without SET_IDLE support keeps its power-up idle behaviour. Returns true on code 1.
+    fn set_hid_idle(&mut self, slot: u8, intf: u8, what: &str) -> bool {
+        match self.sync_control(slot, 0x21, 0x0A, 0x0000, intf as u16, 0, 0, false) {
+            Ok(1) => {
+                serial_println!("xHCI: SET_IDLE(0) OK for {} (slot {}, iface {}).", what, slot, intf);
+                true
+            }
+            Ok(code) => {
+                serial_println!(
+                    "xHCI: SET_IDLE(0) for {} (slot {}, iface {}) returned code {} (device may lack SET_IDLE; tolerated).",
+                    what, slot, intf, code
+                );
+                false
+            }
+            Err(()) => {
+                serial_println!("xHCI: SET_IDLE(0) for {} (slot {}, iface {}) FAILED (EP0 pump timeout; tolerated).", what, slot, intf);
+                false
+            }
+        }
+    }
+
+    /// USB-HID-MULTI: every HID keyboard whose interrupt-IN read is ARMED (keyboard_state == 3, set
+    /// once the device-level SET_CONFIGURATION completed and `queue_keyboard_read` pushed the first
+    /// Normal TRB), as (slot id, root port). More than one composite keyboard can be armed at once —
+    /// each slot's read is re-armed independently in `poll_events`, and every decoded key is pushed
+    /// to the shared `pal` queue, so the platform pump drains a MERGED stream. Ordered by slot id.
+    pub fn armed_keyboards(&self) -> Vec<(u8, u8)> {
+        let mut v = Vec::new();
+        for (i, s) in self.slots.iter().enumerate() {
+            if s.active && s.is_keyboard && s.keyboard_state == 3 {
+                v.push((i as u8, s.port_id));
+            }
+        }
+        v
+    }
+
+    /// USB-HID-MULTI: count of HID pointers whose interrupt-IN read is ARMED (mouse_state == 3).
+    pub fn armed_pointer_count(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|s| s.active && s.is_mouse && s.mouse_state == 3)
+            .count()
     }
 
     fn bring_up_hub(&mut self, hub_slot: u8) {

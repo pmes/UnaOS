@@ -65,17 +65,8 @@ fn cntfrq() -> u64 {
     if v == 0 { 62_500_000 } else { v }
 }
 
-/// A keyboard whose interrupt-IN read is ARMED: `keyboard_state == 3` is set exactly when the
-/// device-level SET_CONFIGURATION completed and `queue_keyboard_read` pushed the first Normal TRB
-/// (drivers/xhci/mod.rs, the HID SET_CONFIGURATION COMPLETE branch). Returns (slot, root port).
-fn keyboard_armed(x: &xhci::XhciController) -> Option<(u8, u8)> {
-    for (i, s) in x.slots.iter().enumerate() {
-        if s.active && s.is_keyboard && s.keyboard_state == 3 {
-            return Some((i as u8, s.port_id));
-        }
-    }
-    None
-}
+/// USB-HID-MULTI: the armed-keyboard witness is now `XhciController::armed_keyboards` (returns ALL
+/// armed HID keyboards, not just the first), driven from the pump loop below. See drivers/xhci/mod.rs.
 
 #[inline]
 fn dsb() {
@@ -1351,6 +1342,12 @@ pub fn jb2b_attach(
     let storage_settle = cntfrq().saturating_mul(8);
     let mut armed: Option<(u8, u8)> = None;
     let mut armed_at: u64 = 0;
+    // USB-HID-MULTI: witness EVERY armed HID keyboard, not just the first. `witnessed` is a
+    // slot-id bitmask (slots are 1..=few) so a newly-armed second composite keyboard prints its
+    // own ARMED line the pass it comes up. The FIRST armed keyboard still drives `armed` (the
+    // storage-settle timer + the return value), and its line keeps the exact spec text.
+    let mut witnessed: u64 = 0;
+    let mut armed_ptr_count: usize = 0;
     // JB9-B capture marks: t≈200 ms (mid the FIRST port's first enable-slot attempt — the JB8
     // log shows ~340 ms per watchdog attempt, so the command is in flight) and t≈5 s (a later
     // port's attempt — same question after several rounds of recovery). Fired OUTSIDE the
@@ -1371,7 +1368,7 @@ pub fn jb2b_attach(
                 }
             }
         }
-        let (armed_now, storage_slot, storage_ready) = {
+        let (armed_kbds, ptr_count, storage_slot, storage_ready) = {
             let mut guard = xhci::XHCI_CONTROLLER.lock();
             let x = guard.as_mut().unwrap();
             x.poll_events();
@@ -1387,22 +1384,34 @@ pub fn jb2b_attach(
             // waits ride `crate::hlt()`, which the timerless EL1 core cannot wake (the JD2/JB2b
             // rule). A no-op until a device is pending, so keyboard-only boots are unaffected.
             x.service_storage();
-            (keyboard_armed(x), x.storage_slot, x.storage_slot != 0 && x.storage_note == "ready")
+            (x.armed_keyboards(), x.armed_pointer_count(), x.storage_slot, x.storage_slot != 0 && x.storage_note == "ready")
         };
-        // Capture the keyboard the first time it arms, but keep pumping so a hubbed MSC can settle.
-        if armed.is_none() {
-            if let Some((slot, port)) = armed_now {
-                serial_println!(
-                    ":: tegra: JB2b — keyboard ARMED (slot {}, root port {}) -> PASS ::",
-                    slot,
-                    port
-                );
+        armed_ptr_count = ptr_count;
+        // USB-HID-MULTI: witness each armed keyboard as it comes up (not only the first), so a boot
+        // where two composite keyboards enumerate records BOTH — every one has its interrupt-IN read
+        // polled and its keys merged into the shared pal queue. The first still drives the settle
+        // timer + the returned handle; its line keeps the exact `-> PASS` spec text.
+        for (slot, port) in armed_kbds.iter().copied() {
+            if witnessed & (1u64 << slot) != 0 {
+                continue;
+            }
+            witnessed |= 1u64 << slot;
+            serial_println!(
+                ":: tegra: JB2b — keyboard ARMED (slot {}, root port {}) -> PASS ::",
+                slot,
+                port
+            );
+            if armed.is_none() {
                 armed = Some((slot, port));
                 armed_at = cntpct();
             }
         }
         if let Some(k) = armed {
             if storage_ready {
+                serial_println!(
+                    ":: tegra: JB2b — HID: {} keyboard(s), {} pointer(s) armed ::",
+                    (witnessed.count_ones()) as usize, armed_ptr_count
+                );
                 serial_println!(
                     ":: tegra: JD3 — mass storage ready (slot {}); panel shell ls/cat live ::",
                     storage_slot
@@ -1411,6 +1420,10 @@ pub fn jb2b_attach(
             }
             // Keyboard up but no disk yet: give the hubbed MSC a bounded settle window, then drop.
             if cntpct().wrapping_sub(armed_at) >= storage_settle {
+                serial_println!(
+                    ":: tegra: JB2b — HID: {} keyboard(s), {} pointer(s) armed ::",
+                    (witnessed.count_ones()) as usize, armed_ptr_count
+                );
                 serial_println!(
                     ":: tegra: JD3 — no mass storage within the settle window; proceeding (shell ls/cat report no disk) ::"
                 );
