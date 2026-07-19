@@ -590,6 +590,51 @@ pub fn jb1a_dump(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) {
     }
 }
 
+/// ORIN-VUG-RAS — enumerate the firmware's DRAM carveouts from the DTB `/reserved-memory` children
+/// as (base, size) byte ranges. On Tegra234 several carveouts (TZ, BPMP, DCE, ...) are protected by
+/// the SNOC memory firewall AND are reported as ordinary Conventional (Usable) DRAM in the UEFI map,
+/// so the kernel heap must exclude them explicitly: a cached store into one succeeds into the
+/// D-cache and then faults on writeback with an SNOC RAS Uncorrectable "Carveout" abort that powers
+/// the cores off (the vug lockup — a heap store into a carveout page, evicted a few frames later).
+/// `/reserved-memory` on Tegra uses 2 address + 2 size cells (root #address-cells/#size-cells = 2).
+/// Only children carrying a concrete `reg` are returned; dynamically-placed carveouts (declared with
+/// `size` + `alloc-ranges` and no static base) can't be excluded from here — the caller notes that
+/// the heap-guard witness line prints the final range so a bench sitting can cross-check the RAS PA.
+/// Read-only RAM walk (the dtb is Normal-WB-mapped by the time `memory::init` runs). Returns the
+/// number of ranges written into `out`.
+pub fn reserved_carveouts(dtb_addr: u64, dtb_size: usize, out: &mut [(u64, u64)]) -> usize {
+    if dtb_addr == 0 || dtb_size == 0 || dtb_size > 4 * 1024 * 1024 || out.is_empty() {
+        return 0;
+    }
+    let blob = unsafe { core::slice::from_raw_parts(dtb_addr as *const u8, dtb_size) };
+    let Some(fdt) = Fdt::new(blob) else { return 0 };
+    let mut n = 0usize;
+    fdt.for_each_prop(|e| {
+        // /reserved-memory/<child> `reg` arrives at depth 3 (root=1, reserved-memory=2, child=3).
+        if n >= out.len() || e.name != b"reg" || e.depth != 3 {
+            return;
+        }
+        let p = e.path;
+        if !(p.len() > 16 && &p[..16] == b"/reserved-memory") {
+            return;
+        }
+        let words = PropWords::capture(blob, e.val_off, e.val_len);
+        // Each reg entry is [base_hi, base_lo, size_hi, size_lo]; a node may carry several. Skip
+        // zero-size entries.
+        let mut i = 0usize;
+        while i + 4 <= words.n && n < out.len() {
+            let base = ((words.words[i] as u64) << 32) | words.words[i + 1] as u64;
+            let size = ((words.words[i + 2] as u64) << 32) | words.words[i + 3] as u64;
+            if size != 0 {
+                out[n] = (base, size);
+                n += 1;
+            }
+            i += 4;
+        }
+    });
+    n
+}
+
 /// JB3 boot-6: census of EVERY smmu/iommu node the firmware DTB knows — name, compatible,
 /// first reg base. Boot-5's verdict (v2 pair open + fault-free, DMA still dead) means a second
 /// killer sits downstream; Tegra234 carries SMMUv3 instances alongside the MMU-500 pairs, and

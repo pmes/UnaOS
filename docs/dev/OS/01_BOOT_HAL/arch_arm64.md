@@ -597,6 +597,41 @@ a live boot console on the Orin:
   keyboard/mouse — the Orin's built-in ports are **Tegra XUSB** (a platform controller needing
   firmware/phy bring-up, NOT the PCIe xHCI the kernel already drives); that is its own arc.
 
+### ORIN-VUG-RAS — carveout-aware kernel heap (the SNOC RAS "Carveout" lockup) — **code fix, metal-owed**
+
+Running `vug` from the JD2 Orin shell killed the box a few frames in: `RAS Uncorrectable Error in
+SNOC … SERR = Illegal address (software fault) … IERR = Carveout Uncorrectable Error … ADDR =
+0x80000000be055a80`, cores powered off. The RAS is a *FillWrite* — a dirty cache line evicted to a
+protected DRAM carveout — which is why it lands **after** `:: VUG: crystal live … exit clean ::` and
+the first meter window print: the offending store went into the D-cache frames earlier and only
+faulted on writeback.
+
+Root cause: the kernel heap was backed by a firmware carveout. NVIDIA's UEFI reports several
+firewall-protected low-DRAM carveouts (TZ / BPMP / DCE / …) as ordinary `Conventional` (Usable)
+memory, so `arch::memory::init`'s naive *"first Usable region ≥ `HEAP_SIZE`"* pick can seat the
+48 MiB heap on protected DRAM. The interactive console never wrote the offending page (it damages
+only small text rectangles); `vug`'s per-frame `String` formatting + full-frame draws grew live heap
+use past the carveout boundary, so `vug` is simply the first workload to store there. The framebuffer
+pixel path was audited and is **not** implicated — `FrameBuffer` holds its base as `usize` and does
+all offset math in 64-bit, so the "truncated 33/34-bit address" hypothesis was ruled out.
+
+Fix (tegra-gated; every other aarch64 target keeps the original selection byte-for-byte):
+- `fdt_tegra::reserved_carveouts` enumerates the DTB `/reserved-memory` carveouts (2 addr + 2 size
+  cells) as `(base, size)` ranges — the firewall carveouts UEFI hides inside Conventional.
+- `mmu_tegra::select_heap_region` slides a `HEAP_SIZE` window through the Usable regions until it
+  finds one clear of **both** the UEFI non-Usable regions **and** the DTB carveouts, emits a
+  `:: tegra: HEAP-GUARD — kernel heap [lo, hi) … clear of N carveout range(s) ::` witness line, and
+  returns `None` → `memory::init` **fails closed** (`panic!`) if no clean window exists. No
+  protection is weakened — this only *narrows* what the heap may claim.
+- Limitation: carveouts declared with `size` + `alloc-ranges` (no static `reg`) carry no base and
+  can't be excluded from here. The HEAP-GUARD witness prints the final range so an attended sitting
+  can confirm the RAS PA (`0xbe055a80`) is outside it; if a firewall carveout is neither UEFI-Reserved
+  nor a concrete `/reserved-memory` `reg`, the guarded range is the evidence a follow-up would need.
+
+**Metal-owed:** re-run `vug`/`pulse` from the JD2 shell on the Orin and confirm the HEAP-GUARD line
+places the heap clear of `0xbe000000` and the RAS no longer fires. QEMU cannot exercise this (tegra
+is metal-only; `virt`/`test-arm` prove only that the non-tegra path is unchanged).
+
 ### JX1 result — XUSB first light (⛔ **the block is EL3-fatal to touch post-EBS; BPMP ungate required first**)
 
 The one-boot probe (a guarded read of the xHCI capability block @ `0x0361_0000`, the Linux DT

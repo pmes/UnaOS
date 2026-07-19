@@ -797,3 +797,95 @@ pub fn a78ae_errata_probe() {
     // Report-only here; the OS-side mitigation is the JB1e heal (exceptions.rs: ic iallu + retry
     // on the proven-stale EC=0 signature).
 }
+
+/// ORIN-VUG-RAS — carveout-aware kernel-heap placement for the Orin (tegra). NVIDIA's UEFI reports
+/// several firewall-protected DRAM carveouts (TZ, BPMP, DCE, ...) as ordinary Conventional (Usable)
+/// memory, so the naive "first Usable region ≥ HEAP_SIZE" pick (`arch::memory::init`) can back the
+/// heap with protected DRAM. A cached store into it succeeds into the D-cache and then faults on
+/// *writeback* with an SNOC RAS Uncorrectable "Carveout" abort that powers the cores off — the
+/// observed vug lockup (a heap String / back-buffer store into a carveout page, evicted a few frames
+/// after "crystal live … exit clean" printed, which is why the RAS lands late). This picks a
+/// `HEAP_SIZE` window that clears BOTH the non-Usable regions in the UEFI map AND the DTB
+/// `/reserved-memory` carveouts, prints one witness line naming the guarded range and the carveout
+/// count, and returns `None` (caller fails closed) when no clean window exists. No protection is
+/// weakened — this only *narrows* what the heap may claim. Returns `(heap_start, HEAP_SIZE)`.
+#[cfg(feature = "tegra")]
+pub fn select_heap_region(
+    regions: &[MemoryRegion],
+    dtb_addr: u64,
+    dtb_size: usize,
+) -> Option<(usize, usize)> {
+    const PAGE: u64 = 4096;
+    let need = crate::allocator::HEAP_SIZE as u64;
+
+    // Collect carveouts to avoid: every non-Usable region the UEFI map declares, plus the DTB
+    // `/reserved-memory` carveouts (the firewall ones UEFI hides inside Conventional descriptors).
+    const MAX_CARVE: usize = 96;
+    let mut carve = [(0u64, 0u64); MAX_CARVE];
+    let mut nc = 0usize;
+    for r in regions {
+        if r.kind != MemoryRegionKind::Usable && nc < MAX_CARVE {
+            carve[nc] = (r.phys_start, (r.page_count * 4096) as u64);
+            nc += 1;
+        }
+    }
+    let mut fdt_carve = [(0u64, 0u64); 48];
+    let nf = super::fdt_tegra::reserved_carveouts(dtb_addr, dtb_size, &mut fdt_carve);
+    for &c in fdt_carve.iter().take(nf) {
+        if nc < MAX_CARVE {
+            carve[nc] = c;
+            nc += 1;
+        }
+    }
+    let carveouts = &carve[..nc];
+
+    // The lowest carveout END that overlaps [s, s+need), if any — the caller slides the window past
+    // it. Overlaps are re-checked after each slide, so a window straddling several carveouts walks
+    // past all of them (each slide strictly advances `s`, so this terminates).
+    let overlap_end = |s: u64, e: u64| -> Option<u64> {
+        let mut hit: Option<u64> = None;
+        for &(cb, cs) in carveouts {
+            let ce = cb.wrapping_add(cs);
+            if cs != 0 && s < ce && cb < e {
+                // Advance to the smallest overlapping carveout end so a usable gap between two
+                // carveouts is never skipped; re-checking after the slide clears the rest.
+                hit = Some(hit.map_or(ce, |h| h.min(ce)));
+            }
+        }
+        hit
+    };
+
+    for r in regions {
+        if r.kind != MemoryRegionKind::Usable {
+            continue;
+        }
+        let region_end = r.phys_start.wrapping_add((r.page_count * 4096) as u64);
+        // Page-align the window base up into the region.
+        let mut s = (r.phys_start + PAGE - 1) & !(PAGE - 1);
+        while s.wrapping_add(need) <= region_end {
+            match overlap_end(s, s + need) {
+                None => {
+                    serial_println!(
+                        ":: tegra: HEAP-GUARD — kernel heap [{:#x}, {:#x}) ({} MiB), clear of {} carveout range(s) (UEFI-reserved + DTB /reserved-memory) ::",
+                        s,
+                        s + need,
+                        need >> 20,
+                        nc
+                    );
+                    return Some((s as usize, need as usize));
+                }
+                Some(ce) => {
+                    // Slide past the carveout, page-aligned; re-check for further overlaps.
+                    s = (ce + PAGE - 1) & !(PAGE - 1);
+                }
+            }
+        }
+    }
+
+    serial_println!(
+        ":: tegra: HEAP-GUARD — FAIL-CLOSED: no {} MiB DRAM window clear of {} carveout(s) ::",
+        need >> 20,
+        nc
+    );
+    None
+}
