@@ -2023,6 +2023,8 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             console.println("          usnapls <gen> [path], usnapcat <gen> <path>  (read a snapshot; current-ACL enforced)");
             console.println("CLOCK:    date, setdate YYYY-MM-DD HH:MM[:SS]  (seeds mtime stamps; unset = honest dashes)");
             console.println("SMP:      sched (per-CPU run queues), pulse (full-screen CPU monitor)");
+            #[cfg(target_arch = "aarch64")]
+            console.println("          burst  (fire a migratable multi-thread burst; watch vug/pulse light every core)");
             console.println("POWER:    batmon (SMC battery snapshot; x86 UNAOS_SMC=1 only)");
             console.println("WITNESS:  bootlog (boot-milestone ring: PORTSW / FTDI console / EHCI HID / block / GUI handoff)");
             console.println("TEST:     tste (in-OS self-test suite: boot-replay + live checks)");
@@ -2781,6 +2783,23 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             }
             #[cfg(not(target_arch = "x86_64"))]
             console.println("sched: x86_64 only");
+        },
+        "burst" => {
+            // ORIN-BURST: fire the SCHED-BAL multi-hot-thread burst live from the tegra shell so the
+            // operator can watch vug/pulse light every Orin core, and repeat it at will. Runs inside the
+            // jd2_console_pump task (pinned to the boot core), so it drives the burst from core 0: the
+            // balancer PLACES the migratable PRIO_LOW busy tasks across the online cores and idle cores
+            // steal the residual. PRIO_LOW keeps it below the console/render, so the shell stays live. The
+            // descriptive per-core witness goes to serial (":: AARCH64 SCHED-BAL: ...") — the verb does
+            // NOT take the screen, so `vug`/`pulse` can be watched in parallel and `burst` re-fired.
+            #[cfg(target_arch = "aarch64")]
+            {
+                console.println("burst: staging 8 migratable busy tasks across the online cores...");
+                crate::arch::sched::run_burst(0);
+                console.println("burst: done (per-core witness on serial: ':: AARCH64 SCHED-BAL: ...')");
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            console.println("burst: SCHED-BAL burst is aarch64 only");
         },
         "batmon" => {
             // NATIVE-MIDDEN M1b: one honest SMC battery line. A one-shot human command, so it does a

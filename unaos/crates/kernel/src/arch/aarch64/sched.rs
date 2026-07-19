@@ -1157,6 +1157,71 @@ pub fn sched_bal_witness() {
     }
 }
 
+/// ORIN-BURST — how many migratable CPU-bound tasks the tegra burst stages to light every core. Eight
+/// exceeds the Orin's six cores so every core has work even before stealing kicks in.
+const BURST_TASKS: usize = 8;
+/// ORIN-BURST — countdown of burst tasks still running; `run_burst` waits (bounded) for it to reach 0
+/// before emitting the witness. `AtomicU64` (not `Usize`) to reuse this module's existing atomic imports.
+static BURST_REMAINING: AtomicU64 = AtomicU64::new(0);
+
+/// ORIN-BURST — a bounded CPU-bound MIGRATABLE task: burn several quanta of work (so it stays runnable
+/// long enough to be PLACED on / STOLEN by an idle core and to actually load that core), then retire by
+/// decrementing the shared countdown. Runs at `PRIO_LOW`, strictly below the console/render, so it can
+/// never starve the shell. Same shape as the x86 `demo_bal_hot`.
+fn burst_hot(_i: usize) {
+    let mut acc: u64 = 0;
+    for r in 0..3u64 {
+        for k in 0..25_000_000u64 {
+            acc = acc.wrapping_add(k ^ r);
+        }
+        core::hint::black_box(acc);
+    }
+    BURST_REMAINING.fetch_sub(1, Ordering::Relaxed);
+}
+
+/// ORIN-BURST — stage a multi-hot-thread burst so SCHED-BAL lights every online Orin core, then report.
+///
+/// Spawns `BURST_TASKS` MIGRATABLE `PRIO_LOW` busy tasks that all PREFER `driver_cpu` (the caller's
+/// core). `spawn_balanced` PLACES each on the least-loaded ONLINE core at spawn (and pokes it with an
+/// `IPI_RESCHED`), and any residual backlog on the hot core is STOLEN by an idle secondary — so the
+/// burst spreads across all six Orin cores instead of serialising on one. `PRIO_LOW` keeps them strictly
+/// below the console/render (`PRIO_NORMAL`), so the shell stays responsive while the cores light.
+///
+/// MUST be called from a TASK body — it `yield_now`s to wait, which is a no-op outside a scheduled task.
+/// The tegra shell `burst` verb runs inside the `jd2_console_pump` task; the `sched_demo` boot trigger
+/// spawns `burst_driver`. Bounded + non-fatal: it waits (cooperatively yielding, so the driver core keeps
+/// dispatching its local share and — on the cooperative boot-core path — the CAPSTONE/console tasks keep
+/// moving) for the burst to drain or a generous spin ceiling, then emits `sched_bal_witness`. A run whose
+/// work fit the available slices without a steal still prints the per-core busy counts — the witness is
+/// descriptive, never a hang.
+pub fn run_burst(driver_cpu: usize) {
+    let online = (0..NUM_CPUS).filter(|&c| ONLINE[c].load(Ordering::Acquire)).count();
+    serial_println!(
+        ":: AARCH64 SCHED-BAL: ORIN-BURST — staging {} migratable PRIO_LOW tasks (driver c{}, {} online core(s)) ::",
+        BURST_TASKS, driver_cpu, online
+    );
+    BURST_REMAINING.store(BURST_TASKS as u64, Ordering::Relaxed);
+    for i in 0..BURST_TASKS {
+        spawn_balanced("burst-hot", burst_hot, i, driver_cpu, PRIO_LOW);
+    }
+    // Cooperatively wait for the burst to drain. The bound is a spin ceiling so a lost wake reports
+    // rather than hangs — far above the total task cost, and each `yield_now` reschedules (it does not
+    // busy-burn a slice), so hitting the ceiling means a genuine stall, not slow work.
+    let mut spins: u64 = 0;
+    while BURST_REMAINING.load(Ordering::Relaxed) != 0 && spins < 500_000_000 {
+        yield_now();
+        spins += 1;
+    }
+    sched_bal_witness();
+}
+
+/// ORIN-BURST — task entry for the `sched_demo` boot trigger: run the burst on the core it is dispatched
+/// on. Spawned by `run_capstone_boot_core` under `feature = "sched_demo"` so a default boot stays quiet.
+#[cfg(feature = "sched_demo")]
+fn burst_driver(_: usize) {
+    run_burst(meter_current_cpu());
+}
+
 /// Park a task that switched back BLOCKED, per the action it set before switching. Runs in the
 /// scheduler context with IRQ masked and owns `task`.
 fn park_blocked(cpu: usize, park: u8, task: Box<Task>) {
@@ -2500,6 +2565,13 @@ pub fn run_capstone_boot_core(cpu: usize) -> ! {
     // keeps the ARM regression capture aware of the balancer. No scheduling effect.
     sched_bal_witness();
     spawn("capstone", capstone_body, 0, cpu);
+    // ORIN-BURST — under `sched_demo` ONLY (DEFAULT-QUIET: a plain boot stages nothing), stage the
+    // multi-hot-thread balancer burst as a boot-core task so SCHED-BAL lights every ONLINE core in the
+    // regression capture (and, on Orin, in vug). Runs at `PRIO_LOW`, below CAPSTONE (`PRIO_NORMAL`), and
+    // the driver yields while waiting, so CAPSTONE still runs to COMPLETE. Not spawned by default, so the
+    // plain GICv3/tegra boot is byte-identical (the whole call compiles out without the feature).
+    #[cfg(feature = "sched_demo")]
+    spawn("burst-driver", burst_driver, 0, cpu);
     SCHED_GO.store(true, Ordering::Release); // harmless (no APs on this path)
     // Cooperative dispatch loop: drain the run queue, then busy-poll (never WFI). `dispatch_next` returns
     // false only once the queue drains — after CAPSTONE has fully completed — at which point the core just
