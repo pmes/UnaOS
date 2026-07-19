@@ -4279,9 +4279,9 @@ impl XhciController {
         // 1. SET_CONFIGURATION(1) so the hub's ports become controllable.
         //    bmRequestType 0x00 (H2D, standard, device), bRequest 9 (SET_CONFIGURATION).
         match self.sync_control(hub_slot, 0x00, 0x09, 1, 0, 0, 0, false) {
-            Ok(1) => {}
-            Ok(c) => serial_println!("xHCI: HUB set-config returned code {}", c),
-            Err(_) => { serial_println!("xHCI: HUB set-config timed out"); return; }
+            Ok(1) => serial_println!("xHCI: HUB slot {} SET_CONFIGURATION(1) -> code 1 (OK)", hub_slot),
+            Ok(c) => serial_println!("xHCI: HUB slot {} SET_CONFIGURATION(1) -> code {}", hub_slot, c),
+            Err(_) => { serial_println!("xHCI: HUB slot {} SET_CONFIGURATION(1) timed out", hub_slot); return; }
         }
 
         // 2. GET_DESCRIPTOR (HUB) -> downstream port count + characteristics.
@@ -4336,6 +4336,26 @@ impl XhciController {
                 hub_slot, hub_depth);
             serial_println!("xHCI: === HUB slot {} bring-up complete ===", hub_slot);
             return;
+        }
+
+        // 2b. SET_HUB_DEPTH (USB 3.x SuperSpeed hubs ONLY). ORIN-USB-FIX-5: a SuperSpeed hub must be
+        //     told its tier depth after SET_CONFIGURATION so it knows which nibble of the 20-bit Route
+        //     String selects its downstream port. Without it the hub cannot decode route strings and
+        //     refuses to forward ANY downstream transaction — the very first downstream packet
+        //     (SET_ADDRESS during the child's ADDRESS_DEVICE) dies as a Transaction Error (completion
+        //     code 4), exactly the Orin boot-4 symptom (stick on the 0bda:0489 SS hub, ADDRESS_DEVICE
+        //     code 4 ×3). USB2 hubs have no such request (it is a USB3-only class request) and route
+        //     via the parent-hub/port slot-context fields instead, so they keep their unchanged path.
+        //     bmRequestType 0x20 (H2D, class, device), bRequest 12 (SET_HUB_DEPTH), wValue = hub depth.
+        //     Hub depth = the Route-String nibble index this hub decodes = our route_depth (0 for a hub
+        //     directly on a root port; +1 per tier) — identical to Linux's `hdev->level - 1`.
+        if is_ss {
+            let depth = hub_depth as u16;
+            match self.sync_control(hub_slot, 0x20, 0x0C, depth, 0, 0, 0, false) {
+                Ok(1) => serial_println!("xHCI: HUB slot {} SET_HUB_DEPTH({}) -> code 1 (OK)", hub_slot, depth),
+                Ok(c) => serial_println!("xHCI: HUB slot {} SET_HUB_DEPTH({}) -> code {}", hub_slot, depth, c),
+                Err(_) => serial_println!("xHCI: HUB slot {} SET_HUB_DEPTH({}) timed out", hub_slot, depth),
+            }
         }
 
         // 3. Mark the slot as a hub (Hub bit + Number of Ports + TTT) so the controller will route
