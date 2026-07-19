@@ -46,6 +46,11 @@ k2_leave = []
 # timing stalls boot for minutes on real hardware (uncalibrated APIC timer). Off => scheduler still
 # inits, boot doesn't pause.
 sched_demo = []
+# SIMMER self-test (R23s1): under the aarch64 `virt` GICv3 boot, stage the per-core load animator,
+# sample the vug per-core meter twice ~1 s apart and assert multiple animated cores show busy deltas,
+# then stop and assert quiescence. Opt-in via `UNAOS_SIMMER=1` — a QEMU-verified smoke test of the
+# `simmer` shell verb's machinery. Off => no boot-time simmer staging (the runtime verb is unaffected).
+simmer_test = []
 # USB bring-up debug view for serial-less hardware: run the full main-loop USB path (enumeration +
 # storage + hubs) but KEEP the boot log on the framebuffer (no GUI takeover, no fbcon detach) and
 # print each input event, so external USB storage/keyboard/mouse enumeration AND live keypresses /

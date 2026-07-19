@@ -163,6 +163,48 @@ are load-bearing and were the subject of the **SCHED-BURST-FIX** arc:
   steals > 0). A lost-progress spin ceiling emits an explicit timeout witness
   rather than hanging silently.
 
+## 4b. SIMMER — the per-core load animator
+
+`simmer` (`arch/aarch64/sched.rs`) is a per-core load ANIMATOR: it makes each
+online Orin core independently "breathe" like a moderately busy machine so the
+`vug` per-core meter shows the bars rising and falling on independent rhythms.
+Where `burst` is a one-shot balancer probe (migratable tasks that get *stolen*
+across cores), `simmer` is a steady-state animator: one **PINNED** `PRIO_LOW`
+task per core, each duty-cycling on its own cadence. Pinning is the point — each
+core's bar is driven by its own animator, not by placement/stealing (`burst`
+already proves stealing).
+
+- **Toggle + default-quiet.** The `simmer` shell verb (inside `jd2_console_pump`,
+  the boot core) toggles it; `simmer off` stops it. Nothing runs unless the verb
+  is typed. `simmer_start`/`simmer_stop`/`simmer_active` back the verb; start and
+  stop emit a single serial witness each (`:: SIMMER: staged N ... ::` /
+  `:: SIMMER: stopped ::`) — the visual is the product, so there is no per-cycle
+  spam.
+- **Per-core rhythm.** Each animator seeds a small `xorshift32` from its core id
+  (no wall-clock entropy) and redraws, every cycle, a period (~120–320 ms) and a
+  duty (~15–70 %). The busy phase burns real work and `yield_now`s so higher-
+  priority work preempts and every dispatch pass records the core BUSY; the idle
+  phase `sleep_ticks` so the run queue drains and the meter reads the core IDLE —
+  the down-stroke. Busy duration is bounded by the core's own `percpu.ticks`
+  (its JC3 PPI clock) with a generous `cntpct` wall backstop.
+- **Every online core EXCEPT the driver (boot) core is animated.** The boot core
+  runs the cooperative loop, not `run()` — it neither drains its sleeper list nor
+  (post-JM6, timer disabled) ticks, so a `sleep_ticks` there would park forever,
+  breaking both the animation and a clean stop. This is also exactly the set `vug`
+  displays as a scheduler busy-*fraction*: during `vug` the boot core renders (its
+  dispatch counters freeze) and its bar reflects render load, while every other
+  online core reads its honest busy fraction. On a fully-online Orin that is the
+  boot core's render load plus five animated secondaries.
+- **Clean stop.** Animators poll a shared `SIMMER_RUN` atomic and exit; a
+  `SIMMER_LIVE` countdown lets `simmer_stop` wait (bounded, cooperatively
+  yielding) for genuine quiescence before witnessing. A stop-ceiling emits an
+  explicit warning rather than wedging.
+- **Self-test (`simmer_test` / `UNAOS_SIMMER=1`).** A gated boot-core task stages
+  the animators, samples the meter twice ~1 s apart and asserts multiple animated
+  cores show BUSY deltas, then stops and asserts quiescence. Run:
+  `UNAOS_GICV3=1 UNAOS_SIMMER=1 ./arroyo test-arm` — on QEMU `virt` (4 cores)
+  three secondaries animate and the case reports PASS + quiescence PASS.
+
 ## 5. Status and limitations
 
 - **No priority inheritance** on `Mutex` (assessed as large/thorny under CPU

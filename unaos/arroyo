@@ -61,6 +61,12 @@ _feats=""
 [ -n "${UNAOS_PI:-}" ] && _feats="${_feats}pi,"
 [ -n "${UNAOS_USBDEBUG:-}" ] && _feats="${_feats}usbdebug,"
 [ -n "${UNAOS_SCHED_DEMO:-}" ] && _feats="${_feats}sched_demo,"
+# SIMMER self-test (R23s1): UNAOS_SIMMER=1 arms the boot-time simmer smoke test on the aarch64 virt
+# GICv3 path (arch/aarch64/sched.rs::simmer_selftest) — stages the per-core load animator, samples the
+# vug meter twice ~1 s apart (asserts multiple animated cores show busy deltas), then stops (asserts
+# quiescence). Run: `UNAOS_GICV3=1 UNAOS_SIMMER=1 ./arroyo test-arm`. Off => no boot-time staging; the
+# runtime `simmer` shell verb is always available regardless of this knob.
+[ -n "${UNAOS_SIMMER:-}" ] && _feats="${_feats}simmer_test,"
 # STOR-1: route x86 storage syscalls through the interrupt-driven storage service task (opt-in;
 # metal-pending). x86_64 only — a no-op on the aarch64 media below.
 [ -n "${UNAOS_IRQSTORAGE:-}" ] && _feats="${_feats}irqstorage,"

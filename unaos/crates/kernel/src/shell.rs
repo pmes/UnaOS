@@ -2025,6 +2025,8 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             console.println("SMP:      sched (per-CPU run queues), pulse (full-screen CPU monitor)");
             #[cfg(target_arch = "aarch64")]
             console.println("          burst  (fire a migratable multi-thread burst; watch vug/pulse light every core)");
+            #[cfg(target_arch = "aarch64")]
+            console.println("          simmer [off]  (per-core load animator: cores breathe independently; type 'simmer' then 'vug')");
             console.println("POWER:    batmon (SMC battery snapshot; x86 UNAOS_SMC=1 only)");
             console.println("WITNESS:  bootlog (boot-milestone ring: PORTSW / FTDI console / EHCI HID / block / GUI handoff)");
             console.println("TEST:     tste (in-OS self-test suite: boot-replay + live checks)");
@@ -2800,6 +2802,35 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             }
             #[cfg(not(target_arch = "aarch64"))]
             console.println("burst: SCHED-BAL burst is aarch64 only");
+        },
+        "simmer" => {
+            // SIMMER (R23s1): a per-core load animator. Stage one PINNED PRIO_LOW duty-cycling task on
+            // every online core EXCEPT this (boot/console) core, each breathing on its own id-seeded
+            // rhythm, so the vug per-core meter shows the cores rising and falling independently — "like
+            // a moderately busy computer." Runs inside jd2_console_pump (the boot core); the animators
+            // live on the secondary cores, which run the preemptive scheduler (so their sleeps cycle).
+            // Toggle: bare `simmer` flips it on/off; `simmer off` stops it explicitly. The verb does NOT
+            // take the screen, so start `simmer` then `vug` to watch the bars wander. Start/stop witness
+            // on serial only (":: SIMMER: ... ::") — the visual is the product, so no per-cycle spam.
+            #[cfg(target_arch = "aarch64")]
+            {
+                let off = args
+                    .first()
+                    .map(|a| *a == "off" || *a == "stop")
+                    .unwrap_or(false);
+                if off {
+                    crate::arch::sched::simmer_stop();
+                    console.println("simmer: stopped.");
+                } else if crate::arch::sched::simmer_active() {
+                    crate::arch::sched::simmer_stop();
+                    console.println("simmer: stopped (toggle). Type 'simmer' to start it again.");
+                } else {
+                    crate::arch::sched::simmer_start(0);
+                    console.println("simmer: per-core animators staged. Now type 'vug' to watch the cores breathe.");
+                }
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            console.println("simmer: per-core load animator is aarch64 only");
         },
         "batmon" => {
             // NATIVE-MIDDEN M1b: one honest SMC battery line. A one-shot human command, so it does a

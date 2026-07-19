@@ -1263,6 +1263,235 @@ fn burst_driver(_: usize) {
     run_burst(meter_current_cpu());
 }
 
+// ---------------------------------------------------------------------------------------------
+// SIMMER — a per-core load animator (R23s1)
+// ---------------------------------------------------------------------------------------------
+//
+// `simmer` stages one PINNED, PRIO_LOW animator task on every ONLINE core EXCEPT the driver
+// (boot) core, and each animator duty-cycles — busy-spin for a while, then `sleep_ticks` — on a
+// per-core-distinct rhythm seeded from the core id. Because the vug per-core meter reads the
+// scheduler's real busy/idle dispatch counts (`CPU_BUSY`/`CPU_IDLE`), the effect is the cores'
+// bars rising and falling on independent periods, "like a moderately busy computer." It is a
+// per-core ANIMATOR, not a balancer test: the tasks are PINNED (burst already proves stealing),
+// so each core's bar is driven by its OWN animator, independently.
+//
+// Why every online core EXCEPT the driver core: the driver/boot core (`meter_current_cpu()`)
+// runs the cooperative CAPSTONE / console-pump loop, not the preemptive `run()` loop — it
+// neither drains its sleeper list nor (on Orin, after the JM6 EL2->EL1 drop that disables its
+// timer) receives a periodic tick, so a task that `sleep_ticks` THERE would park and never wake,
+// breaking both the animation and a clean stop. The secondary cores DO run `run()` (which drains
+// due sleepers and, per JC3, self-ticks off their own timer PPI), so sleeping cycles there. This
+// is also exactly the set vug displays as a scheduler busy-FRACTION: during `vug` the boot core
+// renders (its dispatch counters freeze) and its bar shows its render load, while every other
+// online core shows its honest busy fraction — precisely the cores the animators drive. On a
+// fully-online Orin that is the boot core's render load plus five animated secondaries.
+//
+// DEFAULT-QUIET: nothing here runs unless the `simmer` verb is typed at the shell (or the gated
+// `simmer_test` self-test feature is armed) — a plain boot stages no animators.
+
+/// Shared run flag: every animator polls it and EXITS cleanly when it clears. `simmer_start` sets
+/// it; `simmer_stop` clears it. Acquire/Release so a just-spawned animator observes the `true`
+/// that preceded its spawn and a stop is seen promptly across cores.
+static SIMMER_RUN: AtomicBool = AtomicBool::new(false);
+/// Count of animator tasks currently alive; each animator decrements it on exit so `simmer_stop`
+/// can wait (bounded) for genuine quiescence before emitting the stop witness.
+static SIMMER_LIVE: AtomicU64 = AtomicU64::new(0);
+
+/// xorshift32 — a tiny per-core PRNG seeded from the core id (no wall-clock entropy needed). Drives
+/// each animator's period, phase and duty so the bars wander independently, deterministically per boot.
+#[inline]
+fn simmer_xorshift(state: &mut u32) -> u32 {
+    let mut x = *state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *state = x;
+    x
+}
+
+/// One PINNED per-core animator. `arg` is the core id (== the pinned cpu). Duty-cycles busy/idle on a
+/// per-core rhythm until `SIMMER_RUN` clears, then retires (decrementing `SIMMER_LIVE`). Runs at
+/// `PRIO_LOW` and yields inside the busy phase so the console / input / render always preempt it (the
+/// HID-REGRESS lesson: never busy-spin the idle path — this SLEEPS between duty windows).
+fn simmer_animator(arg: usize) {
+    let cpu = arg;
+    // Seed distinctly per core (id-derived, deterministic — same bars every boot). The multiply +
+    // OR-1 keeps the seed non-zero even for core 0, and warming a core-dependent number of steps
+    // decorrelates the phase between cores so they don't breathe in lockstep.
+    let mut rng: u32 = 0x9E37_79B1 ^ ((cpu as u32).wrapping_mul(0x0100_1001) | 1);
+    for _ in 0..(cpu + 1) * 7 {
+        simmer_xorshift(&mut rng);
+    }
+    let freq = timer::cntfrq();
+    let freq = if freq == 0 { 62_500_000 } else { freq };
+    while SIMMER_RUN.load(Ordering::Acquire) {
+        // This cycle's shape: period 30..=79 ticks (~120..320 ms @ 250 Hz) and duty 15..=70 %, both
+        // redrawn each cycle so the bar height wanders rather than settling on a fixed level.
+        let period = 30 + (simmer_xorshift(&mut rng) % 50) as u64;
+        let duty = 15 + (simmer_xorshift(&mut rng) % 56) as u64; // 15..=70 percent
+        let busy_ticks = (period * duty / 100).max(1);
+        let idle_ticks = period.saturating_sub(busy_ticks).max(1);
+        // BUSY phase: burn real work so the core actually loads, yielding periodically so any higher-
+        // priority work preempts and every dispatch pass records this core BUSY on the meter. Bound it
+        // by THIS core's own tick clock (advances via its JC3 timer PPI) with a generous wall-clock
+        // backstop (`cntpct` always advances) so a core whose tick momentarily stalls can't wedge.
+        let start_ticks = percpu::this_cpu().ticks.load(Ordering::Relaxed);
+        let wall_deadline = timer::cntpct() + freq * 2; // >= any plausible busy window; safety net only
+        let mut acc: u64 = rng as u64;
+        loop {
+            for k in 0..300_000u64 {
+                acc = acc.wrapping_add(k ^ acc.rotate_left(7));
+            }
+            core::hint::black_box(acc);
+            yield_now();
+            if !SIMMER_RUN.load(Ordering::Acquire) {
+                break;
+            }
+            let elapsed = percpu::this_cpu().ticks.load(Ordering::Relaxed).wrapping_sub(start_ticks);
+            if elapsed >= busy_ticks || timer::cntpct() >= wall_deadline {
+                break;
+            }
+        }
+        if !SIMMER_RUN.load(Ordering::Acquire) {
+            break;
+        }
+        // IDLE phase: sleep so this core's run queue drains and the meter reads it IDLE — the down-
+        // stroke of the bar. Sleeping (not spinning) is what makes the bar fall AND keeps the core
+        // genuinely free between windows (so simmer coexists with the shell / burst / input).
+        sleep_ticks(idle_ticks);
+    }
+    SIMMER_LIVE.fetch_sub(1, Ordering::Relaxed);
+}
+
+/// True while the animators are staged (the `simmer` toggle's current state).
+pub fn simmer_active() -> bool {
+    SIMMER_RUN.load(Ordering::Acquire)
+}
+
+/// Start the per-core animators (idempotent: a second start while running is a no-op). `driver_cpu`
+/// is the caller's core (the boot/console core); it is deliberately NOT animated (see the module
+/// note). One PINNED PRIO_LOW animator is staged on every OTHER online core. Emits the start witness.
+pub fn simmer_start(driver_cpu: usize) {
+    if SIMMER_RUN.swap(true, Ordering::AcqRel) {
+        return; // already running
+    }
+    // The boot core drives cooperatively; mark it a SCHED-BAL participant for consistent online
+    // accounting (mirrors `run_burst`) — it is not itself animated.
+    ONLINE[driver_cpu].store(true, Ordering::Release);
+    SIMMER_LIVE.store(0, Ordering::Relaxed);
+    let mut staged = 0usize;
+    for c in 0..NUM_CPUS {
+        if c != driver_cpu && ONLINE[c].load(Ordering::Acquire) {
+            SIMMER_LIVE.fetch_add(1, Ordering::Relaxed);
+            spawn_prio("simmer", simmer_animator, c, c, PRIO_LOW);
+            staged += 1;
+        }
+    }
+    let online = (0..NUM_CPUS).filter(|&c| ONLINE[c].load(Ordering::Acquire)).count();
+    serial_println!(
+        ":: SIMMER: staged {} per-core animators (driver c{} not animated, {} online core(s)) ::",
+        staged, driver_cpu, online
+    );
+}
+
+/// Stop the animators: clear the run flag and wait (bounded, cooperatively yielding so the APs make
+/// progress and drain) for every animator to observe it and exit, then emit the stop witness. Emits a
+/// witness and returns immediately if simmer was not running.
+pub fn simmer_stop() {
+    if !SIMMER_RUN.swap(false, Ordering::AcqRel) {
+        serial_println!(":: SIMMER: already stopped ::");
+        return;
+    }
+    let mut spins: u64 = 0;
+    while SIMMER_LIVE.load(Ordering::Relaxed) != 0 && spins < 500_000_000 {
+        yield_now();
+        spins += 1;
+    }
+    let live = SIMMER_LIVE.load(Ordering::Relaxed);
+    if live != 0 {
+        // Bounded teardown: an animator that never observed the flag is reported, never a silent wedge.
+        serial_println!(
+            ":: SIMMER: WARNING stop ceiling hit after {} passes, {} animator(s) still live ::",
+            spins, live
+        );
+    }
+    serial_println!(":: SIMMER: stopped ::");
+}
+
+/// SIMMER self-test (the gated QEMU case): stage the animators, sample the per-core meter twice
+/// ~1 s apart and assert MULTIPLE animated cores show BUSY deltas, then stop and assert quiescence
+/// (no further busy growth on the animated cores). Boot-core task under `feature = "simmer_test"` so
+/// a default boot stays quiet. Emits PASS/FAIL witness lines the regression capture greps.
+#[cfg(feature = "simmer_test")]
+fn simmer_selftest(_: usize) {
+    // After-stop tolerance: once every animator has exited (`simmer_stop` waits for that) an idle AP
+    // bumps only `CPU_IDLE`, so its busy count is frozen; a small slack absorbs any stray dispatch.
+    const QUIESCE_SLACK: u64 = 8;
+    let driver = meter_current_cpu();
+    serial_println!(":: SIMMER: self-test begin (driver c{}) ::", driver);
+    simmer_start(driver);
+    let s0 = simmer_sample_busy();
+    simmer_wait_wall_ms(1000);
+    let s1 = simmer_sample_busy();
+    let mut moved = 0usize;
+    for c in 0..NUM_CPUS {
+        if c != driver && s1[c] > s0[c] {
+            moved += 1;
+        }
+    }
+    if moved >= 2 {
+        serial_println!(
+            ":: SIMMER: self-test PASS — {} animated cores showed busy deltas over ~1 s ::",
+            moved
+        );
+    } else {
+        serial_println!(
+            ":: SIMMER: self-test FAIL — only {} core(s) showed busy deltas (expected >= 2) ::",
+            moved
+        );
+    }
+    simmer_stop();
+    let q0 = simmer_sample_busy();
+    simmer_wait_wall_ms(1000);
+    let q1 = simmer_sample_busy();
+    let mut still = 0usize;
+    for c in 0..NUM_CPUS {
+        if c != driver && q1[c].wrapping_sub(q0[c]) > QUIESCE_SLACK {
+            still += 1;
+        }
+    }
+    if still == 0 {
+        serial_println!(":: SIMMER: quiescence PASS — no animated core grew busy after stop ::");
+    } else {
+        serial_println!(
+            ":: SIMMER: quiescence FAIL — {} core(s) still growing busy after stop ::",
+            still
+        );
+    }
+}
+
+/// SIMMER self-test helper: snapshot every core's cumulative BUSY dispatch count.
+#[cfg(feature = "simmer_test")]
+fn simmer_sample_busy() -> [u64; NUM_CPUS] {
+    let mut out = [0u64; NUM_CPUS];
+    for c in 0..NUM_CPUS {
+        out[c] = CPU_BUSY[c].load(Ordering::Relaxed);
+    }
+    out
+}
+
+/// SIMMER self-test helper: busy-wait `ms` of wall time on the cooperative driver core, yielding so
+/// its own queue dispatches and the preemptive secondaries run. Rides `cntpct` (always advances).
+#[cfg(feature = "simmer_test")]
+fn simmer_wait_wall_ms(ms: u64) {
+    let freq = timer::cntfrq();
+    let freq = if freq == 0 { 62_500_000 } else { freq };
+    let deadline = timer::cntpct() + freq.saturating_mul(ms) / 1000;
+    while timer::cntpct() < deadline {
+        yield_now();
+    }
+}
+
 /// Park a task that switched back BLOCKED, per the action it set before switching. Runs in the
 /// scheduler context with IRQ masked and owns `task`.
 fn park_blocked(cpu: usize, park: u8, task: Box<Task>) {
@@ -2617,6 +2846,12 @@ pub fn run_capstone_boot_core(cpu: usize) -> ! {
     // plain GICv3/tegra boot is byte-identical (the whole call compiles out without the feature).
     #[cfg(feature = "sched_demo")]
     spawn("burst-driver", burst_driver, 0, cpu);
+    // SIMMER self-test (R23s1) — under `simmer_test` ONLY (DEFAULT-QUIET): stage the per-core load
+    // animator as a boot-core task, sample the meter twice ~1 s apart to prove multiple animated
+    // cores show busy deltas, then stop and prove quiescence. Independent of `sched_demo`; the whole
+    // call compiles out without the feature, so a plain GICv3/tegra boot is byte-identical.
+    #[cfg(feature = "simmer_test")]
+    spawn("simmer-selftest", simmer_selftest, 0, cpu);
     SCHED_GO.store(true, Ordering::Release); // harmless (no APs on this path)
     // Cooperative dispatch loop: drain the run queue, then busy-poll (never WFI). `dispatch_next` returns
     // false only once the queue drains — after CAPSTONE has fully completed — at which point the core just
