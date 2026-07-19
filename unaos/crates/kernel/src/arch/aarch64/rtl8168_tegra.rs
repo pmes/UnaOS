@@ -761,6 +761,18 @@ mod metal {
             if d.opts1 & DESC_OWN != 0 {
                 return None;
             }
+            // NET-4e: DMA READ BARRIER between observing OWN-clear and reading the buffer — the fix
+            // for the DHCP no-lease. The NIC commits a received frame by writing the payload FIRST and
+            // clearing OWN LAST; on weakly-ordered aarch64 the CPU may observe the OWN-clear without yet
+            // observing the payload write, so the copy below reads STALE bytes (the `alloc_zeroed` fill
+            // ⇒ an all-zero frame). Each descriptor is popped exactly once and recycled, so a single
+            // stale read drops that frame forever — which is precisely how the OFFER got through (it won
+            // the race) but the follow-on ACK did not (read as zeros), leaving the lease uncompleted.
+            // This is Linux r8169's `dma_rmb()` after the OWN check. A barrier (not a cache invalidate)
+            // is the honest minimal fix: the TX path already proved controller-0's DMA is CPU-coherent
+            // (the DISCOVER's buffer, written cacheable, was read correctly by the NIC), so what was
+            // missing is only the ORDERING of the CPU's two observations — not cache maintenance.
+            unsafe { core::arch::asm!("dsb ld", options(nostack, preserves_flags)) };
             // Hardware wrote the received length into the length field; clamp so a misbehaving NIC can
             // never make us build an out-of-bounds slice.
             let len = (d.opts1 & DESC_LEN_MASK) as usize;
@@ -770,6 +782,14 @@ mod metal {
                     self.rx_buffers.add(self.rx_cur * RX_BUF_SIZE),
                     out.as_mut_ptr(),
                     len,
+                );
+            }
+            // NET-4e: one-shot witness on the first popped frame — proves the DMA read barrier is on the
+            // live RX path (the fix that lets the DHCP ACK be read instead of stale zeros).
+            if self.rx_count == 0 {
+                serial_println!(
+                    "{}   [net4e] first RX pop len={} — DMA read barrier (dsb ld) active between OWN-check and buffer copy ::",
+                    P4, len
                 );
             }
             self.rx_count += 1;
