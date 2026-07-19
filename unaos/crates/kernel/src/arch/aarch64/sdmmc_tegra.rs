@@ -1243,7 +1243,23 @@ mod metal {
         let mut recs: alloc::vec::Vec<FileRec> = alloc::vec::Vec::new();
         {
             let mut w = fat32::TreeWriter::new(t, geom);
-            let root_entries = src.read_root().map_err(|_| InstallError::Io)?;
+            let root_raw = src.read_root().map_err(|_| InstallError::Io)?;
+            // INSTALL-FILTER: drop host-OS litter trees at the ROOT level BEFORE sizing or cloning, so the
+            // clone carries only the real boot payload and the verdict file count is honest. Only root
+            // entries are filtered — nested payload dirs (EFI/BOOT/…) are copied exactly as before. One
+            // witness line per skipped tree.
+            let mut root_entries: alloc::vec::Vec<crate::fs::fat::DirEntry> = alloc::vec::Vec::new();
+            for e in &root_raw {
+                let name = e.name();
+                if let Some(reason) = host_os_litter_reason(name) {
+                    serial_println!(
+                        "{}   INSTALL: skipped host-OS litter tree {} ({}) ::",
+                        PS, name, reason
+                    );
+                    continue;
+                }
+                root_entries.push(*e);
+            }
             // Size the root directory to its entry count (multi-cluster if >16 entries) and reserve its
             // cluster chain BEFORE any file/subdir allocation (so cluster 2's chain stays contiguous).
             let root_slots = count_nondot(&root_entries);
@@ -1292,6 +1308,44 @@ mod metal {
     /// `..` points at cluster 0 (the FAT convention for a subdirectory of the root).
     /// Count the entries in a source directory that are neither `.` nor `..` (the slots a mirrored copy of
     /// it must hold beyond its own `.`/`..`). Used to size a directory's cluster chain up front.
+    /// INSTALL-FILTER: classify a ROOT directory entry as host-OS litter (a metadata/index tree the
+    /// desktop OS drops on removable media — not part of the boot payload). Returns `Some(reason)` to
+    /// SKIP the tree, `None` to clone it exactly as before.
+    ///
+    /// The in-tree FAT reader skips LFN slots (see `fs::fat`), so `name` is only ever the on-disk 8.3
+    /// SHORT name (uppercase). We therefore match the 8.3 aliases the desktop OS's own FAT driver
+    /// generates for these long names; the full long-name forms are listed too so intent is legible and
+    /// the filter stays correct if the reader ever grows LFN awareness. Conservative by construction:
+    /// only the exact known-litter names (plus the AppleDouble `._*`/`_~N` alias class) match — every
+    /// other entry, including any real EFI/BOOT/KERNEL payload, is copied unchanged.
+    #[cfg(feature = "install_target")]
+    fn host_os_litter_reason(name: &str) -> Option<&'static str> {
+        let eq = |a: &str| name.eq_ignore_ascii_case(a);
+        // AppleDouble sidecars (`._<name>`): on 8.3 the alias collapses to the `_~N` class (e.g.
+        // `_~8.TXT` seen on bench cards). Match the alias, and the literal `._` prefix for LFN-awareness.
+        let up = name.as_bytes();
+        let starts = |p: &[u8]| up.len() >= p.len() && up[..p.len()].eq_ignore_ascii_case(p);
+        if starts(b"._") || starts(b"_~") {
+            return Some("AppleDouble metadata sidecar (._* / 8.3 _~N alias)");
+        }
+        if eq("SPOTLI~1") || eq("SPOTLIGHT-V100") || eq(".SPOTLIGHT-V100") {
+            return Some("macOS Spotlight index (Spotlight-V100)");
+        }
+        if eq("FSEVEN~1") || eq(".FSEVENTSD") {
+            return Some("macOS FSEvents journal (.fseventsd)");
+        }
+        if eq("TRASHE~1") || eq(".TRASHES") {
+            return Some("macOS trash (.Trashes)");
+        }
+        if eq("TEMPOR~1") || eq(".TEMPORARYITEMS") {
+            return Some("macOS temporary items (.TemporaryItems)");
+        }
+        if eq("SYSTEM~1") || eq("SYSTEM VOLUME INFORMATION") {
+            return Some("Windows System Volume Information");
+        }
+        None
+    }
+
     #[cfg(feature = "install_target")]
     fn count_nondot(entries: &[crate::fs::fat::DirEntry]) -> usize {
         entries
