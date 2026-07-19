@@ -110,6 +110,9 @@ struct IntEp {
     layout: Option<ReportLayout>,
     reports: u32,
     dead: bool,
+    /// CLICK-1: previous report's button bitmask, for button-DOWN edge detection (one
+    /// `pal::Event::Button` per press, nothing on release/hold).
+    prev_buttons: u8,
 }
 
 /// EHCI-4 M2 — the minimal field map a HID **pointer** report exposes, extracted by
@@ -1191,6 +1194,7 @@ impl Controller {
             layout,
             reports: 0,
             dead: false,
+            prev_buttons: 0,
         });
     }
 
@@ -1271,9 +1275,18 @@ impl Controller {
                             if dx != 0 || dy != 0 {
                                 crate::pal::push_event(crate::pal::Event::Mouse { x: dx, y: dy });
                             }
-                            // `buttons` is decoded + witnessed; the relative pointer-event path carries
-                            // no click today (parity with the `is_rel_mouse` boot-mouse path below),
-                            // so no button event is emitted here.
+                            // CLICK-1 (metal verdict): emit ONE `Event::Button` per button-DOWN
+                            // edge (0x00 -> 0x01 on this pad) — the click observable: a click
+                            // while vug/pulse runs exits the demo like a keystroke. Release
+                            // emits nothing. Serial line per press (human-rate, bounded).
+                            if buttons & 0x01 != 0 && e.prev_buttons & 0x01 == 0 {
+                                crate::pal::push_event(crate::pal::Event::Button(buttons));
+                                serial_println!(
+                                    ":: EHCI-HID: [{}] trackpad click (button-down edge, buttons={:#04x}) == witness ::",
+                                    idx, buttons
+                                );
+                            }
+                            e.prev_buttons = buttons;
                         }
                     } else {
                         // M2 report-pointer path: decode X/Y/buttons from the parsed field map.
@@ -1287,6 +1300,13 @@ impl Controller {
                         } else if x != 0 || y != 0 {
                             crate::pal::push_event(crate::pal::Event::MouseAbsolute { x, y });
                         }
+                        // CLICK-1: primary-button DOWN edge → one Button event (same semantic as
+                        // the trackpad path above).
+                        let btn = (buttons & 0xFF) as u8;
+                        if btn & 0x01 != 0 && e.prev_buttons & 0x01 == 0 {
+                            crate::pal::push_event(crate::pal::Event::Button(btn));
+                        }
+                        e.prev_buttons = btn;
                         if e.reports == 1 || e.reports % 32 == 0 {
                             serial_println!(
                                 ":: EHCI-HID: [{}] report-pointer {} reports, last {} x={} y={} buttons={:#04x} fingers={} == witness ::",
@@ -1309,6 +1329,11 @@ impl Controller {
                     if dx != 0 || dy != 0 {
                         crate::pal::push_event(crate::pal::Event::Mouse { x: dx, y: dy });
                     }
+                    // CLICK-1: boot-mouse buttons live in report[0]; primary DOWN edge → Button.
+                    if report[0] & 0x01 != 0 && e.prev_buttons & 0x01 == 0 {
+                        crate::pal::push_event(crate::pal::Event::Button(report[0]));
+                    }
+                    e.prev_buttons = report[0];
                     if e.reports == 1 || e.reports % 32 == 0 {
                         serial_println!(
                             ":: EHCI-HID: [{}] mouse {} reports, last dx={} dy={} buttons={:#04x} == witness ::",

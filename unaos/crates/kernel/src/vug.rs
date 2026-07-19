@@ -437,6 +437,9 @@ const METER_DIM: u32 = 0x00_2A2432;
 const METER_LILAC: u32 = 0x00_B36BFF;
 const METER_PURPLE: u32 = 0x00_9B59B6;
 const METER_LABEL: u32 = 0x00_8A8296;
+/// PULSE-ALIVE breath colour — clearly brighter than `METER_DIM`, dimmer than a load fill: the one
+/// sweeping segment an idle-but-scheduled core lights so "alive and idle" reads at a glance.
+const METER_BREATH: u32 = 0x00_5F4E86;
 /// Parked dash colour — cooler/dimmer than `METER_DIM` so a broken track reads as "not participating".
 const METER_PARKED: u32 = 0x00_3A3550;
 
@@ -498,6 +501,9 @@ struct CpuPulse {
     prev: [(u64, u64); MAX_METER_CPUS],
     load: [u32; MAX_METER_CPUS],
     demo_core_logged: bool,
+    /// PULSE-ALIVE evidence: whether the one-shot per-core tick-delta line has fired (first
+    /// refresh window only), so a metal serial capture proves which cores' counters actually tick.
+    ticks_logged: bool,
     /// Serial-evidence tag for the one-shot demo-core log line ("VUG" / "PULSE").
     tag: &'static str,
 }
@@ -509,7 +515,7 @@ impl CpuPulse {
         for (c, p) in prev.iter_mut().enumerate().take(ncpu) {
             *p = crate::arch::sched::meter_cpu_ticks(c);
         }
-        Self { ncpu, prev, load: [0u32; MAX_METER_CPUS], demo_core_logged: false, tag }
+        Self { ncpu, prev, load: [0u32; MAX_METER_CPUS], demo_core_logged: false, ticks_logged: false, tag }
     }
 
     /// Refresh the per-core loads for one display window. Two honest sources, picked per core by
@@ -530,6 +536,21 @@ impl CpuPulse {
         // that core takes the render-load fallback when its counters are frozen; every OTHER frozen-
         // counter core is parked / never-scheduled and reads PARKED — no fabricated load.
         let demo = crate::arch::sched::meter_current_cpu();
+        // PULSE-ALIVE evidence: one bounded line on the FIRST refresh window with the raw per-core
+        // busy/idle tick deltas — the metal disambiguator between "APs idle-ticking (honest 0%)"
+        // and "AP counters frozen (parked)" that the rendered bars alone couldn't prove.
+        if !self.ticks_logged {
+            self.ticks_logged = true;
+            let mut line = alloc::string::String::new();
+            for c in 0..self.ncpu {
+                let (b, i) = crate::arch::sched::meter_cpu_ticks(c);
+                let _ = core::fmt::Write::write_fmt(
+                    &mut line,
+                    format_args!("c{}:{}/{} ", c, b.wrapping_sub(self.prev[c].0), i.wrapping_sub(self.prev[c].1)),
+                );
+            }
+            serial_println!(":: {}: first-window per-core busy/idle tick deltas — {}::", self.tag, line);
+        }
         for c in 0..self.ncpu {
             let (b, i) = crate::arch::sched::meter_cpu_ticks(c);
             let db = b.wrapping_sub(self.prev[c].0);
@@ -571,11 +592,23 @@ fn draw_pulse_bar(
         }
         return bx;
     }
-    let filled = if load == 0 {
-        0
-    } else {
-        ((load as usize * PULSE_SEGS + 50) / 100).clamp(1, PULSE_SEGS)
-    };
+    // PULSE-ALIVE (metal verdict, 2026-07-18): an idle-but-scheduled core (honest 0% — its
+    // busy/idle counters ARE ticking) previously drew an all-dim track, which on the panel read
+    // exactly like "unlit"/dead — Peter's "pulse shows 1 CPU" report with 7 enabled, idle APs.
+    // Now an idle core breathes: one segment, swept slowly along the bar by wall-clock time, lights
+    // in `METER_BREATH`. Not a load claim (the percent text still reads 0%) — a liveness indicator,
+    // visually distinct from BOTH a loaded bar (solid fill) and a parked core (static dashes above).
+    if load == 0 {
+        let phase = ((crate::arch::ms() / 300) as usize) % PULSE_SEGS;
+        let mut bx = x;
+        for s in 0..PULSE_SEGS {
+            let color = if s == phase { METER_BREATH } else { METER_DIM };
+            pal.draw_rect(bx, y, seg_w, seg_h, color);
+            bx += seg_w + gap;
+        }
+        return bx;
+    }
+    let filled = ((load as usize * PULSE_SEGS + 50) / 100).clamp(1, PULSE_SEGS);
     let mut bx = x;
     for s in 0..PULSE_SEGS {
         let color = if s < filled { fill_color } else { METER_DIM };
@@ -607,6 +640,10 @@ fn drain_input(pal: &mut TargetPal) -> bool {
     while let Some(e) = crate::pal::pump_and_poll() {
         match e {
             Event::Key(_) => return true,
+            // CLICK-1 (metal verdict): a trackpad/mouse click closes the full-screen demo through
+            // the SAME exit path a keystroke takes — the on-metal click observable for the next
+            // sitting (press the pad while vug runs; the demo exits to the console).
+            Event::Button(_) => return true,
             Event::Mouse { x, y } => crate::pal::cursor::move_rel(x, y, w, h),
             Event::MouseAbsolute { x, y } => crate::pal::cursor::set_abs(x, y, w, h),
             _ => {}

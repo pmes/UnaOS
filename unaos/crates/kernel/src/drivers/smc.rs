@@ -183,6 +183,16 @@ fn settle_before_command() {
 /// `out.len()`). The classic Apple SMC READ handshake: command 0x10, four key bytes, one length
 /// byte, then value bytes while `DATA_READY` holds.
 pub fn read_key(key: &[u8; 4], out: &mut [u8]) -> Result<usize, SmcError> {
+    let r = read_key_inner(key, out);
+    if let Err(e) = r {
+        // SMC-DIAG: the boot's FIRST failing key read — whatever path it came from (scout,
+        // battery sweep, enumeration) — dumps the raw status timeline, once, unconditionally.
+        dump_first_failure(key, e);
+    }
+    r
+}
+
+fn read_key_inner(key: &[u8; 4], out: &mut [u8]) -> Result<usize, SmcError> {
     // 0) settle any residue from a prior (interrupted) transaction so step-0 starts clean (M2
     //    idle-guard). No-op on an idle SMC — byte-identical on QEMU.
     settle_before_command();
@@ -232,6 +242,40 @@ pub fn read_key(key: &[u8; 4], out: &mut [u8]) -> Result<usize, SmcError> {
         n += 1;
     }
     Ok(n)
+}
+
+/// SMC-DIAG (metal directive, 2026-07-18): one-shot bounded raw-handshake evidence dump on the
+/// FIRST failed key read of the boot — usbdebug-independent (plain serial), fires exactly once,
+/// regardless of any root-cause theory. Captures what four consecutive GUI-build sittings could
+/// not: the actual wire behaviour at the moment the handshake fails. Dumps the failing key, the
+/// failing step, uptime, the RAW (unmasked) status byte at failure, then a 16-sample status-byte
+/// timeline (~15 µs apart — the applesmc pacing quantum) so the next sitting can read whether the
+/// status is dead-flat (0x00/0xFF: device absent / decoded nowhere), busy-wedged, or oscillating.
+/// Read-only: only 0x304 status reads — no new write surface.
+fn dump_first_failure(key: &[u8; 4], err: SmcError) {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static FIRED: AtomicBool = AtomicBool::new(false);
+    if FIRED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let (kind, step) = match err {
+        SmcError::Absent => ("absent", 0xFF),
+        SmcError::Stuck(s) => ("stuck", s),
+    };
+    let mut samples = [0u8; 16];
+    for s in samples.iter_mut() {
+        *s = read_status();
+        poll_pause();
+    }
+    let name = core::str::from_utf8(&key[..]).unwrap_or("????");
+    serial_println!(
+        ":: SMC-DIAG: FIRST FAILURE key {} kind {} step {} t={}ms — raw status timeline [{}] (16 reads, ~15us apart) == evidence ::",
+        name,
+        kind,
+        step,
+        crate::arch::ms(),
+        fmt_hex(&samples)
+    );
 }
 
 /// True if an SMC answers on the ports — detected by reading the always-present `REV ` key.
@@ -328,6 +372,14 @@ fn fmt_hex(bytes: &[u8]) -> alloc::string::String {
 /// Fires once at boot from `pci::init` under the `smc` feature.
 pub fn scout() {
     serial_println!(":: SMC-SCOUT: begin (ports data={:#x} cmd={:#x}) ::", SMC_DATA_PORT, SMC_CMD_PORT);
+    // SMC-DIAG: timestamp + raw pre-touch status byte BEFORE the first transaction — lets a
+    // sitting compare when each build first touches the SMC (the GUI's quiet boot reaches this
+    // point much earlier than the fbcon-heavy usbdebug boot) and what the status port reads cold.
+    serial_println!(
+        ":: SMC-DIAG: pre-touch t={}ms raw status={:#04x} ::",
+        crate::arch::ms(),
+        read_status()
+    );
 
     if !present() {
         serial_println!(":: SMC-SCOUT: end (present=N — no SMC answered REV; metal-first battery keys) ::");
@@ -463,30 +515,58 @@ pub mod battery {
     /// (the SMC looked the key up and said no) is NOT retried.
     const READ_ATTEMPTS: u32 = 3;
 
-    fn read_u16(key: &[u8; 4]) -> Option<u16> {
+    /// One key read's sweep-relevant outcome: value, clean absence, or an unresponsive handshake.
+    enum KeyRead {
+        Val(u16),
+        Absent,
+        Stuck,
+    }
+
+    fn read_u16k(key: &[u8; 4]) -> KeyRead {
         for _ in 0..READ_ATTEMPTS {
             let mut b = [0u8; 2];
             match read_key(key, &mut b) {
-                Ok(2) => return Some(((b[0] as u16) << 8) | b[1] as u16),
-                Err(SmcError::Absent) => return None, // clean absence — no retry
+                Ok(2) => return KeyRead::Val(((b[0] as u16) << 8) | b[1] as u16),
+                Err(SmcError::Absent) => return KeyRead::Absent, // clean absence — no retry
                 _ => {} // Stuck / short read: bounded retry (each attempt itself deadline-bounded)
             }
         }
-        None
+        KeyRead::Stuck
     }
 
-    fn read_i16(key: &[u8; 4]) -> Option<i16> {
-        read_u16(key).map(|u| u as i16)
+    fn opt(r: KeyRead) -> Option<u16> {
+        match r {
+            KeyRead::Val(v) => Some(v),
+            _ => None,
+        }
     }
 
     /// Read all battery keys and return a fresh snapshot (unthrottled). Pure reads.
+    ///
+    /// SWEEP-ABORT (metal perf fix, 2026-07-18): if the FIRST key's handshake comes back Stuck —
+    /// the SMC is not answering at all, not merely lacking that key — the remaining keys are
+    /// skipped (they would each burn the same bounded multi-attempt timeout). On the sitting-1
+    /// metal GUI builds (SMC unresponsive every boot) an un-aborted sweep cost up to ~16 stuck
+    /// handshakes x the 0.1 s budget on the vug meter cadence — the "cursor really slows vug down"
+    /// stall was THIS, not the sprite. A clean `Absent` (QEMU) still sweeps every key, unchanged.
     pub fn snapshot() -> BatterySnapshot {
         let mut s = BatterySnapshot::default();
-        s.soc_pct = read_u16(b"BRSC");
-        s.volt_mv = read_u16(b"B0AV");
-        s.amp_ma = read_i16(b"B0AC");
-        s.full_mah = read_u16(b"B0FC");
-        s.rem_mah = read_u16(b"B0RM");
+        let first = read_u16k(b"BRSC");
+        if matches!(first, KeyRead::Stuck) {
+            use core::sync::atomic::{AtomicBool, Ordering};
+            static NOTED: AtomicBool = AtomicBool::new(false);
+            if !NOTED.swap(true, Ordering::Relaxed) {
+                serial_println!(
+                    ":: SMC-BATT: sweep aborted — first key BRSC stuck (SMC unresponsive); remaining keys skipped (noted once) ::"
+                );
+            }
+            return s; // all-None, present=false: the honest unresponsive snapshot
+        }
+        s.soc_pct = opt(first);
+        s.volt_mv = opt(read_u16k(b"B0AV"));
+        s.amp_ma = opt(read_u16k(b"B0AC")).map(|u| u as i16);
+        s.full_mah = opt(read_u16k(b"B0FC"));
+        s.rem_mah = opt(read_u16k(b"B0RM"));
         // AC presence: any non-zero AC-W payload => adapter attached.
         let mut acw = [0u8; 2];
         s.ac_present = match read_key(b"AC-W", &mut acw) {
@@ -507,16 +587,28 @@ pub mod battery {
     /// future path ever drives the SMC from multiple cores, wrap the transaction in a lock (a
     /// garbled read is bounded — `Stuck` — never a hang, so this is a correctness-of-reading concern,
     /// not a safety one).
+    /// Consecutive failed sweeps since the last good one — drives the failure BACKOFF: the
+    /// refresh interval doubles per failed sweep (1 s → 2 s → … capped at 32 s), so a machine
+    /// whose SMC never answers pays the bounded stuck-handshake cost a couple of times a minute
+    /// instead of every second (the other half of the vug-stall fix; a good sweep resets it).
+    static FAIL_STREAK: Mutex<u32> = Mutex::new(0);
+
     pub fn refresh_if_due() {
         let now = crate::arch::ms();
         {
+            let streak = *FAIL_STREAK.lock();
+            let interval = REFRESH_MS << streak.min(5); // 1 s .. 32 s
             let mut last = LAST_MS.lock();
-            if *last != 0 && now.wrapping_sub(*last) < REFRESH_MS {
+            if *last != 0 && now.wrapping_sub(*last) < interval {
                 return;
             }
             *last = now;
         }
         let s = snapshot();
+        {
+            let mut streak = FAIL_STREAK.lock();
+            *streak = if s.present { 0 } else { streak.saturating_add(1) };
+        }
         // BATMON-HOLD: a failed sweep (present=false) must NOT clobber a previous good reading —
         // the metal SMC read is intermittent (2026-07-18 sitting evidence), and a widget that goes
         // dark on one bad sweep is worse than one that holds the last good number with an honest

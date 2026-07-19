@@ -1002,6 +1002,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     use unaos_kernel::pal::GneissPal;
 
+    // CURSOR-HIDE: whether the console loop last drew the cursor, so the auto-hide transition
+    // erases the sprite exactly once (the full-screen demos clear every frame and need no erase).
+    let mut cursor_was_visible = false;
+
     loop {
         // Poll xHCI Controller, then run any deferred storage work (synchronous BOT
         // transactions run here, in a safe non-event context).
@@ -1142,6 +1146,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 _ => {}
             }
         }
+
+        // CURSOR-HIDE: erase the sprite once when the auto-hide delay expires (reappearance is
+        // instant — the Mouse/MouseAbsolute arms above stamp the activity clock before drawing).
+        let cursor_vis = unaos_kernel::pal::cursor::visible();
+        if cursor_was_visible && !cursor_vis {
+            unaos_kernel::pal::cursor::erase(&mut pal, 0x001E1E1E);
+        }
+        cursor_was_visible = cursor_vis;
 
         // Nothing queued — sleep until the next interrupt (timer/xHCI) rather than busy-spin.
         if !had_event {
