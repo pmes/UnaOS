@@ -34,10 +34,13 @@
 // task cde963a7). This is also the first code to walk a *non-first* redistributor frame on Orin, i.e.
 // the first metal exercise of JM4's VLPIS-derived stride.
 //
-// The scheduler is NOT part of this arc (it is `baremetal`-gated + EL1-coupled, while this path runs at
-// EL2 — see JC2/JC3). So the secondaries do their per-core GICv3 bring-up and **park in a WFI loop with
-// IRQs unmasked** — able to receive SGIs, nothing more. The verdict is cross-core SGI (BSP → each AP,
-// and each AP → BSP), not CAPSTONE.
+// The secondaries do their per-core GICv3 bring-up, prove cross-core SGI (BSP → each AP, and each AP →
+// BSP), then — ORIN-SMP-RUN — run their one-shot cooperative pass (`run_secondary_work`) and enter the
+// preemptive scheduler `run()` loop via `sched::secondary_run`, becoming SCHED-BAL participants (they
+// set `ONLINE` and the balancer may place/steal work onto them). This path runs the scheduler at EL2
+// (the primitives are EL-neutral) with AP periodic ticks DEFERRED (JC3 — a second core arming the
+// shared tick clock double-counts the wall-clock budgets), so `run()` idles on WFI woken by the
+// reschedule SGI rather than a local tick; work always arrives with an `IPI_RESCHED` poke.
 //
 // The whole module is `#[cfg(not(feature = "pi"))]` (baremetal implies pi, so it is compiled out of
 // every Pi image). The `virt` kick-off in `main.rs` is additionally runtime-gated on `gic::is_v3()`, so
@@ -61,7 +64,8 @@ const MAX_CORES: usize = 8;
 const MAX_CORES: usize = 4;
 
 /// SGI 0 — the inter-processor channel used for the cross-core delivery proof (the same INTID the Pi
-/// path reserves as `smp::IPI_RESCHED`; there is no scheduler here, so it is only ever a proof ping).
+/// path reserves as `smp::IPI_RESCHED`; it serves both as the cross-core proof ping AND, once the
+/// secondaries enter `run()` (ORIN-SMP-RUN), as the balancer's reschedule poke that breaks their idle WFI).
 /// Per-AP distinct SGI INTIDs (attributable AP→BSP delivery, delta-list item) are deferred to a
 /// follow-up — the BSP→AP direction is already per-core attributable via each AP's own IPI counter.
 const IPI_SGI: u32 = 0;
@@ -309,20 +313,19 @@ extern "C" fn __secondary_rust_virt(_advisory: u64) -> ! {
     // before. The spin-for-release inside waits with IRQ unmasked, so the BSP→AP ping still lands.
     sched::run_secondary_work(core);
 
-    // Honest idle heartbeat (VUG-1 M3b): this core is online but parks WITHOUT running the scheduler,
-    // so it never calls `dispatch_next` and its CPU-pulse counters would stay (0,0) — a pinned/undefined
-    // meter bar for a demonstrably-online-idle core. Register it as idle so the bar reads honest 0% busy.
-    // Bump once at park entry AND on every WFI wake — the wake bump is the load-bearing one (the BSP's
-    // witness reads busy+idle>0, which each re-park guarantees; the entry bump just seeds it). IRQs are
-    // already unmasked, so the BSP→AP ping is itself such a wake. Introspection-only, lock-free relaxed
-    // — no scheduling-path effect.
-    sched::note_core_idle(core);
-    // Park: IRQs unmasked, so a BSP → AP SGI wakes this WFI, is serviced (handle_irq_v3 counts it), and
-    // the core re-parks. No scheduler on this path (see the module header).
-    loop {
-        unsafe { core::arch::asm!("wfi", options(nomem, nostack, preserves_flags)) };
-        sched::note_core_idle(core);
-    }
+    // ORIN-SMP-RUN: enter the preemptive scheduler `run()` loop instead of the old `note_core_idle`
+    // + WFI park. `secondary_run` sets `ONLINE[core]` first thing, so this formerly-parked secondary
+    // becomes a SCHED-BAL participant — the balancer can place woken/spawned migratable work here and
+    // this core steals when idle (the metal witness: a non-zero `steals`/`busy` on a previously-parked
+    // Orin core). The honest-idle heartbeat the removed `note_core_idle` park fed is subsumed by
+    // `run()`'s idle path, which bumps `CPU_IDLE` on every empty dispatch, so the BSP's `busy+idle>0`
+    // pulse witness still holds (the cooperative pass above already seeded `busy>0`/`idle>0`).
+    //
+    // IRQs are unmasked, so a BSP → AP reschedule SGI still lands and is serviced (handle_irq_v3
+    // counts it): inside `run()` it breaks the idle WFI so newly-placed/stealable work is picked up.
+    // AP periodic ticks stay DEFERRED (JC3); `run()` idles on WFI woken by the reschedule SGI, which
+    // is exactly how `make_ready`/`spawn_balanced` poke a target core. Never returns.
+    sched::secondary_run(core)
 }
 
 /// Issue a PSCI fast call via the **SMC** conduit and return x0 (0/positive = result, else negative

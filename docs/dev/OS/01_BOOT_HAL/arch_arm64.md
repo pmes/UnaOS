@@ -5243,6 +5243,60 @@ tick path in `timer.rs` (the shared-`TICKS` double-count containment named above
 `./arroyo kernel8-test` 44 PASS / 0 FAIL (shared-`sched.rs` unregressed on the Pi — its APs run the
 full `run()` loop via `start_aps`, an untouched path).
 
+### ORIN-SMP-RUN — routing the tegra/virt secondaries into the preemptive `run()` loop (SCHED-BAL participation)
+
+The busy-heartbeat arc named its own deferral: *"preemptive multi-core scheduling on the secondaries
+… remains the metal-only step."* This arc lands it. After the SCHED-BAL balancer (work-stealing +
+wake/spawn placement) merged, the balancer places and steals **only** onto cores that entered
+`sched::run()` and set `ONLINE[cpu]`. The `virt`/tegra secondaries did their per-core bring-up + the
+one-shot cooperative pass (`run_secondary_work`) and then **parked in WFI without ever entering
+`run()`** — so on Orin one core (the boot core, running the cooperative CAPSTONE) stayed hot and the
+five secondaries stayed parked and invisible to the balancer.
+
+**The change (`__secondary_rust_virt` + one new `sched.rs` entry).** The shared secondary-entry tail
+now, after `run_secondary_work(core)`, calls **`sched::secondary_run(core)`** (a thin `-> !` wrapper
+around the private `run()`) instead of the old `note_core_idle` + WFI-park loop. `run()` sets
+`ONLINE[cpu]` first thing, so a previously-parked secondary becomes a full SCHED-BAL participant: the
+balancer may place woken/spawned migratable work on it and it steals from busier cores when idle.
+The entry shape, per-core stack discipline, and every bring-up witness line (`AP N online`, the
+BSP→AP/AP→BSP SGI proofs, CAPSTONE) are unchanged — only the terminal park is replaced.
+
+**Why not `wait_and_run` (the Pi model).** The Pi AP path enters via `wait_and_run`, which gates on
+`SCHED_GO`. The tegra/virt BSP never publishes `SCHED_GO` on the `CPU_ON` path (its boot core runs
+the cooperative CAPSTONE via `run_capstone_boot_core`, not `run()`), so gating there would leave the
+secondaries parked and never-`ONLINE` — defeating the arc. `secondary_run` enters `run()` immediately;
+this is safe because the cooperative pass already drained any BSP-staged startup queue before the call.
+
+**Housekeeping audit — what `run_secondary_work` still owes.** On the tegra/probe paths it is a no-op
+(not armed → immediate return); on `virt` it drains the staged cooperative-probe queue (`CPU_BUSY`)
+and sets `SECWORK_DONE`. Both still happen (the call is kept, before `run()`), so the BSP's
+busy-heartbeat witness is unchanged. The removed `note_core_idle` park loop fed `CPU_IDLE` for the
+CPU-pulse meter; that duty is **subsumed by `run()`'s idle path**, which bumps `CPU_IDLE` on every
+empty dispatch. In the GICv3 capture each AP now reads `pulse (busy=8, idle=2) ran+idle` — `idle=2`
+(vs the `idle=1` a bare cooperative pass leaves) is the direct witness that `run()` is now iterating.
+`note_core_idle` is retained as a general introspection helper (no live caller).
+
+**Timer deferral held (JC3).** AP periodic ticks stay deferred — a second core arming the shared tick
+clock double-counts the wall-clock budgets — so `run()`'s idle WFI wakes on the reschedule SGI, not a
+local tick. That is sufficient: `make_ready`/`spawn_balanced` poke the target with `IPI_RESCHED`, so
+newly-placed or stealable work always breaks the WFI. The JM6 EL2→EL1 boot-core drop and
+`run_capstone_boot_core` are untouched (the secondaries run the scheduler at EL2, EL-neutral).
+
+**QEMU witness.** `UNAOS_GICV3=1 ./arroyo test-arm 30`: the SCHED-BAL witness now reads
+`3 online cores, 4 core(s) ran work` (was `0 online cores` — no core entered `run()`); per-core
+`c1/c2/c3 busy=8 steals=0` (steals 0 on `virt` — no migratable balancer work is staged there, so the
+line is the structural marker). On real Orin, migratable work staged across the six cores is the
+accruing metal witness: a previously-parked core showing `busy>0` / `steals>0` in the SCHED-BAL line.
+
+**Gates green:** `./arroyo check` both arches; `UNAOS_TEGRA=1 ./arroyo check` both arches;
+`UNAOS_GICV3=1 ./arroyo test-arm 30` — no FAIL/SERROR/PANIC, all `AP N online` + `pulse … ran+idle` +
+idle/busy heartbeat PASS + CAPSTONE 6/6 present; `./arroyo kernel8-test 35` + `mbench --replay …
+--spec pi4-regression.spec` = **46/46, 0 forbidden** (shared `sched.rs`/`smp_virt.rs` unregressed on
+the Pi — its `smp.rs` `wait_and_run` path is untouched).
+
+**Metal-owed.** The Orin bench: stage migratable work across the six cores and read the SCHED-BAL
+line for `busy>0` / `steals>0` on the formerly-parked cores (`awk '/SCHED-BAL/' <log>`).
+
 ### VUG-HONESTY — the parked-core *display* completion (the heartbeats' third leg)
 
 The two heartbeats above made the *counters* honest: a parked online secondary reads `idle > 0`, and

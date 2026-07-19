@@ -118,9 +118,10 @@ static SECWORK_ARMED: AtomicBool = AtomicBool::new(false);
 /// Released by the BSP once every secondary's run queue is staged. An armed secondary waits on this
 /// (with a GENEROUS finite backstop, NOT a tight timing ceiling — the fragile 20 ms ceiling flaked
 /// under host load) so it drains REAL work; a non-armed secondary never reads it. The `virt`
-/// secondaries run at EL2 and never enter the full `run()` loop (no per-core timer — see the module
-/// header + `smp_virt`); this flag releases a single cooperative pass (`run_secondary_work`) so an
-/// online core publishes honest BUSY telemetry — the other half of the idle-heartbeat.
+/// secondaries run at EL2 with no per-core timer (see the module header + `smp_virt`); this flag
+/// releases a single cooperative pass (`run_secondary_work`) so an online core publishes honest BUSY
+/// telemetry — the other half of the idle-heartbeat — BEFORE it enters the preemptive `run()` loop
+/// via `secondary_run` (ORIN-SMP-RUN). The cooperative pass is still armed only on `virt`.
 static SECWORK_GO: AtomicBool = AtomicBool::new(false);
 /// Per-core "cooperative pass drained" flag, set by each secondary after `run_secondary_work` empties
 /// its queue; the BSP waits on it before reading the busy-heartbeat witness so it never races an
@@ -250,8 +251,10 @@ static CPU_IDLE: [AtomicU64; NUM_CPUS] = [const { AtomicU64::new(0) }; NUM_CPUS]
 /// SCHED-BAL — set by a core when it enters its scheduler `run()` loop, i.e. the cores that actually
 /// dispatch a run queue and so may participate in load balancing. The balancer places/steals ONLY onto
 /// cores marked here, so a migratable task is never stranded on a core that never runs the scheduler
-/// (the unscheduled BSP, or — on the `virt`/tegra one-shot-cooperative paths — a secondary that parks
-/// after `run_secondary_work` without ever entering `run()`). Lock-free, Acquire/Release.
+/// (the unscheduled BSP running the cooperative CAPSTONE via `run_capstone_boot_core`). On the
+/// `virt`/tegra path the secondaries now DO enter `run()` — after their one-shot cooperative pass
+/// (`run_secondary_work`) they call `secondary_run` (ORIN-SMP-RUN), so they set this and participate.
+/// Lock-free, Acquire/Release.
 static ONLINE: [AtomicBool; NUM_CPUS] = [const { AtomicBool::new(false) }; NUM_CPUS];
 /// SCHED-BAL — per-core count of tasks this core has STOLEN from a busier core's run queue while idle.
 /// The one-line metal witness: a non-zero steal count on the formerly-parked cores is the proof that
@@ -1106,11 +1109,11 @@ pub fn meter_current_cpu() -> usize {
 }
 
 /// VUG-1 M3b: register `cpu` as idle for the CPU-pulse meter — the seam a core that parks WITHOUT
-/// running this scheduler (`smp_virt::__secondary_rust_virt`'s WFI park: comes online, publishes
-/// `CORE_READY`, never calls `dispatch_next`) uses to bump its own `CPU_IDLE`. Without it such a core
-/// stays `(CPU_BUSY, CPU_IDLE) == (0, 0)` and the meter shows a pinned/undefined bar for a
-/// demonstrably-online-idle core; one heartbeat makes it read honest 0% busy. Same contract as the
-/// other pulse counters: introspection only, lock-free relaxed, never read on any scheduling path.
+/// running this scheduler uses to bump its own `CPU_IDLE` so the meter reads honest 0% busy rather
+/// than a pinned/undefined `(0, 0)` bar. Kept as a general introspection helper; the tegra/virt
+/// secondary that once relied on it now enters `run()` (ORIN-SMP-RUN), whose idle path bumps
+/// `CPU_IDLE` on every empty dispatch, so it no longer needs this seam. Same contract as the other
+/// pulse counters: introspection only, lock-free relaxed, never read on any scheduling path.
 pub fn note_core_idle(cpu: usize) {
     if cpu >= NUM_CPUS {
         return;
@@ -1256,6 +1259,27 @@ pub fn wait_and_run(cpu: usize) -> ! {
     run(cpu)
 }
 
+/// ORIN-SMP-RUN — the `virt`/tegra secondary's entry into the preemptive scheduler `run()` loop,
+/// called from `smp_virt::__secondary_rust_virt` AFTER its one-shot cooperative pass
+/// (`run_secondary_work`) in place of the old `note_core_idle` + WFI park. This is the seam that
+/// makes a tegra/virt secondary a SCHED-BAL participant: `run()` sets `ONLINE[cpu]` first thing, so
+/// the balancer may place woken/spawned migratable tasks here and this core may steal when idle.
+///
+/// Unlike `wait_and_run` (the Pi path), this does NOT gate on `SCHED_GO`: the tegra/virt BSP never
+/// publishes `SCHED_GO` on the `CPU_ON` path (its boot core runs the cooperative CAPSTONE via
+/// `run_capstone_boot_core`, not `run()`), and any BSP-staged startup queue was already drained by
+/// `run_secondary_work` before this call — so the core enters `run()` (and goes ONLINE) at once
+/// rather than waiting for a flag that never flips. `run()`'s idle path bumps `CPU_IDLE` on every
+/// empty dispatch, subsuming the honest-idle heartbeat the removed `note_core_idle` park provided.
+///
+/// AP periodic ticks stay DEFERRED on this path (JC3 — a second core arming the shared tick clock
+/// double-counts the wall-clock budgets), so `run()`'s idle WFI wakes only on a reschedule/BSP SGI,
+/// not a local tick. That is sufficient: `make_ready`/`spawn_balanced` poke the target with
+/// `IPI_RESCHED`, so newly-placed or stealable work always breaks the WFI. Never returns.
+pub fn secondary_run(cpu: usize) -> ! {
+    run(cpu)
+}
+
 // ---------------------------------------------------------------------------------------------
 // SCHED-NEXT — one-shot cooperative scheduled work on the `virt` GICv3 secondaries (busy-heartbeat)
 // ---------------------------------------------------------------------------------------------
@@ -1309,7 +1333,7 @@ pub fn secondary_work_done(cpu: usize) -> bool {
 
 /// Secondary-side: if this boot staged cooperative work (armed), wait for the BSP's release then
 /// drain THIS core's staged queue to completion and mark done; otherwise return immediately. Called
-/// by `__secondary_rust_virt` once, BEFORE its idle park. The queue is finite and pre-staged, so
+/// by `__secondary_rust_virt` once, BEFORE it enters the `run()` loop (`secondary_run`). The queue is finite and pre-staged, so
 /// `run_until_empty` drains it and returns (no timer / no WFI); `dispatch_next` bumps `CPU_BUSY[cpu]`
 /// per dispatch. The wait spins with IRQ unmasked (the caller's state), so a BSP→AP SGI landing during
 /// it is still serviced.
