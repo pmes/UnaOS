@@ -1048,6 +1048,14 @@ mod metal {
     const ATU_INCREASE_REGION_SIZE: u32 = 1 << 13;
     /// The DWC-core fallback ATU offset when a controller exposes no dedicated ATU reg region.
     const ATU_DBI_FALLBACK_OFF: u64 = 0x30_0000;
+    /// NET-4h — DWC unrolled-iATU direction bit. Outbound regions live at `atu_base + index*0x200`
+    /// (dir=0); INBOUND regions at `atu_base + 0x100 + index*0x200` (dir=1). This is Linux's
+    /// `PCIE_ATU_UNROLL_BASE(dir, index) = (index << 9) | (dir << 8)` (`pcie-designware.c`), a SEPARATE
+    /// region array from the outbound one — so inbound region 0 does not collide with the outbound
+    /// region 0 the M1-fix programmed. An inbound region translates an incoming PCIe (bus-master DMA)
+    /// address in [BASE, LIMIT] to TARGET + (addr - BASE); REGION_CTRL2 bit30=0 selects address-match
+    /// (not BAR-match). Identity DRAM: BASE = TARGET = DRAM base, LIMIT = DRAM top.
+    const ATU_INBOUND_DIR_OFF: u64 = 0x100;
 
     /// A `ranges` MEM window: its PCIe base, the CPU aperture base it maps to, and its size.
     #[derive(Clone, Copy)]
@@ -1096,6 +1104,74 @@ mod metal {
         );
         w(ATU_UNR_REGION_CTRL2, ATU_ENABLE | ATU_INCREASE_REGION_SIZE);
         unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
+    }
+
+    /// NET-4h — program one DWC INBOUND iATU region for identity DRAM DMA: an incoming bus-master
+    /// PCIe write whose address falls in `[dram_base, dram_base+dram_size)` is translated to the SAME
+    /// DRAM physical address (BASE = TARGET, identity — matching the driver's identity-map ring/buffer
+    /// assumption, where the NIC DMAs against the allocation's PA directly). This is the step the
+    /// OUTBOUND-only M1-fix left unprogrammed: with NO inbound region, the NIC's descriptor + payload
+    /// writes reach DRAM only through whatever firmware-residual inbound mapping survived — enough for
+    /// the ring page and the first buffer, but every later payload write lands nowhere (the NET-4d/f/g
+    /// "first frame real, rest real-length/zero-payload" signature, root-caused to DMA-write
+    /// reachability BELOW the descriptor level). The Pi 4 seam does the analogous thing with the
+    /// brcmstb RC_BAR2 inbound window (`piusb.rs` step (e)); Linux `dw_pcie_setup_rc` programs an
+    /// inbound region for the host's memory the same way. Inbound region 0 (dir=1) is a separate slot
+    /// from the outbound region 0 the M1-fix armed. Every write is announced (the lane's discipline);
+    /// base/limit/target are published (`dsb sy`) before the region is enabled.
+    fn program_inbound_atu(atu_base: u64, index: u64, dram_base: u64, dram_size: u64) {
+        let region = atu_base + ATU_INBOUND_DIR_OFF + index * ATU_REGION_STRIDE;
+        let limit = dram_base + dram_size - 1;
+        let w = |off: u64, v: u32| unsafe { write_volatile((region + off) as *mut u32, v) };
+        serial_println!(
+            "{}   [net4h] inbound iATU region {} @ {:#x} — PCIe DMA [{:#x}..{:#x}] -> DRAM {:#x} (identity, type MEM) ::",
+            P4, index, region, dram_base, limit, dram_base
+        );
+        serial_println!(
+            "{}   >>> ATU WRITE (net4h): BASE lo/hi = {:#010x}/{:#010x} ::",
+            P4, dram_base as u32, (dram_base >> 32) as u32
+        );
+        w(ATU_UNR_LOWER_BASE, dram_base as u32);
+        w(ATU_UNR_UPPER_BASE, (dram_base >> 32) as u32);
+        serial_println!(
+            "{}   >>> ATU WRITE (net4h): LIMIT lo/hi = {:#010x}/{:#010x} ::",
+            P4, limit as u32, (limit >> 32) as u32
+        );
+        w(ATU_UNR_LOWER_LIMIT, limit as u32);
+        w(ATU_UNR_UPPER_LIMIT, (limit >> 32) as u32);
+        serial_println!(
+            "{}   >>> ATU WRITE (net4h): TARGET lo/hi = {:#010x}/{:#010x} (identity) ::",
+            P4, dram_base as u32, (dram_base >> 32) as u32
+        );
+        w(ATU_UNR_LOWER_TARGET, dram_base as u32);
+        w(ATU_UNR_UPPER_TARGET, (dram_base >> 32) as u32);
+        serial_println!("{}   >>> ATU WRITE (net4h): REGION_CTRL1 = TYPE_MEM ::", P4);
+        w(ATU_UNR_REGION_CTRL1, ATU_TYPE_MEM);
+        // Publish base/limit/target BEFORE the region goes live (address-match, region-size increased
+        // because the DRAM window spans >32 bits — base ~2 GiB, limit tens of GiB up).
+        unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
+        serial_println!(
+            "{}   >>> ATU WRITE (net4h): REGION_CTRL2 = ENABLE|INCREASE_REGION_SIZE (bit30=0 address-match) — arming inbound region ::",
+            P4
+        );
+        w(ATU_UNR_REGION_CTRL2, ATU_ENABLE | ATU_INCREASE_REGION_SIZE);
+        unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
+    }
+
+    /// NET-4h — the identity DRAM window the inbound iATU must cover, derived from `ram_gib_mask` (bit
+    /// `g` set ⇒ GiB `g` is RAM). Returns `[lowest RAM GiB .. highest RAM GiB]` as `(base, size)` so a
+    /// single inbound region reaches every buffer the kernel heap can hand the NIC (on Orin the arena
+    /// sits high — ~9.6 GiB in the boot-6 capture — well above the DRAM base at GiB 2). `None` if the
+    /// mask is empty (no RAM known ⇒ refuse rather than program a bogus window).
+    fn dram_window(ram_gib_mask: u64) -> Option<(u64, u64)> {
+        if ram_gib_mask == 0 {
+            return None;
+        }
+        let lo = ram_gib_mask.trailing_zeros() as u64;
+        let hi = 63 - ram_gib_mask.leading_zeros() as u64;
+        let base = lo << 30;
+        let size = (hi - lo + 1) << 30;
+        Some((base, size))
     }
 
     /// Resolve, from the live DTB, controller-0's `atu_dma` ATU base (with the `dbi + 0x30_0000` DWC
@@ -1360,6 +1436,29 @@ mod metal {
         }
         // Program outbound region 0 for the whole MEM window (announced writes; enabled last).
         program_outbound_atu(atu_base, 0, &win);
+
+        // ── NET-4h: INBOUND iATU — the missing PCIe->DRAM DMA translation ──────────────────────────
+        // The outbound region above only lets the CPU REACH the NIC's registers. It does NOT let the
+        // NIC (a bus master) REACH DRAM: an incoming write TLP needs an INBOUND region to be translated
+        // to a DRAM physical address. Without it, the NIC's DMA rides only a firmware-residual inbound
+        // mapping — enough for the descriptor ring + the first RX buffer, but every later payload write
+        // lands nowhere (the NET-4d/f/g "first frame real, rest real-length/zero-payload" no-lease
+        // signature). Program inbound region 0 as an IDENTITY DRAM window (PCIe addr == DRAM PA, the
+        // driver's identity-map ring/buffer contract), covering all of RAM so any heap buffer the NIC
+        // is handed is reachable. If the DRAM window can't be resolved, DO NOT proceed to arm the rings
+        // blind — refuse cleanly (the NIC would DMA into a black hole again).
+        let Some((dram_base, dram_size)) = dram_window(ram_gib_mask) else {
+            serial_println!(
+                "{}   [net4h] no RAM in ram_gib_mask ({:#x}) — cannot program the inbound DMA window; bring-up SKIPPED (the NIC could not reach DRAM) ::",
+                P4, ram_gib_mask
+            );
+            return;
+        };
+        serial_println!(
+            "{}   [net4h] inbound DMA window from ram_gib_mask {:#x}: DRAM [{:#x}..{:#x}) ({} GiB) — programming inbound iATU so the NIC can DMA into any heap buffer ::",
+            P4, ram_gib_mask, dram_base, dram_base + dram_size, dram_size >> 30
+        );
+        program_inbound_atu(atu_base, 0, dram_base, dram_size);
 
         // The CPU-side aperture address for BAR2 = cpu_base + (bar_pci - pci_base). This — NOT bar_pci —
         // is what the CPU dereferences; the iATU forwards it to PCIe. It sits ~200 GiB up, inside the
