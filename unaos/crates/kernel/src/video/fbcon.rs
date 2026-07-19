@@ -335,6 +335,15 @@ pub fn milestone(ms: u64, tag: &str) {
         if GUI_ACTIVE.load(Ordering::Relaxed) {
             return;
         }
+        // SPLASH-SEAMLESS (metal defect fix): once the crystal splash owns the pre-GUI panel,
+        // milestone lines go serial/ring-only. They used to text-paint straight over the splash
+        // — the "jolting flash of text between splash and midden" Peter saw at the end of B5
+        // boot (the last one, gui:handoff, landed in the very frame before the GUI repainted).
+        // The ring still records every milestone (the `bootlog` shell verb shows them), serial
+        // still carries them, and a panic bypasses this via its own red backdrop + PANIC_MIRROR.
+        if crate::splash::active() {
+            return;
+        }
         crate::arch::without_interrupts(|| {
             if let Some(mut c) = FBCON.try_lock() {
                 if c.ready {
