@@ -276,6 +276,11 @@ pub fn bringup(fb: Option<FbTarget>) {
                 ":: V3D: probe verdict BUS-POISON — hub IDENT0 = {:#010x} (open-bus/firmware fill, NOT a live register — the powered+clocked path did not bring the block up) — GPU bring-up skipped, fail-closed ::",
                 v
             );
+            // SError-drain class fix: the powered/clocked/bridged sequence above wrote into a block
+            // that never came up — any of those accesses may have left a LATENT async external
+            // abort pending (the R22 sitting-2 first-tick SERROR). Drain before returning so the
+            // fail-closed branch leaves the machine clean.
+            super::exceptions::serror_drain_request("v3d: BUS-POISON probe");
             return;
         }
     }
@@ -307,6 +312,10 @@ pub fn bringup(fb: Option<FbTarget>) {
     // ── M2: MMU. ────────────────────────────────────────────────────────────────────────────────
     if !program_mmu() {
         serial_println!(":: V3D: M2 MMU program FAILED — halting bring-up (fail-closed) ::");
+        // The MMU-program writes are the R22 sitting-2 metal offender: they targeted a block whose
+        // probe passed but whose MMU window aborted, leaving a latent SError for the first DAIF
+        // unmask. Drain it here so the fail-closed exit leaves the machine clean.
+        super::exceptions::serror_drain_request("v3d: M2 MMU program failed");
         return;
     }
     serial_println!(":: V3D: M2 MMU PASS (arena identity-mapped, confined, TLB flushed) ::");
@@ -317,6 +326,9 @@ pub fn bringup(fb: Option<FbTarget>) {
     } else {
         serial_println!(":: V3D: M3 clear-job did not verify — see lines above ::");
     }
+    // Belt-and-suspenders for the whole bring-up: whatever path M2/M3 took, no latent async abort
+    // from a V3D register access may outlive this function (the SError-drain class rule).
+    super::exceptions::serror_drain_request("v3d: bring-up exit");
 }
 
 /// The three discriminated outcomes of the V3D presence probe. Only `Up` proceeds past the gate.

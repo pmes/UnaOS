@@ -112,10 +112,13 @@ fn dsb() {
     unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
 }
 
-/// Open-bus / firmware-fill poison signatures — NEITHER is ever live data (PI-V3D-1 false-PASS rule).
+/// Open-bus / firmware-fill poison signatures — NONE is ever live data (PI-V3D-1 false-PASS rule).
+/// `0xdeaddead` joined the list after R22 sitting 2: it is the BCM2711 RC's abort-fill for a
+/// downstream config read it could not forward (observed as `config[0x00] = 0xdeaddead` with the
+/// link UP), and the old two-pattern gate FALSE-LIVED it as vendor 0xdead device 0xdead.
 #[inline]
 fn is_poison(v: u32) -> bool {
-    v == 0xFFFF_FFFF || v == 0xDEAD_BEEF
+    v == 0xFFFF_FFFF || v == 0xDEAD_BEEF || v == 0xDEAD_DEAD
 }
 
 /// A config-space `vendor:device` word is LIVE only if it is neither poison nor an absent-decode
@@ -283,17 +286,27 @@ pub fn bringup(dtb: u64) {
     // ── M1: brcmstb RC bring-up. ─────────────────────────────────────────────────────────────────
     if !m1_rc_bringup() {
         serial_println!("{} M1 RC bring-up did not reach link-up — USB bring-up skipped (see lines above) ::", P);
+        // SError-drain class rule (R22 sitting 2): the RC accesses above may have left a latent
+        // async abort pending; a fail-closed exit must leave the machine clean.
+        super::exceptions::serror_drain_request("piusb: M1 fail-closed");
         return;
     }
 
     // ── M2: VL805 enumeration + BAR sizing + firmware reset. ──────────────────────────────────────
     let Some(bar0_pcie) = m2_enumerate_vl805() else {
         serial_println!("{} M2 VL805 enumeration failed — USB bring-up skipped (see lines above) ::", P);
+        // The poisoned downstream config read (`0xdeaddead`) is the R22 sitting-2 metal offender:
+        // it left a pending async external abort that detonated at the first DAIF unmask. Drain.
+        super::exceptions::serror_drain_request("piusb: M2 fail-closed (poisoned cfg read)");
         return;
     };
 
     // ── M3: map the outbound window, attach the shared xHCI to the honesty line. ──────────────────
     m3_attach_xhci(bar0_pcie);
+
+    // Belt-and-suspenders: no latent async abort from any RC/BAR access may outlive the bring-up
+    // (M3's fail-closed CAP-poison branch included — it returns into this drain).
+    super::exceptions::serror_drain_request("piusb: bring-up exit");
 
     serial_println!("{} PI-USB-1 bring-up DONE (honesty line; device enumeration is attended metal) ::", P);
 }
@@ -433,8 +446,55 @@ fn m1_rc_bringup() -> bool {
 /// PCIe base, enable MEM decode + bus-master on the VL805, and issue the NOTIFY_XHCI_RESET mailbox so
 /// the VideoCore firmware (re)loads the VL805 firmware. Returns the PCIe-side BAR0 base on success.
 fn m2_enumerate_vl805() -> Option<u64> {
-    let idword = vl805_cfg_read(0x00);
+    // ── PI-USB-2 R22 sitting-2 fix: the RC never had its ROOT-PORT BRIDGE BUS WINDOW programmed.
+    // The RP is a type-1 (bridge) function; its PRIMARY/SECONDARY/SUBORDINATE bus registers
+    // (config offset 0x18, bytes 0/1/2) reset to 0/0/0, and a bridge whose secondary window does
+    // not cover bus 1 does NOT forward type-1 config requests downstream — the EXT_CFG access to
+    // bus1:dev0 master-aborts inside the RC and the DATA window returns the abort fill
+    // (`0xdeaddead`, the exact word metal captured with the link UP). Linux never hits this in the
+    // driver because the PCI core's pci_scan_bridge programs the window during enumeration; we ARE
+    // the enumerator, so program primary=0 / secondary=1 / subordinate=1 here, before the first
+    // downstream config read. (RP config lives directly at RC_BASE — no EXT_CFG indirection.)
+    let buses = r(RC_BASE + 0x18);
+    let newbuses = (buses & 0xFF00_0000) | 0x0001_0100; // pri=0, sec=1, sub=1; keep latency byte
+    serial_println!(
+        "{} M2: >>> WRITE: RP bus window {:#010x} -> {:#010x} (primary=0 secondary=1 subordinate=1 — forward type-1 cfg to bus 1) ::",
+        P, buses, newbuses
+    );
+    w(RC_BASE + 0x18, newbuses);
+    dsb();
+
+    // PCIe spec: a device may take up to 100 ms after PERST# deassert before it must answer config
+    // requests. Link training consumed part of that budget; burn the remainder (bounded) before the
+    // first downstream read so a slow VL805 is not misread as absent.
+    settle_ms(100);
+
+    let mut idword = vl805_cfg_read(0x00);
     serial_println!("{} M2: VL805 config[0x00] = {:#010x} ::", P, idword);
+    if is_poison(idword) {
+        // One bounded retry after a further settle — distinguishes "still settling" from a hard
+        // forwarding/absence failure before we diagnose.
+        settle_ms(50);
+        idword = vl805_cfg_read(0x00);
+        serial_println!("{} M2: VL805 config[0x00] retry = {:#010x} ::", P, idword);
+    }
+    if is_poison(idword) {
+        // Sharper honest diagnostic: did the RP bus window stick? A readback that lost our
+        // secondary/subordinate programming points at RC/window misprogramming; a stuck window
+        // with a still-poisoned child read points at the device (absent, or firmware not loaded).
+        let rb = r(RC_BASE + 0x18);
+        let window_ok = (rb & 0x00FF_FF00) == 0x0001_0100;
+        serial_println!(
+            "{}   child config POISON ({:#010x}); RP bus window readback {:#010x} — {} ::",
+            P, idword, rb,
+            if window_ok {
+                "window PROGRAMMED (pri/sec/sub = 0/1/1) => forwarding is set up; the DEVICE did not answer (absent below the RP, or VL805 firmware not loaded)"
+            } else {
+                "window DID NOT STICK => RC config-forwarding misprogramming (index/data or offset math), NOT device-absent"
+            }
+        );
+        return None;
+    }
     let (vendor, device) = live_vendor_device(idword)?;
     if vendor != VL805_VENDOR || device != VL805_DEVICE {
         serial_println!(
@@ -615,6 +675,8 @@ pub fn enumerate() {
             "{} enumerate: xHCI CAP reads {:#010x} @ {:#x} — no longer decoding; enumeration SKIPPED, fail-closed ::",
             P, cap0, base
         );
+        // Post-vector fail-closed probe: drain any latent async abort inline (SError-drain class).
+        super::exceptions::serror_drain_request("piusb: enumerate CAP poison");
         return;
     }
     let cap_length = (cap0 & 0xff) as u64;

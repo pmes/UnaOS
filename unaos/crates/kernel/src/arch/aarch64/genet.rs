@@ -756,6 +756,10 @@ mod metal {
                 "{}   SYS_REV_CTRL @ {:#x} = POISON (open-bus/firmware/zero) — this build does NOT model GENET (QEMU raspi4b, or link-down metal); driver compiled-present, bring-up SKIPPED (no write into an absent decode) ::",
                 PG, res.base
             );
+            // SError-drain class rule: the poisoned probe read may have left a latent async abort
+            // pending; drain it (vectors are live at this post-heap call site) so the fail-closed
+            // exit leaves the machine clean.
+            crate::arch::aarch64::exceptions::serror_drain_request("genet: SYS_REV_CTRL poison");
             return;
         };
         // Decode the revision the way Linux `bcmgenet_set_hw_params` does: major nibble at [27:24]
@@ -785,6 +789,8 @@ mod metal {
         // ── M2: UMAC + rings ──
         if !nic.init(mac) {
             serial_println!("{} PI-GENET bring-up STOPPED after M2 init failed (device stopped answering) ::", PG);
+            // The M2 writes went into a block that stopped answering — drain any latent abort.
+            crate::arch::aarch64::exceptions::serror_drain_request("genet: M2 init failed");
             return;
         }
 
