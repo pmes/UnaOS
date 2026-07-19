@@ -691,6 +691,30 @@ pub fn build_boot_info(dtb: u64) -> &'static mut BootInfo {
         let regions = &raw const MEM_REGIONS as u64;
         let bi = &raw mut BOOT_INFO;
         (*bi).dtb_addr = dtb;
+        // PI-GENET metal defect (R22 sitting 2): dtb_size was NEVER populated here — the static's 0
+        // flowed to every consumer, so on metal (firmware DTB really present at `dtb`, totalsize
+        // 0xd8dc observed) `genet::resolve` saw "size=0x0" and refused before parsing. Read the FDT
+        // header ourselves: magic 0xd00dfeed then totalsize, both BIG-endian (the FDT spec byte
+        // order — a plain u32 load would byte-swap on our little-endian cores). Bounded + honest:
+        // a non-FDT pointer (QEMU raspi4b passes x0=0x100 with no blob there) fails the magic test
+        // and the size stays an honest 0; an implausible totalsize (> 4 MiB) is refused too.
+        if dtb != 0 {
+            let hdr = dtb as *const u8;
+            let be32 = |off: usize| -> u32 {
+                u32::from_be_bytes([
+                    hdr.add(off).read_volatile(),
+                    hdr.add(off + 1).read_volatile(),
+                    hdr.add(off + 2).read_volatile(),
+                    hdr.add(off + 3).read_volatile(),
+                ])
+            };
+            if be32(0) == 0xd00d_feed {
+                let totalsize = be32(4) as usize;
+                if totalsize >= 40 && totalsize <= 4 * 1024 * 1024 {
+                    (*bi).dtb_size = totalsize;
+                }
+            }
+        }
         (*bi).memory_regions_addr = regions;
         (*bi).memory_regions_len = 1;
 

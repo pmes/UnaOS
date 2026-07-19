@@ -359,12 +359,26 @@ __vec_fiq:
     mov x0, #2
     bl aarch64_fault_handler
     b .
+    // ---- SError: drain-tolerant. A fail-closed MMIO probe (poisoned/aborted V3D or PCIe access)
+    // can leave a LATENT asynchronous external abort pending, delivered only when PSTATE.A first
+    // unmasks — on metal this landed as a fatal SERROR at the first timer tick (R22 sitting-2, both
+    // kernels). `drain_pending_serror` opens a bounded, ARMED unmask window; if the SError arrives
+    // while armed, aarch64_serror_drain_check consumes it (logs the witness, returns 1) and we
+    // RESUME the interrupted context — which is exactly why this stub, unlike the other fault
+    // dead-ends, pairs SAVE_FP/RESTORE_FP with SAVE_GPRS (the resumed context's NEON must survive
+    // the Rust logging under it). Unarmed, it falls through to the fatal logger exactly as before.
     .globl __vec_serror
 __vec_serror:
     SAVE_GPRS
+    SAVE_FP
+    bl aarch64_serror_drain_check
+    cbnz x0, 6f
     mov x0, #3
     bl aarch64_fault_handler
     b .
+6:  RESTORE_FP
+    RESTORE_GPRS
+    eret
 "#,
     svc_stub!()
 ));
@@ -403,6 +417,17 @@ pub fn install() {
         core::arch::asm!("isb", options(nomem, nostack, preserves_flags));
     }
     serial_println!(":: AARCH64 exception vectors installed (VBAR_EL{} = {:#x}) ::", el, vbar);
+    VECTORS_LIVE.store(true, Ordering::Release);
+    // SError-drain class fix (R22 sitting 2): if a pre-vector fail-closed probe (V3D / PIUSB, both
+    // run inside build_boot_info — before this install) requested a drain, the latent asynchronous
+    // external abort is still pending in PSTATE.A's shadow. Consume it NOW, at the first point the
+    // vectors can catch it, instead of letting enable_irq's permanent A-unmask deliver it as a
+    // fatal SERROR at the first timer tick (the metal signature: ESR=0xbf000002 at ELR=first-tick).
+    // swap(false) makes this once-only: the BSP installs first on the pi flow; AP installs and the
+    // tegra post-drop re-install find the request already consumed.
+    if SERROR_DRAIN_PENDING.swap(false, Ordering::AcqRel) {
+        drain_now("deferred: pre-vector fail-closed probe");
+    }
     // JB1f: surface heals that predate this install — the tegra post-drop re-install runs after
     // the EL2 boot stretch, so a heal whose per-strike line lost the SERIAL_PORT try_lock still
     // shows up here. Silent when zero, so QEMU/pi output is byte-identical.
@@ -430,6 +455,109 @@ pub fn enable_irq() {
     // inherits the firmware DAIF, so leave its A bit alone.
     #[cfg(feature = "baremetal")]
     unsafe { core::arch::asm!("msr daifclr, #4", options(nomem, nostack, preserves_flags)) };
+}
+
+// ══ SError-drain class fix (R22 sitting 2, the metal SERROR-at-first-tick defect) ══════════════════
+//
+// A poison-honest/fail-closed MMIO probe (V3D bring-up writes into a block that never came up; a
+// VL805 config read the RC answered with abort fill) can leave a PENDING asynchronous external abort
+// behind: the access completed from the CPU's view, the fabric's abort response arrives later, and
+// with PSTATE.A masked it sits latent until DAIF first unmasks — where it kills the machine as a
+// fatal `SERROR ESR=0xbf000002` at whatever instruction happens to be live (on metal: the first
+// timer tick, twice, on two kernels). The class fix: after any such probe, the probing module calls
+// `serror_drain_request()`. If the vectors are live, a bounded ARMED unmask window consumes the
+// abort immediately; if not (both offenders run pre-vector, in build_boot_info), the request is
+// latched and `install()` performs the drain the moment the vectors can catch it. Either way a
+// fail-closed probe leaves the machine clean, with a serial witness line whenever an abort was
+// actually consumed. No protection is weakened: an SError arriving OUTSIDE an armed window still
+// takes the fatal logger exactly as before. (FEAT_RAS `esb` would be the architected alternative;
+// the unmask window works on every core we run, RAS or not.)
+
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
+
+/// True once `install()` has pointed VBAR at our table on the boot core.
+static VECTORS_LIVE: AtomicBool = AtomicBool::new(false);
+/// A pre-vector fail-closed probe requested a drain; `install()` services it once.
+static SERROR_DRAIN_PENDING: AtomicBool = AtomicBool::new(false);
+/// The drain window is open: `__vec_serror` consumes-and-resumes instead of halting.
+static SERROR_DRAIN_ARMED: AtomicBool = AtomicBool::new(false);
+/// Total SErrors consumed by armed windows this boot (witness bookkeeping).
+static SERROR_DRAINED: AtomicU32 = AtomicU32::new(0);
+/// ESR of the most recently drained SError (for the summary witness line).
+static SERROR_DRAIN_ESR: AtomicU64 = AtomicU64::new(0);
+
+/// Called by a fail-closed MMIO probe (V3D, PIUSB, GENET — any module whose poison-honest branch
+/// may have left an aborted access in flight). Synchronizes the access, then drains the latent
+/// SError now (vectors live) or latches the request for `install()` (pre-vector boot stretch).
+pub fn serror_drain_request(site: &str) {
+    // Complete the aborted access from the CPU's side so the abort, if any, is pending NOW.
+    unsafe { core::arch::asm!("dsb sy", "isb", options(nostack, preserves_flags)) };
+    if VECTORS_LIVE.load(Ordering::Acquire) {
+        drain_now(site);
+    } else {
+        SERROR_DRAIN_PENDING.store(true, Ordering::Release);
+    }
+}
+
+/// Open a bounded, armed SError window: mask A (so arming and unmasking are ordered), arm the
+/// tolerant handler, unmask A (a pending abort is delivered HERE, into `__vec_serror`'s drain
+/// branch), close the window, restore the caller's original A state. Prints one summary witness
+/// line when at least one abort was consumed; silent otherwise (QEMU logs stay byte-identical).
+fn drain_now(site: &str) {
+    let before = SERROR_DRAINED.load(Ordering::Relaxed);
+    let daif: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, daif", out(reg) daif, options(nomem, nostack, preserves_flags));
+        core::arch::asm!("msr daifset, #4", options(nomem, nostack, preserves_flags));
+    }
+    SERROR_DRAIN_ARMED.store(true, Ordering::SeqCst);
+    unsafe {
+        core::arch::asm!(
+            "dsb sy",
+            "isb",
+            "msr daifclr, #4", // pending SError (if any) delivered here, armed
+            "isb",
+            "isb",
+            "msr daifset, #4", // window closed
+            "isb",
+            options(nostack, preserves_flags)
+        );
+    }
+    SERROR_DRAIN_ARMED.store(false, Ordering::SeqCst);
+    let drained = SERROR_DRAINED.load(Ordering::Relaxed).wrapping_sub(before);
+    if drained > 0 {
+        serial_println!(
+            ":: SERROR-DRAIN: consumed {} latent async abort(s) (last ESR={:#x}) after fail-closed probe [{}] — machine clean ::",
+            drained,
+            SERROR_DRAIN_ESR.load(Ordering::Relaxed),
+            site
+        );
+    }
+    // Restore the caller's A-bit (DAIF.A is bit 8): only re-unmask if it was unmasked coming in.
+    if daif & (1 << 8) == 0 {
+        unsafe { core::arch::asm!("msr daifclr, #4", options(nomem, nostack, preserves_flags)) };
+    }
+}
+
+/// Reached FIRST from `__vec_serror`. Returns 1 (consume + resume the interrupted context) only
+/// while a drain window is armed; 0 falls through to the fatal logger — the pre-existing behaviour
+/// for every SError outside an armed window (no protection weakened).
+#[unsafe(no_mangle)]
+extern "C" fn aarch64_serror_drain_check() -> u64 {
+    if !SERROR_DRAIN_ARMED.load(Ordering::SeqCst) {
+        return 0;
+    }
+    let esr: u64;
+    unsafe {
+        if BOOT_EL.load(Ordering::Relaxed) == 2 {
+            core::arch::asm!("mrs {}, ESR_EL2", out(reg) esr, options(nomem, nostack, preserves_flags));
+        } else {
+            core::arch::asm!("mrs {}, ESR_EL1", out(reg) esr, options(nomem, nostack, preserves_flags));
+        }
+    }
+    SERROR_DRAIN_ESR.store(esr, Ordering::Relaxed);
+    SERROR_DRAINED.fetch_add(1, Ordering::Relaxed);
+    1
 }
 
 /// Rust IRQ dispatcher (called from the IRQ vector stub). EL-agnostic: acknowledge at the GIC CPU
