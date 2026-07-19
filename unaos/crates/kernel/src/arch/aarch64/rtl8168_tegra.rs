@@ -36,9 +36,31 @@
 // Normal cacheable RAM and are handed over with `dsb sy` only — `dsb` orders visibility for
 // COHERENT observers, it cleans/invalidates nothing. The x86 e1000 seam gets coherent DMA from the
 // architecture; aarch64 does not promise it. Correctness therefore assumes Tegra234 controller-0
-// is I/O-coherent (ACE-lite) toward DRAM. If metal shows stale descriptors/payloads (rings never
-// advance, or torn/zero frames, on a live link), the fix is clean-before-OWN / invalidate-before-
-// read on rings + buffers — do NOT weaken the OWN protocol to compensate.
+// is I/O-coherent (ACE-lite) toward DRAM.
+//
+// ## NET-4f — that assumption is REFUTED on Orin silicon; the RX buffers are non-coherent.
+//
+// NET-4e added a `dsb ld` DMA read barrier on the RX pop (the ORDERING theory: CPU sees OWN-clear
+// before the payload write). Boot 3 refuted it: barrier active, the FIRST popped frame reads real
+// bytes (its buffer's cache line missed), every subsequent frame reads ALL-ZERO payload though its
+// DESCRIPTOR carries a real length — the NIC's DMA writes to DRAM are never observed by the CPU.
+// Root cause: the buffers are `alloc_zeroed`, which leaves DIRTY zero lines resident in the D-cache;
+// controller-0's PCIe write path does not snoop the Cortex-A78 cache (no IO-coherency granted here),
+// so the CPU keeps hitting its own cached zeros. This is genuine non-coherent DMA, not an ordering
+// bug. The fix (this file, arch/aarch64/cache.rs primitives), matching the Pi 4 VideoCore recipe:
+//   * RX (device→CPU, DMA_FROM_DEVICE): INVALIDATE (`dc ivac`) each buffer before handing OWN to the
+//     NIC (at alloc + at recycle) so the dirty zero lines are dropped and can never be written back
+//     over the NIC's data, and INVALIDATE `[buf, buf+len)` again after OWN-clear before the copy so a
+//     speculatively-prefetched line is dropped and the read re-fetches DRAM. `dc ivac` (not `civac`)
+//     is mandatory: a clean would flush the stale zeros to DRAM ON TOP of the NIC's payload.
+//   * TX (CPU→device, DMA_TO_DEVICE): CLEAN (`dc cvac`) the frame buffer after the copy, before the
+//     doorbell, so the NIC reads the CPU's bytes from DRAM rather than stale RAM. TX "worked" pre-fix
+//     only by the racy luck of an eviction landing the DISCOVER in DRAM before the NIC fetched it; a
+//     lost future TX is the same non-coherent class, so it is fixed symmetrically (honesty > minimal).
+// The descriptor rings are NOT given maintenance: metal shows their DMA is observed correctly (real
+// per-slot lengths came through even for the zero-payload frames), so the ring stays on the proven
+// path; if a future sitting shows stale OWN/len the same invalidate extends to the ring. Do NOT weaken
+// the OWN protocol to compensate.
 //
 // ## Write discipline
 //
@@ -78,6 +100,7 @@ pub use metal::net4_bringup;
 #[cfg(feature = "tegra")]
 mod metal {
     use super::P4;
+    use crate::arch::aarch64::cache;
     use crate::arch::aarch64::fdt_tegra::Fdt;
     use crate::arch::aarch64::mmu_tegra::{map_mmio_window, MmioMap};
     use crate::net_phy::{fmt_mac, RawNic, SmoltcpPhy};
@@ -427,6 +450,13 @@ mod metal {
             let buf_layout = Layout::from_size_align(NUM_RX * RX_BUF_SIZE, 4096).unwrap();
             self.rx_ring = unsafe { alloc::alloc::alloc_zeroed(ring_layout) as *mut Desc };
             self.rx_buffers = unsafe { alloc::alloc::alloc_zeroed(buf_layout) };
+            // NET-4f: the buffer arena is `alloc_zeroed` → DIRTY zero lines resident in the D-cache.
+            // Invalidate the whole arena BEFORE any descriptor is armed, so (a) those dirty zeros can
+            // never be written back over the NIC's DMA payload and (b) no stale line lingers to be hit
+            // instead of the NIC's DRAM write. `dc ivac` (invalidate, not clean) is required — a clean
+            // would push the zeros to DRAM. Safe: the arena is a dedicated 4096-aligned allocation of
+            // 2048-byte (cache-line-multiple) buffers, so no line is shared with the ring or other heap.
+            cache::invalidate_range(self.rx_buffers as usize, NUM_RX * RX_BUF_SIZE);
             for i in 0..NUM_RX {
                 let buf_phys = (self.rx_buffers as u64) + (i * RX_BUF_SIZE) as u64;
                 let eor = if i == NUM_RX - 1 { DESC_EOR } else { 0 };
@@ -553,6 +583,13 @@ mod metal {
             let len = frame.len().min(TX_BUF_SIZE);
             let buf = unsafe { self.tx_buffers.add(i * TX_BUF_SIZE) };
             unsafe { core::ptr::copy_nonoverlapping(frame.as_ptr(), buf, len) };
+            // NET-4f: non-coherent DMA (see the coherency note at the top of this file) — CLEAN the
+            // frame buffer to DRAM so the NIC reads the CPU's bytes, not stale RAM. TX "worked" pre-fix
+            // only by the racy luck of an eviction landing the DISCOVER before the NIC fetched it; a
+            // lost future TX is the same class, so it is fixed symmetrically with the RX invalidate.
+            // `dc cvac` here (write-back), the mirror of RX's `dc ivac`. Ends with `dsb sy`; the
+            // existing barrier below still orders the descriptor publish before the doorbell.
+            cache::clean_range(buf as usize, len);
             let eor = if i == NUM_TX - 1 { DESC_EOR } else { 0 };
             let d = Desc {
                 opts1: DESC_OWN | DESC_FS | DESC_LS | eor | (len as u32 & DESC_LEN_MASK),
@@ -777,18 +814,22 @@ mod metal {
             // never make us build an out-of-bounds slice.
             let len = (d.opts1 & DESC_LEN_MASK) as usize;
             let len = len.min(RX_BUF_SIZE).min(out.len());
+            let buf = unsafe { self.rx_buffers.add(self.rx_cur * RX_BUF_SIZE) };
+            // NET-4f: this memory is non-coherent (see the coherency note at the top of this file) —
+            // the `dsb ld` orders the CPU's two observations but does NOT drop the stale (zero) cache
+            // lines the NIC's DMA wrote past. INVALIDATE `[buf, buf+len)` so the copy below misses the
+            // cache and re-fetches the NIC's payload from DRAM. Without this the frame reads as the
+            // `alloc_zeroed` fill (the boot-3 all-zero-payload defect). `dc ivac` discards, never
+            // writes back — the buffer is untouched by the CPU since its pre-handoff invalidate.
+            cache::invalidate_range(buf as usize, len);
             unsafe {
-                core::ptr::copy_nonoverlapping(
-                    self.rx_buffers.add(self.rx_cur * RX_BUF_SIZE),
-                    out.as_mut_ptr(),
-                    len,
-                );
+                core::ptr::copy_nonoverlapping(buf, out.as_mut_ptr(), len);
             }
-            // NET-4e: one-shot witness on the first popped frame — proves the DMA read barrier is on the
-            // live RX path (the fix that lets the DHCP ACK be read instead of stale zeros).
+            // NET-4f: one-shot witness on the first popped frame — names the coherency strategy now on
+            // the live RX path (invalidate-before-read, superseding NET-4e's ordering-only barrier).
             if self.rx_count == 0 {
                 serial_println!(
-                    "{}   [net4e] first RX pop len={} — DMA read barrier (dsb ld) active between OWN-check and buffer copy ::",
+                    "{}   [net4f] first RX pop len={} — non-coherent DMA: dc ivac invalidate-before-read (+ dsb ld) between OWN-check and buffer copy ::",
                     P4, len
                 );
             }
@@ -796,6 +837,11 @@ mod metal {
             // NET-4d: classify this frame (bounded, read-only) while the DHCP discover window is live.
             // Borrows `out` (not `self`), so the &mut self counter updates do not alias.
             self.net4d_classify(&out[..len]);
+            // NET-4f: before re-arming, invalidate the whole buffer — the copy above pulled the frame
+            // into the D-cache (now clean lines); dropping them means the NIC's NEXT DMA write is never
+            // shadowed by a resident line, and nothing can be written back over it. (DMA_FROM_DEVICE
+            // sync-for-device, mirroring the pre-handoff invalidate in alloc_rx.)
+            cache::invalidate_range(buf as usize, RX_BUF_SIZE);
             // Recycle: re-arm this descriptor for the NIC (OWN + buffer size + EOR on the last slot).
             let eor = if self.rx_cur == NUM_RX - 1 { DESC_EOR } else { 0 };
             let nd = Desc {
