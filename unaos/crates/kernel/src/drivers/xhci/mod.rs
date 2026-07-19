@@ -4449,33 +4449,87 @@ impl XhciController {
         // it and enumerates cleanly, and QEMU's downstream devices are USB2 — this branch leaves the
         // HS/FS/LS path byte-identical.
         let (reset_sel, done_bit) = if is_ss { (28u16, 1u32 << 21) } else { (4u16, 1u32 << 20) };
-        let _ = self.sync_control(hub_slot, 0x23, 0x03, reset_sel, port as u16, 0, 0, false); // SET (BH_)PORT_RESET
 
+        // ORIN-USB-FIX-3: the warm (BH) reset re-trains the SS link, so the *reset* completing is not
+        // the same event as the *port* enabling. On the Realtek 0bda:0489 SS hub the warm reset latches
+        // C_BH_PORT_RESET (reset done) but leaves the link back in training — metal Orin read
+        // wPortStatus 0x1002b1: C_PORT_RESET set (change half), yet PED=0 and PLS (bits 8:5) = 5 =
+        // Rx.Detect (status half). A hot reset used to leave the port Enabled/U0 immediately (device
+        // present but unaddressable — the code-4 that FIX-2 addressed); the warm reset FIX-2 introduced
+        // instead needs a bounded, paced settle for the link to walk Rx.Detect → Polling → U0 before
+        // the port reads Enabled. FIX-2's walk gave up the instant the reset completed. So on SS: after
+        // the reset completes, poll wPortStatus for PED=1 AND PLS=U0(0) on a wall-clock deadline
+        // (~300 ms/attempt, the now_cycles/hw_wait_budget idiom the enum FSM already uses), and if the
+        // link does not land in budget, redo the warm reset once before honest failure. USB2 keeps the
+        // single hot reset with no training wait — byte-identical to FIX-2.
         let mut pstatus = 0u32;
-        for _ in 0..50 {
-            for _ in 0..20 { if !self.drain_event_ring_once() { crate::hlt(); } }
-            if self.sync_control(hub_slot, 0xA3, 0x00, 0, port as u16, 4, buf, true).is_err() {
-                return None;
+        let mut trained = false;
+        let max_attempts: u32 = if is_ss { 2 } else { 1 };
+        for attempt in 0..max_attempts {
+            let _ = self.sync_control(hub_slot, 0x23, 0x03, reset_sel, port as u16, 0, 0, false); // SET (BH_)PORT_RESET
+
+            for _ in 0..50 {
+                for _ in 0..20 { if !self.drain_event_ring_once() { crate::hlt(); } }
+                if self.sync_control(hub_slot, 0xA3, 0x00, 0, port as u16, 4, buf, true).is_err() {
+                    return None;
+                }
+                pstatus = unsafe {
+                    let p = buf as *const u8;
+                    (*p.add(0) as u32) | ((*p.add(1) as u32) << 8)
+                        | ((*p.add(2) as u32) << 16) | ((*p.add(3) as u32) << 24)
+                };
+                // Reset complete when the matching change bit latches: C_BH_PORT_RESET (bit 21) for a warm
+                // reset, C_PORT_RESET (bit 20) for a hot one. Some SS hubs assert C_PORT_RESET on a warm
+                // reset too, so accept either on the SS path rather than spin past a genuine completion.
+                if pstatus & done_bit != 0 || (is_ss && pstatus & (1 << 20) != 0) { break; }
             }
-            pstatus = unsafe {
-                let p = buf as *const u8;
-                (*p.add(0) as u32) | ((*p.add(1) as u32) << 8)
-                    | ((*p.add(2) as u32) << 16) | ((*p.add(3) as u32) << 24)
-            };
-            // Reset complete when the matching change bit latches: C_BH_PORT_RESET (bit 21) for a warm
-            // reset, C_PORT_RESET (bit 20) for a hot one. Some SS hubs assert C_PORT_RESET on a warm
-            // reset too, so accept either on the SS path rather than spin past a genuine completion.
-            if pstatus & done_bit != 0 || (is_ss && pstatus & (1 << 20) != 0) { break; }
-        }
-        // Deassert every reset-related change this reset latched so the hub's Status Change Endpoint
-        // can quiesce later: C_PORT_RESET always; on SS additionally C_BH_PORT_RESET (asserted by the
-        // warm reset) and C_PORT_LINK_STATE (the warm reset drives the link U0→Recovery→U0). Leaving
-        // C_PORT_LINK_STATE latched storms the SCE — the same class of defect the hot-plug ack path
-        // (service_one_hub_change) already guards, mirrored here for the one-shot boot walk.
-        let _ = self.sync_control(hub_slot, 0x23, 0x01, 20, port as u16, 0, 0, false); // CLEAR C_PORT_RESET
-        if is_ss {
+            // Deassert every reset-related change this reset latched so the hub's Status Change Endpoint
+            // can quiesce later: C_PORT_RESET always; on SS additionally C_BH_PORT_RESET (asserted by the
+            // warm reset) and C_PORT_LINK_STATE (the warm reset drives the link U0→Recovery→U0). Leaving
+            // C_PORT_LINK_STATE latched storms the SCE — the same class of defect the hot-plug ack path
+            // (service_one_hub_change) already guards, mirrored here for the one-shot boot walk.
+            let _ = self.sync_control(hub_slot, 0x23, 0x01, 20, port as u16, 0, 0, false); // CLEAR C_PORT_RESET
+            if !is_ss { break; } // USB2: reset complete, no SS link training — fall through unchanged.
             let _ = self.sync_control(hub_slot, 0x23, 0x01, 29, port as u16, 0, 0, false); // CLEAR C_BH_PORT_RESET
             let _ = self.sync_control(hub_slot, 0x23, 0x01, 25, port as u16, 0, 0, false); // CLEAR C_PORT_LINK_STATE
+
+            // SS link-training wait: poll wPortStatus until the link reaches U0 and the port enables,
+            // or the per-attempt wall-clock budget expires. PLS = wPortStatus bits 8:5.
+            let start = crate::arch::now_cycles();
+            let budget = crate::arch::hw_wait_budget() / 8; // ~300 ms at the fixed 2.5 s base budget.
+            let mut polls = 0u32;
+            let mut pls = (pstatus >> 5) & 0xF;
+            loop {
+                if pstatus & (1 << 1) != 0 && pls == 0 { trained = true; break; }
+                if crate::arch::now_cycles().wrapping_sub(start) >= budget { break; }
+                for _ in 0..20 { if !self.drain_event_ring_once() { crate::hlt(); } }
+                if self.sync_control(hub_slot, 0xA3, 0x00, 0, port as u16, 4, buf, true).is_err() {
+                    return None;
+                }
+                pstatus = unsafe {
+                    let p = buf as *const u8;
+                    (*p.add(0) as u32) | ((*p.add(1) as u32) << 8)
+                        | ((*p.add(2) as u32) << 16) | ((*p.add(3) as u32) << 24)
+                };
+                pls = (pstatus >> 5) & 0xF;
+                polls += 1;
+                // The link drives C_PORT_LINK_STATE (change bit 6) as it walks to U0; clear it each poll
+                // so the SCE does not storm after we hand the port on.
+                if pstatus & (1 << 6) != 0 {
+                    let _ = self.sync_control(hub_slot, 0x23, 0x01, 25, port as u16, 0, 0, false);
+                }
+            }
+            let elapsed = crate::arch::now_cycles().wrapping_sub(start);
+            if trained {
+                serial_println!(
+                    "xHCI: HUB port {} SS link trained (status {:#x} PLS={} U0, {} polls, {} cyc, attempt {})",
+                    port, pstatus, pls, polls, elapsed, attempt);
+                break;
+            }
+            serial_println!(
+                "xHCI: HUB port {} SS link not trained (status {:#x} PLS={} PED={}, {} polls, {} cyc, attempt {}); {}",
+                port, pstatus, pls, (pstatus >> 1) & 1, polls, elapsed, attempt,
+                if attempt + 1 < max_attempts { "retrying warm reset" } else { "giving up" });
         }
 
         if pstatus & (1 << 1) == 0 {
