@@ -1885,6 +1885,20 @@ fn jd2_console_pump(_arg: usize) {
         // A key repaints the console into the back buffer; when that happens the cursor was erased
         // first (restore, below) and must be re-composited on top after the drain.
         let mut key_repainted = false;
+        // ORIN-POINTER-FIX (regression: keyboard went dead at the panel whenever a pointer was
+        // present). An absolute tablet reports at every poll interval, so it streams MouseAbsolute
+        // into the shared 64-deep event queue continuously — not only on motion. The first cut did
+        // a full save-under `restore`+`draw_over`+`pal.render()` PER pointer event; under that flood
+        // each frame turned into dozens of back-buffer read-backs + a DC-CVAC scanout flush, so the
+        // pump drained the queue slower than the tablet filled it. `EventQueue::push` DROPS silently
+        // when full (pal.rs), so the interleaved `Event::Key` pushes were the casualty — keys never
+        // reached the drain. Pre-JD20 the pump popped-and-ignored the same flood for free and keys
+        // got through. Fix: COALESCE all pointer motion in the frame to a single cursor update
+        // (relative deltas accumulate; absolute takes the last position), so per-frame cursor work
+        // is O(1) regardless of report rate and the drain always keeps pace with the keyboard. Keys
+        // are handled inline and unconditionally, so they flow with zero pointer devices too.
+        let mut pending_rel: Option<(i32, i32)> = None;
+        let mut pending_abs: Option<(i32, i32)> = None;
         while let Some(ev) = unaos_kernel::pal::next_event() {
             match ev {
                 Event::Key(c) => {
@@ -1907,29 +1921,25 @@ fn jd2_console_pump(_arg: usize) {
                     }
                 }
                 Event::Mouse { x, y } => {
+                    // Coalesce: accumulate the relative delta; the cursor moves once, after drain.
+                    let (ax, ay) = pending_rel.unwrap_or((0, 0));
+                    pending_rel = Some((ax + x, ay + y));
                     if !announced {
                         serial_println!(
                             ":: tegra: JD20 — pointer live (relative mouse, cursor on scanout) ::"
                         );
                         announced = true;
                     }
-                    cursor::restore(&mut pal);
-                    cursor::move_rel(x, y, pal.width() as i32, pal.height() as i32);
-                    cursor::draw_over(&mut pal);
-                    needs_render = true;
                 }
                 Event::MouseAbsolute { x, y } => {
+                    // Coalesce: last absolute position in the frame wins (raw HID 0..=32767).
+                    pending_abs = Some((x, y));
                     if !announced {
                         serial_println!(
                             ":: tegra: JD20 — pointer live (absolute tablet, cursor on scanout) ::"
                         );
                         announced = true;
                     }
-                    // Absolute tablet coords are raw HID 0..=32767; `set_abs` scales to the panel.
-                    cursor::restore(&mut pal);
-                    cursor::set_abs(x, y, pal.width() as i32, pal.height() as i32);
-                    cursor::draw_over(&mut pal);
-                    needs_render = true;
                 }
                 Event::Button(mask) => {
                     // Log clicks as a JD2 line for now (no UI action wired yet).
@@ -1938,8 +1948,22 @@ fn jd2_console_pump(_arg: usize) {
                 _ => {}
             }
         }
-        // A key repaint erased the cursor and redrew the console; put the arrow back on top.
-        if key_repainted && cursor::visible() {
+        // One cursor composite for the whole frame's pointer activity — bounded work no matter how
+        // many reports arrived. Any key handled above already erased the cursor and repainted the
+        // console; drawing over the fresh back buffer here re-composites the arrow on top.
+        if pending_rel.is_some() || pending_abs.is_some() {
+            cursor::restore(&mut pal);
+            if let Some((dx, dy)) = pending_rel {
+                cursor::move_rel(dx, dy, pal.width() as i32, pal.height() as i32);
+            }
+            if let Some((ax, ay)) = pending_abs {
+                // Absolute tablet coords are raw HID 0..=32767; `set_abs` scales to the panel.
+                cursor::set_abs(ax, ay, pal.width() as i32, pal.height() as i32);
+            }
+            cursor::draw_over(&mut pal);
+            needs_render = true;
+        } else if key_repainted && cursor::visible() {
+            // A key repaint erased the cursor and redrew the console; put the arrow back on top.
             cursor::draw_over(&mut pal);
         }
         // Auto-hide swept the cursor off this frame: erase it once so no arrow is left parked.
