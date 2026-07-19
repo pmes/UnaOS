@@ -136,6 +136,42 @@ impl FrameBuffer {
         }
     }
 
+    /// Read one pixel back as 0x00RRGGBB, or `None` when out of bounds / format undecodable.
+    /// CURSOR-SAVE-UNDER support — for CACHED-RAM surfaces ONLY (a `Screen` back buffer, an
+    /// fbcon shadow). Never call this on a handle over real VRAM: on the rMBP every read of the
+    /// WC/uncached GOP surface is a PCIe round trip, the exact cost the back buffers exist to
+    /// remove. The one caller (`Screen::read_back_pixel`) reads only its heap store.
+    #[inline]
+    pub fn get_pixel(&self, x: usize, y: usize) -> Option<u32> {
+        if self.base == 0 || x >= self.info.width || y >= self.info.height {
+            return None;
+        }
+        let offset = (y * self.info.stride + x) * self.info.bytes_per_pixel;
+        if offset + self.info.bytes_per_pixel > self.len {
+            return None;
+        }
+        unsafe {
+            let p = (self.base + offset) as *const u8;
+            match self.info.pixel_format {
+                PixelFormat::Rgb => Some(
+                    ((p.read() as u32) << 16)
+                        | ((p.add(1).read() as u32) << 8)
+                        | p.add(2).read() as u32,
+                ),
+                PixelFormat::Bgr => Some(
+                    (p.read() as u32)
+                        | ((p.add(1).read() as u32) << 8)
+                        | ((p.add(2).read() as u32) << 16),
+                ),
+                PixelFormat::U8 => {
+                    let g = p.read() as u32;
+                    Some((g << 16) | (g << 8) | g)
+                }
+                _ => None,
+            }
+        }
+    }
+
     /// VPERF M4 (x86 only): encode `color` as the little-endian 4-byte pixel this surface
     /// stores, when the layout is a full 4-byte pixel (bpp 4, Rgb/Bgr). Lets callers hoist the
     /// per-pixel format decode out of their inner loops (`put_raw4` / the `fill_rows` fast

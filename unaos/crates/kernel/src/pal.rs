@@ -33,6 +33,16 @@ pub enum Event {
 
 pub trait GneissPal {
     fn draw_pixel(&mut self, x: u32, y: u32, color: u32);
+
+    /// CURSOR-SAVE-UNDER: read one pixel back from this surface's own BACK buffer, if it has
+    /// one. Default `None` — a surface with no back buffer cannot offer a cheap read, and the
+    /// front framebuffer is NEVER read back (the WC/write-only VRAM contract). `TargetPal`
+    /// overrides via `Screen::read_back_pixel` (cached heap RAM), which is what lets
+    /// `pal::cursor` stash-and-restore the pixels under the sprite on every surface.
+    fn read_pixel(&self, _x: u32, _y: u32) -> Option<u32> {
+        None
+    }
+
     fn poll_event(&mut self) -> Event;
     fn render(&mut self);
 
@@ -194,9 +204,93 @@ pub mod cursor {
         pal.metrics().scale + 1
     }
 
-    /// The cursor's bounding square in pixels (for erase).
+    /// The sprite's full bounding square in pixels, INCLUDING the (s, s)-offset drop shadow:
+    /// 8·s of arrow plus s of shadow overhang = 9·s. (The old erase used 8·s — the shadow's
+    /// right/bottom overhang was never cleaned, one root cause of the midden cursor trails.)
     pub fn extent(pal: &impl GneissPal) -> usize {
-        8 * sprite_scale(pal)
+        9 * sprite_scale(pal)
+    }
+
+    // --- CURSOR-SAVE-UNDER (metal defect fix: cursor trails across midden) -----------------
+    //
+    // The console (midden) loop repaints nothing per frame, so the old erase pass painted a
+    // FLAT color rect over the sprite's previous position — wrong wherever the sprite crossed
+    // text (grey boxes punched through the prompt), and sized 8·s so the drop shadow's overhang
+    // was never erased at all: motion smeared. Save-under fixes the class for every surface:
+    // before the sprite paints, the pixels beneath its full 9·s bounding box are stashed from
+    // the surface's OWN BACK buffer (cached RAM — `GneissPal::read_pixel`; the front VRAM is
+    // never read back, keeping the WC write-only path), and `restore` puts them back on
+    // move/hide. Full-redraw surfaces (vug/pulse clear every frame) keep the plain `draw`,
+    // which just invalidates the stash — their frame repaint IS the restore.
+
+    /// Stash capacity: the sprite bbox at the max metrics scale (9·(SCALE_MAX+1) per side).
+    const SAVE_SPAN: usize = 9 * (crate::ui::SCALE_MAX + 1);
+
+    struct Saved {
+        valid: bool,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+        px: [u32; SAVE_SPAN * SAVE_SPAN],
+    }
+
+    static SAVED: Mutex<Saved> =
+        Mutex::new(Saved { valid: false, x: 0, y: 0, w: 0, h: 0, px: [0; SAVE_SPAN * SAVE_SPAN] });
+
+    /// Restore the pixels stashed under the sprite (the trail-free replacement for the old
+    /// flat-color `erase`). No-op when nothing is stashed. Call before moving the position and
+    /// when the auto-hide expires; the restored pixels come from the stash, never from VRAM.
+    pub fn restore(pal: &mut impl GneissPal) {
+        let mut s = SAVED.lock();
+        if !s.valid {
+            return;
+        }
+        for row in 0..s.h {
+            for col in 0..s.w {
+                pal.draw_pixel(
+                    (s.x + col) as u32,
+                    (s.y + row) as u32,
+                    s.px[row * SAVE_SPAN + col],
+                );
+            }
+        }
+        s.valid = false;
+    }
+
+    /// Draw the sprite OVER a surface that does not repaint per frame (the midden/console
+    /// path): stash the back-buffer pixels under the sprite's full bounding box first, then
+    /// paint. `restore` undoes it exactly. On a surface with no back buffer (`read_pixel` =
+    /// `None`) the stash is skipped and this degrades to a plain draw — no such surface exists
+    /// on the GUI path today (`TargetPal` is always `Screen`-backed).
+    pub fn draw_over(pal: &mut impl GneissPal) {
+        if !visible() {
+            return;
+        }
+        let (x, y) = pos(pal.width() as i32, pal.height() as i32);
+        let (x, y) = (x.max(0) as usize, y.max(0) as usize);
+        let e = extent(pal);
+        let w = e.min((pal.width() as usize).saturating_sub(x));
+        let h = e.min((pal.height() as usize).saturating_sub(y));
+        {
+            let mut s = SAVED.lock();
+            s.valid = false;
+            if w > 0 && h > 0 && pal.read_pixel(x as u32, y as u32).is_some() {
+                for row in 0..h {
+                    for col in 0..w {
+                        s.px[row * SAVE_SPAN + col] = pal
+                            .read_pixel((x + col) as u32, (y + row) as u32)
+                            .unwrap_or(0);
+                    }
+                }
+                s.x = x;
+                s.y = y;
+                s.w = w;
+                s.h = h;
+                s.valid = true;
+            }
+        }
+        paint(pal);
     }
 
     /// Current position, centring on first use.
@@ -225,14 +319,6 @@ pub mod cursor {
         *POS.lock() = Some((cx, cy));
     }
 
-    /// Paint `color` over the sprite's bounding box (the console loop's erase-before-move; the
-    /// full-screen demos clear every frame and never need it).
-    pub fn erase(pal: &mut impl GneissPal, color: u32) {
-        let (x, y) = pos(pal.width() as i32, pal.height() as i32);
-        let e = extent(pal);
-        pal.draw_rect(x as usize, y as usize, e, e, color);
-    }
-
     /// Draw the arrow sprite at the current position: a one-block-offset drop shadow first, then
     /// the white fill — visible over dark and light content alike. No-op while auto-hidden
     /// (CURSOR-HIDE): call sites need no gating of their own.
@@ -245,6 +331,15 @@ pub mod cursor {
     /// non-answering SMC spun multi-second bounded handshake timeouts every second (fixed in
     /// drivers/smc.rs: stuck-sweep early-abort + failure backoff).
     pub fn draw(pal: &mut impl GneissPal) {
+        // CURSOR-SAVE-UNDER: a full-redraw surface just repainted the whole frame beneath the
+        // sprite — any stash is stale; invalidate it so a later `restore` (back on the console)
+        // can never paint old pixels over a fresh frame.
+        SAVED.lock().valid = false;
+        paint(pal);
+    }
+
+    /// The sprite paint itself (shared by `draw` and `draw_over`). No-op while auto-hidden.
+    fn paint(pal: &mut impl GneissPal) {
         if !visible() {
             return;
         }
@@ -384,6 +479,11 @@ impl<'a> TargetPal<'a> {
 impl<'a> GneissPal for TargetPal<'a> {
     fn draw_pixel(&mut self, x: u32, y: u32, color: u32) {
         self.surface.put_pixel(x as usize, y as usize, color);
+    }
+
+    /// CURSOR-SAVE-UNDER: back-buffer read (cached RAM; the front VRAM is never read).
+    fn read_pixel(&self, x: u32, y: u32) -> Option<u32> {
+        self.surface.read_back_pixel(x as usize, y as usize)
     }
 
     // Override the trait defaults to use the surface's bulk ops: one back-buffer fill + one

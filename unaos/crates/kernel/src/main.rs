@@ -1120,38 +1120,41 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 }
                 unaos_kernel::pal::Event::Mouse { x, y } => {
                     had_event = true;
-                    // CURSOR-VIS: the shared metrics-scaled arrow sprite (pal::cursor) replaces
-                    // the old unscaled 10×10 square — near-invisible at Retina pixel density.
-                    // Erase-at-old, move, draw-at-new (the console loop repaints nothing else).
-                    unaos_kernel::pal::cursor::erase(&mut pal, 0x001E1E1E);
+                    // CURSOR-SAVE-UNDER (metal defect fix: trails across midden): restore the
+                    // pixels stashed under the sprite, move, then stash-and-draw at the new
+                    // position. The console repaints nothing per frame, so the sprite must be
+                    // fully self-undoing — the old flat-color erase punched grey boxes through
+                    // text and missed the drop shadow's overhang, smearing motion.
+                    unaos_kernel::pal::cursor::restore(&mut pal);
                     unaos_kernel::pal::cursor::move_rel(
                         x, y,
                         pal.width() as i32,
                         pal.height() as i32,
                     );
-                    unaos_kernel::pal::cursor::draw(&mut pal);
+                    unaos_kernel::pal::cursor::draw_over(&mut pal);
                 }
                 unaos_kernel::pal::Event::MouseAbsolute { x, y } => {
                     had_event = true;
-                    // CURSOR-VIS: absolute report (0..=32767 HID space), same shared sprite.
-                    unaos_kernel::pal::cursor::erase(&mut pal, 0x001E1E1E);
+                    // CURSOR-SAVE-UNDER: absolute report (0..=32767 HID space), same sprite.
+                    unaos_kernel::pal::cursor::restore(&mut pal);
                     unaos_kernel::pal::cursor::set_abs(
                         x, y,
                         pal.width() as i32,
                         pal.height() as i32,
                     );
-                    unaos_kernel::pal::cursor::draw(&mut pal);
+                    unaos_kernel::pal::cursor::draw_over(&mut pal);
                 }
                 // Timer / Unknown: nothing to do.
                 _ => {}
             }
         }
 
-        // CURSOR-HIDE: erase the sprite once when the auto-hide delay expires (reappearance is
-        // instant — the Mouse/MouseAbsolute arms above stamp the activity clock before drawing).
+        // CURSOR-HIDE: restore the pixels under the sprite once when the auto-hide delay
+        // expires (reappearance is instant — the Mouse/MouseAbsolute arms above stamp the
+        // activity clock before drawing).
         let cursor_vis = unaos_kernel::pal::cursor::visible();
         if cursor_was_visible && !cursor_vis {
-            unaos_kernel::pal::cursor::erase(&mut pal, 0x001E1E1E);
+            unaos_kernel::pal::cursor::restore(&mut pal);
         }
         cursor_was_visible = cursor_vis;
 

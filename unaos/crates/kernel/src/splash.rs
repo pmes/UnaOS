@@ -37,7 +37,23 @@
 #![cfg(target_arch = "x86_64")]
 
 use crate::video::framebuffer::FrameBuffer;
+use core::sync::atomic::{AtomicBool, Ordering};
 use unaos_boot_info::FrameBufferInfo;
+
+/// SPLASH-SEAMLESS: set once the splash has rendered. While up, `fbcon::milestone` goes
+/// serial/ring-only — the QUIET-PANEL milestone lines used to text-paint straight over the
+/// crystal (the "jolting flash between splash and midden" metal observation: the VUG-POLISH-2
+/// handoff reorder un-garbled the prompt but re-homed the milestone burst onto the splash
+/// window). The bootlog ring still records every milestone (the `bootlog` shell verb reads it
+/// on-panel) and serial still carries them; only the on-splash text paint is suppressed. A
+/// panic is NOT gated on this — `fbcon::panic_screen` repaints its own red backdrop first.
+static SPLASH_UP: AtomicBool = AtomicBool::new(false);
+
+/// Whether the splash currently owns the pre-GUI panel (never true on
+/// usbdebug/bootlog/witness builds — main.rs gates the paint off them).
+pub fn active() -> bool {
+    SPLASH_UP.load(Ordering::Relaxed)
+}
 
 /// Splash backdrop — near-black, so the beam and spectrum carry the frame.
 const SPLASH_BG: u32 = 0x0006_0608;
@@ -412,6 +428,10 @@ pub fn boot_splash(base: usize, len: usize, info: FrameBufferInfo) {
             );
         }
     }
+
+    // SPLASH-SEAMLESS: from here until the GUI's first frame, nothing text-paints over the
+    // crystal (fbcon::milestone checks this flag; see its doc for the metal defect).
+    SPLASH_UP.store(true, Ordering::Relaxed);
 
     serial_println!(":: SPLASH: crystal cluster traced — 3 shards, {} spectrum rays ::", NRAYS);
 }
