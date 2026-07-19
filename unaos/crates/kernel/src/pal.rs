@@ -24,6 +24,9 @@ pub enum Event {
     Key(u8),
     Mouse { x: i32, y: i32 },
     MouseAbsolute { x: i32, y: i32 },
+    /// CLICK-1: a pointer button-DOWN edge (payload = the report's button bitmask, bit 0 = primary).
+    /// Emitted once per press by the HID decoders (edge-detected there); release emits nothing.
+    Button(u8),
     None,
     Unknown,
 }
@@ -141,6 +144,7 @@ pub trait GneissPal {
 // Now every screen-owning loop shares this position and draws the same metrics-scaled arrow.
 pub mod cursor {
     use super::GneissPal;
+    use core::sync::atomic::{AtomicU64, Ordering};
     use spin::Mutex;
 
     /// 8×8 arrow mask, MSB = leftmost pixel.
@@ -161,6 +165,29 @@ pub mod cursor {
     /// console loop and the full-screen demos all move/draw the same cursor.
     static POS: Mutex<Option<(i32, i32)>> = Mutex::new(None);
 
+    // CURSOR-HIDE (metal verdict, 2026-07-18): the cursor auto-hides after ~1.5 s without pointer
+    // input and reappears instantly on the next report (`move_rel`/`set_abs` stamp the activity
+    // clock, and every draw site runs AFTER the frame's input drain). It also starts hidden — no
+    // arrow parked mid-screen on a keyboard-only session. `draw()` self-gates on `visible()`, so
+    // every existing call site inherits the behaviour without changes.
+    /// Auto-hide delay in ms without pointer input.
+    const HIDE_AFTER_MS: u64 = 1500;
+    /// ms() timestamp of the last pointer report; 0 = never (cursor starts hidden).
+    static LAST_INPUT_MS: AtomicU64 = AtomicU64::new(0);
+
+    /// Stamp the pointer-activity clock (a real report just arrived).
+    fn touch() {
+        // `.max(1)` keeps 0 reserved as the "never" sentinel even if ms() is still 0 at boot.
+        LAST_INPUT_MS.store(crate::arch::ms().max(1), Ordering::Relaxed);
+    }
+
+    /// Whether the cursor should currently be on screen: some pointer input has ever arrived and
+    /// the last report is younger than the auto-hide delay.
+    pub fn visible() -> bool {
+        let t = LAST_INPUT_MS.load(Ordering::Relaxed);
+        t != 0 && crate::arch::ms().wrapping_sub(t) < HIDE_AFTER_MS
+    }
+
     /// Sprite magnification: one step above the text scale so the cursor reads at a glance
     /// (16 px at the 480p QEMU panel, 24 px on the 2880×1800 Retina).
     fn sprite_scale(pal: &impl GneissPal) -> usize {
@@ -179,12 +206,14 @@ pub mod cursor {
 
     /// Apply a relative motion report (trackpad/mouse dx,dy), clamped to the panel.
     pub fn move_rel(dx: i32, dy: i32, w: i32, h: i32) {
+        touch();
         let (x, y) = pos(w, h);
         set_clamped(x + dx, y + dy, w, h);
     }
 
     /// Apply an absolute report in the 0..=32767 HID coordinate space, scaled to the panel.
     pub fn set_abs(ax: i32, ay: i32, w: i32, h: i32) {
+        touch();
         let x = ((ax as i64 * w as i64) / 32767) as i32;
         let y = ((ay as i64 * h as i64) / 32767) as i32;
         set_clamped(x, y, w, h);
@@ -205,21 +234,41 @@ pub mod cursor {
     }
 
     /// Draw the arrow sprite at the current position: a one-block-offset drop shadow first, then
-    /// the white fill — visible over dark and light content alike.
+    /// the white fill — visible over dark and light content alike. No-op while auto-hidden
+    /// (CURSOR-HIDE): call sites need no gating of their own.
+    ///
+    /// Cost note (metal verdict): each glyph row draws as merged horizontal RUNS (≤2 rects/row)
+    /// rather than one rect per set bit — the sprite is a handful of small back-buffer fills per
+    /// frame, and inside the full-screen demos (which clear + full-flush every frame anyway) it
+    /// adds no flush area at all. The vug slowdown observed alongside CURSOR-VIS was NOT this
+    /// sprite: it was the SMC battery sweep the same commit hung on the meter cadence, which on a
+    /// non-answering SMC spun multi-second bounded handshake timeouts every second (fixed in
+    /// drivers/smc.rs: stuck-sweep early-abort + failure backoff).
     pub fn draw(pal: &mut impl GneissPal) {
+        if !visible() {
+            return;
+        }
         let (x, y) = pos(pal.width() as i32, pal.height() as i32);
         let s = sprite_scale(pal);
         for &(ox, oy, color) in &[(s, s, SHADOW), (0, 0, FILL)] {
             for (row, bits) in ARROW.iter().enumerate() {
-                for col in 0..8 {
+                let mut col = 0usize;
+                while col < 8 {
                     if bits & (0x80 >> col) != 0 {
+                        let mut run = 1usize;
+                        while col + run < 8 && bits & (0x80 >> (col + run)) != 0 {
+                            run += 1;
+                        }
                         pal.draw_rect(
                             (x as usize) + col * s + ox,
                             (y as usize) + row * s + oy,
-                            s,
+                            run * s,
                             s,
                             color,
                         );
+                        col += run;
+                    } else {
+                        col += 1;
                     }
                 }
             }

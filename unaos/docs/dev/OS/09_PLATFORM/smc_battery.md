@@ -179,3 +179,30 @@ gate; items 6–8 confirm the GAP 1 / GAP 2 data-phase fix (see the section abov
    `AC-W` `BC2V`) is gone once the clean drain leaves the SMC idle between transactions.
 8. The idle-guard (`settle_before_command`) never has to drain residue on a healthy SMC — an honest
    check that GAP 2 was truly downstream of GAP 1 and not a second independent defect.
+
+## GUI-build dead-SMC investigation (2026-07-18, arc 4 of the sitting-1 verdicts)
+
+Fourth consecutive data point: GUI/sched_demo builds read `SMC-BATT present=false` on every metal
+boot while a usbdebug build on the same machine, same day, read `present=true soc=51%`. A source
+diff of everything that runs before the first SMC read found **no feature-gated difference in the
+SMC path itself** — scout and first battery sweep fire from the same `pci::init` site in both
+builds, after the same ACPI/calibrate/SMP/EHCI bring-up. The two real differences are *timing*
+(the GUI's quiet-panel boot reaches `pci::init` much earlier than the fbcon-heavy usbdebug boot —
+the "scout too early relative to EC readiness" hypothesis stays open) and *scheduling* (sched_demo
+APs + 1 kHz heartbeats live during the transactions). Neither is proven; per the directive the
+driver now carries **unconditional first-failure instrumentation** so the next sitting captures
+wire truth:
+
+* `:: SMC-DIAG: pre-touch t=<ms> raw status=<byte> ::` — timestamp + cold status byte before the
+  first transaction of the boot (compares first-touch time across builds).
+* `:: SMC-DIAG: FIRST FAILURE key <k> kind <absent|stuck> step <n> t=<ms> — raw status timeline
+  [16 bytes, ~15 µs apart] == evidence ::` — one-shot, fires on the boot's first failed key read
+  from any path, usbdebug-independent, read-only (status reads only). Dead-flat `00`/`ff` vs
+  busy-wedged vs oscillating status distinguishes absent-device / wedged-handshake / EC-not-ready.
+
+Perf coupling fixed the same arc (the "cursor slows vug" metal verdict was actually this): on an
+unresponsive SMC each battery sweep burned up to ~16 bounded stuck-handshake budgets (~0.1 s each)
+on the vug meter cadence, every second. Now a sweep whose FIRST key comes back Stuck aborts the
+rest (one-shot noted line), and consecutive failed sweeps back the refresh interval off 1 s → 32 s
+(reset by any good sweep). Clean-`Absent` sweeps (QEMU) still probe every key — the QEMU witness
+lines are unchanged apart from the additive SMC-DIAG lines.
