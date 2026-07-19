@@ -35,12 +35,15 @@
 // the first metal exercise of JM4's VLPIS-derived stride.
 //
 // The secondaries do their per-core GICv3 bring-up, prove cross-core SGI (BSP → each AP, and each AP →
-// BSP), then — ORIN-SMP-RUN — run their one-shot cooperative pass (`run_secondary_work`) and enter the
-// preemptive scheduler `run()` loop via `sched::secondary_run`, becoming SCHED-BAL participants (they
-// set `ONLINE` and the balancer may place/steal work onto them). This path runs the scheduler at EL2
-// (the primitives are EL-neutral) with AP periodic ticks DEFERRED (JC3 — a second core arming the
-// shared tick clock double-counts the wall-clock budgets), so `run()` idles on WFI woken by the
-// reschedule SGI rather than a local tick; work always arrives with an `IPI_RESCHED` poke.
+// BSP), then — ORIN-SMP-RUN — run their one-shot cooperative pass (`run_secondary_work`), arm their OWN
+// per-core generic-timer tick (JC3, `timer::arm_this_core_ap`), and enter the preemptive scheduler
+// `run()` loop via `sched::secondary_run`, becoming SCHED-BAL participants (they set `ONLINE` and the
+// balancer may place/steal work onto them). This path runs the scheduler at EL2 (the primitives are
+// EL-neutral). JC3 promotes the JC2-deferred AP timer: each AP's tick is LOCAL-ONLY (it advances only
+// that core's `percpu.ticks`, never the shared `TICKS`/`ms()` wall-clock — the double-count that held
+// it back), so `run()` now idles on WFI woken by the AP's OWN tick as well as the reschedule SGI —
+// self-driven re-poll every ~4 ms rather than SGI-only. Work still also arrives with an `IPI_RESCHED`
+// poke; the tick is the belt-and-braces wake for when a cross-core poke is slow/lost (boot-11 metal).
 //
 // The whole module is `#[cfg(not(feature = "pi"))]` (baremetal implies pi, so it is compiled out of
 // every Pi image). The `virt` kick-off in `main.rs` is additionally runtime-gated on `gic::is_v3()`, so
@@ -313,6 +316,17 @@ extern "C" fn __secondary_rust_virt(_advisory: u64) -> ! {
     // before. The spin-for-release inside waits with IRQ unmasked, so the BSP→AP ping still lands.
     sched::run_secondary_work(core);
 
+    // JC3 — arm THIS secondary's OWN periodic generic-timer tick (its redistributor PPI 30) before it
+    // enters `run()`. This is the promotion of the JC2-deferred "AP timer PPI stretch": a tickless AP's
+    // only idle wake was the reschedule SGI, and on Orin metal (boot-11) that wake did not reliably
+    // land, so placed burst work stranded on a parked AP. With its own tick this core re-polls its run
+    // queue / attempts a steal every ~4 ms — a self-driven scheduler participant, no longer
+    // SGI-dependent. `arm_this_core_ap` registers the core LOCAL-ONLY, so its tick advances only its
+    // per-CPU `percpu.ticks` and never the shared `TICKS`/`ms()` wall-clock (the double-count that held
+    // this back). The tick does not preempt here (the `virt`/tegra `run()` path leaves `SCHED_ACTIVE`
+    // false and `handle_irq_v3` calls only `on_tick`) — it just breaks the idle WFI so the loop re-polls.
+    timer::arm_this_core_ap();
+
     // ORIN-SMP-RUN: enter the preemptive scheduler `run()` loop instead of the old `note_core_idle`
     // + WFI park. `secondary_run` sets `ONLINE[core]` first thing, so this formerly-parked secondary
     // becomes a SCHED-BAL participant — the balancer can place woken/spawned migratable work here and
@@ -323,9 +337,27 @@ extern "C" fn __secondary_rust_virt(_advisory: u64) -> ! {
     //
     // IRQs are unmasked, so a BSP → AP reschedule SGI still lands and is serviced (handle_irq_v3
     // counts it): inside `run()` it breaks the idle WFI so newly-placed/stealable work is picked up.
-    // AP periodic ticks stay DEFERRED (JC3); `run()` idles on WFI woken by the reschedule SGI, which
-    // is exactly how `make_ready`/`spawn_balanced` poke a target core. Never returns.
+    // With JC3 the AP's own tick is now a SECOND, self-driven wake (belt and braces with the poke),
+    // so work is picked up within a tick even if a cross-core poke is slow/lost. Never returns.
     sched::secondary_run(core)
+}
+
+/// JC3 (SGI audit) — translate a LINEAR core index into the `gic::send_sgi` target for the GICv3 path:
+/// the core's packed MPIDR affinity {Aff3,Aff2,Aff1,Aff0} as published in `AFF_BY_INDEX`. On the v3 CPU
+/// interface `send_sgi` routes by affinity via `ICC_SGI1R_EL1` — NOT by a linear/CPU-interface index —
+/// so a caller holding only a linear index (the scheduler's `poke_cpu`) must map it here first. On QEMU
+/// `virt` affinity == index (single cluster, Aff0 = index), so this is the identity there; on
+/// multi-cluster Tegra234 the cluster is in Aff2/Aff1 and Aff0 is always 0, so the linear index is NOT a
+/// valid SGI target — passing it unmapped is the boot-11 defect where a reschedule poke never woke the
+/// AP. Falls back to the index itself if it is not a published core (out of range / table not yet
+/// published), which preserves the pre-JC3 QEMU-virt behaviour. `pub` for `sched::poke_cpu`.
+pub fn sgi_target_for_index(idx: usize) -> usize {
+    let n = N_CORES_PUB.load(Ordering::Acquire) as usize;
+    if idx < n && idx < MAX_CORES {
+        AFF_BY_INDEX[idx].load(Ordering::Relaxed) as usize
+    } else {
+        idx
+    }
 }
 
 /// Issue a PSCI fast call via the **SMC** conduit and return x0 (0/positive = result, else negative

@@ -789,8 +789,14 @@ fn poke_cpu(target: usize) {
         // branch is never taken (self-poke is skipped), so the `virt` value is only ever a compile target.
         #[cfg(feature = "baremetal")]
         super::gic::send_sgi(target, super::smp::IPI_RESCHED);
+        // JC3 (SGI audit): on the GICv3 `virt`/tegra path `send_sgi` routes by MPIDR AFFINITY (via
+        // `ICC_SGI1R_EL1`), not by the linear core index. `target` is a linear index, so map it to the
+        // core's published affinity first — identity on QEMU `virt` (index == affinity), but load-bearing
+        // on multi-cluster Tegra234 (Aff0 = 0, cluster in Aff2/Aff1) where the raw index is not a valid
+        // SGI target and an unmapped poke never woke the AP (boot-11). The AP's own JC3 tick is the
+        // second, self-driven wake, so a poke is no longer the sole path either way.
         #[cfg(not(feature = "baremetal"))]
-        super::gic::send_sgi(target, 0);
+        super::gic::send_sgi(super::smp_virt::sgi_target_for_index(target), 0);
     }
 }
 
@@ -1372,10 +1378,14 @@ pub fn wait_and_run(cpu: usize) -> ! {
 /// rather than waiting for a flag that never flips. `run()`'s idle path bumps `CPU_IDLE` on every
 /// empty dispatch, subsuming the honest-idle heartbeat the removed `note_core_idle` park provided.
 ///
-/// AP periodic ticks stay DEFERRED on this path (JC3 — a second core arming the shared tick clock
-/// double-counts the wall-clock budgets), so `run()`'s idle WFI wakes only on a reschedule/BSP SGI,
-/// not a local tick. That is sufficient: `make_ready`/`spawn_balanced` poke the target with
-/// `IPI_RESCHED`, so newly-placed or stealable work always breaks the WFI. Never returns.
+/// JC3 landed the AP periodic tick: the caller (`smp_virt::__secondary_rust_virt`) arms this core's
+/// own local-only generic-timer tick (`timer::arm_this_core_ap`) before this call, so `run()`'s idle
+/// WFI now wakes on the AP's OWN tick every ~4 ms as well as on a reschedule/BSP SGI — the core
+/// re-polls its run queue / attempts a steal self-driven, no longer SGI-dependent. The local-only tick
+/// advances only this core's `percpu.ticks`, never the shared `TICKS`/`ms()` clock (the double-count
+/// that deferred it in JC2). `make_ready`/`spawn_balanced` still poke the target with a (now
+/// affinity-targeted) `IPI_RESCHED` for prompt wakeups; the tick is the belt-and-braces backstop.
+/// Never returns.
 pub fn secondary_run(cpu: usize) -> ! {
     run(cpu)
 }

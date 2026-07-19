@@ -118,13 +118,34 @@ are load-bearing and were the subject of the **SCHED-BURST-FIX** arc:
 - The cooperative boot core is an online scheduler participant too, but it marks
   itself `ONLINE` inside `run_burst` (it never runs the `run()` seam that does so
   for secondaries) — otherwise the witness under-counts the online cores by one.
-- Under **JC3** the APs are tickless: an idle AP's only wake is the reschedule
-  SGI (`poke_cpu`). If that cross-core wake is slow or lost on metal, a placed
-  burst task would strand on a parked AP. The cooperative driver therefore
-  **steal-drains** while it waits — it pulls stranded work back to itself and
-  runs it — so the burst always drains (no teardown wedge) and the steal is
-  recorded, so the witness shows steals > 0. A lost-progress spin ceiling emits
-  an explicit timeout witness rather than hanging silently.
+- **JC3 — per-core AP timer tick.** Each GICv3 secondary now arms its OWN
+  periodic generic-timer tick (`timer::arm_this_core_ap`) before entering
+  `run()`, so it re-polls its run queue / attempts a steal every ~4 ms — a
+  self-driven scheduler participant rather than reschedule-SGI-dependent. This
+  promotes the JC2-deferred "AP timer PPI stretch": the deferral existed because
+  `on_tick` bumps the shared monotonic `TICKS` that feeds `ticks()`/`ms()`, so a
+  second ticking core would inflate the wall-clock budget. JC3 contains that with
+  a **local-only** tick: `arm_this_core_ap` registers the core in `AP_LOCAL_TICK`,
+  and such a core advances only its per-CPU `percpu.ticks` (its scheduler clock,
+  which also drives `sleep_ticks`), never the shared `TICKS`. The boot core stays
+  the sole global-clock owner. Each AP prints one witness line on its first tick
+  (`:: AARCH64 SMP: cN timer PPI live (tick 1) ::`), quiet after. The tick does
+  not preempt on this EL2 `run()` path (`SCHED_ACTIVE` stays false; `handle_irq_v3`
+  calls only `on_tick`) — it just breaks the idle WFI so the loop re-polls.
+- **SGI audit (JC3).** The reschedule poke (`poke_cpu`) targeted `gic::send_sgi`
+  with the LINEAR core index, but the GICv3 CPU interface routes SGIs by MPIDR
+  **affinity** (`ICC_SGI1R_EL1`). On QEMU `virt` affinity == index so it worked;
+  on multi-cluster Tegra234 (Aff0 = 0, cluster in Aff2/Aff1) the raw index is not
+  a valid target, so a poke never woke the AP — the boot-11 metal symptom. Fixed:
+  `poke_cpu` maps the index to the core's published affinity
+  (`smp_virt::sgi_target_for_index`) first. The JC3 tick is the belt-and-braces
+  second wake, so placed/stealable work is picked up within a tick even if a poke
+  is slow or lost.
+- Belt and braces, the cooperative burst driver still **steal-drains** while it
+  waits — it pulls any stranded work back to itself and runs it — so the burst
+  always drains (no teardown wedge) and the steal is recorded (witness shows
+  steals > 0). A lost-progress spin ceiling emits an explicit timeout witness
+  rather than hanging silently.
 
 ## 5. Status and limitations
 
