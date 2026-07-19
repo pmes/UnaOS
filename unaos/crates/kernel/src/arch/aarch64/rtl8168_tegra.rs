@@ -230,6 +230,9 @@ mod metal {
     // frames, ALWAYS a full line for any BOOTP/DHCP (UDP port 67/68) frame, and a per-category tally
     // for a single window-close summary. Reads frame bytes only; writes no device register.
     const NET4D_FULL_LINES: u64 = 8;
+    /// NET-4k: bound on the per-boot socket-originated DHCP TX witness lines (DISCOVER + a handful of
+    /// REQUEST retries is the realistic worst case; the bound only guards a pathological retransmit storm).
+    const NET4K_TX_WITNESS_MAX: u64 = 16;
     const RXCAT_N: usize = 6;
     const RXCAT_ARP: usize = 0;
     const RXCAT_DHCP: usize = 1;
@@ -500,6 +503,9 @@ mod metal {
         /// NET-4d: classification is live only across the DHCP discover window; closed at window end
         /// so the post-window bounded ICMP poll does not re-classify.
         rxcls_active: bool,
+        /// NET-4k: how many socket-originated DHCP frames we have witnessed on TX so far — bounds the
+        /// TX-type witness noise to `NET4K_TX_WITNESS_MAX` (DHCP TX is inherently low-volume anyway).
+        dhcp_tx_witnessed: u64,
     }
 
     // The driver owns raw DMA pointers; on the single-CPU main-loop/poll discipline it is only ever
@@ -707,17 +713,27 @@ mod metal {
         /// wait (bounded) for the NIC to clear OWN. A stalled link leaves OWN set — surfaced, not
         /// silently counted. Mirrors the e1000 `transmit` head/tail discipline.
         fn transmit(&mut self, frame: &[u8]) {
-            // NET-4d: capture the DHCP DISCOVER's transaction id the first time we send one, so the
-            // RX-window classifier can match/mismatch inbound OFFERs against it. Read-only parse.
-            if self.d_xid.is_none() {
-                if let Some(di) = decode_dhcp(frame) {
-                    if di.op == 1 && di.mtype == 1 {
-                        self.d_xid = Some(di.xid);
-                        serial_println!(
-                            "{}   [net4d] TX DHCP DISCOVER xid={:#010x} (udp {}->{}, {} bytes) — captured for RX xid-match ::",
-                            P4, di.xid, di.sport, di.dport, frame.len()
-                        );
-                    }
+            // NET-4k: witness EVERY socket-originated DHCP frame we transmit, BY MESSAGE TYPE — not just
+            // the first DISCOVER. The R23s1 boot-13 blind spot the poll-cadence audit exposed: the old
+            // probe fired ONLY for the first DISCOVER (the d_xid capture) and net4c fired ONLY on
+            // tx_count==1, so a smoltcp-emitted REQUEST left NO serial trace at all. "No REQUEST line"
+            // therefore could NOT distinguish "the dhcpv4 socket never emitted a REQUEST" (a frame-accept
+            // problem above the driver) from "the REQUEST was sent but un-witnessed" (the drop is the ACK,
+            // or the wire). This line resolves it: if the socket accepts the OFFER and dispatches a
+            // REQUEST, boot-14 shows `[net4k] TX DHCP 3(REQUEST) ...` on the way to the NIC. Read-only
+            // parse; the classifier's DISCOVER-xid capture is preserved.
+            if let Some(di) = decode_dhcp(frame) {
+                // Preserve the NET-4d classifier's correlation: capture the DISCOVER's xid once.
+                if self.d_xid.is_none() && di.op == 1 && di.mtype == 1 {
+                    self.d_xid = Some(di.xid);
+                }
+                if self.dhcp_tx_witnessed < NET4K_TX_WITNESS_MAX {
+                    self.dhcp_tx_witnessed += 1;
+                    serial_println!(
+                        "{}   [net4k] TX DHCP {}({}) xid={:#010x} (udp {}->{}, {} bytes) tx#{} ::",
+                        P4, di.mtype, dhcp_mtype_name(di.mtype), di.xid, di.sport, di.dport,
+                        frame.len(), self.tx_count + 1
+                    );
                 }
             }
             let i = self.tx_cur;
@@ -947,6 +963,22 @@ mod metal {
                 P4, if is_bcast { "broadcast" } else { "unicast" },
                 di.yiaddr[0], di.yiaddr[1], di.yiaddr[2], di.yiaddr[3]
             );
+            // NET-4k: the RTL8168 C+ RX engine reports the received length INCLUDING the 4-byte Ethernet
+            // FCS (Linux r8169 subtracts 4: `pkt_size = (status & 0x3fff) - 4`); `rx_frame_raw` does NOT,
+            // so smoltcp is handed `frame` with the FCS (and any short-frame padding) still appended. This
+            // normally parses fine — smoltcp bounds L3/L4 by the IP/UDP length fields — but a length-driven
+            // divergence between the driver's tolerant re-decode and smoltcp's own parse is exactly the
+            // RTL8168-specific effect QEMU's virtio path (which strips the FCS) cannot reproduce. Witness
+            // the delta so boot-14 shows whether excess trailing bytes reach the socket. Read-only.
+            if frame.len() >= 18 {
+                let ip_total = u16::from_be_bytes([frame[16], frame[17]]) as usize;
+                let eth_total = 14 + ip_total;
+                let trailing = frame.len().saturating_sub(eth_total);
+                serial_println!(
+                    "{}   [net4k] OFFER frame len={} ip_total={} eth+ip={} trailing={} B (FCS/pad handed to smoltcp; r8169 strips 4) ::",
+                    P4, frame.len(), ip_total, eth_total, trailing
+                );
+            }
             // NET-4j: the smoltcp dhcpv4 socket applies gates ABOVE the driver's three. Compute each and
             // name the FIRST one this frame fails — the definitive localization the boot-11 "passes ALL
             // driver-visible checks" line could not give (it never inspected these). The NET-4j reproducer
@@ -1753,6 +1785,7 @@ mod metal {
             rxcls_full: 0,
             rxcat: [0; RXCAT_N],
             rxcls_active: true,
+            dhcp_tx_witnessed: 0,
         };
 
         // ── M2/M3 GUARD: poison-honest readback through the NEW window BEFORE any register write ──

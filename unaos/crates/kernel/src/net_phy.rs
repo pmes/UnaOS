@@ -250,9 +250,15 @@ pub fn dhcp_or_static<D: Device>(
 
     serial_println!("{} NET: DHCP discover (timeout {} ms) ::", prefix, timeout_ms);
     let start = now_ms();
+    // NET-4k poll-cadence witness: count how many times we drive `iface.poll` across the window. The
+    // Orin RTL8168 no-lease audit put the poll/dispatch cadence under suspicion; this busy loop is the
+    // exact seam the QEMU `vnet` path leases through, so surfacing the poll count on BOTH outcomes lets
+    // boot-14 compare the metal cadence against the known-good virtio lease directly.
+    let mut polls: u64 = 0;
     loop {
         let t = now_ms();
         iface.poll(Instant::from_millis(t), dev, &mut sockets);
+        polls += 1;
 
         match sockets.get_mut::<dhcpv4::Socket>(handle).poll() {
             Some(dhcpv4::Event::Configured(cfg)) => {
@@ -264,11 +270,12 @@ pub fn dhcp_or_static<D: Device>(
                 let srv = cfg.server.address.octets();
                 apply_ipv4(iface, ip, prefix_len, gw);
                 serial_println!(
-                    "{} NET: DHCP lease ip={}.{}.{}.{}/{} gw={}.{}.{}.{} (server {}.{}.{}.{}) => PASS ::",
+                    "{} NET: DHCP lease ip={}.{}.{}.{}/{} gw={}.{}.{}.{} (server {}.{}.{}.{}) after {} polls => PASS ::",
                     prefix,
                     ip[0], ip[1], ip[2], ip[3], prefix_len,
                     gw[0], gw[1], gw[2], gw[3],
                     srv[0], srv[1], srv[2], srv[3],
+                    polls,
                 );
                 return NetConfig { leased: true, ip, prefix_len, gw };
             }
@@ -279,8 +286,8 @@ pub fn dhcp_or_static<D: Device>(
         if now_ms().saturating_sub(start) >= timeout_ms {
             apply_ipv4(iface, static_ip, static_prefix, static_gw);
             serial_println!(
-                "{} NET: no lease within {} ms — falling back to static {}.{}.{}.{}/{} gw {}.{}.{}.{} ::",
-                prefix, timeout_ms,
+                "{} NET: no lease within {} ms ({} polls) — falling back to static {}.{}.{}.{}/{} gw {}.{}.{}.{} ::",
+                prefix, timeout_ms, polls,
                 static_ip[0], static_ip[1], static_ip[2], static_ip[3], static_prefix,
                 static_gw[0], static_gw[1], static_gw[2], static_gw[3],
             );

@@ -756,6 +756,49 @@ broadcast-vs-unicast handling (smoltcp intercepts a unicast OFFER to `yiaddr` *b
 address check, so an address-less interface still receives it). Weakening smoltcp's RX checksum
 verification was explicitly rejected (a protection, not a bug).
 
+## NET-4k — the poll/dispatch cadence, run to ground (QEMU refutes it) + the REQUEST-TX blind spot closed
+
+R23s1 boot-13 sharpened the NET-4j picture: the OFFER passed **every** smoltcp gate (the driver's
+`[net4j] smoltcp ACCEPT` verdict — IPv4 csum OK, UDP csum OK, `chaddr == MAC`, server-id present) yet
+still no REQUEST reached the wire and no lease followed. With frame content exonerated on silicon, the
+`iface.poll` / dispatch **cadence** of the `dhcp_or_static` window loop was the last standing suspect.
+
+**Refuted, empirically.** The aarch64 `vnet` path drives the *identical* `dhcp_or_static` loop over a
+real `virtio-net` ring under QEMU against slirp's DHCP server, and it **leases**:
+`AARCH64 VNET: NET: DHCP lease ip=10.0.2.15/24 gw=10.0.2.2 (server 10.0.2.2) after 3 polls => PASS`.
+Three `iface.poll` calls take the socket Discovering → Requesting → ACK end-to-end. The busy loop is
+correct; the poll cadence is not the defect. (The NET-4j reproducer independently proves the socket
+emits a REQUEST for a well-formed OFFER.) This closes the cadence hypothesis without a metal boot.
+
+**The blind spot the audit exposed (and closed).** The boot-13 claim "no REQUEST TX line appears" was
+**not** proof the socket never emitted one: the driver's TX witnesses only ever fired for the *first*
+DISCOVER (the `d_xid` capture) and for `tx_count == 1` (`[net4c]`). A smoltcp-emitted REQUEST — the
+*second* DHCP TX — left **no serial trace at all**. So "no REQUEST line" could not distinguish
+"socket never emitted a REQUEST" (a frame-accept problem *above* the driver) from "REQUEST sent but
+un-witnessed" (the drop is the ACK, or the wire). The instrumentation now resolves it on one boot:
+
+- **`[net4k] TX DHCP <type> …`** (`arch/aarch64/rtl8168_tegra.rs::transmit`) witnesses **every**
+  socket-originated DHCP frame by message type (bounded), not just the first DISCOVER. If the dhcpv4
+  socket accepts the OFFER and dispatches a REQUEST, boot-14 shows `[net4k] TX DHCP 3(REQUEST) …` on
+  the way to the NIC — the definitive "did the socket emit it" answer.
+- **`[net4k] OFFER frame len=… ip_total=… trailing=… B`** (`net4d_offer_check`) surfaces the trailing
+  bytes handed to smoltcp. The RTL8168 C+ RX engine reports the received length **including** the
+  4-byte Ethernet FCS (Linux r8169 subtracts 4: `pkt_size = (status & 0x3fff) - 4`); `rx_frame_raw`
+  does not. smoltcp normally bounds L3/L4 by the IP/UDP length fields so this parses regardless, but a
+  length-driven divergence is exactly the RTL8168-specific effect QEMU's virtio path (which strips the
+  FCS) cannot reproduce — so it is now witnessed rather than assumed benign.
+- **`… after N polls => PASS` / `no lease within … (N polls) …`** (`net_phy.rs::dhcp_or_static`)
+  surfaces the poll count on both outcomes, so the metal cadence is directly comparable to the
+  known-good virtio lease (`after 3 polls`).
+
+**Expected boot-14 lines.** Either a lease —
+`:: PCIE4: NET: DHCP lease ip=… gw=… (server …) after <N> polls => PASS ::` (preceded by
+`:: PCIE4:   [net4k] TX DHCP 3(REQUEST) xid=0x51fb1e94 … tx#2 ::`) — **or** the named miss: if
+`[net4k] TX DHCP 3(REQUEST)` never prints, the dhcpv4 socket did not accept the (gate-passing) OFFER,
+localizing the defect to a length/parse divergence the `trailing=…` line quantifies; if it *does*
+print yet no lease follows, the REQUEST left the NIC and the drop is the inbound ACK (RX), not the
+DISCOVER→REQUEST cadence. Metal-only: none of this path compiles or runs under QEMU (no Tegra234 RC).
+
 ## The road from here
 
 | Arc | Content |
