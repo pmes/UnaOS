@@ -6694,3 +6694,28 @@ inbound path was built and armed, layer by layer, and finally root-caused **back
 `0x200` IOB `FillWrite` RAS, `[net4m]` all-**nonzero** across the ring, and the DHCP **ACK** lands → a
 `[dhcp]` lease instead of the `[static]` fallback. QEMU cannot exercise the tegra path; the gates prove
 non-regression only.
+
+- **NET-4n2 — PCIDAC is written but does not LATCH; re-apply it as the FINAL `CPlusCmd` write.** Boot-17
+  showed the RMW **issue then revert**: `>>> REG WRITE (NET-4n): CPlusCmd[0xe0] 0x2021 -> 0x2031` at the
+  top of `init_rings`, but the rings-up readback came back `CPlusCmd 0x2021 PCIDAC=0 (64-bit DMA NOT
+  latched)` — bit 4 dropped during the ring/`RxEnb`/`RCR` programming, and the DHCP still no-leased with the
+  same `0x200` FillWrite RAS. **Which cause:** the two candidates were (1) a later `CPlusCmd` write clobbers
+  it, or (2) the write needs a config-unlock/ordering window. A **static trace rules out (1)**: the pre-ring
+  RMW is the **only** write to `CPlusCmd` (`0xE0`) in the driver, it already sits inside the `CFG9346`
+  unlock window, and **no** register programmed after it aliases `0xE0/0xE1` (`RDSAR`@`0xE4`, `RMS`@`0xDA`,
+  `MTPS`@`0xEC`, `TCR`@`0x40`, `RCR`@`0x44`, `CR`@`0x37` all miss it). So the revert is **silicon**: this
+  RTL8168 does not hold the DAC bit when it is set **before** the descriptor engine is armed (the r8169
+  order writes `C+CR` late). **Fix:** re-apply `PCIDAC` as the **final `CPlusCmd` write** — after `RCR`,
+  still inside the `9346` unlock window, as an RMW with a bounded 3-attempt confirm loop and an **immediate
+  readback** printed after the store; the `9346` lock moves to after it so the store lands unlocked. The
+  pre-ring set is kept (its delta vs. the final re-read is the revert oracle), and the rings-up `PCIDAC=N`
+  line remains the second, independent confirmation.
+
+  **Expected boot-18 (metal-owed):** `>>> REG WRITE (NET-4n2): CPlusCmd[0xe0] 0x2021 -> 0x2031 (re-apply
+  PCIDAC — final C+CR write, post-RCR; attempt 0)` immediately followed by `CPlusCmd readback after final
+  write = 0x2031 PCIDAC=1 (LATCHED)`, then `rings up: … CPlusCmd 0x2031 PCIDAC=1 (64-bit DMA ENABLED)`,
+  **no** `0x200` IOB `FillWrite` RAS, `[net4m]` all-**nonzero**, and the DHCP **ACK** → a `[dhcp]` lease.
+  The decisive negative branch: if the readback stays `0x2031`→`0x2021` after the final write under unlock,
+  the loud `!! NET-4n2: PCIDAC WILL NOT LATCH …` line proves the C+ 64-bit-DAC path unusable on this
+  silicon and hands off to the **sub-4 GiB DMA-arena** fallback (a separate arc — touches heap/arena
+  placement, not started here). QEMU cannot exercise the tegra path; the gates prove non-regression only.

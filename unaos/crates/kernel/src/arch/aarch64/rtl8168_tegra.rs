@@ -113,9 +113,21 @@
 // silicon is provably 64-bit-DMA-capable (it fetches the >4 GiB ring). Nothing below the driver changes;
 // the NET-4h iATU already covers the true buffer PAs, so the now-untruncated writes land. If a metal
 // boot shows the truncation survive PCIDAC, the fallback is the 32-bit-arena fork (drive the rings via a
-// sub-4 GiB DMA alias — a tegra-local net-lane arena, still no allocator change). Boot-17 confirms:
-// `CPlusCmd .. PCIDAC=1 (64-bit DMA ENABLED)` at rings-up, no 0x200 IOB RAS, `[net4m]` all-nonzero, and
-// the DHCP ACK lands -> `[dhcp]` lease.
+// sub-4 GiB DMA alias — a tegra-local net-lane arena, still no allocator change).
+//
+// ## NET-4n2 — PCIDAC is written but does not LATCH from a pre-ring store; re-apply it as the final C+CR write.
+//
+// Boot-17 showed the RMW issue then REVERT: `CPlusCmd 0x2021 -> 0x2031` written at the top of
+// `init_rings`, but the rings-up readback came back `0x2021` (bit 4 clear) — the DHCP still no-leased with
+// the same `0x200` FillWrite RAS. Static trace RULES OUT a later clobber: the pre-ring RMW is the ONLY
+// write to CPlusCmd (0xE0) in this driver, it is inside the 9346 unlock window, and no register written
+// after it aliases 0xE0/0xE1 (RDSAR@0xE4, RMS@0xDA, MTPS@0xEC, TCR@0x40, RCR@0x44, CR@0x37 all miss it).
+// So the cause is silicon, not software: this RTL8168 does not hold the DAC bit set BEFORE the descriptor
+// engine is armed (the r8169 order writes C+CR late). NET-4n2 re-applies PCIDAC as the FINAL C+CR write —
+// after RCR, still under 9346 unlock — as an RMW with a bounded confirm loop and an immediate readback, so
+// boot-18 is decisive: `CPlusCmd 0x2031 PCIDAC=1 (64-bit DMA ENABLED)` at rings-up, no `0x200` IOB RAS,
+// `[net4m]` all-nonzero, and the DHCP ACK lands -> `[dhcp]` lease; OR the readback stays `0x2021` after
+// the final write under unlock, proving the C+ DAC path unusable on this silicon (-> sub-4 GiB arena arc).
 //
 // ## Write discipline
 //
@@ -737,9 +749,13 @@ mod metal {
             // register write; announced). This is the brief's PREFERRED "silicon-is-64-bit-capable" fork
             // (the RDSAR >4 GiB fetch proves it is); the sub-4 GiB DMA-arena fork is the fallback if a
             // metal boot shows the truncation survives PCIDAC.
+            // NET-4n2: this is the FIRST of two PCIDAC writes. Boot-17 proved it does NOT survive the ring
+            // programming that follows (read back 0x2021), so a second, decisive re-apply runs as the FINAL
+            // C+CR write after RCR (see below). Keep this one: the delta between it and the final re-read is
+            // the oracle for whether the pre-ring store reverts on this silicon.
             let cpc_dac = cpc | CPCMD_PCIDAC;
             serial_println!(
-                "{}   >>> REG WRITE (NET-4n): CPlusCmd[{:#x}] {:#06x} -> {:#06x} (set PCIDAC — enable 64-bit >4GiB buffer DMA) ::",
+                "{}   >>> REG WRITE (NET-4n): CPlusCmd[{:#x}] {:#06x} -> {:#06x} (set PCIDAC — enable 64-bit >4GiB buffer DMA; initial, pre-ring) ::",
                 P4, REG_CPLUSCMD, cpc, cpc_dac
             );
             self.w16(REG_CPLUSCMD, cpc_dac);
@@ -778,7 +794,50 @@ mod metal {
             serial_println!("{}   >>> REG WRITE (M2): RCR[{:#x}] = {:#010x} (promiscuous bring-up) ::", P4, REG_RCR, rcr);
             self.w32(REG_RCR, rcr);
 
-            // Re-lock the config registers.
+            // NET-4n2 — PCIDAC did not LATCH from the pre-ring write. Boot-17: the RMW above wrote
+            // CPlusCmd 0x2021 -> 0x2031 at the TOP of bring-up, but the rings-up readback (below) read
+            // 0x2021 — bit 4 dropped during the ring/RxEnb/RCR programming. Static trace RULES OUT a later
+            // clobber: the RMW above is the ONLY write to CPlusCmd (0xE0) in this driver, it sits inside the
+            // 9346 unlock window, and no register programmed after it aliases 0xE0/0xE1 (RDSAR@0xE4,
+            // RMS@0xDA, MTPS@0xEC, TCR@0x40, RCR@0x44, CR@0x37 all miss it). So the bit is not surviving
+            // being set BEFORE the descriptor engine is armed — the r8169 order writes C+CR late, and some
+            // RTL8168 variants only latch the DAC bit as the final C+CR state. Re-apply PCIDAC HERE, as the
+            // last CPlusCmd write — after RCR arms reception, still inside the unlock window — as a
+            // read-modify-write with a bounded confirm loop, and print the immediate readback so the capture
+            // shows the exact store that does or does not stick. This makes boot-18 decisive: either PCIDAC
+            // reads back set here (>4 GiB payloads land → LEASE) or it provably will not latch even as the
+            // final write under unlock (→ the sub-4 GiB DMA-arena fallback, a separate arc).
+            let mut cpc_final = self.r16(REG_CPLUSCMD);
+            let mut latched = cpc_final & CPCMD_PCIDAC != 0;
+            for attempt in 0..3u8 {
+                if latched {
+                    break;
+                }
+                let want = cpc_final | CPCMD_PCIDAC;
+                serial_println!(
+                    "{}   >>> REG WRITE (NET-4n2): CPlusCmd[{:#x}] {:#06x} -> {:#06x} (re-apply PCIDAC — final C+CR write, post-RCR; attempt {}) ::",
+                    P4, REG_CPLUSCMD, cpc_final, want, attempt
+                );
+                self.w16(REG_CPLUSCMD, want);
+                unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
+                cpc_final = self.r16(REG_CPLUSCMD);
+                latched = cpc_final & CPCMD_PCIDAC != 0;
+                serial_println!(
+                    "{}   CPlusCmd readback after final write = {:#06x} PCIDAC={} ({}) ::",
+                    P4, cpc_final, (cpc_final >> 4) & 1,
+                    if latched { "LATCHED" } else { "still clear — retrying" }
+                );
+            }
+            if !latched {
+                // Decisive negative: PCIDAC will not hold even as the final write under 9346 unlock. The
+                // C+ DAC path is unusable on this silicon → the sub-4 GiB DMA-arena fallback (separate arc).
+                serial_println!(
+                    "{}   !! NET-4n2: PCIDAC WILL NOT LATCH (CPlusCmd stays {:#06x} after the final write under 9346 unlock) — C+ 64-bit-DAC path unusable on this silicon; fallback = sub-4GiB DMA arena ::",
+                    P4, cpc_final
+                );
+            }
+
+            // Re-lock the config registers (AFTER the final PCIDAC re-apply so the store lands unlocked).
             self.w8(REG_CFG9346, CFG9346_LOCK);
 
             // Polled bring-up: mask every interrupt source, clear any latched status (write-1-to-clear).
