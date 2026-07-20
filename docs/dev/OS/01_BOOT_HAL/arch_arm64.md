@@ -6787,10 +6787,12 @@ non-regression only.
   **no** `0x200` IOB `FillWrite` RAS, `[net4m]` all-**nonzero**, and the DHCP **ACK** → a `[dhcp]` lease.
   The decisive negative branch: if the readback stays `0x2031`→`0x2021` after the final write under unlock,
   the loud `!! NET-4n2: PCIDAC WILL NOT LATCH …` line proves the C+ 64-bit-DAC path unusable on this
-  silicon and hands off to the **sub-4 GiB DMA-arena** fork — **now landed as NET-4o (below)**. QEMU
-  cannot exercise the tegra path; the gates prove non-regression only.
+  silicon and hands off to a placement/reachability fork — first attempted as the **sub-4 GiB DMA-arena**
+  (NET-4o, below), which boot-19 proved impossible on this board, then resolved by the **inbound-iATU alias**
+  (NET-4p, below). QEMU cannot exercise the tegra path; the gates prove non-regression only.
 
-- **NET-4o — PCIDAC won't latch (boot-18 settled it): give the NIC a sub-4 GiB DMA arena.** Boot-18 fired
+- **NET-4o — PCIDAC won't latch (boot-18 settled it): give the NIC a sub-4 GiB DMA arena. `[REVERTED —
+  boot-19]`** Boot-18 fired
   the decisive negative: `!! NET-4n2: PCIDAC WILL NOT LATCH … C+ 64-bit-DAC path unusable on this silicon`,
   `[net4m] rx[1..5] nonzero=false`, `NET: no lease`. The C+ engine's `PCIDAC` bit does not hold on this
   RTL8168 variant even as the final `CPlusCmd` write under `9346` unlock, so the **per-buffer payload DMA is
@@ -6825,3 +6827,53 @@ non-regression only.
   (`NET: DHCP lease …` / `[dhcp]`). QEMU cannot exercise the tegra path; the gates prove non-regression only
   (default `check` + `UNAOS_NET4=1 UNAOS_TEGRA=1` `check`, default `test-arm`, and the `UNAOS_VNET` seam
   regression — vnet lease + the NET-4j reproducer stay PASS).
+
+- **NET-4p — no clean low DRAM exists: keep the buffers HIGH and ALIAS the truncation (the correct IOMMU
+  use).** Boot-19 refuted NET-4o's premise: `!! NET-4o: no sub-4GiB DMA arena seated (mmu_tegra HEAP-GUARD
+  found no clean low span) — REFUSING`. The window `[0x8000_0000, 0x1_0000_0000)` = `[2 GiB, 4 GiB)` is
+  packed with Tegra firmware carveouts (OPTEE `CO:43 @0xbe000000`, BPMP/TSEC/…) + UEFI reservations — there
+  is **no** carveout-clean 256 KiB span, so the arena can never seat and the NIC never comes up. The sub-4 GiB
+  arena fork is **dead** on this board. NET-4o is **REVERTED** — both `mmu_tegra::select_heap_region`'s arena
+  selection (`net4_dma_arena`, `NET4O_ARENA_*`, `lowest_clean_in`) and the driver's `DmaArena`; rings +
+  buffers return to the **high kernel heap** (pre-NET-4o `alloc::alloc::alloc_zeroed`), so there is no
+  fail-closed low-arena path and the NIC boots.
+
+  **The alias.** The inbound iATU translates PCIe bus addresses → CPU/fabric addresses. The C+ engine's
+  per-buffer payload write is permanently 32-bit (`Desc.addr[31:0]`; PCIDAC won't latch), so a high-heap
+  buffer PA `0x2683cbXXX` truncates to `0x683cbXXX` — **below** the `0x8000_0000` identity base → no inbound
+  region matches → the `0x200` `FillWrite` slave-error + a zeroed buffer. NET-4p adds, per DMA buffer span,
+  a dedicated **inbound-iATU ALIAS region** that maps the **low-32-bit alias** of the span back to the real
+  high PA: `BASE = buf_pa & 0xFFFF_FFFF`, `LIMIT = BASE + span − 1`, `TARGET = buf_pa`. The NIC's truncated
+  write to `BASE + off` now MATCHES and translates to `buf_pa + off` = the real high buffer — **no
+  truncation loss, buffers stay in the high heap, no clean low DRAM needed.** Only the **RX and TX buffer
+  spans** are aliased: the descriptor **ring** is fetched/written back through the dedicated 64-bit
+  `RDSAR`/`TNPDS` path (metal-proven un-truncated — the ring stayed coherent while the payloads vanished), so
+  it needs no alias. RX and TX buffers are separate heap allocations, so each gets its own region on a spare
+  inbound index (**1** = RX, **2** = TX; index **0** = the NET-4h identity region).
+
+  **Where it's done (self-contained tegra/net lane).** `program_inbound_alias` (`rtl8168_tegra.rs`) programs
+  the regions from `init_rings`, right after the buffers are allocated and **before** `RxEnb`/`TxEnb`, so the
+  first payload write is already covered. `mmu_tegra` is only *reverted* here — no new mmu logic; the shared
+  allocator is untouched.
+
+  **Collision check (critical, fail-closed — `arm_one_alias`).** Before arming, each alias window is checked
+  and the whole ring bring-up **refuses** on any collision: (a) a span already sub-4 GiB inside the identity
+  region needs no alias (truncation is a no-op) — skipped; (b) a truncated span crossing the 4 GiB boundary
+  can't be one contiguous region — refused; (c) overlap with the NET-4h **identity inbound region** — refused
+  (so a successfully-armed alias is always **< the DRAM base**); (d) overlap with controller-0's **PCIe
+  MEM/BAR window** (`ranges`, resolved from the DTB) — refused (peer-to-peer mis-route hazard); plus a check
+  that the RX and TX alias windows don't overlap each other. The **MSI doorbell** needs no separate test: a
+  firmware-allocated MSI target page lives in DRAM (`≥` the DRAM base), and any armed alias is `<` the DRAM
+  base by (c), so an alias can never collide with it — the one sub-DRAM-base inbound hazard is the PCIe
+  MEM/BAR window, which **is** checked. On the observed placement (buffer alias `~0x683cbXXX ≈ 1.63 GiB`,
+  DRAM base `0x8000_0000 = 2 GiB`, PCIe MEM window at `0x4000_0000`) the alias is clear of both.
+
+  **Expected boot-20 (metal-owed):** at ring bring-up, `[net4p] inbound iATU ALIAS region 1 (rx-buffers) …
+  truncated PCIe DMA [0x683c…..] -> real DRAM 0x2683c… (up-translate)` and `region 2 (tx-buffers) …`, each
+  followed by `[net4p] alias region N … readback: BASE=… LIMIT=… TARGET=0x2… CTRL2=0x8… (enabled=1)` (the
+  **alias witness**); the NET-4n2 `!! PCIDAC WILL NOT LATCH … EXPECTED — NET-4p's inbound-iATU alias makes
+  32-bit payload DMA sufficient`; **no** `0x200` IOB `FillWrite` RAS; `[net4m]` **all nonzero** (the ACK
+  lands in a reachable buffer); and the DHCP **lease** (`NET: DHCP lease …` / `[dhcp]`). QEMU cannot exercise
+  the tegra path; the gates prove non-regression only (default `check` + `UNAOS_NET4=1 UNAOS_TEGRA=1` `check`,
+  default `test-arm`, and the `UNAOS_GICV3=1 UNAOS_WITNESS=1 UNAOS_VNET=1 test-arm` seam regression — vnet
+  lease + the NET-4j reproducer stay PASS).

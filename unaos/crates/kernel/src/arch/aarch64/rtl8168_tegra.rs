@@ -127,7 +127,33 @@
 // after RCR, still under 9346 unlock — as an RMW with a bounded confirm loop and an immediate readback, so
 // boot-18 is decisive: `CPlusCmd 0x2031 PCIDAC=1 (64-bit DMA ENABLED)` at rings-up, no `0x200` IOB RAS,
 // `[net4m]` all-nonzero, and the DHCP ACK lands -> `[dhcp]` lease; OR the readback stays `0x2021` after
-// the final write under unlock, proving the C+ DAC path unusable on this silicon (-> sub-4 GiB arena arc).
+// the final write under unlock, proving the C+ DAC path unusable on this silicon (-> a reachability arc).
+//
+// ## NET-4o (REVERTED) then NET-4p — no clean low DRAM exists; keep buffers HIGH + alias the truncation.
+//
+// Boot-18 fired the decisive negative: PCIDAC will NOT latch even as the final C+CR write under 9346
+// unlock, so the per-buffer payload DMA is 32-bit only (`Desc.addr[31:0]`) — permanently. NET-4o tried the
+// obvious fork (seat the whole NIC DMA surface in a sub-4 GiB arena so a 32-bit address reaches it), but
+// boot-19 proved that IMPOSSIBLE on this board: `!! NET-4o: no sub-4GiB DMA arena seated (HEAP-GUARD found
+// no clean low span)`. The window [0x8000_0000, 0x1_0000_0000) = [2 GiB, 4 GiB) is packed with Tegra
+// firmware carveouts (OPTEE CO:43 @0xbe000000, BPMP/TSEC/etc.) + UEFI reservations — no clean span. NET-4o
+// is REVERTED (both its mmu_tegra arena selection and this driver's DmaArena); the rings + buffers go back
+// to the high kernel heap (pre-NET-4o `alloc_zeroed`).
+//
+// NET-4p is the correct use of the IOMMU: keep the buffers HIGH and add INBOUND-iATU ALIAS regions that
+// catch the NIC's truncated 32-bit writes and translate them BACK UP to the real high PAs. The NIC
+// truncates buffer PA 0x2683cbXXX -> 0x683cbXXX (below the 0x8000_0000 identity base -> the 0x200 sink).
+// So for each buffer span program an inbound region: BASE = `buf_pa & 0xFFFF_FFFF`, LIMIT = BASE+span-1,
+// TARGET = `buf_pa` (the real high PA). The NIC's write to `BASE+off` now MATCHES and translates to
+// `buf_pa+off` — no truncation loss, buffers stay in the high heap, no clean low DRAM needed. The
+// descriptor RING is fetched/written back via the 64-bit RDSAR/TNPDS path (metal-proven un-truncated — the
+// ring stayed coherent while payloads vanished), so ONLY the RX/TX buffer spans need an alias (spare
+// inbound indices 1 & 2; index 0 = the NET-4h identity region). CRITICAL collision check before arming
+// (see `arm_one_alias`): the alias window must not overlap the identity inbound region or controller-0's
+// PCIe MEM/BAR window, and cannot cross the 4 GiB boundary — fail-closed otherwise. A successfully-armed
+// alias is always < the DRAM base (a firmware MSI target lives in DRAM, so no MSI collision is possible).
+// Boot-20 oracle: `[net4p] alias region … readback … enabled=1`, `[net4m]` all-nonzero, no `0x200` IOB
+// RAS, DHCP LEASE.
 //
 // ## Write discipline
 //
@@ -186,8 +212,9 @@ mod metal {
     use super::P4;
     use crate::arch::aarch64::cache;
     use crate::arch::aarch64::fdt_tegra::Fdt;
-    use crate::arch::aarch64::mmu_tegra::{map_mmio_window, net4_dma_arena, MmioMap};
+    use crate::arch::aarch64::mmu_tegra::{map_mmio_window, MmioMap};
     use crate::net_phy::{fmt_mac, RawNic, SmoltcpPhy};
+    use core::alloc::Layout;
     use core::ptr::{read_volatile, write_volatile};
 
     /// The Realtek vendor id and the RTL8168/8111 device id the NET-3 metal enumeration found.
@@ -559,60 +586,27 @@ mod metal {
     /// Downstream device config base = ECAM base + bus1:dev0:fn0 offset (`bus<<20 | dev<<15 | fn<<12`).
     const BUS1_DEV0_FN0: u64 = 1 << 20;
 
-    /// NET-4o — a dead-simple bump allocator over the sub-4GiB NIC DMA arena `mmu_tegra` seated
-    /// (identity-mapped Normal-WB RAM in `[0x8000_0000, 0x1_0000_0000)`, carveout-clean, inside the
-    /// inbound iATU window). The C+ engine's per-buffer payload DMA is 32-bit only on this silicon
-    /// (PCIDAC won't latch, boot-18), so EVERY DMA-touched allocation — rings + buffers — comes from
-    /// here: below the 4 GiB truncation ceiling yet at/above the 0x8000_0000 inbound base. Never freed
-    /// (bring-up lifetime); no global-allocator involvement. `base` doubles as the PA (identity map).
-    struct DmaArena {
-        base: usize,
-        size: usize,
-        cursor: usize,
-    }
-
-    impl DmaArena {
-        /// Read the arena `mmu_tegra::select_heap_region` seated; unseated → an empty arena that fails
-        /// every allocation closed (the driver then refuses ring bring-up rather than truncate).
-        fn from_mmu() -> Self {
-            match net4_dma_arena() {
-                Some((base, size)) => Self { base, size, cursor: 0 },
-                None => Self { base: 0, size: 0, cursor: 0 },
-            }
-        }
-        /// `(base, size)` iff the arena is seated.
-        fn bounds(&self) -> Option<(u64, usize)> {
-            (self.base != 0 && self.size != 0).then_some((self.base as u64, self.size))
-        }
-        /// Bump `bytes` (aligned to `align`), zero them, and return the pointer — or `None` if the arena
-        /// is unseated or exhausted (fail-closed). Zeroing matches the old `alloc_zeroed` contract the
-        /// ring/descriptor setup relies on (TX `addr=0`, empty-ring OWN-clear). The returned span is
-        /// identity-mapped RAM, so the pointer IS the DMA physical address.
-        fn alloc_zeroed(&mut self, bytes: usize, align: usize) -> Option<*mut u8> {
-            if self.base == 0 || self.size == 0 {
-                return None;
-            }
-            let start = (self.base + self.cursor).checked_add(align - 1)? & !(align - 1);
-            let end = start.checked_add(bytes)?;
-            if end > self.base + self.size {
-                return None; // arena exhausted
-            }
-            self.cursor = end - self.base;
-            let p = start as *mut u8;
-            unsafe { core::ptr::write_bytes(p, 0, bytes) };
-            Some(p)
-        }
-    }
-
     /// The claimed NIC: its register-BAR MMIO base, the station MAC, and the C+ RX/TX descriptor
-    /// rings + DMA buffers. NET-4o: rings + buffers are bump-allocated from the sub-4GiB DMA arena
-    /// (`self.arena`), NOT the high kernel heap — the identity map ⇒ the pointer doubles as the physical
-    /// address the NIC DMAs against, and being < 4 GiB a 32-bit payload address reaches it un-truncated.
+    /// rings + DMA buffers. The rings are allocated from the kernel heap (identity map ⇒ the pointer
+    /// doubles as the physical address the NIC DMAs against, exactly like the x86 e1000 driver).
     pub struct Rtl8168 {
         mmio_base: u64,
         mac: [u8; 6],
-        /// NET-4o: the sub-4GiB DMA arena the rings + buffers below are bump-allocated from.
-        arena: DmaArena,
+        /// NET-4p: controller-0's DWC iATU register block base. The inbound-iATU ALIAS regions (which
+        /// catch the NIC's truncated 32-bit payload writes and up-translate them to the real high-heap
+        /// buffer PAs) are programmed from `init_rings` — the only place the buffer PAs are known — so the
+        /// driver keeps the ATU base to reach the inbound region slots after allocation.
+        atu_base: u64,
+        /// NET-4p: the NET-4h identity inbound region `[ident_lo, ident_hi)` (all of RAM). The alias
+        /// collision check refuses any alias window that would overlap it (an overlap would let two
+        /// inbound regions match the same bus address, shadowing/ambiguating the translation).
+        ident_lo: u64,
+        ident_hi: u64,
+        /// NET-4p: controller-0's PCIe MEM `ranges` window `[mem_lo, mem_hi)` — where downstream BARs
+        /// decode. The alias collision check refuses any alias window overlapping it (an inbound write
+        /// into that range risks peer-to-peer routing to a BAR instead of upstream to the RC).
+        mem_lo: u64,
+        mem_hi: u64,
         rx_ring: *mut Desc,
         rx_buffers: *mut u8,
         rx_cur: usize,
@@ -720,24 +714,16 @@ mod metal {
             mac
         }
 
-        /// Allocate the RX descriptor ring (256-byte aligned) + contiguous packet buffers FROM THE
-        /// SUB-4GiB DMA ARENA (NET-4o), and point each descriptor at its buffer with OWN set (ready for
-        /// the NIC to fill) and the buffer size in the length field. The arena pointer doubles as the
-        /// physical address (identity map) AND is < 4 GiB, so the C+ engine's 32-bit payload write
-        /// reaches it un-truncated. EOR marks the last descriptor. Returns false if the arena is unseated
-        /// or exhausted (the caller fails closed rather than truncate a high-heap address).
-        fn alloc_rx(&mut self) -> bool {
-            let ring = match self.arena.alloc_zeroed(NUM_RX * core::mem::size_of::<Desc>(), 256) {
-                Some(p) => p as *mut Desc,
-                None => return false,
-            };
-            let bufs = match self.arena.alloc_zeroed(NUM_RX * RX_BUF_SIZE, 4096) {
-                Some(p) => p,
-                None => return false,
-            };
-            self.rx_ring = ring;
-            self.rx_buffers = bufs;
-            // NET-4f: the buffer arena is zeroed on alloc → DIRTY zero lines resident in the D-cache.
+        /// Allocate the RX descriptor ring (256-byte aligned) + contiguous packet buffers, and point
+        /// each descriptor at its buffer with OWN set (ready for the NIC to fill) and the buffer size
+        /// in the length field. The `alloc_zeroed` pointer doubles as the physical address (identity
+        /// map), matching the x86 e1000 ring allocation. EOR marks the last descriptor.
+        fn alloc_rx(&mut self) {
+            let ring_layout = Layout::from_size_align(NUM_RX * core::mem::size_of::<Desc>(), 256).unwrap();
+            let buf_layout = Layout::from_size_align(NUM_RX * RX_BUF_SIZE, 4096).unwrap();
+            self.rx_ring = unsafe { alloc::alloc::alloc_zeroed(ring_layout) as *mut Desc };
+            self.rx_buffers = unsafe { alloc::alloc::alloc_zeroed(buf_layout) };
+            // NET-4f: the buffer arena is `alloc_zeroed` → DIRTY zero lines resident in the D-cache.
             // Invalidate the whole arena BEFORE any descriptor is armed, so (a) those dirty zeros can
             // never be written back over the NIC's DMA payload and (b) no stale line lingers to be hit
             // instead of the NIC's DRAM write. `dc ivac` (invalidate, not clean) is required — a clean
@@ -754,28 +740,118 @@ mod metal {
                 };
                 unsafe { write_volatile(self.rx_ring.add(i), d) };
             }
-            true
         }
 
-        /// Allocate the TX descriptor ring (256-byte aligned) + frame buffers FROM THE SUB-4GiB DMA
-        /// ARENA (NET-4o). Descriptors start host-owned (OWN clear) so `transmit` can post into them; EOR
-        /// marks the last descriptor. Returns false if the arena is unseated or exhausted.
-        fn alloc_tx(&mut self) -> bool {
-            let ring = match self.arena.alloc_zeroed(NUM_TX * core::mem::size_of::<Desc>(), 256) {
-                Some(p) => p as *mut Desc,
-                None => return false,
-            };
-            let bufs = match self.arena.alloc_zeroed(NUM_TX * TX_BUF_SIZE, 4096) {
-                Some(p) => p,
-                None => return false,
-            };
-            self.tx_ring = ring;
-            self.tx_buffers = bufs;
+        /// Allocate the TX descriptor ring (256-byte aligned) + frame buffers. Descriptors start
+        /// host-owned (OWN clear) so `transmit` can post into them; EOR marks the last descriptor.
+        fn alloc_tx(&mut self) {
+            let ring_layout = Layout::from_size_align(NUM_TX * core::mem::size_of::<Desc>(), 256).unwrap();
+            let buf_layout = Layout::from_size_align(NUM_TX * TX_BUF_SIZE, 4096).unwrap();
+            self.tx_ring = unsafe { alloc::alloc::alloc_zeroed(ring_layout) as *mut Desc };
+            self.tx_buffers = unsafe { alloc::alloc::alloc_zeroed(buf_layout) };
             for i in 0..NUM_TX {
                 let eor = if i == NUM_TX - 1 { DESC_EOR } else { 0 };
                 let d = Desc { opts1: eor, opts2: 0, addr: 0 };
                 unsafe { write_volatile(self.tx_ring.add(i), d) };
             }
+        }
+
+        /// NET-4p — arm the inbound-iATU ALIAS regions that catch the NIC's TRUNCATED 32-bit payload
+        /// writes and translate them back up to the real (high-heap) buffer PAs. Called from
+        /// `init_rings` AFTER `alloc_rx`/`alloc_tx` (the PAs are known) and BEFORE `RxEnb`/`TxEnb` (the
+        /// first payload write is already covered). The C+ engine's per-buffer payload write uses only
+        /// `Desc.addr[31:0]` (PCIDAC won't latch — boot-18), so a high-heap buffer PA truncates to its
+        /// low 32 bits; an inbound region matching that truncated address, targeting the real PA, is the
+        /// reachability lever that keeps the buffers in the high heap (NET-4o's sub-4 GiB arena was
+        /// impossible — no clean low DRAM on this board). RX and TX buffers are SEPARATE heap allocations
+        /// (not contiguous), so each gets its own region (spare inbound indices 1 and 2; index 0 = the
+        /// NET-4h identity region). The descriptor RING is fetched/written back via the 64-bit
+        /// RDSAR/TNPDS path — metal-proven un-truncated (the ring stayed coherent while the payloads
+        /// vanished) — so ONLY the buffer spans need an alias. Returns false (fail-closed) on a collision.
+        fn arm_dma_aliases(&self) -> bool {
+            let rx_lo = self.rx_buffers as u64;
+            let rx_len = (NUM_RX * RX_BUF_SIZE) as u64;
+            let tx_lo = self.tx_buffers as u64;
+            let tx_len = (NUM_TX * TX_BUF_SIZE) as u64;
+            // Guard against the RX and TX alias windows overlapping each other (two separate heap
+            // allocations whose low-32 aliases land within a span of each other) — that would make two
+            // inbound regions match the same truncated bus address. Distinct allocations at distinct PAs
+            // make this all but impossible, but check it rather than trust it.
+            let rx_alias = rx_lo & 0xFFFF_FFFF;
+            let tx_alias = tx_lo & 0xFFFF_FFFF;
+            if rx_alias < tx_alias + tx_len && tx_alias < rx_alias + rx_len {
+                serial_println!(
+                    "{}   !! [net4p] RX alias [{:#x}..+{:#x}) and TX alias [{:#x}..+{:#x}) OVERLAP — REFUSING (ambiguous inbound match) ::",
+                    P4, rx_alias, rx_len, tx_alias, tx_len
+                );
+                return false;
+            }
+            self.arm_one_alias(1, rx_lo, rx_len, "rx-buffers")
+                && self.arm_one_alias(2, tx_lo, tx_len, "tx-buffers")
+        }
+
+        /// NET-4p — arm ONE inbound-iATU alias region for the buffer span `[span_pa, span_pa+span_len)`,
+        /// with the CRITICAL collision check. `alias = span_pa & 0xFFFF_FFFF` is the address the NIC's
+        /// 32-bit payload write actually presents on the bus; the region maps
+        /// `BASE=alias, LIMIT=alias+span_len-1, TARGET=span_pa`, so an inbound write to `alias+off` is
+        /// translated to `span_pa+off` = the real buffer byte. Fail-closed on any collision:
+        ///   * a span already sub-4 GiB and inside the identity region needs NO alias (truncation is a
+        ///     no-op; the identity region already reaches it) — skip cleanly;
+        ///   * a truncated span crossing the 4 GiB boundary can't be one contiguous region — REFUSE;
+        ///   * overlap with the NET-4h identity inbound region (a successfully-armed alias is therefore
+        ///     always `< ident_lo`, i.e. below the DRAM base) — REFUSE;
+        ///   * overlap with controller-0's PCIe MEM/BAR window (peer-to-peer mis-route hazard) — REFUSE.
+        /// The MSI doorbell needs no separate check here: a firmware-allocated MSI target page lives in
+        /// DRAM (`>= ident_lo`), and any armed alias is `< ident_lo` by the identity-overlap refusal
+        /// above, so an alias can never collide with it; the one sub-DRAM-base inbound hazard is the
+        /// PCIe MEM/BAR window, which IS checked. Returns false to fail the whole ring bring-up closed.
+        fn arm_one_alias(&self, index: u64, span_pa: u64, span_len: u64, tag: &str) -> bool {
+            let alias = span_pa & 0xFFFF_FFFF;
+            // Case A — the span is already sub-4 GiB and inside the identity inbound region: the 32-bit
+            // truncation is a no-op (alias == span_pa) and NET-4h's identity region already reaches it.
+            // No alias needed (and arming one would collide with identity). This is the low-heap path.
+            if span_pa == alias && alias >= self.ident_lo && alias + span_len <= self.ident_hi {
+                serial_println!(
+                    "{}   [net4p] {} span [{:#x}..{:#x}) already sub-4GiB inside the identity inbound region [{:#x}..{:#x}) — no alias needed ::",
+                    P4, tag, span_pa, span_pa + span_len, self.ident_lo, self.ident_hi
+                );
+                return true;
+            }
+            // Guard — a truncated span that crosses the 4 GiB boundary in 32-bit space is not contiguous
+            // under truncation, so one region cannot cover it (would need a wrap). Refuse.
+            if alias.checked_add(span_len).map_or(true, |e| e > 0x1_0000_0000) {
+                serial_println!(
+                    "{}   !! [net4p] {} alias [{:#x}..+{:#x}) crosses the 4GiB boundary — one region cannot cover it; REFUSING ::",
+                    P4, tag, alias, span_len
+                );
+                return false;
+            }
+            let alias_hi = alias + span_len;
+            let overlaps = |lo: u64, hi: u64| hi > lo && alias < hi && lo < alias_hi;
+            // Collision 1 — the identity inbound region (index 0). An armed alias passing this is always
+            // `< ident_lo` (below the DRAM base): the alias is a 32-bit value `< 4 GiB`, the identity
+            // region is `[DRAM base .. DRAM top)`, so no overlap forces the alias below the base.
+            if overlaps(self.ident_lo, self.ident_hi) {
+                serial_println!(
+                    "{}   !! [net4p] {} alias [{:#x}..{:#x}) OVERLAPS the identity inbound region [{:#x}..{:#x}) — REFUSING (would shadow/ambiguate the inbound match) ::",
+                    P4, tag, alias, alias_hi, self.ident_lo, self.ident_hi
+                );
+                return false;
+            }
+            // Collision 2 — controller-0's PCIe MEM window (where downstream BARs decode). An inbound
+            // write landing in that range risks being routed peer-to-peer to a BAR instead of upstream.
+            if overlaps(self.mem_lo, self.mem_hi) {
+                serial_println!(
+                    "{}   !! [net4p] {} alias [{:#x}..{:#x}) OVERLAPS the PCIe MEM/BAR window [{:#x}..{:#x}) — REFUSING (peer-to-peer mis-route hazard) ::",
+                    P4, tag, alias, alias_hi, self.mem_lo, self.mem_hi
+                );
+                return false;
+            }
+            serial_println!(
+                "{}   [net4p] {} alias check CLEAR: [{:#x}..{:#x}) below DRAM base {:#x}, clear of PCIe MEM/BAR [{:#x}..{:#x}) — arming ::",
+                P4, tag, alias, alias_hi, self.ident_lo, self.mem_lo, self.mem_hi
+            );
+            program_inbound_alias(self.atu_base, index, alias, span_len, span_pa, tag);
             true
         }
 
@@ -824,29 +900,19 @@ mod metal {
             );
             self.w16(REG_CPLUSCMD, cpc_dac);
 
-            // NET-4o — the NIC DMA surface (rings + buffers) comes from the sub-4GiB arena, NOT the high
-            // heap. PCIDAC will not latch on this silicon (boot-18), so the C+ payload write is 32-bit:
-            // every buffer PA must be < 4 GiB yet >= the inbound iATU base 0x8000_0000. `mmu_tegra` seated
-            // an arena satisfying both from the same carveout scan that seats the heap; witness it, and
-            // fail closed if it is unseated (refuse rather than re-arm the boot-16 writes-to-nowhere).
-            match self.arena.bounds() {
-                Some((lo, sz)) => serial_println!(
-                    "{} NET-4o — NIC DMA arena [{:#x},{:#x}) ({} KiB) sub-4GiB, inside iATU window ::",
-                    P4, lo, lo + sz as u64, sz >> 10
-                ),
-                None => {
-                    serial_println!(
-                        "{}   !! NET-4o: no sub-4GiB DMA arena seated (mmu_tegra HEAP-GUARD found no clean low span) — REFUSING ring alloc rather than truncate a >4GiB payload address (the boot-16 writes-to-nowhere class) ::",
-                        P4
-                    );
-                    return false;
-                }
-            }
+            // Allocate + program the descriptor rings (256-byte-aligned physical bases) from the high
+            // kernel heap (NET-4p reverted NET-4o's impossible sub-4 GiB arena; no clean low DRAM exists).
+            self.alloc_rx();
+            self.alloc_tx();
 
-            // Allocate + program the descriptor rings (256-byte-aligned physical bases) from the arena.
-            if !self.alloc_rx() || !self.alloc_tx() {
+            // NET-4p — arm the inbound-iATU ALIAS regions NOW: after the (high-heap) buffer PAs are known
+            // and BEFORE RxEnb/TxEnb below, so the FIRST payload write is already covered. Each region
+            // maps the NIC's truncated 32-bit payload address back up to the real buffer PA; the collision
+            // check fails the bring-up closed rather than arm a region that would shadow the identity
+            // inbound region or mis-route into the PCIe MEM/BAR window.
+            if !self.arm_dma_aliases() {
                 serial_println!(
-                    "{}   !! NET-4o: DMA arena exhausted during ring/buffer alloc — REFUSING (arena too small for the NIC surface) ::",
+                    "{}   !! NET-4p: inbound-iATU alias could not be armed (collision) — REFUSING ring bring-up rather than DMA into an unreachable/mis-routed surface ::",
                     P4
                 );
                 return false;
@@ -917,13 +983,14 @@ mod metal {
                 );
             }
             if !latched {
-                // Established negative (boot-18, decisive): PCIDAC does not hold even as the final write
+                // Established negative (boot-18, decisive): PCIDAC will not hold even as the final write
                 // under 9346 unlock — the C+ 64-bit-DAC path is unusable on this silicon. This is now the
-                // EXPECTED reading, not a failure: NET-4o seats the ENTIRE NIC DMA surface in the sub-4GiB
-                // arena, so a 32-bit payload address (PCIDAC clear) reaches every buffer un-truncated. The
-                // readback is kept as the standing oracle that this remains the silicon's behavior.
+                // EXPECTED reading, not a failure: NET-4p keeps the buffers in the high heap and adds an
+                // inbound-iATU ALIAS (armed above) that up-translates the truncated 32-bit payload writes
+                // to the real high PAs, so 32-bit payload DMA (PCIDAC clear) is sufficient. The readback
+                // is kept as the standing oracle that this remains the silicon's behavior.
                 serial_println!(
-                    "{}   !! NET-4n2: PCIDAC WILL NOT LATCH (CPlusCmd stays {:#06x} after the final write under 9346 unlock) — C+ 64-bit-DAC path unusable on this silicon; EXPECTED — NET-4o's sub-4GiB DMA arena makes 32-bit payload DMA sufficient ::",
+                    "{}   !! NET-4n2: PCIDAC WILL NOT LATCH (CPlusCmd stays {:#06x} after the final write under 9346 unlock) — C+ 64-bit-DAC path unusable on this silicon; EXPECTED — NET-4p's inbound-iATU alias makes 32-bit payload DMA sufficient ::",
                     P4, cpc_final
                 );
             }
@@ -1719,6 +1786,63 @@ mod metal {
         unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
     }
 
+    /// NET-4p — program one DWC INBOUND iATU ALIAS region. Unlike NET-4h's identity region (BASE=TARGET),
+    /// here BASE != TARGET: an incoming bus-master write whose (truncated 32-bit) address falls in
+    /// `[alias_base, alias_base+size)` is translated UP to `target + (addr - alias_base)` — i.e. back to
+    /// the real high-heap buffer PA whose high dword the C+ engine's 32-bit `Desc.addr[31:0]` dropped.
+    /// `target` is the real (possibly >4 GiB) buffer span base; `alias_base` = `target & 0xFFFF_FFFF`.
+    /// Uses a SPARE inbound index (dir=1) so it never clobbers the NET-4h identity region 0. Same DWC
+    /// register model + write discipline (announced writes, base/limit/target published `dsb sy` before
+    /// enable) as `program_inbound_atu`, plus a readback WITNESS proving the region latched.
+    fn program_inbound_alias(atu_base: u64, index: u64, alias_base: u64, size: u64, target: u64, tag: &str) {
+        let region = atu_base + ATU_INBOUND_DIR_OFF + index * ATU_REGION_STRIDE;
+        let limit = alias_base + size - 1;
+        let w = |off: u64, v: u32| unsafe { write_volatile((region + off) as *mut u32, v) };
+        serial_println!(
+            "{}   [net4p] inbound iATU ALIAS region {} @ {:#x} ({}) — truncated PCIe DMA [{:#x}..{:#x}] -> real DRAM {:#x} (up-translate, type MEM) ::",
+            P4, index, region, tag, alias_base, limit, target
+        );
+        serial_println!(
+            "{}   >>> ATU WRITE (net4p): BASE lo/hi = {:#010x}/{:#010x} ::",
+            P4, alias_base as u32, (alias_base >> 32) as u32
+        );
+        w(ATU_UNR_LOWER_BASE, alias_base as u32);
+        w(ATU_UNR_UPPER_BASE, (alias_base >> 32) as u32);
+        serial_println!(
+            "{}   >>> ATU WRITE (net4p): LIMIT lo/hi = {:#010x}/{:#010x} ::",
+            P4, limit as u32, (limit >> 32) as u32
+        );
+        w(ATU_UNR_LOWER_LIMIT, limit as u32);
+        w(ATU_UNR_UPPER_LIMIT, (limit >> 32) as u32);
+        serial_println!(
+            "{}   >>> ATU WRITE (net4p): TARGET lo/hi = {:#010x}/{:#010x} (the real high buffer PA) ::",
+            P4, target as u32, (target >> 32) as u32
+        );
+        w(ATU_UNR_LOWER_TARGET, target as u32);
+        w(ATU_UNR_UPPER_TARGET, (target >> 32) as u32);
+        serial_println!("{}   >>> ATU WRITE (net4p): REGION_CTRL1 = TYPE_MEM ::", P4);
+        w(ATU_UNR_REGION_CTRL1, ATU_TYPE_MEM);
+        // Publish base/limit/target BEFORE the region goes live (address-match, region-size increased —
+        // the target sits >32 bits up even though the alias base is a 32-bit value).
+        unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
+        serial_println!(
+            "{}   >>> ATU WRITE (net4p): REGION_CTRL2 = ENABLE|INCREASE_REGION_SIZE (bit30=0 address-match) — arming alias region ::",
+            P4
+        );
+        w(ATU_UNR_REGION_CTRL2, ATU_ENABLE | ATU_INCREASE_REGION_SIZE);
+        unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
+        // Readback WITNESS — the alias region's live BASE/LIMIT/TARGET/enable (the boot-20 oracle line).
+        let r = |off: u64| -> u32 { unsafe { read_volatile((region + off) as *const u32) } };
+        let rb_base = ((r(ATU_UNR_UPPER_BASE) as u64) << 32) | r(ATU_UNR_LOWER_BASE) as u64;
+        let rb_limit = ((r(ATU_UNR_UPPER_LIMIT) as u64) << 32) | r(ATU_UNR_LOWER_LIMIT) as u64;
+        let rb_target = ((r(ATU_UNR_UPPER_TARGET) as u64) << 32) | r(ATU_UNR_LOWER_TARGET) as u64;
+        let rb_ctrl2 = r(ATU_UNR_REGION_CTRL2);
+        serial_println!(
+            "{}   [net4p] alias region {} ({}) readback: BASE={:#x} LIMIT={:#x} TARGET={:#x} CTRL2={:#010x} (enabled={}) ::",
+            P4, index, tag, rb_base, rb_limit, rb_target, rb_ctrl2, (rb_ctrl2 >> 31) & 1
+        );
+    }
+
     /// ORIN-DMA-WINDOW — one-shot READ-ONLY probe (UNAOS_DMAWIN): dump the inbound-DMA window DERIVED
     /// from the RC's `dma-ranges`, read BACK the just-programmed inbound iATU region-0 registers, and
     /// cross-check both against the `ram_gib_mask`-derived identity window NET-4h armed. This closes the
@@ -2126,8 +2250,13 @@ mod metal {
         let mut nic = Rtl8168 {
             mmio_base: cpu_addr,
             mac: [0; 6],
-            // NET-4o: the sub-4GiB DMA arena mmu_tegra seated (rings + buffers bump-allocate from it).
-            arena: DmaArena::from_mmu(),
+            // NET-4p: the ATU base + the two collision-check windows the alias arming needs (the identity
+            // inbound region NET-4h just programmed, and controller-0's PCIe MEM/BAR window).
+            atu_base,
+            ident_lo: dram_base,
+            ident_hi: dram_base + dram_size,
+            mem_lo: win.pci_base,
+            mem_hi: win.pci_base + win.size,
             rx_ring: core::ptr::null_mut(),
             rx_buffers: core::ptr::null_mut(),
             rx_cur: 0,
