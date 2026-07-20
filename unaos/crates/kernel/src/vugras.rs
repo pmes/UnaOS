@@ -72,6 +72,26 @@ pub(crate) static VUGRAS_ABOVE_HEAP_TOP: AtomicUsize = AtomicUsize::new(0);
 /// Emit the per-frame / per-tick `swept` witness every this many invocations, so serial isn't flooded.
 const WITNESS_EVERY: u64 = 32;
 
+/// XCARVE-2 — the SNOC RAS FillWrite target: real PA **0x26b900000** (record-format ADDR
+/// `0x800000026b900000`, bit-63 stripped). 5.2 MiB above heap top (heap ends 0x26b3ca000), below the
+/// framebuffer (0x279e00000) — known carveout-free RAM. An UNIDENTIFIED CPU store dirties this line;
+/// the eviction (or a localizer sweep) writeback is only the messenger that raises the RAS. Boot-19's
+/// "confirmed fixed" was FALSE (that boot died earlier on the 0x200 NET RAS and never reached the
+/// idle/sweep path; boot 20 reached it and 0x26b900000 refired). The event-ring/ERST heap move
+/// (425090fd) is a KEEP but was NOT the writer. This arc hunts the writer by store-site bracketing.
+#[cfg(feature = "tegra")]
+pub(crate) const XCARVE_TARGET_PA: usize = 0x2_6b90_0000;
+
+/// Number of witnessed sub-spans span B is bisected into (spatial bracketing). The sub-span whose sweep
+/// fires the RAS pins the dirty line's PA to ~1/N of span B — the last `sub-span k/N` line in the
+/// capture before the fault is the window. 12 keeps each sub-span ~a few MiB while staying serial-cheap.
+const SUBSPANS: usize = 12;
+
+/// Tripwire footprint: `DC CIVAC` the target line ± this many bytes (a few 64 B neighbor lines), so a
+/// store landing one or two lines off the nominal PA is still forced back promptly at every bracket.
+#[cfg(feature = "tegra")]
+const TRIPWIRE_HALF: usize = 192;
+
 /// One-shot cost-witness latches (span A, span B) — the sweep cost is measured and printed exactly once
 /// per span so the capture records it without per-frame noise.
 static COST_A_DONE: AtomicBool = AtomicBool::new(false);
@@ -148,6 +168,131 @@ fn sweep_one(kind: &str, parity: u64) -> usize {
     bytes
 }
 
+/// XCARVE-2 spatial bisection: split `[lo,hi)` into `SUBSPANS` witnessed sub-spans, `DC CIVAC` each in
+/// turn and emit a `sub-span k/N` witness for it. If the unidentified store has already dirtied a line
+/// in one sub-span, the RAS FillWrite fires on THAT sub-span's clean — so the LAST `sub-span k/N` line
+/// in the capture pins the dirty line to `[lo + k*step, lo + (k+1)*step)`, ~1/N of the span. Cheap
+/// enough (one linear pass, same total work as a plain sweep) to run at every bracket point. No-op for
+/// an empty/backwards span (with a witness so the capture records the span was empty, not skipped).
+fn bisect(label: &str, lo: usize, hi: usize) {
+    if hi <= lo {
+        serial_println!(":: VUGRAS: bisect {} — empty span [{:#x},{:#x}), nothing to sweep ::", label, lo, hi);
+        return;
+    }
+    let span = hi - lo;
+    let step = span.div_ceil(SUBSPANS);
+    let mut k = 0usize;
+    let mut base = lo;
+    while base < hi {
+        let end = core::cmp::min(base + step, hi);
+        civac(base, end);
+        serial_println!(
+            ":: VUGRAS: sub-span {}/{} [{:#x},{:#x}) swept ({}) ::",
+            k, SUBSPANS, base, end, label
+        );
+        base = end;
+        k += 1;
+    }
+}
+
+/// XCARVE-2 single-line tripwire (tegra): `DC CIVAC` exactly the cache line at `XCARVE_TARGET_PA`
+/// (± `TRIPWIRE_HALF` bytes of neighbor lines; `clean_invalidate_range` rounds to line boundaries). This
+/// forces the specific 0x26b900000 line back to RAM *now* — if the unidentified store has dirtied it,
+/// the RAS FillWrite fires *inside* this call, bracketing the store to the code that ran since the
+/// previous tripwire. The target is known carveout-free RAM (5.2 MiB above heap top, below the
+/// framebuffer) and RAM is identity-mapped Normal-WB by `mmu_tegra::init`, so it is always safe to clean
+/// regardless of the span-B publish state. No-op when the knob is off.
+#[cfg(feature = "tegra")]
+pub fn tripwire(site: &str) {
+    if !ARMED {
+        return;
+    }
+    let lo = XCARVE_TARGET_PA.saturating_sub(TRIPWIRE_HALF);
+    let hi = XCARVE_TARGET_PA + TRIPWIRE_HALF;
+    civac(lo, hi);
+    serial_println!(
+        ":: VUGRAS: tripwire @ {} — line {:#x} (+/-{} B) swept ::",
+        site, XCARVE_TARGET_PA, TRIPWIRE_HALF
+    );
+}
+
+/// XCARVE-2 temporal bracket (tegra): a named boot-phase boundary. Emits a phase witness, fires the
+/// single-line tripwire, then bisects span B once. The interval between the LAST phase whose tripwire +
+/// bisect swept clean and the phase whose sweep fires the RAS names the code region that made the store.
+/// Called at the named boot boundaries (post-MMU, post-heap-init, post-PCIe, post-NET, post-xHCI-attach,
+/// shell-entry) from `tegra_early_stop` / `jd2_console_pump`. No-op when the knob is off.
+#[cfg(feature = "tegra")]
+pub fn phase(name: &str) {
+    if !ARMED {
+        return;
+    }
+    serial_println!(":: VUGRAS: === phase {} ===", name);
+    tripwire(name);
+    let (_, b) = spans();
+    bisect("span-B", b.0, b.1);
+}
+
+/// XCARVE-2 identity witness (tegra, one-shot): does anything the kernel knows about map/own the target
+/// line? For each known region emit whether `XCARVE_TARGET_PA` falls inside it; if NOTHING contains it,
+/// say so explicitly — the store is then through a wild/stale pointer, and the temporal bracket (which
+/// code region ran between the last clean tripwire and the firing one) is the evidence that matters, not
+/// an owning allocation. Same candidate region set `core_witness` prints. No-op when the knob is off.
+#[cfg(feature = "tegra")]
+pub fn pa_identity_witness() {
+    if !ARMED {
+        return;
+    }
+    let t = XCARVE_TARGET_PA;
+    serial_println!(
+        ":: VUGRAS: XCARVE identity — target line {:#x} (record ADDR {:#x}) ::",
+        t,
+        0x8000_0000_0000_0000u64 | t as u64
+    );
+    let mut hit = false;
+    let (hlo, hhi) = crate::allocator::heap_bounds();
+    if t >= hlo && t < hhi {
+        serial_println!(":: VUGRAS: XCARVE identity — {:#x} IS INSIDE heap [{:#x},{:#x}) ::", t, hlo, hhi);
+        hit = true;
+    }
+    let top = VUGRAS_ABOVE_HEAP_TOP.load(Ordering::Relaxed);
+    let b_hi = if top > hhi { top } else { hhi };
+    if t >= hhi && t < b_hi {
+        serial_println!(
+            ":: VUGRAS: XCARVE identity — {:#x} IS INSIDE span-B (carveout-free above-heap) [{:#x},{:#x}) ::",
+            t, hhi, b_hi
+        );
+        hit = true;
+    }
+    let fb = *crate::video::WRITER.lock();
+    if fb.is_ready() {
+        let (flo, fhi) = (fb.base(), fb.base() + fb.len());
+        if t >= flo && t < fhi {
+            serial_println!(":: VUGRAS: XCARVE identity — {:#x} IS INSIDE framebuffer [{:#x},{:#x}) ::", t, flo, fhi);
+            hit = true;
+        }
+    }
+    let (clo, chi) = crate::pal::cursor::saved_pa();
+    if clo != chi && t >= clo && t < chi {
+        serial_println!(":: VUGRAS: XCARVE identity — {:#x} IS INSIDE cursor save-under [{:#x},{:#x}) ::", t, clo, chi);
+        hit = true;
+    }
+    if !hit {
+        serial_println!(
+            ":: VUGRAS: XCARVE identity — {:#x} is NOT inside any known kernel region (heap/span-B/fb/cursor); WILD/STALE-POINTER store hypothesis — the temporal bracket names the writer ::",
+            t
+        );
+    }
+    // RO-map hard tripwire decision (brief step 4): DISARMED this arc. Read-only-mapping the containing
+    // page so the store faults with ELR = the store site would require a page-table edit in mmu_tegra and
+    // CANNOT be validated on the QEMU gate (the `virt` model has no such above-heap RAM region and never
+    // exercises the tegra identity map), so arming it blind risks perturbing a legitimate mapping on the
+    // one platform where it runs — exactly what the brief forbids. The DC-CIVAC tripwire + spatial
+    // bisection + temporal phase brackets localize the store without touching page permissions; a future
+    // arc can arm the RO-map once this identity witness has established (on metal) whether the page is
+    // ever legitimately written. Witnessed either way, per the brief.
+    serial_println!(":: VUGRAS: XCARVE RO-map hard tripwire — DISARMED (unvalidatable on QEMU gate; DC-CIVAC tripwire + bisect + phase brackets localize without touching page perms) ::");
+}
+
 /// vug frame-loop hook: at the end of each rendered frame, sweep one span (alternating A/B by frame
 /// parity so no single frame pays the full cost), and bracket the fatal frame with a `swept` witness
 /// every `WITNESS_EVERY` frames. No-op when the knob is off.
@@ -214,6 +359,10 @@ pub fn core_witness() {
     serial_println!(":: VUGRAS: cursor save-under stash [{:#x},{:#x}) ::", clo, chi);
     // Exercise the sweep once (span A only — always mapped) so the gate observes it running.
     sweep_one("witness", 0);
+    // XCARVE-2 spatial bracket: bisect span A (the live heap — always mapped, so this runs on the virt
+    // GICv3 gate too) into witnessed sub-spans. On tegra `boot_witness` additionally bisects span B, the
+    // above-heap span that actually covers the 0x26b900000 XCARVE target.
+    bisect("span-A (heap)", lo, hi);
 }
 
 /// Boot witness (post-heap-init, tegra path): the full candidate table — the arch-neutral core plus the
@@ -225,6 +374,15 @@ pub fn boot_witness() {
     serial_println!(":: VUGRAS: boot witness — RAS candidate PA table (bit-63-stripped decode) ::");
     core_witness();
     crate::drivers::xhci::vugras_dump();
+    // XCARVE-2: identify what (if anything) maps the 0x26b900000 target, then bisect span B — the
+    // above-heap span that covers it — so a boot-time capture already brackets the dirty line spatially
+    // before the idle/vug sweeps and the temporal phase brackets narrow it further.
+    #[cfg(feature = "tegra")]
+    {
+        pa_identity_witness();
+        let (_, b) = spans();
+        bisect("span-B (above-heap, covers XCARVE 0x26b900000)", b.0, b.1);
+    }
 }
 
 /// Witness the Screen back buffer span once, when the console/vug builds it (its PA is only known after

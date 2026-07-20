@@ -1202,6 +1202,10 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
         mmu.ttbr0,
         mmu.ram_gib_mask,
     );
+    // XCARVE-2 temporal bracket (RAS store-site hunt, `UNAOS_VUGRAS=1`): first bracket, right after the
+    // MMU identity-maps RAM — the 0x26b900000 line is now cleanable. Heap/span-B are not carved yet, so
+    // the span-B bisect witnesses "empty" here; the tripwire still fires. No-op knob-off.
+    unaos_kernel::vugras::phase("post-mmu");
     // JB1f: install the full healed exceptions.rs vectors NOW — before fbcon starts mirroring —
     // retiring the unhealed early window the 2026-07-11 bench caught: the A78AE-1941500 phantom
     // struck fbcon's glyph loop (the boot's heaviest ifetch+store stretch) under mmu_tegra's
@@ -1413,6 +1417,9 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     let (dtb_addr, dtb_size) = (boot_info.dtb_addr, boot_info.dtb_size);
     unaos_kernel::arch::memory::init(boot_info);
     serial_println!(":: KERNEL HEAP ALLOCATED ::");
+    // XCARVE-2 temporal bracket: heap carved + span-B top published (`select_heap_region`). span-B now
+    // covers the 0x26b900000 target, so this is the first bracket whose bisect can fire on the target.
+    unaos_kernel::vugras::phase("post-heap-init");
 
     // ORIN-NET-1 (read-only PCIe/NIC census, `UNAOS_PCIEPROBE=1`): with the `pcieprobe` feature
     // armed, run the census HERE on the metal Orin — after JM4 (serial/heap live) and the mmu is up
@@ -1444,6 +1451,9 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
         dtb_size,
         ram_gib_mask: mmu.ram_gib_mask,
     });
+    // XCARVE-2 temporal bracket: after the PCIe census/recon (NET-1/2/3). If the RAS fires between here
+    // and post-heap-init, the store is in the PCIe bring-up window.
+    unaos_kernel::vugras::phase("post-pcie");
 
     // ORIN-NET-4 (RTL8168/8111 GbE driver + smoltcp bind, `UNAOS_NET4=1`): with `net4` armed (implies
     // `pcie3`), run the driver bring-up HERE on the metal Orin — AFTER the NET-3 `census2` above has
@@ -1453,6 +1463,10 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     // no Tegra234 RC). Compiled out knob-off => byte-identical to baseline. See arch_arm64.md §ORIN-NET-4.
     #[cfg(all(feature = "net4", feature = "tegra"))]
     unaos_kernel::arch::rtl8168_tegra::net4_bringup(dtb_addr, dtb_size, mmu.ram_gib_mask);
+    // XCARVE-2 temporal bracket: after the NET-4 driver bring-up window (rings/DMA/MAC reset). If the RAS
+    // fires between here and post-pcie, the store is in the NIC bring-up window. (Diagnostic line only —
+    // does NOT touch the RTL8168 descriptor/ring code, which the sibling NET-4q arc owns.)
+    unaos_kernel::vugras::phase("post-net");
 
     // ORIN-SDMMC-1 (`UNAOS_SDMMC=1`): the Tegra234 microSD-slot READ-ONLY recon on the metal Orin — the
     // installer line's first rung. Resolves the SDMMC controller from the live DTB, maps its window,
@@ -1588,6 +1602,10 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
             unaos_kernel::arch::sched::spawn("jd2-console", jd2_console_pump, 0, 0);
             serial_println!(":: tegra: JD2 — EL1 console pump task spawned (boot core) ::");
         }
+        // XCARVE-2 temporal bracket: after the JB2b xHCI attach + enumeration window (the event-ring/ERST
+        // move 425090fd lives here). If the RAS fires between here and post-net, the store is in the xHCI
+        // bring-up window. Placed outside the `attached` guard so the bracket lands on every tegra boot.
+        unaos_kernel::vugras::phase("post-xhci-attach");
     } else {
         serial_println!(":: tegra: JB2b — SKIPPED (XUSB not ungated/alive this boot) ::");
     }
@@ -1804,6 +1822,9 @@ fn jd2_console_pump(_arg: usize) {
     serial_println!(
         ":: tegra: JD2 — EL1 console pump live (boot log holds the panel; first key or ~8 s enters the shell) ::"
     );
+    // XCARVE-2 temporal bracket: shell entry (boot-14/boot-20's crash path — the console pump is live with
+    // no vug run). The last named bracket before the idle-sweep cadence takes over below.
+    unaos_kernel::vugras::phase("shell-entry");
 
     // Phase 1 (JD4 screen-on-boot polish): pump the controller with the JD1 boot log visible, but
     // only until the FIRST KEYSTROKE or a ~8 s wall-clock deadline — whichever comes first — so a

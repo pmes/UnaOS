@@ -743,13 +743,60 @@ survey) the NET-4m rx path. Pinning the exact `.bss` writer and relinking/reloca
 in-lane fix is the carveout-bounded span B above, which makes the localizer sound so the next boot
 attributes `0x26b900000` to the writer and not to the sweep.
 
-**RESOLVED (R23s1, §JETSON-XCARVE "XCARVE-SNOC FIX"):** the `.bss` writer was pinned to the xHCI
-**event ring + ERST** — the *only* two xHC-DMA structures not heap-backed (every other ring/buffer/
-context is heap-resident, confirmed by boot-15's candidate table). Both now heap-allocate (the event
-ring like `TransferRing`; the ERST inside `init_interrupter`), so no xHC DMA structure lives in the
-un-vetted image extent. The formerly-dead `event_ring_base` dump field is now truthful (it read `0x0`
-here, which misled lead #1); the dump gained an `erst_base=` field. QEMU-green; metal-owed confirmation
-in the fix subsection.
+**~~RESOLVED (R23s1, §JETSON-XCARVE "XCARVE-SNOC FIX")~~ — REOPENED (XCARVE-2, boot-19 false-confirm):**
+the event-ring + ERST heap move (commit `425090fd`) *is* a KEEP — every xHC DMA structure is now
+heap-backed — but it was **NOT the writer**. The "confirmed fixed" reading came from **boot 19, which
+died earlier on the `0x200` NET RAS and never reached the idle/sweep path**; boot 20 reached it and
+`0x26b900000` **refired**. The `.bss`/event-ring lead is therefore refuted: the store target survives a
+move that relocated every heap-adjacent DMA structure, so the writer is neither the event ring, the
+ERST, nor any heap-backed buffer. Cross-link to the NET `0x200` defect is separately refuted by
+span-parity (span A = heap-only ran clean). The writer remains **UNIDENTIFIED**; the hunt below switches
+from decoding the record-format ADDR (settled — XCARVE erratum, do not re-chase) to **store-site
+bracketing**.
+
+#### XCARVE-2 — store-site bracketing (`UNAOS_VUGRAS=1`, instrument-only)
+
+Rather than ask *what PA is `0x26b900000`* (answered), XCARVE-2 asks *what code stored to it, and when*.
+Three brackets, all tegra-gated behind `UNAOS_VUGRAS` (default-quiet: zero VUGRAS lines knob-off), added
+in `vugras.rs` (+ the phase call sites in `main.rs`):
+
+1. **Spatial bisection.** `bisect()` splits a span into `SUBSPANS` (12) witnessed sub-spans, `DC CIVAC`-ing
+   each in turn with a `sub-span k/12 [lo,hi) swept` line. When the dirty line is cleaned the RAS
+   FillWrite fires *on that sub-span's clean*, so the **last `sub-span k/12` line before the fault pins
+   the dirty line to ~1/12 of the span**. `boot_witness` bisects **span B** (the above-heap span that
+   covers `0x26b900000`); `core_witness` bisects **span A** (the heap — always mapped, so the QEMU gate
+   exercises the machinery too).
+2. **Single-line tripwire.** `tripwire()` `DC CIVAC`s exactly the `0x26b900000` line (± a few neighbor
+   lines) with its own witness. Known carveout-free RAM (5.2 MiB above heap top, below the framebuffer)
+   and identity-mapped Normal-WB, so it is safe to run at *every* bracket point — if the store has landed,
+   the RAS fires *inside the tripwire call*.
+3. **Temporal bracketing.** `phase(name)` runs the tripwire + span-B bisect at named boot-phase
+   boundaries — **post-mmu, post-heap-init, post-pcie, post-net, post-xhci-attach, shell-entry**. The
+   interval between the last phase that swept clean and the phase whose tripwire/bisect fires the RAS
+   names the code region that made the store.
+
+**Identity witness.** `pa_identity_witness()` (one-shot, in `boot_witness`) reports, for each known
+region (heap, span-B, framebuffer, cursor stash), whether `0x26b900000` falls inside it — and if **nothing
+maps it**, says so explicitly: the store is then through a **wild/stale pointer** and the temporal bracket
+is the decisive evidence, not an owning allocation.
+
+**RO-map hard tripwire (brief step 4): DISARMED.** Read-only-mapping the containing page so the store
+faults with ELR = the store site would need a page-table edit in `mmu_tegra` and **cannot be validated on
+the QEMU gate** (`virt` has no such above-heap RAM and never runs the tegra identity map), so arming it
+blind risks perturbing a legitimate mapping on the only platform where it runs. The DC-CIVAC tripwire +
+bisection + phase brackets localize the store without touching page permissions; a future arc can arm the
+RO-map once the identity witness has established (on metal) whether the page is ever legitimately written.
+Witnessed either way (`:: VUGRAS: XCARVE RO-map hard tripwire — DISARMED … ::`).
+
+**Expected serial (metal, boot 21+, `UNAOS_VUGRAS=1 UNAOS_TEGRA=1`):** the boot-witness table (below) now
+also carries `:: VUGRAS: XCARVE identity — target line 0x26b900000 (record ADDR 0x800000026b900000) ::`
+followed by the region checks (or the NOT-inside/wild-pointer line), the RO-map DISARMED line, and
+`:: VUGRAS: sub-span k/12 [lo,hi) swept (span-B …) ::`. Each phase prints
+`:: VUGRAS: === phase <name> === ::`, `:: VUGRAS: tripwire @ <name> — line 0x26b900000 (+/-192 B) swept ::`,
+and its span-B sub-span lines. **Reading the capture:** find the RAS; the **last `phase`** and the **last
+`sub-span k/12`** printed before it name *when* (which code region) and *where* (which ~1/12 PA window) the
+store landed. A tripwire line immediately preceding the RAS with no intervening code means the store
+happened in the phase whose name that tripwire carries.
 
 **Expected serial (metal, `UNAOS_VUGRAS=1 UNAOS_TEGRA=1`):**
 - `:: VUGRAS: boot witness — RAS candidate PA table (bit-63-stripped decode) ::`
