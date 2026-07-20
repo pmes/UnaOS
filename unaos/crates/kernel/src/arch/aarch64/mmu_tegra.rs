@@ -1026,13 +1026,29 @@ pub fn select_heap_region(
 
     // Collect carveouts to avoid: every non-Usable region the UEFI map declares, plus the DTB
     // `/reserved-memory` carveouts (the firewall ones UEFI hides inside Conventional descriptors).
-    const MAX_CARVE: usize = 96;
+    // XCARVE-5: 192 (was 96) — boot-23 proved the UEFI+FDT set alone fills 96, which silently
+    // dropped the XCARVE-3 hole append below and let span B sweep the unmapped window (sync fault
+    // at 0x26b800000). The hole is now seeded FIRST (slot 0, can never be dropped) and any
+    // overflow is witnessed — no silent caps.
+    const MAX_CARVE: usize = 192;
     let mut carve = [(0u64, 0u64); MAX_CARVE];
     let mut nc = 0usize;
-    for r in regions {
-        if r.kind != MemoryRegionKind::Usable && nc < MAX_CARVE {
-            carve[nc] = (r.phys_start, (r.page_count * 4096) as u64);
+    let mut dropped = 0usize;
+    {
+        let (hb, hs, _) = carveout_hole();
+        if hs != 0 {
+            carve[nc] = (hb, hs);
             nc += 1;
+        }
+    }
+    for r in regions {
+        if r.kind != MemoryRegionKind::Usable {
+            if nc < MAX_CARVE {
+                carve[nc] = (r.phys_start, (r.page_count * 4096) as u64);
+                nc += 1;
+            } else {
+                dropped += 1;
+            }
         }
     }
     let mut fdt_carve = [(0u64, 0u64); 48];
@@ -1041,17 +1057,19 @@ pub fn select_heap_region(
         if nc < MAX_CARVE {
             carve[nc] = c;
             nc += 1;
+        } else {
+            dropped += 1;
         }
     }
-    // XCARVE-3: add the resolved protected-carveout hole (latched by `init`) to the exclusion set. For a
-    // DTB-source hole this duplicates a range already collected above (harmless — the overlap logic dedups
-    // by effect); for a QUIRK-source hole it is the ONLY place the heap-guard learns of it, so the heap
-    // never seats over it and `VUGRAS_ABOVE_HEAP_TOP` (published below) clips span B BELOW it — the sweep
-    // can never DC-CIVAC the fabric-protected line.
-    let (hb, hs, _) = carveout_hole();
-    if hs != 0 && nc < MAX_CARVE {
-        carve[nc] = (hb, hs);
-        nc += 1;
+    // XCARVE-3/5: the protected-carveout hole is seeded at slot 0 above (can never be dropped —
+    // boot-23's silent drop of a late append at nc==MAX_CARVE is the exact failure this ordering
+    // buries). Witness any overflow loudly: a dropped carveout means the exclusion set is
+    // incomplete and every consumer (heap seat, span-B top) may be wrong.
+    if dropped != 0 {
+        serial_println!(
+            ":: tegra: HEAP-GUARD WARNING — {} carveout range(s) DROPPED (set full at {}); exclusion set INCOMPLETE ::",
+            dropped, MAX_CARVE
+        );
     }
     let carveouts = &carve[..nc];
 

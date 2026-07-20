@@ -7052,3 +7052,17 @@ the spec-mandatory 4 KiB fallback, null/heap-bounds-guard the array, witness the
 Healthy controllers (bit 0 set) are byte-identical in behavior. Boots 13–22's RAS family =
 this one store's cache line (plus diagnostics touching the same window); 425090fd fixed the
 sibling instance (event ring/ERST). XCARVE-3's hole + witnesses stay armed as the standing trap.
+
+### XCARVE-5 — the boot-23 correction (2026-07-20): the hole was silently dropped from the set
+Boot-23 (XCARVE-4 aboard) faulted at the SAME FAR 0x26b800000 — symbolized to
+`vugras::bisect+0x104`, ESR ISS CM=1 (a DC CIVAC). Root cause: the UEFI+FDT carveout set
+alone fills MAX_CARVE=96, so the XCARVE-3 hole append at the tail was SILENTLY DROPPED;
+`VUGRAS_ABOVE_HEAP_TOP` published without the hole and span B swept the unmapped window.
+Fix: hole seeded at slot 0 (can never drop), MAX_CARVE 96→192, dropped-carveout overflow
+witnessed loudly. RECORD CORRECTION: boot-22's ELR was mis-symbolized to jb2b_attach
+(inlining-shifted nearest-symbol); its fault fired immediately after the post-heap-init
+tripwire — before any XUSB attach runs — so boot-22's faulter was ALSO this sweep. The
+XCARVE-4 scratchpad PAGESIZE clamp remains as hardening (real garbage-readback hazard) but
+is no longer claimed as "the writer." With the hole enforced, the no-software-writer verdict
+(boot-21) stands: FillWrite/fault activity at this window is any cache traffic into
+firewalled DRAM our map must simply never cover.
