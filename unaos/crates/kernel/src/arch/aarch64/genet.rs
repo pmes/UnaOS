@@ -142,9 +142,15 @@ mod metal {
     // CMD register bits.
     const CMD_TX_EN: u32 = 1 << 0;
     const CMD_RX_EN: u32 = 1 << 1;
+    // UMAC speed encoding (bits [3:2]): 10 -> 0, 100 -> 1, 1000 -> 2.
+    const CMD_SPEED_10: u32 = 0;
+    const CMD_SPEED_100: u32 = 1;
     const CMD_SPEED_1000: u32 = 2;
     const CMD_SPEED_SHIFT: u32 = 2;
+    const CMD_SPEED_MASK: u32 = 0x3;
     const CMD_PROMISC: u32 = 1 << 4;
+    /// Half-duplex enable (bit 10). Set when the PHY resolves half-duplex; clear for full.
+    const CMD_HD_EN: u32 = 1 << 10;
     const CMD_SW_RESET: u32 = 1 << 13;
     // MIB counter reset bits.
     const MIB_RESET_RX: u32 = 1 << 0;
@@ -156,10 +162,26 @@ mod metal {
     const MDIO_RD: u32 = 2 << 26;
     const MDIO_PMD_SHIFT: u32 = 21;
     const MDIO_REG_SHIFT: u32 = 16;
-    // Standard MII registers (Clause 22).
-    const MII_BMSR: u32 = 0x01;
-    const MII_PHYID1: u32 = 0x02;
-    const BMSR_LSTATUS: u16 = 1 << 2;
+    // Standard MII registers (IEEE 802.3 Clause 22 — architectural register facts).
+    const MII_BMSR: u32 = 0x01; // Basic mode status
+    const MII_PHYID1: u32 = 0x02; // PHY identifier 1
+    const MII_ADVERTISE: u32 = 0x04; // Our 10/100 auto-neg advertisement (ANAR)
+    const MII_LPA: u32 = 0x05; // Link-partner 10/100 ability (ANLPAR)
+    const MII_CTRL1000: u32 = 0x09; // Our 1000BASE-T advertisement
+    const MII_STAT1000: u32 = 0x0a; // Link-partner 1000BASE-T ability
+    const BMSR_LSTATUS: u16 = 1 << 2; // Link is up (latched-low)
+    const BMSR_ANEGCOMPLETE: u16 = 1 << 5; // Auto-negotiation complete
+    // ANAR/ANLPAR (reg 0x04/0x05) technology-ability bits.
+    const ADVERTISE_10HALF: u16 = 1 << 5;
+    const ADVERTISE_10FULL: u16 = 1 << 6;
+    const ADVERTISE_100HALF: u16 = 1 << 7;
+    const ADVERTISE_100FULL: u16 = 1 << 8;
+    // 1000BASE-T control (reg 0x09) advertised bits.
+    const ADVERTISE_1000HALF: u16 = 1 << 8;
+    const ADVERTISE_1000FULL: u16 = 1 << 9;
+    // 1000BASE-T status (reg 0x0a) link-partner bits.
+    const LPA_1000HALF: u16 = 1 << 10;
+    const LPA_1000FULL: u16 = 1 << 11;
 
     // ── DMA descriptor + ring register model ──
     /// Descriptors per ring (Linux `TOTAL_DESC`).
@@ -243,6 +265,15 @@ mod metal {
     // The driver owns raw DMA pointers; touched only behind the `GENET_DEVICE` mutex on the single-core
     // poll path, so sharing across contexts is sound (mirrors NET-4 / VNET).
     unsafe impl Send for Genet {}
+
+    /// The PHY's NEGOTIATED link result (autoneg-honest): whether link is up, whether autoneg
+    /// completed, and the resolved speed (Mb/s) + duplex. Programmed into UMAC/RGMII rather than forced.
+    struct LinkState {
+        link: bool,
+        aneg: bool,
+        speed: u16,
+        full_duplex: bool,
+    }
 
     impl Genet {
         #[inline]
@@ -364,6 +395,108 @@ mod metal {
             self.mdio_read(self.phy_addr, MII_BMSR)
                 .map(|s| s & BMSR_LSTATUS != 0)
                 .unwrap_or(false)
+        }
+
+        /// Resolve the PHY's NEGOTIATED link — speed + duplex taken FROM the autoneg result, never
+        /// forced. Reads are IEEE 802.3 Clause-22 standard registers: BMSR link/aneg-complete, then the
+        /// highest-common-denominator technology from our advertisement (ANAR / 1000BASE-T control)
+        /// intersected with the link partner's ability (ANLPAR / 1000BASE-T status). This is the honest
+        /// alternative to hand-asserting SPEED_1000 + RGMII_LINK: a 100M-negotiated link programmed as
+        /// forced-1000 mis-clocks the RGMII pins and corrupts every TX frame on the wire.
+        fn phy_resolve(&self) -> LinkState {
+            // BMSR is latched-low; read twice so LSTATUS reflects the current (not a stale) link.
+            let _ = self.mdio_read(self.phy_addr, MII_BMSR);
+            let bmsr = self.mdio_read(self.phy_addr, MII_BMSR).unwrap_or(0);
+            let link = bmsr & BMSR_LSTATUS != 0;
+            if !link {
+                return LinkState { link: false, aneg: false, speed: 0, full_duplex: false };
+            }
+            // Bounded wait for auto-negotiation to complete (PHY powers up with autoneg enabled per
+            // IEEE default; this only caps a still-negotiating link, it never hangs).
+            let mut aneg = bmsr & BMSR_ANEGCOMPLETE != 0;
+            if !aneg {
+                for _ in 0..200 {
+                    let s = self.mdio_read(self.phy_addr, MII_BMSR).unwrap_or(0);
+                    if s & BMSR_ANEGCOMPLETE != 0 {
+                        aneg = true;
+                        break;
+                    }
+                    for _ in 0..20_000 {
+                        core::hint::spin_loop();
+                    }
+                }
+            }
+            let adv = self.mdio_read(self.phy_addr, MII_ADVERTISE).unwrap_or(0);
+            let lpa = self.mdio_read(self.phy_addr, MII_LPA).unwrap_or(0);
+            let ctrl1000 = self.mdio_read(self.phy_addr, MII_CTRL1000).unwrap_or(0);
+            let stat1000 = self.mdio_read(self.phy_addr, MII_STAT1000).unwrap_or(0);
+            let common = adv & lpa;
+            let g_full = (ctrl1000 & ADVERTISE_1000FULL != 0) && (stat1000 & LPA_1000FULL != 0);
+            let g_half = (ctrl1000 & ADVERTISE_1000HALF != 0) && (stat1000 & LPA_1000HALF != 0);
+            let (speed, full_duplex) = if g_full {
+                (1000, true)
+            } else if g_half {
+                (1000, false)
+            } else if common & ADVERTISE_100FULL != 0 {
+                (100, true)
+            } else if common & ADVERTISE_100HALF != 0 {
+                (100, false)
+            } else if common & ADVERTISE_10FULL != 0 {
+                (10, true)
+            } else if common & ADVERTISE_10HALF != 0 {
+                (10, false)
+            } else {
+                // Link is up but no common technology resolved (autoneg still pending / bad partner):
+                // fall back to the safe slow floor rather than force a fast lie.
+                (10, false)
+            };
+            LinkState { link, aneg, speed, full_duplex }
+        }
+
+        /// Program UMAC speed/duplex + the EXT RGMII out-of-band link bit FROM the resolved PHY state.
+        /// Speed bits and HD_EN mirror the negotiated result; RGMII_LINK is asserted ONLY when the PHY
+        /// actually reports link (Linux `bcmgenet_mii_setup` discipline), never by hand.
+        fn mac_set_from_link(&self, ls: &LinkState) {
+            let sp = match ls.speed {
+                1000 => CMD_SPEED_1000,
+                100 => CMD_SPEED_100,
+                _ => CMD_SPEED_10,
+            };
+            let mut cmd = self.r(UMAC_CMD);
+            cmd &= !((CMD_SPEED_MASK << CMD_SPEED_SHIFT) | CMD_HD_EN);
+            cmd |= sp << CMD_SPEED_SHIFT;
+            if !ls.full_duplex {
+                cmd |= CMD_HD_EN;
+            }
+            serial_println!(
+                "{}   >>> REG WRITE (M2): UMAC_CMD speed<-{}M {} (from PHY autoneg) ::",
+                PG, ls.speed, if ls.full_duplex { "full-duplex" } else { "half-duplex" }
+            );
+            self.w(UMAC_CMD, cmd);
+            let mut oob = RGMII_MODE_EN | OOB_DISABLE | ID_MODE_DIS;
+            if ls.link {
+                oob |= RGMII_LINK;
+            }
+            serial_println!(
+                "{}   >>> REG WRITE (M2): EXT_RGMII_OOB_CTRL RGMII_LINK {} (honoring PHY link) ::",
+                PG, if ls.link { "SET" } else { "CLEAR" }
+            );
+            self.w(EXT_RGMII_OOB_CTRL, oob);
+            barrier();
+        }
+
+        /// TX evidence for the storm / LED-red-herring classes: our software enqueue count vs the
+        /// hardware TDMA producer/consumer indices. `cons_index` is advanced by hardware as it drains
+        /// (transmits) descriptors; `cons == prod` means the ring fully drained with no runaway
+        /// re-post. A steady activity LED with `tx_count` small and cons==prod is NOT a storm.
+        fn tx_evidence(&self, label: &str) {
+            let prod = self.r(self.tdma_ring(RING_TDMA_PROD_INDEX)) & DMA_INDEX_MASK;
+            let cons = self.r(self.tdma_ring(RING_TDMA_CONS_INDEX)) & DMA_INDEX_MASK;
+            serial_println!(
+                "{}   TX evidence [{}]: sw frames-enqueued={} (tx_prod={}) | HW TDMA prod_index={} cons_index={} {} ::",
+                PG, label, self.tx_count, self.tx_prod, prod, cons,
+                if cons == prod { "(drained; no storm)" } else { "(in-flight or stalled)" }
+            );
         }
 
         /// Read the six station-MAC bytes from the UMAC MAC0/MAC1 registers (the firmware programs them
@@ -503,24 +636,26 @@ mod metal {
             serial_println!("{}   >>> REG WRITE (M2): RBUF_CTRL = 64B_EN | ALIGN_2B ::", PG);
             self.w(RBUF_CTRL, RBUF_64B_EN | RBUF_ALIGN_2B);
 
-            // RGMII out-of-band: drive the external PHY link in-band (OOB disabled), RGMII mode on,
-            // internal-delay disabled (the Pi board provides the RGMII delay).
-            serial_println!("{}   >>> REG WRITE (M2): EXT_RGMII_OOB_CTRL = RGMII_MODE_EN | OOB_DISABLE | RGMII_LINK | ID_MODE_DIS ::", PG);
+            // RGMII out-of-band: RGMII mode on, out-of-band status disabled (link driven in-band from
+            // the PHY), internal-delay disabled (the Pi board provides the RGMII delay). RGMII_LINK is
+            // NOT asserted here — it is set later ONLY if the PHY actually reports link (see
+            // `mac_set_from_link`). Hand-asserting it lies to the MAC about a link that may be down.
+            serial_println!("{}   >>> REG WRITE (M2): EXT_RGMII_OOB_CTRL = RGMII_MODE_EN | OOB_DISABLE | ID_MODE_DIS (RGMII_LINK deferred to PHY) ::", PG);
             self.w(
                 EXT_RGMII_OOB_CTRL,
-                RGMII_MODE_EN | OOB_DISABLE | RGMII_LINK | ID_MODE_DIS,
+                RGMII_MODE_EN | OOB_DISABLE | ID_MODE_DIS,
             );
 
             // Descriptor rings.
             self.init_rx();
             self.init_tx();
 
-            // Enable TX + RX at gigabit; promiscuous for bring-up (mirrors the NET-4 / e1000 filter).
-            let cmd = CMD_TX_EN
-                | CMD_RX_EN
-                | (CMD_SPEED_1000 << CMD_SPEED_SHIFT)
-                | CMD_PROMISC;
-            serial_println!("{}   >>> REG WRITE (M2): UMAC_CMD = TX_EN | RX_EN | SPEED_1000 | PROMISC ::", PG);
+            // Enable TX + RX; promiscuous for bring-up (mirrors the NET-4 / e1000 filter). Speed/duplex
+            // are LEFT UNSET here (default 10M floor) — they are programmed from the PHY's negotiated
+            // result in `mac_set_from_link`, not forced to gigabit. Forcing SPEED_1000 while the PHY
+            // negotiated 100M mis-clocks RGMII and corrupts every TX frame.
+            let cmd = CMD_TX_EN | CMD_RX_EN | CMD_PROMISC;
+            serial_println!("{}   >>> REG WRITE (M2): UMAC_CMD = TX_EN | RX_EN | PROMISC (speed set from PHY autoneg later) ::", PG);
             self.w(UMAC_CMD, cmd);
             barrier();
 
@@ -794,19 +929,33 @@ mod metal {
             return;
         }
 
-        // ── PHY: find the external BCM54213PE and read link (bounded; honest link-down line) ──
+        // ── PHY: find the external BCM54213PE and RESOLVE the negotiated link (autoneg-honest) ──
         nic.phy_addr = nic.find_phy();
-        let link = nic.link_up();
+        let ls = nic.phy_resolve();
         serial_println!(
-            "{}   external PHY (MDIO addr {}) link {} ::",
-            PG, nic.phy_addr, if link { "UP" } else { "DOWN (autoneg pending / no cable)" }
+            "{}   PHY autoneg resolved (MDIO addr {}): link {} · aneg {} · speed {}M · {} ::",
+            PG, nic.phy_addr,
+            if ls.link { "UP" } else { "DOWN (no cable / negotiating)" },
+            if ls.aneg { "COMPLETE" } else { "PENDING" },
+            ls.speed,
+            if ls.full_duplex { "full-duplex" } else { "half-duplex" }
         );
+        // Program UMAC speed/duplex + RGMII link FROM the resolution — never forced.
+        nic.mac_set_from_link(&ls);
 
         *GENET_DEVICE.lock() = Some(nic);
         serial_println!("{}   GENET registered; RX/TX rings live ::", PG);
 
         // ── M3: bind a smoltcp phy::Device over the rings + DHCP/ping (the shared net_phy seam) ──
         bind_smoltcp();
+
+        // ── TX evidence (storm / LED-red-herring classes): compare frames we enqueued against the
+        //    hardware TDMA producer/consumer indices after the whole DHCP+ping exchange. A bounded,
+        //    fully-drained ring (cons==prod, small count) rules out a runaway re-post — the solid
+        //    activity LED is then a benign gigabit-link indication, not a TX storm. ──
+        if let Some(n) = GENET_DEVICE.lock().as_ref() {
+            n.tx_evidence("post-DHCP+ping");
+        }
         serial_println!("{} PI-GENET DONE — GENET v5 driver up + smoltcp bound ::", PG);
     }
 

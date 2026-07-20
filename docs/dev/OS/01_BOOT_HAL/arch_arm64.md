@@ -6310,11 +6310,34 @@ TX, exactly as `bcmgenet_init_dma`. The datapath is a **producer/consumer-index*
 per-descriptor OWN handoff): the driver advances the TX producer index after posting and the RX
 consumer index after draining; hardware advances the mirror index. Bring-up order follows
 `bcmgenet_open` / `init_umac` / `init_dma`: SYS port mode → UMAC soft reset + RBUF/TBUF flush → MAC +
-max-frame-len → MIB reset → RBUF 64B/align → RGMII OOB → RX/TX rings → `UMAC_CMD` TX/RX enable at
-gigabit + promiscuous bring-up filter. Interrupts masked (polled). Every register write is announced on
-serial before issue. The GENET register window lands in the `0xC000_0000..0xFFFF_FFFF` Device GiB
-`boot::build_l1` already maps, so — unlike piusb's outbound window / NET-4's iATU — no new page-table
-write is needed once resolved.
+max-frame-len → MIB reset → RBUF 64B/align → RGMII OOB (mode-enable only) → RX/TX rings → `UMAC_CMD`
+TX/RX enable + promiscuous bring-up filter. Interrupts masked (polled). Every register write is
+announced on serial before issue. The GENET register window lands in the `0xC000_0000..0xFFFF_FFFF`
+Device GiB `boot::build_l1` already maps, so — unlike piusb's outbound window / NET-4's iATU — no new
+page-table write is needed once resolved.
+
+### Autoneg-honest link (PI-GENET-2) — speed/duplex/link taken FROM the PHY, never forced
+
+The M2 bring-up **does not** hand-assert `SPEED_1000` in `UMAC_CMD` or `RGMII_LINK` in
+`EXT_RGMII_OOB_CTRL`. Instead, after `find_phy`, `phy_resolve` reads the external BCM54213PE's
+negotiated result over MDIO — all IEEE 802.3 Clause-22 standard registers: `BMSR` (link + autoneg-
+complete), then the highest-common-denominator technology from our advertisement (`ANAR` 0x04 /
+1000BASE-T control 0x09) intersected with the link partner's ability (`ANLPAR` 0x05 / 1000BASE-T
+status 0x0a). `mac_set_from_link` then programs the `UMAC_CMD` speed bits + `CMD_HD_EN` from that
+resolution and sets `RGMII_LINK` **only** when the PHY reports link (the Linux `bcmgenet_mii_setup`
+discipline). Rationale: forcing `SPEED_1000` while the PHY negotiated 100M mis-clocks the RGMII pins,
+so every TX frame is garbage on the wire — the MAC transmits but no peer parses a valid frame (the
+observed "no DHCP OFFER, solid-yellow transport LED, steady beat on the Mac end" signature). Until the
+PHY resolves, `UMAC_CMD` speed is left at the 10M floor rather than a fast lie.
+
+### TX evidence (storm / LED-red-herring classes)
+
+After the DHCP + ping exchange, `tx_evidence` logs the software frames-enqueued count against the
+hardware TDMA producer/consumer indices (`RING_TDMA_PROD_INDEX` / `RING_TDMA_CONS_INDEX`, hardware-
+advanced as it drains descriptors). `cons == prod` with a small count means the ring fully drained
+with no runaway re-post — a steady activity LED under those readings is a benign gigabit-link
+indication, not a TX storm. The driver's `transmit` bumps the producer index exactly once per frame
+(no retransmit loop); DHCP retransmits originate in smoltcp and are bounded by the 5 s lease timeout.
 
 ### DMA / identity-map + coherency
 
@@ -6337,9 +6360,16 @@ of the index protocol.
 ::   SYS_REV_CTRL = 0x.......6 — LIVE GENET v5 ...; this build MODELS the block ::
 ::   station MAC = <mac> (source: dtb local-mac-address | umac-reg readback) ::
 ::   M2 bring-up ... rings up: RX/TX ring 16 (32 desc each); UMAC_CMD readback ... (live) ::
-::   external PHY (MDIO addr 1) link UP ::
+::   PHY autoneg resolved (MDIO addr 1): link UP · aneg COMPLETE · speed 1000M · full-duplex ::
+::   >>> REG WRITE (M2): UMAC_CMD speed<-1000M full-duplex (from PHY autoneg) ::
+::   >>> REG WRITE (M2): EXT_RGMII_OOB_CTRL RGMII_LINK SET (honoring PHY link) ::
 :: PI-GENET ping <gw> (4/4 sent, N/4 replies) [dhcp] link UP => PASS ::
+::   TX evidence [post-DHCP+ping]: sw frames-enqueued=N (tx_prod=N) | HW TDMA prod_index=N cons_index=N (drained; no storm) ::
 ```
+
+If the PHY instead resolves `speed 100M`, the witness makes the previous forced-1000 mismatch visible
+directly, and the MAC is programmed for 100M so the DISCOVER goes out valid — the class-1 fix. A
+`link DOWN` resolution clears `RGMII_LINK` and the bring-up is an honest bounded no-op.
 
 ### Gates green
 
