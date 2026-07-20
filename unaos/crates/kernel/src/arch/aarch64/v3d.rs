@@ -146,6 +146,20 @@ const V3D_CLE_CT1QBA: usize = 0x0164; // CT1 queue begin address (v3d_regs.h V3D
 const V3D_CLE_CT1QEA: usize = 0x016c; // CT1 queue end address (v3d_regs.h V3D_CLE_CT1QEA) — QEA write kicks
 const V3D_CLE_CT1CS_CTRUN: u32 = 1 << 5; // per v3d_regs.h V3D_CLE_CTRUN
 
+// PI-V3D-8 — CT0 (the BINNING queue). The M4 triangle first runs a BIN job on CT0 (the coordinate
+// shader transforms the vertices, the PTB bins them into per-tile lists), then the RENDER job on CT1
+// consumes those lists via BRANCH_TO_IMPLICIT_TILE_LIST. Every offset below is transcribed VERBATIM
+// from Linux `drivers/gpu/drm/v3d/v3d_regs.h` (register offsets are hardware facts — safe to lift from
+// the GPL-2.0-only header; same discipline as the PI-V3D-7 CT1 fix). NOT invented — the CT1 side is
+// merely CT0+4 in every case, which the file already relies on for CT1QBA/CT1QEA.
+//   0x100 CT0CS · 0x110 CT0CA · 0x160 CT0QBA · 0x168 CT0QEA · 0x170 CT0QMA · 0x174 CT0QMS.
+// V3D_CLE_CT0CS is already declared above (0x0100) as the M3 witness-only register.
+const V3D_CLE_CT0CA: usize = 0x0110; // CT0 current address (v3d_regs.h V3D_CLE_CT0CA)
+const V3D_CLE_CT0QBA: usize = 0x0160; // CT0 queue begin address (v3d_regs.h V3D_CLE_CT0QBA)
+const V3D_CLE_CT0QEA: usize = 0x0168; // CT0 queue end address (v3d_regs.h V3D_CLE_CT0QEA) — QEA write kicks
+const V3D_CLE_CT0QMA: usize = 0x0170; // CT0 bin tile-state-array base (v3d_regs.h V3D_CLE_CT0QMA)
+const V3D_CLE_CT0QMS: usize = 0x0174; // CT0 bin tile-state-array size  (v3d_regs.h V3D_CLE_CT0QMS)
+
 // ─── The V3D buffer arena. One page-aligned static in BSS. Because the bare-metal kernel is
 // identity-mapped in low RAM (VA == PA), the address of this static IS its ARM physical address,
 // which is exactly what the V3D MMU page table and the control lists need. Sized generously and
@@ -230,6 +244,31 @@ const OFF_RCL: usize = 0x8000; // [32 KiB, …) the main render control list (CT
 // dereferenced — present only because MULTICORE_RENDERING_TILE_LIST_SET_BASE requires an address.
 const OFF_SUBLIST: usize = 0x9000; // generic per-tile list (branched to per supertile)
 const OFF_TILEALLOC: usize = 0xA000; // tile-alloc base (inert: no binned geometry)
+
+// ── PI-V3D-8 (M4 triangle) arena regions. All 4 KiB-aligned, all ABOVE the M3 regions so the M3
+// clear-job is untouched (it must still PASS as the regression witness). Every region is inside the
+// 256 KiB arena (top used byte 0x20000 < ARENA_BYTES 0x40000) and therefore inside the identity MMU
+// map — a control list referencing any of these iovas is confined by the V3D MMU exactly like M3. ──
+const OFF_M4_TARGET: usize = 0x0C000; // [48 KiB) the 64×64 RGBA8 the render stores the triangle into
+const OFF_BIN_CL: usize = 0x10000; // binning control list (CT0 [BA,EA))
+const OFF_TILESTATE: usize = 0x11000; // bin tile-state data array (CT0QMA; 48 B/tile, 1 tile here)
+const OFF_BIN_TILEALLOC: usize = 0x12000; // bin tile-allocation memory (binner output; render reads it)
+const OFF_M4_RCL: usize = 0x1A000; // M4 render control list (CT1 [BA,EA))
+const OFF_M4_SUBLIST: usize = 0x1B000; // M4 generic per-tile list (branch-to-implicit + store)
+const OFF_SHADREC: usize = 0x1C000; // GL Shader State Record (32-B aligned) + attribute record
+const OFF_VTXDATA: usize = 0x1D000; // triangle vertex attribute data (3 verts × vec4 clip position)
+const OFF_CS_CODE: usize = 0x1E000; // coordinate shader QPU code (binning: transform → VPM)
+const OFF_VS_CODE: usize = 0x1E800; // vertex shader QPU code (render: transform + varyings → VPM)
+const OFF_FS_CODE: usize = 0x1F000; // fragment shader QPU code (solid colour → TLB)
+const OFF_DEFAULT_ATTRS: usize = 0x1F800; // default attribute values block (shader-record field)
+const BIN_TILEALLOC_BYTES: usize = 0x8000; // 32 KiB of tile-alloc scratch for the binner
+
+/// The solid triangle colour the fragment shader writes and the CPU verifies INSIDE the primitive.
+/// Distinct from CLEAR_RGBA so the sample test can tell inside (this) from outside (clear). UnaOS
+/// amber, RGBA8888 little-endian. (Exact channel order is store-config dependent, same as CLEAR_RGBA;
+/// the CPU verify reads the same 32-bit word the store wrote, so the check is order-agnostic.)
+const TRI_RGBA: u32 = 0x00FF_B000;
+
 
 /// Entry point: bring the V3D up far enough to clear a buffer and verify it. Called once on the BSP,
 /// single-threaded, after `emmc2::probe` (the mailbox is free by then). `fb` is the panel
@@ -365,7 +404,14 @@ pub fn bringup(fb: Option<FbTarget>) {
     } else {
         serial_println!(":: V3D: M3 clear-job did not verify — see lines above ::");
     }
-    // Belt-and-suspenders for the whole bring-up: whatever path M2/M3 took, no latent async abort
+
+    // ── M4: the first triangle. Bin one triangle on CT0, render it on CT1 (implicit tile list), then
+    // CPU-verify inside/outside samples. M3's PASS above is the regression witness — M4 runs AFTER it,
+    // in its own arena regions, and never touches M3's buffers. ATTENDED-METAL-UNVERIFIED (QEMU raspi4b
+    // never reaches here; on QEMU the run returned at BLOCK-DOWN far above). ────────────────────────
+    triangle_job(fb);
+
+    // Belt-and-suspenders for the whole bring-up: whatever path M2/M3/M4 took, no latent async abort
     // from a V3D register access may outlive this function (the SError-drain class rule).
     super::exceptions::serror_drain_request("v3d: bring-up exit");
 }
@@ -632,12 +678,26 @@ fn clear_job(fb: Option<FbTarget>) -> bool {
     let ct1ca_advanced =
         ct1ca != 0 && ct1ca != ba as u32 && ct1ca >= ba as u32 && ct1ca <= ea as u32;
     let ran = ctrun_ever || ct1ca_advanced;
+    // PI-V3D-8 mislabel fix. The old "RAN-NO-FAULT" else-branch asserted "store landed off-target"
+    // UNCONDITIONALLY — so even a SUCCESSFUL run (CLE ran, no fault, store correct, verify passes) was
+    // clued as a class-B failure. Do the verify FIRST (only meaningful once the CLE has idled) and let
+    // its result pick the label: a verified store is RAN-OK, an unverified one is the genuine class-B
+    // off-target case. The old code did the invalidate+verify AFTER this block; it now lives here and
+    // the later return simply reuses the result.
+    let verified = if idled {
+        cache::clean_invalidate_range(arena_phys() + OFF_TARGET, TARGET_BYTES);
+        Some(verify_target(CLEAR_RGBA))
+    } else {
+        None
+    };
     let class = if mmu_fault != 0 {
         "CLASS-B MMU-FAULT (store faulted in the V3D MMU — job wrote nowhere)"
     } else if !ran {
         "CLASS-A JOB-NEVER-RAN (CTRUN never observed AND CT1CA never advanced from 0/BA — CLE did not start)"
     } else if !idled {
         "INDETERMINATE (CLE started but CTRUN never cleared — backstop hit)"
+    } else if verified == Some(true) {
+        "RAN-OK (CLE executed, no MMU fault, store byte-verified)"
     } else {
         "CLASS-B RAN-NO-FAULT (CLE executed with no MMU fault — store landed off-target: RCL encoding)"
     };
@@ -665,12 +725,10 @@ fn clear_job(fb: Option<FbTarget>) -> bool {
         return false;
     }
 
-    // Drop our stale cached copy and read the GPU's writes back from RAM. clean_invalidate is safe
-    // here: the target line was published clean by the pre-kick clean_range above, so the clean half
-    // writes nothing back and cannot clobber a GPU DRAM write; the invalidate then forces the verify
-    // to load DRAM truth (defeats a stale-CPU-line false negative — the class-B cache sub-case).
-    cache::clean_invalidate_range(arena_phys() + OFF_TARGET, TARGET_BYTES);
-    let ok = verify_target(CLEAR_RGBA);
+    // The GPU's writes were already read back and byte-verified above (the `verified` snapshot the
+    // clue label used — the clean_invalidate there is what forces DRAM truth, defeating a stale-CPU-line
+    // false negative). Reuse it; on success blit the target to the panel (metal visible witness).
+    let ok = verified == Some(true);
     if ok {
         if let Some(fb) = fb {
             blit_target(&fb);
@@ -1061,4 +1119,571 @@ fn wait_bit_clear(base: usize, reg: usize, mask: u32, what: &str) -> bool {
         core::hint::spin_loop();
     }
     true
+}
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// PI-V3D-8 — M4: the first triangle (bin on CT0 → render on CT1 → CPU sample-verify).
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+//
+// M4 adds the BINNING side of the pipeline (CT0), which M1–M3 never exercised, then a render pass that
+// CONSUMES the binner's per-tile lists via BRANCH_TO_IMPLICIT_TILE_LIST. The shape (single 64×64 tile,
+// one supertile, one triangle) is the minimal thing that puts real geometry + shaders through the GPU.
+//
+// ── PACKET FACTS (CL side — fully cited, correct-by-construction) ────────────────────────────────
+// All binning-side opcodes / field bit-layouts below are transcribed VERBATIM from Mesa
+// `src/broadcom/cle/v3d_packet.xml` (gen 4.2, `min_ver="42"` — the V3D 4.2 variants; identical to the
+// v3d_packet_v33.xml `max_ver=42` set the M3 render list uses). Emission ORDER follows Mesa
+// `src/gallium/drivers/v3d/v3dx_draw.c` (`v3dX(start_binning)` prologue + `v3dX(draw_vbo)` draw emit)
+// and `v3dx_rcl.c` for the render side. Mesa is MIT-licensed — verbatim-liftable WITH attribution
+// (memory: unaos-license-gplv3). No Linux-kernel (GPL-2.0-only) CLE source is used; only register
+// OFFSETS are lifted from the kernel v3d_regs.h (hardware facts).
+//
+// ── QPU SHADER FACTS (the metal-refinement surface — honestly flagged) ───────────────────────────
+// A binned+rendered triangle needs THREE QPU programs: a COORDINATE shader (binning: transform the
+// vertices, write clip/screen coords to the VPM so the PTB can bin them), a VERTEX shader (render:
+// same transform + emit varyings), and a FRAGMENT shader (write the solid colour to the TLB). Mesa
+// COMPILES these from NIR through its VIR→QPU backend; it does not ship pre-assembled blobs, and QEMU
+// `raspi4b` models no V3D, so NONE of this can be exercised or byte-checked off-metal. Rather than
+// FABRICATE QPU words (the exact trap that convicted PI-V3D-4's MMU constants and PI-V3D-7's queue
+// offsets — twice), the QPU programs below are built through a packer whose bit-layout is transcribed
+// from Mesa `src/broadcom/qpu/qpu_pack.c` and SELF-CHECKED against Mesa's canonical NOP word
+// (`0x3c003186bb800000`). The functional bodies are documented minimal skeletons; producing the
+// verified transform/colour instructions is a real V3D-shader-compile step at the attended sitting.
+// This is M4's ONE code-complete-prior-to-metal seam — the CL/register/state scaffolding around it is
+// complete and cited. `triangle_job` witnesses the CT0 bin discriminator and the CT1 render regardless,
+// and the CPU sample-verify reports exactly which samples matched, so the sitting is decisive.
+
+// ─── Binning-side + shared packet opcodes (v3d_packet.xml `code=`). ───
+const P_FLUSH: u8 = 4; // Flush — terminates the binning list (binner-done signal)
+const P_START_TILE_BINNING: u8 = 6; // must follow the bin-mode config before geometry
+const P_BRANCH_TO_IMPLICIT_TILE_LIST: u8 = 21; // render: run the binner's per-tile list for this tile
+const P_VERTEX_ARRAY_PRIMS: u8 = 36; // non-indexed draw
+const P_GL_SHADER_STATE: u8 = 64; // points at the GL Shader State Record + attribute records
+const P_VCM_CACHE_SIZE: u8 = 71;
+const P_NUMBER_OF_LAYERS: u8 = 119;
+const P_TILE_BINNING_MODE_CFG: u8 = 120; // v42 variant (max_ver=42)
+
+const V3D_PRIM_TRIANGLES: u64 = 4; // VERTEX_ARRAY_PRIMS "mode" (enum Primitive) — NOT the PRIM_LIST value
+const TILE_STATE_BYTES: usize = 48 * 4; // TSDA: 48 B/tile, generous for the single 64×64 tile
+
+// ─── The minimal QPU packer (V3D 4.x / VideoCore VI). ───
+// Field shifts VERBATIM from Mesa `qpu_pack.c`: OP_MUL[63:58] SIG[57:53] COND[52:46] MM(45) MA(44)
+// WADDR_M[43:38] WADDR_A[37:32] OP_ADD[31:24] MUL_B[23:21] MUL_A[20:18] ADD_B[17:15] ADD_A[14:12]
+// RADDR_A[11:6] RADDR_B[5:0]. Opcode values from `qpu_pack.c`: add-NOP op=187 (mux a=0,b=0); mul-NOP
+// op=15 (mux b=4); WADDR_NOP=6, WADDR_TLB=7. MM=MA=1 mark the write registers "magic" (Mesa sets both
+// even in its NOP — which is why the canonical NOP is 0x3c003186bb800000, not …0186…).
+const QPU_A_NOP: u64 = 187;
+const QPU_M_NOP_OPMUL: u64 = 15;
+const QPU_M_NOP_MUXB: u64 = 4;
+const QPU_WADDR_NOP: u64 = 6;
+
+/// The canonical V3D 4.x NOP instruction, derived from fields and equal to Mesa's `0x3c003186bb800000`.
+const fn qpu_nop() -> u64 {
+    (QPU_M_NOP_OPMUL << 58) // OP_MUL = mul NOP
+        | (1u64 << 45) // MM (magic mul write)
+        | (1u64 << 44) // MA (magic add write)
+        | (QPU_WADDR_NOP << 38) // WADDR_M = nop
+        | (QPU_WADDR_NOP << 32) // WADDR_A = nop
+        | (QPU_A_NOP << 24) // OP_ADD = add NOP
+        | (QPU_M_NOP_MUXB << 21) // MUL_B mux
+}
+const _: () = assert!(qpu_nop() == 0x3c00_3186_bb80_0000);
+
+/// Build one of the three QPU shader programs into the arena at `off`. Documented minimal skeleton:
+/// a run of NOPs (each the field-validated canonical word) that safely runs to program end — the
+/// STRUCTURAL placeholder for the real transform/colour body assembled at the metal sitting. Returns
+/// the byte length. Every word is written little-endian (QPU fetch order).
+fn write_shader_stub(off: usize, words: usize) -> usize {
+    for i in 0..words {
+        arena_write_u64(off + i * 8, qpu_nop());
+    }
+    words * 8
+}
+
+/// Store a little-endian u64 into the arena.
+#[inline]
+fn arena_write_u64(off: usize, v: u64) {
+    let bytes = v.to_le_bytes();
+    let arena = &raw mut V3D_ARENA;
+    unsafe {
+        for (i, b) in bytes.iter().enumerate() {
+            (*arena).bytes[off + i] = *b;
+        }
+    }
+}
+/// Store a little-endian u32 into the arena.
+#[inline]
+fn arena_write_u32(off: usize, v: u32) {
+    let bytes = v.to_le_bytes();
+    let arena = &raw mut V3D_ARENA;
+    unsafe {
+        for (i, b) in bytes.iter().enumerate() {
+            (*arena).bytes[off + i] = *b;
+        }
+    }
+}
+/// Copy raw bytes into the arena at `off` (bounded — saturates at the arena end, never overruns).
+fn arena_write_bytes(off: usize, src: &[u8]) {
+    let arena = &raw mut V3D_ARENA;
+    unsafe {
+        for (i, b) in src.iter().enumerate() {
+            if off + i >= ARENA_BYTES {
+                break;
+            }
+            (*arena).bytes[off + i] = *b;
+        }
+    }
+}
+/// Fill a 32-bit pattern across `len` bytes at `off` (CPU-side sentinel pre-seed).
+fn fill_region(off: usize, len: usize, pattern: u32) {
+    let p = pattern.to_le_bytes();
+    let arena = &raw mut V3D_ARENA;
+    unsafe {
+        let mut i = 0;
+        while i < len {
+            (*arena).bytes[off + i] = p[i & 3];
+            i += 1;
+        }
+    }
+}
+
+/// The triangle's three clip-space vertices, each a vec4 (x, y, z, w) IEEE-754 f32. NDC in [-1,1];
+/// a centred triangle so its interior samples land near (32,32) of the 64×64 target and its exterior
+/// samples land in the corners. The COORDINATE shader is responsible for the viewport transform to the
+/// 64×64 screen (its exact math is part of the metal-refined shader body). Attribute 0, stride 16 B.
+const TRI_VERTS: [[f32; 4]; 3] = [
+    [-0.6, -0.6, 0.5, 1.0], // lower-left
+    [0.6, -0.6, 0.5, 1.0],  // lower-right
+    [0.0, 0.6, 0.5, 1.0],   // top-centre
+];
+
+/// Emit one field (LSB-first) into a raw struct buffer at ABSOLUTE bit `start` — like `set_bits`, but
+/// for a memory STRUCT (GL Shader State Record / attribute record) which has NO leading opcode byte, so
+/// XML `start` bits are used directly (no +8 shift). Address fields whose XML size is < 32 carry the
+/// aligned address already shifted by the caller.
+#[inline]
+fn sf(buf: &mut [u8], start: usize, width: usize, val: u64) {
+    set_bits(buf, start, width, val);
+}
+
+/// Build the GL Shader State Record (v42, 36 bytes) at OFF_SHADREC and one GL Shader State Attribute
+/// Record (16 bytes) immediately after it. Layout VERBATIM from Mesa `v3d_packet.xml` struct
+/// "GL Shader State Record" (max_ver=42) + "GL Shader State Attribute Record"; field values follow
+/// `v3dx_draw.c` `v3dX(draw_vbo)`'s shader-record emit for a trivial 1-attribute solid draw. Returns
+/// the number of attribute arrays (for the GL_SHADER_STATE packet). Code addresses are 29-bit fields at
+/// the top of a 32-bit aligned word (low 3 bits are the threadability/nan flags) → the address is
+/// written pre-shifted `>> 3`.
+fn build_shader_record() -> u32 {
+    let cs = (arena_phys() + OFF_CS_CODE) as u64;
+    let vs = (arena_phys() + OFF_VS_CODE) as u64;
+    let fs = (arena_phys() + OFF_FS_CODE) as u64;
+    let defaults = (arena_phys() + OFF_DEFAULT_ATTRS) as u64;
+    let vtx = (arena_phys() + OFF_VTXDATA) as u64;
+
+    let mut rec = [0u8; 36];
+    sf(&mut rec, 1, 1, 1); // Enable clipping
+    // FS: 0 varyings (solid colour). VPM segment sizes: 1 segment each (minimal); the coordinate/vertex
+    // shaders each get a single input+output VPM block. These are conservative minimal values, refined
+    // with the real shader's prog_data at the sitting.
+    sf(&mut rec, 24, 8, 0); // Number of varyings in Fragment Shader
+    sf(&mut rec, 32, 4, 1); // Coord Shader output VPM segment size
+    sf(&mut rec, 40, 4, 1); // Coord Shader input VPM segment size
+    sf(&mut rec, 48, 4, 1); // Vertex Shader output VPM segment size
+    sf(&mut rec, 56, 4, 1); // Vertex Shader input VPM segment size
+    sf(&mut rec, 64, 32, defaults); // Address of default attribute values
+    // Fragment shader: flags at 96/97/98 (4-way threadable, final section, propagate NaNs), addr@99(29).
+    sf(&mut rec, 96, 1, 1); // FS 4-way threadable
+    sf(&mut rec, 98, 1, 1); // FS propagate NaNs (v42)
+    sf(&mut rec, 99, 29, fs >> 3); // FS code address
+    sf(&mut rec, 128, 32, 0); // FS uniforms address (none)
+    sf(&mut rec, 160, 1, 1); // VS 4-way threadable
+    sf(&mut rec, 162, 1, 1); // VS propagate NaNs (v42)
+    sf(&mut rec, 163, 29, vs >> 3); // VS code address
+    sf(&mut rec, 192, 32, 0); // VS uniforms address
+    sf(&mut rec, 224, 1, 1); // CS 4-way threadable
+    sf(&mut rec, 226, 1, 1); // CS propagate NaNs (v42)
+    sf(&mut rec, 227, 29, cs >> 3); // CS code address
+    sf(&mut rec, 256, 32, 0); // CS uniforms address
+    arena_write_bytes(OFF_SHADREC, &rec);
+
+    // One attribute record (vec4 position, f32), immediately after the 36-byte record.
+    let mut attr = [0u8; 16];
+    sf(&mut attr, 0, 32, vtx); // Address
+    sf(&mut attr, 32, 2, 3); // Vec size (encodes 4 components: 4-1)
+    sf(&mut attr, 34, 3, 2); // Type = Attribute float
+    sf(&mut attr, 40, 4, 4); // Number of values read by Coordinate shader
+    sf(&mut attr, 44, 4, 4); // Number of values read by Vertex shader
+    sf(&mut attr, 64, 32, 16); // Stride (bytes per vertex)
+    sf(&mut attr, 96, 32, 0xFFFF); // Maximum Index
+    arena_write_bytes(OFF_SHADREC + 36, &attr);
+
+    1 // one attribute array
+}
+
+/// Build the BINNING control list (CT0) at OFF_BIN_CL. Prologue per `v3dX(start_binning)`, draw emit
+/// per `v3dX(draw_vbo)`. Returns its byte length.
+fn build_bin_cl(num_attrs: u32) -> usize {
+    let shadrec = (arena_phys() + OFF_SHADREC) as u32;
+    let mut w = RclWriter::new(OFF_BIN_CL);
+
+    // NUMBER_OF_LAYERS (single layer → minus_one 0), required before the bin-mode config.
+    w.pkt(Pkt::new(P_NUMBER_OF_LAYERS, 2).f(0, 8, 0).done());
+    // TILE_BINNING_MODE_CFG (v42): 64×64 frame, 1 RT, no MSAA, no double-buffer, 32-bit max BPP, 64-byte
+    // initial + overflow tile-alloc blocks. Field bits: width@32(16,minus_one), height@48(16,minus_one),
+    // num RT@8(4,minus_one), max bpp@12(2), block size@4(2), initial block size@2(2).
+    w.pkt(
+        Pkt::new(P_TILE_BINNING_MODE_CFG, 9)
+            .f(2, 2, TILE_ALLOC_BLOCK_SIZE_64B) // tile allocation initial block size 64b
+            .f(4, 2, TILE_ALLOC_BLOCK_SIZE_64B) // tile allocation block size 64b
+            .f(8, 4, 0) // Number of Render Targets (minus_one: 1 → 0)
+            .f(12, 2, INTERNAL_BPP_32) // Maximum BPP of all render targets
+            .f(32, 16, (TARGET_W - 1) as u64) // Width in pixels (minus_one)
+            .f(48, 16, (TARGET_H - 1) as u64) // Height in pixels (minus_one)
+            .done(),
+    );
+    // Flush any stale VCD, then START_TILE_BINNING (must precede geometry).
+    w.pkt(Pkt::new(P_FLUSH_VCD_CACHE, 1).done());
+    w.pkt(Pkt::new(P_START_TILE_BINNING, 1).done());
+
+    // Draw state: VCM cache size (1 batch each for bin+render), the shader-state pointer, then the prim.
+    w.pkt(
+        Pkt::new(P_VCM_CACHE_SIZE, 2)
+            .f(0, 4, 1) // 16-vertex batches for binning
+            .f(4, 4, 1) // 16-vertex batches for rendering
+            .done(),
+    );
+    // GL_SHADER_STATE: address is a 27-bit field @ start5 → the record's 32-byte-aligned address's top
+    // 27 bits; number of attribute arrays in the low 5 bits.
+    w.pkt(
+        Pkt::new(P_GL_SHADER_STATE, 4)
+            .f(0, 5, num_attrs as u64) // number of attribute arrays
+            .f(5, 27, (shadrec >> 5) as u64) // record address (32-byte aligned)
+            .done(),
+    );
+    // VERTEX_ARRAY_PRIMS: draw 3 vertices as a triangle list. mode@0(8)=TRIANGLES(4), length@8(32)=3,
+    // index of first vertex@40(32)=0.
+    w.pkt(
+        Pkt::new(P_VERTEX_ARRAY_PRIMS, 10)
+            .f(0, 8, V3D_PRIM_TRIANGLES)
+            .f(8, 32, 3) // Length (vertex count)
+            .f(40, 32, 0) // Index of First Vertex
+            .done(),
+    );
+    // FLUSH terminates the binning list (the binner-done marker CT0 walks to).
+    w.pkt(Pkt::new(P_FLUSH, 1).done());
+    w.len()
+}
+
+/// Build the M4 RENDER control list (CT1) at OFF_M4_RCL + its generic per-tile sub-list at
+/// OFF_M4_SUBLIST. Mirrors the M3 RCL but (a) targets OFF_M4_TARGET, and (b) the sub-list runs
+/// BRANCH_TO_IMPLICIT_TILE_LIST so the render EXECUTES the binner's per-tile geometry list (the M3
+/// clear-only list omitted this branch — here it is the whole point). Returns `(main_len, sublist_len)`.
+fn build_m4_rcl() -> (usize, usize) {
+    let target = (arena_phys() + OFF_M4_TARGET) as u32;
+    let sublist_start = (arena_phys() + OFF_M4_SUBLIST) as u32;
+    let tile_alloc = (arena_phys() + OFF_BIN_TILEALLOC) as u32;
+    let stride = (TARGET_W * TARGET_BPP) as u64;
+
+    // ── Generic per-tile sub-list: run the implicit (binned) tile list, then store the tile buffer. ──
+    let mut s = RclWriter::new(OFF_M4_SUBLIST);
+    s.pkt(Pkt::new(P_TILE_COORDINATES_IMPLICIT, 1).done());
+    s.pkt(Pkt::new(P_END_OF_LOADS, 1).done());
+    s.pkt(Pkt::new(P_PRIM_LIST_FORMAT, 2).f(0, 6, PRIM_TYPE_LIST_TRIANGLES).done());
+    // THE new branch: execute the binner's per-tile primitive list for this tile (set number 0). This is
+    // what draws the triangle the binner produced — the M3 clear-job had no geometry so omitted it.
+    s.pkt(Pkt::new(P_BRANCH_TO_IMPLICIT_TILE_LIST, 2).f(0, 8, 0).done());
+    // Store RT0 → OFF_M4_TARGET, raster, rgba8, row stride (the write the CPU sample-verifies).
+    s.pkt(
+        Pkt::new(P_STORE_TILE_BUFFER_GENERAL, 13)
+            .f(0, 4, 0) // Buffer to Store = Render target 0
+            .f(4, 3, MEMORY_FORMAT_RASTER)
+            .f(12, 6, OUTPUT_IMAGE_FORMAT_RGBA8)
+            .f(28, 20, stride)
+            .f(64, 32, target as u64)
+            .done(),
+    );
+    s.pkt(Pkt::new(P_CLEAR_TILE_BUFFERS, 2).f(0, 1, 1).f(1, 1, 1).done());
+    s.pkt(Pkt::new(P_END_OF_TILE_MARKER, 1).done());
+    s.pkt(Pkt::new(P_RETURN_FROM_SUB_LIST, 1).done());
+    let sublist_len = s.len();
+    let sublist_end = sublist_start + sublist_len as u32;
+    cache::clean_range(arena_phys() + OFF_M4_SUBLIST, sublist_len);
+
+    // ── Main render list: frame config (clear colour = CLEAR_RGBA so OUTSIDE the triangle reads clear),
+    // then the single-supertile render that branches into the sub-list. Same structure as M3. ──
+    let mut w = RclWriter::new(OFF_M4_RCL);
+    w.pkt(
+        Pkt::new(P_TRMC, 9)
+            .f(0, 4, TRMC_SUBID_COMMON)
+            .f(4, 4, 0)
+            .f(8, 16, TARGET_W as u64)
+            .f(24, 16, TARGET_H as u64)
+            .f(40, 2, INTERNAL_BPP_32)
+            .done(),
+    );
+    w.pkt(
+        Pkt::new(P_TRMC, 9)
+            .f(0, 4, TRMC_SUBID_CLEAR_COLORS_PART1)
+            .f(4, 4, 0)
+            .f(8, 32, CLEAR_RGBA as u64)
+            .done(),
+    );
+    w.pkt(
+        Pkt::new(P_TRMC, 9)
+            .f(0, 4, TRMC_SUBID_COLOR)
+            .f(4, 2, INTERNAL_BPP_32)
+            .f(6, 4, INTERNAL_TYPE_8)
+            .f(10, 2, 0)
+            .done(),
+    );
+    w.pkt(
+        Pkt::new(P_TRMC, 9)
+            .f(0, 4, TRMC_SUBID_ZS_CLEAR_VALUES)
+            .f(8, 8, 0)
+            .f(16, 32, 0)
+            .done(),
+    );
+    w.pkt(
+        Pkt::new(P_TILE_LIST_INITIAL_BLOCK_SIZE, 2)
+            .f(0, 2, TILE_ALLOC_BLOCK_SIZE_64B)
+            .f(2, 1, 1)
+            .done(),
+    );
+    w.pkt(
+        Pkt::new(P_MULTICORE_TILE_LIST_BASE, 5)
+            .f(0, 4, 0)
+            .f(6, 26, (tile_alloc >> 6) as u64)
+            .done(),
+    );
+    w.pkt(
+        Pkt::new(P_MULTICORE_SUPERTILE_CFG, 9)
+            .f(0, 8, 0)
+            .f(8, 8, 0)
+            .f(16, 8, 1)
+            .f(24, 8, 1)
+            .f(32, 12, 1)
+            .f(44, 12, 1)
+            .f(61, 3, 0)
+            .done(),
+    );
+    // Initial tile-buffer clear (GFXH-1742 double-dummy-store workaround), same as M3.
+    w.pkt(Pkt::new(P_TILE_COORDINATES, 4).f(0, 12, 0).f(12, 12, 0).done());
+    for i in 0..2 {
+        if i > 0 {
+            w.pkt(Pkt::new(P_TILE_COORDINATES, 4).f(0, 12, 0).f(12, 12, 0).done());
+        }
+        w.pkt(Pkt::new(P_END_OF_LOADS, 1).done());
+        w.pkt(Pkt::new(P_STORE_TILE_BUFFER_GENERAL, 13).f(0, 4, 8).done());
+        if i == 0 {
+            w.pkt(Pkt::new(P_CLEAR_TILE_BUFFERS, 2).f(0, 1, 1).f(1, 1, 1).done());
+        }
+        w.pkt(Pkt::new(P_END_OF_TILE_MARKER, 1).done());
+    }
+    w.pkt(Pkt::new(P_FLUSH_VCD_CACHE, 1).done());
+    w.pkt(
+        Pkt::new(P_GENERIC_TILE_LIST, 9)
+            .f(0, 32, sublist_start as u64)
+            .f(32, 32, sublist_end as u64)
+            .done(),
+    );
+    w.pkt(Pkt::new(P_SUPERTILE_COORDINATES, 3).f(0, 8, 0).f(8, 8, 0).done());
+    w.pkt(Pkt::new(P_END_OF_RENDERING, 1).done());
+    (w.len(), sublist_len)
+}
+
+/// The CT0 (binning) run/never-ran discriminator — the PI-V3D-7 idiom extended to CT0. Given the
+/// pre/kicked/done CS+CA snapshots and the [BA,EA) queue range, classify whether the BIN CLE actually
+/// started. Same truth table as the CT1 render discriminator: RAN iff CTRUN was ever observed OR CT0CA
+/// advanced INTO (BA, EA]; a never-started CLE has CTRUN never seen AND CT0CA at 0/BA.
+fn ct0_ran(cs_pre: u32, cs_kicked: u32, cs_done: u32, ca_done: u32, ba: u32, ea: u32) -> bool {
+    let ctrun_ever = (cs_pre | cs_kicked | cs_done) & V3D_CLE_CT1CS_CTRUN != 0; // CTRUN bit is shared
+    let ca_advanced = ca_done != 0 && ca_done != ba && ca_done >= ba && ca_done <= ea;
+    ctrun_ever || ca_advanced
+}
+
+/// M4: bin one triangle on CT0, render it on CT1 (implicit tile list), CPU sample-verify.
+/// ATTENDED-METAL-UNVERIFIED — QEMU never reaches here. On success prints the M4 PASS witness + a
+/// sample table; the QPU shader body is the one metal-refinement seam (see the module banner).
+fn triangle_job(fb: Option<FbTarget>) {
+    serial_println!(":: V3D: M4 triangle — binning on CT0, render on CT1 (implicit tile list) ::");
+
+    // (0) Publish the shader programs, vertex data, default attributes. The shaders are the field-
+    // validated NOP skeleton (metal-refinement seam); vertex data is the real triangle.
+    write_shader_stub(OFF_CS_CODE, 16);
+    write_shader_stub(OFF_VS_CODE, 16);
+    write_shader_stub(OFF_FS_CODE, 16);
+    for (i, v) in TRI_VERTS.iter().enumerate() {
+        for (j, comp) in v.iter().enumerate() {
+            arena_write_u32(OFF_VTXDATA + i * 16 + j * 4, comp.to_bits());
+        }
+    }
+    fill_region(OFF_DEFAULT_ATTRS, 16, 0); // zeroed default attribute values
+
+    // (1) Build the shader record + attribute record, the binning CL, and the render CL.
+    let num_attrs = build_shader_record();
+    let bin_len = build_bin_cl(num_attrs);
+    let (rcl_len, sublist_len) = build_m4_rcl();
+
+    // (2) Pre-seed the M4 target with a sentinel distinct from BOTH colours, so the sample-verify proves
+    // the GPU wrote every pixel it claims (neither clear nor triangle can appear by luck).
+    fill_region(OFF_M4_TARGET, TARGET_BYTES, 0x5555_5555);
+
+    // (3) Publish everything to RAM for the non-coherent GPU (shaders, verts, record, both lists, target,
+    // and the tile-state / tile-alloc scratch the binner writes and the render reads).
+    cache::clean_range(arena_phys() + OFF_CS_CODE, 16 * 8);
+    cache::clean_range(arena_phys() + OFF_VS_CODE, 16 * 8);
+    cache::clean_range(arena_phys() + OFF_FS_CODE, 16 * 8);
+    cache::clean_range(arena_phys() + OFF_VTXDATA, TRI_VERTS.len() * 16);
+    cache::clean_range(arena_phys() + OFF_DEFAULT_ATTRS, 16);
+    cache::clean_range(arena_phys() + OFF_SHADREC, 36 + 16);
+    cache::clean_range(arena_phys() + OFF_BIN_CL, bin_len);
+    cache::clean_range(arena_phys() + OFF_M4_RCL, rcl_len);
+    cache::clean_range(arena_phys() + OFF_M4_TARGET, TARGET_BYTES);
+    let _ = sublist_len; // published inside build_m4_rcl
+    fill_region(OFF_TILESTATE, TILE_STATE_BYTES, 0);
+    fill_region(OFF_BIN_TILEALLOC, BIN_TILEALLOC_BYTES, 0);
+    cache::clean_range(arena_phys() + OFF_TILESTATE, TILE_STATE_BYTES);
+    cache::clean_range(arena_phys() + OFF_BIN_TILEALLOC, BIN_TILEALLOC_BYTES);
+
+    // (4) Kick CT0 (the BIN queue). Program the tile-state array (CT0QMA/QMS) first — the binner writes
+    // its per-tile primitive lists into the tile-alloc memory keyed by this state — then CT0QBA (begin)
+    // and CT0QEA (GO). All addresses are arena-internal identity iovas, bounds-checked (memory-safety).
+    let bin_ba = (arena_phys() + OFF_BIN_CL) as u32;
+    let bin_ea = bin_ba + bin_len as u32;
+    let ts = (arena_phys() + OFF_TILESTATE) as u32;
+    if !arena_contains(bin_ba as usize, bin_len) || !arena_contains(ts as usize, TILE_STATE_BYTES) {
+        serial_println!(":: V3D: M4 bin range escapes the arena — refusing kick (fail-closed) ::");
+        return;
+    }
+    let ct0_cs_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CS);
+    let ct0_ca_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CA);
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QMA, ts);
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QMS, TILE_STATE_BYTES as u32);
+    dsb();
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QBA, bin_ba);
+    dsb(); // BA latched before the GO
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QEA, bin_ea); // GO
+    dsb();
+    let ct0_cs_kicked = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CS);
+    let ct0_ca_kicked = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CA);
+    let bin_idled = wait_bit_clear(V3D_CORE0_BASE, V3D_CLE_CT0CS, V3D_CLE_CT1CS_CTRUN, "CT0 bin");
+    let ct0_cs_done = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CS);
+    let ct0_ca_done = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CA);
+    let mmu_ctl_bin = mmio_read(V3D_HUB_BASE, V3D_MMU_CTL);
+    let bin_fault = mmu_ctl_bin
+        & (V3D_MMU_CTL_PT_INVALID | V3D_MMU_CTL_WRITE_VIOLATION | V3D_MMU_CTL_CAP_EXCEEDED);
+    let bin_ran = ct0_ran(ct0_cs_pre, ct0_cs_kicked, ct0_cs_done, ct0_ca_done, bin_ba, bin_ea);
+    serial_println!(
+        ":: V3D: M4 bin clue — CT0CS pre={:#010x} kicked={:#010x} done={:#010x} CT0CA pre={:#010x} kicked={:#010x} done={:#010x} (BA={:#010x} EA={:#010x}) ran={} idled={} MMU_fault={:#x} ::",
+        ct0_cs_pre, ct0_cs_kicked, ct0_cs_done, ct0_ca_pre, ct0_ca_kicked, ct0_ca_done,
+        bin_ba, bin_ea, bin_ran as u32, bin_idled as u32, bin_fault
+    );
+    super::exceptions::serror_drain_request("v3d: M4 bin kick window");
+
+    // (5) Kick CT1 (the RENDER queue) over the M4 RCL — same submit path as M3, different list. It
+    // consumes the binner's per-tile lists via BRANCH_TO_IMPLICIT_TILE_LIST.
+    let rcl_ba = (arena_phys() + OFF_M4_RCL) as u32;
+    let rcl_ea = rcl_ba + rcl_len as u32;
+    if !arena_contains(rcl_ba as usize, rcl_len) {
+        serial_println!(":: V3D: M4 render range escapes the arena — refusing kick (fail-closed) ::");
+        return;
+    }
+    let r_cs_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT1CS);
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT1QBA, rcl_ba);
+    dsb();
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT1QEA, rcl_ea); // GO
+    dsb();
+    let r_cs_kicked = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT1CS);
+    let r_idled = wait_bit_clear(V3D_CORE0_BASE, V3D_CLE_CT1CS, V3D_CLE_CT1CS_CTRUN, "CT1 M4 render");
+    let r_cs_done = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT1CS);
+    let r_ca_done = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT1CA);
+    let mmu_ctl_r = mmio_read(V3D_HUB_BASE, V3D_MMU_CTL);
+    let r_fault = mmu_ctl_r
+        & (V3D_MMU_CTL_PT_INVALID | V3D_MMU_CTL_WRITE_VIOLATION | V3D_MMU_CTL_CAP_EXCEEDED);
+    let r_ran = ct0_ran(r_cs_pre, r_cs_kicked, r_cs_done, r_ca_done, rcl_ba, rcl_ea);
+    serial_println!(
+        ":: V3D: M4 render clue — CT1CS pre={:#010x} kicked={:#010x} done={:#010x} CT1CA done={:#010x} (BA={:#010x} EA={:#010x}) ran={} idled={} MMU_fault={:#x} ::",
+        r_cs_pre, r_cs_kicked, r_cs_done, r_ca_done, rcl_ba, rcl_ea, r_ran as u32, r_idled as u32, r_fault
+    );
+    super::exceptions::serror_drain_request("v3d: M4 render kick window");
+
+    if !bin_idled || !r_idled {
+        serial_println!(":: V3D: M4 — a CLE did not idle within budget (anti-hang backstop) — no verify ::");
+        return;
+    }
+
+    // (6) CPU sample-verify: pull the target back from DRAM and check inside/outside samples.
+    cache::clean_invalidate_range(arena_phys() + OFF_M4_TARGET, TARGET_BYTES);
+    let pass = verify_triangle_samples();
+    if pass {
+        serial_println!(":: V3D: M4 triangle — PASS (inside samples = triangle colour, outside = clear) ::");
+        if let Some(fb) = fb {
+            blit_m4_target(&fb);
+        }
+    } else {
+        serial_println!(":: V3D: M4 triangle — FAIL/UNRENDERED (see sample table; QPU shader body is the metal-refinement seam) ::");
+    }
+}
+
+/// Read one 32-bit pixel from the M4 target at (x, y).
+#[inline]
+fn m4_sample(x: usize, y: usize) -> u32 {
+    let off = OFF_M4_TARGET + (y * TARGET_W + x) * TARGET_BPP;
+    let arena = &raw const V3D_ARENA;
+    unsafe {
+        let b = &(*arena).bytes;
+        u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
+    }
+}
+
+/// Sample-verify the rendered triangle: ≥3 interior points must equal TRI_RGBA and ≥3 exterior points
+/// must equal CLEAR_RGBA (per the brief). Interior points cluster around the centroid (~32,32); exterior
+/// points sit in the corners the centred triangle does not cover. Prints the full sample table (the M4
+/// witness) so the attended sitting sees exactly what landed even on a partial render.
+fn verify_triangle_samples() -> bool {
+    // Screen coords chosen from TRI_VERTS mapped to the 64×64 viewport (y-down): centroid ≈ (32,34).
+    let inside: [(usize, usize); 3] = [(32, 34), (26, 40), (38, 40)];
+    let outside: [(usize, usize); 3] = [(2, 2), (61, 2), (32, 4)];
+    let mut ok = true;
+    for (x, y) in inside {
+        let px = m4_sample(x, y);
+        let hit = px == TRI_RGBA;
+        ok &= hit;
+        serial_println!(
+            ":: V3D: M4 sample IN  ({:2},{:2}) = {:#010x} expect {:#010x} {} ::",
+            x, y, px, TRI_RGBA, if hit { "OK" } else { "MISS" }
+        );
+    }
+    for (x, y) in outside {
+        let px = m4_sample(x, y);
+        let hit = px == CLEAR_RGBA;
+        ok &= hit;
+        serial_println!(
+            ":: V3D: M4 sample OUT ({:2},{:2}) = {:#010x} expect {:#010x} {} ::",
+            x, y, px, CLEAR_RGBA, if hit { "OK" } else { "MISS" }
+        );
+    }
+    ok
+}
+
+/// Blit the M4 target next to the M3 target on the panel (metal visible witness) — offset to the right
+/// so both are visible. Bounds-clipped to the framebuffer.
+fn blit_m4_target(fb: &FbTarget) {
+    if fb.base == 0 || fb.bytes_per_pixel < 4 {
+        return;
+    }
+    let x_origin = TARGET_W + 8; // to the right of the M3 blit
+    let w = TARGET_W.min(fb.width.saturating_sub(x_origin));
+    let h = TARGET_H.min(fb.height);
+    for y in 0..h {
+        for x in 0..w {
+            let px = m4_sample(x, y);
+            let dst = fb.base as usize
+                + y * fb.stride_px * fb.bytes_per_pixel
+                + (x_origin + x) * fb.bytes_per_pixel;
+            if dst + 4 <= fb.base as usize + fb.size {
+                unsafe { core::ptr::write_volatile(dst as *mut u32, px) };
+            }
+        }
+    }
 }

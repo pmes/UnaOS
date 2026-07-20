@@ -6167,6 +6167,66 @@ path itself is refused on this part (the "does V3D 4.2 need a non-CTnQ submit pa
 the submit path here matches exactly what the kernel v3d driver writes for render, so the corrected
 offsets are the expected resolution. QEMU `raspi4b` still stops at BLOCK-DOWN (no V3D modelled).
 
+### PI-V3D-8 — M4: the first triangle (bin on CT0 → render on CT1 → CPU sample-verify)
+
+M1–M3 proved the non-graphics chain and the render side (RCL + tile stores). **M4 adds the binning
+side (CT0)** — the coordinate shader + PTB path that turns vertices into per-tile primitive lists —
+and a render pass that **consumes** those lists via `BRANCH_TO_IMPLICIT_TILE_LIST`. Shape: a single
+64×64 tile / one supertile / one triangle. The M3 clear-job runs first and unchanged as the
+**regression witness**; M4 lives in its own arena regions (all `≥ 0xC000`, all inside the identity MMU
+map) and never touches M3's buffers.
+
+**The pipeline (two kicks).** (1) A **BIN** job on CT0: `NUMBER_OF_LAYERS` → `TILE_BINNING_MODE_CFG`
+(v42) → `FLUSH_VCD_CACHE` → `START_TILE_BINNING` → `VCM_CACHE_SIZE` → `GL_SHADER_STATE` (points at the
+shader-state record) → `VERTEX_ARRAY_PRIMS` (3 verts, mode `TRIANGLES`) → `FLUSH`. Submitted by
+writing the tile-state array to `CT0QMA`/`CT0QMS`, then `CT0QBA` (begin) and `CT0QEA` (**GO**). (2) A
+**RENDER** job on CT1: the M3 RCL structure, but its generic per-tile sub-list now runs
+`BRANCH_TO_IMPLICIT_TILE_LIST` (set 0) so the render executes the binner's geometry before the tile
+store. Clear colour = `CLEAR_RGBA`, so pixels **outside** the triangle read clear and **inside** read
+the fragment-shader colour `TRI_RGBA`. The CPU then samples ≥3 interior points (expect `TRI_RGBA`) and
+≥3 exterior points (expect `CLEAR_RGBA`) and prints the full sample table.
+
+**The CT0 register offsets (the fabricated-offset trap — verified).** `CT0CS 0x100 · CT0CA 0x110 ·
+CT0QBA 0x160 · CT0QEA 0x168 · CT0QMA 0x170 · CT0QMS 0x174`, transcribed VERBATIM from
+`drivers/gpu/drm/v3d/v3d_regs.h` (register offsets are hardware facts). The CT1 side the file already
+trusts (`CT1QBA 0x164`/`CT1QEA 0x16c`) is exactly CT0+4 in every case — the same table.
+
+**The CT0 run/never-ran discriminator.** The PI-V3D-7 idiom is extended to CT0 (`ct0_ran`): the BIN CLE
+RAN iff `CTRUN` was ever observed (pre/kicked/done) **OR** `CT0CA` advanced INTO `(BA, EA]`; a
+never-started CLE has `CTRUN` never seen AND `CT0CA` at `0`/`BA`. Both kicks print a clue line with the
+CS/CA triples + `ran=`/`idled=`/`MMU_fault=`, so the attended sitting is decisive per queue.
+
+**The cosmetic mislabel fix (PI-V3D-5 nit).** The M3 clue's `RAN-NO-FAULT` else-branch asserted "store
+landed off-target" *unconditionally* — so a **successful** run was still clued as class-B. The verify
+now runs before the clue and its result picks the label: a byte-verified store prints **`RAN-OK`**, an
+unverified one keeps the genuine `CLASS-B RAN-NO-FAULT`.
+
+**The QPU shaders — the one metal-refinement seam (honestly flagged).** A binned+rendered triangle
+needs three QPU programs (coordinate, vertex, fragment). Mesa **compiles** these through its VIR→QPU
+backend; it ships no pre-assembled blobs, and QEMU models no V3D, so none of it can be byte-checked
+off-metal. Rather than **fabricate** QPU words (the exact class that convicted the PI-V3D-4 MMU
+constants and the PI-V3D-7 queue offsets — twice), the programs are built through a packer whose
+bit-layout is transcribed from Mesa `src/broadcom/qpu/qpu_pack.c` and **self-checked** against Mesa's
+canonical NOP word `0x3c003186bb800000`. The functional bodies are documented NOP skeletons; producing
+the verified transform/colour instructions is a real V3D-shader-compile step at the attended sitting.
+Everything **around** the shaders — the binning CL, the GL Shader State Record (v42, 36 B) + attribute
+record, the vertex data, the CT0/CT1 kicks and discriminators, the implicit-tile-list render, and the
+sample-verify — is complete and cited. This is M4's code-complete-prior-to-metal standing.
+
+**Expected boot-P5 lines (metal, BLOCK-UP).** M3 still PASSes; the M4 bin clue shows `CTRUN` latch and
+`CT0CA` advance into `(BA,EA]` (`ran=1`); the render clue likewise on CT1; then the sample table. Until
+a real shader is aboard the interior samples will read `CLEAR_RGBA` (`MISS`) — that is the expected
+partial witness that isolates the shader as the remaining work, not a regression:
+```
+:: V3D: M4 bin clue — CT0CS pre=0x… kicked=0x…20 done=0x… CT0CA … (in (BA,EA]) … ran=1 idled=1 MMU_fault=0x0 ::
+:: V3D: M4 render clue — CT1CS … ran=1 idled=1 MMU_fault=0x0 ::
+:: V3D: M4 sample IN  (32,34) = 0x… expect 0x00ffb000 OK|MISS ::
+:: V3D: M4 triangle — PASS (…)   (once a verified shader lands)
+```
+QEMU `raspi4b` still stops at BLOCK-DOWN before any M4 code runs. Packet/register facts: Mesa
+`src/broadcom/cle/v3d_packet.xml` (gen 4.2, `min_ver=42`) + `qpu_pack.c` (MIT, lifted with attribution);
+kernel `v3d_regs.h` register offsets (hardware facts); ordering per `v3dx_draw.c` / `v3dx_rcl.c`.
+
 ### References of record
 
 - Register layout: Linux `drivers/gpu/drm/v3d/v3d_regs.h` (hub + core + MMU offsets, field bits).
@@ -6176,6 +6236,14 @@ offsets are the expected resolution. QEMU `raspi4b` still stops at BLOCK-DOWN (n
   packing convention). **MIT — liftable with attribution** (PI-V3D-6).
 - Render-control-list ordering: Mesa `src/gallium/drivers/v3d/v3dx_rcl.c` (`v3dX(emit_rcl)`,
   `emit_render_layer`, `v3d_rcl_emit_generic_per_tile_list`) — the packet sequence PI-V3D-6 follows.
+- Binning-list packets + shader/attribute records (PI-V3D-8): Mesa `src/broadcom/cle/v3d_packet.xml`
+  (gen 4.2, `min_ver=42` — `TILE_BINNING_MODE_CFG` 120, `START_TILE_BINNING` 6, `VERTEX_ARRAY_PRIMS` 36,
+  `GL_SHADER_STATE` 64, `VCM_CACHE_SIZE` 71, `BRANCH_TO_IMPLICIT_TILE_LIST` 21; structs "GL Shader State
+  Record" v42 + "GL Shader State Attribute Record"). Ordering per `v3dx_draw.c` (`v3dX(start_binning)`,
+  `v3dX(draw_vbo)`). **MIT — liftable with attribution.**
+- QPU instruction encoding (PI-V3D-8): Mesa `src/broadcom/qpu/qpu_pack.c` (the `V3D_QPU_*_SHIFT/_MASK`
+  field layout; canonical NOP `0x3c003186bb800000`, the packer self-check). **MIT — liftable with
+  attribution.** Kernel v3d (GPL-2.0-only) used for register OFFSETS only (hardware facts).
 - Structure reference: librerpi/lk-overlay `v3d.c`.
 - PM / ASB power sequence (PI-V3D-3): Linux `drivers/soc/bcm/bcm2835-power.c` (`bcm2835_asb_power_on`,
   `bcm2835_asb_control`; `PM_GRAFX`/`PM_V3DRSTN`/`PM_PASSWORD`, `ASB_V3D_{S,M}_CTRL`/`ASB_REQ_STOP`/
