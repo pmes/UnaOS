@@ -139,6 +139,30 @@
 // evidence the NIC/RC integration cannot emit >4 GiB TLPs): re-arm the inbound alias per the facts, writing
 // UPPER_BASE + UPPER_TARGET with base congruent to target mod 64 KiB and CTRL2=ENABLE read back.
 //
+// ## NET-4r — the sanctioned fallback fires: boot-24 falsified native-64; re-arm the alias CORRECTLY.
+//
+// Boot-24 ran NET-4q for real: RINGDUMP proved the descriptors carry the FULL 64-bit buffer addresses
+// (`addr=0x2683cb… [MATCH]`, EOR + hi-before-lo ring bases in) — and the result was STILL no lease + the
+// `0x200` IOB `FillWrite`/ACI sink RAS. A provably-correct full-64 descriptor yielding the sink is the
+// first real evidence this RTL8168/Tegra-RC integration cannot emit/carry a >4 GiB DMA TLP: the payload
+// (and, unprovable-otherwise, the ring) truncates to `addr[31:0]` on the wire, landing below the
+// `0x8000_0000` DRAM/identity base → the fabric sink. NET-4q's own falsification clause fires: keep the
+// full-64 descriptor + ring path UNCHANGED (correct per the reference driver, harmless, and the delivery
+// vehicle if the NIC ever emits full-64 natively — the TLP then hits the NET-4h identity region), and
+// re-arm the inbound-iATU ALIAS as the delivery mechanism — CORRECTLY this time, per L4T-FACTS §A0-A5:
+//   * a FREE inbound index per block (`enumerate_inbound_windows` witnesses the region file; index 0 =
+//     the NET-4h identity; aliases take clear indices — §A5, no index collision);
+//   * LOWER/UPPER_BASE ← truncated 32-bit bus base, LIMIT ← 64 KiB-rounded end, LOWER/UPPER_TARGET ← the
+//     real high PA, ALL written AND READ BACK with refuse-to-proceed on any mismatch — the UPPER_TARGET
+//     `0x2` dword boot-20 lost is the whole point (`program_inbound_alias`);
+//   * base ≡ target (mod 64 KiB), both 64 KiB-ALIGNED outright (alloc_rx/alloc_tx nudged to 0x10000), so
+//     the controller's 64 KiB granularity (§A2) rounds nothing (§A3);
+//   * `CTRL2 = ENABLE` only (NO increase-region-size — the match window is sub-4 GiB, §A0/§A2), with the
+//     ENABLE bit POLLED on readback (§A5 the driver loops on it);
+//   * coverage of BOTH the ring and the buffer block of each direction, witnessed (`arm_dma_aliases`).
+// Boot-25 oracle: the enumeration + per-region readbacks all MATCH (UPPER_TARGET=0x2, enabled=1), no
+// `0x200` IOB RAS, `[net4m]` all-nonzero, DHCP LEASE.
+//
 // ## Write discipline
 //
 // The driver, being a driver, DOES the fabric writes NET-3 refused: it enables the device's
@@ -576,6 +600,21 @@ mod metal {
     pub struct Rtl8168 {
         mmio_base: u64,
         mac: [u8; 6],
+        /// NET-4r: controller-0's DWC iATU register block base. The inbound-iATU ALIAS regions (which
+        /// catch the NIC's TRUNCATED ring/payload writes and up-translate them to the real high-heap PAs)
+        /// are armed from `init_rings` — the only place the buffer PAs are known — so the driver keeps the
+        /// ATU base to reach the inbound region slots after allocation.
+        atu_base: u64,
+        /// NET-4r: the NET-4h identity inbound region `[dma_ident_lo, dma_ident_hi)` (all of RAM). Used to
+        /// SKIP arming an alias for any block already sub-4 GiB inside it (the identity region reaches it
+        /// untranslated); the enumeration also reports index 0 as the identity slot.
+        dma_ident_lo: u64,
+        dma_ident_hi: u64,
+        /// NET-4r: controller-0's PCIe MEM `ranges` window `[mem_lo, mem_hi)` — where downstream BARs
+        /// decode. The alias collision check REFUSES any alias window overlapping it (an inbound write into
+        /// that range risks peer-to-peer routing to a BAR instead of upstream to the RC).
+        mem_lo: u64,
+        mem_hi: u64,
         rx_ring: *mut Desc,
         rx_buffers: *mut u8,
         rx_cur: usize,
@@ -688,8 +727,12 @@ mod metal {
         /// in the length field. The `alloc_zeroed` pointer doubles as the physical address (identity
         /// map), matching the x86 e1000 ring allocation. EOR marks the last descriptor.
         fn alloc_rx(&mut self) {
-            let ring_layout = Layout::from_size_align(NUM_RX * core::mem::size_of::<Desc>(), 256).unwrap();
-            let buf_layout = Layout::from_size_align(NUM_RX * RX_BUF_SIZE, 4096).unwrap();
+            // NET-4r: 64 KiB-align the ring AND buffer allocations so the inbound-iATU alias base/target
+            // are 64 KiB-aligned OUTRIGHT (L4T-FACTS §A2/§A3: the DWC controller hardwires BASE/TARGET
+            // low-16 to 0 and LIMIT low-16 to 1, a 64 KiB granularity — aligning here means the region
+            // reads back EXACTLY what was written, with alias_base ≡ target (mod 64 KiB) by construction).
+            let ring_layout = Layout::from_size_align(NUM_RX * core::mem::size_of::<Desc>(), 0x10000).unwrap();
+            let buf_layout = Layout::from_size_align(NUM_RX * RX_BUF_SIZE, 0x10000).unwrap();
             self.rx_ring = unsafe { alloc::alloc::alloc_zeroed(ring_layout) as *mut Desc };
             self.rx_buffers = unsafe { alloc::alloc::alloc_zeroed(buf_layout) };
             // NET-4f: the buffer arena is `alloc_zeroed` → DIRTY zero lines resident in the D-cache.
@@ -714,8 +757,10 @@ mod metal {
         /// Allocate the TX descriptor ring (256-byte aligned) + frame buffers. Descriptors start
         /// host-owned (OWN clear) so `transmit` can post into them; EOR marks the last descriptor.
         fn alloc_tx(&mut self) {
-            let ring_layout = Layout::from_size_align(NUM_TX * core::mem::size_of::<Desc>(), 256).unwrap();
-            let buf_layout = Layout::from_size_align(NUM_TX * TX_BUF_SIZE, 4096).unwrap();
+            // NET-4r: 64 KiB-align (see alloc_rx) so the TX ring/buffer inbound-alias windows land on the
+            // controller's 64 KiB granularity outright.
+            let ring_layout = Layout::from_size_align(NUM_TX * core::mem::size_of::<Desc>(), 0x10000).unwrap();
+            let buf_layout = Layout::from_size_align(NUM_TX * TX_BUF_SIZE, 0x10000).unwrap();
             self.tx_ring = unsafe { alloc::alloc::alloc_zeroed(ring_layout) as *mut Desc };
             self.tx_buffers = unsafe { alloc::alloc::alloc_zeroed(buf_layout) };
             for i in 0..NUM_TX {
@@ -731,6 +776,117 @@ mod metal {
         /// The register-write ORDER follows the RTL8168 programming guide / Linux `r8169` `rtl_hw_start`.
         /// Returns true if a poison-honest readback confirms the device is still answering. Every
         /// register write is announced before issue (they are fabric-visible controller writes).
+        /// NET-4r — arm the inbound-iATU ALIAS regions that catch the NIC's TRUNCATED ring/payload writes
+        /// and up-translate them to the real (high-heap) PAs. Boot-24 proved the full-64 descriptor path
+        /// correct yet the payload still sank (0x200 RAS) — this RC integration truncates the >4 GiB DMA
+        /// TLP, so the alias is NET-4q's sanctioned delivery mechanism. Covers BOTH the ring and buffer
+        /// blocks of each direction: boot-24 could not prove the ring rides un-truncated on THIS silicon,
+        /// so cover it too (a genuinely-full-64 ring TLP simply hits the NET-4h identity region and the
+        /// truncation-keyed alias never matches — harmless). Each block that needs an alias takes a FREE
+        /// inbound index (index 0 = the NET-4h identity region). Returns false (fail-closed) on: an
+        /// alias/target non-congruence, a 4 GiB-crossing window, a PCIe MEM/BAR overlap, an alias-vs-alias
+        /// overlap, no free index, or a readback/enable failure inside `program_inbound_alias`.
+        fn arm_dma_aliases(&self) -> bool {
+            // Witness the inbound region file first: which indices are already programmed (index 0 = the
+            // NET-4h identity) and which are FREE (§A5 — enumerate, do not assume the count).
+            let enabled = enumerate_inbound_windows(self.atu_base);
+            // The four DMA blocks the NIC touches, each (pa, len, tag). Rings + buffers are distinct
+            // 64 KiB-aligned allocations (alloc_rx/alloc_tx).
+            let blocks: [(u64, u64, &str); 4] = [
+                (self.rx_ring as u64, (NUM_RX * core::mem::size_of::<Desc>()) as u64, "rx-ring"),
+                (self.rx_buffers as u64, (NUM_RX * RX_BUF_SIZE) as u64, "rx-buffers"),
+                (self.tx_ring as u64, (NUM_TX * core::mem::size_of::<Desc>()) as u64, "tx-ring"),
+                (self.tx_buffers as u64, (NUM_TX * TX_BUF_SIZE) as u64, "tx-buffers"),
+            ];
+            // Armed alias windows (rounded to the 64 KiB region granularity) for the overlap check, plus a
+            // free-index cursor starting at 1 (0 = identity).
+            let mut armed: [(u64, u64); 4] = [(0, 0); 4];
+            let mut n_armed = 0usize;
+            let mut next_idx = 1u64;
+            for &(pa, len, tag) in blocks.iter() {
+                let alias = pa & 0xFFFF_FFFF;
+                let region_hi = (alias + len + 0xFFFF) & !0xFFFFu64; // 64 KiB-rounded window end (exclusive)
+                // Case A — the block is already sub-4 GiB and inside the identity region: the truncation is
+                // a no-op and NET-4h's identity region already reaches it. No alias needed.
+                if pa == alias && alias >= self.dma_ident_lo && alias + len <= self.dma_ident_hi {
+                    serial_println!(
+                        "{}   [net4r] {} [{:#x}..{:#x}) already inside the identity inbound region [{:#x}..{:#x}) — no alias needed ::",
+                        P4, tag, pa, pa + len, self.dma_ident_lo, self.dma_ident_hi
+                    );
+                    continue;
+                }
+                // Congruence witness (§A3): alias_base ≡ target (mod 64 KiB). alias = pa & 0xFFFF_FFFF, so
+                // the low-16 bits are identical by construction; the 64 KiB-aligned allocation makes both 0.
+                let cong = (alias & 0xFFFF) == (pa & 0xFFFF);
+                let aligned = (alias & 0xFFFF) == 0;
+                serial_println!(
+                    "{}   [net4r] {} congruence: alias {:#x} = target {:#x} (mod 64KiB){} both-64KiB-aligned={} ::",
+                    P4, tag, alias, pa, if cong { " OK" } else { " FAIL" }, aligned as u8
+                );
+                if !cong {
+                    serial_println!(
+                        "{}   !! [net4r] {} alias/target NOT congruent mod 64 KiB — would mistranslate by the low-16 delta; REFUSING ::",
+                        P4, tag
+                    );
+                    return false;
+                }
+                // 4 GiB-crossing guard — a truncated window cannot wrap the boundary in one region.
+                if alias.checked_add(len).map_or(true, |e| e > 0x1_0000_0000) {
+                    serial_println!(
+                        "{}   !! [net4r] {} alias [{:#x}..+{:#x}) crosses the 4 GiB boundary — one region cannot cover it; REFUSING ::",
+                        P4, tag, alias, len
+                    );
+                    return false;
+                }
+                // PCIe MEM/BAR overlap (peer-to-peer mis-route hazard).
+                if self.mem_hi > self.mem_lo && alias < self.mem_hi && self.mem_lo < region_hi {
+                    serial_println!(
+                        "{}   !! [net4r] {} alias [{:#x}..{:#x}) OVERLAPS the PCIe MEM/BAR window [{:#x}..{:#x}) — REFUSING (peer-to-peer mis-route hazard) ::",
+                        P4, tag, alias, region_hi, self.mem_lo, self.mem_hi
+                    );
+                    return false;
+                }
+                // Alias-vs-alias overlap (two regions matching one truncated bus address = ambiguous).
+                for k in 0..n_armed {
+                    let (lo, hi) = armed[k];
+                    if alias < hi && lo < region_hi {
+                        serial_println!(
+                            "{}   !! [net4r] {} alias [{:#x}..{:#x}) OVERLAPS an earlier alias [{:#x}..{:#x}) — REFUSING (ambiguous inbound match) ::",
+                            P4, tag, alias, region_hi, lo, hi
+                        );
+                        return false;
+                    }
+                }
+                // Take the next FREE inbound index (skip any already-enabled slot, including index 0).
+                while next_idx < 8 && (enabled & (1u32 << next_idx)) != 0 {
+                    next_idx += 1;
+                }
+                if next_idx >= 8 {
+                    serial_println!(
+                        "{}   !! [net4r] no FREE inbound iATU index for {} (enabled mask {:#06x}) — REFUSING ::",
+                        P4, tag, enabled
+                    );
+                    return false;
+                }
+                let idx = next_idx;
+                next_idx += 1;
+                if !program_inbound_alias(self.atu_base, idx, alias, len, pa, tag) {
+                    serial_println!(
+                        "{}   !! [net4r] {} alias arm at index {} FAILED its readback/enable proof — REFUSING ::",
+                        P4, tag, idx
+                    );
+                    return false;
+                }
+                armed[n_armed] = (alias, region_hi);
+                n_armed += 1;
+            }
+            serial_println!(
+                "{}   [net4r] {} inbound alias region(s) armed + readback-proven; RX/TX ring AND buffer blocks all covered ::",
+                P4, n_armed
+            );
+            true
+        }
+
         fn init_rings(&mut self) -> bool {
             serial_println!("{}   M2 ring bring-up (C+ mode; RTL8168 programming-guide order) ::", P4);
             // Unlock the config/registers for write (93C46 command = 0xC0).
@@ -763,6 +919,23 @@ mod metal {
             // 64-bit (DAC) address — no sub-4 GiB arena (NET-4o) and no inbound alias (NET-4p) needed.
             self.alloc_rx();
             self.alloc_tx();
+
+            // NET-4r — the SANCTIONED FALLBACK. Boot-24 proved the NET-4q full-64 descriptor path correct
+            // (RINGDUMP addr=0x2683cb… [MATCH], hi-before-lo ring bases) yet the payload STILL sank at the
+            // 0x200 IOB FillWrite RAS with no lease: the first real evidence this RTL8168/Tegra-RC
+            // integration truncates the >4 GiB DMA TLP. So re-arm the inbound-iATU ALIAS as the delivery
+            // mechanism — correctly this time (L4T-FACTS §A0-A5): a FREE inbound index per block, UPPER_BASE
+            // + UPPER_TARGET written AND read back (the UPPER_TARGET=0x2 dword boot-20 lost), base ≡ target
+            // (mod 64 KiB) with both 64 KiB-aligned outright, CTRL2=ENABLE polled, covering BOTH the ring
+            // and buffer blocks. Armed AFTER the (high-heap) PAs are known and BEFORE RxEnb/TxEnb below, so
+            // the FIRST DMA is already covered. Fail the bring-up CLOSED rather than DMA into a sink/mis-route.
+            if !self.arm_dma_aliases() {
+                serial_println!(
+                    "{}   !! NET-4r: inbound-iATU alias could not be armed + readback-proven — REFUSING ring bring-up rather than DMA into an unreachable/mis-routed surface ::",
+                    P4
+                );
+                return false;
+            }
 
             let rx_phys = self.rx_ring as u64;
             let tx_phys = self.tx_ring as u64;
@@ -1595,6 +1768,114 @@ mod metal {
         unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
     }
 
+    /// NET-4r — witness the inbound iATU region file BEFORE arming any alias: read each region's CTRL2
+    /// enable bit so the boot log shows which indices are already programmed (index 0 = the NET-4h
+    /// identity region) and which are FREE. Returns a bitmask of enabled indices over the probed range.
+    /// Read-only. Tegra234's DWC RC is unroll-mode (§A5): each region owns its CSR block at
+    /// `atu_base + (index<<9) | BIT8` (= `ATU_INBOUND_DIR_OFF + index*ATU_REGION_STRIDE`), all within the
+    /// 0x1000 ATU window the caller mapped, so probing 8 indices touches no unmapped register.
+    fn enumerate_inbound_windows(atu_base: u64) -> u32 {
+        const PROBE_N: u64 = 8;
+        let vb = option_env!("UNAOS_NET4").is_some();
+        let mut enabled = 0u32;
+        for idx in 0..PROBE_N {
+            let region = atu_base + ATU_INBOUND_DIR_OFF + idx * ATU_REGION_STRIDE;
+            let ctrl2 = unsafe { read_volatile((region + ATU_UNR_REGION_CTRL2) as *const u32) };
+            let en = ctrl2 & ATU_ENABLE != 0;
+            if en {
+                enabled |= 1u32 << idx;
+            }
+            if vb {
+                serial_println!(
+                    "{}   [net4r] inbound region {} @ {:#x}: CTRL2={:#010x} enabled={} ::",
+                    P4, idx, region, ctrl2, en as u8
+                );
+            }
+        }
+        serial_println!(
+            "{}   [net4r] inbound iATU enumeration: enabled-index mask = {:#06x} (index 0 = NET-4h identity; aliases take FREE indices) ::",
+            P4, enabled
+        );
+        enabled
+    }
+
+    /// NET-4r — program ONE DWC INBOUND iATU ALIAS region and PROVE it latched. Unlike NET-4h's identity
+    /// region (BASE=TARGET), here BASE != TARGET: an incoming bus-master write whose (truncated 32-bit)
+    /// address falls in `[alias_base, limit]` is up-translated to `target + (addr - alias_base)` — back to
+    /// the real high-heap PA whose high dword this RC integration drops (boot-24: the full-64 descriptor
+    /// was correct yet the payload still sank at 0x200, so the >4 GiB TLP truncates on the wire). Boot-20's
+    /// alias failed because `UPPER_TARGET` (the `0x2` dword) never latched, so NET-4r READS BACK every
+    /// register and REFUSES (returns false) on ANY mismatch — BASE, LIMIT, TARGET including UPPER_TARGET —
+    /// and POLLS `CTRL2` for the `ENABLE` bit before trusting the region (the reference driver loops on
+    /// this readback, §A5). `CTRL2 = ENABLE` ONLY — NO `INCREASE_REGION_SIZE`: the MATCH window
+    /// `[alias_base, limit]` is wholly sub-4 GiB (§A0/§A2 — the >4 GiB TARGET's upper-32 is independent and
+    /// does not require it). The caller 64 KiB-aligns `alias_base`/`target`; the LIMIT is 64 KiB-rounded up
+    /// to the controller's granularity so the readback compares exactly.
+    fn program_inbound_alias(atu_base: u64, index: u64, alias_base: u64, size: u64, target: u64, tag: &str) -> bool {
+        let region = atu_base + ATU_INBOUND_DIR_OFF + index * ATU_REGION_STRIDE;
+        // LIMIT rounds UP to the 64 KiB granularity (low-16 hardwired to 1, §A2); alias_base/target are
+        // 64 KiB-aligned by the caller, so the whole region reads back exactly what is written.
+        let limit = ((alias_base + size + 0xFFFF) & !0xFFFFu64) - 1;
+        let w = |off: u64, v: u32| unsafe { write_volatile((region + off) as *mut u32, v) };
+        let vb = option_env!("UNAOS_NET4").is_some();
+        serial_println!(
+            "{}   [net4r] inbound iATU ALIAS region {} @ {:#x} ({}) — truncated PCIe DMA [{:#x}..{:#x}] -> real DRAM {:#x} (up-translate +{:#x}, type MEM) ::",
+            P4, index, region, tag, alias_base, limit, target, target - alias_base
+        );
+        if vb {
+            serial_println!("{}   >>> ATU WRITE (net4r): BASE lo/hi = {:#010x}/{:#010x} ::", P4, alias_base as u32, (alias_base >> 32) as u32);
+        }
+        w(ATU_UNR_LOWER_BASE, alias_base as u32);
+        w(ATU_UNR_UPPER_BASE, (alias_base >> 32) as u32);
+        if vb {
+            serial_println!("{}   >>> ATU WRITE (net4r): LIMIT lo/hi = {:#010x}/{:#010x} ::", P4, limit as u32, (limit >> 32) as u32);
+        }
+        w(ATU_UNR_LOWER_LIMIT, limit as u32);
+        w(ATU_UNR_UPPER_LIMIT, (limit >> 32) as u32);
+        if vb {
+            serial_println!("{}   >>> ATU WRITE (net4r): TARGET lo/hi = {:#010x}/{:#010x} (the real high buffer PA; UPPER_TARGET is the {:#x} dword boot-20 lost) ::", P4, target as u32, (target >> 32) as u32, (target >> 32) as u32);
+        }
+        w(ATU_UNR_LOWER_TARGET, target as u32);
+        w(ATU_UNR_UPPER_TARGET, (target >> 32) as u32);
+        if vb {
+            serial_println!("{}   >>> ATU WRITE (net4r): REGION_CTRL1 = TYPE_MEM ::", P4);
+        }
+        w(ATU_UNR_REGION_CTRL1, ATU_TYPE_MEM);
+        // Publish BASE/LIMIT/TARGET/CTRL1 BEFORE the region goes live.
+        unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
+        if vb {
+            serial_println!("{}   >>> ATU WRITE (net4r): REGION_CTRL2 = ENABLE (bit30=0 address-match; NO increase-region-size — match window sub-4 GiB) — arming ::", P4);
+        }
+        w(ATU_UNR_REGION_CTRL2, ATU_ENABLE);
+        unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
+        // ── Readback ritual (the NET-4r spine): refuse on ANY mismatch; poll CTRL2 for ENABLE. ──
+        let r = |off: u64| -> u32 { unsafe { read_volatile((region + off) as *const u32) } };
+        let mut ctrl2 = r(ATU_UNR_REGION_CTRL2);
+        let mut polls = 0u32;
+        while ctrl2 & ATU_ENABLE == 0 && polls < 1000 {
+            core::hint::spin_loop();
+            ctrl2 = r(ATU_UNR_REGION_CTRL2);
+            polls += 1;
+        }
+        let rb_base = ((r(ATU_UNR_UPPER_BASE) as u64) << 32) | r(ATU_UNR_LOWER_BASE) as u64;
+        let rb_limit = ((r(ATU_UNR_UPPER_LIMIT) as u64) << 32) | r(ATU_UNR_LOWER_LIMIT) as u64;
+        let rb_utarget = r(ATU_UNR_UPPER_TARGET);
+        let rb_target = ((rb_utarget as u64) << 32) | r(ATU_UNR_LOWER_TARGET) as u64;
+        serial_println!(
+            "{}   [net4r] alias region {} ({}) readback: BASE={:#x} LIMIT={:#x} TARGET={:#x} UPPER_TARGET={:#010x} CTRL2={:#010x} enabled={} (after {} polls) ::",
+            P4, index, tag, rb_base, rb_limit, rb_target, rb_utarget, ctrl2, (ctrl2 >> 31) & 1, polls
+        );
+        let want_ut = (target >> 32) as u32;
+        if rb_base != alias_base || rb_limit != limit || rb_target != target || rb_utarget != want_ut || (ctrl2 & ATU_ENABLE == 0) {
+            serial_println!(
+                "{}   !! [net4r] alias region {} ({}) READBACK MISMATCH — expected BASE={:#x} LIMIT={:#x} TARGET={:#x} UPPER_TARGET={:#010x} ENABLE=1; REFUSING (the boot-20 UPPER_TARGET-lost / enable-not-latched failure mode) ::",
+                P4, index, tag, alias_base, limit, target, want_ut
+            );
+            return false;
+        }
+        true
+    }
+
     /// ORIN-DMA-WINDOW — one-shot READ-ONLY probe (UNAOS_DMAWIN): dump the inbound-DMA window DERIVED
     /// from the RC's `dma-ranges`, read BACK the just-programmed inbound iATU region-0 registers, and
     /// cross-check both against the `ram_gib_mask`-derived identity window NET-4h armed. This closes the
@@ -2002,6 +2283,14 @@ mod metal {
         let mut nic = Rtl8168 {
             mmio_base: cpu_addr,
             mac: [0; 6],
+            // NET-4r: the ATU base + the identity inbound window (NET-4h just programmed) + controller-0's
+            // PCIe MEM/BAR window — the inputs `arm_dma_aliases` needs to place + collision-check the
+            // inbound-iATU alias regions once the (high-heap) ring/buffer PAs are known in `init_rings`.
+            atu_base,
+            dma_ident_lo: dram_base,
+            dma_ident_hi: dram_base + dram_size,
+            mem_lo: win.pci_base,
+            mem_hi: win.pci_base + win.size,
             rx_ring: core::ptr::null_mut(),
             rx_buffers: core::ptr::null_mut(),
             rx_cur: 0,

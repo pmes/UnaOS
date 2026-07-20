@@ -7039,6 +7039,49 @@ non-regression only.
   UNAOS_TEGRA=1` `check`, default `test-arm`, and the `UNAOS_GICV3=1 UNAOS_WITNESS=1 UNAOS_VNET=1 test-arm`
   seam regression — vnet lease + the NET-4j reproducer stay PASS).
 
+- **NET-4r — boot-24 fires NET-4q's fallback: native-64 falsified on silicon; re-arm the alias CORRECTLY.**
+  Boot-24 ran NET-4q for real. RINGDUMP proved the descriptors carry the **full** 64-bit buffer addresses
+  (`addr=0x2683cb… [MATCH]`, high dword `0x2` present, EOR + hi-before-lo ring bases in) — and the result was
+  **still no lease** (5000 ms, 83M polls) + the return of the `0x200` sink RAS (IOB `IERR=CBB Interface
+  Error ADDR=0x8000000000000200` + ACI `FillWrite Error ADDR=0x…200`). A **provably-correct** full-64
+  descriptor yielding the sink is the first real evidence this **RTL8168/Tegra-RC integration cannot
+  emit/carry a >4 GiB TLP**: the payload truncates to `addr[31:0]` on the wire, landing below the
+  `0x8000_0000` DRAM/identity base → the fabric sink. This is exactly the falsification clause NET-4q named.
+
+  **The fix (the sanctioned fallback, done to the letter of `L4T-FACTS-NET.md` §A0-A5).** Keep NET-4q's
+  full-64 descriptor + ring path **unchanged** (correct per the reference driver; the delivery vehicle if the
+  NIC ever emits full-64 natively — that TLP hits the NET-4h identity region). Re-arm the DWC **inbound-iATU
+  ALIAS** as the delivery mechanism, correctly this time:
+  1. **Free index, witnessed.** `enumerate_inbound_windows` reads each inbound region's `CTRL2` enable bit
+     (unroll blocks at `atu_base + (index<<9)|BIT8`, §A5) and logs the enabled-index mask; index 0 = the
+     NET-4h identity, aliases take clear indices — no index collision (NET-4p's "TX region shadowed").
+  2. **Full readback + refuse-to-proceed.** `program_inbound_alias` writes `LOWER/UPPER_BASE` ← truncated
+     32-bit bus base, `LIMIT` ← 64 KiB-rounded end, `LOWER/UPPER_TARGET` ← the real high PA, then **reads
+     every register back** and REFUSES (fails the whole bring-up closed) on any mismatch — the `UPPER_TARGET`
+     `0x2` dword **boot-20 lost** is the whole point.
+  3. **Congruence.** `alias_base = target & 0xFFFF_FFFF` ⇒ `alias_base ≡ target (mod 64 KiB)` by
+     construction; `alloc_rx`/`alloc_tx` are nudged to **64 KiB alignment** so both are 64 KiB-aligned
+     outright and the controller's 64 KiB granularity (§A2) rounds nothing (§A3). Congruence is witnessed.
+  4. **`CTRL2 = ENABLE` only** (no increase-region-size — the match window is sub-4 GiB, §A0/§A2), with the
+     `ENABLE` bit **polled** on readback (§A5 the driver loops on it).
+  5. **Both ring AND buffer blocks covered.** `arm_dma_aliases` aliases the RX ring, RX buffers, TX ring, and
+     TX buffers (boot-24 could not prove the ring rides un-truncated on this silicon; a genuinely-full-64 ring
+     TLP simply hits the identity region and the truncation-keyed alias never matches — harmless). Collision
+     checks (4 GiB-crossing, PCIe MEM/BAR overlap, alias-vs-alias) fail closed. New verbosity is knob-gated
+     under `UNAOS_NET4`.
+
+  **Expected boot-25 (metal-owed):** `[net4r] inbound iATU enumeration: enabled-index mask = 0x0001` (only
+  the identity region 0); per alias `[net4r] … congruence: alias 0x683c… = target 0x2683c… (mod 64KiB) OK`;
+  `[net4r] alias region N (…) readback: BASE=0x683c… LIMIT=0x683c… TARGET=0x2683c… UPPER_TARGET=0x00000002
+  CTRL2=0x80000000 enabled=1` for every armed region (all MATCH); `[net4r] N inbound alias region(s) armed +
+  readback-proven; RX/TX ring AND buffer blocks all covered`; then **no** `0x200` IOB/ACI RAS; `[net4m]` all
+  nonzero; and the DHCP **lease**. A readback MISMATCH (`!! [net4r] … READBACK MISMATCH …`) refuses the
+  bring-up cleanly instead of DMAing into a sink — the honest negative.
+
+  QEMU cannot exercise the tegra path; the gates prove non-regression only (default `check` + `UNAOS_TEGRA=1
+  UNAOS_NET4=1 UNAOS_VUGRAS=1` `check`, default `test-arm` MISSION SUCCESS, and `UNAOS_GICV3=1
+  UNAOS_WITNESS=1 UNAOS_VNET=1 test-arm` — vnet lease + the NET-4j reproducer stay PASS).
+
 ### XCARVE-4 — the endgame (2026-07-20, boots 21/22)
 The XCARVE writer is named and fixed. XCARVE-3's unmap converted the SNOC RAS into a precise
 synchronous WRITE fault (boot-22: ESR=0x96000146, FAR=0x26b800000 = align_up(heap_hi, 8 MiB),
