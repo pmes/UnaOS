@@ -279,8 +279,8 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
                  cmd_ring_guard.as_mut().unwrap().get_ptr())
             };
 
-            let erst_table_phys = &raw mut crate::drivers::xhci::ERST_TABLE as u64;
-            xhci.init_interrupter(event_ring_phys, erst_table_phys);
+            // ERST is heap-allocated inside init_interrupter (JETSON-XCARVE: no xHC DMA structure in .bss).
+            xhci.init_interrupter(event_ring_phys);
 
             // Route the controller's interrupts via MSI-X straight to the local APIC (no
             // 8259, no I/O APIC). init_interrupter just published the IR0/OP MMIO bases the

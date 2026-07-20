@@ -1257,11 +1257,12 @@ pub fn jb2b_attach(
         };
         jb9_evt_phys = event_ring_phys;
         jb9_cmd_phys = command_ring_phys;
-        let erst_table_phys = &raw mut xhci::ERST_TABLE as u64;
+        // ERST is heap-allocated inside init_interrupter (JETSON-XCARVE: no xHC DMA structure lives in
+        // kernel-image .bss; the event ring + ERST now share the HEAP-GUARD-vetted firewall-clean window).
         // One line before the first RUNTIME-register / doorbell-array touch (new offsets within
         // the ungated block — the JX1 discipline: a dead boot's last line names the killer).
         serial_println!(":: tegra: JB2b — programming interrupter + rings (runtime regs) ::");
-        x.init_interrupter(event_ring_phys, erst_table_phys);
+        x.init_interrupter(event_ring_phys);
         x.init_pointers(command_ring_phys);
         x.start();
         *xhci::XHCI_CONTROLLER.lock() = Some(x);

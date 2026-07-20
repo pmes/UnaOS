@@ -36,9 +36,22 @@ pub struct ErstTable {
 // init_interrupter().
 pub const EVENT_RING_SIZE: usize = 256;
 
-#[repr(C, align(64))]
+/// JETSON-XCARVE (boot-15 SNOC "Carveout Uncorrectable" FillWrite): the event ring's TRB segment is
+/// HEAP-allocated (`super::ring::allocate_ring`, 64-byte aligned, zeroed ⇒ every slot == `Trb::new()`),
+/// NOT an inline `[Trb; N]` array in this struct. When `EventRing` lived inline in the `static
+/// EVENT_RING`, its TRBs sat in kernel-image `.bss` — inside the *bootloader*-chosen image load extent
+/// (boot-15: `[0x25adea000, +0x18f000)`), which `HEAP-GUARD` does NOT vet for firewall carveouts the way
+/// it vets the heap. The CPU's ring-construction store into that un-vetted `.bss` then FillWrite-RASed on
+/// writeback (surfaced frames later by the VUGRAS DC-CIVAC sweep's cache churn; the fault ADDR is
+/// record-format per the bit-63 XCARVE erratum, so it read as `0x26b900000` — near DRAM top — not as the
+/// literal `.bss` PA). Every OTHER xHC DMA structure — command/transfer rings, DCBAA, scratchpad, per-slot
+/// contexts, HID buffers — is heap-backed; this makes the event ring uniform with them, inside the
+/// firewall-clean, DMA-window-resident heap.
+#[repr(C)]
 pub struct EventRing {
-    pub trbs: [Trb; EVENT_RING_SIZE],
+    /// Heap PA of the 64-byte-aligned ring segment (`EVENT_RING_SIZE` TRBs). The controller DMA-writes
+    /// events here; the CPU reads them via the volatile accessors below.
+    trbs: *mut Trb,
     pub dequeue_index: usize,
     pub cycle_bit: bool, // What we expect the hardware to write
 }
@@ -47,9 +60,13 @@ unsafe impl Send for EventRing {}
 unsafe impl Sync for EventRing {}
 
 impl EventRing {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
+        // Heap ring segment — see the struct doc for why the TRBs must NOT live in the static's .bss.
+        // `allocate_ring` zero-fills, so every TRB starts as `Trb::new()` (all-zero), matching the old
+        // inline `[Trb::new(); EVENT_RING_SIZE]` byte-for-byte.
+        let trbs = super::ring::allocate_ring(EVENT_RING_SIZE) as *mut Trb;
         Self {
-            trbs: [Trb::new(); EVENT_RING_SIZE],
+            trbs,
             dequeue_index: 0,
             cycle_bit: true, // xHCI starts writing 1s
         }
@@ -62,7 +79,7 @@ impl EventRing {
     pub fn has_event(&self) -> bool {
         // Read the whole (aligned) TRB volatile — Trb is `packed`, so taking a reference
         // to an individual field is unaligned/illegal; copy it out, then read the field.
-        let trb = unsafe { core::ptr::read_volatile(&self.trbs[self.dequeue_index]) };
+        let trb = unsafe { core::ptr::read_volatile(self.trbs.add(self.dequeue_index)) };
         let cycle_state = (trb.control & 1) != 0;
         cycle_state == self.cycle_bit
     }
@@ -75,8 +92,8 @@ impl EventRing {
     /// an SMMU/fabric drop.
     #[cfg(feature = "tegra")]
     pub fn has_event_after_invalidate(&self) -> bool {
-        let base = self.trbs.as_ptr() as usize;
-        let end = base + core::mem::size_of_val(&self.trbs);
+        let base = self.trbs as usize;
+        let end = base + EVENT_RING_SIZE * core::mem::size_of::<Trb>();
         let mut p = base & !63;
         while p < end {
             unsafe {
@@ -102,7 +119,7 @@ impl EventRing {
         core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
 
         // Volatile read of the DMA-written TRB (see has_event).
-        let trb = unsafe { core::ptr::read_volatile(&self.trbs[self.dequeue_index]) };
+        let trb = unsafe { core::ptr::read_volatile(self.trbs.add(self.dequeue_index)) };
 
         // Advance
         self.dequeue_index += 1;
@@ -116,14 +133,14 @@ impl EventRing {
         Some(trb)
     }
 
-    /// Returns the physical address of the ring (assuming identity map)
+    /// Returns the physical address of the ring (identity-mapped; now a HEAP PA — see the struct doc).
     pub fn get_ptr(&self) -> u64 {
-        self.trbs.as_ptr() as u64
+        self.trbs as u64
     }
 
     pub fn clear(&mut self) {
         unsafe {
-            core::ptr::write_bytes(self.trbs.as_mut_ptr(), 0, EVENT_RING_SIZE);
+            core::ptr::write_bytes(self.trbs, 0, EVENT_RING_SIZE);
         }
     }
 }

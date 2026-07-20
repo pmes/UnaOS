@@ -116,8 +116,8 @@ pub fn init(dtb_addr: u64, dtb_size: usize) {
                  cmd_ring_guard.as_mut().unwrap().get_ptr())
             };
 
-            let erst_table_phys = &raw mut crate::drivers::xhci::ERST_TABLE as u64;
-            xhci.init_interrupter(event_ring_phys, erst_table_phys);
+            // ERST is heap-allocated inside init_interrupter (JETSON-XCARVE: no xHC DMA structure in .bss).
+            xhci.init_interrupter(event_ring_phys);
             xhci.init_pointers(command_ring_phys);
             xhci.start();
 

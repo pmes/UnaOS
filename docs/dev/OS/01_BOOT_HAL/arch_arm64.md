@@ -743,6 +743,14 @@ survey) the NET-4m rx path. Pinning the exact `.bss` writer and relinking/reloca
 in-lane fix is the carveout-bounded span B above, which makes the localizer sound so the next boot
 attributes `0x26b900000` to the writer and not to the sweep.
 
+**RESOLVED (R23s1, §JETSON-XCARVE "XCARVE-SNOC FIX"):** the `.bss` writer was pinned to the xHCI
+**event ring + ERST** — the *only* two xHC-DMA structures not heap-backed (every other ring/buffer/
+context is heap-resident, confirmed by boot-15's candidate table). Both now heap-allocate (the event
+ring like `TransferRing`; the ERST inside `init_interrupter`), so no xHC DMA structure lives in the
+un-vetted image extent. The formerly-dead `event_ring_base` dump field is now truthful (it read `0x0`
+here, which misled lead #1); the dump gained an `erst_base=` field. QEMU-green; metal-owed confirmation
+in the fix subsection.
+
 **Expected serial (metal, `UNAOS_VUGRAS=1 UNAOS_TEGRA=1`):**
 - `:: VUGRAS: boot witness — RAS candidate PA table (bit-63-stripped decode) ::`
 - `:: VUGRAS: heap span [lo,hi) 48 MiB; tegra DRAM top 0x280000000 ::`
@@ -4796,6 +4804,68 @@ layout joins the faulter ledger (~1-in-3 observed, small sample).
   appl/config/atu_dma/dbi/ecam reg map + ranges captured; controllers 1–7 enumerated; full
   detail in the serial log). The NET-2 scoping data now exists on the record; fold into
   §ORIN-NET-1's metal columns at the next docs pass on the merged tree.
+
+#### XCARVE-SNOC FIX — the xHCI event ring + ERST leave image `.bss` for the heap (R23s1; shared-core, Peter-approved)
+
+The diagnosis arc above and §VUG-RAS-LOCALIZER's VUG-RAS-ANALYZE verdict converged on one class: the
+residual SNOC "Carveout Uncorrectable" FillWrite is a store into the **un-vetted kernel-image load
+extent**, not an allocator miscomputation and not the NET rx path. This arc **pins and relocates the
+writer**.
+
+**Root cause (store-site evidence, not naive PA-match).** The xHCI **event ring** (`EventRing`, whose
+`trbs: [Trb; 256]` array lived *inline* in the `static EVENT_RING`) and the **ERST** (`static mut
+ERST_TABLE`) were the **only** xHC-DMA structures NOT heap-backed. Every other member of the DMA
+surface — the command/transfer rings (`ring::allocate_ring`), DCBAA + scratchpad array/buffers
+(`alloc_zeroed`), per-slot input/output contexts, HID buffers — is heap-allocated, so it lands in the
+`HEAP-GUARD`-vetted, DMA-window-resident heap (boot-15's VUGRAS candidate table confirmed them all at
+`0x2683c…`). The event ring + ERST sat instead in the **bootloader-chosen** image extent (boot-15:
+`Allocated kernel at 0x25adea000`, 399 pages ⇒ `[0x25adea000, 0x25f79000)`), which `HEAP-GUARD` does
+**not** vet for firewall carveouts. The CPU's construction store — `EventRing::new()` zero-fills 4 KiB
+of TRBs at the static; `init_interrupter` writes the ERST entry — dirties cache lines whose PA the SNOC
+firewall rejects, and the **FillWrite fires on writeback**, surfaced frames later by the VUGRAS
+`DC CIVAC` churn (the H2 verdict: span A = the heap, which is carveout-clear, so the sweep *revealed*
+the fault, did not cause it). The reported ADDR is **record-format** (bit-63 erratum, §JETSON-XCARVE
+supersession) and reads near DRAM top (`0x800000026b900000 → 0x26b900000`), **NOT** the literal `.bss`
+PA `~0x25e…`; do not root-cause by matching it. Two independent brackets localize the writer instead:
+(1) the localizer's **timing bracket** — boot-15 faulted at `:: VUGRAS: idle tick 0 swept ::`,
+immediately after the port-7 event was delivered/consumed; (2) the **structural inventory** — the
+event ring + ERST are the sole `.bss`-resident xHC-DMA surface. (Boots 13 `0xbe000f80` and 14
+`0x27724f340` are the same class on other boot paths.)
+
+**Fix (no protection weakened — nothing mapped writable, RAS never masked).** Make the xHC DMA surface
+**uniform**: every structure the controller reads/writes now lives in the vetted heap.
+- `EventRing` holds a heap `*mut Trb` (via `ring::allocate_ring`, 64-byte aligned, zero-filled ⇒
+  byte-identical initial state to the old inline `[Trb::new(); 256]`) — mirrors `TransferRing`.
+- `init_interrupter` **heap-allocates the ERST** (`alloc_zeroed(Layout::new::<ErstTable>())`, 64-byte
+  aligned per xHCI 6.5) and no longer takes an `erst_table_phys` argument; the `static mut ERST_TABLE`
+  is deleted. The allocation is never freed (the controller is `'static`, same discipline as DCBAA).
+- The formerly-**dead** `XhciController::event_ring_phys_base` field is now populated (it was only ever
+  assigned `0` at construction — the phantom `event_ring_base=0x0` that sent the boot-15 investigation's
+  lead #1 chasing an unset ring base), and the VUGRAS candidate dump gains an `erst_base=` field, so a
+  capture witnesses **both** bases as heap-resident.
+
+**Shared-core files touched (flagged — a shared xHCI change bites x86; verified below):**
+`drivers/xhci/event.rs`, `drivers/xhci/mod.rs` (shared core); `arch/x86_64/pci.rs`,
+`arch/aarch64/pci.rs`, `arch/aarch64/piusb.rs`, `arch/aarch64/xusb_tegra.rs` (the four `init_interrupter`
+call sites drop the ERST argument).
+
+**Gates (all green):** `./arroyo check` both arches + aarch64 `tegra,vugras,tegrasmp,xcarve_relink`;
+`./arroyo test` **x86 MISSION SUCCESS** (`BOT + CSW`, the shared-xhci-bites-x86 precedent gate) with the
+event ring + ERST now heap-backed; default `test-arm`, `UNAOS_GICV3=1 test-arm`, and
+`UNAOS_GICV3=1 UNAOS_VUGRAS=1 test-arm` all **CAPSTONE COMPLETE** (localizer sweep runs, no regression);
+`./arroyo kernel8` pi4 image builds (the `piusb.rs` path).
+
+**Expected metal serial (`UNAOS_TEGRA=1`, the wall-repro boot):**
+- `:: VUGRAS: xHCI DCBAA=0x2683… event_ring_base=0x2683… erst_base=0x2683… … ::` — event-ring and ERST
+  bases now inside the heap `[heap_lo,heap_hi)`, **not** image `.bss` `~0x25e…`.
+- a `vug` ×2 + shell-idle + VUGRAS burst run completes with **no `RAS Uncorrectable Error in SNOC …
+  Carveout Uncorrectable`** and no ACI FillWrite through the xHC event path.
+
+**Metal-owed:** QEMU cannot exercise the firewall (tegra is metal-only; the gates prove only no
+regression + that the heap-backed rings enumerate). Re-run the boot-13/14/15 repro on the Orin
+(default path, `UNAOS_VUGRAS=1`) and confirm the SNOC Carveout FillWrite no longer fires through a
+`vug` ×2 + shell-idle + burst, with the VUGRAS candidate table showing the event ring + ERST
+heap-resident.
 
 ### ORIN-SMP-8 — the tegrasmp RELINK (the layout-axis close-out; BUILD-ONLY, `UNAOS_TEGRASMP` + `UNAOS_XCARVE_RELINK`)
 

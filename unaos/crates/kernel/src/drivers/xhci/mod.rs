@@ -411,9 +411,10 @@ pub fn vugras_dump() {
         return;
     };
     serial_println!(
-        ":: VUGRAS: xHCI DCBAA={:#x} event_ring_base={:#x} enum_cmd_trb={:#x} enumerating_port={} stage={} ::",
+        ":: VUGRAS: xHCI DCBAA={:#x} event_ring_base={:#x} erst_base={:#x} enum_cmd_trb={:#x} enumerating_port={} stage={} ::",
         x.dcbaap as u64,
         x.event_ring_phys_base,
+        x.erst_table_phys,
         x.enum_cmd_phys,
         x.enumerating_port,
         x.enum_stage
@@ -476,7 +477,11 @@ pub fn vugras_dump() {
 pub static COMMAND_RING: Mutex<Option<TransferRing>> = Mutex::new(None);
 pub static EVENT_RING: Mutex<Option<EventRing>> = Mutex::new(None);
 
-pub static mut ERST_TABLE: ErstTable = ErstTable { entries: [ErstEntry { ring_address: 0, size: 0, _rsvd: 0, _rsvd2: 0 }] };
+// JETSON-XCARVE: the ERST is HEAP-allocated inside `init_interrupter` (like DCBAA / scratchpad / the
+// command ring), NOT a kernel-image `static mut`. A `.bss`-resident xHC DMA structure inherits the
+// bootloader-chosen image extent's firewall status — which HEAP-GUARD does not vet — and the CPU's
+// construction store FillWrite-RASes on writeback (see the EventRing struct doc). No xHC DMA structure
+// lives in the image any more.
 
 // Store Physical Address of the Event Ring for Runtime ERDP updates
 static mut EVENT_RING_PHYS_BASE: u64 = 0;
@@ -976,6 +981,9 @@ pub struct XhciController {
 
     pub configuring_slot: u8,
     pub event_ring_phys_base: u64,
+    /// Heap PA of the Event Ring Segment Table (ERST) allocated in `init_interrupter`. Kept for the
+    /// VUGRAS candidate-PA dump so both event-ring and ERST bases are witnessed as heap-resident.
+    pub erst_table_phys: u64,
 
     /// Slot id of the enumerated mass-storage device (0 = none).
     pub storage_slot: u8,
@@ -1150,6 +1158,7 @@ impl XhciController {
             ports_to_enumerate: Vec::new(),
             configuring_slot: 0,
             event_ring_phys_base: 0,
+            erst_table_phys: 0,
             storage_slot: 0,
             storage_pending_bringup: false,
             ftdi_configuring_slot: 0,
@@ -2350,10 +2359,17 @@ impl XhciController {
     }
 
     // Call this AFTER init_pointers but BEFORE run
-    pub fn init_interrupter(&mut self, event_ring_phys: u64, erst_table_phys: u64) {
+    /// Program interrupter 0. `event_ring_phys` is the HEAP PA of the event ring segment (the caller
+    /// holds the `EVENT_RING` lock and passes it). The ERST is allocated HERE, in the heap — see the
+    /// `EventRing` struct doc and §JETSON-XCARVE for why no xHC DMA structure may live in image `.bss`.
+    pub fn init_interrupter(&mut self, event_ring_phys: u64) {
         unsafe {
             // SAVE THIS for later use in the interrupt/event loop (ERDP updates)
             EVENT_RING_PHYS_BASE = event_ring_phys;
+            // Publish the real base into the controller struct so the VUGRAS candidate-PA dump is
+            // TRUTHFUL. This field was previously never assigned (always read 0), which sent the
+            // boot-15 RAS investigation's lead #1 chasing a phantom "event_ring_base=0x0".
+            self.event_ring_phys_base = event_ring_phys;
 
             // 1. Calculate Runtime Base
             // Read RTSOFF (Offset 0x18 in Capability Regs)
@@ -2365,16 +2381,21 @@ impl XhciController {
             let ir0_base = runtime_base + 0x20;
             serial_println!("xHCI: RuntimeBase={:#x}, IR0 Base={:#x}", runtime_base, ir0_base);
 
-            // 2. Setup the Segment Table (ERST)
-            // NOTE: Caller holds the EVENT_RING lock and passes us the phys addr.
-            // Do NOT lock EVENT_RING here or we deadlock.
-            ERST_TABLE.entries[0] = ErstEntry {
+            // 2. Heap-allocate + fill the Event Ring Segment Table (ERST) in the HEAP-GUARD-vetted,
+            //    firewall-clean DMA window (mirrors the DCBAA / scratchpad allocations above). Never
+            //    freed — the controller is 'static, same lifetime discipline as DCBAA. This replaces the
+            //    old `static mut ERST_TABLE` in kernel-image .bss (JETSON-XCARVE: see the EventRing doc).
+            //    64-byte alignment (xHCI 6.5) comes from ErstTable's `#[repr(align(64))]`.
+            let erst_layout = core::alloc::Layout::new::<ErstTable>();
+            let erst = alloc::alloc::alloc_zeroed(erst_layout) as *mut ErstTable;
+            (*erst).entries[0] = ErstEntry {
                 ring_address: event_ring_phys,
                 size: event::EVENT_RING_SIZE as u16, // Must match EVENT_RING_SIZE in event.rs
                 _rsvd: 0,
                 _rsvd2: 0,
             };
-            EVENT_RING_PHYS_BASE = event_ring_phys;
+            let erst_table_phys = erst as u64;
+            self.erst_table_phys = erst_table_phys;
 
             // 3. Write ERSTSZ (Segment Table Size) - Offset 0x08
             // Value = 1 (We have 1 segment)
