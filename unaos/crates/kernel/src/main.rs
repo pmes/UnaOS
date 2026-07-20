@@ -1208,19 +1208,38 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     // window is left with no valid translation. Source names whether the DTB declared the reservation
     // (`DTB`) or we fell back to a bounded quirk (`QUIRK`). `hole_size == 0` ⇒ nothing excluded.
     if mmu.hole_size != 0 {
-        let src = match mmu.hole_source {
-            1 => "DTB /reserved-memory",
-            2 => "QUIRK (DTB silent)",
-            _ => "unknown",
-        };
+        // XCARVE-6: the excluded set is now the two QUIRK windows (0x26b9, 0xbe) plus every DTB
+        // `/reserved-memory` carveout inside a RAM GiB. List EVERY window (no-silent-drop, XCARVE-5 law).
         serial_println!(
-            ":: tegra: XCARVE-3 carveout hole EXCLUDED — [{:#x},{:#x}) {} MiB unmapped from GiB {} (source: {}) — SNOC-firewalled DRAM, boot-21 RAS PA 0x26b900000, no software writer ::",
-            mmu.hole_base,
-            mmu.hole_base + mmu.hole_size,
-            mmu.hole_size >> 20,
-            mmu.hole_base >> 30,
-            src,
+            ":: tegra: XCARVE-6 carveout exclusion — {} protected window(s) UNMAPPED from the cacheable map (SNOC-firewalled DRAM, no software writer) ::",
+            mmu.hole_count,
         );
+        for i in 0..mmu.hole_count {
+            let (hb, hs, hsrc) = mmu.holes[i];
+            if hs == 0 {
+                continue;
+            }
+            let src = match hsrc {
+                1 => "DTB /reserved-memory",
+                2 => "QUIRK (DTB silent)",
+                _ => "unknown",
+            };
+            serial_println!(
+                ":: tegra:   window[{}] [{:#x},{:#x}) {} KiB @ GiB {} (source: {}) ::",
+                i,
+                hb,
+                hb + hs,
+                hs >> 10,
+                hb >> 30,
+                src,
+            );
+        }
+        if mmu.hole_dropped != 0 {
+            serial_println!(
+                ":: tegra: XCARVE-6 WARNING — {} protected window(s) DROPPED (set/pool full); exclusion set INCOMPLETE — cacheable carveout may remain ::",
+                mmu.hole_dropped,
+            );
+        }
     }
     // XCARVE-2 temporal bracket (RAS store-site hunt, `UNAOS_VUGRAS=1`): first bracket, right after the
     // MMU identity-maps RAM — the 0x26b900000 line is now cleanable. Heap/span-B are not carved yet, so

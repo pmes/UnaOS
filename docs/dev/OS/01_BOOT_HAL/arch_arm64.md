@@ -896,6 +896,55 @@ MMU — the NET-4q lease oracle reaching its first real run. Metal-owed: confirm
 records the hole source (DTB vs QUIRK) so a future arc can tighten the QUIRK to the firmware's true extent
 if the DTB stays silent.
 
+#### XCARVE-6 — one window is not enough: retire the whole class (**structural, always-on; metal-owed**)
+
+Boot-24 proved the XCARVE-3 exclusion end-to-end for `0x26b9`, but boot-25 died on the **boot-13 `0xbe`
+family** (`ADDR=0x80000000be0d6c60` / `…6c70`), and a boot-25 rerun under `vug`/`simmer` load added a
+third point `0x80000000bf77a500`. Same class: SNOC `Carveout Uncorrectable` + `Illegal address`, no
+software writer, cache traffic touching a firewalled window our Normal-WB map covers.
+
+**Decode verdict (step 1, honest).** The record-format ADDR strips **bit-63** only (§JETSON-XCARVE): none
+of the three ADDRs sets any other high bit, so bit-63-strip yields the real PA directly — `0xbe0d6c60`,
+`0xbe0d6c70`, `0xbf77a500` — **face-value**, all inside the **first DRAM GiB (GiB 2, `0x8000_0000..
+0xC000_0000`)**, *not* a near-DRAM-top reinterpretation. The three points span `0xbe000000..0xbfffffff`
+(~30 MiB), consistent with a single **VPR-shaped 32 MiB carveout `[0xbe000000, 0xc0000000)`** at the top of
+GiB 2 (ending exactly at the GiB boundary — no straddle). Face-value is the correct decode for this family
+(a record-format near-top decode would land above DRAM, which none of the ADDRs do). It fires under heavy
+cache/eviction load, exactly the no-software-writer speculative-fill/writeback mechanism XCARVE-3 settled.
+
+**The structural fix (prefer over one more quirk).** XCARVE-6 generalizes the XCARVE-3 single-hole
+machinery to a **SET** of excluded windows so any firmware-declared protected window can never be cacheable:
+
+- **Set** (`mmu_tegra::resolve_carveout_holes`): (1) the PRIMARY `0x26b9` QUIRK (slot 0, unchanged — keeps
+  `carveout_hole()`/heap-guard/VUGRAS keyed exactly as before); (2) the XCARVE-6 `0xbe` window — a
+  DTB-covering node if declared (`source = DTB`), else the full **32 MiB QUIRK `[0xbe000000, 0xc0000000)`**
+  (`source = QUIRK`) bounding all three observed ADDRs; (3) the STRUCTURAL generalization — **every DTB
+  `/reserved-memory` carveout that falls inside a RAM GiB**, deduped against the quirks. The **framebuffer**
+  carveout is never punched (it is CPU-written scanout, not a no-touch firewall window — any DTB node
+  intersecting `[fb, fb+size)` is skipped).
+- **Exclusion** (`mmu_tegra::install_carveout_holes`): each RAM GiB that contains ≥1 window is sub-divided
+  into its own **L2 table (512 × 2 MiB)** — a block is left **invalid (unmapped)** iff it intersects ANY
+  window, else Normal-WB RAM. Windows sharing a GiB share that GiB's table; **one L2 pool slot per split
+  GiB** (Orin DRAM = GiB 2..=9, the two quirks land in GiB 2 and GiB 9). Applied to BOTH the live EL2 `L1`
+  and the EL1-precise twin, each used slot cleaned to PoC. `map_fb_region`/`map_mmio_window` already skip a
+  **table descriptor** (`is_table_desc`), so a split GiB is never re-flattened to a cacheable 1 GiB block.
+- **Cost (bounded).** L2 pool = `MAX_SPLIT_GIB = 8` tables × 4 KiB × 2 (live + EL1 twin) = **64 KiB** static
+  BSS; the hole set is `MAX_HOLES = 32`. Both bounds exceed the observed handful; overflow of either is
+  **witnessed, never silently dropped** (`hole_dropped` → `:: tegra: XCARVE-6 WARNING — N … DROPPED …`).
+- **Witness (no-silent-drop, XCARVE-5 law).** The always-on banner lists **every** excluded window:
+  `:: tegra: XCARVE-6 carveout exclusion — N protected window(s) UNMAPPED …` then one
+  `:: tegra:   window[i] [lo,hi) K KiB @ GiB g (source: DTB|QUIRK) ::` per window. `carveout_holes()`
+  publishes the full set; the VUGRAS identity witness mirrors it (`:: VUGRAS: XCARVE-6 excluded set — N …`).
+
+**QEMU:** `virt` has no such carveouts, the set is empty, the map is byte-identical, no `XCARVE-6` line
+prints (verified: default `test-arm`, `UNAOS_GICV3=1 UNAOS_VUGRAS=1 test-arm`, and `UNAOS_GICV3=1
+UNAOS_WITNESS=1 UNAOS_VNET=1 test-arm` all green, CAPSTONE PASS). **Expected boot-26 (metal,
+`UNAOS_TEGRA=1`):** the `mmu regs` banner, then `:: tegra: XCARVE-6 carveout exclusion — N protected
+window(s) UNMAPPED …` with a `window[…]` line for the `0x26b9` GiB-9 window AND the `0xbe000000` GiB-2
+32 MiB window (plus any declared DTB carveouts), a **clean `post-mmu` phase and clean shell+idle (no SNOC/
+ACI RAS)** through the `vug`/`simmer` load that fired boot-25. Metal-owed: confirm boot-26 clears both the
+`0x26b9` and `0xbe` families and record whether the DTB declares the `0xbe` window (QUIRK → DTB tightening).
+
 ### JX1 result — XUSB first light (⛔ **the block is EL3-fatal to touch post-EBS; BPMP ungate required first**)
 
 The one-boot probe (a guarded read of the xHCI capability block @ `0x0361_0000`, the Linux DT

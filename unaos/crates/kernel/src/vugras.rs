@@ -274,8 +274,29 @@ pub fn pa_identity_witness() {
         t,
         0x8000_0000_0000_0000u64 | t as u64
     );
+    // XCARVE-6 one-shot excluded-SET witness: list EVERY protected window the MMU unmapped (the two QUIRKs
+    // 0x26b9/0xbe + every DTB /reserved-memory carveout inside a RAM GiB), so a capture accounts for the
+    // whole exclusion set (XCARVE-5 no-silent-drop law), not just the 0x26b9 primary.
+    #[cfg(target_arch = "aarch64")]
+    {
+        let mut set = [(0u64, 0u64, 0u8); crate::arch::aarch64::mmu_tegra::MAX_HOLES];
+        let n = crate::arch::aarch64::mmu_tegra::carveout_holes(&mut set);
+        serial_println!(":: VUGRAS: XCARVE-6 excluded set — {} protected window(s) unmapped ::", n);
+        for i in 0..n {
+            let (b, s, src) = set[i];
+            let ssrc = match src {
+                1 => "DTB /reserved-memory",
+                2 => "QUIRK (DTB silent)",
+                _ => "unknown",
+            };
+            serial_println!(
+                ":: VUGRAS:   window[{}] [{:#x},{:#x}) {} KiB @ GiB {} (source: {}) ::",
+                i, b, b + s, s / 1024, b >> 30, ssrc
+            );
+        }
+    }
     // XCARVE-3 one-shot excluded-window witness: the boot-21 verdict is that the target is fabric-protected
-    // carveout DRAM (no software writer). Report the window the MMU excluded and its source (DTB vs QUIRK).
+    // carveout DRAM (no software writer). Report the PRIMARY window (0x26b9) and its source (DTB vs QUIRK).
     let (hb, hs, src) = hole_bounds();
     if hs != 0 {
         let ssrc = match src {
