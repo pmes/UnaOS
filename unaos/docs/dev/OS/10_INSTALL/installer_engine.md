@@ -3,7 +3,9 @@
 Status: QEMU-proven on a scratch block device (x86_64), 2026-07-18. Arc INSTALL-CORE.
 Wired to the Orin microSD (metal-pending) by **INSTALL-1**, made a real self-clone by **INSTALL-2**, and given
 multi-block SD transfers + multi-cluster directories by **ORIN-SDMMC-3**
-(§INSTALL-1 / §INSTALL-2 / §ORIN-SDMMC-3 below; `UNAOS_INSTALL_TARGET_SD=1`).
+(§INSTALL-1 / §INSTALL-2 / §ORIN-SDMMC-3 below; `UNAOS_INSTALL_TARGET_SD=1`). Wired to the Pi 4 `emmc2` (the
+first LIVE, benchless install) by **INSTALL-PI**, and made a real self-clone there by **INSTALL-PI-2**
+(§INSTALL-PI / §INSTALL-PI-2 below; `UNAOS_PIINSTALL_CONFIRM=1`).
 Knob: `UNAOS_INSTALLDEMO=1` (feature `installdemo`), default OFF. Module: `crates/kernel/src/install/`.
 
 ## What it is
@@ -289,26 +291,74 @@ invocation with a **dedicated BLANK scratch image** in the slot — never the `k
 boot-sector `FAT32` fs-type + `UNAOS` volume label + 0x55AA at the ESP's first LBA) — the installer's claim
 verified from OUTSIDE the kernel. Both the in-kernel PASS line and the host-side `HOST-VERIFY: PASS` are green.
 
-**Payload (M2 adjudication).** A Pi "install" payload is ultimately the boot volume's FAT files (kernel8.img /
-start4.elf / config.txt — what the GPU ROM loads). At the pre-shell BSP call site those are not reachable as a
-readable clone source, so v1 writes a generated `UNAOS.IMG` marker (the honest-and-sufficient choice for the
-QEMU witness) and the **self-clone of the boot FAT files is the named metal follow-up** (the Pi analogue of
-INSTALL-2). **Metal note:** on real hardware the seated card IS the running system's card — the three gates +
-about-to-destroy announcement are exactly the guard for that; a metal install leg wants a dedicated erasable
-card, never the boot card.
+**Payload (INSTALL-PI v1 → self-clone).** INSTALL-PI v1 wrote a generated `UNAOS.IMG` marker, because at the
+pre-shell BSP call site a readable clone source was thought unavailable; the real self-clone was flagged as the
+named follow-up. **§INSTALL-PI-2 below replaces the marker with the real self-clone.** **Metal note:** on real
+hardware the seated card IS the running system's card — the three gates + about-to-destroy announcement are
+exactly the guard for that; a metal install leg wants a dedicated erasable card, never the boot card.
 
-**Knob-off identity.** `piinstall*` default OFF ⇒ the `install/pi` module, the `main.rs` call site, and the
-arch-neutral engine all compile out; all machine code + data are unchanged and the `kernel8-test` battery is
-0 FAIL. As with PI-USB, the only possible delta from baseline is embedded panic-`Location.line` u32s shifted
-by the 8-line gated insertion in `kernel_main` — a source-line number, never code or behavior.
+**Knob-off identity.** `piinstall*` default OFF ⇒ the `install/pi` + `install/clone` modules, the `main.rs`
+call site, and the arch-neutral engine all compile out; all machine code + data are unchanged and the
+`kernel8-test` battery is 0 FAIL. As with PI-USB, the only possible delta from baseline is embedded
+panic-`Location.line` u32s shifted by the gated insertion in `kernel_main` — a source-line number, never code
+or behavior.
+
+## §INSTALL-PI-2 — the Pi self-clone: the booted system reproduces its own boot media
+
+**Landed 2026-07-20** (aarch64/Pi bare-metal; QEMU-live). Same `UNAOS_PIINSTALL_CONFIRM=1` gate. Glue:
+`install/pi.rs` (the rewritten Gate-3 `install_flow`); engine: a new `install/clone.rs` (the buffered
+self-clone primitive). Replaces INSTALL-PI's synthetic `UNAOS.IMG` marker with the **real thing** — the
+Pi analogue of §INSTALL-2, cloning the running system's own boot media (`kernel8.img` + `config.txt` + the
+GPU firmware files) onto a fresh GPT + FAT32 layout, every file sha-extent-verified.
+
+**Same-device clone (the Pi's defining constraint).** §INSTALL-2's Orin clones a SEPARATE USB stick onto the
+microSD, so it can stream read-source→write-target. The Pi has **one** block device: the seated `emmc2` card
+is BOTH the source boot media AND the install target (Pi USB is a honesty stub — no second readable backend).
+A streaming copy would read the source AFTER the GPT write had destroyed it. So the Pi clone is **two phases**,
+the new engine seam in `install/clone.rs`:
+1. **SNAPSHOT** — `clone::snapshot` reads the WHOLE source boot tree into the kernel heap through the in-tree
+   FAT reader (`fs::fat::mount` on the seated card's own boot partition), BEFORE any destructive write.
+   Bounded on every axis (per-file 32 MiB, total 40 MiB, depth 8); a short read is a malformed source, refused.
+2. **WRITE** — after the GPT + zero-ESP + FAT32 pass, `clone::write_snapshot` mirrors the buffered tree onto
+   the fresh ESP via the engine's `TreeWriter` (multi-cluster directories, multi-FAT-sector chains — the same
+   writer §INSTALL-2/§ORIN-SDMMC-3 added), recording each file's extents.
+Both phases are engine-level and target-agnostic (any `InstallTarget`, any `fs::fat` source) — the payload
+seam, **not** a Pi-only fork; the Orin's streaming clone could adopt the buffered path later unchanged.
+
+**Byte-clone vs fresh-format ruling (the partition question).** The boot FAT tree is cloned **BY CONTENT** —
+a fresh FAT32 ESP, files re-written and per-file sha-verified — **never a raw byte-clone**. A source data /
+`unafs` partition is **NOT** byte-copied: `write_gpt` lays a fresh, empty data partition. This follows §INSTALL-2
+and the engine's verify discipline: every cloned byte must be file-sha-verifiable, which a raw partition image
+is not, and the boot media the GPU ROM needs is the FAT tree, not the data volume. A fresh install's data
+volume is empty by design.
+
+**Verify (unchanged discipline, now over real files).** Every cloned file is re-read off the card and
+SHA-checked through `verify_extents`; the flow prints a per-file `sha256=… VERIFIED` manifest, then
+`:: INSTALL: pi emmc2 gpt+zero+fat32+clone(N files) verify => PASS ::`.
+
+**QEMU witness.** `./arroyo kernel8-install [secs]` now stages the scratch card as a throwaway COPY of the
+running system's own boot media (`scripts/make-pi-install-src.sh`: an MBR/FAT32 boot partition carrying the
+freshly-built `KERNEL8.IMG` + `CONFIG.TXT` + `START4.ELF` + `FIXUP4.DAT` + an `OVERLAYS/` subdir, all 8.3-clean
+so the clone round-trips exactly) — never the `kernel8-test` battery fixture. The installer mounts it,
+snapshots, repartitions the same card, clones the tree back. **HOST-VERIFY is extended to the payload:** a
+minimal FAT32 reader walks the resulting ESP root (and `OVERLAYS/`), reads each cloned file's cluster chain,
+and byte-compares its SHA against the `KERNEL8_DIR` source — the clone proven from OUTSIDE the kernel, not just
+the GPT/FAT32 structures. Both the in-kernel PASS line and host-side `HOST-VERIFY: PASS` are green.
+
+**Metal-owed (flagged, not this arc's job).**
+- **Cloned-card bootability** — whether a real Pi GPU ROM actually BOOTS from the cloned card. The QEMU witness
+  boots via `-kernel`, so bootability of the written FAT tree is unverified here.
+- **Long-name (LFN) preservation** — the QEMU source stages 8.3-clean names for an exact round-trip; a real Pi
+  card carries long names (`bcm2711-rpi-4-b.dtb`, `overlays/miniuart-bt.dtbo`) the GPU ROM needs verbatim. The
+  8.3 `TreeWriter` clones via mangled short names; LFN write-back is the follow-up that bootability depends on.
+- **Dedicated target card** — on metal the seated card is the boot card; a real install leg wants a separate
+  erasable target (the single-block-device constraint the same-device snapshot works around in QEMU).
 
 ## What later rungs still owe
 
-- **INSTALL-2 (self-clone):** copy the running system's own boot volume as the payload (needs the boot media
-  readable as a block device at the install site — a post-takeover install position or a second block backend).
-  The Pi analogue: clone the boot FAT files (kernel8.img/start4.elf/config.txt) rather than a marker.
-- **Cross-platform:** the same `InstallTarget` generalizes to the x86 USB stick (installer_engine
-  line seed rung 4); the Pi `emmc2` rung landed as §INSTALL-PI.
-- **Throughput:** multi-block CMD25/CMD18 on the SD path (single-block is correct but slower on the zero pass).
+- **Cross-platform:** the same `InstallTarget`/`TreeWriter`/`clone` seam generalizes to the x86 USB stick
+  (installer_engine line seed rung 4); the Pi `emmc2` rung landed as §INSTALL-PI / §INSTALL-PI-2.
+- **Throughput:** multi-block CMD25/CMD18 on the SD path (single-block is correct but slower on the zero pass
+  and the per-cluster clone writes).
 - **Metal SD throughput:** the multi-block CMD18/CMD25 path is compiled + verified off-metal (QEMU models no
   Tegra234 SDMMC); its first metal exercise is the attended Orin sitting.

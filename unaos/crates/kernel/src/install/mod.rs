@@ -34,6 +34,13 @@ pub mod hash;
 #[cfg(feature = "piinstall")]
 pub mod pi;
 
+// INSTALL-PI-2: the buffered self-clone payload primitive (snapshot the source boot tree into memory,
+// then mirror it onto the freshly-formatted ESP). The engine's payload seam for a SAME-device clone
+// (the Pi reads its source from and installs onto the one seated card). `piinstall_confirm`-gated —
+// compiled only where the destructive Pi install that uses it is.
+#[cfg(feature = "piinstall_confirm")]
+pub mod clone;
+
 use crate::drivers::block;
 
 const SECTOR: usize = 512;

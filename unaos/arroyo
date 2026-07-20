@@ -1013,10 +1013,11 @@ test_kernel8() {
 # scratch image ON THE HOST (GPT signature + protective-MBR + FAT32 boot-sector label bytes at known
 # offsets) — the installer's claim verified from OUTSIDE the kernel. See installer_engine.md §INSTALL-PI.
 install_pi() {
-    local secs="${1:-12}"
+    local secs="${1:-30}"
     # Arm the three gates (cargo implies the lower two, but exporting all three makes the build log list
-    # every gate). Deliberately do NOT arm UNAOS_WITNESS — the scratch card is BLANK, so the fixture
-    # battery (which reads HELLO.BIN / the unafs volume back) must not run.
+    # every gate). Deliberately do NOT arm UNAOS_WITNESS — the scratch card carries only a boot FAT
+    # partition to self-clone, so the fixture battery (which reads HELLO.BIN / the unafs volume back on the
+    # kernel8-test fixture) must not run.
     export UNAOS_PIINSTALL=1 UNAOS_PIINSTALL_ARM=1 UNAOS_PIINSTALL_CONFIRM=1
     local scratch="${WORKSPACE_DIR}/target/pi-install-scratch.img"
     local logf="${WORKSPACE_DIR}/target/serial-pi-install.log"
@@ -1024,12 +1025,15 @@ install_pi() {
 
     kernel8 # rebuild kernel8.img from current source with the install gates armed
 
-    # A PRISTINE all-zero scratch card every run (blank => the installer's blank-check + its own
-    # zero-ESP-metadata pass both apply; nothing of the boot media is ever at risk — the kernel boots via
-    # QEMU -kernel, and this card is a throwaway).
-    echo -e "${COLOR_CYAN}⚡ Generating blank ${scratch_mib} MiB scratch SD image -> ${scratch}${COLOR_RESET}"
+    # INSTALL-PI-2 SELF-CLONE: the scratch card is NOT blank — it is a throwaway COPY of the running
+    # system's own boot media (an MBR/FAT32 boot partition carrying the freshly-built kernel8.img +
+    # config.txt + firmware, staged from KERNEL8_DIR). The booted installer mounts this partition, snapshots
+    # its boot tree into memory, then repartitions the SAME card to GPT+FAT32 and clones the buffered tree
+    # back — never the kernel8-test battery fixture. On metal the seated card IS the boot card; the three
+    # gates + about-to-destroy announcement are exactly the guard, and a metal leg wants a dedicated card.
+    echo -e "${COLOR_CYAN}⚡ Staging ${scratch_mib} MiB self-clone SOURCE card (own boot media) -> ${scratch}${COLOR_RESET}"
     rm -f "$scratch"
-    dd if=/dev/zero of="$scratch" bs=1048576 count="$scratch_mib" 2>/dev/null
+    bash "${WORKSPACE_DIR}/scripts/make-pi-install-src.sh" "$KERNEL8_DIR" "$scratch" "$scratch_mib"
 
     rm -f "$logf"
     echo -e "${COLOR_CYAN}⚡ INSTALL-PI live witness (${secs}s). Serial -> ${logf}${COLOR_RESET}"
@@ -1050,29 +1054,30 @@ install_pi() {
     # ── In-kernel verdict ──
     echo -e "${COLOR_YELLOW}── INSTALL-PI serial verdict ──${COLOR_RESET}"
     awk '/PIINSTALL|:: INSTALL:/' "$logf" || true
-    if awk '/:: INSTALL: pi emmc2 gpt\+fat32\+copy verify => PASS ::/' "$logf" | grep -q .; then
-        echo -e "${COLOR_GREEN}✅ in-kernel: install PASS line present${COLOR_RESET}"
+    if awk '/:: INSTALL: pi emmc2 gpt\+zero\+fat32\+clone\([0-9]+ files\) verify => PASS ::/' "$logf" | grep -q .; then
+        echo -e "${COLOR_GREEN}✅ in-kernel: self-clone install PASS line present${COLOR_RESET}"
     else
-        echo -e "${COLOR_RED}❌ in-kernel: install PASS line MISSING${COLOR_RESET}"
+        echo -e "${COLOR_RED}❌ in-kernel: self-clone install PASS line MISSING${COLOR_RESET}"
     fi
 
     # ── Host-side verification: read the scratch image back from OUTSIDE the kernel ──
     echo -e "${COLOR_YELLOW}── INSTALL-PI host-side verification (${scratch}) ──${COLOR_RESET}"
-    python3 - "$scratch" <<'PY'
-import sys
+    python3 - "$scratch" "$KERNEL8_DIR" <<'PY'
+import sys, hashlib, struct
 img = sys.argv[1]
+srcdir = sys.argv[2]
 SEC = 512
 ESP_LBA = 2048  # gpt::ESP_LBA_START
-with open(img, "rb") as f:
-    lba0 = f.read(SEC)
-    lba1 = f.read(SEC)
-    f.seek(ESP_LBA * SEC)
-    bs = f.read(SEC)
+f = open(img, "rb")
+def rd(lba, n=1):
+    f.seek(lba * SEC); return f.read(n * SEC)
+lba0 = rd(0); lba1 = rd(1); bs = rd(ESP_LBA)
 ok = True
 def check(name, cond):
     global ok
-    ok = ok and cond
+    ok = ok and bool(cond)
     print(("  PASS " if cond else "  FAIL ") + name)
+# ── Structures (GPT + FAT32) ──
 check("protective MBR 0x55AA signature", lba0[510:512] == b"\x55\xaa")
 check("protective MBR 0xEE GPT partition type @450", lba0[450] == 0xEE)
 check('primary GPT header "EFI PART" @LBA1', lba1[0:8] == b"EFI PART")
@@ -1080,6 +1085,77 @@ check("GPT header revision 1.0", lba1[8:12] == bytes([0,0,1,0]))
 check('FAT32 boot sector "FAT32" fs-type @ESP+82', bs[82:87] == b"FAT32")
 check('FAT32 volume label "UNAOS" @ESP+71', bs[71:76] == b"UNAOS")
 check("FAT32 boot sector 0x55AA @ESP+510", bs[510:512] == b"\x55\xaa")
+
+# ── INSTALL-PI-2 payload: read the CLONED boot files off the FAT32 ESP and byte-verify vs the source ──
+# Minimal FAT32 reader: parse the BPB, follow cluster chains through the FAT, walk directories.
+bps = struct.unpack_from("<H", bs, 11)[0]
+spc = bs[13]
+resv = struct.unpack_from("<H", bs, 14)[0]
+nfat = bs[16]
+fatsz = struct.unpack_from("<I", bs, 36)[0]
+rootc = struct.unpack_from("<I", bs, 44)[0]
+fat_lba = ESP_LBA + resv
+data_lba = ESP_LBA + resv + nfat * fatsz
+def clus_lba(c): return data_lba + (c - 2) * spc
+FATCACHE = {}
+def fat_next(c):
+    sec = c // (SEC // 4)
+    if sec not in FATCACHE:
+        FATCACHE[sec] = rd(fat_lba + sec)
+    v = struct.unpack_from("<I", FATCACHE[sec], (c % (SEC // 4)) * 4)[0] & 0x0FFFFFFF
+    return v
+def chain(c):
+    out = []
+    while 2 <= c < 0x0FFFFFF8 and len(out) < 1_000_000:
+        out.append(c); c = fat_next(c)
+    return out
+def read_clusters(c, nbytes):
+    b = bytearray()
+    for cl in chain(c):
+        b += rd(clus_lba(cl), spc)
+        if len(b) >= nbytes: break
+    return bytes(b[:nbytes])
+def read_dir(first):
+    ents = {}
+    raw = b"".join(rd(clus_lba(cl), spc) for cl in chain(first))
+    for o in range(0, len(raw), 32):
+        e = raw[o:o+32]
+        if not e or e[0] == 0x00: break
+        if e[0] == 0xE5: continue
+        attr = e[11]
+        if attr & 0x0F == 0x0F or attr & 0x08: continue  # LFN / volume label
+        base = e[0:8].rstrip(b" ").decode("latin1")
+        ext = e[8:11].rstrip(b" ").decode("latin1")
+        name = base + (("." + ext) if ext else "")
+        if name in (".", ".."): continue
+        fc = (struct.unpack_from("<H", e, 20)[0] << 16) | struct.unpack_from("<H", e, 26)[0]
+        size = struct.unpack_from("<I", e, 28)[0]
+        ents[name] = (fc, size, bool(attr & 0x10))
+    return ents
+def sha(b): return hashlib.sha256(b).hexdigest()
+def src_sha(path):
+    with open(path, "rb") as s: return sha(s.read())
+
+root = read_dir(rootc)
+# Root files cloned from KERNEL8_DIR — byte-verify each against its source.
+import os
+for cloned, src in [("KERNEL8.IMG","kernel8.img"), ("CONFIG.TXT","config.txt"),
+                    ("START4.ELF","start4.elf"), ("FIXUP4.DAT","fixup4.dat")]:
+    sp = os.path.join(srcdir, src)
+    if cloned not in root:
+        check("cloned root file present: " + cloned, False); continue
+    fc, size, isdir = root[cloned]
+    data = read_clusters(fc, size) if size else b""
+    match = (not os.path.isfile(sp)) or (sha(data) == src_sha(sp) and size == os.path.getsize(sp))
+    # If the source file is absent (e.g. firmware not staged), presence alone is the check.
+    check("cloned + byte-verified: %s (%d B)" % (cloned, size), match if os.path.isfile(sp) else True)
+# Subdirectory clone: OVERLAYS/ must exist as a directory and carry OVERLAY1.DAT.
+if "OVERLAYS" in root and root["OVERLAYS"][2]:
+    sub = read_dir(root["OVERLAYS"][0])
+    check("cloned subdir OVERLAYS/ carries OVERLAY1.DAT", "OVERLAY1.DAT" in sub)
+else:
+    check("cloned subdir OVERLAYS/ present", False)
+
 print("HOST-VERIFY: " + ("PASS" if ok else "FAIL"))
 sys.exit(0 if ok else 1)
 PY
