@@ -57,15 +57,12 @@ const P: &str = ":: PIUSB:";
 static XHCI_CPU_BASE: AtomicU64 = AtomicU64::new(0);
 static XHCI_READY: AtomicBool = AtomicBool::new(false);
 
-// ─── PIUSB-5 adopt-don't-reset knob (compile-time; the `UNAOS_SMPPROBE` option_env precedent). When
-// the pre-reset reference dump finds the firmware-left VL805 xHCI already DECODING (CAP non-poison),
-// `UNAOS_PIUSB_ADOPT=1` takes the x86-XENUM inherited-controller road: SKIP our destructive RC reset +
-// VL805 firmware reload entirely, adopt the firmware's working decode, program only what is missing,
-// and attach the shared xHCI at the firmware's own CPU window. Knob-off (default) the dump still runs
-// (read-only; it is the diff evidence) but the code always takes the reset path — so a plain
-// `UNAOS_PIUSB=1` kernel8 is behaviourally identical to baseline apart from the added dump lines. The
-// const is always compiled (both arches type-check the adopt path); only its runtime value gates. ───
-const ADOPT: bool = option_env!("UNAOS_PIUSB_ADOPT").is_some();
+// ─── PIUSB-6: the adopt-don't-reset path is RETIRED. boot-P4 proved on metal that the VideoCore tears
+// PCIe down before handoff (`PHYLINKUP=false DL_ACTIVE=false`, all windows zero, RC fully in reset), so
+// there is never a firmware-left working decode to adopt on this platform — the firmware's config exists
+// only during firmware runtime. The pre-reset dump is KEPT as a one-boot-proven read-only record (now
+// hard-gated on link-up: a link-down RC must never be MMIO'd past its own register block), but the adopt
+// branch, its `UNAOS_PIUSB_ADOPT` knob, and the WIN0 CPU-base decode are gone with it. ───
 
 // ─── BCM2711 PCIe RC register block (ARM-physical; inside the 0xC000_0000–0xFFFF_FFFF Device-nGnRnE
 // window `boot.rs` L1[3] already maps — no new mapping needed to reach ANY of the RC registers or the
@@ -94,6 +91,11 @@ const PCIE_MISC_PCIE_STATUS_DL_ACTIVE: u32 = 1 << 5;
 const PCIE_RGR1_SW_INIT_1_PERST: u32 = 1 << 0; // PERST# assert (1 = in reset)
 const PCIE_RGR1_SW_INIT_1_INIT_GENERIC: u32 = 1 << 1; // bridge core reset (1 = in reset)
 const PCIE_MISC_HARD_DEBUG_SERDES_IDDQ: u32 = 1 << 27; // 1 = serdes powered DOWN; clear to power up
+// MISC_CTRL SCB0 inbound-window SIZE field (bits [31:27]; SCB1 at [26:22], SCB2 at [21:17]). The RC will
+// not claim an inbound region larger than its programmed SCB size — SCB0_SIZE must be sized to match
+// RC_BAR2 BEFORE (or with) the RC_BAR2 write (documented BCM2711 order; pcie-brcmstb.c is GPL-2.0-only).
+const PCIE_MISC_MISC_CTRL_SCB0_SIZE_SHIFT: u32 = 27;
+const PCIE_MISC_MISC_CTRL_SCB0_SIZE_MASK: u32 = 0x1f << 27; // 0xf800_0000
 
 // ─── The VL805 endpoint. It enumerates as bus 1, dev 0, fn 0 behind the RC's single downstream port. ───
 const VL805_VENDOR: u16 = 0x1106; // VIA Technologies
@@ -273,45 +275,30 @@ fn dtb_has_pcie(dtb: u64) -> bool {
     false
 }
 
-// ─── PIUSB-5: the pre-reset firmware reference dump. ────────────────────────────────────────────────
+// ─── PIUSB-5/6: the pre-reset firmware reference dump (link-up-gated). ──────────────────────────────
 //
-// boot-P3 refuted every PIUSB-4 hypothesis on metal by its OWN witnesses: notify-first ordering held
-// (`post-NOTIFY cfg[0x00]` live — the device survived), `BAR0 [0x10]=0xc0000004 -> LATCHED`,
-// `COMMAND=0x0146 -> DECODE ENABLED`, `WIN0 armed: YES` — and the CAP read at CPU 0x6_0000_0000 was
-// STILL 0xdeaddead after 8 tries. Config cycles reach the device; memory cycles vanish. Yet the ROM
-// boot spew shows the VideoCore firmware itself reading THIS xHC (`xHC ver: 256 HCS: 05000420`) moments
-// before our code runs. So a working configuration demonstrably exists on this silicon — the one thing
-// we never looked at is the state the firmware LEFT, because M1 asserts RGR1_SW_INIT_1 (bridge core +
-// PERST reset) as its very first act, destroying it before we can read it.
+// PIUSB-5 captured the firmware-left state before M1's reset destroys it. boot-P4 delivered the verdict:
+// the firmware leaves the RC FULLY IN RESET — `RGR1_SW_INIT_1=0x3 PCIE_STATUS=0x0 (PHYLINKUP=false
+// DL_ACTIVE=false)`, WIN0 all-zero, RC_BAR2 zero, no live child config. The VideoCore tears PCIe down
+// before handoff; its working config exists only during firmware runtime. So there is NOTHING to adopt,
+// and the adopt path (with its knob and the WIN0 CPU-base decode) is RETIRED in PIUSB-6.
 //
-// This dump captures that state FIRST, read-only, before any reset: the RC bridge/window registers, the
-// VL805 config (via the EXT_CFG child window the firmware may already have set up), and — the crux — a
-// CAP-read attempt at the CPU window the firmware-left WIN0 implies. If the firmware state DECODES
-// (CAP non-poison), the diff against our post-reset programming IS the answer, and the adopt path can
-// ride it. If it too reads poison, the wall is upstream of anything we program — so we additionally
-// witness the RC's CPU-side claim regs (MISC_CTRL scb-size fields) against the documented BCM2711
-// bring-up order (facts-only; pcie-brcmstb.c is GPL-2.0-only). Nothing here writes a single register.
+// boot-P4 also exposed the MMIO HAZARD this dump now guards against: with the link down, the original
+// dump proceeded to CAP-read the outbound window anyway — an MMIO into a link-down RC does NOT fault, it
+// STALLS the CPU on the bus for a pathologically long time (the run looked frozen; a power-cycled rerun
+// eventually returned 0x0). So the dump is now HARD-GATED on PHYLINKUP && DL_ACTIVE: it reads only the
+// RC's own register block (always safe), and if the link is down it witnesses the RC's CPU-side claim
+// regs (MISC_CTRL scb-size fields) against the documented BCM2711 order and returns — NO downstream
+// MMIO. That witness is the boot-P5 evidence on the still-poison path. Nothing here writes a register.
+//
+// Breadcrumb for the doc: a pre-bring-up read at 0x6_0000_0000 returns 0x00000000 (the RC does not yet
+// CLAIM that CPU address — unclaimed), whereas a post-bring-up read returns 0xdeaddead (the RC claims it
+// but master-aborts forwarding it downstream). The unclaimed-vs-master-abort difference localises the
+// wall: pre-reset it is the RC's address claim; post-reset it is downstream of the RC (the BAR).
 
-/// What the firmware left, as read before our reset. `live_cap_cpu_base` is `Some(addr)` only when a
-/// CAP read at the firmware-implied CPU window returned non-poison, non-zero data — i.e. the xHC is
-/// already decoding memory cycles at `addr`. That is the adopt trigger.
-struct FwState {
-    live_cap_cpu_base: Option<u64>,
-}
-
-/// Decode the firmware-left outbound WIN0 CPU-side base from the BCM2711 register packing (the inverse
-/// of M1 step (f)): BASE_LIMIT bits[15:4] carry base_mb[11:0]; BASE_HI carries base_mb[>=12]. Returns
-/// the CPU-physical base the RC currently matches for this window (0 if the window looks unprogrammed).
-fn decode_fw_win0_cpu_base(base_limit: u32, base_hi: u32) -> u64 {
-    if is_poison(base_limit) {
-        return 0;
-    }
-    let base_mb = (((base_hi as u64) << WIN_HI_SHIFT) | (((base_limit >> 4) & 0xFFF) as u64)) & 0xFFFFFF;
-    base_mb << WIN_MB_SHIFT
-}
-
-/// One shared constant with M1's packing so the decode above stays in lockstep with the encode.
-const WIN_MB_SHIFT: u64 = 20; // 1 MiB granularity (mirrors m1_rc_bringup step (f))
+/// Outbound-window packing constants (M1 step (f)): CPU base/limit are expressed in 1 MiB units, and the
+/// upper MiB bits spill from the 12-bit BASE_LIMIT field into the separate BASE_HI/LIMIT_HI registers.
+const WIN_MB_SHIFT: u64 = 20; // 1 MiB granularity
 const WIN_HI_SHIFT: u32 = 12; // bits carried by the 12-bit base/limit field in BASE_LIMIT
 
 /// Witness the RC's CPU-side claim registers against the documented BCM2711 bring-up order. Called only
@@ -337,24 +324,33 @@ fn witness_rc_cpu_claim() {
         P, misc, scb0, scb1, scb2, bar2_lo, bar2_hi
     );
     // The documented order: SCB0_SIZE must be set (nonzero) before RC_BAR2 is programmed to a matching
-    // inbound size; a nonzero RC_BAR2 size-code over a zero SCB0 is the classic misordering.
+    // inbound size; a nonzero RC_BAR2 size-code over a zero SCB0 is the classic misordering. This witness
+    // runs on the PRE-RESET path (reading the state the FIRMWARE left) — so a zero SCB0 here reports the
+    // FIRMWARE's teardown, not our programming. PIUSB-6's M1 now sizes SCB0 before RC_BAR2 (step (d));
+    // that fix is proven by M1's own MISC_CTRL readback line, not by this pre-reset witness.
     let bar2_size_code = bar2_lo & 0x1f;
     if scb0 == 0 && bar2_size_code != 0 {
         serial_println!(
-            "{}   RC-claim witness: SCB0_SIZE=0 but RC_BAR2 size-code={:#x} — inbound window programmed AHEAD of its SCB size (documented BCM2711 bring-up-order fault; our M1 sets RC_BAR2 without first sizing SCB0) ::",
+            "{}   RC-claim witness: SCB0_SIZE=0 but RC_BAR2 size-code={:#x} — inbound window sized AHEAD of its SCB window in the FIRMWARE-left state (RC won't claim it); PIUSB-6 M1 corrects this order on our own bring-up ::",
             P, bar2_size_code
         );
     }
 }
 
 /// The pre-reset firmware reference dump. Read-only. Runs after the DTB census (so only when an RC is
-/// present) and before M1's first reset write. Dumps the as-left RC bridge/window state and the VL805
-/// config (through the firmware's EXT_CFG forwarding, if it left any), then maps the firmware-implied
-/// CPU window and TRIES the CAP read there. Returns the adopt disposition.
-fn dump_firmware_state() -> FwState {
+/// present) and before M1's first reset write. Reads the RC's OWN register block (bridge/window/status —
+/// always safe, even with the link down) and prints it as the one-boot-proven record. Then a HARD
+/// LINK-UP GATE: only if PCIE_STATUS shows PHYLINKUP && DL_ACTIVE does it go on to probe the VL805 child
+/// config + the outbound CAP window; otherwise it witnesses the RC's CPU-side claim registers and
+/// returns WITHOUT any downstream MMIO. boot-P4 proved why: the firmware leaves the RC fully in reset
+/// (PHYLINKUP=false DL_ACTIVE=false, all windows zero), and an MMIO probe into a link-down RC does not
+/// fault — it STALLS the CPU on the bus for a pathologically long time (the run appeared frozen; a
+/// power-cycled rerun eventually returned 0). Adopt is retired: there is nothing live to adopt here.
+fn dump_firmware_state() {
     serial_println!("{} PIUSB-5: pre-reset firmware reference dump (read-only; BEFORE any RC reset) ::", P);
 
-    // (1) RC bridge + window registers, exactly as the firmware left them.
+    // (1) RC bridge + window registers, exactly as the firmware left them. These are the RC's OWN
+    //     register block (the 0xFD50_0000 MMIO the CPU always claims) — safe to read link-down.
     let swinit = r(RC_BASE + PCIE_RGR1_SW_INIT_1);
     let status = r(RC_BASE + PCIE_MISC_PCIE_STATUS);
     let buses = r(RC_BASE + 0x18);
@@ -365,26 +361,40 @@ fn dump_firmware_state() -> FwState {
     let win_lhi = r(RC_BASE + PCIE_MISC_CPU_2_PCIE_MEM_WIN0_LIMIT_HI);
     let bar2_lo = r(RC_BASE + PCIE_MISC_RC_BAR2_CONFIG_LO);
     let bar2_hi = r(RC_BASE + PCIE_MISC_RC_BAR2_CONFIG_HI);
+    let phylinkup = status & PCIE_MISC_PCIE_STATUS_PHYLINKUP != 0;
+    let dl_active = status & PCIE_MISC_PCIE_STATUS_DL_ACTIVE != 0;
     serial_println!(
         "{}   fw RC: RGR1_SW_INIT_1={:#010x} PCIE_STATUS={:#010x} (PHYLINKUP={} DL_ACTIVE={}) bus_window[0x18]={:#010x} ::",
-        P, swinit, status,
-        status & PCIE_MISC_PCIE_STATUS_PHYLINKUP != 0,
-        status & PCIE_MISC_PCIE_STATUS_DL_ACTIVE != 0,
-        buses
+        P, swinit, status, phylinkup, dl_active, buses
     );
     serial_println!(
         "{}   fw WIN0: LO={:#010x} HI={:#010x} BASE_LIMIT={:#010x} BASE_HI={:#010x} LIMIT_HI={:#010x} | RC_BAR2 LO={:#010x} HI={:#010x} ::",
         P, win_lo, win_hi, win_bl, win_bhi, win_lhi, bar2_lo, bar2_hi
     );
-    let fw_pcie_base = ((win_hi as u64) << 32) | (win_lo as u64 & 0xFFFF_FFF0);
-    let fw_cpu_base = decode_fw_win0_cpu_base(win_bl, win_bhi);
+
+    // (2) LINK-DOWN GATE (the boot-P4 lesson, now law). PHYLINKUP && DL_ACTIVE are BOTH required before
+    //     ANY probe past the RC register block — the child config goes through EXT_CFG forwarding to the
+    //     (absent) downstream device, and the CAP read is a memory cycle into the outbound window; both
+    //     stall the bus for a very long time when the link is down. If down, witness the RC's own
+    //     claim/scb-size registers (safe, RC-register reads) and return — that witness is boot-P5's
+    //     evidence line on the still-poison path.
+    if is_poison(status) || !(phylinkup && dl_active) {
+        serial_println!(
+            "{}   fw left RC in reset — nothing to adopt/probe (PHYLINKUP={} DL_ACTIVE={}); skipping child-config + CAP probe (MMIO into a link-down RC stalls the bus — boot-P4 stalled here) ::",
+            P, phylinkup, dl_active
+        );
+        witness_rc_cpu_claim();
+        // Drain any latent async abort the RC-register reads could have set (the R22 sitting-2 class);
+        // this dump runs BEFORE M1's reset, so nothing latent may survive into the reset sequence.
+        super::exceptions::serror_drain_request("piusb: PIUSB-5 dump link-down");
+        return;
+    }
     serial_println!(
-        "{}   fw WIN0 decode: CPU base {:#x} -> PCIe base {:#x} (the window the firmware left for the VL805 BAR) ::",
-        P, fw_cpu_base, fw_pcie_base
+        "{}   fw RC link UP (PHYLINKUP && DL_ACTIVE) — firmware left the RC live; probing child config + CAP (read-only) ::",
+        P
     );
 
-    // (2) VL805 config, through whatever EXT_CFG forwarding the firmware left (read-only; if the
-    //     firmware did not program the bridge bus window these read poison — honest, not fatal here).
+    // (3) VL805 config, through whatever EXT_CFG forwarding the firmware left (link-up only; read-only).
     let id = vl805_cfg_read(0x00);
     let cmd = vl805_cfg_read(0x04);
     let bar0_lo = vl805_cfg_read(0x10);
@@ -400,19 +410,9 @@ fn dump_firmware_state() -> FwState {
         ),
     }
 
-    // (3) The crux: TRY the CAP read at the firmware-implied CPU window. Pick the firmware WIN0 CPU base
-    //     if it decodes to a plausible aligned value; otherwise fall back to the canonical Pi outbound
-    //     base (0x6_0000_0000) the DT `ranges` documents. Map that 1 GiB Device block (the same mapping
-    //     M3 would install — idempotent if it is the same block) and read CAPLENGTH/HCIVERSION.
-    let cap_cpu_base = if fw_cpu_base != 0 && fw_cpu_base < 0x10_0000_0000 && (fw_cpu_base & (OUTBOUND_SIZE - 1)) == 0 {
-        fw_cpu_base
-    } else {
-        serial_println!(
-            "{}   fw WIN0 CPU base {:#x} implausible/unprogrammed — trying the canonical outbound base {:#x} for the CAP probe ::",
-            P, fw_cpu_base, OUTBOUND_CPU_BASE
-        );
-        OUTBOUND_CPU_BASE
-    };
+    // (4) CAP read at the canonical outbound window (link-up only). Read-only record: whether the
+    //     firmware-left decode answers is the diff evidence, but with adopt retired we never ride it.
+    let cap_cpu_base = OUTBOUND_CPU_BASE;
     unsafe { super::boot::map_device_1gib(cap_cpu_base) };
     let mut cap0 = r(cap_cpu_base);
     let mut tries = 1u32;
@@ -423,29 +423,21 @@ fn dump_firmware_state() -> FwState {
     }
     if is_poison(cap0) || cap0 == 0 {
         serial_println!(
-            "{}   fw CAP probe @ {:#x} = {:#010x} after {} tries — the firmware-left state ALSO does not decode memory cycles here; the wall is upstream of the BAR ::",
+            "{}   fw CAP probe @ {:#x} = {:#010x} after {} tries — the firmware-left state does not decode memory cycles here; the wall is upstream of the BAR ::",
             P, cap_cpu_base, cap0, tries
         );
-        // Task-3 branch: witness the RC's CPU-side claim/scb-size regs against the BCM2711 order.
         witness_rc_cpu_claim();
-        // A poisoned pre-reset CAP/child read can leave a latent async external abort pending (the R22
-        // sitting-2 class). This dump runs BEFORE M1's reset on the fall-through path, so drain here so
-        // nothing latent survives into the reset sequence (fail-closed never loosened).
         super::exceptions::serror_drain_request("piusb: PIUSB-5 dump poison");
-        return FwState { live_cap_cpu_base: None };
+        return;
     }
     let cap_length = (cap0 & 0xff) as u8;
     let hci_version = (cap0 >> 16) as u16;
     let hcsparams1 = r(cap_cpu_base + 0x04);
     serial_println!(
-        "{}   fw CAP probe @ {:#x} = {:#010x} LIVE — firmware-left xHC IS DECODING: CAPLENGTH={} HCIVERSION={:#06x} HCSPARAMS1={:#010x} ::",
+        "{}   fw CAP probe @ {:#x} = {:#010x} LIVE — firmware-left xHC IS DECODING: CAPLENGTH={} HCIVERSION={:#06x} HCSPARAMS1={:#010x} (record only — adopt retired, we still reset) ::",
         P, cap_cpu_base, cap0, cap_length, hci_version, hcsparams1
     );
-    serial_println!(
-        "{}   PIUSB-5: firmware config is LIVE — the diff vs our post-reset programming is the boot-P3 wall's answer (adopt {}) ::",
-        P, if ADOPT { "ARMED: UNAOS_PIUSB_ADOPT=1 will ride it" } else { "available: rebuild with UNAOS_PIUSB_ADOPT=1 to ride it" }
-    );
-    FwState { live_cap_cpu_base: Some(cap_cpu_base) }
+    super::exceptions::serror_drain_request("piusb: PIUSB-5 dump exit");
 }
 
 /// Entry point: bring the BCM2711 PCIe RC + VL805 xHCI up to the honesty line. Called once on the BSP,
@@ -468,28 +460,11 @@ pub fn bringup(dtb: u64) {
     }
     serial_println!("{} DTB census: `pcie@` controller present — proceeding to RC bring-up ::", P);
 
-    // ── PIUSB-5: reference dump FIRST, reset SECOND. Capture the firmware-left state (read-only) before
-    //    M1 destroys it with the bridge/PERST reset. If it is live AND the adopt knob is armed, ride it
-    //    instead of resetting (the x86-XENUM inherited-controller road). ─────────────────────────────
-    let fw = dump_firmware_state();
-    if ADOPT {
-        if let Some(cpu_base) = fw.live_cap_cpu_base {
-            serial_println!(
-                "{} PIUSB-5 ADOPT: firmware xHC decoding @ {:#x} — SKIPPING our destructive RC reset + VL805 fw reload; adopting the firmware config ::",
-                P, cpu_base
-            );
-            // Program ONLY what is missing — never reset. Ensure the VL805 COMMAND decode bits without
-            // touching the BAR the firmware already latched (poison-honest; a silent child config just
-            // means we ride the firmware's decode as-is).
-            adopt_ensure_decode();
-            // Attach the shared xHCI at the firmware's own CPU window and reach the honesty line.
-            m3_attach_xhci(cpu_base, OUTBOUND_PCIE_BASE);
-            super::exceptions::serror_drain_request("piusb: adopt exit");
-            serial_println!("{} PI-USB-1 bring-up DONE via ADOPT (firmware config ridden; no RC reset) ::", P);
-            return;
-        }
-        serial_println!("{} PIUSB-5 ADOPT armed but firmware state did NOT decode — falling through to the reset path (fail-closed intact) ::", P);
-    }
+    // ── PIUSB-5/6: read-only reference dump FIRST (link-up-gated), reset SECOND. Capture the
+    //    firmware-left state before M1 destroys it with the bridge/PERST reset. boot-P4 proved the
+    //    firmware tears PCIe down before handoff (RC left fully in reset, no child config, no live
+    //    decode), so the adopt path is retired — the dump is a record; we always take the reset path. ──
+    dump_firmware_state();
 
     // ── M1: brcmstb RC bring-up. ─────────────────────────────────────────────────────────────────
     if !m1_rc_bringup() {
@@ -559,9 +534,36 @@ fn m1_rc_bringup() -> bool {
     dsb();
     settle_ms(1);
 
-    // (d) MISC_CTRL: leave the firmware/reset default (SCB access, 64-bit RC BAR sizing) in place — a
-    //     read-modify-touch is unnecessary for our scoped bring-up; log it for the metal record.
-    serial_println!("{}   MISC_CTRL = {:#010x} (firmware default retained) ::", P, r(RC_BASE + PCIE_MISC_MISC_CTRL));
+    // (d) MISC_CTRL SCB0_SIZE: size the RC's inbound (system-cache-bus) window BEFORE programming
+    //     RC_BAR2 — the documented BCM2711 bring-up order.
+    //
+    //     ── PIUSB-6 ADJUDICATION (the SCB/RC_BAR2 ordering audit — now THE live wall hypothesis) ─────
+    //     PIUSB-5's `witness_rc_cpu_claim` flagged our prior code: it wrote RC_BAR2 (step (e)) with
+    //     SCB0_SIZE left at the firmware/reset default, i.e. it programmed the inbound window AHEAD of
+    //     sizing the SCB window that BACKS it. The RC will not claim an inbound region larger than its
+    //     programmed SCB size, so a 4 GiB RC_BAR2 over an unsized (or mismatched) SCB0 is the documented
+    //     ordering fault. `pcie-brcmstb.c` (GPL-2.0-only — facts only) programs the SCB0_SIZE field of
+    //     MISC_CTRL to the inbound size in the SAME setup step, before/with the RC_BAR2 write. SCB0_SIZE
+    //     uses the SAME encode as the ibar size-code (log2(size)-15 for 64 KiB..32 GiB), so a 4 GiB
+    //     inbound window is 0x11 in BOTH fields. We set SCB0_SIZE here, read it back, THEN write
+    //     RC_BAR2 (step (e)) — matching order restored. Read-modify-write: only the SCB0_SIZE field is
+    //     touched; every other MISC_CTRL bit (SCB access enable, RC BAR sizing) is preserved.
+    const RC_BAR2_SIZE_4G: u32 = 0x11; // encode_ibar_size(4 GiB) = log2(2^32) - 15 = 0x11 (shared: SCB0 + RC_BAR2)
+    let misc_before = r(RC_BASE + PCIE_MISC_MISC_CTRL);
+    let misc_after = (misc_before & !PCIE_MISC_MISC_CTRL_SCB0_SIZE_MASK)
+        | ((RC_BAR2_SIZE_4G << PCIE_MISC_MISC_CTRL_SCB0_SIZE_SHIFT) & PCIE_MISC_MISC_CTRL_SCB0_SIZE_MASK);
+    serial_println!(
+        "{}   >>> WRITE: MISC_CTRL {:#010x} -> {:#010x} (SCB0_SIZE := {:#x} = 4 GiB, sized BEFORE RC_BAR2 — documented BCM2711 order; PIUSB-6 fix) ::",
+        P, misc_before, misc_after, RC_BAR2_SIZE_4G
+    );
+    w(RC_BASE + PCIE_MISC_MISC_CTRL, misc_after);
+    dsb();
+    let misc_rb = r(RC_BASE + PCIE_MISC_MISC_CTRL);
+    serial_println!(
+        "{}   MISC_CTRL readback = {:#010x} (SCB0_SIZE={:#x}) -> {} ::",
+        P, misc_rb, (misc_rb >> PCIE_MISC_MISC_CTRL_SCB0_SIZE_SHIFT) & 0x1f,
+        if (misc_rb & PCIE_MISC_MISC_CTRL_SCB0_SIZE_MASK) == (misc_after & PCIE_MISC_MISC_CTRL_SCB0_SIZE_MASK) { "SIZED" } else { "DID NOT LATCH" }
+    );
 
     // (e) Inbound DMA BAR (RC_BAR2): map the PCIe inbound window to system RAM base 0 so a bus-master
     //     device can DMA into RAM. Encoding (brcmstb): CONFIG_LO = (RAM base low 32b) | size-code in
@@ -581,9 +583,9 @@ fn m1_rc_bringup() -> bool {
     //     0x11 by the encode_ibar_size programming model — constant unchanged.
     //
     //     We stop at the honesty line (no DMA yet), but the inbound BAR is part of the RC sequence of
-    //     record, so program + log it for correctness-by-construction.
-    const RC_BAR2_SIZE_4G: u32 = 0x11; // encode_ibar_size(4 GiB) = log2(2^32) - 15 = 32 - 15 = 0x11
-    serial_println!("{}   >>> WRITE: RC_BAR2 inbound window = RAM@0 size=4GiB (DMA) ::", P);
+    //     record, so program + log it for correctness-by-construction. `RC_BAR2_SIZE_4G` is the shared
+    //     size-code declared in step (d) (SCB0_SIZE and RC_BAR2 must agree — same 0x11 for 4 GiB).
+    serial_println!("{}   >>> WRITE: RC_BAR2 inbound window = RAM@0 size=4GiB (DMA; SCB0_SIZE already set in (d)) ::", P);
     w(RC_BASE + PCIE_MISC_RC_BAR2_CONFIG_LO, RC_BAR2_SIZE_4G);
     w(RC_BASE + PCIE_MISC_RC_BAR2_CONFIG_HI, 0);
     dsb();
@@ -615,8 +617,7 @@ fn m1_rc_bringup() -> bool {
     //     separate BASE_HI / LIMIT_HI registers, shifted right by 12 (HWEIGHT of the 12-bit base field).
     //     Every register is READ BACK and witnessed (the ORIN readback ritual) so a boot log proves the
     //     window is armed, not merely written.
-    // WIN_MB_SHIFT / WIN_HI_SHIFT are the module-level packing constants (shared with the PIUSB-5
-    // decode_fw_win0_cpu_base inverse).
+    // WIN_MB_SHIFT / WIN_HI_SHIFT are the module-level packing constants.
     let cpu_base = OUTBOUND_CPU_BASE;
     let cpu_limit = OUTBOUND_CPU_BASE + OUTBOUND_SIZE - 1;
     let pcie_base = OUTBOUND_PCIE_BASE;
@@ -879,42 +880,32 @@ fn m2_enumerate_vl805() -> Option<u64> {
     Some(bar0_pcie)
 }
 
-/// PIUSB-5 adopt path: program ONLY what is missing on the firmware-configured VL805 — never reset,
-/// never touch the BAR the firmware already latched. We only ensure the COMMAND decode bits (MEM + Bus
-/// Master) are set so the CPU reads and future DMA are forwarded; if they already read set (the normal
-/// case for a firmware that was itself reading the xHC), this is a no-op witness. Poison-honest: if the
-/// child config does not answer we simply ride the firmware's decode as-is (the CAP read already proved
-/// it live) and say so. This is the inherited-controller discipline: touch the minimum, disturb nothing.
-fn adopt_ensure_decode() {
-    let cmd = vl805_cfg_read(0x04);
-    if is_poison(cmd) {
-        serial_println!("{}   adopt: VL805 child config silent ({:#010x}) — riding firmware decode as-is (CAP already proven live) ::", P, cmd);
-        return;
-    }
-    let have = (cmd & 0b110) == 0b110;
-    if have {
-        serial_println!("{}   adopt: VL805 COMMAND={:#06x} already has MEM+BusMaster — nothing to program ::", P, cmd & 0xffff);
-        return;
-    }
-    let newcmd = (cmd & 0xFFFF_0000) | ((cmd & 0xFFFF) | 0b110);
-    serial_println!("{}   adopt: >>> WRITE: VL805 COMMAND {:#06x} -> {:#06x} (only the missing MEM+BusMaster bits) ::", P, cmd & 0xffff, newcmd & 0xffff);
-    vl805_cfg_write(0x04, newcmd);
-    let rb = vl805_cfg_read(0x04) & 0xffff;
-    serial_println!(
-        "{}   adopt: COMMAND readback = {:#06x} (MEM={} BusMaster={}) ::",
-        P, rb, (rb >> 1) & 1, (rb >> 2) & 1
-    );
-}
-
 /// M3: map the outbound window Device-nGnRnE, read the xHCI capability registers at the VL805 BAR
 /// (poison-rejecting), attach the shared xHCI driver in polled mode (halt + reset = "halted-but-
 /// decoding"), power the root ports, and STOP. Full device enumeration (rings, ADDRESS_DEVICE, HID/
 /// storage) needs the heap + a live device and is the attended-metal follow-on — not this arc.
 fn m3_attach_xhci(cpu_base: u64, _bar0_pcie: u64) {
+    // BELT LINK-UP GATE (PIUSB-6): re-confirm PHYLINKUP && DL_ACTIVE before the CAP probe into the
+    // outbound window. M3 is only reached after M1 declared link-up, but a link that dropped between M1
+    // and here would make this CAP read an MMIO into a link-down RC — which stalls the bus for a
+    // pathologically long time (boot-P4). Refuse the probe if the link is not up; RC-STATUS is a safe
+    // RC-register read.
+    let status = r(RC_BASE + PCIE_MISC_PCIE_STATUS);
+    let up_mask = PCIE_MISC_PCIE_STATUS_PHYLINKUP | PCIE_MISC_PCIE_STATUS_DL_ACTIVE;
+    if is_poison(status) || (status & up_mask) != up_mask {
+        serial_println!(
+            "{} M3: PCIE_STATUS={:#010x} link NOT up (PHYLINKUP={} DL_ACTIVE={}) — refusing the CAP probe into a link-down RC (link-down MMIO stalls the bus); attach SKIPPED, fail-closed ::",
+            P, status,
+            status & PCIE_MISC_PCIE_STATUS_PHYLINKUP != 0,
+            status & PCIE_MISC_PCIE_STATUS_DL_ACTIVE != 0
+        );
+        return;
+    }
+
     // Map the 1 GiB Device block that contains `cpu_base` into the live translation regime (the ONLY
     // new page-table write this arc makes; `boot::map_device_1gib`, piusb-gated; idempotent if the
     // reference dump already mapped this block). The RC forwards CPU reads of this window to the VL805's
-    // BAR (programmed in M2 on the reset path, or left by the firmware on the adopt path).
+    // BAR (programmed in M2 on the reset path).
     unsafe { super::boot::map_device_1gib(cpu_base) };
     serial_println!("{} M3: mapped outbound window CPU {:#x} (Device-nGnRnE, 1 GiB) — reading VL805 xHCI caps ::", P, cpu_base);
     let outbound_cpu_base = cpu_base;
