@@ -62,6 +62,31 @@
 // path; if a future sitting shows stale OWN/len the same invalidate extends to the ring. Do NOT weaken
 // the OWN protocol to compensate.
 //
+// ## NET-4m — the per-pop invalidate is ALREADY on the live path; the residual zeros are NOT a cache bug.
+//
+// Boot 15 kept the rx[2..] all-zero payloads even with NET-4l's correct OWN-last re-arm active. The
+// natural next suspect — "the `dc ivac` invalidate-before-read fires only on the first pop" — is FALSE:
+// `rx_frame_raw`'s `cache::invalidate_range(buf, len)` is UNCONDITIONAL and runs on every pop (only the
+// `[net4f]` serial WITNESS is one-shot, `rx_count == 0` — the source of that misread). The copy that
+// feeds NET-4d is therefore ALREADY a post-invalidate DRAM read, so the zeros it reports are what the
+// buffer DRAM holds after the invalidate — "more invalidate" cannot change them. Two facts pin the
+// residual cause down and, decisively, BOTH lie outside this driver's invalidate lane:
+//   1. NET-4g proves the descriptor `addr` is all-MATCH (the NIC has the buffer addresses the driver
+//      programmed), so this is not descriptor corruption.
+//   2. The ring is observed COHERENTLY (real per-slot lengths, OWN-clear seen, frames pop) while the
+//      buffers read zero — an ASYMMETRY a pure cache-coherency defect cannot produce, since ring and
+//      buffers share one cacheable identity-mapped heap and one DMA master. A cache bug would zero the
+//      ring too.
+// So the honest "do it right" fork (per the NET-4m brief item 3) resolves to one of two arcs, and the
+// `[net4m]` speculation-fenced buffer-DRAM probe below discriminates them on the next boot:
+//   * writes-to-nowhere: the NIC's payload DMA never lands in the CPU-visible buffer DRAM — an inbound
+//     reachability gap (SMMU / inbound iATU / ORIN-DMA-WINDOW). BELOW the driver's lane.
+//   * cache/speculation (less likely, given the asymmetry): the buffer DRAM holds the payload but the
+//     cacheable read shadows it — cured only by a NON-CACHEABLE DMA arena (a Normal-NC MAIR slot +
+//     splitting mmu_tegra's 1 GiB RAM block to L2/L3 page granularity). An MMU arc, not a driver arc.
+// Either fix is a SEPARATE arc outside this file; NET-4m's job is to name which, not to weaken the
+// (already-correct) per-pop invalidate or the OWN-last re-arm.
+//
 // ## Write discipline
 //
 // The driver, being a driver, DOES the fabric writes NET-3 refused: it enables the device's
@@ -228,6 +253,13 @@ mod metal {
     /// NET-4l: bound on the knob-gated per-real-RX full-ring dumps (so a wrong fix still names the
     /// state machine on the first handful of pops without flooding a whole DHCP window).
     const NET4L_AFTERRX_MAX: u64 = 6;
+    /// NET-4m: bound on the knob-gated per-pop speculation-fenced buffer-DRAM probe (the discriminator
+    /// that names, on the first handful of pops, whether the zero payload is a cache/speculation artifact
+    /// or a writes-to-nowhere inbound-DMA reachability gap). Same six-pop reach as the NET-4l dumps.
+    const NET4M_PROBE_N: u64 = 6;
+    /// NET-4m: leading buffer bytes the probe dumps per pop (two Ethernet MACs' worth — enough to read
+    /// dst/src and tell a real L2 header from an all-zero fill without flooding the window).
+    const NET4M_PROBE_BYTES: usize = 16;
 
     // ── NET-4d: RX-window frame classification (the DHCP no-lease RX-side proof) ──
     // Bounds the per-frame serial noise: a full L2/L3/L4 line for the first NET4D_FULL_LINES popped
@@ -1106,11 +1138,15 @@ mod metal {
             unsafe {
                 core::ptr::copy_nonoverlapping(buf, out.as_mut_ptr(), len);
             }
-            // NET-4f: one-shot witness on the first popped frame — names the coherency strategy now on
+            // NET-4f: one-shot WITNESS on the first popped frame — names the coherency strategy now on
             // the live RX path (invalidate-before-read, superseding NET-4e's ordering-only barrier).
+            // CAUTION (NET-4m): only this serial PRINT is one-shot (`rx_count == 0`). The invalidate it
+            // narrates (`cache::invalidate_range(buf, len)` above) is UNCONDITIONAL — it runs on EVERY
+            // pop. Do not read "first RX pop" as "the invalidate fires once": that misreading of this
+            // line is what NET-4m had to refute (boot-15 kept the zeros WITH the per-pop invalidate live).
             if self.rx_count == 0 {
                 serial_println!(
-                    "{}   [net4f] first RX pop len={} — non-coherent DMA: dc ivac invalidate-before-read (+ dsb ld) between OWN-check and buffer copy ::",
+                    "{}   [net4f] first RX pop len={} — non-coherent DMA: dc ivac invalidate-before-read (+ dsb ld) between OWN-check and buffer copy (PER-POP; this print is the one-shot, not the invalidate) ::",
                     P4, len
                 );
             }
@@ -1118,6 +1154,46 @@ mod metal {
             // NET-4d: classify this frame (bounded, read-only) while the DHCP discover window is live.
             // Borrows `out` (not `self`), so the &mut self counter updates do not alias.
             self.net4d_classify(&out[..len]);
+            // NET-4m: the DECISIVE per-pop discriminator (knob-gated, read-only). The zeros survived
+            // NET-4l's correct OWN-last re-arm AND the per-pop `dc ivac` above (the copy at line ~1107
+            // is ALREADY a post-invalidate DRAM read), so "more invalidate" is a no-op — the open
+            // question is WHERE the zero comes from. This probe re-reads the SAME buffer with an
+            // independent, speculation-FENCED invalidate (`dc ivac` + `dsb sy` + `isb`, so no line
+            // speculatively re-fetched between the invalidate and this read can shadow DRAM), then dumps
+            // the leading bytes. It splits the two remaining root causes on the next metal boot:
+            //   * bytes NON-ZERO  ⇒ the buffer DRAM holds the NIC's payload and the copy's zero was a
+            //     cache/speculation artifact ⇒ the "do it right" fix is a NON-CACHEABLE DMA arena (needs
+            //     a Normal-NC MAIR slot + splitting mmu_tegra's 1 GiB RAM block to L2/L3 — an MMU arc,
+            //     OUTSIDE this driver-invalidate lane).
+            //   * bytes ZERO with a real descriptor len ⇒ the NIC's payload write never landed in the
+            //     CPU-visible buffer DRAM ⇒ a WRITES-TO-NOWHERE inbound-DMA reachability gap (SMMU /
+            //     inbound iATU / ORIN-DMA-WINDOW), BELOW the driver's lane.
+            // The descriptor `addr` is already proven correct by NET-4g (all-MATCH), so those are the
+            // only two branches. Bounded to NET4M_PROBE_N pops; gated behind the NET-4 ring knob.
+            if option_env!("UNAOS_NET4_RINGDUMP").is_some() && self.rx_count <= NET4M_PROBE_N {
+                let n = len.min(NET4M_PROBE_BYTES);
+                cache::invalidate_range(buf as usize, n);
+                unsafe { core::arch::asm!("isb", options(nostack, preserves_flags)) };
+                let mut b = [0u8; NET4M_PROBE_BYTES];
+                let mut nonzero = false;
+                for (i, slot) in b.iter_mut().enumerate().take(n) {
+                    let v = unsafe { read_volatile(buf.add(i)) };
+                    *slot = v;
+                    nonzero |= v != 0;
+                }
+                serial_println!(
+                    "{}   [net4m] rx[{}] slot={} len={} post-ivac(fenced) buf[0..{}]={:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x} nonzero={} — {} ::",
+                    P4, self.rx_count - 1, self.rx_cur, len, n,
+                    b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+                    b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
+                    nonzero,
+                    if nonzero {
+                        "DRAM holds NIC payload -> copy's zero was cache/speculation (non-cacheable-arena, MMU arc)"
+                    } else {
+                        "DRAM ZERO w/ real desc len -> writes-to-nowhere (inbound SMMU/iATU, below driver)"
+                    }
+                );
+            }
             // NET-4f: before re-arming, invalidate the whole buffer — the copy above pulled the frame
             // into the D-cache (now clean lines); dropping them means the NIC's NEXT DMA write is never
             // shadowed by a resident line, and nothing can be written back over it. (DMA_FROM_DEVICE

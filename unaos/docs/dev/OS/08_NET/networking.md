@@ -841,6 +841,53 @@ lands in are published OWN-last. If a lease still does not follow, the `UNAOS_NE
 snapshots name the exact post-re-arm descriptor state (which slots the NIC re-owned, which carry a real
 length, any `addr` divergence). Metal-only: none of this path compiles or runs under QEMU (no Tegra234 RC).
 
+## NET-4m — the zeros survive the OWN-last re-arm; the per-pop invalidate is already live, so the cause is below the driver
+
+R23s1 boot-15 ran the NET-4l OWN-last re-arm and **the rx[2..] all-zero payloads persisted** (rx[1]
+the real OFFER; rx[2] a real 346-byte descriptor length with a zero payload; rx[3..8] lengths varying
+346/346/64/64 read fresh; the re-armed descriptors all `[MATCH]`). The natural next suspect was "the
+`dc ivac` invalidate-before-read fires only on the first pop."
+
+**That suspect is false — verified in the source.** `rx_frame_raw`'s
+`cache::invalidate_range(buf, len)` is **unconditional**: it runs on *every* pop, between the OWN-clear
+check and the buffer copy. Only the `[net4f]` *serial witness* is one-shot (`rx_count == 0`) — and that
+one-shot **print** ("first RX pop …") is exactly what read as "the invalidate is first-pop-only." The
+copy that feeds the NET-4d classifier is therefore **already a post-invalidate DRAM read**, so the zeros
+NET-4d reports are what the buffer DRAM holds *after* the invalidate. Extending the invalidate to every
+pop is a no-op — it is already there.
+
+**Two facts move the root cause outside this driver's invalidate lane.** (1) NET-4g proves the
+descriptor `addr` is **all-MATCH** — the NIC has the buffer addresses the driver programmed, so this is
+not descriptor corruption. (2) The descriptor **ring** is observed *coherently* (real per-slot lengths,
+OWN-clear seen, frames pop) while the **buffers** read zero — an **asymmetry a pure cache-coherency
+defect cannot produce**, since ring and buffers share one cacheable identity-mapped heap and one DMA
+master (a cache bug would zero the ring too). So the residual zero is one of:
+
+  * **writes-to-nowhere** — the NIC's payload DMA never lands in the CPU-visible buffer DRAM: an
+    **inbound-DMA reachability** gap (SMMU / inbound iATU / ORIN-DMA-WINDOW), *below* the driver's lane;
+  * **cache/speculation** (less likely, given the asymmetry) — the buffer DRAM holds the payload but the
+    cacheable read shadows it: curable only by a **non-cacheable DMA arena** (a Normal-NC MAIR slot +
+    splitting `mmu_tegra`'s 1 GiB RAM block to L2/L3 page granularity — an **MMU arc**, not a driver arc).
+
+Either fix is a **separate arc in a file this brief does not name**; NET-4m's job is to name *which*,
+not to weaken the (already-correct) per-pop invalidate or the OWN-last re-arm.
+
+**Instrumentation (`UNAOS_NET4_RINGDUMP`, read-only, default-quiet).** A decisive per-pop discriminator,
+`[net4m]`, re-reads the same buffer with an **independent, speculation-fenced** invalidate
+(`dc ivac` + `dsb sy` + `isb`) and dumps `buf[0..16]` for the first `NET4M_PROBE_N` pops with a
+`nonzero=` flag. It splits the two branches on the next metal boot:
+
+  * `nonzero=true`  → *DRAM holds the NIC payload; the copy's zero was a cache/speculation artifact* →
+    the non-cacheable-arena (MMU) arc.
+  * `nonzero=false` (with a real descriptor len) → *writes-to-nowhere* → the inbound SMMU/iATU arc.
+
+**Expected boot-16 lines (`UNAOS_NET4_RINGDUMP` armed).** For each of the first few real pops:
+`:: PCIE4:   [net4m] rx[<i>] slot=<s> len=<L> post-ivac(fenced) buf[0..16]=<hex> nonzero=<bool> — <verdict> ::`.
+The `[net4m] rx[1]` (the OFFER) line is expected `nonzero=true`; the discriminator is the `rx[2..]`
+lines — their `nonzero` flag names whether the next arc is the inbound-reachability audit or the
+non-cacheable arena. A lease is **not** promised this boot: NET-4m localizes the defect; the fix lands in
+the arc it names. Metal-only (no Tegra234 RC under QEMU).
+
 ## The road from here
 
 | Arc | Content |
