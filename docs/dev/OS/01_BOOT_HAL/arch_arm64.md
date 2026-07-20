@@ -6058,12 +6058,78 @@ byte-identical to baseline).
 ```
 plus, iff the store faulted, one `:: SERROR-DRAIN: consumed N latent async abort(s) … [v3d: M3 clear-job kick window] … ::`. The class label + `VIO_ADDR`/drain trio route the next arc: Class A → CLE kick/ring shape; Class-B MMU-FAULT → the store address vs the arena map; Class-B RAN-NO-FAULT → the `build_rcl` packet encoding.
 
+### PI-V3D-6 — the real render control list (the placeholder `build_rcl` convicted at boot-P2)
+
+**The boot-P2 verdict (2026-07-20, LC-metal R23s1).** PI-V3D-5's discriminator returned **CLASS-B
+RAN-NO-FAULT**: `CT1CS pre=0 kicked=0 done=0 CT0CS=0 CT1CA=0 (BA=…, EA=BA+0x1a)`, `MMU_CTL=0x00090801`
+with every fault bit `0`. The CLE consumed the `0x1a`-byte list to completion with no MMU fault, but
+the store never targeted the buffer. PI-V3D-4's MMU constants are exonerated (audited + metal-clean);
+the admitted-placeholder `build_rcl` was the convicted culprit.
+
+**What the placeholder got wrong, at the packet level.** It wrote a stream of bare opcode *bytes* with
+**no field bit-packing at all**, plus several wrong opcodes and a structurally impossible render:
+- **No field packing.** Each packet was `w.u8(opcode)` followed by a couple of raw `u16`/`u32`s. V3D
+  packets pack named fields at specific bit offsets after the opcode byte; a bare stream sets none of
+  them (sub-ids, BPP, format, stride, buffer-select all read as 0/garbage).
+- **Wrong opcodes.** `114` was used for "clear colors" — `114` is *Blend Enables*; the clear color is
+  sub-id 3 of `TILE_RENDERING_MODE_CFG` (`121`). `125` was used for "end-of-tile marker" — `125` is
+  *Tile Coordinates Implicit*; the real End-of-Tile Marker is `27`.
+- **Malformed STORE.** `STORE_TILE_BUFFER_GENERAL` (`29`, correct opcode) had the target address at
+  the wrong byte offset (the address field is a full 32-bit slot at packet byte 9, XML `start=64`) and
+  none of the Output-Image-Format / Memory-Format / stride / Buffer-to-Store fields — so even had a
+  tile been rendered, the store had no valid destination format.
+- **No supertile execution.** There was no `MULTICORE_RENDERING_SUPERTILE_CFG` and, fatally, no
+  `SUPERTILE_COORDINATES` — nothing ever triggered a tile to render/store. The `0x1a` bytes ran to
+  the `Halt` and wrote nowhere: exactly CLASS-B RAN-NO-FAULT.
+
+**The fix — a correct V3D 4.2 two-level render list.** `build_rcl` now emits the real render-only
+clear+store as Mesa builds it (`v3dX(emit_rcl)` + `emit_render_layer` +
+`v3d_rcl_emit_generic_per_tile_list`), for a single 64×64 tile = single supertile, no binned geometry:
+- **Main list** (`OFF_RCL`, what CT1 executes): `TILE_RENDERING_MODE_CFG` **Common** (64×64, 1 RT,
+  32-bit BPP) → **Clear Colors Part1** (RT0 low-32 = `0x00A68CFF`) → **Color** (RT0 32-bit BPP,
+  internal type `8` = rgba8 unorm, clamp none) → **ZS Clear Values** (ends config) →
+  `TILE_LIST_INITIAL_BLOCK_SIZE` → `MULTICORE_RENDERING_TILE_LIST_SET_BASE` →
+  `MULTICORE_RENDERING_SUPERTILE_CFG` (1×1) → the initial tile-buffer clear (the GFXH-1742 double
+  dummy-store + `CLEAR_TILE_BUFFERS`) → `FLUSH_VCD_CACHE` → `START_ADDRESS_OF_GENERIC_TILE_LIST`
+  (pointing at the sub-list) → `SUPERTILE_COORDINATES(0,0)` → `END_OF_RENDERING` (Halt).
+- **Generic per-tile sub-list** (`OFF_SUBLIST`, branched to per supertile): `TILE_COORDINATES_IMPLICIT`
+  → `END_OF_LOADS` → `PRIM_LIST_FORMAT` (triangles) → `SET_INSTANCEID(0)` → **`STORE_TILE_BUFFER_GENERAL`
+  (RT0 → target, raster, rgba8, 256-byte stride, address at byte 9)** → `CLEAR_TILE_BUFFERS` →
+  `END_OF_TILE_MARKER` → `RETURN_FROM_SUB_LIST`. `BRANCH_TO_IMPLICIT_TILE_LIST` is deliberately omitted
+  (no binned geometry, so the tile-alloc base is never dereferenced).
+
+Every opcode, field bit-offset, size, enum value and packet length is transcribed verbatim from Mesa
+`src/broadcom/cle/v3d_packet_v33.xml` (`gen="3.3" max_ver="42"`); the packing convention (opcode byte
+0, XML `start` bits relative to the bit after the opcode, length = `max(field_end)/8 + 1`) is from
+Mesa `gen_pack_header.py`; the packet ordering is from `src/gallium/drivers/v3d/v3dx_rcl.c`. **Mesa is
+MIT-licensed — verbatim-liftable with attribution** (contrast the Linux-kernel `v3d` GPL-2.0-only
+sources, which remain facts-only; none are used here). The sub-list is `cache::clean_range`d for the
+non-coherent GPU alongside the main list + target.
+
+**CT1CA-reads-0 nuance (carried forward).** boot-P2 showed `CT1CA=0` *after* the malformed run. The
+PI-V3D-5 clue decode treats `CT1CA != BA` as one "ran" witness; if `CT1CA` still latches `0` after this
+*correct* list executes on metal, extend the clue-line decode (CT1CA may latch differently than
+assumed) rather than reading it as job-never-ran — the CLASS label and `SUPERTILE`/store evidence lead.
+
+**Expected boot-P3 lines (metal).** With the block **BLOCK-UP** on silicon: the M3 clue line should now
+report **CLASS-B RAN-NO-FAULT retired** — `CTRUN` latched-then-cleared, no MMU fault — and the verify:
+```
+:: V3D: M3 clear-job PASS (GPU cleared buffer; CPU byte-verified) ::
+```
+i.e. every 32-bit word of the target reads `0x00A68CFF` (the first correct V3D-rendered pixels on the
+Pi), with the panel blit as the visible witness. QEMU `raspi4b` still stops at BLOCK-DOWN (no V3D
+modelled), so this list is correct-by-construction against the cited Mesa sources and refined at the
+attended sitting.
+
 ### References of record
 
 - Register layout: Linux `drivers/gpu/drm/v3d/v3d_regs.h` (hub + core + MMU offsets, field bits).
 - V3D MMU: Linux `drivers/gpu/drm/v3d/v3d_mmu.c` (flat page table, PTE bits, flush sequence).
 - Render-control-list packets: Mesa `src/broadcom/cle/v3d_packet_v33.xml` (4.2 encodings — the
-  VC4-era packet numbers/sizes do **not** transfer).
+  VC4-era packet numbers/sizes do **not** transfer) + `gen_pack_header.py` (the opcode-byte / bit-offset
+  packing convention). **MIT — liftable with attribution** (PI-V3D-6).
+- Render-control-list ordering: Mesa `src/gallium/drivers/v3d/v3dx_rcl.c` (`v3dX(emit_rcl)`,
+  `emit_render_layer`, `v3d_rcl_emit_generic_per_tile_list`) — the packet sequence PI-V3D-6 follows.
 - Structure reference: librerpi/lk-overlay `v3d.c`.
 - PM / ASB power sequence (PI-V3D-3): Linux `drivers/soc/bcm/bcm2835-power.c` (`bcm2835_asb_power_on`,
   `bcm2835_asb_control`; `PM_GRAFX`/`PM_V3DRSTN`/`PM_PASSWORD`, `ASB_V3D_{S,M}_CTRL`/`ASB_REQ_STOP`/

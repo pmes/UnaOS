@@ -214,7 +214,15 @@ const TARGET_BYTES: usize = TARGET_W * TARGET_H * TARGET_BPP;
 
 // Arena layout (byte offsets into the arena; all 4 KiB-aligned starts):
 const OFF_TARGET: usize = 0; // [0, 16 KiB)  the clear target the GPU stores into
-const OFF_RCL: usize = 0x8000; // [32 KiB, …) the render control list
+const OFF_RCL: usize = 0x8000; // [32 KiB, …) the main render control list (CT1 [BA,EA))
+// PI-V3D-6: the render is a two-level control list, exactly as Mesa's v3dX(emit_rcl) builds it. The
+// main list (OFF_RCL) is what CT1 executes; it branches into a *generic per-tile list* (OFF_SUBLIST)
+// once per supertile via START_ADDRESS_OF_GENERIC_TILE_LIST + SUPERTILE_COORDINATES, and that sub-list
+// carries the actual tile-buffer STORE. The tile-allocation scratch (OFF_TILEALLOC) is the base a
+// binner would fill; our clear-only render never emits BRANCH_TO_IMPLICIT_TILE_LIST, so it is never
+// dereferenced — present only because MULTICORE_RENDERING_TILE_LIST_SET_BASE requires an address.
+const OFF_SUBLIST: usize = 0x9000; // generic per-tile list (branched to per supertile)
+const OFF_TILEALLOC: usize = 0xA000; // tile-alloc base (inert: no binned geometry)
 
 /// Entry point: bring the V3D up far enough to clear a buffer and verify it. Called once on the BSP,
 /// single-threaded, after `emmc2::probe` (the mailbox is free by then). `fb` is the panel
@@ -550,17 +558,22 @@ fn program_mmu() -> bool {
 /// it into the target buffer, kick CT1, poll to completion with a finite backstop, then have the CPU
 /// byte-verify the target. On success, blit the target into the panel framebuffer (metal witness).
 ///
-/// The RCL packet stream is the render-only shape (no binner, no shaders) per Mesa v3d_packet_v33.xml
-/// 4.2 encodings — see `build_rcl`. ATTENDED-METAL-UNVERIFIED: QEMU never runs this.
+/// The RCL is a two-level render-only list (main + generic per-tile sub-list, no binner/shaders) per
+/// Mesa v3d_packet_v33.xml 4.2 encodings + v3dx_rcl.c ordering — see `build_rcl`.
+/// ATTENDED-METAL-UNVERIFIED: QEMU never runs this.
 fn clear_job(fb: Option<FbTarget>) -> bool {
     // Pre-seed the target with a sentinel DIFFERENT from the clear colour, so a passing verify proves
     // the GPU actually wrote (not a lucky pre-existing pattern).
     fill_target(0xDEAD_BEEF);
 
-    let rcl_len = build_rcl();
-    // Publish the target (sentinel) + RCL to RAM for the non-coherent GPU.
+    let (rcl_len, sublist_len) = build_rcl();
+    // Publish the target (sentinel) + BOTH control lists to RAM for the non-coherent GPU. The main
+    // list is what CT1 fetches; the generic per-tile sub-list is branched to per supertile, so it must
+    // be published too (PI-V3D-6: the store lives in the sub-list — an unpublished sub-list is exactly
+    // the "CLE ran, store landed nowhere" class-B failure this arc fixes).
     cache::clean_range(arena_phys() + OFF_TARGET, TARGET_BYTES);
     cache::clean_range(arena_phys() + OFF_RCL, rcl_len);
+    cache::clean_range(arena_phys() + OFF_SUBLIST, sublist_len);
 
     // Kick CT1 (render queue): begin address .. end address. Both are arena-internal identity iovas,
     // bounds-checked here — the memory-safety guarantee for what the CLE fetches.
@@ -643,54 +656,267 @@ fn clear_job(fb: Option<FbTarget>) -> bool {
     ok
 }
 
-/// Build the render control list into the arena at OFF_RCL. Returns its length in bytes.
+// ─── V3D 4.2 (BCM2711) control-list packet encodings ──────────────────────────────────────────────
+// PI-V3D-6: the placeholder that boot-P2 convicted (CLASS-B RAN-NO-FAULT) wrote a 0x1a-byte stream of
+// bare opcode bytes with NO field packing, several WRONG opcodes (114 for "clear colors" — actually
+// Blend Enables; 125 for "end-of-tile" — actually Tile Coordinates Implicit), a STORE with the target
+// address at the wrong byte offset and no format/stride/buffer fields, and — fatally — NO
+// SUPERTILE_COORDINATES, so nothing ever triggered a tile store. The CLE happily ran the malformed
+// bytes to completion (no MMU fault) and wrote nowhere. This is the correct encoding.
+//
+// All opcodes, field bit-positions, sizes, enum values and packet lengths below are transcribed
+// verbatim from Mesa `src/broadcom/cle/v3d_packet_v33.xml` (`gen="3.3" max_ver="42"`, the V3D 4.2
+// variants) and the emission ORDER follows Mesa `src/gallium/drivers/v3d/v3dx_rcl.c`
+// (`v3dX(emit_rcl)` + `emit_render_layer` + `v3d_rcl_emit_generic_per_tile_list`). Mesa is
+// MIT-licensed — verbatim-liftable WITH attribution (memory: unaos-license-gplv3). No Linux-kernel
+// (GPL-2.0-only) v3d source is used here.
+//
+// Packing convention (Mesa `gen_pack_header.py`): byte 0 is the opcode; every XML `start` bit is
+// relative to the bit AFTER the opcode, i.e. absolute packet bit = XML start + 8. Packet length =
+// max(field end bit)/8 + 1 bytes. `set_bits` writes a field LSB-first at its absolute bit.
+
+// Packet opcodes (v3d_packet_v33.xml `code=`).
+const P_TRMC: u8 = 121; // Tile Rendering Mode Cfg (sub-id field selects Common/Color/Clear/ZS variant)
+const P_TILE_COORDINATES: u8 = 124;
+const P_TILE_COORDINATES_IMPLICIT: u8 = 125;
+const P_STORE_TILE_BUFFER_GENERAL: u8 = 29;
+const P_CLEAR_TILE_BUFFERS: u8 = 25;
+const P_END_OF_LOADS: u8 = 26;
+const P_END_OF_TILE_MARKER: u8 = 27;
+const P_FLUSH_VCD_CACHE: u8 = 19;
+const P_GENERIC_TILE_LIST: u8 = 20; // Start Address of Generic Tile List
+const P_RETURN_FROM_SUB_LIST: u8 = 18;
+const P_PRIM_LIST_FORMAT: u8 = 56;
+const P_SET_INSTANCEID: u8 = 54;
+const P_TILE_LIST_INITIAL_BLOCK_SIZE: u8 = 126;
+const P_MULTICORE_TILE_LIST_BASE: u8 = 123; // Multicore Rendering Tile List Set Base
+const P_MULTICORE_SUPERTILE_CFG: u8 = 122;
+const P_SUPERTILE_COORDINATES: u8 = 23;
+const P_END_OF_RENDERING: u8 = 0; // Halt (Mesa END_OF_RENDERING)
+
+// TILE_RENDERING_MODE_CFG sub-ids (v42 `sub-id` field defaults).
+const TRMC_SUBID_COMMON: u64 = 0;
+const TRMC_SUBID_COLOR: u64 = 1;
+const TRMC_SUBID_ZS_CLEAR_VALUES: u64 = 2;
+const TRMC_SUBID_CLEAR_COLORS_PART1: u64 = 3;
+
+// Internal-format enum values (v3d_packet_v33.xml enums). rgba8 unorm render target: 32-bit internal
+// BPP (Internal BPP "32" = 0), internal type "8" = 2; stored Output Image Format rgba8 = 27.
+const INTERNAL_BPP_32: u64 = 0;
+const INTERNAL_TYPE_8: u64 = 2;
+const OUTPUT_IMAGE_FORMAT_RGBA8: u64 = 27;
+const MEMORY_FORMAT_RASTER: u64 = 0;
+const PRIM_TYPE_LIST_TRIANGLES: u64 = 2;
+const TILE_ALLOC_BLOCK_SIZE_64B: u64 = 0;
+
+/// Build BOTH control lists (main at OFF_RCL, generic per-tile sub-list at OFF_SUBLIST) and publish the
+/// sub-list to RAM for the non-coherent GPU. Returns `(main_len, sublist_len)` in bytes; the caller
+/// kicks CT1 over `[OFF_RCL, OFF_RCL+main_len)` and has already published the main list + target.
 ///
-/// Packet shape (render-only, no binner/shaders), 4.2 encodings per Mesa v3d_packet_v33.xml:
-///   TILE_RENDERING_MODE_CFG_COMMON + _COLOR + CLEAR_COLORS  (frame setup + clear value)
-///   per-tile: TILE_COORDINATES + STORE_TILE_BUFFER_GENERAL + END_OF_TILE_MARKER
-///   END_OF_RENDERING
-/// The exact opcodes/field packing are the attended-metal work item; here the builder writes a
-/// well-formed, bounds-checked byte stream into the arena and records its span. Kept small so the
-/// whole list fits one arena page.
-fn build_rcl() -> usize {
-    // A conservative fixed capacity; asserted to fit the arena region below OFF_RCL's page.
+/// Shape (single 64×64 tile = single supertile, no binned geometry — a pure clear+store), per Mesa
+/// `v3dX(emit_rcl)`. ATTENDED-METAL-UNVERIFIED: QEMU raspi4b models no V3D, so this is
+/// correct-by-construction against the cited Mesa sources, refined at the attended sitting.
+fn build_rcl() -> (usize, usize) {
+    let target = (arena_phys() + OFF_TARGET) as u32;
+    let sublist_start = (arena_phys() + OFF_SUBLIST) as u32;
+    let tile_alloc = (arena_phys() + OFF_TILEALLOC) as u32;
+    let stride = (TARGET_W * TARGET_BPP) as u64; // raster row stride in bytes (64 px × 4 B = 256)
+
+    // ── Generic per-tile sub-list (OFF_SUBLIST) — executed once per SUPERTILE_COORDINATES. Carries the
+    // real tile-buffer STORE. Order per v3d_rcl_emit_generic_per_tile_list (V3D >= 41 path). We omit
+    // BRANCH_TO_IMPLICIT_TILE_LIST: there is no binned geometry, so no implicit tile list to run. ──
+    let mut s = RclWriter::new(OFF_SUBLIST);
+    s.pkt(Pkt::new(P_TILE_COORDINATES_IMPLICIT, 1).done()); // single coords; END_OF_LOADS flips load→render
+    s.pkt(Pkt::new(P_END_OF_LOADS, 1).done());
+    // PTB assumes triangles as the initial primitive mode; SET_INSTANCEID(0) — hw does not default it.
+    s.pkt(Pkt::new(P_PRIM_LIST_FORMAT, 2).f(0, 6, PRIM_TYPE_LIST_TRIANGLES).done());
+    s.pkt(Pkt::new(P_SET_INSTANCEID, 5).f(0, 32, 0).done());
+    // STORE_TILE_BUFFER_GENERAL: RT0 → target, raster, rgba8, row stride. Address is a full 32-bit
+    // field at XML start 64 (packet byte 9) — the exact slot the placeholder missed. This is the write
+    // the CPU verifies.
+    s.pkt(
+        Pkt::new(P_STORE_TILE_BUFFER_GENERAL, 13)
+            .f(0, 4, 0) // Buffer to Store = Render target 0
+            .f(4, 3, MEMORY_FORMAT_RASTER)
+            .f(12, 6, OUTPUT_IMAGE_FORMAT_RGBA8)
+            .f(28, 20, stride) // Height in UB or Stride (raster → byte stride)
+            .f(64, 32, target as u64) // Address
+            .done(),
+    );
+    // GFXH-1461/1689: after the per-buffer store, clear the tile buffers (job->clear set).
+    s.pkt(
+        Pkt::new(P_CLEAR_TILE_BUFFERS, 2)
+            .f(0, 1, 1) // Clear all Render Targets
+            .f(1, 1, 1) // Clear Z/Stencil Buffer
+            .done(),
+    );
+    s.pkt(Pkt::new(P_END_OF_TILE_MARKER, 1).done());
+    s.pkt(Pkt::new(P_RETURN_FROM_SUB_LIST, 1).done());
+    let sublist_len = s.len();
+    let sublist_end = sublist_start + sublist_len as u32;
+    // Publish the sub-list now (the main list + target are published by the caller).
+    cache::clean_range(arena_phys() + OFF_SUBLIST, sublist_len);
+
+    // ── Main render control list (OFF_RCL) — what CT1 executes. Frame config first (COMMON must be the
+    // first TILE_RENDERING_MODE_CFG, ZS_CLEAR_VALUES last), then the per-layer render. ──
     let mut w = RclWriter::new(OFF_RCL);
 
-    // NOTE: opcode constants below are the 4.2 packet ids from v3d_packet_v33.xml. Encoding the full
-    // field layout of each packet is the attended-metal refinement; the byte-stream framing, target
-    // pointer, clear value, and tile loop bounds are all present and arena-confined.
-    const PKT_TILE_RENDERING_MODE_CFG: u8 = 121;
-    const PKT_TILE_COORDINATES: u8 = 124;
-    const PKT_STORE_TILE_BUFFER_GENERAL: u8 = 29;
-    const PKT_CLEAR_COLORS: u8 = 114;
-    const PKT_END_OF_TILE_MARKER: u8 = 125;
-    const PKT_END_OF_RENDERING: u8 = 0;
+    // TILE_RENDERING_MODE_CFG (Common): 64×64 frame, 1 render target (minus_one → 0), 32-bit max BPP,
+    // no MSAA, no double-buffer, Early-Z LT/LE, depth type 0.
+    w.pkt(
+        Pkt::new(P_TRMC, 9)
+            .f(0, 4, TRMC_SUBID_COMMON)
+            .f(4, 4, 0) // Number of Render Targets (minus_one: 1 RT → 0)
+            .f(8, 16, TARGET_W as u64) // Image Width (pixels)
+            .f(24, 16, TARGET_H as u64) // Image Height (pixels)
+            .f(40, 2, INTERNAL_BPP_32) // Maximum BPP of all render targets
+            .done(),
+    );
+    // TILE_RENDERING_MODE_CFG (Clear Colors Part1): RT0 clear value low 32 bits = CLEAR_RGBA. For a
+    // 32-bit-BPP target only Part1 is needed (Mesa emits Part2/Part3 only for >= 64/128-bit BPP).
+    w.pkt(
+        Pkt::new(P_TRMC, 9)
+            .f(0, 4, TRMC_SUBID_CLEAR_COLORS_PART1)
+            .f(4, 4, 0) // Render Target number
+            .f(8, 32, CLEAR_RGBA as u64) // Clear Color low 32 bits
+            .done(),
+    );
+    // TILE_RENDERING_MODE_CFG (Color, v42): RT0 = 32-bit BPP, internal type "8" (rgba8 unorm), no clamp.
+    w.pkt(
+        Pkt::new(P_TRMC, 9)
+            .f(0, 4, TRMC_SUBID_COLOR)
+            .f(4, 2, INTERNAL_BPP_32) // Render Target 0 Internal BPP
+            .f(6, 4, INTERNAL_TYPE_8) // Render Target 0 Internal Type
+            .f(10, 2, 0) // Render Target 0 Clamp = none
+            .done(),
+    );
+    // TILE_RENDERING_MODE_CFG (ZS Clear Values) — ends the rendering-mode config. No Z/S buffer; clear
+    // values are inert but the packet must terminate config.
+    w.pkt(
+        Pkt::new(P_TRMC, 9)
+            .f(0, 4, TRMC_SUBID_ZS_CLEAR_VALUES)
+            .f(8, 8, 0) // Stencil Clear Value
+            .f(16, 32, 0) // Z Clear Value
+            .done(),
+    );
+    // TILE_LIST_INITIAL_BLOCK_SIZE — must precede the first branch; auto-chained, 64-byte first block.
+    w.pkt(
+        Pkt::new(P_TILE_LIST_INITIAL_BLOCK_SIZE, 2)
+            .f(0, 2, TILE_ALLOC_BLOCK_SIZE_64B) // Size of first block
+            .f(2, 1, 1) // Use auto-chained tile lists
+            .done(),
+    );
 
-    // Frame config: target dimensions.
-    w.u8(PKT_TILE_RENDERING_MODE_CFG);
-    w.u16(TARGET_W as u16);
-    w.u16(TARGET_H as u16);
+    // Per-layer render (single layer). MULTICORE_RENDERING_TILE_LIST_SET_BASE: the tile-alloc base (64-
+    // byte-aligned). Address field is 26 bits at XML start 6 → the 64-aligned address's bits [6..31].
+    w.pkt(
+        Pkt::new(P_MULTICORE_TILE_LIST_BASE, 5)
+            .f(0, 4, 0) // Tile List Set Number
+            .f(6, 26, (tile_alloc >> 6) as u64) // address (64-byte aligned)
+            .done(),
+    );
+    // MULTICORE_RENDERING_SUPERTILE_CFG: 1×1 tiles, one 1×1 supertile, single core, one bin tile list.
+    w.pkt(
+        Pkt::new(P_MULTICORE_SUPERTILE_CFG, 9)
+            .f(0, 8, 0) // Supertile Width in Tiles (minus_one: 1 → 0)
+            .f(8, 8, 0) // Supertile Height in Tiles (minus_one: 1 → 0)
+            .f(16, 8, 1) // Total Frame Width in Supertiles
+            .f(24, 8, 1) // Total Frame Height in Supertiles
+            .f(32, 12, 1) // Total Frame Width in Tiles
+            .f(44, 12, 1) // Total Frame Height in Tiles
+            .f(61, 3, 0) // Number of Bin Tile Lists (minus_one: 1 → 0)
+            .done(),
+    );
 
-    // Clear colour (the value the tile buffer is cleared to).
-    w.u8(PKT_CLEAR_COLORS);
-    w.u32(CLEAR_RGBA);
+    // Initial tile-buffer clear (also the GFXH-1742 double-dummy-store workaround on V3D 4.x). Clears
+    // the tile buffer to the clear color before the first tile inherits stale contents.
+    w.pkt(
+        Pkt::new(P_TILE_COORDINATES, 4)
+            .f(0, 12, 0) // tile column number
+            .f(12, 12, 0) // tile row number
+            .done(),
+    );
+    for i in 0..2 {
+        if i > 0 {
+            w.pkt(
+                Pkt::new(P_TILE_COORDINATES, 4).f(0, 12, 0).f(12, 12, 0).done(),
+            );
+        }
+        w.pkt(Pkt::new(P_END_OF_LOADS, 1).done());
+        // STORE (Buffer to Store = None = 8) — the dummy store that latches TLB type/size.
+        w.pkt(Pkt::new(P_STORE_TILE_BUFFER_GENERAL, 13).f(0, 4, 8).done());
+        if i == 0 {
+            w.pkt(
+                Pkt::new(P_CLEAR_TILE_BUFFERS, 2)
+                    .f(0, 1, 1) // Clear all Render Targets
+                    .f(1, 1, 1) // Clear Z/Stencil Buffer
+                    .done(),
+            );
+        }
+        w.pkt(Pkt::new(P_END_OF_TILE_MARKER, 1).done());
+    }
+    w.pkt(Pkt::new(P_FLUSH_VCD_CACHE, 1).done());
 
-    // Single supertile covering the whole 64×64 target (one tile for the minimal job).
-    w.u8(PKT_TILE_COORDINATES);
-    w.u16(0);
-    w.u16(0);
+    // Branch target for the generic per-tile list, then execute the single supertile (this runs the
+    // sub-list, which performs the real store), then halt.
+    w.pkt(
+        Pkt::new(P_GENERIC_TILE_LIST, 9)
+            .f(0, 32, sublist_start as u64) // start
+            .f(32, 32, sublist_end as u64) // end
+            .done(),
+    );
+    w.pkt(
+        Pkt::new(P_SUPERTILE_COORDINATES, 3)
+            .f(0, 8, 0) // column number in supertiles
+            .f(8, 8, 0) // row number in supertiles
+            .done(),
+    );
+    w.pkt(Pkt::new(P_END_OF_RENDERING, 1).done());
 
-    // Store the tile buffer to the target — the GPU write the CPU verifies. The store address is the
-    // arena-internal identity iova of the target; bounds-checked before it enters the stream.
-    let tgt = arena_phys() + OFF_TARGET;
-    w.u8(PKT_STORE_TILE_BUFFER_GENERAL);
-    w.u32(tgt as u32);
-    w.u32(TARGET_BYTES as u32);
+    (w.len(), sublist_len)
+}
 
-    w.u8(PKT_END_OF_TILE_MARKER);
-    w.u8(PKT_END_OF_RENDERING);
+/// A fixed-capacity control-list packet: byte 0 is the opcode, the rest is the field payload. Fields
+/// are packed by their v3d_packet_v33.xml bit position via `f` (absolute packet bit = XML start + 8,
+/// per Mesa's opcode-shift convention). `len` is the packet's exact byte length.
+struct Pkt {
+    buf: [u8; 16],
+    len: usize,
+}
+impl Pkt {
+    #[inline]
+    fn new(opcode: u8, len: usize) -> Self {
+        let mut buf = [0u8; 16];
+        buf[0] = opcode;
+        Pkt { buf, len }
+    }
+    /// Pack a field: `xml_start` is the v3d_packet_v33.xml `start` bit; the opcode-shift (+8) is applied
+    /// here so callers can quote XML offsets verbatim.
+    #[inline]
+    fn f(&mut self, xml_start: usize, width: usize, val: u64) -> &mut Self {
+        set_bits(&mut self.buf, xml_start + 8, width, val);
+        self
+    }
+    #[inline]
+    fn done(&self) -> (&[u8], usize) {
+        (&self.buf, self.len)
+    }
+}
 
-    w.len()
+/// Write `width` bits of `val` (LSB-first) into `buf` starting at absolute bit `bit`.
+#[inline]
+fn set_bits(buf: &mut [u8], mut bit: usize, mut width: usize, val: u64) {
+    let mut v = val;
+    while width > 0 {
+        let byte = bit / 8;
+        let off = bit % 8;
+        let take = core::cmp::min(8 - off, width);
+        let mask = ((1u64 << take) - 1) as u8;
+        buf[byte] |= ((v as u8) & mask) << off;
+        v >>= take;
+        bit += take;
+        width -= take;
+    }
 }
 
 /// A bounded writer into the arena. Every append is checked against the arena end; it can only ever
@@ -706,26 +932,18 @@ impl RclWriter {
     #[inline]
     fn put(&mut self, b: u8) {
         if self.off >= ARENA_BYTES {
-            return; // saturating — never writes past the arena; build_rcl's stream is far smaller
+            return; // saturating — never writes past the arena; the control lists are far smaller
         }
         unsafe {
             (*(&raw mut V3D_ARENA)).bytes[self.off] = b;
         }
         self.off += 1;
     }
+    /// Append one encoded packet's exact bytes (`(&buf, len)` from `Pkt::done`).
     #[inline]
-    fn u8(&mut self, v: u8) {
-        self.put(v);
-    }
-    #[inline]
-    fn u16(&mut self, v: u16) {
-        for b in v.to_le_bytes() {
-            self.put(b);
-        }
-    }
-    #[inline]
-    fn u32(&mut self, v: u32) {
-        for b in v.to_le_bytes() {
+    fn pkt(&mut self, packet: (&[u8], usize)) {
+        let (buf, len) = packet;
+        for &b in &buf[..len] {
             self.put(b);
         }
     }
