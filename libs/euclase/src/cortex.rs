@@ -137,6 +137,7 @@ impl<'a> Cortex<'a> {
     ///   (boxed inside its ivars); `define_class!` drops the Rust ivars —
     ///   and with them the `Cortex` and its `Surface` — before the NSView
     ///   superclass `dealloc` releases the layer.
+    #[cfg(target_os = "macos")]
     pub unsafe fn ignite_layer_blocking(
         layer: *mut core::ffi::c_void,
         width: u32,

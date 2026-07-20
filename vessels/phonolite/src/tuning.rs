@@ -14,6 +14,8 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+#![allow(dead_code)]
+
 //! The vessel's musical constants and the level-beat seam.
 //!
 //! Pure logic, no AppKit, no audio thread — everything here is unit-tested
