@@ -52,6 +52,115 @@ static mut L1: PageTable = PageTable([0; 512]);
 /// handler. "No EL0 exists yet" does not matter — the rule is unconditional.
 static mut L1_EL1: PageTable = PageTable([0; 512]);
 
+// ── XCARVE-3: protected-carveout hole exclusion ─────────────────────────────────────────────────────
+//
+// Boot-21 capture proved PA 0x26b900000 is firmware-protected carveout DRAM: the RAS (SNOC, IERR =
+// Carveout Uncorrectable, SERR = Illegal address) fired from a DC CIVAC of that line at *post-mmu*, with
+// none of our own code yet run — there is no software writer, and any cache-line traffic (fill, eviction
+// writeback, speculation) that touches the window is rejected by the fabric. Our `build_l1` maps whole
+// GiB blocks Normal-WB, so the carveout is *cacheable* today. The correctness fix is to remove the window
+// from the cacheable map. We do so by **unmapping** it (not Device): an unmapped VA has no valid
+// translation, so the MMU can never fill, speculate into, or write back that line — the fabric is never
+// touched. (Device would still be non-cacheable and safe, but it leaves a live translation an explicit or
+// stray access could reach; unmapped is strictly safer and nothing legitimate lives in the window — the
+// heap seats below it and the framebuffer carveout above it.)
+//
+// The window is sub-GiB, so we sub-divide the single GiB that contains it into an L2 table of 512 × 2 MiB
+// blocks — every block Normal-WB RAM *except* the block(s) intersecting the hole, which are left invalid.
+// The live EL2 table and its EL1-precise twin each get their own L2 table (same GiB, EL1&0 leaf recipe).
+// This is `tegra`-only; on the `virt` gate there is no hole, no L2 split, and `build_l1` is byte-identical.
+#[cfg(feature = "tegra")]
+static mut L2_HOLE: PageTable = PageTable([0; 512]);
+#[cfg(feature = "tegra")]
+static mut L2_HOLE_EL1: PageTable = PageTable([0; 512]);
+
+// Resolved hole, latched once by `init` so `select_heap_region` (heap/span exclusion) and the VUGRAS
+// localizer (`crate::vugras`) can read the SAME extent the map excluded. `0` size ⇒ no hole.
+#[cfg(feature = "tegra")]
+static HOLE_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "tegra")]
+static HOLE_SIZE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "tegra")]
+static HOLE_SOURCE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// XCARVE-3: the excluded carveout hole `(base, size, source)` (`source`: 0 none, 1 DTB, 2 QUIRK), or
+/// `(0,0,0)` before `init` / when none. Read by `select_heap_region` and the VUGRAS localizer so every
+/// consumer agrees with what the map actually excluded.
+#[cfg(feature = "tegra")]
+pub fn carveout_hole() -> (u64, u64, u8) {
+    use core::sync::atomic::Ordering;
+    (
+        HOLE_BASE.load(Ordering::Relaxed),
+        HOLE_SIZE.load(Ordering::Relaxed),
+        HOLE_SOURCE.load(Ordering::Relaxed),
+    )
+}
+
+/// XCARVE-3: determine the protected-carveout hole's true extent. First mine the DTB
+/// `/reserved-memory` carveouts (the nodes `select_heap_region` already trusts) for one that COVERS the
+/// boot-21 RAS PA (`vugras::XCARVE_TARGET_PA`) — that is the firmware's own declaration, used verbatim
+/// (`source = 1`). If the DTB declares no reservation over the PA, fall back to a conservatively-bounded
+/// QUIRK entry: the 2 MiB block (the L2 granule) containing the PA (`source = 2`). The QUIRK is bounded
+/// to a single aligned 2 MiB block — enough to cover the confirmed line, small enough that it cannot
+/// reach the heap top (~0x26b3ca000, below the block) or the framebuffer (0x279e00000, well above).
+#[cfg(feature = "tegra")]
+fn resolve_carveout_hole(dtb_addr: u64, dtb_size: usize) -> (u64, u64, u8) {
+    let target = crate::vugras::XCARVE_TARGET_PA as u64;
+    let mut carve = [(0u64, 0u64); 48];
+    let n = super::fdt_tegra::reserved_carveouts(dtb_addr, dtb_size, &mut carve);
+    for &(base, size) in carve.iter().take(n) {
+        if size != 0 && target >= base && target < base.wrapping_add(size) {
+            return (base, size, 1); // DTB /reserved-memory declared it
+        }
+    }
+    const BLK2: u64 = 2 * 1024 * 1024;
+    (target & !(BLK2 - 1), BLK2, 2) // conservatively-bounded QUIRK: the containing 2 MiB block
+}
+
+/// XCARVE-3: sub-divide the GiB containing `[hole_base, hole_base+hole_size)` into `l2` (512 × 2 MiB),
+/// mapping every block Normal-WB RAM for `el` EXCEPT the block(s) the hole intersects, which stay invalid
+/// (unmapped). Then repoint that GiB's L1 entry at `l2` as a table descriptor. Only splits a GiB the base
+/// map currently holds as Normal-WB RAM (a Device or invalid GiB has nothing to protect). Operates on the
+/// single GiB that contains `hole_base`; a 2 MiB QUIRK or a typical Tegra `/reserved-memory` carveout does
+/// not straddle a 1 GiB block, so a hole that spilled past this GiB's top would simply be clipped to it
+/// (its remainder is another GiB's concern). The `l2` table is cleaned to PoC by the caller before the
+/// switch.
+#[cfg(feature = "tegra")]
+unsafe fn install_hole_l2(l1: *mut u64, l2: *mut u64, el: u64, hole_base: u64, hole_size: u64) {
+    const BLK2: u64 = 2 * 1024 * 1024;
+    let gib = hole_base >> 30;
+    let gi = gib as usize;
+    if gi >= 512 {
+        return;
+    }
+    let cur = unsafe { l1.add(gi).read_volatile() };
+    if !is_ram_block(cur) {
+        return; // not a Normal-WB RAM GiB — leave the base mapping as-is
+    }
+    let gib_base = gib << 30;
+    let hole_lo = hole_base;
+    let hole_hi = hole_base.wrapping_add(hole_size);
+    for i in 0..512usize {
+        let blk_lo = gib_base + (i as u64) * BLK2;
+        let blk_hi = blk_lo + BLK2;
+        // A 2 MiB block that intersects the hole is left INVALID (unmapped): no valid translation ⇒ the
+        // fabric-protected carveout can never be filled, speculated into, or written back. All other
+        // blocks stay Normal-WB RAM (an L2 block descriptor uses the same leaf recipe as an L1 block).
+        let desc = if blk_lo < hole_hi && hole_lo < blk_hi {
+            0
+        } else {
+            ram_block(blk_lo, el)
+        };
+        unsafe {
+            l2.add(i).write_volatile(desc);
+        }
+    }
+    // Repoint the GiB: L1 now holds a TABLE descriptor (bits[1:0]=0b11) to the L2 table.
+    unsafe {
+        l1.add(gi).write_volatile((l2 as u64) | 0b11);
+    }
+}
+
 // ── Translation attributes (ARM ARM DDI0487). ──────────────────────────────────────────────────────
 // MAIR: AttrIdx 0 = Normal Inner/Outer Write-Back non-transient (0xFF); AttrIdx 1 = **Device-nGnRE**
 // (0x04) — deliberately nGnRE for Tegra (early-write-ack tolerant), NOT the Pi's nGnRnE (0x00). Layout
@@ -158,6 +267,14 @@ pub struct MmuInfo {
     /// doc for why the live EL2 table cannot serve. On the EL1 fallback path (`el == 1`) `L1` itself
     /// was already built with the EL1 recipe, so this aliases `ttbr0`.
     pub ttbr0_el1: u64,
+    /// XCARVE-3: base of the protected-carveout hole excluded (unmapped) from the cacheable map, or
+    /// `0` if none (always `0` on non-tegra). See `resolve_carveout_hole`.
+    pub hole_base: u64,
+    /// XCARVE-3: size in bytes of the excluded carveout hole, or `0` if none.
+    pub hole_size: u64,
+    /// XCARVE-3: source of the hole extent — `0` none/virt, `1` DTB `/reserved-memory` node, `2` a
+    /// conservatively-bounded tegra QUIRK entry (the DTB did not declare a reservation over the PA).
+    pub hole_source: u8,
 }
 
 /// Read `CurrentEL` (bits [3:2]). A pure system-register read — cannot fault, so it is always safe to
@@ -192,9 +309,43 @@ pub fn init(boot_info: &BootInfo) -> MmuInfo {
     // built with the EL1 recipe and doubles as both.
     let ttbr0_el1 = if el == 2 { &raw const L1_EL1 as u64 } else { ttbr0 };
     let ram_gib_mask = unsafe { build_l1(boot_info, el) };
+    // XCARVE-3 (tegra, always-on correctness — NOT knob-gated): punch the protected-carveout hole out of
+    // the cacheable map. Resolve its extent (DTB node covering the boot-21 RAS PA, else a bounded QUIRK),
+    // then sub-divide the containing GiB into an L2 table that leaves the hole UNMAPPED in both the live
+    // EL2 table and the EL1-precise twin. Latch the extent so `select_heap_region` and the VUGRAS
+    // localizer exclude the SAME window. On non-tegra there is no hole and the map is byte-identical.
+    #[cfg(feature = "tegra")]
+    let (hole_base, hole_size, hole_source) = {
+        use core::sync::atomic::Ordering;
+        let (hb, hs, src) = resolve_carveout_hole(boot_info.dtb_addr, boot_info.dtb_size);
+        if hs != 0 {
+            unsafe {
+                install_hole_l2(&raw mut L1 as *mut u64, &raw mut L2_HOLE as *mut u64, el, hb, hs);
+                if el == 2 {
+                    install_hole_l2(&raw mut L1_EL1 as *mut u64, &raw mut L2_HOLE_EL1 as *mut u64, 1, hb, hs);
+                }
+            }
+        }
+        HOLE_BASE.store(hb, Ordering::Relaxed);
+        HOLE_SIZE.store(hs, Ordering::Relaxed);
+        HOLE_SOURCE.store(src, Ordering::Relaxed);
+        (hb, hs, src)
+    };
+    #[cfg(not(feature = "tegra"))]
+    let (hole_base, hole_size, hole_source) = (0u64, 0u64, 0u8);
     unsafe { clean_table_to_poc(ttbr0) };
+    // The L2 hole table(s) are walked by the table descriptor `install_hole_l2` wrote into L1, so they
+    // must reach RAM before the data cache is dropped for the switch — clean them like the L1 tables.
+    #[cfg(feature = "tegra")]
+    if hole_size != 0 {
+        unsafe { clean_table_to_poc(&raw const L2_HOLE as u64) };
+    }
     if el == 2 {
         unsafe { clean_table_to_poc(ttbr0_el1) };
+        #[cfg(feature = "tegra")]
+        if hole_size != 0 {
+            unsafe { clean_table_to_poc(&raw const L2_HOLE_EL1 as u64) };
+        }
     }
     let (sctlr_old, sctlr_new) = unsafe {
         if el == 2 { enable_el2(ttbr0) } else { enable_el1(ttbr0) }
@@ -203,7 +354,19 @@ pub fn init(boot_info: &BootInfo) -> MmuInfo {
     // at our handler (Part C) so a subsequent fault is a recorded syndrome, not R4's dark hang under
     // UEFI's now-possibly-unmapped VBAR.
     unsafe { install_vectors(el) };
-    MmuInfo { el, sctlr_old, sctlr_new, tcr, mair, ttbr0, ram_gib_mask, ttbr0_el1 }
+    MmuInfo {
+        el,
+        sctlr_old,
+        sctlr_new,
+        tcr,
+        mair,
+        ttbr0,
+        ram_gib_mask,
+        ttbr0_el1,
+        hole_base,
+        hole_size,
+        hole_source,
+    }
 }
 
 /// Populate `L1`: `L1[0]` = the low-1-GiB Device window (covers UARTC 0x0C28_0000 and the Tegra234 GIC
@@ -455,6 +618,16 @@ fn is_ram_block(desc: u64) -> bool {
     desc & 0b11 == DESC_BLOCK && desc & (0b111 << 2) == ATTR_NORMAL
 }
 
+/// A TABLE descriptor (bits[1:0]=0b11): points to a next-level table. XCARVE-3 installs one for the GiB
+/// it sub-divides to punch the carveout hole; that table maps every 2 MiB block Normal-WB RAM *except* the
+/// protected window, so `map_fb_region`/`map_mmio_window` must treat such a GiB as already-covering RAM
+/// and NOT overwrite its L1 entry with a 1 GiB block (which would re-map the hole). The framebuffer
+/// carveout shares GiB 9 with the hole on the Orin, so this guard is load-bearing, not defensive.
+#[inline]
+fn is_table_desc(desc: u64) -> bool {
+    desc & 0b11 == 0b11
+}
+
 /// JD1 (video): map the inherited firmware scanout framebuffer's GiB span Normal-WB into BOTH live
 /// translation tables — the running EL2 `L1` and the EL1-precise twin `L1_EL1` — so the CPU can draw
 /// into the firmware's live scanout and the panel keeps working across the JM6 EL2 -> EL1 drop.
@@ -492,6 +665,13 @@ pub fn map_fb_region(pa: u64, size: usize) -> bool {
     for g in g_lo..=g_hi {
         let gi = g as usize;
         let cur = unsafe { l1.add(gi).read_volatile() };
+        // XCARVE-3: a TABLE descriptor is our carveout-hole L2 split — it already maps every 2 MiB block
+        // of the GiB Normal-WB except the protected window (which no framebuffer ever lives in), so leave
+        // it untouched. Overwriting it with a 1 GiB block would re-map the hole. (The Orin's fb shares
+        // GiB 9 with the hole, so this GiB is genuinely reached here.)
+        if is_table_desc(cur) {
+            continue;
+        }
         if !is_ram_block(cur) {
             // Invalid (a Reserved-only GiB the RAM scan skipped): map it Normal-WB in the live table.
             unsafe {
@@ -503,7 +683,7 @@ pub fn map_fb_region(pa: u64, size: usize) -> bool {
         // Keep the EL1 twin in lock-step so the mapping survives the JM6 drop.
         if patch_twin {
             let cur1 = unsafe { l1_el1.add(gi).read_volatile() };
-            if !is_ram_block(cur1) {
+            if !is_ram_block(cur1) && !is_table_desc(cur1) {
                 unsafe {
                     l1_el1.add(gi).write_volatile(ram_block(g << 30, 1));
                     clean_desc(l1_el1.add(gi) as u64);
@@ -511,7 +691,8 @@ pub fn map_fb_region(pa: u64, size: usize) -> bool {
                 changed = true;
             }
         }
-        all_ok &= is_ram_block(unsafe { l1.add(gi).read_volatile() });
+        let after = unsafe { l1.add(gi).read_volatile() };
+        all_ok &= is_ram_block(after) || is_table_desc(after);
     }
     if changed {
         // Publish the new descriptors and drop stale TLB state for the ACTIVE regime so the very
@@ -613,6 +794,12 @@ pub fn map_mmio_window(pa: u64, size: usize) -> MmioMap {
     for g in g_lo..=g_hi {
         let gi = g as usize;
         let cur = unsafe { l1.add(gi).read_volatile() };
+        // XCARVE-3: never overwrite a carveout-hole L2 split (a TABLE descriptor) with a Device block —
+        // that GiB is RAM (minus the protected window). MMIO apertures live at GiB 0/1 or high PA, never
+        // in the RAM-split GiB, so this is a guard against a survey misread, not an expected path.
+        if is_table_desc(cur) {
+            continue;
+        }
         if !is_device_block(cur) {
             unsafe {
                 l1.add(gi).write_volatile(device_block(g << 30, el));
@@ -623,7 +810,7 @@ pub fn map_mmio_window(pa: u64, size: usize) -> MmioMap {
         }
         if patch_twin {
             let cur1 = unsafe { l1_el1.add(gi).read_volatile() };
-            if !is_device_block(cur1) {
+            if !is_device_block(cur1) && !is_table_desc(cur1) {
                 unsafe {
                     l1_el1.add(gi).write_volatile(device_block(g << 30, 1));
                     clean_desc(l1_el1.add(gi) as u64);
@@ -855,6 +1042,16 @@ pub fn select_heap_region(
             carve[nc] = c;
             nc += 1;
         }
+    }
+    // XCARVE-3: add the resolved protected-carveout hole (latched by `init`) to the exclusion set. For a
+    // DTB-source hole this duplicates a range already collected above (harmless — the overlap logic dedups
+    // by effect); for a QUIRK-source hole it is the ONLY place the heap-guard learns of it, so the heap
+    // never seats over it and `VUGRAS_ABOVE_HEAP_TOP` (published below) clips span B BELOW it — the sweep
+    // can never DC-CIVAC the fabric-protected line.
+    let (hb, hs, _) = carveout_hole();
+    if hs != 0 && nc < MAX_CARVE {
+        carve[nc] = (hb, hs);
+        nc += 1;
     }
     let carveouts = &carve[..nc];
 

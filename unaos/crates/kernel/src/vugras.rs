@@ -97,6 +97,22 @@ const TRIPWIRE_HALF: usize = 192;
 static COST_A_DONE: AtomicBool = AtomicBool::new(false);
 static COST_B_DONE: AtomicBool = AtomicBool::new(false);
 
+/// XCARVE-3 excluded-carveout hole `(base, size, source)` from `mmu_tegra`. Guarded on `target_arch`
+/// (the `tegra` feature is also enabled on the x86 syntax-check target, where `arch::aarch64` does not
+/// exist), so off-aarch64 it reports "no hole" and the localizer keeps its pre-XCARVE-3 behavior.
+#[cfg(feature = "tegra")]
+#[inline]
+fn hole_bounds() -> (u64, u64, u8) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        crate::arch::aarch64::mmu_tegra::carveout_hole()
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        (0, 0, 0)
+    }
+}
+
 /// Clean+invalidate `[lo, hi)` to the Point of Coherency (forces any dirty line to RAM *now*). No-op
 /// off aarch64 and for an empty/backwards span.
 #[inline]
@@ -195,23 +211,33 @@ fn bisect(label: &str, lo: usize, hi: usize) {
     }
 }
 
-/// XCARVE-2 single-line tripwire (tegra): `DC CIVAC` exactly the cache line at `XCARVE_TARGET_PA`
-/// (± `TRIPWIRE_HALF` bytes of neighbor lines; `clean_invalidate_range` rounds to line boundaries). This
-/// forces the specific 0x26b900000 line back to RAM *now* — if the unidentified store has dirtied it,
-/// the RAS FillWrite fires *inside* this call, bracketing the store to the code that ran since the
-/// previous tripwire. The target is known carveout-free RAM (5.2 MiB above heap top, below the
-/// framebuffer) and RAM is identity-mapped Normal-WB by `mmu_tegra::init`, so it is always safe to clean
-/// regardless of the span-B publish state. No-op when the knob is off.
+/// XCARVE-2/3 single-line tripwire (tegra). Boot-21 reframed XCARVE: `0x26b900000` is firmware-protected
+/// carveout DRAM with NO software writer — the RAS fired from *this tripwire's own* `DC CIVAC` at
+/// post-mmu, because the fabric rejects ANY cache traffic to the window. XCARVE-3's mapping fix therefore
+/// UNMAPS the window (`mmu_tegra` L2 hole), and a `DC CIVAC` to an unmapped VA would now translation-fault.
+/// So the tripwire no longer touches the target: when the target line falls inside the excluded hole
+/// (always, on a tegra build post-`init`) it witnesses the exclusion and issues NO CMO. It only cleans the
+/// line on the defensive path where no hole was resolved (`hole_size == 0`), preserving the old bracket for
+/// a build where the mapping fix did not seat. No-op when the knob is off.
 #[cfg(feature = "tegra")]
 pub fn tripwire(site: &str) {
     if !ARMED {
+        return;
+    }
+    let (hb, hs, _) = hole_bounds();
+    let excluded = hs != 0 && XCARVE_TARGET_PA as u64 >= hb && (XCARVE_TARGET_PA as u64) < hb + hs;
+    if excluded {
+        serial_println!(
+            ":: VUGRAS: tripwire @ {} — line {:#x} is inside the XCARVE-3 excluded carveout [{:#x},{:#x}); UNMAPPED, NO CMO issued (fabric-protected, no software writer) ::",
+            site, XCARVE_TARGET_PA, hb, hb + hs
+        );
         return;
     }
     let lo = XCARVE_TARGET_PA.saturating_sub(TRIPWIRE_HALF);
     let hi = XCARVE_TARGET_PA + TRIPWIRE_HALF;
     civac(lo, hi);
     serial_println!(
-        ":: VUGRAS: tripwire @ {} — line {:#x} (+/-{} B) swept ::",
+        ":: VUGRAS: tripwire @ {} — line {:#x} (+/-{} B) swept (no hole resolved) ::",
         site, XCARVE_TARGET_PA, TRIPWIRE_HALF
     );
 }
@@ -248,6 +274,31 @@ pub fn pa_identity_witness() {
         t,
         0x8000_0000_0000_0000u64 | t as u64
     );
+    // XCARVE-3 one-shot excluded-window witness: the boot-21 verdict is that the target is fabric-protected
+    // carveout DRAM (no software writer). Report the window the MMU excluded and its source (DTB vs QUIRK).
+    let (hb, hs, src) = hole_bounds();
+    if hs != 0 {
+        let ssrc = match src {
+            1 => "DTB /reserved-memory",
+            2 => "QUIRK (DTB silent)",
+            _ => "unknown",
+        };
+        serial_println!(
+            ":: VUGRAS: XCARVE-3 excluded window — [{:#x},{:#x}) {} KiB UNMAPPED (source: {}) ::",
+            hb,
+            hb + hs,
+            hs / 1024,
+            ssrc
+        );
+        if t as u64 >= hb && (t as u64) < hb + hs {
+            serial_println!(
+                ":: VUGRAS: XCARVE identity — {:#x} IS the XCARVE-3 excluded carveout (unmapped, no cacheable translation) — no software writer; RAS retired by exclusion ::",
+                t
+            );
+            serial_println!(":: VUGRAS: XCARVE RO-map hard tripwire — MOOT (window unmapped by XCARVE-3; no page to protect) ::");
+            return;
+        }
+    }
     let mut hit = false;
     let (hlo, hhi) = crate::allocator::heap_bounds();
     if t >= hlo && t < hhi {
@@ -374,14 +425,14 @@ pub fn boot_witness() {
     serial_println!(":: VUGRAS: boot witness — RAS candidate PA table (bit-63-stripped decode) ::");
     core_witness();
     crate::drivers::xhci::vugras_dump();
-    // XCARVE-2: identify what (if anything) maps the 0x26b900000 target, then bisect span B — the
-    // above-heap span that covers it — so a boot-time capture already brackets the dirty line spatially
-    // before the idle/vug sweeps and the temporal phase brackets narrow it further.
+    // XCARVE-3: report the excluded carveout window (the boot-21 verdict — 0x26b900000 is fabric-protected
+    // DRAM, no software writer), then bisect span B. Span B is now clipped BELOW the excluded hole by
+    // `VUGRAS_ABOVE_HEAP_TOP`, so the bisect provably never DC-CIVACs the protected window.
     #[cfg(feature = "tegra")]
     {
         pa_identity_witness();
         let (_, b) = spans();
-        bisect("span-B (above-heap, covers XCARVE 0x26b900000)", b.0, b.1);
+        bisect("span-B (above-heap, clipped below the XCARVE-3 excluded carveout)", b.0, b.1);
     }
 }
 

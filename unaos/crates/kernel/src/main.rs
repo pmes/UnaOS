@@ -1202,6 +1202,26 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
         mmu.ttbr0,
         mmu.ram_gib_mask,
     );
+    // XCARVE-3 (always-on correctness, one-shot witness): report the protected-carveout hole the MMU
+    // just EXCLUDED (unmapped) from the cacheable map. Boot-21 proved PA 0x26b900000 is firewalled
+    // carveout DRAM with no software writer — any cache traffic touching it raises the SNOC RAS — so the
+    // window is left with no valid translation. Source names whether the DTB declared the reservation
+    // (`DTB`) or we fell back to a bounded quirk (`QUIRK`). `hole_size == 0` ⇒ nothing excluded.
+    if mmu.hole_size != 0 {
+        let src = match mmu.hole_source {
+            1 => "DTB /reserved-memory",
+            2 => "QUIRK (DTB silent)",
+            _ => "unknown",
+        };
+        serial_println!(
+            ":: tegra: XCARVE-3 carveout hole EXCLUDED — [{:#x},{:#x}) {} MiB unmapped from GiB {} (source: {}) — SNOC-firewalled DRAM, boot-21 RAS PA 0x26b900000, no software writer ::",
+            mmu.hole_base,
+            mmu.hole_base + mmu.hole_size,
+            mmu.hole_size >> 20,
+            mmu.hole_base >> 30,
+            src,
+        );
+    }
     // XCARVE-2 temporal bracket (RAS store-site hunt, `UNAOS_VUGRAS=1`): first bracket, right after the
     // MMU identity-maps RAM — the 0x26b900000 line is now cleanable. Heap/span-B are not carved yet, so
     // the span-B bisect witnesses "empty" here; the tripwire still fires. No-op knob-off.

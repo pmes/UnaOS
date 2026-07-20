@@ -833,6 +833,69 @@ memory-bandwidth-bound (measure and witness once per span from the capture).
 4. **Correlate with enumeration:** if the flagged `enumerating_port` (port 7 in boots 13+14) owns a
    context/ring/buffer near `A'`, test the "mid-enumeration reset-settle writeback" correlation.
 
+#### XCARVE-3 — the boot-21 verdict: `0x26b900000` is protected carveout DRAM, not a software store (**code fix, always-on; metal-owed**)
+
+The XCARVE-2 store-site bracketing answered the question it was built to answer — but not the way the
+hunt assumed. **Boot-21 (`UNAOS_VUGRAS=1 UNAOS_TEGRA=1`) fired the RAS from the very first bracket, the
+`post-mmu` tripwire's own `DC CIVAC`, with none of our own code yet run** (no heap, no PCIe/net/xHCI, no
+`vug`):
+
+```
+:: VUGRAS: === phase post-mmu ===
+… SNOC RAS Uncorrectable, Status=0xec00030d,
+   SERR = Illegal address (software fault), IERR = Carveout Uncorrectable Error: 0x3,
+   MISC1=0x9d0842000000000, ADDR=0x800000026b900000
+… EL3 sdei_dispatch_event returned -1 … core powered off
+```
+
+**There is no software writer.** `IERR = Carveout Uncorrectable` + `SERR = Illegal address` from the SNOC
+is the fabric rejecting *any* cache-line traffic to a firmware-protected carveout — the tripwire's clean
+was simply the first cache operation to touch it. Our tegra RAM map covers `0x26b900000` as an ordinary
+Normal-WB **cacheable** 1 GiB block (GiB 9), so a fill, a speculative allocation + later writeback, or a
+`DC` sweep all reach it and all are rejected. This exonerates every earlier lead: the `.bss`/event-ring
+writer theory (`425090fd` is a KEEP, unrelated), the record-format ADDR decode (settled), the NET `0x200`
+class (separate). Every prior `0x26b900000`-family RAS (boots 13/14/15/20) was just *whatever first made
+the cache touch the hole*.
+
+**The fix (always-on correctness, not a diagnostic — runs knob-off):** punch the carveout out of the
+cacheable map.
+
+- **Extent** (`mmu_tegra::resolve_carveout_hole`): mine the DTB `/reserved-memory` carveouts (the set
+  `select_heap_region` already trusts) for one that COVERS the RAS PA — used verbatim, `source = DTB`. If
+  the DTB declares no reservation over the PA, fall back to a **conservatively-bounded QUIRK**: the aligned
+  2 MiB block (the L2 granule) containing the PA, `source = QUIRK`. The block cannot reach the heap top
+  (~`0x26b3ca000`, below it) or the framebuffer carveout (`0x279e00000`, well above). Witnessed
+  DTB-vs-QUIRK: `:: tegra: XCARVE-3 carveout hole EXCLUDED — [lo,hi) N MiB unmapped from GiB 9 (source: …)
+  … ::`.
+- **Exclusion** (`mmu_tegra::install_hole_l2`): the window is sub-GiB, so the containing GiB is
+  sub-divided into an **L2 table (512 × 2 MiB)** — every block Normal-WB RAM **except** the block(s) the
+  hole intersects, left **invalid (unmapped)**. Unmapped, not Device: an unmapped VA has no valid
+  translation, so the MMU can never fill, speculate into, or write back the line — the fabric is never
+  touched (Device is non-cacheable and also safe, but leaves a live translation a stray access could
+  reach; nothing legitimate lives in the window). Applied to BOTH the live EL2 `L1` and the EL1-precise
+  twin `L1_EL1`, cleaned to PoC like the other tables. On the Orin the framebuffer shares GiB 9 with the
+  hole, so `map_fb_region`/`map_mmio_window` now treat a **table descriptor** (`is_table_desc`) as
+  already-covering RAM and never overwrite it with a 1 GiB block (which would re-map the hole).
+- **Heap/span coherence:** the resolved hole is latched (`mmu_tegra::carveout_hole`) and fed into
+  `select_heap_region`'s carveout set, so the heap never seats over it and `VUGRAS_ABOVE_HEAP_TOP` clips
+  span B **below** it — the localizer sweeps can never `DC CIVAC` the protected window.
+- **Diagnostics retargeted (VUGRAS, knob-gated):** the single-line `tripwire` no longer issues a CMO into
+  the target — a `DC CIVAC` to the now-unmapped VA would translation-fault — it witnesses the exclusion
+  instead (`… line 0x26b900000 is inside the XCARVE-3 excluded carveout … UNMAPPED, NO CMO issued …`). The
+  phase brackets + identity witness stay; `pa_identity_witness` reports the target **IS** the excluded
+  carveout (not a wild pointer), and the RO-map hard tripwire is now **MOOT** (no page to protect). The
+  always-on `XCARVE-3 … EXCLUDED` banner line is the correctness witness; the VUGRAS lines remain default-
+  quiet.
+
+**QEMU:** `virt` has no such carveout, so `resolve_carveout_hole` finds no DTB match and the hole logic is
+`tegra`-gated — the map is byte-identical and no `XCARVE-3` line prints (verified: `UNAOS_GICV3=1
+UNAOS_VUGRAS=1 ./arroyo test-arm` shows only the span-A bisect, no tegra lines). **Expected boot-22
+(metal, `UNAOS_TEGRA=1`):** the `mmu regs` banner, then `:: tegra: XCARVE-3 carveout hole EXCLUDED …
+(source: DTB|QUIRK) …`, a **clean `post-mmu` phase (no SNOC RAS)**, and — the boot now surviving past the
+MMU — the NET-4q lease oracle reaching its first real run. Metal-owed: confirm boot-22 clears the RAS and
+records the hole source (DTB vs QUIRK) so a future arc can tighten the QUIRK to the firmware's true extent
+if the DTB stays silent.
+
 ### JX1 result — XUSB first light (⛔ **the block is EL3-fatal to touch post-EBS; BPMP ungate required first**)
 
 The one-boot probe (a guarded read of the xHCI capability block @ `0x0361_0000`, the Linux DT
