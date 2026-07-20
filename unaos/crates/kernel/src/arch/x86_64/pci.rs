@@ -239,6 +239,24 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
         crate::drivers::smc::battery::refresh_if_due();
     }
 
+    #[cfg(all(target_arch = "x86_64", any(feature = "nvidia-kepler", feature = "intel-ivb")))]
+    {
+        let gpus = crate::drivers::gpu::detect::detect_gpus();
+        for gpu in &gpus {
+            match gpu.gpu_type {
+                #[cfg(feature = "nvidia-kepler")]
+                crate::drivers::gpu::detect::GpuType::NvidiaKepler => {
+                    crate::drivers::gpu::kepler::init(gpu);
+                }
+                #[cfg(feature = "intel-ivb")]
+                crate::drivers::gpu::detect::GpuType::IntelIvyBridge => {
+                    // crate::drivers::gpu::ivb::init(gpu); // Deferred
+                }
+                _ => {}
+            }
+        }
+    }
+
     if let Some((xhci_phys_addr, bus, dev, func)) = crate::drivers::pci::PciScanner::scan() {
         serial_println!(":: x86_64 PCI Init: Found xHCI at {:#x} ::", xhci_phys_addr);
 
