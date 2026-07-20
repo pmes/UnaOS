@@ -31,8 +31,12 @@
 //!    (per frame) and the JD2 console-idle pump (periodic, ~250 ms). Cleaning already-clean lines is
 //!    harmless; the point is that a dirty line is written back *now*, so the RAS fires within a frame
 //!    (or a period) of the store instead of much later. The sweep alternates two spans so no single
-//!    invocation is unbounded: **A = [heap_lo, heap_hi)** and **B = [heap_hi, DRAM_top)** (B only on
-//!    tegra builds — on the `virt` QEMU gate B is empty so the sweep never touches unmapped RAM).
+//!    invocation is unbounded: **A = [heap_lo, heap_hi)** and **B = [heap_hi, carveout-clipped top)**
+//!    (B only on tegra builds — on the `virt` QEMU gate B is empty so the sweep never touches unmapped
+//!    RAM). Span B is **carveout-bounded** (VUG-RAS-ANALYZE): it is clipped to the first firewall
+//!    carveout above the heap (`mmu_tegra::VUGRAS_ABOVE_HEAP_TOP`), because DC-cleaning a SNOC-protected
+//!    line is *itself* the FillWrite RAS — an unbounded `[heap_hi, DRAM_top)` sweep would self-inflict
+//!    the very fault the localizer exists to attribute to a real writer.
 //!
 //! 2. **Name the candidates.** A one-shot boot witness (post-heap-init) dumps every PA the fault could
 //!    decode to — heap span, framebuffer/scanout, Screen back buffer, cursor save-under stash, and the
@@ -41,6 +45,8 @@
 //!    `docs/dev/OS/01_BOOT_HAL/arch_arm64.md` §JETSON-RAS.
 
 use core::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "tegra")]
+use core::sync::atomic::AtomicUsize;
 
 /// Armed at build time by the `vugras` cargo feature (`UNAOS_VUGRAS=1` in `arroyo`). Default OFF: every
 /// entry point below early-returns, so an unarmed build is byte-behaviour-identical (default-quiet law).
@@ -48,10 +54,20 @@ use core::sync::atomic::{AtomicBool, Ordering};
 /// build genuinely drops the code, mirroring the `smpprobe` pattern.
 pub const ARMED: bool = cfg!(feature = "vugras");
 
-/// Tegra234/Orin DRAM window top (8 GiB). The above-heap span B extends to here on tegra builds only —
-/// the decoded fault ADDRs sit in [heap_hi, DRAM_top). On non-tegra aarch64 (the `virt` gate) this
-/// window does not exist, so span B is empty there (never `DC CIVAC` an unmapped VA).
-const TEGRA_DRAM_TOP: usize = 0x2_8000_0000;
+/// Tegra234/Orin DRAM window top (8 GiB). The above-heap span B's default cap on tegra — the decoded
+/// fault ADDRs sit in [heap_hi, DRAM_top) — but the span is further clipped BELOW the first firewall
+/// carveout above the heap (see `spans`). On non-tegra aarch64 (the `virt` gate) this window does not
+/// exist, so span B is empty there (never `DC CIVAC` an unmapped VA).
+pub(crate) const TEGRA_DRAM_TOP: usize = 0x2_8000_0000;
+
+/// VUG-RAS-ANALYZE — exclusive top bound for the localizer's **above-heap** sweep (span B), published
+/// once by `mmu_tegra::select_heap_region` from the SAME carveout set that seats the heap. Span B must
+/// never `DC CIVAC` a firewall carveout — cleaning a SNOC-protected line is *itself* the FillWrite RAS
+/// (dirty or not) — so it is clipped to `[heap_hi, first-carveout-above-heap)` (capped at DRAM top).
+/// `0` = unpublished ⇒ the sweep treats span B as empty (fail-safe: never clean unproven RAM). Homed
+/// here (not in `mmu_tegra`) so the arch-neutral sweep reaches it without an arch-glob module path.
+#[cfg(feature = "tegra")]
+pub(crate) static VUGRAS_ABOVE_HEAP_TOP: AtomicUsize = AtomicUsize::new(0);
 
 /// Emit the per-frame / per-tick `swept` witness every this many invocations, so serial isn't flooded.
 const WITNESS_EVERY: u64 = 32;
@@ -74,13 +90,29 @@ fn civac(lo: usize, hi: usize) {
     let _ = (lo, hi);
 }
 
-/// The two sweep spans for this build. A is always the live heap; B is [heap_hi, DRAM_top) on tegra
+/// The two sweep spans for this build. A is always the live heap; B is the above-heap span on tegra
 /// (where the out-of-heap fault ADDRs live) and empty elsewhere.
+///
+/// VUG-RAS-ANALYZE (H2): span B is **carveout-clipped** to `[heap_hi, VUGRAS_ABOVE_HEAP_TOP)`, the
+/// firewall-clean DRAM above the heap that `mmu_tegra` derives from the same carveout set it seats the
+/// heap clear of. A raw `[heap_hi, DRAM_top)` sweep would eventually DC-CIVAC a protected carveout, and
+/// cleaning a SNOC-firewalled line IS the FillWrite RAS (dirty or not) — the localizer would then
+/// self-inflict a fault indistinguishable from a real writer's writeback. Clipping keeps the sweep on
+/// RAM we can legitimately clean; a genuine store into a carveout (the boot-15 `0x26b900000` class) is
+/// still surfaced by the span-A clean's incidental cache churn, now UNAMBIGUOUSLY not the sweep's doing.
+/// Unpublished (`0`) ⇒ empty span B (fail-safe: never clean unproven RAM).
 fn spans() -> ((usize, usize), (usize, usize)) {
     let (lo, hi) = crate::allocator::heap_bounds();
     let a = (lo, hi);
     #[cfg(feature = "tegra")]
-    let b = (hi, TEGRA_DRAM_TOP);
+    let b = {
+        let top = VUGRAS_ABOVE_HEAP_TOP.load(Ordering::Relaxed);
+        if top > hi {
+            (hi, top)
+        } else {
+            (hi, hi)
+        }
+    };
     #[cfg(not(feature = "tegra"))]
     let b = (hi, hi);
     (a, b)
@@ -157,6 +189,19 @@ pub fn core_witness() {
         hi.saturating_sub(lo) / (1024 * 1024),
         TEGRA_DRAM_TOP
     );
+    // VUG-RAS-ANALYZE: name the carveout-clipped above-heap sweep span (span B) so a capture can see it
+    // never reaches a firewall carveout. On virt (no tegra) this compiles out and span B stays empty.
+    #[cfg(feature = "tegra")]
+    {
+        let top = VUGRAS_ABOVE_HEAP_TOP.load(Ordering::Relaxed);
+        let b_hi = if top > hi { top } else { hi };
+        serial_println!(
+            ":: VUGRAS: above-heap sweep span B [{:#x},{:#x}) {} KiB — carveout-clipped (never DC-cleans firewall fabric) ::",
+            hi,
+            b_hi,
+            b_hi.saturating_sub(hi) / 1024
+        );
+    }
     let fb = *crate::video::WRITER.lock();
     if fb.is_ready() {
         serial_println!(

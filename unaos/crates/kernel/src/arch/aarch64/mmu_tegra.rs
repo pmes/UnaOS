@@ -858,6 +858,22 @@ pub fn select_heap_region(
     }
     let carveouts = &carve[..nc];
 
+    // VUG-RAS-ANALYZE: publish the carveout-free top bound for the localizer's above-heap sweep
+    // (span B) from the SAME carveout set that seats the heap. The heap `[s, s+need)` is proven clear
+    // of every range in `carveouts`, so no carveout can straddle `heap_hi`; the LOWEST carveout base
+    // at/above `heap_hi` therefore bounds a provably carveout-free `[heap_hi, top)`. Span B must never
+    // DC-CIVAC a carveout (cleaning a firewalled line IS the RAS), so the localizer clips to this.
+    let publish_above_heap_top = |heap_base: u64| {
+        let heap_hi = heap_base + need;
+        let mut top = crate::vugras::TEGRA_DRAM_TOP as u64;
+        for &(cb, cs) in carveouts {
+            if cs != 0 && cb >= heap_hi && cb < top {
+                top = cb;
+            }
+        }
+        crate::vugras::VUGRAS_ABOVE_HEAP_TOP.store(top as usize, core::sync::atomic::Ordering::Relaxed);
+    };
+
     // The greatest carveout BASE that overlaps [s, s+need), if any — the scan-down loop slides the
     // window strictly below it (`s <= cb - need`). Taking the *max* overlapping base is safe: the
     // re-check after each slide catches any lower carveouts, and each slide strictly decreases `s`
@@ -948,6 +964,7 @@ pub fn select_heap_region(
                 need >> 20,
                 nc
             );
+            publish_above_heap_top(s);
             return Some((s as usize, need as usize));
         }
         serial_println!(
@@ -974,6 +991,7 @@ pub fn select_heap_region(
             need >> 20,
             nc
         );
+        publish_above_heap_top(s);
         return Some((s as usize, need as usize));
     }
 

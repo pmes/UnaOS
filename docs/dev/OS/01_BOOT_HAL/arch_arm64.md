@@ -688,6 +688,9 @@ Two field captures pinned the difficulty:
 - **Boot-13**: fired during a 2nd `vug` run with mouse motion. Fault ADDR `0x80000000be000f80`.
 - **Boot-14** (no localizer aboard): fired **at shell entry** — no `vug` run, no mouse, no simmer.
   Fault ADDR `0x800000027724f340`.
+- **Boot-15** (localizer aboard): fired **immediately after the first idle-path sweep** (`idle tick 0
+  swept`). Fault ADDR `0x800000026b900000` → stripped `0x26b900000` — `0x536000` (5.2 MiB) ABOVE heap
+  top `0x26b3ca000`, below the framebuffer `0x279e00000`. In no dumped candidate span.
 
 Two settled facts frame the diagnostic. First, the **XCARVE erratum** (see §JETSON-XCARVE): Tegra234
 RAS ADDRs are **record-format** — bit-63 is a record bit, not a poisoned-pointer half. Strip it:
@@ -703,9 +706,14 @@ a cache-line **writeback**, so the offending store happened *frames before* the 
    has been seen on — the `vug` frame loop (per frame, `vug.rs`) and the **JD2 console-idle pump**
    (~250 ms cadence, `main.rs` — boot-14's crash path had no `vug` at all). The sweep alternates two
    spans by an invocation counter so no single pass is unbounded: **A = `[heap_lo, heap_hi)`** and
-   **B = `[heap_hi, DRAM_top)`** (B is `tegra`-gated ⇒ empty on the `virt` gate, so the sweep never
-   touches unmapped RAM; the boot-14 fault sits in B, which a heap-only sweep would miss). Cleaning an
-   already-clean line is harmless — the point is a *dirty* line writes back **now**.
+   **B = `[heap_hi, carveout-clipped top)`** (B is `tegra`-gated ⇒ empty on the `virt` gate, so the
+   sweep never touches unmapped RAM). Cleaning an already-clean line is harmless — the point is a
+   *dirty* line writes back **now**. **Span B is carveout-bounded (VUG-RAS-ANALYZE):** it is clipped to
+   the first firewall carveout above the heap (`mmu_tegra::VUGRAS_ABOVE_HEAP_TOP`, published from the
+   same carveout set that seats the heap). A raw `[heap_hi, DRAM_top)` sweep would eventually
+   `DC CIVAC` a SNOC-protected carveout — and cleaning a firewalled line *is* the FillWrite RAS whether
+   or not it is dirty — so an unbounded span B would **self-inflict** the very fault the localizer
+   exists to attribute. Real above-heap writes are still surfaced by span A's incidental cache churn.
 2. **A candidate-PA table** dumped once at boot (post-heap-init, before the JD2 spawn): heap span, DRAM
    top, framebuffer/scanout base, the `Screen` back buffer, the cursor save-under stash, and the full
    xHCI DMA surface — DCBAA, event/command rings, per-slot input/output contexts, transfer rings, HID
@@ -716,9 +724,29 @@ a cache-line **writeback**, so the offending store happened *frames before* the 
 This diagnostic **intentionally makes the fault fire earlier** — that is its purpose; the sweep is
 read-only and changes nothing with the knob off.
 
+**VUG-RAS-ANALYZE verdict — the boot-15 RAS is H2 (the sweep REVEALED it, did not CAUSE it).** The
+localizer fired at `idle tick 0`. By the sweep's parity (`vugras::sweep_one`: `tick & 1 == 0 ⇒`
+span A), **tick 0 sweeps span A = the heap only**; span B (the only span covering the fault
+`0x26b900000`) runs on odd ticks and had **never executed** when the RAS fired (the boot witness also
+sweeps span A only). The heap is carveout-clear by construction (`select_heap_region`), so a `DC CIVAC`
+over span A cannot fault at a protected address — the sweep provably never touched `0x26b900000`. The
+fault is therefore a **real earlier store/DMA** whose dirty line was surfaced by the span-A clean's
+incidental cache churn (the FillWrite fires on writeback). A code survey found `0x26b900000` is **not**
+produced by any allocator arithmetic (every xHCI ring/buffer is heap-backed, inside `[heap_lo,heap_hi)`;
+there is no `heap_top + offset` or frame allocator): it is a **kernel-image `.bss`/load-extent address**,
+image-layout-correlated — the same class the `XCARVE_RELINK_PAD` (`xusb_tegra.rs`) shifts the image to
+chase. Candidate writers are DMA/CPU targets that live in `.bss` rather than the heap (the xHCI event
+ring / ERST, or the image load tail). This is the ORIN-VUG-RAS / JETSON-XCARVE "store into
+protected DRAM near the image extent" class, **not** an allocator miscomputation and **not** (per this
+survey) the NET-4m rx path. Pinning the exact `.bss` writer and relinking/relocating it is the
+**XCARVE arc's** work (it touches shared xHCI/core files outside the jetson lane); VUG-RAS-ANALYZE's
+in-lane fix is the carveout-bounded span B above, which makes the localizer sound so the next boot
+attributes `0x26b900000` to the writer and not to the sweep.
+
 **Expected serial (metal, `UNAOS_VUGRAS=1 UNAOS_TEGRA=1`):**
 - `:: VUGRAS: boot witness — RAS candidate PA table (bit-63-stripped decode) ::`
 - `:: VUGRAS: heap span [lo,hi) 48 MiB; tegra DRAM top 0x280000000 ::`
+- `:: VUGRAS: above-heap sweep span B [heap_hi,top) N KiB — carveout-clipped (never DC-cleans firewall fabric) ::`
 - `:: VUGRAS: framebuffer/scanout base 0x… len 0x… ::`
 - `:: VUGRAS: cursor save-under stash [lo,hi) ::`
 - `:: VUGRAS: xHCI DCBAA=0x… event_ring_base=0x… enum_cmd_trb=0x… enumerating_port=N stage=… ::`
@@ -742,8 +770,11 @@ memory-bandwidth-bound (measure and witness once per span from the capture).
 3. **Match `A'` against the candidate table** (the `:: VUGRAS: …` PA lines nearest boot): which named
    span `[lo,hi)` contains `A'`? Heap-but-not-a-named-buffer ⇒ a transient heap allocation; inside a
    named xHCI ring/context/buffer ⇒ that DMA structure; inside the Screen back buffer / cursor stash ⇒
-   the double-buffer or cursor store. If `A'` is in span B (`[heap_hi, DRAM_top)`) but no named entry
-   contains it, it is an allocation made *after* the boot dump — re-dump or widen the table.
+   the double-buffer or cursor store. If `A'` is **above** `heap_hi` and in no named span (the boot-15
+   `0x26b900000` case), it is **not** a heap allocation: it is a kernel-image `.bss`/load-extent address
+   (image-layout-correlated — cross-check against the map file and the `XCARVE` shift). Note the
+   carveout-clipped span-B witness bounds where the sweep *could* have touched: if `A'` lies at/above
+   that clip, the sweep never cleaned it and the RAS is a real writer's natural-eviction writeback.
 4. **Correlate with enumeration:** if the flagged `enumerating_port` (port 7 in boots 13+14) owns a
    context/ring/buffer near `A'`, test the "mid-enumeration reset-settle writeback" correlation.
 
