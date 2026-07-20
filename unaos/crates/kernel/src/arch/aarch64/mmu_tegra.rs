@@ -188,7 +188,14 @@ fn resolve_carveout_holes(
         let g = base >> 30;
         g >= 1 && g < 64 && (ram_gib_mask >> g) & 1 != 0
     };
-    // The framebuffer/scanout carveout is legitimately CPU-written — never unmap it.
+    // The framebuffer/scanout carveout is legitimately CPU-written — never unmap it. This guard keys on
+    // `boot_info.framebuffer_addr`, which is `0` on the "booting without a display" loader path (boot-26)
+    // — so it CANNOT catch a fb the kernel later inherits from the DTB `simple-framebuffer` node. XCARVE-7
+    // belt-at-punch: a node-name skip ("framebuffer"/"simple-framebuffer") would need `reserved_carveouts`
+    // to also thread each node's name string (a signature + classifier change in `fdt_tegra.rs`), which is
+    // NOT cheap; and it is not needed for correctness — `map_fb_region`'s XCARVE-7 L2 repair authoritatively
+    // re-maps any punched fb block at map time, whatever the DTB called the node. So we keep only the
+    // BOOT_INFO guard here and rely on the repair for the DTB-sourced case.
     let fb_lo = boot_info.framebuffer_addr;
     let fb_hi = fb_lo.wrapping_add(boot_info.framebuffer_size as u64);
     let hits_fb = |b: u64, s: u64| -> bool {
@@ -828,6 +835,112 @@ fn is_table_desc(desc: u64) -> bool {
     desc & 0b11 == 0b11
 }
 
+/// XCARVE-7: does any QUIRK (source-2) protected window intersect the 2 MiB block `[blk_lo, blk_hi)`?
+/// The fb L2 repair re-maps a punched block ONLY when the answer is no — a QUIRK window is a real
+/// no-touch firewall carveout (0x26b9, 0xbe), and a framebuffer overlapping one is a genuine conflict the
+/// repair must refuse and surface, not silently re-map. DTB (source-1) windows are NOT a bar: the fb
+/// carveout is itself published as a `/reserved-memory` node, and re-mapping that node's block IS the fix.
+#[cfg(feature = "tegra")]
+fn quirk_hits_block(blk_lo: u64, blk_hi: u64) -> bool {
+    use core::sync::atomic::Ordering;
+    let n = HOLE_N.load(Ordering::Relaxed).min(MAX_HOLES);
+    for i in 0..n {
+        if HOLES_SRC[i].load(Ordering::Relaxed) != 2 {
+            continue;
+        }
+        let b = HOLES_BASE[i].load(Ordering::Relaxed);
+        let s = HOLES_SIZE[i].load(Ordering::Relaxed);
+        if s != 0 && blk_lo < b.wrapping_add(s) && b < blk_hi {
+            return true;
+        }
+    }
+    false
+}
+
+/// XCARVE-7: repair the carveout-hole L2 split of one GiB so the framebuffer span is mapped. `l1_desc`
+/// is the live GiB's L1 TABLE descriptor (its low bits carry the L2 table PA, identity VA==PA). Walks the
+/// 512 × 2 MiB blocks; for every block that intersects the fb span `[pa, pa+size)` and is currently
+/// INVALID (punched by exclusion), re-maps it Normal-WB RAM (attr for `el`) in the live L2 and — when
+/// `patch_twin` — in the EL1 twin's own L2 (attr EL1), with `clean_desc` per written entry. Blocks
+/// outside the span, and blocks already RAM, are untouched. A block intersecting a QUIRK (source-2)
+/// protected window is REFUSED (left unmapped) and witnessed loudly — fb spans and firewall windows must
+/// be disjoint; an overlap is a real conflict to surface. Returns the number of blocks re-mapped, and
+/// witnesses `fb L2 repair — N block(s) re-mapped in GiB g [span)` when that is non-zero. The caller's
+/// trailing `dsb sy` + TLBI publish the writes for the ACTIVE regime.
+#[cfg(feature = "tegra")]
+unsafe fn repair_fb_l2(
+    l1_desc: u64,
+    l1_el1: *mut u64,
+    gi: usize,
+    patch_twin: bool,
+    pa: u64,
+    size: usize,
+    el: u64,
+    gib: u64,
+) -> usize {
+    const BLK2: u64 = 2 * 1024 * 1024;
+    // A table descriptor's next-level table PA is bits [47:12]; the pool tables are 4 KiB aligned and we
+    // wrote no upper attribute bits, but mask precisely rather than assume.
+    const TABLE_ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
+    let l2 = (l1_desc & TABLE_ADDR_MASK) as *mut u64;
+    // The EL1 twin's L2 for this GiB, if the twin exists and is itself an L2 split.
+    let l2_el1: *mut u64 = if patch_twin {
+        let d1 = unsafe { l1_el1.add(gi).read_volatile() };
+        if is_table_desc(d1) {
+            (d1 & TABLE_ADDR_MASK) as *mut u64
+        } else {
+            core::ptr::null_mut()
+        }
+    } else {
+        core::ptr::null_mut()
+    };
+    let fb_lo = pa;
+    let fb_hi = pa + size as u64;
+    let gib_base = gib << 30;
+    let mut repaired = 0usize;
+    for i in 0..512usize {
+        let blk_lo = gib_base + (i as u64) * BLK2;
+        let blk_hi = blk_lo + BLK2;
+        if !(blk_lo < fb_hi && fb_lo < blk_hi) {
+            continue; // block does not intersect the fb span — leave excluded
+        }
+        if quirk_hits_block(blk_lo, blk_hi) {
+            // fb span overlaps a QUIRK firewall window in this block — a genuine conflict. Refuse the
+            // repair for this block (stays unmapped) and surface it; do NOT re-map into a protected window.
+            serial_println!(
+                ":: tegra: XCARVE-7 CONFLICT — fb span [{:#x},{:#x}) overlaps QUIRK window in block [{:#x},{:#x}); repair REFUSED (block left unmapped) ::",
+                fb_lo, fb_hi, blk_lo, blk_hi,
+            );
+            continue;
+        }
+        let cur = unsafe { l2.add(i).read_volatile() };
+        if is_ram_block(cur) {
+            continue; // already Normal-WB RAM — nothing to repair
+        }
+        unsafe {
+            l2.add(i).write_volatile(ram_block(blk_lo, el));
+            clean_desc(l2.add(i) as u64);
+        }
+        if !l2_el1.is_null() {
+            let cur1 = unsafe { l2_el1.add(i).read_volatile() };
+            if !is_ram_block(cur1) {
+                unsafe {
+                    l2_el1.add(i).write_volatile(ram_block(blk_lo, 1));
+                    clean_desc(l2_el1.add(i) as u64);
+                }
+            }
+        }
+        repaired += 1;
+    }
+    if repaired > 0 {
+        serial_println!(
+            ":: tegra: fb L2 repair — {} block(s) re-mapped in GiB {} [{:#x},{:#x}) ::",
+            repaired, gib, fb_lo, fb_hi,
+        );
+    }
+    repaired
+}
+
 /// JD1 (video): map the inherited firmware scanout framebuffer's GiB span Normal-WB into BOTH live
 /// translation tables — the running EL2 `L1` and the EL1-precise twin `L1_EL1` — so the CPU can draw
 /// into the firmware's live scanout and the panel keeps working across the JM6 EL2 -> EL1 drop.
@@ -865,10 +978,31 @@ pub fn map_fb_region(pa: u64, size: usize) -> bool {
     for g in g_lo..=g_hi {
         let gi = g as usize;
         let cur = unsafe { l1.add(gi).read_volatile() };
-        // XCARVE-3: a TABLE descriptor is our carveout-hole L2 split — it already maps every 2 MiB block
-        // of the GiB Normal-WB except the protected window (which no framebuffer ever lives in), so leave
-        // it untouched. Overwriting it with a 1 GiB block would re-map the hole. (The Orin's fb shares
-        // GiB 9 with the hole, so this GiB is genuinely reached here.)
+        // XCARVE-3/7: a TABLE descriptor is our carveout-hole L2 split — it maps every 2 MiB block of the
+        // GiB Normal-WB EXCEPT the protected window(s), which stay invalid. Overwriting it with a 1 GiB
+        // block would re-map those holes, so we never do. XCARVE-3 assumed no framebuffer ever lives in a
+        // punched block — boot-26 falsified that: the DTB published the scanout carveout as a
+        // `/reserved-memory` node AND `BOOT_INFO.framebuffer_addr == 0` this boot (the "booting without a
+        // display" loader path), so the exclusion-time fb guard (`hits_fb`) never matched and the fb's own
+        // 2 MiB block was punched; the first scanout write faulted (FAR=0x279e00000, translation L2). The
+        // authoritative fix is here: walk this GiB's L2 and re-map every INVALID 2 MiB block intersecting
+        // the fb span `[pa, pa+size)` back to Normal-WB RAM (live + EL1 twin, `clean_desc` per entry).
+        // Blocks outside the span stay untouched, so the protected windows stay excluded; a block that
+        // ALSO intersects a QUIRK protected window is a genuine conflict — refused and witnessed loudly,
+        // never papered over. `map_mmio_window`'s Device path keeps the old skip (MMIO never lives in a
+        // RAM-split GiB).
+        #[cfg(feature = "tegra")]
+        if is_table_desc(cur) {
+            let n = unsafe { repair_fb_l2(cur, l1_el1, gi, patch_twin, pa, size, el, g) };
+            if n > 0 {
+                changed = true;
+            }
+            // The GiB stays a valid TABLE descriptor (still covering RAM), so `all_ok` holds.
+            let after = unsafe { l1.add(gi).read_volatile() };
+            all_ok &= is_ram_block(after) || is_table_desc(after);
+            continue;
+        }
+        #[cfg(not(feature = "tegra"))]
         if is_table_desc(cur) {
             continue;
         }

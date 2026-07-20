@@ -945,6 +945,54 @@ window(s) UNMAPPED …` with a `window[…]` line for the `0x26b9` GiB-9 window 
 ACI RAS)** through the `vug`/`simmer` load that fired boot-25. Metal-owed: confirm boot-26 clears both the
 `0x26b9` and `0xbe` families and record whether the DTB declares the `0xbe` window (QUIRK → DTB tightening).
 
+#### XCARVE-7 — boot-26: XCARVE-6 punched the framebuffer; make `map_fb_region` L2-aware (**code fix, always-on; metal-owed**)
+
+Boot-26 cleared the `0x26b9` and `0xbe` RAS families — but died a new way. The XCARVE-6 exclusion set
+listed five windows, one of them `window[4] [0x279e00000, 0x27a760000) 9600 KiB @ GiB 9 (source:
+DTB /reserved-memory)` — **that window is the framebuffer**. Two facts collided: (a) the fb-skip guard in
+`resolve_carveout_holes` keys on `boot_info.framebuffer_addr`, but THIS boot took the loader's "booting
+without a display" path and published `framebuffer_addr = 0`, so `hits_fb` never matched and the fb's DTB
+`/reserved-memory` node was punched like any other carveout; (b) the kernel's fb does not come only from
+BOOT_INFO — `jd1_survey` inherits the firmware scanout from the DTB `simple-framebuffer` node — so the
+kernel later called `map_fb_region` on that very carveout. The GiB was an L2 split, `map_fb_region` skipped
+it wholesale on `is_table_desc` (XCARVE-6's "no framebuffer ever lives in a punched block" assumption), the
+fb's 2 MiB block stayed invalid, and the first scanout write faulted:
+`ESR=0x96000046 (EC=0x25, WRITE, translation L2) FAR=0x279e00000`, right after the banner.
+
+**Root shape.** Exclusion-time fb-guarding can never be complete — the fb can arrive by the DTB/JM7 path
+with `BOOT_INFO.framebuffer_addr == 0`. The authoritative fix must be at MAP time, where the real fb PA is
+known.
+
+**The fix (`mmu_tegra::map_fb_region`, `mmu_tegra::repair_fb_l2`).** When a GiB the fb span covers holds a
+TABLE descriptor (an XCARVE-3/6 L2 split), `map_fb_region` no longer skips it — it walks that GiB's L2 and
+re-maps **every INVALID 2 MiB block intersecting `[pa, pa+size)`** back to Normal-WB RAM (attr for the
+active EL), on BOTH the live table and the EL1-precise twin (each has its own L2 in the pool), with
+`clean_desc` per written entry; the caller's trailing `dsb sy` + regime TLBI publish them. Blocks OUTSIDE
+the fb span are untouched, so every protected window stays excluded — the L1 entry remains a valid TABLE
+descriptor, never re-flattened to a 1 GiB block. `map_mmio_window`'s Device path keeps the old whole-GiB
+skip (MMIO never lives in a RAM-split GiB).
+
+- **Belt (QUIRK disjointness).** Before re-mapping a block, `quirk_hits_block` checks it against the latched
+  QUIRK (`source = QUIRK`) windows (`0x26b9`, `0xbe`). A framebuffer overlapping a firewall carveout is a
+  **genuine conflict**, not something to paper over: the block is **refused** (left unmapped) and witnessed
+  loudly — `:: tegra: XCARVE-7 CONFLICT — fb span […] overlaps QUIRK window in block […]; repair REFUSED …`.
+  DTB (`source = DTB`) windows are NOT a bar — the fb carveout is itself a `/reserved-memory` node, and
+  re-mapping its block IS the fix.
+- **Belt at punch time (disposition).** A node-name skip
+  (`"framebuffer"`/`"simple-framebuffer"`) at exclusion time would need `fdt_tegra::reserved_carveouts` to
+  thread each node's name string through (a signature + classifier change) — **not cheap**, and not needed:
+  the L2 repair re-maps any punched fb block whatever the DTB called the node. So the punch-time guard keeps
+  only the BOOT_INFO check; correctness rides on the repair. Documented in `resolve_carveout_holes`.
+- **Witness.** `:: tegra: fb L2 repair — N block(s) re-mapped in GiB g [lo,hi) ::` when N > 0.
+
+**QEMU:** `virt` has no carveouts → empty set → no L2 split → `map_fb_region` never sees a TABLE descriptor,
+so the repair path is inert and the map is byte-identical (verified: default `test-arm`, `UNAOS_GICV3=1
+UNAOS_VUGRAS=1 test-arm`, `UNAOS_GICV3=1 UNAOS_WITNESS=1 UNAOS_VNET=1 test-arm` all green, CAPSTONE PASS).
+**Expected boot-27 (metal, `UNAOS_TEGRA=1`):** the XCARVE-6 exclusion banner still lists (or skips) the fb
+window; then `:: tegra: fb L2 repair — N block(s) re-mapped in GiB 9 [0x279e00000,…) ::`; the JD1
+`test_pattern` + fbcon scanout writes now **survive** (no `translation L2` abort at `FAR=0x279e00000`); then
+the NET-4s lease + SIMMER/vug survival oracles get their run.
+
 ### JX1 result — XUSB first light (⛔ **the block is EL3-fatal to touch post-EBS; BPMP ungate required first**)
 
 The one-boot probe (a guarded read of the xHCI capability block @ `0x0361_0000`, the Linux DT
