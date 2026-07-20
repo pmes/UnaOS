@@ -799,6 +799,48 @@ localizing the defect to a length/parse divergence the `trailing=…` line quant
 print yet no lease follows, the REQUEST left the NIC and the drop is the inbound ACK (RX), not the
 DISCOVER→REQUEST cadence. Metal-only: none of this path compiles or runs under QEMU (no Tegra234 RC).
 
+## NET-4l — the ACK dies in the zero-frame zone: RX descriptor re-arm published without OWN-last ordering
+
+R23s1 boots 2–14 held one stubborn cross-boot invariant: **the first popped RX frame always carries
+real bytes; every later frame reads a real DESCRIPTOR length but an all-zero payload** (boot-4: the
+whole 32-slot ring popped in 5 s with only ~2 real frames on the wire). With ordering (`dsb ld`),
+cache maintenance (`dc ivac`), the inbound iATU (NET-4h, armed + readback-verified), the SMMU (NET-4i,
+bypassing), descriptor `addr` fields (all-MATCH, NIC-preserved), frame content, poll cadence, and
+checksum caps all refuted, the un-refuted core was the descriptor **re-arm** path.
+
+**The defect (`arch/aarch64/rtl8168_tegra.rs::rx_frame_raw`).** The *initial* ring is published by
+`init_rings`' trailing `dsb sy` **before** RX is enabled, so the NIC observes those descriptors
+fully-formed — which is exactly why the **first** frame is always real. But every **re-arm** wrote the
+whole 16-byte descriptor as **one unordered store with no barrier**. On weakly-ordered aarch64 the
+continuously-polling C+ RX engine could observe the re-armed `OWN=1` (opts1) *before* the `addr` / len
+/ opts2 stores became visible, and DMA the next frame against a **stale (or still-zeroed) descriptor** —
+the "later buffers possibly never written by the NIC at all" signature for slots ≥2, and why the one
+real frame is always the first pop (only the barrier-published initial descriptors are ever seen
+coherently). The DHCP ACK, arriving as one of those post-re-arm frames, is read as zeros → no lease.
+
+**The fix.** Re-arm with Linux r8169's OWN-last publish discipline: write the descriptor **body**
+(addr + len + EOR) with `OWN` **clear** first, `dsb sy` to order it ahead of the ownership handoff,
+then set `OWN` **last** in a single aligned `u32` store to opts1 (offset 0 of the 16-byte-strided,
+256-byte-aligned ring ⇒ always 4-aligned), then `dsb sy` to publish it. This is `addr/opts2 →
+dma_wmb() → OWN|opts1`. It is a DMA **publish** (write-side) barrier — **not** the refuted read-side
+`dsb ld`, and **not** cache maintenance (also refuted). TX already gated its descriptor behind a
+`dsb sy` before the `TPPoll` doorbell, so TX (DISCOVER/REQUEST) was never affected; RX has no doorbell
+(the engine polls continuously), which is why the missing publish barrier bit only the RX re-arm.
+
+**Instrumentation (`UNAOS_NET4_RINGDUMP`, read-only, default-quiet).** So a wrong fix still names the
+state machine exactly: `net4l_ring_dump` dumps OWN/EOR/len/opts2/addr of **all 32** descriptors
+`pre-window` (before the DHCP window) and `after-rx` (after each of the first `NET4L_AFTERRX_MAX` real
+pops); the knob also widens the existing `[net4g]` post-window dump to the full ring. Unset, the boot
+is unchanged.
+
+**Expected boot-15 lines.** A real lease is now expected:
+`:: PCIE4: NET: DHCP lease ip=… gw=… (server …) after <N> polls => PASS ::`, preceded by
+`:: PCIE4:   [net4k] TX DHCP 3(REQUEST) xid=… tx#2 ::` and the OFFER's `[net4j] smoltcp ACCEPT` line —
+the DISCOVER→OFFER→REQUEST→**ACK** round now completing because the re-armed RX descriptors the ACK
+lands in are published OWN-last. If a lease still does not follow, the `UNAOS_NET4_RINGDUMP` `after-rx`
+snapshots name the exact post-re-arm descriptor state (which slots the NIC re-owned, which carry a real
+length, any `addr` divergence). Metal-only: none of this path compiles or runs under QEMU (no Tegra234 RC).
+
 ## The road from here
 
 | Arc | Content |

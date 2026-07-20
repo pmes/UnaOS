@@ -223,7 +223,11 @@ mod metal {
 
     /// NET-4g: how many leading RX descriptors the window-close dump prints (one line each). Eight
     /// covers the metal signature (rx[0] real, rx[1..] real-length/zero-payload) without flooding.
+    /// `UNAOS_NET4_RINGDUMP` widens this to the full ring (NET-4l instrumentation).
     const NET4G_DUMP_N: usize = 8;
+    /// NET-4l: bound on the knob-gated per-real-RX full-ring dumps (so a wrong fix still names the
+    /// state machine on the first handful of pops without flooding a whole DHCP window).
+    const NET4L_AFTERRX_MAX: u64 = 6;
 
     // ── NET-4d: RX-window frame classification (the DHCP no-lease RX-side proof) ──
     // Bounds the per-frame serial noise: a full L2/L3/L4 line for the first NET4D_FULL_LINES popped
@@ -829,7 +833,14 @@ mod metal {
                 "{}   [net4g] RX descriptor dump (post-window): ring @ {:#x}, buffers @ {:#x}, stride {} B, {} slots — addr is NIC-preserved across RX completion ::",
                 P4, self.rx_ring as u64, self.rx_buffers as u64, RX_BUF_SIZE, NUM_RX
             );
-            for i in 0..NET4G_DUMP_N.min(NUM_RX) {
+            // NET-4l: default prints the leading NET4G_DUMP_N slots (the metal signature); UNAOS_NET4_RINGDUMP
+            // widens it to the full ring so the post-window state of ALL 32 descriptors is captured.
+            let n = if option_env!("UNAOS_NET4_RINGDUMP").is_some() {
+                NUM_RX
+            } else {
+                NET4G_DUMP_N.min(NUM_RX)
+            };
+            for i in 0..n {
                 let d = unsafe { read_volatile(self.rx_ring.add(i)) };
                 // Copy packed fields BY VALUE before formatting: a format arg takes `&field`, which on a
                 // `repr(packed)` struct would be a misaligned reference (a hard error). Mirrors net4c.
@@ -839,6 +850,30 @@ mod metal {
                 let expect = (self.rx_buffers as u64) + (i * RX_BUF_SIZE) as u64;
                 serial_println!(
                     "{}   [net4g] rx-desc[{}] opts1={:#010x} (OWN={} EOR={} len={}) opts2={:#010x} addr={:#x} programmed={:#x} [{}] ::",
+                    P4, i, opts1, (opts1 >> 31) & 1, (opts1 >> 30) & 1, opts1 & DESC_LEN_MASK, opts2,
+                    addr, expect, if addr == expect { "MATCH" } else { "ADDR-MISMATCH" }
+                );
+            }
+        }
+
+        /// NET-4l: knob-gated (`UNAOS_NET4_RINGDUMP`) full-ring snapshot — OWN/EOR/len/opts2/addr of ALL
+        /// 32 RX descriptors at a named point (pre-window, and after each of the first few real RX pops).
+        /// The decisive instrumentation for the OWN-last re-arm fix: if the fix is wrong, these lines name
+        /// the exact descriptor state the NIC leaves behind (which slots the NIC re-owned, which carry a
+        /// real length, which addr diverged) instead of leaving the state machine to guesswork. Read-only.
+        fn net4l_ring_dump(&self, tag: &str) {
+            serial_println!(
+                "{}   [net4l ring-dump {}] ring @ {:#x} buffers @ {:#x} stride {} B rx_cur={} popped={} ::",
+                P4, tag, self.rx_ring as u64, self.rx_buffers as u64, RX_BUF_SIZE, self.rx_cur, self.rx_count
+            );
+            for i in 0..NUM_RX {
+                let d = unsafe { read_volatile(self.rx_ring.add(i)) };
+                let opts1 = d.opts1;
+                let opts2 = d.opts2;
+                let addr = d.addr;
+                let expect = (self.rx_buffers as u64) + (i * RX_BUF_SIZE) as u64;
+                serial_println!(
+                    "{}   [net4l] rx-desc[{}] opts1={:#010x} (OWN={} EOR={} len={}) opts2={:#010x} addr={:#x} programmed={:#x} [{}] ::",
                     P4, i, opts1, (opts1 >> 31) & 1, (opts1 >> 30) & 1, opts1 & DESC_LEN_MASK, opts2,
                     addr, expect, if addr == expect { "MATCH" } else { "ADDR-MISMATCH" }
                 );
@@ -1088,14 +1123,41 @@ mod metal {
             // shadowed by a resident line, and nothing can be written back over it. (DMA_FROM_DEVICE
             // sync-for-device, mirroring the pre-handoff invalidate in alloc_rx.)
             cache::invalidate_range(buf as usize, RX_BUF_SIZE);
-            // Recycle: re-arm this descriptor for the NIC (OWN + buffer size + EOR on the last slot).
+            // NET-4l: re-arm with the r8169 OWN-LAST publish discipline — the fix for "only the first
+            // popped frame ever carries real bytes; rx[2..] read a real DESCRIPTOR length but an all-zero
+            // payload." The INITIAL ring is published by `init_rings`' trailing `dsb sy` BEFORE RX is
+            // enabled, so the NIC observes those descriptors fully-formed → the first frame is real. But
+            // every RE-ARM here previously wrote the whole 16-byte descriptor as ONE unordered store with
+            // NO barrier: on weakly-ordered aarch64 the continuously-polling C+ RX engine could observe
+            // OWN=1 (opts1) BEFORE the addr/len/opts2 stores became visible, and DMA the next frame against
+            // a STALE (or still-zeroed) descriptor — precisely the "later buffers possibly never written by
+            // the NIC at all" signature for slots ≥2, and why the ONE real frame is always the first pop
+            // (only the barrier-published initial descriptors are ever seen coherently). Fix: publish the
+            // descriptor BODY (addr + len + EOR) with OWN CLEAR first, `dsb sy` to order it ahead of the
+            // ownership handoff, then set OWN LAST in a single aligned u32 store (opts1 is at offset 0 of a
+            // 16-byte-strided, 256-byte-aligned ring ⇒ always 4-aligned) and `dsb sy` to publish it. This
+            // is Linux r8169's addr/opts2 → dma_wmb() → OWN|opts1 order. It is a DMA PUBLISH (write-side)
+            // barrier — NOT the refuted read-side `dsb ld`, and NOT cache maintenance (also refuted).
             let eor = if self.rx_cur == NUM_RX - 1 { DESC_EOR } else { 0 };
+            let body = eor | (RX_BUF_SIZE as u32 & DESC_LEN_MASK); // OWN CLEAR
+            let desc = unsafe { self.rx_ring.add(self.rx_cur) };
             let nd = Desc {
-                opts1: DESC_OWN | eor | (RX_BUF_SIZE as u32 & DESC_LEN_MASK),
+                opts1: body,
                 opts2: 0,
                 addr: (self.rx_buffers as u64) + (self.rx_cur * RX_BUF_SIZE) as u64,
             };
-            unsafe { write_volatile(self.rx_ring.add(self.rx_cur), nd) };
+            unsafe {
+                write_volatile(desc, nd);
+                core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+                // Hand ownership to the NIC LAST — a single aligned u32 store to opts1 (offset 0).
+                write_volatile(desc as *mut u32, DESC_OWN | body);
+                core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+            }
+            // NET-4l instrumentation (knob-gated, read-only): dump the FULL 32-slot ring state after each
+            // of the first few real RX pops so a wrong fix names the state machine exactly (brief item 3).
+            if option_env!("UNAOS_NET4_RINGDUMP").is_some() && self.rx_count <= NET4L_AFTERRX_MAX {
+                self.net4l_ring_dump("after-rx");
+            }
             self.rx_cur = (self.rx_cur + 1) % NUM_RX;
             Some(len)
         }
@@ -1942,6 +2004,14 @@ mod metal {
         let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
         config.random_seed = 0x4e45_5434; // ASCII "NET4"
         let mut iface = Interface::new(config, &mut dev, Instant::from_millis(0));
+
+        // NET-4l: knob-gated PRE-WINDOW full-ring snapshot — the baseline the after-rx dumps diff against
+        // (brief item 3: dump all 32 descriptors BEFORE the window). Read-only; default-quiet.
+        if option_env!("UNAOS_NET4_RINGDUMP").is_some() {
+            if let Some(n) = NET4_DEVICE.lock().as_ref() {
+                n.net4l_ring_dump("pre-window");
+            }
+        }
 
         // ── DHCP first: acquire a lease for the link's real subnet, else fall back to the static
         //    placeholder (NET-DHCP — the do-it-right fix for the NET-4-landing static bring-up IP). The
