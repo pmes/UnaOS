@@ -846,6 +846,16 @@ kernel8() {
         K8_FEATS="${K8_FEATS},piusb"
         echo -e "${COLOR_YELLOW}  • UNAOS_PIUSB: BCM2711 PCIe RC + VL805 xHCI attach (attended-metal for positive verify)${COLOR_RESET}"
     fi
+    # PIUSB-5: UNAOS_PIUSB_ADOPT=1 is read at compile time via option_env! in piusb.rs (cargo passes the
+    # env to rustc — the UNAOS_SMPPROBE precedent). It arms the adopt-don't-reset path: when the pre-reset
+    # firmware reference dump finds the VL805 xHC already DECODING, the bring-up SKIPS our destructive RC
+    # reset + VL805 fw reload and rides the firmware's working config (x86-XENUM inherited-controller
+    # road). Requires UNAOS_PIUSB=1 (the `piusb` feature); harmless/no-op otherwise. The read-only dump
+    # itself runs whenever piusb is on — this knob only gates whether we ACT on a live firmware state.
+    if [ -n "${UNAOS_PIUSB_ADOPT:-}" ]; then
+        export UNAOS_PIUSB_ADOPT
+        echo -e "${COLOR_YELLOW}  • UNAOS_PIUSB_ADOPT: adopt firmware-left VL805 xHC (skip RC reset) if the pre-reset dump reads it live${COLOR_RESET}"
+    fi
     # PI-GENET: UNAOS_GENET=1 adds the `genet` feature — the BCM2711 on-board Gigabit Ethernet (Broadcom
     # GENET v5) driver + smoltcp bind (arch/aarch64/genet.rs), the Pi's FIRST network path. DTB-resolves
     # the register base, poison-honest probes SYS_REV_CTRL (M1's platform-classifying read — QEMU raspi4b

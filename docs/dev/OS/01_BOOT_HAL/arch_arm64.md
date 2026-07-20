@@ -6260,8 +6260,40 @@ the RC.
   readback-ritual idiom) so a just-enabled decode path that answers a few cycles late is not misread as
   poison; a still-poisoned read after the budget is an honest fail-closed, never a hang.
 
+### PIUSB-5 — reference dump first, adopt-don't-reset (the boot-P3 wall)
+
+boot-P3 **refuted all three PIUSB-4 hypotheses by their own witnesses**: notify-first ordering held
+(`post-NOTIFY cfg[0x00]` live — device survived), `BAR0 [0x10]=0xc0000004 → LATCHED`, `COMMAND=0x0146 →
+DECODE ENABLED`, `WIN0 armed: YES` — and the CAP read at CPU `0x6_0000_0000` was **still `0xdeaddead`
+after 8 tries**. Config cycles reach the device; memory cycles vanish. Yet the ROM boot spew shows the
+**VideoCore firmware itself reading this xHC** (`xHC ver: 256 HCS: 05000420`) moments before we run — a
+working configuration provably exists on this silicon. The one state we never inspected is the one the
+firmware **left**, because M1's first act (`RGR1_SW_INIT_1 |= INIT_GENERIC|PERST`) destroys it.
+
+- **Reference dump FIRST, reset SECOND** (`dump_firmware_state`, read-only, after the DTB census and
+  before M1). Dumps the as-left RC bridge/window state (`RGR1_SW_INIT_1`, `PCIE_STATUS`, bus window,
+  `WIN0 LO/HI/BASE_LIMIT/BASE_HI/LIMIT_HI`, `RC_BAR2`), the VL805 config through whatever `EXT_CFG`
+  forwarding the firmware left (`id/COMMAND/BAR0`), then **maps the firmware-implied CPU window**
+  (decoded from `WIN0 BASE_LIMIT/BASE_HI` via `decode_fw_win0_cpu_base`, the inverse of M1's packing;
+  falls back to the canonical `0x6_0000_0000` if unprogrammed) and **tries the CAP read there**. If it
+  decodes (CAP non-poison), the diff vs our post-reset programming is the answer. **No register is
+  written**; a poisoned pre-reset read is drained (fail-closed never loosened).
+- **Adopt-don't-reset** (`UNAOS_PIUSB_ADOPT=1`, compile-time `option_env!` — the `UNAOS_SMPPROBE`
+  precedent). When the dump finds the firmware xHC **already decoding**, the bring-up **SKIPS** the
+  destructive RC reset + VL805 fw reload, calls `adopt_ensure_decode` (programs **only** the missing
+  `COMMAND` MEM+BusMaster bits — never touches the firmware-latched BAR), and attaches the shared xHCI
+  at the **firmware's own CPU window** (the x86-XENUM inherited-controller road). Knob-off (default) the
+  dump still runs (it is the diff evidence) but the code always takes the reset path; the fail-closed
+  reset path is unchanged.
+- **If the pre-reset state ALSO reads poison** the wall is upstream of the BAR — the RC's CPU-side claim.
+  `witness_rc_cpu_claim` reports `PCIE_MISC_MISC_CTRL` with its `SCB0/1/2_SIZE` fields (bits
+  `[31:27]/[26:22]/[21:17]`) and `RC_BAR2`, and flags the documented BCM2711 bring-up-order fault where a
+  nonzero `RC_BAR2` size-code sits over a zero `SCB0_SIZE` (inbound window programmed ahead of its SCB
+  size). Facts-only — `pcie-brcmstb.c` is GPL-2.0-only.
+
 **Write discipline (the review lens).** The arc's writes are confined to the BCM2711 RC register block
-and the VL805's own config/BAR; every BAR-sizing probe restores its original immediately; no other
+and the VL805's own config/BAR; every BAR-sizing probe restores its original immediately; the PIUSB-5
+dump is **read-only** and the adopt path writes at most the missing `COMMAND` decode bits; no other
 device is touched. Every liveness read rejects both `0xffffffff` (PCIe master-abort / open-bus) and
 `0xdeadbeef` (firmware fill) as ABSENT DECODE — the **PI-V3D-1 poison-rejection rule**.
 
