@@ -7038,3 +7038,17 @@ non-regression only.
   QEMU cannot exercise the tegra path; the gates prove non-regression only (default `check` + `UNAOS_NET4=1
   UNAOS_TEGRA=1` `check`, default `test-arm`, and the `UNAOS_GICV3=1 UNAOS_WITNESS=1 UNAOS_VNET=1 test-arm`
   seam regression — vnet lease + the NET-4j reproducer stay PASS).
+
+### XCARVE-4 — the endgame (2026-07-20, boots 21/22)
+The XCARVE writer is named and fixed. XCARVE-3's unmap converted the SNOC RAS into a precise
+synchronous WRITE fault (boot-22: ESR=0x96000146, FAR=0x26b800000 = align_up(heap_hi, 8 MiB),
+ELR → xusb_tegra::jb2b_attach+0xfd0 = the INLINED shared `xhci::init_pointers` scratchpad
+block). Root cause: scratchpad `page_bytes` was derived from the raw PAGESIZE lowest-set-bit;
+under the Tegra234 no-HCRST inherited-controller takeover PAGESIZE reads back with the
+mandatory 4 KiB bit clear and garbage high bits → 8 MiB size/alignment → the allocation's
+placement overshot the heap into the firewalled carveout. Fix (shared xhci/mod.rs,
+platform-neutral, Peter-authorized class): clamp PAGESIZE to the spec-sane 4–32 KiB bits with
+the spec-mandatory 4 KiB fallback, null/heap-bounds-guard the array, witness the heap PA.
+Healthy controllers (bit 0 set) are byte-identical in behavior. Boots 13–22's RAS family =
+this one store's cache line (plus diagnostics touching the same window); 425090fd fixed the
+sibling instance (event ring/ERST). XCARVE-3's hole + witnesses stay armed as the standing trap.
