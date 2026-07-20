@@ -163,6 +163,34 @@
 // Boot-25 oracle: the enumeration + per-region readbacks all MATCH (UPPER_TARGET=0x2, enabled=1), no
 // `0x200` IOB RAS, `[net4m]` all-nonzero, DHCP LEASE.
 //
+// ## NET-4s — index 2 does not exist: probe the true window count, consolidate to ONE covering region.
+//
+// Boot-25 ran NET-4r's per-block plan for real. Verdict: `alias region 1 (rx-ring) readback: BASE=0x683d0000
+// … UPPER_TARGET=0x00000002 CTRL2=0x80000000 enabled=1 (after 0 polls)` — index 1 armed and readback-PROVED
+// on silicon. Then `alias region 2 (rx-buffers) readback: BASE=0 … enabled=0 (after 1000 polls)` → MISMATCH →
+// the NET-4r readback ritual correctly fail-closed the bring-up (no DHCP attempted). The Tegra234 DWC RC
+// implements FEWER inbound windows than the 8 unroll CSR blocks a CTRL2-read enumeration sees — likely just
+// 2 (index 0 = the NET-4h identity, index 1 = ours). NET-4p's "TX region shadowed" is thereby explained:
+// those higher indices never existed. Demanding one index PER block (four aliases) could never succeed here.
+// The fix keeps NET-4r's full readback ritual + fail-closed UNCHANGED and:
+//   1. DISCOVERS the true window count by a WRITABILITY probe (`probe_inbound_windows`, §A5 / the
+//      `dw_pcie_iatu_detect` idiom): write a probe value to each index's LOWER_TARGET, read it back, restore —
+//      an unimplemented window does not retain the write; windows are contiguous from 0, so the first
+//      non-sticking write bounds `num_ib_windows`. Witnessed. Index 0 (the live identity) is counted present
+//      without a destructive write.
+//   2. CONSOLIDATES every block that needs aliasing into ONE covering region at the proven-armable index 1.
+//      The four DMA blocks share one heap neighborhood (boot-25: 0x2683c…-0x2683f…), all carrying the same
+//      high dword (0x2). Offset-preservation (§A1: translated = target + (incoming − base)) makes a single
+//      64 KiB-aligned window whose fixed up-translate offset is `high_dword << 32` offset-EXACT for every
+//      block (`arm_dma_aliases` computes the covering base = min truncated low-32 floored to 64 KiB, limit =
+//      max block end rounded up, target = `(high << 32) | base`). The blocks all sharing one high dword is
+//      REQUIRED (a single region applies one offset) and enforced fail-closed; the 4 GiB-crossing, PCIe
+//      MEM/BAR-overlap, and congruence guards remain. If the heap ever scatters the blocks across a 4 GiB
+//      boundary, the covering region refuses rather than mistranslate — the remedy is a re-seated arena.
+// Boot-26 oracle: `[net4s] … {N} implemented window(s)` (the discovered count), the covering-window math,
+// per-block coverage lines, ONE `program_inbound_alias` readback MATCH (UPPER_TARGET=0x2, enabled=1) at
+// index 1, no `0x200` IOB RAS, `[net4m]` all-nonzero, DHCP LEASE.
+//
 // ## Write discipline
 //
 // The driver, being a driver, DOES the fabric writes NET-3 refused: it enables the device's
@@ -787,9 +815,18 @@ mod metal {
         /// alias/target non-congruence, a 4 GiB-crossing window, a PCIe MEM/BAR overlap, an alias-vs-alias
         /// overlap, no free index, or a readback/enable failure inside `program_inbound_alias`.
         fn arm_dma_aliases(&self) -> bool {
-            // Witness the inbound region file first: which indices are already programmed (index 0 = the
-            // NET-4h identity) and which are FREE (§A5 — enumerate, do not assume the count).
-            let enabled = enumerate_inbound_windows(self.atu_base);
+            // NET-4s — boot-25 falsified the one-alias-per-block plan: with an index PER block (rx-ring at
+            // index 1, rx-buffers at index 2, …) index 1 armed AND readback-proved on silicon while index 2
+            // NEVER latched (all-zero after 1000 polls). Verdict: the Tegra234 DWC RC implements FEWER inbound
+            // windows than the 8 CSR blocks a CTRL2-read enumeration sees — NET-4p's "TX region shadowed" was
+            // never a shadow, those indices simply do not exist. So (1) DISCOVER the true window count by a
+            // WRITABILITY probe (§A5, not a CTRL2 read), and (2) CONSOLIDATE every block that needs aliasing
+            // into ONE covering region at the proven-armable index 1. The four DMA blocks share one heap
+            // neighborhood (boot-25: 0x2683c…-0x2683f…), so a single 64 KiB-aligned window whose fixed
+            // up-translate offset is the shared high dword << 32 covers them all — one region, offset-exact
+            // for each block (§A1: translated = target + (incoming − base); with base/target sharing the low
+            // 32 bits the offset is exactly high_dword<<32 for every block).
+            let (num_ib, enabled) = probe_inbound_windows(self.atu_base);
             // The four DMA blocks the NIC touches, each (pa, len, tag). Rings + buffers are distinct
             // 64 KiB-aligned allocations (alloc_rx/alloc_tx).
             let blocks: [(u64, u64, &str); 4] = [
@@ -798,91 +835,125 @@ mod metal {
                 (self.tx_ring as u64, (NUM_TX * core::mem::size_of::<Desc>()) as u64, "tx-ring"),
                 (self.tx_buffers as u64, (NUM_TX * TX_BUF_SIZE) as u64, "tx-buffers"),
             ];
-            // Armed alias windows (rounded to the 64 KiB region granularity) for the overlap check, plus a
-            // free-index cursor starting at 1 (0 = identity).
-            let mut armed: [(u64, u64); 4] = [(0, 0); 4];
-            let mut n_armed = 0usize;
-            let mut next_idx = 1u64;
+            // Partition the blocks: which NEED an alias (their PA truncates on the wire / sits outside the
+            // identity region) and which the NET-4h identity region already reaches untranslated. Accumulate
+            // the covering window (in truncated low-32 space) over the blocks that need one, and require they
+            // all share ONE high dword (the single covering region up-translates by ONE fixed offset).
+            let mut need_hi: Option<u64> = None; // the shared high dword every aliased block must carry
+            let mut cover_lo = u64::MAX; // covering window base (low-32 space)
+            let mut cover_hi = 0u64; // covering window end (low-32 space, exclusive, pre-round)
+            let mut n_need = 0usize;
             for &(pa, len, tag) in blocks.iter() {
                 let alias = pa & 0xFFFF_FFFF;
-                let region_hi = (alias + len + 0xFFFF) & !0xFFFFu64; // 64 KiB-rounded window end (exclusive)
-                // Case A — the block is already sub-4 GiB and inside the identity region: the truncation is
-                // a no-op and NET-4h's identity region already reaches it. No alias needed.
+                // Case A — already sub-4 GiB and inside the identity region: the truncation is a no-op and
+                // NET-4h's identity region already reaches it. No alias needed.
                 if pa == alias && alias >= self.dma_ident_lo && alias + len <= self.dma_ident_hi {
                     serial_println!(
-                        "{}   [net4r] {} [{:#x}..{:#x}) already inside the identity inbound region [{:#x}..{:#x}) — no alias needed ::",
+                        "{}   [net4s] {} [{:#x}..{:#x}) inside the identity inbound region [{:#x}..{:#x}) — identity-covered, no alias ::",
                         P4, tag, pa, pa + len, self.dma_ident_lo, self.dma_ident_hi
                     );
                     continue;
                 }
-                // Congruence witness (§A3): alias_base ≡ target (mod 64 KiB). alias = pa & 0xFFFF_FFFF, so
-                // the low-16 bits are identical by construction; the 64 KiB-aligned allocation makes both 0.
-                let cong = (alias & 0xFFFF) == (pa & 0xFFFF);
-                let aligned = (alias & 0xFFFF) == 0;
-                serial_println!(
-                    "{}   [net4r] {} congruence: alias {:#x} = target {:#x} (mod 64KiB){} both-64KiB-aligned={} ::",
-                    P4, tag, alias, pa, if cong { " OK" } else { " FAIL" }, aligned as u8
-                );
-                if !cong {
-                    serial_println!(
-                        "{}   !! [net4r] {} alias/target NOT congruent mod 64 KiB — would mistranslate by the low-16 delta; REFUSING ::",
-                        P4, tag
-                    );
-                    return false;
-                }
-                // 4 GiB-crossing guard — a truncated window cannot wrap the boundary in one region.
-                if alias.checked_add(len).map_or(true, |e| e > 0x1_0000_0000) {
-                    serial_println!(
-                        "{}   !! [net4r] {} alias [{:#x}..+{:#x}) crosses the 4 GiB boundary — one region cannot cover it; REFUSING ::",
-                        P4, tag, alias, len
-                    );
-                    return false;
-                }
-                // PCIe MEM/BAR overlap (peer-to-peer mis-route hazard).
-                if self.mem_hi > self.mem_lo && alias < self.mem_hi && self.mem_lo < region_hi {
-                    serial_println!(
-                        "{}   !! [net4r] {} alias [{:#x}..{:#x}) OVERLAPS the PCIe MEM/BAR window [{:#x}..{:#x}) — REFUSING (peer-to-peer mis-route hazard) ::",
-                        P4, tag, alias, region_hi, self.mem_lo, self.mem_hi
-                    );
-                    return false;
-                }
-                // Alias-vs-alias overlap (two regions matching one truncated bus address = ambiguous).
-                for k in 0..n_armed {
-                    let (lo, hi) = armed[k];
-                    if alias < hi && lo < region_hi {
+                // Needs aliasing. Every aliased block must share one high dword — a single covering region can
+                // only apply ONE up-translate offset. (If the heap ever scatters the blocks across a 4 GiB
+                // boundary, this refuses rather than silently mistranslate; the remedy is a re-seated arena.)
+                let hi = pa >> 32;
+                match need_hi {
+                    None => need_hi = Some(hi),
+                    Some(h) if h != hi => {
                         serial_println!(
-                            "{}   !! [net4r] {} alias [{:#x}..{:#x}) OVERLAPS an earlier alias [{:#x}..{:#x}) — REFUSING (ambiguous inbound match) ::",
-                            P4, tag, alias, region_hi, lo, hi
+                            "{}   !! [net4s] {} high dword {:#x} != {:#x} of the other aliased block(s) — one covering region cannot up-translate both; REFUSING (re-seat the DMA arena into a single 4 GiB-congruent neighborhood) ::",
+                            P4, tag, hi, h
                         );
                         return false;
                     }
+                    _ => {}
                 }
-                // Take the next FREE inbound index (skip any already-enabled slot, including index 0).
-                while next_idx < 8 && (enabled & (1u32 << next_idx)) != 0 {
-                    next_idx += 1;
+                serial_println!(
+                    "{}   [net4s] {} [{:#x}..{:#x}) needs alias: truncated bus [{:#x}..{:#x}), high dword {:#x} ::",
+                    P4, tag, pa, pa + len, alias, alias + len, hi
+                );
+                if alias < cover_lo {
+                    cover_lo = alias;
                 }
-                if next_idx >= 8 {
-                    serial_println!(
-                        "{}   !! [net4r] no FREE inbound iATU index for {} (enabled mask {:#06x}) — REFUSING ::",
-                        P4, tag, enabled
-                    );
-                    return false;
+                if alias + len > cover_hi {
+                    cover_hi = alias + len;
                 }
-                let idx = next_idx;
-                next_idx += 1;
-                if !program_inbound_alias(self.atu_base, idx, alias, len, pa, tag) {
-                    serial_println!(
-                        "{}   !! [net4r] {} alias arm at index {} FAILED its readback/enable proof — REFUSING ::",
-                        P4, tag, idx
-                    );
-                    return false;
-                }
-                armed[n_armed] = (alias, region_hi);
-                n_armed += 1;
+                n_need += 1;
+            }
+            if n_need == 0 {
+                serial_println!(
+                    "{}   [net4s] all four DMA blocks are identity-covered — no inbound alias needed ::",
+                    P4
+                );
+                return true;
+            }
+            let hi = need_hi.unwrap();
+            // ONE covering window over every aliased block. The allocations are 64 KiB-aligned, so cover_lo is
+            // already aligned (floor defensively); the end rounds UP to the controller's 64 KiB granularity
+            // (§A2). base ≡ target (mod 64 KiB) by construction — both carry the same low 32 bits, both
+            // 64 KiB-aligned — so the controller rounds nothing (§A3) and the region reads back exactly.
+            let alias_base = cover_lo & !0xFFFFu64;
+            let region_hi = (cover_hi + 0xFFFF) & !0xFFFFu64; // 64 KiB-rounded window end (exclusive)
+            let size = region_hi - alias_base;
+            let target = (hi << 32) | alias_base;
+            let cong = (alias_base & 0xFFFF) == (target & 0xFFFF);
+            let aligned = (alias_base & 0xFFFF) == 0;
+            serial_println!(
+                "{}   [net4s] covering window: base {:#x} limit {:#x} target {:#x} (up-translate +{:#x}); spans {} aliased block(s); congruent(mod 64KiB)={} 64KiB-aligned={} ::",
+                P4, alias_base, region_hi - 1, target, target - alias_base, n_need, cong as u8, aligned as u8
+            );
+            if !cong || !aligned {
+                serial_println!(
+                    "{}   !! [net4s] covering window base/target NOT 64 KiB-congruent — would mistranslate by the low-16 delta; REFUSING ::",
+                    P4
+                );
+                return false;
+            }
+            // 4 GiB-crossing guard — one region cannot wrap the boundary.
+            if alias_base.checked_add(size).map_or(true, |e| e > 0x1_0000_0000) {
+                serial_println!(
+                    "{}   !! [net4s] covering window [{:#x}..+{:#x}) crosses the 4 GiB boundary — one region cannot cover it; REFUSING (re-seat the DMA arena) ::",
+                    P4, alias_base, size
+                );
+                return false;
+            }
+            // PCIe MEM/BAR overlap (peer-to-peer mis-route hazard).
+            if self.mem_hi > self.mem_lo && alias_base < self.mem_hi && self.mem_lo < region_hi {
+                serial_println!(
+                    "{}   !! [net4s] covering window [{:#x}..{:#x}) OVERLAPS the PCIe MEM/BAR window [{:#x}..{:#x}) — REFUSING (peer-to-peer mis-route hazard) ::",
+                    P4, alias_base, region_hi, self.mem_lo, self.mem_hi
+                );
+                return false;
+            }
+            // Take the FIRST free IMPLEMENTED inbound index (skip enabled slots incl. index 0 identity; the
+            // index must be within the discovered window count — boot-25 proved index 1 is implemented and
+            // index 2 is NOT, so demanding four separate indices could never succeed on this silicon).
+            let mut idx = 1u64;
+            while idx < num_ib && (enabled & (1u32 << idx)) != 0 {
+                idx += 1;
+            }
+            if idx >= num_ib {
+                serial_println!(
+                    "{}   !! [net4s] no FREE implemented inbound iATU index (count={}, enabled mask={:#06x}) — REFUSING ::",
+                    P4, num_ib, enabled
+                );
+                return false;
             }
             serial_println!(
-                "{}   [net4r] {} inbound alias region(s) armed + readback-proven; RX/TX ring AND buffer blocks all covered ::",
-                P4, n_armed
+                "{}   [net4s] consolidating all {} aliased block(s) into ONE covering region at inbound index {} (of {} implemented) ::",
+                P4, n_need, idx, num_ib
+            );
+            if !program_inbound_alias(self.atu_base, idx, alias_base, size, target, "dma-cover") {
+                serial_println!(
+                    "{}   !! [net4s] covering alias arm at index {} FAILED its readback/enable proof — REFUSING ::",
+                    P4, idx
+                );
+                return false;
+            }
+            serial_println!(
+                "{}   [net4s] 1 covering inbound alias region armed + readback-proven at index {}; all {} DMA block(s) (RX/TX ring AND buffers) covered by one window ::",
+                P4, idx, n_need
             );
             true
         }
@@ -1768,16 +1839,26 @@ mod metal {
         unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
     }
 
-    /// NET-4r — witness the inbound iATU region file BEFORE arming any alias: read each region's CTRL2
-    /// enable bit so the boot log shows which indices are already programmed (index 0 = the NET-4h
-    /// identity region) and which are FREE. Returns a bitmask of enabled indices over the probed range.
-    /// Read-only. Tegra234's DWC RC is unroll-mode (§A5): each region owns its CSR block at
+    /// NET-4s — discover the TRUE inbound-iATU window count AND the enabled-index mask in one pass, BEFORE
+    /// arming any alias. Boot-25 proved a CTRL2-read enumeration is not enough: it reports every one of the
+    /// 8 unroll CSR blocks as a candidate "free" index, but index 2 NEVER latched a write while index 1 did —
+    /// the RC implements fewer inbound windows than the CSR address space exposes. So the count is discovered
+    /// by a WRITABILITY probe (L4T-FACTS §A5, `dw_pcie_iatu_detect` idiom): write a probe value to each
+    /// index's `LOWER_TARGET` and read it back — an UNIMPLEMENTED window does not retain the write. Windows
+    /// are contiguous from 0, so the first index whose write does not stick bounds `num_ib_windows`. A live
+    /// ENABLED index (index 0 = the NET-4h identity, in active use) is counted present WITHOUT a destructive
+    /// write; a disabled index is probed write-readback-RESTORE (the probe value has low-16 = 0 since
+    /// `LOWER_TARGET[15:0]` is hardwired to 0 per §A2, so a present window reads it back exactly, and the
+    /// original is restored either way). Returns `(num_ib_windows, enabled_mask)`. Unroll blocks live at
     /// `atu_base + (index<<9) | BIT8` (= `ATU_INBOUND_DIR_OFF + index*ATU_REGION_STRIDE`), all within the
     /// 0x1000 ATU window the caller mapped, so probing 8 indices touches no unmapped register.
-    fn enumerate_inbound_windows(atu_base: u64) -> u32 {
+    fn probe_inbound_windows(atu_base: u64) -> (u64, u32) {
         const PROBE_N: u64 = 8;
+        const PROBE_VAL: u32 = 0x1111_0000; // low-16 zero (§A2 LOWER_TARGET[15:0] hardwired 0) ⇒ exact readback
         let vb = option_env!("UNAOS_NET4").is_some();
         let mut enabled = 0u32;
+        let mut count = 0u64;
+        let mut counting = true; // stop growing the count at the first gap (windows are contiguous from 0)
         for idx in 0..PROBE_N {
             let region = atu_base + ATU_INBOUND_DIR_OFF + idx * ATU_REGION_STRIDE;
             let ctrl2 = unsafe { read_volatile((region + ATU_UNR_REGION_CTRL2) as *const u32) };
@@ -1785,18 +1866,43 @@ mod metal {
             if en {
                 enabled |= 1u32 << idx;
             }
+            // Present iff the window physically exists. A live/enabled index is implemented by definition
+            // (don't clobber it to prove so); a disabled index is proved by write-readback-restore.
+            let present = if en {
+                true
+            } else {
+                let ltgt = (region + ATU_UNR_LOWER_TARGET) as *mut u32;
+                let orig = unsafe { read_volatile(ltgt as *const u32) };
+                unsafe {
+                    write_volatile(ltgt, PROBE_VAL);
+                    core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+                }
+                let rb = unsafe { read_volatile(ltgt as *const u32) };
+                unsafe {
+                    write_volatile(ltgt, orig); // restore — the probe leaves the register file untouched
+                    core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+                }
+                rb == PROBE_VAL
+            };
             if vb {
                 serial_println!(
-                    "{}   [net4r] inbound region {} @ {:#x}: CTRL2={:#010x} enabled={} ::",
-                    P4, idx, region, ctrl2, en as u8
+                    "{}   [net4s] inbound region {} @ {:#x}: CTRL2={:#010x} enabled={} writable={} ::",
+                    P4, idx, region, ctrl2, en as u8, present as u8
                 );
+            }
+            if counting {
+                if present {
+                    count += 1;
+                } else {
+                    counting = false;
+                }
             }
         }
         serial_println!(
-            "{}   [net4r] inbound iATU enumeration: enabled-index mask = {:#06x} (index 0 = NET-4h identity; aliases take FREE indices) ::",
-            P4, enabled
+            "{}   [net4s] inbound iATU probe: {} implemented window(s) (writability write-readback-restore, §A5); enabled-index mask = {:#06x} (index 0 = NET-4h identity; aliases take a FREE implemented index) ::",
+            P4, count, enabled
         );
-        enabled
+        (count, enabled)
     }
 
     /// NET-4r — program ONE DWC INBOUND iATU ALIAS region and PROVE it latched. Unlike NET-4h's identity

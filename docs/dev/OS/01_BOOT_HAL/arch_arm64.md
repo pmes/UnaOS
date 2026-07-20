@@ -7082,6 +7082,49 @@ non-regression only.
   UNAOS_NET4=1 UNAOS_VUGRAS=1` `check`, default `test-arm` MISSION SUCCESS, and `UNAOS_GICV3=1
   UNAOS_WITNESS=1 UNAOS_VNET=1 test-arm` — vnet lease + the NET-4j reproducer stay PASS).
 
+- **NET-4s — index 2 does not exist: probe the true window count, consolidate to ONE covering region.**
+  Boot-25 ran NET-4r's one-alias-per-block plan for real. `alias region 1 (rx-ring) readback: BASE=0x683d0000
+  … UPPER_TARGET=0x00000002 CTRL2=0x80000000 enabled=1 (after 0 polls)` — **index 1 armed and
+  readback-PROVED on silicon**. Then `alias region 2 (rx-buffers) readback: BASE=0 … enabled=0 (after 1000
+  polls)` → MISMATCH → the NET-4r readback ritual correctly **fail-closed** the bring-up (no DHCP attempted,
+  the honest negative doing its job). Verdict: the **Tegra234 DWC RC implements FEWER inbound windows than the
+  8 unroll CSR blocks a CTRL2-read enumeration sees** — likely just 2 (index 0 = the NET-4h identity, index 1
+  = ours). NET-4p's "TX region shadowed" is thereby explained: those higher indices never existed. Demanding
+  one index **per** block (four aliases) could never succeed on this silicon.
+
+  **The fix** keeps NET-4r's full readback ritual + fail-closed **unchanged** and:
+  1. **Discovered window count, not assumed.** `probe_inbound_windows` replaces the CTRL2-read enumeration
+     with a **writability probe** (`L4T-FACTS-NET.md` §A5 / the `dw_pcie_iatu_detect` idiom): for each index,
+     write a probe value (`0x1111_0000` — low-16 = 0, since `LOWER_TARGET[15:0]` is hardwired 0, §A2) to
+     `LOWER_TARGET`, read it back, and **restore** the original; an unimplemented window does not retain the
+     write. Windows are contiguous from 0, so the first non-sticking write bounds `num_ib_windows`. The live
+     ENABLED index 0 (the identity, in use) is counted present without a destructive write. The count and the
+     enabled-index mask are witnessed (`[net4s] inbound iATU probe: N implemented window(s) …`).
+  2. **One covering region, not four.** `arm_dma_aliases` consolidates every block that needs aliasing (RX
+     ring, RX buffers, TX ring, TX buffers — all high-heap, all carrying the same high dword `0x2` in the
+     boot-25 `0x2683c…-0x2683f…` neighborhood) into a **single** DWC inbound region at the proven-armable
+     index 1. Offset-preservation (§A1: `translated = target + (incoming − base)`) makes one 64 KiB-aligned
+     window whose fixed up-translate offset is `high_dword << 32` offset-EXACT for every block: covering base
+     = min truncated-low-32 floored to 64 KiB, limit = max block-end rounded up, `target = (high << 32) |
+     base`. The blocks all sharing one high dword is **required** (a single region applies one offset) and
+     enforced fail-closed; the congruence, 4 GiB-crossing, and PCIe MEM/BAR-overlap guards remain. If the heap
+     ever scatters the blocks across a 4 GiB boundary, the covering region refuses rather than mistranslate —
+     the remedy is a re-seated arena, not more regions.
+  3. **NET-4r's `program_inbound_alias` readback ritual + fail-closed are untouched** — it just runs once, for
+     the covering region.
+
+  **Expected boot-26 (metal-owed):** `[net4s] inbound iATU probe: 2 implemented window(s) … enabled-index
+  mask = 0x0001`; per-block `[net4s] rx-buffers [0x2683d…] needs alias: truncated bus [0x683d…], high dword
+  0x2`; `[net4s] covering window: base 0x683c… limit 0x683f… target 0x2683c… (up-translate +0x200000000) …
+  congruent(mod 64KiB)=1 64KiB-aligned=1`; `[net4s] consolidating all N aliased block(s) into ONE covering
+  region at inbound index 1 (of 2 implemented)`; the single `program_inbound_alias` readback all-MATCH
+  (`UPPER_TARGET=0x00000002 CTRL2=0x80000000 enabled=1`); `[net4s] 1 covering inbound alias region armed +
+  readback-proven at index 1; all N DMA block(s) … covered by one window`; then **no** `0x200` IOB/ACI RAS;
+  `[net4m]` all nonzero; and the DHCP **lease**. QEMU cannot exercise the tegra path; the gates prove
+  non-regression only (default `check` + `UNAOS_TEGRA=1 UNAOS_NET4=1 UNAOS_VUGRAS=1` `check`, default
+  `test-arm` MISSION SUCCESS, and `UNAOS_GICV3=1 UNAOS_WITNESS=1 UNAOS_VNET=1 test-arm` — vnet lease + the
+  NET-4j reproducer stay PASS).
+
 ### XCARVE-4 — the endgame (2026-07-20, boots 21/22)
 The XCARVE writer is named and fixed. XCARVE-3's unmap converted the SNOC RAS into a precise
 synchronous WRITE fault (boot-22: ESR=0x96000146, FAR=0x26b800000 = align_up(heap_hi, 8 MiB),
