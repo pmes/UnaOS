@@ -379,25 +379,79 @@ fn m1_rc_bringup() -> bool {
     w(RC_BASE + PCIE_MISC_RC_BAR2_CONFIG_LO, RC_BAR2_SIZE_4G);
     w(RC_BASE + PCIE_MISC_RC_BAR2_CONFIG_HI, 0);
     dsb();
-
-    // (f) Outbound MEM window: CPU 0x6_0000_0000 decodes PCIe 0xC000_0000, size 1 GiB. WIN0_LO/HI hold
-    //     the CPU-side base; BASE_LIMIT + BASE_HI/LIMIT_HI hold the PCIe-side base..limit (in 1 MiB
-    //     units, per brcmstb). Program all four so the RC forwards CPU reads of the window to the fabric.
-    let pcie_base = OUTBOUND_PCIE_BASE;
-    let pcie_limit = OUTBOUND_PCIE_BASE + OUTBOUND_SIZE - 1;
     serial_println!(
-        "{}   >>> WRITE: outbound MEM WIN0 CPU {:#x} -> PCIe [{:#x}, {:#x}] (1 GiB) ::",
-        P, OUTBOUND_CPU_BASE, pcie_base, pcie_limit
+        "{}   RC_BAR2 readback: CONFIG_LO={:#010x} CONFIG_HI={:#010x} (size-code {:#x} = 4 GiB inbound) ::",
+        P, r(RC_BASE + PCIE_MISC_RC_BAR2_CONFIG_LO), r(RC_BASE + PCIE_MISC_RC_BAR2_CONFIG_HI), RC_BAR2_SIZE_4G
     );
-    w(RC_BASE + PCIE_MISC_CPU_2_PCIE_MEM_WIN0_LO, (OUTBOUND_CPU_BASE & 0xFFFF_FFFF) as u32);
-    w(RC_BASE + PCIE_MISC_CPU_2_PCIE_MEM_WIN0_HI, (OUTBOUND_CPU_BASE >> 32) as u32);
-    // BASE_LIMIT: base[31:20] in bits [15:4], limit[31:20] in bits [31:20] (brcmstb 1 MiB granularity).
-    let base_mb = ((pcie_base >> 20) & 0xFFF) as u32;
-    let limit_mb = ((pcie_limit >> 20) & 0xFFF) as u32;
-    w(RC_BASE + PCIE_MISC_CPU_2_PCIE_MEM_WIN0_BASE_LIMIT, (limit_mb << 20) | (base_mb << 4));
-    w(RC_BASE + PCIE_MISC_CPU_2_PCIE_MEM_WIN0_BASE_HI, (pcie_base >> 32) as u32);
-    w(RC_BASE + PCIE_MISC_CPU_2_PCIE_MEM_WIN0_LIMIT_HI, (pcie_limit >> 32) as u32);
+
+    // (f) Outbound MEM window: CPU 0x6_0000_0000 decodes PCIe 0xC000_0000, size 1 GiB.
+    //
+    //     ── PIUSB-3 ADJUDICATION (the boot-P1 0xdeaddead root cause) ─────────────────────────────────
+    //     boot-P1 metal reached the honesty line's LAST step and read 0xdeaddead at CPU 0x6_0000_0000 —
+    //     the RC never CLAIMED that CPU address, so the outbound window was misprogrammed. Audited against
+    //     the BCM2711 brcmstb register model (`brcm_pcie_set_outbound_win`, facts only — pcie-brcmstb.c
+    //     is GPL-2.0-only): the two register groups had their address spaces SWAPPED.
+    //
+    //       * WIN0_LO / WIN0_HI  hold the **PCIe-side** address the window translates TO (`pcie_addr`).
+    //       * BASE_LIMIT + BASE_HI + LIMIT_HI hold the **CPU-side** address range the RC MATCHES against
+    //         (`cpu_addr .. cpu_addr+size-1`), in 1 MiB units.
+    //
+    //     The prior code wrote the CPU base (0x6_0000_0000) into WIN0_LO/HI and the PCIe range
+    //     (0xC000_0000..0xFFFF_FFFF) into BASE_LIMIT/BASE_HI/LIMIT_HI — inverted. The RC therefore matched
+    //     CPU addresses in [0xC000_0000, 0xFFFF_FFFF] (which the CPU never issues for this BAR) and left
+    //     0x6_0000_0000 (= 0x6000 MiB, bit 34 set) unclaimed → master-abort fill 0xdeaddead. Corrected
+    //     below: PCIe addr -> WIN0_LO/HI; CPU addr range -> BASE_LIMIT/BASE_HI/LIMIT_HI.
+    //
+    //     Field layout (BCM2711): BASE_LIMIT packs base_mb[11:0] in bits [15:4] and limit_mb[11:0] in bits
+    //     [31:20]; the upper MiB bits (a 12 MiB address needs >12 bits — 0x6000 MiB does) spill into the
+    //     separate BASE_HI / LIMIT_HI registers, shifted right by 12 (HWEIGHT of the 12-bit base field).
+    //     Every register is READ BACK and witnessed (the ORIN readback ritual) so a boot log proves the
+    //     window is armed, not merely written.
+    const WIN_MB_SHIFT: u64 = 20; // 1 MiB granularity
+    const WIN_HI_SHIFT: u32 = 12; // bits carried by the 12-bit base/limit field in BASE_LIMIT
+    let cpu_base = OUTBOUND_CPU_BASE;
+    let cpu_limit = OUTBOUND_CPU_BASE + OUTBOUND_SIZE - 1;
+    let pcie_base = OUTBOUND_PCIE_BASE;
+    let cpu_base_mb = cpu_base >> WIN_MB_SHIFT;
+    let cpu_limit_mb = cpu_limit >> WIN_MB_SHIFT;
+    serial_println!(
+        "{}   >>> WRITE: outbound MEM WIN0 CPU [{:#x}, {:#x}] -> PCIe {:#x} (1 GiB) ::",
+        P, cpu_base, cpu_limit, pcie_base
+    );
+    // WIN0_LO/HI = PCIe-side base (what the window translates the matched CPU address TO).
+    w(RC_BASE + PCIE_MISC_CPU_2_PCIE_MEM_WIN0_LO, (pcie_base & 0xFFFF_FFFF) as u32);
+    w(RC_BASE + PCIE_MISC_CPU_2_PCIE_MEM_WIN0_HI, (pcie_base >> 32) as u32);
+    // BASE_LIMIT = CPU-side base/limit low 12 MiB-bits: base in [15:4], limit in [31:20].
+    let base_lo = (cpu_base_mb & 0xFFF) as u32;
+    let limit_lo = (cpu_limit_mb & 0xFFF) as u32;
+    w(RC_BASE + PCIE_MISC_CPU_2_PCIE_MEM_WIN0_BASE_LIMIT, (limit_lo << 20) | (base_lo << 4));
+    // BASE_HI/LIMIT_HI = CPU-side base/limit high MiB-bits (0x6000 MiB >> 12 = 0x6 — carries bit 34).
+    w(RC_BASE + PCIE_MISC_CPU_2_PCIE_MEM_WIN0_BASE_HI, (cpu_base_mb >> WIN_HI_SHIFT) as u32);
+    w(RC_BASE + PCIE_MISC_CPU_2_PCIE_MEM_WIN0_LIMIT_HI, (cpu_limit_mb >> WIN_HI_SHIFT) as u32);
     dsb();
+
+    // Readback witnesses: every window register, so the boot log proves what the RC actually latched.
+    // A LO/HI that reads back the CPU base, or a BASE_LIMIT that reads back the PCIe range, would flag a
+    // regression to the pre-PIUSB-3 inverted programming.
+    let rb_lo = r(RC_BASE + PCIE_MISC_CPU_2_PCIE_MEM_WIN0_LO);
+    let rb_hi = r(RC_BASE + PCIE_MISC_CPU_2_PCIE_MEM_WIN0_HI);
+    let rb_bl = r(RC_BASE + PCIE_MISC_CPU_2_PCIE_MEM_WIN0_BASE_LIMIT);
+    let rb_bhi = r(RC_BASE + PCIE_MISC_CPU_2_PCIE_MEM_WIN0_BASE_HI);
+    let rb_lhi = r(RC_BASE + PCIE_MISC_CPU_2_PCIE_MEM_WIN0_LIMIT_HI);
+    serial_println!(
+        "{}   WIN0 readback: LO={:#010x} HI={:#010x} (PCIe base) | BASE_LIMIT={:#010x} BASE_HI={:#010x} LIMIT_HI={:#010x} (CPU range) ::",
+        P, rb_lo, rb_hi, rb_bl, rb_bhi, rb_lhi
+    );
+    let win_expected = rb_lo == (pcie_base & 0xFFFF_FFFF) as u32
+        && rb_hi == (pcie_base >> 32) as u32
+        && rb_bl == ((limit_lo << 20) | (base_lo << 4))
+        && rb_bhi == (cpu_base_mb >> WIN_HI_SHIFT) as u32
+        && rb_lhi == (cpu_limit_mb >> WIN_HI_SHIFT) as u32;
+    serial_println!(
+        "{}   WIN0 armed: {} (RC now claims CPU {:#x}..{:#x}, translates to PCIe {:#x}) ::",
+        P, if win_expected { "YES" } else { "NO — registers did not latch as programmed" },
+        cpu_base, cpu_limit, pcie_base
+    );
 
     // (g) Deassert PERST — release the downstream link to train.
     v = r(RC_BASE + PCIE_RGR1_SW_INIT_1) & !PCIE_RGR1_SW_INIT_1_PERST;

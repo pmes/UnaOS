@@ -6052,7 +6052,16 @@ the RC.
   program the **inbound DMA BAR** (`RC_BAR2` → RAM base 0, 4 GiB) and the **outbound MEM window**
   (`CPU_2_PCIE_MEM_WIN0_*`: CPU `0x6_0000_0000` decodes PCIe `0xC000_0000`, 1 GiB — the canonical Pi 4
   `ranges`), deassert PERST, and **poll link-up** (`PCIE_MISC_PCIE_STATUS` PHYLINKUP|DL_ACTIVE) with a
-  finite ~100 ms backstop. An honest link-DOWN says so and returns — never a hang. Reads the root-port
+  finite ~100 ms backstop. *(PIUSB-3, boot-P1 fix)* The two outbound-window register groups map **opposite**
+  address spaces and must not be crossed: `WIN0_LO`/`WIN0_HI` hold the **PCIe-side** target address the
+  window translates TO (`0xC000_0000`), while `BASE_LIMIT` + `BASE_HI` + `LIMIT_HI` hold the **CPU-side**
+  address range the RC MATCHES against (`0x6_0000_0000 .. 0x6_3FFF_FFFF`, in 1 MiB units — `0x6000` MiB, so
+  the high MiB-bits carry bit 34 into `BASE_HI`/`LIMIT_HI`, shifted right 12). boot-P1 had these swapped
+  (CPU base in `WIN0_LO/HI`, PCIe range in `BASE_LIMIT`), so the RC never claimed `0x6_0000_0000` and the
+  CAP read returned the master-abort fill `0xdeaddead`. Every window register (outbound five + `RC_BAR2`
+  pair) is now **read back and witnessed** in the boot log (the ORIN readback ritual) with a `WIN0 armed:
+  YES/NO` verdict line.
+  An honest link-DOWN says so and returns — never a hang. Reads the root-port
   identity (expect Broadcom `0x14e4`) from RC config space.
 - **M2 — VL805 enumeration.** Child config via the brcmstb `EXT_CFG_INDEX`/`EXT_CFG_DATA` window (bus 1,
   dev 0, fn 0): verify identity `1106:3483` (poison-rejecting), read class (expect `0c/03/30` USB xHCI),
