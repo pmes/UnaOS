@@ -567,7 +567,48 @@ fn m2_enumerate_vl805() -> Option<u64> {
         );
     }
 
-    // ── BAR0 sizing ritual (all-ones probe + immediate restore; the ORIN-NET-3 pattern) ──
+    // ── PIUSB-4 ADJUDICATION (the boot-P2 device-side 0xdeaddead root cause) ──────────────────────────
+    // boot-P2 proved the outbound window armed CPU-side (every WIN0 readback correct, `WIN0 armed: YES`)
+    // yet the CAP read at CPU 0x6_0000_0000 still returned 0xdeaddead — the abort moved DOWNSTREAM of the
+    // RC. The offender is ORDERING: NOTIFY_XHCI_RESET makes the VideoCore firmware (re)load the VL805's
+    // firmware, which RESETS the VL805's PCI config space — BAR0 and the COMMAND register revert to their
+    // power-on defaults (BAR0 = 0, MEM decode off). The prior code assigned BAR0 + enabled COMMAND and
+    // THEN issued the notify, so the firmware reload wiped both: the VL805 decoded its MMIO at BAR=0 (i.e.
+    // NOT at PCIe 0xC000_0000), the CPU read of the outbound window hit nothing the device claimed, and
+    // the RC returned its master-abort fill 0xdeaddead — device-side, exactly as captured.
+    //
+    // Linux never hits this because `quirk_vl805` is a DECLARE_PCI_FIXUP_HEADER: the firmware load/reset
+    // runs during device scan, BEFORE the PCI core assigns BARs and enables the device (facts-only from
+    // the fixup class; pcie-brcmstb.c / the firmware helper are GPL-2.0-only). We ARE the enumerator, so
+    // we mirror that order here: notify FIRST (firmware settles the VL805 into a known reset state), THEN
+    // size + assign BAR0 + enable COMMAND on top of that settled state, so nothing downstream reverts our
+    // programming. Every layer is READ BACK and witnessed so boot-P3 names the failing layer if the wall
+    // persists (mailbox SUCCESS is NOT proof the VL805 firmware is running; the config re-reads are).
+    //
+    // The dev_addr encoding (VL805_DEV_ADDR = (1<<20)|(0<<15)|(0<<12) = 0x0010_0000) matches the RPi
+    // firmware property model — dev_id = (bus<<20)|(slot<<15)|(func<<12) for bus1/dev0/fn0. Verified
+    // against the mailbox property-interface reference; constant unchanged.
+    serial_println!("{}   NOTIFY_XHCI_RESET (mailbox 0x00030058, dev_addr={:#x}) — firmware VL805 reset/load (BEFORE BAR/COMMAND: the reload resets config space) ::", P, VL805_DEV_ADDR);
+    let ok = mailbox::notify_xhci_reset(VL805_DEV_ADDR);
+    serial_println!("{}   NOTIFY_XHCI_RESET reported {} ::", P, if ok { "SUCCESS (mailbox accepted — NOT proof the VL805 fw is running; see cfg re-read below)" } else { "FAILURE (firmware may already have loaded it at boot)" });
+    // Let the VideoCore firmware finish loading/resetting the VL805 before we touch its config space.
+    settle_ms(50);
+
+    // Witness LAYER 2 (firmware running / device survival): re-read the identity word AFTER the notify.
+    // If the VL805 vanished or the RP forwarding broke across the reset, this catches it before we
+    // program a BAR into thin air. A live vendor:device here = the device answered post-reset.
+    let post = vl805_cfg_read(0x00);
+    match live_vendor_device(post) {
+        Some((v, d)) => serial_println!("{}   post-NOTIFY cfg[0x00] = {:#010x} (vendor={:#06x} device={:#06x} — device survived the fw reset, answering config) ::", P, post, v, d),
+        None => {
+            serial_println!("{}   post-NOTIFY cfg[0x00] = {:#010x} — device did NOT answer after the firmware reset (absent/forwarding lost) — bring-up STOP ::", P, post);
+            return None;
+        }
+    }
+
+    // ── BAR0 sizing ritual (all-ones probe + immediate restore; the ORIN-NET-3 pattern). Now runs on the
+    //    freshly-reset device, so `orig` reflects the post-reset default (typically 0) — that is fine: we
+    //    reassign BAR0 explicitly below regardless. ──
     let orig = vl805_cfg_read(0x10);
     serial_println!("{}   >>> WRITE: BAR0[0x10] all-ones probe (orig={:#010x}) — write 0xffffffff, read size, RESTORE ::", P, orig);
     vl805_cfg_write(0x10, 0xFFFF_FFFF);
@@ -579,35 +620,53 @@ fn m2_enumerate_vl805() -> Option<u64> {
     }
     let is_io = orig & 1 == 1;
     let mem_type = (orig >> 1) & 0x3; // 0 = 32-bit, 2 = 64-bit
+    let is_64bit = mem_type == 0x2;
     let mask = readback & !0xf;
     let size = ((!(mask as u64)) & 0xFFFF_FFFF).wrapping_add(1);
     serial_println!(
         "{}   BAR0 = {} mem, 64bit={}, size={:#x} ::",
-        P, if is_io { "I/O(!)" } else { "MMIO" }, mem_type == 0x2, size
+        P, if is_io { "I/O(!)" } else { "MMIO" }, is_64bit, size
     );
 
     // ── Assign BAR0 to the outbound window's PCIe base and enable decode. The VL805's xHCI MMIO will
     //    then be decoded at PCIe 0xC000_0000, which the CPU reaches at OUTBOUND_CPU_BASE (mapped in M3). ──
     let bar0_pcie = OUTBOUND_PCIE_BASE;
     serial_println!("{}   >>> WRITE: BAR0 := {:#x} (PCIe-side; CPU sees it at {:#x}) ::", P, bar0_pcie, OUTBOUND_CPU_BASE);
-    vl805_cfg_write(0x10, (bar0_pcie & 0xFFFF_FFF0) as u32 | (orig & 0xf));
-    if mem_type == 0x2 {
-        vl805_cfg_write(0x14, (bar0_pcie >> 32) as u32); // 64-bit BAR high half
-    }
-    // Command register (0x04): set MEM Space Enable (bit1) + Bus Master Enable (bit2).
+    let bar0_lo = (bar0_pcie & 0xFFFF_FFF0) as u32 | (orig & 0xf);
+    vl805_cfg_write(0x10, bar0_lo);
+    // Witness LAYER 1 (BAR upper dword): ALWAYS write BAR0[0x14] explicitly. For our sub-4-GiB PCIe base
+    // (0xC000_0000) the high half is 0; leaving it stale/garbage on a 64-bit BAR would make the device
+    // decode at <garbage>:0xC000_0000 — nowhere — which is one of the boot-P2 suspect classes. Write 0
+    // unconditionally (harmless on a 32-bit BAR: [0x14] is then the next BAR, which we do not use and
+    // which decode-enable does not arm until assigned), then read BOTH dwords back and witness them.
+    let bar0_hi = (bar0_pcie >> 32) as u32; // = 0 for 0xC000_0000
+    vl805_cfg_write(0x14, bar0_hi);
+    let rb_bar_lo = vl805_cfg_read(0x10);
+    let rb_bar_hi = vl805_cfg_read(0x14);
+    let bar_ok = rb_bar_lo == bar0_lo && (!is_64bit || rb_bar_hi == bar0_hi);
+    serial_println!(
+        "{}   BAR0 readback: [0x10]={:#010x} [0x14]={:#010x} (wrote LO={:#010x} HI={:#010x}, 64bit={}) -> {} ::",
+        P, rb_bar_lo, rb_bar_hi, bar0_lo, bar0_hi, is_64bit,
+        if bar_ok { "LATCHED" } else { "DID NOT LATCH — BAR programming did not stick" }
+    );
+
+    // Command register (0x04): set MEM Space Enable (bit1) + Bus Master Enable (bit2). Enable decode LAST,
+    // after the BAR is in place — a device must not decode before its BAR is assigned.
     let cmd = vl805_cfg_read(0x04);
     let newcmd = (cmd & 0xFFFF_0000) | ((cmd & 0xFFFF) | 0b110);
     serial_println!("{}   >>> WRITE: VL805 COMMAND {:#06x} -> {:#06x} (MEM+BusMaster enable) ::", P, cmd & 0xffff, newcmd & 0xffff);
     vl805_cfg_write(0x04, newcmd);
-
-    // ── NOTIFY_XHCI_RESET: have the VideoCore firmware (re)load + reset the VL805 firmware. Normally
-    //    the RPi bootloader does this at power-on from the SPI EEPROM; an OS bringing the controller up
-    //    itself re-issues it so the xHCI comes up in a known state before attach. ──
-    serial_println!("{}   NOTIFY_XHCI_RESET (mailbox 0x00030058, dev_addr={:#x}) — firmware VL805 reset/load ::", P, VL805_DEV_ADDR);
-    let ok = mailbox::notify_xhci_reset(VL805_DEV_ADDR);
-    serial_println!("{}   NOTIFY_XHCI_RESET reported {} ::", P, if ok { "SUCCESS" } else { "FAILURE (firmware may already have loaded it at boot)" });
-    // A NOTIFY failure is not fatal to the honesty line — the bootloader normally loaded the firmware
-    // already; log and proceed.
+    // Witness LAYER 3 (enable/settle): read COMMAND back — MEM(bit1)+BM(bit2) must both read set, else the
+    // device will not decode its BAR no matter how the window is armed.
+    let rb_cmd = vl805_cfg_read(0x04) & 0xffff;
+    let cmd_ok = (rb_cmd & 0b110) == 0b110;
+    serial_println!(
+        "{}   COMMAND readback = {:#06x} (MEM={} BusMaster={}) -> {} ::",
+        P, rb_cmd, (rb_cmd >> 1) & 1, (rb_cmd >> 2) & 1,
+        if cmd_ok { "DECODE ENABLED" } else { "DECODE NOT ENABLED — MEM/BM bits did not set" }
+    );
+    // Let decode settle before M3's first MMIO read at the CPU window (enable/settle ordering).
+    settle_ms(10);
 
     Some(bar0_pcie)
 }
@@ -623,13 +682,26 @@ fn m3_attach_xhci(_bar0_pcie: u64) {
     unsafe { super::boot::map_device_1gib(OUTBOUND_CPU_BASE) };
     serial_println!("{} M3: mapped outbound window CPU {:#x} (Device-nGnRnE, 1 GiB) — reading VL805 xHCI caps ::", P, OUTBOUND_CPU_BASE);
 
-    let cap0 = r(OUTBOUND_CPU_BASE);
+    // Bounded settle+retry on the FIRST MMIO read (the ORIN readback-ritual idiom): a freshly-enabled
+    // decode path can take a few cycles to answer. Try up to N times with a short settle between; a
+    // still-poisoned read after the budget is an honest fail-closed, not a hang. Fail-closed after N.
+    const CAP_TRIES: u32 = 8;
+    let mut cap0 = r(OUTBOUND_CPU_BASE);
+    let mut tries = 1u32;
+    while (is_poison(cap0) || cap0 == 0) && tries < CAP_TRIES {
+        settle_ms(5);
+        cap0 = r(OUTBOUND_CPU_BASE);
+        tries += 1;
+    }
     if is_poison(cap0) || cap0 == 0 {
         serial_println!(
-            "{}   xHCI CAP register reads {:#010x} @ {:#x} — BAR not decoding (window/BAR mismatch or firmware not loaded); attach SKIPPED, fail-closed ::",
-            P, cap0, OUTBOUND_CPU_BASE
+            "{}   xHCI CAP register reads {:#010x} @ {:#x} after {} tries — BAR not decoding (window/BAR mismatch or firmware not loaded); attach SKIPPED, fail-closed ::",
+            P, cap0, OUTBOUND_CPU_BASE, tries
         );
         return;
+    }
+    if tries > 1 {
+        serial_println!("{}   xHCI CAP settled after {} tries (first read was poison; decode came up on retry) ::", P, tries);
     }
     let cap_length = (cap0 & 0xff) as u8;
     let hci_version = (cap0 >> 16) as u16;

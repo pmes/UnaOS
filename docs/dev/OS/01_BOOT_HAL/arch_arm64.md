@@ -6123,18 +6123,30 @@ the RC.
   An honest link-DOWN says so and returns — never a hang. Reads the root-port
   identity (expect Broadcom `0x14e4`) from RC config space.
 - **M2 — VL805 enumeration.** Child config via the brcmstb `EXT_CFG_INDEX`/`EXT_CFG_DATA` window (bus 1,
-  dev 0, fn 0): verify identity `1106:3483` (poison-rejecting), read class (expect `0c/03/30` USB xHCI),
-  run the **BAR-sizing ritual** on BAR0 (all-ones probe + **immediate restore** — the ORIN-NET-3 pattern),
-  assign BAR0 to the outbound window's PCIe base, enable MEM decode + bus-master, and issue the
-  **`NOTIFY_XHCI_RESET`** mailbox (tag `0x00030058`, `dev_addr = 0x0010_0000`) so the VideoCore firmware
-  (re)loads the VL805 firmware — the RPi bootloader normally does this from SPI EEPROM at power-on; an OS
-  bringing the controller up itself re-issues it.
+  dev 0, fn 0): verify identity `1106:3483` (poison-rejecting), read class (expect `0c/03/30` USB xHCI).
+  *(PIUSB-4, boot-P2 fix — device-side `0xdeaddead`)* **Order matters:** issue the **`NOTIFY_XHCI_RESET`**
+  mailbox (tag `0x00030058`, `dev_addr = 0x0010_0000` = `(bus1<<20)|(dev0<<15)|(fn0<<12)`) **FIRST**, then
+  size + assign BAR0 + enable decode. The notify makes the VideoCore firmware (re)load the VL805 firmware,
+  which **resets the VL805's PCI config space** — BAR0 and COMMAND revert to power-on defaults. boot-P2 had
+  the arm CPU-side window correct (`WIN0 armed: YES`) yet still read `0xdeaddead`, because the old order
+  assigned BAR0 + enabled COMMAND and only *then* issued the notify, so the firmware reload wiped both and
+  the VL805 decoded at BAR=0 (not PCIe `0xC000_0000`) → master-abort fill device-side. Linux avoids this by
+  running the VL805 firmware load as a `DECLARE_PCI_FIXUP_HEADER` — *before* PCI-core resource assignment;
+  we mirror that order. After the notify (+settle) the device identity is **re-read** (mailbox SUCCESS ≠
+  firmware running — the config re-read is the proof), then the **BAR-sizing ritual** on BAR0 (all-ones
+  probe + **immediate restore** — the ORIN-NET-3 pattern), BAR0 assigned to the outbound window's PCIe base
+  with **`[0x14]` written explicitly (=0)** and **both dwords read back + witnessed**, MEM decode +
+  bus-master enabled with **COMMAND read back + witnessed**. Three witness layers (BAR dwords / post-notify
+  survival / COMMAND) name the failing layer if the wall persists.
 - **M3 — xHCI attach.** Map the outbound window Device-nGnRnE via `boot::map_device_1gib` (one L1 block
   for CPU `0x6_0000_0000`; the **only** new page-table write this arc makes — outside `build_l1`'s fixed
   0–4 GiB map, reachable under the 36-bit IPS / 39-bit VA). Read `CAPLENGTH`/`HCIVERSION`/`HCSPARAMS1`
   (poison-rejecting), attach the shared `drivers/xhci` in **polled** mode (`xhci::init` = halt + HCRST +
   CNR wait — heap-free, no ring allocation), set `PORTSC.PP` on each root port, and **stop** at the
   honesty line. This is the JB2b platform-attach pattern (`xusb_tegra.rs`) adapted to a PCIe-BAR base.
+  *(PIUSB-4)* The first CAP read is a **bounded settle+retry** (up to 8 tries, 5 ms apart — the ORIN
+  readback-ritual idiom) so a just-enabled decode path that answers a few cycles late is not misread as
+  poison; a still-poisoned read after the budget is an honest fail-closed, never a hang.
 
 **Write discipline (the review lens).** The arc's writes are confined to the BCM2711 RC register block
 and the VL805's own config/BAR; every BAR-sizing probe restores its original immediately; no other
