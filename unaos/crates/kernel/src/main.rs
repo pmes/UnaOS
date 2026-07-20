@@ -1581,6 +1581,10 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
             // with a `Screen`-backed `Console` and dispatches lines through the shared shell —
             // the first interactive UnaOS session on the Orin. Headless boots (no JD1 scanout)
             // delegate straight to `kbd_pump_body`, preserving the JB2b serial evidence lines.
+            // VUGRAS (RAS localizer, `UNAOS_VUGRAS=1`): dump the candidate-PA table now — heap +
+            // xHCI rings/contexts/buffers are live, and the enumerating port is flagged — so a decoded
+            // RAS fault ADDR can be matched from the capture alone. No-op with the knob off.
+            unaos_kernel::vugras::boot_witness();
             unaos_kernel::arch::sched::spawn("jd2-console", jd2_console_pump, 0, 0);
             serial_println!(":: tegra: JD2 — EL1 console pump task spawned (boot core) ::");
         }
@@ -1821,6 +1825,19 @@ fn jd2_console_pump(_arg: usize) {
         }
         v
     };
+    // VUGRAS (RAS localizer): a ~250 ms writeback-sweep cadence for the shell-idle path (boot-14
+    // crashed here with no vug run). `sweep_ticks` = CNTFRQ/4; the counter drives the alternating
+    // A/B span sweep. No-op with the knob off. Shared by phase 1 and phase 2 below.
+    let sweep_ticks: u64 = {
+        let f: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, CNTFRQ_EL0", out(reg) f, options(nomem, nostack, preserves_flags));
+        }
+        (if f == 0 { 62_500_000 } else { f }) / 4
+    };
+    let mut last_sweep = cntpct();
+    let mut sweep_tick: u64 = 0;
+
     let phase1_start = cntpct();
     let first_key: Option<u8> = loop {
         if let Some(x) = unaos_kernel::drivers::xhci::XHCI_CONTROLLER.lock().as_mut() {
@@ -1832,6 +1849,11 @@ fn jd2_console_pump(_arg: usize) {
                 if cntpct().wrapping_sub(phase1_start) >= deadline_ticks {
                     break None; // quiescent boot — take the panel and show the prompt
                 }
+                if cntpct().wrapping_sub(last_sweep) >= sweep_ticks {
+                    last_sweep = cntpct();
+                    unaos_kernel::vugras::idle_sweep(sweep_tick);
+                    sweep_tick += 1;
+                }
                 unaos_kernel::arch::sched::yield_now();
             }
         }
@@ -1841,6 +1863,8 @@ fn jd2_console_pump(_arg: usize) {
     // straggler line can't paint over the console frame (serial output is unaffected).
     unaos_kernel::video::fbcon::detach();
     let mut screen = unaos_kernel::video::Screen::new(front_fb);
+    // VUGRAS: the Screen back buffer PA is only known now — add it to the candidate table.
+    unaos_kernel::vugras::note_screen(&screen);
     let mut pal = unaos_kernel::pal::TargetPal::new(&mut screen);
     let mut console = unaos_kernel::console::Console::new();
     // JD11: mirror every command-output line to serial so an attended Orin bench captures a durable,
@@ -1973,6 +1997,13 @@ fn jd2_console_pump(_arg: usize) {
         }
         if needs_render {
             pal.render();
+        }
+        // VUGRAS: the shell-idle writeback sweep on the ~250 ms cadence (boot-14's crash path — the
+        // console pump was live at shell entry with no vug run). No-op with the knob off.
+        if cntpct().wrapping_sub(last_sweep) >= sweep_ticks {
+            last_sweep = cntpct();
+            unaos_kernel::vugras::idle_sweep(sweep_tick);
+            sweep_tick += 1;
         }
         unaos_kernel::arch::sched::yield_now();
     }

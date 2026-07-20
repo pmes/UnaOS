@@ -90,6 +90,7 @@ pub mod console;
 pub mod user;
 pub mod splash;
 pub mod vug;
+pub mod vugras;
 
 pub fn init() {
     arch::init();

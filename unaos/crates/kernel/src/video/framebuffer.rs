@@ -82,6 +82,13 @@ impl FrameBuffer {
         self.len == 0
     }
 
+    /// VUGRAS: the framebuffer's base address (identity-mapped scanout PA on the metal targets). A
+    /// candidate range for the RAS localizer's post-mortem decode table. `0` before `init`.
+    #[inline]
+    pub fn base(&self) -> usize {
+        self.base
+    }
+
     #[inline]
     pub fn width(&self) -> usize {
         self.info.width

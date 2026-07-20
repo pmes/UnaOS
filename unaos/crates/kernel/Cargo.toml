@@ -142,6 +142,14 @@ tegra = []
 # const). Enable via `UNAOS_SMPPROBE=<n> UNAOS_TEGRA=1 ./arroyo esp-jetson`.
 smpprobe = []
 
+# VUG-RAS-LOCALIZER: the `UNAOS_VUGRAS=1` RAS localizer (vugras.rs) — a knob-gated DC CIVAC writeback
+# sweep (vug frame loop + JD2 console-idle pump) plus a boot candidate-PA witness, to make the Orin
+# SNOC+ACI FillWrite RAS fire at/near the offending store and name the address it decodes to. Pure
+# instrumentation; with this feature OFF (default) the sweeps + witnesses vanish and the image is
+# byte-identical to baseline (default-quiet law). Enable via `UNAOS_VUGRAS=1`. The above-heap sweep
+# span [heap_hi, DRAM_top) is additionally `tegra`-gated (empty on the virt QEMU gate).
+vugras = []
+
 # ORIN-SMP-DEFAULT: the real 6-core Orin SMP kick-off (arch/aarch64 smp_virt.rs
 # `start_secondaries_tegra` + the fdt_tegra `/cpus` presence enumerator), wired into
 # `tegra_early_stop` after JM4 and BEFORE the JM6 drop. Tegra-only. As of ORIN-SMP-DEFAULT this

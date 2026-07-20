@@ -141,6 +141,13 @@ impl TransferRing {
         self.trbs as u64
     }
 
+    /// VUGRAS: the ring's `[lo, hi)` byte span (base PA .. base + num_trbs*sizeof(Trb)). Named in the
+    /// RAS localizer's decode table so a fault ADDR inside a transfer ring is attributable.
+    pub fn span(&self) -> (usize, usize) {
+        let lo = self.trbs as usize;
+        (lo, lo + self.num_trbs * core::mem::size_of::<Trb>())
+    }
+
     /// Ring index of the TRB at physical address `phys`, if it lies inside this ring.
     fn index_of(&self, phys: u64) -> Option<usize> {
         let base = self.trbs as u64;

@@ -679,6 +679,74 @@ followed by `:: CAPSTONE COMPLETE …`.
 placement and matches the NET-4h iATU readback (`UNAOS_DMAWIN=1`); QEMU exercises only the fallback +
 the non-tegra derivation (tegra is metal-only).
 
+### VUG-RAS-LOCALIZER — force the FillWrite RAS to name its writer (`UNAOS_VUGRAS=1`, instrument-only)
+
+The ORIN-VUG-RAS / ORIN-RAS-2 heap placement moved the box past the *carveout* and *DMA-window* RAS
+classes, but a residual **SNOC+ACI FillWrite Uncorrectable** still fires intermittently on the Orin.
+Two field captures pinned the difficulty:
+
+- **Boot-13**: fired during a 2nd `vug` run with mouse motion. Fault ADDR `0x80000000be000f80`.
+- **Boot-14** (no localizer aboard): fired **at shell entry** — no `vug` run, no mouse, no simmer.
+  Fault ADDR `0x800000027724f340`.
+
+Two settled facts frame the diagnostic. First, the **XCARVE erratum** (see §JETSON-XCARVE): Tegra234
+RAS ADDRs are **record-format** — bit-63 is a record bit, not a poisoned-pointer half. Strip it:
+`0x800000027724f340 → 0x27724f340`. That decodes ABOVE the heap top (heap
+`[0x2683ca000, 0x26b3ca000)`) and below DRAM top `0x2_8000_0000`. Second, a **FillWrite** RAS fires on
+a cache-line **writeback**, so the offending store happened *frames before* the report — the churn
+(mouse, simmer) merely forces the eviction that surfaces it.
+
+`UNAOS_VUGRAS=1` (feature `vugras`, default OFF ⇒ code + witnesses vanish, image byte-identical) arms a
+**localizer** whose whole job is to make the fault fire *at* the store and to name the address:
+
+1. **Continuous writeback.** A `DC CIVAC` (clean+invalidate to PoC) sweep runs from every path the RAS
+   has been seen on — the `vug` frame loop (per frame, `vug.rs`) and the **JD2 console-idle pump**
+   (~250 ms cadence, `main.rs` — boot-14's crash path had no `vug` at all). The sweep alternates two
+   spans by an invocation counter so no single pass is unbounded: **A = `[heap_lo, heap_hi)`** and
+   **B = `[heap_hi, DRAM_top)`** (B is `tegra`-gated ⇒ empty on the `virt` gate, so the sweep never
+   touches unmapped RAM; the boot-14 fault sits in B, which a heap-only sweep would miss). Cleaning an
+   already-clean line is harmless — the point is a *dirty* line writes back **now**.
+2. **A candidate-PA table** dumped once at boot (post-heap-init, before the JD2 spawn): heap span, DRAM
+   top, framebuffer/scanout base, the `Screen` back buffer, the cursor save-under stash, and the full
+   xHCI DMA surface — DCBAA, event/command rings, per-slot input/output contexts, transfer rings, HID
+   buffers and in-flight `expect_phys` TRBs — **with the enumerating port flagged** (boots 13+14 both
+   crashed with a port mid-enumeration; port 7 in the field capture). So a decoded ADDR can be matched
+   from the serial capture alone.
+
+This diagnostic **intentionally makes the fault fire earlier** — that is its purpose; the sweep is
+read-only and changes nothing with the knob off.
+
+**Expected serial (metal, `UNAOS_VUGRAS=1 UNAOS_TEGRA=1`):**
+- `:: VUGRAS: boot witness — RAS candidate PA table (bit-63-stripped decode) ::`
+- `:: VUGRAS: heap span [lo,hi) 48 MiB; tegra DRAM top 0x280000000 ::`
+- `:: VUGRAS: framebuffer/scanout base 0x… len 0x… ::`
+- `:: VUGRAS: cursor save-under stash [lo,hi) ::`
+- `:: VUGRAS: xHCI DCBAA=0x… event_ring_base=0x… enum_cmd_trb=0x… enumerating_port=N stage=… ::`
+- `:: VUGRAS: xHCI slot S port 7 <== enumerating in_ctx=0x… out_ctx=0x… desc_buf=0x… … ::` (+ per-ring/expect lines)
+- `:: VUGRAS: Screen back buffer [lo,hi) ::` (when the console/vug builds the `Screen`)
+- `:: VUGRAS: idle tick N swept ::` / `:: VUGRAS: frame N swept ::` bracketing the fatal frame/period
+- `:: VUGRAS: {frame,idle} sweep cost — span {heap,above-heap} [lo,hi) M MiB in C cycles (~T ms) ::` (once per span)
+
+**QEMU (`UNAOS_GICV3=1 UNAOS_VUGRAS=1 ./arroyo test-arm`):** the `virt` boot drives neither `vug` nor
+JD2, so the headless witness runs from the CAPSTONE boot core (`arch::sched::run_capstone_boot_core`,
+alongside the VUG-HONESTY witness): it dumps the heap/cursor candidate lines and sweeps span A once —
+`:: VUGRAS: witness sweep cost — span heap [0x40000000,0x43000000) 48 MiB in ~1.3M cycles (~0 ms) ::` —
+then `:: CAPSTONE COMPLETE …`. QEMU models no caches, so `DC CIVAC` is a loop no-op; the metal cost is
+memory-bandwidth-bound (measure and witness once per span from the capture).
+
+**Post-mortem decode procedure** (from a serial capture with a RAS at fault ADDR `A`):
+1. **Strip bit-63:** `A' = A & 0x7FFF_FFFF_FFFF_FFFF` (the XCARVE record bit — never treat it as an
+   address bit). E.g. `0x800000027724f340 → 0x27724f340`.
+2. **Bracket the fault:** the last `:: VUGRAS: {frame,idle} N swept ::` before the RAS is the
+   frame/period whose writeback surfaced it — the offending store is within that window.
+3. **Match `A'` against the candidate table** (the `:: VUGRAS: …` PA lines nearest boot): which named
+   span `[lo,hi)` contains `A'`? Heap-but-not-a-named-buffer ⇒ a transient heap allocation; inside a
+   named xHCI ring/context/buffer ⇒ that DMA structure; inside the Screen back buffer / cursor stash ⇒
+   the double-buffer or cursor store. If `A'` is in span B (`[heap_hi, DRAM_top)`) but no named entry
+   contains it, it is an allocation made *after* the boot dump — re-dump or widen the table.
+4. **Correlate with enumeration:** if the flagged `enumerating_port` (port 7 in boots 13+14) owns a
+   context/ring/buffer near `A'`, test the "mid-enumeration reset-settle writeback" correlation.
+
 ### JX1 result — XUSB first light (⛔ **the block is EL3-fatal to touch post-EBS; BPMP ungate required first**)
 
 The one-boot probe (a guarded read of the xHCI capability block @ `0x0361_0000`, the Linux DT

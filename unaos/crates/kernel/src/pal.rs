@@ -238,6 +238,16 @@ pub mod cursor {
     static SAVED: Mutex<Saved> =
         Mutex::new(Saved { valid: false, x: 0, y: 0, w: 0, h: 0, px: [0; SAVE_SPAN * SAVE_SPAN] });
 
+    /// VUGRAS: the `[lo, hi)` byte span of the cursor save-under pixel stash (`SAVED.px`, a static in
+    /// kernel .bss — NOT heap). The RAS localizer names it in the decode table so a fault ADDR inside
+    /// it is attributable to the cursor stash write rather than a heap store. The lock is taken only to
+    /// read the buffer's address; the address itself is stable for the life of the kernel.
+    pub fn saved_pa() -> (usize, usize) {
+        let s = SAVED.lock();
+        let lo = s.px.as_ptr() as usize;
+        (lo, lo + core::mem::size_of_val(&s.px))
+    }
+
     /// Restore the pixels stashed under the sprite (the trail-free replacement for the old
     /// flat-color `erase`). No-op when nothing is stashed. Call before moving the position and
     /// when the auto-hide expires; the restored pixels come from the stash, never from VRAM.

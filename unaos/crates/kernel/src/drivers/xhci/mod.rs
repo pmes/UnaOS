@@ -399,6 +399,80 @@ pub fn log_summary_once() {
     }
 }
 
+/// VUGRAS (RAS localizer): dump every xHCI DMA structure's physical address to serial so a decoded
+/// RAS fault ADDR can be matched against the controller's rings, contexts and buffers post-mortem. The
+/// controller structures are identity-mapped, so a `*mut`/PA is the physical address the SNOC/ACI sees.
+/// Read-only. Emphasises the port under `enumerating_port` (boots 13+14 both crashed with a port
+/// mid-enumeration; port 7 in the field capture). Called once from the boot witness under the knob.
+pub fn vugras_dump() {
+    let ctrl = XHCI_CONTROLLER.lock();
+    let Some(x) = ctrl.as_ref() else {
+        serial_println!(":: VUGRAS: xHCI not initialised — no controller PAs ::");
+        return;
+    };
+    serial_println!(
+        ":: VUGRAS: xHCI DCBAA={:#x} event_ring_base={:#x} enum_cmd_trb={:#x} enumerating_port={} stage={} ::",
+        x.dcbaap as u64,
+        x.event_ring_phys_base,
+        x.enum_cmd_phys,
+        x.enumerating_port,
+        x.enum_stage
+    );
+    if let Some(cr) = COMMAND_RING.lock().as_ref() {
+        let (lo, hi) = cr.span();
+        serial_println!(":: VUGRAS: xHCI command-ring [{:#x},{:#x}) ::", lo, hi);
+    }
+    let optp = |o: Option<*mut u8>| -> u64 { o.map(|p| p as u64).unwrap_or(0) };
+    for (i, s) in x.slots.iter().enumerate() {
+        if !s.active {
+            continue;
+        }
+        let mark = if s.port_id == x.enumerating_port { " <== enumerating" } else { "" };
+        serial_println!(
+            ":: VUGRAS: xHCI slot {} port {}{} in_ctx={:#x} out_ctx={:#x} desc_buf={:#x} data_buf={:#x} mouse_buf={:#x} ::",
+            i,
+            s.port_id,
+            mark,
+            s.input_context as u64,
+            s.output_context as u64,
+            s.descriptor_buffer as u64,
+            optp(s.data_buffer),
+            optp(s.mouse_data_buffer)
+        );
+        serial_println!(
+            ":: VUGRAS: xHCI slot {} port {} expect ep0={:#x} mouse={:#x} kbd={:#x} hub_int={:#x} ::",
+            i,
+            s.port_id,
+            s.ep0_expect_phys,
+            s.mouse_expect_phys,
+            s.keyboard_expect_phys,
+            s.hub_int_expect_phys
+        );
+        for (tag, r) in [
+            ("ep0", &s.ep0_ring),
+            ("mouse", &s.mouse_ring),
+            ("kbd", &s.keyboard_ring),
+            ("hub_int", &s.hub_int_ring),
+            ("bulk_in", &s.bulk_in_ring),
+            ("bulk_out", &s.bulk_out_ring),
+        ] {
+            if let Some(ring) = r {
+                let (lo, hi) = ring.span();
+                serial_println!(
+                    ":: VUGRAS: xHCI slot {} port {} {}-ring [{:#x},{:#x}) ::",
+                    i, s.port_id, tag, lo, hi
+                );
+            }
+        }
+        if let Some(b) = s.hub_change_buffer {
+            serial_println!(
+                ":: VUGRAS: xHCI slot {} port {} hub_change_buf={:#x} ::",
+                i, s.port_id, b as u64
+            );
+        }
+    }
+}
+
 pub static COMMAND_RING: Mutex<Option<TransferRing>> = Mutex::new(None);
 pub static EVENT_RING: Mutex<Option<EventRing>> = Mutex::new(None);
 

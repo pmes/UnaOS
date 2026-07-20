@@ -127,6 +127,12 @@ _feats=""
 # VPERF M2: the fbcon viewport-cap bench lever (implies videobench). x86_64 only.
 [ -n "${UNAOS_VIDEOCAP:-}" ] && _feats="${_feats}videocap,"
 [ -n "${UNAOS_TEGRA:-}" ] && _feats="${_feats}tegra,"
+# VUG-RAS-LOCALIZER: UNAOS_VUGRAS=1 arms the RAS localizer (vugras.rs) — the knob-gated DC CIVAC
+# writeback sweep (vug frame loop + JD2 console-idle pump) + the boot candidate-PA witness. Pure
+# instrumentation; OFF by default the code vanishes and the image is byte-identical to baseline. The
+# above-heap sweep span [heap_hi, DRAM_top) is tegra-gated (empty on the virt gate, so the sweep never
+# touches unmapped RAM). Gate: `UNAOS_GICV3=1 UNAOS_VUGRAS=1 ./arroyo test-arm` (sweep runs, witnesses).
+[ -n "${UNAOS_VUGRAS:-}" ] && _feats="${_feats}vugras,"
 # ORIN-SMP-2: UNAOS_SMPPROBE=<n> arms the JM5 CPU_ON firmware-wall investigation probe (tegra-only;
 # arch/aarch64/smpprobe.rs). The numeric value selects the experiment at compile time via
 # option_env!("UNAOS_SMPPROBE") (cargo passes the env to rustc), so each armed value is a distinct
