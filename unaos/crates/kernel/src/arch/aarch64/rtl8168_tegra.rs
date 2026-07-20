@@ -87,6 +87,36 @@
 // Either fix is a SEPARATE arc outside this file; NET-4m's job is to name which, not to weaken the
 // (already-correct) per-pop invalidate or the OWN-last re-arm.
 //
+// ## NET-4n — the discriminator fired writes-to-nowhere; the truncation is IN this file (64-bit DMA off).
+//
+// Boot-16 armed the `[net4m]` speculation-fenced probe. Verdict: rx[1..4] read the raw buffer DRAM
+// ZERO with a real descriptor length -> WRITES-TO-NOWHERE, not cache/speculation. The RC confirmed it:
+// an IOB `FillWrite` RAS, ADDR 0x8000000000000200 (bit-63-stripped 0x200 = the fabric slave-error sink
+// for an inbound write that matched no inbound region). So the inbound path (NET-4h iATU armed identity
+// [0x8000_0000, 0x2_8000_0000), NET-4i SMMU bypassing) is NOT the gap — the addresses reaching it are.
+//
+// Root cause, localized to this driver: the C+ RX/TX engine was left in 32-bit-payload-DMA mode
+// (CPlusCmd.PCIDAC clear; boot-16 read back 0x2021). The engine reaches the descriptor RING through the
+// dedicated 64-bit RDSAR/TNPDS registers (so fetch + writeback of a >4 GiB ring are fine — the ring
+// stays coherent, the NET-4m asymmetry), but for the per-buffer PAYLOAD write it uses only
+// `Desc.addr[31:0]`. With `ORIN-DMA-WINDOW` seating the heap high (~9.6 GiB; boot-16 ring @ 0x2683ca000,
+// buffers @ 0x2683cbXXX, all >4 GiB, net4g [MATCH]) the payload address truncates to ~1.6 GiB, BELOW the
+// inbound iATU's 0x8000_0000 base -> no region matches -> slave-error -> the 0x200 FillWrite + a buffer
+// that keeps its alloc_zeroed zeros. Only the FIRST buffer filled after RxEnb lands cleanly (its address
+// latched from the ring context, not the truncating per-buffer path); rx[5]'s "nonzero" is a torn
+// hi/lo write (bytes present, not a valid frame), the same defect. The low-heap boots (heap at
+// 0x8000_0000, boots 1..5) never needed the high dword, so they masked this — until the RAS-2 heap-guard
+// moved the heap high for good.
+//
+// Fix (this file, net lane): set CPlusCmd.PCIDAC in `init_rings` so EVERY payload TLP carries the full
+// 64-bit `Desc.addr` — the r8169 `NETIF_F_HIGHDMA` path, and the brief's PREFERRED fork because the
+// silicon is provably 64-bit-DMA-capable (it fetches the >4 GiB ring). Nothing below the driver changes;
+// the NET-4h iATU already covers the true buffer PAs, so the now-untruncated writes land. If a metal
+// boot shows the truncation survive PCIDAC, the fallback is the 32-bit-arena fork (drive the rings via a
+// sub-4 GiB DMA alias — a tegra-local net-lane arena, still no allocator change). Boot-17 confirms:
+// `CPlusCmd .. PCIDAC=1 (64-bit DMA ENABLED)` at rings-up, no 0x200 IOB RAS, `[net4m]` all-nonzero, and
+// the DHCP ACK lands -> `[dhcp]` lease.
+//
 // ## Write discipline
 //
 // The driver, being a driver, DOES the fabric writes NET-3 refused: it enables the device's
@@ -194,6 +224,13 @@ mod metal {
     const REG_RMS: u64 = 0xda;
     /// CPlusCmd: the C+ command register (enables the C+ descriptor-ring receive/transmit engine).
     const REG_CPLUSCMD: u64 = 0xe0;
+    /// CPlusCmd.PCIDAC (bit 4) — NET-4n: the C+ engine's ">4 GiB / 64-bit buffer-address" enable. With
+    /// it CLEAR the RX/TX DMA engine uses only `Desc.addr[31:0]` for the per-buffer *payload* transfer
+    /// (the ring bases go through the dedicated 64-bit RDSAR/TNPDS registers, so descriptor FETCH still
+    /// reaches a >4 GiB ring — which is why the ring stays coherent while the payloads vanish). The
+    /// historical `r8169` set exactly this bit whenever the 64-bit DMA mask was accepted
+    /// (`tp->cp_cmd |= PCIDAC; dev->features |= NETIF_F_HIGHDMA`). See `init_rings`.
+    const CPCMD_PCIDAC: u16 = 1 << 4;
     /// RDSAR: Receive Descriptor Start Address (64-bit; low @ 0xE4, high @ 0xE8). 256-byte aligned.
     const REG_RDSAR: u64 = 0xe4;
     /// MTPS: Max Transmit Packet Size (8-bit, units of 128 bytes).
@@ -683,6 +720,30 @@ mod metal {
             let cpc = self.r16(REG_CPLUSCMD);
             serial_println!("{}   CPlusCmd[{:#x}] = {:#06x} (C+ engine) ::", P4, REG_CPLUSCMD, cpc);
 
+            // NET-4n — enable 64-bit ( >4 GiB ) buffer-address DMA. THE unified-RX-defect fix. The
+            // driver already writes the FULL 40-bit buffer PA into every descriptor (`Desc.addr` is a
+            // u64, both dwords published — net4g confirmed [MATCH] on metal) and the ring bases into the
+            // dedicated 64-bit RDSAR/TNPDS. What was missing is telling the C+ engine to USE the high
+            // dword for the per-buffer *payload* write: with CPlusCmd.PCIDAC clear (boot-16 read back
+            // 0x2021, bit4=0) the engine drops `addr[63:32]` on payload TLPs, so a heap buffer at the
+            // Orin's high DMA-window (`ORIN-DMA-WINDOW` seats it at ~9.6 GiB, e.g. 0x2_683cb800)
+            // truncates to ~1.6 GiB — BELOW the inbound iATU window's 0x8000_0000 base (NET-4h) — and the
+            // RC slave-errors it to the fabric sink: the IOB `FillWrite` RAS at ADDR 0x200 + an untouched
+            // (alloc_zeroed) buffer. Descriptor FETCH is unaffected (RDSAR is a real 64-bit register), so
+            // the ring stays coherent while payloads vanish — the exact NET-4d/f/g/m asymmetry, and why
+            // only the first buffer the engine fills after RxEnb lands cleanly (address latched from the
+            // ring context) while the rest truncate/tear. Set PCIDAC so EVERY payload write carries the
+            // full 64-bit address — the r8169 `NETIF_F_HIGHDMA` path. Preserve all other bits (a genuine
+            // register write; announced). This is the brief's PREFERRED "silicon-is-64-bit-capable" fork
+            // (the RDSAR >4 GiB fetch proves it is); the sub-4 GiB DMA-arena fork is the fallback if a
+            // metal boot shows the truncation survives PCIDAC.
+            let cpc_dac = cpc | CPCMD_PCIDAC;
+            serial_println!(
+                "{}   >>> REG WRITE (NET-4n): CPlusCmd[{:#x}] {:#06x} -> {:#06x} (set PCIDAC — enable 64-bit >4GiB buffer DMA) ::",
+                P4, REG_CPLUSCMD, cpc, cpc_dac
+            );
+            self.w16(REG_CPLUSCMD, cpc_dac);
+
             // Allocate + program the descriptor rings (256-byte-aligned physical bases).
             self.alloc_rx();
             self.alloc_tx();
@@ -732,9 +793,14 @@ mod metal {
                 serial_println!("{}   TCR readback = {:#010x} — POISON (open bus / device stopped answering); ring bring-up FAILED ::", P4, tcr_rb);
                 return false;
             }
+            // NET-4n: confirm PCIDAC latched (a live 64-bit-DMA enable is the whole fix; a chip that
+            // silently dropped the write would keep truncating >4 GiB payloads on the next boot).
+            let cpc_rb = self.r16(REG_CPLUSCMD);
             serial_println!(
-                "{}   rings up: RX @ {:#x} ({} desc) TX @ {:#x} ({} desc); TCR readback {:#010x} (live) ::",
-                P4, rx_phys, NUM_RX, tx_phys, NUM_TX, tcr_rb
+                "{}   rings up: RX @ {:#x} ({} desc) TX @ {:#x} ({} desc); TCR readback {:#010x} (live); CPlusCmd {:#06x} PCIDAC={} (64-bit DMA {}) ::",
+                P4, rx_phys, NUM_RX, tx_phys, NUM_TX, tcr_rb,
+                cpc_rb, (cpc_rb >> 4) & 1,
+                if cpc_rb & CPCMD_PCIDAC != 0 { "ENABLED" } else { "NOT latched" }
             );
             true
         }

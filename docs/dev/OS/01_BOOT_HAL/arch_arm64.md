@@ -6655,3 +6655,42 @@ bounded, read-only, and keeps every prior witness:
 the descriptor semantics (format/stride — an in-file fix). **All-MATCH** proves the descriptors are
 correct and the payload-to-nowhere is a DMA-write reachability question (SMMU / inbound iATU) **below the
 NET-4 driver's lane** — a STOP-and-report boundary for a follow-up arc.
+
+### NET-4h → 4n — the inbound-DMA path, and the RX defect root-caused to 64-bit DMA left OFF (rtl8168_tegra.rs)
+
+The `[net4g]` boot returned **all-MATCH**, so the RX riddle became a DMA-write reachability question. The
+inbound path was built and armed, layer by layer, and finally root-caused **back inside the driver**:
+
+- **NET-4h** — the missing INBOUND iATU (`program_inbound_atu`). The M1-fix programmed only the OUTBOUND
+  region (CPU → NIC registers); an incoming bus-master write TLP needs an INBOUND region to reach DRAM.
+  Armed one identity region 0 covering all of RAM (`dram_window(ram_gib_mask)` → `[0x8000_0000,
+  0x2_8000_0000)`), BASE = TARGET = DRAM base. Metal: armed, readback confirmed — **the zeros survived.**
+- **NET-4i** — the SMMU stream below the iATU (`smmu_tegra::net4i_*`). Recon of PCIe-C0's stream (sid 0x9)
+  found **CLIENTPD=1 / USFCFG=0** on both MMU-500 instances — the SMMU is globally bypassing, the stream is
+  already untranslated. Nothing to arm; **the zeros survived** this too.
+- **ORIN-DMA-WINDOW** — the heap-guard now DERIVES the inbound window from the RC's `dma-ranges` and
+  constrains the heap into it (see §ORIN-RAS-2 → ORIN-DMA-WINDOW). This also moved the heap **high**
+  (~9.6 GiB) for good, exposing the defect the low-heap boots had masked.
+- **NET-4m** — the speculation-fenced buffer-DRAM probe (`[net4m]`, `UNAOS_NET4_RINGDUMP`). Boot-16 verdict:
+  `rx[1..4]` read the raw buffer DRAM **ZERO** with a real descriptor length → **writes-to-nowhere**, not a
+  cache artifact. The RC corroborated it: an **IOB `FillWrite` RAS, ADDR `0x8000000000000200`** (stripped
+  `0x200` = the fabric slave-error sink for an inbound write matching no inbound region).
+
+- **NET-4n — the fix.** With the inbound iATU armed identity over the true buffer PAs and the SMMU
+  bypassing, the addresses *reaching* them were wrong. Root cause **in this driver**: the C+ engine was
+  left in **32-bit payload-DMA mode** — `CPlusCmd.PCIDAC` (bit 4) clear (boot-16 read back `0x2021`). The
+  engine reaches the descriptor **ring** through the dedicated 64-bit `RDSAR`/`TNPDS` registers (so a
+  >4 GiB ring fetches + writes back fine — the ring stays coherent, the NET-4m asymmetry), but for the
+  per-buffer **payload** write it uses only `Desc.addr[31:0]`. With the heap seated high (buffers at
+  `0x2683cbXXX`, net4g `[MATCH]`) the payload address truncates to ~1.6 GiB, **below** the inbound iATU's
+  `0x8000_0000` base → no region matches → the `0x200` FillWrite RAS + a buffer that keeps its
+  `alloc_zeroed` zeros. Only the FIRST buffer filled after `RxEnb` lands cleanly (address latched from the
+  ring context); `rx[5]`'s "nonzero" is a torn hi/lo write, the same defect. **Fix:** set `CPlusCmd.PCIDAC`
+  in `init_rings` so every payload TLP carries the full 64-bit `Desc.addr` (the r8169 `NETIF_F_HIGHDMA`
+  path). This is the **preferred "silicon-is-64-bit-capable" fork** — the >4 GiB `RDSAR` fetch proves the
+  capability; the sub-4 GiB DMA-arena fork stays as the fallback if a metal boot shows truncation survive.
+
+**Expected boot-17 (metal-owed):** `rings up: … CPlusCmd 0x2031 PCIDAC=1 (64-bit DMA ENABLED)`, **no**
+`0x200` IOB `FillWrite` RAS, `[net4m]` all-**nonzero** across the ring, and the DHCP **ACK** lands → a
+`[dhcp]` lease instead of the `[static]` fallback. QEMU cannot exercise the tegra path; the gates prove
+non-regression only.
