@@ -6121,6 +6121,52 @@ Pi), with the panel blit as the visible witness. QEMU `raspi4b` still stops at B
 modelled), so this list is correct-by-construction against the cited Mesa sources and refined at the
 attended sitting.
 
+### PI-V3D-7 — CT1CA never left zero: the kick went to fabricated queue-register offsets
+
+**The boot-P3 verdict (2026-07-20, LC-metal R23s1).** With the correct Mesa-shaped RCL aboard
+(`EA=BA+0x16006a`), the M3 clue still read `CT1CS pre=0 kicked=0 done=0 CT0CS=0 CT1CA=0` with
+`MMU_CTL=0x00090801` and every fault bit `0`. PI-V3D-6's RCL is exonerated; the clue's **CLASS-B
+RAN-NO-FAULT** label was **wrong**. `CT1CA` stuck at `0` (never advanced, never `== BA`) together with
+`CTRUN` never observed in any snapshot means the render CLE **never started** — a CLASS-A "job never
+ran", not a job that ran and stored off-target.
+
+**Root cause of the kick failure — fabricated CT1 queue-register offsets.** Submitting a V3D render job
+is: write the list's begin address to `CT1QBA`, then write its end address to `CT1QEA`; the **`CT1QEA`
+write is the CLE's GO trigger** (kernel `v3d_gem`/`v3d_regs.h` submit path). The code had
+`CT1QBA = 0x324` and `CT1QEA = 0x334` — **neither is inside the CLE register block** (which runs
+`0x100`–`0x178`, ending at `CT1QCFG`). The verbatim `v3d_regs.h` slots are `CT0QBA 0x160` / `CT1QBA
+0x164` and `CT0QEA 0x168` / `CT1QEA 0x16c`. The GO write therefore landed on an undefined address; the
+real `CT1QEA` (`0x16c`) never fired, so CT1 never fetched — `CT1CA` stayed `0`, `CTRUN` never latched.
+Same **fabricated-register-offset** class as the PI-V3D-4 MMU-constant bug; `CT1CS 0x104` and `CT1CA
+0x114` were already correct. Fix: correct both queue offsets to the transcribed values (register
+offsets are hardware facts — safe to lift from the GPL-2.0-only header).
+
+**The discriminator fix (the mislabel).** The old "ran" test was `(cs_kicked & CTRUN) || CT1CA != BA`.
+A never-started CLE **also** satisfies `CT1CA != BA`, because its `CT1CA` reads `0` (≠ the non-zero
+`BA`) — a false positive that convicted PI-V3D-6's innocent RCL. Corrected truth table: the CLE ran
+**only** if `CTRUN` was ever observed set (in any of pre/kicked/done) **OR** `CT1CA` actually advanced
+*into* the list range `(BA, EA]` (not sitting at `0` or `BA`). CLASS-A (job never ran) = `CTRUN` never
+observed **AND** `CT1CA` never advanced from `0`/`BA`. CLASS-A is now tested before the `!idled`
+backstop (a never-started CLE also hits the backstop, but "never ran" is the more specific verdict).
+
+**Tighter kick witness.** The kick now samples `CT1CA` (not just `CT1CS`) at three points — before the
+kick (`ca_pre`), immediately after the GO write (`ca_kicked`), and after the poll (`ct1ca`) — with a
+`dsb` between the `QBA` and `QEA` writes so BA is latched before the GO fires. The clue line prints the
+full `CT1CS`/`CT1CA` pre/kicked/done triples plus a decoded `ran=` flag, so boot-P4 is decisive either
+way.
+
+**Expected boot-P4 lines (metal, BLOCK-UP).** With the GO write now reaching the real `CT1QEA`, the M3
+clue should show `CTRUN` latch in `kicked` and `CT1CA` advance off `0` into `(BA, EA]`, then either the
+verify passes or a *new* CLASS (MMU-FAULT / RAN-NO-FAULT) is reported against a CLE that actually ran:
+```
+:: V3D: M3 clue — CT1CS pre=0x… kicked=0x…20 done=0x… CT1CA pre=0x00000000 kicked=0x…(in (BA,EA]) done=0x… CT0CS=0x… (BA=…, EA=…) ran=1 — CLASS-… ::
+:: V3D: M3 clear-job PASS (GPU cleared buffer; CPU byte-verified) ::   (on success)
+```
+A repeat of `CT1CA=0 … ran=0 … CLASS-A` after this fix would mean the block is up but the queue-submit
+path itself is refused on this part (the "does V3D 4.2 need a non-CTnQ submit path" hypothesis) — but
+the submit path here matches exactly what the kernel v3d driver writes for render, so the corrected
+offsets are the expected resolution. QEMU `raspi4b` still stops at BLOCK-DOWN (no V3D modelled).
+
 ### References of record
 
 - Register layout: Linux `drivers/gpu/drm/v3d/v3d_regs.h` (hub + core + MMU offsets, field bits).

@@ -133,10 +133,17 @@ const V3D_CTL_IDENT2: usize = 0x0008;
 // CLE (control-list executor) — CT1 is the RENDER queue. Submitting a job = write the ring's start
 // address to CT1QBA and its end address to CT1QEA; the hardware runs [BA, EA).
 const V3D_CLE_CT0CS: usize = 0x0100; // CT0 (bin) control/status — witness only (render job uses CT1)
-const V3D_CLE_CT1CS: usize = 0x0104; // CT1 control/status (bit0 = CTRUN busy)
+const V3D_CLE_CT1CS: usize = 0x0104; // CT1 control/status (bit5 = CTRUN busy)
 const V3D_CLE_CT1CA: usize = 0x0114; // CT1 current address — the address the CLE is executing at
-const V3D_CLE_CT1QBA: usize = 0x0324; // CT1 queue begin address
-const V3D_CLE_CT1QEA: usize = 0x0334; // CT1 queue end address
+// PI-V3D-7 kick-path root cause: the CT1 queue-submit registers were at FABRICATED offsets. The
+// begin/end addresses were written to 0x324/0x334 — not even inside the CLE register block (which
+// ends at CT1QCFG 0x178). The verbatim v3d_regs.h queue slots are CT{0,1}QBA at 0x160/0x164 and
+// CT{0,1}QEA at 0x168/0x16c. Writing CT1QEA is the CLE's GO signal; sending it to 0x334 meant CT1's
+// real queue-end (0x16c) never fired, so the render CLE never started — CT1CA stuck at 0, CTRUN
+// never latched. That is precisely the boot-P3 "never-started" signature (same fabricated-offset
+// class as the PI-V3D-4 MMU-constant bug). Corrected to the transcribed offsets below.
+const V3D_CLE_CT1QBA: usize = 0x0164; // CT1 queue begin address (v3d_regs.h V3D_CLE_CT1QBA)
+const V3D_CLE_CT1QEA: usize = 0x016c; // CT1 queue end address (v3d_regs.h V3D_CLE_CT1QEA) — QEA write kicks
 const V3D_CLE_CT1CS_CTRUN: u32 = 1 << 5; // per v3d_regs.h V3D_CLE_CTRUN
 
 // ─── The V3D buffer arena. One page-aligned static in BSS. Because the bare-metal kernel is
@@ -587,12 +594,19 @@ fn clear_job(fb: Option<FbTarget>) -> bool {
     // so the post-kick reads have a baseline. CTRUN clearing could mean "finished" OR "never started";
     // only a before/after pair disambiguates.
     let cs_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT1CS);
+    let ca_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT1CA);
+    // Order matters: program the queue-BEGIN address first, then writing the queue-END address is the
+    // CLE's GO trigger (v3d_regs.h / the kernel v3d_gem submit path: CT1QBA then CT1QEA). With the
+    // offsets now correct, this QEA write is what actually starts CT1.
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT1QBA, ba as u32);
+    dsb(); // BA must be latched before the EA write triggers the fetch
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT1QEA, ea as u32);
-    dsb(); // ensure the queue-address writes reach the CLE before we sample its status
-    // Sample the status immediately after the kick — if CTRUN never latches here, the CLE never
-    // accepted the job (class A, "job never ran"); if it latches then clears, the list executed.
+    dsb(); // ensure the GO (QEA) write reaches the CLE before we sample its status
+    // Tight kick witness: sample CT1CS + CT1CA the instant after the GO write. A started CLE latches
+    // CTRUN here and CT1CA leaves 0/BA to walk the list; a never-started CLE shows CTRUN=0 and CT1CA
+    // unchanged from ca_pre. This pair is the boot-P4 discriminator's ground truth.
     let cs_kicked = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT1CS);
+    let ca_kicked = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT1CA);
 
     // Poll for CT1 idle (CTRUN clears when the list finishes) with a finite ~500 ms backstop.
     let idled = wait_bit_clear(V3D_CORE0_BASE, V3D_CLE_CT1CS, V3D_CLE_CT1CS_CTRUN, "CT1 render");
@@ -608,19 +622,28 @@ fn clear_job(fb: Option<FbTarget>) -> bool {
     let vio_id = mmio_read(V3D_HUB_BASE, V3D_MMU_VIO_ID);
     let mmu_fault = mmu_ctl
         & (V3D_MMU_CTL_PT_INVALID | V3D_MMU_CTL_WRITE_VIOLATION | V3D_MMU_CTL_CAP_EXCEEDED);
-    let ran = (cs_kicked & V3D_CLE_CT1CS_CTRUN != 0) || ct1ca != ba as u32;
+    // PI-V3D-7 discriminator fix. The old `ran` test used `ct1ca != BA` as proof of execution — but a
+    // CLE that NEVER STARTED also satisfies that, because its CT1CA reads 0 (≠ the non-zero BA). That
+    // false-positive mislabeled boot-P3's never-started CLE as CLASS-B RAN-NO-FAULT. Correct truth
+    // table: the CLE ran ONLY if we ever OBSERVED CTRUN set (in any of pre/kicked/done) OR CT1CA
+    // actually ADVANCED — i.e. it points INTO the list range (BA, EA] rather than sitting at 0 or BA.
+    // A never-started CLE has CTRUN never seen AND CT1CA at 0/BA → CLASS-A.
+    let ctrun_ever = (cs_pre | cs_kicked | cs_done) & V3D_CLE_CT1CS_CTRUN != 0;
+    let ct1ca_advanced =
+        ct1ca != 0 && ct1ca != ba as u32 && ct1ca >= ba as u32 && ct1ca <= ea as u32;
+    let ran = ctrun_ever || ct1ca_advanced;
     let class = if mmu_fault != 0 {
         "CLASS-B MMU-FAULT (store faulted in the V3D MMU — job wrote nowhere)"
-    } else if !idled {
-        "INDETERMINATE (CTRUN never cleared — backstop hit)"
     } else if !ran {
-        "CLASS-A JOB-NEVER-RAN (CTRUN never latched, CT1CA==BA — CLE did not execute the list)"
+        "CLASS-A JOB-NEVER-RAN (CTRUN never observed AND CT1CA never advanced from 0/BA — CLE did not start)"
+    } else if !idled {
+        "INDETERMINATE (CLE started but CTRUN never cleared — backstop hit)"
     } else {
         "CLASS-B RAN-NO-FAULT (CLE executed with no MMU fault — store landed off-target: RCL encoding)"
     };
     serial_println!(
-        ":: V3D: M3 clue — CT1CS pre={:#010x} kicked={:#010x} done={:#010x} CT0CS={:#010x} CT1CA={:#010x} (BA={:#010x} EA={:#010x}) — {} ::",
-        cs_pre, cs_kicked, cs_done, ct0cs, ct1ca, ba as u32, ea as u32, class
+        ":: V3D: M3 clue — CT1CS pre={:#010x} kicked={:#010x} done={:#010x} CT1CA pre={:#010x} kicked={:#010x} done={:#010x} CT0CS={:#010x} (BA={:#010x} EA={:#010x}) ran={} — {} ::",
+        cs_pre, cs_kicked, cs_done, ca_pre, ca_kicked, ct1ca, ct0cs, ba as u32, ea as u32, ran as u32, class
     );
     serial_println!(
         ":: V3D: M3 clue — MMU_CTL={:#010x} (PT_INVALID={} WRITE_VIOLATION={} CAP_EXCEEDED={}) VIO_ADDR={:#010x} VIO_ID={:#010x} ::",
