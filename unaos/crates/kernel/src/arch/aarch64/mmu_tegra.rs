@@ -798,6 +798,37 @@ pub fn a78ae_errata_probe() {
     // on the proven-stale EC=0 signature).
 }
 
+// ── NET-4o — the sub-4GiB NIC DMA arena ─────────────────────────────────────────────────────────────
+// The RTL8168 C+ engine's PCIDAC bit will NOT latch on this Orin's NIC variant (boot-18, decisive), so
+// its per-buffer PAYLOAD DMA is 32-bit only (`Desc.addr[31:0]`): every NIC-touched allocation — RX/TX
+// descriptor rings AND buffers — must live BELOW 4 GiB, yet at/above the inbound iATU base 0x8000_0000
+// (NET-4h) so the fabric's inbound window still covers it. The kernel heap stays HIGH (ORIN-DMA-WINDOW);
+// this is a SEPARATE, tiny carveout seated by `select_heap_region` from the SAME carveout scan + inbound-
+// DMA-window derivation, then handed to the net lane's OWN bump allocator (`rtl8168_tegra`). The shared
+// global allocator is untouched. `(0, 0)` = not seated (non-metal / no derivable window / no clean span).
+#[cfg(feature = "tegra")]
+const NET4O_ARENA_LO: u64 = 0x8000_0000; // 2 GiB — DRAM base & the inbound iATU base (NET-4h)
+#[cfg(feature = "tegra")]
+const NET4O_ARENA_HI: u64 = 0x1_0000_0000; // 4 GiB — the 32-bit-DMA truncation ceiling PCIDAC can't clear
+#[cfg(feature = "tegra")]
+const NET4O_ARENA_BYTES: u64 = 256 * 1024; // rings + 32×2K RX + 8×2K TX ≈ 88 KiB used; generous headroom
+#[cfg(feature = "tegra")]
+static NET4O_ARENA_BASE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+#[cfg(feature = "tegra")]
+static NET4O_ARENA_SIZE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// NET-4o — the sub-4GiB NIC DMA arena `[base, base+size)` seated by [`select_heap_region`] from the
+/// same carveout set + inbound-DMA-window derivation that seats the heap. `None` until seated (and if no
+/// carveout-clean span inside the inbound window exists in `[0x8000_0000, 0x1_0000_0000)`). Read by the
+/// RTL8168 driver's DMA bump allocator; it is identity-mapped Normal-WB RAM, so `base` doubles as the PA
+/// the NIC DMAs against — and being < 4 GiB, a 32-bit payload address reaches it un-truncated.
+#[cfg(feature = "tegra")]
+pub fn net4_dma_arena() -> Option<(usize, usize)> {
+    let base = NET4O_ARENA_BASE.load(core::sync::atomic::Ordering::Relaxed);
+    let size = NET4O_ARENA_SIZE.load(core::sync::atomic::Ordering::Relaxed);
+    (base != 0 && size != 0).then_some((base, size))
+}
+
 /// ORIN-VUG-RAS — carveout-aware kernel-heap placement for the Orin (tegra). NVIDIA's UEFI reports
 /// several firewall-protected DRAM carveouts (TZ, BPMP, DCE, ...) as ordinary Conventional (Usable)
 /// memory, so the naive "first Usable region ≥ HEAP_SIZE" pick (`arch::memory::init`) can back the
@@ -928,6 +959,45 @@ pub fn select_heap_region(
         }
     };
 
+    // NET-4o — the LOWEST carveout-clean page-aligned base for an `abytes`-byte span inside `[lo, hi)`,
+    // also avoiding the just-chosen heap span `[hx_lo, hx_hi)`. Scans UP from `lo`, jumping strictly above
+    // the greatest carveout/heap END that overlaps each candidate (O(carveouts), terminating — each jump
+    // strictly increases `s`). Seats the NIC DMA arena LOW while the heap takes the highest clean base, so
+    // they sit at opposite ends of the window; excluding the heap span makes the no-overlap guarantee hold
+    // by construction rather than by distance.
+    let lowest_clean_in = |lo: u64, hi: u64, abytes: u64, hx_lo: u64, hx_hi: u64| -> Option<u64> {
+        if hi < abytes || hi - abytes < lo {
+            return None; // range can't hold the arena
+        }
+        let mut s = (lo + PAGE - 1) & !(PAGE - 1);
+        loop {
+            if s + abytes > hi {
+                return None;
+            }
+            let e = s + abytes;
+            let mut jump: Option<u64> = None;
+            for &(cb, cs) in carveouts {
+                let ce = cb.wrapping_add(cs);
+                if cs != 0 && s < ce && cb < e {
+                    jump = Some(jump.map_or(ce, |j| j.max(ce)));
+                }
+            }
+            if hx_hi > hx_lo && s < hx_hi && hx_lo < e {
+                jump = Some(jump.map_or(hx_hi, |j| j.max(hx_hi)));
+            }
+            match jump {
+                None => return Some(s),
+                Some(ce) => {
+                    let next = (ce + PAGE - 1) & !(PAGE - 1);
+                    if next <= s {
+                        return None; // no upward progress (guard; shouldn't happen)
+                    }
+                    s = next;
+                }
+            }
+        }
+    };
+
     // best_uncon: highest clean base across ALL usable regions (the RAS-2 heuristic — the fallback and
     // the "what we'd have picked" diagnostic). best_in_win: the highest clean base that ALSO lies
     // fully inside a derived inbound window (the intersection of each usable region with each window).
@@ -992,6 +1062,44 @@ pub fn select_heap_region(
             nc
         );
         publish_above_heap_top(s);
+
+        // NET-4o — seat the sub-4GiB NIC DMA arena from the SAME carveout set + inbound window(s). The
+        // NIC's payload DMA is 32-bit (PCIDAC won't latch), so its rings+buffers must live below 4 GiB
+        // yet at/above the 0x8000_0000 inbound base: the LOWEST clean span in
+        // `[0x8000_0000, 0x1_0000_0000)` ∩ a derived window, excluding the (HIGH) heap span `[s, s+need)`.
+        // Only the derived-window path seats it — the degrade path is QEMU/foreign DTB and never runs on
+        // metal, where the arena is the whole point.
+        let mut arena: Option<u64> = None;
+        for &(wb, ws) in windows {
+            let lo = NET4O_ARENA_LO.max(wb);
+            let hi = NET4O_ARENA_HI.min(wb.wrapping_add(ws));
+            if hi <= lo {
+                continue;
+            }
+            if let Some(ab) = lowest_clean_in(lo, hi, NET4O_ARENA_BYTES, s, s + need) {
+                arena = Some(arena.map_or(ab, |b| b.min(ab)));
+            }
+        }
+        match arena {
+            Some(ab) => {
+                NET4O_ARENA_BASE.store(ab as usize, core::sync::atomic::Ordering::Relaxed);
+                NET4O_ARENA_SIZE.store(NET4O_ARENA_BYTES as usize, core::sync::atomic::Ordering::Relaxed);
+                serial_println!(
+                    ":: tegra: NET-4o — NIC DMA arena [{:#x}, {:#x}) ({} KiB) seated sub-4GiB, inside the derived inbound-DMA window(s), clear of {} carveout(s) + the kernel heap — the 32-bit-DMA NIC surface (PCIDAC will not latch) ::",
+                    ab,
+                    ab + NET4O_ARENA_BYTES,
+                    NET4O_ARENA_BYTES >> 10,
+                    nc
+                );
+            }
+            None => serial_println!(
+                ":: tegra: NET-4o — WARN: no {} KiB carveout-clean span in [{:#x}, {:#x}) inside the derived inbound-DMA window(s); NIC DMA arena UNSEATED (RTL8168 bring-up fails closed rather than truncate >4GiB payloads) ::",
+                NET4O_ARENA_BYTES >> 10,
+                NET4O_ARENA_LO,
+                NET4O_ARENA_HI
+            ),
+        }
+
         return Some((s as usize, need as usize));
     }
 

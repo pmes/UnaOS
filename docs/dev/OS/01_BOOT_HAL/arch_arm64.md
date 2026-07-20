@@ -6717,5 +6717,41 @@ non-regression only.
   **no** `0x200` IOB `FillWrite` RAS, `[net4m]` all-**nonzero**, and the DHCP **ACK** → a `[dhcp]` lease.
   The decisive negative branch: if the readback stays `0x2031`→`0x2021` after the final write under unlock,
   the loud `!! NET-4n2: PCIDAC WILL NOT LATCH …` line proves the C+ 64-bit-DAC path unusable on this
-  silicon and hands off to the **sub-4 GiB DMA-arena** fallback (a separate arc — touches heap/arena
-  placement, not started here). QEMU cannot exercise the tegra path; the gates prove non-regression only.
+  silicon and hands off to the **sub-4 GiB DMA-arena** fork — **now landed as NET-4o (below)**. QEMU
+  cannot exercise the tegra path; the gates prove non-regression only.
+
+- **NET-4o — PCIDAC won't latch (boot-18 settled it): give the NIC a sub-4 GiB DMA arena.** Boot-18 fired
+  the decisive negative: `!! NET-4n2: PCIDAC WILL NOT LATCH … C+ 64-bit-DAC path unusable on this silicon`,
+  `[net4m] rx[1..5] nonzero=false`, `NET: no lease`. The C+ engine's `PCIDAC` bit does not hold on this
+  RTL8168 variant even as the final `CPlusCmd` write under `9346` unlock, so the **per-buffer payload DMA is
+  32-bit only** (`Desc.addr[31:0]`) — while `ORIN-DMA-WINDOW` seats the heap **high** (~9.6 GiB), so a heap
+  buffer PA truncates below the inbound iATU base `0x8000_0000` → the `0x200` `FillWrite` slave-error + zero
+  payloads. Placement below 4 GiB is the last lever, and it is what NET-4o pulls.
+
+  **The arena.** The valid window is **`[0x8000_0000, 0x1_0000_0000)`** — simultaneously `< 4 GiB` (a 32-bit
+  payload address reaches it) and `>= 0x8000_0000` (inside the NET-4h inbound iATU identity window). A tiny
+  (256 KiB) carveout-clean span there holds the **entire** NIC DMA surface: RX descriptor ring, 32×2 KiB RX
+  buffers, TX descriptor ring, 8×2 KiB TX buffers (≈88 KiB used). The kernel heap stays HIGH (ORIN-DMA-
+  WINDOW); this is a **separate small arena**, not a heap move.
+
+  **Where it's seated (the lane call — self-contained tegra/net lane, NO shared-allocator change).**
+  `mmu_tegra::select_heap_region` (a `tegra`-gated jetson-lane file) already scans the UEFI-reserved + DTB
+  `/reserved-memory` carveouts and derives the PCIe inbound-DMA window(s) from `dma-ranges`. NET-4o extends
+  that **same** scan: in the derived-window success path it also seats the **LOWEST** carveout-clean 256 KiB
+  span inside `[0x8000_0000, 0x1_0000_0000)` ∩ a derived window, **excluding the (high) heap span** so the
+  two never collide by construction, and publishes `(base, size)` via `net4_dma_arena()`. The RTL8168 driver
+  reads that and bump-allocates rings + buffers from it through its **own** `DmaArena` (a base+cursor bump
+  pointer in `rtl8168_tegra.rs`) — the shared global allocator is **untouched**. Identity-mapped Normal-WB
+  RAM ⇒ `base` doubles as the PA, and the existing NET-4f cache maintenance (per-pop `dc ivac`) still
+  applies unchanged. If no clean low span exists, `mmu_tegra` witnesses `NET-4o — WARN … UNSEATED` and the
+  driver **fails closed** (`!! NET-4o: no sub-4GiB DMA arena seated … REFUSING ring alloc`) rather than
+  re-arm the truncation. The `PCIDAC`/`[net4m]`/RINGDUMP instrumentation is kept; `PCIDAC=0` at rings-up is
+  now the **expected, correct** reading (32-bit payload DMA into the sub-4 GiB arena is sufficient).
+
+  **Expected boot-19 (metal-owed):** at heap-guard, `:: tegra: NET-4o — NIC DMA arena [0x8…, …) (256 KiB)
+  seated sub-4GiB …`; at ring bring-up, `:: PCIE4: NET-4o — NIC DMA arena [0x8…,0x8…) (256 KiB) sub-4GiB,
+  inside iATU window ::` with the ring/buffer PAs now in `[0x8000_0000, 0x1_0000_0000)`; **no** `0x200` IOB
+  `FillWrite` RAS; `[net4m]` **all nonzero** (the ACK lands in a reachable buffer); and the DHCP **lease**
+  (`NET: DHCP lease …` / `[dhcp]`). QEMU cannot exercise the tegra path; the gates prove non-regression only
+  (default `check` + `UNAOS_NET4=1 UNAOS_TEGRA=1` `check`, default `test-arm`, and the `UNAOS_VNET` seam
+  regression — vnet lease + the NET-4j reproducer stay PASS).

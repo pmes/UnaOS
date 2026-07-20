@@ -186,9 +186,8 @@ mod metal {
     use super::P4;
     use crate::arch::aarch64::cache;
     use crate::arch::aarch64::fdt_tegra::Fdt;
-    use crate::arch::aarch64::mmu_tegra::{map_mmio_window, MmioMap};
+    use crate::arch::aarch64::mmu_tegra::{map_mmio_window, net4_dma_arena, MmioMap};
     use crate::net_phy::{fmt_mac, RawNic, SmoltcpPhy};
-    use core::alloc::Layout;
     use core::ptr::{read_volatile, write_volatile};
 
     /// The Realtek vendor id and the RTL8168/8111 device id the NET-3 metal enumeration found.
@@ -560,12 +559,60 @@ mod metal {
     /// Downstream device config base = ECAM base + bus1:dev0:fn0 offset (`bus<<20 | dev<<15 | fn<<12`).
     const BUS1_DEV0_FN0: u64 = 1 << 20;
 
+    /// NET-4o — a dead-simple bump allocator over the sub-4GiB NIC DMA arena `mmu_tegra` seated
+    /// (identity-mapped Normal-WB RAM in `[0x8000_0000, 0x1_0000_0000)`, carveout-clean, inside the
+    /// inbound iATU window). The C+ engine's per-buffer payload DMA is 32-bit only on this silicon
+    /// (PCIDAC won't latch, boot-18), so EVERY DMA-touched allocation — rings + buffers — comes from
+    /// here: below the 4 GiB truncation ceiling yet at/above the 0x8000_0000 inbound base. Never freed
+    /// (bring-up lifetime); no global-allocator involvement. `base` doubles as the PA (identity map).
+    struct DmaArena {
+        base: usize,
+        size: usize,
+        cursor: usize,
+    }
+
+    impl DmaArena {
+        /// Read the arena `mmu_tegra::select_heap_region` seated; unseated → an empty arena that fails
+        /// every allocation closed (the driver then refuses ring bring-up rather than truncate).
+        fn from_mmu() -> Self {
+            match net4_dma_arena() {
+                Some((base, size)) => Self { base, size, cursor: 0 },
+                None => Self { base: 0, size: 0, cursor: 0 },
+            }
+        }
+        /// `(base, size)` iff the arena is seated.
+        fn bounds(&self) -> Option<(u64, usize)> {
+            (self.base != 0 && self.size != 0).then_some((self.base as u64, self.size))
+        }
+        /// Bump `bytes` (aligned to `align`), zero them, and return the pointer — or `None` if the arena
+        /// is unseated or exhausted (fail-closed). Zeroing matches the old `alloc_zeroed` contract the
+        /// ring/descriptor setup relies on (TX `addr=0`, empty-ring OWN-clear). The returned span is
+        /// identity-mapped RAM, so the pointer IS the DMA physical address.
+        fn alloc_zeroed(&mut self, bytes: usize, align: usize) -> Option<*mut u8> {
+            if self.base == 0 || self.size == 0 {
+                return None;
+            }
+            let start = (self.base + self.cursor).checked_add(align - 1)? & !(align - 1);
+            let end = start.checked_add(bytes)?;
+            if end > self.base + self.size {
+                return None; // arena exhausted
+            }
+            self.cursor = end - self.base;
+            let p = start as *mut u8;
+            unsafe { core::ptr::write_bytes(p, 0, bytes) };
+            Some(p)
+        }
+    }
+
     /// The claimed NIC: its register-BAR MMIO base, the station MAC, and the C+ RX/TX descriptor
-    /// rings + DMA buffers. The rings are allocated from the kernel heap (identity map ⇒ the pointer
-    /// doubles as the physical address the NIC DMAs against, exactly like the x86 e1000 driver).
+    /// rings + DMA buffers. NET-4o: rings + buffers are bump-allocated from the sub-4GiB DMA arena
+    /// (`self.arena`), NOT the high kernel heap — the identity map ⇒ the pointer doubles as the physical
+    /// address the NIC DMAs against, and being < 4 GiB a 32-bit payload address reaches it un-truncated.
     pub struct Rtl8168 {
         mmio_base: u64,
         mac: [u8; 6],
+        /// NET-4o: the sub-4GiB DMA arena the rings + buffers below are bump-allocated from.
+        arena: DmaArena,
         rx_ring: *mut Desc,
         rx_buffers: *mut u8,
         rx_cur: usize,
@@ -673,16 +720,24 @@ mod metal {
             mac
         }
 
-        /// Allocate the RX descriptor ring (256-byte aligned) + contiguous packet buffers, and point
-        /// each descriptor at its buffer with OWN set (ready for the NIC to fill) and the buffer size
-        /// in the length field. The `alloc_zeroed` pointer doubles as the physical address (identity
-        /// map), matching the x86 e1000 ring allocation. EOR marks the last descriptor.
-        fn alloc_rx(&mut self) {
-            let ring_layout = Layout::from_size_align(NUM_RX * core::mem::size_of::<Desc>(), 256).unwrap();
-            let buf_layout = Layout::from_size_align(NUM_RX * RX_BUF_SIZE, 4096).unwrap();
-            self.rx_ring = unsafe { alloc::alloc::alloc_zeroed(ring_layout) as *mut Desc };
-            self.rx_buffers = unsafe { alloc::alloc::alloc_zeroed(buf_layout) };
-            // NET-4f: the buffer arena is `alloc_zeroed` → DIRTY zero lines resident in the D-cache.
+        /// Allocate the RX descriptor ring (256-byte aligned) + contiguous packet buffers FROM THE
+        /// SUB-4GiB DMA ARENA (NET-4o), and point each descriptor at its buffer with OWN set (ready for
+        /// the NIC to fill) and the buffer size in the length field. The arena pointer doubles as the
+        /// physical address (identity map) AND is < 4 GiB, so the C+ engine's 32-bit payload write
+        /// reaches it un-truncated. EOR marks the last descriptor. Returns false if the arena is unseated
+        /// or exhausted (the caller fails closed rather than truncate a high-heap address).
+        fn alloc_rx(&mut self) -> bool {
+            let ring = match self.arena.alloc_zeroed(NUM_RX * core::mem::size_of::<Desc>(), 256) {
+                Some(p) => p as *mut Desc,
+                None => return false,
+            };
+            let bufs = match self.arena.alloc_zeroed(NUM_RX * RX_BUF_SIZE, 4096) {
+                Some(p) => p,
+                None => return false,
+            };
+            self.rx_ring = ring;
+            self.rx_buffers = bufs;
+            // NET-4f: the buffer arena is zeroed on alloc → DIRTY zero lines resident in the D-cache.
             // Invalidate the whole arena BEFORE any descriptor is armed, so (a) those dirty zeros can
             // never be written back over the NIC's DMA payload and (b) no stale line lingers to be hit
             // instead of the NIC's DRAM write. `dc ivac` (invalidate, not clean) is required — a clean
@@ -699,20 +754,29 @@ mod metal {
                 };
                 unsafe { write_volatile(self.rx_ring.add(i), d) };
             }
+            true
         }
 
-        /// Allocate the TX descriptor ring (256-byte aligned) + frame buffers. Descriptors start
-        /// host-owned (OWN clear) so `transmit` can post into them; EOR marks the last descriptor.
-        fn alloc_tx(&mut self) {
-            let ring_layout = Layout::from_size_align(NUM_TX * core::mem::size_of::<Desc>(), 256).unwrap();
-            let buf_layout = Layout::from_size_align(NUM_TX * TX_BUF_SIZE, 4096).unwrap();
-            self.tx_ring = unsafe { alloc::alloc::alloc_zeroed(ring_layout) as *mut Desc };
-            self.tx_buffers = unsafe { alloc::alloc::alloc_zeroed(buf_layout) };
+        /// Allocate the TX descriptor ring (256-byte aligned) + frame buffers FROM THE SUB-4GiB DMA
+        /// ARENA (NET-4o). Descriptors start host-owned (OWN clear) so `transmit` can post into them; EOR
+        /// marks the last descriptor. Returns false if the arena is unseated or exhausted.
+        fn alloc_tx(&mut self) -> bool {
+            let ring = match self.arena.alloc_zeroed(NUM_TX * core::mem::size_of::<Desc>(), 256) {
+                Some(p) => p as *mut Desc,
+                None => return false,
+            };
+            let bufs = match self.arena.alloc_zeroed(NUM_TX * TX_BUF_SIZE, 4096) {
+                Some(p) => p,
+                None => return false,
+            };
+            self.tx_ring = ring;
+            self.tx_buffers = bufs;
             for i in 0..NUM_TX {
                 let eor = if i == NUM_TX - 1 { DESC_EOR } else { 0 };
                 let d = Desc { opts1: eor, opts2: 0, addr: 0 };
                 unsafe { write_volatile(self.tx_ring.add(i), d) };
             }
+            true
         }
 
         /// Bring up the C+ descriptor-ring engine after the M1 soft reset: unlock the config
@@ -760,9 +824,33 @@ mod metal {
             );
             self.w16(REG_CPLUSCMD, cpc_dac);
 
-            // Allocate + program the descriptor rings (256-byte-aligned physical bases).
-            self.alloc_rx();
-            self.alloc_tx();
+            // NET-4o — the NIC DMA surface (rings + buffers) comes from the sub-4GiB arena, NOT the high
+            // heap. PCIDAC will not latch on this silicon (boot-18), so the C+ payload write is 32-bit:
+            // every buffer PA must be < 4 GiB yet >= the inbound iATU base 0x8000_0000. `mmu_tegra` seated
+            // an arena satisfying both from the same carveout scan that seats the heap; witness it, and
+            // fail closed if it is unseated (refuse rather than re-arm the boot-16 writes-to-nowhere).
+            match self.arena.bounds() {
+                Some((lo, sz)) => serial_println!(
+                    "{} NET-4o — NIC DMA arena [{:#x},{:#x}) ({} KiB) sub-4GiB, inside iATU window ::",
+                    P4, lo, lo + sz as u64, sz >> 10
+                ),
+                None => {
+                    serial_println!(
+                        "{}   !! NET-4o: no sub-4GiB DMA arena seated (mmu_tegra HEAP-GUARD found no clean low span) — REFUSING ring alloc rather than truncate a >4GiB payload address (the boot-16 writes-to-nowhere class) ::",
+                        P4
+                    );
+                    return false;
+                }
+            }
+
+            // Allocate + program the descriptor rings (256-byte-aligned physical bases) from the arena.
+            if !self.alloc_rx() || !self.alloc_tx() {
+                serial_println!(
+                    "{}   !! NET-4o: DMA arena exhausted during ring/buffer alloc — REFUSING (arena too small for the NIC surface) ::",
+                    P4
+                );
+                return false;
+            }
             let rx_phys = self.rx_ring as u64;
             let tx_phys = self.tx_ring as u64;
             serial_println!("{}   >>> REG WRITE (M2): RDSAR[{:#x}] = {:#x} (RX ring, {} desc) ::", P4, REG_RDSAR, rx_phys, NUM_RX);
@@ -829,10 +917,13 @@ mod metal {
                 );
             }
             if !latched {
-                // Decisive negative: PCIDAC will not hold even as the final write under 9346 unlock. The
-                // C+ DAC path is unusable on this silicon → the sub-4 GiB DMA-arena fallback (separate arc).
+                // Established negative (boot-18, decisive): PCIDAC does not hold even as the final write
+                // under 9346 unlock — the C+ 64-bit-DAC path is unusable on this silicon. This is now the
+                // EXPECTED reading, not a failure: NET-4o seats the ENTIRE NIC DMA surface in the sub-4GiB
+                // arena, so a 32-bit payload address (PCIDAC clear) reaches every buffer un-truncated. The
+                // readback is kept as the standing oracle that this remains the silicon's behavior.
                 serial_println!(
-                    "{}   !! NET-4n2: PCIDAC WILL NOT LATCH (CPlusCmd stays {:#06x} after the final write under 9346 unlock) — C+ 64-bit-DAC path unusable on this silicon; fallback = sub-4GiB DMA arena ::",
+                    "{}   !! NET-4n2: PCIDAC WILL NOT LATCH (CPlusCmd stays {:#06x} after the final write under 9346 unlock) — C+ 64-bit-DAC path unusable on this silicon; EXPECTED — NET-4o's sub-4GiB DMA arena makes 32-bit payload DMA sufficient ::",
                     P4, cpc_final
                 );
             }
@@ -2035,6 +2126,8 @@ mod metal {
         let mut nic = Rtl8168 {
             mmio_base: cpu_addr,
             mac: [0; 6],
+            // NET-4o: the sub-4GiB DMA arena mmu_tegra seated (rings + buffers bump-allocate from it).
+            arena: DmaArena::from_mmu(),
             rx_ring: core::ptr::null_mut(),
             rx_buffers: core::ptr::null_mut(),
             rx_cur: 0,
