@@ -6525,3 +6525,10 @@ knob-off `./arroyo kernel8-test 35` = 0 FAIL (CAPSTONE 6/6 — functionally byte
 out); the `./arroyo kernel8-install` live witness = in-kernel PASS + host-side `HOST-VERIFY: PASS`;
 `./arroyo test-arm 22`, `UNAOS_GICV3=1 ./arroyo test-arm 40`, `./arroyo test 22`, and the `UNAOS_INSTALLDEMO`
 engine witness all unregressed. Landing: `review/unaos-install-pi-LANDING.md`.
+
+### XCARVE-4 (shared xhci, landed via hw-jetson f81124c3) — scratchpad PAGESIZE clamp
+The shared `xhci::init_pointers` scratchpad block derived `page_bytes` from the raw PAGESIZE
+lowest-set-bit; a garbage readback (Tegra234 no-HCRST takeover) demanded an 8 MiB-aligned
+allocation that overshot the heap into firewalled DRAM. Fix: clamp to the spec-sane 4–32 KiB
+bits (xHCI 5.4.3 mandatory 4 KiB fallback), null/heap-bounds guard, heap-PA witness. No
+behavior change on healthy controllers (Pi VL805 reads bit 0 set → 4 KiB, unchanged).

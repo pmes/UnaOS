@@ -2172,25 +2172,47 @@ impl XhciController {
                 // PAGESIZE (op_base + 0x08): bit n set => the controller supports 2^(n+12)-byte
                 // pages; the scratchpad buffers must be that size and aligned. Use the smallest
                 // supported page size (lowest set bit).
+                // XCARVE-4: trust only the spec-sane low bits (4K/8K/16K/32K). An inherited
+                // controller taken over without HCRST (Tegra234 JB9G) can read back PAGESIZE with
+                // the mandatory 4 KiB bit CLEAR and garbage high bits — the raw lowest-set-bit
+                // math then demands an 8 MiB-aligned allocation whose placement overshoots the
+                // heap into firewalled carveout DRAM (the boots-13..22 SNOC RAS / sync-fault
+                // writer). Spec 5.4.3 makes 4 KiB mandatory, so garbage => 4 KiB fallback.
                 let pagesize = core::ptr::read_volatile((self.op_base + 0x08) as *const u32) & 0xFFFF;
-                let page_bytes = 1usize << (pagesize.trailing_zeros() + 12);
+                let sane = pagesize & 0x000F;
+                let page_bytes: usize =
+                    if sane == 0 { 0x1000 } else { 1usize << (sane.trailing_zeros() + 12) };
 
                 // The Scratchpad Buffer Array: one u64 physical pointer per buffer, page-aligned.
                 let arr_layout =
                     core::alloc::Layout::from_size_align(max_scratchpad * 8, page_bytes).unwrap();
                 let arr = alloc::alloc::alloc_zeroed(arr_layout) as *mut u64;
-                for i in 0..max_scratchpad {
-                    let buf_layout =
-                        core::alloc::Layout::from_size_align(page_bytes, page_bytes).unwrap();
-                    let buf = alloc::alloc::alloc_zeroed(buf_layout);
-                    // Identity-mapped heap: the allocation's virtual address IS its bus/phys address.
-                    *arr.add(i) = buf as u64;
+                let (heap_lo, heap_hi) = crate::allocator::heap_bounds();
+                if arr.is_null()
+                    || (arr as usize) < heap_lo
+                    || (arr as usize) + max_scratchpad * 8 > heap_hi
+                {
+                    serial_println!(
+                        "xHCI: scratchpad: array alloc unusable (arr={:#x} page_bytes={:#x} heap=[{:#x},{:#x})); skipping",
+                        arr as u64, page_bytes, heap_lo, heap_hi
+                    );
+                } else {
+                    for i in 0..max_scratchpad {
+                        let buf_layout =
+                            core::alloc::Layout::from_size_align(page_bytes, page_bytes).unwrap();
+                        let buf = alloc::alloc::alloc_zeroed(buf_layout);
+                        if buf.is_null() {
+                            break;
+                        }
+                        // Identity-mapped heap: the allocation's virtual address IS its bus/phys address.
+                        *arr.add(i) = buf as u64;
+                    }
+                    *dcbaap_ptr.add(0) = arr as u64;
+                    serial_println!(
+                        "xHCI: scratchpad: {} buffer(s) x {} bytes; DCBAA[0]={:#x} (heap PA in [{:#x},{:#x}))",
+                        max_scratchpad, page_bytes, arr as u64, heap_lo, heap_hi
+                    );
                 }
-                *dcbaap_ptr.add(0) = arr as u64;
-                serial_println!(
-                    "xHCI: scratchpad: {} buffer(s) x {} bytes; DCBAA[0]={:#x}",
-                    max_scratchpad, page_bytes, arr as u64
-                );
             } else {
                 serial_println!("xHCI: scratchpad: controller requests 0 buffers (none needed).");
             }
