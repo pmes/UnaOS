@@ -188,6 +188,12 @@ mod metal {
     const TOTAL_DESC: usize = 256;
     /// Per-descriptor size: length_status + address_lo + address_hi = 3 words.
     const DMA_DESC_SIZE: u64 = 12;
+    /// Per-descriptor WORD count (the START/END_ADDR ring registers count in 32-bit WORDS, NOT bytes —
+    /// Linux `end_ptr * words_per_bd - 1`, `words_per_bd = 3` for the 40-bit v5 descriptor). Programming
+    /// END_ADDR in bytes (12/desc) instead of words (3/desc) sizes the HW ring region 4× too large, so
+    /// the engine's read/write pointer never wraps at the last valid descriptor — it walks off into the
+    /// uninitialised tail of the shared 256-descriptor array and stalls. This is the PI-GENET-3 wrap bug.
+    const DMA_DESC_WORDS: u32 = (DMA_DESC_SIZE / 4) as u32; // 3
     /// The default descriptor-based ring index used by the single-queue path (`DESC_INDEX`).
     const RING: usize = 16;
     /// Per-ring register-block stride.
@@ -206,7 +212,6 @@ mod metal {
     const DMA_BUFLENGTH_SHIFT: u32 = 16;
     const DMA_EOP: u32 = 0x4000;
     const DMA_SOP: u32 = 0x2000;
-    const DMA_WRAP: u32 = 0x1000;
     const DMA_TX_APPEND_CRC: u32 = 0x0040;
     const DMA_TX_QTAG_SHIFT: u32 = 7;
     const DMA_TX_QTAG_MASK: u32 = 0x3f;
@@ -492,10 +497,51 @@ mod metal {
         fn tx_evidence(&self, label: &str) {
             let prod = self.r(self.tdma_ring(RING_TDMA_PROD_INDEX)) & DMA_INDEX_MASK;
             let cons = self.r(self.tdma_ring(RING_TDMA_CONS_INDEX)) & DMA_INDEX_MASK;
+            // A cons_index that has advanced past RING_DEPTH is the direct witness that the TDMA ring
+            // WRAPPED (the PI-GENET-3 fix): boot-P3 caught it frozen at exactly RING_DEPTH.
+            let wrapped = cons > RING_DEPTH as u32;
             serial_println!(
-                "{}   TX evidence [{}]: sw frames-enqueued={} (tx_prod={}) | HW TDMA prod_index={} cons_index={} {} ::",
+                "{}   TX evidence [{}]: sw frames-enqueued={} (tx_prod={}) | HW TDMA prod_index={} cons_index={} {}{} ::",
                 PG, label, self.tx_count, self.tx_prod, prod, cons,
-                if cons == prod { "(drained; no storm)" } else { "(in-flight or stalled)" }
+                if cons == prod { "(drained; no storm)" } else { "(in-flight or stalled)" },
+                if wrapped { " [ring WRAPPED past depth]" } else if cons == RING_DEPTH as u32 { " [STALLED at ring depth — no wrap]" } else { "" }
+            );
+        }
+
+        /// RX evidence (the OFFER-never-popped / RX-wrap class, PI-GENET-3): our software consumer cursor
+        /// and popped-frame count against the hardware RDMA producer index. On RDMA the 0x08 register is
+        /// the PRODUCER (hardware-advanced as it fills descriptors, free-running mod 65536) and 0x0c the
+        /// CONSUMER (we publish it). `prod` past RING_DEPTH witnesses the RDMA ring wrapped and kept
+        /// delivering past the first pass — the co-suspect the wrap fix clears. GENET has no single
+        /// simple rx-frames MIB register (the MIB is a swept counter array we do not fabricate an offset
+        /// for under the facts-only rule); the free-running RDMA producer index IS the authoritative
+        /// count of frames hardware delivered into the ring, so it stands in as the rx-frames witness.
+        fn rx_evidence(&self, label: &str) {
+            let prod = self.r(self.rdma_ring(RING_TDMA_CONS_INDEX)) & DMA_INDEX_MASK; // RDMA PROD_INDEX
+            let cons = self.r(self.rdma_ring(RING_TDMA_PROD_INDEX)) & DMA_INDEX_MASK; // RDMA CONS_INDEX
+            let wrapped = prod > RING_DEPTH as u32;
+            serial_println!(
+                "{}   RX evidence [{}]: sw frames-popped={} (rx_c_index={}) | HW RDMA prod_index={} cons_index={} {}{} ::",
+                PG, label, self.rx_count, self.rx_c_index, prod, cons,
+                if prod == cons { "(ring drained)" } else { "(frames waiting)" },
+                if wrapped { " [ring WRAPPED past depth]" } else if prod == RING_DEPTH as u32 { " [STALLED at ring depth — no wrap]" } else { "" }
+            );
+        }
+
+        /// One-time flow-control / ring-arm witness: the per-ring flow registers (TDMA FLOW_PERIOD / RDMA
+        /// XON_XOFF_THRESH, both at ring offset 0x28) and the global DMA_CTRL/RING_CFG readbacks. Confirms
+        /// no XOFF/flow threshold is choking the queue and that both rings are actually enabled — so a
+        /// stall is ring geometry, not back-pressure.
+        fn flow_evidence(&self) {
+            let tflow = self.r(self.tdma_ring(RING_TDMA_FLOW_PERIOD));
+            let rflow = self.r(self.rdma_ring(RING_TDMA_FLOW_PERIOD));
+            let tctrl = self.r(self.tdma_global(DMA_CTRL));
+            let rctrl = self.r(self.rdma_global(DMA_CTRL));
+            let tcfg = self.r(self.tdma_global(DMA_RING_CFG));
+            let rcfg = self.r(self.rdma_global(DMA_RING_CFG));
+            serial_println!(
+                "{}   flow/ring witness: TDMA flow_period={:#x} DMA_CTRL={:#010x} RING_CFG={:#010x} | RDMA xon_xoff={:#x} DMA_CTRL={:#010x} RING_CFG={:#010x} ::",
+                PG, tflow, tctrl, tcfg, rflow, rctrl, rcfg
             );
         }
 
@@ -538,8 +584,9 @@ mod metal {
                 self.w(d + DMA_DESC_ADDRESS_LO, buf as u32);
                 self.w(d + DMA_DESC_ADDRESS_HI, (buf >> 32) as u32);
                 // RX length_status starts cleared; hardware overwrites with the received length/status.
-                let wrap = if i == RING_DEPTH - 1 { DMA_WRAP } else { 0 };
-                self.w(d + DMA_DESC_LENGTH_STATUS, wrap);
+                // No per-descriptor WRAP bit: the GENET ring path wraps via END_ADDR, not a status bit
+                // (Linux never sets DMA_WRAP in the ring-based descriptor length_status).
+                self.w(d + DMA_DESC_LENGTH_STATUS, 0);
             }
             barrier();
             // Ring config: descriptor 0..RING_DEPTH, buffer length in the low half.
@@ -551,9 +598,14 @@ mod metal {
             self.w(self.rdma_ring(RING_TDMA_CONS_INDEX), 0); // RDMA PROD_INDEX
             self.w(self.rdma_ring(RING_DMA_START_ADDR), 0);
             self.w(self.rdma_ring(RING_DMA_START_ADDR_HI), 0);
+            // END_ADDR is in 32-bit WORDS (RING_DEPTH descriptors × 3 words − 1), consistent with the
+            // 32-descriptor RING_BUF_SIZE above — so the RDMA write pointer wraps at the last valid
+            // descriptor. (Was RING_DEPTH×DMA_DESC_SIZE−1 = a 4× byte/word mismatch: the HW ring never
+            // wrapped, drove writes past descriptor 32 into the uninitialised tail, and the OFFER that
+            // arrived after the first pass was never popped.)
             self.w(
                 self.rdma_ring(RING_DMA_END_ADDR),
-                (RING_DEPTH as u32 * DMA_DESC_SIZE as u32) - 1,
+                (RING_DEPTH as u32 * DMA_DESC_WORDS) - 1,
             );
             self.w(self.rdma_ring(RING_DMA_END_ADDR_HI), 0);
             self.w(self.rdma_ring(RING_DMA_MBUF_DONE_THRESH), 1);
@@ -580,8 +632,9 @@ mod metal {
                 let d = self.tx_desc(i);
                 self.w(d + DMA_DESC_ADDRESS_LO, 0);
                 self.w(d + DMA_DESC_ADDRESS_HI, 0);
-                let wrap = if i == RING_DEPTH - 1 { DMA_WRAP } else { 0 };
-                self.w(d + DMA_DESC_LENGTH_STATUS, wrap);
+                // No per-descriptor WRAP bit (END_ADDR governs the ring wrap; Linux ring path never sets
+                // DMA_WRAP in length_status).
+                self.w(d + DMA_DESC_LENGTH_STATUS, 0);
             }
             barrier();
             let bufsz = ((RING_DEPTH as u32) << DMA_BUFLENGTH_SHIFT) | BUF_SIZE as u32;
@@ -592,9 +645,13 @@ mod metal {
             self.w(self.tdma_ring(RING_TDMA_CONS_INDEX), 0);
             self.w(self.tdma_ring(RING_DMA_START_ADDR), 0);
             self.w(self.tdma_ring(RING_DMA_START_ADDR_HI), 0);
+            // END_ADDR in 32-bit WORDS (see init_rx): consistent with the 32-descriptor RING_BUF_SIZE so
+            // the TDMA read pointer wraps at descriptor 32. The byte/word mismatch was the observed stall
+            // — boot-P3 caught cons_index frozen at exactly 32 (the ring depth) with prod at 201: the
+            // engine drained one pass, failed to wrap, and hung on an uninitialised descriptor.
             self.w(
                 self.tdma_ring(RING_DMA_END_ADDR),
-                (RING_DEPTH as u32 * DMA_DESC_SIZE as u32) - 1,
+                (RING_DEPTH as u32 * DMA_DESC_WORDS) - 1,
             );
             self.w(self.tdma_ring(RING_DMA_END_ADDR_HI), 0);
             self.w(self.tdma_ring(RING_DMA_MBUF_DONE_THRESH), 1);
@@ -684,12 +741,12 @@ mod metal {
             let phys = (self.tx_bufs as u64) + (i * BUF_SIZE) as u64;
             self.w(d + DMA_DESC_ADDRESS_LO, phys as u32);
             self.w(d + DMA_DESC_ADDRESS_HI, (phys >> 32) as u32);
-            let wrap = if i == RING_DEPTH - 1 { DMA_WRAP } else { 0 };
+            // length_status fully re-armed every reuse (stale EOP/OWN cleared): SOP|EOP|APPEND_CRC + the
+            // fresh length. No WRAP bit — the ring wraps via END_ADDR (Linux `bcmgenet_xmit_single`).
             let ls = ((len as u32) << DMA_BUFLENGTH_SHIFT)
                 | DMA_SOP
                 | DMA_EOP
                 | DMA_TX_APPEND_CRC
-                | wrap
                 | (DMA_TX_QTAG_MASK << DMA_TX_QTAG_SHIFT);
             self.w(d + DMA_DESC_LENGTH_STATUS, ls);
             barrier();
@@ -721,9 +778,9 @@ mod metal {
                 unsafe { core::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), len) };
             }
             self.rx_count += 1;
-            // Recycle: re-clear the descriptor status (hardware refills), keep the buffer address.
-            let wrap = if i == RING_DEPTH - 1 { DMA_WRAP } else { 0 };
-            self.w(d + DMA_DESC_LENGTH_STATUS, wrap);
+            // Recycle: re-clear the descriptor status (hardware refills), keep the buffer address. No
+            // WRAP bit — the RDMA engine wraps via END_ADDR, not a per-descriptor status bit.
+            self.w(d + DMA_DESC_LENGTH_STATUS, 0);
             barrier();
             // Advance our consumer index and publish it (hands the slot back to hardware).
             self.rx_c_index = self.rx_c_index.wrapping_add(1);
@@ -953,8 +1010,13 @@ mod metal {
         //    hardware TDMA producer/consumer indices after the whole DHCP+ping exchange. A bounded,
         //    fully-drained ring (cons==prod, small count) rules out a runaway re-post — the solid
         //    activity LED is then a benign gigabit-link indication, not a TX storm. ──
+        //    RX evidence + the flow/ring witness ride alongside: an RDMA producer index past the ring
+        //    depth proves the RX ring wrapped and kept delivering (the OFFER-never-popped co-suspect),
+        //    and the flow witness rules out XOFF back-pressure as the stall cause.
         if let Some(n) = GENET_DEVICE.lock().as_ref() {
             n.tx_evidence("post-DHCP+ping");
+            n.rx_evidence("post-DHCP+ping");
+            n.flow_evidence();
         }
         serial_println!("{} PI-GENET DONE — GENET v5 driver up + smoltcp bound ::", PG);
     }

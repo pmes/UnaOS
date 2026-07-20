@@ -6451,6 +6451,38 @@ with no runaway re-post — a steady activity LED under those readings is a beni
 indication, not a TX storm. The driver's `transmit` bumps the producer index exactly once per frame
 (no retransmit loop); DHCP retransmits originate in smoltcp and are bounded by the 5 s lease timeout.
 
+### The ring-wrap fix (PI-GENET-3) — START/END_ADDR are in WORDS, not bytes
+
+Boot-P3's TX evidence caught the concrete defect: `HW TDMA prod_index=201 cons_index=32` — the consumer
+frozen at **exactly** the ring depth (32). The MAC drained one full ring pass and never wrapped;
+everything after frame 32 sat unconsumed (the solid transport LED; DISCOVER retries past the first ~32
+frames never reached the wire). Root cause: the per-ring `DMA_START_ADDR` / `DMA_END_ADDR` registers
+count in **32-bit words** (Linux `end_ptr * words_per_bd - 1`, `words_per_bd = 3` for the 40-bit v5
+descriptor), but `init_tx` / `init_rx` programmed `END_ADDR = RING_DEPTH × DMA_DESC_SIZE − 1` using the
+**byte** stride (12/desc) instead of the word stride (3/desc). That sized the hardware ring region 4×
+too large, so the engine's read/write pointer never wrapped at the last valid descriptor — it walked
+off into the uninitialised tail of the shared 256-descriptor array and stalled on a null descriptor.
+The fix programs `END_ADDR = RING_DEPTH × (DMA_DESC_SIZE/4) − 1 = 95`, consistent with the 32-descriptor
+`RING_BUF_SIZE`. The spurious per-descriptor `DMA_WRAP` bit (0x1000) was also removed from every
+`length_status` write: the GENET ring path wraps via `END_ADDR`, not a status bit (Linux never sets it
+in `bcmgenet_xmit_single` / the ring descriptors), and the bench proved hardware ignores it (it was set
+on descriptor 31 yet the ring still failed to wrap).
+
+The **RX** ring carried the identical byte/word bug and is an equal-priority co-suspect: valid DISCOVERs
+left at the correct speed this boot yet no OFFER was ever popped, because the RDMA write pointer likewise
+never wrapped past descriptor 32 — an OFFER arriving after the first pass landed in a slot the driver
+(reading `mod RING_DEPTH`) never revisited. The same word-unit `END_ADDR` fix corrects both rings.
+
+New witnesses (behind the `genet` knob, post-DHCP+ping): `rx_evidence` logs the software popped-frame
+count + `rx_c_index` against the hardware RDMA producer index (free-running — the authoritative count of
+frames HW delivered; GENET exposes no single simple rx-frames MIB register, so the producer index stands
+in rather than fabricate a swept-counter offset under the facts-only rule); `flow_evidence` witnesses the
+per-ring flow registers (TDMA `FLOW_PERIOD` / RDMA `XON_XOFF_THRESH`) and the `DMA_CTRL`/`RING_CFG`
+readbacks once, ruling out XOFF back-pressure as the stall cause. Both TX and RX evidence lines now tag
+`[ring WRAPPED past depth]` vs `[STALLED at ring depth — no wrap]` so the fix is visible on the
+transcript. Expected boot-P4: `cons_index` follows `prod_index` past 32 (TX wraps), the RDMA producer
+advances past 32 (RX wraps + delivers), and the DHCP LEASE lands.
+
 ### DMA / identity-map + coherency
 
 Rings + buffers are heap-allocated; the Pi bare-metal MMU maps RAM identity (VA==PA), so the pointer
