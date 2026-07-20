@@ -99,6 +99,7 @@ const V3D_HUB_IDENT3: usize = 0x0014;
 const V3D_MMUC_CONTROL: usize = 0x1000;
 const V3D_MMU_CTL: usize = 0x1200;
 const V3D_MMU_PT_PA_BASE: usize = 0x1204;
+const V3D_MMU_VIO_ID: usize = 0x122c; // PI-V3D-5 fault-witness: id of the client that violated
 const V3D_MMU_ILLEGAL_ADDR: usize = 0x1230;
 const V3D_MMU_VIO_ADDR: usize = 0x1234;
 const V3D_MMU_DEBUG_INFO: usize = 0x1238;
@@ -113,6 +114,11 @@ const V3D_MMU_CTL_WRITE_VIOLATION_ABORT: u32 = 1 << 11;
 const V3D_MMU_CTL_TLB_CLEAR: u32 = 1 << 2;
 const V3D_MMU_CTL_TLB_CLEARING: u32 = 1 << 7;
 const V3D_MMU_ILLEGAL_ADDR_ENABLE: u32 = 1 << 31;
+// PI-V3D-5 MMU fault-status bits (v3d_regs.h, read side of V3D_MMU_CTL — set by hardware when a
+// translation faults). Used only to WITNESS a job-store fault; they change no programmed value.
+const V3D_MMU_CTL_PT_INVALID: u32 = 1 << 20; // an access hit an invalid PTE
+const V3D_MMU_CTL_WRITE_VIOLATION: u32 = 1 << 12; // a write hit a non-writeable page
+const V3D_MMU_CTL_CAP_EXCEEDED: u32 = 1 << 27; // an access exceeded the page-table address cap
 
 // V3D MMU PTE bits (v3d_mmu.c). The page-number field is phys >> 12.
 const V3D_MMU_PAGE_SHIFT: u32 = 12;
@@ -126,7 +132,9 @@ const V3D_CTL_IDENT2: usize = 0x0008;
 
 // CLE (control-list executor) — CT1 is the RENDER queue. Submitting a job = write the ring's start
 // address to CT1QBA and its end address to CT1QEA; the hardware runs [BA, EA).
+const V3D_CLE_CT0CS: usize = 0x0100; // CT0 (bin) control/status — witness only (render job uses CT1)
 const V3D_CLE_CT1CS: usize = 0x0104; // CT1 control/status (bit0 = CTRUN busy)
+const V3D_CLE_CT1CA: usize = 0x0114; // CT1 current address — the address the CLE is executing at
 const V3D_CLE_CT1QBA: usize = 0x0324; // CT1 queue begin address
 const V3D_CLE_CT1QEA: usize = 0x0334; // CT1 queue end address
 const V3D_CLE_CT1CS_CTRUN: u32 = 1 << 5; // per v3d_regs.h V3D_CLE_CTRUN
@@ -562,16 +570,69 @@ fn clear_job(fb: Option<FbTarget>) -> bool {
         serial_println!(":: V3D: RCL range escapes the arena — refusing kick (fail-closed) ::");
         return false;
     }
+    // PI-V3D-5 job-never-ran witness (class A): snapshot the CLE status the instant BEFORE the kick,
+    // so the post-kick reads have a baseline. CTRUN clearing could mean "finished" OR "never started";
+    // only a before/after pair disambiguates.
+    let cs_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT1CS);
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT1QBA, ba as u32);
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT1QEA, ea as u32);
+    dsb(); // ensure the queue-address writes reach the CLE before we sample its status
+    // Sample the status immediately after the kick — if CTRUN never latches here, the CLE never
+    // accepted the job (class A, "job never ran"); if it latches then clears, the list executed.
+    let cs_kicked = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT1CS);
 
     // Poll for CT1 idle (CTRUN clears when the list finishes) with a finite ~500 ms backstop.
-    if !wait_bit_clear(V3D_CORE0_BASE, V3D_CLE_CT1CS, V3D_CLE_CT1CS_CTRUN, "CT1 render") {
+    let idled = wait_bit_clear(V3D_CORE0_BASE, V3D_CLE_CT1CS, V3D_CLE_CT1CS_CTRUN, "CT1 render");
+
+    // PI-V3D-5 two-class witness block. Read the CLE progress + the V3D MMU fault status BEFORE the
+    // verify, so the metal log tells job-never-ran (class A) from job-ran-but-wrote-elsewhere/faulted
+    // (class B) regardless of what the verify then reports. All reads; nothing here is programmed.
+    let cs_done = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT1CS);
+    let ct0cs = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CS);
+    let ct1ca = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT1CA);
+    let mmu_ctl = mmio_read(V3D_HUB_BASE, V3D_MMU_CTL);
+    let vio_addr = mmio_read(V3D_HUB_BASE, V3D_MMU_VIO_ADDR);
+    let vio_id = mmio_read(V3D_HUB_BASE, V3D_MMU_VIO_ID);
+    let mmu_fault = mmu_ctl
+        & (V3D_MMU_CTL_PT_INVALID | V3D_MMU_CTL_WRITE_VIOLATION | V3D_MMU_CTL_CAP_EXCEEDED);
+    let ran = (cs_kicked & V3D_CLE_CT1CS_CTRUN != 0) || ct1ca != ba as u32;
+    let class = if mmu_fault != 0 {
+        "CLASS-B MMU-FAULT (store faulted in the V3D MMU — job wrote nowhere)"
+    } else if !idled {
+        "INDETERMINATE (CTRUN never cleared — backstop hit)"
+    } else if !ran {
+        "CLASS-A JOB-NEVER-RAN (CTRUN never latched, CT1CA==BA — CLE did not execute the list)"
+    } else {
+        "CLASS-B RAN-NO-FAULT (CLE executed with no MMU fault — store landed off-target: RCL encoding)"
+    };
+    serial_println!(
+        ":: V3D: M3 clue — CT1CS pre={:#010x} kicked={:#010x} done={:#010x} CT0CS={:#010x} CT1CA={:#010x} (BA={:#010x} EA={:#010x}) — {} ::",
+        cs_pre, cs_kicked, cs_done, ct0cs, ct1ca, ba as u32, ea as u32, class
+    );
+    serial_println!(
+        ":: V3D: M3 clue — MMU_CTL={:#010x} (PT_INVALID={} WRITE_VIOLATION={} CAP_EXCEEDED={}) VIO_ADDR={:#010x} VIO_ID={:#010x} ::",
+        mmu_ctl,
+        (mmu_ctl & V3D_MMU_CTL_PT_INVALID != 0) as u32,
+        (mmu_ctl & V3D_MMU_CTL_WRITE_VIOLATION != 0) as u32,
+        (mmu_ctl & V3D_MMU_CTL_CAP_EXCEEDED != 0) as u32,
+        vio_addr, vio_id
+    );
+    // SError-drain correlation witness: a V3D store that faulted on the bus can leave a latent async
+    // external abort that the global SError-drain would otherwise consume silently at bring-up exit
+    // (or, worse, at the first timer tick). Drain it HERE, labelled to this exact kick→poll window, so
+    // the "consumed N latent async abort(s)" line — if any — is unambiguously correlated with the M3
+    // clear-job store, not with M1/M2. Zero drained here = the store did not raise a bus fault.
+    super::exceptions::serror_drain_request("v3d: M3 clear-job kick window");
+
+    if !idled {
         serial_println!(":: V3D: CT1 did not idle within budget — no verify (anti-hang backstop hit) ::");
         return false;
     }
 
-    // Drop our stale cached copy and read the GPU's writes back from RAM.
+    // Drop our stale cached copy and read the GPU's writes back from RAM. clean_invalidate is safe
+    // here: the target line was published clean by the pre-kick clean_range above, so the clean half
+    // writes nothing back and cannot clobber a GPU DRAM write; the invalidate then forces the verify
+    // to load DRAM truth (defeats a stale-CPU-line false negative — the class-B cache sub-case).
     cache::clean_invalidate_range(arena_phys() + OFF_TARGET, TARGET_BYTES);
     let ok = verify_target(CLEAR_RGBA);
     if ok {

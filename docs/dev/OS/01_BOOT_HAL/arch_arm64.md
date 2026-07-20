@@ -5999,6 +5999,65 @@ The programmed `CTL` value is now `0x00090801` = `ENABLE(0) | WRITE_VIOLATION_AB
 PT_INVALID_ENABLE(16) | PT_INVALID_ABORT(19)`. **Metal-owed:** confirm `ENABLE=1` on the readback and
 that `DEBUG_INFO` decodes a plausible VA/PA width + MMU version (M2 PASS), then M3.
 
+### PI-V3D-5 — the M3 clear-job wrote nothing (two-class instrumentation)
+
+**The V3D-4 metal verdict (boot-P1, 2026-07-20, LC-metal R23s1).** With PI-V3D-4's corrected MMU
+constants the block now programs its MMU and M2 passes; M3 then fails:
+```
+:: V3D: verify mismatch at word 0 — got 0xdeadbeef expect 0x00a68cff ::
+:: V3D: M3 clear-job did not verify ::
+```
+`0xdeadbeef` is the CPU-side sentinel `fill_target` pre-seeds before the kick, so the verify proves
+the **GPU wrote nothing to the target** (or wrote elsewhere and DRAM at the target still holds the
+sentinel). Two failure classes fit that single symptom and cannot be told apart off-metal:
+  - **Class A — job never ran.** The CLE never accepted/executed the render list (a `CT1QBA/QEA`
+    kick that the engine ignored, or `CTRUN` that never latched). The store never issued.
+  - **Class B — job ran but the store landed off-target.** Either the store address faulted in the
+    V3D MMU (wrote nowhere), or the placeholder RCL packet encoding stored to the wrong address (the
+    packet field layout in `build_rcl` is an admitted attended-metal refinement, the *next* arc), or
+    a stale CPU cache line masked a real GPU write on the verify read.
+
+**Off-metal audit of the PI-V3D-4 MMU constants (no provable defect found).** Against BCM2711 V3D 4.2
+(`v3d_regs.h` / `v3d_mmu.c`): the `PT_PA_BASE` load is `pt_paddr >> V3D_MMU_PAGE_SHIFT(12)` ✓; the
+PTE encoding is `VALID(28) | WRITEABLE(29) | (phys>>12)` with an identity map (iova==phys) ✓; the
+programmed `CTL` (`ENABLE(0) | PT_INVALID_ENABLE(16) | PT_INVALID_ABORT(19) | WRITE_VIOLATION_ABORT(11)`)
+matches the register's bottom-of-word layout ✓; the CL/job addresses are V3D **IOVAs** that, under the
+identity map, equal the ARM PA the arena lives at, and the arena's PTEs are the ones marked valid ✓;
+the verify's `clean_invalidate_range` is safe because the target line was published *clean* by the
+pre-kick `clean_range` (the clean half writes nothing back, the invalidate forces a DRAM re-load) ✓.
+**No load-bearing MMU constant is provably wrong** — so this arc adds the discriminating
+instrumentation rather than a speculative constant change. (The witness-only offsets `VIO_ADDR`/
+`VIO_ID`/`DEBUG_INFO` are as PI-V3D-4 transcribed; they gate nothing.)
+
+**Instrumentation (`v3d.rs::clear_job`, all reads — programs nothing new).** Around the CT1 kick:
+  1. **Class-A discriminator.** Snapshot `CT1CS` immediately *before* the kick (`pre`), *after*
+     writing `CT1QBA/QEA` with a `dsb` (`kicked`), and after the poll (`done`); read `CT1CA` (the
+     CLE's current execution address). `CTRUN` latched-then-cleared **or** `CT1CA != BA` ⇒ the CLE
+     executed; `CTRUN` never latched **and** `CT1CA == BA` ⇒ **CLASS-A JOB-NEVER-RAN**.
+  2. **Class-B discriminator.** Read `V3D_MMU_CTL` and decode its hardware-set fault bits
+     `PT_INVALID(20)`, `WRITE_VIOLATION(12)`, `CAP_EXCEEDED(27)`, plus `VIO_ADDR`/`VIO_ID`. Any fault
+     bit ⇒ **CLASS-B MMU-FAULT** (the store faulted, wrote nowhere) and `VIO_ADDR` names where. No
+     fault but the CLE ran and the target is still the sentinel ⇒ **CLASS-B RAN-NO-FAULT** (store
+     landed off-target — the RCL-encoding case, the next arc). The cache sub-case is already defeated
+     by the invalidated verify read.
+  3. **SError-drain correlation.** A faulting V3D store can leave a latent async external abort that
+     the global SError-drain would otherwise consume unlabelled at bring-up exit (or fire at the
+     first timer tick). A `serror_drain_request("v3d: M3 clear-job kick window")` is issued right
+     after the poll, so a `consumed N latent async abort(s) … [v3d: M3 clear-job kick window]` line —
+     if any — is unambiguously correlated with the M3 store, not with M1/M2. Zero drained ⇒ the store
+     raised no bus fault.
+
+QEMU `raspi4b` models no V3D, so it stays on **BLOCK-DOWN** and never reaches M3 — the new lines are
+metal-only by construction (the module is entirely `v3d`-feature-gated, so knob-off images are
+byte-identical to baseline).
+
+**Expected boot-P2 witness lines (metal).** Between the `M2 MMU PASS` line and the verify result:
+```
+:: V3D: M3 clue — CT1CS pre=0x……… kicked=0x……… done=0x……… CT0CS=0x……… CT1CA=0x……… (BA=0x……… EA=0x………) — <CLASS-A JOB-NEVER-RAN | CLASS-B MMU-FAULT | CLASS-B RAN-NO-FAULT | INDETERMINATE> ::
+:: V3D: M3 clue — MMU_CTL=0x……… (PT_INVALID=n WRITE_VIOLATION=n CAP_EXCEEDED=n) VIO_ADDR=0x……… VIO_ID=0x……… ::
+```
+plus, iff the store faulted, one `:: SERROR-DRAIN: consumed N latent async abort(s) … [v3d: M3 clear-job kick window] … ::`. The class label + `VIO_ADDR`/drain trio route the next arc: Class A → CLE kick/ring shape; Class-B MMU-FAULT → the store address vs the arena map; Class-B RAN-NO-FAULT → the `build_rcl` packet encoding.
+
 ### References of record
 
 - Register layout: Linux `drivers/gpu/drm/v3d/v3d_regs.h` (hub + core + MMU offsets, field bits).
