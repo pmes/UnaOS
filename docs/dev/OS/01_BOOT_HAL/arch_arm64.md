@@ -6746,6 +6746,13 @@ inbound path was built and armed, layer by layer, and finally root-caused **back
   cache artifact. The RC corroborated it: an **IOB `FillWrite` RAS, ADDR `0x8000000000000200`** (stripped
   `0x200` = the fabric slave-error sink for an inbound write matching no inbound region).
 
+> **[SUPERSEDED by NET-4q]** — the NET-4n → NET-4n2 → NET-4o → NET-4p arc below rests on the premise that
+> `CplusCmd.PCIDAC` is the "64-bit buffer-DMA enable" and that its failing to latch proves a 32-bit-only
+> payload path. Per the L4T facts that premise is wrong: PCIDAC is a dead parallel-PCI relic, and the PCIe
+> 8168 forms 64-bit (DAC) TLPs natively from the descriptor's `__le64 addr`. NET-4q emits the full 64-bit
+> address (High-before-Low ring bases) and removes the sub-4 GiB arena and the inbound-iATU alias. The
+> narrative below is retained as the investigation record; see **NET-4q** at the end of this section.
+
 - **NET-4n — the fix.** With the inbound iATU armed identity over the true buffer PAs and the SMMU
   bypassing, the addresses *reaching* them were wrong. Root cause **in this driver**: the C+ engine was
   left in **32-bit payload-DMA mode** — `CPlusCmd.PCIDAC` (bit 4) clear (boot-16 read back `0x2021`). The
@@ -6877,3 +6884,47 @@ non-regression only.
   the tegra path; the gates prove non-regression only (default `check` + `UNAOS_NET4=1 UNAOS_TEGRA=1` `check`,
   default `test-arm`, and the `UNAOS_GICV3=1 UNAOS_WITNESS=1 UNAOS_VNET=1 test-arm` seam regression — vnet
   lease + the NET-4j reproducer stay PASS).
+
+- **NET-4q — the 8168 IS 64-bit-DMA capable: emit the full descriptor address, drop the alias.**
+  **The 32-bit-payload premise (NET-4n) and everything built on it (the NET-4o sub-4 GiB arena, the NET-4p
+  inbound-iATU alias) are SUPERSEDED.** The L4T reference (`r8169_main.c`) settles the capability question:
+  the driver requests a **64-bit** DMA mask for every 8168c-and-later (gate: `mac_version >= VER_18`; our
+  PCIe 8168 qualifies) and performs 64-bit RX/TX **purely via the descriptor's `__le64 addr` field** — a
+  full 64-bit dword inside every descriptor. `CplusCmd.PCIDAC` (bit 4) is a **parallel-PCI "Dual Address
+  Cycle" relic** that `r8169` **never sets** for a PCIe 8168/8125 and in fact **masks out** of the value it
+  writes (`CPCMD_MASK`); on PCIe a 64-bit (DAC) TLP is formed **natively** from the descriptor high dword,
+  not gated by any C+ bit. So the boots-16..18 observation *"PCIDAC won't latch"* is **expected and
+  harmless** — a no-op on this silicon — **not** evidence of a 32-bit-only payload path. The
+  `PCIDAC-won't-latch ⇒ 32-bit ⇒ arena ⇒ alias` chain was a misdiagnosis of a dead legacy bit.
+
+  **The actual init divergence (the tension boot-16/20 posed).** Our RINGDUMP already showed the RX
+  descriptor carrying the full `addr=0x2683cb000` `[MATCH]` (high dword `0x2` present) — the descriptor path
+  was **never** truncating in software. The one place our sequence differed from the documented r8169 order
+  is the descriptor-**ring** base registers: `RDSAR` (low `0xe4` / high `0xe8`) and `TNPDS` (low `0x20` /
+  high `0x24`) were written **Low-then-High**; r8169 writes the **High dword before the Low** as a documented
+  erratum ordering (some 8168 variants only latch the base when the low dword lands with the high already in
+  place). NET-4q reverses both to **High-before-Low**.
+
+  **The fix (primary, do-it-right).** (a) Program `RDSAR`/`TNPDS` as full 64-bit hi/lo pairs, **High first**;
+  (b) **remove the PCIDAC writes** (NET-4n/4n2) entirely — the rings-up readback keeps `PCIDAC` only as a
+  witness, **expected clear**; (c) **remove the NET-4p inbound-iATU alias** (`program_inbound_alias`,
+  `arm_dma_aliases`/`arm_one_alias`, and the driver's `atu_base`/`ident_*`/`mem_*` fields). The NIC then
+  emits `0x2683cb000` in a DAC TLP natively; the **NET-4h region-0 identity** `[0x8000_0000, 0x2_8000_0000)`
+  already covers the high buffer PAs (~9.6 GiB), so the payload lands identity-translated — no alias, no
+  arena, no PCIDAC. `[net4m]`/RINGDUMP and the readback witnesses are retained.
+
+  **Expected boot-21 (metal-owed):** at ring bring-up, `>>> REG WRITE (M2): RDSAR[0xe4] = 0x2683ca000 (RX
+  ring …; hi-before-lo)` + `TNPDS[0x20] = 0x… (…; hi-before-lo)`; the RINGDUMP RX descriptor `addr=0x2683cb…
+  [MATCH]` (full 64-bit); `rings up: … CPlusCmd 0x2021 PCIDAC=0 (expected clear; 64-bit DMA rides the
+  descriptor addr)`; **no** `0x200` IOB `FillWrite` RAS; `[net4m]` **all nonzero** (the ACK lands in the
+  natively-reached high buffer); and the DHCP **lease** (`NET: DHCP lease …` / `[dhcp]`).
+
+  **Fallback (only if a provably-correct full-64 descriptor STILL yields zero on metal).** That would be the
+  first real evidence the specific NIC/RC integration cannot emit >4 GiB TLPs. Only then, re-arm the inbound
+  alias per the facts: write **`UPPER_BASE` + `UPPER_TARGET`**, keep `base ≡ target (mod 64 KiB)`, use a free
+  inbound index, set `CTRL2 = ENABLE` and **read it back**. Do not lead with it — the alias is the wrong
+  layer if the primary works.
+
+  QEMU cannot exercise the tegra path; the gates prove non-regression only (default `check` + `UNAOS_NET4=1
+  UNAOS_TEGRA=1` `check`, default `test-arm`, and the `UNAOS_GICV3=1 UNAOS_WITNESS=1 UNAOS_VNET=1 test-arm`
+  seam regression — vnet lease + the NET-4j reproducer stay PASS).

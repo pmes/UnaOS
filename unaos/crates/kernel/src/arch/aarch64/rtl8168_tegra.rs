@@ -108,52 +108,36 @@
 // 0x8000_0000, boots 1..5) never needed the high dword, so they masked this — until the RAS-2 heap-guard
 // moved the heap high for good.
 //
-// Fix (this file, net lane): set CPlusCmd.PCIDAC in `init_rings` so EVERY payload TLP carries the full
-// 64-bit `Desc.addr` — the r8169 `NETIF_F_HIGHDMA` path, and the brief's PREFERRED fork because the
-// silicon is provably 64-bit-DMA-capable (it fetches the >4 GiB ring). Nothing below the driver changes;
-// the NET-4h iATU already covers the true buffer PAs, so the now-untruncated writes land. If a metal
-// boot shows the truncation survive PCIDAC, the fallback is the 32-bit-arena fork (drive the rings via a
-// sub-4 GiB DMA alias — a tegra-local net-lane arena, still no allocator change).
+// ## NET-4n / NET-4o / NET-4p — SUPERSEDED (built on a misread bit).
 //
-// ## NET-4n2 — PCIDAC is written but does not LATCH from a pre-ring store; re-apply it as the final C+CR write.
+// Boots 16..18 chased CplusCmd.PCIDAC (C+CR bit 4) as the "64-bit >4 GiB buffer-address enable": NET-4n
+// set it pre-ring, NET-4n2 re-applied it as the final C+CR write, both read back CLEAR (0x2021), and that
+// "won't latch" was read as proof the payload DMA is 32-bit-only. NET-4o then tried to seat the whole NIC
+// DMA surface in a sub-4 GiB arena (boot-19: no clean low DRAM exists — the [2,4) GiB window is packed
+// with Tegra carveouts), and NET-4p aliased the truncated 32-bit writes back up via inbound iATU regions.
+// The L4T facts (r8169_main.c) refute the premise the whole chain rests on: **PCIDAC is a parallel-PCI
+// "Dual Address Cycle" relic** the reference driver NEVER sets for a PCIe 8168/8125 and masks OUT of the
+// value it writes (CPCMD_MASK). On a PCIe part a 64-bit (DAC) memory TLP is formed NATIVELY from the
+// descriptor's `__le64 addr` high dword — there is no C+ enable bit. So "PCIDAC won't latch" is EXPECTED
+// and HARMLESS (a no-op on this silicon), NOT evidence of a 32-bit-only path; the arena and the alias were
+// solving a non-problem at the wrong layer.
 //
-// Boot-17 showed the RMW issue then REVERT: `CPlusCmd 0x2021 -> 0x2031` written at the top of
-// `init_rings`, but the rings-up readback came back `0x2021` (bit 4 clear) — the DHCP still no-leased with
-// the same `0x200` FillWrite RAS. Static trace RULES OUT a later clobber: the pre-ring RMW is the ONLY
-// write to CPlusCmd (0xE0) in this driver, it is inside the 9346 unlock window, and no register written
-// after it aliases 0xE0/0xE1 (RDSAR@0xE4, RMS@0xDA, MTPS@0xEC, TCR@0x40, RCR@0x44, CR@0x37 all miss it).
-// So the cause is silicon, not software: this RTL8168 does not hold the DAC bit set BEFORE the descriptor
-// engine is armed (the r8169 order writes C+CR late). NET-4n2 re-applies PCIDAC as the FINAL C+CR write —
-// after RCR, still under 9346 unlock — as an RMW with a bounded confirm loop and an immediate readback, so
-// boot-18 is decisive: `CPlusCmd 0x2031 PCIDAC=1 (64-bit DMA ENABLED)` at rings-up, no `0x200` IOB RAS,
-// `[net4m]` all-nonzero, and the DHCP ACK lands -> `[dhcp]` lease; OR the readback stays `0x2021` after
-// the final write under unlock, proving the C+ DAC path unusable on this silicon (-> a reachability arc).
+// ## NET-4q — emit the full 64-bit descriptor/ring address; region-0 identity carries it; no alias.
 //
-// ## NET-4o (REVERTED) then NET-4p — no clean low DRAM exists; keep buffers HIGH + alias the truncation.
-//
-// Boot-18 fired the decisive negative: PCIDAC will NOT latch even as the final C+CR write under 9346
-// unlock, so the per-buffer payload DMA is 32-bit only (`Desc.addr[31:0]`) — permanently. NET-4o tried the
-// obvious fork (seat the whole NIC DMA surface in a sub-4 GiB arena so a 32-bit address reaches it), but
-// boot-19 proved that IMPOSSIBLE on this board: `!! NET-4o: no sub-4GiB DMA arena seated (HEAP-GUARD found
-// no clean low span)`. The window [0x8000_0000, 0x1_0000_0000) = [2 GiB, 4 GiB) is packed with Tegra
-// firmware carveouts (OPTEE CO:43 @0xbe000000, BPMP/TSEC/etc.) + UEFI reservations — no clean span. NET-4o
-// is REVERTED (both its mmu_tegra arena selection and this driver's DmaArena); the rings + buffers go back
-// to the high kernel heap (pre-NET-4o `alloc_zeroed`).
-//
-// NET-4p is the correct use of the IOMMU: keep the buffers HIGH and add INBOUND-iATU ALIAS regions that
-// catch the NIC's truncated 32-bit writes and translate them BACK UP to the real high PAs. The NIC
-// truncates buffer PA 0x2683cbXXX -> 0x683cbXXX (below the 0x8000_0000 identity base -> the 0x200 sink).
-// So for each buffer span program an inbound region: BASE = `buf_pa & 0xFFFF_FFFF`, LIMIT = BASE+span-1,
-// TARGET = `buf_pa` (the real high PA). The NIC's write to `BASE+off` now MATCHES and translates to
-// `buf_pa+off` — no truncation loss, buffers stay in the high heap, no clean low DRAM needed. The
-// descriptor RING is fetched/written back via the 64-bit RDSAR/TNPDS path (metal-proven un-truncated — the
-// ring stayed coherent while payloads vanished), so ONLY the RX/TX buffer spans need an alias (spare
-// inbound indices 1 & 2; index 0 = the NET-4h identity region). CRITICAL collision check before arming
-// (see `arm_one_alias`): the alias window must not overlap the identity inbound region or controller-0's
-// PCIe MEM/BAR window, and cannot cross the 4 GiB boundary — fail-closed otherwise. A successfully-armed
-// alias is always < the DRAM base (a firmware MSI target lives in DRAM, so no MSI collision is possible).
-// Boot-20 oracle: `[net4p] alias region … readback … enabled=1`, `[net4m]` all-nonzero, no `0x200` IOB
-// RAS, DHCP LEASE.
+// The RTL8168 requests a 64-bit DMA mask for every 8168c-and-later (r8169 gates only `mac_version >=
+// VER_18`; our PCIe 8168 qualifies), and does 64-bit RX/TX purely by putting the full PA in the
+// descriptor's `__le64 addr`. Our driver already publishes the full 64-bit `Desc.addr` (u64, both dwords —
+// net4g [MATCH] on metal). The one place we diverged from the documented sequence: the descriptor-RING
+// base registers (RDSAR 0xe4/0xe8, TNPDS 0x20/0x24) were written LOW-then-HIGH; r8169 writes the HIGH
+// dword BEFORE the Low as a documented erratum ordering. NET-4q (a) reverses that to High-before-Low on
+// both ring bases, (b) drops the PCIDAC writes entirely (dead bit; the rings-up readback keeps PCIDAC as a
+// witness, EXPECTED clear), and (c) removes the NET-4p inbound-iATU alias. The NIC then emits the full
+// `0x2683cbXXX` DAC TLP natively; the NET-4h region-0 identity `[0x8000_0000, 0x2_8000_0000)` already
+// covers the high buffer PAs (~9.6 GiB), so the write lands with no alias, no arena, no PCIDAC. Boot-21
+// oracle: the full-64 desc witness, `[net4m]` all-nonzero, no `0x200` IOB FillWrite RAS, DHCP LEASE.
+// FALLBACK (only if a provably-correct full-64 descriptor STILL yields zero on metal — the first real
+// evidence the NIC/RC integration cannot emit >4 GiB TLPs): re-arm the inbound alias per the facts, writing
+// UPPER_BASE + UPPER_TARGET with base congruent to target mod 64 KiB and CTRL2=ENABLE read back.
 //
 // ## Write discipline
 //
@@ -262,12 +246,12 @@ mod metal {
     const REG_RMS: u64 = 0xda;
     /// CPlusCmd: the C+ command register (enables the C+ descriptor-ring receive/transmit engine).
     const REG_CPLUSCMD: u64 = 0xe0;
-    /// CPlusCmd.PCIDAC (bit 4) — NET-4n: the C+ engine's ">4 GiB / 64-bit buffer-address" enable. With
-    /// it CLEAR the RX/TX DMA engine uses only `Desc.addr[31:0]` for the per-buffer *payload* transfer
-    /// (the ring bases go through the dedicated 64-bit RDSAR/TNPDS registers, so descriptor FETCH still
-    /// reaches a >4 GiB ring — which is why the ring stays coherent while the payloads vanish). The
-    /// historical `r8169` set exactly this bit whenever the 64-bit DMA mask was accepted
-    /// (`tp->cp_cmd |= PCIDAC; dev->features |= NETIF_F_HIGHDMA`). See `init_rings`.
+    /// CPlusCmd.PCIDAC (bit 4) — a parallel-PCI "Dual Address Cycle" relic. NET-4q: this is a DEAD bit on
+    /// a PCIe 8168; the reference `r8169` never sets it for the 8168/8125 and masks it out of the value it
+    /// writes (CPCMD_MASK). On PCIe, a 64-bit (DAC) memory TLP is formed NATIVELY from the descriptor's
+    /// `__le64 addr` high dword — PCIDAC does not gate it. Kept only as a rings-up readback WITNESS: it is
+    /// EXPECTED to read CLEAR, and that is the correct 64-bit-capable state (NET-4n's "won't latch ⇒
+    /// 32-bit" inference was a misread of this no-op bit). See `init_rings`.
     const CPCMD_PCIDAC: u16 = 1 << 4;
     /// RDSAR: Receive Descriptor Start Address (64-bit; low @ 0xE4, high @ 0xE8). 256-byte aligned.
     const REG_RDSAR: u64 = 0xe4;
@@ -592,21 +576,6 @@ mod metal {
     pub struct Rtl8168 {
         mmio_base: u64,
         mac: [u8; 6],
-        /// NET-4p: controller-0's DWC iATU register block base. The inbound-iATU ALIAS regions (which
-        /// catch the NIC's truncated 32-bit payload writes and up-translate them to the real high-heap
-        /// buffer PAs) are programmed from `init_rings` — the only place the buffer PAs are known — so the
-        /// driver keeps the ATU base to reach the inbound region slots after allocation.
-        atu_base: u64,
-        /// NET-4p: the NET-4h identity inbound region `[ident_lo, ident_hi)` (all of RAM). The alias
-        /// collision check refuses any alias window that would overlap it (an overlap would let two
-        /// inbound regions match the same bus address, shadowing/ambiguating the translation).
-        ident_lo: u64,
-        ident_hi: u64,
-        /// NET-4p: controller-0's PCIe MEM `ranges` window `[mem_lo, mem_hi)` — where downstream BARs
-        /// decode. The alias collision check refuses any alias window overlapping it (an inbound write
-        /// into that range risks peer-to-peer routing to a BAR instead of upstream to the RC).
-        mem_lo: u64,
-        mem_hi: u64,
         rx_ring: *mut Desc,
         rx_buffers: *mut u8,
         rx_cur: usize,
@@ -756,105 +725,6 @@ mod metal {
             }
         }
 
-        /// NET-4p — arm the inbound-iATU ALIAS regions that catch the NIC's TRUNCATED 32-bit payload
-        /// writes and translate them back up to the real (high-heap) buffer PAs. Called from
-        /// `init_rings` AFTER `alloc_rx`/`alloc_tx` (the PAs are known) and BEFORE `RxEnb`/`TxEnb` (the
-        /// first payload write is already covered). The C+ engine's per-buffer payload write uses only
-        /// `Desc.addr[31:0]` (PCIDAC won't latch — boot-18), so a high-heap buffer PA truncates to its
-        /// low 32 bits; an inbound region matching that truncated address, targeting the real PA, is the
-        /// reachability lever that keeps the buffers in the high heap (NET-4o's sub-4 GiB arena was
-        /// impossible — no clean low DRAM on this board). RX and TX buffers are SEPARATE heap allocations
-        /// (not contiguous), so each gets its own region (spare inbound indices 1 and 2; index 0 = the
-        /// NET-4h identity region). The descriptor RING is fetched/written back via the 64-bit
-        /// RDSAR/TNPDS path — metal-proven un-truncated (the ring stayed coherent while the payloads
-        /// vanished) — so ONLY the buffer spans need an alias. Returns false (fail-closed) on a collision.
-        fn arm_dma_aliases(&self) -> bool {
-            let rx_lo = self.rx_buffers as u64;
-            let rx_len = (NUM_RX * RX_BUF_SIZE) as u64;
-            let tx_lo = self.tx_buffers as u64;
-            let tx_len = (NUM_TX * TX_BUF_SIZE) as u64;
-            // Guard against the RX and TX alias windows overlapping each other (two separate heap
-            // allocations whose low-32 aliases land within a span of each other) — that would make two
-            // inbound regions match the same truncated bus address. Distinct allocations at distinct PAs
-            // make this all but impossible, but check it rather than trust it.
-            let rx_alias = rx_lo & 0xFFFF_FFFF;
-            let tx_alias = tx_lo & 0xFFFF_FFFF;
-            if rx_alias < tx_alias + tx_len && tx_alias < rx_alias + rx_len {
-                serial_println!(
-                    "{}   !! [net4p] RX alias [{:#x}..+{:#x}) and TX alias [{:#x}..+{:#x}) OVERLAP — REFUSING (ambiguous inbound match) ::",
-                    P4, rx_alias, rx_len, tx_alias, tx_len
-                );
-                return false;
-            }
-            self.arm_one_alias(1, rx_lo, rx_len, "rx-buffers")
-                && self.arm_one_alias(2, tx_lo, tx_len, "tx-buffers")
-        }
-
-        /// NET-4p — arm ONE inbound-iATU alias region for the buffer span `[span_pa, span_pa+span_len)`,
-        /// with the CRITICAL collision check. `alias = span_pa & 0xFFFF_FFFF` is the address the NIC's
-        /// 32-bit payload write actually presents on the bus; the region maps
-        /// `BASE=alias, LIMIT=alias+span_len-1, TARGET=span_pa`, so an inbound write to `alias+off` is
-        /// translated to `span_pa+off` = the real buffer byte. Fail-closed on any collision:
-        ///   * a span already sub-4 GiB and inside the identity region needs NO alias (truncation is a
-        ///     no-op; the identity region already reaches it) — skip cleanly;
-        ///   * a truncated span crossing the 4 GiB boundary can't be one contiguous region — REFUSE;
-        ///   * overlap with the NET-4h identity inbound region (a successfully-armed alias is therefore
-        ///     always `< ident_lo`, i.e. below the DRAM base) — REFUSE;
-        ///   * overlap with controller-0's PCIe MEM/BAR window (peer-to-peer mis-route hazard) — REFUSE.
-        /// The MSI doorbell needs no separate check here: a firmware-allocated MSI target page lives in
-        /// DRAM (`>= ident_lo`), and any armed alias is `< ident_lo` by the identity-overlap refusal
-        /// above, so an alias can never collide with it; the one sub-DRAM-base inbound hazard is the
-        /// PCIe MEM/BAR window, which IS checked. Returns false to fail the whole ring bring-up closed.
-        fn arm_one_alias(&self, index: u64, span_pa: u64, span_len: u64, tag: &str) -> bool {
-            let alias = span_pa & 0xFFFF_FFFF;
-            // Case A — the span is already sub-4 GiB and inside the identity inbound region: the 32-bit
-            // truncation is a no-op (alias == span_pa) and NET-4h's identity region already reaches it.
-            // No alias needed (and arming one would collide with identity). This is the low-heap path.
-            if span_pa == alias && alias >= self.ident_lo && alias + span_len <= self.ident_hi {
-                serial_println!(
-                    "{}   [net4p] {} span [{:#x}..{:#x}) already sub-4GiB inside the identity inbound region [{:#x}..{:#x}) — no alias needed ::",
-                    P4, tag, span_pa, span_pa + span_len, self.ident_lo, self.ident_hi
-                );
-                return true;
-            }
-            // Guard — a truncated span that crosses the 4 GiB boundary in 32-bit space is not contiguous
-            // under truncation, so one region cannot cover it (would need a wrap). Refuse.
-            if alias.checked_add(span_len).map_or(true, |e| e > 0x1_0000_0000) {
-                serial_println!(
-                    "{}   !! [net4p] {} alias [{:#x}..+{:#x}) crosses the 4GiB boundary — one region cannot cover it; REFUSING ::",
-                    P4, tag, alias, span_len
-                );
-                return false;
-            }
-            let alias_hi = alias + span_len;
-            let overlaps = |lo: u64, hi: u64| hi > lo && alias < hi && lo < alias_hi;
-            // Collision 1 — the identity inbound region (index 0). An armed alias passing this is always
-            // `< ident_lo` (below the DRAM base): the alias is a 32-bit value `< 4 GiB`, the identity
-            // region is `[DRAM base .. DRAM top)`, so no overlap forces the alias below the base.
-            if overlaps(self.ident_lo, self.ident_hi) {
-                serial_println!(
-                    "{}   !! [net4p] {} alias [{:#x}..{:#x}) OVERLAPS the identity inbound region [{:#x}..{:#x}) — REFUSING (would shadow/ambiguate the inbound match) ::",
-                    P4, tag, alias, alias_hi, self.ident_lo, self.ident_hi
-                );
-                return false;
-            }
-            // Collision 2 — controller-0's PCIe MEM window (where downstream BARs decode). An inbound
-            // write landing in that range risks being routed peer-to-peer to a BAR instead of upstream.
-            if overlaps(self.mem_lo, self.mem_hi) {
-                serial_println!(
-                    "{}   !! [net4p] {} alias [{:#x}..{:#x}) OVERLAPS the PCIe MEM/BAR window [{:#x}..{:#x}) — REFUSING (peer-to-peer mis-route hazard) ::",
-                    P4, tag, alias, alias_hi, self.mem_lo, self.mem_hi
-                );
-                return false;
-            }
-            serial_println!(
-                "{}   [net4p] {} alias check CLEAR: [{:#x}..{:#x}) below DRAM base {:#x}, clear of PCIe MEM/BAR [{:#x}..{:#x}) — arming ::",
-                P4, tag, alias, alias_hi, self.ident_lo, self.mem_lo, self.mem_hi
-            );
-            program_inbound_alias(self.atu_base, index, alias, span_len, span_pa, tag);
-            true
-        }
-
         /// Bring up the C+ descriptor-ring engine after the M1 soft reset: unlock the config
         /// registers, allocate + program the RX/TX rings, set the packet-size / DMA-burst / RX-filter
         /// configuration, enable RX+TX, re-lock the config, and mask interrupts (polled bring-up).
@@ -872,59 +742,41 @@ mod metal {
             let cpc = self.r16(REG_CPLUSCMD);
             serial_println!("{}   CPlusCmd[{:#x}] = {:#06x} (C+ engine) ::", P4, REG_CPLUSCMD, cpc);
 
-            // NET-4n — enable 64-bit ( >4 GiB ) buffer-address DMA. THE unified-RX-defect fix. The
-            // driver already writes the FULL 40-bit buffer PA into every descriptor (`Desc.addr` is a
-            // u64, both dwords published — net4g confirmed [MATCH] on metal) and the ring bases into the
-            // dedicated 64-bit RDSAR/TNPDS. What was missing is telling the C+ engine to USE the high
-            // dword for the per-buffer *payload* write: with CPlusCmd.PCIDAC clear (boot-16 read back
-            // 0x2021, bit4=0) the engine drops `addr[63:32]` on payload TLPs, so a heap buffer at the
-            // Orin's high DMA-window (`ORIN-DMA-WINDOW` seats it at ~9.6 GiB, e.g. 0x2_683cb800)
-            // truncates to ~1.6 GiB — BELOW the inbound iATU window's 0x8000_0000 base (NET-4h) — and the
-            // RC slave-errors it to the fabric sink: the IOB `FillWrite` RAS at ADDR 0x200 + an untouched
-            // (alloc_zeroed) buffer. Descriptor FETCH is unaffected (RDSAR is a real 64-bit register), so
-            // the ring stays coherent while payloads vanish — the exact NET-4d/f/g/m asymmetry, and why
-            // only the first buffer the engine fills after RxEnb lands cleanly (address latched from the
-            // ring context) while the rest truncate/tear. Set PCIDAC so EVERY payload write carries the
-            // full 64-bit address — the r8169 `NETIF_F_HIGHDMA` path. Preserve all other bits (a genuine
-            // register write; announced). This is the brief's PREFERRED "silicon-is-64-bit-capable" fork
-            // (the RDSAR >4 GiB fetch proves it is); the sub-4 GiB DMA-arena fork is the fallback if a
-            // metal boot shows the truncation survives PCIDAC.
-            // NET-4n2: this is the FIRST of two PCIDAC writes. Boot-17 proved it does NOT survive the ring
-            // programming that follows (read back 0x2021), so a second, decisive re-apply runs as the FINAL
-            // C+CR write after RCR (see below). Keep this one: the delta between it and the final re-read is
-            // the oracle for whether the pre-ring store reverts on this silicon.
-            let cpc_dac = cpc | CPCMD_PCIDAC;
-            serial_println!(
-                "{}   >>> REG WRITE (NET-4n): CPlusCmd[{:#x}] {:#06x} -> {:#06x} (set PCIDAC — enable 64-bit >4GiB buffer DMA; initial, pre-ring) ::",
-                P4, REG_CPLUSCMD, cpc, cpc_dac
-            );
-            self.w16(REG_CPLUSCMD, cpc_dac);
+            // NET-4q — the RTL8168 is 64-bit-DMA capable via the descriptor `addr` field ALONE; do NOT
+            // gate 64-bit payload DMA on CPlusCmd.PCIDAC. Per the L4T facts (r8169_main.c): PCIDAC (C+CR
+            // bit 4) is a parallel-PCI "Dual Address Cycle" relic that the reference driver NEVER sets for
+            // a PCIe 8168/8125 and in fact masks OUT of the value it writes (CPCMD_MASK); on a PCIe part a
+            // 64-bit (DAC) memory TLP is formed NATIVELY from the descriptor's `__le64 addr` high dword,
+            // not from any C+ enable bit. So our boots-16..18 observation "PCIDAC won't latch" is EXPECTED
+            // and HARMLESS — a no-op on this silicon — NOT evidence of a 32-bit-only payload path. The
+            // NET-4n (PCIDAC-is-the-64-bit-enable) -> NET-4o (sub-4 GiB arena) -> NET-4p (inbound-iATU
+            // alias) chain was built on that misread bit and is SUPERSEDED. We preserve the reset-default
+            // CplusCmd (it already selects the C+ engine) and only read it back below as a standing witness
+            // that PCIDAC stays clear (the correct reading). The full 64-bit buffer PA already rides in
+            // every descriptor's `addr` (u64, both dwords published — net4g [MATCH] on metal); the ring
+            // bases ride the dedicated 64-bit RDSAR/TNPDS pair (High-before-Low, below). region-0 identity
+            // `[0x8000_0000, 0x2_8000_0000)` (NET-4h) already covers the high buffer PAs (~9.6 GiB), so the
+            // natively-formed DAC TLP lands with no alias.
 
             // Allocate + program the descriptor rings (256-byte-aligned physical bases) from the high
-            // kernel heap (NET-4p reverted NET-4o's impossible sub-4 GiB arena; no clean low DRAM exists).
+            // kernel heap. Buffers stay high; region-0 identity reaches them once the NIC emits the full
+            // 64-bit (DAC) address — no sub-4 GiB arena (NET-4o) and no inbound alias (NET-4p) needed.
             self.alloc_rx();
             self.alloc_tx();
 
-            // NET-4p — arm the inbound-iATU ALIAS regions NOW: after the (high-heap) buffer PAs are known
-            // and BEFORE RxEnb/TxEnb below, so the FIRST payload write is already covered. Each region
-            // maps the NIC's truncated 32-bit payload address back up to the real buffer PA; the collision
-            // check fails the bring-up closed rather than arm a region that would shadow the identity
-            // inbound region or mis-route into the PCIe MEM/BAR window.
-            if !self.arm_dma_aliases() {
-                serial_println!(
-                    "{}   !! NET-4p: inbound-iATU alias could not be armed (collision) — REFUSING ring bring-up rather than DMA into an unreachable/mis-routed surface ::",
-                    P4
-                );
-                return false;
-            }
             let rx_phys = self.rx_ring as u64;
             let tx_phys = self.tx_ring as u64;
-            serial_println!("{}   >>> REG WRITE (M2): RDSAR[{:#x}] = {:#x} (RX ring, {} desc) ::", P4, REG_RDSAR, rx_phys, NUM_RX);
-            self.w32(REG_RDSAR, rx_phys as u32);
+            // NET-4q — program the descriptor-ring bases as full 64-bit hi/lo pairs, HIGH dword FIRST.
+            // r8169 writes RxDescAddrHigh / TxDescStartAddrHigh BEFORE the matching Low as a documented
+            // erratum ordering (some 8168 variants latch the ring base only when the low dword lands with
+            // the high already in place); our prior code wrote Low-then-High, the reverse of the documented
+            // sequence. Emit High first so the full 64-bit base is latched from the NIC's view.
+            serial_println!("{}   >>> REG WRITE (M2): RDSAR[{:#x}] = {:#x} (RX ring, {} desc; hi-before-lo) ::", P4, REG_RDSAR, rx_phys, NUM_RX);
             self.w32(REG_RDSAR + 4, (rx_phys >> 32) as u32);
-            serial_println!("{}   >>> REG WRITE (M2): TNPDS[{:#x}] = {:#x} (TX ring, {} desc) ::", P4, REG_TNPDS, tx_phys, NUM_TX);
-            self.w32(REG_TNPDS, tx_phys as u32);
+            self.w32(REG_RDSAR, rx_phys as u32);
+            serial_println!("{}   >>> REG WRITE (M2): TNPDS[{:#x}] = {:#x} (TX ring, {} desc; hi-before-lo) ::", P4, REG_TNPDS, tx_phys, NUM_TX);
             self.w32(REG_TNPDS + 4, (tx_phys >> 32) as u32);
+            self.w32(REG_TNPDS, tx_phys as u32);
 
             // Receive max size + max TX packet size.
             serial_println!("{}   >>> REG WRITE (M2): RMS[{:#x}] = {:#06x}; MTPS[{:#x}] = {:#04x} ::", P4, REG_RMS, RX_BUF_SIZE as u16, REG_MTPS, MTPS_DEFAULT);
@@ -948,54 +800,12 @@ mod metal {
             serial_println!("{}   >>> REG WRITE (M2): RCR[{:#x}] = {:#010x} (promiscuous bring-up) ::", P4, REG_RCR, rcr);
             self.w32(REG_RCR, rcr);
 
-            // NET-4n2 — PCIDAC did not LATCH from the pre-ring write. Boot-17: the RMW above wrote
-            // CPlusCmd 0x2021 -> 0x2031 at the TOP of bring-up, but the rings-up readback (below) read
-            // 0x2021 — bit 4 dropped during the ring/RxEnb/RCR programming. Static trace RULES OUT a later
-            // clobber: the RMW above is the ONLY write to CPlusCmd (0xE0) in this driver, it sits inside the
-            // 9346 unlock window, and no register programmed after it aliases 0xE0/0xE1 (RDSAR@0xE4,
-            // RMS@0xDA, MTPS@0xEC, TCR@0x40, RCR@0x44, CR@0x37 all miss it). So the bit is not surviving
-            // being set BEFORE the descriptor engine is armed — the r8169 order writes C+CR late, and some
-            // RTL8168 variants only latch the DAC bit as the final C+CR state. Re-apply PCIDAC HERE, as the
-            // last CPlusCmd write — after RCR arms reception, still inside the unlock window — as a
-            // read-modify-write with a bounded confirm loop, and print the immediate readback so the capture
-            // shows the exact store that does or does not stick. This makes boot-18 decisive: either PCIDAC
-            // reads back set here (>4 GiB payloads land → LEASE) or it provably will not latch even as the
-            // final write under unlock (→ the sub-4 GiB DMA-arena fallback, a separate arc).
-            let mut cpc_final = self.r16(REG_CPLUSCMD);
-            let mut latched = cpc_final & CPCMD_PCIDAC != 0;
-            for attempt in 0..3u8 {
-                if latched {
-                    break;
-                }
-                let want = cpc_final | CPCMD_PCIDAC;
-                serial_println!(
-                    "{}   >>> REG WRITE (NET-4n2): CPlusCmd[{:#x}] {:#06x} -> {:#06x} (re-apply PCIDAC — final C+CR write, post-RCR; attempt {}) ::",
-                    P4, REG_CPLUSCMD, cpc_final, want, attempt
-                );
-                self.w16(REG_CPLUSCMD, want);
-                unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
-                cpc_final = self.r16(REG_CPLUSCMD);
-                latched = cpc_final & CPCMD_PCIDAC != 0;
-                serial_println!(
-                    "{}   CPlusCmd readback after final write = {:#06x} PCIDAC={} ({}) ::",
-                    P4, cpc_final, (cpc_final >> 4) & 1,
-                    if latched { "LATCHED" } else { "still clear — retrying" }
-                );
-            }
-            if !latched {
-                // Established negative (boot-18, decisive): PCIDAC will not hold even as the final write
-                // under 9346 unlock — the C+ 64-bit-DAC path is unusable on this silicon. This is now the
-                // EXPECTED reading, not a failure: NET-4p keeps the buffers in the high heap and adds an
-                // inbound-iATU ALIAS (armed above) that up-translates the truncated 32-bit payload writes
-                // to the real high PAs, so 32-bit payload DMA (PCIDAC clear) is sufficient. The readback
-                // is kept as the standing oracle that this remains the silicon's behavior.
-                serial_println!(
-                    "{}   !! NET-4n2: PCIDAC WILL NOT LATCH (CPlusCmd stays {:#06x} after the final write under 9346 unlock) — C+ 64-bit-DAC path unusable on this silicon; EXPECTED — NET-4p's inbound-iATU alias makes 32-bit payload DMA sufficient ::",
-                    P4, cpc_final
-                );
-            }
+            // NET-4q — no PCIDAC write. Per the facts PCIDAC is a dead parallel-PCI relic on this PCIe
+            // 8168 (never set by r8169, masked out of CPCMD_MASK); 64-bit (DAC) payload TLPs form natively
+            // from the descriptor high dword. The rings-up readback below keeps PCIDAC as a standing
+            // witness: it is EXPECTED to read CLEAR, and that is the correct 64-bit-capable state.
 
-            // Re-lock the config registers (AFTER the final PCIDAC re-apply so the store lands unlocked).
+            // Re-lock the config registers.
             self.w8(REG_CFG9346, CFG9346_LOCK);
 
             // Polled bring-up: mask every interrupt source, clear any latched status (write-1-to-clear).
@@ -1010,14 +820,13 @@ mod metal {
                 serial_println!("{}   TCR readback = {:#010x} — POISON (open bus / device stopped answering); ring bring-up FAILED ::", P4, tcr_rb);
                 return false;
             }
-            // NET-4n: confirm PCIDAC latched (a live 64-bit-DMA enable is the whole fix; a chip that
-            // silently dropped the write would keep truncating >4 GiB payloads on the next boot).
+            // NET-4q: read back CplusCmd as a standing witness. PCIDAC is EXPECTED CLEAR — 64-bit DAC
+            // payload TLPs form natively from the descriptor high dword, not from this dead legacy bit.
             let cpc_rb = self.r16(REG_CPLUSCMD);
+            let pcidac = (cpc_rb & CPCMD_PCIDAC != 0) as u8;
             serial_println!(
-                "{}   rings up: RX @ {:#x} ({} desc) TX @ {:#x} ({} desc); TCR readback {:#010x} (live); CPlusCmd {:#06x} PCIDAC={} (64-bit DMA {}) ::",
-                P4, rx_phys, NUM_RX, tx_phys, NUM_TX, tcr_rb,
-                cpc_rb, (cpc_rb >> 4) & 1,
-                if cpc_rb & CPCMD_PCIDAC != 0 { "ENABLED" } else { "NOT latched" }
+                "{}   rings up: RX @ {:#x} ({} desc) TX @ {:#x} ({} desc); TCR readback {:#010x} (live); CPlusCmd {:#06x} PCIDAC={} (expected clear; 64-bit DMA rides the descriptor addr) ::",
+                P4, rx_phys, NUM_RX, tx_phys, NUM_TX, tcr_rb, cpc_rb, pcidac
             );
             true
         }
@@ -1786,63 +1595,6 @@ mod metal {
         unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
     }
 
-    /// NET-4p — program one DWC INBOUND iATU ALIAS region. Unlike NET-4h's identity region (BASE=TARGET),
-    /// here BASE != TARGET: an incoming bus-master write whose (truncated 32-bit) address falls in
-    /// `[alias_base, alias_base+size)` is translated UP to `target + (addr - alias_base)` — i.e. back to
-    /// the real high-heap buffer PA whose high dword the C+ engine's 32-bit `Desc.addr[31:0]` dropped.
-    /// `target` is the real (possibly >4 GiB) buffer span base; `alias_base` = `target & 0xFFFF_FFFF`.
-    /// Uses a SPARE inbound index (dir=1) so it never clobbers the NET-4h identity region 0. Same DWC
-    /// register model + write discipline (announced writes, base/limit/target published `dsb sy` before
-    /// enable) as `program_inbound_atu`, plus a readback WITNESS proving the region latched.
-    fn program_inbound_alias(atu_base: u64, index: u64, alias_base: u64, size: u64, target: u64, tag: &str) {
-        let region = atu_base + ATU_INBOUND_DIR_OFF + index * ATU_REGION_STRIDE;
-        let limit = alias_base + size - 1;
-        let w = |off: u64, v: u32| unsafe { write_volatile((region + off) as *mut u32, v) };
-        serial_println!(
-            "{}   [net4p] inbound iATU ALIAS region {} @ {:#x} ({}) — truncated PCIe DMA [{:#x}..{:#x}] -> real DRAM {:#x} (up-translate, type MEM) ::",
-            P4, index, region, tag, alias_base, limit, target
-        );
-        serial_println!(
-            "{}   >>> ATU WRITE (net4p): BASE lo/hi = {:#010x}/{:#010x} ::",
-            P4, alias_base as u32, (alias_base >> 32) as u32
-        );
-        w(ATU_UNR_LOWER_BASE, alias_base as u32);
-        w(ATU_UNR_UPPER_BASE, (alias_base >> 32) as u32);
-        serial_println!(
-            "{}   >>> ATU WRITE (net4p): LIMIT lo/hi = {:#010x}/{:#010x} ::",
-            P4, limit as u32, (limit >> 32) as u32
-        );
-        w(ATU_UNR_LOWER_LIMIT, limit as u32);
-        w(ATU_UNR_UPPER_LIMIT, (limit >> 32) as u32);
-        serial_println!(
-            "{}   >>> ATU WRITE (net4p): TARGET lo/hi = {:#010x}/{:#010x} (the real high buffer PA) ::",
-            P4, target as u32, (target >> 32) as u32
-        );
-        w(ATU_UNR_LOWER_TARGET, target as u32);
-        w(ATU_UNR_UPPER_TARGET, (target >> 32) as u32);
-        serial_println!("{}   >>> ATU WRITE (net4p): REGION_CTRL1 = TYPE_MEM ::", P4);
-        w(ATU_UNR_REGION_CTRL1, ATU_TYPE_MEM);
-        // Publish base/limit/target BEFORE the region goes live (address-match, region-size increased —
-        // the target sits >32 bits up even though the alias base is a 32-bit value).
-        unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
-        serial_println!(
-            "{}   >>> ATU WRITE (net4p): REGION_CTRL2 = ENABLE|INCREASE_REGION_SIZE (bit30=0 address-match) — arming alias region ::",
-            P4
-        );
-        w(ATU_UNR_REGION_CTRL2, ATU_ENABLE | ATU_INCREASE_REGION_SIZE);
-        unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
-        // Readback WITNESS — the alias region's live BASE/LIMIT/TARGET/enable (the boot-20 oracle line).
-        let r = |off: u64| -> u32 { unsafe { read_volatile((region + off) as *const u32) } };
-        let rb_base = ((r(ATU_UNR_UPPER_BASE) as u64) << 32) | r(ATU_UNR_LOWER_BASE) as u64;
-        let rb_limit = ((r(ATU_UNR_UPPER_LIMIT) as u64) << 32) | r(ATU_UNR_LOWER_LIMIT) as u64;
-        let rb_target = ((r(ATU_UNR_UPPER_TARGET) as u64) << 32) | r(ATU_UNR_LOWER_TARGET) as u64;
-        let rb_ctrl2 = r(ATU_UNR_REGION_CTRL2);
-        serial_println!(
-            "{}   [net4p] alias region {} ({}) readback: BASE={:#x} LIMIT={:#x} TARGET={:#x} CTRL2={:#010x} (enabled={}) ::",
-            P4, index, tag, rb_base, rb_limit, rb_target, rb_ctrl2, (rb_ctrl2 >> 31) & 1
-        );
-    }
-
     /// ORIN-DMA-WINDOW — one-shot READ-ONLY probe (UNAOS_DMAWIN): dump the inbound-DMA window DERIVED
     /// from the RC's `dma-ranges`, read BACK the just-programmed inbound iATU region-0 registers, and
     /// cross-check both against the `ram_gib_mask`-derived identity window NET-4h armed. This closes the
@@ -2250,13 +2002,6 @@ mod metal {
         let mut nic = Rtl8168 {
             mmio_base: cpu_addr,
             mac: [0; 6],
-            // NET-4p: the ATU base + the two collision-check windows the alias arming needs (the identity
-            // inbound region NET-4h just programmed, and controller-0's PCIe MEM/BAR window).
-            atu_base,
-            ident_lo: dram_base,
-            ident_hi: dram_base + dram_size,
-            mem_lo: win.pci_base,
-            mem_hi: win.pci_base + win.size,
             rx_ring: core::ptr::null_mut(),
             rx_buffers: core::ptr::null_mut(),
             rx_cur: 0,
