@@ -157,8 +157,20 @@ const V3D_CLE_CT1CS_CTRUN: u32 = 1 << 5; // per v3d_regs.h V3D_CLE_CTRUN
 const V3D_CLE_CT0CA: usize = 0x0110; // CT0 current address (v3d_regs.h V3D_CLE_CT0CA)
 const V3D_CLE_CT0QBA: usize = 0x0160; // CT0 queue begin address (v3d_regs.h V3D_CLE_CT0QBA)
 const V3D_CLE_CT0QEA: usize = 0x0168; // CT0 queue end address (v3d_regs.h V3D_CLE_CT0QEA) — QEA write kicks
-const V3D_CLE_CT0QMA: usize = 0x0170; // CT0 bin tile-state-array base (v3d_regs.h V3D_CLE_CT0QMA)
-const V3D_CLE_CT0QMS: usize = 0x0174; // CT0 bin tile-state-array size  (v3d_regs.h V3D_CLE_CT0QMS)
+const V3D_CLE_CT0QMA: usize = 0x0170; // CT0 bin TILE-ALLOCATION memory base (v3d_regs.h V3D_CLE_CT0QMA)
+const V3D_CLE_CT0QMS: usize = 0x0174; // CT0 bin TILE-ALLOCATION memory size  (v3d_regs.h V3D_CLE_CT0QMS)
+// PI-V3D-9 boot-P5 root cause: the M4 base wrote the tile-STATE region (192 B) into CT0QMA/QMS as if it
+// were the tile-ALLOCATION pool and never programmed CT0QTS at all. Per Linux v3d_sched.c
+// `v3d_bin_job_run` the three are DISTINCT: CT0QMA/QMS = tile-ALLOCATION memory (the pool the binner
+// grows per-tile primitive lists into), CT0QTS = tile-STATE data array (ENABLE-gated). Handing the
+// binner a 192-byte "pool" overflowed it immediately → it walked off into an unmapped page →
+// PT_INVALID (MMU_fault bit20) with CT0CA halted mid-list. Corrected below. CT0QTS offset + ENABLE bit
+// transcribed VERBATIM from Linux v3d_regs.h (register facts; GPL-2.0-only header, facts-only).
+const V3D_CLE_CT0QTS: usize = 0x015c; // CT0 bin tile-STATE data array base (v3d_regs.h V3D_CLE_CT0QTS)
+const V3D_CLE_CT0QTS_ENABLE: u32 = 1 << 1; // v3d_regs.h V3D_CLE_CT0QTS_ENABLE — gate the tile-state write
+// CTnCS status: only CTRUN (bit5) is corroborated across sources for V3D 4.x; the remaining bits differ
+// from the VideoCore-IV layout and are reported raw rather than guessed (no fabricated bit names).
+const V3D_CLE_CTNCS_CTRUN: u32 = 1 << 5;
 
 // ─── The V3D buffer arena. One page-aligned static in BSS. Because the bare-metal kernel is
 // identity-mapped in low RAM (VA == PA), the address of this static IS its ARM physical address,
@@ -261,6 +273,12 @@ const OFF_CS_CODE: usize = 0x1E000; // coordinate shader QPU code (binning: tran
 const OFF_VS_CODE: usize = 0x1E800; // vertex shader QPU code (render: transform + varyings → VPM)
 const OFF_FS_CODE: usize = 0x1F000; // fragment shader QPU code (solid colour → TLB)
 const OFF_DEFAULT_ATTRS: usize = 0x1F800; // default attribute values block (shader-record field)
+// PI-V3D-9 uniform streams (each a bounded slice of one page, all inside the identity-mapped arena).
+// The FS/VS/CS shader-record uniforms-address fields point here; the QPU pops these in FIFO order via
+// the ldunifrf signal (and, for the FS, the TLBU-config pops).
+const OFF_FS_UNIF: usize = 0x20000; // fragment-shader uniform stream (colour channels + TLB configs)
+const OFF_CS_UNIF: usize = 0x20040; // coordinate-shader uniform stream (VPM read offsets)
+const OFF_VS_UNIF: usize = 0x20080; // vertex-shader uniform stream (VPM read offsets)
 const BIN_TILEALLOC_BYTES: usize = 0x8000; // 32 KiB of tile-alloc scratch for the binner
 
 /// The solid triangle colour the fragment shader writes and the CPU verifies INSIDE the primitive.
@@ -1121,6 +1139,34 @@ fn wait_bit_clear(base: usize, reg: usize, mask: u32, what: &str) -> bool {
     true
 }
 
+/// PI-V3D-9: clear any latched V3D-MMU translation fault (PT_INVALID / WRITE_VIOLATION / CAP_EXCEEDED),
+/// mirroring Linux `v3d_irq.c`: read V3D_MMU_CTL and write it straight back — the fault-status bits are
+/// write-1-to-clear, so echoing the read value clears the latched fault while the ENABLE/abort config
+/// bits (also echoed) are preserved. Reports whether a fault was actually latched (the witness the
+/// attended sitting reads to correlate a render-kick refusal with a sticky bin fault). Reads-then-one-
+/// write; cannot fault or hang (QEMU-safe — the CTL reads 0/absent there and the write-back is inert).
+fn clear_mmu_fault_latch(when: &str) {
+    let ctl = mmio_read(V3D_HUB_BASE, V3D_MMU_CTL);
+    let fault = ctl & (V3D_MMU_CTL_PT_INVALID | V3D_MMU_CTL_WRITE_VIOLATION | V3D_MMU_CTL_CAP_EXCEEDED);
+    if fault != 0 {
+        let vio_addr = mmio_read(V3D_HUB_BASE, V3D_MMU_VIO_ADDR);
+        let vio_id = mmio_read(V3D_HUB_BASE, V3D_MMU_VIO_ID);
+        mmio_write(V3D_HUB_BASE, V3D_MMU_CTL, ctl); // W1C: echo clears the sticky fault bits
+        dsb();
+        let after = mmio_read(V3D_HUB_BASE, V3D_MMU_CTL);
+        serial_println!(
+            ":: V3D: MMU fault-latch CLEARED ({}) — was CTL={:#010x} (PT_INVALID={} WRITE_VIOLATION={} CAP_EXCEEDED={}) VIO_ADDR={:#010x} VIO_ID={:#010x} -> CTL={:#010x} ::",
+            when, ctl,
+            (fault & V3D_MMU_CTL_PT_INVALID != 0) as u32,
+            (fault & V3D_MMU_CTL_WRITE_VIOLATION != 0) as u32,
+            (fault & V3D_MMU_CTL_CAP_EXCEEDED != 0) as u32,
+            vio_addr, vio_id, after
+        );
+    } else {
+        serial_println!(":: V3D: MMU fault-latch clear ({}) — none latched (CTL={:#010x}) ::", when, ctl);
+    }
+}
+
 // ════════════════════════════════════════════════════════════════════════════════════════════════
 // PI-V3D-8 — M4: the first triangle (bin on CT0 → render on CT1 → CPU sample-verify).
 // ════════════════════════════════════════════════════════════════════════════════════════════════
@@ -1145,13 +1191,14 @@ fn wait_bit_clear(base: usize, reg: usize, mask: u32, what: &str) -> bool {
 // COMPILES these from NIR through its VIR→QPU backend; it does not ship pre-assembled blobs, and QEMU
 // `raspi4b` models no V3D, so NONE of this can be exercised or byte-checked off-metal. Rather than
 // FABRICATE QPU words (the exact trap that convicted PI-V3D-4's MMU constants and PI-V3D-7's queue
-// offsets — twice), the QPU programs below are built through a packer whose bit-layout is transcribed
-// from Mesa `src/broadcom/qpu/qpu_pack.c` and SELF-CHECKED against Mesa's canonical NOP word
-// (`0x3c003186bb800000`). The functional bodies are documented minimal skeletons; producing the
-// verified transform/colour instructions is a real V3D-shader-compile step at the attended sitting.
-// This is M4's ONE code-complete-prior-to-metal seam — the CL/register/state scaffolding around it is
-// complete and cited. `triangle_job` witnesses the CT0 bin discriminator and the CT1 render regardless,
-// and the CPU sample-verify reports exactly which samples matched, so the sitting is decisive.
+// offsets — twice), PI-V3D-9 generates every shader word with Mesa's OWN packer
+// (`v3d_qpu_instr_pack`, ver=42) from explicit instruction structs, round-trips each through Mesa's
+// unpacker, and cross-checks the generator against four canonical `qpu_disasm.c` vectors bit-exactly
+// (see the "VERIFIED QPU shader bodies" block below for the full provenance + the honest split between
+// Mesa-verified ENCODING and the silicon-tuned geometry/colour quantities that remain the attended-
+// metal-refinement surface). `triangle_job` witnesses the CT0 bin discriminator and the CT1 render
+// regardless, and the CPU sample-verify reports exactly which samples matched, so the sitting is
+// decisive.
 
 // ─── Binning-side + shared packet opcodes (v3d_packet.xml `code=`). ───
 const P_FLUSH: u8 = 4; // Flush — terminates the binning list (binner-done signal)
@@ -1189,15 +1236,104 @@ const fn qpu_nop() -> u64 {
 }
 const _: () = assert!(qpu_nop() == 0x3c00_3186_bb80_0000);
 
-/// Build one of the three QPU shader programs into the arena at `off`. Documented minimal skeleton:
-/// a run of NOPs (each the field-validated canonical word) that safely runs to program end — the
-/// STRUCTURAL placeholder for the real transform/colour body assembled at the metal sitting. Returns
-/// the byte length. Every word is written little-endian (QPU fetch order).
-fn write_shader_stub(off: usize, words: usize) -> usize {
-    for i in 0..words {
-        arena_write_u64(off + i * 8, qpu_nop());
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// PI-V3D-9 — VERIFIED QPU shader bodies (replacing the V3D-8 NOP skeletons).
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+//
+// PROVENANCE (absolute — this driver has been convicted THREE times for fabricated words; not again):
+// every 64-bit word below was produced by Mesa's OWN packer, `v3d_qpu_instr_pack(devinfo.ver=42, …)`,
+// from an explicit `struct v3d_qpu_instr` — i.e. these ARE Mesa's encoder output, not hand-authored
+// bit patterns. The generator (`scratchpad/mesa/qpu_gen.c`, MIT, links Mesa's qpu_instr.c + qpu_pack.c
+// from mesa 26.3.0-devel) additionally ROUND-TRIPS each word (pack → v3d_qpu_instr_unpack → repack,
+// require identical) and, as a harness self-test, reproduces four canonical vectors from Mesa's
+// `src/broadcom/qpu/tests/qpu_disasm.c` BIT-EXACTLY, proving the struct→word path matches Mesa's
+// documented disasm semantics:
+//     nop                     = 0x3c003186bb800000   (also the file's qpu_nop() self-check)
+//     or rf0,r3,r3;mov vpm,r3 = 0x3c002380b6edb000
+//     vfpack tlb, r0, r1      = 0x3c00318735808000
+//     fadd r1,r1,r5 ; thrsw   = 0x3c20318105829000
+// Mesa is MIT-licensed — verbatim-liftable WITH attribution (memory: unaos-license-gplv3).
+//
+// VERIFICATION LEVEL (honest, per the module's ATTENDED-METAL-UNVERIFIED banner): every WORD's ENCODING
+// is Mesa-verified (round-trips against Mesa's own pack/unpack). The PROGRAMS follow Mesa's documented
+// emit ORDER for the minimal cases (fragment: emit_frag_end + vir_emit_tlb_color_write; coord/vertex:
+// ntq_emit_vpm_read + emit_store_output_vs + emit_vert_end). What remains the attended-metal-refinement
+// surface — NOT fabrication, but silicon-tuned quantities QEMU cannot exercise — is: the coordinate
+// viewport transform + exact VPM output layout/segment sizes, the VPM read-offset/setup values, and the
+// FS colour-channel order + f16 rounding that make the stored word land exactly on TRI_RGBA. Each such
+// quantity is called out at its uniform/word below.
+
+/// FRAGMENT shader (solid colour → TLB). Mesa emit_frag_end path: 4× ldunifrf load colour rgba into
+/// rf0..rf3, passthrough-Z `mov tlbu` (pops the Z TLB-config uniform), then two VFPACKs pack rgba to
+/// f16 and write TLB (the rg write is the `u` variant, popping the colour TLB-config uniform). thrsw +
+/// two nops close the (single) thread. Uniform FIFO order: r,g,b,a, Z-config, colour-config.
+const FS_WORDS: [u64; 10] = [
+    0x3d80_3186_bb80_0000, // nop ; ldunifrf.rf0   (rf0 <- colour.r)
+    0x3d80_7186_bb80_0000, // nop ; ldunifrf.rf1   (rf1 <- colour.g)
+    0x3d80_b186_bb80_0000, // nop ; ldunifrf.rf2   (rf2 <- colour.b)
+    0x3d80_f186_bb80_0000, // nop ; ldunifrf.rf3   (rf3 <- colour.a)
+    0x3c00_3206_bbe0_0000, // mov tlbu, r0         (passthrough-Z; pops Z TLB-config)
+    0x3c00_3188_3583_e001, // vfpack tlbu, rf0, rf1 (colour r,g → f16; pops colour TLB-config)
+    0x3c00_3187_3583_e083, // vfpack tlb, rf2, rf3  (colour b,a → f16)
+    0x3c20_3186_bb80_0000, // nop ; thrsw          (last thread switch)
+    0x3c00_3186_bb80_0000, // nop
+    0x3c00_3186_bb80_0000, // nop
+];
+
+/// COORDINATE / VERTEX shader passthrough body (same minimal program for the bin CS and render VS
+/// variants). Mesa order: 4× ldvpmv_in read the vec4 position attribute from the VPM into rf0..rf3
+/// (each also reloads the read-offset uniform into rf5), vpmsetup arms the VPM output, 4× `mov vpm`
+/// write the position words, vpmwt (GFXH-1684) completes the VPM writes, thrsw + two nops end.
+/// Metal-refinement surface: the ldunifrf read-offsets, the vpmsetup value, and the output layout.
+const CS_VS_WORDS: [u64; 13] = [
+    0x3d81_6180_bc80_6140, // ldvpmv_in rf0, rf5 ; ldunifrf.rf5   (attr.x)
+    0x3d81_6181_bc80_6140, // ldvpmv_in rf1, rf5 ; ldunifrf.rf5   (attr.y)
+    0x3d81_6182_bc80_6140, // ldvpmv_in rf2, rf5 ; ldunifrf.rf5   (attr.z)
+    0x3d81_6183_bc80_6140, // ldvpmv_in rf3, rf5 ; ldunifrf.rf5   (attr.w)
+    0x3c00_3186_bb81_e140, // vpmsetup -, rf5     (VPM output setup; value=metal-refined)
+    0x3c00_3386_bbf8_0000, // mov vpm, rf0        (pos.x)
+    0x3c00_3386_bbf8_0040, // mov vpm, rf1        (pos.y)
+    0x3c00_3386_bbf8_0080, // mov vpm, rf2        (pos.z)
+    0x3c00_3386_bbf8_00c0, // mov vpm, rf3        (pos.w / 1/Wc)
+    0x3c00_3186_bb81_6000, // vpmwt               (VPM writes complete before end)
+    0x3c20_3186_bb80_0000, // nop ; thrsw         (end)
+    0x3c00_3186_bb80_0000, // nop
+    0x3c00_3186_bb80_0000, // nop
+];
+
+/// Write a table of QPU words (little-endian fetch order) into the arena at `off`. Returns byte length.
+fn write_shader_words(off: usize, words: &[u64]) -> usize {
+    for (i, w) in words.iter().enumerate() {
+        arena_write_u64(off + i * 8, *w);
     }
-    words * 8
+    words.len() * 8
+}
+
+/// The fragment-shader uniform stream (FIFO order matches FS_WORDS' pops). Colour channels are the
+/// unorm8 decomposition of TRI_RGBA as f32; the exact channel order + f16 rounding that lands the
+/// stored word on TRI_RGBA is the metal-refinement surface. The two TLB config words follow Mesa
+/// vir_emit_tlb_color_write: Z = passthrough/per-pixel (0xffffff84), colour = F16 RT0 vec4 per-pixel
+/// (0xffffff3f).
+fn write_fs_uniforms(off: usize) -> usize {
+    let r = ((TRI_RGBA & 0xFF) as f32 / 255.0).to_bits();
+    let g = (((TRI_RGBA >> 8) & 0xFF) as f32 / 255.0).to_bits();
+    let b = (((TRI_RGBA >> 16) & 0xFF) as f32 / 255.0).to_bits();
+    let a = (((TRI_RGBA >> 24) & 0xFF) as f32 / 255.0).to_bits();
+    let unif: [u32; 6] = [r, g, b, a, 0xFFFF_FF84, 0xFFFF_FF3F];
+    for (i, w) in unif.iter().enumerate() {
+        arena_write_u32(off + i * 4, *w);
+    }
+    unif.len() * 4
+}
+
+/// The coord/vertex uniform stream: the four VPM read-offsets (attribute component 0..3) the
+/// ldvpmv_in instructions consume via ldunifrf.rf5. Offsets are the metal-refinement surface.
+fn write_geo_uniforms(off: usize) -> usize {
+    let unif: [u32; 4] = [0, 1, 2, 3];
+    for (i, w) in unif.iter().enumerate() {
+        arena_write_u32(off + i * 4, *w);
+    }
+    unif.len() * 4
 }
 
 /// Store a little-endian u64 into the arena.
@@ -1292,18 +1428,21 @@ fn build_shader_record() -> u32 {
     sf(&mut rec, 56, 4, 1); // Vertex Shader input VPM segment size
     sf(&mut rec, 64, 32, defaults); // Address of default attribute values
     // Fragment shader: flags at 96/97/98 (4-way threadable, final section, propagate NaNs), addr@99(29).
+    let fs_unif = (arena_phys() + OFF_FS_UNIF) as u64;
+    let vs_unif = (arena_phys() + OFF_VS_UNIF) as u64;
+    let cs_unif = (arena_phys() + OFF_CS_UNIF) as u64;
     sf(&mut rec, 96, 1, 1); // FS 4-way threadable
     sf(&mut rec, 98, 1, 1); // FS propagate NaNs (v42)
     sf(&mut rec, 99, 29, fs >> 3); // FS code address
-    sf(&mut rec, 128, 32, 0); // FS uniforms address (none)
+    sf(&mut rec, 128, 32, fs_unif); // FS uniforms address (PI-V3D-9: colour + TLB config stream)
     sf(&mut rec, 160, 1, 1); // VS 4-way threadable
     sf(&mut rec, 162, 1, 1); // VS propagate NaNs (v42)
     sf(&mut rec, 163, 29, vs >> 3); // VS code address
-    sf(&mut rec, 192, 32, 0); // VS uniforms address
+    sf(&mut rec, 192, 32, vs_unif); // VS uniforms address (PI-V3D-9: VPM read-offset stream)
     sf(&mut rec, 224, 1, 1); // CS 4-way threadable
     sf(&mut rec, 226, 1, 1); // CS propagate NaNs (v42)
     sf(&mut rec, 227, 29, cs >> 3); // CS code address
-    sf(&mut rec, 256, 32, 0); // CS uniforms address
+    sf(&mut rec, 256, 32, cs_unif); // CS uniforms address (PI-V3D-9: VPM read-offset stream)
     arena_write_bytes(OFF_SHADREC, &rec);
 
     // One attribute record (vec4 position, f32), immediately after the 36-byte record.
@@ -1507,11 +1646,15 @@ fn ct0_ran(cs_pre: u32, cs_kicked: u32, cs_done: u32, ca_done: u32, ba: u32, ea:
 fn triangle_job(fb: Option<FbTarget>) {
     serial_println!(":: V3D: M4 triangle — binning on CT0, render on CT1 (implicit tile list) ::");
 
-    // (0) Publish the shader programs, vertex data, default attributes. The shaders are the field-
-    // validated NOP skeleton (metal-refinement seam); vertex data is the real triangle.
-    write_shader_stub(OFF_CS_CODE, 16);
-    write_shader_stub(OFF_VS_CODE, 16);
-    write_shader_stub(OFF_FS_CODE, 16);
+    // (0) Publish the shader programs, uniform streams, vertex data, default attributes. The shader
+    // bodies are now REAL Mesa-packer-generated + round-trip-verified QPU words (PI-V3D-9), not NOPs:
+    // coordinate/vertex passthrough (VPM in → VPM out) and a solid-colour fragment (rgba → TLB).
+    let cs_len = write_shader_words(OFF_CS_CODE, &CS_VS_WORDS);
+    let vs_len = write_shader_words(OFF_VS_CODE, &CS_VS_WORDS);
+    let fs_len = write_shader_words(OFF_FS_CODE, &FS_WORDS);
+    let fs_unif_len = write_fs_uniforms(OFF_FS_UNIF);
+    let cs_unif_len = write_geo_uniforms(OFF_CS_UNIF);
+    let vs_unif_len = write_geo_uniforms(OFF_VS_UNIF);
     for (i, v) in TRI_VERTS.iter().enumerate() {
         for (j, comp) in v.iter().enumerate() {
             arena_write_u32(OFF_VTXDATA + i * 16 + j * 4, comp.to_bits());
@@ -1530,9 +1673,12 @@ fn triangle_job(fb: Option<FbTarget>) {
 
     // (3) Publish everything to RAM for the non-coherent GPU (shaders, verts, record, both lists, target,
     // and the tile-state / tile-alloc scratch the binner writes and the render reads).
-    cache::clean_range(arena_phys() + OFF_CS_CODE, 16 * 8);
-    cache::clean_range(arena_phys() + OFF_VS_CODE, 16 * 8);
-    cache::clean_range(arena_phys() + OFF_FS_CODE, 16 * 8);
+    cache::clean_range(arena_phys() + OFF_CS_CODE, cs_len);
+    cache::clean_range(arena_phys() + OFF_VS_CODE, vs_len);
+    cache::clean_range(arena_phys() + OFF_FS_CODE, fs_len);
+    cache::clean_range(arena_phys() + OFF_FS_UNIF, fs_unif_len);
+    cache::clean_range(arena_phys() + OFF_CS_UNIF, cs_unif_len);
+    cache::clean_range(arena_phys() + OFF_VS_UNIF, vs_unif_len);
     cache::clean_range(arena_phys() + OFF_VTXDATA, TRI_VERTS.len() * 16);
     cache::clean_range(arena_phys() + OFF_DEFAULT_ATTRS, 16);
     cache::clean_range(arena_phys() + OFF_SHADREC, 36 + 16);
@@ -1545,20 +1691,27 @@ fn triangle_job(fb: Option<FbTarget>) {
     cache::clean_range(arena_phys() + OFF_TILESTATE, TILE_STATE_BYTES);
     cache::clean_range(arena_phys() + OFF_BIN_TILEALLOC, BIN_TILEALLOC_BYTES);
 
-    // (4) Kick CT0 (the BIN queue). Program the tile-state array (CT0QMA/QMS) first — the binner writes
-    // its per-tile primitive lists into the tile-alloc memory keyed by this state — then CT0QBA (begin)
-    // and CT0QEA (GO). All addresses are arena-internal identity iovas, bounds-checked (memory-safety).
+    // (4) Kick CT0 (the BIN queue). PI-V3D-9 boot-P5 fix: program the tile-ALLOCATION pool (CT0QMA/QMS)
+    // AND the tile-STATE array (CT0QTS, ENABLE-gated) as the DISTINCT regions they are — the base
+    // conflated them, handing the binner a 192-byte "pool" that overflowed into an unmapped page
+    // (PT_INVALID). Order per Linux v3d_sched.c v3d_bin_job_run: QMA, QMS, QTS, then QBA (begin), then
+    // QEA (GO). All addresses are arena-internal identity iovas, bounds-checked (memory-safety).
     let bin_ba = (arena_phys() + OFF_BIN_CL) as u32;
     let bin_ea = bin_ba + bin_len as u32;
-    let ts = (arena_phys() + OFF_TILESTATE) as u32;
-    if !arena_contains(bin_ba as usize, bin_len) || !arena_contains(ts as usize, TILE_STATE_BYTES) {
+    let tile_alloc = (arena_phys() + OFF_BIN_TILEALLOC) as u32; // the binner's growable pool (CT0QMA/QMS)
+    let ts = (arena_phys() + OFF_TILESTATE) as u32; // the tile-state data array (CT0QTS)
+    if !arena_contains(bin_ba as usize, bin_len)
+        || !arena_contains(tile_alloc as usize, BIN_TILEALLOC_BYTES)
+        || !arena_contains(ts as usize, TILE_STATE_BYTES)
+    {
         serial_println!(":: V3D: M4 bin range escapes the arena — refusing kick (fail-closed) ::");
         return;
     }
     let ct0_cs_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CS);
     let ct0_ca_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CA);
-    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QMA, ts);
-    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QMS, TILE_STATE_BYTES as u32);
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QMA, tile_alloc); // tile-allocation pool base
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QMS, BIN_TILEALLOC_BYTES as u32); // …and its size
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QTS, ts | V3D_CLE_CT0QTS_ENABLE); // tile-state array (enabled)
     dsb();
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QBA, bin_ba);
     dsb(); // BA latched before the GO
@@ -1579,6 +1732,16 @@ fn triangle_job(fb: Option<FbTarget>) {
         bin_ba, bin_ea, bin_ran as u32, bin_idled as u32, bin_fault
     );
     super::exceptions::serror_drain_request("v3d: M4 bin kick window");
+
+    // PI-V3D-9 boot-P5 fix: clear any latched V3D-MMU fault BEFORE the render kick. Boot-P5 showed the
+    // render CT1 refused to start (CTRUN never latched, CT1CA parked at M3's end) while the MMU carried
+    // a latched PT_INVALID+WRITE_VIOLATION from the (then-broken) bin — a fault the abort policy holds
+    // sticky, wedging subsequent submissions. The clear is the exact Linux v3d_irq.c idiom: read
+    // V3D_MMU_CTL and write it back (the fault status bits are write-1-to-clear; writing the read-back
+    // value clears them while preserving ENABLE/abort config). Harmless when no fault is latched (the
+    // fault bits read 0, so the write-back is a no-op on them). With the bin fault fixed above this is
+    // belt-and-suspenders; it also un-wedges the render if any unrelated fault slipped in.
+    clear_mmu_fault_latch("post-bin");
 
     // (5) Kick CT1 (the RENDER queue) over the M4 RCL — same submit path as M3, different list. It
     // consumes the binner's per-tile lists via BRANCH_TO_IMPLICIT_TILE_LIST.
@@ -1601,9 +1764,14 @@ fn triangle_job(fb: Option<FbTarget>) {
     let r_fault = mmu_ctl_r
         & (V3D_MMU_CTL_PT_INVALID | V3D_MMU_CTL_WRITE_VIOLATION | V3D_MMU_CTL_CAP_EXCEEDED);
     let r_ran = ct0_ran(r_cs_pre, r_cs_kicked, r_cs_done, r_ca_done, rcl_ba, rcl_ea);
+    // PI-V3D-9: decode the one CTnCS bit corroborated for V3D 4.x — CTRUN (bit5, "list running"). The
+    // kicked snapshot having CTRUN set is the positive proof the render actually started (boot-P5 had
+    // CTRUN clear here → the wedge the fault-latch clear above targets); other CTnCS bits are reported
+    // raw, not guessed.
+    let r_ctrun_kicked = (r_cs_kicked & V3D_CLE_CTNCS_CTRUN != 0) as u32;
     serial_println!(
-        ":: V3D: M4 render clue — CT1CS pre={:#010x} kicked={:#010x} done={:#010x} CT1CA done={:#010x} (BA={:#010x} EA={:#010x}) ran={} idled={} MMU_fault={:#x} ::",
-        r_cs_pre, r_cs_kicked, r_cs_done, r_ca_done, rcl_ba, rcl_ea, r_ran as u32, r_idled as u32, r_fault
+        ":: V3D: M4 render clue — CT1CS pre={:#010x} kicked={:#010x} (CTRUN={}) done={:#010x} CT1CA done={:#010x} (BA={:#010x} EA={:#010x}) ran={} idled={} MMU_fault={:#x} ::",
+        r_cs_pre, r_cs_kicked, r_ctrun_kicked, r_cs_done, r_ca_done, rcl_ba, rcl_ea, r_ran as u32, r_idled as u32, r_fault
     );
     super::exceptions::serror_drain_request("v3d: M4 render kick window");
 

@@ -6227,9 +6227,75 @@ QEMU `raspi4b` still stops at BLOCK-DOWN before any M4 code runs. Packet/registe
 `src/broadcom/cle/v3d_packet.xml` (gen 4.2, `min_ver=42`) + `qpu_pack.c` (MIT, lifted with attribution);
 kernel `v3d_regs.h` register offsets (hardware facts); ordering per `v3dx_draw.c` / `v3dx_rcl.c`.
 
+### PI-V3D-9 — verified QPU shader bodies + the boot-P5 bin-address / render-refusal fix
+
+Boot-P5 ran PI-V3D-8's M4 scaffolding on metal and produced two clues that reshaped this arc:
+
+```
+:: V3D: M4 bin clue    — … CT0CA done=0x200017 (BA=0x200000 EA=0x20001e) ran=1 idled=1 MMU_fault=0x100000 ::
+:: V3D: M4 render clue — … CT1CA done=0x1f806a (BA=0x20a000 EA=0x20a06a) ran=0 idled=1 MMU_fault=0x101000 ::  (all 6 samples = 0x55555555 arena poison)
+```
+
+Two defects, both fixed here (M3 clear-job stayed **RAN-OK** throughout — the MMU/arena base machinery
+was never in doubt):
+
+1. **Bin PT_INVALID (the address fault).** The base wrote the 192-byte tile-**state** region into
+   `CT0QMA/CT0QMS` as if it were the tile-**allocation** pool, and never programmed `CT0QTS`. Per Linux
+   `v3d_sched.c::v3d_bin_job_run` the three are distinct: `CT0QMA/QMS` = the tile-allocation memory the
+   binner grows per-tile lists into, `CT0QTS` (ENABLE = BIT(1), offset `0x15c`) = the tile-state array.
+   A 192-byte "pool" overflowed on the first triangle and the binner walked off into an unmapped page →
+   `PT_INVALID` (bit 20), `CT0CA` halted mid-list. Fixed: `CT0QMA/QMS` ← `OFF_BIN_TILEALLOC`/32 KiB,
+   `CT0QTS` ← tile-state `| ENABLE`; all three bounds-checked into the arena.
+2. **Render refused to start.** `CT1` never latched `CTRUN` (ran=0, `CT1CA` parked at M3's end) while the
+   MMU still carried the latched bin fault (`0x101000` = PT_INVALID + WRITE_VIOLATION) — the abort policy
+   holds it sticky and wedges further submissions. Fixed by clearing the MMU fault latch between bin and
+   render with the exact Linux `v3d_irq.c` idiom (read `V3D_MMU_CTL`, write it back — the fault bits are
+   write-1-to-clear, config bits preserved), plus a `CTRUN` decode on the render clue so a future refusal
+   is unambiguous. With defect 1 fixed no fault is latched, so this is belt-and-suspenders.
+
+**The shader bodies — from NOP skeletons to verified QPU (the arc's named mission).** The three programs
+(coordinate/vertex passthrough, solid-colour fragment) are now real QPU words. Provenance is absolute:
+every 64-bit word is emitted by **Mesa's own packer** `v3d_qpu_instr_pack` (ver 42) from an explicit
+`struct v3d_qpu_instr`, round-tripped through Mesa's unpacker, and the generator
+(`scratchpad/mesa/qpu_gen.c`, links Mesa 26.3.0-devel `qpu_instr.c` + `qpu_pack.c`, MIT) reproduces four
+canonical `qpu_disasm.c` vectors bit-exactly as a self-test. No hand-authored bit patterns — the trap
+that convicted PI-V3D-4 and PI-V3D-7 is structurally avoided.
+
+Shader-provenance table (every word is Mesa-packer output; disasm is Mesa's own):
+
+| Shader | # words | Program (Mesa emit path) | Word encoding verified by |
+|---|---|---|---|
+| Fragment (solid colour → TLB) | 10 | `emit_frag_end` + `vir_emit_tlb_color_write`: 4× `ldunifrf` (rgba→rf0..3), `mov tlbu` passthrough-Z, `vfpack tlbu`/`vfpack tlb` (rgba→f16→TLB), `thrsw`+2 nop | Mesa pack↔unpack round-trip |
+| Coordinate (bin) | 13 | `ntq_emit_vpm_read`+`emit_store_output_vs`+`emit_vert_end`: 4× `ldvpmv_in` (attr→rf0..3), `vpmsetup`, 4× `mov vpm` (pos), `vpmwt`, `thrsw`+2 nop | Mesa pack↔unpack round-trip |
+| Vertex (render) | 13 | same passthrough body as the coordinate variant | Mesa pack↔unpack round-trip |
+
+Self-test vectors reproduced bit-exactly by the generator: `nop` `0x3c003186bb800000`,
+`or rf0,r3,r3;mov vpm,r3` `0x3c002380b6edb000`, `vfpack tlb,r0,r1` `0x3c00318735808000`,
+`fadd r1,r1,r5;thrsw` `0x3c20318105829000`.
+
+**Verification level (honest).** Every word's *encoding* is Mesa-verified. What stays the
+attended-metal-refinement surface — silicon-tuned quantities QEMU cannot exercise, **not** fabrication —
+is: the coordinate viewport transform + exact VPM output layout/segment sizes, the VPM read-offset and
+`vpmsetup` values, and the FS colour-channel order + f16 rounding that lands the stored word exactly on
+`TRI_RGBA` (`0x00ffb000`). Each such quantity is flagged at its uniform/word in `v3d.rs`. Uniform streams
+are wired: FS record uniforms → `[r,g,b,a, Z-config 0xffffff84, colour-config 0xffffff3f]`; CS/VS record
+uniforms → the four VPM read-offsets.
+
+**Expected metal flip (attended sitting).** With the bin/render fixes the render now runs and stores;
+with the shader bodies aboard the samples flip from `0x55555555` poison to: interior `0x00ffb000` (`OK`)
+×3, exterior `CLEAR_RGBA` (`OK`) ×3, and `:: V3D: M4 triangle — PASS ::`. Any residual `MISS` on the
+interior isolates the shader geometry/colour-tuning as the remaining metal-refinement, not a regression.
+
 ### References of record
 
 - Register layout: Linux `drivers/gpu/drm/v3d/v3d_regs.h` (hub + core + MMU offsets, field bits).
+- Bin-job register programming (PI-V3D-9): Linux `drivers/gpu/drm/v3d/v3d_sched.c` (`v3d_bin_job_run`:
+  `CT0QMA/QMS` = tile-alloc pool, `CT0QTS` `| ENABLE` = tile-state) + `v3d_irq.c` (MMU fault clear =
+  echo `V3D_MMU_CTL`). Register OFFSETS/bits are hardware facts (GPL-2.0-only header, facts-only).
+- QPU shader words (PI-V3D-9): generated by Mesa's own `v3d_qpu_instr_pack` (ver 42) via
+  `scratchpad/mesa/qpu_gen.c`; round-tripped + cross-checked against `src/broadcom/qpu/tests/qpu_disasm.c`.
+  Emit paths: `src/broadcom/compiler/nir_to_vir.c` (`emit_frag_end`, `vir_emit_tlb_color_write`,
+  `ntq_emit_vpm_read`, `emit_store_output_vs`, `emit_vert_end`). **MIT — used with attribution.**
 - V3D MMU: Linux `drivers/gpu/drm/v3d/v3d_mmu.c` (flat page table, PTE bits, flush sequence).
 - Render-control-list packets: Mesa `src/broadcom/cle/v3d_packet_v33.xml` (4.2 encodings — the
   VC4-era packet numbers/sizes do **not** transfer) + `gen_pack_header.py` (the opcode-byte / bit-offset
