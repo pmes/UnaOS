@@ -57,10 +57,11 @@
 //     doorbell, so the NIC reads the CPU's bytes from DRAM rather than stale RAM. TX "worked" pre-fix
 //     only by the racy luck of an eviction landing the DISCOVER in DRAM before the NIC fetched it; a
 //     lost future TX is the same non-coherent class, so it is fixed symmetrically (honesty > minimal).
-// The descriptor rings are NOT given maintenance: metal shows their DMA is observed correctly (real
-// per-slot lengths came through even for the zero-payload frames), so the ring stays on the proven
-// path; if a future sitting shows stale OWN/len the same invalidate extends to the ring. Do NOT weaken
-// the OWN protocol to compensate.
+// The descriptor rings were NOT given maintenance at NET-4f — metal showed their writebacks observed
+// correctly (real per-slot lengths even for zero-payload frames), which read as "ring coherent". That
+// asymmetry was later RESOLVED, not exonerated: the writebacks ride the NIC's internal ring
+// base+index, while its descriptor FETCHES read ring DRAM — see NET-4x below, which extends the
+// clean/invalidate discipline to the rings. The OWN protocol is unweakened.
 //
 // ## NET-4m — the per-pop invalidate is ALREADY on the live path; the residual zeros are NOT a cache bug.
 //
@@ -212,6 +213,42 @@
 // `covers=ALL` / `covers=MISS(<obj>)` — MISS fails the bring-up CLOSED. Boot-31 oracle: `[net4v]`
 // four per-object `covered` lines + `covers=ALL` (exonerating the limit on silicon), rx[1..] still
 // zero ⇒ the sink is formally below the iATU.
+//
+// ## NET-4x — the NIC's DESCRIPTOR FETCHES read stale-zero DRAM: clean the ring to PoC.
+//
+// Boot-32 exonerated both remaining below-driver suspects (iATU covers=ALL readback-proven on
+// boot-31; BOTH SMMU instances CLIENTPD=1 — globally bypassed, no translation, no residual
+// mappings) and scaled the pattern: 32 pops in the window, ONLY slot-0 recycles carry payload
+// (SSDP len 443, LLDP, …), every other slot DRAM-zero at a real writeback length. The asymmetry
+// that exonerated the ring in NET-4f/4m now RESOLVES instead: the NIC addresses its OWN/len
+// WRITEBACKS via the internal ring base+index it latched from RDSAR/TNPDS (those land and are
+// observed), but its descriptor FETCHES read the per-desc buffer-address field from ring DRAM —
+// and our ring lives in CACHEABLE heap written with volatile stores + `dsb sy` only. `dsb`
+// orders visibility for coherent observers; it cleans NOTHING to the PoC. So the NIC fetches
+// whatever last reached DRAM — mostly the alloc_zeroed fill — and DMA-writes payloads to
+// near-zero bus addresses the fabric sinks (bonus: the real source of the intermittent 0x200
+// IOB/ACI RAS previously bracketed to xHCI by timing alone). slot-0 lands because its line
+// reached DRAM (eviction / init timing), the NET-4h "firmware-residual" misread.
+//
+// The reference discipline (L4T r8169_main.c, facts only, re-verified this arc against v6.6):
+// the rings are allocated with `dma_alloc_coherent` (rtl_open ~:4705-4716 — coherent /
+// non-cacheable-to-the-device memory; the in-code comment notes descriptors need 256-byte
+// alignment and coherent alloc provides more), so `dma_wmb()` before the OWN publish
+// (rtl8169_mark_to_asic :3799-3807; TX start_xmit ~:4244-4249) is ALL the maintenance it ever
+// needs, plus `dma_rmb()` after seeing OWN clear (:4430-4438). We kept the barrier discipline
+// (NET-4l LAW) but on a CACHEABLE ring — the missing half is the CLEAN. Fix (this arc, option
+// (a) of the brief — keeps the cacheable heap):
+//   * per re-arm/post: publish the descriptor BODY (OWN clear), `dc cvac` its line to PoC, then
+//     the OWN store, then `dc cvac` again — OWN-last now holds AT DRAM, not just in cache order;
+//   * at init: clean BOTH whole rings after all descriptors are written, BEFORE RxEnb/TxEnb, and
+//     witness desc[1]/desc[17] addr via a post-invalidate DRAM read (`[net4x]` line);
+//   * before every CPU read of a descriptor (RX OWN check, TX completion poll): `dc ivac` the
+//     line first — a resident copy left by our own clean would otherwise shadow the NIC's
+//     writeback (cvac leaves the line resident; without the read-side invalidate the fix would
+//     break the PROVEN writeback-observation path).
+// Line geometry (hard-won): descriptors are 16 B, 4 per 64 B line; every clean covers a whole
+// line, so ALL fields of a descriptor are written before its clean and no clean is issued
+// between neighbor writes mid-init (the whole-ring cleans run after the init loops complete).
 //
 // ## Write discipline
 //
@@ -1125,6 +1162,35 @@ mod metal {
                 return false;
             }
 
+            // NET-4x — clean BOTH whole descriptor rings to the PoC before the NIC can fetch them.
+            // The rings are cacheable heap: `alloc_rx`/`alloc_tx` wrote every descriptor with volatile
+            // stores, but a store + `dsb sy` publishes to COHERENT observers only — the NIC's
+            // descriptor-fetch engine reads DRAM. Every field of every descriptor is already written
+            // (the init loops completed above), so whole-ring cleans violate no half-written-neighbor
+            // hazard. `clean_range` closes with `dsb sy`. Ordered BEFORE RDSAR/TNPDS and RxEnb/TxEnb
+            // below, so the FIRST fetch already sees real buffer addresses.
+            cache::clean_range(self.rx_ring as usize, NUM_RX * core::mem::size_of::<Desc>());
+            cache::clean_range(self.tx_ring as usize, NUM_TX * core::mem::size_of::<Desc>());
+            // NET-4x WITNESS — prove DRAM (not the cache) holds real buffer addresses pre-enable:
+            // invalidate desc[1]'s and desc[17]'s lines (dropping any resident copy; they are clean —
+            // just cleaned above — so nothing is lost), then read the addr fields back. These reads
+            // MISS and re-fetch from DRAM: a zero here would mean the clean did not reach PoC.
+            {
+                let d1 = unsafe { self.rx_ring.add(1) };
+                let d17 = unsafe { self.rx_ring.add(17) };
+                cache::invalidate_range(d1 as usize, core::mem::size_of::<Desc>());
+                cache::invalidate_range(d17 as usize, core::mem::size_of::<Desc>());
+                let a1 = unsafe { read_volatile(d1) }.addr;
+                let a17 = unsafe { read_volatile(d17) }.addr;
+                let e1 = (self.rx_buffers as u64) + RX_BUF_SIZE as u64;
+                let e17 = (self.rx_buffers as u64) + (17 * RX_BUF_SIZE) as u64;
+                serial_println!(
+                    "{}   [net4x] init witness (post-clean DRAM read): rx-desc[1].addr={:#x} expect={:#x} [{}] rx-desc[17].addr={:#x} expect={:#x} [{}] — DRAM holds the programmed buffer addresses pre-enable ::",
+                    P4, a1, e1, if a1 == e1 { "MATCH" } else { "MISMATCH" },
+                    a17, e17, if a17 == e17 { "MATCH" } else { "MISMATCH" }
+                );
+            }
+
             let rx_phys = self.rx_ring as u64;
             let tx_phys = self.tx_ring as u64;
             // NET-4q — program the descriptor-ring bases as full 64-bit hi/lo pairs, HIGH dword FIRST.
@@ -1244,22 +1310,40 @@ mod metal {
             // `dc cvac` here (write-back), the mirror of RX's `dc ivac`. Ends with `dsb sy`; the
             // existing barrier below still orders the descriptor publish before the doorbell.
             cache::clean_range(buf as usize, len);
+            // NET-4x TX AUDIT (brief item 3 — do NOT assume; audit and state): the pre-fix TX path
+            // wrote the WHOLE descriptor (OWN already set) in one volatile store, `dsb sy`, then the
+            // TPPoll doorbell — NO clean of the descriptor line, ever. The doorbell MMIO write forces
+            // ORDERING (the Device-nGnRE store completes after the prior `dsb sy`) but cleans nothing:
+            // the NIC's post-doorbell descriptor fetch read whatever ring DRAM held. TX "working" on
+            // metal was therefore the same eviction lottery as RX slot-0 — a NUM_TX=8 ring (128 B, 2
+            // lines) whose lines are touched rarely enough to be evicted between posts, NOT a correct
+            // path. Fixed with the same discipline as the RX re-arm: body (OWN clear) -> clean ->
+            // OWN store -> clean -> doorbell, so the fetch is against DRAM that provably holds the
+            // buffer address, and OWN-last holds at the DRAM level.
             let eor = if i == NUM_TX - 1 { DESC_EOR } else { 0 };
+            let body = DESC_FS | DESC_LS | eor | (len as u32 & DESC_LEN_MASK);
+            let desc = unsafe { self.tx_ring.add(i) };
             let d = Desc {
-                opts1: DESC_OWN | DESC_FS | DESC_LS | eor | (len as u32 & DESC_LEN_MASK),
+                opts1: body, // OWN CLEAR — published to DRAM before the ownership handoff
                 opts2: 0,
                 addr: (self.tx_buffers as u64) + (i * TX_BUF_SIZE) as u64,
             };
-            unsafe { write_volatile(self.tx_ring.add(i), d) };
-            // Publish the descriptor + buffer before poking the doorbell.
-            unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
+            unsafe {
+                write_volatile(desc, d);
+                cache::clean_range(desc as usize, core::mem::size_of::<Desc>());
+                write_volatile(desc as *mut u32, DESC_OWN | body);
+                cache::clean_range(desc as usize, core::mem::size_of::<Desc>());
+            }
             self.w8(REG_TPPOLL, TPPOLL_NPQ);
             self.tx_cur = (i + 1) % NUM_TX;
 
             // Wait (bounded) for the descriptor to be handed back (OWN cleared by the NIC).
+            // NET-4x: invalidate the line before each poll read — our own cleans above left it
+            // resident, and a resident OWN=1 copy would shadow the NIC's OWN-clear writeback forever.
             let mut done = false;
             for _ in 0..1_000_000 {
-                let dd = unsafe { read_volatile(self.tx_ring.add(i)) };
+                cache::invalidate_range(desc as usize, core::mem::size_of::<Desc>());
+                let dd = unsafe { read_volatile(desc) };
                 if dd.opts1 & DESC_OWN == 0 {
                     done = true;
                     break;
@@ -1291,6 +1375,11 @@ mod metal {
         /// since-bring-up latches). RX side: frames popped plus how many ring slots the NIC
         /// has filled and handed back unread. Reads only; no register is written.
         fn net4c_evidence(&self, label: &str) {
+            // NET-4x: drop any resident ring lines first so the evidence reads DRAM (the NIC's
+            // writebacks), not our own clean cached copies. All ring lines are clean at every read
+            // point (each publish cleans immediately), so the invalidate discards nothing dirty.
+            cache::invalidate_range(self.rx_ring as usize, NUM_RX * core::mem::size_of::<Desc>());
+            cache::invalidate_range(self.tx_ring as usize, NUM_TX * core::mem::size_of::<Desc>());
             let isr = self.r16(REG_ISR);
             let last_tx = if self.tx_cur == 0 { NUM_TX - 1 } else { self.tx_cur - 1 };
             let d_opts1 = unsafe { read_volatile(self.tx_ring.add(last_tx)) }.opts1;
@@ -1333,6 +1422,8 @@ mod metal {
             } else {
                 NET4G_DUMP_N.min(NUM_RX)
             };
+            // NET-4x: read the ring from DRAM, not our clean resident copies (see net4c_evidence).
+            cache::invalidate_range(self.rx_ring as usize, NUM_RX * core::mem::size_of::<Desc>());
             for i in 0..n {
                 let d = unsafe { read_volatile(self.rx_ring.add(i)) };
                 // Copy packed fields BY VALUE before formatting: a format arg takes `&field`, which on a
@@ -1359,6 +1450,8 @@ mod metal {
                 "{}   [net4l ring-dump {}] ring @ {:#x} buffers @ {:#x} stride {} B rx_cur={} popped={} ::",
                 P4, tag, self.rx_ring as u64, self.rx_buffers as u64, RX_BUF_SIZE, self.rx_cur, self.rx_count
             );
+            // NET-4x: read the ring from DRAM, not our clean resident copies (see net4c_evidence).
+            cache::invalidate_range(self.rx_ring as usize, NUM_RX * core::mem::size_of::<Desc>());
             for i in 0..NUM_RX {
                 let d = unsafe { read_volatile(self.rx_ring.add(i)) };
                 let opts1 = d.opts1;
@@ -1618,6 +1711,16 @@ mod metal {
         /// if the current descriptor is still NIC-owned (ring empty). The C+ analog of the e1000
         /// `rx_frame_raw` — no responder dispatch, smoltcp owns the stack.
         fn rx_frame_raw(&mut self, out: &mut [u8]) -> Option<usize> {
+            // NET-4x — invalidate the descriptor's line before reading it: the re-arm below cleans the
+            // line to PoC with `dc cvac`, which leaves it RESIDENT; without this drop, the CPU would
+            // keep hitting its own clean cached copy (OWN=1) and never observe the NIC's OWN/len
+            // writeback — the read-side half of the ring-clean fix. The line is clean at every read
+            // point (each re-arm cleans immediately after its stores), so `dc ivac` discards nothing
+            // dirty; it covers the whole 64 B line (4 descs) whose neighbors are equally clean.
+            cache::invalidate_range(
+                unsafe { self.rx_ring.add(self.rx_cur) } as usize,
+                core::mem::size_of::<Desc>(),
+            );
             let d = unsafe { read_volatile(self.rx_ring.add(self.rx_cur)) };
             // OWN set ⇒ still owned by the NIC (not yet filled) ⇒ ring empty.
             if d.opts1 & DESC_OWN != 0 {
@@ -1782,10 +1885,20 @@ mod metal {
             };
             unsafe {
                 write_volatile(desc, nd);
-                core::arch::asm!("dsb sy", options(nostack, preserves_flags));
-                // Hand ownership to the NIC LAST — a single aligned u32 store to opts1 (offset 0).
+                // NET-4x — CLEAN the descriptor's line to PoC before the OWN publish. NET-4l's
+                // `dsb sy` ordered the body ahead of OWN for a COHERENT observer, but the NIC's
+                // descriptor fetch reads DRAM: without the clean, neither store ever reliably reached
+                // it (boot-32's stale-zero fetches). This clean lands the fully-written body (OWN
+                // still clear) in DRAM first; `clean_range` closes with `dsb sy`, preserving the
+                // OWN-last LAW at the DRAM level. All 16 bytes of this desc were just written; the
+                // line's neighbor descs are in complete states (each re-arm finishes before the next
+                // begins on the single-CPU poll path), so the whole-line clean publishes no
+                // half-written neighbor.
+                cache::clean_range(desc as usize, core::mem::size_of::<Desc>());
+                // Hand ownership to the NIC LAST — a single aligned u32 store to opts1 (offset 0) —
+                // then clean again so OWN itself reaches DRAM (the NIC polls the fetched copy).
                 write_volatile(desc as *mut u32, DESC_OWN | body);
-                core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+                cache::clean_range(desc as usize, core::mem::size_of::<Desc>());
             }
             // NET-4l instrumentation (knob-gated, read-only): dump the FULL 32-slot ring state after each
             // of the first few real RX pops so a wrong fix names the state machine exactly (brief item 3).
