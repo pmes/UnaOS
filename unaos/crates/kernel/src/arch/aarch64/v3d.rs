@@ -1818,6 +1818,13 @@ fn triangle_job(fb: Option<FbTarget>) -> bool {
         serial_println!(":: V3D: M4 bin range escapes the arena — refusing kick (fail-closed) ::");
         return false;
     }
+    // PI-V3D-15 (brief lead #1 attribution): clear any stale MMU fault BEFORE the bin kick so the
+    // post-bin decode below is provably THIS bin's fault — the M4 bin clue's MMU_fault=0x100000 could
+    // otherwise be a fault latched by program_mmu/M3 and never cleared (there was no pre-bin clear).
+    // (brief lead #2): dump the exact bin CL byte stream the binner will parse, to read against Mesa's
+    // emit order for a mis-sized packet shifting an opcode into an address field (PI-V3D-10 class).
+    clear_mmu_fault_latch("v3d15 pre-bin (attribution)");
+    dump_cl_bytes("M4 bin", OFF_BIN_CL, bin_len, 64);
     // PI-V3D-12: the Linux per-job pre-kick cache invalidate (v3d_bin_job_run does this first).
     invalidate_gpu_caches("L2T flush (M4 bin pre-kick)");
     let ct0_cs_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CS);
@@ -1853,6 +1860,10 @@ fn triangle_job(fb: Option<FbTarget>) -> bool {
     );
     // PI-V3D-13 witness: post-bin, did the binner's output actually land in the pool?
     bin_pool_witness("M4 post-bin");
+    // PI-V3D-15 (brief lead #1): decode WHERE the bin faulted — the clue above reports the fault BITS
+    // but never the address. With the latch cleared pre-kick, a fault here is THIS bin's, and its VA
+    // tells whether the binner walked off the arena (our encoding bug) or idled legally in-bounds.
+    bin_fault_witness("M4 bin");
     super::exceptions::serror_drain_request("v3d: M4 bin kick window");
 
     // PI-V3D-9 boot-P5 fix: clear any latched V3D-MMU fault BEFORE the render kick. Boot-P5 showed the
@@ -2203,6 +2214,69 @@ fn bin_pool_witness(tag: &str) -> bool {
     wrote
 }
 
+/// PI-V3D-15 fault witness (brief lead #1). The M4 bin clue reported the MMU fault BITS
+/// (MMU_fault=0x100000 = PT_INVALID) but never WHERE. Read-only decode (does NOT clear): report the
+/// violating AXI client (VIO_ID), the true faulting VA (VIO_ADDR un-shifted via DEBUG_INFO va_width),
+/// the ILLEGAL_ADDR trap slot, and — the discriminator — whether that VA lies INSIDE the identity-
+/// mapped arena. Inside-arena = not a confinement escape (a CL/shader address or a legally-idle bin);
+/// outside-arena = the binner walked off the mapped region, i.e. a mis-encoded CL address field (the
+/// PI-V3D-10 boot-P6 class). Reads-only; QEMU-safe (CTL reads 0/absent → "no fault latched").
+fn bin_fault_witness(tag: &str) {
+    let ctl = mmio_read(V3D_HUB_BASE, V3D_MMU_CTL);
+    let fault = ctl & (V3D_MMU_CTL_PT_INVALID | V3D_MMU_CTL_WRITE_VIOLATION | V3D_MMU_CTL_CAP_EXCEEDED);
+    let vio_addr = mmio_read(V3D_HUB_BASE, V3D_MMU_VIO_ADDR);
+    let vio_id = mmio_read(V3D_HUB_BASE, V3D_MMU_VIO_ID);
+    let illegal = mmio_read(V3D_HUB_BASE, V3D_MMU_ILLEGAL_ADDR);
+    let dbg = mmio_read(V3D_HUB_BASE, V3D_MMU_DEBUG_INFO);
+    let (client, va) = vio_decode(vio_id, vio_addr);
+    let base = arena_phys() as u64;
+    let top = base + ARENA_BYTES as u64;
+    let locus = if fault == 0 {
+        "no fault latched"
+    } else if va >= base && va < top {
+        "faulting VA INSIDE arena — confinement-legal (CL/shader address or legally-idle bin), NOT an out-of-arena walk-off"
+    } else {
+        "faulting VA OUTSIDE arena — the binner walked off the mapped region (mis-encoded CL address field: PI-V3D-10 class)"
+    };
+    serial_println!(
+        ":: V3D: [v3d15] {} MMU fault decode — CTL={:#010x} (PT_INVALID={} WRITE_VIOLATION={} CAP_EXCEEDED={}) client={} VIO_ADDR={:#010x} VIO_ID={:#010x} ILLEGAL_ADDR={:#010x} DEBUG={:#010x} -> VA={:#012x} arena=[{:#012x},{:#012x}) — {} ::",
+        tag, ctl,
+        (fault & V3D_MMU_CTL_PT_INVALID != 0) as u32,
+        (fault & V3D_MMU_CTL_WRITE_VIOLATION != 0) as u32,
+        (fault & V3D_MMU_CTL_CAP_EXCEEDED != 0) as u32,
+        client, vio_addr, vio_id, illegal, dbg, va, base, top, locus
+    );
+}
+
+/// PI-V3D-15 CL byte-dump witness (brief lead #2). Hex-dump the emitted control-list bytes (bounded to
+/// `cap`) so the exact packet stream the binner parses is on the wire — a mis-sized packet that shifts
+/// a following opcode byte into an address field (the PI-V3D-10 boot-P6 GL_SHADER_STATE fault) is
+/// visible here as the wrong bytes at the wrong offset when read against Mesa's emit order. Reads the
+/// arena bytes the CPU just wrote (pre-kick); 16 bytes per line, tail bytes past the count are padding.
+fn dump_cl_bytes(tag: &str, off: usize, len: usize, cap: usize) {
+    let arena = &raw const V3D_ARENA;
+    let n = len.min(cap);
+    serial_println!(
+        ":: V3D: [v3d15] {} CL byte stream — {} of {} bytes @ arena+{:#x} ::",
+        tag, n, len, off
+    );
+    let mut i = 0;
+    while i < n {
+        let mut line = [0u8; 16];
+        let mut c = 0;
+        while c < 16 && i + c < n {
+            line[c] = unsafe { (*arena).bytes[off + i + c] };
+            c += 1;
+        }
+        serial_println!(
+            "::   [v3d15]   +{:#05x}: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
+            i, line[0], line[1], line[2], line[3], line[4], line[5], line[6], line[7],
+            line[8], line[9], line[10], line[11], line[12], line[13], line[14], line[15]
+        );
+        i += 16;
+    }
+}
+
 /// Kick one bin (CT0) + render (CT1) job pair over already-built, already-published control lists.
 /// Mirrors the M4 kick sequence exactly (QMA/QMS/QTS → QBA → QEA-GO on CT0; QBA → QEA-GO on CT1;
 /// finite backstops; fault-latch clear between the two) without touching the M4 code — so a V3D-10
@@ -2231,6 +2305,11 @@ fn kick_bin_render(bin_off: usize, bin_len: usize, rcl_off: usize, rcl_len: usiz
     // CT0 (bin): QMA/QMS/QTS → QBA → QEA (GO), per Linux v3d_sched.c v3d_bin_job_run — which starts
     // with the per-job cache invalidate (PI-V3D-12 mirror of the M4 kick fix).
     invalidate_gpu_caches("L2T flush (battery bin pre-kick)");
+    // PI-V3D-15 mirror (V3D-11 law): the M4 kick clears any stale MMU fault BEFORE the bin so a post-
+    // bin fault is attributable. Mirror it here QUIETLY — the battery runs per-frame and a verbose
+    // decode/dump per frame would bury the serial witness (quiet-boot law); the verbose [v3d15] decode
+    // stays on the one-shot M4 discriminator path. Accumulate any pre-existing fault into res.fault.
+    res.fault |= clear_mmu_fault_latch_quiet();
     let cs_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CS);
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QMA, tile_alloc);
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QMS, BIN_TILEALLOC_BYTES as u32);
