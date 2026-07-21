@@ -387,6 +387,38 @@ mod metal {
     const RXCAT_IPV4_OTHER: usize = 3;
     const RXCAT_IPV6: usize = 4;
     const RXCAT_OTHER: usize = 5;
+    /// NET-4t: bound on the raw-bytes witness lines for frames classified `other` — the boot-27
+    /// evidence question ("what ARE the 8 other frames?") needs only a handful of exemplars.
+    const NET4T_OTHER_DUMPS: u64 = 4;
+
+    /// NET-4t: resolve a frame's EFFECTIVE EtherType by peeling up to two 802.1Q/802.1ad VLAN tags
+    /// (0x8100 / 0x88a8). Returns `(ethertype, l3_offset, outermost_vlan_id)` — `l3_offset` is where
+    /// the L3 header starts (14 untagged, 18/22 tagged), `None` vlan for an untagged frame. The
+    /// boot-27 `other=8` bucket motivated this: a classifier reading the EtherType at fixed offset
+    /// 12 files ALL VLAN-tagged traffic (including a DHCP OFFER under a VLAN) as `other`.
+    /// Read-only and bounds-checked; a frame too short to carry the claimed tag yields the raw tag
+    /// TPID as the ethertype (still classified `other`, and the runt shows in the witness dump).
+    fn eth_effective_type(frame: &[u8]) -> (u16, usize, Option<u16>) {
+        if frame.len() < 14 {
+            return (0, 14, None);
+        }
+        let mut off = 12usize;
+        let mut vlan: Option<u16> = None;
+        for _ in 0..2 {
+            let et = u16::from_be_bytes([frame[off], frame[off + 1]]);
+            if (et == 0x8100 || et == 0x88a8) && frame.len() >= off + 6 {
+                let tci = u16::from_be_bytes([frame[off + 2], frame[off + 3]]);
+                if vlan.is_none() {
+                    vlan = Some(tci & 0x0fff);
+                }
+                off += 4;
+            } else {
+                return (et, off + 2, vlan);
+            }
+        }
+        let et = u16::from_be_bytes([frame[off], frame[off + 1]]);
+        (et, off + 2, vlan)
+    }
 
     /// A decoded IPv4/UDP/BOOTP view of a frame — the fields the DHCP no-lease investigation needs.
     #[derive(Clone, Copy)]
@@ -428,11 +460,13 @@ mod metal {
         if frame.len() < 14 {
             return None;
         }
-        // EtherType must be IPv4 (0x0800).
-        if u16::from_be_bytes([frame[12], frame[13]]) != 0x0800 {
+        // EtherType must be IPv4 (0x0800) — NET-4t: after peeling any VLAN tag, so a DHCP frame
+        // arriving 802.1Q-tagged is still recognized as DHCP (it previously fell into `other`).
+        let (et, l3_off, _vlan) = eth_effective_type(frame);
+        if et != 0x0800 {
             return None;
         }
-        let ip = frame.get(14..)?;
+        let ip = frame.get(l3_off..)?;
         if ip.len() < 20 || (ip[0] >> 4) != 4 {
             return None;
         }
@@ -668,6 +702,9 @@ mod metal {
         /// NET-4k: how many socket-originated DHCP frames we have witnessed on TX so far — bounds the
         /// TX-type witness noise to `NET4K_TX_WITNESS_MAX` (DHCP TX is inherently low-volume anyway).
         dhcp_tx_witnessed: u64,
+        /// NET-4t: `other`-class frames given a raw-bytes witness dump so far — bounds the boot-27
+        /// "what ARE the other frames" evidence lines to `NET4T_OTHER_DUMPS`.
+        net4t_other_dumped: u64,
     }
 
     // The driver owns raw DMA pointers; on the single-CPU main-loop/poll discipline it is only ever
@@ -1263,6 +1300,22 @@ mod metal {
             let len = frame.len();
             if len < 14 {
                 self.rxcat[RXCAT_OTHER] += 1;
+                // NET-4t: a runt in the `other` bucket is prime DMA-garbage evidence — dump its bytes.
+                if self.net4t_other_dumped < NET4T_OTHER_DUMPS {
+                    self.net4t_other_dumped += 1;
+                    let mut hex = [0u8; 64];
+                    for (j, &b) in frame.iter().take(32).enumerate() {
+                        const HD: &[u8; 16] = b"0123456789abcdef";
+                        hex[j * 2] = HD[(b >> 4) as usize];
+                        hex[j * 2 + 1] = HD[(b & 0x0f) as usize];
+                    }
+                    let n = len.min(32);
+                    serial_println!(
+                        "{}   [net4t] other[{}] len={} RUNT(<14) first{}B={} ::",
+                        P4, self.net4t_other_dumped - 1, len, n,
+                        core::str::from_utf8(&hex[..n * 2]).unwrap_or("?")
+                    );
+                }
                 if self.rxcls_full < NET4D_FULL_LINES {
                     self.rxcls_full += 1;
                     serial_println!("{}   [net4d] rx[{}] len={} runt(<14) — class=other ::", P4, idx, len);
@@ -1271,7 +1324,9 @@ mod metal {
             }
             let d = &frame[0..6];
             let s = &frame[6..12];
-            let et = u16::from_be_bytes([frame[12], frame[13]]);
+            // NET-4t: classify by the EFFECTIVE EtherType (VLAN tags peeled) — the boot-27 `other=8`
+            // bucket would have swallowed a DHCP OFFER arriving 802.1Q-tagged.
+            let (et, l3_off, vlan) = eth_effective_type(frame);
 
             // BOOTP/DHCP: full line ALWAYS (unbounded), the frame the investigation is about.
             if let Some(di) = decode_dhcp(frame) {
@@ -1292,6 +1347,15 @@ mod metal {
                     di.op, di.mtype, dhcp_mtype_name(di.mtype), di.xid, xexp, xtok,
                     di.yiaddr[0], di.yiaddr[1], di.yiaddr[2], di.yiaddr[3]
                 );
+                // NET-4t: a DHCP frame that arrived VLAN-tagged is the one-line verdict — smoltcp has
+                // no 802.1Q support, so the socket can NEVER see it; the no-lease is explained at L2.
+                if let Some(vid) = vlan {
+                    serial_println!(
+                        "{}   [net4t] ^ DHCP frame is 802.1Q-tagged (vlan id={}) — smoltcp does not parse VLAN; the socket never sees it (untag the port or the drop stands) ::",
+                        P4, vid
+                    );
+                    return;
+                }
                 // Item 3: an OFFER that a lease never followed — name the driver-visible check AND
                 // (NET-4j) the exact smoltcp accept gate the frame passes or fails.
                 if di.mtype == 2 {
@@ -1305,7 +1369,7 @@ mod metal {
                 0x0806 => RXCAT_ARP,
                 0x86dd => RXCAT_IPV6,
                 0x0800 => {
-                    let ip = &frame[14..];
+                    let ip = &frame[l3_off.min(frame.len())..];
                     if ip.len() >= 20 && (ip[0] >> 4) == 4 {
                         let ihl = ((ip[0] & 0x0f) as usize) * 4;
                         if ihl >= 20 && ip.len() >= ihl + 4 && ip[9] == 17 {
@@ -1320,6 +1384,30 @@ mod metal {
                 _ => RXCAT_OTHER,
             };
             self.rxcat[cat] += 1;
+            // NET-4t: for the first NET4T_OTHER_DUMPS frames classified `other`, dump len + the first
+            // 32 raw bytes + the L2 decode on one line — the boot-27 distinguishing fact (garbage/
+            // truncated DMA vs real non-IP traffic) is readable straight off this line. Lives inside
+            // the rxcls_active window (the NET4 gated battery), so quiet-boot stays quiet.
+            if cat == RXCAT_OTHER && self.net4t_other_dumped < NET4T_OTHER_DUMPS {
+                self.net4t_other_dumped += 1;
+                let n = len.min(32);
+                let mut hex = [0u8; 64];
+                for (j, &b) in frame[..n].iter().enumerate() {
+                    const HD: &[u8; 16] = b"0123456789abcdef";
+                    hex[j * 2] = HD[(b >> 4) as usize];
+                    hex[j * 2 + 1] = HD[(b & 0x0f) as usize];
+                }
+                let hexs = core::str::from_utf8(&hex[..n * 2]).unwrap_or("?");
+                serial_println!(
+                    "{}   [net4t] other[{}] len={} dst={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} src={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} et={:#06x} vlan={} first{}B={} ::",
+                    P4, self.net4t_other_dumped - 1, len,
+                    d[0], d[1], d[2], d[3], d[4], d[5],
+                    s[0], s[1], s[2], s[3], s[4], s[5],
+                    et,
+                    vlan.map_or(-1i32, |v| v as i32),
+                    n, hexs
+                );
+            }
             if self.rxcls_full < NET4D_FULL_LINES {
                 self.rxcls_full += 1;
                 let name = match cat {
@@ -2411,6 +2499,7 @@ mod metal {
             rxcat: [0; RXCAT_N],
             rxcls_active: true,
             dhcp_tx_witnessed: 0,
+            net4t_other_dumped: 0,
         };
 
         // ── M2/M3 GUARD: poison-honest readback through the NEW window BEFORE any register write ──
