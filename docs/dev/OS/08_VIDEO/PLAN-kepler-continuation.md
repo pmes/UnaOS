@@ -18,7 +18,7 @@ translate()-guarded MMIO, VRAM report, PDISPLAY heuristic scan (fragile), VramAl
 ## Milestones (each independently gated, each ends with `UNAOS_KEPLER=1 ./arroyo check`
 green both arches + x86 QEMU suite green + this doc updated)
 
-### K-GPU-1 — Honest resource discovery
+### K-GPU-1 — Honest resource discovery (COMPLETED)
 - Replace hardcoded VRAM/BAR values: size VRAM from NV_PFB_RAM_AMOUNT with sanity
   bounds; record real BAR1 size from the sizing probe; refuse init on zero/absurd values.
 - Fix the BAR-sizing ordering defect: clear the COMMAND memory-decode bit around the

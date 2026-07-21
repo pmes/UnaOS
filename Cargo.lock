@@ -34,6 +34,7 @@ dependencies = [
  "boa_gc",
  "clap",
  "cssparser 0.37.0",
+ "directories",
  "font-kit",
  "futures-util",
  "gneiss_pal",

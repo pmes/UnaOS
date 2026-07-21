@@ -36,12 +36,54 @@ pub fn init(gpu: &GpuInfo) {
 
     let bar0 = gpu.bar0_phys as usize;
 
-    // We assume the BAR0 physical address is identity mapped (PA == VA)
-    // as is standard in UnaOS for x86_64. We must verify this to avoid page faults.
-    #[cfg(target_arch = "x86_64")]
-    if crate::arch::memory::translate(bar0 as u64).is_none() {
-        serial_println!("[NVIDIA] Error: BAR0 physical address (0x{:X}) is not mapped in the identity map. Probe aborted.", bar0);
+    let mut bar0_size = 0;
+    let mut bar1_base = 0;
+    let mut bar1_size = 0;
+
+    unsafe {
+        let cmd = crate::arch::pci::read_config_16(gpu.bus as u8, gpu.slot, gpu.func, 0x04);
+        crate::arch::pci::write_config_16(gpu.bus as u8, gpu.slot, gpu.func, 0x04, cmd & !0x02);
+
+        let bar0_orig = crate::arch::pci::read_config_32(gpu.bus as u8, gpu.slot, gpu.func, 0x10);
+        crate::arch::pci::write_config_32(gpu.bus as u8, gpu.slot, gpu.func, 0x10, 0xFFFFFFFF);
+        let bar0_val = crate::arch::pci::read_config_32(gpu.bus as u8, gpu.slot, gpu.func, 0x10);
+        crate::arch::pci::write_config_32(gpu.bus as u8, gpu.slot, gpu.func, 0x10, bar0_orig);
+        if bar0_val != 0 && bar0_val != 0xFFFFFFFF {
+            bar0_size = (!(bar0_val & !0xF)).wrapping_add(1) as usize;
+        }
+
+        let bar1_orig_lo = crate::arch::pci::read_config_32(gpu.bus as u8, gpu.slot, gpu.func, 0x14);
+        let bar1_orig_hi = crate::arch::pci::read_config_32(gpu.bus as u8, gpu.slot, gpu.func, 0x18);
+        bar1_base = (bar1_orig_lo & 0xFFFFFFF0) as usize | ((bar1_orig_hi as usize) << 32);
+
+        crate::arch::pci::write_config_32(gpu.bus as u8, gpu.slot, gpu.func, 0x14, 0xFFFFFFFF);
+        crate::arch::pci::write_config_32(gpu.bus as u8, gpu.slot, gpu.func, 0x18, 0xFFFFFFFF);
+        let bar1_val_lo = crate::arch::pci::read_config_32(gpu.bus as u8, gpu.slot, gpu.func, 0x14);
+        let bar1_val_hi = crate::arch::pci::read_config_32(gpu.bus as u8, gpu.slot, gpu.func, 0x18);
+        crate::arch::pci::write_config_32(gpu.bus as u8, gpu.slot, gpu.func, 0x14, bar1_orig_lo);
+        crate::arch::pci::write_config_32(gpu.bus as u8, gpu.slot, gpu.func, 0x18, bar1_orig_hi);
+        
+        let bar1_val = (bar1_val_lo & 0xFFFFFFF0) as u64 | ((bar1_val_hi as u64) << 32);
+        if bar1_val != 0 {
+            bar1_size = (!bar1_val).wrapping_add(1) as usize;
+        }
+
+        crate::arch::pci::write_config_16(gpu.bus as u8, gpu.slot, gpu.func, 0x04, cmd);
+    }
+
+    if bar0_size == 0 || bar1_size == 0 {
+        serial_println!("[NVIDIA] Error: Invalid BAR sizes (BAR0: {} bytes, BAR1: {} bytes). Probe aborted.", bar0_size, bar1_size);
         return;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::arch::memory::map_mmio_window(bar0 as u64, bar0_size);
+        crate::arch::memory::map_mmio_window(bar1_base as u64, bar1_size);
+        if crate::arch::memory::translate(bar0 as u64).is_none() {
+            serial_println!("[NVIDIA] Error: BAR0 physical address (0x{:X}) is not mapped in the identity map. Probe aborted.", bar0);
+            return;
+        }
     }
     
     #[cfg(target_arch = "aarch64")]
@@ -75,10 +117,14 @@ pub fn init(gpu: &GpuInfo) {
         serial_println!("[NVIDIA] Disabled interrupts via PMC_INTR_EN");
 
         // 5. VRAM Detection & Initialization
-        let vram_size = mmio_read(bar0, regs::NV_PFB_RAM_AMOUNT);
+        let vram_size = mmio_read(bar0, regs::NV_PFB_RAM_AMOUNT) as usize;
+        if vram_size < 16 * 1024 * 1024 || vram_size > 32usize * 1024 * 1024 * 1024 {
+            serial_println!("[NVIDIA] Error: Absurd VRAM size reported ({} bytes). Probe aborted.", vram_size);
+            return;
+        }
         serial_println!("[NVIDIA] PFB Reported VRAM Size: {} MB", vram_size >> 20);
 
-        let mut vram_allocator = VramAllocator::new(gpu);
+        let mut vram_allocator = VramAllocator::new(bar1_base, bar1_size, vram_size);
         serial_println!("[NVIDIA] Initialized VRAM bump allocator. Total BAR1 visible: {} MB", vram_allocator.total_size >> 20);
 
         // 6. Display Engine Takeover
@@ -196,22 +242,12 @@ pub struct VramAllocator {
 }
 
 impl VramAllocator {
-    pub fn new(gpu: &GpuInfo) -> Self {
-        // Find BAR1
-        let bar1_reg = unsafe { crate::arch::pci::read_config_32(gpu.bus as u8, gpu.slot, gpu.func, 0x14) };
-        let mut vram_base = (bar1_reg & 0xFFFFFFF0) as usize;
-        if (bar1_reg & 0x04) != 0 {
-            let bar1_high = unsafe { crate::arch::pci::read_config_32(gpu.bus as u8, gpu.slot, gpu.func, 0x18) };
-            vram_base |= (bar1_high as usize) << 32;
-        }
-        
-        // In a real implementation we would size BAR1 correctly.
-        // On 2012 rMBP, BAR1 is 256MB.
-        let bar1_size = 256 * 1024 * 1024;
+    pub fn new(bar1_base: usize, bar1_size: usize, vram_size: usize) -> Self {
+        let total_size = if vram_size < bar1_size { vram_size } else { bar1_size };
         
         Self {
-            base_phys: vram_base,
-            total_size: bar1_size,
+            base_phys: bar1_base,
+            total_size,
             // Skip the first 32MB to avoid stepping on the firmware's GOP framebuffer
             current_offset: 32 * 1024 * 1024,
         }

@@ -729,3 +729,68 @@ pub fn set_framebuffer_wc(fb_base: u64, fb_len: u64) {
         fb_end
     );
 }
+
+/// Map a physical MMIO window into the identity map with Uncacheable (UC) attributes (PCD|PWT).
+/// Creates intermediate page tables if they are absent.
+/// If an existing huge page leaf is encountered, it applies PCD|PWT without clearing the HUGE/PAT bit.
+pub fn map_mmio_window(pa: u64, size: usize) {
+    if pa == 0 || size == 0 {
+        return;
+    }
+    let end = pa.saturating_add(size as u64);
+    let pcd = 1 << 4;
+    let pwt = 1 << 3;
+
+    with_page_tables_writable(|| {
+        let mut va = pa;
+        while va < end {
+            unsafe {
+                let pml4e = cr3_table().add(pml4_index(va));
+                if *pml4e & PTE_PRESENT == 0 {
+                    let frame = alloc_page_frame();
+                    *pml4e = (frame & PTE_ADDR) | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
+                }
+                
+                let pdpt = (*pml4e & PTE_ADDR) as *mut u64;
+                let pdpte = pdpt.add(pdpt_index(va));
+                if *pdpte & PTE_PRESENT != 0 && *pdpte & PTE_HUGE != 0 {
+                    *pdpte |= pcd | pwt;
+                    va = (va & !((1 << 30) - 1)).saturating_add(1 << 30);
+                    continue;
+                }
+                if *pdpte & PTE_PRESENT == 0 {
+                    let frame = alloc_page_frame();
+                    *pdpte = (frame & PTE_ADDR) | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
+                }
+                
+                let pd = (*pdpte & PTE_ADDR) as *mut u64;
+                let pde = pd.add(pd_index(va));
+                if *pde & PTE_PRESENT != 0 && *pde & PTE_HUGE != 0 {
+                    *pde |= pcd | pwt;
+                    va = (va & !((1 << 21) - 1)).saturating_add(1 << 21);
+                    continue;
+                }
+                if *pde & PTE_PRESENT == 0 {
+                    let frame = alloc_page_frame();
+                    *pde = (frame & PTE_ADDR) | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
+                }
+                
+                let pt = (*pde & PTE_ADDR) as *mut u64;
+                let pte = pt.add(pt_index(va));
+                if *pte & PTE_PRESENT == 0 {
+                    *pte = (va & PTE_ADDR) | PTE_PRESENT | PTE_WRITABLE | PTE_NX | pcd | pwt;
+                } else {
+                    *pte |= pcd | pwt;
+                }
+                
+                va = va.saturating_add(1 << 12);
+            }
+        }
+    });
+
+    let mut flush_va = pa & !((1u64 << 12) - 1);
+    while flush_va < end {
+        unsafe { invlpg(flush_va) };
+        flush_va = flush_va.saturating_add(1 << 12);
+    }
+}
