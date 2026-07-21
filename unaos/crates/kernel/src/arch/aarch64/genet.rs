@@ -865,7 +865,26 @@ mod metal {
             // path: `status = (struct status_64 *)skb->data; dma_length_status = status->length_status`)
             // — not the descriptor word. Read the status block (now cache-coherent); fall back to the
             // descriptor word only if the block reads zero (belt-and-braces on odd hardware states).
-            let sb = unsafe { read_volatile(buf_base as *const u32) };
+            let mut sb = unsafe { read_volatile(buf_base as *const u32) };
+            // PI-GENET-6 FIX (boot-P13 rx[0]): the RDMA producer index can advance before the buffer
+            // DMA is visible in DRAM — the first popped frame read a zero status block AND zero payload
+            // even post-invalidate (the OFFER, lost as zeros). A zero status block means "DMA not yet
+            // visible", not "no status": re-invalidate and re-read, bounded, before consuming.
+            if sb == 0 {
+                let mut spins = 0u32;
+                while sb == 0 && spins < 10_000 {
+                    barrier();
+                    invalidate_dcache(buf_base as u64, BUF_SIZE);
+                    sb = unsafe { read_volatile(buf_base as *const u32) };
+                    spins += 1;
+                }
+                if sb != 0 {
+                    serial_println!(
+                        "{}   [genet6] rx status block arrived after {} re-polls (premature pop rescued — producer index led the buffer DMA) ::",
+                        PG, spins
+                    );
+                }
+            }
             let ls = if sb != 0 { sb } else { dsc_ls };
             // Received length is bits [beyond 16]; strip the 64-byte status block + 2-byte align pad
             // (both included in the reported length — see RX_STATUS_PAD).
@@ -1238,7 +1257,9 @@ mod metal {
     const OUR_IP: [u8; 4] = [192, 168, 1, 2];
     const GATEWAY_IP: [u8; 4] = [192, 168, 1, 1];
     /// Bounded DHCP-lease timeout (ms). The clock is real time (CNTPCT), so this is non-hanging.
-    const DHCP_TIMEOUT_MS: i64 = 5_000;
+    // PI-GENET-6: 5 s missed the lease on boot-P13 — a real 342-byte frame landed right after the
+    // window closed. 15 s is the shape that leased on the Orin (2 DISCOVERs, bootpd answered the 2nd).
+    const DHCP_TIMEOUT_MS: i64 = 15_000;
 
     /// Monotonic millisecond clock from the free-running counter (CNTPCT). Drives both smoltcp time and
     /// the DHCP timeout (the NET-4 `now_ms` shape).
