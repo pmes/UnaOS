@@ -131,6 +131,19 @@ const XCARVE_GIB9_BASE: u64 = 0x2_6b80_0000;
 #[cfg(feature = "tegra")]
 const XCARVE_GIB9_SIZE: u64 = 0x0098_0000; // 9.5 MiB, ends at 0x26c180000 (DTB neighbor base) — a GUESS
 
+/// XCARVE-10: the GiB-9 protected span continues ABOVE the declared `[0x26c180000, 0x26c400000)`
+/// DTB carveout. boot-34-retry (2026-07-21) hit SNOC Carveout Uncorrectable + ACI FillWrite at
+/// ADDR 0x800000026c6be4a0 → PA 0x26c6be4a0 — above 0x26c400000, refuting the XCARVE-9 assumption
+/// that the declared upper neighbor capped the family. Same method as XCARVE-9: no honest extent is
+/// readable (DTB/UEFI silent, MC probing is the rejected EL3-crash class), so exclude a bounded
+/// GUESS window starting flush at the declared neighbor's top and covering the observed granule
+/// with slack: **4 MiB** `[0x26c400000, 0x26c800000)`. A hit at/above 0x26c800000 refutes this in
+/// turn. Heap (top 0x26b3ca000) unaffected.
+#[cfg(feature = "tegra")]
+const XCARVE_GIB9B_BASE: u64 = 0x2_6c40_0000;
+#[cfg(feature = "tegra")]
+const XCARVE_GIB9B_SIZE: u64 = 0x0040_0000; // 4 MiB, ends at 0x26c800000 — a GUESS
+
 #[cfg(feature = "tegra")]
 static mut L2_POOL: [PageTable; MAX_SPLIT_GIB] = [const { PageTable([0; 512]) }; MAX_SPLIT_GIB];
 #[cfg(feature = "tegra")]
@@ -261,12 +274,23 @@ fn resolve_carveout_holes(
         dropped += 1;
     }
 
+    // Slot 2: XCARVE-10 upper GiB-9 window (4 MiB QUIRK fallback — the gap ABOVE the declared
+    // [0x26c180000, 0x26c400000) carveout; boot-34-retry's 0x26c6be4a0 hit refuted the XCARVE-9
+    // declared-neighbor cap, see XCARVE_GIB9B_SIZE).
+    let (ub, us, usrc) = resolve_quirk(0x2_6c6b_e4a0, XCARVE_GIB9B_BASE, XCARVE_GIB9B_SIZE); // the boot-34-retry hit PA
+    if n < cap {
+        out[n] = (ub, us, usrc);
+        n += 1;
+    } else {
+        dropped += 1;
+    }
+
     // STRUCTURAL: every remaining DTB `/reserved-memory` carveout inside a RAM GiB (deduped, fb-skipped).
     for &(b, s) in carve.iter().take(nfdt) {
         if s == 0 || !in_ram_gib(b) || hits_fb(b, s) {
             continue;
         }
-        if (b == pb && s == ps) || (b == bb && s == bs) {
+        if (b == pb && s == ps) || (b == bb && s == bs) || (b == ub && s == us) {
             continue; // already represented by a quirk slot
         }
         if n < cap {
