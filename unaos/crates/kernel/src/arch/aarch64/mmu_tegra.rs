@@ -110,6 +110,27 @@ const XCARVE_BE_BASE: u64 = 0xbe00_0000;
 #[cfg(feature = "tegra")]
 const XCARVE_BE_SIZE: u64 = 0x0600_0000; // 96 MiB, ends at 0xc400_0000 — a GUESS (see doc above)
 
+/// XCARVE-9: the PRIMARY "0x26b9" QUIRK window's honest extent. XCARVE-3 guessed the single 2 MiB L2
+/// granule containing the boot-21 hit (`[0x26b800000, 0x26ba00000)`); boot-28 run 2 REFUTED that guess
+/// (SNOC Carveout Uncorrectable + ACI FillWrite, ADDR 0x800000026bc5ee90 → PA 0x26bc5ee90, ~2.4 MiB
+/// ABOVE the 2 MiB top, mid-simmer; EL3 powered off two cores, the machine survived) — the same
+/// too-small-extent class XCARVE-8 fixed for the 0xbe window. As with 0xbe, no honest extent is
+/// readable (the DTB/UEFI sets are silent over this PA — that IS why it is a QUIRK; MC-register
+/// probing is the rejected EL3-crash class). But here the geometry gives a bound the 0xbe window never
+/// had: the DTB DOES declare adjacent carveouts — `[0x26b5f0000, 0x26b7f0000)` below and
+/// `[0x26c180000, 0x26c400000)` above — and the observed family (0x26b900000, 0x26bc5ee90) sits in the
+/// undeclared gap between them, suggesting one contiguous protected span ~`[0x26b5f0000, 0x26c400000)`.
+/// So XCARVE-9 widens the QUIRK to fill exactly that gap: **9.5 MiB** `[0x26b800000, 0x26c180000)` —
+/// top flush against the declared upper neighbor, never overlapping it (the declared windows stay
+/// their own set entries; adjacency is fine). This extent is a bounded GUESS, said so in the banner; a
+/// hit in the residual `[0x26b7f0000, 0x26b800000)` sliver or above 0x26c400000 refutes it in turn.
+/// Heap is unaffected: it tops at 0x26b3ca000, below every window here (`select_heap_region` re-proves
+/// this against the same set).
+#[cfg(feature = "tegra")]
+const XCARVE_GIB9_BASE: u64 = 0x2_6b80_0000;
+#[cfg(feature = "tegra")]
+const XCARVE_GIB9_SIZE: u64 = 0x0098_0000; // 9.5 MiB, ends at 0x26c180000 (DTB neighbor base) — a GUESS
+
 #[cfg(feature = "tegra")]
 static mut L2_POOL: [PageTable; MAX_SPLIT_GIB] = [const { PageTable([0; 512]) }; MAX_SPLIT_GIB];
 #[cfg(feature = "tegra")]
@@ -171,8 +192,8 @@ pub fn carveout_holes(out: &mut [(u64, u64, u8)]) -> usize {
 /// XCARVE-6: build the SET of protected windows to exclude, into `out`, returning `(kept, dropped)` where
 /// `dropped` counts windows that overflowed `out` (witnessed by the caller — never a silent cap).
 ///
-/// Slot 0 is always the PRIMARY 0x26b9 window (DTB-covering node → source 1, else a bounded 2 MiB QUIRK →
-/// source 2), so `carveout_hole()`/`HOLE_*` stay the 0x26b9 extent every existing consumer expects. Slot 1
+/// Slot 0 is always the PRIMARY 0x26b9 window (DTB-covering node → source 1, else the 9.5 MiB XCARVE-9
+/// QUIRK — a bounded GUESS, see `XCARVE_GIB9_SIZE` → source 2), so `carveout_hole()`/`HOLE_*` stay the 0x26b9 extent every existing consumer expects. Slot 1
 /// is the XCARVE-6/8 0xbe window (DTB-covering node → source 1, else the full 96 MiB QUIRK — a bounded GUESS). Then the
 /// STRUCTURAL set: every DTB `/reserved-memory` carveout that falls inside a RAM GiB (deduped against the
 /// quirks). The framebuffer carveout is NEVER added — it is CPU-written scanout, not a no-touch firewall
@@ -223,9 +244,11 @@ fn resolve_carveout_holes(
         (fb_base, fb_size, 2)
     };
 
-    // Slot 0: PRIMARY 0x26b9 window (2 MiB QUIRK fallback — the L2 granule containing the boot-21 PA).
+    // Slot 0: PRIMARY 0x26b9 window (XCARVE-9: 9.5 MiB QUIRK fallback — the undeclared gap between the
+    // DTB's adjacent carveouts; boot-28 refuted the XCARVE-3 single-granule guess, see XCARVE_GIB9_SIZE).
     let target = crate::vugras::XCARVE_TARGET_PA as u64;
-    let (pb, ps, psrc) = resolve_quirk(target, target & !(BLK2 - 1), BLK2);
+    debug_assert_eq!(target & !(BLK2 - 1), XCARVE_GIB9_BASE); // the widened window still contains the boot-21 PA's granule
+    let (pb, ps, psrc) = resolve_quirk(target, XCARVE_GIB9_BASE, XCARVE_GIB9_SIZE);
     out[n] = (pb, ps, psrc);
     n += 1;
 
