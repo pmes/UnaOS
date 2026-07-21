@@ -68,25 +68,25 @@ pub fn setup_window(context: &mut Context) {
         )
         .build();
 
-    context.register_global_property(
+    let _ = context.register_global_property(
         boa_engine::string::JsString::from("window"),
         window.clone(),
         Attribute::all(),
     );
 
-    context.register_global_property(
+    let _ = context.register_global_property(
         boa_engine::string::JsString::from("location"),
         location,
         Attribute::all(),
     );
 
-    context.register_global_property(
+    let _ = context.register_global_property(
         boa_engine::string::JsString::from("history"),
         history,
         Attribute::all(),
     );
 
-    context.register_global_property(
+    let _ = context.register_global_property(
         boa_engine::string::JsString::from("navigator"),
         navigator,
         Attribute::all(),

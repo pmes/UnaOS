@@ -18,14 +18,14 @@ mod tests {
 
     #[test]
     fn test_render_paint_assertions() {
-        let html = r#"<html><body><div id="box" style="width: 10px; height: 10px;"></div></body></html>"#;
+        let html = r#"<html><body><div id="box" style="width: 10px; height: 10px; background-color: red;"></div></body></html>"#;
         let document = dom::parse_html(html);
         let mut layout_tree = layout::compute_layout(&document);
         
         // CSS engine in aether is currently rudimentary, but we just verify it doesn't panic
         // and that we can paint the layout boxes.
         let mut surface = vec![0u8; 100 * 100 * 4];
-        render::render_frame(&layout_tree, &mut surface, 100, 100);
+        render::render_frame(&layout_tree, &mut surface, 100, 100, 0.0, 0.0);
         
         // The current render_frame fills white background: 255, 255, 255, 255
         // We just assert the background is painted at (0, 0) if no boxes overlap, or we check the box color.
@@ -34,8 +34,12 @@ mod tests {
         let is_painted = surface.iter().any(|&b| b != 0);
         assert!(is_painted, "Surface should be painted by render_frame");
         
-        // Assert pixel at 0,0 is background (white, or border black)
-        assert!(surface[0] == 255 || surface[0] == 0, "Expected white or black pixel at 0,0");
+        // Assert pixel at 5,5 is red (0, 0, 255)
+        let idx = (5 * 100 + 5) * 4;
+        assert_eq!(surface[idx], 0, "B should be 0");
+        assert_eq!(surface[idx+1], 0, "G should be 0");
+        assert_eq!(surface[idx+2], 255, "R should be 255");
+        assert_eq!(surface[idx+3], 255, "A should be 255");
     }
 
     #[test]

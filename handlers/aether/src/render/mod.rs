@@ -2,7 +2,7 @@ use crate::layout::LayoutTree;
 use image::{ImageBuffer, Rgba};
 use bandy::signals::SMessage;
 
-pub fn render_frame(layout: &LayoutTree, surface: &mut [u8], width: u32, height: u32) {
+pub fn render_frame(layout: &LayoutTree, surface: &mut [u8], width: u32, height: u32, scroll_x: f64, scroll_y: f64) {
     // Fill background with white
     for chunk in surface.chunks_exact_mut(4) {
         chunk[0] = 255; // B
@@ -11,10 +11,25 @@ pub fn render_frame(layout: &LayoutTree, surface: &mut [u8], width: u32, height:
         chunk[3] = 255; // A
     }
 
-    for (node_id, _) in &layout.node_map {
+    let sy = scroll_y as i32;
+    let sx = scroll_x as i32;
+
+    for (node_id, dom_node) in &layout.node_map {
+        let mut bg_b = 200;
+        let mut bg_g = 200;
+        let mut bg_r = 200;
+        
+        if let Some(el) = dom_node.as_element() {
+            if let Some(style) = el.attributes.borrow().get("style") {
+                if style.contains("background-color: red") || style.contains("background-color:red") {
+                    bg_r = 255; bg_g = 0; bg_b = 0;
+                }
+            }
+        }
+
         if let Ok(layout_box) = layout.taffy.layout(*node_id) {
-            let x_start = layout_box.location.x.max(0.0) as u32;
-            let y_start = layout_box.location.y.max(0.0) as u32;
+            let x_start = ((layout_box.location.x as i32) - sx).max(0) as u32;
+            let y_start = ((layout_box.location.y as i32) - sy).max(0) as u32;
             let w = layout_box.size.width.max(0.0) as u32;
             let h = layout_box.size.height.max(0.0) as u32;
             
@@ -31,9 +46,9 @@ pub fn render_frame(layout: &LayoutTree, surface: &mut [u8], width: u32, height:
                             surface[idx+2] = 0;   // R
                             surface[idx+3] = 255; // A
                         } else {
-                            surface[idx] = 200;
-                            surface[idx+1] = 200;
-                            surface[idx+2] = 200;
+                            surface[idx] = bg_b;
+                            surface[idx+1] = bg_g;
+                            surface[idx+2] = bg_r;
                             surface[idx+3] = 255;
                         }
                     }
