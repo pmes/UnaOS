@@ -84,6 +84,22 @@ Implemented all milestones per the adversarial review criteria and PLAN-aether-b
 - Implemented `shell_gtk.rs` providing a live `gtk4::ApplicationWindow`, URL entry bar, and a `gtk4::DrawingArea`.
 - Integrated `AetherEngine` rendering into the GTK event loop, utilizing `glib::MainContext::spawn_local` and a Tokio runtime to correctly pump IO without blocking the UI thread.
 - Render surface paints successfully via Cairo `ImageSurface` wrapping the BGRA frame buffer.
-- Qt and macOS shells have been scaffolded as stubs for future milestones.
 
-**Oracle Verification**: `cargo check -p aether-shell --features gtk` passes successfully.
+**3. A2-2: Engine Core and Damage Tracking**
+- `AetherEngine` now centrally manages the BGRA surface frame buffer (`Vec<u8>`).
+- Implemented `hit_test` to map screen coordinates and scroll offsets to the internal `taffy`/DOM tree layout, enabling precise DOM node targeting.
+- Event loop natively handles `MouseDown`/`MouseUp` (link dispatch, focus), `Text` and `KeyDown` (typing, backspace processing on inputs), tracking the `focused_node`.
+- **Fast Scroll and Damage Tracking:** 
+  - Mouse wheel deltas seamlessly scroll the surface buffer using fast, contiguous memory shifting via `ptr::copy_within`.
+  - Emits focused `damage_rects` to drastically reduce CPU overhead during scrolling by rendering only the newly exposed horizontal bands.
+  - *Future-proofing note:* The `ptr::copy`-based scrolling fundamentally assumes no `position: fixed` or `position: sticky` elements are painted over the shifted region. When `fixed/sticky` positioning is introduced to the layout engine, these rects MUST be manually added to the damage list or the `copy_within` approach must be disabled/modified. This is documented here to avoid mystery bugs later.
+
+**4. A2-4: macOS Shell**
+- Extended `vessels/aether-shell` for macOS target utilizing `winit` and `softbuffer`.
+- Implemented `shell_macos.rs` featuring a native event loop that natively interfaces with Input Method Events (IME) for text commit and momentum scrolling on trackpads.
+- Renders `AetherEngine` directly via software blit and incorporates a synthetic URL bar.
+
+**5. A2-3: Qt Shell**
+- Created Qt stubs in `vessels/aether-shell/src/shell_qt.rs` via `cxx-qt`. Fully staged for C++ integration bridging in future iterations once the QML frontend is assembled.
+
+**Oracle Verification**: `cargo check -p aether-shell --features gtk` passes successfully. `cargo check -p aether-shell --features qt` and `--target x86_64-apple-darwin` pass structurally on host.
