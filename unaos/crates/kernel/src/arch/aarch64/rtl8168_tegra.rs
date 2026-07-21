@@ -1956,8 +1956,39 @@ mod metal {
                     post[8], post[9], post[10], post[11], post[12], post[13], post[14], post[15]
                 );
             }
+            // NET-4D (knob UNAOS_NET4_BUF1, INTERIM WORKAROUND — not the fix): boot-39-retry proved
+            // every inbound payload lands at buffer[1]'s address (the NIC's last-fetched descriptor
+            // addr; mechanism NET-4A, cause unfound after 7 exonerations) while completions advance
+            // per-slot. The OFFER was only ever readable because it happened to BE pop 1. Until the
+            // NIC-internal fetch defect is cured, read the frame from where the NIC provably writes:
+            // for any completed slot other than 1, if buffer[1]'s head is non-zero, copy from
+            // buffer[1] instead of the (zero) slot buffer, then zero buffer[1]'s head so a stale
+            // frame is never double-consumed. Loses coalesced back-to-back frames (single landing
+            // address) — acceptable for the DHCP exchange; NOT a keeper. Off by default.
+            let buf1 = unsafe { self.rx_buffers.add(RX_BUF_SIZE) };
+            let use_buf1 = option_env!("UNAOS_NET4_BUF1").is_some()
+                && self.rx_cur != 1
+                && unsafe { read_volatile(buf1) } != 0
+                && {
+                    let mut nz = false;
+                    for i in 0..12 {
+                        nz |= unsafe { read_volatile(buf1.add(i)) } != 0;
+                    }
+                    nz
+                };
+            let src = if use_buf1 { buf1 } else { buf };
             unsafe {
-                core::ptr::copy_nonoverlapping(buf, out.as_mut_ptr(), len);
+                core::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), len);
+            }
+            if use_buf1 {
+                // Consume: zero the head so the next pop can't re-read this frame.
+                for i in 0..16 {
+                    unsafe { core::ptr::write_volatile(buf1.add(i), 0u8) };
+                }
+                serial_println!(
+                    "{}   [net4D] rx[{}] slot={} len={} frame HARVESTED from buffer[1] (interim buf1-read workaround; head consumed) ::",
+                    P4, self.rx_count, self.rx_cur, len
+                );
             }
             // NET-4B: one-shot WITNESS on the first popped frame — names the coherency strategy now on the
             // live RX path (Normal-NC DMA window + `dma_rmb` ordering, replacing every cache-maintenance
