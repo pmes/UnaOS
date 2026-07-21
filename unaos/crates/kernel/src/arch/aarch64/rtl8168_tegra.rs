@@ -471,6 +471,10 @@ mod metal {
     /// NET-4m: leading buffer bytes the probe dumps per pop (two Ethernet MACs' worth — enough to read
     /// dst/src and tell a real L2 header from an all-zero fill without flooding the window).
     const NET4M_PROBE_BYTES: usize = 16;
+    /// NET-4z: bound on the knob-gated SCAN-ALL destination witness (fires on every pop, not just the
+    /// non-zero slots net4y inspected). Eight pops localize the payload's TRUE landing index without
+    /// flooding the window.
+    const NET4Z_PROBE_N: u64 = 8;
 
     // ── NET-4d: RX-window frame classification (the DHCP no-lease RX-side proof) ──
     // Bounds the per-frame serial noise: a full L2/L3/L4 line for the first NET4D_FULL_LINES popped
@@ -808,6 +812,11 @@ mod metal {
         /// NET-4y: buffer[0] cross-witness lines emitted so far (bounded to the first 3 pops on a
         /// slot other than 0 — the "is the NIC writing EVERY payload to buffer[0]" discriminator).
         net4y_probes: u64,
+        /// NET-4z: SCAN-ALL destination-witness lines emitted so far (bounded to NET4Z_PROBE_N pops).
+        /// Where net4y inspected ONLY buffer[0], net4z scans the whole ring and names the exact buffer
+        /// index each payload actually landed in — the discriminator between "arena base (index 0)" and
+        /// "some other wrong index", and the proof it is not the completed slot's own buffer.
+        net4z_probes: u64,
     }
 
     // The driver owns raw DMA pointers; on the single-CPU main-loop/poll discipline it is only ever
@@ -1965,6 +1974,52 @@ mod metal {
                     if nonzero && et_sane { "yes" } else { "no" }
                 );
             }
+            // NET-4z — the SCAN-ALL destination witness (knob-gated, read-only; first NET4Z_PROBE_N
+            // pops, every slot). net4y proved buffer[0] holds the frame but only ever INSPECTED
+            // buffer[0], so it cannot tell "every payload to the arena base (index 0)" from "payload to
+            // some OTHER wrong index" nor confirm it is not the completed slot's own buffer. This scans
+            // EVERY RX buffer — each independently invalidated + speculation-fenced so DRAM answers, not
+            // a resident line — and reports the exact index whose head equals THIS pop's frame. `hit==0`
+            // on a non-zero-slot pop is the smoking gun that the NIC sources every payload's target from
+            // the FIRST descriptor's buffer address (== the arena base in this layout) while advancing
+            // its writeback index independently — a NIC-internal descriptor-address latch BELOW the
+            // driver's per-descriptor programming lane (whose DRAM is proven correct: net4x [MATCH]).
+            if option_env!("UNAOS_NET4_RINGDUMP").is_some() && self.net4z_probes < NET4Z_PROBE_N {
+                self.net4z_probes += 1;
+                let n = len.min(16);
+                let mut hit: i64 = -1;
+                if n > 0 {
+                    for k in 0..NUM_RX {
+                        let bk = unsafe { self.rx_buffers.add(k * RX_BUF_SIZE) };
+                        cache::invalidate_range(bk as usize, 64); // closes with dsb sy
+                        unsafe { core::arch::asm!("isb", options(nostack, preserves_flags)) };
+                        let mut same = true;
+                        for i in 0..n {
+                            if unsafe { read_volatile(bk.add(i)) } != out[i] {
+                                same = false;
+                                break;
+                            }
+                        }
+                        if same {
+                            hit = k as i64;
+                            break;
+                        }
+                    }
+                }
+                serial_println!(
+                    "{}   [net4z] rx[{}] popped slot={} len={} frame-landed-in-buffer-index={} completed-slot={} (arena-base=index 0) — {} ::",
+                    P4, self.rx_count - 1, self.rx_cur, len, hit, self.rx_cur,
+                    if hit == self.rx_cur as i64 {
+                        "payload landed in the COMPLETED slot's own buffer -> per-descriptor addressing WORKS"
+                    } else if hit == 0 {
+                        "payload landed at the ARENA BASE (index 0), NOT the completed slot -> NIC latches the first descriptor's buffer address; driver DRAM is correct (net4x MATCH) so this is a NIC/RC descriptor-address reuse below the programming lane"
+                    } else if hit < 0 {
+                        "payload NOT FOUND in any RX buffer (all-zero / sank elsewhere)"
+                    } else {
+                        "payload landed in an UNEXPECTED buffer index (neither the completed slot nor the arena base)"
+                    }
+                );
+            }
             // NET-4f/NET-4u: before re-arming, CLEAN+INVALIDATE the whole buffer (upgraded from plain
             // invalidate). The copy above pulled the frame into the D-cache; those lines should be
             // clean, but `dc civac` is the always-safe sync-for-device: if ANY line in the span is
@@ -2877,6 +2932,7 @@ mod metal {
             dhcp_tx_witnessed: 0,
             net4t_other_dumped: 0,
             net4y_probes: 0,
+            net4z_probes: 0,
         };
 
         // ── M2/M3 GUARD: poison-honest readback through the NEW window BEFORE any register write ──
