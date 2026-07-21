@@ -15,6 +15,9 @@ several sessions can work in parallel without stepping on each other.
   `UNAOS_SCHED_DEMO`, `UNAOS_USBDEBUG`.
 - Inspect serial logs with `awk '/pattern/' <log>` — **not `grep`** (control
   bytes in the logs break it).
+- **Dependencies: latest stable, always** (Peter, 2026-07-21). This is a brand-new
+  OS — when a newer stable version of a crate exists, update to it; there is no
+  legacy to protect. Never pin to a pre-release or downgrade below current stable.
 - Direction: [`docs/ROADMAP.md`](docs/ROADMAP.md). Security model + hardening
   ledger: [`docs/SECURITY.md`](docs/SECURITY.md). Subsystem docs: `docs/dev/OS/`.
 
