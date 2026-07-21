@@ -191,6 +191,28 @@
 // per-block coverage lines, ONE `program_inbound_alias` readback MATCH (UPPER_TARGET=0x2, enabled=1) at
 // index 1, no `0x200` IOB RAS, `[net4m]` all-nonzero, DHCP LEASE.
 //
+// ## NET-4v — audit the covering-region LIMIT + arm a per-object coverage witness (boot-30 evidence).
+//
+// Boot-30 (pi4-r23s1 retry): `[net4u] rx[0]` pre-ivac == post-ivac == real LLDP payload — the first
+// buffer's DMA write LANDS — while `[net4m] rx[1..5]` read all-zero DRAM at real descriptor lengths.
+// Ring writeback (OWN/len) works every slot. The suspect: covering-region LIMIT undersize. The AUDIT
+// REFUTES that suspect with the boot's own armed numbers: the region armed as base=0x683d0000
+// limit=0x6840ffff target=0x2683d0000 (readback-proven, enabled=1 after 0 polls), and the required
+// span — rx-ring [0x683d0000..0x683d0200), rx-buffers [0x683e0000..0x683f0000), tx-ring
+// [0x683f0000..0x683f0080), tx-buffers [0x68400000..0x68404000) — tops out at 0x68403fff, i.e.
+// 0xc000 BELOW the armed inclusive limit. Every rounding in the math is on the correct side
+// (base floors DOWN to 64 KiB, end rounds UP, limit is the inclusive `end − 1`; §A2). rx[1]'s bus
+// address 0x683e0800 sits squarely INSIDE the armed window yet its write sinks, 0x800 bytes after an
+// address that translates — a cut no 64 KiB-granular iATU limit can make. So the sink is NOT the
+// iATU limit; it is below the region (SMMU / another inbound stage), outside this lane.
+// What lands is exactly the NET-4h "firmware-residual" signature (ring page + first buffer).
+// This arc arms the missing instrument instead of a speculative size change: `witness_dma_coverage`
+// re-reads the armed region's BASE/LIMIT/TARGET registers INDEPENDENTLY of `program_inbound_alias`'s
+// readback, prints every DMA object's required bus span against them, and issues a one-line verdict
+// `covers=ALL` / `covers=MISS(<obj>)` — MISS fails the bring-up CLOSED. Boot-31 oracle: `[net4v]`
+// four per-object `covered` lines + `covers=ALL` (exonerating the limit on silicon), rx[1..] still
+// zero ⇒ the sink is formally below the iATU.
+//
 // ## Write discipline
 //
 // The driver, being a driver, DOES the fabric writes NET-3 refused: it enables the device's
@@ -992,7 +1014,65 @@ mod metal {
                 "{}   [net4s] 1 covering inbound alias region armed + readback-proven at index {}; all {} DMA block(s) (RX/TX ring AND buffers) covered by one window ::",
                 P4, idx, n_need
             );
-            true
+            // NET-4v — the coverage witness: prove, from an INDEPENDENT register re-read (not
+            // program_inbound_alias's own readback), that the armed window spans every DMA object.
+            // Fail-closed on any MISS.
+            self.witness_dma_coverage(idx, &blocks)
+        }
+
+        /// NET-4v — per-object coverage witness. Re-reads the armed inbound region `idx`'s
+        /// BASE/LIMIT/TARGET straight from the CSRs (readback-proving the LIMIT pair the same way
+        /// NET-4r proved the rest, but from a fresh read this arc owns), then checks every DMA object's
+        /// REQUIRED bus span — computed from the actual allocation (pa truncated to low-32, length from
+        /// the live ring/buffer geometry), never hardcoded — against the INCLUSIVE `[base, limit]`
+        /// match window (§A0: LIMIT = end − 1, inclusive; §A2: 64 KiB granularity). An object already
+        /// inside the NET-4h identity region needs no alias and is reported as such. One line per
+        /// object plus the verdict line `covers=ALL` / `covers=MISS(<obj>)`; a MISS returns false so
+        /// the bring-up fails CLOSED rather than DMA into a sink. Boot-30 audit note: the armed window
+        /// [0x683d0000..0x6840ffff] already covers the required top 0x68403fff — this witness is the
+        /// standing on-silicon proof of that (the rx[1..] sink is below the iATU).
+        fn witness_dma_coverage(&self, idx: u64, blocks: &[(u64, u64, &str)]) -> bool {
+            let region = self.atu_base + ATU_INBOUND_DIR_OFF + idx * ATU_REGION_STRIDE;
+            let r = |off: u64| -> u32 { unsafe { read_volatile((region + off) as *const u32) } };
+            let rb_base = ((r(ATU_UNR_UPPER_BASE) as u64) << 32) | r(ATU_UNR_LOWER_BASE) as u64;
+            let rb_limit = ((r(ATU_UNR_UPPER_LIMIT) as u64) << 32) | r(ATU_UNR_LOWER_LIMIT) as u64;
+            let rb_target = ((r(ATU_UNR_UPPER_TARGET) as u64) << 32) | r(ATU_UNR_LOWER_TARGET) as u64;
+            let ctrl2 = r(ATU_UNR_REGION_CTRL2);
+            serial_println!(
+                "{}   [net4v] armed region {} re-read: BASE={:#x} LIMIT={:#x} (inclusive) TARGET={:#x} CTRL2={:#010x} enabled={} span={:#x} ::",
+                P4, idx, rb_base, rb_limit, rb_target, ctrl2, (ctrl2 >> 31) & 1,
+                rb_limit.wrapping_sub(rb_base).wrapping_add(1)
+            );
+            let mut miss: Option<&str> = None;
+            for &(pa, len, tag) in blocks.iter() {
+                let alias = pa & 0xFFFF_FFFF;
+                let identity =
+                    pa == alias && alias >= self.dma_ident_lo && alias + len <= self.dma_ident_hi;
+                // Inclusive end of the object's required bus span.
+                let need_end = alias + len - 1;
+                let covered = identity || (alias >= rb_base && need_end <= rb_limit);
+                serial_println!(
+                    "{}   [net4v] {} pa [{:#x}..{:#x}) requires bus [{:#x}..{:#x}] : {} ::",
+                    P4, tag, pa, pa + len, alias, need_end,
+                    if identity { "identity-covered" } else if covered { "covered" } else { "NOT COVERED" }
+                );
+                if !covered && miss.is_none() {
+                    miss = Some(tag);
+                }
+            }
+            match miss {
+                None => {
+                    serial_println!("{}   [net4v] verdict: covers=ALL ::", P4);
+                    true
+                }
+                Some(tag) => {
+                    serial_println!(
+                        "{}   !! [net4v] verdict: covers=MISS({}) — armed window [{:#x}..{:#x}] does not span it; REFUSING (fail-closed) ::",
+                        P4, tag, rb_base, rb_limit
+                    );
+                    false
+                }
+            }
         }
 
         fn init_rings(&mut self) -> bool {
