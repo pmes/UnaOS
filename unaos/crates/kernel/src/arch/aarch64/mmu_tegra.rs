@@ -182,6 +182,39 @@ static HOLES_SIZE: [core::sync::atomic::AtomicU64; MAX_HOLES] =
 static HOLES_SRC: [core::sync::atomic::AtomicU8; MAX_HOLES] =
     [const { core::sync::atomic::AtomicU8::new(0) }; MAX_HOLES];
 
+// ── NET-4B: the Normal-NC DMA window (rings + RX/TX buffers) ─────────────────────────────────────────
+//
+// NET-4A's verdict: the RTL8168/Tegra-RC integration reuses the last-fetched descriptor's buffer address
+// for every later RX completion (a NIC/RC-internal defect below the driver's lane); every cache-maintenance
+// theory on the CACHEABLE ring/buffers was refuted, and the ring DRAM was proven correct. The one
+// structural difference left vs Linux-on-this-silicon (which leases) is that r8169's rings live in
+// dma_alloc_coherent (non-cacheable/coherent) memory while ours were cacheable DRAM with manual
+// clean/invalidate. NET-4B matches the exercised config: a small Normal-NC window the driver lays its
+// rings + buffers into, removing every maintenance-vs-fetch race by construction (first principle: do it
+// right by matching the config the hardware actually leases under, not by out-guessing a below-lane bug).
+//
+// PLACEMENT. One L2 2 MiB block is ample (32×2048 RX + 8×2048 TX buffers + both rings < 256 KiB). It must
+// be RAM, carveout-clean, DMA-reachable, and never double-used by the heap. The heap-guard evidence
+// (`[0x2683ca000, 0x26b3ca000)`, the "highest clean window") shows the usable DRAM tops EXACTLY at the
+// heap top on this silicon — a FIXED PA above it would land in reserved DRAM. So the window is DERIVED,
+// not hardcoded: `select_heap_region` reserves it as a 2 MiB-aligned block carved from the SAME clean +
+// DMA-reachable window it seats the heap in (the heap moves to the top of that window, the NC block sits
+// just below it, no overlap by construction — see `select_heap_region`). `NET4B_NC_BASE` is latched there
+// and the window is mapped NC by `install_net4b_nc` (below), which patches GiB 9's always-present L2 split.
+#[cfg(feature = "tegra")]
+pub const NET4B_NC_SIZE: u64 = 2 * 1024 * 1024;
+#[cfg(feature = "tegra")]
+static NET4B_NC_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// NET-4B: the reserved Normal-NC DMA window `(base, size)`, or `(0, 0)` before `select_heap_region`
+/// has run / on the fail-closed path. The RTL8168 driver reads this to lay its rings + buffers in NC RAM.
+#[cfg(feature = "tegra")]
+pub fn net4b_nc_window() -> (u64, u64) {
+    use core::sync::atomic::Ordering;
+    let base = NET4B_NC_BASE.load(Ordering::Relaxed);
+    (base, if base != 0 { NET4B_NC_SIZE } else { 0 })
+}
+
 /// XCARVE-3: the PRIMARY excluded carveout hole `(base, size, source)` (`source`: 0 none, 1 DTB, 2 QUIRK)
 /// — the 0x26b9 window that `select_heap_region` and the VUGRAS `XCARVE_TARGET_PA` tripwire key off — or
 /// `(0,0,0)` before `init` / when none. See `carveout_holes` for the full XCARVE-6 set.
@@ -397,9 +430,12 @@ unsafe fn install_carveout_holes(
 
 // ── Translation attributes (ARM ARM DDI0487). ──────────────────────────────────────────────────────
 // MAIR: AttrIdx 0 = Normal Inner/Outer Write-Back non-transient (0xFF); AttrIdx 1 = **Device-nGnRE**
-// (0x04) — deliberately nGnRE for Tegra (early-write-ack tolerant), NOT the Pi's nGnRnE (0x00). Layout
-// is regime-independent, so the same value programs MAIR_EL2 or MAIR_EL1.
-const MAIR_VAL: u64 = 0x04FF;
+// (0x04) — deliberately nGnRE for Tegra (early-write-ack tolerant), NOT the Pi's nGnRnE (0x00);
+// AttrIdx 2 = **Normal Inner/Outer Non-Cacheable** (0x44) — the NET-4B DMA window (rings + RX/TX
+// buffers), so the NIC's non-coherent descriptor fetches / payload writes see DRAM directly and no
+// clean/invalidate race can ever mis-order against them (Linux r8169's dma_alloc_coherent config).
+// Layout is regime-independent, so the same value programs MAIR_EL2 or MAIR_EL1.
+const MAIR_VAL: u64 = 0x0044_04FF;
 
 // TCR_EL2, non-VHE short format (E2H == 0) — the field layout DIFFERS from TCR_EL1; do not copy the
 // EL1 recipe. 0x8081_3519 decodes to: T0SZ=25 [5:0]; IRGN0=WB (0b01) [9:8]; ORGN0=WB (0b01) [11:10];
@@ -452,6 +488,9 @@ const DESC_AF: u64 = 1 << 10;
 const SH_INNER: u64 = 0b11 << 8;
 const ATTR_NORMAL: u64 = 0 << 2; // MAIR AttrIdx 0
 const ATTR_DEVICE: u64 = 1 << 2; // MAIR AttrIdx 1
+// NET-4B: MAIR AttrIdx 2 = Normal Inner/Outer Non-Cacheable. Used only for the DMA window.
+#[cfg(feature = "tegra")]
+const ATTR_NC: u64 = 2 << 2;
 // Execute-never. In the **EL2 non-VHE** single-privilege stage-1 regime XN is bit 54 ONLY (bit 53 is
 // RES0 there); the UXN/PXN split is EL1&0-regime-specific.
 const EL2_XN: u64 = 1 << 54;
@@ -471,6 +510,20 @@ fn ram_block(pa: u64, el: u64) -> u64 {
     } else {
         // EL1&0 (Pi recipe): AP[7:6]=0b00 → EL1 read-write, no EL0, executable at EL1.
         pa | DESC_AF | SH_INNER | ATTR_NORMAL | DESC_BLOCK
+    }
+}
+/// NET-4B: Normal Inner/Outer **Non-Cacheable**, execute-never block (used at L2 = 2 MiB granularity for
+/// the DMA window). Shareability is ignored for Normal-NC memory, so no SH field is set. Attribute index
+/// 2 (`ATTR_NC`). EL2 sets AP[1] RES1 like every other EL2 leaf; EL1&0 sets UXN|PXN (DMA buffers are
+/// never executed). The CPU accesses this window uncached, so the NIC (a non-coherent DMA master) and the
+/// CPU share one view of DRAM with no cache-maintenance step between them.
+#[cfg(feature = "tegra")]
+#[inline]
+fn nc_block(pa: u64, el: u64) -> u64 {
+    if el == 2 {
+        pa | EL2_XN | DESC_AF | ATTR_NC | DESC_BLOCK | EL2_AP1_RES1
+    } else {
+        pa | EL1_UXN | EL1_PXN | DESC_AF | ATTR_NC | DESC_BLOCK
     }
 }
 /// Device-nGnRE, execute-never 1 GiB block. No shareability field (ignored for Device memory).
@@ -1120,6 +1173,110 @@ pub fn map_fb_region(pa: u64, size: usize) -> bool {
     all_ok
 }
 
+/// NET-4B: map the reserved Normal-NC DMA window (`net4b_nc_window`) as Normal Non-Cacheable in the LIVE
+/// translation tables. The window sits in GiB 9, which `install_carveout_holes` ALWAYS L2-splits (the
+/// XCARVE-9/10/11 GiB-9 QUIRK windows are unconditional on tegra), so its GiB's L1 entry is a TABLE
+/// descriptor and the covering 2 MiB block is one L2 entry currently mapped Normal-WB RAM (the block is
+/// carveout-clean and outside the heap span by construction — `select_heap_region` reserves it). We flip
+/// that block to Normal-NC in the ACTIVE regime's L2 and — before the JM6 EL2→EL1 drop — the EL1-precise
+/// twin's L2, clean each written descriptor to PoC, then TLBI the active regime. A clean+invalidate over
+/// the window's PA range precedes the flip so no stale Write-Back line survives the cacheability change to
+/// later evict over the NIC's DMA (the break-before-make hygiene for a WB→NC attribute change on RAM the
+/// kernel has not written). Returns true iff the window is mapped NC; false (fail-closed) if the window is
+/// unreserved or its GiB is unexpectedly not split — the driver then REFUSES rather than DMA cacheable.
+#[cfg(feature = "tegra")]
+pub fn install_net4b_nc() -> bool {
+    let (base, size) = net4b_nc_window();
+    if base == 0 || size == 0 {
+        serial_println!(
+            ":: tegra: NET-4B — no NC DMA window reserved (select_heap_region fail-closed or non-tegra); cannot map NC ::"
+        );
+        return false;
+    }
+    const BLK2: u64 = 2 * 1024 * 1024;
+    const TABLE_ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
+    let el = current_el();
+    let patch_twin = el == 2;
+    let l1 = &raw mut L1 as *mut u64;
+    let l1_el1 = &raw mut L1_EL1 as *mut u64;
+    // Drop any resident Write-Back line for the window before the attribute change (the block is
+    // untouched by the kernel, but firmware may have; `dc civac` writes back any dirty line then drops
+    // it so nothing can later evict over the NIC's DMA). Closes with the flip's own `dsb`.
+    {
+        let mut off = 0u64;
+        while off < size {
+            unsafe {
+                core::arch::asm!("dc civac, {}", in(reg) base + off, options(nostack, preserves_flags));
+            }
+            off += 64;
+        }
+        unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
+    }
+    let g_lo = base >> 30;
+    let g_hi = (base + size - 1) >> 30;
+    let mut ok = true;
+    for g in g_lo..=g_hi {
+        let gi = g as usize;
+        let d = unsafe { l1.add(gi).read_volatile() };
+        if !is_table_desc(d) {
+            serial_println!(
+                ":: tegra: NET-4B — GiB {} is not L2-split (L1 desc={:#x}); cannot map the NC window — REFUSING ::",
+                g, d
+            );
+            ok = false;
+            continue;
+        }
+        let l2 = (d & TABLE_ADDR_MASK) as *mut u64;
+        let l2_el1: *mut u64 = if patch_twin {
+            let d1 = unsafe { l1_el1.add(gi).read_volatile() };
+            if is_table_desc(d1) {
+                (d1 & TABLE_ADDR_MASK) as *mut u64
+            } else {
+                core::ptr::null_mut()
+            }
+        } else {
+            core::ptr::null_mut()
+        };
+        let gib_base = g << 30;
+        for i in 0..512usize {
+            let blk_lo = gib_base + (i as u64) * BLK2;
+            let blk_hi = blk_lo + BLK2;
+            if blk_lo < base + size && base < blk_hi {
+                unsafe {
+                    l2.add(i).write_volatile(nc_block(blk_lo, el));
+                    clean_desc(l2.add(i) as u64);
+                }
+                if !l2_el1.is_null() {
+                    unsafe {
+                        l2_el1.add(i).write_volatile(nc_block(blk_lo, 1));
+                        clean_desc(l2_el1.add(i) as u64);
+                    }
+                }
+            }
+        }
+    }
+    // Publish the new descriptors + drop stale TLB state for the ACTIVE regime (the `dsb sy` also orders
+    // the `dc cvac`s above). Mirrors `map_fb_region`: the EL1 twin needs no TLBI here — the JM6 drop's own
+    // `tlbi vmalle1` flushes EL1&0 before that regime is armed.
+    unsafe {
+        if el == 2 {
+            core::arch::asm!("dsb sy", "tlbi alle2", "dsb sy", "isb", options(nostack, preserves_flags));
+        } else {
+            core::arch::asm!("dsb sy", "tlbi vmalle1", "dsb sy", "isb", options(nostack, preserves_flags));
+        }
+    }
+    if ok {
+        serial_println!(
+            ":: tegra: NET-4B — DMA window [{:#x}, {:#x}) ({} KiB) mapped Normal-NC (MAIR AttrIdx 2) in {} table(s) ::",
+            base,
+            base + size,
+            size >> 10,
+            if patch_twin { "EL2 + EL1-twin" } else { "EL1" }
+        );
+    }
+    ok
+}
+
 /// A valid Device-nGnRE 1 GiB block: bits[1:0]=0b01 (block) AND AttrIdx (bits[4:2]) == 1 (MAIR Device).
 #[cfg(feature = "pcie2")]
 #[inline]
@@ -1430,7 +1587,16 @@ pub fn select_heap_region(
     dtb_size: usize,
 ) -> Option<(usize, usize)> {
     const PAGE: u64 = 4096;
-    let need = crate::allocator::HEAP_SIZE as u64;
+    let heap_need = crate::allocator::HEAP_SIZE as u64;
+    // NET-4B: reserve a 2 MiB-aligned Normal-NC DMA window carved from the SAME clean + DMA-reachable
+    // span the heap sits in. We search for `heap + one 2 MiB block + up to 2 MiB alignment slack`, seat
+    // the heap at the TOP of the found window, and place the NC block 2 MiB-aligned just below it — no
+    // overlap by construction, and nothing else double-uses it (the block is outside the heap span, and
+    // the kernel hands out no DRAM but the heap). The heap stays high-DRAM (the RAS-2 / NET-4A
+    // proven-reachable placement); the NC block is contiguous just below, so it is equally clean and
+    // equally inside the (degraded or derived) inbound-DMA window. `install_net4b_nc` maps it NC.
+    const NC_BYTES: u64 = NET4B_NC_SIZE;
+    let need = heap_need + 2 * NC_BYTES;
 
     // Collect carveouts to avoid: every non-Usable region the UEFI map declares, plus the DTB
     // `/reserved-memory` carveouts (the firewall ones UEFI hides inside Conventional descriptors).
@@ -1487,7 +1653,7 @@ pub fn select_heap_region(
     // at/above `heap_hi` therefore bounds a provably carveout-free `[heap_hi, top)`. Span B must never
     // DC-CIVAC a carveout (cleaning a firewalled line IS the RAS), so the localizer clips to this.
     let publish_above_heap_top = |heap_base: u64| {
-        let heap_hi = heap_base + need;
+        let heap_hi = heap_base + heap_need;
         let mut top = crate::vugras::TEGRA_DRAM_TOP as u64;
         for &(cb, cs) in carveouts {
             if cs != 0 && cb >= heap_hi && cb < top {
@@ -1495,6 +1661,18 @@ pub fn select_heap_region(
             }
         }
         crate::vugras::VUGRAS_ABOVE_HEAP_TOP.store(top as usize, core::sync::atomic::Ordering::Relaxed);
+    };
+
+    // NET-4B: from a clean base `s` of a `need`-sized window, split it into the heap (top) and the NC
+    // window (2 MiB-aligned, just below). Latches `NET4B_NC_BASE`, publishes the span-B top for the HEAP
+    // (which now tops the window), and returns the heap base. The NC window sits in `[s, heap_base)`,
+    // fully inside the proven-clean, proven-in-DMA-window span `[s, s+need)`.
+    let seat = |s: u64| -> u64 {
+        let heap_base = s + 2 * NC_BYTES;
+        let nc_base = (s + NC_BYTES - 1) & !(NC_BYTES - 1);
+        NET4B_NC_BASE.store(nc_base, core::sync::atomic::Ordering::Relaxed);
+        publish_above_heap_top(heap_base);
+        heap_base
     };
 
     // The greatest carveout BASE that overlaps [s, s+need), if any — the scan-down loop slides the
@@ -1580,19 +1758,26 @@ pub fn select_heap_region(
     if nd == 0 {
         // No derivable inbound window: keep the RAS-2 highest-clean heuristic, but witness the degrade.
         if let Some(s) = best_uncon {
+            let heap_base = seat(s);
+            let (ncb, ncs) = net4b_nc_window();
             serial_println!(
                 ":: tegra: HEAP-GUARD — kernel heap [{:#x}, {:#x}) ({} MiB), highest clean window (RAS-2 heuristic — NO PCIe dma-ranges in DTB, inbound-DMA window NOT derivable; degraded), clear of {} carveout range(s) (UEFI-reserved + DTB /reserved-memory) ::",
-                s,
-                s + need,
-                need >> 20,
+                heap_base,
+                heap_base + heap_need,
+                heap_need >> 20,
                 nc
             );
-            publish_above_heap_top(s);
-            return Some((s as usize, need as usize));
+            serial_println!(
+                ":: tegra: [net4B] Normal-NC DMA window reserved [{:#x}, {:#x}) ({} KiB), carved just below the heap in the same clean+DMA span ::",
+                ncb,
+                ncb + ncs,
+                ncs >> 10
+            );
+            return Some((heap_base as usize, heap_need as usize));
         }
         serial_println!(
             ":: tegra: HEAP-GUARD — FAIL-CLOSED: no {} MiB DRAM window clear of {} carveout(s) ::",
-            need >> 20,
+            heap_need >> 20,
             nc
         );
         return None;
@@ -1607,15 +1792,22 @@ pub fn select_heap_region(
         windows[0].1 >> 20
     );
     if let Some(s) = best_in_win {
+        let heap_base = seat(s);
+        let (ncb, ncs) = net4b_nc_window();
         serial_println!(
             ":: tegra: HEAP-GUARD — kernel heap [{:#x}, {:#x}) ({} MiB), highest clean window INSIDE the derived PCIe inbound-DMA window(s) (RAS-2 boundary now DERIVED, not folklore), clear of {} carveout range(s) (UEFI-reserved + DTB /reserved-memory) ::",
-            s,
-            s + need,
-            need >> 20,
+            heap_base,
+            heap_base + heap_need,
+            heap_need >> 20,
             nc
         );
-        publish_above_heap_top(s);
-        return Some((s as usize, need as usize));
+        serial_println!(
+            ":: tegra: [net4B] Normal-NC DMA window reserved [{:#x}, {:#x}) ({} KiB), carved just below the heap inside the derived inbound-DMA window ::",
+            ncb,
+            ncb + ncs,
+            ncs >> 10
+        );
+        return Some((heap_base as usize, heap_need as usize));
     }
 
     // A carveout-clean window exists but NONE inside the derived inbound window ⇒ any pick would
@@ -1623,7 +1815,7 @@ pub fn select_heap_region(
     // taken so the divergence is diagnosable rather than a silent bad placement.
     serial_println!(
         ":: tegra: HEAP-GUARD — FAIL-CLOSED: no {} MiB carveout-clean window falls inside the {} derived PCIe inbound-DMA window(s); best clean-but-out-of-window base = {:#x} — REFUSING (would re-arm the RAS-2 inbound fabric-error class) ::",
-        need >> 20,
+        heap_need >> 20,
         nd,
         best_uncon.unwrap_or(0)
     );

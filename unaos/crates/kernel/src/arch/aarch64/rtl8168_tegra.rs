@@ -377,12 +377,28 @@ pub use metal::net4_bringup;
 #[cfg(feature = "tegra")]
 mod metal {
     use super::P4;
-    use crate::arch::aarch64::cache;
     use crate::arch::aarch64::fdt_tegra::Fdt;
-    use crate::arch::aarch64::mmu_tegra::{map_mmio_window, MmioMap};
+    use crate::arch::aarch64::mmu_tegra::{
+        install_net4b_nc, map_mmio_window, net4b_nc_window, MmioMap,
+    };
     use crate::net_phy::{fmt_mac, RawNic, SmoltcpPhy};
-    use core::alloc::Layout;
     use core::ptr::{read_volatile, write_volatile};
+
+    /// NET-4B: DMA memory barriers matching Linux r8169's `dma_wmb()` / `dma_rmb()` on arm64
+    /// (`dmb oshst` / `dmb oshld`). With the rings + buffers now in Normal-NC memory (no cache to
+    /// clean/invalidate), these are the ONLY maintenance the descriptor protocol needs — they order the
+    /// CPU's two accesses as an external observer (the NIC) sees them, which cacheability does not change:
+    ///   * `dma_wmb` before publishing OWN so the descriptor BODY (addr/len) reaches DRAM first;
+    ///   * `dma_rmb` after observing OWN-clear so the payload read is not reordered ahead of the OWN read.
+    /// NC stores/loads still reorder on weakly-ordered aarch64, so both remain load-bearing.
+    #[inline]
+    fn dma_wmb() {
+        unsafe { core::arch::asm!("dmb oshst", options(nostack, preserves_flags)) };
+    }
+    #[inline]
+    fn dma_rmb() {
+        unsafe { core::arch::asm!("dmb oshld", options(nostack, preserves_flags)) };
+    }
 
     /// The Realtek vendor id and the RTL8168/8111 device id the NET-3 metal enumeration found.
     const REALTEK_VENDOR: u16 = 0x10ec;
@@ -829,6 +845,11 @@ mod metal {
         /// that range risks peer-to-peer routing to a BAR instead of upstream to the RC).
         mem_lo: u64,
         mem_hi: u64,
+        /// NET-4B: base PA of the Normal-NC DMA window (`mmu_tegra::net4b_nc_window`) the rings + buffers
+        /// are laid into. `0` until `init_rings` maps + claims it; the rings/buffers below are sub-slices
+        /// of `[nc_base, nc_base + NET4B_NC_SIZE)`, so they are all Non-Cacheable and need no cache
+        /// maintenance — only the `dma_wmb`/`dma_rmb` ordering barriers on the OWN protocol.
+        nc_base: u64,
         rx_ring: *mut Desc,
         rx_buffers: *mut u8,
         rx_cur: usize,
@@ -957,26 +978,28 @@ mod metal {
             mac
         }
 
-        /// Allocate the RX descriptor ring (256-byte aligned) + contiguous packet buffers, and point
-        /// each descriptor at its buffer with OWN set (ready for the NIC to fill) and the buffer size
-        /// in the length field. The `alloc_zeroed` pointer doubles as the physical address (identity
-        /// map), matching the x86 e1000 ring allocation. EOR marks the last descriptor.
+        // NET-4B: fixed 64 KiB-aligned offsets of each DMA object inside the 2 MiB Normal-NC window
+        // (`nc_base`). 64 KiB spacing keeps every object 64 KiB-aligned OUTRIGHT (NET-4r / L4T-FACTS
+        // §A2/§A3: the DWC inbound-iATU hardwires BASE/TARGET low-16 to 0, LIMIT low-16 to 1), so the
+        // covering-alias math in `arm_dma_aliases` reads back exactly what it wrote. Objects: rx-ring
+        // (512 B), rx-buffers (64 KiB), tx-ring (128 B), tx-buffers (16 KiB) — top 0x34000 < 2 MiB.
+        const NC_OFF_RX_RING: u64 = 0x0_0000;
+        const NC_OFF_RX_BUFS: u64 = 0x1_0000;
+        const NC_OFF_TX_RING: u64 = 0x2_0000;
+        const NC_OFF_TX_BUFS: u64 = 0x3_0000;
+
+        /// Lay the RX descriptor ring + contiguous packet buffers into the Normal-NC DMA window and point
+        /// each descriptor at its buffer with OWN set (ready for the NIC to fill) and the buffer size in
+        /// the length field. The NC-window PA doubles as the physical address (identity map), matching the
+        /// x86 e1000 ring allocation. EOR marks the last descriptor. NC memory ⇒ plain volatile stores
+        /// only (no cache maintenance, and no `ldxr/stxr` — the Desc is written whole, never atomically).
         fn alloc_rx(&mut self) {
-            // NET-4r: 64 KiB-align the ring AND buffer allocations so the inbound-iATU alias base/target
-            // are 64 KiB-aligned OUTRIGHT (L4T-FACTS §A2/§A3: the DWC controller hardwires BASE/TARGET
-            // low-16 to 0 and LIMIT low-16 to 1, a 64 KiB granularity — aligning here means the region
-            // reads back EXACTLY what was written, with alias_base ≡ target (mod 64 KiB) by construction).
-            let ring_layout = Layout::from_size_align(NUM_RX * core::mem::size_of::<Desc>(), 0x10000).unwrap();
-            let buf_layout = Layout::from_size_align(NUM_RX * RX_BUF_SIZE, 0x10000).unwrap();
-            self.rx_ring = unsafe { alloc::alloc::alloc_zeroed(ring_layout) as *mut Desc };
-            self.rx_buffers = unsafe { alloc::alloc::alloc_zeroed(buf_layout) };
-            // NET-4f: the buffer arena is `alloc_zeroed` → DIRTY zero lines resident in the D-cache.
-            // Invalidate the whole arena BEFORE any descriptor is armed, so (a) those dirty zeros can
-            // never be written back over the NIC's DMA payload and (b) no stale line lingers to be hit
-            // instead of the NIC's DRAM write. `dc ivac` (invalidate, not clean) is required — a clean
-            // would push the zeros to DRAM. Safe: the arena is a dedicated 4096-aligned allocation of
-            // 2048-byte (cache-line-multiple) buffers, so no line is shared with the ring or other heap.
-            cache::invalidate_range(self.rx_buffers as usize, NUM_RX * RX_BUF_SIZE);
+            self.rx_ring = (self.nc_base + Self::NC_OFF_RX_RING) as *mut Desc;
+            self.rx_buffers = (self.nc_base + Self::NC_OFF_RX_BUFS) as *mut u8;
+            // The window is fresh DRAM the kernel never wrote; zero the RX buffer block so the witnesses
+            // read a known baseline (a plain NC memset — no cache line to clean, and no `dc ivac` needed:
+            // the NIC's DMA lands straight in this same uncached DRAM the CPU reads).
+            unsafe { core::ptr::write_bytes(self.rx_buffers, 0, NUM_RX * RX_BUF_SIZE) };
             for i in 0..NUM_RX {
                 let buf_phys = (self.rx_buffers as u64) + (i * RX_BUF_SIZE) as u64;
                 let eor = if i == NUM_RX - 1 { DESC_EOR } else { 0 };
@@ -989,15 +1012,12 @@ mod metal {
             }
         }
 
-        /// Allocate the TX descriptor ring (256-byte aligned) + frame buffers. Descriptors start
+        /// Lay the TX descriptor ring + frame buffers into the Normal-NC DMA window. Descriptors start
         /// host-owned (OWN clear) so `transmit` can post into them; EOR marks the last descriptor.
         fn alloc_tx(&mut self) {
-            // NET-4r: 64 KiB-align (see alloc_rx) so the TX ring/buffer inbound-alias windows land on the
-            // controller's 64 KiB granularity outright.
-            let ring_layout = Layout::from_size_align(NUM_TX * core::mem::size_of::<Desc>(), 0x10000).unwrap();
-            let buf_layout = Layout::from_size_align(NUM_TX * TX_BUF_SIZE, 0x10000).unwrap();
-            self.tx_ring = unsafe { alloc::alloc::alloc_zeroed(ring_layout) as *mut Desc };
-            self.tx_buffers = unsafe { alloc::alloc::alloc_zeroed(buf_layout) };
+            self.tx_ring = (self.nc_base + Self::NC_OFF_TX_RING) as *mut Desc;
+            self.tx_buffers = (self.nc_base + Self::NC_OFF_TX_BUFS) as *mut u8;
+            unsafe { core::ptr::write_bytes(self.tx_buffers, 0, NUM_TX * TX_BUF_SIZE) };
             for i in 0..NUM_TX {
                 let eor = if i == NUM_TX - 1 { DESC_EOR } else { 0 };
                 let d = Desc { opts1: eor, opts2: 0, addr: 0 };
@@ -1260,9 +1280,27 @@ mod metal {
             // `[0x8000_0000, 0x2_8000_0000)` (NET-4h) already covers the high buffer PAs (~9.6 GiB), so the
             // natively-formed DAC TLP lands with no alias.
 
-            // Allocate + program the descriptor rings (256-byte-aligned physical bases) from the high
-            // kernel heap. Buffers stay high; region-0 identity reaches them once the NIC emits the full
-            // 64-bit (DAC) address — no sub-4 GiB arena (NET-4o) and no inbound alias (NET-4p) needed.
+            // NET-4B — map + claim the Normal-NC DMA window, then lay the rings + buffers into it. This is
+            // the do-it-right move after NET-4A: match Linux r8169's dma_alloc_coherent (non-cacheable)
+            // config instead of out-guessing the below-lane NIC/RC descriptor-address-reuse defect on
+            // CACHEABLE memory. `install_net4b_nc` flips the reserved window (carved by `select_heap_region`
+            // just below the heap, in the same clean + DMA-reachable span) to Normal-NC in both live tables;
+            // refuse the bring-up CLOSED if it is unavailable rather than DMA into cacheable/unmapped DRAM.
+            if !install_net4b_nc() {
+                serial_println!(
+                    "{}   !! NET-4B: Normal-NC DMA window could not be mapped — REFUSING ring bring-up (would DMA into cacheable memory, re-arming the maintenance-vs-fetch race NET-4B exists to remove) ::",
+                    P4
+                );
+                return false;
+            }
+            let (nc_base, nc_size) = net4b_nc_window();
+            self.nc_base = nc_base;
+            serial_println!(
+                "{}   [net4B] rings + buffers in Normal-NC window [{:#x}, {:#x}) (MAIR AttrIdx 2); rx-ring @ +0x0, rx-bufs @ +0x10000, tx-ring @ +0x20000, tx-bufs @ +0x30000 — no cache maintenance, dma_wmb/dma_rmb ordering only ::",
+                P4, nc_base, nc_base + nc_size
+            );
+            // Lay the descriptor rings + buffers into the NC window (64 KiB-aligned sub-slices). The NC PA
+            // doubles as the physical address (identity map); region-0 identity (NET-4h) reaches them.
             self.alloc_rx();
             self.alloc_tx();
 
@@ -1283,30 +1321,23 @@ mod metal {
                 return false;
             }
 
-            // NET-4x — clean BOTH whole descriptor rings to the PoC before the NIC can fetch them.
-            // The rings are cacheable heap: `alloc_rx`/`alloc_tx` wrote every descriptor with volatile
-            // stores, but a store + `dsb sy` publishes to COHERENT observers only — the NIC's
-            // descriptor-fetch engine reads DRAM. Every field of every descriptor is already written
-            // (the init loops completed above), so whole-ring cleans violate no half-written-neighbor
-            // hazard. `clean_range` closes with `dsb sy`. Ordered BEFORE RDSAR/TNPDS and RxEnb/TxEnb
-            // below, so the FIRST fetch already sees real buffer addresses.
-            cache::clean_range(self.rx_ring as usize, NUM_RX * core::mem::size_of::<Desc>());
-            cache::clean_range(self.tx_ring as usize, NUM_TX * core::mem::size_of::<Desc>());
-            // NET-4x WITNESS — prove DRAM (not the cache) holds real buffer addresses pre-enable:
-            // invalidate desc[1]'s and desc[17]'s lines (dropping any resident copy; they are clean —
-            // just cleaned above — so nothing is lost), then read the addr fields back. These reads
-            // MISS and re-fetch from DRAM: a zero here would mean the clean did not reach PoC.
+            // NET-4B — the rings now live in Normal-NC memory: `alloc_rx`/`alloc_tx`'s plain volatile
+            // stores go straight to DRAM (no cache to clean), and the NIC's descriptor-fetch engine reads
+            // that same uncached DRAM. Publish them ahead of RDSAR/TNPDS + RxEnb/TxEnb with one write-side
+            // ordering barrier (Linux r8169's dma_wmb; NC still reorders on aarch64). No `dc cvac`.
+            dma_wmb();
+            // NET-4x WITNESS (retained) — prove DRAM holds real buffer addresses pre-enable. On NC memory
+            // the read is a direct DRAM read (no invalidate needed): a zero here would mean the store never
+            // landed. Kept as the standing on-boot proof of the NC config.
             {
                 let d1 = unsafe { self.rx_ring.add(1) };
                 let d17 = unsafe { self.rx_ring.add(17) };
-                cache::invalidate_range(d1 as usize, core::mem::size_of::<Desc>());
-                cache::invalidate_range(d17 as usize, core::mem::size_of::<Desc>());
                 let a1 = unsafe { read_volatile(d1) }.addr;
                 let a17 = unsafe { read_volatile(d17) }.addr;
                 let e1 = (self.rx_buffers as u64) + RX_BUF_SIZE as u64;
                 let e17 = (self.rx_buffers as u64) + (17 * RX_BUF_SIZE) as u64;
                 serial_println!(
-                    "{}   [net4x] init witness (post-clean DRAM read): rx-desc[1].addr={:#x} expect={:#x} [{}] rx-desc[17].addr={:#x} expect={:#x} [{}] — DRAM holds the programmed buffer addresses pre-enable ::",
+                    "{}   [net4x] init witness (NC direct DRAM read): rx-desc[1].addr={:#x} expect={:#x} [{}] rx-desc[17].addr={:#x} expect={:#x} [{}] — DRAM holds the programmed buffer addresses pre-enable ::",
                     P4, a1, e1, if a1 == e1 { "MATCH" } else { "MISMATCH" },
                     a17, e17, if a17 == e17 { "MATCH" } else { "MISMATCH" }
                 );
@@ -1448,23 +1479,10 @@ mod metal {
             let len = frame.len().min(TX_BUF_SIZE);
             let buf = unsafe { self.tx_buffers.add(i * TX_BUF_SIZE) };
             unsafe { core::ptr::copy_nonoverlapping(frame.as_ptr(), buf, len) };
-            // NET-4f: non-coherent DMA (see the coherency note at the top of this file) — CLEAN the
-            // frame buffer to DRAM so the NIC reads the CPU's bytes, not stale RAM. TX "worked" pre-fix
-            // only by the racy luck of an eviction landing the DISCOVER before the NIC fetched it; a
-            // lost future TX is the same class, so it is fixed symmetrically with the RX invalidate.
-            // `dc cvac` here (write-back), the mirror of RX's `dc ivac`. Ends with `dsb sy`; the
-            // existing barrier below still orders the descriptor publish before the doorbell.
-            cache::clean_range(buf as usize, len);
-            // NET-4x TX AUDIT (brief item 3 — do NOT assume; audit and state): the pre-fix TX path
-            // wrote the WHOLE descriptor (OWN already set) in one volatile store, `dsb sy`, then the
-            // TPPoll doorbell — NO clean of the descriptor line, ever. The doorbell MMIO write forces
-            // ORDERING (the Device-nGnRE store completes after the prior `dsb sy`) but cleans nothing:
-            // the NIC's post-doorbell descriptor fetch read whatever ring DRAM held. TX "working" on
-            // metal was therefore the same eviction lottery as RX slot-0 — a NUM_TX=8 ring (128 B, 2
-            // lines) whose lines are touched rarely enough to be evicted between posts, NOT a correct
-            // path. Fixed with the same discipline as the RX re-arm: body (OWN clear) -> clean ->
-            // OWN store -> clean -> doorbell, so the fetch is against DRAM that provably holds the
-            // buffer address, and OWN-last holds at the DRAM level.
+            // NET-4B: the TX frame buffer is Normal-NC — the copy above lands straight in the uncached
+            // DRAM the NIC fetches; no `dc cvac`. The OWN protocol still needs the r8169 publish order:
+            // write the descriptor BODY (OWN clear), `dma_wmb` so it reaches DRAM ahead of the handoff,
+            // set OWN LAST (single aligned u32 store), then the barrier before the TPPoll doorbell.
             let eor = if i == NUM_TX - 1 { DESC_EOR } else { 0 };
             let body = DESC_FS | DESC_LS | eor | (len as u32 & DESC_LEN_MASK);
             let desc = unsafe { self.tx_ring.add(i) };
@@ -1475,19 +1493,19 @@ mod metal {
             };
             unsafe {
                 write_volatile(desc, d);
-                cache::clean_range(desc as usize, core::mem::size_of::<Desc>());
+                dma_wmb(); // body reaches DRAM before OWN (r8169 dma_wmb)
                 write_volatile(desc as *mut u32, DESC_OWN | body);
-                cache::clean_range(desc as usize, core::mem::size_of::<Desc>());
+                dma_wmb(); // OWN reaches DRAM before the doorbell MMIO write
             }
             self.w8(REG_TPPOLL, TPPOLL_NPQ);
             self.tx_cur = (i + 1) % NUM_TX;
 
-            // Wait (bounded) for the descriptor to be handed back (OWN cleared by the NIC).
-            // NET-4x: invalidate the line before each poll read — our own cleans above left it
-            // resident, and a resident OWN=1 copy would shadow the NIC's OWN-clear writeback forever.
+            // Wait (bounded) for the descriptor to be handed back (OWN cleared by the NIC). NC memory ⇒
+            // each poll reads OWN straight from DRAM (no invalidate); `dma_rmb` orders the OWN read so the
+            // completion is observed correctly.
             let mut done = false;
             for _ in 0..1_000_000 {
-                cache::invalidate_range(desc as usize, core::mem::size_of::<Desc>());
+                dma_rmb();
                 let dd = unsafe { read_volatile(desc) };
                 if dd.opts1 & DESC_OWN == 0 {
                     done = true;
@@ -1520,11 +1538,9 @@ mod metal {
         /// since-bring-up latches). RX side: frames popped plus how many ring slots the NIC
         /// has filled and handed back unread. Reads only; no register is written.
         fn net4c_evidence(&self, label: &str) {
-            // NET-4x: drop any resident ring lines first so the evidence reads DRAM (the NIC's
-            // writebacks), not our own clean cached copies. All ring lines are clean at every read
-            // point (each publish cleans immediately), so the invalidate discards nothing dirty.
-            cache::invalidate_range(self.rx_ring as usize, NUM_RX * core::mem::size_of::<Desc>());
-            cache::invalidate_range(self.tx_ring as usize, NUM_TX * core::mem::size_of::<Desc>());
+            // NET-4B: the rings are Normal-NC — every read below is a direct DRAM read of the NIC's
+            // writebacks; no invalidate needed. `dma_rmb` orders these observations.
+            dma_rmb();
             let isr = self.r16(REG_ISR);
             let last_tx = if self.tx_cur == 0 { NUM_TX - 1 } else { self.tx_cur - 1 };
             let d_opts1 = unsafe { read_volatile(self.tx_ring.add(last_tx)) }.opts1;
@@ -1567,8 +1583,8 @@ mod metal {
             } else {
                 NET4G_DUMP_N.min(NUM_RX)
             };
-            // NET-4x: read the ring from DRAM, not our clean resident copies (see net4c_evidence).
-            cache::invalidate_range(self.rx_ring as usize, NUM_RX * core::mem::size_of::<Desc>());
+            // NET-4B: the ring is Normal-NC — these reads are direct DRAM reads; `dma_rmb` orders them.
+            dma_rmb();
             for i in 0..n {
                 let d = unsafe { read_volatile(self.rx_ring.add(i)) };
                 // Copy packed fields BY VALUE before formatting: a format arg takes `&field`, which on a
@@ -1595,8 +1611,8 @@ mod metal {
                 "{}   [net4l ring-dump {}] ring @ {:#x} buffers @ {:#x} stride {} B rx_cur={} popped={} ::",
                 P4, tag, self.rx_ring as u64, self.rx_buffers as u64, RX_BUF_SIZE, self.rx_cur, self.rx_count
             );
-            // NET-4x: read the ring from DRAM, not our clean resident copies (see net4c_evidence).
-            cache::invalidate_range(self.rx_ring as usize, NUM_RX * core::mem::size_of::<Desc>());
+            // NET-4B: the ring is Normal-NC — these reads are direct DRAM reads; `dma_rmb` orders them.
+            dma_rmb();
             for i in 0..NUM_RX {
                 let d = unsafe { read_volatile(self.rx_ring.add(i)) };
                 let opts1 = d.opts1;
@@ -1856,16 +1872,8 @@ mod metal {
         /// if the current descriptor is still NIC-owned (ring empty). The C+ analog of the e1000
         /// `rx_frame_raw` — no responder dispatch, smoltcp owns the stack.
         fn rx_frame_raw(&mut self, out: &mut [u8]) -> Option<usize> {
-            // NET-4x — invalidate the descriptor's line before reading it: the re-arm below cleans the
-            // line to PoC with `dc cvac`, which leaves it RESIDENT; without this drop, the CPU would
-            // keep hitting its own clean cached copy (OWN=1) and never observe the NIC's OWN/len
-            // writeback — the read-side half of the ring-clean fix. The line is clean at every read
-            // point (each re-arm cleans immediately after its stores), so `dc ivac` discards nothing
-            // dirty; it covers the whole 64 B line (4 descs) whose neighbors are equally clean.
-            cache::invalidate_range(
-                unsafe { self.rx_ring.add(self.rx_cur) } as usize,
-                core::mem::size_of::<Desc>(),
-            );
+            // NET-4B — the descriptor ring is Normal-NC: this read is a direct DRAM read of the NIC's
+            // OWN/len writeback (no invalidate, no resident clean copy to shadow it).
             let d = unsafe { read_volatile(self.rx_ring.add(self.rx_cur)) };
             // OWN set ⇒ still owned by the NIC (not yet filled) ⇒ ring empty.
             if d.opts1 & DESC_OWN != 0 {
@@ -1878,15 +1886,11 @@ mod metal {
             // ⇒ an all-zero frame). Each descriptor is popped exactly once and recycled, so a single
             // stale read drops that frame forever — which is precisely how the OFFER got through (it won
             // the race) but the follow-on ACK did not (read as zeros), leaving the lease uncompleted.
-            // This is Linux r8169's `dma_rmb()` after the OWN check. A barrier (not a cache invalidate)
-            // is the honest minimal fix: the TX path already proved controller-0's DMA is CPU-coherent
-            // (the DISCOVER's buffer, written cacheable, was read correctly by the NIC), so what was
-            // missing is only the ORDERING of the CPU's two observations — not cache maintenance.
-            // NET-4u: full `dsb sy` between observing OWN-clear and the invalidate below (upgraded
-            // from NET-4e's `dsb ld` — the load-only barrier fences loads against loads, but the
-            // maintenance op that follows is not a load; `dsb sy` orders the OWN observation ahead of
-            // the `dc ivac` sequence unconditionally).
-            unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
+            // This is Linux r8169's `dma_rmb()` after the OWN check. NET-4B: the buffers are now
+            // Normal-NC, so no cache invalidate is needed for the payload — but this ordering barrier is
+            // STILL load-bearing: NC loads reorder on weakly-ordered aarch64, so without it the payload
+            // read below could be reordered ahead of the OWN read and observe pre-frame DRAM.
+            dma_rmb();
             // Hardware wrote the received length into the length field; clamp so a misbehaving NIC can
             // never make us build an out-of-bounds slice.
             let len = (d.opts1 & DESC_LEN_MASK) as usize;
@@ -1906,19 +1910,10 @@ mod metal {
                     *slot = unsafe { read_volatile(buf.add(i)) };
                 }
             }
-            // NET-4f/NET-4u: this memory is non-coherent (see the coherency note at the top of this
-            // file) — the barrier orders the CPU's two observations but does NOT drop the stale (zero)
-            // cache lines the NIC's DMA wrote past. INVALIDATE the FULL buffer span (not just
-            // `[buf, buf+len)` — NET-4u: any line of the 2048-byte slot may have been speculatively
-            // refetched between the re-arm invalidate and this pop, and a stale line beyond `len`
-            // this pop would survive into a LATER, longer frame in the same slot) so every read of
-            // this slot re-fetches the NIC's payload from DRAM. `buf` is 2048-strided off a
-            // 64 KiB-aligned block ⇒ line-aligned; `invalidate_range` rounds to line boundaries and
-            // closes with `dsb sy` regardless. `dc ivac` discards, never writes back — the buffer is
-            // untouched by CPU writes since its pre-handoff invalidate, so no dirty line exists to lose.
-            cache::invalidate_range(buf as usize, RX_BUF_SIZE);
-            // NET-4u WITNESS (post-ivac half): re-read the same 16 bytes now that the span is
-            // invalidated — this is what the copy below will see.
+            // NET-4B: the buffer is Normal-NC — the copy below reads the NIC's payload straight from
+            // DRAM; there are no stale cache lines to invalidate (that was the NET-4f/4u cacheable-RAM
+            // maintenance, now removed by construction). The `dma_rmb` above is the only ordering needed.
+            // NET-4u WITNESS (post-barrier half): re-read the same 16 bytes — this is what the copy sees.
             if net4u_witness {
                 let n = len.min(16);
                 let mut post = [0u8; 16];
@@ -1939,15 +1934,12 @@ mod metal {
             unsafe {
                 core::ptr::copy_nonoverlapping(buf, out.as_mut_ptr(), len);
             }
-            // NET-4f: one-shot WITNESS on the first popped frame — names the coherency strategy now on
-            // the live RX path (invalidate-before-read, superseding NET-4e's ordering-only barrier).
-            // CAUTION (NET-4m): only this serial PRINT is one-shot (`rx_count == 0`). The invalidate it
-            // narrates (`cache::invalidate_range(buf, len)` above) is UNCONDITIONAL — it runs on EVERY
-            // pop. Do not read "first RX pop" as "the invalidate fires once": that misreading of this
-            // line is what NET-4m had to refute (boot-15 kept the zeros WITH the per-pop invalidate live).
+            // NET-4B: one-shot WITNESS on the first popped frame — names the coherency strategy now on the
+            // live RX path (Normal-NC DMA window + `dma_rmb` ordering, replacing every cache-maintenance
+            // step). The buffers/ring are uncached, so CPU and NIC share one DRAM view with no clean/inval.
             if self.rx_count == 0 {
                 serial_println!(
-                    "{}   [net4f] first RX pop len={} — non-coherent DMA: dc ivac invalidate-before-read (+ dsb ld) between OWN-check and buffer copy (PER-POP; this print is the one-shot, not the invalidate) ::",
+                    "{}   [net4B] first RX pop len={} — rings + buffers Normal-NC (MAIR AttrIdx 2): dma_rmb after OWN-clear, dma_wmb before OWN publish; NO cache maintenance ::",
                     P4, len
                 );
             }
@@ -1973,8 +1965,8 @@ mod metal {
             // only two branches. Bounded to NET4M_PROBE_N pops; gated behind the NET-4 ring knob.
             if option_env!("UNAOS_NET4_RINGDUMP").is_some() && self.rx_count <= NET4M_PROBE_N {
                 let n = len.min(NET4M_PROBE_BYTES);
-                cache::invalidate_range(buf as usize, n);
-                unsafe { core::arch::asm!("isb", options(nostack, preserves_flags)) };
+                // NET-4B: NC memory — a direct DRAM read (`dma_rmb` orders it); no invalidate/fence.
+                dma_rmb();
                 let mut b = [0u8; NET4M_PROBE_BYTES];
                 let mut nonzero = false;
                 for (i, slot) in b.iter_mut().enumerate().take(n) {
@@ -2009,8 +2001,7 @@ mod metal {
             {
                 self.net4y_probes += 1;
                 let b0 = self.rx_buffers;
-                cache::invalidate_range(b0 as usize, 64); // closes with dsb sy
-                unsafe { core::arch::asm!("isb", options(nostack, preserves_flags)) };
+                dma_rmb(); // NET-4B: NC direct DRAM read, no invalidate
                 let mut b = [0u8; 16];
                 let mut nonzero = false;
                 for (i, slot) in b.iter_mut().enumerate() {
@@ -2047,10 +2038,9 @@ mod metal {
                 let n = len.min(16);
                 let mut hit: i64 = -1;
                 if n > 0 {
+                    dma_rmb(); // NET-4B: NC direct DRAM reads across the ring, no invalidate
                     for k in 0..NUM_RX {
                         let bk = unsafe { self.rx_buffers.add(k * RX_BUF_SIZE) };
-                        cache::invalidate_range(bk as usize, 64); // closes with dsb sy
-                        unsafe { core::arch::asm!("isb", options(nostack, preserves_flags)) };
                         let mut same = true;
                         for i in 0..n {
                             if unsafe { read_volatile(bk.add(i)) } != out[i] {
@@ -2110,16 +2100,10 @@ mod metal {
                 self.net4a_prev_land = hit;
                 self.net4a_prev_slot = slot;
             }
-            // NET-4f/NET-4u: before re-arming, CLEAN+INVALIDATE the whole buffer (upgraded from plain
-            // invalidate). The copy above pulled the frame into the D-cache; those lines should be
-            // clean, but `dc civac` is the always-safe sync-for-device: if ANY line in the span is
-            // dirty for any reason it is written back and dropped rather than silently discarded (a
-            // plain `dc ivac` here would lose such a write) — and, decisively, no dirty line can later
-            // be EVICTED-WRITTEN-BACK on top of the NIC's next DMA payload (the "evicted-then-
-            // refetched/written-back-before-DMA" hazard). For clean lines `civac` degenerates to the
-            // old invalidate: nothing is written, the line is dropped, the NIC's next fill is never
-            // shadowed. Closes with `dsb sy` before the descriptor is republished below.
-            cache::clean_invalidate_range(buf as usize, RX_BUF_SIZE);
+            // NET-4B: the buffer is Normal-NC — no clean/invalidate before re-arming. The copy above read
+            // it uncached (nothing pulled into the D-cache), and the NIC's next fill lands in the same
+            // uncached DRAM. The whole NET-4f/4u "evicted-line-written-back-over-DMA" hazard cannot exist
+            // on NC memory; it is removed by construction, which is the point of this arc.
             // NET-4l: re-arm with the r8169 OWN-LAST publish discipline — the fix for "only the first
             // popped frame ever carries real bytes; rx[2..] read a real DESCRIPTOR length but an all-zero
             // payload." The INITIAL ring is published by `init_rings`' trailing `dsb sy` BEFORE RX is
@@ -2145,20 +2129,13 @@ mod metal {
             };
             unsafe {
                 write_volatile(desc, nd);
-                // NET-4x — CLEAN the descriptor's line to PoC before the OWN publish. NET-4l's
-                // `dsb sy` ordered the body ahead of OWN for a COHERENT observer, but the NIC's
-                // descriptor fetch reads DRAM: without the clean, neither store ever reliably reached
-                // it (boot-32's stale-zero fetches). This clean lands the fully-written body (OWN
-                // still clear) in DRAM first; `clean_range` closes with `dsb sy`, preserving the
-                // OWN-last LAW at the DRAM level. All 16 bytes of this desc were just written; the
-                // line's neighbor descs are in complete states (each re-arm finishes before the next
-                // begins on the single-CPU poll path), so the whole-line clean publishes no
-                // half-written neighbor.
-                cache::clean_range(desc as usize, core::mem::size_of::<Desc>());
-                // Hand ownership to the NIC LAST — a single aligned u32 store to opts1 (offset 0) —
-                // then clean again so OWN itself reaches DRAM (the NIC polls the fetched copy).
+                // NET-4B — NC ring: the body store reaches DRAM directly; `dma_wmb` orders it ahead of
+                // the OWN handoff (r8169's addr/opts2 → dma_wmb() → OWN|opts1 order), no `dc cvac`.
+                dma_wmb();
+                // Hand ownership to the NIC LAST — a single aligned u32 store to opts1 (offset 0) — then
+                // a second `dma_wmb` so OWN reaches DRAM before the next fetch (the NIC polls DRAM).
                 write_volatile(desc as *mut u32, DESC_OWN | body);
-                cache::clean_range(desc as usize, core::mem::size_of::<Desc>());
+                dma_wmb();
             }
             // NET-4l instrumentation (knob-gated, read-only): dump the FULL 32-slot ring state after each
             // of the first few real RX pops so a wrong fix names the state machine exactly (brief item 3).
@@ -3006,6 +2983,7 @@ mod metal {
             dma_ident_hi: dram_base + dram_size,
             mem_lo: win.pci_base,
             mem_hi: win.pci_base + win.size,
+            nc_base: 0,
             rx_ring: core::ptr::null_mut(),
             rx_buffers: core::ptr::null_mut(),
             rx_cur: 0,
