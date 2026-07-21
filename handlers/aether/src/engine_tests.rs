@@ -34,8 +34,16 @@ mod tests {
         let is_painted = surface.iter().any(|&b| b != 0);
         assert!(is_painted, "Surface should be painted by render_frame");
         
-        // Assert pixel at 5,5 is red (0, 0, 255)
-        let idx = (5 * 100 + 5) * 4;
+        // Assert pixel at 3,3 is the body background (200, 200, 200) not the div color,
+        // because the body margin pushes the div to (6,30)
+        let idx_body = (3 * 100 + 3) * 4;
+        assert_eq!(surface[idx_body], 200, "Body B should be 200");
+        assert_eq!(surface[idx_body+1], 200, "Body G should be 200");
+        assert_eq!(surface[idx_body+2], 200, "Body R should be 200");
+        assert_eq!(surface[idx_body+3], 255, "Body A should be 255");
+
+        // Assert pixel at 15,35 is red (0, 0, 255)
+        let idx = (35 * 100 + 15) * 4;
         assert_eq!(surface[idx], 0, "B should be 0");
         assert_eq!(surface[idx+1], 0, "G should be 0");
         assert_eq!(surface[idx+2], 255, "R should be 255");
