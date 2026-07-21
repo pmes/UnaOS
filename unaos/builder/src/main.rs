@@ -89,6 +89,11 @@ fn main() {
     // driver; the QEMU isa-applesmc device is attached below under the same knob so the protocol
     // machinery is gated by a known-key read. Kept in sync with arroyo's mapping.
     if std::env::var("UNAOS_SMC").is_ok() { feats.push("smc"); }
+    // K-GPU: UNAOS_KEPLER=1 arms the GK107 (GT 650M) driver — probe/EVO-decode/PFIFO are further
+    // gated by UNAOS_KEPLER_TAKEOVER / UNAOS_KEPLER_FIFO (option_env!, compile-time). Kept in sync
+    // with arroyo's mapping. (The builder rebuilds the kernel, so this MUST be here or the feature
+    // never reaches the kernel binary.)
+    if std::env::var("UNAOS_KEPLER").is_ok() { feats.push("nvidia-kepler"); }
     // INSTALL-CORE: UNAOS_INSTALLDEMO=1 arms the installer engine + its x86 boot witness (GPT writer
     // + FAT32 formatter + extent content-verify) against the blank scratch disk attached below under
     // the same knob. Kept in sync with arroyo's mapping. (The builder rebuilds the kernel, so this
