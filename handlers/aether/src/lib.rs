@@ -30,6 +30,8 @@ pub struct AetherEngine {
     pub width: u32,
     pub height: u32,
     pub title: String,
+    pub focused_node: Option<kuchiki::NodeRef>,
+    pub surface: Vec<u8>,
 }
 
 impl AetherEngine {
@@ -47,7 +49,13 @@ impl AetherEngine {
             width: 800,
             height: 600,
             title: "Aether Browser".to_string(),
+            focused_node: None,
+            surface: vec![255; 800 * 600 * 4],
         }
+    }
+
+    pub fn surface(&self) -> &[u8] {
+        &self.surface
     }
 
     pub fn tick(&mut self) -> bool {
@@ -60,28 +68,135 @@ impl AetherEngine {
         needs_repaint
     }
     
+    fn hit_test(&self, x: f64, y: f64) -> Option<kuchiki::NodeRef> {
+        let layout = self.layout_tree.as_ref()?;
+        let abs_x = x + self.scroll_x;
+        let abs_y = y + self.scroll_y;
+        
+        let mut hit = None;
+        fn walk(
+            node_id: taffy::prelude::NodeId, 
+            cx: f32, 
+            cy: f32, 
+            abs_x: f64, 
+            abs_y: f64, 
+            layout: &layout::LayoutTree,
+            hit: &mut Option<kuchiki::NodeRef>
+        ) {
+            if let Ok(l) = layout.taffy.layout(node_id) {
+                let nx = cx + l.location.x;
+                let ny = cy + l.location.y;
+                let nw = l.size.width;
+                let nh = l.size.height;
+                
+                if abs_x >= nx as f64 && abs_x <= (nx + nw) as f64 &&
+                   abs_y >= ny as f64 && abs_y <= (ny + nh) as f64 {
+                    if let Some(dom_node) = layout.node_map.get(&node_id) {
+                        *hit = Some(dom_node.clone());
+                    }
+                }
+                
+                if let Ok(children) = layout.taffy.children(node_id) {
+                    for child in children {
+                        walk(child, nx, ny, abs_x, abs_y, layout, hit);
+                    }
+                }
+            }
+        }
+        
+        walk(layout.root_node, 0.0, 0.0, abs_x, abs_y, layout, &mut hit);
+        hit
+    }
+
     pub fn handle_event(&mut self, event: api::events::Event) {
         match event {
-            api::events::Event::Scroll(dx, dy) => {
-                self.scroll_x = (self.scroll_x + dx).max(0.0);
+            api::events::Event::Scroll(_dx, dy) => {
+                let old_sy = self.scroll_y;
                 self.scroll_y = (self.scroll_y + dy).max(0.0);
-                self.needs_repaint = true;
-                // Full repaint on scroll for now, could be optimized
-                self.damage_rects.push((0, 0, self.width, self.height));
+                let actual_dy = self.scroll_y - old_sy;
+                let idy = actual_dy as i32;
+
+                if idy != 0 {
+                    let w = self.width as usize;
+                    let h = self.height as usize;
+                    
+                    if idy > 0 && idy < h as i32 {
+                        // Scrolling down, document moves up, shift pixels UP
+                        let shift = idy as usize * w * 4;
+                        self.surface.copy_within(shift.., 0);
+                        self.damage_rects.push((0, (h as i32 - idy) as u32, self.width, idy as u32));
+                    } else if idy < 0 && -idy < h as i32 {
+                        // Scrolling up, document moves down, shift pixels DOWN
+                        let shift = (-idy) as usize * w * 4;
+                        let src_len = (h - (-idy) as usize) * w * 4;
+                        self.surface.copy_within(0..src_len, shift);
+                        self.damage_rects.push((0, 0, self.width, (-idy) as u32));
+                    } else {
+                        self.damage_rects.push((0, 0, self.width, self.height));
+                    }
+                    self.needs_repaint = true;
+                }
             }
             api::events::Event::Resize(w, h) => {
                 self.width = w;
                 self.height = h;
+                self.surface = vec![255; (w * h * 4) as usize];
                 self.needs_repaint = true;
                 self.damage_rects.push((0, 0, w, h));
             }
-            api::events::Event::Text(_text) => {
-                // Focus and text handling
+            api::events::Event::Text(text) => {
+                if let Some(node) = &self.focused_node {
+                    if let Some(el) = node.as_element() {
+                        if &*el.name.local == "input" {
+                            let mut attrs = el.attributes.borrow_mut();
+                            let mut val = attrs.get("value").unwrap_or("").to_string();
+                            val.push_str(&text);
+                            attrs.insert("value", val);
+                            self.needs_repaint = true;
+                            // Approximate field damage rect: push full for now, layout mapping is needed
+                            self.damage_rects.push((0, 0, self.width, self.height));
+                        }
+                    }
+                }
             }
-            api::events::Event::KeyDown(_key) => {}
+            api::events::Event::KeyDown(key) => {
+                if let Some(node) = &self.focused_node {
+                    if let Some(el) = node.as_element() {
+                        if &*el.name.local == "input" {
+                            if key == "BackSpace" {
+                                let mut attrs = el.attributes.borrow_mut();
+                                let mut val = attrs.get("value").unwrap_or("").to_string();
+                                val.pop();
+                                attrs.insert("value", val);
+                                self.needs_repaint = true;
+                                self.damage_rects.push((0, 0, self.width, self.height));
+                            } else if key == "Return" {
+                                // Form submission logic
+                            }
+                        }
+                    }
+                }
+            }
             api::events::Event::MouseMove(_x, _y) => {}
             api::events::Event::MouseDown(_x, _y) => {}
-            api::events::Event::MouseUp(_x, _y) => {}
+            api::events::Event::MouseUp(x, y) => {
+                if let Some(node) = self.hit_test(x, y) {
+                    if let Some(el) = node.as_element() {
+                        if &*el.name.local == "a" {
+                            if let Some(href) = el.attributes.borrow().get("href") {
+                                let href = href.to_string();
+                                let _ = tokio::task::block_in_place(|| {
+                                    tokio::runtime::Handle::current().block_on(async {
+                                        let _ = self.load_url_internal(&href, true).await;
+                                    })
+                                });
+                            }
+                        } else if &*el.name.local == "input" {
+                            self.focused_node = Some(node);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -159,14 +274,13 @@ impl AetherEngine {
         Ok(())
     }
 
-    pub fn render_frame(&mut self, surface: &mut [u8], w: u32, h: u32) -> Vec<(u32, u32, u32, u32)> {
+    pub fn render_frame(&mut self) -> Vec<(u32, u32, u32, u32)> {
         let damages = std::mem::take(&mut self.damage_rects);
         
         if let Some(layout) = &self.layout_tree {
-            render::render_frame(layout, surface, w, h, self.scroll_x, self.scroll_y);
+            render::render_frame(layout, &mut self.surface, self.width, self.height, self.scroll_x, self.scroll_y, &damages);
         } else {
-            // Fill white if no document loaded
-            for chunk in surface.chunks_exact_mut(4) {
+            for chunk in self.surface.chunks_exact_mut(4) {
                 chunk[0] = 255;
                 chunk[1] = 255;
                 chunk[2] = 255;
@@ -175,7 +289,7 @@ impl AetherEngine {
         }
         
         if damages.is_empty() {
-            vec![(0, 0, w, h)]
+            vec![(0, 0, self.width, self.height)]
         } else {
             damages
         }

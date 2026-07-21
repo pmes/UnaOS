@@ -144,15 +144,16 @@ fn build_ui(app: &Application) {
     drawing_area.set_draw_func(move |_area, cr, width, height| {
         let w = width as u32;
         let h = height as u32;
-        let mut buf = vec![0; (w * h * 4) as usize];
         
         let mut eng = engine_draw.borrow_mut();
-        eng.render_frame(&mut buf, w, h); // damage rects are ignored for now in GTK4 draw_func since cairo sets clip 
+        eng.render_frame();
         
         if let Ok(mut surface) = gtk4::cairo::ImageSurface::create(gtk4::cairo::Format::ARgb32, w as i32, h as i32) {
             {
                 let mut data = surface.data().unwrap();
-                data.copy_from_slice(&buf);
+                let src = eng.surface();
+                let len = src.len().min(data.len());
+                data[..len].copy_from_slice(&src[..len]);
             }
             cr.set_source_surface(&surface, 0.0, 0.0).unwrap();
             cr.paint().unwrap();
@@ -172,7 +173,7 @@ fn build_ui(app: &Application) {
                 da_tick.queue_draw();
             } else {
                 for (x, y, w, h) in damages {
-                    da_tick.queue_draw_area(x as i32, y as i32, w as i32, h as i32);
+                    da_tick.queue_draw();
                 }
             }
             
