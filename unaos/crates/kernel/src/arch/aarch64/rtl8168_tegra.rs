@@ -1995,6 +1995,37 @@ mod metal {
                     }
                 }
             }
+            // rev3: the completing slot's len belongs to a DIFFERENT frame than the harvested one
+            // (lengths and landings are decoupled by the NIC defect) — a 346 B ACK harvested under a
+            // 64 B completion arrives truncated=unparseable. Derive the harvested frame's true length
+            // from its own headers: IPv4/IPv6 → eth hdr + IP total-length; ARP/other → keep desc len.
+            let mut len = len;
+            if !harvest.is_null() {
+                let et = u16::from_be_bytes([
+                    unsafe { read_volatile(harvest.add(12)) },
+                    unsafe { read_volatile(harvest.add(13)) },
+                ]);
+                let derived = match et {
+                    0x0800 => {
+                        let ip_total = u16::from_be_bytes([
+                            unsafe { read_volatile(harvest.add(16)) },
+                            unsafe { read_volatile(harvest.add(17)) },
+                        ]) as usize;
+                        Some(14 + ip_total)
+                    }
+                    0x86dd => {
+                        let pay = u16::from_be_bytes([
+                            unsafe { read_volatile(harvest.add(18)) },
+                            unsafe { read_volatile(harvest.add(19)) },
+                        ]) as usize;
+                        Some(14 + 40 + pay)
+                    }
+                    _ => None,
+                };
+                if let Some(d) = derived {
+                    len = d.max(60).min(RX_BUF_SIZE).min(out.len());
+                }
+            }
             let src: *const u8 = if !harvest.is_null() { harvest } else { buf };
             unsafe {
                 core::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), len);
