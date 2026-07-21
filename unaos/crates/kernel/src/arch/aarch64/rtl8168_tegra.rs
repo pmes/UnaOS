@@ -250,6 +250,30 @@
 // line, so ALL fields of a descriptor are written before its clean and no clean is issued
 // between neighbor writes mid-init (the whole-ring cleans run after the init loops complete).
 //
+// ## NET-4y — C+ RX-mode audit: early-RX was never disabled; CPlusCmd was never written.
+//
+// Boot-33 kept the pattern with the ring clean in (init witness MATCH): 13 pops, only slot-0
+// carries payload, slots 1+ DRAM-zero at real writeback lengths — and boot-32 showed slot-0's
+// CONTENTS changing across pops. The line-by-line audit against r8169 (facts only) found the
+// init sequence diverging from `rtl_hw_start`/`rtl_init_rxcfg` in exactly the RX-mode registers:
+//   * RxConfig (0x44): we wrote the 8169-only RX_FIFO_THRESH field (7<<13); on every 8168 the
+//     reference instead writes RX128_INT_EN(15) | RX_MULTI_EN(14) | RX_DMA_BURST, and for the
+//     modern family (VER_40..53) RX_EARLY_OFF(11) — early-RX DISABLED. We never set bit11, so
+//     early-RX ran enabled (a mode with its own payload-address latching — the named suspect for
+//     every-payload-to-buffer[0]); and we set bit13, which r8169 never sets on an 8168.
+//   * CPlusCmd (0xE0): `rtl_hw_start` WRITES `CPlusCmd = reset & CPCMD_MASK`
+//     (Normal_mode|RxVlan|RxChkSum); we only read it, leaving reset residue (0x2021's stray
+//     bit0) unscrubbed. Now written masked, per the reference.
+//   * Order: reference is ChipCmd(RxEnb|TxEnb) -> RxConfig -> TxConfig; we wrote TCR before CR.
+//     Aligned.
+//   * Verified-matching (no change): RDSAR/TNPDS hi-before-lo, the 16-byte normal descriptor
+//     (opts1/opts2/addr — not an 8169-format divergence), RMS (0xDA) <= buffer size, and NO
+//     legacy RBSTART(0x30)-era single-buffer path exists anywhere in this driver.
+// Plus the decisive witness (knob-gated): on the first ≤3 pops of a slot other than 0, buffer[0]
+// is independently invalidated+fenced and its first 16 bytes printed with a
+// `buf0-holds-the-frame=yes/no` verdict (nonzero + sane EtherType, and same-as-this-pop's-frame)
+// — if yes, the NIC provably resolves every RX payload to buffer[0]'s address.
+//
 // ## Write discipline
 //
 // The driver, being a driver, DOES the fabric writes NET-3 refused: it enables the device's
@@ -364,6 +388,12 @@ mod metal {
     /// EXPECTED to read CLEAR, and that is the correct 64-bit-capable state (NET-4n's "won't latch ⇒
     /// 32-bit" inference was a misread of this no-op bit). See `init_rings`.
     const CPCMD_PCIDAC: u16 = 1 << 4;
+    /// NET-4y — r8169's CPCMD_MASK (facts): the ONLY CPlusCmd bits the reference preserves from the
+    /// reset value are Normal_mode(bit13) | RxVlan(bit6) | RxChkSum(bit5); `rtl_hw_start` then WRITES
+    /// `CPlusCmd = read & CPCMD_MASK` on every bring-up (our previous init only READ the register and
+    /// never wrote it, leaving the undocumented reset residue — boot-16 read 0x2021, stray bit0 set —
+    /// in place). See `init_rings`.
+    const CPCMD_MASK: u16 = (1 << 13) | (1 << 6) | (1 << 5);
     /// RDSAR: Receive Descriptor Start Address (64-bit; low @ 0xE4, high @ 0xE8). 256-byte aligned.
     const REG_RDSAR: u64 = 0xe4;
     /// MTPS: Max Transmit Packet Size (8-bit, units of 128 bytes).
@@ -371,13 +401,24 @@ mod metal {
 
     // ── RCR / TCR field values (datasheet-standard bring-up) ──
     /// RCR: accept-all-packets (promiscuous, for bring-up — mirrors the e1000 driver's promiscuous
-    /// bring-up), physical-match, multicast, broadcast; MXDMA unlimited; RX FIFO threshold none.
+    /// bring-up), physical-match, multicast, broadcast; MXDMA unlimited.
     const RCR_AAP: u32 = 1 << 0;
     const RCR_APM: u32 = 1 << 1;
     const RCR_AM: u32 = 1 << 2;
     const RCR_AB: u32 = 1 << 3;
     const RCR_MXDMA_UNLIMITED: u32 = 0x7 << 8;
-    const RCR_RXFTH_NONE: u32 = 0x7 << 13;
+    // NET-4y — the 8168-family RxConfig mode bits (r8169 facts, `rtl_init_rxcfg`): for every 8168
+    // mac_version the reference writes RX128_INT_EN(bit15) | RX_MULTI_EN(bit14) | RX_DMA_BURST, and
+    // for the modern 8168 family (VER_40..53 — the RTL8111H class on this devkit) ALSO
+    // RX_EARLY_OFF(bit11), i.e. early-RX DISABLED. The old 8169-only RX_FIFO_THRESH field (7<<13)
+    // does NOT exist on the 8168: bits 15/14 are the two mode bits above and bit13 is a bit r8169
+    // never sets on any 8168. Our previous RCR wrote 7<<13 (bit13 set) and NEVER set RX_EARLY_OFF —
+    // early-RX left ENABLED is an RX mode in which the NIC begins DMAing a frame before it is fully
+    // received, with its own payload-address latching (the boot-32/33 "every payload lands at
+    // buffer[0]'s address" signature is that class). See `init_rings`.
+    const RCR_RX128_INT_EN: u32 = 1 << 15;
+    const RCR_RX_MULTI_EN: u32 = 1 << 14;
+    const RCR_RX_EARLY_OFF: u32 = 1 << 11;
     /// TCR: MXDMA unlimited + the standard IEEE inter-frame gap.
     const TCR_MXDMA_UNLIMITED: u32 = 0x7 << 8;
     const TCR_IFG_STD: u32 = 0x3 << 24;
@@ -764,6 +805,9 @@ mod metal {
         /// NET-4t: `other`-class frames given a raw-bytes witness dump so far — bounds the boot-27
         /// "what ARE the other frames" evidence lines to `NET4T_OTHER_DUMPS`.
         net4t_other_dumped: u64,
+        /// NET-4y: buffer[0] cross-witness lines emitted so far (bounded to the first 3 pops on a
+        /// slot other than 0 — the "is the NIC writing EVERY payload to buffer[0]" discriminator).
+        net4y_probes: u64,
     }
 
     // The driver owns raw DMA pointers; on the single-CPU main-loop/poll discipline it is only ever
@@ -1118,10 +1162,20 @@ mod metal {
             serial_println!("{}   >>> REG WRITE (M2): CFG9346[{:#x}] = {:#04x} (unlock config) ::", P4, REG_CFG9346, CFG9346_UNLOCK);
             self.w8(REG_CFG9346, CFG9346_UNLOCK);
 
-            // C+ command register: read + log the current value (the reset default already selects the
-            // C+ descriptor engine on the RTL8168; we preserve it rather than force reserved bits).
+            // NET-4y — C+ command register: r8169's `rtl_hw_start` WRITES CPlusCmd on every bring-up
+            // (`RTL_W16(tp, CPlusCmd, tp->cp_cmd)` where cp_cmd = reset value & CPCMD_MASK — probe-time
+            // capture, mask = Normal_mode|RxVlan|RxChkSum). Our previous init only READ the register and
+            // "preserved" whatever reset residue it held (boot-16: 0x2021 — a stray bit0 the mask exists
+            // to clear; on the 8139C+ heritage encoding bits 1:0 are the CpRx/CpTx mode bits, and an
+            // undefined residue there is exactly the kind of state the reference scrubs). Write the
+            // masked value, matching the reference line for line.
             let cpc = self.r16(REG_CPLUSCMD);
-            serial_println!("{}   CPlusCmd[{:#x}] = {:#06x} (C+ engine) ::", P4, REG_CPLUSCMD, cpc);
+            let cpc_w = cpc & CPCMD_MASK;
+            serial_println!(
+                "{}   >>> REG WRITE (M2): CPlusCmd[{:#x}] {:#06x} -> {:#06x} (& CPCMD_MASK — r8169 rtl_hw_start write; NET-4y) ::",
+                P4, REG_CPLUSCMD, cpc, cpc_w
+            );
+            self.w16(REG_CPLUSCMD, cpc_w);
 
             // NET-4q — the RTL8168 is 64-bit-DMA capable via the descriptor `addr` field ALONE; do NOT
             // gate 64-bit payload DMA on CPlusCmd.PCIDAC. Per the L4T facts (r8169_main.c): PCIDAC (C+CR
@@ -1210,11 +1264,6 @@ mod metal {
             self.w16(REG_RMS, RX_BUF_SIZE as u16);
             self.w8(REG_MTPS, MTPS_DEFAULT);
 
-            // Transmit config (MXDMA unlimited + standard IFG).
-            let tcr = TCR_MXDMA_UNLIMITED | TCR_IFG_STD;
-            serial_println!("{}   >>> REG WRITE (M2): TCR[{:#x}] = {:#010x} ::", P4, REG_TCR, tcr);
-            self.w32(REG_TCR, tcr);
-
             // Publish the ring descriptors before the engine starts fetching them.
             unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
 
@@ -1230,10 +1279,39 @@ mod metal {
             serial_println!("{}   >>> REG WRITE (M2): CR[{:#x}] = {:#04x} (RxEnb | TxEnb) ::", P4, REG_CR, CR_RE | CR_TE);
             self.w8(REG_CR, CR_RE | CR_TE);
 
-            // Receive config LAST (this arms reception): promiscuous bring-up filter + MXDMA/RXFTH.
-            let rcr = RCR_AAP | RCR_APM | RCR_AM | RCR_AB | RCR_MXDMA_UNLIMITED | RCR_RXFTH_NONE;
-            serial_println!("{}   >>> REG WRITE (M2): RCR[{:#x}] = {:#010x} (promiscuous bring-up) ::", P4, REG_RCR, rcr);
+            // NET-4y — RxConfig, the 8168 value + the reference order. r8169's `rtl_hw_start` writes
+            // ChipCmd(RxEnb|TxEnb) FIRST, then RxConfig (`rtl_init_rxcfg`), then TxConfig — our old
+            // sequence wrote TCR before CR (benign but divergent; now aligned). The VALUE is the real
+            // fix: the 8168 family takes RX128_INT_EN | RX_MULTI_EN | RX_DMA_BURST | RX_EARLY_OFF —
+            // early-RX must be DISABLED (bit11 SET). Our old RCR used the 8169-only RX_FIFO_THRESH
+            // field (7<<13): that left bit13 set (a bit r8169 never sets on any 8168) and, decisively,
+            // RX_EARLY_OFF CLEAR — early-RX enabled, an RX mode with its own payload-address latching
+            // (the boot-32/33 every-payload-to-buffer[0] signature's named suspect). Filter bits
+            // (promiscuous bring-up) are OR'd in as `rtl_set_rx_mode` does.
+            let rcr = RCR_RX128_INT_EN
+                | RCR_RX_MULTI_EN
+                | RCR_RX_EARLY_OFF
+                | RCR_MXDMA_UNLIMITED
+                | RCR_AAP
+                | RCR_APM
+                | RCR_AM
+                | RCR_AB;
+            serial_println!(
+                "{}   >>> REG WRITE (M2): RCR[{:#x}] = {:#010x} (8168 mode: RX128_INT_EN|RX_MULTI_EN|RX_EARLY_OFF|MXDMA + promiscuous filter; NET-4y) ::",
+                P4, REG_RCR, rcr
+            );
             self.w32(REG_RCR, rcr);
+            let rcr_rb = self.r32(REG_RCR);
+            serial_println!(
+                "{}   [net4y] RCR readback = {:#010x} (RX_EARLY_OFF={} RX_MULTI_EN={} RX128_INT_EN={} bit13={}) [{}] ::",
+                P4, rcr_rb, (rcr_rb >> 11) & 1, (rcr_rb >> 14) & 1, (rcr_rb >> 15) & 1, (rcr_rb >> 13) & 1,
+                if rcr_rb == rcr { "MATCH" } else { "DIVERGES (NIC-reserved bits)" }
+            );
+
+            // Transmit config (MXDMA unlimited + standard IFG) — after RxConfig, the reference order.
+            let tcr = TCR_MXDMA_UNLIMITED | TCR_IFG_STD;
+            serial_println!("{}   >>> REG WRITE (M2): TCR[{:#x}] = {:#010x} ::", P4, REG_TCR, tcr);
+            self.w32(REG_TCR, tcr);
 
             // NET-4q — no PCIDAC write. Per the facts PCIDAC is a dead parallel-PCI relic on this PCIe
             // 8168 (never set by r8169, masked out of CPCMD_MASK); 64-bit (DAC) payload TLPs form natively
@@ -1848,6 +1926,43 @@ mod metal {
                     } else {
                         "DRAM ZERO w/ real desc len -> writes-to-nowhere (inbound SMMU/iATU, below driver)"
                     }
+                );
+            }
+            // NET-4y — the DECISIVE buffer[0] cross-witness (knob-gated, read-only; first ≤3 pops on a
+            // slot other than 0). Boot-32/33 fact pattern: only slot-0 recycles carry payload, slots 1+
+            // read DRAM-zero at real writeback lengths, and slot-0's CONTENTS changed across pops —
+            // consistent with the NIC resolving EVERY frame's payload write to buffer[0]'s address
+            // regardless of which slot's descriptor completed. So on a non-zero-slot pop, read
+            // buffer[0] (independently invalidated + fenced so DRAM, not a resident line, answers) and
+            // ask: does buffer[0] hold a plausible frame RIGHT NOW (nonzero, sane EtherType), and is it
+            // THIS pop's frame? `buf0-holds-the-frame=yes` on a slot-N pop is the smoking gun.
+            if option_env!("UNAOS_NET4_RINGDUMP").is_some()
+                && self.rx_cur != 0
+                && self.net4y_probes < 3
+            {
+                self.net4y_probes += 1;
+                let b0 = self.rx_buffers;
+                cache::invalidate_range(b0 as usize, 64); // closes with dsb sy
+                unsafe { core::arch::asm!("isb", options(nostack, preserves_flags)) };
+                let mut b = [0u8; 16];
+                let mut nonzero = false;
+                for (i, slot) in b.iter_mut().enumerate() {
+                    let v = unsafe { read_volatile(b0.add(i)) };
+                    *slot = v;
+                    nonzero |= v != 0;
+                }
+                let et = u16::from_be_bytes([b[12], b[13]]);
+                // Plausible Ethernet II EtherType (>= 0x0600) or an 802.1Q TPID — "ethertype sane".
+                let et_sane = et >= 0x0600;
+                let n = len.min(16);
+                let same = n > 0 && b[..n] == out[..n];
+                serial_println!(
+                    "{}   [net4y] rx[{}] popped slot={} len={} buf0[0..16]={:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x} etype={:#06x} same-as-this-pop's-frame={} buf0-holds-the-frame={} ::",
+                    P4, self.rx_count - 1, self.rx_cur, len,
+                    b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+                    b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
+                    et, same as u8,
+                    if nonzero && et_sane { "yes" } else { "no" }
                 );
             }
             // NET-4f/NET-4u: before re-arming, CLEAN+INVALIDATE the whole buffer (upgraded from plain
@@ -2761,6 +2876,7 @@ mod metal {
             rxcls_active: true,
             dhcp_tx_witnessed: 0,
             net4t_other_dumped: 0,
+            net4y_probes: 0,
         };
 
         // ── M2/M3 GUARD: poison-honest readback through the NEW window BEFORE any register write ──
