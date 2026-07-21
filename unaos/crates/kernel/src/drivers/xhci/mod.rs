@@ -474,6 +474,34 @@ pub fn vugras_dump() {
     }
 }
 
+/// ORIN-X200-1 (boot-28): witness every bus/DMA pointer the driver hands the controller, at the
+/// moment of programming, together with the controller state (RS/HCH/CRR) that says whether the
+/// pointer is already fetchable. Boot-28's IOB/ACI FillWrite RAS at bus address
+/// 0x8000000000000200 fired right after "SLOT 1/3 ENABLED & ADDRESSED", before any net code ran —
+/// a low/default-shaped pointer (< 0x1000) handed to the controller is the prime suspect shape.
+/// The battery line is usbdebug-gated (default-quiet law); the < 0x1000 FLAG is unconditional —
+/// it only fires on a real bug and must never be silenced by a build knob. Free function (not a
+/// method) so call sites inside `&mut self.slots[..]` borrows can use it without borrow conflicts.
+#[allow(unused_variables)]
+fn x200_witness(op_base: usize, tag: &str, val: u64) {
+    if val < 0x1000 {
+        serial_println!(
+            "xHCI: X200 FLAG !! {} = {:#x} < 0x1000 — low/default-shaped DMA pointer handed to the controller",
+            tag, val
+        );
+    }
+    #[cfg(feature = "usbdebug")]
+    unsafe {
+        let cmd = core::ptr::read_volatile(op_base as *const u32);
+        let sts = core::ptr::read_volatile((op_base + 0x04) as *const u32);
+        let crcr = core::ptr::read_volatile((op_base + 0x18) as *const u32);
+        serial_println!(
+            ":: X200: {}={:#x} (RS={} HCH={} CRR={}) ::",
+            tag, val, cmd & 1, sts & 1, (crcr >> 3) & 1
+        );
+    }
+}
+
 pub static COMMAND_RING: Mutex<Option<TransferRing>> = Mutex::new(None);
 pub static EVENT_RING: Mutex<Option<EventRing>> = Mutex::new(None);
 
@@ -2309,6 +2337,7 @@ impl XhciController {
             let dcbaap_reg = (self.op_base + 0x30) as *mut u64;
             core::ptr::write_volatile(dcbaap_reg, dcbaap_ptr as u64);
             serial_println!("xHCI: DCBAAP set to {:#x}", dcbaap_ptr as u64);
+            x200_witness(self.op_base, "DCBAAP", dcbaap_ptr as u64);
 
             // 1b. SCRATCHPAD BUFFERS (xHCI spec 4.20). If the controller advertises Max Scratchpad
             // Buffers > 0 in HCSPARAMS2, the OS MUST allocate that many page-sized buffers + a
@@ -2350,6 +2379,7 @@ impl XhciController {
                         arr as u64, page_bytes, heap_lo, heap_hi
                     );
                 } else {
+                    let mut filled = 0usize;
                     for i in 0..max_scratchpad {
                         let buf_layout =
                             core::alloc::Layout::from_size_align(page_bytes, page_bytes).unwrap();
@@ -2359,12 +2389,31 @@ impl XhciController {
                         }
                         // Identity-mapped heap: the allocation's virtual address IS its bus/phys address.
                         *arr.add(i) = buf as u64;
+                        x200_witness(
+                            self.op_base,
+                            &alloc::format!("scratchpad[{}]", i),
+                            buf as u64,
+                        );
+                        filled += 1;
                     }
-                    *dcbaap_ptr.add(0) = arr as u64;
-                    serial_println!(
-                        "xHCI: scratchpad: {} buffer(s) x {} bytes; DCBAA[0]={:#x} (heap PA in [{:#x},{:#x}))",
-                        max_scratchpad, page_bytes, arr as u64, heap_lo, heap_hi
-                    );
+                    if filled < max_scratchpad {
+                        // ORIN-X200-1: a partially-filled scratchpad array published to DCBAA[0]
+                        // leaves ZERO entries the controller treats as buffer physical addresses —
+                        // it then DMA-writes into bus page 0 (exactly the 0x…0200 FillWrite RAS
+                        // shape). Publishing nothing is the lesser failure: the controller may
+                        // raise HSE, but it cannot wild-write. Loud + unconditional by design.
+                        serial_println!(
+                            "xHCI: X200 FLAG !! scratchpad: only {}/{} buffers allocated — NOT publishing DCBAA[0] (zero entries would be fetched as buffer pointers)",
+                            filled, max_scratchpad
+                        );
+                    } else {
+                        *dcbaap_ptr.add(0) = arr as u64;
+                        x200_witness(self.op_base, "DCBAA[0](scratchpad-array)", arr as u64);
+                        serial_println!(
+                            "xHCI: scratchpad: {} buffer(s) x {} bytes; DCBAA[0]={:#x} (heap PA in [{:#x},{:#x}))",
+                            max_scratchpad, page_bytes, arr as u64, heap_lo, heap_hi
+                        );
+                    }
                 }
             } else {
                 serial_println!("xHCI: scratchpad: controller requests 0 buffers (none needed).");
@@ -2377,6 +2426,7 @@ impl XhciController {
             let crcr_value = ring_phys_addr | 1;
             core::ptr::write_volatile(crcr_reg, crcr_value);
             serial_println!("xHCI: CRCR set to {:#x}", crcr_value);
+            x200_witness(self.op_base, "CRCR(command-ring)", ring_phys_addr);
         }
     }
 
@@ -2433,6 +2483,9 @@ impl XhciController {
             // PRESERVE BIT 3 (EHB - Event Handler Busy)? No, clear it initially.
             let erdp_ptr = (ir0_base + 0x18) as *mut u64;
             core::ptr::write_volatile(erdp_ptr, event_ring_phys); // Pointer to the RING, not the table
+            x200_witness(self.op_base, "ERSTBA", erst_table_phys);
+            x200_witness(self.op_base, "ERST[0].ring(event-ring)", event_ring_phys);
+            x200_witness(self.op_base, "ERDP", event_ring_phys);
 
             // 5b. IMOD (Interrupter Moderation, +0x04): 0 = no moderation, fire ASAP.
             // (QEMU ignores moderation timing, but set it explicitly for clarity / real HW.)
@@ -3434,6 +3487,7 @@ impl XhciController {
             let dcbaap_ptr = self.dcbaap;
             *dcbaap_ptr.add(slot_id as usize) = output_ctx_phys;
             serial_println!("xHCI: DCBAAP[{}] linked to {:#x}", slot_id, output_ctx_phys);
+            x200_witness(self.op_base, &alloc::format!("DCBAA[{}](out-ctx,root)", slot_id), output_ctx_phys);
 
             // 2. FILL INPUT CONTEXT (MANUAL OFFSET CALCULATION)
             let base_ptr = input_ctx_virt as *mut u32;
@@ -3478,6 +3532,7 @@ impl XhciController {
             ep0_ctx_ptr.add(1).write_volatile((4 << 3) | (3 << 1) | (mps0 << 16)); // EP Type = 4, CErr = 3, MPS
             ep0_ctx_ptr.add(2).write_volatile((ep0_ring_phys as u32) | 1); // Bit 0 must match Cycle Bit (1)
             ep0_ctx_ptr.add(3).write_volatile((ep0_ring_phys >> 32) as u32);
+            x200_witness(self.op_base, &alloc::format!("slot{} ep0 TRdeq(root)", slot_id), ep0_ring_phys);
             ep0_ctx_ptr.add(4).write_volatile(8); // Average TRB Length = 8
 
             serial_println!("xHCI: Input Context Initialized (Manual Offsets). Phys={:#x}", input_ctx_phys);
@@ -3576,6 +3631,8 @@ impl XhciController {
             ep_out_ptr.add(3).write_volatile((bulk_out_phys >> 32) as u32);
             ep_out_ptr.add(4).write_volatile(out_mps as u32);
 
+            x200_witness(self.op_base, &alloc::format!("slot{} bulk-in TRdeq", slot_id), bulk_in_phys);
+            x200_witness(self.op_base, &alloc::format!("slot{} bulk-out TRdeq", slot_id), bulk_out_phys);
             serial_println!("xHCI: Input Context Configured for Bulk Transport.");
             input_ctx_virt as u64
         }
@@ -4921,6 +4978,7 @@ impl XhciController {
             ep.add(1).write_volatile((7 << 3) | (3 << 1) | ((mps as u32) << 16));
             ep.add(2).write_volatile((phys as u32) | 1);
             ep.add(3).write_volatile((phys >> 32) as u32);
+            x200_witness(self.op_base, &alloc::format!("slot{} hub-int TRdeq", hub_slot), phys);
             ep.add(4).write_volatile(mps as u32);
         }
         let trb = Trb {
@@ -5202,6 +5260,7 @@ impl XhciController {
             slot.route_depth = depth;
 
             *self.dcbaap.add(slot_id as usize) = output_ctx_virt as u64;
+            x200_witness(self.op_base, &alloc::format!("DCBAA[{}](out-ctx,downstream)", slot_id), output_ctx_virt as u64);
 
             let base_ptr = input_ctx_virt as *mut u32;
             core::ptr::write_bytes(base_ptr as *mut u8, 0, core::mem::size_of::<InputContext>());
@@ -5239,6 +5298,7 @@ impl XhciController {
             ep0_ctx.add(1).write_volatile((4 << 3) | (3 << 1) | (mps0 << 16));
             ep0_ctx.add(2).write_volatile((ep0_ring_phys as u32) | 1);
             ep0_ctx.add(3).write_volatile((ep0_ring_phys >> 32) as u32);
+            x200_witness(self.op_base, &alloc::format!("slot{} ep0 TRdeq(downstream)", slot_id), ep0_ring_phys);
             ep0_ctx.add(4).write_volatile(8);
         }
         // XENUM-3 M2: bounded, paced ADDRESS_DEVICE retry. The root-port path gives a stalled device
@@ -5991,6 +6051,7 @@ impl XhciController {
 
         let input_ctx_virt;
         let max_dci;
+        let op_base = self.op_base; // captured before the slot borrow (X200 witness below)
         unsafe {
             let slot = &mut self.slots[slot_id as usize];
             input_ctx_virt = slot.input_context;
@@ -6036,6 +6097,7 @@ impl XhciController {
                 ep.add(2).write_volatile((phys as u32) | 1);
                 ep.add(3).write_volatile((phys >> 32) as u32);
                 ep.add(4).write_volatile(mps);
+                x200_witness(op_base, &alloc::format!("slot{} kbd TRdeq", slot_id), phys);
                 add_flags |= 1 << dci;
                 mdci = mdci.max(dci);
                 slot.keyboard_state = 1;
@@ -6059,6 +6121,7 @@ impl XhciController {
                 ep.add(2).write_volatile((phys as u32) | 1);
                 ep.add(3).write_volatile((phys >> 32) as u32);
                 ep.add(4).write_volatile(mps);
+                x200_witness(op_base, &alloc::format!("slot{} mouse TRdeq", slot_id), phys);
                 add_flags |= 1 << dci;
                 mdci = mdci.max(dci);
                 slot.mouse_state = 1;

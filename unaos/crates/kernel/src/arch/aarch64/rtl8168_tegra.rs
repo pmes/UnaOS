@@ -1073,6 +1073,14 @@ mod metal {
             unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
 
             // Enable RX + TX in the ChipCmd register.
+            // ORIN-X200-1: stamp the NIC's FIRST DMA-arming point (RxEnb|TxEnb — descriptor
+            // fetch/writeback can begin from here) so the next metal boot can temporally separate
+            // the two 0x200-RAS candidates (twin stamp: xusb_tegra's ":: X200: xhci RS=1 ...").
+            serial_println!(
+                "{}   :: X200: rtl8168 first-DMA-arm (RxEnb|TxEnb) t={} (cntpct) ::",
+                P4,
+                crate::arch::aarch64::timer::cntpct()
+            );
             serial_println!("{}   >>> REG WRITE (M2): CR[{:#x}] = {:#04x} (RxEnb | TxEnb) ::", P4, REG_CR, CR_RE | CR_TE);
             self.w8(REG_CR, CR_RE | CR_TE);
 

@@ -1262,9 +1262,13 @@ pub fn jb2b_attach(
         // One line before the first RUNTIME-register / doorbell-array touch (new offsets within
         // the ungated block — the JX1 discipline: a dead boot's last line names the killer).
         serial_println!(":: tegra: JB2b — programming interrupter + rings (runtime regs) ::");
+        // ORIN-X200-1: stamp the xHCI DMA-arming window so the next metal boot can temporally
+        // separate the two 0x200-RAS candidates (xHCI vs RTL8168 — see rtl8168_tegra's twin stamp).
+        serial_println!(":: X200: xhci pointer-programming begins t={} (cntpct) ::", cntpct());
         x.init_interrupter(event_ring_phys);
         x.init_pointers(command_ring_phys);
         x.start();
+        serial_println!(":: X200: xhci RS=1 (controller may DMA from here) t={} (cntpct) ::", cntpct());
         *xhci::XHCI_CONTROLLER.lock() = Some(x);
     }
 
