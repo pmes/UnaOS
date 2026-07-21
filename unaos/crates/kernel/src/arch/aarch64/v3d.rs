@@ -130,6 +130,19 @@ const V3D_CTL_IDENT0: usize = 0x0000;
 const V3D_CTL_IDENT1: usize = 0x0004;
 const V3D_CTL_IDENT2: usize = 0x0008;
 
+// ─── PI-V3D-12: GPU-side cache maintenance (core 0). Offsets + bits transcribed VERBATIM from Linux
+// `drivers/gpu/drm/v3d/v3d_regs.h` (register/hardware facts; GPL-2.0-only header, facts-only — same
+// discipline as the CT-queue and MMU constants above). Linux `v3d_gem.c::v3d_invalidate_caches` runs
+// before EVERY job (both `v3d_bin_job_run` and `v3d_render_job_run` call it, per v3d_sched.c): on
+// V3D >= 4.1 the live steps are the L2T flush (L2TCACTL: L2TFLS with FLM=FLUSH) and the slice-cache
+// invalidate (SLCACTL: all-0xF TVCCS/TDCCS/UCC/ICC); the GCA/L3 step is ver<41-only and the L2C
+// invalidate ver<33-only — both no-ops on the Pi 4's 4.2, so neither is transcribed here.
+const V3D_CTL_SLCACTL: usize = 0x0024; // slice-cache control (TMU-vertex/TMU-data/uniform/instruction)
+const V3D_CTL_L2TCACTL: usize = 0x0030; // L2T cache control
+const V3D_L2TCACTL_L2TFLS: u32 = 1 << 0; // flush start; reads 1 while the flush is in progress
+const V3D_L2TCACTL_FLM_FLUSH: u32 = 0 << 1; // FLM field [2:1] = FLUSH (write-back + invalidate)
+const V3D_SLCACTL_INVALIDATE_ALL: u32 = (0xF << 24) | (0xF << 16) | (0xF << 8) | 0xF;
+
 // CLE (control-list executor) — CT1 is the RENDER queue. Submitting a job = write the ring's start
 // address to CT1QBA and its end address to CT1QEA; the hardware runs [BA, EA).
 const V3D_CLE_CT0CS: usize = 0x0100; // CT0 (bin) control/status — witness only (render job uses CT1)
@@ -427,12 +440,19 @@ pub fn bringup(fb: Option<FbTarget>) {
     // CPU-verify inside/outside samples. M3's PASS above is the regression witness — M4 runs AFTER it,
     // in its own arena regions, and never touches M3's buffers. ATTENDED-METAL-UNVERIFIED (QEMU raspi4b
     // never reaches here; on QEMU the run returned at BLOCK-DOWN far above). ────────────────────────
-    triangle_job(fb);
+    let m4_pass = triangle_job(fb);
 
     // ── PI-V3D-11: the visible graphics battery (M5 gradient → M6 animated → M7 multi-primitive →
     // M8 blit-to-scanout). Purely ADDITIVE stages layered on the M4 scaffold: M3 + M4 above remain
-    // the regression witnesses and none of their buffers or kick code is touched. ─────────────────
-    battery(fb);
+    // the regression witnesses and none of their buffers or kick code is touched. PI-V3D-12: gated
+    // on the M4 verdict — the ONLY battery gate. The stages reuse the M4 shaders/scaffold, so on an
+    // M4 FAIL they can only bury the M4 witness in derivative noise; the boot the triangle lands,
+    // the battery runs. ─────────────────────────────────────────────────────────────────────────
+    if m4_pass {
+        battery(fb);
+    } else {
+        serial_println!(":: V3D: PI-V3D-11 battery SKIPPED — gated on the M4 triangle verdict (FAIL this boot) ::");
+    }
 
     // Belt-and-suspenders for the whole bring-up: whatever path M2/M3/M4 took, no latent async abort
     // from a V3D register access may outlive this function (the SError-drain class rule).
@@ -1196,6 +1216,29 @@ fn clear_mmu_fault_latch(when: &str) {
     }
 }
 
+/// PI-V3D-12: the pre-kick GPU-cache invalidate — the Linux `v3d_invalidate_caches` idiom every job
+/// submission runs (v3d_sched.c calls it in BOTH `v3d_bin_job_run` and `v3d_render_job_run`). On the
+/// Pi 4's V3D 4.2 the two live steps are:
+///   (1) L2T flush (L2TCACTL <= L2TFLS | FLM=FLUSH): write back + invalidate the L2T — this is what
+///       PUBLISHES a prior GPU engine's memory writes (the PTB's binned tile lists) to the next
+///       engine's fetch path, and drops any stale line caching the CPU's pre-job contents;
+///   (2) slice-cache invalidate (SLCACTL <= all-0xF): drop the per-slice TMU/uniform/instruction
+///       caches so shaders fetch current code/uniforms.
+/// The L2TFLS wait is the standard finite backstop (Linux waits on the same bit in v3d_clean_caches);
+/// a timeout is logged and the caller proceeds — the kick's own witnesses stay decisive. Boot-P7 root
+/// cause (PI-V3D-12): our driver never did ANY of this. M3 survived because its CT1 only ever read
+/// CPU-published lists (CPU-side cache cleans cover CPU→GPU); M4's render is the FIRST job whose CLE
+/// must observe ANOTHER GPU job's output (the bin's tile lists) — with the L2T never flushed, the
+/// BRANCH_TO_IMPLICIT_TILE_LIST fetch at the tile-alloc base returned the stale pre-bin zero-fill,
+/// opcode 0x00 = Halt, and the CLE stopped inside the pool (CT1CA parked BELOW BA) before ever
+/// reaching the sub-list's STORE — render "clean", zero stores.
+fn invalidate_gpu_caches(what: &str) {
+    mmio_write(V3D_CORE0_BASE, V3D_CTL_L2TCACTL, V3D_L2TCACTL_L2TFLS | V3D_L2TCACTL_FLM_FLUSH);
+    let _ = wait_bit_clear(V3D_CORE0_BASE, V3D_CTL_L2TCACTL, V3D_L2TCACTL_L2TFLS, what);
+    mmio_write(V3D_CORE0_BASE, V3D_CTL_SLCACTL, V3D_SLCACTL_INVALIDATE_ALL);
+    dsb();
+}
+
 // ════════════════════════════════════════════════════════════════════════════════════════════════
 // PI-V3D-8 — M4: the first triangle (bin on CT0 → render on CT1 → CPU sample-verify).
 // ════════════════════════════════════════════════════════════════════════════════════════════════
@@ -1682,7 +1725,9 @@ fn ct0_ran(cs_pre: u32, cs_kicked: u32, cs_done: u32, ca_done: u32, ba: u32, ea:
 /// M4: bin one triangle on CT0, render it on CT1 (implicit tile list), CPU sample-verify.
 /// ATTENDED-METAL-UNVERIFIED — QEMU never reaches here. On success prints the M4 PASS witness + a
 /// sample table; the QPU shader body is the one metal-refinement seam (see the module banner).
-fn triangle_job(fb: Option<FbTarget>) {
+/// Returns the M4 verdict (PI-V3D-12: `bringup` gates the battery on it — the battery stages layer on
+/// the M4 scaffold, so running them over a failed triangle only buries the M4 witness in noise).
+fn triangle_job(fb: Option<FbTarget>) -> bool {
     serial_println!(":: V3D: M4 triangle — binning on CT0, render on CT1 (implicit tile list) ::");
 
     // (0) Publish the shader programs, uniform streams, vertex data, default attributes. The shader
@@ -1744,8 +1789,10 @@ fn triangle_job(fb: Option<FbTarget>) {
         || !arena_contains(ts as usize, TILE_STATE_BYTES)
     {
         serial_println!(":: V3D: M4 bin range escapes the arena — refusing kick (fail-closed) ::");
-        return;
+        return false;
     }
+    // PI-V3D-12: the Linux per-job pre-kick cache invalidate (v3d_bin_job_run does this first).
+    invalidate_gpu_caches("L2T flush (M4 bin pre-kick)");
     let ct0_cs_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CS);
     let ct0_ca_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CA);
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QMA, tile_alloc); // tile-allocation pool base
@@ -1788,8 +1835,15 @@ fn triangle_job(fb: Option<FbTarget>) {
     let rcl_ea = rcl_ba + rcl_len as u32;
     if !arena_contains(rcl_ba as usize, rcl_len) {
         serial_println!(":: V3D: M4 render range escapes the arena — refusing kick (fail-closed) ::");
-        return;
+        return false;
     }
+    // PI-V3D-12 — THE boot-P7 fix. The render CLE consumes the BINNER's tile lists; without the Linux
+    // per-job invalidate (v3d_render_job_run also runs it) the L2T still held the CPU's pre-bin
+    // zero-fill of the tile-alloc pool, so the BRANCH_TO_IMPLICIT_TILE_LIST fetched 0x00 = Halt at the
+    // pool base and the CLE stopped there (boot-P7: CT1CA done 0x00206000 = arena+OFF_BIN_TILEALLOC,
+    // BELOW BA) without ever reaching the sub-list's STORE. Flush L2T + invalidate slices so the
+    // render observes the bin's actual output.
+    invalidate_gpu_caches("L2T flush (M4 render pre-kick)");
     let r_cs_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT1CS);
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT1QBA, rcl_ba);
     dsb();
@@ -1812,11 +1866,21 @@ fn triangle_job(fb: Option<FbTarget>) {
         ":: V3D: M4 render clue — CT1CS pre={:#010x} kicked={:#010x} (CTRUN={}) done={:#010x} CT1CA done={:#010x} (BA={:#010x} EA={:#010x}) ran={} idled={} MMU_fault={:#x} ::",
         r_cs_pre, r_cs_kicked, r_ctrun_kicked, r_cs_done, r_ca_done, rcl_ba, rcl_ea, r_ran as u32, r_idled as u32, r_fault
     );
+    // PI-V3D-12 CA-locus decode: CT1CA below BA is NOT a stale queued job — the CLE's CA follows
+    // branches. Parked inside the bin tile-alloc pool = the BRANCH_TO_IMPLICIT_TILE_LIST destination,
+    // i.e. the CLE halted INSIDE the (stale/empty) binned tile list before the sub-list's STORE.
+    let ta_base = (arena_phys() + OFF_BIN_TILEALLOC) as u32;
+    if r_ca_done >= ta_base && r_ca_done < ta_base + BIN_TILEALLOC_BYTES as u32 {
+        serial_println!(
+            ":: V3D: M4 render clue — CT1CA parked IN the bin tile-alloc pool (+{:#x}): the CLE halted inside the implicit (binned) tile list, before the STORE ::",
+            r_ca_done - ta_base
+        );
+    }
     super::exceptions::serror_drain_request("v3d: M4 render kick window");
 
     if !bin_idled || !r_idled {
         serial_println!(":: V3D: M4 — a CLE did not idle within budget (anti-hang backstop) — no verify ::");
-        return;
+        return false;
     }
 
     // (6) CPU sample-verify: pull the target back from DRAM and check inside/outside samples.
@@ -1830,6 +1894,7 @@ fn triangle_job(fb: Option<FbTarget>) {
     } else {
         serial_println!(":: V3D: M4 triangle — FAIL/UNRENDERED (see sample table; QPU shader body is the metal-refinement seam) ::");
     }
+    pass
 }
 
 /// Read one 32-bit pixel from the M4 target at (x, y).
@@ -2087,7 +2152,9 @@ fn kick_bin_render(bin_off: usize, bin_len: usize, rcl_off: usize, rcl_len: usiz
     cache::clean_range(arena_phys() + OFF_TILESTATE, TILE_STATE_BYTES);
     cache::clean_range(arena_phys() + OFF_BIN_TILEALLOC, BIN_TILEALLOC_BYTES);
 
-    // CT0 (bin): QMA/QMS/QTS → QBA → QEA (GO), per Linux v3d_sched.c v3d_bin_job_run.
+    // CT0 (bin): QMA/QMS/QTS → QBA → QEA (GO), per Linux v3d_sched.c v3d_bin_job_run — which starts
+    // with the per-job cache invalidate (PI-V3D-12 mirror of the M4 kick fix).
+    invalidate_gpu_caches("L2T flush (battery bin pre-kick)");
     let cs_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CS);
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QMA, tile_alloc);
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QMS, BIN_TILEALLOC_BYTES as u32);
@@ -2105,7 +2172,9 @@ fn kick_bin_render(bin_off: usize, bin_len: usize, rcl_off: usize, rcl_len: usiz
     // Fault-latch hygiene between bin and render (the boot-P5 sticky-fault wedge), quiet per-frame.
     res.fault |= clear_mmu_fault_latch_quiet();
 
-    // CT1 (render): QBA → QEA (GO).
+    // CT1 (render): QBA → QEA (GO). PI-V3D-12: the pre-kick invalidate here is what publishes the
+    // bin's tile lists to the render CLE's branch fetch (the boot-P7 zero-stores root cause).
+    invalidate_gpu_caches("L2T flush (battery render pre-kick)");
     let r_cs_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT1CS);
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT1QBA, rcl_ba);
     dsb();
