@@ -1890,6 +1890,20 @@ mod metal {
                 self.rx_count, xid,
                 if self.d_xid.is_some() { "sent" } else { "NEVER SENT" }
             );
+            // NET-4E (armed-diagnostic builds only): QUENCH RX DMA at window close. The NIC's
+            // misdirected payload writes (NET-4A mechanism, cause unfound) continue as long as RX
+            // is enabled and the segment carries traffic — post-window they serve no verdict and
+            // they are the boot-killer (the 0x200 IOB/ACI RAS class ended boots 34/36/42 after
+            // their windows). TX stays enabled (proven clean); the lease verdict is decided by
+            // window close, so nothing this build owes is lost. NOT in default builds.
+            if option_env!("UNAOS_NET4_RINGDUMP").is_some() {
+                let cr = self.r8(REG_CR);
+                self.w8(REG_CR, cr & !CR_RE);
+                serial_println!(
+                    "{}   [net4E] RX DMA QUENCHED at window-close (CR {:#04x} -> {:#04x}): stray-write source off; boot survives for its remaining witnesses (armed-build only) ::",
+                    P4, cr, cr & !CR_RE
+                );
+            }
         }
 
         /// Pop one completed RX descriptor's raw Ethernet frame into `out` and recycle the descriptor
