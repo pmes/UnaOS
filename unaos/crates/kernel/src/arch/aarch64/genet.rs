@@ -50,9 +50,12 @@
 //
 // The Pi bare-metal MMU maps RAM identity (VA==PA), so a heap allocation's pointer doubles as the
 // physical address the MAC DMAs against (the x86 e1000 / NET-4 / VNET invariant). Rings + buffers are
-// published with `dsb sy`. The BCM2711 GENET is I/O-coherent toward DRAM (ACE-lite), so `dsb` ordering
-// suffices for the datapath; if attended metal ever shows stale descriptors on a live link, the fix is
-// clean-before-own / invalidate-before-read on the rings + buffers (do NOT weaken the index protocol).
+// published with `dsb sy`. The BCM2711 GENET was assumed I/O-coherent toward DRAM (ACE-lite), so `dsb`
+// ordering was thought to suffice — but boot-P10 (151 frames popped, 0 classified) is the attended-metal
+// evidence that the RX datapath is NOT coherent: the CPU read stale pre-refill lines over the recycled
+// buffers. PI-GENET-5 therefore invalidates each RX buffer's cache lines (`dc ivac`) before reading its
+// length + payload (`invalidate_dcache` in `rx_frame_raw`); the `[genet5]` witness records the
+// pre/post-invalidate delta that proves the regime. The index protocol is untouched.
 //
 // ## Write discipline
 //
@@ -262,6 +265,12 @@ mod metal {
     /// PI-GENET-4: bound on the popped-frame witness lines (the boot-P6 evidence question — "what ARE
     /// the 10 popped frames?" — needs only a handful of exemplars). Mirrors NET-4t on the Orin.
     const PG4_RX_DUMPS: u64 = 4;
+    /// PI-GENET-5: bound on the coherency-discriminating witness (the boot-P10 question — "are the 151
+    /// popped frames real payload the classifier drops, or stale/zero DRAM the CPU never re-read?").
+    /// Eight exemplars is ample to read the pre/post-invalidate delta straight off serial.
+    const PG5_RX_DUMPS: u64 = 8;
+    /// Cortex-A72 (BCM2711) L1/L2 cache line = 64 bytes. The RX-buffer invalidate steps by this.
+    const CACHE_LINE: usize = 64;
     /// Largest frame the MAC accepts (jumbo-safe default; a normal frame is far under).
     const MAX_FRAME_LEN: u32 = 1536;
 
@@ -280,6 +289,8 @@ mod metal {
         /// PI-GENET-4: popped frames given a raw-bytes witness line so far (bounds the evidence
         /// noise to `PG4_RX_DUMPS`; all inside the `genet`-gated battery — default boot unchanged).
         pg4_rx_dumped: u64,
+        /// PI-GENET-5: pops given the coherency-discriminating `[genet5]` witness line so far.
+        pg5_rx_dumped: u64,
     }
 
     /// PI-GENET-4 (the NET-4t helper, GENET's own copy — lanes do not share code): resolve a frame's
@@ -828,14 +839,34 @@ mod metal {
             }
             let i = (self.rx_c_index as usize) % RING_DEPTH;
             let d = self.rx_desc(i);
+            let buf_base = unsafe { self.rx_bufs.add(i * BUF_SIZE) };
             barrier(); // order the buffer read AFTER observing the advanced producer index
+            // PI-GENET-5 witness (PRE-invalidate): capture what the CPU sees THROUGH the cache before
+            // any invalidate — the descriptor length_status word (MMIO, always fresh), the in-buffer
+            // status-block first word, and the leading 16 payload bytes. If these differ from the
+            // post-invalidate reads below, the RX datapath was NOT coherent and stale cache — not a
+            // classifier bug — is why boot-P10 popped 151 frames and classified none.
+            let dsc_ls = self.r(d + DMA_DESC_LENGTH_STATUS);
+            let sb_pre = unsafe { read_volatile(buf_base as *const u32) };
+            let mut pre16 = [0u8; 16];
+            let witness = self.pg5_rx_dumped < PG5_RX_DUMPS;
+            if witness {
+                let psrc = unsafe { buf_base.add(RX_STATUS_PAD) };
+                for (k, slot) in pre16.iter_mut().enumerate() {
+                    *slot = unsafe { read_volatile(psrc.add(k)) };
+                }
+            }
+            // PI-GENET-5 FIX: invalidate this buffer's cache lines to the point of coherency so the
+            // length read + payload copy below observe the bytes the MAC DMA'd into DRAM, not a stale
+            // pre-refill line the CPU still held. (No-op cost on a genuinely coherent line.)
+            invalidate_dcache(buf_base as u64, BUF_SIZE);
             // PI-GENET-4: with RBUF 64B_EN set, the authoritative length_status is the FIRST WORD of
             // the in-buffer 64-byte receive-status block (Linux `bcmgenet_desc_rx`, `desc_64b_en`
             // path: `status = (struct status_64 *)skb->data; dma_length_status = status->length_status`)
-            // — not the descriptor word. Read the status block; fall back to the descriptor word only
-            // if the block reads zero (belt-and-braces on odd hardware states).
-            let sb = unsafe { read_volatile(self.rx_bufs.add(i * BUF_SIZE) as *const u32) };
-            let ls = if sb != 0 { sb } else { self.r(d + DMA_DESC_LENGTH_STATUS) };
+            // — not the descriptor word. Read the status block (now cache-coherent); fall back to the
+            // descriptor word only if the block reads zero (belt-and-braces on odd hardware states).
+            let sb = unsafe { read_volatile(buf_base as *const u32) };
+            let ls = if sb != 0 { sb } else { dsc_ls };
             // Received length is bits [beyond 16]; strip the 64-byte status block + 2-byte align pad
             // (both included in the reported length — see RX_STATUS_PAD).
             let total = ((ls >> DMA_BUFLENGTH_SHIFT) & 0x0fff) as usize;
@@ -846,6 +877,52 @@ mod metal {
                 unsafe { core::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), len) };
             }
             self.rx_count += 1;
+            // PI-GENET-5 witness (POST-invalidate): one line per pop that puts the pre/post-invalidate
+            // delta on the record. `dsc`=descriptor length_status word; `sb_pre`/`sb_post`=in-buffer
+            // status-block first word before/after `dc ivac`; `pre16`/`post16`=leading 16 payload bytes
+            // before/after. Reading the two columns discriminates the boot-P10 gap in one glance:
+            //   sb_pre==0 / post16 real  → stale cache; the invalidate is the fix (frames were real).
+            //   sb_pre==sb_post, post16 real, yet 0 classified → payload IS good; the drop is in
+            //     smoltcp ingress (MAC filter / length-offset / VLAN — chase classification, not DMA).
+            //   post16 all-zero with a non-zero length → zero/garbage DMA (reachability), not caching.
+            // The driver-side effective ethertype (`et`) is exactly what this pop hands up to smoltcp.
+            if witness {
+                self.pg5_rx_dumped += 1;
+                let mut post = [0u8; 16];
+                let m = len.min(16);
+                post[..m].copy_from_slice(&out[..m]);
+                let hx = |dst: &mut [u8; 32], s: &[u8; 16]| {
+                    const HD: &[u8; 16] = b"0123456789abcdef";
+                    for (j, &b) in s.iter().enumerate() {
+                        dst[j * 2] = HD[(b >> 4) as usize];
+                        dst[j * 2 + 1] = HD[(b & 0x0f) as usize];
+                    }
+                };
+                let mut preh = [0u8; 32];
+                let mut posth = [0u8; 32];
+                hx(&mut preh, &pre16);
+                hx(&mut posth, &post);
+                let frame = &out[..len];
+                let (et, _l3, _v) = eth_effective_type(frame);
+                serial_println!(
+                    "{}   [genet5] rx[{}] dsc={:#010x} sb_pre={:#010x} sb_post={:#010x} len={} et={:#06x} pre16={} post16={} ::",
+                    PG,
+                    self.pg5_rx_dumped - 1,
+                    dsc_ls,
+                    sb_pre,
+                    sb,
+                    len,
+                    et,
+                    core::str::from_utf8(&preh).unwrap_or("?"),
+                    core::str::from_utf8(&posth).unwrap_or("?"),
+                );
+                if sb_pre != sb || pre16 != post {
+                    serial_println!(
+                        "{}   [genet5] ^ CACHE WAS STALE — pre/post differ: the RX datapath is NOT coherent; invalidate-before-read is the fix (frames were real, the CPU read a pre-DMA line) ::",
+                        PG
+                    );
+                }
+            }
             // PI-GENET-4 witness: the first PG4_RX_DUMPS popped frames print len + dst/src MAC +
             // effective ethertype (+ vlan id if tagged) + the first 32 raw bytes, one line each — the
             // boot-P6 distinguishing fact ("what ARE the 10 popped frames?") reads straight off these
@@ -906,6 +983,29 @@ mod metal {
     #[inline]
     fn barrier() {
         unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
+    }
+
+    /// PI-GENET-5: invalidate the data cache over `[addr, addr+len)` to the point of coherency
+    /// (`dc ivac`, one op per 64-byte line, bracketed by `dsb`). The identity map makes VA==PA, so the
+    /// same pointer the MAC DMA'd into is the one we invalidate. This drops any stale line the CPU
+    /// cached over an RX buffer BEFORE the device refilled it, so the following read observes the DMA'd
+    /// bytes in DRAM rather than a pre-DMA copy. The module header long noted this as the standing fix
+    /// if metal ever showed stale RX (`invalidate-before-read`); boot-P10 (151 popped / 0 classified)
+    /// is that evidence — the ACE-lite "coherent, `dsb` suffices" assumption did not hold for the RX
+    /// datapath. `dc ivac` is safe on an already-coherent line (it merely drops a clean copy).
+    #[inline]
+    fn invalidate_dcache(addr: u64, len: usize) {
+        let start = addr & !((CACHE_LINE as u64) - 1);
+        let end = addr + len as u64;
+        let mut p = start;
+        unsafe {
+            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+            while p < end {
+                core::arch::asm!("dc ivac, {}", in(reg) p, options(nostack, preserves_flags));
+                p += CACHE_LINE as u64;
+            }
+            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+        }
     }
 
     // ── DTB resolution: find the GENET node's register base (no hardcoded base; log candidates) ──
@@ -1052,6 +1152,7 @@ mod metal {
             tx_count: 0,
             phy_addr: 1,
             pg4_rx_dumped: 0,
+            pg5_rx_dumped: 0,
         };
 
         // ── M1: poison-honest version probe BEFORE any write — the platform-classifying read ──
