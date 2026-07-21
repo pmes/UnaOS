@@ -2576,8 +2576,22 @@ mod metal {
             Some(iom) => {
                 let sm = &iom.bases[..iom.n_bases];
                 crate::arch::aarch64::smmu_tegra::net4i_recon(sm, iom.sid, "pre-fix");
-                crate::arch::aarch64::smmu_tegra::net4i_bypass(sm, iom.sid);
+                crate::arch::aarch64::smmu_tegra::net4w_verdict(sm, iom.sid);
+                // NET-4w: boot-30 refuted bypass (option b) — the blackhole survived it, matching
+                // the MB2 "SMMU external bypass disable" fabric policy (untranslated output is
+                // refused). Promote option (a): a stage-1 IDENTITY context we own. Translated
+                // output clears the fabric policy while keeping bus addr == DRAM PA. If translate
+                // fails closed on every instance, fall back to the NET-4i bypass arm so boot-30
+                // behaviour is never regressed.
+                if crate::arch::aarch64::smmu_tegra::net4w_translate(sm, iom.sid) == 0 {
+                    serial_println!(
+                        "{}   [net4w] translate armed 0 instances — falling back to the NET-4i bypass route ::",
+                        P4
+                    );
+                    crate::arch::aarch64::smmu_tegra::net4i_bypass(sm, iom.sid);
+                }
                 crate::arch::aarch64::smmu_tegra::net4i_recon(sm, iom.sid, "post-fix");
+                crate::arch::aarch64::smmu_tegra::net4w_verdict(sm, iom.sid);
             }
             None => {
                 serial_println!(

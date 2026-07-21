@@ -463,6 +463,279 @@ pub fn net4i_bypass(bases: &[u64], sid: u32) -> usize {
     armed
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// NET-4w — the inbound sink is BELOW the iATU: a REAL identity translation context for the PCIe
+// stream (boot-30 + NET-4v audit verdict)
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+//
+// Evidence chain that lands here:
+//   * NET-4v (boot-30): armed iATU region 1 covers ALL DMA objects (limit 0x6840ffff vs top need
+//     0x68403fff) yet rx[1]'s sink at bus 0x683e0800 — INSIDE the window, 2 KiB past rx[0] which
+//     translates — still vanishes. The iATU is exonerated; the sink is a stage below it.
+//   * Surviving inbound set = ring page + first RX buffer only: the firmware-residual-mapping
+//     signature. UEFI programmed inbound SMMU translations for its own DMA; we inherited them;
+//     unmapped bus pages write-to-nowhere silently.
+//   * NET-4i (boot-30) armed per-stream BYPASS for this very stream and the blackhole SURVIVED —
+//     the same verdict the XUSB saga hit one fabric over: the MB2 boot log's "Task: SMMU external
+//     bypass disable" means UNTRANSLATED (bypass-output) traffic is refused at the fabric/MC.
+//     Bypass is a dead end on this silicon; the brief's option (b) is refuted by metal, which
+//     promotes option (a): translate identity, honestly, through a context WE own.
+//
+// FACTS (L4T kernel + tegra234 DTB, GPLv2 = facts only; verify-on-device via the [net4w] lines):
+//   * The devkit NIC enumerates in PCI domain 4: Tegra234 PCIe C4, `pcie@141a0000`. Its DT node
+//     carries `iommu-map = <0x0 &smmu_niso1 TEGRA234_SID_PCIE_C4 0x1000>` with
+//     `iommu-map-mask = <0x0>` — every RID behind the RC is squashed to the ONE stream id
+//     (dt-bindings/memory/tegra234-mc.h). We never hard-code either: `fdt_tegra::pcie_iommu`
+//     resolves phandle → SMMU bases + sid from the live DTB and the witness lines print them.
+//   * That SMMU is NOT an SMMUv3 (no GBPA/STE): compatible "nvidia,tegra234-smmu",
+//     "nvidia,smmu-500" — a dual ARM MMU-500 (SMMUv2), two mirrored instances interleaved by the
+//     fabric (writes must go to BOTH; Linux broadcasts). The v3 "GBPA/STE" language of the brief
+//     maps to v2 reality: sCR0.CLIENTPD (global bypass), sCR0.USFCFG (unmatched-stream policy),
+//     SMR[n]/S2CR[n] stream matching, CBAR/CBA2R/CB[n] translation contexts.
+//   * EL3 firewall: refuted by silicon — JB3/JB9 read this register file and NET-4i WROTE
+//     SMR/S2CR on metal (boot-30) with no abort. Not a JX1 gated-partition class.
+//
+// The fix (option a — bounded, honest): build one stage-1 identity context (the JB3_IDMAP 1 GiB
+// block table already proven const-correct above), program a context bank no live stream routes
+// to, and re-route the PCIe stream's S2CR from bypass to translate-through-that-bank. Identity
+// translation output is TRANSLATED traffic — it clears the fabric's bypass-disable policy while
+// preserving the driver's identity-DMA contract (bus addr == DRAM PA). Options (b)/(c): (b) is
+// the refuted NET-4i state (kept as the fail-closed fallback so a net4w abort never regresses
+// boot-30 behaviour); (c) global bypass is NOT implemented — per-stream translate is possible,
+// and (c) would lower inbound isolation for every master on the instance.
+//
+// Discipline: every register write is announced before issue and witnessed with a readback;
+// any readback mismatch or geometry surprise fails CLOSED (S2CR untouched → the stream keeps
+// its NET-4i bypass route). The page table is cache-cleaned to PoC before the walker can see it.
+
+/// SMMUv2 CB_SCTLR fields (arm-smmu facts): M b0, TRE b1, AFE b2, CFRE b5, CFIE b6, ASIDPNE b12.
+const CB_SCTLR_S1: u32 = (1 << 12) | (1 << 6) | (1 << 5) | (1 << 2) | (1 << 1) | 1; // 0x1067
+/// CB_TCR for VA64 stage-1: T0SZ=25 (IA[38:0] — the JB3_IDMAP span), IRGN0/ORGN0=WBWA,
+/// SH0=inner, TG0=4 KiB granule.
+const CB_TCR_S1: u32 = 25 | (0b01 << 8) | (0b01 << 10) | (0b11 << 12);
+/// CB_TCR2: PASIZE=0b010 (40-bit output — covers Orin DRAM), SEP/TBI zero.
+const CB_TCR2_S1: u32 = 0b010;
+/// MAIR0 attr0 = 0xff (Normal WB RWA) — AttrIndx 0, the index every JB3_IDMAP block names.
+const CB_MAIR0_S1: u32 = 0x0000_00ff;
+/// GR0 TLB maintenance: TLBIALLNSNH 0x68 (invalidate all non-secure non-hyp), sTLBGSYNC 0x70,
+/// sTLBGSTATUS 0x74 (GSACTIVE b0).
+const TLBIALLNSNH: u64 = 0x68;
+const STLBGSYNC: u64 = 0x70;
+const STLBGSTATUS: u64 = 0x74;
+
+/// One announced+witnessed 32-bit register write. Returns false (and says so) on readback
+/// mismatch — the caller fails closed.
+fn wrw(what: &str, i: usize, base: u64, off: u64, val: u32) -> bool {
+    serial_println!(
+        ":: tegra: [net4w] FIX — inst{} >>> WRITE {} @+{:#x} = {:#010x} ::",
+        i, what, off, val
+    );
+    wr(base, off, val);
+    let rb = rd(base, off);
+    if rb == val {
+        true
+    } else {
+        serial_println!(
+            ":: tegra: [net4w] FIX — inst{} !! {} readback {:#010x} != {:#010x} — FAIL-CLOSED ::",
+            i, what, rb, val
+        );
+        false
+    }
+}
+
+/// Per-instance MMU-500 geometry derived from IDR1 at runtime (the boot-1 dumps verified the
+/// niso1 pair; the PCIe stream's instance is DTB-resolved and may differ, so never assume the
+/// fixed XUSB constants): page size, global-half size, and CB count.
+fn mmu500_geometry(base: u64) -> Option<(u64, u64, u32)> {
+    let idr1 = rd(base, IDR1);
+    if smmu_poison(idr1) {
+        return None;
+    }
+    let pagesize: u64 = if idr1 & (1 << 31) != 0 { 0x10000 } else { 0x1000 };
+    let numpage: u64 = 1u64 << (((idr1 >> 28) & 0b111) + 1);
+    let numcb = idr1 & 0xff;
+    if numcb == 0 {
+        return None;
+    }
+    Some((pagesize, numpage * pagesize, numcb))
+}
+
+/// NET-4w step 2 verdict — the brief's one-liner, per instance: how is the PCIe stream routed
+/// RIGHT NOW, and how many live (valid) stream mappings does the instance carry? Read-only.
+pub fn net4w_verdict(bases: &[u64], sid: u32) {
+    for (i, &base) in bases.iter().enumerate() {
+        let scr0 = rd(base, SCR0);
+        if smmu_poison(scr0) {
+            serial_println!(":: tegra: [net4w] verdict inst{}: POISON (not answering) ::", i);
+            continue;
+        }
+        if scr0 & 1 == 1 {
+            serial_println!(":: tegra: [net4w] verdict inst{}: bypass (CLIENTPD=1, SMMU globally off) ::", i);
+            continue;
+        }
+        let n = (rd(base, IDR0) & 0xff).min(MAX_SMRG);
+        let mut live = 0u32;
+        let mut route = "unmatched";
+        for s in 0..n {
+            let smr = rd(base, SMR_BASE + 4 * s as u64);
+            if smr & (1 << 31) == 0 {
+                continue;
+            }
+            live += 1;
+            let (id, mask) = (smr & 0x7fff, (smr >> 16) & 0x7fff);
+            if (sid ^ id) & !mask & 0x7fff == 0 {
+                route = match (rd(base, S2CR_BASE + 4 * s as u64) >> 16) & 0b11 {
+                    0 => "translate",
+                    1 => "bypass",
+                    _ => "fault",
+                };
+            }
+        }
+        serial_println!(
+            ":: tegra: [net4w] verdict inst{}: translate-mode with {} live mappings; stream {:#x} routes {} (USFCFG={}) ::",
+            i, live, sid, route, (scr0 >> 10) & 1
+        );
+    }
+}
+
+/// NET-4w fix (option a): route the PCIe stream through a stage-1 IDENTITY translation context on
+/// every named instance. Per instance: derive geometry from IDR1; find the SMR matching the
+/// stream (or claim a free one); pick the highest context bank no valid stream currently routes
+/// to; program CBA2R(VA64) → CBAR(stage-1) → TCR2/TTBR0/TCR/MAIR0 → clear our CB's FSR → SCTLR.M;
+/// TLB-invalidate + sync; only then flip S2CR to translate/cbndx. Every write witnessed by
+/// readback; ANY mismatch or geometry surprise fails closed with the stream's prior route (the
+/// NET-4i bypass) untouched. Returns instances armed.
+pub fn net4w_translate(bases: &[u64], sid: u32) -> usize {
+    // The walker reads the table through the coherent fabric; make the static table visible to
+    // PoC before any instance can walk it.
+    let tbl = &JB3_IDMAP as *const _ as u64;
+    crate::arch::aarch64::cache::clean_range(tbl as usize, 4096);
+    serial_println!(
+        ":: tegra: [net4w] FIX — arming stage-1 IDENTITY translate for PCIe stream {:#x} across {} instance(s) (table @{:#x}) ::",
+        sid, bases.len(), tbl
+    );
+    let mut armed = 0usize;
+    'inst: for (i, &base) in bases.iter().enumerate() {
+        let scr0 = rd(base, SCR0);
+        if smmu_poison(scr0) {
+            serial_println!(":: tegra: [net4w] FIX — inst{}: sCR0 POISON — FAIL-CLOSED ::", i);
+            continue;
+        }
+        if scr0 & 1 == 1 {
+            serial_println!(
+                ":: tegra: [net4w] FIX — inst{}: CLIENTPD=1 (SMMU globally off) — no context to arm; leaving as-is ::",
+                i
+            );
+            continue;
+        }
+        let Some((pagesize, global_half, numcb)) = mmu500_geometry(base) else {
+            serial_println!(":: tegra: [net4w] FIX — inst{}: IDR1 unreadable/degenerate — FAIL-CLOSED ::", i);
+            continue;
+        };
+        let n = (rd(base, IDR0) & 0xff).min(MAX_SMRG);
+        // Which CBs do live streams route to (type=translate only)? Ours must collide with none.
+        let mut cb_used = [false; 256];
+        let mut our_smr: Option<u32> = None;
+        let mut free_smr: Option<u32> = None;
+        for s in 0..n {
+            let smr = rd(base, SMR_BASE + 4 * s as u64);
+            if smr & (1 << 31) == 0 {
+                if free_smr.is_none() {
+                    free_smr = Some(s);
+                }
+                continue;
+            }
+            let s2cr = rd(base, S2CR_BASE + 4 * s as u64);
+            if (s2cr >> 16) & 0b11 == 0 {
+                cb_used[(s2cr & 0xff) as usize] = true;
+            }
+            let (id, mask) = (smr & 0x7fff, (smr >> 16) & 0x7fff);
+            if (sid ^ id) & !mask & 0x7fff == 0 && our_smr.is_none() {
+                our_smr = Some(s);
+            }
+        }
+        let Some(cbndx) = (0..numcb.min(256)).rev().find(|&c| !cb_used[c as usize]) else {
+            serial_println!(
+                ":: tegra: [net4w] FIX — inst{}: all {} context banks routed-to — FAIL-CLOSED ::",
+                i, numcb
+            );
+            continue;
+        };
+        let gr1 = base + pagesize;
+        let cb = base + global_half + cbndx as u64 * pagesize;
+        serial_println!(
+            ":: tegra: [net4w] FIX — inst{}: geometry page={:#x} global={:#x} numcb={} -> CB{} @+{:#x}, SMR slot {} ::",
+            i, pagesize, global_half, numcb, cbndx,
+            global_half + cbndx as u64 * pagesize,
+            our_smr.map(|s| s as i64).unwrap_or(free_smr.map(|s| s as i64).unwrap_or(-1))
+        );
+        // Program the context BEFORE anything can route to it.
+        let ok = wrw("CBA2R", i, gr1, 0x800 + 4 * cbndx as u64, 1) // VA64
+            && wrw("CBAR", i, gr1, 4 * cbndx as u64, 0b01 << 16) // stage-1, stage-2 bypass
+            && wrw("CB.TCR2", i, cb, 0x10, CB_TCR2_S1)
+            && wrw("CB.TTBR0_LO", i, cb, 0x20, tbl as u32)
+            && wrw("CB.TTBR0_HI", i, cb, 0x24, (tbl >> 32) as u32)
+            && wrw("CB.TCR", i, cb, 0x30, CB_TCR_S1)
+            && wrw("CB.MAIR0", i, cb, 0x38, CB_MAIR0_S1);
+        if !ok {
+            continue;
+        }
+        // Our bank's fault latch starts clean (W1C; we own this CB now) — then enable the MMU.
+        wr(cb, 0x58, 0xffff_ffff);
+        if !wrw("CB.SCTLR", i, cb, 0x0, CB_SCTLR_S1) {
+            continue;
+        }
+        // Stale-TLB hygiene before routing: invalidate all NS-non-hyp entries and sync (bounded).
+        wr(base, TLBIALLNSNH, 0);
+        wr(base, STLBGSYNC, 0);
+        let mut spins = 0u32;
+        while rd(base, STLBGSTATUS) & 1 != 0 {
+            spins += 1;
+            if spins > 1_000_000 {
+                serial_println!(
+                    ":: tegra: [net4w] FIX — inst{}: sTLBGSYNC never drained — FAIL-CLOSED (S2CR untouched) ::",
+                    i
+                );
+                continue 'inst;
+            }
+        }
+        // Route the stream: flip (or place) its S2CR to translate-through-our-bank, LAST.
+        let s2cr_val = cbndx; // TYPE[17:16]=0b00 translate, CBNDX[7:0]
+        match (our_smr, free_smr) {
+            (Some(s), _) => {
+                if !wrw("S2CR(translate)", i, base, S2CR_BASE + 4 * s as u64, s2cr_val) {
+                    continue;
+                }
+            }
+            (None, Some(s)) => {
+                // S2CR first, SMR VALID second — no transient match into a stale route.
+                if !wrw("S2CR(translate)", i, base, S2CR_BASE + 4 * s as u64, s2cr_val)
+                    || !wrw("SMR(valid)", i, base, SMR_BASE + 4 * s as u64, (1u32 << 31) | (sid & 0x7fff))
+                {
+                    continue;
+                }
+            }
+            (None, None) => {
+                serial_println!(
+                    ":: tegra: [net4w] FIX — inst{}: no matching and no free SMR — FAIL-CLOSED ::",
+                    i
+                );
+                continue;
+            }
+        }
+        serial_println!(
+            ":: tegra: [net4w] FIX — inst{} ARMED: stream {:#x} -> CB{} stage-1 identity (TTBR0={:#x}) ::",
+            i, sid, cbndx, tbl
+        );
+        armed += 1;
+    }
+    serial_println!(
+        ":: tegra: [net4w] FIX — done: {} instance(s) translating identity ::",
+        armed
+    );
+    armed
+}
+
 fn jb3_fault_line(i: usize, base: u64, tag: &str) {
     let gfsr = rd(base, SGFSR);
     let far_lo = rd(base, SGFAR_LO);
