@@ -242,10 +242,12 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
     #[cfg(all(target_arch = "x86_64", any(feature = "nvidia-kepler", feature = "intel-ivb")))]
     {
         let gpus = crate::drivers::gpu::detect::detect_gpus();
+        let mut kepler_found = false;
         for gpu in &gpus {
             match gpu.gpu_type {
                 #[cfg(feature = "nvidia-kepler")]
                 crate::drivers::gpu::detect::GpuType::NvidiaKepler => {
+                    kepler_found = true;
                     crate::drivers::gpu::kepler::init(gpu);
                 }
                 #[cfg(feature = "intel-ivb")]
@@ -254,6 +256,10 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
                 }
                 _ => {}
             }
+        }
+        #[cfg(feature = "nvidia-kepler")]
+        if !kepler_found {
+            serial_println!(":: kepler: no-device ::");
         }
     }
 

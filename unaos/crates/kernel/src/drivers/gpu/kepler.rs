@@ -53,19 +53,39 @@ pub fn init(gpu: &GpuInfo) {
         }
 
         let bar1_orig_lo = crate::arch::pci::read_config_32(gpu.bus as u8, gpu.slot, gpu.func, 0x14);
-        let bar1_orig_hi = crate::arch::pci::read_config_32(gpu.bus as u8, gpu.slot, gpu.func, 0x18);
-        bar1_base = (bar1_orig_lo & 0xFFFFFFF0) as usize | ((bar1_orig_hi as usize) << 32);
-
-        crate::arch::pci::write_config_32(gpu.bus as u8, gpu.slot, gpu.func, 0x14, 0xFFFFFFFF);
-        crate::arch::pci::write_config_32(gpu.bus as u8, gpu.slot, gpu.func, 0x18, 0xFFFFFFFF);
-        let bar1_val_lo = crate::arch::pci::read_config_32(gpu.bus as u8, gpu.slot, gpu.func, 0x14);
-        let bar1_val_hi = crate::arch::pci::read_config_32(gpu.bus as u8, gpu.slot, gpu.func, 0x18);
-        crate::arch::pci::write_config_32(gpu.bus as u8, gpu.slot, gpu.func, 0x14, bar1_orig_lo);
-        crate::arch::pci::write_config_32(gpu.bus as u8, gpu.slot, gpu.func, 0x18, bar1_orig_hi);
         
-        let bar1_val = (bar1_val_lo & 0xFFFFFFF0) as u64 | ((bar1_val_hi as u64) << 32);
-        if bar1_val != 0 {
-            bar1_size = (!bar1_val).wrapping_add(1) as usize;
+        if (bar1_orig_lo & 0x1) != 0 {
+            serial_println!("[NVIDIA] Error: BAR1 is I/O space. Probe aborted.");
+            serial_println!(":: kepler: no-device ::");
+            return;
+        }
+
+        let is_64bit = ((bar1_orig_lo >> 1) & 0x3) == 0x2;
+        
+        if is_64bit {
+            let bar1_orig_hi = crate::arch::pci::read_config_32(gpu.bus as u8, gpu.slot, gpu.func, 0x18);
+            bar1_base = (bar1_orig_lo & 0xFFFFFFF0) as usize | ((bar1_orig_hi as usize) << 32);
+
+            crate::arch::pci::write_config_32(gpu.bus as u8, gpu.slot, gpu.func, 0x14, 0xFFFFFFFF);
+            crate::arch::pci::write_config_32(gpu.bus as u8, gpu.slot, gpu.func, 0x18, 0xFFFFFFFF);
+            let bar1_val_lo = crate::arch::pci::read_config_32(gpu.bus as u8, gpu.slot, gpu.func, 0x14);
+            let bar1_val_hi = crate::arch::pci::read_config_32(gpu.bus as u8, gpu.slot, gpu.func, 0x18);
+            crate::arch::pci::write_config_32(gpu.bus as u8, gpu.slot, gpu.func, 0x14, bar1_orig_lo);
+            crate::arch::pci::write_config_32(gpu.bus as u8, gpu.slot, gpu.func, 0x18, bar1_orig_hi);
+            
+            let bar1_val = (bar1_val_lo & 0xFFFFFFF0) as u64 | ((bar1_val_hi as u64) << 32);
+            if bar1_val != 0 {
+                bar1_size = (!bar1_val).wrapping_add(1) as usize;
+            }
+        } else {
+            bar1_base = (bar1_orig_lo & 0xFFFFFFF0) as usize;
+            crate::arch::pci::write_config_32(gpu.bus as u8, gpu.slot, gpu.func, 0x14, 0xFFFFFFFF);
+            let bar1_val_lo = crate::arch::pci::read_config_32(gpu.bus as u8, gpu.slot, gpu.func, 0x14);
+            crate::arch::pci::write_config_32(gpu.bus as u8, gpu.slot, gpu.func, 0x14, bar1_orig_lo);
+            
+            if bar1_val_lo != 0 && bar1_val_lo != 0xFFFFFFFF {
+                bar1_size = (!(bar1_val_lo & 0xFFFFFFF0)).wrapping_add(1) as usize;
+            }
         }
 
         crate::arch::pci::write_config_16(gpu.bus as u8, gpu.slot, gpu.func, 0x04, cmd);
@@ -73,6 +93,7 @@ pub fn init(gpu: &GpuInfo) {
 
     if bar0_size == 0 || bar1_size == 0 {
         serial_println!("[NVIDIA] Error: Invalid BAR sizes (BAR0: {} bytes, BAR1: {} bytes). Probe aborted.", bar0_size, bar1_size);
+        serial_println!(":: kepler: no-device ::");
         return;
     }
 
@@ -82,6 +103,7 @@ pub fn init(gpu: &GpuInfo) {
         crate::arch::memory::map_mmio_window(bar1_base as u64, bar1_size);
         if crate::arch::memory::translate(bar0 as u64).is_none() {
             serial_println!("[NVIDIA] Error: BAR0 physical address (0x{:X}) is not mapped in the identity map. Probe aborted.", bar0);
+            serial_println!(":: kepler: no-device ::");
             return;
         }
     }
@@ -89,6 +111,7 @@ pub fn init(gpu: &GpuInfo) {
     #[cfg(target_arch = "aarch64")]
     {
         serial_println!("[NVIDIA] Error: BAR0 mapping unimplemented on aarch64. Probe aborted.");
+        serial_println!(":: kepler: no-device ::");
         return;
     }
 
@@ -120,6 +143,7 @@ pub fn init(gpu: &GpuInfo) {
         let vram_size = mmio_read(bar0, regs::NV_PFB_RAM_AMOUNT) as usize;
         if vram_size < 16 * 1024 * 1024 || vram_size > 32usize * 1024 * 1024 * 1024 {
             serial_println!("[NVIDIA] Error: Absurd VRAM size reported ({} bytes). Probe aborted.", vram_size);
+            serial_println!(":: kepler: no-device ::");
             return;
         }
         serial_println!("[NVIDIA] PFB Reported VRAM Size: {} MB", vram_size >> 20);

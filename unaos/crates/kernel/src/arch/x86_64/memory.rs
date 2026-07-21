@@ -748,7 +748,7 @@ pub fn map_mmio_window(pa: u64, size: usize) {
                 let pml4e = cr3_table().add(pml4_index(va));
                 if *pml4e & PTE_PRESENT == 0 {
                     let frame = alloc_page_frame();
-                    *pml4e = (frame & PTE_ADDR) | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
+                    *pml4e = (frame & PTE_ADDR) | PTE_PRESENT | PTE_WRITABLE;
                 }
                 
                 let pdpt = (*pml4e & PTE_ADDR) as *mut u64;
@@ -760,7 +760,7 @@ pub fn map_mmio_window(pa: u64, size: usize) {
                 }
                 if *pdpte & PTE_PRESENT == 0 {
                     let frame = alloc_page_frame();
-                    *pdpte = (frame & PTE_ADDR) | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
+                    *pdpte = (frame & PTE_ADDR) | PTE_PRESENT | PTE_WRITABLE;
                 }
                 
                 let pd = (*pdpte & PTE_ADDR) as *mut u64;
@@ -772,7 +772,7 @@ pub fn map_mmio_window(pa: u64, size: usize) {
                 }
                 if *pde & PTE_PRESENT == 0 {
                     let frame = alloc_page_frame();
-                    *pde = (frame & PTE_ADDR) | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
+                    *pde = (frame & PTE_ADDR) | PTE_PRESENT | PTE_WRITABLE;
                 }
                 
                 let pt = (*pde & PTE_ADDR) as *mut u64;
