@@ -3,9 +3,7 @@ use reqwest::Client;
 
 pub async fn fetch_document(url: &str) -> Result<String> {
     if url.starts_with("file://") {
-        let path = url.trim_start_matches("file://");
-        let content = std::fs::read_to_string(path).context("Failed to read local file")?;
-        return Ok(content);
+        anyhow::bail!("file:// fetches are disabled for security reasons.");
     }
 
     let client = Client::builder()
@@ -18,6 +16,15 @@ pub async fn fetch_document(url: &str) -> Result<String> {
         anyhow::bail!("HTTP Error: {}", response.status());
     }
     
-    let text = response.text().await.context("Failed to read response body")?;
+    if response.content_length().unwrap_or(0) > 10 * 1024 * 1024 {
+        anyhow::bail!("Response exceeds size limit");
+    }
+    
+    let bytes = response.bytes().await.context("Failed to read body")?;
+    if bytes.len() > 10 * 1024 * 1024 {
+        anyhow::bail!("Response body exceeds size limit");
+    }
+    
+    let text = String::from_utf8(bytes.to_vec()).context("Invalid UTF-8")?;
     Ok(text)
 }

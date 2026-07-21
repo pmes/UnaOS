@@ -95,10 +95,16 @@ def main():
     # Check for orphaned files
     # We ignore standard files like MANIFEST itself, and directories
     actual_files = set()
-    for item in os.listdir(base_dir):
-        if os.path.isfile(os.path.join(base_dir, item)):
+    for root, dirs, files in os.walk(base_dir):
+        # Prevent traversing hidden directories
+        dirs[:] = [d for d in dirs if not d.startswith('.')]
+        for item in files:
             if item not in ["MANIFEST", "MANIFEST.bak"] and not item.startswith("."):
-                actual_files.add(item)
+                rel_dir = os.path.relpath(root, base_dir)
+                if rel_dir == '.':
+                    actual_files.add(item)
+                else:
+                    actual_files.add(os.path.join(rel_dir, item))
                 
     orphans = actual_files - manifest_files
     for orphan in orphans:

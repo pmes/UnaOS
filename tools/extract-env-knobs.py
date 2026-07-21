@@ -32,7 +32,7 @@ def main():
             with open(full_path, 'r', errors='ignore') as f:
                 for line_num, line in enumerate(f, 1):
                     matches = knob_regex.findall(line)
-                    for match in matches:
+                    for match in set(matches):
                         inventory[match].append((filepath, line_num, line.strip()))
         except Exception:
             pass

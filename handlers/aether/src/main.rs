@@ -14,7 +14,7 @@ pub mod workers;
 pub mod event_loop;
 pub mod fonts;
 pub mod api;
-
+pub mod yt;
 use clap::{Parser, Subcommand};
 use anyhow::Result;
 

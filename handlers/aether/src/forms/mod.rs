@@ -43,7 +43,9 @@ impl Form {
             if i > 0 {
                 query_string.push('&');
             }
-            query_string.push_str(&format!("{}={}", input.name, input.value));
+            let enc_name: String = url::form_urlencoded::byte_serialize(input.name.as_bytes()).collect();
+            let enc_val: String = url::form_urlencoded::byte_serialize(input.value.as_bytes()).collect();
+            query_string.push_str(&format!("{}={}", enc_name, enc_val));
         }
 
         match self.method {

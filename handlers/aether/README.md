@@ -17,13 +17,10 @@ layer of the modern web.
 
 ## Scope
 
-- **Read-only rendering.** Aether parses and lays out HTML, Markdown, and PDF.
-  It supports the subset of CSS needed for clean document layout and does not
-  execute page JavaScript (no JIT). Any scripting, if added later, is expected
-  to run sandboxed and only on explicit user authorization.
+- **Web browser.** Aether parses and lays out HTML, CSS, and executes JavaScript. Per the 2026-07-20 Peter ruling, Aether's read-only/no-JS constraint is lifted. It is now a full JS-enabled web browser.
+- **Delegated playback.** Aether resolves media (like YouTube) but delegates A/V playback to Stria over the Bandy message bus (`SMessage::PlayMedia`). Aether does not embed a video decoder.
 - **Reader-first presentation.** Content is rendered as hypertext: body text,
-  headings, links, and images, with advertising and non-semantic layout
-  elements stripped.
+  headings, links, and images.
 - **Unified local + remote search.** Aether is intended to treat local
   documentation (the `principia` system manuals, `gneiss_pal` API docs, man
   pages) and the remote web as one searchable corpus, resolving local sources

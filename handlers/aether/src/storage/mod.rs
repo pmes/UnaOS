@@ -45,12 +45,15 @@ impl Class for LocalStorage {
     const LENGTH: usize = 0;
 
     fn data_constructor(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<Self> {
-        let path = if let Some(arg) = args.get(0) {
+        let origin = if let Some(arg) = args.get(0) {
             arg.to_string(context)?.to_std_string_escaped()
         } else {
-            "local_storage.json".to_string()
+            "default_origin".to_string()
         };
-        Ok(LocalStorage::new(PathBuf::from(path)))
+        let sanitized = origin.replace(|c: char| !c.is_alphanumeric(), "_");
+        let dir = PathBuf::from("/tmp/aether_storage");
+        let _ = std::fs::create_dir_all(&dir);
+        Ok(LocalStorage::new(dir.join(format!("{}.json", sanitized))))
     }
 
     fn init(class: &mut ClassBuilder<'_>) -> JsResult<()> {

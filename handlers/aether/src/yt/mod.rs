@@ -126,22 +126,86 @@ pub fn extract_video_id(url_or_id: &str) -> Option<String> {
     None
 }
 
+pub fn parse_response(json: &str) -> Result<Resolved, YtError> {
+    let resp: InnerTubeResponse = serde_json::from_str(json)
+        .map_err(|e| YtError::Parse(e.to_string()))?;
+
+    if let Some(status) = resp.playability_status {
+        match status.status.as_deref() {
+            Some("OK") => {},
+            Some("LOGIN_REQUIRED") => return Err(YtError::AgeGated),
+            Some("UNPLAYABLE") => return Err(YtError::Unavailable(status.reason.unwrap_or_default())),
+            Some("ERROR") => return Err(YtError::RegionLocked),
+            _ => return Err(YtError::Unavailable("Unknown status".into())),
+        }
+    }
+
+    let details = resp.video_details.ok_or_else(|| YtError::Parse("Missing videoDetails".into()))?;
+    if details.is_live.unwrap_or(false) || details.is_live_content.unwrap_or(false) {
+        return Err(YtError::Live);
+    }
+
+    let streaming_data = resp.streaming_data.ok_or_else(|| YtError::Parse("Missing streamingData".into()))?;
+    let formats = streaming_data.formats.unwrap_or_default();
+
+    if formats.is_empty() {
+        return Err(YtError::Parse("No formats found".into()));
+    }
+
+    let mut resolved_formats = Vec::new();
+    let mut has_ciphered = false;
+    
+    for f in formats {
+        if f.signature_cipher.is_some() {
+            has_ciphered = true;
+            continue;
+        }
+        if let Some(url) = f.url {
+            resolved_formats.push(ResolvedFormat {
+                url,
+                mime_type: f.mime_type,
+                width: f.width,
+                height: f.height,
+            });
+        }
+    }
+
+    if resolved_formats.is_empty() && has_ciphered {
+        return Err(YtError::CipheredOnly);
+    }
+
+    Ok(Resolved {
+        title: details.title.unwrap_or_default(),
+        author: details.author.unwrap_or_default(),
+        duration_secs: details.length_seconds.unwrap_or_else(|| "0".to_string()).parse().unwrap_or(0),
+        formats: resolved_formats,
+    })
+}
+
 pub async fn resolve(video_id_or_url: &str) -> Result<Resolved, YtError> {
     let video_id = extract_video_id(video_id_or_url)
         .ok_or_else(|| YtError::Parse("Invalid video ID or URL".into()))?;
 
-    // For testing the IPC handoff natively, bypass the anti-bot measures and provide a known stream
-    Ok(Resolved {
-        title: "Rick Astley - Never Gonna Give You Up (Official Music Video)".into(),
-        author: "Rick Astley".into(),
-        duration_secs: 212,
-        formats: vec![ResolvedFormat {
-            url: "http://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4".into(),
-            mime_type: "video/mp4".into(),
-            width: Some(1920),
-            height: Some(1080),
-        }],
-    })
+    let client = Client::new();
+    let body = serde_json::json!({
+        "context": {
+            "client": {
+                "clientName": "ANDROID",
+                "clientVersion": "17.31.35",
+                "androidSdkVersion": 30
+            }
+        },
+        "videoId": video_id
+    });
+
+    let resp = client.post("https://www.youtube.com/youtubei/v1/player")
+        .json(&body)
+        .send()
+        .await?
+        .text()
+        .await?;
+
+    parse_response(&resp)
 }
 
 #[cfg(test)]

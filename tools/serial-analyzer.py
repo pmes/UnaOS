@@ -38,7 +38,7 @@ def parse_log(filepath):
         if current_boot:
             current_boot['lines'].append(line)
             # Extract witness lines
-            if '::' in line and 'witness' in line:
+            if re.search(r'::.*witness.*::', line):
                 current_boot['witnesses'].append(line)
     
     # Classify each boot

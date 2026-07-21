@@ -115,6 +115,7 @@ pub enum SMessage {
     // --- AETHER (The Browser) ---
     OpenDocument { url: String },
     SurfaceBlit { url: String, width: u32, height: u32, pixels: Vec<u8> },
+    PlayMedia { url: String, title: String, mime: String },
 
     // --- EDITOR (The Code Pane) ---
     /// Load a document into the active editor pane. Fired when a file is

@@ -37,8 +37,19 @@ pub fn init(gpu: &GpuInfo) {
     let bar0 = gpu.bar0_phys as usize;
 
     // We assume the BAR0 physical address is identity mapped (PA == VA)
-    // as is standard in UnaOS for x86_64. We also assume it's properly cached
-    // as MMIO (WC or UC). For now, we can just read/write volatile.
+    // as is standard in UnaOS for x86_64. We must verify this to avoid page faults.
+    #[cfg(target_arch = "x86_64")]
+    if crate::arch::memory::translate(bar0 as u64).is_none() {
+        serial_println!("[NVIDIA] Error: BAR0 physical address (0x{:X}) is not mapped in the identity map. Probe aborted.", bar0);
+        return;
+    }
+    
+    #[cfg(target_arch = "aarch64")]
+    {
+        serial_println!("[NVIDIA] Error: BAR0 mapping unimplemented on aarch64. Probe aborted.");
+        return;
+    }
+
 
     unsafe {
         // 2. Read NV_PMC_BOOT_0 to identify chip
