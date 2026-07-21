@@ -67,8 +67,9 @@ static mut L1_EL1: PageTable = PageTable([0; 512]);
 // heap clear of them and the framebuffer carveout is never punched, see below.)
 //
 // XCARVE-6 GENERALIZES XCARVE-3 from one window to a SET. Boot-25 died on the boot-13 "0xbe" family
-// (0xbe0d6c60/70), and a rerun under vug/simmer load added 0xbf77a500 — three points spanning
-// 0xbe000000..0xc0000000, the classic VPR-shaped 32 MiB carveout at that base. So a single quirk is no
+// (0xbe0d6c60/70), and a rerun under vug/simmer load added 0xbf77a500 — points spanning
+// 0xbe000000..0xc0000000 (XCARVE-8/boot-27 later extended the family past 0xc0000000 — see
+// `XCARVE_BE_SIZE`). So a single quirk is no
 // longer enough: the map must honor EVERY protected window. The set is (1) the two undeclared QUIRK
 // windows the firmware hides inside Conventional/Usable DRAM (0x26b9 and 0xbe), and (2) the STRUCTURAL
 // generalization — every DTB `/reserved-memory` carveout that falls inside a RAM GiB — so any window the
@@ -91,14 +92,23 @@ pub const MAX_HOLES: usize = 32;
 #[cfg(feature = "tegra")]
 const MAX_SPLIT_GIB: usize = 8;
 
-/// XCARVE-6: the boot-13/boot-25 "0xbe" protected window, undeclared by the DTB (like 0x26b9) → QUIRK,
-/// bounded to the full aligned **32 MiB** `[0xbe000000, 0xc0000000)` — the top of GiB 2, ending exactly at
-/// the GiB 2/3 boundary (no straddle). The three observed face-value ADDRs (0xbe000f80 boot-13,
-/// 0xbe0d6c60/70 boot-25, 0xbf77a500 boot-25-rerun) span ~30 MiB of it, the VPR-shaped 32 MiB carveout.
+/// XCARVE-6/8: the boot-13/boot-25/boot-27 "0xbe" protected window, undeclared by the DTB (like 0x26b9)
+/// → QUIRK. XCARVE-6 guessed the classic VPR-shaped **32 MiB** `[0xbe000000, 0xc0000000)`; boot-27
+/// REFUTED that guess (SNOC RAS Carveout, ADDR 0x80000000c0883000 → PA 0xc0883000, ~8.5 MiB ABOVE the
+/// 32 MiB top, under the same vug/simmer eviction load). Observed family: 0xbe000f80 (boot-13),
+/// 0xbe0d6c60/70 (boot-25), 0xbf77a500 (boot-25-rerun), 0xc0883000 (boot-27) — span ≈ 40.5 MiB. No
+/// honest extent is readable: the DTB/UEFI sets stay silent (XCARVE-3/6 exhausted them — that IS why
+/// this is a QUIRK), and probing the MC GSC carveout config registers from NS-EL2 is the JB1d class
+/// (EL3-gated IMPDEF access crashed BL31 on metal) and unverifiable in QEMU. So XCARVE-8 widens the
+/// bound: **96 MiB** `[0xbe000000, 0xc4000000)` — a defensible carveout-granule-aligned (64 MiB-aligned
+/// top) envelope leaving ~55 MiB of headroom over the highest observed hit. This extent is a bounded
+/// GUESS, said so in the banner; a hit above 0xc4000000 refutes it in turn. The window now straddles
+/// the GiB 2/3 boundary — `install_carveout_holes` splits every GiB the span touches (the XCARVE-8
+/// straddle fix), not just the base GiB.
 #[cfg(feature = "tegra")]
 const XCARVE_BE_BASE: u64 = 0xbe00_0000;
 #[cfg(feature = "tegra")]
-const XCARVE_BE_SIZE: u64 = 0x0200_0000; // 32 MiB, ends at 0xc000_0000
+const XCARVE_BE_SIZE: u64 = 0x0600_0000; // 96 MiB, ends at 0xc400_0000 — a GUESS (see doc above)
 
 #[cfg(feature = "tegra")]
 static mut L2_POOL: [PageTable; MAX_SPLIT_GIB] = [const { PageTable([0; 512]) }; MAX_SPLIT_GIB];
@@ -163,7 +173,7 @@ pub fn carveout_holes(out: &mut [(u64, u64, u8)]) -> usize {
 ///
 /// Slot 0 is always the PRIMARY 0x26b9 window (DTB-covering node → source 1, else a bounded 2 MiB QUIRK →
 /// source 2), so `carveout_hole()`/`HOLE_*` stay the 0x26b9 extent every existing consumer expects. Slot 1
-/// is the XCARVE-6 0xbe window (DTB-covering node → source 1, else the full 32 MiB QUIRK). Then the
+/// is the XCARVE-6/8 0xbe window (DTB-covering node → source 1, else the full 96 MiB QUIRK — a bounded GUESS). Then the
 /// STRUCTURAL set: every DTB `/reserved-memory` carveout that falls inside a RAM GiB (deduped against the
 /// quirks). The framebuffer carveout is NEVER added — it is CPU-written scanout, not a no-touch firewall
 /// window; unmapping it would break the panel — so any DTB node intersecting `[fb, fb+fb_size)` is skipped.
@@ -219,7 +229,7 @@ fn resolve_carveout_holes(
     out[n] = (pb, ps, psrc);
     n += 1;
 
-    // Slot 1: XCARVE-6 0xbe window (32 MiB QUIRK fallback).
+    // Slot 1: XCARVE-6/8 0xbe window (96 MiB QUIRK fallback — bounded GUESS extent, see XCARVE_BE_SIZE).
     let (bb, bs, bsrc) = resolve_quirk(XCARVE_BE_BASE, XCARVE_BE_BASE, XCARVE_BE_SIZE);
     if n < cap {
         out[n] = (bb, bs, bsrc);
@@ -251,8 +261,11 @@ fn resolve_carveout_holes(
 /// (unmapped), then repoint that GiB's L1 entry at the L2 table. Generalizes the XCARVE-3 single-hole
 /// split: windows sharing a GiB share that GiB's L2 table (one `l2_pool` slot per distinct split GiB).
 /// Only splits a GiB the base map holds as Normal-WB RAM (a Device/invalid GiB has nothing to protect).
-/// A window that spilled past its GiB's top is clipped to it (its remainder is the next GiB's concern —
-/// the 32 MiB 0xbe QUIRK ends exactly at the GiB 2/3 boundary, so nothing straddles in practice). Returns
+/// XCARVE-8: a window is split in EVERY GiB its span `[hb, hb+hs)` touches, not just the GiB of its base —
+/// the widened 96 MiB 0xbe QUIRK straddles the GiB 2/3 boundary, so base-GiB-only collection (the
+/// XCARVE-6 shape) would leave the `[0xc0000000, 0xc4000000)` remainder whole+cacheable, exactly the
+/// boot-27 defect. Each GiB's L2 punches only the intersecting blocks (the punch loop already
+/// intersects per-block, so the per-GiB clip is implicit). Returns
 /// `(l2_tables_used, gib_overflow)`: `gib_overflow` counts distinct split-needing GiBs beyond the pool —
 /// those are left whole+cacheable and MUST be witnessed (no-silent-drop). Pool slots are cleaned to PoC by
 /// the caller before the switch.
@@ -272,24 +285,29 @@ unsafe fn install_carveout_holes(
         if hs == 0 {
             continue;
         }
-        let gib = hb >> 30;
-        let gi = gib as usize;
-        if gi >= 512 {
-            continue;
+        // XCARVE-8 straddle fix: every GiB the window's span touches needs a split (the widened 0xbe
+        // QUIRK crosses the GiB 2/3 boundary); base-GiB-only collection left the spill-over cacheable.
+        let g_lo = hb >> 30;
+        let g_hi = (hb + hs - 1) >> 30;
+        for gib in g_lo..=g_hi {
+            let gi = gib as usize;
+            if gi >= 512 {
+                continue;
+            }
+            let cur = unsafe { l1.add(gi).read_volatile() };
+            if !is_ram_block(cur) {
+                continue; // not Normal-WB RAM — nothing to protect (already unmapped/Device)
+            }
+            if split_gib[..used].iter().any(|&g| g == gib) {
+                continue; // this GiB already has a pool slot
+            }
+            if used >= MAX_SPLIT_GIB {
+                overflow += 1;
+                continue;
+            }
+            split_gib[used] = gib;
+            used += 1;
         }
-        let cur = unsafe { l1.add(gi).read_volatile() };
-        if !is_ram_block(cur) {
-            continue; // not Normal-WB RAM — nothing to protect (already unmapped/Device)
-        }
-        if split_gib[..used].iter().any(|&g| g == gib) {
-            continue; // this GiB already has a pool slot
-        }
-        if used >= MAX_SPLIT_GIB {
-            overflow += 1;
-            continue;
-        }
-        split_gib[used] = gib;
-        used += 1;
     }
     // Build one L2 table per split GiB: a block is invalid iff it intersects ANY window (windows in other
     // GiBs never intersect this GiB's PA range, so only this GiB's windows punch it).

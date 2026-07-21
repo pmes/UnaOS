@@ -1221,7 +1221,9 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
             }
             let src = match hsrc {
                 1 => "DTB /reserved-memory",
-                2 => "QUIRK (DTB silent)",
+                // XCARVE-8: a QUIRK extent is a bounded GUESS (no readable register/DTB truth for the
+                // undeclared windows) — say so in the banner so a refuting hit reads as "widen the guess".
+                2 => "QUIRK (DTB silent; extent = bounded GUESS)",
                 _ => "unknown",
             };
             serial_println!(

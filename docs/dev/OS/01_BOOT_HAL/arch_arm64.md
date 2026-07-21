@@ -993,6 +993,39 @@ window; then `:: tegra: fb L2 repair — N block(s) re-mapped in GiB 9 [0x279e00
 `test_pattern` + fbcon scanout writes now **survive** (no `translation L2` abort at `FAR=0x279e00000`); then
 the NET-4s lease + SIMMER/vug survival oracles get their run.
 
+#### XCARVE-8 — boot-27: the 0xbe carveout extends past 0xc0000000; widen the QUIRK to 96 MiB + the straddle fix (**code fix, always-on; metal-owed**)
+
+Boot-27 was the longest run yet — XCARVE-7's fb repair held (scanout clean, JD2 shell on glass, 3008+
+SIMMER/vug frames with a live mouse) — and then the `0xbe` family came back **above** the window:
+SNOC RAS Uncorrectable (`Status 0xec00030d`, SERR = Illegal address, IERR = Carveout), ACI FillWrite,
+`ADDR 0x80000000c0883000` → PA `0xc0883000` — ~8.5 MiB past the XCARVE-6 window top `0xc0000000`. The
+observed family now spans `0xbe000f80` (boot-13), `0xbe0d6c60/70` (boot-25), `0xbf77a500` (boot-25-rerun),
+`0xc0883000` (boot-27) ≈ 40.5 MiB — the "classic VPR-shaped 32 MiB" guess is **refuted**.
+
+**Why the extent stays a guess (mechanism choice).** (a) A register probe was rejected: the MC GSC
+carveout config registers are the honest source, but reading firewalled MC/IMPDEF state from NS-EL2 is
+the proven JB1d/JX1 class on this firmware (EL3-gated access → BL31 crash/SError, box reboots), and no
+probe is verifiable in QEMU — a boot-risking read to size a window we can simply exclude is a bad trade.
+(b) The DTB/UEFI sets were exhausted by XCARVE-3/6: neither declares the `0xbe` window — that is *why*
+it is a QUIRK. So (c) the QUIRK is widened to a defensible envelope: **96 MiB `[0xbe000000, 0xc4000000)`**
+(64 MiB-aligned top, ~55 MiB headroom over the highest observed hit), and the banner now says the extent
+is a guess for every QUIRK window: `source: QUIRK (DTB silent; extent = bounded GUESS)`. A future hit at
+or above `0xc4000000` refutes this guess in turn — widen again or finally justify a probe arc.
+
+**The straddle fix (`install_carveout_holes`).** The widened window crosses the GiB 2/3 boundary, and the
+XCARVE-6 split-GiB collection keyed on each window's **base** GiB only — the `[0xc0000000, 0xc4000000)`
+remainder would have stayed a whole cacheable 1 GiB block, exactly the boot-27 defect reproduced by
+construction. The collector now splits **every GiB the span `[hb, hb+hs)` touches**; the per-block punch
+loop already intersects per-GiB, so the clip is implicit. GiB 3 now takes a third `L2_POOL` slot
+(GiB 2 + 3 + 9 of `MAX_SPLIT_GIB = 8`). XCARVE-5 slot-0 seeding, `MAX_CARVE 192`, and the XCARVE-7 fb
+repair are untouched; `quirk_hits_block` is extent-generic, so the repair-refusal belt covers the widened
+window automatically.
+
+**QEMU:** `virt` has no carveouts → empty set → byte-identical map, no banner line.
+**Expected boot-28 (metal, `UNAOS_TEGRA=1`):** the exclusion banner lists
+`window[1] [0xbe000000, 0xc4000000) 98304 KiB @ GiB 2 (source: QUIRK (DTB silent; extent = bounded GUESS))`;
+no SNOC RAS from the `0xbe000000..0xc4000000` family under SIMMER/vug load; fb repair line unchanged.
+
 ### JX1 result — XUSB first light (⛔ **the block is EL3-fatal to touch post-EBS; BPMP ungate required first**)
 
 The one-boot probe (a guarded read of the xHCI capability block @ `0x0361_0000`, the Linux DT
