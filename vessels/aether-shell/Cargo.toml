@@ -1,0 +1,18 @@
+[package]
+name = "aether-shell"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+
+[features]
+default = []
+gtk = ["dep:gtk4", "dep:glib"]
+qt = []
+
+[dependencies]
+aether = { path = "../../handlers/aether" }
+tokio = { version = "1", features = ["full"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+gtk4 = { version = "0.11.4", features = ["v4_14"], optional = true }
+glib = { version = "0.22", optional = true }

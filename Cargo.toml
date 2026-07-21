@@ -30,7 +30,8 @@ members = [
     "vessels/phonolite",
     "vessels/facet",
     "vessels/una",
-    "libs/lux"
+    "libs/lux",
+    "vessels/aether-shell"
 ]
 
 # 🦅 MACH'S BRIDGE:

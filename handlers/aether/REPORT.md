@@ -67,3 +67,23 @@ Implemented all milestones per the adversarial review criteria and PLAN-aether-b
 3. Media resolution defers entirely to Stria.
 4. Error coverage and bounds checking fulfilled honestly.
 5. All tests green.
+
+## Phase 4: Aether r2 (Milestones A2-0 and A2-1)
+**Architectural shift towards a native browser interface**
+
+**1. A2-0: Excise**
+- Deleted the `yt/` resolver module completely, shifting scope away from single-site media parsing.
+- Refactored `aether` crate into a hybrid library/binary:
+  - `src/lib.rs` exports the `AetherEngine` containing the DOM, Layout, and JS engine.
+  - Exposes `render_frame(&mut self, surface: &mut [u8], w: u32, h: u32)` for host shells to pump pixel updates.
+  - The legacy `ignite` bus handler is preserved in `src/main.rs` as a thin binary wrapper.
+- Fixed the hardcoded `/tmp/aether_storage` in `src/storage/mod.rs` to securely use the OS-specific application data directory via the `directories` crate.
+
+**2. A2-1: GTK Shell (`vessels/aether-shell`)**
+- Created the `aether-shell` crate featuring cargo feature gates (`gtk`, `qt`) for platform-specific builds.
+- Implemented `shell_gtk.rs` providing a live `gtk4::ApplicationWindow`, URL entry bar, and a `gtk4::DrawingArea`.
+- Integrated `AetherEngine` rendering into the GTK event loop, utilizing `glib::MainContext::spawn_local` and a Tokio runtime to correctly pump IO without blocking the UI thread.
+- Render surface paints successfully via Cairo `ImageSurface` wrapping the BGRA frame buffer.
+- Qt and macOS shells have been scaffolded as stubs for future milestones.
+
+**Oracle Verification**: `cargo check -p aether-shell --features gtk` passes successfully.

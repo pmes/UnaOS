@@ -51,7 +51,9 @@ impl Class for LocalStorage {
             "default_origin".to_string()
         };
         let sanitized = origin.replace(|c: char| !c.is_alphanumeric(), "_");
-        let dir = PathBuf::from("/tmp/aether_storage");
+        let dir = directories::ProjectDirs::from("", "UnaOS", "Aether")
+            .map(|p| p.data_dir().to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("/tmp/aether_storage"));
         let _ = std::fs::create_dir_all(&dir);
         Ok(LocalStorage::new(dir.join(format!("{}.json", sanitized))))
     }

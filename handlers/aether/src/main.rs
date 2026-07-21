@@ -14,13 +14,13 @@ pub mod workers;
 pub mod event_loop;
 pub mod fonts;
 pub mod api;
-pub mod yt;
 use clap::{Parser, Subcommand};
 use anyhow::Result;
+use aether::AetherEngine;
 
 #[derive(Parser)]
 #[command(name = "aether")]
-#[command(about = "Aether Web Browser")]
+#[command(about = "Aether Web Browser Engine Handler")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -28,11 +28,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Open a URL and dump the render to a PNG
+    /// Open a URL (Handler mode)
     Open {
         url: String,
-        #[arg(short, long)]
-        dump: Option<String>,
     },
 }
 
@@ -43,7 +41,7 @@ pub async fn ignite(synapse: Synapse) -> Result<()> {
     let mut rx = synapse.subscribe();
     println!("Aether ignited. Listening for OpenDocument messages...");
 
-        let mut active_doc: Option<(String, kuchiki::NodeRef, layout::LayoutTree, js::Engine)> = None;
+    let mut engine = AetherEngine::new();
 
     loop {
         tokio::select! {
@@ -51,70 +49,49 @@ pub async fn ignite(synapse: Synapse) -> Result<()> {
                 match msg {
                     SMessage::OpenDocument { url } => {
                         println!("Received OpenDocument for {}", url);
-                        
-                        println!("Fetching document...");
-                        let html = net::fetch_document(&url).await?;
-                        println!("Fetched {} bytes. Parsing HTML...", html.len());
-                        let document = dom::parse_html(&html);
-                        
-                        println!("Initializing JS Engine...");
-                        let mut js_engine = js::Engine::new(document.clone());
-                        
-                        if let Ok(scripts) = document.select("script") {
-                            for script_node in scripts {
-                                let text = script_node.text_contents();
-                                if !text.trim().is_empty() {
-                                    println!("Executing script...");
-                                    if let Err(e) = js_engine.execute(&text) {
-                                        eprintln!("JS Execution error: {}", e);
-                                    }
-                                }
-                            }
+                        if let Err(e) = engine.load_url(&url).await {
+                            eprintln!("Failed to load url {}: {}", url, e);
                         }
-                        
-                        println!("Parsed HTML. Computing layout...");
-                        let mut layout_tree = layout::compute_layout(&document);
-                        
-                        if let Ok(styles) = document.select("style") {
-                            for style_node in styles {
-                                let text = style_node.text_contents();
-                                css::apply_css(&mut layout_tree, &text);
-                            }
-                        }
-
-                        println!("Layout computed. Rendering...");
-                        
-                        let img = render::render_to_image(&layout_tree, 800, 600);
-                        println!("Render complete. Blitting...");
-                        let blit = render::create_surface_blit(&url, img);
-                        
-                        // Publish back to compositor
-                        synapse.fire(blit);
-                        
-                        active_doc = Some((url, document, layout_tree, js_engine));
                     }
                     _ => {}
                 }
             }
-            _ = tokio::time::sleep(tokio::time::Duration::from_millis(16)), if active_doc.is_some() => {
-                if let Some((url, document, layout_tree, js_engine)) = &mut active_doc {
-                    let _ = js_engine.context.run_jobs();
-                    
-                    // Trigger a re-render by marking dirty for now
-                    layout_tree.mark_dirty();
-                    
-                    if layout_tree.dirty {
-                        layout_tree.recompute(document);
-                        let img = render::render_to_image(layout_tree, 800, 600);
-                        let blit = render::create_surface_blit(url, img);
-                        synapse.fire(blit);
+            // M1 Mock layout tick
+            _ = tokio::time::sleep(tokio::time::Duration::from_millis(16)), if engine.document.is_some() => {
+                if let Some(js) = &mut engine.js_engine {
+                    let _ = js.context.run_jobs();
+                }
+                
+                if let Some(layout) = &mut engine.layout_tree {
+                    layout.mark_dirty();
+                    if layout.dirty {
+                        if let Some(doc) = &engine.document {
+                            layout.recompute(doc);
+                        }
+                        
+                        // For the standalone mock, we just generate a surface blit here if needed
+                        engine.needs_repaint = true;
+                    }
+                }
+                
+                if engine.needs_repaint {
+                    let w = 800;
+                    let h = 600;
+                    let mut buf = vec![0; (w * h * 4) as usize];
+                    engine.render_frame(&mut buf, w, h);
+                    if let Some(url) = &engine.document.as_ref().and_then(|d| d.children().next()).map(|_| "url") { // Mock URL fetch
+                        // mock publish
+                        synapse.fire(SMessage::SurfaceBlit {
+                            url: url.to_string(),
+                            width: w,
+                            height: h,
+                            pixels: buf,
+                        });
                     }
                 }
             }
         }
     }
-    
-    Ok(())
 }
 
 #[tokio::main]
@@ -122,54 +99,17 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match &cli.command {
-        Commands::Open { url, dump } => {
-            if let Some(dump_path) = dump {
-                println!("Fetching {}...", url);
-                let html = net::fetch_document(url).await?;
-                let document = dom::parse_html(&html);
-                
-                let mut js_engine = js::Engine::new(document.clone());
-                if let Ok(scripts) = document.select("script") {
-                    for script_node in scripts {
-                        let text = script_node.text_contents();
-                        if !text.trim().is_empty() {
-                            let _ = js_engine.execute(&text);
-                        }
-                    }
-                }
-                
-                println!("Pumping JS event loop for 100ms...");
-                let start = std::time::Instant::now();
-                while start.elapsed().as_millis() < 100 {
-                    let _ = js_engine.context.run_jobs();
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                
-                let mut layout_tree = layout::compute_layout(&document);
-                if let Ok(styles) = document.select("style") {
-                    for style_node in styles {
-                        let text = style_node.text_contents();
-                        css::apply_css(&mut layout_tree, &text);
-                    }
-                }
-                
-                let img = render::render_to_image(&layout_tree, 800, 600);
-                img.save(dump_path)?;
-                println!("Saved PNG dump to {}", dump_path);
-            } else {
-                // Run the interaction shell
-                let synapse = Synapse::new();
-                
-                // Mock-dispatch for M2 Oracle
-                let syn_clone = synapse.clone();
-                let u = url.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                    syn_clone.fire(SMessage::OpenDocument { url: u });
-                });
-                
-                ignite(synapse).await?;
-            }
+        Commands::Open { url } => {
+            let synapse = Synapse::new();
+            
+            let syn_clone = synapse.clone();
+            let u = url.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                syn_clone.fire(SMessage::OpenDocument { url: u });
+            });
+            
+            ignite(synapse).await?;
         }
     }
 
