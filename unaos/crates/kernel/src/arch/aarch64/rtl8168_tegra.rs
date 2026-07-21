@@ -322,6 +322,31 @@
 //     landing-index == completed-slot for ≥4 consecutive slots, the stuck-run never reaches 3 pairs and
 //     the verdict never fires).
 //
+// ## NET-4C — audit PCIe MPS/MRRS: we program NEITHER side's Device Control; the fetch-completion path.
+//
+// Boot-38's mechanism-(a) survivor (descriptor-fetch burst reuse, NIC/RC-internal) has a concrete PCIe
+// candidate the six prior exonerations never examined: the descriptor READ COMPLETION is truncated by a
+// Max_Payload_Size mismatch across the controller-0 link. A completion whose data payload exceeds the
+// REQUESTER's MPS is a Malformed TLP the requester drops (PCIe base spec: a receiver checks payload <=
+// its own MPS; the completer splits at min of the two MPS). CODE AUDIT of the bring-up: the driver
+// programs the endpoint COMMAND register (0x04, MEM+bus-master) and the RTL8168 MAC control/ring
+// registers, and NET-3 did the appl LTSSM-enable + BAR sizing — but NOTHING on either side ever writes
+// the PCIe-capability Device Control register (MPS bits[7:5], MRRS bits[14:12] at cap+0x08). So both the
+// Tegra234 DWC root port and the RTL8168 endpoint run whatever UEFI/MB2 left. L4T does NOT: r8169
+// `rtl_jumbo_config` sets the endpoint MRRS to 4096 non-jumbo (`pcie_set_readrq`), and the Linux PCI
+// core's `pcie_bus_configure_settings` walks the tree and writes MPS = min-MPSS on the path, so L4T runs
+// a KNOWN-COHERENT MPS. If firmware left the RC at a larger MPS than the EP, the RC's descriptor-read
+// completions overrun the EP's MPS → dropped → only the first chunk consumed → the NIC reuses the
+// last-latched buffer address (exactly the observed 32-B-then-stuck signature). Fix (this arc,
+// `net4c_mps_mrrs`, BEFORE rings-up): read DevCap/DevCtl/DevSta on BOTH sides via the ECAM (RC =
+// bus0:dev0:fn0, EP = bus1:dev0:fn0), print the `[net4C]` readback table UNCONDITIONALLY, reconcile MPS
+// to the smallest value both DevCaps advertise (writing each side only if its field differs; DevSta high
+// half written 0 so its RW1C error latches survive), and clamp EP MRRS to a conservative 512 B. The
+// DevSta error bits are the discriminator and print either way: a latched UnsupReq/Fatal CONVICTS the
+// completion path; all-clear + already-matching MPS is the honest REFUTATION (the truncation is not an
+// MPS/MRRS mis-program — mechanism-(a) fetch-reuse stands, below this driver's lane). Metal-pending: the
+// witness fires only under `UNAOS_NET4=1 UNAOS_TEGRA=1` on Orin silicon (QEMU models no Tegra234 RC).
+//
 // ## Write discipline
 //
 // The driver, being a driver, DOES the fabric writes NET-3 refused: it enables the device's
@@ -2754,6 +2779,199 @@ mod metal {
         None
     }
 
+    // ── NET-4C: PCIe Max_Payload_Size / Max_Read_Request_Size audit + reconcile ──────────────────────
+    // The seventh mechanism under test (Boot-38 ledger; the six prior exonerations stand). The NIC ever
+    // fetches exactly 2 descriptors (32 B) then reuses buffer 1 forever, while OWN/len writebacks
+    // advance 1:1 and ring DRAM is provably correct (net4x/net4A). Theory (NET-4C): the descriptor READ
+    // completion is truncated/dropped by an MPS mismatch across the controller-0 link. A completion
+    // whose data payload exceeds the REQUESTER's Max_Payload_Size is a Malformed TLP the requester drops
+    // (PCIe base spec: a receiver checks payload <= its own MPS; the completer must split at min of the
+    // two MPS). If UEFI/MB2 left the DWC root port at a larger MPS than the RTL8168 endpoint, the RC's
+    // descriptor-read completions overrun the EP's MPS -> dropped -> only the first (small) chunk is
+    // consumed -> the NIC falls back to the last-latched buffer address for payload DMA (the observed
+    // signature). L4T runs the endpoint at MRRS=4096 non-jumbo (r8169 `rtl_jumbo_config`: readrq=4096
+    // then `pcie_set_readrq`) and MPS = the tree-common value `pcie_bus_configure_settings` computes
+    // (min MPSS across the path). UnaOS's driver programs NEITHER side's Device Control — only COMMAND
+    // (0x04) — so both run whatever firmware left. This function reads DevCap/DevCtl/DevSta on BOTH sides
+    // (RC = bus0:dev0:fn0 = ecam+0; EP = bus1:dev0:fn0), prints the `[net4C]` readback table
+    // UNCONDITIONALLY (the boot oracle), then reconciles MPS to the smallest value BOTH DevCaps advertise
+    // (mirroring the Linux PCI core) and clamps EP MRRS to a conservative 512 — each side written only
+    // if its DevCtl actually changes, announced + read back, BEFORE rings-up. The DevSta error bits
+    // (CorrErr/NonFatalErr/FatalErr/UnsupReq latched) are the completion-path discriminator and print
+    // either way: a latched UnsupReq/error CONVICTS the completion path; all-clear + already-matching
+    // MPS is the honest refutation (the truncation is not an MPS/MRRS mis-program). Read-first; the only
+    // writes are Device Control MPS/MRRS fields (DevSta high half written 0 => RW1C untouched).
+
+    /// PCIe capability id (Device Control lives in this capability at cap+0x08).
+    const PCIE_CAP_ID: u32 = 0x10;
+    /// DevCap (cap+0x04): bits[2:0] = Max_Payload_Size Supported. DevCtl (cap+0x08, low 16): bits[7:5] =
+    /// MPS, bits[14:12] = MRRS. DevSta (cap+0x0a, i.e. the dword's high 16): bit0 CorrErr, bit1
+    /// NonFatalErr, bit2 FatalErr, bit3 UnsupReq. Size in bytes = 128 << field.
+    const NET4C_DEVCAP: u64 = 0x04;
+    const NET4C_DEVCTL: u64 = 0x08;
+
+    /// One side's audited PCIe Device-Control state.
+    #[derive(Clone, Copy)]
+    struct DevCtlState {
+        cap_off: u64,
+        devcap_mps: u32, // Max_Payload_Size Supported field (ceiling)
+        mps_field: u32,  // current DevCtl MPS field
+        mrrs_field: u32, // current DevCtl MRRS field
+        devctl_lo: u16,  // full 16-bit DevCtl (for read-modify-write)
+    }
+
+    /// Walk `cfg_base`'s capability list to the PCIe capability (id 0x10). Mirrors the NET-2 DBI cap
+    /// walk: poison-rejecting, bounded, dword-aligned cap pointers. Returns the cap offset or `None`.
+    fn net4c_find_pcie_cap(cfg_base: u64) -> Option<u64> {
+        let sw = unsafe { read_volatile((cfg_base + 0x04) as *const u32) };
+        if is_poison(sw) || (sw >> 16) & (1 << 4) == 0 {
+            return None; // absent decode or no capabilities list
+        }
+        let mut ptr = (unsafe { read_volatile((cfg_base + 0x34) as *const u32) } & 0xff) as u64;
+        let mut hops = 0;
+        while ptr >= 0x40 && ptr < 0x100 && hops < 48 {
+            let h = unsafe { read_volatile((cfg_base + (ptr & !0x3)) as *const u32) };
+            if is_poison(h) {
+                break;
+            }
+            let id = h & 0xff;
+            let next = (h >> 8) & 0xff;
+            if id == PCIE_CAP_ID {
+                return Some(ptr);
+            }
+            if next == 0 || next as u64 == ptr {
+                break;
+            }
+            ptr = next as u64;
+            hops += 1;
+        }
+        None
+    }
+
+    /// Read + print one side's DevCap/DevCtl/DevSta. `None` on absent decode / no PCIe cap.
+    fn net4c_audit_side(cfg_base: u64, label: &str) -> Option<DevCtlState> {
+        let Some(cap) = net4c_find_pcie_cap(cfg_base) else {
+            serial_println!(
+                "{}   [net4C] {} @ {:#x}: no PCIe capability (absent decode / no cap list) — side UNREAD ::",
+                P4, label, cfg_base
+            );
+            return None;
+        };
+        let devcap = unsafe { read_volatile((cfg_base + cap + NET4C_DEVCAP) as *const u32) };
+        let ctlsta = unsafe { read_volatile((cfg_base + cap + NET4C_DEVCTL) as *const u32) };
+        if is_poison(devcap) || is_poison(ctlsta) {
+            serial_println!(
+                "{}   [net4C] {} PCIe cap @ {:#x}: DevCap/DevCtl poison — side UNREAD ::",
+                P4, label, cap
+            );
+            return None;
+        }
+        let devcap_mps = devcap & 0x7;
+        let devctl_lo = (ctlsta & 0xffff) as u16;
+        let devsta = (ctlsta >> 16) as u16;
+        let mps_field = ((devctl_lo >> 5) & 0x7) as u32;
+        let mrrs_field = ((devctl_lo >> 12) & 0x7) as u32;
+        serial_println!(
+            "{}   [net4C] {} cap@{:#x}: MPS={}B (cap {}B) MRRS={}B | DevSta={:#06x} CorrErr={} NonFatal={} Fatal={} UnsupReq={} ::",
+            P4, label, cap,
+            128u32 << mps_field, 128u32 << devcap_mps, 128u32 << mrrs_field,
+            devsta, devsta & 1, (devsta >> 1) & 1, (devsta >> 2) & 1, (devsta >> 3) & 1
+        );
+        let _ = devsta; // printed above; not retained past the witness line
+        Some(DevCtlState { cap_off: cap, devcap_mps, mps_field, mrrs_field, devctl_lo })
+    }
+
+    /// Audit both sides of the controller-0 link and reconcile MPS/MRRS BEFORE rings-up. `ecam` = the
+    /// mapped whole-domain ECAM base (bus0:dev0:fn0 = the DWC root port); `dev` = the RTL8168 endpoint
+    /// config (bus1:dev0:fn0). Prints the readback table unconditionally; writes Device Control only
+    /// where a field must change (announced + read back). Non-fatal: any unread side leaves the link as
+    /// firmware set it and the bring-up proceeds (the witness records what was — or wasn't — seen).
+    fn net4c_mps_mrrs(ecam: u64, dev: u64) {
+        serial_println!(
+            "{}   [net4C] PCIe MPS/MRRS audit — RC root-port (bus0:dev0:fn0) + RTL8168 endpoint (bus1:dev0:fn0) ::",
+            P4
+        );
+        let rc = net4c_audit_side(ecam, "RC root-port");
+        let ep = net4c_audit_side(dev, "EP RTL8168 ");
+        let (Some(rc), Some(ep)) = (rc, ep) else {
+            serial_println!(
+                "{}   [net4C] one side UNREAD — MPS/MRRS reconcile SKIPPED; link left as firmware set it (witness stands) ::",
+                P4
+            );
+            return;
+        };
+
+        // Smallest MPS both sides SUPPORT (mirrors pcie_bus_configure_settings = min MPSS on the path).
+        let common_mps = rc.devcap_mps.min(ep.devcap_mps);
+        // Conservative bring-up MRRS: clamp to 512 B (field 0b010). L4T runs 4096 non-jumbo (r8169
+        // rtl_jumbo_config); 512 is the safe first-fix value — widen if MPS-reconcile alone leaves the
+        // fetch truncated. Never widen MRRS here.
+        const MRRS_512_FIELD: u32 = 0b010;
+        let ep_target_mrrs = ep.mrrs_field.min(MRRS_512_FIELD);
+
+        let rc_mismatch = rc.mps_field != common_mps;
+        let ep_mismatch = ep.mps_field != common_mps || ep.mrrs_field != ep_target_mrrs;
+        if !rc_mismatch && !ep_mismatch {
+            serial_println!(
+                "{}   [net4C] MPS already coherent (both {}B, common-supported {}B) + EP MRRS {}B ≤ 512B — NO reconcile write. If the fetch still truncates, MPS/MRRS mis-program is REFUTED; look to DevSta error bits above (latched UnsupReq/Fatal = completion path). ::",
+                P4, 128u32 << common_mps, 128u32 << common_mps, 128u32 << ep.mrrs_field
+            );
+            return;
+        }
+
+        // EP reconcile (the driver-owned device): set MPS = common, MRRS = clamped. DevSta high half
+        // written 0 so its RW1C bits are untouched (writing 1 would clear a latched error we want kept).
+        if ep_mismatch {
+            let new_lo = (ep.devctl_lo & !((0x7 << 5) | (0x7 << 12)))
+                | ((common_mps as u16) << 5)
+                | ((ep_target_mrrs as u16) << 12);
+            serial_println!(
+                "{}   >>> CONFIG WRITE (net4C): EP DevCtl[{:#x}] {:#06x} -> {:#06x} (MPS {}B->{}B, MRRS {}B->{}B) — issuing ::",
+                P4, ep.cap_off + NET4C_DEVCTL, ep.devctl_lo, new_lo,
+                128u32 << ep.mps_field, 128u32 << common_mps,
+                128u32 << ep.mrrs_field, 128u32 << ep_target_mrrs
+            );
+            unsafe {
+                write_volatile((dev + ep.cap_off + NET4C_DEVCTL) as *mut u32, new_lo as u32);
+                core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+            }
+            let back = (unsafe { read_volatile((dev + ep.cap_off + NET4C_DEVCTL) as *const u32) }
+                & 0xffff) as u16;
+            serial_println!(
+                "{}   [net4C] EP DevCtl readback = {:#06x} (MPS={}B MRRS={}B) — {} ::",
+                P4, back, 128u32 << ((back >> 5) & 0x7), 128u32 << ((back >> 12) & 0x7),
+                if back == new_lo { "MATCH" } else { "MISMATCH (field(s) hardwired?)" }
+            );
+        }
+
+        // RC reconcile (only if the root port runs a larger MPS than the common value — else the EP
+        // would still receive over-MPS completions). This is a fabric write to the DWC root port's own
+        // config; announced before issue, read back. Left untouched when the RC already matches.
+        if rc_mismatch {
+            let new_lo = (rc.devctl_lo & !(0x7 << 5)) | ((common_mps as u16) << 5);
+            serial_println!(
+                "{}   >>> CONFIG WRITE (net4C): RC root-port DevCtl[{:#x}] {:#06x} -> {:#06x} (MPS {}B->{}B; matches EP so completions never overrun) — issuing ::",
+                P4, rc.cap_off + NET4C_DEVCTL, rc.devctl_lo, new_lo,
+                128u32 << rc.mps_field, 128u32 << common_mps
+            );
+            unsafe {
+                write_volatile((ecam + rc.cap_off + NET4C_DEVCTL) as *mut u32, new_lo as u32);
+                core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+            }
+            let back = (unsafe { read_volatile((ecam + rc.cap_off + NET4C_DEVCTL) as *const u32) }
+                & 0xffff) as u16;
+            serial_println!(
+                "{}   [net4C] RC DevCtl readback = {:#06x} (MPS={}B) — {} ::",
+                P4, back, 128u32 << ((back >> 5) & 0x7),
+                if back == new_lo { "MATCH" } else { "MISMATCH (field hardwired?)" }
+            );
+        }
+        serial_println!(
+            "{}   [net4C] reconcile DONE — both sides MPS={}B; next boot's [net4m]/[net4A] verdict discriminates (payload lands 1:1 = MPS was the cut; still stuck = MPS REFUTED, mechanism-(a) fetch-reuse stands) ::",
+            P4, 128u32 << common_mps
+        );
+    }
+
     /// ORIN-NET-4 entry point (metal): claim controller-0's downstream RTL8168, map its register BAR,
     /// reset the MAC, and read the station MAC. Rings + init (M2) and the smoltcp bind (M3) land in
     /// later milestones. Graceful on any missing/foreign DTB or absent decode (records and returns).
@@ -3035,6 +3253,10 @@ mod metal {
             P4,
             core::str::from_utf8(&macs).unwrap_or("<mac>")
         );
+
+        // ── NET-4C: audit + reconcile PCIe MPS/MRRS on BOTH sides of the controller-0 link BEFORE the
+        //    rings go up (the descriptor-fetch-completion theory; unconditional `[net4C]` witness) ──
+        net4c_mps_mrrs(ecam, dev);
 
         // ── M2: bring up the C+ RX/TX descriptor rings + init sequence ──
         if !nic.init_rings() {
