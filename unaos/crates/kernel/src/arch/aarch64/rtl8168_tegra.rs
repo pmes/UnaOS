@@ -1965,29 +1965,48 @@ mod metal {
             // buffer[1] instead of the (zero) slot buffer, then zero buffer[1]'s head so a stale
             // frame is never double-consumed. Loses coalesced back-to-back frames (single landing
             // address) — acceptable for the DHCP exchange; NOT a keeper. Off by default.
-            let buf1 = unsafe { self.rx_buffers.add(RX_BUF_SIZE) };
-            let use_buf1 = option_env!("UNAOS_NET4_BUF1").is_some()
-                && self.rx_cur != 1
-                && unsafe { read_volatile(buf1) } != 0
-                && {
+            // boot-40 revision: the landing index is NOT fixed at 1 — it is whatever descriptor the
+            // NIC last fetched, which varies per boot (boot-40: the ACK landed at buffer[0] while
+            // pops read zeros). So SCAN all buffers (net4z's proven method) for a nonzero head when
+            // the completed slot's own buffer reads zero, harvest the hit, consume-on-read.
+            let slot_head_zero = {
+                let mut z = true;
+                for i in 0..12 {
+                    z &= unsafe { read_volatile(buf.add(i)) } == 0;
+                }
+                z
+            };
+            let mut harvest: *mut u8 = core::ptr::null_mut();
+            let mut harvest_idx: usize = 0;
+            if option_env!("UNAOS_NET4_BUF1").is_some() && slot_head_zero {
+                for k in 0..NUM_RX {
+                    if k == self.rx_cur {
+                        continue;
+                    }
+                    let bk = unsafe { self.rx_buffers.add(k * RX_BUF_SIZE) };
                     let mut nz = false;
                     for i in 0..12 {
-                        nz |= unsafe { read_volatile(buf1.add(i)) } != 0;
+                        nz |= unsafe { read_volatile(bk.add(i)) } != 0;
                     }
-                    nz
-                };
-            let src = if use_buf1 { buf1 } else { buf };
+                    if nz {
+                        harvest = bk;
+                        harvest_idx = k;
+                        break;
+                    }
+                }
+            }
+            let src: *const u8 = if !harvest.is_null() { harvest } else { buf };
             unsafe {
                 core::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), len);
             }
-            if use_buf1 {
+            if !harvest.is_null() {
                 // Consume: zero the head so the next pop can't re-read this frame.
                 for i in 0..16 {
-                    unsafe { core::ptr::write_volatile(buf1.add(i), 0u8) };
+                    unsafe { core::ptr::write_volatile(harvest.add(i), 0u8) };
                 }
                 serial_println!(
-                    "{}   [net4D] rx[{}] slot={} len={} frame HARVESTED from buffer[1] (interim buf1-read workaround; head consumed) ::",
-                    P4, self.rx_count, self.rx_cur, len
+                    "{}   [net4D] rx[{}] slot={} len={} frame HARVESTED from buffer[{}] (interim scan-harvest; head consumed) ::",
+                    P4, self.rx_count, self.rx_cur, len, harvest_idx
                 );
             }
             // NET-4B: one-shot WITNESS on the first popped frame — names the coherency strategy now on the
