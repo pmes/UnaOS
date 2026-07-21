@@ -180,72 +180,84 @@ pub fn init(gpu: &GpuInfo) {
 
 unsafe fn takeover_display(gpu: &GpuInfo, bar0: usize, allocator: &mut VramAllocator) -> Option<usize> {
     serial_println!("[NVIDIA] Starting PDISPLAY takeover sequence...");
+
+    if option_env!("UNAOS_KEPLER_TAKEOVER").is_none() {
+        serial_println!("[NVIDIA] UNAOS_KEPLER_TAKEOVER knob not set. Skipping display takeover.");
+        return None;
+    }
     
     // 1. Get the current GOP framebuffer physical address
     let gop_fb_phys = crate::video::WRITER.lock().base();
     if gop_fb_phys == 0 {
         serial_println!("[NVIDIA] Warning: video::WRITER has no base address. Cannot correlate scanout.");
+        serial_println!(":: kepler: takeover-abort no-gop ::");
         return None;
     }
     serial_println!("[NVIDIA] GOP Framebuffer Physical Base: 0x{:X}", gop_fb_phys);
 
     // 2. Determine VRAM aperture base (BAR1 or BAR2 depending on 64-bit BAR0)
-    // On Kepler, BAR0 is 16MB. BAR1 is VRAM (256MB).
-    // Let's just read the PCI config space directly for BAR1 (offset 0x14).
     let bar1_reg = crate::arch::pci::read_config_32(gpu.bus as u8, gpu.slot, gpu.func, 0x14);
     let mut vram_base = (bar1_reg & 0xFFFFFFF0) as usize;
     if (bar1_reg & 0x04) != 0 {
-        // 64-bit BAR
         let bar1_high = crate::arch::pci::read_config_32(gpu.bus as u8, gpu.slot, gpu.func, 0x18);
         vram_base |= (bar1_high as usize) << 32;
     }
     serial_println!("[NVIDIA] VRAM Base (BAR1): 0x{:X}", vram_base);
 
     // Calculate the VRAM offset of the GOP framebuffer
-    let mut gop_vram_offset = 0;
-    if gop_fb_phys >= vram_base {
-        gop_vram_offset = gop_fb_phys - vram_base;
-        serial_println!("[NVIDIA] GOP VRAM Offset: 0x{:X}", gop_vram_offset);
-    } else {
-        serial_println!("[NVIDIA] Warning: GOP FB is not within VRAM BAR1. It might be stolen RAM.");
-        // We'll still search for the physical address directly just in case.
+    if gop_fb_phys < vram_base {
+        serial_println!("[NVIDIA] Warning: GOP FB is not within VRAM BAR1.");
+        serial_println!(":: kepler: takeover-abort gop-not-in-vram {:X} ::", gop_fb_phys);
+        return None;
     }
+    let gop_vram_offset = gop_fb_phys - vram_base;
+    serial_println!("[NVIDIA] GOP VRAM Offset: 0x{:X}", gop_vram_offset);
 
-    // 3. Search PDISPLAY registers for the scanout address
-    let mut scanout_reg_offset = None;
-    let search_targets = [
-        gop_vram_offset as u32,
-        (gop_vram_offset >> 8) as u32,
-        gop_fb_phys as u32,
-        (gop_fb_phys >> 8) as u32,
-    ];
+    // 3. Read PDISPLAY Head State
+    // The Core EVO channel (NV_EVO_CORE) is mirrored at NV_PDISPLAY_BASE.
+    // envytools rnndb/display/nv_evo.xml:
+    // NV_EVO_CORE base = 0x610000
+    // HEAD array offset = 0x400, stride = 0x300 (GF119+)
+    // G80_EVO_HEAD -> G80_EVO_FB_SETTINGS stripe at offset 0x60
+    // OFFSET_ORIGIN = 0x0, SIZE = 0x8, STORAGE = 0xC
+    
+    let expected_addr = (gop_vram_offset >> 8) as u32;
+    let mut found_head = None;
+    let mut raw_addr = 0;
+    let mut raw_size = 0;
+    let mut raw_storage = 0;
 
-    for offset in (0..regs::NV_PDISPLAY_SIZE).step_by(4) {
-        let val = mmio_read(bar0, regs::NV_PDISPLAY_BASE + offset);
-        if val != 0 && val != 0xFFFFFFFF {
-            for (i, &target) in search_targets.iter().enumerate() {
-                if target != 0 && val == target {
-                    serial_println!("[NVIDIA] FOUND Scanout Register! Offset 0x{:04X} = 0x{:08X} (Match type {})", offset, val, i);
-                    scanout_reg_offset = Some(offset);
-                    break;
-                }
-            }
+    for head in 0..4 {
+        let head_base = regs::NV_PDISPLAY_BASE + 0x400 + (head * 0x300) + 0x60;
+        let addr = mmio_read(bar0, head_base);
+        if addr != 0 && addr == expected_addr {
+            found_head = Some(head);
+            raw_addr = addr;
+            raw_size = mmio_read(bar0, head_base + 0x8);
+            raw_storage = mmio_read(bar0, head_base + 0xC);
+            break;
         }
     }
 
-    // 4. Reprogram Scanout (Takeover)
-    if let Some(reg_off) = scanout_reg_offset {
-        serial_println!("[NVIDIA] Found active display head scanout register at PDISPLAY+0x{:04X}.", reg_off);
+    if let Some(head) = found_head {
+        let gop_info = crate::video::WRITER.lock().info();
+        let expected_width = gop_info.width as u32;
+        let expected_height = gop_info.height as u32;
         
-        // Phase 3: Allocate a new surface in VRAM for double buffering or clean handoff
-        let fb_size = 2880 * 1800 * 4; // Hardcode rMBP 15" internal panel size for now
+        let width = raw_size & 0xFFFF;
+        let height = raw_size >> 16;
+        
+        if width != expected_width || height != expected_height {
+            serial_println!("[NVIDIA] Bounds check failed for head {}. Expected {}x{}, got {}x{}", head, expected_width, expected_height, width, height);
+            serial_println!(":: kepler: takeover-abort head={} addr={:08X} size={:08X} storage={:08X} ::", head, raw_addr, raw_size, raw_storage);
+            return None;
+        }
+
+        serial_println!("[NVIDIA] Found active display head {} at PDISPLAY+0x{:04X}.", head, 0x460 + head * 0x300);
+        
+        let fb_size = (expected_width * expected_height * 4) as usize; 
         if let Some(new_fb_offset) = allocator.alloc(fb_size) {
             serial_println!("[NVIDIA] Allocated new Framebuffer at VRAM offset 0x{:X}", new_fb_offset);
-            
-            // In a full implementation, we would write `new_fb_offset` or `new_fb_offset >> 8` 
-            // into `NV_PDISPLAY_BASE + reg_off`, and then call `crate::video::WRITER.lock().init(...)`
-            // with `vram_base + new_fb_offset`.
-            
             serial_println!("[NVIDIA] Phase 2/3: Framebuffer handoff and allocation logic verified.");
             return Some(new_fb_offset);
         } else {
@@ -253,6 +265,7 @@ unsafe fn takeover_display(gpu: &GpuInfo, bar0: usize, allocator: &mut VramAlloc
         }
     } else {
         serial_println!("[NVIDIA] Failed to find the active display head scanout register.");
+        serial_println!(":: kepler: takeover-abort no-match ::");
     }
     
     None
