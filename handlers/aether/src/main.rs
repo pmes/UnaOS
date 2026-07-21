@@ -1,22 +1,7 @@
 
-pub mod net;
-pub mod dom;
-pub mod layout;
-pub mod render;
-pub mod js;
-pub mod images;
-pub mod forms;
-pub mod css;
-
-pub mod ledger;
-pub mod storage;
-pub mod workers;
-pub mod event_loop;
-pub mod fonts;
-pub mod api;
 use clap::{Parser, Subcommand};
 use anyhow::Result;
-use aether::AetherEngine;
+use aether::*;
 
 #[derive(Parser)]
 #[command(name = "aether")]
@@ -56,38 +41,17 @@ pub async fn ignite(synapse: Synapse) -> Result<()> {
                     _ => {}
                 }
             }
-            // M1 Mock layout tick
+            // Engine tick
             _ = tokio::time::sleep(tokio::time::Duration::from_millis(16)), if engine.document.is_some() => {
                 if let Some(js) = &mut engine.js_engine {
                     let _ = js.context.run_jobs();
                 }
                 
-                if let Some(layout) = &mut engine.layout_tree {
-                    layout.mark_dirty();
-                    if layout.dirty {
-                        if let Some(doc) = &engine.document {
-                            layout.recompute(doc);
-                        }
-                        
-                        // For the standalone mock, we just generate a surface blit here if needed
-                        engine.needs_repaint = true;
-                    }
-                }
-                
                 if engine.needs_repaint {
-                    let w = 800;
-                    let h = 600;
-                    let mut buf = vec![0; (w * h * 4) as usize];
-                    engine.render_frame(&mut buf, w, h);
-                    if let Some(url) = &engine.document.as_ref().and_then(|d| d.children().next()).map(|_| "url") { // Mock URL fetch
-                        // mock publish
-                        synapse.fire(SMessage::SurfaceBlit {
-                            url: url.to_string(),
-                            width: w,
-                            height: h,
-                            pixels: buf,
-                        });
-                    }
+                    // We let the shells handle repaint, so the handler mode doesn't need to do surface blits here,
+                    // but we will keep this loop alive for JS timers/jobs.
+                    // If we need to send a frame back through bandy in the future, we do it here.
+                    engine.needs_repaint = false;
                 }
             }
         }

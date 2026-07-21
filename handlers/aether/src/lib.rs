@@ -14,6 +14,9 @@ pub mod workers;
 pub mod event_loop;
 pub mod fonts;
 pub mod api;
+
+#[cfg(test)]
+mod engine_tests;
 pub struct AetherEngine {
     pub document: Option<kuchiki::NodeRef>,
     pub layout_tree: Option<layout::LayoutTree>,
