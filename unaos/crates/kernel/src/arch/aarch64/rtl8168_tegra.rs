@@ -1554,19 +1554,60 @@ mod metal {
             // is the honest minimal fix: the TX path already proved controller-0's DMA is CPU-coherent
             // (the DISCOVER's buffer, written cacheable, was read correctly by the NIC), so what was
             // missing is only the ORDERING of the CPU's two observations — not cache maintenance.
-            unsafe { core::arch::asm!("dsb ld", options(nostack, preserves_flags)) };
+            // NET-4u: full `dsb sy` between observing OWN-clear and the invalidate below (upgraded
+            // from NET-4e's `dsb ld` — the load-only barrier fences loads against loads, but the
+            // maintenance op that follows is not a load; `dsb sy` orders the OWN observation ahead of
+            // the `dc ivac` sequence unconditionally).
+            unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
             // Hardware wrote the received length into the length field; clamp so a misbehaving NIC can
             // never make us build an out-of-bounds slice.
             let len = (d.opts1 & DESC_LEN_MASK) as usize;
             let len = len.min(RX_BUF_SIZE).min(out.len());
             let buf = unsafe { self.rx_buffers.add(self.rx_cur * RX_BUF_SIZE) };
-            // NET-4f: this memory is non-coherent (see the coherency note at the top of this file) —
-            // the `dsb ld` orders the CPU's two observations but does NOT drop the stale (zero) cache
-            // lines the NIC's DMA wrote past. INVALIDATE `[buf, buf+len)` so the copy below misses the
-            // cache and re-fetches the NIC's payload from DRAM. Without this the frame reads as the
-            // `alloc_zeroed` fill (the boot-3 all-zero-payload defect). `dc ivac` discards, never
-            // writes back — the buffer is untouched by the CPU since its pre-handoff invalidate.
-            cache::invalidate_range(buf as usize, len);
+            // NET-4u WITNESS (knob-gated, first ≤2 pops): read the leading 16 payload bytes BEFORE the
+            // invalidate — paired with the post-ivac read after it, one boot names whether the pop-path
+            // invalidate is what turns stale zeros into payload (before=00.. after=real ⇒ the fix is the
+            // fix) or whether DRAM itself reads zero (both zero ⇒ below-driver reachability). The
+            // pre-read pulls lines into the cache, but the full-span invalidate right below drops them,
+            // so the witness cannot perturb the frame the copy sees.
+            let net4u_witness = option_env!("UNAOS_NET4_RINGDUMP").is_some() && self.rx_count < 2;
+            let mut net4u_pre = [0u8; 16];
+            if net4u_witness {
+                let n = len.min(16);
+                for (i, slot) in net4u_pre.iter_mut().enumerate().take(n) {
+                    *slot = unsafe { read_volatile(buf.add(i)) };
+                }
+            }
+            // NET-4f/NET-4u: this memory is non-coherent (see the coherency note at the top of this
+            // file) — the barrier orders the CPU's two observations but does NOT drop the stale (zero)
+            // cache lines the NIC's DMA wrote past. INVALIDATE the FULL buffer span (not just
+            // `[buf, buf+len)` — NET-4u: any line of the 2048-byte slot may have been speculatively
+            // refetched between the re-arm invalidate and this pop, and a stale line beyond `len`
+            // this pop would survive into a LATER, longer frame in the same slot) so every read of
+            // this slot re-fetches the NIC's payload from DRAM. `buf` is 2048-strided off a
+            // 64 KiB-aligned block ⇒ line-aligned; `invalidate_range` rounds to line boundaries and
+            // closes with `dsb sy` regardless. `dc ivac` discards, never writes back — the buffer is
+            // untouched by CPU writes since its pre-handoff invalidate, so no dirty line exists to lose.
+            cache::invalidate_range(buf as usize, RX_BUF_SIZE);
+            // NET-4u WITNESS (post-ivac half): re-read the same 16 bytes now that the span is
+            // invalidated — this is what the copy below will see.
+            if net4u_witness {
+                let n = len.min(16);
+                let mut post = [0u8; 16];
+                for (i, slot) in post.iter_mut().enumerate().take(n) {
+                    *slot = unsafe { read_volatile(buf.add(i)) };
+                }
+                serial_println!(
+                    "{}   [net4u] rx[{}] slot={} len={} pre-ivac={:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x} post-ivac={:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x} ::",
+                    P4, self.rx_count, self.rx_cur, len,
+                    net4u_pre[0], net4u_pre[1], net4u_pre[2], net4u_pre[3],
+                    net4u_pre[4], net4u_pre[5], net4u_pre[6], net4u_pre[7],
+                    net4u_pre[8], net4u_pre[9], net4u_pre[10], net4u_pre[11],
+                    net4u_pre[12], net4u_pre[13], net4u_pre[14], net4u_pre[15],
+                    post[0], post[1], post[2], post[3], post[4], post[5], post[6], post[7],
+                    post[8], post[9], post[10], post[11], post[12], post[13], post[14], post[15]
+                );
+            }
             unsafe {
                 core::ptr::copy_nonoverlapping(buf, out.as_mut_ptr(), len);
             }
@@ -1626,11 +1667,16 @@ mod metal {
                     }
                 );
             }
-            // NET-4f: before re-arming, invalidate the whole buffer — the copy above pulled the frame
-            // into the D-cache (now clean lines); dropping them means the NIC's NEXT DMA write is never
-            // shadowed by a resident line, and nothing can be written back over it. (DMA_FROM_DEVICE
-            // sync-for-device, mirroring the pre-handoff invalidate in alloc_rx.)
-            cache::invalidate_range(buf as usize, RX_BUF_SIZE);
+            // NET-4f/NET-4u: before re-arming, CLEAN+INVALIDATE the whole buffer (upgraded from plain
+            // invalidate). The copy above pulled the frame into the D-cache; those lines should be
+            // clean, but `dc civac` is the always-safe sync-for-device: if ANY line in the span is
+            // dirty for any reason it is written back and dropped rather than silently discarded (a
+            // plain `dc ivac` here would lose such a write) — and, decisively, no dirty line can later
+            // be EVICTED-WRITTEN-BACK on top of the NIC's next DMA payload (the "evicted-then-
+            // refetched/written-back-before-DMA" hazard). For clean lines `civac` degenerates to the
+            // old invalidate: nothing is written, the line is dropped, the NIC's next fill is never
+            // shadowed. Closes with `dsb sy` before the descriptor is republished below.
+            cache::clean_invalidate_range(buf as usize, RX_BUF_SIZE);
             // NET-4l: re-arm with the r8169 OWN-LAST publish discipline — the fix for "only the first
             // popped frame ever carries real bytes; rx[2..] read a real DESCRIPTOR length but an all-zero
             // payload." The INITIAL ring is published by `init_rings`' trailing `dsb sy` BEFORE RX is
