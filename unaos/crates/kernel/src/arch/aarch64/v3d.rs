@@ -2198,7 +2198,9 @@ fn build_bin_cl_at(cl_off: usize, draws: &[(usize, u32, u32, u32)]) -> usize {
     for &(rec_off, num_attrs, first, count) in draws {
         let shadrec = (arena_phys() + rec_off) as u32;
         w.pkt(
-            Pkt::new(P_GL_SHADER_STATE, 4)
+            // 5-byte packet — address field spans bits [5,31] (PI-V3D-10 boot-P6 root cause #1;
+            // a 4-byte emission makes the CLE eat the next opcode as the record-address MSB).
+            Pkt::new(P_GL_SHADER_STATE, 5)
                 .f(0, 5, num_attrs as u64)
                 .f(5, 27, (shadrec >> 5) as u64)
                 .done(),
