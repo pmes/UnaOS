@@ -1993,6 +1993,11 @@ mod metal {
             let mut harvest: *mut u8 = core::ptr::null_mut();
             let mut harvest_idx: usize = 0;
             if option_env!("UNAOS_NET4_BUF1").is_some() && slot_head_zero {
+                // rev4: the ACK loses the landing buffer to chatty segment traffic (mDNS) between
+                // completions — boot-42-retry: 3 REQUESTs out, server-side lease bound, zero ACKs
+                // readable. So PREFER a DHCP-to-client frame (IPv4/UDP dst port 68) over the first
+                // nonzero head; the ACK outranks noise whenever both are present at pop time.
+                let mut first_nz: (*mut u8, usize) = (core::ptr::null_mut(), 0);
                 for k in 0..NUM_RX {
                     if k == self.rx_cur {
                         continue;
@@ -2002,11 +2007,31 @@ mod metal {
                     for i in 0..12 {
                         nz |= unsafe { read_volatile(bk.add(i)) } != 0;
                     }
-                    if nz {
+                    if !nz {
+                        continue;
+                    }
+                    if first_nz.0.is_null() {
+                        first_nz = (bk, k);
+                    }
+                    let et = u16::from_be_bytes([
+                        unsafe { read_volatile(bk.add(12)) },
+                        unsafe { read_volatile(bk.add(13)) },
+                    ]);
+                    let is_dhcp_to_client = et == 0x0800
+                        && unsafe { read_volatile(bk.add(23)) } == 17 // IP proto UDP
+                        && u16::from_be_bytes([
+                            unsafe { read_volatile(bk.add(36)) },
+                            unsafe { read_volatile(bk.add(37)) },
+                        ]) == 68; // UDP dst port (IHL=5 header)
+                    if is_dhcp_to_client {
                         harvest = bk;
                         harvest_idx = k;
                         break;
                     }
+                }
+                if harvest.is_null() {
+                    harvest = first_nz.0;
+                    harvest_idx = first_nz.1;
                 }
             }
             // rev3: the completing slot's len belongs to a DIFFERENT frame than the harvested one
