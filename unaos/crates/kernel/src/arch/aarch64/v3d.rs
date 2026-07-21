@@ -300,6 +300,12 @@ const OFF_DEFAULT_ATTRS: usize = 0x1F800; // default attribute values block (sha
 const OFF_FS_UNIF: usize = 0x20000; // fragment-shader uniform stream (colour channels + TLB configs)
 const OFF_CS_UNIF: usize = 0x20040; // coordinate-shader uniform stream (VPM read offsets)
 const OFF_VS_UNIF: usize = 0x20080; // vertex-shader uniform stream (VPM read offsets)
+// PI-V3D-14 pool sizing per Mesa v3d_util.c v3d_tile_alloc_sizes (the config the PTB is validated
+// against): tiles_size = layers × tiles_x × tiles_y × 128 (INITIAL block, STATIC_ASSERTed == 128);
+// pool = align(tiles_size, 4096) + 8192 ("the HW won't trigger OOM during the first allocations")
+// + a draw-scaled continuation slush, page-aligned. Our 64×64 fb = 1 layer × 1×1 tiles →
+// tiles_size = 128 → align 4096 + 8192 = 12,288 → page-aligned 16 KiB with slush. The existing
+// 32 KiB region already covers Mesa's minimum with 2× headroom — kept (no arena-layout change).
 const BIN_TILEALLOC_BYTES: usize = 0x8000; // 32 KiB of tile-alloc scratch for the binner
 
 /// The solid triangle colour the fragment shader writes and the CPU verifies INSIDE the primitive.
@@ -848,7 +854,17 @@ const INTERNAL_TYPE_8: u64 = 2;
 const OUTPUT_IMAGE_FORMAT_RGBA8: u64 = 27;
 const MEMORY_FORMAT_RASTER: u64 = 0;
 const PRIM_TYPE_LIST_TRIANGLES: u64 = 2;
+// Tile-allocation block-size enum (v3d_packet.xml, shared by TILE_BINNING_MODE_CFG and
+// TILE_LIST_INITIAL_BLOCK_SIZE): 64b = 0, 128b = 1, 256b = 2. PI-V3D-14: Mesa's ONLY exercised
+// config on silicon is 128B initial + 64B overflow — v3d_limits.h defines
+// V3D_TILE_ALLOC_INITIAL_BLOCK_SIZE 128 / V3D_TILE_ALLOC_OVERFLOW_BLOCK_SIZE 64 with
+// enum = (size >> 7), and v3d_util.c STATIC_ASSERTs the initial size == 128. Both emitters
+// (v3dvx_cmd_buffer.c job_emit_binning_prolog + cmd_buffer_render_pass_setup_render_pass_rcl,
+// v3dx_draw.c/v3dx_rcl.c on the GL side) use INITIAL(=1) in the bin config's initial-block field
+// AND in the render list's TILE_LIST_INITIAL_BLOCK_SIZE ("needs to match the value from binning
+// mode config"), and OVERFLOW(=0) only in the bin config's (overflow) block-size field.
 const TILE_ALLOC_BLOCK_SIZE_64B: u64 = 0;
+const TILE_ALLOC_BLOCK_SIZE_128B: u64 = 1;
 
 /// Build BOTH control lists (main at OFF_RCL, generic per-tile sub-list at OFF_SUBLIST) and publish the
 /// sub-list to RAM for the non-coherent GPU. Returns `(main_len, sublist_len)` in bytes; the caller
@@ -940,10 +956,11 @@ fn build_rcl() -> (usize, usize) {
             .f(16, 32, 0) // Z Clear Value
             .done(),
     );
-    // TILE_LIST_INITIAL_BLOCK_SIZE — must precede the first branch; auto-chained, 64-byte first block.
+    // TILE_LIST_INITIAL_BLOCK_SIZE — must precede the first branch; auto-chained, 128-byte first
+    // block (PI-V3D-14: must MATCH the bin config's initial-block-size — Mesa fact).
     w.pkt(
         Pkt::new(P_TILE_LIST_INITIAL_BLOCK_SIZE, 2)
-            .f(0, 2, TILE_ALLOC_BLOCK_SIZE_64B) // Size of first block
+            .f(0, 2, TILE_ALLOC_BLOCK_SIZE_128B) // Size of first block
             .f(2, 1, 1) // Use auto-chained tile lists
             .done(),
     );
@@ -1547,13 +1564,15 @@ fn build_bin_cl(num_attrs: u32) -> usize {
 
     // NUMBER_OF_LAYERS (single layer → minus_one 0), required before the bin-mode config.
     w.pkt(Pkt::new(P_NUMBER_OF_LAYERS, 2).f(0, 8, 0).done());
-    // TILE_BINNING_MODE_CFG (v42): 64×64 frame, 1 RT, no MSAA, no double-buffer, 32-bit max BPP, 64-byte
-    // initial + overflow tile-alloc blocks. Field bits: width@32(16,minus_one), height@48(16,minus_one),
+    // TILE_BINNING_MODE_CFG (v42): 64×64 frame, 1 RT, no MSAA, no double-buffer, 32-bit max BPP.
+    // PI-V3D-14: 128-byte INITIAL block + 64-byte overflow block — Mesa's only silicon-exercised
+    // config (v3d_limits.h INITIAL=128/OVERFLOW=64; boot-P9 showed the binner never wrote the pool
+    // under 64B/64B). Field bits: width@32(16,minus_one), height@48(16,minus_one),
     // num RT@8(4,minus_one), max bpp@12(2), block size@4(2), initial block size@2(2).
     w.pkt(
         Pkt::new(P_TILE_BINNING_MODE_CFG, 9)
-            .f(2, 2, TILE_ALLOC_BLOCK_SIZE_64B) // tile allocation initial block size 64b
-            .f(4, 2, TILE_ALLOC_BLOCK_SIZE_64B) // tile allocation block size 64b
+            .f(2, 2, TILE_ALLOC_BLOCK_SIZE_128B) // tile allocation initial block size 128b
+            .f(4, 2, TILE_ALLOC_BLOCK_SIZE_64B) // tile allocation (overflow) block size 64b
             .f(8, 4, 0) // Number of Render Targets (minus_one: 1 → 0)
             .f(12, 2, INTERNAL_BPP_32) // Maximum BPP of all render targets
             .f(32, 16, (TARGET_W - 1) as u64) // Width in pixels (minus_one)
@@ -1674,7 +1693,7 @@ fn build_m4_rcl() -> (usize, usize) {
     );
     w.pkt(
         Pkt::new(P_TILE_LIST_INITIAL_BLOCK_SIZE, 2)
-            .f(0, 2, TILE_ALLOC_BLOCK_SIZE_64B)
+            .f(0, 2, TILE_ALLOC_BLOCK_SIZE_128B) // PI-V3D-14: match bin config's initial block
             .f(2, 1, 1)
             .done(),
     );
@@ -2319,8 +2338,8 @@ fn build_bin_cl_at(cl_off: usize, draws: &[(usize, u32, u32, u32)]) -> usize {
     w.pkt(Pkt::new(P_NUMBER_OF_LAYERS, 2).f(0, 8, 0).done());
     w.pkt(
         Pkt::new(P_TILE_BINNING_MODE_CFG, 9)
-            .f(2, 2, TILE_ALLOC_BLOCK_SIZE_64B)
-            .f(4, 2, TILE_ALLOC_BLOCK_SIZE_64B)
+            .f(2, 2, TILE_ALLOC_BLOCK_SIZE_128B) // PI-V3D-14: 128B initial (Mesa-exercised config)
+            .f(4, 2, TILE_ALLOC_BLOCK_SIZE_64B) // 64B overflow (Mesa OVERFLOW_BLOCK_SIZE)
             .f(8, 4, 0)
             .f(12, 2, INTERNAL_BPP_32)
             .f(32, 16, (TARGET_W - 1) as u64)
@@ -2418,7 +2437,7 @@ fn build_battery_rcl(rcl_off: usize, sublist_off: usize, target_off: usize) -> u
     );
     w.pkt(
         Pkt::new(P_TILE_LIST_INITIAL_BLOCK_SIZE, 2)
-            .f(0, 2, TILE_ALLOC_BLOCK_SIZE_64B)
+            .f(0, 2, TILE_ALLOC_BLOCK_SIZE_128B) // PI-V3D-14: match bin config's initial block
             .f(2, 1, 1)
             .done(),
     );
