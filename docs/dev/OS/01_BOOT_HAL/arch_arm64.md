@@ -6286,6 +6286,48 @@ with the shader bodies aboard the samples flip from `0x55555555` poison to: inte
 ×3, exterior `CLEAR_RGBA` (`OK`) ×3, and `:: V3D: M4 triangle — PASS ::`. Any residual `MISS` on the
 interior isolates the shader geometry/colour-tuning as the remaining metal-refinement, not a regression.
 
+### PI-V3D-10 — the truncated GL_SHADER_STATE packet + the Halt-instead-of-End-of-Rendering render gate
+
+Boot-P6 (capture `pi4-r23s1/cu.usbmodem141402.log`, 2026-07-21) confirmed the PI-V3D-9 fixes held
+(M3 RAN-OK; CT0 kicked and ran; latch-clear worked; `MMU DEBUG=0x00000550`) but left two new clues:
+
+```
+:: V3D: M4 bin clue — … CT0CA done=0x00200017 (BA=0x00200000 EA=0x0020001e) ran=1 idled=1 MMU_fault=0x100000 ::
+:: V3D: MMU fault-latch CLEARED (post-bin) — … VIO_ADDR=0x04841800 VIO_ID=0x00000081 -> CTL=0x00090801 ::
+:: V3D: M4 render clue — CT1CS … kicked=0x00000050 (CTRUN=0) … CT1CA done=0x001f806a (BA=0x0020a000 …) ran=0 idled=1 MMU_fault=0x0 ::
+```
+
+**Defect 1 — the out-of-arena bin fault was our own next opcode byte.** Decode (facts from Linux
+`v3d_irq.c` + `v3d_drv.c`): the violating client is `VIO_ID >> 5` = `0x81 >> 5` = **4 = CLE**
+(`{L2T, PTB, PSE, TLB, CLE, TFU, MMU, GMP}` on V3D 4.1+), and `VIO_ADDR` holds the VA right-shifted by
+`va_width − 32`, where `va_width = 30 + DEBUG_INFO[7:4]` — boot-P6's `DEBUG=0x550` gives va_width 35,
+shift 3, so the true faulting VA = `0x04841800 << 3` = **`0x2420C000`** = `0x24 << 24 | 0x20C000`. The
+low bits are exactly the GL Shader State Record (arena+0x1C000 = `0x20C000`); the `0x24` on top is the
+opcode of the *following* packet, `VERTEX_ARRAY_PRIMS` (36 = 0x24). Root cause: the `GL_SHADER_STATE`
+packet (code 64) was emitted with length **4** — opcode + three payload bytes — but its address field
+spans XML bits [5, 31], making the packet **5 bytes**. The CLE consumed `0x24` as the record address's
+top byte and fetched the shader record at `0x2420C000` → `PT_INVALID`. (The "POR-shaped garbage" the
+brief suspected was our own byte stream.) Fixed: packet length 4 → 5.
+
+**Defect 2 — the render-kick gate was the M3 list's terminator.** `P_END_OF_RENDERING` was defined as
+**0 — the Halt opcode** — mislabeled "Mesa END_OF_RENDERING". In `v3d_packet.xml` they are distinct:
+code 0 = `Halt`, code **13** = `End of rendering` (`end_render`), and both Mesa drivers
+(`v3dx_rcl.c:944`, `v3dvx_cmd_buffer.c:1297`) terminate every RCL with END_OF_RENDERING, never Halt.
+END_OF_RENDERING completes the *frame* — the CLE returns to idle and the next queued CT1 job may
+dispatch; Halt merely stops the CLE with the frame still open. M3's Halt-terminated list therefore
+byte-verified (its store had already landed) but left CT1 wedged: M4's `CT1QEA` write was accepted
+(CS `0x50`) yet `CTRUN` never set and `CT1CA` stayed parked at M3's end `0x001f806a`. The P5
+"must ack the MMU latch" hypothesis stays refuted — the latch was clear and the refusal persisted.
+Fixed: `P_END_OF_RENDERING` 0 → 13 (both the M3 and M4 lists pick it up). Same fabricated-value class
+as PI-V3D-4/-7.
+
+Witness upgrade: the fault-latch clear line now self-decodes `VIO_ID`/`VIO_ADDR` into
+`(client NAME @ VA 0xXXXX)` using the live `DEBUG_INFO` va-width, so the next sitting reads the true
+faulting address directly. Quiet-boot unchanged — the decode prints only inside the existing
+fault-latched path. Expected metal flip: bin completes with `MMU_fault=0x0` and `CT0CA=EA`; render
+latches `CTRUN` and walks `[BA, EA)`; samples flip from `0x55555555` poison toward the PI-V3D-9
+expectations (any residual interior `MISS` isolates shader geometry/colour tuning, per V3D-9).
+
 ### References of record
 
 - Register layout: Linux `drivers/gpu/drm/v3d/v3d_regs.h` (hub + core + MMU offsets, field bits).

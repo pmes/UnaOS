@@ -791,7 +791,16 @@ const P_TILE_LIST_INITIAL_BLOCK_SIZE: u8 = 126;
 const P_MULTICORE_TILE_LIST_BASE: u8 = 123; // Multicore Rendering Tile List Set Base
 const P_MULTICORE_SUPERTILE_CFG: u8 = 122;
 const P_SUPERTILE_COORDINATES: u8 = 23;
-const P_END_OF_RENDERING: u8 = 0; // Halt (Mesa END_OF_RENDERING)
+// PI-V3D-10 boot-P6 root cause #2 (the render-kick gate): this constant was 0 — the "Halt" opcode —
+// mislabeled as Mesa's END_OF_RENDERING. In v3d_packet.xml they are DISTINCT packets: code 0 = Halt,
+// code 13 = "End of rendering" (shortname end_render), and BOTH v3dx_rcl.c (gallium) and
+// v3dvx_cmd_buffer.c (v3dv) terminate every RCL with END_OF_RENDERING, never Halt. The difference is
+// load-bearing for the QUEUED kick path (CTnQBA/QEA): END_OF_RENDERING completes the FRAME (the CLE
+// returns to idle and the next queued CT1 job may dispatch), while Halt merely stops the CLE with the
+// frame still open. M3's Halt-terminated list therefore "passed" (its store had already landed) but
+// left CT1 wedged in the halted frame — the exact boot-P6 signature: M4's CT1QEA write was accepted,
+// CTRUN never set, CT1CA parked at M3's end (0x001f806a). Same fabricated-value class as PI-V3D-4/-7.
+const P_END_OF_RENDERING: u8 = 13; // "End of rendering" (v3d_packet.xml code 13) — NOT Halt (0)
 
 // TILE_RENDERING_MODE_CFG sub-ids (v42 `sub-id` field defaults).
 const TRMC_SUBID_COMMON: u64 = 0;
@@ -1139,6 +1148,20 @@ fn wait_bit_clear(base: usize, reg: usize, mask: u32, what: &str) -> bool {
     true
 }
 
+/// PI-V3D-10: decode the V3D MMU violation witness pair into (client name, true VA). Hardware facts
+/// from Linux drm/v3d (facts-only, no code lifted): the violating AXI client is VIO_ID >> 5 indexing
+/// {L2T, PTB, PSE, TLB, CLE, TFU, MMU, GMP} on V3D 4.1+ (v3d_irq.c), and VIO_ADDR holds the VA
+/// right-shifted by (va_width − 32), where va_width = 30 + DEBUG_INFO[7:4] (v3d_drv.c). Boot-P6
+/// ground truth: DEBUG_INFO 0x550 → va_width 35 → shift 3; VIO_ADDR 0x04841800 → VA 0x2420C000.
+fn vio_decode(vio_id: u32, vio_addr: u32) -> (&'static str, u64) {
+    const CLIENTS: [&str; 8] = ["L2T", "PTB", "PSE", "TLB", "CLE", "TFU", "MMU", "GMP"];
+    let client = CLIENTS[((vio_id >> 5) & 0x7) as usize];
+    let dbg = mmio_read(V3D_HUB_BASE, V3D_MMU_DEBUG_INFO);
+    let va_width = 30 + ((dbg >> 4) & 0xF) as u64;
+    let shift = va_width.saturating_sub(32);
+    (client, (vio_addr as u64) << shift)
+}
+
 /// PI-V3D-9: clear any latched V3D-MMU translation fault (PT_INVALID / WRITE_VIOLATION / CAP_EXCEEDED),
 /// mirroring Linux `v3d_irq.c`: read V3D_MMU_CTL and write it straight back — the fault-status bits are
 /// write-1-to-clear, so echoing the read value clears the latched fault while the ENABLE/abort config
@@ -1154,13 +1177,14 @@ fn clear_mmu_fault_latch(when: &str) {
         mmio_write(V3D_HUB_BASE, V3D_MMU_CTL, ctl); // W1C: echo clears the sticky fault bits
         dsb();
         let after = mmio_read(V3D_HUB_BASE, V3D_MMU_CTL);
+        let (client, va) = vio_decode(vio_id, vio_addr);
         serial_println!(
-            ":: V3D: MMU fault-latch CLEARED ({}) — was CTL={:#010x} (PT_INVALID={} WRITE_VIOLATION={} CAP_EXCEEDED={}) VIO_ADDR={:#010x} VIO_ID={:#010x} -> CTL={:#010x} ::",
+            ":: V3D: MMU fault-latch CLEARED ({}) — was CTL={:#010x} (PT_INVALID={} WRITE_VIOLATION={} CAP_EXCEEDED={}) VIO_ADDR={:#010x} VIO_ID={:#010x} (client {} @ VA {:#010x}) -> CTL={:#010x} ::",
             when, ctl,
             (fault & V3D_MMU_CTL_PT_INVALID != 0) as u32,
             (fault & V3D_MMU_CTL_WRITE_VIOLATION != 0) as u32,
             (fault & V3D_MMU_CTL_CAP_EXCEEDED != 0) as u32,
-            vio_addr, vio_id, after
+            vio_addr, vio_id, client, va, after
         );
     } else {
         serial_println!(":: V3D: MMU fault-latch clear ({}) — none latched (CTL={:#010x}) ::", when, ctl);
@@ -1493,8 +1517,18 @@ fn build_bin_cl(num_attrs: u32) -> usize {
     );
     // GL_SHADER_STATE: address is a 27-bit field @ start5 → the record's 32-byte-aligned address's top
     // 27 bits; number of attribute arrays in the low 5 bits.
+    //
+    // PI-V3D-10 boot-P6 root cause #1 (the out-of-arena bin fault): this packet was emitted with
+    // length 4 — opcode + only THREE payload bytes — but the address field spans XML bits [5, 31], so
+    // the payload is 4 bytes and the packet is 5 bytes total (v3d_packet.xml code 64). The CLE
+    // therefore consumed the FOLLOWING packet's opcode byte — VERTEX_ARRAY_PRIMS, 36 = 0x24 — as the
+    // shader-record address's top byte and fetched the record at 0x24000000 | shadrec. Boot-P6 proof:
+    // VIO_ID 0x81 >> 5 = client 4 = CLE (v3d_irq.c v3d_41_axi_ids), and VIO_ADDR 0x04841800 scaled by
+    // (va_width − 32) = 3 (DEBUG_INFO 0x550 → VA_WIDTH field 5 → va_width 35, per v3d_drv.c) gives
+    // VA 0x2420C000 = 0x24 << 24 | 0x20C000 — exactly the shader record (arena+0x1C000) with the 0x24
+    // opcode byte on top. The "POR-shaped garbage" was our own next opcode. Length corrected to 5.
     w.pkt(
-        Pkt::new(P_GL_SHADER_STATE, 4)
+        Pkt::new(P_GL_SHADER_STATE, 5)
             .f(0, 5, num_attrs as u64) // number of attribute arrays
             .f(5, 27, (shadrec >> 5) as u64) // record address (32-byte aligned)
             .done(),
