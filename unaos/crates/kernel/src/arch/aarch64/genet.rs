@@ -247,9 +247,21 @@ mod metal {
     const RING_DEPTH: usize = 32;
     /// Per-descriptor buffer (a full Ethernet frame + GENET's 2-byte RX status pad fits).
     const BUF_SIZE: usize = 2048;
-    /// GENET prepends a 2-byte hardware status/pad on RX when RBUF_ALIGN_2B is set, so payload starts
-    /// at buffer+2. (We enable the align so DMA writes land 4-byte aligned.)
-    const RX_STATUS_PAD: usize = 2;
+    /// PI-GENET-4 (the boot-P6 10/10-unclassified fix): RBUF_CTRL is programmed `64B_EN | ALIGN_2B`
+    /// (see `init`), and with `64B_EN` set GENET prepends a 64-BYTE receive-status block to every RX
+    /// buffer, followed by the 2-byte IP-align pad — and the descriptor length INCLUDES both. Linux
+    /// `bcmgenet_desc_rx` pulls 64 (`desc_64b_en`) then 2 (the align pad) before handing the skb up.
+    /// This driver previously stripped only the 2-byte pad, so every frame smoltcp classified began
+    /// 62 bytes early — inside the status block — making all 10 popped boot-P6 frames read as garbage
+    /// ethertype (no OFFER ever seen). Payload starts at buffer + 64 + 2.
+    /// (FCS: UMAC CMD.CRC_FWD is never set here, so the MAC strips the FCS — the length does NOT
+    /// include it; no additional trim is owed.)
+    const RX_STATUS_BLOCK: usize = 64;
+    const RX_ALIGN_PAD: usize = 2;
+    const RX_STATUS_PAD: usize = RX_STATUS_BLOCK + RX_ALIGN_PAD;
+    /// PI-GENET-4: bound on the popped-frame witness lines (the boot-P6 evidence question — "what ARE
+    /// the 10 popped frames?" — needs only a handful of exemplars). Mirrors NET-4t on the Orin.
+    const PG4_RX_DUMPS: u64 = 4;
     /// Largest frame the MAC accepts (jumbo-safe default; a normal frame is far under).
     const MAX_FRAME_LEN: u32 = 1536;
 
@@ -265,6 +277,54 @@ mod metal {
         tx_prod: u16, // our producer cursor
         tx_count: u64,
         phy_addr: u8,
+        /// PI-GENET-4: popped frames given a raw-bytes witness line so far (bounds the evidence
+        /// noise to `PG4_RX_DUMPS`; all inside the `genet`-gated battery — default boot unchanged).
+        pg4_rx_dumped: u64,
+    }
+
+    /// PI-GENET-4 (the NET-4t helper, GENET's own copy — lanes do not share code): resolve a frame's
+    /// EFFECTIVE EtherType by peeling up to two 802.1Q/802.1ad VLAN tags (0x8100 / 0x88a8). Returns
+    /// `(ethertype, l3_offset, outermost_vlan_id)`; `None` vlan for an untagged frame. Read-only and
+    /// bounds-checked; a frame too short for its claimed tag yields the raw TPID as the ethertype.
+    fn eth_effective_type(frame: &[u8]) -> (u16, usize, Option<u16>) {
+        if frame.len() < 14 {
+            return (0, 14, None);
+        }
+        let mut off = 12usize;
+        let mut vlan: Option<u16> = None;
+        for _ in 0..2 {
+            let et = u16::from_be_bytes([frame[off], frame[off + 1]]);
+            if (et == 0x8100 || et == 0x88a8) && frame.len() >= off + 6 {
+                let tci = u16::from_be_bytes([frame[off + 2], frame[off + 3]]);
+                if vlan.is_none() {
+                    vlan = Some(tci & 0x0fff);
+                }
+                off += 4;
+            } else {
+                return (et, off + 2, vlan);
+            }
+        }
+        let et = u16::from_be_bytes([frame[off], frame[off + 1]]);
+        (et, off + 2, vlan)
+    }
+
+    /// PI-GENET-4: is this (post-peel) an IPv4/UDP frame on the DHCP client/server ports? Enough of a
+    /// decode to anchor the named DHCP-under-VLAN verdict line; bounds-checked, read-only.
+    fn is_dhcp_udp(frame: &[u8], et: u16, l3_off: usize) -> bool {
+        if et != 0x0800 {
+            return false;
+        }
+        let Some(ip) = frame.get(l3_off..) else { return false };
+        if ip.len() < 20 || (ip[0] >> 4) != 4 {
+            return false;
+        }
+        let ihl = ((ip[0] & 0x0f) as usize) * 4;
+        if ihl < 20 || ip.len() < ihl + 8 || ip[9] != 17 {
+            return false;
+        }
+        let sport = u16::from_be_bytes([ip[ihl], ip[ihl + 1]]);
+        let dport = u16::from_be_bytes([ip[ihl + 2], ip[ihl + 3]]);
+        (sport == 67 || sport == 68) && (dport == 67 || dport == 68)
     }
 
     // The driver owns raw DMA pointers; touched only behind the `GENET_DEVICE` mutex on the single-core
@@ -768,8 +828,16 @@ mod metal {
             }
             let i = (self.rx_c_index as usize) % RING_DEPTH;
             let d = self.rx_desc(i);
-            let ls = self.r(d + DMA_DESC_LENGTH_STATUS);
-            // Received length is bits [beyond 16]; strip the 2-byte hardware RX status pad.
+            barrier(); // order the buffer read AFTER observing the advanced producer index
+            // PI-GENET-4: with RBUF 64B_EN set, the authoritative length_status is the FIRST WORD of
+            // the in-buffer 64-byte receive-status block (Linux `bcmgenet_desc_rx`, `desc_64b_en`
+            // path: `status = (struct status_64 *)skb->data; dma_length_status = status->length_status`)
+            // — not the descriptor word. Read the status block; fall back to the descriptor word only
+            // if the block reads zero (belt-and-braces on odd hardware states).
+            let sb = unsafe { read_volatile(self.rx_bufs.add(i * BUF_SIZE) as *const u32) };
+            let ls = if sb != 0 { sb } else { self.r(d + DMA_DESC_LENGTH_STATUS) };
+            // Received length is bits [beyond 16]; strip the 64-byte status block + 2-byte align pad
+            // (both included in the reported length — see RX_STATUS_PAD).
             let total = ((ls >> DMA_BUFLENGTH_SHIFT) & 0x0fff) as usize;
             let payload = total.saturating_sub(RX_STATUS_PAD);
             let len = payload.min(BUF_SIZE - RX_STATUS_PAD).min(out.len());
@@ -778,8 +846,51 @@ mod metal {
                 unsafe { core::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), len) };
             }
             self.rx_count += 1;
+            // PI-GENET-4 witness: the first PG4_RX_DUMPS popped frames print len + dst/src MAC +
+            // effective ethertype (+ vlan id if tagged) + the first 32 raw bytes, one line each — the
+            // boot-P6 distinguishing fact ("what ARE the 10 popped frames?") reads straight off these
+            // lines. A DHCP frame found under a VLAN gets the named verdict line (the NET-4t verdict:
+            // smoltcp has no 802.1Q — the socket can never see it).
+            if self.pg4_rx_dumped < PG4_RX_DUMPS {
+                self.pg4_rx_dumped += 1;
+                let frame = &out[..len];
+                let n = len.min(32);
+                let mut hex = [0u8; 64];
+                for (j, &b) in frame[..n].iter().enumerate() {
+                    const HD: &[u8; 16] = b"0123456789abcdef";
+                    hex[j * 2] = HD[(b >> 4) as usize];
+                    hex[j * 2 + 1] = HD[(b & 0x0f) as usize];
+                }
+                let hexs = core::str::from_utf8(&hex[..n * 2]).unwrap_or("?");
+                let (et, l3_off, vlan) = eth_effective_type(frame);
+                if frame.len() >= 14 {
+                    serial_println!(
+                        "{}   [pigenet4] rx[{}] len={} dst={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} src={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} et={:#06x} vlan={} first{}B={} ::",
+                        PG, self.pg4_rx_dumped - 1, len,
+                        frame[0], frame[1], frame[2], frame[3], frame[4], frame[5],
+                        frame[6], frame[7], frame[8], frame[9], frame[10], frame[11],
+                        et,
+                        vlan.map_or(-1i32, |v| v as i32),
+                        n, hexs
+                    );
+                } else {
+                    serial_println!(
+                        "{}   [pigenet4] rx[{}] len={} RUNT(<14) first{}B={} ::",
+                        PG, self.pg4_rx_dumped - 1, len, n, hexs
+                    );
+                }
+                if vlan.is_some() && is_dhcp_udp(frame, et, l3_off) {
+                    serial_println!(
+                        "{}   [pigenet4] ^ DHCP frame is 802.1Q-tagged (vlan id={}) — smoltcp does not parse VLAN; the socket never sees it (untag the port or the drop stands) ::",
+                        PG, vlan.unwrap_or(0)
+                    );
+                }
+            }
             // Recycle: re-clear the descriptor status (hardware refills), keep the buffer address. No
             // WRAP bit — the RDMA engine wraps via END_ADDR, not a per-descriptor status bit.
+            // PI-GENET-4: also re-clear the in-buffer status-block word so a stale length_status can
+            // never be read for the NEXT frame delivered into this recycled buffer.
+            unsafe { write_volatile(self.rx_bufs.add(i * BUF_SIZE) as *mut u32, 0) };
             self.w(d + DMA_DESC_LENGTH_STATUS, 0);
             barrier();
             // Advance our consumer index and publish it (hands the slot back to hardware).
@@ -940,6 +1051,7 @@ mod metal {
             tx_prod: 0,
             tx_count: 0,
             phy_addr: 1,
+            pg4_rx_dumped: 0,
         };
 
         // ── M1: poison-honest version probe BEFORE any write — the platform-classifying read ──
