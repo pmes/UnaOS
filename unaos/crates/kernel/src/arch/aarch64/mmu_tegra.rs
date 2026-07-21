@@ -136,13 +136,22 @@ const XCARVE_GIB9_SIZE: u64 = 0x0098_0000; // 9.5 MiB, ends at 0x26c180000 (DTB 
 /// ADDR 0x800000026c6be4a0 → PA 0x26c6be4a0 — above 0x26c400000, refuting the XCARVE-9 assumption
 /// that the declared upper neighbor capped the family. Same method as XCARVE-9: no honest extent is
 /// readable (DTB/UEFI silent, MC probing is the rejected EL3-crash class), so exclude a bounded
-/// GUESS window starting flush at the declared neighbor's top and covering the observed granule
-/// with slack: **4 MiB** `[0x26c400000, 0x26c800000)`. A hit at/above 0x26c800000 refutes this in
-/// turn. Heap (top 0x26b3ca000) unaffected.
+/// GUESS window starting flush at the declared neighbor's top. XCARVE-10 tried 4 MiB and was
+/// refuted within the hour; see the XCARVE-11 note at `XCARVE_GIB9B_SIZE` for the full-gap extent
+/// now used. Heap (top 0x26b3ca000) unaffected.
 #[cfg(feature = "tegra")]
 const XCARVE_GIB9B_BASE: u64 = 0x2_6c40_0000;
 #[cfg(feature = "tegra")]
-const XCARVE_GIB9B_SIZE: u64 = 0x0040_0000; // 4 MiB, ends at 0x26c800000 — a GUESS
+// XCARVE-11: the 4 MiB XCARVE-10 guess was refuted within the hour (boot-36-retry RAS at PA
+// 0x26d03f600, above 0x26c800000). Four hits now CLIMB monotonically (0x26b900000 → 0x26bc5ee90
+// → 0x26c6be4a0 → 0x26d03f600) — incremental widening is a refuted method; the protected span is
+// (or behaves as) the ENTIRE undeclared gap. So exclude everything from the declared
+// [0x26c180000,0x26c400000) carveout's top to the next declared object above, the
+// framebuffer/scanout carveout at 0x279e00000 (CPU-written; never excluded): 218 MiB. Heap
+// (top 0x26b3ca000) and every mapped consumer sit below; the gap holds nothing we map. A RAS at
+// or above 0x279e00000 (inside fb) would refute the static-window model itself, not the extent.
+#[cfg(feature = "tegra")]
+const XCARVE_GIB9B_SIZE: u64 = 0x0da0_0000; // 218 MiB, ends at 0x279e00000 (fb carveout base) — full gap
 
 #[cfg(feature = "tegra")]
 static mut L2_POOL: [PageTable; MAX_SPLIT_GIB] = [const { PageTable([0; 512]) }; MAX_SPLIT_GIB];
