@@ -1916,6 +1916,45 @@ mod metal {
             let d = unsafe { read_volatile(self.rx_ring.add(self.rx_cur)) };
             // OWN set ⇒ still owned by the NIC (not yet filled) ⇒ ring empty.
             if d.opts1 & DESC_OWN != 0 {
+                // NET-4D rev5 (armed builds, DHCP window only): the ACK lands between completions
+                // and is overwritten by segment noise before the next pop ever scans (boot-44:
+                // server lease RENEWED on the wire, zero ACKs readable at pops). So scan for a
+                // DHCP-to-client frame on EVERY poll while the window is open — catch it within
+                // one poll (~µs) of landing, consume-on-read, deliver with header-derived length.
+                if option_env!("UNAOS_NET4_BUF1").is_some() && self.rxcls_active {
+                    for k in 0..NUM_RX {
+                        let bk = unsafe { self.rx_buffers.add(k * RX_BUF_SIZE) };
+                        let et = u16::from_be_bytes([
+                            unsafe { read_volatile(bk.add(12)) },
+                            unsafe { read_volatile(bk.add(13)) },
+                        ]);
+                        if et != 0x0800
+                            || unsafe { read_volatile(bk.add(23)) } != 17
+                            || u16::from_be_bytes([
+                                unsafe { read_volatile(bk.add(36)) },
+                                unsafe { read_volatile(bk.add(37)) },
+                            ]) != 68
+                        {
+                            continue;
+                        }
+                        let ip_total = u16::from_be_bytes([
+                            unsafe { read_volatile(bk.add(16)) },
+                            unsafe { read_volatile(bk.add(17)) },
+                        ]) as usize;
+                        let len = (14 + ip_total).max(60).min(RX_BUF_SIZE).min(out.len());
+                        unsafe { core::ptr::copy_nonoverlapping(bk as *const u8, out.as_mut_ptr(), len) };
+                        for i in 0..16 {
+                            unsafe { core::ptr::write_volatile(bk.add(i), 0u8) };
+                        }
+                        serial_println!(
+                            "{}   [net4D] poll-scan HARVEST: DHCP-to-client frame len={} from buffer[{}] (no completion pending; consumed) ::",
+                            P4, len, k
+                        );
+                        self.rx_count += 1;
+                        self.net4d_classify(&out[..len]);
+                        return Some(len);
+                    }
+                }
                 return None;
             }
             // NET-4e: DMA READ BARRIER between observing OWN-clear and reading the buffer — the fix
