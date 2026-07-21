@@ -49,12 +49,11 @@ impl Engine {
             state.nodes.clear();
         });
 
-        let mut context = ContextBuilder::new().build().unwrap();
+        let mut context = crate::event_loop::create_context();
         
         Self::setup_console(&mut context);
         Self::setup_document(&mut context, document);
         crate::api::window::setup_window(&mut context);
-        // crate::api::cssom::setup_cssom(&mut context);
         crate::api::events::init(&mut context);
         
         Self { context }
@@ -77,17 +76,9 @@ impl Engine {
                 0,
             )
             .build();
-        context.register_global_property(boa_engine::string::JsString::from("console"), console, Attribute::all());
+        let _ = context.register_global_property(boa_engine::string::JsString::from("console"), console, Attribute::all());
 
         crate::api::fetch::init(context);
-
-        let set_timeout = NativeFunction::from_fn_ptr(|_, args, context| {
-            if let Some(cb) = args.get(0).and_then(|v| v.as_callable()) {
-                let _ = cb.call(&JsValue::undefined(), &[], context);
-            }
-            Ok(JsValue::new(1)) // return timer id
-        });
-        context.register_global_callable(boa_engine::string::JsString::from("setTimeout"), 2, set_timeout).unwrap();
 
         let clear_timeout = NativeFunction::from_fn_ptr(|_, _, _| Ok(JsValue::undefined()));
         context.register_global_callable(boa_engine::string::JsString::from("clearTimeout"), 1, clear_timeout).unwrap();

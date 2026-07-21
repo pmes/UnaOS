@@ -18,14 +18,14 @@ bandy = { path = "../../libs/bandy" }
 # The dev-tree Bolt manifest is a versioned, commented config file the crate
 # reads; serde + toml deserialize it (both already in the workspace lock).
 serde = { version = "1", features = ["derive"] }
-toml = "0.9"
+toml = "1.1"
 # git2 removed in favor of pure-Rust gix.
 # `status` powers the real is_dirty check (index-vs-worktree, tree-vs-index).
-gix = { version = "0.80", default-features = false, features = ["parallel", "revision", "blob-diff", "status"] }
+gix = { version = "0.85", default-features = false, features = ["parallel", "revision", "blob-diff", "status"] }
 # The vault-probe rides UnaFS's fail-closed mount check (read-only, host-native).
 unafs = { path = "../../unaos/libs/fs/unafs" }
-gtk4 = { version = "0.10.3", features = ["v4_12"], optional = true }
-glib = { version = "0.21", optional = true }
+gtk4 = { version = "0.11.4", features = ["v4_12"], optional = true }
+glib = { version = "0.22", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

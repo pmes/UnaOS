@@ -6,6 +6,24 @@ pub struct LayoutTree {
     pub taffy: taffy::TaffyTree,
     pub root_node: taffy::NodeId,
     pub node_map: HashMap<taffy::NodeId, NodeRef>, // Maps layout boxes back to DOM nodes
+    pub dirty: bool,
+}
+
+impl LayoutTree {
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    pub fn recompute(&mut self, dom: &NodeRef) {
+        if !self.dirty {
+            return;
+        }
+        let new_tree = compute_layout(dom);
+        self.taffy = new_tree.taffy;
+        self.root_node = new_tree.root_node;
+        self.node_map = new_tree.node_map;
+        self.dirty = false;
+    }
 }
 
 pub fn compute_layout(dom: &NodeRef) -> LayoutTree {
@@ -69,5 +87,6 @@ pub fn compute_layout(dom: &NodeRef) -> LayoutTree {
         taffy,
         root_node,
         node_map,
+        dirty: false,
     }
 }

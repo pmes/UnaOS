@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Aether Test Page</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 40px;
+            background-color: #f0f0f0;
+        }
+        h1 {
+            color: #333;
+        }
+        .container {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+        }
+    </style>
+    <style>
+        .container {
+            display: flex;
+            flex-direction: column;
+            padding: 20px;
+        }
+        .dyn-box {
+            display: flex;
+            width: 200px;
+            height: 100px;
+            margin: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Welcome to Aether (M3/M5)</h1>
+        <ul>
+            <li>Fetched the HTML document</li>
+            <li>Parsed the DOM tree using kuchiki</li>
+            <li>Computed styling rules (cssparser)</li>
+            <li>Generated a Taffy layout</li>
+            <li>JS Event loop handles setTimeout!</li>
+        </ul>
+    </div>
+    <script>
+        console.log("Hello from Aether JS Engine!");
+        setTimeout(() => {
+            let container = document.querySelector(".container");
+            if (container) {
+                let newEl = document.createElement("div");
+                newEl.textContent = "I was added via setTimeout!";
+                // In a full CSSOM we'd do newEl.className = "dyn-box", but we haven't mapped that.
+                // Our CSS engine might not select it if it's dynamic unless we re-run apply_css, 
+                // but let's just append it.
+                container.appendChild(newEl);
+                console.log("Appended new element to DOM via microtask/setTimeout!");
+            }
+        }, 10);
+    </script>
+</body>
+</html>

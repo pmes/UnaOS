@@ -112,6 +112,10 @@ pub enum SMessage {
         records: Vec<DispatchRecord>,
     },
 
+    // --- AETHER (The Browser) ---
+    OpenDocument { url: String },
+    SurfaceBlit { url: String, width: u32, height: u32, pixels: Vec<u8> },
+
     // --- EDITOR (The Code Pane) ---
     /// Load a document into the active editor pane. Fired when a file is
     /// selected for editing; the macOS `MacOSSpline` router pushes `content`

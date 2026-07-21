@@ -11,13 +11,13 @@ description = "Forensic data recovery and preservation tool"
 memmap2 = "0.9"
 
 # THE INTERFACE: 'clap' for robust command-line parsing.
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.6", features = ["derive"] }
 
 # THE VISUALIZER: 'hex' ensures we see the raw truth.
 hex = "0.4"
 
 # NEW: For cryptographic proof (SHA-256)
-sha2 = "0.10"
+sha2 = "0.11"
 
 # NEW: For professional progress bars
 indicatif = "0.18"
