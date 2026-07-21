@@ -162,11 +162,24 @@ fn build_ui(app: &Application) {
     let engine_tick = engine.clone();
     let da_tick = drawing_area.clone();
     let handle_tick = handle.clone();
+    let window_tick = window.clone();
     glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
         let _guard = handle_tick.enter();
         if engine_tick.borrow_mut().tick() {
-            // GTK4 queues draw on the whole widget
-            da_tick.queue_draw();
+            // Check damages
+            let damages = std::mem::take(&mut engine_tick.borrow_mut().damage_rects);
+            if damages.is_empty() {
+                da_tick.queue_draw();
+            } else {
+                for (x, y, w, h) in damages {
+                    da_tick.queue_draw_area(x as i32, y as i32, w as i32, h as i32);
+                }
+            }
+            
+            let title = engine_tick.borrow().title.clone();
+            if title != window_tick.title().unwrap_or_default().as_str() {
+                window_tick.set_title(Some(&title));
+            }
         }
         glib::ControlFlow::Continue
     });

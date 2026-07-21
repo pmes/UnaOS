@@ -29,6 +29,7 @@ pub struct AetherEngine {
     pub history_idx: usize,
     pub width: u32,
     pub height: u32,
+    pub title: String,
 }
 
 impl AetherEngine {
@@ -45,6 +46,7 @@ impl AetherEngine {
             history_idx: 0,
             width: 800,
             height: 600,
+            title: "Aether Browser".to_string(),
         }
     }
 
@@ -104,8 +106,23 @@ impl AetherEngine {
     }
 
     async fn load_url_internal(&mut self, url: &str, add_history: bool) -> anyhow::Result<()> {
-        let html = net::fetch_document(url).await?;
+        let html = match net::fetch_document(url).await {
+            Ok(content) => content,
+            Err(e) => {
+                format!(
+                    "<html><head><title>Error</title></head><body style=\"background-color: #f8d7da; color: #721c24; padding: 20px; font-family: sans-serif;\"><h1>Navigation Error</h1><p>Failed to load {}: {}</p></body></html>",
+                    url, e
+                )
+            }
+        };
         let document = dom::parse_html(&html);
+        
+        self.title = "Aether Browser".to_string();
+        if let Ok(mut titles) = document.select("title") {
+            if let Some(title_node) = titles.next() {
+                self.title = title_node.as_node().text_contents();
+            }
+        }
         
         if add_history {
             self.history.truncate(self.history_idx);
@@ -116,7 +133,7 @@ impl AetherEngine {
         let mut js_engine = js::Engine::new(document.clone());
         if let Ok(scripts) = document.select("script") {
             for script_node in scripts {
-                let text = script_node.text_contents();
+                let text = script_node.as_node().text_contents();
                 if !text.trim().is_empty() {
                     let _ = js_engine.execute(&text);
                 }
@@ -126,7 +143,7 @@ impl AetherEngine {
         let mut layout_tree = layout::compute_layout(&document);
         if let Ok(styles) = document.select("style") {
             for style_node in styles {
-                let text = style_node.text_contents();
+                let text = style_node.as_node().text_contents();
                 css::apply_css(&mut layout_tree, &text);
             }
         }
