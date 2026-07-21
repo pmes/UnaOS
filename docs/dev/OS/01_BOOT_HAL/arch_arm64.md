@@ -7255,6 +7255,31 @@ non-regression only.
   `test-arm` MISSION SUCCESS, and `UNAOS_GICV3=1 UNAOS_WITNESS=1 UNAOS_VNET=1 test-arm` — vnet lease + the
   NET-4j reproducer stay PASS).
 
+- **NET-4v→4A — the RX payload sinks to a STUCK buffer; mechanism localized below the driver lane.**
+  With the inbound alias armed and readback-proven (net4v `covers=ALL`), both SMMU instances globally
+  bypassed (net4x), and the descriptor rings clean-published to the PoC (net4x), the residual RX defect
+  was scaled and localized: only slot-0 recycles ever carried payload while later slots read DRAM-zero at
+  real writeback lengths. NET-4y disabled early-RX (RX_EARLY_OFF) and wrote CPlusCmd masked per r8169;
+  NET-4z's scan-all destination witness then produced the decisive fact (boot-36-retry): **rx[0]→buffer 0,
+  rx[1]→buffer 1, rx[2..7]→buffer 1 STUCK** (the LAST descriptor of a 2-deep prefetch burst), with
+  per-slot OWN/len writebacks correct throughout and ring DRAM carrying the correct distinct addresses
+  (net4x [MATCH]). **NET-4A verdict (code analysis):** mechanism (a) — **NIC-internal descriptor-address
+  REUSE** — survives; the NIC latches the last-fetched descriptor's buffer address and does not re-fetch,
+  while its OWN/len writeback rides the correctly-advancing internal ring index. Mechanism (b) —
+  per-pop cache-line interplay on the 16 B-strided ring — is **refuted**: (1) no clean/invalidate on the
+  ring can substitute one descriptor's `addr` into another slot (every maintenance point re-derives the
+  correct addr; a stale whole-line clean at worst resurrects a same-line neighbor's OWN with its OWN
+  correct addr); (2) the (b) partially-stale sub-case predicts a zero-addr → bus-0 `0x200` sink, but the
+  landing is a VALID buffer with no RAS. The sanctioned (b) fixes don't apply: 64 B descriptor padding is
+  illegal (fixed 16 B C+ stride, no programmable descriptor-size register), and a non-cacheable ring is an
+  mmu_tegra arc — `map_mmio_window` is 1-GiB-block granular and would turn the heap's RAM GiB into Device
+  memory (breaking `ldxr/stxr`). So there is **no in-file functional fix**; the reuse is a NIC/RC
+  descriptor-fetch (or inbound descriptor-READ coherency) behavior below the driver's programming lane.
+  NET-4A lands the honest refutation (NET-4v precedent) plus a cross-pop `[net4A]` witness: it correlates
+  net4z's per-pop landing indices and emits ONE verdict line when ≥4 consecutive pops land in the same
+  buffer while the completed slot advances 1:1 — machine-checkable proof of the reuse on the next boot,
+  and its refutation if a future change makes landing-index == completed-slot.
+
 ### XCARVE-4 — the endgame (2026-07-20, boots 21/22)
 The XCARVE writer is named and fixed. XCARVE-3's unmap converted the SNOC RAS into a precise
 synchronous WRITE fault (boot-22: ESR=0x96000146, FAR=0x26b800000 = align_up(heap_hi, 8 MiB),

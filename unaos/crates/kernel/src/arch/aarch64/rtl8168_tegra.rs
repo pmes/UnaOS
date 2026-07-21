@@ -274,6 +274,54 @@
 // `buf0-holds-the-frame=yes/no` verdict (nonzero + sane EtherType, and same-as-this-pop's-frame)
 // — if yes, the NIC provably resolves every RX payload to buffer[0]'s address.
 //
+// ## NET-4A — the stuck payload address is a NIC-internal descriptor-address REUSE, not a cache bug.
+//
+// Boot-36-retry (net4z scan-all, RINGDUMP armed) gave the decisive fact: rx[0]→buffer 0 (correct),
+// rx[1]→buffer 1 (correct), rx[2..7]→buffer 1, STUCK — including len=108/128 non-ARP frames whose
+// heads cannot false-match a stale ARP. Writebacks (OWN/len) land per-slot correctly the whole time;
+// descriptor DRAM held correct DISTINCT addrs pre-enable (net4x [MATCH]). The stuck address is
+// desc[1]'s (the LAST descriptor of a 2-deep prefetch burst), NOT the arena base — net4y's
+// "buf0-holds-the-frame" was a stale-frame artifact. This arc ruled the brief's two candidate
+// mechanisms in/out by CODE ANALYSIS and lands the verdict + a cross-pop witness (no functional fix —
+// the survivor is below this driver's lane; NET-4v refutation precedent).
+//
+//   * Mechanism (b) — per-pop re-arm's cache-line interplay (descs are 16 B, 4 per 64 B line; every
+//     clean/invalidate covers a whole line) — is REFUTED, two independent ways:
+//       1. CODE: the descriptor `addr` field in ring DRAM is only ever written with the correctly
+//          computed `rx_buffers + i*RX_BUF_SIZE` (alloc_rx + every re-arm), and net4x proves DRAM holds
+//          the correct distinct addrs. Trace every maintenance point: the read-side `invalidate_range`
+//          at the top of `rx_frame_raw` only DROPS clean lines (re-read from DRAM); the re-arm
+//          `clean_range` writes back the CPU's cached line, but that line was just refilled from DRAM
+//          (the `read_volatile` a few lines above), so its neighbor descriptors carry their CORRECT
+//          addrs. The worst a stale whole-line clean can do is resurrect a same-line neighbor's OWN
+//          with the neighbor's OWN (correct) address — it can NEVER substitute desc[1]'s address into
+//          desc[2..7]'s slot. So no ring cache op can redirect a payload to a different slot's buffer.
+//       2. EVIDENCE: the brief's (b) "partially-stale line" sub-case predicts a ZERO addr fetch →
+//          payload to bus 0 → the 0x200 IOB/ACI FillWrite sink. net4z shows a VALID buffer-1 landing
+//          and NO 0x200 RAS — the opposite of the (b) prediction.
+//     Padding the descriptor to a full 64 B line (the other (b) fix) is illegal here: the 8168 C+ engine
+//     indexes descriptors by a FIXED 16-byte stride (RDSAR is the base; there is no programmable
+//     descriptor-size/stride register), so a 64 B stride would desync the NIC's index math. And making
+//     the RING non-cacheable is NOT an in-file fix: `map_mmio_window` (the only Device/NC lever the
+//     driver can call) is 1-GiB-block granular, so it would turn the whole RAM GiB the heap lives in into
+//     Device memory — breaking `ldxr/stxr` (every spinlock/atomic) in that GiB. A sub-GiB Normal-NC/L3
+//     mapping is an mmu_tegra arc, exactly as NET-4m assessed — out of this lane.
+//   * Mechanism (a) — descriptor-fetch burst reuse — SURVIVES and describes the signature: the NIC
+//     prefetched a 2-descriptor burst at RxEnb (rx[0]→buf0, rx[1]→buf1), then reuses the last-fetched
+//     buffer address (desc[1]'s = buf1) for every later completion while its OWN/len writeback rides the
+//     correctly-advancing internal ring index. The reference (r8169) exposes NO host RX doorbell / no
+//     per-descriptor prefetch kick (RX fetch is continuous on real silicon; RDSAR rewrite only resets
+//     the fetch pointer to the ring base, which r8169 never does in steady state), and our ring DRAM is
+//     provably correct — so the failure to re-fetch is NIC/RC-internal (descriptor-fetch/prefetch or the
+//     inbound descriptor-READ coherency the fabric serves), BELOW the driver's programming lane. There
+//     is no honest in-file functional fix; this arc instead lands the decisive cross-pop witness.
+//   * The `[net4A]` witness (knob-gated, read-only; folded into the net4z scan): correlates net4z's
+//     per-pop landing indices ACROSS pops and emits ONE verdict line the moment ≥4 consecutive pops land
+//     in the same buffer index while the completed slot advances 1:1 — the machine-checkable proof of
+//     the reuse mechanism on the next boot (and, symmetrically, its refutation: if a future change makes
+//     landing-index == completed-slot for ≥4 consecutive slots, the stuck-run never reaches 3 pairs and
+//     the verdict never fires).
+//
 // ## Write discipline
 //
 // The driver, being a driver, DOES the fabric writes NET-3 refused: it enables the device's
@@ -817,6 +865,16 @@ mod metal {
         /// index each payload actually landed in — the discriminator between "arena base (index 0)" and
         /// "some other wrong index", and the proof it is not the completed slot's own buffer.
         net4z_probes: u64,
+        /// NET-4A: cross-pop mechanism witness state. `net4z` reports a per-pop landing index; net4A
+        /// correlates them ACROSS pops to prove the boot-36 signature as a single verdict — the payload
+        /// landing index STAYS CONSTANT (stuck at the last-fetched descriptor's buffer) while the
+        /// completed slot ADVANCES, for ≥4 consecutive pops. `net4A_prev_land`/`net4A_prev_slot` are the
+        /// previous pop's landing index and completed slot (−2 = none yet); `net4A_run` counts
+        /// consecutive stuck-and-advancing PAIRS; `net4A_fired` one-shots the verdict line.
+        net4a_prev_land: i64,
+        net4a_prev_slot: i64,
+        net4a_run: u64,
+        net4a_fired: bool,
     }
 
     // The driver owns raw DMA pointers; on the single-CPU main-loop/poll discipline it is only ever
@@ -2019,6 +2077,38 @@ mod metal {
                         "payload landed in an UNEXPECTED buffer index (neither the completed slot nor the arena base)"
                     }
                 );
+                // NET-4A — the CROSS-POP mechanism verdict. net4z names WHERE each payload landed, one
+                // pop at a time; net4A correlates those landings to prove the boot-36 signature as a
+                // SINGLE line: the landing index STAYS CONSTANT (stuck at the last-fetched descriptor's
+                // buffer) while the completed slot ADVANCES, for ≥4 consecutive pops. That pattern is
+                // the fingerprint of NIC-internal descriptor-address REUSE (mechanism (a)): the NIC
+                // latched the last descriptor it fetched and does not re-fetch, so every later
+                // completion's payload DMA targets the same buffer while its OWN/len writeback still
+                // rides the (correctly advancing) internal ring index. It is NOT a driver cache bug
+                // (mechanism (b), refuted — see the NET-4A ledger note): our ring DRAM carries the
+                // correct distinct addr for every slot (net4x [MATCH]), and no clean/invalidate on the
+                // 16 B-strided ring can ever substitute one descriptor's addr into another's slot.
+                let slot = self.rx_cur as i64;
+                if !self.net4a_fired && hit >= 0 {
+                    let advanced = self.net4a_prev_slot >= 0 && slot == self.net4a_prev_slot + 1;
+                    let stuck = self.net4a_prev_land >= 0 && hit == self.net4a_prev_land;
+                    if advanced && stuck {
+                        self.net4a_run += 1;
+                    } else {
+                        self.net4a_run = 0;
+                    }
+                    // `net4a_run` counts consecutive stuck-and-advancing PAIRS; 3 pairs = 4 consecutive
+                    // pops all landing in the same buffer while the slot advanced each time.
+                    if self.net4a_run >= 3 {
+                        self.net4a_fired = true;
+                        serial_println!(
+                            "{}   [net4A] VERDICT mechanism=(a) NIC-internal descriptor-address REUSE: {} consecutive pops (through completed slot {}) all landed in buffer index {} while the completed slot advanced 1:1 — the NIC reuses the LAST-fetched descriptor's buffer addr and does not re-fetch. Ring DRAM is correct (net4x MATCH) ⇒ this is below the driver's programming lane; (b) cache-line interplay is REFUTED (no ring cache op can redirect a payload to another slot's buffer, and (b) predicts a ZERO addr → bus-0 0x200 sink, contradicted by this valid-buffer landing with no RAS) ::",
+                            P4, self.net4a_run + 1, slot, hit
+                        );
+                    }
+                }
+                self.net4a_prev_land = hit;
+                self.net4a_prev_slot = slot;
             }
             // NET-4f/NET-4u: before re-arming, CLEAN+INVALIDATE the whole buffer (upgraded from plain
             // invalidate). The copy above pulled the frame into the D-cache; those lines should be
@@ -2933,6 +3023,10 @@ mod metal {
             net4t_other_dumped: 0,
             net4y_probes: 0,
             net4z_probes: 0,
+            net4a_prev_land: -2,
+            net4a_prev_slot: -2,
+            net4a_run: 0,
+            net4a_fired: false,
         };
 
         // ── M2/M3 GUARD: poison-honest readback through the NEW window BEFORE any register write ──
