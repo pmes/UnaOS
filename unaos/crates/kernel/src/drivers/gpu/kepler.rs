@@ -161,17 +161,124 @@ pub fn init(gpu: &GpuInfo) {
         serial_println!("[NVIDIA] PGRAPH Engine Status (0x400000): 0x{:08X}. Requires firmware for full 2D/3D.", pgraph_status);
 
         // 8. Phase 4: 3D Foundation - PFIFO and Pushbuffer setup
-        let pfifo_status = mmio_read(bar0, regs::NV_PFIFO_BASE);
-        serial_println!("[NVIDIA] PFIFO Engine Status (0x2000): 0x{:08X}.", pfifo_status);
-        
-        let pb_size = 64 * 1024; // 64KB pushbuffer
-        if let Some(pb_offset) = vram_allocator.alloc(pb_size) {
-            let pb = PushBuffer::new(vram_allocator.base_phys + pb_offset, pb_size);
-            serial_println!("[NVIDIA] Phase 4: Allocated 64KB PushBuffer in VRAM at offset 0x{:X} (Capacity: {} commands).", pb_offset, pb.capacity);
-            // In a full implementation, we would register this pushbuffer with PFIFO,
-            // set up the command ring, and write `NV_PFIFO_CACHE1_PUSH1` to submit commands.
-        } else {
-            serial_println!("[NVIDIA] Warning: Failed to allocate PushBuffer in VRAM.");
+        if option_env!("UNAOS_KEPLER_FIFO").is_some() {
+            serial_println!("[NVIDIA] Starting PFIFO initialization...");
+            
+            // Enable PFIFO (bit 8)
+            let pmc_enable = mmio_read(bar0, regs::NV_PMC_ENABLE);
+            mmio_write(bar0, regs::NV_PMC_ENABLE, pmc_enable | 0x100);
+            let check = mmio_read(bar0, regs::NV_PMC_ENABLE);
+            serial_println!("[NVIDIA] NV_PMC_ENABLE after bit 8 set: 0x{:08X}", check);
+
+            if let Some(inst_off) = vram_allocator.alloc(0x1000) {
+                if let Some(gpfifo_off) = vram_allocator.alloc(0x1000) {
+                    if let Some(userd_off) = vram_allocator.alloc(0x1000) {
+                        if let Some(pb_off) = vram_allocator.alloc(64 * 1024) {
+                            if let Some(runlist_off) = vram_allocator.alloc(0x1000) {
+                                if let Some(fence_off) = vram_allocator.alloc(0x1000) {
+                                    serial_println!("[NVIDIA] Allocated Channel Instance, GPFIFO, USERD, PushBuffer, Runlist, Fence.");
+
+                                    let bar1 = vram_allocator.base_phys;
+                                    
+                                    // Zero memory
+                                    for i in 0..(0x1000 / 4) {
+                                        unsafe {
+                                            core::ptr::write_volatile((bar1 + inst_off + i * 4) as *mut u32, 0);
+                                            core::ptr::write_volatile((bar1 + gpfifo_off + i * 4) as *mut u32, 0);
+                                            core::ptr::write_volatile((bar1 + userd_off + i * 4) as *mut u32, 0);
+                                            core::ptr::write_volatile((bar1 + runlist_off + i * 4) as *mut u32, 0);
+                                            core::ptr::write_volatile((bar1 + fence_off + i * 4) as *mut u32, 0);
+                                        }
+                                    }
+
+                                    let chan_id = 0;
+
+                                    // Setup Channel Instance Block
+                                    unsafe {
+                                        core::ptr::write_volatile((bar1 + inst_off + 0x08) as *mut u32, (userd_off & 0xFFFFFFFF) as u32);
+                                        core::ptr::write_volatile((bar1 + inst_off + 0x0C) as *mut u32, (userd_off >> 32) as u32);
+                                        core::ptr::write_volatile((bar1 + inst_off + 0x10) as *mut u32, 0x0000face);
+                                        core::ptr::write_volatile((bar1 + inst_off + 0x30) as *mut u32, 0xfffff902);
+                                        core::ptr::write_volatile((bar1 + inst_off + 0x48) as *mut u32, (gpfifo_off & 0xFFFFFFFF) as u32);
+                                        // limit2 = (0x1000 / 8) - 1 = 511
+                                        core::ptr::write_volatile((bar1 + inst_off + 0x4C) as *mut u32, ((gpfifo_off >> 32) as u32) | (511 << 16));
+                                        core::ptr::write_volatile((bar1 + inst_off + 0x84) as *mut u32, 0x20400000);
+                                        core::ptr::write_volatile((bar1 + inst_off + 0x94) as *mut u32, 0x30000000); // VRAM devm=0
+                                        core::ptr::write_volatile((bar1 + inst_off + 0x9C) as *mut u32, 0x00000100);
+                                        core::ptr::write_volatile((bar1 + inst_off + 0xAC) as *mut u32, 0x0000001f);
+                                        core::ptr::write_volatile((bar1 + inst_off + 0xE4) as *mut u32, 0x00000000);
+                                        core::ptr::write_volatile((bar1 + inst_off + 0xE8) as *mut u32, chan_id);
+                                        core::ptr::write_volatile((bar1 + inst_off + 0xB8) as *mut u32, 0xf8000000);
+                                        core::ptr::write_volatile((bar1 + inst_off + 0xF8) as *mut u32, 0x10003080); // 0x002310
+                                        core::ptr::write_volatile((bar1 + inst_off + 0xFC) as *mut u32, 0x10000010); // 0x002350
+                                    }
+
+                                    // Bind Channel to PFIFO_CHAN (GK104)
+                                    // inst_off >> 12 | 0x80000000
+                                    mmio_write(bar0, 0x800000 + (chan_id as usize * 8), 0x80000000 | ((inst_off as u32) >> 12));
+                                    // Enable Channel
+                                    mmio_write(bar0, 0x800004 + (chan_id as usize * 8), 0x00000400);
+
+                                    // Add to Runlist
+                                    unsafe {
+                                        core::ptr::write_volatile((bar1 + runlist_off) as *mut u32, chan_id);
+                                        core::ptr::write_volatile((bar1 + runlist_off + 4) as *mut u32, 0);
+                                    }
+                                    mmio_write(bar0, 0x2270, (runlist_off as u32) >> 12); // target=0 (VRAM), addr
+                                    mmio_write(bar0, 0x2274, 1); // count=1, runl=0
+                                    serial_println!("[NVIDIA] Configured Runlist and bound channel.");
+
+                                    // Write Pushbuffer payload (A06F GPFIFO class host semaphore release)
+                                    let pb_base = bar1 + pb_off;
+                                    let fence_val = 0xdeadbeef;
+                                    unsafe {
+                                        // SetObject (method 0x0000), class A06F
+                                        core::ptr::write_volatile((pb_base + 0) as *mut u32, 0x20010000); // INCR, 1 words, MTHD 0x00
+                                        core::ptr::write_volatile((pb_base + 4) as *mut u32, 0x0000A06F);
+                                        // Host semaphore release: INCR, 4 words, MTHD 0x10 (SEMAPHOREA)
+                                        core::ptr::write_volatile((pb_base + 8) as *mut u32, 0x20040004);
+                                        core::ptr::write_volatile((pb_base + 12) as *mut u32, (fence_off >> 32) as u32);
+                                        core::ptr::write_volatile((pb_base + 16) as *mut u32, (fence_off & 0xFFFFFFFF) as u32);
+                                        core::ptr::write_volatile((pb_base + 20) as *mut u32, fence_val);
+                                        core::ptr::write_volatile((pb_base + 24) as *mut u32, 0x2); // RELEASE (2)
+                                    }
+
+                                    // Write GPFIFO entry (1 entry pointing to the pushbuffer)
+                                    let gpfifo_base = bar1 + gpfifo_off;
+                                    unsafe {
+                                        core::ptr::write_volatile((gpfifo_base + 0) as *mut u32, (pb_off & 0xFFFFFFFF) as u32);
+                                        // len in bytes / 4 = 7 words. 7 << 10. Opcode 2 (0x20000000)
+                                        core::ptr::write_volatile((gpfifo_base + 4) as *mut u32, ((pb_off >> 32) as u32) | (7 << 10) | (2 << 28));
+                                    }
+
+                                    serial_println!("[NVIDIA] Ringing GP_PUT doorbell...");
+                                    // Submit via GP_PUT to USERD (offset 0x90)
+                                    unsafe {
+                                        core::ptr::write_volatile((bar1 + userd_off + 0x90) as *mut u32, 1); // increment GP_PUT to 1
+                                    }
+
+                                    // Poll VRAM for fence value
+                                    serial_println!("[NVIDIA] Polling for fence value 0x{:08X} at VRAM offset 0x{:X}", fence_val, fence_off);
+                                    let mut found = false;
+                                    for _ in 0..10_000_000 {
+                                        let val = unsafe { core::ptr::read_volatile((bar1 + fence_off) as *const u32) };
+                                        if val == fence_val {
+                                            found = true;
+                                            break;
+                                        }
+                                    }
+
+                                    if found {
+                                        serial_println!(":: kepler: fence {:08X} ::", fence_val);
+                                    } else {
+                                        serial_println!(":: kepler: takeover-abort fence-timeout ::");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
