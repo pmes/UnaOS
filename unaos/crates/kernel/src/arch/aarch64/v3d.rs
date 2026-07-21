@@ -429,6 +429,11 @@ pub fn bringup(fb: Option<FbTarget>) {
     // never reaches here; on QEMU the run returned at BLOCK-DOWN far above). ────────────────────────
     triangle_job(fb);
 
+    // ── PI-V3D-11: the visible graphics battery (M5 gradient → M6 animated → M7 multi-primitive →
+    // M8 blit-to-scanout). Purely ADDITIVE stages layered on the M4 scaffold: M3 + M4 above remain
+    // the regression witnesses and none of their buffers or kick code is touched. ─────────────────
+    battery(fb);
+
     // Belt-and-suspenders for the whole bring-up: whatever path M2/M3/M4 took, no latent async abort
     // from a V3D register access may outlive this function (the SError-drain class rule).
     super::exceptions::serror_drain_request("v3d: bring-up exit");
@@ -1888,4 +1893,782 @@ fn blit_m4_target(fb: &FbTarget) {
             }
         }
     }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// PI-V3D-11 — the visible graphics battery (M5..M8), LAYERED on the M4 triangle scaffold.
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+//
+// Four short on-screen stages, each serial-witnessed (`:: V3D: M<stage> … ::`) + eyeball-verified at
+// the attended sitting. Everything below is ADDITIVE: new arena regions above the M4 regions, new
+// builder/kick functions that mirror (not modify) the M4 idiom, and one call in `bringup`. The M3
+// clear and M4 triangle above stay byte-identical as the head-of-battery regressions.
+// ATTENDED-METAL-UNVERIFIED throughout — QEMU raspi4b returns at BLOCK-DOWN long before this runs.
+//
+// ── QPU-word provenance (the standing thrice-convicted rule — no fabricated bit patterns) ────────
+// Every NEW 64-bit word below is derived from the PI-V3D-9 Mesa-packer-verified vectors already in
+// this file by SINGLE-FIELD surgery, where the touched field's encoding is itself corroborated by
+// multiple in-file verified words (the same "CT1 = CT0 + 4" class the CT0 registers used):
+//   * SIG field [57:53]: corroborated by nop(sig=0), thrsw(sig=1 → bit53, in-file 0x3c20…) and
+//     ldunifrf(sig=12 → bits56+55, in-file 0x3d80…). ldvary is sig=8 (Mesa qpu_pack.c v41 sig map,
+//     the same table that yields 1/12 for the corroborated entries) → bit56 alone.
+//   * SIG dest addr [51:46] (rf#): corroborated by the in-file ldunifrf.rf0..rf3 (+0x0000/bit46/
+//     bit47/bits46+47) and ldunifrf.rf5 words.
+//   * WADDR_A [37:32]: corroborated by the in-file ldvpmv_in rf0..rf3 sequence (+0..3 at bit 32).
+//   * RADDR_A [11:6]: corroborated by the in-file `mov vpm, rf0..rf3` sequence (+0x00/0x40/0x80/0xc0).
+// The gradient-FS SEMANTICS (raw ldvary A-coefficients written to the TLB without the fmul/fadd(W,C)
+// interpolation evaluation) are the honest metal-refinement seam of this arc, exactly like the
+// PI-V3D-9 viewport/VPM quantities — flagged at the M5 verdict.
+
+// ─── Battery arena regions: 0x21000..0x34000, all 4 KiB-aligned starts, all ABOVE the M4 regions
+// (top prior used byte ≈ 0x200C0) and inside the 256 KiB arena → inside the identity MMU map. ───
+const OFF_M5_TARGET: usize = 0x21000; // [16 KiB) M5 gradient render target
+const OFF_M5_VTX: usize = 0x25000; // 3 verts × 32 B (vec4 pos + vec4 colour, interleaved)
+const OFF_M5_FS_CODE: usize = 0x25800; // gradient fragment shader (ldvary path)
+const OFF_M5_VS_CODE: usize = 0x26000; // gradient vertex shader (8-word VPM passthrough)
+const OFF_M5_FS_UNIF: usize = 0x26800; // gradient FS uniforms (alpha + TLB configs)
+const OFF_M5_VS_UNIF: usize = 0x26880; // gradient VS uniforms (8 VPM read-offsets)
+const OFF_M5_SHADREC: usize = 0x26900; // M5 shader record + 2 attribute records (32-B aligned)
+const OFF_M5_BIN_CL: usize = 0x27000;
+const OFF_M5_RCL: usize = 0x28000;
+const OFF_M5_SUBLIST: usize = 0x29000;
+const OFF_BAT_TARGET: usize = 0x2A000; // [16 KiB) shared M6/M7 render target
+const OFF_BAT_VTX: usize = 0x2E000; // animated / multi-primitive vertex data
+const OFF_BAT_BIN_CL: usize = 0x2F000;
+const OFF_BAT_RCL: usize = 0x30000;
+const OFF_BAT_SUBLIST: usize = 0x31000;
+const OFF_BAT_SHADREC: usize = 0x32000; // M6 record @+0; M7 records @+128×k (k=0..3; 52 B each)
+const OFF_M7_UNIF: usize = 0x33000; // 4 FS uniform streams, 64-B stride (one per M7 colour draw)
+const _: () = assert!(OFF_M7_UNIF + 4 * 64 <= ARENA_BYTES);
+
+// ─── Battery QPU shader bodies (field-surgery derivations — provenance in the banner above). ───
+
+/// M5 gradient FRAGMENT shader: pop three varyings (r, g, b A-coefficients) via ldvary into rf0..rf2,
+/// alpha from the uniform FIFO into rf3, then the same passthrough-Z + double-VFPACK TLB write as the
+/// verified FS_WORDS. Uniform FIFO order: alpha, Z-config, colour-config. Metal-refinement seam: the
+/// varying interpolation math (fmul/fadd with W and the C coefficient) is NOT evaluated — the raw
+/// per-fragment ldvary results land in the TLB, which is sufficient for the M5 witness (three
+/// pairwise-distinct non-clear interior samples) but not yet colour-exact.
+const GRAD_FS_WORDS: [u64; 10] = [
+    0x3d00_3186_bb80_0000, // nop ; ldvary.rf0   (varying 0 → r)
+    0x3d00_7186_bb80_0000, // nop ; ldvary.rf1   (varying 1 → g)
+    0x3d00_b186_bb80_0000, // nop ; ldvary.rf2   (varying 2 → b)
+    0x3d80_f186_bb80_0000, // nop ; ldunifrf.rf3 (rf3 <- alpha)   [verbatim in-file word]
+    0x3c00_3206_bbe0_0000, // mov tlbu, r0       (passthrough-Z; pops Z TLB-config)
+    0x3c00_3188_3583_e001, // vfpack tlbu, rf0, rf1 (pops colour TLB-config)
+    0x3c00_3187_3583_e083, // vfpack tlb, rf2, rf3
+    0x3c20_3186_bb80_0000, // nop ; thrsw
+    0x3c00_3186_bb80_0000, // nop
+    0x3c00_3186_bb80_0000, // nop
+];
+
+/// M5 gradient VERTEX shader: the CS_VS_WORDS passthrough widened to EIGHT VPM words (vec4 position +
+/// vec4 colour varying source). Destinations rf0..rf3 + rf6..rf9 (rf4/rf5 skipped: rf5 is the live
+/// read-offset register the ldunifrf reload targets — a dest collision would clobber it). Each word is
+/// its CS_VS_WORDS counterpart with only WADDR_A (ldvpmv) or RADDR_A (mov vpm) advanced.
+const GRAD_VS_WORDS: [u64; 21] = [
+    0x3d81_6180_bc80_6140, // ldvpmv_in rf0, rf5 ; ldunifrf.rf5   (pos.x)  [verbatim]
+    0x3d81_6181_bc80_6140, // ldvpmv_in rf1, rf5 ; ldunifrf.rf5   (pos.y)  [verbatim]
+    0x3d81_6182_bc80_6140, // ldvpmv_in rf2, rf5 ; ldunifrf.rf5   (pos.z)  [verbatim]
+    0x3d81_6183_bc80_6140, // ldvpmv_in rf3, rf5 ; ldunifrf.rf5   (pos.w)  [verbatim]
+    0x3d81_6186_bc80_6140, // ldvpmv_in rf6, rf5 ; ldunifrf.rf5   (col.r)  [WADDR_A 3→6]
+    0x3d81_6187_bc80_6140, // ldvpmv_in rf7, rf5 ; ldunifrf.rf5   (col.g)  [WADDR_A 3→7]
+    0x3d81_6188_bc80_6140, // ldvpmv_in rf8, rf5 ; ldunifrf.rf5   (col.b)  [WADDR_A 3→8]
+    0x3d81_6189_bc80_6140, // ldvpmv_in rf9, rf5 ; ldunifrf.rf5   (col.a)  [WADDR_A 3→9]
+    0x3c00_3186_bb81_e140, // vpmsetup -, rf5     [verbatim]
+    0x3c00_3386_bbf8_0000, // mov vpm, rf0        (pos.x)  [verbatim]
+    0x3c00_3386_bbf8_0040, // mov vpm, rf1        (pos.y)  [verbatim]
+    0x3c00_3386_bbf8_0080, // mov vpm, rf2        (pos.z)  [verbatim]
+    0x3c00_3386_bbf8_00c0, // mov vpm, rf3        (pos.w)  [verbatim]
+    0x3c00_3386_bbf8_0180, // mov vpm, rf6        (col.r)  [RADDR_A 3→6]
+    0x3c00_3386_bbf8_01c0, // mov vpm, rf7        (col.g)  [RADDR_A 3→7]
+    0x3c00_3386_bbf8_0200, // mov vpm, rf8        (col.b)  [RADDR_A 3→8]
+    0x3c00_3386_bbf8_0240, // mov vpm, rf9        (col.a)  [RADDR_A 3→9]
+    0x3c00_3186_bb81_6000, // vpmwt               [verbatim]
+    0x3c20_3186_bb80_0000, // nop ; thrsw
+    0x3c00_3186_bb80_0000, // nop
+    0x3c00_3186_bb80_0000, // nop
+];
+
+/// The M5 per-vertex colours (unorm8 RGBA words) — one primary per corner, so interpolation (or even
+/// raw per-fragment varying data) yields three PAIRWISE-DISTINCT interior samples near the corners.
+const M5_VERT_COLOURS: [u32; 3] = [0x0000_00FF, 0x0000_FF00, 0x00FF_0000]; // red, green, blue
+
+/// M6 animation cadence: 24 rotation steps × 6 revolutions ≈ 5 s at ~33 ms/frame.
+const M6_FRAMES: usize = 144;
+const M6_FRAME_PACE_MS: u64 = 30;
+
+/// 24-step unit-circle table (cos, sin at k×15°), f32 — no libm in the kernel; precomputed.
+const ROT24: [(f32, f32); 24] = [
+    (1.0, 0.0),
+    (0.965926, 0.258819),
+    (0.866025, 0.5),
+    (0.707107, 0.707107),
+    (0.5, 0.866025),
+    (0.258819, 0.965926),
+    (0.0, 1.0),
+    (-0.258819, 0.965926),
+    (-0.5, 0.866025),
+    (-0.707107, 0.707107),
+    (-0.866025, 0.5),
+    (-0.965926, 0.258819),
+    (-1.0, 0.0),
+    (-0.965926, -0.258819),
+    (-0.866025, -0.5),
+    (-0.707107, -0.707107),
+    (-0.5, -0.866025),
+    (-0.258819, -0.965926),
+    (0.0, -1.0),
+    (0.258819, -0.965926),
+    (0.5, -0.866025),
+    (0.707107, -0.707107),
+    (0.866025, -0.5),
+    (0.965926, -0.258819),
+];
+
+/// M7 draw colours (one per 3-wedge group of the 12-triangle pinwheel): red, green, blue, amber.
+const M7_COLOURS: [u32; 4] = [0x0000_00FF, 0x0000_FF00, 0x00FF_0000, TRI_RGBA];
+
+/// The battery sentinel — distinct from CLEAR_RGBA, TRI_RGBA and every M5/M7 draw colour, so a
+/// sample equal to it proves "GPU never wrote this pixel".
+const BAT_SENTINEL: u32 = 0x5555_5555;
+
+/// One bin→render job outcome, shared by every battery stage (the M4 kick idiom, parameterised).
+struct JobResult {
+    bin_ran: bool,
+    bin_idled: bool,
+    r_ran: bool,
+    r_idled: bool,
+    /// OR of the MMU fault-status bits observed after the bin and after the render.
+    fault: u32,
+}
+impl JobResult {
+    fn clean(&self) -> bool {
+        self.bin_ran && self.bin_idled && self.r_ran && self.r_idled && self.fault == 0
+    }
+}
+
+/// Quiet variant of `clear_mmu_fault_latch`: same Linux v3d_irq.c read-echo W1C idiom, but returns the
+/// latched fault bits instead of printing — the M6 frame loop calls this per frame and 144 lines of
+/// latch chatter would bury the serial witness (quiet-boot law). A non-zero return is reported once in
+/// the stage verdict.
+fn clear_mmu_fault_latch_quiet() -> u32 {
+    let ctl = mmio_read(V3D_HUB_BASE, V3D_MMU_CTL);
+    let fault = ctl & (V3D_MMU_CTL_PT_INVALID | V3D_MMU_CTL_WRITE_VIOLATION | V3D_MMU_CTL_CAP_EXCEEDED);
+    if fault != 0 {
+        mmio_write(V3D_HUB_BASE, V3D_MMU_CTL, ctl); // W1C echo
+        dsb();
+    }
+    fault
+}
+
+/// Kick one bin (CT0) + render (CT1) job pair over already-built, already-published control lists.
+/// Mirrors the M4 kick sequence exactly (QMA/QMS/QTS → QBA → QEA-GO on CT0; QBA → QEA-GO on CT1;
+/// finite backstops; fault-latch clear between the two) without touching the M4 code — so a V3D-10
+/// change to the M4 kick path composes by mirroring the same fix here at rebase. The tile-alloc pool
+/// and tile-state array are re-zeroed + re-published per call (the binner scribbles both).
+fn kick_bin_render(bin_off: usize, bin_len: usize, rcl_off: usize, rcl_len: usize) -> JobResult {
+    let mut res = JobResult { bin_ran: false, bin_idled: false, r_ran: false, r_idled: false, fault: 0 };
+
+    let bin_ba = (arena_phys() + bin_off) as u32;
+    let bin_ea = bin_ba + bin_len as u32;
+    let rcl_ba = (arena_phys() + rcl_off) as u32;
+    let rcl_ea = rcl_ba + rcl_len as u32;
+    let tile_alloc = (arena_phys() + OFF_BIN_TILEALLOC) as u32;
+    let ts = (arena_phys() + OFF_TILESTATE) as u32;
+    if !arena_contains(bin_ba as usize, bin_len) || !arena_contains(rcl_ba as usize, rcl_len) {
+        serial_println!(":: V3D: battery job range escapes the arena — refusing kick (fail-closed) ::");
+        return res;
+    }
+
+    // Fresh binner scratch (same regions the M4 job used — free for reuse once M4 has completed).
+    fill_region(OFF_TILESTATE, TILE_STATE_BYTES, 0);
+    fill_region(OFF_BIN_TILEALLOC, BIN_TILEALLOC_BYTES, 0);
+    cache::clean_range(arena_phys() + OFF_TILESTATE, TILE_STATE_BYTES);
+    cache::clean_range(arena_phys() + OFF_BIN_TILEALLOC, BIN_TILEALLOC_BYTES);
+
+    // CT0 (bin): QMA/QMS/QTS → QBA → QEA (GO), per Linux v3d_sched.c v3d_bin_job_run.
+    let cs_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CS);
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QMA, tile_alloc);
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QMS, BIN_TILEALLOC_BYTES as u32);
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QTS, ts | V3D_CLE_CT0QTS_ENABLE);
+    dsb();
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QBA, bin_ba);
+    dsb();
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QEA, bin_ea); // GO
+    dsb();
+    let cs_kicked = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CS);
+    res.bin_idled = wait_bit_clear(V3D_CORE0_BASE, V3D_CLE_CT0CS, V3D_CLE_CTNCS_CTRUN, "CT0 battery bin");
+    let cs_done = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CS);
+    let ca_done = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CA);
+    res.bin_ran = ct0_ran(cs_pre, cs_kicked, cs_done, ca_done, bin_ba, bin_ea);
+    // Fault-latch hygiene between bin and render (the boot-P5 sticky-fault wedge), quiet per-frame.
+    res.fault |= clear_mmu_fault_latch_quiet();
+
+    // CT1 (render): QBA → QEA (GO).
+    let r_cs_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT1CS);
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT1QBA, rcl_ba);
+    dsb();
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT1QEA, rcl_ea); // GO
+    dsb();
+    let r_cs_kicked = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT1CS);
+    res.r_idled = wait_bit_clear(V3D_CORE0_BASE, V3D_CLE_CT1CS, V3D_CLE_CT1CS_CTRUN, "CT1 battery render");
+    let r_cs_done = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT1CS);
+    let r_ca_done = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT1CA);
+    res.r_ran = ct0_ran(r_cs_pre, r_cs_kicked, r_cs_done, r_ca_done, rcl_ba, rcl_ea);
+    res.fault |= clear_mmu_fault_latch_quiet();
+    res
+}
+
+/// A generalised GL Shader State Record + attribute records, mirroring `build_shader_record` with the
+/// addresses/counts parameterised. `attrs`: (data address, stride, values read by CS, values read by
+/// VS) per attribute record. Writes record + attribute records at `rec_off`; returns attr count.
+fn build_shader_record_at(
+    rec_off: usize,
+    cs_off: usize,
+    vs_off: usize,
+    fs_off: usize,
+    fs_unif_off: usize,
+    vs_unif_off: usize,
+    cs_unif_off: usize,
+    num_varyings: u64,
+    attrs: &[(usize, u32, u64, u64)],
+) -> u32 {
+    let cs = (arena_phys() + cs_off) as u64;
+    let vs = (arena_phys() + vs_off) as u64;
+    let fs = (arena_phys() + fs_off) as u64;
+    let defaults = (arena_phys() + OFF_DEFAULT_ATTRS) as u64;
+
+    let mut rec = [0u8; 36];
+    sf(&mut rec, 1, 1, 1); // Enable clipping
+    sf(&mut rec, 24, 8, num_varyings); // Number of varyings in Fragment Shader
+    sf(&mut rec, 32, 4, 1); // Coord Shader output VPM segment size
+    sf(&mut rec, 40, 4, 1); // Coord Shader input VPM segment size
+    sf(&mut rec, 48, 4, 1); // Vertex Shader output VPM segment size
+    sf(&mut rec, 56, 4, 1); // Vertex Shader input VPM segment size
+    sf(&mut rec, 64, 32, defaults);
+    sf(&mut rec, 96, 1, 1); // FS 4-way threadable
+    sf(&mut rec, 98, 1, 1); // FS propagate NaNs
+    sf(&mut rec, 99, 29, fs >> 3);
+    sf(&mut rec, 128, 32, (arena_phys() + fs_unif_off) as u64);
+    sf(&mut rec, 160, 1, 1); // VS 4-way threadable
+    sf(&mut rec, 162, 1, 1);
+    sf(&mut rec, 163, 29, vs >> 3);
+    sf(&mut rec, 192, 32, (arena_phys() + vs_unif_off) as u64);
+    sf(&mut rec, 224, 1, 1); // CS 4-way threadable
+    sf(&mut rec, 226, 1, 1);
+    sf(&mut rec, 227, 29, cs >> 3);
+    sf(&mut rec, 256, 32, (arena_phys() + cs_unif_off) as u64);
+    arena_write_bytes(rec_off, &rec);
+
+    for (i, &(addr_off, stride, cs_reads, vs_reads)) in attrs.iter().enumerate() {
+        let mut attr = [0u8; 16];
+        sf(&mut attr, 0, 32, (arena_phys() + addr_off) as u64);
+        sf(&mut attr, 32, 2, 3); // Vec size (4 components)
+        sf(&mut attr, 34, 3, 2); // Type = Attribute float
+        sf(&mut attr, 40, 4, cs_reads);
+        sf(&mut attr, 44, 4, vs_reads);
+        sf(&mut attr, 64, 32, stride as u64);
+        sf(&mut attr, 96, 32, 0xFFFF); // Maximum Index
+        arena_write_bytes(rec_off + 36 + i * 16, &attr);
+    }
+    cache::clean_range(arena_phys() + rec_off, 36 + attrs.len() * 16);
+    attrs.len() as u32
+}
+
+/// A generalised binning control list, mirroring `build_bin_cl` with the list offset and DRAWS
+/// parameterised: `draws` = (shader-record offset, attr count, first vertex, vertex count) per draw —
+/// M5/M6 issue one draw, M7 issues four (one per colour group). Returns the list byte length.
+fn build_bin_cl_at(cl_off: usize, draws: &[(usize, u32, u32, u32)]) -> usize {
+    let mut w = RclWriter::new(cl_off);
+    w.pkt(Pkt::new(P_NUMBER_OF_LAYERS, 2).f(0, 8, 0).done());
+    w.pkt(
+        Pkt::new(P_TILE_BINNING_MODE_CFG, 9)
+            .f(2, 2, TILE_ALLOC_BLOCK_SIZE_64B)
+            .f(4, 2, TILE_ALLOC_BLOCK_SIZE_64B)
+            .f(8, 4, 0)
+            .f(12, 2, INTERNAL_BPP_32)
+            .f(32, 16, (TARGET_W - 1) as u64)
+            .f(48, 16, (TARGET_H - 1) as u64)
+            .done(),
+    );
+    w.pkt(Pkt::new(P_FLUSH_VCD_CACHE, 1).done());
+    w.pkt(Pkt::new(P_START_TILE_BINNING, 1).done());
+    w.pkt(Pkt::new(P_VCM_CACHE_SIZE, 2).f(0, 4, 1).f(4, 4, 1).done());
+    for &(rec_off, num_attrs, first, count) in draws {
+        let shadrec = (arena_phys() + rec_off) as u32;
+        w.pkt(
+            Pkt::new(P_GL_SHADER_STATE, 4)
+                .f(0, 5, num_attrs as u64)
+                .f(5, 27, (shadrec >> 5) as u64)
+                .done(),
+        );
+        w.pkt(
+            Pkt::new(P_VERTEX_ARRAY_PRIMS, 10)
+                .f(0, 8, V3D_PRIM_TRIANGLES)
+                .f(8, 32, count as u64)
+                .f(40, 32, first as u64)
+                .done(),
+        );
+    }
+    w.pkt(Pkt::new(P_FLUSH, 1).done());
+    let len = w.len();
+    cache::clean_range(arena_phys() + cl_off, len);
+    len
+}
+
+/// A generalised M4-style render control list (main list + generic per-tile sub-list with
+/// BRANCH_TO_IMPLICIT_TILE_LIST), mirroring `build_m4_rcl` with the offsets parameterised. Publishes
+/// both lists; returns the MAIN list byte length (the CT1 [BA, EA) extent).
+fn build_battery_rcl(rcl_off: usize, sublist_off: usize, target_off: usize) -> usize {
+    let target = (arena_phys() + target_off) as u32;
+    let sublist_start = (arena_phys() + sublist_off) as u32;
+    let tile_alloc = (arena_phys() + OFF_BIN_TILEALLOC) as u32;
+    let stride = (TARGET_W * TARGET_BPP) as u64;
+
+    let mut s = RclWriter::new(sublist_off);
+    s.pkt(Pkt::new(P_TILE_COORDINATES_IMPLICIT, 1).done());
+    s.pkt(Pkt::new(P_END_OF_LOADS, 1).done());
+    s.pkt(Pkt::new(P_PRIM_LIST_FORMAT, 2).f(0, 6, PRIM_TYPE_LIST_TRIANGLES).done());
+    s.pkt(Pkt::new(P_BRANCH_TO_IMPLICIT_TILE_LIST, 2).f(0, 8, 0).done());
+    s.pkt(
+        Pkt::new(P_STORE_TILE_BUFFER_GENERAL, 13)
+            .f(0, 4, 0)
+            .f(4, 3, MEMORY_FORMAT_RASTER)
+            .f(12, 6, OUTPUT_IMAGE_FORMAT_RGBA8)
+            .f(28, 20, stride)
+            .f(64, 32, target as u64)
+            .done(),
+    );
+    s.pkt(Pkt::new(P_CLEAR_TILE_BUFFERS, 2).f(0, 1, 1).f(1, 1, 1).done());
+    s.pkt(Pkt::new(P_END_OF_TILE_MARKER, 1).done());
+    s.pkt(Pkt::new(P_RETURN_FROM_SUB_LIST, 1).done());
+    let sublist_len = s.len();
+    let sublist_end = sublist_start + sublist_len as u32;
+    cache::clean_range(arena_phys() + sublist_off, sublist_len);
+
+    let mut w = RclWriter::new(rcl_off);
+    w.pkt(
+        Pkt::new(P_TRMC, 9)
+            .f(0, 4, TRMC_SUBID_COMMON)
+            .f(4, 4, 0)
+            .f(8, 16, TARGET_W as u64)
+            .f(24, 16, TARGET_H as u64)
+            .f(40, 2, INTERNAL_BPP_32)
+            .done(),
+    );
+    w.pkt(
+        Pkt::new(P_TRMC, 9)
+            .f(0, 4, TRMC_SUBID_CLEAR_COLORS_PART1)
+            .f(4, 4, 0)
+            .f(8, 32, CLEAR_RGBA as u64)
+            .done(),
+    );
+    w.pkt(
+        Pkt::new(P_TRMC, 9)
+            .f(0, 4, TRMC_SUBID_COLOR)
+            .f(4, 2, INTERNAL_BPP_32)
+            .f(6, 4, INTERNAL_TYPE_8)
+            .f(10, 2, 0)
+            .done(),
+    );
+    w.pkt(
+        Pkt::new(P_TRMC, 9)
+            .f(0, 4, TRMC_SUBID_ZS_CLEAR_VALUES)
+            .f(8, 8, 0)
+            .f(16, 32, 0)
+            .done(),
+    );
+    w.pkt(
+        Pkt::new(P_TILE_LIST_INITIAL_BLOCK_SIZE, 2)
+            .f(0, 2, TILE_ALLOC_BLOCK_SIZE_64B)
+            .f(2, 1, 1)
+            .done(),
+    );
+    w.pkt(
+        Pkt::new(P_MULTICORE_TILE_LIST_BASE, 5)
+            .f(0, 4, 0)
+            .f(6, 26, (tile_alloc >> 6) as u64)
+            .done(),
+    );
+    w.pkt(
+        Pkt::new(P_MULTICORE_SUPERTILE_CFG, 9)
+            .f(0, 8, 0)
+            .f(8, 8, 0)
+            .f(16, 8, 1)
+            .f(24, 8, 1)
+            .f(32, 12, 1)
+            .f(44, 12, 1)
+            .f(61, 3, 0)
+            .done(),
+    );
+    w.pkt(Pkt::new(P_TILE_COORDINATES, 4).f(0, 12, 0).f(12, 12, 0).done());
+    for i in 0..2 {
+        if i > 0 {
+            w.pkt(Pkt::new(P_TILE_COORDINATES, 4).f(0, 12, 0).f(12, 12, 0).done());
+        }
+        w.pkt(Pkt::new(P_END_OF_LOADS, 1).done());
+        w.pkt(Pkt::new(P_STORE_TILE_BUFFER_GENERAL, 13).f(0, 4, 8).done());
+        if i == 0 {
+            w.pkt(Pkt::new(P_CLEAR_TILE_BUFFERS, 2).f(0, 1, 1).f(1, 1, 1).done());
+        }
+        w.pkt(Pkt::new(P_END_OF_TILE_MARKER, 1).done());
+    }
+    w.pkt(Pkt::new(P_FLUSH_VCD_CACHE, 1).done());
+    w.pkt(
+        Pkt::new(P_GENERIC_TILE_LIST, 9)
+            .f(0, 32, sublist_start as u64)
+            .f(32, 32, sublist_end as u64)
+            .done(),
+    );
+    w.pkt(Pkt::new(P_SUPERTILE_COORDINATES, 3).f(0, 8, 0).f(8, 8, 0).done());
+    w.pkt(Pkt::new(P_END_OF_RENDERING, 1).done());
+    let len = w.len();
+    cache::clean_range(arena_phys() + rcl_off, len);
+    len
+}
+
+/// FS uniform stream for a solid colour `rgba` at `off` (unorm8 → f32 channels + the two TLB configs,
+/// same FIFO order as `write_fs_uniforms`). Publishes; returns the byte length.
+fn write_fs_uniforms_colour(off: usize, rgba: u32) -> usize {
+    let r = ((rgba & 0xFF) as f32 / 255.0).to_bits();
+    let g = (((rgba >> 8) & 0xFF) as f32 / 255.0).to_bits();
+    let b = (((rgba >> 16) & 0xFF) as f32 / 255.0).to_bits();
+    let a = (((rgba >> 24) & 0xFF) as f32 / 255.0).to_bits();
+    let unif: [u32; 6] = [r, g, b, a, 0xFFFF_FF84, 0xFFFF_FF3F];
+    for (i, w) in unif.iter().enumerate() {
+        arena_write_u32(off + i * 4, *w);
+    }
+    cache::clean_range(arena_phys() + off, unif.len() * 4);
+    unif.len() * 4
+}
+
+/// Read one 32-bit pixel from an arbitrary battery target at (x, y).
+#[inline]
+fn target_sample(target_off: usize, x: usize, y: usize) -> u32 {
+    let off = target_off + (y * TARGET_W + x) * TARGET_BPP;
+    let arena = &raw const V3D_ARENA;
+    unsafe {
+        let b = &(*arena).bytes;
+        u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
+    }
+}
+
+/// Blit a 64×64 battery target to the panel at pixel origin (x0, y0) — the same bounds-clipped volatile
+/// idiom as `blit_target`/`blit_m4_target`, parameterised.
+fn blit_target_at(fb: &FbTarget, target_off: usize, x0: usize, y0: usize) {
+    if fb.base == 0 || fb.bytes_per_pixel < 4 {
+        return;
+    }
+    let w = TARGET_W.min(fb.width.saturating_sub(x0));
+    let h = TARGET_H.min(fb.height.saturating_sub(y0));
+    for y in 0..h {
+        for x in 0..w {
+            let px = target_sample(target_off, x, y);
+            let dst = fb.base as usize
+                + (y0 + y) * fb.stride_px * fb.bytes_per_pixel
+                + (x0 + x) * fb.bytes_per_pixel;
+            if dst + 4 <= fb.base as usize + fb.size {
+                unsafe { core::ptr::write_volatile(dst as *mut u32, px) };
+            }
+        }
+    }
+}
+
+/// Write one vec4-f32 vertex into the arena at `off`.
+#[inline]
+fn write_vert4(off: usize, v: [f32; 4]) {
+    for (j, c) in v.iter().enumerate() {
+        arena_write_u32(off + j * 4, c.to_bits());
+    }
+}
+
+/// ── M5: the GRADIENT triangle — per-vertex colour varyings through the QPU varying path. ─────────
+fn m5_gradient_job(fb: Option<FbTarget>) {
+    serial_println!(":: V3D: M5 gradient — per-vertex colour varyings (ldvary FS) ::");
+
+    // Shaders: verified CS (position passthrough) for binning; the widened gradient VS + ldvary FS.
+    let vs_len = write_shader_words(OFF_M5_VS_CODE, &GRAD_VS_WORDS);
+    let fs_len = write_shader_words(OFF_M5_FS_CODE, &GRAD_FS_WORDS);
+    cache::clean_range(arena_phys() + OFF_M5_VS_CODE, vs_len);
+    cache::clean_range(arena_phys() + OFF_M5_FS_CODE, fs_len);
+
+    // FS uniforms: alpha=1.0 then the two TLB configs (FIFO order of GRAD_FS_WORDS' pops).
+    let unif: [u32; 3] = [1.0f32.to_bits(), 0xFFFF_FF84, 0xFFFF_FF3F];
+    for (i, w) in unif.iter().enumerate() {
+        arena_write_u32(OFF_M5_FS_UNIF + i * 4, *w);
+    }
+    cache::clean_range(arena_phys() + OFF_M5_FS_UNIF, unif.len() * 4);
+    // VS uniforms: EIGHT VPM read-offsets (vec4 pos + vec4 colour); metal-refinement surface like the
+    // 4-offset stream PI-V3D-9 flagged.
+    for i in 0..8u32 {
+        arena_write_u32(OFF_M5_VS_UNIF + (i as usize) * 4, i);
+    }
+    cache::clean_range(arena_phys() + OFF_M5_VS_UNIF, 8 * 4);
+
+    // Interleaved vertex data: [pos vec4 | colour vec4] × 3, stride 32 B. Colours are the f32
+    // decomposition of the per-vertex primaries.
+    for (i, v) in TRI_VERTS.iter().enumerate() {
+        write_vert4(OFF_M5_VTX + i * 32, *v);
+        let c = M5_VERT_COLOURS[i];
+        let col = [
+            (c & 0xFF) as f32 / 255.0,
+            ((c >> 8) & 0xFF) as f32 / 255.0,
+            ((c >> 16) & 0xFF) as f32 / 255.0,
+            1.0,
+        ];
+        write_vert4(OFF_M5_VTX + i * 32 + 16, col);
+    }
+    cache::clean_range(arena_phys() + OFF_M5_VTX, 3 * 32);
+
+    // Shader record: CS reads only position (attr 0); VS reads position + colour (attrs 0 and 1);
+    // 4 varyings (the colour vec4) flow VS → FS.
+    let num_attrs = build_shader_record_at(
+        OFF_M5_SHADREC,
+        OFF_CS_CODE, // verified position-only coordinate shader (binning needs no colour)
+        OFF_M5_VS_CODE,
+        OFF_M5_FS_CODE,
+        OFF_M5_FS_UNIF,
+        OFF_M5_VS_UNIF,
+        OFF_CS_UNIF, // the M4 CS read-offset stream (still published; position-only)
+        4,
+        &[(OFF_M5_VTX, 32, 4, 4), (OFF_M5_VTX + 16, 32, 0, 4)],
+    );
+    let bin_len = build_bin_cl_at(OFF_M5_BIN_CL, &[(OFF_M5_SHADREC, num_attrs, 0, 3)]);
+    let rcl_len = build_battery_rcl(OFF_M5_RCL, OFF_M5_SUBLIST, OFF_M5_TARGET);
+
+    fill_region(OFF_M5_TARGET, TARGET_BYTES, BAT_SENTINEL);
+    cache::clean_range(arena_phys() + OFF_M5_TARGET, TARGET_BYTES);
+
+    let job = kick_bin_render(OFF_M5_BIN_CL, bin_len, OFF_M5_RCL, rcl_len);
+    cache::clean_invalidate_range(arena_phys() + OFF_M5_TARGET, TARGET_BYTES);
+
+    // Witness: three interior samples near the three coloured corners must be pairwise DISTINCT and
+    // neither clear nor sentinel (interpolation produced per-corner-dominated colours); two exterior
+    // corners must be the clear colour. Colour-exactness is the flagged metal seam (raw ldvary).
+    let s0 = target_sample(OFF_M5_TARGET, 16, 48); // near lower-left (red) corner
+    let s1 = target_sample(OFF_M5_TARGET, 47, 48); // near lower-right (green) corner
+    let s2 = target_sample(OFF_M5_TARGET, 32, 18); // near top (blue) corner
+    let o0 = target_sample(OFF_M5_TARGET, 2, 2);
+    let o1 = target_sample(OFF_M5_TARGET, 61, 2);
+    let interior_live = |s: u32| s != CLEAR_RGBA && s != BAT_SENTINEL;
+    let distinct = s0 != s1 && s1 != s2 && s0 != s2;
+    let pass = job.clean()
+        && distinct
+        && interior_live(s0)
+        && interior_live(s1)
+        && interior_live(s2)
+        && o0 == CLEAR_RGBA
+        && o1 == CLEAR_RGBA;
+    serial_println!(
+        ":: V3D: M5 gradient {} — in={:#010x}/{:#010x}/{:#010x} distinct={} out={:#010x}/{:#010x} ran={}/{} idled={}/{} faults={:#x} (varying math = metal seam) ::",
+        if pass { "PASS" } else { "FAIL" },
+        s0, s1, s2, distinct as u32, o0, o1,
+        job.bin_ran as u32, job.r_ran as u32, job.bin_idled as u32, job.r_idled as u32, job.fault
+    );
+    super::exceptions::serror_drain_request("v3d: M5 gradient kick window");
+    if pass {
+        if let Some(fb) = fb {
+            blit_target_at(&fb, OFF_M5_TARGET, 2 * (TARGET_W + 8), 0); // right of the M4 blit
+        }
+    }
+}
+
+/// Build the shared M6/M7 solid-colour scaffold: a shader record at OFF_BAT_SHADREC (+`rec_slot`×128)
+/// using the VERIFIED M4 shaders with vertex data at OFF_BAT_VTX and FS uniforms at `fs_unif_off`.
+fn build_bat_solid_record(rec_slot: usize, fs_unif_off: usize) -> (usize, u32) {
+    let rec_off = OFF_BAT_SHADREC + rec_slot * 128;
+    let n = build_shader_record_at(
+        rec_off,
+        OFF_CS_CODE,
+        OFF_VS_CODE,
+        OFF_FS_CODE,
+        fs_unif_off,
+        OFF_VS_UNIF,
+        OFF_CS_UNIF,
+        0, // solid colour: no varyings (the M4 shape)
+        &[(OFF_BAT_VTX, 16, 4, 4)],
+    );
+    (rec_off, n)
+}
+
+/// ── M6: the ANIMATED triangle — re-record + re-kick per frame, ~5 s of sustained bin/render. ─────
+fn m6_animated_job(fb: Option<FbTarget>) {
+    serial_println!(
+        ":: V3D: M6 animate — {} frames @ ~{} ms (sustained bin/render loop) ::",
+        M6_FRAMES, M6_FRAME_PACE_MS
+    );
+
+    // Solid-colour scaffold: verified M4 shaders (already written + published by triangle_job), one
+    // record whose attribute data lives at OFF_BAT_VTX. FS uniforms reuse the amber M4 stream.
+    let (rec_off, num_attrs) = build_bat_solid_record(0, OFF_FS_UNIF);
+    let bin_len = build_bin_cl_at(OFF_BAT_BIN_CL, &[(rec_off, num_attrs, 0, 3)]);
+    let rcl_len = build_battery_rcl(OFF_BAT_RCL, OFF_BAT_SUBLIST, OFF_BAT_TARGET);
+
+    fill_region(OFF_BAT_TARGET, TARGET_BYTES, BAT_SENTINEL);
+    cache::clean_range(arena_phys() + OFF_BAT_TARGET, TARGET_BYTES);
+
+    let mut frames_ok = 0usize;
+    let mut faults = 0u32;
+    let mut fault_frames = 0usize;
+    // 144 rotation frames + one final identity frame (so the closing sample-verify has a known pose).
+    for frame in 0..=M6_FRAMES {
+        let (c, s) = if frame == M6_FRAMES { ROT24[0] } else { ROT24[frame % ROT24.len()] };
+        for (i, v) in TRI_VERTS.iter().enumerate() {
+            let (x, y) = (v[0], v[1]);
+            write_vert4(
+                OFF_BAT_VTX + i * 16,
+                [x * c - y * s, x * s + y * c, v[2], v[3]],
+            );
+        }
+        cache::clean_range(arena_phys() + OFF_BAT_VTX, 3 * 16);
+        let job = kick_bin_render(OFF_BAT_BIN_CL, bin_len, OFF_BAT_RCL, rcl_len);
+        if job.clean() {
+            frames_ok += 1;
+        }
+        if job.fault != 0 {
+            faults |= job.fault;
+            fault_frames += 1;
+        }
+        if frame < M6_FRAMES {
+            settle_ms(M6_FRAME_PACE_MS); // ~5 s of wall-clock animation for the eyeball witness
+        }
+        // Live on-glass animation: blit each frame as it completes (the eyeball IS the witness).
+        if let Some(fbt) = fb {
+            cache::clean_invalidate_range(arena_phys() + OFF_BAT_TARGET, TARGET_BYTES);
+            blit_target_at(&fbt, OFF_BAT_TARGET, 0, TARGET_H + 8); // below the M3 blit
+        }
+    }
+
+    // Closing verify on the identity-pose final frame: centroid = triangle colour, corner = clear.
+    cache::clean_invalidate_range(arena_phys() + OFF_BAT_TARGET, TARGET_BYTES);
+    let centroid = target_sample(OFF_BAT_TARGET, 32, 34);
+    let corner = target_sample(OFF_BAT_TARGET, 2, 2);
+    let total = M6_FRAMES + 1;
+    let pass = frames_ok == total && faults == 0 && centroid == TRI_RGBA && corner == CLEAR_RGBA;
+    serial_println!(
+        ":: V3D: M6 animate {} — frames={}/{} faults={:#x} (fault-frames={}) centroid={:#010x} corner={:#010x} ::",
+        if pass { "PASS" } else { "FAIL" },
+        frames_ok, total, faults, fault_frames, centroid, corner
+    );
+    super::exceptions::serror_drain_request("v3d: M6 animate kick window");
+}
+
+/// ── M7: the MULTI-PRIMITIVE frame — a 12-wedge pinwheel in four colours (four draws, one frame). ─
+fn m7_multiprim_job(fb: Option<FbTarget>) {
+    serial_println!(":: V3D: M7 multiprim — 12-triangle pinwheel, 4 colour draws ::");
+
+    // Vertex data: wedge k = centre, rim(θk), rim(θk+30°); θk = k·30° (every other ROT24 entry).
+    const R: f32 = 0.8;
+    for k in 0..12 {
+        let (c0, s0) = ROT24[(2 * k) % 24];
+        let (c1, s1) = ROT24[(2 * k + 2) % 24];
+        let base = OFF_BAT_VTX + k * 3 * 16;
+        write_vert4(base, [0.0, 0.0, 0.5, 1.0]);
+        write_vert4(base + 16, [R * c0, R * s0, 0.5, 1.0]);
+        write_vert4(base + 32, [R * c1, R * s1, 0.5, 1.0]);
+    }
+    cache::clean_range(arena_phys() + OFF_BAT_VTX, 12 * 3 * 16);
+
+    // Four draws: 3 consecutive wedges each, distinct FS uniform stream (solid colour per group) —
+    // multi-colour without any new QPU words: the verified FS reads its colour from the uniform FIFO.
+    let mut draws: [(usize, u32, u32, u32); 4] = [(0, 0, 0, 0); 4];
+    for (k, &colour) in M7_COLOURS.iter().enumerate() {
+        let unif_off = OFF_M7_UNIF + k * 64;
+        write_fs_uniforms_colour(unif_off, colour);
+        let (rec_off, n) = build_bat_solid_record(k, unif_off);
+        draws[k] = (rec_off, n, (k * 9) as u32, 9);
+    }
+    let bin_len = build_bin_cl_at(OFF_BAT_BIN_CL, &draws);
+    let rcl_len = build_battery_rcl(OFF_BAT_RCL, OFF_BAT_SUBLIST, OFF_BAT_TARGET);
+
+    fill_region(OFF_BAT_TARGET, TARGET_BYTES, BAT_SENTINEL);
+    cache::clean_range(arena_phys() + OFF_BAT_TARGET, TARGET_BYTES);
+
+    let job = kick_bin_render(OFF_BAT_BIN_CL, bin_len, OFF_BAT_RCL, rcl_len);
+    cache::clean_invalidate_range(arena_phys() + OFF_BAT_TARGET, TARGET_BYTES);
+
+    // Witness: one sample inside each colour group's mid-wedge (live: neither clear nor sentinel —
+    // the exact colour-to-quadrant mapping depends on the viewport transform, the flagged PI-V3D-9
+    // metal seam) + two rim corners the R=0.8 pinwheel cannot reach = clear.
+    let q: [(usize, usize); 4] = [(41, 25), (23, 25), (23, 43), (41, 43)];
+    let mut lives = 0u32;
+    let mut vals = [0u32; 4];
+    for (i, &(x, y)) in q.iter().enumerate() {
+        let s = target_sample(OFF_BAT_TARGET, x, y);
+        vals[i] = s;
+        if s != CLEAR_RGBA && s != BAT_SENTINEL {
+            lives += 1;
+        }
+    }
+    let o0 = target_sample(OFF_BAT_TARGET, 1, 1);
+    let o1 = target_sample(OFF_BAT_TARGET, 62, 62);
+    let pass = job.clean() && lives == 4 && o0 == CLEAR_RGBA && o1 == CLEAR_RGBA;
+    serial_println!(
+        ":: V3D: M7 multiprim {} — quads={:#010x}/{:#010x}/{:#010x}/{:#010x} live={}/4 out={:#010x}/{:#010x} ran={}/{} idled={}/{} faults={:#x} ::",
+        if pass { "PASS" } else { "FAIL" },
+        vals[0], vals[1], vals[2], vals[3], lives, o0, o1,
+        job.bin_ran as u32, job.r_ran as u32, job.bin_idled as u32, job.r_idled as u32, job.fault
+    );
+    super::exceptions::serror_drain_request("v3d: M7 multiprim kick window");
+    if pass {
+        if let Some(fbt) = fb {
+            blit_target_at(&fbt, OFF_BAT_TARGET, TARGET_W + 8, TARGET_H + 8);
+        }
+    }
+}
+
+/// ── M8: BLIT TO SCANOUT — composite the battery render target onto the live framebuffer console and
+/// read the written words back from the panel memory (end-to-end GPU→glass witness). The blit is a
+/// bounded 64×64 region (the GUI stays usable); readback compares three probe pixels source↔panel. ─
+fn m8_blit_scanout(fb: Option<FbTarget>) {
+    let Some(fbt) = fb else {
+        serial_println!(":: V3D: M8 blit SKIP — no framebuffer target (serial-only run) ::");
+        return;
+    };
+    if fbt.base == 0 || fbt.bytes_per_pixel < 4 {
+        serial_println!(":: V3D: M8 blit SKIP — framebuffer not blittable (bpp<4 or null base) ::");
+        return;
+    }
+    // Composite the M7 scene (the battery target's final contents) at a fixed console-corner slot.
+    let (x0, y0) = (2 * (TARGET_W + 8), TARGET_H + 8);
+    blit_target_at(&fbt, OFF_BAT_TARGET, x0, y0);
+
+    // Readback witness: three probe pixels re-read VOLATILE from the panel memory must equal the
+    // source target words (proves the composite landed in scanout-visible memory, not a stale cache).
+    let probes: [(usize, usize); 3] = [(0, 0), (32, 34), (63, 63)];
+    let mut ok = 0u32;
+    let mut got = [0u32; 3];
+    let mut want = [0u32; 3];
+    for (i, &(x, y)) in probes.iter().enumerate() {
+        want[i] = target_sample(OFF_BAT_TARGET, x, y);
+        let dst = fbt.base as usize
+            + (y0 + y) * fbt.stride_px * fbt.bytes_per_pixel
+            + (x0 + x) * fbt.bytes_per_pixel;
+        if x0 + x < fbt.width && y0 + y < fbt.height && dst + 4 <= fbt.base as usize + fbt.size {
+            got[i] = unsafe { core::ptr::read_volatile(dst as *const u32) };
+            if got[i] == want[i] {
+                ok += 1;
+            }
+        }
+    }
+    let pass = ok == probes.len() as u32;
+    serial_println!(
+        ":: V3D: M8 blit {} — probes {}/{} panel={:#010x}/{:#010x}/{:#010x} src={:#010x}/{:#010x}/{:#010x} @({},{}) ::",
+        if pass { "PASS" } else { "FAIL" },
+        ok, probes.len(), got[0], got[1], got[2], want[0], want[1], want[2], x0, y0
+    );
+}
+
+/// PI-V3D-11 battery entry: run the four visible stages in order. Called from `bringup` AFTER the M3
+/// clear + M4 triangle regressions; only reachable on metal (QEMU returned at BLOCK-DOWN). Each stage
+/// is independent — a FAIL prints its verdict and the battery continues (every stage is a witness the
+/// attended sitting wants regardless of the others).
+fn battery(fb: Option<FbTarget>) {
+    serial_println!(":: V3D: PI-V3D-11 battery — M5 gradient, M6 animate, M7 multiprim, M8 blit ::");
+    m5_gradient_job(fb);
+    m6_animated_job(fb);
+    m7_multiprim_job(fb);
+    m8_blit_scanout(fb);
+    super::exceptions::serror_drain_request("v3d: battery exit");
 }

@@ -6365,6 +6365,46 @@ expectations (any residual interior `MISS` isolates shader geometry/colour tunin
 (sha256 recorded in the landing report). Positive V3D verification (power/clock/IDENT live, MMU
 program, GPU clear, panel blit) is the **attended Pi sitting** — see `scripts/pi-v3d-bench.md`.
 
+### PI-V3D-11 — the visible graphics battery (M5 gradient → M6 animate → M7 multiprim → M8 blit)
+
+The first triangle is a witness; PI-V3D-11 makes the GPU visibly **work** on glass. Four short stages,
+each with a one-line gated serial verdict (`:: V3D: M<stage> PASS/FAIL <counters> ::`) plus an eyeball
+verdict at the attended sitting. Everything is **additive** on the M4 scaffold — new arena regions
+(`0x21000..0x34000`, above the M4 regions, inside the identity MMU map), new parameterised builders
+(`build_shader_record_at`, `build_bin_cl_at`, `build_battery_rcl`) and a shared `kick_bin_render`
+that **mirrors** (not modifies) the M4 CT0→CT1 kick idiom, and one call in `bringup` after
+`triangle_job`. The M3 clear + M4 triangle stay byte-identical as the head-of-battery regressions.
+ATTENDED-METAL-UNVERIFIED throughout (QEMU raspi4b returns at BLOCK-DOWN).
+
+- **M5 gradient triangle** — per-vertex colour varyings (red/green/blue corners) through the QPU
+  varying path: interleaved pos+colour vertex data (stride 32), a two-attribute shader record with
+  4 FS varyings, a widened 8-word VPM passthrough VS, and an `ldvary`-based FS. New QPU words are
+  derived from the PI-V3D-9 Mesa-verified vectors by **single-field surgery only** where the field's
+  encoding is corroborated by multiple in-file verified words (SIG values 1/12 corroborate the sig
+  map that gives ldvary=8; the ldunifrf.rf0..rf3/rf5 words corroborate the sig-dest addr field; the
+  ldvpmv/mov-vpm sequences corroborate WADDR_A/RADDR_A) — the thrice-convicted fabrication class is
+  avoided. Honest seam: the raw ldvary A-coefficients are written to the TLB without the
+  fmul/fadd(W, C) interpolation evaluation, so the M5 verdict requires three **pairwise-distinct,
+  non-clear** interior samples (not colour-exact values); the interpolation math is the flagged
+  metal refinement.
+- **M6 animated triangle** — 144 rotation frames (24-step precomputed cos/sin table, 6 revolutions)
+  + a final identity-pose frame, re-recording the vertex data and re-kicking bin+render per frame at
+  ~30 ms (~5 s on glass, blitted live below the M3 slot). Uses the **verified** M4 solid-colour
+  shaders untouched. Verdict counts clean frames and ORs per-frame MMU fault bits (a quiet
+  `clear_mmu_fault_latch_quiet` keeps the 145-frame loop off the serial log — quiet-boot law), then
+  sample-verifies the identity frame (centroid = `TRI_RGBA`, corner = `CLEAR_RGBA`).
+- **M7 multi-primitive frame** — a 12-wedge pinwheel (R=0.8) in four colours via **four draws in one
+  binning list** (per-draw `GL_SHADER_STATE` + `VERTEX_ARRAY_PRIMS` with first-vertex offsets), each
+  draw's shader record pointing at its own FS uniform stream — multi-colour with zero new QPU words.
+  Verdict: four mid-wedge samples live (≠ clear, ≠ sentinel; exact colour↔quadrant mapping rides the
+  viewport seam) + two rim corners = clear.
+- **M8 blit to scanout** — composites the battery target onto the live framebuffer console (bounded
+  64×64 slot; the GUI stays usable) and volatile-reads three probe pixels back **from panel memory**,
+  comparing against the source — the end-to-end GPU→glass witness.
+
+Stage independence: a FAIL prints its verdict and the battery continues (every stage is a witness the
+sitting wants). SError drains bracket each stage's kick window, same as M3/M4.
+
 ## PI-USB — BCM2711 PCIe root complex + VL805 xHCI attach on the Pi 4 (Arc PI-USB-1)
 
 Every USB-A port on the Raspberry Pi 4 hangs off **one** endpoint: the VIA **VL805** xHCI (PCI
