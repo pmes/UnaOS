@@ -1188,9 +1188,17 @@ mod metal {
     /// ICMP identifier stamped on the echo requests. ASCII "PG".
     const PING_IDENT: u16 = 0x5047;
     const PING_PAYLOAD: &[u8] = b"unaos-genet";
-    /// Bounded poll-pump iterations (non-hanging by construction — a reply on a live link lands in a
-    /// handful; this only caps how long an unreachable target stalls the boot).
-    const PUMP_ITERS: i64 = 200_000;
+    /// NET-ARP-1: the ping window is REAL time (CNTPCT ms), not an iteration count. The boot-P7 pump
+    /// spun 200k iterations of a FAKE 1-ms-per-iteration clock — milliseconds of real wall time — then
+    /// returned, so the router's ARP requests (arriving seconds later) hit a dead stack and every echo
+    /// was queued before the neighbor resolved. Real-time bounds keep the interface live long enough to
+    /// answer ARP and collect replies; non-hanging by construction (CNTPCT is free-running).
+    const PING_WINDOW_MS: i64 = 8_000;
+    /// One echo per interval (real ms) — the first echo triggers ARP resolution and is dropped by
+    /// smoltcp (no retransmit in the ICMP socket); pacing lets later echoes ride the resolved neighbor.
+    const PING_INTERVAL_MS: i64 = 1_000;
+    /// Link-DOWN window (real ms): pre-cable there is nothing to answer — bound the no-op pump tightly.
+    const PING_WINDOW_DOWN_MS: i64 = 250;
 
     /// Bind a smoltcp `Interface` over the GENET Device, run DHCP, and drive a bounded ICMP echo to the
     /// gateway — the x86 e1000/smolnet + NET-4/VNET seam, on the Pi. On a live link (real Pi metal, or
@@ -1236,13 +1244,22 @@ mod metal {
         let mut sent = 0u16;
         let mut received = 0u16;
         let mut seq = 0u16;
-        let mut clock: i64 = 0;
-        while clock < PUMP_ITERS {
-            clock += 1;
-            iface.poll(Instant::from_millis(clock), &mut dev, &mut sockets);
+        // NET-ARP-1: poll with the SAME real clock dhcp_or_static just used. The old loop restarted a
+        // fake clock at 0 — a huge time regression against the smoltcp Interface's internal timestamps
+        // (neighbor cache, retransmit deadlines) stamped with real CNTPCT ms moments earlier.
+        let window_ms = if up { PING_WINDOW_MS } else { PING_WINDOW_DOWN_MS };
+        let t0 = now_ms();
+        let mut next_send = t0;
+        loop {
+            let t = now_ms();
+            if t.saturating_sub(t0) >= window_ms {
+                break;
+            }
+            iface.poll(Instant::from_millis(t), &mut dev, &mut sockets);
             let sock = sockets.get_mut::<icmp::Socket>(handle);
-            if seq < COUNT && sock.can_send() {
+            if seq < COUNT && t >= next_send && sock.can_send() {
                 seq += 1;
+                next_send = t + PING_INTERVAL_MS;
                 let repr = Icmpv4Repr::EchoRequest { ident: PING_IDENT, seq_no: seq, data: PING_PAYLOAD };
                 if let Ok(buf) = sock.send(repr.buffer_len(), remote) {
                     let mut pkt = Icmpv4Packet::new_unchecked(buf);
@@ -1267,6 +1284,13 @@ mod metal {
         }
 
         let pass = received > 0;
+        // NET-ARP-1 emission witness: what smoltcp actually handed the TX ring across the DHCP + ping
+        // windows (counted at the phy TxToken, i.e. wire-side of the seam).
+        let (txn, arp_reply, dhcp) = crate::net_phy::tx_emission_counts();
+        serial_println!(
+            "{}   [netarp1] smoltcp emitted {} frames (arp-reply={} dhcp={}) ::",
+            PG, txn, arp_reply, dhcp
+        );
         serial_println!(
             "{} ping {}.{}.{}.{} ({}/{} sent, {}/{} replies) [{}] link {} => {} ::",
             PG,

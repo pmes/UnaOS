@@ -1128,14 +1128,26 @@ mod metal {
         let mut sockets = SocketSet::new(&mut storage[..]);
         let _handle = sockets.add(socket);
 
-        // Bounded poll — on metal this pumps ARP for the gateway; pre-subnet / empty-ring it is a
-        // no-op. Kept small (this is a bind witness, not a traffic test): the attended sitting drives
-        // real ICMP once the link's subnet is known.
-        let mut clock: i64 = 0;
-        while clock < 4096 {
-            clock += 1;
-            iface.poll(Instant::from_millis(clock), &mut dev, &mut sockets);
+        // Bounded poll — on metal this answers inbound ARP and lets the stack drain; pre-subnet /
+        // empty-ring it is a bounded no-op. NET-ARP-1: the old loop polled 4096 iterations of a FAKE
+        // clock restarted at 0 — a time regression against the Interface timestamps dhcp_or_static just
+        // stamped with real CNTPCT ms, and a window lasting only microseconds of real time (nothing
+        // arriving after it could ever be answered). Poll with the real clock for a real-time bound.
+        const PUMP_WINDOW_MS: i64 = 1_000;
+        let t0 = now_ms();
+        loop {
+            let t = now_ms();
+            if t.saturating_sub(t0) >= PUMP_WINDOW_MS {
+                break;
+            }
+            iface.poll(Instant::from_millis(t), &mut dev, &mut sockets);
         }
+        // NET-ARP-1 emission witness (counted at the phy TxToken — wire-side of the seam).
+        let (txn, arp_reply, dhcp) = crate::net_phy::tx_emission_counts();
+        serial_println!(
+            "{}   [netarp1] smoltcp emitted {} frames (arp-reply={} dhcp={}) ::",
+            P4, txn, arp_reply, dhcp
+        );
         serial_println!(
             "{}   smoltcp 0.13 Interface BOUND over RTL8168: MAC set, {}.{}.{}.{}/{} + default gw {}.{}.{}.{} [{}], medium=ethernet, polled OK; link {} — live ICMP/ARP is attended-metal ::",
             P4,

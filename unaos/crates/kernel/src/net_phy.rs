@@ -45,6 +45,7 @@
 #![cfg(any(feature = "net4", feature = "vnet", feature = "smolnet", feature = "genet"))]
 
 use core::marker::PhantomData;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant;
@@ -137,9 +138,58 @@ impl<N: RawNic> TxToken for PhyTxToken<'_, N> {
     fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
         let n = len.min(self.buf.len());
         let r = f(&mut self.buf[..n]);
+        classify_tx(&self.buf[..n]);
         N::transmit(&self.buf[..n]);
         r
     }
+}
+
+// ── NET-ARP-1: TX-emission count witness ─────────────────────────────────────────────────────────
+//
+// The boot-P7/boot-29 question was "does smoltcp's poll ever get to EMIT?" — these counters answer it
+// on the wire side of the seam: every frame smoltcp hands the phy is classified as it crosses
+// `TxToken::consume` (i.e. the exact moment it is handed to the NIC TX ring), so the drivers' gated
+// `[netarp1] smoltcp emitted N frames (arp-reply=X dhcp=Y)` line is an emission proof, not a poll-loop
+// guess. Shared by every adapter (x86 smolnet counts too; only the aarch64 binds print the line today).
+
+static TX_TOTAL: AtomicU32 = AtomicU32::new(0);
+static TX_ARP_REPLY: AtomicU32 = AtomicU32::new(0);
+static TX_DHCP: AtomicU32 = AtomicU32::new(0);
+
+/// Classify one outbound L2 frame for the NET-ARP-1 emission witness: total, ARP replies
+/// (ethertype 0x0806, opcode 2) and DHCP client datagrams (IPv4/UDP 68 → 67).
+fn classify_tx(frame: &[u8]) {
+    TX_TOTAL.fetch_add(1, Ordering::Relaxed);
+    if frame.len() < 14 {
+        return;
+    }
+    let et = u16::from_be_bytes([frame[12], frame[13]]);
+    if et == 0x0806 {
+        // ARP opcode is bytes 6..8 of the ARP payload (offset 20..22 in the frame); reply = 2.
+        if frame.len() >= 22 && frame[20] == 0 && frame[21] == 2 {
+            TX_ARP_REPLY.fetch_add(1, Ordering::Relaxed);
+        }
+    } else if et == 0x0800 && frame.len() >= 14 + 20 && frame[23] == 17 {
+        // IPv4/UDP: ports sit right after the IHL-sized header.
+        let ihl = ((frame[14] & 0x0f) as usize) * 4;
+        let udp = 14 + ihl;
+        if frame.len() >= udp + 4 {
+            let sp = u16::from_be_bytes([frame[udp], frame[udp + 1]]);
+            let dp = u16::from_be_bytes([frame[udp + 2], frame[udp + 3]]);
+            if sp == 68 && dp == 67 {
+                TX_DHCP.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// Snapshot the NET-ARP-1 emission counters: `(total, arp_reply, dhcp)`. Cumulative since boot.
+pub fn tx_emission_counts() -> (u32, u32, u32) {
+    (
+        TX_TOTAL.load(Ordering::Relaxed),
+        TX_ARP_REPLY.load(Ordering::Relaxed),
+        TX_DHCP.load(Ordering::Relaxed),
+    )
 }
 
 impl<N: RawNic, O: RxObserver> Device for SmoltcpPhy<N, O> {
