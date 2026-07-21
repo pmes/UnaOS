@@ -1,3 +1,4 @@
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[cfg(feature = "gtk")]
 mod shell_gtk;
 
@@ -8,15 +9,15 @@ mod shell_qt;
 mod shell_macos;
 
 fn main() {
+    #[cfg(target_os = "macos")]
+    {
+        shell_macos::run();
+        return;
+    }
+
     #[cfg(feature = "gtk")]
     shell_gtk::run();
-    
-    #[cfg(all(not(feature = "gtk"), feature = "qt"))]
-    shell_qt::run();
 
-    #[cfg(all(not(feature = "gtk"), not(feature = "qt"), target_os = "macos"))]
-    shell_macos::run();
-    
-    #[cfg(all(not(feature = "gtk"), not(feature = "qt"), not(target_os = "macos")))]
-    println!("No shell feature enabled. Compile with --features gtk or qt");
+    #[cfg(feature = "qt")]
+    shell_qt::run();
 }

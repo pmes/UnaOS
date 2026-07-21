@@ -16,3 +16,7 @@ tokio = { version = "1", features = ["full"] }
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 gtk4 = { version = "0.11.4", features = ["v4_14"], optional = true }
 glib = { version = "0.22", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+winit = "0.30"
+softbuffer = "0.4"
