@@ -6,6 +6,6 @@ license = "LGPL-3.0-or-later"
 
 [dependencies]
 bandy = { path = "../bandy" }
-anyhow = "1.0.102"
-cpal = "0.17"
-ringbuf = "0.4"
+anyhow = "1.0.104"
+cpal = "0.18"
+ringbuf = "0.5"

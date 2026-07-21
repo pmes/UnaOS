@@ -17,4 +17,4 @@ gneiss_pal = { path = "../../libs/gneiss_pal" }
 resonance = { path = "../../libs/resonance" }
 
 log = "0.4"
-tokio = { version = "1.49", features = ["rt-multi-thread", "sync", "macros", "time", "signal"] }
+tokio = { version = "1.53", features = ["rt-multi-thread", "sync", "macros", "time", "signal"] }

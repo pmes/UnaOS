@@ -14,14 +14,17 @@
 
 ## 2. The Handler Manifest (The 21)
 
-**Status:** **LOCKED**, with one amendment by the Architect's hand:
+**Status:** **LOCKED**, with two amendments by the Architect's hand:
 > *Amendment I (2026-07-14): **Helm** joins the Manifest. The machines grow hands; the
 > Codex grows a wheel. Twenty were The 20; the Manifest is now The 21. The lock stands —
 > it guards against drift, never against the Architect.*
+> 
+> *Amendment II (2026-07-20): **Aether** becomes a real web browser. JS-enabled; delegates A/V playback to Stria. The read-only constraint is lifted.*
+
 
 | Handler | Domain | The "App" It Replaces | Technical Role |
 | :--- | :--- | :--- | :--- |
-| **Aether** | **Web** | Chrome, Acrobat | **The Reader.** Read-only renderer for HTML, Markdown, PDF. No JIT JS. |
+| **Aether** | **Web** | Chrome, Acrobat | **The Web Browser.** Web browser; JS-enabled; delegates A/V playback to Stria. |
 | **Amber Bytes** | **Disks** | Disk Utility | **The Block.** Partitioning (GPT), Formatting, Block-level recovery. |
 | **Aulë** | **Forge** | Cargo, Make | **The Builder.** Manages compilation, assets, and packaging. |
 | **Comscan** | **Signals** | Terminal, Pronterface | **IO Bridge.** Serial, GPIO, Bluetooth, SDR. Controls hardware. |

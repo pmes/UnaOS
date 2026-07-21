@@ -10,13 +10,13 @@ license = "LGPL-3.0-or-later"
 gneiss_pal = { path = "../../../../libs/gneiss_pal", optional = true }
 bandy = { path = "../../../../libs/bandy", optional = true }
 serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
-bincode = { version = "2.0", default-features = false, features = ["serde", "alloc"] }
+bincode = { version = "2.0.0-rc.3", default-features = false, features = ["serde", "alloc"] }
 thiserror = { version = "2.0", default-features = false }
 # Pure-Rust no_std float math for the query engine's cosine similarity. Used
 # unconditionally (std builds too) so host and kernel score along ONE code
 # path and results stay bit-identical.
 libm = { version = "0.2", default-features = false }
-anyhow = { version = "1.0.102", optional = true }
+anyhow = { version = "1.0.104", optional = true }
 memmap2 = { version = "0.9", optional = true }
 
 [features]
