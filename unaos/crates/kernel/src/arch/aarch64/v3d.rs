@@ -181,6 +181,14 @@ const V3D_CLE_CT0QMS: usize = 0x0174; // CT0 bin TILE-ALLOCATION memory size  (v
 // transcribed VERBATIM from Linux v3d_regs.h (register facts; GPL-2.0-only header, facts-only).
 const V3D_CLE_CT0QTS: usize = 0x015c; // CT0 bin tile-STATE data array base (v3d_regs.h V3D_CLE_CT0QTS)
 const V3D_CLE_CT0QTS_ENABLE: u32 = 1 << 1; // v3d_regs.h V3D_CLE_CT0QTS_ENABLE — gate the tile-state write
+// PI-V3D-13 fact-check (Linux v3d_regs.h + v3d_sched.c v3d_bin_job_run, verbatim; facts only —
+// GPLv2): CT0QTS=0x15c with ENABLE=BIT(1), CT0QBA=0x160, CT0QEA=0x168, CT0QMA=0x170, CT0QMS=0x174;
+// bin submit order = invalidate caches, then CT0QMA (pool base) → CT0QMS (pool SIZE, not end) →
+// CT0QTS|ENABLE → CT0QBA → CT0QEA (GO). On 4.x the TILE_BINNING_MODE_CFG packet carries only the
+// tile-alloc BLOCK-SIZE enums (Mesa v3dvx_cmd_buffer.c job_emit_binning_prolog), never the pool
+// address — the pool/state addresses travel ONLY through these registers. This file's programming
+// already matches all of it (PI-V3D-9); PI-V3D-13 adds the pre-kick readback + post-bin pool-head
+// witnesses so the next metal sitting sees exactly which half of that story the silicon disputes.
 // CTnCS status: only CTRUN (bit5) is corroborated across sources for V3D 4.x; the remaining bits differ
 // from the VideoCore-IV layout and are reported raw rather than guessed (no fabricated bit names).
 const V3D_CLE_CTNCS_CTRUN: u32 = 1 << 5;
@@ -1799,6 +1807,13 @@ fn triangle_job(fb: Option<FbTarget>) -> bool {
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QMS, BIN_TILEALLOC_BYTES as u32); // …and its size
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QTS, ts | V3D_CLE_CT0QTS_ENABLE); // tile-state array (enabled)
     dsb();
+    // PI-V3D-13 witness: prove the bin-memory registers hold what we wrote BEFORE the GO.
+    bin_mem_prekick_witness(
+        "M4",
+        tile_alloc,
+        BIN_TILEALLOC_BYTES as u32,
+        ts | V3D_CLE_CT0QTS_ENABLE,
+    );
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QBA, bin_ba);
     dsb(); // BA latched before the GO
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QEA, bin_ea); // GO
@@ -1817,6 +1832,8 @@ fn triangle_job(fb: Option<FbTarget>) -> bool {
         ct0_cs_pre, ct0_cs_kicked, ct0_cs_done, ct0_ca_pre, ct0_ca_kicked, ct0_ca_done,
         bin_ba, bin_ea, bin_ran as u32, bin_idled as u32, bin_fault
     );
+    // PI-V3D-13 witness: post-bin, did the binner's output actually land in the pool?
+    bin_pool_witness("M4 post-bin");
     super::exceptions::serror_drain_request("v3d: M4 bin kick window");
 
     // PI-V3D-9 boot-P5 fix: clear any latched V3D-MMU fault BEFORE the render kick. Boot-P5 showed the
@@ -2127,6 +2144,46 @@ fn clear_mmu_fault_latch_quiet() -> u32 {
     fault
 }
 
+/// PI-V3D-13 pre-kick witness: read back the three bin-memory registers just written (CT0QMA =
+/// tile-allocation pool base, CT0QMS = its size, CT0QTS = tile-state array base | ENABLE). The
+/// PI-V3D-13 fact-check confirmed the programming model against Linux v3d_regs.h/v3d_sched.c
+/// verbatim (offsets 0x170/0x174/0x15c, ENABLE=BIT(1), order QMA→QMS→QTS→QBA→QEA-GO), so a readback
+/// that does NOT echo what we wrote is itself the boot-P8 clue: either the slots are not where the
+/// silicon holds them or the writes are not landing.
+fn bin_mem_prekick_witness(tag: &str, qma_w: u32, qms_w: u32, qts_w: u32) {
+    let qma = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0QMA);
+    let qms = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0QMS);
+    let qts = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0QTS);
+    serial_println!(
+        ":: V3D: {} bin-mem regs — CT0QMA={:#010x} (wrote {:#010x}) CT0QMS={:#010x} (wrote {:#010x}) CT0QTS={:#010x} (wrote {:#010x}) echo={} ::",
+        tag, qma, qma_w, qms, qms_w, qts, qts_w,
+        (qma == qma_w && qms == qms_w && qts == qts_w) as u32
+    );
+}
+
+/// PI-V3D-13 post-bin witness: CPU-read the tile-alloc pool head and give the one-line verdict the
+/// brief asks for — did the BINNER actually write its output into the pool? The CPU zero-filled and
+/// cleaned the pool pre-kick, so its D-cache holds zero lines over the head; clean+invalidate the
+/// head line first (clean is a no-op — the lines were cleaned at publish — and the invalidate makes
+/// this read observe the binner's DRAM write). Nonzero head bytes = the binner wrote a tile list.
+fn bin_pool_witness(tag: &str) -> bool {
+    cache::clean_invalidate_range(arena_phys() + OFF_BIN_TILEALLOC, 64);
+    let arena = &raw const V3D_ARENA;
+    let mut head = [0u8; 8];
+    unsafe {
+        for (i, h) in head.iter_mut().enumerate() {
+            *h = (*arena).bytes[OFF_BIN_TILEALLOC + i];
+        }
+    }
+    let wrote = head.iter().any(|&b| b != 0);
+    serial_println!(
+        ":: V3D: {} tile-alloc pool[0..8] = {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} — {} ::",
+        tag, head[0], head[1], head[2], head[3], head[4], head[5], head[6], head[7],
+        if wrote { "nonzero: the binner WROTE the pool" } else { "all zero: the binner never wrote the pool" }
+    );
+    wrote
+}
+
 /// Kick one bin (CT0) + render (CT1) job pair over already-built, already-published control lists.
 /// Mirrors the M4 kick sequence exactly (QMA/QMS/QTS → QBA → QEA-GO on CT0; QBA → QEA-GO on CT1;
 /// finite backstops; fault-latch clear between the two) without touching the M4 code — so a V3D-10
@@ -2160,6 +2217,13 @@ fn kick_bin_render(bin_off: usize, bin_len: usize, rcl_off: usize, rcl_len: usiz
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QMS, BIN_TILEALLOC_BYTES as u32);
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QTS, ts | V3D_CLE_CT0QTS_ENABLE);
     dsb();
+    // PI-V3D-13 witness mirror of the M4 kick path.
+    bin_mem_prekick_witness(
+        "battery",
+        tile_alloc,
+        BIN_TILEALLOC_BYTES as u32,
+        ts | V3D_CLE_CT0QTS_ENABLE,
+    );
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QBA, bin_ba);
     dsb();
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QEA, bin_ea); // GO
@@ -2169,6 +2233,8 @@ fn kick_bin_render(bin_off: usize, bin_len: usize, rcl_off: usize, rcl_len: usiz
     let cs_done = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CS);
     let ca_done = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CA);
     res.bin_ran = ct0_ran(cs_pre, cs_kicked, cs_done, ca_done, bin_ba, bin_ea);
+    // PI-V3D-13 witness mirror of the M4 kick path.
+    bin_pool_witness("battery post-bin");
     // Fault-latch hygiene between bin and render (the boot-P5 sticky-fault wedge), quiet per-frame.
     res.fault |= clear_mmu_fault_latch_quiet();
 
