@@ -384,22 +384,37 @@ unsafe fn takeover_display(gpu: &GpuInfo, bar0: usize, allocator: &mut VramAlloc
     let mut raw_storage = 0;
 
     for head in 0..4 {
-        // NV_EVO_CORE base = 0x610000. HEAD array starts at 0x400, stride 0x300.
-        // G80_EVO_FB_SETTINGS is at offset 0x60 within the head.
-        let head_base = regs::NV_PDISPLAY_BASE + 0x400 + (head * 0x300) + 0x60;
-        let addr = mmio_read(bar0, head_base + 0x0); // OFFSET_ORIGIN
-        let size = mmio_read(bar0, head_base + 0x8); // SIZE
-        let storage = mmio_read(bar0, head_base + 0xC); // STORAGE
+        // Candidate 1: NV_EVO_CORE (may be zero if EFI bypassed EVO)
+        let head_evo = regs::NV_PDISPLAY_BASE + 0x400 + (head * 0x300) + 0x60;
+        let addr_evo = mmio_read(bar0, head_evo + 0x0); // OFFSET_ORIGIN
+        
+        // Candidate 2: Direct CRTC (HEAD_VAL)
+        let head_crtc = regs::NV_PDISPLAY_BASE + 0xA00 + (head * 0x540) + 0x128;
+        let addr_crtc = mmio_read(bar0, head_crtc); // FB_POS
 
-        serial_println!(":: kepler: head-raw head={} addr={:08X} size={:08X} storage={:08X} ::", head, addr, size, storage);
+        serial_println!(":: kepler: head-raw head={} evo={:08X} crtc={:08X} ::", head, addr_evo, addr_crtc);
 
-        if addr == 0 || (addr & 0xFFF00000) == 0xBAD00000 {
-            serial_println!(":: kepler: bad-read head {:X} {:08X} ::", head_base, addr);
+        let addr;
+        let size;
+        let storage;
+
+        if addr_evo != 0 && (addr_evo & 0xFFF00000) != 0xBAD00000 {
+            addr = addr_evo;
+            size = mmio_read(bar0, head_evo + 0x8);
+            storage = mmio_read(bar0, head_evo + 0xC);
+            serial_println!(":: kepler: head-selected evo head={} ::", head);
+        } else if addr_crtc != 0 && (addr_crtc & 0xFFF00000) != 0xBAD00000 {
+            addr = addr_crtc;
+            size = mmio_read(bar0, regs::NV_PDISPLAY_BASE + 0xA00 + (head * 0x540) + 0x118); // FB_SIZE
+            storage = 0;
+            serial_println!(":: kepler: head-selected crtc head={} ::", head);
+        } else {
+            serial_println!(":: kepler: bad-read head {} no valid candidates ::", head);
             continue;
         }
 
         if size == 0 || (size & 0xFFF00000) == 0xBAD00000 {
-            serial_println!(":: kepler: bad-read head {:X} {:08X} ::", head_base + 0x8, size);
+            serial_println!(":: kepler: bad-read head-size {:08X} ::", size);
             continue;
         }
 
