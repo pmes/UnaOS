@@ -348,6 +348,60 @@ fn witness_rc_cpu_claim() {
     }
 }
 
+/// PIUSB-14: the NOTIFY-boundary witness. Prints the exact downstream state the VideoCore's
+/// `NOTIFY_XHCI_RESET` handler depends on to reach the VL805 and (re)load its firmware over PCIe —
+/// captured immediately BEFORE and immediately AFTER a NOTIFY so a single boot shows what the fw-load
+/// touched. On this EEPROM-less rev-1.5 board the VC MUST push the VL805 firmware across the link at
+/// NOTIFY time (there is no SPI EEPROM), so the link must be trained (DL_ACTIVE) AND the RC's config-
+/// forwarding path to bus1/dev0 must be live AT THE MOMENT the handler runs. The discriminators this
+/// captures across the boundary:
+///   * PCIE link (PHYLINKUP/DL_ACTIVE) — was the link up when the VC ran the handler, and did the VC
+///     DROP it (its handler may PERST the VL805 to "reset" it, which would re-train the link and could
+///     tear our forwarding down)?
+///   * RGR1_SW_INIT_1 + RP bus window [0x18] + RP mem window [0x20] + RP COMMAND — did the VC CLOBBER
+///     our RC programming (a changed value POST-NOTIFY = the VC re-ran its own RC bring-up and does not
+///     use our windows; an unchanged value = it rides ours, so ours must be correct)?
+///   * VL805 config id[0x00]/COMMAND[0x04]/BAR0[0x10..0x14] — did the device change state (a fw load
+///     resets the VL805's config space; id going live, or BAR0/COMMAND reverting to power-on defaults,
+///     witnesses that the reset/load actually reached the silicon vs. a handler that ran into a dead
+///     downstream path and loaded nothing).
+/// Read-only. Child-config reads are HARD-GATED on PHYLINKUP && DL_ACTIVE (the boot-P4 link-down-MMIO-
+/// stalls-the-bus law); with the link down it prints the RC register block only and returns.
+fn witness_notify_boundary(ctx: &str, label: &str) {
+    let swinit = r(RC_BASE + PCIE_RGR1_SW_INIT_1);
+    let status = r(RC_BASE + PCIE_MISC_PCIE_STATUS);
+    let phylinkup = status & PCIE_MISC_PCIE_STATUS_PHYLINKUP != 0;
+    let dl_active = status & PCIE_MISC_PCIE_STATUS_DL_ACTIVE != 0;
+    let buses = r(RC_BASE + 0x18);
+    let memwin = r(RC_BASE + 0x20);
+    let rp_cmd = r(RC_BASE + 0x04) & 0xffff;
+    serial_println!(
+        "{}   NOTIFY-{} ({}): RGR1={:#010x} PCIE_STATUS={:#010x} (PHYLINKUP={} DL_ACTIVE={}) | RP bus[0x18]={:#010x} mem[0x20]={:#010x} CMD[0x04]={:#06x} (MEM={} BM={}) ::",
+        P, label, ctx, swinit, status, phylinkup, dl_active, buses, memwin, rp_cmd, (rp_cmd >> 1) & 1, (rp_cmd >> 2) & 1
+    );
+    if is_poison(status) || !(phylinkup && dl_active) {
+        serial_println!(
+            "{}   NOTIFY-{} ({}): link NOT up (PHYLINKUP={} DL_ACTIVE={}) — skipping child-config read (link-down MMIO stalls the bus, boot-P4) ::",
+            P, label, ctx, phylinkup, dl_active
+        );
+        return;
+    }
+    let id = vl805_cfg_read(0x00);
+    let cmd = vl805_cfg_read(0x04) & 0xffff;
+    let bar0_lo = vl805_cfg_read(0x10);
+    let bar0_hi = vl805_cfg_read(0x14);
+    match live_vendor_device(id) {
+        Some((v, d)) => serial_println!(
+            "{}   NOTIFY-{} ({}): VL805 cfg id={:#010x} (vendor={:#06x} device={:#06x}) COMMAND={:#06x} (MEM={} BM={}) BAR0=[{:#010x} {:#010x}] ::",
+            P, label, ctx, id, v, d, cmd, (cmd >> 1) & 1, (cmd >> 2) & 1, bar0_lo, bar0_hi
+        ),
+        None => serial_println!(
+            "{}   NOTIFY-{} ({}): VL805 cfg id={:#010x} — child config not answering (device silent / forwarding down) BAR0=[{:#010x} {:#010x}] ::",
+            P, label, ctx, id, bar0_lo, bar0_hi
+        ),
+    }
+}
+
 /// The pre-reset firmware reference dump. Read-only. Runs after the DTB census (so only when an RC is
 /// present) and before M1's first reset write. Reads the RC's OWN register block (bridge/window/status —
 /// always safe, even with the link down) and prints it as the one-boot-proven record. Then a HARD
@@ -871,11 +925,28 @@ fn m2_enumerate_vl805() -> Option<u64> {
     // The dev_addr encoding (VL805_DEV_ADDR = (1<<20)|(0<<15)|(0<<12) = 0x0010_0000) matches the RPi
     // firmware property model — dev_id = (bus<<20)|(slot<<15)|(func<<12) for bus1/dev0/fn0. Verified
     // against the mailbox property-interface reference; constant unchanged.
+    // PIUSB-14: witness the exact downstream state the VC's fw-load handler depends on, immediately
+    // BEFORE the NOTIFY — the link (DL_ACTIVE printed here, at notify time), our RC/RP forwarding, and
+    // the VL805's live config. On this EEPROM-less board the VC pushes the VL805 firmware over PCIe at
+    // NOTIFY time, so this line records that the config path is up when the handler runs. Windows are
+    // programmed (bus[0x18], mem[0x20], RP COMMAND — all set above); the BAR is assigned AFTER NOTIFY
+    // (PIUSB-4: the reload resets config space), and the PRE/POST id[0x00] diff below tells us whether
+    // that reset actually reached the silicon.
+    witness_notify_boundary("M2", "PRE");
+
     serial_println!("{}   NOTIFY_XHCI_RESET (mailbox 0x00030058, dev_addr={:#x}) — firmware VL805 reset/load (BEFORE BAR/COMMAND: the reload resets config space) ::", P, VL805_DEV_ADDR);
     let n = mailbox::notify_xhci_reset(VL805_DEV_ADDR);
     witness_notify("M2", &n);
     // Let the VideoCore firmware finish loading/resetting the VL805 before we touch its config space.
     settle_ms(50);
+
+    // PIUSB-14: re-witness the SAME state AFTER the NOTIFY. Compare against the PRE line above:
+    //   * RC/RP registers CHANGED  => the VC re-ran its own RC bring-up (it does NOT ride our windows;
+    //     our forwarding is moot and the fix is to match the VC's expected topology, not program ours).
+    //   * RC/RP registers UNCHANGED => the VC rode our windows; if the fw still didn't load, our
+    //     forwarding was insufficient (e.g. the fw push needs the mem window/BAR, which we set later).
+    //   * VL805 id/BAR0/COMMAND CHANGED => the reset/load reached the silicon (config space reverted).
+    witness_notify_boundary("M2", "POST");
 
     // Witness LAYER 2 (firmware running / device survival): re-read the identity word AFTER the notify.
     // If the VL805 vanished or the RP forwarding broke across the reset, this catches it before we
@@ -1118,7 +1189,32 @@ fn m3_attach_xhci(cpu_base: u64, _bar0_pcie: u64) {
     // PIUSB-11: reload the VL805 firmware immediately before halt+HCRST (Linux places its
     // reset_control_reset() right before probe/HCRST). Without a fresh fw the HCRST completes into a
     // firmwareless controller and CNR wedges at 1.
+    //
+    // PIUSB-14: MMIO BAR0 sanity read across this pre-HCRST NOTIFY. Unlike the M2 boundary witness
+    // (config-space only — the window is not yet mapped there), the outbound window IS mapped here, so
+    // we read the controller's OWN xHCI registers through the BAR: CAP[0] (is it decoding?) and USBSTS
+    // (CNR bit 11 — Not-Ready). If the fw load reaches the silicon, the post-NOTIFY USBSTS should show
+    // CNR behaviour change (the fw drives CNR); an identical CAP/USBSTS across the NOTIFY = the load did
+    // not alter the controller through this BAR path. `op_base` = CAP base + CAPLENGTH.
+    let op_base_probe = outbound_cpu_base + cap_length as u64;
+    let cap_pre = r(outbound_cpu_base);
+    let usbsts_pre = r(op_base_probe + 0x04);
+    serial_println!(
+        "{}   NOTIFY-PRE (M3 MMIO): CAP[0]={:#010x} USBSTS={:#010x} (CNR={} HCH={}) @ op_base {:#x} ::",
+        P, cap_pre, usbsts_pre, (usbsts_pre >> 11) & 1, usbsts_pre & 1, op_base_probe
+    );
     notify_before_reset("M3 attach");
+    let cap_post = r(outbound_cpu_base);
+    let usbsts_post = r(op_base_probe + 0x04);
+    serial_println!(
+        "{}   NOTIFY-POST (M3 MMIO): CAP[0]={:#010x} USBSTS={:#010x} (CNR={} HCH={}) -> {} ::",
+        P, cap_post, usbsts_post, (usbsts_post >> 11) & 1, usbsts_post & 1,
+        if usbsts_post != usbsts_pre || cap_post != cap_pre {
+            "controller state CHANGED across NOTIFY (fw load reached the silicon through the BAR)"
+        } else {
+            "controller state UNCHANGED across NOTIFY (fw load did NOT alter the controller via this BAR path)"
+        }
+    );
     xhci::init(outbound_cpu_base);
 
     // Power the root ports: set PORTSC.PP (bit 9) on each port register (operational base +0x400 +
