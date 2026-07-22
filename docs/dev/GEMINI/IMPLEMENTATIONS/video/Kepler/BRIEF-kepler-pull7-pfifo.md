@@ -3,8 +3,10 @@ STATUS: BRIEF — awaiting Gemini intro proposal (new arc, new session)
 # BRIEF — Kepler wall-2 (PFIFO/PBDMA fence), pull 7 arc intro
 
 Coordinator-authored brief (2026-07-22, post sitting #5). The assigned Gemini
-specialist answers this with `PROPOSAL-kepler-pull7.md` (STATUS: PROPOSED) per
-`README.md` in this directory — **no implementation commits before approval**.
+specialist answers this with `PROPOSAL-kepler-pull7.md` (STATUS: PROPOSED)
+saved in THIS directory (`docs/dev/GEMINI/IMPLEMENTATIONS/video/Kepler/`),
+following the review flow in `docs/dev/GEMINI/PROPOSALS/README.md` — **no
+implementation commits before approval**.
 This is a **derivation arc**: the proposal must contain the derived offsets
 with rnndb/envytools XML citations so facts are checkable before code.
 

@@ -3,8 +3,10 @@ STATUS: BRIEF — awaiting Gemini intro proposal (new arc, new session)
 # BRIEF — iGPU (Intel HD 4000) display driver, arc intro
 
 Coordinator-authored brief (2026-07-22, post sitting #5). The assigned Gemini
-specialist answers this with `PROPOSAL-igpu-pull1.md` (STATUS: PROPOSED) per
-`README.md` in this directory — **no implementation commits before approval**.
+specialist answers this with `PROPOSAL-igpu-pull1.md` (STATUS: PROPOSED) saved
+in THIS directory (`docs/dev/GEMINI/IMPLEMENTATIONS/video/iGUI/`), following
+the review flow in `docs/dev/GEMINI/PROPOSALS/README.md` — **no implementation
+commits before approval**.
 
 ## Why this arc exists (sitting #5 strategic redirect)
 
