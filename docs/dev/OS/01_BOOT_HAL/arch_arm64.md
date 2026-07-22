@@ -6682,6 +6682,58 @@ at notify time + CNR still 1 → the load path is **not** BAR-MMIO (next theory:
 translation/DMA for the push) — report, do not flail. QEMU raspi4b models no PCIe RC, so the whole path
 sits behind the DTB-census honesty-line gate (clean skip, byte-identity preserved).
 
+### PIUSB-17 — align the M1 PERST reset to Linux `brcm_pcie_start_link` (the device-ready window)
+
+**What the P21–P27 metal set closed, and what it left.** By P27, PIUSB-15's discrimination outcome **(c)**
+had fired on silicon: BAR0 assigned, `COMMAND` MEM+BM set, an MMIO `CAP[0]=0x01000020` read LIVE through the
+BAR *before* NOTIFY, the `NOTIFY_XHCI_RESET` tag **honoured** (`tag_code` bit31 set, echo 0) — yet
+`USBSTS.CNR` never clears and `USBCMD.HCRST` never completes. The controller accepts every MMIO read (PCIe
+core alive) but its firmware state machine never runs (8051 dead). Every mailbox/BAR/firmware-blob theory is
+refuted: stock RPi OS on this same board makes USB work, Linux cold-builds the same RC (VideoCore leaves it
+in reset there too) and Linux's NOTIFY load works. So the delta is strictly between our cold-build+NOTIFY
+sequence and Linux's — a **null-hypothesis, our-sequence** search.
+
+**The verified Linux ordering (facts of record).**
+- The VL805 firmware load is `rpi_firmware_init_vl805(pdev)`, called from `quirk_usb_early_handoff` in
+  `drivers/usb/host/pci-quirks.c`, registered `DECLARE_PCI_FIXUP_CLASS_FINAL(…, PCI_CLASS_SERIAL_USB, 8, …)`.
+  A **FINAL** class fixup runs at `pci_bus_add_device`, i.e. **after** PCI resource/BAR assignment. So Linux
+  issues NOTIFY with the VL805's BAR0 **already assigned** — **PIUSB-15's central assumption survives**
+  (BAR-assigned-then-NOTIFY is Linux's order, not an inversion). `dev_addr = (bus<<20)|(slot<<15)|(func<<12)`
+  = `0x100000` for bus1/dev0/fn0 — our `VL805_DEV_ADDR` matches exactly.
+- The delta is in **M1's PERST reset timing**. Linux `pcie-brcmstb.c` does, in `brcm_pcie_setup`:
+  `bridge_sw_init_set(1)` → `perst_set(1)` → `usleep_range(100,200)` → `bridge_sw_init_set(0)` → clear
+  `HARD_DEBUG.SERDES_IDDQ` + `usleep_range(100,200)` → configure windows; then in `brcm_pcie_start_link`:
+  `perst_set(0)` → **`msleep(PCIE_RESET_CONFIG_WAIT_MS)` = 100 ms unconditionally** → only THEN poll
+  PHYLINKUP/DL_ACTIVE (every 5 ms, up to ~500 ms). Our prior M1 deasserted PERST and **polled link-up
+  immediately**, then pressed straight into M2 (config → NOTIFY) the instant `DL_ACTIVE` flipped. The PCIe
+  CEM `T_PVPERL` / device-ready window is exactly this 100 ms: the VL805 PCIe core trains the link in a few
+  ms, but its 8051 firmware engine needs the full fundamental-reset recovery before it can be reset/loaded
+  and clear CNR. **link-trained ≠ device-ready** — we were touching the controller while the 8051 was still
+  in reset, which is precisely the "MMIO live, state machine dead" signature.
+
+**The change (M1 only, in-lane `piusb.rs`).** (1) Split the assert into Linux's two-step order —
+`RGR1_SW_INIT_1 |= INIT_GENERIC` then `|= PERST` as distinct writes (was one combined write). (2) After
+deasserting PERST, a **mandatory fixed `settle_ms(100)` before any link poll or downstream access**
+(`PERST_DEASSERT_SETTLE_MS`, = Linux `PCIE_RESET_CONFIG_WAIT_MS`), then poll link-up on our existing bounded
+budget on top of it. Every existing witness is preserved; M2's `settle_ms(100)` pre-config-read is unchanged
+(now stacked after the M1 window, giving the 8051 a Linux-comparable total before NOTIFY). No protection
+weakened, no file outside the lane touched.
+
+**Expected witnesses + one-boot discrimination.**
+- New: `PIUSB-17: waited 100 ms post-PERST-deassert BEFORE link poll …` and, on link-up,
+  `M1: LINK UP … N ms after PERST-deassert (fixed settle 100 ms + M ms of polling)`.
+- **(d) delta was the premature access** → after the fixed settle, HCRST completes / CNR clears (PIUSB-10
+  gate), PIUSB-13's `[enum]` observer walks the keyboard. The `N ms after PERST-deassert` line shows the
+  link was already up when the settle expired (M≈0), i.e. the wall was device-readiness timing, not link
+  training.
+- **CNR still 1 after the aligned reset** → M1 timing is not the delta either; the remaining candidates are
+  link speed/width training state at NOTIFY (candidate 3) and the VC-side push mechanism (outcome (c)'s
+  "the VC uses its own translation/DMA, not our BAR"). Report, do not flail.
+
+QEMU raspi4b models no PCIe RC, so this whole M1 path sits behind the DTB-census honesty-line gate — the
+QEMU regression is byte-behaviour-identical (census-skip, graceful degradation, full U-arc PASS chain);
+the change is exercised only at an attended metal sitting.
+
 ## PI-USB-2 — from the honesty line to device enumeration on the VL805 (Arc PI-USB-2)
 
 Rung 1 stopped the VL805 xHCI at "halted-but-decoding + ports powered". Rung 2 adds the **DMA-side

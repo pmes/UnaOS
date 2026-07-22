@@ -1687,8 +1687,16 @@ fn build_shader_record() -> u32 {
 /// Build the BINNING control list (CT0) at OFF_BIN_CL. Prologue per `v3dX(start_binning)`, draw emit
 /// per `v3dX(draw_vbo)`. Returns its byte length.
 fn build_bin_cl(num_attrs: u32) -> usize {
-    let shadrec = (arena_phys() + OFF_SHADREC) as u32;
-    let mut w = RclWriter::new(OFF_BIN_CL);
+    build_bin_cl_generic(OFF_BIN_CL, OFF_SHADREC, num_attrs)
+}
+
+/// Same bin CL as `build_bin_cl`, but with the control-list and shader-record offsets parameterised so
+/// a second (probe) draw can reuse the identical prologue/state/draw emit against its own record.
+/// PI-V3D-27 uses it to bin the Mesa-compiled TMU-store probe over the SAME vertex buffer + attribute
+/// record as the real draw.
+fn build_bin_cl_generic(cl_off: usize, shadrec_off: usize, num_attrs: u32) -> usize {
+    let shadrec = (arena_phys() + shadrec_off) as u32;
+    let mut w = RclWriter::new(cl_off);
 
     // NUMBER_OF_LAYERS (single layer → minus_one 0), required before the bin-mode config.
     w.pkt(Pkt::new(P_NUMBER_OF_LAYERS, 2).f(0, 8, 0).done());
@@ -1965,6 +1973,259 @@ fn ct0_ran(cs_pre: u32, cs_kicked: u32, cs_done: u32, ca_done: u32, ba: u32, ea:
     ctrun_ever || ca_advanced
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════════
+// PI-V3D-27: the Mesa-COMPILED attribute-DMA probe (v3d.md §12).
+//
+// The empty-bin wall's one surviving candidate after §8/§10/§11: the VCD never DMAs the vertex
+// attributes into the VPM, so the coord shader's `ldvpmv_in` reads collapse every vertex to Xc=Yc=0 →
+// a degenerate zero-area primitive the PTB legitimately bins to nothing (consistent with every witness:
+// shader runs (PCTR §4), no fault, CL clean, empty pool). Every CPU→GPU hand-off is exonerated and the
+// VPM output is on-chip/CPU-unreadable (§3), so the only way to settle it is to make the QPU itself tell
+// us what it loaded. V3D-26 compiled — with Mesa's real `v3d_compile()` (ver 4.2), authoritative words —
+// a passthrough coord VS that ALSO `store_ssbo`s its four loaded attribute components; Mesa lowered the
+// store to `mov tmud ×4 → mov tmuau → tmuwt` (the TMUAU-config-coupled words §10 said could not be
+// hand-authored to §5 confidence). This arc wires that probe into the M4 bin path as a one-off draw
+// BEFORE the real bin: same vertex buffer + attribute record, its own shader record with the coord slot
+// pointing at the probe words, and a QUNIFORM_UBO_ADDR uniform aimed at a CPU-visible scratch buffer.
+// After the bin idles we invalidate + read the four stored words back — a direct readout of what the VCD
+// actually delivered to the QPU for THIS draw's attribute fetch.
+//
+// PROVENANCE (§5 fabricated-constant law): every PROBE_WORDS entry is transcribed verbatim from the
+// V3D-26 harness reference output (scripts/pi-v3d26-mesa-compile.out.txt, the PROBE VS section) — real
+// `v3d_compile` bytes, not hand-authored. The uniform stream is likewise the harness stream, with the
+// two driver-patched slots filled exactly as the real draw fills them: QUNIFORM_VIEWPORT_{X,Y}_SCALE →
+// 8192.0f32 (0x46000000, the V3D-18 contract constant write_geo_uniforms already bakes) and
+// QUNIFORM_UBO_ADDR → the scratch buffer's (identity-mapped) V3D address. Those are driver uniform
+// VALUES, not shader words — no QPU word is touched.
+
+/// PI-V3D-27 arena regions — placed in the free tail above the M5–M8 battery (top used byte 0x33100 <
+/// 0x40000). The bin scratch (tile-alloc / tile-state) is REUSED from the M4 regions: the probe bins
+/// first, then `triangle_job` re-zeros + re-cleans OFF_BIN_TILEALLOC / OFF_TILESTATE before the real
+/// bin, so the reuse is invisible to the real draw.
+const OFF_PROBE_CODE: usize = 0x34000; // probe coord-shader QPU code (25 words = 200 B)
+const OFF_PROBE_UNIF: usize = 0x34400; // probe uniform stream (12 words = 48 B)
+const OFF_PROBE_SHADREC: usize = 0x34800; // probe GL Shader State Record (32-B aligned) + attr record
+const OFF_PROBE_SCRATCH: usize = 0x34C00; // TMU-store target: 4 words the QPU writes (CPU reads back)
+const OFF_PROBE_BIN_CL: usize = 0x35000; // probe binning control list (CT0)
+const _: () = assert!(OFF_PROBE_BIN_CL + 0x1000 <= ARENA_BYTES);
+
+/// The Mesa-COMPILED probe coord shader (25 words), transcribed byte-for-byte from the V3D-26 harness
+/// PROBE VS output (scripts/pi-v3d26-mesa-compile.out.txt). It is a full coord shader — it loads the
+/// four attribute components (`ldvpmv_in` → rf3..rf6), STORES them to SSBO 0 via TMU
+/// (`mov tmud ×4 → mov tmuau → tmuwt`), and ALSO emits the six-word STVPMV VPM output so the bin stays
+/// legal. threads=2, tmu_count=1. NO word is hand-authored (§5): these are real `v3d_compile` bytes.
+const PROBE_WORDS: [u64; 25] = [
+    0x3c40_3186_bb80_0000, // nop ; nop ; ldunif
+    0x3d90_2183_bc80_5000, // ldvpmv_in rf3, r5 ; nop ; ldunifrf.r0
+    0x3d90_72c6_bbf8_00c0, // nop ; mov tmud, rf3 ; ldunifrf.r1     (store attr[0])
+    0x3d90_a184_bc80_0000, // ldvpmv_in rf4, r0 ; nop ; ldunifrf.r2
+    0x3d90_e185_bc80_1000, // ldvpmv_in rf5, r1 ; nop ; ldunifrf.r3
+    0x3c00_32c6_bbf8_0100, // nop ; mov tmud, rf4                   (store attr[1])
+    0x3c00_2186_bc80_2000, // ldvpmv_in rf6, r2 ; nop
+    0x3c00_32c6_bbf8_0140, // nop ; mov tmud, rf5                   (store attr[2])
+    0x3c00_32c6_bbf8_0180, // nop ; mov tmud, rf6                   (store attr[3])
+    0x3c00_3346_bbec_0000, // nop ; mov tmuau, r3                   (r3 = UBO_ADDR → fire the store)
+    0x3d91_2180_f883_50c0, // stvpmv r5, rf3 ; nop ; ldunifrf.r4
+    0x5440_2047_ba9a_f0c6, // recip rf7, rf6 ; fmul r1, rf3, r4 ; ldunif
+    0x5440_20c0_f8bb_0100, // stvpmv r0, rf4 ; fmul r3, rf4, r5 ; ldunif
+    0x5440_2080_f8e7_5147, // stvpmv r5, rf5 ; fmul r2, r1, rf7 ; ldunif
+    0x5400_3004_f6cc_21c0, // ffloor r4, r2 ; fmul r0, r3, rf7
+    0x3c40_2180_f883_5180, // stvpmv r5, rf6 ; nop ; ldunif
+    0x3c00_3181_f583_c000, // ftoiz r1, r4 ; nop
+    0x3c00_3182_f680_0000, // ffloor r2, r0 ; nop
+    0x3c60_2180_f880_d000, // stvpmv r5, r1 ; nop ; thrsw ; ldunif
+    0x3c20_3183_f583_a000, // ftoiz r3, r2 ; nop ; thrsw
+    0x3c00_2180_f881_d000, // stvpmv r5, r3 ; nop
+    0x3c00_3186_bb81_6000, // vpmwt -
+    0x3c20_3184_bb81_5000, // tmuwt r4 ; nop ; thrsw
+    0x3c00_3186_bb80_0000, // nop
+    0x3c00_3186_bb80_0000, // nop
+];
+
+/// The probe uniform stream (FIFO order matches PROBE_WORDS' ldunif/ldunifrf pops), transcribed from the
+/// V3D-26 harness with the two driver-patched slots resolved. `scratch_v3d` is the identity-mapped V3D
+/// address the TMU store targets (QUNIFORM_UBO_ADDR).
+fn write_probe_uniforms(off: usize, scratch_v3d: u32) -> usize {
+    // Reference stream (harness): u0..u3 = component indices 0,1,2,3; u4 = UBO_ADDR (0 placeholder →
+    // scratch); u5 = CONSTANT 0xfffffffc; u6/u7 = VIEWPORT_X/Y_SCALE (0 placeholder → 8192.0f32);
+    // u8..u11 = CONSTANT 2,3,4,5. Only the four store slots (u0..u4) govern the witness; the scales and
+    // trailing constants keep the coord math well-defined so the bin stays legal.
+    let unif: [u32; 12] = [
+        0, 1, 2, 3,             // ldvpmv_in component indices (verbatim)
+        scratch_v3d,            // u4: QUNIFORM_UBO_ADDR → CPU-visible scratch (driver-supplied)
+        0xFFFF_FFFC,            // u5: CONSTANT (verbatim)
+        0x4600_0000,            // u6: QUNIFORM_VIEWPORT_X_SCALE → 8192.0f32 (driver-supplied)
+        0x4600_0000,            // u7: QUNIFORM_VIEWPORT_Y_SCALE → 8192.0f32 (driver-supplied)
+        2, 3, 4, 5,             // u8..u11: CONSTANT (verbatim)
+    ];
+    for (i, wv) in unif.iter().enumerate() {
+        arena_write_u32(off + i * 4, *wv);
+    }
+    unif.len() * 4
+}
+
+/// Build the probe's GL Shader State Record + attribute record at OFF_PROBE_SHADREC. The COORD slot
+/// points at PROBE_WORDS + the probe uniform stream; the attribute record is byte-identical to the real
+/// draw's (same OFF_VTXDATA base, vec4 f32, stride 16, in=0/out=1 segment sizes) so the probe witnesses
+/// THIS draw's attribute fetch. The VS/FS slots point at the probe code too — a bin-only job never
+/// executes them, so their contents are irrelevant; the addresses only need to be valid arena pointers.
+/// Coord 4-way-threadable = 0 (the compiled probe reports threads = 2). Returns the attribute count.
+fn build_probe_shader_record() -> u32 {
+    let code = (arena_phys() + OFF_PROBE_CODE) as u64;
+    let unif = (arena_phys() + OFF_PROBE_UNIF) as u64;
+    let defaults = (arena_phys() + OFF_DEFAULT_ATTRS) as u64;
+    let vtx = (arena_phys() + OFF_VTXDATA) as u64;
+
+    let mut rec = [0u8; 36];
+    sf(&mut rec, 1, 1, 1); // Enable clipping
+    sf(&mut rec, 24, 8, 0); // Number of varyings in Fragment Shader
+    // VPM segment sizes — same Mesa contract as the real record (§10): out = 1 sector, in = 0.
+    sf(&mut rec, 32, 4, 1); // Coord Shader output VPM segment size
+    sf(&mut rec, 40, 4, 0); // Coord Shader input VPM segment size
+    sf(&mut rec, 48, 4, 1); // Vertex Shader output VPM segment size
+    sf(&mut rec, 56, 4, 0); // Vertex Shader input VPM segment size
+    sf(&mut rec, 64, 32, defaults); // Address of default attribute values
+    // FS / VS slots (never executed in a bin-only job) — point at the probe code + uniforms so every
+    // address field is a valid arena pointer.
+    sf(&mut rec, 96, 1, 1); // FS 4-way threadable
+    sf(&mut rec, 98, 1, 1); // FS propagate NaNs (v42)
+    sf(&mut rec, 99, 29, code >> 3); // FS code address
+    sf(&mut rec, 128, 32, unif); // FS uniforms address
+    sf(&mut rec, 160, 1, 1); // VS 4-way threadable
+    sf(&mut rec, 162, 1, 1); // VS propagate NaNs (v42)
+    sf(&mut rec, 163, 29, code >> 3); // VS code address
+    sf(&mut rec, 192, 32, unif); // VS uniforms address
+    // Coord shader — the one the bin runs. threads = 2 ⇒ NOT 4-way threadable.
+    sf(&mut rec, 226, 1, 1); // CS propagate NaNs (v42)
+    sf(&mut rec, 227, 29, code >> 3); // CS code address
+    sf(&mut rec, 256, 32, unif); // CS uniforms address (probe stream: indices + UBO_ADDR + scales)
+    arena_write_bytes(OFF_PROBE_SHADREC, &rec);
+
+    // Attribute record — byte-identical to the real draw's (build_shader_record): vec4 f32, stride 16.
+    let mut attr = [0u8; 16];
+    sf(&mut attr, 0, 32, vtx); // Address
+    sf(&mut attr, 32, 2, 3); // Vec size (4 components)
+    sf(&mut attr, 34, 3, 2); // Type = Attribute float
+    sf(&mut attr, 40, 4, 4); // Number of values read by Coordinate shader
+    sf(&mut attr, 44, 4, 4); // Number of values read by Vertex shader
+    sf(&mut attr, 64, 32, 16); // Stride
+    sf(&mut attr, 96, 32, 0xFFFF); // Maximum Index
+    arena_write_bytes(OFF_PROBE_SHADREC + 36, &attr);
+    1
+}
+
+/// PI-V3D-27: run the Mesa-compiled attribute-DMA probe as a one-off bin job over the real draw's vertex
+/// buffer, then read back the four attribute words the QPU stored via TMU. Runs BEFORE the real M4 bin;
+/// reuses the M4 bin-scratch regions (re-zeroed by triangle_job before the real kick). Assumes
+/// OFF_VTXDATA + OFF_DEFAULT_ATTRS already hold this draw's data (triangle_job step 0). Prints the
+/// three-way discrimination witness; returns nothing (diagnostic-only, never gates M4).
+fn probe_job() {
+    serial_println!(
+        ":: V3D: [v3d27] attribute-DMA probe — Mesa-compiled TMU-store coord shader over the real vertex buffer; reading what the VCD delivered ::"
+    );
+    let scratch_v3d = (arena_phys() + OFF_PROBE_SCRATCH) as u32;
+
+    // Publish probe code + uniforms + record; pre-seed scratch with the 0x55 "store never landed"
+    // sentinel (distinct from loaded-zeros 0x00000000 and from real coords).
+    let code_len = write_shader_words(OFF_PROBE_CODE, &PROBE_WORDS);
+    let unif_len = write_probe_uniforms(OFF_PROBE_UNIF, scratch_v3d);
+    let num_attrs = build_probe_shader_record();
+    let bin_len = build_bin_cl_generic(OFF_PROBE_BIN_CL, OFF_PROBE_SHADREC, num_attrs);
+    fill_region(OFF_PROBE_SCRATCH, 16, 0x5555_5555);
+
+    // Publish everything to RAM for the non-coherent GPU (vertex data + defaults were written by the
+    // caller; clean them here so the probe sees them).
+    cache::clean_range(arena_phys() + OFF_PROBE_CODE, code_len);
+    cache::clean_range(arena_phys() + OFF_PROBE_UNIF, unif_len);
+    cache::clean_range(arena_phys() + OFF_PROBE_SHADREC, 36 + 16);
+    cache::clean_range(arena_phys() + OFF_PROBE_BIN_CL, bin_len);
+    cache::clean_range(arena_phys() + OFF_PROBE_SCRATCH, 16);
+    cache::clean_range(arena_phys() + OFF_VTXDATA, TRI_VERTS.len() * 16);
+    cache::clean_range(arena_phys() + OFF_DEFAULT_ATTRS, 16);
+    // Bin scratch (reused from M4): zero + clean.
+    fill_region(OFF_TILESTATE, TILE_STATE_BYTES, 0);
+    fill_region(OFF_BIN_TILEALLOC, BIN_TILEALLOC_BYTES, 0);
+    cache::clean_range(arena_phys() + OFF_TILESTATE, TILE_STATE_BYTES);
+    cache::clean_range(arena_phys() + OFF_BIN_TILEALLOC, BIN_TILEALLOC_BYTES);
+
+    let bin_ba = (arena_phys() + OFF_PROBE_BIN_CL) as u32;
+    let bin_ea = bin_ba + bin_len as u32;
+    let tile_alloc = (arena_phys() + OFF_BIN_TILEALLOC) as u32;
+    let ts = (arena_phys() + OFF_TILESTATE) as u32;
+    if !arena_contains(bin_ba as usize, bin_len)
+        || !arena_contains(OFF_PROBE_SCRATCH + arena_phys(), 16)
+        || !arena_contains(tile_alloc as usize, BIN_TILEALLOC_BYTES)
+        || !arena_contains(ts as usize, TILE_STATE_BYTES)
+    {
+        serial_println!(":: V3D: [v3d27] probe range escapes the arena — skipping probe (fail-closed) ::");
+        return;
+    }
+
+    clear_mmu_fault_latch("v3d27 pre-probe");
+    invalidate_gpu_caches("L2T flush (probe bin pre-kick)");
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QMA, tile_alloc);
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QMS, BIN_TILEALLOC_BYTES as u32);
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QTS, ts | V3D_CLE_CT0QTS_ENABLE);
+    dsb();
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QBA, bin_ba);
+    dsb();
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QEA, bin_ea); // GO
+    dsb();
+    let idled = wait_bit_clear(V3D_CORE0_BASE, V3D_CLE_CT0CS, V3D_CLE_CT1CS_CTRUN, "CT0 probe bin");
+    let mmu_ctl = mmio_read(V3D_HUB_BASE, V3D_MMU_CTL);
+    let fault = mmu_ctl
+        & (V3D_MMU_CTL_PT_INVALID | V3D_MMU_CTL_WRITE_VIOLATION | V3D_MMU_CTL_CAP_EXCEEDED);
+
+    // Read back the four TMU-stored words. Invalidate the CPU's stale copy first (the GPU wrote DRAM).
+    cache::clean_invalidate_range(arena_phys() + OFF_PROBE_SCRATCH, 16);
+    let w0 = probe_word(OFF_PROBE_SCRATCH);
+    let w1 = probe_word(OFF_PROBE_SCRATCH + 4);
+    let w2 = probe_word(OFF_PROBE_SCRATCH + 8);
+    let w3 = probe_word(OFF_PROBE_SCRATCH + 12);
+
+    // Expected: whichever vertex won the (offset-0) store race. All three carry Zc=0.5 (0x3F000000) and
+    // Wc=1.0 (0x3F800000); Xc/Yc ∈ {±0.6 = 0x3F19999A / 0xBF19999A, 0.0}. Discriminate three ways.
+    const SENT: u32 = 0x5555_5555;
+    let untouched = w0 == SENT && w1 == SENT && w2 == SENT && w3 == SENT;
+    let all_zero = w0 == 0 && w1 == 0 && w2 == 0 && w3 == 0;
+    let is_coord = |v: u32| v == 0x3F19_999A || v == 0xBF19_999A || v == 0x0000_0000;
+    let real_coords = is_coord(w0) && is_coord(w1) && w2 == 0x3F00_0000 && w3 == 0x3F80_0000;
+
+    serial_println!(
+        ":: V3D: [v3d27] probe idled={} MMU_fault={:#x} — loaded attr v=({:#010x},{:#010x},{:#010x},{:#010x}) expect Zc=0x3f000000 Wc=0x3f800000 Xc/Yc∈{{0x3f19999a,0xbf19999a,0x00000000}} ::",
+        idled as u32, fault, w0, w1, w2, w3
+    );
+    if untouched {
+        serial_println!(
+            ":: V3D: [v3d27] VERDICT probe-inconclusive — scratch still 0x55555555: the TMU store never landed (probe plumbing: UBO_ADDR/tmuau path, MMU map of scratch, or the coord shader did not reach the store). NOT a VCD verdict. ::"
+        );
+    } else if all_zero {
+        serial_println!(
+            ":: V3D: [v3d27] VERDICT MISMATCH (loaded-zeros) — store landed but attributes are ZERO: the VCD did NOT DMA the vertex buffer into VPM. Attribute-fetch is the empty-bin wall — audit the attribute-record base/stride/enable + VCD setup against Mesa for THIS draw. ::"
+        );
+    } else if real_coords {
+        serial_println!(
+            ":: V3D: [v3d27] VERDICT MATCH (real coords) — the VCD delivered the attributes intact. Attribute fetch is EXONERATED; the wall moves downstream to primitive assembly / VCM → PTB handoff. ::"
+        );
+    } else {
+        serial_println!(
+            ":: V3D: [v3d27] VERDICT MISMATCH (unexpected pattern) — store landed with non-zero, non-vertex data: partial DMA, wrong stride/base, or a store race artifact. Compare the words above against OFF_VTXDATA byte-for-byte. ::"
+        );
+    }
+    // Leave the M4 bin registers untouched here — triangle_job reprograms QMA/QMS/QTS/QBA/QEA and
+    // re-arms the PCTR counters for the real bin below.
+    clear_mmu_fault_latch("v3d27 post-probe");
+}
+
+/// Read a little-endian u32 out of the arena at `off` (probe scratch readback).
+fn probe_word(off: usize) -> u32 {
+    let arena = &raw const V3D_ARENA;
+    unsafe {
+        let b = &(*arena).bytes;
+        u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
+    }
+}
+
 /// M4: bin one triangle on CT0, render it on CT1 (implicit tile list), CPU sample-verify.
 /// ATTENDED-METAL-UNVERIFIED — QEMU never reaches here. On success prints the M4 PASS witness + a
 /// sample table; the QPU shader body is the one metal-refinement seam (see the module banner).
@@ -1988,6 +2249,13 @@ fn triangle_job(fb: Option<FbTarget>) -> bool {
         }
     }
     fill_region(OFF_DEFAULT_ATTRS, 16, 0); // zeroed default attribute values
+
+    // (0.5) PI-V3D-27: run the Mesa-compiled attribute-DMA probe over THIS draw's vertex buffer before
+    // the real bin — a direct readout of what the VCD delivered to the QPU (does it DMA attributes into
+    // VPM, or does the coord shader read zeros?). Diagnostic-only: it reuses the M4 bin-scratch regions
+    // (re-zeroed below), touches no real-draw CL, and never gates M4. QEMU models no V3D so the verdict
+    // is metal; see v3d.md §12.
+    probe_job();
 
     // (1) Build the shader record + attribute record, the binning CL, and the render CL.
     let num_attrs = build_shader_record();

@@ -257,6 +257,11 @@ pub struct NetConfig {
     pub prefix_len: u8,
     /// The default gateway / router.
     pub gw: [u8; 4],
+    /// The first DHCP-provided DNS server, if the lease carried one. `None` on the static-fallback
+    /// path (no DHCP), or when a lease offered no DNS option. Callers that need a resolver use this
+    /// when present and fall back to querying the gateway (`gw`) when it is `None`. Populated from
+    /// smoltcp's `dhcpv4::Config::dns_servers` (first entry) where the lease is processed.
+    pub dns: Option<[u8; 4]>,
 }
 
 /// Apply an IPv4 address + default route to `iface` in place (replacing any prior config). Shared by
@@ -312,6 +317,9 @@ pub fn dhcp_or_static<D: Device>(
                 // the static gateway if the server offered none (rare, but keeps the route sane).
                 let gw = cfg.router.map(|r| r.octets()).unwrap_or(static_gw);
                 let srv = cfg.server.address.octets();
+                // Surface the first DHCP-provided DNS server (if any) so a resolver can use the real
+                // nameserver instead of falling back to the gateway (NET-14/NET-16 fold).
+                let dns = cfg.dns_servers.first().map(|a| a.octets());
                 apply_ipv4(iface, ip, prefix_len, gw);
                 serial_println!(
                     "{} NET: DHCP lease ip={}.{}.{}.{}/{} gw={}.{}.{}.{} (server {}.{}.{}.{}) => PASS ::",
@@ -320,7 +328,7 @@ pub fn dhcp_or_static<D: Device>(
                     gw[0], gw[1], gw[2], gw[3],
                     srv[0], srv[1], srv[2], srv[3],
                 );
-                return NetConfig { leased: true, ip, prefix_len, gw };
+                return NetConfig { leased: true, ip, prefix_len, gw, dns };
             }
             Some(dhcpv4::Event::Deconfigured) => {}
             None => {}
@@ -339,6 +347,7 @@ pub fn dhcp_or_static<D: Device>(
                 ip: static_ip,
                 prefix_len: static_prefix,
                 gw: static_gw,
+                dns: None,
             };
         }
     }

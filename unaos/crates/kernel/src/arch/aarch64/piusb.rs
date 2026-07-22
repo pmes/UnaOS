@@ -618,13 +618,20 @@ fn m1_rc_bringup() -> bool {
     }
     serial_println!("{} M1: RC alive (RGR1_SW_INIT_1 = {:#010x}) — bridge reset sequence ::", P, swinit);
 
-    // (a) Assert bridge core reset + PERST (put the bridge and the downstream link in reset).
-    let mut v = r(RC_BASE + PCIE_RGR1_SW_INIT_1);
-    v |= PCIE_RGR1_SW_INIT_1_INIT_GENERIC | PCIE_RGR1_SW_INIT_1_PERST;
-    serial_println!("{}   >>> WRITE: RGR1_SW_INIT_1 |= INIT_GENERIC|PERST ({:#010x}) — assert reset ::", P, v);
+    // (a) Assert bridge core reset FIRST, then PERST — the exact Linux `brcm_pcie_setup` order
+    //     (`brcm_pcie_bridge_sw_init_set(pcie, 1)` then `perst_set(pcie, 1)`), each a DISTINCT write, so
+    //     the bridge core is quiesced before the downstream link is forced into fundamental reset.
+    //     PIUSB-17: matched to the brcmstb reset structure exactly (was one combined write). PERST is
+    //     held asserted from here through step (g) while we configure the windows — Linux does the same.
+    let mut v = r(RC_BASE + PCIE_RGR1_SW_INIT_1) | PCIE_RGR1_SW_INIT_1_INIT_GENERIC;
+    serial_println!("{}   >>> WRITE: RGR1_SW_INIT_1 |= INIT_GENERIC ({:#010x}) — assert bridge core reset (Linux step 1) ::", P, v);
     w(RC_BASE + PCIE_RGR1_SW_INIT_1, v);
     dsb();
-    settle_us(200); // brcmstb: >= 100 us in reset
+    v = r(RC_BASE + PCIE_RGR1_SW_INIT_1) | PCIE_RGR1_SW_INIT_1_PERST;
+    serial_println!("{}   >>> WRITE: RGR1_SW_INIT_1 |= PERST ({:#010x}) — assert downstream fundamental reset (Linux step 2) ::", P, v);
+    w(RC_BASE + PCIE_RGR1_SW_INIT_1, v);
+    dsb();
+    settle_us(200); // Linux `usleep_range(100, 200)` while asserted; we hold a conservative 200 us
 
     // (b) Deassert the bridge core reset (INIT_GENERIC), KEEPING PERST asserted while we configure.
     v = r(RC_BASE + PCIE_RGR1_SW_INIT_1) & !PCIE_RGR1_SW_INIT_1_INIT_GENERIC;
@@ -773,17 +780,39 @@ fn m1_rc_bringup() -> bool {
     serial_println!("{}   >>> WRITE: RGR1_SW_INIT_1 &= ~PERST ({:#010x}) — release link, training ::", P, v);
     w(RC_BASE + PCIE_RGR1_SW_INIT_1, v);
     dsb();
+    let perst_deassert_at = super::timer::cntpct();
 
-    // (h) Poll link-up (PHYLINKUP + DL_ACTIVE) with a finite ~100 ms backstop (brcmstb allows up to
-    //     ~100 ms for link training). An honest DOWN after the budget is a real result, not a hang.
+    // (h) PIUSB-17 — THE DELTA. Mandatory fixed post-PERST-deassert settle BEFORE any link poll or
+    //     downstream access. Linux `brcm_pcie_start_link()` does `msleep(PCIE_RESET_CONFIG_WAIT_MS)`
+    //     (= 100 ms) UNCONDITIONALLY right after `perst_set(pcie, 0)`, and only THEN begins polling
+    //     PHYLINKUP/DL_ACTIVE. This is the PCIe CEM T_PVPERL / device-ready window: the VL805's PCIe
+    //     CORE trains the link within a few ms (so DL_ACTIVE flips early), but its internal 8051
+    //     firmware engine needs the FULL fundamental-reset recovery before it is ready to be reset/loaded
+    //     and to clear USBSTS.CNR. The prior M1 polled link-up the instant PERST deasserted and pressed
+    //     straight into M2 (config → NOTIFY) as soon as DL_ACTIVE flipped — i.e. it touched the
+    //     controller while the 8051 was still coming out of reset. That is the "MMIO live (PCIe core),
+    //     state machine dead (CNR wedged)" signature this arc chases: link-trained ≠ device-ready.
+    //     Wait the spec window first, exactly as Linux does. Bounded, finite (the anti-hang rule).
+    const PERST_DEASSERT_SETTLE_MS: u64 = 100; // Linux PCIE_RESET_CONFIG_WAIT_MS
+    settle_ms(PERST_DEASSERT_SETTLE_MS);
+    serial_println!(
+        "{}   PIUSB-17: waited {} ms post-PERST-deassert BEFORE link poll (Linux PCIE_RESET_CONFIG_WAIT_MS; device-ready/T_PVPERL window — the 8051 fw engine needs this even though the link trains sooner) ::",
+        P, PERST_DEASSERT_SETTLE_MS
+    );
+
+    // (i) Poll link-up (PHYLINKUP + DL_ACTIVE) with a finite ~100 ms backstop (brcmstb polls every 5 ms
+    //     for up to ~500 ms; we keep a bounded 100 ms budget ON TOP of the fixed settle above). An honest
+    //     DOWN after the budget is a real result, not a hang.
     let up_mask = PCIE_MISC_PCIE_STATUS_PHYLINKUP | PCIE_MISC_PCIE_STATUS_DL_ACTIVE;
     let deadline = super::timer::cntpct() + super::timer::cntfrq() / 10; // ~100 ms
     let mut status = 0u32;
     let mut up = false;
+    let mut link_up_at = 0u64;
     while super::timer::cntpct() < deadline {
         status = r(RC_BASE + PCIE_MISC_PCIE_STATUS);
         if !is_poison(status) && (status & up_mask) == up_mask {
             up = true;
+            link_up_at = super::timer::cntpct();
             break;
         }
         core::hint::spin_loop();
@@ -797,7 +826,18 @@ fn m1_rc_bringup() -> bool {
         );
         return false;
     }
-    serial_println!("{} M1: LINK UP (PCIE_STATUS = {:#010x}) ::", P, status);
+    // PIUSB-17 discriminator: how long AFTER PERST-deassert did the link actually report up? This tells
+    // one boot whether the link was already up when the fixed 100 ms settle expired (elapsed ~= settle,
+    // link trained during the wait — the expected, healthy case) or only came up well after (a slow
+    // train). `settle_ms` above already burned PERST_DEASSERT_SETTLE_MS, so `poll_elapsed` here is the
+    // EXTRA time the poll loop spent beyond the fixed settle.
+    let freq = super::timer::cntfrq().max(1);
+    let total_since_perst_ms = link_up_at.wrapping_sub(perst_deassert_at) * 1000 / freq;
+    let poll_elapsed_ms = link_up_at.wrapping_sub(perst_deassert_at + freq / 10).saturating_mul(1000) / freq;
+    serial_println!(
+        "{} M1: LINK UP (PCIE_STATUS = {:#010x}) — {} ms after PERST-deassert (fixed settle {} ms + {} ms of polling) ::",
+        P, status, total_since_perst_ms, 100u64, poll_elapsed_ms
+    );
 
     // (i) Read the root-port identity (bus 0, dev 0) directly from the RC config space — expect a
     //     Broadcom vendor id (0x14e4). Poison-rejecting.

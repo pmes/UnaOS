@@ -2556,7 +2556,12 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
     /// Hand the DHCP-configured `iface`/`dev` to the persistent [`NetService`] and register the poll task
     /// on a secondary core. Called at the tail of `bind_smoltcp` (a NIC is guaranteed present). The empty
     /// SocketSet uses leaked static storage (smoltcp's owned-Vec path is off in our no_std feature set).
-    fn arm_net_service(mut iface: Interface, mut dev: SmoltcpPhy<GenetNic>, dns_ip: [u8; 4]) {
+    fn arm_net_service(
+        mut iface: Interface,
+        mut dev: SmoltcpPhy<GenetNic>,
+        dns_ip: [u8; 4],
+        dns_from_dhcp: bool,
+    ) {
         // PI-NET-12/16: storage holds the HTTP listener POOL plus the mDNS and SNTP UDP sockets.
         let storage: &'static mut [SocketStorage; HTTP_POOL + 2] =
             alloc::boxed::Box::leak(alloc::boxed::Box::new(Default::default()));
@@ -2610,12 +2615,12 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
         // serving pool is never touched — the census that the net9 task first reports is a clean
         // listen=HTTP_POOL. On a bench segment without upstream reachability the honest witness is a
         // `dns timeout` / `connect timeout` line; the QEMU NET14-GATE is the correctness proof.
-        net14_ask(&mut iface, &mut dev, dns_ip);
+        net14_ask(&mut iface, &mut dev, dns_ip, dns_from_dhcp);
 
         // PI-NET-16: the initial (blocking, bounded) time sync — same discipline as net14_ask (BSP, before
-        // the poll task spawns, own temporary sockets). Resolves pool.ntp.org (DNS server = the gateway
-        // today, the same NetConfig cross-lane gap net14 notes; falls back to querying the gateway directly
-        // as the time source), sets the wall-clock, and prints the boot witness. The resolved/fallback
+        // the poll task spawns, own temporary sockets). Resolves pool.ntp.org via the same DNS server net14
+        // used (DHCP-provided when the lease carried one — the NET-PHY fold now surfaces it — else the
+        // gateway), sets the wall-clock, and prints the boot witness. The resolved/fallback
         // server is cached so the poll-loop re-sync can retry it. On a bench segment without upstream the
         // honest witness is a `sntp timeout` line; the QEMU NET16-GATE is the correctness proof.
         let sntp_server = net16_initial_sync(&mut iface, &mut dev, dns_ip, dns_ip);
@@ -2774,10 +2779,13 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
         // PI-NET-9: the verdict above is the regression gate and has now printed. Hand the same
         // DHCP-configured `iface` + `dev` to the persistent service so the interface keeps being polled
         // and the Pi ANSWERS the gateway's ARP who-has / ICMP echo requests that arrive seconds later.
-        // PI-NET-14: pass the DNS server for the outbound "UnaOS asks" client. The lease carries a DNS
-        // server, but `NetConfig` (shared `net_phy.rs`, outside this lane) does not surface it yet, so we
-        // use the gateway — the brief's stated fallback, and the resolver on a typical home router.
-        arm_net_service(iface, dev, gw);
+        // PI-NET-14/16: pass the DNS server for the outbound "UnaOS asks" client + SNTP. The NET-PHY fold
+        // now surfaces the DHCP-provided DNS server on `NetConfig` (shared `net_phy.rs`); use it when the
+        // lease carried one, and fall back to the gateway (the resolver on a typical home router) when it
+        // did not (static-fallback boot, or a lease with no DNS option).
+        let dns_ip = netcfg.dns.unwrap_or(gw);
+        let dns_from_dhcp = netcfg.dns.is_some();
+        arm_net_service(iface, dev, dns_ip, dns_from_dhcp);
     }
 
     // ══════════════════════════════════════════════════════════════════════════════════════════════════
@@ -2996,7 +3004,15 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
     /// status line + a body excerpt. Every failure mode gets a one-line witness so a metal boot localises
     /// the failing leg. Uses only temporary, stack-buffered sockets on `iface`/`dev` — the serving pool
     /// is never touched. Bounded by construction (real-time windows over the free-running counter).
-    fn net14_ask(iface: &mut Interface, dev: &mut SmoltcpPhy<GenetNic>, dns_ip: [u8; 4]) {
+    fn net14_ask(
+        iface: &mut Interface,
+        dev: &mut SmoltcpPhy<GenetNic>,
+        dns_ip: [u8; 4],
+        dns_from_dhcp: bool,
+    ) {
+        // Name which DNS server this resolve used: the DHCP-provided one (NET-PHY fold surfaces it on
+        // NetConfig) or the gateway fallback.
+        let dns_src = if dns_from_dhcp { "dhcp-dns" } else { "gw-fallback" };
         // ── DNS resolve ──────────────────────────────────────────────────────────────────────────────
         let ip = {
             let mut rx_meta = [udp::PacketMetadata::EMPTY; 4];
@@ -3050,8 +3066,9 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
             match outcome {
                 Some(Net14Dns::Resolved(ip)) => {
                     serial_println!(
-                        "{} [net14] dns {} -> {}.{}.{}.{} ::",
-                        PG, NET14_HOST, ip[0], ip[1], ip[2], ip[3]
+                        "{} [net14] dns {} -> {}.{}.{}.{} (via {}.{}.{}.{} {}) ::",
+                        PG, NET14_HOST, ip[0], ip[1], ip[2], ip[3],
+                        dns_ip[0], dns_ip[1], dns_ip[2], dns_ip[3], dns_src
                     );
                     ip
                 }
@@ -3069,8 +3086,8 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
                 }
                 None => {
                     serial_println!(
-                        "{} [net14] dns {} => timeout (no upstream? dns={}.{}.{}.{}) ::",
-                        PG, NET14_HOST, dns_ip[0], dns_ip[1], dns_ip[2], dns_ip[3]
+                        "{} [net14] dns {} => timeout (no upstream? dns={}.{}.{}.{} {}) ::",
+                        PG, NET14_HOST, dns_ip[0], dns_ip[1], dns_ip[2], dns_ip[3], dns_src
                     );
                     return;
                 }
@@ -4202,6 +4219,31 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
                 ":: NET14-GATE: dns/http client battery {} [w=0x{:x}] (parse-ok|parse-malformed|parse-loop|parse-rcode|dns-rt|http-200|refused|timeout) ::",
                 if pass { "PASS" } else { "FAIL" }, w
             );
+
+            // NET-PHY fold: assert the DHCP-provided DNS server surfaced on `NetConfig` threads to the
+            // resolver-server selection the metal `bind_smoltcp` runs. The loopback harness uses a static
+            // interface (no DHCP exchange to model), so we construct the two NetConfig shapes directly and
+            // check the EXACT `dns.unwrap_or(gw)` / `dns.is_some()` selection `arm_net_service` applies:
+            //   * a lease that carried a DNS server picks THAT server (source = dhcp-dns);
+            //   * absence (static fallback / lease with no DNS option) falls back to the gateway (gw-fallback).
+            {
+                let gw = [10, 0, 0, 1];
+                let leased = crate::net_phy::NetConfig {
+                    leased: true, ip: [10, 0, 0, 44], prefix_len: 24, gw, dns: Some([1, 1, 1, 1]),
+                };
+                let fallback = crate::net_phy::NetConfig {
+                    leased: false, ip: [10, 0, 0, 44], prefix_len: 24, gw, dns: None,
+                };
+                let l_ip = leased.dns.unwrap_or(gw);
+                let f_ip = fallback.dns.unwrap_or(gw);
+                let surfaced = l_ip == [1, 1, 1, 1] && leased.dns.is_some()
+                    && f_ip == gw && fallback.dns.is_none();
+                serial_println!(
+                    ":: PI-GENET: [netphy] dhcp dns surfaced -> {}.{}.{}.{} {} ::",
+                    l_ip[0], l_ip[1], l_ip[2], l_ip[3],
+                    if surfaced { "PASS" } else { "FAIL" }
+                );
+            }
         }
 
         // ── PI-NET-15 gate helpers ────────────────────────────────────────────────────────────────────

@@ -458,3 +458,51 @@ the VCD actually DMAs attributes into VPM (the surviving candidate after §8/§1
 Wiring it (an SSBO binding + `UBO_ADDR` uniform + a CPU-readable buffer in the bin CL)
 is a metal-sitting deliverable — it cannot be validated in QEMU — and is left for that
 arc rather than folded blind here.
+
+---
+
+## 12. The Mesa-compiled attribute-DMA probe, wired as a boot witness (V3D-27)
+
+V3D-27 wires the V3D-26 probe (§11) into the kernel as a discriminating boot witness for the
+**one surviving empty-bin candidate**: that the VCD never DMAs the vertex attributes into the VPM, so
+the coord shader's `ldvpmv_in` reads collapse every vertex to `Xc=Yc=0` → a degenerate zero-area
+primitive the PTB legitimately bins to nothing (fitting every prior witness: shader runs (§4), no
+fault, CL clean, empty pool). Because the VPM output is on-chip / CPU-unreadable (§3), the only way to
+settle it is to make the QPU **store what it loaded** to DRAM and read it back.
+
+**What is wired.** A one-off **probe bin job** runs on CT0 immediately before the real M4 bin, over the
+**same vertex buffer and a byte-identical attribute record**, so it witnesses *this* draw's attribute
+fetch:
+
+- **`PROBE_WORDS` (25 words)** — transcribed byte-for-byte from the V3D-26 harness reference output
+  (`scripts/pi-v3d26-mesa-compile.out.txt`, the PROBE VS section), i.e. real `v3d_compile()` (ver 4.2)
+  bytes. It is a full coord shader: it loads the four attribute components (`ldvpmv_in` → rf3..rf6),
+  **stores them to SSBO 0 via TMU** (`mov tmud ×4 → mov tmuau → tmuwt` — the TMUAU-config-coupled words
+  §10 said could not be hand-authored to §5 confidence), and still emits the six-word STVPMV VPM output
+  so the bin stays legal. `threads = 2`, `tmu_count = 1`. **No word is hand-authored** — §5 untouched.
+- **The uniform stream** is the harness stream with the two driver-patched slots resolved exactly as the
+  real draw resolves them: `QUNIFORM_VIEWPORT_{X,Y}_SCALE → 8192.0f32` (0x46000000, the §8 contract
+  constant `write_geo_uniforms` already bakes) and `QUNIFORM_UBO_ADDR → OFF_PROBE_SCRATCH`'s
+  identity-mapped V3D address. Those are driver uniform *values*, not shader words.
+- Its own shader record (`OFF_PROBE_SHADREC`, coord slot → the probe words; in=0/out=1 segment sizes per
+  §10) and its own bin CL (`build_bin_cl_generic`, the same prologue/state/draw emit as the real bin).
+  The bin-scratch regions (`OFF_BIN_TILEALLOC` / `OFF_TILESTATE`) are **reused** from M4 — the probe
+  bins first, then `triangle_job` re-zeros + re-cleans them before the real bin, so the reuse is
+  invisible to the real draw, whose CL is left entirely intact.
+
+**Three-way discrimination (the scratch is pre-filled with `0x55555555`).** After the probe bin idles
+the four stored words are invalidated + read back; all three test vertices carry `Zc = 0.5`
+(`0x3F000000`), `Wc = 1.0` (`0x3F800000`), and `Xc/Yc ∈ {±0.6 = 0x3F19999A / 0xBF19999A, 0.0}` (all
+three coord shaders store to offset 0, so the readback is whichever vertex won the race — a single-vertex
+capture, which is what the compiled probe does):
+
+| Readback | Verdict line | Meaning | Next step |
+| --- | --- | --- | --- |
+| `0x55555555` ×4 (untouched) | `probe-inconclusive` | TMU store never landed | probe plumbing — `UBO_ADDR`/`tmuau` path, scratch MMU map, or shader never reached the store; **not** a VCD verdict |
+| `0x00000000` ×4 | `MISMATCH (loaded-zeros)` | store landed, attributes are **zero** | **VCD attribute fetch confirmed broken** — audit attribute-record base/stride/enable + VCD setup vs Mesa for this draw |
+| `Zc=0x3f000000`, `Wc=0x3f800000`, `Xc/Yc` a vertex value | `MATCH (real coords)` | VCD delivered attributes intact | attribute fetch **exonerated**; wall moves downstream to primitive assembly / VCM → PTB handoff |
+| non-zero, non-vertex | `MISMATCH (unexpected)` | partial DMA / wrong stride/base / store-race artifact | diff the words vs `OFF_VTXDATA` byte-for-byte |
+
+QEMU `raspi4b` models no V3D (`BLOCK-DOWN`), so the verdict is **metal**; the probe is diagnostic-only and
+never gates M4. Arena regions `OFF_PROBE_{CODE,UNIF,SHADREC,SCRATCH,BIN_CL}` sit in the free tail above
+the M5–M8 battery (0x34000+, top used byte was 0x33100 < 0x40000).
