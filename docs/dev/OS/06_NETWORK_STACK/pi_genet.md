@@ -236,6 +236,48 @@ leased on the Orin, where bootpd answered the *second* DISCOVER. On no lease the
 driver falls back to a static address and reports it honestly. The station MAC comes
 from the DTB `local-mac-address` property of the GENET node.
 
+### PI-NET-15 — serving the filesystem (`GET /fs/`)
+
+The serving pool gains filesystem routes on the same `:80` listener:
+
+* `GET /` — the status page (now carrying a link to `/fs/`).
+* `GET /fs/` — an HTML listing of the native unafs root (name + size; files linked).
+* `GET /fs/<NAME>` — the file's bytes with a `Content-Type` from the 8.3 extension
+  (`.htm`/`.html` → `text/html`, `.txt` or no-extension → `text/plain`, else
+  `application/octet-stream`). A missing file / rejected name → `404`; a file beyond the
+  RAM cap → `413`.
+
+**Lock-vs-serve design.** The unafs mount lock (`with_unafs`) masks IRQs around the
+polled SD read (~0.7 s worst case on a real card). The serve path therefore reads the
+**whole file into a bounded RAM buffer under ONE short hold** (cap `FS_CAP` = **64 KiB**),
+then streams that buffer out through the normal TX path — the lock is **never** held
+across `send_slice`, and a file larger than one TX ring drains across several poll steps
+(the listener stays *active*, never parked; the idle-reaper still covers a stall). A file
+whose inode size exceeds the cap is refused `413` *without* being read. Every fs request
+emits a `[net15]` witness carrying the hold duration in **ticks and ms**; a hold past
+`FS_HOLD_WARN_MS` (50 ms) appends a `WARN: with_unafs IRQ-mask > 50ms` suffix so the bench
+can watch the mask cost (QEMU's emulated SD routinely trips this on the first read).
+
+**Hostile-input path handling.** The `<NAME>` after `/fs/` is validated as a single 8.3
+component: 1..=12 bytes from `[A-Za-z0-9._-]`, with `.`/`..` rejected explicitly. That one
+charset check rejects directory traversal (`..`, a nested `/`), `%`-escapes (nothing is
+decoded — `%` is simply not in the set), zero-length, and oversize names. Bounds-checked
+throughout; the request line is captured into a fixed `REQ_CAP` (256 B) buffer.
+
+* **FS route gate** (`nettest::run15`, same loopback seam + scripted peer, reading the K3
+  fixture volume the `kernel8-test` image carries):
+  `:: NET15-GATE: fs route battery PASS [w=0x1f] (fs-list|exact-bytes|traversal-reject|404|oversize-413) ::`
+  * `0x01` `GET /fs/` lists `K3HELLO.TXT`; `0x02` `GET /fs/K3HELLO.TXT` returns the exact
+    fixture bytes; `0x04` `GET /fs/../evil` is rejected (`404`); `0x08` a missing file
+    `404`s; `0x10` an oversize file is refused `413` (driven against `K3PAT.BIN` via a
+    gate-scoped cap override — no card state added). A multi-block full serve of
+    `K3PAT.BIN` at the real cap (12288 bytes, pattern-faithful) is a diagnostic line.
+
+Expected metal witnesses:
+`:: PI-GENET: [net15] fs route armed (root listing + /fs/<name>, cap 64 KiB) ::`,
+then per request e.g.
+`:: PI-GENET: [net15] GET /fs/K3HELLO.TXT => 200 37 bytes (with_unafs hold <t> ticks / <n> ms) ::`.
+
 ---
 
 ## 5. Bench verification
@@ -252,6 +294,8 @@ from the DTB `local-mac-address` property of the GENET node.
 | TCP/HTTP/mDNS regression gate runs off-metal | NET-13 `nettest` | QEMU raspi4b + test-arm | `:: NET-GATE: ... PASS [w=0xf] ::` — basic 200, flood→SATURATED→reaped +4→recovery 200, FIN recycle, table-full RST, mDNS answered |
 | Outbound DNS + HTTP client gate runs off-metal | NET-14 `nettest` | QEMU raspi4b + test-arm | `:: NET14-GATE: ... PASS [w=0xff] ::` — parser accepts well-formed / rejects truncated + non-terminating name + surfaces RCODE, live loopback DNS resolve, HTTP 200, connect refused (RST), connect timeout |
 | "UnaOS asks" — outbound resolve + fetch | NET-14 | *(pending metal)* | `[net14] dns example.com -> <ip>` + `GET http://example.com/ -> HTTP/1.1 200 (<n> bytes)` + body excerpt; or an honest per-leg failure witness |
+| FS route gate (`GET /fs/` + `/fs/<name>`) runs off-metal | NET-15 `nettest` | QEMU raspi4b | `:: NET15-GATE: ... PASS [w=0x1f] ::` — `/fs/` lists the fixture, exact bytes, traversal `/fs/../evil` → 404, missing → 404, oversize → 413; multi-block `K3PAT.BIN` (12288 B) pattern-faithful |
+| "UnaOS serves its filesystem" — browse `/fs/` | NET-15 | *(pending metal)* | `[net15] fs route armed (…, cap 64 KiB)` + per-request `GET /fs/<name> => 200 <n> bytes (with_unafs hold <t> ticks / <n> ms)` (WARN suffix if the hold > 50 ms) |
 
 QEMU `raspi4b` (bcm2838) does **not** model GENET; the DTB census makes bring-up a
 clean pre-MMIO skip (`kernel8-test` stays green). Every *metal* finding above is

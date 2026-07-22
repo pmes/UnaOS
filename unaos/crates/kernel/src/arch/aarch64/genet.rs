@@ -1238,6 +1238,12 @@ mod metal {
         #[cfg(feature = "nettest")]
         nettest::run14();
 
+        // PI-NET-15: the FILESYSTEM route gate — the scripted peer fetches `/fs/` + `/fs/<fixture>` off
+        // the SAME serving pool, over the same loopback seam, reading the unafs K3 fixture volume the
+        // kernel8-test image carries. Prints `:: NET15-GATE: ... PASS [w=0x..] ::` for the battery.
+        #[cfg(feature = "nettest")]
+        nettest::run15();
+
         // ── M1: resolve the register base from the DTB. NO DTB node => QEMU / DTB-less boot: this build
         //    does NOT model GENET, and touching the register window would FAULT (external abort), not
         //    return poison. Skip BEFORE any MMIO — the piusb `dtb_has_pcie` discipline. This is the
@@ -1495,6 +1501,15 @@ mod metal {
         mdns: SocketHandle,
         /// PI-NET-10: our configured IPv4 (leased or static-fallback), shown on the status page.
         ip: [u8; 4],
+        /// PI-NET-15: per-listener request-line capture (method + path + version). Bytes accumulate here
+        /// until the end of the request line (`\n`) is seen or the buffer fills, then the route is parsed.
+        req_buf: [[u8; REQ_CAP]; HTTP_POOL],
+        req_len: [usize; HTTP_POOL],
+        /// PI-NET-15: per-listener rendered response + send cursor. Built ONCE when the route resolves
+        /// (the file is read into RAM under a single with_unafs hold — the IRQ-mask cost is bounded to
+        /// that one read), then streamed out across poll steps through the normal TX path so a large
+        /// file never parks a listener under the mount lock. `None` while listening/idle.
+        resp: [Option<(alloc::vec::Vec<u8>, usize)>; HTTP_POOL],
     }
     // Single-core service, touched only behind this mutex on the BSP/AP that owns it — same discipline
     // (and the same raw-DMA reachability through GENET_DEVICE) as `Genet`.
@@ -1541,6 +1556,233 @@ mod metal {
     const HTTP_BODY_CAP: usize = 1024;
     /// aarch64 generic-timer tick rate (Hz) — used only to present uptime as scheduler ticks on the page.
     const TICK_HZ: i64 = 250;
+
+    // ── PI-NET-15: the filesystem route — serve the native unafs volume over HTTP ─────────────────────
+    //
+    // `GET /` keeps the status page (now with links); `GET /fs/` lists the unafs root; `GET /fs/<NAME>`
+    // serves one file's bytes. The mount lock (`with_unafs`) masks IRQs around the polled SD read, so the
+    // serve path reads the WHOLE file into a bounded RAM buffer under ONE short hold, then streams that
+    // buffer out through the normal TX path — the lock is never held across `send_slice`, and the reaper
+    // still covers a stalled peer. A file beyond the cap is refused (413) rather than read.
+    /// Largest file the fs route reads into RAM under one hold (bounded kernel RAM; a Pi 4 has GiB, so
+    /// 64 KiB × the pool is trivially affordable). Beyond this the request is refused 413.
+    const FS_CAP: usize = 64 * 1024;
+    /// Request-line capture cap (method + path + HTTP-version; a real request line fits well under this).
+    const REQ_CAP: usize = 256;
+    /// Longest accepted 8.3 name (`NNNNNNNN.EEE` = 12). Anything longer is rejected as a bad name.
+    const FS_NAME_MAX: usize = 12;
+    /// with_unafs hold-duration WARN threshold (ms): a hold longer than this masked IRQs long enough that
+    /// the bench should see it flagged (the mount-lock IRQ-mask cost the brief calls out).
+    const FS_HOLD_WARN_MS: i64 = 50;
+
+    /// PI-NET-15 (gate seam only): when non-zero, overrides [`FS_CAP`] for the file-serve path so the
+    /// loopback gate can drive the oversize-refusal branch against an EXISTING fixture (K3PAT.BIN, 12 KiB)
+    /// without adding card state. 0 in every production build — a single relaxed load in the serve path,
+    /// the same test-seam idiom as `unafs::TEST_FAIL_MIDSTAGE`. Only `nettest::run15` ever writes it.
+    static FS_CAP_OVERRIDE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    fn fs_cap() -> usize {
+        let o = FS_CAP_OVERRIDE.load(core::sync::atomic::Ordering::Relaxed);
+        if o == 0 { FS_CAP } else { o }
+    }
+
+    /// Raw free-running counter read (for measuring the with_unafs hold in ticks).
+    #[inline]
+    fn cntpct() -> u64 {
+        let c: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, cntpct_el0", out(reg) c, options(nomem, nostack, preserves_flags));
+        }
+        c
+    }
+    /// Convert a `(t0, t1)` counter span into `(ticks, milliseconds)` using CNTFRQ.
+    fn hold_span(t0: u64, t1: u64) -> (u64, i64) {
+        let ticks = t1.wrapping_sub(t0);
+        let frq: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, cntfrq_el0", out(reg) frq, options(nomem, nostack, preserves_flags));
+        }
+        let ms = if frq == 0 { 0 } else { (ticks.wrapping_mul(1_000) / frq) as i64 };
+        (ticks, ms)
+    }
+    /// Suffix appended to a per-request witness when the hold exceeded the WARN threshold.
+    fn hold_warn(ms: i64) -> &'static str {
+        if ms > FS_HOLD_WARN_MS { " WARN: with_unafs IRQ-mask > 50ms" } else { "" }
+    }
+
+    /// PI-NET-15: the resolved route for one request line.
+    enum Route<'a> {
+        /// `GET /` — the status page.
+        Status,
+        /// `GET /fs/` (or `/fs`) — the unafs root directory listing.
+        FsList,
+        /// `GET /fs/<NAME>` with a name that passed hostile-input validation.
+        FsFile(&'a str),
+        /// Anything else (bad method, unknown path, or a rejected name) — answered 404.
+        NotFound,
+    }
+
+    /// PI-NET-15: hostile-input path validation for the `<NAME>` after `/fs/`. 8.3 names ONLY: a single
+    /// path component of 1..=12 bytes drawn from `[A-Za-z0-9._-]`. This one charset check rejects `..`
+    /// and `.` (guarded explicitly), a nested `/` (directory traversal), `%`-escapes (decode NOTHING —
+    /// a `%` is simply not in the set), a zero-length name, and an oversize name.
+    fn valid_fs_name(name: &[u8]) -> bool {
+        if name.is_empty() || name.len() > FS_NAME_MAX {
+            return false;
+        }
+        if name == b"." || name == b".." {
+            return false;
+        }
+        name.iter()
+            .all(|&c| c.is_ascii_alphanumeric() || c == b'.' || c == b'_' || c == b'-')
+    }
+
+    /// PI-NET-15: parse the accumulated request bytes into a [`Route`]. Only `GET` is served; the path is
+    /// the token between the first and second space (or CR/LF). Bounds-checked throughout.
+    fn parse_route(req: &[u8]) -> Route<'_> {
+        let Some(rest) = req.strip_prefix(b"GET ") else {
+            return Route::NotFound;
+        };
+        let end = rest
+            .iter()
+            .position(|&c| c == b' ' || c == b'\r' || c == b'\n')
+            .unwrap_or(rest.len());
+        let path = &rest[..end];
+        if path == b"/" {
+            return Route::Status;
+        }
+        if path == b"/fs" || path == b"/fs/" {
+            return Route::FsList;
+        }
+        if let Some(name) = path.strip_prefix(b"/fs/") {
+            if valid_fs_name(name) {
+                // Valid names are a strict ASCII subset, so this never fails.
+                if let Ok(s) = core::str::from_utf8(name) {
+                    return Route::FsFile(s);
+                }
+            }
+            return Route::NotFound;
+        }
+        Route::NotFound
+    }
+
+    /// PI-NET-15: MIME type from the 8.3 extension. `.htm`/`.html` => text/html; `.txt` or a name with
+    /// no extension => text/plain (the default); anything else => application/octet-stream.
+    fn content_type_for(name: &str) -> &'static str {
+        fn ends_ci(name: &str, suf: &str) -> bool {
+            let (n, s) = (name.as_bytes(), suf.as_bytes());
+            n.len() >= s.len()
+                && n[n.len() - s.len()..]
+                    .iter()
+                    .zip(s)
+                    .all(|(a, b)| a.eq_ignore_ascii_case(b))
+        }
+        if ends_ci(name, ".html") || ends_ci(name, ".htm") {
+            "text/html; charset=utf-8"
+        } else if ends_ci(name, ".txt") || !name.contains('.') {
+            "text/plain; charset=utf-8"
+        } else {
+            "application/octet-stream"
+        }
+    }
+
+    /// PI-NET-15: assemble a full HTTP/1.0 response (status line + headers + body) into an owned buffer.
+    /// The body is already in RAM; the listener streams the returned bytes out through the normal TX path.
+    fn http_response(status: &str, ctype: &str, body: &[u8]) -> alloc::vec::Vec<u8> {
+        let hdr = alloc::format!(
+            "HTTP/1.0 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\
+Connection: close\r\nServer: UnaOS/genet\r\n\r\n",
+            body.len()
+        );
+        let mut v = alloc::vec::Vec::with_capacity(hdr.len() + body.len());
+        v.extend_from_slice(hdr.as_bytes());
+        v.extend_from_slice(body);
+        v
+    }
+
+    /// PI-NET-15: the outcome of reading one file off the unafs volume under a single with_unafs hold.
+    enum FsFileResult {
+        Ok(alloc::vec::Vec<u8>),
+        TooBig(u64),
+        IsDir,
+        NotFound,
+        MountErr,
+    }
+
+    /// PI-NET-15: read one file's bytes into RAM under ONE IRQ-masked with_unafs hold, returning the
+    /// result plus the hold duration `(ticks, ms)` so the caller can witness the IRQ-mask cost. Resolve →
+    /// stat → (size ≤ cap ?) → read_data(0, size). The lock is dropped before any TX work.
+    fn fs_read_file(name: &str) -> (FsFileResult, u64, i64) {
+        let cap = fs_cap() as u64;
+        let path = alloc::format!("/{}", name);
+        let t0 = cntpct();
+        let r = crate::fs::unafs::with_unafs(|fs| {
+            let id = match fs.resolve_path(&path) {
+                Ok(id) => id,
+                Err(_) => return FsFileResult::NotFound,
+            };
+            let inode = match fs.read_inode(id) {
+                Ok(i) => i,
+                Err(_) => return FsFileResult::NotFound,
+            };
+            if inode.kind == ::unafs::FileKind::Directory {
+                return FsFileResult::IsDir;
+            }
+            if inode.size > cap {
+                return FsFileResult::TooBig(inode.size);
+            }
+            match fs.read_data(id, 0, inode.size) {
+                Ok(d) => FsFileResult::Ok(d),
+                Err(_) => FsFileResult::NotFound,
+            }
+        });
+        let (ticks, ms) = hold_span(t0, cntpct());
+        (r.unwrap_or(FsFileResult::MountErr), ticks, ms)
+    }
+
+    /// PI-NET-15: read the unafs root directory under ONE with_unafs hold — `(name, size, is_dir)` per
+    /// entry — plus the hold duration. `Err(())` means the volume could not be mounted/listed.
+    #[allow(clippy::type_complexity)]
+    fn fs_read_dir() -> (Result<alloc::vec::Vec<(alloc::string::String, u64, bool)>, ()>, u64, i64) {
+        let t0 = cntpct();
+        let r = crate::fs::unafs::with_unafs(|fs| {
+            let root = fs.resolve_path("/").map_err(|_| ())?;
+            let entries = fs.ls(root).map_err(|_| ())?;
+            let mut out = alloc::vec::Vec::with_capacity(entries.len());
+            for de in &entries {
+                let size = fs.read_inode(de.inode_id).map(|i| i.size).unwrap_or(0);
+                let is_dir = de.kind == ::unafs::FileKind::Directory;
+                out.push((de.name.clone(), size, is_dir));
+            }
+            Ok::<_, ()>(out)
+        });
+        let (ticks, ms) = hold_span(t0, cntpct());
+        (r.unwrap_or(Err(())), ticks, ms)
+    }
+
+    /// PI-NET-15: render the `/fs/` directory-listing HTML (name + size, files linked to `/fs/<name>`).
+    /// Entry names come from the trusted local volume (8.3), so they are emitted verbatim.
+    fn build_fs_list(entries: &[(alloc::string::String, u64, bool)]) -> alloc::vec::Vec<u8> {
+        use core::fmt::Write as _;
+        let mut body = alloc::string::String::new();
+        let _ = write!(
+            body,
+            "<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\">\
+<title>UnaOS \u{2014} /fs/</title></head><body>\
+<h1>unafs volume \u{2014} root</h1><ul>"
+        );
+        for (name, size, is_dir) in entries {
+            if *is_dir {
+                let _ = write!(body, "<li>&lt;DIR&gt; {name}/</li>");
+            } else {
+                let _ = write!(body, "<li><a href=\"/fs/{name}\">{name}</a> \u{2014} {size} bytes</li>");
+            }
+        }
+        let _ = write!(
+            body,
+            "</ul><p><a href=\"/\">back to status</a></p></body></html>\n"
+        );
+        http_response("200 OK", "text/html; charset=utf-8", body.as_bytes())
+    }
 
     /// PI-NET-10: cumulative count of status pages served since boot (the `[net10] served N` witness).
     static NET10_SERVED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -1754,7 +1996,8 @@ the kernel's own TCP stack (smoltcp bound over the GENET rings, served by the ne
 <li>pages served: {served}</li>\
 <li>lease ip: {}.{}.{}.{}</li>\
 </ul>\
-<p>PI-NET-10 \u{2014} the Pi's first TCP service.</p>\
+<p><a href=\"/fs/\">browse the unafs volume (/fs/)</a></p>\
+<p>PI-NET-10 \u{2014} the Pi's first TCP service; PI-NET-15 \u{2014} it serves its filesystem.</p>\
 </body></html>\n",
             ip[0], ip[1], ip[2], ip[3],
         );
@@ -1788,60 +2031,198 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
             let ip = self.ip;
             let mut reaped = 0u32;
             for i in 0..HTTP_POOL {
-                let sock = self.sockets.get_mut::<tcp::Socket>(self.http[i]);
+                {
+                    let sock = self.sockets.get_mut::<tcp::Socket>(self.http[i]);
 
-                // TIME-WAIT can't be re-listened directly (`listen` needs CLOSED), and it pins a TCB for
-                // 2*MSL. We've already delivered the response, so abort it straight to CLOSED and re-arm
-                // on the same pass — no MSL stall, the listener is back in the backlog immediately.
-                if sock.state() == tcp::State::TimeWait {
-                    sock.abort();
-                }
+                    // TIME-WAIT can't be re-listened directly (`listen` needs CLOSED), and it pins a TCB
+                    // for 2*MSL. We've already delivered the response, so abort it straight to CLOSED and
+                    // re-arm on the same pass — no MSL stall, the listener is back in the backlog at once.
+                    if sock.state() == tcp::State::TimeWait {
+                        sock.abort();
+                    }
 
-                // Re-arm the passive listener from any closed/idle state (post-close, post-RST, post-abort,
-                // or first arm). `listen` errors from a non-CLOSED state; the guard above guarantees CLOSED.
-                if !sock.is_open() {
-                    let _ = sock.listen(HTTP_PORT);
-                    self.req_seen[i] = false;
-                    self.active_since[i] = 0;
-                    continue;
-                }
-
-                // The socket is open. If it has left LISTEN (accepted a connection or a half-open SYN),
-                // clock its idle age and reap it once it overstays without completing service. This is the
-                // wedge fix: a peer that connects but never sends a request no longer holds the TCB forever.
-                if sock.is_active() {
-                    if self.active_since[i] == 0 {
-                        self.active_since[i] = now;
-                    } else if now.saturating_sub(self.active_since[i]) > HTTP_IDLE_MS {
-                        sock.abort(); // RST to the peer; re-listened on the next pass via the CLOSED path.
+                    // Re-arm the passive listener from any closed/idle state (post-close, post-RST,
+                    // post-abort, or first arm). `listen` errors from a non-CLOSED state; the guard above
+                    // guarantees CLOSED. Reset the per-listener request + response state.
+                    if !sock.is_open() {
+                        let _ = sock.listen(HTTP_PORT);
                         self.req_seen[i] = false;
                         self.active_since[i] = 0;
-                        reaped += 1;
+                        self.req_len[i] = 0;
+                        self.resp[i] = None;
                         continue;
+                    }
+
+                    // The socket is open. If it has left LISTEN (accepted a connection or a half-open SYN),
+                    // clock its idle age and reap it once it overstays without completing service. This is
+                    // the wedge fix: a peer that connects but never sends a request no longer holds the TCB.
+                    if sock.is_active() {
+                        if self.active_since[i] == 0 {
+                            self.active_since[i] = now;
+                        } else if now.saturating_sub(self.active_since[i]) > HTTP_IDLE_MS {
+                            sock.abort(); // RST; re-listened on the next pass via the CLOSED path.
+                            self.req_seen[i] = false;
+                            self.active_since[i] = 0;
+                            self.req_len[i] = 0;
+                            self.resp[i] = None;
+                            reaped += 1;
+                            continue;
+                        }
+                    }
+
+                    // Phase 1 — accumulate the request line until we can parse a route. Copy new bytes
+                    // into the per-listener buffer (bounded to REQ_CAP), consuming the whole RX ring each
+                    // step so the window stays open. Once the end of the request line (`\n`) is in, or the
+                    // buffer fills, the request is ready to route.
+                    if self.resp[i].is_none() && sock.can_recv() {
+                        let rl = &mut self.req_len[i];
+                        let rb = &mut self.req_buf[i];
+                        let _ = sock.recv(|buf| {
+                            let take = buf.len().min(REQ_CAP - *rl);
+                            rb[*rl..*rl + take].copy_from_slice(&buf[..take]);
+                            *rl += take;
+                            (buf.len(), ())
+                        });
+                        if self.req_buf[i][..self.req_len[i]].contains(&b'\n')
+                            || self.req_len[i] == REQ_CAP
+                        {
+                            self.req_seen[i] = true;
+                        }
                     }
                 }
 
-                // Drain the request bytes (we serve the same page regardless of method/path). Consuming the
-                // whole RX ring each step keeps per-poll work bounded and the window open.
-                if sock.can_recv() {
-                    let _ = sock.recv(|buf| (buf.len(), ()));
-                    self.req_seen[i] = true;
+                // Phase 2 — route + render ONCE (this is where the single with_unafs hold happens, off the
+                // socket borrow). The whole file lands in the RAM buffer here; nothing below touches the
+                // mount lock, so a large file is streamed without holding IRQs masked.
+                if self.req_seen[i] && self.resp[i].is_none() {
+                    let vec = self.build_route_response(i, ip);
+                    self.resp[i] = Some((vec, 0));
                 }
-                // Serve once the request is in and the TX half is writable, then close (half-close via FIN).
-                if self.req_seen[i] && sock.can_send() {
-                    let mut resp = [0u8; HTTP_RESP_CAP];
-                    let n = render_http_response(&mut resp, ip);
-                    let _ = sock.send_slice(&resp[..n]);
-                    sock.close();
-                    self.req_seen[i] = false;
-                    // Re-clock: close() walks the FIN handshake (still is_active); let it progress on its
-                    // own deadline so a peer that never ACKs our FIN is reaped rather than pinning the TCB.
-                    self.active_since[i] = now;
-                    NET10_SERVED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+
+                // Phase 3 — stream the rendered response out through the normal TX path; close when the
+                // whole buffer has been enqueued. A file larger than one TX ring simply drains across
+                // several poll steps (the listener stays ACTIVE, never parked; the reaper covers a stall).
+                if self.resp[i].is_some() {
+                    let sock = self.sockets.get_mut::<tcp::Socket>(self.http[i]);
+                    if sock.can_send() {
+                        if let Some((buf, off)) = self.resp[i].as_mut() {
+                            if let Ok(sent) = sock.send_slice(&buf[*off..]) {
+                                *off += sent;
+                            }
+                        }
+                    }
+                    let done = self
+                        .resp[i]
+                        .as_ref()
+                        .map(|(buf, off)| *off >= buf.len())
+                        .unwrap_or(false);
+                    if done {
+                        let sock = self.sockets.get_mut::<tcp::Socket>(self.http[i]);
+                        sock.close();
+                        self.resp[i] = None;
+                        self.req_seen[i] = false;
+                        self.req_len[i] = 0;
+                        // Re-clock: close() walks the FIN handshake (still is_active); let it progress on
+                        // its own deadline so a peer that never ACKs our FIN is reaped, not pinned.
+                        self.active_since[i] = now;
+                        NET10_SERVED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    }
                 }
             }
             if reaped > 0 {
                 NET10_REAPED.fetch_add(reaped, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        /// PI-NET-15: resolve the captured request line to a [`Route`] and render its full HTTP response
+        /// into an owned buffer. `GET /` → the status page; `GET /fs/` → the unafs root listing; `GET
+        /// /fs/<NAME>` → the file bytes (404 on a missing file / rejected name, 413 beyond the cap). The
+        /// fs branches read under one with_unafs hold and emit a per-request `[net15]` witness carrying
+        /// the hold duration in ticks/ms (with a WARN suffix when the IRQ-mask exceeded the threshold).
+        fn build_route_response(&mut self, i: usize, ip: [u8; 4]) -> alloc::vec::Vec<u8> {
+            let route = parse_route(&self.req_buf[i][..self.req_len[i]]);
+            match route {
+                Route::Status => {
+                    let mut buf = [0u8; HTTP_RESP_CAP];
+                    let n = render_http_response(&mut buf, ip);
+                    buf[..n].to_vec()
+                }
+                Route::FsList => {
+                    let (res, ticks, ms) = fs_read_dir();
+                    match res {
+                        Ok(entries) => {
+                            serial_println!(
+                                "{} [net15] GET /fs/ => 200 ({} entries; with_unafs hold {} ticks / {} ms){} ::",
+                                PG, entries.len(), ticks, ms, hold_warn(ms)
+                            );
+                            build_fs_list(&entries)
+                        }
+                        Err(()) => {
+                            serial_println!(
+                                "{} [net15] GET /fs/ => 500 unafs mount unavailable (hold {} ticks / {} ms) ::",
+                                PG, ticks, ms
+                            );
+                            http_response(
+                                "500 Internal Server Error",
+                                "text/plain; charset=utf-8",
+                                b"unafs mount unavailable\n",
+                            )
+                        }
+                    }
+                }
+                Route::FsFile(name) => {
+                    let (res, ticks, ms) = fs_read_file(name);
+                    let warn = hold_warn(ms);
+                    match res {
+                        FsFileResult::Ok(data) => {
+                            serial_println!(
+                                "{} [net15] GET /fs/{} => 200 {} bytes (with_unafs hold {} ticks / {} ms){} ::",
+                                PG, name, data.len(), ticks, ms, warn
+                            );
+                            http_response("200 OK", content_type_for(name), &data)
+                        }
+                        FsFileResult::TooBig(sz) => {
+                            serial_println!(
+                                "{} [net15] GET /fs/{} => 413 REFUSED (size {} > cap {}; hold {} ticks / {} ms){} ::",
+                                PG, name, sz, fs_cap(), ticks, ms, warn
+                            );
+                            http_response(
+                                "413 Payload Too Large",
+                                "text/plain; charset=utf-8",
+                                b"file exceeds server buffer cap\n",
+                            )
+                        }
+                        FsFileResult::IsDir => {
+                            serial_println!("{} [net15] GET /fs/{} => 404 (is a directory) ::", PG, name);
+                            http_response(
+                                "404 Not Found",
+                                "text/plain; charset=utf-8",
+                                b"not a file\n",
+                            )
+                        }
+                        FsFileResult::NotFound => {
+                            serial_println!("{} [net15] GET /fs/{} => 404 (no such file) ::", PG, name);
+                            http_response(
+                                "404 Not Found",
+                                "text/plain; charset=utf-8",
+                                b"no such file\n",
+                            )
+                        }
+                        FsFileResult::MountErr => {
+                            serial_println!("{} [net15] GET /fs/{} => 500 (unafs mount unavailable) ::", PG, name);
+                            http_response(
+                                "500 Internal Server Error",
+                                "text/plain; charset=utf-8",
+                                b"unafs mount unavailable\n",
+                            )
+                        }
+                    }
+                }
+                Route::NotFound => http_response(
+                    "404 Not Found",
+                    "text/plain; charset=utf-8",
+                    b"not found\n",
+                ),
             }
         }
 
@@ -2085,6 +2466,12 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
         } else {
             serial_println!("{} [net10] http listen(:80) FAILED — status service will not accept ::", PG);
         }
+        // PI-NET-15: the filesystem route rides the same pool (GET / status, GET /fs/ listing, GET
+        // /fs/<name> file bytes; files read into a bounded RAM buffer under one with_unafs hold).
+        serial_println!(
+            "{} [net15] fs route armed (root listing + /fs/<name>, cap {} KiB) ::",
+            PG, FS_CAP / 1024
+        );
         if bound && joined {
             serial_println!(
                 "{} [net11] mdns responder up (unaos.local -> {}.{}.{}.{}) ::",
@@ -2115,6 +2502,9 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
             active_since: [0; HTTP_POOL],
             mdns,
             ip,
+            req_buf: [[0u8; REQ_CAP]; HTTP_POOL],
+            req_len: [0; HTTP_POOL],
+            resp: core::array::from_fn(|_| None),
         });
 
         // Host the task on a secondary core (never the BSP), like input/render/orphan-reaper. If no AP
@@ -2864,6 +3254,9 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
                 active_since: [0; HTTP_POOL],
                 mdns,
                 ip: KIP,
+                req_buf: [[0u8; REQ_CAP]; HTTP_POOL],
+                req_len: [0; HTTP_POOL],
+                resp: core::array::from_fn(|_| None),
             };
 
             // Peer stack: a plain smoltcp interface + its own socket set on the other end of the channel.
@@ -3303,6 +3696,181 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
             let pass = w == 0xff;
             serial_println!(
                 ":: NET14-GATE: dns/http client battery {} [w=0x{:x}] (parse-ok|parse-malformed|parse-loop|parse-rcode|dns-rt|http-200|refused|timeout) ::",
+                if pass { "PASS" } else { "FAIL" }, w
+            );
+        }
+
+        // ── PI-NET-15 gate helpers ────────────────────────────────────────────────────────────────────
+        /// The K3 fixture volume the kernel8-test image carries (staged by `arroyo`): a known text file
+        /// and a 12 KiB pattern file (byte i = (i*7+3)&0xFF) spanning several unafs blocks.
+        const FIX_HELLO: &[u8] = b"Hello from native UnaFS on the Pi 4!\n";
+
+        /// Does `hay` contain the contiguous subsequence `needle`?
+        fn contains_sub(hay: &[u8], needle: &[u8]) -> bool {
+            !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
+        }
+        /// Parse the numeric status code out of an `HTTP/1.0 NNN ...` response line.
+        fn status_code(resp: &[u8]) -> Option<u32> {
+            let rest = resp.strip_prefix(b"HTTP/1.0 ")?;
+            core::str::from_utf8(rest.get(..3)?).ok()?.parse().ok()
+        }
+        /// The response body (everything past the `\r\n\r\n` header terminator).
+        fn body_of(resp: &[u8]) -> &[u8] {
+            resp.windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .map(|p| &resp[p + 4..])
+                .unwrap_or(&[])
+        }
+        /// Drive one full peer request against the kernel serving pool and return the complete response
+        /// bytes. Sends `req` once the handshake completes, drains every reply (so the kernel can keep
+        /// streaming a multi-block file), and stops once the kernel has closed its half.
+        fn fetch_full(
+            ks: &mut NetService<SmoltcpPhy<KernelLoopNic>>,
+            pface: &mut Interface,
+            pdev: &mut SmoltcpPhy<PeerLoopNic>,
+            psock: &mut SocketSet<'static>,
+            clk: &mut i64,
+            h: SocketHandle,
+            req: &[u8],
+        ) -> Vec<u8> {
+            let mut sent = false;
+            let mut acc: Vec<u8> = Vec::new();
+            for _ in 0..300 {
+                pump(ks, pface, pdev, psock, clk, 1);
+                let s = psock.get_mut::<tcp::Socket>(h);
+                if !sent && s.may_send() {
+                    let _ = s.send_slice(req);
+                    sent = true;
+                }
+                if s.can_recv() {
+                    let _ = s.recv(|buf| {
+                        acc.extend_from_slice(buf);
+                        (buf.len(), ())
+                    });
+                }
+                if sent && !acc.is_empty() && !s.may_recv() {
+                    break;
+                }
+            }
+            psock.get_mut::<tcp::Socket>(h).close();
+            pump(ks, pface, pdev, psock, clk, 20);
+            acc
+        }
+
+        /// PI-NET-15: the FILESYSTEM route gate — the scripted peer fetches the unafs volume off the SAME
+        /// serving pool `run()` exercises, reading the K3 fixtures the kernel8-test image carries. Bitmask
+        /// `w`: 0x01 `/fs/` lists a fixture; 0x02 `/fs/K3HELLO.TXT` returns the exact bytes; 0x04 a
+        /// traversal `/fs/../evil` is rejected (404, not a 200); 0x08 a missing file 404s; 0x10 an oversize
+        /// file is refused 413 (driven against K3PAT.BIN via a gate-scoped cap override — no card state
+        /// added). PASS = 0x1f. A multi-block full-serve of K3PAT.BIN at the real cap is a diagnostic line.
+        pub fn run15() {
+            *K_RX.lock() = Some(VecDeque::new());
+            *P_RX.lock() = Some(VecDeque::new());
+
+            let mut kdev = SmoltcpPhy::<KernelLoopNic>::new();
+            let mut kiface = build_iface(&mut kdev, KMAC, KIP, 0x4b31_3500); // "K15"
+            let kstorage: &'static mut [SocketStorage; HTTP_POOL + 1] =
+                Box::leak(Box::new(Default::default()));
+            let mut ksockets = SocketSet::new(&mut kstorage[..]);
+            let (http, mdns, listening, _b, _j) = build_net_sockets(&mut kiface, &mut ksockets);
+            let mut ks = NetService {
+                iface: kiface,
+                dev: kdev,
+                sockets: ksockets,
+                http,
+                req_seen: [false; HTTP_POOL],
+                active_since: [0; HTTP_POOL],
+                mdns,
+                ip: KIP,
+                req_buf: [[0u8; REQ_CAP]; HTTP_POOL],
+                req_len: [0; HTTP_POOL],
+                resp: core::array::from_fn(|_| None),
+            };
+
+            let mut pdev = SmoltcpPhy::<PeerLoopNic>::new();
+            let mut pface = build_iface(&mut pdev, PMAC, PIP, 0x5031_3500); // "P15"
+            let pstorage: &'static mut [SocketStorage; 16] = Box::leak(Box::new(Default::default()));
+            let mut psock = SocketSet::new(&mut pstorage[..]);
+
+            let mut clk: i64 = 0;
+            let mut w: u32 = 0;
+            serial_println!(
+                "{} [net15] fs gate: pool armed listening={}/{} (cap {} KiB) ::",
+                PG, listening, HTTP_POOL, FS_CAP / 1024
+            );
+
+            // ── A (0x01): GET /fs/ lists the K3HELLO.TXT fixture. ──
+            {
+                let h = open_peer(&mut psock, pface.context(), 49401);
+                let resp = fetch_full(&mut ks, &mut pface, &mut pdev, &mut psock, &mut clk, h,
+                    b"GET /fs/ HTTP/1.0\r\n\r\n");
+                let ok = status_code(&resp) == Some(200) && contains_sub(&resp, b"K3HELLO.TXT");
+                if ok { w |= 0x01; }
+                serial_println!("{} [net15] A GET /fs/ lists fixture => {} ::", PG, if ok { "PASS" } else { "FAIL" });
+            }
+
+            // ── B (0x02): GET /fs/K3HELLO.TXT returns the exact fixture bytes. ──
+            {
+                let h = open_peer(&mut psock, pface.context(), 49402);
+                let resp = fetch_full(&mut ks, &mut pface, &mut pdev, &mut psock, &mut clk, h,
+                    b"GET /fs/K3HELLO.TXT HTTP/1.0\r\n\r\n");
+                let ok = status_code(&resp) == Some(200) && body_of(&resp) == FIX_HELLO;
+                if ok { w |= 0x02; }
+                serial_println!("{} [net15] B GET /fs/K3HELLO.TXT exact bytes => {} ::", PG, if ok { "PASS" } else { "FAIL" });
+            }
+
+            // ── C (0x04): GET /fs/../evil is rejected by name validation (404, never a 200/traversal). ──
+            {
+                let h = open_peer(&mut psock, pface.context(), 49403);
+                let resp = fetch_full(&mut ks, &mut pface, &mut pdev, &mut psock, &mut clk, h,
+                    b"GET /fs/../evil HTTP/1.0\r\n\r\n");
+                let ok = status_code(&resp) == Some(404);
+                if ok { w |= 0x04; }
+                serial_println!("{} [net15] C GET /fs/../evil rejected => {} ::", PG, if ok { "404 PASS" } else { "FAIL" });
+            }
+
+            // ── D (0x08): GET /fs/MISSING.TXT 404s. ──
+            {
+                let h = open_peer(&mut psock, pface.context(), 49404);
+                let resp = fetch_full(&mut ks, &mut pface, &mut pdev, &mut psock, &mut clk, h,
+                    b"GET /fs/MISSING.TXT HTTP/1.0\r\n\r\n");
+                let ok = status_code(&resp) == Some(404);
+                if ok { w |= 0x08; }
+                serial_println!("{} [net15] D GET /fs/MISSING.TXT => {} ::", PG, if ok { "404 PASS" } else { "FAIL" });
+            }
+
+            // ── E (0x10): oversize refusal. Lower the cap to 4 KiB (gate-only override), fetch K3PAT.BIN
+            //    (12 KiB > cap): the serve path must refuse 413 without reading it. Reset the override. ──
+            {
+                FS_CAP_OVERRIDE.store(4096, core::sync::atomic::Ordering::Relaxed);
+                let h = open_peer(&mut psock, pface.context(), 49405);
+                let resp = fetch_full(&mut ks, &mut pface, &mut pdev, &mut psock, &mut clk, h,
+                    b"GET /fs/K3PAT.BIN HTTP/1.0\r\n\r\n");
+                FS_CAP_OVERRIDE.store(0, core::sync::atomic::Ordering::Relaxed);
+                let ok = status_code(&resp) == Some(413);
+                if ok { w |= 0x10; }
+                serial_println!("{} [net15] E GET /fs/K3PAT.BIN (cap 4 KiB) => {} ::", PG, if ok { "413 PASS" } else { "FAIL" });
+            }
+
+            // ── Diagnostic (not gated): full multi-block serve of K3PAT.BIN at the real 64 KiB cap —
+            //    proves extent-walking a several-block file streams byte-faithful through the TX path. ──
+            {
+                let h = open_peer(&mut psock, pface.context(), 49406);
+                let resp = fetch_full(&mut ks, &mut pface, &mut pdev, &mut psock, &mut clk, h,
+                    b"GET /fs/K3PAT.BIN HTTP/1.0\r\n\r\n");
+                let body = body_of(&resp);
+                let pattern_ok = body.len() == 12288
+                    && body.iter().enumerate().all(|(i, &b)| b == ((i * 7 + 3) & 0xFF) as u8);
+                serial_println!(
+                    "{} [net15] F multi-block K3PAT.BIN => {} ({} bytes) ::",
+                    PG, if status_code(&resp) == Some(200) && pattern_ok { "200 pattern-faithful" } else { "MISMATCH" },
+                    body.len()
+                );
+            }
+
+            let pass = w == 0x1f;
+            serial_println!(
+                ":: NET15-GATE: fs route battery {} [w=0x{:x}] (fs-list|exact-bytes|traversal-reject|404|oversize-413) ::",
                 if pass { "PASS" } else { "FAIL" }, w
             );
         }
