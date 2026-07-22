@@ -57,12 +57,18 @@ const P: &str = ":: PIUSB:";
 static XHCI_CPU_BASE: AtomicU64 = AtomicU64::new(0);
 static XHCI_READY: AtomicBool = AtomicBool::new(false);
 
-// ─── PIUSB-6: the adopt-don't-reset path is RETIRED. boot-P4 proved on metal that the VideoCore tears
-// PCIe down before handoff (`PHYLINKUP=false DL_ACTIVE=false`, all windows zero, RC fully in reset), so
-// there is never a firmware-left working decode to adopt on this platform — the firmware's config exists
-// only during firmware runtime. The pre-reset dump is KEPT as a one-boot-proven read-only record (now
-// hard-gated on link-up: a link-down RC must never be MMIO'd past its own register block), but the adopt
-// branch, its `UNAOS_PIUSB_ADOPT` knob, and the WIN0 CPU-base decode are gone with it. ───
+// ─── PIUSB-6/16: the adopt-don't-reset path. boot-P4 proved that with the OLD boot firmware (pftf UEFI
+// v1.52) the VideoCore tore PCIe down before handoff (`PHYLINKUP=false DL_ACTIVE=false`, all windows
+// zero, RC fully in reset), so PIUSB-6 RETIRED adopt: there was never a firmware-left decode to adopt.
+// PIUSB-16 changes the lever UPSTREAM of this file — the image build now ships the CURRENT official
+// raspberrypi/firmware start4.elf/fixup4.dat/DTB (arroyo FW_TAG), which does the stock power-on
+// VL805/PCIe init + firmware push before handoff. So adopt is RE-ENABLED, but STRICTLY GATED on the
+// ENTRY link state read in `bringup`: only when the firmware handed us `PHYLINKUP && DL_ACTIVE` (RC live)
+// do we take the adopt branch — skip M1's RGR1/PERST reset (which would tear the VC's trained link +
+// loaded VL805 fw back down), keep the VC's outbound WIN0, and go straight through M2 (config/NOTIFY —
+// non-destructive to the link) into M3. A cold entry (RC still in reset) falls through to the unchanged
+// COLD-BUILD path (M1 reset → M2 → M3). The pre-reset dump stays a one-boot-proven read-only record,
+// hard-gated on link-up (a link-down RC must never be MMIO'd past its own register block). ───
 
 // ─── BCM2711 PCIe RC register block (ARM-physical; inside the 0xC000_0000–0xFFFF_FFFF Device-nGnRnE
 // window `boot.rs` L1[3] already maps — no new mapping needed to reach ANY of the RC registers or the
@@ -531,16 +537,51 @@ pub fn bringup(dtb: u64) {
     //    decode), so the adopt path is retired — the dump is a record; we always take the reset path. ──
     dump_firmware_state();
 
-    // ── M1: brcmstb RC bring-up. ─────────────────────────────────────────────────────────────────
-    if !m1_rc_bringup() {
-        serial_println!("{} M1 RC bring-up did not reach link-up — USB bring-up skipped (see lines above) ::", P);
-        // SError-drain class rule (R22 sitting 2): the RC accesses above may have left a latent
-        // async abort pending; a fail-closed exit must leave the machine clean.
-        super::exceptions::serror_drain_request("piusb: M1 fail-closed");
-        return;
+    // ── PIUSB-16: the ENTRY link-state discriminator — the one-boot lever verdict. ────────────────
+    //    Read the RC's own reset + status registers exactly as the firmware left them (both are safe
+    //    RC-register reads even link-down). This is where the FW_TAG lever proves out in a single boot:
+    //      * PHYLINKUP && DL_ACTIVE here  => the VideoCore ran its stock power-on PCIe/VL805 init and
+    //        handed us a LIVE root complex (with the fw pushed on this EEPROM-less rev-1.5 board). Take
+    //        the ADOPT path: NO M1 reset (it would tear the trained link + loaded fw down); keep the VC's
+    //        outbound WIN0; run M2 (config/NOTIFY only — non-destructive to the link) then M3, and CNR is
+    //        expected to be 0 at M3 because the controller was already loaded.
+    //      * RC still in reset (RGR1 INIT_GENERIC|PERST set, PCIE_STATUS=0) => the new firmware still did
+    //        NOT init PCIe before handoff — the FW_TAG swap was not the lever; take the COLD-BUILD path
+    //        (M1 reset → M2 → M3) exactly as before, and the next lever is up for evaluation.
+    let entry_status = r(RC_BASE + PCIE_MISC_PCIE_STATUS);
+    let entry_swinit = r(RC_BASE + PCIE_RGR1_SW_INIT_1);
+    let up_mask = PCIE_MISC_PCIE_STATUS_PHYLINKUP | PCIE_MISC_PCIE_STATUS_DL_ACTIVE;
+    let link_up_at_entry = !is_poison(entry_status) && (entry_status & up_mask) == up_mask;
+    serial_println!(
+        "{} PIUSB-16: ENTRY link state — RGR1_SW_INIT_1={:#010x} PCIE_STATUS={:#010x} (PHYLINKUP={} DL_ACTIVE={}) -> {} ::",
+        P, entry_swinit, entry_status,
+        entry_status & PCIE_MISC_PCIE_STATUS_PHYLINKUP != 0,
+        entry_status & PCIE_MISC_PCIE_STATUS_DL_ACTIVE != 0,
+        if link_up_at_entry {
+            "VC LEFT PCIe LIVE — ADOPT path (skip RC reset; keep VC windows + loaded VL805 fw; M2 config/NOTIFY → M3)"
+        } else {
+            "VC left RC in reset — COLD-BUILD path (M1 reset → M2 → M3); FW_TAG lever did not move VC init"
+        }
+    );
+
+    // ── M1: brcmstb RC bring-up — COLD-BUILD path ONLY. On the ADOPT path we deliberately SKIP M1: its
+    //    RGR1 INIT_GENERIC|PERST assert would reset the bridge and PERST the downstream link, tearing
+    //    down the very link the VC trained and forcing a VL805 fw reload from cold (the wall this arc
+    //    exists to avoid). ─────────────────────────────────────────────────────────────────────────────
+    if !link_up_at_entry {
+        if !m1_rc_bringup() {
+            serial_println!("{} M1 RC bring-up did not reach link-up — USB bring-up skipped (see lines above) ::", P);
+            // SError-drain class rule (R22 sitting 2): the RC accesses above may have left a latent
+            // async abort pending; a fail-closed exit must leave the machine clean.
+            super::exceptions::serror_drain_request("piusb: M1 fail-closed");
+            return;
+        }
+    } else {
+        serial_println!("{} PIUSB-16 ADOPT: skipping M1 RC reset — riding the VideoCore's live link + outbound window ::", P);
     }
 
-    // ── M2: VL805 enumeration + BAR sizing + firmware reset. ──────────────────────────────────────
+    // ── M2: VL805 enumeration + BAR sizing + firmware reset. Config-space + mailbox only — it does NOT
+    //    reset the PCIe link, so it is safe on BOTH paths (cold-built or adopted). ────────────────────
     let Some(bar0_pcie) = m2_enumerate_vl805() else {
         serial_println!("{} M2 VL805 enumeration failed — USB bring-up skipped (see lines above) ::", P);
         // The poisoned downstream config read (`0xdeaddead`) is the R22 sitting-2 metal offender:

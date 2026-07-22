@@ -736,7 +736,17 @@ EOF
 # and build a flashable .img for Raspberry Pi Imager. Links non-PIE at 0x80000 (aarch64-base.json,
 # relocation-model=static) with pi-baremetal.ld, then objcopy to a raw binary.
 KERNEL8_DIR="${WORKSPACE_DIR}/target/pi_baremetal"
-FW_ZIP="${WORKSPACE_DIR}/target/RPi4_UEFI_Firmware_v1.52.zip"
+# PIUSB-16: the Pi GPU firmware blobs we stage (start4.elf/fixup4.dat), the base DTB, and the
+# miniuart-bt overlay come from the OFFICIAL raspberrypi/firmware repo at a pinned stable tag — NOT
+# scavenged from a stale third-party UEFI bundle. The prior source (pftf/RPi4 UEFI v1.52, ~2023) is a
+# UEFI-oriented bundle whose old start4.elf did not run the stock power-on VL805/PCIe init this board's
+# updated bootloader (2026-05-17) expects — the VideoCore handed our kernel a PCIe RC left in reset
+# (RGR1_SW_INIT_1=0x3, PCIE_STATUS=0x0). FW_TAG matches the bootloader era so the VC does its normal
+# init + VL805 firmware push before handoff. Blobs are redistributable in binary form under
+# boot/LICENCE.broadcom (the same terms under which RPi OS ships them). "latest stable, always."
+FW_TAG="1.20260521"
+FW_CACHE="${WORKSPACE_DIR}/target/pi-firmware-${FW_TAG}"
+FW_RAW="https://raw.githubusercontent.com/raspberrypi/firmware/${FW_TAG}/boot"
 kernel8() {
     local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
 
@@ -916,15 +926,20 @@ kernel8() {
       "${WORKSPACE_DIR}/target/aarch64-base/release/unaos-kernel" "$KERNEL8_DIR/kernel8.img"
     cp "${WORKSPACE_DIR}/scripts/pi-baremetal-config.txt" "$KERNEL8_DIR/config.txt"
 
-    # Standard Pi GPU firmware blobs (start4.elf/fixup4.dat) + base DTB + the miniuart-bt overlay,
-    # pulled from the cached pftf release zip (we use only its stock firmware files here).
-    if [ ! -f "$FW_ZIP" ]; then
-        echo -e "${COLOR_CYAN}⚡ Fetching Pi firmware (pftf v1.52)...${COLOR_RESET}"
-        curl -sL -o "$FW_ZIP" https://github.com/pftf/RPi4/releases/download/v1.52/RPi4_UEFI_Firmware_v1.52.zip
+    # PIUSB-16: stock Pi GPU firmware blobs (start4.elf/fixup4.dat) + base DTB + the miniuart-bt overlay,
+    # fetched from the OFFICIAL raspberrypi/firmware repo at the pinned FW_TAG (see the FW_* vars above)
+    # and cached under target/. These are the same blobs stock RPi OS ships; the VideoCore does its normal
+    # power-on VL805/PCIe bring-up from them before it hands off to kernel8.img.
+    if [ ! -d "$FW_CACHE" ]; then
+        echo -e "${COLOR_CYAN}⚡ Fetching official Pi firmware (raspberrypi/firmware ${FW_TAG})...${COLOR_RESET}"
+        mkdir -p "$FW_CACHE/overlays"
+        for f in start4.elf fixup4.dat bcm2711-rpi-4-b.dtb overlays/miniuart-bt.dtbo; do
+            curl -sfL -o "$FW_CACHE/$f" "$FW_RAW/$f" || { echo "firmware fetch failed: $f" >&2; rm -rf "$FW_CACHE"; exit 1; }
+        done
     fi
-    unzip -o -j "$FW_ZIP" start4.elf fixup4.dat bcm2711-rpi-4-b.dtb -d "$KERNEL8_DIR" >/dev/null
-    unzip -o -j "$FW_ZIP" "overlays/miniuart-bt.dtbo" -d "$KERNEL8_DIR/overlays" >/dev/null
-    echo -e "${COLOR_GREEN}✅ Boot files: ${KERNEL8_DIR}${COLOR_RESET}"
+    cp "$FW_CACHE/start4.elf" "$FW_CACHE/fixup4.dat" "$FW_CACHE/bcm2711-rpi-4-b.dtb" "$KERNEL8_DIR/"
+    cp "$FW_CACHE/overlays/miniuart-bt.dtbo" "$KERNEL8_DIR/overlays/"
+    echo -e "${COLOR_GREEN}✅ Boot files: ${KERNEL8_DIR} (firmware raspberrypi/firmware ${FW_TAG})${COLOR_RESET}"
 
     # M6g: carry the EL0 user blob onto the boot media as HELLO.BIN, next to kernel8.img in the FAT32
     # root (make-pi-img.sh ditto's the whole staging dir). On metal the kernel's M6g loader reads this
