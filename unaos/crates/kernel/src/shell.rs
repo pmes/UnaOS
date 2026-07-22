@@ -2029,6 +2029,8 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             console.println("CLOCK:    date, setdate YYYY-MM-DD HH:MM[:SS]  (seeds mtime stamps; unset = honest dashes)");
             console.println("          time  (shared civil clock: ISO-8601 UTC + source; unsynced until SNTP/setdate)");
             console.println("SMP:      sched (per-CPU run queues), pulse (full-screen CPU monitor)");
+            #[cfg(target_arch = "aarch64")]
+            console.println("          top  (per-core load: recent busy%, ctx-switches, last task)");
             // PI-APP-1: v3d-gated so the knob-off build's help text stays byte-identical to baseline.
             #[cfg(all(target_arch = "aarch64", feature = "v3d"))]
             console.println("APPS:     vug (3D sculptor), v3d (replay the visible GPU graphics battery)");
@@ -2829,6 +2831,15 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             }
             #[cfg(not(target_arch = "x86_64"))]
             console.println("sched: x86_64 only");
+        },
+        "top" => {
+            // SCHED-2: per-core scheduler load table (aarch64). Recent busy% (rolling window),
+            // cumulative context switches, and the last task dispatched on each core. On-demand read
+            // of `sched::core_load` — introspection only, no scheduling-path effect.
+            #[cfg(target_arch = "aarch64")]
+            crate::arch::sched::load_table(|row| console.println(row));
+            #[cfg(not(target_arch = "aarch64"))]
+            console.println("top: aarch64 only");
         },
         "batmon" => {
             // NATIVE-MIDDEN M1b: one honest SMC battery line. A one-shot human command, so it does a

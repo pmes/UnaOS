@@ -62,6 +62,42 @@ Boot evidence: `APIC: x2APIC software-enabled (id=0…3)`, `SMP: AP 1/2/3 online
   high-priority task cannot starve lower ones forever. A promoted task runs at
   its base priority once dispatched.
 
+### Per-core load accounting (aarch64, SCHED-2)
+
+The aarch64 `sched.rs` maintains a live per-core load view alongside the older
+cumulative `CPU_BUSY`/`CPU_IDLE` pulse counters (which feed the demo's CPU-pulse
+meter and converge to a since-boot average). Accounting is **per-core,
+single-writer, lock-free, `Relaxed`** — updated from the tick/switch path that is
+already running, adding no new lock to the scheduler hot path and no cross-core
+contention. Each `dispatch_next` pass folds one sample into the core's slot:
+a **busy** pass (a task was dispatched) or an **idle** pass (empty run queue).
+
+- **Rolling-window busy fraction.** Samples accumulate over `LOAD_WINDOW = 64`
+  dispatch passes; on window completion the busy percent is snapshotted and the
+  accumulators reset, so `busy_pct_recent` tracks *recent* activity rather than
+  the since-boot average. The window is measured in **dispatch passes, not timer
+  ticks** — same reasoning as priority aging (`AGE_TICKS`): the cooperative paths
+  and QEMU raspi4b have no live periodic tick, and a pass advances on every path.
+- **Context-switch count.** A cumulative `ctx_switches` per core (one per busy
+  dispatch).
+- **Last-scheduled task.** Id + `&'static str` name of the last task dispatched
+  on the core, published under a per-core **seqlock** so a cross-core reader never
+  reconstructs a torn `(ptr, len)` pair from the fat string pointer.
+
+Read API — `core_load(core) -> CoreLoad { busy_pct_recent, ctx_switches,
+last_task_id, last_task }` — is allocation-free and callable from any core;
+strictly introspection (never consulted on a scheduling decision).
+
+**Surfaces.** The `top` shell verb prints the per-core table on demand (recent
+busy %, ctx-switches, last task). On metal, `timer_preempt` drives a periodic,
+change-only serial heartbeat
+`:: SCHED: load c0=..% c1=..% c2=..% c3=..% (ctx +N/win) ::` (one emitter per
+window via an atomic boundary election; metal-only, since QEMU delivers no timer
+IRQ). A non-degeneracy witness (`load_accounting_witness`) runs in the pi
+`kernel8-test` battery after the cooperative demo and asserts the accounting is
+live — at least one core busy and the context-switch counter advanced — catching
+a regression that freezes it: `:: AARCH64 SCHED: load-accounting PASS (...) ::`.
+
 ---
 
 ## 3. Blocking and synchronization primitives

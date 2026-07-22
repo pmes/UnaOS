@@ -27,7 +27,9 @@ use alloc::sync::Arc;
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{
+    AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+};
 // spin's Mutex is the low-level SPINLOCK guarding the run queues / sleeper lists; alias it so this
 // module's own sleeping `Mutex<T>` (below) owns the bare name — same split as x86's sched.rs.
 use spin::Mutex as SpinMutex;
@@ -235,6 +237,180 @@ static SCHED: [SchedCpu; NUM_CPUS] = [const { SchedCpu::new() }; NUM_CPUS];
 /// any scheduling path. This is the SEAM a real per-core utilization feed would replace.
 static CPU_BUSY: [AtomicU64; NUM_CPUS] = [const { AtomicU64::new(0) }; NUM_CPUS];
 static CPU_IDLE: [AtomicU64; NUM_CPUS] = [const { AtomicU64::new(0) }; NUM_CPUS];
+
+// ---------------------------------------------------------------------------------------------
+// SCHED-2 — per-core load accounting (rolling-window utilization, ctx-switch count, last task)
+// ---------------------------------------------------------------------------------------------
+//
+// The `CPU_BUSY`/`CPU_IDLE` pulse counters above are CUMULATIVE-since-boot pass counts — good for a
+// meter that diffs across its own frame window, but they never answer "what is this core doing NOW"
+// on demand (busy% since boot converges to a flat average). This adds a LIVE per-core view: a
+// busy fraction over the most-recent WINDOW dispatch passes, a running context-switch count, and the
+// id+name of the last task dispatched on the core.
+//
+// Cost & concurrency: strictly per-core, single-writer (only the owning core's scheduler loop writes
+// its slot, from the tick/switch path that is already running), lock-free, Relaxed atomics — it adds
+// NO new lock to the scheduler hot path and no cross-core contention. Each dispatch pass does a
+// handful of relaxed loads/stores. Reads (the `top` shell verb, the witnesses) may run from ANY core;
+// the counters are plain relaxed reads and the last-task (id + &'static str) is published under a
+// per-core SEQLOCK so a cross-core reader never observes a torn id/name/len triple. Introspection
+// only: `core_load` and the witnesses NEVER run on a scheduling decision path.
+//
+// AGING-CLOCK NOTE (same reasoning as `AGE_TICKS`): the "window" is measured in DISPATCH PASSES, not
+// timer ticks, because the aarch64 cooperative paths (and QEMU raspi4b) have no live periodic tick.
+// A pass is a `dispatch_next` call; it is BUSY if a task was dispatched, IDLE if the queue was empty.
+// So `busy_pct_recent` is "fraction of the last WINDOW passes that dispatched work" — a live activity
+// proxy that advances on every path (cooperative and preemptive, QEMU and metal).
+
+/// Rolling-window size, in dispatch passes, over which `busy_pct_recent` is computed. A completed
+/// window snapshots its busy fraction and resets, so the reported percentage tracks recent activity
+/// rather than the since-boot average. 64 passes keeps the read live without storing per-pass history.
+const LOAD_WINDOW: u32 = 64;
+
+/// Sentinel `recent_pct` meaning "no window has completed yet" (fall back to the partial window).
+const LOAD_PCT_NONE: u32 = u32::MAX;
+
+/// One core's load accounting slot. All fields written ONLY by the owning core's scheduler loop
+/// (single-writer, Relaxed); read cross-core by introspection. The last-task triple is seqlock-
+/// protected (odd `last_seq` = write in progress) so a reader never reconstructs a torn `&str`.
+struct CoreAccount {
+    /// Cumulative context switches INTO a task on this core (one per busy dispatch).
+    ctx_switches: AtomicU64,
+    /// Busy passes accrued in the CURRENT (incomplete) window.
+    win_busy: AtomicU32,
+    /// Total passes accrued in the current window (rolls over at `LOAD_WINDOW`).
+    win_total: AtomicU32,
+    /// Busy percent (0..=100) of the last COMPLETED window, or `LOAD_PCT_NONE` before the first.
+    recent_pct: AtomicU32,
+    /// Seqlock sequence for the last-task triple: even = stable, odd = write in progress.
+    last_seq: AtomicU64,
+    /// Id of the last task dispatched here (0 = none yet).
+    last_id: AtomicU64,
+    /// `&'static str` name of the last task, split into `.as_ptr()` + `.len()` (both published under
+    /// the seqlock). A `&'static str` is a 16-byte fat pointer that no single atomic can hold, so the
+    /// seqlock is what makes the cross-core read of the pair sound.
+    last_name_ptr: AtomicUsize,
+    last_name_len: AtomicUsize,
+}
+
+impl CoreAccount {
+    const fn new() -> Self {
+        CoreAccount {
+            ctx_switches: AtomicU64::new(0),
+            win_busy: AtomicU32::new(0),
+            win_total: AtomicU32::new(0),
+            recent_pct: AtomicU32::new(LOAD_PCT_NONE),
+            last_seq: AtomicU64::new(0),
+            last_id: AtomicU64::new(0),
+            last_name_ptr: AtomicUsize::new(0),
+            last_name_len: AtomicUsize::new(0),
+        }
+    }
+
+    /// Fold one pass into the rolling window (single-writer, owning core). `busy` = a task was
+    /// dispatched this pass. On window completion, snapshot the busy percent and reset the accumulators.
+    #[inline]
+    fn sample(&self, busy: bool) {
+        let total = self.win_total.load(Ordering::Relaxed) + 1;
+        let busyc = self.win_busy.load(Ordering::Relaxed) + busy as u32;
+        if total >= LOAD_WINDOW {
+            self.recent_pct.store(busyc * 100 / total, Ordering::Relaxed);
+            self.win_total.store(0, Ordering::Relaxed);
+            self.win_busy.store(0, Ordering::Relaxed);
+        } else {
+            self.win_total.store(total, Ordering::Relaxed);
+            self.win_busy.store(busyc, Ordering::Relaxed);
+        }
+    }
+
+    /// Publish the last-dispatched task's id + name under the seqlock (owning core only). Bump the
+    /// sequence odd, write the triple, bump it even — a reader spinning on an even/matching sequence
+    /// then sees a consistent snapshot. Release fences pair with the reader's Acquire loads.
+    #[inline]
+    fn note_last(&self, id: u64, name: &'static str) {
+        let seq = self.last_seq.load(Ordering::Relaxed);
+        self.last_seq.store(seq + 1, Ordering::Release); // odd: write in progress
+        self.last_id.store(id, Ordering::Relaxed);
+        self.last_name_ptr.store(name.as_ptr() as usize, Ordering::Relaxed);
+        self.last_name_len.store(name.len(), Ordering::Relaxed);
+        self.last_seq.store(seq + 2, Ordering::Release); // even: stable
+    }
+
+    /// Busy percent (0..=100) for `core_load`: the last completed window, or the partial window if
+    /// none has completed yet (0 when the core has never run a pass).
+    fn busy_pct(&self) -> u32 {
+        let recent = self.recent_pct.load(Ordering::Relaxed);
+        if recent != LOAD_PCT_NONE {
+            return recent;
+        }
+        let total = self.win_total.load(Ordering::Relaxed);
+        if total == 0 {
+            0
+        } else {
+            self.win_busy.load(Ordering::Relaxed) * 100 / total
+        }
+    }
+
+    /// Read the last-task triple with a bounded seqlock retry. `&'static str` reconstruction is sound:
+    /// the writer only ever publishes a live `'static` name's `(ptr, len)` pair, and the seqlock
+    /// guarantees the reader sees a matching pair (never a torn ptr-from-A / len-from-B).
+    fn last_task(&self) -> (u64, &'static str) {
+        for _ in 0..8 {
+            let s1 = self.last_seq.load(Ordering::Acquire);
+            if s1 & 1 != 0 {
+                continue; // write in progress; retry
+            }
+            let id = self.last_id.load(Ordering::Relaxed);
+            let ptr = self.last_name_ptr.load(Ordering::Relaxed);
+            let len = self.last_name_len.load(Ordering::Relaxed);
+            if self.last_seq.load(Ordering::Acquire) != s1 {
+                continue; // changed under us; retry
+            }
+            if ptr == 0 || len == 0 {
+                return (id, "-");
+            }
+            // SAFETY: `ptr`/`len` were published together (seqlock-consistent) from a live `&'static
+            // str`, so this reconstructs that exact still-live string slice.
+            let name = unsafe {
+                core::str::from_utf8_unchecked(core::slice::from_raw_parts(ptr as *const u8, len))
+            };
+            return (id, name);
+        }
+        (self.last_id.load(Ordering::Relaxed), "?")
+    }
+}
+
+static ACCT: [CoreAccount; NUM_CPUS] = [const { CoreAccount::new() }; NUM_CPUS];
+
+/// A snapshot of one core's live scheduler load (SCHED-2). Returned by `core_load`; consumed by the
+/// `top` shell verb and the load witnesses. All fields are a point-in-time read — introspection only.
+pub struct CoreLoad {
+    /// Busy fraction (0..=100) over the most recent `LOAD_WINDOW` dispatch passes.
+    pub busy_pct_recent: u32,
+    /// Cumulative context switches into a task on this core since boot.
+    pub ctx_switches: u64,
+    /// Id of the last task dispatched on this core (0 = none yet).
+    pub last_task_id: u64,
+    /// Name of the last task dispatched on this core ("-" = none yet).
+    pub last_task: &'static str,
+}
+
+/// SCHED-2 — read this core's live load: recent busy percent (rolling window), cumulative context
+/// switches, and the last task dispatched. Allocation-free and lock-free; callable from ANY core
+/// (the shell `top` verb, the witnesses). Introspection only — never consulted on a scheduling path.
+pub fn core_load(core: usize) -> CoreLoad {
+    if core >= NUM_CPUS {
+        return CoreLoad { busy_pct_recent: 0, ctx_switches: 0, last_task_id: 0, last_task: "-" };
+    }
+    let acct = &ACCT[core];
+    let (last_task_id, last_task) = acct.last_task();
+    CoreLoad {
+        busy_pct_recent: acct.busy_pct(),
+        ctx_switches: acct.ctx_switches.load(Ordering::Relaxed),
+        last_task_id,
+        last_task,
+    }
+}
 
 /// AARCH64-PRIO — a CPU's ready tasks, bucketed by EFFECTIVE level. A task normally sits at its base
 /// `priority` level, but the aging sweep (`age`) may transiently lift a long-waiting task to a higher
@@ -879,6 +1055,10 @@ pub fn timer_preempt() {
     if !SCHED_ACTIVE.load(Ordering::Acquire) {
         return;
     }
+    // SCHED-2: drive the periodic load heartbeat off the per-core timer tick (metal-only — QEMU never
+    // reaches here). Placed before the current-null return so an idle-but-ticking core still advances
+    // the aggregate cadence; the emit itself is change-only and single-core per window (see the fn).
+    load_witness_tick();
     let cpu = percpu::this_cpu().cpu_index as usize;
     let raw = SCHED[cpu].current.load(Ordering::Acquire) as *mut Task;
     if raw.is_null() {
@@ -922,10 +1102,16 @@ fn dispatch_next(cpu: usize) -> bool {
     };
     let Some(task) = next else {
         CPU_IDLE[cpu].fetch_add(1, Ordering::Relaxed); // M3b CPU-pulse meter (introspection)
+        ACCT[cpu].sample(false); // SCHED-2: idle pass (no task dispatched this window slot)
         unmask_irq();
         return false;
     };
     CPU_BUSY[cpu].fetch_add(1, Ordering::Relaxed); // M3b CPU-pulse meter (introspection)
+    // SCHED-2: busy pass — one context switch into a task; record it + the last-task identity for the
+    // rolling-window load view. Single-writer (this core), relaxed; no lock added to the switch path.
+    ACCT[cpu].ctx_switches.fetch_add(1, Ordering::Relaxed);
+    ACCT[cpu].sample(true);
+    ACCT[cpu].note_last(task.id, task.name);
     task.state.store(STATE_RUNNING, Ordering::Release);
     SCHED[cpu].quantum.store(QUANTUM_TICKS, Ordering::Relaxed);
     let raw = Box::into_raw(task);
@@ -1861,6 +2047,16 @@ pub fn demo_cooperative() {
     // On the `virt`/Orin paths the boot core diverges into `run_capstone_boot_core` before reaching here,
     // so those get the witness there instead (no double run).
     prio_mix_witness(0);
+
+    // SCHED-2: non-degeneracy proof for the per-core load accounting. The cooperative demo + prio-mix
+    // above drove dozens of dispatches on core 0, so the rolling-window busy fraction and the
+    // context-switch counter are both provably non-zero here — this witness catches a regression that
+    // freezes the accounting (a stuck-at-0 counter, a window that never advances). Runs in the QEMU
+    // `kernel8-test` gate (no timer needed — the accounting rides the cooperative dispatch path).
+    // `pi`-gated exactly like `core_load_report`: fires on the target + gate, byte-identical for the
+    // jetson/virt builds that diverge into `run_capstone_boot_core` before reaching here.
+    #[cfg(feature = "pi")]
+    load_accounting_witness();
 }
 
 /// Busy-wait `ms` milliseconds off the free-running CNTPCT (works even where the timer IRQ isn't
@@ -2056,6 +2252,97 @@ pub fn core_load_report() {
         let busy = CPU_BUSY[cpu].load(Ordering::Relaxed);
         let idle = CPU_IDLE[cpu].load(Ordering::Relaxed);
         serial_println!(":: SCHED-LOAD: core {} busy {} idle {} ::", cpu, busy, idle);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// SCHED-2 — load witnesses (periodic serial line + on-demand `top` table + a non-degeneracy proof)
+// ---------------------------------------------------------------------------------------------
+
+/// Periodic-witness cadence, in aggregate timer ticks across all cores. At the ~4 ms/tick Pi quantum
+/// this fires roughly every few seconds. Metal-only — `timer_preempt` (its only driver) never runs in
+/// QEMU raspi4b (no Group-1 timer delivery), so this line appears on the real Pi, not in the gate.
+const LOAD_WITNESS_INTERVAL: u64 = 1024;
+/// Aggregate tick accumulator across cores (whichever core lands on the interval boundary emits).
+static LOAD_WITNESS_TICKS: AtomicU64 = AtomicU64::new(0);
+/// Packed busy-percents of the last emitted line (`c0 | c1<<8 | c2<<16 | c3<<24`), for change-only
+/// suppression — a steady-state system stops re-printing an unchanged load line.
+static LOAD_WITNESS_LAST: AtomicU64 = AtomicU64::new(u64::MAX);
+/// `ctx_switches` sum snapshot at the last emission, to derive the per-window context-switch delta.
+static LOAD_WITNESS_CTX: AtomicU64 = AtomicU64::new(0);
+
+/// SCHED-2 periodic load heartbeat: called once per `timer_preempt` (per core, per tick, metal-only).
+/// The core whose atomic increment lands exactly on the `LOAD_WITNESS_INTERVAL` boundary is the sole
+/// emitter for that window (fetch_add hands each multiple to exactly one core), so there is no
+/// double-print and no reader lock. Change-only: it prints only when the packed per-core busy-percents
+/// differ from the last emission. Cheap on the non-boundary passes (one relaxed fetch_add + a modulo).
+fn load_witness_tick() {
+    let n = LOAD_WITNESS_TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n % LOAD_WITNESS_INTERVAL != 0 {
+        return;
+    }
+    let mut packed = 0u64;
+    let mut ctx_now = 0u64;
+    for cpu in 0..NUM_CPUS.min(8) {
+        let ld = core_load(cpu);
+        packed |= (ld.busy_pct_recent.min(255) as u64) << (cpu * 8);
+        ctx_now += ld.ctx_switches;
+    }
+    if packed == LOAD_WITNESS_LAST.swap(packed, Ordering::Relaxed) {
+        return; // unchanged since the last window — stay quiet
+    }
+    let ctx_delta = ctx_now.saturating_sub(LOAD_WITNESS_CTX.swap(ctx_now, Ordering::Relaxed));
+    let c = |i: usize| core_load(i).busy_pct_recent;
+    serial_println!(
+        ":: SCHED: load c0={}% c1={}% c2={}% c3={}% (ctx +{}/win) ::",
+        c(0), c(1), c(2), c(3), ctx_delta
+    );
+}
+
+/// SCHED-2 on-demand per-core load table (the `top` shell verb's body, and a serial witness). Prints
+/// one row per core: recent busy percent (rolling window), cumulative context switches, and the last
+/// task (id + name). Reads `core_load` per core — introspection only, safe from any core.
+pub fn load_table(mut line: impl FnMut(&str)) {
+    line("core  busy%  ctx-switches  last-task");
+    for cpu in 0..NUM_CPUS {
+        let ld = core_load(cpu);
+        line(&alloc::format!(
+            "{:>3}   {:>4}   {:>11}   {} (tid {})",
+            cpu, ld.busy_pct_recent, ld.ctx_switches, ld.last_task, ld.last_task_id
+        ));
+    }
+}
+
+/// SCHED-2 non-degeneracy witness (the QEMU-gate proof): assert the per-core accounting is LIVE — at
+/// least one core shows busy activity and its context-switch counter has advanced past zero. A
+/// regression that freezes the accounting (counters stuck at 0, no window ever completes) FAILs this
+/// loudly. Uncounted (not part of the timed battery); prints a single PASS/FAIL line. Reads only.
+pub fn load_accounting_witness() {
+    let mut any_busy = false;
+    let mut any_ctx = false;
+    let mut max_pct = 0u32;
+    let mut total_ctx = 0u64;
+    for cpu in 0..NUM_CPUS {
+        let ld = core_load(cpu);
+        if ld.busy_pct_recent > 0 {
+            any_busy = true;
+        }
+        if ld.ctx_switches > 0 {
+            any_ctx = true;
+        }
+        max_pct = max_pct.max(ld.busy_pct_recent);
+        total_ctx += ld.ctx_switches;
+    }
+    if any_busy && any_ctx {
+        serial_println!(
+            ":: AARCH64 SCHED: load-accounting PASS (max busy {}%, {} ctx-switches total) ::",
+            max_pct, total_ctx
+        );
+    } else {
+        serial_println!(
+            ":: AARCH64 SCHED: load-accounting FAIL (any_busy={}, any_ctx={}) ::",
+            any_busy, any_ctx
+        );
     }
 }
 
