@@ -1,3 +1,5 @@
+STATUS: APPROVED (2026-07-22, reviewer) — with cleanroom amendment: PBDMA init must cite rnndb facts, never nouveau code/function names; log instance-block words as raws.
+
 # PROPOSAL — Kepler pull 4 (for the Gemini session): head-scanout decode + PBDMA front-of-queue
 
 ## Overview

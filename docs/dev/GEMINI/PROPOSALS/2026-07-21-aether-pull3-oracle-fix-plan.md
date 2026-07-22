@@ -1,3 +1,5 @@
+STATUS: APPROVED (2026-07-22, reviewer) — as written; https→http fallback on connect failure only.
+
 # Aether Pull 3 Oracle Fixes Implementation Plan
 
 This plan outlines the architecture fixes needed to address the three oracle test failures (GTK white viewport, macOS featureless window, and scheme-less input normalization).
