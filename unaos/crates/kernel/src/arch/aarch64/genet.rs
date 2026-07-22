@@ -3710,82 +3710,37 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
     static NET16_TIMEOUTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
     static NET16_REJECTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-    /// The monotonic-anchored wall-clock. Captured at each successful sync: `anchor_unix` is the UTC second
-    /// the server reported; `anchor_cntpct` is the free-running counter value read in the same breath. The
-    /// live time is extrapolated from the counter, so the clock ticks forward between syns with no drift
-    /// beyond the counter's (and never runs backwards within one anchor).
-    #[derive(Clone, Copy)]
-    struct WallClock {
-        anchor_unix: u64,
-        anchor_cntpct: u64,
-        stratum: u8,
-    }
-    /// Module-local wall-clock state. INTEGRATOR FOLD: a proper kernel-wide clock service belongs in a
-    /// shared core file (so `time`/log timestamps/filesystem mtimes can all read it); this arc keeps the
-    /// state here, in-lane, and exposes a small read API. When the shared service lands, this becomes its
-    /// backing store or is migrated wholesale.
-    static WALL_CLOCK: spin::Mutex<Option<WallClock>> = spin::Mutex::new(None);
+    // CLOCK-1: PI-NET-16's module-local wall-clock has MIGRATED to the shared kernel clock service
+    // (`crate::clock`). The state (the Unix anchor + monotonic reference), the civil (Hinnant) math, and
+    // the ISO-8601 renderer now live in one arch-agnostic place so `time`, log timestamps, and fs mtimes
+    // can all read one clock. The SNTP client below keeps its own names — `wall_set`/`wall_unix_now`/
+    // `wall_anchor`/`render_iso8601` — as thin forwarders, so every call site and the NET16-GATE witness
+    // are byte-identical to PI-NET-16. `NET16_SYNCS` (a net-service metric) still bumps on each set.
 
-    /// Anchor the wall-clock to `unix_secs` (UTC), reading CNTPCT now as the monotonic reference. Bumps the
-    /// sync counter. This is the ONLY writer of `WALL_CLOCK`.
+    /// Anchor the shared clock to `unix_secs` (UTC), tagged `Sntp{stratum}`, pairing it with CNTPCT read
+    /// in the same breath (the shared service's aarch64 monotonic source). Bumps the sync counter.
     fn wall_set(unix_secs: u64, stratum: u8) {
-        *WALL_CLOCK.lock() = Some(WallClock {
-            anchor_unix: unix_secs,
-            anchor_cntpct: cntpct(),
-            stratum,
-        });
+        crate::clock::set_anchor(unix_secs, cntpct(), crate::clock::ClockSource::Sntp { stratum });
         NET16_SYNCS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Current extrapolated UTC Unix seconds, or `None` if never synced. Adds the counter-measured elapsed
-    /// seconds since the anchor to the anchored second — monotonic, non-hanging (CNTPCT is free-running).
+    /// Current extrapolated UTC Unix seconds, or `None` if never synced — the shared clock service.
     fn wall_unix_now() -> Option<u64> {
-        let wc = (*WALL_CLOCK.lock())?;
-        let frq: u64;
-        unsafe {
-            core::arch::asm!("mrs {}, cntfrq_el0", out(reg) frq, options(nomem, nostack, preserves_flags));
-        }
-        if frq == 0 {
-            return Some(wc.anchor_unix);
-        }
-        let elapsed = cntpct().wrapping_sub(wc.anchor_cntpct) / frq;
-        Some(wc.anchor_unix.saturating_add(elapsed))
+        crate::clock::unix_now()
     }
 
-    /// Snapshot the raw anchor `(anchor_unix, stratum)` — the deterministic, non-extrapolated pair. Used by
-    /// the gate to assert an exact rendered ISO string without racing the free-running counter.
+    /// Snapshot the raw anchor `(anchor_unix, stratum)` — deterministic, non-extrapolated. `None` unless
+    /// the current anchor is an SNTP sync (the gate's precondition). Reads the shared clock service.
     fn wall_anchor() -> Option<(u64, u8)> {
-        (*WALL_CLOCK.lock()).map(|wc| (wc.anchor_unix, wc.stratum))
+        match crate::clock::raw_anchor() {
+            Some((unix, crate::clock::ClockSource::Sntp { stratum })) => Some((unix, stratum)),
+            _ => None,
+        }
     }
 
-    /// Civil date/time from Unix seconds (UTC), no floats. Howard Hinnant's days→civil algorithm, proven
-    /// exact for the whole proleptic-Gregorian range. Returns `(year, month[1..12], day[1..31], h, m, s)`.
-    fn civil_from_unix(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
-        let days = (secs / 86_400) as i64;
-        let rem = (secs % 86_400) as u32;
-        let (hh, mm, ss) = (rem / 3_600, (rem % 3_600) / 60, rem % 60);
-        // Shift the epoch so era math has no negative-days special case for our band (days >= 0 here).
-        let z = days + 719_468;
-        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-        let doe = z - era * 146_097; // [0, 146096]
-        let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
-        let y = yoe + era * 400;
-        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-        let mp = (5 * doy + 2) / 153; // [0, 11]
-        let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
-        let month = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32; // [1, 12]
-        let year = y + if month <= 2 { 1 } else { 0 };
-        (year, month, d, hh, mm, ss)
-    }
-
-    /// Render `unix_secs` (UTC) as an ISO-8601 `YYYY-MM-DDTHH:MM:SSZ` string into `out`, returning its
-    /// byte length (always 20 for a 4-digit year). Fixed-width, no allocation.
+    /// Render `unix_secs` (UTC) as ISO-8601 `YYYY-MM-DDTHH:MM:SSZ` into `out` — the shared renderer.
     fn render_iso8601(unix_secs: u64, out: &mut [u8]) -> usize {
-        use core::fmt::Write as _;
-        let (y, mo, d, h, mi, s) = civil_from_unix(unix_secs);
-        let mut w = BufWriter { buf: out, len: 0 };
-        let _ = write!(w, "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, d, h, mi, s);
-        w.len
+        crate::clock::render_iso8601(unix_secs, out)
     }
 
     /// Typed outcome of parsing an SNTP reply — every failure mode gets its own witness.
