@@ -21,11 +21,9 @@ mod tests {
         let html = r#"<html><body><div id="box" style="width: 10px; height: 10px; background-color: red;"></div></body></html>"#;
         let document = dom::parse_html(html);
         let mut layout_tree = layout::compute_layout(&document);
-        
-        // CSS engine in aether is currently rudimentary, but we just verify it doesn't panic
-        // and that we can paint the layout boxes.
         let mut surface = vec![0u8; 100 * 100 * 4];
-        render::render_frame(&layout_tree, &mut surface, 100, 100, 0.0, 0.0);
+        let damage = vec![(0, 0, 100, 100)];
+        render::render_frame(&layout_tree, &mut surface, 100, 100, 0.0, 0.0, &damage);
         
         // The current render_frame fills white background: 255, 255, 255, 255
         // We just assert the background is painted at (0, 0) if no boxes overlap, or we check the box color.
