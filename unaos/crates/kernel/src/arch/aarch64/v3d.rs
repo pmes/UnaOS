@@ -2607,8 +2607,8 @@ fn cs_vpm_output_witness(tag: &str) {
         serial_println!(
             ":: V3D: [v3d24] {} abs v{} — screen px ({}.{:02},{}.{:02}) after +VIEWPORT_OFFSET(32,32) — clip window 0..{}×0..{}: {} — encoding Mesa-verified (v3d_nir_lower_io.c + genxml v41+), so on-grid ⇒ empty bin is NOT the encoding ::",
             tag, i,
-            px_x as i32, ((px_x.fract() * 100.0) as i32).abs(),
-            px_y as i32, ((px_y.fract() * 100.0) as i32).abs(),
+            px_x as i32, (((px_x - px_x as i64 as f64) * 100.0) as i32).abs(),
+            px_y as i32, (((px_y - px_y as i64 as f64) * 100.0) as i32).abs(),
             TARGET_W, TARGET_H,
             if inside { "INSIDE (should bin to a tile)" } else { "OUTSIDE (off every tile)" }
         );
