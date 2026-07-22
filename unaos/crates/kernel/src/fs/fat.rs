@@ -1688,6 +1688,15 @@ impl FatFs {
         buf[43] = 0x10;
         buf[52..54].copy_from_slice(&((parent_first_cluster >> 16) as u16).to_le_bytes());
         buf[58..60].copy_from_slice(&((parent_first_cluster & 0xFFFF) as u16).to_le_bytes());
+        // CLOCK-3: stamp the last-write time/date words (@0x16/@0x18) of BOTH `.` and `..` from the
+        // unified kernel clock, the same path every other fat.rs writer uses — a fresh subdir now carries
+        // a real mtime instead of the all-zero (dashed) placeholder. `(0, 0)` while the clock is unset,
+        // so the unset-boot on-disk bytes are byte-identical to the pre-CLOCK-3 zeroed field.
+        let (mt, md) = crate::clock::fat_stamp();
+        buf[22..24].copy_from_slice(&mt.to_le_bytes()); //  "."  time @0x16
+        buf[24..26].copy_from_slice(&md.to_le_bytes()); //  "."  date @0x18
+        buf[54..56].copy_from_slice(&mt.to_le_bytes()); //  ".." time @0x16 (entry base 32 + 22)
+        buf[56..58].copy_from_slice(&md.to_le_bytes()); //  ".." date @0x18 (entry base 32 + 24)
         // size@28..32 and @60..64 stay 0 (directories report size 0); the rest of the cluster is already
         // zero (alloc_cluster), so this one sector fully initializes the directory.
         write_sector(self.cluster_lba(self_cluster), &buf)

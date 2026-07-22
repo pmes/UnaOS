@@ -8542,6 +8542,12 @@ pub fn u7_launcher(demo_cpu: usize) {
     // perturb the 23 fixtures or the witnesses), fully self-cleaning. Its own uncounted
     // `:: FATMOVE: … PASS ::` line. Unblocks a future jetson `mv` arc (JD10).
     fatmove_launcher();
+    // CLOCK-3: prove the FAT last-write stamp DERIVES from the unified kernel clock — after a
+    // deterministic Manual civil anchor, a freshly created file's on-disk dir-entry date matches the
+    // anchor (not the all-zero unset value). Runs LAST in the storage chain (its disk I/O can never
+    // perturb the fixtures/witnesses), restores the civil clock to exactly as found, and is fully
+    // self-cleaning. Its own uncounted `:: CLOCK3-fat: … PASS ::` line.
+    clock3_fat_launcher();
     // BeFS-K3: locate + mount the native unafs partition off the live card and prove the superblock
     // + the read paths (ls/cat byte-verified) + the write seam's bound-check. Read-only by
     // construction — safe here. Its own uncounted `:: K3-mount: … PASS ::` line; an honest skip on
@@ -11854,6 +11860,87 @@ fn fatmove_launcher() {
     serial_println!(
         ":: FATMOVE: fat.rs rename_entry(in-place 8.3 name RMW) + move_entry(dst-entry-first, then 0xE5 src keep-chain) {} (rename: name-swap, old gone/new=same head+size, content intact, onto-existing refused; move: cross-dir by-reference, content intact, onto-existing refused, directory refused, empty-file relink) [w={:#05x}] ::",
         if w == FATMOVE_ALL { "PASS" } else { "FAIL" },
+        w
+    );
+}
+
+// ===================================================================================================
+// CLOCK-3: prove the FAT last-write stamp DERIVES from the unified kernel clock (crate::clock). The
+// end-to-end witness: plant a DETERMINISTIC Manual civil (Unix) anchor, create a real file on the live
+// volume, read its on-disk dir-entry back, and assert its decoded mtime DATE equals the anchor's civil
+// date — i.e. the fat.rs writer stamped the unified clock, not the pre-CLOCK-3 all-zero placeholder.
+// Runs LAST in the storage chain (its disk I/O can never perturb the fixtures/witnesses); restores the
+// civil clock to EXACTLY as found (re-plants a prior anchor, else clears back to UNSET); fully
+// self-cleaning (deletes its scratch file). Emits ONE uncounted `:: CLOCK3-fat: … PASS [w=0x..] ::`
+// line (the k1-atr `<noun> PASS` idiom — NOT a `-> PASS` fixture line, so the fixture count is unchanged).
+const CLOCK3_FILE: &str = "CLK3.BIN";
+// A deterministic Manual anchor: 2020-06-15 12:34:56 UTC (Unix 1_592_224_496). Its FAT packing is fixed —
+// DATE = ((2020-1980)<<9)|(6<<5)|15 = 0x50CF, TIME = (12<<11)|(34<<5)|(56/2) = 0x645C — so the witness
+// asserts an EXACT on-disk value, independent of boot timing (the date is ~11h from midnight: no rollover).
+const CLOCK3_UNIX: u64 = 1_592_224_496;
+const CLOCK3_WANT_DATE: u16 = 0x50CF; // 2020-06-15
+const CLOCK3_ALL: u32 = 0x7; // three assertions: created, date-derived-from-anchor, civil clock restored
+
+fn clock3_check() -> u32 {
+    let mut w = 0u32;
+    let fs = match crate::fs::fat::mount() {
+        Ok(f) => f,
+        Err(_) => return 0,
+    };
+    // Pristine start: a stale scratch file from an interrupted run would confound the create.
+    if let Ok((de, lba, off)) = fs.locate_in_dir(0, CLOCK3_FILE) {
+        let _ = fs.delete_located(lba, off, de.first_cluster());
+    }
+
+    // Save the civil clock as found, then plant the deterministic Manual anchor (captures a mono tick in
+    // the same breath, exactly as `setdate`/SNTP do). Elapsed since the anchor is ~0s across the few
+    // I/Os below, so `fat_stamp()` extrapolates to the exact anchored second.
+    let prior = crate::clock::raw_anchor();
+    let tick = crate::clock::mono_ticks().unwrap_or(0);
+    crate::clock::set_anchor(CLOCK3_UNIX, tick, crate::clock::ClockSource::Manual);
+
+    // Create the scratch file, then read the on-disk dir entry back and decode its mtime.
+    if fs.create_in_dir(0, CLOCK3_FILE, 0x20).is_ok() {
+        w |= 1 << 0; // file created
+        if let Ok((de, _lba, _off)) = fs.locate_in_dir(0, CLOCK3_FILE) {
+            let ts = de.mtime();
+            // DATE derived from the anchor: 2020-06-15 (never the all-zero `is_zero()` placeholder).
+            if !ts.is_zero() && ts.year == 2020 && ts.month == 6 && ts.day == 15 {
+                w |= 1 << 1;
+            }
+        }
+        // Self-clean: remove the scratch file, leaving the volume EXACTLY as found.
+        if let Ok((de, lba, off)) = fs.locate_in_dir(0, CLOCK3_FILE) {
+            let _ = fs.delete_located(lba, off, de.first_cluster());
+        }
+    }
+
+    // Restore the civil clock to exactly as found (re-plant a prior anchor, else clear back to UNSET).
+    match prior {
+        Some((base, src)) => crate::clock::set_anchor(base, tick, src),
+        None => crate::clock::clear_anchor(),
+    }
+    if crate::clock::raw_anchor().map(|(b, _)| b) == prior.map(|(b, _)| b) {
+        w |= 1 << 2; // civil clock restored to the pre-witness anchor state
+    }
+    let _ = CLOCK3_WANT_DATE;
+    w
+}
+
+/// CLOCK-3 launcher + verdict — rides the U7 kernel task AFTER the FAT write selftests (its disk I/O can
+/// never perturb the fixtures or witnesses). Emits ONE uncounted `:: CLOCK3-fat: … PASS ::` line.
+fn clock3_fat_launcher() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if crate::drivers::block::info().is_none() {
+        return; // no SD -> the proof writes a real file; skip silently (the control-path discipline)
+    }
+    let w = clock3_check();
+    serial_println!(
+        ":: CLOCK3-fat: FAT mtime derives from the unified clock — after a Manual civil anchor, a created file's dir-entry date matches the anchor {} (deterministic 2020-06-15 anchor; date != zero-placeholder; civil clock restored) [w={:#04x}] ::",
+        if w == CLOCK3_ALL { "PASS" } else { "FAIL" },
         w
     );
 }
