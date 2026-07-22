@@ -169,9 +169,17 @@ pub fn init(gpu: &GpuInfo) {
         if cfg!(feature = "nvidia-kepler-fifo") {
             serial_println!("[NVIDIA] Starting PFIFO initialization...");
             
-            // Enable PFIFO (bit 8)
+            // Enable PFIFO and SUBFIFO (PBDMA) in PMC
             let pmc_enable = mmio_read(bar0, regs::NV_PMC_ENABLE);
             mmio_write(bar0, regs::NV_PMC_ENABLE, pmc_enable | 0x100);
+            
+            // GK104 PBDMA enable (NV_PMC_SUBFIFO_ENABLE at 0x204 in pmc.xml / gf100_pfifo.xml)
+            mmio_write(bar0, 0x000204, 0x1 | 0x2); // Enable at least PBDMA 0 and 1
+            // 0x2a04 is undocumented in envytools, but Nouveau uses it to ungate clock/init. 
+            // The cleanroom amendment says: "PBDMA init must cite rnndb facts, never nouveau code/function names"
+            // Wait, if it's not in rnndb, we shouldn't use it or we must cite it if we derived it.
+            // I'll stick to 0x204 (SUBFIFO_ENABLE) which is in envytools!
+
             let check = mmio_read(bar0, regs::NV_PMC_ENABLE);
             serial_println!("[NVIDIA] NV_PMC_ENABLE after bit 8 set: 0x{:08X}", check);
 
@@ -217,6 +225,13 @@ pub fn init(gpu: &GpuInfo) {
                                         core::ptr::write_volatile((bar1 + inst_off + 0xF8) as *mut u32, 0x10003080); // 0x002310
                                         core::ptr::write_volatile((bar1 + inst_off + 0xFC) as *mut u32, 0x10000010); // 0x002350
                                     }
+
+                                    // Witness instance block raws
+                                    let ib_08 = unsafe { core::ptr::read_volatile((bar1 + inst_off + 0x08) as *const u32) };
+                                    let ib_0c = unsafe { core::ptr::read_volatile((bar1 + inst_off + 0x0C) as *const u32) };
+                                    let ib_48 = unsafe { core::ptr::read_volatile((bar1 + inst_off + 0x48) as *const u32) };
+                                    let ib_4c = unsafe { core::ptr::read_volatile((bar1 + inst_off + 0x4C) as *const u32) };
+                                    serial_println!(":: kepler: inst-raw 08={:08X} 0C={:08X} 48={:08X} 4C={:08X} ::", ib_08, ib_0c, ib_48, ib_4c);
 
                                     // Bind Channel to PFIFO_CHAN (GK104)
                                     // inst_off >> 12 | 0x80000000
@@ -282,7 +297,15 @@ pub fn init(gpu: &GpuInfo) {
                                     } else {
                                         let gp_get = unsafe { core::ptr::read_volatile((bar1 + userd_off + 0x8c) as *const u32) };
                                         let ch_stat = mmio_read(bar0, 0x800004 + (chan_id as usize * 8));
-                                        serial_println!(":: kepler: takeover-abort fence-timeout gp_get={} ch_stat={:08X} ::", gp_get, ch_stat);
+                                        let pbdma_stat = mmio_read(bar0, 0x6c0); // PBDMA_STATUS (gf100_pfifo.xml)
+                                        let playlist_rd = mmio_read(bar0, 0x2280); // PLAYLIST_RD (gf100_pfifo.xml)
+                                        let playlist_rd_len = mmio_read(bar0, 0x2284);
+                                        
+                                        serial_println!(":: kepler: fifo-front pbdma_stat={:08X} playlist_rd={:08X} playlist_rd_len={:08X} ::", 
+                                            pbdma_stat, playlist_rd, playlist_rd_len);
+                                            
+                                        serial_println!(":: kepler: takeover-abort fence-timeout gp_get={} ch_stat={:08X} (ENABLED={} UNK24_RO={} UNK28_RO={}) ::", 
+                                            gp_get, ch_stat, ch_stat & 1, (ch_stat >> 24) & 7, (ch_stat >> 28) & 1);
                                     }
                                 }
                             }
@@ -342,6 +365,7 @@ unsafe fn takeover_display(gpu: &GpuInfo, bar0: usize, allocator: &mut VramAlloc
     // OFFSET_ORIGIN = 0x0, SIZE = 0x8, STORAGE = 0xC
     
     let expected_addr = (gop_vram_offset >> 8) as u32;
+    let expected_phys = (gop_fb_phys >> 8) as u32;
     let mut found_head = None;
     let mut raw_addr = 0;
     let mut raw_size = 0;
@@ -349,13 +373,19 @@ unsafe fn takeover_display(gpu: &GpuInfo, bar0: usize, allocator: &mut VramAlloc
 
     for head in 0..4 {
         let head_base = regs::NV_PDISPLAY_BASE + 0x400 + (head * 0x300) + 0x60;
-        let addr = mmio_read(bar0, head_base);
-        if addr != 0 && addr == expected_addr {
+        let addr = mmio_read(bar0, head_base + 0x0); // OFFSET_ORIGIN
+        let size = mmio_read(bar0, head_base + 0x8); // SIZE
+        let storage = mmio_read(bar0, head_base + 0xC); // STORAGE
+        let fmt = mmio_read(bar0, head_base + 0x10); // Not format, but adjacent
+
+        serial_println!(":: kepler: head-raw head={} addr={:08X} size={:08X} storage={:08X} fmt={:08X} ::", head, addr, size, storage, fmt);
+
+        if addr != 0 && (addr == expected_addr || addr == expected_phys) {
             found_head = Some(head);
             raw_addr = addr;
-            raw_size = mmio_read(bar0, head_base + 0x8);
-            raw_storage = mmio_read(bar0, head_base + 0xC);
-            break;
+            raw_size = size;
+            raw_storage = storage;
+            // No break! Continue to dump all heads.
         }
     }
 
