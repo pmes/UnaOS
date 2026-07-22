@@ -94,6 +94,8 @@ fn main() {
     // with arroyo's mapping. (The builder rebuilds the kernel, so this MUST be here or the feature
     // never reaches the kernel binary.)
     if std::env::var("UNAOS_KEPLER").is_ok() { feats.push("nvidia-kepler"); }
+    if std::env::var("UNAOS_KEPLER_TAKEOVER").is_ok() { feats.push("nvidia-kepler-takeover"); }
+    if std::env::var("UNAOS_KEPLER_FIFO").is_ok() { feats.push("nvidia-kepler-fifo"); }
     // INSTALL-CORE: UNAOS_INSTALLDEMO=1 arms the installer engine + its x86 boot witness (GPT writer
     // + FAT32 formatter + extent content-verify) against the blank scratch disk attached below under
     // the same knob. Kept in sync with arroyo's mapping. (The builder rebuilds the kernel, so this

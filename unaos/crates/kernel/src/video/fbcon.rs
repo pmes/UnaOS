@@ -246,6 +246,26 @@ unsafe impl Send for FbCon {}
 
 static FBCON: Mutex<FbCon> = Mutex::new(FbCon::new());
 
+/// Returns the active framebuffer base address if initialized, or None otherwise.
+pub fn current_base() -> Option<u64> {
+    let base = FBCON.lock().fb.base();
+    if base != 0 {
+        Some(base as u64)
+    } else {
+        None
+    }
+}
+
+/// Returns the active framebuffer info if initialized, or None otherwise.
+pub fn current_info() -> Option<unaos_boot_info::FrameBufferInfo> {
+    let fb = FBCON.lock();
+    if fb.fb.base() != 0 {
+        Some(fb.fb.info())
+    } else {
+        None
+    }
+}
+
 /// Bring the framebuffer console online. Call as early as possible in `kernel_main` (the
 /// framebuffer details come straight from `BootInfo`). No-op when there is no framebuffer.
 pub fn init(fb_addr: u64, fb_len: usize, info: FrameBufferInfo) {

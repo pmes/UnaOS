@@ -15,7 +15,7 @@ pub mod regs {
 
     // PFB — Framebuffer (VRAM) Controller
     pub const NV_PFB_BASE: usize = 0x0010_0000;
-    pub const NV_PFB_RAM_AMOUNT: usize = 0x0010_020C; // Common VRAM size register
+    pub const NV_PFB_RAM_AMOUNT: usize = 0x0010_F20C; // Kepler VRAM size register in MB (PBFB_BROADCAST + MEM_AMOUNT)
 
     // PFIFO — Command Submission / Pushbuffer
     pub const NV_PFIFO_BASE: usize = 0x0000_2000;
@@ -56,7 +56,7 @@ pub fn init(gpu: &GpuInfo) {
         
         if (bar1_orig_lo & 0x1) != 0 {
             serial_println!("[NVIDIA] Error: BAR1 is I/O space. Probe aborted.");
-            serial_println!(":: kepler: no-device ::");
+            serial_println!(":: kepler: probe-abort bar0-unmapped ::");
             return;
         }
 
@@ -93,7 +93,7 @@ pub fn init(gpu: &GpuInfo) {
 
     if bar0_size == 0 || bar1_size == 0 {
         serial_println!("[NVIDIA] Error: Invalid BAR sizes (BAR0: {} bytes, BAR1: {} bytes). Probe aborted.", bar0_size, bar1_size);
-        serial_println!(":: kepler: no-device ::");
+        serial_println!(":: kepler: probe-abort bar1-unmapped ::");
         return;
     }
 
@@ -103,7 +103,7 @@ pub fn init(gpu: &GpuInfo) {
         crate::arch::memory::map_mmio_window(bar1_base as u64, bar1_size);
         if crate::arch::memory::translate(bar0 as u64).is_none() {
             serial_println!("[NVIDIA] Error: BAR0 physical address (0x{:X}) is not mapped in the identity map. Probe aborted.", bar0);
-            serial_println!(":: kepler: no-device ::");
+            serial_println!(":: kepler: probe-abort bar1-not-64bit ::");
             return;
         }
     }
@@ -111,7 +111,7 @@ pub fn init(gpu: &GpuInfo) {
     #[cfg(target_arch = "aarch64")]
     {
         serial_println!("[NVIDIA] Error: BAR0 mapping unimplemented on aarch64. Probe aborted.");
-        serial_println!(":: kepler: no-device ::");
+        serial_println!(":: kepler: probe-abort bar0-unmapped ::");
         return;
     }
 
@@ -140,13 +140,18 @@ pub fn init(gpu: &GpuInfo) {
         serial_println!("[NVIDIA] Disabled interrupts via PMC_INTR_EN");
 
         // 5. VRAM Detection & Initialization
-        let vram_size = mmio_read(bar0, regs::NV_PFB_RAM_AMOUNT) as usize;
-        if vram_size < 16 * 1024 * 1024 || vram_size > 32usize * 1024 * 1024 * 1024 {
-            serial_println!("[NVIDIA] Error: Absurd VRAM size reported ({} bytes). Probe aborted.", vram_size);
-            serial_println!(":: kepler: no-device ::");
+        let vram_size_mb = mmio_read(bar0, regs::NV_PFB_RAM_AMOUNT) as usize;
+        let vram_size = vram_size_mb * 1024 * 1024;
+        
+        let is_power_of_two = vram_size_mb.is_power_of_two();
+        let is_3n_over_4 = (vram_size_mb % 3 == 0) && (vram_size_mb / 3 * 4).is_power_of_two();
+
+        if vram_size < 16 * 1024 * 1024 || vram_size > 32usize * 1024 * 1024 * 1024 || (!is_power_of_two && !is_3n_over_4) {
+            serial_println!("[NVIDIA] Error: Absurd VRAM size reported ({} MB). Probe aborted.", vram_size_mb);
+            serial_println!(":: kepler: probe-abort vram-size-invalid ::");
             return;
         }
-        serial_println!("[NVIDIA] PFB Reported VRAM Size: {} MB", vram_size >> 20);
+        serial_println!("[NVIDIA] PFB Reported VRAM Size: {} MB", vram_size_mb);
 
         let mut vram_allocator = VramAllocator::new(bar1_base, bar1_size, vram_size);
         serial_println!("[NVIDIA] Initialized VRAM bump allocator. Total BAR1 visible: {} MB", vram_allocator.total_size >> 20);
@@ -161,7 +166,7 @@ pub fn init(gpu: &GpuInfo) {
         serial_println!("[NVIDIA] PGRAPH Engine Status (0x400000): 0x{:08X}. Requires firmware for full 2D/3D.", pgraph_status);
 
         // 8. Phase 4: 3D Foundation - PFIFO and Pushbuffer setup
-        if option_env!("UNAOS_KEPLER_FIFO").is_some() {
+        if cfg!(feature = "nvidia-kepler-fifo") {
             serial_println!("[NVIDIA] Starting PFIFO initialization...");
             
             // Enable PFIFO (bit 8)
@@ -257,6 +262,10 @@ pub fn init(gpu: &GpuInfo) {
                                         core::ptr::write_volatile((bar1 + userd_off + 0x90) as *mut u32, 1); // increment GP_PUT to 1
                                     }
 
+                                    let gp_get = unsafe { core::ptr::read_volatile((bar1 + userd_off + 0x8c) as *const u32) };
+                                    let gp_put = unsafe { core::ptr::read_volatile((bar1 + userd_off + 0x90) as *const u32) };
+                                    serial_println!(":: kepler: fifo-layout userd={:X} fence={:X} gp={}/{} ::", userd_off, fence_off, gp_put, gp_get);
+
                                     // Poll VRAM for fence value
                                     serial_println!("[NVIDIA] Polling for fence value 0x{:08X} at VRAM offset 0x{:X}", fence_val, fence_off);
                                     let mut found = false;
@@ -271,7 +280,9 @@ pub fn init(gpu: &GpuInfo) {
                                     if found {
                                         serial_println!(":: kepler: fence {:08X} ::", fence_val);
                                     } else {
-                                        serial_println!(":: kepler: takeover-abort fence-timeout ::");
+                                        let gp_get = unsafe { core::ptr::read_volatile((bar1 + userd_off + 0x8c) as *const u32) };
+                                        let ch_stat = mmio_read(bar0, 0x800004 + (chan_id as usize * 8));
+                                        serial_println!(":: kepler: takeover-abort fence-timeout gp_get={} ch_stat={:08X} ::", gp_get, ch_stat);
                                     }
                                 }
                             }
@@ -288,18 +299,20 @@ pub fn init(gpu: &GpuInfo) {
 unsafe fn takeover_display(gpu: &GpuInfo, bar0: usize, allocator: &mut VramAllocator) -> Option<usize> {
     serial_println!("[NVIDIA] Starting PDISPLAY takeover sequence...");
 
-    if option_env!("UNAOS_KEPLER_TAKEOVER").is_none() {
-        serial_println!("[NVIDIA] UNAOS_KEPLER_TAKEOVER knob not set. Skipping display takeover.");
+    if !cfg!(feature = "nvidia-kepler-takeover") {
+        serial_println!("[NVIDIA] UNAOS_KEPLER_TAKEOVER feature not set. Skipping display takeover.");
         return None;
     }
     
-    // 1. Get the current GOP framebuffer physical address
-    let gop_fb_phys = crate::video::WRITER.lock().base();
-    if gop_fb_phys == 0 {
-        serial_println!("[NVIDIA] Warning: video::WRITER has no base address. Cannot correlate scanout.");
-        serial_println!(":: kepler: takeover-abort no-gop ::");
-        return None;
-    }
+    // 1. Get current framebuffer base address
+    let gop_fb_phys = match crate::video::fbcon::current_base() {
+        Some(base) => base,
+        None => {
+            serial_println!("[NVIDIA] Warning: video::fbcon has no base address.");
+            serial_println!(":: kepler: takeover-abort no-gop ::");
+            return None;
+        }
+    };
     serial_println!("[NVIDIA] GOP Framebuffer Physical Base: 0x{:X}", gop_fb_phys);
 
     // 2. Determine VRAM aperture base (BAR1 or BAR2 depending on 64-bit BAR0)
@@ -312,12 +325,12 @@ unsafe fn takeover_display(gpu: &GpuInfo, bar0: usize, allocator: &mut VramAlloc
     serial_println!("[NVIDIA] VRAM Base (BAR1): 0x{:X}", vram_base);
 
     // Calculate the VRAM offset of the GOP framebuffer
-    if gop_fb_phys < vram_base {
+    if gop_fb_phys < vram_base as u64 {
         serial_println!("[NVIDIA] Warning: GOP FB is not within VRAM BAR1.");
         serial_println!(":: kepler: takeover-abort gop-not-in-vram {:X} ::", gop_fb_phys);
         return None;
     }
-    let gop_vram_offset = gop_fb_phys - vram_base;
+    let gop_vram_offset = (gop_fb_phys - vram_base as u64) as usize;
     serial_println!("[NVIDIA] GOP VRAM Offset: 0x{:X}", gop_vram_offset);
 
     // 3. Read PDISPLAY Head State
@@ -347,7 +360,7 @@ unsafe fn takeover_display(gpu: &GpuInfo, bar0: usize, allocator: &mut VramAlloc
     }
 
     if let Some(head) = found_head {
-        let gop_info = crate::video::WRITER.lock().info();
+        let gop_info = crate::video::fbcon::current_info().unwrap();
         let expected_width = gop_info.width as u32;
         let expected_height = gop_info.height as u32;
         
@@ -360,13 +373,97 @@ unsafe fn takeover_display(gpu: &GpuInfo, bar0: usize, allocator: &mut VramAlloc
             return None;
         }
 
-        serial_println!("[NVIDIA] Found active display head {} at PDISPLAY+0x{:04X}.", head, 0x460 + head * 0x300);
-        
+        let bar1 = vram_base; // Already defined earlier
+        let expected_height = (raw_size >> 16) & 0xFFFF;
+        serial_println!("[NVIDIA] Head {} is active. Address: 0x{:X}, Size: {}x{}",
+            found_head.unwrap(), raw_addr, expected_width, expected_height);
+            
+        // 4. Double buffer: Copy GOP contents to new surface before the flip
         let fb_size = (expected_width * expected_height * 4) as usize; 
         if let Some(new_fb_offset) = allocator.alloc(fb_size) {
             serial_println!("[NVIDIA] Allocated new Framebuffer at VRAM offset 0x{:X}", new_fb_offset);
-            serial_println!("[NVIDIA] Phase 2/3: Framebuffer handoff and allocation logic verified.");
-            return Some(new_fb_offset);
+            
+            // Perform the double-buffer copy
+            // The GOP surface is at `gop_vram_offset`, the new surface is at `new_fb_offset`
+            // Map both to copy. Since we already have VRAM mapped linearly at `bar1`, we can do it directly.
+            serial_println!("[NVIDIA] Copying GOP contents to new surface...");
+            let src = (bar1 + gop_vram_offset) as *const u8;
+            let dst = (bar1 + new_fb_offset) as *mut u8;
+            core::ptr::copy_nonoverlapping(src, dst, fb_size);
+            
+            // 5. EVO core-channel push to flip the surface address
+            // Allocate a 4KB pushbuffer for the EVO core channel
+            if let Some(evo_pb_off) = allocator.alloc(4096) {
+                serial_println!("[NVIDIA] Allocated EVO Pushbuffer at VRAM offset 0x{:X}", evo_pb_off);
+                
+                let evo_pb = (bar1 + evo_pb_off) as *mut u32;
+                let head = found_head.unwrap();
+                
+                // Write the methods to the pushbuffer
+                // Envytools: NV_EVO_CORE methods (size << 18) | method
+                // OFFSET_ORIGIN (0x460 for head 0, +0x300 per head) (envytools: nv_evo.xml)
+                let offset_origin_method = 0x400 + (head * 0x300) + 0x60; 
+                // UPDATE (0x80) (envytools: nv_evo.xml)
+                let update_method = 0x80;
+                
+                let new_addr = (new_fb_offset >> 8) as u32;
+                
+                // 1 dword to OFFSET_ORIGIN
+                core::ptr::write_volatile(evo_pb.add(0), (1 << 18) | (offset_origin_method as u32));
+                core::ptr::write_volatile(evo_pb.add(1), new_addr);
+                
+                // 1 dword to UPDATE
+                core::ptr::write_volatile(evo_pb.add(2), (1 << 18) | (update_method as u32));
+                core::ptr::write_volatile(evo_pb.add(3), 0x00000000);
+                
+                // Initialize the GF119+ EVO core channel (NV_PDISPLAY + 0x490)
+                // (Offsets derived from nouveau/gf119.c as envytools is sparse here)
+                let core_ctrl = regs::NV_PDISPLAY_BASE + 0x490;
+                
+                // Deactivate channel first
+                mmio_write(bar0, core_ctrl, mmio_read(bar0, core_ctrl) & !0x10);
+                mmio_write(bar0, core_ctrl, mmio_read(bar0, core_ctrl) & !0x03);
+                
+                // Delay briefly for inactivation (blind)
+                for _ in 0..100000 { core::hint::spin_loop(); }
+                
+                // Bind our new pushbuffer
+                let push_handle = (evo_pb_off >> 8) as u32 | 0x1; // VRAM target
+                mmio_write(bar0, core_ctrl + 0x4, push_handle); // PB address
+                mmio_write(bar0, core_ctrl + 0x8, 0x00010000);
+                mmio_write(bar0, core_ctrl + 0xC, 0x00000001);
+                
+                // Set DISP_USER PUT to 0
+                // DISP_USER array offset 0x640000 (g80_pdisplay.xml)
+                mmio_write(bar0, 0x640000, 0);
+                
+                // Activate channel
+                mmio_write(bar0, core_ctrl, mmio_read(bar0, core_ctrl) | 0x10);
+                mmio_write(bar0, core_ctrl, mmio_read(bar0, core_ctrl) | 0x01000013);
+                
+                // Submit the pushbuffer by writing the new PUT value (4 dwords = 16 bytes)
+                mmio_write(bar0, 0x640000, 16);
+                
+                // Wait for latch by reading back OFFSET_ORIGIN via MMIO shadow
+                let head_base = regs::NV_PDISPLAY_BASE + 0x400 + (head * 0x300) + 0x60;
+                let mut latched = false;
+                for _ in 0..1000000 {
+                    if mmio_read(bar0, head_base) == new_addr {
+                        latched = true;
+                        break;
+                    }
+                    core::hint::spin_loop();
+                }
+                
+                if latched {
+                    serial_println!("[NVIDIA] EVO flip successful! Head {} latched to 0x{:X}", head, new_addr);
+                    return Some(new_fb_offset);
+                } else {
+                    serial_println!("[NVIDIA] EVO flip timeout! OFFSET_ORIGIN readback did not match.");
+                    serial_println!(":: kepler: takeover-abort evo-flip-timeout ::");
+                    return None;
+                }
+            }
         } else {
             serial_println!("[NVIDIA] Error: Failed to allocate VRAM for new framebuffer.");
         }

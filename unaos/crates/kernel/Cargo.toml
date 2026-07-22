@@ -8,6 +8,8 @@ license = "GPL-3.0-or-later"
 default = []
 # Cleanroom GPU driver features
 nvidia-kepler = []
+nvidia-kepler-takeover = []
+nvidia-kepler-fifo = []
 intel-ivb = []
 # DEFAULT-QUIET (witness): gate the battery of EL0/kernel fixtures that RE-PROVE long-metal-confirmed
 # facts on every boot (x86: nmi-self-fire + canonical-guard + U1a/U1b/U2-0a/U3/U3.5 + the
