@@ -16,7 +16,6 @@ use objc2_app_kit::{
 use objc2_foundation::{MainThreadMarker, NSObjectProtocol};
 use std::cell::RefCell;
 
-pub mod browser;
 pub mod gpu_view;
 pub mod image_view;
 pub mod meter;
@@ -25,6 +24,9 @@ pub mod spline;
 pub mod tone_panel;
 pub mod window_chrome;
 pub mod workspace;
+pub mod tetra_eval;
+pub mod button;
+pub mod text_field;
 
 // The UI bootstrapping closure
 type BootstrapFn = Box<
@@ -382,6 +384,18 @@ impl Backend {
         });
 
         Self { delegate }
+    }
+
+    pub fn new_tetra_vessel(
+        app_id: &str,
+        title: &str,
+        content_size: (f64, f64),
+        tetra_node: crate::tetra::TetraNode,
+        synapse: bandy::Synapse,
+    ) -> Self {
+        Self::new_vessel(app_id, title, content_size, move |_window| {
+            crate::platforms::macos::tetra_eval::eval_tetra(tetra_node, synapse.clone())
+        })
     }
 
     pub fn run(&self) {

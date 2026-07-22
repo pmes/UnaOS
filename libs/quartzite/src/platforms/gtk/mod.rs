@@ -185,13 +185,28 @@ impl Backend {
         Self { app }
     }
 
+    pub fn new_tetra_vessel(
+        app_id: &str,
+        title: &str,
+        content_size: (f64, f64),
+        tetra_node: crate::tetra::TetraNode,
+        synapse: bandy::Synapse,
+    ) -> Self {
+        Self::new_vessel(app_id, title, content_size, move |_window| {
+            crate::platforms::gtk::tetra_eval::eval_tetra(tetra_node, synapse.clone())
+        })
+    }
+
     pub fn run(&self) {
         self.app.run();
     }
 }
 
+pub mod tetra_eval;
+pub mod button;
+pub mod text_field;
+pub mod image_view;
 // pub mod spline;
 // pub mod mega_bar;
 // pub mod types;
 // pub mod workspace;
-pub mod browser;

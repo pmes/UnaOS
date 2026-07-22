@@ -37,10 +37,36 @@ impl Default for StreamTetra {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum TextAction {
+    OpenDocument, // Maps text to SMessage::OpenDocument { url }
+    ConsoleInput, // Maps text to SMessage::ConsoleInput(text)
+    BrowserText,  // Maps text to SMessage::BrowserText(text)
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum TetraNode {
     Matrix, // Future MatrixTetra (Sidebar)
     Stream(StreamTetra), // Structuring Comms
     Empty,  // Placeholder
+
+    // Layout
+    VStack(Vec<TetraNode>),
+    HStack(Vec<TetraNode>),
+
+    // Controls
+    Button {
+        id: String,
+        label: String,
+        action: bandy::SMessage,
+    },
+    TextField {
+        id: String,
+        placeholder: String,
+        action: TextAction,
+    },
+    Surface {
+        id: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

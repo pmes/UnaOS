@@ -51,7 +51,6 @@ pub use platforms::macos::Backend;
 #[cfg(target_os = "macos")]
 pub use platforms::macos::meter;
 #[cfg(target_os = "macos")]
-pub use platforms::macos::browser;
 
 // --- Windows 11+ (WinUI/Win32) ---
 #[cfg(target_os = "windows")]
@@ -69,7 +68,6 @@ pub type NativeView = gtk4::Widget;
 #[cfg(all(target_os = "linux", feature = "gtk"))]
 pub use platforms::gtk::Backend;
 #[cfg(all(target_os = "linux", feature = "gtk"))]
-pub use platforms::gtk::browser;
 
 // --- Linux (*nix) / Qt ---
 #[cfg(all(target_os = "linux", feature = "qt"))]

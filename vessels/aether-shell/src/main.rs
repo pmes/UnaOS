@@ -1,7 +1,7 @@
 use std::thread;
 use tokio::task::LocalSet;
 use bandy::{SMessage, Synapse};
-use quartzite::browser::bootstrap_browser;
+// use quartzite::browser::bootstrap_browser;
 use aether::AetherEngine;
 
 fn main() {
@@ -88,10 +88,31 @@ fn main() {
         });
     });
 
-    let rx = synapse.subscribe();
-    let tx = synapse.clone();
+    let aether_ui = quartzite::tetra::TetraNode::VStack(vec![
+        quartzite::tetra::TetraNode::HStack(vec![
+            quartzite::tetra::TetraNode::Button {
+                id: "back".into(),
+                label: "<".into(),
+                action: bandy::SMessage::BrowserNavBack,
+            },
+            quartzite::tetra::TetraNode::Button {
+                id: "fwd".into(),
+                label: ">".into(),
+                action: bandy::SMessage::BrowserNavForward,
+            },
+            quartzite::tetra::TetraNode::Button {
+                id: "reload".into(),
+                label: "C".into(),
+                action: bandy::SMessage::BrowserNavReload,
+            },
+            quartzite::tetra::TetraNode::TextField {
+                id: "url".into(),
+                placeholder: "Enter URL...".into(),
+                action: quartzite::tetra::TextAction::OpenDocument,
+            },
+        ]),
+        quartzite::tetra::TetraNode::Surface { id: "viewport".into() }
+    ]);
     
-    quartzite::Backend::new_vessel("org.unaos.aether", "Aether Browser", (800.0, 600.0), move |window| {
-        bootstrap_browser(window, tx, rx)
-    }).run();
+    quartzite::Backend::new_tetra_vessel("org.unaos.aether", "Aether Browser", (800.0, 600.0), aether_ui, synapse.clone()).run();
 }
