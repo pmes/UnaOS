@@ -619,6 +619,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // 4b''') so the invariant TSC is calibrated; silent if this machine has no invariant TSC.
         unaos_kernel::arch::syscall::clock_x1_witness();
 
+        // SNTP-X86 GATE (witness battery): the deterministic x86 SNTP client battery — canned datagrams
+        // through the shared parser + the `crate::clock` anchor path, no NIC/network required. Proves x86
+        // SNTP correctness under `./arroyo test` in any environment (the live boot sync in `service_net`
+        // stays honest-but-INCOMPLETE under hermetic slirp). Prints `:: SNTP-X86-GATE: ... PASS [w=0x1f] ::`.
+        #[cfg(all(target_arch = "x86_64", feature = "witness", feature = "smolnet"))]
+        unaos_kernel::smolnet::sntp_x86_gate();
+
         // U1a: x86 ring-3 round-trip (the aarch64 M6a equivalent). Turn scheduling on (the default
         // test build never enables the feature-gated demo below, so the APs would otherwise idle in
         // `wait_and_run`), map the ring-3 window, then drop a scheduled task to ring 3 on an AP: it

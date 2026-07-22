@@ -66,5 +66,13 @@ until a manual `setdate` — the seam is what CLOCK-1 delivers; x86 SNTP is a fu
 * **fs-mtime adoption** — converge `fat_stamp()`/`now()` onto the Unix anchor so a networked
   board stamps real mtimes from the SNTP sync (today the FAT anchor is operator-only). This is
   the arc that unifies the two anchors into one.
-* **x86 SNTP client** (rmbp track) — gives the x86 civil clock a network writer; the CLOCK-1
-  seam is already in place, so it is purely a genet-side addition.
+* **x86 SNTP client** (SNTP-X86, ✅ landed) — the x86 smolnet stack now has its own SNTP client
+  (`crate::smolnet::sntp_sync_once` / `witness_tick_sntp`), so the x86 civil clock gets a network
+  writer exactly as the pi/genet client does. One RFC 4330 client-mode request over the persistent
+  UDP stack, parsed by the shared, hostile-input-hardened `crate::net_sntp` parser (ported from
+  PI-NET-16; genet migrates onto it in a later fold), then `set_anchor(unix, mono, Sntp{stratum})`.
+  Since smolnet has no DNS client yet (SOCK-8+) it targets the live default gateway (the DHCP-leased
+  router, or slirp's 10.0.2.2). Success emits `:: SMOLNET: [sntp] <server> -> <ISO> (stratum N) ::`;
+  the honest one-liner otherwise. The deterministic `sntp_x86_gate` (`witness` battery) proves the
+  parser + anchor path with canned datagrams in any environment — `:: SNTP-X86-GATE: ... PASS
+  [w=0x1f] ::`. On real rMBP hardware behind an NTP-answering router, `time` then shows synced time.

@@ -1205,6 +1205,12 @@ pub fn service_net() {
     // hermetic slirp never connects in, so it prints an honest PENDING note and keeps listening cheaply.
     #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
     crate::smolnet::witness_tick6();
+    // SNTP-X86 (knob-on): the smoltcp SNTP client — one-shot, syncs the shared `crate::clock` from the
+    // live gateway over SNTP. Same post-guard discipline (its UDP pump short-locks NET_DEVICE per ring op).
+    // Hermetically the gateway is silent, so it prints the honest `no reply` note; on real hardware with an
+    // NTP-answering router it anchors `time` for real.
+    #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+    crate::smolnet::witness_tick_sntp();
 }
 
 /// Outcome of a blocking [`ping`] (rendered by the `ping` shell command).
