@@ -808,6 +808,11 @@ mod metal {
             let len = frame.len().min(BUF_SIZE);
             let buf = unsafe { self.tx_bufs.add(i * BUF_SIZE) };
             unsafe { core::ptr::copy_nonoverlapping(frame.as_ptr(), buf, len) };
+            // PI-GENET-7 FIX (the TX mirror of GENET-5): the buffers are CACHED memory, so the frame
+            // bytes just written can sit in the D-cache while the MAC DMA-reads stale DRAM — TDMA
+            // drains (descriptors consumed) yet nothing real egresses. Clean the buffer's lines to the
+            // point of coherency BEFORE publishing the descriptor. (No-op cost on a coherent line.)
+            clean_dcache(buf as u64, len);
             let d = self.tx_desc(i);
             let phys = (self.tx_bufs as u64) + (i * BUF_SIZE) as u64;
             self.w(d + DMA_DESC_ADDRESS_LO, phys as u32);
@@ -1021,6 +1026,24 @@ mod metal {
             core::arch::asm!("dsb sy", options(nostack, preserves_flags));
             while p < end {
                 core::arch::asm!("dc ivac, {}", in(reg) p, options(nostack, preserves_flags));
+                p += CACHE_LINE as u64;
+            }
+            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+        }
+    }
+
+    /// PI-GENET-7: clean (write back) `[addr, addr+len)` to the point of coherency (`dc cvac`, one op
+    /// per 64-byte line, bracketed by `dsb`) so the MAC's TX DMA reads the frame the CPU just wrote,
+    /// not a stale DRAM line. The TX mirror of `invalidate_dcache`.
+    #[inline]
+    fn clean_dcache(addr: u64, len: usize) {
+        const CACHE_LINE: usize = 64;
+        let mut p = addr & !(CACHE_LINE as u64 - 1);
+        let end = addr + len as u64;
+        unsafe {
+            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+            while p < end {
+                core::arch::asm!("dc cvac, {}", in(reg) p, options(nostack, preserves_flags));
                 p += CACHE_LINE as u64;
             }
             core::arch::asm!("dsb sy", options(nostack, preserves_flags));
