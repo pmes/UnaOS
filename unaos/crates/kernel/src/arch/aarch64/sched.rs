@@ -560,6 +560,20 @@ fn spawn_inner(
         user_ttbr0: 0, // kernel task: no root switch (kernel mappings are Global in every root)
     });
     RUN_QUEUES[cpu].lock().push(task);
+    // PI-SCHED-1 — placement witness. The scheduler PINS a task to the caller-chosen core and never
+    // migrates it (see `Task.cpu` / `make_ready`), so the placement is decided entirely at the spawn
+    // site; this line makes that decision auditable (the probe's core deliverable). Gated behind the
+    // `pi` feature so it fires on the Raspberry Pi target (where the two core-placement sightings that
+    // motivated this arc were observed) and in the `kernel8-test` gate, while staying BYTE-IDENTICAL for
+    // the jetson/tegra + virt builds that share this aarch64 module. FLAG: this file is shared across the
+    // aarch64 sub-tracks — the addition is log-only and behind `pi`, so it cannot alter scheduling on any
+    // track. (The Pi `kernel8` build never sets `sched_demo`, so `pi` is the gate that makes the probe
+    // visible on the actual target.)
+    #[cfg(feature = "pi")]
+    serial_println!(
+        ":: SCHED: task '{}' -> core {} (policy: caller-pinned, no-migrate; prio {}) ::",
+        name, cpu, priority
+    );
     // Wake the target if it's a different, possibly-idle core (same-core needs no poke).
     poke_cpu(cpu);
     id
@@ -646,6 +660,13 @@ fn spawn_user_inner(
         user_ttbr0,
     });
     RUN_QUEUES[cpu].lock().push(task);
+    // PI-SCHED-1 — placement witness for EL0 tasks (the vug/midden GUI-app loads land here — the
+    // "all vug load on core 2" sighting). Same `pi`-gating + rationale as `spawn_inner`.
+    #[cfg(feature = "pi")]
+    serial_println!(
+        ":: SCHED: task '{}' -> core {} (policy: caller-pinned EL0, no-migrate) ::",
+        name, cpu
+    );
     poke_cpu(cpu);
     id
 }
@@ -2017,6 +2038,25 @@ fn capstone_body(_: usize) {
     //    until the worker's completion post, at least one cross-core).
     cap_report("join", true);
     serial_println!(":: CAPSTONE COMPLETE — all 6 sync primitives verified in one boot ::");
+    // PI-SCHED-1 — one-shot per-core load snapshot at a steady state (after the capstone has driven
+    // real cross-core dispatch on every AP). `pi`-gated (fires on the target + `kernel8-test`, byte-
+    // identical for jetson/virt); `core_load_report()` itself is callable on demand for future paths.
+    #[cfg(feature = "pi")]
+    core_load_report();
+}
+
+/// PI-SCHED-1 — per-core task-slice activation snapshot (introspection only). Prints each core's
+/// dispatch BUSY vs IDLE pass counts, taken from the `CPU_BUSY`/`CPU_IDLE` pulse counters that
+/// `dispatch_next` already maintains (BUSY bumped when a task is dispatched, IDLE when the run queue is
+/// empty). A one-shot witness — call it on demand (e.g. a future shell command) or once at steady
+/// state. NEVER read on a scheduling path; it only observes the counters. Left `pub` (no dead-code
+/// warning) so the call site can stay behind `sched_demo` without gating the function itself.
+pub fn core_load_report() {
+    for cpu in 0..NUM_CPUS {
+        let busy = CPU_BUSY[cpu].load(Ordering::Relaxed);
+        let idle = CPU_IDLE[cpu].load(Ordering::Relaxed);
+        serial_println!(":: SCHED-LOAD: core {} busy {} idle {} ::", cpu, busy, idle);
+    }
 }
 
 /// M3b/M4a/M4-capstone: turn on preemptive scheduling and put a workload on the APs, then flip
