@@ -2375,6 +2375,48 @@ impl XhciController {
                 hw_wait_budget(), "USBSTS.HCH=0 (run)");
             serial_println!("xHCI: Controller Started!");
 
+            // PIUSB-9 witness (aarch64-only, minimal — x86 behaviour byte-identical): dump the
+            // controller-side view of the command ring + interrupter/event ring the instant RS
+            // latched. This is the "at RS=1" snapshot hypothesis (c) reads off. The VL805's
+            // ENABLE_SLOT never completes on metal (watchdog cmd=0x2002240 in heap PA); before we
+            // even doorbell a command, prove the poll-path plumbing the controller must fetch from:
+            //   * CRCR.CRR (bit3): 0 here is expected (ring idle, no command pushed yet); it should
+            //     go 1 once the first doorbell lands — the enable-slot watchdog witness reads it there.
+            //   * ERSTSZ==1 / ERSTBA==erst_table_phys / ERDP==event_ring_phys: if any reads back 0 or
+            //     a value we never wrote, the interrupter is misprogrammed and NO event can post on the
+            //     polled path regardless of IMAN — that is hypothesis (c). IMAN.IE is irrelevant to
+            //     polling but dumped so a masked-interrupter VL805 quirk is visible if it gates posting.
+            //   * DCBAAP readback: the controller DMA-reads this at the first slot command; a 0/torn
+            //     value would fail ENABLE_SLOT downstream.
+            // All heap pointers must be < 4 GiB and VA==PA (identity map) for the RC_BAR2 inbound
+            // window (RAM@0, 4 GiB) to translate them — the audit confirmed the heap is at PA
+            // 0x0200_0000..0x0500_0000, so these readbacks double as an inbound-window sanity check.
+            #[cfg(target_arch = "aarch64")]
+            {
+                let crcr = core::ptr::read_volatile((self.op_base + 0x18) as *const u64);
+                let dcbaap = core::ptr::read_volatile((self.op_base + 0x30) as *const u64);
+                let usbcmd_rb = core::ptr::read_volatile(usbcmd_ptr);
+                let usbsts_rb = core::ptr::read_volatile(usbsts_ptr);
+                serial_println!(
+                    "xHCI: [aarch64] RS=1 witness: USBCMD={:#x}(RS={} INTE={}) USBSTS={:#x}(HCH={} HSE={} CNR={} HCE={}) CRCR={:#018x}(CRR={} CS={} CA={} RCS={}) DCBAAP={:#018x}",
+                    usbcmd_rb, usbcmd_rb & 1, (usbcmd_rb >> 2) & 1,
+                    usbsts_rb, usbsts_rb & 1, (usbsts_rb >> 2) & 1, (usbsts_rb >> 11) & 1, (usbsts_rb >> 12) & 1,
+                    crcr, (crcr >> 3) & 1, (crcr >> 1) & 1, (crcr >> 2) & 1, crcr & 1, dcbaap
+                );
+                let ir0 = XHCI_IR0_BASE.load(Ordering::Acquire);
+                if ir0 != 0 {
+                    let iman = core::ptr::read_volatile(ir0 as *const u32);
+                    let erstsz = core::ptr::read_volatile((ir0 + 0x08) as *const u32);
+                    let erstba = core::ptr::read_volatile((ir0 + 0x10) as *const u64);
+                    let erdp = core::ptr::read_volatile((ir0 + 0x18) as *const u64);
+                    serial_println!(
+                        "xHCI: [aarch64] RS=1 witness: IR0={:#x} IMAN={:#x}(IP={} IE={}) ERSTSZ={} ERSTBA={:#018x} ERDP={:#018x}(EHB={}) ERST[0].ring={:#018x}",
+                        ir0, iman, iman & 1, (iman >> 1) & 1, erstsz, erstba, erdp, (erdp >> 3) & 1,
+                        core::ptr::read_unaligned(core::ptr::addr_of!(ERST_TABLE.entries[0].ring_address))
+                    );
+                }
+            }
+
             // Power on all ports. Use the REAL MaxPorts (HCSPARAMS1 bits 24:31),
             // captured as self.max_ports. The previous code read bits 0:7, which is
             // MaxSlots (64 here) — powering 64 nonexistent ports.
@@ -3019,6 +3061,35 @@ impl XhciController {
                     // Pi 4 (VL805) now gets the same forensic line.
                     #[cfg(target_arch = "aarch64")]
                     {
+                        // PIUSB-9 witness (hypotheses b/d): read the command ring's controller-side
+                        // state AT the stall. The doorbell was rung when the command was pushed; by now
+                        // a healthy controller has fetched the TRB and posted a completion. CRCR.CRR
+                        // (bit3) is the discriminator:
+                        //   * CRR=1  -> the controller ACCEPTED the doorbell and the ring is RUNNING; it
+                        //              fetched (or is fetching) the ENABLE_SLOT TRB but never posted the
+                        //              completion event => a DMA/event-posting fault (hypothesis b: the
+                        //              completion write never reached DRAM / event ring), NOT a dead ring.
+                        //   * CRR=0  -> the controller NEVER started fetching: either the doorbell write
+                        //              was not observed, or the controller is running dead firmware that
+                        //              accepts MMIO but processes nothing (hypothesis d). CS/CA would only
+                        //              be set by an abort handshake we have not issued yet, so both 0 here.
+                        // enum_cmd_phys is the pushed TRB's PA (heap, <4 GiB); print it beside CRCR so the
+                        // log ties the stuck command to the ring the controller is (or isn't) fetching.
+                        let (crcr, usbcmd, usbsts) = unsafe {
+                            (
+                                core::ptr::read_volatile((self.op_base + 0x18) as *const u64),
+                                core::ptr::read_volatile(self.op_base as *const u32),
+                                core::ptr::read_volatile((self.op_base + 0x04) as *const u32),
+                            )
+                        };
+                        serial_println!(
+                            "xHCI: [aarch64] enable-slot stall witness: cmd_trb={:#x} CRCR={:#018x}(CRR={} CS={} CA={} RCS={}) USBCMD={:#x}(RS={}) USBSTS={:#x}(HCH={} HSE={} CNR={} HCE={}) => {}",
+                            self.enum_cmd_phys, crcr, (crcr >> 3) & 1, (crcr >> 1) & 1, (crcr >> 2) & 1, crcr & 1,
+                            usbcmd, usbcmd & 1,
+                            usbsts, usbsts & 1, (usbsts >> 2) & 1, (usbsts >> 11) & 1, (usbsts >> 12) & 1,
+                            if (crcr >> 3) & 1 == 1 { "CRR=1 ring RUNNING — fetched, no completion posted (DMA/event fault, hyp b)" }
+                            else { "CRR=0 ring NEVER STARTED — doorbell not observed or dead fw (hyp d)" }
+                        );
                         let landed = {
                             EVENT_RING
                                 .lock()
