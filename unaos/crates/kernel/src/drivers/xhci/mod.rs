@@ -18,6 +18,7 @@ pub mod trb;
 pub mod ring;
 pub mod event;
 pub mod context;
+pub mod dma_coherency;
 pub mod ftdi;
 // STOR-1: the interrupt-driven storage service task + BlockRequest submit/complete. x86_64 + the
 // `irqstorage` knob only — the default build never links it, so the staged storage path is untouched.
@@ -1144,10 +1145,24 @@ impl XhciController {
     /// the pushed TRB — the Command Completion event echoes it, so callers can match their own
     /// completion exactly (the root enumeration FSM tracks it in `enum_cmd_phys`; the sync hub
     /// path computes the same address in `run_command_sync`).
+    /// XHCI-COHERENCE: the context-bearing commands (ADDRESS_DEVICE=11, CONFIGURE_ENDPOINT=12,
+    /// EVALUATE_CONTEXT=13) carry an Input Context physical address in `parameter`; the controller
+    /// DMA-reads that struct when it consumes the command. Clean it to DRAM here — ONE chokepoint
+    /// for every context command, whichever builder produced it — so a non-snooping controller reads
+    /// the freshly-written context. No-op on coherent x86_64.
+    #[inline]
+    fn clean_cmd_input_ctx(trb: &Trb) {
+        let cmd_type = (trb.control >> 10) & 0x3F;
+        if matches!(cmd_type, 11 | 12 | 13) && trb.parameter != 0 {
+            dma_coherency::clean(trb.parameter as usize, core::mem::size_of::<InputContext>());
+        }
+    }
+
     pub fn send_command(&mut self, trb: Trb) -> Result<u64, &'static str> {
         if self.cmd_ring_stopped {
             return Err("command ring stopped (abort in progress)");
         }
+        Self::clean_cmd_input_ctx(&trb);
         let phys = {
             let mut g = COMMAND_RING.lock();
             let ring = g.as_mut().ok_or("command ring not initialised")?;
@@ -1708,6 +1723,9 @@ impl XhciController {
                                     serial_println!("xHCI: >>> INTERCEPTED DESCRIPTOR EVENT (Slot 1 EP 1) <<<");
                                     unsafe {
                                         let desc_buf = self.slots[slot_id as usize].descriptor_buffer;
+                                        // XHCI-COHERENCE: consumer boundary — the descriptor was
+                                        // DMA-written by the controller; invalidate before reading. No-op x86.
+                                        dma_coherency::inval(desc_buf as usize, 256);
                                         let desc_data = core::slice::from_raw_parts(desc_buf, 256);
                                         let vid = (desc_data[8] as u16) | ((desc_data[9] as u16) << 8);
                                     let pid = (desc_data[10] as u16) | ((desc_data[11] as u16) << 8);
@@ -1915,6 +1933,9 @@ impl XhciController {
                                             return;
                                         }
                                         if let Some(data_buf_ptr) = slot.mouse_data_buffer {
+                                            // XHCI-COHERENCE: consumer boundary — the interrupt-IN
+                                            // report was DMA-written; invalidate before decoding. No-op x86.
+                                            dma_coherency::inval(data_buf_ptr as usize, 512);
                                             let data_data = core::slice::from_raw_parts(data_buf_ptr, 512);
                                             let _buttons = data_data[0];
                                             // Metal diagnostic (parallels the keyboard dump): show the raw
@@ -2010,6 +2031,9 @@ impl XhciController {
                                             return;
                                         }
                                         if let Some(data_buf_ptr) = slot.data_buffer {
+                                            // XHCI-COHERENCE: consumer boundary — the boot-keyboard
+                                            // report was DMA-written; invalidate before decoding. No-op x86.
+                                            dma_coherency::inval(data_buf_ptr as usize, 8);
                                             let report = core::slice::from_raw_parts(data_buf_ptr, 8);
                                             // Metal diagnostic: dump the raw report bytes so that if a keyboard
                                             // interrupt-IN transfer arrives but decodes to nothing (e.g. the device is
@@ -2064,6 +2088,9 @@ impl XhciController {
                                         let change_buf = slot.hub_change_buffer;
                                         if let Some(buf_ptr) = change_buf {
                                             let len = Self::hub_change_bitmap_len(nbr_ports);
+                                            // XHCI-COHERENCE: consumer boundary — the status-change
+                                            // bitmap was DMA-written; invalidate before reading. No-op x86.
+                                            dma_coherency::inval(buf_ptr as usize, len);
                                             let bytes = core::slice::from_raw_parts(buf_ptr, len);
                                             // Bit 0 = the hub itself (over-current / local change).
                                             if (bytes[0] & 1) != 0 {
@@ -2206,8 +2233,16 @@ impl XhciController {
                         }
                         // Identity-mapped heap: the allocation's virtual address IS its bus/phys address.
                         *arr.add(i) = buf as u64;
+                        // XHCI-COHERENCE: the controller DMA-reads/writes each scratchpad buffer as its
+                        // private working memory; clean the zeroed buffer to DRAM so a non-snooping
+                        // controller does not fault on stale contents. No-op x86.
+                        dma_coherency::clean(buf as usize, page_bytes);
                     }
                     *dcbaap_ptr.add(0) = arr as u64;
+                    // XHCI-COHERENCE: clean the scratchpad pointer array and the DCBAA[0] entry that
+                    // points at it — both are controller-read before/at RS=1. No-op x86.
+                    dma_coherency::clean(arr as usize, max_scratchpad * 8);
+                    dma_coherency::clean(dcbaap_ptr as usize, core::mem::size_of::<u64>());
                     serial_println!(
                         "xHCI: scratchpad: {} buffer(s) x {} bytes; DCBAA[0]={:#x} (heap PA in [{:#x},{:#x}))",
                         max_scratchpad, page_bytes, arr as u64, heap_lo, heap_hi
@@ -2233,6 +2268,15 @@ impl XhciController {
             // SAVE THIS for later use in the interrupt/event loop (ERDP updates)
             EVENT_RING_PHYS_BASE = event_ring_phys;
 
+            // XHCI-COHERENCE: zeroed-handoff for the event ring. `EventRing::new()` zeroed the ring
+            // into (dirty) cache lines; clean+invalidate so those zeros reach DRAM before the
+            // controller DMA-writes events into it, and no stale CPU line shadows the first event.
+            // This is the driver-internal replacement for PIUSB-8's external event-ring bridge.
+            dma_coherency::clean_inval(
+                event_ring_phys as usize,
+                event::EVENT_RING_SIZE * core::mem::size_of::<Trb>(),
+            );
+
             // 1. Calculate Runtime Base
             // Read RTSOFF (Offset 0x18 in Capability Regs)
             let rtsoff_ptr = (self.base_addr + 0x18) as *const u32;
@@ -2252,6 +2296,12 @@ impl XhciController {
                 _rsvd: 0,
                 _rsvd2: 0,
             };
+            // XHCI-COHERENCE: producer boundary — the controller DMA-reads the ERST when the
+            // interrupter is armed / ERSTBA is written below; clean the table to DRAM. No-op x86.
+            dma_coherency::clean(
+                core::ptr::addr_of!(ERST_TABLE) as usize,
+                core::mem::size_of::<ErstTable>(),
+            );
             EVENT_RING_PHYS_BASE = event_ring_phys;
 
             // 3. Write ERSTSZ (Segment Table Size) - Offset 0x08
@@ -2871,6 +2921,12 @@ impl XhciController {
                         unsafe {
                             if !self.dcbaap.is_null() {
                                 *self.dcbaap.add(slot as usize) = 0;
+                                // XHCI-COHERENCE: clean the cleared DCBAA entry so the controller
+                                // sees the slot released, not a stale output-context pointer. No-op x86.
+                                dma_coherency::clean(
+                                    self.dcbaap.add(slot as usize) as usize,
+                                    core::mem::size_of::<u64>(),
+                                );
                             }
                         }
                     }
@@ -2953,22 +3009,25 @@ impl XhciController {
                     serial_println!(
                         "xHCI: WATCHDOG: port {} stuck at '{}' (cmd={:#x}).",
                         port, self.enum_stage, self.enum_cmd_phys);
-                    // JB3 boot-8 experiment (Tegra-only, one line per watchdog): the SMMU
-                    // passes our stream fault-free yet no event ever appears — distinguish
-                    // "the controller's DMA write never reached DRAM" from "it landed but
-                    // the CPU's cached line is stale (fabric snooping dead post-EBS)" by
-                    // invalidating the CPU's copy of the event ring and re-checking.
-                    #[cfg(feature = "tegra")]
+                    // XHCI-COHERENCE (was JB3 boot-8, tegra-only; now general aarch64): on a
+                    // non-coherent bus the SMMU/RC passes our stream fault-free yet no event appears —
+                    // distinguish "the controller's DMA write never reached DRAM" from "it landed but
+                    // the CPU's cached line is stale". `has_event()` now invalidates the dequeue TRB's
+                    // line before its read on ALL aarch64 targets (the unified `dma_coherency` seam
+                    // that replaced `has_event_after_invalidate`), so this watchdog line simply
+                    // re-checks post-invalidate. Behaviour on tegra is identical to the old hack; the
+                    // Pi 4 (VL805) now gets the same forensic line.
+                    #[cfg(target_arch = "aarch64")]
                     {
                         let landed = {
                             EVENT_RING
                                 .lock()
                                 .as_ref()
-                                .map(|r| r.has_event_after_invalidate())
+                                .map(|r| r.has_event())
                                 .unwrap_or(false)
                         };
                         serial_println!(
-                            "xHCI: [tegra] event ring after dc-civac: {}",
+                            "xHCI: [aarch64] event ring after dc-civac: {}",
                             if landed {
                                 "EVENT PRESENT — writes LAND, CPU snoop broken (coherency)"
                             } else {
@@ -3256,6 +3315,11 @@ impl XhciController {
             let output_ctx_phys = output_ctx_virt as u64;
             let input_ctx_phys = input_ctx_virt as u64;
 
+            // XHCI-COHERENCE: zeroed-handoff boundary — the controller DMA-WRITES the output (device)
+            // context during ADDRESS_DEVICE; clean+invalidate so the zeros reach DRAM and the CPU's
+            // later read-back observes the controller's data, not a stale zero line. No-op x86.
+            dma_coherency::clean_inval(output_ctx_virt as usize, core::mem::size_of::<DeviceContext>());
+
             // Store them in slot
             let slot = &mut self.slots[slot_id as usize];
             slot.input_context = input_ctx_virt;
@@ -3268,6 +3332,9 @@ impl XhciController {
             // Point the Slot ID entry to the Output Context
             let dcbaap_ptr = self.dcbaap;
             *dcbaap_ptr.add(slot_id as usize) = output_ctx_phys;
+            // XHCI-COHERENCE: producer boundary — the controller reads DCBAA[slot] to locate the
+            // output context during ADDRESS_DEVICE; clean the 8-byte entry to DRAM. No-op x86.
+            dma_coherency::clean(dcbaap_ptr.add(slot_id as usize) as usize, core::mem::size_of::<u64>());
             serial_println!("xHCI: DCBAAP[{}] linked to {:#x}", slot_id, output_ctx_phys);
 
             // 2. FILL INPUT CONTEXT (MANUAL OFFSET CALCULATION)
@@ -3358,7 +3425,11 @@ impl XhciController {
             let input_ctx_virt = slot.input_context;
             let output_ctx_virt = slot.output_context;
             let base_ptr = input_ctx_virt as *mut u32;
-            
+            // XHCI-COHERENCE: consumer boundary — the slot context copied out of the output context
+            // below was DMA-written by the controller (ADDRESS_DEVICE); invalidate so the copy reads
+            // fresh, not a stale cached line. No-op x86.
+            dma_coherency::inval(output_ctx_virt as usize, core::mem::size_of::<DeviceContext>());
+
             let bulk_in_ring = ring::TransferRing::new(16);
             let bulk_in_phys = bulk_in_ring.get_ptr();
             slot.bulk_in_ring = Some(bulk_in_ring);
@@ -3504,6 +3575,11 @@ impl XhciController {
 
         let tag = self.build_cbw(cbw_phys as *mut u8, data_len, dir, cdb);
         unsafe { core::ptr::write_bytes(csw_phys as *mut u8, 0, 13); }
+        // XHCI-COHERENCE: the CBW is CPU-written and DMA-read by the controller (bulk OUT) — clean it
+        // to DRAM before its doorbell. The CSW was just zeroed and the controller will DMA-write it —
+        // clean+invalidate the zeroed handoff so the later read observes the controller's status.
+        dma_coherency::clean(cbw_phys as usize, 31);
+        dma_coherency::clean_inval(csw_phys as usize, 13);
 
         // BOT phases are SERIALIZED: CBW -> [DATA] -> CSW, each transfer completing before
         // the next is queued — mirroring the Linux usb-storage bulk transport. We must NOT
@@ -3529,6 +3605,12 @@ impl XhciController {
                     self.slots[slot_id as usize].bulk_in_ring.as_mut().unwrap()
                 };
                 let base = ring.get_ptr();
+                // XHCI-COHERENCE: an OUT data stage's buffer is CPU-written and DMA-read — clean it
+                // to DRAM before the doorbell below. (An IN data buffer is invalidated after the
+                // transfer, at its read site.) No-op x86.
+                if data_out {
+                    dma_coherency::clean(data_phys as usize, data_len as usize);
+                }
                 let idx = ring.push(Trb { parameter: data_phys, status: data_len,
                     control: (1 << 10) | (1 << 5) | (1 << 2) }).unwrap_or(0);
                 (if data_out { out_dci } else { in_dci }, base + (idx as u64) * 16)
@@ -3544,6 +3626,12 @@ impl XhciController {
                 serial_println!("xHCI: BOT data stage error, completion code {}", code);
                 return if code == 4 || code == 6 { Err(BotError::Stall) }
                        else { Err(BotError::TransferError(code)) };
+            }
+            // XHCI-COHERENCE: consumer boundary — an IN data stage's buffer was DMA-written by the
+            // controller; invalidate it here (ONE chokepoint for every SCSI IN reader: INQUIRY,
+            // READ CAPACITY, block reads) so callers parse fresh DRAM. No-op x86.
+            if !data_out {
+                dma_coherency::inval(data_phys as usize, data_len as usize);
             }
         } else {
             // No data stage: fetch+send the CBW now; the CSW is queued next.
@@ -3569,6 +3657,8 @@ impl XhciController {
 
         // 4) Validate the CSW.
         unsafe {
+            // XHCI-COHERENCE: consumer boundary — the CSW was DMA-written; invalidate before reading.
+            dma_coherency::inval(csw_phys as usize, 13);
             let csw = core::slice::from_raw_parts(csw_phys as *const u8, 13);
             let sig = (csw[0] as u32) | ((csw[1] as u32) << 8) | ((csw[2] as u32) << 16) | ((csw[3] as u32) << 24);
             let csw_tag = (csw[4] as u32) | ((csw[5] as u32) << 8) | ((csw[6] as u32) << 16) | ((csw[7] as u32) << 24);
@@ -4018,6 +4108,9 @@ impl XhciController {
     /// OUT doorbell, and pump the event ring until its completion arrives (matched by TRB address).
     /// Returns the completion code. A slimmer twin of `run_bot_stage` (single stage, no CBW/CSW).
     fn ftdi_tx_stage(&mut self, slot_id: u8, out_dci: u8, data_phys: u64, len: u32) -> Result<u8, ()> {
+        // XHCI-COHERENCE: the TX staging buffer is CPU-written (drained from the serial ring) and
+        // DMA-read by the controller (bulk OUT); clean it to DRAM before its doorbell. No-op x86.
+        dma_coherency::clean(data_phys as usize, len as usize);
         let wait_trb_phys = {
             let ring = self.slots[slot_id as usize].bulk_out_ring.as_mut().ok_or(())?;
             let base = ring.get_ptr();
@@ -4075,6 +4168,14 @@ impl XhciController {
             | ((w_index as u64) << 32)
             | ((w_length as u64) << 48);
 
+        // XHCI-COHERENCE: producer-side eviction for the data buffer. Some callers pre-zero the buffer
+        // (e.g. the 8-byte MPS0-learn) or reuse it, leaving dirty CPU lines; clean them to DRAM BEFORE
+        // the controller DMAs so a delayed eviction can't later clobber its write (IN) or so it reads
+        // current bytes (OUT). The IN buffer is invalidated again after completion, below. No-op x86.
+        if w_length > 0 {
+            dma_coherency::clean(data_phys as usize, w_length as usize);
+        }
+
         // Setup stage. TRT: 0 = no data, 2 = OUT data, 3 = IN data.
         let trt: u32 = if w_length == 0 { 0 } else if dir_in { 3 } else { 2 };
         self.push_ep0(slot_id, Trb { parameter: setup, status: 8, control: (2 << 10) | (1 << 6) | (trt << 16) });
@@ -4109,6 +4210,12 @@ impl XhciController {
         let pump = self.pump_until_ep0_done(2000);
         let pending = self.ep0_pending.take();
         pump?;
+        // XHCI-COHERENCE: consumer boundary (one chokepoint for every control-IN reader — device /
+        // config / hub-status descriptors all land here). The controller DMA-wrote `data_phys`;
+        // invalidate the CPU's stale lines so the caller parses fresh DRAM. No-op x86.
+        if dir_in && w_length > 0 {
+            dma_coherency::inval(data_phys as usize, w_length as usize);
+        }
         let p = pending.ok_or(())?;
         // XENUM-3 M1: surface the actual transferred length. If the DATA stage reported a residual,
         // the read was short; with no data stage (zero-length control) the full "length" is 0.
@@ -4151,6 +4258,7 @@ impl XhciController {
             serial_println!("xHCI: run_command_sync refused: command ring stopped (abort in progress).");
             return Err(());
         }
+        Self::clean_cmd_input_ctx(&trb);
         let cmd_phys = {
             let mut g = COMMAND_RING.lock();
             let ring = g.as_mut().ok_or(())?;
@@ -4378,6 +4486,9 @@ impl XhciController {
             core::ptr::write_bytes(base_ptr as *mut u8, 0, core::mem::size_of::<InputContext>());
             base_ptr.add(1).write_volatile(1); // Input Control: A0 (slot context) only
 
+            // XHCI-COHERENCE: consumer boundary — invalidate the controller-written output context
+            // before copying its slot context out. No-op x86.
+            dma_coherency::inval(output_ctx_virt as usize, core::mem::size_of::<DeviceContext>());
             let slot_ctx = base_ptr.add(CTX_WORDS);
             for i in 0..8 {
                 slot_ctx.add(i).write_volatile(core::ptr::read_volatile((output_ctx_virt as *const u32).add(i)));
@@ -4506,6 +4617,9 @@ impl XhciController {
             let base_ptr = input_ctx_virt as *mut u32;
             core::ptr::write_bytes(base_ptr as *mut u8, 0, core::mem::size_of::<InputContext>());
 
+            // XHCI-COHERENCE: consumer boundary — invalidate the controller-written output context
+            // before reading its slot context (speed) and copying it out. No-op x86.
+            dma_coherency::inval(output_ctx_virt as usize, core::mem::size_of::<DeviceContext>());
             // Interval encoding follows the hub's own speed (from its output slot context).
             let out_dw0 = core::ptr::read_volatile((output_ctx_virt as *const u32).add(0));
             let speed = (out_dw0 >> 20) & 0x0F;
@@ -4564,6 +4678,9 @@ impl XhciController {
         let Some(buf_ptr) = buf else { return; };
         let dci = ((ep & 0x0F) * 2 + 1) as u32; // interrupt IN
         let read_len = Self::hub_change_bitmap_len(nbr_ports) as u32;
+        // XHCI-COHERENCE: evict stale/dirty lines of the change buffer before arming the
+        // interrupt-IN read (controller DMA-writes it; completion path invalidates before reading).
+        dma_coherency::clean(buf_ptr as usize, read_len as usize);
         let in_trb = Trb {
             parameter: buf_ptr as u64,
             status: read_len,
@@ -4796,6 +4913,11 @@ impl XhciController {
             let ep0_ring = ring::TransferRing::new(16);
             let ep0_ring_phys = ep0_ring.get_ptr();
 
+            // XHCI-COHERENCE: zeroed-handoff — the controller DMA-writes this output context during
+            // ADDRESS_DEVICE; clean+invalidate so its zeros reach DRAM and the CPU's read-back is
+            // fresh. No-op x86.
+            dma_coherency::clean_inval(output_ctx_virt as usize, core::mem::size_of::<DeviceContext>());
+
             let slot = &mut self.slots[slot_id as usize];
             slot.input_context = input_ctx_virt;
             slot.output_context = output_ctx_virt;
@@ -4812,6 +4934,9 @@ impl XhciController {
             slot.route_depth = depth;
 
             *self.dcbaap.add(slot_id as usize) = output_ctx_virt as u64;
+            // XHCI-COHERENCE: producer boundary — clean the DCBAA entry the controller reads to
+            // locate this slot's output context. No-op x86.
+            dma_coherency::clean(self.dcbaap.add(slot_id as usize) as usize, core::mem::size_of::<u64>());
 
             let base_ptr = input_ctx_virt as *mut u32;
             core::ptr::write_bytes(base_ptr as *mut u8, 0, core::mem::size_of::<InputContext>());
@@ -4938,6 +5063,9 @@ impl XhciController {
             // EP Type / CErr / TR Dequeue Pointer ADDRESS_DEVICE established; only MPS0 (DW1 bits 31:16)
             // changes. (Copying from 2*CTX_WORDS of the zeroed input would submit an EP-Type=0 / null-ring
             // context that strict silicon rejects.)
+            // XHCI-COHERENCE: consumer boundary — the live EP0 context copied out here was
+            // DMA-written by the controller at ADDRESS_DEVICE; invalidate before reading. No-op x86.
+            dma_coherency::inval(output_ctx_virt as usize, core::mem::size_of::<DeviceContext>());
             let ep0_out = (output_ctx_virt as *const u32).add(CTX_WORDS);
             let ep0_in = base_ptr.add(2 * CTX_WORDS);
             for i in 0..8 {
@@ -5442,6 +5570,9 @@ impl XhciController {
             // the live EP Type / CErr / TR Dequeue Pointer that ADDRESS_DEVICE established; only
             // MPS0 changes. (Copying from 2*CTX_WORDS here would grab the zeroed EP1 region and
             // submit an EP-Type=0 / null-ring context the strict Tegra FW rejects with code 17.)
+            // XHCI-COHERENCE: consumer boundary — the live EP0 context copied out here was
+            // DMA-written by the controller at ADDRESS_DEVICE; invalidate before reading. No-op x86.
+            dma_coherency::inval(output_ctx_virt as usize, core::mem::size_of::<DeviceContext>());
             let ep0_out = (output_ctx_virt as *const u32).add(CTX_WORDS);
             let ep0_in = base_ptr.add(2 * CTX_WORDS);
             for i in 0..8 {
@@ -5477,6 +5608,10 @@ impl XhciController {
             serial_println!("xHCI: CRITICAL ERROR - Descriptor Buffer Phys Addr is 0!");
             return;
         }
+        // XHCI-COHERENCE: evict any dirty/stale lines of the (reused) descriptor buffer before the
+        // controller DMA-writes the descriptor into it; the async completion parse invalidates before
+        // reading. No-op x86.
+        dma_coherency::clean(desc_phys as usize, 18);
 
         // 1. Setup Stage
         // 0x80 06 00 01 00 00 12 00
@@ -5525,6 +5660,9 @@ impl XhciController {
             serial_println!("xHCI: CRITICAL ERROR - Descriptor Buffer Phys Addr is 0!");
             return;
         }
+        // XHCI-COHERENCE: evict stale lines of the reused descriptor buffer before the controller
+        // DMA-writes the config descriptor (parse invalidates before reading). No-op x86.
+        dma_coherency::clean(desc_phys as usize, 64);
 
         // 1. Setup Stage
         // bmRequestType = 0x80 (Device to Host, Standard, Device)
@@ -5603,6 +5741,9 @@ impl XhciController {
             let output_ctx_virt = slot.output_context;
             let base_ptr = input_ctx_virt as *mut u32;
 
+            // XHCI-COHERENCE: consumer boundary — invalidate the controller-written output context
+            // before reading its speed and copying the slot context out below. No-op x86.
+            dma_coherency::inval(output_ctx_virt as usize, core::mem::size_of::<DeviceContext>());
             // Speed (from the output slot context) governs the interval encoding for both endpoints.
             let out_dw0 = core::ptr::read_volatile((output_ctx_virt as *const u32).add(0));
             let speed = (out_dw0 >> 20) & 0x0F;
@@ -5751,6 +5892,10 @@ impl XhciController {
             let dci = (ep_num * 2) + if dir_in { 1 } else { 0 };
 
             let data_phys = self.slots[slot_id as usize].mouse_data_buffer.unwrap() as u64;
+            // XHCI-COHERENCE: evict any stale/dirty lines of the report buffer before arming the
+            // interrupt-IN read (the controller DMA-writes it; the completion path invalidates before
+            // decoding). No-op x86.
+            dma_coherency::clean(data_phys as usize, self.slots[slot_id as usize].mouse_mps as usize);
 
             let in_trb = Trb {
                 parameter: data_phys,
@@ -5776,6 +5921,10 @@ impl XhciController {
             let dci = (ep_num * 2) + if dir_in { 1 } else { 0 };
 
             let data_phys = self.slots[slot_id as usize].data_buffer.unwrap() as u64;
+            // XHCI-COHERENCE: evict stale/dirty lines of the report buffer before arming the
+            // interrupt-IN read (controller DMA-writes it; completion path invalidates before
+            // decoding). No-op x86.
+            dma_coherency::clean(data_phys as usize, self.slots[slot_id as usize].keyboard_mps as usize);
 
             let in_trb = Trb {
                 parameter: data_phys,

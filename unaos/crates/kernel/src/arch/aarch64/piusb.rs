@@ -124,62 +124,16 @@ fn dsb() {
     unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
 }
 
-// ─── PIUSB-8: non-coherent-DMA cache maintenance for the xHCI ring/ERST structures. ────────────────
+// ─── PIUSB-8 → XHCI-COHERENCE: the external non-coherent-DMA bridge is RETIRED. ─────────────────────
 // The VL805 reaches host RAM through the BCM2711 RC's inbound window (RC_BAR2, RAM@0 4 GiB), and that
-// PCIe path is NOT I/O-coherent — a PCIe master read/write does NOT snoop the A72 data caches. The
-// shared `drivers/xhci` driver allocates its command/event rings + ERST + contexts from the normal
-// (Write-Back cacheable) heap and does its "flush" with a bare `fence(SeqCst)` (a `dmb`, which orders
-// CPU observers but never evicts a dirty line to DRAM). On an I/O-coherent host (the rMBP's Intel xHCI)
-// that is enough; on the Pi 4 it is not — so the controller DMA-reads a STALE command ring (never sees
-// the freshly-pushed ENABLE_SLOT, whose cycle bit is still only in the CPU's cache) and the CPU polls a
-// STALE event ring (never sees the controller's DMA-written completion). That is the enable-slot
-// WATCHDOG: the command is never consumed and no completion is ever observed. The Jetson (tegra) path
-// already carries the event-ring half of this (`EventRing::has_event_after_invalidate`, feature-gated);
-// the Pi build had neither half. We bridge it here, from the attach side, over the structures the
-// driver exposes (`COMMAND_RING`/`EVENT_RING`/`ERST_TABLE` are pub) WITHOUT editing the shared driver.
-// Line size is the A72's 64 B; kernel low RAM is identity-mapped so the CPU VA equals the PA the VL805
-// DMAs to. NOTE (durable fix, cross-lane): the complete cure — covering the per-device Input/Device
-// contexts, DCBAA, scratchpad and transfer rings the driver allocates internally and does NOT expose —
-// is to map ALL xHCI DMA memory Normal-NonCacheable (or add clean/invalidate at every producer/consumer
-// boundary) inside `drivers/xhci`; that is shared kernel-core, outside this arc's aarch64 lane.
-const CACHE_LINE: u64 = 64;
-
-/// Clean the D-cache to the Point of Coherency over `[base, base+len)` — pushes CPU-written bytes out
-/// to DRAM so the (non-snooping) VL805 reads current data. Use on CPU-produced DMA memory (command
-/// ring, ERST) before the controller fetches it.
-fn dcache_clean_poc(base: u64, len: u64) {
-    if base == 0 || len == 0 {
-        return;
-    }
-    let mut p = base & !(CACHE_LINE - 1);
-    let end = base + len;
-    while p < end {
-        unsafe { core::arch::asm!("dc cvac, {}", in(reg) p, options(nostack, preserves_flags)) };
-        p += CACHE_LINE;
-    }
-    dsb();
-}
-
-/// Clean+invalidate the D-cache to PoC over `[base, base+len)` — drops the CPU's stale cached copy so
-/// the next read observes the controller's DMA-written data. Use on controller-produced DMA memory
-/// (event ring) before the CPU reads it. Safe for a region the CPU only reads.
-fn dcache_clean_inval_poc(base: u64, len: u64) {
-    if base == 0 || len == 0 {
-        return;
-    }
-    let mut p = base & !(CACHE_LINE - 1);
-    let end = base + len;
-    while p < end {
-        unsafe { core::arch::asm!("dc civac, {}", in(reg) p, options(nostack, preserves_flags)) };
-        p += CACHE_LINE;
-    }
-    dsb();
-}
-
-/// Byte spans of the two rings `enumerate()` seats (command ring = `TransferRing::new(256)`, event ring
-/// = `EVENT_RING_SIZE` TRBs), each TRB 16 B. Used to bound the cache-maintenance sweeps above.
-const XHCI_CMD_RING_BYTES: u64 = 256 * 16;
-const XHCI_EVT_RING_BYTES: u64 = xhci::event::EVENT_RING_SIZE as u64 * 16;
+// PCIe path is NOT I/O-coherent — a PCIe master read/write does NOT snoop the A72 data caches. PIUSB-8
+// bridged this from the attach side over the three pub structures the driver exposed (command/event
+// rings + ERST), which was partial by construction — the per-device Input/Device contexts, DCBAA,
+// scratchpad and transfer rings the driver allocates internally were unreachable from here. The durable
+// cure now lives INSIDE the shared driver: the `drivers/xhci::dma_coherency` seam (gated
+// `target_arch = "aarch64"`, no-op on x86) cleans/invalidates every DMA structure at its
+// producer/consumer boundary, so the Pi 4 (and the Jetson) are coherent by construction with NO cache
+// maintenance in this file. The old `dcache_*` helpers + ring-span constants are gone with the bridge.
 
 /// Open-bus / firmware-fill poison signatures — NONE is ever live data (PI-V3D-1 false-PASS rule).
 /// `0xdeaddead` joined the list after R22 sitting 2: it is the BCM2711 RC's abort-fill for a
@@ -1178,12 +1132,11 @@ pub fn enumerate() {
             )
         };
         let erst_table_phys = &raw mut xhci::ERST_TABLE as u64;
-        // PIUSB-8: flush the CPU-initialised DMA structures to DRAM BEFORE the controller (a non-snooping
-        // PCIe master) latches them — the ERST the interrupter reads, the zeroed event ring (so a stale
-        // cache line is not misread as a phantom event), and the command ring. Non-coherent Pi 4 PCIe.
-        dcache_clean_poc(erst_table_phys, core::mem::size_of::<xhci::event::ErstTable>() as u64);
-        dcache_clean_inval_poc(event_ring_phys, XHCI_EVT_RING_BYTES);
-        dcache_clean_poc(command_ring_phys, XHCI_CMD_RING_BYTES);
+        // XHCI-COHERENCE: the shared `drivers/xhci` driver is now SELF-COHERENT — it cleans the ERST
+        // (init_interrupter), the zeroed event ring (init_interrupter clean+invalidate), and every
+        // ring's zeroed handoff (TransferRing::new) via its internal `dma_coherency` seam. PIUSB-8's
+        // external pre-RS flush of these same structures is therefore redundant and has been removed;
+        // maintaining it here would double-apply the same `dc c*vac` for no effect.
         serial_println!("{}   programming interrupter + rings (runtime regs), then RS=1 ::", P);
         x.init_interrupter(event_ring_phys, erst_table_phys);
         x.init_pointers(command_ring_phys);
@@ -1191,13 +1144,16 @@ pub fn enumerate() {
         *xhci::XHCI_CONTROLLER.lock() = Some(x);
     }
 
-    // PIUSB-8: ring bases for the per-iteration non-coherent-DMA maintenance below. The base of each
-    // ring never moves after construction, so capture once (get_ptr is pub; the lock is uncontended
-    // here, single-threaded pre-pump).
+    // XHCI-COHERENCE witness: the shared driver now self-maintains every DMA structure through its
+    // internal `dma_coherency` seam (command/transfer TRBs cleaned at push, the event ring
+    // invalidated at each dequeue, contexts/DCBAA/ERST/scratchpad cleaned before their command / the
+    // Run bit, transfer buffers invalidated before the CPU reads them). The external PIUSB-8 bridge
+    // that used to clean/invalidate these from here is retired — the Pi 4 (non-coherent PCIe → VL805)
+    // is covered by the same `target_arch = "aarch64"` path as the Jetson.
     let cmd_ring_base = xhci::COMMAND_RING.lock().as_ref().map(|r| r.get_ptr()).unwrap_or(0);
     let evt_ring_base = xhci::EVENT_RING.lock().as_ref().map(|r| r.get_ptr()).unwrap_or(0);
     serial_println!(
-        "{} enumerate: non-coherent-DMA bridge ARMED (cmd ring @ {:#x} clean-before-doorbell, event ring @ {:#x} invalidate-before-poll) — Pi 4 PCIe is not I/O-coherent; drivers/xhci does no cache maintenance off the tegra path ::",
+        "{} enumerate: xHCI self-coherent (cmd ring @ {:#x}, event ring @ {:#x}) — drivers/xhci dma_coherency seam maintains all DMA memory on aarch64; no external bridge ::",
         P, cmd_ring_base, evt_ring_base
     );
 
@@ -1212,15 +1168,10 @@ pub fn enumerate() {
     let mut armed: Option<(u8, u8)> = None;
     let mut armed_at: u64 = 0;
     loop {
-        // PIUSB-8 non-coherent-DMA bridge (Pi 4 PCIe does not snoop the A72 caches):
-        //  * invalidate the event ring BEFORE polling so the CPU observes the controller's DMA-written
-        //    completion/transfer events instead of a stale cached copy;
-        //  * clean the command ring AFTER servicing (below) so any TRB the FSM just pushed is in DRAM
-        //    before the controller's next fetch (an ENUM RECOVERY re-ring then reads it fresh).
-        // Without this the ENABLE_SLOT command is never consumed and its completion never seen — the
-        // enable-slot WATCHDOG. Cheap (two 4 KiB sweeps) and safe (event ring is CPU-read-only → civac;
-        // command ring is CPU-written → cvac only, never invalidated).
-        dcache_clean_inval_poc(evt_ring_base, XHCI_EVT_RING_BYTES);
+        // XHCI-COHERENCE: no external cache maintenance here anymore. The driver's `poll_events`
+        // invalidates the event ring at each dequeue (`EventRing::has_event`) and cleans every command
+        // TRB it pushes (`ring::write_trb`), so the enable-slot handshake is coherent by construction
+        // on aarch64 without this loop touching the caches.
         let (armed_now, storage_slot, storage_ready) = {
             let mut guard = xhci::XHCI_CONTROLLER.lock();
             let x = guard.as_mut().unwrap();
@@ -1236,9 +1187,6 @@ pub fn enumerate() {
                 x.storage_slot != 0 && x.storage_note == "ready",
             )
         };
-        // PIUSB-8: flush any command TRB the FSM pushed this iteration out to DRAM so the controller's
-        // next fetch (including an ENUM RECOVERY re-ring) reads it fresh, not from the CPU's cache.
-        dcache_clean_poc(cmd_ring_base, XHCI_CMD_RING_BYTES);
         if armed.is_none() {
             if let Some((slot, port)) = armed_now {
                 serial_println!("{} enumerate: keyboard ARMED (slot {}, root port {}) -> PASS ::", P, slot, port);

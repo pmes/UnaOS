@@ -16,6 +16,7 @@
 
 use core::alloc::Layout;
 use super::trb::Trb;
+use super::dma_coherency;
 
 
 const RING_SIZE: usize = 16;
@@ -49,6 +50,11 @@ unsafe impl Sync for TransferRing {}
 impl TransferRing {
     pub fn new(num_trbs: usize) -> Self {
         let ptr = allocate_ring(num_trbs) as *mut Trb;
+        // XHCI-COHERENCE: zeroed-handoff — `alloc_zeroed` writes the ring's zeros into (dirty) cache
+        // lines; on a non-coherent bus the controller would otherwise read stale DRAM (a phantom
+        // valid cycle bit in an un-pushed slot). Clean the whole zeroed ring to DRAM before the
+        // controller can fetch from it. No-op x86.
+        dma_coherency::clean(ptr as usize, num_trbs * core::mem::size_of::<Trb>());
         Self {
             trbs: ptr,
             num_trbs,
@@ -69,6 +75,9 @@ impl TransferRing {
             // FLUSH CACHE (Directive J11:FLUSH-01)
             let trb_ptr = self.trbs.add(index);
             core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            // XHCI-COHERENCE: producer boundary — push the No-Op TRB out to DRAM before its
+            // doorbell so the non-snooping controller fetches the fresh cycle bit (no-op on x86).
+            dma_coherency::clean(trb_ptr as usize, core::mem::size_of::<Trb>());
             let control_val = (*trb_ptr).control;
             serial_println!("xHCI DEBUG: CMD TRB = {:#x}", control_val);
         }
@@ -132,7 +141,12 @@ impl TransferRing {
 
     fn write_trb(&mut self, index: usize, trb: Trb) {
         unsafe {
-            core::ptr::write_volatile(self.trbs.add(index), trb);
+            let p = self.trbs.add(index);
+            core::ptr::write_volatile(p, trb);
+            // XHCI-COHERENCE: producer boundary — the controller (command ring or any transfer
+            // ring) DMA-reads this TRB after its doorbell; clean the line to DRAM so a non-snooping
+            // master sees it (cycle bit included). No-op on coherent x86_64.
+            dma_coherency::clean(p as usize, core::mem::size_of::<Trb>());
         }
     }
 
@@ -179,6 +193,9 @@ impl TransferRing {
             let cycle = core::ptr::read_volatile(p).control & 1;
             core::ptr::write_volatile(p, Trb { parameter: 0, status: 0, control: (23 << 10) | cycle });
             core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            // XHCI-COHERENCE: producer boundary — the defused No-Op must reach DRAM before the ring
+            // is restarted (doorbell 0), else the controller re-reads the wedged command. No-op x86.
+            dma_coherency::clean(p as usize, core::mem::size_of::<Trb>());
         }
         true
     }

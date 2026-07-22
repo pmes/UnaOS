@@ -22,6 +22,50 @@ tablet) are delivered through the same controller.
 | `event.rs` | The event ring (`EventRing`, the ERST table). |
 | `ring.rs` | Command/transfer rings (`TransferRing`). |
 | `context.rs` | Device/slot/endpoint context structures. |
+| `dma_coherency.rs` | The single DMA cache-maintenance seam (`clean` / `clean_inval` / `inval`). |
+
+### DMA coherency (XHCI-COHERENCE)
+
+Every xHCI DMA structure (command ring, event ring + ERST, DCBAA, device/input
+contexts, scratchpad, transfer rings, transfer buffers) is allocated from the
+Write-Back **cacheable** heap. On an I/O-coherent host (x86_64, and the Intel xHCI
+on the 2012 rMBP) the CPU caches and the controller's DMA path snoop each other, so
+a bare `fence`/`dmb` suffices. On a **non-coherent** bus they do not: the BCM2711
+PCIe root complex → VIA VL805 path never snoops the A72 caches (PIUSB-8), and the
+Tegra234 XUSB fabric loses its `dma-coherent` handoff at ExitBootServices. There the
+CPU must **clean** (write-back) memory it produces before the controller reads it,
+and **invalidate** memory the controller produces before the CPU reads it.
+
+`dma_coherency` is the one seam that does this. Its three functions are gated by
+`target_arch`, **not** by a board feature — so both aarch64 boards (Pi 4, Jetson)
+get maintenance from a single path, while on x86_64 every function is an
+`#[inline(always)]` empty body that compiles to nothing (the coherent path is
+byte-identical to before the seam existed). Maintenance is applied at each
+producer/consumer boundary:
+
+| Structure | Boundary | Op | Site |
+| --- | --- | --- | --- |
+| Command / transfer ring TRBs | after CPU push, before doorbell | clean | `ring::write_trb` / `push_noop` / `replace_with_noop` |
+| Ring zeroed handoff | after `alloc_zeroed`, before controller fetch | clean | `ring::TransferRing::new` |
+| Event ring dequeue | before CPU read | clean+inval | `event::EventRing::has_event` |
+| Event ring zeroed handoff | before controller writes | clean+inval | `init_interrupter` |
+| Input context | before its command | clean | `send_command` / `run_command_sync` (one chokepoint for ADDRESS_DEVICE/CONFIGURE_ENDPOINT/EVALUATE_CONTEXT) |
+| Output (device) context | zeroed handoff / before CPU read-back | clean+inval / inval | `address_device`, `address_downstream` / the context builders |
+| DCBAA entry | after CPU write, before controller read | clean | `address_device`, `address_downstream`, disable-slot |
+| DCBAA[0] + scratchpad array/buffers | before RS=1 | clean | `init_pointers` |
+| ERST table | before ERSTBA / RS=1 | clean | `init_interrupter` |
+| Control-IN data (descriptors, hub status) | evict before / invalidate after transfer | clean / inval | `sync_control`, `request_device_descriptor`, `request_configuration_descriptor` |
+| Interrupt-IN reports (kbd/mouse/hub-change) | evict before arm / invalidate before decode | clean / inval | `queue_*_read` / the transfer-event dispatch |
+| BOT CBW / CSW / SCSI data | clean OUT, invalidate IN | clean / clean+inval / inval | `bot_transfer` |
+| FTDI TX staging buffer | before doorbell | clean | `ftdi_tx_stage` |
+
+This **unifies** the old tegra-only `EventRing::has_event_after_invalidate` (its
+`dc civac` is now the general aarch64 `has_event` path — identical behavior on
+tegra, and the Pi 4 gets it too) and **retires** PIUSB-8's external attach-side
+bridge in `arch/aarch64/piusb.rs` (which could only reach the three `pub` ring/ERST
+structures; the internal contexts/DCBAA/scratchpad/transfer buffers are now covered
+by construction). The Pi 4 enable-slot stall — the controller DMA-reading a stale
+command ring and the CPU polling a stale event ring — is fixed at the source.
 
 ---
 
