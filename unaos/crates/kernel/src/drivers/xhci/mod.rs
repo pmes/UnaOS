@@ -408,7 +408,56 @@ pub static mut ERST_TABLE: ErstTable = ErstTable { entries: [ErstEntry { ring_ad
 // Store Physical Address of the Event Ring for Runtime ERDP updates
 static mut EVENT_RING_PHYS_BASE: u64 = 0;
 
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+
+/// PIUSB-10: set true once USBSTS.CNR has been observed clear (in `init_interrupter`, immediately
+/// before the first op/runtime-register programming). `init_pointers` and `start` refuse to write
+/// their registers if this is false, so a controller that never reports Ready (a wedged CNR) fails
+/// LOUD and honestly instead of silently dropping every CRCR/DCBAAP/ERST/RS write into a not-ready
+/// controller. Defaults true so a path that never runs the wait behaves exactly as before; on x86
+/// CNR clears near-instantly, so this is always true and the guards are behaviourally invisible.
+static XHCI_CNR_OK: AtomicBool = AtomicBool::new(true);
+
+/// xHCI 5.4.1 / 4.2: after a Chip Hardware Reset (HCRST) software MUST NOT write ANY Doorbell,
+/// Operational, or Runtime (interrupter) register until USBSTS.CNR (Controller Not Ready, bit 11)
+/// reads 0. Intel clears CNR near-instantly, so on x86 this returns true on the first poll and is a
+/// behavioural no-op. The Pi's VL805 holds CNR set for up to ~100s of ms while it loads its internal
+/// firmware after HCRST, and — witnessed on metal (boot-P20: USBSTS=0x811, CNR=1) — every op/runtime
+/// register write issued while CNR=1 is silently DROPPED (CRCR/DCBAAP/ERST all read back 0, RS never
+/// latches). The pre-HCRST reset writes (USBCMD.RS clear to halt, then HCRST) are the ONLY register
+/// writes that legitimately precede this wait — per spec 4.2 the CNR wait belongs AFTER HCRST, which
+/// is exactly where this runs (the reset path is in `init()` / `reset()`; this gates the ring/
+/// interrupter programming that follows). Bounded by `hw_wait_budget()` (~2.5 s aarch64 / ~2 s x86,
+/// comfortably over the VL805's fw-load); a few-ms interval between polls. Returns false on timeout
+/// so the caller aborts loudly rather than programming a not-ready controller (no hang either way —
+/// the budget is a hard wall-clock bound).
+fn wait_for_cnr_clear(op_base: usize) -> bool {
+    let usbsts = (op_base + 0x04) as *const u32;
+    let budget = hw_wait_budget();
+    let start = crate::arch::now_cycles();
+    // A few-ms pause between polls so a slow fw-load is not hammered with back-to-back MMIO reads.
+    let poll_gap = (budget / 800).max(1);
+    let mut polls: u64 = 0;
+    loop {
+        polls += 1;
+        if unsafe { core::ptr::read_volatile(usbsts) } & (1 << 11) == 0 {
+            #[cfg(target_arch = "aarch64")]
+            serial_println!("xHCI: CNR cleared after {} polls", polls);
+            return true;
+        }
+        if crate::arch::now_cycles().wrapping_sub(start) > budget {
+            serial_println!(
+                "xHCI: FATAL — USBSTS.CNR still 1 after {} polls (~{} cyc); aborting xHCI register programming (spec 5.4.1: op/runtime writes while CNR=1 are dropped)",
+                polls, budget
+            );
+            return false;
+        }
+        let gap_start = crate::arch::now_cycles();
+        while crate::arch::now_cycles().wrapping_sub(gap_start) < poll_gap {
+            core::hint::spin_loop();
+        }
+    }
+}
 
 // --- Interrupt-driven xHCI (MSI-X via the local APIC) ---
 // These let the interrupt handler acknowledge the interrupter using ONLY raw MMIO and
@@ -2173,6 +2222,12 @@ impl XhciController {
     }
 
     pub unsafe fn init_pointers(&mut self, ring_phys_addr: u64) {
+        // PIUSB-10: if CNR never cleared (init_interrupter aborted), do NOT program CRCR/DCBAAP —
+        // the controller is not ready and would silently drop the writes. Fail loud, skip cleanly.
+        if !XHCI_CNR_OK.load(Ordering::Acquire) {
+            serial_println!("xHCI: init_pointers SKIPPED — controller never left Not-Ready (CNR=1)");
+            return;
+        }
         unsafe {
             // 1. Allocate and set DCBAAP
             let dcbaap_size = (self.max_slots as usize + 1) * 8;
@@ -2264,6 +2319,16 @@ impl XhciController {
 
     // Call this AFTER init_pointers but BEFORE run
     pub fn init_interrupter(&mut self, event_ring_phys: u64, erst_table_phys: u64) {
+        // PIUSB-10: xHCI 5.4.1/4.2 — the FIRST register programming after HCRST (this writes the
+        // interrupter's ERST/ERSTBA/ERDP runtime regs; `init_pointers`/`start` write CRCR/DCBAAP/
+        // CONFIG/USBCMD after us). Gate ALL of it on USBSTS.CNR==0 so no write is dropped by a
+        // not-ready controller (the Pi VL805 holds CNR during fw-load; Intel clears it instantly, so
+        // this is a fast no-op on x86 and its register-write behaviour is byte-identical).
+        if !wait_for_cnr_clear(self.op_base) {
+            XHCI_CNR_OK.store(false, Ordering::Release);
+            return;
+        }
+        XHCI_CNR_OK.store(true, Ordering::Release);
         unsafe {
             // SAVE THIS for later use in the interrupt/event loop (ERDP updates)
             EVENT_RING_PHYS_BASE = event_ring_phys;
@@ -2344,6 +2409,12 @@ impl XhciController {
     }
 
     pub fn start(&mut self) {
+        // PIUSB-10: if CNR never cleared, do NOT set CONFIG/RS=1 on a not-ready controller — fail
+        // loud and skip so RS never latches into a controller that dropped its ring/interrupter setup.
+        if !XHCI_CNR_OK.load(Ordering::Acquire) {
+            serial_println!("xHCI: start SKIPPED — controller never left Not-Ready (CNR=1); RS=1 not issued");
+            return;
+        }
         unsafe {
             // Program CONFIG.MaxSlotsEn (op_base + 0x38, bits 7:0) BEFORE Run, while the
             // controller is still halted. Without this the controller has zero usable
