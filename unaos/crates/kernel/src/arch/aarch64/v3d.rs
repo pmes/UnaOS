@@ -2584,6 +2584,35 @@ fn cs_vpm_output_witness(tag: &str) {
             xs, ys
         );
     }
+    // PI-V3D-24 DISCRIMINATOR — the screen-coordinate encoding is byte-faithful to Mesa; PROVE the
+    // transformed triangle lands ON the tile grid. The shader emits CENTRE-RELATIVE screen coords
+    // (Xs/Ys above); the hardware PTB composes them with VIEWPORT_OFFSET's centre (fine .8 = 8192 →
+    // 32.0 px, exactly what our CL emits) to get the ABSOLUTE framebuffer position it bins from.
+    // Mesa contract confirmed verbatim this arc against src/broadcom/compiler/v3d_nir_lower_io.c
+    // `v3d_nir_emit_ff_vpm_outputs` (scale-only, no in-shader offset, `f2i32(ffloor(pos·scale·1/Wc))`,
+    // .8 fixed-point) + genxml v41+ VIEWPORT_OFFSET (s14.8 centre @0, coarse @22) / CLIPPER_XY_SCALING
+    // (half-extent·256 as f32). If every vertex below is INSIDE the 0..W/0..H clip window, the empty
+    // bin is NOT an encoding/geometry defect — the surviving candidate is the VPM INPUT (attribute
+    // fetch) collapsing the triangle to a degenerate point (see v3d.md §8).
+    let centre_fp: f64 = ((TARGET_W as f64) / 2.0) * 256.0; // VIEWPORT_OFFSET fine = 8192 (.8) = 32.0 px
+    for (i, v) in TRI_VERTS.iter().enumerate() {
+        let (xc, yc, wc) = (v[0] as f64, v[1] as f64, v[3] as f64);
+        let rcp_wc = if wc != 0.0 { 1.0 / wc } else { 0.0 };
+        let xs = floor_i32(xc * vp_scale * rcp_wc) as f64;
+        let ys = floor_i32(yc * vp_scale * rcp_wc) as f64;
+        // absolute framebuffer position in pixels = (centre-rel .8 + centre .8) / 256
+        let px_x = (xs + centre_fp) / 256.0;
+        let px_y = (ys + centre_fp) / 256.0;
+        let inside = px_x >= 0.0 && px_x <= TARGET_W as f64 && px_y >= 0.0 && px_y <= TARGET_H as f64;
+        serial_println!(
+            ":: V3D: [v3d24] {} abs v{} — screen px ({}.{:02},{}.{:02}) after +VIEWPORT_OFFSET(32,32) — clip window 0..{}×0..{}: {} — encoding Mesa-verified (v3d_nir_lower_io.c + genxml v41+), so on-grid ⇒ empty bin is NOT the encoding ::",
+            tag, i,
+            px_x as i32, ((px_x.fract() * 100.0) as i32).abs(),
+            px_y as i32, ((px_y.fract() * 100.0) as i32).abs(),
+            TARGET_W, TARGET_H,
+            if inside { "INSIDE (should bin to a tile)" } else { "OUTSIDE (off every tile)" }
+        );
+    }
 }
 
 /// floor(x) → i32 without libm (kernel no_std). `as i64` truncates toward zero; adjust down for

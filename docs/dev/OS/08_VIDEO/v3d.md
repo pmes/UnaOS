@@ -255,7 +255,77 @@ the tile-alloc pool head **and** the tile-STATE head after the bin idles:
 
 ---
 
-## 8. Replaying the visible battery (PI-APP-1)
+## 8. The screen-coordinate encoding is byte-faithful to Mesa (V3D-24)
+
+Boot-P24 (image with V3D-23's `Vc = 4` + OQ-disable) still binned empty: pool[0..8]
+and tile-STATE[0..8] all-zero, `MMU_fault = 0x0`, CL consumed clean, PCTR still
+proving the coordinate shader executes. VCM starvation is thus **refuted as the sole
+wall**. V3D-24 took the last CPU-side hypothesis the campaign had not settled against
+the authoritative source: that our screen-coordinate **encoding/space** (the `Xs/Ys`
+words the coord shader stores, and the fixed-function scale/offset that composes with
+them) diverged from Mesa — a wrong scale or origin would legitimately bin the triangle
+off every tile with zero faults, fitting every witness.
+
+It does **not** diverge. Each link was checked verbatim against Mesa (compiler + genxml,
+fetched this arc):
+
+- **Coord-shader position math** — `v3d_nir_emit_ff_vpm_outputs`
+  (`src/broadcom/compiler/v3d_nir_lower_io.c`) computes, for the two screen words,
+  `pos = f2i32(ffloor(pos_i · viewport_scale_i · (1/Wc)))`: **scale only, NO in-shader
+  offset**, floored to **.8** fixed-point (the pre-V3D-4.3 `.8`-then-internal-`.6`
+  double-rounding quirk; Broadcom's prescribed fix is exactly `ffloor`). The clip words
+  `Xc,Yc,Zc,Wc` go to VPM offsets 0..3, the screen `Xs,Ys` to 4..5, and `Zs`/`1/Wc`
+  are **not** emitted for a coord shader — precisely our six-word STVPMV contract
+  (§2/§3). Our shader body (`fmul·8192 → ffloor → ftoiz`, `1/Wc = 1` for the W=1 test
+  geometry) is bit-identical.
+- **`viewport_scale`** — `QUNIFORM_VIEWPORT_X/Y_SCALE = viewport.scale · 256.0`
+  (`v3d_uniforms.c`); for a 64-px viewport `scale = 32`, so `32 · 256 = 8192.0` — our
+  constant.
+- **`VIEWPORT_OFFSET` (108)** — Mesa sets one field
+  `viewport_centre_x_coordinate = viewport.translate = 32.0` and lets the packer split
+  it; genxml **v41+** types it `s14.8` centre @ bit 0 (22 b) + `Coarse X` uint @ bit 22
+  (10 b). `32.0` packs to fine `8192`, coarse `0` — exactly our bytes (the earlier
+  `u14.8` label is harmless for the positive centre: same bits).
+- **`CLIPPER_XY_SCALING` (110)** — `viewport_half_{width,height}_in_1_256th_of_pixel =
+  scale · 256.0 = 8192.0f32`; **`CLIP_WINDOW` (107)** `0,0,64,64`;
+  **`TILE_BINNING_MODE_CFG`** width/height minus-one `63/63`, 1 RT, 32-bit BPP,
+  128 B/64 B blocks — all match.
+
+**Numbers for our viewport** (shader stores centre-relative; PTB adds the `+32,+32`
+centre from `VIEWPORT_OFFSET`):
+
+| Vertex (NDC) | `Xs,Ys` centre-rel (.8) | Absolute px after `+VIEWPORT_OFFSET` | In `0..64`? |
+| --- | --- | --- | --- |
+| v0 (−0.6,−0.6) | −4916, −4916 | (12.80, 12.80) | ✅ |
+| v1 (0.6,−0.6) | 4915, −4916 | (51.20, 12.80) | ✅ |
+| v2 (0.0, 0.6) | 0, 4915 | (32.00, 51.20) | ✅ |
+
+All three land squarely inside the 64×64 clip window (a single 64×64 tile), so a
+correctly-fed PTB **must** write tile 0's list. The encoding and every fixed-function
+packet are exonerated at the byte level; **candidates #1/#2 (wrong screen-coord
+scale/origin, wrong `CLIPPER_XY_SCALING`/`VIEWPORT_OFFSET`) are dead.**
+
+Per the fabricated-constant law (§5) no shader word was authored (no Mesa checkout /
+packer this session, and none was warranted — the words are already Mesa's). V3D-24
+adds a CPU-side discriminator only: `cs_vpm_output_witness` now prints each vertex's
+**absolute** screen px after the `VIEWPORT_OFFSET` compose and an **INSIDE/OUTSIDE**
+clip-window verdict (`[v3d24]` tag), so no future boot can re-blame the encoding.
+
+**Where the wall now points.** The shader provably runs (§4) yet the on-grid triangle
+does not bin — with the encoding exonerated, the narrowest surviving candidate is the
+coordinate shader's **VPM input** (the VCD attribute fetch): if attributes do not DMA
+into VPM, the `ldvpmv_in` reads collapse all three vertices to `Xc=Yc=0` → absolute
+`(32,32)` for every vertex → a **degenerate zero-area primitive** the PTB legitimately
+bins to nothing — fully consistent with shader-runs / no-fault / empty-pool (this is
+the V3D-25 candidate). The next
+arc should witness the *loaded* `Xc/Yc` (a single TMU general-store of the input reg is
+now unambiguous, since §4 already proved execution) rather than the *expected* values
+`cs_vpm_output_witness` prints from the CPU. The attribute record / VCD setup
+(`OFF_SHADREC + 36`, stride 16, 4 values read) is the audit surface.
+
+---
+
+## 9. Replaying the visible battery (PI-APP-1)
 
 The `v3d` shell command (PI-APP-1, `1e8e7a0f`) re-runs the four **visible** V3D
 battery stages (M5 gradient, M6 animate, M7 multiprim, M8 blit — see
