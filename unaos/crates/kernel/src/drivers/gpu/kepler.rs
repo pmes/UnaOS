@@ -173,12 +173,11 @@ pub fn init(gpu: &GpuInfo) {
             let pmc_enable = mmio_read(bar0, regs::NV_PMC_ENABLE);
             mmio_write(bar0, regs::NV_PMC_ENABLE, pmc_enable | 0x100);
             
-            // GK104 PBDMA enable (NV_PMC_SUBFIFO_ENABLE at 0x204 in pmc.xml / gf100_pfifo.xml)
-            mmio_write(bar0, 0x000204, 0x1 | 0x2); // Enable at least PBDMA 0 and 1
-            // 0x2a04 is undocumented in envytools, but Nouveau uses it to ungate clock/init. 
-            // The cleanroom amendment says: "PBDMA init must cite rnndb facts, never nouveau code/function names"
-            // Wait, if it's not in rnndb, we shouldn't use it or we must cite it if we derived it.
-            // I'll stick to 0x204 (SUBFIFO_ENABLE) which is in envytools!
+            // GK104 PBDMA enable (NV_PMC_SUBFIFO_ENABLE at 0x204 in pmc.xml)
+            mmio_write(bar0, 0x000204, 0xFFFFFFFF);
+            let pbdma_count_mask = mmio_read(bar0, 0x000204);
+            let pbdma_count = pbdma_count_mask.count_ones();
+            serial_println!(":: kepler: pbdma-count {} ::", pbdma_count);
 
             let check = mmio_read(bar0, regs::NV_PMC_ENABLE);
             serial_println!("[NVIDIA] NV_PMC_ENABLE after bit 8 set: 0x{:08X}", check);
@@ -297,7 +296,14 @@ pub fn init(gpu: &GpuInfo) {
                                     } else {
                                         let gp_get = unsafe { core::ptr::read_volatile((bar1 + userd_off + 0x8c) as *const u32) };
                                         let ch_stat = mmio_read(bar0, 0x800004 + (chan_id as usize * 8));
-                                        let pbdma_stat = mmio_read(bar0, 0x6c0); // PBDMA_STATUS (gf100_pfifo.xml)
+                                        
+                                        let pbdma_base = 0x40000; // PSUBFIFO base
+                                        let pbdma_stat = mmio_read(bar0, pbdma_base + 0x108); // PSUBFIFO INTR (gf100_pfifo.xml)
+                                        
+                                        if pbdma_stat == 0 || (pbdma_stat & 0xFFF00000) == 0xBAD00000 {
+                                            serial_println!(":: kepler: bad-read pbdma {:X} {:08X} ::", pbdma_base + 0x108, pbdma_stat);
+                                        }
+
                                         let playlist_rd = mmio_read(bar0, 0x2280); // PLAYLIST_RD (gf100_pfifo.xml)
                                         let playlist_rd_len = mmio_read(bar0, 0x2284);
                                         
@@ -372,15 +378,24 @@ unsafe fn takeover_display(gpu: &GpuInfo, bar0: usize, allocator: &mut VramAlloc
     let mut raw_storage = 0;
 
     for head in 0..4 {
-        let head_base = regs::NV_PDISPLAY_BASE + 0x400 + (head * 0x300) + 0x60;
+        let head_base = regs::NV_PDISPLAY_BASE + 0x6100 + (head * 0x800);
         let addr = mmio_read(bar0, head_base + 0x0); // OFFSET_ORIGIN
         let size = mmio_read(bar0, head_base + 0x8); // SIZE
         let storage = mmio_read(bar0, head_base + 0xC); // STORAGE
-        let fmt = mmio_read(bar0, head_base + 0x10); // Not format, but adjacent
 
-        serial_println!(":: kepler: head-raw head={} addr={:08X} size={:08X} storage={:08X} fmt={:08X} ::", head, addr, size, storage, fmt);
+        serial_println!(":: kepler: head-raw head={} addr={:08X} size={:08X} storage={:08X} ::", head, addr, size, storage);
 
-        if addr != 0 && (addr == expected_addr || addr == expected_phys) {
+        if addr == 0 || (addr & 0xFFF00000) == 0xBAD00000 {
+            serial_println!(":: kepler: bad-read head {:X} {:08X} ::", head_base, addr);
+            continue;
+        }
+
+        if size == 0 || (size & 0xFFF00000) == 0xBAD00000 {
+            serial_println!(":: kepler: bad-read head {:X} {:08X} ::", head_base + 0x8, size);
+            continue;
+        }
+
+        if addr == expected_addr || addr == expected_phys {
             found_head = Some(head);
             raw_addr = addr;
             raw_size = size;
@@ -475,7 +490,7 @@ unsafe fn takeover_display(gpu: &GpuInfo, bar0: usize, allocator: &mut VramAlloc
                 mmio_write(bar0, 0x640000, 16);
                 
                 // Wait for latch by reading back OFFSET_ORIGIN via MMIO shadow
-                let head_base = regs::NV_PDISPLAY_BASE + 0x400 + (head * 0x300) + 0x60;
+                let head_base = regs::NV_PDISPLAY_BASE + 0x6100 + (head * 0x800);
                 let mut latched = false;
                 for _ in 0..1000000 {
                     if mmio_read(bar0, head_base) == new_addr {
