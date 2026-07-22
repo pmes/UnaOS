@@ -41,6 +41,7 @@ impl ApplicationHandler<AppEvent> for AetherApp {
             
             // Set IME allowed to receive Ime events
             window.set_ime_allowed(true);
+            window.request_redraw();
         }
     }
 
@@ -82,23 +83,75 @@ impl ApplicationHandler<AppEvent> for AetherApp {
                     let mut buffer = surface.buffer_mut().unwrap();
                     let eng_surface = eng.surface();
                     
-                    for (i, pixel) in buffer.iter_mut().enumerate() {
-                        let idx = i * 4;
-                        if idx + 3 < eng_surface.len() {
-                            let b = eng_surface[idx] as u32;
-                            let g = eng_surface[idx+1] as u32;
-                            let r = eng_surface[idx+2] as u32;
-                            *pixel = b | (g << 8) | (r << 16);
+                    let win_size = window.inner_size();
+                    let w_w = win_size.width as usize;
+                    let w_h = win_size.height as usize;
+                    let e_w = eng.width as usize;
+                    let e_h = eng.height as usize;
+                    
+                    for y in 0..e_h {
+                        if y >= w_h { break; }
+                        for x in 0..e_w {
+                            if x >= w_w { break; }
+                            let buf_idx = y * w_w + x;
+                            let eng_idx = (y * e_w + x) * 4;
+                            if eng_idx + 3 < eng_surface.len() && buf_idx < buffer.len() {
+                                let b = eng_surface[eng_idx] as u32;
+                                let g = eng_surface[eng_idx+1] as u32;
+                                let r = eng_surface[eng_idx+2] as u32;
+                                buffer[buf_idx] = b | (g << 8) | (r << 16);
+                            }
                         }
                     }
                     
                     // Synthetic URL Bar
+                    for y in 0..30 {
+                        for x in 0..w_w {
+                            let idx = y * w_w + x;
+                            if idx < buffer.len() {
+                                buffer[idx] = if self.url_bar_active { 0xFFFFFF } else { 0xDDDDDD };
+                            }
+                        }
+                    }
+                    
+                    // Draw URL Text
+                    let text_color = 0x000000;
+                    let mut cursor_x = 10;
+                    for c in self.current_url.chars() {
+                        if let Some(glyph) = font8x8::BASIC_FONTS.get(c) {
+                            for (gy, row) in glyph.iter().enumerate() {
+                                for gx in 0..8 {
+                                    if (row & (1 << gx)) != 0 {
+                                        let py = 10 + gy * 2;
+                                        let px = cursor_x + gx * 2;
+                                        // Draw 2x2 blocks for visibility
+                                        for dy in 0..2 {
+                                            for dx in 0..2 {
+                                                if py + dy < 30 && px + dx < w_w {
+                                                    let idx = (py + dy) * w_w + (px + dx);
+                                                    if idx < buffer.len() {
+                                                        buffer[idx] = text_color;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        cursor_x += 16;
+                    }
+                    
                     if self.url_bar_active {
-                        for y in 0..30 {
-                            for x in 0..eng.width {
-                                let idx = (y * eng.width + x) as usize;
+                        for py in 8..26 {
+                            if py < 30 && cursor_x < w_w {
+                                let idx = py * w_w + cursor_x;
                                 if idx < buffer.len() {
-                                    buffer[idx] = 0xDDDDDD; // Gray bar
+                                    buffer[idx] = 0xFF0000; // Red caret
+                                }
+                                let idx2 = py * w_w + cursor_x + 1;
+                                if idx2 < buffer.len() {
+                                    buffer[idx2] = 0xFF0000;
                                 }
                             }
                         }

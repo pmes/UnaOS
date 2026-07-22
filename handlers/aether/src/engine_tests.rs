@@ -144,4 +144,32 @@ mod tests {
         
 
     }
+
+    #[tokio::test]
+    async fn test_shell_borrow_panic_prevention() {
+        use std::rc::Rc;
+        use std::cell::RefCell;
+        let engine = Rc::new(RefCell::new(crate::AetherEngine::new()));
+        
+        let engine_clone = engine.clone();
+        let local = tokio::task::LocalSet::new();
+        
+        local.run_until(async move {
+            tokio::task::spawn_local(async move {
+                let html = {
+                    // Do the fetch WITHOUT holding the borrow
+                    let _ = crate::net::fetch_document("http://invalid.test.domain.for.test").await;
+                    "<html></html>".to_string()
+                };
+                // Then borrow to apply
+                engine_clone.borrow_mut().load_html("http://invalid.test.domain.for.test", &html, true);
+            });
+            
+            // Yield to allow the spawn_local to run until its await point (simulating GTK timeout)
+            tokio::task::yield_now().await;
+            
+            // This will panic if the spawn_local held the borrow across the await, proving safety.
+            engine.borrow_mut().tick();
+        }).await;
+    }
 }

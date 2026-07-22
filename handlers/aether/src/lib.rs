@@ -230,6 +230,7 @@ impl AetherEngine {
         }
     }
 
+    #[deprecated(since = "0.1.0", note = "use aether::net::fetch_document and engine.load_html instead to prevent borrow panics")]
     pub async fn load_url(&mut self, url: &str) -> anyhow::Result<()> {
         self.load_url_internal(url, true).await
     }
@@ -238,14 +239,20 @@ impl AetherEngine {
         let html = match net::fetch_document(url).await {
             Ok(content) => content,
             Err(e) => {
-                format!(
-                    "<html><head><title>Error</title></head><body style=\"background-color: #f8d7da; color: #721c24; padding: 20px; font-family: sans-serif;\"><h1>Navigation Error</h1><p>Failed to load {}: {}</p></body></html>",
-                    url, e
-                )
+                self.load_error_page(url, &e.to_string());
+                return Ok(());
             }
         };
         self.load_html(url, &html, add_history);
         Ok(())
+    }
+
+    pub fn load_error_page(&mut self, url: &str, error: &str) {
+        let html = format!(
+            "<html><head><title>Error</title></head><body style=\"background-color: #f8d7da; color: #721c24; padding: 20px; font-family: sans-serif;\"><h1>Navigation Error</h1><p>Failed to load {}: {}</p></body></html>",
+            url, error
+        );
+        self.load_html(url, &html, true);
     }
 
     pub fn load_html(&mut self, url: &str, html: &str, add_history: bool) {

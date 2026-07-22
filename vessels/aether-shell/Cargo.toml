@@ -26,3 +26,4 @@ qt = ["dep:cxx", "dep:cxx-qt", "dep:cxx-qt-lib", "dep:cxx-qt-build"]
 [target.'cfg(target_os = "macos")'.dependencies]
 winit = "0.30"
 softbuffer = "0.4"
+font8x8 = "0.3"
