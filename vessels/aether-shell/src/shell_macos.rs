@@ -1,4 +1,5 @@
 #![cfg(target_os = "macos")]
+use font8x8::UnicodeFonts;
 use winit::{
     application::ApplicationHandler,
     event::{WindowEvent, KeyEvent, MouseScrollDelta, ElementState, MouseButton, Ime},
