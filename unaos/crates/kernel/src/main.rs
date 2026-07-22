@@ -934,6 +934,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                     input_cpu,
                 );
                 unaos_kernel::arch::sched::spawn("rx-backstop", rx_backstop, 0, input_cpu);
+                // PI-UI-2: the 1 Hz status-strip refresh pulse. Co-located on the input core (a
+                // once-a-second wake, off the render core's frame-pacing critical path). Timer-gated
+                // like rx-backstop: its sleep_ticks nap needs the live timer IRQ to wake.
+                unaos_kernel::arch::sched::spawn("status-tick", status_tick, 0, input_cpu);
             }
             unaos_kernel::arch::sched::spawn("input", input_service, 0, input_cpu);
             unaos_kernel::arch::sched::spawn("render", render_service, 0, render_cpu);
@@ -1987,13 +1991,35 @@ fn render_service(_: usize) {
     let mut console = unaos_kernel::console::Console::new();
 
     console.draw(&mut pal);
+    // PI-UI-2: the always-on GUI status strip (hostname / lease IP / UTC wall clock). Drawn AFTER the
+    // console each frame so it sits on top; refreshed at ~1 Hz by the `status_tick` task, which pings
+    // GUI_CHANNEL with an Event::Timer so this loop re-renders even with no keyboard input. Reads only
+    // public snapshot accessors (clock::now / net_phy::settled_ipv4) — no net/clock lock in this path.
+    unaos_kernel::ui_status::draw(&mut pal);
     pal.render();
+    serial_println!(":: UI2: status strip armed (host+ip+time, 1 Hz) ::");
 
     loop {
+        // Any event wakes a repaint; only a Key is dispatched to the shell. An Event::Timer from the
+        // status-tick task (or any non-Key event) falls through to just refresh the strip + present.
         if let unaos_kernel::pal::Event::Key(c) = GUI_CHANNEL.recv() {
             handle_key(c, &mut console, &mut pal);
         }
+        unaos_kernel::ui_status::draw(&mut pal);
         pal.render();
+    }
+}
+
+/// PI-UI-2 status-strip refresh pulse (metal only): once per second, post an `Event::Timer` to
+/// GUI_CHANNEL so the render task re-draws the status strip (lease IP / wall clock advance) even when
+/// no keystroke is arriving. Mirrors the `rx_backstop` shape — a tiny periodic wake, off the render
+/// core's critical path. Gated on `timer::is_live()` at spawn (a `sleep_ticks` nap needs the timer
+/// IRQ to wake); in QEMU raspi4b (no Group-1 IRQ) it is not spawned and the strip refreshes on input.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn status_tick(_: usize) {
+    loop {
+        unaos_kernel::arch::sched::sleep_ticks(250); // ~1 s at the 250 Hz per-core tick
+        GUI_CHANNEL.send(unaos_kernel::pal::Event::Timer);
     }
 }
 

@@ -84,6 +84,7 @@ pub mod bootlog;
 
 pub mod pal;
 pub mod ui;
+pub mod ui_status;
 pub mod video;
 pub mod clock;
 pub mod console;

@@ -49,6 +49,43 @@ the GUI's life cycle. Anything else that names a pixel count is a bug.
 > (`type Fx = i32`; the integer value is `real * 65536`) off a 256-entry *brad*
 > sine table (256 brads = one turn).
 
+### 0a. The GUI status strip (PI-UI-2)
+
+`unaos/crates/kernel/src/ui_status.rs` draws an always-on one-line status bar
+pinned to the **bottom** line of the panel, surfacing the net/time state a bench
+user would otherwise only read on serial:
+
+```
+unaos.local   ip 192.168.2.3   2026-07-22 14:31:07 UTC
+```
+
+with honest placeholders before the state settles: `no lease` until a bring-up
+records an address, `unsynced` until SNTP seeds the wall clock. All geometry
+derives from `ui::Metrics` (THE METRICS RULE — the band is one `line_h`, the
+glyph cell is centred within it); nothing names a pixel.
+
+**Read-only by construction.** The strip consumes only public snapshot
+accessors — `clock::now()` for the wall clock and `net_phy::settled_ipv4()` for
+the interface address. The latter is a lock-free atomic snapshot recorded by
+`net_phy::dhcp_or_static` (the single chokepoint every arch's bring-up funnels
+through), so the render core reads the address without reaching into any
+driver's private `NetService` state and takes no net lock in the render path.
+The hostname is the fixed mDNS/DNS-SD name `unaos.local` (net11/net17).
+
+**Refresh.** On the Pi bare-metal path the render task (`render_service`,
+`main.rs`) draws the strip **after** the console each frame (so it always sits on
+top) and presents. A tiny `status_tick` task posts an `Event::Timer` to
+`GUI_CHANNEL` once a second (mirroring `rx_backstop`), waking the render loop to
+re-draw so the clock advances and a late lease appears without a keystroke. It is
+timer-gated at spawn (its `sleep_ticks` nap needs the live timer IRQ); in QEMU
+raspi4b, where no Group-1 IRQ is delivered, the tick task is not spawned and the
+strip refreshes on input instead. Bring-up witness, printed once by
+`render_service`:
+
+```
+:: UI2: status strip armed (host+ip+time, 1 Hz) ::
+```
+
 ---
 
 ## 1. Drawing primitives (in `video/` + `pal.rs`)
