@@ -280,6 +280,67 @@ then per request e.g.
 
 ---
 
+## 4a. "UnaOS knows what time it is" — SNTP client + kernel wall-clock (PI-NET-16)
+
+UnaOS has a free-running counter (CNTPCT) and a 250 Hz tick but no notion of *civil*
+time. PI-NET-16 adds one: an SNTP client (RFC 4330, client mode 3, v4) that learns the
+UTC second from the network, and a monotonic-anchored wall-clock that ticks it forward
+between syncs off CNTPCT.
+
+**Wall-clock representation.** On each successful sync the module captures a
+`WallClock { anchor_unix, anchor_cntpct, stratum }` — the UTC Unix second the server
+reported plus the CNTPCT value read in the same breath. The live UTC second is
+`anchor_unix + (cntpct_now - anchor_cntpct) / cntfrq`: the free-running counter supplies
+the elapsed time, so the clock advances monotonically between the ~6-hourly re-syncs with
+no wall-clock hardware and never runs backwards within one anchor. State is a module-local
+`spin::Mutex<Option<WallClock>>` with a small read API (`wall_unix_now`, `wall_anchor`).
+**Integrator fold:** a proper kernel-wide clock service (so `time`, log timestamps, and
+filesystem mtimes can all read one clock) belongs in a shared core file; this arc keeps
+the state in-lane and notes the fold rather than reaching outside the net lane.
+
+**2036 rollover stance.** NTP's 32-bit seconds field rolls over 2036-02-07. The conversion
+is era-aware per RFC 4330 §3: a value with the high bit **set** is era 0 (1900-based,
+covering 1968..2036) and maps to Unix via `ntp - 2208988800`; with the high bit **clear**
+it is era 1 (2036-based) and maps via `ntp + 2085978496`. We are in era 0 today; a resolved
+time is additionally clamped to a sanity band (~2023-11 .. ~2096) so a misconfigured or
+spoofed server cannot jam the clock to a nonsense year.
+
+**Hostile-input handling.** `net16_parse_sntp` bounds-checks the 48-byte reply before any
+field read, then validates: LI≠3 (an alarm/unsynchronized server is rejected), version in
+3..=4, mode==4 (server), stratum≠0 (stratum 0 = Kiss-o'-Death → rejected, RFC 4330 §8),
+stratum≤15 (reserved rejected), and a non-zero transmit timestamp inside the sanity band.
+No float math (1 s resolution; the fraction word is ignored). Every failure is a typed
+outcome with its own one-line witness: `sntp timeout`, `sntp malformed (rejected)`,
+`sntp KoD (rejected)`.
+
+**Sync lifecycle.** The initial sync runs once on the BSP at `arm_net_service` time
+(blocking, bounded, own temporary sockets — the `net14_ask` discipline): resolve
+`pool.ntp.org` via the NET-14 DNS client (DNS server = the gateway today, the same
+`NetConfig` cross-lane gap NET-14 notes; falls back to querying the gateway directly as the
+time source if DNS times out), query it, set the clock, print the boot witness. Re-sync
+rides the persistent poll loop as a non-blocking state machine (`sntp_step`) over a UDP
+socket in the service's own pool: on the ~6 h cadence it fires one request and reads the
+reply on a later poll — never blocking the 4 ms poll. A missed/rejected reply schedules a
+nearer retry.
+
+* **SNTP client gate** (`nettest::run16`, same hardware-free loopback seam):
+  `:: NET16-GATE: sntp client battery PASS [w=0x3f] (parse-ok+iso|reject-short|kod|reject-alarm|live-set-clock|resync-timeout) ::`
+  * `0x01` the parser accepts a well-formed reply → the exact injected instant, round-tripping
+    through the NTP epoch **and** rendering to `2026-07-22T15:30:45Z`; `0x02` rejects a short
+    (<48 B) packet; `0x04` surfaces a stratum-0 KoD; `0x08` rejects an LI=3 alarm reply;
+    `0x10` a live loopback exchange drives the real `sntp_step`, anchors the wall-clock, and
+    the anchored ISO matches; `0x20` a re-sync to a black-hole address takes the honest
+    timeout path.
+
+Boot witness (metal): `:: PI-GENET: [net16] dns pool.ntp.org -> <ip> ::` then
+`:: PI-GENET: [net16] sntp <ip> -> 2026-07-22T14:03:07Z (stratum N, rtt ~M ms) ::` on
+success, or `[net16] sntp <ip> => sntp timeout` on a bench segment without upstream. Each
+re-sync prints `[net16] resync <ip> -> <iso> (stratum N)`. On the status page Peter sees a
+new `time (UTC): 2026-07-22T14:03:07Z` line (or `unsynced (no SNTP yet)` before the first
+sync).
+
+---
+
 ## 5. Bench verification
 
 | Claim | Arc / commit | Boot | Verdict |
@@ -296,6 +357,8 @@ then per request e.g.
 | "UnaOS asks" — outbound resolve + fetch | NET-14 | *(pending metal)* | `[net14] dns example.com -> <ip>` + `GET http://example.com/ -> HTTP/1.1 200 (<n> bytes)` + body excerpt; or an honest per-leg failure witness |
 | FS route gate (`GET /fs/` + `/fs/<name>`) runs off-metal | NET-15 `nettest` | QEMU raspi4b | `:: NET15-GATE: ... PASS [w=0x1f] ::` — `/fs/` lists the fixture, exact bytes, traversal `/fs/../evil` → 404, missing → 404, oversize → 413; multi-block `K3PAT.BIN` (12288 B) pattern-faithful |
 | "UnaOS serves its filesystem" — browse `/fs/` | NET-15 | *(pending metal)* | `[net15] fs route armed (…, cap 64 KiB)` + per-request `GET /fs/<name> => 200 <n> bytes (with_unafs hold <t> ticks / <n> ms)` (WARN suffix if the hold > 50 ms) |
+| SNTP client + wall-clock gate runs off-metal | NET-16 `nettest` | QEMU raspi4b + test-arm | `:: NET16-GATE: ... PASS [w=0x3f] ::` — parser accepts well-formed + renders ISO / rejects short / surfaces KoD / rejects LI=3 alarm, live loopback sets the clock, re-sync black-hole timeout |
+| "UnaOS knows what time it is" — SNTP sync | NET-16 | *(pending metal)* | `[net16] dns pool.ntp.org -> <ip>` + `[net16] sntp <ip> -> <iso>Z (stratum N, rtt ~M ms)`; status page gains a `time (UTC)` line; or an honest `sntp timeout` |
 
 QEMU `raspi4b` (bcm2838) does **not** model GENET; the DTB census makes bring-up a
 clean pre-MMIO skip (`kernel8-test` stays green). Every *metal* finding above is

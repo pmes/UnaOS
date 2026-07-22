@@ -1244,6 +1244,12 @@ mod metal {
         #[cfg(feature = "nettest")]
         nettest::run15();
 
+        // PI-NET-16: the SNTP client + wall-clock gate — pure hostile-input parser checks plus a live
+        // loopback exchange that sets the clock, over the same hardware-free seam. Prints a self-checking
+        // `:: NET16-GATE: ... PASS [w=0x..] ::` line the battery asserts.
+        #[cfg(feature = "nettest")]
+        nettest::run16();
+
         // ── M1: resolve the register base from the DTB. NO DTB node => QEMU / DTB-less boot: this build
         //    does NOT model GENET, and touching the register window would FAULT (external abort), not
         //    return poison. Skip BEFORE any MMIO — the piusb `dtb_has_pcie` discipline. This is the
@@ -1481,6 +1487,14 @@ mod metal {
     // (`arm_net_service`, the `NET_SERVICE` static) is byte-identical — it instantiates
     // `NetService<SmoltcpPhy<GenetNic>>` by inference, exactly as before. The QEMU loopback gate
     // (`nettest`) instantiates `NetService<SmoltcpPhy<LoopNic>>` and drives the identical methods.
+    /// PI-NET-16: the non-blocking re-sync state machine that rides the poll loop. `Idle` holds the
+    /// wall-clock ms at which the next query is due; `Waiting` holds the send time and the reply deadline.
+    #[derive(Clone, Copy)]
+    enum SntpState {
+        Idle { due_ms: i64 },
+        Waiting { deadline_ms: i64 },
+    }
+
     struct NetService<D: Device = SmoltcpPhy<GenetNic>> {
         iface: Interface,
         dev: D,
@@ -1499,6 +1513,12 @@ mod metal {
         active_since: [i64; HTTP_POOL],
         /// PI-NET-11: the mDNS UDP socket's handle (bound to 5353, answering `unaos.local`).
         mdns: SocketHandle,
+        /// PI-NET-16: the SNTP re-sync UDP socket (bound to the ephemeral client port), the cached time
+        /// source resolved at boot, and the non-blocking re-sync state. `sntp_server` is `None` until the
+        /// initial sync yields an address; `sntp_state` gates the next ~6-hourly query.
+        sntp: SocketHandle,
+        sntp_server: Option<[u8; 4]>,
+        sntp_state: SntpState,
         /// PI-NET-10: our configured IPv4 (leased or static-fallback), shown on the status page.
         ip: [u8; 4],
         /// PI-NET-15: per-listener request-line capture (method + path + version). Bytes accumulate here
@@ -1979,6 +1999,16 @@ Connection: close\r\nServer: UnaOS/genet\r\n\r\n",
         let up_ms = now_ms().max(0);
         let up_ticks = up_ms * TICK_HZ / 1000;
         let sha = option_env!("UNAOS_GIT_SHA").unwrap_or("hw-pi4");
+        // PI-NET-16: the current UTC wall-clock, extrapolated from the last SNTP anchor + CNTPCT elapsed.
+        // Before the first successful sync there is no civil time to show — say so honestly.
+        let mut time_buf = [0u8; 24];
+        let time_str: &str = match wall_unix_now() {
+            Some(secs) => {
+                let n = render_iso8601(secs, &mut time_buf);
+                core::str::from_utf8(&time_buf[..n]).unwrap_or("unsynced")
+            }
+            None => "unsynced (no SNTP yet)",
+        };
 
         let mut body_buf = [0u8; HTTP_BODY_CAP];
         let mut body = BufWriter { buf: &mut body_buf, len: 0 };
@@ -1992,6 +2022,7 @@ the kernel's own TCP stack (smoltcp bound over the GENET rings, served by the ne
 <ul>\
 <li>track: <b>hw-pi4</b> (tip {sha})</li>\
 <li>uptime: {up_ms} ms ({up_ticks} ticks @ {TICK_HZ} Hz)</li>\
+<li>time (UTC): {time_str}</li>\
 <li>net9 replies: arp={arp}, icmp-echo={icmp}</li>\
 <li>pages served: {served}</li>\
 <li>lease ip: {}.{}.{}.{}</li>\
@@ -2283,6 +2314,73 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
                 }
             }
         }
+
+        /// PI-NET-16: one non-blocking re-sync step, run after each `iface.poll`. When the ~6 h cadence
+        /// comes due it fires ONE SNTP request at the cached server through the pool's UDP socket, then in
+        /// later steps reads the reply and re-anchors the wall-clock — never blocking the poll loop. A
+        /// missed reply (deadline) or a KoD/malformed reply schedules a nearer retry; the failure path is
+        /// witnessed exactly once per attempt. No-ops entirely until the boot sync has cached a server.
+        fn sntp_step(&mut self, now: i64) {
+            let Some(server) = self.sntp_server else {
+                return; // no time source cached (initial sync produced none) — nothing to re-sync
+            };
+            match self.sntp_state {
+                SntpState::Idle { due_ms } => {
+                    if now < due_ms {
+                        return;
+                    }
+                    let mut req = [0u8; 48];
+                    net16_build_request(&mut req);
+                    let dst =
+                        IpEndpoint::new(IpAddress::v4(server[0], server[1], server[2], server[3]), NTP_PORT);
+                    let s = self.sockets.get_mut::<udp::Socket>(self.sntp);
+                    if s.can_send() && s.send_slice(&req, dst).is_ok() {
+                        self.sntp_state = SntpState::Waiting { deadline_ms: now + NET16_SNTP_WINDOW_MS };
+                    } else {
+                        // Socket not ready (unconfigured/wedged) — retry the whole attempt later.
+                        self.sntp_state = SntpState::Idle { due_ms: now + NET16_RESYNC_RETRY_MS };
+                    }
+                }
+                SntpState::Waiting { deadline_ms } => {
+                    let s = self.sockets.get_mut::<udp::Socket>(self.sntp);
+                    if s.can_recv() {
+                        let mut rb = [0u8; 128];
+                        if let Ok((n, _meta)) = s.recv_slice(&mut rb) {
+                            match net16_parse_sntp(&rb[..n]) {
+                                Sntp::Ok { unix_secs, stratum } => {
+                                    wall_set(unix_secs, stratum);
+                                    let mut iso = [0u8; 24];
+                                    let l = render_iso8601(unix_secs, &mut iso);
+                                    serial_println!(
+                                        "{} [net16] resync {}.{}.{}.{} -> {} (stratum {}) ::",
+                                        PG, server[0], server[1], server[2], server[3],
+                                        core::str::from_utf8(&iso[..l]).unwrap_or("<iso>"), stratum
+                                    );
+                                    self.sntp_state =
+                                        SntpState::Idle { due_ms: now + NET16_RESYNC_INTERVAL_MS };
+                                }
+                                Sntp::KissOfDeath => {
+                                    NET16_REJECTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                                    serial_println!("{} [net16] resync => sntp KoD (rejected) ::", PG);
+                                    self.sntp_state =
+                                        SntpState::Idle { due_ms: now + NET16_RESYNC_RETRY_MS };
+                                }
+                                Sntp::Malformed => {
+                                    NET16_REJECTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                                    serial_println!("{} [net16] resync => sntp malformed (rejected) ::", PG);
+                                    self.sntp_state =
+                                        SntpState::Idle { due_ms: now + NET16_RESYNC_RETRY_MS };
+                                }
+                            }
+                        }
+                    } else if now >= deadline_ms {
+                        NET16_TIMEOUTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        serial_println!("{} [net16] resync => sntp timeout ::", PG);
+                        self.sntp_state = SntpState::Idle { due_ms: now + NET16_RESYNC_RETRY_MS };
+                    }
+                }
+            }
+        }
     }
 
     /// Poll cadence: 1 per-core tick ≈ 4 ms at the 250 Hz aarch64 generic-timer tick.
@@ -2319,6 +2417,9 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
                 ns.http_step(t);
                 // PI-NET-11: one bounded mDNS service step (answer `unaos.local` on the share segment).
                 ns.mdns_step();
+                // PI-NET-16: one non-blocking SNTP re-sync step (fires a query on the ~6 h cadence, reads
+                // the reply on a later poll, re-anchors the wall-clock — never blocks this poll loop).
+                ns.sntp_step(t);
                 census = ns.http_census();
             }
             let (arp, icmp) = net9_counts();
@@ -2386,7 +2487,7 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
     fn build_net_sockets(
         iface: &mut Interface,
         sockets: &mut SocketSet<'static>,
-    ) -> ([SocketHandle; HTTP_POOL], SocketHandle, u32, bool, bool) {
+    ) -> ([SocketHandle; HTTP_POOL], SocketHandle, SocketHandle, u32, bool, bool) {
         // The Pi's TCP status service — a POOL of passive sockets, each with its own static (leaked) ring
         // buffers, all listening on :80. The pool is the accept backlog; per-socket timeout + keep-alive
         // plus the app-level idle-reaper (http_step) keep any single TCB from wedging.
@@ -2426,28 +2527,46 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
         let bound = mdns_sock.bind(MDNS_PORT).is_ok();
         let mdns = sockets.add(mdns_sock);
 
+        // PI-NET-16: the SNTP re-sync client socket — UDP bound to the ephemeral client port, its outbound
+        // queries hitting the cached time source on :123. Same static (leaked) owned-storage discipline.
+        let sntp_rx_meta: &'static mut [udp::PacketMetadata; UDP_META_SLOTS] =
+            alloc::boxed::Box::leak(alloc::boxed::Box::new([udp::PacketMetadata::EMPTY; UDP_META_SLOTS]));
+        let sntp_rx_payload: &'static mut [u8; UDP_RX_CAP] =
+            alloc::boxed::Box::leak(alloc::boxed::Box::new([0u8; UDP_RX_CAP]));
+        let sntp_tx_meta: &'static mut [udp::PacketMetadata; UDP_META_SLOTS] =
+            alloc::boxed::Box::leak(alloc::boxed::Box::new([udp::PacketMetadata::EMPTY; UDP_META_SLOTS]));
+        let sntp_tx_payload: &'static mut [u8; UDP_TX_CAP] =
+            alloc::boxed::Box::leak(alloc::boxed::Box::new([0u8; UDP_TX_CAP]));
+        let mut sntp_sock = udp::Socket::new(
+            udp::PacketBuffer::new(&mut sntp_rx_meta[..], &mut sntp_rx_payload[..]),
+            udp::PacketBuffer::new(&mut sntp_tx_meta[..], &mut sntp_tx_payload[..]),
+        );
+        let _ = sntp_sock.bind(NET16_SNTP_SPORT);
+        let sntp = sockets.add(sntp_sock);
+
         // Join the mDNS IPv4 multicast group so smoltcp's IP layer accepts 224.0.0.251 datagrams even if
         // the RX promisc filter ever drops (proto-igmp is off, so no membership report is emitted — the
         // join updates the stack's own accept filter, which is what makes the query reach the socket).
         let mcast = IpAddress::v4(MDNS_MCAST[0], MDNS_MCAST[1], MDNS_MCAST[2], MDNS_MCAST[3]);
         let joined = iface.join_multicast_group(mcast).is_ok();
 
-        (http, mdns, listening, bound, joined)
+        (http, mdns, sntp, listening, bound, joined)
     }
 
     /// Hand the DHCP-configured `iface`/`dev` to the persistent [`NetService`] and register the poll task
     /// on a secondary core. Called at the tail of `bind_smoltcp` (a NIC is guaranteed present). The empty
     /// SocketSet uses leaked static storage (smoltcp's owned-Vec path is off in our no_std feature set).
     fn arm_net_service(mut iface: Interface, mut dev: SmoltcpPhy<GenetNic>, dns_ip: [u8; 4]) {
-        // PI-NET-12: storage holds the HTTP listener POOL plus the one mDNS UDP socket.
-        let storage: &'static mut [SocketStorage; HTTP_POOL + 1] =
+        // PI-NET-12/16: storage holds the HTTP listener POOL plus the mDNS and SNTP UDP sockets.
+        let storage: &'static mut [SocketStorage; HTTP_POOL + 2] =
             alloc::boxed::Box::leak(alloc::boxed::Box::new(Default::default()));
         let mut sockets = SocketSet::new(&mut storage[..]);
 
         // PI-NET-13: build the HTTP listener pool + mDNS socket + multicast join. Extracted into
         // `build_net_sockets` so the QEMU loopback gate constructs the identical pool the metal service
-        // runs — same ring caps, same timeout/keep-alive, same :80 listen, same 224.0.0.251 join.
-        let (http, mdns, listening, bound, joined) = build_net_sockets(&mut iface, &mut sockets);
+        // runs — same ring caps, same timeout/keep-alive, same :80 listen, same 224.0.0.251 join. PI-NET-16
+        // adds the SNTP re-sync UDP socket to the same pool.
+        let (http, mdns, sntp, listening, bound, joined) = build_net_sockets(&mut iface, &mut sockets);
 
         // The configured IPv4 (leased or static fallback) — shown on the served status page + the mDNS
         // up-witness (mDNS answers only once configured; the address here is what a query would resolve).
@@ -2493,6 +2612,16 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
         // `dns timeout` / `connect timeout` line; the QEMU NET14-GATE is the correctness proof.
         net14_ask(&mut iface, &mut dev, dns_ip);
 
+        // PI-NET-16: the initial (blocking, bounded) time sync — same discipline as net14_ask (BSP, before
+        // the poll task spawns, own temporary sockets). Resolves pool.ntp.org (DNS server = the gateway
+        // today, the same NetConfig cross-lane gap net14 notes; falls back to querying the gateway directly
+        // as the time source), sets the wall-clock, and prints the boot witness. The resolved/fallback
+        // server is cached so the poll-loop re-sync can retry it. On a bench segment without upstream the
+        // honest witness is a `sntp timeout` line; the QEMU NET16-GATE is the correctness proof.
+        let sntp_server = net16_initial_sync(&mut iface, &mut dev, dns_ip, dns_ip);
+        // Seed the re-sync state: first opportunistic re-sync one interval out from boot.
+        let sntp_state = SntpState::Idle { due_ms: now_ms() + NET16_RESYNC_INTERVAL_MS };
+
         *NET_SERVICE.lock() = Some(NetService {
             iface,
             dev,
@@ -2501,6 +2630,9 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
             req_seen: [false; HTTP_POOL],
             active_since: [0; HTTP_POOL],
             mdns,
+            sntp,
+            sntp_server,
+            sntp_state,
             ip,
             req_buf: [[0u8; REQ_CAP]; HTTP_POOL],
             req_len: [0; HTTP_POOL],
@@ -3061,6 +3193,375 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
     }
 
     // ══════════════════════════════════════════════════════════════════════════════════════════════════
+    // PI-NET-16: "UnaOS knows what time it is" — SNTP client + a monotonic-anchored kernel wall-clock.
+    // ══════════════════════════════════════════════════════════════════════════════════════════════════
+    //
+    // UnaOS has a free-running counter (CNTPCT) and a 250 Hz tick, but no notion of *civil* time — nothing
+    // that can say "it is 2026-07-22T14:03:07Z". This section adds one, WITHOUT touching the shared
+    // kernel-core time files (a proper kernel-wide clock service is noted as an integrator fold below; the
+    // state here is module-local by construction). Two halves:
+    //
+    //   1. A hostile-input-hardened SNTP client (RFC 4330, client mode 3, v4) over UDP :123. It resolves
+    //      `pool.ntp.org` via the existing NET-14 DNS client (falling back to the gateway if DNS times
+    //      out), sends one request, and parses the 48-byte reply with EVERY field bounds-/sanity-checked.
+    //   2. A wall-clock: an (anchor_unix_secs, anchor_cntpct) pair captured at each successful sync. The
+    //      current UTC second is `anchor_unix + (cntpct_now - anchor_cntpct) / cntfrq` — the free-running
+    //      counter supplies the elapsed time between syns, so the clock advances monotonically between the
+    //      ~6-hourly re-syncs without any wall-clock hardware.
+    //
+    // The initial sync runs once (blocking, bounded) on the BSP at `arm_net_service` time, printing the
+    // boot witness. Re-sync rides the persistent poll loop as a small non-blocking state machine
+    // (`sntp_step`) over a UDP socket in the service's own pool, on a ~6 h cadence.
+
+    /// Host resolved for the time source. `pool.ntp.org` load-balances across the NTP pool; any one A
+    /// record is a stratum-1/2/3 server that answers plain SNTP on :123.
+    const NET16_HOST: &str = "pool.ntp.org";
+    /// DNS transaction id + ephemeral source ports for the SNTP client sockets (distinct from NET-14's,
+    /// well clear of the well-known ports the service listens on).
+    const NET16_TXID: u16 = 0x4e36;
+    const NET16_DNS_SPORT: u16 = 49523;
+    const NET16_SNTP_SPORT: u16 = 49525;
+    /// The well-known NTP/SNTP port.
+    const NTP_PORT: u16 = 123;
+    /// Bounded real-time windows (CNTPCT ms). DNS mirrors NET-14 (resend across the window so an
+    /// ARP-dropped first datagram is retried); the SNTP exchange is a single request with a resend cadence.
+    const NET16_DNS_WINDOW_MS: i64 = 2_500;
+    const NET16_DNS_RESEND_MS: i64 = 400;
+    const NET16_SNTP_WINDOW_MS: i64 = 2_000;
+    const NET16_SNTP_RESEND_MS: i64 = 500;
+    /// Opportunistic re-sync cadence (ms) — every ~6 h of uptime the poll-loop state machine re-queries the
+    /// cached server. On a failed re-sync it retries sooner rather than waiting the full interval.
+    const NET16_RESYNC_INTERVAL_MS: i64 = 6 * 3_600 * 1_000;
+    const NET16_RESYNC_RETRY_MS: i64 = 5 * 60 * 1_000;
+
+    /// Seconds between the NTP epoch (1900-01-01) and the Unix epoch (1970-01-01).
+    const NTP_UNIX_DELTA: u64 = 2_208_988_800;
+    /// Era-1 offset (2^32 - NTP_UNIX_DELTA): added to an NTP seconds value whose high bit is CLEAR, which
+    /// per RFC 4330 §3 denotes a timestamp in the era beginning 2036-02-07 (see the 2036 rollover note).
+    const NTP_ERA1_OFFSET: u64 = 2_085_978_496;
+    /// Sanity band on the resolved Unix time: reject anything before 2023-11 or after ~2096. A server that
+    /// answers with a wildly-out-of-band timestamp (misconfigured, spoofed, or a stratum-0 KoD that slipped
+    /// the stratum check) is rejected rather than jamming the clock to a nonsense year.
+    const NET16_SANE_MIN_UNIX: u64 = 1_700_000_000; // ~2023-11-14
+    const NET16_SANE_MAX_UNIX: u64 = 4_000_000_000; // ~2096-10
+
+    /// The SNTP client request first byte: LI=0 (no warning), VN=4, Mode=3 (client). `(0<<6)|(4<<3)|3`.
+    const SNTP_REQ_B0: u8 = 0x23;
+
+    /// PI-NET-16 witness/diagnostic counters (the re-sync state machine bumps these; the gate asserts them).
+    static NET16_SYNCS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    static NET16_TIMEOUTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    static NET16_REJECTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+    /// The monotonic-anchored wall-clock. Captured at each successful sync: `anchor_unix` is the UTC second
+    /// the server reported; `anchor_cntpct` is the free-running counter value read in the same breath. The
+    /// live time is extrapolated from the counter, so the clock ticks forward between syns with no drift
+    /// beyond the counter's (and never runs backwards within one anchor).
+    #[derive(Clone, Copy)]
+    struct WallClock {
+        anchor_unix: u64,
+        anchor_cntpct: u64,
+        stratum: u8,
+    }
+    /// Module-local wall-clock state. INTEGRATOR FOLD: a proper kernel-wide clock service belongs in a
+    /// shared core file (so `time`/log timestamps/filesystem mtimes can all read it); this arc keeps the
+    /// state here, in-lane, and exposes a small read API. When the shared service lands, this becomes its
+    /// backing store or is migrated wholesale.
+    static WALL_CLOCK: spin::Mutex<Option<WallClock>> = spin::Mutex::new(None);
+
+    /// Anchor the wall-clock to `unix_secs` (UTC), reading CNTPCT now as the monotonic reference. Bumps the
+    /// sync counter. This is the ONLY writer of `WALL_CLOCK`.
+    fn wall_set(unix_secs: u64, stratum: u8) {
+        *WALL_CLOCK.lock() = Some(WallClock {
+            anchor_unix: unix_secs,
+            anchor_cntpct: cntpct(),
+            stratum,
+        });
+        NET16_SYNCS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Current extrapolated UTC Unix seconds, or `None` if never synced. Adds the counter-measured elapsed
+    /// seconds since the anchor to the anchored second — monotonic, non-hanging (CNTPCT is free-running).
+    fn wall_unix_now() -> Option<u64> {
+        let wc = (*WALL_CLOCK.lock())?;
+        let frq: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, cntfrq_el0", out(reg) frq, options(nomem, nostack, preserves_flags));
+        }
+        if frq == 0 {
+            return Some(wc.anchor_unix);
+        }
+        let elapsed = cntpct().wrapping_sub(wc.anchor_cntpct) / frq;
+        Some(wc.anchor_unix.saturating_add(elapsed))
+    }
+
+    /// Snapshot the raw anchor `(anchor_unix, stratum)` — the deterministic, non-extrapolated pair. Used by
+    /// the gate to assert an exact rendered ISO string without racing the free-running counter.
+    fn wall_anchor() -> Option<(u64, u8)> {
+        (*WALL_CLOCK.lock()).map(|wc| (wc.anchor_unix, wc.stratum))
+    }
+
+    /// Civil date/time from Unix seconds (UTC), no floats. Howard Hinnant's days→civil algorithm, proven
+    /// exact for the whole proleptic-Gregorian range. Returns `(year, month[1..12], day[1..31], h, m, s)`.
+    fn civil_from_unix(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
+        let days = (secs / 86_400) as i64;
+        let rem = (secs % 86_400) as u32;
+        let (hh, mm, ss) = (rem / 3_600, (rem % 3_600) / 60, rem % 60);
+        // Shift the epoch so era math has no negative-days special case for our band (days >= 0 here).
+        let z = days + 719_468;
+        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+        let doe = z - era * 146_097; // [0, 146096]
+        let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+        let mp = (5 * doy + 2) / 153; // [0, 11]
+        let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+        let month = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32; // [1, 12]
+        let year = y + if month <= 2 { 1 } else { 0 };
+        (year, month, d, hh, mm, ss)
+    }
+
+    /// Render `unix_secs` (UTC) as an ISO-8601 `YYYY-MM-DDTHH:MM:SSZ` string into `out`, returning its
+    /// byte length (always 20 for a 4-digit year). Fixed-width, no allocation.
+    fn render_iso8601(unix_secs: u64, out: &mut [u8]) -> usize {
+        use core::fmt::Write as _;
+        let (y, mo, d, h, mi, s) = civil_from_unix(unix_secs);
+        let mut w = BufWriter { buf: out, len: 0 };
+        let _ = write!(w, "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, d, h, mi, s);
+        w.len
+    }
+
+    /// Typed outcome of parsing an SNTP reply — every failure mode gets its own witness.
+    enum Sntp {
+        /// A usable time: UTC Unix seconds + the server's stratum.
+        Ok { unix_secs: u64, stratum: u8 },
+        /// Stratum 0 = Kiss-o'-Death (rate-limit / deny). RFC 4330 §8: back off, do NOT use.
+        KissOfDeath,
+        /// Structurally invalid, wrong mode/version, LI=alarm(3), zero/insane timestamp — rejected.
+        Malformed,
+    }
+
+    /// Convert a 32-bit NTP seconds field to UTC Unix seconds, era-aware (see the 2036 rollover note): a
+    /// value with the high bit SET is era 0 (1900-based, 1968..2036); with it clear, era 1 (2036-based).
+    fn ntp_to_unix(ntp_secs: u32) -> u64 {
+        let s = ntp_secs as u64;
+        if s >= NTP_UNIX_DELTA {
+            s - NTP_UNIX_DELTA
+        } else {
+            s + NTP_ERA1_OFFSET
+        }
+    }
+
+    /// Parse an SNTP server reply. HOSTILE-INPUT HARDENED: the length is checked before any field read; the
+    /// LI/VN/Mode byte is decoded and an alarm LI (3), a version outside 3..=4, or a non-server mode (!=4)
+    /// is rejected; stratum 0 surfaces as KoD and stratum > 15 is rejected (reserved); the transmit
+    /// timestamp is read from a bounds-checked window and a zero or out-of-sanity-band time is rejected. No
+    /// path can panic. `pkt` is the raw UDP payload.
+    fn net16_parse_sntp(pkt: &[u8]) -> Sntp {
+        if pkt.len() < 48 {
+            return Sntp::Malformed; // an SNTP datagram is exactly 48 bytes (no extension/auth here)
+        }
+        let b0 = pkt[0];
+        let li = (b0 >> 6) & 0x3;
+        let vn = (b0 >> 3) & 0x7;
+        let mode = b0 & 0x7;
+        if li == 3 {
+            return Sntp::Malformed; // LI=3: server clock unsynchronized (alarm) — do not trust its time
+        }
+        if !(3..=4).contains(&vn) {
+            return Sntp::Malformed; // we speak SNTPv4; accept a v3 responder, reject anything else
+        }
+        if mode != 4 {
+            return Sntp::Malformed; // Mode 4 = server. A non-server reply is stale/spoofed
+        }
+        let stratum = pkt[1];
+        if stratum == 0 {
+            return Sntp::KissOfDeath; // stratum 0 = KoD packet
+        }
+        if stratum > 15 {
+            return Sntp::Malformed; // 16..=255 reserved / unsynchronized
+        }
+        // Transmit timestamp: seconds at [40..44], fraction at [44..48] (fraction unused — 1 s resolution
+        // is plenty for a civil clock, and avoids float math entirely).
+        let secs = u32::from_be_bytes([pkt[40], pkt[41], pkt[42], pkt[43]]);
+        if secs == 0 {
+            return Sntp::Malformed; // a zero transmit timestamp is not a real time
+        }
+        let unix = ntp_to_unix(secs);
+        if !(NET16_SANE_MIN_UNIX..=NET16_SANE_MAX_UNIX).contains(&unix) {
+            return Sntp::Malformed; // out of the plausible band — refuse to jam the clock to a nonsense year
+        }
+        Sntp::Ok { unix_secs: unix, stratum }
+    }
+
+    /// Build the 48-byte SNTP client request into `out[..48]` (LI=0/VN=4/Mode=3, all other fields zero,
+    /// per RFC 4330 §5 for a client-only request).
+    fn net16_build_request(out: &mut [u8; 48]) {
+        *out = [0u8; 48];
+        out[0] = SNTP_REQ_B0;
+    }
+
+    /// PI-NET-16: resolve `pool.ntp.org` to a single A record via UDP :53 to `dns_ip`, bounded + retransmit
+    /// (the NET-14 DNS shape). Returns `None` on timeout / server-error / malformed / no-answer — the caller
+    /// then falls back to the gateway. Uses its own temporary sockets; never touches the serving pool.
+    fn net16_resolve(iface: &mut Interface, dev: &mut SmoltcpPhy<GenetNic>, dns_ip: [u8; 4]) -> Option<[u8; 4]> {
+        let mut rx_meta = [udp::PacketMetadata::EMPTY; 4];
+        let mut rx_pl = [0u8; 768];
+        let mut tx_meta = [udp::PacketMetadata::EMPTY; 4];
+        let mut tx_pl = [0u8; 768];
+        let mut sock = udp::Socket::new(
+            udp::PacketBuffer::new(&mut rx_meta[..], &mut rx_pl[..]),
+            udp::PacketBuffer::new(&mut tx_meta[..], &mut tx_pl[..]),
+        );
+        if sock.bind(NET16_DNS_SPORT).is_err() {
+            return None;
+        }
+        let mut storage: [SocketStorage; 1] = Default::default();
+        let mut sockets = SocketSet::new(&mut storage[..]);
+        let h = sockets.add(sock);
+
+        let mut qbuf = [0u8; 300];
+        let qlen = net14_build_dns_query(&mut qbuf, NET16_TXID, NET16_HOST)?;
+        let dst = IpEndpoint::new(IpAddress::v4(dns_ip[0], dns_ip[1], dns_ip[2], dns_ip[3]), 53);
+
+        let t0 = now_ms();
+        let mut next_send = t0;
+        loop {
+            let t = now_ms();
+            if t.saturating_sub(t0) >= NET16_DNS_WINDOW_MS {
+                return None;
+            }
+            iface.poll(Instant::from_millis(t), dev, &mut sockets);
+            let s = sockets.get_mut::<udp::Socket>(h);
+            if t >= next_send && s.can_send() {
+                let _ = s.send_slice(&qbuf[..qlen], dst);
+                next_send = t + NET16_DNS_RESEND_MS;
+            }
+            if s.can_recv() {
+                let mut rb = [0u8; 768];
+                if let Ok((n, _meta)) = s.recv_slice(&mut rb) {
+                    if let Net14Dns::Resolved(ip) = net14_parse_a(&rb[..n], NET16_TXID) {
+                        return Some(ip);
+                    }
+                    return None; // a response arrived but had no usable A record — fall back
+                }
+            }
+        }
+    }
+
+    /// PI-NET-16: one bounded, blocking SNTP exchange with `server` over UDP :123, with a resend cadence
+    /// (the first datagram races ARP resolution). Returns the parsed [`Sntp`] outcome and the measured
+    /// round-trip time in ms, or `None` on window timeout. Temporary sockets only.
+    fn net16_query(
+        iface: &mut Interface,
+        dev: &mut SmoltcpPhy<GenetNic>,
+        server: [u8; 4],
+    ) -> Option<(Sntp, i64)> {
+        let mut rx_meta = [udp::PacketMetadata::EMPTY; 4];
+        let mut rx_pl = [0u8; 256];
+        let mut tx_meta = [udp::PacketMetadata::EMPTY; 4];
+        let mut tx_pl = [0u8; 256];
+        let mut sock = udp::Socket::new(
+            udp::PacketBuffer::new(&mut rx_meta[..], &mut rx_pl[..]),
+            udp::PacketBuffer::new(&mut tx_meta[..], &mut tx_pl[..]),
+        );
+        if sock.bind(NET16_SNTP_SPORT).is_err() {
+            return None;
+        }
+        let mut storage: [SocketStorage; 1] = Default::default();
+        let mut sockets = SocketSet::new(&mut storage[..]);
+        let h = sockets.add(sock);
+
+        let mut req = [0u8; 48];
+        net16_build_request(&mut req);
+        let dst = IpEndpoint::new(IpAddress::v4(server[0], server[1], server[2], server[3]), NTP_PORT);
+
+        let t0 = now_ms();
+        let mut next_send = t0;
+        let mut sent_at = t0;
+        loop {
+            let t = now_ms();
+            if t.saturating_sub(t0) >= NET16_SNTP_WINDOW_MS {
+                return None;
+            }
+            iface.poll(Instant::from_millis(t), dev, &mut sockets);
+            let s = sockets.get_mut::<udp::Socket>(h);
+            if t >= next_send && s.can_send() {
+                if s.send_slice(&req, dst).is_ok() {
+                    sent_at = t;
+                }
+                next_send = t + NET16_SNTP_RESEND_MS;
+            }
+            if s.can_recv() {
+                let mut rb = [0u8; 128];
+                if let Ok((n, _meta)) = s.recv_slice(&mut rb) {
+                    let rtt = now_ms().saturating_sub(sent_at).max(0);
+                    return Some((net16_parse_sntp(&rb[..n]), rtt));
+                }
+            }
+        }
+    }
+
+    /// PI-NET-16: the initial (blocking, bounded) time sync, run once on the BSP at `arm_net_service`. It
+    /// resolves the time source (DNS → `pool.ntp.org`, gateway fallback), queries it, sets the wall-clock,
+    /// and prints the boot witness on success or an honest one-liner on each failure mode. Returns the
+    /// server address to CACHE for the poll-loop re-sync (whichever address we ended up trying), or `None`
+    /// if we could not even form one.
+    fn net16_initial_sync(
+        iface: &mut Interface,
+        dev: &mut SmoltcpPhy<GenetNic>,
+        dns_ip: [u8; 4],
+        gw: [u8; 4],
+    ) -> Option<[u8; 4]> {
+        let server = match net16_resolve(iface, dev, dns_ip) {
+            Some(ip) => {
+                serial_println!(
+                    "{} [net16] dns {} -> {}.{}.{}.{} ::",
+                    PG, NET16_HOST, ip[0], ip[1], ip[2], ip[3]
+                );
+                ip
+            }
+            None => {
+                serial_println!(
+                    "{} [net16] dns {} => timeout — falling back to gateway {}.{}.{}.{} as time source ::",
+                    PG, NET16_HOST, gw[0], gw[1], gw[2], gw[3]
+                );
+                gw
+            }
+        };
+
+        match net16_query(iface, dev, server) {
+            Some((Sntp::Ok { unix_secs, stratum }, rtt)) => {
+                wall_set(unix_secs, stratum);
+                let mut iso = [0u8; 24];
+                let n = render_iso8601(unix_secs, &mut iso);
+                serial_println!(
+                    "{} [net16] sntp {}.{}.{}.{} -> {} (stratum {}, rtt ~{} ms) ::",
+                    PG, server[0], server[1], server[2], server[3],
+                    core::str::from_utf8(&iso[..n]).unwrap_or("<iso>"),
+                    stratum, rtt
+                );
+            }
+            Some((Sntp::KissOfDeath, _)) => {
+                NET16_REJECTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                serial_println!("{} [net16] sntp {}.{}.{}.{} => sntp KoD (rejected) ::", PG,
+                    server[0], server[1], server[2], server[3]);
+            }
+            Some((Sntp::Malformed, _)) => {
+                NET16_REJECTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                serial_println!("{} [net16] sntp {}.{}.{}.{} => sntp malformed (rejected) ::", PG,
+                    server[0], server[1], server[2], server[3]);
+            }
+            None => {
+                NET16_TIMEOUTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                serial_println!("{} [net16] sntp {}.{}.{}.{} => sntp timeout ::", PG,
+                    server[0], server[1], server[2], server[3]);
+            }
+        }
+        Some(server)
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════════════════════════
     // PI-NET-13: the QEMU TCP/HTTP/mDNS regression gate — a hardware-free loopback seam + scripted peer.
     // ══════════════════════════════════════════════════════════════════════════════════════════════════
     //
@@ -3240,10 +3741,10 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
             // Kernel service: the REAL NetService methods over the loopback phy + the identical socket pool.
             let mut kdev = SmoltcpPhy::<KernelLoopNic>::new();
             let mut kiface = build_iface(&mut kdev, KMAC, KIP, 0x4b45_524e); // "KERN"
-            let kstorage: &'static mut [SocketStorage; HTTP_POOL + 1] =
+            let kstorage: &'static mut [SocketStorage; HTTP_POOL + 2] =
                 Box::leak(Box::new(Default::default()));
             let mut ksockets = SocketSet::new(&mut kstorage[..]);
-            let (http, mdns, listening, _bound, _joined) =
+            let (http, mdns, sntp, listening, _bound, _joined) =
                 build_net_sockets(&mut kiface, &mut ksockets);
             let mut ks = NetService {
                 iface: kiface,
@@ -3253,6 +3754,9 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
                 req_seen: [false; HTTP_POOL],
                 active_since: [0; HTTP_POOL],
                 mdns,
+                sntp,
+                sntp_server: None,
+                sntp_state: SntpState::Idle { due_ms: i64::MAX },
                 ip: KIP,
                 req_buf: [[0u8; REQ_CAP]; HTTP_POOL],
                 req_len: [0; HTTP_POOL],
@@ -3769,10 +4273,10 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
 
             let mut kdev = SmoltcpPhy::<KernelLoopNic>::new();
             let mut kiface = build_iface(&mut kdev, KMAC, KIP, 0x4b31_3500); // "K15"
-            let kstorage: &'static mut [SocketStorage; HTTP_POOL + 1] =
+            let kstorage: &'static mut [SocketStorage; HTTP_POOL + 2] =
                 Box::leak(Box::new(Default::default()));
             let mut ksockets = SocketSet::new(&mut kstorage[..]);
-            let (http, mdns, listening, _b, _j) = build_net_sockets(&mut kiface, &mut ksockets);
+            let (http, mdns, sntp, listening, _b, _j) = build_net_sockets(&mut kiface, &mut ksockets);
             let mut ks = NetService {
                 iface: kiface,
                 dev: kdev,
@@ -3781,6 +4285,9 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
                 req_seen: [false; HTTP_POOL],
                 active_since: [0; HTTP_POOL],
                 mdns,
+                sntp,
+                sntp_server: None,
+                sntp_state: SntpState::Idle { due_ms: i64::MAX },
                 ip: KIP,
                 req_buf: [[0u8; REQ_CAP]; HTTP_POOL],
                 req_len: [0; HTTP_POOL],
@@ -3871,6 +4378,204 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
             let pass = w == 0x1f;
             serial_println!(
                 ":: NET15-GATE: fs route battery {} [w=0x{:x}] (fs-list|exact-bytes|traversal-reject|404|oversize-413) ::",
+                if pass { "PASS" } else { "FAIL" }, w
+            );
+        }
+
+        // ── PI-NET-16 gate helpers ────────────────────────────────────────────────────────────────────
+        /// The injected wall-clock instant the SNTP gate scripts: 2026-07-22T15:30:45Z. `INJ_UNIX` is its
+        /// UTC Unix seconds (independently computed: 20656 days to 2026-07-22 × 86400 + 55845 s-of-day) and
+        /// `INJ_ISO` the string `render_iso8601` must reproduce from it — the round-trip correctness anchor.
+        const INJ_UNIX: u64 = 1_784_734_245;
+        const INJ_ISO: &str = "2026-07-22T15:30:45Z";
+        /// A black-hole address with no host on the loopback segment (ARP goes unanswered) — drives the
+        /// re-sync timeout path deterministically.
+        const BLACKHOLE: [u8; 4] = [10, 0, 0, 9];
+
+        /// Build a 48-byte SNTP server reply carrying transmit-timestamp `unix_secs` (converted to the NTP
+        /// era-0 epoch), with the given `li`/`vn`/`mode`/`stratum`. The gate uses this to script both
+        /// well-formed and adversarial replies against `net16_parse_sntp`.
+        fn build_sntp_reply(unix_secs: u64, li: u8, vn: u8, mode: u8, stratum: u8) -> Vec<u8> {
+            let mut v: Vec<u8> = Vec::new();
+            v.resize(48, 0u8);
+            v[0] = ((li & 0x3) << 6) | ((vn & 0x7) << 3) | (mode & 0x7);
+            v[1] = stratum;
+            let ntp_secs = (unix_secs + NTP_UNIX_DELTA) as u32;
+            v[40..44].copy_from_slice(&ntp_secs.to_be_bytes());
+            v
+        }
+
+        /// PI-NET-16: the SNTP client + wall-clock gate. Bitmask `w`:
+        ///   0x01 parser accepts a well-formed reply → the exact injected time (round-trips through the NTP
+        ///        epoch AND renders to `INJ_ISO`); 0x02 rejects a short (<48 B) packet; 0x04 surfaces a
+        ///        stratum-0 Kiss-o'-Death; 0x08 rejects an LI=3 (alarm/unsynchronized) reply; 0x10 a live
+        ///        loopback SNTP exchange sets the wall-clock and the anchored ISO matches `INJ_ISO`; 0x20 a
+        ///        re-sync to a black-hole address times out (honest timeout path). PASS = 0x3f.
+        pub fn run16() {
+            *K_RX.lock() = Some(VecDeque::new());
+            *P_RX.lock() = Some(VecDeque::new());
+            let mut w: u32 = 0;
+
+            // ── Pure hostile-input parser checks (the security surface in isolation). ──
+            let good = build_sntp_reply(INJ_UNIX, 0, 4, 4, 2);
+            let parse_ok = match net16_parse_sntp(&good) {
+                Sntp::Ok { unix_secs, stratum } => {
+                    let mut iso = [0u8; 24];
+                    let n = render_iso8601(unix_secs, &mut iso);
+                    unix_secs == INJ_UNIX
+                        && stratum == 2
+                        && core::str::from_utf8(&iso[..n]) == Ok(INJ_ISO)
+                }
+                _ => false,
+            };
+            if parse_ok {
+                w |= 0x01;
+            }
+            serial_println!(
+                "{} [net16t] parse well-formed => {} ::",
+                PG, if parse_ok { "resolved+ISO PASS" } else { "FAIL" }
+            );
+
+            let short = &good[..40];
+            let rej_short = matches!(net16_parse_sntp(short), Sntp::Malformed);
+            if rej_short {
+                w |= 0x02;
+            }
+            serial_println!(
+                "{} [net16t] reject short packet => {} ::",
+                PG, if rej_short { "malformed PASS" } else { "FAIL" }
+            );
+
+            let kod = build_sntp_reply(INJ_UNIX, 0, 4, 4, 0);
+            let is_kod = matches!(net16_parse_sntp(&kod), Sntp::KissOfDeath);
+            if is_kod {
+                w |= 0x04;
+            }
+            serial_println!(
+                "{} [net16t] surface KoD (stratum 0) => {} ::",
+                PG, if is_kod { "KoD PASS" } else { "FAIL" }
+            );
+
+            let alarm = build_sntp_reply(INJ_UNIX, 3, 4, 4, 2);
+            let rej_alarm = matches!(net16_parse_sntp(&alarm), Sntp::Malformed);
+            if rej_alarm {
+                w |= 0x08;
+            }
+            serial_println!(
+                "{} [net16t] reject LI=3 alarm => {} ::",
+                PG, if rej_alarm { "malformed PASS" } else { "FAIL" }
+            );
+
+            // ── Live loopback SNTP exchange over the REAL service `sntp_step`: kernel = client (KIP), peer
+            //    answers on :123 with the injected timestamp. Asserts the wall-clock is anchored and the
+            //    anchored ISO is exactly INJ_ISO. ──
+            {
+                *WALL_CLOCK.lock() = None; // start unsynced so this scenario proves the set
+                let mut kdev = SmoltcpPhy::<KernelLoopNic>::new();
+                let mut kiface = build_iface(&mut kdev, KMAC, KIP, 0x4b31_3600); // "K16"
+                let kstorage: &'static mut [SocketStorage; HTTP_POOL + 2] =
+                    Box::leak(Box::new(Default::default()));
+                let mut ksockets = SocketSet::new(&mut kstorage[..]);
+                let (http, mdns, sntp, _l, _b, _j) = build_net_sockets(&mut kiface, &mut ksockets);
+                let mut ks = NetService {
+                    iface: kiface,
+                    dev: kdev,
+                    sockets: ksockets,
+                    http,
+                    req_seen: [false; HTTP_POOL],
+                    active_since: [0; HTTP_POOL],
+                    mdns,
+                    sntp,
+                    // Seed the peer (PIP) as the time source and make the first re-sync due immediately.
+                    sntp_server: Some(PIP),
+                    sntp_state: SntpState::Idle { due_ms: 0 },
+                    ip: KIP,
+                    req_buf: [[0u8; REQ_CAP]; HTTP_POOL],
+                    req_len: [0; HTTP_POOL],
+                    resp: core::array::from_fn(|_| None),
+                };
+
+                let mut pdev = SmoltcpPhy::<PeerLoopNic>::new();
+                let mut pface = build_iface(&mut pdev, PMAC, PIP, 0x5031_3600); // "P16"
+                let pstorage: &'static mut [SocketStorage; 4] = Box::leak(Box::new(Default::default()));
+                let mut psock = SocketSet::new(&mut pstorage[..]);
+                // Peer NTP server socket bound to :123.
+                let prx: &'static mut [udp::PacketMetadata; 4] =
+                    Box::leak(Box::new([udp::PacketMetadata::EMPTY; 4]));
+                let prxp: &'static mut [u8; 256] = Box::leak(Box::new([0u8; 256]));
+                let ptx: &'static mut [udp::PacketMetadata; 4] =
+                    Box::leak(Box::new([udp::PacketMetadata::EMPTY; 4]));
+                let ptxp: &'static mut [u8; 256] = Box::leak(Box::new([0u8; 256]));
+                let mut pu = udp::Socket::new(
+                    udp::PacketBuffer::new(&mut prx[..], &mut prxp[..]),
+                    udp::PacketBuffer::new(&mut ptx[..], &mut ptxp[..]),
+                );
+                let _ = pu.bind(NTP_PORT);
+                let ph = psock.add(pu);
+
+                let mut clk: i64 = 0;
+                for _ in 0..160 {
+                    let t = Instant::from_millis(clk);
+                    ks.iface.poll(t, &mut ks.dev, &mut ks.sockets);
+                    ks.sntp_step(clk);
+                    pface.poll(t, &mut pdev, &mut psock);
+                    let ps = psock.get_mut::<udp::Socket>(ph);
+                    if ps.can_recv() {
+                        let mut qb = [0u8; 128];
+                        if let Ok((_n, meta)) = ps.recv_slice(&mut qb) {
+                            let reply = build_sntp_reply(INJ_UNIX, 0, 4, 4, 2);
+                            let _ = ps.send_slice(&reply, meta.endpoint);
+                        }
+                    }
+                    clk += STEP_MS;
+                    if wall_anchor().is_some() {
+                        // Let the step settle back to Idle; the anchor is set.
+                        break;
+                    }
+                }
+                let live_ok = match wall_anchor() {
+                    Some((anchor_unix, stratum)) => {
+                        let mut iso = [0u8; 24];
+                        let n = render_iso8601(anchor_unix, &mut iso);
+                        stratum == 2 && core::str::from_utf8(&iso[..n]) == Ok(INJ_ISO)
+                    }
+                    None => false,
+                };
+                if live_ok {
+                    w |= 0x10;
+                }
+                serial_println!(
+                    "{} [net16] loopback sntp sets clock => {} ::",
+                    PG, if live_ok { "2026-07-22T15:30:45Z PASS" } else { "FAIL" }
+                );
+
+                // ── Timeout path: re-target the SAME service at a black-hole address, make a re-sync due,
+                //    and pump well past the window — the reply never comes, so `sntp_step` must take the
+                //    timeout branch (NET16_TIMEOUTS bumps) and fall back to Idle. ──
+                let to_before = NET16_TIMEOUTS.load(core::sync::atomic::Ordering::Relaxed);
+                ks.sntp_server = Some(BLACKHOLE);
+                ks.sntp_state = SntpState::Idle { due_ms: clk };
+                for _ in 0..200 {
+                    let t = Instant::from_millis(clk);
+                    ks.iface.poll(t, &mut ks.dev, &mut ks.sockets);
+                    ks.sntp_step(clk);
+                    pface.poll(t, &mut pdev, &mut psock);
+                    clk += STEP_MS;
+                }
+                let timed_out =
+                    NET16_TIMEOUTS.load(core::sync::atomic::Ordering::Relaxed) > to_before;
+                if timed_out {
+                    w |= 0x20;
+                }
+                serial_println!(
+                    "{} [net16] resync black-hole => {} ::",
+                    PG, if timed_out { "timeout PASS" } else { "FAIL" }
+                );
+            }
+
+            let pass = w == 0x3f;
+            serial_println!(
+                ":: NET16-GATE: sntp client battery {} [w=0x{:x}] (parse-ok+iso|reject-short|kod|reject-alarm|live-set-clock|resync-timeout) ::",
                 if pass { "PASS" } else { "FAIL" }, w
             );
         }
