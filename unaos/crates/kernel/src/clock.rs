@@ -171,10 +171,20 @@ pub fn set(t: WallTime) -> Result<(), ()> {
     if !t.is_valid() {
         return Err(());
     }
+    let base_secs = t.to_secs();
     let ticks = monotonic().map(|(p, _)| p).unwrap_or(0);
-    *ANCHOR.lock() = Some(Anchor { base_secs: t.to_secs(), anchor_ticks: ticks });
+    *ANCHOR.lock() = Some(Anchor { base_secs, anchor_ticks: ticks });
+    // CLOCK-1: an operator seed is also a civil-clock anchor — plant a `Manual` Unix anchor so `time`
+    // (and future log/mtime readers) reflect the setdate. Reads the SAME monotonic tick, so the two
+    // anchors advance in lock-step. This does NOT touch the FAT anchor above, so `date`/`fat_stamp`
+    // witnesses are byte-identical to JD17.
+    set_anchor(base_secs.saturating_add(UNIX_1980), ticks, ClockSource::Manual);
     Ok(())
 }
+
+/// Whole seconds between the Unix epoch (1970-01-01) and the FAT epoch (1980-01-01): 10 years, two of
+/// them leap (1972, 1976). Bridges JD17's FAT-epoch anchor to CLOCK-1's Unix-epoch civil clock.
+const UNIX_1980: u64 = 315_532_800;
 
 /// JD18: whole seconds since boot from the free-running architectural counter, INDEPENDENT of
 /// whether the wall clock has been seeded. aarch64: `CNTPCT_EL0 / CNTFRQ_EL0` (the counter resets to
@@ -196,6 +206,136 @@ pub fn now() -> Option<WallTime> {
         None => 0, // no invariant/calibrated counter: frozen at the seeded value, documented above
     };
     Some(WallTime::from_secs(a.base_secs.saturating_add(elapsed)))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// CLOCK-1 — the shared kernel WALL-CLOCK SERVICE (Unix-epoch, source-tagged).
+//
+// JD17 above serves the FAT consumer in FAT's own epoch (whole seconds since 1980, operator-seeded).
+// CLOCK-1 adds the arch-agnostic *civil* clock the rest of the kernel wants: a single Unix-second
+// anchor plus the source that set it, so `time`, log timestamps, and fs mtimes can eventually all
+// read one clock. It shares the SAME arch monotonic seam as JD17 (`monotonic()` above: aarch64
+// CNTPCT/CNTFRQ, x86_64 the CLOCK-X1 invariant TSC), so it works on both arches with no new plumbing.
+//
+// This arc lands the SERVICE + the SNTP migration (pi/genet's PI-NET-16 wall-clock forwards here).
+// Log-timestamp and fs-mtime adoption are each a named follow-up (see docs/dev/OS/02_KERNEL_CORE):
+// this arc does NOT rewire `fat_stamp()`/`now()` onto the Unix anchor — the FAT anchor stays JD17's,
+// so no fs-mtime behaviour changes here.
+
+/// Where the current Unix anchor came from. `Unset` is first-class (no anchor yet — the honest state
+/// the `time` verb prints as `unsynced`). `Sntp{stratum}` is a network sync (pi/genet PI-NET-16);
+/// `Manual` is an operator seed (the `setdate` verb also plants one, so `time` reflects it).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ClockSource {
+    Unset,
+    Manual,
+    Sntp { stratum: u8 },
+}
+
+/// The canonical civil-time anchor: a UTC Unix second paired with the monotonic counter reading taken
+/// in the same breath, plus the source that planted it. `unix_now()` = `base_unix` + (monotonic
+/// elapsed since `anchor_ticks`). One small lock (anchoring is rare; reads are a couple of loads).
+struct UnixAnchor {
+    /// UTC seconds since the Unix epoch (1970-01-01T00:00:00Z) at the moment of anchoring.
+    base_unix: u64,
+    /// The architectural monotonic counter at the moment of anchoring (from `monotonic()`; 0 where
+    /// no counter is available, in which case the clock stays honestly frozen at `base_unix`).
+    anchor_ticks: u64,
+    /// What set this anchor.
+    source: ClockSource,
+}
+
+static UNIX_ANCHOR: Mutex<Option<UnixAnchor>> = Mutex::new(None);
+
+/// Read the shared arch monotonic counter (ticks only), for callers that want to capture the counter
+/// "in the same breath" as a network/operator timestamp and pass it to `set_anchor`. `None` where the
+/// arch provides no trustworthy counter (a non-invariant/uncalibrated x86 TSC, or CNTFRQ==0).
+pub fn mono_ticks() -> Option<u64> {
+    monotonic().map(|(ticks, _)| ticks)
+}
+
+/// Anchor the civil clock to `unix_secs` (UTC), pairing it with `mono_now` (a `mono_ticks()` reading
+/// captured at the same instant) and tagging it with `source`. The ONLY writer of `UNIX_ANCHOR`.
+/// Re-anchoring simply replaces the anchor — a fresh sync or operator correction wins.
+pub fn set_anchor(unix_secs: u64, mono_now: u64, source: ClockSource) {
+    *UNIX_ANCHOR.lock() = Some(UnixAnchor { base_unix: unix_secs, anchor_ticks: mono_now, source });
+}
+
+/// Current UTC Unix seconds: the anchored second plus counter-measured whole seconds elapsed since,
+/// or `None` while the clock has never been anchored this boot (the honest UNSET state). Monotonic and
+/// non-hanging (the arch counter is free-running); frozen at `base_unix` where no counter is available.
+pub fn unix_now() -> Option<u64> {
+    let guard = UNIX_ANCHOR.lock();
+    let a = guard.as_ref()?;
+    let elapsed = match monotonic() {
+        Some((ticks, freq)) => ticks.wrapping_sub(a.anchor_ticks) / freq,
+        None => 0, // no invariant/calibrated counter: frozen at the anchored value
+    };
+    Some(a.base_unix.saturating_add(elapsed))
+}
+
+/// The source of the current anchor, or `ClockSource::Unset` while never anchored.
+pub fn source() -> ClockSource {
+    (*UNIX_ANCHOR.lock()).as_ref().map(|a| a.source).unwrap_or(ClockSource::Unset)
+}
+
+/// The raw, NON-extrapolated anchor pair `(base_unix, source)` — deterministic, does not race the
+/// free-running counter. Used by the pi/genet NET16-GATE to assert an exact rendered ISO string.
+pub fn raw_anchor() -> Option<(u64, ClockSource)> {
+    (*UNIX_ANCHOR.lock()).as_ref().map(|a| (a.base_unix, a.source))
+}
+
+/// Civil date/time from UTC Unix seconds, no floats. Howard Hinnant's days→civil algorithm, exact for
+/// the whole proleptic-Gregorian range. Returns `(year, month[1..12], day[1..31], h, m, s)`. Moved here
+/// (CLOCK-1) from pi/genet PI-NET-16 so `time` and the SNTP client render civil time through one path.
+pub fn civil_from_unix(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
+    let days = (secs / 86_400) as i64;
+    let rem = (secs % 86_400) as u32;
+    let (hh, mm, ss) = (rem / 3_600, (rem % 3_600) / 60, rem % 60);
+    // Shift the epoch so era math has no negative-days special case for our band (days >= 0 here).
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let month = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32; // [1, 12]
+    let year = y + if month <= 2 { 1 } else { 0 };
+    (year, month, d, hh, mm, ss)
+}
+
+/// A fixed-width byte writer for the ISO renderer (no allocation, no heap).
+struct IsoWriter<'a> {
+    buf: &'a mut [u8],
+    len: usize,
+}
+impl core::fmt::Write for IsoWriter<'_> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let b = s.as_bytes();
+        let end = core::cmp::min(self.buf.len(), self.len + b.len());
+        let n = end - self.len;
+        self.buf[self.len..end].copy_from_slice(&b[..n]);
+        self.len = end;
+        Ok(())
+    }
+}
+
+/// Render `unix_secs` (UTC) as ISO-8601 `YYYY-MM-DDTHH:MM:SSZ` into `out`, returning its byte length
+/// (20 for a 4-digit year). Fixed-width, no allocation. Moved here (CLOCK-1) from pi/genet PI-NET-16.
+pub fn render_iso8601(unix_secs: u64, out: &mut [u8]) -> usize {
+    use core::fmt::Write as _;
+    let (y, mo, d, h, mi, s) = civil_from_unix(unix_secs);
+    let mut w = IsoWriter { buf: out, len: 0 };
+    let _ = write!(w, "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, d, h, mi, s);
+    w.len
+}
+
+/// Render "now" as ISO-8601 UTC into `out`, returning `Some(len)`, or `None` while unset (the honest
+/// state the `time` verb prints as `unsynced`). The one call the shell's `time` verb makes.
+pub fn iso8601_now(out: &mut [u8]) -> Option<usize> {
+    unix_now().map(|secs| render_iso8601(secs, out))
 }
 
 /// The two packed FAT on-disk words `(time @0x16, date @0x18)` for "now" — the exact layout

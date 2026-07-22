@@ -2027,6 +2027,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             #[cfg(target_arch = "aarch64")]
             console.println("          usnapls <gen> [path], usnapcat <gen> <path>  (read a snapshot; current-ACL enforced)");
             console.println("CLOCK:    date, setdate YYYY-MM-DD HH:MM[:SS]  (seeds mtime stamps; unset = honest dashes)");
+            console.println("          time  (shared civil clock: ISO-8601 UTC + source; unsynced until SNTP/setdate)");
             console.println("SMP:      sched (per-CPU run queues), pulse (full-screen CPU monitor)");
             // PI-APP-1: v3d-gated so the knob-off build's help text stays byte-identical to baseline.
             #[cfg(all(target_arch = "aarch64", feature = "v3d"))]
@@ -2060,6 +2061,26 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 }
                 _ => console.println(
                     "setdate: usage: setdate YYYY-MM-DD HH:MM[:SS]  (year 1980-2107)"),
+            }
+        },
+        "time" => {
+            // CLOCK-1: the shared kernel civil clock — ISO-8601 UTC plus the source that set it.
+            // UNSET is first-class and honest: `unsynced` until an SNTP sync (pi/genet PI-NET-16) or a
+            // `setdate` seeds it. x86 has no SNTP client yet, so `time` there reads `unsynced` until a
+            // manual `setdate` — the seam is what this arc delivers; x86 SNTP is a future rmbp arc.
+            let mut buf = [0u8; 24];
+            match crate::clock::iso8601_now(&mut buf) {
+                Some(n) => {
+                    let iso = core::str::from_utf8(&buf[..n]).unwrap_or("<iso>");
+                    let src = match crate::clock::source() {
+                        crate::clock::ClockSource::Sntp { stratum } =>
+                            alloc::format!("sntp, stratum {}", stratum),
+                        crate::clock::ClockSource::Manual => alloc::format!("manual"),
+                        crate::clock::ClockSource::Unset => alloc::format!("unsynced"),
+                    };
+                    console.println(&alloc::format!("{} ({})", iso, src));
+                }
+                None => console.println("time: unsynced (no SNTP sync or setdate yet)"),
             }
         },
         "clear" => {
