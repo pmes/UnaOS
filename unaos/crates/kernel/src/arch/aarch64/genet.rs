@@ -1250,6 +1250,12 @@ mod metal {
         #[cfg(feature = "nettest")]
         nettest::run16();
 
+        // PI-NET-17: the DNS-SD advertisement gate — the scripted peer sends PTR / meta / malformed /
+        // unknown-type mDNS queries against the SAME responder and asserts the PTR+SRV+TXT+A bundle,
+        // the service-type PTR, and clean silent drops. Prints `:: NET17-GATE: ... PASS [w=0x..] ::`.
+        #[cfg(feature = "nettest")]
+        nettest::run17();
+
         // ── M1: resolve the register base from the DTB. NO DTB node => QEMU / DTB-less boot: this build
         //    does NOT model GENET, and touching the register window would FAULT (external abort), not
         //    return poison. Skip BEFORE any MMIO — the piusb `dtb_has_pcie` discipline. This is the
@@ -1519,6 +1525,11 @@ mod metal {
         sntp: SocketHandle,
         sntp_server: Option<[u8; 4]>,
         sntp_state: SntpState,
+        /// PI-NET-17: gratuitous DNS-SD announcements remaining on bring-up, and the wall-clock ms the next
+        /// one is due. `announce_left` starts at `MDNS_ANNOUNCE_COUNT`; each `announce_step` fires one and
+        /// schedules the next `MDNS_ANNOUNCE_GAP_MS` out, printing the net17 witness when it reaches 0.
+        announce_left: u8,
+        announce_next_ms: i64,
         /// PI-NET-10: our configured IPv4 (leased or static-fallback), shown on the status page.
         ip: [u8; 4],
         /// PI-NET-15: per-listener request-line capture (method + path + version). Bytes accumulate here
@@ -1849,79 +1860,15 @@ Connection: close\r\nServer: UnaOS/genet\r\n\r\n",
     /// Bound on datagrams drained + answered per poll step (keeps the shared poll budget bounded so the
     /// HTTP service and net9 ARP/ICMP answering are never starved by an mDNS flood).
     const MDNS_MAX_PER_POLL: usize = 8;
+    /// PI-NET-17: number of gratuitous DNS-SD announcements on bring-up, and their spacing (RFC 6762 §8.3
+    /// says 2–8 announcements ≥1 s apart; we send 3).
+    const MDNS_ANNOUNCE_COUNT: u8 = 3;
+    const MDNS_ANNOUNCE_GAP_MS: i64 = 1_000;
 
     /// PI-NET-11: cumulative count of mDNS queries answered since boot (the `[net11] answered N` witness).
     static NET11_ANSWERED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
     fn net11_answered() -> u32 {
         NET11_ANSWERED.load(core::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// PI-NET-11: parse a DNS query and decide whether it asks for `unaos.local` (QTYPE A or ANY,
-    /// case-insensitive). Returns `Some(unicast_requested)` — the query's QU (unicast-response) bit — when
-    /// it matches, else `None`. EVERY read is bounds-checked (`get`/`get(..)` with `?`): a truncated or
-    /// malformed packet yields `None` and is dropped, never a panic. Name compression (a 0xC0 pointer) is
-    /// rejected defensively — a legitimate first-question QNAME in a query is never compressed.
-    fn mdns_wants_unaos(pkt: &[u8]) -> Option<bool> {
-        // DNS header is 12 bytes: ID, flags, QDCOUNT, ANCOUNT, NSCOUNT, ARCOUNT.
-        if pkt.len() < 12 {
-            return None;
-        }
-        let flags = u16::from_be_bytes([pkt[2], pkt[3]]);
-        // QR bit (0x8000) must be 0 (a query, not a response); opcode (bits 11..14) must be 0 (standard).
-        if flags & 0x8000 != 0 || (flags >> 11) & 0x0f != 0 {
-            return None;
-        }
-        let qdcount = u16::from_be_bytes([pkt[4], pkt[5]]);
-        if qdcount == 0 {
-            return None;
-        }
-        // Walk the first question's QNAME labels against ["unaos", "local"], case-insensitively.
-        let want: [&[u8]; 2] = [MDNS_HOST, MDNS_TLD];
-        let mut off = 12usize;
-        let mut li = 0usize;
-        loop {
-            let len = *pkt.get(off)? as usize;
-            off += 1;
-            if len == 0 {
-                break; // end of name
-            }
-            if len & 0xc0 != 0 {
-                return None; // compression pointer / reserved bits — bail defensively
-            }
-            let label = pkt.get(off..off + len)?;
-            off += len;
-            if li >= want.len() {
-                return None; // more labels than "unaos.local" has
-            }
-            let w = want[li];
-            if label.len() != w.len() {
-                return None;
-            }
-            for (a, b) in label.iter().zip(w.iter()) {
-                if a.to_ascii_lowercase() != *b {
-                    return None;
-                }
-            }
-            li += 1;
-        }
-        if li != want.len() {
-            return None; // fewer labels than "unaos.local"
-        }
-        // QTYPE + QCLASS follow the null terminator.
-        let qtype = u16::from_be_bytes([*pkt.get(off)?, *pkt.get(off + 1)?]);
-        let qclass = u16::from_be_bytes([*pkt.get(off + 2)?, *pkt.get(off + 3)?]);
-        // A = 1, ANY = 255.
-        if qtype != 1 && qtype != 255 {
-            return None;
-        }
-        // The QU (unicast-response) bit is the top bit of QCLASS; the low 15 bits carry the class
-        // (IN = 1, or ANY = 255).
-        let qu = qclass & 0x8000 != 0;
-        let cls = qclass & 0x7fff;
-        if cls != 1 && cls != 255 {
-            return None;
-        }
-        Some(qu)
     }
 
     /// PI-NET-11: build a standard mDNS A-record response for `unaos.local` -> `ip` into `out`, returning
@@ -1969,6 +1916,353 @@ Connection: close\r\nServer: UnaOS/genet\r\n\r\n",
         w += 4;
         debug_assert_eq!(w, RESP_LEN);
         w
+    }
+
+    // ── PI-NET-17: DNS-SD (RFC 6763) service advertisement over the same mDNS endpoint ────────────────
+    //
+    // The Pi already answers `unaos.local` A queries (net11). net17 makes it DISCOVERABLE: it advertises
+    // an `_http._tcp` service instance ("UnaOS Pi 4", port 80) so a macOS/Bonjour browser (`dns-sd -B
+    // _http._tcp`, Safari's network browser) lists the Pi by name. Three shapes:
+    //   * a PTR query for `_http._tcp.local` is answered with the PTR (service -> instance) as the answer
+    //     plus the SRV (instance -> unaos.local:80), TXT (`path=/`), and A (unaos.local -> lease) stuffed
+    //     into the ADDITIONAL section — the one-shot bundle a resolver needs to connect without re-asking;
+    //   * the meta-query `_services._dns-sd._udp.local` (PTR) is answered with the service-type PTR
+    //     (`_services._dns-sd._udp.local` -> `_http._tcp.local`) so a browser enumerating service *types*
+    //     sees `_http._tcp`;
+    //   * a direct SRV / TXT query for the instance name is answered with that record (SRV additionally
+    //     stuffs the A). Unknown QTYPEs for any of our names are ignored silently.
+    // On bring-up net17 also emits 2–3 gratuitous multicast announcements (RFC 6762 §8.3), spaced ≥1 s,
+    // carrying PTR+SRV+TXT+A in the ANSWER section so a browser already listening learns us immediately.
+    //
+    // HOSTILE-INPUT: the query classifier `mdns_classify` walks the first-question QNAME once through
+    // `mdns_read_name` — every byte bounds-checked, a bounded label count, compression pointers followed
+    // with the SAME hop-cap discipline `net14_skip_name` uses, reserved length bits rejected — then
+    // compares the decoded labels case-insensitively against our known names. Response records are written
+    // with names IN FULL (no compression pointers — the net11 responder writes full names too; simpler and
+    // legal), every write bounds-checked against the output buffer.
+
+    /// DNS RR/Q TYPE codes we handle.
+    const DNS_TYPE_A: u16 = 1;
+    const DNS_TYPE_PTR: u16 = 12;
+    const DNS_TYPE_TXT: u16 = 16;
+    const DNS_TYPE_SRV: u16 = 33;
+    const DNS_TYPE_ANY: u16 = 255;
+
+    /// mDNS TTLs (RFC 6763 §10): host-name-bearing records (A, SRV) 120 s; shared records that carry no
+    /// host name (PTR, TXT) 4500 s.
+    const MDNS_TTL_HOST: u32 = 120;
+    const MDNS_TTL_SHARED: u32 = 4500;
+
+    /// The advertised service. Instance label carries a space — legal in a DNS-SD instance label (it is a
+    /// single label, length-prefixed on the wire, not a dotted name).
+    const LBL_INSTANCE: [&[u8]; 4] = [b"UnaOS Pi 4", b"_http", b"_tcp", b"local"];
+    const LBL_SERVICE: [&[u8]; 3] = [b"_http", b"_tcp", b"local"];
+    const LBL_META: [&[u8]; 4] = [b"_services", b"_dns-sd", b"_udp", b"local"];
+    const LBL_HOST: [&[u8]; 2] = [MDNS_HOST, MDNS_TLD];
+    /// The service's TCP port (the net10 HTTP status service).
+    const SVC_PORT: u16 = HTTP_PORT;
+    /// A single minimal TXT key/value. DNS-SD requires a non-empty TXT; `path=/` is the conventional hint.
+    const SVC_TXT: &[u8] = b"path=/";
+
+    /// PI-NET-17: per-record-kind answered census (the `[net17] answered ptr/srv/txt` witness). PTR counts
+    /// both the service-PTR and the meta-PTR answers; SRV/TXT count direct instance queries.
+    static NET17_PTR: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    static NET17_SRV: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    static NET17_TXT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    fn net17_counts() -> (u32, u32, u32) {
+        use core::sync::atomic::Ordering::Relaxed;
+        (NET17_PTR.load(Relaxed), NET17_SRV.load(Relaxed), NET17_TXT.load(Relaxed))
+    }
+
+    /// PI-NET-17: what a well-formed query asked of us (already matched to one of our names + a QTYPE we
+    /// serve). Anything else classifies to `None` and is dropped.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum MdnsAsk {
+        /// A/ANY for `unaos.local` — the net11 host A answer.
+        HostA,
+        /// PTR/ANY for `_http._tcp.local` — the PTR + SRV + TXT + A bundle.
+        ServicePtr,
+        /// PTR/ANY for `_services._dns-sd._udp.local` — the service-type PTR.
+        MetaPtr,
+        /// SRV/ANY for the instance — SRV answer + A additional.
+        InstanceSrv,
+        /// TXT for the instance — TXT answer.
+        InstanceTxt,
+    }
+
+    /// PI-NET-17: decode the DNS name at `start` into `out` label-slices. HOSTILE-INPUT HARDENED: every
+    /// byte is bounds-checked; a compression pointer (top two bits `0xc0`) is FOLLOWED with a bounded hop
+    /// cap (never trusting the target blindly — each jump is re-bounds-checked and the hop count is capped,
+    /// so a pointer loop terminates); reserved length bits (`0x40`/`0x80`) are rejected; the label count is
+    /// capped by `out.len()`. Returns `(label_count, end_off)` where `end_off` is the offset on the wire
+    /// just past the name's FIRST-encountered terminator (root null or first pointer) — i.e. where QTYPE
+    /// begins for a question. Returns `None` on any structural violation or overflow.
+    fn mdns_read_name<'a>(pkt: &'a [u8], start: usize, out: &mut [&'a [u8]]) -> Option<(usize, usize)> {
+        let mut off = start;
+        let mut wire_end: Option<usize> = None; // set once, at the first terminator on the ORIGINAL path
+        let mut count = 0usize;
+        let mut hops = 0usize; // pointer-follow hops (loop guard)
+        let mut labels = 0usize; // total labels walked (independent hop cap, net14 discipline)
+        loop {
+            let b = *pkt.get(off)?;
+            match b & 0xc0 {
+                0x00 => {
+                    if b == 0 {
+                        if wire_end.is_none() {
+                            wire_end = Some(off + 1);
+                        }
+                        return Some((count, wire_end?));
+                    }
+                    let len = b as usize;
+                    let s = off.checked_add(1)?;
+                    let e = s.checked_add(len)?;
+                    let label = pkt.get(s..e)?;
+                    if count < out.len() {
+                        out[count] = label;
+                    }
+                    count += 1;
+                    labels += 1;
+                    if labels > 127 || count > out.len() {
+                        return None; // hop cap / more labels than any name we serve
+                    }
+                    off = e;
+                }
+                0xc0 => {
+                    let b2 = *pkt.get(off + 1)?;
+                    if wire_end.is_none() {
+                        wire_end = Some(off + 2); // the name's on-wire span ends at the pointer
+                    }
+                    let target = (((b & 0x3f) as usize) << 8) | b2 as usize;
+                    if target >= off {
+                        return None; // a pointer must go strictly backward — forward/self = malformed/loop
+                    }
+                    hops += 1;
+                    if hops > 128 {
+                        return None; // pointer-chain hop cap
+                    }
+                    off = target;
+                }
+                _ => return None, // 0x40 / 0x80 reserved — malformed
+            }
+        }
+    }
+
+    /// PI-NET-17: case-insensitive label-sequence equality.
+    fn labels_eq(got: &[&[u8]], want: &[&[u8]]) -> bool {
+        if got.len() != want.len() {
+            return false;
+        }
+        for (a, b) in got.iter().zip(want.iter()) {
+            if a.len() != b.len() {
+                return false;
+            }
+            for (x, y) in a.iter().zip(b.iter()) {
+                if x.to_ascii_lowercase() != y.to_ascii_lowercase() {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// PI-NET-17: classify an mDNS query. Returns `Some((ask, unicast))` when the first question matches one
+    /// of our names with a QTYPE we serve, else `None` (dropped silently). Superset of net11's A-only
+    /// matcher: A/ANY→host, PTR/ANY→service or meta, SRV/ANY→instance-SRV, TXT→instance-TXT. Every read
+    /// bounds-checked; the QNAME is decoded once via `mdns_read_name` (compression-loop-immune).
+    fn mdns_classify(pkt: &[u8]) -> Option<(MdnsAsk, bool)> {
+        if pkt.len() < 12 {
+            return None;
+        }
+        let flags = u16::from_be_bytes([pkt[2], pkt[3]]);
+        // QR must be 0 (a query); opcode (bits 11..14) must be 0 (standard).
+        if flags & 0x8000 != 0 || (flags >> 11) & 0x0f != 0 {
+            return None;
+        }
+        let qdcount = u16::from_be_bytes([pkt[4], pkt[5]]);
+        if qdcount == 0 {
+            return None;
+        }
+        let mut labels: [&[u8]; 8] = [&[]; 8];
+        let (n, end) = mdns_read_name(pkt, 12, &mut labels)?;
+        let name = &labels[..n];
+        let qtype = u16::from_be_bytes([*pkt.get(end)?, *pkt.get(end + 1)?]);
+        let qclass = u16::from_be_bytes([*pkt.get(end + 2)?, *pkt.get(end + 3)?]);
+        let unicast = qclass & 0x8000 != 0; // QU (unicast-response) bit
+        let cls = qclass & 0x7fff;
+        if cls != 1 && cls != DNS_TYPE_ANY {
+            return None; // not IN / ANY class
+        }
+        let any = qtype == DNS_TYPE_ANY;
+        let ask = if labels_eq(name, &LBL_HOST) {
+            if qtype == DNS_TYPE_A || any { MdnsAsk::HostA } else { return None }
+        } else if labels_eq(name, &LBL_SERVICE) {
+            if qtype == DNS_TYPE_PTR || any { MdnsAsk::ServicePtr } else { return None }
+        } else if labels_eq(name, &LBL_META) {
+            if qtype == DNS_TYPE_PTR || any { MdnsAsk::MetaPtr } else { return None }
+        } else if labels_eq(name, &LBL_INSTANCE) {
+            // ANY / SRV → the SRV bundle (which also stuffs the A); a bare TXT → the TXT answer.
+            if qtype == DNS_TYPE_SRV || any {
+                MdnsAsk::InstanceSrv
+            } else if qtype == DNS_TYPE_TXT {
+                MdnsAsk::InstanceTxt
+            } else {
+                return None;
+            }
+        } else {
+            return None; // not a name we advertise — ignore
+        };
+        Some((ask, unicast))
+    }
+
+    // ── PI-NET-17: response-record writers. Each appends one RR at `*w` into `out`, bounds-checked, and
+    //    returns `false` on overflow (the caller then drops the response rather than emit a truncated one).
+    fn put_slice(out: &mut [u8], w: &mut usize, bytes: &[u8]) -> bool {
+        let end = match w.checked_add(bytes.len()) {
+            Some(e) if e <= out.len() => e,
+            _ => return false,
+        };
+        out[*w..end].copy_from_slice(bytes);
+        *w = end;
+        true
+    }
+    fn put_u16(out: &mut [u8], w: &mut usize, v: u16) -> bool {
+        put_slice(out, w, &v.to_be_bytes())
+    }
+    fn put_u32(out: &mut [u8], w: &mut usize, v: u32) -> bool {
+        put_slice(out, w, &v.to_be_bytes())
+    }
+    /// Write a DNS name from label slices, in full (root null appended). Each label is length-prefixed.
+    fn put_name(out: &mut [u8], w: &mut usize, labels: &[&[u8]]) -> bool {
+        for l in labels {
+            if l.len() > 63 {
+                return false;
+            }
+            if !put_slice(out, w, &[l.len() as u8]) || !put_slice(out, w, l) {
+                return false;
+            }
+        }
+        put_slice(out, w, &[0u8])
+    }
+    /// Common RR head: NAME + TYPE + CLASS + TTL. Returns the offset where RDLENGTH's 2 bytes sit (to be
+    /// back-patched by the caller once RDATA is written), or `None` on overflow.
+    fn put_rr_head(
+        out: &mut [u8],
+        w: &mut usize,
+        name: &[&[u8]],
+        rtype: u16,
+        class: u16,
+        ttl: u32,
+    ) -> Option<usize> {
+        if !put_name(out, w, name) || !put_u16(out, w, rtype) || !put_u16(out, w, class)
+            || !put_u32(out, w, ttl)
+        {
+            return None;
+        }
+        let rdlen_at = *w;
+        if !put_u16(out, w, 0) {
+            return None; // placeholder RDLENGTH
+        }
+        Some(rdlen_at)
+    }
+    fn patch_rdlen(out: &mut [u8], rdlen_at: usize, w: usize) -> bool {
+        let rdata_len = w - (rdlen_at + 2);
+        if rdata_len > u16::MAX as usize {
+            return false;
+        }
+        out[rdlen_at..rdlen_at + 2].copy_from_slice(&(rdata_len as u16).to_be_bytes());
+        true
+    }
+    /// PTR RR: shared record (class IN, NO cache-flush), RDATA = a domain name.
+    fn rec_ptr(out: &mut [u8], w: &mut usize, name: &[&[u8]], target: &[&[u8]], ttl: u32) -> bool {
+        let Some(rd) = put_rr_head(out, w, name, DNS_TYPE_PTR, 0x0001, ttl) else { return false };
+        if !put_name(out, w, target) {
+            return false;
+        }
+        patch_rdlen(out, rd, *w)
+    }
+    /// SRV RR: unique record (class IN | cache-flush), RDATA = priority, weight, port, target name.
+    fn rec_srv(out: &mut [u8], w: &mut usize, name: &[&[u8]], port: u16, target: &[&[u8]], ttl: u32) -> bool {
+        let Some(rd) = put_rr_head(out, w, name, DNS_TYPE_SRV, 0x8001, ttl) else { return false };
+        if !put_u16(out, w, 0) || !put_u16(out, w, 0) || !put_u16(out, w, port) || !put_name(out, w, target) {
+            return false;
+        }
+        patch_rdlen(out, rd, *w)
+    }
+    /// TXT RR: unique record (class IN | cache-flush), RDATA = one length-prefixed character-string.
+    fn rec_txt(out: &mut [u8], w: &mut usize, name: &[&[u8]], txt: &[u8], ttl: u32) -> bool {
+        if txt.len() > 255 {
+            return false;
+        }
+        let Some(rd) = put_rr_head(out, w, name, DNS_TYPE_TXT, 0x8001, ttl) else { return false };
+        if !put_slice(out, w, &[txt.len() as u8]) || !put_slice(out, w, txt) {
+            return false;
+        }
+        patch_rdlen(out, rd, *w)
+    }
+    /// A RR: unique record (class IN | cache-flush), RDATA = 4 IPv4 octets.
+    fn rec_a(out: &mut [u8], w: &mut usize, name: &[&[u8]], ip: [u8; 4], ttl: u32) -> bool {
+        let Some(rd) = put_rr_head(out, w, name, DNS_TYPE_A, 0x8001, ttl) else { return false };
+        if !put_slice(out, w, &ip) {
+            return false;
+        }
+        patch_rdlen(out, rd, *w)
+    }
+    /// Write a response header (QR=1 AA=1, no question echoed) with the given answer/additional counts.
+    fn put_resp_header(out: &mut [u8], w: &mut usize, ancount: u16, arcount: u16) -> bool {
+        put_u16(out, w, 0)          // ID = 0
+            && put_u16(out, w, 0x8400) // flags: QR=1, AA=1
+            && put_u16(out, w, 0)      // QDCOUNT = 0
+            && put_u16(out, w, ancount)
+            && put_u16(out, w, 0)      // NSCOUNT = 0
+            && put_u16(out, w, arcount)
+    }
+
+    /// PI-NET-17: build the `_http._tcp` service response/announcement into `out`.
+    /// * `announce = false`: a query response — PTR in the ANSWER section, SRV+TXT+A stuffed as ADDITIONAL
+    ///   records (ANCOUNT=1, ARCOUNT=3).
+    /// * `announce = true`: a gratuitous announcement — PTR+SRV+TXT+A all in the ANSWER section
+    ///   (ANCOUNT=4, ARCOUNT=0), per RFC 6762 §8.3.
+    /// Returns the byte length, or 0 on overflow (buffer must hold the ~180-byte bundle).
+    fn build_service_response(out: &mut [u8], ip: [u8; 4], announce: bool) -> usize {
+        let mut w = 0usize;
+        let (an, ar): (u16, u16) = if announce { (4, 0) } else { (1, 3) };
+        if !put_resp_header(out, &mut w, an, ar) {
+            return 0;
+        }
+        let ok = rec_ptr(out, &mut w, &LBL_SERVICE, &LBL_INSTANCE, MDNS_TTL_SHARED)
+            && rec_srv(out, &mut w, &LBL_INSTANCE, SVC_PORT, &LBL_HOST, MDNS_TTL_HOST)
+            && rec_txt(out, &mut w, &LBL_INSTANCE, SVC_TXT, MDNS_TTL_SHARED)
+            && rec_a(out, &mut w, &LBL_HOST, ip, MDNS_TTL_HOST);
+        if ok { w } else { 0 }
+    }
+
+    /// PI-NET-17: build the meta-query answer — `_services._dns-sd._udp.local` PTR -> `_http._tcp.local`.
+    fn build_meta_response(out: &mut [u8]) -> usize {
+        let mut w = 0usize;
+        if !put_resp_header(out, &mut w, 1, 0) {
+            return 0;
+        }
+        if rec_ptr(out, &mut w, &LBL_META, &LBL_SERVICE, MDNS_TTL_SHARED) { w } else { 0 }
+    }
+
+    /// PI-NET-17: build the direct-SRV answer — SRV in the ANSWER section, A stuffed as ADDITIONAL.
+    fn build_srv_response(out: &mut [u8], ip: [u8; 4]) -> usize {
+        let mut w = 0usize;
+        if !put_resp_header(out, &mut w, 1, 1) {
+            return 0;
+        }
+        let ok = rec_srv(out, &mut w, &LBL_INSTANCE, SVC_PORT, &LBL_HOST, MDNS_TTL_HOST)
+            && rec_a(out, &mut w, &LBL_HOST, ip, MDNS_TTL_HOST);
+        if ok { w } else { 0 }
+    }
+
+    /// PI-NET-17: build the direct-TXT answer — TXT in the ANSWER section.
+    fn build_txt_response(out: &mut [u8]) -> usize {
+        let mut w = 0usize;
+        if !put_resp_header(out, &mut w, 1, 0) {
+            return 0;
+        }
+        if rec_txt(out, &mut w, &LBL_INSTANCE, SVC_TXT, MDNS_TTL_SHARED) { w } else { 0 }
     }
 
     /// A fixed-buffer `core::fmt::Write` sink (no heap): appends until the buffer is full, then silently
@@ -2294,11 +2588,20 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
                 };
                 // Skip answering while unconfigured, but the datagram is already drained above.
                 let Some(ip) = ip else { continue };
-                let Some(qu) = mdns_wants_unaos(&qbuf[..n]) else { continue };
-                let mut resp = [0u8; 48];
-                let rlen = build_mdns_response(&mut resp, ip);
+                // PI-NET-17: classify the query (net11 A + the DNS-SD PTR/SRV/TXT shapes). An unknown name
+                // or QTYPE, or a malformed packet, yields `None` and is ignored silently.
+                let Some((ask, qu)) = mdns_classify(&qbuf[..n]) else { continue };
+                let mut resp = [0u8; 512];
+                use core::sync::atomic::Ordering::Relaxed;
+                let (rlen, counter): (usize, &core::sync::atomic::AtomicU32) = match ask {
+                    MdnsAsk::HostA => (build_mdns_response(&mut resp, ip), &NET11_ANSWERED),
+                    MdnsAsk::ServicePtr => (build_service_response(&mut resp, ip, false), &NET17_PTR),
+                    MdnsAsk::MetaPtr => (build_meta_response(&mut resp), &NET17_PTR),
+                    MdnsAsk::InstanceSrv => (build_srv_response(&mut resp, ip), &NET17_SRV),
+                    MdnsAsk::InstanceTxt => (build_txt_response(&mut resp), &NET17_TXT),
+                };
                 if rlen == 0 {
-                    continue;
+                    continue; // a builder overflow — never emit a truncated response
                 }
                 // Multicast reply by default; unicast to the querier (its source addr + port) if it asked.
                 let dst = if qu {
@@ -2310,8 +2613,42 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
                     )
                 };
                 if sock.send_slice(&resp[..rlen], dst).is_ok() {
-                    NET11_ANSWERED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    counter.fetch_add(1, Relaxed);
                 }
+            }
+        }
+
+        /// PI-NET-17: one bounded DNS-SD announcement step, run after each `iface.poll` on the metal poll
+        /// task. Emits up to `MDNS_ANNOUNCE_COUNT` gratuitous multicast announcements (PTR+SRV+TXT+A in the
+        /// answer section) spaced `MDNS_ANNOUNCE_GAP_MS` apart once the interface is configured (RFC 6762
+        /// §8.3), then prints the net17 witness ONCE. No-ops after the announcements are done.
+        fn announce_step(&mut self, now: i64) {
+            if self.announce_left == 0 {
+                return;
+            }
+            let Some(ip) = self.iface.ipv4_addr().map(|a| a.octets()) else { return };
+            if now < self.announce_next_ms {
+                return;
+            }
+            let mut resp = [0u8; 512];
+            let rlen = build_service_response(&mut resp, ip, true);
+            if rlen == 0 {
+                self.announce_left = 0; // builder overflow (unreachable in practice) — stop trying
+                return;
+            }
+            let dst = IpEndpoint::new(
+                IpAddress::v4(MDNS_MCAST[0], MDNS_MCAST[1], MDNS_MCAST[2], MDNS_MCAST[3]),
+                MDNS_PORT,
+            );
+            let sock = self.sockets.get_mut::<udp::Socket>(self.mdns);
+            let _ = sock.send_slice(&resp[..rlen], dst);
+            self.announce_left -= 1;
+            self.announce_next_ms = now + MDNS_ANNOUNCE_GAP_MS;
+            if self.announce_left == 0 {
+                serial_println!(
+                    "{} [net17] dns-sd announced _http._tcp (UnaOS Pi 4 -> unaos.local:{}) ::",
+                    PG, SVC_PORT
+                );
             }
         }
 
@@ -2402,6 +2739,9 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
         // PI-NET-11: mDNS answered-count witness state (change-only, rate-limited like net9/net10).
         let mut last_answered = 0u32;
         let mut last_answered_report_ms: i64 = 0;
+        // PI-NET-17: DNS-SD ptr/srv/txt answered-count witness state (change-only, same cadence).
+        let mut last_net17 = (0u32, 0u32, 0u32);
+        let mut last_net17_report_ms: i64 = 0;
         // PI-NET-12: TCB-census witness state (change-only, rate-limited; plus a saturation flag edge).
         let mut last_census = (u32::MAX, u32::MAX);
         let mut last_census_report_ms: i64 = 0;
@@ -2417,6 +2757,9 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
                 ns.http_step(t);
                 // PI-NET-11: one bounded mDNS service step (answer `unaos.local` on the share segment).
                 ns.mdns_step();
+                // PI-NET-17: one bounded DNS-SD announcement step (2–3 gratuitous multicast announcements
+                // on bring-up, ≥1 s apart, then quiet). Rides the same poll cadence, never blocks.
+                ns.announce_step(t);
                 // PI-NET-16: one non-blocking SNTP re-sync step (fires a query on the ~6 h cadence, reads
                 // the reply on a later poll, re-anchors the wall-clock — never blocks this poll loop).
                 ns.sntp_step(t);
@@ -2451,6 +2794,19 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
                 serial_println!("{} [net11] answered {} queries ::", PG, answered);
                 last_answered = answered;
                 last_answered_report_ms = t;
+            }
+            // PI-NET-17: rate-limited, change-only DNS-SD census (same cadence as net11).
+            let net17 = net17_counts();
+            if net17 != last_net17
+                && (t.saturating_sub(last_net17_report_ms) >= NET9_REPORT_MS
+                    || net17.0.wrapping_sub(last_net17.0) >= NET10_REPORT_DELTA)
+            {
+                serial_println!(
+                    "{} [net17] answered ptr={} srv={} txt={} ::",
+                    PG, net17.0, net17.1, net17.2
+                );
+                last_net17 = net17;
+                last_net17_report_ms = t;
             }
 
             // PI-NET-12: TCB-table census. Print when the (listen, active) shape changes and the ~5 s
@@ -2601,6 +2957,12 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
                 "{} [net11] mdns responder up (unaos.local -> {}.{}.{}.{}) ::",
                 PG, ip[0], ip[1], ip[2], ip[3]
             );
+            // PI-NET-17: the DNS-SD advertisement rides the same responder — the gratuitous announcements
+            // fire from the poll task (spaced ≥1 s); the per-record answered census is the [net17] witness.
+            serial_println!(
+                "{} [net17] dns-sd advertising _http._tcp.local instance \"UnaOS Pi 4\" :{} (announce x{}) ::",
+                PG, SVC_PORT, MDNS_ANNOUNCE_COUNT
+            );
         } else {
             serial_println!(
                 "{} [net11] mdns responder DEGRADED (bind5353={} joined224.0.0.251={}) — name resolution will not answer ::",
@@ -2638,6 +3000,8 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
             sntp,
             sntp_server,
             sntp_state,
+            announce_left: MDNS_ANNOUNCE_COUNT,
+            announce_next_ms: now_ms(),
             ip,
             req_buf: [[0u8; REQ_CAP]; HTTP_POOL],
             req_len: [0; HTTP_POOL],
@@ -3774,6 +4138,8 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
                 sntp,
                 sntp_server: None,
                 sntp_state: SntpState::Idle { due_ms: i64::MAX },
+                announce_left: 0,
+                announce_next_ms: 0,
                 ip: KIP,
                 req_buf: [[0u8; REQ_CAP]; HTTP_POOL],
                 req_len: [0; HTTP_POOL],
@@ -4330,6 +4696,8 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
                 sntp,
                 sntp_server: None,
                 sntp_state: SntpState::Idle { due_ms: i64::MAX },
+                announce_left: 0,
+                announce_next_ms: 0,
                 ip: KIP,
                 req_buf: [[0u8; REQ_CAP]; HTTP_POOL],
                 req_len: [0; HTTP_POOL],
@@ -4531,6 +4899,8 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
                     // Seed the peer (PIP) as the time source and make the first re-sync due immediately.
                     sntp_server: Some(PIP),
                     sntp_state: SntpState::Idle { due_ms: 0 },
+                    announce_left: 0,
+                    announce_next_ms: 0,
                     ip: KIP,
                     req_buf: [[0u8; REQ_CAP]; HTTP_POOL],
                     req_len: [0; HTTP_POOL],
@@ -4677,6 +5047,279 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
             let _ = psock.get_mut::<udp::Socket>(uh).send_slice(&query, dst);
             pump(ks, pface, pdev, psock, clk, 20);
             net11_answered() != before
+        }
+
+        // ── PI-NET-17: the DNS-SD advertisement gate — scripted-peer PTR / meta / malformed / unknown-type
+        //    scenarios against the SAME `mdns_step` the metal responder runs, over the loopback Device. ──
+
+        /// Build a minimal single-question mDNS query for `name` (full labels) asking `qtype`, class IN.
+        fn build_query(name: &[&[u8]], qtype: u16) -> Vec<u8> {
+            let mut q = Vec::new();
+            q.extend_from_slice(&0u16.to_be_bytes()); // ID
+            q.extend_from_slice(&0u16.to_be_bytes()); // flags: standard query
+            q.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT = 1
+            q.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT
+            q.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
+            q.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
+            for l in name {
+                q.push(l.len() as u8);
+                q.extend_from_slice(l);
+            }
+            q.push(0);
+            q.extend_from_slice(&qtype.to_be_bytes());
+            q.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
+            q
+        }
+
+        /// Decode a full (uncompressed) DNS name at `off` into a bounded label list, returning
+        /// `(labels_count, end_off)`. Reuses the hostile-input-hardened parent reader.
+        fn read_name<'a>(pkt: &'a [u8], off: usize, out: &mut [&'a [u8]]) -> Option<(usize, usize)> {
+            mdns_read_name(pkt, off, out)
+        }
+
+        /// Assert the `_http._tcp.local` PTR-query response carries the full bundle with EXACT fields:
+        /// header (QR/AA, ANCOUNT=1, ARCOUNT=3); a PTR (_http._tcp.local -> the instance); an SRV
+        /// (instance -> unaos.local:80); a TXT (`path=/`); and an A (unaos.local -> `ip`). Walks every
+        /// record with bounds-checked field reads.
+        fn check_bundle(resp: &[u8], ip: [u8; 4]) -> bool {
+            let inner = || -> Option<bool> {
+                if resp.len() < 12 {
+                    return Some(false);
+                }
+                let flags = u16::from_be_bytes([resp[2], resp[3]]);
+                if flags & 0x8400 != 0x8400 {
+                    return Some(false); // QR=1 AA=1
+                }
+                let an = u16::from_be_bytes([resp[6], resp[7]]);
+                let ar = u16::from_be_bytes([resp[10], resp[11]]);
+                if an != 1 || ar != 3 {
+                    return Some(false);
+                }
+                let (mut saw_ptr, mut saw_srv, mut saw_txt, mut saw_a) = (false, false, false, false);
+                let mut off = 12usize;
+                for _ in 0..(an as usize + ar as usize) {
+                    let mut nm: [&[u8]; 8] = [&[]; 8];
+                    let (nn, e) = read_name(resp, off, &mut nm)?;
+                    let name = &nm[..nn];
+                    // Fixed RR fields after the NAME: TYPE(2) CLASS(2) TTL(4) RDLENGTH(2), then RDATA.
+                    let rtype = u16::from_be_bytes([*resp.get(e)?, *resp.get(e + 1)?]);
+                    let rdlen = u16::from_be_bytes([*resp.get(e + 8)?, *resp.get(e + 9)?]) as usize;
+                    let rd = e + 10;
+                    if rd + rdlen > resp.len() {
+                        return Some(false);
+                    }
+                    match rtype {
+                        DNS_TYPE_PTR if labels_eq(name, &LBL_SERVICE) => {
+                            let mut tn: [&[u8]; 8] = [&[]; 8];
+                            let (tc, _) = read_name(resp, rd, &mut tn)?;
+                            saw_ptr = labels_eq(&tn[..tc], &LBL_INSTANCE);
+                        }
+                        DNS_TYPE_SRV if labels_eq(name, &LBL_INSTANCE) => {
+                            let port = u16::from_be_bytes([*resp.get(rd + 4)?, *resp.get(rd + 5)?]);
+                            let mut tn: [&[u8]; 8] = [&[]; 8];
+                            let (tc, _) = read_name(resp, rd + 6, &mut tn)?;
+                            saw_srv = port == SVC_PORT && labels_eq(&tn[..tc], &LBL_HOST);
+                        }
+                        DNS_TYPE_TXT if labels_eq(name, &LBL_INSTANCE) => {
+                            let slen = *resp.get(rd)? as usize;
+                            saw_txt =
+                                slen == SVC_TXT.len() && resp.get(rd + 1..rd + 1 + slen) == Some(SVC_TXT);
+                        }
+                        DNS_TYPE_A if labels_eq(name, &LBL_HOST) => {
+                            saw_a = rdlen == 4 && resp.get(rd..rd + 4) == Some(&ip[..]);
+                        }
+                        _ => {}
+                    }
+                    off = rd + rdlen;
+                }
+                Some(saw_ptr && saw_srv && saw_txt && saw_a)
+            };
+            inner().unwrap_or(false)
+        }
+
+        /// Assert the meta-query response is a single PTR `_services._dns-sd._udp.local` -> `_http._tcp.local`.
+        fn check_meta(resp: &[u8]) -> bool {
+            if resp.len() < 12 {
+                return false;
+            }
+            let an = u16::from_be_bytes([resp[6], resp[7]]);
+            if an != 1 {
+                return false;
+            }
+            let mut nm: [&[u8]; 8] = [&[]; 8];
+            let (nn, e) = match read_name(resp, 12, &mut nm) {
+                Some(v) => v,
+                None => return false,
+            };
+            if !labels_eq(&nm[..nn], &LBL_META) {
+                return false;
+            }
+            let rtype = match (resp.get(e), resp.get(e + 1)) {
+                (Some(a), Some(b)) => u16::from_be_bytes([*a, *b]),
+                _ => return false,
+            };
+            if rtype != DNS_TYPE_PTR {
+                return false;
+            }
+            // TYPE(2) CLASS(2) TTL(4) RDLENGTH(2) = 10 bytes after the NAME, then the target RDATA name.
+            let mut tn: [&[u8]; 8] = [&[]; 8];
+            match read_name(resp, e + 10, &mut tn) {
+                Some((tc, _)) => labels_eq(&tn[..tc], &LBL_SERVICE),
+                None => false,
+            }
+        }
+
+        /// Run the DNS-SD gate and print the `NET17-GATE` witness. Bitmask `w`:
+        ///   0x1 PTR query -> PTR+SRV+TXT+A bundle (exact fields); 0x2 meta-query -> service-type PTR;
+        ///   0x4 malformed (truncated) query ignored cleanly; 0x8 unknown QTYPE ignored.
+        pub fn run17() {
+            *K_RX.lock() = Some(VecDeque::new());
+            *P_RX.lock() = Some(VecDeque::new());
+
+            let mut kdev = SmoltcpPhy::<KernelLoopNic>::new();
+            let mut kiface = build_iface(&mut kdev, KMAC, KIP, 0x4e31_37aa); // "N17"
+            let kstorage: &'static mut [SocketStorage; HTTP_POOL + 2] =
+                Box::leak(Box::new(Default::default()));
+            let mut ksockets = SocketSet::new(&mut kstorage[..]);
+            let (http, mdns, sntp, _l, _b, _j) = build_net_sockets(&mut kiface, &mut ksockets);
+            let mut ks = NetService {
+                iface: kiface,
+                dev: kdev,
+                sockets: ksockets,
+                http,
+                req_seen: [false; HTTP_POOL],
+                active_since: [0; HTTP_POOL],
+                mdns,
+                sntp,
+                sntp_server: None,
+                sntp_state: SntpState::Idle { due_ms: i64::MAX },
+                announce_left: 0,
+                announce_next_ms: 0,
+                ip: KIP,
+                req_buf: [[0u8; REQ_CAP]; HTTP_POOL],
+                req_len: [0; HTTP_POOL],
+                resp: core::array::from_fn(|_| None),
+            };
+
+            let mut pdev = SmoltcpPhy::<PeerLoopNic>::new();
+            let mut pface = build_iface(&mut pdev, PMAC, PIP, 0x5031_37aa);
+            let pstorage: &'static mut [SocketStorage; 16] = Box::leak(Box::new(Default::default()));
+            let mut psock = SocketSet::new(&mut pstorage[..]);
+
+            // The peer's mDNS UDP socket — bound to 5353, joined to the group so the responder's multicast
+            // answer (non-QU) lands back.
+            use smoltcp::socket::udp;
+            let rx_meta: &'static mut [udp::PacketMetadata; 8] =
+                Box::leak(Box::new([udp::PacketMetadata::EMPTY; 8]));
+            let rx_pl: &'static mut [u8; 1024] = Box::leak(Box::new([0u8; 1024]));
+            let tx_meta: &'static mut [udp::PacketMetadata; 8] =
+                Box::leak(Box::new([udp::PacketMetadata::EMPTY; 8]));
+            let tx_pl: &'static mut [u8; 1024] = Box::leak(Box::new([0u8; 1024]));
+            let mut us = udp::Socket::new(
+                udp::PacketBuffer::new(&mut rx_meta[..], &mut rx_pl[..]),
+                udp::PacketBuffer::new(&mut tx_meta[..], &mut tx_pl[..]),
+            );
+            let _ = us.bind(5353u16);
+            let uh = psock.add(us);
+            let _ = pface.join_multicast_group(IpAddress::v4(224, 0, 0, 251));
+
+            let mut clk: i64 = 0;
+            let mut w: u32 = 0;
+            let dst = IpEndpoint::new(IpAddress::v4(224, 0, 0, 251), 5353);
+
+            // Small helper: send `query`, pump, and drain ONE response datagram into `out`, returning its len.
+            let mut send_recv = |ks: &mut NetService<SmoltcpPhy<KernelLoopNic>>,
+                                 pface: &mut Interface,
+                                 pdev: &mut SmoltcpPhy<PeerLoopNic>,
+                                 psock: &mut SocketSet<'static>,
+                                 clk: &mut i64,
+                                 query: &[u8],
+                                 out: &mut [u8]|
+             -> usize {
+                let _ = psock.get_mut::<udp::Socket>(uh).send_slice(query, dst);
+                pump(ks, pface, pdev, psock, clk, 20);
+                let s = psock.get_mut::<udp::Socket>(uh);
+                if s.can_recv() {
+                    match s.recv_slice(out) {
+                        Ok((n, _)) => n,
+                        Err(_) => 0,
+                    }
+                } else {
+                    0
+                }
+            };
+
+            serial_println!("{} [net17] dns-sd gate: responder armed (KIP {}.{}.{}.{}) ::",
+                PG, KIP[0], KIP[1], KIP[2], KIP[3]);
+
+            // ── Scenario A (0x1): a PTR query for `_http._tcp.local` returns the full bundle. ──
+            {
+                let q = build_query(&LBL_SERVICE, DNS_TYPE_PTR);
+                let mut buf = [0u8; 1024];
+                let n = send_recv(&mut ks, &mut pface, &mut pdev, &mut psock, &mut clk, &q, &mut buf);
+                let ok = n > 0 && check_bundle(&buf[..n], KIP);
+                if ok {
+                    w |= 0x1;
+                }
+                serial_println!(
+                    "{} [net17] A ptr-query => PTR+SRV+TXT+A bundle ({} bytes) {} ::",
+                    PG, n, if ok { "PASS" } else { "FAIL" }
+                );
+            }
+
+            // ── Scenario B (0x2): the meta-query returns the service-type PTR. ──
+            {
+                let q = build_query(&LBL_META, DNS_TYPE_PTR);
+                let mut buf = [0u8; 1024];
+                let n = send_recv(&mut ks, &mut pface, &mut pdev, &mut psock, &mut clk, &q, &mut buf);
+                let ok = n > 0 && check_meta(&buf[..n]);
+                if ok {
+                    w |= 0x2;
+                }
+                serial_println!(
+                    "{} [net17] B meta-query => _services PTR -> _http._tcp ({} bytes) {} ::",
+                    PG, n, if ok { "PASS" } else { "FAIL" }
+                );
+            }
+
+            // ── Scenario C (0x4): a truncated (malformed) query is ignored — no counter moves, no reply. ──
+            {
+                let before = net17_counts();
+                let mut q = build_query(&LBL_SERVICE, DNS_TYPE_PTR);
+                q.truncate(14); // cut mid-QNAME — a hostile truncation
+                let mut buf = [0u8; 1024];
+                let n = send_recv(&mut ks, &mut pface, &mut pdev, &mut psock, &mut clk, &q, &mut buf);
+                let ignored = n == 0 && net17_counts() == before;
+                if ignored {
+                    w |= 0x4;
+                }
+                serial_println!(
+                    "{} [net17] C malformed query => {} ::",
+                    PG, if ignored { "ignored PASS" } else { "ANSWERED FAIL" }
+                );
+            }
+
+            // ── Scenario D (0x8): an unknown QTYPE (MX=15) for our service name is ignored. ──
+            {
+                let before = net17_counts();
+                let q = build_query(&LBL_SERVICE, 15); // MX — a type we do not serve
+                let mut buf = [0u8; 1024];
+                let n = send_recv(&mut ks, &mut pface, &mut pdev, &mut psock, &mut clk, &q, &mut buf);
+                let ignored = n == 0 && net17_counts() == before;
+                if ignored {
+                    w |= 0x8;
+                }
+                serial_println!(
+                    "{} [net17] D unknown qtype => {} ::",
+                    PG, if ignored { "ignored PASS" } else { "ANSWERED FAIL" }
+                );
+            }
+
+            let pass = w == 0xf;
+            serial_println!(
+                ":: NET17-GATE: dns-sd advertisement battery {} [w=0x{:x}] (ptr-bundle|meta-ptr|malformed-ignored|unknown-type-ignored) ::",
+                if pass { "PASS" } else { "FAIL" }, w
+            );
         }
     }
 }

@@ -294,9 +294,16 @@ reported plus the CNTPCT value read in the same breath. The live UTC second is
 the elapsed time, so the clock advances monotonically between the ~6-hourly re-syncs with
 no wall-clock hardware and never runs backwards within one anchor. State is a module-local
 `spin::Mutex<Option<WallClock>>` with a small read API (`wall_unix_now`, `wall_anchor`).
-**Integrator fold:** a proper kernel-wide clock service (so `time`, log timestamps, and
-filesystem mtimes can all read one clock) belongs in a shared core file; this arc keeps
-the state in-lane and notes the fold rather than reaching outside the net lane.
+
+**Integrator fold — LANDED (CLOCK-1).** The kernel-wide clock service now lives in shared
+core: [`crate::clock`](../02_KERNEL_CORE/clock.md) owns the Unix-second anchor, the source
+tag (`Sntp{stratum}`/`Manual`/`Unset`), the civil (Hinnant) math, and the ISO-8601 renderer,
+behind the same arch monotonic seam JD17 uses (aarch64 CNTPCT/CNTFRQ, x86_64 invariant TSC).
+PI-NET-16's SNTP client keeps its `wall_set`/`wall_unix_now`/`wall_anchor`/`render_iso8601`
+names as **thin forwarders** into `crate::clock` — every call site and the NET16-GATE witness
+stay byte-identical; `NET16_SYNCS` still bumps on each set. So `time` (shell), and eventually
+log timestamps and fs mtimes, read the same clock the SNTP client anchors. (Log-timestamp and
+fs-mtime adoption remain separate follow-up arcs; this fold does not rewire `fat_stamp()`.)
 
 **2036 rollover stance.** NTP's 32-bit seconds field rolls over 2036-02-07. The conversion
 is era-aware per RFC 4330 §3: a value with the high bit **set** is era 0 (1900-based,
@@ -341,6 +348,76 @@ sync).
 
 ---
 
+## 4b. "UnaOS is discoverable" — DNS-SD service advertisement (PI-NET-17)
+
+PI-NET-11 makes the Pi answer `unaos.local`; PI-NET-17 makes it *discoverable*. It
+layers DNS-SD (RFC 6763) onto the same mDNS UDP socket so a macOS/Bonjour browser
+(`dns-sd -B _http._tcp`, Safari's network browser, the Finder network view) lists the Pi
+by name and can connect to its HTTP status service without being told the address.
+
+**Advertised service.** One instance, `"UnaOS Pi 4"`, of type `_http._tcp.local`, port
+**80** (the net10 status service), target `unaos.local`, with a minimal TXT `path=/`. The
+service labels are compile-time constants (`LBL_INSTANCE`/`LBL_SERVICE`/`LBL_META`/
+`LBL_HOST`); the instance label carries a space — legal in a DNS-SD instance label, which
+is a single length-prefixed label on the wire, not a dotted name.
+
+**Query shapes answered** (all over the existing 5353 socket, dispatched by
+`mdns_classify` after each poll's `mdns_step`):
+
+* **PTR `_http._tcp.local`** → the one-shot bundle a resolver needs: **PTR** (service →
+  instance) in the ANSWER section, plus **SRV** (instance → `unaos.local:80`), **TXT**
+  (`path=/`), and **A** (`unaos.local` → lease) stuffed as ADDITIONAL records
+  (ANCOUNT=1, ARCOUNT=3) — so a browser connects without a second round-trip.
+* **PTR `_services._dns-sd._udp.local`** (the meta-query) → the service-type PTR
+  (`_services._dns-sd._udp.local` → `_http._tcp.local`), so a browser enumerating service
+  *types* sees `_http._tcp`.
+* **SRV / TXT for the instance** → that record directly (SRV additionally stuffs the A).
+* **A `unaos.local`** → the net11 host answer (unchanged).
+
+TTLs follow RFC 6763 §10: host-name-bearing records (A, SRV) 120 s; shared records (PTR,
+TXT) 4500 s. SRV/TXT/A carry the cache-flush bit (class `0x8001`); the shared PTRs do not
+(class `0x0001`). Response names are written **in full** (no compression pointers — the
+net11 responder writes full names too; simpler and legal).
+
+**Unsolicited announcements.** On bring-up (once the interface is configured) the poll
+task fires **3 gratuitous multicast announcements** ≥1 s apart (RFC 6762 §8.3), each
+carrying PTR+SRV+TXT+A in the ANSWER section (ANCOUNT=4), so a browser already listening
+learns the Pi immediately rather than only on its next query. State is two `NetService`
+fields (`announce_left`/`announce_next_ms`); `announce_step` rides the same 4 ms poll and
+never blocks. After the last announcement it prints the witness once.
+
+**Hostile-input handling.** `mdns_classify` decodes the first-question QNAME once through
+`mdns_read_name` — every byte bounds-checked, the label count capped, compression pointers
+followed with the **same hop-cap discipline `net14_skip_name` uses** (each jump must go
+strictly backward and is re-bounds-checked; hop count capped so a pointer loop terminates),
+reserved length bits rejected — then compares the decoded labels case-insensitively against
+the advertised names. A malformed packet, an unknown name, or an unknown QTYPE classifies to
+`None` and is dropped silently. Response records are written with every byte bounds-checked
+against the output buffer; a builder overflow drops the response rather than emit a truncated
+one.
+
+**Query-answer census.** Three counters (`NET17_PTR`/`NET17_SRV`/`NET17_TXT`; PTR counts
+both the service-PTR and meta-PTR answers) drive a change-only, rate-limited
+`[net17] answered ptr=<p> srv=<s> txt=<t>` witness (the net11 cadence). Host A answers keep
+counting on the existing `[net11] answered N queries` line.
+
+* **DNS-SD gate** (`nettest::run17`, same hardware-free loopback seam — a scripted peer
+  sends real mDNS queries at the responder over the loopback `Device`):
+  `:: NET17-GATE: dns-sd advertisement battery PASS [w=0xf] (ptr-bundle|meta-ptr|malformed-ignored|unknown-type-ignored) ::`
+  * `0x1` a PTR query for `_http._tcp.local` returns the bundle, asserted field-by-field
+    (PTR → instance, SRV port 80 → `unaos.local`, TXT `path=/`, A → the kernel IP);
+    `0x2` the meta-query returns the service-type PTR; `0x4` a truncated query is ignored
+    (no counter moves, no reply); `0x8` an unknown QTYPE (MX) for the service name is
+    ignored.
+
+Boot witness (metal): `:: PI-GENET: [net17] dns-sd advertising _http._tcp.local instance
+"UnaOS Pi 4" :80 (announce x3) ::` at arm, then after the announcements
+`:: PI-GENET: [net17] dns-sd announced _http._tcp (UnaOS Pi 4 -> unaos.local:80) ::`.
+What **Peter** sees: the Pi appears by name in Safari's Bonjour/network browser and in
+`dns-sd -B _http._tcp` on the Mac.
+
+---
+
 ## 5. Bench verification
 
 | Claim | Arc / commit | Boot | Verdict |
@@ -359,6 +436,8 @@ sync).
 | "UnaOS serves its filesystem" — browse `/fs/` | NET-15 | *(pending metal)* | `[net15] fs route armed (…, cap 64 KiB)` + per-request `GET /fs/<name> => 200 <n> bytes (with_unafs hold <t> ticks / <n> ms)` (WARN suffix if the hold > 50 ms) |
 | SNTP client + wall-clock gate runs off-metal | NET-16 `nettest` | QEMU raspi4b + test-arm | `:: NET16-GATE: ... PASS [w=0x3f] ::` — parser accepts well-formed + renders ISO / rejects short / surfaces KoD / rejects LI=3 alarm, live loopback sets the clock, re-sync black-hole timeout |
 | "UnaOS knows what time it is" — SNTP sync | NET-16 | *(pending metal)* | `[net16] dns pool.ntp.org -> <ip>` + `[net16] sntp <ip> -> <iso>Z (stratum N, rtt ~M ms)`; status page gains a `time (UTC)` line; or an honest `sntp timeout` |
+| DNS-SD advertisement gate runs off-metal | NET-17 `nettest` | QEMU raspi4b (`UNAOS_NETTEST=1 UNAOS_PI=1 kernel8-test`) | `:: NET17-GATE: ... PASS [w=0xf] ::` — PTR query → PTR+SRV+TXT+A bundle (field-asserted), meta-query → service-type PTR, malformed query ignored, unknown QTYPE ignored |
+| "UnaOS is discoverable" — DNS-SD `_http._tcp` | NET-17 | *(pending metal)* | `[net17] dns-sd advertising _http._tcp.local instance "UnaOS Pi 4" :80 (announce x3)` + `[net17] dns-sd announced _http._tcp (UnaOS Pi 4 -> unaos.local:80)`; Pi appears by name in Safari's Bonjour browser / `dns-sd -B _http._tcp` on the Mac |
 
 QEMU `raspi4b` (bcm2838) does **not** model GENET; the DTB census makes bring-up a
 clean pre-MMIO skip (`kernel8-test` stays green). Every *metal* finding above is
