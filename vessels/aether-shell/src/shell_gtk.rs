@@ -171,7 +171,29 @@ fn build_ui(app: &Application) {
         let h = height as u32;
         
         let mut eng = engine_draw.borrow_mut();
-        eng.render_frame();
+        let damages = eng.render_frame();
+        let damage_count = damages.len();
+        
+        if std::env::var("AETHER_DEBUG").is_ok() {
+            let non_white_count = eng.surface().chunks(4).filter(|p| {
+                p.len() == 4 && (p[0] != 255 || p[1] != 255 || p[2] != 255)
+            }).count();
+            println!("GTK draw: w={}, h={}, eng.width={}, eng.height={}, damages={}, non_white_px={}", w, h, eng.width, eng.height, damage_count, non_white_count);
+            
+            static DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if eng.title != "Aether Browser" && !DUMPED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                if let Ok(mut f) = std::fs::File::create("/tmp/aether-frame.ppm") {
+                    use std::io::Write;
+                    write!(f, "P6\n{} {}\n255\n", eng.width, eng.height).unwrap();
+                    for chunk in eng.surface().chunks(4) {
+                        if chunk.len() == 4 {
+                            f.write_all(&[chunk[2], chunk[1], chunk[0]]).unwrap();
+                        }
+                    }
+                    println!("Dumped /tmp/aether-frame.ppm");
+                }
+            }
+        }
         
         if let Ok(mut surface) = gtk4::cairo::ImageSurface::create(gtk4::cairo::Format::ARgb32, w as i32, h as i32) {
             {

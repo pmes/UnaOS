@@ -29,6 +29,7 @@ struct AetherApp {
     url_bar_active: bool,
     current_url: String,
     proxy: winit::event_loop::EventLoopProxy<AppEvent>,
+    modifiers: winit::keyboard::ModifiersState,
 }
 
 impl ApplicationHandler<AppEvent> for AetherApp {
@@ -235,19 +236,8 @@ impl ApplicationHandler<AppEvent> for AetherApp {
                             self.url_bar_active = false;
                             let url = self.current_url.clone();
                             
-                            // Let the engine fetch async but we don't move the engine itself. 
-                            // Wait, AetherEngine::load_url is `async fn`. If we are on the main thread, 
-                            // we can't easily await it without blocking or without passing a Send reference.
-                            // But GTK handles this by using `glib::MainContext::spawn_local`. winit has no such thing.
-                            // Wait, if `engine` is not thread-safe (`Rc<RefCell<...>>`), how do we run an async fn on it?
-                            // We can use `tokio::task::LocalSet` and run it on the main thread!
-                            // Or we can just block on the main thread for simplicity for the Mac stub,
-                            // or better, implement a `LocalSet` in the event loop.
-                            // But the instructions specifically say: "Engine stays on the main/UI thread, single-threaded, no Arc<Mutex>. Network loads run on the tokio runtime; completed results (HTML string or error) come back via a channel or winit::EventLoopProxy user event; the event loop hands them to the engine."
-                            
-                            // Ah! `engine.load_url` does the fetch itself. I need to decouple the fetch from the engine load!
-                            // Actually, I can just spawn a blocking network request in Tokio, return the HTML via proxy, and then call `engine.load_html` on the main thread.
-                            
+                            // Engine stays on the main/UI thread, single-threaded. Network loads run on the tokio 
+                            // runtime; completed results come back via winit::EventLoopProxy user event.
                             let proxy = self.proxy.clone();
                             let handle = self.rt.handle().clone();
                             std::thread::spawn(move || {
@@ -267,7 +257,12 @@ impl ApplicationHandler<AppEvent> for AetherApp {
                             }
                         }
                     } else if let Key::Character(c) = event.logical_key {
-                        if c == "[" {
+                        if self.url_bar_active {
+                            if c.chars().count() == 1 {
+                                self.current_url.push_str(c.as_str());
+                                window.request_redraw();
+                            }
+                        } else if self.modifiers.super_key() && c == "[" {
                             if let Some(url) = self.engine.borrow_mut().get_back_url() {
                                 let proxy = self.proxy.clone();
                                 let handle = self.rt.handle().clone();
@@ -281,7 +276,7 @@ impl ApplicationHandler<AppEvent> for AetherApp {
                                     });
                                 });
                             }
-                        } else if c == "]" {
+                        } else if self.modifiers.super_key() && c == "]" {
                             if let Some(url) = self.engine.borrow_mut().get_forward_url() {
                                 let proxy = self.proxy.clone();
                                 let handle = self.rt.handle().clone();
@@ -295,9 +290,18 @@ impl ApplicationHandler<AppEvent> for AetherApp {
                                     });
                                 });
                             }
+                        } else {
+                            let mut eng = self.engine.borrow_mut();
+                            eng.handle_event(aether::api::events::Event::Text(c.to_string()));
+                            if eng.needs_repaint {
+                                window.request_redraw();
+                            }
                         }
                     }
                 }
+            }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                self.modifiers = modifiers.state();
             }
             _ => (),
         }
@@ -318,6 +322,7 @@ pub fn run() {
         url_bar_active: false,
         current_url: String::new(),
         proxy: event_loop.create_proxy(),
+        modifiers: winit::keyboard::ModifiersState::empty(),
     };
     
     event_loop.run_app(&mut app).unwrap();
