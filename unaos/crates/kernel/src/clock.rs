@@ -254,6 +254,28 @@ pub fn mono_ticks() -> Option<u64> {
     monotonic().map(|(ticks, _)| ticks)
 }
 
+/// CLOCK-2 — the lock-free-safe snapshot the serial log-timestamp prefix (`crate::logts`) reads on
+/// every line. Returns `(monotonic milliseconds since boot, current UTC Unix seconds if anchored)`.
+/// The monotonic part is fully lock-free (one counter read); the civil part uses `try_lock` and
+/// yields `None` if the anchor lock is momentarily contended — so this NEVER blocks or panics and is
+/// safe from early boot, IRQ-masked handlers, and any core. A `None` civil part simply keeps the
+/// prefix in its monotonic form for that one line.
+#[cfg(feature = "logts")]
+pub fn logts_now() -> (Option<u64>, Option<u64>) {
+    let mono_ms = monotonic().map(|(ticks, freq)| ticks.saturating_mul(1000) / freq);
+    let unix = match UNIX_ANCHOR.try_lock() {
+        Some(guard) => guard.as_ref().map(|a| {
+            let elapsed = match monotonic() {
+                Some((ticks, freq)) => ticks.wrapping_sub(a.anchor_ticks) / freq,
+                None => 0,
+            };
+            a.base_unix.saturating_add(elapsed)
+        }),
+        None => None,
+    };
+    (mono_ms, unix)
+}
+
 /// Anchor the civil clock to `unix_secs` (UTC), pairing it with `mono_now` (a `mono_ticks()` reading
 /// captured at the same instant) and tagging it with `source`. The ONLY writer of `UNIX_ANCHOR`.
 /// Re-anchoring simply replaces the anchor — a fresh sync or operator correction wins.
@@ -277,6 +299,14 @@ pub fn unix_now() -> Option<u64> {
 /// The source of the current anchor, or `ClockSource::Unset` while never anchored.
 pub fn source() -> ClockSource {
     (*UNIX_ANCHOR.lock()).as_ref().map(|a| a.source).unwrap_or(ClockSource::Unset)
+}
+
+/// Drop the civil (Unix) anchor, returning the clock to the honest UNSET state (`unix_now()` → `None`,
+/// `source()` → `Unset`). Symmetric with `set_anchor`; used by the CLOCK-3 FAT-stamp witness to leave
+/// the civil clock EXACTLY as it found it after a deterministic self-test anchor. Does NOT touch the
+/// JD17 FAT anchor.
+pub fn clear_anchor() {
+    *UNIX_ANCHOR.lock() = None;
 }
 
 /// The raw, NON-extrapolated anchor pair `(base_unix, source)` — deterministic, does not race the
@@ -338,17 +368,50 @@ pub fn iso8601_now(out: &mut [u8]) -> Option<usize> {
     unix_now().map(|secs| render_iso8601(secs, out))
 }
 
-/// The two packed FAT on-disk words `(time @0x16, date @0x18)` for "now" — the exact layout
-/// §JD16's `DirEntry::mtime()` decodes (DATE: year-1980/month/day; TIME: hour/min/sec÷2).
-/// `(0, 0)` while the clock is unset: byte-identical to the pre-JD17 zeroed field, which the
-/// `ls -l` renderer already shows as the dashed placeholder.
+/// Pack a `WallTime` into the two FAT on-disk words `(time @0x16, date @0x18)` — the exact layout
+/// §JD16's `DirEntry::mtime()` decodes (DATE: year-1980 in bits 15..9, month in 8..5, day in 4..0;
+/// TIME: hour in 15..11, min in 10..5, seconds÷2 in 4..0 — FAT's 2-second granularity, the low
+/// second bit is unrepresentable). Assumes the year is already within FAT's 1980..=2107 span
+/// (callers clamp); the field widths silently wrap outside it, which is why the derivation clamps first.
+fn fat_pack(t: &WallTime) -> (u16, u16) {
+    let date = (((t.year - 1980) as u16) << 9) | ((t.month as u16) << 5) | t.day as u16;
+    let time = ((t.hour as u16) << 11) | ((t.min as u16) << 5) | (t.sec as u16 / 2);
+    (time, date)
+}
+
+/// CLOCK-3: convert UTC Unix seconds to a FAT-representable `WallTime`, CLAMPING to FAT's on-disk span
+/// `[1980-01-01 00:00:00 .. 2107-12-31 23:59:58]` rather than wrapping or panicking — FAT simply cannot
+/// represent a moment outside that band. Witnessable rule: a pre-1980 anchor pins to the epoch FLOOR, a
+/// post-2107 anchor to the last representable 2-second tick (`23:59:58`). FAT stores wall-clock time with
+/// no timezone; we stamp UTC (`civil_from_unix` is UTC), documented in clock.md.
+fn wall_from_unix_clamped(unix: u64) -> WallTime {
+    if unix < UNIX_1980 {
+        return WallTime { year: 1980, month: 1, day: 1, hour: 0, min: 0, sec: 0 };
+    }
+    let (y, mo, d, h, mi, s) = civil_from_unix(unix);
+    if y > 2107 {
+        return WallTime { year: 2107, month: 12, day: 31, hour: 23, min: 59, sec: 58 };
+    }
+    // `unix >= UNIX_1980` ⇒ `y >= 1980`, and the `y > 2107` guard above bounds the top, so the cast is safe.
+    WallTime { year: y as u32, month: mo, day: d, hour: h, min: mi, sec: s }
+}
+
+/// The two packed FAT on-disk words `(time @0x16, date @0x18)` for "now".
+///
+/// CLOCK-3 — the UNIFIED clock is the single source of truth. When a civil (Unix) anchor exists — an
+/// SNTP sync (pi/genet PI-NET-16) or a `setdate` Manual seed — the FAT stamp is DERIVED from it
+/// (`unix_now()` → `civil_from_unix` → FAT packing, clamped to the FAT span), so a networked board
+/// stamps REAL last-write times with zero operator action. It falls back to the legacy JD17 FAT anchor
+/// (`now()`) only when no Unix anchor is set, and to `(0, 0)` when neither is — byte-identical to the
+/// pre-JD17 zeroed field, which the `ls -l` renderer already shows as the dashed placeholder. (Because
+/// `setdate` plants BOTH anchors in the same breath from the same monotonic tick, the derivation
+/// round-trips: `setdate D` → `fat_stamp()` yields `D`.)
 pub fn fat_stamp() -> (u16, u16) {
+    if let Some(unix) = unix_now() {
+        return fat_pack(&wall_from_unix_clamped(unix));
+    }
     match now() {
-        Some(t) => {
-            let date = (((t.year - 1980) as u16) << 9) | ((t.month as u16) << 5) | t.day as u16;
-            let time = ((t.hour as u16) << 11) | ((t.min as u16) << 5) | (t.sec as u16 / 2);
-            (time, date)
-        }
+        Some(t) => fat_pack(&t),
         None => (0, 0),
     }
 }

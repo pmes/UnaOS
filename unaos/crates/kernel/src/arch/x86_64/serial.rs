@@ -41,7 +41,17 @@ pub fn _print(args: ::core::fmt::Arguments) {
     interrupts::without_interrupts(|| {
         if let Some(mut guard) = SERIAL1.try_lock() {
             if let Some(uart) = guard.as_mut() {
-                let _ = uart.write_fmt(args);
+                // CLOCK-2: with `logts`, prefix each serial LINE with a compact timestamp (monotonic
+                // ms → UTC after a civil anchor exists). Only the UART byte-stream is touched; the
+                // fbcon + capture-ring mirrors below still receive the raw `args`. OFF => identical.
+                #[cfg(feature = "logts")]
+                {
+                    let _ = crate::logts::PrefixWriter { inner: uart }.write_fmt(args);
+                }
+                #[cfg(not(feature = "logts"))]
+                {
+                    let _ = uart.write_fmt(args);
+                }
             }
         }
     });

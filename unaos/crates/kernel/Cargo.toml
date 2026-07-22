@@ -26,6 +26,13 @@ skip_xhci = []
 # effective framebuffer geometry/format (the result of EDID/GOP mode selection) and halts, so the
 # whole boot log can be photographed on serial-less hardware. Enable via `UNAOS_BOOTLOG=1`.
 bootlog = []
+# CLOCK-2: opt-in log timestamps on the kernel serial log. Prefixes each serial LINE with a compact
+# fixed-width timestamp — monotonic ms since boot (`[  12345ms] `) before a civil anchor exists,
+# flipping to UTC wall time (`[15:04:07Z] `) once SNTP/`setdate` anchors `crate::clock`. UART
+# byte-stream ONLY — the fbcon + capture-ring mirrors keep the raw text, so tste/UNAOS.LOG are
+# unchanged. DEFAULT OFF => module + prefix path vanish and serial is byte-identical (witness/mbench
+# specs parse serial lines and must be unaffected). Enable via `UNAOS_LOGTS=1`.
+logts = []
 # Raspberry Pi 4 build: the BCM2711 PL011 is not at the QEMU `virt` MMIO address the aarch64 serial
 # hardcodes, so don't touch that UART (it would be RAM on the Pi) — rely on fbcon for on-screen
 # output, like the Mac. Enable via `UNAOS_PI=1`.

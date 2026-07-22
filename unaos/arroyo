@@ -62,6 +62,10 @@ _feats=""
 [ -n "${UNAOS_WITNESS:-}" ] && _feats="${_feats}witness,"
 [ -n "${UNAOS_SKIP_XHCI:-}" ] && _feats="${_feats}skip_xhci,"
 [ -n "${UNAOS_BOOTLOG:-}" ] && _feats="${_feats}bootlog,"
+# CLOCK-2: UNAOS_LOGTS=1 arms the `logts` feature — a compact timestamp prefix on each serial LINE
+# (monotonic ms → UTC after a civil anchor). UART byte-stream only; default OFF => serial byte-
+# identical (witness/mbench specs parse serial lines). Kept in sync with builder/src/main.rs.
+[ -n "${UNAOS_LOGTS:-}" ] && _feats="${_feats}logts,"
 [ -n "${UNAOS_PI:-}" ] && _feats="${_feats}pi,"
 [ -n "${UNAOS_USBDEBUG:-}" ] && _feats="${_feats}usbdebug,"
 [ -n "${UNAOS_SCHED_DEMO:-}" ] && _feats="${_feats}sched_demo,"
@@ -878,6 +882,14 @@ kernel8() {
     if [ -n "${UNAOS_WITNESS:-}" ]; then
         K8_FEATS="${K8_FEATS},witness"
         echo -e "${COLOR_YELLOW}  • UNAOS_WITNESS: kernel8 carries the M6b..U7 fixture battery (CAPSTONE + PASS lines)${COLOR_RESET}"
+    fi
+    # CLOCK-2: UNAOS_LOGTS=1 adds the `logts` feature — a compact timestamp prefix on each serial LINE
+    # (monotonic ms → UTC after a civil anchor). K8_FEATS is CURATED (does not draw from the general
+    # `_feats`), so the arm must be added here too or logts never reaches the Pi image. OFF => the
+    # prefix path is not compiled and serial is byte-identical.
+    if [ -n "${UNAOS_LOGTS:-}" ]; then
+        K8_FEATS="${K8_FEATS},logts"
+        echo -e "${COLOR_YELLOW}  • UNAOS_LOGTS: kernel8 serial lines carry a timestamp prefix (monotonic ms → UTC after sync)${COLOR_RESET}"
     fi
     if [ -n "${UNAOS_K2_LEAVE:-}" ]; then
         K8_FEATS="${K8_FEATS},k2_leave"
