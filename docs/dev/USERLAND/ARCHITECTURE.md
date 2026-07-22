@@ -144,6 +144,28 @@ other handlers.
 `libs/quartzite` is the GUI API. It renders a `WorkspaceState` natively on the
 host and routes user input back to the logic layer as `SMessage`s.
 
+### Two presentation modes (Peter, 2026-07-22)
+
+UnaOS content is presented one of two ways, never a third hand-rolled one:
+
+1. **UnaOS-native GUI — "like a game."** On UnaOS itself (the reserved
+   `platforms/unaos` backend), the GUI draws its own pixels and its own ideal —
+   the [Surface](SURFACE.md) material, its own aesthetic. Full pixel control is
+   correct *here*, because the target is the UnaOS ideal ("a person wishing they
+   could touch it"), not any host's look.
+2. **quartzite — the translator, on foreign soil.** On a host (macOS/GNOME/KDE/
+   Windows), quartzite renders through the platform's **real native widgets** so
+   host users get the UnaOS benefit while staying comfortable in the environment
+   they know. It builds the host toolkit's real view tree; it does **not** draw
+   its own chrome.
+
+The failure mode to avoid is the crack between them: painting a fake imitation of
+host chrome (a hand-drawn "input box" pixel-blitted onto a raw canvas) — that is
+neither native (mode 2) nor the UnaOS ideal (mode 1). A vessel on a host uses
+quartzite's native backend; it never hand-paints widgets. Rendered *content*
+(e.g. a web page inside a browser vessel) composites into a native content view —
+the surrounding chrome stays native.
+
 ### Public API
 - `Backend::new(app_id, …, bootstrap).run()` — creates the host
   application/window and runs the platform event loop.
