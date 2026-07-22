@@ -1430,7 +1430,7 @@ mod metal {
     use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage};
     use smoltcp::phy::Device;
     use smoltcp::socket::{icmp, tcp, udp};
-    use smoltcp::time::Instant;
+    use smoltcp::time::{Duration, Instant};
     use smoltcp::wire::{
         EthernetAddress, HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpEndpoint,
     };
@@ -1462,15 +1462,22 @@ mod metal {
         iface: Interface,
         dev: SmoltcpPhy<GenetNic>,
         sockets: SocketSet<'static>,
-        /// PI-NET-10: the passively-listening HTTP socket's handle in `sockets`.
-        http: SocketHandle,
+        /// PI-NET-10 / PI-NET-12: the pool of passively-listening HTTP socket handles in `sockets`.
+        /// A POOL (not a single socket) gives real accept concurrency + a listen backlog: a browser
+        /// opening several parallel connections (Safari preconnect/pipelining) each land on a distinct
+        /// listener instead of every SYN-after-the-first being dropped for want of a free TCB.
+        http: [SocketHandle; HTTP_POOL],
+        /// PI-NET-12: per-listener "request-seen" latch — set once that connection's request bytes have
+        /// arrived, so its response is emitted only after the peer's GET is in; cleared on every re-listen.
+        req_seen: [bool; HTTP_POOL],
+        /// PI-NET-12: per-listener idle clock (ms). Stamped when a listener first goes active (accepts a
+        /// connection / half-open SYN); 0 while listening or free. Drives the idle-reaper that frees a TCB
+        /// wedged by a peer that connects but never sends a request (Safari speculative socket, SYN flood).
+        active_since: [i64; HTTP_POOL],
         /// PI-NET-11: the mDNS UDP socket's handle (bound to 5353, answering `unaos.local`).
         mdns: SocketHandle,
         /// PI-NET-10: our configured IPv4 (leased or static-fallback), shown on the status page.
         ip: [u8; 4],
-        /// PI-NET-10: set once the current connection's request bytes have arrived, so the response is
-        /// emitted only after the peer's GET is in — cleared on every fresh re-listen.
-        req_seen: bool,
     }
     // Single-core service, touched only behind this mutex on the BSP/AP that owns it — same discipline
     // (and the same raw-DMA reachability through GENET_DEVICE) as `Genet`.
@@ -1489,6 +1496,23 @@ mod metal {
     // `bind_smoltcp`/`arm_net_service` ever run: the whole service no-ops under the existing SKIP path.
     /// The service listens on the well-known HTTP port.
     const HTTP_PORT: u16 = 80;
+    /// PI-NET-12: number of listening TCP sockets (the accept backlog). Each is an independent TCB with
+    /// its own ring buffers; N concurrent client connections can be in flight before any SYN is dropped.
+    /// A status page needs little concurrency, but a browser routinely opens 4–6 parallel sockets, and a
+    /// pool absorbs that instead of serializing onto one TCB. Bounded (fixed static storage), so a flood
+    /// can at worst fill the pool — the idle-reaper (below) then frees wedged TCBs on a deadline.
+    const HTTP_POOL: usize = 4;
+    /// PI-NET-12: idle-reap deadline (ms). A listener that has been in a non-listening, non-closed state
+    /// this long WITHOUT completing a request/response is force-aborted (RST) and re-armed. This is the
+    /// structural fix for the wedge: smoltcp's socket `timeout` only fires when TX data is pending, so an
+    /// established-but-silent peer (never sends its GET) would otherwise hold a TCB forever. On a LAN a
+    /// real client sends its GET within milliseconds of connecting; 3 s is generous headroom.
+    const HTTP_IDLE_MS: i64 = 3_000;
+    /// PI-NET-12: transport-level guards layered under the app idle-reaper. `set_timeout` aborts a peer
+    /// that stalls mid-response (TX data pending, no ACK); `set_keep_alive` probes idle peers so a dead
+    /// TCP endpoint is detected and the timeout can fire. Belt-and-suspenders with the idle-reaper.
+    const TCP_TIMEOUT_MS: u64 = 3_000;
+    const TCP_KEEPALIVE_MS: u64 = 1_000;
     /// TCP socket ring buffers (bytes). RX holds a browser's request line + headers; TX comfortably holds
     /// the full response (headers + page) so a single `send_slice` never truncates before `close`.
     const TCP_RX_CAP: usize = 2048;
@@ -1508,6 +1532,12 @@ mod metal {
     /// Rate-limit for the `[net10]` served witness: mirror net9 — at most once per ~5 s, unless ≥4 new
     /// requests landed. Change-only (the poll task only reports when the count moved).
     const NET10_REPORT_DELTA: u32 = 4;
+
+    /// PI-NET-12: cumulative count of HTTP TCBs force-reaped (idle/half-open aborts) since boot.
+    static NET10_REAPED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    fn net10_reaped() -> u32 {
+        NET10_REAPED.load(core::sync::atomic::Ordering::Relaxed)
+    }
 
     // ── PI-NET-11: the mDNS responder — make the Pi answer `unaos.local` on the share segment ─────────
     //
@@ -1735,31 +1765,82 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
         /// ignored — the same status page answers all); once the request is in and TX is writable the
         /// response is sent and the socket closed. `close()` walks the FIN handshake to `Closed`, where
         /// the next step re-listens. A peer RST drops the socket straight to `Closed` \u{2014} same path.
-        fn http_step(&mut self) {
+        fn http_step(&mut self, now: i64) {
             let ip = self.ip;
-            let sock = self.sockets.get_mut::<tcp::Socket>(self.http);
-            // Re-arm the passive listener from any closed/idle state (post-close, post-RST, or the very
-            // first step after `abort`). `listen` is a no-op if already listening on this port.
-            if !sock.is_open() {
-                let _ = sock.listen(HTTP_PORT);
-                self.req_seen = false;
-                return;
+            let mut reaped = 0u32;
+            for i in 0..HTTP_POOL {
+                let sock = self.sockets.get_mut::<tcp::Socket>(self.http[i]);
+
+                // TIME-WAIT can't be re-listened directly (`listen` needs CLOSED), and it pins a TCB for
+                // 2*MSL. We've already delivered the response, so abort it straight to CLOSED and re-arm
+                // on the same pass — no MSL stall, the listener is back in the backlog immediately.
+                if sock.state() == tcp::State::TimeWait {
+                    sock.abort();
+                }
+
+                // Re-arm the passive listener from any closed/idle state (post-close, post-RST, post-abort,
+                // or first arm). `listen` errors from a non-CLOSED state; the guard above guarantees CLOSED.
+                if !sock.is_open() {
+                    let _ = sock.listen(HTTP_PORT);
+                    self.req_seen[i] = false;
+                    self.active_since[i] = 0;
+                    continue;
+                }
+
+                // The socket is open. If it has left LISTEN (accepted a connection or a half-open SYN),
+                // clock its idle age and reap it once it overstays without completing service. This is the
+                // wedge fix: a peer that connects but never sends a request no longer holds the TCB forever.
+                if sock.is_active() {
+                    if self.active_since[i] == 0 {
+                        self.active_since[i] = now;
+                    } else if now.saturating_sub(self.active_since[i]) > HTTP_IDLE_MS {
+                        sock.abort(); // RST to the peer; re-listened on the next pass via the CLOSED path.
+                        self.req_seen[i] = false;
+                        self.active_since[i] = 0;
+                        reaped += 1;
+                        continue;
+                    }
+                }
+
+                // Drain the request bytes (we serve the same page regardless of method/path). Consuming the
+                // whole RX ring each step keeps per-poll work bounded and the window open.
+                if sock.can_recv() {
+                    let _ = sock.recv(|buf| (buf.len(), ()));
+                    self.req_seen[i] = true;
+                }
+                // Serve once the request is in and the TX half is writable, then close (half-close via FIN).
+                if self.req_seen[i] && sock.can_send() {
+                    let mut resp = [0u8; HTTP_RESP_CAP];
+                    let n = render_http_response(&mut resp, ip);
+                    let _ = sock.send_slice(&resp[..n]);
+                    sock.close();
+                    self.req_seen[i] = false;
+                    // Re-clock: close() walks the FIN handshake (still is_active); let it progress on its
+                    // own deadline so a peer that never ACKs our FIN is reaped rather than pinning the TCB.
+                    self.active_since[i] = now;
+                    NET10_SERVED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                }
             }
-            // Drain the request bytes (we serve the same page regardless of method/path). Consuming the
-            // whole RX ring each step keeps per-poll work bounded and the window open.
-            if sock.can_recv() {
-                let _ = sock.recv(|buf| (buf.len(), ()));
-                self.req_seen = true;
+            if reaped > 0 {
+                NET10_REAPED.fetch_add(reaped, core::sync::atomic::Ordering::Relaxed);
             }
-            // Serve once the request is in and the TX half is writable, then close (half-close via FIN).
-            if self.req_seen && sock.can_send() {
-                let mut resp = [0u8; HTTP_RESP_CAP];
-                let n = render_http_response(&mut resp, ip);
-                let _ = sock.send_slice(&resp[..n]);
-                sock.close();
-                self.req_seen = false;
-                NET10_SERVED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+
+        /// PI-NET-12: census the HTTP listener pool — (listening, active) counts for the TCB witness.
+        /// `active` = accepted/in-flight connections (not LISTEN, not CLOSED/TIME-WAIT). `listen == 0`
+        /// means the backlog is saturated (every TCB busy) — the poll task flags that explicitly.
+        fn http_census(&mut self) -> (u32, u32) {
+            let mut listen = 0u32;
+            let mut active = 0u32;
+            for i in 0..HTTP_POOL {
+                let sock = self.sockets.get_mut::<tcp::Socket>(self.http[i]);
+                if sock.is_listening() {
+                    listen += 1;
+                } else if sock.is_active() {
+                    active += 1;
+                }
             }
+            (listen, active)
         }
 
         /// PI-NET-11: one bounded mDNS service step on the UDP socket, run after each `iface.poll`.
@@ -1823,15 +1904,22 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
         // PI-NET-11: mDNS answered-count witness state (change-only, rate-limited like net9/net10).
         let mut last_answered = 0u32;
         let mut last_answered_report_ms: i64 = 0;
+        // PI-NET-12: TCB-census witness state (change-only, rate-limited; plus a saturation flag edge).
+        let mut last_census = (u32::MAX, u32::MAX);
+        let mut last_census_report_ms: i64 = 0;
+        let mut last_reaped = 0u32;
+        let mut was_saturated = false;
         loop {
             crate::arch::sched::sleep_ticks(NET9_POLL_TICKS);
             let t = now_ms();
+            let mut census = (0u32, 0u32);
             if let Some(ns) = NET_SERVICE.lock().as_mut() {
                 ns.iface.poll(Instant::from_millis(t), &mut ns.dev, &mut ns.sockets);
-                // PI-NET-10: one bounded HTTP service step after the interface has run its state machine.
-                ns.http_step();
+                // PI-NET-10/12: one bounded HTTP service step (pool re-listen, drain, serve, idle-reap).
+                ns.http_step(t);
                 // PI-NET-11: one bounded mDNS service step (answer `unaos.local` on the share segment).
                 ns.mdns_step();
+                census = ns.http_census();
             }
             let (arp, icmp) = net9_counts();
             if arp != last_arp || icmp != last_icmp {
@@ -1863,6 +1951,30 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
                 last_answered = answered;
                 last_answered_report_ms = t;
             }
+
+            // PI-NET-12: TCB-table census. Print when the (listen, active) shape changes and the ~5 s
+            // floor has passed (default-quiet on a steady state), and ALWAYS on a reap edge or the moment
+            // the backlog saturates (listen==0) — those are the diagnostic edges for the accept wedge.
+            let (listen, active) = census;
+            let reaped = net10_reaped();
+            let saturated = listen == 0;
+            let census_changed = (listen, active) != last_census;
+            let reap_edge = reaped != last_reaped;
+            let sat_edge = saturated && !was_saturated;
+            if reap_edge
+                || sat_edge
+                || (census_changed && t.saturating_sub(last_census_report_ms) >= NET9_REPORT_MS)
+            {
+                serial_println!(
+                    "{} [net12] tcbs listen={} active={} pool={} reaped={} served={}{} ::",
+                    PG, listen, active, HTTP_POOL, reaped, net10_served(),
+                    if saturated { " SATURATED" } else { "" }
+                );
+                last_census = (listen, active);
+                last_census_report_ms = t;
+                last_reaped = reaped;
+            }
+            was_saturated = saturated;
         }
     }
 
@@ -1870,20 +1982,34 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
     /// on a secondary core. Called at the tail of `bind_smoltcp` (a NIC is guaranteed present). The empty
     /// SocketSet uses leaked static storage (smoltcp's owned-Vec path is off in our no_std feature set).
     fn arm_net_service(mut iface: Interface, dev: SmoltcpPhy<GenetNic>) {
-        let storage: &'static mut [SocketStorage; 2] =
+        // PI-NET-12: storage holds the HTTP listener POOL plus the one mDNS UDP socket.
+        let storage: &'static mut [SocketStorage; HTTP_POOL + 1] =
             alloc::boxed::Box::leak(alloc::boxed::Box::new(Default::default()));
         let mut sockets = SocketSet::new(&mut storage[..]);
 
-        // PI-NET-10: the Pi's first TCP service. One passive socket with static (leaked) ring buffers —
-        // the same owned-storage discipline GENET_DEVICE/NetService use — listening on :80. `iface.poll`
-        // (driven by the net9 task) then serves it via `NetService::http_step`.
-        let tcp_rx: &'static mut [u8] =
-            alloc::boxed::Box::leak(alloc::boxed::Box::new([0u8; TCP_RX_CAP]));
-        let tcp_tx: &'static mut [u8] =
-            alloc::boxed::Box::leak(alloc::boxed::Box::new([0u8; TCP_TX_CAP]));
-        let mut http_sock = tcp::Socket::new(tcp::SocketBuffer::new(tcp_rx), tcp::SocketBuffer::new(tcp_tx));
-        let listening = http_sock.listen(HTTP_PORT).is_ok();
-        let http = sockets.add(http_sock);
+        // PI-NET-10/12: the Pi's TCP status service — a POOL of passive sockets, each with its own static
+        // (leaked) ring buffers, all listening on :80. The pool is the accept backlog; per-socket timeout
+        // + keep-alive plus the app-level idle-reaper (http_step) keep any single TCB from wedging. `iface
+        // .poll` (driven by the net9 task) then serves the pool via `NetService::http_step`.
+        let mut http: [SocketHandle; HTTP_POOL] =
+            [SocketHandle::default(); HTTP_POOL];
+        let mut listening = 0u32;
+        for slot in http.iter_mut() {
+            let tcp_rx: &'static mut [u8] =
+                alloc::boxed::Box::leak(alloc::boxed::Box::new([0u8; TCP_RX_CAP]));
+            let tcp_tx: &'static mut [u8] =
+                alloc::boxed::Box::leak(alloc::boxed::Box::new([0u8; TCP_TX_CAP]));
+            let mut http_sock =
+                tcp::Socket::new(tcp::SocketBuffer::new(tcp_rx), tcp::SocketBuffer::new(tcp_tx));
+            // Transport-level reaping under the app idle-reaper: abort a peer that stalls mid-response,
+            // and probe idle peers so a dead endpoint is detected and the timeout can fire.
+            http_sock.set_timeout(Some(Duration::from_millis(TCP_TIMEOUT_MS)));
+            http_sock.set_keep_alive(Some(Duration::from_millis(TCP_KEEPALIVE_MS)));
+            if http_sock.listen(HTTP_PORT).is_ok() {
+                listening += 1;
+            }
+            *slot = sockets.add(http_sock);
+        }
 
         // PI-NET-11: the mDNS responder socket — UDP bound to 5353. Static (leaked) metadata + payload
         // rings, same owned-storage discipline as the TCP socket above.
@@ -1915,8 +2041,13 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
             .map(|a| a.octets())
             .unwrap_or(OUR_IP);
 
-        if listening {
-            serial_println!("{} [net10] http listening :80 ::", PG);
+        if listening == HTTP_POOL as u32 {
+            serial_println!("{} [net10] http listening :80 (pool of {}) ::", PG, HTTP_POOL);
+        } else if listening > 0 {
+            serial_println!(
+                "{} [net10] http listening :80 ({}/{} of pool armed) ::",
+                PG, listening, HTTP_POOL
+            );
         } else {
             serial_println!("{} [net10] http listen(:80) FAILED — status service will not accept ::", PG);
         }
@@ -1932,7 +2063,16 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
             );
         }
 
-        *NET_SERVICE.lock() = Some(NetService { iface, dev, sockets, http, mdns, ip, req_seen: false });
+        *NET_SERVICE.lock() = Some(NetService {
+            iface,
+            dev,
+            sockets,
+            http,
+            req_seen: [false; HTTP_POOL],
+            active_since: [0; HTTP_POOL],
+            mdns,
+            ip,
+        });
 
         // Host the task on a secondary core (never the BSP), like input/render/orphan-reaper. If no AP
         // came up, the service cannot be scheduled — report the degraded state rather than wedge the BSP.
