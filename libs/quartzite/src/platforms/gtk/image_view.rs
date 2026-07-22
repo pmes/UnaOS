@@ -5,7 +5,7 @@ use std::rc::Rc;
 use bandy::{SMessage, Synapse};
 use crate::NativeView;
 
-pub fn bootstrap_image_view(synapse: Synapse) -> NativeView {
+pub fn bootstrap_image_surface(id: &str, synapse: Synapse) -> NativeView {
     let drawing_area = DrawingArea::builder()
         .hexpand(true)
         .vexpand(true)
@@ -44,12 +44,15 @@ pub fn bootstrap_image_view(synapse: Synapse) -> NativeView {
     let da_clone = drawing_area.clone();
     let mut rx = synapse.subscribe();
     
+    let target_id = id.to_string();
     gtk4::glib::spawn_future_local(async move {
         while let Ok(msg) = rx.recv().await {
-            if let SMessage::SurfaceBlit { width, height, pixels, .. } = msg {
-                *buffer.borrow_mut() = pixels;
-                *dim.borrow_mut() = (width, height);
-                da_clone.queue_draw();
+            if let SMessage::SurfaceBlit { url, width, height, pixels } = msg {
+                if url == target_id {
+                    *buffer.borrow_mut() = pixels;
+                    *dim.borrow_mut() = (width, height);
+                    da_clone.queue_draw();
+                }
             }
         }
     });

@@ -26,8 +26,8 @@ pub fn eval_tetra(node: TetraNode, synapse: Synapse) -> NativeView {
         TetraNode::TextField { id: _, placeholder, action } => {
             super::text_field::bootstrap_text_field(&placeholder, action, synapse)
         }
-        TetraNode::Surface { id: _ } => {
-            super::image_view::bootstrap_image_view(synapse)
+        TetraNode::Surface { id } => {
+            super::image_view::bootstrap_image_surface(&id, synapse)
         }
         _ => {
             let container = Box::new(Orientation::Horizontal, 0);

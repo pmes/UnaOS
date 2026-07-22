@@ -44,9 +44,9 @@ pub fn eval_tetra(node: TetraNode, synapse: Synapse) -> Retained<NSView> {
         TetraNode::TextField { id: _, placeholder, action } => {
             super::text_field::bootstrap_text_field(&placeholder, action, synapse)
         }
-        TetraNode::Surface { id: _ } => {
+        TetraNode::Surface { id } => {
             // Note: SurfaceBlit must target a Surface by id once >1 surface exists
-            super::image_view::bootstrap_image_view(synapse)
+            super::image_view::bootstrap_image_surface(&id, synapse)
         }
         _ => {
             // Placeholder for unsupported nodes

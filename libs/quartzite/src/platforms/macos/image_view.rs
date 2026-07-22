@@ -644,3 +644,35 @@ pub fn bootstrap_image_view(
 
     Retained::into_super(view)
 }
+
+pub fn bootstrap_image_surface(id: &str, synapse: bandy::Synapse) -> Retained<NSView> {
+    let mtm = MainThreadMarker::new().expect("bootstrap_image_surface must run on the main thread");
+
+    let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(800.0, 600.0));
+    let view = FacetImageView::new(mtm, frame);
+
+    let bound = std::sync::Arc::new(dispatch2::MainThreadBound::new(view.clone(), mtm));
+    let mut rx = synapse.subscribe();
+
+    let target_id = id.to_string();
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(bandy::SMessage::SurfaceBlit { url, width, height, pixels }) => {
+                    if url == target_id {
+                        let bound = bound.clone();
+                        dispatch2::DispatchQueue::main().exec_async(move || {
+                            let mtm = MainThreadMarker::new().unwrap();
+                            bound.get(mtm).set_frame(&pixels, &[], width, height);
+                        });
+                    }
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+
+    Retained::into_super(view)
+}
