@@ -6452,9 +6452,12 @@ the RC.
   identity (expect Broadcom `0x14e4`) from RC config space.
 - **M2 — VL805 enumeration.** Child config via the brcmstb `EXT_CFG_INDEX`/`EXT_CFG_DATA` window (bus 1,
   dev 0, fn 0): verify identity `1106:3483` (poison-rejecting), read class (expect `0c/03/30` USB xHCI).
-  *(PIUSB-4, boot-P2 fix — device-side `0xdeaddead`)* **Order matters:** issue the **`NOTIFY_XHCI_RESET`**
-  mailbox (tag `0x00030058`, `dev_addr = 0x0010_0000` = `(bus1<<20)|(dev0<<15)|(fn0<<12)`) **FIRST**, then
-  size + assign BAR0 + enable decode. The notify makes the VideoCore firmware (re)load the VL805 firmware,
+  *(PIUSB-4, boot-P2 — superseded by PIUSB-15 below; the notify-first order was reversed after boot-P25)*
+  PIUSB-4 issued the **`NOTIFY_XHCI_RESET`** mailbox (tag `0x00030058`,
+  `dev_addr = 0x0010_0000` = `(bus1<<20)|(dev0<<15)|(fn0<<12)`) **FIRST**, then sized + assigned BAR0 +
+  enabled decode — on the theory the reload wipes config space. **PIUSB-15 reverses this:** BAR0 is now
+  assigned + MMIO-verified BEFORE the notify (boot-P25 showed the fw push needs a live BAR); see the
+  PIUSB-15 entry. The historical PIUSB-4 rationale is retained below for the record. The notify makes the VideoCore firmware (re)load the VL805 firmware,
   which **resets the VL805's PCI config space** — BAR0 and COMMAND revert to power-on defaults. boot-P2 had
   the arm CPU-side window correct (`WIN0 armed: YES`) yet still read `0xdeaddead`, because the old order
   assigned BAR0 + enabled COMMAND and only *then* issued the notify, so the firmware reload wiped both and
@@ -6644,6 +6647,40 @@ byte-identical to baseline** (sha256 in the landing report); knob-on `UNAOS_PIUS
 `UNAOS_GICV3=1 ./arroyo test-arm 40`, `./arroyo test 22` all unregressed. Positive verification (RC link
 up, VL805 `1106:3483` found, BAR sized, xHCI decoding, ports powered) is the **attended Pi sitting** —
 see `scripts/pi-usb1-bench.md`.
+
+### PIUSB-15 — assign + MMIO-verify BAR0 BEFORE NOTIFY; the PIUSB-4 order is reversed (boot-P25)
+
+**The confounder.** PIUSB-4 ruled "NOTIFY first, BAR after — the fw reload wipes config space, so
+assigning before is pointless." boot-P25 (PIUSB-14's real boundary capture) refutes that ruling, and
+since it predates the PIUSB-7 RP mem window + this boundary data it is **not binding**:
+
+- At NOTIFY time the VL805 `BAR0 = [0x00000004 0x00000000]` — **UNASSIGNED** (the prior code deferred BAR
+  assignment until after the notify).
+- The VC nonetheless **reached the device and set VL805 `COMMAND` MEM+BM itself** (`0x0000 → 0x0146`), so
+  the config-forwarding path was live at notify time — yet BAR0 stayed unassigned and `USBSTS.CNR` stayed
+  1 through the full wait. The controller was **never loaded**.
+- M3-MMIO `CAP[0]=0x01000020 USBSTS=0x00000801` unchanged across the notify — the load never touched the
+  controller.
+
+**Derived conclusion (acted on).** The VC's fw-load path writes the VL805 firmware image **through the
+device's BAR0** (an MMIO push). With BAR0 unassigned there is no address to push through, so the handler
+enables `COMMAND` and exits **without loading**. In Linux, PCI enumeration assigns the VL805's BAR0
+**before** `rpi_firmware_init_vl805`'s NOTIFY fires. We are the enumerator, so M2 now mirrors that order:
+**size + assign BAR0** into the RP mem window, **enable MEM+BM**, **verify an MMIO `CAP[0]` read decodes**
+through the new BAR (the xHCI capability registers are hardware-fixed and decode as soon as BAR0+MEM are
+set — CNR tracks fw readiness separately), and **only then** issue `NOTIFY_XHCI_RESET`. After the notify a
+**BAR0-retention witness** compares the assigned value against the post-notify read; if the load reverted
+config space, `reassert_vl805_decode()` re-programs BAR0+COMMAND (the PIUSB-4 concern kept as a witness,
+not a reason to defer). The M3 pre-HCRST NOTIFY re-issue already runs with BAR0 assigned (M2) and after
+its own CAP verify, so it needs no reorder. One authoritative BAR-assignment path; PIUSB-10's CNR wait
+stays the verdict gate. In-lane: `piusb.rs` only; `drivers/xhci` + `mailbox.rs` untouched.
+
+**Metal discrimination (next boot).** (a) `CAP[0]` LIVE pre-NOTIFY + CNR clears → the load ran through
+the BAR; PIUSB-13's `[enum]` walks the keyboard. (b) BAR0 changed across NOTIFY + re-program + CNR clears
+→ same, load reverts config space (retention witness names it). (c) BAR0 assigned + `CAP[0]` MMIO-verified
+at notify time + CNR still 1 → the load path is **not** BAR-MMIO (next theory: the VC uses its own
+translation/DMA for the push) — report, do not flail. QEMU raspi4b models no PCIe RC, so the whole path
+sits behind the DTB-census honesty-line gate (clean skip, byte-identity preserved).
 
 ## PI-USB-2 — from the honesty line to device enumeration on the VL805 (Arc PI-USB-2)
 

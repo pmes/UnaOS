@@ -771,8 +771,11 @@ fn m1_rc_bringup() -> bool {
 
 /// M2: enumerate the VL805 through the EXT_CFG child window, verify its identity (poison-rejecting),
 /// run the standard BAR-sizing ritual on BAR0 (restore-immediate), assign BAR0 to the outbound window's
-/// PCIe base, enable MEM decode + bus-master on the VL805, and issue the NOTIFY_XHCI_RESET mailbox so
-/// the VideoCore firmware (re)loads the VL805 firmware. Returns the PCIe-side BAR0 base on success.
+/// PCIe base, enable MEM decode + bus-master on the VL805, VERIFY an MMIO CAP[0] read decodes through
+/// the new BAR, and ONLY THEN issue the NOTIFY_XHCI_RESET mailbox so the VideoCore firmware (re)loads
+/// the VL805 firmware over that live BAR (PIUSB-15: boot-P25 showed the load needs an assigned BAR to
+/// push through). Witnesses BAR0 retention across the notify and re-programs if the load reverts config
+/// space. Returns the PCIe-side BAR0 base on success.
 fn m2_enumerate_vl805() -> Option<u64> {
     // ── PI-USB-2 R22 sitting-2 fix: the RC never had its ROOT-PORT BRIDGE BUS WINDOW programmed.
     // The RP is a type-1 (bridge) function; its PRIMARY/SECONDARY/SUBORDINATE bus registers
@@ -904,65 +907,28 @@ fn m2_enumerate_vl805() -> Option<u64> {
         );
     }
 
-    // ── PIUSB-4 ADJUDICATION (the boot-P2 device-side 0xdeaddead root cause) ──────────────────────────
-    // boot-P2 proved the outbound window armed CPU-side (every WIN0 readback correct, `WIN0 armed: YES`)
-    // yet the CAP read at CPU 0x6_0000_0000 still returned 0xdeaddead — the abort moved DOWNSTREAM of the
-    // RC. The offender is ORDERING: NOTIFY_XHCI_RESET makes the VideoCore firmware (re)load the VL805's
-    // firmware, which RESETS the VL805's PCI config space — BAR0 and the COMMAND register revert to their
-    // power-on defaults (BAR0 = 0, MEM decode off). The prior code assigned BAR0 + enabled COMMAND and
-    // THEN issued the notify, so the firmware reload wiped both: the VL805 decoded its MMIO at BAR=0 (i.e.
-    // NOT at PCIe 0xC000_0000), the CPU read of the outbound window hit nothing the device claimed, and
-    // the RC returned its master-abort fill 0xdeaddead — device-side, exactly as captured.
-    //
-    // Linux never hits this because `quirk_vl805` is a DECLARE_PCI_FIXUP_HEADER: the firmware load/reset
-    // runs during device scan, BEFORE the PCI core assigns BARs and enables the device (facts-only from
-    // the fixup class; pcie-brcmstb.c / the firmware helper are GPL-2.0-only). We ARE the enumerator, so
-    // we mirror that order here: notify FIRST (firmware settles the VL805 into a known reset state), THEN
-    // size + assign BAR0 + enable COMMAND on top of that settled state, so nothing downstream reverts our
-    // programming. Every layer is READ BACK and witnessed so boot-P3 names the failing layer if the wall
-    // persists (mailbox SUCCESS is NOT proof the VL805 firmware is running; the config re-reads are).
+    // ── PIUSB-15 ADJUDICATION (boot-P25's boundary witness REVERSES the PIUSB-4 order) ─────────────────
+    // PIUSB-4 concluded "NOTIFY first, THEN assign BAR — the fw reload wipes config space, so assigning
+    // before is pointless." boot-P25 (PIUSB-14's real capture) CONFOUNDS that verdict, and it predates the
+    // PIUSB-7 RP mem window + this boundary data so it is NOT binding:
+    //   * At NOTIFY time the VL805 BAR0 read [0x00000004 0x00000000] — UNASSIGNED — because the prior code
+    //     deferred BAR assignment until AFTER the notify.
+    //   * The VC nonetheless REACHED the device and set VL805 COMMAND MEM+BM ITSELF (0x0000 -> 0x0146) —
+    //     so the config-forwarding path was live at notify time — yet BAR0 stayed unassigned and CNR
+    //     stayed 1 through the full wait. The controller was never loaded.
+    // Derived conclusion (this arc acts on it): the VC's fw-load path writes the VL805 fw image THROUGH
+    // the device's BAR0 (an MMIO push). With BAR0 unassigned there is no address to push through, so the
+    // handler enables the COMMAND bits and EXITS WITHOUT LOADING. In Linux, PCI enumeration assigns the
+    // VL805's BAR0 BEFORE `rpi_firmware_init_vl805`'s NOTIFY fires — we ARE the enumerator, so we mirror
+    // that: SIZE + ASSIGN BAR0 into the RP mem window, ENABLE MEM+BM, VERIFY an MMIO CAP[0] read decodes
+    // through the new BAR, and ONLY THEN issue NOTIFY. After NOTIFY we witness BAR0 RETENTION (the old
+    // PIUSB-4 concern, now a witness rather than a reason to defer) and re-program if the load reverted
+    // config space. The CNR wait (M3 / enumerate) remains the verdict gate.
     //
     // The dev_addr encoding (VL805_DEV_ADDR = (1<<20)|(0<<15)|(0<<12) = 0x0010_0000) matches the RPi
-    // firmware property model — dev_id = (bus<<20)|(slot<<15)|(func<<12) for bus1/dev0/fn0. Verified
-    // against the mailbox property-interface reference; constant unchanged.
-    // PIUSB-14: witness the exact downstream state the VC's fw-load handler depends on, immediately
-    // BEFORE the NOTIFY — the link (DL_ACTIVE printed here, at notify time), our RC/RP forwarding, and
-    // the VL805's live config. On this EEPROM-less board the VC pushes the VL805 firmware over PCIe at
-    // NOTIFY time, so this line records that the config path is up when the handler runs. Windows are
-    // programmed (bus[0x18], mem[0x20], RP COMMAND — all set above); the BAR is assigned AFTER NOTIFY
-    // (PIUSB-4: the reload resets config space), and the PRE/POST id[0x00] diff below tells us whether
-    // that reset actually reached the silicon.
-    witness_notify_boundary("M2", "PRE");
+    // firmware property model — dev_id = (bus<<20)|(slot<<15)|(func<<12) for bus1/dev0/fn0.
 
-    serial_println!("{}   NOTIFY_XHCI_RESET (mailbox 0x00030058, dev_addr={:#x}) — firmware VL805 reset/load (BEFORE BAR/COMMAND: the reload resets config space) ::", P, VL805_DEV_ADDR);
-    let n = mailbox::notify_xhci_reset(VL805_DEV_ADDR);
-    witness_notify("M2", &n);
-    // Let the VideoCore firmware finish loading/resetting the VL805 before we touch its config space.
-    settle_ms(50);
-
-    // PIUSB-14: re-witness the SAME state AFTER the NOTIFY. Compare against the PRE line above:
-    //   * RC/RP registers CHANGED  => the VC re-ran its own RC bring-up (it does NOT ride our windows;
-    //     our forwarding is moot and the fix is to match the VC's expected topology, not program ours).
-    //   * RC/RP registers UNCHANGED => the VC rode our windows; if the fw still didn't load, our
-    //     forwarding was insufficient (e.g. the fw push needs the mem window/BAR, which we set later).
-    //   * VL805 id/BAR0/COMMAND CHANGED => the reset/load reached the silicon (config space reverted).
-    witness_notify_boundary("M2", "POST");
-
-    // Witness LAYER 2 (firmware running / device survival): re-read the identity word AFTER the notify.
-    // If the VL805 vanished or the RP forwarding broke across the reset, this catches it before we
-    // program a BAR into thin air. A live vendor:device here = the device answered post-reset.
-    let post = vl805_cfg_read(0x00);
-    match live_vendor_device(post) {
-        Some((v, d)) => serial_println!("{}   post-NOTIFY cfg[0x00] = {:#010x} (vendor={:#06x} device={:#06x} — device survived the fw reset, answering config) ::", P, post, v, d),
-        None => {
-            serial_println!("{}   post-NOTIFY cfg[0x00] = {:#010x} — device did NOT answer after the firmware reset (absent/forwarding lost) — bring-up STOP ::", P, post);
-            return None;
-        }
-    }
-
-    // ── BAR0 sizing ritual (all-ones probe + immediate restore; the ORIN-NET-3 pattern). Now runs on the
-    //    freshly-reset device, so `orig` reflects the post-reset default (typically 0) — that is fine: we
-    //    reassign BAR0 explicitly below regardless. ──
+    // ── BAR0 sizing ritual (all-ones probe + immediate restore; the ORIN-NET-3 pattern), BEFORE NOTIFY. ──
     let orig = vl805_cfg_read(0x10);
     serial_println!("{}   >>> WRITE: BAR0[0x10] all-ones probe (orig={:#010x}) — write 0xffffffff, read size, RESTORE ::", P, orig);
     vl805_cfg_write(0x10, 0xFFFF_FFFF);
@@ -982,17 +948,15 @@ fn m2_enumerate_vl805() -> Option<u64> {
         P, if is_io { "I/O(!)" } else { "MMIO" }, is_64bit, size
     );
 
-    // ── Assign BAR0 to the outbound window's PCIe base and enable decode. The VL805's xHCI MMIO will
-    //    then be decoded at PCIe 0xC000_0000, which the CPU reaches at OUTBOUND_CPU_BASE (mapped in M3). ──
+    // ── Assign BAR0 to the outbound window's PCIe base and enable decode — BEFORE NOTIFY (PIUSB-15). The
+    //    VL805's xHCI MMIO decodes at PCIe 0xC000_0000, reachable by the CPU at OUTBOUND_CPU_BASE, which
+    //    gives the VC's fw-load path a live MMIO target to push the firmware image through. ──
     let bar0_pcie = OUTBOUND_PCIE_BASE;
-    serial_println!("{}   >>> WRITE: BAR0 := {:#x} (PCIe-side; CPU sees it at {:#x}) ::", P, bar0_pcie, OUTBOUND_CPU_BASE);
+    serial_println!("{}   >>> WRITE: BAR0 := {:#x} (PCIe-side; CPU sees it at {:#x}) — assigned BEFORE NOTIFY (PIUSB-15) ::", P, bar0_pcie, OUTBOUND_CPU_BASE);
     let bar0_lo = (bar0_pcie & 0xFFFF_FFF0) as u32 | (orig & 0xf);
     vl805_cfg_write(0x10, bar0_lo);
-    // Witness LAYER 1 (BAR upper dword): ALWAYS write BAR0[0x14] explicitly. For our sub-4-GiB PCIe base
-    // (0xC000_0000) the high half is 0; leaving it stale/garbage on a 64-bit BAR would make the device
-    // decode at <garbage>:0xC000_0000 — nowhere — which is one of the boot-P2 suspect classes. Write 0
-    // unconditionally (harmless on a 32-bit BAR: [0x14] is then the next BAR, which we do not use and
-    // which decode-enable does not arm until assigned), then read BOTH dwords back and witness them.
+    // ALWAYS write BAR0[0x14] explicitly. For our sub-4-GiB PCIe base (0xC000_0000) the high half is 0;
+    // leaving it stale on a 64-bit BAR would make the device decode at <garbage>:0xC000_0000 — nowhere.
     let bar0_hi = (bar0_pcie >> 32) as u32; // = 0 for 0xC000_0000
     vl805_cfg_write(0x14, bar0_hi);
     let rb_bar_lo = vl805_cfg_read(0x10);
@@ -1004,14 +968,12 @@ fn m2_enumerate_vl805() -> Option<u64> {
         if bar_ok { "LATCHED" } else { "DID NOT LATCH — BAR programming did not stick" }
     );
 
-    // Command register (0x04): set MEM Space Enable (bit1) + Bus Master Enable (bit2). Enable decode LAST,
-    // after the BAR is in place — a device must not decode before its BAR is assigned.
+    // Command register (0x04): set MEM Space Enable (bit1) + Bus Master Enable (bit2). Enable decode after
+    // the BAR is in place — a device must not decode before its BAR is assigned.
     let cmd = vl805_cfg_read(0x04);
     let newcmd = (cmd & 0xFFFF_0000) | ((cmd & 0xFFFF) | 0b110);
-    serial_println!("{}   >>> WRITE: VL805 COMMAND {:#06x} -> {:#06x} (MEM+BusMaster enable) ::", P, cmd & 0xffff, newcmd & 0xffff);
+    serial_println!("{}   >>> WRITE: VL805 COMMAND {:#06x} -> {:#06x} (MEM+BusMaster enable, BEFORE NOTIFY) ::", P, cmd & 0xffff, newcmd & 0xffff);
     vl805_cfg_write(0x04, newcmd);
-    // Witness LAYER 3 (enable/settle): read COMMAND back — MEM(bit1)+BM(bit2) must both read set, else the
-    // device will not decode its BAR no matter how the window is armed.
     let rb_cmd = vl805_cfg_read(0x04) & 0xffff;
     let cmd_ok = (rb_cmd & 0b110) == 0b110;
     serial_println!(
@@ -1019,8 +981,77 @@ fn m2_enumerate_vl805() -> Option<u64> {
         P, rb_cmd, (rb_cmd >> 1) & 1, (rb_cmd >> 2) & 1,
         if cmd_ok { "DECODE ENABLED" } else { "DECODE NOT ENABLED — MEM/BM bits did not set" }
     );
-    // Let decode settle before M3's first MMIO read at the CPU window (enable/settle ordering).
-    settle_ms(10);
+    settle_ms(10); // let decode settle before the MMIO verify read
+
+    // ── PIUSB-15: VERIFY an MMIO CAP[0] read decodes through the freshly-assigned BAR, BEFORE NOTIFY.
+    //    This is the arc's core precondition: the VC fw-load push needs a live MMIO address. Map the
+    //    outbound window (idempotent with the reference dump / M3's map) and read CAP[0]. The xHCI
+    //    capability registers are hardware-fixed and decode as soon as BAR0+MEM are set — they do NOT
+    //    require the fw to be loaded (USBSTS.CNR tracks fw readiness separately), so a live CAP[0] here
+    //    confirms the BAR is a real MMIO target. A poison read is recorded LOUDLY but does NOT abort:
+    //    issuing the NOTIFY anyway is what captures the CNR verdict that discriminates the theories. ──
+    unsafe { super::boot::map_device_1gib(OUTBOUND_CPU_BASE) };
+    let mut precap = r(OUTBOUND_CPU_BASE);
+    let mut ptries = 1u32;
+    while (is_poison(precap) || precap == 0) && ptries < 8 {
+        settle_ms(5);
+        precap = r(OUTBOUND_CPU_BASE);
+        ptries += 1;
+    }
+    if is_poison(precap) || precap == 0 {
+        serial_println!(
+            "{}   PIUSB-15 pre-NOTIFY MMIO verify: CAP[0]={:#010x} @ {:#x} after {} tries — BAR does NOT decode MMIO yet (theory (c): the load path may not be BAR-MMIO; proceeding to NOTIFY to capture the CNR verdict) ::",
+            P, precap, OUTBOUND_CPU_BASE, ptries
+        );
+    } else {
+        serial_println!(
+            "{}   PIUSB-15 pre-NOTIFY MMIO verify: CAP[0]={:#010x} @ {:#x} LIVE (CAPLENGTH={} HCIVERSION={:#06x}) — BAR decodes MMIO; the VC fw-load now has an address to push through ::",
+            P, precap, OUTBOUND_CPU_BASE, precap & 0xff, (precap >> 16) as u16
+        );
+    }
+
+    // PIUSB-14 boundary witness, immediately BEFORE the NOTIFY — now BAR0 is ASSIGNED at notify time
+    // (the PIUSB-15 reversal). BAR0 in this line vs. the POST line below shows whether the fw load
+    // reverts config space (theory (b)); the CNR wait shows whether the load actually ran (a)/(c).
+    witness_notify_boundary("M2", "PRE");
+
+    serial_println!("{}   NOTIFY_XHCI_RESET (mailbox 0x00030058, dev_addr={:#x}) — VC (re)loads VL805 fw; BAR0 ASSIGNED+MMIO-verified FIRST (PIUSB-15: the fw push needs a live BAR) ::", P, VL805_DEV_ADDR);
+    let n = mailbox::notify_xhci_reset(VL805_DEV_ADDR);
+    witness_notify("M2", &n);
+    // Let the VideoCore firmware finish loading/resetting the VL805 before we re-read its config space.
+    settle_ms(50);
+
+    // PIUSB-14: re-witness the SAME state AFTER the NOTIFY. RC/RP registers changed => the VC re-ran its
+    // own bring-up (does not ride our windows); VL805 BAR0/COMMAND changed => the load reverted config
+    // space (theory (b)).
+    witness_notify_boundary("M2", "POST");
+
+    // Device survival: a live vendor:device here = the device answered post-reset.
+    let post = vl805_cfg_read(0x00);
+    match live_vendor_device(post) {
+        Some((v, d)) => serial_println!("{}   post-NOTIFY cfg[0x00] = {:#010x} (vendor={:#06x} device={:#06x} — device survived the fw reset, answering config) ::", P, post, v, d),
+        None => {
+            serial_println!("{}   post-NOTIFY cfg[0x00] = {:#010x} — device did NOT answer after the firmware reset (absent/forwarding lost) — bring-up STOP ::", P, post);
+            return None;
+        }
+    }
+
+    // PIUSB-15: BAR0 RETENTION across the fw load (the old PIUSB-4 concern, now a witness). If the load
+    // reverted BAR0 to a power-on default, re-program BAR0+COMMAND so M3's CAP read + HCRST land on a
+    // decoding controller (discrimination (b)).
+    let post_bar = vl805_cfg_read(0x10);
+    if post_bar != bar0_lo {
+        serial_println!(
+            "{}   PIUSB-15: BAR0 changed across NOTIFY ({:#010x} -> {:#010x}) — fw load reverted config space; re-programming BAR0+COMMAND (theory (b)) ::",
+            P, bar0_lo, post_bar
+        );
+        reassert_vl805_decode("M2 post-notify");
+    } else {
+        serial_println!(
+            "{}   PIUSB-15: BAR0 RETAINED across NOTIFY ({:#010x}) — fw load did not revert config space ::",
+            P, post_bar
+        );
+    }
 
     Some(bar0_pcie)
 }
