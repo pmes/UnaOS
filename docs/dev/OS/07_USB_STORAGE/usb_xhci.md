@@ -110,6 +110,62 @@ every coherency and ring hypothesis. The root cause, witnessed on metal:
 
 ---
 
+### 1b. Post-CNR enumeration witness (PIUSB-13)
+
+Once the CNR wall (§1a) falls, the VL805 root ports must be walked to a live HID
+keyboard: port scan → reset → speed → **Enable Slot** → **ADDRESS_DEVICE** (input
+context = slot + EP0 sized to the trained speed) → GET_DESCRIPTOR(device, config) →
+select the boot-protocol keyboard interface → SET_CONFIGURATION → SET_PROTOCOL(boot)
+→ arm the interrupt-IN endpoint → decode boot-keyboard reports (scancode → ASCII).
+
+**None of that machinery is Pi-specific.** The entire FSM lives in the shared
+`drivers/xhci` driver (`service_enum` / `service_hid_setproto` / `poll_events`, the
+`HID_SCANCODE_TO_ASCII` table, the `xHCI: KEY: '…'` report line) and is driven
+verbatim by the Pi's post-heap `piusb::enumerate()` pump — the same code the x86
+rMBP and the Jetson run. PIUSB-13 therefore adds **no enumeration control flow**; it
+adds an *observer* (`EnumWitness` in `arch/aarch64/piusb.rs`) that snapshots the
+driver's read-only state each pump tick (~2 ms cadence) and emits one
+`:: PIUSB: [enum] … ::` milestone line per stage transition, so a single metal boot
+localizes exactly how far a keyboard got — and, on failure, the stage + completion
+code that stopped it. The state the observer reads (`enum_stage_now`,
+`enumerating_port_now`, `last_stall_now`, `stall_count_now`, `root_ports_now`, and
+the new `DeviceSlot::keyboard_report_count`) is exposed through **aarch64-gated,
+read-only accessors** on the shared `XhciController`; the `#[cfg(target_arch =
+"aarch64")]` block does not compile on x86, so x86 codegen is byte-identical.
+
+**Gating (inert while CNR is stuck).** `enumerate()` returns at the `XHCI_READY`
+gate in QEMU raspi4b (no VL805 modelled — nothing is built), and on a metal boot
+where the CNR wall is still up, `RS=1` is dropped, so no port ever connects, no
+enum stage ever advances, and no slot is ever assigned. Every edge test in the
+observer is then a no-op and it stays **silent** — it speaks only once real
+enumeration makes progress. The Pi QEMU battery is unchanged (0 FAIL); the path is
+metal-only by construction.
+
+**Expected metal witness sequence** (keyboard in a VL805 root port, CNR cleared):
+
+```
+:: PIUSB: [enum] observer armed … ::
+:: PIUSB: [enum] port P connect (device attached) ::
+:: PIUSB: [enum] port P trained speed High-Speed (xhci speed id 3) ::
+:: PIUSB: [enum] port P stage -> enable-slot ::
+:: PIUSB: [enum] port P stage -> address-device ::
+:: PIUSB: [enum] slot N addressed (root port P) ::
+:: PIUSB: [enum] port P stage -> dev-desc ::
+:: PIUSB: [enum] port P stage -> cfg-desc ::
+:: PIUSB: [enum] port P stage -> set-config ::
+:: PIUSB: [enum] slot N HID boot-keyboard armed (interrupt-IN ep 0x81 mps 8, root port P) ::
+:: PIUSB: [enum] slot N first keyboard report received — HID pipe live … ::
+xHCI: KEY: 'a' (scancode 0x4)
+```
+
+A `:: PIUSB: [enum] STALL port P @ stage <S> (<why>, completion code C) PORTSC=0x… ::`
+line replaces the milestone that never came: the stage names *where* it stopped
+(`enable-slot`, `address-device`, `set-config`, …) and code `C` names *why* (xHCI
+completion code — e.g. 4 = USB Transaction Error, 5 = TRB Error, 17 = Parameter
+Error, 19 = Context State Error), so one boot localizes the failure.
+
+---
+
 ## 2. Controller bring-up
 
 `xhci::init(base_address)` takes the MMIO base handed over by the bootloader and:

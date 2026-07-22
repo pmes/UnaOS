@@ -1173,6 +1173,137 @@ fn keyboard_armed(x: &xhci::XhciController) -> Option<(u8, u8)> {
     None
 }
 
+/// PIUSB-13: the post-CNR enumeration observer. The full enumeration FSM (enable-slot →
+/// ADDRESS_DEVICE → GET_DESCRIPTOR → SET_CONFIGURATION → SET_PROTOCOL(boot) → arm interrupt-IN →
+/// boot-report decode → ASCII) lives in the shared `drivers/xhci` driver and is driven verbatim by
+/// the pump below (`service_enum`/`service_hid_setproto`/`poll_events`). This struct adds no control
+/// flow — it is a pure *observer* that snapshots the driver's read-only state each pump tick and
+/// emits one `:: PIUSB: [enum] ... ::` milestone line per stage transition, so a single metal boot
+/// localizes exactly how far a keyboard got and — on failure — the stage + completion code that
+/// stopped it.
+///
+/// GATING (inert while CNR is stuck): `enumerate()` returns at the `XHCI_READY` gate in QEMU (no
+/// controller built), and on metal with the VL805 CNR wall still up, RS=1 is dropped, so NO port
+/// ever connects, NO enum stage ever advances, and NO slot is ever assigned — every edge test below
+/// is a no-op and the observer stays silent. It only speaks once real enumeration makes progress.
+struct EnumWitness {
+    // Root-port edge state, indexed by xHCI port id (1..=max_ports; VL805 = 8). Index 0 unused.
+    port_connected: [bool; 17],
+    port_speed: [u32; 17],
+    // Per-slot once-only milestone bitmasks (slot id 0..63).
+    slot_addressed: u64,
+    slot_hid_armed: u64,
+    slot_first_report: u64,
+    // Root-enum FSM stage edge state.
+    last_stage: &'static str,
+    last_stage_port: u8,
+    last_stall_count: u32,
+    // cntpct throttle: the pump spins hot, but enumeration milestones are ms-scale, so the observer
+    // samples on a ~2 ms cadence (bounds the per-tick snapshot cost without missing a stage).
+    next_poll: u64,
+    poll_period: u64,
+}
+
+impl EnumWitness {
+    fn new() -> Self {
+        let freq = super::timer::cntfrq();
+        EnumWitness {
+            port_connected: [false; 17],
+            port_speed: [0; 17],
+            slot_addressed: 0,
+            slot_hid_armed: 0,
+            slot_first_report: 0,
+            last_stage: "idle",
+            last_stage_port: 0,
+            last_stall_count: 0,
+            next_poll: 0,
+            poll_period: (freq / 500).max(1), // ~2 ms
+        }
+    }
+
+    fn speed_name(id: u32) -> &'static str {
+        match id { 1 => "Full-Speed", 2 => "Low-Speed", 3 => "High-Speed", 4 => "SuperSpeed", _ => "untrained" }
+    }
+
+    /// Snapshot the driver's read-only state and emit any newly-crossed milestones. Never mutates
+    /// the controller.
+    fn tick(&mut self, x: &xhci::XhciController) {
+        let now = super::timer::cntpct();
+        if now.wrapping_sub(self.next_poll) >= (1u64 << 63) {
+            return; // not yet due (wrap-safe)
+        }
+        self.next_poll = now.wrapping_add(self.poll_period);
+
+        // (1) Root-port connect / speed edges.
+        for (port, connected, speed) in x.root_ports_now() {
+            let p = port as usize;
+            if p >= self.port_connected.len() { continue; }
+            if connected && !self.port_connected[p] {
+                serial_println!("{} [enum] port {} connect (device attached) ::", P, port);
+            } else if !connected && self.port_connected[p] {
+                serial_println!("{} [enum] port {} disconnect (device removed) ::", P, port);
+                self.port_speed[p] = 0; // re-arm the speed edge for a re-plug
+            }
+            self.port_connected[p] = connected;
+            if connected && speed != 0 && self.port_speed[p] == 0 {
+                serial_println!(
+                    "{} [enum] port {} trained speed {} (xhci speed id {}) ::",
+                    P, port, Self::speed_name(speed), speed
+                );
+                self.port_speed[p] = speed;
+            }
+        }
+
+        // (2) Root-enum FSM stage transitions — surfaces enable-slot (slot assigned),
+        //     address-device (addressed), dev-desc/cfg-desc (descriptors), set-config (configured).
+        let stage = x.enum_stage_now();
+        let stage_port = x.enumerating_port_now();
+        if stage != self.last_stage || stage_port != self.last_stage_port {
+            if stage != "idle" {
+                serial_println!("{} [enum] port {} stage -> {} ::", P, stage_port, stage);
+            }
+            self.last_stage = stage;
+            self.last_stage_port = stage_port;
+        }
+
+        // (3) Per-slot milestones (addressed / HID armed / first report), once each.
+        for (i, s) in x.slots.iter().enumerate() {
+            if i >= 64 { break; }
+            let bit = 1u64 << i;
+            if s.active && (self.slot_addressed & bit) == 0 {
+                serial_println!("{} [enum] slot {} addressed (root port {}) ::", P, i, s.port_id);
+                self.slot_addressed |= bit;
+            }
+            if s.active && s.is_keyboard && s.keyboard_state == 3 && (self.slot_hid_armed & bit) == 0 {
+                serial_println!(
+                    "{} [enum] slot {} HID boot-keyboard armed (interrupt-IN ep {:#04x} mps {}, root port {}) ::",
+                    P, i, s.keyboard_ep, s.keyboard_mps, s.port_id
+                );
+                self.slot_hid_armed |= bit;
+            }
+            if s.is_keyboard && s.keyboard_report_count > 0 && (self.slot_first_report & bit) == 0 {
+                serial_println!(
+                    "{} [enum] slot {} first keyboard report received — HID pipe live (keycodes decode to `xHCI: KEY` lines) ::",
+                    P, i
+                );
+                self.slot_first_report |= bit;
+            }
+        }
+
+        // (4) Stall localizer — on a NEW stall, name the stage + completion code that stopped it.
+        let sc = x.stall_count_now();
+        if sc != self.last_stall_count {
+            if let Some((port, st, why, code, portsc)) = x.last_stall_now() {
+                serial_println!(
+                    "{} [enum] STALL port {} @ stage {} ({}, completion code {}) PORTSC={:#010x} — enumeration halted here ::",
+                    P, port, st, why, code, portsc
+                );
+            }
+            self.last_stall_count = sc;
+        }
+    }
+}
+
 /// PI-USB-2 M3 — the DMA-side bring-up + device enumeration on the VL805. Called ONCE on the BSP,
 /// post-heap (kernel_main), after `bringup` reached the honesty line pre-heap. Reuses the shared xHCI
 /// driver's polled-attach machinery verbatim (the JB2b pattern, `xusb_tegra::jb2b_attach`) with ZERO
@@ -1275,6 +1406,14 @@ pub fn enumerate() {
     let storage_settle = freq.saturating_mul(6); // keyboard-up: let a hubbed MSC settle, then stop
     let mut armed: Option<(u8, u8)> = None;
     let mut armed_at: u64 = 0;
+    // PIUSB-13: the post-CNR enumeration observer. Inert until real enumeration makes progress (see
+    // EnumWitness gating note) — silent on a CNR-stuck boot, one `[enum]` line per milestone on a
+    // live one.
+    let mut witness = EnumWitness::new();
+    serial_println!(
+        "{} [enum] observer armed — watching root-port connect/speed, slot assign/address, HID arm, first report (silent unless enumeration advances) ::",
+        P
+    );
     loop {
         // XHCI-COHERENCE: no external cache maintenance here anymore. The driver's `poll_events`
         // invalidates the event ring at each dequeue (`EventRing::has_event`) and cleans every command
@@ -1289,6 +1428,7 @@ pub fn enumerate() {
             x.service_slot_disposal();
             x.service_enum();
             x.service_storage();
+            witness.tick(x);
             (
                 keyboard_armed(x),
                 x.storage_slot,

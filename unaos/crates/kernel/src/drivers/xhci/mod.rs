@@ -743,6 +743,10 @@ pub struct DeviceSlot {
     /// mirrors the pointer path pre-emptively. Set in `queue_keyboard_read`, matched in the
     /// interrupt-IN transfer dispatch. On QEMU (no dup) `param` always matches, so it never trips.
     pub keyboard_expect_phys: u64,
+    /// Count of boot-keyboard interrupt-IN reports serviced since the read was armed. Mirrors
+    /// `mouse_report_count`; drives the Pi-side PIUSB-13 `[enum]` first-report witness (the 0→1
+    /// edge is "the keyboard is live"). Inert on x86 (nothing reads it there).
+    pub keyboard_report_count: u32,
 
     pub descriptor_buffer: *mut u8,
 
@@ -836,6 +840,7 @@ impl DeviceSlot {
             keyboard_state: 0,
             keyboard_ring: None,
             keyboard_expect_phys: 0,
+            keyboard_report_count: 0,
             descriptor_buffer: desc_buffer,
             ep0_expect_phys: 0,
             is_downstream: false,
@@ -905,6 +910,7 @@ impl DeviceSlot {
         self.keyboard_intf = 0;
         self.keyboard_state = 0;
         self.keyboard_expect_phys = 0;
+        self.keyboard_report_count = 0;
         self.ep0_expect_phys = 0;
         self.is_downstream = false;
         self.route_string = 0;
@@ -1729,6 +1735,7 @@ impl XhciController {
                                     serial_println!("xHCI: >>> HID SET_CONFIGURATION COMPLETE <<<");
                                     if self.slots[slot_id as usize].keyboard_state == 2 {
                                         self.slots[slot_id as usize].keyboard_state = 3;
+                                        self.slots[slot_id as usize].keyboard_report_count = 0;
                                         self.queue_keyboard_read(slot_id as u8);
                                     }
                                     if self.slots[slot_id as usize].mouse_state == 2 {
@@ -2083,6 +2090,11 @@ impl XhciController {
                                             // XHCI-COHERENCE: consumer boundary — the boot-keyboard
                                             // report was DMA-written; invalidate before decoding. No-op x86.
                                             dma_coherency::inval(data_buf_ptr as usize, 8);
+                                            // PIUSB-13: count every serviced keyboard report (the Pi-side
+                                            // `[enum]` observer watches the 0→1 edge for its first-report
+                                            // witness). Mirrors `mouse_report_count`; inert on x86.
+                                            self.slots[slot_id as usize].keyboard_report_count =
+                                                self.slots[slot_id as usize].keyboard_report_count.wrapping_add(1);
                                             let report = core::slice::from_raw_parts(data_buf_ptr, 8);
                                             // Metal diagnostic: dump the raw report bytes so that if a keyboard
                                             // interrupt-IN transfer arrives but decodes to nothing (e.g. the device is
@@ -4036,6 +4048,37 @@ impl XhciController {
     /// sanity read of LBA 0.
     /// Multi-line dump of the live port + slot state for the shell `usbinfo` command — the metal
     /// diagnostic for "which USB devices enumerated, at what speed, and how far". Read-only.
+    /// PIUSB-13: read-only enumeration observability for the Pi-side `enumerate()` pump. These
+    /// expose the private root-enum FSM state (stage, in-flight port, last stall) and a structured
+    /// root-port snapshot so `piusb::enumerate` can emit the `:: PIUSB: [enum] ... ::` milestone
+    /// stream without duplicating the FSM. aarch64-gated: the block does not compile on x86, so x86
+    /// codegen is byte-identical (nothing there reads this state). All methods are pure reads with
+    /// no controller side effects.
+    #[cfg(target_arch = "aarch64")]
+    pub fn enum_stage_now(&self) -> &'static str { self.enum_stage }
+    /// Root port currently mid-enumeration (0 = none).
+    #[cfg(target_arch = "aarch64")]
+    pub fn enumerating_port_now(&self) -> u8 { self.enumerating_port }
+    /// Last recorded enumeration stall: (port, stage, why, completion-code, PORTSC). `None` until one.
+    #[cfg(target_arch = "aarch64")]
+    pub fn last_stall_now(&self) -> Option<(u8, &'static str, &'static str, u8, u32)> {
+        self.last_stall.as_ref().map(|s| (s.port, s.stage, s.why, s.code, s.portsc))
+    }
+    /// Total enumeration stalls this boot.
+    #[cfg(target_arch = "aarch64")]
+    pub fn stall_count_now(&self) -> u32 { self.stall_count }
+    /// Per-root-port snapshot for the observer: `(port, connected(CCS), xhci_speed_id)`.
+    /// Speed id: 1=FS 2=LS 3=HS 4=SS, 0 = none/untrained.
+    #[cfg(target_arch = "aarch64")]
+    pub fn root_ports_now(&self) -> Vec<(u8, bool, u32)> {
+        let mut v = Vec::new();
+        for p in 1..=self.max_ports {
+            let s = self.read_portsc(p);
+            v.push((p, (s & 1) != 0, (s >> 10) & 0xF));
+        }
+        v
+    }
+
     pub fn port_slot_summary(&self) -> Vec<alloc::string::String> {
         fn speed_name(s: u32) -> &'static str {
             match s { 1 => "FS", 2 => "LS", 3 => "HS", 4 => "SS", 0 => "-", _ => "?" }
