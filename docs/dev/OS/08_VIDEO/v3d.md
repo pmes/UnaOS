@@ -192,7 +192,70 @@ binner — the narrowest the empty-bin wall has ever been.
 
 ---
 
-## 7. Replaying the visible battery (PI-APP-1)
+## 7. The VCM starvation — the bin CL wrote an illegal `VCM_CACHE_SIZE` (V3D-23)
+
+V3D-23 audited the 71-byte bin CL packet-by-packet against the authoritative Mesa
+`v3d` sources for a minimal single-triangle draw on V3D 4.2 (`v3dx_draw.c`
+`v3d_start_binning` + `v3d_emit_gl_shader_state`; `vir.c` `v3d_vs_set_prog_data` /
+`v3d_compute_vpm_config`; `v3d_nir_lower_io.c` `v3d_nir_setup_vpm_layout_vs`;
+`v3d_packet.xml` structs). The enumeration **exonerated** the two hypotheses §6 left
+open and found **one real divergence** plus one defensive omission:
+
+**Exonerated (our CL already matches Mesa):**
+
+- **Coordinate-shader VPM output order.** `v3d_nir_setup_vpm_layout_vs` for
+  `is_coord` assigns `pos_vpm_offset = 0` (`+4`: clip `Xc,Yc,Zc,Wc` at 0..3) then
+  `vp_vpm_offset = 4` (`+2`: screen `Xs,Ys` at 4,5); `zs`/`rcp_wc` are **not**
+  emitted for a coord shader. `vpm_output_size = 6`. This is **exactly** the V3D-18/20
+  contract — the layout is correct.
+- **GL Shader State Record `min … segments required in play`.** For the non-GS path
+  `v3d_compute_vpm_config` sets `As = 1`, `Ve = 0`. The record fields
+  `Min {Coord,Vertex} Shader input segments required in play` are `minus_one`-encoded
+  (`v3d_packet.xml`), so Mesa's `As = 1` packs to **raw 0** — which is what our record
+  already writes. The `… output segments … in addition to VCM cache size` fields want
+  `Ve = 0` (raw 0), also already correct. The record needs no change.
+- **`separate_segments`.** `v3d_vs_set_prog_data` sets it **`false`
+  unconditionally** (comment: "necessary for our VCM setup to avoid varying
+  corruption"), folding `vpm_input_size` to 0. Our record leaves the separate-block
+  bits clear and both input/output segment sizes at 1 — matches.
+
+**The defect (`VCM_CACHE_SIZE`, opcode 71).** Every prior arc emitted `Vc = 1` for both
+the binning and rendering batch-count fields. Mesa **never** emits 1:
+`v3d_vs_set_prog_data` computes `vcm_cache_size = CLAMP(vpm_output_batches - 1, 2, 4)`
+and `v3d_compute_vpm_config` copies it verbatim (`vpm_cfg{,_bin}->Vc`). For this draw
+on the Pi 4's 16 KiB VPM the value is **4** (sector = `V3D_CHANNELS 16 · 4 · 8 = 512 B`
+→ 32 sectors → half 16; 1-sector output ⇒ 16 output batches ⇒ `CLAMP(15,2,4) = 4`; the
+CLAMP ceiling pins any 1-sector-output shader to 4). The field's **hardware-valid floor
+is 2** — Mesa's own comment: *"we can't go lower than 2 due to GFXH-1744"*. The VCM is
+the vertex-cache manager that stages the coordinate shader's binned vertices for the
+PTB; **`Vc = 1` starves it below the erratum floor, so the PTB never receives assembled
+primitives — pool + tile-STATE stay all-zero.** This is fully consistent with every
+§6 witness: the shader runs (PCTR), nothing faults, the CL is consumed clean, yet the
+bin is empty. `Vc = 1` is the one CPU→GPU hand-off never re-checked against Mesa.
+
+**The fix (PI-V3D-23).** `build_bin_cl` and `build_bin_cl_at` now emit
+`VCM_CACHE_SIZE` with `Vc = 4` (const `VCM_CACHE_BATCHES`, with the full Mesa
+derivation) for both fields, and add the Mesa-prologue `OCCLUSION_QUERY_COUNTER`
+(opcode 92, address 0 = disable stale OQ) between `FLUSH_VCD_CACHE` and
+`START_TILE_BINNING`, matching `v3d_start_binning` verbatim. Both packet layouts are
+transcribed from `v3d_packet.xml` (VCM fields carry **no** `minus_one`, so the raw
+field is the batch count; OQ is a single 32-bit address). No shader word changed, so
+the fabricated-constant law (§5) is untouched.
+
+**Discriminator (one boot).** QEMU `raspi4b` models no V3D, so the verdict is metal.
+The M4 bin path prints `[v3d23] … VCM_CACHE_SIZE Vc=4 …`, dumps the bin CL bytes
+(`dump_cl_bytes` — the OQ packet + `Vc=4` are visible), and `bin_pool_witness` reads
+the tile-alloc pool head **and** the tile-STATE head after the bin idles:
+
+- **pool / tile-STATE go non-zero** ⇒ the PTB now bins — VCM starvation was the wall;
+  the M4 triangle should render and the sample-verify pass.
+- **still all-zero** ⇒ VCM was not the (sole) cause; the surviving candidate is
+  degenerate/fully-clipped transformed geometry (the shader runs but bins to nothing),
+  read from the `cs_vpm_output_witness` expected screen coords vs the CL vertex data.
+
+---
+
+## 8. Replaying the visible battery (PI-APP-1)
 
 The `v3d` shell command (PI-APP-1, `1e8e7a0f`) re-runs the four **visible** V3D
 battery stages (M5 gradient, M6 animate, M7 multiprim, M8 blit — see

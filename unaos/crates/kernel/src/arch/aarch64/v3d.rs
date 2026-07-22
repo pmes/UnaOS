@@ -1333,6 +1333,7 @@ const P_BRANCH_TO_IMPLICIT_TILE_LIST: u8 = 21; // render: run the binner's per-t
 const P_VERTEX_ARRAY_PRIMS: u8 = 36; // non-indexed draw
 const P_GL_SHADER_STATE: u8 = 64; // points at the GL Shader State Record + attribute records
 const P_VCM_CACHE_SIZE: u8 = 71;
+const P_OCCLUSION_QUERY_COUNTER: u8 = 92; // v3d_packet.xml code 92 — addr 0 = disable stale OQ state
 const P_NUMBER_OF_LAYERS: u8 = 119;
 const P_TILE_BINNING_MODE_CFG: u8 = 120; // v42 variant (max_ver=42)
 // PI-V3D-17 — clip/viewport/config state (v3d_packet.xml, gen 4.2). Codes transcribed VERBATIM:
@@ -1346,6 +1347,22 @@ const P_CLIPPER_Z_SCALE_AND_OFFSET: u8 = 111; // "Clipper Z Scale and Offset" �
 
 const V3D_PRIM_TRIANGLES: u64 = 4; // VERTEX_ARRAY_PRIMS "mode" (enum Primitive) — NOT the PRIM_LIST value
 const TILE_STATE_BYTES: usize = 48 * 4; // TSDA: 48 B/tile, generous for the single 64×64 tile
+
+// PI-V3D-23: the VCM (Vertex Cache Manager) cache size — the number of 16-vertex OUTPUT batches the
+// hardware buffers between the coordinate shader's VPM output and the PTB. Prior arcs wrote 1; Mesa's
+// `v3d_vs_set_prog_data` (broadcom/compiler/vir.c) NEVER emits 1: it computes
+//   vcm_cache_size = CLAMP(vpm_output_batches - 1, 2, 4)   (the field's HW-valid floor is 2, ceiling 4)
+// and `v3d_compute_vpm_config` copies it verbatim into VCM_CACHE_SIZE's binning+rendering fields
+// (vpm_cfg{,_bin}->Vc). For our fixed minimal draw on the Pi 4's 16 KiB VPM:
+//   sector = V3D_CHANNELS(16)·4·8 = 512 B → 16384/512 = 32 sectors → half = 16;
+//   vpm_output_size = 1 sector (6-word coord output rounds to 1); vpm_input_size folds to 0
+//   (separate_segments = false, vir.c) → vpm_output_batches = 16/1 = 16 → CLAMP(15,2,4) = 4.
+// The CLAMP ceiling is 4, so any 1-sector-output shader yields 4 regardless of exact VPM size. THE
+// PI-V3D-23 empty-bin fix: Vc = 1 is below the GFXH-1744 floor (Mesa: "we can't go lower than 2 due to
+// GFXH-1744, which makes an odd hardware bug that manifests as corrupt vertices"); a starved VCM cannot
+// stage the coord shader's binned vertices for the PTB, so the PTB emits nothing — pool stays all-zero,
+// exactly the observed wall (shader proven running, no fault, empty bin).
+const VCM_CACHE_BATCHES: u64 = 4;
 
 // ─── The minimal QPU packer (V3D 4.x / VideoCore VI). ───
 // Field shifts VERBATIM from Mesa `qpu_pack.c`: OP_MUL[63:58] SIG[57:53] COND[52:46] MM(45) MA(44)
@@ -1660,8 +1677,13 @@ fn build_bin_cl(num_attrs: u32) -> usize {
             .f(48, 16, (TARGET_H - 1) as u64) // Height in pixels (minus_one)
             .done(),
     );
-    // Flush any stale VCD, then START_TILE_BINNING (must precede geometry).
+    // Flush any stale VCD, disable any leftover occlusion-query state, then START_TILE_BINNING (must
+    // precede geometry). PI-V3D-23: Mesa's `v3d_start_binning` (gallium v3dx_draw.c) emits
+    // OCCLUSION_QUERY_COUNTER with a null address between FLUSH_VCD_CACHE and START_TILE_BINNING —
+    // "Disable any leftover OQ state from another job." A stale-enabled OQ counter can gate the PTB's
+    // primitive accounting, so we match Mesa's prologue verbatim (addr 0 = OQ disabled).
     w.pkt(Pkt::new(P_FLUSH_VCD_CACHE, 1).done());
+    w.pkt(Pkt::new(P_OCCLUSION_QUERY_COUNTER, 5).f(0, 32, 0).done());
     w.pkt(Pkt::new(P_START_TILE_BINNING, 1).done());
 
     // ── PI-V3D-17: clip/viewport/config state (V3D-16 verdict). Without these the hardware clipper
@@ -1744,11 +1766,14 @@ fn build_bin_cl(num_attrs: u32) -> usize {
             .done(),
     );
 
-    // Draw state: VCM cache size (1 batch each for bin+render), the shader-state pointer, then the prim.
+    // Draw state: VCM cache size, the shader-state pointer, then the prim. PI-V3D-23: Vc = 4 (was the
+    // GFXH-1744-illegal 1) for BOTH the binning and rendering fields — the Mesa-computed value for this
+    // draw (see VCM_CACHE_BATCHES). Field layout per v3d_packet.xml code 71: binning@0(4), rendering@4(4),
+    // neither minus_one — so the raw field IS the batch count.
     w.pkt(
         Pkt::new(P_VCM_CACHE_SIZE, 2)
-            .f(0, 4, 1) // 16-vertex batches for binning
-            .f(4, 4, 1) // 16-vertex batches for rendering
+            .f(0, 4, VCM_CACHE_BATCHES) // 16-vertex batches for binning
+            .f(4, 4, VCM_CACHE_BATCHES) // 16-vertex batches for rendering
             .done(),
     );
     // GL_SHADER_STATE: address is a 27-bit field @ start5 → the record's 32-byte-aligned address's top
@@ -1985,6 +2010,14 @@ fn triangle_job(fb: Option<FbTarget>) -> bool {
     // (brief lead #2): dump the exact bin CL byte stream the binner will parse, to read against Mesa's
     // emit order for a mis-sized packet shifting an opcode into an address field (PI-V3D-10 class).
     clear_mmu_fault_latch("v3d15 pre-bin (attribution)");
+    // PI-V3D-23: announce the two Mesa-conformance corrections this arc applies to the bin CL, so the
+    // metal log names the change under test. VCM Vc: 1 → 4 (GFXH-1744 floor is 2; Mesa computes 4 for
+    // this draw), + OCCLUSION_QUERY_COUNTER(addr=0) added to the prologue (Mesa's OQ-disable). The
+    // discriminator is the post-bin tile-alloc pool / tile-STATE going non-zero (bin_pool_witness).
+    serial_println!(
+        ":: V3D: [v3d23] M4 bin — VCM_CACHE_SIZE Vc={} (was 1; GFXH-1744 floor 2, Mesa-computed 4) + OCCLUSION_QUERY_COUNTER disable in prologue — WATCH the tile-alloc pool / tile-STATE below ::",
+        VCM_CACHE_BATCHES
+    );
     dump_cl_bytes("M4 bin", OFF_BIN_CL, bin_len, 64);
     // PI-V3D-12: the Linux per-job pre-kick cache invalidate (v3d_bin_job_run does this first).
     invalidate_gpu_caches("L2T flush (M4 bin pre-kick)");
@@ -2798,9 +2831,16 @@ fn build_bin_cl_at(cl_off: usize, draws: &[(usize, u32, u32, u32)]) -> usize {
             .f(48, 16, (TARGET_H - 1) as u64)
             .done(),
     );
+    // PI-V3D-23: OQ-disable in the prologue + VCM Vc = 4 (was 1, GFXH-1744-illegal) — see build_bin_cl.
     w.pkt(Pkt::new(P_FLUSH_VCD_CACHE, 1).done());
+    w.pkt(Pkt::new(P_OCCLUSION_QUERY_COUNTER, 5).f(0, 32, 0).done());
     w.pkt(Pkt::new(P_START_TILE_BINNING, 1).done());
-    w.pkt(Pkt::new(P_VCM_CACHE_SIZE, 2).f(0, 4, 1).f(4, 4, 1).done());
+    w.pkt(
+        Pkt::new(P_VCM_CACHE_SIZE, 2)
+            .f(0, 4, VCM_CACHE_BATCHES)
+            .f(4, 4, VCM_CACHE_BATCHES)
+            .done(),
+    );
     for &(rec_off, num_attrs, first, count) in draws {
         let shadrec = (arena_phys() + rec_off) as u32;
         w.pkt(
