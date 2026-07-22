@@ -727,6 +727,69 @@ fn m2_enumerate_vl805() -> Option<u64> {
     w(RC_BASE + 0x18, newbuses);
     dsb();
 
+    // ── PIUSB-7 ADJUDICATION (the boot-P3 CAP=0xdeaddead wall — memory forwarding, not config) ────────
+    // boot-P1..P6 proved every CONFIG-path layer is GREEN: link UP, RP bus window latched, VL805
+    // config[0x00]=0x34831106 answers, BAR0 latches to 0xc0000000, COMMAND MEM+BM read set — yet the
+    // MEMORY read at CPU 0x6_0000_0000 (→ PCIe 0xc0000000) still returns 0xdeaddead. Config and memory
+    // reach the VL805 by DIFFERENT gates in the root-port bridge: config forwarding is governed by the
+    // bus-number window (0x18, fixed above), but a PCI-to-PCI bridge forwards MEMORY transactions from
+    // its primary to its secondary bus ONLY when the target address falls inside its type-1 MEMORY
+    // Base/Limit window (config 0x20) AND the bridge's own COMMAND Memory-Space-Enable is set. Both reset
+    // to their power-on defaults: Memory Base/Limit = 0/0 (base 0 .. limit 0x000fffff — a base>limit
+    // "forward nothing" window for our 0xc0000000 target), COMMAND MEM=0. So the CPU→PCIe memory TLP
+    // reaches the root-port bridge and is DROPPED (not forwarded downstream) → master-abort fill
+    // 0xdeaddead. This is the EXACT memory-forwarding analogue of the 0x18 bus-window fix that made
+    // config forwarding work. Linux never hits it because pci_setup_bridge() programs the bridge memory
+    // window from the child bus's assigned resources during enumeration; we ARE the enumerator, so we
+    // program the RP bridge's memory window to cover the outbound region [0xc0000000, 0xffffffff] and
+    // enable memory-space on the RP itself — BEFORE the first downstream memory access in M3.
+    //
+    // PCI-to-PCI bridge Memory Base/Limit (config 0x20, one dword): Memory Base in bits [15:0] holds
+    // A[31:20] of the base in its top 12 bits [15:4]; Memory Limit in bits [31:16] holds A[31:20] of the
+    // (inclusive) limit in its top 12 bits [31:20]. The low 20 bits of base are implied 0 and of limit
+    // are implied 0xf_ffff, so a 1 MiB granularity covers our 1 GiB region exactly.
+    const RP_MEM_BASE_A: u32 = (OUTBOUND_PCIE_BASE >> 20) as u32; // 0xc00
+    const RP_MEM_LIMIT_A: u32 = ((OUTBOUND_PCIE_BASE + OUTBOUND_SIZE - 1) >> 20) as u32; // 0xfff
+    const RP_MEM_BASE_LIMIT: u32 = ((RP_MEM_LIMIT_A & 0xfff) << 20) | ((RP_MEM_BASE_A & 0xfff) << 4);
+    serial_println!(
+        "{} M2: >>> WRITE: RP mem window [0x20] = {:#010x} (base {:#x} limit {:#x} — forward PCIe mem {:#x}..{:#x} to bus 1) ::",
+        P, RP_MEM_BASE_LIMIT, OUTBOUND_PCIE_BASE, OUTBOUND_PCIE_BASE + OUTBOUND_SIZE - 1,
+        OUTBOUND_PCIE_BASE, OUTBOUND_PCIE_BASE + OUTBOUND_SIZE - 1
+    );
+    w(RC_BASE + 0x20, RP_MEM_BASE_LIMIT);
+    // Disable the prefetchable-memory window (0x24) explicitly: base>limit = forward nothing. Our BAR0 is
+    // NON-prefetchable MMIO, so it must ride the (0x20) window above, never this one; a stale/enabled
+    // prefetch window could otherwise shadow the region. Upper-32 base/limit (0x28/0x2c) → 0.
+    w(RC_BASE + 0x24, 0x0000_fff0); // pref base A[31:20]=0xfff (0xfff00000), pref limit=0 → base>limit = off
+    w(RC_BASE + 0x28, 0);
+    w(RC_BASE + 0x2c, 0);
+    dsb();
+    let rb_memwin = r(RC_BASE + 0x20);
+    serial_println!(
+        "{} M2:   RP mem window readback [0x20] = {:#010x} -> {} ::",
+        P, rb_memwin,
+        if rb_memwin == RP_MEM_BASE_LIMIT { "LATCHED (bridge now forwards this mem range downstream)" } else { "DID NOT LATCH — RP mem window rejected" }
+    );
+
+    // Enable Memory-Space + Bus-Master on the ROOT PORT's own COMMAND (config 0x04, at RC_BASE directly).
+    // A PCI-to-PCI bridge forwards downstream memory only while its COMMAND Memory-Space-Enable is set;
+    // Bus-Master lets downstream DMA (upstream reads) traverse it. Read-modify-write; RP config is type-1
+    // at RC_BASE (no EXT_CFG indirection).
+    let rp_cmd = r(RC_BASE + 0x04);
+    let rp_newcmd = (rp_cmd & 0xFFFF_0000) | ((rp_cmd & 0xFFFF) | 0b110);
+    serial_println!(
+        "{} M2: >>> WRITE: RP COMMAND {:#06x} -> {:#06x} (MEM+BusMaster enable on the root port — forward mem downstream) ::",
+        P, rp_cmd & 0xffff, rp_newcmd & 0xffff
+    );
+    w(RC_BASE + 0x04, rp_newcmd);
+    dsb();
+    let rb_rp_cmd = r(RC_BASE + 0x04) & 0xffff;
+    serial_println!(
+        "{} M2:   RP COMMAND readback = {:#06x} (MEM={} BusMaster={}) -> {} ::",
+        P, rb_rp_cmd, (rb_rp_cmd >> 1) & 1, (rb_rp_cmd >> 2) & 1,
+        if (rb_rp_cmd & 0b110) == 0b110 { "RP MEM-FORWARDING ENABLED" } else { "NOT ENABLED — RP will still drop downstream mem" }
+    );
+
     // PCIe spec: a device may take up to 100 ms after PERST# deassert before it must answer config
     // requests. Link training consumed part of that budget; burn the remainder (bounded) before the
     // first downstream read so a slow VL805 is not misread as absent.

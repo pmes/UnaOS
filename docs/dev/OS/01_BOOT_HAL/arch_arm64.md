@@ -6528,6 +6528,63 @@ probe restores its original immediately; the dump is **read-only**; no other dev
 liveness read rejects both `0xffffffff` (PCIe master-abort / open-bus) and `0xdeadbeef` (firmware fill) as
 ABSENT DECODE — the **PI-V3D-1 poison-rejection rule**.
 
+### PIUSB-7 — the wall was memory FORWARDING, not the outbound window (boot-P5/P6)
+
+**boot-P5/P6 handed over a fully green config path and a still-dead memory path.** Every layer the prior
+arcs armed reads back correct on metal: `M1: LINK UP (PCIE_STATUS=0x000000b0)`, root port `14e4:2711`,
+RP bus window latched, `MISC_CTRL … SCB0_SIZE=0x11 → SIZED`, `WIN0 armed: YES`, `VL805 FOUND
+1106:3483` (class `0c/03/30`), `NOTIFY_XHCI_RESET SUCCESS`, `post-NOTIFY cfg[0x00]` live, `BAR0
+[0x10]=0xc0000004 → LATCHED`, `COMMAND=0x0146 → DECODE ENABLED` — yet the CAP read at CPU
+`0x6_0000_0000` is **still `0xdeaddead` after 8 tries**.
+
+**Hypothesis ranking (PIUSB-7).**
+- **(a) Outbound window misprogramming — REFUTED.** The `CPU_2_PCIE_MEM_WIN0` math was re-audited
+  register-for-register against Linux `pcie-brcmstb.c brcm_pcie_set_outbound_win`. The masks are
+  `BASE_LIMIT_BASE_MASK=0xfff0` (base in `[15:4]`), `BASE_LIMIT_LIMIT_MASK=0xfff00000` (limit in
+  `[31:20]`), `high_addr_shift = hweight32(0xfff0) = 12`. Our code writes `(limit_mb<<20)|(base_mb<<4)`
+  with `BASE_HI/LIMIT_HI = mb>>12` — **exactly** Linux. The metal readbacks confirm it latched
+  (`BASE_LIMIT=0x3ff00000 BASE_HI=0x6 LIMIT_HI=0x6` ⇒ the RC claims CPU `0x6_0000_0000..0x6_3fff_ffff`).
+  The outbound window is correct; it is **not** the wall.
+- **(b) NOTIFY/PERST ordering — weak.** The device answers config *after* the notify (`post-NOTIFY
+  cfg[0x00]` live), so the firmware is loaded enough to respond; a pure *memory*-only abort while config
+  works is not explained by firmware-not-running.
+- **(c) SSC / L1-substate — weakest.** The link is up and stable and config is clean; not an electrical
+  or link-state fault.
+- **(d) Root-port bridge MEMORY-forwarding window unprogrammed — CONFIRMED (the fix).** Config and memory
+  reach the VL805 by **different gates** in the root-port PCI-to-PCI bridge. Config forwarding is governed
+  by the **bus-number** window (config `0x18` — fixed in the R22 sitting-2 arc, which is *why config works*).
+  Memory forwarding is governed by the type-1 **Memory Base/Limit** window (config `0x20`) **and** the
+  bridge's own **COMMAND Memory-Space-Enable**. Both were still at power-on defaults: Memory Base/Limit
+  `0/0` (a base>limit "forward nothing" window for our `0xc0000000` target), RP COMMAND MEM=0. So the
+  CPU→PCIe memory TLP is translated by `WIN0` onto bus 0, reaches the root port, and is **dropped** (not
+  forwarded to bus 1) → master-abort fill `0xdeaddead`. This is the **exact memory-forwarding analogue**
+  of the `0x18` bus-window fix. Linux never hits it because `pci_setup_bridge()` programs the bridge memory
+  window from the child bus's assigned resources; we ARE the enumerator, so we program it ourselves.
+
+**The fix (M2, before the M3 memory access).** Right after the `0x18` bus-window write:
+- **RP Memory Base/Limit (config `0x20`)** := cover `[0xc0000000, 0xffffffff]` — base A[31:20]=`0xc00`
+  in `[15:4]`, limit A[31:20]=`0xfff` in `[31:20]` ⇒ dword `0xfff0c000`, read back + witnessed.
+- **Prefetchable-memory window (`0x24`)** := disabled (base>limit; our BAR0 is non-prefetchable MMIO so it
+  must ride the `0x20` window), upper-32 base/limit (`0x28`/`0x2c`) := 0.
+- **RP COMMAND (config `0x04`)** := MEM + Bus-Master enable (RMW), read back + witnessed — a bridge forwards
+  downstream memory only while its own Memory-Space-Enable is set.
+
+All writes stay within the BCM2711 RC register block (RP config is type-1 at `RC_BASE` directly, no
+`EXT_CFG` indirection) and the VL805's own config/BAR — no protection weakened, poison-rejection intact.
+
+**The witnesses one metal boot must decide.** Look for, in order: `RP mem window readback [0x20] =
+0xfff0c000 → LATCHED`, `RP COMMAND readback = 0x0146 (MEM=1 BusMaster=1) → RP MEM-FORWARDING ENABLED`,
+then the CAP first-dword at `0x6_0000_0000`. If PIUSB-7 is right, that CAP read now returns a **live**
+xHCI cap dword (`xHCI DECODING: CAPLENGTH=… HCIVERSION=0x0100 …`) instead of `0xdeaddead`, and the
+honesty line is reached. If it is still `0xdeaddead` with the two new witnesses green, the wall is
+downstream of the bridge (the VL805's own decode / firmware) — hypothesis (b) is re-opened.
+
+**HID follow-on (NOT this arc).** Once CAP decodes, `piusb::enumerate()` (post-heap) already builds
+rings + RS=1 and runs the polled pump; the keyboard/mouse **HID report parsing** rides the shared
+`drivers/xhci` HID FSM (the JB2b `keyboard_state==3` armed predicate). The follow-on arc needs: a live CAP
+(this arc), then a connected device on a powered port to drive `service_enum`/`service_hid_setproto`
+through ADDRESS_DEVICE to armed — an attended metal sitting with a real keyboard + mouse plugged in.
+
 ### Byte-identity call sites
 
 `piusb::bringup(dtb)` is called at the **end of `build_boot_info`** (with the DTB in hand); the map
