@@ -6585,6 +6585,42 @@ rings + RS=1 and runs the polled pump; the keyboard/mouse **HID report parsing**
 (this arc), then a connected device on a powered port to drive `service_enum`/`service_hid_setproto`
 through ADDRESS_DEVICE to armed — an attended metal sitting with a real keyboard + mouse plugged in.
 
+### PIUSB-11 — reload the VL805 firmware immediately before every HCRST (boot-P18..P21)
+
+**The wall.** boot-P18..P21 (metal) showed the VL805 hardware alive — CAP regs read real values
+(`CAPLENGTH=32 HCIVERSION=0x0100`), `PORTSC` reports real connect status, config space answers — yet
+**every operational-register write is dropped**: `USBSTS.CNR` (Controller Not Ready) stays 1 forever
+(P20: `USBSTS=0x811`), so CRCR/DCBAAP/ERST/RS never latch and PIUSB-10's spec-mandated CNR wait times
+out (~2.5 s budget). The controller is alive but its **internal firmware never booted**.
+
+**Board.** boardrev `d03115` decodes to a **Pi 4B, BCM2711, Sony UK, 8 GB, rev 1.5** (mem nibble
+`d`=8 GB; type `0x11`=4B; proc `3`=BCM2711; PCB rev `5`). Rev **≥ 1.4** ⇒ the VL805 has **no dedicated
+SPI EEPROM**; its firmware is loaded from the main bootloader EEPROM by the VideoCore, and the mailbox
+`NOTIFY_XHCI_RESET` is the **only** way to (re)load it. M1's PERST cycle (a PCIe fundamental reset) is
+exactly the "PCI reset [that] resets the VL805 requiring the firmware to be reloaded" that Linux's
+`drivers/reset/reset-raspberrypi.c` documents — so after M1 the fw is DOWN.
+
+**The Linux sequence (authoritative).** `drivers/usb/host/xhci-pci.c` `xhci_pci_common_probe()` calls
+`reset_control_reset(reset)` as the **first act of probe** — on the Pi 4 that lands in
+`rpi_reset_reset()` (`drivers/reset/reset-raspberrypi.c`), which issues `RPI_FIRMWARE_NOTIFY_XHCI_RESET`
+with a hardwired `dev_addr = 0x100000` (`PCI_BUS<<20|PCI_SLOT<<15|PCI_FUNC<<12`), checks only the return
+code (no fw-already-loaded probe, no dev_addr echo check), then `usleep_range(200,1000)`. **Immediately
+after**, `usb_hcd_pci_probe()` → `xhci_gen_setup()` runs the xHCI HCRST. So Linux **reloads the VL805
+firmware on every probe, right before every HCRST**.
+
+**Our bug vs Linux.** We issued a single early NOTIFY (M2, pre-heap) then HCRST'd the controller
+**twice with no intervening NOTIFY** — M3 (pre-heap) and `enumerate()` (post-heap, **seconds** later
+after heap/AP/eMMC bring-up). A controller whose firmware is not running when HCRST completes wedges
+`CNR=1`. Fix: `notify_before_reset()` re-issues the mailbox NOTIFY immediately before each halt+HCRST
+(M3 + enumerate), settles (≥ Linux's 200 µs–1 ms), then **re-asserts the VL805 decode path**
+(`BAR0 = OUTBOUND_PCIE_BASE` + MEM/BM) because the fw reload resets config space (PIUSB-4). PIUSB-10's
+CNR wait stays the verdict gate; `mailbox::notify_xhci_reset` now returns `(ok, echo)` so each boot
+logs `NOTIFY (pre-reset, …) rc=… echo=…`. In-lane: `piusb.rs` + `mailbox.rs`; `drivers/xhci` untouched.
+
+**Metal expectation.** CNR clears after the re-timed NOTIFY → real op-register readbacks → enable-slot →
+keyboard. QEMU raspi4b models no PCIe RC, so both new paths sit behind the DTB-census honesty-line gate
+(clean skip, byte-identity preserved).
+
 ### Byte-identity call sites
 
 `piusb::bringup(dtb)` is called at the **end of `build_boot_info`** (with the DTB in hand); the map
