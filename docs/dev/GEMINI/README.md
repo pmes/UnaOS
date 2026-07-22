@@ -1,11 +1,9 @@
 # Gemini proposals — review-before-run
 
-**Layout (from 2026-07-22):** new work files under
-`../IMPLEMENTATIONS/<area>/<lane>/` — `video/iGUI/`, `video/Kepler/`,
+**Layout (from 2026-07-22):** lane directories directly under
+`docs/dev/GEMINI/<area>/<lane>/` — `video/iGUI/`, `video/Kepler/`,
 `www/aether/`. Each lane directory holds its coordinator `BRIEF-*`, the
-specialist's `PROPOSAL-*`, and the `REVIEW-*` notes. The workflow below is
-unchanged; only the location moved. This directory keeps the pre-2026-07-22
-Kepler pull records (pulls 4–6) as history.
+specialist's `PROPOSAL-*`, the `REVIEW-*` notes, and the landed-pull records.
 
 Workflow (standing, from 2026-07-21):
 
