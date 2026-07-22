@@ -1609,15 +1609,28 @@ fn build_bin_cl(num_attrs: u32) -> usize {
     // bits are VERBATIM from Mesa v3d_packet.xml gen 4.2; the transform values follow Mesa's own
     // v3dX(emit) (v3dx_emit.c / v3dvx_cmd_buffer.c) fixed-function viewport emit.
     //
-    // CS-COORDS CONSISTENCY (the V3D-16 caveat): the line-1485 comment claims the coordinate shader
-    // does the viewport transform, but the ACTUAL CS body (CS_VS_WORDS) is a pure passthrough — it
-    // ldvpmv_in's the vec4 attribute and mov's it straight to VPM with NO arithmetic. So the CS emits
-    // clip-space NDC (== TRI_VERTS, [-1,1]) and the fixed-function transform below MUST do the
-    // clip→screen map. Hence the STANDARD (non-identity) values: half-extent 32 px, centre (32,32).
-    // ALTERNATIVE (do NOT use with the current shader): if the CS were changed to output screen coords
-    // itself, this transform would have to be identity (half-extent 1 px → scaling 256.0, centre 0) to
-    // avoid double-applying. That is the known follow-on if the pool stays zero on metal AND the CS is
-    // reworked to screen-space (v3d.rs ~1485) — out of scope for this arc.
+    // CS-COORDS CONSISTENCY — PI-V3D-18 RESOLUTION (supersedes the earlier "shader OR fixed-function"
+    // framing, which was a false dichotomy). Mesa's coordinate (bin) shader emits BOTH: the fixed-
+    // function viewport state below AND two screen-space words the shader itself writes. Authoritative
+    // layout — `v3d_nir_setup_vpm_layout_vs` / `v3d_nir_emit_ff_vpm_outputs`
+    // (src/broadcom/compiler/v3d_nir_lower_io.c): for is_coord the VPM OUTPUT is SIX words —
+    //     offset 0..3 : Xc, Yc, Zc, Wc     (raw clip-space position; state->pos[0..3])
+    //     offset 4    : Xs = f2i32(floor( Xc · vp_scale_x · 1/Wc ))   ← screen X, .8 fixed-point, INT
+    //     offset 5    : Ys = f2i32(floor( Yc · vp_scale_y · 1/Wc ))   ← screen Y
+    // where vp_scale = viewport.scale · clipper_xy_granularity = 32 · 256 = 8192 (v3d_uniforms.c
+    // QUNIFORM_VIEWPORT_X_SCALE; granularity 256.0f for ver 42, v3d_device_info.c). The Xs/Ys are
+    // CENTRE-RELATIVE (no +centre in the shader); the +32,+32 centre is supplied by VIEWPORT_OFFSET
+    // below — so the two mechanisms COMPOSE, they do not double-apply. The PTB bins from the SCREEN
+    // words (out-offsets 4,5). Our CS_VS_WORDS is a pure 4-word passthrough (ldvpmv_in ×4 → mov vpm
+    // ×4) — it writes offsets 0..3 and NEVER 4,5 → the PTB reads zero screen coords → empty-but-legal
+    // bin. THIS is the residual V3D-17 empty-bin cause (metal boot-P17: CL fully consumed, no fault,
+    // pool + tile-STATE both zero). The fixed-function state below is CORRECT and stays; the record's
+    // VPM segment sizes are also CORRECT (Mesa packs them in SECTORS = align(words,8)/8: 4 in → 1, 6
+    // out → 1; vir.c v3d_vs_set_prog_data — our record's 1 is right, NOT the bug). THE FIX (deferred —
+    // needs Mesa-packed QPU words, fabricated-constant law; NOT hand-authorable): extend the coord
+    // shader to also emit Xs,Ys at out-offsets 4,5 (6-word output), i.e. add 2× mov-vpm of the two
+    // screen words + a 6-wide vpmsetup. cs_vpm_output_witness() prints the contract vs. our emit every
+    // boot. See PI-V3D-18 landing report.
 
     // CFG_BITS (code 96, v42): enable BOTH forward- and reverse-facing primitives (no cull); every
     // other bit 0 (no depth/stencil/blend). Fields: fwd-facing@0(1), rev-facing@1(1). Length 4
@@ -1948,6 +1961,10 @@ fn triangle_job(fb: Option<FbTarget>) -> bool {
     );
     // PI-V3D-13 witness: post-bin, did the binner's output actually land in the pool?
     bin_pool_witness("M4 post-bin");
+    // PI-V3D-18 witness (V3D-16-mandated): the shader-state record bytes the CLE handed the PTB, plus
+    // the CONTRACTED 6-word coordinate-shader VPM output vs. our 4-word passthrough — so every boot
+    // shows the two screen-space words (out-offsets 4,5) the CS omits, the confirmed empty-bin cause.
+    cs_vpm_output_witness("M4 post-bin");
     // PI-V3D-15 (brief lead #1): decode WHERE the bin faulted — the clue above reports the fault BITS
     // but never the address. With the latch cleared pre-kick, a fault here is THIS bin's, and its VA
     // tells whether the binner walked off the arena (our encoding bug) or idled legally in-bounds.
@@ -2314,6 +2331,80 @@ fn bin_pool_witness(tag: &str) -> bool {
         if ts.iter().any(|&b| b != 0) { "nonzero: the PTB wrote tile-state" } else { "all zero: no tile-state written" }
     );
     wrote
+}
+
+/// PI-V3D-18 witness (V3D-16-mandated post-bin CS/VPM audit). Two records the next metal boot reads
+/// to confirm what the hardware actually consumed for the coordinate (bin) shader:
+///
+///  (1) the 52 shader-state bytes at OFF_SHADREC — the 36-byte GL Shader State Record + the 16-byte
+///      GL Shader State Attribute Record — the exact bytes the CLE's GL_SHADER_STATE fetch handed the
+///      PTB. (The coordinate shader's VPM OUTPUT is on-chip and NOT CPU/DRAM-readable, so the record
+///      bytes are the readable witness of what the hardware was told, per the V3D-16 fallback ask.)
+///
+///  (2) the CONTRACTED coordinate-shader VPM output vs. what CS_VS_WORDS actually emits, per vertex.
+///      Mesa `v3d_nir_setup_vpm_layout_vs` (src/broadcom/compiler/v3d_nir_lower_io.c): for is_coord
+///      the output layout is SIX words — pos[0..3] = clip Xc,Yc,Zc,Wc at offsets 0..3, THEN the two
+///      screen-space words the PTB bins from at offsets 4,5: Xs = f2i32(floor(Xc·vp_scale_x·(1/Wc))),
+///      Ys = f2i32(floor(Yc·vp_scale_y·(1/Wc))) (floor path is the ver==42 branch in
+///      `v3d_nir_emit_ff_vpm_outputs`; f2i gives INTEGER .8 fixed-point, CENTRE-RELATIVE — the centre
+///      is added by the fixed-function VIEWPORT_OFFSET). vp_scale = viewport.scale·clipper_xy_granularity
+///      = 32 · 256 = 8192 (v3d_uniforms.c QUNIFORM_VIEWPORT_X_SCALE; granularity 256.0f for ver 42,
+///      v3d_device_info.c). Our CS_VS_WORDS writes only offsets 0..3 (the 4 clip words) and NEVER
+///      offsets 4,5 → the PTB reads zero screen coords → empty-but-legal bin. This line prints both so
+///      the discrepancy is on the wire every boot until the 2-word emit lands (needs Mesa-packed QPU).
+fn cs_vpm_output_witness(tag: &str) {
+    // (1) shader-state record + attribute record bytes (36 + 16 = 52).
+    cache::clean_invalidate_range(arena_phys() + OFF_SHADREC, 52);
+    dump_shadrec_bytes(tag, OFF_SHADREC, 52);
+    // (2) contracted 6-word CS output vs. our 4-word passthrough, per vertex. Center-relative screen
+    // coords (Mesa's shader math; VIEWPORT_OFFSET adds the +32,+32 centre in fixed function).
+    let vp_scale: f64 = ((TARGET_W as f64) / 2.0) * 256.0; // 8192.0
+    for (i, v) in TRI_VERTS.iter().enumerate() {
+        let (xc, yc, zc, wc) = (v[0] as f64, v[1] as f64, v[2] as f64, v[3] as f64);
+        let rcp_wc = if wc != 0.0 { 1.0 / wc } else { 0.0 };
+        let xs = floor_i32(xc * vp_scale * rcp_wc);
+        let ys = floor_i32(yc * vp_scale * rcp_wc);
+        serial_println!(
+            ":: V3D: [v3d18] {} CS-out v{} — CONTRACT[6] Xc={} Yc={} Zc={} Wc={} | Xs={} Ys={} (centre-rel .8fp) — our CS_VS_WORDS emits ONLY the 4 clip words; Xs/Ys @out-offset 4,5 MISSING → PTB bins zeros ::",
+            tag, i,
+            (xc * 1000.0) as i32, (yc * 1000.0) as i32, (zc * 1000.0) as i32, (wc * 1000.0) as i32,
+            xs, ys
+        );
+    }
+}
+
+/// floor(x) → i32 without libm (kernel no_std). `as i64` truncates toward zero; adjust down for
+/// negatives with a fractional part to get a true floor.
+#[inline]
+fn floor_i32(x: f64) -> i32 {
+    let t = x as i64;
+    let f = if x < 0.0 && (t as f64) != x { t - 1 } else { t };
+    f as i32
+}
+
+/// Hex-dump `n` arena bytes at `off` under the [v3d18] tag (the shader-state record witness; the CL
+/// dumper's tag is fixed to [v3d15], so this dedicated copy keeps the arc tag correct).
+fn dump_shadrec_bytes(tag: &str, off: usize, n: usize) {
+    let arena = &raw const V3D_ARENA;
+    serial_println!(
+        ":: V3D: [v3d18] {} shader-state record — {} bytes @ arena+{:#x} (36 B record + 16 B attr) ::",
+        tag, n, off
+    );
+    let mut i = 0;
+    while i < n {
+        let mut line = [0u8; 16];
+        let mut c = 0;
+        while c < 16 && i + c < n {
+            line[c] = unsafe { (*arena).bytes[off + i + c] };
+            c += 1;
+        }
+        serial_println!(
+            "::   [v3d18]   +{:#05x}: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
+            i, line[0], line[1], line[2], line[3], line[4], line[5], line[6], line[7],
+            line[8], line[9], line[10], line[11], line[12], line[13], line[14], line[15]
+        );
+        i += 16;
+    }
 }
 
 /// PI-V3D-15 fault witness (brief lead #1). The M4 bin clue reported the MMU fault BITS
