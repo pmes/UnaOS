@@ -217,7 +217,10 @@ open and found **one real divergence** plus one defensive omission:
 - **`separate_segments`.** `v3d_vs_set_prog_data` sets it **`false`
   unconditionally** (comment: "necessary for our VCM setup to avoid varying
   corruption"), folding `vpm_input_size` to 0. Our record leaves the separate-block
-  bits clear and both input/output segment sizes at 1 — matches.
+  bits clear — matches. **(Correction, V3D-25.)** This bullet *also* claimed both
+  input/output segment sizes at 1 "matches" — that half was **wrong**. The fold
+  zeroes the *input* size; the record's input fields must be **0**, not 1. Our record
+  wrote 1, and that was a real defect — see §10.
 
 **The defect (`VCM_CACHE_SIZE`, opcode 71).** Every prior arc emitted `Vc = 1` for both
 the binning and rendering batch-count fields. Mesa **never** emits 1:
@@ -336,3 +339,66 @@ established (power/clock/PM-ASB/MMU stay enabled, the arena stays identity-mappe
 and only re-kicks the per-stage jobs; a one-shot `V3D_REPLAY_READY` flag gates it, so
 when the block never came up this boot (QEMU `BLOCK-DOWN` / any fail-closed verdict)
 the app prints `stages=0` and touches no MMIO.
+
+---
+
+## 10. The VPM input segment size must be 0, not 1 (V3D-25)
+
+V3D-24 exonerated the screen-coord encoding and redirected the campaign to the
+**VPM input** (the VCD attribute fetch): if attributes never DMA into the VPM rows
+the coordinate shader reads, `ldvpmv_in` returns zeros, all three vertices collapse
+to `(0,0)`, and the PTB legitimately bins the degenerate zero-area primitive to
+nothing — consistent with every witness (shader runs, no fault, CL clean, empty pool).
+
+V3D-25 took that redirect two ways: a byte-level audit of the VCD/attribute state
+against live Mesa (`v3d` compiler + genxml, fetched this arc), and the input-read
+offsets the shader actually consumes. The input-read side is **correct**: Mesa's
+`ntq_emit_load_input` / `ntq_setup_vpm_inputs` (`nir_to_vir.c`) issue
+`vir_LDVPMV_IN(c, vir_uniform_ui(c, index))` with a running component index — for our
+single vec4 attribute with no builtins read, exactly `0,1,2,3`, which is our coord
+uniform stream and our four `ldvpmv_in` words. The attribute record (address, vec
+size 4, type float, 4 values read by CS/VS, stride 16, max index) matches
+`v3d_packet.xml`, and the vertex buffer is `cache::clean_range`d before the bin kick
+(the GENET-7 stale-DRAM class does not apply).
+
+**The defect — the shader record's VPM *input* segment-size fields.** Mesa's
+`v3d_vs_set_prog_data` (`broadcom/compiler/vir.c`) runs for **both** the coord (bin)
+and vertex variants and, to share one VPM block between input and output
+(`separate_segments = false`, "necessary for our VCM setup to avoid varying
+corruption"), folds the input into the output and **zeroes the input size**:
+
+```
+prog_data->vpm_output_size = MAX2(vpm_output_size, vpm_input_size);
+prog_data->vpm_input_size   = 0;        // vir.c:918-920
+```
+
+`v3dvx_pipeline.c` then writes
+`coordinate_shader_input_vpm_segment_size = prog_data_vs_bin->vpm_input_size` — i.e.
+**0**. Our `build_shader_record` / `build_shader_record_at` wrote **1** for both the
+coord and vertex input fields (record bytes 5 and 7, low nibble; genxml `5b`/`7b`).
+A non-zero input size declares a **spurious separate 1-sector input block**, so the
+hardware's VPM partitioning for the VCD attribute DMA no longer coincides with the
+segment base the shader's `ldvpmv_in` reads from — the shader reads zeros, exactly
+the V3D-24 collapse. It also made the record internally **inconsistent** with the
+V3D-23 `Vc = 4`: Mesa derives `vcm_cache_size` from `half_vpm − vpm_input_size` with
+`vpm_input_size = 0`, so `Vc = 4` was only ever correct for an input size of 0.
+
+**The fix (PI-V3D-25).** Both record builders now emit input segment size **0**
+(output stays 1: six coord words → `align(6,8)/8 = 1` sector). **No shader word
+changed** — the fabricated-constant law (§5) is untouched; this is a shader-record
+field correction transcribed from live Mesa source. The `cs_vpm_output_witness`
+gains a `[v3d25]` line that decodes the four segment-size nibbles back out of the
+record and verdicts them against the Mesa contract (out=1, in=0), so the boot proves
+the fix landed.
+
+**Discriminator (one boot; QEMU models no V3D → metal decides).**
+
+- **pool / tile-STATE go non-zero** ⇒ the VCD now lands attributes where the coord
+  shader reads them; the PTB bins the real triangle — the input-segment defect was
+  the wall, and the M4 sample-verify should pass.
+- **still all-zero** ⇒ the segment-size fold was not the (sole) cause. The remaining
+  unwitnessed link is a *direct* readout of the loaded `Xc/Yc` (a coord-shader TMU
+  general store to a CPU-visible buffer); that needs new QPU words compiled through
+  Mesa's real `v3d_compile` (the TMUAU config-uniform FIFO coupling can't be
+  hand-encoded to §5 confidence and can't be metal-validated in a code-only arc), so
+  it is deferred rather than fabricated.

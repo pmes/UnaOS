@@ -1553,6 +1553,12 @@ fn arena_write_u32(off: usize, v: u32) {
         }
     }
 }
+/// Read a single arena byte (for CPU-side witnesses that decode a struct field back out of the arena).
+#[inline]
+fn arena_byte(off: usize) -> u8 {
+    let arena = &raw const V3D_ARENA;
+    unsafe { (*arena).bytes[off] }
+}
 /// Copy raw bytes into the arena at `off` (bounded — saturates at the arena end, never overruns).
 fn arena_write_bytes(off: usize, src: &[u8]) {
     let arena = &raw mut V3D_ARENA;
@@ -1617,10 +1623,22 @@ fn build_shader_record() -> u32 {
     // shaders each get a single input+output VPM block. These are conservative minimal values, refined
     // with the real shader's prog_data at the sitting.
     sf(&mut rec, 24, 8, 0); // Number of varyings in Fragment Shader
-    sf(&mut rec, 32, 4, 1); // Coord Shader output VPM segment size
-    sf(&mut rec, 40, 4, 1); // Coord Shader input VPM segment size
-    sf(&mut rec, 48, 4, 1); // Vertex Shader output VPM segment size
-    sf(&mut rec, 56, 4, 1); // Vertex Shader input VPM segment size
+    // PI-V3D-25: VPM segment sizes VERBATIM from Mesa `v3d_vs_set_prog_data` (broadcom/compiler/vir.c,
+    // this arc's checkout). Mesa runs it for BOTH the coord (bin) and vertex variants and, to share one
+    // VPM block between input and output (`separate_segments = false`, "necessary for our VCM setup to
+    // avoid varying corruption"), FOLDS the input into the output and ZEROES the input size:
+    //     vpm_output_size = MAX(vpm_output_size, vpm_input_size);  vpm_input_size = 0;   (vir.c:918-920)
+    // So the shader record's INPUT segment-size fields must be 0, not 1. `v3dvx_pipeline.c` writes
+    // `coordinate_shader_input_vpm_segment_size = prog_data_vs_bin->vpm_input_size` (= 0). Prior arcs
+    // (and v3d.md §7) wrongly declared input = 1: a bogus separate 1-sector input block, so the VCD's
+    // attribute DMA and the shader's `ldvpmv_in` reads addressed different VPM rows — the shader read
+    // zeros, every vertex collapsed to (0,0), and the PTB legitimately binned the degenerate point to
+    // nothing. This is the V3D-24 attribute-fetch hypothesis, root-caused CPU-side. output = 1 (6 coord
+    // words → align(6,8)/8 = 1 sector) is correct and unchanged. No shader word changes (§5 untouched).
+    sf(&mut rec, 32, 4, 1); // Coord Shader output VPM segment size (Mesa vpm_output_size = 1)
+    sf(&mut rec, 40, 4, 0); // Coord Shader input VPM segment size  (Mesa folds input → 0)
+    sf(&mut rec, 48, 4, 1); // Vertex Shader output VPM segment size (Mesa vpm_output_size = 1)
+    sf(&mut rec, 56, 4, 0); // Vertex Shader input VPM segment size  (Mesa folds input → 0)
     sf(&mut rec, 64, 32, defaults); // Address of default attribute values
     // Fragment shader: flags at 96/97/98 (4-way threadable, final section, propagate NaNs), addr@99(29).
     let fs_unif = (arena_phys() + OFF_FS_UNIF) as u64;
@@ -2569,6 +2587,22 @@ fn cs_vpm_output_witness(tag: &str) {
     // (1) shader-state record + attribute record bytes (36 + 16 = 52).
     cache::clean_invalidate_range(arena_phys() + OFF_SHADREC, 52);
     dump_shadrec_bytes(tag, OFF_SHADREC, 52);
+    // PI-V3D-25 DISCRIMINATOR — decode the four VPM segment-size nibbles the CLE just handed the PTB
+    // (record bytes 4/5/6/7 low nibble = coord-out/coord-in/vertex-out/vertex-in). Mesa's
+    // `v3d_vs_set_prog_data` folds the INPUT into the output and zeroes it (vir.c:918-920), so the
+    // hardware-correct values are out=1, in=0. A prior in=1 built a spurious separate input block that
+    // mis-aligned the VCD attribute DMA vs the shader's ldvpmv_in reads (the coord shader read zeros →
+    // degenerate primitive → empty bin, the V3D-24 attribute-fetch hypothesis). This line proves the
+    // corrected in=0 landed; the decisive verdict remains bin_pool_witness going non-zero on this boot.
+    let seg_co = arena_byte(OFF_SHADREC + 4) & 0x0F;
+    let seg_ci = arena_byte(OFF_SHADREC + 5) & 0x0F;
+    let seg_vo = arena_byte(OFF_SHADREC + 6) & 0x0F;
+    let seg_vi = arena_byte(OFF_SHADREC + 7) & 0x0F;
+    serial_println!(
+        ":: V3D: [v3d25] {} VPM segment sizes coord(out={} in={}) vertex(out={} in={}) — Mesa contract out=1 in=0 (vir.c v3d_vs_set_prog_data folds input→output); in=0 aligns VCD attribute DMA with the shader ldvpmv_in reads: {} ::",
+        tag, seg_co, seg_ci, seg_vo, seg_vi,
+        if seg_ci == 0 && seg_vi == 0 { "MATCH (attribute-fetch fix aboard)" } else { "MISMATCH (input block still spurious)" }
+    );
     // (2) contracted 6-word CS output vs. our 4-word passthrough, per vertex. Center-relative screen
     // coords (Mesa's shader math; VIEWPORT_OFFSET adds the +32,+32 centre in fixed function).
     let vp_scale: f64 = ((TARGET_W as f64) / 2.0) * 256.0; // 8192.0
@@ -2810,10 +2844,11 @@ fn build_shader_record_at(
     let mut rec = [0u8; 36];
     sf(&mut rec, 1, 1, 1); // Enable clipping
     sf(&mut rec, 24, 8, num_varyings); // Number of varyings in Fragment Shader
+    // PI-V3D-25: input segment sizes = 0 (Mesa folds input → output; vir.c:918-920). See build_shader_record.
     sf(&mut rec, 32, 4, 1); // Coord Shader output VPM segment size
-    sf(&mut rec, 40, 4, 1); // Coord Shader input VPM segment size
+    sf(&mut rec, 40, 4, 0); // Coord Shader input VPM segment size  (Mesa folds input → 0)
     sf(&mut rec, 48, 4, 1); // Vertex Shader output VPM segment size
-    sf(&mut rec, 56, 4, 1); // Vertex Shader input VPM segment size
+    sf(&mut rec, 56, 4, 0); // Vertex Shader input VPM segment size  (Mesa folds input → 0)
     sf(&mut rec, 64, 32, defaults);
     sf(&mut rec, 96, 1, 1); // FS 4-way threadable
     sf(&mut rec, 98, 1, 1); // FS propagate NaNs
