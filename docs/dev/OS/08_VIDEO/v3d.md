@@ -402,3 +402,59 @@ the fix landed.
   Mesa's real `v3d_compile` (the TMUAU config-uniform FIFO coupling can't be
   hand-encoded to §5 confidence and can't be metal-validated in a code-only arc), so
   it is deferred rather than fabricated.
+
+---
+
+## 11. The coord shader is Mesa-*compiled*-equivalent — the fabricated-constant law taken to its end (V3D-26)
+
+Every prior arc packed its QPU words with Mesa's own `v3d_qpu_instr_pack`, but the
+instruction *sequence* was still hand-structured (the §5 law guarantees the bytes are
+Mesa's, not that the shape is what Mesa's compiler would emit). V3D-26 closed that
+last gap: it stood up a standalone build of Mesa's **real `v3d_compile()`** (ver 4.2)
+and ran it end-to-end on the UnaOS passthrough VS, so every word and every uniform is
+authoritative. The harness, its reproduction recipe, and the captured reference output
+are checked in at `scripts/pi-v3d26-mesa-compile.{c,out.txt}`.
+
+**Build path (chosen: option (a), standalone on the Mac).** No Docker on this machine;
+a manual, meson-free build against a sparse Mesa checkout succeeded. NIR + genxml +
+format-table headers were produced by running Mesa's own python generators directly
+(`mako` and `pyyaml` installed to `--user`); the NIR library, `broadcom/{compiler,qpu,
+common}`, `compiler/{glsl_types,shader_enums,builtin_types}`, and `util` were compiled
+with `cc`/`c++` and linked into a witness harness that calls `v3d_compile` for the
+coord/bin variant, the render VS, and a TMU-store probe. `v3d_device_info` is populated
+exactly as `v3d_device_info_init()` would for the Pi 4 (V3D 4.2): `vpm_size = 16384`,
+`has_accumulators`, `clipper_xy_granularity = 256`, `cle_readahead = 256`.
+
+**The word-by-word verdict — our coord shader is functionally Mesa-equivalent.** The
+one setup subtlety that matters: the driver builds the binning VS key with
+`num_used_outputs = 0` (v3dv `pipeline_populate_v3d_vs_key`, the last-geometry-stage
+coord path). With that, Mesa's coord shader:
+
+- stores clip `Xc,Yc,Zc,Wc` to VPM offsets **0,1,2,3** and screen `Xs,Ys` to **4,5** —
+  byte-for-byte the V3D-18/20 six-word STVPMV contract our `CS_VS_WORDS` already emits;
+- uses viewport scale **8192** (`viewport.scale 32 · 256`) — our constant;
+- reports `vpm_output_size = 1` sector, `vcm_cache_size = 4`, input size `0`,
+  `separate_segments = false`, `threads = 4` — all matching our shader-state record.
+
+The only structural divergences are **numeric no-ops for the W = 1 test geometry**:
+Mesa emits an unconditional `recip(1/Wc)` (we drop it, valid only for W = 1), and it
+delivers the scale through `QUNIFORM_VIEWPORT_{X,Y}_SCALE` uniforms the driver patches
+at draw time rather than a baked `8192.0` literal (same value for our square viewport).
+Our shader's ldunif pops and our uniform stream are a self-consistent matched pair
+(11 pops, 11 words), so no uniform-FIFO desync exists. **The coordinate shader is thus
+exonerated at the highest available standard: a real `v3d_compile` produces the same
+result our words do.** No word was changed — fabricating a swap to Mesa's exact register
+allocation on a QEMU-untestable path would only risk regressing a metal-equivalent
+shader. This narrows the empty-bin wall off the shader entirely.
+
+**The probe is no longer un-hand-encodable (the §10 deferral is lifted).** The harness
+also compiled, with Mesa-authoritative words, a passthrough VS that `store_ssbo`s its
+four loaded attribute components — Mesa lowers it to `mov tmud ×4` → `mov tmuau` →
+`tmuwt` (25 words; `threads = 2`, `tmu_count = 1`), with the buffer base delivered as a
+`QUNIFORM_UBO_ADDR` uniform. These are exactly the TMUAU-config-coupled words §10 said
+could not be hand-authored to §5 confidence — now available for the next arc/sitting to
+wire into the bin job as the **direct "what did the QPU receive" witness** of whether
+the VCD actually DMAs attributes into VPM (the surviving candidate after §8/§10/§11).
+Wiring it (an SSBO binding + `UBO_ADDR` uniform + a CPU-readable buffer in the bin CL)
+is a metal-sitting deliverable — it cannot be validated in QEMU — and is left for that
+arc rather than folded blind here.

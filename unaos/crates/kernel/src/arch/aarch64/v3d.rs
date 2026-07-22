@@ -1461,6 +1461,18 @@ const FS_WORDS: [u64; 10] = [
 /// PROVENANCE: every word Mesa-packed (v3d_qpu_instr_pack, ver 42) + round-tripped by
 /// scripts/pi-v3d20-qpu-gen.c (see its .out.txt). Metal-refinement surface (unchanged stance): the
 /// ldunifrf read-offsets and the RF write→read hazard scheduling — QEMU models no V3D, metal decides.
+///
+/// PI-V3D-26 (Mesa-COMPILED cross-check): this hand-structured body was validated against a real
+/// `v3d_compile()` run (ver 4.2) of the passthrough VS — see scripts/pi-v3d26-mesa-compile.c and its
+/// .out.txt. With the key configured as the driver configures the binning VS
+/// (num_used_outputs = 0 for the last-geometry-stage coord shader), Mesa's coord shader stores clip
+/// Xc,Yc,Zc,Wc to VPM offsets **0,1,2,3** and screen Xs,Ys to **4,5**, with viewport scale
+/// 32·256 = **8192** — byte-for-byte this contract. Mesa additionally emits an unconditional
+/// `recip(1/Wc)` and delivers the scale via QUNIFORM_VIEWPORT_{X,Y}_SCALE rather than a baked 8192.0
+/// literal; both are numeric no-ops for the W = 1 test geometry, so this body is functionally
+/// Mesa-equivalent. The coord shader is exonerated at the authoritative level — the empty-bin wall is
+/// NOT in these words. (No word changed: fabricating a swap to Mesa's register allocation on a
+/// QEMU-untestable path would risk regressing a metal-equivalent shader.) See v3d.md §11.
 const CS_VS_WORDS: [u64; 27] = [
     0x3d81_6180_bc80_6140, // ldvpmv_in rf0, rf5 ; ldunifrf.rf5   (attr[0] -> Xc)
     0x3d81_6181_bc80_6140, // ldvpmv_in rf1, rf5 ; ldunifrf.rf5   (attr[1] -> Yc)
