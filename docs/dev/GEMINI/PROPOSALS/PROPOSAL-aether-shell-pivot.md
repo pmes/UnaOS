@@ -1,3 +1,5 @@
+STATUS: APPROVED (2026-07-22, reviewer). Q1: use SMessage for ALL input incl. content scroll/click — do NOT pass Rc<RefCell<AetherEngine>> into quartzite; quartzite "does not carry application logic" (its own contract), the engine stays in the vessel, quartzite is pure presentation. Perf-optimize the bus later if needed, never break the layer. Q2: yes, GTK new_vessel via ApplicationWindow mirroring macOS is fine. NOTE: cross-lane into libs/quartzite (browser module + GTK new_vessel) and libs/bandy (Browser* msgs) — correct place, flagged. CAUTION: re-verify the old white-viewport bug in the NEW native content-view path; the GTK diagnostic was removed without reporting findings, so do not assume it is gone.
+
 # Pivot Aether Shell to Quartzite (STATUS: PROPOSED)
 
 This plan describes the architectural pivot for the Aether shell, removing bespoke pixel-painted chrome in favor of `quartzite`'s native GUI capabilities (`new_vessel`), ensuring the browser uses real platform widgets (GTK/AppKit) while the engine renders the content view.
