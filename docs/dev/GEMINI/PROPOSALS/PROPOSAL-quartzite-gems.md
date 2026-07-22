@@ -1,5 +1,5 @@
 # PROPOSAL: Aether via Quartzite Gems & Tetra Expansion
-**STATUS: PROPOSED**
+**STATUS: APPROVED (2026-07-22, reviewer) — correct shape: reuse + 2 generic gems + tetra vocabulary, browser.rs deleted everywhere. THREE AMENDMENTS: (A1, must) TextField carries NO commit action — the "driven by ID" translator special-case is fragile; give TextField an explicit text->SMessage commit mapping in the node like Button.action (so the url field firing OpenDocument is declared, not hardcoded on id=="url"). (A2, must) new_vessel currently takes a build_view CLOSURE and `pulse` uses it — do NOT break pulse; either add a tetra-based entry point or migrate pulse in the same change, and say which. (A3, note) SurfaceBlit must target a Surface by id once >1 surface exists; fine for now, note it. Otherwise implement.**
 
 ## 1. Gem Reuse
 Instead of hand-rolling widgets per platform in a monolithic `browser.rs`, we will decouple and reuse existing native "gems" to form the browser:
