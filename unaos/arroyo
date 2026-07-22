@@ -37,6 +37,10 @@ case "${1:-}" in
         export UNAOS_WITNESS="${UNAOS_WITNESS:-1}" ;;
 esac
 
+# BUILD-SHA-1: Export git SHA as UNAOS_GIT_SHA for compile-time embedding (option_env!("UNAOS_GIT_SHA")).
+# This makes the build ID available to all cargo invocations (check/test/kernel8/esp targets).
+export UNAOS_GIT_SHA="$(git rev-parse --short=8 HEAD 2>/dev/null || echo unknown)"
+
 # Build flags shared by both targets
 NIGHTLY_FLAGS="-Z build-std=core,compiler_builtins,alloc -Z build-std-features=compiler-builtins-mem -Z json-target-spec"
 
