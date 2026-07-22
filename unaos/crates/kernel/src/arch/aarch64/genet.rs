@@ -1233,6 +1233,10 @@ mod metal {
         // self-checking `:: NET-GATE: ... PASS/FAIL [w=0x..] ::` witness the arm/kernel8 battery asserts.
         #[cfg(feature = "nettest")]
         nettest::run();
+        // PI-NET-14: the OUTBOUND client gate (DNS resolver + HTTP client), same hardware-free loopback
+        // seam. Prints a self-checking `:: NET14-GATE: ... PASS [w=0x..] ::` line the battery asserts.
+        #[cfg(feature = "nettest")]
+        nettest::run14();
 
         // ── M1: resolve the register base from the DTB. NO DTB node => QEMU / DTB-less boot: this build
         //    does NOT model GENET, and touching the register window would FAULT (external abort), not
@@ -2053,7 +2057,7 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
     /// Hand the DHCP-configured `iface`/`dev` to the persistent [`NetService`] and register the poll task
     /// on a secondary core. Called at the tail of `bind_smoltcp` (a NIC is guaranteed present). The empty
     /// SocketSet uses leaked static storage (smoltcp's owned-Vec path is off in our no_std feature set).
-    fn arm_net_service(mut iface: Interface, dev: SmoltcpPhy<GenetNic>) {
+    fn arm_net_service(mut iface: Interface, mut dev: SmoltcpPhy<GenetNic>, dns_ip: [u8; 4]) {
         // PI-NET-12: storage holds the HTTP listener POOL plus the one mDNS UDP socket.
         let storage: &'static mut [SocketStorage; HTTP_POOL + 1] =
             alloc::boxed::Box::leak(alloc::boxed::Box::new(Default::default()));
@@ -2092,6 +2096,15 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
                 PG, bound, joined
             );
         }
+
+        // PI-NET-14: the outbound "UnaOS asks" client — DNS resolve + HTTP GET, once, now that the
+        // serving pool + mDNS responder are armed and witnessed. It runs on the BSP BEFORE the net9 poll
+        // task is spawned on a secondary, so there is no concurrency against the serving pool. It uses its
+        // OWN temporary sockets (local `SocketSet`s scoped inside `net14_ask`, freed on return), so the
+        // serving pool is never touched — the census that the net9 task first reports is a clean
+        // listen=HTTP_POOL. On a bench segment without upstream reachability the honest witness is a
+        // `dns timeout` / `connect timeout` line; the QEMU NET14-GATE is the correctness proof.
+        net14_ask(&mut iface, &mut dev, dns_ip);
 
         *NET_SERVICE.lock() = Some(NetService {
             iface,
@@ -2239,7 +2252,422 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
         // PI-NET-9: the verdict above is the regression gate and has now printed. Hand the same
         // DHCP-configured `iface` + `dev` to the persistent service so the interface keeps being polled
         // and the Pi ANSWERS the gateway's ARP who-has / ICMP echo requests that arrive seconds later.
-        arm_net_service(iface, dev);
+        // PI-NET-14: pass the DNS server for the outbound "UnaOS asks" client. The lease carries a DNS
+        // server, but `NetConfig` (shared `net_phy.rs`, outside this lane) does not surface it yet, so we
+        // use the gateway — the brief's stated fallback, and the resolver on a typical home router.
+        arm_net_service(iface, dev, gw);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════════════════════════
+    // PI-NET-14: "UnaOS asks" — the OUTBOUND client half (DNS resolver + HTTP GET).
+    // ══════════════════════════════════════════════════════════════════════════════════════════════════
+    //
+    // Everything above answers the network; this leg initiates. Two pure, hostile-input-hardened parsers
+    // (`net14_parse_a`, `net14_http_status`) plus a bounded live driver (`net14_ask`) that runs once
+    // post-lease. The DNS parser treats every byte of the response as adversarial: EVERY read is
+    // bounds-checked (`get`/`checked_add`), compression pointers are NEVER dereferenced (a pointer is
+    // two bytes and terminates a name — so we are immune to the classic compression-loop DoS by
+    // construction, not by a visited-set), the label walk carries a hop cap, the answer walk is capped,
+    // and any structural violation returns a typed error rather than panicking or looping. The whole
+    // client uses its own temporary sockets and never touches the serving pool.
+
+    /// Default host the Pi resolves + fetches. `example.com` serves a stable 200 on plain :80 (no HTTPS
+    /// redirect), so a successful metal fetch is unambiguous.
+    const NET14_HOST: &str = "example.com";
+    /// DNS transaction id stamped on the query and required to match on the response (a mismatched id is
+    /// a stale/spoofed datagram and is rejected as malformed). ASCII-ish "N4".
+    const NET14_TXID: u16 = 0x4e34;
+    /// Ephemeral source ports for the client sockets (DNS udp, HTTP tcp) — well clear of the well-known
+    /// ports the service listens on (:80, :5353).
+    const NET14_DNS_SPORT: u16 = 49517;
+    const NET14_HTTP_SPORT: u16 = 49519;
+    /// Bounded real-time windows (CNTPCT ms). DNS: resend the query on a cadence across the window so an
+    /// unresolved-neighbor first packet (dropped during ARP) is retried; HTTP: connect + response.
+    const NET14_DNS_WINDOW_MS: i64 = 2_500;
+    const NET14_DNS_RESEND_MS: i64 = 400;
+    const NET14_HTTP_WINDOW_MS: i64 = 4_000;
+    /// Short transport timeout so a black-holed SYN aborts to a `connect timeout` witness rather than
+    /// riding the whole HTTP window.
+    const NET14_TCP_TIMEOUT_MS: u64 = 1_500;
+    /// Bytes of the response body captured for the excerpt witness.
+    const NET14_EXCERPT: usize = 80;
+
+    /// Outcome of parsing a DNS response — a typed result so every failure mode gets its own witness.
+    enum Net14Dns {
+        Resolved([u8; 4]),
+        Malformed,
+        NoAnswer,
+        ServerErr(u8),
+    }
+
+    /// Build a minimal DNS A-record query for `host` into `out`, returning its length. RD=1 standard
+    /// query, one question, QTYPE A / QCLASS IN. Rejects (`None`) an empty/over-long label or a buffer
+    /// too small — never writes past `out`.
+    fn net14_build_dns_query(out: &mut [u8], txid: u16, host: &str) -> Option<usize> {
+        if out.len() < 12 {
+            return None;
+        }
+        out[0..2].copy_from_slice(&txid.to_be_bytes());
+        out[2..4].copy_from_slice(&0x0100u16.to_be_bytes()); // flags: RD=1 (standard recursive query)
+        out[4..6].copy_from_slice(&1u16.to_be_bytes()); // QDCOUNT = 1
+        out[6..12].copy_from_slice(&[0, 0, 0, 0, 0, 0]); // AN/NS/AR = 0
+        let mut w = 12usize;
+        for label in host.split('.') {
+            let lb = label.as_bytes();
+            if lb.is_empty() || lb.len() > 63 {
+                return None; // an empty or > 63-byte label is not a legal DNS label
+            }
+            if w + 1 + lb.len() > out.len() {
+                return None;
+            }
+            out[w] = lb.len() as u8;
+            w += 1;
+            out[w..w + lb.len()].copy_from_slice(lb);
+            w += lb.len();
+        }
+        if w + 5 > out.len() {
+            return None;
+        }
+        out[w] = 0; // root label
+        w += 1;
+        out[w..w + 2].copy_from_slice(&1u16.to_be_bytes()); // QTYPE = A
+        w += 2;
+        out[w..w + 2].copy_from_slice(&1u16.to_be_bytes()); // QCLASS = IN
+        w += 2;
+        Some(w)
+    }
+
+    /// Return the offset just past the DNS name encoded at `off` in `pkt`. HOSTILE-INPUT HARDENED:
+    /// every byte is bounds-checked; a compression pointer (top two bits set) is NEVER followed — it is
+    /// two bytes and terminates the name, so returning `off + 2` is both correct for skipping and immune
+    /// to compression loops by construction; a label walk carries a hop cap; reserved length bits
+    /// (0x40 / 0x80) are rejected. Returns `None` on any structural violation.
+    fn net14_skip_name(pkt: &[u8], mut off: usize) -> Option<usize> {
+        let mut labels = 0usize;
+        loop {
+            let b = *pkt.get(off)?;
+            match b & 0xc0 {
+                0x00 => {
+                    if b == 0 {
+                        return Some(off + 1); // root label — end of name
+                    }
+                    off = off.checked_add(1 + b as usize)?;
+                    if off > pkt.len() {
+                        return None;
+                    }
+                    labels += 1;
+                    if labels > 127 {
+                        return None; // hop cap — a sane name has far fewer than 128 labels
+                    }
+                }
+                0xc0 => {
+                    pkt.get(off + 1)?; // bounds-check the 2nd pointer byte; we do NOT dereference it
+                    return Some(off + 2);
+                }
+                _ => return None, // 0x40 / 0x80 reserved in the top two bits — malformed
+            }
+        }
+    }
+
+    /// Parse a DNS response and extract the first A record, or a typed failure. HOSTILE-INPUT HARDENED:
+    /// header length checked, transaction id must match (a mismatch is a stale/spoofed datagram), the QR
+    /// bit must say "response", a non-zero RCODE surfaces as `ServerErr`, the question + answer sections
+    /// are walked with `net14_skip_name` (compression-loop-immune) and every fixed field is
+    /// bounds-checked before read, and the answer walk is capped. No path can panic or loop unbounded.
+    fn net14_parse_a(pkt: &[u8], txid: u16) -> Net14Dns {
+        if pkt.len() < 12 {
+            return Net14Dns::Malformed;
+        }
+        if pkt[0..2] != txid.to_be_bytes() {
+            return Net14Dns::Malformed; // not our transaction
+        }
+        let flags = u16::from_be_bytes([pkt[2], pkt[3]]);
+        if flags & 0x8000 == 0 {
+            return Net14Dns::Malformed; // QR=0: this is a query, not a response
+        }
+        let rcode = (flags & 0x000f) as u8;
+        if rcode != 0 {
+            return Net14Dns::ServerErr(rcode); // NXDOMAIN (3), SERVFAIL (2), REFUSED (5), ...
+        }
+        let qd = u16::from_be_bytes([pkt[4], pkt[5]]);
+        let an = u16::from_be_bytes([pkt[6], pkt[7]]);
+        let mut off = 12usize;
+        // Skip the question section: each question is a name + QTYPE(2) + QCLASS(2).
+        for _ in 0..qd {
+            off = match net14_skip_name(pkt, off) {
+                Some(o) => o,
+                None => return Net14Dns::Malformed,
+            };
+            off = match off.checked_add(4) {
+                Some(o) if o <= pkt.len() => o,
+                _ => return Net14Dns::Malformed,
+            };
+        }
+        // Walk the answers (capped) for the first A/IN record with a 4-byte RDATA.
+        let mut i = 0u16;
+        while i < an && i < 64 {
+            off = match net14_skip_name(pkt, off) {
+                Some(o) => o,
+                None => return Net14Dns::Malformed,
+            };
+            // Fixed RR header: TYPE(2) CLASS(2) TTL(4) RDLENGTH(2) = 10 bytes.
+            if off + 10 > pkt.len() {
+                return Net14Dns::Malformed;
+            }
+            let rtype = u16::from_be_bytes([pkt[off], pkt[off + 1]]);
+            let rclass = u16::from_be_bytes([pkt[off + 2], pkt[off + 3]]);
+            let rdlen = u16::from_be_bytes([pkt[off + 8], pkt[off + 9]]) as usize;
+            let rdata = off + 10;
+            if rdata + rdlen > pkt.len() {
+                return Net14Dns::Malformed;
+            }
+            if rtype == 1 && rclass == 1 && rdlen == 4 {
+                return Net14Dns::Resolved([pkt[rdata], pkt[rdata + 1], pkt[rdata + 2], pkt[rdata + 3]]);
+            }
+            off = rdata + rdlen; // skip CNAME / AAAA / etc. and keep looking
+            i += 1;
+        }
+        Net14Dns::NoAnswer
+    }
+
+    /// Parse the numeric status code from an HTTP status line (`HTTP/1.x SP DDD SP ...`). Bounds-checked;
+    /// returns `None` if the line is too short, not an `HTTP/` line, or the code field is not three digits.
+    fn net14_http_status(resp: &[u8]) -> Option<u16> {
+        if resp.len() < 12 || &resp[0..5] != b"HTTP/" {
+            return None;
+        }
+        let d = &resp[9..12];
+        let mut code = 0u16;
+        for &c in d {
+            if !c.is_ascii_digit() {
+                return None;
+            }
+            code = code * 10 + (c - b'0') as u16;
+        }
+        Some(code)
+    }
+
+    /// Copy up to `NET14_EXCERPT` body bytes (the region after the `\r\n\r\n` header terminator) into
+    /// `out`, sanitising non-printable bytes to '.', and return the sanitised length. If no header
+    /// terminator is found the whole response is treated as body (still sanitised + bounded).
+    fn net14_body_excerpt(resp: &[u8], out: &mut [u8; NET14_EXCERPT]) -> usize {
+        // Find the CRLFCRLF header/body boundary.
+        let mut body = resp.len();
+        if resp.len() >= 4 {
+            for i in 0..resp.len() - 3 {
+                if &resp[i..i + 4] == b"\r\n\r\n" {
+                    body = i + 4;
+                    break;
+                }
+            }
+        }
+        let src = &resp[body.min(resp.len())..];
+        let n = src.len().min(NET14_EXCERPT);
+        for (o, &b) in out.iter_mut().zip(src[..n].iter()) {
+            *o = if (0x20..0x7f).contains(&b) { b } else { b'.' };
+        }
+        n
+    }
+
+    /// PI-NET-14: the live outbound client. Resolves `NET14_HOST` via UDP :53 to `dns_ip` (bounded,
+    /// with retransmit), then TCP-connects to the resolved address on :80, sends a GET, and witnesses the
+    /// status line + a body excerpt. Every failure mode gets a one-line witness so a metal boot localises
+    /// the failing leg. Uses only temporary, stack-buffered sockets on `iface`/`dev` — the serving pool
+    /// is never touched. Bounded by construction (real-time windows over the free-running counter).
+    fn net14_ask(iface: &mut Interface, dev: &mut SmoltcpPhy<GenetNic>, dns_ip: [u8; 4]) {
+        // ── DNS resolve ──────────────────────────────────────────────────────────────────────────────
+        let ip = {
+            let mut rx_meta = [udp::PacketMetadata::EMPTY; 4];
+            let mut rx_pl = [0u8; 768];
+            let mut tx_meta = [udp::PacketMetadata::EMPTY; 4];
+            let mut tx_pl = [0u8; 768];
+            let mut sock = udp::Socket::new(
+                udp::PacketBuffer::new(&mut rx_meta[..], &mut rx_pl[..]),
+                udp::PacketBuffer::new(&mut tx_meta[..], &mut tx_pl[..]),
+            );
+            if sock.bind(NET14_DNS_SPORT).is_err() {
+                serial_println!("{} [net14] dns {} => socket bind FAILED ::", PG, NET14_HOST);
+                return;
+            }
+            let mut storage: [SocketStorage; 1] = Default::default();
+            let mut sockets = SocketSet::new(&mut storage[..]);
+            let h = sockets.add(sock);
+
+            let mut qbuf = [0u8; 300];
+            let Some(qlen) = net14_build_dns_query(&mut qbuf, NET14_TXID, NET14_HOST) else {
+                serial_println!("{} [net14] dns {} => query build FAILED ::", PG, NET14_HOST);
+                return;
+            };
+            let dst = IpEndpoint::new(IpAddress::v4(dns_ip[0], dns_ip[1], dns_ip[2], dns_ip[3]), 53);
+
+            let t0 = now_ms();
+            let mut next_send = t0;
+            let mut outcome: Option<Net14Dns> = None;
+            loop {
+                let t = now_ms();
+                if t.saturating_sub(t0) >= NET14_DNS_WINDOW_MS {
+                    break;
+                }
+                iface.poll(Instant::from_millis(t), dev, &mut sockets);
+                let s = sockets.get_mut::<udp::Socket>(h);
+                if t >= next_send && s.can_send() {
+                    // Retransmit on a cadence: the first datagram is dropped while the DNS-server neighbor
+                    // is being ARP-resolved, so a single send would race the resolution and time out.
+                    let _ = s.send_slice(&qbuf[..qlen], dst);
+                    next_send = t + NET14_DNS_RESEND_MS;
+                }
+                if s.can_recv() {
+                    let mut rb = [0u8; 768];
+                    if let Ok((n, _meta)) = s.recv_slice(&mut rb) {
+                        outcome = Some(net14_parse_a(&rb[..n], NET14_TXID));
+                        break;
+                    }
+                }
+            }
+
+            match outcome {
+                Some(Net14Dns::Resolved(ip)) => {
+                    serial_println!(
+                        "{} [net14] dns {} -> {}.{}.{}.{} ::",
+                        PG, NET14_HOST, ip[0], ip[1], ip[2], ip[3]
+                    );
+                    ip
+                }
+                Some(Net14Dns::ServerErr(r)) => {
+                    serial_println!("{} [net14] dns {} => server rcode {} ::", PG, NET14_HOST, r);
+                    return;
+                }
+                Some(Net14Dns::NoAnswer) => {
+                    serial_println!("{} [net14] dns {} => no A record ::", PG, NET14_HOST);
+                    return;
+                }
+                Some(Net14Dns::Malformed) => {
+                    serial_println!("{} [net14] dns {} => malformed response (rejected) ::", PG, NET14_HOST);
+                    return;
+                }
+                None => {
+                    serial_println!(
+                        "{} [net14] dns {} => timeout (no upstream? dns={}.{}.{}.{}) ::",
+                        PG, NET14_HOST, dns_ip[0], dns_ip[1], dns_ip[2], dns_ip[3]
+                    );
+                    return;
+                }
+            }
+        };
+
+        // ── HTTP GET ─────────────────────────────────────────────────────────────────────────────────
+        let mut rxb = [0u8; 2048];
+        let mut txb = [0u8; 512];
+        let mut sock = tcp::Socket::new(
+            tcp::SocketBuffer::new(&mut rxb[..]),
+            tcp::SocketBuffer::new(&mut txb[..]),
+        );
+        sock.set_timeout(Some(Duration::from_millis(NET14_TCP_TIMEOUT_MS)));
+        let mut storage: [SocketStorage; 1] = Default::default();
+        let mut sockets = SocketSet::new(&mut storage[..]);
+        let h = sockets.add(sock);
+        let remote = (IpAddress::v4(ip[0], ip[1], ip[2], ip[3]), HTTP_PORT);
+        if sockets
+            .get_mut::<tcp::Socket>(h)
+            .connect(iface.context(), remote, NET14_HTTP_SPORT)
+            .is_err()
+        {
+            serial_println!("{} [net14] GET http://{}/ => connect setup FAILED ::", PG, NET14_HOST);
+            return;
+        }
+
+        // A minimal HTTP/1.1 GET with an explicit Host + Connection: close so the server closes after one
+        // response. Fits `txb` comfortably.
+        let mut get = [0u8; 160];
+        let getlen = {
+            use core::fmt::Write as _;
+            let mut w = BufWriter { buf: &mut get, len: 0 };
+            let _ = write!(
+                w,
+                "GET / HTTP/1.1\r\nHost: {}\r\nUser-Agent: UnaOS/genet\r\nConnection: close\r\n\r\n",
+                NET14_HOST
+            );
+            w.len
+        };
+
+        let t0 = now_ms();
+        let mut established = false;
+        let mut sent = false;
+        let mut rlen = 0usize;
+        let mut resp = [0u8; 1024];
+        enum Http {
+            Got,
+            Refused,
+            Timeout,
+            NoData,
+        }
+        let result;
+        loop {
+            let t = now_ms();
+            if t.saturating_sub(t0) >= NET14_HTTP_WINDOW_MS {
+                result = if established { Http::NoData } else { Http::Timeout };
+                break;
+            }
+            iface.poll(Instant::from_millis(t), dev, &mut sockets);
+            let s = sockets.get_mut::<tcp::Socket>(h);
+            if s.may_send() {
+                established = true;
+                if !sent {
+                    let _ = s.send_slice(&get[..getlen]);
+                    sent = true;
+                }
+            }
+            if s.can_recv() {
+                let _ = s.recv(|buf| {
+                    let n = buf.len().min(resp.len() - rlen);
+                    resp[rlen..rlen + n].copy_from_slice(&buf[..n]);
+                    rlen += n;
+                    (buf.len(), ())
+                });
+                // Enough for the status line + a body excerpt — stop reading.
+                if rlen >= 12 {
+                    result = Http::Got;
+                    break;
+                }
+            }
+            if !established && !s.is_active() {
+                // The socket left SYN_SENT without ever becoming writable => the peer refused (RST).
+                result = Http::Refused;
+                break;
+            }
+        }
+
+        match result {
+            Http::Got => {
+                let code = net14_http_status(&resp[..rlen]).unwrap_or(0);
+                let note = if code == 200 { "" } else { " (non-200)" };
+                serial_println!(
+                    "{} [net14] GET http://{}/ -> HTTP/1.1 {} ({} bytes){} ::",
+                    PG, NET14_HOST, code, rlen, note
+                );
+                let mut ex = [0u8; NET14_EXCERPT];
+                let exn = net14_body_excerpt(&resp[..rlen], &mut ex);
+                serial_println!(
+                    "{} [net14] body: {} ::",
+                    PG,
+                    core::str::from_utf8(&ex[..exn]).unwrap_or("<binary>")
+                );
+                // Close cleanly so we do not leave a TCB in the peer.
+                sockets.get_mut::<tcp::Socket>(h).close();
+                for _ in 0..40 {
+                    iface.poll(Instant::from_millis(now_ms()), dev, &mut sockets);
+                }
+            }
+            Http::Refused => {
+                serial_println!("{} [net14] GET http://{}/ => connect refused (RST) ::", PG, NET14_HOST);
+            }
+            Http::Timeout => {
+                serial_println!("{} [net14] GET http://{}/ => connect timeout ::", PG, NET14_HOST);
+            }
+            Http::NoData => {
+                serial_println!("{} [net14] GET http://{}/ => connected, no response ::", PG, NET14_HOST);
+            }
+        }
     }
 
     // ══════════════════════════════════════════════════════════════════════════════════════════════════
@@ -2537,6 +2965,344 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
             let pass = w == 0xf;
             serial_println!(
                 ":: NET-GATE: tcp/http/mdns loopback battery {} [w=0x{:x}] (basic|flood-reap-recover|fin-recycle|table-full) ::",
+                if pass { "PASS" } else { "FAIL" }, w
+            );
+        }
+
+        /// Build a well-formed DNS A response for `example.com` -> `ip` with transaction id `txid`. The
+        /// answer name uses a compression pointer (0xC0 0x0C) back to the question name — the exact shape
+        /// a real resolver emits — so the gate exercises `net14_skip_name`'s pointer handling.
+        fn build_a_response(txid: u16, ip: [u8; 4], rcode: u8, ancount: u16) -> Vec<u8> {
+            let mut v = Vec::new();
+            v.extend_from_slice(&txid.to_be_bytes());
+            v.extend_from_slice(&(0x8180u16 | rcode as u16).to_be_bytes()); // QR=1 RD=1 RA=1 + rcode
+            v.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
+            v.extend_from_slice(&ancount.to_be_bytes()); // ANCOUNT
+            v.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
+            v.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
+            // Question: example.com A IN (name starts at offset 12).
+            v.push(7);
+            v.extend_from_slice(b"example");
+            v.push(3);
+            v.extend_from_slice(b"com");
+            v.push(0);
+            v.extend_from_slice(&1u16.to_be_bytes()); // QTYPE A
+            v.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
+            if ancount > 0 {
+                // Answer: name = pointer to offset 12, A IN, ttl 300, rdlen 4, rdata ip.
+                v.extend_from_slice(&[0xc0, 0x0c]);
+                v.extend_from_slice(&1u16.to_be_bytes()); // TYPE A
+                v.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN
+                v.extend_from_slice(&300u32.to_be_bytes()); // TTL
+                v.extend_from_slice(&4u16.to_be_bytes()); // RDLENGTH
+                v.extend_from_slice(&ip);
+            }
+            v
+        }
+
+        /// Poll both loopback stacks once at the shared clock and advance it (client gate variant — no
+        /// service methods; the kernel side runs a bare client socket).
+        fn pump14(
+            kiface: &mut Interface,
+            kdev: &mut SmoltcpPhy<KernelLoopNic>,
+            ksock: &mut SocketSet<'static>,
+            piface: &mut Interface,
+            pdev: &mut SmoltcpPhy<PeerLoopNic>,
+            psock: &mut SocketSet<'static>,
+            clk: &mut i64,
+            iters: usize,
+        ) {
+            for _ in 0..iters {
+                let t = Instant::from_millis(*clk);
+                kiface.poll(t, kdev, ksock);
+                piface.poll(t, pdev, psock);
+                *clk += STEP_MS;
+            }
+        }
+
+        /// PI-NET-14: the OUTBOUND client gate — the counterpart to `run()` (which tests the service half).
+        /// Bitmask `w`:
+        ///   0x01 parser accepts a well-formed A response; 0x02 rejects a truncated response;
+        ///   0x04 rejects a name that never terminates (hop cap / no compression-loop hang);
+        ///   0x08 surfaces a server RCODE; 0x10 a live loopback DNS query/response resolves;
+        ///   0x20 a live loopback HTTP GET returns 200; 0x40 connect-to-closed-port is refused (RST);
+        ///   0x80 connect-to-black-hole times out.
+        pub fn run14() {
+            *K_RX.lock() = Some(VecDeque::new());
+            *P_RX.lock() = Some(VecDeque::new());
+            let mut w: u32 = 0;
+
+            // ── Pure hostile-input parser checks (no sockets — the security surface tested in isolation). ─
+            let good = build_a_response(NET14_TXID, [93, 184, 216, 34], 0, 1);
+            if let Net14Dns::Resolved([93, 184, 216, 34]) = net14_parse_a(&good, NET14_TXID) {
+                w |= 0x01;
+            }
+            serial_println!(
+                "{} [net14t] parse well-formed A => {} ::",
+                PG, if w & 0x01 != 0 { "resolved PASS" } else { "FAIL" }
+            );
+
+            // Truncate the well-formed response mid-answer (drop the last 3 rdata bytes): rdlen now
+            // over-runs the buffer, which the bounds check must reject.
+            let mut trunc = good.clone();
+            trunc.truncate(trunc.len() - 3);
+            let rej_trunc = matches!(net14_parse_a(&trunc, NET14_TXID), Net14Dns::Malformed);
+            if rej_trunc {
+                w |= 0x02;
+            }
+            serial_println!(
+                "{} [net14t] reject truncated => {} ::",
+                PG, if rej_trunc { "malformed PASS" } else { "FAIL" }
+            );
+
+            // A name that is 130 one-byte labels with NO root terminator: `net14_skip_name` must bail
+            // (hop cap / running past the buffer) rather than loop — the compression-loop-DoS guard.
+            let mut loopname = Vec::new();
+            for _ in 0..130 {
+                loopname.push(1u8);
+                loopname.push(b'a');
+            }
+            let rej_loop = net14_skip_name(&loopname, 0).is_none();
+            if rej_loop {
+                w |= 0x04;
+            }
+            serial_println!(
+                "{} [net14t] reject non-terminating name => {} ::",
+                PG, if rej_loop { "bailed PASS" } else { "FAIL" }
+            );
+
+            // A response carrying RCODE=3 (NXDOMAIN) must surface as a server error, not a resolve.
+            let nx = build_a_response(NET14_TXID, [0, 0, 0, 0], 3, 0);
+            let rcode_ok = matches!(net14_parse_a(&nx, NET14_TXID), Net14Dns::ServerErr(3));
+            if rcode_ok {
+                w |= 0x08;
+            }
+            serial_println!(
+                "{} [net14t] surface server rcode => {} ::",
+                PG, if rcode_ok { "rcode3 PASS" } else { "FAIL" }
+            );
+
+            // ── Live loopback socket scenarios. Kernel = client (KIP), peer = server (PIP). ────────────
+            let mut kdev = SmoltcpPhy::<KernelLoopNic>::new();
+            let mut kiface = build_iface(&mut kdev, KMAC, KIP, 0x4b31_3400); // "K14"
+            let mut pdev = SmoltcpPhy::<PeerLoopNic>::new();
+            let mut piface = build_iface(&mut pdev, PMAC, PIP, 0x5031_3400); // "P14"
+            let kstore: &'static mut [SocketStorage; 4] = Box::leak(Box::new(Default::default()));
+            let mut ksock = SocketSet::new(&mut kstore[..]);
+            let pstore: &'static mut [SocketStorage; 4] = Box::leak(Box::new(Default::default()));
+            let mut psock = SocketSet::new(&mut pstore[..]);
+            let mut clk: i64 = 0;
+
+            // Scenario 0x10: DNS query/response over the loopback. Kernel udp -> peer udp :53 -> A reply.
+            {
+                let krx: &'static mut [udp::PacketMetadata; 4] =
+                    Box::leak(Box::new([udp::PacketMetadata::EMPTY; 4]));
+                let krxp: &'static mut [u8; 768] = Box::leak(Box::new([0u8; 768]));
+                let ktx: &'static mut [udp::PacketMetadata; 4] =
+                    Box::leak(Box::new([udp::PacketMetadata::EMPTY; 4]));
+                let ktxp: &'static mut [u8; 768] = Box::leak(Box::new([0u8; 768]));
+                let mut ku = udp::Socket::new(
+                    udp::PacketBuffer::new(&mut krx[..], &mut krxp[..]),
+                    udp::PacketBuffer::new(&mut ktx[..], &mut ktxp[..]),
+                );
+                let _ = ku.bind(NET14_DNS_SPORT);
+                let kh = ksock.add(ku);
+
+                let prx: &'static mut [udp::PacketMetadata; 4] =
+                    Box::leak(Box::new([udp::PacketMetadata::EMPTY; 4]));
+                let prxp: &'static mut [u8; 768] = Box::leak(Box::new([0u8; 768]));
+                let ptx: &'static mut [udp::PacketMetadata; 4] =
+                    Box::leak(Box::new([udp::PacketMetadata::EMPTY; 4]));
+                let ptxp: &'static mut [u8; 768] = Box::leak(Box::new([0u8; 768]));
+                let mut pu = udp::Socket::new(
+                    udp::PacketBuffer::new(&mut prx[..], &mut prxp[..]),
+                    udp::PacketBuffer::new(&mut ptx[..], &mut ptxp[..]),
+                );
+                let _ = pu.bind(53u16);
+                let ph = psock.add(pu);
+
+                let mut qbuf = [0u8; 300];
+                let qlen = net14_build_dns_query(&mut qbuf, NET14_TXID, "example.com").unwrap_or(0);
+                let dst = IpEndpoint::new(IpAddress::v4(PIP[0], PIP[1], PIP[2], PIP[3]), 53);
+
+                let mut resolved: Option<[u8; 4]> = None;
+                let mut sent = false;
+                for _ in 0..60 {
+                    pump14(&mut kiface, &mut kdev, &mut ksock, &mut piface, &mut pdev, &mut psock, &mut clk, 1);
+                    let ks = ksock.get_mut::<udp::Socket>(kh);
+                    if !sent && ks.can_send() {
+                        let _ = ks.send_slice(&qbuf[..qlen], dst);
+                        sent = true;
+                    }
+                    if ks.can_recv() {
+                        let mut rb = [0u8; 768];
+                        if let Ok((n, _m)) = ks.recv_slice(&mut rb) {
+                            if let Net14Dns::Resolved(ip) = net14_parse_a(&rb[..n], NET14_TXID) {
+                                resolved = Some(ip);
+                            }
+                            break;
+                        }
+                    }
+                    // Peer: on receiving the query, answer with a well-formed A record to the querier.
+                    let ps = psock.get_mut::<udp::Socket>(ph);
+                    if ps.can_recv() {
+                        let mut qb = [0u8; 768];
+                        if let Ok((_n, meta)) = ps.recv_slice(&mut qb) {
+                            let resp = build_a_response(NET14_TXID, [93, 184, 216, 34], 0, 1);
+                            let _ = ps.send_slice(&resp, meta.endpoint);
+                        }
+                    }
+                }
+                let dns_rt = resolved == Some([93, 184, 216, 34]);
+                if dns_rt {
+                    w |= 0x10;
+                }
+                serial_println!(
+                    "{} [net14] loopback dns example.com => {} ::",
+                    PG, if dns_rt { "93.184.216.34 PASS" } else { "FAIL" }
+                );
+            }
+
+            // Scenario 0x20: HTTP GET over the loopback. Peer listens :80, answers 200; kernel fetches.
+            {
+                let plisten = {
+                    let rx: &'static mut [u8] = Box::leak(Box::new([0u8; PEER_CAP]));
+                    let tx: &'static mut [u8] = Box::leak(Box::new([0u8; PEER_CAP]));
+                    let mut s = tcp::Socket::new(tcp::SocketBuffer::new(rx), tcp::SocketBuffer::new(tx));
+                    let _ = s.listen(80u16);
+                    psock.add(s)
+                };
+                let kfetch = {
+                    let rx: &'static mut [u8] = Box::leak(Box::new([0u8; PEER_CAP]));
+                    let tx: &'static mut [u8] = Box::leak(Box::new([0u8; PEER_CAP]));
+                    let mut s = tcp::Socket::new(tcp::SocketBuffer::new(rx), tcp::SocketBuffer::new(tx));
+                    s.set_timeout(Some(Duration::from_millis(NET14_TCP_TIMEOUT_MS)));
+                    let _ = s.connect(
+                        kiface.context(),
+                        (IpAddress::v4(PIP[0], PIP[1], PIP[2], PIP[3]), 80),
+                        NET14_HTTP_SPORT,
+                    );
+                    ksock.add(s)
+                };
+                let mut got200 = false;
+                let mut sent = false;
+                let mut answered = false;
+                for _ in 0..100 {
+                    pump14(&mut kiface, &mut kdev, &mut ksock, &mut piface, &mut pdev, &mut psock, &mut clk, 1);
+                    // Kernel client: send GET once writable, capture status on recv.
+                    let ks = ksock.get_mut::<tcp::Socket>(kfetch);
+                    if ks.may_send() && !sent {
+                        let _ = ks.send_slice(b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n");
+                        sent = true;
+                    }
+                    if ks.can_recv() {
+                        let mut rb = [0u8; 256];
+                        let mut n = 0usize;
+                        let _ = ks.recv(|buf| {
+                            n = buf.len().min(rb.len());
+                            rb[..n].copy_from_slice(&buf[..n]);
+                            (buf.len(), ())
+                        });
+                        if net14_http_status(&rb[..n]) == Some(200) {
+                            got200 = true;
+                            break;
+                        }
+                    }
+                    // Peer server: once the request is in, answer a 200 and close.
+                    let ps = psock.get_mut::<tcp::Socket>(plisten);
+                    if ps.can_recv() && !answered {
+                        let mut junk = [0u8; 256];
+                        let _ = ps.recv_slice(&mut junk);
+                        let _ = ps.send_slice(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+                        );
+                        ps.close();
+                        answered = true;
+                    }
+                }
+                if got200 {
+                    w |= 0x20;
+                }
+                serial_println!(
+                    "{} [net14] loopback GET => {} ::",
+                    PG, if got200 { "HTTP/1.1 200 PASS" } else { "FAIL" }
+                );
+            }
+
+            // Scenario 0x40: connect to a CLOSED peer port (:81, no listener) => the peer RSTs the SYN.
+            {
+                let rx: &'static mut [u8] = Box::leak(Box::new([0u8; PEER_CAP]));
+                let tx: &'static mut [u8] = Box::leak(Box::new([0u8; PEER_CAP]));
+                let mut s = tcp::Socket::new(tcp::SocketBuffer::new(rx), tcp::SocketBuffer::new(tx));
+                s.set_timeout(Some(Duration::from_millis(NET14_TCP_TIMEOUT_MS)));
+                let _ = s.connect(
+                    kiface.context(),
+                    (IpAddress::v4(PIP[0], PIP[1], PIP[2], PIP[3]), 81),
+                    NET14_HTTP_SPORT + 2,
+                );
+                let h = ksock.add(s);
+                let mut refused = false;
+                let mut established = false;
+                for _ in 0..40 {
+                    pump14(&mut kiface, &mut kdev, &mut ksock, &mut piface, &mut pdev, &mut psock, &mut clk, 1);
+                    let s = ksock.get_mut::<tcp::Socket>(h);
+                    if s.may_send() {
+                        established = true;
+                    }
+                    if !established && !s.is_active() {
+                        refused = true; // RST closed the SYN_SENT socket before it ever became writable
+                        break;
+                    }
+                }
+                if refused {
+                    w |= 0x40;
+                }
+                serial_println!(
+                    "{} [net14] connect closed-port => {} ::",
+                    PG, if refused { "RST/refused PASS" } else { "FAIL" }
+                );
+            }
+
+            // Scenario 0x80: connect to a BLACK HOLE (10.0.0.9 — no host on the segment). ARP goes
+            // unanswered, the SYN never lands, and the transport timeout aborts the socket => timeout.
+            {
+                let rx: &'static mut [u8] = Box::leak(Box::new([0u8; PEER_CAP]));
+                let tx: &'static mut [u8] = Box::leak(Box::new([0u8; PEER_CAP]));
+                let mut s = tcp::Socket::new(tcp::SocketBuffer::new(rx), tcp::SocketBuffer::new(tx));
+                s.set_timeout(Some(Duration::from_millis(NET14_TCP_TIMEOUT_MS)));
+                let _ = s.connect(
+                    kiface.context(),
+                    (IpAddress::v4(10, 0, 0, 9), 80),
+                    NET14_HTTP_SPORT + 3,
+                );
+                let h = ksock.add(s);
+                let mut established = false;
+                let mut timed_out = false;
+                // Pump well past the transport timeout (STEP_MS * iters >> NET14_TCP_TIMEOUT_MS).
+                for _ in 0..200 {
+                    pump14(&mut kiface, &mut kdev, &mut ksock, &mut piface, &mut pdev, &mut psock, &mut clk, 1);
+                    let s = ksock.get_mut::<tcp::Socket>(h);
+                    if s.may_send() {
+                        established = true;
+                        break; // should NEVER happen — there is no host at .9
+                    }
+                    if !s.is_active() {
+                        timed_out = true;
+                        break;
+                    }
+                }
+                if timed_out && !established {
+                    w |= 0x80;
+                }
+                serial_println!(
+                    "{} [net14] connect black-hole => {} ::",
+                    PG, if timed_out && !established { "timeout PASS" } else { "FAIL" }
+                );
+            }
+
+            let pass = w == 0xff;
+            serial_println!(
+                ":: NET14-GATE: dns/http client battery {} [w=0x{:x}] (parse-ok|parse-malformed|parse-loop|parse-rcode|dns-rt|http-200|refused|timeout) ::",
                 if pass { "PASS" } else { "FAIL" }, w
             );
         }

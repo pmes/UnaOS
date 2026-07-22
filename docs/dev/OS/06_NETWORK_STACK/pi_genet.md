@@ -180,6 +180,54 @@ Arm with `UNAOS_NETTEST=1 UNAOS_PI=1 ./arroyo kernel8-test` (implies `genet`). D
 OFF ⇒ the loopback module + its call vanish; the kernel8 image is byte-identical to a
 plain build. `nettest` is hardware-free, so it also runs under `test-arm` if armed.
 
+### `net14` — the outbound client, "UnaOS asks" (PI-NET-14)
+
+Everything above **answers** the network; PI-NET-14 **initiates**. After the serving
+pool + mDNS responder arm (and are witnessed), `arm_net_service` runs `net14_ask` **once
+on the BSP, before the `net9` poll task is spawned** on a secondary — so there is no
+concurrency against the pool, and it uses **its own temporary, stack-buffered sockets**
+(local `SocketSet`s freed on return). The pool is never touched: the first `[net12]`
+census the poll task reports is a clean `listen=4`.
+
+* **DNS client** — a UDP :53 A-query to the lease's DNS server, resolved with retransmit
+  over a bounded real-time window. The DNS server is currently the **gateway** (the
+  lease's DNS-server option lives in smoltcp's `dhcpv4::Config` but `NetConfig` in the
+  shared `net_phy.rs` does not surface it yet — a cross-lane fold; the gateway is the
+  resolver on a typical home router, and is the brief's stated fallback).
+* **Hostile-input hardening** — the response parser (`net14_parse_a` / `net14_skip_name`)
+  treats every byte as adversarial: the header length + transaction id are checked, the
+  QR bit must say "response", a non-zero RCODE surfaces as a typed `ServerErr`, the
+  question/answer sections are walked with all fixed fields bounds-checked, the answer
+  walk is capped, and — the key guard — **compression pointers are never dereferenced**.
+  A pointer is two bytes and terminates a name, so returning `off+2` is both correct for
+  skipping and **immune to the compression-loop DoS by construction** (no visited-set
+  needed); the label walk additionally carries a 127-hop cap. Any violation returns a
+  typed error, never a panic or an unbounded loop.
+* **HTTP client** — a TCP connect out to the resolved address on :80, a `GET / HTTP/1.1`
+  with `Host` + `Connection: close`, capturing the status code, byte count, and a
+  sanitised body excerpt. A short `set_timeout` distinguishes a black-holed SYN
+  (`connect timeout`) from a peer RST (`connect refused`).
+* **Failure honesty** — every leg has a one-line witness so a metal boot localises the
+  failure: `dns … => timeout (no upstream?)`, `malformed response (rejected)`,
+  `server rcode N`, `no A record`, `connect refused (RST)`, `connect timeout`,
+  `connected, no response`, or a `(non-200)` note on the GET line. On a bench segment
+  with no upstream reachability, a clean `dns timeout` **is** an acceptable metal
+  outcome — the QEMU gate is the correctness proof.
+* **Client gate** (`nettest::run14`, same loopback seam, kernel = client / peer = server):
+  `:: NET14-GATE: dns/http client battery PASS [w=0xff] (parse-ok|parse-malformed|parse-loop|parse-rcode|dns-rt|http-200|refused|timeout) ::`
+  * `0x01`/`0x02`/`0x04`/`0x08` — pure parser checks (no sockets): well-formed A
+    resolves; a truncated response is rejected; a non-terminating name bails on the hop
+    cap; an NXDOMAIN RCODE surfaces as `ServerErr`.
+  * `0x10` a live loopback DNS query/response resolves `example.com`.
+  * `0x20` a live loopback HTTP `GET` returns `HTTP/1.1 200`.
+  * `0x40` connect to a closed peer port is RST/refused; `0x80` connect to a black-hole
+    address (no host on the segment) hits the transport timeout.
+
+Expected metal witnesses (target host `example.com`):
+`:: PI-GENET: [net14] dns example.com -> <ip> ::`,
+`:: PI-GENET: [net14] GET http://example.com/ -> HTTP/1.1 200 (<n> bytes) ::`,
+`:: PI-GENET: [net14] body: <excerpt> ::`.
+
 ### DHCP shape
 
 The DHCP window is **15 seconds** (GENET-6, `31f0d269`). The original 5 s window
@@ -202,6 +250,8 @@ from the DTB `local-mac-address` property of the GENET node.
 | PHY LED selectors fix stuck amber | GENET-8 `565bf8c7` | P18 | LED OUT at power-on — METAL-CONFIRMED |
 | First TCP service (HTTP :80 over net9) | NET-9/10 `15c6626e` / `4055900c` | P19 | **"UnaOS answers"** — Mac browser loaded `http://192.168.2.3/` off the Pi; screenshot in hand |
 | TCP/HTTP/mDNS regression gate runs off-metal | NET-13 `nettest` | QEMU raspi4b + test-arm | `:: NET-GATE: ... PASS [w=0xf] ::` — basic 200, flood→SATURATED→reaped +4→recovery 200, FIN recycle, table-full RST, mDNS answered |
+| Outbound DNS + HTTP client gate runs off-metal | NET-14 `nettest` | QEMU raspi4b + test-arm | `:: NET14-GATE: ... PASS [w=0xff] ::` — parser accepts well-formed / rejects truncated + non-terminating name + surfaces RCODE, live loopback DNS resolve, HTTP 200, connect refused (RST), connect timeout |
+| "UnaOS asks" — outbound resolve + fetch | NET-14 | *(pending metal)* | `[net14] dns example.com -> <ip>` + `GET http://example.com/ -> HTTP/1.1 200 (<n> bytes)` + body excerpt; or an honest per-leg failure witness |
 
 QEMU `raspi4b` (bcm2838) does **not** model GENET; the DTB census makes bring-up a
 clean pre-MMIO skip (`kernel8-test` stays green). Every *metal* finding above is
