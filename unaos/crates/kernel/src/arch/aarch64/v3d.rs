@@ -1306,6 +1306,14 @@ const P_GL_SHADER_STATE: u8 = 64; // points at the GL Shader State Record + attr
 const P_VCM_CACHE_SIZE: u8 = 71;
 const P_NUMBER_OF_LAYERS: u8 = 119;
 const P_TILE_BINNING_MODE_CFG: u8 = 120; // v42 variant (max_ver=42)
+// PI-V3D-17 — clip/viewport/config state (v3d_packet.xml, gen 4.2). Codes transcribed VERBATIM:
+//   Cfg Bits code=96 (max_ver=42), clip_window code=107, Viewport Offset code=108,
+//   Clipper XY Scaling code=110 (max_ver=42), Clipper Z Scale and Offset code=111.
+const P_CFG_BITS: u8 = 96; // "Cfg Bits" (max_ver=42) — facing/cull + rasterizer config
+const P_CLIP_WINDOW: u8 = 107; // "clip_window" — scissor/clip rect in pixels
+const P_VIEWPORT_OFFSET: u8 = 108; // "Viewport Offset" — screen-space centre (coarse int + fine u14.8)
+const P_CLIPPER_XY_SCALING: u8 = 110; // "Clipper XY Scaling" (max_ver=42) — half w/h in 1/256 px, f32
+const P_CLIPPER_Z_SCALE_AND_OFFSET: u8 = 111; // "Clipper Z Scale and Offset" — z scale/offset, f32
 
 const V3D_PRIM_TRIANGLES: u64 = 4; // VERTEX_ARRAY_PRIMS "mode" (enum Primitive) — NOT the PRIM_LIST value
 const TILE_STATE_BYTES: usize = 48 * 4; // TSDA: 48 B/tile, generous for the single 64×64 tile
@@ -1582,6 +1590,74 @@ fn build_bin_cl(num_attrs: u32) -> usize {
     // Flush any stale VCD, then START_TILE_BINNING (must precede geometry).
     w.pkt(Pkt::new(P_FLUSH_VCD_CACHE, 1).done());
     w.pkt(Pkt::new(P_START_TILE_BINNING, 1).done());
+
+    // ── PI-V3D-17: clip/viewport/config state (V3D-16 verdict). Without these the hardware clipper
+    // runs at power-on-reset zeros — zero viewport scale collapses every primitive to a point and the
+    // binner writes an empty-but-legal bin (tile-alloc pool never touched). All opcodes/lengths/field
+    // bits are VERBATIM from Mesa v3d_packet.xml gen 4.2; the transform values follow Mesa's own
+    // v3dX(emit) (v3dx_emit.c / v3dvx_cmd_buffer.c) fixed-function viewport emit.
+    //
+    // CS-COORDS CONSISTENCY (the V3D-16 caveat): the line-1485 comment claims the coordinate shader
+    // does the viewport transform, but the ACTUAL CS body (CS_VS_WORDS) is a pure passthrough — it
+    // ldvpmv_in's the vec4 attribute and mov's it straight to VPM with NO arithmetic. So the CS emits
+    // clip-space NDC (== TRI_VERTS, [-1,1]) and the fixed-function transform below MUST do the
+    // clip→screen map. Hence the STANDARD (non-identity) values: half-extent 32 px, centre (32,32).
+    // ALTERNATIVE (do NOT use with the current shader): if the CS were changed to output screen coords
+    // itself, this transform would have to be identity (half-extent 1 px → scaling 256.0, centre 0) to
+    // avoid double-applying. That is the known follow-on if the pool stays zero on metal AND the CS is
+    // reworked to screen-space (v3d.rs ~1485) — out of scope for this arc.
+
+    // CFG_BITS (code 96, v42): enable BOTH forward- and reverse-facing primitives (no cull); every
+    // other bit 0 (no depth/stencil/blend). Fields: fwd-facing@0(1), rev-facing@1(1). Length 4
+    // (opcode + 3 payload; max field bit 21 → 3 bytes).
+    w.pkt(
+        Pkt::new(P_CFG_BITS, 4)
+            .f(0, 1, 1) // Enable Forward Facing Primitive
+            .f(1, 1, 1) // Enable Reverse Facing Primitive
+            .done(),
+    );
+    // CLIP_WINDOW (code 107): left=0, bottom=0, width=TARGET_W, height=TARGET_H. Fields:
+    // left@0(16), bottom@16(16), width@32(16), height@48(16). Length 9 (opcode + 8 payload).
+    w.pkt(
+        Pkt::new(P_CLIP_WINDOW, 9)
+            .f(0, 16, 0) // Clip Window Left Pixel Coordinate
+            .f(16, 16, 0) // Clip Window Bottom Pixel Coordinate
+            .f(32, 16, TARGET_W as u64) // Clip Window Width in pixels
+            .f(48, 16, TARGET_H as u64) // Clip Window Height in pixels
+            .done(),
+    );
+    // VIEWPORT_OFFSET (code 108): screen-space centre (32,32). Per v3dx_emit.c the fine coords hold
+    // viewport.translate (the centre, in pixels) and coarse=0 for non-negative centres. Fine X/Y are
+    // type u14.8 (value × 256): 32.0 px → 8192. Fields: fine_x@0(22,u14.8), coarse_x@22(10,int),
+    // fine_y@32(22,u14.8), coarse_y@54(10,int). Length 9 (opcode + 8 payload; max field bit 63).
+    const VP_FINE_CENTRE: u64 = (TARGET_W as u64 / 2) * 256; // 32 px × 256 = 8192 (u14.8)
+    w.pkt(
+        Pkt::new(P_VIEWPORT_OFFSET, 9)
+            .f(0, 22, VP_FINE_CENTRE) // Fine X (u14.8): centre 32.0 px
+            .f(22, 10, 0) // Coarse X (int): 0
+            .f(32, 22, VP_FINE_CENTRE) // Fine Y (u14.8): centre 32.0 px
+            .f(54, 10, 0) // Coarse Y (int): 0
+            .done(),
+    );
+    // CLIPPER_XY_SCALING (code 110, v42): viewport half-extent in 1/256th px, as f32. Per
+    // v3dx_emit.c the field is viewport.scale × 256.0f; half-width of a 64 px viewport = 32 px →
+    // 32 × 256 = 8192.0f32. Fields: half-width@0(32,float), half-height@32(32,float). Length 9.
+    let half_scale = (((TARGET_W as f32) / 2.0) * 256.0).to_bits() as u64; // 8192.0f32
+    w.pkt(
+        Pkt::new(P_CLIPPER_XY_SCALING, 9)
+            .f(0, 32, half_scale) // Viewport Half-Width in 1/256th of pixel
+            .f(32, 32, half_scale) // Viewport Half-Height in 1/256th of pixel
+            .done(),
+    );
+    // CLIPPER_Z_SCALE_AND_OFFSET (code 111): map NDC z [-1,1] → depth [0,1]. Per v3dx_emit.c the
+    // fields are viewport.scale[2] (=0.5) and viewport.translate[2] (=0.5). Fields:
+    // z_scale@0(32,float), z_offset@32(32,float). Length 9.
+    w.pkt(
+        Pkt::new(P_CLIPPER_Z_SCALE_AND_OFFSET, 9)
+            .f(0, 32, (0.5f32).to_bits() as u64) // Viewport Z Scale (Zc to Zs)
+            .f(32, 32, (0.5f32).to_bits() as u64) // Viewport Z Offset (Zc to Zs)
+            .done(),
+    );
 
     // Draw state: VCM cache size (1 batch each for bin+render), the shader-state pointer, then the prim.
     w.pkt(
@@ -2210,6 +2286,20 @@ fn bin_pool_witness(tag: &str) -> bool {
         ":: V3D: {} tile-alloc pool[0..8] = {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} — {} ::",
         tag, head[0], head[1], head[2], head[3], head[4], head[5], head[6], head[7],
         if wrote { "nonzero: the binner WROTE the pool" } else { "all zero: the binner never wrote the pool" }
+    );
+    // PI-V3D-17 (V3D-16 ask): dump the tile-STATE array head (CT0QTS) alongside the pool. The PTB
+    // writes per-tile state (TSDA) here as it bins; nonzero here corroborates the pool witness.
+    cache::clean_invalidate_range(arena_phys() + OFF_TILESTATE, 8);
+    let mut ts = [0u8; 8];
+    unsafe {
+        for (i, t) in ts.iter_mut().enumerate() {
+            *t = (*arena).bytes[OFF_TILESTATE + i];
+        }
+    }
+    serial_println!(
+        ":: V3D: {} tile-STATE[0..8] = {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} — {} ::",
+        tag, ts[0], ts[1], ts[2], ts[3], ts[4], ts[5], ts[6], ts[7],
+        if ts.iter().any(|&b| b != 0) { "nonzero: the PTB wrote tile-state" } else { "all zero: no tile-state written" }
     );
     wrote
 }
