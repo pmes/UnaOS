@@ -1366,9 +1366,47 @@ mod metal {
         GENET_DEVICE.lock().as_mut().and_then(|n| n.rx_frame_raw(out))
     }
     fn raw_tx(frame: &[u8]) {
+        // PI-NET-9: count the replies smoltcp emits (ARP reply / ICMP echo reply) as they cross the
+        // wire seam — every outbound frame passes here. Echo *requests* (type 8, our bind_smoltcp ping)
+        // and DHCP are NOT counted; only the answers the persistent poll produces bump these.
+        net9_classify_tx(frame);
         if let Some(n) = GENET_DEVICE.lock().as_mut() {
             n.transmit(frame);
         }
+    }
+
+    // ── PI-NET-9: reply-emission counters (the [net9] witness) ──────────────────────────────────────
+    static NET9_ARP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    static NET9_ICMP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+    /// Classify one outbound L2 frame: bump NET9_ARP for an ARP reply (ethertype 0x0806, opcode 2) and
+    /// NET9_ICMP for an ICMPv4 echo reply (ethertype 0x0800, proto 1, type 0). These are exactly the
+    /// frames smoltcp's `iface.poll` emits in answer to the gateway's who-has / echo-request, so the
+    /// counters are an emission proof that the Pi ANSWERED, not a poll-loop guess.
+    fn net9_classify_tx(frame: &[u8]) {
+        use core::sync::atomic::Ordering::Relaxed;
+        if frame.len() < 14 {
+            return;
+        }
+        let et = u16::from_be_bytes([frame[12], frame[13]]);
+        if et == 0x0806 {
+            if frame.len() >= 22 && frame[20] == 0 && frame[21] == 2 {
+                NET9_ARP.fetch_add(1, Relaxed);
+            }
+        } else if et == 0x0800 && frame.len() >= 14 + 20 {
+            let ihl = ((frame[14] & 0x0f) as usize) * 4;
+            let l4 = 14 + ihl;
+            // proto 1 = ICMP; the ICMP type byte is the first of the L4 header; type 0 = echo reply.
+            if frame[23] == 1 && frame.len() > l4 && frame[l4] == 0 {
+                NET9_ICMP.fetch_add(1, Relaxed);
+            }
+        }
+    }
+
+    /// Snapshot the PI-NET-9 reply counters `(arp_reply, icmp_echo_reply)`. Cumulative since boot.
+    fn net9_counts() -> (u32, u32) {
+        use core::sync::atomic::Ordering::Relaxed;
+        (NET9_ARP.load(Relaxed), NET9_ICMP.load(Relaxed))
     }
     fn link_up() -> bool {
         GENET_DEVICE.lock().as_ref().map(|n| n.link_up()).unwrap_or(false)
@@ -1409,6 +1447,86 @@ mod metal {
     const PING_INTERVAL_MS: i64 = 1_000;
     /// Link-DOWN window (real ms): pre-cable there is nothing to answer — bound the no-op pump tightly.
     const PING_WINDOW_DOWN_MS: i64 = 250;
+
+    // ── PI-NET-9: the PERSISTENT net service ────────────────────────────────────────────────────────
+    //
+    // bind_smoltcp's DHCP+ping window is bounded — it returns, and the interface stops being polled, so
+    // nothing can ever answer the gateway's later ARP who-has / ICMP echo requests. This gives the
+    // DHCP-configured `Interface` + `Device` a home BEYOND that window (a static, single-core-owned like
+    // GENET_DEVICE) and a scheduled kernel task that polls it on a tick cadence. smoltcp's `iface.poll`
+    // answers ARP and ICMP echo BY ITSELF when polled — no protocol code here; the empty SocketSet is
+    // just the poll signature's third argument.
+    struct NetService {
+        iface: Interface,
+        dev: SmoltcpPhy<GenetNic>,
+        sockets: SocketSet<'static>,
+    }
+    // Single-core service, touched only behind this mutex on the BSP/AP that owns it — same discipline
+    // (and the same raw-DMA reachability through GENET_DEVICE) as `Genet`.
+    unsafe impl Send for NetService {}
+    static NET_SERVICE: spin::Mutex<Option<NetService>> = spin::Mutex::new(None);
+
+    /// Poll cadence: 1 per-core tick ≈ 4 ms at the 250 Hz aarch64 generic-timer tick.
+    const NET9_POLL_TICKS: u64 = 1;
+    const NET9_POLL_MS: u64 = 4;
+    /// Rate-limit floor for the `[net9]` witness: at most once per ~5 s, unless ≥16 new replies landed.
+    const NET9_REPORT_MS: i64 = 5_000;
+    const NET9_REPORT_DELTA: u32 = 16;
+
+    /// The forever net-service task (scheduled on a secondary core). Each wake polls the persistent
+    /// interface so smoltcp answers ARP + ICMP echo, then prints a rate-limited `[net9]` line ONLY when
+    /// the reply counts changed (default-quiet: no serial storm on a steady ping).
+    fn net_service_poll(_: usize) {
+        let (mut last_arp, mut last_icmp) = (0u32, 0u32);
+        let mut last_report_ms: i64 = 0;
+        loop {
+            crate::arch::sched::sleep_ticks(NET9_POLL_TICKS);
+            let t = now_ms();
+            if let Some(ns) = NET_SERVICE.lock().as_mut() {
+                ns.iface.poll(Instant::from_millis(t), &mut ns.dev, &mut ns.sockets);
+            }
+            let (arp, icmp) = net9_counts();
+            if arp == last_arp && icmp == last_icmp {
+                continue; // nothing answered since last poll — stay quiet
+            }
+            let delta = arp.wrapping_sub(last_arp) + icmp.wrapping_sub(last_icmp);
+            if t.saturating_sub(last_report_ms) >= NET9_REPORT_MS || delta >= NET9_REPORT_DELTA {
+                serial_println!("{} [net9] answered arp={} icmp={} ::", PG, arp, icmp);
+                last_arp = arp;
+                last_icmp = icmp;
+                last_report_ms = t;
+            }
+        }
+    }
+
+    /// Hand the DHCP-configured `iface`/`dev` to the persistent [`NetService`] and register the poll task
+    /// on a secondary core. Called at the tail of `bind_smoltcp` (a NIC is guaranteed present). The empty
+    /// SocketSet uses leaked static storage (smoltcp's owned-Vec path is off in our no_std feature set).
+    fn arm_net_service(iface: Interface, dev: SmoltcpPhy<GenetNic>) {
+        let storage: &'static mut [SocketStorage; 1] =
+            alloc::boxed::Box::leak(alloc::boxed::Box::new(Default::default()));
+        let sockets = SocketSet::new(&mut storage[..]);
+        *NET_SERVICE.lock() = Some(NetService { iface, dev, sockets });
+
+        // Host the task on a secondary core (never the BSP), like input/render/orphan-reaper. If no AP
+        // came up, the service cannot be scheduled — report the degraded state rather than wedge the BSP.
+        let online = crate::arch::smp::online_secondaries();
+        match online.first() {
+            Some(&cpu) => {
+                crate::arch::sched::spawn("net9", net_service_poll, 0, cpu);
+                serial_println!(
+                    "{} net service task registered (poll every {} ms, core {}) ::",
+                    PG, NET9_POLL_MS, cpu
+                );
+            }
+            None => {
+                serial_println!(
+                    "{} net service NOT registered — no secondary core online (interface will not be polled) ::",
+                    PG
+                );
+            }
+        }
+    }
 
     /// Bind a smoltcp `Interface` over the GENET Device, run DHCP, and drive a bounded ICMP echo to the
     /// gateway — the x86 e1000/smolnet + NET-4/VNET seam, on the Pi. On a live link (real Pi metal, or
@@ -1510,5 +1628,10 @@ mod metal {
             if up { "UP" } else { "DOWN" },
             if pass { "PASS" } else { "SKIP (no reply — pre-cable / no DHCP is the honest pre-metal state)" }
         );
+
+        // PI-NET-9: the verdict above is the regression gate and has now printed. Hand the same
+        // DHCP-configured `iface` + `dev` to the persistent service so the interface keeps being polled
+        // and the Pi ANSWERS the gateway's ARP who-has / ICMP echo requests that arrive seconds later.
+        arm_net_service(iface, dev);
     }
 }
