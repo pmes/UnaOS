@@ -305,6 +305,22 @@ stay byte-identical; `NET16_SYNCS` still bumps on each set. So `time` (shell), a
 log timestamps and fs mtimes, read the same clock the SNTP client anchors. (Log-timestamp and
 fs-mtime adoption remain separate follow-up arcs; this fold does not rewire `fat_stamp()`.)
 
+**Parser fold — LANDED (NET-SNTP-FOLD).** The RFC 4330 wire logic PI-NET-16 authored — the
+reply parser, the request builder, `ntp_to_unix`, the `Sntp` outcome enum, and the wire
+constants (NTP↔Unix epoch delta, era-1 offset, sanity band, request first byte, NTP port) —
+was extracted by SNTP-X86 into the shared, arch-neutral [`crate::net_sntp`](../../../../unaos/crates/kernel/src/net_sntp.rs)
+so the pi/genet client and the x86 smolnet client render one parser. This fold retires
+genet's duplicate: `net16_parse_sntp`/`net16_build_request` are now thin forwarders to
+`crate::net_sntp::parse`/`build_request`, the local `enum Sntp` is `use crate::net_sntp::Sntp`,
+`NTP_PORT` aliases the shared constant, and the `run16` gate fixture calls
+`crate::net_sntp::build_reply`. The two parsers were **byte-identical** at the fold (same field
+checks, same band bounds `1_700_000_000..=4_000_000_000`, same KoD/alarm/version handling), so
+no reconciliation was needed and `crate::net_sntp` was not modified. Every `[net16]`/`[net16t]`
+witness line and `NET16-GATE [w=0x3f]` pass unchanged. (Fold also repaired a CLOCK-1 orphan: the
+gate's live-set-clock scenario referenced the removed `WALL_CLOCK` static; it now calls
+`crate::clock::clear_anchor()`, the direct equivalent — that reference had silently broken the
+`nettest`+`genet` build since CLOCK-1.)
+
 **2036 rollover stance.** NTP's 32-bit seconds field rolls over 2036-02-07. The conversion
 is era-aware per RFC 4330 §3: a value with the high bit **set** is era 0 (1900-based,
 covering 1968..2036) and maps to Unix via `ntp - 2208988800`; with the high bit **clear**

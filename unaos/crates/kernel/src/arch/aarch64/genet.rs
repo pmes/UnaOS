@@ -3678,8 +3678,8 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
     const NET16_TXID: u16 = 0x4e36;
     const NET16_DNS_SPORT: u16 = 49523;
     const NET16_SNTP_SPORT: u16 = 49525;
-    /// The well-known NTP/SNTP port.
-    const NTP_PORT: u16 = 123;
+    /// The well-known NTP/SNTP port — the shared wire constant (NET-SNTP-FOLD).
+    const NTP_PORT: u16 = crate::net_sntp::NTP_PORT;
     /// Bounded real-time windows (CNTPCT ms). DNS mirrors NET-14 (resend across the window so an
     /// ARP-dropped first datagram is retried); the SNTP exchange is a single request with a resend cadence.
     const NET16_DNS_WINDOW_MS: i64 = 2_500;
@@ -3691,19 +3691,10 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
     const NET16_RESYNC_INTERVAL_MS: i64 = 6 * 3_600 * 1_000;
     const NET16_RESYNC_RETRY_MS: i64 = 5 * 60 * 1_000;
 
-    /// Seconds between the NTP epoch (1900-01-01) and the Unix epoch (1970-01-01).
-    const NTP_UNIX_DELTA: u64 = 2_208_988_800;
-    /// Era-1 offset (2^32 - NTP_UNIX_DELTA): added to an NTP seconds value whose high bit is CLEAR, which
-    /// per RFC 4330 §3 denotes a timestamp in the era beginning 2036-02-07 (see the 2036 rollover note).
-    const NTP_ERA1_OFFSET: u64 = 2_085_978_496;
-    /// Sanity band on the resolved Unix time: reject anything before 2023-11 or after ~2096. A server that
-    /// answers with a wildly-out-of-band timestamp (misconfigured, spoofed, or a stratum-0 KoD that slipped
-    /// the stratum check) is rejected rather than jamming the clock to a nonsense year.
-    const NET16_SANE_MIN_UNIX: u64 = 1_700_000_000; // ~2023-11-14
-    const NET16_SANE_MAX_UNIX: u64 = 4_000_000_000; // ~2096-10
-
-    /// The SNTP client request first byte: LI=0 (no warning), VN=4, Mode=3 (client). `(0<<6)|(4<<3)|3`.
-    const SNTP_REQ_B0: u8 = 0x23;
+    // NET-SNTP-FOLD: the RFC 4330 wire constants (NTP↔Unix epoch delta + era-1 offset, the sanity band,
+    // the client request first byte) formerly duplicated here now live once in `crate::net_sntp`
+    // (NTP_UNIX_DELTA / NTP_ERA1_OFFSET / SANE_MIN_UNIX / SANE_MAX_UNIX / SNTP_REQ_B0), alongside the
+    // era-aware `ntp_to_unix`. The parser and request builder below forward to that shared module.
 
     /// PI-NET-16 witness/diagnostic counters (the re-sync state machine bumps these; the gate asserts them).
     static NET16_SYNCS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -3743,74 +3734,21 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
         crate::clock::render_iso8601(unix_secs, out)
     }
 
-    /// Typed outcome of parsing an SNTP reply — every failure mode gets its own witness.
-    enum Sntp {
-        /// A usable time: UTC Unix seconds + the server's stratum.
-        Ok { unix_secs: u64, stratum: u8 },
-        /// Stratum 0 = Kiss-o'-Death (rate-limit / deny). RFC 4330 §8: back off, do NOT use.
-        KissOfDeath,
-        /// Structurally invalid, wrong mode/version, LI=alarm(3), zero/insane timestamp — rejected.
-        Malformed,
-    }
+    /// NET-SNTP-FOLD: the typed parse outcome now lives once in `crate::net_sntp`. Imported under the same
+    /// local name `Sntp` so every `Sntp::Ok`/`KissOfDeath`/`Malformed` call site is unchanged. (Distinct
+    /// from `crate::clock::ClockSource::Sntp`, which is always fully qualified.)
+    use crate::net_sntp::Sntp;
 
-    /// Convert a 32-bit NTP seconds field to UTC Unix seconds, era-aware (see the 2036 rollover note): a
-    /// value with the high bit SET is era 0 (1900-based, 1968..2036); with it clear, era 1 (2036-based).
-    fn ntp_to_unix(ntp_secs: u32) -> u64 {
-        let s = ntp_secs as u64;
-        if s >= NTP_UNIX_DELTA {
-            s - NTP_UNIX_DELTA
-        } else {
-            s + NTP_ERA1_OFFSET
-        }
-    }
-
-    /// Parse an SNTP server reply. HOSTILE-INPUT HARDENED: the length is checked before any field read; the
-    /// LI/VN/Mode byte is decoded and an alarm LI (3), a version outside 3..=4, or a non-server mode (!=4)
-    /// is rejected; stratum 0 surfaces as KoD and stratum > 15 is rejected (reserved); the transmit
-    /// timestamp is read from a bounds-checked window and a zero or out-of-sanity-band time is rejected. No
-    /// path can panic. `pkt` is the raw UDP payload.
+    /// Parse an SNTP server reply — forwards to the shared, hostile-input-hardened `crate::net_sntp::parse`
+    /// (the length/LI/VN/mode/stratum/timestamp/sanity-band checks, byte-identical to PI-NET-16's original).
     fn net16_parse_sntp(pkt: &[u8]) -> Sntp {
-        if pkt.len() < 48 {
-            return Sntp::Malformed; // an SNTP datagram is exactly 48 bytes (no extension/auth here)
-        }
-        let b0 = pkt[0];
-        let li = (b0 >> 6) & 0x3;
-        let vn = (b0 >> 3) & 0x7;
-        let mode = b0 & 0x7;
-        if li == 3 {
-            return Sntp::Malformed; // LI=3: server clock unsynchronized (alarm) — do not trust its time
-        }
-        if !(3..=4).contains(&vn) {
-            return Sntp::Malformed; // we speak SNTPv4; accept a v3 responder, reject anything else
-        }
-        if mode != 4 {
-            return Sntp::Malformed; // Mode 4 = server. A non-server reply is stale/spoofed
-        }
-        let stratum = pkt[1];
-        if stratum == 0 {
-            return Sntp::KissOfDeath; // stratum 0 = KoD packet
-        }
-        if stratum > 15 {
-            return Sntp::Malformed; // 16..=255 reserved / unsynchronized
-        }
-        // Transmit timestamp: seconds at [40..44], fraction at [44..48] (fraction unused — 1 s resolution
-        // is plenty for a civil clock, and avoids float math entirely).
-        let secs = u32::from_be_bytes([pkt[40], pkt[41], pkt[42], pkt[43]]);
-        if secs == 0 {
-            return Sntp::Malformed; // a zero transmit timestamp is not a real time
-        }
-        let unix = ntp_to_unix(secs);
-        if !(NET16_SANE_MIN_UNIX..=NET16_SANE_MAX_UNIX).contains(&unix) {
-            return Sntp::Malformed; // out of the plausible band — refuse to jam the clock to a nonsense year
-        }
-        Sntp::Ok { unix_secs: unix, stratum }
+        crate::net_sntp::parse(pkt)
     }
 
-    /// Build the 48-byte SNTP client request into `out[..48]` (LI=0/VN=4/Mode=3, all other fields zero,
-    /// per RFC 4330 §5 for a client-only request).
+    /// Build the 48-byte SNTP client request into `out[..48]` — forwards to `crate::net_sntp::build_request`
+    /// (LI=0/VN=4/Mode=3, all other fields zero, per RFC 4330 §5).
     fn net16_build_request(out: &mut [u8; 48]) {
-        *out = [0u8; 48];
-        out[0] = SNTP_REQ_B0;
+        crate::net_sntp::build_request(out);
     }
 
     /// PI-NET-16: resolve `pool.ntp.org` to a single A record via UDP :53 to `dns_ip`, bounded + retransmit
@@ -4834,16 +4772,10 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
         const BLACKHOLE: [u8; 4] = [10, 0, 0, 9];
 
         /// Build a 48-byte SNTP server reply carrying transmit-timestamp `unix_secs` (converted to the NTP
-        /// era-0 epoch), with the given `li`/`vn`/`mode`/`stratum`. The gate uses this to script both
-        /// well-formed and adversarial replies against `net16_parse_sntp`.
-        fn build_sntp_reply(unix_secs: u64, li: u8, vn: u8, mode: u8, stratum: u8) -> Vec<u8> {
-            let mut v: Vec<u8> = Vec::new();
-            v.resize(48, 0u8);
-            v[0] = ((li & 0x3) << 6) | ((vn & 0x7) << 3) | (mode & 0x7);
-            v[1] = stratum;
-            let ntp_secs = (unix_secs + NTP_UNIX_DELTA) as u32;
-            v[40..44].copy_from_slice(&ntp_secs.to_be_bytes());
-            v
+        /// era-0 epoch), with the given `li`/`vn`/`mode`/`stratum`. NET-SNTP-FOLD: forwards to the shared
+        /// `crate::net_sntp::build_reply` fixture; returns the stack array (call sites take it as a slice).
+        fn build_sntp_reply(unix_secs: u64, li: u8, vn: u8, mode: u8, stratum: u8) -> [u8; 48] {
+            crate::net_sntp::build_reply(unix_secs, li, vn, mode, stratum)
         }
 
         /// PI-NET-16: the SNTP client + wall-clock gate. Bitmask `w`:
@@ -4911,7 +4843,7 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
             //    answers on :123 with the injected timestamp. Asserts the wall-clock is anchored and the
             //    anchored ISO is exactly INJ_ISO. ──
             {
-                *WALL_CLOCK.lock() = None; // start unsynced so this scenario proves the set
+                crate::clock::clear_anchor(); // start unsynced so this scenario proves the set
                 let mut kdev = SmoltcpPhy::<KernelLoopNic>::new();
                 let mut kiface = build_iface(&mut kdev, KMAC, KIP, 0x4b31_3600); // "K16"
                 let kstorage: &'static mut [SocketStorage; HTTP_POOL + 2] =
