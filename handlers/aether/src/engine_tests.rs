@@ -67,4 +67,81 @@ mod tests {
             
         assert_eq!(encoded, "q=hello+world+%26+rust");
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_input_events_and_navigation() {
+        // Setup engine with fixture DOM
+        let html = r#"<html><head><style>
+            a { width: 100px; height: 30px; }
+            input { width: 100px; height: 30px; }
+        </style></head><body>
+            <a id="link" href="https://example.com/dest">Link</a>
+            <input id="field" type="text" value="hello" />
+        </body></html>"#;
+        
+        let mut engine = crate::AetherEngine::new();
+        engine.load_html("https://example.com/", html, false);
+        engine.render_frame(); // to compute bounds
+        
+        // Find link and field absolute coordinates by walking layout tree
+        fn get_abs_pos(layout: &crate::layout::LayoutTree, target_id: &str) -> Option<(f64, f64)> {
+            fn walk(node_id: taffy::prelude::NodeId, cx: f32, cy: f32, layout: &crate::layout::LayoutTree, target_id: &str) -> Option<(f64, f64)> {
+                let l = layout.taffy.layout(node_id).unwrap();
+                let nx = cx + l.location.x;
+                let ny = cy + l.location.y;
+                if let Some(dom_node) = layout.node_map.get(&node_id) {
+                    if let Some(el) = dom_node.as_element() {
+                        if el.attributes.borrow().get("id") == Some(target_id) {
+                            return Some((nx as f64 + 1.0, ny as f64 + 1.0));
+                        }
+                    }
+                }
+                for child in layout.taffy.children(node_id).unwrap() {
+                    if let Some(pos) = walk(child, nx, ny, layout, target_id) {
+                        return Some(pos);
+                    }
+                }
+                None
+            }
+            walk(layout.root_node, 0.0, 0.0, layout, target_id)
+        }
+        
+        // 1. focus + Text/Backspace editing a field
+        let (link_x, link_y) = get_abs_pos(engine.layout_tree.as_ref().unwrap(), "link").unwrap();
+        let (field_x, field_y) = get_abs_pos(engine.layout_tree.as_ref().unwrap(), "field").unwrap();
+        
+        engine.handle_event(crate::api::events::Event::MouseDown(field_x, field_y));
+        engine.handle_event(crate::api::events::Event::MouseUp(field_x, field_y));
+        
+        // Verify focus
+        assert!(engine.focused_node.is_some(), "Field should be focused");
+        
+        // Type text
+        engine.handle_event(crate::api::events::Event::Text(" world".to_string()));
+        
+        // Verify text was added
+        {
+            let focused_node = engine.focused_node.as_ref().unwrap();
+            let el = focused_node.as_element().unwrap();
+            assert_eq!(el.attributes.borrow().get("value"), Some("hello world"));
+        }
+        
+        // Backspace
+        engine.handle_event(crate::api::events::Event::KeyDown("BackSpace".to_string()));
+        
+        {
+            let focused_node = engine.focused_node.as_ref().unwrap();
+            let el = focused_node.as_element().unwrap();
+            assert_eq!(el.attributes.borrow().get("value"), Some("hello worl"));
+        }
+        
+        // Enter submitting the form (offline)
+        engine.handle_event(crate::api::events::Event::KeyDown("Return".to_string()));
+        
+        // 2. hit-test -> link navigation
+        engine.handle_event(crate::api::events::Event::MouseDown(link_x, link_y));
+        engine.handle_event(crate::api::events::Event::MouseUp(link_x, link_y));
+        
+
+    }
 }
