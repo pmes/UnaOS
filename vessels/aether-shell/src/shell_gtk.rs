@@ -61,10 +61,17 @@ fn build_ui(app: &Application) {
         let handle_clone = handle_url.clone();
         
         glib::MainContext::default().spawn_local(async move {
-            let _guard = handle_clone.enter();
-            if let Err(e) = engine_ref.borrow_mut().load_url(&url).await {
-                eprintln!("Load error: {}", e);
-            }
+            let html = {
+                let _guard = handle_clone.enter();
+                match aether::net::fetch_document(&url).await {
+                    Ok(content) => content,
+                    Err(e) => format!(
+                        "<html><head><title>Error</title></head><body style=\"background-color: #f8d7da; color: #721c24; padding: 20px; font-family: sans-serif;\"><h1>Navigation Error</h1><p>Failed to load {}: {}</p></body></html>",
+                        url, e
+                    ),
+                }
+            };
+            engine_ref.borrow_mut().load_html(&url, &html, true);
             da.queue_draw();
         });
     });
@@ -77,9 +84,18 @@ fn build_ui(app: &Application) {
         let da = da_back.clone();
         let handle_clone = handle_back.clone();
         glib::MainContext::default().spawn_local(async move {
-            let _guard = handle_clone.enter();
-            engine_ref.borrow_mut().go_back().await;
-            da.queue_draw();
+            let url = engine_ref.borrow_mut().get_back_url();
+            if let Some(u) = url {
+                let html = {
+                    let _guard = handle_clone.enter();
+                    match aether::net::fetch_document(&u).await {
+                        Ok(content) => content,
+                        Err(e) => format!("<html><body><h1>Error</h1><p>{}</p></body></html>", e),
+                    }
+                };
+                engine_ref.borrow_mut().load_html(&u, &html, false);
+                da.queue_draw();
+            }
         });
     });
 
@@ -91,9 +107,18 @@ fn build_ui(app: &Application) {
         let da = da_fwd.clone();
         let handle_clone = handle_fwd.clone();
         glib::MainContext::default().spawn_local(async move {
-            let _guard = handle_clone.enter();
-            engine_ref.borrow_mut().go_forward().await;
-            da.queue_draw();
+            let url = engine_ref.borrow_mut().get_forward_url();
+            if let Some(u) = url {
+                let html = {
+                    let _guard = handle_clone.enter();
+                    match aether::net::fetch_document(&u).await {
+                        Ok(content) => content,
+                        Err(e) => format!("<html><body><h1>Error</h1><p>{}</p></body></html>", e),
+                    }
+                };
+                engine_ref.borrow_mut().load_html(&u, &html, false);
+                da.queue_draw();
+            }
         });
     });
 
