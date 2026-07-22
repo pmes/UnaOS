@@ -137,6 +137,49 @@ configured IPv4) and close.
 > **probe only** — log-only, it cannot alter scheduling — but it flags that net-poll
 > co-tenancy with the render core is a placement item worth an eventual policy arc.
 
+### `net11` / `net12` — mDNS responder + the TCB pool (PI-NET-11 `142fe2ee`, PI-NET-12 `b26d2dbe`)
+
+PI-NET-11 adds a UDP socket bound to **5353** that answers `unaos.local` A queries
+(`mdns_step`), joining `224.0.0.251`. PI-NET-12 grows the single :80 listener into a
+**pool of 4** independent TCBs (the accept backlog) plus a **3 s idle-reaper**: a
+listener that leaves LISTEN but never completes a request is force-aborted (RST) and
+re-armed, fixing an accept wedge where a silent peer pinned a TCB forever. A `[net12]`
+census witness reports `(listen, active)` and flags `SATURATED` (listen==0) / reap edges.
+
+### QEMU regression gate (PI-NET-13, `nettest`)
+
+The GENET datapath **no-ops under QEMU raspi4b** (no GENET modelled — `genet_bringup`
+returns at the DTB skip), so every TCP/HTTP/mDNS behavior above was previously
+**metal-only**. PI-NET-13 makes them QEMU-testable **without hardware**:
+
+* **`NetService<D: Device>` is now generic** over the smoltcp `Device` (default type
+  parameter `SmoltcpPhy<GenetNic>`, so the metal path and the `NET_SERVICE` static are
+  byte-identical). The pool/reaper/http/mdns methods never touched the device — only
+  `iface.poll` does — so the **same** `http_step` / `mdns_step` / `http_census` /
+  `render_http_response` service code runs over any seam. The socket-pool construction
+  is factored into `build_net_sockets`, shared by `arm_net_service` and the gate.
+* **A loopback seam + scripted peer** (`mod nettest`, `#[cfg(feature = "nettest")]`):
+  two in-kernel frame FIFOs wire a `KernelLoopNic` to a `PeerLoopNic`; the real
+  `NetService` runs on one end, a plain smoltcp "peer" interface on the other. A
+  **manually-advanced clock** drives both stacks *and* the idle-reaper deadline, so the
+  PI-NET-12 wedge scenario is deterministic and NIC-free. It runs at the **top** of
+  `genet_bringup` (before the DTB skip) so raspi4b executes it.
+* **Witness** — a self-checking bitmask line, asserted by the battery:
+  `:: NET-GATE: tcp/http/mdns loopback battery PASS [w=0xf] (basic|flood-reap-recover|fin-recycle|table-full) ::`
+  * `0x1` full handshake + `GET` → `HTTP/1.0 200`
+  * `0x2` half-open flood → `SATURATED` (listen==0) → idle-reaper aborts 4 TCBs → recovery fetch 200
+  * `0x4` served connection's FIN close recycles the TCB back to LISTEN
+  * `0x8` a table-full 5th connection while saturated is RST/refused
+
+  **Deterministic-reaper note:** the reap scenario advances the clock in small steps
+  (not one jump) so the peer keeps answering keepalive probes — the transport
+  `set_timeout`/`set_keep_alive` never aborts, leaving the **app** idle-reaper as the
+  sole force-abort path (so `[net12] reaped` counts what PI-NET-12 actually fixed).
+
+Arm with `UNAOS_NETTEST=1 UNAOS_PI=1 ./arroyo kernel8-test` (implies `genet`). Default
+OFF ⇒ the loopback module + its call vanish; the kernel8 image is byte-identical to a
+plain build. `nettest` is hardware-free, so it also runs under `test-arm` if armed.
+
 ### DHCP shape
 
 The DHCP window is **15 seconds** (GENET-6, `31f0d269`). The original 5 s window
@@ -158,7 +201,10 @@ from the DTB `local-mac-address` property of the GENET node.
 | Lease survives / regresses clean | — | P17 | Lease regression PASS |
 | PHY LED selectors fix stuck amber | GENET-8 `565bf8c7` | P18 | LED OUT at power-on — METAL-CONFIRMED |
 | First TCP service (HTTP :80 over net9) | NET-9/10 `15c6626e` / `4055900c` | P19 | **"UnaOS answers"** — Mac browser loaded `http://192.168.2.3/` off the Pi; screenshot in hand |
+| TCP/HTTP/mDNS regression gate runs off-metal | NET-13 `nettest` | QEMU raspi4b + test-arm | `:: NET-GATE: ... PASS [w=0xf] ::` — basic 200, flood→SATURATED→reaped +4→recovery 200, FIN recycle, table-full RST, mDNS answered |
 
 QEMU `raspi4b` (bcm2838) does **not** model GENET; the DTB census makes bring-up a
-clean pre-MMIO skip (`kernel8-test` stays green). Every finding above is
-attended-metal-only.
+clean pre-MMIO skip (`kernel8-test` stays green). Every *metal* finding above is
+attended-metal-only — but PI-NET-13's `nettest` loopback gate now exercises the
+TCP/HTTP/mDNS *service logic* deterministically in QEMU (hardware-free), so those
+regressions fail the battery rather than waiting for a bench sitting.

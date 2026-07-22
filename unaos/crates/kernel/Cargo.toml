@@ -350,6 +350,16 @@ piusb = ["baremetal"]
 # scripts/pi-genet-bench.md.
 genet = ["dep:smoltcp"]
 
+# PI-NET-13: arm the QEMU TCP/HTTP/mDNS regression gate — a hardware-free in-kernel loopback seam + a
+# scripted smoltcp peer that drives the SAME pool/reaper/http/mdns service code the GENET path runs
+# (`NetService` is generic over the smoltcp `Device`). Because the GENET datapath no-ops under QEMU
+# raspi4b (no GENET modelled), this is the ONLY way those TCP behaviors are exercised off metal. Implies
+# `genet` (the module + `NetService` live there). The gate runs at the TOP of `genet_bringup` (before the
+# DTB skip, so raspi4b executes it) and prints a self-checking `:: NET-GATE: ... PASS [w=0x..] ::` witness.
+# Default OFF => the loopback module + its call vanish and the kernel8 image is byte-identical to a plain
+# `genet` build. Enable via `UNAOS_NETTEST=1 UNAOS_PI=1 ./arroyo kernel8-test`.
+nettest = ["genet"]
+
 # NS-SPAN (K7 WATCH rider): instrument the IRQ-masked namespace-lock hold at the three fused K6/K3/K5
 # persist sites (`sys_fgrant_revoke_2phase`, `native_persist_grants`, `native_persist_grow`) — read
 # CNTPCT at ns-take and ns-release, track the per-site WORST-CASE hold in ticks, and emit ONE serial line

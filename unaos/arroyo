@@ -257,6 +257,12 @@ _feats=""
 # aarch64. Default OFF => module + call site vanish, smoltcp not pulled, byte-identical. See
 # arch_arm64.md §PI-GENET and scripts/pi-genet-bench.md.
 [ -n "${UNAOS_GENET:-}" ] && _feats="${_feats}genet,"
+# PI-NET-13: UNAOS_NETTEST=1 arms the QEMU TCP/HTTP/mDNS regression gate — a hardware-free in-kernel
+# loopback seam + scripted smoltcp peer that drives the SAME pool/reaper/http/mdns service code the GENET
+# path runs (the GENET datapath no-ops under QEMU raspi4b, so this is the only off-metal coverage). Implies
+# `genet` (Cargo feature). Runs at the top of `genet_bringup` and prints `:: NET-GATE: ... PASS [w=0x..] ::`.
+# Pair with UNAOS_PI=1 on the kernel8-test battery: `UNAOS_NETTEST=1 UNAOS_PI=1 ./arroyo kernel8-test`.
+[ -n "${UNAOS_NETTEST:-}" ] && _feats="${_feats}nettest,genet,"
 if [ -n "$_feats" ]; then
     KERNEL_FEATURES="--features ${_feats%,}"
     echo -e "${COLOR_YELLOW}⚡ kernel features: ${_feats%,}${COLOR_RESET}"
@@ -870,6 +876,16 @@ kernel8() {
     if [ -n "${UNAOS_GENET:-}" ]; then
         K8_FEATS="${K8_FEATS},genet"
         echo -e "${COLOR_YELLOW}  • UNAOS_GENET: BCM2711 GENET v5 GbE + smoltcp bind (M1 probe classifies QEMU modelling; attended-metal for link/DHCP)${COLOR_RESET}"
+    fi
+    # PI-NET-13: UNAOS_NETTEST=1 adds the `nettest` (+`genet`) features — the hardware-free QEMU
+    # TCP/HTTP/mDNS regression gate. A pure in-kernel loopback seam + scripted smoltcp peer drive the SAME
+    # pool/reaper/http/mdns service code the GENET path runs (the GENET datapath no-ops on QEMU raspi4b, so
+    # this is the only off-metal coverage of the PI-NET-10/11/12 TCP behaviors). Runs at the top of
+    # `genet_bringup` and prints `:: NET-GATE: ... PASS [w=0x..] ::`. OFF => the loopback module + its call
+    # vanish and kernel8 is byte-identical to a plain build. Assert the NET-GATE PASS line on kernel8-test.
+    if [ -n "${UNAOS_NETTEST:-}" ]; then
+        K8_FEATS="${K8_FEATS},nettest,genet"
+        echo -e "${COLOR_YELLOW}  • UNAOS_NETTEST: QEMU TCP/HTTP/mDNS loopback gate (NET-GATE witness; hardware-free)${COLOR_RESET}"
     fi
     # INSTALL-PI: the UNAOS_PIINSTALL family — the installer engine's first LIVE end-to-end execution on the
     # Pi emmc2 microSD (install/pi.rs). Three-gate escalation; each knob adds the next feature (cargo also

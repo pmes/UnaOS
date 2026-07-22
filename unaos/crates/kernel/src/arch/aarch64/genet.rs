@@ -1226,6 +1226,14 @@ mod metal {
             PG, dtb_addr, dtb_size
         );
 
+        // PI-NET-13: the QEMU TCP/HTTP/mDNS regression gate. Hardware-free (a pure in-kernel loopback
+        // seam driving the SAME pool/reaper/http service code the GENET path runs), so it executes here
+        // BEFORE the DTB skip — i.e. it runs on QEMU raspi4b, which models no GENET. Armed only by the
+        // `nettest` feature (UNAOS_NETTEST=1), so a normal `genet` build never enters it. It prints a
+        // self-checking `:: NET-GATE: ... PASS/FAIL [w=0x..] ::` witness the arm/kernel8 battery asserts.
+        #[cfg(feature = "nettest")]
+        nettest::run();
+
         // ── M1: resolve the register base from the DTB. NO DTB node => QEMU / DTB-less boot: this build
         //    does NOT model GENET, and touching the register window would FAULT (external abort), not
         //    return poison. Skip BEFORE any MMIO — the piusb `dtb_has_pcie` discipline. This is the
@@ -1458,9 +1466,14 @@ mod metal {
     // GENET_DEVICE) and a scheduled kernel task that polls it on a tick cadence. smoltcp's `iface.poll`
     // answers ARP and ICMP echo BY ITSELF when polled — no protocol code here; the empty SocketSet is
     // just the poll signature's third argument.
-    struct NetService {
+    // PI-NET-13: `NetService` is generic over the smoltcp `Device` so the SAME pool/reaper/http/mdns
+    // service logic runs over ANY seam. The default type parameter is the GENET phy, so the metal path
+    // (`arm_net_service`, the `NET_SERVICE` static) is byte-identical — it instantiates
+    // `NetService<SmoltcpPhy<GenetNic>>` by inference, exactly as before. The QEMU loopback gate
+    // (`nettest`) instantiates `NetService<SmoltcpPhy<LoopNic>>` and drives the identical methods.
+    struct NetService<D: Device = SmoltcpPhy<GenetNic>> {
         iface: Interface,
-        dev: SmoltcpPhy<GenetNic>,
+        dev: D,
         sockets: SocketSet<'static>,
         /// PI-NET-10 / PI-NET-12: the pool of passively-listening HTTP socket handles in `sockets`.
         /// A POOL (not a single socket) gives real accept concurrency + a listen backlog: a browser
@@ -1481,7 +1494,9 @@ mod metal {
     }
     // Single-core service, touched only behind this mutex on the BSP/AP that owns it — same discipline
     // (and the same raw-DMA reachability through GENET_DEVICE) as `Genet`.
-    unsafe impl Send for NetService {}
+    unsafe impl<D: Device> Send for NetService<D> {}
+    // The default type parameter resolves `NetService` here to `NetService<SmoltcpPhy<GenetNic>>` — the
+    // exact concrete type the metal service used before PI-NET-13.
     static NET_SERVICE: spin::Mutex<Option<NetService>> = spin::Mutex::new(None);
 
     // ── PI-NET-10: the Pi's first TCP service — a listening socket that serves a status page ──────────
@@ -1758,7 +1773,7 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
         }
     }
 
-    impl NetService {
+    impl<D: Device> NetService<D> {
         /// PI-NET-10: one bounded HTTP service step on the listening socket, run after each `iface.poll`.
         /// Handles every socket state so the service survives repeated requests and rude clients:
         /// any non-open state re-arms `listen(:80)`; an open connection's request is drained (path
@@ -1978,21 +1993,19 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
         }
     }
 
-    /// Hand the DHCP-configured `iface`/`dev` to the persistent [`NetService`] and register the poll task
-    /// on a secondary core. Called at the tail of `bind_smoltcp` (a NIC is guaranteed present). The empty
-    /// SocketSet uses leaked static storage (smoltcp's owned-Vec path is off in our no_std feature set).
-    fn arm_net_service(mut iface: Interface, dev: SmoltcpPhy<GenetNic>) {
-        // PI-NET-12: storage holds the HTTP listener POOL plus the one mDNS UDP socket.
-        let storage: &'static mut [SocketStorage; HTTP_POOL + 1] =
-            alloc::boxed::Box::leak(alloc::boxed::Box::new(Default::default()));
-        let mut sockets = SocketSet::new(&mut storage[..]);
-
-        // PI-NET-10/12: the Pi's TCP status service — a POOL of passive sockets, each with its own static
-        // (leaked) ring buffers, all listening on :80. The pool is the accept backlog; per-socket timeout
-        // + keep-alive plus the app-level idle-reaper (http_step) keep any single TCB from wedging. `iface
-        // .poll` (driven by the net9 task) then serves the pool via `NetService::http_step`.
-        let mut http: [SocketHandle; HTTP_POOL] =
-            [SocketHandle::default(); HTTP_POOL];
+    /// PI-NET-13: build the HTTP listener POOL + the mDNS UDP socket into `sockets`, and join the mDNS
+    /// multicast group on `iface`. Returns `(http_handles, mdns_handle, listening_count, mdns_bound,
+    /// mcast_joined)`. Every socket ring buffer is `Box::leak`'d `'static` (the owned-Vec smoltcp path is
+    /// off in our no_std feature set), so the handles are valid for a `SocketSet<'static>`. Shared by the
+    /// metal `arm_net_service` and the QEMU loopback gate so BOTH exercise the identical pool shape.
+    fn build_net_sockets(
+        iface: &mut Interface,
+        sockets: &mut SocketSet<'static>,
+    ) -> ([SocketHandle; HTTP_POOL], SocketHandle, u32, bool, bool) {
+        // The Pi's TCP status service — a POOL of passive sockets, each with its own static (leaked) ring
+        // buffers, all listening on :80. The pool is the accept backlog; per-socket timeout + keep-alive
+        // plus the app-level idle-reaper (http_step) keep any single TCB from wedging.
+        let mut http: [SocketHandle; HTTP_POOL] = [SocketHandle::default(); HTTP_POOL];
         let mut listening = 0u32;
         for slot in http.iter_mut() {
             let tcp_rx: &'static mut [u8] =
@@ -2012,7 +2025,7 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
         }
 
         // PI-NET-11: the mDNS responder socket — UDP bound to 5353. Static (leaked) metadata + payload
-        // rings, same owned-storage discipline as the TCP socket above.
+        // rings, same owned-storage discipline as the TCP sockets above.
         let udp_rx_meta: &'static mut [udp::PacketMetadata; UDP_META_SLOTS] =
             alloc::boxed::Box::leak(alloc::boxed::Box::new([udp::PacketMetadata::EMPTY; UDP_META_SLOTS]));
         let udp_rx_payload: &'static mut [u8; UDP_RX_CAP] =
@@ -2029,10 +2042,27 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
         let mdns = sockets.add(mdns_sock);
 
         // Join the mDNS IPv4 multicast group so smoltcp's IP layer accepts 224.0.0.251 datagrams even if
-        // the GENET RX promisc filter ever drops (proto-igmp is off, so no membership report is emitted —
-        // the join updates the stack's own accept filter, which is what makes the query reach the socket).
+        // the RX promisc filter ever drops (proto-igmp is off, so no membership report is emitted — the
+        // join updates the stack's own accept filter, which is what makes the query reach the socket).
         let mcast = IpAddress::v4(MDNS_MCAST[0], MDNS_MCAST[1], MDNS_MCAST[2], MDNS_MCAST[3]);
         let joined = iface.join_multicast_group(mcast).is_ok();
+
+        (http, mdns, listening, bound, joined)
+    }
+
+    /// Hand the DHCP-configured `iface`/`dev` to the persistent [`NetService`] and register the poll task
+    /// on a secondary core. Called at the tail of `bind_smoltcp` (a NIC is guaranteed present). The empty
+    /// SocketSet uses leaked static storage (smoltcp's owned-Vec path is off in our no_std feature set).
+    fn arm_net_service(mut iface: Interface, dev: SmoltcpPhy<GenetNic>) {
+        // PI-NET-12: storage holds the HTTP listener POOL plus the one mDNS UDP socket.
+        let storage: &'static mut [SocketStorage; HTTP_POOL + 1] =
+            alloc::boxed::Box::leak(alloc::boxed::Box::new(Default::default()));
+        let mut sockets = SocketSet::new(&mut storage[..]);
+
+        // PI-NET-13: build the HTTP listener pool + mDNS socket + multicast join. Extracted into
+        // `build_net_sockets` so the QEMU loopback gate constructs the identical pool the metal service
+        // runs — same ring caps, same timeout/keep-alive, same :80 listen, same 224.0.0.251 join.
+        let (http, mdns, listening, bound, joined) = build_net_sockets(&mut iface, &mut sockets);
 
         // The configured IPv4 (leased or static fallback) — shown on the served status page + the mDNS
         // up-witness (mDNS answers only once configured; the address here is what a query would resolve).
@@ -2210,5 +2240,362 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
         // DHCP-configured `iface` + `dev` to the persistent service so the interface keeps being polled
         // and the Pi ANSWERS the gateway's ARP who-has / ICMP echo requests that arrive seconds later.
         arm_net_service(iface, dev);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════════════════════════
+    // PI-NET-13: the QEMU TCP/HTTP/mDNS regression gate — a hardware-free loopback seam + scripted peer.
+    // ══════════════════════════════════════════════════════════════════════════════════════════════════
+    //
+    // The GENET path no-ops under QEMU raspi4b (which models no GENET), so every TCP/HTTP/mDNS regression
+    // was metal-only. This module gives that service logic a DETERMINISTIC, hardware-free home: an
+    // in-kernel loopback `Device` (two frame queues wired kernel<->peer) carries frames between the REAL
+    // `NetService` (the identical pool/reaper/http/mdns methods, now generic over the smoltcp `Device`)
+    // and a scripted smoltcp "peer" interface that opens connections, sends GETs, floods half-opens, and
+    // reads responses. A manually-advanced clock drives BOTH stacks AND the idle-reaper's deadline, so the
+    // exact PI-NET-12 accept-wedge scenario (saturate -> reap -> recover) is reproducible without a NIC.
+    //
+    // Armed only by the `nettest` feature (UNAOS_NETTEST=1). It runs at the TOP of `genet_bringup`, before
+    // the DTB skip, so QEMU raspi4b executes it. The verdict is a self-checking `:: NET-GATE: ... PASS
+    // [w=0x..] ::` bitmask line the arm/kernel8 battery asserts.
+    #[cfg(feature = "nettest")]
+    mod nettest {
+        use super::*;
+        use alloc::boxed::Box;
+        use alloc::collections::VecDeque;
+        use alloc::vec::Vec;
+        use smoltcp::iface::{Config, Context};
+        use smoltcp::wire::IpCidr;
+
+        /// The kernel service's IPv4 on the loopback segment (the peer connects here).
+        const KIP: [u8; 4] = [10, 0, 0, 1];
+        /// The scripted peer's IPv4.
+        const PIP: [u8; 4] = [10, 0, 0, 2];
+        const KMAC: [u8; 6] = [0x02, 0, 0, 0, 0, 0x01];
+        const PMAC: [u8; 6] = [0x02, 0, 0, 0, 0, 0x02];
+        /// Wall-clock ms each pump iteration advances the shared clock. Small enough that a handshake
+        /// completes in a few iters, large enough that a bounded pump covers seconds cheaply.
+        const STEP_MS: i64 = 20;
+        /// Per-peer-socket ring buffers (a request line + the status page both fit comfortably).
+        const PEER_CAP: usize = 2048;
+
+        // ── The loopback channel: two frame FIFOs. `K_RX` = frames destined for the KERNEL (peer TX);
+        //    `P_RX` = frames destined for the PEER (kernel TX). `VecDeque::new` is not `const`, so they
+        //    are `Option`-wrapped and initialised at `run()` entry. A hard cap drops frames rather than
+        //    growing unbounded if some pathology loops (a test must never OOM the boot). ──
+        static K_RX: spin::Mutex<Option<VecDeque<Vec<u8>>>> = spin::Mutex::new(None);
+        static P_RX: spin::Mutex<Option<VecDeque<Vec<u8>>>> = spin::Mutex::new(None);
+        const QUEUE_CAP: usize = 256;
+
+        fn push(q: &spin::Mutex<Option<VecDeque<Vec<u8>>>>, frame: &[u8]) {
+            if let Some(dq) = q.lock().as_mut() {
+                if dq.len() < QUEUE_CAP {
+                    dq.push_back(frame.to_vec());
+                }
+            }
+        }
+        fn pop(q: &spin::Mutex<Option<VecDeque<Vec<u8>>>>, out: &mut [u8]) -> Option<usize> {
+            let frame = q.lock().as_mut()?.pop_front()?;
+            let n = frame.len().min(out.len());
+            out[..n].copy_from_slice(&frame[..n]);
+            Some(n)
+        }
+
+        /// The kernel side of the loopback: RX drains `K_RX` (peer -> kernel); TX fills `P_RX`.
+        struct KernelLoopNic;
+        impl RawNic for KernelLoopNic {
+            fn rx_frame_raw(out: &mut [u8]) -> Option<usize> {
+                pop(&K_RX, out)
+            }
+            fn transmit(frame: &[u8]) {
+                push(&P_RX, frame);
+            }
+            fn mac() -> Option<[u8; 6]> {
+                Some(KMAC)
+            }
+        }
+        /// The peer side: mirror image — RX drains `P_RX`; TX fills `K_RX`.
+        struct PeerLoopNic;
+        impl RawNic for PeerLoopNic {
+            fn rx_frame_raw(out: &mut [u8]) -> Option<usize> {
+                pop(&P_RX, out)
+            }
+            fn transmit(frame: &[u8]) {
+                push(&K_RX, frame);
+            }
+            fn mac() -> Option<[u8; 6]> {
+                Some(PMAC)
+            }
+        }
+
+        /// Build a smoltcp `Interface` with a static /24 address on the loopback segment.
+        fn build_iface<D: Device>(dev: &mut D, mac: [u8; 6], ip: [u8; 4], seed: u64) -> Interface {
+            let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
+            config.random_seed = seed;
+            let mut iface = Interface::new(config, dev, Instant::from_millis(0));
+            iface.update_ip_addrs(|addrs| {
+                addrs.clear();
+                let _ = addrs.push(IpCidr::new(IpAddress::v4(ip[0], ip[1], ip[2], ip[3]), 24));
+            });
+            iface
+        }
+
+        /// One shared pump step across BOTH stacks and the service logic, at the current clock. Kernel
+        /// polls first (drains its RX, runs the pool/reaper/http/mdns service, emits replies), then the
+        /// peer polls (drains those replies, emits its next frames). Advances `clk` by `STEP_MS`.
+        fn pump(
+            ks: &mut NetService<SmoltcpPhy<KernelLoopNic>>,
+            pface: &mut Interface,
+            pdev: &mut SmoltcpPhy<PeerLoopNic>,
+            psock: &mut SocketSet<'static>,
+            clk: &mut i64,
+            iters: usize,
+        ) {
+            for _ in 0..iters {
+                let t = Instant::from_millis(*clk);
+                ks.iface.poll(t, &mut ks.dev, &mut ks.sockets);
+                ks.http_step(*clk);
+                ks.mdns_step();
+                pface.poll(t, pdev, psock);
+                *clk += STEP_MS;
+            }
+        }
+
+        /// Open a fresh peer TCP socket (leaked `'static` rings) and actively connect it to the kernel
+        /// service's `:80` from `local_port`. Returns its handle.
+        fn open_peer(psock: &mut SocketSet<'static>, cx: &mut Context, local_port: u16) -> SocketHandle {
+            let rx: &'static mut [u8] = Box::leak(Box::new([0u8; PEER_CAP]));
+            let tx: &'static mut [u8] = Box::leak(Box::new([0u8; PEER_CAP]));
+            let mut s = tcp::Socket::new(tcp::SocketBuffer::new(rx), tcp::SocketBuffer::new(tx));
+            let _ = s.connect(cx, (IpAddress::v4(KIP[0], KIP[1], KIP[2], KIP[3]), HTTP_PORT), local_port);
+            psock.add(s)
+        }
+
+        /// A full client fetch on peer socket `h`: wait for the handshake, send a GET, drain the reply,
+        /// and report whether the status line was `HTTP/1.0 200`. Bounded by `pump`'s iteration budget.
+        fn fetch_200(
+            ks: &mut NetService<SmoltcpPhy<KernelLoopNic>>,
+            pface: &mut Interface,
+            pdev: &mut SmoltcpPhy<PeerLoopNic>,
+            psock: &mut SocketSet<'static>,
+            clk: &mut i64,
+            h: SocketHandle,
+        ) -> bool {
+            // Wait for the handshake to complete (peer may_send), then push the request once.
+            let mut sent = false;
+            let mut got200 = false;
+            for _ in 0..80 {
+                pump(ks, pface, pdev, psock, clk, 1);
+                let s = psock.get_mut::<tcp::Socket>(h);
+                if !sent && s.may_send() {
+                    let _ = s.send_slice(b"GET / HTTP/1.0\r\n\r\n");
+                    sent = true;
+                }
+                if s.can_recv() {
+                    let _ = s.recv(|buf| {
+                        if buf.len() >= 12 && &buf[..12] == b"HTTP/1.0 200" {
+                            got200 = true;
+                        }
+                        (buf.len(), ())
+                    });
+                }
+                if got200 {
+                    break;
+                }
+            }
+            // Close the peer half so the kernel's FIN handshake can complete to TIME-WAIT (which
+            // `http_step` aborts + re-listens) rather than stalling in FIN_WAIT_2 forever — otherwise the
+            // served TCB never recycles. Pump a little to walk both sides through the close.
+            if got200 {
+                psock.get_mut::<tcp::Socket>(h).close();
+                pump(ks, pface, pdev, psock, clk, 20);
+            }
+            got200
+        }
+
+        /// Run the loopback battery and print the `NET-GATE` witness. Bitmask `w`:
+        ///   0x1 basic handshake + GET -> 200; 0x2 half-open flood -> SATURATED -> reaped -> recovery
+        ///   fetch; 0x4 FIN close recycles the TCB back to LISTEN; 0x8 table-full connection gets RST.
+        pub fn run() {
+            *K_RX.lock() = Some(VecDeque::new());
+            *P_RX.lock() = Some(VecDeque::new());
+
+            // Kernel service: the REAL NetService methods over the loopback phy + the identical socket pool.
+            let mut kdev = SmoltcpPhy::<KernelLoopNic>::new();
+            let mut kiface = build_iface(&mut kdev, KMAC, KIP, 0x4b45_524e); // "KERN"
+            let kstorage: &'static mut [SocketStorage; HTTP_POOL + 1] =
+                Box::leak(Box::new(Default::default()));
+            let mut ksockets = SocketSet::new(&mut kstorage[..]);
+            let (http, mdns, listening, _bound, _joined) =
+                build_net_sockets(&mut kiface, &mut ksockets);
+            let mut ks = NetService {
+                iface: kiface,
+                dev: kdev,
+                sockets: ksockets,
+                http,
+                req_seen: [false; HTTP_POOL],
+                active_since: [0; HTTP_POOL],
+                mdns,
+                ip: KIP,
+            };
+
+            // Peer stack: a plain smoltcp interface + its own socket set on the other end of the channel.
+            let mut pdev = SmoltcpPhy::<PeerLoopNic>::new();
+            let mut pface = build_iface(&mut pdev, PMAC, PIP, 0x50_4545_52); // "PEER"
+            let pstorage: &'static mut [SocketStorage; 16] = Box::leak(Box::new(Default::default()));
+            let mut psock = SocketSet::new(&mut pstorage[..]);
+
+            let mut clk: i64 = 0;
+            let mut w: u32 = 0;
+
+            serial_println!("{} [net13] loopback gate: pool armed listening={}/{} ::", PG, listening, HTTP_POOL);
+
+            // ── Scenario A (0x1): a full client handshake + GET returns the 200 status page. ──
+            {
+                let h = open_peer(&mut psock, pface.context(), 49001);
+                let ok = fetch_200(&mut ks, &mut pface, &mut pdev, &mut psock, &mut clk, h);
+                if ok {
+                    w |= 0x1;
+                }
+                serial_println!("{} [net13] A handshake+GET => {} ::", PG, if ok { "200 PASS" } else { "FAIL" });
+            }
+
+            // ── Scenario C (0x4): after the served connection closes, the TCB recycles back to LISTEN
+            //    (FIN handshake -> TIME-WAIT -> abort -> re-listen), so the whole pool is listening again. ──
+            {
+                pump(&mut ks, &mut pface, &mut pdev, &mut psock, &mut clk, 80);
+                let (listen, _active) = ks.http_census();
+                let recycled = listen == HTTP_POOL as u32;
+                if recycled {
+                    w |= 0x4;
+                }
+                serial_println!(
+                    "{} [net13] C fin-close recycles => listen={}/{} {} ::",
+                    PG, listen, HTTP_POOL, if recycled { "PASS" } else { "FAIL" }
+                );
+            }
+
+            // ── Scenario B/D (0x2 + 0x8): half-open flood saturates the pool, a table-full connection is
+            //    RST, then the idle-reaper frees the wedged TCBs and a fresh fetch recovers. ──
+            {
+                // Open HTTP_POOL half-open connections (connect, never send a request).
+                let mut flood = [SocketHandle::default(); HTTP_POOL];
+                for (i, slot) in flood.iter_mut().enumerate() {
+                    *slot = open_peer(&mut psock, pface.context(), 49100 + i as u16);
+                }
+                // Pump briefly (well under the 3 s reap deadline) to complete all four handshakes.
+                pump(&mut ks, &mut pface, &mut pdev, &mut psock, &mut clk, 40);
+                let (listen_sat, active_sat) = ks.http_census();
+                let saturated = listen_sat == 0;
+                serial_println!(
+                    "{} [net13] B flood => listen={} active={} {} ::",
+                    PG, listen_sat, active_sat, if saturated { "SATURATED" } else { "not-saturated" }
+                );
+
+                // Scenario D: a 5th connection while saturated finds no listening TCB and is RST.
+                let extra = open_peer(&mut psock, pface.context(), 49200);
+                pump(&mut ks, &mut pface, &mut pdev, &mut psock, &mut clk, 30);
+                let refused = !psock.get_mut::<tcp::Socket>(extra).is_active();
+                if saturated && refused {
+                    w |= 0x8;
+                }
+                serial_println!(
+                    "{} [net13] D table-full 5th conn => {} ::",
+                    PG, if refused { "RST/refused PASS" } else { "accepted FAIL" }
+                );
+
+                // Advance the clock GRADUALLY past the idle-reap deadline. A single big jump would let
+                // smoltcp's transport keepalive/timeout abort the wedged TCBs itself (no reap count);
+                // stepping keeps the peer answering keepalive probes so the connections stay ESTABLISHED
+                // until the APP idle-reaper (`http_step`, HTTP_IDLE_MS) is the one that force-aborts them —
+                // exactly the PI-NET-12 wedge fix under test. ~4.4 s of steps clears the 3 s deadline.
+                let reaped_before = net10_reaped();
+                pump(&mut ks, &mut pface, &mut pdev, &mut psock, &mut clk, 220);
+                let reaped_delta = net10_reaped().wrapping_sub(reaped_before);
+                let (listen_rec, _a) = ks.http_census();
+                serial_println!(
+                    "{} [net13] B reaped +{} (listen recovered={}/{}) ::",
+                    PG, reaped_delta, listen_rec, HTTP_POOL
+                );
+
+                // Recovery fetch: the service must accept + serve again after the flood was reaped.
+                let r = open_peer(&mut psock, pface.context(), 49300);
+                let recovered = fetch_200(&mut ks, &mut pface, &mut pdev, &mut psock, &mut clk, r);
+                if saturated && reaped_delta >= 1 && recovered {
+                    w |= 0x2;
+                }
+                serial_println!(
+                    "{} [net13] B recovery fetch => {} ::",
+                    PG, if recovered { "200 PASS" } else { "FAIL" }
+                );
+            }
+
+            // ── mDNS (diagnostic, not gated): a query for unaos.local over the same loopback is answered.
+            //    Exercises the SAME `mdns_step` the metal responder runs, over the loopback Device. ──
+            let mdns_ok = mdns_probe(&mut ks, &mut pface, &mut pdev, &mut psock, &mut clk);
+            serial_println!("{} [net13] mdns unaos.local => {} ::", PG, if mdns_ok { "answered" } else { "no-answer" });
+
+            let pass = w == 0xf;
+            serial_println!(
+                ":: NET-GATE: tcp/http/mdns loopback battery {} [w=0x{:x}] (basic|flood-reap-recover|fin-recycle|table-full) ::",
+                if pass { "PASS" } else { "FAIL" }, w
+            );
+        }
+
+        /// Send a single mDNS A query for `unaos.local` from a peer UDP socket to 224.0.0.251:5353 and
+        /// check `mdns_step` answered (the responder's `net11_answered` counter moved). Diagnostic only.
+        fn mdns_probe(
+            ks: &mut NetService<SmoltcpPhy<KernelLoopNic>>,
+            pface: &mut Interface,
+            pdev: &mut SmoltcpPhy<PeerLoopNic>,
+            psock: &mut SocketSet<'static>,
+            clk: &mut i64,
+        ) -> bool {
+            use smoltcp::socket::udp;
+            let rx_meta: &'static mut [udp::PacketMetadata; 4] =
+                Box::leak(Box::new([udp::PacketMetadata::EMPTY; 4]));
+            let rx_pl: &'static mut [u8; 512] = Box::leak(Box::new([0u8; 512]));
+            let tx_meta: &'static mut [udp::PacketMetadata; 4] =
+                Box::leak(Box::new([udp::PacketMetadata::EMPTY; 4]));
+            let tx_pl: &'static mut [u8; 512] = Box::leak(Box::new([0u8; 512]));
+            let mut us = udp::Socket::new(
+                udp::PacketBuffer::new(&mut rx_meta[..], &mut rx_pl[..]),
+                udp::PacketBuffer::new(&mut tx_meta[..], &mut tx_pl[..]),
+            );
+            if us.bind(5353u16).is_err() {
+                return false;
+            }
+            let uh = psock.add(us);
+            // Peer must accept the multicast group the query targets so the responder's multicast answer
+            // is delivered back (the responder replies to 224.0.0.251:5353 for a non-QU query).
+            let _ = pface.join_multicast_group(IpAddress::v4(224, 0, 0, 251));
+
+            // A minimal DNS query: 1 question, QNAME "unaos"."local", QTYPE A, QCLASS IN.
+            let query: [u8; 12 + 13 + 4] = {
+                let mut q = [0u8; 29];
+                q[0..2].copy_from_slice(&0u16.to_be_bytes()); // ID
+                q[2..4].copy_from_slice(&0u16.to_be_bytes()); // flags: standard query
+                q[4..6].copy_from_slice(&1u16.to_be_bytes()); // QDCOUNT = 1
+                let mut o = 12;
+                q[o] = 5;
+                o += 1;
+                q[o..o + 5].copy_from_slice(b"unaos");
+                o += 5;
+                q[o] = 5;
+                o += 1;
+                q[o..o + 5].copy_from_slice(b"local");
+                o += 5;
+                q[o] = 0;
+                o += 1;
+                q[o..o + 2].copy_from_slice(&1u16.to_be_bytes()); // QTYPE A
+                o += 2;
+                q[o..o + 2].copy_from_slice(&1u16.to_be_bytes()); // QCLASS IN
+                q
+            };
+            let before = net11_answered();
+            let dst = IpEndpoint::new(IpAddress::v4(224, 0, 0, 251), 5353);
+            let _ = psock.get_mut::<udp::Socket>(uh).send_slice(&query, dst);
+            pump(ks, pface, pdev, psock, clk, 20);
+            net11_answered() != before
+        }
     }
 }
