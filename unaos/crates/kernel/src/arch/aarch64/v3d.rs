@@ -144,6 +144,23 @@ const V3D_L2TCACTL_L2TFLS: u32 = 1 << 0; // flush start; reads 1 while the flush
 const V3D_L2TCACTL_FLM_FLUSH: u32 = 0 << 1; // FLM field [2:1] = FLUSH (write-back + invalidate)
 const V3D_SLCACTL_INVALIDATE_ALL: u32 = (0xF << 24) | (0xF << 16) | (0xF << 8) | 0xF;
 
+// ─── PI-V3D-21: performance-counter (PCTR) block, core 0. Offsets + field layout transcribed VERBATIM
+// from Linux `drivers/gpu/drm/v3d/v3d_regs.h` (V3D 4.x / "V4" variant; register/hardware facts,
+// GPL-2.0-only header, facts-only discipline). Used to WITNESS coordinate-shader QPU execution without
+// perturbing the shader (see the pctr_* functions). The programming sequence (SRC selects → EN=mask →
+// CLR=mask → OVERFLOW=mask; read PCTRx; EN=0) is the exact `v3d_perfmon_start`/`v3d_perfmon_stop` idiom.
+const V3D_V4_PCTR_0_EN: usize = 0x0650; // per-counter enable mask (bit i enables counter i)
+const V3D_V4_PCTR_0_CLR: usize = 0x0654; // per-counter clear-to-0 mask
+const V3D_PCTR_0_OVERFLOW: usize = 0x0658; // per-counter overflow-clear mask
+const V3D_V4_PCTR_0_SRC_0_3: usize = 0x0660; // source-select for counters 0..3 (four 7-bit S0..S3 fields)
+const V3D_PCTR_0_PCTR0: usize = 0x0680; // counter 0 output; counter i output = PCTR0 + 4*i
+// Counter SOURCE ids — the `enum v3d_perfcnt` INDEX from Linux uapi `include/uapi/drm/v3d_drm.h`. On
+// V3D 4.2 (ver<71) the enum index IS the hardware source id written into the SRC field (cross-checked:
+// CYCLE_COUNT sits at enum index 32, matching v3d_regs.h `V3D_PCTR_CYCLE_COUNT(ver)=32` for ver<71).
+const PCTR_SRC_QPU_ACTIVE_CYCLES_VERTEX_COORD_USER: u32 = 14; // QPU cycles executing vertex/coord USER shaders
+const PCTR_SRC_QPU_CYCLES_VALID_INSTR: u32 = 16; // QPU cycles issuing a valid instruction
+const PCTR_SRC_CYCLE_COUNT: u32 = 32; // total core clock cycles (block-was-clocked sanity)
+
 // CLE (control-list executor) — CT1 is the RENDER queue. Submitting a job = write the ring's start
 // address to CT1QBA and its end address to CT1QEA; the hardware runs [BA, EA).
 const V3D_CLE_CT0CS: usize = 0x0100; // CT0 (bin) control/status — witness only (render job uses CT1)
@@ -1986,6 +2003,9 @@ fn triangle_job(fb: Option<FbTarget>) -> bool {
     );
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QBA, bin_ba);
     dsb(); // BA latched before the GO
+    // PI-V3D-21: arm the QPU-execution performance counters immediately before the GO so they span the
+    // bin (coord-shader) run. Read-only w.r.t. the shader — cannot perturb execution (see pctr_* above).
+    pctr_setup_cs_witness();
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QEA, bin_ea); // GO
     dsb();
     let ct0_cs_kicked = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CS);
@@ -2002,6 +2022,10 @@ fn triangle_job(fb: Option<FbTarget>) -> bool {
         ct0_cs_pre, ct0_cs_kicked, ct0_cs_done, ct0_ca_pre, ct0_ca_kicked, ct0_ca_done,
         bin_ba, bin_ea, bin_ran as u32, bin_idled as u32, bin_fault
     );
+    // PI-V3D-21: read the QPU-execution counters now the bin has idled — THE decisive verdict for this
+    // arc (coord-shader QPU active cycles nonzero ⇒ the shader ran). Done before the render kick so the
+    // reading isolates the bin (coord) shader.
+    pctr_read_cs_witness("M4 post-bin");
     // PI-V3D-13 witness: post-bin, did the binner's output actually land in the pool?
     bin_pool_witness("M4 post-bin");
     // PI-V3D-18 witness (V3D-16-mandated): the shader-state record bytes the CLE handed the PTB, plus
@@ -2374,6 +2398,58 @@ fn bin_pool_witness(tag: &str) -> bool {
         if ts.iter().any(|&b| b != 0) { "nonzero: the PTB wrote tile-state" } else { "all zero: no tile-state written" }
     );
     wrote
+}
+
+/// PI-V3D-21: the coordinate-shader EXECUTION witness — the read-only route. After V3D-17/18/20 proved
+/// every CPU→GPU hand-off correct (clip state, 6-word STVPMV output, Mesa-packed) yet the tile-alloc
+/// pool/tile-STATE stayed all-zero with the CL consumed clean and no fault, the single unproven link is
+/// QPU execution itself: no side effect from the coord shader has EVER been observed. This route settles
+/// it WITHOUT touching the shader — hardware performance counters. The decisive counter,
+/// QPU_ACTIVE_CYCLES_VERTEX_COORD_USER (source 14), ticks ONLY while the QPU runs a vertex/coord USER
+/// shader — exactly our coordinate shader on the bin queue — so a nonzero reading is unambiguous proof
+/// the CS ran, and it cannot be confounded by CLE activity or the fragment shader (a different counter).
+/// A TMU general-store witness (the alternative) was REJECTED: it perturbs the shader (new QPU words →
+/// fabricated-constant risk, 3 convictions) and, worse, makes a null result ambiguous — a non-writing
+/// store cannot distinguish "QPU never ran" from "store mis-encoded/unsupported in a bin-mode coord
+/// shader", the precise question this arc must answer. The PCTR route is read-only w.r.t. the shader and
+/// gives a clean yes/no. (Mesa/kernel do emit TMU general stores in vertex/coord shaders — SSBO/image/
+/// transform-feedback via nir_to_vir.c ntq_emit_tmu_general — so it is not architecturally impossible;
+/// it is merely the wrong instrument for a "did it execute at all" probe.)
+///
+/// Programming is the exact Linux `v3d_perfmon_start` idiom (v3d_perfmon.c, V3D 4.x path): pack the three
+/// source ids into the 7-bit S0..S3 fields of PCTR_0_SRC_0_3 (counters 0,1,2), enable via EN=mask, then
+/// CLR=mask (reset to 0) and OVERFLOW=mask. Called just before the bin GO so the counters span the bin.
+fn pctr_setup_cs_witness() {
+    // counter 0 = QPU active cycles in vertex/coord user shaders (the decisive execution witness),
+    // counter 1 = QPU cycles issuing a valid instruction (corroboration), counter 2 = core cycle count
+    // (block-was-clocked sanity). All three live in source group 0 (counters 0..3), packed S0/S1/S2.
+    let channel = (PCTR_SRC_QPU_ACTIVE_CYCLES_VERTEX_COORD_USER & 0x7f)
+        | ((PCTR_SRC_QPU_CYCLES_VALID_INSTR & 0x7f) << 8)
+        | ((PCTR_SRC_CYCLE_COUNT & 0x7f) << 16);
+    let mask: u32 = 0b111; // three counters enabled
+    mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_SRC_0_3, channel);
+    dsb();
+    mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_EN, mask);
+    mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_CLR, mask);
+    mmio_write(V3D_CORE0_BASE, V3D_PCTR_0_OVERFLOW, mask);
+    dsb();
+}
+
+/// PI-V3D-21: read the three PCTR counters after the bin idled, disable them, and print the decisive
+/// verdict line. counter 0 (QPU_ACTIVE_CYCLES_VERTEX_COORD_USER) nonzero ⇒ the coordinate shader's QPU
+/// program executed. QEMU raspi4b has no V3D, so these reads return 0 → "NEVER RAN" there; metal decides.
+fn pctr_read_cs_witness(tag: &str) {
+    dsb();
+    let coord = mmio_read(V3D_CORE0_BASE, V3D_PCTR_0_PCTR0); // counter 0
+    let vinstr = mmio_read(V3D_CORE0_BASE, V3D_PCTR_0_PCTR0 + 4); // counter 1
+    let cycles = mmio_read(V3D_CORE0_BASE, V3D_PCTR_0_PCTR0 + 8); // counter 2
+    mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_EN, 0); // stop counting
+    dsb();
+    serial_println!(
+        ":: V3D: [v3d21] {} CS-exec proof via PCTR — QPU_ACTIVE_CYCLES_VERTEX_COORD(src14)={} valid_instr(src16)={} cycle_count(src32)={} — SHADER {} ::",
+        tag, coord, vinstr, cycles,
+        if coord != 0 { "RAN" } else { "NEVER RAN" }
+    );
 }
 
 /// PI-V3D-18 witness (V3D-16-mandated post-bin CS/VPM audit). Two records the next metal boot reads
