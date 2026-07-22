@@ -1026,6 +1026,57 @@ window automatically.
 `window[1] [0xbe000000, 0xc4000000) 98304 KiB @ GiB 2 (source: QUIRK (DTB silent; extent = bounded GUESS))`;
 no SNOC RAS from the `0xbe000000..0xc4000000` family under SIMMER/vug load; fb repair line unchanged.
 
+#### XCARVE-9 — the PRIMARY `0x26b9` window's honest extent: the declared-neighbor cap (**code fix, always-on; metal-owed**)
+
+The `0xbe` family had its extent widened by XCARVE-8; the PRIMARY `0x26b9` window still carried the
+XCARVE-3 guess — the single 2 MiB L2 granule `[0x26b800000, 0x26ba00000)` around the boot-21 hit.
+**Boot-28 run 2 refuted it**: SNOC Carveout Uncorrectable + ACI FillWrite, `ADDR 0x800000026bc5ee90`
+→ PA `0x26bc5ee90` — ~2.4 MiB **above** the 2 MiB top, mid-simmer; EL3 powered off two cores and the
+machine survived. This is the same too-small-extent class XCARVE-8 fixed for `0xbe`, and the same
+mechanism-choice bind applies: no honest extent is readable (DTB/UEFI silent over this PA — that is
+*why* it is a QUIRK; MC-register probing is the rejected EL3-crash class).
+
+**But here the geometry gives a bound `0xbe` never had.** The DTB *does* declare the adjacent
+carveouts — `[0x26b5f0000, 0x26b7f0000)` below and `[0x26c180000, 0x26c400000)` above — and the
+observed family (`0x26b900000`, `0x26bc5ee90`) sits in the *undeclared gap* between them, suggesting
+one contiguous protected span ~`[0x26b5f0000, 0x26c400000)`. So XCARVE-9 widens the QUIRK to fill
+exactly that gap: **9.5 MiB `[0x26b800000, 0x26c180000)`** (`XCARVE_GIB9_SIZE = 0x00980000`) — top
+flush against the declared upper neighbor's base, never overlapping it (the declared windows stay
+their own set entries; adjacency is fine). This is a bounded GUESS, said so in the banner; a hit in
+the residual `[0x26b7f0000, 0x26b800000)` sliver or above `0x26c400000` refutes it in turn. Heap is
+unaffected — it tops at `0x26b3ca000`, below every window here (`select_heap_region` re-proves this
+against the same set).
+
+#### XCARVE-10 — boot-34-retry: the span continues past the declared neighbor; the bounded 4 MiB gap window (**code fix, always-on; metal-owed**)
+
+XCARVE-9 assumed the declared upper neighbor `[0x26c180000, 0x26c400000)` capped the family.
+**Boot-34-retry (2026-07-21) refuted that assumption**: SNOC Carveout Uncorrectable + ACI FillWrite,
+`ADDR 0x800000026c6be4a0` → PA `0x26c6be4a0` — **above** `0x26c400000`, past the declared carveout's
+top. Same method as XCARVE-9: no honest extent is readable (DTB/UEFI silent, MC probing the rejected
+EL3-crash class), so exclude a bounded GUESS window starting flush at the declared neighbor's top.
+XCARVE-10 tried **4 MiB `[0x26c400000, 0x26c800000)`** (`XCARVE_GIB9B_BASE = 0x26c400000`) — an
+explicit bounded guess, said so in the banner, refutable at or above `0x26c800000`. Heap
+(top `0x26b3ca000`) unaffected. It was refuted within the hour — see XCARVE-11.
+
+#### XCARVE-11 — the four climbing hits: stop chasing, exclude the ENTIRE undeclared gap (**structural, always-on; metal-owed**)
+
+The 4 MiB XCARVE-10 guess was refuted **within the hour**: boot-36-retry hit a RAS at PA
+`0x26d03f600` — above `0x26c800000`. Four hits now **climb monotonically**:
+`0x26b900000` → `0x26bc5ee90` → `0x26c6be4a0` → `0x26d03f600`. Incremental widening is a refuted
+method; each bounded step just moves the wall. The verdict: stop chasing the family granule by
+granule — the protected span is (or behaves as) the **entire undeclared gap**. So XCARVE-11 excludes
+everything from the declared `[0x26c180000, 0x26c400000)` carveout's top up to the next declared
+object above it — the framebuffer/scanout carveout at `0x279e00000` (CPU-written; never excluded):
+**`[0x26c400000, 0x279e00000)` = 218 MiB** (`XCARVE_GIB9B_SIZE = 0x0da00000`). The declared windows
+(`[0x26b5f0000, 0x26b7f0000)` and `[0x26c180000, 0x26c400000)`) stay their own set entries; the span
+actually protected against the RAS family is the whole gap between and above them, now excluded in one
+sweep. Heap (top `0x26b3ca000`) and every mapped consumer sit below it; the gap holds nothing we map.
+A RAS at or above `0x279e00000` (inside fb) would refute the *static-window model itself*, not the
+extent — the escalation is a different arc, not another widening.
+
+**Cross-reference.** The forum-reply revision of 2026-07-22 (`review/unaos-orin-repro-REPLY.md` v3)
+draws on the XCARVE-9/10/11 entries above for the undeclared-gap exclusion narrative.
+
 ### JX1 result — XUSB first light (⛔ **the block is EL3-fatal to touch post-EBS; BPMP ungate required first**)
 
 The one-boot probe (a guarded read of the xHCI capability block @ `0x0361_0000`, the Linux DT
