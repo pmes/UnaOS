@@ -872,8 +872,8 @@ fn m2_enumerate_vl805() -> Option<u64> {
     // firmware property model — dev_id = (bus<<20)|(slot<<15)|(func<<12) for bus1/dev0/fn0. Verified
     // against the mailbox property-interface reference; constant unchanged.
     serial_println!("{}   NOTIFY_XHCI_RESET (mailbox 0x00030058, dev_addr={:#x}) — firmware VL805 reset/load (BEFORE BAR/COMMAND: the reload resets config space) ::", P, VL805_DEV_ADDR);
-    let (ok, echo) = mailbox::notify_xhci_reset(VL805_DEV_ADDR);
-    serial_println!("{}   NOTIFY_XHCI_RESET rc={} echo={:#x} ({}) ::", P, ok, echo, if ok { "SUCCESS (mailbox accepted — NOT proof the VL805 fw is running; see cfg re-read below)" } else { "FAILURE (firmware may already have loaded it at boot)" });
+    let n = mailbox::notify_xhci_reset(VL805_DEV_ADDR);
+    witness_notify("M2", &n);
     // Let the VideoCore firmware finish loading/resetting the VL805 before we touch its config space.
     settle_ms(50);
 
@@ -954,6 +954,41 @@ fn m2_enumerate_vl805() -> Option<u64> {
     Some(bar0_pcie)
 }
 
+/// PIUSB-12: decode + print one NOTIFY_XHCI_RESET response into the three status words that
+/// discriminate the CNR-never-clears theories in a SINGLE boot. The prior witness (`rc={} echo={}`)
+/// conflated "mailbox message processed" with "VL805 reset handler ran" and read the value echo as if
+/// it were a load proof — but boot-P21 (rc=true echo=0x0) is fully consistent with the tag being
+/// honoured (this command tag returns 0, it does NOT echo dev_addr). The load-vs-noop verdict lives in
+/// the TAG response word, not the echo. This prints:
+///   * `overall` (buffer word 1): 0x80000000 = message OK, 0x80000001 = malformed buffer.
+///   * `tag_code` (buffer word 4): bit31 SET (e.g. 0x80000004) = firmware RAN the tag handler;
+///     bit31 CLEAR = firmware IGNORED the tag (unknown/unsupported in this fw config) — a genuinely
+///     different root cause than a handler that ran but the VL805 fw blob failed to load.
+///   * `echo` (buffer word 5): we POST dev_addr (0x100000) here, so echo==0 also proves the reply
+///     was re-fetched from RAM (cache-invalidate working) rather than served from our stale write.
+/// One boot now separates: (T1) tag honoured, load ran → CNR wall is downstream (VL805 blob / link);
+/// (T2) tag_code bit31 clear → firmware never ran the handler (tag/dev_addr/fw-config problem);
+/// (T3) overall==0x80000001 → our message buffer is malformed.
+fn witness_notify(ctx: &str, n: &mailbox::NotifyResp) {
+    let honoured = n.tag_code & 0x8000_0000 != 0;
+    let resp_len = n.tag_code & 0x7fff_ffff;
+    serial_println!(
+        "{}   NOTIFY ({}) rc={} overall={:#010x} tag_code={:#010x} (honoured={} resp_len={}) echo={:#010x} buf_pa={:#x} ::",
+        P, ctx, n.ok, n.overall, n.tag_code, honoured, resp_len, n.echo, n.buf_pa
+    );
+    serial_println!(
+        "{}   NOTIFY ({}) verdict: {} ::",
+        P, ctx,
+        if !n.ok {
+            "MAILBOX FAILED — overall code not 0x80000000 (malformed buffer / no reply); NOTIFY did NOT run"
+        } else if honoured {
+            "tag HONOURED (firmware ran the VL805 reset/load handler) — if CNR still wedges the wall is DOWNSTREAM (VL805 fw blob absent in bootloader EEPROM, or link/BAR), NOT the NOTIFY"
+        } else {
+            "tag IGNORED (bit31 clear) — firmware did NOT run the handler: tag unsupported in this fw config, or dev_addr/topology mismatch — NOTIFY is the wall"
+        }
+    );
+}
+
 /// PIUSB-11: re-issue NOTIFY_XHCI_RESET to the VideoCore firmware IMMEDIATELY before a controller
 /// halt+HCRST, then let the firmware settle. This mirrors Linux verbatim: `xhci_pci_common_probe`
 /// (drivers/usb/host/xhci-pci.c) calls `reset_control_reset(reset)` — which on the Pi 4 lands in
@@ -976,8 +1011,8 @@ fn m2_enumerate_vl805() -> Option<u64> {
 /// fresh, in-sequence reload so CNR can clear. PIUSB-10's CNR wait remains the verdict gate.
 fn notify_before_reset(ctx: &str) {
     serial_println!("{}   NOTIFY (pre-reset, {}): mailbox 0x00030058 dev_addr={:#x} — reload VL805 fw immediately before halt+HCRST (Linux reset_control_reset placement) ::", P, ctx, VL805_DEV_ADDR);
-    let (ok, echo) = mailbox::notify_xhci_reset(VL805_DEV_ADDR);
-    serial_println!("{}   NOTIFY (pre-reset, {}) rc={} echo={:#x} ::", P, ctx, ok, echo);
+    let n = mailbox::notify_xhci_reset(VL805_DEV_ADDR);
+    witness_notify(ctx, &n);
     // Linux waits usleep_range(200, 1000) for VL805 startup after the reset mailbox; give it a
     // comfortably wider bounded settle so the fw is running before HCRST samples CNR.
     settle_ms(5);

@@ -340,23 +340,48 @@ pub fn set_clock_rate(clock_id: u32, rate_hz: u32) -> Option<u32> {
 /// controller and before attaching the xHCI driver. Returns whether the mailbox reported success.
 /// Single-user `MBOX` like the other calls (boot-time, single-threaded, framebuffer call long done).
 ///
-/// Returns `(ok, echo)`: `ok` is the mailbox success flag (reply(1) == RESPONSE — the firmware
-/// ACCEPTED the tag, NOT proof the VL805 fw is running); `echo` is the value-buffer word the firmware
-/// wrote back at request slot 5. Linux (`drivers/reset/reset-raspberrypi.c rpi_reset_reset`) only
-/// checks the return code and does NOT inspect the echo, but PIUSB-11 witnesses it so a boot log can
-/// prove the firmware round-tripped the exact `dev_addr` we posted (a mismatch would localise a
-/// malformed tag vs a genuine no-op reload).
+/// PIUSB-12: the full response witness for one NOTIFY. The RPi property protocol writes THREE
+/// distinct status words the caller must separate to localise a no-op:
+///   * `overall` = buffer word 1: the whole-message code. `0x8000_0000` = processed OK,
+///     `0x8000_0001` = "error parsing request buffer" (malformed message). `ok` is `overall ==
+///     0x8000_0000`. This alone does NOT prove any individual tag was honoured.
+///   * `tag_code` = the tag's own request/response word (our buffer word 4). On REQUEST it is 0;
+///     on a honoured RESPONSE the firmware sets bit 31 and puts the returned byte-length in bits
+///     [30:0] (so a 4-byte response reads `0x8000_0004`). If the firmware does NOT recognise /
+///     act on the tag, it leaves bit 31 CLEAR here. **This is the discriminating word** — it, not
+///     the value echo, says whether the VideoCore actually ran the VL805 reset/load handler.
+///   * `echo` = the value-buffer word (our buffer word 5). For NOTIFY_XHCI_RESET the firmware does
+///     NOT echo `dev_addr` back — it is a command tag, and on metal (boot-P21) it returned 0 even
+///     with the mailbox reporting success. Because we POST `dev_addr` (non-zero) into this slot, a
+///     read-back of 0 also PROVES cache invalidation worked (a stale cached read would return our
+///     own posted `dev_addr`, not 0), so `echo` is a cache-coherency witness, not a load witness.
+/// `buf_pa` is the ARM-physical address of the message buffer (for correlating the raw dump).
 #[cfg(feature = "piusb")]
-pub fn notify_xhci_reset(dev_addr: u32) -> (bool, u32) {
+pub struct NotifyResp {
+    pub ok: bool,
+    pub overall: u32,
+    pub tag_code: u32,
+    pub echo: u32,
+    pub buf_pa: usize,
+}
+
+/// PI-USB-1 / PIUSB-12: ask the firmware to reset+reload the VL805 xHCI (tag `NOTIFY_XHCI_RESET`,
+/// `0x00030058`), `dev_addr = (bus<<20)|(dev<<15)|(fn<<12)` = `0x0010_0000` for bus1/dev0/fn0.
+/// Returns the full [`NotifyResp`] so the caller can print the per-word witness that discriminates
+/// "tag honoured, VL805 reset ran" (tag_code bit31 set) from "tag silently dropped" (bit31 clear).
+/// Linux (`rpi_reset_reset`) checks only the overall return code; we witness every word because the
+/// CNR-never-clears wall means we must know WHICH layer is failing.
+#[cfg(feature = "piusb")]
+pub fn notify_xhci_reset(dev_addr: u32) -> NotifyResp {
     request(0, 7 * 4); // total size (7 words used)
     request(1, 0); // request
     request(2, TAG_NOTIFY_XHCI_RESET);
     request(3, 4); // value buffer size (1 word: the PCI device address)
-    request(4, 0); // request code
+    request(4, 0); // request code (firmware overwrites with 0x8000_0000|len if honoured)
     request(5, dev_addr);
     request(6, TAG_END);
     let ok = mbox_call(7);
-    (ok, reply(5))
+    NotifyResp { ok, overall: reply(1), tag_code: reply(4), echo: reply(5), buf_pa: mbox_phys() }
 }
 
 /// Bring up the VideoCore framebuffer: pick a resolution (the firmware's current mode if sane,
