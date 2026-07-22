@@ -86,7 +86,7 @@ pub fn spawn_listener(pointers: ReactorPointers, rx_gui: Receiver<GuiUpdate>) {
                     let mut batch: Vec<HistoryObject> = Vec::new();
                     for (i, msg) in messages.into_iter().enumerate() {
                         let id = format!("{}-hist-{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0), i);
-                        let obj = HistoryObject::new(&id, &msg.sender, "History", &msg.timestamp, &msg.content, msg.is_chat);
+                        let obj = HistoryObject::new(&id, msg.display_name.as_deref().unwrap_or("Unknown"), "History", &msg.timestamp, &msg.content, msg.is_chat);
                         batch.push(obj);
                     }
                     if !batch.is_empty() {
@@ -114,7 +114,7 @@ pub fn spawn_listener(pointers: ReactorPointers, rx_gui: Receiver<GuiUpdate>) {
                     let mut batch: Vec<HistoryObject> = Vec::new();
                     for (i, msg) in messages.into_iter().enumerate() {
                         let id = format!("{}-hist-{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0), i);
-                        let obj = HistoryObject::new(&id, &msg.sender, "History", &msg.timestamp, &msg.content, msg.is_chat);
+                        let obj = HistoryObject::new(&id, msg.display_name.as_deref().unwrap_or("Unknown"), "History", &msg.timestamp, &msg.content, msg.is_chat);
                         batch.push(obj);
                     }
                     if !batch.is_empty() {

@@ -1,23 +1,97 @@
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-#[cfg(feature = "gtk")]
-mod shell_gtk;
-
-#[cfg(feature = "qt")]
-mod shell_qt;
-
-#[cfg(target_os = "macos")]
-mod shell_macos;
+use std::thread;
+use tokio::task::LocalSet;
+use bandy::{SMessage, Synapse};
+use quartzite::browser::bootstrap_browser;
+use aether::AetherEngine;
 
 fn main() {
-    #[cfg(target_os = "macos")]
-    {
-        shell_macos::run();
-        return;
-    }
+    let synapse = Synapse::new();
+    
+    let engine_tx = synapse.clone();
+    let mut engine_rx = synapse.subscribe();
+    
+    // Spawn the Engine Thread
+    thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let local = LocalSet::new();
+        
+        local.block_on(&rt, async move {
+            let mut engine = AetherEngine::new();
+            
+            // Initial render
+            let _damages = engine.render_frame();
+            engine_tx.fire(SMessage::SurfaceBlit {
+                url: engine.title.clone(),
+                width: engine.width,
+                height: engine.height,
+                pixels: engine.surface().to_vec(),
+            });
+            
+            let mut tick_interval = tokio::time::interval(std::time::Duration::from_millis(16));
+            
+            loop {
+                tokio::select! {
+                    _ = tick_interval.tick() => {
+                        if engine.tick() {
+                            let damages = engine.render_frame();
+                            if !damages.is_empty() {
+                                engine_tx.fire(SMessage::SurfaceBlit {
+                                    url: engine.title.clone(),
+                                    width: engine.width,
+                                    height: engine.height,
+                                    pixels: engine.surface().to_vec(),
+                                });
+                            }
+                        }
+                    }
+                    Ok(msg) = engine_rx.recv() => {
+                        match msg {
+                            SMessage::OpenDocument { url } => {
+                                let content = match aether::net::fetch_document(&url).await {
+                                    Ok(c) => c,
+                                    Err(e) => format!("<html><body><h1>Error</h1><p>{}</p></body></html>", e),
+                                };
+                                engine.load_html(&url, &content, true);
+                            }
+                            SMessage::BrowserNavBack => {
+                                if let Some(url) = engine.get_back_url() {
+                                    let content = aether::net::fetch_document(&url).await.unwrap_or_default();
+                                    engine.load_html(&url, &content, false);
+                                }
+                            }
+                            SMessage::BrowserNavForward => {
+                                if let Some(url) = engine.get_forward_url() {
+                                    let content = aether::net::fetch_document(&url).await.unwrap_or_default();
+                                    engine.load_html(&url, &content, false);
+                                }
+                            }
+                            SMessage::BrowserNavReload => {
+                                // Reload logic not directly supported by get_forward_url, ignoring for now or using current
+                            }
+                            SMessage::BrowserScroll(dx, dy) => {
+                                engine.handle_event(aether::api::events::Event::Scroll(dx, dy));
+                            }
+                            SMessage::BrowserResize(w, h) => {
+                                engine.handle_event(aether::api::events::Event::Resize(w, h));
+                            }
+                            SMessage::BrowserKey(key) => {
+                                engine.handle_event(aether::api::events::Event::KeyDown(key));
+                            }
+                            SMessage::BrowserText(text) => {
+                                engine.handle_event(aether::api::events::Event::Text(text));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        });
+    });
 
-    #[cfg(feature = "gtk")]
-    shell_gtk::run();
-
-    #[cfg(feature = "qt")]
-    shell_qt::run();
+    let rx = synapse.subscribe();
+    let tx = synapse.clone();
+    
+    quartzite::Backend::new_vessel("org.unaos.aether", "Aether Browser", (800.0, 600.0), move |window| {
+        bootstrap_browser(window, tx, rx)
+    }).run();
 }

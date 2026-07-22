@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, VecDeque, HashSet};
 use serde::{Deserialize, Serialize};
-use crate::ontology::{Origin, Shard, ShardStatus, WeightedSkeleton};
+pub use crate::ontology::{Origin, Shard, ShardStatus, WeightedSkeleton};
 
 pub const MAX_STATE_CAPACITY: usize = 1000;
 

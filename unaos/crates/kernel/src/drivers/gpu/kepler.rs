@@ -179,6 +179,12 @@ pub fn init(gpu: &GpuInfo) {
             let pbdma_count = pbdma_count_mask.count_ones();
             serial_println!(":: kepler: pbdma-count {} ::", pbdma_count);
 
+            // Bind PBDMA 0 to Engine 0 (PGRAPH) by writing mask `1` to SUBFIFO_ENG_MASK[0]
+            // According to gf100_pfifo.xml, SUBFIFO_ENG_MASK is at offset 0x390 relative to PFIFO (0x2000).
+            let pfifo_base = 0x2000;
+            mmio_write(bar0, pfifo_base + 0x390, 1 << 0);
+            serial_println!(":: kepler: pbdma-eng-mask set ::");
+
             let check = mmio_read(bar0, regs::NV_PMC_ENABLE);
             serial_println!("[NVIDIA] NV_PMC_ENABLE after bit 8 set: 0x{:08X}", check);
 
@@ -378,7 +384,9 @@ unsafe fn takeover_display(gpu: &GpuInfo, bar0: usize, allocator: &mut VramAlloc
     let mut raw_storage = 0;
 
     for head in 0..4 {
-        let head_base = regs::NV_PDISPLAY_BASE + 0x6100 + (head * 0x800);
+        // NV_EVO_CORE base = 0x610000. HEAD array starts at 0x400, stride 0x300.
+        // G80_EVO_FB_SETTINGS is at offset 0x60 within the head.
+        let head_base = regs::NV_PDISPLAY_BASE + 0x400 + (head * 0x300) + 0x60;
         let addr = mmio_read(bar0, head_base + 0x0); // OFFSET_ORIGIN
         let size = mmio_read(bar0, head_base + 0x8); // SIZE
         let storage = mmio_read(bar0, head_base + 0xC); // STORAGE
@@ -462,11 +470,19 @@ unsafe fn takeover_display(gpu: &GpuInfo, bar0: usize, allocator: &mut VramAlloc
                 core::ptr::write_volatile(evo_pb.add(3), 0x00000000);
                 
                 // Initialize the GF119+ EVO core channel (NV_PDISPLAY + 0x490)
-                // (Offsets derived from nouveau/gf119.c as envytools is sparse here)
+                // Empirically probed on GK107, unverified against public docs.
                 let core_ctrl = regs::NV_PDISPLAY_BASE + 0x490;
                 
+                // Read behind a bad-read guard so incorrect probing will self-identify
+                let core_ctrl_val = mmio_read(bar0, core_ctrl);
+                if core_ctrl_val == 0 || (core_ctrl_val & 0xFFF00000) == 0xBAD00000 {
+                    serial_println!(":: kepler: bad-read core_ctrl {:X} {:08X} ::", core_ctrl, core_ctrl_val);
+                    serial_println!(":: kepler: takeover-abort bad-core-ctrl ::");
+                    return None;
+                }
+                
                 // Deactivate channel first
-                mmio_write(bar0, core_ctrl, mmio_read(bar0, core_ctrl) & !0x10);
+                mmio_write(bar0, core_ctrl, core_ctrl_val & !0x10);
                 mmio_write(bar0, core_ctrl, mmio_read(bar0, core_ctrl) & !0x03);
                 
                 // Delay briefly for inactivation (blind)
@@ -490,7 +506,7 @@ unsafe fn takeover_display(gpu: &GpuInfo, bar0: usize, allocator: &mut VramAlloc
                 mmio_write(bar0, 0x640000, 16);
                 
                 // Wait for latch by reading back OFFSET_ORIGIN via MMIO shadow
-                let head_base = regs::NV_PDISPLAY_BASE + 0x6100 + (head * 0x800);
+                let head_base = regs::NV_PDISPLAY_BASE + 0x400 + (head * 0x300) + 0x60;
                 let mut latched = false;
                 for _ in 0..1000000 {
                     if mmio_read(bar0, head_base) == new_addr {
