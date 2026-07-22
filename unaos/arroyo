@@ -747,7 +747,57 @@ KERNEL8_DIR="${WORKSPACE_DIR}/target/pi_baremetal"
 FW_TAG="1.20260521"
 FW_CACHE="${WORKSPACE_DIR}/target/pi-firmware-${FW_TAG}"
 FW_RAW="https://raw.githubusercontent.com/raspberrypi/firmware/${FW_TAG}/boot"
+
+# BUILD-2 (concurrency safety): the whole kernel8() build stages into SHARED trees —
+# crates/user-blob/target, ${WORKSPACE_DIR}/target/*.bin, KERNEL8_DIR (wiped at entry) — and then
+# calls make-pi-img.sh on the ONE shared UnaOS-pi4-baremetal.img. Two concurrent `arroyo kernel8`
+# (or kernel8-test) runs in the same worktree race there: one run wipes/relinks a file the other's
+# objcopy is reading ("llvm-objcopy: No such file or directory") and both hit the make-pi-img
+# hdiutil/partitionDisk race. So the build critical section is serialized on a coarse lock, released
+# the moment the build finishes (BEFORE any QEMU phase — QEMU runs already use per-run ports/logs and
+# may overlap). make-pi-img.sh keeps its own finer lock too (defense in depth; instant when we hold
+# this one). Mechanism mirrors make-pi-img: mkdir-atomic lock, PID file, stale-break on dead holder
+# or age > K8_LOCK_STALE_SECS, bounded wait with dots. Env: UNAOS_K8_LOCK_WAIT_SECS / _STALE_SECS.
+K8_LOCKDIR="${WORKSPACE_DIR}/target/kernel8-build.lock"
+K8_LOCK_HELD=""
+k8_lock_release() {
+    [ -n "$K8_LOCK_HELD" ] && rm -rf "$K8_LOCKDIR" 2>/dev/null || true
+    K8_LOCK_HELD=""
+}
+k8_lock_acquire() {
+    local wait_secs="${UNAOS_K8_LOCK_WAIT_SECS:-1800}"
+    local stale_secs="${UNAOS_K8_LOCK_STALE_SECS:-1200}"
+    local waited=0 dotted=0 holder mtime now age
+    mkdir -p "${WORKSPACE_DIR}/target"
+    while ! mkdir "$K8_LOCKDIR" 2>/dev/null; do
+        holder=$(cat "$K8_LOCKDIR/pid" 2>/dev/null || echo "")
+        mtime=$(stat -f %m "$K8_LOCKDIR" 2>/dev/null || echo 0)
+        now=$(date +%s); age=$(( now - mtime ))
+        if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
+            echo -e "${COLOR_YELLOW}kernel8: stale build lock reclaimed — holder PID $holder dead (age ${age}s)${COLOR_RESET}" >&2
+            rm -rf "$K8_LOCKDIR" 2>/dev/null || true; continue
+        fi
+        if [ "$age" -gt "$stale_secs" ]; then
+            echo -e "${COLOR_YELLOW}kernel8: stale build lock reclaimed — age ${age}s > ${stale_secs}s (holder PID ${holder:-unknown})${COLOR_RESET}" >&2
+            rm -rf "$K8_LOCKDIR" 2>/dev/null || true; continue
+        fi
+        if [ "$waited" -ge "$wait_secs" ]; then
+            echo "" >&2
+            echo -e "${COLOR_RED}kernel8: timed out after ${waited}s waiting for build lock held by PID ${holder:-unknown} ($K8_LOCKDIR)${COLOR_RESET}" >&2
+            exit 1
+        fi
+        [ "$dotted" -eq 0 ] && { printf 'kernel8: waiting for concurrent build lock (PID %s) ' "${holder:-unknown}" >&2; dotted=1; }
+        printf '.' >&2
+        sleep 3; waited=$(( waited + 3 ))
+    done
+    [ "$dotted" -eq 1 ] && echo "" >&2
+    echo $$ > "$K8_LOCKDIR/pid"
+    K8_LOCK_HELD=1
+    trap 'k8_lock_release' EXIT INT TERM
+}
+
 kernel8() {
+    k8_lock_acquire
     local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
 
     # M6c: build the EL0 user program as a SEPARATE link product (out of the kernel's .text) and
@@ -993,6 +1043,9 @@ kernel8() {
 
     bash "${WORKSPACE_DIR}/scripts/make-pi-img.sh" "$KERNEL8_DIR" "${WORKSPACE_DIR}/target/UnaOS-pi4-baremetal.img" 64 "$UNAFS_K3_IMG"
     echo -e "${COLOR_GREEN}✅ Flashable image: target/UnaOS-pi4-baremetal.img — Imager → Use custom → microSD → SD slot.${COLOR_RESET}"
+    # BUILD-2: release the coarse build lock now that the image is complete — any QEMU phase that
+    # follows (kernel8-test / -run / install) uses per-run ports/logs and may overlap other runs.
+    k8_lock_release
 }
 
 # Boot the bare-metal kernel8.img on QEMU's `raspi4b` (emulated BCM2711) — the same flat binary the
