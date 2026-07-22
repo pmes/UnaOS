@@ -48,6 +48,12 @@ pub mod smolnet;
 // arch has no consumer yet). See net_sntp.rs.
 pub mod net_sntp;
 
+// SOCK-8: the shared, arch-neutral DNS A-record query builder + response parser. The x86 smolnet resolver
+// (`smolnet::resolve`) renders name lookups through it; the pi/genet PI-NET-14 client migrates onto it in a
+// later fold. Pure no_std/no-alloc (all `pub`, so no dead-code warning where a given arch has no consumer
+// yet). See net_dns.rs.
+pub mod net_dns;
+
 pub mod allocator;
 pub mod shell;
 pub mod selftest;

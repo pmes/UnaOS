@@ -626,6 +626,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         #[cfg(all(target_arch = "x86_64", feature = "witness", feature = "smolnet"))]
         unaos_kernel::smolnet::sntp_x86_gate();
 
+        // SOCK-8 GATE (witness battery): the deterministic x86 DNS client battery — canned datagrams
+        // through the shared `crate::net_dns` parser, no NIC/network required. Proves x86 DNS parsing
+        // (well-formed A / truncated / compression-loop / rcode) under `./arroyo test` in any environment
+        // (the live boot resolve in `service_net` stays a bonus). Prints `:: DNS-X86-GATE: ... PASS [w=0xf] ::`.
+        #[cfg(all(target_arch = "x86_64", feature = "witness", feature = "smolnet"))]
+        unaos_kernel::smolnet::dns_x86_gate();
+
         // U1a: x86 ring-3 round-trip (the aarch64 M6a equivalent). Turn scheduling on (the default
         // test build never enables the feature-gated demo below, so the APs would otherwise idle in
         // `wait_and_run`), map the ring-3 window, then drop a scheduled task to ring 3 on an AP: it

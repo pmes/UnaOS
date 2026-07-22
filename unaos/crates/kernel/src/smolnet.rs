@@ -524,11 +524,26 @@ fn apply_ipv4_config(stack: &mut SmolStack, cidr: Ipv4Cidr, gw: Ipv4Address) {
 static CURRENT_GW: AtomicU32 = AtomicU32::new(0);
 
 /// The current SNTP time-source target: the live default gateway, or the static slirp gateway before any
-/// config. UnaOS smolnet has no DNS client of its own (SOCK-8+), so the gateway/router is the reachable
-/// SNTP responder — on real hardware behind a router that runs NTP, or a LAN time server reached via it.
+/// config. When DNS is available (SOCK-8), the SNTP client prefers a resolved `pool.ntp.org`; this gateway
+/// is the fallback SNTP responder — on real hardware behind a router that runs NTP, or a LAN time server.
 fn sntp_target() -> [u8; 4] {
     match CURRENT_GW.load(Ordering::Relaxed) {
         0 => GATEWAY_IP,
+        v => v.to_be_bytes(),
+    }
+}
+
+/// SOCK-8: the DHCP-provided DNS server (big-endian octets), recorded by `dhcp_acquire` from the lease's
+/// `dhcpv4::Config::dns_servers` (first entry). `0` = no lease / the lease offered no DNS option — the
+/// resolver then falls back to querying the gateway. (slirp's DHCP offers 10.0.2.3, its built-in forwarder.)
+static CURRENT_DNS: AtomicU32 = AtomicU32::new(0);
+
+/// SOCK-8: the resolver's nameserver target — the DHCP-provided DNS server if the boot lease carried one,
+/// else the live default gateway (`sntp_target`'s gateway). On slirp this resolves to 10.0.2.3 (the lease's
+/// DNS option), which forwards to the host resolver; on real hardware it is the LAN/ISP nameserver.
+fn dns_server() -> [u8; 4] {
+    match CURRENT_DNS.load(Ordering::Relaxed) {
+        0 => sntp_target(),
         v => v.to_be_bytes(),
     }
 }
@@ -548,6 +563,9 @@ fn dhcp_acquire() {
     }
     let mut leased: Option<Ipv4Cidr> = None;
     let mut router: Option<Ipv4Address> = None;
+    // SOCK-8: the first DHCP-provided DNS server, captured alongside the address/router so the resolver can
+    // query the real nameserver instead of falling back to the gateway.
+    let mut dns_srv: Option<Ipv4Address> = None;
     let mut spent = 0i64;
     'acquire: while spent < DHCP_PUMP {
         let mut g = STACK.lock();
@@ -568,6 +586,7 @@ fn dhcp_acquire() {
                 Some(dhcpv4::Event::Configured(cfg)) => {
                     leased = Some(cfg.address);
                     router = cfg.router;
+                    dns_srv = cfg.dns_servers.first().copied();
                     break 'acquire;
                 }
                 Some(dhcpv4::Event::Deconfigured) | None => {}
@@ -591,6 +610,11 @@ fn dhcp_acquire() {
             GATEWAY_IP[3],
         ));
         apply_ipv4_config(stack, cidr, gw);
+        // SOCK-8: record the leased DNS server (if any) so the resolver targets the real nameserver.
+        if let Some(d) = dns_srv {
+            let o = d.octets();
+            CURRENT_DNS.store(u32::from_be_bytes([o[0], o[1], o[2], o[3]]), Ordering::Relaxed);
+        }
         let addr = cidr.address().octets();
         serial_println!(
             ":: SOCK-5: smoltcp dhcpv4 lease {}.{}.{}.{}/{} gw {} — witness OK ::",
@@ -1623,7 +1647,11 @@ pub fn witness_tick_sntp() {
     }
     WITNESS_SNTP_DONE.store(true, Ordering::Relaxed);
 
-    let server = sntp_target();
+    // SOCK-8: prefer a resolved `pool.ntp.org` when DNS is available; fall back to the live gateway if the
+    // resolve fails (no lease DNS / no reply). Either way the target is an honest, reachable-or-not IP the
+    // witness prints. Under hermetic slirp the resolve may actually succeed (10.0.2.3 forwards to the host),
+    // but the SNTP leg then still needs an NTP-answering server on that address to anchor `time`.
+    let server = resolve(SNTP_POOL_HOST).unwrap_or_else(sntp_target);
     match sntp_sync_once(server) {
         Some((unix, stratum)) => {
             let mut iso = [0u8; 24];
@@ -1749,6 +1777,181 @@ pub fn sntp_x86_gate() {
     let pass = w == 0x1f;
     serial_println!(
         ":: SNTP-X86-GATE: x86 sntp client battery {} [w=0x{:x}] (parse-ok+iso|reject-short|kod|reject-alarm|set-clock) ::",
+        if pass { "PASS" } else { "FAIL" },
+        w
+    );
+}
+
+// =============================================================================
+// SOCK-8 (ROADMAP §1b): the x86 smolnet DNS CLIENT over the shared, arch-neutral `crate::net_dns`.
+//
+// Until now smolnet had no way to turn a name into an address, so SNTP-X86 could only target the gateway.
+// SOCK-8 gives smolnet a resolver built on the SAME hostile-input-hardened wire logic the pi/genet
+// PI-NET-14 client uses — now extracted to `crate::net_dns` (the `net_sntp` sharing pattern), which genet
+// migrates onto in a later fold. `resolve()` sends one A-record query over the PERSISTENT UDP stack to the
+// DHCP-provided DNS server (`dns_server()` — the lease's DNS option, else the gateway) and parses the reply
+// with `net_dns::parse_a`. The SNTP client now prefers a resolved `pool.ntp.org` (see `witness_tick_sntp`).
+//
+// Under the hermetic `./arroyo test` slirp backend, slirp's DHCP offers 10.0.2.3 as the DNS server AND
+// forwards queries to the host resolver, so a live boot resolve may actually SUCCEED — captured as a bonus
+// witness. The deterministic `dns_x86_gate` (below, `witness`-feature) proves the parser with canned
+// datagrams in ANY environment and NEVER depends on external reachability.
+// =============================================================================
+
+/// The host the SNTP client resolves for its time source (RFC-standard NTP pool name).
+const SNTP_POOL_HOST: &str = "pool.ntp.org";
+/// SOCK-8 resolver ephemeral source port — distinct from the SOCK-2 witness (49200) and the SNTP client
+/// (49250) so a co-resident witness never collides on a bound port.
+const DNS_SPORT: u16 = 49260;
+/// A fixed transaction id for the resolver's queries. `parse_a` requires the reply to echo it (a mismatch
+/// is a stale/spoofed datagram). ASCII "SD" (Sock-Dns).
+const DNS_TXID: u16 = 0x5344;
+
+/// SOCK-8: resolve `host` to a single IPv4 A record via one bounded, non-blocking UDP query to the
+/// DHCP-provided DNS server (`dns_server()`, gateway fallback). Opens a kernel-owned UDP socket in the
+/// persistent set (`usize::MAX` owner — never a ring-3 slot, so no task teardown frees it), binds the
+/// ephemeral client port, sends the A-record query to `server:53`, pumps for the reply, and parses it with
+/// the shared, hostile-input-hardened `crate::net_dns::parse_a`. Returns the four address octets on a
+/// resolved A record, or `None` on no NIC / query-build failure / no reply / a malformed / no-answer /
+/// server-error reply. The socket is always closed before returning.
+pub fn resolve(host: &str) -> Option<[u8; 4]> {
+    let server = dns_server();
+    let mut qbuf = [0u8; 300];
+    let qlen = crate::net_dns::build_query(&mut qbuf, DNS_TXID, host)?;
+    let sid = stack_open(usize::MAX)?;
+    let _ = stack_bind(sid, DNS_SPORT);
+    let _ = stack_sendto(sid, server, crate::net_dns::DNS_PORT, &qbuf[..qlen]);
+    let mut buf = [0u8; 512];
+    let got = stack_recvfrom(sid, &mut buf);
+    stack_close(sid);
+    let (_src, _port, n) = got?;
+    match crate::net_dns::parse_a(&buf[..n], DNS_TXID) {
+        crate::net_dns::Dns::Resolved(ip) => Some(ip),
+        _ => None, // malformed / no A record / server error — the caller falls back
+    }
+}
+
+/// True once the SOCK-8 boot DNS witness has run (one-shot).
+static WITNESS_DNS_DONE: AtomicBool = AtomicBool::new(false);
+/// service_net call counter — settle past the SOCK-5 DHCP lease (so `dns_server()` sees the leased DNS) but
+/// before the SNTP witness, which reuses the resolver.
+static WITNESS_DNS_TICKS: AtomicU32 = AtomicU32::new(0);
+/// Warm up past SOCK-6's witness (WARMUP 56) + the DHCP lease, and ahead of the SNTP witness (WARMUP 72).
+const WITNESS_DNS_WARMUP: u32 = 64;
+
+/// SOCK-8 boot DNS witness: knob-on, one-shot — resolve `pool.ntp.org` through the shared DNS client and
+/// emit the witness line. Runs on the BSP main loop from `service_net`, AFTER the NET_DEVICE guard drops
+/// (the UDP pump re-locks NET_DEVICE per ring op). Under hermetic slirp the resolve may SUCCEED (10.0.2.3
+/// forwards to the host resolver) — captured as the live-resolve witness; if it times out, the honest
+/// `no answer` line prints instead. Either way the mission stays green. No-op once done / no NIC.
+pub fn witness_tick_dns() {
+    if WITNESS_DNS_DONE.load(Ordering::Relaxed) {
+        return;
+    }
+    if WITNESS_DNS_TICKS.fetch_add(1, Ordering::Relaxed) < WITNESS_DNS_WARMUP {
+        return;
+    }
+    if e1000::hw_addr().is_none() {
+        return;
+    }
+    WITNESS_DNS_DONE.store(true, Ordering::Relaxed);
+
+    let server = dns_server();
+    match resolve(SNTP_POOL_HOST) {
+        Some(ip) => serial_println!(
+            ":: SMOLNET: [dns] {} -> {} (via {}) ::",
+            SNTP_POOL_HOST,
+            e1000::fmt_ip(&ip),
+            e1000::fmt_ip(&server)
+        ),
+        None => serial_println!(
+            ":: SMOLNET: [dns] {} no answer (via {}) — resolver reachable only where the nameserver replies ::",
+            SNTP_POOL_HOST,
+            e1000::fmt_ip(&server)
+        ),
+    }
+}
+
+// --- SOCK-8 deterministic gate (witness-feature): the DNS parser, canned + hermetic ---
+
+/// SOCK-8 deterministic gate (armed by the `witness` battery feature): drive canned DNS datagrams through
+/// the shared `crate::net_dns` parser, asserting each outcome, with NO NIC or network required — so
+/// `./arroyo test` proves x86 DNS parsing correctness in any environment. Prints the self-checking
+/// `:: DNS-X86-GATE: ... PASS [w=0x..] ::` line the x86 battery asserts. Bitmask `w`: 0x01 a well-formed A
+/// reply (with the universal compression pointer in the answer name, NEVER dereferenced) parses to the
+/// exact address; 0x02 a truncated reply (RR cut short) is rejected as `Malformed`; 0x04 a compression LOOP
+/// (a QNAME that is a self-pointer) is rejected WITHOUT hanging (loop-immune by construction); 0x08 a
+/// non-zero RCODE (NXDOMAIN=3) surfaces as `ServerErr(3)`.
+#[cfg(feature = "witness")]
+pub fn dns_x86_gate() {
+    use crate::net_dns::{self, Dns};
+    let mut w: u32 = 0;
+
+    // 0x01 — well-formed A reply parses to the exact address. The answer name is a compression pointer
+    // (0xc0 0x0c) exactly as a real resolver emits — `parse_a` accepts it as a name terminator without
+    // dereferencing it, and still extracts the A RDATA.
+    let mut good = [0u8; 512];
+    let gp = net_dns::build_a_reply(&mut good, DNS_TXID, "example.com", [93, 184, 216, 34], 0, 1)
+        .unwrap_or(0);
+    let parse_ok = matches!(net_dns::parse_a(&good[..gp], DNS_TXID), Dns::Resolved([93, 184, 216, 34]));
+    if parse_ok {
+        w |= 0x01;
+    }
+    serial_println!(
+        ":: [dns-x86] parse well-formed A => {} ::",
+        if parse_ok { "93.184.216.34 PASS" } else { "FAIL" }
+    );
+
+    // 0x02 — a truncated reply (the answer RR cut off mid-header) is rejected. Chop the well-formed reply
+    // to just past the question so the single claimed answer's fixed header runs off the end.
+    let trunc_len = gp.saturating_sub(8); // drop the last 8 bytes of the 16-byte answer RR
+    let rej_trunc = matches!(net_dns::parse_a(&good[..trunc_len], DNS_TXID), Dns::Malformed);
+    if rej_trunc {
+        w |= 0x02;
+    }
+    serial_println!(
+        ":: [dns-x86] reject truncated answer => {} ::",
+        if rej_trunc { "malformed PASS" } else { "FAIL" }
+    );
+
+    // 0x04 — a compression LOOP is rejected without hanging. The QNAME at offset 12 is a self-referential
+    // pointer (0xc0 0x0c → points at itself); `skip_name` treats it as a two-byte terminator and does NOT
+    // follow it (loop-immune by construction), so the walk terminates — and because the claimed single
+    // answer is absent, the parse is rejected as Malformed rather than looping forever.
+    let loop_pkt: [u8; 18] = [
+        0x53, 0x44, // txid = DNS_TXID
+        0x81, 0x80, // QR=1 RD=1 RA=1, rcode 0
+        0x00, 0x01, // QDCOUNT = 1
+        0x00, 0x01, // ANCOUNT = 1 (claimed, but absent)
+        0x00, 0x00, 0x00, 0x00, // NS/AR = 0
+        0xc0, 0x0c, // QNAME = pointer to offset 12 (itself) — a compression loop
+        0x00, 0x01, // QTYPE A
+        0x00, 0x01, // QCLASS IN
+    ];
+    let rej_loop = matches!(net_dns::parse_a(&loop_pkt, DNS_TXID), Dns::Malformed);
+    if rej_loop {
+        w |= 0x04;
+    }
+    serial_println!(
+        ":: [dns-x86] reject compression loop (no hang) => {} ::",
+        if rej_loop { "malformed PASS" } else { "FAIL" }
+    );
+
+    // 0x08 — a non-zero RCODE surfaces as ServerErr. Build an NXDOMAIN (rcode 3), zero answers.
+    let mut nx = [0u8; 64];
+    let np = net_dns::build_a_reply(&mut nx, DNS_TXID, "nope.example", [0, 0, 0, 0], 3, 0).unwrap_or(0);
+    let is_nx = matches!(net_dns::parse_a(&nx[..np], DNS_TXID), Dns::ServerErr(3));
+    if is_nx {
+        w |= 0x08;
+    }
+    serial_println!(
+        ":: [dns-x86] surface NXDOMAIN (rcode 3) => {} ::",
+        if is_nx { "ServerErr(3) PASS" } else { "FAIL" }
+    );
+
+    let pass = w == 0x0f;
+    serial_println!(
+        ":: DNS-X86-GATE: x86 dns client battery {} [w=0x{:x}] (parse-A|reject-truncated|reject-loop|rcode) ::",
         if pass { "PASS" } else { "FAIL" },
         w
     );
