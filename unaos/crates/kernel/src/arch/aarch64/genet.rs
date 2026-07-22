@@ -1427,9 +1427,9 @@ mod metal {
     }
 
     // ── smoltcp interface plumbing (the phy::Device itself is the shared `net_phy::SmoltcpPhy`) ──
-    use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage};
+    use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage};
     use smoltcp::phy::Device;
-    use smoltcp::socket::icmp;
+    use smoltcp::socket::{icmp, tcp};
     use smoltcp::time::Instant;
     use smoltcp::wire::{EthernetAddress, HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress};
 
@@ -1460,11 +1460,153 @@ mod metal {
         iface: Interface,
         dev: SmoltcpPhy<GenetNic>,
         sockets: SocketSet<'static>,
+        /// PI-NET-10: the passively-listening HTTP socket's handle in `sockets`.
+        http: SocketHandle,
+        /// PI-NET-10: our configured IPv4 (leased or static-fallback), shown on the status page.
+        ip: [u8; 4],
+        /// PI-NET-10: set once the current connection's request bytes have arrived, so the response is
+        /// emitted only after the peer's GET is in — cleared on every fresh re-listen.
+        req_seen: bool,
     }
     // Single-core service, touched only behind this mutex on the BSP/AP that owns it — same discipline
     // (and the same raw-DMA reachability through GENET_DEVICE) as `Genet`.
     unsafe impl Send for NetService {}
     static NET_SERVICE: spin::Mutex<Option<NetService>> = spin::Mutex::new(None);
+
+    // ── PI-NET-10: the Pi's first TCP service — a listening socket that serves a status page ──────────
+    //
+    // A single passive TCP socket lives in the persistent SocketSet. `iface.poll` (already driven every
+    // ~4 ms by the net9 task) runs the TCP state machine; each poll we take ONE bounded service step on
+    // the socket: re-arm the listener whenever it falls idle, drain the incoming request, and once the
+    // peer's GET is in and our TX half is open, emit a small HTTP/1.0 status page and close. Because a
+    // smoltcp socket needs an explicit re-listen after RST/close, `http_step` re-listens from EVERY
+    // non-open state — so the service survives repeated requests and rude clients (RST mid-handshake,
+    // half-open close) without wedging. QEMU raspi4b models no GENET, so `genet_bringup` returns before
+    // `bind_smoltcp`/`arm_net_service` ever run: the whole service no-ops under the existing SKIP path.
+    /// The service listens on the well-known HTTP port.
+    const HTTP_PORT: u16 = 80;
+    /// TCP socket ring buffers (bytes). RX holds a browser's request line + headers; TX comfortably holds
+    /// the full response (headers + page) so a single `send_slice` never truncates before `close`.
+    const TCP_RX_CAP: usize = 2048;
+    const TCP_TX_CAP: usize = 4096;
+    /// Rendered-response scratch cap (HTTP headers + body). The body is bounded well under this.
+    const HTTP_RESP_CAP: usize = 1536;
+    const HTTP_BODY_CAP: usize = 1024;
+    /// aarch64 generic-timer tick rate (Hz) — used only to present uptime as scheduler ticks on the page.
+    const TICK_HZ: i64 = 250;
+
+    /// PI-NET-10: cumulative count of status pages served since boot (the `[net10] served N` witness).
+    static NET10_SERVED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    fn net10_served() -> u32 {
+        NET10_SERVED.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Rate-limit for the `[net10]` served witness: mirror net9 — at most once per ~5 s, unless ≥4 new
+    /// requests landed. Change-only (the poll task only reports when the count moved).
+    const NET10_REPORT_DELTA: u32 = 4;
+
+    /// A fixed-buffer `core::fmt::Write` sink (no heap): appends until the buffer is full, then silently
+    /// drops the tail. Every string we format is far under the caller's cap, so no truncation occurs.
+    struct BufWriter<'a> {
+        buf: &'a mut [u8],
+        len: usize,
+    }
+    impl core::fmt::Write for BufWriter<'_> {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let b = s.as_bytes();
+            let n = b.len().min(self.buf.len() - self.len);
+            self.buf[self.len..self.len + n].copy_from_slice(&b[..n]);
+            self.len += n;
+            Ok(())
+        }
+    }
+
+    /// PI-NET-10: render the full HTTP/1.0 response (status line + headers + HTML body) into `out`,
+    /// returning its byte length. The body reports the OS name, the compiled-in hw-pi4 tip sha
+    /// (`UNAOS_GIT_SHA` if the build passed one, else the branch label), uptime, the net9 ARP/ICMP
+    /// reply counters, the served count, and our configured IPv4. Two-pass: body first (to know its
+    /// length for `Content-Length`), then headers + body.
+    fn render_http_response(out: &mut [u8], ip: [u8; 4]) -> usize {
+        use core::fmt::Write as _;
+        let (arp, icmp) = net9_counts();
+        let served = net10_served();
+        let up_ms = now_ms().max(0);
+        let up_ticks = up_ms * TICK_HZ / 1000;
+        let sha = option_env!("UNAOS_GIT_SHA").unwrap_or("hw-pi4");
+
+        let mut body_buf = [0u8; HTTP_BODY_CAP];
+        let mut body = BufWriter { buf: &mut body_buf, len: 0 };
+        let _ = write!(
+            body,
+            "<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\">\
+<title>UnaOS \u{2014} Pi 4</title></head><body>\
+<h1>UnaOS answers</h1>\
+<p>The Raspberry Pi 4's on-board Broadcom GENET v5 GbE is up, and this page came off \
+the kernel's own TCP stack (smoltcp bound over the GENET rings, served by the net9 poll task).</p>\
+<ul>\
+<li>track: <b>hw-pi4</b> (tip {sha})</li>\
+<li>uptime: {up_ms} ms ({up_ticks} ticks @ {TICK_HZ} Hz)</li>\
+<li>net9 replies: arp={arp}, icmp-echo={icmp}</li>\
+<li>pages served: {served}</li>\
+<li>lease ip: {}.{}.{}.{}</li>\
+</ul>\
+<p>PI-NET-10 \u{2014} the Pi's first TCP service.</p>\
+</body></html>\n",
+            ip[0], ip[1], ip[2], ip[3],
+        );
+        let blen = body.len;
+
+        let mut hw = BufWriter { buf: out, len: 0 };
+        let _ = write!(
+            hw,
+            "HTTP/1.0 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\
+Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
+        );
+        let hlen = hw.len;
+        let total = hlen + blen;
+        if total <= out.len() {
+            out[hlen..total].copy_from_slice(&body_buf[..blen]);
+            total
+        } else {
+            // Unreachable given the caps, but never write past the buffer.
+            hlen
+        }
+    }
+
+    impl NetService {
+        /// PI-NET-10: one bounded HTTP service step on the listening socket, run after each `iface.poll`.
+        /// Handles every socket state so the service survives repeated requests and rude clients:
+        /// any non-open state re-arms `listen(:80)`; an open connection's request is drained (path
+        /// ignored — the same status page answers all); once the request is in and TX is writable the
+        /// response is sent and the socket closed. `close()` walks the FIN handshake to `Closed`, where
+        /// the next step re-listens. A peer RST drops the socket straight to `Closed` \u{2014} same path.
+        fn http_step(&mut self) {
+            let ip = self.ip;
+            let sock = self.sockets.get_mut::<tcp::Socket>(self.http);
+            // Re-arm the passive listener from any closed/idle state (post-close, post-RST, or the very
+            // first step after `abort`). `listen` is a no-op if already listening on this port.
+            if !sock.is_open() {
+                let _ = sock.listen(HTTP_PORT);
+                self.req_seen = false;
+                return;
+            }
+            // Drain the request bytes (we serve the same page regardless of method/path). Consuming the
+            // whole RX ring each step keeps per-poll work bounded and the window open.
+            if sock.can_recv() {
+                let _ = sock.recv(|buf| (buf.len(), ()));
+                self.req_seen = true;
+            }
+            // Serve once the request is in and the TX half is writable, then close (half-close via FIN).
+            if self.req_seen && sock.can_send() {
+                let mut resp = [0u8; HTTP_RESP_CAP];
+                let n = render_http_response(&mut resp, ip);
+                let _ = sock.send_slice(&resp[..n]);
+                sock.close();
+                self.req_seen = false;
+                NET10_SERVED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
 
     /// Poll cadence: 1 per-core tick ≈ 4 ms at the 250 Hz aarch64 generic-timer tick.
     const NET9_POLL_TICKS: u64 = 1;
@@ -1479,22 +1621,36 @@ mod metal {
     fn net_service_poll(_: usize) {
         let (mut last_arp, mut last_icmp) = (0u32, 0u32);
         let mut last_report_ms: i64 = 0;
+        // PI-NET-10: served-count witness state (independent of the net9 counters above).
+        let mut last_served = 0u32;
+        let mut last_served_report_ms: i64 = 0;
         loop {
             crate::arch::sched::sleep_ticks(NET9_POLL_TICKS);
             let t = now_ms();
             if let Some(ns) = NET_SERVICE.lock().as_mut() {
                 ns.iface.poll(Instant::from_millis(t), &mut ns.dev, &mut ns.sockets);
+                // PI-NET-10: one bounded HTTP service step after the interface has run its state machine.
+                ns.http_step();
             }
             let (arp, icmp) = net9_counts();
-            if arp == last_arp && icmp == last_icmp {
-                continue; // nothing answered since last poll — stay quiet
+            if arp != last_arp || icmp != last_icmp {
+                let delta = arp.wrapping_sub(last_arp) + icmp.wrapping_sub(last_icmp);
+                if t.saturating_sub(last_report_ms) >= NET9_REPORT_MS || delta >= NET9_REPORT_DELTA {
+                    serial_println!("{} [net9] answered arp={} icmp={} ::", PG, arp, icmp);
+                    last_arp = arp;
+                    last_icmp = icmp;
+                    last_report_ms = t;
+                }
             }
-            let delta = arp.wrapping_sub(last_arp) + icmp.wrapping_sub(last_icmp);
-            if t.saturating_sub(last_report_ms) >= NET9_REPORT_MS || delta >= NET9_REPORT_DELTA {
-                serial_println!("{} [net9] answered arp={} icmp={} ::", PG, arp, icmp);
-                last_arp = arp;
-                last_icmp = icmp;
-                last_report_ms = t;
+            // PI-NET-10: rate-limited, change-only served witness (mirrors the net9 counter cadence).
+            let served = net10_served();
+            if served != last_served
+                && (t.saturating_sub(last_served_report_ms) >= NET9_REPORT_MS
+                    || served.wrapping_sub(last_served) >= NET10_REPORT_DELTA)
+            {
+                serial_println!("{} [net10] served {} requests ::", PG, served);
+                last_served = served;
+                last_served_report_ms = t;
             }
         }
     }
@@ -1505,17 +1661,52 @@ mod metal {
     fn arm_net_service(iface: Interface, dev: SmoltcpPhy<GenetNic>) {
         let storage: &'static mut [SocketStorage; 1] =
             alloc::boxed::Box::leak(alloc::boxed::Box::new(Default::default()));
-        let sockets = SocketSet::new(&mut storage[..]);
-        *NET_SERVICE.lock() = Some(NetService { iface, dev, sockets });
+        let mut sockets = SocketSet::new(&mut storage[..]);
+
+        // PI-NET-10: the Pi's first TCP service. One passive socket with static (leaked) ring buffers —
+        // the same owned-storage discipline GENET_DEVICE/NetService use — listening on :80. `iface.poll`
+        // (driven by the net9 task) then serves it via `NetService::http_step`.
+        let tcp_rx: &'static mut [u8] =
+            alloc::boxed::Box::leak(alloc::boxed::Box::new([0u8; TCP_RX_CAP]));
+        let tcp_tx: &'static mut [u8] =
+            alloc::boxed::Box::leak(alloc::boxed::Box::new([0u8; TCP_TX_CAP]));
+        let mut http_sock = tcp::Socket::new(tcp::SocketBuffer::new(tcp_rx), tcp::SocketBuffer::new(tcp_tx));
+        let listening = http_sock.listen(HTTP_PORT).is_ok();
+        let http = sockets.add(http_sock);
+
+        // The configured IPv4 (leased or static fallback) — shown on the served status page.
+        let ip = iface
+            .ipv4_addr()
+            .map(|a| a.octets())
+            .unwrap_or(OUR_IP);
+
+        if listening {
+            serial_println!("{} [net10] http listening :80 ::", PG);
+        } else {
+            serial_println!("{} [net10] http listen(:80) FAILED — status service will not accept ::", PG);
+        }
+
+        *NET_SERVICE.lock() = Some(NetService { iface, dev, sockets, http, ip, req_seen: false });
 
         // Host the task on a secondary core (never the BSP), like input/render/orphan-reaper. If no AP
         // came up, the service cannot be scheduled — report the degraded state rather than wedge the BSP.
         let online = crate::arch::smp::online_secondaries();
-        match online.first() {
+        // PI-SCHED-1 — net9 is a 4 ms BACKGROUND poll service. The original `online.first()` placement
+        // pinned it to the RENDER core (render is `online.first()`; frame-pacing critical — the skew
+        // net9's own author flagged). At net-arm time every secondary carries the same boot-capstone
+        // load, so there is no live "least-loaded" signal to read yet (`sched::core_load_report()`
+        // exposes the live counts for on-demand checks); instead pin net9 deterministically OFF the
+        // render core, onto the background/orphan-reaper secondary (`online.get(1)` — the most-idle
+        // standing service: the reaper sleeps between orphan teardowns), falling back to the input core
+        // (`last`) and finally the render core only as APs thin out (single-AP boots coincide, exactly
+        // as documented for the input/render split). INPUT/RENDER/reaper placements are untouched
+        // (metal-proven); this only moves net9 off the render core's critical path.
+        let net_cpu = online.get(1).or(online.last()).or(online.first());
+        match net_cpu {
             Some(&cpu) => {
                 crate::arch::sched::spawn("net9", net_service_poll, 0, cpu);
                 serial_println!(
-                    "{} net service task registered (poll every {} ms, core {}) ::",
+                    "{} net service task registered (poll every {} ms, core {} — off render core) ::",
                     PG, NET9_POLL_MS, cpu
                 );
             }

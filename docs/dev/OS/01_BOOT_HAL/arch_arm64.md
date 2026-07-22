@@ -6835,6 +6835,27 @@ If the PHY instead resolves `speed 100M`, the witness makes the previous forced-
 directly, and the MAC is programmed for 100M so the DISCOVER goes out valid — the class-1 fix. A
 `link DOWN` resolution clears `RGMII_LINK` and the bring-up is an honest bounded no-op.
 
+### Persistent net service + the first TCP service (PI-NET-9, PI-NET-10)
+
+`bind_smoltcp`'s DHCP+ping window is bounded — it returns, and the interface stops being polled, so
+nothing could answer the gateway's later ARP who-has / ICMP echo. **PI-NET-9** gives the
+DHCP-configured `Interface` + `Device` a home beyond that window (the static `NET_SERVICE`) and a
+scheduled kernel task (`net9`, hosted on a secondary core) that polls it every ~4 ms; smoltcp's
+`iface.poll` answers ARP + ICMP echo by itself. The `[net9]` witness is rate-limited/change-only.
+
+**PI-NET-10** grows the persistent `SocketSet` to hold one passive TCP socket (static leaked ring
+buffers, `2048` RX / `4096` TX) listening on **:80**, and takes one bounded HTTP service step per poll
+(`NetService::http_step`): re-arm `listen(:80)` from any non-open state (so the service survives
+repeated requests, RST mid-handshake, and half-open closes — a smoltcp socket needs an explicit
+re-listen after RST/close), drain the request (path ignored), then once the request is in and TX is
+writable, emit a small static **HTTP/1.0 200** page (OS name, hw-pi4 tip sha via `option_env!(
+"UNAOS_GIT_SHA")` else the branch label, uptime ms/ticks, the `[net9]` ARP/ICMP reply counters, the
+served count, the configured IPv4) and `close`. Point a browser on the bench LAN at
+`http://192.168.2.3/` (the Mac-bootpd lease) to see UnaOS answer. Witnesses:
+`:: PI-GENET: [net10] http listening :80 ::` once at arm; `:: PI-GENET: [net10] served N requests ::`
+rate-limited/change-only. In QEMU (no GENET) the whole service no-ops under the existing DTB-gated
+SKIP — `genet_bringup` returns before `bind_smoltcp`/`arm_net_service` ever run.
+
 ### Gates green
 
 `./arroyo check` both arches, knob on **and** off; knob-off `./arroyo kernel8-test` = 0 FAIL with
