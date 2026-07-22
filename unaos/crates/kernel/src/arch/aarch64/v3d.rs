@@ -36,6 +36,7 @@
 
 use super::cache;
 use super::mailbox;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 // ─── MMIO bases (ARM physical; Device-nGnRnE-mapped by boot.rs L1[3], the 0xC000_0000–0xFFFF_FFFF
 // GiB block — same window as the mailbox/PL011/GIC, so no new MMU mapping is needed). ───
@@ -464,6 +465,17 @@ pub fn bringup(fb: Option<FbTarget>) {
     // the battery runs. ─────────────────────────────────────────────────────────────────────────
     if m4_pass {
         battery(fb);
+        // PI-APP-1: the block is up, the MMU is programmed, and the visible battery just ran to
+        // completion off `fb`. Latch that state so the `v3d` shell app can REPLAY the visible stages
+        // on the live framebuffer while the system is up (the boot flash is too fast for the monitor
+        // to catch). Replay reuses THIS initialized state — power/clock/PM-ASB/MMU stay enabled from
+        // boot; only the per-stage jobs (which rebuild their own arena control lists idempotently) are
+        // re-kicked. We store the exact FbTarget the boot battery used so replay is byte-for-byte the
+        // same path, and do NOT re-enter `bringup` (which would re-power/re-clock/re-program the MMU).
+        unsafe {
+            V3D_REPLAY_FB = fb;
+        }
+        V3D_REPLAY_READY.store(true, Ordering::Release);
     } else {
         serial_println!(":: V3D: PI-V3D-11 battery SKIPPED — gated on the M4 triangle verdict (FAIL this boot) ::");
     }
@@ -2996,4 +3008,47 @@ fn battery(fb: Option<FbTarget>) {
     m7_multiprim_job(fb);
     m8_blit_scanout(fb);
     super::exceptions::serror_drain_request("v3d: battery exit");
+}
+
+/// The number of VISIBLE battery stages `battery` replays (M5 gradient, M6 animate, M7 multiprim,
+/// M8 blit). Kept as one constant so the `v3d` app's `stages=N` witness never drifts from `battery`.
+const VISIBLE_BATTERY_STAGES: u32 = 4;
+
+// ── PI-APP-1 replay state. Latched once at the tail of a successful boot `bringup` (block up, MMU
+// programmed, visible battery already run). The `v3d` shell app reads it to REPLAY the visible stages
+// on the live framebuffer WITHOUT re-entering the init path. `V3D_REPLAY_FB` is written exactly once
+// (single-threaded boot, pre-shell) and only ever read after `V3D_REPLAY_READY` is observed true, so
+// the plain `static mut` needs no further synchronisation beyond the acquire/release on the flag.
+static V3D_REPLAY_READY: AtomicBool = AtomicBool::new(false);
+static mut V3D_REPLAY_FB: Option<FbTarget> = None;
+
+/// PI-APP-1: replay the VISIBLE V3D battery on the live framebuffer, on demand from the shell.
+///
+/// Re-entry safety: this does NOT call `bringup`. It reuses the state boot already established — the
+/// V3D power domain, clock gate, PM/ASB bridges and the V3D MMU all stay enabled from boot, and the
+/// buffer arena stays identity-mapped. Each visible stage (`m5..m8`) rebuilds its own control list
+/// into fixed arena offsets from scratch and re-kicks the GPU, so re-running them is idempotent — no
+/// static needs re-init and no init step is duplicated. If boot never brought the block up (QEMU
+/// raspi4b returns at BLOCK-DOWN; any fail-closed probe/MMU verdict), the flag is false and we print
+/// a skip witness and touch no MMIO — the serial-only gate stays clean.
+///
+/// Prints `:: V3D: app replay start ::` / `:: V3D: app replay done (stages=N) ::` for the bench.
+/// Returns the number of stages replayed (0 when the block was never up).
+pub fn run_visible_battery_again() -> u32 {
+    serial_println!(":: V3D: app replay start ::");
+    if !V3D_REPLAY_READY.load(Ordering::Acquire) {
+        serial_println!(
+            ":: V3D: app replay done (stages=0) — V3D not brought up this boot (absent/fail-closed); nothing to replay ::"
+        );
+        return 0;
+    }
+    // SAFETY: written once at boot before any shell exists; only read here after the acquire load
+    // above observed the release store, so the FbTarget is fully published.
+    let fb = unsafe { V3D_REPLAY_FB };
+    battery(fb);
+    serial_println!(
+        ":: V3D: app replay done (stages={}) ::",
+        VISIBLE_BATTERY_STAGES
+    );
+    VISIBLE_BATTERY_STAGES
 }

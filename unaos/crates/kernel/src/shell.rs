@@ -1990,7 +1990,12 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
     let args: Vec<&str> = parts.collect();
 
     // The `vug` and `pulse` commands paint full-screen views; everything else leaves the
-    // console visible.
+    // console visible. PI-APP-1: `v3d` blits the visible battery onto the live scanout, so it too
+    // keeps the console off (a repaint would overwrite the replayed tiles). Aarch64+v3d only; the
+    // knob-off build never registers the command, so this OR-clause is constant-folded away there.
+    #[cfg(all(target_arch = "aarch64", feature = "v3d"))]
+    let took_screen = command == "vug" || command == "pulse" || command == "v3d";
+    #[cfg(not(all(target_arch = "aarch64", feature = "v3d")))]
     let took_screen = command == "vug" || command == "pulse";
 
     match command {
@@ -2023,6 +2028,9 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             console.println("          usnapls <gen> [path], usnapcat <gen> <path>  (read a snapshot; current-ACL enforced)");
             console.println("CLOCK:    date, setdate YYYY-MM-DD HH:MM[:SS]  (seeds mtime stamps; unset = honest dashes)");
             console.println("SMP:      sched (per-CPU run queues), pulse (full-screen CPU monitor)");
+            // PI-APP-1: v3d-gated so the knob-off build's help text stays byte-identical to baseline.
+            #[cfg(all(target_arch = "aarch64", feature = "v3d"))]
+            console.println("APPS:     vug (3D sculptor), v3d (replay the visible GPU graphics battery)");
             console.println("POWER:    batmon (SMC battery snapshot; x86 UNAOS_SMC=1 only)");
             console.println("WITNESS:  bootlog (boot-milestone ring: PORTSW / FTDI console / EHCI HID / block / GUI handoff)");
             console.println("TEST:     tste (in-OS self-test suite: boot-replay + live checks)");
@@ -2744,6 +2752,25 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                      console.draw(pal); // clean exit: restore the shell over the demo
                  }
              }
+        },
+        // PI-APP-1: the V3D visible-battery app. Registered in the same launcher path as `vug` (a
+        // shell-command match arm — the kernel's convention for a launchable UI program). It replays
+        // the four visible V3D stages (gradient / animate / multi-primitive / blit) onto the live
+        // framebuffer so the graphics are watchable while the system is up — the boot-time battery
+        // flashes past before the monitor wakes. Reuses the state boot established (no GPU re-init);
+        // the `:: V3D: app replay ... ::` witnesses go to serial for the bench. Aarch64+v3d only, so
+        // the knob-off build is byte-identical (the whole arm vanishes with the feature).
+        #[cfg(all(target_arch = "aarch64", feature = "v3d"))]
+        "v3d" => {
+            console.println("V3D: replaying the visible graphics battery (press any key)...");
+            let n = crate::arch::aarch64::v3d::run_visible_battery_again();
+            if n == 0 {
+                // Block never came up this boot (QEMU / fail-closed) — nothing landed on screen, so
+                // restore the console rather than leaving a blank take-screen.
+                console.println("V3D: not available on this boot (GPU absent or bring-up skipped).");
+                console.draw(pal);
+            }
+            // On a real replay `took_screen` keeps the console off the freshly-blitted tiles.
         },
         "pulse" => {
             // UI1-M3: the full-screen system monitor (BeOS Pulse homage). Any key exits; the
