@@ -2190,16 +2190,18 @@ fn blit_m4_target(fb: &FbTarget) {
 // ATTENDED-METAL-UNVERIFIED throughout — QEMU raspi4b returns at BLOCK-DOWN long before this runs.
 //
 // ── QPU-word provenance (the standing thrice-convicted rule — no fabricated bit patterns) ────────
-// Every NEW 64-bit word below is derived from the PI-V3D-9 Mesa-packer-verified vectors already in
-// this file by SINGLE-FIELD surgery, where the touched field's encoding is itself corroborated by
-// multiple in-file verified words (the same "CT1 = CT0 + 4" class the CT0 registers used):
+// GRAD_VS_WORDS (the render-path M5 vertex shader) is FULLY Mesa-packed (v3d_qpu_instr_pack, ver 42) +
+// round-tripped by scripts/pi-v3d22-qpu-gen.c — see its .out.txt; PI-V3D-22 switched it off the
+// (dead-on-4.x) mov-vpm/vpmsetup mechanism to STVPMV, so no `mov vpm` word remains to derive from.
+// GRAD_FS_WORDS below is still derived from the PI-V3D-9 Mesa-packer-verified vectors already in this
+// file by SINGLE-FIELD surgery, where the touched field's encoding is itself corroborated by multiple
+// in-file verified words (the same "CT1 = CT0 + 4" class the CT0 registers used):
 //   * SIG field [57:53]: corroborated by nop(sig=0), thrsw(sig=1 → bit53, in-file 0x3c20…) and
 //     ldunifrf(sig=12 → bits56+55, in-file 0x3d80…). ldvary is sig=8 (Mesa qpu_pack.c v41 sig map,
 //     the same table that yields 1/12 for the corroborated entries) → bit56 alone.
 //   * SIG dest addr [51:46] (rf#): corroborated by the in-file ldunifrf.rf0..rf3 (+0x0000/bit46/
 //     bit47/bits46+47) and ldunifrf.rf5 words.
 //   * WADDR_A [37:32]: corroborated by the in-file ldvpmv_in rf0..rf3 sequence (+0..3 at bit 32).
-//   * RADDR_A [11:6]: corroborated by the in-file `mov vpm, rf0..rf3` sequence (+0x00/0x40/0x80/0xc0).
 // The gradient-FS SEMANTICS (raw ldvary A-coefficients written to the TLB without the fmul/fadd(W,C)
 // interpolation evaluation) are the honest metal-refinement seam of this arc, exactly like the
 // PI-V3D-9 viewport/VPM quantities — flagged at the M5 verdict.
@@ -2209,9 +2211,9 @@ fn blit_m4_target(fb: &FbTarget) {
 const OFF_M5_TARGET: usize = 0x21000; // [16 KiB) M5 gradient render target
 const OFF_M5_VTX: usize = 0x25000; // 3 verts × 32 B (vec4 pos + vec4 colour, interleaved)
 const OFF_M5_FS_CODE: usize = 0x25800; // gradient fragment shader (ldvary path)
-const OFF_M5_VS_CODE: usize = 0x26000; // gradient vertex shader (8-word VPM passthrough)
+const OFF_M5_VS_CODE: usize = 0x26000; // gradient vertex shader (render-path STVPMV output)
 const OFF_M5_FS_UNIF: usize = 0x26800; // gradient FS uniforms (alpha + TLB configs)
-const OFF_M5_VS_UNIF: usize = 0x26880; // gradient VS uniforms (8 VPM read-offsets)
+const OFF_M5_VS_UNIF: usize = 0x26880; // gradient VS uniforms (8 in-offsets + XY/Z scale + 8 out-offsets)
 const OFF_M5_SHADREC: usize = 0x26900; // M5 shader record + 2 attribute records (32-B aligned)
 const OFF_M5_BIN_CL: usize = 0x27000;
 const OFF_M5_RCL: usize = 0x28000;
@@ -2246,30 +2248,81 @@ const GRAD_FS_WORDS: [u64; 10] = [
     0x3c00_3186_bb80_0000, // nop
 ];
 
-/// M5 gradient VERTEX shader: the CS_VS_WORDS passthrough widened to EIGHT VPM words (vec4 position +
-/// vec4 colour varying source). Destinations rf0..rf3 + rf6..rf9 (rf4/rf5 skipped: rf5 is the live
-/// read-offset register the ldunifrf reload targets — a dest collision would clobber it). Each word is
-/// its CS_VS_WORDS counterpart with only WADDR_A (ldvpmv) or RADDR_A (mov vpm) advanced.
-const GRAD_VS_WORDS: [u64; 21] = [
-    0x3d81_6180_bc80_6140, // ldvpmv_in rf0, rf5 ; ldunifrf.rf5   (pos.x)  [verbatim]
-    0x3d81_6181_bc80_6140, // ldvpmv_in rf1, rf5 ; ldunifrf.rf5   (pos.y)  [verbatim]
-    0x3d81_6182_bc80_6140, // ldvpmv_in rf2, rf5 ; ldunifrf.rf5   (pos.z)  [verbatim]
-    0x3d81_6183_bc80_6140, // ldvpmv_in rf3, rf5 ; ldunifrf.rf5   (pos.w)  [verbatim]
-    0x3d81_6186_bc80_6140, // ldvpmv_in rf6, rf5 ; ldunifrf.rf5   (col.r)  [WADDR_A 3→6]
-    0x3d81_6187_bc80_6140, // ldvpmv_in rf7, rf5 ; ldunifrf.rf5   (col.g)  [WADDR_A 3→7]
-    0x3d81_6188_bc80_6140, // ldvpmv_in rf8, rf5 ; ldunifrf.rf5   (col.b)  [WADDR_A 3→8]
-    0x3d81_6189_bc80_6140, // ldvpmv_in rf9, rf5 ; ldunifrf.rf5   (col.a)  [WADDR_A 3→9]
-    0x3c00_3186_bb81_e140, // vpmsetup -, rf5     [verbatim]
-    0x3c00_3386_bbf8_0000, // mov vpm, rf0        (pos.x)  [verbatim]
-    0x3c00_3386_bbf8_0040, // mov vpm, rf1        (pos.y)  [verbatim]
-    0x3c00_3386_bbf8_0080, // mov vpm, rf2        (pos.z)  [verbatim]
-    0x3c00_3386_bbf8_00c0, // mov vpm, rf3        (pos.w)  [verbatim]
-    0x3c00_3386_bbf8_0180, // mov vpm, rf6        (col.r)  [RADDR_A 3→6]
-    0x3c00_3386_bbf8_01c0, // mov vpm, rf7        (col.g)  [RADDR_A 3→7]
-    0x3c00_3386_bbf8_0200, // mov vpm, rf8        (col.b)  [RADDR_A 3→8]
-    0x3c00_3386_bbf8_0240, // mov vpm, rf9        (col.a)  [RADDR_A 3→9]
-    0x3c00_3186_bb81_6000, // vpmwt               [verbatim]
-    0x3c20_3186_bb80_0000, // nop ; thrsw
+/// M5 gradient VERTEX shader — the RENDER-path VS, written with the V3D 4.2 STVPMV output mechanism.
+///
+/// PI-V3D-22 applies the PI-V3D-20 root-cause fix to this shader. The prior body wrote its per-vertex
+/// VPM output with the streamed VC4 / V3D-3.3 mechanism — `vpmsetup` + `mov vpm, rfN` (magic waddr
+/// VPM=14) — which DOES NOT EXIST for per-vertex shader output on V3D 4.x (ver==42, the Pi 4). Mesa's
+/// `vir_VPM_WRITE` (src/broadcom/compiler/nir_to_vir.c) emits ONE `vir_STVPMV(c, vir_uniform_ui(c,
+/// vpm_index), val)` per output component — a store-VPM with an EXPLICIT VPM offset — and no
+/// `mov vpm`/`vpmsetup` in the ver-42 VS output path. The old `mov vpm` writes went to an unconfigured
+/// magic register; the rasterizer read nothing. `vpmsetup` is DROPPED; VPMWT stays (GFXH-1684).
+///
+/// NON-COORD (render) VPM CONTRACT — Mesa `v3d_nir_setup_vpm_layout_vs` (v3d_nir_lower_io.c), for
+/// is_coord==false / is_last_geometry_stage: the position block is FOUR words —
+///     [Xs @0, Ys @1, Zs @2, 1/Wc @3]  — then user varyings at offset 4+.
+/// This is NOT the six-word coordinate-shader layout ([Xc,Yc,Zc,Wc, Xs,Ys]); the render VS does not
+/// emit the four clip words (only the is_coord path does, at offsets 0..3). PI-V3D-18 landed this split.
+///
+/// SCREEN MATH — Mesa `v3d_nir_emit_ff_vpm_outputs` (same file): rcp_wc = frcp(Wc);
+///     Xs = f2i32(ffloor(Xc·vp_scale·rcp_wc)), Ys likewise (ffloor is the ver==42 branch);
+///     Zs = Zc·viewport_z_scale·rcp_wc + viewport_z_offset;  out3 = rcp_wc.
+/// vp_scale = viewport.scale(32)·clipper_xy_granularity(256) = 8192. viewport_z_scale/offset are the
+/// SAME viewport Z params the M5 RCL programs into CLIPPER_Z_SCALE_AND_OFFSET (0.5/0.5), sourced here
+/// as uniforms exactly as Mesa sources QUNIFORM_VIEWPORT_Z_SCALE/_OFFSET.
+///
+/// W=1 SIMPLIFICATION (LOUD, same stance as PI-V3D-19/20): M5's TRI_VERTS all carry Wc = 1.0, so
+/// rcp_wc = 1.0 and NO reciprocal is emitted — Xs = f2i32(floor(Xc·8192)); Zs = Zc·0.5 + 0.5; the
+/// 1/Wc word is the rf3 (Wc) passthrough, exact because Wc==1.0. A perspective draw (W≠1) would need a
+/// per-vertex reciprocal restored on Xs/Ys/Zs here.
+///
+/// Register map: rf0..3 = clip Xc,Yc,Zc,Wc; rf5 = in read-offset (reused); rf6 = 8192.0; rf7 = Xs;
+/// rf8 = Ys; rf10..13 = colour r,g,b,a; rf14 = z_scale; rf15 = z_offset; rf16 = Zs; rf20..27 = the
+/// eight output VPM offsets 0..7 (Mesa-sourced as ui uniforms). Uniform FIFO: [in-off 0..7, 8192.0f,
+/// 0.5f, 0.5f, out-off 0..7] = 19 words. Colour flows VS→FS as four varyings @4..7 (num_varyings=4,
+/// record unchanged); the FS's raw (un-interpolated) varying read stays the M5 metal-refinement seam.
+///
+/// PROVENANCE: every word Mesa-packed (v3d_qpu_instr_pack, ver 42) + round-tripped by
+/// scripts/pi-v3d22-qpu-gen.c (see its .out.txt); the carried V3D-20 words (ldvpmv_in, fmul/ffloor/
+/// ftoiz, stvpmv) are bit-identical to CS_VS_WORDS. QEMU models no V3D — metal decides.
+const GRAD_VS_WORDS: [u64; 39] = [
+    0x3d81_6180_bc80_6140, // ldvpmv_in rf0, rf5 ; ldunifrf.rf5   (pos.Xc)
+    0x3d81_6181_bc80_6140, // ldvpmv_in rf1, rf5 ; ldunifrf.rf5   (pos.Yc)
+    0x3d81_6182_bc80_6140, // ldvpmv_in rf2, rf5 ; ldunifrf.rf5   (pos.Zc)
+    0x3d81_6183_bc80_6140, // ldvpmv_in rf3, rf5 ; ldunifrf.rf5   (pos.Wc)
+    0x3d81_618a_bc80_6140, // ldvpmv_in rf10, rf5 ; ldunifrf.rf5  (col.r)
+    0x3d81_618b_bc80_6140, // ldvpmv_in rf11, rf5 ; ldunifrf.rf5  (col.g)
+    0x3d81_618c_bc80_6140, // ldvpmv_in rf12, rf5 ; ldunifrf.rf5  (col.b)
+    0x3d81_618d_bc80_6140, // ldvpmv_in rf13, rf5 ; ldunifrf.rf5  (col.a)
+    0x3d81_b186_bb80_0000, // nop ; ldunifrf.rf6    (rf6 <- 8192.0f vp_scale)
+    0x3d83_b186_bb80_0000, // nop ; ldunifrf.rf14   (rf14 <- viewport_z_scale 0.5f)
+    0x3d83_f186_bb80_0000, // nop ; ldunifrf.rf15   (rf15 <- viewport_z_offset 0.5f)
+    0x3d85_3186_bb80_0000, // nop ; ldunifrf.rf20   (out-offset 0)
+    0x3d85_7186_bb80_0000, // nop ; ldunifrf.rf21   (out-offset 1)
+    0x3d85_b186_bb80_0000, // nop ; ldunifrf.rf22   (out-offset 2)
+    0x3d85_f186_bb80_0000, // nop ; ldunifrf.rf23   (out-offset 3)
+    0x3d86_3186_bb80_0000, // nop ; ldunifrf.rf24   (out-offset 4)
+    0x3d86_7186_bb80_0000, // nop ; ldunifrf.rf25   (out-offset 5)
+    0x3d86_b186_bb80_0000, // nop ; ldunifrf.rf26   (out-offset 6)
+    0x3d86_f186_bb80_0000, // nop ; ldunifrf.rf27   (out-offset 7)
+    0x5400_11c6_bbf8_0006, // fmul rf7, rf0, rf6    (Xc · 8192.0 ; W=1 so no 1/Wc)
+    0x3c00_2187_f680_61c0, // ffloor rf7, rf7       (floor, ver==42 path)
+    0x3c00_2187_f583_e1c0, // ftoiz rf7, rf7        (f2i32 -> Xs)
+    0x5400_1206_bbf8_0046, // fmul rf8, rf1, rf6    (Yc · 8192.0)
+    0x3c00_2188_f680_6200, // ffloor rf8, rf8       (floor, ver==42 path)
+    0x3c00_2188_f583_e200, // ftoiz rf8, rf8        (f2i32 -> Ys)
+    0x5400_1406_bbf8_008e, // fmul rf16, rf2, rf14  (Zc · z_scale ; W=1 so no 1/Wc)
+    0x3c00_2190_0583_e40f, // fadd rf16, rf16, rf15 (+ z_offset -> Zs)
+    0x3c00_2180_f883_e507, // stvpmv rf20, rf7      (out0 screen Xs @ offset 0)
+    0x3c00_2180_f883_e548, // stvpmv rf21, rf8      (out1 screen Ys @ offset 1)
+    0x3c00_2180_f883_e590, // stvpmv rf22, rf16     (out2 screen Zs @ offset 2)
+    0x3c00_2180_f883_e5c3, // stvpmv rf23, rf3      (out3 1/Wc = Wc = 1.0 @ offset 3)
+    0x3c00_2180_f883_e60a, // stvpmv rf24, rf10     (out4 varying col.r @ offset 4)
+    0x3c00_2180_f883_e64b, // stvpmv rf25, rf11     (out5 varying col.g @ offset 5)
+    0x3c00_2180_f883_e68c, // stvpmv rf26, rf12     (out6 varying col.b @ offset 6)
+    0x3c00_2180_f883_e6cd, // stvpmv rf27, rf13     (out7 varying col.a @ offset 7)
+    0x3c00_3186_bb81_6000, // vpmwt                 (VPM writes complete before end)
+    0x3c20_3186_bb80_0000, // nop ; thrsw           (end)
     0x3c00_3186_bb80_0000, // nop
     0x3c00_3186_bb80_0000, // nop
 ];
@@ -2942,7 +2995,7 @@ fn write_vert4(off: usize, v: [f32; 4]) {
 fn m5_gradient_job(fb: Option<FbTarget>) {
     serial_println!(":: V3D: M5 gradient — per-vertex colour varyings (ldvary FS) ::");
 
-    // Shaders: verified CS (position passthrough) for binning; the widened gradient VS + ldvary FS.
+    // Shaders: verified CS (position passthrough) for binning; the render-path STVPMV gradient VS + ldvary FS.
     let vs_len = write_shader_words(OFF_M5_VS_CODE, &GRAD_VS_WORDS);
     let fs_len = write_shader_words(OFF_M5_FS_CODE, &GRAD_FS_WORDS);
     cache::clean_range(arena_phys() + OFF_M5_VS_CODE, vs_len);
@@ -2954,12 +3007,21 @@ fn m5_gradient_job(fb: Option<FbTarget>) {
         arena_write_u32(OFF_M5_FS_UNIF + i * 4, *w);
     }
     cache::clean_range(arena_phys() + OFF_M5_FS_UNIF, unif.len() * 4);
-    // VS uniforms: EIGHT VPM read-offsets (vec4 pos + vec4 colour); metal-refinement surface like the
-    // 4-offset stream PI-V3D-9 flagged.
-    for i in 0..8u32 {
-        arena_write_u32(OFF_M5_VS_UNIF + (i as usize) * 4, i);
+    // VS uniforms (PI-V3D-22): the render-path VS FIFO — eight VPM in-offsets (vec4 pos + vec4 colour),
+    // then the 8192.0f XY scale, the viewport Z scale/offset (0.5/0.5, the CLIPPER_Z params), then the
+    // eight output VPM offsets 0..7 the STVPMV stores consume (Mesa sources these as vir_uniform_ui).
+    // In-offsets are the metal-refinement surface; the scales/out-offsets are the Mesa contract values.
+    let vs_unif: [u32; 19] = [
+        0, 1, 2, 3, 4, 5, 6, 7, // VPM read-offsets (pos.xyzw, col.rgba)
+        0x4600_0000,            // 8192.0f32 vp_scale
+        0x3F00_0000,            // 0.5f32 viewport_z_scale
+        0x3F00_0000,            // 0.5f32 viewport_z_offset
+        0, 1, 2, 3, 4, 5, 6, 7, // output VPM offsets 0..7
+    ];
+    for (i, w) in vs_unif.iter().enumerate() {
+        arena_write_u32(OFF_M5_VS_UNIF + i * 4, *w);
     }
-    cache::clean_range(arena_phys() + OFF_M5_VS_UNIF, 8 * 4);
+    cache::clean_range(arena_phys() + OFF_M5_VS_UNIF, vs_unif.len() * 4);
 
     // Interleaved vertex data: [pos vec4 | colour vec4] × 3, stride 32 B. Colours are the f32
     // decomposition of the per-vertex primaries.

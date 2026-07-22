@@ -1,0 +1,50 @@
+== packer self-test vs Mesa qpu_disasm.c vectors (ver 42) ==
+  0x3c003186bb800000  ; nop (canonical)
+  selftest nop                          0x3c003186bb800000 OK
+  0x3c002380b6edb000  ; or rf0, r3, r3 ; mov vpm, r3
+  selftest or rf0,r3,r3;mov vpm,r3      0x3c002380b6edb000 OK
+  0x3c20318105829000  ; fadd r1, r1, r5 ; thrsw
+  selftest fadd r1,r1,r5;nop;thrsw      0x3c20318105829000 OK
+
+== M5 gradient VERTEX shader (OFF_M5_VS_CODE), STVPMV render-path output ==
+  0x3d816180bc806140  ; ldvpmv_in rf0, rf5 ; ldunifrf.rf5  (pos.Xc)
+  0x3d816181bc806140  ; ldvpmv_in rf1, rf5 ; ldunifrf.rf5  (pos.Yc)
+  0x3d816182bc806140  ; ldvpmv_in rf2, rf5 ; ldunifrf.rf5  (pos.Zc)
+  0x3d816183bc806140  ; ldvpmv_in rf3, rf5 ; ldunifrf.rf5  (pos.Wc)
+  0x3d81618abc806140  ; ldvpmv_in rf10, rf5 ; ldunifrf.rf5  (col.r)
+  0x3d81618bbc806140  ; ldvpmv_in rf11, rf5 ; ldunifrf.rf5  (col.g)
+  0x3d81618cbc806140  ; ldvpmv_in rf12, rf5 ; ldunifrf.rf5  (col.b)
+  0x3d81618dbc806140  ; ldvpmv_in rf13, rf5 ; ldunifrf.rf5  (col.a)
+  0x3d81b186bb800000  ; nop ; ldunifrf.rf6    (rf6 <- 8192.0f vp_scale)
+  0x3d83b186bb800000  ; nop ; ldunifrf.rf14   (rf14 <- viewport_z_scale 0.5f)
+  0x3d83f186bb800000  ; nop ; ldunifrf.rf15   (rf15 <- viewport_z_offset 0.5f)
+  0x3d853186bb800000  ; nop ; ldunifrf.rf20   (out-offset 0)
+  0x3d857186bb800000  ; nop ; ldunifrf.rf21   (out-offset 1)
+  0x3d85b186bb800000  ; nop ; ldunifrf.rf22   (out-offset 2)
+  0x3d85f186bb800000  ; nop ; ldunifrf.rf23   (out-offset 3)
+  0x3d863186bb800000  ; nop ; ldunifrf.rf24   (out-offset 4)
+  0x3d867186bb800000  ; nop ; ldunifrf.rf25   (out-offset 5)
+  0x3d86b186bb800000  ; nop ; ldunifrf.rf26   (out-offset 6)
+  0x3d86f186bb800000  ; nop ; ldunifrf.rf27   (out-offset 7)
+  0x540011c6bbf80006  ; fmul rf7, rf0, rf6   (Xc * 8192.0 ; W=1 so no 1/Wc)
+  0x3c002187f68061c0  ; ffloor rf7, rf7      (floor, ver==42 path)
+  0x3c002187f583e1c0  ; ftoiz rf7, rf7       (f2i32)
+  0x54001206bbf80046  ; fmul rf8, rf1, rf6   (Yc * 8192.0)
+  0x3c002188f6806200  ; ffloor rf8, rf8      (floor, ver==42 path)
+  0x3c002188f583e200  ; ftoiz rf8, rf8       (f2i32)
+  0x54001406bbf8008e  ; fmul rf16, rf2, rf14 (Zc * z_scale ; W=1 so no 1/Wc)
+  0x3c0021900583e40f  ; fadd rf16, rf16, rf15 (+ z_offset -> Zs)
+  0x3c002180f883e507  ; stvpmv rf20, rf7   (out0 screen Xs)
+  0x3c002180f883e548  ; stvpmv rf21, rf8   (out1 screen Ys)
+  0x3c002180f883e590  ; stvpmv rf22, rf16  (out2 screen Zs)
+  0x3c002180f883e5c3  ; stvpmv rf23, rf3   (out3 1/Wc = Wc = 1.0, W=1)
+  0x3c002180f883e60a  ; stvpmv rf24, rf10   (out4 varying col.r)
+  0x3c002180f883e64b  ; stvpmv rf25, rf11   (out5 varying col.g)
+  0x3c002180f883e68c  ; stvpmv rf26, rf12   (out6 varying col.b)
+  0x3c002180f883e6cd  ; stvpmv rf27, rf13   (out7 varying col.a)
+  0x3c003186bb816000  ; vpmwt   (GFXH-1684: VPM writes complete)
+  0x3c203186bb800000  ; nop ; thrsw   (end)
+  0x3c003186bb800000  ; nop
+  0x3c003186bb800000  ; nop
+
+All words packed + round-tripped OK.
