@@ -418,6 +418,62 @@ What **Peter** sees: the Pi appears by name in Safari's Bonjour/network browser 
 
 ---
 
+## 4c. "UnaOS says no fast" — mDNS negative responses (PI-NET-18)
+
+net11/net17 make the Pi *answer* the queries it can. But a macOS/Safari client always queries
+**A and AAAA in parallel** for any `.local` name, and UnaOS has no IPv6. The mDNS responder used to
+simply drop the AAAA query (owned name, unmatched QTYPE → `None`), so the client waited out a
+timeout before falling back to the A address — the "trying really hard" first-connection stall.
+PI-NET-18 closes that: when a query asks a type we do **not** hold for a name we **own**, we answer
+with an **NSEC** record (RFC 6762 §6.1) that asserts exactly which types the name *does* have. The
+client learns immediately "no AAAA exists here" and proceeds on the A address with no timeout.
+
+**What changed.** `mdns_classify` no longer drops an owned-name/unmatched-QTYPE query — it returns
+`MdnsAsk::Nsec(NsecName)` keyed to which name matched. `mdns_step` dispatches it to
+`build_nsec_response`. A name we do **not** own is still dropped silently (unchanged). The
+hostile-input decoder (`mdns_read_name`) and the bounds-checked `put_*`/`rec_*` writers are reused
+verbatim — `rec_nsec` bounds-checks every append and drops the response on overflow.
+
+**The NSEC record** (`rec_nsec`, RFC 4034 §4 / RFC 6762 §6.1): NAME, TYPE=NSEC (47),
+CLASS = IN | cache-flush (`0x8001`), TTL 120, RDATA = the **Next Domain Name** (in mDNS this is the
+record's *own* name — there is no ordered zone) followed by **one type bitmap window**. Every type we
+advertise (A=1, PTR=12, TXT=16, SRV=33) is < 256, so window block 0 covers them all and a single
+window suffices. The bitmap is **MSB-first within each byte** (RFC 4034 §4.1.2: bit *k* of window *b*
+= type `256·b + k`), and its length is trimmed to the highest byte carrying a set bit:
+
+| Owned name | Types present | Bitmap field bytes (window, len, bitmap…) |
+| --- | --- | --- |
+| `unaos.local` | A (1) | `00 01 40` |
+| instance (`"UnaOS Pi 4"._http._tcp.local`) | SRV (33) + TXT (16) | `00 05 00 00 80 00 40` |
+| `_http._tcp.local` / `_services._dns-sd._udp.local` | PTR (12) | `00 02 00 10` |
+
+For A=1: byte 0, bit `7-(1%8)=6` → `0x40`. For TXT=16: byte 2, bit `7-0=7` → `0x80`. For SRV=33:
+byte 4, bit `7-1=6` → `0x40`.
+
+**Proactive NSEC (RFC 6762 §6.2).** The host **A** answer (`build_mdns_response`) now also stuffs the
+host NSEC (A-only) as an **ADDITIONAL** record (ANCOUNT=1, ARCOUNT=1), so a client that also wanted
+AAAA never even has to ask — the negative arrives with the positive. The builder was rewritten onto
+the same `rec_a`/`rec_nsec`/`put_*` helpers (previously hand-indexed).
+
+**Census.** A `[net18] nsec <N>` witness (change-only, rate-limited, same cadence as `[net17]`) counts
+NSEC responses emitted.
+
+* **Negative-response gate** (`nettest::run18`, same hardware-free loopback seam + scripted peer):
+  `:: NET18-GATE: mdns negative-response battery PASS [w=0xf] (host-nsec|instance-nsec|foreign-silence|a-additional) ::`
+  * `0x1` AAAA `unaos.local` → NSEC asserting A-only, **exact bitmap `00 01 40`**; `0x2` AAAA the
+    instance → NSEC asserting SRV+TXT, **exact bitmap `00 05 00 00 80 00 40`**; `0x4` AAAA for a name we
+    do not own → silence (no reply, no counter move); `0x8` the host A answer carries the NSEC
+    additional (ARCOUNT≥1, bitmap `00 01 40`).
+
+  (NET17's scenario D — "unknown QTYPE ignored" — was retargeted to a **foreign** name, since an unknown
+  type for a name we *own* now legitimately gets an NSEC; the owned-name negative path is NET18's.)
+
+Expected **metal effect.** First-connection latency from Safari to `http://unaos.local/` drops: the
+parallel AAAA query is answered instantly with a negative instead of timing out, removing the
+multi-second "trying really hard" stall on the first connect.
+
+---
+
 ## 5. Bench verification
 
 | Claim | Arc / commit | Boot | Verdict |
@@ -438,6 +494,8 @@ What **Peter** sees: the Pi appears by name in Safari's Bonjour/network browser 
 | "UnaOS knows what time it is" — SNTP sync | NET-16 | *(pending metal)* | `[net16] dns pool.ntp.org -> <ip>` + `[net16] sntp <ip> -> <iso>Z (stratum N, rtt ~M ms)`; status page gains a `time (UTC)` line; or an honest `sntp timeout` |
 | DNS-SD advertisement gate runs off-metal | NET-17 `nettest` | QEMU raspi4b (`UNAOS_NETTEST=1 UNAOS_PI=1 kernel8-test`) | `:: NET17-GATE: ... PASS [w=0xf] ::` — PTR query → PTR+SRV+TXT+A bundle (field-asserted), meta-query → service-type PTR, malformed query ignored, unknown QTYPE ignored |
 | "UnaOS is discoverable" — DNS-SD `_http._tcp` | NET-17 | *(pending metal)* | `[net17] dns-sd advertising _http._tcp.local instance "UnaOS Pi 4" :80 (announce x3)` + `[net17] dns-sd announced _http._tcp (UnaOS Pi 4 -> unaos.local:80)`; Pi appears by name in Safari's Bonjour browser / `dns-sd -B _http._tcp` on the Mac |
+| mDNS negative-response (NSEC) gate runs off-metal | NET-18 `nettest` | QEMU raspi4b (`UNAOS_NETTEST=1 UNAOS_PI=1 kernel8-test`) | `:: NET18-GATE: ... PASS [w=0xf] ::` — AAAA `unaos.local` → NSEC A-only (bitmap `00 01 40`), AAAA instance → NSEC SRV+TXT (`00 05 00 00 80 00 40`), AAAA foreign name → silence, host A answer stuffs NSEC additional |
+| "UnaOS says no fast" — NSEC negative for AAAA | NET-18 | *(pending metal)* | first-connection Safari stall gone (AAAA answered negative, no timeout); `dns-sd -q unaos.local AAAA` returns a negative immediately; `[net18] nsec N` witness counts responses |
 
 QEMU `raspi4b` (bcm2838) does **not** model GENET; the DTB census makes bring-up a
 clean pre-MMIO skip (`kernel8-test` stays green). Every *metal* finding above is

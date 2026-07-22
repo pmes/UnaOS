@@ -1256,6 +1256,13 @@ mod metal {
         #[cfg(feature = "nettest")]
         nettest::run17();
 
+        // PI-NET-18: the RFC 6762 §6.1 negative-response gate — the scripted peer sends AAAA queries for
+        // names we own (expect an NSEC asserting the types that DO exist, exact bitmap bytes) and for a name
+        // we do not own (expect silence), and checks the host A answer stuffs an NSEC additional (§6.2).
+        // Prints `:: NET18-GATE: ... PASS [w=0x..] ::` the battery asserts.
+        #[cfg(feature = "nettest")]
+        nettest::run18();
+
         // ── M1: resolve the register base from the DTB. NO DTB node => QEMU / DTB-less boot: this build
         //    does NOT model GENET, and touching the register window would FAULT (external abort), not
         //    return poison. Skip BEFORE any MMIO — the piusb `dtb_has_pcie` discipline. This is the
@@ -1871,51 +1878,20 @@ Connection: close\r\nServer: UnaOS/genet\r\n\r\n",
         NET11_ANSWERED.load(core::sync::atomic::Ordering::Relaxed)
     }
 
-    /// PI-NET-11: build a standard mDNS A-record response for `unaos.local` -> `ip` into `out`, returning
-    /// its byte length. QR=1 AA=1, QDCOUNT=0 (mDNS responses do not echo the question), one A answer with
-    /// the cache-flush bit set in its class, TTL `MDNS_TTL`, RDATA = the four lease octets. `out` must be
-    /// at least `MDNS_RESP_LEN` bytes; the answer is a fixed 39 bytes.
+    /// PI-NET-11 / PI-NET-18: build a standard mDNS A-record response for `unaos.local` -> `ip` into `out`,
+    /// returning its byte length. QR=1 AA=1, QDCOUNT=0 (mDNS responses do not echo the question). The A
+    /// answer carries the cache-flush bit, TTL `MDNS_TTL`, RDATA = the four lease octets. PI-NET-18 also
+    /// stuffs an NSEC record (RFC 6762 §6.2) as an ADDITIONAL, asserting the host has A only — so a client
+    /// that also wanted AAAA learns immediately none exists, without a second query (ANCOUNT=1, ARCOUNT=1).
+    /// The writers are the same bounds-checked `rec_*`/`put_*` helpers the DNS-SD builders use.
     fn build_mdns_response(out: &mut [u8], ip: [u8; 4]) -> usize {
-        // 12 (header) + 13 (name: 5+"unaos"+5+"local"+0) + 2 (type) + 2 (class) + 4 (ttl) + 2 (rdlen)
-        // + 4 (rdata) = 39.
-        const RESP_LEN: usize = 39;
-        if out.len() < RESP_LEN {
-            return 0;
+        let mut w = 0usize;
+        if !put_resp_header(out, &mut w, 1, 1) {
+            return 0; // ANCOUNT=1 (A), ARCOUNT=1 (NSEC)
         }
-        // Header.
-        out[0..2].copy_from_slice(&0u16.to_be_bytes()); // ID = 0 (mDNS multicast response)
-        out[2..4].copy_from_slice(&0x8400u16.to_be_bytes()); // flags: QR=1, AA=1
-        out[4..6].copy_from_slice(&0u16.to_be_bytes()); // QDCOUNT = 0
-        out[6..8].copy_from_slice(&1u16.to_be_bytes()); // ANCOUNT = 1
-        out[8..10].copy_from_slice(&0u16.to_be_bytes()); // NSCOUNT = 0
-        out[10..12].copy_from_slice(&0u16.to_be_bytes()); // ARCOUNT = 0
-        // Answer NAME: 0x05 "unaos" 0x05 "local" 0x00.
-        let mut w = 12usize;
-        out[w] = MDNS_HOST.len() as u8;
-        w += 1;
-        out[w..w + MDNS_HOST.len()].copy_from_slice(MDNS_HOST);
-        w += MDNS_HOST.len();
-        out[w] = MDNS_TLD.len() as u8;
-        w += 1;
-        out[w..w + MDNS_TLD.len()].copy_from_slice(MDNS_TLD);
-        w += MDNS_TLD.len();
-        out[w] = 0; // root label
-        w += 1;
-        // TYPE = A (1); CLASS = IN (1) | cache-flush (0x8000) = 0x8001.
-        out[w..w + 2].copy_from_slice(&1u16.to_be_bytes());
-        w += 2;
-        out[w..w + 2].copy_from_slice(&0x8001u16.to_be_bytes());
-        w += 2;
-        // TTL.
-        out[w..w + 4].copy_from_slice(&MDNS_TTL.to_be_bytes());
-        w += 4;
-        // RDLENGTH = 4, RDATA = the IPv4 lease.
-        out[w..w + 2].copy_from_slice(&4u16.to_be_bytes());
-        w += 2;
-        out[w..w + 4].copy_from_slice(&ip);
-        w += 4;
-        debug_assert_eq!(w, RESP_LEN);
-        w
+        let ok = rec_a(out, &mut w, &LBL_HOST, ip, MDNS_TTL)
+            && rec_nsec(out, &mut w, &LBL_HOST, &[DNS_TYPE_A], MDNS_TTL);
+        if ok { w } else { 0 }
     }
 
     // ── PI-NET-17: DNS-SD (RFC 6763) service advertisement over the same mDNS endpoint ────────────────
@@ -1945,7 +1921,9 @@ Connection: close\r\nServer: UnaOS/genet\r\n\r\n",
     const DNS_TYPE_A: u16 = 1;
     const DNS_TYPE_PTR: u16 = 12;
     const DNS_TYPE_TXT: u16 = 16;
+    const DNS_TYPE_AAAA: u16 = 28;
     const DNS_TYPE_SRV: u16 = 33;
+    const DNS_TYPE_NSEC: u16 = 47;
     const DNS_TYPE_ANY: u16 = 255;
 
     /// mDNS TTLs (RFC 6763 §10): host-name-bearing records (A, SRV) 120 s; shared records that carry no
@@ -1974,6 +1952,26 @@ Connection: close\r\nServer: UnaOS/genet\r\n\r\n",
         (NET17_PTR.load(Relaxed), NET17_SRV.load(Relaxed), NET17_TXT.load(Relaxed))
     }
 
+    /// PI-NET-18: count of RFC 6762 §6.1 negative (NSEC) responses emitted — the `[net18] nsec N` witness.
+    static NET18_NSEC: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    fn net18_count() -> u32 {
+        NET18_NSEC.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// PI-NET-18: which owned name an NSEC negative response is being built for. Each maps to the exact set
+    /// of record types that DO exist at that name (RFC 6762 §6.1 type bitmap).
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum NsecName {
+        /// `unaos.local` — has A only.
+        Host,
+        /// the service instance (`"UnaOS Pi 4"._http._tcp.local`) — has SRV + TXT.
+        Instance,
+        /// `_http._tcp.local` — has PTR.
+        Service,
+        /// `_services._dns-sd._udp.local` — has PTR.
+        Meta,
+    }
+
     /// PI-NET-17: what a well-formed query asked of us (already matched to one of our names + a QTYPE we
     /// serve). Anything else classifies to `None` and is dropped.
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1988,6 +1986,10 @@ Connection: close\r\nServer: UnaOS/genet\r\n\r\n",
         InstanceSrv,
         /// TXT for the instance — TXT answer.
         InstanceTxt,
+        /// PI-NET-18: a query for a type we do NOT hold at a name we OWN — answered with an NSEC negative
+        /// response (RFC 6762 §6.1) asserting which types the name actually has (e.g. AAAA at `unaos.local`
+        /// → NSEC asserting A-only), so the client stops waiting for a record that will never come.
+        Nsec(NsecName),
     }
 
     /// PI-NET-17: decode the DNS name at `start` into `out` label-slices. HOSTILE-INPUT HARDENED: every
@@ -2093,20 +2095,23 @@ Connection: close\r\nServer: UnaOS/genet\r\n\r\n",
             return None; // not IN / ANY class
         }
         let any = qtype == DNS_TYPE_ANY;
+        // PI-NET-18: for a name we OWN, an unmatched QTYPE is NOT dropped — it gets an NSEC negative answer
+        // (RFC 6762 §6.1) asserting the types the name really has. Only a name we do not own is ignored.
         let ask = if labels_eq(name, &LBL_HOST) {
-            if qtype == DNS_TYPE_A || any { MdnsAsk::HostA } else { return None }
+            if qtype == DNS_TYPE_A || any { MdnsAsk::HostA } else { MdnsAsk::Nsec(NsecName::Host) }
         } else if labels_eq(name, &LBL_SERVICE) {
-            if qtype == DNS_TYPE_PTR || any { MdnsAsk::ServicePtr } else { return None }
+            if qtype == DNS_TYPE_PTR || any { MdnsAsk::ServicePtr } else { MdnsAsk::Nsec(NsecName::Service) }
         } else if labels_eq(name, &LBL_META) {
-            if qtype == DNS_TYPE_PTR || any { MdnsAsk::MetaPtr } else { return None }
+            if qtype == DNS_TYPE_PTR || any { MdnsAsk::MetaPtr } else { MdnsAsk::Nsec(NsecName::Meta) }
         } else if labels_eq(name, &LBL_INSTANCE) {
-            // ANY / SRV → the SRV bundle (which also stuffs the A); a bare TXT → the TXT answer.
+            // ANY / SRV → the SRV bundle (which also stuffs the A); a bare TXT → the TXT answer; any other
+            // type → NSEC asserting SRV+TXT.
             if qtype == DNS_TYPE_SRV || any {
                 MdnsAsk::InstanceSrv
             } else if qtype == DNS_TYPE_TXT {
                 MdnsAsk::InstanceTxt
             } else {
-                return None;
+                MdnsAsk::Nsec(NsecName::Instance)
             }
         } else {
             return None; // not a name we advertise — ignore
@@ -2207,6 +2212,42 @@ Connection: close\r\nServer: UnaOS/genet\r\n\r\n",
         }
         patch_rdlen(out, rd, *w)
     }
+    /// PI-NET-18: NSEC RR (RFC 4034 §4 / RFC 6762 §6.1) — the negative "these are the only types at this
+    /// name" assertion. Unique record (class IN | cache-flush). RDATA = the Next Domain Name (in mDNS this
+    /// is the record's OWN name, RFC 6762 §6.1) followed by a single window-0 type bitmap. Every advertised
+    /// type (A=1, PTR=12, TXT=16, SRV=33) is < 256, so window block 0 covers them all and one window
+    /// suffices. The bitmap is MSB-first within each byte (RFC 4034 §4.1.2: bit `k` of window `b` = type
+    /// `256*b + k`), and its length is trimmed to the highest byte that carries a set bit. Fully
+    /// bounds-checked; returns `false` on any overflow so the caller drops the response.
+    fn rec_nsec(out: &mut [u8], w: &mut usize, name: &[&[u8]], types: &[u16], ttl: u32) -> bool {
+        let Some(rd) = put_rr_head(out, w, name, DNS_TYPE_NSEC, 0x8001, ttl) else { return false };
+        // Next Domain Name = the same name (mDNS convention — there is no ordered zone).
+        if !put_name(out, w, name) {
+            return false;
+        }
+        // Window-0 type bitmap. 32 bytes span types 0..=255.
+        let mut bitmap = [0u8; 32];
+        let mut max_byte = 0usize;
+        for &t in types {
+            if t >= 256 {
+                return false; // window 0 only — no advertised type reaches here
+            }
+            let byte = (t / 8) as usize;
+            let bit = 7 - (t % 8) as u8; // MSB-first within the byte
+            bitmap[byte] |= 1 << bit;
+            if byte > max_byte {
+                max_byte = byte;
+            }
+        }
+        let blen = max_byte + 1; // trim to the highest byte with a set bit
+        if !put_slice(out, w, &[0u8])            // window block number 0
+            || !put_slice(out, w, &[blen as u8]) // bitmap length
+            || !put_slice(out, w, &bitmap[..blen])
+        {
+            return false;
+        }
+        patch_rdlen(out, rd, *w)
+    }
     /// Write a response header (QR=1 AA=1, no question echoed) with the given answer/additional counts.
     fn put_resp_header(out: &mut [u8], w: &mut usize, ancount: u16, arcount: u16) -> bool {
         put_u16(out, w, 0)          // ID = 0
@@ -2263,6 +2304,26 @@ Connection: close\r\nServer: UnaOS/genet\r\n\r\n",
             return 0;
         }
         if rec_txt(out, &mut w, &LBL_INSTANCE, SVC_TXT, MDNS_TTL_SHARED) { w } else { 0 }
+    }
+
+    /// PI-NET-18: build the NSEC negative response for an owned name whose queried type does not exist
+    /// (RFC 6762 §6.1). One NSEC RR in the ANSWER section, TTL 120, asserting exactly the types present:
+    /// `unaos.local` → A; the instance → SRV+TXT; the two service PTR names → PTR. Returns the byte length
+    /// or 0 on overflow.
+    fn build_nsec_response(out: &mut [u8], which: NsecName) -> usize {
+        let mut w = 0usize;
+        if !put_resp_header(out, &mut w, 1, 0) {
+            return 0;
+        }
+        let ok = match which {
+            NsecName::Host => rec_nsec(out, &mut w, &LBL_HOST, &[DNS_TYPE_A], MDNS_TTL_HOST),
+            NsecName::Instance => {
+                rec_nsec(out, &mut w, &LBL_INSTANCE, &[DNS_TYPE_TXT, DNS_TYPE_SRV], MDNS_TTL_HOST)
+            }
+            NsecName::Service => rec_nsec(out, &mut w, &LBL_SERVICE, &[DNS_TYPE_PTR], MDNS_TTL_HOST),
+            NsecName::Meta => rec_nsec(out, &mut w, &LBL_META, &[DNS_TYPE_PTR], MDNS_TTL_HOST),
+        };
+        if ok { w } else { 0 }
     }
 
     /// A fixed-buffer `core::fmt::Write` sink (no heap): appends until the buffer is full, then silently
@@ -2599,6 +2660,8 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
                     MdnsAsk::MetaPtr => (build_meta_response(&mut resp), &NET17_PTR),
                     MdnsAsk::InstanceSrv => (build_srv_response(&mut resp, ip), &NET17_SRV),
                     MdnsAsk::InstanceTxt => (build_txt_response(&mut resp), &NET17_TXT),
+                    // PI-NET-18: owned name, type we don't have → NSEC negative response.
+                    MdnsAsk::Nsec(which) => (build_nsec_response(&mut resp, which), &NET18_NSEC),
                 };
                 if rlen == 0 {
                     continue; // a builder overflow — never emit a truncated response
@@ -2742,6 +2805,9 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
         // PI-NET-17: DNS-SD ptr/srv/txt answered-count witness state (change-only, same cadence).
         let mut last_net17 = (0u32, 0u32, 0u32);
         let mut last_net17_report_ms: i64 = 0;
+        // PI-NET-18: NSEC negative-response census (same change-only, rate-limited cadence).
+        let mut last_net18 = 0u32;
+        let mut last_net18_report_ms: i64 = 0;
         // PI-NET-12: TCB-census witness state (change-only, rate-limited; plus a saturation flag edge).
         let mut last_census = (u32::MAX, u32::MAX);
         let mut last_census_report_ms: i64 = 0;
@@ -2807,6 +2873,16 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
                 );
                 last_net17 = net17;
                 last_net17_report_ms = t;
+            }
+            // PI-NET-18: rate-limited, change-only NSEC negative-response census.
+            let net18 = net18_count();
+            if net18 != last_net18
+                && (t.saturating_sub(last_net18_report_ms) >= NET9_REPORT_MS
+                    || net18.wrapping_sub(last_net18) >= NET10_REPORT_DELTA)
+            {
+                serial_println!("{} [net18] nsec {} ::", PG, net18);
+                last_net18 = net18;
+                last_net18_report_ms = t;
             }
 
             // PI-NET-12: TCB-table census. Print when the (listen, active) shape changes and the ~5 s
@@ -5299,10 +5375,12 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
                 );
             }
 
-            // ── Scenario D (0x8): an unknown QTYPE (MX=15) for our service name is ignored. ──
+            // ── Scenario D (0x8): an unknown QTYPE (MX=15) for a name we do NOT own is ignored. (An unknown
+            //    type for a name we OWN now gets an NSEC negative answer — that path is covered by NET18.) ──
             {
                 let before = net17_counts();
-                let q = build_query(&LBL_SERVICE, 15); // MX — a type we do not serve
+                let foreign: [&[u8]; 2] = [b"nope", b"local"];
+                let q = build_query(&foreign, 15); // MX for a foreign name — a name/type we do not serve
                 let mut buf = [0u8; 1024];
                 let n = send_recv(&mut ks, &mut pface, &mut pdev, &mut psock, &mut clk, &q, &mut buf);
                 let ignored = n == 0 && net17_counts() == before;
@@ -5318,6 +5396,210 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
             let pass = w == 0xf;
             serial_println!(
                 ":: NET17-GATE: dns-sd advertisement battery {} [w=0x{:x}] (ptr-bundle|meta-ptr|malformed-ignored|unknown-type-ignored) ::",
+                if pass { "PASS" } else { "FAIL" }, w
+            );
+        }
+
+        // ── PI-NET-18: the RFC 6762 §6.1 negative-response gate — scripted-peer AAAA queries against the
+        //    SAME `mdns_step` the metal responder runs. Owned name + a type we lack → NSEC asserting the
+        //    types that DO exist (exact bitmap bytes); a foreign name → silence; the host A answer stuffs an
+        //    NSEC additional (§6.2). ──
+
+        /// Locate the NSEC RR for `want_name` anywhere in `resp` (answer, authority, or additional section)
+        /// and return its full type-bitmap field (window byte + bitmap-length byte + bitmap bytes). Also
+        /// verifies the record's TYPE=NSEC, class carries cache-flush (0x8001), and the RDATA next-domain-name
+        /// equals `want_name` (the mDNS §6.1 convention). Every field bounds-checked; `None` on any mismatch.
+        fn nsec_bitmap(resp: &[u8], want_name: &[&[u8]]) -> Option<Vec<u8>> {
+            if resp.len() < 12 {
+                return None;
+            }
+            let an = u16::from_be_bytes([resp[6], resp[7]]) as usize;
+            let ns = u16::from_be_bytes([resp[8], resp[9]]) as usize;
+            let ar = u16::from_be_bytes([resp[10], resp[11]]) as usize;
+            let mut off = 12usize;
+            for _ in 0..(an + ns + ar) {
+                let mut nm: [&[u8]; 8] = [&[]; 8];
+                let (nn, e) = read_name(resp, off, &mut nm)?;
+                let rtype = u16::from_be_bytes([*resp.get(e)?, *resp.get(e + 1)?]);
+                let rclass = u16::from_be_bytes([*resp.get(e + 2)?, *resp.get(e + 3)?]);
+                let rdlen = u16::from_be_bytes([*resp.get(e + 8)?, *resp.get(e + 9)?]) as usize;
+                let rd = e + 10;
+                if rd + rdlen > resp.len() {
+                    return None;
+                }
+                if rtype == DNS_TYPE_NSEC && labels_eq(&nm[..nn], want_name) {
+                    if rclass != 0x8001 {
+                        return None; // must carry the cache-flush bit
+                    }
+                    // RDATA = next-domain-name (full, uncompressed) + the type bitmap. Skip the name.
+                    let mut tn: [&[u8]; 8] = [&[]; 8];
+                    let (tc, nend) = read_name(resp, rd, &mut tn)?;
+                    if !labels_eq(&tn[..tc], want_name) {
+                        return None; // next-domain-name must be the record's own name
+                    }
+                    return Some(resp.get(nend..rd + rdlen)?.to_vec());
+                }
+                off = rd + rdlen;
+            }
+            None
+        }
+
+        /// Run the negative-response gate and print the `NET18-GATE` witness. Bitmask `w`:
+        ///   0x1 AAAA `unaos.local` → NSEC asserting A-only (exact bitmap); 0x2 AAAA the instance → NSEC
+        ///   asserting SRV+TXT (exact bitmap); 0x4 AAAA for a name we do not own → silence; 0x8 the host A
+        ///   answer stuffs an NSEC additional asserting A-only.
+        pub fn run18() {
+            *K_RX.lock() = Some(VecDeque::new());
+            *P_RX.lock() = Some(VecDeque::new());
+
+            let mut kdev = SmoltcpPhy::<KernelLoopNic>::new();
+            let mut kiface = build_iface(&mut kdev, KMAC, KIP, 0x4e31_38aa); // "N18"
+            let kstorage: &'static mut [SocketStorage; HTTP_POOL + 2] =
+                Box::leak(Box::new(Default::default()));
+            let mut ksockets = SocketSet::new(&mut kstorage[..]);
+            let (http, mdns, sntp, _l, _b, _j) = build_net_sockets(&mut kiface, &mut ksockets);
+            let mut ks = NetService {
+                iface: kiface,
+                dev: kdev,
+                sockets: ksockets,
+                http,
+                req_seen: [false; HTTP_POOL],
+                active_since: [0; HTTP_POOL],
+                mdns,
+                sntp,
+                sntp_server: None,
+                sntp_state: SntpState::Idle { due_ms: i64::MAX },
+                announce_left: 0,
+                announce_next_ms: 0,
+                ip: KIP,
+                req_buf: [[0u8; REQ_CAP]; HTTP_POOL],
+                req_len: [0; HTTP_POOL],
+                resp: core::array::from_fn(|_| None),
+            };
+
+            let mut pdev = SmoltcpPhy::<PeerLoopNic>::new();
+            let mut pface = build_iface(&mut pdev, PMAC, PIP, 0x5031_38aa);
+            let pstorage: &'static mut [SocketStorage; 16] = Box::leak(Box::new(Default::default()));
+            let mut psock = SocketSet::new(&mut pstorage[..]);
+
+            use smoltcp::socket::udp;
+            let rx_meta: &'static mut [udp::PacketMetadata; 8] =
+                Box::leak(Box::new([udp::PacketMetadata::EMPTY; 8]));
+            let rx_pl: &'static mut [u8; 1024] = Box::leak(Box::new([0u8; 1024]));
+            let tx_meta: &'static mut [udp::PacketMetadata; 8] =
+                Box::leak(Box::new([udp::PacketMetadata::EMPTY; 8]));
+            let tx_pl: &'static mut [u8; 1024] = Box::leak(Box::new([0u8; 1024]));
+            let mut us = udp::Socket::new(
+                udp::PacketBuffer::new(&mut rx_meta[..], &mut rx_pl[..]),
+                udp::PacketBuffer::new(&mut tx_meta[..], &mut tx_pl[..]),
+            );
+            let _ = us.bind(5353u16);
+            let uh = psock.add(us);
+            let _ = pface.join_multicast_group(IpAddress::v4(224, 0, 0, 251));
+
+            let mut clk: i64 = 0;
+            let mut w: u32 = 0;
+            let dst = IpEndpoint::new(IpAddress::v4(224, 0, 0, 251), 5353);
+
+            let mut send_recv = |ks: &mut NetService<SmoltcpPhy<KernelLoopNic>>,
+                                 pface: &mut Interface,
+                                 pdev: &mut SmoltcpPhy<PeerLoopNic>,
+                                 psock: &mut SocketSet<'static>,
+                                 clk: &mut i64,
+                                 query: &[u8],
+                                 out: &mut [u8]|
+             -> usize {
+                let _ = psock.get_mut::<udp::Socket>(uh).send_slice(query, dst);
+                pump(ks, pface, pdev, psock, clk, 20);
+                let s = psock.get_mut::<udp::Socket>(uh);
+                if s.can_recv() {
+                    match s.recv_slice(out) {
+                        Ok((n, _)) => n,
+                        Err(_) => 0,
+                    }
+                } else {
+                    0
+                }
+            };
+
+            serial_println!("{} [net18] nsec gate: responder armed (KIP {}.{}.{}.{}) ::",
+                PG, KIP[0], KIP[1], KIP[2], KIP[3]);
+
+            // ── Scenario A (0x1): AAAA for `unaos.local` → NSEC asserting A-only. Exact bitmap:
+            //    window 0, length 1, byte0 = 0x40 (type A = 1, MSB-first bit 6). ──
+            {
+                let q = build_query(&LBL_HOST, DNS_TYPE_AAAA);
+                let mut buf = [0u8; 1024];
+                let n = send_recv(&mut ks, &mut pface, &mut pdev, &mut psock, &mut clk, &q, &mut buf);
+                let bm = if n > 0 { nsec_bitmap(&buf[..n], &LBL_HOST) } else { None };
+                let ok = bm.as_deref() == Some(&[0x00u8, 0x01, 0x40][..]);
+                if ok {
+                    w |= 0x1;
+                }
+                serial_println!(
+                    "{} [net18] A aaaa unaos.local => NSEC A-only bitmap={:x?} {} ::",
+                    PG, bm.as_deref().unwrap_or(&[]), if ok { "PASS" } else { "FAIL" }
+                );
+            }
+
+            // ── Scenario B (0x2): AAAA for the instance → NSEC asserting SRV+TXT. Exact bitmap:
+            //    window 0, length 5, byte2 = 0x80 (TXT = 16), byte4 = 0x40 (SRV = 33). ──
+            {
+                let q = build_query(&LBL_INSTANCE, DNS_TYPE_AAAA);
+                let mut buf = [0u8; 1024];
+                let n = send_recv(&mut ks, &mut pface, &mut pdev, &mut psock, &mut clk, &q, &mut buf);
+                let bm = if n > 0 { nsec_bitmap(&buf[..n], &LBL_INSTANCE) } else { None };
+                let ok = bm.as_deref() == Some(&[0x00u8, 0x05, 0x00, 0x00, 0x80, 0x00, 0x40][..]);
+                if ok {
+                    w |= 0x2;
+                }
+                serial_println!(
+                    "{} [net18] B aaaa instance => NSEC SRV+TXT bitmap={:x?} {} ::",
+                    PG, bm.as_deref().unwrap_or(&[]), if ok { "PASS" } else { "FAIL" }
+                );
+            }
+
+            // ── Scenario C (0x4): AAAA for a name we do NOT own → silence (no reply, no counter move). ──
+            {
+                let before = net18_count();
+                let foreign: [&[u8]; 2] = [b"nope", b"local"];
+                let q = build_query(&foreign, DNS_TYPE_AAAA);
+                let mut buf = [0u8; 1024];
+                let n = send_recv(&mut ks, &mut pface, &mut pdev, &mut psock, &mut clk, &q, &mut buf);
+                let ignored = n == 0 && net18_count() == before;
+                if ignored {
+                    w |= 0x4;
+                }
+                serial_println!(
+                    "{} [net18] C aaaa foreign-name => {} ::",
+                    PG, if ignored { "silent PASS" } else { "ANSWERED FAIL" }
+                );
+            }
+
+            // ── Scenario D (0x8): the host A answer stuffs an NSEC additional (§6.2) asserting A-only. ──
+            {
+                let q = build_query(&LBL_HOST, DNS_TYPE_A);
+                let mut buf = [0u8; 1024];
+                let n = send_recv(&mut ks, &mut pface, &mut pdev, &mut psock, &mut clk, &q, &mut buf);
+                let ar = if n >= 12 {
+                    u16::from_be_bytes([buf[10], buf[11]])
+                } else {
+                    0
+                };
+                let bm = if n > 0 { nsec_bitmap(&buf[..n], &LBL_HOST) } else { None };
+                let ok = ar >= 1 && bm.as_deref() == Some(&[0x00u8, 0x01, 0x40][..]);
+                if ok {
+                    w |= 0x8;
+                }
+                serial_println!(
+                    "{} [net18] D A-answer arcount={} nsec-additional bitmap={:x?} {} ::",
+                    PG, ar, bm.as_deref().unwrap_or(&[]), if ok { "PASS" } else { "FAIL" }
+                );
+            }
+
+            let pass = w == 0xf;
+            serial_println!(
+                ":: NET18-GATE: mdns negative-response battery {} [w=0x{:x}] (host-nsec|instance-nsec|foreign-silence|a-additional) ::",
                 if pass { "PASS" } else { "FAIL" }, w
             );
         }
