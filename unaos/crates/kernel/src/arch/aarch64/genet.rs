@@ -1429,9 +1429,11 @@ mod metal {
     // ── smoltcp interface plumbing (the phy::Device itself is the shared `net_phy::SmoltcpPhy`) ──
     use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage};
     use smoltcp::phy::Device;
-    use smoltcp::socket::{icmp, tcp};
+    use smoltcp::socket::{icmp, tcp, udp};
     use smoltcp::time::Instant;
-    use smoltcp::wire::{EthernetAddress, HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress};
+    use smoltcp::wire::{
+        EthernetAddress, HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpEndpoint,
+    };
 
     /// ICMP identifier stamped on the echo requests. ASCII "PG".
     const PING_IDENT: u16 = 0x5047;
@@ -1462,6 +1464,8 @@ mod metal {
         sockets: SocketSet<'static>,
         /// PI-NET-10: the passively-listening HTTP socket's handle in `sockets`.
         http: SocketHandle,
+        /// PI-NET-11: the mDNS UDP socket's handle (bound to 5353, answering `unaos.local`).
+        mdns: SocketHandle,
         /// PI-NET-10: our configured IPv4 (leased or static-fallback), shown on the status page.
         ip: [u8; 4],
         /// PI-NET-10: set once the current connection's request bytes have arrived, so the response is
@@ -1504,6 +1508,157 @@ mod metal {
     /// Rate-limit for the `[net10]` served witness: mirror net9 — at most once per ~5 s, unless ≥4 new
     /// requests landed. Change-only (the poll task only reports when the count moved).
     const NET10_REPORT_DELTA: u32 = 4;
+
+    // ── PI-NET-11: the mDNS responder — make the Pi answer `unaos.local` on the share segment ─────────
+    //
+    // A single UDP socket in the persistent SocketSet is bound to the mDNS port 5353, and the interface
+    // joins the mDNS IPv4 multicast group 224.0.0.251 so smoltcp's IP layer ACCEPTS the group's frames
+    // even if promisc ever drops (the GENET RX filter is promisc for bring-up, but the join keeps the
+    // stack correct on its own). Each poll `mdns_step` drains a bounded number of received datagrams,
+    // hand-parses the DNS header + first question (length-checking every read — a malformed packet is
+    // dropped, never panics or wedges the loop), and when the query is QTYPE A/ANY for `unaos.local`
+    // (case-insensitive) it emits a standard mDNS response (QR=1 AA=1, one A answer, TTL 120, cache-flush
+    // bit set, RDATA = the current lease IPv4) from port 5353 to 224.0.0.251:5353 — or unicast back to the
+    // querier if the query set the QU (unicast-response) bit. QEMU raspi4b models no GENET, so the whole
+    // service (and this socket) never arms there: a clean no-op under the existing SKIP path.
+    /// The well-known mDNS UDP port.
+    const MDNS_PORT: u16 = 5353;
+    /// The mDNS IPv4 link-local multicast group.
+    const MDNS_MCAST: [u8; 4] = [224, 0, 0, 251];
+    /// The name we answer for (a single-label host under `.local`).
+    const MDNS_HOST: &[u8] = b"unaos";
+    const MDNS_TLD: &[u8] = b"local";
+    /// mDNS answer TTL (seconds) — the RFC 6762 default host-record TTL.
+    const MDNS_TTL: u32 = 120;
+    /// UDP socket ring buffers. A single mDNS query is well under a KiB; a handful of metadata slots
+    /// covers the bounded per-poll drain.
+    const UDP_META_SLOTS: usize = 8;
+    const UDP_RX_CAP: usize = 1024;
+    const UDP_TX_CAP: usize = 1024;
+    /// Bound on datagrams drained + answered per poll step (keeps the shared poll budget bounded so the
+    /// HTTP service and net9 ARP/ICMP answering are never starved by an mDNS flood).
+    const MDNS_MAX_PER_POLL: usize = 8;
+
+    /// PI-NET-11: cumulative count of mDNS queries answered since boot (the `[net11] answered N` witness).
+    static NET11_ANSWERED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    fn net11_answered() -> u32 {
+        NET11_ANSWERED.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// PI-NET-11: parse a DNS query and decide whether it asks for `unaos.local` (QTYPE A or ANY,
+    /// case-insensitive). Returns `Some(unicast_requested)` — the query's QU (unicast-response) bit — when
+    /// it matches, else `None`. EVERY read is bounds-checked (`get`/`get(..)` with `?`): a truncated or
+    /// malformed packet yields `None` and is dropped, never a panic. Name compression (a 0xC0 pointer) is
+    /// rejected defensively — a legitimate first-question QNAME in a query is never compressed.
+    fn mdns_wants_unaos(pkt: &[u8]) -> Option<bool> {
+        // DNS header is 12 bytes: ID, flags, QDCOUNT, ANCOUNT, NSCOUNT, ARCOUNT.
+        if pkt.len() < 12 {
+            return None;
+        }
+        let flags = u16::from_be_bytes([pkt[2], pkt[3]]);
+        // QR bit (0x8000) must be 0 (a query, not a response); opcode (bits 11..14) must be 0 (standard).
+        if flags & 0x8000 != 0 || (flags >> 11) & 0x0f != 0 {
+            return None;
+        }
+        let qdcount = u16::from_be_bytes([pkt[4], pkt[5]]);
+        if qdcount == 0 {
+            return None;
+        }
+        // Walk the first question's QNAME labels against ["unaos", "local"], case-insensitively.
+        let want: [&[u8]; 2] = [MDNS_HOST, MDNS_TLD];
+        let mut off = 12usize;
+        let mut li = 0usize;
+        loop {
+            let len = *pkt.get(off)? as usize;
+            off += 1;
+            if len == 0 {
+                break; // end of name
+            }
+            if len & 0xc0 != 0 {
+                return None; // compression pointer / reserved bits — bail defensively
+            }
+            let label = pkt.get(off..off + len)?;
+            off += len;
+            if li >= want.len() {
+                return None; // more labels than "unaos.local" has
+            }
+            let w = want[li];
+            if label.len() != w.len() {
+                return None;
+            }
+            for (a, b) in label.iter().zip(w.iter()) {
+                if a.to_ascii_lowercase() != *b {
+                    return None;
+                }
+            }
+            li += 1;
+        }
+        if li != want.len() {
+            return None; // fewer labels than "unaos.local"
+        }
+        // QTYPE + QCLASS follow the null terminator.
+        let qtype = u16::from_be_bytes([*pkt.get(off)?, *pkt.get(off + 1)?]);
+        let qclass = u16::from_be_bytes([*pkt.get(off + 2)?, *pkt.get(off + 3)?]);
+        // A = 1, ANY = 255.
+        if qtype != 1 && qtype != 255 {
+            return None;
+        }
+        // The QU (unicast-response) bit is the top bit of QCLASS; the low 15 bits carry the class
+        // (IN = 1, or ANY = 255).
+        let qu = qclass & 0x8000 != 0;
+        let cls = qclass & 0x7fff;
+        if cls != 1 && cls != 255 {
+            return None;
+        }
+        Some(qu)
+    }
+
+    /// PI-NET-11: build a standard mDNS A-record response for `unaos.local` -> `ip` into `out`, returning
+    /// its byte length. QR=1 AA=1, QDCOUNT=0 (mDNS responses do not echo the question), one A answer with
+    /// the cache-flush bit set in its class, TTL `MDNS_TTL`, RDATA = the four lease octets. `out` must be
+    /// at least `MDNS_RESP_LEN` bytes; the answer is a fixed 39 bytes.
+    fn build_mdns_response(out: &mut [u8], ip: [u8; 4]) -> usize {
+        // 12 (header) + 13 (name: 5+"unaos"+5+"local"+0) + 2 (type) + 2 (class) + 4 (ttl) + 2 (rdlen)
+        // + 4 (rdata) = 39.
+        const RESP_LEN: usize = 39;
+        if out.len() < RESP_LEN {
+            return 0;
+        }
+        // Header.
+        out[0..2].copy_from_slice(&0u16.to_be_bytes()); // ID = 0 (mDNS multicast response)
+        out[2..4].copy_from_slice(&0x8400u16.to_be_bytes()); // flags: QR=1, AA=1
+        out[4..6].copy_from_slice(&0u16.to_be_bytes()); // QDCOUNT = 0
+        out[6..8].copy_from_slice(&1u16.to_be_bytes()); // ANCOUNT = 1
+        out[8..10].copy_from_slice(&0u16.to_be_bytes()); // NSCOUNT = 0
+        out[10..12].copy_from_slice(&0u16.to_be_bytes()); // ARCOUNT = 0
+        // Answer NAME: 0x05 "unaos" 0x05 "local" 0x00.
+        let mut w = 12usize;
+        out[w] = MDNS_HOST.len() as u8;
+        w += 1;
+        out[w..w + MDNS_HOST.len()].copy_from_slice(MDNS_HOST);
+        w += MDNS_HOST.len();
+        out[w] = MDNS_TLD.len() as u8;
+        w += 1;
+        out[w..w + MDNS_TLD.len()].copy_from_slice(MDNS_TLD);
+        w += MDNS_TLD.len();
+        out[w] = 0; // root label
+        w += 1;
+        // TYPE = A (1); CLASS = IN (1) | cache-flush (0x8000) = 0x8001.
+        out[w..w + 2].copy_from_slice(&1u16.to_be_bytes());
+        w += 2;
+        out[w..w + 2].copy_from_slice(&0x8001u16.to_be_bytes());
+        w += 2;
+        // TTL.
+        out[w..w + 4].copy_from_slice(&MDNS_TTL.to_be_bytes());
+        w += 4;
+        // RDLENGTH = 4, RDATA = the IPv4 lease.
+        out[w..w + 2].copy_from_slice(&4u16.to_be_bytes());
+        w += 2;
+        out[w..w + 4].copy_from_slice(&ip);
+        w += 4;
+        debug_assert_eq!(w, RESP_LEN);
+        w
+    }
 
     /// A fixed-buffer `core::fmt::Write` sink (no heap): appends until the buffer is full, then silently
     /// drops the tail. Every string we format is far under the caller's cap, so no truncation occurs.
@@ -1606,6 +1761,47 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
                 NET10_SERVED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             }
         }
+
+        /// PI-NET-11: one bounded mDNS service step on the UDP socket, run after each `iface.poll`.
+        /// Drains up to `MDNS_MAX_PER_POLL` received datagrams; each is hand-parsed (every read
+        /// bounds-checked) and, when it is a query for `unaos.local` (QTYPE A/ANY), answered with an A
+        /// record for the current lease IPv4 — multicast to 224.0.0.251:5353, or unicast to the querier
+        /// when the QU bit was set. While the interface is unconfigured (no lease yet) we skip answering
+        /// but still drain the socket so its RX ring never backs up.
+        fn mdns_step(&mut self) {
+            let ip = self.iface.ipv4_addr().map(|a| a.octets());
+            let sock = self.sockets.get_mut::<udp::Socket>(self.mdns);
+            for _ in 0..MDNS_MAX_PER_POLL {
+                if !sock.can_recv() {
+                    break;
+                }
+                let mut qbuf = [0u8; 512];
+                let (n, meta) = match sock.recv_slice(&mut qbuf) {
+                    Ok(v) => v,
+                    Err(_) => break, // exhausted, or a too-big datagram dropped — stop draining
+                };
+                // Skip answering while unconfigured, but the datagram is already drained above.
+                let Some(ip) = ip else { continue };
+                let Some(qu) = mdns_wants_unaos(&qbuf[..n]) else { continue };
+                let mut resp = [0u8; 48];
+                let rlen = build_mdns_response(&mut resp, ip);
+                if rlen == 0 {
+                    continue;
+                }
+                // Multicast reply by default; unicast to the querier (its source addr + port) if it asked.
+                let dst = if qu {
+                    meta.endpoint
+                } else {
+                    IpEndpoint::new(
+                        IpAddress::v4(MDNS_MCAST[0], MDNS_MCAST[1], MDNS_MCAST[2], MDNS_MCAST[3]),
+                        MDNS_PORT,
+                    )
+                };
+                if sock.send_slice(&resp[..rlen], dst).is_ok() {
+                    NET11_ANSWERED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
     }
 
     /// Poll cadence: 1 per-core tick ≈ 4 ms at the 250 Hz aarch64 generic-timer tick.
@@ -1624,6 +1820,9 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
         // PI-NET-10: served-count witness state (independent of the net9 counters above).
         let mut last_served = 0u32;
         let mut last_served_report_ms: i64 = 0;
+        // PI-NET-11: mDNS answered-count witness state (change-only, rate-limited like net9/net10).
+        let mut last_answered = 0u32;
+        let mut last_answered_report_ms: i64 = 0;
         loop {
             crate::arch::sched::sleep_ticks(NET9_POLL_TICKS);
             let t = now_ms();
@@ -1631,6 +1830,8 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
                 ns.iface.poll(Instant::from_millis(t), &mut ns.dev, &mut ns.sockets);
                 // PI-NET-10: one bounded HTTP service step after the interface has run its state machine.
                 ns.http_step();
+                // PI-NET-11: one bounded mDNS service step (answer `unaos.local` on the share segment).
+                ns.mdns_step();
             }
             let (arp, icmp) = net9_counts();
             if arp != last_arp || icmp != last_icmp {
@@ -1652,14 +1853,24 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
                 last_served = served;
                 last_served_report_ms = t;
             }
+            // PI-NET-11: rate-limited, change-only answered witness (same cadence as net9/net10).
+            let answered = net11_answered();
+            if answered != last_answered
+                && (t.saturating_sub(last_answered_report_ms) >= NET9_REPORT_MS
+                    || answered.wrapping_sub(last_answered) >= NET10_REPORT_DELTA)
+            {
+                serial_println!("{} [net11] answered {} queries ::", PG, answered);
+                last_answered = answered;
+                last_answered_report_ms = t;
+            }
         }
     }
 
     /// Hand the DHCP-configured `iface`/`dev` to the persistent [`NetService`] and register the poll task
     /// on a secondary core. Called at the tail of `bind_smoltcp` (a NIC is guaranteed present). The empty
     /// SocketSet uses leaked static storage (smoltcp's owned-Vec path is off in our no_std feature set).
-    fn arm_net_service(iface: Interface, dev: SmoltcpPhy<GenetNic>) {
-        let storage: &'static mut [SocketStorage; 1] =
+    fn arm_net_service(mut iface: Interface, dev: SmoltcpPhy<GenetNic>) {
+        let storage: &'static mut [SocketStorage; 2] =
             alloc::boxed::Box::leak(alloc::boxed::Box::new(Default::default()));
         let mut sockets = SocketSet::new(&mut storage[..]);
 
@@ -1674,7 +1885,31 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
         let listening = http_sock.listen(HTTP_PORT).is_ok();
         let http = sockets.add(http_sock);
 
-        // The configured IPv4 (leased or static fallback) — shown on the served status page.
+        // PI-NET-11: the mDNS responder socket — UDP bound to 5353. Static (leaked) metadata + payload
+        // rings, same owned-storage discipline as the TCP socket above.
+        let udp_rx_meta: &'static mut [udp::PacketMetadata; UDP_META_SLOTS] =
+            alloc::boxed::Box::leak(alloc::boxed::Box::new([udp::PacketMetadata::EMPTY; UDP_META_SLOTS]));
+        let udp_rx_payload: &'static mut [u8; UDP_RX_CAP] =
+            alloc::boxed::Box::leak(alloc::boxed::Box::new([0u8; UDP_RX_CAP]));
+        let udp_tx_meta: &'static mut [udp::PacketMetadata; UDP_META_SLOTS] =
+            alloc::boxed::Box::leak(alloc::boxed::Box::new([udp::PacketMetadata::EMPTY; UDP_META_SLOTS]));
+        let udp_tx_payload: &'static mut [u8; UDP_TX_CAP] =
+            alloc::boxed::Box::leak(alloc::boxed::Box::new([0u8; UDP_TX_CAP]));
+        let mut mdns_sock = udp::Socket::new(
+            udp::PacketBuffer::new(&mut udp_rx_meta[..], &mut udp_rx_payload[..]),
+            udp::PacketBuffer::new(&mut udp_tx_meta[..], &mut udp_tx_payload[..]),
+        );
+        let bound = mdns_sock.bind(MDNS_PORT).is_ok();
+        let mdns = sockets.add(mdns_sock);
+
+        // Join the mDNS IPv4 multicast group so smoltcp's IP layer accepts 224.0.0.251 datagrams even if
+        // the GENET RX promisc filter ever drops (proto-igmp is off, so no membership report is emitted —
+        // the join updates the stack's own accept filter, which is what makes the query reach the socket).
+        let mcast = IpAddress::v4(MDNS_MCAST[0], MDNS_MCAST[1], MDNS_MCAST[2], MDNS_MCAST[3]);
+        let joined = iface.join_multicast_group(mcast).is_ok();
+
+        // The configured IPv4 (leased or static fallback) — shown on the served status page + the mDNS
+        // up-witness (mDNS answers only once configured; the address here is what a query would resolve).
         let ip = iface
             .ipv4_addr()
             .map(|a| a.octets())
@@ -1685,8 +1920,19 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
         } else {
             serial_println!("{} [net10] http listen(:80) FAILED — status service will not accept ::", PG);
         }
+        if bound && joined {
+            serial_println!(
+                "{} [net11] mdns responder up (unaos.local -> {}.{}.{}.{}) ::",
+                PG, ip[0], ip[1], ip[2], ip[3]
+            );
+        } else {
+            serial_println!(
+                "{} [net11] mdns responder DEGRADED (bind5353={} joined224.0.0.251={}) — name resolution will not answer ::",
+                PG, bound, joined
+            );
+        }
 
-        *NET_SERVICE.lock() = Some(NetService { iface, dev, sockets, http, ip, req_seen: false });
+        *NET_SERVICE.lock() = Some(NetService { iface, dev, sockets, http, mdns, ip, req_seen: false });
 
         // Host the task on a secondary core (never the BSP), like input/render/orphan-reaper. If no AP
         // came up, the service cannot be scheduled — report the degraded state rather than wedge the BSP.
