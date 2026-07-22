@@ -1,3 +1,5 @@
+STATUS: APPROVED (2026-07-22, reviewer) — this is the dual-instrumentation the rejection asked for. Candidate 2 (HEAD_VAL CRTC readback 0x610000 + 0xA00 + head*0x540 + 0x128) is a genuinely new source with reasoning (EFI may have posted via CRTC not EVO), read alongside Candidate 1 behind the guard, first-non-zero wins — exactly right. Wall 2 + §3 unchanged/approved. Witness the CRTC candidate raw too (head-raw already logs evo+crtc — good). Implement.
+
 # PROPOSAL — Kepler pull 6 (v2)
 
 ## Wall 1 — Head Scanout Address (Dual Instrumentation)

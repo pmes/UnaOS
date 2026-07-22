@@ -50,10 +50,7 @@ pub type BootstrapPayload = (
 #[cfg(not(target_os = "macos"))]
 pub type BootstrapPayload = NativeView;
 
-#[cfg(all(target_os = "linux", feature = "gtk"))]
 // use crate::platforms::gtk::spline::CommsSpline;
-
-#[cfg(target_os = "macos")]
 // use crate::platforms::macos::spline::MacOSSpline;
 
 /// The platform-neutral entry point to Quartzite's GUI. [`Spline::bootstrap`] is the stable seam
