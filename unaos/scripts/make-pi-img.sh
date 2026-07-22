@@ -31,9 +31,9 @@ dd if=/dev/zero of="$OUT" bs=1m count="$SIZE_MB" 2>/dev/null
 DEV=$(hdiutil attach -nomount "$OUT" | awk 'NR==1{print $1; exit}')
 trap 'hdiutil detach "$DEV" >/dev/null 2>&1 || true' EXIT
 if [ -n "$UNAFS_IMG" ]; then
-    diskutil partitionDisk "$DEV" 2 MBR "MS-DOS FAT32" UNAOS "$FAT_SPEC" "Free Space" FREE R >/dev/null
+    diskutil partitionDisk "$DEV" 2 MBR "MS-DOS FAT32" UNAOS-PI "$FAT_SPEC" "Free Space" FREE R >/dev/null
 else
-    diskutil partitionDisk "$DEV" 1 MBR "MS-DOS FAT32" UNAOS 100% >/dev/null
+    diskutil partitionDisk "$DEV" 1 MBR "MS-DOS FAT32" UNAOS-PI 100% >/dev/null
 fi
 # NEVER address the volume by /Volumes name: if a physical card/stick named UNAOS is mounted,
 # partitionDisk's auto-mount lands the image at "/Volumes/UNAOS 1" and a name-addressed ditto
