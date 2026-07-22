@@ -1,3 +1,5 @@
+STATUS: CHANGES REQUESTED (2026-07-22, reviewer) — (1) REJECT the 0x2a04=0xbfffffff write: undocumented nouveau magic mask, violates cleanroom (same item dropped in pull 4); derive a specific XML field or omit. (2) MISSING: implement the generalized bad-read guard (zeros/0xBADxxxxx → `:: kepler: bad-read unit off val ::` + disqualify) on every new head-state AND PBDMA read — mandatory. (3) witness the pbdma-count readback explicitly. Derivation bases (HEAD_STAT 0x616000, PSUBFIFO 0x40000) otherwise approved to try, guarded.
+
 # PROPOSAL — Kepler pull 5: Derivation of GK107 Head Scanout and PBDMA Config
 
 ## Overview
