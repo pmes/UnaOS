@@ -872,8 +872,8 @@ fn m2_enumerate_vl805() -> Option<u64> {
     // firmware property model — dev_id = (bus<<20)|(slot<<15)|(func<<12) for bus1/dev0/fn0. Verified
     // against the mailbox property-interface reference; constant unchanged.
     serial_println!("{}   NOTIFY_XHCI_RESET (mailbox 0x00030058, dev_addr={:#x}) — firmware VL805 reset/load (BEFORE BAR/COMMAND: the reload resets config space) ::", P, VL805_DEV_ADDR);
-    let ok = mailbox::notify_xhci_reset(VL805_DEV_ADDR);
-    serial_println!("{}   NOTIFY_XHCI_RESET reported {} ::", P, if ok { "SUCCESS (mailbox accepted — NOT proof the VL805 fw is running; see cfg re-read below)" } else { "FAILURE (firmware may already have loaded it at boot)" });
+    let (ok, echo) = mailbox::notify_xhci_reset(VL805_DEV_ADDR);
+    serial_println!("{}   NOTIFY_XHCI_RESET rc={} echo={:#x} ({}) ::", P, ok, echo, if ok { "SUCCESS (mailbox accepted — NOT proof the VL805 fw is running; see cfg re-read below)" } else { "FAILURE (firmware may already have loaded it at boot)" });
     // Let the VideoCore firmware finish loading/resetting the VL805 before we touch its config space.
     settle_ms(50);
 
@@ -954,6 +954,67 @@ fn m2_enumerate_vl805() -> Option<u64> {
     Some(bar0_pcie)
 }
 
+/// PIUSB-11: re-issue NOTIFY_XHCI_RESET to the VideoCore firmware IMMEDIATELY before a controller
+/// halt+HCRST, then let the firmware settle. This mirrors Linux verbatim: `xhci_pci_common_probe`
+/// (drivers/usb/host/xhci-pci.c) calls `reset_control_reset(reset)` — which on the Pi 4 lands in
+/// `rpi_reset_reset` (drivers/reset/reset-raspberrypi.c), issuing this exact mailbox with
+/// dev_addr=0x100000 then `usleep_range(200,1000)` — as the FIRST act of probe, right before
+/// `usb_hcd_pci_probe` → `xhci_gen_setup` runs the xHCI HCRST. Linux therefore reloads the VL805
+/// firmware on EVERY probe, immediately before every HCRST.
+///
+/// Our board is a Pi 4B rev 1.5 (boardrev d03115: 8 GB, Sony UK, BCM2711) — rev >= 1.4, so the VL805
+/// has NO dedicated SPI EEPROM; its firmware is loaded from the main bootloader EEPROM by the
+/// VideoCore, and this mailbox is the ONLY way to (re)load it. M1's PERST cycle (a PCIe fundamental
+/// reset) is exactly the "PCI reset [that] resets the VL805 requiring the firmware to be reloaded"
+/// the Linux reset driver documents — so after M1 the fw is DOWN and only NOTIFY brings it back.
+///
+/// The bug this fixes (boot-P18..P21): M2 issued a single early NOTIFY, then the controller was
+/// HCRST'd TWICE with no intervening NOTIFY — once in M3 (pre-heap) and again in `enumerate` (post-
+/// heap, SECONDS later after heap/AP/eMMC bring-up). A controller whose firmware is not running when
+/// HCRST completes holds USBSTS.CNR=1 forever and silently drops every op/runtime write (P20:
+/// USBSTS=0x811). Re-issuing NOTIFY right before each HCRST — Linux's placement — gives the firmware a
+/// fresh, in-sequence reload so CNR can clear. PIUSB-10's CNR wait remains the verdict gate.
+fn notify_before_reset(ctx: &str) {
+    serial_println!("{}   NOTIFY (pre-reset, {}): mailbox 0x00030058 dev_addr={:#x} — reload VL805 fw immediately before halt+HCRST (Linux reset_control_reset placement) ::", P, ctx, VL805_DEV_ADDR);
+    let (ok, echo) = mailbox::notify_xhci_reset(VL805_DEV_ADDR);
+    serial_println!("{}   NOTIFY (pre-reset, {}) rc={} echo={:#x} ::", P, ctx, ok, echo);
+    // Linux waits usleep_range(200, 1000) for VL805 startup after the reset mailbox; give it a
+    // comfortably wider bounded settle so the fw is running before HCRST samples CNR.
+    settle_ms(5);
+    // The firmware (re)load resets the VL805's PCI config space (PIUSB-4: BAR0 -> 0, COMMAND MEM/BM
+    // off) — so re-assert the decode path AFTER the reload, or the outbound-window CAP read that
+    // follows would hit an unclaimed address (0xdeaddead) and HCRST would sample a non-decoding
+    // controller. Idempotent: if this firmware revision preserves config across the reload, these
+    // writes read back identical; if it clears it, they restore BAR0=OUTBOUND_PCIE_BASE + MEM/BM.
+    reassert_vl805_decode(ctx);
+}
+
+/// Re-program the VL805's BAR0 to the outbound-window PCIe base and re-enable MEM-space + Bus-Master
+/// decode, then witness the readback. Called after every pre-reset NOTIFY (the fw reload may revert
+/// config space). Uses the EXT_CFG child window (same path M2 assigns the BAR through). The low BAR
+/// flag bits are hardware-fixed type indicators (RO) — we read them and preserve them.
+fn reassert_vl805_decode(ctx: &str) {
+    let orig = vl805_cfg_read(0x10);
+    if is_poison(orig) {
+        serial_println!("{}   re-assert decode ({}): BAR0 reads poison {:#010x} — VL805 not answering config after reload; leaving as-is ::", P, ctx, orig);
+        return;
+    }
+    let bar0_lo = (OUTBOUND_PCIE_BASE & 0xFFFF_FFF0) as u32 | (orig & 0xf);
+    vl805_cfg_write(0x10, bar0_lo);
+    vl805_cfg_write(0x14, (OUTBOUND_PCIE_BASE >> 32) as u32); // = 0 for 0xC000_0000
+    let cmd = vl805_cfg_read(0x04);
+    let newcmd = (cmd & 0xFFFF_0000) | ((cmd & 0xFFFF) | 0b110);
+    vl805_cfg_write(0x04, newcmd);
+    let rb_bar = vl805_cfg_read(0x10);
+    let rb_cmd = vl805_cfg_read(0x04) & 0xffff;
+    serial_println!(
+        "{}   re-assert decode ({}): BAR0={:#010x} (wrote {:#010x}) COMMAND={:#06x} (MEM={} BM={}) -> {} ::",
+        P, ctx, rb_bar, bar0_lo, rb_cmd, (rb_cmd >> 1) & 1, (rb_cmd >> 2) & 1,
+        if rb_bar == bar0_lo && (rb_cmd & 0b110) == 0b110 { "DECODE RE-ARMED" } else { "MISMATCH — config did not latch post-reload" }
+    );
+    settle_ms(5);
+}
+
 /// M3: map the outbound window Device-nGnRnE, read the xHCI capability registers at the VL805 BAR
 /// (poison-rejecting), attach the shared xHCI driver in polled mode (halt + reset = "halted-but-
 /// decoding"), power the root ports, and STOP. Full device enumeration (rings, ADDRESS_DEVICE, HID/
@@ -1019,6 +1080,10 @@ fn m3_attach_xhci(cpu_base: u64, _bar0_pcie: u64) {
     // HALTED-BUT-DECODING: its registers answer, it is reset to a clean state, ready for the metal
     // enumeration arc to program rings and pump ports.
     serial_println!("{}   attaching shared xHCI driver @ {:#x} (polled, halt+reset) ::", P, outbound_cpu_base);
+    // PIUSB-11: reload the VL805 firmware immediately before halt+HCRST (Linux places its
+    // reset_control_reset() right before probe/HCRST). Without a fresh fw the HCRST completes into a
+    // firmwareless controller and CNR wedges at 1.
+    notify_before_reset("M3 attach");
     xhci::init(outbound_cpu_base);
 
     // Power the root ports: set PORTSC.PP (bit 9) on each port register (operational base +0x400 +
@@ -1114,6 +1179,14 @@ pub fn enumerate() {
     //     (the JB2b ordering; idempotent even though `bringup` reset it pre-heap — the intervening
     //     heap/AP/emmc bring-up leaves the halted controller untouched, but a defensive reset here
     //     guarantees the RS=1 below rides a known state).
+    //
+    // PIUSB-11: this is the load-bearing NOTIFY. `bringup` issued its NOTIFY seconds ago (pre-heap);
+    // the intervening heap/AP/eMMC bring-up means the VL805 firmware may no longer be running when
+    // this HCRST completes — and a firmwareless controller wedges USBSTS.CNR=1 forever, dropping every
+    // CRCR/DCBAAP/ERST/RS write (boot-P18..P21). Linux reloads the fw on EVERY probe immediately before
+    // the HCRST (reset_control_reset → rpi_reset_reset, then xhci_gen_setup's reset); we mirror that
+    // here so the CNR wait (PIUSB-10) has a running firmware to clear against.
+    notify_before_reset("enumerate");
     xhci::init(base);
 
     // (2) Rings / DCBAA / interrupter via the driver's existing init paths (heap-backed). Exactly the

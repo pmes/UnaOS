@@ -339,8 +339,15 @@ pub fn set_clock_rate(clock_id: u32, rate_hz: u32) -> Option<u32> {
 /// VL805 reset/firmware-load it does at cold boot; a bringing-up OS issues it after enumerating the
 /// controller and before attaching the xHCI driver. Returns whether the mailbox reported success.
 /// Single-user `MBOX` like the other calls (boot-time, single-threaded, framebuffer call long done).
+///
+/// Returns `(ok, echo)`: `ok` is the mailbox success flag (reply(1) == RESPONSE — the firmware
+/// ACCEPTED the tag, NOT proof the VL805 fw is running); `echo` is the value-buffer word the firmware
+/// wrote back at request slot 5. Linux (`drivers/reset/reset-raspberrypi.c rpi_reset_reset`) only
+/// checks the return code and does NOT inspect the echo, but PIUSB-11 witnesses it so a boot log can
+/// prove the firmware round-tripped the exact `dev_addr` we posted (a mismatch would localise a
+/// malformed tag vs a genuine no-op reload).
 #[cfg(feature = "piusb")]
-pub fn notify_xhci_reset(dev_addr: u32) -> bool {
+pub fn notify_xhci_reset(dev_addr: u32) -> (bool, u32) {
     request(0, 7 * 4); // total size (7 words used)
     request(1, 0); // request
     request(2, TAG_NOTIFY_XHCI_RESET);
@@ -348,7 +355,8 @@ pub fn notify_xhci_reset(dev_addr: u32) -> bool {
     request(4, 0); // request code
     request(5, dev_addr);
     request(6, TAG_END);
-    mbox_call(7)
+    let ok = mbox_call(7);
+    (ok, reply(5))
 }
 
 /// Bring up the VideoCore framebuffer: pick a resolution (the firmware's current mode if sane,
