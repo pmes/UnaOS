@@ -54,7 +54,7 @@ pub type BootstrapPayload = NativeView;
 // use crate::platforms::gtk::spline::CommsSpline;
 
 #[cfg(target_os = "macos")]
-use crate::platforms::macos::spline::MacOSSpline;
+// use crate::platforms::macos::spline::MacOSSpline;
 
 /// The platform-neutral entry point to Quartzite's GUI. [`Spline::bootstrap`] is the stable seam
 /// between a workspace snapshot and native rendering; it dispatches to the compile-time-selected
@@ -63,8 +63,8 @@ pub struct Spline {
     // #[cfg(all(target_os = "linux", feature = "gtk"))]
     // inner: CommsSpline,
 
-    #[cfg(target_os = "macos")]
-    inner: MacOSSpline,
+    // #[cfg(target_os = "macos")]
+    // inner: MacOSSpline,
 }
 
 impl Spline {
@@ -76,7 +76,7 @@ impl Spline {
 
         #[cfg(target_os = "macos")]
         return Self {
-            inner: MacOSSpline::new(),
+            // inner: MacOSSpline::new(),
         };
 
         // For the Qt platform, Spline is entirely stateless.
@@ -102,9 +102,7 @@ impl Spline {
         #[cfg(any(all(target_os = "linux", feature = "gtk"), target_os = "macos"))]
         {
             #[cfg(target_os = "macos")]
-            return self
-                .inner
-                .bootstrap(_window, _tx_event, _app_state, _rx_synapse, _workspace_tetra);
+            unimplemented!("MacOSSpline is disabled for aether-shell browser path");
             
             #[cfg(all(target_os = "linux", feature = "gtk"))]
             return gtk4::Box::new(gtk4::Orientation::Horizontal, 0).into(); // Fallback, GTK workspace is deprecated

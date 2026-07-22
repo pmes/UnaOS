@@ -1,7 +1,7 @@
-use objc2::rc::Retained;
+use objc2::{msg_send, ClassType};
+use objc2::rc::{Allocated, Retained};
 use objc2_app_kit::{
     NSWindow, NSView, NSStackView, NSTextField, NSButton, NSImageView,
-    NSUserInterfaceLayoutOrientation, NSStackViewGravity
 };
 use objc2_foundation::{MainThreadMarker, NSRect, NSPoint, NSSize, NSString};
 use bandy::{SMessage, Synapse};
@@ -17,38 +17,35 @@ pub fn bootstrap_browser(
     let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(800.0, 600.0));
     
     unsafe {
-        let stack: Retained<NSStackView> = objc2::msg_send_id![NSStackView::class(), alloc];
-        let stack: Retained<NSStackView> = objc2::msg_send_id![&stack, initWithFrame: frame];
-        stack.setOrientation(NSUserInterfaceLayoutOrientation::Vertical);
+        let stack: Allocated<NSStackView> = msg_send![NSStackView::class(), alloc];
+        let stack: Retained<NSStackView> = msg_send![stack, initWithFrame: frame];
+        let _: () = msg_send![&stack, setOrientation: 1isize]; // Vertical
         
-        let chrome_stack: Retained<NSStackView> = objc2::msg_send_id![NSStackView::class(), alloc];
-        let chrome_stack: Retained<NSStackView> = objc2::msg_send_id![&chrome_stack, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(800.0, 40.0))];
-        chrome_stack.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
+        let chrome_stack: Allocated<NSStackView> = msg_send![NSStackView::class(), alloc];
+        let chrome_stack: Retained<NSStackView> = msg_send![chrome_stack, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(800.0, 40.0))];
+        let _: () = msg_send![&chrome_stack, setOrientation: 0isize]; // Horizontal
         
-        let url_bar: Retained<NSTextField> = objc2::msg_send_id![NSTextField::class(), alloc];
-        let url_bar: Retained<NSTextField> = objc2::msg_send_id![&url_bar, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(600.0, 24.0))];
+        let url_bar: Allocated<NSTextField> = msg_send![NSTextField::class(), alloc];
+        let url_bar: Retained<NSTextField> = msg_send![url_bar, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(600.0, 24.0))];
         
-        let back_btn: Retained<NSButton> = objc2::msg_send_id![NSButton::class(), alloc];
-        let back_btn: Retained<NSButton> = objc2::msg_send_id![&back_btn, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(40.0, 24.0))];
-        back_btn.setTitle(&NSString::from_str("<"));
+        let back_btn: Allocated<NSButton> = msg_send![NSButton::class(), alloc];
+        let back_btn: Retained<NSButton> = msg_send![back_btn, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(40.0, 24.0))];
+        let _: () = msg_send![&back_btn, setTitle: &*NSString::from_str("<")];
         
-        let fwd_btn: Retained<NSButton> = objc2::msg_send_id![NSButton::class(), alloc];
-        let fwd_btn: Retained<NSButton> = objc2::msg_send_id![&fwd_btn, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(40.0, 24.0))];
-        fwd_btn.setTitle(&NSString::from_str(">"));
+        let fwd_btn: Allocated<NSButton> = msg_send![NSButton::class(), alloc];
+        let fwd_btn: Retained<NSButton> = msg_send![fwd_btn, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(40.0, 24.0))];
+        let _: () = msg_send![&fwd_btn, setTitle: &*NSString::from_str(">")];
         
-        chrome_stack.addView_inGravity(&back_btn, NSStackViewGravity::Leading);
-        chrome_stack.addView_inGravity(&fwd_btn, NSStackViewGravity::Leading);
-        chrome_stack.addView_inGravity(&url_bar, NSStackViewGravity::Leading);
+        let _: () = msg_send![&chrome_stack, addView: &*back_btn, inGravity: 1isize]; // Leading
+        let _: () = msg_send![&chrome_stack, addView: &*fwd_btn, inGravity: 1isize];
+        let _: () = msg_send![&chrome_stack, addView: &*url_bar, inGravity: 1isize];
         
-        let content_view: Retained<NSImageView> = objc2::msg_send_id![NSImageView::class(), alloc];
-        let content_view: Retained<NSImageView> = objc2::msg_send_id![&content_view, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(800.0, 560.0))];
+        let content_view: Allocated<NSImageView> = msg_send![NSImageView::class(), alloc];
+        let content_view: Retained<NSImageView> = msg_send![content_view, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(800.0, 560.0))];
         
-        stack.addView_inGravity(&chrome_stack, NSStackViewGravity::Top);
-        stack.addView_inGravity(&content_view, NSStackViewGravity::Bottom);
+        let _: () = msg_send![&stack, addView: &*chrome_stack, inGravity: 1isize]; // Top
+        let _: () = msg_send![&stack, addView: &*content_view, inGravity: 3isize]; // Bottom
         
-        // Note: For full macOS implementation, we'd wire the NSTextField delegate and event loops
-        // similarly to GTK, but using objc2 delegation macros.
-        
-        stack.upcast()
+        unsafe { Retained::cast_unchecked::<NSView>(stack) }
     }
 }
