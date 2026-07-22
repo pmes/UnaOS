@@ -64,8 +64,49 @@ This **unifies** the old tegra-only `EventRing::has_event_after_invalidate` (its
 tegra, and the Pi 4 gets it too) and **retires** PIUSB-8's external attach-side
 bridge in `arch/aarch64/piusb.rs` (which could only reach the three `pub` ring/ERST
 structures; the internal contexts/DCBAA/scratchpad/transfer buffers are now covered
-by construction). The Pi 4 enable-slot stall — the controller DMA-reading a stale
-command ring and the CPU polling a stale event ring — is fixed at the source.
+by construction). Stale-DMA of the command/event rings — a controller reading a
+stale command ring and a CPU polling a stale event ring — is fixed at the source.
+
+> **Coherency was NOT the sole cause of the Pi 4 enable-slot stall.** Full-driver DMA
+> maintenance (this seam) landed at boot-P19 and the VL805's `ENABLE_SLOT` **still**
+> stalled — so the non-coherent-DMA hypothesis is *refuted as the sole cause* on
+> metal. The real defect was controller-firmware readiness, not cache coherency
+> (§1a).
+
+### 1a. VL805 firmware-load ordering (Pi 4) — the CNR wall
+
+Every USB-A port on the Pi 4 hangs off one endpoint: the VIA **VL805** xHCI behind
+the BCM2711 PCIe root complex (attach + the 0xdeaddead root-port memory-window fix
+are in [`arch_arm64.md` §PI-USB](../01_BOOT_HAL/arch_arm64.md)). Once config and
+memory cycles reached the controller, the `ENABLE_SLOT` command stalled through
+every coherency and ring hypothesis. The root cause, witnessed on metal:
+
+- **CNR (Controller Not Ready) drops op/runtime-register writes (PIUSB-10,
+  `726eb24b`).** At the moment the driver programmed the interrupter / CRCR / DCBAAP
+  / ERST and set `RS = 1`, boot-P20's PIUSB-9 witnesses read `USBSTS = 0x811`
+  (**CNR = 1**) and **every op/runtime-register write read back 0**. Per xHCI spec
+  **§5.4.1 / §4.2**, software must not write any Doorbell, Operational, or Runtime
+  register after `HCRST` until `USBSTS.CNR` clears. Intel clears CNR near-instantly
+  (x86 never noticed); the VL805 holds it up to ~100s of ms **while it loads its
+  internal firmware**, so the Pi silently dropped every register write — the entire
+  enable-slot saga was writes into a not-ready controller.
+
+  The fix adds `wait_for_cnr_clear()`: a bounded (`hw_wait_budget`, ~2.5 s) poll of
+  `USBSTS.CNR` at the *top* of `init_interrupter` — the first register programming
+  after `HCRST`, immediately before ERST/CRCR/DCBAAP/CONFIG/RS. Only the pre-CNR
+  halt + `HCRST` reset writes precede the wait (spec-correct). On success it emits
+  `xHCI: CNR cleared after N polls`; on timeout it fails **loud** and sets
+  `XHCI_CNR_OK = false`, which makes `init_pointers` and `start` skip their register
+  writes (loud, no hang) rather than program a not-ready controller. x86 behaviour is
+  byte-identical (CNR is always clear there).
+
+- **The mailbox NOTIFY reports hollow success (PIUSB-11, in flight).** With the CNR
+  wait in place at boot-P21, `wait_for_cnr_clear` **timed out** — the VL805's CNR
+  never cleared, meaning its **internal firmware never booted**. The RPi firmware
+  mailbox `NOTIFY_XHCI_RESET` returns `SUCCESS` *without* a running controller
+  firmware behind it — a hollow success. **PIUSB-11 is in flight**: NOTIFY-before-reset
+  ordering per the Linux VL805 quirk, with the `d03115` board-revision decode still
+  pending.
 
 ---
 
