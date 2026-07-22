@@ -1,0 +1,38 @@
+== packer self-test vs Mesa qpu_disasm.c vectors (ver 42) ==
+  0x3c003186bb800000  ; nop (canonical)
+  selftest nop                          0x3c003186bb800000 OK
+  0x3c002380b6edb000  ; or rf0, r3, r3 ; mov vpm, r3
+  selftest or rf0,r3,r3;mov vpm,r3      0x3c002380b6edb000 OK
+  0x3c20318105829000  ; fadd r1, r1, r5 ; thrsw
+  selftest fadd r1,r1,r5;nop;thrsw      0x3c20318105829000 OK
+
+== COORDINATE/VERTEX shader body (OFF_CS_CODE / OFF_VS_CODE), STVPMV 6-word output ==
+  0x3d816180bc806140  ; ldvpmv_in rf0, rf5 ; ldunifrf.rf5  (attr[0] -> Xc)
+  0x3d816181bc806140  ; ldvpmv_in rf1, rf5 ; ldunifrf.rf5  (attr[1] -> Yc)
+  0x3d816182bc806140  ; ldvpmv_in rf2, rf5 ; ldunifrf.rf5  (attr[2] -> Zc)
+  0x3d816183bc806140  ; ldvpmv_in rf3, rf5 ; ldunifrf.rf5  (attr[3] -> Wc)
+  0x3d81b186bb800000  ; nop ; ldunifrf.rf6    (rf6 <- 8192.0f vp_scale)
+  0x3d827186bb800000  ; nop ; ldunifrf.rf9   (out-offset 0)
+  0x3d82b186bb800000  ; nop ; ldunifrf.rf10   (out-offset 1)
+  0x3d82f186bb800000  ; nop ; ldunifrf.rf11   (out-offset 2)
+  0x3d833186bb800000  ; nop ; ldunifrf.rf12   (out-offset 3)
+  0x3d837186bb800000  ; nop ; ldunifrf.rf13   (out-offset 4)
+  0x3d83b186bb800000  ; nop ; ldunifrf.rf14   (out-offset 5)
+  0x540011c6bbf80006  ; fmul rf7, rf0, rf6   (Xc * 8192.0 ; W=1 so no 1/Wc)
+  0x3c002187f68061c0  ; ffloor rf7, rf7      (floor, ver==42 path)
+  0x3c002187f583e1c0  ; ftoiz rf7, rf7       (f2i32)
+  0x54001206bbf80046  ; fmul rf8, rf1, rf6   (Yc * 8192.0)
+  0x3c002188f6806200  ; ffloor rf8, rf8      (floor, ver==42 path)
+  0x3c002188f583e200  ; ftoiz rf8, rf8       (f2i32)
+  0x3c002180f883e240  ; stvpmv rf9, rf0   (out0 clip Xc)
+  0x3c002180f883e281  ; stvpmv rf10, rf1   (out1 clip Yc)
+  0x3c002180f883e2c2  ; stvpmv rf11, rf2   (out2 clip Zc)
+  0x3c002180f883e303  ; stvpmv rf12, rf3   (out3 clip Wc)
+  0x3c002180f883e347  ; stvpmv rf13, rf7   (out4 screen Xs)
+  0x3c002180f883e388  ; stvpmv rf14, rf8   (out5 screen Ys)
+  0x3c003186bb816000  ; vpmwt   (GFXH-1684: VPM writes complete)
+  0x3c203186bb800000  ; nop ; thrsw   (end)
+  0x3c003186bb800000  ; nop
+  0x3c003186bb800000  ; nop
+
+All words packed + round-tripped OK.
