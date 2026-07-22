@@ -201,18 +201,32 @@ impl AetherEngine {
     }
 
     pub async fn go_back(&mut self) {
-        if self.history_idx > 0 {
-            self.history_idx -= 1;
-            let url = self.history[self.history_idx].clone();
+        if let Some(url) = self.get_back_url() {
             let _ = self.load_url_internal(&url, false).await;
         }
     }
 
+    pub fn get_back_url(&mut self) -> Option<String> {
+        if self.history_idx > 0 {
+            self.history_idx -= 1;
+            Some(self.history[self.history_idx].clone())
+        } else {
+            None
+        }
+    }
+
     pub async fn go_forward(&mut self) {
+        if let Some(url) = self.get_forward_url() {
+            let _ = self.load_url_internal(&url, false).await;
+        }
+    }
+
+    pub fn get_forward_url(&mut self) -> Option<String> {
         if self.history_idx + 1 < self.history.len() {
             self.history_idx += 1;
-            let url = self.history[self.history_idx].clone();
-            let _ = self.load_url_internal(&url, false).await;
+            Some(self.history[self.history_idx].clone())
+        } else {
+            None
         }
     }
 
@@ -230,7 +244,12 @@ impl AetherEngine {
                 )
             }
         };
-        let document = dom::parse_html(&html);
+        self.load_html(url, &html, add_history);
+        Ok(())
+    }
+
+    pub fn load_html(&mut self, url: &str, html: &str, add_history: bool) {
+        let document = dom::parse_html(html);
         
         self.title = "Aether Browser".to_string();
         if let Ok(mut titles) = document.select("title") {
@@ -262,7 +281,7 @@ impl AetherEngine {
                 css::apply_css(&mut layout_tree, &text);
             }
         }
-
+        
         self.document = Some(document);
         self.layout_tree = Some(layout_tree);
         self.js_engine = Some(js_engine);
@@ -270,8 +289,6 @@ impl AetherEngine {
         self.scroll_y = 0.0;
         self.needs_repaint = true;
         self.damage_rects.push((0, 0, self.width, self.height));
-        
-        Ok(())
     }
 
     pub fn render_frame(&mut self) -> Vec<(u32, u32, u32, u32)> {

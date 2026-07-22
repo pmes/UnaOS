@@ -12,6 +12,12 @@ use std::cell::RefCell;
 use aether::AetherEngine;
 use tokio::runtime::Runtime;
 
+#[derive(Debug)]
+pub enum AppEvent {
+    UrlLoaded(String, String),
+    NavigateDone,
+}
+
 struct AetherApp {
     window: Option<Rc<Window>>,
     surface: Option<Surface<Rc<Window>, Rc<Window>>>,
@@ -21,9 +27,10 @@ struct AetherApp {
     cursor_y: f64,
     url_bar_active: bool,
     current_url: String,
+    proxy: winit::event_loop::EventLoopProxy<AppEvent>,
 }
 
-impl ApplicationHandler for AetherApp {
+impl ApplicationHandler<AppEvent> for AetherApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_none() {
             let window = Rc::new(event_loop.create_window(Window::default_attributes().with_title("Aether Browser").with_inner_size(winit::dpi::LogicalSize::new(800.0, 600.0))).unwrap());
@@ -34,6 +41,19 @@ impl ApplicationHandler for AetherApp {
             
             // Set IME allowed to receive Ime events
             window.set_ime_allowed(true);
+        }
+    }
+
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: AppEvent) {
+        let window = self.window.as_ref().unwrap();
+        match event {
+            AppEvent::UrlLoaded(url, html) => {
+                self.engine.borrow_mut().load_html(&url, &html, true);
+                window.request_redraw();
+            }
+            AppEvent::NavigateDone => {
+                window.request_redraw();
+            }
         }
     }
 
@@ -160,14 +180,29 @@ impl ApplicationHandler for AetherApp {
                         if self.url_bar_active {
                             self.url_bar_active = false;
                             let url = self.current_url.clone();
-                            let engine = self.engine.clone();
-                            let handle = self.rt.handle().clone();
-                            let w = window.clone();
                             
+                            // Let the engine fetch async but we don't move the engine itself. 
+                            // Wait, AetherEngine::load_url is `async fn`. If we are on the main thread, 
+                            // we can't easily await it without blocking or without passing a Send reference.
+                            // But GTK handles this by using `glib::MainContext::spawn_local`. winit has no such thing.
+                            // Wait, if `engine` is not thread-safe (`Rc<RefCell<...>>`), how do we run an async fn on it?
+                            // We can use `tokio::task::LocalSet` and run it on the main thread!
+                            // Or we can just block on the main thread for simplicity for the Mac stub,
+                            // or better, implement a `LocalSet` in the event loop.
+                            // But the instructions specifically say: "Engine stays on the main/UI thread, single-threaded, no Arc<Mutex>. Network loads run on the tokio runtime; completed results (HTML string or error) come back via a channel or winit::EventLoopProxy user event; the event loop hands them to the engine."
+                            
+                            // Ah! `engine.load_url` does the fetch itself. I need to decouple the fetch from the engine load!
+                            // Actually, I can just spawn a blocking network request in Tokio, return the HTML via proxy, and then call `engine.load_html` on the main thread.
+                            
+                            let proxy = self.proxy.clone();
+                            let handle = self.rt.handle().clone();
                             std::thread::spawn(move || {
                                 handle.block_on(async move {
-                                    let _ = engine.borrow_mut().load_url(&url).await;
-                                    w.request_redraw();
+                                    let html = match aether::net::fetch_document(&url).await {
+                                        Ok(content) => content,
+                                        Err(e) => format!("<html><body><h1>Error</h1><p>{}</p></body></html>", e),
+                                    };
+                                    let _ = proxy.send_event(AppEvent::UrlLoaded(url, html));
                                 });
                             });
                         } else {
@@ -179,27 +214,33 @@ impl ApplicationHandler for AetherApp {
                         }
                     } else if let Key::Character(c) = event.logical_key {
                         if c == "[" {
-                            let mut eng = self.engine.borrow_mut();
-                            let handle = self.rt.handle().clone();
-                            let engine = self.engine.clone();
-                            let w = window.clone();
-                            std::thread::spawn(move || {
-                                handle.block_on(async move {
-                                    engine.borrow_mut().go_back().await;
-                                    w.request_redraw();
+                            if let Some(url) = self.engine.borrow_mut().get_back_url() {
+                                let proxy = self.proxy.clone();
+                                let handle = self.rt.handle().clone();
+                                std::thread::spawn(move || {
+                                    handle.block_on(async move {
+                                        let html = match aether::net::fetch_document(&url).await {
+                                            Ok(content) => content,
+                                            Err(e) => format!("<html><body><h1>Error</h1><p>{}</p></body></html>", e),
+                                        };
+                                        let _ = proxy.send_event(AppEvent::UrlLoaded(url, html));
+                                    });
                                 });
-                            });
+                            }
                         } else if c == "]" {
-                            let mut eng = self.engine.borrow_mut();
-                            let handle = self.rt.handle().clone();
-                            let engine = self.engine.clone();
-                            let w = window.clone();
-                            std::thread::spawn(move || {
-                                handle.block_on(async move {
-                                    engine.borrow_mut().go_forward().await;
-                                    w.request_redraw();
+                            if let Some(url) = self.engine.borrow_mut().get_forward_url() {
+                                let proxy = self.proxy.clone();
+                                let handle = self.rt.handle().clone();
+                                std::thread::spawn(move || {
+                                    handle.block_on(async move {
+                                        let html = match aether::net::fetch_document(&url).await {
+                                            Ok(content) => content,
+                                            Err(e) => format!("<html><body><h1>Error</h1><p>{}</p></body></html>", e),
+                                        };
+                                        let _ = proxy.send_event(AppEvent::UrlLoaded(url, html));
+                                    });
                                 });
-                            });
+                            }
                         }
                     }
                 }
@@ -210,7 +251,7 @@ impl ApplicationHandler for AetherApp {
 }
 
 pub fn run() {
-    let event_loop = EventLoop::new().unwrap();
+    let event_loop = EventLoop::<AppEvent>::with_user_event().build().unwrap();
     event_loop.set_control_flow(ControlFlow::Wait);
     
     let mut app = AetherApp {
@@ -222,6 +263,7 @@ pub fn run() {
         cursor_y: 0.0,
         url_bar_active: false,
         current_url: String::new(),
+        proxy: event_loop.create_proxy(),
     };
     
     event_loop.run_app(&mut app).unwrap();
