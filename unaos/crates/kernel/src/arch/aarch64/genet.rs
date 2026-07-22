@@ -163,6 +163,7 @@ mod metal {
     const MDIO_START_BUSY: u32 = 1 << 29;
     const MDIO_READ_FAIL: u32 = 1 << 28;
     const MDIO_RD: u32 = 2 << 26;
+    const MDIO_WR: u32 = 1 << 26;
     const MDIO_PMD_SHIFT: u32 = 21;
     const MDIO_REG_SHIFT: u32 = 16;
     // Standard MII registers (IEEE 802.3 Clause 22 — architectural register facts).
@@ -185,6 +186,27 @@ mod metal {
     // 1000BASE-T status (reg 0x0a) link-partner bits.
     const LPA_1000HALF: u16 = 1 << 10;
     const LPA_1000FULL: u16 = 1 << 11;
+
+    // ── PI-GENET-8: BCM54xx PHY LED control (the external BCM54213PE at MDIO addr 1, PHYID1=0x600d
+    //    confirms the Broadcom BCM5421x family). The Pi 4's RJ45 LEDs are driven by THIS PHY, not by the
+    //    MAC — so the MAC-side EXT_RGMII OOB_DISABLE / forced RGMII_LINK bits have no bearing on them
+    //    (that was the red herring). The LED behaviour is set by the PHY's LED-selector SHADOW registers,
+    //    reached through the standard Broadcom shadow-access register 0x1c: a write is
+    //    `WRITE | (shadow<<10) | data[9:0]`. Left at their power-on / bootloader defaults, a selector can
+    //    map an LED to a SOLID source (link/speed or full-duplex — lit the whole time a gigabit
+    //    full-duplex link is up), which is exactly the stuck-amber the operator flagged ("no card leaves
+    //    the yellow light on"). We reprogram the LED selectors to standard link + activity sources so
+    //    neither LED is tied to an always-asserted source. Encodings + register map follow Linux
+    //    `bcm-phy-lib` / `brcmphy.h` (BCM_LED_SRC_*, BCM5482_SHD_LEDS1/2) — architectural PHY facts. ──
+    const MII_BCM_SHD: u32 = 0x1c; // Broadcom shadow-register access register
+    const BCM_SHD_WRITE: u16 = 0x8000; // shadow write-enable
+    const BCM_SHD_LEDS1: u16 = 0x0d; // LED Selector 1: LED1 [3:0], LED3 [7:4]
+    const BCM_SHD_LEDS2: u16 = 0x0e; // LED Selector 2: LED2 [3:0], LED4 [7:4]
+    // LED source encodings (BCM_LED_SRC_*): 0x0 = link/speed indication (solid on link),
+    // 0x3 = activity (blinks on RX/TX, dark when idle), 0xe = OFF (tied high). We use only the
+    // non-tied-on sources so no LED can sit permanently lit.
+    const BCM_LED_SRC_LINKSPD1: u16 = 0x0;
+    const BCM_LED_SRC_ACTIVITYLED: u16 = 0x3;
 
     // ── DMA descriptor + ring register model ──
     /// Descriptors per ring (Linux `TOTAL_DESC`).
@@ -447,6 +469,51 @@ mod metal {
                 return None;
             }
             Some((res & 0xffff) as u16)
+        }
+
+        /// Write one MII register on the external PHY over the UMAC MDIO master (bounded busy-wait).
+        /// The MDIO write mirror of `mdio_read`; used for the PI-GENET-8 PHY LED-selector programming.
+        fn mdio_write(&self, phy: u8, reg: u32, val: u16) {
+            let cmd = MDIO_WR
+                | ((phy as u32) << MDIO_PMD_SHIFT)
+                | (reg << MDIO_REG_SHIFT)
+                | (val as u32);
+            self.w(UMAC_MDIO_CMD, cmd);
+            let v = self.r(UMAC_MDIO_CMD);
+            self.w(UMAC_MDIO_CMD, v | MDIO_START_BUSY);
+            barrier();
+            for _ in 0..100_000 {
+                if self.r(UMAC_MDIO_CMD) & MDIO_START_BUSY == 0 {
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+        }
+
+        /// PI-GENET-8: write a BCM54xx PHY SHADOW register through the standard shadow-access register
+        /// 0x1c (`WRITE | (shadow<<10) | data[9:0]`). Data is masked to 10 bits per the register field.
+        fn phy_shd_write(&self, shadow: u16, data: u16) {
+            let v = BCM_SHD_WRITE | (shadow << 10) | (data & 0x03ff);
+            self.mdio_write(self.phy_addr, MII_BCM_SHD, v);
+        }
+
+        /// PI-GENET-8: program the external BCM54213PE's LED selectors to standard link + activity
+        /// sources so neither RJ45 LED is tied to an always-asserted source (the observed stuck-amber).
+        /// The board's physical green/amber mapping to LED1..LED4 is not documented to us, so BOTH
+        /// selector nibbles of BOTH selector registers are set to real (non-tied-on) sources: whichever
+        /// pins the board wires out then show link and activity, never a permanently-lit selector. This
+        /// is a PHY-side cosmetic fix (MDIO only); it touches no MAC datapath and weakens no protection.
+        fn phy_config_leds(&self) {
+            // LEDS1: LED1 [3:0] = link/speed, LED3 [7:4] = activity.
+            let leds1 = (BCM_LED_SRC_ACTIVITYLED << 4) | BCM_LED_SRC_LINKSPD1;
+            // LEDS2: LED2 [3:0] = activity, LED4 [7:4] = link/speed (symmetric to LEDS1).
+            let leds2 = (BCM_LED_SRC_LINKSPD1 << 4) | BCM_LED_SRC_ACTIVITYLED;
+            serial_println!(
+                "{}   >>> PHY MDIO (M2): BCM54xx LED selectors LEDS1={:#06x} LEDS2={:#06x} (link+activity; no tied-on source — stuck-amber fix) ::",
+                PG, leds1, leds2
+            );
+            self.phy_shd_write(BCM_SHD_LEDS1, leds1);
+            self.phy_shd_write(BCM_SHD_LEDS2, leds2);
         }
 
         /// Scan MDIO addresses 0..31 for a PHY that returns a plausible (non-0xffff/0x0000) PHYID1.
@@ -870,27 +937,22 @@ mod metal {
             // path: `status = (struct status_64 *)skb->data; dma_length_status = status->length_status`)
             // — not the descriptor word. Read the status block (now cache-coherent); fall back to the
             // descriptor word only if the block reads zero (belt-and-braces on odd hardware states).
-            let mut sb = unsafe { read_volatile(buf_base as *const u32) };
-            // PI-GENET-6 FIX (boot-P13 rx[0]): the RDMA producer index can advance before the buffer
-            // DMA is visible in DRAM — the first popped frame read a zero status block AND zero payload
-            // even post-invalidate (the OFFER, lost as zeros). A zero status block means "DMA not yet
-            // visible", not "no status": re-invalidate and re-read, bounded, before consuming.
-            if sb == 0 {
-                let mut spins = 0u32;
-                while sb == 0 && spins < 10_000 {
-                    barrier();
-                    invalidate_dcache(buf_base as u64, BUF_SIZE);
-                    sb = unsafe { read_volatile(buf_base as *const u32) };
-                    spins += 1;
-                }
-                if sb != 0 {
-                    serial_println!(
-                        "{}   [genet6] rx status block arrived after {} re-polls (premature pop rescued — producer index led the buffer DMA) ::",
-                        PG, spins
-                    );
-                }
-            }
-            let ls = if sb != 0 { sb } else { dsc_ls };
+            let sb = unsafe { read_volatile(buf_base as *const u32) };
+            // PI-GENET-8 FIX (rx[0] phantom zero-status pop): on EVERY boot the FIRST popped frame reads
+            // a ZERO in-buffer status block even after `dc ivac`, while the DESCRIPTOR length_status word
+            // (MMIO, always fresh) is a valid non-zero length AND the payload at offset RX_STATUS_PAD is
+            // the real frame (metal: rx[0] dsc=0x01987f80 len=342 et=0x0800, pre16 = the live OFFER — the
+            // status block alone was zero). From rx[1] on, sb_pre==sb_post==dsc: the status block IS
+            // populated for later slots. So the RDMA completion writes back the descriptor length_status
+            // + advances the producer index, but the 64-byte status-block write lags / is skipped on the
+            // first ring pass. The GENET-6 assumption ("sb==0 => DMA not yet visible; a bounded
+            // invalidate+re-read re-poll rescues it") is REFUTED by metal — 10k spins NEVER flipped the
+            // block, because nothing writes it for that slot; the loop only burned time while real frames
+            // queued. The descriptor length_status word is therefore the AUTHORITATIVE length source (the
+            // status block is kept only as the `[genet5]` witness column). Note this also refutes the
+            // index-baseline hypothesis: a slot popped one-early would show dsc_ls==0 too (init clears
+            // it), but dsc_ls is a valid length here — the slot WAS completed, not popped early.
+            let ls = if dsc_ls != 0 { dsc_ls } else { sb };
             // Received length is bits [beyond 16]; strip the 64-byte status block + 2-byte align pad
             // (both included in the reported length — see RX_STATUS_PAD).
             let total = ((ls >> DMA_BUFLENGTH_SHIFT) & 0x0fff) as usize;
@@ -1243,6 +1305,9 @@ mod metal {
 
         // ── PHY: find the external BCM54213PE and RESOLVE the negotiated link (autoneg-honest) ──
         nic.phy_addr = nic.find_phy();
+        // PI-GENET-8: reprogram the PHY LED selectors off their power-on defaults so the RJ45 amber
+        // LED is not left tied to a solid link/full-duplex source (the operator's stuck-yellow report).
+        nic.phy_config_leds();
         let ls = nic.phy_resolve();
         serial_println!(
             "{}   PHY autoneg resolved (MDIO addr {}): link {} · aneg {} · speed {}M · {} ::",
