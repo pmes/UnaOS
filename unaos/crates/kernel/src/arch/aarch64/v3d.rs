@@ -1397,23 +1397,45 @@ const FS_WORDS: [u64; 10] = [
     0x3c00_3186_bb80_0000, // nop
 ];
 
-/// COORDINATE / VERTEX shader passthrough body (same minimal program for the bin CS and render VS
-/// variants). Mesa order: 4× ldvpmv_in read the vec4 position attribute from the VPM into rf0..rf3
-/// (each also reloads the read-offset uniform into rf5), vpmsetup arms the VPM output, 4× `mov vpm`
-/// write the position words, vpmwt (GFXH-1684) completes the VPM writes, thrsw + two nops end.
-/// Metal-refinement surface: the ldunifrf read-offsets, the vpmsetup value, and the output layout.
-const CS_VS_WORDS: [u64; 13] = [
-    0x3d81_6180_bc80_6140, // ldvpmv_in rf0, rf5 ; ldunifrf.rf5   (attr.x)
-    0x3d81_6181_bc80_6140, // ldvpmv_in rf1, rf5 ; ldunifrf.rf5   (attr.y)
-    0x3d81_6182_bc80_6140, // ldvpmv_in rf2, rf5 ; ldunifrf.rf5   (attr.z)
-    0x3d81_6183_bc80_6140, // ldvpmv_in rf3, rf5 ; ldunifrf.rf5   (attr.w)
-    0x3c00_3186_bb81_e140, // vpmsetup -, rf5     (VPM output setup; value=metal-refined)
-    0x3c00_3386_bbf8_0000, // mov vpm, rf0        (pos.x)
-    0x3c00_3386_bbf8_0040, // mov vpm, rf1        (pos.y)
-    0x3c00_3386_bbf8_0080, // mov vpm, rf2        (pos.z)
-    0x3c00_3386_bbf8_00c0, // mov vpm, rf3        (pos.w / 1/Wc)
-    0x3c00_3186_bb81_6000, // vpmwt               (VPM writes complete before end)
-    0x3c20_3186_bb80_0000, // nop ; thrsw         (end)
+/// COORDINATE / VERTEX shader body — the SIX-word screen-space output (same program for the bin CS and
+/// render VS variants). PI-V3D-19 widened the V3D-9 four-word passthrough to satisfy the V3D-18-proven
+/// coordinate contract: after the four clip words [Xc,Yc,Zc,Wc] at out-offsets 0..3, it computes and
+/// writes the two screen-space words the PTB bins from at offsets 4,5 —
+///     Xs = f2i32(floor( Xc · 8192 )),  Ys = f2i32(floor( Yc · 8192 ))   (8192 = vp_scale 32·256).
+///
+/// W=1 SIMPLIFICATION (LOUD): TRI_VERTS all carry Wc = 1.0, so 1/Wc = 1.0 and NO reciprocal (SFU/recip)
+/// instruction is emitted — the transform collapses to floor(Xc·8192). This holds ONLY for W=1 geometry;
+/// a perspective draw (W≠1) would need a per-vertex reciprocal inserted here.
+///
+/// Mesa order: 4× ldvpmv_in read the vec4 clip position into rf0..rf3 (each reloads the read-offset into
+/// rf5); ldunifrf loads the 8192.0f vp_scale into rf6; vpmsetup arms the (now 6-wide) VPM output; 4× mov
+/// vpm write the clip words; then per screen axis fmul→ffloor→ftoiz→mov vpm; vpmwt (GFXH-1684); thrsw +
+/// two nops end. Registers: rf0..3 clip, rf5 offset, rf6=8192.0, rf7=Xs, rf8=Ys.
+///
+/// PROVENANCE: every word Mesa-packed + round-tripped by scripts/pi-v3d19-qpu-gen.c (see its .out.txt);
+/// the clip words match the V3D-9 output bit-exactly. Metal-refinement surface (unchanged stance): the
+/// ldunifrf read-offsets, the vpmsetup width value, and the RF write→read hazard scheduling.
+const CS_VS_WORDS: [u64; 22] = [
+    0x3d81_6180_bc80_6140, // ldvpmv_in rf0, rf5 ; ldunifrf.rf5   (attr[0] -> Xc)
+    0x3d81_6181_bc80_6140, // ldvpmv_in rf1, rf5 ; ldunifrf.rf5   (attr[1] -> Yc)
+    0x3d81_6182_bc80_6140, // ldvpmv_in rf2, rf5 ; ldunifrf.rf5   (attr[2] -> Zc)
+    0x3d81_6183_bc80_6140, // ldvpmv_in rf3, rf5 ; ldunifrf.rf5   (attr[3] -> Wc)
+    0x3d81_b186_bb80_0000, // nop ; ldunifrf.rf6                  (rf6 <- 8192.0f vp_scale)
+    0x3c00_3186_bb81_e140, // vpmsetup -, rf5                     (VPM output setup, 6-wide; value=metal)
+    0x3c00_3386_bbf8_0000, // mov vpm, rf0                        (out0 clip Xc)
+    0x3c00_3386_bbf8_0040, // mov vpm, rf1                        (out1 clip Yc)
+    0x3c00_3386_bbf8_0080, // mov vpm, rf2                        (out2 clip Zc)
+    0x3c00_3386_bbf8_00c0, // mov vpm, rf3                        (out3 clip Wc)
+    0x5400_11c6_bbf8_0006, // fmul rf7, rf0, rf6                  (Xc · 8192.0 ; W=1 so no 1/Wc)
+    0x3c00_2187_f680_61c0, // ffloor rf7, rf7                     (floor, ver==42 path)
+    0x3c00_2187_f583_e1c0, // ftoiz rf7, rf7                      (f2i32)
+    0x3c00_3386_bbf8_01c0, // mov vpm, rf7                        (out4 screen Xs)
+    0x5400_1206_bbf8_0046, // fmul rf8, rf1, rf6                  (Yc · 8192.0)
+    0x3c00_2188_f680_6200, // ffloor rf8, rf8                     (floor, ver==42 path)
+    0x3c00_2188_f583_e200, // ftoiz rf8, rf8                      (f2i32)
+    0x3c00_3386_bbf8_0200, // mov vpm, rf8                        (out5 screen Ys)
+    0x3c00_3186_bb81_6000, // vpmwt                               (VPM writes complete before end)
+    0x3c20_3186_bb80_0000, // nop ; thrsw                         (end)
     0x3c00_3186_bb80_0000, // nop
     0x3c00_3186_bb80_0000, // nop
 ];
@@ -1444,9 +1466,12 @@ fn write_fs_uniforms(off: usize) -> usize {
 }
 
 /// The coord/vertex uniform stream: the four VPM read-offsets (attribute component 0..3) the
-/// ldvpmv_in instructions consume via ldunifrf.rf5. Offsets are the metal-refinement surface.
+/// ldvpmv_in instructions consume via ldunifrf.rf5, then the 8192.0f viewport scale (vp_scale =
+/// viewport.scale 32 · clipper_xy_granularity 256) the PI-V3D-19 screen-space `ldunifrf.rf6` consumes
+/// to compute Xs/Ys = f2i32(floor(coord · 8192)). Offsets are the metal-refinement surface; 8192.0 is
+/// the V3D-18-proven contract constant.
 fn write_geo_uniforms(off: usize) -> usize {
-    let unif: [u32; 4] = [0, 1, 2, 3];
+    let unif: [u32; 5] = [0, 1, 2, 3, 0x4600_0000 /* 8192.0f32 */];
     for (i, w) in unif.iter().enumerate() {
         arena_write_u32(off + i * 4, *w);
     }
@@ -1621,16 +1646,15 @@ fn build_bin_cl(num_attrs: u32) -> usize {
     // QUNIFORM_VIEWPORT_X_SCALE; granularity 256.0f for ver 42, v3d_device_info.c). The Xs/Ys are
     // CENTRE-RELATIVE (no +centre in the shader); the +32,+32 centre is supplied by VIEWPORT_OFFSET
     // below — so the two mechanisms COMPOSE, they do not double-apply. The PTB bins from the SCREEN
-    // words (out-offsets 4,5). Our CS_VS_WORDS is a pure 4-word passthrough (ldvpmv_in ×4 → mov vpm
-    // ×4) — it writes offsets 0..3 and NEVER 4,5 → the PTB reads zero screen coords → empty-but-legal
-    // bin. THIS is the residual V3D-17 empty-bin cause (metal boot-P17: CL fully consumed, no fault,
-    // pool + tile-STATE both zero). The fixed-function state below is CORRECT and stays; the record's
-    // VPM segment sizes are also CORRECT (Mesa packs them in SECTORS = align(words,8)/8: 4 in → 1, 6
-    // out → 1; vir.c v3d_vs_set_prog_data — our record's 1 is right, NOT the bug). THE FIX (deferred —
-    // needs Mesa-packed QPU words, fabricated-constant law; NOT hand-authorable): extend the coord
-    // shader to also emit Xs,Ys at out-offsets 4,5 (6-word output), i.e. add 2× mov-vpm of the two
-    // screen words + a 6-wide vpmsetup. cs_vpm_output_witness() prints the contract vs. our emit every
-    // boot. See PI-V3D-18 landing report.
+    // words (out-offsets 4,5). PI-V3D-19 RESOLVES the residual V3D-17/18 empty-bin cause: CS_VS_WORDS now
+    // emits all SIX words — the 4 clip words THEN Xs,Ys (fmul·8192 → ffloor → ftoiz → mov vpm, per axis),
+    // Mesa-packed by scripts/pi-v3d19-qpu-gen.c. W=1 SIMPLIFICATION: TRI_VERTS all carry Wc=1.0, so
+    // 1/Wc=1.0 and the transform is floor(coord·8192) with NO reciprocal (this holds ONLY for W=1
+    // geometry). The fixed-function state below is CORRECT and stays; the record's VPM segment sizes are
+    // also CORRECT (Mesa packs them in SECTORS = align(words,8)/8: 4 in → 1, 6 out → 1; vir.c
+    // v3d_vs_set_prog_data — re-verified: 6 words still round to 1 sector, record unchanged). QEMU models
+    // no V3D so the real verdict is the next metal boot's tile-alloc pool / tile-STATE going non-zero;
+    // cs_vpm_output_witness() prints the expected Xs/Ys per vertex to check against.
 
     // CFG_BITS (code 96, v42): enable BOTH forward- and reverse-facing primitives (no cull); every
     // other bit 0 (no depth/stencil/blend). Fields: fwd-facing@0(1), rev-facing@1(1). Length 4
@@ -2349,9 +2373,11 @@ fn bin_pool_witness(tag: &str) -> bool {
 ///      `v3d_nir_emit_ff_vpm_outputs`; f2i gives INTEGER .8 fixed-point, CENTRE-RELATIVE — the centre
 ///      is added by the fixed-function VIEWPORT_OFFSET). vp_scale = viewport.scale·clipper_xy_granularity
 ///      = 32 · 256 = 8192 (v3d_uniforms.c QUNIFORM_VIEWPORT_X_SCALE; granularity 256.0f for ver 42,
-///      v3d_device_info.c). Our CS_VS_WORDS writes only offsets 0..3 (the 4 clip words) and NEVER
-///      offsets 4,5 → the PTB reads zero screen coords → empty-but-legal bin. This line prints both so
-///      the discrepancy is on the wire every boot until the 2-word emit lands (needs Mesa-packed QPU).
+///      v3d_device_info.c). PI-V3D-19 widened CS_VS_WORDS to emit offsets 4,5 (fmul·8192 → ffloor →
+///      ftoiz → mov vpm, per axis; W=1 so no 1/Wc), Mesa-packed by scripts/pi-v3d19-qpu-gen.c. This line
+///      prints the expected Xs/Ys per vertex so the next metal boot can check the PTB's binned coords
+///      against them (the CS VPM output is on-chip; the tile-alloc pool / tile-STATE going non-zero is
+///      the real verdict).
 fn cs_vpm_output_witness(tag: &str) {
     // (1) shader-state record + attribute record bytes (36 + 16 = 52).
     cache::clean_invalidate_range(arena_phys() + OFF_SHADREC, 52);
@@ -2365,7 +2391,7 @@ fn cs_vpm_output_witness(tag: &str) {
         let xs = floor_i32(xc * vp_scale * rcp_wc);
         let ys = floor_i32(yc * vp_scale * rcp_wc);
         serial_println!(
-            ":: V3D: [v3d18] {} CS-out v{} — CONTRACT[6] Xc={} Yc={} Zc={} Wc={} | Xs={} Ys={} (centre-rel .8fp) — our CS_VS_WORDS emits ONLY the 4 clip words; Xs/Ys @out-offset 4,5 MISSING → PTB bins zeros ::",
+            ":: V3D: [v3d19] {} CS-out v{} — CONTRACT[6] Xc={} Yc={} Zc={} Wc={} | Xs={} Ys={} (centre-rel .8fp) — CS_VS_WORDS now EMITS Xs/Ys @out-offset 4,5 (W=1: floor(coord·8192)); PTB should bin these ::",
             tag, i,
             (xc * 1000.0) as i32, (yc * 1000.0) as i32, (zc * 1000.0) as i32, (wc * 1000.0) as i32,
             xs, ys
