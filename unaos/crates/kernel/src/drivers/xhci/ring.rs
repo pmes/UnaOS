@@ -155,6 +155,16 @@ impl TransferRing {
         self.trbs as u64
     }
 
+    /// USB-WRITE-2: the (physical address, Dequeue Cycle State) the controller should resume at
+    /// after a bulk STALL is cleared — the CURRENT enqueue slot (the next TRB the host will push),
+    /// carrying this ring's live cycle bit. Feeds a Set TR Dequeue Pointer command so a halted
+    /// endpoint restarts PAST the faulted TRB instead of re-fetching it. Pairs with a Reset
+    /// Endpoint command (Halted -> Stopped) and a device-side CLEAR_FEATURE(ENDPOINT_HALT).
+    pub fn dequeue_reset_target(&self) -> (u64, u32) {
+        let phys = self.trbs as u64 + (self.enqueue_index as u64) * 16;
+        (phys, if self.cycle_bit { 1 } else { 0 })
+    }
+
     /// Ring index of the TRB at physical address `phys`, if it lies inside this ring.
     fn index_of(&self, phys: u64) -> Option<usize> {
         let base = self.trbs as u64;

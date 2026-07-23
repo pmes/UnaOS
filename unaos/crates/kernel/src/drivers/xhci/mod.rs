@@ -3965,8 +3965,13 @@ impl XhciController {
             let code = self.run_bot_stage(slot_id, in_dci, out_dci, data_trb_phys)?;
             if code != 1 && code != 13 {
                 serial_println!("xHCI: BOT data stage error, completion code {}", code);
-                return if code == 4 || code == 6 { Err(BotError::Stall) }
-                       else { Err(BotError::TransferError(code)) };
+                if code == 4 || code == 6 {
+                    // USB-WRITE-2: the data endpoint halted (STALL/Babble). Recover the pipe NOW so
+                    // this faulted transfer cannot poison every later BOT command on the same slot.
+                    self.recover_bulk_stall(slot_id, !data_out);
+                    return Err(BotError::Stall);
+                }
+                return Err(BotError::TransferError(code));
             }
             // XHCI-COHERENCE: consumer boundary — an IN data stage's buffer was DMA-written by the
             // controller; invalidate it here (ONE chokepoint for every SCSI IN reader: INQUIRY,
@@ -3992,8 +3997,13 @@ impl XhciController {
         let code = self.run_bot_stage(slot_id, in_dci, out_dci, csw_trb_phys)?;
         if code != 1 && code != 13 {
             serial_println!("xHCI: BOT transfer error, completion code {}", code);
-            return if code == 4 || code == 6 { Err(BotError::Stall) }
-                   else { Err(BotError::TransferError(code)) };
+            if code == 4 || code == 6 {
+                // USB-WRITE-2: the CSW rides the bulk IN pipe; a halt here leaves the IN endpoint
+                // dead. Recover it before returning so subsequent reads/writes aren't poisoned.
+                self.recover_bulk_stall(slot_id, true);
+                return Err(BotError::Stall);
+            }
+            return Err(BotError::TransferError(code));
         }
 
         // 4) Validate the CSW.
@@ -4019,6 +4029,64 @@ impl XhciController {
                 2 => CswStatus::PhaseError, _ => CswStatus::Unknown,
             };
             Ok(BotResult { status, residue })
+        }
+    }
+
+    /// USB-WRITE-2: recover a halted bulk endpoint after a STALL (completion code 4) or Babble
+    /// (6) so one faulted transfer cannot dead-line every later BOT command on the slot. This is
+    /// the standard USB BOT clear-stall sequence, host + device side:
+    ///   1. **Reset Endpoint** (xHCI command TRB type 14): moves the endpoint context from the
+    ///      Halted state to Stopped and clears the host-side data-toggle/sequence.
+    ///   2. **Set TR Dequeue Pointer** (command TRB type 16): repoints the transfer ring's dequeue
+    ///      pointer PAST the faulted TRB (the current enqueue slot + live cycle), so restarting the
+    ///      endpoint does not re-fetch the command that stalled.
+    ///   3. **CLEAR_FEATURE(ENDPOINT_HALT)** (EP0 control, bmRequestType 0x02, bRequest 0x01,
+    ///      wValue 0 = ENDPOINT_HALT, wIndex = endpoint address): clears the DEVICE-side halt so it
+    ///      resumes accepting transactions on that pipe.
+    /// `ep_in` selects the bulk IN (CSW / READ data) vs bulk OUT (WRITE data) endpoint. Best-effort:
+    /// each step logs but the sequence proceeds — a device that NAKs one step should not block the
+    /// others. Runs in the same safe synchronous polled context as the BOT pump itself.
+    fn recover_bulk_stall(&mut self, slot_id: u8, ep_in: bool) {
+        let ep_addr = {
+            let slot = &self.slots[slot_id as usize];
+            if ep_in { slot.bulk_in_ep } else { slot.bulk_out_ep }
+        };
+        if ep_addr == 0 { return; }
+        let dci: u32 = if ep_in {
+            (((ep_addr as u32) & 0x0F) * 2) + 1
+        } else {
+            ((ep_addr as u32) & 0x0F) * 2
+        };
+        serial_println!("xHCI: [usbw] bulk STALL recovery slot {} ep {:#04x} (dci {})", slot_id, ep_addr, dci);
+
+        // 1) Reset Endpoint: Halted -> Stopped, clears host sequence/toggle.
+        let reset_trb = Trb { parameter: 0, status: 0,
+            control: (14 << 10) | (dci << 16) | ((slot_id as u32) << 24) };
+        match self.run_command_sync(reset_trb) {
+            Ok((1, _)) => {}
+            other => serial_println!("xHCI: [usbw] Reset Endpoint unexpected {:?}", other),
+        }
+
+        // 2) Set TR Dequeue Pointer to the ring's current enqueue slot (past the faulted TRB).
+        let deq = {
+            let slot = &self.slots[slot_id as usize];
+            let ring = if ep_in { slot.bulk_in_ring.as_ref() } else { slot.bulk_out_ring.as_ref() };
+            ring.map(|r| r.dequeue_reset_target())
+        };
+        if let Some((phys, dcs)) = deq {
+            let deq_trb = Trb { parameter: phys | (dcs as u64), status: 0,
+                control: (16 << 10) | (dci << 16) | ((slot_id as u32) << 24) };
+            match self.run_command_sync(deq_trb) {
+                Ok((1, _)) => {}
+                other => serial_println!("xHCI: [usbw] Set TR Dequeue unexpected {:?}", other),
+            }
+        }
+
+        // 3) Device-side CLEAR_FEATURE(ENDPOINT_HALT) on EP0. wIndex carries the full endpoint
+        //    address (with the direction bit for an IN endpoint).
+        match self.sync_control(slot_id, 0x02, 0x01, 0x0000, ep_addr as u16, 0, 0, false) {
+            Ok(1) => {}
+            other => serial_println!("xHCI: [usbw] CLEAR_FEATURE(HALT) unexpected {:?}", other),
         }
     }
 
@@ -4419,14 +4487,48 @@ impl XhciController {
             None => return,
         };
         if nb < 2 { return; }
-        let lba = (nb - 1) as u32; // last sector — well clear of any FS payload
         let ptr = match self.storage_data_ptr() { Some(p) => p, None => return };
 
-        // 1) READ the scratch sector; stash the ORIGINAL 512 bytes before we perturb it.
-        match self.storage_read10(lba, 1) {
-            Ok(r) if r.status == CswStatus::Passed => {}
-            other => { serial_println!(":: PIUSB: [usbw] write lba={} -> FAIL (pre-read {:?}) ::", lba, other); return; }
+        // USB-WRITE-2: pick a scratch sector near the END of the medium (well clear of any FS
+        // payload) but fall BACK progressively when the first choice STALLs. Metal reality (P44):
+        // some sticks report a READ CAPACITY last-LBA they will then STALL a READ(10) against — the
+        // very-last sector is not always addressable. Try last, last-8, last-64 in order; each pre-
+        // read that halts is recovered inside `bot_transfer`, so the next candidate rides a clean
+        // pipe. All candidates stay in the top 64 sectors — NEVER near low (filesystem) LBAs.
+        let mut lba = (nb - 1) as u32;
+        {
+            let mut candidates = [(nb - 1) as u32, 0u32, 0u32];
+            let mut ncand = 1usize;
+            if nb > 8  { candidates[ncand] = (nb - 8) as u32;  ncand += 1; }
+            if nb > 64 { candidates[ncand] = (nb - 64) as u32; ncand += 1; }
+            let mut chosen: Option<u32> = None;
+            for i in 0..ncand {
+                let cand = candidates[i];
+                match self.storage_read10(cand, 1) {
+                    Ok(r) if r.status == CswStatus::Passed => { chosen = Some(cand); break; }
+                    other => {
+                        serial_println!(
+                            ":: PIUSB: [usbw] pre-read lba={} -> {:?}, falling back ::", cand, other);
+                    }
+                }
+            }
+            match chosen {
+                Some(c) => {
+                    if c != lba {
+                        serial_println!(":: PIUSB: [usbw] fallback lba={} ::", c);
+                    }
+                    lba = c;
+                }
+                None => {
+                    serial_println!(
+                        ":: PIUSB: [usbw] write lba={} -> FAIL (pre-read all candidates stalled) ::", lba);
+                    return;
+                }
+            }
         }
+
+        // 1) The chosen sector is already in the DMA buffer from its successful pre-read; stash the
+        //    ORIGINAL 512 bytes before we perturb it.
         let mut orig = [0u8; 512];
         unsafe { core::ptr::copy_nonoverlapping(ptr as *const u8, orig.as_mut_ptr(), 512); }
 
