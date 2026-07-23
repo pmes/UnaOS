@@ -1,6 +1,23 @@
 # PROPOSAL — Kepler Pull 9: Runlist-Entry & Channel-Bind Derivation (Round 2)
 
-STATUS: PROPOSED
+STATUS: APPROVED WITH AMENDMENTS (2026-07-22 — reviewer verified PFIFO_CHAN
+against envytools master: 0x800000 stride 8 length 0x1000 GK104-, CHAN
+INST 0-29 + UNK31, STATE ENABLED/UNK9/ENABLE_TRIGGER/ENGINE 16-19 — the §2
+audit is exact. The honest "rnndb has no runlist-entry layout" + empirical
+fuzz plan is the right cleanroom move. Amendments:
+A1 — the fuzz needs a DISCRIMINATOR: after submitting the 3-entry runlist,
+read back each PBDMA's CH register (CHID field) and print it — the CHID that
+appears identifies WHICH encoding won without a second boot. Entries must use
+distinct CHIDs for that to work; ensure the three encodings resolve to
+distinguishable CHID values, and print the entry table as written.
+A2 — §1's exploratory prose (the "but wait—" chain) must not reach the
+implementation: the code implements exactly the §5 plan; any deviation goes
+in the REPORT, per the standing flow.
+A3 — configure PFIFO_CHAN for EVERY chid the fuzz entries can select (at
+minimum chids 1 and 3), so a "wrong" decode still lands on an initialized
+channel and the discriminator stays meaningful rather than scheduling an
+uninitialized slot.
+Full-knob land-review law. Metal owed: sitting #8.)
 
 This proposal derives the exact structures required to bridge the remaining gap in the Kepler channel-bind sequence, following the successful repair of the `ORDER` validation in pull 8.
 

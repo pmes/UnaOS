@@ -1,6 +1,18 @@
 # PROPOSAL — iGPU Pull 3: Point-0 and the gmux
 
-STATUS: PROPOSED
+STATUS: APPROVED WITH AMENDMENTS (2026-07-22 — Point-0 design, PP_STATUS
+(0x61200) / PP_CONTROL / DPLL_A (0x6014) additions, and sentinel discipline
+all accepted; those PRM offsets check out. Amendments:
+A1 — gmux protocol variant is UNPROVEN for this exact board: the indexed
+scheme described (index→0x7D0, value←0x7C2) is one of two known gmux access
+styles; the other is classic direct reads at 0x700+reg. Dump BOTH styles as
+separate labeled rows (classic read of 0x710/0x750 alongside the indexed
+reads of reg 0x10/0x50), read-only, sentinels on both — one boot then tells
+us which style this gmux speaks instead of guessing.
+A2 — boot-info grows a third array: same shared-ABI law as pull 2 (initializer
+fields + BOTH builder sides arm the feature — the pull-2 land-review lists the
+exact holes; re-verify each, then strings-prove kernel.elf AND BOOTX64.EFI).
+Metal owed: sitting #8, rides with kepler pull 9.)
 
 ## The Paradox
 In sitting #7, the iGPU trace read fully dead at all three points (including Point-1, immediately before ExitBootServices), yet the GOP text console was visibly on the panel during boot. This implies one of two scenarios:
