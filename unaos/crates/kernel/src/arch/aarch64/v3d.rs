@@ -153,6 +153,7 @@ const V3D_V4_PCTR_0_EN: usize = 0x0650; // per-counter enable mask (bit i enable
 const V3D_V4_PCTR_0_CLR: usize = 0x0654; // per-counter clear-to-0 mask
 const V3D_PCTR_0_OVERFLOW: usize = 0x0658; // per-counter overflow-clear mask
 const V3D_V4_PCTR_0_SRC_0_3: usize = 0x0660; // source-select for counters 0..3 (four 7-bit S0..S3 fields)
+const V3D_V4_PCTR_0_SRC_4_7: usize = 0x0664; // source-select for counters 4..7 (SRC_0_3 + 4; S4..S7 fields)
 const V3D_PCTR_0_PCTR0: usize = 0x0680; // counter 0 output; counter i output = PCTR0 + 4*i
 // Counter SOURCE ids — the `enum v3d_perfcnt` INDEX from Linux uapi `include/uapi/drm/v3d_drm.h`. On
 // V3D 4.2 (ver<71) the enum index IS the hardware source id written into the SRC field (cross-checked:
@@ -160,6 +161,17 @@ const V3D_PCTR_0_PCTR0: usize = 0x0680; // counter 0 output; counter i output = 
 const PCTR_SRC_QPU_ACTIVE_CYCLES_VERTEX_COORD_USER: u32 = 14; // QPU cycles executing vertex/coord USER shaders
 const PCTR_SRC_QPU_CYCLES_VALID_INSTR: u32 = 16; // QPU cycles issuing a valid instruction
 const PCTR_SRC_CYCLE_COUNT: u32 = 32; // total core clock cycles (block-was-clocked sanity)
+// PI-V3D-33 TMU-block witness sources — same `enum drm_v3d_perfcnt` index==source-id contract, and all
+// three fall BETWEEN the code's own verified anchors (16 valid_instr, 32 cycle_count), so they inherit
+// the same cross-check. These three counter the TMU pipe directly so the next boot distinguishes "the
+// QPU never issued the general store to the TMU" (all three read 0) from "the TMU was engaged but the
+// write never reached DRAM" (any nonzero → the store fired; a drain/L2T/address defect, not an issue
+// defect). No known-working TMU op exists on this hardware to calibrate against (both fragment shaders
+// use TLB writes / ldvary, never a TMU lookup — see FS_WORDS / GRAD_FS_WORDS), so the trio is read as a
+// battery: any member nonzero proves the TMU block saw activity.
+const PCTR_SRC_QPU_CYCLES_WAITING_TMU: u32 = 17; // QPU cycles stalled waiting on the TMU
+const PCTR_SRC_TMU_TCACHE_ACCESS: u32 = 24; // TMU tcache accesses (per TMU op that touches the cache)
+const PCTR_SRC_TMU_TCACHE_MISS: u32 = 25; // TMU tcache misses (a store to a fresh line misses)
 
 // CLE (control-list executor) — CT1 is the RENDER queue. Submitting a job = write the ring's start
 // address to CT1QBA and its end address to CT1QEA; the hardware runs [BA, EA).
@@ -2043,6 +2055,15 @@ const PROBE_WORDS: [u64; 25] = [
     0x3c00_2186_bc80_2000, // ldvpmv_in rf6, r2 ; nop
     0x3c00_32c6_bbf8_0140, // nop ; mov tmud, rf5                   (store attr[2])
     0x3c00_32c6_bbf8_0180, // nop ; mov tmud, rf6                   (store attr[3])
+    // PI-V3D-33 byte-precise waddr decode of THIS word (0x3c00_3346_bbec_0000), against Mesa's ver-42 QPU
+    // packing (qpu_pack.c: MA=bit44, WADDR_A=bits[43:38]) and the `enum v3d_qpu_waddr` (qpu_instr.h):
+    //   bit44 MA=1  → the add-ALU result is a MAGIC write (to a special register, not a regfile slot);
+    //   bits[43:38] = 0b001101 = 13 = V3D_QPU_WADDR_TMUAU  (TMUD=11, TMUA=12, TMUAU=13 — cross-checked
+    //   against word[5] `mov tmud` whose WADDR_A decodes to 11=TMUD in the very same layout).
+    // VERDICT: the encoding is CORRECT — this genuinely names TMUAU (13), NOT TMUA (12). The "TMUA-vs-TMUAU
+    // mix-up → default config → a lookup not a write" hypothesis is REFUTED. TMUAU means the TMU consumes
+    // the next word of the shader's uniform FIFO as its write config (u5=0xFFFFFFFC, audited 12/12 by
+    // [v3d32]); a plain TMUA would have used the last-loaded config. Config delivery is correct by encoding.
     0x3c00_3346_bbec_0000, // nop ; mov tmuau, r3                   (r3 = UBO_ADDR → fire the store)
     0x3d91_2180_f883_50c0, // stvpmv r5, rf3 ; nop ; ldunifrf.r4
     0x5440_2047_ba9a_f0c6, // recip rf7, rf6 ; fmul r1, rf3, r4 ; ldunif
@@ -2242,6 +2263,20 @@ fn probe_job() {
         serial_println!(
             ":: V3D: [v3d30] executed QPU words @CS start — last4=[{:#018x} {:#018x} {:#018x} {:#018x}] (word22=tmuwt+thrsw; thrsw also on words 18,19 — thread may end before tmuwt) ::",
             qword(21), qword(22), qword(23), qword(24)
+        );
+        // PI-V3D-33: echo the static waddr decode of word[9] into the capture alongside the bytes that ran,
+        // so the "is the store even asking the TMU for a write?" question is answered from the log itself.
+        // MA(bit44)=1 magic-write, WADDR_A(bits43:38)=13=TMUAU (not 12=TMUA) — config IS pulled from the
+        // uniform FIFO. Encoding exonerated; if the TMU witness below reads SAW-NOTHING the defect is the
+        // ISSUE path (thread-end/quad-mask), not the config/address.
+        let w9 = qword(9);
+        let ma = (w9 >> 44) & 1;
+        let waddr_a = (w9 >> 38) & 0x3f;
+        serial_println!(
+            ":: V3D: [v3d33] word[9]={:#018x} decode — MA(magic-write)={} WADDR_A={} ({}) — general store {} the TMU for a write ::",
+            w9, ma, waddr_a,
+            match waddr_a { 11 => "TMUD", 12 => "TMUA", 13 => "TMUAU", 6 => "NOP", _ => "OTHER" },
+            if ma == 1 && waddr_a == 13 { "correctly asks" } else { "does NOT correctly ask" }
         );
     } else {
         serial_println!(
@@ -2989,18 +3024,28 @@ fn bin_pool_witness(tag: &str) -> bool {
 /// transform-feedback via nir_to_vir.c ntq_emit_tmu_general — so it is not architecturally impossible;
 /// it is merely the wrong instrument for a "did it execute at all" probe.)
 ///
-/// Programming is the exact Linux `v3d_perfmon_start` idiom (v3d_perfmon.c, V3D 4.x path): pack the three
-/// source ids into the 7-bit S0..S3 fields of PCTR_0_SRC_0_3 (counters 0,1,2), enable via EN=mask, then
-/// CLR=mask (reset to 0) and OVERFLOW=mask. Called just before the bin GO so the counters span the bin.
+/// Programming is the exact Linux `v3d_perfmon_start` idiom (v3d_perfmon.c, V3D 4.x path): pack the
+/// source ids into the 7-bit S-fields of PCTR_0_SRC_0_3 (counters 0..3) and PCTR_0_SRC_4_7 (counters
+/// 4,5), enable via EN=mask, then CLR=mask (reset to 0) and OVERFLOW=mask. Called just before the bin GO
+/// so the counters span the bin. PI-V3D-33 adds counters 3,4,5 = the TMU-issue battery (tcache access,
+/// cycles-waiting-TMU, tcache miss) on top of the V3D-21 execution trio (0,1,2).
 fn pctr_setup_cs_witness() {
     // counter 0 = QPU active cycles in vertex/coord user shaders (the decisive execution witness),
     // counter 1 = QPU cycles issuing a valid instruction (corroboration), counter 2 = core cycle count
     // (block-was-clocked sanity). All three live in source group 0 (counters 0..3), packed S0/S1/S2.
     let channel = (PCTR_SRC_QPU_ACTIVE_CYCLES_VERTEX_COORD_USER & 0x7f)
         | ((PCTR_SRC_QPU_CYCLES_VALID_INSTR & 0x7f) << 8)
-        | ((PCTR_SRC_CYCLE_COUNT & 0x7f) << 16);
-    let mask: u32 = 0b111; // three counters enabled
+        | ((PCTR_SRC_CYCLE_COUNT & 0x7f) << 16)
+        // PI-V3D-33: counter 3 (S3, bits 24..30) = TMU tcache accesses — the direct "did the TMU see the
+        // general store?" witness, sharing this same source register.
+        | ((PCTR_SRC_TMU_TCACHE_ACCESS & 0x7f) << 24);
+    // PI-V3D-33: counters 4,5 in the next source group (SRC_4_7): S4 = QPU cycles waiting on the TMU,
+    // S5 = TMU tcache misses. Together with counter 3 they form the TMU-engaged battery.
+    let channel_4_7 =
+        (PCTR_SRC_QPU_CYCLES_WAITING_TMU & 0x7f) | ((PCTR_SRC_TMU_TCACHE_MISS & 0x7f) << 8);
+    let mask: u32 = 0b11_1111; // six counters enabled (0..5)
     mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_SRC_0_3, channel);
+    mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_SRC_4_7, channel_4_7);
     dsb();
     mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_EN, mask);
     mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_CLR, mask);
@@ -3016,12 +3061,30 @@ fn pctr_read_cs_witness(tag: &str) {
     let coord = mmio_read(V3D_CORE0_BASE, V3D_PCTR_0_PCTR0); // counter 0
     let vinstr = mmio_read(V3D_CORE0_BASE, V3D_PCTR_0_PCTR0 + 4); // counter 1
     let cycles = mmio_read(V3D_CORE0_BASE, V3D_PCTR_0_PCTR0 + 8); // counter 2
+    // PI-V3D-33 TMU battery: counter 3 = tcache accesses, 4 = cycles waiting TMU, 5 = tcache misses.
+    let tmu_acc = mmio_read(V3D_CORE0_BASE, V3D_PCTR_0_PCTR0 + 12); // counter 3
+    let tmu_wait = mmio_read(V3D_CORE0_BASE, V3D_PCTR_0_PCTR0 + 16); // counter 4
+    let tmu_miss = mmio_read(V3D_CORE0_BASE, V3D_PCTR_0_PCTR0 + 20); // counter 5
     mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_EN, 0); // stop counting
     dsb();
     serial_println!(
         ":: V3D: [v3d21] {} CS-exec proof via PCTR — QPU_ACTIVE_CYCLES_VERTEX_COORD(src14)={} valid_instr(src16)={} cycle_count(src32)={} — SHADER {} ::",
         tag, coord, vinstr, cycles,
         if coord != 0 { "RAN" } else { "NEVER RAN" }
+    );
+    // PI-V3D-33: the decisive TMU-issue witness. The probe's general store (word[9] mov tmuau) is the
+    // ONLY TMU op in the whole kernel — both fragment shaders write the TLB, never the TMU — so a nonzero
+    // in ANY of these three is the first TMU-block activity UnaOS has ever recorded on this silicon.
+    let tmu_engaged = tmu_acc != 0 || tmu_wait != 0 || tmu_miss != 0;
+    serial_println!(
+        ":: V3D: [v3d33] {} TMU-issue witness via PCTR — tcache_access(src24)={} cycles_waiting_tmu(src17)={} tcache_miss(src25)={} — TMU {} ({}) ::",
+        tag, tmu_acc, tmu_wait, tmu_miss,
+        if tmu_engaged { "ENGAGED" } else { "SAW-NOTHING" },
+        if tmu_engaged {
+            "store issued to the TMU — chase the drain/L2T/address, NOT the issue"
+        } else {
+            "general store never reached the TMU block — chase the issue path (shader/thread-end/waddr), NOT the drain"
+        }
     );
 }
 
