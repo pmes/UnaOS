@@ -19,7 +19,7 @@ Three pull sequences, numbered independently. Every pull = one BRIEF (coordinato
 ## Lane 2: Kepler DISPLAY (scanout — kepler_display.rs after split) — `video/Kepler/`, files `*kepler-display-pull<N>*`
 | Pull | Files | Status | One-liner |
 |---|---|---|---|
-| 4 | BRIEF-kepler-display-pull4-evo-core / PROPOSAL-kepler-display-pull4 | LANDED b025467b — metal owed s14 (serves BOTH lanes; fence holds) | EVO core-channel read-out: dense 0x610480 window + known-value scan of 0x610000–0x613FFC |
+| 4 | BRIEF-kepler-display-pull4-evo-core / PROPOSAL-kepler-display-pull4 | LANDED b025467b; s14: DELIVERED — single hit 0x6101E0=0x200 (surface pointer candidate); core window stable | EVO core-channel read-out: dense 0x610480 window + known-value scan of 0x610000–0x613FFC |
 | 3 | BRIEF-kepler-display-pull3-decode / PROPOSAL-kepler-display-pull3 | LANDED 8ddc7fc3; s13: DELIVERED (0x604/0x614 = telemetry; timing block pinned; no surface addr in windows) | read-only candidate decode (dense windows, 3 passes, arithmetic cross-check) |
 | 2 | BRIEF-kepler-display-pull2-head0-anchor / PROPOSAL-kepler-display-pull2 | LANDED f148d199; s12: DELIVERED (49/40 rows, diff decoded — no bare surface addr; 0x310 lead candidate) | capped head-0 dump (96) + head-1 baseline (64) |
 | 1 | BRIEF-kepler-display-pull1-scanout-rederive / PROPOSAL-kepler-display-pull1 | LANDED; s11: HEAD 0 ALIVE (mirrors refuted, stat anchor proven) | module split + dual-mirror trace |

@@ -3,6 +3,31 @@
 Hard-won silicon facts from the fox-metal sitting series. Trust these over any
 QEMU behavior. Newest sitting first.
 
+## Sitting #14 (display pull 4, UnaOS-gemini@114fad64, 2026-07-23, fox-metal-r23s1i)
+
+**Single read-only boot — EVO core-channel read-out. THE SURFACE REGISTER
+CANDIDATE FELL OUT.**
+- Bench "divergence" (missing pass2) was a miscount — the brief's two passes
+  are pass0+pass1, both complete in the capture (33 lines each). No rerun
+  needed.
+- **Known-value scan: exactly ONE hit in the full 16 KB sweep —
+  `0x6101E0 = 0x00000200`** = the GOP surface address in >>8 form
+  (fb at VRAM +0x20000; 0x20000>>8 = 0x200 — the `expected_addr` shape the
+  s12 differential hunted for). hits=1 capped=false: the predicate produced
+  zero false positives; this is the armed scanout surface pointer candidate,
+  and it lives in the PDISPLAY armed-state region (0x6101E0), NOT the
+  per-head 0x616000 block — exactly why s12/s13 couldn't find it there.
+- **Core window (0x610480–0x6104FC) fully stable across passes** (zero
+  varying words). Structure: +0x10=0x0D0500A9 +0x14=1 (the s13 recon words),
+  then a repeating 3-word record {0x40000088, 0x00000001, 0x80010000} at
+  stride 0x10 from +0x20 — a channel descriptor table (per-EVO-channel
+  ctrl/flag/base records), uniform and quiescent.
+- Verdict: display pull 5 = repoint-the-surface experiment (write 0x6101E0
+  to a second prepared surface, watch panel, restore). FIRST display-register
+  write — Peter decision required. Fence's disp-era-USERD input: the core
+  channel is configured and idle; the descriptor table above is the map for
+  any USERD-linkage probe.
+
 ## Sitting #13 (display pull 3 + kepler pull 14, UnaOS-gemini@f4a7ef6e, 2026-07-23, fox-metal-r23s1i)
 
 **Boot 1 — display pull 3 candidate decode DELIVERED. Coordinator decode:**
