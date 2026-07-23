@@ -109,6 +109,36 @@ pub fn read_block_usb(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
     Ok(n)
 }
 
+/// PIUSB-28: publish the geometry of a freshly enumerated USB mass-storage device. Always records it
+/// under the dedicated [`USB_BLOCK_DEVICE`] handle (so `read_block_usb`/`/fs/usb` can reach the stick),
+/// then raises the storage-ready edge. The global [`BLOCK_DEVICE`] is only claimed when USB is the ACTIVE
+/// backend — i.e. no SD card has flipped the selector to `BACKEND_SD`. On the Pi the microSD registers at
+/// BSP probe (long before xHCI enum), so a later-enumerated USB stick must NOT overwrite the SD geometry:
+/// PI-FS-2 traced a 14 MiB USB card reader's `num_blocks` clobbering the SD's global, which bounded fresh
+/// unafs mounts to the reader's size → `PartError::OutOfBounds(63)`. On x86 (no `register_sd`, no BACKEND
+/// selector) the stick IS the default/boot backend, so this always claims the global — byte-identical to
+/// the pre-PIUSB-28 behavior there. Must run OUTSIDE the xHCI controller lock's storage callers as before.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+pub fn publish_usb_geometry(dev: BlockDeviceInfo) {
+    *USB_BLOCK_DEVICE.lock() = Some(dev);
+    // Claim the global only while USB is still the active backend; once the SD has registered, leave
+    // BLOCK_DEVICE (the SD's geometry) untouched — the stick stays reachable via USB_BLOCK_DEVICE.
+    if BACKEND.load(Ordering::Acquire) != BACKEND_SD {
+        *BLOCK_DEVICE.lock() = Some(dev);
+    }
+    set_usb_ready();
+}
+
+/// PIUSB-28: x86 / non-SD-capable targets — the USB stick is the default (boot) block backend, so it
+/// always claims the global `BLOCK_DEVICE` alongside the dedicated USB handle. Preserves the historical
+/// behavior on any target that never compiles the SD backend / BACKEND selector.
+#[cfg(not(all(target_arch = "aarch64", feature = "baremetal")))]
+pub fn publish_usb_geometry(dev: BlockDeviceInfo) {
+    *BLOCK_DEVICE.lock() = Some(dev);
+    *USB_BLOCK_DEVICE.lock() = Some(dev);
+    set_usb_ready();
+}
+
 /// M6g: register the microSD (EMMC2/SDHCI) as the block backend — publish its geometry AND flip the
 /// selector so `read_block` (and, since U9, `write_block`) route to `drivers::emmc2`. Called once, from
 /// the bare-metal BSP probe after a successful card init (`emmc2::probe`). aarch64 bare-metal only; x86

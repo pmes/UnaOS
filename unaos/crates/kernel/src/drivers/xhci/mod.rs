@@ -4078,15 +4078,14 @@ impl XhciController {
         let dev_info = crate::drivers::block::BlockDeviceInfo {
             slot_id: slot, block_size, num_blocks, vendor, product,
         };
-        *crate::drivers::block::BLOCK_DEVICE.lock() = Some(dev_info);
-        // PIUSB-27: also publish under the dedicated USB handle so the stick's geometry survives a later
-        // `register_sd` claiming the global BLOCK_DEVICE for the microSD — the read-only /fs/usb mount
-        // reads through `read_block_usb`, which needs this geometry even when the SD backend is active.
-        // Raise the storage-ready edge so the main loop mounts + witnesses OUTSIDE this controller lock
-        // (the FAT mount re-locks the controller via `read_block_usb`, so it must not run here). The flag
-        // re-arms on every hot-plug re-enumeration.
-        *crate::drivers::block::USB_BLOCK_DEVICE.lock() = Some(dev_info);
-        crate::drivers::block::set_usb_ready();
+        // PIUSB-28: publish geometry through the backend-aware helper. It ALWAYS records the stick under
+        // the dedicated USB handle (so the read-only /fs/usb mount reaches it via `read_block_usb`) and
+        // raises the storage-ready edge (re-arming on every hot-plug re-enum, consumed OUTSIDE this
+        // controller lock since the FAT mount re-locks the controller). It claims the GLOBAL BLOCK_DEVICE
+        // only when USB is the active backend: on the Pi the microSD registered at BSP probe, so a later
+        // USB stick must NOT clobber the SD's geometry (PI-FS-2: a 14 MiB card reader bounded fresh unafs
+        // mounts → OutOfBounds(63)); on x86 the stick is the boot backend and still claims the global.
+        crate::drivers::block::publish_usb_geometry(dev_info);
         // GUI-WITNESS: the USB block device is up (geometry published). One of the "did storage come
         // up?" milestones a silent boot otherwise can't answer on-panel.
         crate::bootlog::record("block:up");
