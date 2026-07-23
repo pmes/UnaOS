@@ -1,6 +1,14 @@
 # PROPOSAL — Kepler Pull 12: Poll Area 2 (Instance Block)
 
-STATUS: PROPOSED
+STATUS: APPROVED WITH AMENDMENTS (2026-07-22 — the honest "no cleanroom
+RAMFC layout exists for GF100/GK104" finding is accepted and recorded; the
+single logically-derived bit test (USERD_HI bit31) is exactly the right size,
+and the restore+re-test discipline is right. Amendments:
+A1 — after the failure-path restore and re-test, read and print
+CHAN_TABLE_ERROR one more time so "no residue" is evidenced, not asserted.
+A2 — USERD_SNOOP scrub approved; keep one comment line in kepler.rs noting
+0x2a1c was tested inert on GK107 (sitting #10) so it never gets re-proposed.
+Full-knob land-review; arch gate stays. Metal owed: sitting #11.)
 
 This pull addresses the `NO_POLL` (2) rejection observed in Sitting #10. With global MMIO candidates refuted or undocumented, we pivot to the hypothesis that the "poll area" (USERD) is enabled via per-channel state within the instance block.
 

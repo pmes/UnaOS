@@ -1,4 +1,4 @@
-STATUS: BRIEF — awaiting proposal (`PROPOSAL-kepler-display-pull1.md`, this directory)
+STATUS: BRIEF — answered by `PROPOSAL-video-pull6.md` (this directory; submitted before the brief's rename — that name stands for this pull, display-lane numbering restarts at kepler-display-pull2)
 
 # BRIEF — Kepler display pull 1: the panel is Kepler's — re-derive GK107 scanout
 

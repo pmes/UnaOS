@@ -1,3 +1,21 @@
+STATUS: APPROVED WITH AMENDMENTS (2026-07-22 — the two refutations are the
+best part: 0x616100=HEAD_CAP (RO capabilities) and 0x490 unmapped in nv_evo
+both explain the sitting-5 zeros with citations. Module split accepted as
+milestone 1. Amendments:
+A1 — EVO offsets (0x400 OFFSET_ORIGIN, 0x80 UPDATE, 0x84 PRESENT_CTRL) are
+push-buffer METHODS, not MMIO addresses: "probe the MMIO mirror" needs the
+CITED mirror base where GF119- armed/assembly method state is readable. If
+the cleanroom sources give one, cite it; if ambiguous, dump BOTH candidate
+mirror bases as separate labeled rows (read-only) so a zero row refutes a
+mirror hypothesis instead of the whole decode — we are not burning another
+boot on an uncited base address.
+A2 — HEAD_STAT (0x616000) rows ride along as proposed; keep the trace array
+sized for all rows and sentinel any fallible read.
+ABI law for pdisp_trace_0; `:: kdisp:` prefix; full-knob land-review with
+strings-proof both artifacts; arch gate untouched. Metal owed: sitting #11.)
+Note: submitted as PROPOSAL-video-pull6 before the display-lane renumber;
+this file name stands. Successors use kepler-display-pull<N>.
+
 # Kepler Pull 6: Scanout Re-derivation & Display Refactor
 
 ## Objective
