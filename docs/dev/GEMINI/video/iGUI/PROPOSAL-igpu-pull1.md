@@ -1,4 +1,9 @@
-STATUS: APPROVED WITH AMENDMENTS (2026-07-22 — see REVIEW-igpu-pull1.md in
+STATUS: LANDED f73c85eb+4f819d8a (2026-07-22 — both amendments honored: GGTT
+treated as offset with PTE-window inspection, full geometry/tiling/PIPESRC
+dumps, DP_A readback, and the black-panel Fox cross-check callout. Read-only
+throughout. `./arroyo check` green both arches + QEMU suite green. Two
+non-blocking nits in REVIEW-igpu-pull1.md §Landing. Metal owed: sitting #6.)
+Prior: APPROVED WITH AMENDMENTS (2026-07-22 — see REVIEW-igpu-pull1.md in
 this directory; the amendments are binding: DSPxSURF holds a GGTT offset, not
 a CPU physical address, and milestone 1 must also dump stride/tiling/PIPESRC.
 Milestone 1 read-only pass may proceed as amended; the repoint milestone needs

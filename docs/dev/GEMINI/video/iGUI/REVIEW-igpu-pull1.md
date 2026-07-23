@@ -35,6 +35,15 @@ Add to the read-only pass, for the active pipe/plane:
 - `PIPExSRC` (0x6001C/0x6101C/0x6201C) — source width/height;
 - `DSPxLINOFF`/`DSPxTILEOFF` — panning offsets.
 
+## Landing review (f73c85eb + 4f819d8a) — PASS, two non-blocking nits
+
+A1 and A2 both honored; probe is read-only; gates green (check both arches +
+QEMU suite). Nits for milestone 2, not now:
+1. `mmio_write` in igpu.rs is dead code in a read-only milestone — drop it
+   until a write milestone is approved (an unused write helper invites use).
+2. mmio idiom: igpu.rs uses the `volatile` crate wrapper while kepler.rs uses
+   the raw `read_volatile` helper — converge on one idiom for the gpu dir.
+
 ## Notes (non-binding)
 
 - eDP on this machine is CPU DP port A; a readback of `DP_A` / port-active

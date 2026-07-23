@@ -1,4 +1,9 @@
-STATUS: APPROVED (2026-07-22 — reviewer verified every rnndb citation against
+STATUS: LANDED 0715c94c (2026-07-22 — implementation matches the approved text
+exactly: all-3-PBDMA CH/IB_PUT/IB_GET dump, eng-mask 0x2390+i*4 readback, PMC
+0x200/0x204 clock state, nouveau attribution replaced with the honest
+empirical note. `./arroyo check` green both arches + QEMU suite green.
+Metal owed: sitting #6.)
+Prior: APPROVED (2026-07-22 — reviewer verified every rnndb citation against
 envytools master: PSUBFIFO 0x40000/stride 0x2000/len 3 ✓, SUBFIFO_ENG_MASK
 0x390 len 3 GK104- ✓, +0x108=INTR ✓, +0x120=CH with GK104 CHID 0-11/ACTIVE
 bit 13 ✓, IB_PUT +0x00 / IB_GET +0x14 ✓, PMC.ENABLE bit 8 PFIFO ✓,
