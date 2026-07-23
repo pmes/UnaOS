@@ -1,6 +1,23 @@
 # PROPOSAL — iGPU Pull 2: Scanout Teardown Hunt
 
-STATUS: PROPOSED
+STATUS: APPROVED WITH AMENDMENTS (2026-07-22 — trace design, register list,
+and suspect list are all good. Two binding amendments:
+A1 — OUTPUT PATH IS WRONG FOR THIS MACHINE: the 2012 rMBP has no legacy
+16550 at 0x3F8 — our own kernel serial.rs probes it with a loopback self-test
+and gets `None` on this Mac; bench serial is the usbdebug path, which isn't up
+in the bootloader. A raw outb writer at point 2 prints into the void, and
+pre-EBS `log::info!` may never reach the bench capture either. Replace BOTH
+bootloader output paths: stash the 8 dwords per trace point in new
+`unaos-boot-info` fields (point-1 and point-2 arrays + a validity flag) and
+have igpu.rs print all three points together at probe time. Zero new output
+channels, and the comparison arrives on serial as one block.
+A2 — TOUCHED-FILES LIST GROWS: A1 adds `unaos-boot-info` (shared crate) to
+the lane touch alongside bootloader main.rs — both flagged to the integrator.
+Gate every bootloader/boot-info addition behind the same `UNAOS_IVB` feature
+so default builds carry zero delta.
+Full-knob land-review law applies, extended per the brief: strings-proof in
+BOTH kernel.elf AND BOOTX64.EFI. Metal owed: sitting #7.)
+Prior: STATUS: PROPOSED
 
 ## The Problem
 As identified in sitting #6, GOP sets up a working scanout, but by the time the kernel's `igpu::init` probe runs, all pipes and planes are dead (`CONF=0`, `CNTR=0`, `SURF=0`), resulting in a persistent black panel. To localize the teardown (firmware at ExitBootServices vs. our early kernel boot), we will execute a three-point trace of the minimal scanout state.
