@@ -1,6 +1,10 @@
 # PROPOSAL — Kepler Pull 9: Runlist-Entry & Channel-Bind Derivation (Round 2)
 
-STATUS: APPROVED WITH AMENDMENTS (2026-07-22 — reviewer verified PFIFO_CHAN
+STATUS: LANDED 861b116c + 80ede042 (2026-07-22 — fuzz implemented per A1/A3:
+distinct CHIDs 1/2/3(/7 both-decodes), all initialized in PFIFO_CHAN,
+DISCRIMINATOR readback per PBDMA, PFIFO_CHAN pre/post dumps, RAMFC post-submit
+dump. Gates green, strings-proven. Metal owed: sitting #8.)
+Prior: APPROVED WITH AMENDMENTS (2026-07-22 — reviewer verified PFIFO_CHAN
 against envytools master: 0x800000 stride 8 length 0x1000 GK104-, CHAN
 INST 0-29 + UNK31, STATE ENABLED/UNK9/ENABLE_TRIGGER/ENGINE 16-19 — the §2
 audit is exact. The honest "rnndb has no runlist-entry layout" + empirical

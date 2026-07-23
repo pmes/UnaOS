@@ -1,6 +1,13 @@
 # PROPOSAL — iGPU Pull 3: Point-0 and the gmux
 
-STATUS: APPROVED WITH AMENDMENTS (2026-07-22 — Point-0 design, PP_STATUS
+STATUS: LANDED 2a4a92ff + 80ede042 (2026-07-22 — Point-0 at true bootloader
+entry (before helpers::init), dual-style gmux dump per A1 (indexed 0x7D0/0x7C2
++ classic 0x710/0x750, byte sentinels), PP_STATUS/PP_CONTROL/DPLL_A added,
+11-reg traces through boot-info per A2. Land-review caught one regression: the
+intel-ivb+x86_64 gate on the kernel handoff was dropped AGAIN (same aarch64
+break as pull 2) — restored in 80ede042 with a keep-this comment. Gates green,
+strings-proven both artifacts. Metal owed: sitting #8.)
+Prior: APPROVED WITH AMENDMENTS (2026-07-22 — Point-0 design, PP_STATUS
 (0x61200) / PP_CONTROL / DPLL_A (0x6014) additions, and sentinel discipline
 all accepted; those PRM offsets check out. Amendments:
 A1 — gmux protocol variant is UNPROVEN for this exact board: the indexed
