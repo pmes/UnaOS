@@ -741,6 +741,10 @@ fn main() -> Status {
         igpu_trace_2: [0; 11],
         #[cfg(feature = "unaos_ivb")]
         igpu_trace_valid: false,
+        #[cfg(feature = "unaos_ivb")]
+        kdisp_trace_0: [0; 7],
+        #[cfg(feature = "unaos_ivb")]
+        kdisp_trace_valid: false,
     });
     let boot_info_static = alloc::boxed::Box::leak(boot_info);
 
