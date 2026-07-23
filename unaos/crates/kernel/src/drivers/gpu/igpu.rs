@@ -1,5 +1,4 @@
 use super::detect::GpuInfo;
-use volatile::Volatile;
 
 pub mod regs {
     // Pipe Configuration
@@ -82,8 +81,8 @@ pub fn init(gpu: &GpuInfo) {
 
         if let Some(surf) = surf_a.or(surf_b).or(surf_c) {
             // Read GGTT entries around the surface base
-            let page_number = surf >> 12;
-            let gtt_offset = regs::GTT_BASE + (page_number as usize * 4);
+            let page_number = (surf >> 12) as usize;
+            let gtt_offset = regs::GTT_BASE + (page_number * 4);
             
             serial_println!("[Intel iGPU] GGTT Inspection for surface at 0x{:X}:", surf);
             for i in 0..4 {
@@ -128,13 +127,5 @@ unsafe fn dump_plane(bar0: usize, name: char, cntr_reg: usize, surf_reg: usize, 
 }
 
 unsafe fn mmio_read(base: usize, offset: usize) -> u32 {
-    let ptr = (base + offset) as *const u32;
-    let vol = Volatile::new(ptr);
-    vol.read()
-}
-
-unsafe fn mmio_write(base: usize, offset: usize, value: u32) {
-    let ptr = (base + offset) as *mut u32;
-    let mut vol = Volatile::new(ptr);
-    vol.write(value);
+    core::ptr::read_volatile((base + offset) as *const u32)
 }

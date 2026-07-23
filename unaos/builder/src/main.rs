@@ -96,6 +96,9 @@ fn main() {
     if std::env::var("UNAOS_KEPLER").is_ok() { feats.push("nvidia-kepler"); }
     if std::env::var("UNAOS_KEPLER_TAKEOVER").is_ok() { feats.push("nvidia-kepler-takeover"); }
     if std::env::var("UNAOS_KEPLER_FIFO").is_ok() { feats.push("nvidia-kepler-fifo"); }
+    // IVB-iGPU: UNAOS_IVB=1 arms the Intel HD 4000 ground-truth probe (sitting #6). Kept in sync
+    // with arroyo's mapping — boot-1 of sitting #6 shipped WITHOUT this line and carried no probe.
+    if std::env::var("UNAOS_IVB").is_ok() { feats.push("intel-ivb"); }
     // INSTALL-CORE: UNAOS_INSTALLDEMO=1 arms the installer engine + its x86 boot witness (GPT writer
     // + FAT32 formatter + extent content-verify) against the blank scratch disk attached below under
     // the same knob. Kept in sync with arroyo's mapping. (The builder rebuilds the kernel, so this
