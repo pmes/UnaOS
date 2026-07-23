@@ -1920,6 +1920,42 @@ static GUI_CHANNEL: unaos_kernel::arch::sched::Channel<unaos_kernel::pal::Event>
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 static RX_LOGGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// PIUSB-23 (bare-metal aarch64): pump the xHCI controller from the scheduled input service and bridge
+/// decoded HID keys into the GUI channel. THE keyboard-goes-silent structural fix.
+///
+/// On the Pi baremetal+fb path, `kernel_main` spawns input/render then `hlt_loop`s the BSP, so the
+/// x86/virt GUI loop's xHCI hooks (poll_events + service_*) are never reached. After `piusb::enumerate`'s
+/// bounded pump returns, nothing consumes re-armed interrupt-IN transfer completions — so `xHCI: KEY`
+/// lines stop and USB keystrokes never move. This restores the pump on the input core:
+///   (1) `poll_events` drains transfer events; its HID decode (drivers/xhci/mod.rs) prints the
+///       `xHCI: KEY` serial witness and pushes each decoded key into `pal::EVENT_QUEUE`;
+///   (2) the deferred services run (same set the x86/virt loop runs), keeping enum/hub/HID-setproto work
+///       alive; then
+///   (3) queued keys are forwarded into `GUI_CHANNEL` in the SAME `Event::Key` shape UART bytes take
+///       (see `input_service`), so a USB keystroke reaches the shell/panel exactly like a serial byte.
+///
+/// The XHCI_CONTROLLER lock is released before the drain (its guard scope ends) so a backpressured
+/// `GUI_CHANNEL.send` never blocks while holding the controller. Same global handle `enumerate` seeded.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn pump_usb_into_gui() {
+    if let Some(x) = unaos_kernel::drivers::xhci::XHCI_CONTROLLER.lock().as_mut() {
+        x.poll_events();
+        x.service_storage();
+        x.service_hubs();
+        x.service_hid_setproto();
+        x.service_ftdi();
+        x.service_slot_disposal();
+        x.service_enum();
+    }
+    // Bridge only decoded keys (the HID decode also enqueues Mouse/Button; the render task dispatches
+    // Key alone). Draining the rest keeps EVENT_QUEUE from accreting on the Pi's channel-based path.
+    while let Some(ev) = unaos_kernel::pal::next_event() {
+        if let unaos_kernel::pal::Event::Key(byte) = ev {
+            GUI_CHANNEL.send(unaos_kernel::pal::Event::Key(byte));
+        }
+    }
+}
+
 /// M5 (bare-metal aarch64): keyboard input as a scheduled kernel service. The OS runs its own input
 /// on the scheduler: instead of the BSP polling the PL011 inline, this kernel thread on a secondary
 /// core drains bytes from the UART RX FIFO and `send`s each as a Key event over GUI_CHANNEL to the
@@ -1955,6 +1991,10 @@ fn input_service(_: usize) {
             if serial::rx_pending() {
                 serial::RX_READY.post();
             }
+            // PIUSB-23: also pump the xHCI controller and bridge decoded HID keys into GUI_CHANNEL, so
+            // USB keyboard input flows on the same wake cadence (the rx-backstop pokes this task ~5 Hz
+            // even absent a UART IRQ). No busy-spin — this rides the existing RX_READY.wait() blocking.
+            pump_usb_into_gui();
         }
     } else {
         // Poll-nap fallback (QEMU raspi4b: the RX ISR never fires). Cooperative — the AP's run() keeps
@@ -1963,6 +2003,10 @@ fn input_service(_: usize) {
             while let Some(byte) = unaos_kernel::arch::poll_input() {
                 GUI_CHANNEL.send(unaos_kernel::pal::Event::Key(byte));
             }
+            // PIUSB-23: pump xHCI + bridge decoded HID keys into GUI_CHANNEL each cooperative pass
+            // (QEMU raspi4b delivers no USB HID, so this is a cheap no-op there; on metal it consumes
+            // the re-armed interrupt-IN completions the enumerate() pump no longer services).
+            pump_usb_into_gui();
             unaos_kernel::arch::sched::yield_now();
         }
     }
