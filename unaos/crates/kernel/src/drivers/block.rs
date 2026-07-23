@@ -109,6 +109,34 @@ pub fn read_block_usb(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
     Ok(n)
 }
 
+/// USB-WRITE: write one block (`lba`) to the USB mass-storage stick DIRECTLY through the xHCI
+/// controller — the write twin of [`read_block_usb`]. Bypasses the backend selector, so the stick
+/// is writable even when the global block device is the microSD (BACKEND_SD on the Pi). Geometry
+/// (block size, bound) comes from [`USB_BLOCK_DEVICE`]; the transfer is the same xHCI BOT WRITE(10)
+/// the default path uses, taking only the xHCI controller lock (the SD/emmc2 path is untouched).
+/// The caller's `buf` is staged (zero-padded to the block size) into the controller's DMA buffer,
+/// then WRITE(10) is issued; a non-`Passed` CSW propagates as [`BlockError::Io`] — the write NEVER
+/// reports a false success. This is the block-layer half of a writable `/usb`: the FAT layer's
+/// `write_sector` routes its `Usb` source here in place of the PIUSB-27 read-only refusal.
+pub fn write_block_usb(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
+    let dev = usb_info().ok_or(BlockError::NotReady)?;
+    if lba >= dev.num_blocks {
+        return Err(BlockError::BadLba);
+    }
+    let mut guard = XHCI_CONTROLLER.lock();
+    let xhci = guard.as_mut().ok_or(BlockError::NotReady)?;
+    let dst = xhci.storage_data_ptr().ok_or(BlockError::Io)?;
+    let n = (dev.block_size as usize).min(buf.len());
+    unsafe {
+        core::ptr::write_bytes(dst, 0, dev.block_size as usize);
+        core::ptr::copy_nonoverlapping(buf.as_ptr(), dst, n);
+    }
+    match xhci.storage_write10(lba as u32, 1) {
+        Ok(res) if res.status == CswStatus::Passed => Ok(()),
+        _ => Err(BlockError::Io),
+    }
+}
+
 /// PIUSB-28: publish the geometry of a freshly enumerated USB mass-storage device. Always records it
 /// under the dedicated [`USB_BLOCK_DEVICE`] handle (so `read_block_usb`/`/fs/usb` can reach the stick),
 /// then raises the storage-ready edge. The global [`BLOCK_DEVICE`] is only claimed when USB is the ACTIVE

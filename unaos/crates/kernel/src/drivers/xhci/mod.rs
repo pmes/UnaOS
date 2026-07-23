@@ -4400,6 +4400,87 @@ impl XhciController {
             Err(e) => serial_println!("xHCI: READ(10) LBA0 failed: {:?}", e),
         }
 
+        // USB-WRITE: prove the BOT WRITE(10) OUT path on the enumerated stick with a
+        // read-modify-write-restore of one scratch sector (byte-identical afterward).
+        self.mission_write_selftest();
+    }
+
+    /// USB-WRITE: MISSION write proof — a read-modify-write-restore of a single scratch sector well
+    /// past the filesystem area (the last block), leaving the medium BYTE-IDENTICAL. Exercises the
+    /// xHCI BOT WRITE(10) OUT data stage end to end (CBW OUT -> DATA OUT -> CSW) via the same
+    /// `storage_write10`/`storage_read10` the block layer uses, with a readback assertion after both
+    /// the pattern write AND the restore. Emits `[usbw] write lba=<n> ok` only when every step
+    /// verifies; ANY divergence emits a `-> FAIL` witness (which the battery's generic FAIL scan
+    /// catches) and NO success is claimed — no partial-write lie. Runs in the same safe non-event
+    /// context as the LBA0 sanity read; single-sector, bounded to the storage slot's own DMA buffer.
+    fn mission_write_selftest(&mut self) {
+        let nb = match crate::drivers::block::info() {
+            Some(d) => d.num_blocks,
+            None => return,
+        };
+        if nb < 2 { return; }
+        let lba = (nb - 1) as u32; // last sector — well clear of any FS payload
+        let ptr = match self.storage_data_ptr() { Some(p) => p, None => return };
+
+        // 1) READ the scratch sector; stash the ORIGINAL 512 bytes before we perturb it.
+        match self.storage_read10(lba, 1) {
+            Ok(r) if r.status == CswStatus::Passed => {}
+            other => { serial_println!(":: PIUSB: [usbw] write lba={} -> FAIL (pre-read {:?}) ::", lba, other); return; }
+        }
+        let mut orig = [0u8; 512];
+        unsafe { core::ptr::copy_nonoverlapping(ptr as *const u8, orig.as_mut_ptr(), 512); }
+
+        // 2) Stage a distinct pattern into the DMA buffer and WRITE it.
+        let mut pat = [0u8; 512];
+        for i in 0..512 { pat[i] = (orig[i] ^ 0xA5).wrapping_add(i as u8); }
+        unsafe { core::ptr::copy_nonoverlapping(pat.as_ptr(), ptr, 512); }
+        match self.storage_write10(lba, 1) {
+            Ok(r) if r.status == CswStatus::Passed => {}
+            other => {
+                serial_println!(":: PIUSB: [usbw] write lba={} -> FAIL (write {:?}) ::", lba, other);
+                self.restore_sector(lba, &orig); return;
+            }
+        }
+
+        // 3) READ back; the medium must now hold the pattern verbatim.
+        match self.storage_read10(lba, 1) {
+            Ok(r) if r.status == CswStatus::Passed => {}
+            other => {
+                serial_println!(":: PIUSB: [usbw] write lba={} -> FAIL (verify-read {:?}) ::", lba, other);
+                self.restore_sector(lba, &orig); return;
+            }
+        }
+        let mut rb = [0u8; 512];
+        unsafe { core::ptr::copy_nonoverlapping(ptr as *const u8, rb.as_mut_ptr(), 512); }
+        if rb != pat {
+            serial_println!(":: PIUSB: [usbw] write lba={} -> FAIL (readback mismatch) ::", lba);
+            self.restore_sector(lba, &orig); return;
+        }
+
+        // 4) RESTORE the original and confirm the medium is byte-identical again.
+        if !self.restore_sector(lba, &orig) {
+            serial_println!(":: PIUSB: [usbw] write lba={} -> FAIL (restore write) ::", lba); return;
+        }
+        match self.storage_read10(lba, 1) {
+            Ok(r) if r.status == CswStatus::Passed => {}
+            other => { serial_println!(":: PIUSB: [usbw] write lba={} -> FAIL (restore-verify {:?}) ::", lba, other); return; }
+        }
+        let mut chk = [0u8; 512];
+        unsafe { core::ptr::copy_nonoverlapping(ptr as *const u8, chk.as_mut_ptr(), 512); }
+        if chk != orig {
+            serial_println!(":: PIUSB: [usbw] write lba={} -> FAIL (not restored) ::", lba); return;
+        }
+
+        serial_println!(":: PIUSB: [usbw] write lba={} ok — RMW+readback+restore, medium byte-identical ::", lba);
+    }
+
+    /// USB-WRITE: stage `data` into the storage slot's DMA buffer and WRITE(10) it to `lba` (single
+    /// sector). Returns true iff the CSW reported Passed. Used to restore the scratch sector so the
+    /// medium is left byte-identical after the self-test.
+    fn restore_sector(&mut self, lba: u32, data: &[u8; 512]) -> bool {
+        let ptr = match self.storage_data_ptr() { Some(p) => p, None => return false };
+        unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), ptr, 512); }
+        matches!(self.storage_write10(lba, 1), Ok(r) if r.status == CswStatus::Passed)
     }
 
     /// Main-loop hook (U2.5): bring up the FTDI console ONCE (SET_CONFIGURATION + the four FTDI
