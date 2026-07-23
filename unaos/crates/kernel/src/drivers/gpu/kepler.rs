@@ -257,7 +257,10 @@ pub fn init(gpu: &GpuInfo) {
                                     serial_println!("[NVIDIA] Polling PLAYLIST_RD for engine 0 (waiting for runlist acceptance)...");
                                     let mut pl_rd = 0;
                                     let mut pl_rd_len = 0;
-                                    for _ in 0..10_000_000 {
+                                    // Bounded at 100k reads (~sub-second even at slow MMIO): the
+                                    // acceptance is either fast or not coming; 10M reads against a
+                                    // stalled unit looks like a multi-minute hang on the bench.
+                                    for _ in 0..100_000 {
                                         pl_rd = mmio_read(bar0, 0x2280);
                                         pl_rd_len = mmio_read(bar0, 0x2284);
                                         if pl_rd == ((runlist_off as u32) >> 12) && (pl_rd_len & 0xFFF) == 1 {

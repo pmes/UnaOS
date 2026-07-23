@@ -86,7 +86,7 @@ pub fn init(gpu: &GpuInfo) {
     unsafe {
         if TRACES_VALID {
             serial_println!(":: igpu: TEARDOWN HUNT TRACE ::");
-            serial_println!("Reg          | Point 1 (Pre-EBS) | Point 2 (Post-EBS)| Point 3 (Kernel)");
+            serial_println!(":: igpu: Reg          | Point 1 (Pre-EBS) | Point 2 (Post-EBS)| Point 3 (Kernel) ::");
             let trace3 = [
                 mmio_read(bar0, regs::PIPEACONF),
                 mmio_read(bar0, regs::PIPEBCONF),
@@ -99,7 +99,7 @@ pub fn init(gpu: &GpuInfo) {
             ];
             let names = ["PIPEACONF", "PIPEBCONF", "PIPECCONF", "DSPACNTR", "DSPBCNTR", "DSPCCNTR", "DSPASURF", "DP_A"];
             for i in 0..8 {
-                serial_println!("{:<12} | 0x{:08X}        | 0x{:08X}        | 0x{:08X}", 
+                serial_println!(":: igpu: {:<12} | 0x{:08X}        | 0x{:08X}        | 0x{:08X} ::",
                     names[i], TRACE_1[i], TRACE_2[i], trace3[i]);
             }
             serial_println!(":: igpu: TRACE END ::");

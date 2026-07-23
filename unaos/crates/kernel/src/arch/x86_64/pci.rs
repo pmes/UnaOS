@@ -239,30 +239,6 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
         crate::drivers::smc::battery::refresh_if_due();
     }
 
-    #[cfg(all(target_arch = "x86_64", any(feature = "nvidia-kepler", feature = "intel-ivb")))]
-    {
-        let gpus = crate::drivers::gpu::detect::detect_gpus();
-        let mut kepler_found = false;
-        for gpu in &gpus {
-            match gpu.gpu_type {
-                #[cfg(feature = "nvidia-kepler")]
-                crate::drivers::gpu::detect::GpuType::NvidiaKepler => {
-                    kepler_found = true;
-                    crate::drivers::gpu::kepler::init(gpu);
-                }
-                #[cfg(feature = "intel-ivb")]
-                crate::drivers::gpu::detect::GpuType::IntelIvyBridge => {
-                    crate::drivers::gpu::igpu::init(gpu);
-                }
-                _ => {}
-            }
-        }
-        #[cfg(feature = "nvidia-kepler")]
-        if !kepler_found {
-            serial_println!(":: kepler: no-device ::");
-        }
-    }
-
     if let Some((xhci_phys_addr, bus, dev, func)) = crate::drivers::pci::PciScanner::scan() {
         serial_println!(":: x86_64 PCI Init: Found xHCI at {:#x} ::", xhci_phys_addr);
 
@@ -321,6 +297,33 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
 
             // Store globally
             *crate::drivers::xhci::XHCI_CONTROLLER.lock() = Some(xhci);
+        }
+    }
+
+    // GPU init runs AFTER the xHCI block: bench serial on the rMBP is the usbdebug FTDI behind
+    // xHCI, so any GPU-init wedge before this point is invisible (zero serial from power-on —
+    // sitting #7 boot 2 hard-hang signature). After xHCI is up, a wedge leaves breadcrumbs.
+    #[cfg(all(target_arch = "x86_64", any(feature = "nvidia-kepler", feature = "intel-ivb")))]
+    {
+        let gpus = crate::drivers::gpu::detect::detect_gpus();
+        let mut kepler_found = false;
+        for gpu in &gpus {
+            match gpu.gpu_type {
+                #[cfg(feature = "nvidia-kepler")]
+                crate::drivers::gpu::detect::GpuType::NvidiaKepler => {
+                    kepler_found = true;
+                    crate::drivers::gpu::kepler::init(gpu);
+                }
+                #[cfg(feature = "intel-ivb")]
+                crate::drivers::gpu::detect::GpuType::IntelIvyBridge => {
+                    crate::drivers::gpu::igpu::init(gpu);
+                }
+                _ => {}
+            }
+        }
+        #[cfg(feature = "nvidia-kepler")]
+        if !kepler_found {
+            serial_println!(":: kepler: no-device ::");
         }
     }
 
