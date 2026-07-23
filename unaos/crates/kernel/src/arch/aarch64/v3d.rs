@@ -1571,6 +1571,16 @@ fn arena_byte(off: usize) -> u8 {
     let arena = &raw const V3D_ARENA;
     unsafe { (*arena).bytes[off] }
 }
+/// Read a little-endian u32 struct field back out of the arena (CPU-side witness decode).
+#[inline]
+fn arena_u32(off: usize) -> u32 {
+    u32::from_le_bytes([
+        arena_byte(off),
+        arena_byte(off + 1),
+        arena_byte(off + 2),
+        arena_byte(off + 3),
+    ])
+}
 /// Copy raw bytes into the arena at `off` (bounded — saturates at the arena end, never overruns).
 fn arena_write_bytes(off: usize, src: &[u8]) {
     let arena = &raw mut V3D_ARENA;
@@ -2413,6 +2423,10 @@ fn triangle_job(fb: Option<FbTarget>) -> bool {
     // the CONTRACTED 6-word coordinate-shader VPM output vs. our 4-word passthrough — so every boot
     // shows the two screen-space words (out-offsets 4,5) the CS omits, the confirmed empty-bin cause.
     cs_vpm_output_witness("M4 post-bin");
+    // PI-V3D-29: audit the attribute record's base/stride/enable/count fields + the shader-record VPM
+    // segment-size gates against the Mesa v42 contract — the pre-armed verdict tool for V3D-28's
+    // loaded-zeros branch (VCD never DMA'd the vertex buffer into VPM). Instrumentation only.
+    attr_record_audit_witness("M4 post-bin", num_attrs);
     // PI-V3D-15 (brief lead #1): decode WHERE the bin faulted — the clue above reports the fault BITS
     // but never the address. With the latch cleared pre-kick, a fault here is THIS bin's, and its VA
     // tells whether the binner walked off the arena (our encoding bug) or idled legally in-bounds.
@@ -2976,6 +2990,120 @@ fn cs_vpm_output_witness(tag: &str) {
             TARGET_W, TARGET_H,
             if inside { "INSIDE (should bin to a tile)" } else { "OUTSIDE (off every tile)" }
         );
+    }
+}
+
+/// PI-V3D-29 — ATTRIBUTE-RECORD AUDIT WITNESS (pre-arm for the loaded-zeros branch).
+///
+/// V3D-28's fixed probe decodes the next boot as real-coords / loaded-zeros / landed-elsewhere /
+/// never-issued. If it reads LOADED-ZEROS (the VCD never DMA'd the vertex buffer into VPM), the named
+/// next step is: audit the attribute record's base/stride/enable/count fields — every knob that gates
+/// the VCD's per-vertex attribute fetch — against what Mesa v42 emits for THIS draw. This witness
+/// pre-arms that step: it decodes the GL Shader State Attribute Record (16 B @ OFF_SHADREC+36) and the
+/// shader-record fields that gate fetch (VPM segment sizes + the GL_SHADER_STATE attribute-array count)
+/// back out of the arena EXACTLY AS WRITTEN, cross-checks each against the Mesa-v42 contract value, and
+/// prints PASS/DIVERGE per field with both sides. It also re-dumps the full 52-byte shader-state record
+/// (record + attr) as raw hex, one line per 16 B, so a human can diff it against a Mesa-packed record
+/// offline. Instrumentation only — no field is rewritten, no CL/kick path changes.
+///
+/// Mesa contract of record (facts-only; sourced verbatim from this arc's build_shader_record(), itself
+/// Mesa-verbatim per v3d_packet.xml "GL Shader State Attribute Record" (max_ver=42) + v3dX(draw_vbo),
+/// cross-checked against scripts/pi-v3d26-mesa-compile.out.txt: vpm_input_size=0 vpm_output_size=1
+/// vcm_cache_size=4 separate_segments=0). For a trivial 1-attribute vec4-f32 solid draw:
+///   attr.Address = OFF_VTXDATA PA (must point at the vertex buffer)   attr.Vec size = 3 (4 comps)
+///   attr.Type = 2 (Attribute float)   CS values read = 4   VS values read = 4   Stride = 16
+///   Maximum Index = 0xFFFF   coord/vertex INPUT VPM segment = 0 (folded)   OUTPUT segment = 1
+///   GL_SHADER_STATE attribute arrays = 1
+/// QEMU raspi4b models no V3D, so nothing here can DIVERGE in QEMU (the arena bytes are exactly what the
+/// CPU just wrote); the audit is the metal-boot verdict tool for the loaded-zeros branch.
+fn attr_record_audit_witness(tag: &str, num_attrs: u32) {
+    // The record + attr were cache-clean-invalidated at the top of cs_vpm_output_witness (its caller
+    // site precedes this one); re-sync defensively so the decode reads DRAM, not a stale CPU line.
+    cache::clean_invalidate_range(arena_phys() + OFF_SHADREC, 52);
+
+    const ATTR: usize = OFF_SHADREC + 36; // attribute record base (immediately after the 36-B record)
+    // ── Decode the GL Shader State Attribute Record exactly as written. ──
+    let addr = arena_u32(ATTR);
+    let b4 = arena_byte(ATTR + 4);
+    let vec_size = b4 & 0x3; // @32(2): 4 comps encoded as (4-1)=3
+    let attr_type = (b4 >> 2) & 0x7; // @34(3): Attribute float = 2
+    let signed_int = (b4 >> 5) & 0x1; // @37(1)
+    let norm_int = (b4 >> 6) & 0x1; // @38(1)
+    let b5 = arena_byte(ATTR + 5);
+    let cs_nvals = b5 & 0xF; // @40(4): values read by Coordinate shader
+    let vs_nvals = (b5 >> 4) & 0xF; // @44(4): values read by Vertex shader
+    let instance_div = (arena_u32(ATTR + 4) >> 16) & 0xFFFF; // @48(16): instance divisor
+    let stride = arena_u32(ATTR + 8); // @64(32)
+    let max_index = arena_u32(ATTR + 12); // @96(32)
+    // ── Shader-record fields that gate the fetch (VPM segment sizes; low nibble of bytes 4..7). ──
+    let coord_out = arena_byte(OFF_SHADREC + 4) & 0xF;
+    let coord_in = arena_byte(OFF_SHADREC + 5) & 0xF;
+    let vertex_out = arena_byte(OFF_SHADREC + 6) & 0xF;
+    let vertex_in = arena_byte(OFF_SHADREC + 7) & 0xF;
+
+    // ── Mesa v42 contract for this draw. ──
+    let exp_addr = (arena_phys() + OFF_VTXDATA) as u32;
+    let addr_is_vtx = addr == exp_addr;
+    serial_println!(
+        ":: V3D: [v3d29] {} ATTR AUDIT — GL Shader State Attribute Record @arena+{:#x} (16 B), vs Mesa v42 ::",
+        tag, ATTR
+    );
+    // Field-by-field PASS/DIVERGE, both values, so a metal boot reads the verdict directly.
+    macro_rules! audit {
+        ($name:expr, $got:expr, $exp:expr, $note:expr) => {
+            serial_println!(
+                ":: V3D: [v3d29]   {:<22} got={:#x} exp={:#x} {} — {} ::",
+                $name, $got as u64, $exp as u64,
+                if ($got as u64) == ($exp as u64) { "PASS" } else { "DIVERGE" },
+                $note
+            );
+        };
+    }
+    // Address is the fetch BASE — the single most load-bearing field for the loaded-zeros branch: if the
+    // VCD's attribute base does not point at the vertex buffer, it DMAs garbage/zeros into VPM.
+    audit!("attr.Address", addr, exp_addr,
+        if addr_is_vtx { "points at vertex buffer (OFF_VTXDATA)" } else { "does NOT point at OFF_VTXDATA — fetch base wrong" });
+    audit!("attr.Vec size", vec_size, 3u32, "4 components (encoded 4-1)");
+    audit!("attr.Type", attr_type, 2u32, "Attribute float (v42)");
+    audit!("attr.Signed int", signed_int, 0u32, "float attr: unsigned");
+    audit!("attr.Normalized int", norm_int, 0u32, "float attr: not normalized");
+    // CS/VS values-read are the per-vertex component COUNTS the VCD fetches for each shader stage; a 0
+    // here is the textbook loaded-zeros cause (VCD DMAs nothing → VPM stays zero → degenerate primitive).
+    audit!("attr.CS values read", cs_nvals, 4u32, "Coordinate shader reads vec4 → 4 (0 ⇒ loaded-zeros)");
+    audit!("attr.VS values read", vs_nvals, 4u32, "Vertex shader reads vec4 → 4 (0 ⇒ loaded-zeros)");
+    audit!("attr.Instance Divisor", instance_div, 0u32, "non-instanced draw");
+    audit!("attr.Stride", stride, 16u32, "16 B per vertex (vec4 f32)");
+    audit!("attr.Maximum Index", max_index, 0xFFFFu32, "trivial draw ceiling");
+    // Shader-record VPM segment sizes gate WHERE the VCD DMA lands vs where the shader ldvpmv_in reads
+    // (the V3D-24/25 alignment story): input folded to 0, output 1 sector.
+    audit!("rec.CS out VPM seg", coord_out, 1u32, "coord output = 1 sector (6 words)");
+    audit!("rec.CS in VPM seg", coord_in, 0u32, "Mesa folds input→output → 0");
+    audit!("rec.VS out VPM seg", vertex_out, 1u32, "vertex output = 1 sector");
+    audit!("rec.VS in VPM seg", vertex_in, 0u32, "Mesa folds input→output → 0");
+    // The GL_SHADER_STATE attribute-array count is the effective enable mask — how many attribute records
+    // the VCD walks. 0 would mean the VCD fetches NO attributes at all (a distinct loaded-zeros path).
+    audit!("gl_shader.num_attrs", num_attrs, 1u32, "one enabled attribute array (VCD walk count)");
+
+    // ── Raw shader-state record bytes for offline diff against a Mesa-packed record (record + attr). ──
+    serial_println!(
+        ":: V3D: [v3d29] {} raw shader-state record — 52 B @arena+{:#x} (36 B record + 16 B attr), one line/16 B ::",
+        tag, OFF_SHADREC
+    );
+    let arena = &raw const V3D_ARENA;
+    let mut i = 0usize;
+    while i < 52 {
+        let mut line = [0u8; 16];
+        let mut c = 0;
+        while c < 16 && i + c < 52 {
+            line[c] = unsafe { (*arena).bytes[OFF_SHADREC + i + c] };
+            c += 1;
+        }
+        serial_println!(
+            "::   [v3d29]   +{:#05x}: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
+            i, line[0], line[1], line[2], line[3], line[4], line[5], line[6], line[7],
+            line[8], line[9], line[10], line[11], line[12], line[13], line[14], line[15]
+        );
+        i += 16;
     }
 }
 
