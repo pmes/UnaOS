@@ -3980,8 +3980,9 @@ fn free_orphan_chain(first_cluster: u32) -> bool {
 //     API in `main.rs`, NOT lazily — a spawn allocates a `Box<Task>` and takes `RUN_QUEUES`, both illegal in
 //     the teardown push path) DRAINS the queue: pop one head UNDER the lock, RELEASE the lock, THEN mount +
 //     free the chain (`free_orphan_chain`). Block I/O runs ONLY in the reaper's context (EL1, IRQs enabled,
-//     its own stack), never under the queue lock. It `yield_now()`s when the queue is empty so it never hogs
-//     its core (QEMU raspi4b is cooperative — no timer preemption). It never exits (a forever service loop).
+//     its own stack), never under the queue lock. It BLOCKS on `REAPER_SEM` when the queue is empty (SCHED-4b),
+//     which `deferred_free_push` posts on enqueue — an event-driven, lost-wakeup-safe wake (~0% idle duty
+//     cycle) that fires in QEMU (the timer-driven sleep it replaced did not). It never exits (a forever loop).
 //
 // Freed EXACTLY once: a teardown-orphaned chain reaches the queue ONLY via `openfile_decref_at` returning
 // `Some(fc)` (last-close-of-pending, the row already cleared to EMPTY), so it is queued once and freed once
@@ -4059,13 +4060,22 @@ fn deferred_free_push(first_cluster: u32) -> bool {
     // IRQ-mask the critical section (declared BEFORE the lock guard, so on scope exit the lock drops FIRST,
     // then IRQs are restored): the paired `deferred_free_pop` runs preemptibly, so the lock must be IRQ-safe.
     let _irq = IrqGuard::mask_save();
-    let mut q = DEFERRED_FREE.lock();
-    if q.len >= NDEFERFREE {
-        return false; // full — caller logs the honest leak
-    }
-    let i = q.len;
-    q.heads[i] = first_cluster;
-    q.len = i + 1;
+    {
+        let mut q = DEFERRED_FREE.lock();
+        if q.len >= NDEFERFREE {
+            return false; // full — caller logs the honest leak
+        }
+        let i = q.len;
+        q.heads[i] = first_cluster;
+        q.len = i + 1;
+    } // DEFERRED_FREE lock dropped here — BEFORE the post, so its run-queue lock is never nested under ours
+
+    // SCHED-4b: wake the reaper immediately. `post()` moves a blocked reaper onto its run queue + pokes its
+    // core (or, if the reaper is momentarily awake and not parked, increments the permit count so the wakeup
+    // is not lost). Called with the DEFERRED_FREE lock released and IRQs still masked (post nests its own
+    // save/restore) — the enqueue-array critical section and the wake are thus strictly ordered and
+    // non-overlapping. This is the event-driven wake that replaces SCHED-4's timer sleep (dead in QEMU).
+    REAPER_SEM.post();
     true
 }
 
@@ -4094,14 +4104,29 @@ fn deferred_free_pop() -> Option<u32> {
 /// it already exists before any orphan is queued — a lazily-spawned reaper would need a heap `Box<Task>` +
 /// `RUN_QUEUES`, both illegal from the IRQ-masked teardown push. Each turn: pop one chain head (lock held only
 /// for the pop), RELEASE the lock, THEN `free_orphan_chain` (mount + all-FAT-copies free — block I/O, legal
-/// HERE: EL1, IRQs enabled, its own stack, never in teardown context). When the queue is empty it `yield_now`s,
-/// so on QEMU raspi4b's cooperative scheduler (no timer preemption) it cedes its core to the launcher/verdict
-/// tasks and never hogs it. The `arg` is unused (the `fn(usize)` service-task shape). Never returns.
-/// SCHED-4: sleeps between sweeps (100 ms cadence) to avoid monopolizing a core when the queue is empty.
-/// At 250 Hz, 1 tick ≈ 4 ms, so 25 ticks ≈ 100 ms. When orphans arrive during the block I/O phase they
-/// wake immediately (the sleep is preempted by the scheduler's timer); between arrivals the core idles.
+/// HERE: EL1, IRQs enabled, its own stack, never in teardown context). When the queue is empty it BLOCKS on
+/// `REAPER_SEM` (below), so it consumes ~0% of its core while idle and never hogs it. The `arg` is unused
+/// (the `fn(usize)` service-task shape). Never returns.
+///
+/// SCHED-4b (U11-reap regression fix): the wake is EVENT-DRIVEN, not timer-driven. SCHED-4 replaced the
+/// empty-queue `yield_now()` with `sleep_ticks(25)` (~100 ms) to drop the metal idle duty-cycle — correct
+/// goal, but it introduced a latency regression AND is DEAD in QEMU: `sleep_ticks` parks on the per-CPU
+/// sleeper list whose only wake source is the generic-timer tick, and QEMU raspi4b never delivers that tick
+/// (`percpu.ticks` frozen at 0), so the parked reaper never woke — the teardown-orphan sat unfreed past the
+/// U11-reap witness's bounded wait, a DETERMINISTIC FAIL. SCHED-4b blocks on a counting `Semaphore` instead:
+/// `deferred_free_push` `post()`s it on every enqueue, which `make_ready`s + pokes the reaper immediately
+/// (cross-CPU, lost-wakeup-safe — a post with no waiter increments the permit count, so an enqueue that
+/// races the reaper's pop/park is never lost). The wake rides the SGI/poll-spin reschedule path, NOT the
+/// timer, so it fires in QEMU (the AP idle loop poll-spins and re-dispatches the readied reaper) AND on
+/// metal (~immediate) — and the idle duty-cycle is now ~0% (a true block), even lower than SCHED-4's 3%.
+/// No timer fallback is needed: the semaphore cannot lose a wakeup, so there is nothing for a periodic
+/// re-poll to recover.
 pub fn orphan_reaper(_: usize) {
-    const REAPER_SLEEP_TICKS: u64 = 25; // ~100 ms at 250 Hz
+    // Reserve the (single-waiter) waiter-list capacity BEFORE the first block, so the scheduler's park-side
+    // push into it is allocation-free under the semaphore lock. The reaper is the sole waiter and runs this
+    // once before its first `wait()`; a producer `post()` that races this init hits the count path (no push,
+    // no realloc), so the enqueue is never lost.
+    REAPER_SEM.init();
     loop {
         match deferred_free_pop() {
             Some(fc) => {
@@ -4114,10 +4139,22 @@ pub fn orphan_reaper(_: usize) {
                     serial_println!("U11-defer: reaper freed teardown-orphaned chain @cluster {}", fc);
                 }
             }
-            None => super::sched::sleep_ticks(REAPER_SLEEP_TICKS),
+            // Queue drained: block until a producer enqueues + posts. `wait()` returns `true` here (the
+            // reaper is always a scheduled task); a surplus permit from a burst of posts is consumed by an
+            // immediate return that finds the queue already drained, then blocks — self-correcting, no busy-spin.
+            None => {
+                let _ = REAPER_SEM.wait();
+            }
         }
     }
 }
+
+/// U11-M2b / SCHED-4b: the reaper's wakeup semaphore. A counting semaphore starting at 0 permits: the
+/// `orphan_reaper` `wait()`s on it when the deferred-free queue drains, and `deferred_free_push` `post()`s
+/// it on every enqueue. Being a `Semaphore` (not a timer sleep) makes the wake event-driven, cross-CPU, and
+/// lost-wakeup-safe — the property SCHED-4's `sleep_ticks` lacked (and which the QEMU timer's absence exposed
+/// as the U11-reap regression). The reaper is the ONLY task that ever waits on it.
+static REAPER_SEM: super::sched::Semaphore = super::sched::Semaphore::new(0);
 
 // =============================================================================================
 // U6: UnaFS owner/grants — the by-NAME namespace ACL, enforced at SYS_OPEN.
