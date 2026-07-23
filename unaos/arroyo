@@ -125,7 +125,9 @@ _feats=""
 [ -n "${UNAOS_KEPLER:-}" ] && _feats="${_feats}nvidia-kepler,"
 [ -n "${UNAOS_KEPLER_TAKEOVER:-}" ] && _feats="${_feats}nvidia-kepler-takeover,"
 [ -n "${UNAOS_KEPLER_FIFO:-}" ] && _feats="${_feats}nvidia-kepler-fifo,"
-[ -n "${UNAOS_IVB:-}" ] && _feats="${_feats}intel-ivb,"
+# unaos_ivb rides the same knob: BootInfo ABI fields — kernel and bootloader must agree (builder
+# arms the bootloader side; this feature list only reaches the kernel).
+[ -n "${UNAOS_IVB:-}" ] && _feats="${_feats}intel-ivb,unaos_ivb,"
 
 [ -n "${UNAOS_TEGRA:-}" ] && _feats="${_feats}tegra,"
 # ORIN-SMP-2: UNAOS_SMPPROBE=<n> arms the JM5 CPU_ON firmware-wall investigation probe (tegra-only;

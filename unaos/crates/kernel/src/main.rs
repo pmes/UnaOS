@@ -101,7 +101,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     #[cfg(all(feature = "tegra", target_arch = "aarch64"))]
     tegra_early_stop(boot_info);
 
-    #[cfg(feature = "unaos_ivb")]
+    #[cfg(all(feature = "unaos_ivb", feature = "intel-ivb", target_arch = "x86_64"))]
     if boot_info.igpu_trace_valid {
         unaos_kernel::drivers::gpu::igpu::set_boot_traces(boot_info.igpu_trace_1, boot_info.igpu_trace_2);
     }

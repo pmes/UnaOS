@@ -728,6 +728,12 @@ fn main() -> Status {
         edid_native_height: edid_native_h,
         edid_source,
         mode_action,
+        #[cfg(feature = "unaos_ivb")]
+        igpu_trace_1: [0; 8],
+        #[cfg(feature = "unaos_ivb")]
+        igpu_trace_2: [0; 8],
+        #[cfg(feature = "unaos_ivb")]
+        igpu_trace_valid: false,
     });
     let boot_info_static = alloc::boxed::Box::leak(boot_info);
 

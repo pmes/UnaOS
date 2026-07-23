@@ -98,7 +98,9 @@ fn main() {
     if std::env::var("UNAOS_KEPLER_FIFO").is_ok() { feats.push("nvidia-kepler-fifo"); }
     // IVB-iGPU: UNAOS_IVB=1 arms the Intel HD 4000 ground-truth probe (sitting #6). Kept in sync
     // with arroyo's mapping — boot-1 of sitting #6 shipped WITHOUT this line and carried no probe.
-    if std::env::var("UNAOS_IVB").is_ok() { feats.push("intel-ivb"); }
+    // unaos_ivb rides the same knob: it adds the teardown-trace fields to the SHARED BootInfo
+    // struct, so kernel and bootloader must agree on it (see the bootloader build below).
+    if std::env::var("UNAOS_IVB").is_ok() { feats.push("intel-ivb"); feats.push("unaos_ivb"); }
     // INSTALL-CORE: UNAOS_INSTALLDEMO=1 arms the installer engine + its x86 boot witness (GPT writer
     // + FAT32 formatter + extent content-verify) against the blank scratch disk attached below under
     // the same knob. Kept in sync with arroyo's mapping. (The builder rebuilds the kernel, so this
@@ -137,16 +139,22 @@ fn main() {
     }
 
     println!("🔹 Building x86_64 UEFI Bootloader...");
-    let bootloader_status = Command::new("cargo")
+    let mut bootloader_cmd = Command::new("cargo");
+    bootloader_cmd
         .current_dir(workspace_dir.join("crates/bootloader"))
         .arg("+nightly")
         .arg("build")
         .arg("--release")
         .arg("--target").arg("x86_64-unknown-uefi")
         .arg("-Z").arg("build-std=core,compiler_builtins,alloc")
-        .arg("-Z").arg("build-std-features=compiler-builtins-mem")
-        .status()
-        .unwrap();
+        .arg("-Z").arg("build-std-features=compiler-builtins-mem");
+    // BootInfo ABI: unaos_ivb adds fields to the shared BootInfo struct — the bootloader must
+    // arm it from the SAME knob as the kernel above or the two binaries disagree on the layout.
+    if std::env::var("UNAOS_IVB").is_ok() {
+        bootloader_cmd.arg("--features").arg("unaos_ivb");
+        println!("   bootloader features: unaos_ivb");
+    }
+    let bootloader_status = bootloader_cmd.status().unwrap();
 
     if !bootloader_status.success() {
         panic!("Bootloader build failed");
