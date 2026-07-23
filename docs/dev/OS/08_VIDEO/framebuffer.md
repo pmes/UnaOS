@@ -107,10 +107,17 @@ not a per-pixel re-encode — so the split, not the copy loop, is where a flush
 regression would show.
 
 The `vug` crystal demo drives this with dirty-rect rendering: instead of clearing
-the whole panel each frame it background-fills only the union of the crystal's
-previous + current projected-vertex bbox (plus the cursor's old footprint), and
-the HUD / corner meters clear their own small blocks. Painter's back-to-front
-face ordering is unchanged.
+the whole panel each frame it background-fills the crystal's **vacated** (previous
+projected-vertex bbox) and **current** footprints as *separate* fills — plus the
+cursor's old footprint — and the HUD / corner meters clear their own small blocks.
+Painter's back-to-front face ordering is unchanged. Keeping erase and paint as
+separate damage rects (rather than one `prev ∪ curr` box) is VUG-FPS-3: the
+`DamageSet` merges the two while they overlap — the steady auto-tumble, where
+`prev ≈ curr`, is byte-identical to a single-union erase — but keeps them tight
+and disjoint when the crystal jumps (a drag/zoom, or a wide/tall tumble extreme),
+so the dead gap *between* an old and new position is never filled or flushed. A
+single union rect there was the P46 damage that "grew and never shrank",
+ballooning both the raster fill and the flush bytes as the frame time decayed.
 
 This is what the console / `pal::TargetPal` draws through in steady state.
 
