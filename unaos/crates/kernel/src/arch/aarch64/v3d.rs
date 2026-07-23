@@ -290,6 +290,32 @@ const V3D_PTB_BPCS: usize = 0x0304; // PTB binning primitive-list current size  
 const V3D_PTB_BPOA: usize = 0x0308; // PTB binning primitive-list overflow address (v3d_regs.h V3D_PTB_BPOA)
 const V3D_PTB_BPOS: usize = 0x030c; // PTB binning primitive-list overflow size    (v3d_regs.h V3D_PTB_BPOS)
 
+// PI-V3D-44: per-CORE interrupt status/clear registers (v3d_regs.h V3D_CTL_INT_*, read via
+// V3D_CORE_READ in v3d_irq.c on the 4.x path). The kernel driver treats a completed bin as
+// "retired" ONLY when V3D_INT_FLDONE (binning FLUSH done) latches in INT_STS — NOT when the
+// CT0CS run bit drops (the CLE can idle while the PTB is still draining / awaiting overflow).
+// Our post-kick "idle" predicate has always been CT0CS-based, which is why P40 read the pool
+// pre-retire (BFC Δ0, PCS bit0=1). These offsets let us poll the true retire signal instead.
+const V3D_CTL_INT_STS: usize = 0x0050; // latched interrupt status (v3d_regs.h V3D_CTL_INT_STS)
+const V3D_CTL_INT_CLR: usize = 0x0058; // write-1-to-clear latched interrupts (V3D_CTL_INT_CLR)
+// V3D 4.x per-core interrupt bit layout (v3d_regs.h, the 33_5+ block):
+const V3D_INT_FRDONE: u32 = 1 << 0; // render frame done
+const V3D_INT_FLDONE: u32 = 1 << 1; // binning flush done — the true bin-retire signal
+const V3D_INT_OUTOMEM: u32 = 1 << 2; // binner ran out of tile-alloc memory (needs an overflow block)
+const V3D_INT_SPILLUSE: u32 = 1 << 3; // QPU spill-memory used
+const V3D_INT_GMPV: u32 = 1 << 5; // GMP (memory-protection) violation
+
+// PI-V3D-44 overflow (BPO) pool — the tail of the arena (0x36000, above the probe bin CL at
+// 0x35000+0x1000). The V3D binner requests overflow tile-list memory via the OUTOMEM interrupt;
+// the kernel driver answers by writing BPOA (block address) + BPOS (block size) — v3d_irq.c's
+// V3D_INT_OUTOMEM path → v3d_overflow_mem_work. We give the PTB NO overflow pool today (BPOA/BPOS
+// unset = 0), so if the initial 128 B tile-alloc block is exhausted the binner stalls waiting for
+// overflow memory that never arrives — FLDONE never fires. Pre-arm a small overflow block so the
+// PTB can complete the flush without the interrupt round-trip.
+const OFF_PROBE_BIN_OVERFLOW: usize = 0x36000; // probe overflow tile-list pool (BPOA)
+const PROBE_BIN_OVERFLOW_BYTES: usize = 0x2000; // 8 KiB — ample overflow for the probe bin
+const _: () = assert!(OFF_PROBE_BIN_OVERFLOW + PROBE_BIN_OVERFLOW_BYTES <= ARENA_BYTES);
+
 // ─── The V3D buffer arena. One page-aligned static in BSS. Because the bare-metal kernel is
 // identity-mapped in low RAM (VA == PA), the address of this static IS its ARM physical address,
 // which is exactly what the V3D MMU page table and the control lists need. Sized generously and
@@ -1304,6 +1330,60 @@ fn wait_bit_clear(base: usize, reg: usize, mask: u32, what: &str) -> bool {
         core::hint::spin_loop();
     }
     true
+}
+
+/// PI-V3D-44: wait for the binner to actually RETIRE, not merely for CT0CS's run bit to drop.
+///
+/// V3D-43 STOP verdict falsified the wrong-opcode theory (our bin-list tail is Mesa v3d 4.2's exact
+/// job_emit_binning_flush — single FLUSH op 4). P40 metal then showed the CLE consumed the whole list
+/// incl. the FLUSH (CT0CA=EA) and the PTB emitted 0x3000 bytes (BPCA 0x1a2000→0x1a5000), yet BFC held
+/// at Δ0 and raw PCS bit0=1 at the post-idle readout — the flush never RETIRED. The cause named by
+/// V3D-43: our "idle" predicate is CT0CS-based; the binner can still be draining (or stalled waiting
+/// on overflow memory) when the CT0CS run bit clears. The kernel v3d driver never polls CT0CS for this
+/// — it waits for the BIN done IRQ V3D_INT_FLDONE (v3d_irq.c). We poll the same register bit.
+///
+/// Bounded poll of INT_STS FLDONE off the free-running CNTPCT (same ~0.5 s backstop shape as
+/// `wait_bit_clear`). Returns (raw INT_STS at exit, microseconds waited, FLDONE-observed). On a
+/// timeout the RAW status is printed so the next boot names which interrupt DID fire — OUTOMEM (binner
+/// stalled for overflow memory it was never given) and GMPV especially. The witness the brief names is
+/// emitted by the caller with the BFC pre/post pair.
+fn wait_fldone(what: &str) -> (u32, u64, bool) {
+    let frq = super::timer::cntfrq();
+    let start = super::timer::cntpct();
+    let deadline = start + frq / 2; // ~0.5 s, matching wait_bit_clear's backstop
+    loop {
+        let sts = mmio_read(V3D_CORE0_BASE, V3D_CTL_INT_STS);
+        if sts & V3D_INT_FLDONE != 0 {
+            let waited_us = (super::timer::cntpct().wrapping_sub(start)).saturating_mul(1_000_000) / frq.max(1);
+            // W1C the latched status so a stale FLDONE from a prior kick never masquerades as this one's.
+            mmio_write(V3D_CORE0_BASE, V3D_CTL_INT_CLR, sts);
+            dsb();
+            return (sts, waited_us, true);
+        }
+        if super::timer::cntpct() >= deadline {
+            let waited_us = (super::timer::cntpct().wrapping_sub(start)).saturating_mul(1_000_000) / frq.max(1);
+            serial_println!(
+                ":: V3D: [v3d44] FLDONE timeout ({}) — INT_STS={:#010x} (FRDONE={} FLDONE={} OUTOMEM={} SPILLUSE={} GMPV={}) — {} ::",
+                what, sts,
+                (sts & V3D_INT_FRDONE != 0) as u32,
+                (sts & V3D_INT_FLDONE != 0) as u32,
+                (sts & V3D_INT_OUTOMEM != 0) as u32,
+                (sts & V3D_INT_SPILLUSE != 0) as u32,
+                (sts & V3D_INT_GMPV != 0) as u32,
+                if sts & V3D_INT_OUTOMEM != 0 {
+                    "OUTOMEM fired: the binner stalled waiting for overflow tile-alloc memory — the pre-armed BPOA/BPOS block was too small or not honoured"
+                } else if sts & V3D_INT_GMPV != 0 {
+                    "GMPV fired: a GMP memory-protection violation blocked the flush"
+                } else if sts == 0 {
+                    "no interrupt latched at all: the flush never even began to retire (chase START_TILE_BINNING / PTB bring-up)"
+                } else {
+                    "an interrupt other than FLDONE latched — see the raw bits above"
+                }
+            );
+            return (sts, waited_us, false);
+        }
+        core::hint::spin_loop();
+    }
 }
 
 /// PI-V3D-10: decode the V3D MMU violation witness pair into (client name, true VA). Hardware facts
@@ -2559,6 +2639,12 @@ fn probe_job() {
     fill_region(OFF_BIN_TILEALLOC, BIN_TILEALLOC_BYTES, 0);
     cache::clean_range(arena_phys() + OFF_TILESTATE, TILE_STATE_BYTES);
     cache::clean_range(arena_phys() + OFF_BIN_TILEALLOC, BIN_TILEALLOC_BYTES);
+    // PI-V3D-44: zero + publish the overflow tile-list pool so the pre-armed BPOA/BPOS block below
+    // is fresh, coherent memory the PTB can spill into if the 128 B initial block runs out.
+    for i in (0..PROBE_BIN_OVERFLOW_BYTES).step_by(4) {
+        arena_write_u32(OFF_PROBE_BIN_OVERFLOW + i, 0);
+    }
+    cache::clean_range(arena_phys() + OFF_PROBE_BIN_OVERFLOW, PROBE_BIN_OVERFLOW_BYTES);
 
     let bin_ba = (arena_phys() + OFF_PROBE_BIN_CL) as u32;
     let bin_ea = bin_ba + bin_len as u32;
@@ -2623,6 +2709,19 @@ fn probe_job() {
     // Arm the execution trio (src14/16/32) + TMU battery (src24/17/25) so they span the probe bin. This is
     // read-only w.r.t. the shader (see pctr_* above) — it cannot perturb execution.
     pctr_setup_cs_witness();
+    // [v3d44] hand the PTB a small overflow tile-list pool BEFORE the GO (BPOA=block addr, BPOS=size),
+    // exactly as the kernel v3d driver answers an OUTOMEM interrupt (v3d_irq.c/v3d_overflow_mem_work).
+    // The V3D-44 OUTOMEM theory: we gave the binner NO overflow pool (BPOA/BPOS=0), so once the 128 B
+    // initial tile-alloc block filled the PTB stalled waiting for overflow memory that never came —
+    // holding FLDONE hostage (fits every P40 datum: bytes emitted, flush consumed, never retired, no
+    // fault, binner busy). Pre-arming it lets the flush retire without the interrupt round-trip.
+    let bpo_addr = (arena_phys() + OFF_PROBE_BIN_OVERFLOW) as u32;
+    mmio_write(V3D_CORE0_BASE, V3D_PTB_BPOA, bpo_addr);
+    mmio_write(V3D_CORE0_BASE, V3D_PTB_BPOS, PROBE_BIN_OVERFLOW_BYTES as u32);
+    // Clear any latched interrupts so this kick's FLDONE (and OUTOMEM/GMPV) reads fresh, not a stale
+    // bit from a prior job.
+    mmio_write(V3D_CORE0_BASE, V3D_CTL_INT_CLR, mmio_read(V3D_CORE0_BASE, V3D_CTL_INT_STS));
+    dsb();
     // [v3d41] snapshot the frame-completion counters immediately before the GO — the post-idle diff
     // (ptb_frame_witness below) is the started-vs-never-started discriminator for the V3D-40 wall.
     let bfc_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_BFC);
@@ -2645,6 +2744,28 @@ fn probe_job() {
         bin_ba, bin_ea, probe_ran as u32, idled as u32,
         if ct0_ca_done == bin_ea { "reached EA" } else if ct0_ca_done == bin_ba || ct0_ca_done == 0 { "stuck at BA/0" } else { "mid-list" },
         ca_advanced as u32
+    );
+    // ── [v3d44] THE flush-retire wait — poll the true retire signal (INT_STS FLDONE), not CT0CS ──────
+    // The CT0CS run bit dropping (`idled` above) only means the CLE stopped fetching; V3D-43 proved the
+    // PTB can still be draining/stalled then. Wait for FLDONE — the binning-flush-done interrupt the
+    // kernel driver treats as retire — BEFORE the L2T flush + pool readback, so the pool read below
+    // reflects a RETIRED bin, not the P40 pre-retire snapshot (BFC Δ0, PCS bit0=1). The witness the
+    // brief names carries the raw INT_STS, the microseconds waited, whether FLDONE retired, and the
+    // BFC pre/post pair (BFC advancing is the independent frame-completed corroboration of FLDONE).
+    let (fldone_sts, fldone_us, fldone_retired) = wait_fldone("v3d44 PROBE bin flush");
+    let bfc_after_flush = mmio_read(V3D_CORE0_BASE, V3D_CLE_BFC);
+    serial_println!(
+        ":: V3D: [v3d44] FLDONE wait — INT_STS={:#010x} waited={}us retired={} BFC={:#010x}->{:#010x} (Δ{}) BPOA(armed)={:#010x} BPOS={:#x} — {} ::",
+        fldone_sts, fldone_us, fldone_retired as u32,
+        bfc_pre, bfc_after_flush, bfc_after_flush.wrapping_sub(bfc_pre),
+        bpo_addr, PROBE_BIN_OVERFLOW_BYTES,
+        if fldone_retired {
+            "the bin flush RETIRED — the P40 read-too-early wall is closed; the pool read below is post-retire truth"
+        } else if fldone_sts & V3D_INT_OUTOMEM != 0 {
+            "OUTOMEM despite the pre-armed overflow block — the binner wants MORE (grow BPOS) or the block is not honoured"
+        } else {
+            "FLDONE never fired — the bin did not retire; see the raw INT_STS bits for what did"
+        }
     );
     // Read the battery now the probe has idled — THE decisive witness for V3D-35. valid_instr says how far
     // the probe thread got (reached the [9] store word or died before it); tcache_access says whether the
