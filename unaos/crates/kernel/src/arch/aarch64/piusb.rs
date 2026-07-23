@@ -674,12 +674,56 @@ fn dump_firmware_state() {
     super::exceptions::serror_drain_request("piusb: PIUSB-5 dump exit");
 }
 
-/// Entry point: bring the BCM2711 PCIe RC + VL805 xHCI up to the honesty line. Called once on the BSP,
-/// single-threaded, from `build_boot_info` (pre-SMP, pre-heap, mailbox idle). Heap-free: the attach
-/// stops at "halted-but-decoding + ports powered" and never allocates rings (full enumeration is the
-/// metal follow-on). `dtb` is the firmware device tree from x0 — censused for a `pcie@` node BEFORE any
-/// RC MMIO (QEMU raspi4b has none → clean skip). Every wait is a FINITE wall-clock backstop off CNTPCT.
+/// PIUSB-29: firmware DTB pointer stashed by `bringup` (the pre-heap `build_boot_info` call) for the
+/// async bring-up task to read. The RC bring-up + enumeration no longer run on the boot-critical path;
+/// `bringup` now only records the DTB and returns immediately so `kernel_main` reaches the GUI/panel
+/// without waiting on the multi-second brcmstb RC reset/PERST/CNR settle + the bounded enumerate pump.
+static PIUSB_DTB: AtomicU64 = AtomicU64::new(0);
+
+/// PIUSB-29: entry point kept for `build_boot_info` (boot.rs) — now a zero-cost DTB stash. The real RC
+/// bring-up + enumeration is deferred to `bringup_task`, spawned from `kernel_main` onto a secondary
+/// core so the boot core proceeds straight to the GUI/panel. Called once on the BSP, pre-heap/pre-SMP;
+/// stashing an AtomicU64 is heap-free and safe there. Off the boot path = the panel unblocks at once.
 pub fn bringup(dtb: u64) {
+    PIUSB_DTB.store(dtb, Ordering::Release);
+}
+
+/// PIUSB-29: the async USB bring-up task. Spawned (`spawn_auto`) from `kernel_main` once the secondary
+/// cores are online, so the boot core does NOT block on it. Runs ONCE: RC bring-up (`bringup_inner`,
+/// the brcmstb RC reset/PERST/CNR settle) → `enumerate` (rings + RS=1 + the bounded polled walk) →
+/// exits, leaving steady-state servicing to `usb_pump`. A keyboard/mouse plugged at power-on arms the
+/// same way, just slightly later (the devices do not vanish). Brackets the work with a CNTPCT-derived
+/// millisecond witness so the boot-time win (panel responsive while this runs) is measurable in serial.
+pub fn bringup_task(_arg: usize) {
+    serial_println!(
+        ":: piusb29: async bring-up start (panel unblocked at {}ms) ::",
+        ms_now()
+    );
+    bringup_inner(PIUSB_DTB.load(Ordering::Acquire));
+    enumerate();
+    serial_println!(
+        ":: piusb29: async bring-up done ({}ms; RC bring-up + enumerate ran off the boot path) ::",
+        ms_now()
+    );
+}
+
+/// PIUSB-29: milliseconds since power-on off the always-live generic counter (CNTPCT/CNTFRQ). Used only
+/// to timestamp the bring-up witness; a zero frequency (never on real silicon) degrades to 0 rather
+/// than dividing by zero.
+fn ms_now() -> u64 {
+    let f = super::timer::cntfrq();
+    if f == 0 {
+        return 0;
+    }
+    super::timer::cntpct().saturating_mul(1000) / f
+}
+
+/// Bring the BCM2711 PCIe RC + VL805 xHCI up to the honesty line. Runs inside `bringup_task` on a
+/// secondary core (post-heap, post-SMP) — no longer on the boot-critical path. Heap-free itself: the
+/// attach stops at "halted-but-decoding + ports powered" and never allocates rings (`enumerate` does
+/// that next). `dtb` is the firmware device tree stashed by `bringup` — censused for a `pcie@` node
+/// BEFORE any RC MMIO (QEMU raspi4b has none → clean skip). Every wait is a FINITE CNTPCT backstop.
+fn bringup_inner(dtb: u64) {
     serial_println!("{} PI-USB-1 bring-up starting (BCM2711 PCIe RC @ {:#x} + VL805 xHCI) ::", P, RC_BASE);
 
     // CENSUS-BEFORE-TOUCH: only proceed to RC MMIO if the firmware DTB describes a `pcie@` controller.

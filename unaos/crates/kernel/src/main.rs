@@ -311,13 +311,29 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         #[cfg(feature = "piinstall")]
         unaos_kernel::install::pi::run();
 
-        // PI-USB-2: the DMA-side xHCI bring-up + device enumeration on the VL805, post-heap on the BSP.
-        // `piusb::bringup` (pre-heap, in build_boot_info) already reached the honesty line (RC link +
-        // VL805 found + BAR sized + xHCI decoding + ports powered); this reads its handoff, programs
-        // rings/interrupter (needs the heap), RS=1, and walks whatever is plugged. QEMU raspi4b models
-        // no PCIe RC/VL805, so the honesty line was never reached and this returns after one skip line.
+        // PIUSB-29: USB bring-up is OFF the boot-critical path. `piusb::bringup` (pre-heap, in
+        // build_boot_info) now only stashes the DTB; the entire cost — the brcmstb RC reset/PERST/CNR
+        // settle AND `enumerate`'s bounded polled walk (rings/interrupter, RS=1, port/HID/storage
+        // enumeration) — runs inside `piusb::bringup_task`, spawned onto a secondary core here so the
+        // boot core proceeds straight to the GUI/panel instead of freezing at the square for seconds.
+        // Nothing below needs USB done: the GUI needs nothing from it, keyboard/mouse arrive via the
+        // late-tolerant input_service, and storage mounts on PIUSB-28's ready-edge whenever it fires.
+        // The task runs once (RC bring-up → enumerate → exit) and hands steady state to `usb_pump`;
+        // `usb_pump` locks XHCI_CONTROLLER, which stays None until the task publishes it, so its spawn
+        // cannot race the controller appearing late (None-safe by the `if let Some` at every lock site).
+        // Zero-secondary fallback: with no AP to host the task, keep the legacy synchronous bring-up so
+        // a serial-only / single-core boot still enumerates USB (mirrors the GUI-task path's AP guard).
+        // In QEMU raspi4b (no PCIe RC/VL805) both bring-up and enumerate census-skip either way.
         #[cfg(feature = "piusb")]
-        unaos_kernel::arch::piusb::enumerate();
+        if online.is_empty() {
+            unaos_kernel::arch::piusb::bringup_task(0);
+        } else {
+            unaos_kernel::arch::sched::spawn_auto(
+                "piusb-bringup",
+                unaos_kernel::arch::piusb::bringup_task,
+                0,
+            );
+        }
 
         // PI-GENET: the BCM2711 on-board Gigabit Ethernet (GENET v5) + smoltcp bind — the Pi's FIRST
         // network path. DTB-resolves the register base, poison-honest probes SYS_REV_CTRL to classify
