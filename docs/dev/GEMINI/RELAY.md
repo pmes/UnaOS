@@ -2,16 +2,12 @@
 # the message(s) Peter posts into each Gemini chat, verbatim.
 # (updated 2026-07-23, after s14: surface pointer candidate found; pull-5 briefed)
 
-## → kepler-display session — POST NOW
+# (updated 2026-07-23, after s16: assembly state found; pull-7 briefed)
 
-Display: pull 6 proposal is APPROVED clean (git pull for the status header). Implement now. PUSH OWED reminder stands.
+## → kepler-display session
 
-## → kepler-display session — AFTER THE s16 BOOT (post the matching branch; the coordinator folds the log in parallel)
-
-IF the capture shows a 0x200-holding hit outside 0x6101E0 (or a pair line where first≠second): "Display: s16 found assembly candidate(s) — the pair table is in the capture and the coordinator is folding it into KEPLER-METAL-LOG.md sitting #16 (git pull shortly). Stand by for the pull-7 latch brief — it will name the exact register(s) from your own pair table."
-
-IF hits=0 in evo-scan2 and no diverging pair: "Display: s16 came back empty — no assembly twin in the scanned ranges. Honest null. The coordinator is scoping the next window (likely the 0x680000+ channel-user region or an instance-memory-side hunt); pull-7 brief follows after the fold. Nothing owed from you until then."
+Display: s16 delivered — your scan found the assembly state: 0x640460=0x200 inside a coherent method-mirror record (raster totals at 0x640420, geometry cluster behind it); UPDATE slot = 0x640080. All capture-verified, sitting #16 in KEPLER-METAL-LOG.md. Pull 7 is briefed — git pull and read `docs/dev/GEMINI/video/Kepler/BRIEF-kepler-display-pull7-latch.md`: arm 0x640460, latch via 0x640080, restore-paired; writes limited to exactly those two registers. Proposal first. PUSH OWED reminder stands.
 
 ## → kepler-fence session
 
-(nothing new — still holding; the display lane is mapping the EVO assembly/latch path your USERD fallback will ride)
+(nothing new — still holding; if the pull-7 latch proves live the EVO method path, your disp-era USERD probe gets briefed on the same mechanism)
