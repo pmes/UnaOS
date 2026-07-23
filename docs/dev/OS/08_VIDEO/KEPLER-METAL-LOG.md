@@ -3,6 +3,30 @@
 Hard-won silicon facts from the fox-metal sitting series. Trust these over any
 QEMU behavior. Newest sitting first.
 
+## Sitting #8 (igpu pull 3 + kepler pull 9, UnaOS-gemini@b3ec47d1, 2026-07-22, fox-metal-r23s1h)
+
+**Boot 1 — display paradox, two hard facts:**
+- **Point-0 is ALL-DEAD too.** Pipes/planes/PP_STATUS/PP_CONTROL/DPLL_A read
+  0x00000000 at all four points (first-instruction-adjacent bootloader entry
+  included); DP_A=0x1C constant. Panel power and the PLL were NEVER on at any
+  observable instant → the "firmware tears down during our bootloader window"
+  theory is DEAD. What remains: wrong-registers or the mux points elsewhere.
+- **The gmux answers on the INDEXED protocol and its state MOVES:** indexed
+  reads return real bytes (classic PIO = sentinel; absent on this rig);
+  values 0x39 at Point-0 → 0x03 at kernel probe. First register on this
+  machine that answers differently at boot vs kernel.
+- **CAVEAT on the decode (not yet canon):** idx_SWITCH and idx_POWER returned
+  IDENTICAL bytes at each point (0x39/0x39, 0x03/0x03). Two distinct
+  registers agreeing twice is the signature of an incomplete indexed
+  handshake (missing ready-wait between index write and value read) — we may
+  be reading a status/stale byte, not per-register data. The boot→kernel
+  CHANGE is a real observable; the 0x39/0x03 meanings are NOT decodable yet.
+  Pull 4 = full indexed protocol with ready-wait + a version-register
+  self-test (known-shape value proves the protocol before trusting
+  switch/power).
+
+Boot 2 (runlist fuzz) verdict pending.
+
 ## Sitting #7 (igpu pull 2 + kepler pull 8, UnaOS-gemini@7014b022→94b0ed0c, 2026-07-22, fox-metal-r23s1h) — COMPLETE
 
 **Boot 1 (teardown hunt):** three-point trace ran; verdict **ALL THREE POINTS
