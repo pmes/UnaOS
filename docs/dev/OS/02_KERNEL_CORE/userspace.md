@@ -366,6 +366,26 @@
     exits. QEMU-verified (2026-07-23): `:: EL0: fb test — mapped=32x32 threads=2 present=1 checksum=<hex>
     :: PASS ::`, the checksum self-verified against the kernel-computed expected pattern. **DEFERRED wiring:
     the `video/screen.rs` present-hook registration (3 lines) — out of the syscall/sched/boot lane.**
+- **EXEC-1 (landed 2026-07-23)** — connect the ELF-1 loader to the VFS: a panel shell **`run <path>`**
+  command that loads and executes an ELF64 (or flat) EL0 program off the filesystem and reports its exit
+  status. The EL1/ASID-0 shell reads the whole file through the VFS `MountTable` (`/fat` = FAT boot
+  partition, `/usb` = USB stick, `/` = native UnaFS), bounds it to the 16 KiB user window (an oversize file
+  is rejected `-E2BIG`, never silently truncated), pre-checks the ELF64 magic + aarch64 machine for a
+  friendly reason, then hands the bytes to the kernel loader **`run_user_image(name, bytes, deadline)`**.
+  The loader shares the ELF-1 mapping core: `load_program_into_slot` (the by-name FAT loader) and
+  `run_user_image` (the VFS-read path) both call a new FatKind-free **`map_image_into_slot`** — validate
+  fully → `alloc_user_slot` → copy+map+protect each PT_LOAD (per-segment W^X) → stamp the IMAGE_SHA256
+  principal — so the two paths never drift (m6g/ELF1 stay byte-identical). `run_user_image` endows the slot
+  a console write-cap, plants a **Proc entry** so the program's exit rides the SAME generic child-reap
+  short-circuit `sys_wait` uses (no dedicated `SYS_EXIT` arm — the program runs under an arbitrary name),
+  spawns it co-located, and deadline-bounded-yields until it exits or the fault-kill net contains a fault
+  (a killed run-image task marks its Proc entry with a kill sentinel, off the M6b `killed_unexpected`
+  count). On return the scheduler has already repointed the core to the boot root (ASID 0), honouring the
+  shell's ASID-0 invariant. The panel prints `run: <path>: exited with status <n>`; the headless witness is
+  `:: EXEC: run <path> — loaded <n> bytes, entry 0x<..>, exit=<code> ::`. QEMU-verified (2026-07-23) via a
+  boot self-test that reads `/fat/ELFHELLO.ELF` through the VFS and runs it through `run_user_image`:
+  `:: EXEC1: run /fat/ELFHELLO.ELF — loaded 8560 bytes, entry 0x268000, exit=0 -> PASS ::` (the program
+  prints its own `elf hello from EL0`).
 - Not yet: **revocation trees** (a derived copy — re-grant or onward re-transfer — escapes
   single-level revoke today; derivation records + `CAP_REVOKE` are that arc), the **bandy Ring-3
   delegation wrapper**, `File` transfer (descriptor migration), real `Socket` fs/net syscalls.

@@ -2830,6 +2830,19 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // foreign volume-level path from the same surface. `vfs <op> <path>`.
             vfs_cmd(console, &args);
         },
+        #[cfg(feature = "baremetal")]
+        "run" => {
+            // EXEC-1: load an ELF64 EL0 program off the VFS namespace and execute it at EL0, reporting its
+            // exit status. Rides the SAME `MountTable` the `vfs` verb uses (`/fat` = FAT boot partition,
+            // `/usb` = USB stick, `/` = native UnaFS), so `run /fat/ELFHELLO.ELF` loads the boot-partition
+            // fixture. The bytes are read here (EL1/ASID 0) and handed to the kernel loader
+            // (`run_user_image`), which maps them into a fresh per-task slot with per-segment W^X pages and
+            // runs them under EL0 + the fault-kill net. `run <path>`.
+            match args.first() {
+                None => console.println("usage: run <path>   (load + execute an ELF64 EL0 program)"),
+                Some(&path) => run_program(console, path),
+            }
+        },
         "cp" | "copy" => {
             // JD8: copy a file (`cp FILE DIR/` lands as DIR/<leaf>). JD9: `-r`/`-R` recursively copies a
             // directory tree. Flags (leading `-`) precede the paths; only `-r`/`-R` are recognized (any
@@ -3408,6 +3421,110 @@ fn parse_num(s: &str) -> Option<u64> {
 /// at `/usb` returns `-ENOTSUP` (the FatBackend refuses writes on a non-Default
 /// source before touching the block layer). Rebuilt per invocation, so a stick
 /// hot-plugged (or ejected) between commands is picked up on the next `vfs`.
+/// EXEC-1: `run <path>` — load an ELF64 (or flat) EL0 program off the VFS namespace and execute it at EL0,
+/// reporting its exit status. Reads the whole file through the same `MountTable` the `vfs` verb uses,
+/// bounds it to the kernel's 16 KiB user window (an oversize file is rejected with a clear message — never
+/// silently truncated), pre-checks the ELF64 magic + aarch64 machine for an early operator-friendly reason,
+/// then hands the bytes to the kernel loader `run_user_image`, which maps them into a fresh per-task slot
+/// (per-segment W^X pages) and runs them under EL0 + the fault-kill net. The kernel is the security
+/// authority: this pre-check only sharpens the error text; `run_user_image` re-validates from scratch.
+///
+/// Witness (headless-capturable): `:: EXEC: run <path> — loaded <n> bytes, entry 0x<..>, exit=<code> ::`.
+#[cfg(feature = "baremetal")]
+fn run_program(console: &mut Console, path: &str) {
+    use crate::fs::vfs::NodeKind;
+    // Cap = the kernel user window; a file at or under it may still be rejected by the loader (a flat blob
+    // is re-bounded to one code page), but this is the hard read ceiling — we never read past it.
+    const CAP: u64 = crate::arch::aarch64::boot::USER_REGION_SIZE as u64;
+    let mt = vfs_mount_table();
+    let st = match mt.stat(path) {
+        Ok(s) => s,
+        Err(e) => {
+            console.println(&alloc::format!("run: {}: {}", path, vfs_err(e)));
+            return;
+        }
+    };
+    if matches!(st.kind, NodeKind::Dir) {
+        console.println(&alloc::format!("run: {}: is a directory (-EISDIR)", path));
+        return;
+    }
+    if st.size == 0 {
+        console.println(&alloc::format!("run: {}: empty file", path));
+        return;
+    }
+    if st.size > CAP {
+        console.println(&alloc::format!(
+            "run: {}: {} bytes exceeds the {}-byte EL0 user window (-E2BIG)",
+            path, st.size, CAP
+        ));
+        return;
+    }
+    let bytes = match mt.read(path, 0, st.size as usize) {
+        Ok(b) => b,
+        Err(e) => {
+            console.println(&alloc::format!("run: {}: {}", path, vfs_err(e)));
+            return;
+        }
+    };
+    // Early ELF64/aarch64 pre-check for a friendly reason (the kernel loader is the real gate). A flat blob
+    // (no ELF magic) is allowed through — the loader routes it to the position-independent flat path.
+    if bytes.len() >= 20 && bytes[0..4] == [0x7F, b'E', b'L', b'F'] {
+        if bytes[4] != 2 {
+            console.println(&alloc::format!("run: {}: not an ELF64 image (EI_CLASS != 2)", path));
+            return;
+        }
+        if bytes[5] != 1 {
+            console.println(&alloc::format!("run: {}: not little-endian (EI_DATA != 1)", path));
+            return;
+        }
+        let machine = u16::from_le_bytes([bytes[18], bytes[19]]);
+        if machine != 183 {
+            console.println(&alloc::format!(
+                "run: {}: not an aarch64 image (e_machine {} != 183)", path, machine
+            ));
+            return;
+        }
+    }
+    // Hand the bytes to the kernel loader: map into a fresh EL0 slot, run co-located, wait (bounded 5 s) for
+    // the program to exit or fault. The image length + entry are reported for the witness.
+    let n = bytes.len();
+    let deadline = 5 * crate::arch::aarch64::timer::cntfrq();
+    match crate::arch::syscall::run_user_image("shell-run", &bytes, deadline) {
+        Ok((outcome, entry)) => {
+            use crate::arch::syscall::RunOutcome;
+            match outcome {
+                RunOutcome::Exited(code) => {
+                    console.println(&alloc::format!("run: {}: exited with status {}", path, code));
+                    serial_println!(
+                        ":: EXEC: run {} — loaded {} bytes, entry {:#x}, exit={} ::",
+                        path, n, entry, code
+                    );
+                }
+                RunOutcome::Faulted => {
+                    console.println(&alloc::format!(
+                        "run: {}: killed by the fault-kill net (contained fault)", path
+                    ));
+                    serial_println!(
+                        ":: EXEC: run {} — loaded {} bytes, entry {:#x}, exit=FAULT ::",
+                        path, n, entry
+                    );
+                }
+                RunOutcome::Timeout => {
+                    console.println(&alloc::format!("run: {}: did not exit within the deadline", path));
+                    serial_println!(
+                        ":: EXEC: run {} — loaded {} bytes, entry {:#x}, exit=TIMEOUT ::",
+                        path, n, entry
+                    );
+                }
+            }
+        }
+        Err(why) => {
+            console.println(&alloc::format!("run: {}: {}", path, why));
+            serial_println!(":: EXEC: run {} — rejected ({}) ::", path, why);
+        }
+    }
+}
+
 #[cfg(target_arch = "aarch64")]
 fn vfs_mount_table() -> crate::fs::vfs::MountTable {
     use crate::fs::vfs::{FatBackend, MountTable, NativeBackend, KERNEL_PRINCIPAL};

@@ -5185,6 +5185,20 @@ pub fn record_el0_kill(name: &str, ec: u64, far: u64, far_valid: bool) {
         EL0_K2_KILLED.fetch_add(1, Ordering::AcqRel);
         return;
     }
+    // EXEC-1: a killed run-image task (the shell `run <path>` program) has a planted Proc entry but no
+    // dedicated name arm above (it runs under an arbitrary caller-supplied name). Mark its Proc entry EXITED
+    // with the kill sentinel + post `done` so `run_user_image`'s wait wakes PROMPTLY (not at its deadline),
+    // and route the kill OFF the M6b `killed_unexpected` count — a fault in an operator-launched untrusted
+    // program is CONTAINED, not an M6b regression. Byte-identical for the boot battery: every Proc-tracked
+    // fixture is already matched by a name arm above, so no existing task reaches here with a live Proc entry.
+    if let Some(id) = super::sched::current_id() {
+        if let Some(i) = proc_find_running(id) {
+            PROCS[i].status.store(EXEC_KILLED_STATUS, Ordering::Release);
+            PROCS[i].state.store(PEXITED, Ordering::Release);
+            PROCS[i].done.post();
+            return;
+        }
+    }
     let (base, size) = super::boot::user_region();
     let code = super::boot::USER_CODE_SIZE as u64;
     let expected = far_valid
@@ -6204,23 +6218,74 @@ fn load_program_into_slot(name: &str) -> Result<Loaded, SpawnErr> {
         return Err(SpawnErr::Empty(kind));
     }
 
-    // ELF-1: dispatch on the magic. VALIDATE fully BEFORE allocating a slot (the "slot allocated LAST"
-    // invariant — there is no free-an-unused-slot primitive, so no fallible step may follow the alloc). For
-    // a flat blob the validation is the one-code-page bound; for an ELF it is the full header/phdr/segment
-    // walk. Only the (infallible, given a validated plan) copy+map follows the alloc.
+    // ELF-1/EXEC-1: hand the read bytes to the shared MAPPER (`map_image_into_slot`) — it dispatches on the
+    // ELF magic, validates fully BEFORE it allocates a slot (the "slot allocated LAST" invariant), then
+    // copies+maps+protects. The mapper is FatKind-free (shared with the shell's `run_user_image`); re-attach
+    // the kind here so this loader's `SpawnErr` variants and the m6g/ELF1 log lines stay byte-identical.
+    let mapped = map_image_into_slot(&bytes).map_err(|e| match e {
+        MapErr::Empty => SpawnErr::Empty(kind),
+        MapErr::BadSize(sz) => SpawnErr::BadSize(kind, sz),
+        MapErr::BadElf(why) => SpawnErr::BadElf(kind, why),
+        MapErr::NoSlot => SpawnErr::NoSlot(kind),
+    })?;
+    Ok(Loaded {
+        base: mapped.base,
+        sp: mapped.sp,
+        ttbr0: mapped.ttbr0,
+        slot: mapped.slot,
+        len: mapped.len,
+        kind,
+        is_elf: mapped.is_elf,
+        nsegs: mapped.nsegs,
+    })
+}
+
+/// The FatKind-free result of `map_image_into_slot`: the EL0 run parameters. `load_program_into_slot`
+/// wraps it in a `Loaded` (re-attaching the FAT kind); `run_user_image` consumes it directly.
+struct Mapped {
+    base: u64, // the EL0 ENTRY VA (window base for a flat blob, `bias + e_entry` for an ELF)
+    sp: u64,   // 16-aligned window top = initial SP_EL0
+    ttbr0: u64,
+    slot: usize,
+    len: usize,
+    is_elf: bool,
+    nsegs: u32,
+}
+
+/// A FatKind-free mapping failure. `load_program_into_slot` re-attaches the kind to reproduce its exact
+/// `SpawnErr`; `run_user_image` renders it as an operator string.
+enum MapErr {
+    Empty,
+    BadSize(u32), // a flat blob larger than one code page
+    BadElf(&'static str),
+    NoSlot,
+}
+
+/// EXEC-1: the FatKind-free image MAPPER — the shared CORE of `load_program_into_slot` (the by-name FAT
+/// loader) and `run_user_image` (the shell's VFS-read `run <path>`). Given the WHOLE read image (already
+/// bounded to `USER_REGION_SIZE` by the caller), it dispatches on the ELF magic, VALIDATES fully BEFORE
+/// allocating a slot (the "slot allocated LAST" invariant — no fallible step may follow the alloc), then
+/// copies each PT_LOAD (or the one flat page) into a FRESH slot, I-cache-syncs, and applies per-segment
+/// W^X page permissions (PF_X -> RO+EL0-exec code pages; R/W -> EL0+EL1-RW/never-exec data pages). It
+/// stamps the IMAGE_SHA256 principal over the whole image. The bytes are UNTRUSTED — nothing is trusted
+/// beyond the size bound + per-page permissions; they run only under EL0 + the M6b fault-kill net.
+fn map_image_into_slot(bytes: &[u8]) -> Result<Mapped, MapErr> {
+    if bytes.is_empty() {
+        return Err(MapErr::Empty);
+    }
     let (base, size) = super::boot::user_region();
-    let elf_plan = if is_elf_image(&bytes) {
-        Some(validate_elf(&bytes, size).map_err(|why| SpawnErr::BadElf(kind, why))?)
+    let elf_plan = if is_elf_image(bytes) {
+        Some(validate_elf(bytes, size).map_err(MapErr::BadElf)?)
     } else {
         // FLAT path: the historical model — one code page, entered at offset 0, position-independent. Keep
-        // the exact `USER_CODE_SIZE` bound (a larger flat blob is `BadSize`/E2BIG, byte-identical to before).
+        // the exact `USER_CODE_SIZE` bound (a larger flat blob is `BadSize`, byte-identical to before).
         if bytes.len() > super::boot::USER_CODE_SIZE {
-            return Err(SpawnErr::BadSize(kind, bytes.len() as u32));
+            return Err(MapErr::BadSize(bytes.len() as u32));
         }
         None
     };
 
-    let slot = super::boot::alloc_user_slot().ok_or(SpawnErr::NoSlot(kind))?;
+    let slot = super::boot::alloc_user_slot().ok_or(MapErr::NoSlot)?;
     let backing = super::boot::slot_backing_ptr(slot);
     let (entry, nsegs, is_elf) = match &elf_plan {
         Some(plan) => {
@@ -6256,23 +6321,102 @@ fn load_program_into_slot(name: &str) -> Result<Loaded, SpawnErr> {
         }
     };
     let ttbr0 = super::boot::slot_ttbr0(slot);
-    // IMAGE_SHA256 (code-signing): stamp this slot's persistent principal from the loaded IMAGE bytes, not the
-    // 8.3 name — the SOLE mint path, kernel-derived from `bytes` (the untrusted image), never EL0-set. This
-    // GRADUATES the U6 owner from PROGRAM_NAME ("same 8.3 name = same principal", the honest residual) to the
-    // image digest: two byte-identical images share a principal (a re-spawn is re-admitted by name+identity),
-    // two DIFFERENT images under the same name do NOT (a swapped blob is refused). `name` still drives
-    // find/read/logging, so it stays live. Hashed over the WHOLE file image (flat or ELF) identically.
-    slot_ppid_stamp(ttbr0 >> 48, PrincipalRecord::image_of(&bytes));
-    Ok(Loaded {
+    // IMAGE_SHA256 (code-signing): stamp this slot's persistent principal from the loaded IMAGE bytes, not
+    // any 8.3 name — the SOLE mint path, kernel-derived from the untrusted image, never EL0-set. Two
+    // byte-identical images share a principal; two different images do not. Hashed over the WHOLE file image
+    // (flat or ELF) identically.
+    slot_ppid_stamp(ttbr0 >> 48, PrincipalRecord::image_of(bytes));
+    Ok(Mapped {
         base: entry,
         sp: (base + size as u64) & !0xF, // 16-aligned window top = initial SP_EL0
         ttbr0,
         slot,
         len: bytes.len(),
-        kind,
         is_elf,
         nsegs,
     })
+}
+
+/// EXEC-1: the outcome of `run_user_image` — the program exited with a status, was killed by the fault-kill
+/// net (a CONTAINED fault), or overran its deadline (still running / stuck).
+pub enum RunOutcome {
+    Exited(i32),
+    Faulted,
+    Timeout,
+}
+
+/// run_user_image: the Proc `status` a killed run-image task is marked with (see the fault-kill path), so
+/// the wait renders it as `Faulted` rather than `Exited`. `i32::MIN` never collides with a real exit code.
+const EXEC_KILLED_STATUS: i32 = i32::MIN;
+
+/// EXEC-1: load an already-read program IMAGE (flat or ELF64) into a fresh EL0 slot, run it to completion
+/// on THIS core, and return its exit status. The synchronous shell `run <path>` entry: the EL1/ASID-0 panel
+/// shell reads the bytes off the VFS and hands them here. We map (via the shared `map_image_into_slot`),
+/// endow a console write-cap, plant a Proc entry so the GENERIC child-reap short-circuit in the SYS_EXIT
+/// handler records the status (no dedicated exit arm — the program runs under an arbitrary `name`), spawn it
+/// co-located, then deadline-bounded-yield until it exits or faults. On return the scheduler has already
+/// repointed this core to the boot root (ASID 0) via `teardown_user_slot`, honoring the shell's ASID-0
+/// invariant (shell.rs). `deadline_ticks` is a CNTPCT span (`timer::cntfrq()` = 1 s).
+/// Returns `(outcome, entry)` where `entry` is the EL0 entry VA the image was mapped at (for the caller's
+/// witness line) — or an operator string if the image could not be loaded.
+pub fn run_user_image(
+    name: &'static str,
+    bytes: &[u8],
+    deadline_ticks: u64,
+) -> Result<(RunOutcome, u64), &'static str> {
+    // Fail-closed backstop (the caller also bounds): the whole image must fit the slot window. The mapper
+    // re-bounds the flat path to one code page and each ELF segment to the window.
+    if bytes.len() > super::boot::USER_REGION_SIZE {
+        return Err("image larger than the 16 KiB user window");
+    }
+    // Claim the Proc entry FIRST so a failed map frees nothing but the entry (no slot is allocated on any
+    // map-failure path), and so the pid slot exists before the co-located task can be dispatched.
+    let Some(pi) = proc_reserve() else {
+        return Err("process table full");
+    };
+    let mapped = match map_image_into_slot(bytes) {
+        Ok(m) => m,
+        Err(e) => {
+            proc_free(pi);
+            return Err(match e {
+                MapErr::Empty => "empty image",
+                MapErr::BadSize(_) => "flat blob larger than one code page",
+                MapErr::BadElf(why) => why,
+                MapErr::NoSlot => "no free address-space slot",
+            });
+        }
+    };
+    let asid = mapped.ttbr0 >> 48;
+    // Endow the fresh slot with a console write-cap so the program's SYS_WRITE(fd 1) reaches the console.
+    // Done BEFORE the spawn, on a slot no other core can resolve yet (the co-location invariant below).
+    install_console_cap(asid);
+    let cpu = super::percpu::this_cpu().cpu_index as usize;
+    let pid = super::sched::spawn_user_slot(name, mapped.base, mapped.sp, mapped.ttbr0, cpu);
+    // Publish the Proc key (ASID before pid — the entry's live word) BEFORE the co-located task can be
+    // dispatched: the caller yields only in the wait loop below, so the pid is always stored before the
+    // exit/kill path's `proc_find_running` lookup (the sys_spawn co-location invariant, reused here).
+    PROCS[pi].asid.store(asid, Ordering::Release);
+    PROCS[pi].pid.store(pid, Ordering::Release);
+    // Deadline-bounded cooperative wait: yield so the co-located task runs; its SYS_EXIT (or the fault-kill
+    // path) marks PROCS[pi] EXITED and records the status via the GENERIC child-reap short-circuit.
+    let start = super::timer::cntpct();
+    while PROCS[pi].state.load(Ordering::Acquire) != PEXITED
+        && super::timer::cntpct().wrapping_sub(start) <= deadline_ticks
+    {
+        super::sched::yield_now();
+    }
+    let outcome = if PROCS[pi].state.load(Ordering::Acquire) == PEXITED {
+        match PROCS[pi].status.load(Ordering::Acquire) {
+            EXEC_KILLED_STATUS => RunOutcome::Faulted,
+            s => RunOutcome::Exited(s),
+        }
+    } else {
+        RunOutcome::Timeout
+    };
+    // Reap the Proc entry. The scheduler's exit path already repointed THIS core to the boot root (ASID 0)
+    // and dispatched back to the caller (the shell task), so the shell's ASID-0 invariant holds on return.
+    proc_free(pi);
+    Ok((outcome, mapped.base))
 }
 
 // =============================================================================================
@@ -8199,6 +8343,64 @@ fn elf1_launcher(_demo_cpu: usize) {
     }
 }
 
+/// EXEC-1 witness: prove the panel `run <path>` PATH end-to-end at boot. Reads ELFHELLO.ELF through the VFS
+/// `MountTable` (the same namespace the `run` verb builds — `/fat` = FAT boot partition), then hands the
+/// bytes to the NEW loader entry `run_user_image`, which maps them into a fresh EL0 slot, runs the program
+/// co-located, and returns its exit status. The ELF-1 launcher's twin, but driven through the VFS read +
+/// `run_user_image` (not the by-name `load_program_into_slot`), so it self-verifies the EXEC-1 integration:
+/// the program prints its own `elf hello from EL0` line (the hello witness) and this launcher adds the
+/// uncounted `:: EXEC1: … exit=0 -> PASS ::` verdict. Runs right after `elf1_launcher` (the FAT volume is
+/// mounted + proven), fully self-contained (a fresh slot, reaped on exit); an honest skip without the SD/
+/// fixture. It can never perturb the 23-fixture battery (its exit rides the generic Proc reap, off every
+/// M6b/sentinel counter).
+fn exec1_witness(_demo_cpu: usize) {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if crate::drivers::block::info().is_none() {
+        serial_println!(":: EXEC1: no SD card found — run-path witness skipped ::");
+        return;
+    }
+    use crate::fs::vfs::{FatBackend, MountTable, KERNEL_PRINCIPAL};
+    let mut mt = MountTable::new();
+    mt.mount("/fat", alloc::boxed::Box::new(FatBackend::new("fat", KERNEL_PRINCIPAL, true)));
+    let path = "/fat/ELFHELLO.ELF";
+    let st = match mt.stat(path) {
+        Ok(s) => s,
+        Err(e) => {
+            serial_println!(":: EXEC1: {} not found on the VFS ({:?}) — skipped ::", path, e);
+            return;
+        }
+    };
+    let bytes = match mt.read(path, 0, st.size as usize) {
+        Ok(b) => b,
+        Err(e) => {
+            serial_println!(":: EXEC1: {} read error ({:?}) -> FAIL ::", path, e);
+            return;
+        }
+    };
+    let n = bytes.len();
+    let deadline = 5 * super::timer::cntfrq();
+    match run_user_image("shell-run", &bytes, deadline) {
+        Ok((RunOutcome::Exited(0), entry)) => serial_println!(
+            ":: EXEC1: run {} — loaded {} bytes, entry {:#x}, exit=0 -> PASS ::",
+            path, n, entry
+        ),
+        Ok((RunOutcome::Exited(code), entry)) => serial_println!(
+            ":: EXEC1: run {} — loaded {} bytes, entry {:#x}, exit={} (want 0) -> FAIL ::",
+            path, n, entry, code
+        ),
+        Ok((RunOutcome::Faulted, _)) => {
+            serial_println!(":: EXEC1: run {} — EL0 program FAULTED -> FAIL ::", path)
+        }
+        Ok((RunOutcome::Timeout, _)) => {
+            serial_println!(":: EXEC1: run {} — EL0 program did not exit in time -> FAIL ::", path)
+        }
+        Err(why) => serial_println!(":: EXEC1: run {} — loader rejected ({}) -> FAIL ::", path, why),
+    }
+}
+
 // =============================================================================================
 // ELF-2: EL0 threading — SYS_THREAD_SPAWN / _JOIN / _EXIT + the multi-core shared-memory threads test.
 //
@@ -9623,6 +9825,10 @@ pub fn u7_launcher(demo_cpu: usize) {
     // page permissions), then drops it to EL0 and confirms it ran (its SYS_REPORT token arrived, its
     // SYS_WRITE message printed). Its own uncounted `:: ELF1: … ::` line; an honest skip without the fixture.
     elf1_launcher(demo_cpu);
+    // EXEC-1: prove the panel `run <path>` path — read ELFHELLO.ELF through the VFS mount table and execute
+    // it via the NEW `run_user_image` loader entry, asserting a clean `exit=0`. Placed right after ELF-1
+    // (same freshly-mounted FAT volume); its own uncounted `:: EXEC1: … ::` line, self-cleaning.
+    exec1_witness(demo_cpu);
     // ELF-2: the EL0-threading test — SYS_THREAD_SPAWN/_JOIN/_EXIT with a shared-memory counter across two
     // worker threads (one co-located, one on a sibling core). In-RAM (no disk), so it can never perturb the
     // fixture battery or the FAT witnesses; its own uncounted `:: EL0: threads test — … ::` line. Placed after
@@ -9711,6 +9917,11 @@ pub fn u7_launcher(demo_cpu: usize) {
     // LAST, fully self-cleaning (leaves only the staged K3 fixtures). Its own uncounted
     // `:: K6-migrate: … PASS ::` line; honest skip on media without a unafs partition.
     k6_migrate_selftest();
+    // VFS-2 (fold, from commit 76762338): the mount-table WRITE witnesses — a create+write+read-back
+    // round-trip through the FAT backend and the native unafs backend. Their own uncounted
+    // `:: vfs2-fat: … ::` / `:: vfs2-native: … ::` lines; honest skip when the backing volume is absent.
+    crate::fs::vfs::vfs2_fat_write_witness();
+    crate::fs::vfs::vfs2_native_write_witness();
     // BANDY-1 M1: the bus v1 subset codec KATs — reply bodies proven byte-compatible with the
     // HOST serializer (tools/bandy-golden captures), native request header+payloads frozen,
     // decode fail-closed at the hard ceiling. Read-only, in-RAM (no disk, no card); its own
