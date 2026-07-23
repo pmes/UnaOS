@@ -18,7 +18,28 @@ QEMU behavior. Newest sitting first.
   pull 5 = variant version-reg offsets / gmux revision protocol variants.
 - iGPU teardown rows unchanged (all-dead, DP_A=0x1C constant).
 
-Boot 2 (sched-status ask-the-chip) verdict pending.
+**Boot 2 — THE CHIP SPOKE. The wall's name is NO_POLL:**
+- `sched-status`: pre-init `err=0 stat=0` → post-init `err=0x00000002` →
+  post-submit `err=0x00000002 stat=0x00000005`. CHAN_TABLE_ERROR EXISTS on
+  GK107 and names the reject: **code 2 = NO_POLL ("validated a channel with
+  POLL_ENABLE, but poll area is disabled")**, fired at channel-VALIDATE time,
+  before any runlist submit.
+- Sharper coordinator read: the hardware REFUSES the validate — sitting #8's
+  dump already showed it (`PFIFO_CHAN[1] 00=0x00002000` after we wrote
+  0x80002000: bit31 was CLEARED on readback). The chip rejects and strips
+  VALID(/POLL) when the poll area isn't configured. Bit30 "not sticking" is
+  the SYMPTOM; the missing "poll area" configuration is the cause.
+- `stat=0x00000005` (SCHED_STATUS, RO) post-submit — undecoded; rnndb gives
+  no bit meanings.
+- rnndb dead-ends on "poll area": the only mentions in gf100_pfifo.xml are
+  the NO_POLL code and the POLL_ENABLE bit. Pull-11 derivation must find the
+  poll-area config (USERD/BAR1 poll machinery or PFIFO config) elsewhere in
+  envytools or empirically.
+- Everything else unchanged (discriminators 0, RAMFC untouched, gmux rows
+  as boot 1).
+
+Sitting #9 complete, both rungs. **First silicon-named root cause of the
+fence wall.** Capture + MANIFEST are the record.
 
 ## Sitting #8 (igpu pull 3 + kepler pull 9, UnaOS-gemini@b3ec47d1, 2026-07-22, fox-metal-r23s1h)
 
