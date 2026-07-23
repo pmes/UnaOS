@@ -1,6 +1,17 @@
 # PROPOSAL — iGPU Pull 5: gmux Protocol Prove
 
-STATUS: PROPOSED
+STATUS: APPROVED WITH AMENDMENTS (2026-07-22 — the 8-bit-vs-32-bit version
+read diagnosis is credible and cleanly explains the #9 gate failure; the
+variant table matches known gmux hardware facts (facts with attribution are
+this lane's standing rule; no GPL code bodies). Amendments:
+A1 — MAX_BRIGHTNESS (0x70, 32-bit) is REQUIRED as the secondary proof row,
+not optional: two independent known-shape reads make the protocol proof
+robust against one register coincidentally looking sane.
+A2 — decode stays gated exactly as in pull 4 (raw-only on unproven), and if
+the gate PASSES, print both the decoded ownership verdict AND the raw bytes
+so the log carries the evidence, not just the conclusion.
+ABI unchanged as stated; land-review law; arch gate stays. Metal owed:
+sitting #10.)
 
 ## The Hardware Facts: gmux Variants & Version Read
 Research into the Linux `apple-gmux.c` driver reveals why the version self-test failed in Sitting #9 despite the handshake yielding stable switch bytes: **the version tuple is read differently depending on the gmux variant**.

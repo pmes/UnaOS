@@ -1,6 +1,22 @@
 # PROPOSAL — Kepler Pull 11: Poll Area & Validate Stick Witness
 
-STATUS: PROPOSED
+STATUS: APPROVED WITH AMENDMENTS (2026-07-22 — Candidate A verified
+(USERD_SNOOP 0xa1c boolean, gf100_pfifo.xml:247 ✓), test plan shape and
+witness design accepted, SCHED_STATUS honesty accepted. Amendments:
+A1 — **Candidate B is CUT from this pull.** Two independent reasons: (i) its
+claimed USERD meaning is sourced from nouveau — that's the forbidden category
+on this lane, and it taints the derivation record; (ii) the rnndb comment
+shows IDLE_FILTER has a LIVE default (0x0020 on GK104) — writing 1 clobbers
+it and the proposed "restore 0" clobbers it differently. B may return in a
+future pull only with an envytools/hwdocs citation and a
+read-original/restore-original discipline.
+A2 — Candidate A gets the same restore discipline anyway: read USERD_SNOOP's
+original value and print it BEFORE writing 1; on witness failure restore the
+READ value, not an assumed 0.
+A3 — success-path expected outputs stand, except the fence value: the code's
+fence constant is 0xdeadbeef (not "0xFACE0001") — quote what the code
+actually writes so the sitting log can grep for it.
+Full-knob land-review law; arch gate stays. Metal owed: sitting #10.)
 
 This pull targets the `CHAN_TABLE_ERROR = 2 (NO_POLL)` wall observed in Sitting #9. The hardware rejects the channel validation because it detects that `POLL_ENABLE` (bit 30) is set, but the global "poll area" is disabled. The hardware then strips bits 30 and 31 from `PFIFO_CHAN[1].CHAN`, rendering the channel invalid and preventing scheduling.
 
