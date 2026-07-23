@@ -19,3 +19,13 @@ unaOS is a workbench, not a consumption device.
 ## 4. Dark Mode by Default (Ecology)
 * **OLED Black:** The default theme uses true black (`#000000`) to turn off pixels on OLED screens (Pixel 10, modern laptops). This saves energy.
 * **Accent Colors:** Used strictly to indicate status (Green = Good, Yellow = Busy, Red = Error). No decorative colors.
+
+## 5. The App-Input Watchdog (never trap the keyboard)
+A concrete enforcement of the §1 promise "even if the app is frozen … the window manager must respond." While a full-screen app owns the screen (the GUI-CLICK-2 `SCREEN_APP_ACTIVE` gate in `main.rs`), the Pi input router stops forwarding events into `GUI_CHANNEL` and leaves them in `pal::EVENT_QUEUE` for the app's own drain. That gate is correct while the app is *live*, but on its own it has no escape hatch: a wedged app would trap the keyboard until reboot.
+
+`kernel/src/gui_watchdog.rs` is that escape hatch — a self-contained, both-arch state machine (no dependency on the router internals in `main.rs`/`pal.rs`):
+* **Mode-transition witnesses** — `[gui] app-enter t=<s>s` and `[gui] app-exit t=<s>s dur=<s>s wedged=<bool>`, timestamped from the monotonic `clock::uptime_secs()` seam, make every screen hand-off self-dating on serial.
+* **Liveness heartbeat** — the active app's drain loop calls `note_progress()` each pass.
+* **The watchdog** — `poll()`, run on the status/pump cadence, returns `true` (and prints a latched `[gui] watchdog app wedged <n>s … — returning input to shell`) once the app has made no drain progress for `WATCHDOG_TIMEOUT_SECS` (5 s). The caller clears `SCREEN_APP_ACTIVE`, and the router resumes delivering input to the shell.
+
+The state machine and witnesses land with the module; the call-site hooks live in the off-limits `main.rs` (`on_app_enter`/`on_app_exit` around `dispatch_command`, `poll()` in the status/pump cadence) and `pal.rs` (`note_progress()` in `pump_and_poll`), and are wired in a follow-up arc.
