@@ -713,9 +713,20 @@ pub fn run_crystal(pal: &mut TargetPal, mode: Mode) {
         }
         // Pointer motion → rotation, but ONLY while dragging (a button is held). Free pointer motion
         // just moves the cursor; the crystal rotates only when the user drags it.
+        //
+        // DRAG-FEEL (P46 metal, Peter: "drag works awkwardly, arrows work well"): the raw fold below
+        // applied one pointer pixel as one brad — a full panel-width drag spun the crystal ~w/256 ≈
+        // 7 revolutions, so any real drag jerked past control. Map travel to rotation so a full
+        // panel-width horizontal drag ≈ ONE revolution (256 brad) and a full-height vertical drag
+        // likewise (metrics-derived, no magic constant): horizontal spins (yaw), vertical tilts
+        // (pitch, sign unchanged — drag down tilts the top toward you, matching the idle tumble).
+        // Clamp the per-frame step so a single big accumulated burst can't jolt.
+        const DRAG_MAX_STEP: i32 = 12; // brad/frame cap (~1/21 rev) — smooths a fast flick
         if drag {
-            yaw_step += gi.mdx;
-            pit_step += gi.mdy;
+            let yaw_d = (gi.mdx * 256 / w.max(1)).clamp(-DRAG_MAX_STEP, DRAG_MAX_STEP);
+            let pit_d = (gi.mdy * 256 / h.max(1)).clamp(-DRAG_MAX_STEP, DRAG_MAX_STEP);
+            yaw_step += yaw_d;
+            pit_step += pit_d;
         }
 
         // Manual input this frame steps by the user; an idle frame keeps the auto-tumble.
@@ -769,21 +780,29 @@ pub fn run_crystal(pal: &mut TargetPal, mode: Mode) {
         let cx1 = (bx1 + PAD).clamp(0, w) as usize;
         let cy1 = (by1 + PAD).clamp(0, h) as usize;
         let cur_crystal = (cx0, cy0, cx1.saturating_sub(cx0), cy1.saturating_sub(cy0));
-        // Erase the union of previous + current crystal footprints (frame 0 already cleared all).
+        // VUG-FPS-3: erase the crystal's VACATED footprint (previous bbox) and background-fill the
+        // CURRENT footprint as SEPARATE damage rects — not one prev∪curr union rect. This is the
+        // P46 union-growth / rects=16 fix: unioning prev+curr into a single box means a drag or zoom
+        // that jumps the crystal (or the auto-tumble's wide/tall extremes) presents ONE box spanning
+        // the empty space BETWEEN the two positions, and that whole box is background-filled AND
+        // flushed every frame — the union that "grows and never shrinks", ballooning both the raster
+        // fill and the flush bytes. As two rects the DamageSet still MERGES them while they overlap
+        // (the steady auto-tumble, where prev≈curr — byte-identical to the old single-union erase),
+        // but keeps them tight and disjoint when the crystal jumps, so the dead gap between an old
+        // and new position is never filled or flushed. Frame 0's full clear_screen seeds the first
+        // backdrop, so the per-frame fills only run from frame 1.
         if frame != 0 {
-            let (ex0, ey0, ex1, ey1) = match prev_crystal {
-                Some((px0, py0, pw, ph)) => {
-                    (cx0.min(px0), cy0.min(py0), cx1.max(px0 + pw), cy1.max(py0 + ph))
-                }
-                None => (cx0, cy0, cx1, cy1),
-            };
-            if ex1 > ex0 && ey1 > ey0 {
-                pal.draw_rect(ex0, ey0, ex1 - ex0, ey1 - ey0, BG);
+            if let Some((px0, py0, pw, ph)) = prev_crystal {
+                pal.draw_rect(px0, py0, pw, ph, BG); // erase where the crystal was
             }
             // Erase the cursor's previous footprint BEFORE redraw (so the crystal/HUD painted below
             // can cover it) — the dirty-rect path no longer wipes the whole panel each frame.
             if let Some((qx, qy, qw, qh)) = prev_cursor {
                 pal.draw_rect(qx, qy, qw, qh, BG);
+            }
+            // Background behind the crystal's current position (the triangles paint over it).
+            if cur_crystal.2 > 0 && cur_crystal.3 > 0 {
+                pal.draw_rect(cx0, cy0, cur_crystal.2, cur_crystal.3, BG);
             }
         }
         prev_crystal = Some(cur_crystal);
