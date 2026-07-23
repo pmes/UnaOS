@@ -1,4 +1,4 @@
-STATUS: PROPOSED
+STATUS: APPROVED (2026-07-23 — clean match to brief, no amendments; one note: `hits=N` in the done line counts ALL hits found, not just the ≤64 printed)
 
 # PROPOSAL — kepler-display pull 4: EVO core-channel read-out
 
