@@ -1,6 +1,17 @@
 # PROPOSAL — iGPU Pull 4: gmux Indexed Protocol & Decode
 
-STATUS: PROPOSED
+STATUS: APPROVED WITH AMENDMENTS (2026-07-22 — handshake sequence, version
+self-test gate, register set, decode table, and timeout fallback all accepted
+as specified; port/index/protocol facts and decode values are consistent with
+the known apple-gmux hardware facts. Amendments:
+A1 — the version self-test is a GATE, not a row: if version reads implausible
+(0x00/0xFF/identical bytes), print the raw bytes with a "PROTOCOL UNPROVEN"
+marker and do NOT print decoded meanings for switch/power — raw only. No
+decode output from an unproven protocol.
+A2 — ABI law as listed, plus: the main.rs handoff keeps its
+intel-ivb+x86_64 arch gate (dropped twice; the keep-this comment is in the
+file), and the handshake timeouts are iteration-bounded like every poll on
+this branch. Metal owed: sitting #9.)
 
 ## The Hardware Facts
 Sitting #8 proved that the Apple gmux on this board ignores classic PIO reads but responds to the Indexed I/O ports. However, reading the `VALUE` port (`0x7C2`) immediately after writing to the `INDEX` port (`0x7D0`) yielded identical garbage values (`0x39` at boot, `0x03` in the kernel) across completely different registers (like `0x10` and `0x50`). 

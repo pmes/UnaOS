@@ -1,6 +1,17 @@
 # PROPOSAL — Kepler Pull 10: Sched-Precondition & Reject Reason
 
-STATUS: PROPOSED
+STATUS: APPROVED WITH AMENDMENTS (2026-07-22 — error-readback-first shape,
+invalidate→modify→validate ordering, and the bit30 hypothesis all accepted;
+the honest "no USERD-enable register in rnndb" is noted. Amendments:
+A1 — NO undocumented-register write fuzzing in this pull: if the readback
+says NO_POLL, print it and STOP; the 0x2200-0x22FF fuzz idea is a separate
+proposal needing its own approval (blind writes to undocumented PFIFO config
+on the only bench GPU is not a rider).
+A2 — CHAN_TABLE_ERROR/SCHED_STATUS carry no GK104- variant tag in the XML and
+sit beside GF100:GK104-only registers; they may not exist on GK107. Treat a
+0/poison readback as "register absent" and SAY so in the serial output —
+don't canonize a zero as "no error".
+Full-knob land-review law; keep the main.rs arch gate. Metal owed: sitting #9.)
 
 This proposal addresses the final Kepler scheduling precondition gate. As verified in Sitting #8, the runlist is successfully read (`playlist_rd=0x2013`), but the hardware refuses to schedule the channel. We will implement strict `CHAN_TABLE_ERROR` instrumentation to ask the hardware directly *why* it rejects the channel, while simultaneously correcting the `PFIFO_CHAN` enablement ordering to satisfy known hardware semantics.
 
