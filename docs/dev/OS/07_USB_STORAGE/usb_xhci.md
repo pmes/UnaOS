@@ -317,6 +317,37 @@ convention at every interrupt-IN / control-IN / descriptor arming site. Witness:
 `[piusb34] LBA0 re-read post-invalidate: … <first-16 bytes>` (P44 zeros → P45 real
 boot sector).
 
+### 5b. DMA-address audit — the inbound-window theory is REFUTED (PIUSB-35)
+
+P45 metal **refuted** the PIUSB-34 cache theory: with the clean-before-doorbell +
+post-invalidate in place, READ(10) LBA0 *still* returned all-zero with a Passed /
+`residue=0` CSW, while READ CAPACITY(10) still returned correct geometry and the
+last-sector RMW candidates (last, −8, −64) all reported `Err(Stall)` (the new stall
+recovery works — the pipe survives and enumeration completes). Prime new suspect:
+the BCM2711 PCIe RC **inbound window / DMA address** — if the deferred-phase heap sat
+above the RC's reachable window (or needed a `dma-ranges` offset we don't apply), the
+VL805 would DMA the block into nowhere (stale zeros) while short control transfers on
+low buffers still worked.
+
+**Static audit refutes it.** The aarch64 bare-metal kernel heap is placed at physical
+`0x0200_0000` (32 MiB), 64 MiB long (`boot::MEM_REGIONS`; `HEAP_SIZE` = 48 MiB), RAM
+is identity-mapped (VA==PA in the low 1 GiB Normal block), and `init_heap_raw` hands
+out addresses straight from that physical region. Every DMA structure — transfer
+rings, DCBAA, the event ring, the CBW buffer (DMA-**read** by the device) and the CSW
+buffer (DMA-**written** by the device, returning **Passed**) — comes from the *same*
+32–96 MiB pool as `scsi_data_buffer`, which is deep inside the RC inbound window
+(RAM@0, 4 GiB, `dma-ranges` 1:1, offset 0; see `piusb::M1` RC_BAR2) and far below the
+classic <3 GiB VL805 DMA quirk boundary. A working CSW-write to that pool cannot
+coexist with an unreachable data-write to the same pool, and READ CAPACITY reuses the
+identical buffer (killing the offset variant too). No address fix is warranted.
+
+Witness (P46, aarch64): `[piusb35] databuf phys=… in_trb=… cbw=… csw=… |
+rc-inbound=[0x0,0x100000000) offset=0 | databuf in_window=… below_3G=… — … address
+theory REFUTED on-metal …`. When P46 confirms `in_window=true below_3G=true`, the
+address theory is dead on-metal and the discriminator returns to transfer
+length / TD-shape (READ CAPACITY 8 B works, READ(10) 512 B zeros) or a genuine
+device-side cause — *not* the DMA address.
+
 ---
 
 ## 6. Enumeration robustness (metal-informed)

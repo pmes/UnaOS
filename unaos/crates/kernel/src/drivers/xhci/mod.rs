@@ -4418,6 +4418,46 @@ impl XhciController {
             Err(e) => { serial_println!("xHCI: storage bring-up failed: {:?}", e); return; }
         }
 
+        // PIUSB-35: decisive DMA-address witness. P45 refuted the cache theory (the LBA0 read still
+        // returns all-zero with a Passed/residue=0 CSW even with PIUSB-34's clean-before-doorbell +
+        // post-invalidate), so the next suspect was the BCM2711 PCIe RC inbound window / DMA address:
+        // if the deferred-phase heap sat above the RC's reachable window (or needed a dma-ranges
+        // offset we don't apply), the VL805 would DMA the block into nowhere → stale zeros, while
+        // short control transfers using low buffers still worked. STATIC AUDIT REFUTES this: the
+        // aarch64 heap is placed at phys 0x0200_0000 (32 MiB), 64 MiB long (boot::MEM_REGIONS), RAM is
+        // identity-mapped (VA==PA in the low 1 GiB block), and init_heap_raw hands out from that
+        // physical region. The rings/DCBAA/event ring, the CBW buffer (DMA-READ by the device) and the
+        // CSW buffer (DMA-WRITTEN by the device — it returns Passed) ALL come from the same 32–96 MiB
+        // pool as scsi_data_buffer, and the RC inbound window is RAM@0 / 4 GiB / dma-ranges 1:1
+        // (offset 0; see piusb::M1 RC_BAR2). A working CSW-write to that pool cannot coexist with an
+        // unreachable data-write to the same pool. This witness prints the live physical addresses so
+        // P46 confirms on-metal that the data DMA target is in-window and below 3 GiB, retiring the
+        // address theory and redirecting to the length/TD-shape (or genuine device-side) discriminator.
+        #[cfg(target_arch = "aarch64")]
+        {
+            let s = &self.slots[self.storage_slot as usize];
+            let databuf = s.scsi_data_buffer.map(|p| p as u64).unwrap_or(0);
+            let cbw = s.cbw_buffer.map(|p| p as u64).unwrap_or(0);
+            let csw = s.csw_buffer.map(|p| p as u64).unwrap_or(0);
+            let in_trb = s.bulk_in_ring.as_ref().map(|r| r.get_ptr()).unwrap_or(0);
+            // BCM2711 RC inbound window: RAM base 0, 4 GiB, dma-ranges 1:1 (cpu→pci offset 0).
+            const RC_INBOUND_BASE: u64 = 0;
+            const RC_INBOUND_SIZE: u64 = 0x1_0000_0000; // 4 GiB
+            const VL805_DMA_CEILING: u64 = 0xC000_0000; // classic <3 GiB VL805 DMA quirk boundary
+            let in_window = databuf >= RC_INBOUND_BASE && databuf < RC_INBOUND_BASE + RC_INBOUND_SIZE;
+            let below_3g = databuf < VL805_DMA_CEILING;
+            serial_println!(
+                ":: PIUSB: [piusb35] databuf phys={:#x} in_trb={:#x} cbw={:#x} csw={:#x} | rc-inbound=[{:#x},{:#x}) offset=0 (1:1) | databuf in_window={} below_3G={} — CBW(DMA-read)+CSW(DMA-write→Passed) share this pool; address theory {} ::",
+                databuf, in_trb, cbw, csw,
+                RC_INBOUND_BASE, RC_INBOUND_BASE + RC_INBOUND_SIZE,
+                in_window, below_3g,
+                if in_window && below_3g {
+                    "REFUTED on-metal (data DMA target reachable — look at length/TD-shape or device-side)"
+                } else {
+                    "HOLDS — data buffer is OUT of the reachable inbound window; move BOT buffers to a low DMA pool"
+                });
+        }
+
         // Sanity read of LBA 0.
         match self.storage_read10(0, 1) {
             Ok(res) => {
