@@ -603,3 +603,34 @@ The attribute record audit (V3D-29) exonerated the structure; the executed-words
 ## 17. P31b metal result — V3D-31 corrected, V3D-32 2-way bit fix (V3D-32)
 
 **P31b: V3D-31's 4-way bit REFUTED on metal** (4way=1 confirmed in [v3d30], verdict still store-never-issued). **V3D-32 root cause** (`d0c3792c`): the probe is threads=2 and Mesa's record encoding has a separate 2-WAY bit (bit1 of the flag group; 4-way=bit0, propNaN=bit2); declaring 4-way for a 2-thread layout mis-schedules the terminal segment. **Fix = 2-way bit set, 4-way clear**, PROBE_WORDS untouched; plus [v3d32] 12-slot uniform-stream witness (static audit 12/12 vs artifact, incl. u4=UBO_ADDR scratch, u5=0xFFFFFFFC write config). **If P32 still store-never-issued with 2way=1 + 12/12 PASS: remaining suspect = tmuau write-config semantics** (config-in-stream vs tmuc register) vs the working render TMU path.
+
+## 18. The pool readback missed the post-bin L2T write-back (V3D-42)
+
+**P40 flipped the whole artifact investigation.** The [v3d41] PTB witness read `BPCA=0x001a5000`
+against `pool base 0x001a2000` — the PTB's binning-primitive-list write pointer had **advanced 0x3000
+bytes off the pool base**, i.e. the binner *emitted primitive-list bytes*. Yet `bin_pool_witness`
+(§13's sibling, running one step earlier) read the pool head as all-zero, and the canaries survived
+across every prior sitting. The binner was writing; the CPU readback could not see it.
+
+**Root cause — the same defect V3D-28 (§13) fixed for the probe scratch, left unfixed on the pool
+readback.** The binner's pool / tile-state writes land in the GPU's L2T cache, not DRAM. `bin_pool_witness`
+invalidated the *CPU* D-cache and read DRAM — but the only post-bin L2T write-back ran **after** it (the
+render pre-kick flush at the CT1 submit, or the probe's own V3D-28 flush that guards only the scratch
+read that follows it). So the pool read observed the stale pre-bin zero-fill in DRAM while the binner's
+bytes sat in L2T. The CPU read path was suspect, exactly as the P40 BPCA/pool contradiction implied — not
+the binner, and not an address mismatch (the V3D-MMU identity map makes the CT0QMA iova and the CPU-read
+VA the *same physical page*, now printed side by side by the [v3d42] address line).
+
+**Fix (`bin_pool_witness`).** Before the CPU reads the pool / tile-state, **flush the V3D L2T
+(write-back + invalidate)** so the binner's writes reach DRAM, then invalidate the CPU's stale lines and
+read. The witness now captures a **pre-flush (stale) and post-flush** head for both the pool and the
+tile-state, and prints the GPU-given iova next to the CPU-read VA — a zeros→bytes flip across the flush is
+the direct signature of the L2T-parked writes. Applies to all three callers (probe, M4, battery) by
+construction. QEMU raspi4b has no V3D block, so the witness is dormant there — **P41 metal decides**.
+
+**Expected P41 witnesses.** `[v3d42] … pool addr — GPU iova (CT0QMA)=0x001a2000 CPU read VA=0x001a2000
+(SAME physical page …)`; and the pool/tile-STATE lines showing `pre-L2T-flush = 00 …` → `post-flush = <nonzero>`
+if the binner's 0x3000-byte emission (BPCA evidence) is real — which would retire the whole seven-layer
+"empty bin" investigation as a readback artifact. Note the **separate, un-conflated** downstream fact: P40's
+`BFC Δ0` (no bin frame *completed*) is not addressed here — the readback fix is orthogonal to whether the
+PTB frame ran to completion.

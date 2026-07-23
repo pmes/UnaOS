@@ -3282,38 +3282,81 @@ fn bin_mem_prekick_witness(tag: &str, qma_w: u32, qms_w: u32, qts_w: u32) {
     );
 }
 
-/// PI-V3D-13 post-bin witness: CPU-read the tile-alloc pool head and give the one-line verdict the
-/// brief asks for — did the BINNER actually write its output into the pool? The CPU zero-filled and
-/// cleaned the pool pre-kick, so its D-cache holds zero lines over the head; clean+invalidate the
-/// head line first (clean is a no-op — the lines were cleaned at publish — and the invalidate makes
-/// this read observe the binner's DRAM write). Nonzero head bytes = the binner wrote a tile list.
-fn bin_pool_witness(tag: &str) -> bool {
-    cache::clean_invalidate_range(arena_phys() + OFF_BIN_TILEALLOC, 64);
+/// Read `n` (≤8) bytes from the arena at `off` into a fixed 8-byte buffer WITHOUT any cache
+/// maintenance — a raw CPU load through whatever the D-cache currently holds. Used to capture the
+/// PRE-flush (possibly stale) view for the V3D-42 re-read.
+fn arena_head8(off: usize) -> [u8; 8] {
     let arena = &raw const V3D_ARENA;
-    let mut head = [0u8; 8];
+    let mut b = [0u8; 8];
     unsafe {
-        for (i, h) in head.iter_mut().enumerate() {
-            *h = (*arena).bytes[OFF_BIN_TILEALLOC + i];
+        for (i, h) in b.iter_mut().enumerate() {
+            *h = (*arena).bytes[off + i];
         }
     }
-    let wrote = head.iter().any(|&b| b != 0);
-    serial_println!(
-        ":: V3D: {} tile-alloc pool[0..8] = {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} — {} ::",
-        tag, head[0], head[1], head[2], head[3], head[4], head[5], head[6], head[7],
-        if wrote { "nonzero: the binner WROTE the pool" } else { "all zero: the binner never wrote the pool" }
-    );
-    // PI-V3D-17 (V3D-16 ask): dump the tile-STATE array head (CT0QTS) alongside the pool. The PTB
-    // writes per-tile state (TSDA) here as it bins; nonzero here corroborates the pool witness.
+    b
+}
+
+/// PI-V3D-13 post-bin witness — V3D-42 corrected. Did the BINNER actually write its output into the
+/// tile-alloc pool / tile-state? The subtlety this arc fixes: the binner's writes land in the GPU's
+/// L2T cache, NOT DRAM — the PTB's `tmuwt`/store acceptance only reaches L2T (exactly the V3D-28
+/// mechanism proven for the probe-scratch TMU store). This witness previously read the pool BEFORE any
+/// post-bin L2T write-back (the render pre-kick flush ran AFTER it), so the CPU invalidated its own
+/// cache and read stale-zero DRAM while the binner's bytes sat in L2T — the P40 contradiction (BPCA
+/// advanced 0x3000 off the pool base, yet every CPU pool read was zero). The read path was suspect,
+/// not the binner. Fix: FLUSH the V3D L2T (write-back + invalidate) so the binner's pool/tile-state
+/// writes reach DRAM, THEN invalidate the CPU's stale copy and read. The GPU-given iova (CT0QMA =
+/// arena_phys()+OFF_BIN_TILEALLOC, V3D-MMU-identity-mapped) and the CPU-read VA are printed side by
+/// side — under the identity map they are the SAME physical page, which is the point the P40 evidence
+/// forced us to prove. A pre-flush (stale) re-read is captured first so the log shows the L2T flush
+/// flipping zeros → binner bytes. Nonzero head = the binner wrote a tile list.
+fn bin_pool_witness(tag: &str) -> bool {
+    let pool_iova = (arena_phys() + OFF_BIN_TILEALLOC) as u32; // exactly what was written to CT0QMA
+    let ts_iova = (arena_phys() + OFF_TILESTATE) as u32; // exactly what was written to CT0QTS (sans ENABLE)
+
+    // (1) PRE-flush snapshot: the stale view the un-fixed witness reported. Invalidate the CPU line so
+    // this reflects current DRAM (not a stale CPU line), but do NOT touch the GPU L2T yet — if the
+    // binner's bytes are still parked in L2T this reads zero, and the post-flush read below flips it.
+    cache::clean_invalidate_range(arena_phys() + OFF_BIN_TILEALLOC, 64);
     cache::clean_invalidate_range(arena_phys() + OFF_TILESTATE, 8);
-    let mut ts = [0u8; 8];
-    unsafe {
-        for (i, t) in ts.iter_mut().enumerate() {
-            *t = (*arena).bytes[OFF_TILESTATE + i];
-        }
-    }
+    let pool_pre = arena_head8(OFF_BIN_TILEALLOC);
+    let ts_pre = arena_head8(OFF_TILESTATE);
+
+    // (2) THE V3D-42 FIX: write the V3D L2T back to DRAM so the binner's pool + tile-state writes are
+    // visible to the CPU, then drop the CPU's now-stale zero lines and re-read from DRAM truth.
+    invalidate_gpu_caches("L2T write-back (post-bin pool readback — drain the binner's writes to DRAM)");
+    cache::clean_invalidate_range(arena_phys() + OFF_BIN_TILEALLOC, 64);
+    cache::clean_invalidate_range(arena_phys() + OFF_TILESTATE, 8);
+    let pool = arena_head8(OFF_BIN_TILEALLOC);
+    let ts = arena_head8(OFF_TILESTATE);
+
+    let wrote = pool.iter().any(|&b| b != 0);
+    // Address witness: the GPU was handed `pool_iova`; the CPU reads `cpu_va`. Under the V3D-MMU
+    // identity map these name the same physical page — printing both lets the metal log confirm the
+    // binner and the CPU touch the same memory (the P40 same-page question, settled inline).
+    let cpu_va = unsafe { core::ptr::addr_of!((*(&raw const V3D_ARENA)).bytes[OFF_BIN_TILEALLOC]) } as usize;
     serial_println!(
-        ":: V3D: {} tile-STATE[0..8] = {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} — {} ::",
-        tag, ts[0], ts[1], ts[2], ts[3], ts[4], ts[5], ts[6], ts[7],
+        ":: V3D: [v3d42] {} pool addr — GPU iova (CT0QMA)={:#010x} CPU read VA={:#010x} ({}) | tile-STATE iova (CT0QTS)={:#010x} ::",
+        tag, pool_iova, cpu_va,
+        if cpu_va == pool_iova as usize { "SAME physical page (identity map)" } else { "MISMATCH — GPU and CPU address different pages!" },
+        ts_iova
+    );
+    serial_println!(
+        ":: V3D: {} tile-alloc pool[0..8] pre-L2T-flush = {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} → post-flush = {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} — {} ::",
+        tag,
+        pool_pre[0], pool_pre[1], pool_pre[2], pool_pre[3], pool_pre[4], pool_pre[5], pool_pre[6], pool_pre[7],
+        pool[0], pool[1], pool[2], pool[3], pool[4], pool[5], pool[6], pool[7],
+        if wrote {
+            if pool_pre.iter().all(|&b| b == 0) { "nonzero AFTER L2T flush: the binner WROTE the pool (writes were parked in L2T — V3D-42)" }
+            else { "nonzero: the binner WROTE the pool" }
+        } else { "all zero: the binner never wrote the pool" }
+    );
+    // PI-V3D-17 (V3D-16 ask): the tile-STATE array head (CT0QTS). The PTB writes per-tile state (TSDA)
+    // here as it bins; nonzero corroborates the pool witness. Same pre/post-flush re-read.
+    serial_println!(
+        ":: V3D: {} tile-STATE[0..8] pre-L2T-flush = {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} → post-flush = {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} — {} ::",
+        tag,
+        ts_pre[0], ts_pre[1], ts_pre[2], ts_pre[3], ts_pre[4], ts_pre[5], ts_pre[6], ts_pre[7],
+        ts[0], ts[1], ts[2], ts[3], ts[4], ts[5], ts[6], ts[7],
         if ts.iter().any(|&b| b != 0) { "nonzero: the PTB wrote tile-state" } else { "all zero: no tile-state written" }
     );
     wrote
