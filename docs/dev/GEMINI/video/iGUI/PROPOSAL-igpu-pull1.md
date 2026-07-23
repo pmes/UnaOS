@@ -1,4 +1,8 @@
-STATUS: PROPOSED — awaiting review/approval
+STATUS: APPROVED WITH AMENDMENTS (2026-07-22 — see REVIEW-igpu-pull1.md in
+this directory; the amendments are binding: DSPxSURF holds a GGTT offset, not
+a CPU physical address, and milestone 1 must also dump stride/tiling/PIPESRC.
+Milestone 1 read-only pass may proceed as amended; the repoint milestone needs
+the GGTT answer from metal first.)
 
 # PROPOSAL — iGPU (Intel HD 4000) Pull 1: Read-only Probe & Framebuffer Repoint
 

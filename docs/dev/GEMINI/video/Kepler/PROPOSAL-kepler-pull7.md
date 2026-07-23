@@ -1,4 +1,12 @@
-STATUS: PROPOSED
+STATUS: APPROVED (2026-07-22 — reviewer verified every rnndb citation against
+envytools master: PSUBFIFO 0x40000/stride 0x2000/len 3 ✓, SUBFIFO_ENG_MASK
+0x390 len 3 GK104- ✓, +0x108=INTR ✓, +0x120=CH with GK104 CHID 0-11/ACTIVE
+bit 13 ✓, IB_PUT +0x00 / IB_GET +0x14 ✓, PMC.ENABLE bit 8 PFIFO ✓,
+PMC.SUBFIFO_ENABLE 0x204 ✓, PFIFO-internal 0x2200/0x2204 GF100:GK104-only ✓.
+The 40108=INTR reframe — "bad-read zero" was a naturally-zero interrupt
+register, not a wrong base — is the best kind of wall demolition: the base was
+right all along and we were reading the wrong register. Proceed exactly as
+written; instrumentation commit first, sitting #6 falsifies.)
 
 # PROPOSAL — Kepler wall-2 (PFIFO/PBDMA fence), pull 7 arc intro
 
