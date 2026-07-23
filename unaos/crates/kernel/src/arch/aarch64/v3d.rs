@@ -2566,10 +2566,29 @@ fn probe_job() {
     // means the thread died before [9] and the store word never executed — chase thread lifetime/dispatch.
     clear_mmu_fault_latch("v3d28 pre-probe");
     invalidate_gpu_caches("L2T flush (probe bin pre-kick)");
+    // ── [v3d40] the probe kick was the ONE CT0 kick without a CT0CA-progression witness ──────────────
+    // V3D-40 root fact: after v3d36 (CLs byte-identical), v3d38 (records field-identical bar cs_uniforms)
+    // and v3d39 (M4's OWN CS program in the probe slot) the probe STILL reads valid_instr=0 while M4 —
+    // same CLE, same registers, byte-identical CL — dispatches (valid_instr=57). The variable left is no
+    // longer WHAT the job says but HOW/WHERE/WHEN it runs. The probe is the FIRST CT0 bin kick of the boot
+    // (M3's clear_job kicks CT1 only); M4 is the SECOND. Yet the probe kick never captured the CT0CS/CT0CA
+    // progression the M4 kick has carried since PI-V3D-13 — so we have never known whether the probe's CLE
+    // even ADVANCES through its control list (CT0CA: BA→EA) or is silently refused at the GO (CT0CA stuck
+    // at BA / CT0CS ERROR). Instrument the probe kick to the exact shape as M4's (pre / immediately-after-
+    // GO / at-idle snapshots of CT0CS + CT0CA, the kick-register echo, ct0_ran, and the pool witness) so
+    // the next metal boot DIFFS the two kicks directly: if the probe's CT0CA reaches EA like M4's, the CLE
+    // ran the list and the wall is downstream (dispatch/QPU); if CT0CA stays at BA, the GO was refused and
+    // the wall is the kick/CLE-state itself (needs a reset/flush between the M3 CT1 job and the first CT0
+    // bin). Reads only — no shader-visible state is touched.
+    let ct0_cs_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CS);
+    let ct0_ca_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CA);
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QMA, tile_alloc);
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QMS, BIN_TILEALLOC_BYTES as u32);
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QTS, ts | V3D_CLE_CT0QTS_ENABLE);
     dsb();
+    // [v3d40] echo the tile-memory registers before the GO — same check M4's kick runs, so a probe-vs-M4
+    // discrepancy in what the slots latch is visible in the log.
+    bin_mem_prekick_witness("v3d40 PROBE", tile_alloc, BIN_TILEALLOC_BYTES as u32, ts | V3D_CLE_CT0QTS_ENABLE);
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QBA, bin_ba);
     dsb();
     // Arm the execution trio (src14/16/32) + TMU battery (src24/17/25) so they span the probe bin. This is
@@ -2577,11 +2596,31 @@ fn probe_job() {
     pctr_setup_cs_witness();
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QEA, bin_ea); // GO
     dsb();
+    // [v3d40] tight kick witness: sample CT0CS + CT0CA the instant after the GO write — a started CLE
+    // latches CTRUN here and CT0CA begins advancing off BA. This is the snapshot M4's kick has and the
+    // probe's never did.
+    let ct0_cs_kicked = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CS);
+    let ct0_ca_kicked = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CA);
     let idled = wait_bit_clear(V3D_CORE0_BASE, V3D_CLE_CT0CS, V3D_CLE_CT1CS_CTRUN, "CT0 probe bin");
+    let ct0_cs_done = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CS);
+    let ct0_ca_done = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CA);
+    let probe_ran = ct0_ran(ct0_cs_pre, ct0_cs_kicked, ct0_cs_done, ct0_ca_done, bin_ba, bin_ea);
+    let ca_advanced = ct0_ca_done != 0 && ct0_ca_done != bin_ba && ct0_ca_done >= bin_ba && ct0_ca_done <= bin_ea;
+    serial_println!(
+        ":: V3D: [v3d40] PROBE bin clue — CT0CS pre={:#010x} kicked={:#010x} done={:#010x} CT0CA pre={:#010x} kicked={:#010x} done={:#010x} (BA={:#010x} EA={:#010x}) ran={} idled={} — CT0CA {} (advance {}; if BA-stuck the GO was refused, if ==EA the CLE ran the list and the wall is downstream) ::",
+        ct0_cs_pre, ct0_cs_kicked, ct0_cs_done, ct0_ca_pre, ct0_ca_kicked, ct0_ca_done,
+        bin_ba, bin_ea, probe_ran as u32, idled as u32,
+        if ct0_ca_done == bin_ea { "reached EA" } else if ct0_ca_done == bin_ba || ct0_ca_done == 0 { "stuck at BA/0" } else { "mid-list" },
+        ca_advanced as u32
+    );
     // Read the battery now the probe has idled — THE decisive witness for V3D-35. valid_instr says how far
     // the probe thread got (reached the [9] store word or died before it); tcache_access says whether the
     // TMU saw the store (launched at [9], independent of the post-switch tail per the reconciliation above).
     pctr_read_cs_witness("v3d35 PROBE bin");
+    // [v3d40] did the PROBE binner write its tile-alloc pool + tile-state, exactly as M4's post-bin
+    // witness reports? A probe that reached EA (CT0CA above) but left the pool all-zero — while M4's pool
+    // goes nonzero — localises the divergence to the bin run itself, not the kick.
+    bin_pool_witness("v3d40 PROBE post-bin");
     let mmu_ctl = mmio_read(V3D_HUB_BASE, V3D_MMU_CTL);
     let fault = mmu_ctl
         & (V3D_MMU_CTL_PT_INVALID | V3D_MMU_CTL_WRITE_VIOLATION | V3D_MMU_CTL_CAP_EXCEEDED);
