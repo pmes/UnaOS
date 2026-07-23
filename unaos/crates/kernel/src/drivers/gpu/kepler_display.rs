@@ -15,7 +15,7 @@
 // uncited register addresses; bounded polls.
 
 use super::detect::GpuInfo;
-use super::kepler::{mmio_read, regs, VramAllocator};
+use super::kepler::{mmio_read, mmio_write, regs, VramAllocator};
 
 /// Sentinel value for a read that returned the BAD-read pattern (BAR0 unmapped
 /// or device-absent 0xFFFFFFFF) or literal zero from a register we expected to
@@ -224,83 +224,102 @@ pub unsafe fn takeover_display(
     let capped = if hits > 64 { "true" } else { "false" };
     serial_println!(":: kdisp: evo-scan done range=610000-613FFC hits={} capped={} ::", hits, capped);
 
-    // ── Phase 2: Assembly-State Hunt (Pull 6) ──────────────────────────────
+    // ── Phase 2: Assembly Write + UPDATE Latch (Pull 7) ────────────────────
     if !cfg!(feature = "nvidia-kepler-takeover") {
         serial_println!(":: kdisp: trace-only — takeover feature not set ::");
         return None;
     }
 
-    // Milestone 1: The gap region (0x610000..=0x6103FC)
-    let mut m1_0x6101e0_val = 0;
-    for pass in 0..2 {
-        let mut rows = 0;
-        for addr in (0x610000..=0x6103FC).step_by(4) {
-            let val = mmio_read(bar0, addr);
-            serial_println!(":: kdisp: gap pass{} off={:03X} val={:08X} ::", pass, addr - 0x610000, val);
-            if pass == 0 && addr == (regs::NV_PDISPLAY_BASE + 0x01E0) {
-                m1_0x6101e0_val = val;
-            }
-            rows += 1;
+    let gop_info = match crate::video::fbcon::current_info() {
+        Some(info) => info,
+        None => {
+            serial_println!(":: kdisp: takeover-abort no-gop-info ::");
+            return None;
         }
-        serial_println!(":: kdisp: gap pass{} done rows={} ::", pass, rows);
+    };
+    let expected_width = gop_info.width as u32;
+    let expected_height = gop_info.height as u32;
+    let fb_size = (expected_width * expected_height * 4) as usize;
 
-        if pass == 0 {
-            for _ in 0..2_000_000 { core::hint::spin_loop(); }
-        }
+    // 1. Prepare surf2 (green fill at VRAM + 0x1600000)
+    let bar1 = vram_base;
+    let surf2_offset = 0x1600000;
+    let dst = (bar1 + surf2_offset) as *mut u32;
+    let dwords = fb_size / 4;
+    for i in 0..dwords {
+        core::ptr::write_volatile(dst.add(i), 0xFF00FF00);
+    }
+    serial_println!(":: kdisp: surf2 prep off=01600000 bytes={:08X} fill=FF00FF00 ::", fb_size);
+
+    // 2. Pre-state
+    let asm_reg = 0x640460;
+    let armed_reg = 0x6101E0;
+    let shadow_reg = 0x61D1E0;
+    let update_reg = 0x640080;
+    
+    let pre_asm = mmio_read(bar0, asm_reg);
+    let pre_armed = mmio_read(bar0, armed_reg);
+    let pre_shadow = mmio_read(bar0, shadow_reg);
+    serial_println!(":: kdisp: latch pre asm={:08X} armed={:08X} shadow={:08X} ::", pre_asm, pre_armed, pre_shadow);
+
+    // 3. Write 0x640460 = 0x00016000
+    let new_ptr = 0x00016000;
+    mmio_write(bar0, asm_reg, new_ptr);
+    let rb_asm = mmio_read(bar0, asm_reg);
+    serial_println!(":: kdisp: latch asm-wrote=00016000 rb={:08X} ::", rb_asm);
+
+    // 4. Self-check hold (~2s)
+    for t in 1..=2 {
+        for _ in 0..60_000_000 { core::hint::spin_loop(); }
+        let armed = mmio_read(bar0, armed_reg);
+        serial_println!(":: kdisp: latch selfcheck t={}s armed={:08X} ::", t, armed);
     }
 
-    // Milestone 2: Widened known-value scan
-    const MAX_HITS: usize = 64;
-    let mut hit_addrs = [0usize; MAX_HITS];
-    let mut hit_vals = [0u32; MAX_HITS];
-    let mut hits = 0;
-
-    let scan_ranges = [(0x614000, 0x61FFFC), (0x640000, 0x647FFC)];
-    for (start, end) in scan_ranges.iter() {
-        for addr in (*start..=*end).step_by(4) {
-            let val = mmio_read(bar0, addr);
-            
-            let keyname = match val {
-                0x00000200 => "0x200",
-                0x00020000 => "0x20000",
-                0x90020000 => "0x90020000",
-                0x00002D00 => "pitch2880",
-                0x013C6800 => "fbsize",
-                0x07380BAF | 0x0BAF0738 => "raster",
-                _ if (val & 0xFFF00000) == 0x90000000 => "barshape",
-                _ if (val & 0xFFFF) == 0x0B40 || (val >> 16) == 0x0B40 => "w2880",
-                _ if (val & 0xFFFF) == 0x0708 || (val >> 16) == 0x0708 => "h1800",
-                _ => "",
-            };
-            
-            if !keyname.is_empty() {
-                if hits < MAX_HITS {
-                    hit_addrs[hits] = addr;
-                    hit_vals[hits] = val;
-                    serial_println!(":: kdisp: evo-scan2 hit off={:06X} val={:08X} key={} ::", addr, val, keyname);
-                }
-                hits += 1;
-            }
-        }
+    if rb_asm != new_ptr {
+        // Honesty rule: skip the update write AND skip restore if asm didn't stick
+        serial_println!(":: kdisp: latch skip — asm rb unchanged ::");
+        
+        // 6 (skip) & 7: Re-read the three registers, report, verdict
+        let final_asm = mmio_read(bar0, asm_reg);
+        let final_armed = mmio_read(bar0, armed_reg);
+        let final_shadow = mmio_read(bar0, shadow_reg);
+        serial_println!(":: kdisp: latch restored asm={:08X} armed={:08X} shadow={:08X} ::", final_asm, final_armed, final_shadow);
+        serial_println!(":: kdisp: latch verdict asm-stuck=n armed-followed=n ::");
+        return None;
     }
-    let capped = if hits > MAX_HITS { "t" } else { "f" };
-    serial_println!(":: kdisp: evo-scan2 done ranges=614000-61FFFC,640000-647FFC hits={} capped={} ::", hits, capped);
 
-    // Bounded delay before M3
-    for _ in 0..2_000_000 { core::hint::spin_loop(); }
+    // 5. UPDATE Latch
+    mmio_write(bar0, update_reg, 0x00000000);
+    let rb_update = mmio_read(bar0, update_reg);
+    serial_println!(":: kdisp: latch update-wrote rb0080={:08X} ::", rb_update);
 
-    // Milestone 3: Armed-pair check
-    let repoint_reg = regs::NV_PDISPLAY_BASE + 0x01E0; // 0x6101E0
-    let m3_0x6101e0_val = mmio_read(bar0, repoint_reg);
-    serial_println!(":: kdisp: pair off=6101E0 first={:08X} second={:08X} ::", m1_0x6101e0_val, m3_0x6101e0_val);
-
-    let check_count = if hits > MAX_HITS { MAX_HITS } else { hits };
-    for i in 0..check_count {
-        let addr = hit_addrs[i];
-        let first = hit_vals[i];
-        let second = mmio_read(bar0, addr);
-        serial_println!(":: kdisp: pair off={:06X} first={:08X} second={:08X} ::", addr, first, second);
+    // ~5 s hold polling 0x6101E0 and HEAD_STAT vertical once/s.
+    // Head 0 HEAD_STAT base is 0x6000 + 0 = 0x6000, vert is +0x340.
+    let hs_vert_reg = regs::NV_PDISPLAY_BASE + 0x6340; 
+    let mut last_hold_armed = pre_armed;
+    for t in 1..=5 {
+        for _ in 0..60_000_000 { core::hint::spin_loop(); }
+        let armed = mmio_read(bar0, armed_reg);
+        let vert = mmio_read(bar0, hs_vert_reg);
+        last_hold_armed = armed;
+        serial_println!(":: kdisp: latch hold t={}s armed={:08X} stat vert={:08X} ::", t, armed, vert);
     }
+
+    // 6. Restore
+    mmio_write(bar0, asm_reg, pre_asm);
+    mmio_write(bar0, update_reg, 0x00000000);
+    
+    for _ in 0..120_000_000 { core::hint::spin_loop(); } // ~2s hold
+
+    let final_asm = mmio_read(bar0, asm_reg);
+    let final_armed = mmio_read(bar0, armed_reg);
+    let final_shadow = mmio_read(bar0, shadow_reg);
+    serial_println!(":: kdisp: latch restored asm={:08X} armed={:08X} shadow={:08X} ::", final_asm, final_armed, final_shadow);
+
+    // 7. Verdict
+    let asm_stuck = if rb_asm == new_ptr { "y" } else { "n" };
+    let armed_followed = if last_hold_armed == new_ptr { "y" } else { "n" };
+    serial_println!(":: kdisp: latch verdict asm-stuck={} armed-followed={} ::", asm_stuck, armed_followed);
 
     None
 }
