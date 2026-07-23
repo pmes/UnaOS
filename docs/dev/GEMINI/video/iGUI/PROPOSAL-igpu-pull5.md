@@ -1,6 +1,7 @@
 # PROPOSAL — iGPU Pull 5: gmux Protocol Prove
 
-STATUS: APPROVED WITH AMENDMENTS (2026-07-22 — the 8-bit-vs-32-bit version
+STATUS: LANDED 9d904c96 (2026-07-22 — 32-bit version + required MAX_BRIGHTNESS row, ABI 7-wide both sides, gate logic intact. Gates green, strings-proven both artifacts. Metal owed: sitting #10.)
+Prior: APPROVED WITH AMENDMENTS (2026-07-22 — the 8-bit-vs-32-bit version
 read diagnosis is credible and cleanly explains the #9 gate failure; the
 variant table matches known gmux hardware facts (facts with attribution are
 this lane's standing rule; no GPL code bodies). Amendments:

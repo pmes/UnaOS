@@ -1,6 +1,7 @@
 # PROPOSAL — Kepler Pull 11: Poll Area & Validate Stick Witness
 
-STATUS: APPROVED WITH AMENDMENTS (2026-07-22 — Candidate A verified
+STATUS: LANDED 7124e4e1 (2026-07-22 — A2 restore-original honored, witness check clean, no candidate B. Gates green, strings-proven. Metal owed: sitting #10.)
+Prior: APPROVED WITH AMENDMENTS (2026-07-22 — Candidate A verified
 (USERD_SNOOP 0xa1c boolean, gf100_pfifo.xml:247 ✓), test plan shape and
 witness design accepted, SCHED_STATUS honesty accepted. Amendments:
 A1 — **Candidate B is CUT from this pull.** Two independent reasons: (i) its
