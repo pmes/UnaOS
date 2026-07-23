@@ -796,3 +796,69 @@ the retained `[v3d44/45/46]` wedge dump.
 Diagnostic-only: the ladder reuses the M4 bin-scratch regions (re-zeroed per rung and again by
 `triangle_job`), touches no real-draw CL, and never gates M4. QEMU raspi4b models no V3D block, so the whole
 ladder is dormant there — **P45 metal reads the tree.**
+
+## 23. P45 empty-frame verdict — the frame enables audited; the unmasked interrupt is the one omission (V3D-49)
+
+**P45 metal read the §22 ladder's first rung:** the `Empty` frame
+(`NUMBER_OF_LAYERS` + `TILE_BINNING_MODE_CFG` + `FLUSH_VCD_CACHE` + `START_TILE_BINNING` + `FLUSH`, zero
+prims/state) **does NOT retire** — `FLDONE` never fires, `INT_STS=0x00000000` (nothing latched at all,
+consistent with an empty frame that runs no QPU program), `PCS=BMACTIVE=1` (bin mode held open), `BFC` Δ0,
+CLE idles, no MMU fault, GMP off. Per the kernel `v3d_bin_job_run` an empty bin frame **must** retire, so
+the frame-level handshake never worked — every per-packet audit (§10–22) was measuring a layer above the
+break. V3D-49 audited the three named frame-level suspects byte-for-byte against `v3d_bin_job_run`
+(`v3d_sched.c`), `v3d_irq.c`, and `v3d_regs.h`, and the "masked-poll inverts the verdict" candidate first.
+
+**The interrupt-mask inversion candidate — REFUTED, and by our own witnesses.** The cheapest, most
+explosive theory was: if `INT_STS` only latches *unmasked* bits, our `wait_fldone` could read `FLDONE=0`
+forever while the frame actually retired. It does not hold. `V3D_INT_QPU_MASK` = `V3D_MASK(27,16)` — the
+per-QPU host-interrupt vector (bit 16) lives in the **same** `V3D_CTL_INT_STS` register (0x050) as
+`FLDONE` (BIT 1), under the same mask. Our driver **never programmed `INT_MSK`**, yet prior boots
+(§19–21) saw bit 16 latch in `INT_STS`. So the mask's power-on-reset state permits raw latching:
+`INT_STS` is the **raw** latched vector and the mask gates only the CPU IRQ line, not visibility. Whatever
+let bit 16 latch equally governs bit 1 — `FLDONE` genuinely never fired. The verdict is not inverted.
+
+**The three frame enables — each byte-exact against the kernel:**
+
+- **`CT0QTS` ENABLE semantics.** `v3d_regs.h`: `V3D_CLE_CT0QTS_ENABLE = BIT(1)` — the enable is **bit 1,
+  not bit 0**. P39's `CT0QTS=0x001a1002` decodes cleanly as tile-STATE base `0x1a1000` (32-byte-aligned)
+  `| 0x2` (ENABLE). The kernel writes exactly `V3D_CLE_CT0QTS_ENABLE | job->qts`; our composed value is
+  identical. The `[v3d49]` witness now echoes `CT0QTS`/`CT0QMS` back from the CLE with the ENABLE-bit
+  decoded, so P46 confirms the latch on silicon. **Exonerated.**
+- **`CT0QMS` size encoding.** The kernel writes `job->qms` = the tile-alloc BO **size in raw bytes**
+  (not an end address, not a block count). Our `0x8000` (32 KiB) is the same encoding. **Exonerated.**
+- **CT1/RENDER config ordering.** `v3d_bin_job_run` touches only CT0 (+`BPOS`); bin and render are
+  independent jobs (`v3d_bin_job_run` vs `v3d_render_job_run`). Bin retire requires **no** render-side
+  state armed. **Exonerated.**
+
+**The whole kick vs `v3d_bin_job_run`, register for register — one genuine omission and one stale-state
+divergence.** The kernel's bin submit is: `V3D_PTB_BPOS=0` (clear overflow) → `v3d_invalidate_caches` →
+`CT0QMA` → `CT0QMS` → `CT0QTS = ENABLE|qts` → `CT0QBA` → `CT0QEA` (GO). It never writes `BPOA` in the run
+path (overflow is armed lazily, only on an `OUTOMEM` IRQ). Two divergences fixed:
+
+1. **`INT_MSK` was never programmed** (the omission). The kernel unmasks its working set **once at probe**
+   in `v3d_irq_enable` — `MSK_SET = ~V3D_CORE_IRQS`, `MSK_CLR = V3D_CORE_IRQS`, where
+   `V3D_CORE_IRQS`(ver<71) = `OUTOMEM|FLDONE|FRDONE|CSDDONE(BIT7)|GMPV(BIT5)` = `0xa7` — **not** per job.
+   Our driver ran every bin frame at the mask's power-on-reset value, the one frame-level enable no
+   per-packet audit covered. V3D-49 adds a kernel-faithful `v3d_irq_enable()` called once in `bringup`
+   after the M2 MMU PASS (block powered + mapped, before any CT0/CT1 kick). It records `MSK_STS`
+   before/after, so **P46 settles the reset mask state on metal**: if `FLDONE` read MASKED at reset, the
+   unmask is the empty-frame fix; if already unmasked, the raw-latch refutation is confirmed and the wedge
+   is downstream of the frame enables. `wait_fldone` still polls the raw `INT_STS`, so the polling
+   contract is unchanged; no ISR is installed (we poll), so unmasking un-serviced bits is safe.
+2. **The V3D-44 `BPOA`/`BPOS` overflow pre-arm removed** (stale-state divergence). §19's OUTOMEM-starvation
+   theory (pre-arm a nonzero overflow block before GO) was **refuted** at P43/P44 (`OUTOMEM=0`,
+   `BMOOM=0` — the binner never stalled for tile-alloc memory). The pre-arm also put the frame in a
+   nonzero-`BPOS` state the kernel is never in at frame start and leaked a stale overflow block into later
+   kicks. All three CT0 kicks (probe, bisect rungs, real M4) now write **`BPOS=0` at frame start**,
+   byte-exact to `v3d_bin_job_run` ("Clear out the overflow allocation, so we don't reuse the overflow
+   attached to a previous job").
+
+**Expected P46 witnesses.** `[v3d49] irq-enable — MSK_STS por=<x> (FLDONE MASKED|unmasked) -> now=<y>
+(FLDONE unmasked) unmasked set=0x000000a7`; `[v3d49] <rung> frame enables — CT0QTS wrote/echo (base …
+ENABLE(bit1)=1) | CT0QMS wrote/echo (raw bytes)`; and the `[v3d48]` empty-frame line reading `retired=1
+BFC Δ1 PCS=…BMACTIVE=0` **if** the unmask was the wall — which would retire the whole "empty bin"
+investigation as an un-enabled `FLDONE`. If the empty frame still does not retire with `FLDONE` proven
+unmasked at reset, the wedge sits below the CLE→PTB `FLDONE` generation itself (a hub/reset or
+tile-state-flush step), which the `[v3d44/45/46]` dump the `Empty` rung emits will name. QEMU raspi4b
+models no V3D (returns at `BLOCK-DOWN` before M2), so all `[v3d49]` instrumentation is dormant there —
+**P46 metal decides.**

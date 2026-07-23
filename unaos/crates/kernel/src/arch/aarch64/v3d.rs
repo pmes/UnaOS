@@ -310,6 +310,16 @@ const V3D_PTB_BPOS: usize = 0x030c; // PTB binning primitive-list overflow size 
 // pre-retire (BFC Δ0, PCS bit0=1). These offsets let us poll the true retire signal instead.
 const V3D_CTL_INT_STS: usize = 0x0050; // latched interrupt status (v3d_regs.h V3D_CTL_INT_STS)
 const V3D_CTL_INT_CLR: usize = 0x0058; // write-1-to-clear latched interrupts (V3D_CTL_INT_CLR)
+// PI-V3D-49: the interrupt MASK block (v3d_regs.h V3D_CTL_INT_MSK_*). MSK_STS reads the current mask
+// (1 = that interrupt is masked/disabled); MSK_SET sets mask bits (disable); MSK_CLR clears mask bits
+// (enable). The kernel programs these ONCE at probe in `v3d_irq_enable` — NOT per bin job — to unmask
+// its working set before any job runs; `v3d_bin_job_run` itself writes no mask. Our driver never
+// programmed the mask at all: the block ran every bin frame at the mask's power-on-reset value, an
+// un-audited frame-level enable. V3D-49 makes us kernel-faithful: unmask the working set once at
+// bring-up (see `v3d_irq_enable`).
+const V3D_CTL_INT_MSK_STS: usize = 0x005c; // current interrupt mask (1 = masked) (V3D_CTL_INT_MSK_STS)
+const V3D_CTL_INT_MSK_SET: usize = 0x0060; // write-1-to-MASK (disable) an interrupt (V3D_CTL_INT_MSK_SET)
+const V3D_CTL_INT_MSK_CLR: usize = 0x0064; // write-1-to-UNMASK (enable) an interrupt (V3D_CTL_INT_MSK_CLR)
 // V3D 4.x per-core interrupt bit layout (v3d_regs.h, the 33_5+ block):
 const V3D_INT_FRDONE: u32 = 1 << 0; // render frame done
 const V3D_INT_FLDONE: u32 = 1 << 1; // binning flush done — the true bin-retire signal
@@ -327,6 +337,16 @@ const V3D_INT_GMPV: u32 = 1 << 5; // GMP (memory-protection) violation
 // a program-end host interrupt" — the QPU RAN and signalled completion, independent of the PTB's FLDONE.
 const V3D_INT_QPU_MASK: u32 = 0xffff_0000; // [31:16] per-QPU host-interrupt vector
 const V3D_INT_QPU_SHIFT: u32 = 16; // bit (16+n) = QPU n raised a host interrupt
+// PI-V3D-49: the kernel's working interrupt set for V3D 4.2 (`V3D_CORE_IRQS`, v3d_irq.c, ver<71 path):
+// OUTOMEM | FLDONE | FRDONE | CSDDONE(BIT7 for ver<71) | GMPV(BIT5). This is the exact bitset
+// `v3d_irq_enable` UNMASKS (MSK_CLR) and everything else it MASKS (MSK_SET = ~this). FLDONE (BIT1) — the
+// bin-retire signal our poll waits on — is in it. Note the per-QPU host-interrupt half-word (bits 16+)
+// is deliberately NOT in the kernel's set: those latch in INT_STS regardless (which is why our witnesses
+// saw bit16 despite never touching the mask — INT_STS is the RAW latched vector, the mask gates only the
+// CPU IRQ line, so masking never inverted our FLDONE=0 reads; see v3d.md §23).
+const V3D_INT_CSDDONE_LT71: u32 = 1 << 7; // compute-shader-dispatch done (ver < 71)
+const V3D_CORE_IRQS: u32 =
+    V3D_INT_OUTOMEM | V3D_INT_FLDONE | V3D_INT_FRDONE | V3D_INT_CSDDONE_LT71 | V3D_INT_GMPV; // 0xa7
 
 // PI-V3D-44 overflow (BPO) pool — the tail of the arena (0x36000, above the probe bin CL at
 // 0x35000+0x1000). The V3D binner requests overflow tile-list memory via the OUTOMEM interrupt;
@@ -595,6 +615,12 @@ pub fn bringup(fb: Option<FbTarget>) {
         return;
     }
     serial_println!(":: V3D: M2 MMU PASS (arena identity-mapped, confined, TLB flushed) ::");
+
+    // PI-V3D-49: unmask the core interrupt working set once, kernel-faithfully (v3d_irq_enable), now the
+    // block is powered and MMU-mapped and before any CT0/CT1 kick. FLDONE (the bin-retire signal every
+    // kick's wait_fldone polls) had never been unmasked; every prior boot ran the frame at the mask's
+    // power-on-reset value. See v3d.md §23 for why this is the empty-frame verdict's named frame-level fix.
+    v3d_irq_enable();
 
     // ── M3: clear job. ──────────────────────────────────────────────────────────────────────────
     if clear_job(fb) {
@@ -1578,6 +1604,40 @@ fn invalidate_gpu_caches(what: &str) {
     let _ = wait_bit_clear(V3D_CORE0_BASE, V3D_CTL_L2TCACTL, V3D_L2TCACTL_L2TFLS, what);
     mmio_write(V3D_CORE0_BASE, V3D_CTL_SLCACTL, V3D_SLCACTL_INVALIDATE_ALL);
     dsb();
+}
+
+/// PI-V3D-49: unmask the core interrupt working set once at bring-up, byte-for-byte as the kernel's
+/// `v3d_irq_enable` (`drivers/gpu/drm/v3d/v3d_irq.c`, ver<71 path):
+///   V3D_CORE_WRITE(core, V3D_CTL_INT_MSK_SET, ~V3D_CORE_IRQS(ver));  // mask everything else
+///   V3D_CORE_WRITE(core, V3D_CTL_INT_MSK_CLR,  V3D_CORE_IRQS(ver));  // unmask our set (incl. FLDONE)
+/// The kernel does this ONCE at probe — not per job — so every bin frame runs with FLDONE unmasked.
+/// Our driver had never programmed the mask, so the block ran every frame at the mask's power-on-reset
+/// value: the one frame-level enable that the per-packet audits (§19–22) never covered, because they
+/// were per-packet. `wait_fldone` polls INT_STS (the raw latched vector, mask-independent), so this
+/// does NOT change our polling contract; it makes the block kernel-faithful and — should this silicon
+/// gate FLDONE *generation* (not just delivery) on the unmask — is the fix the empty-frame verdict
+/// (§23) points at. Idempotent; no ISR is installed (we poll), so unmasking bits we don't IRQ-service
+/// is safe. Reads MSK_STS before/after so the P46 metal boot records the power-on-reset mask state —
+/// which itself settles whether FLDONE was masked at reset (the inversion candidate).
+fn v3d_irq_enable() {
+    let msk_por = mmio_read(V3D_CORE0_BASE, V3D_CTL_INT_MSK_STS);
+    mmio_write(V3D_CORE0_BASE, V3D_CTL_INT_MSK_SET, !V3D_CORE_IRQS);
+    mmio_write(V3D_CORE0_BASE, V3D_CTL_INT_MSK_CLR, V3D_CORE_IRQS);
+    dsb();
+    let msk_now = mmio_read(V3D_CORE0_BASE, V3D_CTL_INT_MSK_STS);
+    serial_println!(
+        ":: V3D: [v3d49] irq-enable — MSK_STS por={:#010x} (FLDONE {}) -> now={:#010x} (FLDONE {}) unmasked set={:#010x} — {} ::",
+        msk_por,
+        if msk_por & V3D_INT_FLDONE != 0 { "MASKED" } else { "unmasked" },
+        msk_now,
+        if msk_now & V3D_INT_FLDONE != 0 { "MASKED" } else { "unmasked" },
+        V3D_CORE_IRQS,
+        if msk_por & V3D_INT_FLDONE != 0 {
+            "FLDONE was MASKED at power-on-reset — every prior boot polled a gated retire signal; this unmask is the empty-frame fix"
+        } else {
+            "FLDONE was already unmasked at reset — INT_STS latches raw, so masking never inverted the FLDONE=0 verdict; the wedge is downstream of the frame enables"
+        }
+    );
 }
 
 // ════════════════════════════════════════════════════════════════════════════════════════════════
@@ -2928,15 +2988,12 @@ fn probe_job() {
     // Arm the execution trio (src14/16/32) + TMU battery (src24/17/25) so they span the probe bin. This is
     // read-only w.r.t. the shader (see pctr_* above) — it cannot perturb execution.
     pctr_setup_cs_witness();
-    // [v3d44] hand the PTB a small overflow tile-list pool BEFORE the GO (BPOA=block addr, BPOS=size),
-    // exactly as the kernel v3d driver answers an OUTOMEM interrupt (v3d_irq.c/v3d_overflow_mem_work).
-    // The V3D-44 OUTOMEM theory: we gave the binner NO overflow pool (BPOA/BPOS=0), so once the 128 B
-    // initial tile-alloc block filled the PTB stalled waiting for overflow memory that never came —
-    // holding FLDONE hostage (fits every P40 datum: bytes emitted, flush consumed, never retired, no
-    // fault, binner busy). Pre-arming it lets the flush retire without the interrupt round-trip.
-    let bpo_addr = (arena_phys() + OFF_PROBE_BIN_OVERFLOW) as u32;
-    mmio_write(V3D_CORE0_BASE, V3D_PTB_BPOA, bpo_addr);
-    mmio_write(V3D_CORE0_BASE, V3D_PTB_BPOS, PROBE_BIN_OVERFLOW_BYTES as u32);
+    // PI-V3D-49: clear the overflow allocation (BPOS=0) exactly as the kernel's `v3d_bin_job_run` does
+    // at bin-job start. The V3D-44 pre-arm of a nonzero BPOA/BPOS block here was a diagnostic for the
+    // OUTOMEM-starvation theory, which P43/P44 REFUTED (OUTOMEM=0, BMOOM=0 — the binner never stalled for
+    // tile-alloc memory). Pre-arming also left the frame in a nonzero-BPOS state the kernel is never in at
+    // frame start, and leaked a stale overflow block into later kicks. Restore the kernel-exact BPOS=0.
+    mmio_write(V3D_CORE0_BASE, V3D_PTB_BPOS, 0);
     // Clear any latched interrupts so this kick's FLDONE (and OUTOMEM/GMPV) reads fresh, not a stale
     // bit from a prior job.
     mmio_write(V3D_CORE0_BASE, V3D_CTL_INT_CLR, mmio_read(V3D_CORE0_BASE, V3D_CTL_INT_STS));
@@ -2974,14 +3031,14 @@ fn probe_job() {
     let (fldone_sts, fldone_us, fldone_retired) = wait_fldone("v3d44 PROBE bin flush");
     let bfc_after_flush = mmio_read(V3D_CORE0_BASE, V3D_CLE_BFC);
     serial_println!(
-        ":: V3D: [v3d44] FLDONE wait — INT_STS={:#010x} waited={}us retired={} BFC={:#010x}->{:#010x} (Δ{}) BPOA(armed)={:#010x} BPOS={:#x} — {} ::",
+        ":: V3D: [v3d44] FLDONE wait — INT_STS={:#010x} waited={}us retired={} BFC={:#010x}->{:#010x} (Δ{}) BPOA={:#010x} BPOS={:#010x} (V3D-49: BPOS=0 at frame start, kernel-exact) — {} ::",
         fldone_sts, fldone_us, fldone_retired as u32,
         bfc_pre, bfc_after_flush, bfc_after_flush.wrapping_sub(bfc_pre),
-        bpo_addr, PROBE_BIN_OVERFLOW_BYTES,
+        mmio_read(V3D_CORE0_BASE, V3D_PTB_BPOA), mmio_read(V3D_CORE0_BASE, V3D_PTB_BPOS),
         if fldone_retired {
             "the bin flush RETIRED — the P40 read-too-early wall is closed; the pool read below is post-retire truth"
         } else if fldone_sts & V3D_INT_OUTOMEM != 0 {
-            "OUTOMEM despite the pre-armed overflow block — the binner wants MORE (grow BPOS) or the block is not honoured"
+            "OUTOMEM with BPOS=0: the binner exhausted the initial tile-alloc pool and needs an overflow block (the OUTOMEM path, refuted at P43/P44)"
         } else if fldone_sts & V3D_INT_QPU_MASK != 0 {
             "QPU host-interrupt (bit16+) latched, FLDONE did NOT: the coord shader reached program-end but the PTB never flushed — see the [v3d45] wedge dump above for CTRUN/PCS/BPCA"
         } else {
@@ -3171,17 +3228,35 @@ fn submit_bisect_rung(rung: &str, content: BinContent, shadrec_off: usize) {
 
     clear_mmu_fault_latch("v3d48 bisect pre-kick");
     invalidate_gpu_caches("L2T flush (v3d48 bisect pre-kick)");
+    let qts_val = ts | V3D_CLE_CT0QTS_ENABLE;
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QMA, tile_alloc);
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QMS, BIN_TILEALLOC_BYTES as u32);
-    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QTS, ts | V3D_CLE_CT0QTS_ENABLE);
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QTS, qts_val);
     dsb();
+    // PI-V3D-49: decode the frame-level enables the brief named for the "Empty does NOT retire" verdict,
+    // echoed back from the CLE after the writes latch. CT0QTS = tile-STATE base | ENABLE(BIT1); the
+    // kernel's `v3d_bin_job_run` writes exactly `V3D_CLE_CT0QTS_ENABLE(BIT1) | qts`, so our composed
+    // value is byte-identical (base 32-byte-aligned, ENABLE at bit1 — NOT bit0). CT0QMS is the raw
+    // tile-alloc pool SIZE in bytes (job->qms), not an end address or block count. Both are echoed so
+    // P46 confirms the CLE latched them.
+    let qts_echo = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0QTS);
+    let qms_echo = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0QMS);
+    serial_println!(
+        ":: V3D: [v3d49] {} frame enables — CT0QTS wrote={:#010x} echo={:#010x} (base={:#010x} ENABLE(bit1)={}) | CT0QMS wrote={:#x} echo={:#x} (raw bytes) — QTS ENABLE is bit1 per v3d_regs.h, base|0x2 is kernel-exact ::",
+        rung, qts_val, qts_echo, qts_val & !V3D_CLE_CT0QTS_ENABLE,
+        (qts_echo & V3D_CLE_CT0QTS_ENABLE != 0) as u32,
+        BIN_TILEALLOC_BYTES as u32, qms_echo,
+    );
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QBA, bin_ba);
     dsb();
-    // Pre-arm the overflow pool exactly as the probe/M4 kick does, so an OUTOMEM stall cannot masquerade
-    // as a frame-handshake failure in this bisection.
-    let bpo_addr = (arena_phys() + OFF_PROBE_BIN_OVERFLOW) as u32;
-    mmio_write(V3D_CORE0_BASE, V3D_PTB_BPOA, bpo_addr);
-    mmio_write(V3D_CORE0_BASE, V3D_PTB_BPOS, PROBE_BIN_OVERFLOW_BYTES as u32);
+    // PI-V3D-49: match `v3d_bin_job_run` — clear the overflow allocation (BPOS=0) so a stale overflow
+    // block from a prior rung/kick is never reused, exactly as the kernel does at bin-job start ("Clear
+    // out the overflow allocation, so we don't reuse the overflow attached to a previous job"). The
+    // kernel does NOT pre-arm BPOA/BPOS before the GO — overflow is armed lazily only on an OUTOMEM
+    // interrupt (v3d_overflow_mem_work). The V3D-44 pre-arm was a diagnostic for the OUTOMEM theory,
+    // which P43/P44 REFUTED (OUTOMEM=0, BMOOM=0); it also put the frame in a nonzero-BPOS state the
+    // kernel is never in at frame start. Restore the kernel-exact BPOS=0.
+    mmio_write(V3D_CORE0_BASE, V3D_PTB_BPOS, 0);
     mmio_write(V3D_CORE0_BASE, V3D_CTL_INT_CLR, mmio_read(V3D_CORE0_BASE, V3D_CTL_INT_STS));
     dsb();
     let bfc_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_BFC);
@@ -3391,6 +3466,12 @@ fn triangle_job(fb: Option<FbTarget>) -> bool {
     // [v3d47] dump the published coord-shader thread-end bytes right before the GO — P45 confirms WHAT
     // RAN. V3D-47 finding: this tail is byte-for-byte Mesa's own v3d_compile coord tail (no divergence).
     cs_tail_witness("M4", OFF_CS_CODE, CS_VS_WORDS.len());
+    // PI-V3D-49: clear the overflow allocation (BPOS=0) at bin-job start, exactly as the kernel's
+    // `v3d_bin_job_run` ("Clear out the overflow allocation, so we don't reuse the overflow attached to a
+    // previous job"). The real M4 bin never pre-armed BPOA/BPOS, but the probe/bisect kicks that run
+    // BEFORE it used to leave a stale nonzero BPOS latched; this write makes the real draw kernel-exact
+    // and stale-overflow-proof.
+    mmio_write(V3D_CORE0_BASE, V3D_PTB_BPOS, 0);
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QEA, bin_ea); // GO
     dsb();
     let ct0_cs_kicked = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CS);
