@@ -799,9 +799,10 @@ pub fn bringup(dtb: u64) {
     let t0 = ms_now();
     bringup_inner(dtb);
     if dtb_has_pcie(dtb) {
+        let now = ms_now();
         serial_println!(
-            ":: piusb33: early hw bring-up done ({}ms; RC reset + link train + xHCI init to ports-powered, on the early P38 path) ::",
-            ms_now().saturating_sub(t0)
+            ":: piusb33: early hw bring-up done (dur={}ms, t={}ms; RC reset + link train + xHCI init to ports-powered, on the early P38 path) ::",
+            now.saturating_sub(t0), now
         );
     }
 }
@@ -828,13 +829,14 @@ pub fn bringup_task(_arg: usize) {
     // census-skip, link-down, BAR mismatch) it says so and returns.
     let t0 = ms_now();
     serial_println!(
-        ":: piusb33: deferred enumerate start (early hw bring-up already reached the honesty line; panel already live on the APs at {}ms) ::",
+        ":: piusb33: deferred enumerate start (early hw bring-up already reached the honesty line; panel already live on the APs at t={}ms) ::",
         t0
     );
     enumerate();
+    let now = ms_now();
     serial_println!(
-        ":: piusb33: deferred enumerate done ({}ms; DMA-side walk ran on the BSP, off the panel path) ::",
-        ms_now().saturating_sub(t0)
+        ":: piusb33: deferred enumerate done (dur={}ms, t={}ms; DMA-side walk ran on the BSP, off the panel path) ::",
+        now.saturating_sub(t0), now
     );
 }
 

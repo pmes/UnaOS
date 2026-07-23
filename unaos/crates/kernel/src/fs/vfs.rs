@@ -1344,7 +1344,8 @@ fn checksum(bytes: &[u8]) -> u32 {
 // =========================================================================================
 // VFS-3 USB-mount witness — proves the hot-plugged USB FAT stick lives in the VFS namespace
 // (at `/usb`) ALONGSIDE the SD boot FAT (at `/fat`), each routing to its own block device, and
-// that the USB volume's read-only posture is honored HONESTLY (writes refused, no panic).
+// that the USB volume is WRITABLE through the table (USB-WRITE cleared the old read-only guard:
+// a `create` at `/usb/...` now lands a real entry rather than being refused).
 //
 // This is a METAL proof, honest-skip under QEMU: the USB stick is reached through the xHCI
 // `Usb` source (PIUSB-27), which needs the BCM2711 PCIe RC + VL805 xHCI. QEMU raspi4b models no
@@ -1356,8 +1357,10 @@ fn checksum(bytes: &[u8]) -> u32 {
 /// VFS-3 USB-mount witness: build a `MountTable` carrying the SD boot FAT at `/fat` and the USB
 /// FAT stick at `/usb` (each on its own block source), then prove through the table that (a) the
 /// USB volume is reachable — its root lists and a file reads back — and (b) the USB volume is
-/// honestly read-only: a `create` at `/usb/...` is refused with `Unsupported`, never a panic.
-/// Honest-skip when no USB volume is present (always, under QEMU raspi4b).
+/// now WRITABLE: a `create` at `/usb/...` succeeds through the table (USB-WRITE made
+/// `FatBackend::read_only()` false — the `Usb` source carries a verified BOT WRITE(10) path), so
+/// the mount no longer refuses writes with `Unsupported`. Honest-skip when no USB volume is
+/// present (always, under QEMU raspi4b).
 #[cfg(target_arch = "aarch64")]
 pub fn vfs3_usb_mount_witness() {
     use core::sync::atomic::{AtomicBool, Ordering};
@@ -1397,27 +1400,29 @@ pub fn vfs3_usb_mount_witness() {
             }
         }
     }
-    // (c) the USB volume is honestly read-only: a write is REFUSED (Unsupported), not attempted
-    // against the block layer and not a panic. This is the by-construction PIUSB-27 posture
-    // surfaced cleanly at the VFS layer.
-    match mt.create("/usb/VFS3RO.TXT", NodeKind::File, KERNEL_PRINCIPAL) {
-        Err(VfsError::Unsupported) => {}
-        other => {
+    // (c) the USB volume is now WRITABLE through the table: a `create` at `/usb/...` SUCCEEDS
+    // (USB-WRITE cleared the by-construction read-only guard — the `Usb` source has a verified
+    // BOT WRITE(10) path), landing a real directory entry rather than being refused with
+    // `Unsupported`. A failure here means the write path regressed, not that a guard held.
+    let create_ok = match mt.create("/usb/VFS3W.TXT", NodeKind::File, KERNEL_PRINCIPAL) {
+        Ok(_) => true,
+        Err(e) => {
             serial_println!(
-                ":: VFS3: usb-mount — read-only guard breached (create /usb returned {:?}) :: FAIL ::",
-                other
+                ":: VFS3: usb-mount — writable-mount check failed (create /usb returned {:?}) :: FAIL ::",
+                e
             );
             return;
         }
-    }
+    };
     // (d) the two mounts are independent: /fat still resolves to the Default-source backend and
     // its root lists (coexistence — /usb did not displace the boot FAT).
     let fat_ok = mt.read_dir("/fat").is_ok();
 
     serial_println!(
-        ":: VFS3: usb-mount test — /usb root {} entries, read {} bytes, read-only enforced, /fat coexists={} :: PASS ::",
+        ":: VFS3: usb-mount test — /usb root {} entries, read {} bytes, create-ok={}, /fat coexists={} :: PASS ::",
         entries.len(),
         read_bytes,
+        create_ok,
         fat_ok
     );
 }
