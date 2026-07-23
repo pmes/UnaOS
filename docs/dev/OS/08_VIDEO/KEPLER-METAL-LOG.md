@@ -25,7 +25,24 @@ QEMU behavior. Newest sitting first.
   self-test (known-shape value proves the protocol before trusting
   switch/power).
 
-Boot 2 (runlist fuzz) verdict pending.
+**Boot 2 — fuzz answered, negatively but sharply:**
+- `playlist_rd=0x2013 len=0x00100003` — scheduler READ and COUNTED all three
+  entries (len 1→3 vs #7).
+- DISCRIMINATOR pbdma0/1/2 all `ch=0 ACTIVE=0` — raw, bit31-valid, and
+  bit0-valid entry encodings ALL REFUTED as sufficient.
+- `PFIFO_CHAN[1]` pre==post (`00=00002000 04=11000001`); RAMFC untouched by
+  hw (0xFACE sentinel intact). The scheduler never writes back anything.
+- Synthesis: runlist parse is fine; the gate is a per-channel scheduling
+  PRECONDITION. Pull-10 leads (rnndb, cited): GF100's CHAN_TABLE decode has
+  bit30 `POLL_ENABLE` + bit31 `VALID` in the CHAN word and bit0 `RUNNABLE` in
+  STATE — GK104's "UNK31" is almost certainly VALID, and we never set the
+  bit30 analog. And **`CHAN_TABLE_ERROR` (PFIFO+0x52c) is a readable reject
+  reason** (codes incl. NO_POLL "validated a channel with POLL_ENABLE, but
+  poll area is disabled", NO_ENGINE, INVALID_TARGET) plus `SCHED_STATUS`
+  (+0x63c RO) — never read them; the chip may have been naming the reason
+  every boot.
+
+Sitting #8 complete, both rungs. Capture + MANIFEST are the record.
 
 ## Sitting #7 (igpu pull 2 + kepler pull 8, UnaOS-gemini@7014b022→94b0ed0c, 2026-07-22, fox-metal-r23s1h) — COMPLETE
 
