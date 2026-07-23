@@ -337,6 +337,35 @@
   `:: EL0: threads test — spawned=2 joined=2 counter=2 cores=1,2 :: PASS ::` — genuine cross-core EL0 with a
   shared `ttbr0`. Metal note: cross-core LL/SC atomicity depends on the user window being Normal
   Inner-Shareable cacheable memory (an arc-boundary hardware check, not gated by QEMU).
+- **ELF-3 (landed 2026-07-23)** — rung 2 of the EL0-vug ladder: give EL0 something to **draw on** + real
+  **synchronisation**. Three syscalls (`SYS_FB_MAP = 24`, `SYS_FB_PRESENT = 25`, `SYS_FUTEX = 26`).
+  - **`SYS_FB_MAP()`** maps the calling process's dedicated, kernel-allocated **off-screen surface**
+    (32×32 ARGB8888 = one page, EL0-RW Normal-cacheable) plus a **read-only info page** (magic, width,
+    height, stride, format, size, surface-offset) into its EL0 window, and returns the surface VA. The
+    surface + info live in a **reserved VA hole** carved immediately above the 16 KiB program window (the
+    per-slot backing region grew from 0x4000 to 0x6000, 0x8000-aligned so the whole region stays inside one
+    2 MiB `L3_USER` block); `boot::map_slot_fb` repoints the slot's private L3 leaves at the slot's OWN FB
+    frames with a proper break-before-make (info EL0-RO `user_ro_page`, surface EL0-RW `user_data_page`).
+    **EL0 NEVER receives the real scan-out**, any kernel mapping, or a physical address — page-permission
+    laws (WXN, per-page perms) untouched.
+  - **`SYS_FB_PRESENT()`** is the only path from the surface to the screen: the kernel composites the
+    surface via a **present hook** (`syscall::register_fb_present_hook` — a public seam the video subsystem
+    registers, calling the existing dirty-rect damage+flush). Until that hook is wired (a 3-line deferred
+    diff in `video/screen.rs`, documented at the seam), present is a no-op composite; either way it records
+    a checksum of the surface for the self-verifying witness. EL0 owns the surface bytes, never the scan-out.
+  - **`SYS_FUTEX(uaddr, op, val)`** is a minimal wait/wake: `op=0` FUTEX_WAIT blocks iff `*uaddr == val`,
+    `op=1` FUTEX_WAKE wakes up to `val` waiters. Keyed by the **physical address** of the user word (via
+    `AT s1e0r` — globally unique, so a word shared across a process's threads keys the same bucket) on a
+    bounded kernel wait-queue pool (`sched::futex_wait`/`futex_wake`, reusing the Semaphore `PARK_WAITQ`
+    lock-handoff — lost-wakeup-safe). `uaddr` is validated inside the caller's writable user window. Enough
+    to build a userspace mutex/condvar.
+  - Test (`__fb_prog_*`, in-RAM): the parent maps its surface, reads geometry from the RO info page (proving
+    EL0-read), spawns 2 draw threads (one co-located, one on a sibling core) that each fill THEIR HALF of
+    the surface (top = 0xA1, bottom = 0xB2), an atomic counter + FUTEX wake/wait synchronises the parent to
+    both halves being drawn, the parent PRESENTS (the kernel checksums the surface), joins both threads, and
+    exits. QEMU-verified (2026-07-23): `:: EL0: fb test — mapped=32x32 threads=2 present=1 checksum=<hex>
+    :: PASS ::`, the checksum self-verified against the kernel-computed expected pattern. **DEFERRED wiring:
+    the `video/screen.rs` present-hook registration (3 lines) — out of the syscall/sched/boot lane.**
 - Not yet: **revocation trees** (a derived copy — re-grant or onward re-transfer — escapes
   single-level revoke today; derivation records + `CAP_REVOKE` are that arc), the **bandy Ring-3
   delegation wrapper**, `File` transfer (descriptor migration), real `Socket` fs/net syscalls.
@@ -498,6 +527,9 @@ Conventions shared across arches:
   | 21 | `SYS_THREAD_SPAWN` | entry, sp, arg, place | **thread handle** / `-errno` | aarch64 **ELF-2** — a new EL0 thread SHARING the caller's `ttbr0`/ASID; `place` 0=caller-core, 1=sibling-core; `arg` in x0; retains the slot (freed on the last thread's exit) |
   | 22 | `SYS_THREAD_EXIT` | — | — (no return) | aarch64 **ELF-2** — posts the thread's completion + releases the slot; scheduler reclaims the task |
   | 23 | `SYS_THREAD_JOIN` | handle | 0 / `-ESRCH` | aarch64 **ELF-2** — blocks on the thread's completion `Semaphore`; `-ESRCH` if the handle is not the caller's live thread |
+  | 24 | `SYS_FB_MAP` | — | surface VA / `-errno` | aarch64 **ELF-3** — maps the process's off-screen surface (EL0-RW) + RO info page; EL0 never gets the scan-out |
+  | 25 | `SYS_FB_PRESENT` | — | 0 / `-errno` | aarch64 **ELF-3** — kernel composites the surface to the screen (present hook); records the surface checksum |
+  | 26 | `SYS_FUTEX` | uaddr, op, val | op-specific / `-errno` | aarch64 **ELF-3** — op 0 WAIT (block iff `*uaddr==val`), op 1 WAKE (wake ≤`val`); phys-addr-keyed wait queue |
 
   aarch64 leads 4–9 (M6f 4–7, M7 8–9) and 21–23 (ELF-2 threading); the x86 U-side port adopts the same
   numbers so the arches stay aligned (x86 adds SMAP considerations aarch64's PAN-less A72 lacks).

@@ -146,6 +146,28 @@ const SYS_THREAD_SPAWN: u64 = 21;
 const SYS_THREAD_EXIT: u64 = 22;
 const SYS_THREAD_JOIN: u64 = 23;
 
+/// ELF-3: give EL0 something to draw on + real synchronisation.
+///   SYS_FB_MAP() -> surface VA >= 0 / -errno
+///     Maps the calling process's dedicated OFF-SCREEN surface (kernel-allocated, page-aligned,
+///     EL0-RW Normal-cacheable) plus a read-only INFO page (width/height/stride/format/size) into its
+///     EL0 window, and returns the surface VA. EL0 NEVER receives the real scan-out — only the kernel
+///     composites the surface to the screen (SYS_FB_PRESENT). Idempotent.
+///   SYS_FB_PRESENT() -> 0 / -errno
+///     Composite the process's surface to the real framebuffer via the registered present hook (the
+///     existing dirty-rect damage+flush machinery in the video subsystem). Also records a checksum of
+///     the surface for the self-verifying witness. If no hook is registered (headless/QEMU), the
+///     checksum still proves the drawn surface; the scan-out is never exposed to EL0 either way.
+///   SYS_FUTEX(uaddr, op, val) -> op-specific / -errno
+///     op=0 FUTEX_WAIT: block iff *uaddr == val, keyed by the physical address of uaddr (bounded queue).
+///     op=1 FUTEX_WAKE: wake up to `val` waiters on that key; returns the count woken. Enough for a
+///     userspace mutex/condvar. `uaddr` is validated to lie in the caller's writable user window.
+const SYS_FB_MAP: u64 = 24;
+const SYS_FB_PRESENT: u64 = 25;
+const SYS_FUTEX: u64 = 26;
+/// SYS_FUTEX sub-ops (in x1).
+const FUTEX_WAIT: u64 = 0;
+const FUTEX_WAKE: u64 = 1;
+
 /// M6e demo: the sentinel `sys_exit` status the preemption spinner uses so its exit is accounted to
 /// `EL0_SPIN_DONE` and never perturbs the M6b `exited/killed` counters. Demo-only — there is no real
 /// userspace yet, so overloading one status value for demo bookkeeping is safe and documented here.
@@ -5564,6 +5586,7 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
             bandy_report(a0);
             elf1_report(a0);
             threads_report(a0);
+            fb_report(a0);
             0
         }
         SYS_YIELD => sys_yield(),
@@ -5586,6 +5609,9 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
         SYS_THREAD_SPAWN => sys_thread_spawn(a0, a1, a2, a3),
         SYS_THREAD_JOIN => sys_thread_join(a0),
         SYS_THREAD_EXIT => sys_thread_exit(), // never returns
+        SYS_FB_MAP => sys_fb_map(),
+        SYS_FB_PRESENT => sys_fb_present(),
+        SYS_FUTEX => sys_futex(a0, a1, a2),
         SYS_EXIT => {
             // Demo accounting BEFORE the no-return exit. The sentinel statuses are routed to their own
             // counters so the M6b (`exited=1 killed=3`) and M6e (`completed=1`) verdicts stay byte-
@@ -5709,6 +5735,10 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
                 // NAME (like elf1-hello) so it lands in the ELF-2 witness, never the M6b `EL0_EXITED_OK`
                 // accounting. The worker threads exit via SYS_THREAD_EXIT (not here).
                 THREADS_PARENT_DONE.store(a0 == 0, Ordering::Release);
+            } else if super::sched::current_name() == Some("el0-fb") {
+                // ELF-3: the fb-test PARENT exits (status 0) after presenting + joining both draw threads.
+                // Route by NAME so it lands in the ELF-3 witness, never the M6b `EL0_EXITED_OK` accounting.
+                FB_PARENT_DONE.store(a0 == 0, Ordering::Release);
             } else if a0 == M6E_SPIN_STATUS {
                 EL0_SPIN_DONE.fetch_add(1, Ordering::AcqRel);
             } else if a0 == M6D_EXIT_STATUS {
@@ -8457,6 +8487,375 @@ fn threads_launcher(_demo_cpu: usize) {
 }
 
 // =============================================================================================
+// ELF-3: give EL0 something to draw on (SYS_FB_MAP / SYS_FB_PRESENT) + real sync (SYS_FUTEX).
+//
+// SYS_FB_MAP maps a per-process, kernel-allocated OFF-SCREEN surface (EL0-RW, Normal-cacheable) plus a
+// read-only INFO page into the caller's EL0 window (see `boot::map_slot_fb`). EL0 draws into the surface
+// but NEVER touches the real scan-out: only the kernel composites it, via SYS_FB_PRESENT, which calls a
+// present hook the video subsystem registers (`register_fb_present_hook`) — the existing dirty-rect
+// damage+flush path. SYS_FUTEX gives EL0 a real wait/wake primitive (a userspace mutex/condvar can be
+// built on it), keyed by the physical address of the user word (see `sched::futex_wait/_wake`).
+//
+// The test (`__fb_prog_*`): the parent maps the surface, reads its geometry from the RO info page, spawns
+// 2 draw threads (one co-located, one on a sibling core) that each fill THEIR HALF of the surface, an
+// atomic counter + FUTEX wake/wait synchronises the parent to both halves being drawn, the parent PRESENTS
+// (the kernel checksums the surface), joins both threads, and exits. The witness self-verifies the drawn
+// bytes against the kernel-computed expected checksum.
+// =============================================================================================
+
+/// The FB info-page magic (first u32) — proves EL0 read a real, kernel-written info page.
+const FB_MAGIC: u32 = 0xFB01_0000;
+/// The FB pixel format tag written into the info page (ARGB8888, 4 bytes/pixel).
+const FB_FORMAT_ARGB8888: u32 = 1;
+
+/// ELF-3 present hook: the signature the video/compositor subsystem registers to composite an EL0
+/// process's off-screen surface onto the real framebuffer. `(surface_ptr, width, height, stride)`; the
+/// surface is kernel-owned (EL1 identity pointer), so the hook may blit + damage-flush it directly.
+pub type FbPresentFn = fn(*const u8, u32, u32, u32);
+
+/// The registered present hook, as a raw fn-pointer word (0 = none). SYS_FB_PRESENT calls it if set.
+static FB_PRESENT_HOOK: AtomicU64 = AtomicU64::new(0);
+
+/// ELF-3 PRESENT SEAM (public, in-lane): the video subsystem registers its blit-to-scan-out hook here at
+/// init. SYS_FB_PRESENT calls it to composite the kernel-owned off-screen surface to the real framebuffer
+/// through the existing dirty-rect damage+flush machinery. EL0 never gets the scan-out — only this kernel
+/// path touches it. DEFERRED WIRING (3 lines, outside this lane — `video/screen.rs` init):
+///     use crate::arch::aarch64::syscall::register_fb_present_hook;
+///     register_fb_present_hook(|surf, w, h, stride| Screen::global().blit_surface(surf, w, h, stride));
+/// Until wired, SYS_FB_PRESENT is a no-op composite (the checksum witness still proves the drawn surface).
+pub fn register_fb_present_hook(f: FbPresentFn) {
+    FB_PRESENT_HOOK.store(f as usize as u64, Ordering::Release);
+}
+
+/// Translate a validated EL0 user VA to its physical address via `AT s1e0r` (the futex key). Returns 0 on
+/// a translation fault (F=1). Masks IRQ across the AT->MRS pair (PAR_EL1 is per-core state any AT clobbers).
+fn user_va_to_phys(va: u64) -> u64 {
+    let (par, daif): (u64, u64);
+    unsafe {
+        core::arch::asm!(
+            "mrs {daif}, DAIF",
+            "msr DAIFSet, #2",
+            "at s1e0r, {va}",
+            "isb",
+            "mrs {par}, PAR_EL1",
+            "msr DAIF, {daif}",
+            va = in(reg) va,
+            par = out(reg) par,
+            daif = out(reg) daif,
+            options(nostack, preserves_flags),
+        );
+    }
+    if par & 1 != 0 {
+        return 0; // PAR_EL1.F = 1 -> translation fault
+    }
+    (par & 0x0000_FFFF_FFFF_F000) | (va & 0xFFF)
+}
+
+/// SYS_FB_MAP(): map the caller's off-screen surface + RO info page into its EL0 window and return the
+/// surface VA. Requires a per-process slot (ASID != 0); `-EINVAL` from the shared/boot context. Idempotent
+/// (re-mapping re-writes the same leaves + info). The info page carries the geometry EL0 needs to draw.
+fn sys_fb_map() -> i64 {
+    let asid = current_asid();
+    if asid == 0 || asid as usize > super::boot::USER_SLOTS {
+        return EINVAL;
+    }
+    let slot = (asid - 1) as usize;
+    unsafe { super::boot::map_slot_fb(slot) };
+    // Write the geometry into the RO info page through the kernel identity pointer (EL1-RW; the EL0 alias
+    // is read-only). u32 fields: [magic, width, height, stride, format, size, surface_offset].
+    let info = super::boot::slot_fb_info_ptr(slot) as *mut u32;
+    unsafe {
+        info.add(0).write_volatile(FB_MAGIC);
+        info.add(1).write_volatile(super::boot::FB_SURFACE_W);
+        info.add(2).write_volatile(super::boot::FB_SURFACE_H);
+        info.add(3).write_volatile(super::boot::FB_SURFACE_STRIDE);
+        info.add(4).write_volatile(FB_FORMAT_ARGB8888);
+        info.add(5).write_volatile(super::boot::FB_SURFACE_SIZE as u32);
+        info.add(6).write_volatile(super::boot::FB_INFO_SIZE as u32); // surface offset from the info base
+    }
+    super::boot::fb_surface_va() as i64
+}
+
+/// FNV-1a 64-bit over `n` bytes at `p` — the surface checksum for the self-verifying witness.
+fn fb_checksum(p: *const u8, n: usize) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut i = 0usize;
+    while i < n {
+        let b = unsafe { p.add(i).read_volatile() };
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        i += 1;
+    }
+    h
+}
+
+/// SYS_FB_PRESENT(): composite the caller's surface to the real screen (registered hook) and record its
+/// checksum for the witness. Requires a per-process slot. EL0 never sees the scan-out.
+fn sys_fb_present() -> i64 {
+    let asid = current_asid();
+    if asid == 0 || asid as usize > super::boot::USER_SLOTS {
+        return EINVAL;
+    }
+    let slot = (asid - 1) as usize;
+    let surf = super::boot::slot_fb_surface_ptr(slot);
+    let sum = fb_checksum(surf, super::boot::FB_SURFACE_SIZE);
+    FB_PRESENT_CHECKSUM.store(sum, Ordering::Release);
+    FB_PRESENT_COUNT.fetch_add(1, Ordering::AcqRel);
+    let hook = FB_PRESENT_HOOK.load(Ordering::Acquire);
+    if hook != 0 {
+        // SAFETY: only `register_fb_present_hook` ever stores here, always a valid `FbPresentFn`.
+        let f: FbPresentFn = unsafe { core::mem::transmute(hook as usize) };
+        f(surf as *const u8, super::boot::FB_SURFACE_W, super::boot::FB_SURFACE_H, super::boot::FB_SURFACE_STRIDE);
+    }
+    0
+}
+
+/// SYS_FUTEX(uaddr, op, val): a physical-address-keyed EL0 wait/wake. Validates `uaddr` (4-aligned, inside
+/// the caller's WRITABLE user window — a futex word is RW), translates it to its PA (the key), then:
+///   FUTEX_WAIT: block iff *uaddr == val (return 0 woken, `-EAGAIN` on value mismatch, `-EINVAL` off a task
+///     / table full);
+///   FUTEX_WAKE: wake up to `val` waiters on the key; return the count woken.
+fn sys_futex(uaddr: u64, op: u64, val: u64) -> i64 {
+    if uaddr & 3 != 0 || !user_range_ok(uaddr, 4, true) {
+        return EFAULT;
+    }
+    let key = user_va_to_phys(uaddr);
+    if key == 0 {
+        return EFAULT;
+    }
+    match op {
+        FUTEX_WAIT => match super::sched::futex_wait(key, uaddr, val as u32) {
+            super::sched::FutexWait::Woken => 0,
+            super::sched::FutexWait::Mismatch => EAGAIN,
+            super::sched::FutexWait::TableFull => EAGAIN,
+            super::sched::FutexWait::NoTask => EINVAL,
+        },
+        FUTEX_WAKE => super::sched::futex_wake(key, val as usize) as i64,
+        _ => EINVAL,
+    }
+}
+
+// ELF-3 fb-test witnesses (captured kernel-side, printed by `fb_launcher`).
+static FB_PARENT_DONE: AtomicBool = AtomicBool::new(false); // the parent reached its clean sys_exit(0)
+static FB_PRESENT_COUNT: AtomicU64 = AtomicU64::new(0); // SYS_FB_PRESENT calls (want 1)
+static FB_PRESENT_CHECKSUM: AtomicU64 = AtomicU64::new(0); // checksum of the surface at present time
+static FB_REPORTED_GEOM: AtomicU64 = AtomicU64::new(0); // (width<<16 | height) the parent read from the info page
+
+/// ELF-3: capture the fb-test parent's SYS_REPORT (the width/height it read from the RO info page), keyed by
+/// name. Proves EL0 actually READ the info page. Called from the SYS_REPORT arm; ignores other names.
+fn fb_report(value: u64) {
+    if super::sched::current_name() == Some("el0-fb") {
+        FB_REPORTED_GEOM.store(value, Ordering::Release);
+    }
+}
+
+/// The kernel-computed EXPECTED surface checksum: worker A fills the TOP half with 0xA1 bytes, worker B the
+/// BOTTOM half with 0xB2 bytes (see the blob). The witness PASSes only if the presented surface matches.
+fn fb_expected_checksum() -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let half = super::boot::FB_SURFACE_SIZE / 2;
+    let mut i = 0usize;
+    while i < super::boot::FB_SURFACE_SIZE {
+        let b: u8 = if i < half { 0xA1 } else { 0xB2 };
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        i += 1;
+    }
+    h
+}
+
+// The fb-test EL0 program: a parent + a draw worker, one code page (RX), sharing the slot's data/stack
+// pages AND the mapped FB surface. Position-independent (`adr __fb_blob_start` recovers the window base).
+// Window layout: page 0 code; the sync word (done-counter) at base+0x1000; worker A stack top base+0x3000,
+// worker B base+0x3800, parent stack the launcher-set window top. The FB surface (base+0x5000) and RO info
+// page (base+0x4000) live in the reserved hole above the window, mapped by SYS_FB_MAP.
+core::arch::global_asm!(
+    r#"
+    .balign 4
+    .globl __fb_blob_start
+__fb_blob_start:
+    .globl __fb_prog_parent
+__fb_prog_parent:
+    adr  x9, __fb_blob_start               // x9 = window base (PC-relative), preserved across svc
+    mov  x8, #24                           // SYS_FB_MAP
+    svc  #0                                // x0 = surface VA (workers recompute it PC-relatively)
+    // read geometry from the RO info page (base+0x4000): width@+4, height@+8 -> report (w<<16 | h)
+    add  x10, x9, #0x4000
+    ldr  w11, [x10, #4]                    // width
+    ldr  w12, [x10, #8]                    // height
+    lsl  w11, w11, #16
+    orr  w11, w11, w12
+    mov  x0, x11                           // SYS_REPORT(width<<16 | height)
+    mov  x8, #3
+    svc  #0
+    add  x20, x9, #0x1000                  // x20 = the done-counter / futex word
+    str  wzr, [x20]                        // zero it before any worker increments
+    dmb  ish
+    adr  x21, __fb_prog_worker             // x21 = worker entry VA
+    // worker A: caller's core (place 0), arg 0 (top half), stack top base+0x3000
+    mov  x0, x21
+    add  x1, x9, #0x3000
+    mov  x2, #0
+    mov  x3, #0
+    mov  x8, #21                           // SYS_THREAD_SPAWN
+    svc  #0
+    mov  x23, x0                           // x23 = handle_a
+    // worker B: sibling core (place 1), arg 1 (bottom half), stack top base+0x3800
+    mov  x0, x21
+    add  x1, x9, #0x3000
+    add  x1, x1, #0x800
+    mov  x2, #1
+    mov  x3, #1
+    mov  x8, #21
+    svc  #0
+    mov  x24, x0                           // x24 = handle_b
+    // futex wait loop: block until the done-counter reaches 2 (both halves drawn)
+1:  ldr  w25, [x20]                        // v = done counter
+    cmp  w25, #2
+    b.ge 2f
+    mov  x0, x20                           // SYS_FUTEX(uaddr=counter, FUTEX_WAIT, expected=v)
+    mov  x1, #0
+    mov  x2, x25
+    mov  x8, #26
+    svc  #0
+    b    1b
+2:  mov  x8, #25                           // SYS_FB_PRESENT (kernel checksums + composites)
+    svc  #0
+    mov  x0, x23                           // SYS_THREAD_JOIN(handle_a)  (reap)
+    mov  x8, #23
+    svc  #0
+    mov  x0, x24                           // SYS_THREAD_JOIN(handle_b)
+    mov  x8, #23
+    svc  #0
+    mov  x0, #1                            // SYS_WRITE(fd=1, msg, 16)
+    adr  x1, __fb_msg
+    mov  x2, #16
+    mov  x8, #1
+    svc  #0
+    mov  x0, #0                            // SYS_EXIT(0) -> routed to the ELF-3 witness by name
+    mov  x8, #2
+    svc  #0
+3:  b 3b
+
+    .balign 4
+    .globl __fb_prog_worker
+__fb_prog_worker:
+    // x0 = arg (0 = top half / 0xA1, 1 = bottom half / 0xB2).
+    adr  x9, __fb_blob_start               // x9 = window base
+    add  x12, x9, #0x5000                  // x12 = surface VA (base + 0x4000 info + 0x1000)
+    mov  x13, #2048                        // half the 4096-byte surface
+    cbz  x0, 4f
+    add  x12, x12, x13                     // bottom half start
+    mov  w14, #0xB2
+    b    5f
+4:  mov  w14, #0xA1
+5:  orr  w14, w14, w14, lsl #8             // replicate the fill byte across the word
+    orr  w14, w14, w14, lsl #16
+    mov  x15, #0
+6:  str  w14, [x12, x15]                   // fill this half of the surface
+    add  x15, x15, #4
+    cmp  x15, x13
+    b.lt 6b
+    dmb  ish                               // publish the drawn bytes before signalling done
+    add  x16, x9, #0x1000                  // the done-counter / futex word
+7:  ldxr w17, [x16]                        // atomic increment (A72 LL/SC)
+    add  w17, w17, #1
+    stxr w18, w17, [x16]
+    cbnz w18, 7b
+    dmb  ish
+    mov  x0, x16                           // SYS_FUTEX(uaddr=counter, FUTEX_WAKE, 1) — wake the parent
+    mov  x1, #1
+    mov  x2, #1
+    mov  x8, #26
+    svc  #0
+    mov  x8, #22                           // SYS_THREAD_EXIT (posts completion; never returns)
+    svc  #0
+8:  b 8b
+
+    .balign 4
+    .globl __fb_msg
+__fb_msg:
+    .ascii "fb presented ok\n"
+    .balign 4
+    .globl __fb_blob_end
+__fb_blob_end:
+"#
+);
+
+unsafe extern "C" {
+    static __fb_blob_start: u8;
+    static __fb_blob_end: u8;
+    static __fb_prog_parent: u8;
+}
+
+/// ELF-3 fb-test launcher + verdict (the `threads_launcher` shape: one gated kernel task, self-contained,
+/// its own uncounted `:: EL0: fb test — … ::` line). Copies the fb blob into a fresh slot's code page,
+/// protects it EL0-RX/EL1-RO, endows a console cap, initialises the futex pool, and runs the parent
+/// `el0-fb` on THIS core (so the cooperative-yield verdict drives it under QEMU). The parent maps its FB
+/// surface, spawns 2 draw threads that fill halves under futex sync, presents (the kernel checksums the
+/// surface), joins, and exits. The verdict prints the authoritative witness with the mapped geometry, the
+/// present count, and the surface checksum — self-verified against `fb_expected_checksum`. Runs AFTER
+/// `threads_launcher`'s verdict, so its reuse of the shared SYS_THREAD_* accounting perturbs nothing.
+fn fb_launcher(_demo_cpu: usize) {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let bstart = &raw const __fb_blob_start as usize;
+    let bend = &raw const __fb_blob_end as usize;
+    let blen = bend - bstart;
+    if blen > super::boot::USER_CODE_SIZE {
+        serial_println!(":: EL0: fb test — blob {} B > code page, SKIP ::", blen);
+        return;
+    }
+    super::sched::futex_init();
+    let (base, size) = super::boot::user_region();
+    let sp = (base + size as u64) & !0xF; // 16-aligned window top = the parent's initial SP_EL0
+    let Some(slot) = super::boot::alloc_user_slot() else {
+        serial_println!(":: EL0: fb test — no free address-space slot, SKIP ::");
+        return;
+    };
+    let backing = super::boot::slot_backing_ptr(slot);
+    unsafe { core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen) };
+    super::cache::icache_sync_range(backing as usize, blen);
+    unsafe { super::boot::protect_user_slot_code(slot, super::boot::USER_CODE_SIZE) };
+    let ttbr0 = super::boot::slot_ttbr0(slot);
+    install_console_cap(ttbr0 >> 48);
+    let entry = base + (&raw const __fb_prog_parent as usize - bstart) as u64;
+    let run_cpu = super::percpu::this_cpu().cpu_index as usize;
+    super::sched::spawn_user_slot("el0-fb", entry, sp, ttbr0, run_cpu);
+
+    // Verdict: yield (bounded ~2 s) so el0-fb + its co-located worker run on this core until the parent exits.
+    let vstart = super::timer::cntpct();
+    let vdeadline = 2 * super::timer::cntfrq();
+    while !FB_PARENT_DONE.load(Ordering::Acquire)
+        && super::timer::cntpct().wrapping_sub(vstart) <= vdeadline
+    {
+        super::sched::yield_now();
+    }
+    let done = FB_PARENT_DONE.load(Ordering::Acquire);
+    let present = FB_PRESENT_COUNT.load(Ordering::Acquire);
+    let checksum = FB_PRESENT_CHECKSUM.load(Ordering::Acquire);
+    let geom = FB_REPORTED_GEOM.load(Ordering::Acquire);
+    let w = (geom >> 16) as u32;
+    let h = (geom & 0xFFFF) as u32;
+    let expect = fb_expected_checksum();
+    let geom_ok = w == super::boot::FB_SURFACE_W && h == super::boot::FB_SURFACE_H;
+    if done && present == 1 && geom_ok && checksum == expect {
+        serial_println!(
+            ":: EL0: fb test — mapped={}x{} threads=2 present={} checksum={:#x} :: PASS ::",
+            w, h, present, checksum
+        );
+    } else {
+        serial_println!(
+            ":: EL0: fb test — mapped={}x{} threads=2 present={} checksum={:#x} (want {}x{}/1/{:#x} done={}) :: FAIL ::",
+            w, h, present, checksum,
+            super::boot::FB_SURFACE_W, super::boot::FB_SURFACE_H, expect, done
+        );
+    }
+}
+
+// =============================================================================================
 // U4: the process-model demo — the parent + orphan slots + the gated launcher/verdict
 // =============================================================================================
 
@@ -9229,6 +9628,12 @@ pub fn u7_launcher(demo_cpu: usize) {
     // fixture battery or the FAT witnesses; its own uncounted `:: EL0: threads test — … ::` line. Placed after
     // ELF-1 (the loader is proven; this exercises the thread primitives on top of the same slot machinery).
     threads_launcher(demo_cpu);
+    // ELF-3: give EL0 something to draw on + real sync — SYS_FB_MAP / SYS_FB_PRESENT / SYS_FUTEX. The parent
+    // maps a per-process off-screen surface, 2 threads draw halves under futex sync, the parent presents (the
+    // kernel checksums + composites through the registered present hook), and the witness self-verifies the
+    // drawn bytes against the expected checksum. In-RAM (no disk), so it can never perturb the fixture battery;
+    // its own uncounted `:: EL0: fb test — … ::` line. Placed after ELF-2 (the thread primitives it builds on).
+    fb_launcher(demo_cpu);
     // K3: the revoke-persist commit-ordering proof — a named-owner file's SYS_FGRANT revoke commits to disk
     // BEFORE the in-RAM removal, so it SURVIVES REBOOT and fails CLOSED on a persist failure. Its own uncounted
     // `:: K3-revoke: … PASS ::` line; fully self-cleaning (leaves no owned row on the metal card).

@@ -53,9 +53,32 @@ static mut L3_USER: PageTable = PageTable([0; 512]);
 pub const USER_REGION_SIZE: usize = 0x4000; // 16 KiB = 4 pages
 /// The CODE page(s) at the bottom of USER_REGION — the only EL0-executable memory in the system.
 pub const USER_CODE_SIZE: usize = 0x1000;
-#[repr(C, align(0x4000))]
-struct UserRegion([u8; USER_REGION_SIZE]);
-static mut USER_REGION: UserRegion = UserRegion([0; USER_REGION_SIZE]);
+
+// ---------------------------------------------------------------------------------------------
+// ELF-3: the per-process off-screen framebuffer surface (SYS_FB_MAP).
+//
+// A dedicated kernel-allocated surface each EL0 process may map (EL0-RW, Normal-cacheable) plus a
+// read-only info page (geometry). It lives in the RESERVED VA HOLE immediately ABOVE the 16 KiB EL0
+// program window — the backing is carried per-slot (see `SLOT_BACKING`), and each slot's L3 maps it
+// only after `map_slot_fb` is called (from SYS_FB_MAP). EL0 NEVER gets the real scan-out: the kernel
+// composites the surface to the screen through SYS_FB_PRESENT (a public present hook the video
+// subsystem registers). Small (a 32×32 ARGB8888 surface = one page) — the point is the mechanism, not
+// resolution. Layout in the hole: [+0x4000] RO info page (1 page), [+0x5000] RW surface (1 page).
+pub const FB_INFO_SIZE: usize = 0x1000; // the read-only geometry page (1 page)
+pub const FB_SURFACE_W: u32 = 32;
+pub const FB_SURFACE_H: u32 = 32;
+pub const FB_SURFACE_STRIDE: u32 = FB_SURFACE_W * 4; // ARGB8888, 4 bytes/pixel
+pub const FB_SURFACE_SIZE: usize = (FB_SURFACE_STRIDE * FB_SURFACE_H) as usize; // 4096 = 1 page
+/// The FB info + surface VA hole reserved above the program window.
+pub const FB_REGION_SIZE: usize = FB_INFO_SIZE + FB_SURFACE_SIZE; // 0x2000
+
+/// Total per-slot reserved region: the 16 KiB EL0 program window + the FB info/surface hole. Aligned to
+/// 0x8000 (>= the 0x6000 size) so the whole region is STRUCTURALLY guaranteed to fall inside one 2 MiB
+/// L3_USER block (0x8000 divides 2 MiB, and size <= 0x8000, so it can never straddle a 2 MiB boundary).
+const USER_STATIC_SIZE: usize = USER_REGION_SIZE + FB_REGION_SIZE; // 0x6000
+#[repr(C, align(0x8000))]
+struct UserRegion([u8; USER_STATIC_SIZE]);
+static mut USER_REGION: UserRegion = UserRegion([0; USER_STATIC_SIZE]);
 
 // --- Translation attributes (ARM ARM DDI0487). We drop to EL1 (see `drop_to_el1`) before enabling
 // the MMU, so these program the EL1&0 regime (TTBR0_EL1/TCR_EL1/MAIR_EL1/SCTLR_EL1). ---
@@ -141,6 +164,13 @@ const fn user_data_page(pa: u64) -> u64 {
 const fn user_code_page(pa: u64) -> u64 {
     pa | DESC_NG | DESC_PXN | AP_RO_ALL | DESC_AF | SH_INNER | ATTR_NORMAL | DESC_PAGE
 }
+/// L3 4 KiB USER READ-ONLY DATA page (ELF-3 FB info page): Normal cacheable, read-only at BOTH ELs
+/// (AP=0b11), never executable at either EL (UXN|PXN), non-global. EL0 can read it; the kernel writes
+/// the geometry through the IDENTITY backing pointer (EL1-RW under the plain RAM mapping), never this
+/// EL0 VA — so EL0 can never mutate the info page.
+const fn user_ro_page(pa: u64) -> u64 {
+    pa | DESC_NG | DESC_UXN | DESC_PXN | AP_RO_ALL | DESC_AF | SH_INNER | ATTR_NORMAL | DESC_PAGE
+}
 /// A table descriptor pointing at the next-level table. Mask to bits[47:12] so no stray bits land in
 /// the table-attribute fields [63:59] (NSTable/APTable/UXNTable/PXNTable); leaving them 0 adds no
 /// restriction at this level, so the leaf page's own AP/XN govern.
@@ -174,8 +204,8 @@ fn build_l1() {
     // Structurally guaranteed by align(0x4000) == the region size; documents that every page falls
     // inside the ONE 2 MiB block L3_USER covers (a straddling tail would silently stay EL1-only).
     debug_assert!(
-        user_pa >> 21 == (user_pa + USER_REGION_SIZE as u64 - 1) >> 21,
-        "USER_REGION straddles a 2 MiB block"
+        user_pa >> 21 == (user_pa + USER_STATIC_SIZE as u64 - 1) >> 21,
+        "USER_REGION (incl. the FB hole) straddles a 2 MiB block"
     );
     let l2_idx = (user_pa >> 21) as usize; // the 2 MiB block of 0–1 GiB that holds USER_REGION
     let l3_base = (l2_idx as u64) << 21; // that block's base PA
@@ -344,7 +374,7 @@ static mut SLOT_L1: [PageTable; USER_SLOTS] = [const { PageTable([0; 512]) }; US
 static mut SLOT_L2: [PageTable; USER_SLOTS] = [const { PageTable([0; 512]) }; USER_SLOTS];
 static mut SLOT_L3: [PageTable; USER_SLOTS] = [const { PageTable([0; 512]) }; USER_SLOTS];
 static mut SLOT_BACKING: [UserRegion; USER_SLOTS] =
-    [const { UserRegion([0; USER_REGION_SIZE]) }; USER_SLOTS];
+    [const { UserRegion([0; USER_STATIC_SIZE]) }; USER_SLOTS];
 /// Allocation state, one flag per slot. Atomic so `alloc`/`teardown` are race-free across cores.
 static SLOT_USED: [AtomicBool; USER_SLOTS] = [const { AtomicBool::new(false) }; USER_SLOTS];
 
@@ -538,6 +568,64 @@ pub unsafe fn protect_user_slot_code_range(s: usize, off: usize, len: usize) {
             va += 0x1000;
         }
         core::arch::asm!("dsb ish", "isb", options(nostack, preserves_flags));
+    }
+}
+
+/// ELF-3: the EL0 VA of slot `s`'s FB info page (read-only geometry) — the shared user-window VA hole
+/// immediately above the 16 KiB program window. Same VA in every slot; the FRAME differs per slot (its
+/// own backing), installed by `map_slot_fb`.
+pub fn fb_info_va() -> u64 {
+    (&raw const USER_REGION as u64) + USER_REGION_SIZE as u64
+}
+/// ELF-3: the EL0 VA of slot `s`'s FB surface (EL0-RW off-screen draw target), one page above the info
+/// page. This is what SYS_FB_MAP returns to EL0.
+pub fn fb_surface_va() -> u64 {
+    fb_info_va() + FB_INFO_SIZE as u64
+}
+/// ELF-3: kernel-side identity pointer to slot `s`'s FB info page (EL1-RW, the kernel writes geometry
+/// here; the EL0 alias is read-only).
+pub fn slot_fb_info_ptr(s: usize) -> *mut u8 {
+    debug_assert!(s < USER_SLOTS);
+    unsafe { slot_backing_ptr(s).add(USER_REGION_SIZE) }
+}
+/// ELF-3: kernel-side identity pointer to slot `s`'s FB surface (EL1-RW; the kernel reads it to composite
+/// / checksum, EL0 draws into the aliased EL0-RW VA — A72 PIPT caches keep the two coherent).
+pub fn slot_fb_surface_ptr(s: usize) -> *mut u8 {
+    debug_assert!(s < USER_SLOTS);
+    unsafe { slot_backing_ptr(s).add(USER_REGION_SIZE + FB_INFO_SIZE) }
+}
+
+/// ELF-3: map slot `s`'s FB info + surface pages into its EL0 window (from SYS_FB_MAP). The two leaves
+/// were copies of the boot L3 (identity RAM, EL1-only — the reserved hole); this repoints them at the
+/// slot's OWN backing frames: the info page EL0-RO (`user_ro_page`), the surface EL0-RW Normal-cacheable
+/// (`user_data_page`). Because the output address changes on a live valid leaf (not a permission-only
+/// change), the sequence is proper BREAK-BEFORE-MAKE: invalidate the old leaf, broadcast-TLBI, THEN write
+/// the new leaf and publish. Safe against a sibling-core drawing thread because SYS_FB_MAP is called by the
+/// process BEFORE it spawns any drawing thread, so no core walks these VAs during the flip; the `dsb ish`
+/// after the TLBI + `dsb ishst` after the new store make the new mapping visible to every Inner-Shareable
+/// walker before the first draw. Editing only USER leaves in the slot's PRIVATE L3 (in-lane; the per-slot
+/// freeze note in `build_slot` is about KERNEL mappings).
+pub unsafe fn map_slot_fb(s: usize) {
+    debug_assert!(s < USER_SLOTS);
+    let info_va = fb_info_va();
+    let surf_va = fb_surface_va();
+    let info_pa = slot_fb_info_ptr(s) as u64;
+    let surf_pa = slot_fb_surface_ptr(s) as u64;
+    let sl3 = unsafe { (&raw mut SLOT_L3).cast::<PageTable>().add(s).cast::<u64>() };
+    let info_idx = ((info_va >> 12) & 0x1FF) as usize;
+    let surf_idx = ((surf_va >> 12) & 0x1FF) as usize;
+    unsafe {
+        // Break: invalidate the old (identity, EL1-only) leaves.
+        sl3.add(info_idx).write_volatile(0);
+        sl3.add(surf_idx).write_volatile(0);
+        core::arch::asm!("dsb ishst", options(nostack, preserves_flags));
+        core::arch::asm!("tlbi vaae1is, {}", in(reg) (info_va >> 12), options(nostack, preserves_flags));
+        core::arch::asm!("tlbi vaae1is, {}", in(reg) (surf_va >> 12), options(nostack, preserves_flags));
+        core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+        // Make: install the FB frames (info EL0-RO, surface EL0-RW), then publish + sync this core.
+        sl3.add(info_idx).write_volatile(user_ro_page(info_pa));
+        sl3.add(surf_idx).write_volatile(user_data_page(surf_pa));
+        core::arch::asm!("dsb ishst", "isb", options(nostack, preserves_flags));
     }
 }
 

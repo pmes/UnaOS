@@ -1820,6 +1820,203 @@ impl Semaphore {
 }
 
 // ---------------------------------------------------------------------------------------------
+// ELF-3: futex — a physical-address-keyed EL0 wait/wake primitive (backs SYS_FUTEX)
+// ---------------------------------------------------------------------------------------------
+//
+// A futex lets EL0 build a userspace mutex/condvar: block on a u32 user word iff it still holds an
+// expected value, and wake N blocked waiters. The KEY is the word's PHYSICAL address — globally unique,
+// so the threads of one process (same slot backing frame) that share a word key on the same bucket, and
+// two different processes never collide. Bucket selection reuses the exact Semaphore lock-handoff park
+// (PARK_WAITQ): the blocking task holds the bucket lock across the switch, the scheduler pushes its Box
+// then releases the lock — lost-wakeup-safe. A small fixed pool of buckets (one per live key); the ELF-3
+// test uses ONE. `-EAGAIN`-equivalent (TableFull) when every bucket is serving a different live key.
+
+/// Distinct futex keys the kernel can have waiters parked on at once (never grown — same discipline as
+/// the thread/proc tables).
+const NFUTEX: usize = 16;
+
+/// One futex wait bucket: a keyed FIFO wait queue with a Semaphore-style raw lock handed to the scheduler.
+struct FutexBucket {
+    /// Raw spinlock guarding `key` + `waiters` (Acquire on lock, Release on unlock; the PARK_WAITQ
+    /// lock-handoff releases it AFTER the scheduler pushes the blocking Box).
+    locked: AtomicBool,
+    /// The physical-address key this bucket serves, or 0 = free. Claimed on the first waiter for a key,
+    /// released back to 0 when its last waiter leaves.
+    key: AtomicU64,
+    /// FIFO waiter list; touched only under `locked`, pre-reserved by `futex_init`.
+    waiters: UnsafeCell<VecDeque<Box<Task>>>,
+}
+
+// SAFETY: every access to `key`/`waiters` is serialised by `locked`; identical argument to `Semaphore`.
+unsafe impl Sync for FutexBucket {}
+
+impl FutexBucket {
+    const fn new() -> Self {
+        FutexBucket {
+            locked: AtomicBool::new(false),
+            key: AtomicU64::new(0),
+            waiters: UnsafeCell::new(VecDeque::new()),
+        }
+    }
+    #[inline]
+    fn lock_raw(&self) {
+        while self.locked.swap(true, Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
+    }
+    #[inline]
+    fn unlock_raw(&self) {
+        self.locked.store(false, Ordering::Release);
+    }
+    #[inline]
+    fn waiters_empty(&self) -> bool {
+        unsafe { (*self.waiters.get()).is_empty() }
+    }
+}
+
+static FUTEX: [FutexBucket; NFUTEX] = [const { FutexBucket::new() }; NFUTEX];
+
+/// Reserve every futex bucket's waiter capacity on the BSP before any task can park on one (so the
+/// scheduler's park-side `push_back` never reallocates under the held lock). Call once at boot / before
+/// the first `futex_wait`.
+pub fn futex_init() {
+    for b in FUTEX.iter() {
+        b.lock_raw();
+        unsafe { (*b.waiters.get()).reserve(WAIT_CAPACITY) };
+        b.unlock_raw();
+    }
+}
+
+/// Outcome of `futex_wait`.
+pub enum FutexWait {
+    /// Was blocked, then woken by a `futex_wake` on the same key.
+    Woken,
+    /// `*uaddr != expected` at the compare — the caller must re-check and loop (no sleep happened).
+    Mismatch,
+    /// Every bucket is busy with a different live key — the futex pool is exhausted.
+    TableFull,
+    /// Called off a scheduled task (no `current` to park) — cannot block.
+    NoTask,
+}
+
+/// FUTEX_WAIT: block the current task on `key` iff the u32 at `uaddr` still equals `expected`. The compare
+/// is performed UNDER the bucket lock, and any `futex_wake(key, ..)` must take that same lock, so a wake
+/// can never slip between the compare and the park being enqueued (the classic race-free compare-and-block).
+/// `key` MUST be the physical address of `uaddr`. `uaddr` must already be validated (in the caller's user
+/// window) by the syscall layer; this reads it at EL1 (the syscall runs with the caller's TTBR0 live).
+pub fn futex_wait(key: u64, uaddr: u64, expected: u32) -> FutexWait {
+    debug_assert!(key != 0, "futex key must be non-zero");
+    let daif = irq_save_mask();
+    // Select the bucket: an existing one for this key, else claim a free one. Left LOCKED on success.
+    let mut chosen: Option<&FutexBucket> = None;
+    for b in FUTEX.iter() {
+        b.lock_raw();
+        if b.key.load(Ordering::Relaxed) == key {
+            chosen = Some(b);
+            break;
+        }
+        b.unlock_raw();
+    }
+    let b = match chosen {
+        Some(b) => b,
+        None => {
+            let mut claimed = None;
+            for b in FUTEX.iter() {
+                b.lock_raw();
+                if b.key.load(Ordering::Relaxed) == 0 {
+                    b.key.store(key, Ordering::Relaxed);
+                    claimed = Some(b);
+                    break;
+                }
+                b.unlock_raw();
+            }
+            match claimed {
+                Some(b) => b,
+                None => {
+                    irq_restore(daif);
+                    return FutexWait::TableFull;
+                }
+            }
+        }
+    };
+    // b is locked and serves `key`. Compare-and-block under the lock.
+    let cur = unsafe { core::ptr::read_volatile(uaddr as *const u32) };
+    if cur != expected {
+        if b.waiters_empty() {
+            b.key.store(0, Ordering::Relaxed); // release a bucket we claimed but won't park on
+        }
+        b.unlock_raw();
+        irq_restore(daif);
+        return FutexWait::Mismatch;
+    }
+    let cpu = percpu::this_cpu().cpu_index as usize;
+    let raw = SCHED[cpu].current.load(Ordering::Acquire) as *mut Task;
+    if raw.is_null() {
+        if b.waiters_empty() {
+            b.key.store(0, Ordering::Relaxed);
+        }
+        b.unlock_raw();
+        irq_restore(daif);
+        return FutexWait::NoTask;
+    }
+    assert!(
+        unsafe { (*b.waiters.get()).len() } < WAIT_CAPACITY,
+        "futex waiter overflow (raise WAIT_CAPACITY)"
+    );
+    unsafe {
+        debug_assert_eq!((*raw).cpu as usize, cpu, "futex_wait: task on the wrong CPU");
+        (*raw).state.store(STATE_BLOCKED, Ordering::Release);
+        // Hand the scheduler this bucket's waiter list + lock (PARK_WAITQ lock-handoff — see Semaphore::wait).
+        SCHED[cpu].park_waiters.store(b.waiters.get() as u64, Ordering::Relaxed);
+        SCHED[cpu].park_lock.store(&b.locked as *const AtomicBool as u64, Ordering::Relaxed);
+        SCHED[cpu].park_kind.store(PARK_WAITQ, Ordering::Relaxed);
+        switch_context(&raw mut (*raw).ctx_sp, SCHED[cpu].scheduler_sp.load(Ordering::Acquire));
+    }
+    // Resumed once `futex_wake` moved us back to our run queue (it released the lock).
+    irq_restore(daif);
+    FutexWait::Woken
+}
+
+/// FUTEX_WAKE: wake up to `n` waiters parked on `key`; returns the number actually woken. Releases the
+/// bucket back to free once its last waiter leaves. Waiters are re-readied OUTSIDE the bucket lock (the
+/// run-queue lock must never nest under it — same rule as `Semaphore::post`).
+pub fn futex_wake(key: u64, n: usize) -> usize {
+    debug_assert!(key != 0, "futex key must be non-zero");
+    let daif = irq_save_mask();
+    let mut woken = 0usize;
+    for b in FUTEX.iter() {
+        b.lock_raw();
+        if b.key.load(Ordering::Relaxed) != key {
+            b.unlock_raw();
+            continue;
+        }
+        while woken < n {
+            let next = unsafe { (*b.waiters.get()).pop_front() };
+            match next {
+                Some(task) => {
+                    b.unlock_raw();
+                    make_ready(task);
+                    woken += 1;
+                    b.lock_raw();
+                    // A concurrent drain may have freed + reclaimed this bucket for another key; stop.
+                    if b.key.load(Ordering::Relaxed) != key {
+                        break;
+                    }
+                }
+                None => break,
+            }
+        }
+        if b.key.load(Ordering::Relaxed) == key && b.waiters_empty() {
+            b.key.store(0, Ordering::Relaxed); // last waiter gone — release the bucket
+        }
+        b.unlock_raw();
+        break;
+    }
+    irq_restore(daif);
+    woken
+}
+
+// ---------------------------------------------------------------------------------------------
 // Mutex<T> — a sleeping mutual-exclusion lock (a binary semaphore guarding owned data)
 // ---------------------------------------------------------------------------------------------
 
