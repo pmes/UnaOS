@@ -3,6 +3,31 @@
 Hard-won silicon facts from the fox-metal sitting series. Trust these over any
 QEMU behavior. Newest sitting first.
 
+## Sitting #10 (igpu pull 5 + kepler pull 11, UnaOS-gemini@dffa7816, 2026-07-22, fox-metal-r23s1h)
+
+**Boot 1 — GMUX PROTOCOL PROVEN, PANEL OWNER NAMED (canon reversal):**
+- Version 3.2.19 via the 32-bit indexed read (#9's failure was the 3×8-bit
+  variant fact, confirmed); MAX_BRIGHTNESS=0x3FF second proof. Gate PASSED.
+- Decoded, stable at Boot AND Kernel: **SW_DISPLAY=0x03 (DISCRETE),
+  SW_DDC=0x02 (DISCRETE), DISC_POWER=0x03 (ON). The Kepler dGPU owns the
+  panel at every observed instant.**
+- Canon updates:
+  1. iGPU-all-dead (all 4 trace points, reconfirmed this boot) is the
+     EXPECTED state — the iGPU paradox is CLOSED, not mysterious.
+  2. **Sitting #5's gmux/iGPU redirect is formally REVERSED.** The GOP
+     console at 0x90020000 is scanned by the KEPLER; sitting #5's
+     "evo=crtc=0 on all heads" is now the anomaly to re-derive: either the
+     GK107 PDISPLAY head/scanout decode is wrong for this part, or firmware
+     tears the Kepler display engine down at EBS while the gmux keeps the
+     panel wired to it (which would produce exactly the black panel).
+  3. Display line pivots back to Kepler-side scanout derivation
+     (BRIEF-video-pull6-kepler-scanout-rederive in the iGUI lane dir — the
+     display specialist carries it; module split first so the two Kepler
+     lanes don't collide in kepler.rs).
+
+Boot 2 (USERD_SNOOP witness ladder) verdict pending — both wall lines could
+fall in one sitting.
+
 ## Sitting #9 (igpu pull 4 + kepler pull 10, UnaOS-gemini@785a8795, 2026-07-22, fox-metal-r23s1h)
 
 **Boot 1 — gmux handshake: protocol UNPROVEN, but the picture sharpened:**
