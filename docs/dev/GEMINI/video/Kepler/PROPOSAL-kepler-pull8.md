@@ -1,3 +1,22 @@
+STATUS: APPROVED WITH AMENDMENTS (2026-07-22 — reviewer re-verified the two
+load-bearing citations against envytools master: IB_CONFIG 0x4C =
+ADDRESS_HIGH 0-7 / UNK8 8-15 / ORDER 16-31 ✓; PLAYLIST_WR_LEN LEN 0-11 +
+ENG 20-23 GK104- ✓. The ORDER=511 find is the strongest candidate we've had:
+511 is invalid under any reading of a field named ORDER, and log2(512)=9 is
+the natural fix. Binding amendments:
+A1 — the proposal arrived without the STATUS header; restored here. Keep it.
+A2 — the "Cleanroom Debt" section is STALE: the ~465 nouveau/GF119 comment
+was already fixed in pull 7 (0715c94c). Drop it from the implementation; do
+not re-touch that line. Reshipping completed items is the failure mode this
+review process exists to catch.
+A3 — chan_id 0→1 (§a) is an uncited hypothesis, fine as a cheap simultaneous
+change but LABEL it as such in serial output (print the chan id), and §c's
+"ensure we wait" must be concrete: after PLAYLIST_WR/WR_LEN, poll engine-0
+PLAYLIST_RD/RD_LEN (0x2280/0x2284) for the new address/len before the fence
+wait, and print both. If the fence still times out, those breadcrumbs
+separate "runlist not accepted" from "accepted but still unbound".
+Full-knob law applies at land-review. Metal owed: sitting #7.)
+
 # PROPOSAL — Kepler Pull 8: Runlist-Entry & Channel Bind Derivation
 
 This proposal addresses the wall upstream of the PBDMA from sitting #6, where the channel is never scheduled onto a PBDMA. Using `envytools/rnndb/fifo/gf100_pfifo.xml`, we decode the failed `inst-raw` and the runlist mechanics to break the wall.
