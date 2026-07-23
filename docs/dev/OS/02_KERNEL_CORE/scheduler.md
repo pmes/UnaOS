@@ -89,6 +89,17 @@ a **busy** pass (a task was dispatched) or an **idle** pass (empty run queue).
   there is no per-instruction cost. The `SCHED: load cN=..%` line format is
   unchanged; only the meaning of the percentage moved from pass-fraction to
   time-fraction (idle cores now report near 0%, a continuously-running core ~100%).
+- **Idle = wall-minus-busy (SCHED-7).** The idle side is measured as the whole pass
+  span (`t_prev`→now in `run()`) minus the busy span `dispatch_next` folded in that
+  pass (`PASS_BUSY_CYC`), so **every** non-task cycle counts as idle — the WFI *and*
+  the sleeper drain, empty-queue dispatch passes, and any poll-spin where WFI returns
+  immediately. The original SCHED-5 code bracketed only the explicit WFI, leaving
+  those overheads unaccounted; on the input/render cores — whose per-tick peripheral
+  IRQ breaks WFI near-instantly, so only the micro busy spans ever landed in the
+  window — that read a steady phantom `c0=100% c1=100%` while the workloads were
+  provably idle (render parked in `recv`, usb-pump ~60 cyc / 4 ms). Folding
+  wall-minus-busy makes busy% == task-execution / wall-time regardless of whether
+  WFI sleeps, so those cores now read their true near-0%.
 - **Context-switch count.** A cumulative `ctx_switches` per core (one per busy
   dispatch).
 - **Last-scheduled task.** Id + `&'static str` name of the last task dispatched

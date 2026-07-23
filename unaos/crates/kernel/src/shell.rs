@@ -1272,6 +1272,8 @@ fn fmt_mtime(de: &DirEntry) -> String {
 
 /// Print one directory's entries in the `ls` table format, with the file/dir tally. `long` selects the
 /// JD16 `-l` long format (size + FAT last-write timestamp + name), otherwise the classic short table.
+/// PI-SHELL-LS: FAT-only (the x86 storage path); the Pi routes `ls` to unafs via `pi_ls`.
+#[cfg(not(target_arch = "aarch64"))]
 fn print_dir_listing(console: &mut Console, entries: &[DirEntry], long: bool) {
     let (mut files, mut dirs) = (0u32, 0u32);
     for de in entries {
@@ -1294,6 +1296,114 @@ fn print_dir_listing(console: &mut Console, entries: &[DirEntry], long: bool) {
         }
     }
     console.println(&alloc::format!("{} file(s), {} dir(s)", files, dirs));
+}
+
+// ---------------------------------------------------------------------------------------------
+// PI-SHELL-LS — `ls` on the Pi shell lists the NATIVE unafs volume (the SD-card partition), not FAT.
+//
+// The shared `ls`/`dir` arm rides `fat::mount()` — the x86 USB-storage backend. The Pi has no FAT
+// volume mounted (its native store is unafs; FAT on the SD card is only the firmware boot partition),
+// so on the board `ls` printed "ls: no FAT filesystem (...)". The unafs volume DOES work — it is the
+// very volume PI-NET-15 serves at `/fs/` (what Safari sees, K3HELLO.TXT et al.) via the same
+// `with_unafs` + `resolve_path`/`read_inode`/`ls` calls used here. So on aarch64 we route `ls` to
+// unafs and it lists exactly what `/fs/` shows. (x86 keeps the FAT path, unchanged.)
+// ---------------------------------------------------------------------------------------------
+
+/// PI-SHELL-LS: list `path` off the native unafs volume under ONE `with_unafs` hold, returning
+/// `(is_dir, rows)` where each row is `(name, size, is_dir)` sorted by name (`.`/`..`/System entries
+/// filtered — the same subset `/fs/` shows). A directory yields its entries; a plain file yields its
+/// own single row (the DOS `ls <file>` idiom). Any resolve/mount failure surfaces as an errno-tagged
+/// message string. Mirrors `genet::fs_read_dir` so the shell and `/fs/` never disagree.
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::type_complexity)]
+fn pi_ls_collect(path: &str) -> Result<(bool, Vec<(String, u64, bool)>), String> {
+    let listed = crate::fs::unafs::with_unafs(|fs| {
+        let id = fs
+            .resolve_path(path)
+            .map_err(|e| alloc::format!("{}: not found ({:?}, -ENOENT)", path, e))?;
+        let inode = fs
+            .read_inode(id)
+            .map_err(|e| alloc::format!("{}: stat failed ({:?}, -EIO)", path, e))?;
+        if inode.kind == ::unafs::FileKind::Directory {
+            let entries = fs
+                .ls(id)
+                .map_err(|e| alloc::format!("{}: read failed ({:?}, -EIO)", path, e))?;
+            let mut rows: Vec<(String, u64, bool)> = Vec::new();
+            for de in &entries {
+                if de.name == "." || de.name == ".." || de.kind == ::unafs::FileKind::System {
+                    continue;
+                }
+                let sz = fs.read_inode(de.inode_id).map(|i| i.size).unwrap_or(0);
+                rows.push((de.name.clone(), sz, de.kind == ::unafs::FileKind::Directory));
+            }
+            rows.sort_by(|a, b| a.0.cmp(&b.0));
+            Ok::<_, String>((true, rows))
+        } else {
+            let leaf = String::from(path.rsplit('/').next().unwrap_or(path));
+            Ok((false, alloc::vec![(leaf, inode.size, false)]))
+        }
+    });
+    match listed {
+        Ok(inner) => inner,
+        Err(e) => Err(alloc::format!("no unafs volume ({:?})", e)),
+    }
+}
+
+/// PI-SHELL-LS: the Pi `ls`/`dir` core. Resolves `arg` against the cwd, prints the unafs listing in the
+/// same table shape as the FAT path (size + name; a dir shows `<DIR>`), then a per-invocation
+/// `:: ls1: <path>: <names> (N file, M dir) ::` serial witness — the verb renders panel-only on the
+/// bench, so the witness gives a headless capture the same content (the PI-UI-3 `ui3_say` idiom).
+/// unafs inodes carry no last-write time, so `-l` collapses to the short (size + name) form.
+#[cfg(target_arch = "aarch64")]
+fn pi_ls(console: &mut Console, arg: &str, long: bool) {
+    let _ = long; // no mtime in unafs inodes → long format == short format on the Pi
+    let path = normalize_path(&cwd_path(), arg);
+    match pi_ls_collect(&path) {
+        Ok((is_dir, rows)) => {
+            let (mut files, mut dirs) = (0u32, 0u32);
+            for (name, size, row_is_dir) in &rows {
+                if *row_is_dir {
+                    dirs += 1;
+                    console.println(&alloc::format!("  <DIR>         {}", name));
+                } else {
+                    files += 1;
+                    console.println(&alloc::format!("  {:>10}  {}", size, name));
+                }
+            }
+            if is_dir {
+                console.println(&alloc::format!("{} file(s), {} dir(s)", files, dirs));
+            }
+            let names: Vec<&str> = rows.iter().map(|(n, _, _)| n.as_str()).collect();
+            serial_println!(
+                ":: ls1: {}: {} ({} file, {} dir) ::",
+                path, names.join(" "), files, dirs
+            );
+        }
+        Err(msg) => {
+            console.println(&alloc::format!("ls: {}", msg));
+            serial_println!(":: ls1: {}: ERR {} ::", path, msg);
+        }
+    }
+}
+
+/// PI-SHELL-LS boot witness (`witness` battery only): exercise the exact `pi_ls_collect` listing the
+/// shell verb uses, against the unafs root, and emit the `:: ls1: ... ::` line headlessly — so
+/// `UNAOS_PI=1 ./arroyo kernel8-test` proves `ls` works without a serial-console injection path. Quiet
+/// default boots never compile this. Baremetal-gated to match the emmc2 backend the volume rides.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal", feature = "witness"))]
+pub fn pi_ls_witness() {
+    match pi_ls_collect("/") {
+        Ok((_, rows)) => {
+            let names: Vec<&str> = rows.iter().map(|(n, _, _)| n.as_str()).collect();
+            let dirs = rows.iter().filter(|(_, _, d)| *d).count();
+            let files = rows.len() - dirs;
+            serial_println!(
+                ":: ls1: /: {} ({} file, {} dir) ::",
+                names.join(" "), files, dirs
+            );
+        }
+        Err(msg) => serial_println!(":: ls1: /: ERR {} ::", msg),
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1400,6 +1510,8 @@ fn glob_expand(fs: &FatFs, arg: &str) -> Glob {
 /// Resolve `path` and print it in the `ls` table format (the single-path `ls` core, shared by the
 /// `ls` arm and the wildcard `ls *.EXT` Literal fall-through). A directory lists its entries; a plain
 /// file prints its one table line (the DOS idiom); errors are errno-tagged.
+/// PI-SHELL-LS: FAT-only (x86); the Pi lists unafs via `pi_ls`.
+#[cfg(not(target_arch = "aarch64"))]
 fn ls_resolved(console: &mut Console, fs: &FatFs, path: &str, long: bool) {
     match resolve_path(fs, path) {
         Ok(Resolved::Root) => match fs.read_dir(0) {
@@ -1426,6 +1538,7 @@ fn ls_resolved(console: &mut Console, fs: &FatFs, path: &str, long: bool) {
 
 /// JD4 `ls`/`ls <dir>` (single path): mount + resolve + print. Extracted so the wildcard `ls *.EXT`
 /// can share the exact resolve/print behaviour for a non-trailing-glob fall-through.
+#[cfg(not(target_arch = "aarch64"))]
 fn ls_path(console: &mut Console, arg: &str, long: bool) {
     match crate::fs::fat::mount() {
         Ok(fs) => ls_resolved(console, &fs, &normalize_path(&cwd_path(), arg), long),
@@ -1436,6 +1549,7 @@ fn ls_path(console: &mut Console, arg: &str, long: bool) {
 /// JD12 `ls *.EXT`: list every entry matching a wildcard, one `ls`-table line each (sorted), with the
 /// file/dir tally. A directory match shows as `<DIR>` (its contents are not expanded — that mirrors
 /// how a shell hands matched names to `ls`); no match is an honest "no match".
+#[cfg(not(target_arch = "aarch64"))]
 fn ls_globbed(console: &mut Console, arg: &str, long: bool) {
     let fs = match crate::fs::fat::mount() {
         Ok(fs) => fs,
@@ -2155,6 +2269,14 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             let path = args.iter().copied().find(|a|
                 !(a.len() > 1 && a.starts_with('-')
                   && a[1..].bytes().all(|b| b.is_ascii_alphabetic())));
+            // PI-SHELL-LS: on the Pi the native store is unafs (the volume `/fs/` serves), not FAT, so
+            // route `ls` there. `ls <path>` resolves subpaths; wildcards fall back to a literal resolve
+            // (unafs has no glob layer — an honest not-found if it isn't a real name). x86 keeps FAT.
+            #[cfg(target_arch = "aarch64")]
+            {
+                pi_ls(console, path.unwrap_or("."), long);
+            }
+            #[cfg(not(target_arch = "aarch64"))]
             match path {
                 Some(a) if has_glob(a) => ls_globbed(console, a, long),
                 other => ls_path(console, other.unwrap_or("."), long),

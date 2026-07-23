@@ -296,6 +296,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
         unaos_kernel::drivers::emmc2::probe();
 
+        // PI-SHELL-LS (witness battery): prove the Pi shell's `ls` lists the native unafs volume — the
+        // same store PI-NET-15 serves at `/fs/`. The verb is panel-only on the bench, so this exercises
+        // the exact `pi_ls_collect` listing headlessly and emits the `:: ls1: /: ... ::` witness a
+        // `UNAOS_PI=1 ./arroyo kernel8-test` capture can verify. Quiet default boots compile none of it.
+        #[cfg(all(target_arch = "aarch64", feature = "baremetal", feature = "witness"))]
+        unaos_kernel::shell::pi_ls_witness();
+
         // INSTALL-PI: the installer engine's first LIVE end-to-end execution — GPT → FAT32 → payload copy
         // → sha extent-verify onto the emmc2 microSD just censused above. Three-gate escalation (census /
         // scratch-ladder / destructive-confirm), all `piinstall*`-gated, so a default build compiles NONE

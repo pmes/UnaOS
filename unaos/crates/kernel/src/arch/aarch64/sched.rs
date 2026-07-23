@@ -238,6 +238,12 @@ static SCHED: [SchedCpu; NUM_CPUS] = [const { SchedCpu::new() }; NUM_CPUS];
 static CPU_BUSY: [AtomicU64; NUM_CPUS] = [const { AtomicU64::new(0) }; NUM_CPUS];
 static CPU_IDLE: [AtomicU64; NUM_CPUS] = [const { AtomicU64::new(0) }; NUM_CPUS];
 
+/// SCHED-7 — the CNTPCT busy span `dispatch_next` folded into the load window on the CURRENT pass
+/// (0 when the run queue was empty). `run()` reads+clears it after every pass and folds the REST of
+/// the pass's wall span in as IDLE, so no wall time is left unaccounted. Single-writer (the owning
+/// core's scheduler loop writes it in `dispatch_next`; the same loop consumes it in `run()`); relaxed.
+static PASS_BUSY_CYC: [AtomicU64; NUM_CPUS] = [const { AtomicU64::new(0) }; NUM_CPUS];
+
 // ---------------------------------------------------------------------------------------------
 // SCHED-2 — per-core load accounting (rolling-window utilization, ctx-switch count, last task)
 // ---------------------------------------------------------------------------------------------
@@ -1224,6 +1230,10 @@ pub fn timer_preempt() {
 /// scheduler on its own stack); on an empty queue IRQ is left UNMASKED for the caller to idle.
 fn dispatch_next(cpu: usize) -> bool {
     mask_irq();
+    // SCHED-7: start each pass with no busy span recorded; the busy branch below overwrites this with
+    // the task's measured execution span. An empty pass leaves it 0, so `run()` folds the whole pass
+    // (drain + this empty dispatch + the following WFI/poll-spin) in as idle.
+    PASS_BUSY_CYC[cpu].store(0, Ordering::Relaxed);
     // AARCH64-PRIO — age then pick, under ONE run-queue lock acquisition. Count this dispatch pass
     // (the aging clock) and, ~every AGING_INTERVAL passes, run the anti-starvation sweep BEFORE the
     // pop so a long-waiting task cannot be dispatched before it is aged in the same pass. The sweep
@@ -1295,6 +1305,9 @@ fn dispatch_next(cpu: usize) -> bool {
     // future switch-in path could leave enabled.
     mask_irq();
     ACCT[cpu].account(busy_cyc, 0); // fold this task's execution span into the rolling load window
+    // SCHED-7: publish this pass's busy span so `run()` can subtract it from the pass's total wall
+    // span and fold the remainder (scheduler overhead, then the WFI/poll-spin) in as idle.
+    PASS_BUSY_CYC[cpu].store(busy_cyc, Ordering::Relaxed);
     SCHED[cpu].current.store(0, Ordering::Release);
     // Consume the park action exactly once: read it and immediately reset to NONE, so a stale action
     // can never leak into the next task's switch-back. Only a task that switched back BLOCKED carries
@@ -1412,6 +1425,10 @@ pub fn run_until_empty(cpu: usize) {
 /// The APs' scheduler loop: dispatch ready tasks forever, idling (WFI on metal / poll in QEMU, via
 /// `arch::hlt`) when the queue is empty until the timer/an IPI makes work. Never returns.
 fn run(cpu: usize) -> ! {
+    // SCHED-7: the wall-clock anchor for time-based load accounting. Every cycle between one pass's
+    // anchor and the next is either a task's EXECUTION span (folded in as busy by `dispatch_next`) or
+    // the core AWAITING work (WFI, poll-spin, sleeper drain, run-queue management) — which is idle.
+    let mut t_prev = now_cyc();
     loop {
         // Wake any sleepers whose deadline has passed (IRQ masked, matching the switch-back critical
         // section); `make_ready` pushes them onto THIS CPU's own run queue so the dispatch below
@@ -1422,13 +1439,23 @@ fn run(cpu: usize) -> ! {
         mask_irq();
         drain_due_sleepers(cpu);
         if !dispatch_next(cpu) {
-            // SCHED-5: this is where an idle core actually spends time — WFI parks it until the next
-            // tick/IPI (metal) or a light poll-spin (QEMU, no Group-1 timer). Bracket that span with a
-            // CNTPCT read and fold it in as IDLE time, so a core that mostly sleeps reports near 0%.
-            let idle_t0 = now_cyc();
+            // Empty queue: park until the next tick/IPI — WFI on metal, a light poll-spin in QEMU
+            // (no Group-1 timer). This span is idle; it is folded in below along with the rest of the
+            // pass, so it does not matter whether WFI actually sleeps or returns immediately.
             crate::arch::hlt();
-            ACCT[cpu].account(0, now_cyc().wrapping_sub(idle_t0));
         }
+        // SCHED-7: fold EVERY cycle this pass did NOT spend executing a task in as IDLE — the whole
+        // pass span (`t_prev`→now) minus the busy span `dispatch_next` already accounted. This closes
+        // the phantom-100% hole: the old code bracketed ONLY the explicit WFI, so on a core whose WFI
+        // returns near-instantly (a peripheral IRQ pending on that core — the input/render cores) or
+        // that spins the empty-queue loop between infrequent micro-wakes, the drain + empty passes +
+        // instant-return WFI were UNACCOUNTED, and the only cycles ever landing in the window were the
+        // micro busy spans → a steady phantom 100%. Measuring wall-minus-busy makes busy% ==
+        // (task-execution / wall-time): ~0 for a provably-idle workload, ~100 for a CPU-bound one.
+        let t_now = now_cyc();
+        let busy = PASS_BUSY_CYC[cpu].swap(0, Ordering::Relaxed);
+        ACCT[cpu].account(0, t_now.wrapping_sub(t_prev).saturating_sub(busy));
+        t_prev = t_now;
     }
 }
 
