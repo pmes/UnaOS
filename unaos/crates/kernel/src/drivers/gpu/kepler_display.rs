@@ -224,7 +224,7 @@ pub unsafe fn takeover_display(
     let capped = if hits > 64 { "true" } else { "false" };
     serial_println!(":: kdisp: evo-scan done range=610000-613FFC hits={} capped={} ::", hits, capped);
 
-    // ── Phase 2: Display takeover (write path, gated) ──────────────────
+    // ── Phase 2: Display takeover (Pull 5: repoint-the-surface) ────────────
     if !cfg!(feature = "nvidia-kepler-takeover") {
         serial_println!(":: kdisp: trace-only — takeover feature not set ::");
         return None;
@@ -257,90 +257,52 @@ pub unsafe fn takeover_display(
     }
 
     let bar1 = vram_base;
-    serial_println!(":: kdisp: takeover head={} addr={:08X} {}x{} ::",
-        head, matched_addr, expected_width, expected_height);
-
-    // Double-buffer: copy GOP surface to new allocation
     let fb_size = (expected_width * expected_height * 4) as usize;
-    let new_fb_offset = match allocator.alloc(fb_size) {
-        Some(off) => off,
-        None => {
-            serial_println!(":: kdisp: takeover-abort alloc-fail ::");
-            return None;
-        }
-    };
-    serial_println!(":: kdisp: alloc new_fb={:X} ::", new_fb_offset);
 
-    let src = (bar1 + gop_vram_offset) as *const u8;
-    let dst = (bar1 + new_fb_offset) as *mut u8;
-    core::ptr::copy_nonoverlapping(src, dst, fb_size);
+    // 1. Prepare second surface at 0x1600000
+    let surf2_offset = 0x1600000;
+    let dst = (bar1 + surf2_offset) as *mut u32;
+    let dwords = fb_size / 4;
+    for i in 0..dwords {
+        core::ptr::write_volatile(dst.add(i), 0xFF00FF00);
+    }
+    serial_println!(":: kdisp: surf2 prep off=01600000 bytes={:08X} fill=FF00FF00 ::", fb_size);
 
-    // EVO core channel push (flip surface address)
-    let evo_pb_off = match allocator.alloc(4096) {
-        Some(off) => off,
-        None => {
-            serial_println!(":: kdisp: takeover-abort pb-alloc-fail ::");
-            return None;
-        }
-    };
+    // 2. Pre-repoint check
+    let repoint_reg = regs::NV_PDISPLAY_BASE + 0x01E0; // 0x6101E0
+    let orig_ptr = mmio_read(bar0, repoint_reg);
+    let hs_base = regs::NV_PDISPLAY_BASE + 0x6000 + (head * 0x800);
+    let pre_vert = mmio_read(bar0, hs_base + 0x340);
+    let pre_horz = mmio_read(bar0, hs_base + 0x344);
+    serial_println!(":: kdisp: repoint pre 6101E0={:08X} stat vert={:08X} horz={:08X} ::", orig_ptr, pre_vert, pre_horz);
 
-    let evo_pb = (bar1 + evo_pb_off) as *mut u32;
-    let offset_origin_method = 0x400 + (head * 0x300) + 0x60;
-    let update_method = 0x80;
-    let new_addr = (new_fb_offset >> 8) as u32;
+    // 3. Repoint
+    let new_ptr = 0x00016000;
+    mmio_write(bar0, repoint_reg, new_ptr);
+    let rb = mmio_read(bar0, repoint_reg);
+    serial_println!(":: kdisp: repoint wrote=00016000 rb={:08X} ::", rb);
 
-    core::ptr::write_volatile(evo_pb.add(0), (1 << 18) | (offset_origin_method as u32));
-    core::ptr::write_volatile(evo_pb.add(1), new_addr);
-    core::ptr::write_volatile(evo_pb.add(2), (1 << 18) | (update_method as u32));
-    core::ptr::write_volatile(evo_pb.add(3), 0x00000000);
-
-    // EVO core channel control — g80_pdisplay.xml line 1065: 0x610490 is
-    // actually DAEMON.RFIFO_STATUS (GF119+), not an EVO channel control.
-    // The pre-GF119 CTRL array lives at PDISPLAY+0x300 (stride 0x8, length 5)
-    // but is absent from the GF119+ stripe.  We proceed with the empirically
-    // probed 0x490 offset with a full bad-read guard; if it reads zero the
-    // takeover aborts cleanly.
-    let core_ctrl = regs::NV_PDISPLAY_BASE + 0x490;
-    let core_ctrl_val = mmio_read(bar0, core_ctrl);
-    if core_ctrl_val == 0 || (core_ctrl_val & 0xFFF00000) == 0xBAD00000 {
-        serial_println!(":: kdisp: bad-read core_ctrl {:X} {:08X} ::", core_ctrl, core_ctrl_val);
-        serial_println!(":: kdisp: takeover-abort bad-core-ctrl ::");
-        return None;
+    // 4. Bounded panel window (~5s)
+    for t in 1..=5 {
+        for _ in 0..60_000_000 { core::hint::spin_loop(); }
+        let vert = mmio_read(bar0, hs_base + 0x340);
+        let horz = mmio_read(bar0, hs_base + 0x344);
+        serial_println!(":: kdisp: repoint hold t={}s stat vert={:08X} horz={:08X} ::", t, vert, horz);
     }
 
-    mmio_write(bar0, core_ctrl, core_ctrl_val & !0x10);
-    mmio_write(bar0, core_ctrl, mmio_read(bar0, core_ctrl) & !0x03);
-    for _ in 0..100_000 { core::hint::spin_loop(); }
+    // 5. Restore
+    mmio_write(bar0, repoint_reg, orig_ptr);
+    let rb_restored = mmio_read(bar0, repoint_reg);
+    serial_println!(":: kdisp: repoint restored rb={:08X} ::", rb_restored);
+    
+    // Second ~2s hold
+    for _ in 0..120_000_000 { core::hint::spin_loop(); }
 
-    let push_handle = (evo_pb_off >> 8) as u32 | 0x1;
-    mmio_write(bar0, core_ctrl + 0x4, push_handle);
-    mmio_write(bar0, core_ctrl + 0x8, 0x00010000);
-    mmio_write(bar0, core_ctrl + 0xC, 0x00000001);
+    // 6. Verdict
+    let stuck = if rb == new_ptr { "yes" } else { "no" };
+    serial_println!(":: kdisp: repoint verdict rb-stuck={} ::", stuck);
 
-    // DISP_USER PUT — g80_pdisplay.xml line 1091
-    mmio_write(bar0, 0x640000, 0);
-    mmio_write(bar0, core_ctrl, mmio_read(bar0, core_ctrl) | 0x10);
-    mmio_write(bar0, core_ctrl, mmio_read(bar0, core_ctrl) | 0x01000013);
-    mmio_write(bar0, 0x640000, 16);
-
-    // Bounded latch poll
-    let head_base = regs::NV_PDISPLAY_BASE + 0x400 + (head * 0x300) + 0x60;
-    let mut latched = false;
-    for _ in 0..1_000_000 {
-        if mmio_read(bar0, head_base) == new_addr {
-            latched = true;
-            break;
-        }
-        core::hint::spin_loop();
-    }
-
-    if latched {
-        serial_println!(":: kdisp: flip-ok head={} addr={:X} ::", head, new_addr);
-        Some(new_fb_offset)
-    } else {
-        serial_println!(":: kdisp: takeover-abort evo-flip-timeout ::");
-        None
-    }
+    None
 }
 
 /// Returns false for zero, 0xFFFFFFFF, and the 0xBAD0xxxx pattern that our
