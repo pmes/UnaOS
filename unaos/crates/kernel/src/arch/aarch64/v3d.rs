@@ -2384,6 +2384,26 @@ fn probe_job() {
         return;
     }
 
+    // ── [v3d35] scope the PCTR battery to the PROBE bin (the store's ONLY home) ────────────────────
+    // Root fact V3D-35 surfaces: every prior [v3d33] "TMU SAW-NOTHING" reading was armed around the REAL
+    // M4 bin (pctr_read_cs_witness("M4 post-bin") in triangle_job), whose coord shader CS_VS_WORDS is a
+    // pure VPM-in→VPM-out passthrough with NO TMU op. That shader CANNOT touch the TMU, so tcache_access=0
+    // there is a tautology, not evidence about the store. The probe — the ONLY shader in the kernel that
+    // issues a general TMU store (word[9] `mov tmuau`) — was never PCTR-instrumented. The battery has been
+    // measuring the wrong program. Arm it HERE, around the probe GO, so tcache_access / cycles_waiting_tmu
+    // and valid_instr are finally scoped to the store that matters.
+    //
+    // TMUAU-LAUNCH vs TMUWT-DRAIN reconciliation (Mesa v3d ntq_emit_tmu_general / qpu_instr.h, v42):
+    // a general TMU store LAUNCHES when the address register is written — writing TMUA/TMUAU issues the
+    // memory transaction to the TMU immediately; the TMUD writes before it only stage the data. `tmuwt`
+    // ("TMU write wait", word[22]) is NOT a launch: it is a completion barrier that stalls the thread until
+    // outstanding TMU writes have drained. So the store fires at [9] (PRE the [18]/[19] thread switch); the
+    // TMU sees it there regardless of whether the post-switch tail ([20]-[22]) ever resumes. Consequence:
+    // if this PROBE-scoped tcache_access reads 0, the leading "post-switch segment never resumes" theory is
+    // REFUTED as the cause — the store's issuance does not depend on the tail. The verdict then reduces to
+    // valid_instr: a full-run count (~23·lanes) with tcache_access=0 means the thread reached [9] but the
+    // TMU rejected the launch (config/quad-mask/block state) — chase the TMU; a truncated count (< ~9·lanes)
+    // means the thread died before [9] and the store word never executed — chase thread lifetime/dispatch.
     clear_mmu_fault_latch("v3d28 pre-probe");
     invalidate_gpu_caches("L2T flush (probe bin pre-kick)");
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QMA, tile_alloc);
@@ -2392,9 +2412,16 @@ fn probe_job() {
     dsb();
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QBA, bin_ba);
     dsb();
+    // Arm the execution trio (src14/16/32) + TMU battery (src24/17/25) so they span the probe bin. This is
+    // read-only w.r.t. the shader (see pctr_* above) — it cannot perturb execution.
+    pctr_setup_cs_witness();
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QEA, bin_ea); // GO
     dsb();
     let idled = wait_bit_clear(V3D_CORE0_BASE, V3D_CLE_CT0CS, V3D_CLE_CT1CS_CTRUN, "CT0 probe bin");
+    // Read the battery now the probe has idled — THE decisive witness for V3D-35. valid_instr says how far
+    // the probe thread got (reached the [9] store word or died before it); tcache_access says whether the
+    // TMU saw the store (launched at [9], independent of the post-switch tail per the reconciliation above).
+    pctr_read_cs_witness("v3d35 PROBE bin");
     let mmu_ctl = mmio_read(V3D_HUB_BASE, V3D_MMU_CTL);
     let fault = mmu_ctl
         & (V3D_MMU_CTL_PT_INVALID | V3D_MMU_CTL_WRITE_VIOLATION | V3D_MMU_CTL_CAP_EXCEEDED);
@@ -3115,9 +3142,12 @@ fn pctr_read_cs_witness(tag: &str) {
         tag, coord, vinstr, cycles,
         if coord != 0 { "RAN" } else { "NEVER RAN" }
     );
-    // PI-V3D-33: the decisive TMU-issue witness. The probe's general store (word[9] mov tmuau) is the
-    // ONLY TMU op in the whole kernel — both fragment shaders write the TLB, never the TMU — so a nonzero
-    // in ANY of these three is the first TMU-block activity UnaOS has ever recorded on this silicon.
+    // PI-V3D-33/35: the TMU-issue witness. It only reflects a store when armed around the PROBE bin (tag
+    // "v3d35 PROBE bin") — the probe's word[9] `mov tmuau` is the ONLY TMU op in the whole kernel (both
+    // fragment shaders write the TLB, never the TMU; the real M4 coord shader CS_VS_WORDS is a pure
+    // VPM-passthrough with no TMU op). Armed around the M4 bin (tag "M4 post-bin") these three are 0 BY
+    // CONSTRUCTION and carry no information — V3D-35's finding. A nonzero here under the probe tag is the
+    // first TMU-block activity UnaOS has ever recorded on this silicon.
     let tmu_engaged = tmu_acc != 0 || tmu_wait != 0 || tmu_miss != 0;
     serial_println!(
         ":: V3D: [v3d33] {} TMU-issue witness via PCTR — tcache_access(src24)={} cycles_waiting_tmu(src17)={} tcache_miss(src25)={} — TMU {} ({}) ::",
