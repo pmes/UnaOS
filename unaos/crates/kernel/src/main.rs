@@ -1019,7 +1019,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // controller, and hands steady-state servicing to `usb_pump` (spawned above). QEMU census-skips.
             #[cfg(feature = "piusb")]
             unaos_kernel::arch::piusb::bringup_task(0);
-            unaos_kernel::arch::hlt_loop();
+            // SMP-BAL: after its boot duties the BSP joins the scheduler (steal-eligible kernel
+            // tasks only land here; EL0/pinned never do) instead of parking in hlt_loop forever.
+            unaos_kernel::arch::sched::run_bsp(0);
         }
     }
 
