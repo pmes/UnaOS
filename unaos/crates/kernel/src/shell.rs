@@ -3389,19 +3389,35 @@ fn parse_num(s: &str) -> Option<u64> {
 // truncate / unlink verbs. The shell is the trusted operator console, so it
 // writes as the kernel-authority principal (`KERNEL_PRINCIPAL`) — the same
 // posture the `u*` native verbs record. Namespace: native UnaFS at `/`, the FAT
-// boot partition at `/fat`. Both real backends are aarch64-only (the x86 build
+// boot partition at `/fat`, and the hot-plugged USB FAT stick at `/usb` when
+// present (VFS-3, read-only). Both real backends are aarch64-only (the x86 build
 // has neither the unafs module nor a `VfsBackend for FatBackend` impl), so the
 // x86 arm is an honest "unsupported on this arch" line.
 
 /// Build the shell's VFS namespace: native UnaFS at `/`, FAT boot partition at
-/// `/fat`. World-readable is a READ posture only (it does not confer write); the
-/// shell writes as `KERNEL_PRINCIPAL`, which both backends authorize.
+/// `/fat`, and — when a USB stick is enumerated — the hot-plugged USB FAT at
+/// `/usb` (VFS-3). World-readable is a READ posture only (it does not confer
+/// write); the shell writes as `KERNEL_PRINCIPAL`, which both backends authorize.
+///
+/// VFS-3: the `/usb` mount is bound only when the stick is actually present
+/// (`mount_source(Usb)` succeeds) — the presence check at build time is the
+/// honest hot-plug posture (doc §6): absent → `/usb` is simply not in the table,
+/// so a `/usb/...` path falls through to the native root and resolves to a clean
+/// `-ENOENT`, never a panic. The USB volume is read through the xHCI `Usb` source
+/// and is **read-only by construction** (PIUSB-27): a `vfs write|append|rm|mkdir`
+/// at `/usb` returns `-ENOTSUP` (the FatBackend refuses writes on a non-Default
+/// source before touching the block layer). Rebuilt per invocation, so a stick
+/// hot-plugged (or ejected) between commands is picked up on the next `vfs`.
 #[cfg(target_arch = "aarch64")]
 fn vfs_mount_table() -> crate::fs::vfs::MountTable {
     use crate::fs::vfs::{FatBackend, MountTable, NativeBackend, KERNEL_PRINCIPAL};
     let mut mt = MountTable::new();
     mt.mount("/", alloc::boxed::Box::new(NativeBackend::new("native")));
     mt.mount("/fat", alloc::boxed::Box::new(FatBackend::new("fat", KERNEL_PRINCIPAL, true)));
+    // VFS-3: bind the USB stick at /usb only when it is present (honest hot-plug).
+    if crate::fs::fat::mount_source(crate::fs::fat::BlockSource::Usb).is_ok() {
+        mt.mount("/usb", alloc::boxed::Box::new(FatBackend::new_usb("usb", KERNEL_PRINCIPAL)));
+    }
     mt
 }
 
@@ -3438,7 +3454,7 @@ fn vfs_cmd(console: &mut Console, args: &[&str]) {
         Some(&o) => o,
         None => {
             console.println("usage: vfs <write|append|rm|mkdir> <path> [text ...]");
-            console.println("  namespace: / = native UnaFS, /fat = FAT boot partition");
+            console.println("  namespace: / = native UnaFS, /fat = FAT boot partition, /usb = USB stick (read-only)");
             return;
         }
     };

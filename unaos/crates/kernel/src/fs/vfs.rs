@@ -394,9 +394,20 @@ fn components(rel: &str) -> impl Iterator<Item = &str> {
 ///
 /// FAT carries no owners, so this adapter holds the volume's ACL posture: the
 /// `principal` a mount conferred and whether the volume is world-readable. It
-/// re-mounts through [`crate::fs::fat::mount`] per call (the same stateless
-/// posture the shell's FAT commands already use — a swapped card is picked up
-/// on the next access).
+/// re-mounts through [`crate::fs::fat::mount_source`] per call (the same
+/// stateless posture the shell's FAT commands already use — a swapped card is
+/// picked up on the next access).
+///
+/// VFS-3: the adapter is parametrized by the block [`crate::fs::fat::BlockSource`]
+/// it mounts through, so ONE `MountTable` can carry BOTH FAT volumes the Pi
+/// exposes at once — the SD boot partition ([`Default`](crate::fs::fat::BlockSource::Default),
+/// at `/fat`) and the hot-plugged USB stick ([`Usb`](crate::fs::fat::BlockSource::Usb),
+/// at `/usb`) — each reaching its own device. A `Usb`-sourced mount is **strictly
+/// read-only by construction** (PIUSB-27: the block layer's `write_sector`
+/// refuses any non-`Default` source, so no FAT/dir/data write can ever reach the
+/// stick); the adapter mirrors that guard at the VFS layer, refusing every write
+/// verb with [`VfsError::Unsupported`] BEFORE it touches the block path, so a
+/// caller gets a clean "read-only volume" answer rather than an opaque I/O error.
 pub struct FatBackend {
     volume: String,
     /// The volume principal every object on this foreign volume inherits.
@@ -404,16 +415,47 @@ pub struct FatBackend {
     /// When true, any principal may read (a world-readable mount, e.g. the boot
     /// USB stick); else only the volume principal and kernel authority.
     world_readable: bool,
+    /// VFS-3: which block device this volume mounts through. `Default` = the
+    /// globally-registered device (SD on the Pi); `Usb` = the USB stick read
+    /// directly through xHCI (read-only, PIUSB-27).
+    source: crate::fs::fat::BlockSource,
 }
 
 impl FatBackend {
-    /// Mount a FAT volume into the VFS with an explicit ACL posture.
+    /// Mount a FAT volume into the VFS with an explicit ACL posture, reading
+    /// through the globally-registered block device
+    /// ([`Default`](crate::fs::fat::BlockSource::Default) — the SD boot partition
+    /// on the Pi). Writable (the boot FAT).
     pub fn new(volume: &str, principal: &str, world_readable: bool) -> Self {
         Self {
             volume: volume.to_string(),
             principal: principal.to_string(),
             world_readable,
+            source: crate::fs::fat::BlockSource::Default,
         }
+    }
+
+    /// VFS-3: mount the hot-plugged USB FAT stick into the VFS, read through the
+    /// xHCI [`Usb`](crate::fs::fat::BlockSource::Usb) source — the same read-only
+    /// mount `ls /usb` and the `/fs/usb` HTTP route already use. World-readable
+    /// (its contents are meant to be read) and **read-only**: every write verb
+    /// returns [`VfsError::Unsupported`], honoring the PIUSB-27 by-construction
+    /// read-only guard rather than emitting a raw block I/O error.
+    pub fn new_usb(volume: &str, principal: &str) -> Self {
+        Self {
+            volume: volume.to_string(),
+            principal: principal.to_string(),
+            world_readable: true,
+            source: crate::fs::fat::BlockSource::Usb,
+        }
+    }
+
+    /// VFS-3: is this a read-only mount? A non-`Default` source (the USB stick)
+    /// cannot be written through the block layer (PIUSB-27), so the adapter
+    /// refuses writes at the VFS layer to give a clean [`VfsError::Unsupported`].
+    #[cfg(target_arch = "aarch64")]
+    fn read_only(&self) -> bool {
+        self.source != crate::fs::fat::BlockSource::Default
     }
 
     /// Resolve a volume-relative path to its FAT directory entry by walking the
@@ -514,7 +556,7 @@ impl VfsBackend for FatBackend {
     }
 
     fn read_dir(&self, rel: &str) -> Result<Vec<DirEnt>, VfsError> {
-        let fs = crate::fs::fat::mount().map_err(fat_err)?;
+        let fs = crate::fs::fat::mount_source(self.source).map_err(fat_err)?;
         let entries = match Self::resolve_entry(&fs, rel)? {
             None => fs.read_root().map_err(fat_err)?, // volume root
             Some(e) if e.is_dir => fs.read_dir(e.first_cluster()).map_err(fat_err)?,
@@ -530,7 +572,7 @@ impl VfsBackend for FatBackend {
     }
 
     fn stat(&self, rel: &str) -> Result<Stat, VfsError> {
-        let fs = crate::fs::fat::mount().map_err(fat_err)?;
+        let fs = crate::fs::fat::mount_source(self.source).map_err(fat_err)?;
         match Self::resolve_entry(&fs, rel)? {
             None => Ok(Stat {
                 kind: NodeKind::Dir,
@@ -544,7 +586,7 @@ impl VfsBackend for FatBackend {
     }
 
     fn read(&self, rel: &str, offset: u64, len: usize) -> Result<Vec<u8>, VfsError> {
-        let fs = crate::fs::fat::mount().map_err(fat_err)?;
+        let fs = crate::fs::fat::mount_source(self.source).map_err(fat_err)?;
         let entry = Self::resolve_entry(&fs, rel)?.ok_or(VfsError::IsADirectory)?;
         if entry.is_dir {
             return Err(VfsError::IsADirectory);
@@ -576,6 +618,16 @@ impl VfsBackend for FatBackend {
     }
 
     fn authorize_write(&self, _rel: &str, principal: &str) -> Result<(), VfsError> {
+        // VFS-3: a non-Default source (the USB stick) is read-only BY
+        // CONSTRUCTION — PIUSB-27's `write_sector` refuses it, so no write could
+        // ever reach the medium. Refuse here so the caller gets a clean
+        // "read-only volume" (`Unsupported`) rather than a block I/O error
+        // surfacing from deep in `write_grow`. This is not an ACL refusal
+        // (`Denied`): the principal may be perfectly authorized; the VOLUME has
+        // no writable surface. A future world-writable USB flag would relax this.
+        if self.read_only() {
+            return Err(VfsError::Unsupported);
+        }
         // FOREIGN-VOLUME WRITE POSTURE (doc §5, extended by VFS-2): the volume's
         // one mount capability governs writes too — permit the volume principal
         // and kernel authority. The `world_readable` posture is deliberately NOT
@@ -591,7 +643,7 @@ impl VfsBackend for FatBackend {
 
     fn create(&self, rel: &str, kind: NodeKind, principal: &str) -> Result<Stat, VfsError> {
         self.authorize_write(rel, principal)?;
-        let fs = crate::fs::fat::mount().map_err(fat_err)?;
+        let fs = crate::fs::fat::mount_source(self.source).map_err(fat_err)?;
         let (parent, leaf) = Self::resolve_parent(&fs, rel)?;
         // Reject an existing name (create is not idempotent-overwrite).
         match fs.locate_in_dir(parent, &leaf) {
@@ -615,7 +667,7 @@ impl VfsBackend for FatBackend {
 
     fn write(&self, rel: &str, offset: u64, data: &[u8], principal: &str) -> Result<usize, VfsError> {
         self.authorize_write(rel, principal)?;
-        let fs = crate::fs::fat::mount().map_err(fat_err)?;
+        let fs = crate::fs::fat::mount_source(self.source).map_err(fat_err)?;
         let (parent, leaf) = Self::resolve_parent(&fs, rel)?;
         let off32: u32 = offset.try_into().map_err(|_| VfsError::Unsupported)?;
         let (de, dir_lba, dir_off) = fs.locate_in_dir(parent, &leaf).map_err(fat_err)?;
@@ -637,7 +689,7 @@ impl VfsBackend for FatBackend {
 
     fn truncate(&self, rel: &str, size: u64, principal: &str) -> Result<(), VfsError> {
         self.authorize_write(rel, principal)?;
-        let fs = crate::fs::fat::mount().map_err(fat_err)?;
+        let fs = crate::fs::fat::mount_source(self.source).map_err(fat_err)?;
         let (parent, leaf) = Self::resolve_parent(&fs, rel)?;
         let (de, dir_lba, dir_off) = fs.locate_in_dir(parent, &leaf).map_err(fat_err)?;
         if de.is_dir {
@@ -671,7 +723,7 @@ impl VfsBackend for FatBackend {
 
     fn unlink(&self, rel: &str, principal: &str) -> Result<(), VfsError> {
         self.authorize_write(rel, principal)?;
-        let fs = crate::fs::fat::mount().map_err(fat_err)?;
+        let fs = crate::fs::fat::mount_source(self.source).map_err(fat_err)?;
         let (parent, leaf) = Self::resolve_parent(&fs, rel)?;
         let (de, dir_lba, dir_off) = fs.locate_in_dir(parent, &leaf).map_err(fat_err)?;
         if de.is_dir {
@@ -1286,4 +1338,85 @@ pub fn vfs2_native_write_witness() {
 #[cfg(target_arch = "aarch64")]
 fn checksum(bytes: &[u8]) -> u32 {
     bytes.iter().fold(0u32, |a, &b| a.wrapping_add(b as u32))
+}
+
+// =========================================================================================
+// VFS-3 USB-mount witness — proves the hot-plugged USB FAT stick lives in the VFS namespace
+// (at `/usb`) ALONGSIDE the SD boot FAT (at `/fat`), each routing to its own block device, and
+// that the USB volume's read-only posture is honored HONESTLY (writes refused, no panic).
+//
+// This is a METAL proof, honest-skip under QEMU: the USB stick is reached through the xHCI
+// `Usb` source (PIUSB-27), which needs the BCM2711 PCIe RC + VL805 xHCI. QEMU raspi4b models no
+// PCIe RC and attaches no usb-storage, so `mount_source(Usb)` finds no device and the witness
+// prints the skip line there. The positive PASS line is the attended-metal evidence, the same
+// posture the whole piusb line already carries ("attended-metal for positive verify").
+// =========================================================================================
+
+/// VFS-3 USB-mount witness: build a `MountTable` carrying the SD boot FAT at `/fat` and the USB
+/// FAT stick at `/usb` (each on its own block source), then prove through the table that (a) the
+/// USB volume is reachable — its root lists and a file reads back — and (b) the USB volume is
+/// honestly read-only: a `create` at `/usb/...` is refused with `Unsupported`, never a panic.
+/// Honest-skip when no USB volume is present (always, under QEMU raspi4b).
+#[cfg(target_arch = "aarch64")]
+pub fn vfs3_usb_mount_witness() {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    // Presence check at MountTable build time (doc §6 hot-mount): only bind /usb when the stick
+    // is actually enumerated. Absent -> honest skip, no panic.
+    if crate::fs::fat::mount_source(crate::fs::fat::BlockSource::Usb).is_err() {
+        serial_println!(":: VFS3: usb-mount — no USB volume — skipped ::");
+        return;
+    }
+    let mut mt = MountTable::new();
+    // Both FAT volumes in ONE namespace, each on its own device — the SHELL-WRITE flag's core
+    // concern (before VFS-3 the FatBackend could only ever reach the Default/boot device).
+    mt.mount("/fat", Box::new(FatBackend::new("fat", KERNEL_PRINCIPAL, true)));
+    mt.mount("/usb", Box::new(FatBackend::new_usb("usb", KERNEL_PRINCIPAL)));
+
+    // (a) the USB root lists through the table.
+    let entries = match mt.read_dir("/usb") {
+        Ok(e) => e,
+        Err(e) => {
+            serial_println!(":: VFS3: usb-mount — read_dir /usb failed {:?} :: FAIL ::", e);
+            return;
+        }
+    };
+    // (b) read a real file back through the table (the first regular file in the root, if any).
+    let mut read_bytes = 0usize;
+    if let Some(f) = entries.iter().find(|e| matches!(e.kind, NodeKind::File)) {
+        let path = alloc::format!("/usb/{}", f.name);
+        match mt.read(&path, 0, 64) {
+            Ok(b) => read_bytes = b.len(),
+            Err(e) => {
+                serial_println!(":: VFS3: usb-mount — read {} failed {:?} :: FAIL ::", path, e);
+                return;
+            }
+        }
+    }
+    // (c) the USB volume is honestly read-only: a write is REFUSED (Unsupported), not attempted
+    // against the block layer and not a panic. This is the by-construction PIUSB-27 posture
+    // surfaced cleanly at the VFS layer.
+    match mt.create("/usb/VFS3RO.TXT", NodeKind::File, KERNEL_PRINCIPAL) {
+        Err(VfsError::Unsupported) => {}
+        other => {
+            serial_println!(
+                ":: VFS3: usb-mount — read-only guard breached (create /usb returned {:?}) :: FAIL ::",
+                other
+            );
+            return;
+        }
+    }
+    // (d) the two mounts are independent: /fat still resolves to the Default-source backend and
+    // its root lists (coexistence — /usb did not displace the boot FAT).
+    let fat_ok = mt.read_dir("/fat").is_ok();
+
+    serial_println!(
+        ":: VFS3: usb-mount test — /usb root {} entries, read {} bytes, read-only enforced, /fat coexists={} :: PASS ::",
+        entries.len(),
+        read_bytes,
+        fat_ok
+    );
 }

@@ -1,6 +1,12 @@
 # VFS: the unifying virtual-filesystem layer
 
-Status: **VFS-2 landed** — the write surface is implemented for both backends
+Status: **VFS-3 landed** — the USB FAT stick is now in the VFS namespace at `/usb`,
+alongside the SD boot FAT at `/fat` and the native UnaFS root at `/` (see §11). The
+`FatBackend` is parametrized by its block source, so ONE `MountTable` reaches both FAT
+volumes at once; the USB mount is read-only by construction (PIUSB-27) and bound only
+when the stick is present. On top of:
+
+**VFS-2** — the write surface is implemented for both backends
 (`unaos/crates/kernel/src/fs/vfs.rs`), on top of VFS-1's read/resolve/authorize spine.
 First consumer landed (**SHELL-WRITE**): the panel shell's `vfs` verb
 (`unaos/crates/kernel/src/shell.rs`) routes create / write / truncate / unlink
@@ -264,6 +270,68 @@ Each emits `:: VFS2: write test — created <path>, wrote <n>, readback OK :: PA
 its scratch file. They are invoked from the `syscall.rs` storage battery (after the K-series, so
 their scratch never perturbs those fixtures); because `syscall.rs` is outside the VFS lane, that
 one-line-per-witness wiring lands as a deferred diff alongside this arc.
+
+## 11. VFS-3 — the USB volume in the namespace
+
+VFS-2's SHELL-WRITE consumer flagged a gap: the `FatBackend` always mounted through
+`fat::mount()` (the globally-registered block device = the SD boot partition on the Pi), so the
+hot-plugged USB stick — the volume `ls /usb` and the `/fs/usb` HTTP route already read through
+`fat::mount_source(BlockSource::Usb)` — could not be reached through the `MountTable` at all. The
+namespace of record (§4) names `/usb → FAT`, but nothing could bind it.
+
+**The fix (the VFS-1 design intent, made real).** `FatBackend` now carries the
+`fat::BlockSource` it mounts through, and `MountTable` can therefore hold BOTH FAT volumes at
+once, each reaching its own device:
+
+```
+/          → native UnaFS   (BlockSource::Default via unafs; per-object ACL)
+/fat       → FAT boot part   (BlockSource::Default; the SD card; writable)
+/usb       → FAT USB stick   (BlockSource::Usb; the xHCI stick; READ-ONLY)
+```
+
+* `FatBackend::new(volume, principal, world_readable)` mounts the `Default` source (the boot
+  FAT), unchanged — every VFS-2 call site keeps working.
+* `FatBackend::new_usb(volume, principal)` mounts the `Usb` source (world-readable), the same
+  read-only xHCI mount `ls /usb` uses.
+
+**Read-only is honored honestly, not fabricated as writable.** The `Usb` block source is
+**read-only by construction** (PIUSB-27: `write_sector` refuses any non-`Default` source, so no
+FAT/dir/data write can ever reach the stick). The adapter mirrors that guard at the VFS layer:
+`authorize_write` refuses every write verb on a non-`Default` source with `VfsError::Unsupported`
+(`-ENOTSUP`, a clean "read-only volume" answer) BEFORE it touches the block path — never a raw
+I/O error, and never by weakening the block-layer guard. A future world-*writable* USB flag (or a
+USB WRITE(10) path) is the only thing that would relax this; VFS-3 does not, and must not, invent
+one. Writing a USB stick's contents onto a writable volume is the installer's copy-onto-native
+job (§5.2), not an in-place `/usb` write.
+
+**Honest hot-plug (doc §6).** The `/usb` mount is bound only when the stick is actually
+enumerated — `vfs_mount_table()` (rebuilt per shell `vfs` invocation) and the witness both do a
+`mount_source(Usb)` presence check at build time. Absent → `/usb` is simply not in the table, so
+a `/usb/...` path falls through to the native root and resolves to a clean `-ENOENT`, never a
+panic. A stick plugged (or ejected) between commands is picked up on the next `vfs`.
+
+**The shell `vfs` verb picks it up automatically.** `vfs_mount_table()` gained the conditional
+`/usb` mount, so `vfs write|append|rm|mkdir /usb/...` route through the same four verbs — read
+paths work, writes return `-ENOTSUP` (the read-only posture). No new dispatch code.
+
+### 11.1 The VFS-3 USB-mount witness
+
+`vfs::vfs3_usb_mount_witness()` (aarch64) builds a `MountTable` with `/fat` (Default) and `/usb`
+(Usb) and proves through the table that the USB volume is reachable (its root lists, a file reads
+back), that the read-only guard is enforced (a `create` at `/usb/...` returns `Unsupported`, no
+panic), and that `/fat` coexists (its root still lists) — emitting
+`:: VFS3: usb-mount test — /usb root <n> entries, read <m> bytes, read-only enforced, /fat coexists=<b> :: PASS ::`.
+
+This is a **metal** proof, honest-skip under QEMU: the stick is reached through the xHCI `Usb`
+source, which needs the BCM2711 PCIe RC + VL805 xHCI. QEMU raspi4b models no PCIe RC and attaches
+no usb-storage, so `mount_source(Usb)` finds no device and the witness prints
+`:: VFS3: usb-mount — no USB volume — skipped ::` there (verified under
+`UNAOS_V3D=1 UNAOS_GENET=1 UNAOS_PIUSB=1 ./arroyo kernel8-test`). The positive PASS line is the
+attended-metal evidence — the same posture the whole piusb line carries ("attended-metal for
+positive verify"). Its permanent call site is the aarch64 storage/USB path (co-located with
+`piusb27_service`, where the stick is live), which lives outside the VFS lane; that one-line
+wiring lands as a deferred diff, and a temporary proof captured the QEMU skip line for this arc
+(reverted after capture), exactly as VFS-2 did.
 
 ## 10. File map
 
