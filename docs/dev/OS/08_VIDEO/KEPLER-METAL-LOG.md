@@ -3,6 +3,27 @@
 Hard-won silicon facts from the fox-metal sitting series. Trust these over any
 QEMU behavior. Newest sitting first.
 
+## Sitting #11 (display pull 1 + kepler pull 12, UnaOS-gemini@9eab5823, 2026-07-22, fox-metal-r23s1h)
+
+**Boot 1 — HEAD 0 IS ALIVE AND SCANNING (major canon correction):**
+- `caps version=0210 class=917D` (GK107 display class live);
+  `gop phys=0x90020000 vram_off=0x20000`.
+- Both candidate EVO mirror layouts REFUTED: evo rows AND hv rows all zero on
+  all 4 heads.
+- **`head[0] stat underflow=0 vert=0x0493048A horz=0x0000068C` — nonzero
+  raster counters, head 0 ONLY** (heads 1-3 stat all zero). The display
+  engine was NEVER torn down and NEVER idle; every "evo=crtc=0 all heads →
+  engine idle" reading (sittings #5-#10) was wrong-address decode — exactly
+  what the panel-owner proof demanded. vert 0x0493/0x048A and horz 0x068C
+  decode as plausible raster line/column pairs for the panel timing.
+- Sentinel discipline worked: trace cells beyond caps+head0-stat carry the
+  DEAD sentinel, so real-vs-absent is unambiguous per cell.
+- Display pull 2 target: HEAD_STAT (0x616000-block) is the one genuinely
+  decoded block — derive the armed/surface registers outward from ITS
+  offsets for the 917D class.
+
+Boot 2 (USERD_HI ladder) verdict pending.
+
 ## Sitting #10 (igpu pull 5 + kepler pull 11, UnaOS-gemini@dffa7816, 2026-07-22, fox-metal-r23s1h)
 
 **Boot 1 — GMUX PROTOCOL PROVEN, PANEL OWNER NAMED (canon reversal):**
