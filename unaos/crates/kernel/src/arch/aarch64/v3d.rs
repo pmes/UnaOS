@@ -3133,12 +3133,25 @@ fn pctr_setup_cs_witness() {
     let channel_4_7 =
         (PCTR_SRC_QPU_CYCLES_WAITING_TMU & 0x7f) | ((PCTR_SRC_TMU_TCACHE_MISS & 0x7f) << 8);
     let mask: u32 = 0b11_1111; // six counters enabled (0..5)
+    // PI-V3D-37: arm in the exact Linux v3d_perfmon.c::v3d_perfmon_start order — STOP, program sources
+    // while stopped, CLR+OVERFLOW while stopped, then EN LAST. The V3D-33 six-counter arming inherited the
+    // V3D-21 order (EN before CLR, no barrier between), which enables the counters BEFORE they are cleared:
+    // between EN and CLR the block counts against a source-select word that may not have settled, and the
+    // CLR then races the running counters. That window aliased the two counters that actually tick during
+    // the bin — counter1 (src16 valid_instr) and counter4 (src17 cycles_waiting_tmu) — so P35 read them at
+    // ~cycle_count/4 (2116418 / 2116395, near-equal) instead of the true 55 / 0. Two witnesses (probe then
+    // M4) reuse slots 0..5 sequentially; the leading EN=0 also guarantees the prior arming is fully
+    // quiesced before this one reprograms the shared source-selects, so neither witness's slots overlap the
+    // other's live counting.
+    mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_EN, 0); // stop any prior counting before reprogramming
+    dsb();
     mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_SRC_0_3, channel);
     mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_SRC_4_7, channel_4_7);
-    dsb();
-    mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_EN, mask);
-    mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_CLR, mask);
-    mmio_write(V3D_CORE0_BASE, V3D_PCTR_0_OVERFLOW, mask);
+    dsb(); // source-selects land before the counters are cleared/enabled
+    mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_CLR, mask); // zero the counters WHILE stopped
+    mmio_write(V3D_CORE0_BASE, V3D_PCTR_0_OVERFLOW, mask); // clear latched overflow flags
+    dsb(); // clear lands before enable
+    mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_EN, mask); // enable LAST — counting starts from a clean zero
     dsb();
 }
 
