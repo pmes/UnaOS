@@ -277,13 +277,13 @@ pub fn init(gpu: &GpuInfo) {
                                         let ctrl_addr_high_off = pbdma_base + 0x0C;
                                         
                                         let pre_low = mmio_read(bar0, ctrl_addr_low_off);
-                                        // We read high just to be clean, but target is in low.
-                                        
+                                        let pre_high = mmio_read(bar0, ctrl_addr_high_off); // report-only; TARGET is in low
+
                                         if pre_low == 0xFFFFFFFF || pre_low == 0xBAD0BA20 {
                                             serial_println!(":: kepler: ctrladdr pbdma{} ABSENT? rb={:08X} ::", pbdma_idx, pre_low);
                                             continue;
                                         }
-                                        serial_println!(":: kepler: ctrladdr pbdma{} pre={:08X} ::", pbdma_idx, pre_low);
+                                        serial_println!(":: kepler: ctrladdr pbdma{} pre={:08X} hi={:08X} ::", pbdma_idx, pre_low, pre_high);
                                         
                                         for target in 0..4 {
                                             let wrote = (pre_low & !0x3) | target;

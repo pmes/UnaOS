@@ -54,6 +54,9 @@ STOP: say so in your proposal/report; the coordinator handles it.
   file is worth keeping, say so in your report instead of leaving it silently.
 - Commit on `UnaOS-gemini` only. Never merge, never force-push, never rebase.
   Message style: `gpu: <imperative summary> [knobs touched]`.
+- **You do not push. Peter pushes.** End every report with the line
+  "PUSH OWED: <n> commit(s) on UnaOS-gemini" so he knows the branch is ahead —
+  work he hasn't pushed is work that can be lost.
 - `git pull` before you start and before any file reorganization — the
   coordinator and the other specialist commit to this branch too.
 
