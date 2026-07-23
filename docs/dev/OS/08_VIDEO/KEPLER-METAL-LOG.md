@@ -34,7 +34,27 @@ panel theory flips:** `[Intel iGPU]` through `:: igpu: probe-complete ::`.
   — the original brief omitted the FIFO knob; Fox's strings check caught the
   under-build before it flew.
 
-Boot 2b (kepler pbdma/clock dumps) staged; verdict pending.
+**Boot 2b (full pass) — SITTING COMPLETE, wall 2 relocated upstream:**
+- igpu probe re-ran identically (all-dark confirmed twice). Nit: the probe
+  prints twice — PCI walk revisits the device; harmless, dedupe whenever the
+  file is next touched.
+- Kepler: pbdma-count 3; **all three PBDMAs `ch=00000000 ACTIVE=0,
+  ib_put=ib_get=0` — no PBDMA ever binds our channel.** Eng-masks are set
+  (pbdma0=0x01, pbdma1=0x6E, pbdma2=0x10). Clocks proven fine:
+  `PMC_ENABLE=0xE011216D` (PFIFO=1), `SUBFIFO_ENABLE=0x7` — the
+  clock/enable theory is DEAD. Meanwhile `playlist_rd=0x2013 len=0x100001`
+  (scheduler reads the runlist), `ch_stat=0x11000001` (ENABLED), `gp_get=0`,
+  fence-timeout as before.
+- **Synthesis:** the fetch never happens because the channel is never
+  SCHEDULED onto a PBDMA. The wall moved upstream of PBDMA to the
+  runlist-entry/channel-bind step. Pull-8 candidate list (rnndb facts only):
+  (a) GK107 runlist entry format/ID vs our channel id; (b) RAMFC/instance
+  fields the scheduler validates before binding (inst-raw
+  08=0x02002000 0C=0 48=0x02001000 4C=0x01FF0000 is on serial to decode);
+  (c) runlist submit/commit ordering vs channel-enable; (d) whether the
+  channel must ride the ENGINE's runlist rather than runlist 0.
+
+Capture: `~/unaos-bench/capture/rmbp-r23s6/` + MANIFEST rows.
 
 ## Sitting #5 (pull 6 v2, UnaOS-gemini@e49efbeb, 2026-07-22, fox-metal-r23s1g) — STRATEGIC REDIRECT
 
