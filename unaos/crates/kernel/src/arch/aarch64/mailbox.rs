@@ -62,12 +62,22 @@ const TAG_GET_CLOCK_RATE: u32 = 0x0003_0002; // M6g: query a clock's current rat
 // the Pi-4/VC6 path (the legacy VC4 `Enable_QPU`/set-power tags are NOT used here). See
 // arch_arm64.md §PI-V3D and the scout research of record. `v3d`-gated so a knob-off kernel8 is
 // byte-identical to baseline (these are additive, not called on any default path).
-#[cfg(feature = "v3d")]
+#[cfg(any(feature = "v3d", feature = "piusb"))]
 const TAG_SET_DOMAIN_STATE: u32 = 0x0003_8030; // set a power-domain's on/off state (value {domain, state})
-#[cfg(feature = "v3d")]
+#[cfg(any(feature = "v3d", feature = "piusb"))]
 const TAG_SET_CLOCK_STATE: u32 = 0x0003_8001; // enable/disable a clock's GATE (value {clock_id, state})
 #[cfg(feature = "v3d")]
 const TAG_SET_CLOCK_RATE: u32 = 0x0003_8002; // set a clock's rate (value {clock_id, rate_hz, skip_turbo})
+// PIUSB-32: the READ-side companions the diagnostic census uses to witness the power/clock state of the
+// candidate firmware domains BEFORE the deferred RC APB read (which P39/P40/P41 metal proved hard-stalls
+// the CPU). Query-only tags — they never change firmware state. `{id, state}` value buffers; the reply
+// `state` echoes bit0 = on/active, bit1 = "device/clock/domain does not exist". `piusb`-gated (additive).
+#[cfg(feature = "piusb")]
+const TAG_GET_POWER_STATE: u32 = 0x0002_0001; // get a firmware DEVICE's power state (value {device_id, state})
+#[cfg(feature = "piusb")]
+const TAG_GET_DOMAIN_STATE: u32 = 0x0003_0030; // get a power-DOMAIN's on/off state (value {domain, state})
+#[cfg(feature = "piusb")]
+const TAG_GET_CLOCK_STATE: u32 = 0x0003_0001; // get a clock's GATE state (value {clock_id, state})
 // PI-USB-1: notify the VideoCore firmware to reset (and reload the SPI-EEPROM firmware into) the VIA
 // VL805 xHCI behind the BCM2711 PCIe RC. The RPi bootloader normally loads the VL805 firmware at power-on;
 // this tag re-issues that reset for an OS bringing the controller up itself. Value buffer = one u32, the
@@ -266,7 +276,7 @@ pub fn get_clock_rate(clock_id: u32) -> Option<u32> {
 /// mailbox failure. Used to power the V3D block (`POWER_DOMAIN_V3D`) before touching its registers —
 /// with the domain off, V3D MMIO reads garbage. Single-user `MBOX` like the other calls: the V3D
 /// bring-up runs single-threaded on the BSP after the boot framebuffer call is long done.
-#[cfg(feature = "v3d")]
+#[cfg(any(feature = "v3d", feature = "piusb"))]
 pub fn set_power_domain(domain: u32, state: u32) -> Option<u32> {
     request(0, 8 * 4); // total size (8 words used)
     request(1, 0); // request
@@ -290,7 +300,7 @@ pub fn set_power_domain(domain: u32, state: u32) -> Option<u32> {
 /// power + rate both ACKed yet the V3D never decoded. Reply `state`: bit0 = clock active, bit1 = clock
 /// not present. Returns `Some(true)` if the firmware reports the clock present AND active,
 /// `Some(false)` if present-but-off, `None` on a mailbox failure or an absent clock.
-#[cfg(feature = "v3d")]
+#[cfg(any(feature = "v3d", feature = "piusb"))]
 pub fn set_clock_state(clock_id: u32, on: bool) -> Option<bool> {
     request(0, 8 * 4); // total size (8 words used)
     request(1, 0); // request
@@ -308,6 +318,63 @@ pub fn set_clock_state(clock_id: u32, on: bool) -> Option<bool> {
         return None; // firmware reports the clock not present
     }
     Some(state & 0x1 != 0)
+}
+
+/// PIUSB-32: the read-only power/clock STATE witnesses. Each returns the raw firmware `state` reply word
+/// (bit0 = on/active, bit1 = "does-not-exist") so the census can print the whole word, or `None` on a
+/// mailbox transport failure. Query-only: none of these three tags mutates firmware state — they are the
+/// diagnostic companions to `set_power_domain` / `set_clock_state`. Single-user `MBOX` like every other
+/// call here (the census runs single-threaded on the BSP, boot framebuffer call long done).
+#[cfg(feature = "piusb")]
+pub fn get_power_state(device_id: u32) -> Option<u32> {
+    request(0, 8 * 4);
+    request(1, 0);
+    request(2, TAG_GET_POWER_STATE);
+    request(3, 8); // value buffer (2 words: device_id, state)
+    request(4, 0);
+    request(5, device_id);
+    request(6, 0); // state (reply)
+    request(7, TAG_END);
+    if !mbox_call(8) {
+        return None;
+    }
+    Some(reply(6))
+}
+
+/// PIUSB-32: read-only power-DOMAIN state (the same domain-id namespace `set_power_domain` writes —
+/// e.g. `POWER_DOMAIN_V3D`). Returns the firmware `state` word (bit0 on, bit1 does-not-exist).
+#[cfg(feature = "piusb")]
+pub fn get_domain_state(domain: u32) -> Option<u32> {
+    request(0, 8 * 4);
+    request(1, 0);
+    request(2, TAG_GET_DOMAIN_STATE);
+    request(3, 8); // value buffer (2 words: domain, state)
+    request(4, 0);
+    request(5, domain);
+    request(6, 0); // state (reply)
+    request(7, TAG_END);
+    if !mbox_call(8) {
+        return None;
+    }
+    Some(reply(6))
+}
+
+/// PIUSB-32: read-only CLOCK gate state (the clock-id namespace `set_clock_state` writes — e.g.
+/// `CLOCK_ID_V3D`). Returns the firmware `state` word (bit0 active, bit1 does-not-exist).
+#[cfg(feature = "piusb")]
+pub fn get_clock_state(clock_id: u32) -> Option<u32> {
+    request(0, 8 * 4);
+    request(1, 0);
+    request(2, TAG_GET_CLOCK_STATE);
+    request(3, 8); // value buffer (2 words: clock_id, state)
+    request(4, 0);
+    request(5, clock_id);
+    request(6, 0); // state (reply)
+    request(7, TAG_END);
+    if !mbox_call(8) {
+        return None;
+    }
+    Some(reply(6))
 }
 
 /// PI-V3D-1: set a firmware-managed clock's rate in Hz. Returns the rate the firmware actually

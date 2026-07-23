@@ -6884,6 +6884,48 @@ the original site (it never spawns the GUI tasks and falls through to the shared
 renamed `piusb30: boot-core bring-up start/done`. Positive verification (rings/RS=1, live enumeration,
 keyboard armed) remains the attended Pi sitting; QEMU proves only non-regression (census-skip both ways).
 
+### PIUSB-32 — the deferred-RC-APB-stall diagnostic (power/clock census)
+
+**Metal wall (P39/P40/P41):** with V3D + GENET + the panel live, the FIRST RC APB register read in the
+deferred bring-up — `RGR1_SW_INIT_1 @ 0xfd509210` — **hard-stalls the CPU**: the `piusb31` enter line
+prints, the exit line never does, with no fault and no timeout (an unbounded bus stall, not the
+timeout-guarded mailbox). The SAME read is fine in P38's early (pre-V3D / pre-SMP / pre-panel)
+single-threaded context. Mailbox is exonerated (bounded; the wedge precedes any USB mailbox call).
+
+**Order-of-operations differential (what changed between P38 and P40/41, before the RC read):** the ONLY
+new mailbox power/clock activity is **V3D bring-up** (`v3d::bringup`, called from `init_framebuffer`):
+`set_power_domain(V3D=10, on)` → `set_clock_rate(V3D=5)` → `set_clock_state(V3D=5, on)`. **GENET and the
+framebuffer allocation issue NO `SET_POWER`/`SET_CLOCK`** (GENET clocks itself via its own registers). So
+V3D's power/clock is the single differential candidate for a shared-PLL-parent perturbation.
+
+**Authoritative DTB fact (refutes the firmware-gating theory):** `bcm2711.dtsi` `pcie@7d500000` carries
+**no** `clocks` / `power-domains` / `resets` / `reset-names` property (GENET `@7d580000` likewise). In the
+Linux/firmware model the RC's APB register block is **not** behind a firmware-managed power/clock/reset
+domain the OS claims — it is expected to be always-clocked. That makes "firmware gated the RC APB clock"
+and "V3D toggled a PLL feeding the RC register clock" **unsupported by the device tree**; the null
+hypothesis shifts to *our* deferred execution context.
+
+**Instrumentation landed (`power_clock_census`, mailbox-only, timeout-bounded):** read-only
+`get_domain_state`/`get_clock_state`/`get_power_state` witnesses (RPi firmware tags `0x00030030` /
+`0x00030001` / `0x00020001`) for the candidate ids — V3D power domain **10**, V3D clock **5**, USB-HCD
+device **3** (control). Printed as `[piusb32] census(<ctx>): ...` in **both** the early P38-equivalent
+context (`bringup`, tail of `build_boot_info`) **and** the deferred stall context (`bringup_inner`, right
+before the first RC MMIO). Per brief step 4, a candidate reported **present-but-off** is enabled and
+re-witnessed (a no-op on metal where V3D is freshly up — it fires only on a genuine off-when-on). Both
+census calls are gated on `dtb_has_pcie`, so QEMU raspi4b (no `pcie@` node) prints nothing — verified.
+
+**P42 decision tree (diff the two `[piusb32]` lines):**
+- a candidate whose power/clock **differs** early-vs-deferred ⇒ firmware-owned; the conditional enable
+  re-arms it and the following RC read should return (root cause = a domain V3D/runtime-PM perturbed);
+- all three **identical and ON** in both lines ⇒ the RC registers are **not** power/clock gated (matches
+  the DTB) — the stall is owned by the deferred execution *context*, and the fix is the **split** (run the
+  RC + xHCI hardware bring-up in the earlier single-threaded context, defer only enumeration). NOTE: a
+  true pre-V3D split needs the `piusb::bringup` call reordered ahead of `init_framebuffer` in `boot.rs`
+  (outside the pi arc's lane) — flagged to the integrator rather than taken unilaterally.
+
+Gates: `./arroyo check` both arches; `UNAOS_V3D=1 UNAOS_GENET=1 UNAOS_PIUSB=1 ./arroyo kernel8-test`
+(clean boot, census-skip); `./arroyo test-arm` (virt xHCI KB/mouse/storage enumerate).
+
 ## PI-GENET — BCM2711 on-board Gigabit Ethernet (Broadcom GENET v5) + smoltcp bind (Arc PI-GENET)
 
 The Pi's **first network path.** The BCM2711 integrates a Broadcom "GENET" v5 unimac Ethernet

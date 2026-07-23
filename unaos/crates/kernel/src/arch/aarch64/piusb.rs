@@ -323,6 +323,87 @@ fn dtb_has_pcie(dtb: u64) -> bool {
 // but master-aborts forwarding it downstream). The unclaimed-vs-master-abort difference localises the
 // wall: pre-reset it is the RC's address claim; post-reset it is downstream of the RC (the BAR).
 
+// ─── PIUSB-32: the power/clock CENSUS — the deferred-RC-stall diagnostic. ────────────────────────────
+//
+// Metal P39/P40/P41: with V3D + GENET + the panel live, the FIRST RC APB register read
+// (RGR1_SW_INIT_1 @ 0xfd509210) HARD-STALLS the CPU — the `piusb31` enter line prints, the exit line
+// never does, with no fault and no timeout. The SAME read is fine in P38's early (pre-V3D/pre-SMP/
+// pre-panel) single-threaded context. The question this census answers on the next metal boot: did any
+// firmware-managed power/clock domain that could feed the RC's register interface CHANGE state between
+// P38's early context and the deferred context (e.g. V3D bring-up's mailbox SET_POWER/SET_CLOCK
+// reassigning a shared PLL parent, or a firmware runtime-PM powering an unclaimed domain down)?
+//
+// ── AUTHORITATIVE DTB FACT (bcm2711.dtsi, `pcie@7d500000`) ──────────────────────────────────────────
+// The BCM2711 PCIe RC node carries NO `clocks`, `power-domains`, `resets` or `reset-names` property
+// (GENET @7d580000 likewise). So in the Linux/firmware model the RC's APB register block is NOT behind a
+// firmware-managed power/clock/reset domain the OS is expected to claim — it is expected to be
+// always-clocked. That makes the "firmware gated the RC APB clock" and "V3D toggled a PLL feeding the RC
+// register clock" theories UNSUPPORTED by the device tree; this census is here to PROVE OR REFUTE them
+// empirically at the next boot (there is no DTB node to consult on real silicon for these state words).
+//
+// Candidate firmware ids (RPi firmware property interface; two id namespaces):
+//   * V3D power DOMAIN 10 + V3D clock 5 — the ONLY power/clock domains our boot now writes before the
+//     deferred RC read (via `v3d::bringup` inside `init_framebuffer`); GENET and the framebuffer alloc
+//     issue no SET_POWER/SET_CLOCK. If V3D bring-up perturbed a shared parent, these are where it shows.
+//   * USB HCD DEVICE 3 (the GET/SET_POWER_STATE device-id namespace: 3 = USB HCD) — the closest
+//     firmware "USB power" handle, witnessed as a control.
+// The census is READ-ONLY by default; per the PIUSB-32 brief step 4 it will ENABLE a candidate ONLY IF
+// the firmware reports it PRESENT-BUT-OFF (a genuine off-when-it-should-be-on), witnessing the flip. It
+// is mailbox-only (timeout-bounded — never the source of a hard stall) so it is safe on BOTH the early
+// boot-critical path and the deferred path.
+const CENSUS_DOMAIN_V3D: u32 = 10;
+const CENSUS_CLOCK_V3D: u32 = 5;
+const CENSUS_DEVICE_USB_HCD: u32 = 3;
+
+/// Decode a firmware state reply word into a short verdict. bit1 = does-not-exist, bit0 = on/active.
+fn census_state(word: Option<u32>) -> (&'static str, u32) {
+    match word {
+        None => ("mbox-fail", 0xffff_ffff),
+        Some(w) if w & 0x2 != 0 => ("ABSENT", w),
+        Some(w) if w & 0x1 != 0 => ("ON", w),
+        Some(w) => ("off", w),
+    }
+}
+
+/// PIUSB-32 census: witness (and, if genuinely off, enable) the candidate firmware power/clock domains at
+/// `ctx`. Prints one `[piusb32]` line per candidate plus a verdict, all mailbox-only (no RC MMIO). Called
+/// in BOTH the early P38-equivalent context (`bringup`) and the deferred context (`bringup_inner`) so the
+/// two boots' lines can be diffed: a candidate whose state DIFFERS across the wall is the smoking gun; all
+/// three IDENTICAL and ON exonerates the firmware-power/clock theory and localizes the stall to the
+/// deferred execution context itself (the split-design signal — see the arc report).
+fn power_clock_census(ctx: &str) {
+    let dom = mailbox::get_domain_state(CENSUS_DOMAIN_V3D);
+    let clk = mailbox::get_clock_state(CENSUS_CLOCK_V3D);
+    let usb = mailbox::get_power_state(CENSUS_DEVICE_USB_HCD);
+    let (dom_s, dom_w) = census_state(dom);
+    let (clk_s, clk_w) = census_state(clk);
+    let (usb_s, usb_w) = census_state(usb);
+    serial_println!(
+        "{}   [piusb32] census({}): V3D-domain({}) power={} ({:#010x}) | V3D-clock({}) clock={} ({:#010x}) | USB-HCD-dev({}) power={} ({:#010x}) ::",
+        P, ctx, CENSUS_DOMAIN_V3D, dom_s, dom_w, CENSUS_CLOCK_V3D, clk_s, clk_w, CENSUS_DEVICE_USB_HCD, usb_s, usb_w
+    );
+
+    // Step 4 (conditional enable): only a candidate the firmware reports PRESENT-BUT-OFF gets flipped on,
+    // and the flip is re-witnessed. On metal V3D is freshly powered/clocked (expected ON), so this is a
+    // no-op unless something genuinely powered a candidate down — in which case the re-witness proves it.
+    if dom_s == "off" {
+        let got = mailbox::set_power_domain(CENSUS_DOMAIN_V3D, 1);
+        let re = census_state(mailbox::get_domain_state(CENSUS_DOMAIN_V3D));
+        serial_println!(
+            "{}   [piusb32] census({}): V3D-domain({}) was OFF — SET on -> {:?}, re-read {} ({:#010x}) ::",
+            P, ctx, CENSUS_DOMAIN_V3D, got, re.0, re.1
+        );
+    }
+    if clk_s == "off" {
+        let got = mailbox::set_clock_state(CENSUS_CLOCK_V3D, true);
+        let re = census_state(mailbox::get_clock_state(CENSUS_CLOCK_V3D));
+        serial_println!(
+            "{}   [piusb32] census({}): V3D-clock({}) was OFF — SET on -> {:?}, re-read {} ({:#010x}) ::",
+            P, ctx, CENSUS_CLOCK_V3D, got, re.0, re.1
+        );
+    }
+}
+
 /// Outbound-window packing constants (M1 step (f)): CPU base/limit are expressed in 1 MiB units, and the
 /// upper MiB bits spill from the 12-bit BASE_LIMIT field into the separate BASE_HI/LIMIT_HI registers.
 const WIN_MB_SHIFT: u64 = 20; // 1 MiB granularity
@@ -699,6 +780,15 @@ static PIUSB_DTB: AtomicU64 = AtomicU64::new(0);
 /// stashing an AtomicU64 is heap-free and safe there. Off the boot path = the panel unblocks at once.
 pub fn bringup(dtb: u64) {
     PIUSB_DTB.store(dtb, Ordering::Release);
+    // PIUSB-32: EARLY power/clock census — this call runs at the tail of `build_boot_info` (pre-heap,
+    // pre-SMP, IRQs masked, panel not yet live): the P38-equivalent context in which the RC APB read is
+    // metal-proven to succeed. It captures the candidate firmware domains' state HERE so the deferred
+    // census (in `bringup_inner`) can be diffed against it — a state change across the two is the wall.
+    // Mailbox-only (no RC MMIO), so it never risks the boot-critical stall PIUSB-29 removed; gated on the
+    // DTB `pcie@` census so QEMU raspi4b (no RC) stays silent, matching every other RC-touch site.
+    if dtb_has_pcie(dtb) {
+        power_clock_census("early/build_boot_info (P38-equivalent context)");
+    }
 }
 
 /// PIUSB-30: the deferred USB bring-up, run ONCE on the BOOT CORE (the BSP) from `kernel_main` AFTER the
@@ -754,6 +844,20 @@ fn bringup_inner(dtb: u64) {
         return;
     }
     serial_println!("{} DTB census: `pcie@` controller present — proceeding to RC bring-up ::", P);
+
+    // ── PIUSB-32: DEFERRED power/clock census — the counterpart to the early census in `bringup`. This
+    //    runs in the exact context where the RC APB read stalls (post-V3D/GENET/panel), RIGHT BEFORE the
+    //    first RC MMIO (`dump_firmware_state`'s `piusb31` enter/read). The next metal boot decides the
+    //    root cause by diffing these two `[piusb32] census(...)` lines:
+    //      * a candidate whose power/clock DIFFERS here vs the early line  => firmware-owned: V3D bring-up
+    //        (or a firmware runtime-PM) changed a domain the RC depends on; the conditional enable above
+    //        will have already re-armed it, and the following RC read should now return.
+    //      * all three IDENTICAL and ON in both lines                       => the RC's registers are NOT
+    //        firmware power/clock gated (consistent with the DTB carrying no such domain); the stall is
+    //        owned by the deferred execution CONTEXT, not power/clock — the split-design signal.
+    //    Mailbox-only (timeout-bounded); it cannot itself be the source of the hard stall (mailbox is
+    //    already exonerated — the wedge precedes any USB mailbox call).
+    power_clock_census("deferred/bringup_inner (post-V3D+GENET+panel — the stall context)");
 
     // ── PIUSB-5/6: read-only reference dump FIRST (link-up-gated), reset SECOND. Capture the
     //    firmware-left state before M1 destroys it with the bridge/PERST reset. boot-P4 proved the
