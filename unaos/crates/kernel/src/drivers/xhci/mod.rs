@@ -519,6 +519,44 @@ pub unsafe fn ring_doorbell_asm(doorbell_addr: u64, target: u32) {
     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 }
 
+/// Write a 64-bit xHCI operational/runtime register as an ordered pair of 32-bit
+/// stores — low dword first, then high dword. xHCI 5.1 explicitly permits every
+/// 64-bit register (CRCR, DCBAAP, ERSTBA, ERDP) to be accessed as two 32-bit
+/// registers, and this is the ONLY portable form.
+///
+/// PIUSB-21 root cause: on the Pi 4 the VL805 sits behind the brcmstb PCIe root
+/// complex, whose BAR window does not carry 8-byte MMIO TLPs. A single AArch64
+/// `str x` (64-bit store) is down-converted by the RC and the 32-bit data lane is
+/// REPLICATED into both dwords — a `0x02003240` DCBAAP write reads back
+/// `0x0200324002003240`, an ERSTBA/ERDP write likewise (`0x0015b7800015b780`,
+/// `0x0014fa400014fa40`). The mirrored high dword pushes every controller DMA base
+/// above 4 GiB, outside the RC_BAR2 inbound window (RAM @ 0, 4 GiB), so the command
+/// ring, ERST, and event ring all fetch from garbage: the ring shows CRR=1 but no
+/// command completes and no event is ever posted. Splitting into two 32-bit stores
+/// delivers the correct low dword and a true-zero high dword.
+///
+/// x86 is unaffected either way: Intel/AMD root complexes carry native 64-bit MMIO
+/// (no replication), and two 32-bit stores are byte-identical there — this mirrors
+/// Linux's universal `lo_hi_writeq`/`xhci_write_64`, so there is no x86 regression.
+#[inline(always)]
+unsafe fn write_reg64(reg: *mut u64, val: u64) {
+    let p = reg as *mut u32;
+    core::ptr::write_volatile(p, val as u32);
+    core::ptr::write_volatile(p.add(1), (val >> 32) as u32);
+}
+
+/// Read a 64-bit xHCI register as two 32-bit loads (low then high), reassembled.
+/// The same RC that replicates 64-bit stores also replicates 64-bit LOADS on the
+/// Pi (a single `ldr x` returns lo mirrored into hi); two 32-bit loads return the
+/// true low and high dwords. Byte-identical on x86.
+#[inline(always)]
+unsafe fn read_reg64(reg: *const u64) -> u64 {
+    let p = reg as *const u32;
+    let lo = core::ptr::read_volatile(p) as u64;
+    let hi = core::ptr::read_volatile(p.add(1)) as u64;
+    (hi << 32) | lo
+}
+
 /// Direction of a Bulk-Only Transport data stage.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Direction { In, Out, None }
@@ -1361,7 +1399,7 @@ impl XhciController {
 
             let new_dequeue_ptr = EVENT_RING_PHYS_BASE + (dequeue_index as u64 * 16);
             // Bit 3 (EHB) is write-1-to-clear.
-            core::ptr::write_volatile((ir0_base + 0x18) as *mut u64, new_dequeue_ptr | 8);
+            write_reg64((ir0_base + 0x18) as *mut u64, new_dequeue_ptr | 8);
             xdbg!("xHCI: ERDP Advanced to {:#x}", new_dequeue_ptr);
         }
     }
@@ -2248,7 +2286,7 @@ impl XhciController {
             self.dcbaap = dcbaap_ptr;
 
             let dcbaap_reg = (self.op_base + 0x30) as *mut u64;
-            core::ptr::write_volatile(dcbaap_reg, dcbaap_ptr as u64);
+            write_reg64(dcbaap_reg, dcbaap_ptr as u64);
             serial_println!("xHCI: DCBAAP set to {:#x}", dcbaap_ptr as u64);
 
             // 1b. SCRATCHPAD BUFFERS (xHCI spec 4.20). If the controller advertises Max Scratchpad
@@ -2324,7 +2362,7 @@ impl XhciController {
             // MUST set Bit 0 (RCS - Ring Cycle State) to 1 to match our initial Ring state.
             let crcr_reg = (self.op_base + 0x18) as *mut u64;
             let crcr_value = ring_phys_addr | 1;
-            core::ptr::write_volatile(crcr_reg, crcr_value);
+            write_reg64(crcr_reg, crcr_value);
             serial_println!("xHCI: CRCR set to {:#x}", crcr_value);
         }
     }
@@ -2388,13 +2426,13 @@ impl XhciController {
 
             // 4. Write ERSTBA (Segment Table Base Address) - Offset 0x10
             let erstba_ptr = (ir0_base + 0x10) as *mut u64;
-            core::ptr::write_volatile(erstba_ptr, erst_table_phys);
+            write_reg64(erstba_ptr, erst_table_phys);
 
             // 5. Write ERDP (Event Ring Dequeue Pointer) - Offset 0x18
             // Initialize to the start of the ring.
             // PRESERVE BIT 3 (EHB - Event Handler Busy)? No, clear it initially.
             let erdp_ptr = (ir0_base + 0x18) as *mut u64;
-            core::ptr::write_volatile(erdp_ptr, event_ring_phys); // Pointer to the RING, not the table
+            write_reg64(erdp_ptr, event_ring_phys); // Pointer to the RING, not the table
 
             // 5b. IMOD (Interrupter Moderation, +0x04): 0 = no moderation, fire ASAP.
             // (QEMU ignores moderation timing, but set it explicitly for clarity / real HW.)
@@ -2476,22 +2514,26 @@ impl XhciController {
             // 0x0200_0000..0x0500_0000, so these readbacks double as an inbound-window sanity check.
             #[cfg(target_arch = "aarch64")]
             {
-                let crcr = core::ptr::read_volatile((self.op_base + 0x18) as *const u64);
-                let dcbaap = core::ptr::read_volatile((self.op_base + 0x30) as *const u64);
+                // PIUSB-21: read 64-bit regs as two 32-bit loads so the witness prints the
+                // TRUE hi:lo (a single ldr mirrors lo->hi through the brcmstb RC). The raw
+                // single-load readback is dumped alongside so the mirror is still visible.
+                let crcr = read_reg64((self.op_base + 0x18) as *const u64);
+                let dcbaap = read_reg64((self.op_base + 0x30) as *const u64);
+                let dcbaap_raw = core::ptr::read_volatile((self.op_base + 0x30) as *const u64);
                 let usbcmd_rb = core::ptr::read_volatile(usbcmd_ptr);
                 let usbsts_rb = core::ptr::read_volatile(usbsts_ptr);
                 serial_println!(
-                    "xHCI: [aarch64] RS=1 witness: USBCMD={:#x}(RS={} INTE={}) USBSTS={:#x}(HCH={} HSE={} CNR={} HCE={}) CRCR={:#018x}(CRR={} CS={} CA={} RCS={}) DCBAAP={:#018x}",
+                    "xHCI: [aarch64] RS=1 witness: USBCMD={:#x}(RS={} INTE={}) USBSTS={:#x}(HCH={} HSE={} CNR={} HCE={}) CRCR={:#018x}(CRR={} CS={} CA={} RCS={}) DCBAAP={:#018x} DCBAAP_raw64={:#018x}",
                     usbcmd_rb, usbcmd_rb & 1, (usbcmd_rb >> 2) & 1,
                     usbsts_rb, usbsts_rb & 1, (usbsts_rb >> 2) & 1, (usbsts_rb >> 11) & 1, (usbsts_rb >> 12) & 1,
-                    crcr, (crcr >> 3) & 1, (crcr >> 1) & 1, (crcr >> 2) & 1, crcr & 1, dcbaap
+                    crcr, (crcr >> 3) & 1, (crcr >> 1) & 1, (crcr >> 2) & 1, crcr & 1, dcbaap, dcbaap_raw
                 );
                 let ir0 = XHCI_IR0_BASE.load(Ordering::Acquire);
                 if ir0 != 0 {
                     let iman = core::ptr::read_volatile(ir0 as *const u32);
                     let erstsz = core::ptr::read_volatile((ir0 + 0x08) as *const u32);
-                    let erstba = core::ptr::read_volatile((ir0 + 0x10) as *const u64);
-                    let erdp = core::ptr::read_volatile((ir0 + 0x18) as *const u64);
+                    let erstba = read_reg64((ir0 + 0x10) as *const u64);
+                    let erdp = read_reg64((ir0 + 0x18) as *const u64);
                     serial_println!(
                         "xHCI: [aarch64] RS=1 witness: IR0={:#x} IMAN={:#x}(IP={} IE={}) ERSTSZ={} ERSTBA={:#018x} ERDP={:#018x}(EHB={}) ERST[0].ring={:#018x}",
                         ir0, iman, iman & 1, (iman >> 1) & 1, erstsz, erstba, erdp, (erdp >> 3) & 1,
@@ -3160,7 +3202,7 @@ impl XhciController {
                         // log ties the stuck command to the ring the controller is (or isn't) fetching.
                         let (crcr, usbcmd, usbsts) = unsafe {
                             (
-                                core::ptr::read_volatile((self.op_base + 0x18) as *const u64),
+                                read_reg64((self.op_base + 0x18) as *const u64),
                                 core::ptr::read_volatile(self.op_base as *const u32),
                                 core::ptr::read_volatile((self.op_base + 0x04) as *const u32),
                             )
@@ -3252,21 +3294,21 @@ impl XhciController {
         }
         let stage_stamp = self.enum_stage_set_at;
         let crcr_ptr = (self.op_base + 0x18) as *mut u64;
-        let crr_set = unsafe { (core::ptr::read_volatile(crcr_ptr) >> 3) & 1 != 0 };
+        let crr_set = unsafe { (read_reg64(crcr_ptr) >> 3) & 1 != 0 };
         if crr_set {
             self.cmd_ring_stopped = true;
             let rcs = COMMAND_RING.lock().as_ref()
                 .map(|r| r.trb_cycle(aborted))
                 .unwrap_or(1) as u64;
             unsafe {
-                core::ptr::write_volatile(crcr_ptr, aborted | rcs | (1 << 2));
+                write_reg64(crcr_ptr, aborted | rcs | (1 << 2));
             }
             serial_println!("xHCI: command abort issued (CRCR.CA, aborted TRB {:#x}).", aborted);
             let start = crate::arch::now_cycles();
             let budget = hw_wait_budget(); // ~2 s; Linux allows 5 s, but this is boot-critical
             loop {
                 while self.drain_event_ring_once() {}
-                let crr = unsafe { (core::ptr::read_volatile(crcr_ptr) >> 3) & 1 };
+                let crr = unsafe { (read_reg64(crcr_ptr) >> 3) & 1 };
                 if crr == 0 {
                     break;
                 }
@@ -3299,7 +3341,7 @@ impl XhciController {
             // 1. READ CRCR (Command Ring Control Register)
             // Offset 0x18 from OpBase
             let crcr_reg = (self.op_base + 0x18) as *const u64;
-            let crcr_raw = core::ptr::read_volatile(crcr_reg);
+            let crcr_raw = read_reg64(crcr_reg);
 
             // Mask bits 0-5 to get the pointer (address is 64-byte aligned, so low 6 bits are flags)
             let crcr_ptr = crcr_raw & !0x3F;

@@ -184,6 +184,32 @@ budget (`wait_until`) so a wedged controller cannot hang the boot.
 Boot evidence: `xHCI: Controller Started!`, `MaxSlots=64, MaxPorts=8`,
 `Interrupter 0 enabled (IMAN.IE set, interrupt-driven)`.
 
+### 2a. 64-bit register access — split 32-bit writes (PIUSB-21)
+
+Every 64-bit xHCI operational/runtime register (`CRCR`, `DCBAAP`, `ERSTBA`,
+`ERDP`) is written and read through `write_reg64` / `read_reg64` (mod.rs), which
+issue an ordered **pair of 32-bit MMIO accesses** (low dword first, then high) —
+the form xHCI 5.1 explicitly permits and Linux uses universally (`lo_hi_writeq`).
+
+This is mandatory on the Pi 4. The VL805 sits behind the brcmstb PCIe root
+complex, whose BAR window does **not** carry 8-byte MMIO TLPs: a single AArch64
+`str x` (64-bit store) is down-converted and its 32-bit data lane is **replicated
+into both dwords**. A `0x02003240` DCBAAP write read back `0x0200324002003240`;
+`ERSTBA`/`ERDP` likewise (`0x0015b7800015b780`, `0x0014fa400014fa40`). The
+mirrored high dword pushes every controller DMA base above 4 GiB — outside the
+`RC_BAR2` inbound window (RAM @ 0, 4 GiB) — so the command ring, ERST, and event
+ring all fetch from unmapped addresses: the ring reports `CRR=1` (running) but no
+command ever completes and **no event is ever posted** (the PIUSB-20 enable-slot
+wall). Splitting into two 32-bit stores delivers the correct low dword and a
+true-zero high dword; the controller's DMA bases land inside the window and
+completions post.
+
+x86 is unaffected: Intel/AMD root complexes carry native 64-bit MMIO (no
+replication), and the two-write form is byte-identical there — no regression, and
+the x86 MISSION-SUCCESS storage gate is unchanged. The RS=1 witness now prints
+`DCBAAP` reassembled from two 32-bit reads alongside the raw single-load readback
+(`DCBAAP_raw64`), so the replication is directly observable on the wire.
+
 ---
 
 ## 3. Interrupt model (MSI → local APIC)
