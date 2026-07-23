@@ -2118,19 +2118,30 @@ fn build_probe_shader_record() -> u32 {
     sf(&mut rec, 64, 32, defaults); // Address of default attribute values
     // FS / VS slots (never executed in a bin-only job) — point at the probe code + uniforms so every
     // address field is a valid arena pointer.
-    sf(&mut rec, 96, 1, 1); // FS 4-way threadable
+    // V3D-32: the probe is a threads=2 program (artifact line 76 "threads=2 tmu_count=1"), NOT threads=4
+    // like the working coord/vertex shaders. In the GL Shader State Record's per-shader flag group the
+    // low three bits are, per Mesa's `v3dX(pack)` of "GL Shader State Record" (v3d_packet_v42.xml, driver
+    // `v3d_emit.c`): bit0 = N-way threadable where `_4_way_threadable = (prog_data.base.threads == 4)`,
+    // bit1 = `_2_way_threadable = (prog_data.base.threads == 2)`, bit2 = propagate NaNs. V3D-31 set the
+    // 4-WAY bit (offset 0) for this threads=2 program — a mis-declared thread count: the hardware's
+    // thread scheduler was told to run 4-way when the compiler laid the code out for 2, so the terminal
+    // [22] tmuwt segment never executed and the store never drained. The correct declaration for a
+    // threads=2 shader is the 2-WAY bit (offset 1), 4-way clear. All three record slots point at the same
+    // threads=2 probe code, so all three carry the 2-way flag (FS/VS are unexecuted in a bin-only job,
+    // but declaring them correctly costs nothing). PROBE_WORDS stays byte-verbatim (§5 untouched).
+    sf(&mut rec, 97, 1, 1); // FS 2-way threadable (threads=2)
     sf(&mut rec, 98, 1, 1); // FS propagate NaNs (v42)
     sf(&mut rec, 99, 29, code >> 3); // FS code address
     sf(&mut rec, 128, 32, unif); // FS uniforms address
-    sf(&mut rec, 160, 1, 1); // VS 4-way threadable
+    sf(&mut rec, 161, 1, 1); // VS 2-way threadable (threads=2)
     sf(&mut rec, 162, 1, 1); // VS propagate NaNs (v42)
     sf(&mut rec, 163, 29, code >> 3); // VS code address
     sf(&mut rec, 192, 32, unif); // VS uniforms address
-    // Coord shader — the one the bin runs. V3D-31: declare 4-way threadable so the hardware honours the
-    // [18]/[19] mid-shader thread-switch pair and runs on to the terminal [22] tmuwt (store drain),
-    // instead of terminating at the [18] switch treated as a thread-end (the [v3d28] store-never-issued
-    // root cause). Matches the working build_shader_record; PROBE_WORDS unchanged.
-    sf(&mut rec, 224, 1, 1); // CS 4-way threadable
+    // Coord shader — the one the bin runs. V3D-32: 2-WAY threadable (threads=2), matching the Mesa
+    // compile; NOT 4-way (V3D-31's bug). This makes the hardware run the program with the 2-thread
+    // segmentation the compiler emitted — the [18]/[19] thrsw pair is the single 2-way thread switch to
+    // the final segment, which runs on to [22] tmuwt where the store at [9] finally drains.
+    sf(&mut rec, 225, 1, 1); // CS 2-way threadable (threads=2)
     sf(&mut rec, 226, 1, 1); // CS propagate NaNs (v42)
     sf(&mut rec, 227, 29, code >> 3); // CS code address
     sf(&mut rec, 256, 32, unif); // CS uniforms address (probe stream: indices + UBO_ADDR + scales)
@@ -2206,12 +2217,13 @@ fn probe_job() {
     let fs_code_pa = rec_w12 & 0xFFFF_FFF8;
     let vs_code_pa = rec_w20 & 0xFFFF_FFF8;
     let cs_code_pa = rec_w28 & 0xFFFF_FFF8;
-    let cs_4way = rec_w28 & 1; // bit 224
+    let cs_4way = rec_w28 & 1; // bit 224 (V3D-32: expect 0 for the threads=2 probe)
+    let cs_2way = (rec_w28 >> 1) & 1; // bit 225 (V3D-32: expect 1 for the threads=2 probe)
     let cs_propnan = (rec_w28 >> 2) & 1; // bit 226
-    let vs_4way = rec_w20 & 1; // bit 160
+    let vs_2way = (rec_w20 >> 1) & 1; // bit 161
     serial_println!(
-        ":: V3D: [v3d30] shader-record decode — probe code PA={:#010x} | CS start={:#010x} (4way={} propNaN={}) VS start={:#010x} (4way={}) FS start={:#010x} | CS unif={:#010x} — CS start {} probe code ::",
-        probe_code_pa, cs_code_pa, cs_4way, cs_propnan, vs_code_pa, vs_4way, fs_code_pa, rec_cs_unif,
+        ":: V3D: [v3d30] shader-record decode — probe code PA={:#010x} | CS start={:#010x} (4way={} 2way={} propNaN={}) VS start={:#010x} (2way={}) FS start={:#010x} | CS unif={:#010x} — CS start {} probe code ::",
+        probe_code_pa, cs_code_pa, cs_4way, cs_2way, cs_propnan, vs_code_pa, vs_2way, fs_code_pa, rec_cs_unif,
         if cs_code_pa == probe_code_pa { "==" } else { "!= (MISMATCH — bin ran the WRONG program)" }
     );
     // Read the executed QPU words BACK from the arena at the recorded CS start address. If the record
@@ -2235,6 +2247,47 @@ fn probe_job() {
         serial_println!(
             ":: V3D: [v3d30] CS start PA {:#010x} + program length escapes the arena — cannot read back executed bytes ::",
             cs_code_pa
+        );
+    }
+
+    // ── [v3d32] uniform-stream witness ────────────────────────────────────────────────────────────
+    // A threads-correct record still drops the store if the tmuau at word [9] pops a wrong TMU write
+    // CONFIG. The probe pops its uniforms in FIFO order; the TMU store target (u4 = UBO_ADDR → scratch)
+    // and the write config (u5 = 0xFFFFFFFC) both travel in this stream. Dump the 12 words physically AT
+    // the record's CS-unif pointer (read back from the arena, exactly what the QPU FIFO will pop) and
+    // compare each to the artifact's expected list (scripts/pi-v3d26-mesa-compile.out.txt PROBE VS,
+    // u0..u11), PASS/DIVERGE per slot. Slot 4 is the driver-patched UBO_ADDR (compared to scratch_v3d,
+    // not the artifact's 0 placeholder); slots 6/7 are the driver-patched viewport scales (0x46000000 =
+    // 8192.0f, vs the artifact's 0 placeholder). A DIVERGE on u5 (config) or u4 (address) is a silent
+    // store-drop / wrong-address cause independent of threading.
+    let cs_unif_off = (rec_cs_unif as usize).wrapping_sub(arena_phys());
+    let expect_unif: [u32; 12] = [
+        0, 1, 2, 3, scratch_v3d, 0xFFFF_FFFC, 0x4600_0000, 0x4600_0000, 2, 3, 4, 5,
+    ];
+    if arena_contains(rec_cs_unif as usize, 12 * 4) {
+        let mut diverged = 0u32;
+        for i in 0..12 {
+            let got = probe_word(cs_unif_off + i * 4);
+            let exp = expect_unif[i];
+            if got != exp {
+                diverged += 1;
+                serial_println!(
+                    ":: V3D: [v3d32] uniform u[{:2}] got={:#010x} exp={:#010x} DIVERGE{} ::",
+                    i, got, exp,
+                    match i { 4 => " (UBO_ADDR/scratch — store TARGET)", 5 => " (0xFFFFFFFC — TMU write CONFIG)", 6 | 7 => " (viewport scale 8192.0f)", _ => "" }
+                );
+            }
+        }
+        serial_println!(
+            ":: V3D: [v3d32] uniform-stream witness @CS unif={:#010x} — {} — u4(UBO_ADDR)={:#010x} u5(config)={:#010x} (expect config 0xfffffffc; store target = scratch {:#010x}) ::",
+            rec_cs_unif,
+            if diverged == 0 { "12/12 PASS — stream matches the Mesa artifact byte-for-byte" } else { "DIVERGE — see per-slot lines above" },
+            probe_word(cs_unif_off + 16), probe_word(cs_unif_off + 20), scratch_v3d
+        );
+    } else {
+        serial_println!(
+            ":: V3D: [v3d32] CS unif {:#010x} + 48 B escapes the arena — cannot read back the uniform stream ::",
+            rec_cs_unif
         );
     }
     // ─────────────────────────────────────────────────────────────────────────────────────────────
