@@ -1925,6 +1925,19 @@ static RX_LOGGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBoo
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 static PIUSB24_LAST_LOG_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// GUI-CLICK-1: previous pointer-button bitmask, so the render task acts on PRESS edges only (a new
+/// bit going 0→1) and ignores the matching release. A raw HID button report carries the full set of
+/// currently-held buttons, so without edge detection a press+release would dispatch twice (or a held
+/// drag would re-fire every report). 0 = no button held.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+static CLICK1_PREV_MASK: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// GUI-CLICK-1: ms() timestamp of the last `[click1]` witness line, to rate-limit it to ~10 Hz. A
+/// press edge is rare compared to motion, but a chattering switch or a fast double-click should not
+/// flood serial; genuine distinct clicks are far enough apart to survive the throttle. 0 = never.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+static CLICK1_LAST_LOG_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// PIUSB-23 (bare-metal aarch64): pump the xHCI controller from the scheduled input service and bridge
 /// decoded HID keys into the GUI channel. THE keyboard-goes-silent structural fix.
 ///
@@ -2076,6 +2089,101 @@ fn rx_backstop(_: usize) {
 ///
 /// Blocking on `recv` (vs a poll-nap) means whenever there is no input this task is off the run queue
 /// entirely and its core WFI-idles; it wakes only when the input service sends, via the reschedule SGI.
+/// GUI-CLICK-1: the view a screen point falls in, in the *shared* GUI model. The Pi/x86 panel is a
+/// full-screen text console with the always-on status strip (`ui_status`) pinned to the bottom
+/// line-pitch band — there are no windows/buttons/close-boxes in the shared model, so those are the
+/// only two hit regions. `None` is impossible for an in-bounds point today (the two regions tile the
+/// panel) but is kept so the witness can name a miss if the model later grows insets.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+#[derive(Clone, Copy)]
+enum Click1Hit {
+    /// The bottom status strip (host / lease IP / wall clock) — `ui_status`'s one-line band.
+    Status,
+    /// The console / shell text area — the focused interactive view.
+    Console,
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+impl Click1Hit {
+    fn name(self) -> &'static str {
+        match self {
+            Click1Hit::Status => "status",
+            Click1Hit::Console => "console",
+        }
+    }
+}
+
+/// GUI-CLICK-1: hit-test a cursor position against the shared GUI model. Mirrors `ui_status::draw`'s
+/// geometry exactly (`band_y = height - line_h`) so the strip's drawn band and its click target can
+/// never disagree. A point on or below `band_y` hits the status strip; everything above it is the
+/// console. Read-only — takes the same public `metrics()`/`height()` the strip draw uses.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn click1_hit_test(y: i32, pal: &unaos_kernel::pal::TargetPal<'_>) -> Option<Click1Hit> {
+    use unaos_kernel::pal::GneissPal;
+    let h = pal.height() as i32;
+    let line_h = pal.metrics().line_h as i32;
+    let band_y = h.saturating_sub(line_h);
+    if y < 0 || y >= h {
+        None
+    } else if y >= band_y {
+        Some(Click1Hit::Status)
+    } else {
+        Some(Click1Hit::Console)
+    }
+}
+
+/// GUI-CLICK-1: rate-limited (~10 Hz) `[click1]` serial witness of a click reaching GUI dispatch —
+/// the cursor position, the button bitmask that produced the press edge, and the hit target's name
+/// (or `none` for a miss). Rare vs motion, but throttled so a chattering switch can't flood serial.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn click1_witness(x: i32, y: i32, mask: u8, hit: Option<Click1Hit>) {
+    use core::sync::atomic::Ordering;
+    let now = unaos_kernel::arch::ms();
+    let last = CLICK1_LAST_LOG_MS.load(Ordering::Relaxed);
+    if now.wrapping_sub(last) >= 100 || last == 0 {
+        CLICK1_LAST_LOG_MS.store(now.max(1), Ordering::Relaxed);
+        let target = hit.map(Click1Hit::name).unwrap_or("none");
+        serial_println!(
+            "[click1] x={} y={} btn=0b{:08b} hit={}",
+            x, y, mask, target
+        );
+    }
+}
+
+/// GUI-CLICK-1: dispatch a pointer-button report to the shared GUI model. Called from the render
+/// task's `Button` arm with the current sprite position (`pal::cursor::pos`). Acts on a PRESS edge
+/// only — a bit that went 0→1 since the last report (`CLICK1_PREV_MASK`) — so a press+release fires
+/// once and a held drag doesn't re-fire. On a press it hit-tests the cursor and delivers a click to
+/// the hit view: the console is the focused interactive view, so a click on it reasserts the shell's
+/// input line (focus/redraw — the same non-destructive activation the shared model already exposes,
+/// mirroring vug's "a click is a keystroke-equivalent activation of the focused view"); a click on
+/// the status strip only witnesses (it draws nothing interactive). Returns whether a repaint of the
+/// console is owed. Never touches the key or motion paths.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn click1_dispatch(
+    mask: u8,
+    console: &unaos_kernel::console::Console,
+    pal: &mut unaos_kernel::pal::TargetPal<'_>,
+) {
+    use core::sync::atomic::Ordering;
+    use unaos_kernel::pal::GneissPal;
+    let prev = CLICK1_PREV_MASK.swap(mask, Ordering::Relaxed);
+    // Newly-pressed bits: set now, clear before. No new press → nothing to dispatch (this is the
+    // release edge, or an unchanged held state).
+    let pressed = mask & !prev;
+    if pressed == 0 {
+        return;
+    }
+    let (x, y) = unaos_kernel::pal::cursor::pos(pal.width() as i32, pal.height() as i32);
+    let hit = click1_hit_test(y, pal);
+    click1_witness(x, y, mask, hit);
+    if let Some(Click1Hit::Console) = hit {
+        // Focus/activate the console: reassert its prompt + current input at the caret. Non-
+        // destructive (submits nothing, mutates no shell state); makes the click visibly land.
+        console.draw_input_line(pal);
+    }
+}
+
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 fn render_service(_: usize) {
     use unaos_kernel::pal::GneissPal; // for pal.render()
@@ -2122,7 +2230,13 @@ fn render_service(_: usize) {
                 unaos_kernel::pal::cursor::set_abs(x, y, pal.width() as i32, pal.height() as i32);
                 unaos_kernel::pal::cursor::draw(&mut pal);
             }
-            // Button edges carry no cursor motion; the witness already logged them at the bridge.
+            // GUI-CLICK-1: a Button report carries no cursor motion — dispatch it against the shared
+            // GUI model at the current sprite position (hit-test → deliver to the hit view). Press
+            // edges only; the console's activation is a non-destructive focus/redraw of its input
+            // line. Emits the rate-limited `[click1]` witness. Key/motion paths are untouched.
+            unaos_kernel::pal::Event::Button(mask) => {
+                click1_dispatch(mask, &console, &mut pal);
+            }
             // Timer / others just refresh below.
             _ => {}
         }
