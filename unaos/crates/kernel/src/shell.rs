@@ -3563,6 +3563,39 @@ fn vfs_say(console: &mut Console, line: &str) {
     serial_println!(":: vfsw: {} ::", line);
 }
 
+/// VFS-4: the namespace prefixes the shell's `vfs` verb reserves for DISTINCT
+/// backing volumes that may be absent. A mutating verb aimed at one of these when
+/// it is NOT currently mounted must report "volume not mounted" — never fall
+/// through to the native root, which mis-reports a bare `-ENOENT`. On the P44
+/// sitting a `vfs write /usb/…` with the stick's FAT unreadable (its READ(10)
+/// LBA0 returned all-zeros with a passing CSW, so `mount_source(Usb)` honestly
+/// found no FAT and `/usb` never bound) fell through to native-root create,
+/// which failed resolving the parent `/usb` as a native path and said
+/// "no such file or directory (-ENOENT)". That misdirection cost bench time; the
+/// honest answer is that the *volume* is not mounted. `/` (native) is excluded —
+/// it is always mounted and is the legitimate fall-through for un-prefixed paths.
+#[cfg(target_arch = "aarch64")]
+const RESERVED_VOLUME_PREFIXES: &[&str] = &["/usb", "/fat"];
+
+/// VFS-4: if `path` targets a reserved volume prefix (see
+/// [`RESERVED_VOLUME_PREFIXES`]) that is not present in the live `mounted`
+/// prefix set, return that prefix. Boundary-matched exactly as the resolver is
+/// (§4): `/usb` and `/usb/…` name the volume, but `/usbfoo` does NOT (it is a
+/// native-root name and legitimately resolves there).
+#[cfg(target_arch = "aarch64")]
+fn unmounted_reserved_volume(mounted: &[&str], path: &str) -> Option<&'static str> {
+    for &pfx in RESERVED_VOLUME_PREFIXES {
+        let claims = path == pfx
+            || (path.len() > pfx.len()
+                && path.starts_with(pfx)
+                && path.as_bytes()[pfx.len()] == b'/');
+        if claims && !mounted.iter().any(|m| *m == pfx) {
+            return Some(pfx);
+        }
+    }
+    None
+}
+
 /// SHELL-WRITE dispatcher: `vfs <write|append|rm|mkdir> <path> [text ...]`.
 #[cfg(target_arch = "aarch64")]
 fn vfs_cmd(console: &mut Console, args: &[&str]) {
@@ -3583,6 +3616,16 @@ fn vfs_cmd(console: &mut Console, args: &[&str]) {
         }
     };
     let mt = vfs_mount_table();
+    // VFS-4: a mutating verb aimed at a reserved volume that is not mounted (the
+    // USB stick absent, or its FAT unreadable so `mount_source(Usb)` failed and
+    // `/usb` never bound) must say so plainly — NOT fall through to the native
+    // root and mis-report `-ENOENT` (the P44 misdirection). Applies to every op
+    // uniformly, before dispatch.
+    if let Some(vol) = unmounted_reserved_volume(&mt.prefixes(), path) {
+        vfs_say(console, &alloc::format!(
+            "vfs {}: {}: volume {} not mounted (-ENODEV)", op, path, vol));
+        return;
+    }
     let principal = KERNEL_PRINCIPAL;
     match op {
         "write" => {

@@ -305,10 +305,10 @@ one. Writing a USB stick's contents onto a writable volume is the installer's co
 job (§5.2), not an in-place `/usb` write.
 
 **Honest hot-plug (doc §6).** The `/usb` mount is bound only when the stick is actually
-enumerated — `vfs_mount_table()` (rebuilt per shell `vfs` invocation) and the witness both do a
-`mount_source(Usb)` presence check at build time. Absent → `/usb` is simply not in the table, so
-a `/usb/...` path falls through to the native root and resolves to a clean `-ENOENT`, never a
-panic. A stick plugged (or ejected) between commands is picked up on the next `vfs`.
+enumerated *and its FAT is mountable* — `vfs_mount_table()` (rebuilt per shell `vfs` invocation)
+and the witness both do a `mount_source(Usb)` presence check at build time. Absent (or the medium
+unreadable) → `/usb` is simply not in the table. A stick plugged (or ejected) between commands is
+picked up on the next `vfs`. See §11.2 for how a mutating verb reports an unbound `/usb`.
 
 **The shell `vfs` verb picks it up automatically.** `vfs_mount_table()` gained the conditional
 `/usb` mount, so `vfs write|append|rm|mkdir /usb/...` route through the same four verbs — read
@@ -332,6 +332,35 @@ positive verify"). Its permanent call site is the aarch64 storage/USB path (co-l
 `piusb27_service`, where the stick is live), which lives outside the VFS lane; that one-line
 wiring lands as a deferred diff, and a temporary proof captured the QEMU skip line for this arc
 (reverted after capture), exactly as VFS-2 did.
+
+### 11.2 VFS-4 — unbound `/usb` reports "volume not mounted", not `-ENOENT`
+
+The P44 metal sitting exposed a **misdirecting error message**. With the USB stick fully
+enumerated (`storage enumerated … 30436 MiB`), `vfs write /usb/test123.txt hi` returned
+`vfs write: /usb/test123.txt: no such file or directory (-ENOENT)`. Root cause was **upstream of
+the VFS** (PIUSB-34): the stick's `READ(10)` of LBA 0 returned all-zeros with a *passing* CSW, so
+`fat::mount_source(Usb)` honestly found no FAT volume, and `vfs_mount_table()`'s presence check
+therefore never bound `/usb`. The path then fell through the longest-prefix resolver to the native
+root (`/` claims everything), where `NativeBackend::create` tried to resolve the parent `/usb` as a
+*native* path, failed, and surfaced `-ENOENT` — as if the file were missing, when in truth the
+whole **volume** was not mounted. That misdirection cost bench time.
+
+VFS-4 fixes the reporting half (the block-layer read fault is PIUSB-34's lane). The shell reserves
+the volume prefixes that may be absent (`RESERVED_VOLUME_PREFIXES = ["/usb", "/fat"]`), and
+`vfs_cmd` checks — before dispatch, for *every* verb — whether the target path names a reserved
+volume that is not in the live mount table (`unmounted_reserved_volume`, boundary-matched exactly
+as the resolver: `/usb` and `/usb/…` match, `/usbfoo` does not). If so it reports
+`vfs <op>: <path>: volume /usb not mounted (-ENODEV)` and stops, instead of letting the path fall
+through to the native root. The honest-absent posture of §6 is preserved — an unbound `/usb` is
+still simply not in the table — but the *message* now names the real condition. `/` is deliberately
+excluded from the reserved set: it is always mounted and is the legitimate fall-through for
+un-prefixed paths. No new dispatch code beyond the one guard; when `/usb` *is* bound (the FAT
+mounts), every verb routes to `FatBackend` exactly as before.
+
+The FAT root-level create walk itself was exonerated: `vfs2_fat_write_witness` already proves a
+`create → write → read-back` round-trip on a FAT volume root through the same `MountTable` /
+`FatBackend` path (it runs green in the aarch64 storage battery), so no `(b)`-type create-walk bug
+exists — the only defect was the presence/reporting path above.
 
 ## 10. File map
 
