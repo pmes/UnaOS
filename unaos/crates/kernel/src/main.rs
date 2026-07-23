@@ -1920,6 +1920,11 @@ static GUI_CHANNEL: unaos_kernel::arch::sched::Channel<unaos_kernel::pal::Event>
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 static RX_LOGGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// PIUSB-24: ms() timestamp of the last `[piusb24]` pointer witness line, to rate-limit it to ~4 Hz
+/// (a moving mouse emits reports far faster than serial should mirror). 0 = never logged.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+static PIUSB24_LAST_LOG_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// PIUSB-23 (bare-metal aarch64): pump the xHCI controller from the scheduled input service and bridge
 /// decoded HID keys into the GUI channel. THE keyboard-goes-silent structural fix.
 ///
@@ -1947,12 +1952,48 @@ fn pump_usb_into_gui() {
         x.service_slot_disposal();
         x.service_enum();
     }
-    // Bridge only decoded keys (the HID decode also enqueues Mouse/Button; the render task dispatches
-    // Key alone). Draining the rest keeps EVENT_QUEUE from accreting on the Pi's channel-based path.
+    // PIUSB-24: bridge decoded KEYS **and** POINTER events (Mouse/MouseAbsolute/Button) into the GUI
+    // channel — the render task now moves the shared `pal::cursor` sprite from them (mirroring the x86
+    // console loop). The MOUSE-1 witness confirmed relative boot-mouse reports arrive on metal; before
+    // this arc the drain forwarded Key alone and silently dropped every pointer report. Timer/None/
+    // Unknown are still dropped here (Timer is the render task's own status pulse; None/Unknown carry
+    // nothing) so EVENT_QUEUE never accretes on the Pi's channel-based path.
     while let Some(ev) = unaos_kernel::pal::next_event() {
-        if let unaos_kernel::pal::Event::Key(byte) = ev {
-            GUI_CHANNEL.send(unaos_kernel::pal::Event::Key(byte));
+        match ev {
+            unaos_kernel::pal::Event::Key(_) => GUI_CHANNEL.send(ev),
+            unaos_kernel::pal::Event::Mouse { x, y } => {
+                piusb24_pointer_witness(x, y, None);
+                GUI_CHANNEL.send(ev);
+            }
+            unaos_kernel::pal::Event::MouseAbsolute { x, y } => {
+                piusb24_pointer_witness(x, y, None);
+                GUI_CHANNEL.send(ev);
+            }
+            unaos_kernel::pal::Event::Button(mask) => {
+                piusb24_pointer_witness(0, 0, Some(mask));
+                GUI_CHANNEL.send(ev);
+            }
+            _ => {}
         }
+    }
+}
+
+/// PIUSB-24: rate-limited (~4 Hz) `[piusb24]` serial witness of a pointer report reaching the GUI
+/// bridge — dx/dy for motion (relative or absolute payload) or the button bitmask for a click edge.
+/// A moving mouse emits reports far faster than serial should mirror, so log at most every ~250 ms;
+/// button edges are rare and always logged (they bypass the throttle via the `buttons` arm).
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn piusb24_pointer_witness(dx: i32, dy: i32, buttons: Option<u8>) {
+    use core::sync::atomic::Ordering;
+    if let Some(mask) = buttons {
+        serial_println!("[piusb24] pointer buttons=0b{:08b}", mask);
+        return;
+    }
+    let now = unaos_kernel::arch::ms();
+    let last = PIUSB24_LAST_LOG_MS.load(Ordering::Relaxed);
+    if now.wrapping_sub(last) >= 250 || last == 0 {
+        PIUSB24_LAST_LOG_MS.store(now.max(1), Ordering::Relaxed);
+        serial_println!("[piusb24] pointer dx={} dy={}", dx, dy);
     }
 }
 
@@ -2055,12 +2096,43 @@ fn render_service(_: usize) {
     pal.render();
     serial_println!(":: UI2: status strip armed (host+ip+time, 1 Hz) ::");
 
+    // PIUSB-24: whether the cursor was drawn last pass, so the auto-hide transition erases the sprite
+    // exactly once when the ~1.5 s idle expires (mirrors the x86 console loop's CURSOR-HIDE). The
+    // status_tick Timer pulse (~1 Hz) provides the periodic wake this check rides on.
+    let mut cursor_was_visible = false;
+
     loop {
-        // Any event wakes a repaint; only a Key is dispatched to the shell. An Event::Timer from the
-        // status-tick task (or any non-Key event) falls through to just refresh the strip + present.
-        if let unaos_kernel::pal::Event::Key(c) = GUI_CHANNEL.recv() {
-            handle_key(c, &mut console, &mut pal);
+        // Any event wakes a repaint. A Key is dispatched to the shell; a pointer event moves the
+        // shared `pal::cursor` sprite (PIUSB-24 — mirrors the x86 console loop's Mouse/MouseAbsolute
+        // arms so the mouse follows the keyboard here too). An Event::Timer from the status-tick task
+        // (or any other event) falls through to just refresh the strip + present.
+        match GUI_CHANNEL.recv() {
+            unaos_kernel::pal::Event::Key(c) => {
+                handle_key(c, &mut console, &mut pal);
+            }
+            unaos_kernel::pal::Event::Mouse { x, y } => {
+                // Relative motion (boot-mouse proto): erase-at-old, move, draw-at-new.
+                unaos_kernel::pal::cursor::erase(&mut pal, 0x001E1E1E);
+                unaos_kernel::pal::cursor::move_rel(x, y, pal.width() as i32, pal.height() as i32);
+                unaos_kernel::pal::cursor::draw(&mut pal);
+            }
+            unaos_kernel::pal::Event::MouseAbsolute { x, y } => {
+                // Absolute report (0..=32767 HID space), same shared sprite.
+                unaos_kernel::pal::cursor::erase(&mut pal, 0x001E1E1E);
+                unaos_kernel::pal::cursor::set_abs(x, y, pal.width() as i32, pal.height() as i32);
+                unaos_kernel::pal::cursor::draw(&mut pal);
+            }
+            // Button edges carry no cursor motion; the witness already logged them at the bridge.
+            // Timer / others just refresh below.
+            _ => {}
         }
+        // CURSOR-HIDE: erase the sprite once when the auto-hide delay expires (reappearance is instant
+        // — the move_rel/set_abs arms above stamp the activity clock before drawing).
+        let cursor_vis = unaos_kernel::pal::cursor::visible();
+        if cursor_was_visible && !cursor_vis {
+            unaos_kernel::pal::cursor::erase(&mut pal, 0x001E1E1E);
+        }
+        cursor_was_visible = cursor_vis;
         unaos_kernel::ui_status::draw(&mut pal);
         pal.render();
     }
