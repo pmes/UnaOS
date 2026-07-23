@@ -3,6 +3,29 @@
 Hard-won silicon facts from the fox-metal sitting series. Trust these over any
 QEMU behavior. Newest sitting first.
 
+## Sitting #16 (display pull 6, UnaOS-gemini@939ba952, 2026-07-23, fox-metal-r23s1i)
+
+**Single read-only boot — ASSEMBLY STATE FOUND. Coordinator decode:**
+- evo-scan2: 18 hits, uncapped. Pair table: no first≠second anywhere
+  (nothing latched during the window — expected; nothing was arming).
+- **The find: 0x640460 = 0x00000200** — a third 0x200-holder, sitting inside
+  a coherent record in the 0x640000 (DISP_USER) region: 0x640420 holds
+  0x07380BAF (the SAME raster-totals value proven at 0x61634C/s13), with the
+  w2880/h1800 cluster at 0x640468–0x6404C8. Decode: the 0x640000 region is
+  the EVO core-channel METHOD MIRROR — core-channel method layout puts head 0
+  at +0x400 with the surface OFFSET slot at +0x60 → 0x640460. The record
+  shape matches method semantics exactly (offset + raster + geometry).
+  **0x640460 is the assembly-side surface pointer; the UPDATE method slot is
+  +0x80 → 0x640080 is the latch-trigger candidate.**
+- 0x61D1E0 = 0x200 as well: armed-shadow at +0xD000 from the s15 readout
+  (second armed-side mirror, read-only presumed). Same block also holds
+  0x61D014 = 0x00020000 — the GOP vram offset UN-shifted (coordinator
+  capture-verified; 18/18 hits confirmed, 19 pair lines, zero diverging).
+- Repeating 0x90000000-shaped words at 0x61C/0x61D x128-stride and the
+  full gap-window rows (256×2) are in the capture for later decode.
+- Next: pull 7 = assembly-write + UPDATE-latch experiment (0x640460 then
+  0x640080), fully restore-paired. Display-write class already approved (s15).
+
 ## Sitting #15 (display pull 5, UnaOS-gemini@5686f417/e9b1e89f, 2026-07-23, fox-metal-r23s1i)
 
 **Boot 1 (5686f417) — no write occurred:** the LEGACY EVO-mirror head-match
