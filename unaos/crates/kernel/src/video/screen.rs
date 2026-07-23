@@ -225,6 +225,14 @@ pub struct Screen {
     /// VUG-PAR — number of parallel bands the most recent [`flush`] actually used (1 = serial /
     /// fallback / feature-off). The `[vugfps]` witness reports it as `bands=N`.
     last_flush_bands: usize,
+    /// VUG-FPS-2 — number of (merged) damage rectangles the most recent [`flush`] presented. Names
+    /// whether the 16-rect merge cascade is collapsing the frame's disjoint regions into one big box.
+    last_flush_rects: usize,
+    /// VUG-FPS-2 — bounding-box dimensions (pixels) of the union of all damage rects the most recent
+    /// [`flush`] presented. If this is ~panel-sized every frame, the dirty-rect union is the whole
+    /// screen and bytes/frame can never drop — the number that explains the ~3.5 MB/frame plateau.
+    last_union_w: usize,
+    last_union_h: usize,
 }
 
 impl Screen {
@@ -262,6 +270,9 @@ impl Screen {
             },
             last_flush_bytes: 0,
             last_flush_bands: 1,
+            last_flush_rects: 0,
+            last_union_w: 0,
+            last_union_h: 0,
         }
     }
 
@@ -390,6 +401,20 @@ impl Screen {
         self.last_flush_bands
     }
 
+    /// VUG-FPS-2 — merged damage-rect count of the last [`flush`] (`[vugfps]` prints `rects=N`).
+    #[inline]
+    pub fn last_flush_rects(&self) -> usize {
+        self.last_flush_rects
+    }
+
+    /// VUG-FPS-2 — union bounding-box `(w, h)` of the last [`flush`]'s damage (`[vugfps]` prints
+    /// `union=WxH`). Compared against the panel size it tells P46 whether the dirty region is
+    /// effectively the whole screen (why bytes/frame stays ~3.5 MB) or genuinely sub-panel.
+    #[inline]
+    pub fn last_union_dims(&self) -> (usize, usize) {
+        (self.last_union_w, self.last_union_h)
+    }
+
     /// Present the back buffer: copy each damaged rectangle to the framebuffer, row by row (each
     /// row a single bulk copy), then clear the damage. No-op if nothing changed. VUG-FPS: the set
     /// holds disjoint dirty regions, so a rotating crystal plus two corner widgets blit as a few
@@ -399,8 +424,35 @@ impl Screen {
         self.damage.clear();
         self.last_flush_bytes = 0;
         self.last_flush_bands = 1;
+        self.last_flush_rects = 0;
+        self.last_union_w = 0;
+        self.last_union_h = 0;
         if n == 0 || !self.front.is_ready() {
             return;
+        }
+        // VUG-FPS-2 witness: the merged rect count and the union bbox of all damage this frame. The
+        // rects array still holds the pre-clear data (clear() only zeroed len), so read [0..n].
+        {
+            let (mut ux0, mut uy0, mut ux1, mut uy1) = (usize::MAX, usize::MAX, 0usize, 0usize);
+            let mut live = 0usize;
+            for idx in 0..n {
+                let d = self.damage.rects[idx];
+                let x1 = d.x1.min(self.info.width);
+                let y1 = d.y1.min(self.info.height);
+                if d.x0 >= x1 || d.y0 >= y1 {
+                    continue;
+                }
+                live += 1;
+                ux0 = ux0.min(d.x0);
+                uy0 = uy0.min(d.y0);
+                ux1 = ux1.max(x1);
+                uy1 = uy1.max(y1);
+            }
+            self.last_flush_rects = live;
+            if ux1 > ux0 && uy1 > uy0 {
+                self.last_union_w = ux1 - ux0;
+                self.last_union_h = uy1 - uy0;
+            }
         }
         // VUG-PAR: try to fan the row-copy work across free secondary cores. Returns true when it
         // handled the flush (>= 2 bands); false to fall through to the byte-identical serial path

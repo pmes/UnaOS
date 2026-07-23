@@ -86,7 +86,25 @@ plus a moving cursor would, under a single bounding box, collapse to a
 panel-spanning box that reflushed most of the framebuffer every frame — the metal
 `vug` 8–9 fps bottleneck. As separate rects each blits tightly. `Screen`'s
 `last_flush_bytes()` reports the bytes the last flush copied (the `[vugfps]`
-bandwidth witness).
+bandwidth witness); `last_flush_rects()` and `last_union_dims()` report the
+merged rect count and the union bounding-box `(w, h)` of that flush's damage
+(VUG-FPS-2), so a metal capture can see whether the disjoint regions really
+stay separate or the merge cascade collapses them to a near-panel box.
+
+The `[vugfps]` line (emitted ~1×/s by the `vug` loop) reads:
+
+```
+[vugfps] F.f fps  N bytes/frame flushed  bands=B  rects=R union=WxH  raster=Xus flush=Yus (n frames / m ms)
+```
+
+where `raster` and `flush` are the per-frame cycle split (VUG-FPS-2) — the draw
+span (input drain + all back-buffer rasterisation) vs the present span
+(`pal.render()`: the row blits + one cache-clean sweep). It names whether a slow
+frame is raster-bound or flush(bandwidth)-bound; µs are derived from the aarch64
+generic-timer rate (raw cycles on x86, where this witness is not the target). The
+copy path itself is already a per-row `copy_nonoverlapping` (a word-wide memcpy),
+not a per-pixel re-encode — so the split, not the copy loop, is where a flush
+regression would show.
 
 The `vug` crystal demo drives this with dirty-rect rendering: instead of clearing
 the whole panel each frame it background-fills only the union of the crystal's

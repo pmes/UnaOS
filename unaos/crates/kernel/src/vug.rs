@@ -608,6 +608,17 @@ pub fn run_crystal(pal: &mut TargetPal, mode: Mode) {
     let mut wit_bytes: u64 = 0;
     // VUG-PAR: the max parallel band count seen in the window — reads the parallel flush win directly.
     let mut wit_bands: usize = 1;
+    // VUG-FPS-2: where the frame's cycles actually go. `wit_raster_cyc` sums the draw span (input
+    // drain + all back-buffer rasterisation), `wit_flush_cyc` sums the present span (`pal.render()`),
+    // measured with `now_cycles()` per frame; the witness reports each as avg µs/frame so P46 can name
+    // whether the ~120 ms/frame is raster-bound or flush(bandwidth)-bound — QEMU can't, but the split
+    // rides the same serial line the metal capture reads. `wit_rects`/`wit_uw`/`wit_uh` carry the
+    // merged damage-rect count and the union bbox, testing the "one screen-spanning box" hypothesis.
+    let mut wit_raster_cyc: u64 = 0;
+    let mut wit_flush_cyc: u64 = 0;
+    let mut wit_rects: usize = 0;
+    let mut wit_uw: usize = 0;
+    let mut wit_uh: usize = 0;
 
     // GAME-MODE TRUE held-key model (GAME-MODE-2b). Since HID-KEYS the HID path delivers a Key on the
     // PRESS edge and a KeyUp on the RELEASE edge, so a key's held bit is set on press and cleared on
@@ -872,11 +883,24 @@ pub fn run_crystal(pal: &mut TargetPal, mode: Mode) {
             None
         };
 
+        // VUG-FPS-2: bracket the present so the witness can split flush cycles from raster cycles.
+        // `top` (loop head) → `flush_t0` is the raster span (input drain + all drawing this frame);
+        // `flush_t0` → after render is the present span (blit + cache-clean, the bandwidth path).
+        let flush_t0 = crate::arch::now_cycles();
         pal.render(); // present ONCE per frame
+        let flush_end = crate::arch::now_cycles();
+        wit_flush_cyc += flush_end.wrapping_sub(flush_t0);
+        wit_raster_cyc += flush_t0.wrapping_sub(top);
 
         // VUG-FPS witness: accumulate this frame's flushed bytes and print a `[vugfps]` line ~1x/s.
         wit_bytes += pal.last_flush_bytes();
         wit_bands = wit_bands.max(pal.last_flush_bands());
+        wit_rects = wit_rects.max(pal.surface.last_flush_rects());
+        {
+            let (uw, uh) = pal.surface.last_union_dims();
+            wit_uw = wit_uw.max(uw);
+            wit_uh = wit_uh.max(uh);
+        }
         wit_frames += 1;
         {
             let wnow = crate::arch::ms();
@@ -884,12 +908,33 @@ pub fn run_crystal(pal: &mut TargetPal, mode: Mode) {
             if wdt >= 1000 && wit_frames > 0 {
                 let fps_x10 = (wit_frames as u64 * 10_000) / wdt.max(1);
                 let bpf = wit_bytes / wit_frames as u64;
+                // Cycles→µs uses the known generic-timer rate on aarch64 (the metal Pi timebase, ~54
+                // MHz; ~62.5 MHz under QEMU virt/raspi). On x86 the timebase is rdtsc GHz with no
+                // arch-neutral rate here, so we report raw cycles (÷1) — this witness is a Pi tool.
+                let cyc_per_us: u64 = {
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        (crate::arch::aarch64::timer::cntfrq() / 1_000_000).max(1)
+                    }
+                    #[cfg(not(target_arch = "aarch64"))]
+                    {
+                        1
+                    }
+                };
+                let raster_us = wit_raster_cyc / wit_frames as u64 / cyc_per_us;
+                let flush_us = wit_flush_cyc / wit_frames as u64 / cyc_per_us;
                 serial_println!(
-                    ":: [vugfps] {}.{} fps  {} bytes/frame flushed  bands={} ({} frames / {} ms) ::",
+                    ":: [vugfps] {}.{} fps  {} bytes/frame flushed  bands={}  rects={} union={}x{}  \
+                     raster={}us flush={}us ({} frames / {} ms) ::",
                     fps_x10 / 10,
                     fps_x10 % 10,
                     bpf,
                     wit_bands,
+                    wit_rects,
+                    wit_uw,
+                    wit_uh,
+                    raster_us,
+                    flush_us,
                     wit_frames,
                     wdt
                 );
@@ -897,6 +942,11 @@ pub fn run_crystal(pal: &mut TargetPal, mode: Mode) {
                 wit_frames = 0;
                 wit_bytes = 0;
                 wit_bands = 1;
+                wit_rects = 0;
+                wit_uw = 0;
+                wit_uh = 0;
+                wit_raster_cyc = 0;
+                wit_flush_cyc = 0;
             }
         }
 
