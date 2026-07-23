@@ -56,7 +56,7 @@ producer/consumer boundary:
 | ERST table | before ERSTBA / RS=1 | clean | `init_interrupter` |
 | Control-IN data (descriptors, hub status) | evict before / invalidate after transfer | clean / inval | `sync_control`, `request_device_descriptor`, `request_configuration_descriptor` |
 | Interrupt-IN reports (kbd/mouse/hub-change) | evict before arm / invalidate before decode | clean / inval | `queue_*_read` / the transfer-event dispatch |
-| BOT CBW / CSW / SCSI data | clean OUT, invalidate IN | clean / clean+inval / inval | `bot_transfer` |
+| BOT CBW / CSW / SCSI data | evict before (both dirs), invalidate IN after | clean / clean+inval / inval | `bot_transfer` |
 | FTDI TX staging buffer | before doorbell | clean | `ftdi_tx_stage` |
 
 This **unifies** the old tegra-only `EventRing::has_event_after_invalidate` (its
@@ -291,6 +291,31 @@ The shell exposes these as `diskinfo`, `read <lba>`, and `write <lba> <byte>`.
 
 Boot evidence: `xHCI: READ(10) LBA0 CSW status=Passed residue=0`,
 `xHCI: >>> MISSION SUCCESS (BOT + CSW). TARGET ACQUIRED. <<<`.
+
+### 5a. BOT IN data buffer must be evicted before the doorbell (PIUSB-34)
+
+On P44 metal the Pi 4 read LBA0 of a known-good FAT stick as **all zeros** with a
+**passing** CSW (`residue=0`) — repeatably — while READ CAPACITY(10) returned the
+correct geometry. Both commands ride the identical `bot_transfer` path against the
+same reused `scsi_data_buffer`, so the discriminator was purely transfer length.
+
+Root cause (our code, not the hardware): the BOT **IN** data stage relied *only* on
+the post-transfer `inval`, and — unlike every other IN-arming site in the driver —
+did **not** clean the data buffer *before* the doorbell. The 512-byte buffer is
+`alloc_zeroed` (eight dirty zero cache lines) and reused across SCSI commands; a
+short prior IN (READ CAPACITY = 8 B, INQUIRY = 36 B) only ever touches line 0,
+leaving lines 1..7 dirty-zero in the A72 D-cache. On the non-coherent BCM2711 PCIe →
+VL805 path the controller DMA-writes the block straight to DRAM; a natural
+write-back of those stale dirty lines in the window around the DMA clobbers the
+just-written DRAM with zeros. READ CAPACITY / INQUIRY escaped because they only span
+line 0, which the immediately-prior transfer's `inval` had already dropped.
+
+Fix: `bot_transfer` now cleans the IN data buffer to DRAM *before* the doorbell
+(the OUT path already did), so no dirty line survives to lose; the post-transfer
+`inval` still drops the clean lines so the CPU parses fresh DRAM. This matches the
+convention at every interrupt-IN / control-IN / descriptor arming site. Witness:
+`[piusb34] LBA0 re-read post-invalidate: … <first-16 bytes>` (P44 zeros → P45 real
+boot sector).
 
 ---
 

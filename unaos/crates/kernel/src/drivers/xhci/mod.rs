@@ -3946,12 +3946,18 @@ impl XhciController {
                     self.slots[slot_id as usize].bulk_in_ring.as_mut().unwrap()
                 };
                 let base = ring.get_ptr();
-                // XHCI-COHERENCE: an OUT data stage's buffer is CPU-written and DMA-read — clean it
-                // to DRAM before the doorbell below. (An IN data buffer is invalidated after the
-                // transfer, at its read site.) No-op x86.
-                if data_out {
-                    dma_coherency::clean(data_phys as usize, data_len as usize);
-                }
+                // XHCI-COHERENCE: evict the data buffer to DRAM BEFORE the doorbell — for BOTH
+                // directions. OUT: the buffer is CPU-written and DMA-read, so the clean pushes the
+                // current bytes to DRAM. IN (PIUSB-34): the buffer is freshly `alloc_zeroed` (8 dirty
+                // zero lines) and reused across SCSI reads — a short prior read (READ CAPACITY = 8 B,
+                // INQUIRY = 36 B) only ever touches line 0, leaving lines 1..7 dirty-zero in cache. On
+                // the non-coherent Pi 4 PCIe path the controller DMA-writes the block straight to DRAM;
+                // a natural write-back of those stale dirty lines in the window around the DMA clobbers
+                // the just-written DRAM with zeros (Passed/residue=0/data=00). Cleaning here leaves no
+                // dirty line to lose, so the controller's DMA survives; the post-transfer invalidate
+                // below then drops the clean lines and the CPU parses fresh DRAM. This mirrors every
+                // other IN-arming site (interrupt-IN reports, control-IN, descriptor reads). No-op x86.
+                dma_coherency::clean(data_phys as usize, data_len as usize);
                 let idx = ring.push(Trb { parameter: data_phys, status: data_len,
                     control: (1 << 10) | (1 << 5) | (1 << 2) }).unwrap_or(0);
                 (if data_out { out_dci } else { in_dci }, base + (idx as u64) * 16)
@@ -4461,6 +4467,23 @@ impl XhciController {
                             serial_println!(
                                 ":: PIUSB: [piusb25] boot-sector sanity: 0x55AA={} type={} ::",
                                 boot_sig, fs);
+                        }
+                    }
+                }
+                // PIUSB-34: fix-proof witness. Re-issue READ(10) LBA0 through the same BOT path
+                // (which now cleans the IN buffer before the doorbell AND invalidates after) and dump
+                // the first 16 bytes of the freshly-DMA'd + post-invalidate DRAM. On P44 this printed
+                // zeros; on P45 it must match the real boot sector. aarch64-only, read-only.
+                #[cfg(target_arch = "aarch64")]
+                if let Ok(re) = self.storage_read10(0, 1) {
+                    if let Some(p) = self.storage_data_ptr() {
+                        unsafe {
+                            let d = core::slice::from_raw_parts(p as *const u8, 16);
+                            serial_println!(
+                                ":: PIUSB: [piusb34] LBA0 re-read post-invalidate: CSW={:?} residue={} — {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
+                                re.status, re.residue,
+                                d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7],
+                                d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15]);
                         }
                     }
                 }
