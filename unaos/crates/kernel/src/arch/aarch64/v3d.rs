@@ -144,6 +144,44 @@ const V3D_L2TCACTL_L2TFLS: u32 = 1 << 0; // flush start; reads 1 while the flush
 const V3D_L2TCACTL_FLM_FLUSH: u32 = 0 << 1; // FLM field [2:1] = FLUSH (write-back + invalidate)
 const V3D_SLCACTL_INVALIDATE_ALL: u32 = (0xF << 24) | (0xF << 16) | (0xF << 8) | 0xF;
 
+// ─── PI-V3D-34: TMU/GMP block-state witness constants. Offsets + bits transcribed VERBATIM from Linux
+// `drivers/gpu/drm/v3d/v3d_regs.h` (register/hardware facts; GPL-2.0-only header, facts-only). These
+// are the configuration/enable-state registers a v42 TMU general store depends on — dumped read-only so
+// the next boot's SAW-NOTHING branch (TMU-issue PCTR battery all zero) can decide block-wide-disabled
+// vs probe-specific. NONE of these are written anywhere in UnaOS bring-up (see the witness annotations).
+//
+// MISCCFG (core CTL): OVRTMUOUT overrides the TMU output type to come from the sampler-uniform config
+// word instead of the hardware default. Linux `v3d_init_core` writes MISCCFG=OVRTMUOUT ONLY on ver<41
+// (`if (v3d->ver < V3D_GEN_41)`); the Pi 4's V3D 4.2 (ver 42) is >= 41, so the KMD leaves MISCCFG at its
+// reset value and the TMU output type is taken from the config word — so OURS must match (untouched).
+const V3D_CTL_MISCCFG: usize = 0x0018;
+const V3D_MISCCFG_OVRTMUOUT: u32 = 1 << 0; // override TMU output type from the sampler-config word
+const V3D_CTL_MISCCFG_QRMAXCNT_MASK: u32 = 0x7 << 1; // [3:1] queued-request max count
+// L2TCACTL.TMUWCF = TMU write-combiner flush — the TMU-store-drain-specific bit of the L2T control we
+// already drive for FLM=FLUSH. Dumped to show whether the TMU write combiner is being flushed alongside.
+const V3D_L2TCACTL_TMUWCF: u32 = 1 << 8;
+// GMP (Graphics Memory Protection), per-core block at core+0x800 (ver<71 layout; ver42 uses this base).
+// A GMP write-violation drops the store SILENTLY with no MMU fault on some v3d revisions — the exact
+// signature of "store accepted but never lands, MMU fault latch clean". Linux NEVER writes any GMP
+// register in init or submit (v3d_gem.c reads GMP only in v3d_idle_axi); GMP therefore sits in its reset
+// state, where CFG.PROT_ENABLE=0 = protection DISABLED = all accesses allowed. So the reset default is
+// allow-all, NOT default-deny — but only the silicon read-back proves the latched state, hence this dump.
+const V3D_GMP_STATUS: usize = 0x0800;
+const V3D_GMP_CFG: usize = 0x0804;
+const V3D_GMP_VIO_ADDR: usize = 0x0808;
+const V3D_GMP_VIO_TYPE: usize = 0x080c;
+const V3D_GMP_TABLE_ADDR: usize = 0x0810;
+const V3D_GMP_VALID_LINES: usize = 0x0820;
+const V3D_GMP_CFG_PROT_ENABLE: u32 = 1 << 0; // protection enable — 0 at reset = allow all accesses
+const V3D_GMP_CFG_STOP_REQ: u32 = 1 << 1;
+const V3D_GMP_CFG_LBURSTEN: u32 = 1 << 3;
+const V3D_GMP_STATUS_VIO: u32 = 1 << 0; // a protection violation was latched
+const V3D_GMP_STATUS_INVPROT: u32 = 1 << 1; // an access hit an invalid protection entry
+const V3D_GMP_STATUS_CNTOVF: u32 = 1 << 2;
+const V3D_GMP_STATUS_WR_ACTIVE: u32 = 1 << 5;
+const V3D_GMP_STATUS_RD_ACTIVE: u32 = 1 << 4;
+const V3D_GMP_STATUS_GMPRST: u32 = 1 << 31; // GMP in reset (protection tables not loaded)
+
 // ─── PI-V3D-21: performance-counter (PCTR) block, core 0. Offsets + field layout transcribed VERBATIM
 // from Linux `drivers/gpu/drm/v3d/v3d_regs.h` (V3D 4.x / "V4" variant; register/hardware facts,
 // GPL-2.0-only header, facts-only discipline). Used to WITNESS coordinate-shader QPU execution without
@@ -2432,6 +2470,11 @@ fn probe_job() {
             ":: V3D: [v3d28] VERDICT MISMATCH (unexpected pattern) — store landed at the target with non-zero, non-vertex data: partial DMA, wrong stride/base, or a store race artifact. Compare the words above against OFF_VTXDATA byte-for-byte. ::"
         );
     }
+    // PI-V3D-34: pre-arm the SAW-NOTHING branch. If the TMU-issue PCTR battery reads all-zero next boot,
+    // the block-state dump below decides TMU-block-wide-disabled vs probe-specific — GMP first (silent
+    // drop with a clean MMU latch), plus MISCCFG/L2T/SLC and the record-carries-no-TMU-config fact.
+    // Read-only; runs regardless of the probe verdict so the config context is always captured.
+    tmu_gmp_block_state_witness("v3d34 post-probe");
     // Leave the M4 bin registers untouched here — triangle_job reprograms QMA/QMS/QTS/QBA/QEA and
     // re-arms the PCTR counters for the real bin below.
     clear_mmu_fault_latch("v3d28 post-probe");
@@ -3085,6 +3128,107 @@ fn pctr_read_cs_witness(tag: &str) {
         } else {
             "general store never reached the TMU block — chase the issue path (shader/thread-end/waddr), NOT the drain"
         }
+    );
+}
+
+/// PI-V3D-34: TMU/GMP block-state witness — the pre-arm for V3D-33's SAW-NOTHING branch.
+///
+/// V3D-33 proved the probe's word[9] genuinely names TMUAU(13) and that this general store is the FIRST
+/// TMU op UnaOS has ever issued on this silicon (no other shader touches the TMU — both fragment shaders
+/// write only the TLB). If the next boot's TMU-issue PCTR battery (tcache_access / cycles_waiting_tmu /
+/// tcache_miss) reads all-zero (SAW-NOTHING), the defect may be TMU-block-wide (never enabled/configured)
+/// rather than probe-specific. This witness puts the whole set of configuration/enable-state registers a
+/// v42 TMU general store depends on on serial, read-only, each annotated MESA-EXPECTS vs OURS where the
+/// expectation is derivable from the Linux v3d KMD / Mesa v42 contract. It changes NO state (pure reads).
+///
+/// The three axes the brief names:
+///  (1) shader-record TMU config: the GL Shader State Record + Attribute Record carry NO TMU config word;
+///      on v42 the TMU config is delivered in the UNIFORM stream (the 0xfffffffc config word u5 carries,
+///      already witnessed by [v3d32]) and consumed by the TMUAU write — so there is nothing TMU-specific
+///      to read out of the record here; the record path is exonerated by [v3d18]/[v3d25]/[v3d29].
+///  (2) core registers gating TMU operation: MISCCFG.OVRTMUOUT (ver>=41 → KMD leaves it at reset, TMU
+///      output type comes from the config word), the L2T control incl. TMUWCF (TMU write-combiner flush),
+///      and the SLC TMU-cache clear fields (TVCCS/TDCCS) — the caches a TMU store's data traverses.
+///  (3) GMP: a GMP write-violation drops a store SILENTLY with no MMU fault — the exact signature of the
+///      store-accepted-but-never-lands wall with a clean fault latch. Linux never programs the GMP, so it
+///      sits in reset (CFG.PROT_ENABLE=0 = allow-all); the read-back proves the actual latched state.
+fn tmu_gmp_block_state_witness(tag: &str) {
+    dsb();
+    // (2) MISCCFG — the TMU-output-type gate. MESA-EXPECTS on ver42(>=41): untouched at reset value,
+    // OVRTMUOUT=0 (KMD writes OVRTMUOUT only on ver<41); the TMU output type then comes from the config
+    // word the TMUAU consumes. A set OVRTMUOUT here would mean something enabled it out of band.
+    let misccfg = mmio_read(V3D_CORE0_BASE, V3D_CTL_MISCCFG);
+    serial_println!(
+        ":: V3D: [v3d34] {} MISCCFG={:#010x} — OVRTMUOUT(bit0)={} QRMAXCNT[3:1]={} — MESA-EXPECTS ver42>=41: KMD leaves MISCCFG untouched (OVRTMUOUT written only ver<41), TMU output type from the config word — OURS: UnaOS never writes MISCCFG ::",
+        tag, misccfg,
+        (misccfg & V3D_MISCCFG_OVRTMUOUT != 0) as u32,
+        (misccfg & V3D_CTL_MISCCFG_QRMAXCNT_MASK) >> 1
+    );
+
+    // (2) L2TCACTL — the L2T cache control we already drive for the post-bin FLM=FLUSH drain. TMUWCF is
+    // the TMU write-combiner flush bit; dump the live control word so the SAW-NOTHING boot shows whether
+    // the TMU write combiner participates in our flush. MESA-EXPECTS: idle between ops (L2TFLS clear).
+    let l2tcactl = mmio_read(V3D_CORE0_BASE, V3D_CTL_L2TCACTL);
+    serial_println!(
+        ":: V3D: [v3d34] {} L2TCACTL={:#010x} — L2TFLS(bit0,in-progress)={} TMUWCF(bit8,TMU-write-combiner-flush)={} — MESA-EXPECTS: idle between jobs (FLM=FLUSH driven per-drain by invalidate_gpu_caches); TMUWCF is NOT set by our flush ::",
+        tag, l2tcactl,
+        (l2tcactl & V3D_L2TCACTL_L2TFLS != 0) as u32,
+        (l2tcactl & V3D_L2TCACTL_TMUWCF != 0) as u32
+    );
+
+    // (2) SLCACTL — slice caches a TMU store's data traverses (TVCCS=TMU-vertex-cache, TDCCS=TMU-data-
+    // cache). We drive all-0xF invalidate per job; between ops the field reads back its idle state.
+    let slcactl = mmio_read(V3D_CORE0_BASE, V3D_CTL_SLCACTL);
+    serial_println!(
+        ":: V3D: [v3d34] {} SLCACTL={:#010x} — TVCCS[27:24]={:#x} TDCCS[19:16]={:#x} UCC[11:8]={:#x} ICC[3:0]={:#x} — MESA-EXPECTS: TMU-vertex/TMU-data caches invalidated (0xF) per job by invalidate_gpu_caches; OURS drives SLCACTL_INVALIDATE_ALL ::",
+        tag, slcactl,
+        (slcactl >> 24) & 0xF, (slcactl >> 16) & 0xF, (slcactl >> 8) & 0xF, slcactl & 0xF
+    );
+
+    // (3) GMP — the prime silent-drop candidate. Linux never writes any GMP register; GMP sits in reset,
+    // where CFG.PROT_ENABLE=0 = protection disabled = ALL accesses allowed (NOT default-deny). Read back
+    // CFG + STATUS: if PROT_ENABLE reads 1, or STATUS.VIO/INVPROT is latched, THAT is the silent-drop the
+    // MMU fault latch cannot see. Expected on a clean block: CFG.PROT_ENABLE=0 and STATUS.VIO=0.
+    let gmp_cfg = mmio_read(V3D_CORE0_BASE, V3D_GMP_CFG);
+    let gmp_status = mmio_read(V3D_CORE0_BASE, V3D_GMP_STATUS);
+    let gmp_vio_addr = mmio_read(V3D_CORE0_BASE, V3D_GMP_VIO_ADDR);
+    let gmp_vio_type = mmio_read(V3D_CORE0_BASE, V3D_GMP_VIO_TYPE);
+    let gmp_table = mmio_read(V3D_CORE0_BASE, V3D_GMP_TABLE_ADDR);
+    let gmp_valid = mmio_read(V3D_CORE0_BASE, V3D_GMP_VALID_LINES);
+    let prot_on = gmp_cfg & V3D_GMP_CFG_PROT_ENABLE != 0;
+    let vio = gmp_status & V3D_GMP_STATUS_VIO != 0;
+    let invprot = gmp_status & V3D_GMP_STATUS_INVPROT != 0;
+    serial_println!(
+        ":: V3D: [v3d34] {} GMP_CFG={:#010x} — PROT_ENABLE(bit0)={} STOP_REQ(bit1)={} LBURSTEN(bit3)={} — MESA-EXPECTS: KMD never writes GMP → reset state, PROT_ENABLE=0 = ALLOW-ALL (not default-deny) ::",
+        tag, gmp_cfg,
+        prot_on as u32,
+        (gmp_cfg & V3D_GMP_CFG_STOP_REQ != 0) as u32,
+        (gmp_cfg & V3D_GMP_CFG_LBURSTEN != 0) as u32
+    );
+    serial_println!(
+        ":: V3D: [v3d34] {} GMP_STATUS={:#010x} — VIO(bit0)={} INVPROT(bit1)={} CNTOVF(bit2)={} RD_ACTIVE(bit4)={} WR_ACTIVE(bit5)={} GMPRST(bit31)={} VIO_ADDR={:#010x} VIO_TYPE={:#010x} — MESA-EXPECTS: VIO=0, no violation latched ::",
+        tag, gmp_status,
+        vio as u32, invprot as u32,
+        (gmp_status & V3D_GMP_STATUS_CNTOVF != 0) as u32,
+        (gmp_status & V3D_GMP_STATUS_RD_ACTIVE != 0) as u32,
+        (gmp_status & V3D_GMP_STATUS_WR_ACTIVE != 0) as u32,
+        (gmp_status & V3D_GMP_STATUS_GMPRST != 0) as u32,
+        gmp_vio_addr, gmp_vio_type
+    );
+    serial_println!(
+        ":: V3D: [v3d34] {} GMP_TABLE_ADDR={:#010x} VALID_LINES={:#010x} — protection-table base + loaded-line count (both 0 when unconfigured; irrelevant while PROT_ENABLE=0) ::",
+        tag, gmp_table, gmp_valid
+    );
+
+    // Decisive one-liner: does the GMP explain a silent store drop? Only if protection is ON *and* a
+    // write violation latched. With PROT_ENABLE=0 the GMP is exonerated as the SAW-NOTHING cause.
+    let gmp_could_drop = prot_on && (vio || invprot);
+    serial_println!(
+        ":: V3D: [v3d34] {} GMP verdict — protection {} → GMP {} the silent-store-drop cause (PROT_ENABLE={}, VIO={}, INVPROT={}); (1) shader record carries NO TMU config word — TMU config is uniform-delivered (config 0xfffffffc, see [v3d32]) ::",
+        tag,
+        if prot_on { "ENABLED" } else { "DISABLED (allow-all)" },
+        if gmp_could_drop { "IS A CANDIDATE for" } else { "is EXONERATED as" },
+        prot_on as u32, vio as u32, invprot as u32
     );
 }
 
