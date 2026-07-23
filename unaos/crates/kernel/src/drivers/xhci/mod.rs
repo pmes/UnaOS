@@ -4205,6 +4205,42 @@ impl XhciController {
                         }
                         serial_println!("xHCI: [IRQ] xHCI interrupts taken so far: {}",
                             XHCI_IRQ_COUNT.load(Ordering::Relaxed));
+                        // PIUSB-25: Pi mass-storage enumeration + LBA0 read-proof witness. aarch64-gated
+                        // (byte-identical x86 codegen — nothing here changes the BOT/CSW core path; the
+                        // `data` slice is the block just read by the READ(10) above, invalidated at the
+                        // shared `bot_transfer` IN chokepoint so it is fresh DRAM on Pi silicon). Reports
+                        // the slot + geometry, the first 16 bytes hex, and a boot-sector sanity decode
+                        // (0x55AA signature, FAT/GPT hints). Read-only — never a write.
+                        #[cfg(target_arch = "aarch64")]
+                        {
+                            let (bs, nb, mib) = match crate::drivers::block::BLOCK_DEVICE.lock().as_ref() {
+                                Some(d) => (d.block_size, d.num_blocks,
+                                            (d.num_blocks.saturating_mul(d.block_size as u64)) / (1024 * 1024)),
+                                None => (0, 0, 0),
+                            };
+                            serial_println!(
+                                ":: PIUSB: [piusb25] storage enumerated: slot {} bulk_in={:#04x} bulk_out={:#04x} block_size={} num_blocks={} ({} MiB) ::",
+                                self.storage_slot,
+                                self.slots[self.storage_slot as usize].bulk_in_ep,
+                                self.slots[self.storage_slot as usize].bulk_out_ep,
+                                bs, nb, mib);
+                            serial_println!(
+                                ":: PIUSB: [piusb25] READ(10) LBA0 CSW={:?} residue={} — first 16 bytes: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
+                                res.status, res.residue,
+                                data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+                                data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15]);
+                            let boot_sig = data[510] == 0x55 && data[511] == 0xAA;
+                            let gpt_protective = data[0x1C2] == 0xEE;   // protective-MBR partition type
+                            let fat16 = data[0x36..0x3B].starts_with(b"FAT");
+                            let fat32 = data[0x52..0x57].starts_with(b"FAT");
+                            let fs = if gpt_protective { "GPT (protective MBR)" }
+                                     else if fat32 { "FAT32 BPB" }
+                                     else if fat16 { "FAT12/16 BPB" }
+                                     else { "unrecognized/raw" };
+                            serial_println!(
+                                ":: PIUSB: [piusb25] boot-sector sanity: 0x55AA={} type={} ::",
+                                boot_sig, fs);
+                        }
                     }
                 }
             }

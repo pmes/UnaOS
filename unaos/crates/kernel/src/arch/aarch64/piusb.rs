@@ -1861,12 +1861,16 @@ pub fn enumerate() {
             x.service_hid_setproto();
             x.service_slot_disposal();
             x.service_enum();
+            // service_storage() carries the PIUSB-25 `[piusb25]` enumeration + LBA0 read-proof
+            // witness (shared xhci, aarch64-gated) — it fires here on Pi metal and on the QEMU virt
+            // main-loop path alike, the instant the shared bring-up publishes geometry.
             x.service_storage();
             witness.tick(x);
+            let ready = x.storage_slot != 0 && x.storage_note == "ready";
             (
                 keyboard_armed(x),
                 x.storage_slot,
-                x.storage_slot != 0 && x.storage_note == "ready",
+                ready,
             )
         };
         if armed.is_none() {
@@ -1876,11 +1880,14 @@ pub fn enumerate() {
                 armed_at = super::timer::cntpct();
             }
         }
+        // Storage-ready is a terminal state on its own — a stick present at boot with no keyboard
+        // must still report and exit (the old gate only broke once a keyboard had armed, an x86
+        // keyboard-first carryover that left a disk-only Pi boot spinning to the 30 s deadline).
+        if storage_ready {
+            serial_println!("{} enumerate: mass storage ready (slot {}) ::", P, storage_slot);
+            break;
+        }
         if armed.is_some() {
-            if storage_ready {
-                serial_println!("{} enumerate: mass storage ready (slot {}) ::", P, storage_slot);
-                break;
-            }
             if super::timer::cntpct().wrapping_sub(armed_at) >= storage_settle {
                 break; // keyboard up, no disk within the settle window — stop
             }
