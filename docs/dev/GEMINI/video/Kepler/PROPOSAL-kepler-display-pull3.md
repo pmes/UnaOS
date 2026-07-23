@@ -1,4 +1,4 @@
-STATUS: PROPOSED
+STATUS: APPROVED (2026-07-23 — clean match to brief, no amendments)
 
 # PROPOSAL — kepler-display pull 3: candidate decode
 

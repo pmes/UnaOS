@@ -1,4 +1,4 @@
-STATUS: PROPOSED
+STATUS: APPROVED WITH AMENDMENTS (2026-07-23 — see REVIEW-kepler-fence-pull14.md; amendments are binding)
 
 # Proposal: kepler-fence pull 14 — PBDMA CTRL_ADDR TARGET audit & disp-era fallback
 
