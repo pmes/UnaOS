@@ -6734,6 +6734,25 @@ QEMU raspi4b models no PCIe RC, so this whole M1 path sits behind the DTB-census
 QEMU regression is byte-behaviour-identical (census-skip, graceful degradation, full U-arc PASS chain);
 the change is exercised only at an attended metal sitting.
 
+### PIUSB-18 — the RC inbound (SCB) master was disabled: firmware fetch had no SDRAM path (boot-P28)
+
+**The P27–P28 transition: PERST settle refuted, true wall found.** P27 landed PIUSB-17 (the 100 ms PERST-deassert settle) on metal. P28 boot showed **LINK UP 115 ms post-deassert** (the M1 settle worked; link was not the wall), yet the root issue persisted: **`USBSTS.CNR` never cleared, `NOTIFY_XHCI_RESET` honoured but the VL805 8051 state machine never ran** — the same "MMIO live, firmware dead" signature as P27. This refutes the PERST-deassert timing as the sole cause; the delta must lie elsewhere in the cold-build → NOTIFY sequence.
+
+**The metal divergence from Linux `pcie-brcmstb`.** Every PIUSB-17 hypothesis target (M1 PERST order, deassertion settle, link training state at NOTIFY) survives P28. A register audit of `MISC_CTRL` (the RC bridge's inbound and outbound window controls) between cold-build and M2 (pre-NOTIFY readback) found a critical divergence: our MISC_CTRL readback yields `0x88000000`, which decodes as:
+
+- Bits [31:24] = `0x88` → **SCB0 inbound window is SIZED** (not disabled)
+- Bit 12 (`SCB_ACCESS_EN`) = **CLEAR** → **the RC inbound master is disabled**
+
+The **inbound window (SCB path) is the VideoCore firmware's DMA path to system SDRAM** — it fetches the VL805 firmware blob from SDRAM at cold-build time via the RC's inbound-master interface. With `SCB_ACCESS_EN` clear, that DMA path is gated; the VC firmware load attempt stalls waiting for the fetch to complete, the NOTIFY response does not propagate back through the firmware state machine, and the VL805 8051 never starts. This is consistent with every P28 witness: the notify is honoured (mailbox core acknowledges), MMIO succeeds (PCIe core is live), but the controller state machine never runs (firmware fetch hit the closed gate).
+
+**Root-cause candidate (untested on metal; P29 decides).** The Linux `pcie-brcmstb` driver (`drivers/pci/controller/pcie-brcmstb.c`, `brcm_pcie_setup`) sets `MISC_CTRL.SCB_ACCESS_EN` and two related fields during the RC power-on sequence; our cold-build omits these. The fix candidate sets:
+
+- **`SCB_ACCESS_EN` (bit 12)** — enable the RC inbound master
+- **`CFG_READ_UR_MODE` (bits 1:0 = 0x2)** — configuration reads return completion status per PCIe spec (mirrors Linux)
+- **`MISC_CTRL` byte-order / burst fields** — Linux sets inbound burst to 128 B
+
+Refutation chain (facts of record): NOTIFY echo (P24, mailbox core alive) → BAR-MMIO load (P26, RC PCIe core alive) → stale pftf firmware (P27, recovered via Linux blob) → **PERST settle (P28, link-trained 115 ms post-deassert, NOTIFY still honoured, 8051 still dead)** → surviving: inbound SCB path (P29 test gate). The VC's firmware fetch from SDRAM rides the RC inbound window; the window gate is the last untested link in the cold-build → firmware-load chain.
+
 ## PI-USB-2 — from the honesty line to device enumeration on the VL805 (Arc PI-USB-2)
 
 Rung 1 stopped the VL805 xHCI at "halted-but-decoding + ports powered". Rung 2 adds the **DMA-side

@@ -506,3 +506,43 @@ capture, which is what the compiled probe does):
 QEMU `raspi4b` models no V3D (`BLOCK-DOWN`), so the verdict is **metal**; the probe is diagnostic-only and
 never gates M4. Arena regions `OFF_PROBE_{CODE,UNIF,SHADREC,SCRATCH,BIN_CL}` sit in the free tail above
 the M5–M8 battery (0x34000+, top used byte was 0x33100 < 0x40000).
+
+---
+
+## 13. The probe L2T flush — GPU caches must be written back before CPU reads (V3D-28)
+
+V3D-27's attribute probe boot-P27 returned **`0x55555555` ×4 (untouched sentinel)**, the `probe-inconclusive`
+verdict: the probe scratch window was never written, so either the TMU store never issued or landed somewhere
+other than CPU-visible DRAM. The §12 diagnostic candidates covered probe plumbing (shader path, UBO_ADDR
+uniform delivery, scratch MMU mapping), but one physical layer remained unexamined: **GPU cache coherence**.
+
+The V3D 4.2 hardware pipeline holds TMU stores in the **GPU's Level-2 Texture cache (L2T)**; a store-to-load
+barrier (or in this case, a CPU read of a buffer the GPU just wrote) requires the L2T writeback to complete
+before the CPU accesses DRAM. P27's readback sequence ran immediately after the bin job idled — there was
+**no intervening L2T flush or cache invalidation**, so the CPU read the stale (sentinel) DRAM value while the
+TMU store was still resident in the L2T.
+
+**The fix (PI-V3D-28).** After the probe bin idles, **`invalidate_gpu_caches()`** flushes and invalidates
+the V3D caches (L2T writeback + L1 cache invalidation, register-sequenced per the V3D 4.2 spec) before the
+CPU reads the probe scratch. Additionally, the probe scratch region is now **"canaried" with a 128 B witness
+window** at a different physical address, so future probes can verify not just "did the store land?" but also
+distinguish between multiple failure modes:
+
+| Readback variant | Diagnosis |
+| --- | --- |
+| Sentinel intact in primary; witness untouched | L2T store never issued (shader path broken) |
+| Sentinel flushed in primary; witness struck | TMU store issued and landed; L2T flush works; next probe narrows to VCD |
+| Sentinel intact; witness struck | store landed off-target (stride/base bug, race artifact) |
+
+**Discriminator (one boot; QEMU models no V3D → metal decides).** P28 reprises the V3D-27 probe with
+`invalidate_gpu_caches` interposed:
+
+- **Primary scratch = real coords** (`Zc=0x3f000000`, `Wc=0x3f800000`, `Xc/Yc` a vertex value) ⇒ **VCD
+  attribute fetch confirmed working**; the empty-bin wall moves off the CPU→GPU hand-off entirely. The PTB
+  is now the sole remaining candidate (primitive assembly / binner configuration / VCM → PTB tile-list output).
+- **Primary sentinel intact, witness struck** ⇒ **VCD partially working** (attribute DMA reached GPU L2T but
+  address decoding or stride introduced errors); compare witness bytes vs `OFF_VTXDATA` to localize.
+- **Both sentinel intact** ⇒ **L2T flush verified the previous diagnosis** — TMU store never issued; the
+  probe's shader path or UBO_ADDR uniform delivery is broken and must be audited against Mesa's compiled
+  reference.
+- **Other** ⇒ the three-way table (§12) re-applies with L2T coherence now exonerated.
