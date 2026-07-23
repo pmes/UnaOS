@@ -25,8 +25,28 @@ QEMU behavior. Newest sitting first.
      display specialist carries it; module split first so the two Kepler
      lanes don't collide in kepler.rs).
 
-Boot 2 (USERD_SNOOP witness ladder) verdict pending — both wall lines could
-fall in one sitting.
+**Boot 2 — Candidate A cleanly refuted:** `USERD_SNOOP orig=0` → write 1 →
+witness FAILED (bits stripped), snoop restored; err stays 2, stat 5,
+discriminators 0, RAMFC untouched. No residue.
+- **Write-behavior pattern (coordinator-refined from Fox's read):** it is NOT
+  "PFIFO config writes don't stick" — SUBFIFO_ENG_MASK (0x2390+) and
+  PLAYLIST_WR/LEN demonstrably stick. The true split:
+  (i) PFIFO_CHAN VALID/POLL — SEMANTIC refusal (chip sets err=2 NO_POLL and
+      strips by design; this is the documented CHAN_TABLE_ERROR behavior);
+  (ii) USERD_SNOOP 0x2a1c — writes-read-as-zero, UNEXPLAINED: either absent
+      on GK107 (rnndb has no variants tag either way), write-gated, or not a
+      simple boolean on this part.
+- Open hypotheses for pull 12, strongest first: (b) the "poll area" on GK104+
+  is per-channel state in INSTANCE memory (USERD pointer/enable in the inst
+  block or channel-table INST word), not a global MMIO knob — we may be
+  missing an inst-block field, not an MMIO write; (a) a PFIFO
+  reset/priv-unlock handshake gating config writes; (c) a sched-block clock
+  domain. envytools hwdocs (allowed source) likely documents GK104 fifo
+  channel setup.
+
+Sitting #10 complete, both rungs: panel owner PROVEN (discrete), candidate A
+refuted, write-behavior pattern named and refined. Capture + MANIFEST are
+the record.
 
 ## Sitting #9 (igpu pull 4 + kepler pull 10, UnaOS-gemini@785a8795, 2026-07-22, fox-metal-r23s1h)
 
