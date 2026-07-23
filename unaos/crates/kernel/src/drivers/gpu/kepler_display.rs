@@ -224,7 +224,7 @@ pub unsafe fn takeover_display(
     let capped = if hits > 64 { "true" } else { "false" };
     serial_println!(":: kdisp: evo-scan done range=610000-613FFC hits={} capped={} ::", hits, capped);
 
-    // ── Phase 2: Assembly Write + UPDATE Latch (Pull 7) ────────────────────
+    // ── Phase 2: Assembly Write + UPDATE Latch (Pull 8) ────────────────────
     if !cfg!(feature = "nvidia-kepler-takeover") {
         serial_println!(":: kdisp: trace-only — takeover feature not set ::");
         return None;
@@ -239,17 +239,33 @@ pub unsafe fn takeover_display(
     };
     let expected_width = gop_info.width as u32;
     let expected_height = gop_info.height as u32;
+    let expected_pitch = expected_width * 4;
     let fb_size = (expected_width * expected_height * 4) as usize;
 
-    // 1. Prepare surf2 (green fill at VRAM + 0x1600000)
+    // 1. Prepare surf2 (pattern fill at VRAM + 0x1600000)
     let bar1 = vram_base;
     let surf2_offset = 0x1600000;
     let dst = (bar1 + surf2_offset) as *mut u32;
-    let dwords = fb_size / 4;
-    for i in 0..dwords {
-        core::ptr::write_volatile(dst.add(i), 0xFF00FF00);
+    
+    serial_println!(":: kdisp: surf2 geom w={} h={} pitch={} ::", expected_width, expected_height, expected_pitch);
+    for y in 0..expected_height {
+        let color = if y < expected_height / 4 {
+            0xFFFF0000 // RED
+        } else if y < expected_height / 2 {
+            0xFF00FF00 // GREEN
+        } else if y < (expected_height * 3) / 4 {
+            0xFF0000FF // BLUE
+        } else {
+            0xFFFFFFFF // WHITE
+        };
+        
+        let row_ptr = dst.add((y * expected_width) as usize);
+        for x in 0..expected_width {
+            let final_color = if x < 64 { 0xFF000000 } else { color };
+            core::ptr::write_volatile(row_ptr.add(x as usize), final_color);
+        }
     }
-    serial_println!(":: kdisp: surf2 prep off=01600000 bytes={:08X} fill=FF00FF00 ::", fb_size);
+    serial_println!(":: kdisp: surf2 prep off=01600000 bytes={:08X} pattern=quarters+leftbar ::", fb_size);
 
     // 2. Pre-state
     let asm_reg = 0x640460;
@@ -293,16 +309,25 @@ pub unsafe fn takeover_display(
     let rb_update = mmio_read(bar0, update_reg);
     serial_println!(":: kdisp: latch update-wrote rb0080={:08X} ::", rb_update);
 
-    // ~5 s hold polling 0x6101E0 and HEAD_STAT vertical once/s.
+    // ~8 s hold polling 0x6101E0 and HEAD_STAT vertical once/s.
     // Head 0 HEAD_STAT base is 0x6000 + 0 = 0x6000, vert is +0x340.
     let hs_vert_reg = regs::NV_PDISPLAY_BASE + 0x6340; 
     let mut last_hold_armed = pre_armed;
-    for t in 1..=5 {
+    for t in 1..=8 {
         for _ in 0..60_000_000 { core::hint::spin_loop(); }
         let armed = mmio_read(bar0, armed_reg);
         let vert = mmio_read(bar0, hs_vert_reg);
         last_hold_armed = armed;
         serial_println!(":: kdisp: latch hold t={}s armed={:08X} stat vert={:08X} ::", t, armed, vert);
+        
+        if t == 4 {
+            let p_616340 = mmio_read(bar0, 0x616340);
+            let p_61634c = mmio_read(bar0, 0x61634C);
+            let p_61d1e0 = mmio_read(bar0, 0x61D1E0);
+            let p_61d014 = mmio_read(bar0, 0x61D014);
+            serial_println!(":: kdisp: latch midhold 616340={:08X} 61634C={:08X} 6101E0={:08X} 61D1E0={:08X} 61D014={:08X} ::",
+                p_616340, p_61634c, armed, p_61d1e0, p_61d014);
+        }
     }
 
     // 6. Restore
