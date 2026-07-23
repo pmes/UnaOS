@@ -4258,6 +4258,213 @@ impl XhciController {
         serial_println!(":: PIUSB: [piusb36] === matrix complete === ::");
     }
 
+    // ==================== PIUSB-37: chase the command itself ====================
+
+    /// PIUSB-37 helper: dump the first 16 bytes at `phys` with a zeros/pattern/data verdict.
+    #[cfg(target_arch = "aarch64")]
+    fn piusb37_dump16(label: &str, phys: u64, status: CswStatus, residue: u32) {
+        let d = unsafe { core::slice::from_raw_parts(phys as *const u8, 16) };
+        let verdict = if d.iter().all(|&b| b == 0) { "ZEROS" } else { "DATA(real-bytes-landed)" };
+        serial_println!(
+            ":: PIUSB: [piusb37] {} buf={:#x} CSW={:?} residue={} verdict={} — {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
+            label, phys, status, residue, verdict,
+            d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7],
+            d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15]);
+    }
+
+    /// PIUSB-37: chase the READ(10)-returns-zeros wedge into the SCSI command itself. With the
+    /// cache theory (§5a), the DMA-address theory (§5b), and — pending P46 — buffer/region/TD-shape/
+    /// posted-write visibility (§5c) all pointing away from our transport, the residual suspect is
+    /// the command or the device's response to it: a wrong LUN, a byte-swapped/zero transfer length,
+    /// or a pending UNIT ATTENTION (post power-on/reset) under which some bridges return zero-filled
+    /// data + GOOD status until the sense is cleared (which would explain why the early P38 path —
+    /// a different reset/clear sequence — read real sectors while the deferred path reads zeros).
+    /// Four read-only steps, each witnessed. aarch64-only; never compiled on x86.
+    #[cfg(target_arch = "aarch64")]
+    fn piusb37_matrix(&mut self) {
+        let slot = self.storage_slot;
+        if slot == 0 { serial_println!(":: PIUSB: [piusb37] no storage slot — matrix skipped ::"); return; }
+        let (databuf, cbw_phys) = {
+            let s = &self.slots[slot as usize];
+            match (s.scsi_data_buffer, s.cbw_buffer) {
+                (Some(d), Some(c)) => (d as u64, c as u64),
+                _ => { serial_println!(":: PIUSB: [piusb37] no data/cbw buffer — matrix skipped ::"); return; }
+            }
+        };
+        let read10_lba0 = [0x28u8, 0, 0, 0, 0, 0, 0, 0, 1, 0];
+
+        serial_println!(":: PIUSB: [piusb37] === chase-the-command matrix (read-only, one boot) === ::");
+
+        // --- Step 1: CBW AUDIT. Build the exact 31-byte CBW that bot_transfer hands to the
+        //     controller (build_cbw writes the on-the-wire little-endian layout, so a post-build
+        //     dump IS what the VL805 DMA-reads) for READ(10) LBA0 and, as a reference, INQUIRY.
+        //     Decode + spec-check each field: dCBWSignature must be "USBC" (55 53 42 43),
+        //     dCBWDataTransferLength must be 512 for READ(10) / 36 for INQUIRY (little-endian),
+        //     bmCBWFlags 0x80 (device->host IN), bCBWLUN 0, bCBWCBLength = CDB len, and the CDB:
+        //     READ(10) opcode 0x28 with LBA + transfer-length-in-blocks BIG-endian; a wrong LUN, a
+        //     zero blocks field, or a byte-swapped LBA each yields exactly the zeros-with-Passed
+        //     signature. This only builds into the CBW buffer — it issues no transfer. ---
+        for (label, cdb, want_len) in [
+            ("READ10", &read10_lba0[..], 512u32),
+            ("INQUIRY", &[0x12u8, 0, 0, 0, 36, 0][..], 36u32),
+        ] {
+            let _ = self.build_cbw(cbw_phys as *mut u8, want_len, Direction::In, cdb);
+            let c = unsafe { core::slice::from_raw_parts(cbw_phys as *const u8, 31) };
+            let sig = (c[0] as u32) | ((c[1] as u32) << 8) | ((c[2] as u32) << 16) | ((c[3] as u32) << 24);
+            let tag = (c[4] as u32) | ((c[5] as u32) << 8) | ((c[6] as u32) << 16) | ((c[7] as u32) << 24);
+            let dxlen = (c[8] as u32) | ((c[9] as u32) << 8) | ((c[10] as u32) << 16) | ((c[11] as u32) << 24);
+            let flags = c[12]; let lun = c[13]; let cblen = c[14];
+            let sig_ok = sig == 0x43425355;
+            let len_ok = dxlen == want_len;
+            let flags_ok = flags == 0x80;
+            let lun_ok = lun == 0;
+            let cblen_ok = cblen as usize == cdb.len();
+            serial_println!(
+                ":: PIUSB: [piusb37] cbw-dump {} sig={:#010x}({}) tag={:#x} dCBWDataTransferLength={}({}) bmFlags={:#04x}({}) bCBWLUN={}({}) bCBWCBLength={}({}) ::",
+                label, sig, if sig_ok {"USBC-ok"} else {"BAD"}, tag,
+                dxlen, if len_ok {"ok"} else {"MISMATCH"},
+                flags, if flags_ok {"IN-ok"} else {"BAD"},
+                lun, if lun_ok {"ok"} else {"NONZERO!"},
+                cblen, if cblen_ok {"ok"} else {"MISMATCH"});
+            serial_println!(
+                ":: PIUSB: [piusb37] cbw-dump {} CDB= {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
+                label,
+                c[15], c[16], c[17], c[18], c[19], c[20], c[21], c[22],
+                c[23], c[24], c[25], c[26], c[27], c[28], c[29], c[30]);
+            if label == "READ10" {
+                // Opcode 0x28; LBA = c[17..21] BE; transfer length in blocks = c[22..24] BE.
+                let opcode = c[15];
+                let lba = ((c[17] as u32) << 24) | ((c[18] as u32) << 16) | ((c[19] as u32) << 8) | (c[20] as u32);
+                let blocks = ((c[22] as u16) << 8) | (c[23] as u16);
+                serial_println!(
+                    ":: PIUSB: [piusb37] cbw-dump READ10 decode: opcode={:#04x}({}) LBA(BE)={} blocks(BE)={} — {} ::",
+                    opcode, if opcode == 0x28 {"ok"} else {"BAD"}, lba, blocks,
+                    if opcode == 0x28 && lba == 0 && blocks == 1 { "CDB well-formed — command is NOT the fault" }
+                    else { "CDB MALFORMED — this alone would return zeros+Passed" });
+            }
+        }
+
+        // --- Step 2: command-set + known-nonzero-LBA matrix. READ(10) of mid-disk FAT-area LBAs
+        //     (8192, 16384) — if LBA0 is a zero-filled reserved sector but these read data, the wedge
+        //     is not universal. Then LBA0 via READ(12) (0xA8) and READ(16) (0x88): some bridges
+        //     mishandle one command-set variant while another works. All read-only, first-16 dumped. ---
+        for &lba in &[8192u32, 16384u32] {
+            let cdb = [0x28u8, 0,
+                (lba >> 24) as u8, (lba >> 16) as u8, (lba >> 8) as u8, lba as u8,
+                0, 0, 1, 0];
+            unsafe { core::ptr::write_bytes(databuf as *mut u8, 0xA5, 512); }
+            match self.bot_transfer(slot, &cdb, databuf, 512, Direction::In) {
+                Ok(r) => {
+                    let d = unsafe { core::slice::from_raw_parts(databuf as *const u8, 16) };
+                    let verdict = if d.iter().all(|&b| b == 0) { "ZEROS" } else { "DATA(real-bytes-landed)" };
+                    serial_println!(
+                        ":: PIUSB: [piusb37] read10-lba{} buf={:#x} CSW={:?} residue={} verdict={} — {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
+                        lba, databuf, r.status, r.residue, verdict,
+                        d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7],
+                        d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15]);
+                }
+                Err(e) => serial_println!(":: PIUSB: [piusb37] read10-lba{} ERR {:?} ::", lba, e),
+            }
+        }
+        // READ(12) LBA0 (opcode 0xA8): LBA BE in bytes 2..6, transfer length BE (blocks) in 6..10.
+        {
+            let cdb = [0xA8u8, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0];
+            unsafe { core::ptr::write_bytes(databuf as *mut u8, 0xA5, 512); }
+            match self.bot_transfer(slot, &cdb, databuf, 512, Direction::In) {
+                Ok(r) => Self::piusb37_dump16("read12-lba0", databuf, r.status, r.residue),
+                Err(e) => serial_println!(":: PIUSB: [piusb37] read12-lba0 ERR {:?} ::", e),
+            }
+        }
+        // READ(16) LBA0 (opcode 0x88): LBA BE in bytes 2..10, transfer length BE (blocks) in 10..14.
+        {
+            let cdb = [0x88u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0];
+            unsafe { core::ptr::write_bytes(databuf as *mut u8, 0xA5, 512); }
+            match self.bot_transfer(slot, &cdb, databuf, 512, Direction::In) {
+                Ok(r) => Self::piusb37_dump16("read16-lba0", databuf, r.status, r.residue),
+                Err(e) => serial_println!(":: PIUSB: [piusb37] read16-lba0 ERR {:?} ::", e),
+            }
+        }
+
+        // --- Step 3: REQUEST SENSE immediately after a zeros-read. STRONG CANDIDATE: some bridges
+        //     return zero-filled data + GOOD status while a UNIT ATTENTION (power-on/reset, sense
+        //     key 0x06, ASC 0x29) is pending — the sense stays latched until read. Issue a READ(10)
+        //     LBA0 (the zeros-read), then REQUEST SENSE (0x03, 18 B) and decode the sense buffer:
+        //     response code, sense key, ASC/ASCQ. A non-zero sense key here is the smoking gun. ---
+        {
+            unsafe { core::ptr::write_bytes(databuf as *mut u8, 0, 512); }
+            let read_res = self.bot_transfer(slot, &read10_lba0, databuf, 512, Direction::In);
+            match read_res {
+                Ok(r) => Self::piusb37_dump16("presense-read10-lba0", databuf, r.status, r.residue),
+                Err(e) => serial_println!(":: PIUSB: [piusb37] presense-read10 ERR {:?} ::", e),
+            }
+            let sense_cdb = [0x03u8, 0, 0, 0, 18, 0];
+            unsafe { core::ptr::write_bytes(databuf as *mut u8, 0, 18); }
+            match self.bot_transfer(slot, &sense_cdb, databuf, 18, Direction::In) {
+                Ok(r) => {
+                    let s = unsafe { core::slice::from_raw_parts(databuf as *const u8, 18) };
+                    let resp = s[0] & 0x7f;
+                    let key = s[2] & 0x0f;
+                    let asc = s[12]; let ascq = s[13];
+                    let name = match key {
+                        0x00 => "NO SENSE", 0x02 => "NOT READY", 0x03 => "MEDIUM ERROR",
+                        0x04 => "HARDWARE ERROR", 0x05 => "ILLEGAL REQUEST",
+                        0x06 => "UNIT ATTENTION", 0x0b => "ABORTED COMMAND", _ => "other",
+                    };
+                    serial_println!(
+                        ":: PIUSB: [piusb37] REQUEST-SENSE CSW={:?} residue={} response={:#04x} key={:#x}({}) ASC={:#04x} ASCQ={:#04x} — {} ::",
+                        r.status, r.residue, resp, key, name, asc, ascq,
+                        if key == 0x06 { "UNIT ATTENTION PENDING — strong candidate for zeros-then-good" }
+                        else if key == 0x00 { "no pending sense — UA theory does NOT explain the zeros" }
+                        else { "pending non-UA sense condition" });
+                    serial_println!(
+                        ":: PIUSB: [piusb37] REQUEST-SENSE raw= {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
+                        s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8],
+                        s[9], s[10], s[11], s[12], s[13], s[14], s[15], s[16], s[17]);
+                }
+                Err(e) => serial_println!(":: PIUSB: [piusb37] REQUEST-SENSE ERR {:?} ::", e),
+            }
+        }
+
+        // --- Step 4: TEST UNIT READY drain + retry READ(10). Standard bring-up practice: issue
+        //     TUR / REQUEST SENSE until the unit reports ready (clearing any latched UA), THEN
+        //     re-read LBA0. If the zeros become data after the sense-clear, THAT is the fix: drain
+        //     TUR/sense before the first read. If they stay zeros, the UA theory is refuted and the
+        //     residual is a genuine device/transport response to the READ command itself. ---
+        {
+            let mut ready = false;
+            for attempt in 0..8 {
+                match self.scsi_test_unit_ready(slot) {
+                    Ok(CswStatus::Passed) => {
+                        serial_println!(":: PIUSB: [piusb37] TUR attempt {} => Passed (ready) ::", attempt);
+                        ready = true; break;
+                    }
+                    Ok(st) => {
+                        serial_println!(":: PIUSB: [piusb37] TUR attempt {} => {:?}; clearing sense ::", attempt, st);
+                        let sense_cdb = [0x03u8, 0, 0, 0, 18, 0];
+                        let _ = self.bot_transfer(slot, &sense_cdb, databuf, 18, Direction::In);
+                    }
+                    Err(e) => serial_println!(":: PIUSB: [piusb37] TUR attempt {} ERR {:?} ::", attempt, e),
+                }
+            }
+            unsafe { core::ptr::write_bytes(databuf as *mut u8, 0, 512); }
+            match self.bot_transfer(slot, &read10_lba0, databuf, 512, Direction::In) {
+                Ok(r) => {
+                    Self::piusb37_dump16("postready-read10-lba0", databuf, r.status, r.residue);
+                    let d = unsafe { core::slice::from_raw_parts(databuf as *const u8, 16) };
+                    let still_zeros = d.iter().all(|&b| b == 0);
+                    serial_println!(
+                        ":: PIUSB: [piusb37] post-TUR verdict: ready={} data={} — {} ::",
+                        ready, if still_zeros {"ZEROS"} else {"REAL"},
+                        if !still_zeros { "SENSE-CLEAR IS THE FIX: drain TUR/REQUEST-SENSE before first read" }
+                        else { "still zeros after ready — UA/sense theory REFUTED; residual is READ-command response" });
+                }
+                Err(e) => serial_println!(":: PIUSB: [piusb37] postready-read10 ERR {:?} ::", e),
+            }
+        }
+
+        serial_println!(":: PIUSB: [piusb37] === chase-the-command matrix complete === ::");
+    }
+
     /// USB-WRITE-2: recover a halted bulk endpoint after a STALL (completion code 4) or Babble
     /// (6) so one faulted transfer cannot dead-line every later BOT command on the slot. This is
     /// the standard USB BOT clear-stall sequence, host + device side:
@@ -4757,6 +4964,13 @@ impl XhciController {
         // its buffer/TD-shape/posted-write experiments sit on the same enumerated slot.
         #[cfg(target_arch = "aarch64")]
         self.piusb36_matrix();
+
+        // PIUSB-37: chase the READ(10)-returns-zeros wedge into the SCSI command itself — CBW audit,
+        // command-set / known-nonzero-LBA matrix, REQUEST SENSE (UNIT ATTENTION candidate), and a
+        // TUR-drain-then-retry. Read-only; aarch64 witness only (no-op on x86). Runs after the
+        // piusb36 matrix so it sits on the same enumerated slot.
+        #[cfg(target_arch = "aarch64")]
+        self.piusb37_matrix();
 
         // USB-WRITE: prove the BOT WRITE(10) OUT path on the enumerated stick with a
         // read-modify-write-restore of one scratch sector (byte-identical afterward).
