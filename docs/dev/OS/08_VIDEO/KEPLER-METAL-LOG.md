@@ -3,6 +3,39 @@
 Hard-won silicon facts from the fox-metal sitting series. Trust these over any
 QEMU behavior. Newest sitting first.
 
+## Sitting #13 (display pull 3 + kepler pull 14, UnaOS-gemini@f4a7ef6e, 2026-07-23, fox-metal-r23s1i)
+
+**Boot 1 — display pull 3 candidate decode DELIVERED. Coordinator decode:**
+- Dense windows (0x300–0x35C, 0x3F0–0x40C, 0x5F0–0x61C), both heads, 3 passes,
+  all rows captured (`~/unaos-bench/capture/rmbp-s13/`, mark s13boot1).
+- **Telemetry (varies across passes, disqualified as config):** 0x314 is a
+  frame counter (0xACE→0xACF, monotone; the value s12 saw mirrored at
+  0x118/0x53C), 0x340/0x344 track raster position, 0x3F4 toggles, and — new —
+  **both 0x604 (0x0078→0x007A high-half) and 0x614 (0x22500→0x22900) move**:
+  the in-kernel `stable=yes` for 0x614 was a per-pass sampling artifact; the
+  window rows refute it. Both former candidates are counters, not config.
+- **Mode-timing block identified:** 0x34C=0x07380BAF decodes as
+  vtotal=0x738 (1848) | htotal=0xBAF (2991) — exactly raster totals for the
+  2880×1800 panel with blanking; 0x348=0x00310070 is sync/porch-shaped
+  (49/112); head 1 holds near-reset 0x00050008/0x00060009. The head block's
+  0x340-region is the live timing/raster cluster, matching HEAD_STAT.
+- **Surviving stable head-0-only config:** 0x310=0x008959E6 (same value
+  across s12 AND s13 boots — config, not a counter; magnitude ~9.0M fits no
+  obvious address/pitch/size against fb=+0x20000, pitch 0x2D00, fbsize
+  0x13C6800 — PLL/link-coefficient-shaped, unresolved), 0x30C=0x58008000
+  (flag word vs head 1's 0x01220000), 0x520=0x00000600, 0x600=0x000F4101
+  vs 0x00000100 (enable cluster), 0x610=0x08000014 vs 0x08000000.
+- **Verdict: the scanout surface ADDRESS is not exposed anywhere in these
+  head-block windows.** 0x408=0x21EC4000 is address-shaped but identical on
+  the dead head — a shared default, not the surface. Conclusion for pull 4
+  planning: on 917D the armed surface likely lives in EVO core-channel state
+  (reachable via the core channel, not as a bare per-head MMIO word), or in a
+  head-block region outside the three windows. Peter decision required either
+  way (first write vs wider read).
+
+**Boot 2 — kepler pull 14 CTRL_ADDR ladder: staged, pending.** (Entry will be
+amended when it flies.)
+
 ## Sitting #12 (display pull 2 + kepler pull 13, UnaOS-gemini@9d22d263, 2026-07-23, fox-metal-r23s1i)
 
 Captures: `~/.claude/plans/unaos/review/rmbp-s12boot1-headdumps.md` (boot 1,
