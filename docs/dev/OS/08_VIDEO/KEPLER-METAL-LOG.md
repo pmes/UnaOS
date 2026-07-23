@@ -3,6 +3,31 @@
 Hard-won silicon facts from the fox-metal sitting series. Trust these over any
 QEMU behavior. Newest sitting first.
 
+## Sitting #17 (display pull 7, UnaOS-gemini@11f06ded, 2026-07-23, fox-metal-r23s1i) — ⭐ MILESTONE
+
+**FIRST DELIBERATE UNAOS PIXELS ON THE rMBP INTERNAL PANEL. The EVO
+arm-and-latch mechanism WORKS.** (Coordinator capture-verified, all lines.)
+- Ladder: pre asm=armed=shadow=0x200 → `asm-wrote=00016000 rb=00016000`
+  (assembly slot 0x640460 is WRITABLE and holds) → selfcheck ×2: armed
+  unchanged (no premature latch — assembly and armed states are properly
+  distinct) → UPDATE write 0x640080=0 (rb 0) → **panel showed a GREEN BAR at
+  the BOTTOM of the screen during the 5 s hold (Peter's eyes)** → restore:
+  asm back to 0x200, armed/shadow 0x200, screen recovered.
+- `verdict asm-stuck=y armed-followed=n`: the 0x6101E0 "armed" readout NEVER
+  left 0x200 even while green was on the panel — so 0x6101E0 is NOT the live
+  scanout tracker (it reports some other/base state, or latches at a
+  boundary we didn't cross). Known-unknown, logged as such.
+- Green as a bottom BAND (not full screen) — the 0x640460 offset evidently
+  maps a sub-region of the raster. Facts in hand cannot yet say which
+  mapping (stride/tiling/multi-window split); pull 8 discriminates with a
+  patterned fill instead of solid green. HEAD_STAT vert ticked throughout
+  (raster never stalled); vblank_count high-halves advanced ~13-14/s.
+- Fence-lane consequence: the EVO method-mirror write + UPDATE path is
+  PROVEN LIVE — the disp-era-USERD fallback now has a working mechanism to
+  ride; fence pull 15 = read-only recon of the method-mirror header region
+  (0x640000–0x6403FC, never yet dumped) to locate channel-control/USERD
+  slots.
+
 ## Sitting #16 (display pull 6, UnaOS-gemini@939ba952, 2026-07-23, fox-metal-r23s1i)
 
 **Single read-only boot — ASSEMBLY STATE FOUND. Coordinator decode:**
