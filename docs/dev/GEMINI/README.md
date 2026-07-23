@@ -23,10 +23,7 @@ STOP: say so in your proposal/report; the coordinator handles it.
 ## 2. Read order at session start
 
 1. This README.
-2. `RELAY.md` (this directory) — the coordinator's current message to each
-   lane, overwritten every round. After EVERY `git pull`, read your lane's
-   section first; it is the freshest instruction and outranks stale briefs.
-3. `video/INDEX.md` — the map: every pull, its status, the naming authority.
+2. `video/INDEX.md` — the map: every pull, its status, the naming authority.
 3. Your lane's newest `BRIEF-*` (the coordinator writes these; your work is
    defined by the newest brief with no `PROPOSAL` answering it).
 4. `docs/dev/OS/08_VIDEO/KEPLER-METAL-LOG.md` — silicon facts of record,

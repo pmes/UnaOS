@@ -1,4 +1,5 @@
-# GEMINI RELAY — overwritten by the coordinator; post whatever is below, verbatim
+# PETER'S RELAY SHEET — not for specialists. Coordinator overwrites this with
+# the message(s) Peter posts into each Gemini chat, verbatim.
 # (updated 2026-07-23, after sitting #13 fold + display pull-4 brief)
 
 ## → kepler-display session
