@@ -1145,7 +1145,7 @@ unsafe fn read_igpu_trace() -> [u32; 11] {
 }
 
 #[cfg(feature = "unaos_ivb")]
-unsafe fn read_gmux_trace() -> [u32; 4] {
+unsafe fn read_gmux_trace() -> [u32; 6] {
     #[cfg(target_arch = "x86_64")]
     unsafe {
         use core::arch::asm;
@@ -1159,36 +1159,50 @@ unsafe fn read_gmux_trace() -> [u32; 4] {
             val
         };
 
-        // Indexed read: index -> 0x7D0, value <- 0x7C2
-        let index_read = |reg: u8| -> u32 {
-            outb(0x7D0, reg);
-            let val = inb(0x7C2);
-            if val == 0 || val == 0xFF {
-                0xBAD0BA20
-            } else {
-                val as u32
+        let wait_ready = || {
+            let mut i = 200;
+            let mut gwr = inb(0x7D4);
+            while i > 0 && (gwr & 0x01) != 0 {
+                inb(0x7D0);
+                gwr = inb(0x7D4);
+                // Simple delay loop
+                for _ in 0..1000 { unsafe { asm!("pause", options(nomem, nostack, preserves_flags)); } }
+                i -= 1;
             }
         };
 
-        // Classic read: value <- 0x700 + reg
-        let pio_read = |port: u16| -> u32 {
-            let val = inb(port);
-            if val == 0 || val == 0xFF {
-                0xBAD0BA20
-            } else {
-                val as u32
+        let wait_complete = || {
+            let mut i = 200;
+            let mut gwr = inb(0x7D4);
+            while i > 0 && (gwr & 0x01) == 0 {
+                gwr = inb(0x7D4);
+                for _ in 0..1000 { unsafe { asm!("pause", options(nomem, nostack, preserves_flags)); } }
+                i -= 1;
             }
+            if (gwr & 0x01) != 0 {
+                inb(0x7D0);
+            }
+        };
+
+        let index_read = |reg: u8| -> u32 {
+            wait_ready();
+            outb(0x7D0, reg);
+            wait_complete();
+            let val = inb(0x7C2);
+            val as u32
         };
 
         [
-            index_read(0x10), // Indexed SWITCH_DISPLAY
-            index_read(0x50), // Indexed DISCRETE_POWER
-            pio_read(0x710),  // Classic SWITCH_DISPLAY
-            pio_read(0x750),  // Classic DISCRETE_POWER
+            index_read(0x04), // VERSION_MAJOR
+            index_read(0x05), // VERSION_MINOR
+            index_read(0x06), // VERSION_RELEASE
+            index_read(0x10), // SWITCH_DISPLAY
+            index_read(0x28), // SWITCH_DDC
+            index_read(0x50), // DISCRETE_POWER
         ]
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
-        [0; 4]
+        [0; 6]
     }
 }

@@ -51,10 +51,10 @@ static PROBED: AtomicBool = AtomicBool::new(false);
 static mut TRACE_0: [u32; 11] = [0; 11];
 static mut TRACE_1: [u32; 11] = [0; 11];
 static mut TRACE_2: [u32; 11] = [0; 11];
-static mut GMUX_0: [u32; 4] = [0; 4];
+static mut GMUX_0: [u32; 6] = [0; 6];
 static mut TRACES_VALID: bool = false;
 
-pub fn set_boot_traces(t0: [u32; 11], t1: [u32; 11], t2: [u32; 11], g0: [u32; 4]) {
+pub fn set_boot_traces(t0: [u32; 11], t1: [u32; 11], t2: [u32; 11], g0: [u32; 6]) {
     unsafe {
         TRACE_0 = t0;
         TRACE_1 = t1;
@@ -65,7 +65,7 @@ pub fn set_boot_traces(t0: [u32; 11], t1: [u32; 11], t2: [u32; 11], g0: [u32; 4]
 }
 
 #[cfg(target_arch = "x86_64")]
-unsafe fn read_gmux_trace() -> [u32; 4] {
+unsafe fn read_gmux_trace() -> [u32; 6] {
     use core::arch::asm;
     let outb = |port: u16, val: u8| {
         unsafe { asm!("out dx, al", in("dx") port, in("al") val, options(nomem, nostack, preserves_flags)); }
@@ -76,26 +76,50 @@ unsafe fn read_gmux_trace() -> [u32; 4] {
         val
     };
 
-    let index_read = |reg: u8| -> u32 {
-        outb(0x7D0, reg);
-        let val = inb(0x7C2);
-        if val == 0 || val == 0xFF { 0xBAD0BA20 } else { val as u32 }
+    let wait_ready = || {
+        let mut i = 200;
+        let mut gwr = inb(0x7D4);
+        while i > 0 && (gwr & 0x01) != 0 {
+            inb(0x7D0);
+            gwr = inb(0x7D4);
+            for _ in 0..1000 { unsafe { asm!("pause", options(nomem, nostack, preserves_flags)); } }
+            i -= 1;
+        }
     };
-    let pio_read = |port: u16| -> u32 {
-        let val = inb(port);
-        if val == 0 || val == 0xFF { 0xBAD0BA20 } else { val as u32 }
+
+    let wait_complete = || {
+        let mut i = 200;
+        let mut gwr = inb(0x7D4);
+        while i > 0 && (gwr & 0x01) == 0 {
+            gwr = inb(0x7D4);
+            for _ in 0..1000 { unsafe { asm!("pause", options(nomem, nostack, preserves_flags)); } }
+            i -= 1;
+        }
+        if (gwr & 0x01) != 0 {
+            inb(0x7D0);
+        }
+    };
+
+    let index_read = |reg: u8| -> u32 {
+        wait_ready();
+        outb(0x7D0, reg);
+        wait_complete();
+        let val = inb(0x7C2);
+        val as u32
     };
 
     [
-        index_read(0x10), // Indexed SWITCH_DISPLAY
-        index_read(0x50), // Indexed DISCRETE_POWER
-        pio_read(0x710),  // Classic SWITCH_DISPLAY
-        pio_read(0x750),  // Classic DISCRETE_POWER
+        index_read(0x04), // VERSION_MAJOR
+        index_read(0x05), // VERSION_MINOR
+        index_read(0x06), // VERSION_RELEASE
+        index_read(0x10), // SWITCH_DISPLAY
+        index_read(0x28), // SWITCH_DDC
+        index_read(0x50), // DISCRETE_POWER
     ]
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-unsafe fn read_gmux_trace() -> [u32; 4] { [0; 4] }
+unsafe fn read_gmux_trace() -> [u32; 6] { [0; 6] }
 
 pub fn init(gpu: &GpuInfo) {
     if PROBED.swap(true, Ordering::SeqCst) {
@@ -148,10 +172,29 @@ pub fn init(gpu: &GpuInfo) {
                     names[i], TRACE_0[i], TRACE_1[i], TRACE_2[i], trace3[i]);
             }
             serial_println!(":: igpu: GMUX TRACE ::");
-            let gnames = ["idx_SWITCH", "idx_POWER", "pio_SWITCH", "pio_POWER"];
-            for i in 0..4 {
-                serial_println!(":: igpu: {:<12} | 0x{:08X}        |                   |                   | 0x{:08X} ::", 
-                    gnames[i], GMUX_0[i], gmux3[i]);
+            
+            let boot_ver_ok = !(GMUX_0[0] == 0x00 && GMUX_0[1] == 0x00 && GMUX_0[2] == 0x00) &&
+                              !(GMUX_0[0] == 0xFF && GMUX_0[1] == 0xFF && GMUX_0[2] == 0xFF) &&
+                              !(GMUX_0[0] == GMUX_0[1] && GMUX_0[1] == GMUX_0[2]);
+            let kern_ver_ok = !(gmux3[0] == 0x00 && gmux3[1] == 0x00 && gmux3[2] == 0x00) &&
+                              !(gmux3[0] == 0xFF && gmux3[1] == 0xFF && gmux3[2] == 0xFF) &&
+                              !(gmux3[0] == gmux3[1] && gmux3[1] == gmux3[2]);
+
+            if !boot_ver_ok || !kern_ver_ok {
+                serial_println!(":: igpu: PROTOCOL UNPROVEN (implausible version tuples)");
+                serial_println!(":: igpu: Boot Version: {}.{}.{} | Kernel Version: {}.{}.{}", 
+                    GMUX_0[0], GMUX_0[1], GMUX_0[2], gmux3[0], gmux3[1], gmux3[2]);
+                serial_println!(":: igpu: Raw SW_DISP: Boot=0x{:02X}, Kern=0x{:02X}", GMUX_0[3], gmux3[3]);
+                serial_println!(":: igpu: Raw SW_DDC : Boot=0x{:02X}, Kern=0x{:02X}", GMUX_0[4], gmux3[4]);
+                serial_println!(":: igpu: Raw POWER  : Boot=0x{:02X}, Kern=0x{:02X}", GMUX_0[5], gmux3[5]);
+            } else {
+                serial_println!(":: igpu: Version (Maj,Min,Rel) | {}.{}.{}             |                   |                   | {}.{}.{} ::", 
+                    GMUX_0[0], GMUX_0[1], GMUX_0[2], gmux3[0], gmux3[1], gmux3[2]);
+                let gnames = ["SW_DISPLAY", "SW_DDC", "DISC_POWER"];
+                for i in 0..3 {
+                    serial_println!(":: igpu: {:<19} | 0x{:08X}        |                   |                   | 0x{:08X} ::", 
+                        gnames[i], GMUX_0[i+3], gmux3[i+3]);
+                }
             }
             serial_println!(":: igpu: TRACE END ::");
         }
