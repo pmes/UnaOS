@@ -22,7 +22,24 @@ QEMU behavior. Newest sitting first.
   decoded block — derive the armed/surface registers outward from ITS
   offsets for the 917D class.
 
-Boot 2 (USERD_HI ladder) verdict pending.
+**Boot 2 — USERD_HI bit31 refuted as the poll enable, with a new precision:**
+- Witness FAILED, err=2 unchanged, discriminators zero, clean evidenced
+  restore (post-restore err=2 stat=0).
+- NEW: `inst-raw 0C=80000000` — **the bit31 write PERSISTS in instance
+  memory** (read 0 in s9/s10). Coordinator's read, sharper than the bench
+  framing: the strip has always been on the PFIFO_CHAN MMIO word (documented
+  NO_POLL refusal), NOT on instance bytes — inst writes are visible to US
+  via BAR1. The genuinely open question this creates: does the ENGINE see
+  our instance bytes at validate time? BAR1 readback only proves BAR1
+  self-coherence, not scheduler-side visibility (WC/L2 flush between inst
+  writes and validate is now a live hypothesis).
+- Fence poll ran bounded, failed as expected.
+
+Sitting #11 complete, both rungs: head-0-alive (boot 1) + inst-writes-persist
+/ USERD_HI-refuted (boot 2). Pull-13 targets: (1) VRAM-write→validate
+visibility (a cited flush/serialization step), (2) if flushing changes
+nothing, the poll area is still elsewhere — widen the derivation. Capture +
+MANIFEST are the record.
 
 ## Sitting #10 (igpu pull 5 + kepler pull 11, UnaOS-gemini@dffa7816, 2026-07-22, fox-metal-r23s1h)
 
