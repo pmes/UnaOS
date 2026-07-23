@@ -2247,7 +2247,23 @@ fn write_probe_uniforms(off: usize, scratch_v3d: u32) -> usize {
 /// terminal [22] thrsw where tmuwt drains the store. The Mesa artifact (PROBE_WORDS) stays byte-verbatim
 /// (§5 untouched); only the record's threading declaration changes. Returns the attribute count.
 fn build_probe_shader_record() -> u32 {
-    let code = (arena_phys() + OFF_PROBE_CODE) as u64;
+    // V3D-39 WITNESS (Task A — the dispatch wall): the [v3d38] record diff proved the probe record now
+    // equals the confirmed-dispatching M4 record on EVERY field except the two CS pointers (cs_code_addr,
+    // cs_uniforms_addr) — FS/VS borrowed, CL byte-identical (v3d36), threading refuted both ways (v3d37).
+    // Yet the probe coord shader still NEVER dispatches (valid_instr=0). The ONLY remaining variable is the
+    // CS PROGRAM ITSELF: PROBE_WORDS is Mesa's "PROBE VS" — a VERTEX-shader-shaped threads=2 program with a
+    // MID-shader thrsw (words [18],[19]) — sitting in the COORD slot. The V3D-26 harness only ever emitted
+    // three VS variants (coord VS, render VS, probe VS); it never compiled a bin_mode/CS variant, and no
+    // CS-mode probe artifact exists in scripts/ to swap in (the Mesa harness checkout — session 0f1145d9's
+    // scratchpad — is deleted, so it cannot be re-run here). So land the decisive witness the brief names:
+    // put M4's KNOWN-DISPATCHABLE CS program (CS_VS_WORDS @ OFF_CS_CODE — a pure VPM passthrough that
+    // provably bins with valid_instr>0) into the probe record's CS slot, keeping everything else the probe
+    // record (probe's CS uniforms are irrelevant to the dispatch question). Verdict via the [v3d35] PROBE
+    // battery: if the probe bin now dispatches (valid_instr/coord > 0), the CS BYTES gate dispatch — the
+    // probe program's thread-switching/threads=2 shape is refused by v42 coord/bin dispatch. If it STILL
+    // reads valid_instr=0 with a dispatchable program in the slot, the gate is the record/arena ADDRESS
+    // window (the 0x34800 probe-record range vs the 0x1C000 M4 range) and the next arc hunts address windows.
+    let code = (arena_phys() + OFF_CS_CODE) as u64; // V3D-39: M4's CS program, not OFF_PROBE_CODE
     let unif = (arena_phys() + OFF_PROBE_UNIF) as u64;
     let defaults = (arena_phys() + OFF_DEFAULT_ATTRS) as u64;
     let vtx = (arena_phys() + OFF_VTXDATA) as u64;
@@ -2310,7 +2326,7 @@ fn build_probe_shader_record() -> u32 {
     // P34 capture caught (valid_instr=0).
     sf(&mut rec, 224, 1, 1); // CS 4-way threadable (mirror the dispatching M4 coord shader)
     sf(&mut rec, 226, 1, 1); // CS propagate NaNs (v42)
-    sf(&mut rec, 227, 29, code >> 3); // CS code address
+    sf(&mut rec, 227, 29, code >> 3); // CS code address — V3D-39: M4's known-dispatchable CS_VS_WORDS
     sf(&mut rec, 256, 32, unif); // CS uniforms address (probe stream: indices + UBO_ADDR + scales)
     arena_write_bytes(OFF_PROBE_SHADREC, &rec);
 
@@ -2371,6 +2387,10 @@ fn probe_job() {
     // DRAM. Also flush the M4 record we just published for the [v3d38] witness.
     cache::clean_range(arena_phys() + OFF_FS_CODE, FS_WORDS.len() * 8);
     cache::clean_range(arena_phys() + OFF_VS_CODE, CS_VS_WORDS.len() * 8);
+    // V3D-39 (Task A): the probe record's CS slot now points at OFF_CS_CODE (M4's known-dispatchable CS
+    // program). triangle_job wrote those bytes before calling us but does not clean them until AFTER us, so
+    // flush them to RAM here — the non-coherent GPU must run M4's CS at the probe bin, not stale DRAM.
+    cache::clean_range(arena_phys() + OFF_CS_CODE, CS_VS_WORDS.len() * 8);
     cache::clean_range(arena_phys() + OFF_FS_UNIF, 6 * 4);
     cache::clean_range(arena_phys() + OFF_VS_UNIF, 11 * 4);
     cache::clean_range(arena_phys() + OFF_SHADREC, 36 + 16);
@@ -2402,7 +2422,10 @@ fn probe_job() {
     // word) — [19] sits in [18]'s thrsw delay slot, so the thread can terminate after [18]'s two
     // delay slots ([19],[20]), leaving [21] vpmwt and [22] tmuwt UNEXECUTED and the store (fired at
     // [9] `mov tmuau`) never completed → dropped. This witness makes that decidable from the capture.
-    let probe_code_pa = (arena_phys() + OFF_PROBE_CODE) as u32;
+    // V3D-39 (Task A): the probe record's CS slot now intentionally holds M4's CS program (OFF_CS_CODE),
+    // NOT OFF_PROBE_CODE — the decisive dispatch witness. Expect CS start == M4's CS code PA (the swap), and
+    // the word[9] decode below to show a CS_VS_WORDS instruction (a passthrough, NOT the probe's tmuau).
+    let probe_code_pa = (arena_phys() + OFF_CS_CODE) as u32; // V3D-39: the intended (M4) CS program PA
     // Decode the record straight from the arena (same field layout build_probe_shader_record wrote):
     //   FS code @bit99  w29 → word@byte12 >>3<<3 ; VS code @bit163 → word@byte20 ; CS code @bit227 →
     //   word@byte28. The low bits of the CS/VS/FS words carry the threadability/propagate-NaN flags.
@@ -3256,20 +3279,43 @@ fn pctr_setup_cs_witness() {
         (PCTR_SRC_QPU_CYCLES_WAITING_TMU & 0x7f) | ((PCTR_SRC_TMU_TCACHE_MISS & 0x7f) << 8);
     let mask: u32 = 0b11_1111; // six counters enabled (0..5)
     // PI-V3D-37: arm in the exact Linux v3d_perfmon.c::v3d_perfmon_start order — STOP, program sources
-    // while stopped, CLR+OVERFLOW while stopped, then EN LAST. The V3D-33 six-counter arming inherited the
-    // V3D-21 order (EN before CLR, no barrier between), which enables the counters BEFORE they are cleared:
-    // between EN and CLR the block counts against a source-select word that may not have settled, and the
-    // CLR then races the running counters. That window aliased the two counters that actually tick during
-    // the bin — counter1 (src16 valid_instr) and counter4 (src17 cycles_waiting_tmu) — so P35 read them at
-    // ~cycle_count/4 (2116418 / 2116395, near-equal) instead of the true 55 / 0. Two witnesses (probe then
-    // M4) reuse slots 0..5 sequentially; the leading EN=0 also guarantees the prior arming is fully
-    // quiesced before this one reprograms the shared source-selects, so neither witness's slots overlap the
-    // other's live counting.
+    // while stopped, CLR+OVERFLOW while stopped, then EN LAST.
+    //
+    // PI-V3D-39 (Task B — the true mechanism, from the P36 multi-boot capture): V3D-37's reorder did NOT
+    // cure the src16 "aliasing" — the SAME kernel, across boots, reads M4's valid_instr(src16) as 55 (the
+    // true coord-shader count) on SOME boots and ~2,116,4xx on OTHERS, with cycle_count(src32) STABLE at
+    // ~8,465,5xx every boot. So it is NOT an arming-ORDER defect (the ordered+barriered sequence is present
+    // in the very capture that still flips) and NOT a field-packing defect (the three SRC shifts pack
+    // distinct, correct 8-bit fields — S0..S3 at 0/8/16/24 in SRC_0_3, S4/S5 at 0/8 in SRC_4_7, each masked
+    // 0x7f, matching v3d_regs.h V3D_PCTR_0_SRC_MASK; counter0=src14 and counter2=src32, written by the SAME
+    // SRC_0_3 store, are ALWAYS sane). It is a NON-DETERMINISTIC SOURCE-LATCH: the garbage value decomposes
+    // as cycle_count/4 + true_count (2116432 = 2116387 + ~45), and it strikes counter1(src16) and
+    // counter4(src17) — the two QPU-PIPELINE sources — TOGETHER (src17 leaks the identical ~cycle/4 in
+    // lockstep, flipping [v3d33] between SAW-NOTHING and a spurious "TMU ENGAGED"), while the non-pipeline
+    // counters never leak. On the leaking boots those two counters ALSO count a free-running ~core/4 term
+    // across the whole bin on top of their real event — the signature of a source-select that did not
+    // cleanly latch before counting began.
+    //
+    // Software mitigation (the do-it-right cure available from ring 0): make the SRC-select stores fully
+    // RETIRE before anything enables the counters — a bare dsb() orders the posted writes but does not prove
+    // the block latched them, and posted MMIO to the V3D core can retire after the barrier. READ the two SRC
+    // registers back (read-after-write forces the store to complete and the select to be observably latched)
+    // between programming and CLR/EN. The verdict does NOT rely on this succeeding: [v3d21] keys RAN/NEVER-
+    // RAN off counter0 (src14 QPU_ACTIVE_CYCLES_VERTEX_COORD_USER), the shader-scoped counter that reads sane
+    // every boot; src16/src17 are corroboration only and are now labeled race-prone at the read site.
+    //
+    // Two witnesses (probe then M4) reuse slots 0..5 sequentially; the leading EN=0 guarantees the prior
+    // arming is fully quiesced before this one reprograms the shared source-selects.
     mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_EN, 0); // stop any prior counting before reprogramming
     dsb();
     mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_SRC_0_3, channel);
     mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_SRC_4_7, channel_4_7);
-    dsb(); // source-selects land before the counters are cleared/enabled
+    dsb(); // order the source-select stores ahead of the read-back
+    // PI-V3D-39: read the SRC selects back so the posted stores RETIRE and the selects are provably latched
+    // before the counters are cleared/enabled — the mitigation for the non-deterministic src16/src17 latch.
+    let _srclat = mmio_read(V3D_CORE0_BASE, V3D_V4_PCTR_0_SRC_0_3)
+        | mmio_read(V3D_CORE0_BASE, V3D_V4_PCTR_0_SRC_4_7);
+    dsb(); // source-selects latched before the counters are cleared/enabled
     mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_CLR, mask); // zero the counters WHILE stopped
     mmio_write(V3D_CORE0_BASE, V3D_PCTR_0_OVERFLOW, mask); // clear latched overflow flags
     dsb(); // clear lands before enable
@@ -3291,9 +3337,15 @@ fn pctr_read_cs_witness(tag: &str) {
     let tmu_miss = mmio_read(V3D_CORE0_BASE, V3D_PCTR_0_PCTR0 + 20); // counter 5
     mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_EN, 0); // stop counting
     dsb();
+    // PI-V3D-39: the RAN/NEVER-RAN verdict keys off counter0 (src14 QPU_ACTIVE_CYCLES_VERTEX_COORD_USER) —
+    // the shader-scoped counter that reads sane every boot. valid_instr(src16) is a RACE-PRONE corroboration
+    // only: the P36 multi-boot capture proved it non-deterministically reads either the true count (~55) or
+    // cycle_count/4+true on the leaking boots (see pctr_setup_cs_witness for the mechanism + mitigation).
     serial_println!(
-        ":: V3D: [v3d21] {} CS-exec proof via PCTR — QPU_ACTIVE_CYCLES_VERTEX_COORD(src14)={} valid_instr(src16)={} cycle_count(src32)={} — SHADER {} ::",
-        tag, coord, vinstr, cycles,
+        ":: V3D: [v3d21] {} CS-exec proof via PCTR — QPU_ACTIVE_CYCLES_VERTEX_COORD(src14)={} valid_instr(src16)={}{} cycle_count(src32)={} — SHADER {} (verdict=src14) ::",
+        tag, coord, vinstr,
+        if vinstr > cycles / 8 { " [race-leak: ~cyc/4, disregard]" } else { "" },
+        cycles,
         if coord != 0 { "RAN" } else { "NEVER RAN" }
     );
     // PI-V3D-33/35: the TMU-issue witness. It only reflects a store when armed around the PROBE bin (tag
