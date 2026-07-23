@@ -1145,7 +1145,7 @@ unsafe fn read_igpu_trace() -> [u32; 11] {
 }
 
 #[cfg(feature = "unaos_ivb")]
-unsafe fn read_gmux_trace() -> [u32; 6] {
+unsafe fn read_gmux_trace() -> [u32; 7] {
     #[cfg(target_arch = "x86_64")]
     unsafe {
         use core::arch::asm;
@@ -1192,17 +1192,29 @@ unsafe fn read_gmux_trace() -> [u32; 6] {
             val as u32
         };
 
+        let index_read32 = |reg: u8| -> u32 {
+            wait_ready();
+            outb(0x7D0, reg);
+            wait_complete();
+            let mut val: u32;
+            unsafe { asm!("in eax, dx", out("eax") val, in("dx") 0x7C2u16, options(nomem, nostack, preserves_flags)); }
+            val
+        };
+
+        let version32 = index_read32(0x04);
+
         [
-            index_read(0x04), // VERSION_MAJOR
-            index_read(0x05), // VERSION_MINOR
-            index_read(0x06), // VERSION_RELEASE
-            index_read(0x10), // SWITCH_DISPLAY
-            index_read(0x28), // SWITCH_DDC
-            index_read(0x50), // DISCRETE_POWER
+            (version32 >> 24) & 0xFF, // VERSION_MAJOR
+            (version32 >> 16) & 0xFF, // VERSION_MINOR
+            (version32 >> 8) & 0xFF,  // VERSION_RELEASE
+            index_read(0x10),         // SWITCH_DISPLAY
+            index_read(0x28),         // SWITCH_DDC
+            index_read(0x50),         // DISCRETE_POWER
+            index_read32(0x70),       // MAX_BRIGHTNESS
         ]
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
-        [0; 6]
+        [0; 7]
     }
 }

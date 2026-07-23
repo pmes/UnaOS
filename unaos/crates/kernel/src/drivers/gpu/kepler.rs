@@ -264,6 +264,11 @@ pub fn init(gpu: &GpuInfo) {
 
                                     read_sched_status("pre-init");
 
+                                    // Candidate A: USERD_SNOOP (0x2a1c)
+                                    let snoop_orig = mmio_read(bar0, 0x2a1c);
+                                    serial_println!(":: kepler: USERD_SNOOP (0x2a1c) orig={:08X} ::", snoop_orig);
+                                    mmio_write(bar0, 0x2a1c, 1);
+
                                     // 2. Bind and Enable PFIFO_CHAN for all test CHIDs (including 7, since entry_2 == 7)
                                     for ch in [1, 2, 3, 7].iter() {
                                         let offset = *ch as usize * 8;
@@ -278,6 +283,14 @@ pub fn init(gpu: &GpuInfo) {
                                     let ch_1_0_pre = mmio_read(bar0, 0x800000 + (1 * 8));
                                     let ch_1_4_pre = mmio_read(bar0, 0x800004 + (1 * 8));
                                     serial_println!(":: kepler: PFIFO_CHAN[1] pre-submit: 00={:08X} 04={:08X} ::", ch_1_0_pre, ch_1_4_pre);
+                                    
+                                    // Witness check
+                                    if (ch_1_0_pre & 0xC0000000) != 0xC0000000 {
+                                        serial_println!(":: kepler: WITNESS FAILED - bits stripped. Restoring USERD_SNOOP={:08X} ::", snoop_orig);
+                                        mmio_write(bar0, 0x2a1c, snoop_orig);
+                                    } else {
+                                        serial_println!(":: kepler: WITNESS PASSED - bits stuck! ::");
+                                    }
 
                                     // 3. Submit Runlist
                                     mmio_write(bar0, 0x2270, (runlist_off as u32) >> 12); // target=0 (VRAM), addr
