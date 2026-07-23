@@ -117,6 +117,19 @@ struct SdCard {
 }
 static CARD: Mutex<Option<SdCard>> = Mutex::new(None);
 
+/// PI-FS-2: the identified microSD card's block count, or `None` until [`probe`] succeeds.
+///
+/// Read-only geometry source for the unafs mount. The SD-backed volume must be *sized* by the SD
+/// itself, never by whatever the shared `block::BLOCK_DEVICE` global happens to hold: a USB
+/// mass-storage enumeration overwrites that global with the stick's geometry (see
+/// `drivers::xhci` storage bring-up), so a mount that read its bound from the global would guard
+/// the SD's own reads against a foreign device's block count. Since `read_block_512` already
+/// serves SD data whenever the SD backend is active, its size guard must come from the same card
+/// — this accessor is that source.
+pub fn card_num_blocks() -> Option<u64> {
+    CARD.lock().as_ref().map(|c| c.num_blocks)
+}
+
 #[inline]
 fn read32(base: usize, off: usize) -> u32 {
     unsafe { core::ptr::read_volatile((base + off) as *const u32) }
