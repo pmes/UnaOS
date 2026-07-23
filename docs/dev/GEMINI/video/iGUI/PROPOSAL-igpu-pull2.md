@@ -1,6 +1,16 @@
 # PROPOSAL — iGPU Pull 2: Scanout Teardown Hunt
 
-STATUS: APPROVED WITH AMENDMENTS (2026-07-22 — trace design, register list,
+STATUS: LANDED df4fe972 + eb183393 (2026-07-22 — A1/A2 honored (boot-info
+carry, feature-gated, three-point table printed by igpu.rs). Land-review
+caught and fixed inline (eb183393): NOTHING armed `unaos_ivb` — arroyo and
+builder mapped UNAOS_IVB only to intel-ivb, so bootloader traces + kernel
+handoff would have silently cfg'd out (boot-1 failure class); the builder now
+arms the bootloader side too because the cfg'd BootInfo fields are a shared
+ABI both binaries must agree on; the BootInfo initializer was missing the new
+fields (bootloader had never compiled with its own feature); kernel handoff
+needed an x86-only arch gate. Full-knob gates green; strings-proven in BOTH
+kernel.elf and BOOTX64.EFI; default QEMU suite green. Metal owed: sitting #7.)
+Prior: APPROVED WITH AMENDMENTS (2026-07-22 — trace design, register list,
 and suspect list are all good. Two binding amendments:
 A1 — OUTPUT PATH IS WRONG FOR THIS MACHINE: the 2012 rMBP has no legacy
 16550 at 0x3F8 — our own kernel serial.rs probes it with a loopback self-test

@@ -1,4 +1,8 @@
-STATUS: APPROVED WITH AMENDMENTS (2026-07-22 — reviewer re-verified the two
+STATUS: LANDED 34aa12cd + eb183393 (2026-07-22 — ORDER 511→9, chan_id 0→1
+labeled, post-bind PLAYLIST_RD/LEN poll + breadcrumb per A3, igpu probe
+dedup guard; stale cleanroom item correctly dropped per A2. Gates green,
+strings-proven. Metal owed: sitting #7.)
+Prior: APPROVED WITH AMENDMENTS (2026-07-22 — reviewer re-verified the two
 load-bearing citations against envytools master: IB_CONFIG 0x4C =
 ADDRESS_HIGH 0-7 / UNK8 8-15 / ORDER 16-31 ✓; PLAYLIST_WR_LEN LEN 0-11 +
 ENG 20-23 GK104- ✓. The ORDER=511 find is the strongest candidate we've had:
