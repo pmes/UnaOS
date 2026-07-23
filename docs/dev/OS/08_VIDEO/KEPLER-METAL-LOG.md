@@ -17,6 +17,15 @@ boot.)
   **no scanout engine on either GPU is lit at ANY observed point**, while the
   GOP fb at 0x90020000 accepts writes. Display strategy remains open — next
   question is who CAN light a pipe, and what the gmux muxes.
+- **CF8-failed-read caveat REFUTED (canon upgrade):** the DP_A row reads
+  `0x0000001C | 0x0000001C | 0x0000001C` — nonzero and stable across all
+  three points while every pipe/plane row is zero. The bootloader's reads are
+  live (a failed read would have zeroed DP_A too). All-three-points-dead is
+  REAL. Since the GOP text console is visibly scanned during Option-boot,
+  either (a) firmware tears scanout down BEFORE our Point-1 read (Point-1 is
+  later in the boot than assumed), or (b) scanout state on these parts lives
+  in registers other than the ones decoded. Pull-3 brief targets the split:
+  Point-0 at bootloader entry + gmux status readback.
 
 **Boot 2 (all five knobs) — "hard hang" RETRACTED, was SLOW:** full output
 landed ~6-7 min in; culprit = unbounded instrumentation polls (10M-read fence
