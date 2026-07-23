@@ -489,6 +489,41 @@
     `SYS_INPUT_POLL`, drawing/responding to input — the last delivery gap in the EL0-vug ladder.
     Lane: `main.rs` (the router branch + `route_input_to_active_el0` + `input_router_selftest`) + the
     `run_user_image` focus-registration call site in `arch/aarch64/syscall.rs` + this doc.
+- **UVUG-3 (landed 2026-07-23)** — the mini-vug becomes the first **interactive** EL0 application. `crates/user-uvug`
+  is rewritten from the UVUG-1 animated gradient into a real **vug-style wireframe quartz crystal**: the Q16.16
+  fixed-point sin table, rotation (yaw-then-pitch), and the 14-vertex elongated hexagonal bipyramid are
+  reimplemented in the user crate from the kernel `vug.rs` geometry (integer math, no float), projected
+  screen-space to the surface and drawn as 30 Bresenham edges. **Surface size:** SYS_FB_MAP exposes exactly one
+  page (32×32 ARGB8888 — `boot::FB_SURFACE_W`/`FB_REGION_SIZE`, out of this lane), so the crystal is scaled to
+  32×32; the brief's "e.g. 256×256" is capped there until the kernel FB region grows. The two persistent worker
+  threads (one co-located, one sibling-core) keep the ELF-3 futex frame barrier, but now each **rasterises its
+  half** of the surface (worker A rows 0..16, B rows 16..32): it clears its band and draws every crystal edge
+  clipped to its band from the shared projected-vertex arrays the parent publishes each frame (release/acquire
+  on the `phase` word carries the `PX`/`PY` writes). Input folds into the parent's per-frame state exactly like
+  kernel game-mode: **SYS_INPUT_POLL** is drained each frame; WASD/arrows are TRUE held-state (KeyDown sets a
+  movement bit, KeyUp clears it) driving yaw/pitch, Q/E zoom the camera distance, a mouse drag (Button-press →
+  MouseRel while held → Button-release) rotates, and a click or ESC exits cleanly (workers signalled via a
+  `PHASE_EXIT` sentinel, both joined, exit 0). **Dual-path (the UVUG-3 crux):** if NO input event arrives within
+  the first `DETECT_FRAMES` (60) frames — always true under QEMU raspi4b, which has no USB HID — the program
+  COMMITS to the deterministic auto path: it keeps the fixed idle tumble it ran from frame 0 (yaw += 3, pitch +=
+  1 brad/frame), runs to `AUTO_FRAMES` = 300 total, FNV-1a-checksums the final surface, and prints the **unchanged
+  witness** `:: UVUG: frames=300 threads=2 checksum=<hex> ::` before exiting 0 (the checksum is a pure function
+  of the frame-300 geometry, so it is deterministic and thread-interleaving-independent). The interactive path is
+  metal-only, runs until an exit event (bounded by `INTERACTIVE_CAP` = 36000 frames), and prints
+  `:: UVUG: interactive exit=<key|click> frames=<n> ::`. The program is now written in Rust (a tiny `_start` in
+  `.text.entry` + the worker entry, syscalls via inline-asm helpers) rather than a single asm stream, staying
+  position-independent (relocation-model=static → adrp/add, **zero relocations** in the linked image; verified)
+  and fitting the 16 KiB window (12568-byte ELF, two PT_LOAD segments, per-segment W^X). QEMU-verified
+  (`UNAOS_V3D=1 UNAOS_GENET=1 UNAOS_PIUSB=1 ./arroyo kernel8-test`, and again with `UNAOS_VUGPAR=1`; reproducible):
+  `:: UVUG: frames=300 threads=2 checksum=0x48221e4101db3924 ::` then `:: EXEC-UVUG: run /fat/UVUG.ELF — loaded
+  12568 bytes, entry 0x270000, exit=0 -> PASS ::`, with the whole prior battery (CAPSTONE 6/6, EXEC1, ELF-2
+  threads, ELF-3 fb, ELF-5/INPUT-WIRE input router+drain) byte-equivalent. The auto checksum is a NEW deterministic
+  value (0x48221e4101db3924, vs UVUG-1's gradient 0x0313e510f24daae5 — the rendered content changed from gradient
+  to wireframe). **Metal is where the interactive path lights up:** at the panel, `run /fat/UVUG.ELF` now shows a
+  rotating wireframe crystal (via the UVUG-2 present hook) that the operator drives with WASD/arrows/Q/E and the
+  mouse, exiting on a click or ESC — the `:: UVUG: interactive exit=… ::` line is the metal-only witness. Lane:
+  `crates/user-uvug` only (no kernel/syscall/boot/arroyo change — same crate, linker script, and build/stage
+  path) + this doc.
 - Not yet: **revocation trees** (a derived copy — re-grant or onward re-transfer — escapes
   single-level revoke today; derivation records + `CAP_REVOKE` are that arc), the **bandy Ring-3
   delegation wrapper**, `File` transfer (descriptor migration), real `Socket` fs/net syscalls.
