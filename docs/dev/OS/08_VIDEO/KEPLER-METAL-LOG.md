@@ -3,7 +3,39 @@
 Hard-won silicon facts from the fox-metal sitting series. Trust these over any
 QEMU behavior. Newest sitting first.
 
-## Sitting #6 (igpu pull 1 + kepler pull 7, UnaOS-gemini@8105f73c, 2026-07-22, fox-metal-r23s1h) — IN PROGRESS
+## Sitting #7 (igpu pull 2 + kepler pull 8, UnaOS-gemini@7014b022→94b0ed0c, 2026-07-22, fox-metal-r23s1h) — COMPLETE
+
+**Boot 1 (teardown hunt):** three-point trace ran; verdict **ALL THREE POINTS
+DEAD** — iGPU pipes/planes/DP_A read disabled even PRE-ExitBootServices.
+Firmware never lights iGPU scanout at any stage we can see. (Filter lesson:
+the rows carried no "igpu" substring and were initially reported missing;
+rows now carry the `:: igpu:` prefix. Residual caveat: an all-zero trace was
+also the failed-BAR0-read signature; the bootloader helper now returns the
+`0xBAD0BA20` sentinel on a failed read, so the ambiguity dies with the next
+boot.)
+- Combined with #5 (Kepler heads dead) and #6 (iGPU dark at kernel time):
+  **no scanout engine on either GPU is lit at ANY observed point**, while the
+  GOP fb at 0x90020000 accepts writes. Display strategy remains open — next
+  question is who CAN light a pipe, and what the gmux muxes.
+
+**Boot 2 (all five knobs) — "hard hang" RETRACTED, was SLOW:** full output
+landed ~6-7 min in; culprit = unbounded instrumentation polls (10M-read fence
+poll through BAR1 + takeover retries), not a wedge. Fixed post-sitting: fence
+poll bounded 500k, acceptance poll 100k, and GPU init moved AFTER xHCI so any
+future GPU wedge prints breadcrumbs instead of pre-serial silence (bench
+serial is the usbdebug FTDI behind xHCI — structural blind spot removed).
+
+**Kepler wall-2:** the ORDER defect was REAL and is FIXED on silicon —
+`inst-raw 4C=0x00090000` (was 0x01FF0000; log2(512)=9 took). But **REFUTED as
+the bind wall**: post-bind `playlist_rd=0x2013 len=0x100001` (runlist read),
+yet all three PBDMAs still `ch=0 ACTIVE=0 ib=0/0`, `gp_get=0`,
+fence-timeout, `ch_stat=0x11000001`. The channel is never scheduled onto any
+PBDMA. Pull-9 target: runlist entry format/ID encoding, RAMFC fields the
+scheduler validates, submit-vs-enable ordering, which-runlist.
+
+Capture: `~/unaos-bench/capture/rmbp-r23s6/` + MANIFEST rows.
+
+## Sitting #6 (igpu pull 1 + kepler pull 7, UnaOS-gemini@8105f73c, 2026-07-22, fox-metal-r23s1h) — superseded notes below (boots 1/1b/2b)
 
 **Boot 1 (8f7aaa6e media) — WASTED, defect ours:** the staged kernel carried no
 probe. Builder lacked the `UNAOS_IVB` env→feature mapping AND igpu.rs had never

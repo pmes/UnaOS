@@ -305,7 +305,10 @@ pub fn init(gpu: &GpuInfo) {
                                     // Poll VRAM for fence value
                                     serial_println!("[NVIDIA] Polling for fence value 0x{:08X} at VRAM offset 0x{:X}", fence_val, fence_off);
                                     let mut found = false;
-                                    for _ in 0..10_000_000 {
+                                    // Bounded at 500k VRAM reads: a landed fence shows within
+                                    // thousands of polls; 10M BAR1 reads was the sitting-#7
+                                    // "hang" (~6-7 min of silence before the abort lines).
+                                    for _ in 0..500_000 {
                                         let val = unsafe { core::ptr::read_volatile((bar1 + fence_off) as *const u32) };
                                         if val == fence_val {
                                             found = true;

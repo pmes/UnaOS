@@ -1108,7 +1108,9 @@ unsafe fn read_igpu_trace() -> [u32; 8] {
         outl(0xCF8, 0x80001010);
         let bar0 = inl(0xCFC) & 0xFFFFFFF0;
         if bar0 == 0 || bar0 == 0xFFFFFFF0 {
-            return [0; 8];
+            // Sentinel, NOT zeros: an all-zero trace is also a legitimate all-dark reading,
+            // so a failed BAR0 read must be unmistakable in the serial table.
+            return [0xBAD0BA20; 8];
         }
         
         let read_mmio = |offset: u32| -> u32 {
