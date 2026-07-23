@@ -256,16 +256,59 @@ static CPU_IDLE: [AtomicU64; NUM_CPUS] = [const { AtomicU64::new(0) }; NUM_CPUS]
 // per-core SEQLOCK so a cross-core reader never observes a torn id/name/len triple. Introspection
 // only: `core_load` and the witnesses NEVER run on a scheduling decision path.
 //
-// AGING-CLOCK NOTE (same reasoning as `AGE_TICKS`): the "window" is measured in DISPATCH PASSES, not
-// timer ticks, because the aarch64 cooperative paths (and QEMU raspi4b) have no live periodic tick.
-// A pass is a `dispatch_next` call; it is BUSY if a task was dispatched, IDLE if the queue was empty.
-// So `busy_pct_recent` is "fraction of the last WINDOW passes that dispatched work" — a live activity
-// proxy that advances on every path (cooperative and preemptive, QEMU and metal).
+// SCHED-5 — TIME, NOT PASSES. `busy_pct_recent` was originally "fraction of the last WINDOW dispatch
+// PASSES that dispatched work". That counts scheduler activity, not CPU time: a task that wakes once
+// per 4 ms tick, runs for microseconds, then blocks looks 50% "loaded" (one busy pass, one idle pass
+// per tick) while consuming almost no CPU — it cannot tell a busy-loop apart from a bare cadence, and
+// it misled a whole downstream arc (NET-19 was briefed off a spurious `c1=50%`). SCHED-5 makes the
+// metric time-based: it measures the CYCLES (free-running CNTPCT, see `now_cyc`) this core spends
+// EXECUTING tasks vs sitting IDLE (WFI / empty-queue), and reports the busy time fraction over a
+// rolling ~250 ms window. The counter is read only at the dispatch entry/exit boundary (around
+// `switch_context`) and at the idle WFI in `run()` — no per-instruction cost. CNTPCT (unlike the
+// Group-1 timer IRQ, which QEMU withholds) is always running, so the accounting advances on every
+// path — cooperative and preemptive, QEMU and metal. The LINE FORMAT is unchanged
+// (`SCHED: load cN=..%`); only the meaning of the percentage moves from pass-fraction to time-fraction.
 
-/// Rolling-window size, in dispatch passes, over which `busy_pct_recent` is computed. A completed
-/// window snapshots its busy fraction and resets, so the reported percentage tracks recent activity
-/// rather than the since-boot average. 64 passes keeps the read live without storing per-pass history.
-const LOAD_WINDOW: u32 = 64;
+/// Rolling-window size, in CNTPCT cycles, over which `busy_pct_recent` is computed. A completed window
+/// (busy+idle cycles reaching this budget) snapshots its busy TIME fraction and resets, so the reported
+/// percentage tracks recent utilization rather than the since-boot average. Derived from the counter
+/// frequency (`CNTFRQ_EL0`) as ~250 ms, so the window is a fixed wall-clock span on any board (the
+/// frequency differs — ~54 MHz on the BCM2711, ~62.5 MHz on QEMU virt — but the percentage is a ratio,
+/// so only the smoothing span is frequency-derived, never the value).
+static CNTFRQ_HZ: AtomicU64 = AtomicU64::new(0);
+
+/// Free-running system counter (CNTPCT_EL0) — the time base for time-based load accounting. Mirrors
+/// genet.rs's `now_cyc` probe but kept self-contained here (the scheduler pulls in no net code). A
+/// single non-trapping EL2/EL1 sysreg read; NOT CPU clock cycles (CNTPCT is a fixed-frequency counter),
+/// but a stable monotonic tick that is ALWAYS advancing, so it works even where the timer IRQ does not.
+#[inline]
+fn now_cyc() -> u64 {
+    let cnt: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, cntpct_el0", out(reg) cnt, options(nomem, nostack, preserves_flags));
+    }
+    cnt
+}
+
+/// The load window budget in CNTPCT cycles (~250 ms). Reads `CNTFRQ_EL0` once and caches it (some
+/// firmwares report it per-boot but not per-pass-cheap, so cache to keep the accounting fold O(1)).
+/// Falls back to a nominal 54 MHz if firmware leaves CNTFRQ_EL0 at 0 (only affects the smoothing span).
+#[inline]
+fn load_window_cyc() -> u64 {
+    let f = CNTFRQ_HZ.load(Ordering::Relaxed);
+    let frq = if f != 0 {
+        f
+    } else {
+        let v: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, cntfrq_el0", out(reg) v, options(nomem, nostack, preserves_flags));
+        }
+        let v = if v == 0 { 54_000_000 } else { v };
+        CNTFRQ_HZ.store(v, Ordering::Relaxed);
+        v
+    };
+    frq / 4
+}
 
 /// Sentinel `recent_pct` meaning "no window has completed yet" (fall back to the partial window).
 const LOAD_PCT_NONE: u32 = u32::MAX;
@@ -276,10 +319,11 @@ const LOAD_PCT_NONE: u32 = u32::MAX;
 struct CoreAccount {
     /// Cumulative context switches INTO a task on this core (one per busy dispatch).
     ctx_switches: AtomicU64,
-    /// Busy passes accrued in the CURRENT (incomplete) window.
-    win_busy: AtomicU32,
-    /// Total passes accrued in the current window (rolls over at `LOAD_WINDOW`).
-    win_total: AtomicU32,
+    /// SCHED-5 — CNTPCT cycles spent EXECUTING tasks in the CURRENT (incomplete) window.
+    win_busy_cyc: AtomicU64,
+    /// SCHED-5 — CNTPCT cycles spent IDLE (WFI / empty queue) in the current window. The window rolls
+    /// over when `win_busy_cyc + win_idle_cyc` reaches `load_window_cyc()`.
+    win_idle_cyc: AtomicU64,
     /// Busy percent (0..=100) of the last COMPLETED window, or `LOAD_PCT_NONE` before the first.
     recent_pct: AtomicU32,
     /// Seqlock sequence for the last-task triple: even = stable, odd = write in progress.
@@ -297,8 +341,8 @@ impl CoreAccount {
     const fn new() -> Self {
         CoreAccount {
             ctx_switches: AtomicU64::new(0),
-            win_busy: AtomicU32::new(0),
-            win_total: AtomicU32::new(0),
+            win_busy_cyc: AtomicU64::new(0),
+            win_idle_cyc: AtomicU64::new(0),
             recent_pct: AtomicU32::new(LOAD_PCT_NONE),
             last_seq: AtomicU64::new(0),
             last_id: AtomicU64::new(0),
@@ -307,19 +351,23 @@ impl CoreAccount {
         }
     }
 
-    /// Fold one pass into the rolling window (single-writer, owning core). `busy` = a task was
-    /// dispatched this pass. On window completion, snapshot the busy percent and reset the accumulators.
+    /// SCHED-5 — fold a measured span into the rolling window (single-writer, owning core). Exactly one
+    /// of `busy_cyc` / `idle_cyc` is non-zero per call: `account(delta, 0)` after a task's execution
+    /// span (around `switch_context`), `account(0, delta)` after an idle WFI. On window completion
+    /// (busy+idle cycles reaching the ~250 ms budget) it snapshots the busy TIME fraction and resets.
+    /// Relaxed loads/stores are sound because only this core's scheduler loop ever writes its slot.
     #[inline]
-    fn sample(&self, busy: bool) {
-        let total = self.win_total.load(Ordering::Relaxed) + 1;
-        let busyc = self.win_busy.load(Ordering::Relaxed) + busy as u32;
-        if total >= LOAD_WINDOW {
-            self.recent_pct.store(busyc * 100 / total, Ordering::Relaxed);
-            self.win_total.store(0, Ordering::Relaxed);
-            self.win_busy.store(0, Ordering::Relaxed);
+    fn account(&self, busy_cyc: u64, idle_cyc: u64) {
+        let busy = self.win_busy_cyc.load(Ordering::Relaxed) + busy_cyc;
+        let idle = self.win_idle_cyc.load(Ordering::Relaxed) + idle_cyc;
+        let total = busy + idle;
+        if total >= load_window_cyc() {
+            self.recent_pct.store((busy * 100 / total) as u32, Ordering::Relaxed); // total>=budget>0
+            self.win_busy_cyc.store(0, Ordering::Relaxed);
+            self.win_idle_cyc.store(0, Ordering::Relaxed);
         } else {
-            self.win_total.store(total, Ordering::Relaxed);
-            self.win_busy.store(busyc, Ordering::Relaxed);
+            self.win_busy_cyc.store(busy, Ordering::Relaxed);
+            self.win_idle_cyc.store(idle, Ordering::Relaxed);
         }
     }
 
@@ -343,11 +391,12 @@ impl CoreAccount {
         if recent != LOAD_PCT_NONE {
             return recent;
         }
-        let total = self.win_total.load(Ordering::Relaxed);
+        let busy = self.win_busy_cyc.load(Ordering::Relaxed);
+        let total = busy + self.win_idle_cyc.load(Ordering::Relaxed);
         if total == 0 {
             0
         } else {
-            self.win_busy.load(Ordering::Relaxed) * 100 / total
+            (busy * 100 / total) as u32
         }
     }
 
@@ -385,7 +434,9 @@ static ACCT: [CoreAccount; NUM_CPUS] = [const { CoreAccount::new() }; NUM_CPUS];
 /// A snapshot of one core's live scheduler load (SCHED-2). Returned by `core_load`; consumed by the
 /// `top` shell verb and the load witnesses. All fields are a point-in-time read — introspection only.
 pub struct CoreLoad {
-    /// Busy fraction (0..=100) over the most recent `LOAD_WINDOW` dispatch passes.
+    /// SCHED-5 — busy TIME fraction (0..=100): CNTPCT cycles spent executing tasks over the most recent
+    /// ~250 ms window (was, pre-SCHED-5, the fraction of dispatch PASSES that ran work — a cadence proxy
+    /// that read ~50% for a task waking once per tick; now it is real CPU utilization).
     pub busy_pct_recent: u32,
     /// Cumulative context switches into a task on this core since boot.
     pub ctx_switches: u64,
@@ -1190,15 +1241,16 @@ fn dispatch_next(cpu: usize) -> bool {
     };
     let Some(task) = next else {
         CPU_IDLE[cpu].fetch_add(1, Ordering::Relaxed); // M3b CPU-pulse meter (introspection)
-        ACCT[cpu].sample(false); // SCHED-2: idle pass (no task dispatched this window slot)
+        // SCHED-5: idle TIME is measured at the WFI in `run()` (the span the core actually sleeps), not
+        // here — this empty pass itself takes negligible time and returns straight to the idle loop.
         unmask_irq();
         return false;
     };
     CPU_BUSY[cpu].fetch_add(1, Ordering::Relaxed); // M3b CPU-pulse meter (introspection)
-    // SCHED-2: busy pass — one context switch into a task; record it + the last-task identity for the
-    // rolling-window load view. Single-writer (this core), relaxed; no lock added to the switch path.
+    // SCHED-2/SCHED-5: busy dispatch — one context switch into a task; record it + the last-task
+    // identity. The task's EXECUTION TIME is folded into the window AFTER `switch_context` returns
+    // (below), when the elapsed CNTPCT span is known. Single-writer (this core), relaxed; no lock added.
     ACCT[cpu].ctx_switches.fetch_add(1, Ordering::Relaxed);
-    ACCT[cpu].sample(true);
     ACCT[cpu].note_last(task.id, task.name);
     task.state.store(STATE_RUNNING, Ordering::Release);
     SCHED[cpu].quantum.store(QUANTUM_TICKS, Ordering::Relaxed);
@@ -1228,14 +1280,21 @@ fn dispatch_next(cpu: usize) -> bool {
             }
         }
     }
+    // SCHED-5: bracket the task's execution with a CNTPCT read. The span from here to the switch-back
+    // is exactly the wall-clock time this core spent running the dispatched task (plus any IRQ handling
+    // that fired while it ran) — the "busy" time for time-based load accounting. Two sysreg reads per
+    // dispatch, off the per-instruction path.
+    let busy_t0 = now_cyc();
     unsafe {
         switch_context(SCHED[cpu].scheduler_sp.as_ptr(), entry_sp);
     }
+    let busy_cyc = now_cyc().wrapping_sub(busy_t0);
     // The switch-back always lands IRQ-masked (yield_now/exit mask first; timer_preempt runs in the
     // auto-masked IRQ handler), so the Box reclaim below can't race a re-entrant preempt on this
     // core. Re-assert the mask explicitly so that safety doesn't rest on an inherited DAIF that a
     // future switch-in path could leave enabled.
     mask_irq();
+    ACCT[cpu].account(busy_cyc, 0); // fold this task's execution span into the rolling load window
     SCHED[cpu].current.store(0, Ordering::Release);
     // Consume the park action exactly once: read it and immediately reset to NONE, so a stale action
     // can never leak into the next task's switch-back. Only a task that switched back BLOCKED carries
@@ -1363,7 +1422,12 @@ fn run(cpu: usize) -> ! {
         mask_irq();
         drain_due_sleepers(cpu);
         if !dispatch_next(cpu) {
+            // SCHED-5: this is where an idle core actually spends time — WFI parks it until the next
+            // tick/IPI (metal) or a light poll-spin (QEMU, no Group-1 timer). Bracket that span with a
+            // CNTPCT read and fold it in as IDLE time, so a core that mostly sleeps reports near 0%.
+            let idle_t0 = now_cyc();
             crate::arch::hlt();
+            ACCT[cpu].account(0, now_cyc().wrapping_sub(idle_t0));
         }
     }
 }

@@ -72,12 +72,23 @@ already running, adding no new lock to the scheduler hot path and no cross-core
 contention. Each `dispatch_next` pass folds one sample into the core's slot:
 a **busy** pass (a task was dispatched) or an **idle** pass (empty run queue).
 
-- **Rolling-window busy fraction.** Samples accumulate over `LOAD_WINDOW = 64`
-  dispatch passes; on window completion the busy percent is snapshotted and the
-  accumulators reset, so `busy_pct_recent` tracks *recent* activity rather than
-  the since-boot average. The window is measured in **dispatch passes, not timer
-  ticks** — same reasoning as priority aging (`AGE_TICKS`): the cooperative paths
-  and QEMU raspi4b have no live periodic tick, and a pass advances on every path.
+- **Rolling-window busy fraction — TIME, not passes (SCHED-5).** `busy_pct_recent`
+  is the fraction of **CPU time** this core spent executing tasks over a rolling
+  **~250 ms** window. It measures CNTPCT (free-running system counter) cycles spent
+  running tasks — bracketed around `switch_context` in `dispatch_next` — versus
+  cycles spent idle (the WFI / poll-spin in `run()`); when their sum reaches the
+  window budget (derived from `CNTFRQ_EL0`) the busy time fraction is snapshotted
+  and the accumulators reset. This replaced the original **dispatch-pass** counting,
+  which measured scheduler *activity*, not time: a task waking once per 4 ms tick and
+  running for microseconds read ~50% "load" (one busy pass, one idle pass per tick)
+  while consuming almost no CPU, and could not tell a busy-loop from a bare cadence
+  (it misled the NET-19 arc off a spurious `c1=50%`). CNTPCT is chosen because it is
+  always running even where the Group-1 timer IRQ is withheld (QEMU raspi4b), so the
+  accounting advances on every path — cooperative and preemptive, QEMU and metal.
+  The counter is read only at the dispatch entry/exit boundary and the idle WFI, so
+  there is no per-instruction cost. The `SCHED: load cN=..%` line format is
+  unchanged; only the meaning of the percentage moved from pass-fraction to
+  time-fraction (idle cores now report near 0%, a continuously-running core ~100%).
 - **Context-switch count.** A cumulative `ctx_switches` per core (one per busy
   dispatch).
 - **Last-scheduled task.** Id + `&'static str` name of the last task dispatched
