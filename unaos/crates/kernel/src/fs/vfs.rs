@@ -450,12 +450,13 @@ impl FatBackend {
         }
     }
 
-    /// VFS-3: is this a read-only mount? A non-`Default` source (the USB stick)
-    /// cannot be written through the block layer (PIUSB-27), so the adapter
-    /// refuses writes at the VFS layer to give a clean [`VfsError::Unsupported`].
+    /// VFS-3/USB-WRITE: is this a read-only mount? Every current source has a
+    /// verified write path (`Default` = SD, `Usb` = BOT WRITE(10) with the
+    /// MISSION RMW+restore witness), so no mount is read-only by construction
+    /// today; a future source without a verified write path returns true here.
     #[cfg(target_arch = "aarch64")]
     fn read_only(&self) -> bool {
-        self.source != crate::fs::fat::BlockSource::Default
+        false
     }
 
     /// Resolve a volume-relative path to its FAT directory entry by walking the

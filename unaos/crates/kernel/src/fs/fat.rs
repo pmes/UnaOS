@@ -561,16 +561,15 @@ fn read_sector(source: BlockSource, lba: u64, buf: &mut [u8; SECTOR_SIZE]) -> Re
 /// U9: write one full 512-byte sector at absolute `lba` from `buf`. The write half of `read_sector`; the
 /// caller supplies a whole sector (a read-modify-write already merged the changed bytes). Any block error
 /// is `FatError::Io`. Used ONLY by `write_at`, which passes only LBAs it walked out of an existing chain.
-/// PIUSB-27: a `Usb`-sourced volume is read-only — the write is REFUSED (`FatError::Io`) so a mounted USB
-/// stick can never be written through the FAT layer, at any call site, by construction.
+/// USB-WRITE (supersedes PIUSB-27's blanket refusal): a `Usb`-sourced volume routes to the verified
+/// BOT WRITE(10) path (`write_block_usb`, MISSION-gated with an RMW+restore witness); any source
+/// without a verified write path would still be refused here.
 fn write_sector(source: BlockSource, lba: u64, buf: &[u8; SECTOR_SIZE]) -> Result<(), FatError> {
-    if source != BlockSource::Default {
-        return Err(FatError::Io); // read-only source: never write
-    }
-    match crate::drivers::block::write_block(lba, buf) {
-        Ok(()) => Ok(()),
-        Err(_) => Err(FatError::Io),
-    }
+    let r = match source {
+        BlockSource::Default => crate::drivers::block::write_block(lba, buf),
+        BlockSource::Usb => crate::drivers::block::write_block_usb(lba, buf),
+    };
+    r.map_err(|_| FatError::Io)
 }
 
 /// F2 (SMP-hardening): the FAT-table mutation lock. Serializes the read-modify-write of a FAT sector so two
