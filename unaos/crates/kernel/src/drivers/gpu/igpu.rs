@@ -108,16 +108,19 @@ unsafe fn dump_pipe(bar0: usize, name: char, conf_reg: usize, src_reg: usize) {
 unsafe fn dump_plane(bar0: usize, name: char, cntr_reg: usize, surf_reg: usize, stride_reg: usize, linoff_reg: usize, tileoff_reg: usize) -> Option<u32> {
     let cntr = mmio_read(bar0, cntr_reg);
     let enabled = (cntr & (1 << 31)) != 0;
+    let format = (cntr >> 26) & 0xF;
+    let tiled = (cntr & (1 << 10)) != 0;
     let surf = mmio_read(bar0, surf_reg);
     let stride = mmio_read(bar0, stride_reg);
     let linoff = mmio_read(bar0, linoff_reg);
     let tileoff = mmio_read(bar0, tileoff_reg);
 
-    serial_println!("[Intel iGPU] Plane {}: CNTR=0x{:08X} (Enabled: {})", name, cntr, enabled);
+    serial_println!("[Intel iGPU] Plane {}: CNTR=0x{:08X} (Enabled: {}, Format: 0x{:X}, Tiled: {})", name, cntr, enabled, format, tiled);
     serial_println!("[Intel iGPU] Plane {}: SURF=0x{:08X}, STRIDE=0x{:08X}, LINOFF=0x{:08X}, TILEOFF=0x{:08X}", 
         name, surf, stride, linoff, tileoff);
-
+    
     if enabled {
+        serial_println!(":: igpu: FOX CROSS-CHECK - If Plane {} is enabled here but panel goes black, handoff/bootchain is the cause, not hardware! ::", name);
         Some(surf)
     } else {
         None
