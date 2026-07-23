@@ -311,28 +311,21 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         #[cfg(feature = "piinstall")]
         unaos_kernel::install::pi::run();
 
-        // PIUSB-29: USB bring-up is OFF the boot-critical path. `piusb::bringup` (pre-heap, in
-        // build_boot_info) now only stashes the DTB; the entire cost — the brcmstb RC reset/PERST/CNR
-        // settle AND `enumerate`'s bounded polled walk (rings/interrupter, RS=1, port/HID/storage
-        // enumeration) — runs inside `piusb::bringup_task`, spawned onto a secondary core here so the
-        // boot core proceeds straight to the GUI/panel instead of freezing at the square for seconds.
-        // Nothing below needs USB done: the GUI needs nothing from it, keyboard/mouse arrive via the
-        // late-tolerant input_service, and storage mounts on PIUSB-28's ready-edge whenever it fires.
-        // The task runs once (RC bring-up → enumerate → exit) and hands steady state to `usb_pump`;
-        // `usb_pump` locks XHCI_CONTROLLER, which stays None until the task publishes it, so its spawn
-        // cannot race the controller appearing late (None-safe by the `if let Some` at every lock site).
-        // Zero-secondary fallback: with no AP to host the task, keep the legacy synchronous bring-up so
-        // a serial-only / single-core boot still enumerates USB (mirrors the GUI-task path's AP guard).
-        // In QEMU raspi4b (no PCIe RC/VL805) both bring-up and enumerate census-skip either way.
+        // PIUSB-30: USB bring-up is OFF the panel-critical path but stays on the BOOT CORE. `piusb::bringup`
+        // (pre-heap, in build_boot_info) only stashes the DTB; the real cost — the brcmstb RC reset/PERST/CNR
+        // settle AND `enumerate`'s bounded polled walk (rings/interrupter, RS=1, port/HID/storage enumeration)
+        // — runs in `piusb::bringup_task(0)`. PIUSB-29 deferred that onto a SECONDARY core via `spawn_auto`;
+        // metal P39 proved that wedges: the RC/VL805 sequence + the VideoCore mailbox singleton it drives are
+        // metal-proven only in the boot core's single-threaded pre-GUI context, and on an AP the task stalled
+        // right after the DTB census (controller never published, `usb_pump` idled forever, no HID). So the
+        // AP placement is retired; the deferred call now runs on the BSP AFTER the GUI/input/render tasks are
+        // spawned (see the `bringup_task(0)` call just before the BSP idles), keeping BOTH the panel-unblock
+        // win (the APs paint while it runs) AND the P38 execution context. HERE we only handle the no-AP /
+        // serial-only fallback that never spawns those GUI tasks: bring USB up synchronously before the shared
+        // BSP loop below polls the controller. In QEMU raspi4b (no PCIe RC/VL805) bringup+enumerate census-skip.
         #[cfg(feature = "piusb")]
         if online.is_empty() {
             unaos_kernel::arch::piusb::bringup_task(0);
-        } else {
-            unaos_kernel::arch::sched::spawn_auto(
-                "piusb-bringup",
-                unaos_kernel::arch::piusb::bringup_task,
-                0,
-            );
         }
 
         // PI-GENET: the BCM2711 on-board Gigabit Ethernet (GENET v5) + smoltcp bind — the Pi's FIRST
@@ -1003,6 +996,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 ":: INPUT on core {} + RENDER on core {} + orphan-reaper load-balanced scheduled (OS on its own scheduler; BSP idle) ::",
                 input_cpu, render_cpu
             );
+            // PIUSB-30: NOW bring USB up — on the BOOT CORE, deferred past the GUI-task spawn above. The
+            // input/render tasks are already live on the APs (the panel is unblocked and painting), so the
+            // brcmstb RC reset/PERST/CNR settle + `enumerate` run here without freezing the panel, yet in
+            // the single-threaded boot-core context the RC/VL805 + VideoCore-mailbox sequence is metal-proven
+            // in (the P38 context). PIUSB-29's `spawn_auto`-onto-an-AP is what wedged on metal P39 (stalled
+            // after the DTB census; controller never published). Runs once, publishes XHCI_CONTROLLER, and
+            // hands steady-state servicing to `usb_pump` (spawned above). QEMU raspi4b census-skips (no RC).
+            #[cfg(feature = "piusb")]
+            unaos_kernel::arch::piusb::bringup_task(0);
             unaos_kernel::arch::hlt_loop();
         }
     }

@@ -6857,6 +6857,33 @@ QEMU exactly as rung 1 does); `./arroyo test-arm 22`, `UNAOS_GICV3=1 ./arroyo te
 22` all unregressed. Positive verification (rings/RS=1, live device enumeration, keyboard armed) is the
 attended Pi sitting — see the rung-2 runbook in `scripts/pi-usb1-bench.md`.
 
+### PIUSB-29 → PIUSB-30 — off the panel-critical path, but ON the boot core
+
+**PIUSB-29** moved the whole bring-up (`bringup_inner`'s brcmstb RC reset/PERST/CNR settle **plus**
+`enumerate`) out of the boot-critical path into `piusb::bringup_task`, spawned via `spawn_auto` onto a
+**secondary core** so `kernel_main` reached the GUI/panel without freezing at the square for seconds.
+
+**Metal P39 (hw-pi4@3329bcfd) regression:** on real BCM2711 silicon the async task **stalled right
+after the DTB census line** — it printed the async-start, `PI-USB-1 bring-up starting`, and `DTB census:
+… proceeding to RC bring-up` witnesses, then produced nothing more; the controller was never published,
+`usb_pump` idled forever (`[piusb26] pump pass … idle controller` repeating), and keyboard/mouse never
+armed. Boot was otherwise healthy. The prior synchronous boot (P38, `45c…`) had working USB. Root cause:
+the RC/VL805 attach + the **VideoCore mailbox singleton** it drives (M2's `NOTIFY_XHCI_RESET`) plus
+`boot::map_device_1gib` are all metal-proven **only in the boot core's single-threaded, pre-GUI context**
+(`map_device_1gib` is even documented "single-threaded boot-time use, pre-SMP, no cross-core BBM
+concern"). Running that sequence on an AP, concurrently with the live GUI/render/input tasks, is not the
+proven context and wedges. QEMU cannot reproduce it (raspi4b models no PCIe RC → the census-skip fires,
+so no real bring-up runs).
+
+**PIUSB-30 fix:** keep the deferral (the panel still unblocks) but retire the AP placement. The
+`spawn_auto`-onto-a-secondary-core call is gone; `bringup_task(0)` now runs **synchronously on the BSP**,
+deferred to just **after** the GUI/input/render tasks are spawned onto the APs and just **before** the BSP
+idles (`hlt_loop`). The APs paint the panel while the boot core does the RC bring-up + enumerate in the
+exact P38 single-threaded context. The no-AP / serial-only fallback still brings USB up synchronously at
+the original site (it never spawns the GUI tasks and falls through to the shared BSP loop). Witnesses
+renamed `piusb30: boot-core bring-up start/done`. Positive verification (rings/RS=1, live enumeration,
+keyboard armed) remains the attended Pi sitting; QEMU proves only non-regression (census-skip both ways).
+
 ## PI-GENET — BCM2711 on-board Gigabit Ethernet (Broadcom GENET v5) + smoltcp bind (Arc PI-GENET)
 
 The Pi's **first network path.** The BCM2711 integrates a Broadcom "GENET" v5 unimac Ethernet

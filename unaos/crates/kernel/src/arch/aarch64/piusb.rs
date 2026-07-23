@@ -688,21 +688,25 @@ pub fn bringup(dtb: u64) {
     PIUSB_DTB.store(dtb, Ordering::Release);
 }
 
-/// PIUSB-29: the async USB bring-up task. Spawned (`spawn_auto`) from `kernel_main` once the secondary
-/// cores are online, so the boot core does NOT block on it. Runs ONCE: RC bring-up (`bringup_inner`,
-/// the brcmstb RC reset/PERST/CNR settle) → `enumerate` (rings + RS=1 + the bounded polled walk) →
-/// exits, leaving steady-state servicing to `usb_pump`. A keyboard/mouse plugged at power-on arms the
-/// same way, just slightly later (the devices do not vanish). Brackets the work with a CNTPCT-derived
-/// millisecond witness so the boot-time win (panel responsive while this runs) is measurable in serial.
+/// PIUSB-30: the deferred USB bring-up, run ONCE on the BOOT CORE (the BSP) from `kernel_main` AFTER the
+/// GUI/input/render tasks are spawned onto the APs — so the panel is already live and painting while this
+/// runs, but the RC/VL805 + VideoCore-mailbox sequence stays in its metal-proven single-threaded boot-core
+/// context (P38). PIUSB-29 deferred this onto a SECONDARY core via `spawn_auto`; metal P39 proved that
+/// wedges (the task stalled right after the DTB census, controller never published) — running RC MMIO +
+/// the mailbox singleton concurrently with the GUI on an AP is not the proven context, so the AP placement
+/// is retired. Runs ONCE: RC bring-up (`bringup_inner`, the brcmstb RC reset/PERST/CNR settle) → `enumerate`
+/// (rings + RS=1 + the bounded polled walk) → returns, leaving steady-state servicing to `usb_pump`. A
+/// keyboard/mouse plugged at power-on arms the same way, just slightly later (the devices do not vanish).
+/// Brackets the work with a CNTPCT-derived millisecond witness so the panel-unblock win is serial-visible.
 pub fn bringup_task(_arg: usize) {
     serial_println!(
-        ":: piusb29: async bring-up start (panel unblocked at {}ms) ::",
+        ":: piusb30: boot-core bring-up start (panel already live on the APs at {}ms) ::",
         ms_now()
     );
     bringup_inner(PIUSB_DTB.load(Ordering::Acquire));
     enumerate();
     serial_println!(
-        ":: piusb29: async bring-up done ({}ms; RC bring-up + enumerate ran off the boot path) ::",
+        ":: piusb30: boot-core bring-up done ({}ms; RC bring-up + enumerate ran on the BSP, off the panel path) ::",
         ms_now()
     );
 }
