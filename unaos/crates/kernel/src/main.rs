@@ -101,7 +101,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     #[cfg(all(feature = "tegra", target_arch = "aarch64"))]
     tegra_early_stop(boot_info);
 
-    #[cfg(feature = "unaos_ivb")]
+    // Gated on intel-ivb + x86_64 too, not just unaos_ivb: drivers::gpu does not exist on
+    // aarch64 (this exact gate was dropped once before and broke the aarch64 check — keep it).
+    #[cfg(all(feature = "unaos_ivb", feature = "intel-ivb", target_arch = "x86_64"))]
     if boot_info.igpu_trace_valid {
         unaos_kernel::drivers::gpu::igpu::set_boot_traces(
             boot_info.igpu_trace_0,
