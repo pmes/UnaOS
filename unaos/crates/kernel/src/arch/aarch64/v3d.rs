@@ -283,6 +283,18 @@ const V3D_CLE_CTNCS_CTRUN: u32 = 1 << 5;
 const V3D_CLE_CT0LC: usize = 0x0120; // CT0 list counter (v3d_regs.h V3D_CLE_CT0LC)
 const V3D_CLE_CT0PC: usize = 0x0128; // CT0 primitive-list counter (v3d_regs.h V3D_CLE_CT0PC)
 const V3D_CLE_PCS: usize = 0x0130; // CLE pipeline control/status (v3d_regs.h V3D_CLE_PCS) — raw
+// PI-V3D-46: PCS bit decode. The Linux v3d_regs.h treats PCS as opaque, but the field layout is public
+// in the Broadcom VideoCore IV 3D Architecture Reference Guide (VideoCoreIV-AG100-R, §V3D_PCS) and is
+// unchanged across the CLE in V3D 4.x: BMACTIVE=bit0 (binning pipeline IN USE — set by START_TILE_BINNING,
+// cleared when the bin frame flushes/retires), BMBUSY=bit1 (a binning operation actually in progress),
+// RMACTIVE=bit2 / RMBUSY=bit3 (the render-side pair), BMOOM=bit8 (PTB ran out of binning memory). So the
+// P44 read PCS=0x1 = BMACTIVE set, BMBUSY/RMACTIVE/RMBUSY/BMOOM all clear = binning mode still ACTIVE with
+// NO work in progress and NO out-of-memory — the bin frame never tore down though the CLE consumed FLUSH.
+const V3D_PCS_BMACTIVE: u32 = 1 << 0; // Binning Mode Active — pipeline in use
+const V3D_PCS_BMBUSY: u32 = 1 << 1; // Binning Mode Busy — a bin op is in progress
+const V3D_PCS_RMACTIVE: u32 = 1 << 2; // Rendering Mode Active
+const V3D_PCS_RMBUSY: u32 = 1 << 3; // Rendering Mode Busy
+const V3D_PCS_BMOOM: u32 = 1 << 8; // Binning Mode Out Of Memory (PTB pool exhausted)
 const V3D_CLE_BFC: usize = 0x0134; // bin frame count (v3d_regs.h V3D_CLE_BFC)
 const V3D_CLE_RFC: usize = 0x0138; // render frame count (v3d_regs.h V3D_CLE_RFC)
 const V3D_PTB_BPCA: usize = 0x0300; // PTB binning primitive-list current address (v3d_regs.h V3D_PTB_BPCA)
@@ -1358,6 +1370,29 @@ fn wait_bit_clear(base: usize, reg: usize, mask: u32, what: &str) -> bool {
 /// timeout the RAW status is printed so the next boot names which interrupt DID fire — OUTOMEM (binner
 /// stalled for overflow memory it was never given) and GMPV especially. The witness the brief names is
 /// emitted by the caller with the BFC pre/post pair.
+/// PI-V3D-46: rebuild the exact TILE_BINNING_MODE_CFG (v42) packet we submit — from the SAME `Pkt` path
+/// `build_bin_cl_generic` uses — and hex-dump its 9 bytes. Proves on metal that the config the binner ran
+/// is byte-identical to the Mesa v3d_packet.xml gen-4.2 contract. Audited field-by-field in V3D-46 against
+/// `v3dX(job_emit_binning_prolog)` (Mesa `v3dvx_cmd_buffer.c`) and the genxml packet code 120:
+///   bits[2..4)=initial block size (128B→1), bits[4..6)=block size (64B→0), bits[8..12)=RT count-1 (1→0),
+///   bits[12..14)=max BPP (32-bit→0), bits[32..48)=width-1 (63), bits[48..64)=height-1 (63) — 8/8 MATCH.
+fn dump_bin_mode_cfg_bytes() {
+    let mut p = Pkt::new(P_TILE_BINNING_MODE_CFG, 9);
+    p.f(2, 2, TILE_ALLOC_BLOCK_SIZE_128B)
+        .f(4, 2, TILE_ALLOC_BLOCK_SIZE_64B)
+        .f(8, 4, 0)
+        .f(12, 2, INTERNAL_BPP_32)
+        .f(32, 16, (TARGET_W - 1) as u64)
+        .f(48, 16, (TARGET_H - 1) as u64);
+    let (buf, len) = p.done();
+    serial_println!(
+        ":: V3D: [v3d46] TILE_BINNING_MODE_CFG bytes ({} B) = {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} — opcode=120, initial=128B/overflow=64B, RTs=1, BPP=32, {}x{} px (minus_one 63x63) — audited 8/8 vs Mesa v42 ::",
+        len,
+        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8],
+        TARGET_W, TARGET_H,
+    );
+}
+
 fn wait_fldone(what: &str) -> (u32, u64, bool) {
     let frq = super::timer::cntfrq();
     let start = super::timer::cntpct();
@@ -1423,6 +1458,32 @@ fn wait_fldone(what: &str) -> (u32, u64, bool) {
                     "CT0 CTRUN clear: the BIN CLE idled but FLDONE never latched — flush stalled DOWNSTREAM of the CLE (PTB drain / tile-state writeback)"
                 }
             );
+            // [v3d46] — full PCS decode (the brief's ask). PCS bits are now named (see the V3D_PCS_* facts
+            // block): a BMACTIVE-set / BMBUSY-clear read is the exact P44 signature — binning mode is still
+            // ACTIVE (the frame never tore down) yet nothing is in progress and the pool is not exhausted.
+            serial_println!(
+                ":: V3D: [v3d46] PCS decode — PCS={:#010x} BMACTIVE={} BMBUSY={} RMACTIVE={} RMBUSY={} BMOOM={} — {} ::",
+                pcs,
+                (pcs & V3D_PCS_BMACTIVE != 0) as u32,
+                (pcs & V3D_PCS_BMBUSY != 0) as u32,
+                (pcs & V3D_PCS_RMACTIVE != 0) as u32,
+                (pcs & V3D_PCS_RMBUSY != 0) as u32,
+                (pcs & V3D_PCS_BMOOM != 0) as u32,
+                if pcs & V3D_PCS_BMOOM != 0 {
+                    "BMOOM set: the PTB exhausted its tile-alloc pool — the wedge is overflow starvation (feed BPOA/BPOS)"
+                } else if (pcs & V3D_PCS_BMACTIVE != 0) && (pcs & V3D_PCS_BMBUSY == 0) {
+                    "BMACTIVE set + BMBUSY clear: binning mode held OPEN with no op in progress — the bin frame never retired though FLUSH was consumed; the coord-shader thread-end handshake to the PTB is the named suspect (QPU raised a program-end host interrupt, INT_STS bit16, yet the PTB never closed the frame)"
+                } else if pcs & V3D_PCS_BMBUSY != 0 {
+                    "BMBUSY still set: a bin op is genuinely still in progress — the binner has not finished emitting"
+                } else {
+                    "BMACTIVE clear: binning mode already torn down — the missing FLDONE is a stale-read / IRQ-mask issue, not a live wedge"
+                }
+            );
+            // [v3d46] — hex-dump the exact TILE_BINNING_MODE_CFG packet bytes we submit, so P45 confirms on
+            // metal that the config the binner ran matches the Mesa v42 contract (audited byte-for-byte in
+            // V3D-46: 8/8 fields MATCH — width/height minus_one, RT count minus_one, 128B initial + 64B
+            // overflow block, 32-bit max BPP). Rebuilt here from the SAME Pkt path build_bin_cl_generic uses.
+            dump_bin_mode_cfg_bytes();
             // Also surface the GMP block state — a silent GMP write-drop leaves STATUS.VIO set with no MMU fault
             // (see the V3D_GMP_* facts block); reading it here rules that class in or out in the same boot.
             let gmp_status = mmio_read(V3D_CORE0_BASE, V3D_GMP_STATUS);

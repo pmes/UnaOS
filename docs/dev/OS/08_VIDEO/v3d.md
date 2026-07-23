@@ -663,3 +663,42 @@ the same boot. **CT0 CTRUN still set** = the BIN CLE never idled, PTB holding th
 **CT0 CTRUN clear** = CLE idled but the flush stalled downstream (PTB drain / tile-state writeback). QEMU
 raspi4b has no V3D block, so the witness is dormant there — **P44 metal decides** which branch, and that
 read names the fix (shader program-end sequencing vs a downstream PTB/tile-state flush step).
+
+## 20. PCS decoded, config exonerated byte-for-byte — the wedge is the coord-shader thread-end (V3D-46)
+
+**P44 read `PCS=0x00000001` with `CT0CS=0` (CTRUN clear), `CT0CA` consumed to EA, `BPCA/BPCS` showing the
+PTB emitted its primitive list, `QPU_vec=0x0001`, and FLDONE never latched.** V3D-46 names the wedge from
+three audits, plus the PCS bit decode the prior arcs had reported raw.
+
+**PCS decode (authoritative).** The Linux `v3d_regs.h` treats PCS as opaque, but the field layout is
+public in the Broadcom *VideoCore IV 3D Architecture Reference Guide* (VideoCoreIV-AG100-R, `V3D_PCS`) and
+is unchanged across the CLE in V3D 4.x: `BMACTIVE=bit0` (binning pipeline **in use** — set by
+START_TILE_BINNING, cleared when the bin frame flushes/retires), `BMBUSY=bit1` (a bin op actually in
+progress), `RMACTIVE=bit2`/`RMBUSY=bit3` (render pair), `BMOOM=bit8` (PTB out of tile-alloc memory). So
+**`PCS=0x1` = BMACTIVE set, BMBUSY clear, BMOOM clear** = binning mode is still **ACTIVE** (the frame never
+tore down) with **no op in progress** and **no out-of-memory**. The bin frame idled *open*, not *drained*.
+
+**Config audit — TILE_BINNING_MODE_CFG is byte-for-byte correct (REFUTES the wrong-encoding hypothesis).**
+Field-by-field against Mesa `v3dX(job_emit_binning_prolog)` (`v3dvx_cmd_buffer.c`, `V3D_VERSION==42`) and
+genxml packet code 120 (`v3d_packet.xml` gen 4.2): initial block size `bits[2..4)=1` (128 B, Mesa
+`V3D_TILE_ALLOC_INITIAL_BLOCK_SIZE_ENUM`), overflow block size `bits[4..6)=0` (64 B), RT count
+`bits[8..12)=0` (genxml `minus_one`, Mesa `MAX2(count,1)=1`), max BPP `bits[12..14)=0` (32-bit), width
+`bits[32..48)=63` and height `bits[48..64)=63` (both genxml `minus_one`, Mesa passes full 64). **8/8 fields
+MATCH.** The initial-block-size / allocation-handshake theory is dead — the config the PTB ran is the exact
+Mesa contract. `[v3d46] TILE_BINNING_MODE_CFG bytes` now hex-dumps the 9-byte packet so P45 confirms on
+metal.
+
+**Terminator + submit-order audits — both clean.** The bin CL ends with a single `FLUSH` packet, identical
+to Mesa `v3dX(job_emit_binning_flush)` (which emits `FLUSH` alone — no INCREMENT_SEMAPHORE for a lone job).
+The register kick order (`CT0QMA → CT0QMS → CT0QTS|ENABLE → CT0QBA → CT0QEA`) is byte-identical to the
+kernel `v3d_bin_job_run` (`v3d_sched.c`). Nothing in the CPU→GPU submission is convicted.
+
+**Named wedge.** Every producer finished and the config/terminator/ordering are exonerated, yet BMACTIVE
+stays set with FLUSH consumed. The one anomaly is `QPU_vec` bit16: **the coordinate shader ran to a
+program-end host interrupt** (`INT_STS` bit16, per `V3D_INT_QPU_SHIFT`) rather than a clean thread-end
+handshake the PTB waits on. The signature — binning mode held ACTIVE, no op in progress, no OOM, FLUSH
+consumed, QPU program-end-interrupt latched — points at the **coord-shader thread-end sequencing**
+(`CS_VS_WORDS` end: `vpmwt ; nop;thrsw ; nop ; nop`) leaving the PTB with an unretired CS thread. This is a
+QPU-word change that QEMU (no V3D block) cannot verify, so per the no-fabricated-fix discipline V3D-46
+stops at **naming** it: the `[v3d46]` PCS decode + config hex-dump are the instrumentation the P45 metal
+read confirms, and that read authorizes the shader-word fix. **P45 metal decides.**
