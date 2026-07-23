@@ -2167,6 +2167,62 @@ fn probe_job() {
     cache::clean_range(arena_phys() + OFF_PROBE_SCRATCH, PROBE_CANARY_BYTES);
     cache::clean_range(arena_phys() + OFF_VTXDATA, TRI_VERTS.len() * 16);
     cache::clean_range(arena_phys() + OFF_DEFAULT_ATTRS, 16);
+
+    // ── [v3d30] executed-bytes witness ──────────────────────────────────────────────────────────
+    // v3d28 VERDICT store-never-issued (canaries + sentinel intact, no fault) proves the TMU write
+    // never drained. Before blaming the TMU config, put the GROUND TRUTH on serial: (a) which code
+    // PAs the shader record's CS/VS/FS start-address fields actually resolve to (read BACK from the
+    // arena, decoded exactly as the CLE will), vs the probe program PA we intended; and (b) the
+    // first-4 / last-4 QPU words physically present AT the recorded CS start address — so the capture
+    // shows the bytes the QPU runs, not the bytes we think we wrote. The tail words also expose the
+    // thrsw/thread-end shape: PROBE_WORDS carries `thrsw` on words [18],[19] AND [22] (the tmuwt
+    // word) — [19] sits in [18]'s thrsw delay slot, so the thread can terminate after [18]'s two
+    // delay slots ([19],[20]), leaving [21] vpmwt and [22] tmuwt UNEXECUTED and the store (fired at
+    // [9] `mov tmuau`) never completed → dropped. This witness makes that decidable from the capture.
+    let probe_code_pa = (arena_phys() + OFF_PROBE_CODE) as u32;
+    // Decode the record straight from the arena (same field layout build_probe_shader_record wrote):
+    //   FS code @bit99  w29 → word@byte12 >>3<<3 ; VS code @bit163 → word@byte20 ; CS code @bit227 →
+    //   word@byte28. The low bits of the CS/VS/FS words carry the threadability/propagate-NaN flags.
+    let rec_w12 = probe_word(OFF_PROBE_SHADREC + 12);
+    let rec_w20 = probe_word(OFF_PROBE_SHADREC + 20);
+    let rec_w28 = probe_word(OFF_PROBE_SHADREC + 28);
+    let rec_cs_unif = probe_word(OFF_PROBE_SHADREC + 32);
+    let fs_code_pa = rec_w12 & 0xFFFF_FFF8;
+    let vs_code_pa = rec_w20 & 0xFFFF_FFF8;
+    let cs_code_pa = rec_w28 & 0xFFFF_FFF8;
+    let cs_4way = rec_w28 & 1; // bit 224
+    let cs_propnan = (rec_w28 >> 2) & 1; // bit 226
+    let vs_4way = rec_w20 & 1; // bit 160
+    serial_println!(
+        ":: V3D: [v3d30] shader-record decode — probe code PA={:#010x} | CS start={:#010x} (4way={} propNaN={}) VS start={:#010x} (4way={}) FS start={:#010x} | CS unif={:#010x} — CS start {} probe code ::",
+        probe_code_pa, cs_code_pa, cs_4way, cs_propnan, vs_code_pa, vs_4way, fs_code_pa, rec_cs_unif,
+        if cs_code_pa == probe_code_pa { "==" } else { "!= (MISMATCH — bin ran the WRONG program)" }
+    );
+    // Read the executed QPU words BACK from the arena at the recorded CS start address. If the record
+    // points elsewhere the readback follows it; here CS start == probe code, so off resolves to the
+    // probe program. Print first 4 and last 4 of the 25-word program as full 64-bit instruction words.
+    let cs_off = (cs_code_pa as usize).wrapping_sub(arena_phys());
+    let qword = |instr: usize| -> u64 {
+        let o = cs_off + instr * 8;
+        (probe_word(o) as u64) | ((probe_word(o + 4) as u64) << 32)
+    };
+    if arena_contains(cs_code_pa as usize, PROBE_WORDS.len() * 8) {
+        serial_println!(
+            ":: V3D: [v3d30] executed QPU words @CS start — first4=[{:#018x} {:#018x} {:#018x} {:#018x}] ::",
+            qword(0), qword(1), qword(2), qword(3)
+        );
+        serial_println!(
+            ":: V3D: [v3d30] executed QPU words @CS start — last4=[{:#018x} {:#018x} {:#018x} {:#018x}] (word22=tmuwt+thrsw; thrsw also on words 18,19 — thread may end before tmuwt) ::",
+            qword(21), qword(22), qword(23), qword(24)
+        );
+    } else {
+        serial_println!(
+            ":: V3D: [v3d30] CS start PA {:#010x} + program length escapes the arena — cannot read back executed bytes ::",
+            cs_code_pa
+        );
+    }
+    // ─────────────────────────────────────────────────────────────────────────────────────────────
+
     // Bin scratch (reused from M4): zero + clean.
     fill_region(OFF_TILESTATE, TILE_STATE_BYTES, 0);
     fill_region(OFF_BIN_TILEALLOC, BIN_TILEALLOC_BYTES, 0);
