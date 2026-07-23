@@ -118,10 +118,14 @@ pub(crate) const HID_SCANCODE_TO_ASCII: [(u8, u8); 104] = [
     (0x7F, 0x7F), // 0x4C: Delete
     (0, 0), // 0x4D: End
     (0, 0), // 0x4E: PageDown
-    (0, 0), // 0x4F: Right Arrow
-    (0, 0), // 0x50: Left Arrow
-    (0, 0), // 0x51: Down Arrow
-    (0, 0), // 0x52: Up Arrow
+    // HID-KEYS: arrow keys map into the C0 control range (no printable-ASCII collision), so a
+    // console consumer sees a distinct control byte and a game/UI consumer can bind them. Chosen
+    // consistent with the table's existing control-code convention (Esc 0x1B, Backspace 0x08,
+    // Delete 0x7F): 0x1C..0x1F, otherwise unused here. Shift does not change an arrow.
+    (0x1C, 0x1C), // 0x4F: Right Arrow
+    (0x1D, 0x1D), // 0x50: Left Arrow
+    (0x1E, 0x1E), // 0x51: Down Arrow
+    (0x1F, 0x1F), // 0x52: Up Arrow
     (0, 0), // 0x53: Num Lock
     (b'/', b'/'), // 0x54: Keypad /
     (b'*', b'*'), // 0x55: Keypad *
@@ -818,6 +822,12 @@ pub struct DeviceSlot {
     /// `mouse_report_count`; drives the Pi-side PIUSB-13 `[enum]` first-report witness (the 0→1
     /// edge is "the keyboard is live"). Inert on x86 (nothing reads it there).
     pub keyboard_report_count: u32,
+    /// HID-KEYS: the six keycodes (report bytes 2..8) of this slot's PREVIOUS boot-keyboard
+    /// report. A boot report carries the FULL set of currently-pressed keys, so a keycode present
+    /// last report but absent now IS a release — the decode emits `pal::Event::KeyUp(ascii)` for
+    /// each such code (edge-detected here, mirroring the pointer-button press-edge idiom). All-zero
+    /// = no keys held. Seeded to zero at enumeration and cleared on slot reuse.
+    pub keyboard_prev_keys: [u8; 6],
 
     pub descriptor_buffer: *mut u8,
 
@@ -913,6 +923,7 @@ impl DeviceSlot {
             keyboard_ring: None,
             keyboard_expect_phys: 0,
             keyboard_report_count: 0,
+            keyboard_prev_keys: [0; 6],
             descriptor_buffer: desc_buffer,
             ep0_expect_phys: 0,
             is_downstream: false,
@@ -984,6 +995,7 @@ impl DeviceSlot {
         self.keyboard_state = 0;
         self.keyboard_expect_phys = 0;
         self.keyboard_report_count = 0;
+        self.keyboard_prev_keys = [0; 6];
         self.ep0_expect_phys = 0;
         self.is_downstream = false;
         self.route_string = 0;
@@ -2126,15 +2138,22 @@ impl XhciController {
                                             // `slot` (the shared borrow) is no longer read past here;
                                             // the &mut self accesses below are the count bump + re-arm.
 
-                                            // GUI-CLICK-2: emit ONE Button on the button-DOWN edge
-                                            // (any bit newly set), mirroring the EHCI press-edge
-                                            // idiom (ehci/mod.rs). Release emits nothing; a held
-                                            // button does not re-fire. The Pi render task / vug
-                                            // exit on this observable exactly like a keystroke.
-                                            // Shared xHCI code: x86 xHCI mice gain the same correct
-                                            // Button (a fix, not a risk — EHCI keeps its own emit).
+                                            // GUI-CLICK-2 / HID-KEYS: emit a Button on ANY mask
+                                            // change — both the press edge (a bit going 0→1) and the
+                                            // release edge (a bit going 1→0). The payload is always
+                                            // the CURRENT mask, so a consumer that only acts on
+                                            // presses stays correct (it sees a nonzero mask on press
+                                            // and a mask with the released bit cleared — often 0 — on
+                                            // release, which it ignores); a consumer that tracks
+                                            // held-state now gets the release it was missing (the
+                                            // GUI-CLICK-2b gap). A held button (unchanged mask) still
+                                            // does not re-fire. Shared xHCI code: x86 xHCI mice gain
+                                            // the same correct release edge (a fix, not a risk —
+                                            // EHCI keeps its own emit).
                                             let prev_btn = self.slots[slot_id as usize].mouse_prev_buttons;
-                                            if buttons & !prev_btn != 0 {
+                                            if buttons != prev_btn {
+                                                #[cfg(feature = "usbdebug")]
+                                                serial_println!("[hidkeys] button {:#04x} -> {:#04x} slot={}", prev_btn, buttons, slot_id);
                                                 crate::pal::push_event(crate::pal::Event::Button(buttons));
                                             }
                                             self.slots[slot_id as usize].mouse_prev_buttons = buttons;
@@ -2204,12 +2223,24 @@ impl XhciController {
                                             // Bytes 2-7: Key codes (up to 6 simultaneous keys)
                                             let modifiers = report[0];
                                             let shift = (modifiers & 0x22) != 0; // L-Shift (bit 1) or R-Shift (bit 5)
-                                            
+
+                                            // HID-KEYS: snapshot this report's keycodes and the
+                                            // previous report's, so releases (a code present last
+                                            // report, absent now) can be edge-detected below. The
+                                            // KeyDown loop is unchanged — Key(ascii) still fires for
+                                            // every held key each report (natural repeats on resend),
+                                            // preserving every existing consumer.
+                                            let cur_keys: [u8; 6] = [
+                                                report[2], report[3], report[4],
+                                                report[5], report[6], report[7],
+                                            ];
+                                            let prev_keys = self.slots[slot_id as usize].keyboard_prev_keys;
+
                                             for i in 2..8 {
                                                 let keycode = report[i];
                                                 if keycode == 0 { continue; } // No key
                                                 if keycode == 1 { continue; } // ErrorRollOver
-                                                
+
                                                 if (keycode as usize) < HID_SCANCODE_TO_ASCII.len() {
                                                     let (unshifted, shifted) = HID_SCANCODE_TO_ASCII[keycode as usize];
                                                     let ascii = if shift { shifted } else { unshifted };
@@ -2219,7 +2250,28 @@ impl XhciController {
                                                     }
                                                 }
                                             }
-                                            
+
+                                            // HID-KEYS: key-UP edges. A boot report carries the FULL
+                                            // pressed-key set, so any keycode in the previous report
+                                            // that is absent now was released — emit KeyUp(ascii)
+                                            // once per such code. Shift state at release time is used
+                                            // for the ascii (consumers that care about identity match
+                                            // case-insensitively; e.g. GAME-MODE lowercases).
+                                            for &keycode in prev_keys.iter() {
+                                                if keycode == 0 || keycode == 1 { continue; }
+                                                if cur_keys.contains(&keycode) { continue; } // still held
+                                                if (keycode as usize) < HID_SCANCODE_TO_ASCII.len() {
+                                                    let (unshifted, shifted) = HID_SCANCODE_TO_ASCII[keycode as usize];
+                                                    let ascii = if shift { shifted } else { unshifted };
+                                                    if ascii != 0 {
+                                                        #[cfg(feature = "usbdebug")]
+                                                        serial_println!("[hidkeys] keyup '{}' (scancode {:#x}) slot={}", ascii as char, keycode, slot_id);
+                                                        crate::pal::push_event(crate::pal::Event::KeyUp(ascii));
+                                                    }
+                                                }
+                                            }
+
+                                            self.slots[slot_id as usize].keyboard_prev_keys = cur_keys;
                                             self.queue_keyboard_read(slot_id as u8);
                                         }
                                     } else if hub_int_dci == Some(endpoint_id as u8) {
@@ -4662,9 +4714,30 @@ impl XhciController {
             if boot_mouse && !self.set_hid_boot_protocol(slot, mouse_intf, "boot-mouse") {
                 continue;
             }
-            if kbd {
-                self.set_hid_boot_protocol(slot, kbd_intf, "keyboard");
+            if kbd && self.set_hid_boot_protocol(slot, kbd_intf, "keyboard") {
+                // HID-KEYS: SET_IDLE(0) on the keyboard interface. Duration 0 = "report only on
+                // change" (USB HID 1.11 §7.2.4): a keyboard that powered up with a nonzero idle
+                // rate (periodic resends) stops re-sending an unchanged report, so a held key is
+                // one press + one release edge rather than a stream of duplicate reports. Bounded
+                // and tolerated — some keyboards NAK/STALL it; we witness either way and move on.
+                // Only issued after SET_PROTOCOL succeeded (a STALL there halts EP0, so a following
+                // request would just time out).
+                self.set_hid_idle(slot, kbd_intf);
             }
+        }
+    }
+
+    /// HID-KEYS: HID class request SET_IDLE(duration=0, reportID=0) for one interface —
+    /// bmRequestType 0x21 (host->device, class, interface recipient), bRequest 0x0A,
+    /// wValue 0x0000 (duration high byte 0, report id low byte 0), wIndex = interface, no data.
+    /// Best-effort: logs a single `[hidkeys] set-idle ok/nak slot=N` witness and never bails the
+    /// caller (a NAK/STALL/timeout here is expected on some devices and is harmless — the decoders
+    /// still work, just without idle suppression).
+    fn set_hid_idle(&mut self, slot: u8, intf: u8) {
+        match self.sync_control(slot, 0x21, 0x0A, 0x0000, intf as u16, 0, 0, false) {
+            Ok(1) => serial_println!("[hidkeys] set-idle ok slot={} iface={}", slot, intf),
+            Ok(code) => serial_println!("[hidkeys] set-idle nak slot={} iface={} (code {})", slot, intf, code),
+            Err(()) => serial_println!("[hidkeys] set-idle nak slot={} iface={} (EP0 timeout)", slot, intf),
         }
     }
 

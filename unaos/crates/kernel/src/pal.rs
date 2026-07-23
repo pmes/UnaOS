@@ -22,6 +22,11 @@ use spin::Mutex;
 pub enum Event {
     Timer,
     Key(u8),
+    /// HID-KEYS: a key-RELEASE edge (payload = the ASCII the matching `Key` press carried).
+    /// The HID decoders track each keyboard slot's previous boot report and emit this when a
+    /// keycode leaves the pressed set. Consumers that only act on presses ignore it (they match
+    /// `Key` and fall through the wildcard); held-state consumers can pair it with `Key`.
+    KeyUp(u8),
     Mouse { x: i32, y: i32 },
     MouseAbsolute { x: i32, y: i32 },
     /// CLICK-1: a pointer button-DOWN edge (payload = the report's button bitmask, bit 0 = primary).
