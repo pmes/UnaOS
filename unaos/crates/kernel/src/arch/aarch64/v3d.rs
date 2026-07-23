@@ -532,13 +532,15 @@ pub fn bringup(fb: Option<FbTarget>) {
         }
     }
 
-    // PI-V3D-3: the PM / ASB enable step — the piece the firmware power+clock path leaves undone on
-    // BCM2711 (PI-V3D-2's metal verdict). Deassert the V3D reset in PM_GRAFX, then release the two
-    // async AXI bridges (master, slave). Sequenced AFTER the firmware power/rate/gate steps above and
-    // BEFORE the probe, so the probe reads a (hopefully) decoded block. Best-effort + poison-honest:
-    // on QEMU these registers are absent and every wait is a finite backstop, so the run still lands
-    // on the honest BLOCK-DOWN below; on metal this is what turns BUS-POISON into BLOCK-UP.
-    enable_pm_asb();
+    // PI-V3D-50: the kernel-faithful V3D core RESET CYCLE (was PI-V3D-3's ON-half-only `enable_pm_asb`).
+    // The kernel `v3d_reset_v3d` power-CYCLES the GRAFX_V3D domain (OFF then ON) to return the core to a
+    // clean reset; UnaOS only ever ran the ON half once, on a firmware-powered block, leaving any stale
+    // CLE/PTB/hub state uncleared — the wedge below per-job programming that §10–23 cornered. Sequenced
+    // AFTER the firmware power/rate/gate steps and BEFORE the probe, so the probe reads a decoded block.
+    // Best-effort + poison-honest: on QEMU these registers are absent and every wait is a finite backstop,
+    // so the run still lands on the honest BLOCK-DOWN below; on metal this is what turns BUS-POISON into
+    // BLOCK-UP and (the V3D-50 hypothesis) unwedges the empty-frame retire.
+    v3d_reset_cycle();
 
     // Let the freshly powered + clocked + bridged block settle before its first register read (a
     // bounded wall-clock delay off CNTPCT — finite by construction, never an unbounded spin).
@@ -717,14 +719,92 @@ fn settle_ms(ms: u64) {
     }
 }
 
-/// PI-V3D-3: the PM / ASB enable step. On BCM2711 the firmware property-tag power+clock path leaves
-/// the V3D held in reset with its async AXI bridges stopped (PI-V3D-2 metal: powered+clocked yet
-/// 0xdeadbeef). Mirror the two BCM2711-relevant steps of Linux `bcm2835_asb_power_on` for the
-/// GRAFX_V3D domain: (1) deassert PM_V3DRSTN in PM_GRAFX, (2) release ASB_V3D_M_CTRL then
-/// ASB_V3D_S_CTRL. Every PM/ASB write carries the PM password. Best-effort: a bridge that never ACKs
-/// (or reads poison) is logged and we proceed — the IDENT0 probe that follows is the real verdict
-/// gate (it BUS-POISONs honestly if the block still did not decode). Announced-before-issue writes,
-/// poison-honest readbacks, bounded settles — nothing here can fault or hang (QEMU-safe).
+/// PI-V3D-50: the kernel-faithful V3D core RESET CYCLE — the bring-up step the probe path performs and
+/// we never did. Prior arcs (§10–23) proved every *per-job* register write byte-exact yet the empty bin
+/// frame still never retires (BMACTIVE held set forever, INT_STS=0, FLDONE never fires). That wedge sits
+/// BELOW per-job programming, in the bring-up/reset state the kernel driver inherits from its probe path.
+///
+/// The kernel's reset is `v3d_reset_v3d` → (BCM2711 has a reset-controller, so) `reset_control_reset(v3d->
+/// reset)`. On the Pi 4 that reset id is `BCM2835_RESET_V3D`, and `bcm2835-pm`'s `bcm2835_reset_reset`
+/// implements it as **power the GRAFX_V3D domain OFF, then back ON** — i.e. `bcm2835_asb_power_off` then
+/// `bcm2835_asb_power_on`. That full OFF→ON cycle is what returns the V3D core (CLE/PTB/hub state machine)
+/// to a clean reset state. UnaOS only ever ran the ON half ONCE (`enable_pm_asb`, PI-V3D-3), on a block the
+/// firmware had already powered — so any stale internal state the firmware left (a bin pipeline that never
+/// cleanly idled, a half-reset PTB) was never cleared. A block out of clean reset can fetch/consume a CL
+/// (CLE walks, QPU runs to program-end) while the frame-accounting/flush unit sits in a half-reset state
+/// that never latches FLDONE — exactly the P46 signature.
+///
+/// This mirrors `bcm2835_asb_power_off` (the OFF half) followed by our existing ON half:
+///   OFF: stop the two async AXI bridges (set `ASB_REQ_STOP`, wait `ASB_ACK` to SET = quiesced) master
+///        then slave, then assert the V3D reset (clear `PM_V3DRSTN` in `PM_GRAFX`). The BCM2711 SKIPs the
+///        POWUP/MEMPD memory-power path (`if (power->rpivid_asb) return 0`), same as the ON half's note.
+///   ON:  the existing `enable_pm_asb` — deassert `PM_V3DRSTN`, release both bridges (clear `ASB_REQ_STOP`,
+///        wait `ASB_ACK` to CLEAR = released).
+/// Every PM/ASB write carries the PM password. Best-effort/QEMU-safe: unbacked ASB regs read 0 (ACK never
+/// sets → OFF bridge-stop backstop returns at once; ACK already clear → ON release returns at once), and
+/// the IDENT0 probe downstream is the real verdict gate. `[v3d50]` before/after witnesses on every reg.
+fn v3d_reset_cycle() {
+    serial_println!(
+        ":: V3D: [v3d50] core reset CYCLE — kernel `reset_control_reset(BCM2835_RESET_V3D)` = GRAFX_V3D power OFF then ON (bcm2835_asb_power_off → _on). Prior bring-up ran only the ON half once on a firmware-powered block; this OFF→ON returns the CLE/PTB/hub to clean reset ::"
+    );
+    // ── OFF half: `bcm2835_asb_power_off` (BCM2711 path) ──────────────────────────────────────────
+    // (1) Stop the two async AXI bridges — request stopped and wait for the ACK to SET (bridge quiesced).
+    //     Master first, then slave (Linux `bcm2835_asb_power_off` order is the reverse of power_on).
+    let grafx_pre = mmio_read(PM_BASE, PM_GRAFX);
+    serial_println!(
+        ":: V3D: [v3d50] reset OFF — PM_GRAFX pre={:#010x} (PM_V3DRSTN={}) — stopping ASB bridges + asserting reset ::",
+        grafx_pre, (grafx_pre & PM_V3DRSTN != 0) as u32
+    );
+    asb_stop("V3D master (ASB_V3D_M_CTRL)", ASB_V3D_M_CTRL);
+    asb_stop("V3D slave  (ASB_V3D_S_CTRL)", ASB_V3D_S_CTRL);
+    // (2) Assert the V3D reset: clear PM_V3DRSTN in PM_GRAFX (with the PM password), holding the core in
+    //     reset while the bridges are stopped.
+    let grafx_off = mmio_read(PM_BASE, PM_GRAFX);
+    mmio_write(PM_BASE, PM_GRAFX, PM_PASSWORD | (grafx_off & !PM_V3DRSTN));
+    let grafx_asserted = mmio_read(PM_BASE, PM_GRAFX);
+    serial_println!(
+        ":: V3D: [v3d50] reset OFF — PM_GRAFX assert V3DRSTN(clear bit6): pre={:#010x} post={:#010x} (PM_V3DRSTN now {}){} ::",
+        grafx_off, grafx_asserted, (grafx_asserted & PM_V3DRSTN != 0) as u32,
+        if is_poison(grafx_asserted) { " (poison/absent — QEMU or block-down)" } else { "" }
+    );
+    // Hold the core in reset briefly (bounded off CNTPCT) before releasing — the reset must be observed.
+    settle_ms(1);
+
+    // ── ON half: `bcm2835_asb_power_on` (deassert reset, release bridges) — the existing PI-V3D-3 step ──
+    enable_pm_asb();
+}
+
+/// PI-V3D-50: stop one V3D async AXI bridge (the OFF-half of the reset cycle) — mirror
+/// `bcm2835_asb_enable`'s stop path: set `ASB_REQ_STOP` (with the PM password) and wait, bounded, for
+/// `ASB_ACK` to SET (the bridge acknowledging it has quiesced). The counterpart of `asb_release`.
+/// Announced-before-issue; poison-honest readback; never fatal (a bridge that will not ACK is logged and
+/// the reset proceeds — the ON half + IDENT0 probe deliver the honest verdict). QEMU-safe: unbacked reg
+/// reads 0, ACK never sets, the backstop returns false at once and we proceed.
+fn asb_stop(what: &str, reg: usize) {
+    let cur = mmio_read(RPIVID_ASB_BASE, reg);
+    serial_println!(
+        ":: V3D: [v3d50] reset OFF — ASB stop {} — cur {:#010x} -> set ASB_REQ_STOP (pw), wait ACK SET ::",
+        what, cur
+    );
+    mmio_write(RPIVID_ASB_BASE, reg, PM_PASSWORD | (cur | ASB_REQ_STOP));
+    let stopped = wait_bit_set(RPIVID_ASB_BASE, reg, ASB_ACK, what);
+    let rb = mmio_read(RPIVID_ASB_BASE, reg);
+    serial_println!(
+        ":: V3D: [v3d50] reset OFF — ASB {} readback {:#010x} — {}{} ::",
+        what, rb,
+        if stopped { "ACK set (bridge stopped)" } else { "ACK never set (backstop hit — proceeding)" },
+        if is_poison(rb) { ", poison/absent (QEMU or block-down)" } else { "" }
+    );
+}
+
+/// PI-V3D-3: the PM / ASB enable step (the ON half of the PI-V3D-50 reset cycle). On BCM2711 the firmware
+/// property-tag power+clock path leaves the V3D held in reset with its async AXI bridges stopped
+/// (PI-V3D-2 metal: powered+clocked yet 0xdeadbeef). Mirror the two BCM2711-relevant steps of Linux
+/// `bcm2835_asb_power_on` for the GRAFX_V3D domain: (1) deassert PM_V3DRSTN in PM_GRAFX, (2) release
+/// ASB_V3D_M_CTRL then ASB_V3D_S_CTRL. Every PM/ASB write carries the PM password. Best-effort: a bridge
+/// that never ACKs (or reads poison) is logged and we proceed — the IDENT0 probe that follows is the real
+/// verdict gate (it BUS-POISONs honestly if the block still did not decode). Announced-before-issue
+/// writes, poison-honest readbacks, bounded settles — nothing here can fault or hang (QEMU-safe).
 fn enable_pm_asb() {
     // (1) Deassert the V3D reset in PM_GRAFX (bit PM_V3DRSTN), preserving the other bits, PM password
     // in the top byte. Read-modify-write via the Device window; the read is poison-tolerant (we only
@@ -1381,6 +1461,23 @@ fn wait_bit_clear(base: usize, reg: usize, mask: u32, what: &str) -> bool {
     while mmio_read(base, reg) & mask != 0 {
         if super::timer::cntpct() >= deadline {
             serial_println!(":: V3D: timeout waiting for {} (backstop) ::", what);
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+    true
+}
+
+/// Poll `base+reg & mask` until it becomes SET, with the same finite ~0.5 s CNTPCT backstop as
+/// `wait_bit_clear`. Used by the V3D-50 core-reset OFF half: `bcm2835_asb_power_off` requests a bridge
+/// stopped and waits for `ASB_ACK` to SET (the bridge acknowledging it has quiesced). On QEMU the
+/// rpivid_asb block is unbacked (reads 0), so ACK never sets and the backstop returns false — logged,
+/// non-fatal (the IDENT0 probe downstream is the real verdict gate).
+fn wait_bit_set(base: usize, reg: usize, mask: u32, what: &str) -> bool {
+    let deadline = super::timer::cntpct() + super::timer::cntfrq() / 2;
+    while mmio_read(base, reg) & mask == 0 {
+        if super::timer::cntpct() >= deadline {
+            serial_println!(":: V3D: timeout waiting for {} to SET (backstop) ::", what);
             return false;
         }
         core::hint::spin_loop();
@@ -3199,6 +3296,13 @@ fn build_bisect_null_shader_record() {
 /// `[v3d48] <rung>` line — retired, BFC delta, and the full PCS decode — and, on timeout, the retained
 /// `[v3d44/45/46]` wedge suite fires from `wait_fldone`. Diagnostic-only; never gates M4.
 fn submit_bisect_rung(rung: &str, content: BinContent, shadrec_off: usize) {
+    submit_bisect_rung_tagged("v3d48", rung, content, shadrec_off);
+}
+
+/// As `submit_bisect_rung`, but with a caller-chosen witness `tag` on the verdict line — so the
+/// PI-V3D-50 empty-after-fix re-run (post-reset-cycle) can print under `[v3d50]` while the bisection
+/// ladder keeps its `[v3d48]` tag.
+fn submit_bisect_rung_tagged(tag: &str, rung: &str, content: BinContent, shadrec_off: usize) {
     let bin_len = build_bin_cl_content(OFF_PROBE_BIN_CL, shadrec_off, 1, content);
 
     // Fresh, coherent bin scratch + overflow pool for this rung (reuses the M4 / probe regions).
@@ -3220,7 +3324,7 @@ fn submit_bisect_rung(rung: &str, content: BinContent, shadrec_off: usize) {
         || !arena_contains(tile_alloc as usize, BIN_TILEALLOC_BYTES)
         || !arena_contains(ts as usize, TILE_STATE_BYTES)
     {
-        serial_println!(":: V3D: [v3d48] {} — range escapes the arena, skipping (fail-closed) ::", rung);
+        serial_println!(":: V3D: [{}] {} — range escapes the arena, skipping (fail-closed) ::", tag, rung);
         return;
     }
     // Decode the rung's CL packet-by-packet so the log shows exactly which packets this rung submitted.
@@ -3281,8 +3385,8 @@ fn submit_bisect_rung(rung: &str, content: BinContent, shadrec_off: usize) {
         "did NOT retire — this rung's added packet class is the offending one (the rung below it retired); localise there"
     };
     serial_println!(
-        ":: V3D: [v3d48] {} — retired={} BFC {:#010x}->{:#010x} (Δ{}) PCS={:#010x}(BMACTIVE={} BMBUSY={} RMACTIVE={} RMBUSY={} BMOOM={}) idled={} INT_STS={:#010x} waited={}us — {} ::",
-        rung, retired as u32, bfc_pre, bfc_after, bfc_after.wrapping_sub(bfc_pre),
+        ":: V3D: [{}] {} — retired={} BFC {:#010x}->{:#010x} (Δ{}) PCS={:#010x}(BMACTIVE={} BMBUSY={} RMACTIVE={} RMBUSY={} BMOOM={}) idled={} INT_STS={:#010x} waited={}us — {} ::",
+        tag, rung, retired as u32, bfc_pre, bfc_after, bfc_after.wrapping_sub(bfc_pre),
         pcs,
         (pcs & V3D_PCS_BMACTIVE != 0) as u32,
         (pcs & V3D_PCS_BMBUSY != 0) as u32,
@@ -3326,6 +3430,12 @@ fn empty_frame_bisection() {
     // OFF_SHADREC (the real M4 record) was already published + cleaned by probe_job; StateNoPrims reuses it.
     cs_tail_witness("v3d48 NULL", OFF_BISECT_NULL_CODE, NULL_CS_WORDS.len());
 
+    // PI-V3D-50: re-run the EMPTY rung first, tagged [v3d50], as the direct before/after witness for the
+    // new kernel-faithful reset cycle (`v3d_reset_cycle` ran in bring-up this boot). If the OFF→ON core
+    // reset unwedged the frame handshake, THIS is where it shows: `retired=1 BFC Δ1 PCS=…BMACTIVE=0`,
+    // retiring the whole seven-layer empty-bin investigation. If it still reads `retired=0 BFC Δ0
+    // BMACTIVE=1`, the reset cycle was not the wall and the wedge sits below the CLE→PTB FLDONE generation.
+    submit_bisect_rung_tagged("v3d50", "empty-after-fix", BinContent::Empty, OFF_SHADREC);
     submit_bisect_rung("empty-frame", BinContent::Empty, OFF_SHADREC);
     submit_bisect_rung("state-no-prims", BinContent::StateNoPrims, OFF_SHADREC);
     submit_bisect_rung("prims-null-shader", BinContent::PrimsNullShader, OFF_BISECT_NULL_SHADREC);
