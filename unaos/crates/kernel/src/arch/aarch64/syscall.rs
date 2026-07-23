@@ -168,6 +168,20 @@ const SYS_FUTEX: u64 = 26;
 const FUTEX_WAIT: u64 = 0;
 const FUTEX_WAKE: u64 = 1;
 
+/// ELF-5: input into EL0 — the next ladder rung after surface + threads + futex. An interactive EL0
+/// app needs keys/mouse.
+///   SYS_INPUT_POLL() -> packed event >= 0 / -EAGAIN
+///     NON-BLOCKING. Returns the next input event queued for the CALLING process (only while it is the
+///     ACTIVE app — the router only enqueues into the active process's ring), or `-EAGAIN` when the ring
+///     is empty. The event is a packed u64 (bit 63 always clear, so it never collides with a negative
+///     errno): [55:48] = type (see `INPUT_EV_*`), payload in the low 32 bits — key ASCII / button mask in
+///     [7:0], mouse dx/x in [31:16] (i16), dy/y in [15:0] (i16). The router seam is `el0_input_enqueue`
+///     (mirroring ELF-3's present seam); active-process registration is `el0_input_set_active`.
+const SYS_INPUT_POLL: u64 = 27;
+/// SYS_INPUT_WAIT = 28 is DEFERRED (documented at `sys_input_poll`) — a blocking variant on a per-ASID
+/// Semaphore that `el0_input_enqueue` posts; QEMU has no real input source, so POLL is the QEMU-provable
+/// rung this arc lands.
+
 /// M6e demo: the sentinel `sys_exit` status the preemption spinner uses so its exit is accounted to
 /// `EL0_SPIN_DONE` and never perturbs the M6b `exited/killed` counters. Demo-only — there is no real
 /// userspace yet, so overloading one status value for demo bookkeeping is safe and documented here.
@@ -3473,6 +3487,10 @@ pub fn clear_handle_row(asid: u64) {
     // M2.1: clear this slot's persistent principal STAMP — the slot's next tenant is a different program, so
     // it must not inherit the departed program's principal (the ppid twin of owned_clear_owner_asid).
     slot_ppid_clear(asid);
+    // ELF-5: reset this ASID's input ring (a reused ASID inherits no stale input event), and if it was the
+    // registered active input target, clear the designation so the router stops enqueueing to a dead slot.
+    clear_input_row(asid);
+    let _ = EL0_INPUT_ACTIVE.compare_exchange(asid, 0, Ordering::AcqRel, Ordering::Acquire);
 }
 
 /// The ASID of the address space the caller is running in, read from `TTBR0_EL1[63:48]`. A syscall executes
@@ -5601,6 +5619,7 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
             elf1_report(a0);
             threads_report(a0);
             fb_report(a0);
+            input_report(a0);
             0
         }
         SYS_YIELD => sys_yield(),
@@ -5626,6 +5645,7 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
         SYS_FB_MAP => sys_fb_map(),
         SYS_FB_PRESENT => sys_fb_present(),
         SYS_FUTEX => sys_futex(a0, a1, a2),
+        SYS_INPUT_POLL => sys_input_poll(),
         SYS_EXIT => {
             // Demo accounting BEFORE the no-return exit. The sentinel statuses are routed to their own
             // counters so the M6b (`exited=1 killed=3`) and M6e (`completed=1`) verdicts stay byte-
@@ -5753,6 +5773,11 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
                 // ELF-3: the fb-test PARENT exits (status 0) after presenting + joining both draw threads.
                 // Route by NAME so it lands in the ELF-3 witness, never the M6b `EL0_EXITED_OK` accounting.
                 FB_PARENT_DONE.store(a0 == 0, Ordering::Release);
+            } else if super::sched::current_name() == Some("el0-input") {
+                // ELF-5: the input-test program exits (status 0) after polling empty, draining the injected
+                // event, and polling empty again. Route by NAME so it lands in the ELF-5 witness, never the
+                // M6b `EL0_EXITED_OK` accounting.
+                INPUT_PARENT_DONE.store(a0 == 0, Ordering::Release);
             } else if a0 == M6E_SPIN_STATUS {
                 EL0_SPIN_DONE.fetch_add(1, Ordering::AcqRel);
             } else if a0 == M6D_EXIT_STATUS {
@@ -8903,6 +8928,296 @@ fn sys_futex(uaddr: u64, op: u64, val: u64) -> i64 {
     }
 }
 
+// =============================================================================================
+// ELF-5: input into EL0 — SYS_INPUT_POLL + the per-process input ring, the router enqueue seam, and the
+// active-process registration. An interactive EL0 app (built on ELF-3's surface + ELF-2's threads +
+// ELF-3's futex) needs keys/mouse; this is the delivery half.
+//
+// SHAPE (mirrors how the GUI routes input to kernel apps today — GUI-CLICK-2b's SCREEN_APP_ACTIVE gate +
+// gui_watchdog: only the ACTIVE app receives input). The kernel holds a small per-ASID ring of packed
+// events; the GUI router (main.rs `pump_usb_into_gui`) fills the ACTIVE process's ring when it drains
+// `pal::next_event()` — via the public `el0_input_enqueue` seam here (the ELF-3 present-hook twin). EL0
+// polls its own ring nonblocking through SYS_INPUT_POLL. One producer (the single router task) + one
+// consumer (the EL0 task) per ring => a lock-free SPSC ring (free-running head/tail, occupancy = tail-head).
+//
+// PACKED EVENT (u64, bit 63 always CLEAR so an event never aliases a negative errno):
+//   [55:48] = type (INPUT_EV_*); low 32 bits = payload — key ASCII / button mask in [7:0], mouse x/dx in
+//   [31:16] (i16), mouse y/dy in [15:0] (i16).
+//
+// DEFERRED ROUTER WIRING (2-3 lines, OUTSIDE this lane — main.rs `pump_usb_into_gui`, the next arc folds):
+// when an EL0 app owns the screen (an ELF-5 analogue of SCREEN_APP_ACTIVE, with the focused process's ASID
+// registered via `el0_input_set_active`), route drained pal events to the EL0 ring instead of GUI_CHANNEL:
+//     while let Some(ev) = unaos_kernel::pal::next_event() {
+//         unaos_kernel::arch::aarch64::syscall::el0_input_enqueue(ev); // -> the active EL0 app's ring
+//     }
+// (Today only the in-kernel witness registers an active process + injects a test event — see
+// `input_launcher`. QEMU raspi4b delivers no USB HID, so the kernel-injected event is what proves the
+// enqueue->drain path there; the router edge is the metal-only piece the fold lights up.)
+// =============================================================================================
+
+/// ELF-5 packed-event type tags (packed value bits [55:48]).
+const INPUT_EV_KEY_DOWN: u64 = 1; // a key PRESS   (payload[7:0] = ASCII)
+const INPUT_EV_KEY_UP: u64 = 2; // a key RELEASE (payload[7:0] = ASCII)
+const INPUT_EV_MOUSE_REL: u64 = 3; // relative pointer motion (payload[31:16]=dx, [15:0]=dy as i16)
+const INPUT_EV_MOUSE_ABS: u64 = 4; // absolute pointer position (payload[31:16]=x,  [15:0]=y  as i16)
+const INPUT_EV_BUTTON: u64 = 5; // a pointer button-DOWN edge (payload[7:0] = button bitmask)
+
+/// Per-ASID input ring capacity (power of two — occupancy math is `tail.wrapping_sub(head)`).
+const INPUT_RING_CAP: usize = 32;
+
+/// The per-process input rings, keyed by ASID (0 = the shared/boot context, never a delivery target). One
+/// producer (the router) + one consumer (the EL0 task) per ring => a lock-free SPSC ring.
+static EL0_INPUT_BUF: [[AtomicU64; INPUT_RING_CAP]; super::boot::USER_SLOTS + 1] =
+    [const { [const { AtomicU64::new(0) }; INPUT_RING_CAP] }; super::boot::USER_SLOTS + 1];
+/// Consumer index (free-running; advanced by SYS_INPUT_POLL). Real slot = `head & (CAP-1)`.
+static EL0_INPUT_HEAD: [AtomicU32; super::boot::USER_SLOTS + 1] =
+    [const { AtomicU32::new(0) }; super::boot::USER_SLOTS + 1];
+/// Producer index (free-running; advanced by `el0_input_enqueue`). Occupancy = `tail - head`.
+static EL0_INPUT_TAIL: [AtomicU32; super::boot::USER_SLOTS + 1] =
+    [const { AtomicU32::new(0) }; super::boot::USER_SLOTS + 1];
+
+/// The ASID of the process currently designated to RECEIVE input (0 = none). The router enqueues only into
+/// this process's ring — the ELF-5 twin of `SCREEN_APP_ACTIVE`. Set via `el0_input_set_active`.
+static EL0_INPUT_ACTIVE: AtomicU64 = AtomicU64::new(0);
+
+/// Pack a `pal::Event` into the ELF-5 u64 wire form, or `None` for a non-deliverable event (Timer/None/
+/// Unknown carry nothing for EL0). Bit 63 is always clear, so `sys_input_poll` can hand the packed value
+/// straight back as a non-negative i64 distinct from `-EAGAIN`.
+fn pack_input(ev: crate::pal::Event) -> Option<u64> {
+    use crate::pal::Event;
+    let pack_xy = |x: i32, y: i32| -> u64 {
+        ((x as i16 as u16 as u64) << 16) | (y as i16 as u16 as u64)
+    };
+    let (ty, payload): (u64, u64) = match ev {
+        Event::Key(b) => (INPUT_EV_KEY_DOWN, b as u64),
+        Event::KeyUp(b) => (INPUT_EV_KEY_UP, b as u64),
+        Event::Mouse { x, y } => (INPUT_EV_MOUSE_REL, pack_xy(x, y)),
+        Event::MouseAbsolute { x, y } => (INPUT_EV_MOUSE_ABS, pack_xy(x, y)),
+        Event::Button(mask) => (INPUT_EV_BUTTON, mask as u64),
+        Event::Timer | Event::None | Event::Unknown => return None,
+    };
+    Some((ty << 48) | payload)
+}
+
+/// ELF-5 ROUTER SEAM (public, in-lane): enqueue one input event into the ACTIVE process's ring. Called by the
+/// GUI router (main.rs `pump_usb_into_gui`) when it drains `pal::next_event()` and an EL0 app owns input.
+/// Returns `true` if the event was queued, `false` if there is no active EL0 target, the event is not
+/// deliverable, or the ring is full (drop-newest — an unread event is never overwritten). Single producer.
+pub fn el0_input_enqueue(ev: crate::pal::Event) -> bool {
+    let asid = EL0_INPUT_ACTIVE.load(Ordering::Acquire);
+    if asid == 0 || asid as usize > super::boot::USER_SLOTS {
+        return false;
+    }
+    let Some(packed) = pack_input(ev) else {
+        return false;
+    };
+    el0_input_push(asid, packed)
+}
+
+/// Push a pre-packed event into `asid`'s ring (the SPSC producer half). Drop-newest on a full ring so a
+/// backlog can never clobber an event the EL0 consumer has not yet read. `asid` is validated by the caller.
+fn el0_input_push(asid: u64, packed: u64) -> bool {
+    let a = asid as usize;
+    let head = EL0_INPUT_HEAD[a].load(Ordering::Acquire);
+    let tail = EL0_INPUT_TAIL[a].load(Ordering::Relaxed); // this task is the sole producer
+    if tail.wrapping_sub(head) >= INPUT_RING_CAP as u32 {
+        return false; // full — drop the newest
+    }
+    EL0_INPUT_BUF[a][(tail as usize) & (INPUT_RING_CAP - 1)].store(packed, Ordering::Release);
+    EL0_INPUT_TAIL[a].store(tail.wrapping_add(1), Ordering::Release); // publish AFTER the slot store
+    true
+}
+
+/// ELF-5 ACTIVE-PROCESS REGISTRATION (public, in-lane): designate which process receives input. Passing an
+/// ASID resets that ring (a freshly-focused process starts with an empty queue — no stale input from a prior
+/// focus); passing 0 clears the designation (no EL0 target — enqueues become no-ops). Called by the focus
+/// owner (today the witness; on the folded router, the shell/compositor on a focus change).
+pub fn el0_input_set_active(asid: u64) {
+    if asid != 0 && (asid as usize) <= super::boot::USER_SLOTS {
+        clear_input_row(asid); // fresh focus starts clean
+    }
+    EL0_INPUT_ACTIVE.store(asid, Ordering::Release);
+}
+
+/// The ASID currently designated to receive input (0 = none) — the read side of `el0_input_set_active`.
+pub fn el0_input_active() -> u64 {
+    EL0_INPUT_ACTIVE.load(Ordering::Acquire)
+}
+
+/// Reset an ASID's input ring (head == tail == 0 => empty). Called on a focus change (fresh start) and from
+/// `clear_handle_row` on slot teardown (a reused ASID inherits no stale input). Safe because on teardown no
+/// producer runs for the dying ASID, and on a focus change the router only ever targets the newly-active ASID.
+fn clear_input_row(asid: u64) {
+    let a = asid as usize;
+    EL0_INPUT_HEAD[a].store(0, Ordering::Release);
+    EL0_INPUT_TAIL[a].store(0, Ordering::Release);
+}
+
+/// SYS_INPUT_POLL(): nonblocking dequeue of the next input event for the CALLING process. Returns the packed
+/// event (>= 0) or `-EAGAIN` when the ring is empty (or the caller has no private slot — ASID 0). The SPSC
+/// consumer half: this EL0 task is the sole consumer of its own ring.
+fn sys_input_poll() -> i64 {
+    let asid = current_asid();
+    if asid == 0 || asid as usize > super::boot::USER_SLOTS {
+        return EAGAIN;
+    }
+    let a = asid as usize;
+    let head = EL0_INPUT_HEAD[a].load(Ordering::Relaxed); // this task is the sole consumer
+    let tail = EL0_INPUT_TAIL[a].load(Ordering::Acquire);
+    if head == tail {
+        return EAGAIN; // empty
+    }
+    let packed = EL0_INPUT_BUF[a][(head as usize) & (INPUT_RING_CAP - 1)].load(Ordering::Acquire);
+    EL0_INPUT_HEAD[a].store(head.wrapping_add(1), Ordering::Release); // consume AFTER the load
+    packed as i64
+}
+
+// ELF-5 input-test witnesses (captured kernel-side, printed by `input_launcher`). The program SYS_REPORTs
+// three observations in order (initial poll, drained event, final poll); `INPUT_OBS_N` counts them, so the
+// launcher can wait for the initial poll (>=1) before injecting, making the enqueue->drain ordering exact.
+static INPUT_OBS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+static INPUT_OBS_N: AtomicU32 = AtomicU32::new(0);
+static INPUT_PARENT_DONE: AtomicBool = AtomicBool::new(false); // the program reached its clean sys_exit(0)
+static INPUT_ENQUEUE_OK: AtomicBool = AtomicBool::new(false); // the kernel injection returned true
+
+/// ELF-5: record the input-test program's SYS_REPORTs in arrival order, keyed by name. Called from the
+/// SYS_REPORT arm alongside the other reporters; each ignores the others' names.
+fn input_report(value: u64) {
+    if super::sched::current_name() == Some("el0-input") {
+        let n = INPUT_OBS_N.fetch_add(1, Ordering::AcqRel) as usize;
+        if n < INPUT_OBS.len() {
+            INPUT_OBS[n].store(value, Ordering::Release);
+        }
+    }
+}
+
+// The input-test EL0 program: one code page, register-only (no data refs, so fully position-independent —
+// it runs wherever the loader copies it). It (1) polls once and reports the result (expect -EAGAIN, ring
+// empty), (2) poll+yields until a non-negative event arrives and reports it (the kernel-injected KeyDown),
+// (3) polls once more and reports the result (expect -EAGAIN, drained), then exits 0. Poll result / errno
+// is in x0; an event has bit 63 clear, `-EAGAIN` has it set — so `tbz x0,#63` distinguishes them.
+core::arch::global_asm!(
+    r#"
+    .balign 4
+    .globl __input_blob_start
+__input_blob_start:
+    .globl __input_prog
+__input_prog:
+    mov  x8, #27                          // (1) SYS_INPUT_POLL — expect -EAGAIN (ring empty)
+    svc  #0
+    mov  x8, #3                           // SYS_REPORT(obs[0] = poll result); x0 still holds it
+    svc  #0
+1:  mov  x8, #27                          // (2) SYS_INPUT_POLL, looping until an event arrives
+    svc  #0
+    tbz  x0, #63, 2f                      // bit 63 clear => a packed event (>= 0); else -EAGAIN
+    mov  x8, #4                           // SYS_YIELD — let the launcher inject / other cores run
+    svc  #0
+    b    1b
+2:  mov  x8, #3                           // SYS_REPORT(obs[1] = the drained event); x0 holds it
+    svc  #0
+    mov  x8, #27                          // (3) SYS_INPUT_POLL — expect -EAGAIN (drained)
+    svc  #0
+    mov  x8, #3                           // SYS_REPORT(obs[2] = poll result)
+    svc  #0
+    mov  x0, #0                           // SYS_EXIT(0) -> routed to the ELF-5 witness by name
+    mov  x8, #2
+    svc  #0
+3:  b 3b
+    .balign 4
+    .globl __input_blob_end
+__input_blob_end:
+"#
+);
+
+unsafe extern "C" {
+    static __input_blob_start: u8;
+    static __input_blob_end: u8;
+    static __input_prog: u8;
+}
+
+/// ELF-5 input-test launcher + verdict (the `threads_launcher` shape: one gated kernel task, self-contained,
+/// its own uncounted `:: EL0: input test … ::` line). Copies the input blob into a fresh slot's code page,
+/// protects it EL0-RX/EL1-RO, REGISTERS the slot as the active input target, and runs `el0-input` on THIS
+/// core (so the cooperative-yield verdict drives it under QEMU). Once the program has done its initial poll
+/// (observed the empty ring), the launcher injects ONE KeyDown('A') through the REAL `el0_input_enqueue`
+/// router seam (proving pack + active routing), then waits for the program to drain it and exit. The verdict
+/// asserts: initial poll == -EAGAIN, injection returned true, the drained event == the expected packed value,
+/// final poll == -EAGAIN. QEMU raspi4b has no USB HID, so the kernel-injected event is what proves the
+/// enqueue->drain path here — an honest statement of what QEMU can and cannot show. Never perturbs the
+/// fixture battery (its own line, exit routed by name).
+fn input_launcher(_demo_cpu: usize) {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let bstart = &raw const __input_blob_start as usize;
+    let bend = &raw const __input_blob_end as usize;
+    let blen = bend - bstart;
+    if blen > super::boot::USER_CODE_SIZE {
+        serial_println!(":: EL0: input test — blob {} B > code page, SKIP ::", blen);
+        return;
+    }
+    let (base, size) = super::boot::user_region();
+    let sp = (base + size as u64) & !0xF; // 16-aligned window top = the program's initial SP_EL0
+    let Some(slot) = super::boot::alloc_user_slot() else {
+        serial_println!(":: EL0: input test — no free address-space slot, SKIP ::");
+        return;
+    };
+    let backing = super::boot::slot_backing_ptr(slot);
+    unsafe { core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen) };
+    super::cache::icache_sync_range(backing as usize, blen);
+    unsafe { super::boot::protect_user_slot_code(slot, super::boot::USER_CODE_SIZE) };
+    let ttbr0 = super::boot::slot_ttbr0(slot);
+    let asid = ttbr0 >> 48;
+    install_console_cap(asid);
+    // ELF-5: register this process as the active input target BEFORE it runs, so `el0_input_enqueue` routes
+    // to its ring (and resets the ring — a clean start).
+    el0_input_set_active(asid);
+    let entry = base + (&raw const __input_prog as usize - bstart) as u64;
+    let run_cpu = super::percpu::this_cpu().cpu_index as usize;
+    super::sched::spawn_user_slot("el0-input", entry, sp, ttbr0, run_cpu);
+
+    let vstart = super::timer::cntpct();
+    let vdeadline = 2 * super::timer::cntfrq();
+    // Wait until the program has done its INITIAL poll (obs count >= 1 => it observed the empty ring), so the
+    // injection lands strictly AFTER the empty observation — the enqueue->drain ordering is then exact.
+    while INPUT_OBS_N.load(Ordering::Acquire) < 1
+        && super::timer::cntpct().wrapping_sub(vstart) <= vdeadline
+    {
+        super::sched::yield_now();
+    }
+    // Inject one KeyDown('A') through the REAL router seam — targets the active ASID (this program's ring).
+    let ok = el0_input_enqueue(crate::pal::Event::Key(b'A'));
+    INPUT_ENQUEUE_OK.store(ok, Ordering::Release);
+    // Wait (bounded) for the program to drain the event and exit cleanly.
+    while !INPUT_PARENT_DONE.load(Ordering::Acquire)
+        && super::timer::cntpct().wrapping_sub(vstart) <= vdeadline
+    {
+        super::sched::yield_now();
+    }
+    // Clear the active designation (also cleared at slot teardown; explicit here for symmetry).
+    el0_input_set_active(0);
+
+    let obs0 = INPUT_OBS[0].load(Ordering::Acquire);
+    let obs1 = INPUT_OBS[1].load(Ordering::Acquire);
+    let obs2 = INPUT_OBS[2].load(Ordering::Acquire);
+    let n = INPUT_OBS_N.load(Ordering::Acquire);
+    let done = INPUT_PARENT_DONE.load(Ordering::Acquire);
+    let expected = (INPUT_EV_KEY_DOWN << 48) | (b'A' as u64);
+    let eagain = EAGAIN as u64; // -EAGAIN sign-extended to u64
+    if done && ok && n == 3 && obs0 == eagain && obs1 == expected && obs2 == eagain {
+        serial_println!(
+            ":: EL0: input test — poll-empty=EAGAIN enqueue=1 event={:#x} drained=EAGAIN :: PASS ::",
+            obs1
+        );
+    } else {
+        serial_println!(
+            ":: EL0: input test — n={} obs0={:#x} obs1={:#x}(want {:#x}) obs2={:#x} enq={} done={} :: FAIL ::",
+            n, obs0, obs1, expected, obs2, ok, done
+        );
+    }
+}
+
 // ELF-3 fb-test witnesses (captured kernel-side, printed by `fb_launcher`).
 static FB_PARENT_DONE: AtomicBool = AtomicBool::new(false); // the parent reached its clean sys_exit(0)
 static FB_PRESENT_COUNT: AtomicU64 = AtomicU64::new(0); // SYS_FB_PRESENT calls (want 1)
@@ -9914,6 +10229,13 @@ pub fn u7_launcher(demo_cpu: usize) {
     // (the SYS_FB_* / SYS_FUTEX primitives it builds on are proven, and the futex pool is armed). Its own
     // uncounted `:: EXEC-UVUG: … ::` verdict; an honest skip without the fixture.
     uvug_witness(demo_cpu);
+    // ELF-5: input into EL0 — SYS_INPUT_POLL + the per-process ring + the `el0_input_enqueue` router seam.
+    // A register-only EL0 program polls its ring empty (-EAGAIN), the launcher injects one KeyDown through
+    // the real router seam, the program drains it (verifying the packed value) and polls empty again. In-RAM
+    // (no disk), so it can never perturb the fixture battery; its own uncounted `:: EL0: input test — … ::`
+    // line. Placed after the EL0 graphics/thread ladder (the primitives it complements are proven). QEMU has
+    // no real HID, so the kernel-injected event is what proves the enqueue->drain path (honest by design).
+    input_launcher(demo_cpu);
     // K3: the revoke-persist commit-ordering proof — a named-owner file's SYS_FGRANT revoke commits to disk
     // BEFORE the in-RAM removal, so it SURVIVES REBOOT and fails CLOSED on a persist failure. Its own uncounted
     // `:: K3-revoke: … PASS ::` line; fully self-cleaning (leaves no owned row on the metal card).

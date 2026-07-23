@@ -417,6 +417,43 @@
   it lands, `SYS_FB_PRESENT` composites nothing to the screen, so the panel run prints the witness and exits
   cleanly but shows no pixels. Lane: `crates/user-uvug` + `arroyo` (build/stage) + an additive
   `arch/aarch64/syscall.rs` (`futex_init` in `run_user_image` + the `uvug_witness` self-test) + this doc.
+- **ELF-5 (landed 2026-07-23)** — rung 4 of the EL0-vug ladder: **input into EL0**. An interactive EL0 app
+  (built on ELF-3's surface + ELF-2's threads + ELF-3's futex) needs keys/mouse; this is the delivery half.
+  **`SYS_INPUT_POLL = 27`** is a NON-BLOCKING dequeue: it returns the next input event queued for the CALLING
+  process, or `-EAGAIN` when its ring is empty. The event is a **packed u64** whose bit 63 is always clear
+  (so it never aliases a negative errno): `[55:48]` = type (`1` KeyDown, `2` KeyUp, `3` MouseRel, `4`
+  MouseAbs, `5` Button), the low 32 bits the payload — key ASCII / button mask in `[7:0]`, mouse x/dx in
+  `[31:16]` and y/dy in `[15:0]` (i16). Kernel side mirrors how the GUI routes input to kernel apps today
+  (the GUI-CLICK-2b `SCREEN_APP_ACTIVE` gate + `gui_watchdog`: only the ACTIVE app receives input): a small
+  **per-ASID ring** (`EL0_INPUT_BUF`/`HEAD`/`TAIL`, cap 32), a single producer (the router) + single
+  consumer (the EL0 task) so it is a **lock-free SPSC ring** (drop-newest on a full ring — an unread event is
+  never overwritten). Two **public in-lane seams** (the ELF-3 present-hook twins): `el0_input_enqueue(ev)`
+  (the router pushes a decoded `pal::Event` into the active process's ring) and `el0_input_set_active(asid)` /
+  `el0_input_active()` (focus registration — the ELF-5 analogue of `SCREEN_APP_ACTIVE`; setting a focus
+  resets that ring, so a freshly-focused app starts clean). Teardown folds in: `clear_handle_row` now resets
+  the ASID's ring and clears the active designation if the dying slot held it (a reused ASID inherits no
+  stale input; the router never enqueues to a dead slot). **SYS_INPUT_WAIT = 28 is DEFERRED** (documented at
+  the seam) — a blocking variant on a per-ASID `Semaphore` that `el0_input_enqueue` would post; QEMU has no
+  real input source, so `SYS_INPUT_POLL` is the QEMU-provable rung this arc lands. Test (`__input_prog`,
+  in-RAM, register-only): the program polls its ring empty (`-EAGAIN`), the launcher — after the initial
+  empty observation, so the ordering is exact — injects ONE `KeyDown('A')` through the real
+  `el0_input_enqueue` seam, the program poll+yields until the event arrives, verifies the packed value, then
+  polls empty again. QEMU-verified (`UNAOS_V3D=1 UNAOS_GENET=1 UNAOS_PIUSB=1 ./arroyo kernel8-test`):
+  `:: EL0: input test — poll-empty=EAGAIN enqueue=1 event=0x1000000000041 drained=EAGAIN :: PASS ::` (the
+  packed event = `(KeyDown<<48) | 'A'`), with the whole prior battery (CAPSTONE 6/6, ELF1/EXEC1, ELF-2 threads,
+  ELF-3 fb, UVUG) byte-equivalent. **HONEST QEMU NOTE:** QEMU raspi4b delivers no USB HID, so the
+  kernel-injected event is what proves the enqueue->drain + `-EAGAIN` paths — the router edge (real HID ->
+  ring) is metal-only, lit up by the deferred fold. **DEFERRED ROUTER WIRING (2-3 lines, OUTSIDE this lane —
+  `main.rs` `pump_usb_into_gui`, the next arc folds):** when an EL0 app owns the screen (an ELF-5 analogue of
+  `SCREEN_APP_ACTIVE`, its ASID registered via `el0_input_set_active`), route drained pal events to the EL0
+  ring instead of `GUI_CHANNEL`:
+  ```rust
+  while let Some(ev) = unaos_kernel::pal::next_event() {
+      unaos_kernel::arch::aarch64::syscall::el0_input_enqueue(ev); // -> the active EL0 app's ring
+  }
+  ```
+  Lane: `arch/aarch64/syscall.rs` (the ring + seams + `sys_input_poll` + the `clear_handle_row` fold + the
+  in-RAM witness) + this doc — no scheduler primitive, no driver, no `main.rs`/`pal.rs` change, no x86 file.
 - Not yet: **revocation trees** (a derived copy — re-grant or onward re-transfer — escapes
   single-level revoke today; derivation records + `CAP_REVOKE` are that arc), the **bandy Ring-3
   delegation wrapper**, `File` transfer (descriptor migration), real `Socket` fs/net syscalls.
@@ -581,6 +618,7 @@ Conventions shared across arches:
   | 24 | `SYS_FB_MAP` | — | surface VA / `-errno` | aarch64 **ELF-3** — maps the process's off-screen surface (EL0-RW) + RO info page; EL0 never gets the scan-out |
   | 25 | `SYS_FB_PRESENT` | — | 0 / `-errno` | aarch64 **ELF-3** — kernel composites the surface to the screen (present hook); records the surface checksum |
   | 26 | `SYS_FUTEX` | uaddr, op, val | op-specific / `-errno` | aarch64 **ELF-3** — op 0 WAIT (block iff `*uaddr==val`), op 1 WAKE (wake ≤`val`); phys-addr-keyed wait queue |
+  | 27 | `SYS_INPUT_POLL` | — | packed event ≥ 0 / `-EAGAIN` | aarch64 **ELF-5** — nonblocking next input event for the caller (packed u64: `[55:48]`=type, low 32=payload), `-EAGAIN` when its per-process ring is empty; the router fills the ACTIVE process's ring via `el0_input_enqueue` |
 
   aarch64 leads 4–9 (M6f 4–7, M7 8–9) and 21–23 (ELF-2 threading); the x86 U-side port adopts the same
   numbers so the arches stay aligned (x86 adds SMAP considerations aarch64's PAN-less A72 lacks).
