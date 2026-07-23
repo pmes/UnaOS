@@ -3,6 +3,30 @@
 Hard-won silicon facts from the fox-metal sitting series. Trust these over any
 QEMU behavior. Newest sitting first.
 
+## Sitting #15 (display pull 5, UnaOS-gemini@5686f417/e9b1e89f, 2026-07-23, fox-metal-r23s1i)
+
+**Boot 1 (5686f417) — no write occurred:** the LEGACY EVO-mirror head-match
+gate (refuted decode, s11) sat upstream of the repoint code and aborted
+(`takeover-abort no-match`). Land-review miss (control flow not verified to
+reach the new code); fixed inline at e9b1e89f — gate defaults to head 0
+(HEAD_STAT canon) with an honest marker; refuted bounds check neutralized.
+
+**Boot 2 (e9b1e89f) — repoint hypothesis REFUTED, cleanly:**
+- Full ladder ran twice (known double-invocation), both passes identical:
+  surf2 filled (0x1600000, 0x13C6800 bytes green) →
+  `repoint wrote=00016000 rb=00000200` — **the write does not take; readback
+  is the original value immediately** → raster ticked through all 5 hold
+  seconds (vert 0x11C3→0x1206) → restore rb=00000200 → `verdict rb-stuck=no`.
+  Panel never changed (nothing was armed). Boot continued normally.
+- **Verdict: 0x6101E0 is a READ-ONLY armed-state readout, not a writable
+  pointer.** Consistent with EVO armed-vs-assembly semantics: the armed
+  surface value is reported here, but arming goes through the core channel's
+  assembly state + an UPDATE/latch step (s13's 0x494=1 companion and the
+  descriptor table at 0x6104A0+ are the standing leads).
+- Bench note: the "stray no-match line" reported for boot 2 was a cross-mark
+  grep artifact (it was boot 1's abort in the same accumulating log); the
+  boot-2 segment is clean.
+
 ## Sitting #14 (display pull 4, UnaOS-gemini@114fad64, 2026-07-23, fox-metal-r23s1i)
 
 **Single read-only boot — EVO core-channel read-out. THE SURFACE REGISTER
