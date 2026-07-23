@@ -1,6 +1,10 @@
 # PROPOSAL — Kepler Pull 10: Sched-Precondition & Reject Reason
 
-STATUS: APPROVED WITH AMENDMENTS (2026-07-22 — error-readback-first shape,
+STATUS: LANDED 2650a38b (2026-07-22 — error-readback at pre-init/post-init/
+post-submit with "absent?" honesty per A2, invalidate→modify→validate order,
+bit30 POLL_ENABLE asserted, no fuzz rider per A1. Gates green, strings-proven.
+Metal owed: sitting #9.)
+Prior: APPROVED WITH AMENDMENTS (2026-07-22 — error-readback-first shape,
 invalidate→modify→validate ordering, and the bit30 hypothesis all accepted;
 the honest "no USERD-enable register in rnndb" is noted. Amendments:
 A1 — NO undocumented-register write fuzzing in this pull: if the readback

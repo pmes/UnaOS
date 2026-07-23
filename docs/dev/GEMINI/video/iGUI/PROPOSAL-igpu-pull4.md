@@ -1,6 +1,10 @@
 # PROPOSAL — iGPU Pull 4: gmux Indexed Protocol & Decode
 
-STATUS: APPROVED WITH AMENDMENTS (2026-07-22 — handshake sequence, version
+STATUS: LANDED 6ee2eaf8 (2026-07-22 — full handshake with bounded waits both
+sides, version self-test as a decode GATE (raw-only on unproven protocol per
+A1), 6-reg ABI carried per A2, arch gate intact. Gates green, strings-proven
+both artifacts. Metal owed: sitting #9.)
+Prior: APPROVED WITH AMENDMENTS (2026-07-22 — handshake sequence, version
 self-test gate, register set, decode table, and timeout fallback all accepted
 as specified; port/index/protocol facts and decode values are consistent with
 the known apple-gmux hardware facts. Amendments:
