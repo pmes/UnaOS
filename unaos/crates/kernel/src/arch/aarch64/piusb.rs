@@ -887,6 +887,38 @@ fn m1_rc_bringup() -> bool {
         "{}   RC_BAR2 readback: CONFIG_LO={:#010x} CONFIG_HI={:#010x} (size-code {:#x} = 4 GiB inbound) ::",
         P, r(RC_BASE + PCIE_MISC_RC_BAR2_CONFIG_LO), r(RC_BASE + PCIE_MISC_RC_BAR2_CONFIG_HI), RC_BAR2_SIZE_4G
     );
+    // (e′) PIUSB-20 DECODE WITNESS — spell out the inbound match window + the applied cpu→pci offset.
+    //     RC_BAR2 encoding (brcmstb `brcm_pcie_get_rc_bar2_size_and_offset`): the inbound MATCH ADDRESS is
+    //     the LOWEST PCIe address in the DTB `dma-ranges`, split across CONFIG_LO[31:5] (low, size-code in
+    //     [4:0]) and CONFIG_HI[31:0] (high). The device-visible cpu→pci translation offset is
+    //     `pci_addr - cpu_addr` from that same `dma-ranges` entry.
+    //
+    //     AUTHORITATIVE dma-ranges (BCM2711, `bcm2711.dtsi` `pcie@7d500000`; QEMU raspi4b models no RC so
+    //     there is no firmware DTB node to parse — the values are the fixed BCM2711 facts):
+    //         dma-ranges = <0x02000000 0x0 0x00000000   0x0 0x00000000   0x4 0x00000000>;
+    //                        \_flags_/ \__PCIe addr__/   \__CPU addr__/   \___size 16G__/
+    //     PCIe base 0x0 == CPU base 0x0  ⇒  match address = 0, and the cpu→pci offset is 0 (1:1). So a host
+    //     physical address is handed to the VL805 UNCHANGED as its bus address; DCBAAP/CRCR/ERST/TRB
+    //     pointers need NO translation on BCM2711 (unlike the pre-C0 `0xc0000000` era or a Tegra-style
+    //     offset). Any nonzero offset here would MIS-match the window and break the (already-working)
+    //     inbound command fetch — so match-base 0 / offset 0 is the correct programming, confirmed by the
+    //     live command-ring READ landing at boot P29. This witness makes offset==0 explicit per boot.
+    let bar2_lo = r(RC_BASE + PCIE_MISC_RC_BAR2_CONFIG_LO);
+    let bar2_hi = r(RC_BASE + PCIE_MISC_RC_BAR2_CONFIG_HI);
+    let match_base: u64 = ((bar2_hi as u64) << 32) | ((bar2_lo & !0x1f) as u64);
+    let size_code = bar2_lo & 0x1f;
+    // Decode size-code back to bytes (inverse of brcm_pcie_encode_ibar_size): [0x1c,0x1f]→4K..32K,
+    // [0x01,0x14]→64K..32G, 0→disabled.
+    let size_bytes: u64 = match size_code {
+        0x1c..=0x1f => 1u64 << ((size_code - 0x1c) + 12),
+        0x01..=0x14 => 1u64 << (size_code + 15),
+        _ => 0,
+    };
+    const CPU_TO_PCI_OFFSET: u64 = 0; // BCM2711 dma-ranges: pci_addr(0) - cpu_addr(0) = 0 (1:1)
+    serial_println!(
+        "{}   PIUSB-20 RC_BAR2 DECODE: inbound match_base={:#x} size={:#x}B (code {:#x}) | dma-ranges cpu→pci offset={:#x} (BCM2711 1:1) — bus addrs handed to VL805 UNCHANGED ::",
+        P, match_base, size_bytes, size_code, CPU_TO_PCI_OFFSET
+    );
 
     // (f) Outbound MEM window: CPU 0x6_0000_0000 decodes PCIe 0xC000_0000, size 1 GiB.
     //
