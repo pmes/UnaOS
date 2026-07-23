@@ -53,7 +53,7 @@ if ! diskutil info "$DISK" | grep -q "Virtual:.*Yes"; then
 fi
 echo "    attached as ${DISK}"
 
-diskutil partitionDisk "$DISK" MBR "MS-DOS FAT32" UNAOS 100% >/dev/null
+diskutil partitionDisk "$DISK" MBR "MS-DOS FAT32" UNAOS-PI 100% >/dev/null
 VOLDEV="${DISK}s1"
 # Resolve the mount point, retrying (and explicitly mounting) since the auto-mount after partitionDisk
 # can lag; never assume /Volumes/UNAOS (a stale physical mount could shift it).
