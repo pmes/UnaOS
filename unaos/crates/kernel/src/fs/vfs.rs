@@ -436,11 +436,11 @@ impl FatBackend {
     }
 
     /// VFS-3: mount the hot-plugged USB FAT stick into the VFS, read through the
-    /// xHCI [`Usb`](crate::fs::fat::BlockSource::Usb) source — the same read-only
-    /// mount `ls /usb` and the `/fs/usb` HTTP route already use. World-readable
-    /// (its contents are meant to be read) and **read-only**: every write verb
-    /// returns [`VfsError::Unsupported`], honoring the PIUSB-27 by-construction
-    /// read-only guard rather than emitting a raw block I/O error.
+    /// xHCI [`Usb`](crate::fs::fat::BlockSource::Usb) source — the same mount
+    /// `ls /usb` and the `/fs/usb` HTTP route already use. World-readable (its
+    /// contents are meant to be read) and **writable** since USB-WRITE: the
+    /// write verbs route to the verified BOT WRITE(10) path (`write_block_usb`,
+    /// MISSION RMW+restore witnessed), which superseded the PIUSB-27 guard.
     pub fn new_usb(volume: &str, principal: &str) -> Self {
         Self {
             volume: volume.to_string(),
