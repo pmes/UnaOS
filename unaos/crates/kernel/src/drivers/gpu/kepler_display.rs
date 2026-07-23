@@ -230,11 +230,14 @@ pub unsafe fn takeover_display(
         return None;
     }
 
+    // Legacy EVO-mirror head matching is refuted history (s11): found_head is
+    // always None on this silicon. Head 0 is the proven-alive head (HEAD_STAT
+    // canon, s11–s14) — default to it honestly instead of aborting.
     let head = match found_head {
         Some(h) => h,
         None => {
-            serial_println!(":: kdisp: takeover-abort no-match ::");
-            return None;
+            serial_println!(":: kdisp: head-match absent — using head 0 (HEAD_STAT canon) ::");
+            0
         }
     };
 
@@ -247,14 +250,7 @@ pub unsafe fn takeover_display(
     };
     let expected_width = gop_info.width as u32;
     let expected_height = gop_info.height as u32;
-
-    let width = matched_size & 0xFFFF;
-    let height = matched_size >> 16;
-    if width != expected_width || height != expected_height {
-        serial_println!(":: kdisp: takeover-abort bounds head={} {}x{} vs {}x{} ::",
-            head, width, height, expected_width, expected_height);
-        return None;
-    }
+    let _ = matched_size; // refuted-mirror data; not a gate (s15 no-match lesson)
 
     let bar1 = vram_base;
     let fb_size = (expected_width * expected_height * 4) as usize;
