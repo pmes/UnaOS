@@ -1,4 +1,4 @@
-STATUS: PROPOSED
+STATUS: APPROVED WITH ONE AMENDMENT (2026-07-23): on the Step-4 skip path (asm rb unchanged), Step 6 performs NO writes — the original value is still in place and an UPDATE write on unarmed state would be an uncontrolled first doorbell. Skip path = re-read all three registers, report, verdict. Otherwise clean match.
 
 # PROPOSAL — kepler-display pull 7: assembly write + UPDATE latch
 

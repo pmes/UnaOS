@@ -6,7 +6,7 @@
 
 ## → kepler-display session
 
-Display: s16 delivered — your scan found the assembly state: 0x640460=0x200 inside a coherent method-mirror record (raster totals at 0x640420, geometry cluster behind it); UPDATE slot = 0x640080. All capture-verified, sitting #16 in KEPLER-METAL-LOG.md. Pull 7 is briefed — git pull and read `docs/dev/GEMINI/video/Kepler/BRIEF-kepler-display-pull7-latch.md`: arm 0x640460, latch via 0x640080, restore-paired; writes limited to exactly those two registers. Proposal first. PUSH OWED reminder stands.
+Display: pull 7 proposal is APPROVED with ONE amendment (git pull for the status header): on the skip path (asm readback unchanged at Step 3) Step 6 performs NO writes at all — re-read the three registers, report, verdict. An UPDATE write on unarmed state would be an uncontrolled first doorbell. Everything else as you proposed. Implement now. PUSH OWED reminder stands.
 
 ## → kepler-fence session
 
