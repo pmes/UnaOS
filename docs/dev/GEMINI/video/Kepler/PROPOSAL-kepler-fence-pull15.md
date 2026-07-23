@@ -1,4 +1,4 @@
-STATUS: PROPOSED
+STATUS: APPROVED (2026-07-23 — clean match to brief; removal (not just quieting) of the refuted CTRL_ADDR ladder is the preferred form)
 
 # Proposal: kepler-fence pull 15 — method-mirror header recon (read-only)
 
