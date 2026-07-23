@@ -443,21 +443,22 @@ fn drain_input(pal: &mut TargetPal) -> bool {
 // ---------------------------------------------------------------------------------------------
 // GAME-MODE — held-key stepping + drag-rotate for the crystal ("UnaOS-native, like a game").
 //
-// WHAT THE INPUT STREAM ACTUALLY DELIVERS (xHCI HID boot protocol — see drivers/xhci/mod.rs):
-//   * Keyboard: one `Event::Key(ascii)` on the PRESS of a mapped key. There is NO key-up event
-//     (a release is an all-zero boot report that decodes to nothing) and NO SET_IDLE is issued,
-//     so auto-repeat while a key stays down is NOT guaranteed. Arrow keys are absent from the
-//     ASCII table (they decode to 0), so WASD/QE are the reliable controls.
+// WHAT THE INPUT STREAM DELIVERS (xHCI HID boot protocol — see drivers/xhci/mod.rs; since HID-KEYS):
+//   * Keyboard: `Event::Key(ascii)` on the PRESS edge and `Event::KeyUp(ascii)` on the RELEASE edge
+//     of a mapped key (the HID decoder edge-detects both against the previous boot report). SET_IDLE(0)
+//     is armed, so the device reports only on change — a held key sends ONE press and no repeats until
+//     its release. Arrow keys decode to the C0 control codes below (Right 0x1C, Left 0x1D, Down 0x1E,
+//     Up 0x1F) and join WASD as movement controls.
 //   * Pointer: `Event::Mouse{dx,dy}` on any relative motion (independent of buttons);
-//     `Event::MouseAbsolute{x,y}` for tablet/absolute pointers; `Event::Button(mask)` ONCE on the
-//     button-DOWN edge only. A button RELEASE is not delivered (the GUI-CLICK-2b gap).
+//     `Event::MouseAbsolute{x,y}` for tablet/absolute pointers; `Event::Button(mask)` on BOTH the
+//     press edge (mask != 0) and the release edge (mask == 0) — the GUI-CLICK-2b gap is closed.
 //
-// CONSEQUENCE / SAFE SUBSET: with no key-up and no button-release we cannot maintain a true
-// press/release held-state. Instead each movement-key press arms a short HOLD window and the key
-// reads "held" until it lapses (a resent report while down refreshes it → continuous stepping;
-// otherwise a press nudges with a brief momentum). Drag-rotate is driven by pointer MOTION events
-// (which flow regardless of button state) rather than a held button, since the button-down edge is
-// already the click-to-exit observable and no release arrives to end a drag.
+// MODEL (GAME-MODE-2, TRUE held state): a Key press sets a movement key's held bit; its KeyUp clears
+// it — the crystal steps continuously exactly while the key is down. A hot-unplug safety net drops a
+// held key whose press has not been refreshed for ~2 s (a stuck/vanished device never releases). A
+// pointer button press starts a DRAG (motion rotates the crystal only while dragging); the release
+// ends it. A press+release with no motion past a small pixel threshold is a CLICK → exit (drag and
+// click-to-exit coexist). Any non-mapped key also exits (the shell exit contract is preserved).
 // ---------------------------------------------------------------------------------------------
 
 const G_YAW_L: u8 = 1 << 0; // 'a' — yaw left
@@ -468,14 +469,21 @@ const G_ZOOM_IN: u8 = 1 << 4; // 'e' / '+' / '=' — zoom in (camera nearer)
 const G_ZOOM_OUT: u8 = 1 << 5; // 'q' / '-' / '_' — zoom out (camera farther)
 const G_BITS: usize = 6;
 
-/// Map an ASCII key to its movement bit, or `None` if it is not a game-mode control. A `None` key
-/// takes the shell exit path (any non-mapped key exits), so the exit contract is preserved.
+// HID-KEYS arrow C0 codes (see the module notes) — arrows join WASD as movement controls.
+const K_RIGHT: u8 = 0x1C;
+const K_LEFT: u8 = 0x1D;
+const K_DOWN: u8 = 0x1E;
+const K_UP: u8 = 0x1F;
+
+/// Map an ASCII/C0 key to its movement bit, or `None` if it is not a game-mode control. A `None`
+/// key takes the shell exit path (any non-mapped key exits), so the exit contract is preserved.
+/// Arrow keys (their C0 codes) mirror WASD: Left/Right yaw, Up/Down pitch.
 fn game_key_bit(k: u8) -> Option<u8> {
     match k.to_ascii_lowercase() {
-        b'a' => Some(G_YAW_L),
-        b'd' => Some(G_YAW_R),
-        b'w' => Some(G_PIT_U),
-        b's' => Some(G_PIT_D),
+        b'a' | K_LEFT => Some(G_YAW_L),
+        b'd' | K_RIGHT => Some(G_YAW_R),
+        b'w' | K_UP => Some(G_PIT_U),
+        b's' | K_DOWN => Some(G_PIT_D),
         b'e' | b'+' | b'=' => Some(G_ZOOM_IN),
         b'q' | b'-' | b'_' => Some(G_ZOOM_OUT),
         _ => None,
@@ -485,18 +493,21 @@ fn game_key_bit(k: u8) -> Option<u8> {
 /// GAME-MODE per-frame input, accumulated over one full drain of the event queue.
 #[derive(Default, Clone, Copy)]
 struct GameInput {
-    exit: bool,   // a non-mapped key or a button press-edge asked to exit
-    pressed: u8,  // movement-key bits freshly seen this drain
-    mdx: i32,     // summed relative pointer dx this drain (drag-rotate)
-    mdy: i32,     // summed relative pointer dy this drain
-    motion: bool, // any pointer motion this drain
+    exit: bool,     // a non-mapped key asked to exit (shell exit contract)
+    pressed: u8,    // movement-key bits whose PRESS edge landed this drain
+    released: u8,   // movement-key bits whose RELEASE edge (KeyUp) landed this drain
+    btn_down: bool, // a pointer button PRESS edge (mask != 0) this drain — starts a drag
+    btn_up: bool,   // a pointer button RELEASE edge (mask == 0) this drain — ends a drag
+    mdx: i32,       // summed relative pointer dx this drain (drag-rotate)
+    mdy: i32,       // summed relative pointer dy this drain
 }
 
 /// GAME-MODE input drain — the crystal's frame-paced pump. Drains EVERY queued event this frame
 /// (`pump_and_poll` until empty, so a burst never backs up one-per-frame AND `note_progress` fires
-/// on each pass, keeping the app-input watchdog fed). Movement keys feed the held-step model; any
-/// other key, or a button press-edge, requests exit (shell exit paths preserved). Pointer motion
-/// both drives the cursor sprite (CURSOR-VIS) and accumulates a drag-rotate delta.
+/// on each pass, keeping the app-input watchdog fed). Movement-key PRESS edges arm the held bit and
+/// KeyUp RELEASE edges clear it (TRUE held state); a non-mapped key requests exit (shell exit path
+/// preserved). Pointer button press/release edges bracket a drag; pointer motion drives the cursor
+/// sprite (CURSOR-VIS) and accumulates the drag-rotate delta the loop applies while dragging.
 fn drain_game_input(pal: &mut TargetPal) -> GameInput {
     let (w, h) = (pal.width() as i32, pal.height() as i32);
     let mut gi = GameInput::default();
@@ -504,18 +515,31 @@ fn drain_game_input(pal: &mut TargetPal) -> GameInput {
         match e {
             Event::Key(k) => match game_key_bit(k) {
                 Some(bit) => gi.pressed |= bit,
-                None => gi.exit = true,
+                None => gi.exit = true, // any non-mapped key exits
             },
-            Event::Button(_) => gi.exit = true,
+            // A movement key's release clears its held bit; a non-mapped KeyUp is ignored (only the
+            // PRESS of a non-mapped key exits — a release must never trigger the exit path).
+            Event::KeyUp(k) => {
+                if let Some(bit) = game_key_bit(k) {
+                    gi.released |= bit;
+                }
+            }
+            // Button now fires on both edges: mask != 0 is a press (start drag), mask == 0 a release
+            // (end drag; the loop decides click-vs-drag from the motion accumulated in between).
+            Event::Button(mask) => {
+                if mask != 0 {
+                    gi.btn_down = true;
+                } else {
+                    gi.btn_up = true;
+                }
+            }
             Event::Mouse { x, y } => {
                 crate::pal::cursor::move_rel(x, y, w, h);
                 gi.mdx += x;
                 gi.mdy += y;
-                gi.motion = true;
             }
             Event::MouseAbsolute { x, y } => {
                 crate::pal::cursor::set_abs(x, y, w, h);
-                gi.motion = true;
             }
             _ => {}
         }
@@ -582,14 +606,21 @@ pub fn run_crystal(pal: &mut TargetPal, mode: Mode) {
     // VUG-PAR: the max parallel band count seen in the window — reads the parallel flush win directly.
     let mut wit_bands: usize = 1;
 
-    // GAME-MODE held-key model. The HID path delivers a Key event on PRESS only (no key-up, no
-    // guaranteed auto-repeat — see the module notes above), so each press arms a hold window and a
-    // key reads "held" until it lapses. `held_until[bit]` is the ms deadline; a fresh report while
-    // the key is down refreshes it (continuous stepping), otherwise a press nudges with momentum.
-    let mut held_until = [0u64; G_BITS];
-    const HOLD_MS: u64 = 220; // how long a press keeps a key "held" absent a fresh report
-    const DRAG_MS: u64 = 160; // how long pointer motion keeps the drag witness live
-    let mut drag_until: u64 = 0;
+    // GAME-MODE TRUE held-key model (GAME-MODE-2). Since HID-KEYS the HID path delivers a Key on the
+    // PRESS edge and a KeyUp on the RELEASE edge, so a key's held bit is set on press and cleared on
+    // release — continuous stepping exactly while down. `held` is the live mask; `key_seen[bit]` is
+    // the ms of that bit's last press, used only by the hot-unplug safety net: a held key whose press
+    // has not been refreshed within `KEY_FALLBACK_MS` (a vanished device never sends its KeyUp) is
+    // dropped so the crystal cannot spin forever.
+    let mut held: u8 = 0;
+    let mut key_seen = [0u64; G_BITS];
+    const KEY_FALLBACK_MS: u64 = 2000; // drop a held key with no press refresh for ~2 s (hot-unplug)
+    // Drag-rotate: a button press starts a drag, its release ends it; motion rotates only while
+    // dragging. `drag_motion` sums |pointer delta| from press to release — a release under
+    // `CLICK_THRESH` px is a CLICK (exit); more is a genuine drag (no exit).
+    let mut dragging = false;
+    let mut drag_motion: i32 = 0;
+    const CLICK_THRESH: i32 = 6; // total px of motion below which a press+release reads as a click
     let mut game_wit_ms = crate::arch::ms(); // GAME-MODE ~1 Hz witness cadence
 
     loop {
@@ -599,26 +630,46 @@ pub fn run_crystal(pal: &mut TargetPal, mode: Mode) {
         // pass feeds the app-input watchdog via note_progress). A non-mapped key or a click exits.
         let gi = drain_game_input(pal);
         if gi.exit {
+            serial_println!(":: [game] exit=key ::");
             break;
         }
         let now = crate::arch::ms();
-        // Arm/refresh the hold window for each freshly-pressed movement key.
+        // TRUE held state: a press sets the bit (and refreshes its safety timestamp), a KeyUp clears
+        // it. Continuous stepping runs exactly while the key is down.
         for b in 0..G_BITS {
             if gi.pressed & (1 << b) != 0 {
-                held_until[b] = now + HOLD_MS;
-            }
-        }
-        // The currently-held mask: bits whose hold window has not lapsed.
-        let mut held: u8 = 0;
-        for b in 0..G_BITS {
-            if now < held_until[b] {
                 held |= 1 << b;
+                key_seen[b] = now;
+            }
+            if gi.released & (1 << b) != 0 {
+                held &= !(1 << b);
             }
         }
-        if gi.motion && (gi.mdx != 0 || gi.mdy != 0) {
-            drag_until = now + DRAG_MS;
+        // Hot-unplug safety net: drop any held key whose press has gone unrefreshed past the fallback
+        // window (its KeyUp never arrived — a stuck or vanished device), so the crystal can't spin on.
+        for b in 0..G_BITS {
+            if held & (1 << b) != 0 && now.wrapping_sub(key_seen[b]) > KEY_FALLBACK_MS {
+                held &= !(1 << b);
+            }
         }
-        let drag = now < drag_until;
+        // Drag session bracketed by the button press/release edges. Press starts a drag and resets
+        // the motion accumulator; while dragging, pointer motion both rotates and accrues; release
+        // ends it — a release under the click threshold is a click-to-exit (drag and exit coexist).
+        if gi.btn_down {
+            dragging = true;
+            drag_motion = 0;
+        }
+        if dragging {
+            drag_motion += gi.mdx.abs() + gi.mdy.abs();
+        }
+        let drag = dragging; // rotate from pointer motion only while a drag is live
+        if gi.btn_up {
+            if drag_motion < CLICK_THRESH {
+                serial_println!(":: [game] exit=click ::");
+                break;
+            }
+            dragging = false;
+        }
 
         // Frame-paced stepping: fold held keys + pointer motion into per-frame yaw/pitch/zoom.
         const KEY_YAW: i32 = 4; // brad/frame while a yaw key is held
@@ -647,9 +698,12 @@ pub fn run_crystal(pal: &mut TargetPal, mode: Mode) {
         if held & G_ZOOM_OUT != 0 {
             dist = (dist + ZOOM_STEP).min(DIST_MAX);
         }
-        // Pointer motion → rotation (relative mice; absolute pointers drive only the cursor).
-        yaw_step += gi.mdx;
-        pit_step += gi.mdy;
+        // Pointer motion → rotation, but ONLY while dragging (a button is held). Free pointer motion
+        // just moves the cursor; the crystal rotates only when the user drags it.
+        if drag {
+            yaw_step += gi.mdx;
+            pit_step += gi.mdy;
+        }
 
         // Manual input this frame steps by the user; an idle frame keeps the auto-tumble.
         let manual = held != 0 || drag;
