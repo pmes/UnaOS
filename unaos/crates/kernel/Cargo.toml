@@ -42,6 +42,15 @@ pi = []
 # entry for a raw `_start` that sets up a stack, zeroes BSS, enables a minimal MMU (so atomics work),
 # builds a BootInfo, and calls kernel_main. Implies `pi`. Enable via `UNAOS_BAREMETAL=1`.
 baremetal = ["pi"]
+# VUG-PAR: band-parallel Screen::flush — split the damaged row-copy blit (and large clears) into
+# disjoint scanline bands dispatched to free secondary cores via sched::spawn_joinable + a JoinHandle
+# join barrier, falling back to the single-core serial flush when no free AP is scheduled. Only
+# compiled on the Pi bare-metal path (needs `sched`; gated `all(vugpar, baremetal)`). OFF => the
+# parallel machinery + its sched dependency vanish and `Screen::flush` is byte-identical to the
+# serial VUG-FPS path. The `[vugfps]` witness always reports `bands=N` (N=1 when off/serial). QEMU
+# raspi4b stays deterministic (the join barrier is a correctness barrier; band count tracks the
+# actually-scheduled cores). Enable via `UNAOS_VUGPAR=1`. See scripts/pi-vugpar-bench.md.
+vugpar = []
 # K2 metal money-shot: turn k2_liveenf_launcher into a REAL two-boot cross-reboot power-cycle proof (instead of
 # the same-boot simulate). One image, flashed once, booted twice: boot-1 (K2PRIV.BIN absent) creates+persists+
 # LEAVES an owned file; power-cycle; boot-2 (K2PRIV.BIN present) verifies the LIVE boot rebuild reinstalled the

@@ -384,6 +384,11 @@ impl<'a> TargetPal<'a> {
     pub fn last_flush_bytes(&self) -> u64 {
         self.surface.last_flush_bytes()
     }
+
+    /// VUG-PAR witness: parallel bands the last `render()` (flush) used (1 = serial / feature-off).
+    pub fn last_flush_bands(&self) -> usize {
+        self.surface.last_flush_bands()
+    }
 }
 
 impl<'a> GneissPal for TargetPal<'a> {

@@ -942,6 +942,17 @@ kernel8() {
         K8_FEATS="${K8_FEATS},v3d"
         echo -e "${COLOR_YELLOW}  • UNAOS_V3D: V3D GPU foundation bring-up (probe/MMU/clear; attended-metal for positive verify)${COLOR_RESET}"
     fi
+    # VUG-PAR: UNAOS_VUGPAR=1 adds the `vugpar` feature — band-parallel Screen::flush that splits the
+    # damaged row-copy blit into disjoint scanline bands dispatched to free secondary cores (sched::
+    # spawn_joinable + JoinHandle join barrier), falling back to the single-core serial flush when no
+    # free AP is scheduled. OFF => the parallel machinery + its sched dependency vanish and flush is
+    # byte-identical to the serial VUG-FPS path. The `[vugfps]` witness reports `bands=N` (N>=2 reads
+    # the parallel win directly on metal; N=1 = serial/fallback). QEMU raspi4b stays deterministic
+    # (join is a correctness barrier; band count tracks the scheduled cores). See scripts/pi-vugpar-bench.md.
+    if [ -n "${UNAOS_VUGPAR:-}" ]; then
+        K8_FEATS="${K8_FEATS},vugpar"
+        echo -e "${COLOR_YELLOW}  • UNAOS_VUGPAR: band-parallel flush across free secondary cores (bands=N in [vugfps]; serial fallback)${COLOR_RESET}"
+    fi
     # PI-USB-1: UNAOS_PIUSB=1 adds the `piusb` feature — the BCM2711 PCIe root complex + VL805 xHCI attach
     # (RC bridge reset / link-up / MEM-window, VL805 1106:3483 enumeration + BAR sizing, NOTIFY_XHCI_RESET
     # mailbox, polled shared-xHCI attach to the halted-but-decoding + ports-powered honesty line). The VL805

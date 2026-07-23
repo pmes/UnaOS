@@ -130,6 +130,83 @@ impl DamageSet {
     }
 }
 
+/// VUG-PAR — the maximum number of parallel flush bands (1 render core + up to 3 helper APs). The Pi
+/// 4 has 4 cores; keeping the cap here means a helper scan never exceeds the frame's true parallelism
+/// and the on-stack job array stays fixed-size (no per-frame heap for the jobs themselves).
+#[cfg(all(feature = "vugpar", feature = "baremetal"))]
+const MAX_BANDS: usize = 4;
+
+/// VUG-PAR — don't pay the spawn/join cost for a trivially small flush: only band-split when the
+/// damaged region spans at least this many scanlines. Below it the serial path is strictly cheaper
+/// (a cursor-sized dirty rect is a handful of rows), so we fall through to the byte-identical serial
+/// flush. Tuned conservatively — the win this arc chases is the panel-height rotating crystal.
+#[cfg(all(feature = "vugpar", feature = "baremetal"))]
+const PAR_MIN_ROWS: usize = 64;
+
+/// VUG-PAR — immutable work shared by every band of one flush. Lives on the flushing task's stack for
+/// the whole `flush` call; the join barrier guarantees no worker outlives it. `front` is a `Copy`
+/// `FrameBuffer` (raw base held as `usize`, so `Send`); `back_ptr`/`back_len` address the back buffer
+/// for READ-ONLY row copies. Bands write DISJOINT scanline ranges of `front`, so the concurrent blits
+/// never alias.
+#[cfg(all(feature = "vugpar", feature = "baremetal"))]
+struct FlushCommon {
+    front: FrameBuffer,
+    back_ptr: usize,
+    back_len: usize,
+    rects: [Damage; MAX_DAMAGE_RECTS],
+    nrects: usize,
+    stride: usize,
+    bpp: usize,
+}
+
+/// VUG-PAR — one band's slice of the flush: the shared work plus the half-open scanline range
+/// `[yb0, yb1)` this band owns. Bands partition the damaged y-extent into disjoint contiguous ranges,
+/// so two bands never touch the same framebuffer row.
+#[cfg(all(feature = "vugpar", feature = "baremetal"))]
+#[derive(Clone, Copy)]
+struct BandJob {
+    common: *const FlushCommon,
+    yb0: usize,
+    yb1: usize,
+}
+
+/// VUG-PAR — blit every damaged rect's rows that fall inside this band's `[yb0, yb1)` range, then
+/// clean each rect's band-local span for the non-coherent scan-out. Read-only on the back buffer,
+/// write-only on disjoint front rows — safe to run concurrently with the other bands.
+#[cfg(all(feature = "vugpar", feature = "baremetal"))]
+fn band_run(job: &BandJob) {
+    // SAFETY: `common` points at the flushing task's live stack frame; the join barrier keeps that
+    // frame alive until every band has returned. The back buffer is read-only here.
+    let c = unsafe { &*job.common };
+    let back = unsafe { core::slice::from_raw_parts(c.back_ptr as *const u8, c.back_len) };
+    for i in 0..c.nrects {
+        let d = c.rects[i];
+        let y0 = d.y0.max(job.yb0);
+        let y1 = d.y1.min(job.yb1);
+        if d.x0 >= d.x1 || y0 >= y1 {
+            continue;
+        }
+        let seg = (d.x1 - d.x0) * c.bpp;
+        for y in y0..y1 {
+            let off = (y * c.stride + d.x0) * c.bpp;
+            if off + seg <= c.back_len {
+                c.front.blit(off, &back[off..off + seg]);
+            }
+        }
+        let span_start = (y0 * c.stride + d.x0) * c.bpp;
+        let span_end = ((y1 - 1) * c.stride + d.x1) * c.bpp;
+        c.front.flush_range(span_start, span_end - span_start);
+    }
+}
+
+/// VUG-PAR — the `spawn_joinable` entry (a bare `fn(usize)`): the `usize` is the address of this
+/// band's `BandJob` on the flushing task's stack.
+#[cfg(all(feature = "vugpar", feature = "baremetal"))]
+fn band_worker(arg: usize) {
+    // SAFETY: `arg` is `&BandJob as usize` from `flush_parallel`, valid until the join barrier.
+    band_run(unsafe { &*(arg as *const BandJob) });
+}
+
 pub struct Screen {
     /// The real framebuffer (flush target).
     front: FrameBuffer,
@@ -145,6 +222,9 @@ pub struct Screen {
     damage: DamageSet,
     /// Bytes copied by the most recent [`flush`] (VUG-FPS bandwidth witness).
     last_flush_bytes: u64,
+    /// VUG-PAR — number of parallel bands the most recent [`flush`] actually used (1 = serial /
+    /// fallback / feature-off). The `[vugfps]` witness reports it as `bands=N`.
+    last_flush_bands: usize,
 }
 
 impl Screen {
@@ -181,6 +261,7 @@ impl Screen {
                 ds
             },
             last_flush_bytes: 0,
+            last_flush_bands: 1,
         }
     }
 
@@ -302,6 +383,13 @@ impl Screen {
         self.last_flush_bytes
     }
 
+    /// VUG-PAR — parallel bands the last [`flush`] used (1 = serial / fallback / feature-off). The
+    /// `[vugfps]` witness prints it as `bands=N` so a metal capture reads the parallel win directly.
+    #[inline]
+    pub fn last_flush_bands(&self) -> usize {
+        self.last_flush_bands
+    }
+
     /// Present the back buffer: copy each damaged rectangle to the framebuffer, row by row (each
     /// row a single bulk copy), then clear the damage. No-op if nothing changed. VUG-FPS: the set
     /// holds disjoint dirty regions, so a rotating crystal plus two corner widgets blit as a few
@@ -310,8 +398,18 @@ impl Screen {
         let n = self.damage.len;
         self.damage.clear();
         self.last_flush_bytes = 0;
+        self.last_flush_bands = 1;
         if n == 0 || !self.front.is_ready() {
             return;
+        }
+        // VUG-PAR: try to fan the row-copy work across free secondary cores. Returns true when it
+        // handled the flush (>= 2 bands); false to fall through to the byte-identical serial path
+        // (no free AP, or too little work to amortize the spawn/join).
+        #[cfg(all(feature = "vugpar", feature = "baremetal"))]
+        {
+            if self.flush_parallel(n) {
+                return;
+            }
         }
         let bpp = self.info.bytes_per_pixel;
         let stride = self.info.stride;
@@ -341,5 +439,117 @@ impl Screen {
             self.front.flush_range(span_start, span_end - span_start);
         }
         self.last_flush_bytes = flushed;
+    }
+
+    /// VUG-PAR — band-parallel flush. Clips the damage set, decides a band count from the currently
+    /// SCHEDULED secondary cores (`sched::core_load(cpu).tracked`, minus this core), splits the
+    /// damaged scanline extent into that many DISJOINT contiguous bands, dispatches all-but-one to
+    /// helper APs via `sched::spawn_joinable` (this core runs band 0 inline), then joins — the
+    /// correctness barrier that guarantees every band's writes land before `flush` returns.
+    ///
+    /// Returns `true` when it presented the frame (>= 2 bands used); `false` to fall through to the
+    /// serial path (no free AP, or the damage is too small to amortize spawn/join). `last_flush_bytes`
+    /// is computed here the same way the serial path counts it, so the witness is banding-independent.
+    #[cfg(all(feature = "vugpar", feature = "baremetal"))]
+    fn flush_parallel(&mut self, n: usize) -> bool {
+        use crate::arch::sched;
+
+        let bpp = self.info.bytes_per_pixel;
+        let stride = self.info.stride;
+        let blen = self.back_store.len();
+
+        // Clip the damage set once, count the bytes the flush will copy, and find the damaged
+        // scanline extent [y_lo, y_hi) that the bands will partition.
+        let mut rects = [Damage { x0: 0, y0: 0, x1: 0, y1: 0 }; MAX_DAMAGE_RECTS];
+        let mut nr = 0usize;
+        let mut flushed: u64 = 0;
+        let mut y_lo = usize::MAX;
+        let mut y_hi = 0usize;
+        for idx in 0..n {
+            let d = self.damage.rects[idx];
+            let x1 = d.x1.min(self.info.width);
+            let y1 = d.y1.min(self.info.height);
+            if d.x0 >= x1 || d.y0 >= y1 {
+                continue;
+            }
+            let seg = (x1 - d.x0) * bpp;
+            for y in d.y0..y1 {
+                let off = (y * stride + d.x0) * bpp;
+                if off + seg <= blen {
+                    flushed += seg as u64;
+                }
+            }
+            rects[nr] = Damage { x0: d.x0, y0: d.y0, x1, y1 };
+            nr += 1;
+            y_lo = y_lo.min(d.y0);
+            y_hi = y_hi.max(y1);
+        }
+        if nr == 0 {
+            self.last_flush_bytes = 0;
+            self.last_flush_bands = 1;
+            return true;
+        }
+
+        // Enumerate free helper cores: scheduled (inside `run()`) and not this core. `tracked` is the
+        // honest "is this core live in the scheduler" signal, so QEMU (however many cores it releases)
+        // and metal (at least core 2 free) both get a deterministic, real band count.
+        let self_cpu = sched::meter_current_cpu();
+        let ncpu = sched::meter_cpu_count();
+        let mut helpers = [0usize; MAX_BANDS - 1];
+        let mut nh = 0usize;
+        let mut c = 0usize;
+        while c < ncpu && nh < MAX_BANDS - 1 {
+            if c != self_cpu && sched::core_load(c).tracked {
+                helpers[nh] = c;
+                nh += 1;
+            }
+            c += 1;
+        }
+
+        let total_rows = y_hi.saturating_sub(y_lo);
+        if nh == 0 || total_rows < PAR_MIN_ROWS {
+            // No helper, or too little work: let the serial path present it (byte-identical).
+            return false;
+        }
+
+        let nbands = nh + 1;
+        let common = FlushCommon {
+            front: self.front,
+            back_ptr: self.back_store.as_ptr() as usize,
+            back_len: blen,
+            rects,
+            nrects: nr,
+            stride,
+            bpp,
+        };
+
+        // Partition [y_lo, y_hi) into `nbands` contiguous slices. Band boundaries via `y_lo + span*b/nbands`
+        // so the ranges tile the extent exactly with no gap or overlap.
+        let span = y_hi - y_lo;
+        let mut jobs: [BandJob; MAX_BANDS] =
+            [BandJob { common: &common, yb0: 0, yb1: 0 }; MAX_BANDS];
+        for b in 0..nbands {
+            jobs[b] = BandJob {
+                common: &common,
+                yb0: y_lo + span * b / nbands,
+                yb1: y_lo + span * (b + 1) / nbands,
+            };
+        }
+
+        // Dispatch bands 1..nbands to helper APs; run band 0 on this core while they work; then join.
+        // `jobs`/`common` stay on this frame — the joins below keep it alive until every band returns.
+        let mut handles: alloc::vec::Vec<sched::JoinHandle> = alloc::vec::Vec::with_capacity(nh);
+        for b in 1..nbands {
+            let arg = &jobs[b] as *const BandJob as usize;
+            handles.push(sched::spawn_joinable("vugband", band_worker, arg, helpers[b - 1]));
+        }
+        band_run(&jobs[0]);
+        for h in handles {
+            h.join();
+        }
+
+        self.last_flush_bytes = flushed;
+        self.last_flush_bands = nbands;
+        true
     }
 }

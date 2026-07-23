@@ -496,6 +496,8 @@ pub fn run_crystal(pal: &mut TargetPal, mode: Mode) {
     let mut wit_ms = crate::arch::ms();
     let mut wit_frames: u32 = 0;
     let mut wit_bytes: u64 = 0;
+    // VUG-PAR: the max parallel band count seen in the window — reads the parallel flush win directly.
+    let mut wit_bands: usize = 1;
 
     loop {
         let top = crate::arch::now_cycles();
@@ -660,6 +662,7 @@ pub fn run_crystal(pal: &mut TargetPal, mode: Mode) {
 
         // VUG-FPS witness: accumulate this frame's flushed bytes and print a `[vugfps]` line ~1x/s.
         wit_bytes += pal.last_flush_bytes();
+        wit_bands = wit_bands.max(pal.last_flush_bands());
         wit_frames += 1;
         {
             let wnow = crate::arch::ms();
@@ -668,16 +671,18 @@ pub fn run_crystal(pal: &mut TargetPal, mode: Mode) {
                 let fps_x10 = (wit_frames as u64 * 10_000) / wdt.max(1);
                 let bpf = wit_bytes / wit_frames as u64;
                 serial_println!(
-                    ":: [vugfps] {}.{} fps  {} bytes/frame flushed ({} frames / {} ms) ::",
+                    ":: [vugfps] {}.{} fps  {} bytes/frame flushed  bands={} ({} frames / {} ms) ::",
                     fps_x10 / 10,
                     fps_x10 % 10,
                     bpf,
+                    wit_bands,
                     wit_frames,
                     wdt
                 );
                 wit_ms = wnow;
                 wit_frames = 0;
                 wit_bytes = 0;
+                wit_bands = 1;
             }
         }
 
