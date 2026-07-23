@@ -1715,6 +1715,10 @@ mod metal {
         FsList,
         /// `GET /fs/<NAME>` with a name that passed hostile-input validation.
         FsFile(&'a str),
+        /// PIUSB-27: `GET /fs/usb/` (or `/fs/usb`) — the mounted USB stick's FAT root listing.
+        UsbList,
+        /// PIUSB-27: `GET /fs/usb/<NAME>` — one file off the USB stick's FAT volume (read-only).
+        UsbFile(&'a str),
         /// Anything else (bad method, unknown path, or a rejected name) — answered 404.
         NotFound,
     }
@@ -1750,6 +1754,20 @@ mod metal {
         }
         if path == b"/fs" || path == b"/fs/" {
             return Route::FsList;
+        }
+        // PIUSB-27: the USB sub-namespace — checked BEFORE the generic `/fs/<NAME>` case so `usb` is a
+        // mount point, not a filename. `/fs/usb` and `/fs/usb/` list the stick's FAT root; `/fs/usb/<NAME>`
+        // serves one file. The name passes the same hostile-input validation as the unafs route.
+        if path == b"/fs/usb" || path == b"/fs/usb/" {
+            return Route::UsbList;
+        }
+        if let Some(name) = path.strip_prefix(b"/fs/usb/") {
+            if valid_fs_name(name) {
+                if let Ok(s) = core::str::from_utf8(name) {
+                    return Route::UsbFile(s);
+                }
+            }
+            return Route::NotFound;
         }
         if let Some(name) = path.strip_prefix(b"/fs/") {
             if valid_fs_name(name) {
@@ -1868,6 +1886,10 @@ Connection: close\r\nServer: UnaOS/genet\r\n\r\n",
 <title>UnaOS \u{2014} /fs/</title></head><body>\
 <h1>unafs volume \u{2014} root</h1><ul>"
         );
+        // PIUSB-27: the USB stick appears as a `usb/` mount point at the top of the /fs/ root listing so
+        // Safari's http://unaos.local/fs/ browses onto it. The listing under it is served live per request
+        // (a hot-swapped stick shows up on the next click); a no-stick / no-FAT click answers honestly.
+        let _ = write!(body, "<li>&lt;DIR&gt; <a href=\"/fs/usb/\">usb/</a></li>");
         for (name, size, is_dir) in entries {
             if *is_dir {
                 let _ = write!(body, "<li>&lt;DIR&gt; {name}/</li>");
@@ -1878,6 +1900,80 @@ Connection: close\r\nServer: UnaOS/genet\r\n\r\n",
         let _ = write!(
             body,
             "</ul><p><a href=\"/\">back to status</a></p></body></html>\n"
+        );
+        http_response("200 OK", "text/html; charset=utf-8", body.as_bytes())
+    }
+
+    // ── PIUSB-27: the /fs/usb sub-route — serve the USB stick's FAT volume, READ-ONLY ─────────────────
+    //
+    // `GET /fs/usb/` lists the stick's FAT root; `GET /fs/usb/<NAME>` serves one file's bytes. Each
+    // request re-mounts the volume through `fat::mount_source(BlockSource::Usb)` — the mount reads a
+    // handful of sectors straight through the xHCI controller (independent of the SD backend that owns
+    // the global block device), so no state is cached between requests and a hot-swapped stick is picked
+    // up on the next GET. Strictly read-only: `BlockSource::Usb` refuses every write at the sector layer.
+    // A file beyond the same 64 KiB `fs_cap()` NET-15 uses is refused 413 rather than read into RAM.
+
+    /// PIUSB-27: read the USB stick's FAT root directory — `(name, size, is_dir)` per entry. `Err(reason)`
+    /// carries an honest failure string when the volume cannot be mounted or listed.
+    #[allow(clippy::type_complexity)]
+    fn usb_read_dir() -> Result<alloc::vec::Vec<(alloc::string::String, u64, bool)>, &'static str> {
+        let fs = crate::fs::fat::mount_source(crate::fs::fat::BlockSource::Usb)
+            .map_err(crate::fs::fat::fat_reason)?;
+        let entries = fs.read_root().map_err(crate::fs::fat::fat_reason)?;
+        let mut out = alloc::vec::Vec::with_capacity(entries.len());
+        for de in &entries {
+            out.push((alloc::string::String::from(de.name()), de.size as u64, de.is_dir));
+        }
+        Ok(out)
+    }
+
+    /// PIUSB-27: read one file off the USB stick's FAT root into RAM, capped at `fs_cap()`. Mirrors the
+    /// unafs `fs_read_file` outcomes so the dispatch is uniform.
+    fn usb_read_file(name: &str) -> FsFileResult {
+        let cap = fs_cap();
+        let fs = match crate::fs::fat::mount_source(crate::fs::fat::BlockSource::Usb) {
+            Ok(fs) => fs,
+            Err(_) => return FsFileResult::MountErr,
+        };
+        let de = match fs.find_in_root(name) {
+            Ok(de) => de,
+            Err(_) => return FsFileResult::NotFound,
+        };
+        if de.is_dir {
+            return FsFileResult::IsDir;
+        }
+        if de.size as usize > cap {
+            return FsFileResult::TooBig(de.size as u64);
+        }
+        let mut data = alloc::vec::Vec::new();
+        match fs.read_file(&de, &mut data, cap) {
+            Ok(()) => FsFileResult::Ok(data),
+            Err(_) => FsFileResult::NotFound,
+        }
+    }
+
+    /// PIUSB-27: render the `/fs/usb/` FAT root listing (name + size, files linked to `/fs/usb/<name>`).
+    /// FAT short (8.3) names come from the mounted volume and are a restricted charset, emitted verbatim.
+    fn build_usb_list(entries: &[(alloc::string::String, u64, bool)]) -> alloc::vec::Vec<u8> {
+        use core::fmt::Write as _;
+        let mut body = alloc::string::String::new();
+        let _ = write!(
+            body,
+            "<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\">\
+<title>UnaOS \u{2014} /fs/usb/</title></head><body>\
+<h1>USB stick (FAT) \u{2014} root</h1><ul>"
+        );
+        for (name, size, is_dir) in entries {
+            if *is_dir {
+                let _ = write!(body, "<li>&lt;DIR&gt; {name}/</li>");
+            } else {
+                let _ =
+                    write!(body, "<li><a href=\"/fs/usb/{name}\">{name}</a> \u{2014} {size} bytes</li>");
+            }
+        }
+        let _ = write!(
+            body,
+            "</ul><p><a href=\"/fs/\">back to /fs/</a></p></body></html>\n"
         );
         http_response("200 OK", "text/html; charset=utf-8", body.as_bytes())
     }
@@ -2664,6 +2760,55 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
                         }
                     }
                 }
+                Route::UsbList => match usb_read_dir() {
+                    Ok(entries) => {
+                        serial_println!(
+                            "{} [piusb27] GET /fs/usb/ => 200 ({} entries) ::",
+                            PG, entries.len()
+                        );
+                        build_usb_list(&entries)
+                    }
+                    Err(reason) => {
+                        serial_println!("{} [piusb27] GET /fs/usb/ => 404 no FAT volume ({}) ::", PG, reason);
+                        let msg = alloc::format!("no USB FAT volume: {reason}\n");
+                        http_response("404 Not Found", "text/plain; charset=utf-8", msg.as_bytes())
+                    }
+                },
+                Route::UsbFile(name) => match usb_read_file(name) {
+                    FsFileResult::Ok(data) => {
+                        serial_println!(
+                            "{} [piusb27] GET /fs/usb/{} => 200 {} bytes ::", PG, name, data.len()
+                        );
+                        http_response("200 OK", content_type_for(name), &data)
+                    }
+                    FsFileResult::TooBig(sz) => {
+                        serial_println!(
+                            "{} [piusb27] GET /fs/usb/{} => 413 REFUSED (size {} > cap {}) ::",
+                            PG, name, sz, fs_cap()
+                        );
+                        http_response(
+                            "413 Payload Too Large",
+                            "text/plain; charset=utf-8",
+                            b"file exceeds server buffer cap\n",
+                        )
+                    }
+                    FsFileResult::IsDir => {
+                        serial_println!("{} [piusb27] GET /fs/usb/{} => 404 (is a directory) ::", PG, name);
+                        http_response("404 Not Found", "text/plain; charset=utf-8", b"not a file\n")
+                    }
+                    FsFileResult::NotFound => {
+                        serial_println!("{} [piusb27] GET /fs/usb/{} => 404 (no such file) ::", PG, name);
+                        http_response("404 Not Found", "text/plain; charset=utf-8", b"no such file\n")
+                    }
+                    FsFileResult::MountErr => {
+                        serial_println!("{} [piusb27] GET /fs/usb/{} => 500 (no FAT volume) ::", PG, name);
+                        http_response(
+                            "500 Internal Server Error",
+                            "text/plain; charset=utf-8",
+                            b"no USB FAT volume\n",
+                        )
+                    }
+                },
                 Route::NotFound => http_response(
                     "404 Not Found",
                     "text/plain; charset=utf-8",

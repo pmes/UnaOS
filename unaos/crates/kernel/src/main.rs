@@ -854,6 +854,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             }
             // Once storage is up, mount + log the FAT volume geometry (one-shot).
             unaos_kernel::fs::fat::probe_once();
+            // PIUSB-27: on the USB storage-ready edge, mount the stick's FAT volume read-only under
+            // /fs/usb and emit the witness (aarch64 Pi path; runs with the xHCI lock released).
+            #[cfg(target_arch = "aarch64")]
+            unaos_kernel::fs::fat::piusb27_service();
             // GUI-WITNESS M3: re-dump the boot-milestone ring to serial on growth. A usbdebug-class
             // run surfaces the exact recorder ring via serial (M3 proof path), including the FTDI/block
             // milestones recorded from inside this loop. Serial-only + bounded.
@@ -1061,6 +1065,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // Once storage is up, mount + log the FAT volume geometry (one-shot). Runs with the xHCI
         // lock released; read_block re-locks it briefly, so there is no nested-lock hazard.
         unaos_kernel::fs::fat::probe_once();
+        // PIUSB-27: on the USB storage-ready edge, mount the stick's FAT volume read-only under /fs/usb
+        // and emit the witness (aarch64 Pi path; runs here with the xHCI lock released, like probe_once).
+        #[cfg(target_arch = "aarch64")]
+        unaos_kernel::fs::fat::piusb27_service();
         // GUI-WITNESS M3 (witness knob): re-dump the boot-milestone ring to serial whenever it grows.
         // On QEMU (serial live) this makes the recorded ring — including the FTDI/block milestones that
         // land from inside this loop — verifiable in serial.log without keyboard input, the M3 proof

@@ -57,6 +57,58 @@ pub fn info() -> Option<BlockDeviceInfo> {
     *BLOCK_DEVICE.lock()
 }
 
+/// PIUSB-27: geometry of the USB mass-storage stick, published by the xHCI storage bring-up ALONGSIDE
+/// `BLOCK_DEVICE`. Kept separate so it survives `register_sd` flipping the global device to the microSD:
+/// on the Pi the SD backend owns `BLOCK_DEVICE`, but the USB stick's geometry stays available here so it
+/// can be mounted read-only through [`read_block_usb`]. `None` until a USB stick enumerates.
+pub static USB_BLOCK_DEVICE: Mutex<Option<BlockDeviceInfo>> = Mutex::new(None);
+
+/// PIUSB-27: snapshot of the USB stick geometry, if one enumerated.
+pub fn usb_info() -> Option<BlockDeviceInfo> {
+    *USB_BLOCK_DEVICE.lock()
+}
+
+/// PIUSB-27: storage-ready edge for the USB FAT mount. `set_usb_ready` is raised by the xHCI storage
+/// bring-up (once per enumeration, so it re-arms on hot-plug); `take_usb_ready` is the main loop's
+/// consume-once read (swaps it back to false). The mount runs from the main loop rather than the
+/// bring-up path because the FAT mount re-locks the xHCI controller via `read_block_usb`, and the
+/// bring-up already holds that lock — so the mount+witness must fire with the lock released.
+static USB_STORAGE_READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// PIUSB-27: raise the USB storage-ready edge (called from the xHCI bring-up on each enumeration).
+pub fn set_usb_ready() {
+    USB_STORAGE_READY.store(true, core::sync::atomic::Ordering::Release);
+}
+
+/// PIUSB-27: consume the USB storage-ready edge — returns true exactly once per raised edge.
+pub fn take_usb_ready() -> bool {
+    USB_STORAGE_READY.swap(false, core::sync::atomic::Ordering::AcqRel)
+}
+
+/// PIUSB-27: read one block (`lba`) from the USB mass-storage stick DIRECTLY through the xHCI controller,
+/// bypassing the backend selector — so the stick is readable even when the global block device is the
+/// microSD (BACKEND_SD on the Pi). Strictly read-only. Geometry (block size, bound) comes from
+/// [`USB_BLOCK_DEVICE`]; the transfer is the same xHCI BOT READ(10) the default path has always used, and
+/// it takes only the xHCI controller lock (the SD/emmc2 path is untouched). Returns bytes copied.
+pub fn read_block_usb(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
+    let dev = usb_info().ok_or(BlockError::NotReady)?;
+    if lba >= dev.num_blocks {
+        return Err(BlockError::BadLba);
+    }
+    let mut guard = XHCI_CONTROLLER.lock();
+    let xhci = guard.as_mut().ok_or(BlockError::NotReady)?;
+    match xhci.storage_read10(lba as u32, 1) {
+        Ok(res) if res.status == CswStatus::Passed => {}
+        _ => return Err(BlockError::Io),
+    }
+    let src = xhci.storage_data_ptr().ok_or(BlockError::Io)?;
+    let n = (dev.block_size as usize).min(buf.len());
+    unsafe {
+        core::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), n);
+    }
+    Ok(n)
+}
+
 /// M6g: register the microSD (EMMC2/SDHCI) as the block backend — publish its geometry AND flip the
 /// selector so `read_block` (and, since U9, `write_block`) route to `drivers::emmc2`. Called once, from
 /// the bare-metal BSP probe after a successful card init (`emmc2::probe`). aarch64 bare-metal only; x86

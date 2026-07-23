@@ -4075,9 +4075,18 @@ impl XhciController {
             vendor_s, product_s, block_size, num_blocks,
             (num_blocks * block_size as u64) / (1024 * 1024));
 
-        *crate::drivers::block::BLOCK_DEVICE.lock() = Some(crate::drivers::block::BlockDeviceInfo {
+        let dev_info = crate::drivers::block::BlockDeviceInfo {
             slot_id: slot, block_size, num_blocks, vendor, product,
-        });
+        };
+        *crate::drivers::block::BLOCK_DEVICE.lock() = Some(dev_info);
+        // PIUSB-27: also publish under the dedicated USB handle so the stick's geometry survives a later
+        // `register_sd` claiming the global BLOCK_DEVICE for the microSD — the read-only /fs/usb mount
+        // reads through `read_block_usb`, which needs this geometry even when the SD backend is active.
+        // Raise the storage-ready edge so the main loop mounts + witnesses OUTSIDE this controller lock
+        // (the FAT mount re-locks the controller via `read_block_usb`, so it must not run here). The flag
+        // re-arms on every hot-plug re-enumeration.
+        *crate::drivers::block::USB_BLOCK_DEVICE.lock() = Some(dev_info);
+        crate::drivers::block::set_usb_ready();
         // GUI-WITNESS: the USB block device is up (geometry published). One of the "did storage come
         // up?" milestones a silent boot otherwise can't answer on-panel.
         crate::bootlog::record("block:up");
@@ -4246,6 +4255,7 @@ impl XhciController {
             }
             Err(e) => serial_println!("xHCI: READ(10) LBA0 failed: {:?}", e),
         }
+
     }
 
     /// Main-loop hook (U2.5): bring up the FTDI console ONCE (SET_CONFIGURATION + the four FTDI
