@@ -1293,6 +1293,12 @@ mod metal {
         #[cfg(feature = "nettest")]
         nettest::run18();
 
+        // NET-CARRIES: the gratuitous host-name publish gate — a deterministic builder assertion on the
+        // A + NSEC(A-only) record the metal `announce_step` multicasts on bring-up. Prints a self-checking
+        // `:: NET20-GATE: ... PASS [w=0x..] ::` line the battery asserts.
+        #[cfg(feature = "nettest")]
+        nettest::run20();
+
         // ── M1: resolve the register base from the DTB. NO DTB node => QEMU / DTB-less boot: this build
         //    does NOT model GENET, and touching the register window would FAULT (external abort), not
         //    return poison. Skip BEFORE any MMIO — the piusb `dtb_has_pcie` discipline. This is the
@@ -2465,6 +2471,27 @@ Connection: close\r\nServer: UnaOS/genet\r\n\r\n",
         if ok { w } else { 0 }
     }
 
+    /// NET-CARRIES: build the gratuitous HOST-NAME publish for `unaos.local` -> `ip` into `out`, returning
+    /// its byte length. This is the proactive twin of the net11 reactive A answer: on bring-up the responder
+    /// MULTICASTS the host's own address record so a Mac on the LAN caches `unaos.local` -> `ip` WITHOUT
+    /// having to ask first (`ping unaos.local` resolves off the cache). QR=1 AA=1, QDCOUNT=0, ANCOUNT=2,
+    /// ARCOUNT=0 — both records authoritative in the ANSWER section per RFC 6762 §8.3:
+    ///   * the A record (`unaos.local` -> `ip`), cache-flush, TTL `MDNS_TTL_HOST`;
+    ///   * the NSEC record asserting the host has A ONLY (no AAAA). Publishing the negative alongside the A
+    ///     makes a dual-stack client's FIRST connect snappy: it learns `unaos.local` has no AAAA from the
+    ///     cache and never issues (nor waits out) an AAAA query. This is the announcement-path extension of
+    ///     the net18 reactive AAAA→NSEC answer.
+    /// Same bounds-checked `rec_*`/`put_*` writers as the DNS-SD builders; 0 on overflow (never truncates).
+    fn build_host_announcement(out: &mut [u8], ip: [u8; 4]) -> usize {
+        let mut w = 0usize;
+        if !put_resp_header(out, &mut w, 2, 0) {
+            return 0; // ANCOUNT=2 (A + NSEC), ARCOUNT=0
+        }
+        let ok = rec_a(out, &mut w, &LBL_HOST, ip, MDNS_TTL_HOST)
+            && rec_nsec(out, &mut w, &LBL_HOST, &[DNS_TYPE_A], MDNS_TTL_HOST);
+        if ok { w } else { 0 }
+    }
+
     /// PI-NET-17: build the meta-query answer — `_services._dns-sd._udp.local` PTR -> `_http._tcp.local`.
     fn build_meta_response(out: &mut [u8]) -> usize {
         let mut w = 0usize;
@@ -2936,18 +2963,29 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
                 self.announce_left = 0; // builder overflow (unreachable in practice) — stop trying
                 return;
             }
+            // NET-CARRIES: also publish the host's own address record (A + NSEC A-only) gratuitously, so
+            // `unaos.local` pre-resolves in Mac caches and a dual-stack first connect never waits on AAAA.
+            let mut host = [0u8; 512];
+            let hlen = build_host_announcement(&mut host, ip);
             let dst = IpEndpoint::new(
                 IpAddress::v4(MDNS_MCAST[0], MDNS_MCAST[1], MDNS_MCAST[2], MDNS_MCAST[3]),
                 MDNS_PORT,
             );
             let sock = self.sockets.get_mut::<udp::Socket>(self.mdns);
             let _ = sock.send_slice(&resp[..rlen], dst);
+            if hlen != 0 {
+                let _ = sock.send_slice(&host[..hlen], dst);
+            }
             self.announce_left -= 1;
             self.announce_next_ms = now + MDNS_ANNOUNCE_GAP_MS;
             if self.announce_left == 0 {
                 serial_println!(
                     "{} [net17] dns-sd announced _http._tcp (UnaOS Pi 4 -> unaos.local:{}) ::",
                     PG, SVC_PORT
+                );
+                serial_println!(
+                    "{} [net20] host published unaos.local A={}.{}.{}.{} + NSEC A-only (AAAA-negative) ::",
+                    PG, ip[0], ip[1], ip[2], ip[3]
                 );
             }
         }
@@ -3348,6 +3386,13 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
             serial_println!(
                 "{} [net17] dns-sd advertising _http._tcp.local instance \"UnaOS Pi 4\" :{} (announce x{}) ::",
                 PG, SVC_PORT, MDNS_ANNOUNCE_COUNT
+            );
+            // NET-CARRIES: the host-name publish rides the same gratuitous announcements — each fires an A
+            // (unaos.local -> lease) plus an NSEC asserting A-only, so a Mac caches the name AND learns there
+            // is no AAAA before its first connect (snappy dual-stack first-connect, no AAAA round-trip).
+            serial_println!(
+                "{} [net20] host-name publish armed (unaos.local A + NSEC A-only, announce x{}) ::",
+                PG, MDNS_ANNOUNCE_COUNT
             );
         } else {
             serial_println!(
@@ -5791,6 +5836,94 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
             let pass = w == 0xf;
             serial_println!(
                 ":: NET18-GATE: mdns negative-response battery {} [w=0x{:x}] (host-nsec|instance-nsec|foreign-silence|a-additional) ::",
+                if pass { "PASS" } else { "FAIL" }, w
+            );
+        }
+
+        // ── NET-CARRIES: the gratuitous host-name publish gate — a pure, deterministic builder assertion on
+        //    `build_host_announcement` (the record the metal `announce_step` multicasts on bring-up). No
+        //    loopback pump is needed: the builder is total and output-only, so we assert its exact bytes. ──
+
+        /// Locate the first A RR for `want_name` in `resp` and return its four RDATA octets. Verifies TYPE=A,
+        /// class carries the cache-flush bit (0x8001), and RDLENGTH=4. Every field bounds-checked; `None` on
+        /// any mismatch. (Answer/authority/additional are all walked, but the host announcement puts A first.)
+        fn a_rdata(resp: &[u8], want_name: &[&[u8]]) -> Option<[u8; 4]> {
+            if resp.len() < 12 {
+                return None;
+            }
+            let an = u16::from_be_bytes([resp[6], resp[7]]) as usize;
+            let ns = u16::from_be_bytes([resp[8], resp[9]]) as usize;
+            let ar = u16::from_be_bytes([resp[10], resp[11]]) as usize;
+            let mut off = 12usize;
+            for _ in 0..(an + ns + ar) {
+                let mut nm: [&[u8]; 8] = [&[]; 8];
+                let (nn, e) = read_name(resp, off, &mut nm)?;
+                let rtype = u16::from_be_bytes([*resp.get(e)?, *resp.get(e + 1)?]);
+                let rclass = u16::from_be_bytes([*resp.get(e + 2)?, *resp.get(e + 3)?]);
+                let rdlen = u16::from_be_bytes([*resp.get(e + 8)?, *resp.get(e + 9)?]) as usize;
+                let rd = e + 10;
+                if rd + rdlen > resp.len() {
+                    return None;
+                }
+                if rtype == DNS_TYPE_A && labels_eq(&nm[..nn], want_name) {
+                    if rclass != 0x8001 || rdlen != 4 {
+                        return None; // must be a cache-flush A with a 4-byte RDATA
+                    }
+                    return Some([resp[rd], resp[rd + 1], resp[rd + 2], resp[rd + 3]]);
+                }
+                off = rd + rdlen;
+            }
+            None
+        }
+
+        /// Run the host-name publish gate and print the `NET20-GATE` witness. Bitmask `w`:
+        ///   0x1 header is a gratuitous response (QR=1 AA=1, QDCOUNT=0, ANCOUNT=2, ARCOUNT=0);
+        ///   0x2 the A record resolves `unaos.local` -> the given lease IP (cache-flush);
+        ///   0x4 the NSEC record asserts A-only (exact bitmap `00 01 40`) — the AAAA-negative the first
+        ///       connect reads off the cache without an AAAA query.
+        pub fn run20() {
+            const PUB_IP: [u8; 4] = [192, 168, 7, 42];
+            let mut buf = [0u8; 512];
+            let n = build_host_announcement(&mut buf, PUB_IP);
+            let resp = &buf[..n];
+            let mut w: u32 = 0;
+
+            let hdr_ok = n >= 12
+                && u16::from_be_bytes([buf[2], buf[3]]) == 0x8400 // QR=1 AA=1
+                && u16::from_be_bytes([buf[4], buf[5]]) == 0       // QDCOUNT=0
+                && u16::from_be_bytes([buf[6], buf[7]]) == 2       // ANCOUNT=2 (A + NSEC)
+                && u16::from_be_bytes([buf[10], buf[11]]) == 0;    // ARCOUNT=0
+            if hdr_ok {
+                w |= 0x1;
+            }
+            serial_println!(
+                "{} [net20] host-publish header (qr/aa an=2 ar=0) {} ::",
+                PG, if hdr_ok { "PASS" } else { "FAIL" }
+            );
+
+            let a = if n > 0 { a_rdata(resp, &LBL_HOST) } else { None };
+            let a_ok = a == Some(PUB_IP);
+            if a_ok {
+                w |= 0x2;
+            }
+            serial_println!(
+                "{} [net20] host A unaos.local => {:?} {} ::",
+                PG, a, if a_ok { "PASS" } else { "FAIL" }
+            );
+
+            let bm = if n > 0 { nsec_bitmap(resp, &LBL_HOST) } else { None };
+            let nsec_ok = bm.as_deref() == Some(&[0x00u8, 0x01, 0x40][..]);
+            if nsec_ok {
+                w |= 0x4;
+            }
+            serial_println!(
+                "{} [net20] host NSEC A-only bitmap={:x?} {} ::",
+                PG, bm.as_deref().unwrap_or(&[]), if nsec_ok { "PASS" } else { "FAIL" }
+            );
+
+            let pass = w == 0x7;
+            serial_println!(
+                ":: NET20-GATE: mdns host-name publish battery {} [w=0x{:x}] (header|a-record|nsec-a-only) ::",
                 if pass { "PASS" } else { "FAIL" }, w
             );
         }

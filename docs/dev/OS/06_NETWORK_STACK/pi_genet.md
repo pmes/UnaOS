@@ -540,6 +540,47 @@ multi-second "trying really hard" stall on the first connect.
 
 ---
 
+## 4d. "UnaOS announces itself" — gratuitous host-name publish (NET-CARRIES)
+
+net11/net17/net18 all *answer queries*: the Pi resolves `unaos.local`, serves DNS-SD, and returns
+NSEC negatives — but only reactively, once a client asks. NET-CARRIES adds the **proactive** twin: on
+bring-up the responder **multicasts the host's own address record**, so a Mac on the LAN caches
+`unaos.local` **before** it ever queries.
+
+**What changed.** `build_host_announcement` builds a gratuitous host publish — QR=1 AA=1, QDCOUNT=0,
+**ANCOUNT=2, ARCOUNT=0**, both records authoritative in the ANSWER section (RFC 6762 §8.3):
+
+* an **A** record (`unaos.local` → lease IP), cache-flush, TTL 120; and
+* an **NSEC** record asserting the host has **A only** (no AAAA) — bitmap `00 01 40`, the same
+  assertion net18 returns reactively.
+
+`announce_step` now multicasts this host publish alongside each of the 3 gratuitous DNS-SD service
+announcements (same `announce_left`/`announce_next_ms` cadence, ≥1 s apart, never blocks the poll).
+Publishing the NSEC **with** the A is what makes a dual-stack client's *first* connect snappy: the Mac
+reads "`unaos.local` has A, and no AAAA" straight off the multicast cache and never issues (nor waits
+out) an AAAA query. It is the announcement-path extension of net18's reactive negative and net11's
+reactive A — no query round-trip needed at all.
+
+The builder reuses the bounds-checked `rec_a` / `rec_nsec` / `put_*` writers verbatim; on overflow it
+returns 0 and the host publish is simply skipped (the service announcement still goes out).
+
+* **Host-name publish gate** (`nettest::run20`, a pure deterministic builder assertion — the record is
+  total and output-only, so no loopback pump is needed):
+  `:: NET20-GATE: mdns host-name publish battery PASS [w=0x7] (header|a-record|nsec-a-only) ::`
+  * `0x1` header is a gratuitous response (QR=1 AA=1, QDCOUNT=0, ANCOUNT=2, ARCOUNT=0); `0x2` the A
+    record resolves `unaos.local` → the lease IP (cache-flush, RDLENGTH 4); `0x4` the NSEC asserts
+    A-only, **exact bitmap `00 01 40`**.
+
+Boot witnesses (metal): `:: PI-GENET: [net20] host-name publish armed (unaos.local A + NSEC A-only,
+announce x3) ::` at arm, then after the announcements
+`:: PI-GENET: [net20] host published unaos.local A=<ip> + NSEC A-only (AAAA-negative) ::`.
+
+Expected **metal effect.** `ping unaos.local` from a Mac resolves off the cached announcement without a
+query round-trip, and `dns-sd -G v4v6 unaos.local` returns the v4 address immediately with a negative
+for v6 — no AAAA stall on the very first connect.
+
+---
+
 ## 5. Bench verification
 
 | Claim | Arc / commit | Boot | Verdict |
