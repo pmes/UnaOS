@@ -44,6 +44,92 @@ struct Damage {
     y1: usize,
 }
 
+impl Damage {
+    #[inline]
+    fn overlaps(&self, o: &Damage) -> bool {
+        self.x0 < o.x1 && o.x0 < self.x1 && self.y0 < o.y1 && o.y0 < self.y1
+    }
+    #[inline]
+    fn union(&self, o: &Damage) -> Damage {
+        Damage {
+            x0: self.x0.min(o.x0),
+            y0: self.y0.min(o.y0),
+            x1: self.x1.max(o.x1),
+            y1: self.y1.max(o.y1),
+        }
+    }
+    #[inline]
+    fn area(&self) -> u64 {
+        ((self.x1 - self.x0) as u64) * ((self.y1 - self.y0) as u64)
+    }
+}
+
+/// VUG-FPS — the maximum number of independent damage rectangles tracked between flushes. Disjoint
+/// dirty regions (vug's centre crystal, the bottom-left corner meters, the moving cursor, the
+/// top-left HUD) each present as their own small row-copy blit rather than collapsing to a single
+/// screen-spanning bounding box — the flush is bandwidth-bound, so bounding a rotating full-height
+/// crystal + two corner widgets into ONE box reflushed most of the panel every frame (the metal
+/// 8–9 fps). On overflow the set coalesces the least-growth pair, so it always presents a correct
+/// SUPERSET of the true damage — never drops a dirty pixel, only (rarely) reflushes a clean one.
+const MAX_DAMAGE_RECTS: usize = 16;
+
+/// A small bounded set of damage rectangles. `len == 0` means nothing changed (flush is a no-op).
+struct DamageSet {
+    rects: [Damage; MAX_DAMAGE_RECTS],
+    len: usize,
+}
+
+impl DamageSet {
+    const fn empty() -> Self {
+        let z = Damage { x0: 0, y0: 0, x1: 0, y1: 0 };
+        Self { rects: [z; MAX_DAMAGE_RECTS], len: 0 }
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    fn set_single(&mut self, d: Damage) {
+        self.rects[0] = d;
+        self.len = 1;
+    }
+
+    /// Add `r`, merging it into every rect it overlaps (cascading, since a merge can grow `r` into
+    /// reach of a rect it previously missed). On a full set with no overlap, fold `r` into the
+    /// existing rect whose union grows the total area least — keeps the flush a tight superset.
+    fn add(&mut self, mut r: Damage) {
+        if r.x0 >= r.x1 || r.y0 >= r.y1 {
+            return;
+        }
+        let mut i = 0;
+        while i < self.len {
+            if self.rects[i].overlaps(&r) {
+                r = r.union(&self.rects[i]);
+                self.len -= 1;
+                self.rects[i] = self.rects[self.len];
+                i = 0; // r grew; rescan from the start
+            } else {
+                i += 1;
+            }
+        }
+        if self.len < MAX_DAMAGE_RECTS {
+            self.rects[self.len] = r;
+            self.len += 1;
+        } else {
+            let mut best = 0usize;
+            let mut best_grow = u64::MAX;
+            for k in 0..self.len {
+                let grow = self.rects[k].union(&r).area() - self.rects[k].area();
+                if grow < best_grow {
+                    best_grow = grow;
+                    best = k;
+                }
+            }
+            self.rects[best] = self.rects[best].union(&r);
+        }
+    }
+}
+
 pub struct Screen {
     /// The real framebuffer (flush target).
     front: FrameBuffer,
@@ -55,8 +141,10 @@ pub struct Screen {
     /// moves the `Vec` header, not the heap allocation it points at).
     back: FrameBuffer,
     info: FrameBufferInfo,
-    /// Accumulated dirty rectangle since the last flush; `None` when nothing changed.
-    damage: Option<Damage>,
+    /// Accumulated dirty rectangles since the last flush; empty when nothing changed.
+    damage: DamageSet,
+    /// Bytes copied by the most recent [`flush`] (VUG-FPS bandwidth witness).
+    last_flush_bytes: u64,
 }
 
 impl Screen {
@@ -87,7 +175,12 @@ impl Screen {
             back_store,
             back,
             info,
-            damage: Some(Damage { x0: 0, y0: 0, x1: info.width, y1: info.height }),
+            damage: {
+                let mut ds = DamageSet::empty();
+                ds.set_single(Damage { x0: 0, y0: 0, x1: info.width, y1: info.height });
+                ds
+            },
+            last_flush_bytes: 0,
         }
     }
 
@@ -108,19 +201,11 @@ impl Screen {
         if x0 >= x1 || y0 >= y1 {
             return;
         }
-        self.damage = Some(match self.damage {
-            None => Damage { x0, y0, x1, y1 },
-            Some(d) => Damage {
-                x0: d.x0.min(x0),
-                y0: d.y0.min(y0),
-                x1: d.x1.max(x1),
-                y1: d.y1.max(y1),
-            },
-        });
+        self.damage.add(Damage { x0, y0, x1, y1 });
     }
 
     fn mark_full(&mut self) {
-        self.damage = Some(Damage { x0: 0, y0: 0, x1: self.info.width, y1: self.info.height });
+        self.damage.set_single(Damage { x0: 0, y0: 0, x1: self.info.width, y1: self.info.height });
     }
 
     #[inline]
@@ -210,34 +295,51 @@ impl Screen {
         self.mark_full();
     }
 
-    /// Present the back buffer: copy the damaged region to the framebuffer, row by row (each row
-    /// a single bulk copy), then clear the damage. No-op if nothing changed.
+    /// Total bytes the last [`flush`] copied to the framebuffer — the VUG-FPS bandwidth witness
+    /// (`[vugfps]` reads it to report flushed-bytes/frame, the number the dirty-rect win moves).
+    #[inline]
+    pub fn last_flush_bytes(&self) -> u64 {
+        self.last_flush_bytes
+    }
+
+    /// Present the back buffer: copy each damaged rectangle to the framebuffer, row by row (each
+    /// row a single bulk copy), then clear the damage. No-op if nothing changed. VUG-FPS: the set
+    /// holds disjoint dirty regions, so a rotating crystal plus two corner widgets blit as a few
+    /// tight rectangles instead of one panel-spanning box.
     pub fn flush(&mut self) {
-        let Some(d) = self.damage.take() else { return };
-        if !self.front.is_ready() {
+        let n = self.damage.len;
+        self.damage.clear();
+        self.last_flush_bytes = 0;
+        if n == 0 || !self.front.is_ready() {
             return;
         }
         let bpp = self.info.bytes_per_pixel;
         let stride = self.info.stride;
-        let x1 = d.x1.min(self.info.width);
-        let y1 = d.y1.min(self.info.height);
-        if d.x0 >= x1 || d.y0 >= y1 {
-            return;
-        }
-        let seg = (x1 - d.x0) * bpp;
-        for y in d.y0..y1 {
-            let off = (y * stride + d.x0) * bpp;
-            if off + seg <= self.back_store.len() {
-                self.front.blit(off, &self.back_store[off..off + seg]);
+        let mut flushed: u64 = 0;
+        for idx in 0..n {
+            let d = self.damage.rects[idx];
+            let x1 = d.x1.min(self.info.width);
+            let y1 = d.y1.min(self.info.height);
+            if d.x0 >= x1 || d.y0 >= y1 {
+                continue;
             }
+            let seg = (x1 - d.x0) * bpp;
+            for y in d.y0..y1 {
+                let off = (y * stride + d.x0) * bpp;
+                if off + seg <= self.back_store.len() {
+                    self.front.blit(off, &self.back_store[off..off + seg]);
+                    flushed += seg as u64;
+                }
+            }
+            // Present to a non-coherent scan-out (the Pi 4 HVS) with a single cache clean over this
+            // rectangle's span — one `DC CVAC` sweep + one `DSB`, not one per scanline. The span is a
+            // contiguous byte range covering every blitted row (its interior may include undamaged
+            // left/right margins of middle rows, but cleaning already-clean lines is harmless). No-op
+            // on cache-coherent targets (x86, and QEMU which models no caches).
+            let span_start = (d.y0 * stride + d.x0) * bpp;
+            let span_end = ((y1 - 1) * stride + x1) * bpp;
+            self.front.flush_range(span_start, span_end - span_start);
         }
-        // Present to a non-coherent scan-out (the Pi 4 HVS) with a single cache clean over the
-        // whole damaged span — one `DC CVAC` sweep + one `DSB`, not one per scanline. The span is a
-        // contiguous byte range covering every blitted row (its interior may include undamaged
-        // left/right margins of middle rows, but cleaning already-clean lines is harmless). No-op on
-        // cache-coherent targets (x86, and QEMU which models no caches).
-        let span_start = (d.y0 * stride + d.x0) * bpp;
-        let span_end = ((y1 - 1) * stride + x1) * bpp;
-        self.front.flush_range(span_start, span_end - span_start);
+        self.last_flush_bytes = flushed;
     }
 }

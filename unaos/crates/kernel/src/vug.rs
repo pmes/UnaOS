@@ -469,6 +469,12 @@ pub fn run_crystal(pal: &mut TargetPal, mode: Mode) {
     let mut py = [0i32; 14];
     let mut rot = [Vec3 { x: 0, y: 0, z: 0 }; 14];
 
+    // VUG-FPS dirty-rect state: the crystal's footprint last frame (so its vacated pixels get
+    // repainted to background) and the cursor's last footprint (dirty-rect no longer clears the
+    // whole panel, so the moving sprite must erase its own trail). Bboxes are `(x, y, w, h)`.
+    let mut prev_crystal: Option<(usize, usize, usize, usize)> = None;
+    let mut prev_cursor: Option<(usize, usize, usize, usize)> = None;
+
     // --- M3b: the two corner load meters --------------------------------------------------
     // Render-load meter (the honest "GPU monitor" — we render in software): each frame we clock
     // the render span (`now_cycles`) against the whole frame span to get a busy fraction, and time
@@ -483,6 +489,13 @@ pub fn run_crystal(pal: &mut TargetPal, mode: Mode) {
     let mut total_acc: u64 = 0;
     let mut win_frames: u32 = 0;
     let mut win_ms = crate::arch::ms();
+
+    // VUG-FPS serial witness: frames and flushed bytes accumulated over ~1 s windows, printed as
+    // `[vugfps]` so a metal serial capture reads the fps and the per-frame flush bandwidth the
+    // dirty-rect path moves (the whole point of the arc).
+    let mut wit_ms = crate::arch::ms();
+    let mut wit_frames: u32 = 0;
+    let mut wit_bytes: u64 = 0;
 
     loop {
         let top = crate::arch::now_cycles();
@@ -504,8 +517,49 @@ pub fn run_crystal(pal: &mut TargetPal, mode: Mode) {
             py[i] = cy - (((v.y as i64) * ppu) >> 16) as i32;
         }
 
-        // --- clear to the dark-grey backdrop ---------------------------------------------
-        pal.clear_screen(BG);
+        // --- VUG-FPS dirty-rect: erase only what changed, not the whole panel -------------
+        // The flush is bandwidth-bound (a full clear reflushes the entire ~8 MB framebuffer every
+        // frame — the metal 8–9 fps). Instead, background-fill only the crystal's footprint (union
+        // of this frame's projected-vertex bbox with last frame's, so vacated pixels repaint) and
+        // the cursor's old footprint. The HUD and corner meters clear their own small blocks in
+        // `draw_stats`/`draw_meters`. `flush` then copies a few tight rectangles.
+        if frame == 0 {
+            pal.clear_screen(BG); // first frame only: establish a clean backdrop over the console
+        }
+        let mut bx0 = i32::MAX;
+        let mut by0 = i32::MAX;
+        let mut bx1 = i32::MIN;
+        let mut by1 = i32::MIN;
+        for i in 0..14 {
+            bx0 = bx0.min(px[i]);
+            by0 = by0.min(py[i]);
+            bx1 = bx1.max(px[i]);
+            by1 = by1.max(py[i]);
+        }
+        const PAD: i32 = 2; // cover the seam lines drawn a pixel outside the fill
+        let cx0 = (bx0 - PAD).clamp(0, w) as usize;
+        let cy0 = (by0 - PAD).clamp(0, h) as usize;
+        let cx1 = (bx1 + PAD).clamp(0, w) as usize;
+        let cy1 = (by1 + PAD).clamp(0, h) as usize;
+        let cur_crystal = (cx0, cy0, cx1.saturating_sub(cx0), cy1.saturating_sub(cy0));
+        // Erase the union of previous + current crystal footprints (frame 0 already cleared all).
+        if frame != 0 {
+            let (ex0, ey0, ex1, ey1) = match prev_crystal {
+                Some((px0, py0, pw, ph)) => {
+                    (cx0.min(px0), cy0.min(py0), cx1.max(px0 + pw), cy1.max(py0 + ph))
+                }
+                None => (cx0, cy0, cx1, cy1),
+            };
+            if ex1 > ex0 && ey1 > ey0 {
+                pal.draw_rect(ex0, ey0, ex1 - ex0, ey1 - ey0, BG);
+            }
+            // Erase the cursor's previous footprint BEFORE redraw (so the crystal/HUD painted below
+            // can cover it) — the dirty-rect path no longer wipes the whole panel each frame.
+            if let Some((qx, qy, qw, qh)) = prev_cursor {
+                pal.draw_rect(qx, qy, qw, qh, BG);
+            }
+        }
+        prev_crystal = Some(cur_crystal);
 
         // --- draw the front-facing faces, painter-sorted back-to-front -------------------
         // Collect visible faces with their average camera-depth, then insertion-sort farthest
@@ -590,11 +644,42 @@ pub fn run_crystal(pal: &mut TargetPal, mode: Mode) {
         m.px = est_px;
         draw_stats(pal, frame, n as u32, solid, w, h);
         draw_meters(pal, &m, &cpu, h);
-        // CURSOR-VIS: the cursor draws LAST, over everything, every frame (the frame was cleared
-        // above, so no erase pass is needed).
+        // CURSOR-VIS: the cursor draws LAST, over everything, every frame. VUG-FPS: its previous
+        // footprint was erased in the dirty-rect phase above; record the new one for next frame.
         crate::pal::cursor::draw(pal);
+        prev_cursor = if crate::pal::cursor::visible() {
+            let (curx, cury) = crate::pal::cursor::pos(w, h);
+            let e = crate::pal::cursor::extent(pal);
+            let pad = e / 8 + 1; // cover the one-block drop shadow offset
+            Some((curx as usize, cury as usize, e + pad, e + pad))
+        } else {
+            None
+        };
 
         pal.render(); // present ONCE per frame
+
+        // VUG-FPS witness: accumulate this frame's flushed bytes and print a `[vugfps]` line ~1x/s.
+        wit_bytes += pal.last_flush_bytes();
+        wit_frames += 1;
+        {
+            let wnow = crate::arch::ms();
+            let wdt = wnow.wrapping_sub(wit_ms);
+            if wdt >= 1000 && wit_frames > 0 {
+                let fps_x10 = (wit_frames as u64 * 10_000) / wdt.max(1);
+                let bpf = wit_bytes / wit_frames as u64;
+                serial_println!(
+                    ":: [vugfps] {}.{} fps  {} bytes/frame flushed ({} frames / {} ms) ::",
+                    fps_x10 / 10,
+                    fps_x10 % 10,
+                    bpf,
+                    wit_frames,
+                    wdt
+                );
+                wit_ms = wnow;
+                wit_frames = 0;
+                wit_bytes = 0;
+            }
+        }
 
         // --- M3b render-load accounting: work span vs whole-frame span -------------------
         let end = crate::arch::now_cycles();
@@ -645,6 +730,10 @@ pub fn run_crystal(pal: &mut TargetPal, mode: Mode) {
 fn draw_stats(pal: &mut TargetPal, frame: u64, faces: u32, solid: bool, _w: i32, _h: i32) {
     // Title + live stat line. UI-1: all positions derive from the panel metrics.
     let m = pal.metrics();
+    // VUG-FPS: erase this HUD block's own footprint (the crystal-region clear does not reach the
+    // top-left corner) so the changing frame counter doesn't ghost. Three text lines wide enough
+    // for the longest ("mode solid  faces 24  frame NNNNN").
+    pal.draw_rect(m.margin, m.margin, m.text_w(34), 3 * m.line_h, BG);
     pal.draw_text(m.margin, m.margin, "VUG // quartz", 0x00FFFFFF);
     let mode = if solid { "solid" } else { "wire " };
     let line = alloc::format!("mode {}  faces {:>2}  frame {}", mode, faces, frame);
@@ -664,6 +753,20 @@ fn draw_meters(pal: &mut TargetPal, m: &RenderStats, cpu: &CpuPulse, h: i32) {
     let x0 = mt.margin;
     // The block is three text pitches (label / bar / readout) + one pitch of air + the CPU row.
     let base = (h as usize).saturating_sub(mt.margin + 4 * mt.line_h + mt.cell_h);
+
+    // VUG-FPS: erase this widget's own footprint (the crystal-region clear does not reach the
+    // bottom-left corner). Opaque bars over-paint themselves, but the changing text readouts and
+    // the swept "breath" segment would ghost without a background clear first. Two blocks: the
+    // RENDER label/bar/readout stack, and the CPU pulse row (sized to the per-core bars).
+    pal.draw_rect(x0, base, mt.text_w(28), 3 * mt.line_h + mt.cell_h, BG);
+    {
+        let seg_w = mt.cell_w / 2;
+        let gap = mt.scale;
+        let bar_w = PULSE_SEGS * (seg_w + gap);
+        let per_core = mt.text_w(2) + 2 * gap + bar_w + mt.cell_w;
+        let row_w = mt.text_w(4) + cpu.ncpu * per_core;
+        pal.draw_rect(x0, base + 4 * mt.line_h, row_w, mt.cell_h, BG);
+    }
 
     // --- RENDER meter --------------------------------------------------------------------
     pal.draw_text(x0, base, "RENDER", METER_LABEL);
@@ -720,6 +823,8 @@ fn draw_meters(pal: &mut TargetPal, m: &RenderStats, cpu: &CpuPulse, h: i32) {
         const STALE_MS: u64 = 3000;
         let stale = snap.present && age_ms >= STALE_MS;
         let by = base.saturating_sub(2 * mt.line_h);
+        // VUG-FPS: erase the battery block's footprint (two text lines) before repaint.
+        pal.draw_rect(x0, by, mt.text_w(30), 2 * mt.line_h, BG);
         pal.draw_text(x0, by, "BATT", METER_LABEL);
         let bx = x0 + mt.text_w(5);
         let bw = mt.text_w(10);

@@ -379,6 +379,11 @@ impl<'a> TargetPal<'a> {
         );
         Self { surface }
     }
+
+    /// VUG-FPS bandwidth witness: bytes the last `render()` (flush) copied to the framebuffer.
+    pub fn last_flush_bytes(&self) -> u64 {
+        self.surface.last_flush_bytes()
+    }
 }
 
 impl<'a> GneissPal for TargetPal<'a> {

@@ -71,9 +71,28 @@ framebuffer by physical address (stored as `usize`, so the type is `Send` and
 
 `Screen::new(front)` takes a `FrameBuffer` handle and builds a cached-RAM back
 buffer. All GUI drawing (`put_pixel`, `fill_rect`, `scroll_up`, …) goes to the
-back buffer; `flush()` copies **only the damaged region** to the (slow)
+back buffer; `flush()` copies **only the damaged region(s)** to the (slow)
 framebuffer. The `kernel_main` loop calls the equivalent of `flush()` once per
 frame, so the idle path stays cheap when nothing changed.
+
+Damage is tracked as a small **set** of up to `MAX_DAMAGE_RECTS` (16) independent
+rectangles, not a single bounding box (VUG-FPS). A new dirty rect merges into any
+rect it overlaps (cascading); on overflow it folds into the least-growth
+neighbour, so the set is always a correct **superset** of the true damage — never
+dropping a dirty pixel, only rarely reflushing a clean one. `flush()` blits each
+rect as its own run of bulk row copies. This matters for animated content with
+**disjoint** dirty regions: a full-height rotating crystal plus two corner meters
+plus a moving cursor would, under a single bounding box, collapse to a
+panel-spanning box that reflushed most of the framebuffer every frame — the metal
+`vug` 8–9 fps bottleneck. As separate rects each blits tightly. `Screen`'s
+`last_flush_bytes()` reports the bytes the last flush copied (the `[vugfps]`
+bandwidth witness).
+
+The `vug` crystal demo drives this with dirty-rect rendering: instead of clearing
+the whole panel each frame it background-fills only the union of the crystal's
+previous + current projected-vertex bbox (plus the cursor's old footprint), and
+the HUD / corner meters clear their own small blocks. Painter's back-to-front
+face ordering is unchanged.
 
 This is what the console / `pal::TargetPal` draws through in steady state.
 
