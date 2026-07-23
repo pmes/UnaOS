@@ -252,7 +252,7 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
                 }
                 #[cfg(feature = "intel-ivb")]
                 crate::drivers::gpu::detect::GpuType::IntelIvyBridge => {
-                    // crate::drivers::gpu::ivb::init(gpu); // Deferred
+                    crate::drivers::gpu::igpu::init(gpu);
                 }
                 _ => {}
             }
