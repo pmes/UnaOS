@@ -3,6 +3,23 @@
 Hard-won silicon facts from the fox-metal sitting series. Trust these over any
 QEMU behavior. Newest sitting first.
 
+## Sitting #9 (igpu pull 4 + kepler pull 10, UnaOS-gemini@785a8795, 2026-07-22, fox-metal-r23s1h)
+
+**Boot 1 — gmux handshake: protocol UNPROVEN, but the picture sharpened:**
+- Version self-test FAILED (implausible tuples) → gate held, raw bytes only.
+- With the real handshake the values are STABLE boot→kernel (sitting #8's
+  0x39→0x03 "movement" is RETRACTED as a handshake artifact — the canon guard
+  was right) and the three registers now answer DISTINCT bytes:
+  SW_DISP=0x03, SW_DDC=0x02, POWER=0x03 (both points).
+- UNPROVEN-decode note (not canon): 0x03 in SW_DISPLAY would read "discrete
+  owns the panel" in the classic decode — which would put the GOP console on
+  the Kepler side and reopen the wrong-registers question on the KEPLER
+  display engine, not Intel. Proving the protocol is now the whole game:
+  pull 5 = variant version-reg offsets / gmux revision protocol variants.
+- iGPU teardown rows unchanged (all-dead, DP_A=0x1C constant).
+
+Boot 2 (sched-status ask-the-chip) verdict pending.
+
 ## Sitting #8 (igpu pull 3 + kepler pull 9, UnaOS-gemini@b3ec47d1, 2026-07-22, fox-metal-r23s1h)
 
 **Boot 1 — display paradox, two hard facts:**
