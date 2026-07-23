@@ -180,6 +180,11 @@ pub unsafe fn takeover_display(
         kdisp_trace[0], kdisp_trace[1], kdisp_trace[2], kdisp_trace[3],
         kdisp_trace[4], kdisp_trace[5], kdisp_trace[6]);
 
+    // ── Phase 1.5: Full-block trace dumps (Pull 2) ─────────────────────
+    dump_head_block(bar0, 0, 96);
+    dump_head_block(bar0, 1, 64);
+
+
     // ── Phase 2: Display takeover (write path, gated) ──────────────────
     if !cfg!(feature = "nvidia-kepler-takeover") {
         serial_println!(":: kdisp: trace-only — takeover feature not set ::");
@@ -305,3 +310,25 @@ pub unsafe fn takeover_display(
 fn is_live(val: u32) -> bool {
     val != 0 && val != 0xFFFFFFFF && (val & 0xFFF00000) != 0xBAD00000
 }
+
+/// Dumps a head configuration block (0x616000 + head*0x800) for offline decode.
+fn dump_head_block(bar0: usize, head: usize, max_rows: usize) {
+    let mut printed = 0;
+    let mut total_live = 0;
+    let base = regs::NV_PDISPLAY_BASE + 0x6000 + (head * 0x800);
+    
+    for offset in (0..0x800).step_by(4) {
+        let val = unsafe { mmio_read(bar0, base + offset) };
+        if is_live(val) {
+            if printed < max_rows {
+                serial_println!(":: kdisp: head{}-dump off={:03X} val={:08X} ::", head, offset, val);
+                printed += 1;
+            }
+            total_live += 1;
+        }
+    }
+    
+    let capped = total_live > max_rows;
+    serial_println!(":: kdisp: head{}-dump rows={} capped={} ::", head, printed, capped);
+}
+
