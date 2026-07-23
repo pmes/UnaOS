@@ -553,3 +553,62 @@ impl Screen {
         true
     }
 }
+
+/// UVUG-2 — whether the first `[uvug2]` present witness has been emitted (first present only, no
+/// per-frame spam; the mini-vug presents ~300 times).
+static UVUG2_WITNESSED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// UVUG-2 PRESENT SEAM impl — composite an EL1-owned ARGB8888/XRGB surface `(ptr, w, h, stride)` onto
+/// the real scan-out framebuffer. This is the function registered via
+/// `arch::aarch64::syscall::register_fb_present_hook`; `SYS_FB_PRESENT` calls it from the presenting
+/// task's syscall context (EL1). Convention: **centered** on the panel (clamped to the top-left origin
+/// when the surface exceeds the panel — off-panel pixels clip via `put_pixel`'s bounds checks).
+///
+/// Concurrency: this writes DIRECTLY to the front framebuffer (a `Copy` handle taken from `WRITER`),
+/// not through the render task's back-buffered `Screen`. That is deliberate and sound here — there is
+/// no shared/global `Screen` to borrow, and while a full-screen EL0 program owns the panel the render
+/// core is parked inside `dispatch_command` (SCREEN_APP_ACTIVE) and is not flushing, so the small
+/// centered blit does not race an owner. The writes are per-pixel volatile stores (`FrameBuffer` is
+/// `Copy`, no aliased `&mut`), followed by a `flush_range` cache-clean over the touched rows so the
+/// non-coherent Pi 4 HVS scan-out sees them — the identical present discipline `Screen::flush` uses.
+/// This is the "inline blit" choice from the brief (compositor-route was rejected: the render task is
+/// blocked during the app run, so routing through it would present nothing).
+///
+/// The surface is ARGB8888 little-endian (`FB_FORMAT_ARGB8888`): each u32 is `0xAARRGGBB`, so the low
+/// 24 bits are `0xRRGGBB` — exactly the `color` convention `put_pixel` expects (it re-encodes for the
+/// panel's RGB/BGR layout). The alpha byte is ignored (opaque composite).
+pub fn present_surface(surf: *const u8, w: u32, h: u32, stride: u32) {
+    let fb = *super::WRITER.lock();
+    if !fb.is_ready() || surf.is_null() || w == 0 || h == 0 {
+        return;
+    }
+    let info = fb.info();
+    let (fw, fh) = (info.width, info.height);
+    let (w, h, stride) = (w as usize, h as usize, stride as usize);
+    // Centered, clamped to (0,0) so an over-large surface pins to the top-left and clips.
+    let x0 = fw.saturating_sub(w) / 2;
+    let y0 = fh.saturating_sub(h) / 2;
+
+    for row in 0..h {
+        let row_base = row * stride;
+        for col in 0..w {
+            // Unaligned-safe read of the ARGB8888 pixel; low 24 bits are RRGGBB.
+            let px = unsafe {
+                core::ptr::read_unaligned(surf.add(row_base + col * 4) as *const u32)
+            };
+            fb.put_pixel(x0 + col, y0 + row, px & 0x00FF_FFFF);
+        }
+    }
+
+    // Clean the touched rows for the non-coherent scan-out (superset: whole rows [y0, y0+h)).
+    let row_bytes = info.stride * info.bytes_per_pixel;
+    let y_end = (y0 + h).min(fh);
+    if y_end > y0 {
+        fb.flush_range(y0 * row_bytes, (y_end - y0) * row_bytes);
+    }
+
+    // First present only — no per-frame witness spam.
+    if !UVUG2_WITNESSED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        serial_println!("[uvug2] present {}x{} -> blit at ({},{})", w, h, x0, y0);
+    }
+}

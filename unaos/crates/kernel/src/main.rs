@@ -935,6 +935,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             .init(framebuffer_addr as usize, framebuffer_size, info);
 
         unaos_kernel::vug::init(framebuffer_addr as usize, framebuffer_size, info);
+
+        // UVUG-2: wire the SYS_FB_PRESENT seam to the real scan-out now that WRITER is initialized.
+        // One registration call site; the hook centers an EL0 program's presented off-screen surface
+        // on the panel (see `video::screen::present_surface`). Same code on the baremetal and QEMU
+        // kernel8 paths (both reach here with a live framebuffer). aarch64-only — the seam lives in
+        // arch/aarch64/syscall.
+        #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+        unaos_kernel::arch::aarch64::syscall::register_fb_present_hook(
+            unaos_kernel::video::screen::present_surface,
+        );
     } else {
         serial_println!(":: WARNING: No framebuffer detected ::");
     }
