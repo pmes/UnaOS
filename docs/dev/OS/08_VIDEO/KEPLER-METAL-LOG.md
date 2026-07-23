@@ -3,6 +3,39 @@
 Hard-won silicon facts from the fox-metal sitting series. Trust these over any
 QEMU behavior. Newest sitting first.
 
+## Sitting #6 (igpu pull 1 + kepler pull 7, UnaOS-gemini@8105f73c, 2026-07-22, fox-metal-r23s1h) — IN PROGRESS
+
+**Boot 1 (8f7aaa6e media) — WASTED, defect ours:** the staged kernel carried no
+probe. Builder lacked the `UNAOS_IVB` env→feature mapping AND igpu.rs had never
+compiled (3 errors) — the land-review "gates green" never armed the knob.
+Fixed in d6efd093; false PASS corrected in 8105f73c. **Law adopted (both
+sides): a knob-gated PASS requires the gate WITH knobs armed + strings-proof
+of the probe in the builder-path kernel.elf.** (The builder's own env→feature
+map can silently drop features — check it, not just arroyo's.)
+
+**Boot 1b (8105f73c, strings-verified media) — iGPU probe CLEAN, and the
+panel theory flips:** `[Intel iGPU]` through `:: igpu: probe-complete ::`.
+- Pipes A/B/C `CONF=0` (ALL disabled). Planes A/B/C `CNTR=0 SURF=0 STRIDE=0
+  LINOFF=0 TILEOFF=0` (all disabled, nothing mapped). `DP_A=0x1C` (port not
+  enabled). FOX CROSS-CHECK line correctly did not fire.
+- **Reading:** GOP left NO live iGPU scanout. Combined with sitting #5
+  (Kepler evo/crtc=0 on all 4 heads): **NEITHER GPU has an enabled scanout at
+  probe time** while the panel is black. The "gmux gave the panel to the iGPU"
+  theory loses its iGPU half as-probed. Either firmware tears scanout down at
+  ExitBootServices, or the 0x90020000 fb writes go to an aperture nobody
+  scans. Milestone-2 framing (write-in-place vs GGTT remap) is MOOT as posed —
+  there may be nothing to write into; the next question is "who can light a
+  pipe from scratch" + what gmux muxes when both engines are off. Per
+  null-hypothesis law, our bootchain's at/after-handoff behavior stays the
+  prime suspect for the teardown. **Strategy call is Peter's, not an
+  auto-continue.**
+- Sitting-brief hygiene (recorded): boot-2 knob list must be
+  `UNAOS_USBDEBUG+UNAOS_IVB+UNAOS_KEPLER+UNAOS_KEPLER_TAKEOVER+UNAOS_KEPLER_FIFO`
+  — the original brief omitted the FIFO knob; Fox's strings check caught the
+  under-build before it flew.
+
+Boot 2b (kepler pbdma/clock dumps) staged; verdict pending.
+
 ## Sitting #5 (pull 6 v2, UnaOS-gemini@e49efbeb, 2026-07-22, fox-metal-r23s1g) — STRATEGIC REDIRECT
 
 **Wall 1 — DOUBLE REFUTATION + gmux redirect.** Both candidates dead on all 4 heads:
