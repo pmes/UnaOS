@@ -780,14 +780,29 @@ static PIUSB_DTB: AtomicU64 = AtomicU64::new(0);
 /// stashing an AtomicU64 is heap-free and safe there. Off the boot path = the panel unblocks at once.
 pub fn bringup(dtb: u64) {
     PIUSB_DTB.store(dtb, Ordering::Release);
-    // PIUSB-32: EARLY power/clock census — this call runs at the tail of `build_boot_info` (pre-heap,
-    // pre-SMP, IRQs masked, panel not yet live): the P38-equivalent context in which the RC APB read is
-    // metal-proven to succeed. It captures the candidate firmware domains' state HERE so the deferred
-    // census (in `bringup_inner`) can be diffed against it — a state change across the two is the wall.
-    // Mailbox-only (no RC MMIO), so it never risks the boot-critical stall PIUSB-29 removed; gated on the
-    // DTB `pcie@` census so QEMU raspi4b (no RC) stays silent, matching every other RC-touch site.
+    // PIUSB-33: the SPLIT bring-up — run the RC + xHCI HARDWARE bring-up HERE, in the early P38-proven
+    // single-threaded pre-V3D/pre-GENET/pre-panel context (tail of `build_boot_info`: pre-heap, pre-SMP,
+    // IRQs masked, panel not yet live). Metal evidence (this sitting): P39/P40/P41 — the very first RC APB
+    // read (RGR1_SW_INIT_1 @ 0xfd509210) HARD-STALLS on ANY core in the deferred post-panel context; P43 —
+    // the early-vs-deferred power/clock census is IDENTICAL (firmware power/clock exonerated; the DTB
+    // carries no clocks/power-domains on `pcie@`); P38 — the FULL bring-up succeeds in exactly this early
+    // context. Conclusion: the RC APB + xHCI controller bring-up must run in the early proven context;
+    // only the heap-backed device enumeration / HID-and-storage walk stays deferred (`bringup_task` →
+    // `enumerate`), because the heap is not up yet at this point in `build_boot_info` and enumeration
+    // touches the xHCI BAR MMIO (not the stalling RC APB). `bringup_inner` is heap-free (it stops at the
+    // "controller halted-but-decoding + ports powered" honesty line, allocating no rings) and CENSUS-
+    // BEFORE-TOUCH: it reads the firmware DTB for a `pcie@` node FIRST and returns before ANY RC MMIO if
+    // none is present, so QEMU raspi4b (models no PCIe RC, no `pcie@` node) skips cleanly. The early
+    // power/clock census (kept — cheap, proven harmless) fires inside `bringup_inner`, right before the
+    // first RC read. Cost is measured + witnessed so the honest panel-delay impact of putting the hardware
+    // bring-up back on the early path is serial-visible.
+    let t0 = ms_now();
+    bringup_inner(dtb);
     if dtb_has_pcie(dtb) {
-        power_clock_census("early/build_boot_info (P38-equivalent context)");
+        serial_println!(
+            ":: piusb33: early hw bring-up done ({}ms; RC reset + link train + xHCI init to ports-powered, on the early P38 path) ::",
+            ms_now().saturating_sub(t0)
+        );
     }
 }
 
@@ -802,15 +817,24 @@ pub fn bringup(dtb: u64) {
 /// keyboard/mouse plugged at power-on arms the same way, just slightly later (the devices do not vanish).
 /// Brackets the work with a CNTPCT-derived millisecond witness so the panel-unblock win is serial-visible.
 pub fn bringup_task(_arg: usize) {
+    // PIUSB-33: the DEFERRED half of the split — enumeration ONLY. The RC + xHCI hardware bring-up
+    // (`bringup_inner`) already ran EARLY, in `build_boot_info`'s P38-proven context (the RC APB read
+    // that P39/P40/P41 proved hard-stalls in this deferred post-panel context never happens here — the
+    // controller is already halted-but-decoding with its ports powered, `XHCI_READY` set). All that
+    // remains is the heap-backed DMA-side walk: rings/interrupter, RS=1, port-connect pump, ADDRESS_DEVICE
+    // and the HID/mass-storage enumeration — which touches the xHCI BAR MMIO (not the stalling RC APB) and
+    // needs the heap, so it stays here on the BSP after the GUI/panel tasks are spawned. `enumerate`
+    // self-gates on `XHCI_READY`: if the early bring-up did not reach the honesty line (QEMU raspi4b
+    // census-skip, link-down, BAR mismatch) it says so and returns.
+    let t0 = ms_now();
     serial_println!(
-        ":: piusb30: boot-core bring-up start (panel already live on the APs at {}ms) ::",
-        ms_now()
+        ":: piusb33: deferred enumerate start (early hw bring-up already reached the honesty line; panel already live on the APs at {}ms) ::",
+        t0
     );
-    bringup_inner(PIUSB_DTB.load(Ordering::Acquire));
     enumerate();
     serial_println!(
-        ":: piusb30: boot-core bring-up done ({}ms; RC bring-up + enumerate ran on the BSP, off the panel path) ::",
-        ms_now()
+        ":: piusb33: deferred enumerate done ({}ms; DMA-side walk ran on the BSP, off the panel path) ::",
+        ms_now().saturating_sub(t0)
     );
 }
 
@@ -825,11 +849,13 @@ fn ms_now() -> u64 {
     super::timer::cntpct().saturating_mul(1000) / f
 }
 
-/// Bring the BCM2711 PCIe RC + VL805 xHCI up to the honesty line. Runs inside `bringup_task` on a
-/// secondary core (post-heap, post-SMP) — no longer on the boot-critical path. Heap-free itself: the
-/// attach stops at "halted-but-decoding + ports powered" and never allocates rings (`enumerate` does
-/// that next). `dtb` is the firmware device tree stashed by `bringup` — censused for a `pcie@` node
-/// BEFORE any RC MMIO (QEMU raspi4b has none → clean skip). Every wait is a FINITE CNTPCT backstop.
+/// Bring the BCM2711 PCIe RC + VL805 xHCI up to the honesty line. PIUSB-33: runs EARLY, from `bringup`
+/// in `build_boot_info` (pre-heap, pre-SMP, single-threaded — the P38-proven context in which the RC APB
+/// read succeeds; the deferred post-panel context hard-stalls it, P39/P40/P41). Heap-free itself: the
+/// attach stops at "halted-but-decoding + ports powered" and never allocates rings (`enumerate`, deferred
+/// to `bringup_task`, does that next once the heap is up). `dtb` is the firmware device tree stashed by
+/// `bringup` — censused for a `pcie@` node BEFORE any RC MMIO (QEMU raspi4b has none → clean skip). Every
+/// wait is a FINITE CNTPCT backstop.
 fn bringup_inner(dtb: u64) {
     serial_println!("{} PI-USB-1 bring-up starting (BCM2711 PCIe RC @ {:#x} + VL805 xHCI) ::", P, RC_BASE);
 
@@ -845,19 +871,16 @@ fn bringup_inner(dtb: u64) {
     }
     serial_println!("{} DTB census: `pcie@` controller present — proceeding to RC bring-up ::", P);
 
-    // ── PIUSB-32: DEFERRED power/clock census — the counterpart to the early census in `bringup`. This
-    //    runs in the exact context where the RC APB read stalls (post-V3D/GENET/panel), RIGHT BEFORE the
-    //    first RC MMIO (`dump_firmware_state`'s `piusb31` enter/read). The next metal boot decides the
-    //    root cause by diffing these two `[piusb32] census(...)` lines:
-    //      * a candidate whose power/clock DIFFERS here vs the early line  => firmware-owned: V3D bring-up
-    //        (or a firmware runtime-PM) changed a domain the RC depends on; the conditional enable above
-    //        will have already re-armed it, and the following RC read should now return.
-    //      * all three IDENTICAL and ON in both lines                       => the RC's registers are NOT
-    //        firmware power/clock gated (consistent with the DTB carrying no such domain); the stall is
-    //        owned by the deferred execution CONTEXT, not power/clock — the split-design signal.
-    //    Mailbox-only (timeout-bounded); it cannot itself be the source of the hard stall (mailbox is
-    //    already exonerated — the wedge precedes any USB mailbox call).
-    power_clock_census("deferred/bringup_inner (post-V3D+GENET+panel — the stall context)");
+    // ── PIUSB-32/33: the power/clock census, RIGHT BEFORE the first RC MMIO (`dump_firmware_state`'s
+    //    `piusb31` enter/read). As of PIUSB-33 `bringup_inner` runs EARLY (from `bringup`, in
+    //    `build_boot_info`), so this census now fires in the P38-proven pre-V3D/pre-GENET/pre-panel
+    //    context — the same context the (former) early census captured. It is kept because it is cheap and
+    //    proven harmless (mailbox-only, timeout-bounded; it cannot be the source of the deferred hard
+    //    stall — that stall is what PIUSB-33 designed out by moving the RC read here). P43 already showed
+    //    the early-vs-deferred census IDENTICAL (firmware power/clock exonerated: the DTB carries no
+    //    clocks/power-domains on `pcie@`), so this line is now steady-state instrumentation, not a
+    //    diagnostic diff-target.
+    power_clock_census("early/bringup_inner (P38 context, right before the first RC read)");
 
     // ── PIUSB-5/6: read-only reference dump FIRST (link-up-gated), reset SECOND. Capture the
     //    firmware-left state before M1 destroys it with the bridge/PERST reset. boot-P4 proved the

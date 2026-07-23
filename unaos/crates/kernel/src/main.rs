@@ -311,18 +311,17 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         #[cfg(feature = "piinstall")]
         unaos_kernel::install::pi::run();
 
-        // PIUSB-30: USB bring-up is OFF the panel-critical path but stays on the BOOT CORE. `piusb::bringup`
-        // (pre-heap, in build_boot_info) only stashes the DTB; the real cost — the brcmstb RC reset/PERST/CNR
-        // settle AND `enumerate`'s bounded polled walk (rings/interrupter, RS=1, port/HID/storage enumeration)
-        // — runs in `piusb::bringup_task(0)`. PIUSB-29 deferred that onto a SECONDARY core via `spawn_auto`;
-        // metal P39 proved that wedges: the RC/VL805 sequence + the VideoCore mailbox singleton it drives are
-        // metal-proven only in the boot core's single-threaded pre-GUI context, and on an AP the task stalled
-        // right after the DTB census (controller never published, `usb_pump` idled forever, no HID). So the
-        // AP placement is retired; the deferred call now runs on the BSP AFTER the GUI/input/render tasks are
-        // spawned (see the `bringup_task(0)` call just before the BSP idles), keeping BOTH the panel-unblock
-        // win (the APs paint while it runs) AND the P38 execution context. HERE we only handle the no-AP /
-        // serial-only fallback that never spawns those GUI tasks: bring USB up synchronously before the shared
-        // BSP loop below polls the controller. In QEMU raspi4b (no PCIe RC/VL805) bringup+enumerate census-skip.
+        // PIUSB-33: the SPLIT USB bring-up. The RC + xHCI HARDWARE bring-up (brcmstb RC reset/PERST/CNR
+        // settle → controller halted-but-decoding + ports powered) already ran EARLY, inside
+        // `piusb::bringup` in build_boot_info — the P38-proven single-threaded pre-V3D/pre-GENET/pre-panel
+        // context. Metal P39/P40/P41 proved the first RC APB read HARD-STALLS on ANY core in the deferred
+        // post-panel context; P43 exonerated firmware power/clock; so the RC read must live in the early
+        // context. `piusb::bringup_task(0)` now runs the DEFERRED half ONLY: the heap-backed DMA-side walk
+        // (`enumerate` — rings/interrupter, RS=1, port/HID/storage enumeration), which touches the xHCI BAR
+        // MMIO (not the stalling RC APB) and needs the heap. It runs on the BSP AFTER the GUI/input/render
+        // tasks are spawned (see the call just before the BSP idles), so the panel is live while it walks.
+        // HERE we handle only the no-AP / serial-only fallback that never spawns those GUI tasks: enumerate
+        // synchronously before the shared BSP loop below polls the controller. QEMU raspi4b census-skips.
         #[cfg(feature = "piusb")]
         if online.is_empty() {
             unaos_kernel::arch::piusb::bringup_task(0);
@@ -996,13 +995,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 ":: INPUT on core {} + RENDER on core {} + orphan-reaper load-balanced scheduled (OS on its own scheduler; BSP idle) ::",
                 input_cpu, render_cpu
             );
-            // PIUSB-30: NOW bring USB up — on the BOOT CORE, deferred past the GUI-task spawn above. The
-            // input/render tasks are already live on the APs (the panel is unblocked and painting), so the
-            // brcmstb RC reset/PERST/CNR settle + `enumerate` run here without freezing the panel, yet in
-            // the single-threaded boot-core context the RC/VL805 + VideoCore-mailbox sequence is metal-proven
-            // in (the P38 context). PIUSB-29's `spawn_auto`-onto-an-AP is what wedged on metal P39 (stalled
-            // after the DTB census; controller never published). Runs once, publishes XHCI_CONTROLLER, and
-            // hands steady-state servicing to `usb_pump` (spawned above). QEMU raspi4b census-skips (no RC).
+            // PIUSB-33: NOW run the DEFERRED half of the split — enumeration only, on the BOOT CORE, past
+            // the GUI-task spawn above. The RC + xHCI hardware bring-up already ran EARLY in build_boot_info
+            // (the P38-proven context; the RC APB read that P39/P40/P41 proved hard-stalls in this deferred
+            // context is long done, `XHCI_READY` set). The input/render tasks are already live on the APs
+            // (the panel is unblocked and painting), so `enumerate`'s heap-backed DMA-side walk (rings, RS=1,
+            // port/HID/storage) runs here without freezing the panel — and it touches the xHCI BAR MMIO, not
+            // the stalling RC APB, so the deferred context is safe for it. Runs once, publishes the xHCI
+            // controller, and hands steady-state servicing to `usb_pump` (spawned above). QEMU census-skips.
             #[cfg(feature = "piusb")]
             unaos_kernel::arch::piusb::bringup_task(0);
             unaos_kernel::arch::hlt_loop();

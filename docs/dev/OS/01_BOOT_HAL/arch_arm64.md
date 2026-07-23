@@ -6919,12 +6919,52 @@ census calls are gated on `dtb_has_pcie`, so QEMU raspi4b (no `pcie@` node) prin
   re-arms it and the following RC read should return (root cause = a domain V3D/runtime-PM perturbed);
 - all three **identical and ON** in both lines ⇒ the RC registers are **not** power/clock gated (matches
   the DTB) — the stall is owned by the deferred execution *context*, and the fix is the **split** (run the
-  RC + xHCI hardware bring-up in the earlier single-threaded context, defer only enumeration). NOTE: a
-  true pre-V3D split needs the `piusb::bringup` call reordered ahead of `init_framebuffer` in `boot.rs`
-  (outside the pi arc's lane) — flagged to the integrator rather than taken unilaterally.
+  RC + xHCI hardware bring-up in the earlier single-threaded context, defer only enumeration).
+
+**P43 verdict (metal):** the census was **identical early-vs-deferred** — firmware power/clock exonerated,
+exactly as the DTB predicted. The stall is owned by the **deferred execution context**, not power/clock.
+That is the split signal → **PIUSB-33** below. (No `boot.rs` reorder ahead of `init_framebuffer` was
+needed: P38's working bring-up already ran at the *end* of `build_boot_info` with V3D up — so the P38
+context is "pre-SMP / pre-heap / pre-panel / single-threaded," not "pre-V3D." The current `piusb::bringup`
+call site already sits there.)
 
 Gates: `./arroyo check` both arches; `UNAOS_V3D=1 UNAOS_GENET=1 UNAOS_PIUSB=1 ./arroyo kernel8-test`
 (clean boot, census-skip); `./arroyo test-arm` (virt xHCI KB/mouse/storage enumerate).
+
+### PIUSB-33 — the SPLIT: early hardware bring-up + deferred enumeration
+
+**The evidence-owned fix for the deferred-RC-APB stall.** P43 settled the P42 tree at the "identical
+census ⇒ deferred *context* owns the stall" branch. So the RC + xHCI **hardware** bring-up is moved back
+into the P38-proven early context, and **only** the enumeration/HID/mass-storage walk stays deferred:
+
+- **Early phase — `piusb::bringup` (tail of `build_boot_info`, `boot.rs`).** Now runs the full
+  `bringup_inner` (the census, `dump_firmware_state`'s RC reads, M1 RC reset + link train, M2 VL805
+  enumeration + fw load, M3 outbound-window map + xHCI init + **root ports powered**) — up to the
+  "controller halted-but-decoding + ports-powered honesty line," **excluding** the device walk. This is
+  the exact single-threaded pre-SMP / pre-heap / pre-panel context P38 proved (heap-free — the attach
+  allocates no rings; V3D is already up here, and P43 exonerated it). Witness:
+  `:: piusb33: early hw bring-up done (<ms>ms) ::` (printed only when `dtb_has_pcie`, so QEMU stays
+  silent). The cost is measured so the panel-delay impact of the early placement is honest and
+  serial-visible.
+- **Deferred phase — `piusb::bringup_task(0)` (BSP, after the GUI/input/render tasks spawn).**
+  `enumerate` **only**: it self-gates on `XHCI_READY` (set by the early M3), re-confirms the BAR still
+  decodes, then does the heap-backed DMA-side walk — rings/DCBAA/interrupter, `RS=1`, port-connect pump,
+  `ADDRESS_DEVICE`, HID/storage enumeration. This touches the **xHCI BAR MMIO** (not the stalling RC APB),
+  needs the heap, and runs with the panel already live. Witness:
+  `:: piusb33: deferred enumerate done (<ms>ms) ::` plus the existing HID/storage attach lines.
+
+The `piusb31` enter/exit bracket around the (now-early) first RC read is **kept** — harmless and its
+witness dump is still useful; it simply no longer straddles a stall. The `power_clock_census` call is
+kept (relabeled `early/bringup_inner`) as steady-state instrumentation.
+
+**QEMU:** the census-skip path is unchanged — no `pcie@` node ⇒ `bringup_inner` returns before any RC
+MMIO (no early witness), and the deferred `enumerate` reports "honesty line not reached" and returns.
+Batteries stay green.
+
+Gates: `./arroyo check` both arches ✅; `UNAOS_V3D=1 UNAOS_GENET=1 UNAOS_PIUSB=1 ./arroyo kernel8-test`
+✅ (clean boot, census-skip both halves, all PASS); `./arroyo test-arm` ✅ (virt xHCI MISSION SUCCESS —
+KB/mouse/storage). Positive metal verification (early bring-up reaches the honesty line, deferred
+enumerate arms the keyboard) is the **P44** attended sitting — the boot that returns the keyboard.
 
 ## PI-GENET — BCM2711 on-board Gigabit Ethernet (Broadcom GENET v5) + smoltcp bind (Arc PI-GENET)
 
