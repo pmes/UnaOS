@@ -2,11 +2,15 @@
 
 Status: **VFS-2 landed** — the write surface is implemented for both backends
 (`unaos/crates/kernel/src/fs/vfs.rs`), on top of VFS-1's read/resolve/authorize spine.
-The spine is still **unconsumed by production callers**: no shell command, syscall, or
-EL0 path routes through it yet (adoption — shell, `SYS_OPEN`, `genet`/net paths — is a
-follow-up). VFS-2's write path is proven by two self-verifying on-card witnesses
-(§9); wiring those into the boot battery is a one-line-per-witness `syscall.rs` change
-carried as a deferred diff (that file is outside the VFS lane).
+First consumer landed (**SHELL-WRITE**): the panel shell's `vfs` verb
+(`unaos/crates/kernel/src/shell.rs`) routes create / write / truncate / unlink
+through the `MountTable` over one namespace — the native UnaFS volume at `/`, the
+FAT boot partition at `/fat`. `vfs write|append|rm|mkdir <path> [text]`, writing as
+`KERNEL_PRINCIPAL` (the shell's trusted-operator posture). `SYS_OPEN` and the
+`genet`/net paths remain follow-up adoptions. VFS-2's write path is also proven by
+two self-verifying on-card witnesses (§9); wiring those into the boot battery is a
+one-line-per-witness `syscall.rs` change carried as a deferred diff (that file is
+outside the VFS lane).
 
 ## 1. Why a VFS, and why now
 

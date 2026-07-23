@@ -2316,6 +2316,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             console.println("PAGING:   head <path> [n], tail <path> [n]  (first / last n lines, default 10)");
             console.println("WRITE:    touch <path>, write <path> <text>, append <path> <text>, rm [-r] [-f] <path>");
             console.println("DIRS:     mkdir <path>, rmdir <path>  (create / remove empty directories)");
+            console.println("VFS:      vfs write|append|rm|mkdir <path> [text]  (unified namespace: / native, /fat FAT)");
             console.println("          rm -r <dir>  (recursively delete a directory tree; root refused)");
             console.println("COPY:     cp [-f] <src> <dst>  (copy a file; cp FILE DIR/ lands as DIR/<leaf>)");
             console.println("          cp -r <srcdir> <dst>  (recursively copy a directory tree)");
@@ -2818,6 +2819,16 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 None => console.println("usage: rmdir <path>"),
                 Some(name) => fs_rmdir(console, name),
             }
+        },
+        "vfs" => {
+            // SHELL-WRITE: the unified VFS write surface. Unlike the FAT-direct
+            // verbs above (`write`/`append`/`rm`/`mkdir`, which ride fat.rs on the
+            // boot partition at cwd-relative paths), this routes create / write /
+            // truncate / unlink through the VFS-2 `MountTable` over ONE namespace —
+            // the native UnaFS volume at `/`, the FAT boot partition at `/fat` — so
+            // a panel operator can exercise the per-object native ACL path and the
+            // foreign volume-level path from the same surface. `vfs <op> <path>`.
+            vfs_cmd(console, &args);
         },
         "cp" | "copy" => {
             // JD8: copy a file (`cp FILE DIR/` lands as DIR/<leaf>). JD9: `-r`/`-R` recursively copies a
@@ -3368,6 +3379,150 @@ fn parse_num(s: &str) -> Option<u64> {
     } else {
         s.parse::<u64>().ok()
     }
+}
+
+// --- SHELL-WRITE: unified VFS write surface (`vfs <op> <path> [text]`) ---------
+//
+// The FIRST consumer of the VFS-2 write surface. Each invocation builds the
+// process namespace fresh (stateless, like the FAT verbs — a swapped card is
+// picked up on the next command) and drives the `MountTable` create / write /
+// truncate / unlink verbs. The shell is the trusted operator console, so it
+// writes as the kernel-authority principal (`KERNEL_PRINCIPAL`) — the same
+// posture the `u*` native verbs record. Namespace: native UnaFS at `/`, the FAT
+// boot partition at `/fat`. Both real backends are aarch64-only (the x86 build
+// has neither the unafs module nor a `VfsBackend for FatBackend` impl), so the
+// x86 arm is an honest "unsupported on this arch" line.
+
+/// Build the shell's VFS namespace: native UnaFS at `/`, FAT boot partition at
+/// `/fat`. World-readable is a READ posture only (it does not confer write); the
+/// shell writes as `KERNEL_PRINCIPAL`, which both backends authorize.
+#[cfg(target_arch = "aarch64")]
+fn vfs_mount_table() -> crate::fs::vfs::MountTable {
+    use crate::fs::vfs::{FatBackend, MountTable, NativeBackend, KERNEL_PRINCIPAL};
+    let mut mt = MountTable::new();
+    mt.mount("/", alloc::boxed::Box::new(NativeBackend::new("native")));
+    mt.mount("/fat", alloc::boxed::Box::new(FatBackend::new("fat", KERNEL_PRINCIPAL, true)));
+    mt
+}
+
+/// Render a `VfsError` as an errno-style operator line, matching the shell's
+/// `-ENOENT`/`-EISDIR` house style.
+#[cfg(target_arch = "aarch64")]
+fn vfs_err(e: crate::fs::vfs::VfsError) -> String {
+    use crate::fs::vfs::VfsError::*;
+    match e {
+        NoSuchVolume => String::from("no such volume"),
+        NoSuchPath => String::from("no such file or directory (-ENOENT)"),
+        NotADirectory => String::from("not a directory (-ENOTDIR)"),
+        IsADirectory => String::from("is a directory (-EISDIR)"),
+        Denied => String::from("permission denied (-EACCES)"),
+        Unsupported => String::from("operation not supported on this volume (-ENOTSUP)"),
+        Backend(s) => alloc::format!("backend error: {}", s),
+    }
+}
+
+/// Panel-line + `:: vfsw: <line> ::` serial mirror (the `ui3_say` idiom, dedicated
+/// tag) — the verb renders panel-only on the bench, so the witness gives a headless
+/// capture the same content.
+#[cfg(target_arch = "aarch64")]
+fn vfs_say(console: &mut Console, line: &str) {
+    console.println(line);
+    serial_println!(":: vfsw: {} ::", line);
+}
+
+/// SHELL-WRITE dispatcher: `vfs <write|append|rm|mkdir> <path> [text ...]`.
+#[cfg(target_arch = "aarch64")]
+fn vfs_cmd(console: &mut Console, args: &[&str]) {
+    use crate::fs::vfs::{NodeKind, VfsError, KERNEL_PRINCIPAL};
+    let op = match args.first() {
+        Some(&o) => o,
+        None => {
+            console.println("usage: vfs <write|append|rm|mkdir> <path> [text ...]");
+            console.println("  namespace: / = native UnaFS, /fat = FAT boot partition");
+            return;
+        }
+    };
+    let path = match args.get(1) {
+        Some(&p) => p,
+        None => {
+            console.println(&alloc::format!("usage: vfs {} <path> [text ...]", op));
+            return;
+        }
+    };
+    let mt = vfs_mount_table();
+    let principal = KERNEL_PRINCIPAL;
+    match op {
+        "write" => {
+            // Create-or-overwrite: replace an existing file's contents wholesale.
+            // We unlink-then-create rather than truncate-to-0 because the native
+            // backend has no in-place shrink primitive (truncate to 0 on a
+            // non-empty native file is `Unsupported` by design) — replace works on
+            // both backends. A directory target is refused up front.
+            if let Ok(st) = mt.stat(path) {
+                if matches!(st.kind, NodeKind::Dir) {
+                    vfs_say(console, &alloc::format!("vfs write: {}: is a directory (-EISDIR)", path));
+                    return;
+                }
+            }
+            let mut data = args[2..].join(" ").into_bytes();
+            data.push(b'\n');
+            let _ = mt.unlink(path, principal); // drop the old file if present
+            if let Err(e) = mt.create(path, NodeKind::File, principal) {
+                vfs_say(console, &alloc::format!("vfs write: {}: {}", path, vfs_err(e)));
+                return;
+            }
+            match mt.write(path, 0, &data, principal) {
+                Ok(n) => vfs_say(console, &alloc::format!("vfs write: {}: wrote {} bytes", path, n)),
+                Err(e) => vfs_say(console, &alloc::format!("vfs write: {}: {}", path, vfs_err(e))),
+            }
+        }
+        "append" => {
+            let offset = match mt.stat(path) {
+                Ok(st) if matches!(st.kind, NodeKind::Dir) => {
+                    vfs_say(console, &alloc::format!("vfs append: {}: is a directory (-EISDIR)", path));
+                    return;
+                }
+                Ok(st) => st.size, // append at the current EOF
+                Err(VfsError::NoSuchPath) => {
+                    if let Err(e) = mt.create(path, NodeKind::File, principal) {
+                        vfs_say(console, &alloc::format!("vfs append: {}: {}", path, vfs_err(e)));
+                        return;
+                    }
+                    0
+                }
+                Err(e) => {
+                    vfs_say(console, &alloc::format!("vfs append: {}: {}", path, vfs_err(e)));
+                    return;
+                }
+            };
+            let mut data = args[2..].join(" ").into_bytes();
+            data.push(b'\n');
+            match mt.write(path, offset, &data, principal) {
+                Ok(n) => vfs_say(console, &alloc::format!(
+                    "vfs append: {}: wrote {} bytes at offset {}", path, n, offset)),
+                Err(e) => vfs_say(console, &alloc::format!("vfs append: {}: {}", path, vfs_err(e))),
+            }
+        }
+        "rm" => match mt.unlink(path, principal) {
+            Ok(()) => vfs_say(console, &alloc::format!("vfs rm: {}: removed", path)),
+            Err(e) => vfs_say(console, &alloc::format!("vfs rm: {}: {}", path, vfs_err(e))),
+        },
+        "mkdir" => match mt.create(path, NodeKind::Dir, principal) {
+            Ok(_) => vfs_say(console, &alloc::format!("vfs mkdir: {}: created", path)),
+            Err(VfsError::Backend("exists")) =>
+                vfs_say(console, &alloc::format!("vfs mkdir: {}: already exists (-EEXIST)", path)),
+            Err(e) => vfs_say(console, &alloc::format!("vfs mkdir: {}: {}", path, vfs_err(e))),
+        },
+        other => console.println(&alloc::format!(
+            "vfs: unknown op '{}' (write|append|rm|mkdir)", other)),
+    }
+}
+
+/// x86 has no writable VFS backend (no unafs module, no `VfsBackend for FatBackend`
+/// impl), so the unified write surface is aarch64-only. Honest refusal on x86.
+#[cfg(not(target_arch = "aarch64"))]
+fn vfs_cmd(console: &mut Console, _args: &[&str]) {
+    console.println("vfs: unified VFS write surface is aarch64-only (no writable backend on this arch)");
 }
 
 // --- BeFS-K4 native unafs write verbs -----------------------------------------
