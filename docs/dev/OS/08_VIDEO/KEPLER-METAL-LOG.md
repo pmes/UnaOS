@@ -42,6 +42,13 @@ fence-timeout, `ch_stat=0x11000001`. The channel is never scheduled onto any
 PBDMA. Pull-9 target: runlist entry format/ID encoding, RAMFC fields the
 scheduler validates, submit-vs-enable ordering, which-runlist.
 
+**Boot 2r (94b0ed0c, all five knobs) — all post-sitting fixes PROVEN on
+metal:** serial-first GPU init (PDISPLAY breadcrumb on the wire), takeover
+aborts in seconds (bounded polls), prefixed rows pass the filter. Content
+pure confirmation of the above canon (iGPU all-dead, DP_A=0x1C ×3, ORDER
+0x00090000, playlist read, PBDMAs unbound). Wall 2 = pull-9's
+runlist-entry/channel-bind, nothing else remains.
+
 Capture: `~/unaos-bench/capture/rmbp-r23s6/` + MANIFEST rows.
 
 ## Sitting #6 (igpu pull 1 + kepler pull 7, UnaOS-gemini@8105f73c, 2026-07-22, fox-metal-r23s1h) — superseded notes below (boots 1/1b/2b)
