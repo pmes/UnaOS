@@ -44,6 +44,17 @@ pub mod regs {
 use core::sync::atomic::{AtomicBool, Ordering};
 
 static PROBED: AtomicBool = AtomicBool::new(false);
+static mut TRACE_1: [u32; 8] = [0; 8];
+static mut TRACE_2: [u32; 8] = [0; 8];
+static mut TRACES_VALID: bool = false;
+
+pub fn set_boot_traces(t1: [u32; 8], t2: [u32; 8]) {
+    unsafe {
+        TRACE_1 = t1;
+        TRACE_2 = t2;
+        TRACES_VALID = true;
+    }
+}
 
 pub fn init(gpu: &GpuInfo) {
     if PROBED.swap(true, Ordering::SeqCst) {
@@ -73,6 +84,27 @@ pub fn init(gpu: &GpuInfo) {
     serial_println!("[Intel iGPU] Milestone 1: Read-only probe (instrumentation phase)");
 
     unsafe {
+        if TRACES_VALID {
+            serial_println!(":: igpu: TEARDOWN HUNT TRACE ::");
+            serial_println!("Reg          | Point 1 (Pre-EBS) | Point 2 (Post-EBS)| Point 3 (Kernel)");
+            let trace3 = [
+                mmio_read(bar0, regs::PIPEACONF),
+                mmio_read(bar0, regs::PIPEBCONF),
+                mmio_read(bar0, regs::PIPECCONF),
+                mmio_read(bar0, regs::DSPACNTR),
+                mmio_read(bar0, regs::DSPBCNTR),
+                mmio_read(bar0, regs::DSPCCNTR),
+                mmio_read(bar0, regs::DSPASURF),
+                mmio_read(bar0, regs::DP_A),
+            ];
+            let names = ["PIPEACONF", "PIPEBCONF", "PIPECCONF", "DSPACNTR", "DSPBCNTR", "DSPCCNTR", "DSPASURF", "DP_A"];
+            for i in 0..8 {
+                serial_println!("{:<12} | 0x{:08X}        | 0x{:08X}        | 0x{:08X}", 
+                    names[i], TRACE_1[i], TRACE_2[i], trace3[i]);
+            }
+            serial_println!(":: igpu: TRACE END ::");
+        }
+
         let dp_a = mmio_read(bar0, regs::DP_A);
         serial_println!("[Intel iGPU] DP_A: 0x{:08X} (Port A / eDP)", dp_a);
 

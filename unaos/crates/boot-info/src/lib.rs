@@ -67,4 +67,11 @@ pub struct BootInfo {
     /// 0 = kept firmware current mode, 1 = set the EDID-native mode, 2 = set a fallback linear
     /// mode (current was BltOnly), 3 = headless (no linear framebuffer available).
     pub mode_action: u32,
+
+    #[cfg(feature = "unaos_ivb")]
+    pub igpu_trace_1: [u32; 8],
+    #[cfg(feature = "unaos_ivb")]
+    pub igpu_trace_2: [u32; 8],
+    #[cfg(feature = "unaos_ivb")]
+    pub igpu_trace_valid: bool,
 }

@@ -11,6 +11,7 @@ nvidia-kepler = []
 nvidia-kepler-takeover = []
 nvidia-kepler-fifo = []
 intel-ivb = []
+unaos_ivb = ["unaos-boot-info/unaos_ivb"]
 # DEFAULT-QUIET (witness): gate the battery of EL0/kernel fixtures that RE-PROVE long-metal-confirmed
 # facts on every boot (x86: nmi-self-fire + canonical-guard + U1a/U1b/U2-0a/U3/U3.5 + the
 # U2/U4x/U5x/U6x/U6bx storage chain that cascades U7x..U6gx; aarch64 baremetal: the M6b/M6e/M6d/M6f/M6g

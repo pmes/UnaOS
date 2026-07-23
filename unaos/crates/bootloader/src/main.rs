@@ -776,7 +776,19 @@ fn main() -> Status {
         }
     }
 
+    #[cfg(feature = "unaos_ivb")]
+    {
+        boot_info_static.igpu_trace_1 = unsafe { read_igpu_trace() };
+        log::info!("iGPU trace 1 (pre-EBS) collected.");
+    }
+
     let memory_map = unsafe { boot::exit_boot_services(Some(MemoryType::LOADER_DATA)) };
+
+    #[cfg(feature = "unaos_ivb")]
+    {
+        boot_info_static.igpu_trace_2 = unsafe { read_igpu_trace() };
+        boot_info_static.igpu_trace_valid = true;
+    }
     
     let mut regions_len = 0;
     for desc in memory_map.entries() {
@@ -1068,4 +1080,48 @@ fn jb8_disconnect_lever() {
 fn acpi_checksum(bytes: &[u8]) -> u8 {
     let sum = bytes.iter().fold(0u8, |a, &b| a.wrapping_add(b));
     0u8.wrapping_sub(sum)
+}
+
+#[cfg(feature = "unaos_ivb")]
+unsafe fn read_igpu_trace() -> [u32; 8] {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use core::arch::asm;
+        
+        let mut outl = |port: u16, val: u32| {
+            asm!("out dx, eax", in("dx") port, in("eax") val, options(nomem, nostack, preserves_flags));
+        };
+        let mut inl = |port: u16| -> u32 {
+            let mut val: u32;
+            asm!("in eax, dx", out("eax") val, in("dx") port, options(nomem, nostack, preserves_flags));
+            val
+        };
+        
+        // 0x80000000 | (bus << 16) | (dev << 11) | (func << 8) | offset
+        // Bus 0, Dev 2, Func 0. 0x80001000.
+        outl(0xCF8, 0x80001010);
+        let bar0 = inl(0xCFC) & 0xFFFFFFF0;
+        if bar0 == 0 || bar0 == 0xFFFFFFF0 {
+            return [0; 8];
+        }
+        
+        let read_mmio = |offset: u32| -> u32 {
+            core::ptr::read_volatile((bar0 as usize + offset as usize) as *const u32)
+        };
+        
+        [
+            read_mmio(0x70008), // PIPEACONF
+            read_mmio(0x71008), // PIPEBCONF
+            read_mmio(0x72008), // PIPECCONF
+            read_mmio(0x70180), // DSPACNTR
+            read_mmio(0x71180), // DSPBCNTR
+            read_mmio(0x72180), // DSPCCNTR
+            read_mmio(0x7019C), // DSPASURF
+            read_mmio(0x64000), // DP_A
+        ]
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        [0; 8]
+    }
 }

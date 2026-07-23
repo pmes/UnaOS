@@ -16,6 +16,7 @@ bootdiag = ["dep:fdt"]
 # force a fresh XhciControllerDxe.Start (fresh Falcon firmware load) right before handoff. Bench-only
 # risk media — OFF by default; enabled by arroyo via UNAOS_JB8_LEVER=1. aarch64-only code paths.
 jb8lever = []
+unaos_ivb = ["unaos-boot-info/unaos_ivb"]
 
 [dependencies]
 uefi = { version = "0.38.0", features = ["alloc", "global_allocator", "logger", "panic_handler"] }
