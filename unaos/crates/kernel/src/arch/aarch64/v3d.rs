@@ -2088,7 +2088,19 @@ fn write_probe_uniforms(off: usize, scratch_v3d: u32) -> usize {
 /// draw's (same OFF_VTXDATA base, vec4 f32, stride 16, in=0/out=1 segment sizes) so the probe witnesses
 /// THIS draw's attribute fetch. The VS/FS slots point at the probe code too — a bin-only job never
 /// executes them, so their contents are irrelevant; the addresses only need to be valid arena pointers.
-/// Coord 4-way-threadable = 0 (the compiled probe reports threads = 2). Returns the attribute count.
+///
+/// V3D-31 (CS 4-way-threadable = 1): the [v3d28] store-never-issued verdict was root-caused to the CS
+/// thread-end shape. PROBE_WORDS carries `thrsw` on words [18],[19] (a consecutive pair) AND [22]
+/// (tmuwt). Cross-referenced against the SAME harness's threads=4 coord/vertex shaders
+/// (scripts/pi-v3d26-mesa-compile.out.txt), which each carry exactly ONE terminal `thrsw ; nop ; nop`
+/// and NO mid-program switch, the [18]/[19] pair is unambiguously Mesa's mid-shader THREAD SWITCH — a
+/// structure that appears only in this multi-segment threads=2 probe. It is NOT a thread-end. With the
+/// record declaring the CS as non-threadable (bit 224 = 0), the hardware ran a single thread section
+/// and terminated at the [18] switch's delay slots, dropping words [21] vpmwt / [22] tmuwt so the
+/// TMU store fired at [9] never drained. This build now sets bit 224 = 1 (CS 4-way threadable), matching
+/// the working `build_shader_record`, so the hardware honours the [18]/[19] switch and runs on to the
+/// terminal [22] thrsw where tmuwt drains the store. The Mesa artifact (PROBE_WORDS) stays byte-verbatim
+/// (§5 untouched); only the record's threading declaration changes. Returns the attribute count.
 fn build_probe_shader_record() -> u32 {
     let code = (arena_phys() + OFF_PROBE_CODE) as u64;
     let unif = (arena_phys() + OFF_PROBE_UNIF) as u64;
@@ -2114,7 +2126,11 @@ fn build_probe_shader_record() -> u32 {
     sf(&mut rec, 162, 1, 1); // VS propagate NaNs (v42)
     sf(&mut rec, 163, 29, code >> 3); // VS code address
     sf(&mut rec, 192, 32, unif); // VS uniforms address
-    // Coord shader — the one the bin runs. threads = 2 ⇒ NOT 4-way threadable.
+    // Coord shader — the one the bin runs. V3D-31: declare 4-way threadable so the hardware honours the
+    // [18]/[19] mid-shader thread-switch pair and runs on to the terminal [22] tmuwt (store drain),
+    // instead of terminating at the [18] switch treated as a thread-end (the [v3d28] store-never-issued
+    // root cause). Matches the working build_shader_record; PROBE_WORDS unchanged.
+    sf(&mut rec, 224, 1, 1); // CS 4-way threadable
     sf(&mut rec, 226, 1, 1); // CS propagate NaNs (v42)
     sf(&mut rec, 227, 29, code >> 3); // CS code address
     sf(&mut rec, 256, 32, unif); // CS uniforms address (probe stream: indices + UBO_ADDR + scales)
