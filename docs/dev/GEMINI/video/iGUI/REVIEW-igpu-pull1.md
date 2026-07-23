@@ -35,7 +35,20 @@ Add to the read-only pass, for the active pipe/plane:
 - `PIPExSRC` (0x6001C/0x6101C/0x6201C) — source width/height;
 - `DSPxLINOFF`/`DSPxTILEOFF` — panning offsets.
 
+## CORRECTION (2026-07-22, post sitting-#6 boot 1) — the PASS below was FALSE
+
+The landing review below certified "gates green" without arming `intel-ivb`.
+igpu.rs had NEVER compiled (3 errors), and the builder lacked the `UNAOS_IVB`
+mapping, so boot 1 flew with no probe in the binary — a wasted metal boot.
+Caught by Fox (capture rmbp-r23s6). Fixed in d6efd093 (core::ptr idiom — which
+also resolves both nits below — usize page math, builder mapping folded).
+**Standing law from this failure: a land-review of knob-gated code MUST run
+the gate WITH the knob armed AND strings-verify the probe in the builder-path
+kernel.elf.** d6efd093 passes both: full-knob check green on both arches;
+kernel.elf carries 4 igpu + 3 kepler-pbdma strings.
+
 ## Landing review (f73c85eb + 4f819d8a) — PASS, two non-blocking nits
+## ^ SUPERSEDED by the correction above — kept for the record
 
 A1 and A2 both honored; probe is read-only; gates green (check both arches +
 QEMU suite). Nits for milestone 2, not now:
