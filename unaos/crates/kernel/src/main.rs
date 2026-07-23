@@ -1797,7 +1797,9 @@ fn handle_key(
         // inside dispatch_command — cannot drain. Cleared unconditionally on return (a took_screen
         // command has already restored the console by the time it returns).
         SCREEN_APP_ACTIVE.store(true, core::sync::atomic::Ordering::Relaxed);
+        unaos_kernel::gui_watchdog::on_app_enter();
         let took_screen = unaos_kernel::shell::dispatch_command(&cmd, console, pal);
+        unaos_kernel::gui_watchdog::on_app_exit();
         SCREEN_APP_ACTIVE.store(false, core::sync::atomic::Ordering::Relaxed);
         if !took_screen {
             console.draw(pal);
@@ -2540,6 +2542,12 @@ fn status_tick(_: usize) {
         // ungated 1 Hz Timer would fill the 64-slot channel in ~64 s — a slow re-run of the exact
         // saturation the pointer-path gate prevents (and the strip is not visible under the app
         // anyway). The pulse resumes the instant the command returns.
+        // GUI-WIRE: the watchdog escape hatch. If the active full-screen app has stopped making
+        // drain progress (poll() latches its own wedge witness), return input to the shell so the
+        // keyboard is never trapped inside a dead app. No-op when no app owns the screen.
+        if unaos_kernel::gui_watchdog::poll() {
+            SCREEN_APP_ACTIVE.store(false, core::sync::atomic::Ordering::Relaxed);
+        }
         if !SCREEN_APP_ACTIVE.load(core::sync::atomic::Ordering::Relaxed) {
             gui_send(unaos_kernel::pal::Event::Timer);
         }

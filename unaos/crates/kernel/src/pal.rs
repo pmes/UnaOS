@@ -356,6 +356,9 @@ pub fn pump_and_poll() -> Option<Event> {
     while let Some(byte) = crate::arch::poll_input() {
         push_event(Event::Key(byte));
     }
+    // GUI-WIRE: liveness heartbeat for the app-input watchdog — the active full-screen app's drain
+    // loop proves it is still making progress once per pass. No-op when no app owns the screen.
+    crate::gui_watchdog::note_progress();
     pop_event()
 }
 
