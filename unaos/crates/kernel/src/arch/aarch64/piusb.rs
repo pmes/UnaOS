@@ -421,6 +421,156 @@ fn witness_notify_boundary(ctx: &str, label: &str) {
     }
 }
 
+// ─── PIUSB-19: link speed/width witness (candidate-(a) pre-arm). ────────────────────────────────────
+//
+// The surviving suspect after PIUSB-18 (which enabled the RC inbound SCB master — candidate (b)) is
+// candidate (a): the PCIe link geometry at NOTIFY time. Linux's brcmstb reads the STANDARD PCI Express
+// capability's Link Status register (LNKSTA) and logs negotiated speed/width; some VL805 units need the
+// link at a particular Gen (or a retrain) before their internal 8051 firmware engine behaves and clears
+// USBSTS.CNR. This witness READS the Express capability (LNKCAP / LNKSTA / LNKCTL2) on BOTH the BCM2711
+// root complex (bus0/dev0, config at RC_BASE) and the VL805 endpoint (bus1/dev0, via the EXT_CFG child
+// window), decodes negotiated speed (Gen1/Gen2) + width (x1), prints the `link Gen<N> x<W> (rc) /
+// Gen<N> x<W> (ep)` verdict template, and FLAGS any side whose negotiated geometry falls short of its
+// own LNKCAP maximum (the candidate-(a) signature). It is strictly READ-ONLY — no retrain / LNKCTL2 /
+// speed writes this arc. The EP side is HARD-GATED on PHYLINKUP && DL_ACTIVE (a link-down child-config
+// MMIO stalls the bus — boot-P4); the RC-side Express cap is in the RC's own register block (always
+// safe to read even link-down).
+
+/// PCI Express capability id (standard PCI capability list).
+const PCI_CAP_ID_EXPRESS: u32 = 0x10;
+/// Offsets WITHIN the PCI Express capability structure (from the capability's base offset).
+const EXP_LNKCAP: u64 = 0x0C; // Link Capabilities (32-bit): [3:0] max speed, [9:4] max width
+const EXP_LNKCTL_STA: u64 = 0x10; // Link Control [15:0] + Link Status (LNKSTA) [31:16]
+const EXP_LNKCTL2_STA2: u64 = 0x30; // Link Control 2 (LNKCTL2) [15:0] + Link Status 2 [31:16]
+
+/// Walk a config space's PCI capability list to the PCI Express capability; return its byte offset.
+/// `rd` reads a 32-bit dword at a byte offset into the target's config space (dword-aligned). Bounded
+/// (<=48 links) and poison-guarded — a non-answering config space (poison id) returns None without a
+/// walk. RC config uses `|off| r(RC_BASE+off)`; the EP uses `vl805_cfg_read` (EXT_CFG child window).
+fn find_express_cap(rd: &dyn Fn(u64) -> u32) -> Option<u64> {
+    // A config space that does not answer (poison vendor:device) has no walkable cap list.
+    if is_poison(rd(0x00)) {
+        return None;
+    }
+    // Status register (bits [31:16] of the 0x04 dword): bit 4 = Capabilities List present.
+    let status = rd(0x04) >> 16;
+    if status & (1 << 4) == 0 {
+        return None;
+    }
+    // Capabilities Pointer: low byte of the 0x34 dword.
+    let mut ptr = (rd(0x34) & 0xff) as u64 & !0x3;
+    let mut guard = 0u32;
+    while ptr >= 0x40 && ptr != 0xfc && guard < 48 {
+        guard += 1;
+        let hdr = rd(ptr); // cap-id = byte0, next-ptr = byte1 (ptr is dword-aligned)
+        if is_poison(hdr) {
+            return None;
+        }
+        if (hdr & 0xff) == PCI_CAP_ID_EXPRESS {
+            return Some(ptr);
+        }
+        ptr = ((hdr >> 8) & 0xff) as u64 & !0x3;
+    }
+    None
+}
+
+/// Decode + print one side's Express-capability link geometry. Returns
+/// `(cur_speed_gen, cur_width, cap_speed_gen, cap_width)` so the caller can build the verdict and flag a
+/// short-of-LNKCAP negotiation. Speed codes are the PCIe encoding (1=Gen1/2.5GT/s, 2=Gen2/5GT/s,
+/// 3=Gen3/8GT/s, ...), so the Gen number equals the code. Read-only.
+fn decode_link_geometry(rd: &dyn Fn(u64) -> u32, cap: u64, side: &str) -> Option<(u32, u32, u32, u32)> {
+    let lnkcap = rd(cap + EXP_LNKCAP);
+    let lnkctl_sta = rd(cap + EXP_LNKCTL_STA);
+    let lnkctl2 = rd(cap + EXP_LNKCTL2_STA2) & 0xffff;
+    if is_poison(lnkcap) || is_poison(lnkctl_sta) {
+        serial_println!("{}   PIUSB-19 {}: Express-cap link regs read poison (LNKCAP={:#010x} LNKCTL/STA={:#010x}) — not answering ::", P, side, lnkcap, lnkctl_sta);
+        return None;
+    }
+    let cap_speed = lnkcap & 0xf; // max link speed (Gen N)
+    let cap_width = (lnkcap >> 4) & 0x3f; // max link width
+    let lnksta = (lnkctl_sta >> 16) & 0xffff;
+    let cur_speed = lnksta & 0xf; // negotiated (current) link speed
+    let cur_width = (lnksta >> 4) & 0x3f; // negotiated link width
+    let target_speed = lnkctl2 & 0xf; // LNKCTL2 target link speed (retrain target)
+    serial_println!(
+        "{}   PIUSB-19 {}: cap@{:#x} LNKCAP={:#010x} (maxGen{} x{}) LNKSTA={:#06x} (curGen{} x{}) LNKCTL2={:#06x} (targetGen{}) ::",
+        P, side, cap, lnkcap, cap_speed, cap_width, lnksta, cur_speed, cur_width, lnkctl2, target_speed
+    );
+    Some((cur_speed, cur_width, cap_speed, cap_width))
+}
+
+/// The PIUSB-19 witness. Prints the RC + VL805 link geometry + the EP identity snapshot at `ctx`, then a
+/// single `PIUSB-19 (<ctx>) VERDICT: link Gen<N> x<W> (rc) / Gen<N> x<W> (ep) — <flag>` line. READ-ONLY:
+/// no retrain, no LNKCTL2/speed writes. EP-side reads are gated on link-up (boot-P4); any latent async
+/// abort from a child-config read into an unforwarded/absent EP is drained before return.
+fn witness_link_speed_width(ctx: &str) {
+    let status = r(RC_BASE + PCIE_MISC_PCIE_STATUS);
+    let phylinkup = status & PCIE_MISC_PCIE_STATUS_PHYLINKUP != 0;
+    let dl_active = status & PCIE_MISC_PCIE_STATUS_DL_ACTIVE != 0;
+
+    // ── RC side (bus0/dev0): config at RC_BASE, the RC's own always-safe register block. ──
+    let rc_rd = |off: u64| r(RC_BASE + off);
+    let rc = find_express_cap(&rc_rd).and_then(|cap| decode_link_geometry(&rc_rd, cap, "rc(bus0)"));
+    if rc.is_none() {
+        serial_println!("{}   PIUSB-19 ({}): RC Express capability not found (no cap list / cap absent) ::", P, ctx);
+    }
+
+    // ── EP side (bus1/dev0): only when the link is up (link-down child MMIO stalls the bus). ──
+    let ep = if is_poison(status) || !(phylinkup && dl_active) {
+        serial_println!(
+            "{}   PIUSB-19 ({}): link NOT up (PHYLINKUP={} DL_ACTIVE={}) — RC side only; skipping EP child-config (boot-P4 link-down-MMIO law) ::",
+            P, ctx, phylinkup, dl_active
+        );
+        None
+    } else {
+        let ep_rd = |off: u64| vl805_cfg_read(off);
+        // EP identity + decode-state snapshot at this exact moment (VID/DID, COMMAND, BAR0, class/rev).
+        let id = ep_rd(0x00);
+        let cmd = ep_rd(0x04) & 0xffff;
+        let classrev = ep_rd(0x08);
+        let bar0_lo = ep_rd(0x10);
+        let bar0_hi = ep_rd(0x14);
+        match live_vendor_device(id) {
+            Some((v, d)) => serial_println!(
+                "{}   PIUSB-19 ({}) EP VL805 cfg: id={:#010x} (vendor={:#06x} device={:#06x}) COMMAND={:#06x} (MEM={} BM={}) BAR0=[{:#010x} {:#010x}] class={:#04x}/{:#04x}/{:#04x} rev={:#04x} ::",
+                P, ctx, id, v, d, cmd, (cmd >> 1) & 1, (cmd >> 2) & 1, bar0_lo, bar0_hi,
+                (classrev >> 24) & 0xff, (classrev >> 16) & 0xff, (classrev >> 8) & 0xff, classrev & 0xff
+            ),
+            None => serial_println!(
+                "{}   PIUSB-19 ({}) EP VL805 cfg: id={:#010x} — child config not answering (forwarding not yet set / device silent) BAR0=[{:#010x} {:#010x}] ::",
+                P, ctx, id, bar0_lo, bar0_hi
+            ),
+        }
+        let ep = find_express_cap(&ep_rd).and_then(|cap| decode_link_geometry(&ep_rd, cap, "ep(bus1)"));
+        if ep.is_none() {
+            serial_println!("{}   PIUSB-19 ({}): EP Express capability not found (config not forwarded / cap absent) ::", P, ctx);
+        }
+        // A child-config read into an unforwarded/absent EP can leave a latent async external abort (the
+        // 0xdeaddead class); drain it here so it never outlives this read-only witness.
+        super::exceptions::serror_drain_request("piusb: PIUSB-19 EP witness");
+        ep
+    };
+
+    // ── Verdict template + short-of-LNKCAP flag (the candidate-(a) signature). ──
+    let (rgen, rwid, rcapgen, rcapwid) = rc.unwrap_or((0, 0, 0, 0));
+    let (egen, ewid, ecapgen, ecapwid) = ep.unwrap_or((0, 0, 0, 0));
+    let rc_short = rc.is_some() && (rgen < rcapgen || rwid < rcapwid);
+    let ep_short = ep.is_some() && (egen < ecapgen || ewid < ecapwid);
+    serial_println!(
+        "{}   PIUSB-19 ({}) VERDICT: link Gen{} x{} (rc) / Gen{} x{} (ep) — {} ::",
+        P, ctx, rgen, rwid, egen, ewid,
+        if rc_short || ep_short {
+            "NEGOTIATED BELOW LNKCAP (candidate-(a) INDICATED: link short of its max Gen/width — a retrain to the LNKCAP geometry may be needed before the VL805 8051 behaves)"
+        } else if rc.is_some() && ep.is_some() {
+            "negotiated at LNKCAP max on both sides (candidate-(a) NOT indicated by speed/width — the link geometry is not the CNR wall)"
+        } else if rc.is_some() {
+            "RC side only (EP Express cap unread — link down or forwarding not set at this ctx); RC geometry is the record"
+        } else {
+            "incomplete (neither side's Express cap read)"
+        }
+    );
+}
+
 /// The pre-reset firmware reference dump. Read-only. Runs after the DTB census (so only when an RC is
 /// present) and before M1's first reset write. Reads the RC's OWN register block (bridge/window/status —
 /// always safe, even with the link down) and prints it as the one-boot-proven record. Then a HARD
@@ -870,6 +1020,12 @@ fn m1_rc_bringup() -> bool {
         P, status, total_since_perst_ms, 100u64, poll_elapsed_ms
     );
 
+    // PIUSB-19: witness the negotiated link speed/width AT M1 POST-LINK-UP (candidate-(a) pre-arm). The
+    // RP bus window is not programmed until M2, so the EP child config is not yet forwarded here — this
+    // captures the RC side's LNKSTA (the trained link geometry) as the earliest record; the EP side fills
+    // in at the M2/M3 pre-NOTIFY witnesses once forwarding is up. Read-only.
+    witness_link_speed_width("M1-post-linkup");
+
     // (i) Read the root-port identity (bus 0, dev 0) directly from the RC config space — expect a
     //     Broadcom vendor id (0x14e4). Poison-rejecting.
     let rp = r(RC_BASE + 0x00);
@@ -1127,6 +1283,10 @@ fn m2_enumerate_vl805() -> Option<u64> {
     // reverts config space (theory (b)); the CNR wait shows whether the load actually ran (a)/(c).
     witness_notify_boundary("M2", "PRE");
 
+    // PIUSB-19: witness link speed/width IMMEDIATELY BEFORE the M2 NOTIFY (candidate-(a)). Forwarding is
+    // now set up (RP bus + mem windows programmed above), so both RC and EP Express caps read here.
+    witness_link_speed_width("M2-pre-NOTIFY");
+
     serial_println!("{}   NOTIFY_XHCI_RESET (mailbox 0x00030058, dev_addr={:#x}) — VC (re)loads VL805 fw; BAR0 ASSIGNED+MMIO-verified FIRST (PIUSB-15: the fw push needs a live BAR) ::", P, VL805_DEV_ADDR);
     let n = mailbox::notify_xhci_reset(VL805_DEV_ADDR);
     witness_notify("M2", &n);
@@ -1346,6 +1506,9 @@ fn m3_attach_xhci(cpu_base: u64, _bar0_pcie: u64) {
         "{}   NOTIFY-PRE (M3 MMIO): CAP[0]={:#010x} USBSTS={:#010x} (CNR={} HCH={}) @ op_base {:#x} ::",
         P, cap_pre, usbsts_pre, (usbsts_pre >> 11) & 1, usbsts_pre & 1, op_base_probe
     );
+    // PIUSB-19: witness link speed/width IMMEDIATELY BEFORE the M3 pre-HCRST NOTIFY (candidate-(a)) — the
+    // last read of the link geometry the VC's fw (re)load engine sees before the controller is HCRST'd.
+    witness_link_speed_width("M3-pre-NOTIFY");
     notify_before_reset("M3 attach");
     let cap_post = r(outbound_cpu_base);
     let usbsts_post = r(op_base_probe + 0x04);
