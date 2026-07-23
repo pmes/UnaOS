@@ -13,10 +13,11 @@ A2 — HEAD_STAT (0x616000) rows ride along as proposed; keep the trace array
 sized for all rows and sentinel any fallible read.
 ABI law for pdisp_trace_0; `:: kdisp:` prefix; full-knob land-review with
 strings-proof both artifacts; arch gate untouched. Metal owed: sitting #11.)
-Note: submitted as PROPOSAL-video-pull6 before the display-lane renumber;
-this file name stands. Successors use kepler-display-pull<N>.
+Note: submitted as "video-pull6"; renamed to kepler-display-pull1 — the
+display lane numbers kepler-display-pull1, 2, ... independently of the fence
+lane's kepler-pull4..12 sequence.
 
-# Kepler Pull 6: Scanout Re-derivation & Display Refactor
+# Kepler Display Pull 1: Scanout Re-derivation & Display Refactor
 
 ## Objective
 Transition to the Kepler display engine (GF119-family) re-derivation. The primary goals are to split the monolithic `kepler.rs` module, cleanly re-derive the scanout surface address from `envytools/rnndb` facts (refuting old guesses), and establish read-only boot-time trace points for the PDISPLAY engine.
