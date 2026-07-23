@@ -348,6 +348,44 @@ address theory is dead on-metal and the discriminator returns to transfer
 length / TD-shape (READ CAPACITY 8 B works, READ(10) 512 B zeros) or a genuine
 device-side cause — *not* the DMA address.
 
+### 5c. PIUSB-36 — the one-boot read-wedge experiment matrix
+
+With the address theory refuted (§5b) and the cache theory refuted (§5a), the Pi-only
+symptom is sharp: READ CAPACITY(10) (8 B) and every control transfer DMA correctly to
+the same heap pool, yet READ(10) (512 B) returns `Passed`/`residue=0`/**all-zero** on
+metal — while the *identical code shape* read real data in the early, pre-SMP,
+IRQs-masked bring-up phase (P38) and QEMU virt/x86 are always fine. `service_storage`
+runs a self-contained, read-only **experiment matrix** (`piusb36_matrix`, aarch64-only,
+byte-identical no-op on x86) that fires six discriminating reads in one boot, each
+witnessed with the first 16 bytes plus a pattern verdict:
+
+| Step | Experiment | What it isolates |
+| --- | --- | --- |
+| 1 | READ(10) LBA0 into the current `scsi_data_buffer` | baseline — confirms the wedge is live this boot |
+| 2 | Same, into a FRESH `alloc_zeroed` buffer PRE-FILLED with `0xA5` | `PATTERN-SURVIVED` (device never wrote) vs `ZEROS` (something wrote zeros over the pattern) vs `DATA` — the decisive *never-lands* vs *lands-zeros* split |
+| 3 | Same, into a STATIC `.bss` buffer (`PIUSB36_STATIC_BUF`, phys typically <4 MiB) | region dependence (RC inbound-window / cache-color) vs universal |
+| 4 | INQUIRY (36 B) into `scsi_data_buffer` | a MID-SIZE control point between 8 B-works and 512 B-fails — where the threshold sits |
+| 5 | READ(10) LBA0 as TWO chained TRBs (256 + 256) | TD *shape* vs transfer *length* |
+| 6 | READ(10) LBA0, snapshot immediately (A), then wait 1 ms, invalidate the SAME buffer again, re-read (B) | posted-write **visibility**: `A=zeros,B=data` ⇒ the controller's PCIe-posted DMA write was not yet globally visible when the transfer event fired and we invalidated+read |
+
+Two structural facts anchor the analysis. First, the DATA-stage completion is **explicitly
+awaited**, matched by the data TRB's own physical address in `run_bot_stage` /
+`drain_event_ring_once` (not merely inferred from the CSW stage), so a logical "we read
+before the transfer finished" ordering bug is excluded — leaving posted-write *visibility*
+(transfer event ≠ DMA globally-visible in DRAM) as the live timing hypothesis step 6
+tests. Second, the early phase (P38) ran with IRQs masked pre-SMP, whereas the deferred
+phase (`service_storage`) runs on the BSP with IRQs and the preemptive timer scheduler
+live; the whole transaction is held under `XHCI_CONTROLLER.lock()` with a polled event
+pump (no scheduler yield between doorbell and the invalidate+read), so a context switch
+cannot interpose between them — but the two phases differ in bus/interrupt activity, which
+is exactly what a posted-write visibility window would be sensitive to.
+
+Witness lines: `:: PIUSB: [piusb36] step<N>-<label> buf=… CSW=… residue=… verdict=… — <16 bytes> ::`
+(step 6 prints both the immediate `A` and the `+1ms+inval` `B` snapshots). In QEMU virt
+(coherent) all six steps read real data and step 6 reports `no-race-hit`; the P46 metal
+run reads the verdicts as the decision tree — step 2 splits never-lands from lands-zeros,
+step 6 confirms/refutes the posted-write race, steps 3–5 localize region/threshold/TD-shape.
+
 ---
 
 ## 6. Enumeration robustness (metal-informed)

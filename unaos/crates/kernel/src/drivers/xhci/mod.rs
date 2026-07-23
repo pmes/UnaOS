@@ -32,6 +32,12 @@ use self::context::{InputContext, DeviceContext, CTX_WORDS};
 use spin::Mutex;
 use alloc::vec::Vec;
 
+/// PIUSB-36 step 3: a dedicated static 512-byte buffer living in the kernel image's `.bss`
+/// (physical address typically <4 MiB — a wholly different region from the 32 MiB heap the SCSI
+/// data buffer comes from). One-boot experiment scratch only; read-only DMA target for the matrix.
+#[cfg(target_arch = "aarch64")]
+static mut PIUSB36_STATIC_BUF: [u8; 512] = [0; 512];
+
 /// Flip to `true` to restore the very verbose per-doorbell / per-event xHCI tracing.
 /// Left `false` so the serial log shows only milestones and errors.
 const XHCI_VERBOSE: bool = false;
@@ -4038,6 +4044,220 @@ impl XhciController {
         }
     }
 
+    // ==================== PIUSB-36: read-wedge experiment matrix ====================
+
+    /// PIUSB-36 step 5: READ(10) LBA0 with the IN data stage split across TWO chained TRBs
+    /// (256 B + 256 B, chain bit on the first, IOC on the second) into `data_phys`. Everything
+    /// else mirrors `bot_transfer`'s IN path exactly (same clean-before-doorbell + post-invalidate
+    /// coherency, same serialized CBW -> DATA -> CSW). A TD-SHAPE variant: if a single-TRB 512 B
+    /// TD reads zeros but a two-TRB TD reads data (or vice-versa), the discriminator is TD shape,
+    /// not transfer length. Read-only, aarch64-only.
+    #[cfg(target_arch = "aarch64")]
+    fn piusb36_read10_two_trb(&mut self, slot_id: u8, data_phys: u64) -> Result<BotResult, BotError> {
+        let (cbw_phys, csw_phys, in_addr, out_addr) = {
+            let slot = &self.slots[slot_id as usize];
+            let cbw = match slot.cbw_buffer { Some(p) => p as u64, None => return Err(BotError::NoDevice) };
+            let csw = match slot.csw_buffer { Some(p) => p as u64, None => return Err(BotError::NoDevice) };
+            (cbw, csw, slot.bulk_in_ep, slot.bulk_out_ep)
+        };
+        if in_addr == 0 || out_addr == 0 { return Err(BotError::NoDevice); }
+        let in_dci = ((in_addr & 0x0F) * 2) + 1;
+        let out_dci = (out_addr & 0x0F) * 2;
+
+        let cdb = [0x28u8, 0, 0, 0, 0, 0, 0, 0, 1, 0]; // READ(10) LBA0, 1 block
+        let tag = self.build_cbw(cbw_phys as *mut u8, 512, Direction::In, &cdb);
+        unsafe { core::ptr::write_bytes(csw_phys as *mut u8, 0, 13); }
+        dma_coherency::clean(cbw_phys as usize, 31);
+        dma_coherency::clean_inval(csw_phys as usize, 13);
+
+        // 1) CBW on bulk OUT.
+        self.slots[slot_id as usize].bulk_out_ring.as_mut().unwrap()
+            .push(Trb { parameter: cbw_phys, status: 31, control: 1 << 10 }).ok();
+
+        // 2) Two chained IN data TRBs (256 B + 256 B). Clean the whole 512 B buffer to DRAM first,
+        //    exactly like the single-TRB IN path. The completion event (IOC) rides the SECOND TRB;
+        //    the first carries the CHAIN bit (1<<4) and no IOC. Wait on the second TRB's phys.
+        dma_coherency::clean(data_phys as usize, 512);
+        let data_trb_phys = {
+            let ring = self.slots[slot_id as usize].bulk_in_ring.as_mut().unwrap();
+            let base = ring.get_ptr();
+            // TRB 1: 256 B, CHAIN, no IOC.
+            ring.push(Trb { parameter: data_phys, status: 256, control: (1 << 10) | (1 << 4) }).ok();
+            // TRB 2: 256 B, IOC (1<<5) + ISP (1<<2).
+            let idx = ring.push(Trb { parameter: data_phys + 256, status: 256,
+                control: (1 << 10) | (1 << 5) | (1 << 2) }).unwrap_or(0);
+            base + (idx as u64) * 16
+        };
+        self.ring_doorbell(slot_id, out_dci as u32);
+        self.ring_doorbell(slot_id, in_dci as u32);
+        let code = self.run_bot_stage(slot_id, in_dci, out_dci, data_trb_phys)?;
+        if code != 1 && code != 13 {
+            if code == 4 || code == 6 { self.recover_bulk_stall(slot_id, true); return Err(BotError::Stall); }
+            return Err(BotError::TransferError(code));
+        }
+        dma_coherency::inval(data_phys as usize, 512);
+
+        // 3) CSW on bulk IN.
+        let csw_trb_phys = {
+            let ring = self.slots[slot_id as usize].bulk_in_ring.as_mut().unwrap();
+            let base = ring.get_ptr();
+            let idx = ring.push(Trb { parameter: csw_phys, status: 13, control: (1 << 10) | (1 << 5) }).unwrap_or(0);
+            base + (idx as u64) * 16
+        };
+        self.ring_doorbell(slot_id, in_dci as u32);
+        let code = self.run_bot_stage(slot_id, in_dci, out_dci, csw_trb_phys)?;
+        if code != 1 && code != 13 {
+            if code == 4 || code == 6 { self.recover_bulk_stall(slot_id, true); return Err(BotError::Stall); }
+            return Err(BotError::TransferError(code));
+        }
+        unsafe {
+            dma_coherency::inval(csw_phys as usize, 13);
+            let csw = core::slice::from_raw_parts(csw_phys as *const u8, 13);
+            let csw_tag = (csw[4] as u32) | ((csw[5] as u32) << 8) | ((csw[6] as u32) << 16) | ((csw[7] as u32) << 24);
+            let residue = (csw[8] as u32) | ((csw[9] as u32) << 8) | ((csw[10] as u32) << 16) | ((csw[11] as u32) << 24);
+            let status = match csw[12] { 0 => CswStatus::Passed, 1 => CswStatus::Failed, 2 => CswStatus::PhaseError, _ => CswStatus::Unknown };
+            if csw_tag != tag { return Err(BotError::TagMismatch); }
+            Ok(BotResult { status, residue })
+        }
+    }
+
+    /// PIUSB-36 witness printer: dump the first 16 bytes at `buf_phys` plus a discriminating
+    /// verdict. With a `pattern` byte the verdict separates the three outcomes that matter:
+    /// PATTERN-SURVIVED (the device never DMA-wrote), ZEROS (something wrote zeros over the
+    /// pattern), DATA (real bytes landed). Read-only.
+    #[cfg(target_arch = "aarch64")]
+    fn piusb36_report(label: &str, buf_phys: u64, status: CswStatus, residue: u32, pattern: Option<u8>) {
+        let d = unsafe { core::slice::from_raw_parts(buf_phys as *const u8, 16) };
+        let all_zero = d.iter().all(|&b| b == 0);
+        let verdict = match pattern {
+            Some(p) if d.iter().all(|&b| b == p) => "PATTERN-SURVIVED(device-never-wrote)",
+            _ if all_zero => "ZEROS(dma-wrote-zeros-or-nothing)",
+            _ => "DATA(real-bytes-landed)",
+        };
+        serial_println!(
+            ":: PIUSB: [piusb36] {} buf={:#x} CSW={:?} residue={} verdict={} — {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
+            label, buf_phys, status, residue, verdict,
+            d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7],
+            d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15]);
+    }
+
+    /// Busy-wait `ms` milliseconds off the free-running generic-timer counter (CNTVCT/CNTFRQ). Used
+    /// only by the PIUSB-36 posted-write-visibility step — never on any hot path.
+    #[cfg(target_arch = "aarch64")]
+    fn piusb36_delay_ms(ms: u64) {
+        let freq: u64;
+        unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq, options(nomem, nostack, preserves_flags)); }
+        if freq == 0 { return; }
+        let budget = (freq / 1000).saturating_mul(ms);
+        let start = crate::arch::now_cycles();
+        while crate::arch::now_cycles().wrapping_sub(start) < budget { core::hint::spin_loop(); }
+    }
+
+    /// PIUSB-36: one-boot decisive experiment matrix for the Pi-only 512-B-read-returns-zeros wedge.
+    /// READ CAPACITY (8 B) and INQUIRY-adjacent control transfers DMA correctly to the SAME heap pool,
+    /// yet READ(10) 512 B returns Passed/residue=0/all-zero on Pi metal (P45), while the identical
+    /// code shape read REAL data in the early pre-SMP IRQ-masked phase (P38) and QEMU virt/x86 are
+    /// fine. This runs six read-only experiments in a single boot, each witnessed with first-16-bytes
+    /// + a pattern verdict, to corner the variable: buffer region, DMA-lands-zeros-vs-never-lands,
+    /// TD shape, mid-size transfer, and posted-write visibility. Bounded (~10 ms + transfers).
+    #[cfg(target_arch = "aarch64")]
+    fn piusb36_matrix(&mut self) {
+        let slot = self.storage_slot;
+        if slot == 0 { serial_println!(":: PIUSB: [piusb36] no storage slot — matrix skipped ::"); return; }
+        let databuf = match self.slots[slot as usize].scsi_data_buffer {
+            Some(p) => p as u64,
+            None => { serial_println!(":: PIUSB: [piusb36] no scsi_data_buffer — matrix skipped ::"); return; }
+        };
+        let read10_lba0 = [0x28u8, 0, 0, 0, 0, 0, 0, 0, 1, 0];
+
+        serial_println!(":: PIUSB: [piusb36] === experiment matrix (read-only, one boot) === ::");
+
+        // --- Step 1: baseline READ(10) LBA0 into the CURRENT scsi_data_buffer (expect zeros on
+        //     metal). Establishes the wedge is live this boot before the discriminating variants. ---
+        match self.bot_transfer(slot, &read10_lba0, databuf, 512, Direction::In) {
+            Ok(r) => Self::piusb36_report("step1-baseline-scsibuf", databuf, r.status, r.residue, None),
+            Err(e) => serial_println!(":: PIUSB: [piusb36] step1 baseline ERR {:?} ::", e),
+        }
+
+        // --- Step 2: FRESH alloc_zeroed buffer PRE-FILLED with 0xA5, then READ(10) LBA0 into it.
+        //     PATTERN-SURVIVED => the device never wrote (DMA never landed); ZEROS => something wrote
+        //     zeros OVER the pattern (DMA landed zeros, or a stale write-back clobbered it); DATA =>
+        //     the block landed. This is the critical 'never-lands vs lands-zeros' discriminator. ---
+        {
+            let layout = core::alloc::Layout::from_size_align(512, 64).unwrap();
+            let fresh = unsafe { alloc::alloc::alloc_zeroed(layout) };
+            if fresh.is_null() {
+                serial_println!(":: PIUSB: [piusb36] step2 alloc failed ::");
+            } else {
+                unsafe { core::ptr::write_bytes(fresh, 0xA5, 512); }
+                match self.bot_transfer(slot, &read10_lba0, fresh as u64, 512, Direction::In) {
+                    Ok(r) => Self::piusb36_report("step2-fresh-A5-heap", fresh as u64, r.status, r.residue, Some(0xA5)),
+                    Err(e) => serial_println!(":: PIUSB: [piusb36] step2 fresh-A5 ERR {:?} ::", e),
+                }
+                unsafe { alloc::alloc::dealloc(fresh, layout); }
+            }
+        }
+
+        // --- Step 3: STATIC low buffer (kernel-image .bss, phys typically <4 MiB — a wholly
+        //     different region from the 32 MiB heap). Pre-filled 0xA5, same READ(10) LBA0. Tests
+        //     whether the wedge is region-specific (RC inbound-window / cache-color) vs universal. ---
+        {
+            let sbuf = core::ptr::addr_of_mut!(PIUSB36_STATIC_BUF) as *mut u8;
+            unsafe { core::ptr::write_bytes(sbuf, 0xA5, 512); }
+            match self.bot_transfer(slot, &read10_lba0, sbuf as u64, 512, Direction::In) {
+                Ok(r) => Self::piusb36_report("step3-static-A5-low", sbuf as u64, r.status, r.residue, Some(0xA5)),
+                Err(e) => serial_println!(":: PIUSB: [piusb36] step3 static ERR {:?} ::", e),
+            }
+        }
+
+        // --- Step 4: INQUIRY (36 B) into scsi_data_buffer — a MID-SIZE control point between the
+        //     8 B READ CAPACITY that works and the 512 B READ(10) that fails. If 36 B lands data,
+        //     the failure threshold sits above 36 B (points at a length/burst boundary). ---
+        {
+            let inquiry = [0x12u8, 0, 0, 0, 36, 0, 0, 0, 0, 0];
+            unsafe { core::ptr::write_bytes(databuf as *mut u8, 0xA5, 36); }
+            match self.bot_transfer(slot, &inquiry, databuf, 36, Direction::In) {
+                Ok(r) => Self::piusb36_report("step4-inquiry36-scsibuf", databuf, r.status, r.residue, Some(0xA5)),
+                Err(e) => serial_println!(":: PIUSB: [piusb36] step4 inquiry ERR {:?} ::", e),
+            }
+        }
+
+        // --- Step 5: READ(10) LBA0 as TWO chained TRBs (256 + 256) into scsi_data_buffer — a
+        //     TD-shape variant of the same 512 B transfer. Discriminates TD shape from length. ---
+        match self.piusb36_read10_two_trb(slot, databuf) {
+            Ok(r) => Self::piusb36_report("step5-two-trb-scsibuf", databuf, r.status, r.residue, None),
+            Err(e) => serial_println!(":: PIUSB: [piusb36] step5 two-TRB ERR {:?} ::", e),
+        }
+
+        // --- Step 6: POSTED-WRITE VISIBILITY. Re-read LBA0 (single TRB, 1 block): bot_transfer
+        //     invalidates + we snapshot immediately (A). Then wait 1 ms, invalidate the SAME buffer
+        //     AGAIN, and re-read (B) — WITHOUT re-issuing the transfer. If A is zeros but B is data,
+        //     the controller's PCIe-posted DMA write was not yet globally visible in DRAM when the
+        //     transfer event fired and we read it (the small-read race window closes for 512 B). If
+        //     A == B, no posted-write timing race — the wedge is not a visibility latency. ---
+        match self.bot_transfer(slot, &read10_lba0, databuf, 512, Direction::In) {
+            Ok(r) => {
+                let a: [u8; 16] = unsafe { core::ptr::read(databuf as *const [u8; 16]) };
+                Self::piusb36_delay_ms(1);
+                dma_coherency::inval(databuf as usize, 512);
+                let b: [u8; 16] = unsafe { core::ptr::read(databuf as *const [u8; 16]) };
+                let a_zero = a.iter().all(|&x| x == 0);
+                let b_zero = b.iter().all(|&x| x == 0);
+                let verdict = if a_zero && !b_zero { "POSTED-WRITE-RACE-CONFIRMED(A-zeros,B-data-after-1ms)" }
+                    else if a_zero && b_zero { "no-race(both-zero-after-1ms-delay)" }
+                    else { "immediate-read-already-had-data(no-race-hit)" };
+                serial_println!(
+                    ":: PIUSB: [piusb36] step6-posted-write buf={:#x} CSW={:?} residue={} verdict={} | A(immediate)={:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} | B(+1ms+inval)={:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
+                    databuf, r.status, r.residue, verdict,
+                    a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7],
+                    b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
+            }
+            Err(e) => serial_println!(":: PIUSB: [piusb36] step6 posted-write ERR {:?} ::", e),
+        }
+
+        serial_println!(":: PIUSB: [piusb36] === matrix complete === ::");
+    }
+
     /// USB-WRITE-2: recover a halted bulk endpoint after a STALL (completion code 4) or Babble
     /// (6) so one faulted transfer cannot dead-line every later BOT command on the slot. This is
     /// the standard USB BOT clear-stall sequence, host + device side:
@@ -4530,6 +4750,13 @@ impl XhciController {
             }
             Err(e) => serial_println!("xHCI: READ(10) LBA0 failed: {:?}", e),
         }
+
+        // PIUSB-36: one-boot decisive experiment matrix for the Pi-only 512-B-read-returns-zeros
+        // wedge (READ CAPACITY 8 B works, READ(10) 512 B returns Passed/residue=0/zeros). Read-only;
+        // aarch64 witness only — no-op on x86 (never compiled). Runs after the baseline witnesses so
+        // its buffer/TD-shape/posted-write experiments sit on the same enumerated slot.
+        #[cfg(target_arch = "aarch64")]
+        self.piusb36_matrix();
 
         // USB-WRITE: prove the BOT WRITE(10) OUT path on the enumerated stick with a
         // read-modify-write-restore of one scratch sector (byte-identical afterward).
