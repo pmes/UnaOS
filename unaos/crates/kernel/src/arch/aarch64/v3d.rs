@@ -2009,6 +2009,15 @@ const OFF_PROBE_SCRATCH: usize = 0x34C00; // TMU-store target: 4 words the QPU w
 const OFF_PROBE_BIN_CL: usize = 0x35000; // probe binning control list (CT0)
 const _: () = assert!(OFF_PROBE_BIN_CL + 0x1000 <= ARENA_BYTES);
 
+/// PI-V3D-28 canary window: the 4-word TMU-store target lives at word [0..4]; words [4..PROBE_CANARY_WORDS]
+/// are seeded with per-index canaries (0xCA00_00NN) so a store that lands at the WRONG address inside this
+/// page reveals itself (which slot flipped, and to what) rather than reading back as an untouched sentinel.
+/// 32 words = 128 B stays well inside the 0x400-byte gap to OFF_PROBE_BIN_CL. Word [0..4] hold the
+/// 0x55555555 "never-landed" sentinel; the canary tail brackets the target on the high side.
+const PROBE_CANARY_WORDS: usize = 32;
+const PROBE_CANARY_BYTES: usize = PROBE_CANARY_WORDS * 4;
+const _: () = assert!(OFF_PROBE_SCRATCH + PROBE_CANARY_BYTES <= OFF_PROBE_BIN_CL);
+
 /// The Mesa-COMPILED probe coord shader (25 words), transcribed byte-for-byte from the V3D-26 harness
 /// PROBE VS output (scripts/pi-v3d26-mesa-compile.out.txt). It is a full coord shader — it loads the
 /// four attribute components (`ldvpmv_in` → rf3..rf6), STORES them to SSBO 0 via TMU
@@ -2121,7 +2130,7 @@ fn build_probe_shader_record() -> u32 {
 /// three-way discrimination witness; returns nothing (diagnostic-only, never gates M4).
 fn probe_job() {
     serial_println!(
-        ":: V3D: [v3d27] attribute-DMA probe — Mesa-compiled TMU-store coord shader over the real vertex buffer; reading what the VCD delivered ::"
+        ":: V3D: [v3d28] attribute-DMA probe — Mesa-compiled TMU-store coord shader over the real vertex buffer; post-bin L2T flush drains the store, canary window catches wrong-address landings ::"
     );
     let scratch_v3d = (arena_phys() + OFF_PROBE_SCRATCH) as u32;
 
@@ -2131,7 +2140,13 @@ fn probe_job() {
     let unif_len = write_probe_uniforms(OFF_PROBE_UNIF, scratch_v3d);
     let num_attrs = build_probe_shader_record();
     let bin_len = build_bin_cl_generic(OFF_PROBE_BIN_CL, OFF_PROBE_SHADREC, num_attrs);
+    // Seed the store target (words 0..4) with the 0x55 "never-landed" sentinel and the tail (words
+    // 4..PROBE_CANARY_WORDS) with per-index canaries 0xCA00_00NN, so a wrong-address landing inside the
+    // page is caught by which canary flipped rather than masquerading as an untouched sentinel.
     fill_region(OFF_PROBE_SCRATCH, 16, 0x5555_5555);
+    for i in 4..PROBE_CANARY_WORDS {
+        arena_write_u32(OFF_PROBE_SCRATCH + i * 4, 0xCA00_0000 | i as u32);
+    }
 
     // Publish everything to RAM for the non-coherent GPU (vertex data + defaults were written by the
     // caller; clean them here so the probe sees them).
@@ -2139,7 +2154,7 @@ fn probe_job() {
     cache::clean_range(arena_phys() + OFF_PROBE_UNIF, unif_len);
     cache::clean_range(arena_phys() + OFF_PROBE_SHADREC, 36 + 16);
     cache::clean_range(arena_phys() + OFF_PROBE_BIN_CL, bin_len);
-    cache::clean_range(arena_phys() + OFF_PROBE_SCRATCH, 16);
+    cache::clean_range(arena_phys() + OFF_PROBE_SCRATCH, PROBE_CANARY_BYTES);
     cache::clean_range(arena_phys() + OFF_VTXDATA, TRI_VERTS.len() * 16);
     cache::clean_range(arena_phys() + OFF_DEFAULT_ATTRS, 16);
     // Bin scratch (reused from M4): zero + clean.
@@ -2153,15 +2168,15 @@ fn probe_job() {
     let tile_alloc = (arena_phys() + OFF_BIN_TILEALLOC) as u32;
     let ts = (arena_phys() + OFF_TILESTATE) as u32;
     if !arena_contains(bin_ba as usize, bin_len)
-        || !arena_contains(OFF_PROBE_SCRATCH + arena_phys(), 16)
+        || !arena_contains(OFF_PROBE_SCRATCH + arena_phys(), PROBE_CANARY_BYTES)
         || !arena_contains(tile_alloc as usize, BIN_TILEALLOC_BYTES)
         || !arena_contains(ts as usize, TILE_STATE_BYTES)
     {
-        serial_println!(":: V3D: [v3d27] probe range escapes the arena — skipping probe (fail-closed) ::");
+        serial_println!(":: V3D: [v3d28] probe range escapes the arena — skipping probe (fail-closed) ::");
         return;
     }
 
-    clear_mmu_fault_latch("v3d27 pre-probe");
+    clear_mmu_fault_latch("v3d28 pre-probe");
     invalidate_gpu_caches("L2T flush (probe bin pre-kick)");
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QMA, tile_alloc);
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QMS, BIN_TILEALLOC_BYTES as u32);
@@ -2176,12 +2191,30 @@ fn probe_job() {
     let fault = mmu_ctl
         & (V3D_MMU_CTL_PT_INVALID | V3D_MMU_CTL_WRITE_VIOLATION | V3D_MMU_CTL_CAP_EXCEEDED);
 
-    // Read back the four TMU-stored words. Invalidate the CPU's stale copy first (the GPU wrote DRAM).
-    cache::clean_invalidate_range(arena_phys() + OFF_PROBE_SCRATCH, 16);
+    // THE V3D-28 FIX: the TMU store lands in the GPU's L2T cache, not DRAM. `tmuwt` in the shader only
+    // waits for the TMU to accept the write into L2T — it does NOT write L2T back to DRAM. V3D-27 flushed
+    // L2T only PRE-kick, so the CPU read DRAM and always saw the untouched 0x55555555 sentinel (that is the
+    // whole "probe-inconclusive" wall). Flush L2T (write-back + invalidate) AFTER the bin idles so the
+    // store reaches DRAM, THEN invalidate the CPU's stale copy and read back.
+    invalidate_gpu_caches("L2T write-back (probe post-bin — drain the TMU store to DRAM)");
+    // Read back the four TMU-stored words + scan the canary tail. Invalidate the CPU's stale copy first.
+    cache::clean_invalidate_range(arena_phys() + OFF_PROBE_SCRATCH, PROBE_CANARY_BYTES);
     let w0 = probe_word(OFF_PROBE_SCRATCH);
     let w1 = probe_word(OFF_PROBE_SCRATCH + 4);
     let w2 = probe_word(OFF_PROBE_SCRATCH + 8);
     let w3 = probe_word(OFF_PROBE_SCRATCH + 12);
+    // Canary scan: did any tail word (4..PROBE_CANARY_WORDS) flip off its 0xCA00_00NN seed? That means the
+    // store landed at the WRONG address inside the page. Report the first disturbed slot.
+    let mut canary_hit_idx: i32 = -1;
+    let mut canary_hit_val: u32 = 0;
+    for i in 4..PROBE_CANARY_WORDS {
+        let v = probe_word(OFF_PROBE_SCRATCH + i * 4);
+        if v != (0xCA00_0000 | i as u32) {
+            canary_hit_idx = i as i32;
+            canary_hit_val = v;
+            break;
+        }
+    }
 
     // Expected: whichever vertex won the (offset-0) store race. All three carry Zc=0.5 (0x3F000000) and
     // Wc=1.0 (0x3F800000); Xc/Yc ∈ {±0.6 = 0x3F19999A / 0xBF19999A, 0.0}. Discriminate three ways.
@@ -2192,29 +2225,46 @@ fn probe_job() {
     let real_coords = is_coord(w0) && is_coord(w1) && w2 == 0x3F00_0000 && w3 == 0x3F80_0000;
 
     serial_println!(
-        ":: V3D: [v3d27] probe idled={} MMU_fault={:#x} — loaded attr v=({:#010x},{:#010x},{:#010x},{:#010x}) expect Zc=0x3f000000 Wc=0x3f800000 Xc/Yc∈{{0x3f19999a,0xbf19999a,0x00000000}} ::",
+        ":: V3D: [v3d28] probe idled={} MMU_fault={:#x} (post-bin L2T flushed) — loaded attr v=({:#010x},{:#010x},{:#010x},{:#010x}) expect Zc=0x3f000000 Wc=0x3f800000 Xc/Yc∈{{0x3f19999a,0xbf19999a,0x00000000}} ::",
         idled as u32, fault, w0, w1, w2, w3
     );
-    if untouched {
+    if canary_hit_idx >= 0 {
         serial_println!(
-            ":: V3D: [v3d27] VERDICT probe-inconclusive — scratch still 0x55555555: the TMU store never landed (probe plumbing: UBO_ADDR/tmuau path, MMU map of scratch, or the coord shader did not reach the store). NOT a VCD verdict. ::"
-        );
-    } else if all_zero {
-        serial_println!(
-            ":: V3D: [v3d27] VERDICT MISMATCH (loaded-zeros) — store landed but attributes are ZERO: the VCD did NOT DMA the vertex buffer into VPM. Attribute-fetch is the empty-bin wall — audit the attribute-record base/stride/enable + VCD setup against Mesa for THIS draw. ::"
-        );
-    } else if real_coords {
-        serial_println!(
-            ":: V3D: [v3d27] VERDICT MATCH (real coords) — the VCD delivered the attributes intact. Attribute fetch is EXONERATED; the wall moves downstream to primitive assembly / VCM → PTB handoff. ::"
+            ":: V3D: [v3d28] CANARY DISTURBED — tail word[{}] = {:#010x} (seed {:#010x}): the TMU store landed at the WRONG address (page-relative +{:#x}), not the UBO_ADDR target. The tmuau/UBO_ADDR value or its offset is off. ::",
+            canary_hit_idx, canary_hit_val, 0xCA00_0000u32 | canary_hit_idx as u32, canary_hit_idx * 4
         );
     } else {
         serial_println!(
-            ":: V3D: [v3d27] VERDICT MISMATCH (unexpected pattern) — store landed with non-zero, non-vertex data: partial DMA, wrong stride/base, or a store race artifact. Compare the words above against OFF_VTXDATA byte-for-byte. ::"
+            ":: V3D: [v3d28] canary window intact (words 4..{}) — no wrong-address landing inside the scratch page ::",
+            PROBE_CANARY_WORDS
+        );
+    }
+    if untouched {
+        if canary_hit_idx >= 0 {
+            serial_println!(
+                ":: V3D: [v3d28] VERDICT store-landed-elsewhere — target untouched but a canary flipped: the store issued and drained to DRAM but at the wrong address. Fix the UBO_ADDR uniform (u4) / tmuau offset; the TMU path itself works. NOT a VCD verdict. ::"
+            );
+        } else {
+            serial_println!(
+                ":: V3D: [v3d28] VERDICT store-never-issued — target sentinel AND all canaries intact after the post-bin L2T flush: no TMU write drained anywhere in the page. Suspect the coord shader never reached `mov tmuau` (thrsw/thread-end drain) or the tmud/tmuau config. NOT a VCD verdict. ::"
+            );
+        }
+    } else if all_zero {
+        serial_println!(
+            ":: V3D: [v3d28] VERDICT MISMATCH (loaded-zeros) — store landed but attributes are ZERO: the VCD did NOT DMA the vertex buffer into VPM. Attribute-fetch is the empty-bin wall — audit the attribute-record base/stride/enable + VCD setup against Mesa for THIS draw. ::"
+        );
+    } else if real_coords {
+        serial_println!(
+            ":: V3D: [v3d28] VERDICT MATCH (real coords) — the VCD delivered the attributes intact. Attribute fetch is EXONERATED; the wall moves downstream to primitive assembly / VCM → PTB handoff. ::"
+        );
+    } else {
+        serial_println!(
+            ":: V3D: [v3d28] VERDICT MISMATCH (unexpected pattern) — store landed at the target with non-zero, non-vertex data: partial DMA, wrong stride/base, or a store race artifact. Compare the words above against OFF_VTXDATA byte-for-byte. ::"
         );
     }
     // Leave the M4 bin registers untouched here — triangle_job reprograms QMA/QMS/QTS/QBA/QEA and
     // re-arms the PCTR counters for the real bin below.
-    clear_mmu_fault_latch("v3d27 post-probe");
+    clear_mmu_fault_latch("v3d28 post-probe");
 }
 
 /// Read a little-endian u32 out of the arena at `off` (probe scratch readback).
