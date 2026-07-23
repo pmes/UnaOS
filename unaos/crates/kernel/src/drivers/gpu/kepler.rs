@@ -303,18 +303,26 @@ pub fn init(gpu: &GpuInfo) {
                                         let gp_get = unsafe { core::ptr::read_volatile((bar1 + userd_off + 0x8c) as *const u32) };
                                         let ch_stat = mmio_read(bar0, 0x800004 + (chan_id as usize * 8));
                                         
-                                        let pbdma_base = 0x40000; // PSUBFIFO base
-                                        let pbdma_stat = mmio_read(bar0, pbdma_base + 0x108); // PSUBFIFO INTR (gf100_pfifo.xml)
-                                        
-                                        if pbdma_stat == 0 || (pbdma_stat & 0xFFF00000) == 0xBAD00000 {
-                                            serial_println!(":: kepler: bad-read pbdma {:X} {:08X} ::", pbdma_base + 0x108, pbdma_stat);
+                                        for i in 0..3 {
+                                            let pbdma_base = 0x40000 + (i * 0x2000);
+                                            let ch = mmio_read(bar0, pbdma_base + 0x120);
+                                            let ib_put = mmio_read(bar0, pbdma_base + 0x00);
+                                            let ib_get = mmio_read(bar0, pbdma_base + 0x14);
+                                            let eng_mask = mmio_read(bar0, 0x2390 + (i * 4));
+                                            serial_println!(":: kepler: pbdma{} ch={:08X} (ACTIVE={}) ib_put={:08X} ib_get={:08X} eng_mask={:08X} ::",
+                                                i, ch, (ch >> 13) & 1, ib_put, ib_get, eng_mask);
                                         }
+
+                                        let pmc_enable = mmio_read(bar0, regs::NV_PMC_ENABLE); // 0x200
+                                        let pmc_subfifo_enable = mmio_read(bar0, 0x000204);
+                                        serial_println!(":: kepler: clock-state PMC_ENABLE={:08X} (PFIFO={}) PMC_SUBFIFO_ENABLE={:08X} ::",
+                                            pmc_enable, (pmc_enable >> 8) & 1, pmc_subfifo_enable);
 
                                         let playlist_rd = mmio_read(bar0, 0x2280); // PLAYLIST_RD (gf100_pfifo.xml)
                                         let playlist_rd_len = mmio_read(bar0, 0x2284);
                                         
-                                        serial_println!(":: kepler: fifo-front pbdma_stat={:08X} playlist_rd={:08X} playlist_rd_len={:08X} ::", 
-                                            pbdma_stat, playlist_rd, playlist_rd_len);
+                                        serial_println!(":: kepler: fifo-front playlist_rd={:08X} playlist_rd_len={:08X} ::", 
+                                            playlist_rd, playlist_rd_len);
                                             
                                         serial_println!(":: kepler: takeover-abort fence-timeout gp_get={} ch_stat={:08X} (ENABLED={} UNK24_RO={} UNK28_RO={}) ::", 
                                             gp_get, ch_stat, ch_stat & 1, (ch_stat >> 24) & 7, (ch_stat >> 28) & 1);
@@ -484,7 +492,7 @@ unsafe fn takeover_display(gpu: &GpuInfo, bar0: usize, allocator: &mut VramAlloc
                 core::ptr::write_volatile(evo_pb.add(2), (1 << 18) | (update_method as u32));
                 core::ptr::write_volatile(evo_pb.add(3), 0x00000000);
                 
-                // Initialize the GF119+ EVO core channel (NV_PDISPLAY + 0x490)
+                // Initialize the Kepler EVO core channel (NV_PDISPLAY + 0x490)
                 // Empirically probed on GK107, unverified against public docs.
                 let core_ctrl = regs::NV_PDISPLAY_BASE + 0x490;
                 
