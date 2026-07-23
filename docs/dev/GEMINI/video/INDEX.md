@@ -6,7 +6,7 @@ Three pull sequences, numbered independently. Every pull = one BRIEF (coordinato
 ## Lane 1: Kepler FENCE (PFIFO/scheduler — kepler.rs) — `video/Kepler/`, files `*kepler-pull<N>*`
 | Pull | Files | Status | One-liner |
 |---|---|---|---|
-| 12 | BRIEF-kepler-pull12-poll-area-2 / PROPOSAL-kepler-pull12 | APPROVED W/ AMENDMENTS | USERD_HI bit31 single-bit test; SNOOP scrubbed |
+| 12 | BRIEF-kepler-pull12-poll-area-2 / PROPOSAL-kepler-pull12 | LANDED 3d7aea61+f8e0b316 — metal owed s11 | USERD_HI bit31 single-bit test; SNOOP scrubbed |
 | 11 | BRIEF-kepler-pull11-poll-area / PROPOSAL-kepler-pull11 | LANDED 7124e4e1; s10: candidate refuted | USERD_SNOOP test — inert on GK107 |
 | 10 | BRIEF-kepler-pull10-sched-precondition / PROPOSAL-kepler-pull10 | LANDED 2650a38b; s9: CHIP NAMED NO_POLL | ask-the-chip error readback |
 | 9 | BRIEF-kepler-pull9-runlist-entry / PROPOSAL-kepler-pull9 | LANDED 861b116c; s8: all encodings refuted | runlist entry fuzz + discriminators |
@@ -17,7 +17,7 @@ Three pull sequences, numbered independently. Every pull = one BRIEF (coordinato
 ## Lane 2: Kepler DISPLAY (scanout — kepler_display.rs after split) — `video/Kepler/`, files `*kepler-display-pull<N>*`
 | Pull | Files | Status | One-liner |
 |---|---|---|---|
-| 1 | BRIEF-kepler-display-pull1-scanout-rederive / PROPOSAL-kepler-display-pull1 | APPROVED W/ AMENDMENTS | module split + EVO-mirror re-derivation + kdisp boot trace |
+| 1 | BRIEF-kepler-display-pull1-scanout-rederive / PROPOSAL-kepler-display-pull1 | LANDED 9611a129+f8e0b316 — metal owed s11 | module split + dual-candidate EVO-mirror trace + kdisp rows |
 
 (Lane exists because sitting #10 proved the discrete GPU owns the panel; carried
 by the ex-iGPU specialist. Sitting-5-era scanout guesses are refuted history.)
