@@ -102,6 +102,16 @@ const PCIE_MISC_HARD_DEBUG_SERDES_IDDQ: u32 = 1 << 27; // 1 = serdes powered DOW
 // RC_BAR2 BEFORE (or with) the RC_BAR2 write (documented BCM2711 order; pcie-brcmstb.c is GPL-2.0-only).
 const PCIE_MISC_MISC_CTRL_SCB0_SIZE_SHIFT: u32 = 27;
 const PCIE_MISC_MISC_CTRL_SCB0_SIZE_MASK: u32 = 0x1f << 27; // 0xf800_0000
+// ── PIUSB-18: the MISC_CTRL access-control bits Linux `brcm_pcie_setup` programs and our step (d) has
+// been OMITTING. SCB_ACCESS_EN gates the RC's system-cache-bus (SCB) master path — the inbound route by
+// which a downstream master (or the VideoCore's VL805 firmware-load engine) reaches host SDRAM. Sizing
+// SCB0 (the window) without enabling SCB_ACCESS (the master) leaves the inbound path CLOSED: the RC will
+// not issue SCB cycles at all. P28 metal proved our bring-up left MISC_CTRL=0x88000000 — SCB0_SIZE=0x11
+// set, bit12 (SCB_ACCESS_EN) CLEAR. Facts-only from pcie-brcmstb.c (GPL-2.0-only): bit masks + the fact
+// that brcm_pcie_setup sets SCB_ACCESS_EN=1, CFG_READ_UR_MODE=1, MAX_BURST_SIZE=128B (=0 on BCM2711).
+const PCIE_MISC_MISC_CTRL_SCB_ACCESS_EN: u32 = 1 << 12; // 0x0000_1000 — enable RC SCB (inbound) master
+const PCIE_MISC_MISC_CTRL_CFG_READ_UR_MODE: u32 = 1 << 13; // 0x0000_2000 — return UR (not fault) on bad cfg read
+const PCIE_MISC_MISC_CTRL_MAX_BURST_SIZE_MASK: u32 = 0x3 << 20; // bits[21:20]; 0b00 = 128B (BCM2711)
 
 // ─── The VL805 endpoint. It enumerates as bus 1, dev 0, fn 0 behind the RC's single downstream port. ───
 const VL805_VENDOR: u16 = 0x1106; // VIA Technologies
@@ -336,9 +346,12 @@ fn witness_rc_cpu_claim() {
     let scb0 = (misc >> 27) & 0x1f;
     let scb1 = (misc >> 22) & 0x1f;
     let scb2 = (misc >> 17) & 0x1f;
+    // PIUSB-18: also witness SCB_ACCESS_EN (bit12) — a sized SCB0 with SCB_ACCESS_EN=0 is the "inbound
+    // window armed but master disabled" state that closes the RC's route to SDRAM (the P28 wall).
+    let scb_access = misc & PCIE_MISC_MISC_CTRL_SCB_ACCESS_EN != 0;
     serial_println!(
-        "{}   RC-claim witness: MISC_CTRL={:#010x} SCB0_SIZE={:#x} SCB1_SIZE={:#x} SCB2_SIZE={:#x} | RC_BAR2 LO={:#010x} HI={:#010x} ::",
-        P, misc, scb0, scb1, scb2, bar2_lo, bar2_hi
+        "{}   RC-claim witness: MISC_CTRL={:#010x} SCB0_SIZE={:#x} SCB1_SIZE={:#x} SCB2_SIZE={:#x} SCB_ACCESS_EN={} | RC_BAR2 LO={:#010x} HI={:#010x} ::",
+        P, misc, scb0, scb1, scb2, scb_access as u8, bar2_lo, bar2_hi
     );
     // The documented order: SCB0_SIZE must be set (nonzero) before RC_BAR2 is programmed to a matching
     // inbound size; a nonzero RC_BAR2 size-code over a zero SCB0 is the classic misordering. This witness
@@ -663,19 +676,37 @@ fn m1_rc_bringup() -> bool {
     //     touched; every other MISC_CTRL bit (SCB access enable, RC BAR sizing) is preserved.
     const RC_BAR2_SIZE_4G: u32 = 0x11; // encode_ibar_size(4 GiB) = log2(2^32) - 15 = 0x11 (shared: SCB0 + RC_BAR2)
     let misc_before = r(RC_BASE + PCIE_MISC_MISC_CTRL);
-    let misc_after = (misc_before & !PCIE_MISC_MISC_CTRL_SCB0_SIZE_MASK)
-        | ((RC_BAR2_SIZE_4G << PCIE_MISC_MISC_CTRL_SCB0_SIZE_SHIFT) & PCIE_MISC_MISC_CTRL_SCB0_SIZE_MASK);
+    // ── PIUSB-18: program the SCB0 window size AND the access-control bits Linux sets in the SAME
+    //    MISC_CTRL write. Sizing SCB0 alone (our pre-18 code) armed the inbound WINDOW but never enabled
+    //    the RC's SCB MASTER (bit12) — so the RC issued no inbound SCB cycles at all, and the VideoCore's
+    //    VL805 firmware-load path (which P26/P28 proved is NOT our outbound BAR — the load must reach the
+    //    device/its blob by the RC's own inbound/SCB route) had a closed door to SDRAM: CNR wedged. Set:
+    //      * SCB0_SIZE   := 0x11 (4 GiB, unchanged — the window)
+    //      * SCB_ACCESS_EN := 1  (the master enable — THE PIUSB-18 delta; bit12 was 0 on P28 metal)
+    //      * CFG_READ_UR_MODE := 1 (bad cfg reads return UR, not an abort — Linux default; hardens the
+    //                               downstream config path the notify handler walks)
+    //      * MAX_BURST_SIZE := 0b00 (128B, the BCM2711 value)
+    //    RMW: preserve every other MISC_CTRL bit (SCB1/2 sizes etc.).
+    let misc_after = (misc_before
+        & !(PCIE_MISC_MISC_CTRL_SCB0_SIZE_MASK | PCIE_MISC_MISC_CTRL_MAX_BURST_SIZE_MASK))
+        | ((RC_BAR2_SIZE_4G << PCIE_MISC_MISC_CTRL_SCB0_SIZE_SHIFT) & PCIE_MISC_MISC_CTRL_SCB0_SIZE_MASK)
+        | PCIE_MISC_MISC_CTRL_SCB_ACCESS_EN
+        | PCIE_MISC_MISC_CTRL_CFG_READ_UR_MODE; // MAX_BURST_SIZE field left 0 (128B) by the clear above
     serial_println!(
-        "{}   >>> WRITE: MISC_CTRL {:#010x} -> {:#010x} (SCB0_SIZE := {:#x} = 4 GiB, sized BEFORE RC_BAR2 — documented BCM2711 order; PIUSB-6 fix) ::",
+        "{}   >>> WRITE: MISC_CTRL {:#010x} -> {:#010x} (SCB0_SIZE := {:#x} = 4 GiB + SCB_ACCESS_EN + CFG_READ_UR_MODE + burst=128B — PIUSB-18: enable the inbound SCB master, not just size the window) ::",
         P, misc_before, misc_after, RC_BAR2_SIZE_4G
     );
     w(RC_BASE + PCIE_MISC_MISC_CTRL, misc_after);
     dsb();
     let misc_rb = r(RC_BASE + PCIE_MISC_MISC_CTRL);
+    let scb_access = misc_rb & PCIE_MISC_MISC_CTRL_SCB_ACCESS_EN != 0;
     serial_println!(
-        "{}   MISC_CTRL readback = {:#010x} (SCB0_SIZE={:#x}) -> {} ::",
+        "{}   MISC_CTRL readback = {:#010x} (SCB0_SIZE={:#x} SCB_ACCESS_EN={} CFG_READ_UR_MODE={}) -> {} ::",
         P, misc_rb, (misc_rb >> PCIE_MISC_MISC_CTRL_SCB0_SIZE_SHIFT) & 0x1f,
-        if (misc_rb & PCIE_MISC_MISC_CTRL_SCB0_SIZE_MASK) == (misc_after & PCIE_MISC_MISC_CTRL_SCB0_SIZE_MASK) { "SIZED" } else { "DID NOT LATCH" }
+        scb_access as u8, (misc_rb & PCIE_MISC_MISC_CTRL_CFG_READ_UR_MODE != 0) as u8,
+        if (misc_rb & (PCIE_MISC_MISC_CTRL_SCB0_SIZE_MASK | PCIE_MISC_MISC_CTRL_SCB_ACCESS_EN))
+            == (misc_after & (PCIE_MISC_MISC_CTRL_SCB0_SIZE_MASK | PCIE_MISC_MISC_CTRL_SCB_ACCESS_EN))
+        { "SIZED + SCB MASTER ENABLED" } else { "DID NOT LATCH" }
     );
 
     // (e) Inbound DMA BAR (RC_BAR2): map the PCIe inbound window to system RAM base 0 so a bus-master
