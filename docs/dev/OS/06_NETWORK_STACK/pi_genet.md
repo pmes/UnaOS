@@ -278,6 +278,36 @@ Expected metal witnesses:
 then per request e.g.
 `:: PI-GENET: [net15] GET /fs/K3HELLO.TXT => 200 37 bytes (with_unafs hold <t> ticks / <n> ms) ::`.
 
+### PI-FS-5 — the shell shares the HTTP namespace (`ls /usb`, `diskinfo`)
+
+The Pi shell's storage verbs are wired to the **same two volumes the HTTP `/fs` tree
+exposes**, so the browser and the console never disagree about what is mounted:
+
+* **`ls`** (`shell::pi_ls`) routes by path prefix. `ls /` (and any non-`/usb` path) lists
+  the native **unafs** volume — the store `GET /fs/` serves — via `pi_ls_collect`
+  (`with_unafs` + `resolve_path`/`ls`). A `/usb` or `/usb/<sub>` path instead lists the
+  live **USB FAT** mount via `pi_usb_ls_collect`, which re-mounts read-only through
+  `fat::mount_source(BlockSource::Usb)` — the identical API the `GET /fs/usb` route
+  (PIUSB-27) uses — and walks each path component by its **display name** (LFN-aware,
+  PI-FS-3), so `ls /usb/SUBDIR` and long names like `Long Filename Example.txt` resolve.
+  When the USB stick is mounted, bare `ls /` appends a `usb/` pseudo-entry, mirroring the
+  `/fs/` HTML listing's `usb/` link. `ls -l` keeps PI-FS-4's size + FAT last-write date
+  columns on FAT paths (a dashed date on unafs, which carries no mtime).
+* **`diskinfo`** on the Pi reports **both** storage devices: the **SD card** (emmc2
+  geometry from `block::info()` — the global device that hosts unafs + the FAT boot
+  partition) and, when present, the **USB stick** (its own geometry from
+  `block::usb_info()`, plus the FAT **type / volume size / label** read from the live
+  read-only mount via `fat::label()` / `fat::volume_bytes()`). x86 keeps its single-device
+  report (its one block device *is* the USB stick).
+
+Both verbs render panel-only on the bench, so each mirrors its output to serial: `ls`
+paths (unafs and `/usb`) witness as `:: ls1: <path>: <names> (N file, M dir) ::`;
+`diskinfo` lines mirror as `:: fs5: <line> ::`. The `pi_usb_ls_witness` fires from the
+PIUSB-27 mount witness (once per bring-up + every hot-plug), so `UNAOS_FATIMG=1 ./arroyo
+test-arm` proves `ls /usb` headlessly, e.g.
+`:: ls1: /usb: … Long Filename Example.txt MixedCaseName.md … SUBDIR/ (10 file, 2 dir) ::`
+and `:: ls1: /usb/SUBDIR: LEVEL1.TXT Nested Directory/ (1 file, 1 dir) ::`.
+
 ---
 
 ## 4a. "UnaOS knows what time it is" — SNTP client + kernel wall-clock (PI-NET-16)

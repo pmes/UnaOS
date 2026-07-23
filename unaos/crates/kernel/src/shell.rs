@@ -210,6 +210,14 @@ fn ui3_say(console: &mut Console, verb: &str, line: &str) {
     serial_println!(":: ui3:{}: {} ::", verb, line);
 }
 
+/// PI-FS-5: panel-line + `:: fs5: <line> ::` serial mirror (the `ui3_say` idiom, dedicated tag) — the
+/// `diskinfo` verb renders panel-only on the bench, so the witness gives a headless capture the same content.
+#[cfg(target_arch = "aarch64")]
+fn fs5_say(console: &mut Console, line: &str) {
+    console.println(line);
+    serial_println!(":: fs5: {} ::", line);
+}
+
 /// JD6 `touch`: ensure a 0-length file exists at `path` in ANY directory the shell can reach
 /// (create if absent; idempotent no-op if present). Rides the dir-aware `locate_in_dir` /
 /// `create_in_dir` twins — the parent may be the root or any subdirectory.
@@ -1356,14 +1364,130 @@ fn pi_ls_collect(path: &str) -> Result<(bool, Vec<(String, u64, bool)>), String>
 /// PI-FS-4: unafs inodes carry a size but no last-write time, so `ls -l` shows the size plus a dashed
 /// date column (`UNAFS_NO_MTIME`), and the short `ls` is unchanged. The `-l` serial mirror keeps the
 /// `:: ls1:` shape and appends the per-entry sizes so a headless capture can witness the long form.
+/// PI-FS-5: format a FAT last-write stamp as the fixed-width `YYYY-MM-DD HH:MM:SS` field the FAT `ls -l`
+/// column uses (mirrors genet's `fmt_fat_mtime` so the shell and `/fs/usb/` never disagree). An all-zero
+/// on-disk stamp renders as the dashed placeholder — the same 19-char width — rather than a bogus 1980 date.
+#[cfg(target_arch = "aarch64")]
+fn fat_mtime_field(ts: &crate::fs::fat::FatTimestamp) -> String {
+    if ts.is_zero() {
+        return String::from("       -           ");
+    }
+    alloc::format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        ts.year, ts.month, ts.day, ts.hour, ts.min, ts.sec
+    )
+}
+
+/// PI-FS-5: collect a listing off the LIVE USB FAT mount at `sub` (relative to the USB root — `""` or `"/"`
+/// is the root; `"/DIR"` / `"/DIR/SUB"` descend). Mounts read-only through the same `fat::mount_source(Usb)`
+/// API genet's `/fs/usb` route uses, walks each path component by its display name (LFN-aware, PI-FS-3), and
+/// returns `(is_dir, rows)` where each row is `(name, size, is_dir, mtime_field)`. `.`/`..` are filtered.
+/// A file leaf yields its own single row (the DOS `ls <file>` idiom). Any mount/resolve failure is an
+/// errno-tagged message string, matching the unafs path's shape.
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::type_complexity)]
+fn pi_usb_ls_collect(sub: &str) -> Result<(bool, Vec<(String, u64, bool, String)>), String> {
+    let fs = crate::fs::fat::mount_source(crate::fs::fat::BlockSource::Usb)
+        .map_err(|e| alloc::format!("no USB FAT mount ({}, -ENODEV)", crate::fs::fat::fat_reason(e)))?;
+    let comps: Vec<&str> = sub.split('/').filter(|c| !c.is_empty()).collect();
+    let mut entries = fs
+        .read_root()
+        .map_err(|e| alloc::format!("/usb: read failed ({}, -EIO)", crate::fs::fat::fat_reason(e)))?;
+    for (i, comp) in comps.iter().enumerate() {
+        let here = alloc::format!("/usb/{}", comps[..=i].join("/"));
+        let de = entries
+            .iter()
+            .find(|d| d.name().eq_ignore_ascii_case(comp))
+            .ok_or_else(|| alloc::format!("{}: not found (-ENOENT)", here))?;
+        if de.is_dir {
+            entries = fs
+                .read_dir(de.first_cluster())
+                .map_err(|e| alloc::format!("{}: read failed ({}, -EIO)", here, crate::fs::fat::fat_reason(e)))?;
+        } else if i == comps.len() - 1 {
+            // A file leaf named as the final component — list its own single row (DOS idiom).
+            return Ok((false, alloc::vec![(String::from(de.name()), de.size as u64, false, fat_mtime_field(&de.mtime()))]));
+        } else {
+            return Err(alloc::format!("{}: not a directory (-ENOTDIR)", here));
+        }
+    }
+    let mut rows: Vec<(String, u64, bool, String)> = Vec::new();
+    for de in &entries {
+        let name = de.name();
+        if name == "." || name == ".." {
+            continue;
+        }
+        rows.push((String::from(name), de.size as u64, de.is_dir, fat_mtime_field(&de.mtime())));
+    }
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok((true, rows))
+}
+
+/// PI-FS-5: the `/usb[...]` arm of the Pi `ls`. `full` is the normalized `/usb...` path (for the table
+/// header and the `:: ls1: /usb...` witness); `sub` is the part past `/usb`. Prints the same table shape as
+/// the unafs/FAT paths — size + name, `<DIR>` for directories — and, under `-l`, the FAT last-write date the
+/// `/fs/usb/` HTTP listing shows (PI-FS-4). Emits the `:: ls1:` witness so a headless capture sees the rows.
+#[cfg(target_arch = "aarch64")]
+fn pi_usb_ls(console: &mut Console, full: &str, sub: &str, long: bool) {
+    match pi_usb_ls_collect(sub) {
+        Ok((is_dir, rows)) => {
+            let (mut files, mut dirs) = (0u32, 0u32);
+            for (name, size, row_is_dir, date) in &rows {
+                if *row_is_dir {
+                    dirs += 1;
+                    if long {
+                        console.println(&alloc::format!("  <DIR>        {}  {}/", date, name));
+                    } else {
+                        console.println(&alloc::format!("  <DIR>         {}", name));
+                    }
+                } else {
+                    files += 1;
+                    if long {
+                        console.println(&alloc::format!("  {:>10}  {}  {}", size, date, name));
+                    } else {
+                        console.println(&alloc::format!("  {:>10}  {}", size, name));
+                    }
+                }
+            }
+            if is_dir {
+                console.println(&alloc::format!("{} file(s), {} dir(s)", files, dirs));
+            }
+            let names: Vec<&str> = rows.iter().map(|(n, _, _, _)| n.as_str()).collect();
+            if long {
+                let sizes: Vec<String> = rows.iter().map(|(_, s, _, _)| alloc::format!("{}", s)).collect();
+                serial_println!(
+                    ":: ls1: {}: {} ({} file, {} dir) sizes: {} ::",
+                    full, names.join(" "), files, dirs, sizes.join(" ")
+                );
+            } else {
+                serial_println!(":: ls1: {}: {} ({} file, {} dir) ::", full, names.join(" "), files, dirs);
+            }
+        }
+        Err(msg) => {
+            console.println(&alloc::format!("ls: {}", msg));
+            serial_println!(":: ls1: {}: ERR {} ::", full, msg);
+        }
+    }
+}
+
 #[cfg(target_arch = "aarch64")]
 fn pi_ls(console: &mut Console, arg: &str, long: bool) {
     // 19-char dashed placeholder, the same width as the FAT `YYYY-MM-DD HH:MM:SS` field — unafs has no
     // last-write time to render, so `ls -l` shows a `-` here honestly rather than a fabricated date.
     const UNAFS_NO_MTIME: &str = "       -           ";
     let path = normalize_path(&cwd_path(), arg);
+    // PI-FS-5: the `/usb` mount lives in the SAME path namespace the HTTP server exposes at `/fs/usb`.
+    // `ls /usb` (and `/usb/<sub>`, LFN-aware) lists the live USB FAT volume via the genet mount API rather
+    // than unafs. Everything else stays on the native unafs volume below.
+    if path == "/usb" || path.starts_with("/usb/") {
+        let sub = path.strip_prefix("/usb").unwrap_or("");
+        pi_usb_ls(console, &path, sub, long);
+        return;
+    }
     match pi_ls_collect(&path) {
         Ok((is_dir, rows)) => {
+            // PI-FS-5: at the unafs root, append a `usb/` pseudo-entry when the USB stick is mounted — mirroring
+            // the `/fs/` HTTP listing's `usb/` link, so `ls /` advertises the drive the same way the browser does.
+            let show_usb = path == "/" && crate::drivers::block::usb_info().is_some();
             let (mut files, mut dirs) = (0u32, 0u32);
             for (name, size, row_is_dir) in &rows {
                 if *row_is_dir {
@@ -1382,10 +1506,22 @@ fn pi_ls(console: &mut Console, arg: &str, long: bool) {
                     }
                 }
             }
+            // PI-FS-5: the mounted-USB pseudo-entry — a `usb/` dir row at the unafs root, counted as a dir.
+            if show_usb {
+                dirs += 1;
+                if long {
+                    console.println(&alloc::format!("  <DIR>        {}  usb/", UNAFS_NO_MTIME));
+                } else {
+                    console.println("  <DIR>         usb");
+                }
+            }
             if is_dir {
                 console.println(&alloc::format!("{} file(s), {} dir(s)", files, dirs));
             }
-            let names: Vec<&str> = rows.iter().map(|(n, _, _)| n.as_str()).collect();
+            let mut names: Vec<&str> = rows.iter().map(|(n, _, _)| n.as_str()).collect();
+            if show_usb {
+                names.push("usb");
+            }
             if long {
                 let sizes: Vec<String> = rows.iter().map(|(_, s, _)| alloc::format!("{}", s)).collect();
                 serial_println!(
@@ -1423,6 +1559,34 @@ pub fn pi_ls_witness() {
             );
         }
         Err(msg) => serial_println!(":: ls1: /: ERR {} ::", msg),
+    }
+}
+
+/// PI-FS-5 boot/hot-plug witness: exercise the EXACT `pi_usb_ls_collect` listing the shell's `ls /usb`
+/// verb uses, against the live USB FAT mount, and emit the `:: ls1: /usb... ::` line headlessly — so a
+/// capture proves the shell sees the same volume `/fs/usb` serves, without a serial-console injection
+/// path. Called from `fat::piusb27_mount_witness` (which fires once per bring-up + every hot-plug), so it
+/// rides the same USB feature gate as the mount witness — NOT the baremetal/witness battery (the USB FAT
+/// volume is present in `UNAOS_FATIMG=1 ./arroyo test-arm`, where the emmc2-backed unafs volume is not).
+/// Lists the `/usb` root then descends one named subdir to prove the LFN-aware subpath walk.
+#[cfg(target_arch = "aarch64")]
+pub fn pi_usb_ls_witness() {
+    for (full, sub) in [("/usb", ""), ("/usb/SUBDIR", "/SUBDIR")] {
+        match pi_usb_ls_collect(sub) {
+            Ok((_, rows)) => {
+                let names: Vec<String> = rows
+                    .iter()
+                    .map(|(n, _, d, _)| if *d { alloc::format!("{}/", n) } else { n.clone() })
+                    .collect();
+                let dirs = rows.iter().filter(|(_, _, d, _)| *d).count();
+                let files = rows.len() - dirs;
+                serial_println!(
+                    ":: ls1: {}: {} ({} file, {} dir) ::",
+                    full, names.join(" "), files, dirs
+                );
+            }
+            Err(msg) => serial_println!(":: ls1: {}: ERR {} ::", full, msg),
+        }
     }
 }
 
@@ -2708,6 +2872,53 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             console.println("sync: write-through storage — every write is already durable on the card");
         },
         "diskinfo" => {
+            // PI-FS-5: on the Pi report BOTH storage devices — the SD card (emmc2, the global block device that
+            // hosts unafs + the FAT boot partition) AND, when present, the USB stick (its own geometry from
+            // `USB_BLOCK_DEVICE`, plus the FAT type/size/label read from the live read-only mount). x86 keeps the
+            // single-device report below (its one block device IS the USB stick).
+            #[cfg(target_arch = "aarch64")]
+            {
+                match crate::drivers::block::info() {
+                    Some(d) => {
+                        let vendor = core::str::from_utf8(&d.vendor).unwrap_or("?");
+                        let product = core::str::from_utf8(&d.product).unwrap_or("?");
+                        let cap_mib = (d.num_blocks * d.block_size as u64) / (1024 * 1024);
+                        fs5_say(console, &alloc::format!(
+                            "SD: {} {}  block {}  blocks {}  {} MiB (unafs + FAT boot)",
+                            vendor.trim_end(), product.trim_end(), d.block_size, d.num_blocks, cap_mib));
+                    }
+                    None => fs5_say(console, "SD: no card block device ready."),
+                }
+                match crate::drivers::block::usb_info() {
+                    Some(u) => {
+                        let vendor = core::str::from_utf8(&u.vendor).unwrap_or("?");
+                        let product = core::str::from_utf8(&u.product).unwrap_or("?");
+                        let cap_mib = (u.num_blocks * u.block_size as u64) / (1024 * 1024);
+                        fs5_say(console, &alloc::format!(
+                            "USB: {} {}  block {}  blocks {}  {} MiB",
+                            vendor.trim_end(), product.trim_end(), u.block_size, u.num_blocks, cap_mib));
+                        // FAT type/size/label off the LIVE read-only mount (the volume `/fs/usb` and `ls /usb` serve).
+                        match crate::fs::fat::mount_source(crate::fs::fat::BlockSource::Usb) {
+                            Ok(fs) => {
+                                let kind = match fs.kind() {
+                                    crate::fs::fat::FatKind::Fat16 => "FAT16",
+                                    crate::fs::fat::FatKind::Fat32 => "FAT32",
+                                };
+                                let label = fs.label();
+                                let label = if label.is_empty() { String::from("-") } else { label };
+                                let vol_mib = fs.volume_bytes() / (1024 * 1024);
+                                fs5_say(console, &alloc::format!(
+                                    "USB FAT: {}  label {}  volume {} MiB  mounted /usb (read-only)",
+                                    kind, label, vol_mib));
+                            }
+                            Err(e) => fs5_say(console, &alloc::format!(
+                                "USB FAT: unmounted ({})", crate::fs::fat::fat_reason(e))),
+                        }
+                    }
+                    None => fs5_say(console, "USB: no stick present."),
+                }
+            }
+            #[cfg(not(target_arch = "aarch64"))]
             match crate::drivers::block::info() {
                 Some(d) => {
                     let vendor = core::str::from_utf8(&d.vendor).unwrap_or("?");

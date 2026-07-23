@@ -503,6 +503,10 @@ pub struct FatFs {
     /// rows never attach to this volume; a full byte-for-byte clone preserves both and is NOT rejected — offline
     /// tampering is out of scope).
     vol_id: u32,
+    /// PI-FS-5: `BS_VolLab`, the 11-byte volume label the formatter stamped into the boot sector (offset 0x2B on
+    /// FAT16, 0x47 on FAT32). Read-only; space-padded on disk, surfaced trimmed by [`FatFs::label`] for `diskinfo`.
+    /// A blank/`NO NAME    ` field renders as empty (the caller shows a `-` then).
+    vol_label: [u8; 11],
     /// PIUSB-27: which block device every sector read of this volume routes to. `Default` for the
     /// globally-registered device (SD on the Pi); `Usb` for a read-only mount of the USB stick read
     /// straight through the xHCI controller.
@@ -820,6 +824,12 @@ fn parse_bpb(
     // FAT32 (both well within the already-read boot sector). Read-only; used only as a UNAFS.ATR binding fingerprint.
     let vol_id = u32le(sec, if kind == FatKind::Fat32 { 0x43 } else { 0x27 });
 
+    // PI-FS-5: BS_VolLab — the formatter's 11-byte volume label. Extended-BPB field: offset 0x2B on FAT12/16,
+    // 0x47 on FAT32 (both within the already-read boot sector). Read-only, surfaced trimmed by `label()`.
+    let mut vol_label = [0u8; 11];
+    let lab_off = if kind == FatKind::Fat32 { 0x47 } else { 0x2B };
+    vol_label.copy_from_slice(&sec[lab_off..lab_off + 11]);
+
     Ok(FatFs {
         kind,
         part_lba,
@@ -835,6 +845,7 @@ fn parse_bpb(
         root_dir_sectors,
         count_of_clusters,
         vol_id,
+        vol_label,
         source,
     })
 }
@@ -1069,6 +1080,24 @@ impl FatFs {
     /// launcher computes the expected chain length rather than assuming a fixed 2.
     pub fn cluster_size(&self) -> u32 {
         self.sec_per_clus * self.bytes_per_sec
+    }
+
+    /// PI-FS-5: the volume's formatted usable capacity in bytes (`count_of_clusters * cluster_size`) — the
+    /// data-region size a `diskinfo` line reports for the FAT volume. Not the raw device size (which the block
+    /// geometry gives): this is what the filesystem actually addresses.
+    pub fn volume_bytes(&self) -> u64 {
+        self.count_of_clusters as u64 * self.cluster_size() as u64
+    }
+
+    /// PI-FS-5: the trimmed `BS_VolLab` volume label (ASCII, space-padded on disk). Returns an empty string when
+    /// the field is blank or the conventional `NO NAME` placeholder, so `diskinfo` can show a `-` instead.
+    pub fn label(&self) -> String {
+        let raw = core::str::from_utf8(&self.vol_label).unwrap_or("").trim_end_matches([' ', '\0']);
+        if raw.is_empty() || raw == "NO NAME" {
+            String::new()
+        } else {
+            String::from(raw)
+        }
     }
 
     /// The end-of-chain marker to write into a terminal cluster's FAT entry (`>= 0xFFF8` / `>= 0x0FFFFFF8`
@@ -2525,6 +2554,9 @@ pub fn piusb27_mount_witness() {
                 }
                 Err(e) => serial_println!(":: piusb27: root read error ({}) ::", fat_reason(e)),
             }
+            // PI-FS-5: prove the SHELL's `ls /usb` collector sees the same mount (the `:: ls1: /usb... ::`
+            // witness), so the shell and the `/fs/usb` HTTP route never disagree on the namespace.
+            crate::shell::pi_usb_ls_witness();
         }
         Err(e) => serial_println!(":: piusb27: no FAT volume ({}) ::", fat_reason(e)),
     }
