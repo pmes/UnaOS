@@ -31,11 +31,11 @@ const SENTINEL: u32 = 0xDEAD_0000;
 /// 7-slot `kdisp_trace_0` array for the boot-info ABI.
 ///
 /// Phase 2 (behind `nvidia-kepler-takeover`): If a matching head is found,
-/// performs the double-buffer + EVO flip.
+/// performs the pull-5 repoint-the-surface experiment (0x6101E0 only).
 pub unsafe fn takeover_display(
     gpu: &GpuInfo,
     bar0: usize,
-    allocator: &mut VramAllocator,
+    _allocator: &mut VramAllocator,
     kdisp_trace: &mut [u32; 7],
 ) -> Option<usize> {
     serial_println!(":: kdisp: begin-trace ::");
