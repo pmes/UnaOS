@@ -453,12 +453,15 @@ fn drain_input(pal: &mut TargetPal) -> bool {
 //     `Event::MouseAbsolute{x,y}` for tablet/absolute pointers; `Event::Button(mask)` on BOTH the
 //     press edge (mask != 0) and the release edge (mask == 0) — the GUI-CLICK-2b gap is closed.
 //
-// MODEL (GAME-MODE-2, TRUE held state): a Key press sets a movement key's held bit; its KeyUp clears
-// it — the crystal steps continuously exactly while the key is down. A hot-unplug safety net drops a
-// held key whose press has not been refreshed for ~2 s (a stuck/vanished device never releases). A
-// pointer button press starts a DRAG (motion rotates the crystal only while dragging); the release
-// ends it. A press+release with no motion past a small pixel threshold is a CLICK → exit (drag and
-// click-to-exit coexist). Any non-mapped key also exits (the shell exit contract is preserved).
+// MODEL (GAME-MODE-2b, TRUE held state): a Key press sets a movement key's held bit; its KeyUp clears
+// it — the crystal steps continuously exactly while the key is down. KeyUp is reliable, so it is
+// TRUSTED: there is NO time-based drop (SET_IDLE(0) sends one press and no further reports until
+// release, so any keyboard-idle timeout would false-drop a long hold). The one orphan — a keyboard
+// hot-unplugged mid-hold, whose KeyUp never arrives — is caught by clearing the whole held mask on
+// ANY Button event: the pointer is independent and a click is always reachable, so it both stops a
+// stuck spin and (when clean) exits. A pointer button press starts a DRAG (motion rotates the crystal
+// only while dragging); the release ends it. A press+release with no motion past a small pixel
+// threshold is a CLICK → exit (drag and click-to-exit coexist). Any non-mapped key also exits.
 // ---------------------------------------------------------------------------------------------
 
 const G_YAW_L: u8 = 1 << 0; // 'a' — yaw left
@@ -606,15 +609,15 @@ pub fn run_crystal(pal: &mut TargetPal, mode: Mode) {
     // VUG-PAR: the max parallel band count seen in the window — reads the parallel flush win directly.
     let mut wit_bands: usize = 1;
 
-    // GAME-MODE TRUE held-key model (GAME-MODE-2). Since HID-KEYS the HID path delivers a Key on the
+    // GAME-MODE TRUE held-key model (GAME-MODE-2b). Since HID-KEYS the HID path delivers a Key on the
     // PRESS edge and a KeyUp on the RELEASE edge, so a key's held bit is set on press and cleared on
-    // release — continuous stepping exactly while down. `held` is the live mask; `key_seen[bit]` is
-    // the ms of that bit's last press, used only by the hot-unplug safety net: a held key whose press
-    // has not been refreshed within `KEY_FALLBACK_MS` (a vanished device never sends its KeyUp) is
-    // dropped so the crystal cannot spin forever.
+    // release — continuous stepping exactly while down. KeyUp is reliable, so we TRUST it: there is no
+    // time-based drop (a genuine hold under SET_IDLE(0) sends one press and NO further reports until
+    // release, so any keyboard-idle timeout would false-drop a long hold — the GAME-MODE-2 mistake).
+    // The only orphan is a keyboard hot-unplugged mid-hold (its KeyUp never arrives): we clear the
+    // whole held mask on ANY Button event, since the pointer is independent and a click is always
+    // reachable — that both stops a stuck spin and, on a clean click, exits.
     let mut held: u8 = 0;
-    let mut key_seen = [0u64; G_BITS];
-    const KEY_FALLBACK_MS: u64 = 2000; // drop a held key with no press refresh for ~2 s (hot-unplug)
     // Drag-rotate: a button press starts a drag, its release ends it; motion rotates only while
     // dragging. `drag_motion` sums |pointer delta| from press to release — a release under
     // `CLICK_THRESH` px is a CLICK (exit); more is a genuine drag (no exit).
@@ -634,23 +637,22 @@ pub fn run_crystal(pal: &mut TargetPal, mode: Mode) {
             break;
         }
         let now = crate::arch::ms();
-        // TRUE held state: a press sets the bit (and refreshes its safety timestamp), a KeyUp clears
-        // it. Continuous stepping runs exactly while the key is down.
+        // TRUE held state: a press sets the bit, a KeyUp clears it. Continuous stepping runs exactly
+        // while the key is down — KeyUp is trusted, so there is no time-based drop.
         for b in 0..G_BITS {
             if gi.pressed & (1 << b) != 0 {
                 held |= 1 << b;
-                key_seen[b] = now;
             }
             if gi.released & (1 << b) != 0 {
                 held &= !(1 << b);
             }
         }
-        // Hot-unplug safety net: drop any held key whose press has gone unrefreshed past the fallback
-        // window (its KeyUp never arrived — a stuck or vanished device), so the crystal can't spin on.
-        for b in 0..G_BITS {
-            if held & (1 << b) != 0 && now.wrapping_sub(key_seen[b]) > KEY_FALLBACK_MS {
-                held &= !(1 << b);
-            }
+        // Hot-unplug net: any Button event clears the whole held mask. If a keyboard is unplugged
+        // mid-hold its KeyUp never arrives, but the pointer is independent — a click (always
+        // reachable) both stops the orphaned spin and, when clean, exits. No keyboard-idle timeout,
+        // which would false-drop a legitimately long hold (SET_IDLE(0) sends no reports while down).
+        if gi.btn_down || gi.btn_up {
+            held = 0;
         }
         // Drag session bracketed by the button press/release edges. Press starts a drag and resets
         // the motion accumulator; while dragging, pointer motion both rotates and accrues; release
