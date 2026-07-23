@@ -17,6 +17,14 @@
 //! FAT16 / FAT32 reader (+ U9 in-place writer, + U10 grow/create allocator) built on the generic
 //! block device.
 //!
+//! PI-FS-3: the read walkers parse VFAT **long filenames** (the 0x0F-attribute LFN component slots that
+//! precede a short 8.3 entry) — accumulated across sector/cluster boundaries by [`LfnBuf`], checksum-
+//! validated against the short entry, and decoded UTF-16→UTF-8 into `DirEntry`'s inline long-name buffer.
+//! [`DirEntry::name`] returns the long name when present (else the 8.3 short name); `eq_name` matches
+//! EITHER spelling. **Subdirectory traversal** to arbitrary depth is served by [`FatFs::read_dir`] (the
+//! FAT16 fixed root, the FAT32 root cluster chain, and any subdirectory cluster chain all resolve through
+//! one API — a directory's `first_cluster()` is the chain head). All of this is strictly read-only.
+//!
 //! Handles both a **superfloppy** (the FAT BPB sits at LBA 0, no partition table) and an
 //! **MBR-partitioned** disk (an MBR at LBA 0 whose partition entry points at the BPB). All
 //! multi-byte on-disk fields are little-endian. Parsing is read-only — a mis-parse can at worst
@@ -69,12 +77,23 @@ pub enum FatKind {
     Fat32,
 }
 
-/// A parsed short (8.3) directory entry. Long-file-name (LFN) entries are skipped, so the name is
-/// the on-disk short name (uppercase, e.g. `KERNEL.ELF`).
+/// PI-FS-3: the widest long name we carry inline. A VFAT LFN is at most 255 UTF-16 code units; its
+/// UTF-8 encoding can be up to 3 bytes per BMP unit, so a fully-3-byte 255-unit name needs 765 bytes.
+/// We store the decoded UTF-8 inline (keeps `DirEntry: Copy` and `name() -> &str` — no signature churn
+/// on the presentation callers); a name whose UTF-8 would not fit falls back to its 8.3 short name.
+const LNAME_MAX: usize = 768;
+
+/// A parsed directory entry. Carries the on-disk short (8.3) name (uppercase, e.g. `KERNEL.ELF`) and,
+/// when VFAT long-file-name (LFN) entries preceded it and validated (PI-FS-3), the decoded UTF-8 long
+/// name. `name()` returns the long name when present, else the short; `eq_name` matches EITHER, so a
+/// lookup by the long spelling OR the 8.3 short both resolve.
 #[derive(Clone, Copy)]
 pub struct DirEntry {
-    name: [u8; 12], // "NAME.EXT", NUL-padded (max 8 + '.' + 3 = 12)
+    name: [u8; 12], // 8.3 short name: "NAME.EXT", NUL-padded (max 8 + '.' + 3 = 12)
     name_len: u8,
+    /// PI-FS-3: decoded UTF-8 long name; `lname_len == 0` means "no LFN — use the 8.3 short name".
+    lname: [u8; LNAME_MAX],
+    lname_len: u16,
     pub is_dir: bool,
     pub size: u32,
     first_cluster: u32,
@@ -111,17 +130,39 @@ impl FatTimestamp {
 }
 
 impl DirEntry {
-    /// The 8.3 name as text (e.g. `"KERNEL.ELF"`).
-    pub fn name(&self) -> &str {
+    /// The entry's short (8.3) name as text (e.g. `"KERNEL.ELF"`).
+    fn short_name(&self) -> &str {
         core::str::from_utf8(&self.name[..self.name_len as usize]).unwrap_or("?")
     }
 
-    /// Case-insensitive match against an 8.3 name (short names are stored uppercase on disk, so
-    /// `cat hello.txt` finds `HELLO.TXT`).
+    /// The display name: the decoded VFAT long name when one is present (PI-FS-3), else the 8.3 short
+    /// name. The long-name bytes are always valid UTF-8 (built by `LfnBuf::decode_into`), so the
+    /// `unwrap_or` fallback to the short name never triggers in practice.
+    pub fn name(&self) -> &str {
+        if self.lname_len > 0 {
+            core::str::from_utf8(&self.lname[..self.lname_len as usize]).unwrap_or_else(|_| self.short_name())
+        } else {
+            self.short_name()
+        }
+    }
+
+    /// Case-insensitive match against EITHER the long name or the 8.3 short name. Short names are stored
+    /// uppercase on disk (so `cat hello.txt` finds `HELLO.TXT`); with PI-FS-3 a lookup by the long
+    /// spelling (`cat .fseventsd`) also resolves. The long compare is ASCII-case-insensitive byte-wise —
+    /// exact for the ASCII names our callers use; non-ASCII long names match only by identical bytes.
     fn eq_name(&self, other: &str) -> bool {
-        let me = &self.name[..self.name_len as usize];
-        me.len() == other.len()
-            && me.iter().zip(other.bytes()).all(|(a, b)| a.eq_ignore_ascii_case(&b))
+        let short = &self.name[..self.name_len as usize];
+        if short.len() == other.len()
+            && short.iter().zip(other.bytes()).all(|(a, b)| a.eq_ignore_ascii_case(&b))
+        {
+            return true;
+        }
+        if self.lname_len > 0 {
+            let long = &self.lname[..self.lname_len as usize];
+            return long.len() == other.len()
+                && long.iter().zip(other.bytes()).all(|(a, b)| a.eq_ignore_ascii_case(&b));
+        }
+        false
     }
 
     /// The entry's first data cluster — the chain head a `read_at` walk starts from (U6b: `SYS_OPEN`
@@ -201,6 +242,8 @@ fn classify_dir_slot(e: &[u8]) -> DirSlot {
     DirSlot::Entry(DirEntry {
         name,
         name_len: n as u8,
+        lname: [0u8; LNAME_MAX],
+        lname_len: 0,
         is_dir: attr & 0x10 != 0,
         size: u32le(e, 28),
         first_cluster: ((u16le(e, 20) as u32) << 16) | u16le(e, 26) as u32,
@@ -270,14 +313,161 @@ fn format_83(name: &str) -> Option<[u8; 11]> {
     Some(out)
 }
 
-/// Parse one 512-byte directory sector, appending real file/dir entries to `out`. Returns `true`
-/// if a 0x00 (end-of-directory) marker was reached, telling the caller to stop scanning.
-fn scan_dir_sector(sec: &[u8; SECTOR_SIZE], out: &mut alloc::vec::Vec<DirEntry>) -> bool {
+/// PI-FS-3: the VFAT long-file-name checksum — computed over a short entry's 11 on-disk name bytes
+/// (Microsoft FAT spec). Every LFN component slot stores this checksum at offset 13; a component whose
+/// checksum disagrees with the short entry it precedes is orphaned (from a deleted/renamed file) and is
+/// discarded, so a stale LFN run can never mislabel a live short entry.
+fn lfn_checksum(short11: &[u8; 11]) -> u8 {
+    let mut sum: u8 = 0;
+    for &b in short11.iter() {
+        sum = (((sum & 1) << 7).wrapping_add(sum >> 1)).wrapping_add(b);
+    }
+    sum
+}
+
+/// PI-FS-3: accumulates the VFAT long-file-name component slots (attribute 0x0F) that physically PRECEDE
+/// a short (8.3) entry, then decodes them into a UTF-8 long name once the short entry is reached. LFN
+/// components appear in REVERSE order — the LAST component first, flagged by bit 6 (0x40) in its ordinal
+/// byte — so we see the highest ordinal first and place each component's 13 UTF-16 units at
+/// `(ordinal-1)*13`. A run is accepted only when it is contiguous (ordinals N..1 with no gap), every
+/// component carries the same checksum, and that checksum matches the short entry's name field. Any
+/// inconsistency (out-of-range ordinal, checksum split, non-descending sequence, a deleted/volume-label
+/// slot interrupting the run) marks the buffer broken and the entry falls back to its 8.3 short name.
+struct LfnBuf {
+    /// Up to 20 components × 13 UTF-16 code units (VFAT caps a name at 255 chars → ≤ 20 components).
+    units: [u16; 20 * 13],
+    max_ord: usize, // highest ordinal seen (0 = no active run)
+    prev_ord: usize, // last ordinal consumed, for the descend-by-one contiguity check
+    checksum: u8,
+    broken: bool,
+}
+
+impl LfnBuf {
+    fn new() -> Self {
+        LfnBuf { units: [0u16; 20 * 13], max_ord: 0, prev_ord: 0, checksum: 0, broken: false }
+    }
+
+    /// Drop any partially-accumulated run (a live short entry with no LFN, a deleted slot, a volume
+    /// label, or an inconsistency all break the run).
+    fn reset(&mut self) {
+        self.max_ord = 0;
+        self.prev_ord = 0;
+        self.broken = false;
+    }
+
+    /// Consume one 0x0F long-name component slot `e` (32 bytes).
+    fn push(&mut self, e: &[u8]) {
+        let b0 = e[0];
+        let is_last = b0 & 0x40 != 0;
+        let ord = (b0 & 0x1F) as usize;
+        let cksum = e[13];
+        if ord == 0 || ord > 20 {
+            self.broken = true; // impossible ordinal — poison the run
+            return;
+        }
+        if is_last {
+            // Start a fresh run: the last component (highest ordinal) leads the reversed sequence.
+            self.reset();
+            self.max_ord = ord;
+            self.checksum = cksum;
+            self.prev_ord = ord + 1; // so the contiguity check below accepts this first component
+        }
+        if self.max_ord == 0 {
+            self.broken = true; // a non-last component with no active run — orphan
+            return;
+        }
+        if cksum != self.checksum || ord + 1 != self.prev_ord {
+            self.broken = true; // checksum split, or a gap / non-descending ordinal
+            return;
+        }
+        self.prev_ord = ord;
+        // The 13 UTF-16 units live at three disjoint spans within the slot (offsets 1, 14, 28).
+        const OFFS: [usize; 13] = [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30];
+        let base = (ord - 1) * 13;
+        for (k, &o) in OFFS.iter().enumerate() {
+            self.units[base + k] = u16le(e, o);
+        }
+    }
+
+    /// The short entry `short11` (its 11 on-disk name bytes) has been reached: if a complete, checksum-
+    /// matching LFN run accumulated, decode it into `de`'s long name. Consumes (resets) the run either
+    /// way, so the next entry starts clean.
+    fn attach(&mut self, short11: &[u8; 11], de: &mut DirEntry) {
+        let ok = self.max_ord != 0
+            && !self.broken
+            && self.prev_ord == 1 // descended contiguously all the way to component 1
+            && lfn_checksum(short11) == self.checksum;
+        if ok {
+            self.decode_into(de);
+        }
+        self.reset();
+    }
+
+    /// Decode the accumulated UTF-16 units (up to the 0x0000 terminator) into `de.lname` as UTF-8. On a
+    /// name whose UTF-8 would overflow `LNAME_MAX`, leaves `de` untouched (falls back to the 8.3 name).
+    fn decode_into(&self, de: &mut DirEntry) {
+        let total = self.max_ord * 13;
+        let mut n = 0usize;
+        while n < total && self.units[n] != 0x0000 {
+            n += 1; // stop at the NUL terminator; trailing 0xFFFF padding sits beyond it
+        }
+        let mut buf = [0u8; LNAME_MAX];
+        let mut len = 0usize;
+        for ch in core::char::decode_utf16(self.units[..n].iter().copied()) {
+            let c = ch.unwrap_or('\u{FFFD}');
+            let mut tmp = [0u8; 4];
+            let s = c.encode_utf8(&mut tmp);
+            if len + s.len() > LNAME_MAX {
+                return; // too long to carry inline — keep the 8.3 fallback
+            }
+            buf[len..len + s.len()].copy_from_slice(s.as_bytes());
+            len += s.len();
+        }
+        if len == 0 {
+            return;
+        }
+        de.lname = buf;
+        de.lname_len = len as u16;
+    }
+}
+
+/// Parse one 512-byte directory sector, appending real file/dir entries to `out`, threading the VFAT
+/// long-name accumulator `lfn` across sector (and cluster) boundaries so a long name split across the
+/// slot preceding a short entry is reassembled correctly. Returns `true` if a 0x00 (end-of-directory)
+/// marker was reached, telling the caller to stop scanning. LFN component slots (attr 0x0F) feed `lfn`;
+/// a deleted slot or volume label breaks any run in progress; each real short entry consumes the run.
+fn scan_dir_sector(
+    sec: &[u8; SECTOR_SIZE],
+    out: &mut alloc::vec::Vec<DirEntry>,
+    lfn: &mut LfnBuf,
+) -> bool {
     for i in 0..(SECTOR_SIZE / 32) {
-        match classify_dir_slot(&sec[i * 32..i * 32 + 32]) {
-            DirSlot::End => return true,
-            DirSlot::Skip => continue,
-            DirSlot::Entry(de) => out.push(de),
+        let e = &sec[i * 32..i * 32 + 32];
+        match e[0] {
+            0x00 => return true, // end of directory
+            0xE5 => {
+                lfn.reset(); // a deleted slot (incl. a deleted LFN component) interrupts any run
+                continue;
+            }
+            _ => {}
+        }
+        let attr = e[11];
+        if attr & 0x0F == 0x0F {
+            lfn.push(e); // long-name component
+            continue;
+        }
+        if attr & 0x08 != 0 {
+            lfn.reset(); // volume label — not a name, breaks a run
+            continue;
+        }
+        match classify_dir_slot(e) {
+            DirSlot::Entry(mut de) => {
+                let mut short11 = [0u8; 11];
+                short11.copy_from_slice(&e[0..11]);
+                lfn.attach(&short11, &mut de);
+                out.push(de);
+            }
+            _ => lfn.reset(),
         }
     }
     false
@@ -1078,9 +1268,10 @@ impl FatFs {
     fn read_fixed_root16(&self) -> Result<alloc::vec::Vec<DirEntry>, FatError> {
         let mut out = alloc::vec::Vec::new();
         let mut buf = [0u8; SECTOR_SIZE];
+        let mut lfn = LfnBuf::new();
         for s in 0..self.root_dir_sectors as u64 {
             read_sector(self.source, self.root_dir_lba + s, &mut buf)?;
-            if scan_dir_sector(&buf, &mut out) {
+            if scan_dir_sector(&buf, &mut out, &mut lfn) {
                 break;
             }
         }
@@ -1095,13 +1286,14 @@ impl FatFs {
         let mut cluster = start;
         let mut hops = 0u32;
         let mut buf = [0u8; SECTOR_SIZE];
+        let mut lfn = LfnBuf::new();
         loop {
             if !self.valid_cluster(cluster) {
                 return Err(FatError::BadChain);
             }
             for s in 0..self.sec_per_clus as u64 {
                 read_sector(self.source, self.cluster_lba(cluster) + s, &mut buf)?;
-                if scan_dir_sector(&buf, &mut out) {
+                if scan_dir_sector(&buf, &mut out, &mut lfn) {
                     return Ok(out);
                 }
             }
@@ -2327,10 +2519,60 @@ pub fn piusb27_mount_witness() {
                         ":: piusb27: /fs/usb root: {} entries [{}] ::",
                         entries.len(), list
                     );
+                    // PI-FS-3: descend the tree to prove arbitrary-depth subdirectory traversal (root →
+                    // subdir → nested…). Bounded depth guards a malformed self-referential volume.
+                    piusb27_walk_subtree(&fs, &entries, "/fs/usb", 0);
                 }
                 Err(e) => serial_println!(":: piusb27: root read error ({}) ::", fat_reason(e)),
             }
         }
         Err(e) => serial_println!(":: piusb27: no FAT volume ({}) ::", fat_reason(e)),
+    }
+}
+
+/// PI-FS-3: recursively list every subdirectory of `entries` (already-listed contents of the directory
+/// at `prefix`), emitting one witness line per subdirectory with its full path and entry list — the
+/// proof that traversal reaches arbitrary depth (FAT16 fixed root / FAT32 root chain / subdir cluster
+/// chains all resolve through `read_dir`). Skips the `.`/`..` self/parent links so the walk terminates,
+/// and caps depth at 8 as a belt-and-braces guard against a malformed self-referential volume (on top of
+/// `read_dir_chain`'s own chain-loop guard). aarch64-only, mirroring the witness it extends.
+#[cfg(target_arch = "aarch64")]
+fn piusb27_walk_subtree(fs: &FatFs, entries: &[DirEntry], prefix: &str, depth: u32) {
+    if depth >= 8 {
+        return;
+    }
+    for de in entries {
+        if !de.is_dir {
+            continue;
+        }
+        let nm = de.name();
+        if nm == "." || nm == ".." {
+            continue; // self/parent links — do not recurse
+        }
+        let path = alloc::format!("{}/{}", prefix, nm);
+        match fs.read_dir(de.first_cluster()) {
+            Ok(sub) => {
+                let mut list = String::new();
+                for e in &sub {
+                    if list.len() > 200 {
+                        list.push_str(" …");
+                        break;
+                    }
+                    if !list.is_empty() {
+                        list.push_str(", ");
+                    }
+                    list.push_str(e.name());
+                    if e.is_dir {
+                        list.push('/');
+                    }
+                }
+                serial_println!(
+                    ":: piusb27: {} ({} entries) [{}] ::",
+                    path, sub.len(), list
+                );
+                piusb27_walk_subtree(fs, &sub, &path, depth + 1);
+            }
+            Err(e) => serial_println!(":: piusb27: {} read error ({}) ::", path, fat_reason(e)),
+        }
     }
 }
