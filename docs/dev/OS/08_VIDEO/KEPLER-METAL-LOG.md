@@ -3,6 +3,56 @@
 Hard-won silicon facts from the fox-metal sitting series. Trust these over any
 QEMU behavior. Newest sitting first.
 
+## Sitting #12 (display pull 2 + kepler pull 13, UnaOS-gemini@9d22d263, 2026-07-23, fox-metal-r23s1i)
+
+Captures: `~/.claude/plans/unaos/review/rmbp-s12boot1-headdumps.md` (boot 1,
+full rows) and `rmbp-s12boot2-capture.md` (boot 2, raw post-mark). Bench note:
+port labels were crossed — the rMBP serial for boot 1 landed in the
+`pi4-r23s1i/cu.usbserial-ABAFUJCO.log` capture; content-verified rMBP output.
+
+**Boot 1 — head0/head1 differential dump DELIVERED (display pull 2 complete):**
+- Two full trace passes; head 0 dump 49/46 live rows, head 1 dump 40/38 rows,
+  neither capped (96/64 caps were sufficient). HEAD_STAT confirms head 0 alive
+  again (vert/horz counters tick across passes), heads 1–3 stat zero.
+- Offline diff (coordinator decode): 19 offsets differ. Head-0-ONLY rows split
+  into (a) frame-varying values — 0x118/0x314/0x53C all hold the same value
+  (0x0E35 pass 1 → 0x0D9E pass 2) and 0x340/0x344 track the HEAD_STAT raster —
+  i.e. live-scan telemetry, and (b) stable config-shaped rows: 0x310=0x008959E6,
+  0x520=0x00000600, 0x604=0x00780000, 0x614=0x00022500. Rich DIFF rows where
+  head 1 holds near-reset defaults: 0x348/0x34C (0x00310070/0x07380BAF vs
+  0x00060009/0x00050008 — timing-shaped), 0x600 (0x000F4101 vs 0x00000100),
+  0x538 (0x80001200 vs 0x80000000), 0x30C (0x58008000 vs 0x01220000).
+- **The hoped-for clean signature did NOT fall out**: no offset on either pass
+  holds a 0x200/0x20000/0x90020000-shaped value (the GOP surface address in
+  any obvious shift). The scanout surface pointer is not a bare address in the
+  0x616000 head block, or it is encoded (0x310's stable 0x008959E6 is the one
+  address-shaped head-0-only candidate). Write-a-pixel cannot claim a proven
+  target register yet; a decode step stands between us and it.
+
+**Boot 2 — pull-13 flush hypothesis REFUTED (correcting the bench summary):**
+- The first bench read ("aborted before PFLUSH ever printed") was wrong — the
+  grep missed the success-branch marker. The ladder RAN:
+  `flush-executed 0x70000 pre=00000000 post=00000000 iters=1` (register
+  present, not ABSENT/POISON, drained in one iteration) →
+  `WITNESS FAILED - bits stripped` → err=2 unchanged post-restore →
+  post-submit stat=0x5, playlist_rd advances (0x2013/len 0x00100003) →
+  all three PBDMA discriminators CHID=0 ACTIVE=0 → fence timeout at
+  0x2014000, `takeover-abort fence-timeout gp_get=0 ch_stat=11000001`.
+- Verdict: **a PFIFO_FLUSH between instance writes and validate does not stop
+  the VALID/POLL strip.** Engine-side stale-view-of-BAR1-writes, in its
+  flushable form, is refuted. inst-raw confirms our bytes persist
+  (0C=80000000) exactly as s11 found.
+- New evidence for the fallback audit: full RAMFC post-submit dump (16 rows;
+  +08=02002000 userd, +10=0000FACE, +30=FFFFF902, +48/+4C=02001000/00090000)
+  and per-PBDMA eng_mask readbacks (0x01/0x6E/0x10) with ib_put=ib_get=0 —
+  no PBDMA was ever bound to the channel.
+- Boot-2 kdisp side printed `takeover-abort no-match` only (expected — display
+  read-only this sitting).
+
+Sitting #12 complete, both rungs. Fence lane → pull 14 per the pre-committed
+fallbacks (PBDMA CTRL_ADDR TARGET audit; disp-era USERD enablement). Display
+lane → pull 3 shape is a Peter decision (decode-first vs write-and-watch).
+
 ## Sitting #11 (display pull 1 + kepler pull 12, UnaOS-gemini@9eab5823, 2026-07-22, fox-metal-r23s1h)
 
 **Boot 1 — HEAD 0 IS ALIVE AND SCANNING (major canon correction):**
