@@ -182,6 +182,14 @@ pub struct Task {
     /// `dispatch_next` installs it (only if it differs from the live TTBR0); `exit` tears the slot down
     /// (when `asid = user_ttbr0 >> 48` is non-zero).
     user_ttbr0: u64,
+    /// SMP-BAL — the no-migrate flag. `true` = this task has NO hard core affinity and an idle core may
+    /// STEAL it from its current run queue (`try_steal`); `false` = it is PINNED and never migrates. Set
+    /// once at spawn: a `CPU_AUTO` (load-balanced) kernel task is steal-eligible; a task spawned with an
+    /// explicit core index (render/input/pump/backstop/capstone) and EVERY EL0/slot task (which carry
+    /// per-core TTBR0/ASID state) are pinned. Read ONLY under the owning run-queue lock (in `steal_one`),
+    /// mutated ONLY by the stealer while it exclusively owns the popped `Box` (retargeting `cpu`), so it
+    /// never races the owning core's dispatch. Honors the brief's "pinned tasks stay pinned" contract.
+    steal_ok: bool,
 }
 
 /// One CPU's scheduler bookkeeping (interior-mutable atomics, so the array is a plain static).
@@ -545,6 +553,21 @@ impl RunQueue {
         }
         None
     }
+    /// SMP-BAL — remove and return the first STEAL-ELIGIBLE (`steal_ok`) ready task, scanning LOW→HIGH
+    /// priority (take a core's BACKGROUND work first, never rob it of its most-urgent task) and front-
+    /// first within a level (oldest waiter). Pinned tasks (render/input/pump/capstone/EL0) are skipped
+    /// and left in place. Returns `None` if the queue holds only pinned work. Runs on the STEALER's core
+    /// under the VICTIM's run-queue lock; every task here is `STATE_READY` (a running task is out of the
+    /// queue in `current`, a blocked one is in a wait/sleeper list), so a stolen task is always safe to
+    /// re-home. O(ready tasks) worst case, off the switch hot path (only an idle core with an empty queue).
+    fn steal_one(&mut self) -> Option<Box<Task>> {
+        for level in self.levels.iter_mut() {
+            if let Some(pos) = level.iter().position(|t| t.steal_ok) {
+                return level.remove(pos);
+            }
+        }
+        None
+    }
     /// Priority-aging sweep (anti-starvation): RELOCATE every ready task that has now waited at least
     /// `AGE_TICKS` one level UP, carrying any surplus credit to the next sweep. `elapsed` is the aging
     /// units (dispatch passes) since the previous sweep. Run on the OWNING CPU under the run-queue lock.
@@ -903,6 +926,9 @@ fn spawn_inner(
         user_entry: 0,
         user_sp: 0,
         user_ttbr0: 0, // kernel task: no root switch (kernel mappings are Global in every root)
+        // SMP-BAL: a load-balanced (CPU_AUTO) kernel task has no core affinity → steal-eligible. A task
+        // spawned onto an explicit core is pinned there (no-migrate), so stealing never touches it.
+        steal_ok: requested_cpu == CPU_AUTO,
     });
     RUN_QUEUES[cpu].lock().push(task);
     // PI-SCHED-1 — placement witness. The scheduler PINS a task to the caller-chosen core and never
@@ -1015,6 +1041,8 @@ fn spawn_user_inner(
         user_entry,
         user_sp,
         user_ttbr0,
+        // SMP-BAL: EL0/slot tasks carry per-core TTBR0/ASID state — always pinned, never stolen.
+        steal_ok: false,
     });
     RUN_QUEUES[cpu].lock().push(task);
     // PI-SCHED-1 — placement witness for EL0 tasks (the vug/midden GUI-app loads land here — the
@@ -1076,6 +1104,8 @@ pub fn spawn_user_thread(
         user_entry,
         user_sp,
         user_ttbr0,
+        // SMP-BAL: shared-ASID EL0 thread — per-core address-space state, always pinned.
+        steal_ok: false,
     });
     RUN_QUEUES[cpu].lock().push(task);
     #[cfg(feature = "pi")]
@@ -1548,6 +1578,115 @@ pub fn run_until_empty(cpu: usize) {
     while dispatch_next(cpu) {}
 }
 
+// ---------------------------------------------------------------------------------------------
+// SMP-BAL — work stealing: an idle core pulls a steal-eligible task off the most-loaded core
+// ---------------------------------------------------------------------------------------------
+//
+// Placement (`pick_cpu`, SCHED-3) balances at SPAWN, but a task's cost is not known then and wake
+// bursts pile work unevenly AFTER placement (the metal P45 sighting: cores 1-3 "sort of" work but
+// never balance). Stealing is the runtime correction: whenever a core finds its own run queue empty
+// (in `run`), it looks for the most-loaded OTHER core and pulls ONE of its steal-eligible ready tasks
+// over, so backlog drains onto idle silicon instead of waiting behind a saturated core's queue.
+//
+// Protocol (provably race-free against the existing per-core run-queue spinlocks):
+//   1. VICTIM SELECT (lock-free peek): scan online cores != self, pick the one with the deepest run
+//      queue whose depth is >= STEAL_MIN_DEPTH. The floor leaves the last task at home (no ping-pong: a
+//      core with a single task keeps it) and means we only ever move genuine backlog.
+//   2. STEAL (under the victim's lock ONLY): re-read depth (it may have drained since the peek) and, if
+//      still >= the floor, `steal_one()` — remove the first steal-eligible ready task. Pinned tasks are
+//      skipped. The lock is released before we touch our own queue, so only ONE run-queue lock is ever
+//      held at a time — no lock-ordering hazard, no deadlock.
+//   3. RE-HOME (we exclusively own the popped Box): retarget `task.cpu` to self so a later wake returns
+//      it here (the no-migrate invariant is preserved for its NEW home), then push onto our own queue.
+// Soundness: a task sitting in a run queue is always `STATE_READY` (running → out in `current`; blocked
+// → in a wait/sleeper list), and both queues are touched only under their own lock with IRQ masked, so
+// the steal can never race the victim's own `dispatch_next`/`push` or observe a half-built task. Only an
+// idle core steals, and it steals at most one task per empty pass, so it self-limits.
+
+/// Minimum victim run-queue depth to steal from. `2` leaves the last ready task at its home core (a core
+/// with one task is not "loaded"), which prevents two idle cores from ping-ponging a lone task.
+const STEAL_MIN_DEPTH: usize = 2;
+
+/// SMP-BAL — rate limit for the `[smpbal] steal` witness: emit the first `STEAL_LOG_MAX` steals then go
+/// quiet, so a steady rebalancing workload cannot flood the serial log. Introspection only.
+#[cfg(feature = "pi")]
+const STEAL_LOG_MAX: u32 = 12;
+#[cfg(feature = "pi")]
+static STEAL_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// SMP-BAL — an idle `cpu` (empty local queue) tries to steal ONE steal-eligible ready task from the
+/// most-loaded online core. Returns `true` if a task was moved onto `cpu`'s queue (the caller then loops
+/// and dispatches it), `false` if there was nothing worth stealing. IRQ-masked throughout (matching the
+/// run-queue lock contract); acquires at most one run-queue lock at a time.
+fn try_steal(cpu: usize) -> bool {
+    mask_irq();
+    // 1. Peek for the deepest OTHER online queue at/above the floor (lock-free length reads).
+    let mut victim: Option<usize> = None;
+    let mut best_depth = STEAL_MIN_DEPTH - 1;
+    for c in 0..NUM_CPUS {
+        if c == cpu || !ONLINE_MASK[c].load(Ordering::Acquire) {
+            continue;
+        }
+        let depth = RUN_QUEUES[c].lock().len();
+        if depth > best_depth {
+            best_depth = depth;
+            victim = Some(c);
+        }
+    }
+    let Some(v) = victim else {
+        unmask_irq();
+        return false;
+    };
+    // 2. Steal under the victim's lock only (re-check depth — it may have drained since the peek).
+    let stolen = {
+        let mut vq = RUN_QUEUES[v].lock();
+        if vq.len() < STEAL_MIN_DEPTH {
+            None
+        } else {
+            vq.steal_one()
+        }
+    };
+    let Some(mut task) = stolen else {
+        unmask_irq();
+        return false;
+    };
+    // 3. Re-home onto this core and enqueue (we exclusively own the Box here).
+    let name = task.name;
+    task.cpu = cpu as u32;
+    RUN_QUEUES[cpu].lock().push(task);
+    // Rate-limited steal witness (pi-gated: fires on the target + kernel8-test, byte-identical elsewhere).
+    #[cfg(feature = "pi")]
+    if STEAL_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < STEAL_LOG_MAX {
+        serial_println!(":: [smpbal] steal '{}' c{}->c{} ::", name, v, cpu);
+    }
+    #[cfg(not(feature = "pi"))]
+    let _ = name;
+    unmask_irq();
+    true
+}
+
+/// SMP-BAL — the BSP's entry into the scheduler, after it finishes its one-time boot duties (service
+/// spawn + deferred USB enumerate). Mirrors the APs' `wait_and_run`→`run`, minus the `SCHED_GO` wait (the
+/// BSP is the core that SET `SCHED_GO` in `start_aps`, so scheduling is already live). Registers core 0
+/// as an online, scheduling core (so `CPU_AUTO` placement and stealing may use it) and enters the loop;
+/// never returns. Replaces the historical `hlt_loop()` the Pi/tegra BSP parked in.
+///
+/// Why this is safe (the "BSP never schedules" invariants audited):
+///   * MMU/percpu/vectors: all installed on the BSP long before it reaches here (boot path).
+///   * GIC/IRQ routing: distributor config is BSP-only and already done; the PL011 RX SPI is routed to
+///     the input core, not core 0. The BSP running scheduled tasks adds no distributor state.
+///   * ms-clock: the BSP's periodic timer IRQ still runs its tick bookkeeping BEFORE `timer_preempt`, so
+///     the global clock keeps advancing whether or not a task is preempted on core 0.
+///   * meter sentinel: the `c0 = --` display is `tracked()` returning false because core 0 never folded a
+///     load span. Once core 0 runs this loop it folds a busy/idle span every pass → `tracked()` true →
+///     the `SCHED: load` line and `top` show core 0's REAL utilization (the P45 `c0 = --` artifact heals).
+///   * only steal-eligible KERNEL tasks (`CPU_AUTO`) can land on core 0 (via placement or steal); pinned
+///     EL0/render/input tasks never do, so no ASID-0/per-core-window assumption is disturbed.
+pub fn run_bsp(cpu: usize) -> ! {
+    mark_online(cpu);
+    run(cpu)
+}
+
 /// The APs' scheduler loop: dispatch ready tasks forever, idling (WFI on metal / poll in QEMU, via
 /// `arch::hlt`) when the queue is empty until the timer/an IPI makes work. Never returns.
 fn run(cpu: usize) -> ! {
@@ -1565,10 +1704,17 @@ fn run(cpu: usize) -> ! {
         mask_irq();
         drain_due_sleepers(cpu);
         if !dispatch_next(cpu) {
-            // Empty queue: park until the next tick/IPI — WFI on metal, a light poll-spin in QEMU
-            // (no Group-1 timer). This span is idle; it is folded in below along with the rest of the
-            // pass, so it does not matter whether WFI actually sleeps or returns immediately.
-            crate::arch::hlt();
+            // SMP-BAL: local queue is empty — before parking, try to pull a steal-eligible task off the
+            // MOST-loaded core (work redistribution). A successful steal enqueues onto THIS core, so we
+            // loop straight back and `dispatch_next` runs it; nothing is parked. This is what lets an
+            // idle core (incl. the BSP once it runs `run_bsp`) drain a saturated core's backlog. Only an
+            // idle core ever steals, so it never competes with useful local work.
+            if !try_steal(cpu) {
+                // Nothing to steal either: park until the next tick/IPI — WFI on metal, a light poll-spin
+                // in QEMU (no Group-1 timer). This span is idle; it is folded in below along with the
+                // rest of the pass, so it does not matter whether WFI actually sleeps or returns at once.
+                crate::arch::hlt();
+            }
         }
         // SCHED-7: fold EVERY cycle this pass did NOT spend executing a task in as IDLE — the whole
         // pass span (`t_prev`→now) minus the busy span `dispatch_next` already accounted. This closes
@@ -2877,9 +3023,10 @@ pub fn load_accounting_witness() {
 /// busy-poll (SGI delivery being the metal-only half). Call AFTER the BSP's cooperative demo.
 pub fn start_aps(online: &[usize]) {
     // SCHED-3: register every online AP as a candidate for CPU_AUTO load-balanced placement. The BSP
-    // (core 0) never enters `run` on the Pi, so it stays off the candidate set — a CPU_AUTO task only
-    // ever lands on a core that actually drains its run queue. No effect on the caller-pinned spawns
-    // below (they name their core), so the workload placement here is byte-identical.
+    // (core 0) is registered SEPARATELY by `run_bsp` if/when it enters the scheduler after its boot
+    // duties (SMP-BAL); until then it stays off the candidate set — a CPU_AUTO task only ever lands on a
+    // core that actually drains its run queue. No effect on the caller-pinned spawns below (they name
+    // their core), so the workload placement here is byte-identical.
     for &c in online {
         mark_online(c);
     }
@@ -2922,6 +3069,11 @@ pub fn start_aps(online: &[usize]) {
     // guaranteed); the PASS gate was the deterministic placement spread above.
     #[cfg(all(feature = "pi", feature = "witness"))]
     placement_spread_epilogue();
+
+    // SMP-BAL: with the placement/capstone workload drained and the APs idle-polling in `run`, exercise
+    // WORK STEALING end to end — pile movable tasks on one core and prove idle siblings pull them over.
+    #[cfg(all(feature = "pi", feature = "witness"))]
+    smpbal_steal_witness();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2993,6 +3145,96 @@ pub fn placement_spread_epilogue() {
         ran_mask,
         ran_mask.count_ones()
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// SMP-BAL — work-stealing spread witness (QEMU-testable, default-quiet)
+// ---------------------------------------------------------------------------------------------
+//
+// Directly exercises STEALING (not just placement): concentrate N steal-eligible tasks on ONE core with
+// every OTHER online core idle in `run`, then assert the tasks actually RAN on >= 2 distinct cores — the
+// only way that can happen with a single-core spawn is that idle cores pulled the backlog over via
+// `try_steal`. Runs at the END of `start_aps`, after the capstone/placement workload has drained (so the
+// APs are idle-polling in `run`), and stages tasks that each spin briefly so the home core cannot drain
+// the whole pile before its idle siblings steal. `pi`+`witness` gated → byte-identical off the gate.
+
+#[cfg(all(feature = "pi", feature = "witness"))]
+const SMPBAL_N: usize = 4;
+#[cfg(all(feature = "pi", feature = "witness"))]
+static SMPBAL_RAN_MASK: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(all(feature = "pi", feature = "witness"))]
+fn smpbal_worker(_: usize) {
+    let cpu = percpu::this_cpu().cpu_index as usize;
+    SMPBAL_RAN_MASK.fetch_or(1u32 << (cpu & 31), Ordering::Relaxed);
+    busy_delay_ms(3); // hold the core long enough that idle siblings steal the rest of the pile
+}
+
+/// SMP-BAL witness-only spawn: enqueue a STEAL-ELIGIBLE task PINNED to `cpu` (i.e. `steal_ok = true` while
+/// starting concentrated on one core) — the exact runtime state "a movable task is currently queued on a
+/// loaded core". Mirrors `spawn_inner` minus the placement policy/log; used solely by `smpbal_steal_witness`.
+#[cfg(all(feature = "pi", feature = "witness"))]
+fn spawn_stealable_on(name: &'static str, entry: fn(usize), arg: usize, cpu: usize) {
+    let mut stack: Box<[u8]> = alloc::vec![0u8; TASK_STACK_SIZE].into_boxed_slice();
+    let ctx_sp = build_initial_frame(&mut stack, task_trampoline);
+    let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
+    let task = Box::new(Task {
+        id,
+        name,
+        state: AtomicU8::new(STATE_READY),
+        ctx_sp,
+        stack,
+        entry,
+        arg,
+        cpu: cpu as u32,
+        priority: PRIO_NORMAL,
+        wait_ticks: 0,
+        done_sem: None,
+        user_entry: 0,
+        user_sp: 0,
+        user_ttbr0: 0,
+        steal_ok: true, // the point of the fixture: movable, but staged on one core
+    });
+    RUN_QUEUES[cpu].lock().push(task);
+    poke_cpu(cpu);
+}
+
+/// SMP-BAL — the deliverable-4 spread test. Pile `SMPBAL_N` steal-eligible tasks on ONE online core while
+/// the others idle in `run`, wait a bounded window, and PASS iff they ran on >= 2 distinct cores (proving
+/// idle cores stole the backlog). Runs LAST in `start_aps` (APs already idle post-capstone). Emits
+/// `:: SMPBAL: spread test — tasks=N cores-used=M :: PASS ::`.
+#[cfg(all(feature = "pi", feature = "witness"))]
+pub fn smpbal_steal_witness() {
+    let online: alloc::vec::Vec<usize> = (0..NUM_CPUS)
+        .filter(|&c| ONLINE_MASK[c].load(Ordering::Acquire))
+        .collect();
+    if online.len() < 2 {
+        serial_println!(
+            ":: SMPBAL: spread test SKIP (needs >= 2 online cores, have {}) ::",
+            online.len()
+        );
+        return;
+    }
+    let home = online[0];
+    SMPBAL_RAN_MASK.store(0, Ordering::Relaxed);
+    for _ in 0..SMPBAL_N {
+        spawn_stealable_on("smpbal", smpbal_worker, 0, home);
+    }
+    // Give the idle siblings time to steal + everyone to drain (each worker spins ~3 ms).
+    busy_delay_ms(60);
+    let mask = SMPBAL_RAN_MASK.load(Ordering::Relaxed);
+    let used = mask.count_ones();
+    if used >= 2 {
+        serial_println!(
+            ":: SMPBAL: spread test — tasks={} cores-used={} :: PASS ::",
+            SMPBAL_N, used
+        );
+    } else {
+        serial_println!(
+            ":: SMPBAL: spread test — tasks={} cores-used={} (mask {:#06b}) :: FAIL ::",
+            SMPBAL_N, used, mask
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

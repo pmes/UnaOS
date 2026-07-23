@@ -33,7 +33,9 @@ device interrupts are enabled:
 
 The **BSP is never scheduled** — it remains the hardware-service core (it drives
 xHCI/storage, the NIC, and the console in `kernel_main`'s loop). The scheduler
-runs application work on the APs.
+runs application work on the APs. (aarch64 SMP-BAL changes this on the Pi: once
+the BSP finishes its boot duties it enters the scheduler via `run_bsp` and becomes
+a schedulable, steal-eligible core — see §2, *BSP scheduling + work stealing*.)
 
 Boot evidence: `APIC: x2APIC software-enabled (id=0…3)`, `SMP: AP 1/2/3 online`.
 
@@ -180,6 +182,70 @@ that share this module.
 > `orphan-reaper` in `main.rs`) is the follow-up that spreads those services in
 > practice; those files are outside the scheduler lane, so SCHED-3 lands the
 > mechanism + witness and leaves the call-site conversion to a net/main arc.
+
+### BSP scheduling + work stealing (aarch64, SMP-BAL)
+
+SCHED-3 balances at **spawn**, but a task's cost is unknown then and wake bursts
+pile work unevenly *after* placement. On metal (P45) cores 1–3 "sort of" worked
+but never balanced, and core 0 showed `--` forever because the Pi BSP finished its
+boot duties and `hlt_loop`ed **outside** the scheduler. SMP-BAL closes both gaps.
+
+**1. BSP into the scheduler.** `run_bsp(cpu)` is the BSP's entry into the
+scheduler loop, called after it finishes its one-time boot duties (service spawn +
+deferred USB enumerate) in place of the historical `hlt_loop()`. It mirrors the
+APs' `wait_and_run` → `run` (minus the `SCHED_GO` wait — the BSP is the core that
+*set* `SCHED_GO`), and it `mark_online`s core 0 so placement and stealing may use
+it. The "BSP never schedules" invariants were audited and hold: MMU/percpu/vectors
+are up long before; GIC distributor config is BSP-only and already done (PL011 RX
+is routed to the input core, not core 0); the periodic timer IRQ still runs its
+ms-clock tick *before* `timer_preempt`, so the global clock keeps advancing whether
+or not a task is preempted on core 0; and only steal-eligible **kernel** tasks can
+land on core 0, so no EL0/ASID-0 window assumption is disturbed. Once core 0 folds
+a load span every pass, `tracked()` flips true and the `SCHED: load` line / `top`
+show core 0's **real** utilization — the P45 `c0 = --` artifact heals with no meter
+change (it was already honest; the BSP simply now produces live data).
+
+> The one call-site that swaps `hlt_loop()` → `run_bsp(0)` lives in `main.rs`
+> (`kernel_main`, the Pi GUI+AP path), which is outside the scheduler lane. SMP-BAL
+> lands the `run_bsp` entry + the invariant audit; the one-line wire-up is a
+> deferred `main.rs` diff (see the arc's landing report). Until it lands, core 0
+> stays honestly `--`; stealing among the APs is unaffected.
+
+**2. Work stealing.** The `Task.steal_ok` flag is the no-migrate control: a
+`CPU_AUTO` kernel task is steal-eligible; a task pinned to an explicit core
+(render/input/pump/backstop/capstone) and **every** EL0/slot task (which carry
+per-core TTBR0/ASID state) are pinned and never move. Whenever a core finds its own
+run queue empty in `run`, `try_steal` runs before it parks:
+
+1. **Victim select** (lock-free length peek): the online core ≠ self with the
+   deepest run queue, provided its depth ≥ `STEAL_MIN_DEPTH = 2` (the floor leaves
+   the last task at home, so two idle cores never ping-pong a lone task).
+2. **Steal** under the victim's run-queue lock *only*: re-check depth (it may have
+   drained), then `steal_one` — remove the first steal-eligible ready task,
+   scanning **low → high** priority (take background work first, never rob a core
+   of its most-urgent task). Pinned tasks are skipped.
+3. **Re-home**: retarget `task.cpu` to self (preserving the no-migrate invariant
+   for its new home) and push onto the local queue; the loop then dispatches it.
+
+**Race-freedom.** Every task in a run queue is `STATE_READY` (running → out in
+`current`, blocked → in a wait/sleeper list), so a stolen task is always safe to
+move; both queues are touched only under their own lock with IRQ masked; and **at
+most one** run-queue lock is held at a time (victim lock released before the local
+push), so there is no lock-ordering hazard. Only an idle core steals, at most one
+task per empty pass, so it self-limits and never competes with useful local work.
+Capstone/render/input tasks are pinned, so stealing cannot perturb them — CAPSTONE
+6/6 stays green with stealing active.
+
+**Witnesses.** A rate-limited (`STEAL_LOG_MAX = 12`) `:: [smpbal] steal '<task>'
+c<from>-><to> ::` line per steal, and the spread test `smpbal_steal_witness`
+(last in `start_aps`): it piles `SMPBAL_N = 4` steal-eligible tasks on one core
+while the others idle in `run`, then asserts they ran on ≥ 2 distinct cores —
+`:: SMPBAL: spread test — tasks=4 cores-used=2 :: PASS ::`. A single-core spawn can
+only reach two cores if idle cores stole the backlog, so this directly proves the
+steal path (not just placement). Both are `all(feature = "pi", feature =
+"witness")` gated — armed for `kernel8-test`, byte-identical for the default boot
+and the jetson/virt builds. The `SCHED: task ... -> core N (policy: ...)` line is
+the spawn-placement decision witness (already present from SCHED-3).
 
 ### Orphan-reaper wake on enqueue (aarch64, SCHED-4b)
 
