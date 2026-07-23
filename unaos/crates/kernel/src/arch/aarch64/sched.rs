@@ -332,6 +332,13 @@ struct CoreAccount {
     win_idle_cyc: AtomicU64,
     /// Busy percent (0..=100) of the last COMPLETED window, or `LOAD_PCT_NONE` before the first.
     recent_pct: AtomicU32,
+    /// SCHED-8 — CNTPCT timestamp of the most recent `account()` fold (0 = never accounted). A core
+    /// running `run()` folds a busy OR idle span every dispatch pass, so this stays fresh; a core that
+    /// left `run()` (the Pi/tegra BSP `hlt_loop`s after spawning services; the virt boot core spin-loops
+    /// after CAPSTONE drains) stops folding, so this freezes and `tracked()` reports the slot STALE. That
+    /// is what makes the `SCHED: load` line print `--` for an untracked core instead of the last window's
+    /// frozen percent (the c0=100% artifact): honest "no current data" over a fabricated number.
+    last_acct_cyc: AtomicU64,
     /// Seqlock sequence for the last-task triple: even = stable, odd = write in progress.
     last_seq: AtomicU64,
     /// Id of the last task dispatched here (0 = none yet).
@@ -350,6 +357,7 @@ impl CoreAccount {
             win_busy_cyc: AtomicU64::new(0),
             win_idle_cyc: AtomicU64::new(0),
             recent_pct: AtomicU32::new(LOAD_PCT_NONE),
+            last_acct_cyc: AtomicU64::new(0),
             last_seq: AtomicU64::new(0),
             last_id: AtomicU64::new(0),
             last_name_ptr: AtomicUsize::new(0),
@@ -364,6 +372,9 @@ impl CoreAccount {
     /// Relaxed loads/stores are sound because only this core's scheduler loop ever writes its slot.
     #[inline]
     fn account(&self, busy_cyc: u64, idle_cyc: u64) {
+        // SCHED-8: mark the slot fresh — every dispatch pass in `run()` folds a span, so a core still
+        // inside the scheduler keeps this current; a core that left `run()` stops touching it (goes STALE).
+        self.last_acct_cyc.store(now_cyc(), Ordering::Relaxed);
         let busy = self.win_busy_cyc.load(Ordering::Relaxed) + busy_cyc;
         let idle = self.win_idle_cyc.load(Ordering::Relaxed) + idle_cyc;
         let total = busy + idle;
@@ -404,6 +415,21 @@ impl CoreAccount {
         } else {
             (busy * 100 / total) as u32
         }
+    }
+
+    /// SCHED-8 — is this core's load being accounted RIGHT NOW? True when the owning core folded a span
+    /// within the last ~2 load windows (~500 ms): i.e. it is inside `run()`, folding a busy or idle span
+    /// every dispatch pass. False when the slot has never been touched (never-scheduled core) or has gone
+    /// stale — the core left the scheduler loop (the Pi/tegra BSP `hlt_loop`; the virt boot core's post-
+    /// CAPSTONE spin) and its `recent_pct` is a frozen snapshot, not a live number. Untracked cores are
+    /// reported `--` rather than that frozen percent. Two windows of slack absorbs a slow rollover so a
+    /// genuinely-scheduled core is never mislabeled stale.
+    fn tracked(&self) -> bool {
+        let last = self.last_acct_cyc.load(Ordering::Relaxed);
+        if last == 0 {
+            return false; // never accounted — this core has not run the scheduler loop
+        }
+        now_cyc().wrapping_sub(last) < load_window_cyc().saturating_mul(2)
     }
 
     /// Read the last-task triple with a bounded seqlock retry. `&'static str` reconstruction is sound:
@@ -450,6 +476,12 @@ pub struct CoreLoad {
     pub last_task_id: u64,
     /// Name of the last task dispatched on this core ("-" = none yet).
     pub last_task: &'static str,
+    /// SCHED-8 — is `busy_pct_recent` a LIVE number? True when this core is currently inside `run()`
+    /// (folding a span every dispatch pass); false when its accounting slot is stale — the core left the
+    /// scheduler loop (BSP `hlt_loop` / post-CAPSTONE spin) or never ran it, so `busy_pct_recent` is a
+    /// frozen last-window snapshot. Honest views (`SCHED: load` line, `top`) render an untracked core as
+    /// `--`; the liveness gate still reads the raw `busy_pct_recent`/`ctx_switches` so it stays green.
+    pub tracked: bool,
 }
 
 /// SCHED-2 — read this core's live load: recent busy percent (rolling window), cumulative context
@@ -457,7 +489,7 @@ pub struct CoreLoad {
 /// (the shell `top` verb, the witnesses). Introspection only — never consulted on a scheduling path.
 pub fn core_load(core: usize) -> CoreLoad {
     if core >= NUM_CPUS {
-        return CoreLoad { busy_pct_recent: 0, ctx_switches: 0, last_task_id: 0, last_task: "-" };
+        return CoreLoad { busy_pct_recent: 0, ctx_switches: 0, last_task_id: 0, last_task: "-", tracked: false };
     }
     let acct = &ACCT[core];
     let (last_task_id, last_task) = acct.last_task();
@@ -466,6 +498,7 @@ pub fn core_load(core: usize) -> CoreLoad {
         ctx_switches: acct.ctx_switches.load(Ordering::Relaxed),
         last_task_id,
         last_task,
+        tracked: acct.tracked(),
     }
 }
 
@@ -2464,16 +2497,27 @@ fn load_witness_tick() {
     let mut ctx_now = 0u64;
     for cpu in 0..NUM_CPUS.min(8) {
         let ld = core_load(cpu);
-        packed |= (ld.busy_pct_recent.min(255) as u64) << (cpu * 8);
+        // SCHED-8: pack 255 for an untracked (stale/never-run) core so a tracked→untracked transition
+        // changes the signature and re-emits the line; real percents are 0..100 so 255 never collides.
+        let byte = if ld.tracked { ld.busy_pct_recent.min(254) as u64 } else { 255 };
+        packed |= byte << (cpu * 8);
         ctx_now += ld.ctx_switches;
     }
     if packed == LOAD_WITNESS_LAST.swap(packed, Ordering::Relaxed) {
         return; // unchanged since the last window — stay quiet
     }
     let ctx_delta = ctx_now.saturating_sub(LOAD_WITNESS_CTX.swap(ctx_now, Ordering::Relaxed));
-    let c = |i: usize| core_load(i).busy_pct_recent;
+    // SCHED-8: an untracked core prints `--` (no live number) rather than its frozen last-window percent.
+    let c = |i: usize| {
+        let ld = core_load(i);
+        if ld.tracked {
+            alloc::format!("{}%", ld.busy_pct_recent)
+        } else {
+            alloc::string::String::from("--")
+        }
+    };
     serial_println!(
-        ":: SCHED: load c0={}% c1={}% c2={}% c3={}% (ctx +{}/win) ::",
+        ":: SCHED: load c0={} c1={} c2={} c3={} (ctx +{}/win) ::",
         c(0), c(1), c(2), c(3), ctx_delta
     );
 }
@@ -2485,9 +2529,16 @@ pub fn load_table(mut line: impl FnMut(&str)) {
     line("core  busy%  ctx-switches  last-task");
     for cpu in 0..NUM_CPUS {
         let ld = core_load(cpu);
+        // SCHED-8: `--` for a core not being accounted right now (left `run()` / never ran it), so the
+        // busy% column never shows a frozen snapshot as if it were live.
+        let busy = if ld.tracked {
+            alloc::format!("{}", ld.busy_pct_recent)
+        } else {
+            alloc::string::String::from("--")
+        };
         line(&alloc::format!(
             "{:>3}   {:>4}   {:>11}   {} (tid {})",
-            cpu, ld.busy_pct_recent, ld.ctx_switches, ld.last_task, ld.last_task_id
+            cpu, busy, ld.ctx_switches, ld.last_task, ld.last_task_id
         ));
     }
 }

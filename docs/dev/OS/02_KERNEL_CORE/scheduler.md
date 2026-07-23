@@ -100,6 +100,22 @@ a **busy** pass (a task was dispatched) or an **idle** pass (empty run queue).
   provably idle (render parked in `recv`, usb-pump ~60 cyc / 4 ms). Folding
   wall-minus-busy makes busy% == task-execution / wall-time regardless of whether
   WFI sleeps, so those cores now read their true near-0%.
+- **Untracked cores read `--`, not a frozen percent (SCHED-8).** SCHED-7 fixed
+  cores *inside* `run()`; a core that *leaves* the scheduler loop is a separate
+  hole. The Pi/tegra boot core spawns its services then `hlt_loop`s (it never runs
+  `run()` on the fb path); the virt boot core spin-loops after CAPSTONE drains.
+  Such a core stops folding spans, so its `recent_pct` freezes at the last window
+  it completed — on the Pi that was ~100% (the BSP was busy cooperatively draining
+  boot tasks), which then printed a permanent `c0=100%` even though the BSP was
+  idle in WFI. The fix stamps `last_acct_cyc` on every `account()` fold and adds
+  `CoreLoad::tracked`: a slot untouched for >2 windows (~500 ms), or never touched,
+  is **stale** — the core is not being accounted right now. Honest views (the
+  `SCHED: load` heartbeat and the `top`/`load_table` verb) render an untracked
+  core as `--` rather than its frozen snapshot; the liveness gate still reads the
+  raw `busy_pct_recent`/`ctx_switches`, so `load-accounting PASS` is unaffected.
+  Self-healing: a core re-entering `run()` refreshes the stamp and reports live
+  numbers again. General across boards — the same guard covers the x86 BSP inline
+  loop and any parked/never-scheduled core.
 - **Context-switch count.** A cumulative `ctx_switches` per core (one per busy
   dispatch).
 - **Last-scheduled task.** Id + `&'static str` name of the last task dispatched
