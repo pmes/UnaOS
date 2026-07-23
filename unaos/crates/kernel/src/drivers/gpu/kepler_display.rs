@@ -15,7 +15,7 @@
 // uncited register addresses; bounded polls.
 
 use super::detect::GpuInfo;
-use super::kepler::{mmio_read, mmio_write, regs, VramAllocator};
+use super::kepler::{mmio_read, regs, VramAllocator};
 
 /// Sentinel value for a read that returned the BAD-read pattern (BAR0 unmapped
 /// or device-absent 0xFFFFFFFF) or literal zero from a register we expected to
