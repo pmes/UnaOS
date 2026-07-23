@@ -1398,6 +1398,20 @@ mod metal {
         if frq == 0 { 0 } else { (cnt.wrapping_mul(1_000) / frq) as i64 }
     }
 
+    /// PI-NET-19: the raw free-running counter (CNTPCT) and its frequency, for a cheap in-loop cost probe.
+    /// Returns `(count, frq_hz)`; a `count` delta divided by `frq/1_000_000` is the elapsed microseconds.
+    /// Not CPU cycles (CNTPCT runs at a fixed ~54 MHz on the BCM2711), but a stable, always-available
+    /// wall-time tick — enough to quantify that one idle poll iteration is microseconds, not milliseconds.
+    #[inline]
+    fn now_cyc() -> (u64, u64) {
+        let (cnt, frq): (u64, u64);
+        unsafe {
+            core::arch::asm!("mrs {}, cntpct_el0", out(reg) cnt, options(nomem, nostack, preserves_flags));
+            core::arch::asm!("mrs {}, cntfrq_el0", out(reg) frq, options(nomem, nostack, preserves_flags));
+        }
+        (cnt, frq)
+    }
+
     // ── Raw L2 accessors over the GENET_DEVICE registry (the shared smoltcp Device seam) ──
     fn raw_rx(out: &mut [u8]) -> Option<usize> {
         GENET_DEVICE.lock().as_mut().and_then(|n| n.rx_frame_raw(out))
@@ -2783,9 +2797,27 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
         }
     }
 
-    /// Poll cadence: 1 per-core tick ≈ 4 ms at the 250 Hz aarch64 generic-timer tick.
+    /// Poll cadence: 1 per-core tick ≈ 4 ms at the 250 Hz aarch64 generic-timer tick. This is the BUSY
+    /// floor — the sleep the poll uses whenever the interface is doing real work (a reply just went out,
+    /// an HTTP transfer is mid-flight, an mDNS answer landed). See NET-19 for the idle backoff.
     const NET9_POLL_TICKS: u64 = 1;
     const NET9_POLL_MS: u64 = 4;
+    /// PI-NET-19 — idle backoff. The `SCHED: load` metric is a fraction of *dispatch passes* (busy vs an
+    /// empty-run-queue idle pass), not CPU time: at the 4 ms floor net9 produces roughly one busy pass
+    /// per idle WFI pass, so an idle NIC pins core-1 at ~50% even though the poll body itself costs only
+    /// a few microseconds (see the `[net19]` witness). The cure is to wake LESS OFTEN when nothing is
+    /// being served: after a couple of quiet rounds the sleep grows geometrically toward the cap, and any
+    /// real activity (a reply emitted, an HTTP socket active, an mDNS/DNS-SD/NSEC answer, a reap) snaps
+    /// it straight back to the 4 ms floor. Protocol behaviour is unchanged — a first ARP who-has / TCP
+    /// SYN / mDNS query is answered at most one backed-off period (≤ NET19_IDLE_CAP_TICKS) late, then the
+    /// activity it produces pulls the cadence back to 4 ms for the duration of the exchange. This is an
+    /// idle-cost fix, NOT a move to interrupt-driven polling (GENET IRQs stay unproven on metal).
+    const NET19_IDLE_CAP_TICKS: u64 = 12; // ~48 ms ceiling: ~1 busy pass / ~12 idle passes ⇒ well <10%
+    /// Grow only after this many consecutive quiet rounds, so a lone quiet poll between two exchanges
+    /// doesn't cost the next packet a backed-off period of latency.
+    const NET19_IDLE_GRACE: u32 = 2;
+    /// `[net19]` witness floor: at most once per ~5 s (mirrors the other net witnesses), plus one line on
+    /// any change of the backoff cadence so the transition into/out of idle is always on the record.
     /// Rate-limit floor for the `[net9]` witness: at most once per ~5 s, unless ≥16 new replies landed.
     const NET9_REPORT_MS: i64 = 5_000;
     const NET9_REPORT_DELTA: u32 = 16;
@@ -2813,10 +2845,22 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
         let mut last_census_report_ms: i64 = 0;
         let mut last_reaped = 0u32;
         let mut was_saturated = false;
+        // PI-NET-19: idle-backoff state. `backoff` is the sleep in ticks for the NEXT round (starts at
+        // the 4 ms floor); `quiet_rounds` counts consecutive rounds with no serviced activity; `last_sig`
+        // is the fold of every emission/service counter, so a change in it is the "we did real work"
+        // signal that resets the cadence. The `[net19]` witness carries the measured cost + cadence.
+        let mut backoff = NET9_POLL_TICKS;
+        let mut quiet_rounds = 0u32;
+        let mut last_sig = 0u64;
+        let mut last_backoff = backoff;
+        let mut last_net19_report_ms: i64 = 0;
         loop {
-            crate::arch::sched::sleep_ticks(NET9_POLL_TICKS);
+            crate::arch::sched::sleep_ticks(backoff);
             let t = now_ms();
             let mut census = (0u32, 0u32);
+            // PI-NET-19: bracket the service body with the free-running counter to quantify one iteration's
+            // real cost. This is what proves the 50% load was a pass-counting artifact, not 2 ms of work.
+            let (cyc0, frq) = now_cyc();
             if let Some(ns) = NET_SERVICE.lock().as_mut() {
                 ns.iface.poll(Instant::from_millis(t), &mut ns.dev, &mut ns.sockets);
                 // PI-NET-10/12: one bounded HTTP service step (pool re-listen, drain, serve, idle-reap).
@@ -2831,6 +2875,9 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
                 ns.sntp_step(t);
                 census = ns.http_census();
             }
+            let (cyc1, _) = now_cyc();
+            let iter_cyc = cyc1.wrapping_sub(cyc0);
+            let iter_us = if frq == 0 { 0 } else { iter_cyc.wrapping_mul(1_000_000) / frq };
             let (arp, icmp) = net9_counts();
             if arp != last_arp || icmp != last_icmp {
                 let delta = arp.wrapping_sub(last_arp) + icmp.wrapping_sub(last_icmp);
@@ -2908,6 +2955,46 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
                 last_reaped = reaped;
             }
             was_saturated = saturated;
+
+            // ── PI-NET-19: idle backoff + witness ──────────────────────────────────────────────────────
+            // Activity signal = the fold of every emission/service counter plus "an HTTP socket is active".
+            // Raw multicast we merely drain (background mDNS chatter for other names) does NOT bump any of
+            // these, so it does not keep the cadence hot — only work we actually did for the wire does.
+            let sig = arp as u64
+                + icmp as u64
+                + served as u64
+                + answered as u64
+                + net17.0 as u64
+                + net17.1 as u64
+                + net17.2 as u64
+                + net18 as u64
+                + reaped as u64;
+            let busy_now = sig != last_sig || active > 0;
+            last_sig = sig;
+            if busy_now {
+                // Real work (or an in-flight connection): snap back to the 4 ms floor for responsiveness.
+                quiet_rounds = 0;
+                backoff = NET9_POLL_TICKS;
+            } else {
+                quiet_rounds = quiet_rounds.saturating_add(1);
+                if quiet_rounds > NET19_IDLE_GRACE {
+                    // Geometric growth toward the cap: 1 → 2 → 4 → 8 → 12 ticks (≈4 → 48 ms).
+                    backoff = (backoff.saturating_mul(2)).min(NET19_IDLE_CAP_TICKS);
+                }
+            }
+            // Witness: change-only on the cadence, with a ~5 s floor so a steady idle state prints one line
+            // then stays quiet. Carries the measured per-iteration cost (counter ticks + µs) — the proof
+            // that one poll is microseconds, not the ~2 ms a 50%/4 ms reading would imply — and the live
+            // backoff state (sleep ticks/ms + consecutive quiet rounds).
+            let cadence_changed = backoff != last_backoff;
+            if cadence_changed || t.saturating_sub(last_net19_report_ms) >= NET9_REPORT_MS {
+                serial_println!(
+                    "{} [net19] poll cost {} cyc (~{} us) | backoff {} ticks (~{} ms) quiet={} ::",
+                    PG, iter_cyc, iter_us, backoff, backoff * NET9_POLL_MS, quiet_rounds
+                );
+                last_backoff = backoff;
+                last_net19_report_ms = t;
+            }
         }
     }
 
