@@ -272,6 +272,21 @@ pub fn init(gpu: &GpuInfo) {
 
                                     // USERD_SNOOP (0x2a1c) scrubbed: tested inert on GK107 (sitting #10). Never re-propose.
 
+                                    // PFLUSH (0x70000) execution
+                                    let flush_pre = mmio_read(bar0, 0x70000);
+                                    if flush_pre == 0xFFFFFFFF || flush_pre == 0xBAD0BA20 {
+                                        serial_println!(":: kepler: PFLUSH (0x70000) ABSENT/POISON pre={:08X} ::", flush_pre);
+                                    } else {
+                                        mmio_write(bar0, 0x70000, 1); // TRIGGER
+                                        let mut flush_post = mmio_read(bar0, 0x70000);
+                                        let mut iters = 0;
+                                        while (flush_post & 2) != 0 && iters < 10000 { // Poll BUSY bit (bit 1)
+                                            core::hint::spin_loop();
+                                            flush_post = mmio_read(bar0, 0x70000);
+                                            iters += 1;
+                                        }
+                                        serial_println!(":: kepler: flush-executed 0x70000 pre={:08X} post={:08X} iters={} ::", flush_pre, flush_post, iters);
+                                    }
                                     // 2. Bind and Enable PFIFO_CHAN for all test CHIDs (including 7, since entry_2 == 7)
                                     for ch in [1, 2, 3, 7].iter() {
                                         let offset = *ch as usize * 8;
