@@ -238,20 +238,37 @@ pub fn init(gpu: &GpuInfo) {
                                     let ib_4c = unsafe { core::ptr::read_volatile((bar1 + inst_off + 0x4C) as *const u32) };
                                     serial_println!(":: kepler: inst-raw 08={:08X} 0C={:08X} 48={:08X} 4C={:08X} ::", ib_08, ib_0c, ib_48, ib_4c);
 
-                                    // Bind Channel to PFIFO_CHAN (GK104)
-                                    // inst_off >> 12 | 0x80000000
-                                    mmio_write(bar0, 0x800000 + (chan_id as usize * 8), 0x80000000 | ((inst_off as u32) >> 12));
-                                    // Enable Channel
-                                    mmio_write(bar0, 0x800004 + (chan_id as usize * 8), 0x00000400);
+                                    let chid_0 = 1;
+                                    let chid_1 = 2;
+                                    let chid_2 = 3;
+                                    let entry_0 = chid_0;
+                                    let entry_1 = chid_1 | (1 << 31);
+                                    let entry_2 = (chid_2 << 1) | 1;
 
-                                    // Add to Runlist
+                                    // 1. Write Runlist VRAM FIRST
                                     unsafe {
-                                        core::ptr::write_volatile((bar1 + runlist_off) as *mut u32, chan_id);
+                                        core::ptr::write_volatile((bar1 + runlist_off) as *mut u32, entry_0);
                                         core::ptr::write_volatile((bar1 + runlist_off + 4) as *mut u32, 0);
+                                        core::ptr::write_volatile((bar1 + runlist_off + 8) as *mut u32, entry_1);
+                                        core::ptr::write_volatile((bar1 + runlist_off + 12) as *mut u32, 0);
+                                        core::ptr::write_volatile((bar1 + runlist_off + 16) as *mut u32, entry_2);
+                                        core::ptr::write_volatile((bar1 + runlist_off + 20) as *mut u32, 0);
                                     }
+
+                                    // 2. Bind and Enable PFIFO_CHAN for all test CHIDs (including 7, since entry_2 == 7)
+                                    for ch in [1, 2, 3, 7].iter() {
+                                        mmio_write(bar0, 0x800000 + (*ch as usize * 8), 0x80000000 | ((inst_off as u32) >> 12));
+                                        mmio_write(bar0, 0x800004 + (*ch as usize * 8), 0x00000400);
+                                    }
+
+                                    let ch_1_0_pre = mmio_read(bar0, 0x800000 + (1 * 8));
+                                    let ch_1_4_pre = mmio_read(bar0, 0x800004 + (1 * 8));
+                                    serial_println!(":: kepler: PFIFO_CHAN[1] pre-submit: 00={:08X} 04={:08X} ::", ch_1_0_pre, ch_1_4_pre);
+
+                                    // 3. Submit Runlist
                                     mmio_write(bar0, 0x2270, (runlist_off as u32) >> 12); // target=0 (VRAM), addr
-                                    mmio_write(bar0, 0x2274, 1); // count=1, runl=0
-                                    serial_println!("[NVIDIA] Configured Runlist and bound channel (chan_id={}).", chan_id);
+                                    mmio_write(bar0, 0x2274, 3); // LEN=3, ENG=0
+                                    serial_println!("[NVIDIA] Configured Runlist and bound channel. Fuzz entries: [0]={:08X} [1]={:08X} [2]={:08X}", entry_0, entry_1, entry_2);
 
                                     // Wait for PLAYLIST_RD to accept the runlist
                                     serial_println!("[NVIDIA] Polling PLAYLIST_RD for engine 0 (waiting for runlist acceptance)...");
@@ -268,6 +285,29 @@ pub fn init(gpu: &GpuInfo) {
                                         }
                                     }
                                     serial_println!(":: kepler: post-bind playlist_rd={:08X} playlist_rd_len={:08X} ::", pl_rd, pl_rd_len);
+
+                                    let ch_1_0_post = mmio_read(bar0, 0x800000 + (1 * 8));
+                                    let ch_1_4_post = mmio_read(bar0, 0x800004 + (1 * 8));
+                                    serial_println!(":: kepler: PFIFO_CHAN[1] post-submit: 00={:08X} 04={:08X} ::", ch_1_0_post, ch_1_4_post);
+
+                                    // Discriminator readback
+                                    for i in 0..3 {
+                                        let pbdma_base = 0x40000 + (i * 0x2000);
+                                        let ch = mmio_read(bar0, pbdma_base + 0x120);
+                                        let chid_active = ch & 0xFFF;
+                                        let is_active = (ch >> 13) & 1;
+                                        serial_println!(":: kepler: DISCRIMINATOR pbdma{} ch={:08X} (CHID={} ACTIVE={}) ::", i, ch, chid_active, is_active);
+                                    }
+
+                                    // RAMFC Dump
+                                    serial_println!(":: kepler: RAMFC DUMP POST-SUBMIT ::");
+                                    for offset in (0..0x80).step_by(16) {
+                                        let w0 = unsafe { core::ptr::read_volatile((bar1 + inst_off + offset) as *const u32) };
+                                        let w1 = unsafe { core::ptr::read_volatile((bar1 + inst_off + offset + 4) as *const u32) };
+                                        let w2 = unsafe { core::ptr::read_volatile((bar1 + inst_off + offset + 8) as *const u32) };
+                                        let w3 = unsafe { core::ptr::read_volatile((bar1 + inst_off + offset + 12) as *const u32) };
+                                        serial_println!(":: kepler: RAMFC +{:02X}: {:08X} {:08X} {:08X} {:08X} ::", offset, w0, w1, w2, w3);
+                                    }
 
                                     // Write Pushbuffer payload (A06F GPFIFO class host semaphore release)
                                     let pb_base = bar1 + pb_off;

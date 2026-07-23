@@ -69,9 +69,13 @@ pub struct BootInfo {
     pub mode_action: u32,
 
     #[cfg(feature = "unaos_ivb")]
-    pub igpu_trace_1: [u32; 8],
+    pub igpu_trace_0: [u32; 11],
     #[cfg(feature = "unaos_ivb")]
-    pub igpu_trace_2: [u32; 8],
+    pub igpu_trace_1: [u32; 11],
+    #[cfg(feature = "unaos_ivb")]
+    pub igpu_trace_2: [u32; 11],
+    #[cfg(feature = "unaos_ivb")]
+    pub gmux_trace_0: [u32; 4],
     #[cfg(feature = "unaos_ivb")]
     pub igpu_trace_valid: bool,
 }
