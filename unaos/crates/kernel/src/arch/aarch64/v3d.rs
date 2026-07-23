@@ -1675,6 +1675,92 @@ fn sf(buf: &mut [u8], start: usize, width: usize, val: u64) {
     set_bits(buf, start, width, val);
 }
 
+/// Read one LSB-first field of `width` bits at ABSOLUTE bit `start` out of a raw struct buffer — the
+/// inverse of `sf`/`set_bits`. Used by the [v3d38] record-diff witness to decode a GL Shader State
+/// Record field-by-field straight out of the arena bytes.
+#[inline]
+fn gf(buf: &[u8], mut bit: usize, mut width: usize) -> u64 {
+    let mut out: u64 = 0;
+    let mut shift = 0;
+    while width > 0 {
+        let byte = bit / 8;
+        let off = bit % 8;
+        let take = core::cmp::min(8 - off, width);
+        let mask = ((1u64 << take) - 1) as u8;
+        let chunk = ((buf[byte] >> off) & mask) as u64;
+        out |= chunk << shift;
+        shift += take;
+        bit += take;
+        width -= take;
+    }
+    out
+}
+
+/// [v3d38] witness: field-by-field dump + DIFF of the two 36-byte GL Shader State Records — the probe's
+/// (at OFF_PROBE_SHADREC) and the confirmed-dispatching M4's (at OFF_SHADREC) — decoded per the v42
+/// genxml "GL Shader State Record" layout. Both records must already be published to the arena. Every
+/// field is printed for both records; a field that differs is annotated `DIFF`. This is the witness for
+/// V3D-38's thesis that, with the two binning CLs proven byte-identical (v3d36) and threading refuted
+/// both ways (v3d37), the RECORD CONTENTS the GL_SHADER_STATE pointer selects are the last variable.
+fn witness_shadrec_diff() {
+    // Copy both 36-byte records out of the arena.
+    let mut p = [0u8; 36];
+    let mut m = [0u8; 36];
+    for i in 0..36 {
+        p[i] = arena_byte(OFF_PROBE_SHADREC + i);
+        m[i] = arena_byte(OFF_SHADREC + i);
+    }
+    // (name, bit start, width) per the v42 GL Shader State Record. Address fields are stored pre-shifted
+    // (>>3 for the 29-bit code fields); the raw extracted value is printed as-is.
+    let fields: [(&str, usize, usize); 22] = [
+        ("point_size_in_shaded_vertex_data", 0, 1),
+        ("enable_clipping", 1, 1),
+        ("vertex_id_read_by_coord", 2, 1),
+        ("instance_id_read_by_coord", 3, 1),
+        ("fs_number_of_varyings", 24, 8),
+        ("cs_output_vpm_segment_size", 32, 4),
+        ("cs_input_vpm_segment_size", 40, 4),
+        ("vs_output_vpm_segment_size", 48, 4),
+        ("vs_input_vpm_segment_size", 56, 4),
+        ("default_attr_values_addr", 64, 32),
+        ("fs_4way_threadable", 96, 1),
+        ("fs_single_seg", 97, 1),
+        ("fs_propagate_nans", 98, 1),
+        ("fs_code_addr>>3", 99, 29),
+        ("fs_uniforms_addr", 128, 32),
+        ("vs_4way_threadable", 160, 1),
+        ("vs_2way_threadable", 161, 1),
+        ("vs_code_addr>>3", 163, 29),
+        ("vs_uniforms_addr", 192, 32),
+        ("cs_4way_threadable", 224, 1),
+        ("cs_code_addr>>3", 227, 29),
+        ("cs_uniforms_addr", 256, 32),
+    ];
+    serial_println!(
+        ":: V3D: [v3d38] GL Shader State Record field diff — PROBE @{:#010x} vs M4 @{:#010x} (v42 layout; both records published to RAM) ::",
+        (arena_phys() + OFF_PROBE_SHADREC) as u32,
+        (arena_phys() + OFF_SHADREC) as u32
+    );
+    let mut ndiff = 0u32;
+    for (name, start, width) in fields.iter() {
+        let pv = gf(&p, *start, *width);
+        let mv = gf(&m, *start, *width);
+        let diff = pv != mv;
+        if diff {
+            ndiff += 1;
+        }
+        serial_println!(
+            ":: V3D: [v3d38]   {:<32} probe={:#010x} M4={:#010x} {} ::",
+            name, pv, mv,
+            if diff { "<-- DIFF" } else { "==" }
+        );
+    }
+    serial_println!(
+        ":: V3D: [v3d38] record diff summary — {} field(s) differ. Post-borrow the FS/VS slots should read `==` (probe now shares M4's known-good FS+VS); only the CS code/uniform pointers should carry the probe's TMU-store program. ::",
+        ndiff
+    );
+}
+
 /// Build the GL Shader State Record (v42, 36 bytes) at OFF_SHADREC and one GL Shader State Attribute
 /// Record (16 bytes) immediately after it. Layout VERBATIM from Mesa `v3d_packet.xml` struct
 /// "GL Shader State Record" (max_ver=42) + "GL Shader State Attribute Record"; field values follow
@@ -2165,6 +2251,15 @@ fn build_probe_shader_record() -> u32 {
     let unif = (arena_phys() + OFF_PROBE_UNIF) as u64;
     let defaults = (arena_phys() + OFF_DEFAULT_ATTRS) as u64;
     let vtx = (arena_phys() + OFF_VTXDATA) as u64;
+    // V3D-38 BORROW: the FS/VS slots now point at M4's KNOWN-GOOD fragment + vertex programs (published by
+    // triangle_job before probe_job runs; cleaned to RAM in probe_job's clean batch). See the FS/VS emit
+    // block below for the rationale — a bin-only job executes only the CS, so borrowing M4's validated
+    // FS/VS while keeping the probe's TMU-store program in the CS slot is semantically safe and removes the
+    // last record-content variable the hardware might validate/prefetch at bin time.
+    let fs = (arena_phys() + OFF_FS_CODE) as u64;
+    let vs = (arena_phys() + OFF_VS_CODE) as u64;
+    let fs_unif = (arena_phys() + OFF_FS_UNIF) as u64;
+    let vs_unif = (arena_phys() + OFF_VS_UNIF) as u64;
 
     let mut rec = [0u8; 36];
     sf(&mut rec, 1, 1, 1); // Enable clipping
@@ -2175,8 +2270,14 @@ fn build_probe_shader_record() -> u32 {
     sf(&mut rec, 48, 4, 1); // Vertex Shader output VPM segment size
     sf(&mut rec, 56, 4, 0); // Vertex Shader input VPM segment size
     sf(&mut rec, 64, 32, defaults); // Address of default attribute values
-    // FS / VS slots (never executed in a bin-only job) — point at the probe code + uniforms so every
-    // address field is a valid arena pointer.
+    // FS / VS slots — V3D-38 BORROW: the bin-only job executes ONLY the CS, so the FS/VS slots are never
+    // dispatched. Prior arcs pointed them at the probe program (a VS-shaped, multi-segment TMU-store coord
+    // shader with mid-shader thrsw) — a nonsense program to sit in the FS slot. Even at bin time the
+    // hardware may VALIDATE or PREFETCH the FS/VS descriptors (single-seg/flags/addr) as part of accepting
+    // the shader-state record, and refuse the whole dispatch on a malformed FS. Point the FS/VS slots at
+    // M4's KNOWN-GOOD, provably-dispatching fragment/vertex programs + their uniform streams; only the CS
+    // keeps the probe's TMU-store program. This removes the last record-content variable while keeping the
+    // probe's purpose intact (the store fires at bin time from the CS). See the [v3d38] record diff.
     // GL Shader State Record per-shader flag group (Mesa `v3dX(pack)`, v3d_packet_v42.xml / v3d_emit.c):
     // bit0 = 4-way threadable = (prog_data.base.threads == 4), bit1 = 2-way threadable = (threads == 2),
     // bit2 = propagate NaNs.
@@ -2198,12 +2299,12 @@ fn build_probe_shader_record() -> u32 {
     // targets, and the next boot's [v3d35] reading is its verdict. PROBE_WORDS stays byte-verbatim.
     sf(&mut rec, 96, 1, 1); // FS 4-way threadable (mirror the M4 record)
     sf(&mut rec, 98, 1, 1); // FS propagate NaNs (v42)
-    sf(&mut rec, 99, 29, code >> 3); // FS code address
-    sf(&mut rec, 128, 32, unif); // FS uniforms address
+    sf(&mut rec, 99, 29, fs >> 3); // FS code address — V3D-38 BORROW: M4's known-good fragment shader
+    sf(&mut rec, 128, 32, fs_unif); // FS uniforms address — M4's FS stream (colour + TLB config)
     sf(&mut rec, 160, 1, 1); // VS 4-way threadable (mirror the M4 record)
     sf(&mut rec, 162, 1, 1); // VS propagate NaNs (v42)
-    sf(&mut rec, 163, 29, code >> 3); // VS code address
-    sf(&mut rec, 192, 32, unif); // VS uniforms address
+    sf(&mut rec, 163, 29, vs >> 3); // VS code address — V3D-38 BORROW: M4's known-good vertex shader
+    sf(&mut rec, 192, 32, vs_unif); // VS uniforms address — M4's VS read-offset stream
     // Coord shader — the one the bin runs. V3D-36: 4-WAY threadable, matching the M4 coord shader that
     // provably dispatches (valid_instr=55). The 2-way declaration (V3D-32) is the dispatch regression the
     // P34 capture caught (valid_instr=0).
@@ -2243,6 +2344,10 @@ fn probe_job() {
     let unif_len = write_probe_uniforms(OFF_PROBE_UNIF, scratch_v3d);
     let num_attrs = build_probe_shader_record();
     let bin_len = build_bin_cl_generic(OFF_PROBE_BIN_CL, OFF_PROBE_SHADREC, num_attrs);
+    // V3D-38: publish the M4 shader-state record now (triangle_job builds it again identically after us)
+    // so the [v3d38] field diff below can decode the confirmed-dispatching M4 record alongside the probe's.
+    // Idempotent — writes OFF_SHADREC from the same M4 FS/VS/CS addresses triangle_job already published.
+    build_shader_record();
     // Seed the store target (words 0..4) with the 0x55 "never-landed" sentinel and the tail (words
     // 4..PROBE_CANARY_WORDS) with per-index canaries 0xCA00_00NN, so a wrong-address landing inside the
     // page is caught by which canary flipped rather than masquerading as an untouched sentinel.
@@ -2260,6 +2365,23 @@ fn probe_job() {
     cache::clean_range(arena_phys() + OFF_PROBE_SCRATCH, PROBE_CANARY_BYTES);
     cache::clean_range(arena_phys() + OFF_VTXDATA, TRI_VERTS.len() * 16);
     cache::clean_range(arena_phys() + OFF_DEFAULT_ATTRS, 16);
+    // V3D-38 BORROW: the probe record now points its FS/VS slots at M4's known-good programs + uniform
+    // streams. triangle_job wrote those bytes before calling probe_job but does not clean them until AFTER
+    // us, so flush them to RAM here — the non-coherent GPU must see M4's real FS/VS at bin time, not stale
+    // DRAM. Also flush the M4 record we just published for the [v3d38] witness.
+    cache::clean_range(arena_phys() + OFF_FS_CODE, FS_WORDS.len() * 8);
+    cache::clean_range(arena_phys() + OFF_VS_CODE, CS_VS_WORDS.len() * 8);
+    cache::clean_range(arena_phys() + OFF_FS_UNIF, 6 * 4);
+    cache::clean_range(arena_phys() + OFF_VS_UNIF, 11 * 4);
+    cache::clean_range(arena_phys() + OFF_SHADREC, 36 + 16);
+
+    // ── [v3d38] shader-state record field diff (probe vs confirmed-dispatching M4) ────────────────
+    // With the two binning CLs proven byte-identical (v3d36) and CS threading refuted both 2-way and 4-way
+    // (v3d37, clean counters), the RECORD the GL_SHADER_STATE pointer selects is the last variable. Dump
+    // both 36-byte records field-by-field so the difference is decidable from the log. Post-V3D-38-borrow
+    // the FS/VS fields read `==` (probe shares M4's FS+VS); only the CS code/uniform pointers still carry
+    // the probe's TMU-store program.
+    witness_shadrec_diff();
 
     // ── [v3d36] PROBE bin CL structural decode ──────────────────────────────────────────────────
     // Put the probe's binning CL on serial packet-by-packet, so it can be diffed against the M4 bin CL
