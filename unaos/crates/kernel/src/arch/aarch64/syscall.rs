@@ -4097,7 +4097,11 @@ fn deferred_free_pop() -> Option<u32> {
 /// HERE: EL1, IRQs enabled, its own stack, never in teardown context). When the queue is empty it `yield_now`s,
 /// so on QEMU raspi4b's cooperative scheduler (no timer preemption) it cedes its core to the launcher/verdict
 /// tasks and never hogs it. The `arg` is unused (the `fn(usize)` service-task shape). Never returns.
+/// SCHED-4: sleeps between sweeps (100 ms cadence) to avoid monopolizing a core when the queue is empty.
+/// At 250 Hz, 1 tick ≈ 4 ms, so 25 ticks ≈ 100 ms. When orphans arrive during the block I/O phase they
+/// wake immediately (the sleep is preempted by the scheduler's timer); between arrivals the core idles.
 pub fn orphan_reaper(_: usize) {
+    const REAPER_SLEEP_TICKS: u64 = 25; // ~100 ms at 250 Hz
     loop {
         match deferred_free_pop() {
             Some(fc) => {
@@ -4110,7 +4114,7 @@ pub fn orphan_reaper(_: usize) {
                     serial_println!("U11-defer: reaper freed teardown-orphaned chain @cluster {}", fc);
                 }
             }
-            None => super::sched::yield_now(),
+            None => super::sched::sleep_ticks(REAPER_SLEEP_TICKS),
         }
     }
 }
