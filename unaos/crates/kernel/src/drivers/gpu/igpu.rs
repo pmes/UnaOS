@@ -41,7 +41,14 @@ pub mod regs {
     pub const GTT_BASE: usize = 0x200000;
 }
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
+static PROBED: AtomicBool = AtomicBool::new(false);
+
 pub fn init(gpu: &GpuInfo) {
+    if PROBED.swap(true, Ordering::SeqCst) {
+        return;
+    }
     serial_println!("[Intel iGPU] Initializing Ivy Bridge GT2 at BDF {}:{}:{}", gpu.bus, gpu.slot, gpu.func);
 
     let bar0 = gpu.bar0_phys as usize;

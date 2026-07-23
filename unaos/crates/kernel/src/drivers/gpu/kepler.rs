@@ -209,7 +209,7 @@ pub fn init(gpu: &GpuInfo) {
                                         }
                                     }
 
-                                    let chan_id = 0;
+                                    let chan_id = 1;
 
                                     // Setup Channel Instance Block
                                     unsafe {
@@ -218,8 +218,8 @@ pub fn init(gpu: &GpuInfo) {
                                         core::ptr::write_volatile((bar1 + inst_off + 0x10) as *mut u32, 0x0000face);
                                         core::ptr::write_volatile((bar1 + inst_off + 0x30) as *mut u32, 0xfffff902);
                                         core::ptr::write_volatile((bar1 + inst_off + 0x48) as *mut u32, (gpfifo_off & 0xFFFFFFFF) as u32);
-                                        // limit2 = (0x1000 / 8) - 1 = 511
-                                        core::ptr::write_volatile((bar1 + inst_off + 0x4C) as *mut u32, ((gpfifo_off >> 32) as u32) | (511 << 16));
+                                        // limit2 = ORDER 9 (512 entries)
+                                        core::ptr::write_volatile((bar1 + inst_off + 0x4C) as *mut u32, ((gpfifo_off >> 32) as u32) | (9 << 16));
                                         core::ptr::write_volatile((bar1 + inst_off + 0x84) as *mut u32, 0x20400000);
                                         core::ptr::write_volatile((bar1 + inst_off + 0x94) as *mut u32, 0x30000000); // VRAM devm=0
                                         core::ptr::write_volatile((bar1 + inst_off + 0x9C) as *mut u32, 0x00000100);
@@ -251,7 +251,20 @@ pub fn init(gpu: &GpuInfo) {
                                     }
                                     mmio_write(bar0, 0x2270, (runlist_off as u32) >> 12); // target=0 (VRAM), addr
                                     mmio_write(bar0, 0x2274, 1); // count=1, runl=0
-                                    serial_println!("[NVIDIA] Configured Runlist and bound channel.");
+                                    serial_println!("[NVIDIA] Configured Runlist and bound channel (chan_id={}).", chan_id);
+
+                                    // Wait for PLAYLIST_RD to accept the runlist
+                                    serial_println!("[NVIDIA] Polling PLAYLIST_RD for engine 0 (waiting for runlist acceptance)...");
+                                    let mut pl_rd = 0;
+                                    let mut pl_rd_len = 0;
+                                    for _ in 0..10_000_000 {
+                                        pl_rd = mmio_read(bar0, 0x2280);
+                                        pl_rd_len = mmio_read(bar0, 0x2284);
+                                        if pl_rd == ((runlist_off as u32) >> 12) && (pl_rd_len & 0xFFF) == 1 {
+                                            break;
+                                        }
+                                    }
+                                    serial_println!(":: kepler: post-bind playlist_rd={:08X} playlist_rd_len={:08X} ::", pl_rd, pl_rd_len);
 
                                     // Write Pushbuffer payload (A06F GPFIFO class host semaphore release)
                                     let pb_base = bar1 + pb_off;
