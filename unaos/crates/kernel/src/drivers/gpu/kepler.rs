@@ -255,11 +255,25 @@ pub fn init(gpu: &GpuInfo) {
                                         core::ptr::write_volatile((bar1 + runlist_off + 20) as *mut u32, 0);
                                     }
 
+                                    let read_sched_status = |label: &str| {
+                                        let err = mmio_read(bar0, 0x252c);
+                                        let stat = mmio_read(bar0, 0x263c);
+                                        let err_str = if err == 0 || err == 0xFFFFFFFF || err == 0xBAD0BA20 { "absent?" } else { "present" };
+                                        serial_println!(":: kepler: sched-status {} err={:08X} ({}) stat={:08X} ::", label, err, err_str, stat);
+                                    };
+
+                                    read_sched_status("pre-init");
+
                                     // 2. Bind and Enable PFIFO_CHAN for all test CHIDs (including 7, since entry_2 == 7)
                                     for ch in [1, 2, 3, 7].iter() {
-                                        mmio_write(bar0, 0x800000 + (*ch as usize * 8), 0x80000000 | ((inst_off as u32) >> 12));
-                                        mmio_write(bar0, 0x800004 + (*ch as usize * 8), 0x00000400);
+                                        let offset = *ch as usize * 8;
+                                        // Ordering: Invalidate -> Modify State -> Validate (with POLL_ENABLE bit 30)
+                                        mmio_write(bar0, 0x800000 + offset, 0); 
+                                        mmio_write(bar0, 0x800004 + offset, 0x00000400); 
+                                        mmio_write(bar0, 0x800000 + offset, 0xC0000000 | ((inst_off as u32) >> 12)); 
                                     }
+
+                                    read_sched_status("post-init");
 
                                     let ch_1_0_pre = mmio_read(bar0, 0x800000 + (1 * 8));
                                     let ch_1_4_pre = mmio_read(bar0, 0x800004 + (1 * 8));
@@ -285,6 +299,7 @@ pub fn init(gpu: &GpuInfo) {
                                         }
                                     }
                                     serial_println!(":: kepler: post-bind playlist_rd={:08X} playlist_rd_len={:08X} ::", pl_rd, pl_rd_len);
+                                    read_sched_status("post-submit");
 
                                     let ch_1_0_post = mmio_read(bar0, 0x800000 + (1 * 8));
                                     let ch_1_4_post = mmio_read(bar0, 0x800004 + (1 * 8));
