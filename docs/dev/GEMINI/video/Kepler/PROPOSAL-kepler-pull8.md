@@ -1,55 +1,43 @@
-# PROPOSAL — Kepler wall-2 pull 8: runlist-entry and channel-bind derivation
+# PROPOSAL — Kepler Pull 8: Runlist-Entry & Channel Bind Derivation
 
-STATUS: PROPOSED
+This proposal addresses the wall upstream of the PBDMA from sitting #6, where the channel is never scheduled onto a PBDMA. Using `envytools/rnndb/fifo/gf100_pfifo.xml`, we decode the failed `inst-raw` and the runlist mechanics to break the wall.
 
-## a. GK107 runlist entry format vs our channel id
+## a. GK107 Runlist Entry Format
+**Diagnosis**: In `kepler.rs`, we populate the runlist entry as just `chan_id` (0).
+- In `gf100_pfifo.xml`, there is no explicit VRAM struct for the playlist entry. However, the channel ID on GK104 is definitively 12 bits (`CHID` field in `PSUBFIFO.CH` at `0x120`).
+- While writing `0` is structurally an integer channel ID, channel `0` might be treated as a null/invalid entry by the hardware scheduler.
+- **Fix**: We will allocate `chan_id = 1` instead of `0` to ensure the entry isn't ignored as an empty slot, and we will write it as a 32-bit word (`chan_id`).
 
-The runlist entry for GK104-family GPUs is an 8-byte (64-bit) structure in memory. Our current implementation writes the channel ID `chan_id = 0` to the first 4 bytes, and `0` to the next 4 bytes:
-```rust
-core::ptr::write_volatile((bar1 + runlist_off) as *mut u32, chan_id);
-core::ptr::write_volatile((bar1 + runlist_off + 4) as *mut u32, 0);
-```
-Per `rnndb/fifo/gf100_pfifo.xml` and related structures, the `CHID` is generally 12 bits on GK104 (`CHID` variants `GK104-`). No other bits are strictly required to be non-zero for a basic valid entry (there is no "valid" bit in the entry itself, its presence in the array defines its existence). Thus, `0x00000000_00000000` correctly specifies Channel 0. Our entry format is well-formed.
+## b. RAMFC/Instance-Block Fields Validation
+**Diagnosis**: The scheduler DMAs the RAMFC (Instance Block) in VRAM directly into the `PSUBFIFO` MMIO registers (base `0x40000`). Our `inst-raw` writes matched `PSUBFIFO` offsets, but with a fatal formatting error in `IB_CONFIG`.
 
-## b. RAMFC / instance-block fields the scheduler validates
+**Decode against rnndb (`gf100_pfifo.xml`, `array name="PSUBFIFO"`):**
+- `0x08`: `CTRL_ADDR_LOW` (Target/Addr for `USERD`). We wrote `userd_off & 0xFFFFFFFF`. Since `ADDR_LOW` is `shr="12"` and `TARGET` is bits 0-1 (0 = VRAM), writing the raw page-aligned address coincidentally sets the right bits.
+- `0x0C`: `CTRL_ADDR_HIGH`. We wrote `userd_off >> 32` (0). Correct.
+- `0x48`: `IB_ADDRESS_LOW` (GPFIFO base). We wrote `gpfifo_off & 0xFFFFFFFF`. Correct.
+- `0x4C`: `IB_CONFIG`. **FATAL ERROR.**
+  - `gf100_pfifo.xml` defines `IB_CONFIG` as: bits 0..7 `ADDRESS_HIGH`, bits 16..31 `ORDER`.
+  - We wrote `(gpfifo_off >> 32) | (511 << 16)`.
+  - We treated bits 16..31 as a length/limit (511 for a 512-entry ring). BUT `ORDER` is a logarithm (`log2(entries)`).
+  - Writing `511` to `ORDER` means $2^{511}$ entries! The scheduler sees an invalid GPFIFO size and refuses to bind the channel.
+  - **Fix**: `ORDER` for 512 entries must be `9` (`log2(512)`). Write `(gpfifo_off >> 32) | (9 << 16)`.
 
-The `inst-raw` values from sitting #6 map perfectly to the `PSUBFIFO` domain (which serves as the RAMFC instance block layout) in `envytools/rnndb/fifo/gf100_pfifo.xml`:
+## c. Runlist Submit/Commit Ordering vs Channel-Enable
+**Diagnosis**: In `kepler.rs`, we:
+1. Bound channel to engine `0x80000000 | inst_off >> 12`
+2. Enabled channel (`0x800004` = `0x00000400`)
+3. Submitted Runlist (`PLAYLIST_WR` and `PLAYLIST_WR_LEN`)
+- According to standard scheduling flow, the channel must be enabled *before* or *during* the runlist update so the scheduler sees it as runnable when evaluating the new runlist. The order used in `kepler.rs` is generally correct, but we must ensure we wait for `PLAYLIST_RD` to acknowledge the new runlist.
 
-- `08=0x02002000`: Maps to `CTRL_ADDR_LOW`. Bits 0-1 are `TARGET` (0 = VRAM), bits 12-31 are `ADDR_LOW`. Matches our USERD offset `0x2002000`.
-- `0C=0`: Maps to `CTRL_ADDR_HIGH`. Matches our USERD high bits.
-- `48=0x02001000`: Maps to `IB_ADDRESS_LOW`. Matches our GPFIFO offset `0x2001000`.
-- `4C=0x01FF0000`: Maps to `IB_CONFIG`. Bits 0-7 are `ADDRESS_HIGH` (0), bits 16-31 are `ORDER` (511). Matches our GPFIFO length config.
+## d. Which Runlist?
+**Diagnosis**: On GK104, there is a per-engine runlist.
+- In `kepler.rs`, we wrote `1` to `PLAYLIST_WR_LEN` (`0x2274`).
+- Per `gf100_pfifo.xml`, `PLAYLIST_WR_LEN` bits 20..23 are the `ENG` field (`type="gf100_pfifo_engine"`). Writing `1` sets `LEN=1` and `ENG=0`.
+- Engine `0` is PGRAPH. This is correct because we bound PBDMA 0 to Engine 0 (PGRAPH) in `SUBFIFO_ENG_MASK`.
+- **Fix**: The runlist targeting is correct (`ENG=0`). We will keep using this runlist.
 
-The scheduler validates these fields. A potential issue is `TARGET` mapping. In `CTRL_ADDR_LOW` (0x08), we wrote `0x02002000`. Bits 0-1 are `TARGET`. On GF100/GK104, a `TARGET` of `0` in this context may not map to VRAM depending on the GMMU setup, or it may require specific flags. However, assuming standard `g80_mem_target` mappings, 0 = VRAM.
-The missing element is likely related to **engine binding/RAMFC alignment** or missing flags in the upper fields (which we populated from Kepler-specific offsets like 0x84, 0x94, etc., not fully detailed in the GF100 `PSUBFIFO` xml but valid for GK104).
+## e. Deduplication
+- We will deduplicate the `igpu.rs` probe run by adding a guard against re-entry (using an `AtomicBool` or static flag) to ensure the PCI walk doesn't double-probe the Ivy Bridge iGPU.
 
-## c. Runlist submit/commit ordering vs channel-enable
-
-Our current sequence:
-1. `mmio_write` to `0x800000` (PFIFO_CHAN_PTR)
-2. `mmio_write` to `0x800004` (PFIFO_CHAN_ENABLE) -> **Channel Enabled**
-3. Memory writes to construct the runlist.
-4. `mmio_write` to `0x2270` (PLAYLIST_WR)
-5. `mmio_write` to `0x2274` (PLAYLIST_WR_LEN) -> **Runlist Submitted**
-
-**Correction required:** We must submit the runlist (and wait for it to be accepted/committed) *before* enabling the channel, or at least ensure the channel is disabled, the runlist is committed, and *then* the channel is enabled. If a channel is enabled but not in an active runlist, the scheduler may immediately fault it or hang the binding process.
-We will flip the sequence: Write Runlist -> Commit (PLAYLIST_WR/LEN) -> Enable Channel.
-
-## d. Which runlist?
-
-On GK104, `PLAYLIST_WR_LEN` (0x2274) contains an `ENG` field at bits 20-23 (`variants="GK104-" type="gf100_pfifo_engine"`).
-We are writing `1` to `PLAYLIST_WR_LEN`, which implies `LEN=1` and `ENG=0` (PGRAPH).
-If the channel does not use PGRAPH (engine 0) or the PGRAPH engine is powered down or not fully initialized by our bare-bones driver, the scheduler will fail to bind the channel to the PGRAPH PBDMA. 
-We should submit to the `NONE` engine (`ENG=0x1F`) or `PCOPY0` (`ENG=4`) if we only want PFIFO methods, or we must ensure we use an active engine's runlist. We will submit to engine `0` (PGRAPH) but ensure `PGRAPH` is powered/masked, or alternatively submit to the Copy Engine `PCOPY0` (4) or `NONE` (0x1F) to test if the scheduler binds it.
-*Implementation Plan:* We will submit to `ENG=0x1F` (NONE) and `ENG=0` (PGRAPH) sequentially if needed, but first, we will fix the order. Let's write `(0x1F << 20) | 1` to `PLAYLIST_WR_LEN` to target the `NONE` / generic PFIFO runlist to bypass PGRAPH dependencies, or just `(0 << 20) | 1` but after fixing the submit order.
-
-## Implementation Details (Pull 8)
-
-1. **Reorder Initialization:**
-   Construct Runlist -> Commit Runlist to `PLAYLIST_WR` -> Enable Channel `PFIFO_CHAN_ENABLE`.
-2. **Dedupe Double Probe:**
-   We will add a static `static ATTEMPTED: AtomicBool = AtomicBool::new(false);` in `kepler::init` to immediately return if already initialized, preventing the PCI walk from double-initializing the GPU.
-
-## Verification
-- We will arm the gate `UNAOS_IVB+UNAOS_KEPLER+UNAOS_KEPLER_TAKEOVER+UNAOS_KEPLER_FIFO`.
-- A successful run will finally show `ib_get` advance from `ib_put`, meaning the PBDMA has bound the channel and processed the Host Semaphore Release.
+## Cleanroom Debt
+We will remove the `GF119` EVO comment at line `~465` of `kepler.rs` and replace it with an honest empirically probed note or an rnndb citation if applicable.
