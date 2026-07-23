@@ -829,6 +829,13 @@ pub struct DeviceSlot {
     /// = no keys held. Seeded to zero at enumeration and cleared on slot reuse.
     pub keyboard_prev_keys: [u8; 6],
 
+    /// HID-LED: current keyboard lock-LED bitmap for this slot (USB HID Output report,
+    /// LED usage page): bit0 = Num Lock, bit1 = Caps Lock, bit2 = Scroll Lock. Toggled on
+    /// the press edge of the corresponding lock key and pushed to the device via SET_REPORT
+    /// (0x21/0x09, wValue 0x0200). Caps also feeds the ascii case logic so the lit LED and the
+    /// typed case agree. Seeded to zero at enumeration and cleared on slot reuse.
+    pub keyboard_leds: u8,
+
     pub descriptor_buffer: *mut u8,
 
     /// Physical address of the STATUS TRB of the async EP0 TD the enumeration FSM is
@@ -924,6 +931,7 @@ impl DeviceSlot {
             keyboard_expect_phys: 0,
             keyboard_report_count: 0,
             keyboard_prev_keys: [0; 6],
+            keyboard_leds: 0,
             descriptor_buffer: desc_buffer,
             ep0_expect_phys: 0,
             is_downstream: false,
@@ -996,6 +1004,7 @@ impl DeviceSlot {
         self.keyboard_expect_phys = 0;
         self.keyboard_report_count = 0;
         self.keyboard_prev_keys = [0; 6];
+        self.keyboard_leds = 0;
         self.ep0_expect_phys = 0;
         self.is_downstream = false;
         self.route_string = 0;
@@ -2223,6 +2232,12 @@ impl XhciController {
                                             // Bytes 2-7: Key codes (up to 6 simultaneous keys)
                                             let modifiers = report[0];
                                             let shift = (modifiers & 0x22) != 0; // L-Shift (bit 1) or R-Shift (bit 5)
+                                            // HID-LED: current caps-lock LED state feeds the ascii case
+                                            // logic so the lit LED and the typed case agree. Caps only
+                                            // inverts case for the alphabetic keycodes (0x04..=0x1D =
+                                            // a..z); digits/symbols are unaffected (caps XOR shift would
+                                            // wrongly shift them). effective_shift = shift ^ (caps & is_letter).
+                                            let caps = (self.slots[slot_id as usize].keyboard_leds & 0x02) != 0;
 
                                             // HID-KEYS: snapshot this report's keycodes and the
                                             // previous report's, so releases (a code present last
@@ -2243,7 +2258,9 @@ impl XhciController {
 
                                                 if (keycode as usize) < HID_SCANCODE_TO_ASCII.len() {
                                                     let (unshifted, shifted) = HID_SCANCODE_TO_ASCII[keycode as usize];
-                                                    let ascii = if shift { shifted } else { unshifted };
+                                                    let is_letter = (0x04..=0x1D).contains(&keycode);
+                                                    let eff_shift = shift ^ (caps & is_letter);
+                                                    let ascii = if eff_shift { shifted } else { unshifted };
                                                     if ascii != 0 {
                                                         serial_println!("xHCI: KEY: '{}' (scancode {:#x})", ascii as char, keycode);
                                                         crate::pal::push_event(crate::pal::Event::Key(ascii));
@@ -2262,7 +2279,9 @@ impl XhciController {
                                                 if cur_keys.contains(&keycode) { continue; } // still held
                                                 if (keycode as usize) < HID_SCANCODE_TO_ASCII.len() {
                                                     let (unshifted, shifted) = HID_SCANCODE_TO_ASCII[keycode as usize];
-                                                    let ascii = if shift { shifted } else { unshifted };
+                                                    let is_letter = (0x04..=0x1D).contains(&keycode);
+                                                    let eff_shift = shift ^ (caps & is_letter);
+                                                    let ascii = if eff_shift { shifted } else { unshifted };
                                                     if ascii != 0 {
                                                         #[cfg(feature = "usbdebug")]
                                                         serial_println!("[hidkeys] keyup '{}' (scancode {:#x}) slot={}", ascii as char, keycode, slot_id);
@@ -2272,6 +2291,27 @@ impl XhciController {
                                             }
 
                                             self.slots[slot_id as usize].keyboard_prev_keys = cur_keys;
+
+                                            // HID-LED: lock-key press edges. A lock key present in this
+                                            // report but absent last report is a fresh press — toggle the
+                                            // matching LED bit and push the new bitmap to the device via
+                                            // SET_REPORT. Caps Lock (0x39, bit1) is the one Peter observed
+                                            // never lighting; Num Lock (0x53, bit0) and Scroll Lock (0x47,
+                                            // bit2) are toggled the same way for LED/state agreement.
+                                            let mut leds_changed = false;
+                                            for &(usage, bit) in &[(0x39u8, 0x02u8), (0x53u8, 0x01u8), (0x47u8, 0x04u8)] {
+                                                let pressed_now = cur_keys.contains(&usage);
+                                                let pressed_before = prev_keys.contains(&usage);
+                                                if pressed_now && !pressed_before {
+                                                    self.slots[slot_id as usize].keyboard_leds ^= bit;
+                                                    leds_changed = true;
+                                                }
+                                            }
+                                            if leds_changed {
+                                                let kbd_intf = self.slots[slot_id as usize].keyboard_intf;
+                                                self.set_hid_leds(slot_id as u8, kbd_intf);
+                                            }
+
                                             self.queue_keyboard_read(slot_id as u8);
                                         }
                                     } else if hub_int_dci == Some(endpoint_id as u8) {
@@ -4738,6 +4778,30 @@ impl XhciController {
             Ok(1) => serial_println!("[hidkeys] set-idle ok slot={} iface={}", slot, intf),
             Ok(code) => serial_println!("[hidkeys] set-idle nak slot={} iface={} (code {})", slot, intf, code),
             Err(()) => serial_println!("[hidkeys] set-idle nak slot={} iface={} (EP0 timeout)", slot, intf),
+        }
+    }
+
+    /// HID-LED: push this slot's current keyboard lock-LED bitmap to the device via SET_REPORT —
+    /// bmRequestType 0x21 (host->device, class, interface recipient), bRequest 0x09 (SET_REPORT),
+    /// wValue 0x0200 (report-type Output (0x02) << 8 | report-id 0), wIndex = interface, one data
+    /// byte OUT carrying the LED bitmap (bit0 Num, bit1 Caps, bit2 Scroll). The byte is staged in
+    /// this slot's descriptor_buffer (idle at report time — enumeration is long done). Best-effort:
+    /// logs a single `[hidled] caps=<0|1> set-report <ok|nak> slot=N` witness and tolerates a
+    /// NAK/STALL/timeout (some devices lack a settable Output report; the state is still tracked).
+    fn set_hid_leds(&mut self, slot: u8, intf: u8) {
+        let leds = self.slots[slot as usize].keyboard_leds;
+        let caps = (leds >> 1) & 1;
+        let buf = self.slots[slot as usize].descriptor_buffer;
+        if buf.is_null() {
+            serial_println!("[hidled] caps={} set-report nak slot={} (no buffer)", caps, slot);
+            return;
+        }
+        unsafe { core::ptr::write(buf, leds); }
+        let buf_phys = buf as u64;
+        match self.sync_control(slot, 0x21, 0x09, 0x0200, intf as u16, 1, buf_phys, false) {
+            Ok(1) => serial_println!("[hidled] caps={} set-report ok slot={}", caps, slot),
+            Ok(code) => serial_println!("[hidled] caps={} set-report nak slot={} (code {})", caps, slot, code),
+            Err(()) => serial_println!("[hidled] caps={} set-report nak slot={} (EP0 timeout)", caps, slot),
         }
     }
 
