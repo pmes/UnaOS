@@ -1353,10 +1353,14 @@ fn pi_ls_collect(path: &str) -> Result<(bool, Vec<(String, u64, bool)>), String>
 /// same table shape as the FAT path (size + name; a dir shows `<DIR>`), then a per-invocation
 /// `:: ls1: <path>: <names> (N file, M dir) ::` serial witness — the verb renders panel-only on the
 /// bench, so the witness gives a headless capture the same content (the PI-UI-3 `ui3_say` idiom).
-/// unafs inodes carry no last-write time, so `-l` collapses to the short (size + name) form.
+/// PI-FS-4: unafs inodes carry a size but no last-write time, so `ls -l` shows the size plus a dashed
+/// date column (`UNAFS_NO_MTIME`), and the short `ls` is unchanged. The `-l` serial mirror keeps the
+/// `:: ls1:` shape and appends the per-entry sizes so a headless capture can witness the long form.
 #[cfg(target_arch = "aarch64")]
 fn pi_ls(console: &mut Console, arg: &str, long: bool) {
-    let _ = long; // no mtime in unafs inodes → long format == short format on the Pi
+    // 19-char dashed placeholder, the same width as the FAT `YYYY-MM-DD HH:MM:SS` field — unafs has no
+    // last-write time to render, so `ls -l` shows a `-` here honestly rather than a fabricated date.
+    const UNAFS_NO_MTIME: &str = "       -           ";
     let path = normalize_path(&cwd_path(), arg);
     match pi_ls_collect(&path) {
         Ok((is_dir, rows)) => {
@@ -1364,20 +1368,36 @@ fn pi_ls(console: &mut Console, arg: &str, long: bool) {
             for (name, size, row_is_dir) in &rows {
                 if *row_is_dir {
                     dirs += 1;
-                    console.println(&alloc::format!("  <DIR>         {}", name));
+                    if long {
+                        console.println(&alloc::format!("  <DIR>        {}  {}/", UNAFS_NO_MTIME, name));
+                    } else {
+                        console.println(&alloc::format!("  <DIR>         {}", name));
+                    }
                 } else {
                     files += 1;
-                    console.println(&alloc::format!("  {:>10}  {}", size, name));
+                    if long {
+                        console.println(&alloc::format!("  {:>10}  {}  {}", size, UNAFS_NO_MTIME, name));
+                    } else {
+                        console.println(&alloc::format!("  {:>10}  {}", size, name));
+                    }
                 }
             }
             if is_dir {
                 console.println(&alloc::format!("{} file(s), {} dir(s)", files, dirs));
             }
             let names: Vec<&str> = rows.iter().map(|(n, _, _)| n.as_str()).collect();
-            serial_println!(
-                ":: ls1: {}: {} ({} file, {} dir) ::",
-                path, names.join(" "), files, dirs
-            );
+            if long {
+                let sizes: Vec<String> = rows.iter().map(|(_, s, _)| alloc::format!("{}", s)).collect();
+                serial_println!(
+                    ":: ls1: {}: {} ({} file, {} dir) sizes: {} ::",
+                    path, names.join(" "), files, dirs, sizes.join(" ")
+                );
+            } else {
+                serial_println!(
+                    ":: ls1: {}: {} ({} file, {} dir) ::",
+                    path, names.join(" "), files, dirs
+                );
+            }
         }
         Err(msg) => {
             console.println(&alloc::format!("ls: {}", msg));

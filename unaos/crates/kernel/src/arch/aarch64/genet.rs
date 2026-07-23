@@ -1875,8 +1875,9 @@ Connection: close\r\nServer: UnaOS/genet\r\n\r\n",
         (r.unwrap_or(Err(())), ticks, ms)
     }
 
-    /// PI-NET-15: render the `/fs/` directory-listing HTML (name + size, files linked to `/fs/<name>`).
-    /// Entry names come from the trusted local volume (8.3), so they are emitted verbatim.
+    /// PI-NET-15 / PI-FS-4: render the `/fs/` directory-listing HTML (name + size + date, files linked to
+    /// `/fs/<name>`). Entry names come from the trusted local volume (8.3), so they are emitted verbatim.
+    /// unafs inodes carry a size but no last-write time, so the date column is a literal `-`.
     fn build_fs_list(entries: &[(alloc::string::String, u64, bool)]) -> alloc::vec::Vec<u8> {
         use core::fmt::Write as _;
         let mut body = alloc::string::String::new();
@@ -1892,9 +1893,12 @@ Connection: close\r\nServer: UnaOS/genet\r\n\r\n",
         let _ = write!(body, "<li>&lt;DIR&gt; <a href=\"/fs/usb/\">usb/</a></li>");
         for (name, size, is_dir) in entries {
             if *is_dir {
-                let _ = write!(body, "<li>&lt;DIR&gt; {name}/</li>");
+                let _ = write!(body, "<li>&lt;DIR&gt; {name}/ \u{2014} -</li>");
             } else {
-                let _ = write!(body, "<li><a href=\"/fs/{name}\">{name}</a> \u{2014} {size} bytes</li>");
+                let _ = write!(
+                    body,
+                    "<li><a href=\"/fs/{name}\">{name}</a> \u{2014} {size} bytes \u{2014} -</li>"
+                );
             }
         }
         let _ = write!(
@@ -1913,16 +1917,38 @@ Connection: close\r\nServer: UnaOS/genet\r\n\r\n",
     // up on the next GET. Strictly read-only: `BlockSource::Usb` refuses every write at the sector layer.
     // A file beyond the same 64 KiB `fs_cap()` NET-15 uses is refused 413 rather than read into RAM.
 
-    /// PIUSB-27: read the USB stick's FAT root directory — `(name, size, is_dir)` per entry. `Err(reason)`
+    /// PI-FS-4: format a FAT last-write timestamp (decoded from the on-disk date/time words per the FAT
+    /// spec by `DirEntry::mtime`) as a fixed-width `YYYY-MM-DD HH:MM:SS` field for a listing. An all-zero
+    /// on-disk stamp (`is_zero()`: a host tool that left it 0, or a kernel-written entry with no RTC to
+    /// stamp) renders as a bare `-` rather than a bogus 1980 date. Precision is 2 s, no timezone.
+    fn fmt_fat_mtime(ts: &crate::fs::fat::FatTimestamp) -> alloc::string::String {
+        if ts.is_zero() {
+            return alloc::string::String::from("-");
+        }
+        alloc::format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+            ts.year, ts.month, ts.day, ts.hour, ts.min, ts.sec
+        )
+    }
+
+    /// PIUSB-27 / PI-FS-4: read the USB stick's FAT root directory — `(name, size, is_dir, mtime)` per
+    /// entry, where `mtime` is the FAT last-write stamp formatted (or `-` when unstamped). `Err(reason)`
     /// carries an honest failure string when the volume cannot be mounted or listed.
     #[allow(clippy::type_complexity)]
-    fn usb_read_dir() -> Result<alloc::vec::Vec<(alloc::string::String, u64, bool)>, &'static str> {
+    fn usb_read_dir(
+    ) -> Result<alloc::vec::Vec<(alloc::string::String, u64, bool, alloc::string::String)>, &'static str>
+    {
         let fs = crate::fs::fat::mount_source(crate::fs::fat::BlockSource::Usb)
             .map_err(crate::fs::fat::fat_reason)?;
         let entries = fs.read_root().map_err(crate::fs::fat::fat_reason)?;
         let mut out = alloc::vec::Vec::with_capacity(entries.len());
         for de in &entries {
-            out.push((alloc::string::String::from(de.name()), de.size as u64, de.is_dir));
+            out.push((
+                alloc::string::String::from(de.name()),
+                de.size as u64,
+                de.is_dir,
+                fmt_fat_mtime(&de.mtime()),
+            ));
         }
         Ok(out)
     }
@@ -1952,9 +1978,13 @@ Connection: close\r\nServer: UnaOS/genet\r\n\r\n",
         }
     }
 
-    /// PIUSB-27: render the `/fs/usb/` FAT root listing (name + size, files linked to `/fs/usb/<name>`).
-    /// FAT short (8.3) names come from the mounted volume and are a restricted charset, emitted verbatim.
-    fn build_usb_list(entries: &[(alloc::string::String, u64, bool)]) -> alloc::vec::Vec<u8> {
+    /// PIUSB-27 / PI-FS-4: render the `/fs/usb/` FAT root listing (name + size + FAT last-write date,
+    /// files linked to `/fs/usb/<name>`). FAT short (8.3) names come from the mounted volume and are a
+    /// restricted charset, emitted verbatim; the date is the decoded last-write stamp (or `-` when the
+    /// entry carries no stamp).
+    fn build_usb_list(
+        entries: &[(alloc::string::String, u64, bool, alloc::string::String)],
+    ) -> alloc::vec::Vec<u8> {
         use core::fmt::Write as _;
         let mut body = alloc::string::String::new();
         let _ = write!(
@@ -1963,12 +1993,14 @@ Connection: close\r\nServer: UnaOS/genet\r\n\r\n",
 <title>UnaOS \u{2014} /fs/usb/</title></head><body>\
 <h1>USB stick (FAT) \u{2014} root</h1><ul>"
         );
-        for (name, size, is_dir) in entries {
+        for (name, size, is_dir, date) in entries {
             if *is_dir {
-                let _ = write!(body, "<li>&lt;DIR&gt; {name}/</li>");
+                let _ = write!(body, "<li>&lt;DIR&gt; {name}/ \u{2014} {date}</li>");
             } else {
-                let _ =
-                    write!(body, "<li><a href=\"/fs/usb/{name}\">{name}</a> \u{2014} {size} bytes</li>");
+                let _ = write!(
+                    body,
+                    "<li><a href=\"/fs/usb/{name}\">{name}</a> \u{2014} {size} bytes \u{2014} {date}</li>"
+                );
             }
         }
         let _ = write!(
