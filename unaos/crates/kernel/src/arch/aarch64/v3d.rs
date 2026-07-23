@@ -261,6 +261,35 @@ const V3D_CLE_CT0QTS_ENABLE: u32 = 1 << 1; // v3d_regs.h V3D_CLE_CT0QTS_ENABLE �
 // from the VideoCore-IV layout and are reported raw rather than guessed (no fabricated bit names).
 const V3D_CLE_CTNCS_CTRUN: u32 = 1 << 5;
 
+// ── V3D-41 PTB / frame-completion witness registers ──────────────────────────────────────────────
+// Offsets transcribed VERBATIM from Linux drivers/gpu/drm/v3d/v3d_regs.h (register offsets are hardware
+// facts; GPLv2-only header, facts-only — same discipline as the PI-V3D-8/9/13 CT0 lifts above). These
+// discriminate the V3D-40 wall ("CT0CA reached EA, coord shader RAN, pool+tile-state stayed zero") into
+// its two remaining branches — a bin frame that NEVER started the PTB, vs one that started but wrote
+// nothing — by reading state the CT0CS/pool witnesses alone cannot see:
+//   CT0LC/CT0PC — CLE list-counter / primitive-counter (how many list items / primitives the CLE fed).
+//   BFC/RFC     — bin / render FRAME-completion counters: BFC increments once per completed bin frame
+//                 (v3d_irq.c FLDONE path). BFC advancing across the kick = a bin frame COMPLETED (the PTB
+//                 ran a frame); BFC unchanged = START_TILE_BINNING never brought up a PTB frame despite
+//                 the CLE walking BA→EA. This is the decisive "started vs never-started" bit.
+//   PCS         — CLE pipeline control/status (bin/render busy + empty). Bit names past CTRUN are NOT
+//                 corroborated for 4.x, so PCS is reported RAW (no fabricated bit decode; §5 law).
+//   PTB BPCA/BPCS/BPOA/BPOS — the PTB's binning-primitive-list write pointer + size, and its overflow
+//                 allocation pointer + size. BPCA is the address the PTB is writing tile lists INTO; if
+//                 binning emitted anything, BPCA advances off the pool base (CT0QMA). BPCA == pool base
+//                 (or 0) with BFC advanced = the frame ran but the PTB produced no primitive-list bytes
+//                 (empty bin — geometry clipped/culled to nothing on-chip). BPOA nonzero = the binner
+//                 requested an overflow block (it ran out of pool — the opposite failure).
+const V3D_CLE_CT0LC: usize = 0x0120; // CT0 list counter (v3d_regs.h V3D_CLE_CT0LC)
+const V3D_CLE_CT0PC: usize = 0x0128; // CT0 primitive-list counter (v3d_regs.h V3D_CLE_CT0PC)
+const V3D_CLE_PCS: usize = 0x0130; // CLE pipeline control/status (v3d_regs.h V3D_CLE_PCS) — raw
+const V3D_CLE_BFC: usize = 0x0134; // bin frame count (v3d_regs.h V3D_CLE_BFC)
+const V3D_CLE_RFC: usize = 0x0138; // render frame count (v3d_regs.h V3D_CLE_RFC)
+const V3D_PTB_BPCA: usize = 0x0300; // PTB binning primitive-list current address (v3d_regs.h V3D_PTB_BPCA)
+const V3D_PTB_BPCS: usize = 0x0304; // PTB binning primitive-list current size    (v3d_regs.h V3D_PTB_BPCS)
+const V3D_PTB_BPOA: usize = 0x0308; // PTB binning primitive-list overflow address (v3d_regs.h V3D_PTB_BPOA)
+const V3D_PTB_BPOS: usize = 0x030c; // PTB binning primitive-list overflow size    (v3d_regs.h V3D_PTB_BPOS)
+
 // ─── The V3D buffer arena. One page-aligned static in BSS. Because the bare-metal kernel is
 // identity-mapped in low RAM (VA == PA), the address of this static IS its ARM physical address,
 // which is exactly what the V3D MMU page table and the control lists need. Sized generously and
@@ -2594,6 +2623,10 @@ fn probe_job() {
     // Arm the execution trio (src14/16/32) + TMU battery (src24/17/25) so they span the probe bin. This is
     // read-only w.r.t. the shader (see pctr_* above) — it cannot perturb execution.
     pctr_setup_cs_witness();
+    // [v3d41] snapshot the frame-completion counters immediately before the GO — the post-idle diff
+    // (ptb_frame_witness below) is the started-vs-never-started discriminator for the V3D-40 wall.
+    let bfc_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_BFC);
+    let rfc_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_RFC);
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QEA, bin_ea); // GO
     dsb();
     // [v3d40] tight kick witness: sample CT0CS + CT0CA the instant after the GO write — a started CLE
@@ -2621,6 +2654,11 @@ fn probe_job() {
     // witness reports? A probe that reached EA (CT0CA above) but left the pool all-zero — while M4's pool
     // goes nonzero — localises the divergence to the bin run itself, not the kick.
     bin_pool_witness("v3d40 PROBE post-bin");
+    // [v3d41] the decisive discriminator: with the pool + tile-state proven zero above and the coord
+    // shader proven to have RUN (v3d35), did START_TILE_BINNING actually complete a PTB bin FRAME? BFC's
+    // pre→post delta answers "started vs never-started"; BPCA (the PTB write pointer vs the pool base)
+    // corroborates whether any primitive-list bytes were emitted at all.
+    ptb_frame_witness("v3d41 PROBE post-bin", bfc_pre, rfc_pre, tile_alloc);
     let mmu_ctl = mmio_read(V3D_HUB_BASE, V3D_MMU_CTL);
     let fault = mmu_ctl
         & (V3D_MMU_CTL_PT_INVALID | V3D_MMU_CTL_WRITE_VIOLATION | V3D_MMU_CTL_CAP_EXCEEDED);
@@ -3279,6 +3317,60 @@ fn bin_pool_witness(tag: &str) -> bool {
         if ts.iter().any(|&b| b != 0) { "nonzero: the PTB wrote tile-state" } else { "all zero: no tile-state written" }
     );
     wrote
+}
+
+/// V3D-41 PTB / frame-completion witness — the discriminator downstream of the V3D-40 verdict.
+///
+/// P39 metal established: the coord shader RAN (v3d35 valid_instr=53, src14=28), CT0CA advanced BA→EA,
+/// CTRUN latched then cleared, no MMU fault — yet tile-alloc pool AND tile-state stayed all-zero. The
+/// CLE walked the whole list; the PTB wrote nothing. Two branches survive and the CT0CS/pool witnesses
+/// cannot separate them:
+///   (A) START_TILE_BINNING consumed clean but never brought up a PTB bin frame ("never started");
+///   (B) a bin frame ran to completion but produced zero primitive-list bytes ("started, writes lost /
+///       empty bin" — every screen-space primitive clipped/culled on-chip).
+///
+/// The frame-completion counter BFC decides it: read it before the GO and after idle. A `bfc_pre` is
+/// captured by the caller immediately before the CT0QEA GO; this fn reads the post-idle counters and
+/// diffs. BFC advanced by ≥1 ⇒ branch (B) (a frame completed — chase the on-chip clipper/VCM/PTB write
+/// path); BFC unchanged ⇒ branch (A) (no frame — chase START_TILE_BINNING / PTB bring-up / the CT0
+/// primitive feed). BPCA (the PTB write pointer) corroborates: advanced off `pool_base` ⇒ the PTB
+/// emitted bytes (the CPU read path is then suspect, not the binner); still at `pool_base`/0 ⇒ it did
+/// not. BPOA nonzero ⇒ overflow requested (a distinct pool-exhaustion failure, not this one). All reads
+/// are of GPU status/counter registers — no shader-visible state is touched. PCS is reported RAW: its
+/// bit layout past CTRUN is uncorroborated for V3D 4.x, so no bit names are fabricated (§5 law).
+fn ptb_frame_witness(tag: &str, bfc_pre: u32, rfc_pre: u32, pool_base: u32) {
+    let bfc = mmio_read(V3D_CORE0_BASE, V3D_CLE_BFC);
+    let rfc = mmio_read(V3D_CORE0_BASE, V3D_CLE_RFC);
+    let pcs = mmio_read(V3D_CORE0_BASE, V3D_CLE_PCS);
+    let ct0lc = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0LC);
+    let ct0pc = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0PC);
+    let bpca = mmio_read(V3D_CORE0_BASE, V3D_PTB_BPCA);
+    let bpcs = mmio_read(V3D_CORE0_BASE, V3D_PTB_BPCS);
+    let bpoa = mmio_read(V3D_CORE0_BASE, V3D_PTB_BPOA);
+    let bpos = mmio_read(V3D_CORE0_BASE, V3D_PTB_BPOS);
+    let bfc_delta = bfc.wrapping_sub(bfc_pre);
+    let rfc_delta = rfc.wrapping_sub(rfc_pre);
+    let bpca_advanced = bpca != 0 && bpca != pool_base;
+    serial_println!(
+        ":: V3D: [v3d41] {} frame counters — BFC {:#010x}->{:#010x} (Δ{}) RFC {:#010x}->{:#010x} (Δ{}) — {} ::",
+        tag, bfc_pre, bfc, bfc_delta, rfc_pre, rfc, rfc_delta,
+        if bfc_delta >= 1 {
+            "BIN FRAME COMPLETED: START_TILE_BINNING brought up a PTB frame — branch (B) writes-lost/empty-bin (chase clipper/VCM/PTB write path, NOT bring-up)"
+        } else {
+            "NO BIN FRAME: the PTB frame never completed despite CT0CA reaching EA — branch (A) never-started (chase START_TILE_BINNING / PTB bring-up / CT0 primitive feed)"
+        }
+    );
+    serial_println!(
+        ":: V3D: [v3d41] {} CLE feed + PTB pointer — CT0LC={:#010x} CT0PC={:#010x} PCS={:#010x} (raw) | BPCA={:#010x} (pool base {:#010x}) BPCS={:#010x} BPOA={:#010x} BPOS={:#010x} — PTB write pointer {} ::",
+        tag, ct0lc, ct0pc, pcs, bpca, pool_base, bpcs, bpoa, bpos,
+        if bpca_advanced {
+            "ADVANCED off the pool base: the PTB emitted primitive-list bytes (if the pool head still reads zero the CPU READ path is suspect, not the binner)"
+        } else if bpoa != 0 {
+            "at/near pool base but BPOA nonzero: the binner requested an OVERFLOW block (pool-exhaustion — a distinct failure)"
+        } else {
+            "still at the pool base/0: the PTB never advanced its write pointer — it produced no primitive-list bytes"
+        }
+    );
 }
 
 /// PI-V3D-21: the coordinate-shader EXECUTION witness — the read-only route. After V3D-17/18/20 proved
