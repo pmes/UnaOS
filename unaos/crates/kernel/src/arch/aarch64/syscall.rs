@@ -6387,6 +6387,11 @@ pub fn run_user_image(
         }
     };
     let asid = mapped.ttbr0 >> 48;
+    // Ensure the FUTEX waiter pool is initialised before the program can run: an EL0 program loaded through
+    // this path (e.g. the UVUG mini-vug) may call SYS_FUTEX, and on a plain (non-witness) boot the in-kernel
+    // fb-test launcher — the other futex_init caller — never runs. `futex_init` is idempotent (it only
+    // reserves waiter-list capacity), so re-calling it here is a cheap no-op once armed.
+    super::sched::futex_init();
     // Endow the fresh slot with a console write-cap so the program's SYS_WRITE(fd 1) reaches the console.
     // Done BEFORE the spawn, on a slot no other core can resolve yet (the co-location invariant below).
     install_console_cap(asid);
@@ -8401,6 +8406,67 @@ fn exec1_witness(_demo_cpu: usize) {
     }
 }
 
+/// UVUG-1 witness: prove the mini-vug EL0 graphics program end-to-end at boot. Reads UVUG.ELF through the
+/// VFS `MountTable` (the same namespace the panel `run` verb builds) and executes it via `run_user_image` —
+/// the identical path the operator drives with `run /fat/UVUG.ELF`. The program maps its off-screen surface
+/// (SYS_FB_MAP), spawns 2 EL0 worker threads that render halves of an animated pattern under a FUTEX frame
+/// barrier, presents each frame (SYS_FB_PRESENT), joins both (SYS_THREAD_JOIN), and prints its OWN witness
+/// line `:: UVUG: frames=300 threads=2 checksum=<hex> ::` before exiting 0. This launcher only asserts the
+/// clean `exit=0` (its own uncounted `:: EXEC-UVUG: … ::` verdict) — the program's self-printed UVUG line is
+/// the deterministic-checksum witness. Runs AFTER `fb_launcher` (which also arms the futex pool; `run_user_image`
+/// re-arms it idempotently anyway) so its reuse of the SYS_FB_* / SYS_THREAD_* / SYS_FUTEX machinery perturbs
+/// nothing. Self-contained (a fresh slot, reaped on exit); an honest skip without the SD/fixture. Its exit
+/// rides the generic Proc reap, off every M6b/sentinel counter, so it can never perturb the fixture battery.
+fn uvug_witness(_demo_cpu: usize) {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if crate::drivers::block::info().is_none() {
+        serial_println!(":: EXEC-UVUG: no SD card found — mini-vug witness skipped ::");
+        return;
+    }
+    use crate::fs::vfs::{FatBackend, MountTable, KERNEL_PRINCIPAL};
+    let mut mt = MountTable::new();
+    mt.mount("/fat", alloc::boxed::Box::new(FatBackend::new("fat", KERNEL_PRINCIPAL, true)));
+    let path = "/fat/UVUG.ELF";
+    let st = match mt.stat(path) {
+        Ok(s) => s,
+        Err(e) => {
+            serial_println!(":: EXEC-UVUG: {} not found on the VFS ({:?}) — skipped ::", path, e);
+            return;
+        }
+    };
+    let bytes = match mt.read(path, 0, st.size as usize) {
+        Ok(b) => b,
+        Err(e) => {
+            serial_println!(":: EXEC-UVUG: {} read error ({:?}) -> FAIL ::", path, e);
+            return;
+        }
+    };
+    let n = bytes.len();
+    // Generous deadline: 300 futex-synchronised frames across 2 worker threads (one on a sibling core) run
+    // well under a second in QEMU, but bound loosely so a slow host never spuriously times out.
+    let deadline = 15 * super::timer::cntfrq();
+    match run_user_image("shell-run", &bytes, deadline) {
+        Ok((RunOutcome::Exited(0), entry)) => serial_println!(
+            ":: EXEC-UVUG: run {} — loaded {} bytes, entry {:#x}, exit=0 -> PASS ::",
+            path, n, entry
+        ),
+        Ok((RunOutcome::Exited(code), entry)) => serial_println!(
+            ":: EXEC-UVUG: run {} — loaded {} bytes, entry {:#x}, exit={} (want 0) -> FAIL ::",
+            path, n, entry, code
+        ),
+        Ok((RunOutcome::Faulted, _)) => {
+            serial_println!(":: EXEC-UVUG: run {} — EL0 program FAULTED -> FAIL ::", path)
+        }
+        Ok((RunOutcome::Timeout, _)) => {
+            serial_println!(":: EXEC-UVUG: run {} — EL0 program did not exit in time -> FAIL ::", path)
+        }
+        Err(why) => serial_println!(":: EXEC-UVUG: run {} — loader rejected ({}) -> FAIL ::", path, why),
+    }
+}
+
 // =============================================================================================
 // ELF-2: EL0 threading — SYS_THREAD_SPAWN / _JOIN / _EXIT + the multi-core shared-memory threads test.
 //
@@ -9840,6 +9906,14 @@ pub fn u7_launcher(demo_cpu: usize) {
     // drawn bytes against the expected checksum. In-RAM (no disk), so it can never perturb the fixture battery;
     // its own uncounted `:: EL0: fb test — … ::` line. Placed after ELF-2 (the thread primitives it builds on).
     fb_launcher(demo_cpu);
+    // UVUG-1: the first REAL EL0 graphics program — the mini-vug. Reads UVUG.ELF through the VFS and runs it
+    // via the EXEC-1 `run_user_image` path (the same path `run /fat/UVUG.ELF` drives at the panel): it maps an
+    // off-screen surface, spawns 2 EL0 worker threads that render halves of an animated pattern under a FUTEX
+    // frame barrier, presents each frame, joins both, and prints its OWN deterministic
+    // `:: UVUG: frames=300 threads=2 checksum=<hex> ::` witness before exiting 0. Placed after `fb_launcher`
+    // (the SYS_FB_* / SYS_FUTEX primitives it builds on are proven, and the futex pool is armed). Its own
+    // uncounted `:: EXEC-UVUG: … ::` verdict; an honest skip without the fixture.
+    uvug_witness(demo_cpu);
     // K3: the revoke-persist commit-ordering proof — a named-owner file's SYS_FGRANT revoke commits to disk
     // BEFORE the in-RAM removal, so it SURVIVES REBOOT and fails CLOSED on a persist failure. Its own uncounted
     // `:: K3-revoke: … PASS ::` line; fully self-cleaning (leaves no owned row on the metal card).

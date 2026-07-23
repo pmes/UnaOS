@@ -386,6 +386,37 @@
   boot self-test that reads `/fat/ELFHELLO.ELF` through the VFS and runs it through `run_user_image`:
   `:: EXEC1: run /fat/ELFHELLO.ELF — loaded 8560 bytes, entry 0x268000, exit=0 -> PASS ::` (the program
   prints its own `elf hello from EL0`).
+- **UVUG-1 (landed 2026-07-23)** — the first REAL EL0 graphics program: a userspace **mini-vug**, and the
+  affirmative answer to "is it possible to make EL0 vug more multi-threaded?". A static ELF64 program
+  (`crates/user-uvug`, staged onto the FAT media as **UVUG.ELF** by `arroyo`, same build path as ELFHELLO)
+  loaded and run through the EXEC-1 `run_user_image` machinery — the identical path the panel `run
+  /fat/UVUG.ELF` drives. It maps its off-screen surface (`SYS_FB_MAP`), spawns **two persistent EL0 worker
+  threads** (`SYS_THREAD_SPAWN` — one co-located, one on a **sibling core**) that each render HALF of an
+  animated integer-math gradient into the shared surface, drives a **per-frame barrier**, `SYS_FB_PRESENT`s
+  each of 300 frames, then `SYS_THREAD_JOIN`s both, computes a deterministic FNV-1a checksum of the final
+  surface, and prints its own witness `:: UVUG: frames=300 threads=2 checksum=<hex> ::` before exiting 0.
+  The barrier direction is deliberately split for robustness under QEMU raspi4b (which delivers **no Group-1
+  timer IRQ**, so a core that parks with nothing else runnable is not preemptively rescheduled): **arrival**
+  (worker→parent) is a real `SYS_FUTEX` (workers bump `done` + WAKE, parent WAITs — the fb-proven direction,
+  reliable because the run core is kept cycling by the `run_user_image` driver loop); **release**
+  (parent→worker) is a `SYS_YIELD` poll on a `phase` word (keeps each worker runnable on its own core, so no
+  cross-core re-dispatch of an idle sibling is needed). Both wait loops re-check their condition, so the
+  barrier is lost-wakeup-safe by construction; on metal (real timer IRQs) either direction works. The
+  checksum is deterministic (the final surface is a pure integer function of pixel position and the last
+  frame index, independent of thread interleaving), so QEMU and metal agree. EL0 owns only the off-screen
+  surface bytes — never the scan-out, a physical address, or a kernel mapping; page-permission laws (WXN,
+  per-page perms) are untouched. Kernel side is a small additive fix only: `run_user_image` now calls the
+  idempotent `sched::futex_init()` (so a plain non-witness boot arms the futex pool before an EL0 program
+  can call `SYS_FUTEX`), plus a `uvug_witness` battery self-test that reads UVUG.ELF through the VFS and runs
+  it, asserting `exit=0`. QEMU-verified (`UNAOS_V3D=1 UNAOS_GENET=1 UNAOS_PIUSB=1 ./arroyo kernel8-test`,
+  reproducible across runs): `:: UVUG: frames=300 threads=2 checksum=0x0313e510f24daae5 ::` then
+  `:: EXEC-UVUG: run /fat/UVUG.ELF — loaded 8544 bytes, entry 0x270000, exit=0 -> PASS ::`, with the workers
+  scheduled on cores 2 (co-located) + 1 (sibling) and the whole prior battery (CAPSTONE 6/6, EXEC1,
+  ELF-2/-3) byte-equivalent. **DEFERRED (out of this lane):** the live panel animation still needs the
+  ELF-3 present-hook wiring (the 3-line `video/screen.rs` `register_fb_present_hook` registration) — until
+  it lands, `SYS_FB_PRESENT` composites nothing to the screen, so the panel run prints the witness and exits
+  cleanly but shows no pixels. Lane: `crates/user-uvug` + `arroyo` (build/stage) + an additive
+  `arch/aarch64/syscall.rs` (`futex_init` in `run_user_image` + the `uvug_witness` self-test) + this doc.
 - Not yet: **revocation trees** (a derived copy — re-grant or onward re-transfer — escapes
   single-level revoke today; derivation records + `CAP_REVOKE` are that arc), the **bandy Ring-3
   delegation wrapper**, `File` transfer (descriptor migration), real `Socket` fs/net syscalls.
