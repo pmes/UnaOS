@@ -440,6 +440,11 @@ impl RunQueue {
         let level = (task.priority as usize).min(NUM_PRIORITIES - 1);
         self.levels[level].push_back(task);
     }
+    /// Total ready tasks across all levels — the depth signal SCHED-3 load-balanced placement reads
+    /// to pick the least-loaded core (introspection under the run-queue lock, never on the switch path).
+    fn len(&self) -> usize {
+        self.levels.iter().map(VecDeque::len).sum()
+    }
     /// Dequeue the front of the HIGHEST non-empty level (strict priority over the effective level,
     /// round-robin within).
     fn pop_highest(&mut self) -> Option<Box<Task>> {
@@ -705,16 +710,85 @@ fn build_initial_frame(stack: &mut [u8], trampoline: extern "C" fn() -> !) -> u6
     sp as u64
 }
 
+// ---------------------------------------------------------------------------------------------
+// SCHED-3 — load-balanced placement for UNPINNED spawns
+// ---------------------------------------------------------------------------------------------
+//
+// The scheduler is no-migrate: a task lives on the core its `Task.cpu` names, decided once at spawn.
+// Historically EVERY caller named that core explicitly, so placement was 100% caller-pinned and hot
+// services that all pass a hand-picked "off the render core" pin cluster on the SAME core (the metal
+// R23s1f/R23s1h sightings: net9 + orphan-reaper both land on core 2 -> c2 saturates while core 1 sits
+// near-idle). SCHED-3 keeps explicit pins verbatim (render/input MUST stay single-core) but adds an
+// opt-in placement: a caller that passes `CPU_AUTO` lets the scheduler drop the task on the LEAST-
+// loaded online core, so unpinned work spreads by actual load instead of piling onto one pin.
+//
+// The candidate set is the cores that are actually running the scheduler loop, registered via
+// `mark_online` when the BSP releases the APs (`start_aps`). The load metric is the ready-queue DEPTH
+// (the most direct "will this task wait" signal), tie-broken by the rolling-window busy fraction and
+// then a rotating cursor so equal-load cores fill round-robin rather than all landing on the lowest
+// index. Placement runs off the hot path (spawn only), so the brief per-queue depth read is free.
+
+/// Sentinel `cpu` for `spawn`/`spawn_prio`/`spawn_auto`: "don't pin me — place me on the least-loaded
+/// online core by actual load". Any real core index (`< NUM_CPUS`) is honored verbatim (no-migrate).
+pub const CPU_AUTO: usize = usize::MAX;
+
+/// Cores registered as online + scheduling (the `CPU_AUTO` placement candidate set). Set by
+/// `mark_online` when the BSP releases an AP into `run`; never cleared (a core stays a candidate).
+static ONLINE_MASK: [AtomicBool; NUM_CPUS] = [const { AtomicBool::new(false) }; NUM_CPUS];
+
+/// Round-robin cursor for `CPU_AUTO` tie-breaking: when several online cores share the minimum load,
+/// the scan starts at a rotating offset so consecutive auto-placements fan out instead of stacking.
+static AUTO_ROTATE: AtomicUsize = AtomicUsize::new(0);
+
+/// Register `cpu` as an online, scheduling core — a candidate for `CPU_AUTO` load-balanced placement.
+/// Called by the BSP as it releases the APs (`start_aps`); idempotent, introspection-only bookkeeping
+/// (no effect on any existing caller-pinned spawn, so boot behavior is byte-identical without CPU_AUTO).
+pub fn mark_online(cpu: usize) {
+    if cpu < NUM_CPUS {
+        ONLINE_MASK[cpu].store(true, Ordering::Release);
+    }
+}
+
+/// Resolve a requested `cpu` to a concrete core. An explicit index passes through verbatim (the
+/// no-migrate pin contract). `CPU_AUTO` selects the least-loaded online core: minimum ready-queue
+/// depth first, then the lower rolling-window busy fraction, then a rotating cursor for round-robin
+/// spread on ties. Falls back to core 0 only if no core is online yet (early BSP staging).
+fn pick_cpu(requested: usize) -> usize {
+    if requested != CPU_AUTO {
+        return requested;
+    }
+    let rot = AUTO_ROTATE.fetch_add(1, Ordering::Relaxed);
+    let mut best: Option<usize> = None;
+    let mut best_depth = usize::MAX;
+    let mut best_pct = u32::MAX;
+    for i in 0..NUM_CPUS {
+        let cpu = (rot + i) % NUM_CPUS; // rotating start => equal-load cores fill round-robin
+        if !ONLINE_MASK[cpu].load(Ordering::Acquire) {
+            continue;
+        }
+        let depth = RUN_QUEUES[cpu].lock().len();
+        let pct = ACCT[cpu].busy_pct();
+        if depth < best_depth || (depth == best_depth && pct < best_pct) {
+            best = Some(cpu);
+            best_depth = depth;
+            best_pct = pct;
+        }
+    }
+    best.unwrap_or(0)
+}
+
 /// Shared spawn path: build a kernel thread on `cpu`'s run queue (optionally carrying a `done_sem`
-/// completion signal for `join`), enqueue it, and poke that CPU. Returns the new task's id.
+/// completion signal for `join`), enqueue it, and poke that CPU. `cpu` may be `CPU_AUTO` for
+/// load-balanced placement (see `pick_cpu`); any real index is a verbatim no-migrate pin. Returns id.
 fn spawn_inner(
     name: &'static str,
     entry: fn(usize),
     arg: usize,
-    cpu: usize,
+    requested_cpu: usize,
     priority: u8,
     done_sem: Option<Arc<Semaphore>>,
 ) -> u64 {
+    let cpu = pick_cpu(requested_cpu);
     assert!(cpu < NUM_CPUS, "spawn: cpu out of range");
     let mut stack: Box<[u8]> = alloc::vec![0u8; TASK_STACK_SIZE].into_boxed_slice();
     let ctx_sp = build_initial_frame(&mut stack, task_trampoline);
@@ -747,8 +821,11 @@ fn spawn_inner(
     // visible on the actual target.)
     #[cfg(feature = "pi")]
     serial_println!(
-        ":: SCHED: task '{}' -> core {} (policy: caller-pinned, no-migrate; prio {}) ::",
-        name, cpu, priority
+        ":: SCHED: task '{}' -> core {} (policy: {}, no-migrate; prio {}) ::",
+        name,
+        cpu,
+        if requested_cpu == CPU_AUTO { "load-balanced" } else { "caller-pinned" },
+        priority
     );
     // Wake the target if it's a different, possibly-idle core (same-core needs no poke).
     poke_cpu(cpu);
@@ -768,6 +845,14 @@ pub fn spawn(name: &'static str, entry: fn(usize), arg: usize, cpu: usize) -> u6
 /// is protected from indefinite starvation by aging (see `AGE_TICKS`). Returns the task id.
 pub fn spawn_prio(name: &'static str, entry: fn(usize), arg: usize, cpu: usize, priority: u8) -> u64 {
     spawn_inner(name, entry, arg, cpu, priority, None)
+}
+
+/// SCHED-3: like `spawn`, but LOAD-BALANCED — the scheduler places the task on the least-loaded online
+/// core (see `pick_cpu`) instead of a caller-named pin. For fire-and-forget service/worker tasks that
+/// have no core affinity; use `spawn` (explicit `cpu`) when a task MUST run on a specific core (e.g. the
+/// single-core render loop). Equivalent to `spawn(.., CPU_AUTO)`. Returns the task id.
+pub fn spawn_auto(name: &'static str, entry: fn(usize), arg: usize) -> u64 {
+    spawn_inner(name, entry, arg, CPU_AUTO, PRIO_NORMAL, None)
 }
 
 /// Create a ready EL0 (user-mode) task on `cpu`'s run queue (M6a): when dispatched it drops to EL0 at
@@ -813,8 +898,9 @@ fn spawn_user_inner(
     user_entry: u64,
     user_sp: u64,
     user_ttbr0: u64,
-    cpu: usize,
+    requested_cpu: usize,
 ) -> u64 {
+    let cpu = pick_cpu(requested_cpu);
     assert!(cpu < NUM_CPUS, "spawn_user: cpu out of range");
     let mut stack: Box<[u8]> = alloc::vec![0u8; TASK_STACK_SIZE].into_boxed_slice();
     let ctx_sp = build_initial_frame(&mut stack, user_task_trampoline);
@@ -840,8 +926,10 @@ fn spawn_user_inner(
     // "all vug load on core 2" sighting). Same `pi`-gating + rationale as `spawn_inner`.
     #[cfg(feature = "pi")]
     serial_println!(
-        ":: SCHED: task '{}' -> core {} (policy: caller-pinned EL0, no-migrate) ::",
-        name, cpu
+        ":: SCHED: task '{}' -> core {} (policy: {} EL0, no-migrate) ::",
+        name,
+        cpu,
+        if requested_cpu == CPU_AUTO { "load-balanced" } else { "caller-pinned" }
     );
     poke_cpu(cpu);
     id
@@ -2356,6 +2444,21 @@ pub fn load_accounting_witness() {
 /// busy tasks run sequentially, the sleeper self-skips, and every block/wake is carried by the run()
 /// busy-poll (SGI delivery being the metal-only half). Call AFTER the BSP's cooperative demo.
 pub fn start_aps(online: &[usize]) {
+    // SCHED-3: register every online AP as a candidate for CPU_AUTO load-balanced placement. The BSP
+    // (core 0) never enters `run` on the Pi, so it stays off the candidate set — a CPU_AUTO task only
+    // ever lands on a core that actually drains its run queue. No effect on the caller-pinned spawns
+    // below (they name their core), so the workload placement here is byte-identical.
+    for &c in online {
+        mark_online(c);
+    }
+    // SCHED-3: prove load-balanced placement spreads unpinned work across the online cores. Run HERE,
+    // BEFORE the caller-pinned workload below is staged, so every online core's run queue is empty and
+    // the depth-balancer fans the unpinned tasks evenly across ALL of them (a proof that once a core is
+    // loaded the balancer correctly steers away from it belongs to the accounting witness, not this
+    // one). Gated behind `witness` (armed for `kernel8-test`, OFF for a default `kernel8` boot) so quiet
+    // boot stays quiet, and `pi` so it fires only on the target/gate — byte-identical for jetson/virt.
+    #[cfg(all(feature = "pi", feature = "witness"))]
+    placement_spread_witness();
     if let Some(&c) = online.first() {
         spawn("busy-a", preempt_body, c * 10, c);
         spawn("busy-b", preempt_body, c * 10 + 1, c);
@@ -2379,6 +2482,84 @@ pub fn start_aps(online: &[usize]) {
     serial_println!(
         ":: AARCH64 SCHED: preemption ON; busy-pair + sleep + full M4 capstone on APs {:?} ::",
         online
+    );
+
+    // SCHED-3: with the APs now released, the unpinned workers placed at the top of this fn drain and
+    // record the core they actually RAN on — corroboration that the placement spread is real execution,
+    // not just an enqueue decision. Informational (non-gating: cross-core drain timing under QEMU is not
+    // guaranteed); the PASS gate was the deterministic placement spread above.
+    #[cfg(all(feature = "pi", feature = "witness"))]
+    placement_spread_epilogue();
+}
+
+// ---------------------------------------------------------------------------------------------
+// SCHED-3 — load-balanced-placement spread witness (QEMU-testable, default-quiet)
+// ---------------------------------------------------------------------------------------------
+//
+// Asserts that N `CPU_AUTO` (unpinned) spawns land on >= 3 DISTINCT cores — the direct inverse of the
+// metal imbalance (all unpinned work piling onto one caller-picked pin). Run with every online core's
+// run queue empty (top of `start_aps`), so the depth-balancer fans the tasks evenly; the LANDING core
+// of each auto-placement (deterministic — decided at enqueue by `pick_cpu`) is folded into a bitset and
+// the distinct-core count is the PASS gate. The workers also record the core they actually RAN on
+// (`placement_spread_epilogue`, after the APs are released) as non-gating corroboration.
+#[cfg(all(feature = "pi", feature = "witness"))]
+const SPREAD_N: usize = 12;
+#[cfg(all(feature = "pi", feature = "witness"))]
+static SPREAD_RAN_MASK: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(all(feature = "pi", feature = "witness"))]
+fn spread_worker(_: usize) {
+    let cpu = percpu::this_cpu().cpu_index as usize;
+    SPREAD_RAN_MASK.fetch_or(1u32 << (cpu & 31), Ordering::Relaxed);
+}
+
+#[cfg(all(feature = "pi", feature = "witness"))]
+pub fn placement_spread_witness() {
+    let online_n = (0..NUM_CPUS)
+        .filter(|&c| ONLINE_MASK[c].load(Ordering::Acquire))
+        .count();
+    if online_n < 3 {
+        serial_println!(
+            ":: AARCH64 SCHED: placement-spread witness SKIP (needs >= 3 online cores, have {}) ::",
+            online_n
+        );
+        return;
+    }
+    SPREAD_RAN_MASK.store(0, Ordering::Relaxed);
+    let mut placed_mask: u32 = 0;
+    for _ in 0..SPREAD_N {
+        // Balance across the online cores, then pin to the chosen core so the landing is observable.
+        // Each spawn pushes onto its core's queue, so the depth signal `pick_cpu` reads climbs there and
+        // the next placement moves on — genuine load spread across the (empty) cores, not a fixed rotation.
+        let cpu = pick_cpu(CPU_AUTO);
+        spawn_prio("spread", spread_worker, 0, cpu, PRIO_NORMAL);
+        placed_mask |= 1u32 << (cpu & 31);
+    }
+    let distinct = placed_mask.count_ones();
+    if distinct >= 3 {
+        serial_println!(
+            ":: AARCH64 SCHED: placement-spread PASS ({} unpinned tasks -> {} distinct cores, mask {:#06b}) ::",
+            SPREAD_N, distinct, placed_mask
+        );
+    } else {
+        serial_println!(
+            ":: AARCH64 SCHED: placement-spread FAIL ({} unpinned tasks -> only {} distinct cores, mask {:#06b}) ::",
+            SPREAD_N, distinct, placed_mask
+        );
+    }
+}
+
+/// SCHED-3 corroboration: after the APs are released, give the unpinned spread workers a bounded window
+/// to drain and report the cores they actually RAN on. Informational only (never a PASS/FAIL gate) —
+/// cross-core drain timing under QEMU is not guaranteed, so this confirms live execution without gating.
+#[cfg(all(feature = "pi", feature = "witness"))]
+pub fn placement_spread_epilogue() {
+    busy_delay_ms(20);
+    let ran_mask = SPREAD_RAN_MASK.load(Ordering::Relaxed);
+    serial_println!(
+        ":: AARCH64 SCHED: placement-spread ran-mask {:#06b} ({} cores observed running) ::",
+        ran_mask,
+        ran_mask.count_ones()
     );
 }
 

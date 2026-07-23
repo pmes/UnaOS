@@ -98,6 +98,51 @@ IRQ). A non-degeneracy witness (`load_accounting_witness`) runs in the pi
 live — at least one core busy and the context-switch counter advanced — catching
 a regression that freezes it: `:: AARCH64 SCHED: load-accounting PASS (...) ::`.
 
+### Load-balanced placement (aarch64, SCHED-3)
+
+The scheduler is **no-migrate**: a task lives for its whole life on the core its
+`Task.cpu` names, chosen once at spawn (a woken task always returns to that
+core's run queue). Historically *every* caller named that core explicitly, so
+placement was 100% caller-pinned. That is correct for tasks that **must** be
+single-core (the GUI render loop, the input service), but it also meant several
+independent hot services that each pass a hand-picked "off the render core" pin
+could pile onto the **same** core. On metal (R23s1f/R23s1h) `net9` (a 4 ms poll)
+and `orphan-reaper` both landed on core 2, saturating it (`c2=100%`) while core 1
+sat near-idle (`c1=0%`) — the `SCHED: load` heartbeat made the imbalance visible.
+
+SCHED-3 keeps explicit pins **verbatim** and adds an opt-in load-balanced
+placement for tasks with no core affinity:
+
+- **`CPU_AUTO` sentinel + `spawn_auto`.** A caller that passes `CPU_AUTO`
+  (or uses `spawn_auto(name, entry, arg)`) asks the scheduler to place the task
+  on the **least-loaded online core** instead of a fixed pin. Any real core index
+  still passes through unchanged, so all existing spawns are byte-identical.
+- **`pick_cpu`.** Among the cores registered online (`mark_online`, called by
+  `start_aps` as it releases the APs — the BSP never schedules on the Pi, so it is
+  never a candidate), pick the minimum **ready-queue depth** first, tie-broken by
+  the lower rolling-window busy fraction (SCHED-2), then a rotating cursor so
+  equal-load cores fill round-robin. Placement runs on the spawn path only (never
+  the switch hot path), so the brief per-queue depth read is free.
+
+The `SCHED: task ... -> core N` placement witness line now reports the policy
+(`load-balanced` vs `caller-pinned`). The `SCHED: load` heartbeat format is
+unchanged (bench parses it).
+
+**Witness.** `placement_spread_witness` runs at the top of `start_aps` (all
+online run queues still empty), spawns `SPREAD_N = 12` `CPU_AUTO` tasks, and
+asserts they land on **≥ 3 distinct cores**: `:: AARCH64 SCHED: placement-spread
+PASS (12 unpinned tasks -> 3 distinct cores, mask 0b1110) ::`. After the APs are
+released, `placement_spread_epilogue` reports the cores those workers actually ran
+on as non-gating corroboration. Both are gated behind `all(feature = "pi",
+feature = "witness")` — armed for the `kernel8-test` battery, **off** for a
+default `kernel8` boot (default-quiet), byte-identical for the jetson/virt builds
+that share this module.
+
+> Adopting `CPU_AUTO` at the real service call sites (e.g. `net9` in `genet.rs`,
+> `orphan-reaper` in `main.rs`) is the follow-up that spreads those services in
+> practice; those files are outside the scheduler lane, so SCHED-3 lands the
+> mechanism + witness and leaves the call-site conversion to a net/main arc.
+
 ---
 
 ## 3. Blocking and synchronization primitives
