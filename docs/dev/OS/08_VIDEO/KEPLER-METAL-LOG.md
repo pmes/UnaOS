@@ -33,8 +33,24 @@ QEMU behavior. Newest sitting first.
   head-block region outside the three windows. Peter decision required either
   way (first write vs wider read).
 
-**Boot 2 — kepler pull 14 CTRL_ADDR ladder: staged, pending.** (Entry will be
-amended when it flies.)
+**Boot 2 — kepler pull 14: CTRL_ADDR TARGET hypothesis REFUTED (12/12).**
+- All three PBDMAs read `pre=00000000 hi=00000000`; every TARGET value 0..3
+  on every PBDMA wrote and READ BACK exactly (`wrote=rb`, register writable,
+  never ABSENT/RO) — and the s10 witness ladder never latched once:
+  `WITNESS FAILED - bits stripped` on all 12 steps, err=2 throughout,
+  fence-timeout each iteration, clean evidenced restores (`restored
+  rb=00000000`) between steps. Amendment discipline held (one PBDMA at a
+  time; no freeze since no PASS).
+- **M2 disp-era recon (read-only) found live EVO core-channel state:**
+  `disp-userd-recon pdisplay_0=917D0210 +40=0000000A evo_0x490=0D0500A9
+  evo_0x494=00000001`. 0x610490 holds a rich value and 0x610494 reads 1 —
+  the disp-era USERD/core-channel enablement path (the last pre-committed
+  fallback) has a live anchor to probe.
+- Fence-wall ledger after s13: refuted = 3 runlist encodings (s8),
+  USERD_SNOOP (s10), USERD_HI bit31 (s11), PFIFO_FLUSH (s12), CTRL_ADDR
+  TARGET ×12 (s13). Remaining in-family lead: disp-era USERD enablement
+  (write phase — needs its own brief). Beyond that the lane pivots to
+  PGRAPH/ucode (K-GPU-4) — Peter strategy call.
 
 ## Sitting #12 (display pull 2 + kepler pull 13, UnaOS-gemini@9d22d263, 2026-07-23, fox-metal-r23s1i)
 

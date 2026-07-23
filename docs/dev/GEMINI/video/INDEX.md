@@ -6,7 +6,7 @@ Three pull sequences, numbered independently. Every pull = one BRIEF (coordinato
 ## Lane 1: Kepler FENCE (PFIFO/scheduler — kepler.rs) — `video/Kepler/`, files `*kepler-fence-pull<N>*` (pulls ≤13: `*kepler-pull<N>*`)
 | Pull | Files | Status | One-liner |
 |---|---|---|---|
-| 14 | BRIEF-kepler-fence-pull14-ctrladdr / PROPOSAL-kepler-fence-pull14 | LANDED 384449d7 (+inline hi-read fix) — metal owed s13 | PBDMA CTRL_ADDR TARGET audit; amendments honored; M2 recon read-only |
+| 14 | BRIEF-kepler-fence-pull14-ctrladdr / PROPOSAL-kepler-fence-pull14 | LANDED 384449d7; s13: REFUTED 12/12 (writes stick, witness never latched); recon: EVO 0x490=0D0500A9 live | PBDMA CTRL_ADDR TARGET audit; disp-era USERD = last in-family lead |
 | 13 | BRIEF-kepler-pull13-visibility / PROPOSAL-kepler-pull13 | LANDED d63a1495; s12: REFUTED (flush executed, strip persists) | PFIFO_FLUSH before validate — flush is not the missing step; pull 14 = pre-committed fallbacks |
 | 12 | BRIEF-kepler-pull12-poll-area-2 / PROPOSAL-kepler-pull12 | LANDED; s11: REFUTED (bit persists in inst, err=2) | USERD_HI bit31 test; SNOOP scrubbed |
 | 11 | BRIEF-kepler-pull11-poll-area / PROPOSAL-kepler-pull11 | LANDED 7124e4e1; s10: candidate refuted | USERD_SNOOP test — inert on GK107 |
@@ -19,7 +19,7 @@ Three pull sequences, numbered independently. Every pull = one BRIEF (coordinato
 ## Lane 2: Kepler DISPLAY (scanout — kepler_display.rs after split) — `video/Kepler/`, files `*kepler-display-pull<N>*`
 | Pull | Files | Status | One-liner |
 |---|---|---|---|
-| 3 | BRIEF-kepler-display-pull3-decode / PROPOSAL-kepler-display-pull3 | LANDED 8ddc7fc3 — metal owed s13 | read-only candidate decode (dense windows, 3 passes, arithmetic cross-check) |
+| 3 | BRIEF-kepler-display-pull3-decode / PROPOSAL-kepler-display-pull3 | LANDED 8ddc7fc3; s13: DELIVERED (0x604/0x614 = telemetry; timing block pinned; no surface addr in windows) | read-only candidate decode (dense windows, 3 passes, arithmetic cross-check) |
 | 2 | BRIEF-kepler-display-pull2-head0-anchor / PROPOSAL-kepler-display-pull2 | LANDED f148d199; s12: DELIVERED (49/40 rows, diff decoded — no bare surface addr; 0x310 lead candidate) | capped head-0 dump (96) + head-1 baseline (64) |
 | 1 | BRIEF-kepler-display-pull1-scanout-rederive / PROPOSAL-kepler-display-pull1 | LANDED; s11: HEAD 0 ALIVE (mirrors refuted, stat anchor proven) | module split + dual-mirror trace |
 
