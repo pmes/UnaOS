@@ -143,6 +143,10 @@ that share this module.
 > practice; those files are outside the scheduler lane, so SCHED-3 lands the
 > mechanism + witness and leaves the call-site conversion to a net/main arc.
 
+### Orphan-reaper wake on enqueue (aarch64, SCHED-4b)
+
+**SCHED-4 sleep_ticks regression** (U11-reap FAIL, timer never ticks in QEMU) bisected and fixed by SCHED-4b (`d7631117`): semaphore wake on orphan enqueue — ~0% idle duty metal-confirmed (c2=0% P31b), U11-reap PASS restored.
+
 ---
 
 ## 3. Blocking and synchronization primitives

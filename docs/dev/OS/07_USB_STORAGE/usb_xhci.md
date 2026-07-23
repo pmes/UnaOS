@@ -210,6 +210,10 @@ the x86 MISSION-SUCCESS storage gate is unchanged. The RS=1 witness now prints
 `DCBAAP` reassembled from two 32-bit reads alongside the raw single-load readback
 (`DCBAAP_raw64`), so the replication is directly observable on the wire.
 
+### 2b. P31b metal result — enable-slot and HID keyboard enumeration (PIUSB-21 / PIUSB-22)
+
+**P31b METAL RESULT (2026-07-23): the 64-bit-MMIO lo/hi fix CONFIRMED** — enable-slot completed, slots 2/3 addressed, HID boot-keyboard ARMED, first report received, mouse witness up: **FIRST USB INPUT DEVICE ENUMERATED ON PI SILICON.** Residual: interrupt-IN pipe delivers one report then goes silent (no xHCI: KEY lines under typing) — **PIUSB-22 in flight** (re-queue / ERDP EHB write-order under the new lo/hi split / SET_IDLE fork).
+
 ---
 
 ## 3. Interrupt model (MSI → local APIC)
