@@ -964,6 +964,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         let online = unaos_kernel::arch::smp::online_secondaries();
         if let (Some(&render_cpu), Some(&input_cpu)) = (online.first(), online.last()) {
             GUI_CHANNEL.init(); // reserve waiter capacity on the BSP before the tasks block on it
+            // INPUT-WIRE: prove the router->ring path once, HERE — before any input/render service task is
+            // spawned, so EVENT_QUEUE is empty and no EL0 slot is live (a deterministic, non-perturbing
+            // window). The ELF-5 witness proves ring->EL0-drain; this closes the router half.
+            input_router_selftest();
             unaos_kernel::arch::serial::RX_READY.init(); // M5c: the RX-wake semaphore's waiter list
             unaos_kernel::video::fbcon::detach();
             // M5c: on metal, route + enable the PL011 RX interrupt (SPI 153) to the input core so the
@@ -2048,6 +2052,60 @@ fn gui_send(ev: unaos_kernel::pal::Event) {
     GUI_CHANNEL.send(ev);
 }
 
+/// INPUT-WIRE (ELF-5 router fold): drain every pending pal event into the ACTIVE EL0 program's per-process
+/// input ring via the `el0_input_enqueue` seam. The single choke point for router->ring delivery — called by
+/// `pump_usb_into_gui` when an EL0 app holds input focus, and exercised directly by `input_router_selftest`.
+/// Returns the count actually queued (a deliverable event on a non-full ring); Timer/None/Unknown and a full
+/// ring are dropped by the seam (returns `false`). Never forwards into GUI_CHANNEL — that is the whole point.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn route_input_to_active_el0() -> usize {
+    let mut routed = 0usize;
+    while let Some(ev) = unaos_kernel::pal::next_event() {
+        if unaos_kernel::arch::aarch64::syscall::el0_input_enqueue(ev) {
+            routed += 1;
+        }
+    }
+    routed
+}
+
+/// INPUT-WIRE QEMU witness: prove the ROUTER path (EVENT_QUEUE -> the active-focus EL0 ring) that the ELF-5
+/// in-RAM `input_launcher` test cannot — it injects straight into `el0_input_enqueue`, bypassing the router.
+/// This runs the REAL router drain (`route_input_to_active_el0`, the exact code `pump_usb_into_gui` calls)
+/// against a FAKE active focus and asserts: (1) a Key and a Mouse event pushed into EVENT_QUEUE are routed
+/// to the focused ring (routed == 2), (2) a non-deliverable Timer is dropped (not routed), and (3) GUI_CHANNEL
+/// is BYPASSED (GUI_SENT unchanged — the events did NOT leak into the render channel). The ring -> EL0 drain
+/// half is proven by the ELF-5 `:: EL0: input test … ::` witness; together they cover the full HID->EL0 path.
+/// HONEST QEMU NOTE: the real HID *edge* (a USB keypress landing in EVENT_QUEUE) is metal-only — QEMU raspi4b
+/// delivers no HID — so this drives the router with a synthetically pushed event. Called ONCE on the BSP
+/// before the input/render service tasks are spawned, when EVENT_QUEUE is guaranteed empty (no producer has
+/// run) and no EL0 slot is live, so ASID 1 is a safe fake target and the test perturbs nothing.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn input_router_selftest() {
+    use core::sync::atomic::Ordering;
+    use unaos_kernel::arch::aarch64::syscall as sc;
+    let sent0 = GUI_SENT.load(Ordering::Relaxed);
+    // Fake focus: ASID 1 is a valid ring index (the per-ASID rings exist independent of slot liveness); no
+    // real EL0 slot is allocated this early in boot, so nothing else targets it. Setting focus resets the ring.
+    sc::el0_input_set_active(1);
+    unaos_kernel::pal::push_event(unaos_kernel::pal::Event::Key(b'R'));
+    unaos_kernel::pal::push_event(unaos_kernel::pal::Event::Mouse { x: 3, y: -4 });
+    unaos_kernel::pal::push_event(unaos_kernel::pal::Event::Timer); // non-deliverable — must be dropped
+    let routed = route_input_to_active_el0();
+    let sent1 = GUI_SENT.load(Ordering::Relaxed);
+    sc::el0_input_set_active(0); // restore: no active EL0 focus for the real boot
+    if routed == 2 && sent1 == sent0 {
+        serial_println!(
+            ":: EL0: input router — routed=2 (key+mouse) to active-focus ring, Timer dropped, GUI_CHANNEL bypassed :: PASS ::"
+        );
+    } else {
+        serial_println!(
+            ":: EL0: input router — routed={} gui_sent_delta={} :: FAIL ::",
+            routed,
+            sent1.wrapping_sub(sent0)
+        );
+    }
+}
+
 /// PIUSB-23 (bare-metal aarch64): pump the xHCI controller from the scheduled input service and bridge
 /// decoded HID keys into the GUI channel. THE keyboard-goes-silent structural fix.
 ///
@@ -2091,6 +2149,28 @@ fn pump_usb_into_gui() {
     // channel empty. Normal forwarding resumes the instant the command returns (flag cleared).
     // poll_events() above still ran (it re-arms the HID rings + fills EVENT_QUEUE) — only the
     // forward is suppressed, and the app's pump_and_poll is the sole consumer meanwhile.
+    // INPUT-WIRE (ELF-5 router fold): when an EL0 program holds input focus (its ASID registered via
+    // `el0_input_set_active` in `run_user_image`), route the drained pal events into ITS per-process ring
+    // through the `el0_input_enqueue` seam — keyboard AND mouse — instead of GUI_CHANNEL. The EL0 app is
+    // the SOLE consumer of that ring (it polls via SYS_INPUT_POLL); it cannot reach EVENT_QUEUE, so — unlike
+    // the SCREEN_APP_ACTIVE kernel-app gate below, which LEAVES events in EVENT_QUEUE for the app's own
+    // `pump_and_poll` drain — we DRAIN here (a left event would never be consumed and would just age out of
+    // the 64-slot queue). This check takes PRECEDENCE over SCREEN_APP_ACTIVE: the `run` shell command
+    // dispatches through `dispatch_command` (which sets SCREEN_APP_ACTIVE), so both flags are live during an
+    // EL0 `run`, and the EL0 ring is the real sink. `poll_events()` above already re-armed the HID rings and
+    // filled EVENT_QUEUE; only the destination changes.
+    //
+    // Watchdog / escape hatch: an EL0 program runs under `run_user_image`'s 5 s deadline (shell.rs), which
+    // EQUALS `gui_watchdog::WATCHDOG_TIMEOUT_SECS`, so a wedged EL0 app loses the screen after 5 s by that
+    // bound — no per-process drain-counter seam is added, and the `gui_watchdog` note_progress/poll path is
+    // left byte-untouched (it stays exact for kernel apps, which DO call `note_progress`). `run_user_image`
+    // clears the focus on return, so the router reverts to the GUI_CHANNEL / SCREEN_APP_ACTIVE paths the
+    // instant the program exits — the shell regains the keyboard immediately.
+    if unaos_kernel::arch::aarch64::syscall::el0_input_active() != 0 {
+        route_input_to_active_el0();
+        click2_depth_witness();
+        return;
+    }
     if SCREEN_APP_ACTIVE.load(core::sync::atomic::Ordering::Relaxed) {
         // Non-destructively witness a pending press for the `[click2] input left for app` line, then
         // hand every event back to the app untouched. Drain into a fixed buffer (queue is bounded to

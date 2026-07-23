@@ -6427,6 +6427,15 @@ pub fn run_user_image(
     // exit/kill path's `proc_find_running` lookup (the sys_spawn co-location invariant, reused here).
     PROCS[pi].asid.store(asid, Ordering::Release);
     PROCS[pi].pid.store(pid, Ordering::Release);
+    // INPUT-WIRE (ELF-5 router fold): register this program as the ACTIVE input target so the GUI router
+    // (main.rs `pump_usb_into_gui`) delivers real keys/mouse into ITS per-process ring while it runs. Set
+    // AFTER the slot exists and the pid is published (the router only enqueues to a live, resolvable ASID),
+    // and BEFORE the wait loop yields (the co-located task cannot be dispatched until we yield below, so no
+    // input is missed). Cleared on return just below — and `clear_handle_row` already clears the designation
+    // on the slot's teardown, so an exited program's focus never lingers; the explicit clear covers the
+    // Timeout path (task still alive, no teardown yet). Setting a focus RESETS the ring, so a fresh program
+    // starts with an empty input queue.
+    el0_input_set_active(asid);
     // Deadline-bounded cooperative wait: yield so the co-located task runs; its SYS_EXIT (or the fault-kill
     // path) marks PROCS[pi] EXITED and records the status via the GENERIC child-reap short-circuit.
     let start = super::timer::cntpct();
@@ -6443,6 +6452,11 @@ pub fn run_user_image(
     } else {
         RunOutcome::Timeout
     };
+    // INPUT-WIRE: drop input focus so the shell regains the keyboard the instant this program returns.
+    // Belt-and-suspenders with `clear_handle_row`'s teardown clear (which fired already if the program
+    // exited/was killed and its slot was torn down) — and the SOLE clear on the Timeout path, where the
+    // task is still alive and no teardown has run. Idempotent: a no-op if the designation was already 0.
+    el0_input_set_active(0);
     // Reap the Proc entry. The scheduler's exit path already repointed THIS core to the boot root (ASID 0)
     // and dispatched back to the caller (the shell task), so the shell's ASID-0 invariant holds on return.
     proc_free(pi);

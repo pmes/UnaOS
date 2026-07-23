@@ -454,6 +454,41 @@
   ```
   Lane: `arch/aarch64/syscall.rs` (the ring + seams + `sys_input_poll` + the `clear_handle_row` fold + the
   in-RAM witness) + this doc — no scheduler primitive, no driver, no `main.rs`/`pal.rs` change, no x86 file.
+- **INPUT-WIRE (landed 2026-07-23)** — folds ELF-5's deferred router wiring so a running EL0 program receives
+  REAL keys/mouse. Two halves:
+  - **Router (main.rs `pump_usb_into_gui`).** When an EL0 program holds input focus (`el0_input_active() != 0`),
+    the GUI router drains `pal::next_event()` into that process's per-process ring via the `el0_input_enqueue`
+    seam — **keyboard AND mouse** (Key/KeyUp/Mouse/MouseAbsolute/Button; Timer/None/Unknown are dropped by the
+    seam) — instead of `GUI_CHANNEL`. Factored into `route_input_to_active_el0()`, the single router->ring choke
+    point. This branch takes **precedence over `SCREEN_APP_ACTIVE`**: the panel `run` verb dispatches through
+    `dispatch_command` (which sets `SCREEN_APP_ACTIVE`), so both flags are live during an EL0 `run`, and the EL0
+    ring is the real sink. Unlike the kernel-app `SCREEN_APP_ACTIVE` gate (which LEAVES events in `EVENT_QUEUE`
+    for the app's own `pump_and_poll`), the EL0 branch **drains** — an EL0 app cannot reach `EVENT_QUEUE`, so a
+    left event would never be consumed.
+  - **Focus lifecycle (`run_user_image`).** Focus is registered (`el0_input_set_active(asid)`) right after the
+    slot exists and the pid is published, and BEFORE the wait loop yields (the co-located task cannot dispatch
+    until then, so no input is missed). It is cleared (`el0_input_set_active(0)`) on return: `clear_handle_row`
+    already clears the designation on slot teardown (verified — ELF-5's `EL0_INPUT_ACTIVE` compare-exchange), so
+    the explicit clear is belt-and-suspenders for the exit/kill path and the **sole** clear on the Timeout path
+    (task still alive, no teardown). The shell regains input the instant the program returns.
+  - **Watchdog / escape hatch — decision (documented).** The heartbeat for a focused EL0 app is **`run_user_image`'s
+    own deadline**, NOT a new per-process drain-counter seam. The shell's `run` gives a **5 s deadline**
+    (`shell.rs`), which EQUALS `gui_watchdog::WATCHDOG_TIMEOUT_SECS`, so a wedged EL0 app loses the screen after
+    5 s by that bound — the simplest sound choice. The `gui_watchdog` `note_progress`/`poll` path is left
+    **byte-untouched** (it stays exact for kernel apps, which call `note_progress`); the shell's escape hatch (the
+    deadline return, and the watchdog's `SCREEN_APP_ACTIVE` reclaim at the same 5 s) is preserved.
+  - **QEMU proof.** A new BSP-side `input_router_selftest()` runs the REAL router drain against a fake active
+    focus (ASID 1, before any service task or EL0 slot is live, `EVENT_QUEUE` empty): a Key + a Mouse pushed into
+    `EVENT_QUEUE` are routed to the focused ring (`routed == 2`), a Timer is dropped, and `GUI_CHANNEL` is bypassed
+    (`GUI_SENT` unchanged) — `:: EL0: input router — routed=2 (key+mouse) to active-focus ring, Timer dropped,
+    GUI_CHANNEL bypassed :: PASS ::`. This proves the router->ring edge; the ELF-5 `:: EL0: input test … ::`
+    witness proves ring->EL0-drain; together they cover the full path. **HONEST QEMU NOTE:** the real HID *edge*
+    (a USB keypress landing in `EVENT_QUEUE`) is metal-only — QEMU raspi4b delivers no USB HID — so the selftest
+    drives the router with a synthetically pushed event. **What an interactive EL0 program can now do:** an ELF-3
+    surface + ELF-2 threads app run via `run <path>` receives live keyboard and mouse from real hardware through
+    `SYS_INPUT_POLL`, drawing/responding to input — the last delivery gap in the EL0-vug ladder.
+    Lane: `main.rs` (the router branch + `route_input_to_active_el0` + `input_router_selftest`) + the
+    `run_user_image` focus-registration call site in `arch/aarch64/syscall.rs` + this doc.
 - Not yet: **revocation trees** (a derived copy — re-grant or onward re-transfer — escapes
   single-level revoke today; derivation records + `CAP_REVOKE` are that arc), the **bandy Ring-3
   delegation wrapper**, `File` transfer (descriptor migration), real `Socket` fs/net syscalls.
