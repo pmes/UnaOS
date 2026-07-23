@@ -21,7 +21,7 @@ QEMU behavior. Newest sitting first.
      tears the Kepler display engine down at EBS while the gmux keeps the
      panel wired to it (which would produce exactly the black panel).
   3. Display line pivots back to Kepler-side scanout derivation
-     (BRIEF-video-pull6-kepler-scanout-rederive in the iGUI lane dir — the
+     (BRIEF-kepler-display-pull1-scanout-rederive in video/Kepler/ — the
      display specialist carries it; module split first so the two Kepler
      lanes don't collide in kepler.rs).
 

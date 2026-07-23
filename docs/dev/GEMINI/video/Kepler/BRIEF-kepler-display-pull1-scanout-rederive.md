@@ -1,6 +1,6 @@
-STATUS: BRIEF — awaiting proposal (`PROPOSAL-video-pull6.md`, this directory)
+STATUS: BRIEF — awaiting proposal (`PROPOSAL-kepler-display-pull1.md`, this directory)
 
-# BRIEF — display pull 6: the panel is Kepler's — re-derive GK107 scanout
+# BRIEF — Kepler display pull 1: the panel is Kepler's — re-derive GK107 scanout
 
 Coordinator-authored (2026-07-22, post sitting #10 boot 1). The display lane
 (this directory) pivots from Intel to Kepler: the gmux, on a PROVEN protocol,
