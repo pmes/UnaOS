@@ -1,6 +1,18 @@
 # PROPOSAL — Kepler Pull 13: Instance Bytes Visibility (Flush)
 
-STATUS: PROPOSED
+STATUS: APPROVED WITH AMENDMENTS (2026-07-22 — reviewer verified the load-
+bearing citation: PFIFO_FLUSH array at 0x70000, G84-, FLUSH_CTRL at +0
+(g80_pfifo.xml:471-473) ✓. Single-variable design and pre-committed fallback
+accepted. Amendments:
+A1 — print FLUSH_CTRL's readback value both before the trigger write and
+after (not just "flush-executed"): if the register reads as poison/absent on
+GK107 the experiment is void and must SAY so, same absence-honesty rule as
+CHAN_TABLE_ERROR.
+A2 — bound the trigger: if FLUSH_CTRL exposes a busy/trigger-clear bit, poll
+it bounded and print the settle; if not, the single readback serialization
+stands as designed.
+Markers as listed. Full-knob land-review; arch gate stays. Metal owed:
+sitting #12.)
 
 This pull tests the hypothesis that the `NO_POLL` rejection occurs because the PFIFO engine reads a stale/cached view of the instance block during channel validation, failing to see our `USERD` pointer and flags written via BAR1.
 

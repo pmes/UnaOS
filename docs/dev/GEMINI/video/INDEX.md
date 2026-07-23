@@ -6,7 +6,7 @@ Three pull sequences, numbered independently. Every pull = one BRIEF (coordinato
 ## Lane 1: Kepler FENCE (PFIFO/scheduler — kepler.rs) — `video/Kepler/`, files `*kepler-pull<N>*`
 | Pull | Files | Status | One-liner |
 |---|---|---|---|
-| 13 | BRIEF-kepler-pull13-visibility | BRIEF OUT | scheduler-side VRAM visibility (flush before validate) |
+| 13 | BRIEF-kepler-pull13-visibility / PROPOSAL-kepler-pull13 | APPROVED W/ AMENDMENTS | PFIFO_FLUSH 0x70000 before validate (citation verified) |
 | 12 | BRIEF-kepler-pull12-poll-area-2 / PROPOSAL-kepler-pull12 | LANDED; s11: REFUTED (bit persists in inst, err=2) | USERD_HI bit31 test; SNOOP scrubbed |
 | 11 | BRIEF-kepler-pull11-poll-area / PROPOSAL-kepler-pull11 | LANDED 7124e4e1; s10: candidate refuted | USERD_SNOOP test — inert on GK107 |
 | 10 | BRIEF-kepler-pull10-sched-precondition / PROPOSAL-kepler-pull10 | LANDED 2650a38b; s9: CHIP NAMED NO_POLL | ask-the-chip error readback |
@@ -18,7 +18,7 @@ Three pull sequences, numbered independently. Every pull = one BRIEF (coordinato
 ## Lane 2: Kepler DISPLAY (scanout — kepler_display.rs after split) — `video/Kepler/`, files `*kepler-display-pull<N>*`
 | Pull | Files | Status | One-liner |
 |---|---|---|---|
-| 2 | BRIEF-kepler-display-pull2-head0-anchor | BRIEF OUT | map head-0 block from the proven HEAD_STAT anchor |
+| 2 | BRIEF-kepler-display-pull2-head0-anchor / PROPOSAL-kepler-display-pull2 | APPROVED W/ AMENDMENTS | filtered head-0 block dump + dead-head-1 differential baseline |
 | 1 | BRIEF-kepler-display-pull1-scanout-rederive / PROPOSAL-kepler-display-pull1 | LANDED; s11: HEAD 0 ALIVE (mirrors refuted, stat anchor proven) | module split + dual-mirror trace |
 
 (Lane exists because sitting #10 proved the discrete GPU owns the panel; carried

@@ -1,3 +1,21 @@
+STATUS: APPROVED WITH AMENDMENTS (2026-07-22 — the raster-counter decode
+locking the anchor (VERT line/frame counters + HORZ pixel consistent with an
+active mode) and the filtered full-block dump are both accepted; live-only
+filtering is the right shape. Amendments:
+A1 — cap the dump at 96 printed rows with a final ":: kdisp: head0-dump
+rows=<n> capped=<bool> ::" summary line, so a dense block can't flood the
+serial capture; if capped, the next pull narrows the window.
+A2 — also dump the SAME filtered sweep for head 1 (dead head) as a
+64-row-capped baseline: a register live on head 0 but zero on head 1 is a
+far stronger scanout-state candidate than one live on both (capabilities/
+constants will be live everywhere). Two sweeps, one boot, differential
+decode.
+A3 — success values: also accept the shifted form 0x200 at ANY alignment the
+field defines (print raw; the offline diff decides) — don't hard-filter to
+the two guessed encodings.
+Read-only confirmed. Full-knob land-review; strings-proof both artifacts;
+arch gate stays. Metal owed: sitting #12.)
+
 # PROPOSAL — Kepler display pull 2: head 0 scans
 
 ## The Anchor: Raster Counter Confirmation
