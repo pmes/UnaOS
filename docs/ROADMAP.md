@@ -52,7 +52,7 @@ Security model: **capabilities first, POSIX-layerable** — detailed in
 | :--- | :--- | :--- | :--- |
 | **U1a** | x86 ring-3 round-trip: user GDT descriptors, TSS.RSP0, SYSCALL/SYSRET MSRs, `sys_write`/`sys_exit`, U/S page-walk demotion for the user window. Immediate hardening: EFER.NXE, NX on user data, CR4.SMEP | rmbp | design from Pi M6a (proven) |
 | **U1b** | x86 fault→task-kill: PF/GP handlers kill the offending user task instead of halting; survivor demos + verdict | rmbp | design from Pi M6b |
-| **U2** | Loadable programs: flat user blob read from FAT storage, loaded and run in ring 3 (ELF later) | rmbp | Pi as **M6c** via embedded blob (no Pi storage driver yet) |
+| **U2** | Loadable programs: flat user blob read from FAT storage, loaded and run in ring 3. "ELF later" debt closed on aarch64 by **ELF-1** (2026-07-22): the loader dispatches on the ELF magic — a minimal static ELF64 (aarch64) validator walks the `PT_LOAD` program headers and maps each segment with per-segment page permissions (R/X code page, R/W data page, `.bss` tail zeroed); the flat `.BIN` path stays the fallback so every existing fixture is untouched. Fixture `ELFHELLO.ELF` (two segments) + the QEMU-verified `:: ELF1: … PASS ::` witness | rmbp | Pi as **M6c** via embedded blob → **ELF-1** static-ELF loader |
 | **U3** | Per-process address spaces: per-process PML4, CR3 switch in the scheduler | rmbp | Pi as **M6d** (per-task TTBR0 + ASID) |
 | **U4** | Process model: PIDs, spawn/wait/exit status, **per-process handle table** — arch-neutral | shared | — |
 | **U5** | **Capability model**: handles are capabilities; every syscall checked at the handle table; grant/attenuate/revoke; bandy handle-transfer semantics | shared | — |

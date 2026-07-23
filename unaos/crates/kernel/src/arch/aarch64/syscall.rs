@@ -5547,6 +5547,7 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
             uowner_report(a0);
             k2_report(a0);
             bandy_report(a0);
+            elf1_report(a0);
             0
         }
         SYS_YIELD => sys_yield(),
@@ -5675,6 +5676,14 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
                     EL0_M6G_DONE.fetch_add(1, Ordering::AcqRel);
                 } else {
                     EL0_M6G_ERR.fetch_add(1, Ordering::AcqRel);
+                }
+            } else if super::sched::current_name() == Some("elf1-hello") {
+                // ELF-1: the ELF-loaded program exits 0. Route by NAME (like m6g-hello) so its clean exit
+                // lands in the ELF1 counters and never corrupts the M6b `EL0_EXITED_OK` accounting.
+                if a0 == 0 {
+                    EL0_ELF1_DONE.fetch_add(1, Ordering::AcqRel);
+                } else {
+                    EL0_ELF1_ERR.fetch_add(1, Ordering::AcqRel);
                 }
             } else if a0 == M6E_SPIN_STATUS {
                 EL0_SPIN_DONE.fetch_add(1, Ordering::AcqRel);
@@ -6068,12 +6077,16 @@ const EMSGSIZE: i64 = -90; // BANDY-1: SYS_MRECV buffer smaller than BUS_FRAME_M
 /// A program successfully loaded into a fresh per-task slot: the EL0 entry VA, the initial SP_EL0, the
 /// slot's TTBR0, and (for the M6g loader's log line) the slot id, byte length, and FAT kind.
 struct Loaded {
-    base: u64,
+    base: u64, // the EL0 ENTRY VA: the window base for a flat blob, `bias + e_entry` for an ELF
     sp: u64,
     ttbr0: u64,
     slot: usize,
-    len: usize,
+    len: usize, // total on-disk image byte length (for the loader's log line)
     kind: crate::fs::fat::FatKind,
+    // ELF-1: how the image was loaded. `is_elf` distinguishes the two paths; `nsegs` is the number of
+    // PT_LOAD segments mapped (1 for the flat path). The ELF-1 witness reads these to prove the ELF path ran.
+    is_elf: bool,
+    nsegs: u32,
 }
 
 /// Why `load_program_into_slot` could not produce a `Loaded`. The `FatKind` rides along on the post-mount
@@ -6086,6 +6099,10 @@ enum SpawnErr {
     ReadErr(crate::fs::fat::FatKind, crate::fs::fat::FatError),
     Empty(crate::fs::fat::FatKind),
     NoSlot(crate::fs::fat::FatKind),
+    // ELF-1: the image began with the ELF magic but was not a loadable minimal static aarch64 ELF (a
+    // rejected ident/type/machine, a malformed/oversize program header, or a segment that would not fit
+    // the slot window). The `&'static str` names the specific rejection for the loader's honest log line.
+    BadElf(crate::fs::fat::FatKind, &'static str),
 }
 
 /// Map a load failure to the errno sys_spawn returns to EL0.
@@ -6096,6 +6113,7 @@ fn spawn_errno(e: &SpawnErr) -> i64 {
         SpawnErr::BadSize(_, _) => E2BIG,
         SpawnErr::ReadErr(_, _) | SpawnErr::Empty(_) => EIO,
         SpawnErr::NoSlot(_) => EAGAIN,
+        SpawnErr::BadElf(_, _) => EINVAL, // a malformed/unsupported ELF is a bad argument, not I/O
     }
 }
 
@@ -6115,10 +6133,13 @@ fn load_program_into_slot(name: &str) -> Result<Loaded, SpawnErr> {
     let fs = crate::fs::fat::mount().map_err(SpawnErr::NoMount)?;
     let kind = fs.kind();
     let de = fs.find_in_root(name).map_err(|_| SpawnErr::NoFile(kind))?;
-    // Reject up-front from the ON-DISK directory size (the U2 truncation lesson): `read_file` caps the copy
-    // at min(de.size, cap), so a post-read length check could never SEE an oversize file — it would silently
-    // truncate then run it. Gate on `de.size` against the single code page instead.
-    let cap = super::boot::USER_CODE_SIZE;
+    // Read the WHOLE on-disk image, bounded by the slot's user window (the U2 truncation lesson: `read_file`
+    // caps at min(de.size, cap), so a post-read length check could never SEE an oversize file — it would
+    // silently truncate then run it; gate on `de.size` up front). The cap is the 16 KiB WINDOW, not one code
+    // page, so a small static ELF's headers + segments fit; the FLAT path re-bounds to one code page below,
+    // and the ELF path bounds each SEGMENT to the window. The image is hashed WHOLE for the principal, so the
+    // cap must admit the whole file (a >window image is `BadSize`, never a truncated hash).
+    let cap = super::boot::USER_REGION_SIZE;
     if de.size == 0 || de.size as u64 > cap as u64 {
         return Err(SpawnErr::BadSize(kind, de.size));
     }
@@ -6127,39 +6148,246 @@ fn load_program_into_slot(name: &str) -> Result<Loaded, SpawnErr> {
     if bytes.is_empty() {
         return Err(SpawnErr::Empty(kind));
     }
-    let slot = super::boot::alloc_user_slot().ok_or(SpawnErr::NoSlot(kind))?;
+
+    // ELF-1: dispatch on the magic. VALIDATE fully BEFORE allocating a slot (the "slot allocated LAST"
+    // invariant — there is no free-an-unused-slot primitive, so no fallible step may follow the alloc). For
+    // a flat blob the validation is the one-code-page bound; for an ELF it is the full header/phdr/segment
+    // walk. Only the (infallible, given a validated plan) copy+map follows the alloc.
     let (base, size) = super::boot::user_region();
+    let elf_plan = if is_elf_image(&bytes) {
+        Some(validate_elf(&bytes, size).map_err(|why| SpawnErr::BadElf(kind, why))?)
+    } else {
+        // FLAT path: the historical model — one code page, entered at offset 0, position-independent. Keep
+        // the exact `USER_CODE_SIZE` bound (a larger flat blob is `BadSize`/E2BIG, byte-identical to before).
+        if bytes.len() > super::boot::USER_CODE_SIZE {
+            return Err(SpawnErr::BadSize(kind, bytes.len() as u32));
+        }
+        None
+    };
+
+    let slot = super::boot::alloc_user_slot().ok_or(SpawnErr::NoSlot(kind))?;
     let backing = super::boot::slot_backing_ptr(slot);
-    unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), backing, bytes.len()) };
-    super::cache::icache_sync_range(backing as usize, bytes.len());
-    unsafe { super::boot::protect_user_slot_code(slot, super::boot::USER_CODE_SIZE) };
+    let (entry, nsegs, is_elf) = match &elf_plan {
+        Some(plan) => {
+            // Map each PT_LOAD: zero [dst, dst+memsz) (the .bss tail — p_memsz>p_filesz), copy p_filesz
+            // bytes, then flip executable segments to code pages; R/W segments stay data pages.
+            for i in 0..plan.nsegs {
+                let s = plan.segs[i];
+                let dst_off = (s.vaddr - plan.min_vaddr) as usize;
+                unsafe {
+                    let dst = backing.add(dst_off);
+                    core::ptr::write_bytes(dst, 0, s.memsz); // zero the whole memsz (covers the bss tail)
+                    core::ptr::copy_nonoverlapping(bytes.as_ptr().add(s.off), dst, s.filesz);
+                }
+            }
+            // I-cache sync + code-protect the executable segments (after the copies, while pages are RW).
+            for i in 0..plan.nsegs {
+                let s = plan.segs[i];
+                if s.flags & PF_X != 0 {
+                    let dst_off = (s.vaddr - plan.min_vaddr) as usize;
+                    super::cache::icache_sync_range(backing as usize + dst_off, s.memsz);
+                    unsafe { super::boot::protect_user_slot_code_range(slot, dst_off, s.memsz) };
+                }
+            }
+            let entry = base + (plan.entry - plan.min_vaddr);
+            (entry, plan.nsegs as u32, true)
+        }
+        None => {
+            // FLAT: copy to the code page at the window base, I-cache sync, protect page 0.
+            unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), backing, bytes.len()) };
+            super::cache::icache_sync_range(backing as usize, bytes.len());
+            unsafe { super::boot::protect_user_slot_code(slot, super::boot::USER_CODE_SIZE) };
+            (base, 1, false)
+        }
+    };
     let ttbr0 = super::boot::slot_ttbr0(slot);
     // IMAGE_SHA256 (code-signing): stamp this slot's persistent principal from the loaded IMAGE bytes, not the
     // 8.3 name — the SOLE mint path, kernel-derived from `bytes` (the untrusted image), never EL0-set. This
     // GRADUATES the U6 owner from PROGRAM_NAME ("same 8.3 name = same principal", the honest residual) to the
     // image digest: two byte-identical images share a principal (a re-spawn is re-admitted by name+identity),
     // two DIFFERENT images under the same name do NOT (a swapped blob is refused). `name` still drives
-    // find/read/logging, so it stays live.
+    // find/read/logging, so it stays live. Hashed over the WHOLE file image (flat or ELF) identically.
     slot_ppid_stamp(ttbr0 >> 48, PrincipalRecord::image_of(&bytes));
     Ok(Loaded {
-        base,
+        base: entry,
         sp: (base + size as u64) & !0xF, // 16-aligned window top = initial SP_EL0
         ttbr0,
         slot,
         len: bytes.len(),
         kind,
+        is_elf,
+        nsegs,
     })
+}
+
+// =============================================================================================
+// ELF-1: a minimal static ELF64 (aarch64) loader. Validates the ident + type + machine, walks the
+// PT_LOAD program headers, and (in `load_program_into_slot`) maps each segment into a slot's 16 KiB user
+// window with per-segment permissions. Deliberately minimal: ET_EXEC only, no dynamic linking, no
+// relocations (the fixture is position-independent), no interpreter. The flat-binary path stays the
+// fallback for images without the ELF magic, so every existing .BIN fixture is untouched.
+// =============================================================================================
+
+const ELF_MAGIC: [u8; 4] = [0x7F, b'E', b'L', b'F'];
+const ELFCLASS64: u8 = 2; // e_ident[EI_CLASS]
+const ELFDATA2LSB: u8 = 1; // e_ident[EI_DATA] — little-endian
+const ET_EXEC: u16 = 2; // e_type — a fixed-address executable (no PIE/DYN this arc)
+const EM_AARCH64: u16 = 183; // e_machine (0xB7)
+const PT_LOAD: u32 = 1; // p_type — a loadable segment
+const PF_X: u32 = 0x1; // p_flags — executable
+const PF_W: u32 = 0x2; // p_flags — writable
+const EHDR_SIZE: usize = 64; // sizeof(Elf64_Ehdr)
+const PHDR_SIZE: usize = 56; // sizeof(Elf64_Phdr)
+const MAX_LOAD_SEGS: usize = 8; // a minimal loader ceiling (a real ELF here has 2); reject more, fail-closed
+
+/// One validated PT_LOAD segment: its file offset/size, virtual address, in-memory size (>= filesz for a
+/// .bss tail), and flags. Bounds are already checked against the image and the slot window at collection.
+#[derive(Clone, Copy)]
+struct ElfSeg {
+    off: usize,
+    vaddr: u64,
+    filesz: usize,
+    memsz: usize,
+    flags: u32,
+}
+
+/// A validated load plan: the entry VA, the lowest PT_LOAD vaddr (the load bias is `window_base - min_vaddr`,
+/// so p_vaddr are treated as offsets from the window base — the fixture links at 0), and the collected
+/// segments. Fixed-size array (no heap): a minimal loader with a hard `MAX_LOAD_SEGS` ceiling.
+struct ElfPlan {
+    entry: u64,
+    min_vaddr: u64,
+    segs: [ElfSeg; MAX_LOAD_SEGS],
+    nsegs: usize,
+}
+
+/// True iff `b` begins with the ELF magic (`\x7fELF`). The dispatch between the ELF loader and the flat
+/// fallback — a flat .BIN never begins with this magic (the fixtures start with `mov`/`b`), so they route
+/// to the flat path unchanged.
+fn is_elf_image(b: &[u8]) -> bool {
+    b.len() >= 4 && b[0..4] == ELF_MAGIC
+}
+
+// Little-endian field reads, bounds-checked against the image slice (a malformed ELF must never index OOB).
+fn rd_u16(b: &[u8], off: usize) -> Option<u16> {
+    b.get(off..off + 2).map(|s| u16::from_le_bytes([s[0], s[1]]))
+}
+fn rd_u32(b: &[u8], off: usize) -> Option<u32> {
+    b.get(off..off + 4).map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+}
+fn rd_u64(b: &[u8], off: usize) -> Option<u64> {
+    b.get(off..off + 8)
+        .map(|s| u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]))
+}
+
+/// Validate a minimal static ELF64 image and collect its PT_LOAD plan, WITHOUT allocating a slot (so a
+/// rejection leaks nothing). `win_size` is the slot's user-window size — every segment's in-window span
+/// (`p_vaddr - min_vaddr + p_memsz`) must fit it. Returns the plan or a `&'static str` naming the rejection
+/// (honest error, surfaced by the loader's log line and as `-EINVAL` to a `sys_spawn`).
+fn validate_elf(b: &[u8], win_size: usize) -> Result<ElfPlan, &'static str> {
+    if b.len() < EHDR_SIZE {
+        return Err("truncated ELF header");
+    }
+    // e_ident checks (magic already matched by `is_elf_image`).
+    if b[4] != ELFCLASS64 {
+        return Err("not ELF64 (EI_CLASS != 2)");
+    }
+    if b[5] != ELFDATA2LSB {
+        return Err("not little-endian (EI_DATA != 1)");
+    }
+    if rd_u16(b, 16) != Some(ET_EXEC) {
+        return Err("not ET_EXEC");
+    }
+    if rd_u16(b, 18) != Some(EM_AARCH64) {
+        return Err("not EM_AARCH64");
+    }
+    let e_entry = rd_u64(b, 24).ok_or("bad e_entry")?;
+    let e_phoff = rd_u64(b, 32).ok_or("bad e_phoff")? as usize;
+    let e_phentsize = rd_u16(b, 54).ok_or("bad e_phentsize")? as usize;
+    let e_phnum = rd_u16(b, 56).ok_or("bad e_phnum")? as usize;
+    if e_phentsize != PHDR_SIZE {
+        return Err("unexpected e_phentsize");
+    }
+    if e_phnum == 0 {
+        return Err("no program headers");
+    }
+    // The whole program-header table must lie inside the image.
+    let ph_end = e_phoff.checked_add(e_phnum * PHDR_SIZE).ok_or("phdr table overflow")?;
+    if ph_end > b.len() {
+        return Err("program-header table out of image");
+    }
+
+    let mut segs = [ElfSeg { off: 0, vaddr: 0, filesz: 0, memsz: 0, flags: 0 }; MAX_LOAD_SEGS];
+    let mut nsegs = 0usize;
+    let mut min_vaddr = u64::MAX;
+    for i in 0..e_phnum {
+        let ph = e_phoff + i * PHDR_SIZE;
+        let p_type = rd_u32(b, ph).ok_or("bad p_type")?;
+        if p_type != PT_LOAD {
+            continue; // ignore PT_GNU_STACK / PT_PHDR / etc. — a minimal loader maps only PT_LOAD
+        }
+        let p_flags = rd_u32(b, ph + 4).ok_or("bad p_flags")?;
+        let p_offset = rd_u64(b, ph + 8).ok_or("bad p_offset")? as usize;
+        let p_vaddr = rd_u64(b, ph + 16).ok_or("bad p_vaddr")?;
+        let p_filesz = rd_u64(b, ph + 32).ok_or("bad p_filesz")? as usize;
+        let p_memsz = rd_u64(b, ph + 40).ok_or("bad p_memsz")? as usize;
+        if nsegs >= MAX_LOAD_SEGS {
+            return Err("too many PT_LOAD segments");
+        }
+        if p_filesz > p_memsz {
+            return Err("p_filesz > p_memsz");
+        }
+        // The segment's file bytes must lie inside the image.
+        let file_end = p_offset.checked_add(p_filesz).ok_or("segment file range overflow")?;
+        if file_end > b.len() {
+            return Err("segment file range out of image");
+        }
+        // W^X: a segment must not be both writable and executable (page shapes are RO+X or RW+NX).
+        if p_flags & PF_W != 0 && p_flags & PF_X != 0 {
+            return Err("W^X: segment both writable and executable");
+        }
+        segs[nsegs] = ElfSeg { off: p_offset, vaddr: p_vaddr, filesz: p_filesz, memsz: p_memsz, flags: p_flags };
+        nsegs += 1;
+        if p_vaddr < min_vaddr {
+            min_vaddr = p_vaddr;
+        }
+    }
+    if nsegs == 0 {
+        return Err("no PT_LOAD segments");
+    }
+    // Every segment must fit the slot's user window once biased so min_vaddr maps to the window base.
+    let mut entry_in_exec = false;
+    for i in 0..nsegs {
+        let s = segs[i];
+        let win_off = s.vaddr.checked_sub(min_vaddr).ok_or("vaddr below min")? as usize;
+        let span_end = win_off.checked_add(s.memsz).ok_or("segment span overflow")?;
+        if span_end > win_size {
+            return Err("segment overflows the slot window");
+        }
+        // The entry must land inside an EXECUTABLE segment's mapped range (a data-only entry would fault).
+        if s.flags & PF_X != 0 && e_entry >= s.vaddr && e_entry < s.vaddr + s.memsz as u64 {
+            entry_in_exec = true;
+        }
+    }
+    if e_entry < min_vaddr {
+        return Err("entry below the lowest segment");
+    }
+    if !entry_in_exec {
+        return Err("entry not in an executable segment");
+    }
+    Ok(ElfPlan { entry: e_entry, min_vaddr, segs, nsegs })
 }
 
 /// IMAGE_SHA256 (code-signing): the IMAGE_SHA256 principal a program's on-disk image WOULD be stamped with by
 /// `load_program_into_slot`, computed WITHOUT allocating a slot — mount, find, read the same bytes under the
-/// same one-page cap, hash. Mirrors the loader's read EXACTLY so the result is bit-identical to the live stamp.
+/// same window cap, hash. Mirrors the loader's read EXACTLY (the same `USER_REGION_SIZE` cap) so the result is
+/// bit-identical to the live stamp for any image the loader accepts — flat (<= one code page) or ELF.
 /// `None` if the file is absent, mis-sized, or unreadable. Used by the K2 launcher/metal fixtures (the expected
 /// owner principal, now an image digest not a name) and by the IMG-SIG witness.
 fn image_principal_of_file(name: &str) -> Option<PrincipalRecord> {
     let fs = crate::fs::fat::mount().ok()?;
     let de = fs.find_in_root(name).ok()?;
-    let cap = super::boot::USER_CODE_SIZE;
+    let cap = super::boot::USER_REGION_SIZE;
     if de.size == 0 || de.size as u64 > cap as u64 {
         return None;
     }
@@ -7751,6 +7979,13 @@ fn m6g_loader_run(_: usize) {
             serial_println!(":: M6g: no free address-space slot — loader skipped ::");
             return;
         }
+        Err(SpawnErr::BadElf(kind, why)) => {
+            // HELLO.BIN is a flat blob (never ELF), so this arm is unreachable for it; present for
+            // completeness so the match is total (the loader core is shared with the ELF-1 path).
+            serial_println!(":: M6g: FAT mounted from SD ({:?}) ::", kind);
+            serial_println!(":: M6g: HELLO.BIN rejected as ELF ({}) — loader skipped ::", why);
+            return;
+        }
     };
     serial_println!(":: M6g: FAT mounted from SD ({:?}) ::", loaded.kind);
     serial_println!(
@@ -7787,6 +8022,124 @@ fn m6g_loader_run(_: usize) {
         serial_println!(
             ":: M6g: disk-loaded EL0 program FAIL — done={} err={} killed={} (want 1/0/0) ::",
             done, err, killed
+        );
+    }
+}
+
+// =============================================================================================
+// ELF-1: the minimal-static-ELF64 loader witness. Loads ELFHELLO.ELF (a two-PT_LOAD-segment static
+// ELF) through the SAME `load_program_into_slot` core that HELLO.BIN uses — the core now dispatches
+// ELF vs flat on the magic. The witness asserts, kernel-side, that the ELF path ran (is_elf, 2
+// segments) with correct per-segment page permissions (the code segment's page is RO+EL0-exec, the
+// data segment's page is EL0+EL1-RW/never-exec), then drops the program to EL0 and confirms it ran (its
+// SYS_REPORT token arrived; its SYS_WRITE message printed to the console). One uncounted `:: ELF1: ::`
+// line; an honest skip on media without the fixture. QEMU-verifiable (raspi4b runs EL0 baremetal).
+// =============================================================================================
+
+/// The witness token ELFHELLO.ELF reports via SYS_REPORT (`movz x0, #0x1E`) — must match the fixture.
+const ELF1_WITNESS_TOKEN: u64 = 0x1E;
+
+/// The token the ELF-loaded program reported (0 until it runs). Read by `elf1_launcher`'s verdict.
+static ELF1_WITNESS: AtomicU64 = AtomicU64::new(0);
+/// The ELF-loaded program reached its clean `sys_exit(0)` (want 1). Routed by name in the SYS_EXIT arm.
+static EL0_ELF1_DONE: AtomicU64 = AtomicU64::new(0);
+/// The ELF-loaded program exited NON-zero (want 0) — a fixture/loader bug.
+static EL0_ELF1_ERR: AtomicU64 = AtomicU64::new(0);
+
+/// ELF-1: record the ELF fixture's SYS_REPORT token, keyed by the reporting task's name. Called from the
+/// SYS_REPORT arm alongside the other reporters; each ignores the others' names.
+fn elf1_report(value: u64) {
+    if super::sched::current_name() == Some("elf1-hello") {
+        ELF1_WITNESS.store(value, Ordering::Release);
+    }
+}
+
+/// ELF-1 witness/verdict: load ELFHELLO.ELF via the shared loader core (ELF path), assert the ELF was
+/// validated + mapped with per-segment permissions, run it at EL0, and confirm it ran. Modelled on
+/// `m6g_loader_run`. Self-contained; runs LAST in the u7 chain (all 8 slots are free by then). Emits ONE
+/// uncounted `:: ELF1: … ::` line (PASS or an honest skip/FAIL); never perturbs the 23-fixture battery.
+fn elf1_launcher(_demo_cpu: usize) {
+    // One-shot (defensive, the m6g idiom).
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    // Gate: an SD block device must be present to load the fixture off.
+    if crate::drivers::block::info().is_none() {
+        serial_println!(":: ELF1: no SD card found — ELF loader witness skipped ::");
+        return;
+    }
+    let loaded = match load_program_into_slot("ELFHELLO.ELF") {
+        Ok(l) => l,
+        Err(SpawnErr::NoMount(e)) => {
+            serial_println!(":: ELF1: no FAT volume ({:?}) — skipped ::", e);
+            return;
+        }
+        Err(SpawnErr::NoFile(_)) => {
+            serial_println!(":: ELF1: ELFHELLO.ELF not found on the FAT volume — skipped ::");
+            return;
+        }
+        Err(SpawnErr::BadElf(_, why)) => {
+            serial_println!(":: ELF1: ELFHELLO.ELF rejected by the ELF loader ({}) -> FAIL ::", why);
+            return;
+        }
+        Err(SpawnErr::BadSize(_, sz)) => {
+            serial_println!(":: ELF1: ELFHELLO.ELF bad size {} bytes -> FAIL ::", sz);
+            return;
+        }
+        Err(SpawnErr::ReadErr(_, e)) => {
+            serial_println!(":: ELF1: ELFHELLO.ELF read error ({:?}) -> FAIL ::", e);
+            return;
+        }
+        Err(SpawnErr::Empty(_)) => {
+            serial_println!(":: ELF1: ELFHELLO.ELF read empty -> FAIL ::");
+            return;
+        }
+        Err(SpawnErr::NoSlot(_)) => {
+            serial_println!(":: ELF1: no free address-space slot — skipped ::");
+            return;
+        }
+    };
+
+    // Kernel-side structural proof (BEFORE the program runs, while the slot's leaves are live): it took the
+    // ELF path, mapped 2 PT_LOAD segments, and the two segments landed on DISTINCT pages with the right
+    // permissions — page 0 (the R+X text segment) is a CODE leaf (RO-both + EL0-executable), page 1 (the
+    // R+W data segment carrying the witness message) is a DATA leaf (EL0+EL1-RW, never executable).
+    let (base, _size) = super::boot::user_region();
+    let took_elf = loaded.is_elf;
+    let two_segs = loaded.nsegs == 2;
+    let code_ok = super::boot::slot_page_is_code(loaded.slot, base);
+    let data_ok = super::boot::slot_page_is_data(loaded.slot, base + 0x1000);
+    let entry_at_base = loaded.base == base; // fixture links at vaddr 0 -> bias == base -> entry == base
+
+    // Endow the slot with a console write-cap so its SYS_WRITE(fd 1) reaches the console, then drop it to
+    // EL0 on THIS core (the cooperative-yield verdict below guarantees dispatch).
+    install_console_cap(loaded.ttbr0 >> 48);
+    let run_cpu = super::percpu::this_cpu().cpu_index as usize;
+    super::sched::spawn_user_slot("elf1-hello", loaded.base, loaded.sp, loaded.ttbr0, run_cpu);
+
+    // Verdict: wait (bounded ~2 s, yielding so elf1-hello runs on this core) for the program to terminate.
+    let vstart = super::timer::cntpct();
+    let vdeadline = 2 * super::timer::cntfrq();
+    while EL0_ELF1_DONE.load(Ordering::Acquire) + EL0_ELF1_ERR.load(Ordering::Acquire) == 0
+        && super::timer::cntpct().wrapping_sub(vstart) <= vdeadline
+    {
+        super::sched::yield_now();
+    }
+    let done = EL0_ELF1_DONE.load(Ordering::Acquire);
+    let err = EL0_ELF1_ERR.load(Ordering::Acquire);
+    let token = ELF1_WITNESS.load(Ordering::Acquire);
+    let ran_ok = done == 1 && err == 0 && token == ELF1_WITNESS_TOKEN;
+
+    if took_elf && two_segs && code_ok && data_ok && entry_at_base && ran_ok {
+        serial_println!(
+            ":: ELF1: static ELF64 loaded ({} bytes, {} PT_LOAD segs) -> EL0 ran (token {:#x}) -> PASS ::",
+            loaded.len, loaded.nsegs, token
+        );
+    } else {
+        serial_println!(
+            ":: ELF1: FAIL — elf={} segs={} code_leaf={} data_leaf={} entry@base={} done={} err={} token={:#x} (want ELF/2/RX/RW/1/0/{:#x}) ::",
+            took_elf, loaded.nsegs, code_ok, data_ok, entry_at_base, done, err, token, ELF1_WITNESS_TOKEN
         );
     }
 }
@@ -8551,6 +8904,14 @@ pub fn u7_launcher(demo_cpu: usize) {
     k2_liveenf_launcher(demo_cpu);
     #[cfg(feature = "k2_leave")]
     k2_metal_launcher(demo_cpu);
+    // ELF-1: graduate the loader from flat-binary to minimal static ELF64. Placed HERE, among the
+    // real-program loaders (right after K2's by-name spawns), where the FAT volume is freshly mounted and
+    // proven — rather than at the very tail, after the unafs write-selftests reshape the card. Loads
+    // ELFHELLO.ELF through the SAME `load_program_into_slot` core (now dispatching ELF vs flat on the
+    // magic), asserts kernel-side that it took the ELF path (2 PT_LOAD segments mapped with per-segment
+    // page permissions), then drops it to EL0 and confirms it ran (its SYS_REPORT token arrived, its
+    // SYS_WRITE message printed). Its own uncounted `:: ELF1: … ::` line; an honest skip without the fixture.
+    elf1_launcher(demo_cpu);
     // K3: the revoke-persist commit-ordering proof — a named-owner file's SYS_FGRANT revoke commits to disk
     // BEFORE the in-RAM removal, so it SURVIVES REBOOT and fails CLOSED on a persist failure. Its own uncounted
     // `:: K3-revoke: … PASS ::` line; fully self-cleaning (leaves no owned row on the metal card).

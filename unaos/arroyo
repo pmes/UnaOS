@@ -872,6 +872,30 @@ kernel8() {
     esac
     echo -e "${COLOR_GREEN}✅ midden EL0 program: midden_blob.bin (${msz} B)${COLOR_RESET}"
 
+    # ELF-1: build the minimal static ELF64 EL0 program (crates/user-elf) and — UNLIKE the flat blobs above
+    # — KEEP it as an ELF (strip-all removes section headers/symbols but preserves the ELF header + program
+    # headers + the two PT_LOAD segments). Its own workspace + linker script (user-elf.ld's PHDRS clause
+    # declares a R+X text segment and a R+W data segment); `-z max-page-size=0x1000` packs the segments on
+    # 4 KiB boundaries so the whole image fits the kernel's 16 KiB slot-window read cap. The kernel's aarch64
+    # loader (load_program_into_slot -> validate_elf) reads this back off the SD as ELFHELLO.ELF, validates
+    # the ident/type/machine, walks the PT_LOAD headers, and maps each segment with per-segment permissions.
+    echo -e "${COLOR_YELLOW}⚡ Building EL0 static-ELF program (crates/user-elf → target/ELFHELLO.ELF)...${COLOR_RESET}"
+    cd "$WORKSPACE_DIR/crates/user-elf"
+    RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-elf/user-elf.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
+      cargo +nightly build --release -Z json-target-spec
+    cd "$WORKSPACE_DIR"
+    "$TOOLBIN/llvm-objcopy" --strip-all \
+      "${WORKSPACE_DIR}/crates/user-elf/target/aarch64-base/release/user-elf" \
+      "${WORKSPACE_DIR}/target/ELFHELLO.ELF"
+    # It must exist, begin with the ELF magic (\x7fELF), and fit the slot window (USER_REGION_SIZE = 16 KiB;
+    # a larger image is BadSize at load). A wrong magic or oversize image is a build failure caught here.
+    [ -s "${WORKSPACE_DIR}/target/ELFHELLO.ELF" ] || { echo -e "${COLOR_RED}ERROR: ELFHELLO.ELF missing/empty — ELF build failed${COLOR_RESET}"; exit 1; }
+    emag="$(head -c 4 "${WORKSPACE_DIR}/target/ELFHELLO.ELF" | od -An -tx1 | tr -d ' \n')"
+    [ "$emag" = "7f454c46" ] || { echo -e "${COLOR_RED}ERROR: ELFHELLO.ELF does not start with the ELF magic; first 4 bytes = ${emag}${COLOR_RESET}"; exit 1; }
+    esz="$(wc -c < "${WORKSPACE_DIR}/target/ELFHELLO.ELF" | tr -d ' ')"
+    [ "$esz" -le 16384 ] || { echo -e "${COLOR_RED}ERROR: ELFHELLO.ELF ${esz} bytes > USER_REGION_SIZE (16384)${COLOR_RESET}"; exit 1; }
+    echo -e "${COLOR_GREEN}✅ static-ELF EL0 program: ELFHELLO.ELF (${esz} B)${COLOR_RESET}"
+
     # K2 metal money-shot: UNAOS_K2_LEAVE=1 adds the `k2_leave` feature — k2_liveenf becomes a two-boot
     # cross-reboot power-cycle proof (boot-1 leaves a persisted owned file; boot-2 verifies the live boot
     # rebuild). OFF => the normal same-boot battery (byte-identical). For the ATTENDED Pi bench only.
@@ -1020,6 +1044,12 @@ kernel8() {
     # launcher spawns it for the round-trip + equivalence witnesses. Distinct 8.3 name => its own
     # IMAGE_SHA256 principal via the sole mint path.
     cp "${WORKSPACE_DIR}/target/midden_blob.bin" "$KERNEL8_DIR/MIDDEN.BIN"
+
+    # ELF-1: carry the minimal static ELF64 program onto the boot media as ELFHELLO.ELF (make-pi-img.sh
+    # ditto's the whole staging dir). The kernel's ELF1 witness reads it back off the SD, validates + maps
+    # its two PT_LOAD segments, and runs it at EL0. Distinct 8.3 name => its own IMAGE_SHA256 principal via
+    # the sole mint path. NEVER collides with the flat fixtures (HELLO/K2*/MIDDEN/SCRATCH/GROW .BIN).
+    cp "${WORKSPACE_DIR}/target/ELFHELLO.ELF" "$KERNEL8_DIR/ELFHELLO.ELF"
 
     # U9: plant a DEDICATED writable scratch file (NEVER HELLO.BIN — other fixtures load that as EL0 code).
     # 1 KiB (> 512 so fat::probe_once never cats it) of a known 0xEE filler; the u9 File-write demo opens it

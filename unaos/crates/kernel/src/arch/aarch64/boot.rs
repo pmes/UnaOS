@@ -50,7 +50,7 @@ static mut L3_USER: PageTable = PageTable([0; 512]);
 ///
 /// M6b permission split: page 0 = CODE (EL0-RX/EL1-RO after `protect_user_code`; RW during the blob
 /// copy), pages 1–3 = DATA/STACK (EL0+EL1 RW, never executable at any EL).
-const USER_REGION_SIZE: usize = 0x4000; // 16 KiB = 4 pages
+pub const USER_REGION_SIZE: usize = 0x4000; // 16 KiB = 4 pages
 /// The CODE page(s) at the bottom of USER_REGION — the only EL0-executable memory in the system.
 pub const USER_CODE_SIZE: usize = 0x1000;
 #[repr(C, align(0x4000))]
@@ -479,25 +479,66 @@ unsafe fn build_slot(s: usize) {
 /// task ever running, so no concurrent walk under this ASID -> the permission-only leaf rewrite is
 /// break-before-make-exempt.
 pub unsafe fn protect_user_slot_code(s: usize, len: usize) {
+    unsafe { protect_user_slot_code_range(s, 0, len) };
+}
+
+/// ELF-1 generalisation of `protect_user_slot_code`: flip the pages covering `[user_va+off, user_va+off+len)`
+/// of slot `s` from RW data pages to their final EL0-RX/EL1-RO code shape. `protect_user_slot_code` is the
+/// `off == 0` case (the flat-binary path + the U4/K2 fixtures — one code page at the window base). The ELF
+/// loader calls this once per PT_LOAD segment carrying PF_X, so an executable segment at ANY page offset
+/// within the window becomes code while the R/W (data) segments stay `user_data_page` (RW, UXN). Pages are
+/// flipped whole (the covered `[off, off+len)` range is rounded out to page boundaries by the loop, which
+/// walks from the page containing `off`); the loader lays code and data segments on DISTINCT pages (its
+/// linker forces a page gap), so a flip never straddles a data segment. Same maintenance as the base case
+/// (descriptor write -> `dsb ishst` -> per-page broadcast `tlbi vaae1is` -> `dsb ish` -> `isb`), and the
+/// same break-before-make exemption (the slot's task does not yet run, so no concurrent walk under its ASID).
+pub unsafe fn protect_user_slot_code_range(s: usize, off: usize, len: usize) {
     debug_assert!(s < USER_SLOTS);
+    debug_assert!(off + len <= USER_REGION_SIZE, "protect range outside the slot window");
     let user_pa = &raw const USER_REGION as u64;
     let backing = slot_backing_ptr(s) as u64;
     let sl3 = unsafe { (&raw mut SLOT_L3).cast::<PageTable>().add(s).cast::<u64>() };
+    let start = user_pa + (off as u64 & !0xFFF); // first page of the range
+    let end = user_pa + off as u64 + len as u64; // exclusive
     unsafe {
-        let mut va = user_pa;
-        while va < user_pa + len as u64 {
+        let mut va = start;
+        while va < end {
             let pa = backing + (va - user_pa);
             sl3.add(((va >> 12) & 0x1FF) as usize).write_volatile(user_code_page(pa));
             va += 0x1000;
         }
         core::arch::asm!("dsb ishst", options(nostack, preserves_flags));
-        let mut va = user_pa;
-        while va < user_pa + len as u64 {
+        let mut va = start;
+        while va < end {
             core::arch::asm!("tlbi vaae1is, {}", in(reg) (va >> 12), options(nostack, preserves_flags));
             va += 0x1000;
         }
         core::arch::asm!("dsb ish", "isb", options(nostack, preserves_flags));
     }
+}
+
+/// ELF-1 witness support: read slot `s`'s L3 leaf descriptor for the user window page containing `va`
+/// (a window VA in `[user_region, user_region+size)`). Lets the loader witness assert, kernel-side, that
+/// an executable segment's page landed as a CODE leaf (RO-both + EL0-executable) and a data segment's page
+/// as a DATA leaf (EL0+EL1 RW, never executable) — the per-segment permission proof.
+pub fn slot_leaf_desc(s: usize, va: u64) -> u64 {
+    debug_assert!(s < USER_SLOTS);
+    let sl3 = unsafe { (&raw const SLOT_L3).cast::<PageTable>().add(s).cast::<u64>() };
+    unsafe { sl3.add(((va >> 12) & 0x1FF) as usize).read_volatile() }
+}
+
+/// True iff slot `s`'s page for window VA `va` is a CODE leaf: read-only at both ELs (AP=0b11) AND
+/// EL0-executable (UXN clear). The exact shape `user_code_page` writes.
+pub fn slot_page_is_code(s: usize, va: u64) -> bool {
+    let d = slot_leaf_desc(s, va);
+    (d & (0b11 << 6)) == AP_RO_ALL && (d & DESC_UXN) == 0
+}
+
+/// True iff slot `s`'s page for window VA `va` is a DATA leaf: EL0+EL1 read-write (AP=0b01) AND
+/// unprivileged-execute-never (UXN set). The shape `user_data_page` writes.
+pub fn slot_page_is_data(s: usize, va: u64) -> bool {
+    let d = slot_leaf_desc(s, va);
+    (d & (0b11 << 6)) == AP_EL0 && (d & DESC_UXN) != 0
 }
 
 /// Tear down the slot owning `asid` (1..=USER_SLOTS) at task exit / slot release. Order is load-bearing
