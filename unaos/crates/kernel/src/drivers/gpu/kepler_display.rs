@@ -180,10 +180,45 @@ pub unsafe fn takeover_display(
         kdisp_trace[0], kdisp_trace[1], kdisp_trace[2], kdisp_trace[3],
         kdisp_trace[4], kdisp_trace[5], kdisp_trace[6]);
 
-    // ── Phase 1.5: Full-block trace dumps (Pull 2) ─────────────────────
-    dump_head_block(bar0, 0, 96);
-    dump_head_block(bar0, 1, 64);
+    // ── Phase 1.5: Candidate Decode (Pull 3) ───────────────────────────
+    let mut cand_vals = [[0u32; 3]; 4];
+    let cands = [0x310, 0x520, 0x604, 0x614];
+    
+    for pass in 0..3 {
+        for head in 0..2 {
+            dump_dense_window(bar0, head, pass, 0x300, 0x35C);
+            dump_dense_window(bar0, head, pass, 0x3F0, 0x40C);
+            dump_dense_window(bar0, head, pass, 0x5F0, 0x61C);
+        }
+        
+        let head0_base = regs::NV_PDISPLAY_BASE + 0x6000;
+        for i in 0..4 {
+            cand_vals[i][pass] = mmio_read(bar0, head0_base + cands[i]);
+        }
 
+        if pass < 2 {
+            for _ in 0..2_000_000 { core::hint::spin_loop(); }
+        }
+    }
+
+    for i in 0..4 {
+        let off = cands[i];
+        let v0 = cand_vals[i][0];
+        let v1 = cand_vals[i][1];
+        let v2 = cand_vals[i][2];
+        let stable = if v0 == v1 && v1 == v2 { "yes" } else { "no" };
+        
+        serial_println!(":: kdisp: cand off={:03X} stable={} v0={:08X} v1={:08X} v2={:08X} ::",
+            off, stable, v0, v1, v2);
+        
+        let shl8 = v0.wrapping_shl(8);
+        let shl12 = v0.wrapping_shl(12);
+        let pitch4 = v0 / 4;
+        serial_println!(":: kdisp: cand off={:03X} shl8={:08X} shl12={:08X} pitch4={} ::",
+            off, shl8, shl12, pitch4);
+        serial_println!(":: kdisp: cand off={:03X} geom high={} low={} ::",
+            off, v0 >> 16, v0 & 0xFFFF);
+    }
 
     // ── Phase 2: Display takeover (write path, gated) ──────────────────
     if !cfg!(feature = "nvidia-kepler-takeover") {
@@ -311,24 +346,15 @@ fn is_live(val: u32) -> bool {
     val != 0 && val != 0xFFFFFFFF && (val & 0xFFF00000) != 0xBAD00000
 }
 
-/// Dumps a head configuration block (0x616000 + head*0x800) for offline decode.
-fn dump_head_block(bar0: usize, head: usize, max_rows: usize) {
-    let mut printed = 0;
-    let mut total_live = 0;
+/// Dumps a dense window of head configuration.
+fn dump_dense_window(bar0: usize, head: usize, pass: usize, start: usize, end: usize) {
     let base = regs::NV_PDISPLAY_BASE + 0x6000 + (head * 0x800);
-    
-    for offset in (0..0x800).step_by(4) {
+    let mut rows = 0;
+    for offset in (start..=end).step_by(4) {
         let val = unsafe { mmio_read(bar0, base + offset) };
-        if is_live(val) {
-            if printed < max_rows {
-                serial_println!(":: kdisp: head{}-dump off={:03X} val={:08X} ::", head, offset, val);
-                printed += 1;
-            }
-            total_live += 1;
-        }
+        serial_println!(":: kdisp: window head{} pass{} off={:03X} val={:08X} ::", head, pass, offset, val);
+        rows += 1;
     }
-    
-    let capped = total_live > max_rows;
-    serial_println!(":: kdisp: head{}-dump rows={} capped={} ::", head, printed, capped);
+    serial_println!(":: kdisp: window head{} pass{} done rows={} ::", head, pass, rows);
 }
 
