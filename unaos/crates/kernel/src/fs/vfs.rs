@@ -75,8 +75,17 @@ pub enum VfsError {
     /// A read/stat targeted a directory where a file was required.
     IsADirectory,
     /// The ACL refused this principal (native per-object, or the foreign
-    /// volume's mount capability).
+    /// volume's mount capability). On a write op this is the *write*-side ACL
+    /// refusal (VFS-2): the principal lacks the write right on this object.
     Denied,
+    /// The requested mutation is not expressible through this backend's write
+    /// surface (VFS-2). Examples: an in-place *shrink* truncate (neither the FAT
+    /// nor the UnaFS backend carries a shrink primitive this arc), a name that
+    /// is not a representable FAT 8.3 short name (LFN write is out of scope this
+    /// arc), or a write op on a backend that exposes no mutating surface at all
+    /// (the default trait bodies). Distinct from [`VfsError::Denied`] — the
+    /// caller is authorized, the operation itself has no sound implementation.
+    Unsupported,
     /// The backend failed for a reason the VFS does not model finely; the
     /// static string is the backend's own reason, for tracing only.
     Backend(&'static str),
@@ -144,6 +153,65 @@ pub trait VfsBackend {
     fn open_read(&self, rel: &str, principal: &str) -> Result<Stat, VfsError> {
         self.authorize_read(rel, principal)?;
         self.stat(rel)
+    }
+
+    // --- Write surface (VFS-2) -------------------------------------------------
+    //
+    // The mutating half of the open contract the design doc (§2) shaped and
+    // deferred. It mirrors the read side's discipline: a `authorize_write` ACL
+    // check that the mutating verbs compose FIRST, then act — so a principal
+    // without the write right never mutates (and, for `create`, never learns
+    // whether the name was free). The default bodies make the surface *opt-in*:
+    // a backend that exposes no mutation (the witness mock, a future read-only
+    // adapter) inherits [`VfsError::Unsupported`] for every verb and needs no
+    // change. The doc's op naming is honored — `create` / `write` / `unlink`,
+    // plus `truncate` (VFS-2's brief) — and no new shape is invented.
+
+    /// The WRITE-side ACL check, the mutating twin of [`authorize_read`]. Permit
+    /// → `Ok(())`; the principal lacks the write right → [`VfsError::Denied`].
+    ///
+    /// Native volumes consult the per-object owner/grants ACL for the WRITE
+    /// right (`CAP_WRITE`); foreign (FAT) volumes apply the volume-level mount
+    /// capability — but write is **never** granted by the world-**readable**
+    /// posture (a stick mounted for reading is not thereby writable): only the
+    /// volume principal and kernel authority may write a foreign volume.
+    ///
+    /// [`authorize_read`]: VfsBackend::authorize_read
+    fn authorize_write(&self, _rel: &str, _principal: &str) -> Result<(), VfsError> {
+        Err(VfsError::Unsupported)
+    }
+
+    /// Create a new node (`NodeKind::File` or `NodeKind::Dir`) at `rel`. The
+    /// parent directory must exist; the leaf must not (a backend may reject an
+    /// existing name with [`VfsError::Backend`]). Returns the new node's stat.
+    /// Implementors authorize the write FIRST (via [`authorize_write`]).
+    ///
+    /// [`authorize_write`]: VfsBackend::authorize_write
+    fn create(&self, _rel: &str, _kind: NodeKind, _principal: &str) -> Result<Stat, VfsError> {
+        Err(VfsError::Unsupported)
+    }
+
+    /// Write `data` to the file at `rel` starting at `offset`, growing the file
+    /// (allocating storage) as needed. `offset` may not exceed the current size
+    /// (no sparse holes). Returns the number of bytes written. Implementors
+    /// authorize the write FIRST.
+    fn write(&self, _rel: &str, _offset: u64, _data: &[u8], _principal: &str) -> Result<usize, VfsError> {
+        Err(VfsError::Unsupported)
+    }
+
+    /// Set the file at `rel` to exactly `size` bytes. Growing zero-extends;
+    /// `size == current` is a no-op; truncation to `0` is supported. An in-place
+    /// *shrink* to a non-zero size is [`VfsError::Unsupported`] this arc (neither
+    /// backend carries a shrink primitive). Implementors authorize FIRST.
+    fn truncate(&self, _rel: &str, _size: u64, _principal: &str) -> Result<(), VfsError> {
+        Err(VfsError::Unsupported)
+    }
+
+    /// Remove the file at `rel`. A directory is refused with
+    /// [`VfsError::IsADirectory`] (directory removal is a separate verb).
+    /// Implementors authorize the write FIRST.
+    fn unlink(&self, _rel: &str, _principal: &str) -> Result<(), VfsError> {
+        Err(VfsError::Unsupported)
     }
 }
 
@@ -251,6 +319,28 @@ impl MountTable {
         let (b, rel) = self.resolve(path)?;
         b.open_read(rel, principal)
     }
+
+    // --- write-side resolve-then-dispatch conveniences (VFS-2) ---
+
+    pub fn create(&self, path: &str, kind: NodeKind, principal: &str) -> Result<Stat, VfsError> {
+        let (b, rel) = self.resolve(path)?;
+        b.create(rel, kind, principal)
+    }
+
+    pub fn write(&self, path: &str, offset: u64, data: &[u8], principal: &str) -> Result<usize, VfsError> {
+        let (b, rel) = self.resolve(path)?;
+        b.write(rel, offset, data, principal)
+    }
+
+    pub fn truncate(&self, path: &str, size: u64, principal: &str) -> Result<(), VfsError> {
+        let (b, rel) = self.resolve(path)?;
+        b.truncate(rel, size, principal)
+    }
+
+    pub fn unlink(&self, path: &str, principal: &str) -> Result<(), VfsError> {
+        let (b, rel) = self.resolve(path)?;
+        b.unlink(rel, principal)
+    }
 }
 
 /// Canonicalize a mount prefix: ensure a leading `/`, drop a trailing `/`
@@ -357,6 +447,41 @@ impl FatBackend {
         }
         Ok(found)
     }
+
+    /// VFS-2: resolve `rel` to `(parent_first_cluster, leaf_name)` — the shape
+    /// the dir-aware fat.rs write twins (`create_in_dir`/`locate_in_dir`) take.
+    /// The parent directory is walked read-only; `first_cluster == 0` is the
+    /// volume root. `rel` must name a leaf under a directory: the bare root
+    /// (`""`/`"/"`) has no leaf and is refused [`VfsError::IsADirectory`]; a
+    /// parent that is a file is [`VfsError::NotADirectory`]; an absent parent is
+    /// [`VfsError::NoSuchPath`]. The leaf itself need NOT exist (it is what the
+    /// caller creates/locates).
+    #[cfg(target_arch = "aarch64")]
+    fn resolve_parent(
+        fs: &crate::fs::fat::FatFs,
+        rel: &str,
+    ) -> Result<(u32, String), VfsError> {
+        let comps: Vec<&str> = components(rel).collect();
+        let (leaf, parents) = comps.split_last().ok_or(VfsError::IsADirectory)?;
+        let leaf = leaf.to_string();
+        if parents.is_empty() {
+            return Ok((0, leaf)); // parent is the volume root
+        }
+        // Walk to the parent directory and take its first cluster.
+        let parent_rel = {
+            let mut s = String::new();
+            for c in parents {
+                s.push('/');
+                s.push_str(c);
+            }
+            s
+        };
+        match Self::resolve_entry(fs, &parent_rel)? {
+            None => Ok((0, leaf)), // parent resolved to the root
+            Some(e) if e.is_dir => Ok((e.first_cluster(), leaf)),
+            Some(_) => Err(VfsError::NotADirectory),
+        }
+    }
 }
 
 /// Map a FAT error into the VFS error space.
@@ -367,6 +492,18 @@ fn fat_err(e: crate::fs::fat::FatError) -> VfsError {
         FatError::NotFound => VfsError::NoSuchPath,
         FatError::IsDirectory => VfsError::IsADirectory,
         _ => VfsError::Backend(crate::fs::fat::fat_reason(e)),
+    }
+}
+
+/// VFS-2: map a FAT *create*-path error. `Unsupported` here means the name is
+/// not a representable 8.3 short name — VFAT LFN write is out of scope this arc
+/// (documented bound), so it surfaces as [`VfsError::Unsupported`] rather than
+/// an opaque backend string. Everything else maps as [`fat_err`].
+#[cfg(target_arch = "aarch64")]
+fn fat_create_err(e: crate::fs::fat::FatError) -> VfsError {
+    match e {
+        crate::fs::fat::FatError::Unsupported => VfsError::Unsupported,
+        other => fat_err(other),
     }
 }
 
@@ -437,6 +574,112 @@ impl VfsBackend for FatBackend {
             Err(VfsError::Denied)
         }
     }
+
+    fn authorize_write(&self, _rel: &str, principal: &str) -> Result<(), VfsError> {
+        // FOREIGN-VOLUME WRITE POSTURE (doc §5, extended by VFS-2): the volume's
+        // one mount capability governs writes too — permit the volume principal
+        // and kernel authority. The `world_readable` posture is deliberately NOT
+        // consulted: a stick mounted for reading is not thereby writable. A
+        // future world-WRITABLE posture would be a separate mount flag; until
+        // then a foreign write is authorized exactly to the mounting principal.
+        if principal == self.principal || principal == KERNEL_PRINCIPAL {
+            Ok(())
+        } else {
+            Err(VfsError::Denied)
+        }
+    }
+
+    fn create(&self, rel: &str, kind: NodeKind, principal: &str) -> Result<Stat, VfsError> {
+        self.authorize_write(rel, principal)?;
+        let fs = crate::fs::fat::mount().map_err(fat_err)?;
+        let (parent, leaf) = Self::resolve_parent(&fs, rel)?;
+        // Reject an existing name (create is not idempotent-overwrite).
+        match fs.locate_in_dir(parent, &leaf) {
+            Ok(_) => return Err(VfsError::Backend("exists")),
+            Err(crate::fs::fat::FatError::NotFound) => {}
+            Err(e) => return Err(fat_err(e)),
+        }
+        match kind {
+            // 0x20 = plain file; create_in_dir yields a 0-length entry.
+            NodeKind::File => {
+                fs.create_in_dir(parent, &leaf, 0x20).map_err(fat_create_err)?;
+                Ok(Stat { kind: NodeKind::File, size: 0 })
+            }
+            // create_dir allocates the child cluster + `.`/`..` and publishes it.
+            NodeKind::Dir => {
+                fs.create_dir(parent, &leaf).map_err(fat_create_err)?;
+                Ok(Stat { kind: NodeKind::Dir, size: 0 })
+            }
+        }
+    }
+
+    fn write(&self, rel: &str, offset: u64, data: &[u8], principal: &str) -> Result<usize, VfsError> {
+        self.authorize_write(rel, principal)?;
+        let fs = crate::fs::fat::mount().map_err(fat_err)?;
+        let (parent, leaf) = Self::resolve_parent(&fs, rel)?;
+        let off32: u32 = offset.try_into().map_err(|_| VfsError::Unsupported)?;
+        let (de, dir_lba, dir_off) = fs.locate_in_dir(parent, &leaf).map_err(fat_err)?;
+        if de.is_dir {
+            return Err(VfsError::IsADirectory);
+        }
+        // write_grow handles the whole span the brief scopes: overwrite-in-place
+        // (offset < size), append at EOF (offset == size), and free-cluster
+        // allocation when the write runs past the last cluster — publishing the
+        // grown `size` / new first_cluster to the directory entry LAST (data +
+        // FAT already durable). offset > size (a sparse hole) is rejected by
+        // write_grow with BadChain, which we surface as Unsupported.
+        match fs.write_grow(de.first_cluster(), de.size, dir_lba, dir_off, off32, data) {
+            Ok((written, _new_size, _new_first)) => Ok(written),
+            Err(crate::fs::fat::FatError::BadChain) if off32 > de.size => Err(VfsError::Unsupported),
+            Err(e) => Err(fat_err(e)),
+        }
+    }
+
+    fn truncate(&self, rel: &str, size: u64, principal: &str) -> Result<(), VfsError> {
+        self.authorize_write(rel, principal)?;
+        let fs = crate::fs::fat::mount().map_err(fat_err)?;
+        let (parent, leaf) = Self::resolve_parent(&fs, rel)?;
+        let (de, dir_lba, dir_off) = fs.locate_in_dir(parent, &leaf).map_err(fat_err)?;
+        if de.is_dir {
+            return Err(VfsError::IsADirectory);
+        }
+        let cur = de.size as u64;
+        if size == cur {
+            return Ok(()); // no-op
+        }
+        if size == 0 {
+            // Truncate-to-zero = free the chain + a fresh 0-length entry (the
+            // only shrink fat.rs's PUBLIC surface expresses; there is no in-place
+            // shrink primitive). delete_located marks the slot 0xE5 FIRST, THEN
+            // frees the chain (crash-safe), then a fresh entry reclaims the name.
+            fs.delete_located(dir_lba, dir_off, de.first_cluster()).map_err(fat_err)?;
+            fs.create_in_dir(parent, &leaf, 0x20).map_err(fat_create_err)?;
+            return Ok(());
+        }
+        if size > cur {
+            // Zero-extend: grow with a run of zero bytes from the old EOF.
+            let add = (size - cur) as usize;
+            let zeros = alloc::vec![0u8; add];
+            let start: u32 = cur.try_into().map_err(|_| VfsError::Unsupported)?;
+            fs.write_grow(de.first_cluster(), de.size, dir_lba, dir_off, start, &zeros)
+                .map_err(fat_err)?;
+            return Ok(());
+        }
+        // 0 < size < cur: an in-place shrink to a non-zero size. No primitive.
+        Err(VfsError::Unsupported)
+    }
+
+    fn unlink(&self, rel: &str, principal: &str) -> Result<(), VfsError> {
+        self.authorize_write(rel, principal)?;
+        let fs = crate::fs::fat::mount().map_err(fat_err)?;
+        let (parent, leaf) = Self::resolve_parent(&fs, rel)?;
+        let (de, dir_lba, dir_off) = fs.locate_in_dir(parent, &leaf).map_err(fat_err)?;
+        if de.is_dir {
+            return Err(VfsError::IsADirectory); // directory removal is a separate verb
+        }
+        fs.delete_located(dir_lba, dir_off, de.first_cluster()).map_err(fat_err)?;
+        Ok(())
+    }
 }
 
 /// Native UnaFS backend adapter (aarch64 only — the kernel `unafs` module is
@@ -462,6 +705,81 @@ impl NativeBackend {
 #[cfg(target_arch = "aarch64")]
 fn unafs_err(_e: crate::fs::unafs::MountError) -> VfsError {
     VfsError::Backend("unafs-mount")
+}
+
+/// VFS-2: the native WRITE-side ACL evaluator for a resolved live inode `id` —
+/// the write twin of [`crate::fs::unafs::read_authz`], consulting the SAME
+/// per-object `owner`/`grants:<principal>` attributes but testing the WRITE
+/// right. It reuses the ONE grant-rights decoder
+/// ([`crate::fs::unafs::rights_from_native`]) and the `CAP_WRITE`-equal
+/// [`crate::fs::unafs::RIGHT_WRITE`] bit, so a VFS write and the syscall layer's
+/// grant machinery agree on what a `w`/`rw` grant admits.
+///
+/// Semantics mirror the read evaluator's ordering: a GONE inode fails closed for
+/// everyone (deletion is total revocation); then kernel authority permits; a
+/// public object (no `owner`) permits (unchanged public semantics — a public
+/// native object is writable, as it is readable); the owner permits; a
+/// `grants:<principal>` row permits IFF it carries the write right; else denied.
+///
+/// This write evaluator lives in the VFS adapter (not beside `read_authz` in
+/// `unafs.rs`) to keep VFS-2 within the VFS lane; a follow-up may hoist it into
+/// `unafs.rs` as a `write_authz` sibling the way the read side already defers.
+#[cfg(target_arch = "aarch64")]
+fn native_write_authz(
+    fs: &mut crate::fs::unafs::KernelUnaFS,
+    id: u64,
+    principal: &str,
+) -> Result<(), VfsError> {
+    use ::unafs::inode::AttributeValue;
+    let ino = match fs.read_inode(id) {
+        Ok(i) => i,
+        Err(_) => return Err(VfsError::Denied), // gone -> fail closed for everyone
+    };
+    if principal == KERNEL_PRINCIPAL {
+        return Ok(());
+    }
+    let owner = match ino.attributes.get("owner") {
+        Some(AttributeValue::String(s)) => s.clone(),
+        _ => return Ok(()), // no owner row -> public object, writable
+    };
+    if principal == owner {
+        return Ok(());
+    }
+    if let Some(AttributeValue::String(rights)) =
+        ino.attributes.get(&alloc::format!("grants:{}", principal))
+    {
+        if crate::fs::unafs::rights_from_native(rights.as_bytes()) & crate::fs::unafs::RIGHT_WRITE
+            != 0
+        {
+            return Ok(());
+        }
+    }
+    Err(VfsError::Denied)
+}
+
+/// VFS-2: resolve a volume-relative `rel` to `(parent_inode_id, leaf_name)` for
+/// the native create/unlink path. `rel` must name a leaf under a directory: the
+/// bare root has no leaf ([`VfsError::IsADirectory`]); a missing parent is
+/// [`VfsError::NoSuchPath`].
+#[cfg(target_arch = "aarch64")]
+fn native_parent(
+    fs: &mut crate::fs::unafs::KernelUnaFS,
+    rel: &str,
+) -> Result<(u64, String), VfsError> {
+    let comps: Vec<&str> = components(rel).collect();
+    let (leaf, parents) = comps.split_last().ok_or(VfsError::IsADirectory)?;
+    let leaf = leaf.to_string();
+    let mut parent_path = String::from("/");
+    for (i, c) in parents.iter().enumerate() {
+        if i > 0 {
+            parent_path.push('/');
+        }
+        parent_path.push_str(c);
+    }
+    let parent_id = fs
+        .resolve_path(&parent_path)
+        .map_err(|_| VfsError::NoSuchPath)?;
+    Ok((parent_id, leaf))
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -524,6 +842,115 @@ impl VfsBackend for NativeBackend {
                 crate::fs::unafs::ReadAuthz::Permit => Ok(()),
                 _ => Err(VfsError::Denied),
             }
+        })
+        .map_err(unafs_err)?
+    }
+
+    fn authorize_write(&self, rel: &str, principal: &str) -> Result<(), VfsError> {
+        // NATIVE WRITE POSTURE (VFS-2): per-object owner/grants ACL, WRITE right.
+        let path = native_abs(rel);
+        crate::fs::unafs::with_unafs(|fs| {
+            let id = fs.resolve_path(&path).map_err(|_| VfsError::NoSuchPath)?;
+            native_write_authz(fs, id, principal)
+        })
+        .map_err(unafs_err)?
+    }
+
+    fn create(&self, rel: &str, kind: NodeKind, principal: &str) -> Result<Stat, VfsError> {
+        crate::fs::unafs::with_unafs(|fs| {
+            // Create authorizes against the PARENT directory's write ACL (the
+            // leaf does not exist yet), then plants the node under it.
+            let (parent_id, leaf) = native_parent(fs, rel)?;
+            native_write_authz(fs, parent_id, principal)?;
+            let id = match kind {
+                NodeKind::File => fs
+                    .create_file(parent_id, leaf)
+                    .map_err(|_| VfsError::Backend("unafs-create"))?,
+                NodeKind::Dir => fs
+                    .mkdir(parent_id, leaf)
+                    .map_err(|_| VfsError::Backend("unafs-mkdir"))?,
+            };
+            // The new object ACQUIRES A REAL OWNER — the creating principal — so
+            // it is not left world-writable (do-it-right: a native object carries
+            // its own per-object ACL, unlike the foreign volume it may be copied
+            // from). Kernel-created objects stay public (no owner row).
+            if principal != KERNEL_PRINCIPAL {
+                fs.set_attribute(
+                    id,
+                    alloc::string::String::from("owner"),
+                    ::unafs::inode::AttributeValue::String(principal.to_string()),
+                )
+                .map_err(|_| VfsError::Backend("unafs-owner"))?;
+            }
+            Ok(Stat {
+                kind,
+                size: 0,
+            })
+        })
+        .map_err(unafs_err)?
+    }
+
+    fn write(&self, rel: &str, offset: u64, data: &[u8], principal: &str) -> Result<usize, VfsError> {
+        let path = native_abs(rel);
+        crate::fs::unafs::with_unafs(|fs| {
+            let id = fs.resolve_path(&path).map_err(|_| VfsError::NoSuchPath)?;
+            native_write_authz(fs, id, principal)?;
+            let ino = fs.read_inode(id).map_err(|_| VfsError::NoSuchPath)?;
+            if matches!(native_kind(ino.kind), NodeKind::Dir) {
+                return Err(VfsError::IsADirectory);
+            }
+            fs.write_data(id, offset, data)
+                .map_err(|_| VfsError::Backend("unafs-write"))?;
+            Ok(data.len())
+        })
+        .map_err(unafs_err)?
+    }
+
+    fn truncate(&self, rel: &str, size: u64, principal: &str) -> Result<(), VfsError> {
+        let path = native_abs(rel);
+        crate::fs::unafs::with_unafs(|fs| {
+            let id = fs.resolve_path(&path).map_err(|_| VfsError::NoSuchPath)?;
+            native_write_authz(fs, id, principal)?;
+            let ino = fs.read_inode(id).map_err(|_| VfsError::NoSuchPath)?;
+            if matches!(native_kind(ino.kind), NodeKind::Dir) {
+                return Err(VfsError::IsADirectory);
+            }
+            if size == ino.size {
+                return Ok(()); // no-op
+            }
+            if size > ino.size {
+                // Zero-extend from the old EOF.
+                let add = (size - ino.size) as usize;
+                let zeros = alloc::vec![0u8; add];
+                fs.write_data(id, ino.size, &zeros)
+                    .map_err(|_| VfsError::Backend("unafs-write"))?;
+                return Ok(());
+            }
+            // A shrink (including to 0) would DROP the per-object ACL if done by
+            // unlink+recreate — the one thing the native volume must never lose.
+            // UnaFS carries no in-place shrink primitive this arc, so a native
+            // shrink is honestly Unsupported (a caller that wants smaller content
+            // creates a fresh object and writes it). This is a DELIBERATE
+            // asymmetry with the FAT backend (which truncates-to-0 by
+            // delete+recreate — FAT has no per-object ACL to preserve).
+            Err(VfsError::Unsupported)
+        })
+        .map_err(unafs_err)?
+    }
+
+    fn unlink(&self, rel: &str, principal: &str) -> Result<(), VfsError> {
+        let path = native_abs(rel);
+        crate::fs::unafs::with_unafs(|fs| {
+            let id = fs.resolve_path(&path).map_err(|_| VfsError::NoSuchPath)?;
+            native_write_authz(fs, id, principal)?;
+            let ino = fs.read_inode(id).map_err(|_| VfsError::NoSuchPath)?;
+            if matches!(native_kind(ino.kind), NodeKind::Dir) {
+                return Err(VfsError::IsADirectory); // directory removal is a separate verb
+            }
+            let (parent_id, leaf) = native_parent(fs, rel)?;
+            fs.unlink(parent_id, &leaf)
+                .map_err(|_| VfsError::Backend("unafs-unlink"))?;
+            Ok(())
         })
         .map_err(unafs_err)?
     }
@@ -725,4 +1152,138 @@ pub fn vfs1_resolution_witness() -> Result<(), &'static str> {
     }
 
     Ok(())
+}
+
+// =========================================================================================
+// VFS-2 write witnesses — self-verifying, self-cleaning proofs that a CREATE + WRITE + READ
+// BACK round-trips through the mount table to each real backend on the live QEMU card. Unlike
+// the arch-neutral `vfs1_resolution_witness` (in-RAM mocks), these mount the actual FAT /
+// UnaFS adapter and exercise the disk write path, so they are aarch64-only and honest-skip on
+// media that lacks the volume. Each runs once, cleans up its scratch file, and prints its own
+// uncounted witness line. Wired into the storage battery in `syscall.rs` (VFS-2 adoption).
+// =========================================================================================
+
+/// VFS-2 FAT write witness: create → write → read-back → checksum on the FAT volume, routed
+/// entirely through the `MountTable`/`FatBackend` write surface. Self-cleaning.
+#[cfg(target_arch = "aarch64")]
+pub fn vfs2_fat_write_witness() {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if crate::fs::fat::mount().is_err() {
+        serial_println!(":: VFS2-fat: no FAT filesystem — skipped ::");
+        return;
+    }
+    // Foreign volume mounted to the kernel principal (world_readable is a READ posture and does
+    // not confer write — the witness writes as the volume principal `kernel`).
+    let mut mt = MountTable::new();
+    mt.mount("/", Box::new(FatBackend::new("fat", KERNEL_PRINCIPAL, true)));
+
+    let path = "/VFS2TST.TXT";
+    let payload: &[u8] = b"VFS-2 FAT write-path witness bytes\n";
+    let _ = mt.unlink(path, KERNEL_PRINCIPAL); // clear stale scratch from an interrupted run
+
+    if let Err(e) = mt.create(path, NodeKind::File, KERNEL_PRINCIPAL) {
+        serial_println!(":: VFS2-fat: create {} failed {:?} :: FAIL ::", path, e);
+        return;
+    }
+    let wrote = match mt.write(path, 0, payload, KERNEL_PRINCIPAL) {
+        Ok(n) => n,
+        Err(e) => {
+            serial_println!(":: VFS2-fat: write {} failed {:?} :: FAIL ::", path, e);
+            let _ = mt.unlink(path, KERNEL_PRINCIPAL);
+            return;
+        }
+    };
+    let back = match mt.read(path, 0, payload.len()) {
+        Ok(b) => b,
+        Err(e) => {
+            serial_println!(":: VFS2-fat: readback {} failed {:?} :: FAIL ::", path, e);
+            let _ = mt.unlink(path, KERNEL_PRINCIPAL);
+            return;
+        }
+    };
+    let ok = wrote == payload.len() && back == payload;
+    let got = checksum(&back);
+    let want = checksum(payload);
+    let _ = mt.unlink(path, KERNEL_PRINCIPAL); // self-clean, whatever the verdict
+
+    if ok && got == want {
+        serial_println!(
+            ":: VFS2: write test — created {}, wrote {}, readback OK :: PASS ::",
+            path, wrote
+        );
+    } else {
+        serial_println!(
+            ":: VFS2-fat: readback mismatch on {} (wrote {}, sum {:#x} want {:#x}) :: FAIL ::",
+            path, wrote, got, want
+        );
+    }
+}
+
+/// VFS-2 native write witness: create → write → read-back → checksum on the native UnaFS
+/// volume, routed through the `MountTable`/`NativeBackend` write surface. Self-cleaning; honest
+/// skip on media without a unafs partition.
+#[cfg(target_arch = "aarch64")]
+pub fn vfs2_native_write_witness() {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if crate::fs::unafs::locate().is_err() {
+        serial_println!(":: VFS2-native: no unafs volume — skipped ::");
+        return;
+    }
+    let mut mt = MountTable::new();
+    mt.mount("/", Box::new(NativeBackend::new("native")));
+
+    let path = "/vfs2ntv.txt";
+    let payload: &[u8] = b"VFS-2 native write-path witness bytes\n";
+    let _ = mt.unlink(path, KERNEL_PRINCIPAL); // clear stale scratch
+
+    if let Err(e) = mt.create(path, NodeKind::File, KERNEL_PRINCIPAL) {
+        serial_println!(":: VFS2-native: create {} failed {:?} :: FAIL ::", path, e);
+        return;
+    }
+    let wrote = match mt.write(path, 0, payload, KERNEL_PRINCIPAL) {
+        Ok(n) => n,
+        Err(e) => {
+            serial_println!(":: VFS2-native: write {} failed {:?} :: FAIL ::", path, e);
+            let _ = mt.unlink(path, KERNEL_PRINCIPAL);
+            return;
+        }
+    };
+    let back = match mt.read(path, 0, payload.len()) {
+        Ok(b) => b,
+        Err(e) => {
+            serial_println!(":: VFS2-native: readback {} failed {:?} :: FAIL ::", path, e);
+            let _ = mt.unlink(path, KERNEL_PRINCIPAL);
+            return;
+        }
+    };
+    let ok = wrote == payload.len() && back == payload;
+    let got = checksum(&back);
+    let want = checksum(payload);
+    let _ = mt.unlink(path, KERNEL_PRINCIPAL); // self-clean
+
+    if ok && got == want {
+        serial_println!(
+            ":: VFS2: write test — created {}, wrote {}, readback OK :: PASS ::",
+            path, wrote
+        );
+    } else {
+        serial_println!(
+            ":: VFS2-native: readback mismatch on {} (wrote {}, sum {:#x} want {:#x}) :: FAIL ::",
+            path, wrote, got, want
+        );
+    }
+}
+
+/// A trivial additive byte checksum for the witnesses' read-back verification.
+#[cfg(target_arch = "aarch64")]
+fn checksum(bytes: &[u8]) -> u32 {
+    bytes.iter().fold(0u32, |a, &b| a.wrapping_add(b as u32))
 }

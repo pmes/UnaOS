@@ -1,9 +1,12 @@
 # VFS: the unifying virtual-filesystem layer
 
-Status: **VFS-1 landed** — design of record + spine (`unaos/crates/kernel/src/fs/vfs.rs`).
-The spine is **unconsumed**: no shell command, syscall, or EL0 path routes through it yet.
-It lands with this document so the design can be reviewed before consumers move onto it.
-Adoption (shell, `SYS_OPEN`, `genet`/net paths) is deferred to follow-up arcs.
+Status: **VFS-2 landed** — the write surface is implemented for both backends
+(`unaos/crates/kernel/src/fs/vfs.rs`), on top of VFS-1's read/resolve/authorize spine.
+The spine is still **unconsumed by production callers**: no shell command, syscall, or
+EL0 path routes through it yet (adoption — shell, `SYS_OPEN`, `genet`/net paths — is a
+follow-up). VFS-2's write path is proven by two self-verifying on-card witnesses
+(§9); wiring those into the boot battery is a one-line-per-witness `syscall.rs` change
+carried as a deferred diff (that file is outside the VFS lane).
 
 ## 1. Why a VFS, and why now
 
@@ -46,11 +49,26 @@ or `"/"` is the volume root. The default `open_read` fixes the open ordering for
 **authorize first, then stat**, so a denied principal never learns even a file's size or that a
 name is a file. Backends do not override that ordering.
 
-**Write is shaped but deferred.** The `&self` receivers leave room for a later mutating surface
-(`create` / `write` / `unlink`), but no backend exposes a mutation through the trait this arc.
-The two backends already have rich write paths (FAT in-place/grow/create, UnaFS journaled CoW);
-VFS-write is a separate design (write authorization, cross-volume rename/copy semantics) and a
-separate arc. VFS-1 is read + resolve + authorize only.
+**Write (VFS-2) — the mutating half.** VFS-2 lands the write surface the `&self` receivers left
+room for, honoring the op naming this section shaped — `create` / `write` / `unlink`, plus
+`truncate`:
+
+```
+fn authorize_write(&self, rel: &str, principal: &str) -> Result<(), VfsError>;
+fn create(&self, rel: &str, kind: NodeKind, principal: &str) -> Result<Stat, VfsError>;
+fn write(&self, rel: &str, offset: u64, data: &[u8], principal: &str) -> Result<usize, VfsError>;
+fn truncate(&self, rel: &str, size: u64, principal: &str) -> Result<(), VfsError>;
+fn unlink(&self, rel: &str, principal: &str) -> Result<(), VfsError>;
+```
+
+Every mutating verb composes the **write** ACL check first (`authorize_write`, the mutating twin
+of `authorize_read`), then acts — the same authorize-first discipline as `open_read`. The trait's
+default bodies return `VfsError::Unsupported`, so the surface is **opt-in**: a read-only backend
+(or the witness mock) inherits "no mutation" for every verb unchanged.
+
+The two backends already carried rich write paths (FAT in-place/grow/create, UnaFS journaled CoW);
+VFS-2 is thin plumbing onto them, not a rewrite. See §5.3 (write authorization) and §8.1 (the
+per-backend implementation and its bounds).
 
 ## 3. Path resolution contract
 
@@ -137,6 +155,27 @@ them, a foreign volume is authorized **at mount time**:
 This keeps the VFS **policy-honest**: it never invents ownership metadata a medium does not carry,
 and it never silently widens the native ACL to accommodate a foreign one.
 
+### 5.3 Write authorization (VFS-2)
+
+The write ACL mirrors the read ACL's split, testing the **write** right rather than the read
+right:
+
+* **Native (per-object).** `authorize_write` consults the same per-object `owner`/`grants:<principal>`
+  attributes, admitting the owner, a `grants` row that carries the **write** right (`CAP_WRITE`,
+  decoded by the ONE `rights_from_native` decoder the syscall grant machinery uses), kernel
+  authority, and a public object (no `owner` — a public native object is writable as it is
+  readable). A GONE inode fails closed for everyone (deletion is total revocation). `create`
+  authorizes against the **parent directory's** write right (the leaf does not exist yet); the
+  other verbs authorize against the target.
+* **Foreign (FAT, volume-level).** Only the volume principal and kernel authority may write.
+  The **world-readable** posture does **not** confer write — a stick mounted for reading is not
+  thereby writable; a world-*writable* mount would be a separate future flag.
+
+A newly `create`d **native** object acquires the creating principal as its `owner`, so it is not
+left world-writable — the "acquires a real owner" property §5.2 names as the reason the installer
+copies foreign content onto the native volume. Kernel-created native objects stay public (no
+owner row).
+
 ## 6. Hot-mount / unmount lifecycle
 
 The mount table is the lifecycle surface:
@@ -174,10 +213,59 @@ The function returns `Ok(())` when every assertion holds and `Err(reason)` namin
 fails. It is a pure function compiled on both arches (proving the spine is arch-neutral); a
 follow-up arc may wire it behind the `witness` feature alongside the other kernel selftests.
 
-## 8. File map
+## 8. Backend write implementation (VFS-2) and its bounds
 
-* `unaos/crates/kernel/src/fs/vfs.rs` — the spine: `VfsError`, `NodeKind`, `Stat`, `DirEnt`, the
-  `VfsBackend` trait, `MountTable` (mount/unmount/resolve + resolve-then-dispatch conveniences),
-  the `FatBackend` and `NativeBackend` adapters, and the witness.
+Both adapters plumb the trait's write verbs onto the backends' existing, already-crash-safe
+mutation primitives — no new on-disk mutation logic is introduced.
+
+**FAT (`FatBackend`).** `create` → `create_in_dir` (file) / `create_dir` (directory);
+`write` → `write_grow` (which subsumes overwrite-in-place, append-at-EOF, and free-cluster
+allocation from the FAT, publishing the grown `size`/`first_cluster` to the directory entry
+LAST — data and both FATs durable first); `unlink` → `delete_located` (marks the directory slot
+`0xE5` FIRST, then frees the chain). `truncate` supports grow (zero-extend via `write_grow`),
+no-op, and truncate-**to-zero** (`delete_located` + a fresh 0-length entry — the only shrink the
+public FAT surface expresses).
+
+**Native (`NativeBackend`).** `create` → `create_file` / `mkdir` then a per-object `owner`
+attribute (§5.3); `write` → `write_data` (journaled CoW); `unlink` → `unlink`. `truncate`
+supports grow and no-op.
+
+**Documented bounds (this arc):**
+
+* **FAT LFN write is out of scope.** `create` accepts only representable 8.3 short names
+  (`format_83`); a non-representable name is `VfsError::Unsupported`. Reading VFAT long names is
+  unchanged (that is the backend's read posture, §3.2).
+* **No non-zero in-place shrink.** `0 < size < current` is `VfsError::Unsupported` on both
+  backends — neither carries an in-place shrink primitive. For **native**, even shrink-to-zero is
+  `Unsupported`: doing it by unlink+recreate would DROP the per-object ACL, the one thing the
+  native volume must never silently lose. (FAT truncate-to-zero is fine — FAT has no per-object
+  ACL to preserve.) A caller wanting smaller content creates a fresh object and writes it.
+* **`offset > size` (a sparse hole) is rejected**, matching `write_grow`'s no-hole contract.
+
+**Failure safety.** Every write is write-through and each backend step is atomic under its own
+lock, so a mid-sequence failure leaves the volume consistent, never partial-committed: a failed
+FAT grow keeps the OLD (smaller) size (size is published last); a failed native mutation unwinds
+to the last committed root (CoW). The witnesses (§9) abort with a `FAIL` line rather than commit a
+half-write.
+
+## 9. The VFS-2 write witnesses
+
+Two on-card, self-cleaning witnesses prove a `create` → `write` → read-back → checksum round-trip
+through the mount table to each real backend (aarch64-only; honest skip when the volume is absent):
+
+* `vfs::vfs2_fat_write_witness()` — FAT volume mounted at `/`;
+* `vfs::vfs2_native_write_witness()` — native UnaFS volume mounted at `/`.
+
+Each emits `:: VFS2: write test — created <path>, wrote <n>, readback OK :: PASS ::` and unlinks
+its scratch file. They are invoked from the `syscall.rs` storage battery (after the K-series, so
+their scratch never perturbs those fixtures); because `syscall.rs` is outside the VFS lane, that
+one-line-per-witness wiring lands as a deferred diff alongside this arc.
+
+## 10. File map
+
+* `unaos/crates/kernel/src/fs/vfs.rs` — the spine + adapters: `VfsError`, `NodeKind`, `Stat`,
+  `DirEnt`, the `VfsBackend` trait (read + write surface), `MountTable` (mount/unmount/resolve +
+  read/write resolve-then-dispatch conveniences), the `FatBackend` and `NativeBackend` adapters
+  (read + write), the VFS-1 resolution witness, and the two VFS-2 write witnesses.
 * `unaos/crates/kernel/src/fs/fat.rs`, `…/unafs.rs` — the backends the adapters wrap (unchanged
-  by this arc).
+  by VFS-2; their existing write primitives are consumed as-is).
