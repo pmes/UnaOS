@@ -1791,6 +1791,48 @@ fn write_shader_words(off: usize, words: &[u64]) -> usize {
     words.len() * 8
 }
 
+/// [v3d47] CS thread-end witness — dump the final six QPU words of the published coordinate shader as
+/// they sit in the arena (the exact bytes the CLE hands the QPU), immediately before the bin GO, so the
+/// P45 metal read confirms WHAT RAN rather than trusting the source constant. The `sig` field of each
+/// word is decoded (bits[57:53]; SIG_THRSW==1) so the terminal thread-switch is visible on serial: a
+/// clean coord-shader thread-end is `… vpmwt(sig=none) ; nop(sig=thrsw) ; nop ; nop` — byte-for-byte the
+/// tail Mesa's own `v3d_compile` (ver 4.2) emits for a `threads=4` binning coord shader
+/// (scripts/pi-v3d26-mesa-compile.out.txt words 18..21). See v3d.md §21: V3D-47 audited this tail against
+/// that reference and found NO divergence — sig=thrsw, no sig.int, vpmwt correctly ahead of thrsw — so no
+/// word was changed; this witness is the confirmation instrument for the P45 read.
+fn cs_tail_witness(tag: &str, code_off: usize, word_count: usize) {
+    // Re-read from DRAM through the arena so a corrupt publish (not just the constant) would show.
+    cache::clean_invalidate_range(arena_phys() + code_off, word_count * 8);
+    let start = word_count.saturating_sub(6);
+    serial_println!(
+        ":: V3D: [v3d47] {} CS tail @arena+{:#x} (words {}..{} of {}) — the exact published bytes ::",
+        tag,
+        code_off + start * 8,
+        start,
+        word_count,
+        word_count
+    );
+    for i in start..word_count {
+        let w = arena_u64(code_off + i * 8);
+        let sig = ((w >> 53) & 0x1f) as u32; // V3D 4.x sig field: bits[57:53]; SIG_THRSW == 1
+        let sig_name = match sig {
+            0 => "none",
+            1 => "thrsw",
+            _ => "other",
+        };
+        serial_println!(
+            ":: V3D:   [v3d47]   w[{:>2}] = {:#018x}  sig={:#04x}({}) ::",
+            i,
+            w,
+            sig,
+            sig_name
+        );
+    }
+    serial_println!(
+        ":: V3D: [v3d47] expected (Mesa v42 v3d_compile coord tail): vpmwt(sig=none) → nop(sig=thrsw) → nop → nop — NO sig.int; byte-for-byte per scripts/pi-v3d26-mesa-compile.out.txt [18..21] ::"
+    );
+}
+
 /// The fragment-shader uniform stream (FIFO order matches FS_WORDS' pops). Colour channels are the
 /// unorm8 decomposition of TRI_RGBA as f32; the exact channel order + f16 rounding that lands the
 /// stored word on TRI_RGBA is the metal-refinement surface. The two TLB config words follow Mesa
@@ -1860,6 +1902,12 @@ fn arena_u32(off: usize) -> u32 {
         arena_byte(off + 2),
         arena_byte(off + 3),
     ])
+}
+/// Read a little-endian u64 QPU word back out of the arena (CPU-side witness decode — used by the
+/// [v3d47] CS tail witness to confirm the exact bytes the CLE hands the QPU, not the source constant).
+#[inline]
+fn arena_u64(off: usize) -> u64 {
+    (arena_u32(off) as u64) | ((arena_u32(off + 4) as u64) << 32)
 }
 /// Copy raw bytes into the arena at `off` (bounded — saturates at the arena end, never overruns).
 fn arena_write_bytes(off: usize, src: &[u8]) {
@@ -3112,6 +3160,9 @@ fn triangle_job(fb: Option<FbTarget>) -> bool {
     // PI-V3D-21: arm the QPU-execution performance counters immediately before the GO so they span the
     // bin (coord-shader) run. Read-only w.r.t. the shader — cannot perturb execution (see pctr_* above).
     pctr_setup_cs_witness();
+    // [v3d47] dump the published coord-shader thread-end bytes right before the GO — P45 confirms WHAT
+    // RAN. V3D-47 finding: this tail is byte-for-byte Mesa's own v3d_compile coord tail (no divergence).
+    cs_tail_witness("M4", OFF_CS_CODE, CS_VS_WORDS.len());
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QEA, bin_ea); // GO
     dsb();
     let ct0_cs_kicked = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CS);

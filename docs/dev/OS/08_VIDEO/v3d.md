@@ -702,3 +702,54 @@ consumed, QPU program-end-interrupt latched — points at the **coord-shader thr
 QPU-word change that QEMU (no V3D block) cannot verify, so per the no-fabricated-fix discipline V3D-46
 stops at **naming** it: the `[v3d46]` PCS decode + config hex-dump are the instrumentation the P45 metal
 read confirms, and that read authorizes the shader-word fix. **P45 metal decides.**
+
+## 21. The thread-end is already Mesa-exact — V3D-46's shader-word suspect is refuted byte-for-byte (V3D-47)
+
+V3D-46 authorized a shader-word fix to the coord-shader thread-end. V3D-47 went to establish the
+Mesa-faithful program-end sequence **before** touching a word — and found there is nothing to change: our
+tail is already byte-identical to Mesa's own `v3d_compile()` output.
+
+**Reference (real `v3d_compile`, ver 4.2).** `scripts/pi-v3d26-mesa-compile.out.txt` is a genuine Mesa
+compile of the binning coord shader (`is_coord=1`, `threads=4`). Its last four words are:
+
+| # | word | decode |
+| --- | --- | --- |
+| 18 | `0x3c003186bb816000` | `vpmwt` (sig=none) |
+| 19 | `0x3c203186bb800000` | `nop ; thrsw` (sig=thrsw) |
+| 20 | `0x3c003186bb800000` | `nop` (sig=none) |
+| 21 | `0x3c003186bb800000` | `nop` (sig=none) |
+
+**Our `CS_VS_WORDS` tail (words 23..26):** `0x3c003186bb816000` (vpmwt) → `0x3c203186bb800000`
+(nop;thrsw) → `0x3c003186bb800000` (nop) → `0x3c003186bb800000` (nop). **Byte-for-byte identical** to
+Mesa words 18..21. `CS_VS_WORDS` is also M4's coord shader (published at `OFF_CS_CODE` by `triangle_job`),
+so "our M4 shader's tail" is the same four words — same comparison, same identity.
+
+**The three V3D-46 candidate divergences, each refuted by field decode:**
+
+- *"is `sig.int` set where Mesa uses `sig.none`/`ldunif`?"* — **No.** The `sig` field is bits[57:53]
+  (thrsw XOR nop = bit 53). Our terminal thread-switch word carries `sig=0b00001 = V3D_QPU_SIG_THRSW`,
+  exactly Mesa's. `vpmwt` and both trailing `nop`s carry `sig=none`. There is no `sig.int` anywhere on the
+  end sequence — the QPU's program-end **host interrupt** (`INT_STS` bit16) is not a per-instruction
+  signal our words set; it is the normal completion IRQ every finishing coord-shader thread raises. Bit 16
+  latching is a *positive* "the CS ran to completion" witness, **not** a defect signature.
+- *"is `thrsw` missing the proper double-issue slots?"* — **No.** Mesa emits the terminal `thrsw` as a
+  standalone `nop`-instruction carrying the thrsw signal, followed by two `nop` delay slots. Ours is
+  identical. A *second* thrsw appears only in the `threads=2` PROBE variant (words 18/19/22 of the same
+  reference) — a thread-count artifact, not the `threads=4` coord path M4 uses.
+- *"is `vpmwt` in the wrong slot relative to `thrsw`?"* — **No.** Mesa: `vpmwt` at [18], thrsw at [19].
+  Ours: `vpmwt` then thrsw. Same order.
+
+**Conclusion — no word changed (per the no-fabricated-fix discipline, now doubly warranted).** The coord
+shader was already exonerated *functionally* in §11; §21 exonerates its thread-end *byte-for-byte* against
+the same authoritative reference. Fabricating a deviation from Mesa's exact bytes on a QEMU-untestable path
+is precisely the error this driver was convicted for three times; V3D-46's "thread-end sequencing" suspect
+does not survive the byte comparison. **The wedge is not in the shader words.** The live signature (QPU ran
+to program-end IRQ, FLUSH consumed, `PCS=BMACTIVE`, FLDONE never fires) now points *downstream of a cleanly
+completed coord shader* — the PTB/VCM tile-list retire path, not the QPU program.
+
+**Witness wired.** `[v3d47]` (`cs_tail_witness`) dumps the published coord-shader tail from the arena —
+the exact bytes the CLE hands the QPU — with each word's `sig` decoded, printed immediately before the M4
+bin GO. The P45 metal read confirms `w[24]` carries `sig=thrsw` and no word is `sig.int`, closing the
+shader-word question on-silicon and re-aiming the next arc at the PTB retire path. All `[v3d44/45/46]`
+instrumentation is retained. QEMU raspi4b models no V3D block, so `[v3d47]` is dormant there — **P45 metal
+confirms the bytes; it does not itself retire the bin.**
