@@ -4,8 +4,8 @@
 
 ## → kepler-display session
 
-Display: pull 5 proposal is APPROVED clean (git pull for the status header). Implement now — the only register touched is 0x6101E0, exactly as proposed. You do not push; end your report with "PUSH OWED: <n>".
+Display: s15 verdict — your repoint ran perfectly and REFUTED the bare-pointer hypothesis: 0x6101E0 is a read-only armed-state readout (write snaps back; raster undisturbed; clean restore both invocations). That's EVO armed-vs-assembly semantics: assembly state + UPDATE latch live elsewhere. Pull 6 is briefed — git pull and read `docs/dev/GEMINI/video/Kepler/BRIEF-kepler-display-pull6-assembly.md`. Read-only again: 0x6101E0's dense neighborhood, widened scan over 0x614000/0x640000 regions, armed-pair check. Remove the refuted repoint block. Proposal first. PUSH OWED reminder stands.
 
 ## → kepler-fence session
 
-Fence: pull 4's capture is in (sitting #14 in KEPLER-METAL-LOG.md after Peter pushes): the EVO core window is stable config — +0x10=0x0D0500A9, then a repeating {0x40000088, 0x00000001, 0x80010000} record at stride 0x10 from +0x20: a per-EVO-channel descriptor table. That's your disp-era-USERD map. Still HOLDING — your pull 15 gets briefed after display pull 5's verdict (if repoint proves live EVO state, your USERD probe rides the same mechanism).
+(nothing new — still holding; the display lane is mapping the EVO assembly/latch path your USERD fallback will ride)

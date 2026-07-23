@@ -19,6 +19,7 @@ Three pull sequences, numbered independently. Every pull = one BRIEF (coordinato
 ## Lane 2: Kepler DISPLAY (scanout — kepler_display.rs after split) — `video/Kepler/`, files `*kepler-display-pull<N>*`
 | Pull | Files | Status | One-liner |
 |---|---|---|---|
+| 6 | BRIEF-kepler-display-pull6-assembly | BRIEFED — awaiting proposal | read-only assembly-state hunt: 0x6101E0 neighborhood + widened scan + armed-pair check |
 | 5 | BRIEF-kepler-display-pull5-repoint / PROPOSAL-kepler-display-pull5 | LANDED 896faee0 (+2 inline fixes); s15: REFUTED — 0x6101E0 is read-only armed-state (write snaps back) | repoint 0x6101E0; arming evidently needs core-channel assembly + UPDATE latch |
 | 4 | BRIEF-kepler-display-pull4-evo-core / PROPOSAL-kepler-display-pull4 | LANDED b025467b; s14: DELIVERED — single hit 0x6101E0=0x200 (surface pointer candidate); core window stable | EVO core-channel read-out: dense 0x610480 window + known-value scan of 0x610000–0x613FFC |
 | 3 | BRIEF-kepler-display-pull3-decode / PROPOSAL-kepler-display-pull3 | LANDED 8ddc7fc3; s13: DELIVERED (0x604/0x614 = telemetry; timing block pinned; no surface addr in windows) | read-only candidate decode (dense windows, 3 passes, arithmetic cross-check) |
