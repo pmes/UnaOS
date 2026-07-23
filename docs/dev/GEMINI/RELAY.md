@@ -4,7 +4,7 @@
 
 ## → kepler-display session
 
-Display: your pull 4 flew — the scan found exactly ONE hit: 0x6101E0=0x00000200, the GOP surface address >>8. That's the armed surface pointer candidate. Peter has approved the FIRST display write: pull 5 is briefed — git pull and read `docs/dev/GEMINI/video/Kepler/BRIEF-kepler-display-pull5-repoint.md`. One register (0x6101E0), repoint to a prepared surface, restore; NO other writes, no improvised doorbells — a null result is an honest result. Proposal first. You do not push; end your report with "PUSH OWED: <n>".
+Display: pull 5 proposal is APPROVED clean (git pull for the status header). Implement now — the only register touched is 0x6101E0, exactly as proposed. You do not push; end your report with "PUSH OWED: <n>".
 
 ## → kepler-fence session
 
