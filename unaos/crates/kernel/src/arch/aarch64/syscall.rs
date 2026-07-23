@@ -132,6 +132,20 @@ const SYS_FGRANT: u64 = 18;
 const SYS_MSEND: u64 = 19;
 const SYS_MRECV: u64 = 20;
 
+/// ELF-2: the EL0-threading syscalls (first rung of the thread ladder). Unlike `SYS_SPAWN` (a new PROCESS —
+/// fresh slot/ttbr0/ASID, its own address space), these create/reap THREADS that SHARE the caller's address
+/// space (same slot root/ASID), so a shared-memory word is coherent across them.
+///   SYS_THREAD_SPAWN(entry, sp, arg) [+ a3 = placement: 0 caller-core, 1 sibling-core] -> thread handle >=0
+///     A new EL0 thread under the caller's ttbr0/ASID: it starts at `entry` on stack `sp` (both carved from
+///     the caller's 16 KiB window) with `arg` in x0. Returns a small per-process thread handle, or -errno.
+///   SYS_THREAD_JOIN(handle) -> 0: block until that thread finishes (its `SYS_THREAD_EXIT`), via the
+///     JoinHandle completion Semaphore. -ESRCH if the handle is not the caller's live thread.
+///   SYS_THREAD_EXIT(): terminate the calling thread — posts its completion, decrements the slot refcount
+///     (teardown only on the LAST thread), never returns.
+const SYS_THREAD_SPAWN: u64 = 21;
+const SYS_THREAD_EXIT: u64 = 22;
+const SYS_THREAD_JOIN: u64 = 23;
+
 /// M6e demo: the sentinel `sys_exit` status the preemption spinner uses so its exit is accounted to
 /// `EL0_SPIN_DONE` and never perturbs the M6b `exited/killed` counters. Demo-only — there is no real
 /// userspace yet, so overloading one status value for demo bookkeeping is safe and documented here.
@@ -5518,6 +5532,7 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
     let a0 = unsafe { *frame.add(0) }; // x0
     let a1 = unsafe { *frame.add(1) }; // x1
     let a2 = unsafe { *frame.add(2) }; // x2
+    let a3 = unsafe { *frame.add(3) }; // x3 (ELF-2: SYS_THREAD_SPAWN placement hint)
 
     if !SVC_LOGGED.swap(true, Ordering::Relaxed) {
         serial_println!(":: SVC: EC=0x15 nr={} — EL0->EL1 syscall path live ::", nr);
@@ -5548,6 +5563,7 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
             k2_report(a0);
             bandy_report(a0);
             elf1_report(a0);
+            threads_report(a0);
             0
         }
         SYS_YIELD => sys_yield(),
@@ -5567,6 +5583,9 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
         SYS_FGRANT => sys_fgrant(a0, a1, a2),
         SYS_MSEND => sys_msend(a0, a1),
         SYS_MRECV => sys_mrecv(a0, a1),
+        SYS_THREAD_SPAWN => sys_thread_spawn(a0, a1, a2, a3),
+        SYS_THREAD_JOIN => sys_thread_join(a0),
+        SYS_THREAD_EXIT => sys_thread_exit(), // never returns
         SYS_EXIT => {
             // Demo accounting BEFORE the no-return exit. The sentinel statuses are routed to their own
             // counters so the M6b (`exited=1 killed=3`) and M6e (`completed=1`) verdicts stay byte-
@@ -5685,6 +5704,11 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
                 } else {
                     EL0_ELF1_ERR.fetch_add(1, Ordering::AcqRel);
                 }
+            } else if super::sched::current_name() == Some("el0-threads") {
+                // ELF-2: the threads-test PARENT exits (status 0) after joining both worker threads. Route by
+                // NAME (like elf1-hello) so it lands in the ELF-2 witness, never the M6b `EL0_EXITED_OK`
+                // accounting. The worker threads exit via SYS_THREAD_EXIT (not here).
+                THREADS_PARENT_DONE.store(a0 == 0, Ordering::Release);
             } else if a0 == M6E_SPIN_STATUS {
                 EL0_SPIN_DONE.fetch_add(1, Ordering::AcqRel);
             } else if a0 == M6D_EXIT_STATUS {
@@ -6064,6 +6088,7 @@ const ENOENT: i64 = -2; // no such file (HELLO.BIN missing)
 const EIO: i64 = -5; // read/mount I/O error, or an empty file
 const E2BIG: i64 = -7; // the program is larger than one code page
 const EBADF: i64 = -9; // U11: sys_close of an unresolvable / already-closed / stale-slot handle
+const ESRCH: i64 = -3; // ELF-2: sys_thread_join on a handle that is not the caller's live thread
 const ECHILD: i64 = -10; // sys_wait: no child with that pid
 const EAGAIN: i64 = -11; // the process table (or slot pool) is full
 const ENODEV: i64 = -19; // no block device / FAT volume to load from
@@ -8145,6 +8170,293 @@ fn elf1_launcher(_demo_cpu: usize) {
 }
 
 // =============================================================================================
+// ELF-2: EL0 threading — SYS_THREAD_SPAWN / _JOIN / _EXIT + the multi-core shared-memory threads test.
+//
+// ELF-1 loaded ONE static task into a private slot (its own ttbr0/ASID). ELF-2 adds THREADS: several EL0
+// tasks SHARING one slot's address space (same ttbr0/ASID), so a memory word is coherent across them. The
+// primitives:
+//   * SYS_THREAD_SPAWN(entry, sp, arg, place) — a new EL0 task under the caller's ttbr0/ASID, started at
+//     `entry` on stack `sp` (both carved from the caller's window) with `arg` in x0; `place` = 0 caller-core,
+//     1 sibling-core. Returns a per-process thread handle. Backed by `sched::spawn_user_thread` +
+//     `boot::slot_thread_retain` (the slot lives until the LAST thread exits).
+//   * SYS_THREAD_JOIN(handle) — block on that thread's completion Semaphore (its `JoinHandle`), then reap it.
+//   * SYS_THREAD_EXIT() — post completion + decrement the slot refcount (teardown only on the last thread).
+//
+// The test (`__threads_prog_*`): the parent zeroes a shared counter, spawns 2 workers (one co-located, one on
+// a sibling core), each atomically (A72 LL/SC — no LSE) increments the counter and SYS_THREAD_EXITs, the
+// parent joins both, SYS_REPORTs the total, SYS_WRITEs a witness, and exits. `threads_launcher` composes the
+// authoritative witness line. Multi-core soundness rests on `teardown_user_slot`'s per-thread TTBR0 repoint
+// (see boot.rs) so the final ASID flush races no live root on the sibling core.
+// =============================================================================================
+
+/// How many concurrently-tracked joinable EL0 threads the kernel holds handles for (the test uses 2). A small
+/// fixed pool; `-EAGAIN` when exhausted (never grown — same discipline as the Proc/handle tables).
+const NTHREAD: usize = 8;
+
+/// One live thread the kernel can be `SYS_THREAD_JOIN`ed on: the owning ASID (only that process's parent may
+/// join) plus the completion `JoinHandle` (an `Arc<Semaphore>` posted in `exit()`). Taken out of the table by
+/// the join (single-shot), and by construction never observed by two joiners (one live parent per ASID).
+struct ThreadRec {
+    owner: u64,
+    join: super::sched::JoinHandle,
+}
+
+/// The thread-handle table: a small fixed pool of live joinable threads, index = the handle returned to EL0.
+/// A `spin::Mutex` (not per-ASID atomics like `HANDLES`) because a `JoinHandle` is a non-Copy owned value that
+/// `join` must MOVE out; the lock is held only for the claim/take, never across the blocking `join`.
+static THREAD_TABLE: SpinMutex<[Option<ThreadRec>; NTHREAD]> = SpinMutex::new([const { None }; NTHREAD]);
+
+/// ELF-2 threads-test witnesses (captured kernel-side, printed by `threads_launcher`). Global (not per-ASID)
+/// because these three syscalls are used only by this one test this arc.
+static THREADS_SPAWNED: AtomicU64 = AtomicU64::new(0); // successful SYS_THREAD_SPAWNs (want 2)
+static THREADS_JOINED: AtomicU64 = AtomicU64::new(0); // completed SYS_THREAD_JOINs (want 2)
+static THREADS_COUNTER: AtomicU64 = AtomicU64::new(0); // the shared counter the parent SYS_REPORTs (want 2)
+static THREADS_EXIT_IDX: AtomicU64 = AtomicU64::new(0); // which worker is exiting (0 -> core A, 1 -> core B)
+static THREADS_CORE_A: AtomicI32 = AtomicI32::new(-1); // the core the first worker actually ran+exited on
+static THREADS_CORE_B: AtomicI32 = AtomicI32::new(-1); // the core the second worker actually ran+exited on
+static THREADS_PARENT_DONE: AtomicBool = AtomicBool::new(false); // the parent reached its clean sys_exit(0)
+
+/// Read the full live `TTBR0_EL1` (root | ASID<<48) — the caller's shared address space, which a spawned
+/// thread runs under. `current_asid` is the top 16 bits of this; a thread needs the whole value.
+fn current_ttbr0() -> u64 {
+    let ttbr0: u64;
+    unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0, options(nomem, nostack, preserves_flags)) };
+    ttbr0
+}
+
+/// SYS_THREAD_SPAWN(entry, sp, arg, place): create an EL0 thread sharing the caller's address space. Validates
+/// `entry` (4-aligned, inside the window — a non-exec target simply faults the thread, contained by the M6b
+/// kill net) and `sp` (16-aligned, inside the WRITABLE window with headroom below it). `place`: 0 = the
+/// caller's core, 1 = a sibling online core (genuine cross-core parallelism). Returns the thread handle, or a
+/// negative errno (`-EFAULT` bad entry/sp, `-EINVAL` from the shared ASID-0 context, `-EAGAIN` table full).
+fn sys_thread_spawn(entry: u64, sp: u64, arg: u64, place: u64) -> i64 {
+    let (base, size) = super::boot::user_region();
+    let win_end = base + size as u64;
+    // entry: 4-aligned and inside the window (exec enforcement is left to the page permissions).
+    if entry & 3 != 0 || entry < base || entry >= win_end {
+        return EFAULT;
+    }
+    // sp: 16-aligned, at/below the window top, with at least 16 writable bytes below it (excludes the RO code
+    // page, so a stack aimed at page 0 is refused).
+    if sp & 0xF != 0 || sp > win_end || sp < 16 || !user_range_ok(sp - 16, 16, true) {
+        return EFAULT;
+    }
+    let ttbr0 = current_ttbr0();
+    let asid = ttbr0 >> 48;
+    if asid == 0 {
+        return EINVAL; // the shared-window (ASID 0) context owns no private slot to thread within
+    }
+    let caller = super::percpu::this_cpu().cpu_index as usize;
+    let cpu = if place == 1 { super::sched::other_online_cpu(caller) } else { caller };
+    // Claim a tracking slot, retain the shared address space for the new thread, then spawn it. The retain
+    // precedes the spawn so the slot cannot be torn down between here and the thread's first dispatch; the
+    // thread's own exit balances it (`teardown_user_slot`). The lock spans the spawn (a brief critical
+    // section, no cross-core contention) so the returned handle index is stable before EL0 sees it.
+    let mut tab = THREAD_TABLE.lock();
+    let Some(idx) = tab.iter().position(|s| s.is_none()) else {
+        return EAGAIN;
+    };
+    super::boot::slot_thread_retain(asid);
+    let join = super::sched::spawn_user_thread("el0-thread-w", entry, sp, arg, ttbr0, cpu);
+    tab[idx] = Some(ThreadRec { owner: asid, join });
+    drop(tab);
+    THREADS_SPAWNED.fetch_add(1, Ordering::AcqRel);
+    idx as i64
+}
+
+/// SYS_THREAD_JOIN(handle): block until the thread named by `handle` finishes, then reap its handle. Resolves
+/// the handle against the CALLER's ASID (only the owning process may join); `-ESRCH` if out of range, empty,
+/// or foreign. The `JoinHandle` is MOVED out under the lock, which is then dropped BEFORE the blocking `join`
+/// (never block holding the spinlock). The wake is the thread's `exit()` completion post — a scheduler wake,
+/// so it works under QEMU (like `sys_wait`).
+fn sys_thread_join(handle: u64) -> i64 {
+    let asid = current_asid();
+    let idx = handle as usize;
+    let rec = {
+        let mut tab = THREAD_TABLE.lock();
+        if idx >= NTHREAD || tab[idx].as_ref().map(|r| r.owner) != Some(asid) {
+            return ESRCH;
+        }
+        tab[idx].take().unwrap()
+    };
+    rec.join.join(); // blocks until the thread posts its completion (scheduler wake)
+    // `JoinHandle::join` -> `Semaphore::wait` restores the SVC-entry DAIF (IRQ masked on exception entry);
+    // re-mask defensively so the `__vec_svc` epilogue's banked ELR/SPSR/SP_EL0 restore is I-masked (the
+    // sys_wait contract).
+    remask_irq();
+    THREADS_JOINED.fetch_add(1, Ordering::AcqRel);
+    0
+}
+
+/// SYS_THREAD_EXIT(): terminate the calling EL0 thread. Records the exiting worker's core for the witness
+/// (first exit -> A, second -> B), then `sched::exit()` — which posts the thread's completion (waking a
+/// joiner) and, via `teardown_user_slot`, decrements the slot refcount (tearing the shared slot down only on
+/// the LAST thread's exit). Never returns.
+fn sys_thread_exit() -> i64 {
+    let cpu = super::percpu::this_cpu().cpu_index as i32;
+    match THREADS_EXIT_IDX.fetch_add(1, Ordering::AcqRel) {
+        0 => THREADS_CORE_A.store(cpu, Ordering::Release),
+        1 => THREADS_CORE_B.store(cpu, Ordering::Release),
+        _ => {}
+    }
+    super::sched::exit() // diverges; the `__vec_svc` eret tail is not reached
+}
+
+/// ELF-2: capture the threads-test parent's SYS_REPORT (the shared counter), keyed by name. Called from the
+/// SYS_REPORT arm alongside the other reporters; each ignores the others' names.
+fn threads_report(value: u64) {
+    if super::sched::current_name() == Some("el0-threads") {
+        THREADS_COUNTER.store(value, Ordering::Release);
+    }
+}
+
+// The threads-test EL0 program: a parent + a worker, one code page (RX), sharing the slot's data/stack pages.
+// The shared counter lives at window+0x1000 (data page 1, RW); worker A's stack top is window+0x3000, worker
+// B's is window+0x3800, and the parent runs on the window-top stack the launcher sets — all distinct sub-
+// ranges of the RW pages [0x1000,0x4000). Position-independent: `adr __threads_blob_start` recovers the window
+// base (the blob is copied to & entered at the base), so every VA is computed at run time.
+core::arch::global_asm!(
+    r#"
+    .balign 4
+    .globl __threads_blob_start
+__threads_blob_start:
+    .globl __threads_prog_parent
+__threads_prog_parent:
+    adr  x20, __threads_blob_start        // x20 = window base (PC-relative)
+    add  x22, x20, #0x1000                // x22 = shared counter address (RW data page 1)
+    str  xzr, [x22]                       // zero the counter before any worker reads it
+    dmb  ish                              // publish the zero to the sibling core before spawning
+    adr  x21, __threads_prog_worker       // x21 = worker entry VA (base + worker offset)
+    // worker A: caller's core (placement 0), arg 0, stack top = base+0x3000
+    mov  x0, x21
+    add  x1, x20, #0x3000
+    mov  x2, #0
+    mov  x3, #0
+    mov  x8, #21                          // SYS_THREAD_SPAWN
+    svc  #0
+    mov  x23, x0                          // x23 = handle_a
+    // worker B: sibling core (placement 1), arg 1, stack top = base+0x3800
+    mov  x0, x21
+    add  x1, x20, #0x3000
+    add  x1, x1, #0x800
+    mov  x2, #1
+    mov  x3, #1
+    mov  x8, #21
+    svc  #0
+    mov  x24, x0                          // x24 = handle_b
+    mov  x0, x23                           // SYS_THREAD_JOIN(handle_a)
+    mov  x8, #23
+    svc  #0
+    mov  x0, x24                           // SYS_THREAD_JOIN(handle_b)
+    mov  x8, #23
+    svc  #0
+    ldr  x25, [x22]                        // read the shared counter (both increments now visible)
+    mov  x0, x25                           // SYS_REPORT(counter)
+    mov  x8, #3
+    svc  #0
+    mov  x0, #1                            // SYS_WRITE(fd=1, msg, 16) — exercise the write path post-join
+    adr  x1, __threads_msg
+    mov  x2, #16
+    mov  x8, #1
+    svc  #0
+    mov  x0, #0                            // SYS_EXIT(0) -> routed to the ELF-2 witness by name
+    mov  x8, #2
+    svc  #0
+1:  b 1b
+
+    .balign 4
+    .globl __threads_prog_worker
+__threads_prog_worker:
+    adr  x9, __threads_blob_start          // x9 = window base
+    add  x9, x9, #0x1000                   // x9 = shared counter address (shared across threads/cores)
+2:  ldxr x10, [x9]                         // A72 = ARMv8.0: LL/SC exclusive (no LSE atomics)
+    add  x10, x10, #1
+    stxr w11, x10, [x9]
+    cbnz w11, 2b                           // monitor lost (contention/preempt) -> retry
+    mov  x8, #22                           // SYS_THREAD_EXIT (posts completion; never returns)
+    svc  #0
+3:  b 3b
+
+    .balign 4
+    .globl __threads_msg
+__threads_msg:
+    .ascii "threads: joined\n"
+    .balign 4
+    .globl __threads_blob_end
+__threads_blob_end:
+"#
+);
+
+unsafe extern "C" {
+    static __threads_blob_start: u8;
+    static __threads_blob_end: u8;
+    static __threads_prog_parent: u8;
+}
+
+/// ELF-2 threads-test launcher + verdict (the `elf1_launcher` shape: one gated kernel task, self-contained,
+/// its own uncounted `:: EL0: threads test … ::` line). Copies the threads blob into a fresh slot's code page,
+/// protects it EL0-RX/EL1-RO, endows a console cap, and runs the parent `el0-threads` on THIS core (so the
+/// cooperative-yield verdict below drives it under QEMU). The parent spawns 2 workers (one here, one on a
+/// sibling core), each atomically bumps the shared counter, joins them, and exits; the verdict prints the
+/// authoritative witness with the kernel-observed spawned/joined counts, the reported counter, and the cores
+/// the two workers actually ran on. Never perturbs the fixture battery (its own line, no shared counter).
+fn threads_launcher(_demo_cpu: usize) {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let bstart = &raw const __threads_blob_start as usize;
+    let bend = &raw const __threads_blob_end as usize;
+    let blen = bend - bstart;
+    if blen > super::boot::USER_CODE_SIZE {
+        serial_println!(":: EL0: threads test — blob {} B > code page, SKIP ::", blen);
+        return;
+    }
+    let (base, size) = super::boot::user_region();
+    let sp = (base + size as u64) & !0xF; // 16-aligned window top = the parent's initial SP_EL0
+    let Some(slot) = super::boot::alloc_user_slot() else {
+        serial_println!(":: EL0: threads test — no free address-space slot, SKIP ::");
+        return;
+    };
+    let backing = super::boot::slot_backing_ptr(slot);
+    unsafe { core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen) };
+    super::cache::icache_sync_range(backing as usize, blen);
+    unsafe { super::boot::protect_user_slot_code(slot, super::boot::USER_CODE_SIZE) };
+    let ttbr0 = super::boot::slot_ttbr0(slot);
+    install_console_cap(ttbr0 >> 48);
+    let entry = base + (&raw const __threads_prog_parent as usize - bstart) as u64;
+    let run_cpu = super::percpu::this_cpu().cpu_index as usize;
+    super::sched::spawn_user_slot("el0-threads", entry, sp, ttbr0, run_cpu);
+
+    // Verdict: wait (bounded ~2 s, yielding so el0-threads + its co-located worker run on this core) for the
+    // parent to reach its clean exit.
+    let vstart = super::timer::cntpct();
+    let vdeadline = 2 * super::timer::cntfrq();
+    while !THREADS_PARENT_DONE.load(Ordering::Acquire)
+        && super::timer::cntpct().wrapping_sub(vstart) <= vdeadline
+    {
+        super::sched::yield_now();
+    }
+    let spawned = THREADS_SPAWNED.load(Ordering::Acquire);
+    let joined = THREADS_JOINED.load(Ordering::Acquire);
+    let counter = THREADS_COUNTER.load(Ordering::Acquire);
+    let ca = THREADS_CORE_A.load(Ordering::Acquire);
+    let cb = THREADS_CORE_B.load(Ordering::Acquire);
+    let done = THREADS_PARENT_DONE.load(Ordering::Acquire);
+    if done && spawned == 2 && joined == 2 && counter == 2 {
+        serial_println!(
+            ":: EL0: threads test — spawned={} joined={} counter={} cores={},{} :: PASS ::",
+            spawned, joined, counter, ca, cb
+        );
+    } else {
+        serial_println!(
+            ":: EL0: threads test — spawned={} joined={} counter={} cores={},{} done={} (want 2/2/2) :: FAIL ::",
+            spawned, joined, counter, ca, cb, done
+        );
+    }
+}
+
+// =============================================================================================
 // U4: the process-model demo — the parent + orphan slots + the gated launcher/verdict
 // =============================================================================================
 
@@ -8912,6 +9224,11 @@ pub fn u7_launcher(demo_cpu: usize) {
     // page permissions), then drops it to EL0 and confirms it ran (its SYS_REPORT token arrived, its
     // SYS_WRITE message printed). Its own uncounted `:: ELF1: … ::` line; an honest skip without the fixture.
     elf1_launcher(demo_cpu);
+    // ELF-2: the EL0-threading test — SYS_THREAD_SPAWN/_JOIN/_EXIT with a shared-memory counter across two
+    // worker threads (one co-located, one on a sibling core). In-RAM (no disk), so it can never perturb the
+    // fixture battery or the FAT witnesses; its own uncounted `:: EL0: threads test — … ::` line. Placed after
+    // ELF-1 (the loader is proven; this exercises the thread primitives on top of the same slot machinery).
+    threads_launcher(demo_cpu);
     // K3: the revoke-persist commit-ordering proof — a named-owner file's SYS_FGRANT revoke commits to disk
     // BEFORE the in-RAM removal, so it SURVIVES REBOOT and fails CLOSED on a persist failure. Its own uncounted
     // `:: K3-revoke: … PASS ::` line; fully self-cleaning (leaves no owned row on the metal card).

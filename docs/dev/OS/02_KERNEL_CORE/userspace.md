@@ -311,6 +311,32 @@
   transfer refused, the child prints through the transferred cap, the revoked cap denies with
   `-EACCES`, and the launcher proves the child's row byte-clear while the deposit was pending. See
   the `SECURITY.md` U7 ledger entry for the full mechanism.
+- **ELF-1 (landed 2026-07-22)** — the loader graduated from flat blob to a minimal static **ELF64**
+  (`load_program_into_slot` dispatches on the magic; `validate_elf` walks the PT_LOAD program headers and
+  maps each segment into the 16 KiB slot window with per-segment permissions — R+X → code page, R+W → data
+  page). The flat path stays the fallback for magic-less `.BIN` fixtures. Witness: `:: ELF1: static ELF64
+  loaded (… bytes, 2 PT_LOAD segs) -> EL0 ran … -> PASS ::`.
+- **ELF-2 (landed 2026-07-23)** — first rung of the **EL0-threading** ladder: multiple EL0 tasks SHARING one
+  address space (the parent's slot `ttbr0`/ASID), the substrate for multi-threaded programs. Three syscalls:
+  `SYS_THREAD_SPAWN = 21` (entry, sp, arg, placement → a new EL0 thread under the caller's `ttbr0`/ASID,
+  started at `entry` on a caller-carved `sp` with `arg` in x0, on the caller's core or a sibling; returns a
+  per-process thread handle), `SYS_THREAD_JOIN = 23` (block on the thread's completion `Semaphore`, then
+  reap), `SYS_THREAD_EXIT = 22` (post completion + release the slot). The slot now carries a **live-task
+  refcount** (`boot::SLOT_REFCOUNT`): `alloc_user_slot` seeds it to 1, `slot_thread_retain` bumps it per
+  thread, and `teardown_user_slot` frees the slot only on the 1→0 edge — so a shared address space outlives
+  the first thread to exit and is torn down only when the last leaves. **Multi-core soundness** (the same ASID
+  live on two cores): `teardown_user_slot` now repoints EACH exiting thread's core off the slot root
+  unconditionally (not only the last), so the final broadcast `TLBI ASIDE1IS` races no live slot root on any
+  other core — preserving `build_slot`'s "the ASID was flushed at teardown, no core can speculatively
+  re-cache it" realloc invariant. Completion is posted at the single point in `sched::exit()` (moved out of
+  `task_trampoline`), covering both a kernel thread's return and an EL0 thread's `SYS_THREAD_EXIT`; the thread
+  arg rides in x0 out of `user_task_trampoline` (placed AFTER the GPR/FP scrub — a deliberate ABI value, the
+  scrub's no-leak property unweakened). Test: a parent zeroes a shared counter, spawns 2 workers (one
+  co-located, one on a sibling core), each **atomically** (A72 LL/SC — ARMv8.0, no LSE) increments the
+  counter and exits, the parent joins both and reports the total. QEMU-verified (2026-07-23):
+  `:: EL0: threads test — spawned=2 joined=2 counter=2 cores=1,2 :: PASS ::` — genuine cross-core EL0 with a
+  shared `ttbr0`. Metal note: cross-core LL/SC atomicity depends on the user window being Normal
+  Inner-Shareable cacheable memory (an arc-boundary hardware check, not gated by QEMU).
 - Not yet: **revocation trees** (a derived copy — re-grant or onward re-transfer — escapes
   single-level revoke today; derivation records + `CAP_REVOKE` are that arc), the **bandy Ring-3
   delegation wrapper**, `File` transfer (descriptor migration), real `Socket` fs/net syscalls.
@@ -463,8 +489,18 @@ Conventions shared across arches:
   | 8 | `SYS_SPAWN` | — | **handle** / `-errno` | aarch64 M7→**U4** — loads the fixed `HELLO.BIN` into a fresh slot, runs it at EL0 as a child, and returns a **handle index into the caller's per-process handle table** (U4 — not the raw pid; arbitrary program-by-name is M8) |
   | 9 | `SYS_WAIT` | **handle** | exit status / `-ECHILD` | aarch64 M7→**U4** — blocks until the child that *handle* refers to exits (scheduler wake via the child's `done` post); `-ECHILD` if the handle is not in the caller's table (structural ownership) |
 
-  aarch64 leads 4–9 (M6f 4–7, M7 8–9); the x86 U-side port adopts the same numbers so
-  the arches stay aligned (x86 adds SMAP considerations aarch64's PAN-less A72 lacks).
+  (Numbers 10–20 are the aarch64 capability/FS/bus surface — `SYS_CAP`=10, `SYS_OPEN`=11,
+  `SYS_READ`=12, `SYS_XFER`=13, `SYS_RECV`=14, `SYS_SEEK`=15, `SYS_UNLINK`=16, `SYS_CLOSE`=17,
+  `SYS_FGRANT`=18, `SYS_MSEND`=19, `SYS_MRECV`=20 — documented in their U5–U11 / BANDY entries.)
+
+  | # | Name | Args | Returns | Notes |
+  | :--- | :--- | :--- | :--- | :--- |
+  | 21 | `SYS_THREAD_SPAWN` | entry, sp, arg, place | **thread handle** / `-errno` | aarch64 **ELF-2** — a new EL0 thread SHARING the caller's `ttbr0`/ASID; `place` 0=caller-core, 1=sibling-core; `arg` in x0; retains the slot (freed on the last thread's exit) |
+  | 22 | `SYS_THREAD_EXIT` | — | — (no return) | aarch64 **ELF-2** — posts the thread's completion + releases the slot; scheduler reclaims the task |
+  | 23 | `SYS_THREAD_JOIN` | handle | 0 / `-ESRCH` | aarch64 **ELF-2** — blocks on the thread's completion `Semaphore`; `-ESRCH` if the handle is not the caller's live thread |
+
+  aarch64 leads 4–9 (M6f 4–7, M7 8–9) and 21–23 (ELF-2 threading); the x86 U-side port adopts the same
+  numbers so the arches stay aligned (x86 adds SMAP considerations aarch64's PAN-less A72 lacks).
 - **User faults kill the task, kernel faults stay fatal.** Fault accounting
   is matched (task, vector/EC, address) so demos assert exact outcomes.
 - **User pages are never executable-and-writable**; code pages are read-only

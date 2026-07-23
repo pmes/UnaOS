@@ -682,15 +682,9 @@ extern "C" fn task_trampoline() -> ! {
     debug_assert!(!raw.is_null(), "task_trampoline: current is null");
     let (entry, arg) = unsafe { ((*raw).entry, (*raw).arg) };
     entry(arg);
-    // Signal completion to any joiner. `post()` cross-core-wakes a parked joiner if there is one.
-    // BORROW `done_sem` (never move it): the Box's own Arc clone is this `post()`'s liveness anchor
-    // and must remain in the Box until the scheduler drops it on the Finished path — strictly AFTER
-    // this post (exit() switches away; the scheduler then reclaims and drops the Box).
-    unsafe {
-        if let Some(sem) = &(*raw).done_sem {
-            sem.post();
-        }
-    }
+    // Completion is signalled in `exit()` now (the single post point — see the note there), which covers
+    // this kernel-thread return AND the EL0-thread `SYS_THREAD_EXIT` path (ELF-2), whose task erets to EL0
+    // and never runs this trampoline tail.
     exit();
 }
 
@@ -721,6 +715,12 @@ extern "C" fn user_task_trampoline() -> ! {
     let raw = SCHED[cpu].current.load(Ordering::Acquire) as *const Task;
     debug_assert!(!raw.is_null(), "user_task_trampoline: current is null");
     let (entry, sp) = unsafe { ((*raw).user_entry, (*raw).user_sp) };
+    // ELF-2: the one u64 argument the EL0 task starts with in x0 (the thread ABI's single arg). Regular EL0
+    // tasks (`spawn_user`/`spawn_user_slot`) leave `arg` 0, so x0 stays 0 — byte-identical to the pre-ELF-2
+    // scrub. A `spawn_user_thread` sets it. This is a DELIBERATE ABI value, not kernel residue: it is placed
+    // in x0 AFTER the full GPR/FP scrub below, so the scrub's no-leak property is unweakened (every other
+    // register is still zeroed; x0 alone carries the intended argument, exactly as a syscall ABI arg would).
+    let arg = unsafe { (*raw).arg as u64 };
     // SPSR_EL1 = 0x240 (M6e): M[3:0]=0b0000 (EL0t — a dedicated SP_EL0; EL0h/0b0001 is an illegal
     // return from EL1 -> PSTATE.IL), M[4]=0 (AArch64), DAIF = D,F masked with A (SError) and I (IRQ)
     // CLEAR. I unmasked => the generic timer preempts a running EL0 task (M6e; safe now that
@@ -751,7 +751,7 @@ extern "C" fn user_task_trampoline() -> ! {
             "msr SPSR_EL1, x2",
             "mov x0, xzr",  "mov x1, xzr",  "mov x2, xzr",  "mov x3, xzr",
             "mov x4, xzr",  "mov x5, xzr",  "mov x6, xzr",  "mov x7, xzr",
-            "mov x8, xzr",  "mov x9, xzr",  "mov x10, xzr", "mov x11, xzr",
+            "mov x8, xzr",  /* x9 holds the ELF-2 thread arg; scrubbed at the tail */ "mov x10, xzr", "mov x11, xzr",
             "mov x12, xzr", "mov x13, xzr", "mov x14, xzr", "mov x15, xzr",
             "mov x16, xzr", "mov x17, xzr", "mov x18, xzr", "mov x19, xzr",
             "mov x20, xzr", "mov x21, xzr", "mov x22, xzr", "mov x23, xzr",
@@ -770,11 +770,16 @@ extern "C" fn user_task_trampoline() -> ! {
             "msr FPCR, xzr",        // default control (round-to-nearest, no FTZ, no traps)
             "msr TPIDR_EL0, xzr",   // EL0 RW thread pointer — no kernel residue reaches EL0
             "msr TPIDRRO_EL0, xzr", // EL0 RO thread pointer (EL1-writable)
+            // ELF-2: plant the thread argument in x0 AFTER the scrub (deliberate ABI value), then scrub the
+            // scratch x9 that carried it. For a 0-arg task this writes x0=0 — identical to the scrub result.
+            "mov x0, x9",
+            "mov x9, xzr",
             "isb",
             "eret",
             in("x0") sp,
             in("x1") entry,
             in("x2") 0x240u64,
+            in("x9") arg,
             options(noreturn, nostack),
         );
     }
@@ -1025,6 +1030,84 @@ fn spawn_user_inner(
     id
 }
 
+/// ELF-2 — spawn an EL0 THREAD: a new user task that SHARES the address space named by `user_ttbr0` (the
+/// parent's slot root `slot_l1_pa | asid<<48`), rather than a fresh private slot. This is the primitive
+/// behind `SYS_THREAD_SPAWN`: the caller carves `user_sp` (a stack) from its own 16 KiB window, names an
+/// `user_entry` PC inside the shared window, and the new thread runs concurrently under the SAME ASID —
+/// possibly on a different core (`cpu`). It carries one u64 `arg` (delivered in x0 by `user_task_trampoline`)
+/// and a `JoinHandle` completion semaphore (posted in `exit()` — the single post point).
+///
+/// SLOT REFCOUNT: the caller MUST have already `slot_thread_retain`ed the slot BEFORE calling this, so the
+/// shared address space cannot be torn down between here and the thread's first dispatch. Teardown happens
+/// on the LAST thread's exit (`teardown_user_slot`'s 1->0 edge).
+///
+/// Multi-core soundness (shared ASID on two cores): `dispatch_next` installs `user_ttbr0` per-core, so both
+/// cores run under the same root/ASID; nG user leaves are ASID-tagged and TLB maintenance is Inner-Shareable
+/// broadcast; and `teardown_user_slot` now repoints EACH exiting thread's core off the slot root, so the
+/// final ASID flush races no live root on any other core. Baremetal-only (reaches the Pi-gated user MMU).
+#[cfg(feature = "baremetal")]
+pub fn spawn_user_thread(
+    name: &'static str,
+    user_entry: u64,
+    user_sp: u64,
+    arg: u64,
+    user_ttbr0: u64,
+    requested_cpu: usize,
+) -> JoinHandle {
+    let cpu = pick_cpu(requested_cpu);
+    assert!(cpu < NUM_CPUS, "spawn_user_thread: cpu out of range");
+    let done = Arc::new(Semaphore::new(0));
+    done.init(); // reserve the waiter list BEFORE the thread can run + post (alloc-free park)
+    let mut stack: Box<[u8]> = alloc::vec![0u8; TASK_STACK_SIZE].into_boxed_slice();
+    let ctx_sp = build_initial_frame(&mut stack, user_task_trampoline);
+    let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
+    let task = Box::new(Task {
+        id,
+        name,
+        state: AtomicU8::new(STATE_READY),
+        ctx_sp,
+        stack,
+        entry: user_never,
+        arg: arg as usize, // delivered to EL0 in x0 by user_task_trampoline (the thread's single argument)
+        cpu: cpu as u32,
+        priority: PRIO_NORMAL,
+        wait_ticks: 0,
+        done_sem: Some(done.clone()),
+        user_entry,
+        user_sp,
+        user_ttbr0,
+    });
+    RUN_QUEUES[cpu].lock().push(task);
+    #[cfg(feature = "pi")]
+    serial_println!(
+        ":: SCHED: thread '{}' -> core {} (ELF-2 shared-ASID EL0 thread, no-migrate) ::",
+        name,
+        cpu
+    );
+    poke_cpu(cpu);
+    JoinHandle { done, id }
+}
+
+/// ELF-2 — pick an online scheduling core DIFFERENT from `not`, for placing a thread on a sibling core (the
+/// `SYS_THREAD_SPAWN` "spread" hint). Returns the least-loaded such core, or `not` itself if no other core is
+/// online (uniprocessor / early staging). Lets a thread demonstrate genuine cross-core parallelism without
+/// the EL0 program knowing the CPU topology.
+pub fn other_online_cpu(not: usize) -> usize {
+    let mut best: Option<usize> = None;
+    let mut best_depth = usize::MAX;
+    for c in 0..NUM_CPUS {
+        if c == not || !ONLINE_MASK[c].load(Ordering::Acquire) {
+            continue;
+        }
+        let depth = RUN_QUEUES[c].lock().len();
+        if depth < best_depth {
+            best_depth = depth;
+            best = Some(c);
+        }
+    }
+    best.unwrap_or(not)
+}
+
 /// Like `spawn`, but returns a `JoinHandle` a scheduled task can `join()` to block until this task
 /// finishes. Allocates an `Arc<Semaphore>` (0 permits) shared between the new task and the handle;
 /// the task's trampoline posts it on completion. Costs one heap alloc + a reserved waiter list, so
@@ -1178,6 +1261,16 @@ pub fn exit() -> ! {
             if asid != 0 {
                 super::boot::teardown_user_slot(asid);
             }
+        }
+        // Signal completion to any joiner — the SINGLE post point for `done_sem`, covering BOTH a kernel
+        // thread's normal `entry` return (via `task_trampoline`) and an EL0 thread's `SYS_THREAD_EXIT`
+        // (ELF-2), which reaches `exit()` directly from the syscall handler. BORROW `done_sem` (never move
+        // it): the Box's own Arc clone is this `post()`'s liveness anchor and must stay in the Box until the
+        // scheduler drops it on the Finished path — strictly AFTER this post (we `switch_context` away just
+        // below; the scheduler then reclaims and drops the Box). Only joinable spawns set `done_sem`; every
+        // other task carries `None`, so this is a no-op for them (byte-identical to the pre-ELF-2 path).
+        if let Some(sem) = &(*raw).done_sem {
+            sem.post();
         }
         (*raw).state.store(STATE_FINISHED, Ordering::Release);
         // `old_sp` is a throwaway on the dying stack — the scheduler never reads it back and never

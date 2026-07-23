@@ -21,7 +21,7 @@
 // SCTLR_EL1). The drop is purely additive — it configures the EL1-facing controls that would otherwise
 // trap or read UNKNOWN, and leaves the (now-unused-for-translation) EL2 regime alone.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use unaos_boot_info::{BootInfo, FrameBufferInfo, MemoryRegion, MemoryRegionKind, PixelFormat};
 
@@ -348,6 +348,26 @@ static mut SLOT_BACKING: [UserRegion; USER_SLOTS] =
 /// Allocation state, one flag per slot. Atomic so `alloc`/`teardown` are race-free across cores.
 static SLOT_USED: [AtomicBool; USER_SLOTS] = [const { AtomicBool::new(false) }; USER_SLOTS];
 
+/// ELF-2 — the LIVE-TASK refcount for each slot (its shared address space). ELF-1 ran one task per slot,
+/// so a slot's lifetime was "alloc … single task exits … teardown". ELF-2 lets several EL0 THREADS share
+/// one slot's TTBR0/ASID (`SYS_THREAD_SPAWN`), so the slot's address space must outlive the FIRST thread to
+/// exit and be torn down only when the LAST leaves. This counter is that guard: `alloc_user_slot` seeds it
+/// to 1 (the initial owner task), `slot_thread_retain` bumps it per additional thread, and
+/// `teardown_user_slot` decrements — doing the real ASID-flush + slot-free only on the 1->0 edge. Indexed by
+/// slot (`asid - 1`). Untouched by the shared-window (ASID 0) / kernel (ttbr0 0) tasks, which never call
+/// teardown.
+static SLOT_REFCOUNT: [AtomicU32; USER_SLOTS] = [const { AtomicU32::new(0) }; USER_SLOTS];
+
+/// ELF-2 — register one more live EL0 thread against the slot owning `asid` (the shared address space a
+/// `SYS_THREAD_SPAWN` adds a task to). Balanced by that thread's eventual `teardown_user_slot` call at exit.
+/// MUST be called on a live slot (refcount already >= 1 from the initial owner) BEFORE the new thread can be
+/// dispatched, so no thread exit can drive the count to 0 while another is still being wired up.
+pub fn slot_thread_retain(asid: u64) {
+    debug_assert!(asid >= 1 && asid as usize <= USER_SLOTS, "retain: asid out of range");
+    let prev = SLOT_REFCOUNT[(asid - 1) as usize].fetch_add(1, Ordering::AcqRel);
+    debug_assert!(prev >= 1, "slot_thread_retain on a slot with no live owner");
+}
+
 /// The boot/shared context TTBR0 value: `&L1 | (ASID 0 << 48)` == `&L1` (identity-mapped, so PA == VA).
 /// Kernel tasks and the shared-window (M6b/M6e) EL0 tasks run under this root.
 pub fn boot_ttbr0() -> u64 {
@@ -384,6 +404,10 @@ pub fn alloc_user_slot() -> Option<usize> {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
+            // ELF-2: seed the live-task refcount to 1 for the initial owner. The store precedes
+            // `build_slot`'s publishing barrier and any dispatch onto this slot, so a
+            // `slot_thread_retain` (only reachable once a task runs on the slot) always sees >= 1.
+            SLOT_REFCOUNT[s].store(1, Ordering::Release);
             unsafe { build_slot(s) };
             return Some(s);
         }
@@ -541,28 +565,51 @@ pub fn slot_page_is_data(s: usize, va: u64) -> bool {
     (d & (0b11 << 6)) == AP_EL0 && (d & DESC_UXN) != 0
 }
 
-/// Tear down the slot owning `asid` (1..=USER_SLOTS) at task exit / slot release. Order is load-bearing
-/// (this is the exact class of bug QEMU cannot see): FIRST repoint the exiting core's TTBR0 off the dead
-/// slot root to the boot root (`&L1 | ASID 0`) + `isb`, so the retired ASID's tables are no longer the
-/// live root and speculative TLB refill cannot silently re-cache under it; THEN broadcast-invalidate that
-/// ASID (`dsb ishst; tlbi aside1is,(asid<<48); dsb ish; isb`) — broadcast because a reused slot may next
-/// run on ANOTHER core. Tasks are core-pinned, so only this core ever had this root live. Finally free the
-/// slot for reuse.
+/// Release ONE live task's hold on the slot owning `asid` (1..=USER_SLOTS) at task exit. Called for EVERY
+/// slot-bound EL0 task's exit (`sched::exit`); the ELF-1 single-task case and the ELF-2 multi-thread case
+/// share this path.
+///
+/// TWO-PHASE, order load-bearing (the exact class of bug QEMU cannot see):
+///  1. ALWAYS repoint THIS core's TTBR0 off the slot root to the boot root (`&L1 | ASID 0`) + `isb`. This
+///     runs on every thread's exit, not only the last — so no core is ever left with a torn-down (or, for a
+///     not-yet-last thread, a soon-to-be-torn-down) slot root live in TTBR0. That is what makes the
+///     multi-core shared-ASID case sound: `build_slot`'s "the ASID was flushed at teardown and no core can
+///     speculatively re-cache it" invariant (relied on at the slot's next `alloc`) holds because each thread
+///     repoints its own core away from the slot root as it exits, so at the final flush no OTHER core holds
+///     the root live to speculatively refill under it.
+///  2. Decrement the live-task refcount. On a NON-final release (`prev != 1`) stop here: the slot's address
+///     space is still in use by sibling threads — no ASID flush, no free. Only the FINAL release (1->0 edge)
+///     broadcast-invalidates the ASID (`dsb ishst; tlbi aside1is,(asid<<48); dsb ish; isb` — broadcast
+///     because a reused slot may next run on ANOTHER core), clears the handle row, and frees the slot.
+///
+/// ELF-1 behavior is a special case: one task, refcount 1, so the first (and only) release is the final one
+/// and the flush+free run exactly as before.
 pub unsafe fn teardown_user_slot(asid: u64) {
     debug_assert!(asid >= 1 && asid as usize <= USER_SLOTS, "teardown: asid out of range");
     // The ASIDE1IS operand carries the ASID in Xt[63:48]; assert `asid << 48` round-trips (a mis-encoded
     // operand would flush the wrong ASID — silent on QEMU, a stale-entry bug on metal).
     debug_assert_eq!((asid << 48) >> 48, asid, "teardown: ASID does not fit Xt[63:48]");
     let boot = &raw const L1 as u64; // boot root, ASID 0
+    // Phase 1 — repoint THIS core off the slot root unconditionally (see the two-phase note above).
     unsafe {
         core::arch::asm!(
             "msr TTBR0_EL1, {boot}",
             "isb",
+            boot = in(reg) boot,
+            options(nostack, preserves_flags),
+        );
+    }
+    // Phase 2 — only the LAST live task flushes the ASID + frees the slot. A non-final release leaves the
+    // shared address space intact for the surviving sibling threads (this core is already off it, above).
+    if SLOT_REFCOUNT[(asid - 1) as usize].fetch_sub(1, Ordering::AcqRel) != 1 {
+        return;
+    }
+    unsafe {
+        core::arch::asm!(
             "dsb ishst",
             "tlbi aside1is, {asidreg}",
             "dsb ish",
             "isb",
-            boot = in(reg) boot,
             asidreg = in(reg) (asid << 48),
             options(nostack, preserves_flags),
         );
