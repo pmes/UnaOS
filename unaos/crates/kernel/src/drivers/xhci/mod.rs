@@ -760,6 +760,11 @@ pub struct DeviceSlot {
     /// Count of REAL (non-dup) pointer reports serviced since arming — drives the bounded serial
     /// mouse-witness (first report + every Nth), never one-line-per-report.
     pub mouse_report_count: u32,
+    /// GUI-CLICK-2: previous pointer-button bitmask for this slot, so the decode emits a
+    /// `pal::Event::Button` on the button-DOWN edge only (any bit going 0→1) and ignores the
+    /// matching release. Mirrors the EHCI press-edge idiom (ehci/mod.rs) and `CLICK1_PREV_MASK`.
+    /// 0 = no button held. Shared xHCI code: x86 xHCI mice track this identically.
+    pub mouse_prev_buttons: u8,
 
     pub is_keyboard: bool,
     pub keyboard_ep: u8,
@@ -870,6 +875,7 @@ impl DeviceSlot {
             mouse_ring: None,
             mouse_expect_phys: 0,
             mouse_report_count: 0,
+            mouse_prev_buttons: 0,
             is_keyboard: false,
             keyboard_ep: 0,
             keyboard_mps: 0,
@@ -941,6 +947,7 @@ impl DeviceSlot {
         self.mouse_state = 0;
         self.mouse_expect_phys = 0;
         self.mouse_report_count = 0;
+        self.mouse_prev_buttons = 0;
         self.is_keyboard = false;
         self.keyboard_ep = 0;
         self.keyboard_mps = 0;
@@ -2088,6 +2095,19 @@ impl XhciController {
                                             };
                                             // `slot` (the shared borrow) is no longer read past here;
                                             // the &mut self accesses below are the count bump + re-arm.
+
+                                            // GUI-CLICK-2: emit ONE Button on the button-DOWN edge
+                                            // (any bit newly set), mirroring the EHCI press-edge
+                                            // idiom (ehci/mod.rs). Release emits nothing; a held
+                                            // button does not re-fire. The Pi render task / vug
+                                            // exit on this observable exactly like a keystroke.
+                                            // Shared xHCI code: x86 xHCI mice gain the same correct
+                                            // Button (a fix, not a risk — EHCI keeps its own emit).
+                                            let prev_btn = self.slots[slot_id as usize].mouse_prev_buttons;
+                                            if buttons & !prev_btn != 0 {
+                                                crate::pal::push_event(crate::pal::Event::Button(buttons));
+                                            }
+                                            self.slots[slot_id as usize].mouse_prev_buttons = buttons;
 
                                             // UI1-MOUSE M1: bounded serial mouse-witness — first report
                                             // + every 32nd thereafter, NEVER one-per-report (that would

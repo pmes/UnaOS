@@ -1773,7 +1773,14 @@ fn handle_key(
     if c == b'\n' || c == b'\r' {
         let cmd = console.current_input.clone();
         console.current_input.clear();
+        // GUI-CLICK-2: mark the screen app-owned across the (possibly long-running, full-screen)
+        // command so the Pi USB pump leaves input in EVENT_QUEUE for the command's own pump_and_poll
+        // (vug/pulse) instead of forwarding it into a GUI_CHANNEL that render_service — blocked HERE
+        // inside dispatch_command — cannot drain. Cleared unconditionally on return (a took_screen
+        // command has already restored the console by the time it returns).
+        SCREEN_APP_ACTIVE.store(true, core::sync::atomic::Ordering::Relaxed);
         let took_screen = unaos_kernel::shell::dispatch_command(&cmd, console, pal);
+        SCREEN_APP_ACTIVE.store(false, core::sync::atomic::Ordering::Relaxed);
         if !took_screen {
             console.draw(pal);
         }
@@ -1970,6 +1977,47 @@ static CLICK1_PREV_MASK: core::sync::atomic::AtomicU8 = core::sync::atomic::Atom
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 static CLICK1_LAST_LOG_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// GUI-CLICK-2: true while a full-screen app owns the screen — set around `dispatch_command` in
+/// `handle_key`. While true, `pump_usb_into_gui` STOPS forwarding pointer/key events into
+/// GUI_CHANNEL and leaves them in `pal::EVENT_QUEUE` for the app's own `pump_and_poll` drain (vug,
+/// pulse, …). This both delivers input (incl. the exit click) to the app AND stops the pump from
+/// saturating the 64-slot GUI_CHANNEL while render_service is blocked inside the app — the P-metal
+/// fps-decay-under-vug mechanism. Ungated (shared `handle_key` sets it on every arch); only the Pi
+/// pump reads it. `[click1]` stays the no-app fallback dispatch.
+static SCREEN_APP_ACTIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// GUI-CLICK-2 (depth witness): running count of events forwarded INTO GUI_CHANNEL and RECEIVED out
+/// of it. `sent - recv` is the live channel queue-depth (the coordinator's saturation suspect). Both
+/// send and recv sites live in this file's aarch64+baremetal service tasks, so the pair is exact
+/// without touching the `Channel` type in sched.rs (another lane). Printed by the `[click2] depth`
+/// line every ~5 s, always (so the degradation curve is on serial regardless of app-active state).
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+static GUI_SENT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+static GUI_RECV: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// GUI-CLICK-2: `[click2] depth` is rate-limited by a PASS COUNTER, not wall-clock: the pump runs
+/// from the raspi4b poll-nap fallback where `arch::ms()` is stuck at 0 (Group-1 timer not live), so
+/// an ms() rate-limit never holds there and floods serial. A pass counter is monotonic regardless of
+/// timer state — one line every `CLICK2_DEPTH_EVERY` passes (~5 s at the metal ~250 Hz pump cadence).
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+static CLICK2_DEPTH_PASSES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+const CLICK2_DEPTH_EVERY: u64 = 1250;
+/// GUI-CLICK-2: ms() of the last `[click2] input left for app` witness (rate-limit ~5 s so a held/
+/// chattering click during an app does not flood serial). Edge-triggered on a real press, which only
+/// occurs on metal (QEMU raspi4b has no USB HID) where ms() advances — so ms gating is safe here.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+static CLICK2_LEFT_LAST_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// GUI-CLICK-2: forward one event into GUI_CHANNEL and bump the sent counter (depth accounting). The
+/// single choke point for every producer in this file, so `GUI_SENT` can never drift from real sends.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn gui_send(ev: unaos_kernel::pal::Event) {
+    GUI_SENT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    GUI_CHANNEL.send(ev);
+}
+
 /// PIUSB-23 (bare-metal aarch64): pump the xHCI controller from the scheduled input service and bridge
 /// decoded HID keys into the GUI channel. THE keyboard-goes-silent structural fix.
 ///
@@ -2003,24 +2051,65 @@ fn pump_usb_into_gui() {
     // this arc the drain forwarded Key alone and silently dropped every pointer report. Timer/None/
     // Unknown are still dropped here (Timer is the render task's own status pulse; None/Unknown carry
     // nothing) so EVENT_QUEUE never accretes on the Pi's channel-based path.
+    //
+    // GUI-CLICK-2: when a full-screen app owns the screen (SCREEN_APP_ACTIVE — set around
+    // dispatch_command in handle_key), do NOT drain EVENT_QUEUE into GUI_CHANNEL. render_service is
+    // blocked inside that command and cannot recv, so every forward here would (a) steal the app's
+    // input (the app polls the SAME EVENT_QUEUE via pump_and_poll — incl. the exit click) and
+    // (b) fill the 64-slot GUI_CHANNEL until `send` blocks this pump task, the metal fps-decay
+    // mechanism. Leaving the events untouched hands them to the app's own drain and keeps the
+    // channel empty. Normal forwarding resumes the instant the command returns (flag cleared).
+    // poll_events() above still ran (it re-arms the HID rings + fills EVENT_QUEUE) — only the
+    // forward is suppressed, and the app's pump_and_poll is the sole consumer meanwhile.
+    if SCREEN_APP_ACTIVE.load(core::sync::atomic::Ordering::Relaxed) {
+        // Non-destructively witness a pending press for the `[click2] input left for app` line, then
+        // hand every event back to the app untouched. Drain into a fixed buffer (queue is bounded to
+        // 64), scan for a Button, re-push in original order. No heap; the queue is empty for only the
+        // few instructions between drain and re-push (the app's next pump_and_poll pass re-reads it).
+        let mut buf: [unaos_kernel::pal::Event; 64] =
+            [unaos_kernel::pal::Event::None; 64];
+        let mut n = 0usize;
+        let mut saw_button = false;
+        while n < buf.len() {
+            match unaos_kernel::pal::next_event() {
+                Some(ev) => {
+                    if matches!(ev, unaos_kernel::pal::Event::Button(_)) {
+                        saw_button = true;
+                    }
+                    buf[n] = ev;
+                    n += 1;
+                }
+                None => break,
+            }
+        }
+        for ev in buf.iter().take(n) {
+            unaos_kernel::pal::push_event(*ev);
+        }
+        if saw_button {
+            click2_left_witness();
+        }
+        click2_depth_witness();
+        return;
+    }
     while let Some(ev) = unaos_kernel::pal::next_event() {
         match ev {
-            unaos_kernel::pal::Event::Key(_) => GUI_CHANNEL.send(ev),
+            unaos_kernel::pal::Event::Key(_) => gui_send(ev),
             unaos_kernel::pal::Event::Mouse { x, y } => {
                 piusb24_pointer_witness(x, y, None);
-                GUI_CHANNEL.send(ev);
+                gui_send(ev);
             }
             unaos_kernel::pal::Event::MouseAbsolute { x, y } => {
                 piusb24_pointer_witness(x, y, None);
-                GUI_CHANNEL.send(ev);
+                gui_send(ev);
             }
             unaos_kernel::pal::Event::Button(mask) => {
                 piusb24_pointer_witness(0, 0, Some(mask));
-                GUI_CHANNEL.send(ev);
+                gui_send(ev);
             }
             _ => {}
         }
     }
+    click2_depth_witness();
     // PIUSB-28: fire the FAT mount from the path that ACTUALLY runs on Pi baremetal+fb. PIUSB-27
     // wired `piusb27_service()` beside `probe_once` in the main/GUI loop — but that loop never runs
     // on Pi metal (kernel_main spawns services and hlt_loops; the PIUSB-22 structural finding, which
@@ -2059,6 +2148,45 @@ fn piusb24_pointer_witness(dx: i32, dy: i32, buttons: Option<u8>) {
     }
 }
 
+/// GUI-CLICK-2: rate-limited (~5 s) `[click2] input left for app` witness — proves a press edge
+/// arrived while a full-screen app owned the screen and was LEFT in EVENT_QUEUE for the app's own
+/// pump_and_poll (rather than forwarded into the render task's channel). The click that exits vug
+/// rides this path; the throttle keeps a held/chattering button from flooding serial.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn click2_left_witness() {
+    use core::sync::atomic::Ordering;
+    let now = unaos_kernel::arch::ms();
+    let last = CLICK2_LEFT_LAST_MS.load(Ordering::Relaxed);
+    if now.wrapping_sub(last) >= 5000 || last == 0 {
+        CLICK2_LEFT_LAST_MS.store(now.max(1), Ordering::Relaxed);
+        serial_println!("[click2] input left for app");
+    }
+}
+
+/// GUI-CLICK-2 (scope addition): rate-limited (~5 s) `[click2] depth` witness — the live GUI_CHANNEL
+/// queue depth (`GUI_SENT - GUI_RECV`) plus lifetime forwarded/received totals, so the metal serial
+/// carries the channel-saturation curve directly. Printed ALWAYS (both app-active and idle passes),
+/// so the fps-decay-under-vug mechanism is proven rather than inferred: depth spiking toward the
+/// 64-slot cap while an app runs is the backlog the SCREEN_APP_ACTIVE gate now prevents. (Exact
+/// `pal::EVENT_QUEUE` depth and heap-free would need accessors in pal.rs / allocator.rs — outside
+/// this arc's lane — so they are omitted here; GUI_CHANNEL depth is the direct suspect.)
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn click2_depth_witness() {
+    use core::sync::atomic::Ordering;
+    // Fire on pass 0, then once per CLICK2_DEPTH_EVERY passes — timer-independent (see the static's
+    // doc: raspi4b's stuck ms() would defeat a wall-clock throttle).
+    let pass = CLICK2_DEPTH_PASSES.fetch_add(1, Ordering::Relaxed);
+    if pass % CLICK2_DEPTH_EVERY == 0 {
+        let sent = GUI_SENT.load(Ordering::Relaxed);
+        let recv = GUI_RECV.load(Ordering::Relaxed);
+        let app = SCREEN_APP_ACTIVE.load(Ordering::Relaxed);
+        serial_println!(
+            "[click2] depth gui_chan={} (sent={} recv={}) app_active={}",
+            sent.wrapping_sub(recv), sent, recv, app
+        );
+    }
+}
+
 /// M5 (bare-metal aarch64): keyboard input as a scheduled kernel service. The OS runs its own input
 /// on the scheduler: instead of the BSP polling the PL011 inline, this kernel thread on a secondary
 /// core drains bytes from the UART RX FIFO and `send`s each as a Key event over GUI_CHANNEL to the
@@ -2086,7 +2214,7 @@ fn input_service(_: usize) {
                 serial_println!(":: INPUT: PL011 RX interrupt live — keyboard is interrupt-driven ::");
             }
             while let Some(byte) = unaos_kernel::arch::poll_input() {
-                GUI_CHANNEL.send(unaos_kernel::pal::Event::Key(byte));
+                gui_send(unaos_kernel::pal::Event::Key(byte));
             }
             serial::rearm_rx_interrupt(); // re-enable IMSC (no ICR — keeps a straggler's timeout)
             // Close the drain/re-arm gap: if a byte landed meanwhile, wake ourselves to drain it
@@ -2104,7 +2232,7 @@ fn input_service(_: usize) {
         // re-dispatching us; sleep_ticks would park forever with no timer IRQ to wake it.
         loop {
             while let Some(byte) = unaos_kernel::arch::poll_input() {
-                GUI_CHANNEL.send(unaos_kernel::pal::Event::Key(byte));
+                gui_send(unaos_kernel::pal::Event::Key(byte));
             }
             // PIUSB-23: pump xHCI + bridge decoded HID keys into GUI_CHANNEL each cooperative pass
             // (QEMU raspi4b delivers no USB HID, so this is a cheap no-op there; on metal it consumes
@@ -2281,6 +2409,7 @@ fn render_service(_: usize) {
     loop {
         // Block until an event arrives (recv parks the task — an idle render core burns nothing).
         let ev = GUI_CHANNEL.recv();
+        GUI_RECV.fetch_add(1, core::sync::atomic::Ordering::Relaxed); // GUI-CLICK-2 depth accounting
         let t0 = unaos_kernel::arch::now_cycles();
         s6_passes += 1;
         // `dirty` — did this pass draw anything that must be presented? `strip_dirty` — must the
@@ -2388,7 +2517,14 @@ fn render_service(_: usize) {
 fn status_tick(_: usize) {
     loop {
         unaos_kernel::arch::sched::sleep_ticks(250); // ~1 s at the 250 Hz per-core tick
-        GUI_CHANNEL.send(unaos_kernel::pal::Event::Timer);
+        // GUI-CLICK-2: suppress the status-strip pulse while a full-screen app owns the screen.
+        // render_service is blocked inside dispatch_command and cannot drain GUI_CHANNEL, so an
+        // ungated 1 Hz Timer would fill the 64-slot channel in ~64 s — a slow re-run of the exact
+        // saturation the pointer-path gate prevents (and the strip is not visible under the app
+        // anyway). The pulse resumes the instant the command returns.
+        if !SCREEN_APP_ACTIVE.load(core::sync::atomic::Ordering::Relaxed) {
+            gui_send(unaos_kernel::pal::Event::Timer);
+        }
     }
 }
 
