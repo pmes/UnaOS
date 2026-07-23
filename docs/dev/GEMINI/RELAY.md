@@ -2,9 +2,15 @@
 # the message(s) Peter posts into each Gemini chat, verbatim.
 # (updated 2026-07-23, after s14: surface pointer candidate found; pull-5 briefed)
 
-## → kepler-display session
+## → kepler-display session — POST NOW
 
-Display: s15 verdict — your repoint ran perfectly and REFUTED the bare-pointer hypothesis: 0x6101E0 is a read-only armed-state readout (write snaps back; raster undisturbed; clean restore both invocations). That's EVO armed-vs-assembly semantics: assembly state + UPDATE latch live elsewhere. Pull 6 is briefed — git pull and read `docs/dev/GEMINI/video/Kepler/BRIEF-kepler-display-pull6-assembly.md`. Read-only again: 0x6101E0's dense neighborhood, widened scan over 0x614000/0x640000 regions, armed-pair check. Remove the refuted repoint block. Proposal first. PUSH OWED reminder stands.
+Display: pull 6 proposal is APPROVED clean (git pull for the status header). Implement now. PUSH OWED reminder stands.
+
+## → kepler-display session — AFTER THE s16 BOOT (post the matching branch; the coordinator folds the log in parallel)
+
+IF the capture shows a 0x200-holding hit outside 0x6101E0 (or a pair line where first≠second): "Display: s16 found assembly candidate(s) — the pair table is in the capture and the coordinator is folding it into KEPLER-METAL-LOG.md sitting #16 (git pull shortly). Stand by for the pull-7 latch brief — it will name the exact register(s) from your own pair table."
+
+IF hits=0 in evo-scan2 and no diverging pair: "Display: s16 came back empty — no assembly twin in the scanned ranges. Honest null. The coordinator is scoping the next window (likely the 0x680000+ channel-user region or an instance-memory-side hunt); pull-7 brief follows after the fold. Nothing owed from you until then."
 
 ## → kepler-fence session
 
