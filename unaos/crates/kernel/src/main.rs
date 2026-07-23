@@ -952,6 +952,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 // once-a-second wake, off the render core's frame-pacing critical path). Timer-gated
                 // like rx-backstop: its sleep_ticks nap needs the live timer IRQ to wake.
                 unaos_kernel::arch::sched::spawn("status-tick", status_tick, 0, input_cpu);
+                // PIUSB-26: the xHCI event pump on its own ~4 ms cadence (see `usb_pump`). Co-located
+                // on the input core; timer-gated like the neighbours (its `sleep_ticks` nap needs the
+                // live timer IRQ). In QEMU raspi4b (not spawned) the input task's poll-nap still pumps.
+                unaos_kernel::arch::sched::spawn("usb-pump", usb_pump, 0, input_cpu);
             }
             unaos_kernel::arch::sched::spawn("input", input_service, 0, input_cpu);
             unaos_kernel::arch::sched::spawn("render", render_service, 0, render_cpu);
@@ -1925,6 +1929,11 @@ static RX_LOGGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBoo
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 static PIUSB24_LAST_LOG_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// PIUSB-26: ms() timestamp of the last `[piusb26]` pump idle-cost witness, to rate-limit it to once
+/// every ~5 s (the pump runs ~250×/s — no point mirroring every pass). 0 = never logged.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+static PIUSB26_LAST_LOG_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// GUI-CLICK-1: previous pointer-button bitmask, so the render task acts on PRESS edges only (a new
 /// bit going 0→1) and ignores the matching release. A raw HID button report carries the full set of
 /// currently-held buttons, so without edge detection a press+release would dispatch twice (or a held
@@ -2045,10 +2054,10 @@ fn input_service(_: usize) {
             if serial::rx_pending() {
                 serial::RX_READY.post();
             }
-            // PIUSB-23: also pump the xHCI controller and bridge decoded HID keys into GUI_CHANNEL, so
-            // USB keyboard input flows on the same wake cadence (the rx-backstop pokes this task ~5 Hz
-            // even absent a UART IRQ). No busy-spin — this rides the existing RX_READY.wait() blocking.
-            pump_usb_into_gui();
+            // PIUSB-26: the xHCI pump no longer rides this UART wake. PIUSB-23 pumped here, but the
+            // metal wake cadence is the RX ISR (keystrokes) or the ~5 Hz rx-backstop poke — so pointer
+            // reports batched to ~5 fps ("very very slow", P33). The dedicated `usb_pump` task now
+            // drains the controller at ~4 ms, leaving this keyboard/UART interrupt path untouched.
         }
     } else {
         // Poll-nap fallback (QEMU raspi4b: the RX ISR never fires). Cooperative — the AP's run() keeps
@@ -2262,6 +2271,33 @@ fn status_tick(_: usize) {
     loop {
         unaos_kernel::arch::sched::sleep_ticks(250); // ~1 s at the 250 Hz per-core tick
         GUI_CHANNEL.send(unaos_kernel::pal::Event::Timer);
+    }
+}
+
+/// PIUSB-26 (metal only): the xHCI event pump on its own cadence. PIUSB-23 wired `pump_usb_into_gui`
+/// into the input service's UART wake, so pointer/key events only drained on an RX interrupt or the
+/// ~5 Hz rx-backstop poke — batching a moving mouse to ~5 fps ("very very slow" on metal, P33). This
+/// dedicated task pumps at ~4 ms (`sleep_ticks(1)` at the 250 Hz per-core tick, matching interrupt-EP
+/// intervals of 8-10 ms), so ~60+ pointer reports/s reach the render task while the UART/keyboard
+/// interrupt path stays untouched. No busy-spin — it naps between passes. Gated on `timer::is_live()`
+/// at spawn like `rx_backstop`/`status_tick`; in QEMU raspi4b the input task's poll-nap fallback still
+/// pumps each cooperative pass. A rate-limited `[piusb26]` witness proves the idle-controller cost of a
+/// pass is micro (a `poll_events` on an empty event ring is cheap MMIO). Never returns.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn usb_pump(_: usize) {
+    use core::sync::atomic::Ordering;
+    loop {
+        unaos_kernel::arch::sched::sleep_ticks(1); // ~4 ms at the 250 Hz per-core tick
+        let t0 = unaos_kernel::arch::now_cycles();
+        pump_usb_into_gui();
+        let dt = unaos_kernel::arch::now_cycles().wrapping_sub(t0);
+        // Rate-limit the cost line to once every ~5 s (this loop runs ~250×/s).
+        let now = unaos_kernel::arch::ms();
+        let last = PIUSB26_LAST_LOG_MS.load(Ordering::Relaxed);
+        if now.wrapping_sub(last) >= 5000 || last == 0 {
+            PIUSB26_LAST_LOG_MS.store(now.max(1), Ordering::Relaxed);
+            serial_println!("[piusb26] pump pass {} cyc (~4 ms cadence, idle controller)", dt);
+        }
     }
 }
 
