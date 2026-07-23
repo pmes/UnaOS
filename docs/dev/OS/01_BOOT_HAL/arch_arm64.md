@@ -6753,6 +6753,22 @@ The **inbound window (SCB path) is the VideoCore firmware's DMA path to system S
 
 Refutation chain (facts of record): NOTIFY echo (P24, mailbox core alive) → BAR-MMIO load (P26, RC PCIe core alive) → stale pftf firmware (P27, recovered via Linux blob) → **PERST settle (P28, link-trained 115 ms post-deassert, NOTIFY still honoured, 8051 still dead)** → surviving: inbound SCB path (P29 test gate). The VC's firmware fetch from SDRAM rides the RC inbound window; the window gate is the last untested link in the cold-build → firmware-load chain.
 
+### PIUSB-19 — link Gen2 x1 trained on both sides at LNKCAP max (boot-P29)
+
+**The P28–P29 transition: SCB_ACCESS_EN refuted; CNR wall stands.** P29 landed PIUSB-18's fix (enable RC inbound master via `SCB_ACCESS_EN=1` in `MISC_CTRL`), and the VL805 firmware **booted for the FIRST TIME on UnaOS**. Metal confirms: `MISC_CTRL` readback `0x88003000` with `SCB_ACCESS_EN=1` active. The boot progressed past firmware init and into xHCI decoding — `USBSTS` reads `0x11` (halted-but-decoding), and the Max Ports field decodes correctly (5 ports from the VL805 device). However, the wall persists: port-1 walks to enable-slot, but the command never completes. The firmware loaded, the controller is parsing commands, yet command execution stalls.
+
+**Link training on both sides.** The xHCI controller began decoding and issued device notifications. A link trained to **Gen2 x1 on both sides at LNKCAP maximum** — the RC reports the capability, and the device negotiated the trained width. No link-geometry divergence; the speed/width are consistent and optimal.
+
+### PIUSB-20 — enable-slot command fetched (CRR=1) but no completion event posts (boot-P30)
+
+**The P29–P30 transition: CNR wall re-scoped.** P30 probes deeper into the command-execution stall with serial capture + xHCI register read-outs. The `USBCMD.HCRST` bit-write followed by the typical `USBSTS.CNR` poll reached completion only **after the HCRST driver issued the second reset** (watchdog ×3 before timing out). However, the real blocker re-emerges in the ring walk: after enable-slot is posted to the command ring, `CRR` (Command Ring Running, USBCMD bit 3) **readback is 1** — the hardware fetched the command — but the completion event **never posts to the event ring**. The `ERDP` (Event Ring Dequeue Pointer) stays unchanged and the interrupter status (`USBSTS[3] = EINT`) never fires. The command was fetched but its result never populated the ring.
+
+**Wall re-scoped to shared xhci interrupter/event path.** The enable-slot command executing (CRR=1 proves fetch) yet no completion-event emission refutes the ring architecture itself and points to a shared xhci block: event-ring buffer write-back, interrupter configuration (IMOD, ring base, size), or the completion-event generation logic tied to the interrupter. `RC_BAR2` 4 GiB @ address 0 is programmed and readback-verified; the CPU can read MMIO through it. **This is not a region-mapping defect.** The surviving candidate is the event ring's interrupt delivery or the command's write-back coherence (GPU cache or PCIe write-merge behavior on the inbound path).
+
+### PIUSB-21 — in flight in shared drivers/xhci (x86 MISSION gate mandatory)
+
+The interrupter/event path shares code with the x86 xHCI driver (`drivers/xhci/mod.rs`). Fixing the event-ring or interrupter setup in this shared block must pass **both** the x86 MISSION gate *and* the Pi 4 metal (P31 sitting) to unblock forward motion. The defect signature — command fetched, no completion-event delivery — indicates a coherency or write-ordering issue in shared xhci logic rather than Pi-side initialization. PIUSB-21 is deferred to a shared-driver fix arc with full x86 coverage.
+
 ## PI-USB-2 — from the honesty line to device enumeration on the VL805 (Arc PI-USB-2)
 
 Rung 1 stopped the VL805 xHCI at "halted-but-decoding + ports powered". Rung 2 adds the **DMA-side
