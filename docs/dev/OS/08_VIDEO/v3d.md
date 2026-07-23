@@ -753,3 +753,46 @@ bin GO. The P45 metal read confirms `w[24]` carries `sig=thrsw` and no word is `
 shader-word question on-silicon and re-aiming the next arc at the PTB retire path. All `[v3d44/45/46]`
 instrumentation is retained. QEMU raspi4b models no V3D block, so `[v3d47]` is dormant there — **P45 metal
 confirms the bytes; it does not itself retire the bin.**
+
+## 22. The empty-frame bisection — walk the wedge down to one packet class (V3D-48)
+
+The per-packet exoneration is now total: shader words (§21), `TILE_BINNING_MODE_CFG` (§20, 8/8 vs Mesa),
+the lone `FLUSH` terminator, the `CT0QMA→QMS→QTS|ENABLE→QBA→QEA` submit order, GMP, and the pre-armed
+overflow pool are each byte-perfect against Mesa/the kernel. Yet on metal the full draw's bin still never
+retires: `FLUSH` consumed (`CT0CA`=EA), the coord shader completes (bit16 QPU host-IRQ), the PTB emits its
+primitive-list bytes (BPCA advances), `BMACTIVE` stays set, `FLDONE` never fires, `BFC` Δ0. Every audit has
+been *per-packet*; none has tested the **frame-level handshake** itself in isolation.
+
+**The discriminating experiment.** `empty_frame_bisection` (`build_bin_cl_content` + `submit_bisect_rung`,
+`arch/aarch64/v3d.rs`) submits a ladder of increasingly-populated bin frames on CT0 — each with the SAME
+`QMA/QMS/QTS/BPOA` setup and the SAME `FLDONE` wait + `[v3d44/45/46]` witness suite as the real draw — so
+ONE metal boot localises the offending packet class:
+
+1. **`Empty`** — `NUMBER_OF_LAYERS` + `TILE_BINNING_MODE_CFG` + `FLUSH_VCD_CACHE` + `START_TILE_BINNING` +
+   `FLUSH`. Zero primitives, zero shader/viewport state. Per the kernel `v3d_bin_job_run` an empty bin frame
+   **must still retire** (`FLDONE` + `BFC++`).
+2. **`StateNoPrims`** — + full fixed-function state (`CFG_BITS`/`CLIP_WINDOW`/viewport/`VCM_CACHE_SIZE`) +
+   `GL_SHADER_STATE`, but NO `VERTEX_ARRAY_PRIMS`.
+3. **`PrimsNullShader`** — + `VERTEX_ARRAY_PRIMS` with a NULL coord shader: the exonerated 4-word Mesa
+   thread-end tail (`CS_VS_WORDS[23..27]`, `vpmwt → nop;thrsw → nop → nop`), which writes nothing to VPM.
+   Isolates the primitive-walk/dispatch handshake from the real coord shader's 6-word transform.
+
+The real M4 draw runs AFTER the ladder, unchanged — the ladder brackets the M4 bin from below. Witness:
+`[v3d48] <rung> — retired=<b> BFC Δ<n> PCS=<decode> …`, plus a per-rung packet decode and, on any timeout,
+the retained `[v3d44/45/46]` wedge dump.
+
+**The decision tree P45's `[v3d48]` witnesses resolve:**
+
+- **`Empty` RETIRES** → the frame handshake is sound; the wedge enters with a later rung. The first rung
+  that stops retiring names the class: `StateNoPrims` wedging ⇒ the fixed-function state; `PrimsNullShader`
+  wedging (with `StateNoPrims` clean) ⇒ the primitive-walk/dispatch handshake; both clean but the full M4
+  draw wedging ⇒ the real coord shader's VPM output / VCM→PTB handoff.
+- **`Empty` does NOT retire** → the frame handshake itself never worked, and every per-packet audit was
+  measuring the wrong layer. The next fix targets the frame-level enables nobody has audited *because* they
+  exonerated per-packet: `CT0QTS` ENABLE-bit semantics (P39 read `CT0QTS=0x001a1002`), `QMS` size encoding,
+  and whether v3d 4.x requires the CT1/RENDER frame config armed before the BIN frame can retire — decided
+  by the `[v3d44/45/46]` dump the `Empty` rung emits.
+
+Diagnostic-only: the ladder reuses the M4 bin-scratch regions (re-zeroed per rung and again by
+`triangle_job`), touches no real-draw CL, and never gates M4. QEMU raspi4b models no V3D block, so the whole
+ladder is dormant there — **P45 metal reads the tree.**

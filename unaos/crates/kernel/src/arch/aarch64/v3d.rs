@@ -339,6 +339,13 @@ const OFF_PROBE_BIN_OVERFLOW: usize = 0x36000; // probe overflow tile-list pool 
 const PROBE_BIN_OVERFLOW_BYTES: usize = 0x2000; // 8 KiB — ample overflow for the probe bin
 const _: () = assert!(OFF_PROBE_BIN_OVERFLOW + PROBE_BIN_OVERFLOW_BYTES <= ARENA_BYTES);
 
+// PI-V3D-48 empty-frame bisection scratch (arena tail, above the overflow pool). The ladder builds each
+// rung's CL into OFF_PROBE_BIN_CL (free after probe_job) and reuses the M4 tile-alloc / tile-state / BPO
+// regions; it needs only its own NULL coord-shader program + shader record for the PrimsNullShader rung.
+const OFF_BISECT_NULL_CODE: usize = 0x38000; // NULL coord shader: the 4-word Mesa thread-end tail
+const OFF_BISECT_NULL_SHADREC: usize = 0x38400; // shader record whose CS/VS/FS select the NULL program
+const _: () = assert!(OFF_BISECT_NULL_SHADREC + 36 + 16 <= ARENA_BYTES);
+
 // ─── The V3D buffer arena. One page-aligned static in BSS. Because the bare-metal kernel is
 // identity-mapped in low RAM (VA == PA), the address of this static IS its ARM physical address,
 // which is exactly what the V3D MMU page table and the control lists need. Sized generously and
@@ -2114,11 +2121,41 @@ fn build_bin_cl(num_attrs: u32) -> usize {
     build_bin_cl_generic(OFF_BIN_CL, OFF_SHADREC, num_attrs)
 }
 
+/// PI-V3D-48 — the empty-frame bisection. `build_bin_cl_content` emits the SAME bin CL as the real draw
+/// but truncated to a chosen "rung" so ONE metal boot can localise which packet class introduces the
+/// wedge (empty frame retires but the full draw does not). Each rung is a strict superset of the one
+/// below it, so the FLDONE verdict per rung walks the offending packet down to a single class.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BinContent {
+    /// Full draw: fixed-function state + GL_SHADER_STATE + VERTEX_ARRAY_PRIMS (the real M4 / probe bin).
+    Full,
+    /// Empty frame — the discriminating experiment. NUMBER_OF_LAYERS + TILE_BINNING_MODE_CFG +
+    /// FLUSH_VCD_CACHE + START_TILE_BINNING + FLUSH. Zero primitives, zero shader/viewport state. Per the
+    /// kernel `v3d_bin_job_run` an empty bin frame must still retire (FLDONE + BFC++). If THIS retires the
+    /// frame-level handshake is sound and the wedge enters with the state/prims below.
+    Empty,
+    /// Config + START + the full fixed-function state + GL_SHADER_STATE, but NO VERTEX_ARRAY_PRIMS: the
+    /// binner has a shader selected but is handed no primitives to walk.
+    StateNoPrims,
+    /// Full state + VERTEX_ARRAY_PRIMS, but GL_SHADER_STATE selects a NULL coord shader (the exonerated
+    /// 4-word Mesa thread-end tail, no VPM output). Isolates the primitive-walk/shader-dispatch handshake
+    /// from the specific 6-word transform the real coord shader emits.
+    PrimsNullShader,
+}
+
 /// Same bin CL as `build_bin_cl`, but with the control-list and shader-record offsets parameterised so
 /// a second (probe) draw can reuse the identical prologue/state/draw emit against its own record.
 /// PI-V3D-27 uses it to bin the Mesa-compiled TMU-store probe over the SAME vertex buffer + attribute
 /// record as the real draw.
 fn build_bin_cl_generic(cl_off: usize, shadrec_off: usize, num_attrs: u32) -> usize {
+    build_bin_cl_content(cl_off, shadrec_off, num_attrs, BinContent::Full)
+}
+
+/// PI-V3D-48 bisection body. `content` selects the rung (see `BinContent`). `Full` reproduces the exact
+/// legacy `build_bin_cl_generic` byte stream (the real draw); the reduced rungs drop packet classes from
+/// the top down. The prologue (NUMBER_OF_LAYERS, TILE_BINNING_MODE_CFG, FLUSH_VCD_CACHE, START_TILE_BINNING)
+/// and the terminating FLUSH are common to every rung — those are the frame-level handshake under test.
+fn build_bin_cl_content(cl_off: usize, shadrec_off: usize, num_attrs: u32, content: BinContent) -> usize {
     let shadrec = (arena_phys() + shadrec_off) as u32;
     let mut w = RclWriter::new(cl_off);
 
@@ -2145,8 +2182,18 @@ fn build_bin_cl_generic(cl_off: usize, shadrec_off: usize, num_attrs: u32) -> us
     // "Disable any leftover OQ state from another job." A stale-enabled OQ counter can gate the PTB's
     // primitive accounting, so we match Mesa's prologue verbatim (addr 0 = OQ disabled).
     w.pkt(Pkt::new(P_FLUSH_VCD_CACHE, 1).done());
-    w.pkt(Pkt::new(P_OCCLUSION_QUERY_COUNTER, 5).f(0, 32, 0).done());
+    // PI-V3D-48: the `Empty` rung is the minimal frame — config + START + FLUSH only (no OQ-disable, no
+    // state, no prims). Every richer rung keeps Mesa's OQ-disable in the prologue.
+    if content != BinContent::Empty {
+        w.pkt(Pkt::new(P_OCCLUSION_QUERY_COUNTER, 5).f(0, 32, 0).done());
+    }
     w.pkt(Pkt::new(P_START_TILE_BINNING, 1).done());
+    // PI-V3D-48: `Empty` stops here — START_TILE_BINNING then straight to the terminating FLUSH, no
+    // fixed-function state and no draw. An empty bin frame must still retire (kernel `v3d_bin_job_run`).
+    if content == BinContent::Empty {
+        w.pkt(Pkt::new(P_FLUSH, 1).done());
+        return w.len();
+    }
 
     // ── PI-V3D-17: clip/viewport/config state (V3D-16 verdict). Without these the hardware clipper
     // runs at power-on-reset zeros — zero viewport scale collapses every primitive to a point and the
@@ -2257,14 +2304,17 @@ fn build_bin_cl_generic(cl_off: usize, shadrec_off: usize, num_attrs: u32) -> us
             .done(),
     );
     // VERTEX_ARRAY_PRIMS: draw 3 vertices as a triangle list. mode@0(8)=TRIANGLES(4), length@8(32)=3,
-    // index of first vertex@40(32)=0.
-    w.pkt(
-        Pkt::new(P_VERTEX_ARRAY_PRIMS, 10)
-            .f(0, 8, V3D_PRIM_TRIANGLES)
-            .f(8, 32, 3) // Length (vertex count)
-            .f(40, 32, 0) // Index of First Vertex
-            .done(),
-    );
+    // index of first vertex@40(32)=0. PI-V3D-48: the `StateNoPrims` rung OMITS this — state + shader
+    // selected but no primitives to walk, so the binner runs no vertex shading and emits no list bytes.
+    if content != BinContent::StateNoPrims {
+        w.pkt(
+            Pkt::new(P_VERTEX_ARRAY_PRIMS, 10)
+                .f(0, 8, V3D_PRIM_TRIANGLES)
+                .f(8, 32, 3) // Length (vertex count)
+                .f(40, 32, 0) // Index of First Vertex
+                .done(),
+        );
+    }
     // FLUSH terminates the binning list (the binner-done marker CT0 walks to).
     w.pkt(Pkt::new(P_FLUSH, 1).done());
     w.len()
@@ -3036,6 +3086,176 @@ fn probe_job() {
     clear_mmu_fault_latch("v3d28 post-probe");
 }
 
+/// PI-V3D-48 — build the NULL coord-shader record at OFF_BISECT_NULL_SHADREC. Structurally identical to
+/// `build_shader_record` (same VPM segment sizes, clip enable, one attribute) but the CS/VS/FS code
+/// address fields all select OFF_BISECT_NULL_CODE — the exonerated 4-word Mesa thread-end tail (vpmwt →
+/// nop;thrsw → nop → nop), which writes NOTHING to VPM. Used by the `PrimsNullShader` rung: prims present,
+/// a real dispatching thread, but no coordinate output — isolating the primitive-walk/dispatch handshake
+/// from the specific 6-word transform of the real coord shader. Uniform streams reuse the M4 streams (the
+/// null program pops no uniforms, so the addresses are inert placeholders the record still must carry).
+fn build_bisect_null_shader_record() {
+    let nullc = (arena_phys() + OFF_BISECT_NULL_CODE) as u64;
+    let defaults = (arena_phys() + OFF_DEFAULT_ATTRS) as u64;
+    let vtx = (arena_phys() + OFF_VTXDATA) as u64;
+    let fs_unif = (arena_phys() + OFF_FS_UNIF) as u64;
+    let vs_unif = (arena_phys() + OFF_VS_UNIF) as u64;
+    let cs_unif = (arena_phys() + OFF_CS_UNIF) as u64;
+
+    let mut rec = [0u8; 36];
+    sf(&mut rec, 1, 1, 1); // Enable clipping
+    sf(&mut rec, 24, 8, 0); // Number of varyings in Fragment Shader
+    sf(&mut rec, 32, 4, 1); // Coord Shader output VPM segment size
+    sf(&mut rec, 40, 4, 0); // Coord Shader input VPM segment size
+    sf(&mut rec, 48, 4, 1); // Vertex Shader output VPM segment size
+    sf(&mut rec, 56, 4, 0); // Vertex Shader input VPM segment size
+    sf(&mut rec, 64, 32, defaults); // Address of default attribute values
+    sf(&mut rec, 96, 1, 1); // FS 4-way threadable
+    sf(&mut rec, 98, 1, 1); // FS propagate NaNs (v42)
+    sf(&mut rec, 99, 29, nullc >> 3); // FS code address → NULL program
+    sf(&mut rec, 128, 32, fs_unif); // FS uniforms address (inert)
+    sf(&mut rec, 160, 1, 1); // VS 4-way threadable
+    sf(&mut rec, 162, 1, 1); // VS propagate NaNs (v42)
+    sf(&mut rec, 163, 29, nullc >> 3); // VS code address → NULL program
+    sf(&mut rec, 192, 32, vs_unif); // VS uniforms address (inert)
+    sf(&mut rec, 224, 1, 1); // CS 4-way threadable
+    sf(&mut rec, 226, 1, 1); // CS propagate NaNs (v42)
+    sf(&mut rec, 227, 29, nullc >> 3); // CS code address → NULL program
+    sf(&mut rec, 256, 32, cs_unif); // CS uniforms address (inert)
+    arena_write_bytes(OFF_BISECT_NULL_SHADREC, &rec);
+
+    // One attribute record (vec4 position, f32) — same as the real record so VERTEX_ARRAY_PRIMS has an
+    // attribute array to reference (the null program never reads it).
+    let mut attr = [0u8; 16];
+    sf(&mut attr, 0, 32, vtx); // Address
+    sf(&mut attr, 32, 2, 3); // Vec size (4 components)
+    sf(&mut attr, 34, 3, 2); // Type = Attribute float
+    sf(&mut attr, 40, 4, 4); // Values read by Coordinate shader
+    sf(&mut attr, 44, 4, 4); // Values read by Vertex shader
+    sf(&mut attr, 64, 32, 16); // Stride (bytes per vertex)
+    sf(&mut attr, 96, 32, 0xFFFF); // Maximum Index
+    arena_write_bytes(OFF_BISECT_NULL_SHADREC + 36, &attr);
+}
+
+/// PI-V3D-48 — submit ONE bisection rung and witness its frame-level retire. Mirrors the probe/M4 bin
+/// kick byte-for-byte (same QMA/QMS/QTS setup, same pre-armed BPOA/BPOS overflow block, same INT clear,
+/// same FLDONE wait) but binds the CL to `content`'s truncated packet set. Emits the discriminating
+/// `[v3d48] <rung>` line — retired, BFC delta, and the full PCS decode — and, on timeout, the retained
+/// `[v3d44/45/46]` wedge suite fires from `wait_fldone`. Diagnostic-only; never gates M4.
+fn submit_bisect_rung(rung: &str, content: BinContent, shadrec_off: usize) {
+    let bin_len = build_bin_cl_content(OFF_PROBE_BIN_CL, shadrec_off, 1, content);
+
+    // Fresh, coherent bin scratch + overflow pool for this rung (reuses the M4 / probe regions).
+    fill_region(OFF_TILESTATE, TILE_STATE_BYTES, 0);
+    fill_region(OFF_BIN_TILEALLOC, BIN_TILEALLOC_BYTES, 0);
+    cache::clean_range(arena_phys() + OFF_TILESTATE, TILE_STATE_BYTES);
+    cache::clean_range(arena_phys() + OFF_BIN_TILEALLOC, BIN_TILEALLOC_BYTES);
+    for i in (0..PROBE_BIN_OVERFLOW_BYTES).step_by(4) {
+        arena_write_u32(OFF_PROBE_BIN_OVERFLOW + i, 0);
+    }
+    cache::clean_range(arena_phys() + OFF_PROBE_BIN_OVERFLOW, PROBE_BIN_OVERFLOW_BYTES);
+    cache::clean_range(arena_phys() + OFF_PROBE_BIN_CL, bin_len);
+
+    let bin_ba = (arena_phys() + OFF_PROBE_BIN_CL) as u32;
+    let bin_ea = bin_ba + bin_len as u32;
+    let tile_alloc = (arena_phys() + OFF_BIN_TILEALLOC) as u32;
+    let ts = (arena_phys() + OFF_TILESTATE) as u32;
+    if !arena_contains(bin_ba as usize, bin_len)
+        || !arena_contains(tile_alloc as usize, BIN_TILEALLOC_BYTES)
+        || !arena_contains(ts as usize, TILE_STATE_BYTES)
+    {
+        serial_println!(":: V3D: [v3d48] {} — range escapes the arena, skipping (fail-closed) ::", rung);
+        return;
+    }
+    // Decode the rung's CL packet-by-packet so the log shows exactly which packets this rung submitted.
+    decode_cl_packets("v3d48 bisect", OFF_PROBE_BIN_CL, bin_len);
+
+    clear_mmu_fault_latch("v3d48 bisect pre-kick");
+    invalidate_gpu_caches("L2T flush (v3d48 bisect pre-kick)");
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QMA, tile_alloc);
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QMS, BIN_TILEALLOC_BYTES as u32);
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QTS, ts | V3D_CLE_CT0QTS_ENABLE);
+    dsb();
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QBA, bin_ba);
+    dsb();
+    // Pre-arm the overflow pool exactly as the probe/M4 kick does, so an OUTOMEM stall cannot masquerade
+    // as a frame-handshake failure in this bisection.
+    let bpo_addr = (arena_phys() + OFF_PROBE_BIN_OVERFLOW) as u32;
+    mmio_write(V3D_CORE0_BASE, V3D_PTB_BPOA, bpo_addr);
+    mmio_write(V3D_CORE0_BASE, V3D_PTB_BPOS, PROBE_BIN_OVERFLOW_BYTES as u32);
+    mmio_write(V3D_CORE0_BASE, V3D_CTL_INT_CLR, mmio_read(V3D_CORE0_BASE, V3D_CTL_INT_STS));
+    dsb();
+    let bfc_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_BFC);
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QEA, bin_ea); // GO
+    dsb();
+    let idled = wait_bit_clear(V3D_CORE0_BASE, V3D_CLE_CT0CS, V3D_CLE_CT1CS_CTRUN, "CT0 v3d48 bisect");
+    let (sts, us, retired) = wait_fldone("v3d48 bisect");
+    let bfc_after = mmio_read(V3D_CORE0_BASE, V3D_CLE_BFC);
+    let pcs = mmio_read(V3D_CORE0_BASE, V3D_CLE_PCS);
+    // The empty-frame verdict is the discriminator the whole arc turns on; every richer rung's verdict is
+    // read relative to it (see the [v3d48] header for the decision tree).
+    let verdict = if retired {
+        match content {
+            BinContent::Empty => "empty frame RETIRED — the frame-level handshake WORKS; the wedge enters with the state/prims rungs below",
+            BinContent::StateNoPrims => "state-but-no-prims RETIRED — fixed-function state + GL_SHADER_STATE are innocent; watch the prims rung",
+            BinContent::PrimsNullShader => "prims-null-shader RETIRED — the primitive walk + dispatch handshake works with a no-output shader; the wedge is the real coord shader's VPM output / VCM→PTB handoff",
+            BinContent::Full => "full draw RETIRED",
+        }
+    } else if content == BinContent::Empty {
+        "empty frame did NOT retire — the frame handshake itself never worked; audit the frame-level enables (CT0QTS ENABLE-bit semantics, QMS size encoding, CT1/RENDER-config ordering) — see the [v3d44/45/46] wedge dump above"
+    } else {
+        "did NOT retire — this rung's added packet class is the offending one (the rung below it retired); localise there"
+    };
+    serial_println!(
+        ":: V3D: [v3d48] {} — retired={} BFC {:#010x}->{:#010x} (Δ{}) PCS={:#010x}(BMACTIVE={} BMBUSY={} RMACTIVE={} RMBUSY={} BMOOM={}) idled={} INT_STS={:#010x} waited={}us — {} ::",
+        rung, retired as u32, bfc_pre, bfc_after, bfc_after.wrapping_sub(bfc_pre),
+        pcs,
+        (pcs & V3D_PCS_BMACTIVE != 0) as u32,
+        (pcs & V3D_PCS_BMBUSY != 0) as u32,
+        (pcs & V3D_PCS_RMACTIVE != 0) as u32,
+        (pcs & V3D_PCS_RMBUSY != 0) as u32,
+        (pcs & V3D_PCS_BMOOM != 0) as u32,
+        idled as u32, sts, us, verdict
+    );
+    clear_mmu_fault_latch("v3d48 bisect post-kick");
+}
+
+/// PI-V3D-48 — the empty-frame bisection ladder. Runs a sequence of increasingly-populated bin frames on
+/// CT0, each with the SAME QMA/QMS/QTS/BPOA setup + FLDONE wait as the real draw, so ONE metal boot walks
+/// the offending packet class down to a single rung:
+///
+///   1. `Empty`           — config + START + FLUSH, zero state, zero prims. The discriminating experiment:
+///                          per the kernel `v3d_bin_job_run` this MUST retire (FLDONE + BFC++). If it does
+///                          not, the frame handshake itself is broken — the [v3d44/45/46] wedge dump names
+///                          which frame-level enable (and every per-packet audit was measuring the wrong
+///                          layer). If it DOES, the frame handshake is sound and the wedge is in the rungs.
+///   2. `StateNoPrims`    — + full fixed-function state + GL_SHADER_STATE, no VERTEX_ARRAY_PRIMS.
+///   3. `PrimsNullShader` — + VERTEX_ARRAY_PRIMS with a NULL (no-output) coord shader.
+///
+/// The real M4 draw (full state + prims + the real coord shader) runs AFTER, unchanged — so the ladder
+/// brackets the M4 bin from below. Diagnostic-only: reuses the M4 bin-scratch regions (re-zeroed here and
+/// again by triangle_job before the real kick), touches no real-draw CL, never gates M4. QEMU raspi4b
+/// models no V3D block, so the ladder is dormant there — P45 metal reads the decision tree.
+fn empty_frame_bisection() {
+    serial_println!(
+        ":: V3D: [v3d48] empty-frame bisection — walk the wedge down: Empty (config+START+FLUSH) → StateNoPrims → PrimsNullShader, each with the M4 QMA/QMS/QTS/BPOA setup + FLDONE wait. Empty MUST retire (kernel v3d_bin_job_run); if it does, the frame handshake is sound and the offending packet is the first rung that stops retiring ::"
+    );
+    // Publish the NULL coord shader (the exonerated 4-word Mesa thread-end tail — CS_VS_WORDS[23..27],
+    // vpmwt → nop;thrsw → nop → nop) + its record once.
+    const NULL_CS_WORDS: [u64; 4] = [
+        CS_VS_WORDS[23], CS_VS_WORDS[24], CS_VS_WORDS[25], CS_VS_WORDS[26],
+    ];
+    let null_len = write_shader_words(OFF_BISECT_NULL_CODE, &NULL_CS_WORDS);
+    build_bisect_null_shader_record();
+    cache::clean_range(arena_phys() + OFF_BISECT_NULL_CODE, null_len);
+    cache::clean_range(arena_phys() + OFF_BISECT_NULL_SHADREC, 36 + 16);
+    // OFF_SHADREC (the real M4 record) was already published + cleaned by probe_job; StateNoPrims reuses it.
+    cs_tail_witness("v3d48 NULL", OFF_BISECT_NULL_CODE, NULL_CS_WORDS.len());
+
+    submit_bisect_rung("empty-frame", BinContent::Empty, OFF_SHADREC);
+    submit_bisect_rung("state-no-prims", BinContent::StateNoPrims, OFF_SHADREC);
+    submit_bisect_rung("prims-null-shader", BinContent::PrimsNullShader, OFF_BISECT_NULL_SHADREC);
+}
+
 /// Read a little-endian u32 out of the arena at `off` (probe scratch readback).
 fn probe_word(off: usize) -> u32 {
     let arena = &raw const V3D_ARENA;
@@ -3075,6 +3295,14 @@ fn triangle_job(fb: Option<FbTarget>) -> bool {
     // (re-zeroed below), touches no real-draw CL, and never gates M4. QEMU models no V3D so the verdict
     // is metal; see v3d.md §12.
     probe_job();
+
+    // (0.6) PI-V3D-48: the empty-frame bisection ladder. With every per-packet suspect exonerated
+    // (shader words, TILE_BINNING_MODE_CFG, FLUSH terminator, submit order, GMP, overflow pool) yet the
+    // full draw's bin never retiring (FLDONE never fires, BMACTIVE stays set), submit a sequence of
+    // increasingly-populated bin frames — Empty → StateNoPrims → PrimsNullShader — each with the same
+    // frame-level setup + FLDONE wait, so ONE metal boot localises the offending packet class. The real
+    // M4 draw below runs unchanged and remains the regression witness. Diagnostic-only; QEMU has no V3D.
+    empty_frame_bisection();
 
     // (1) Build the shader record + attribute record, the binning CL, and the render CL.
     let num_attrs = build_shader_record();
