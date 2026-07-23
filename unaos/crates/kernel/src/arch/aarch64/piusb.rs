@@ -585,6 +585,12 @@ fn dump_firmware_state() {
 
     // (1) RC bridge + window registers, exactly as the firmware left them. These are the RC's OWN
     //     register block (the 0xFD50_0000 MMIO the CPU always claims) — safe to read link-down.
+    // PIUSB-31 pinpoint witness: metal P40 printed the PIUSB-5 header (above) then wedged silently
+    // with no further line and no MAILBOX-timeout — an UNBOUNDED CPU bus stall, not the (timeout-
+    // guarded) mailbox. The very first RC-register MMIO read is the prime suspect: safe in P38's
+    // pre-SMP pre-V3D single-threaded boot context, wedging in this deferred post-GUI context. This
+    // enter/exit pair makes P41 say precisely whether the wall is the first RC read.
+    serial_println!("{} piusb31: RC-reg-read enter (RGR1_SW_INIT_1 @ {:#x}) ::", P, RC_BASE + PCIE_RGR1_SW_INIT_1);
     let swinit = r(RC_BASE + PCIE_RGR1_SW_INIT_1);
     let status = r(RC_BASE + PCIE_MISC_PCIE_STATUS);
     let buses = r(RC_BASE + 0x18);
@@ -595,6 +601,7 @@ fn dump_firmware_state() {
     let win_lhi = r(RC_BASE + PCIE_MISC_CPU_2_PCIE_MEM_WIN0_LIMIT_HI);
     let bar2_lo = r(RC_BASE + PCIE_MISC_RC_BAR2_CONFIG_LO);
     let bar2_hi = r(RC_BASE + PCIE_MISC_RC_BAR2_CONFIG_HI);
+    serial_println!("{} piusb31: RC-reg-read exit (10 RC-own registers read OK) ::", P);
     let phylinkup = status & PCIE_MISC_PCIE_STATUS_PHYLINKUP != 0;
     let dl_active = status & PCIE_MISC_PCIE_STATUS_DL_ACTIVE != 0;
     serial_println!(
@@ -647,7 +654,13 @@ fn dump_firmware_state() {
     // (4) CAP read at the canonical outbound window (link-up only). Read-only record: whether the
     //     firmware-left decode answers is the diff evidence, but with adopt retired we never ride it.
     let cap_cpu_base = OUTBOUND_CPU_BASE;
+    // PIUSB-31 pinpoint witness: map_device_1gib documents pre-SMP single-threaded use only (its live
+    // page-table block install is break-before-make-hazardous once the APs are translating). This
+    // dump now runs post-SMP, so bracket the map + the first CAP read (a memory cycle into the
+    // outbound window) — the second-stage stall candidate if the RC-reg reads above pass.
+    serial_println!("{} piusb31: map_device_1gib enter (@ {:#x}, post-SMP) ::", P, cap_cpu_base);
     unsafe { super::boot::map_device_1gib(cap_cpu_base) };
+    serial_println!("{} piusb31: map_device_1gib exit; CAP-read enter ::", P);
     let mut cap0 = r(cap_cpu_base);
     let mut tries = 1u32;
     while (is_poison(cap0) || cap0 == 0) && tries < 4 {
