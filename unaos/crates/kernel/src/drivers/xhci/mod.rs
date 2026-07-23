@@ -557,6 +557,34 @@ unsafe fn read_reg64(reg: *const u64) -> u64 {
     (hi << 32) | lo
 }
 
+/// Write the Event Ring Dequeue Pointer (ERDP, IR0 +0x18) as a **high-dword-first**
+/// pair of 32-bit stores — the reverse of `write_reg64`.
+///
+/// XHCI-INT root cause (PIUSB-22, the "one report then silent" wall). ERDP is the ONE
+/// 64-bit xHCI register with a *latch side effect*: its low dword carries EHB (bit 3,
+/// Event Handler Busy, RW1C) and DESI plus the low pointer bits, and the controller
+/// re-evaluates its event-ring free space — and clears EHB — the instant the low dword
+/// is written. `write_reg64` writes low-then-high (PIUSB-21 order, correct for the
+/// write-once init regs CRCR/DCBAAP/ERSTBA where nothing latches mid-pair). Applied to
+/// ERDP under the genuine two-store split that PIUSB-21 forces on the brcmstb RC, that
+/// order latches a TORN pointer: the low write commits the new low bits + clears EHB
+/// while the high dword still holds the previous value, so the controller computes a
+/// dequeue pointer with a stale (often mirror-garbage, >4 GiB) high dword, decides the
+/// ring is full, and stops posting transfer events — the interrupt-IN HID pipe delivers
+/// exactly one report then goes silent. The polled drain papers over it briefly (it reads
+/// the cycle bit straight from DRAM regardless of EHB) until the controller's producer
+/// catches the stale ERDP and halts. Writing HIGH first, then LOW (EHB + latch) last
+/// guarantees the full 64-bit pointer is in place before the controller latches.
+///
+/// x86 is unaffected: no RC replication, both stores land, and Intel/AMD re-evaluate on
+/// the complete pointer either order — byte-visible identical, MISSION gate unchanged.
+#[inline(always)]
+unsafe fn write_erdp(reg: *mut u64, val: u64) {
+    let p = reg as *mut u32;
+    core::ptr::write_volatile(p.add(1), (val >> 32) as u32); // high dword first
+    core::ptr::write_volatile(p, val as u32);                // low dword (EHB + latch) last
+}
+
 /// Direction of a Bulk-Only Transport data stage.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Direction { In, Out, None }
@@ -1405,9 +1433,11 @@ impl XhciController {
             core::ptr::write_volatile((self.op_base + 0x04) as *mut u32, 1 << 3);
 
             let new_dequeue_ptr = EVENT_RING_PHYS_BASE + (dequeue_index as u64 * 16);
-            // Bit 3 (EHB) is write-1-to-clear.
-            write_reg64((ir0_base + 0x18) as *mut u64, new_dequeue_ptr | 8);
-            xdbg!("xHCI: ERDP Advanced to {:#x}", new_dequeue_ptr);
+            // Bit 3 (EHB) is write-1-to-clear. High-dword-first (write_erdp) so the
+            // controller never latches a torn pointer when PIUSB-21 forces a real 32-bit
+            // split on the brcmstb RC — see write_erdp (XHCI-INT).
+            write_erdp((ir0_base + 0x18) as *mut u64, new_dequeue_ptr | 8);
+            xdbg!("[xhciint] ERDP advanced to {:#x} (EHB cleared, hi-first)", new_dequeue_ptr);
         }
     }
 
@@ -2452,7 +2482,10 @@ impl XhciController {
             // Initialize to the start of the ring.
             // PRESERVE BIT 3 (EHB - Event Handler Busy)? No, clear it initially.
             let erdp_ptr = (ir0_base + 0x18) as *mut u64;
-            write_reg64(erdp_ptr, event_ring_phys); // Pointer to the RING, not the table
+            // High-dword-first (write_erdp): even at init, guarantee the controller latches a
+            // complete pointer under the PIUSB-21 32-bit split — never a stale/mirrored high.
+            write_erdp(erdp_ptr, event_ring_phys); // Pointer to the RING, not the table
+            serial_println!("[xhciint] ERDP initialized to {:#018x} (hi-first, EHB clear)", event_ring_phys);
 
             // 5b. IMOD (Interrupter Moderation, +0x04): 0 = no moderation, fire ASAP.
             // (QEMU ignores moderation timing, but set it explicitly for clarity / real HW.)

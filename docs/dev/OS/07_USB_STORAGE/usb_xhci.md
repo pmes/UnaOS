@@ -214,6 +214,35 @@ the x86 MISSION-SUCCESS storage gate is unchanged. The RS=1 witness now prints
 
 **P31b METAL RESULT (2026-07-23): the 64-bit-MMIO lo/hi fix CONFIRMED** — enable-slot completed, slots 2/3 addressed, HID boot-keyboard ARMED, first report received, mouse witness up: **FIRST USB INPUT DEVICE ENUMERATED ON PI SILICON.** Residual: interrupt-IN pipe delivers one report then goes silent (no xHCI: KEY lines under typing) — **PIUSB-22 in flight** (re-queue / ERDP EHB write-order under the new lo/hi split / SET_IDLE fork).
 
+### 2c. ERDP write-order under the 32-bit split (XHCI-INT)
+
+The ERDP (Event Ring Dequeue Pointer, IR0 +0x18) is the one 64-bit xHCI register
+with a **latch side effect**: its low dword carries EHB (bit 3, Event Handler Busy,
+RW1C) and DESI alongside the low pointer bits, and the controller re-evaluates its
+event-ring free space — and clears EHB — the instant the low dword is written. The
+PIUSB-21 helper `write_reg64` writes **low-then-high**, which is correct for the
+write-once init registers (CRCR/DCBAAP/ERSTBA: nothing latches mid-pair, RS=1 latches
+them once). Applied to ERDP under the genuine two-store split that PIUSB-21 forces on
+the brcmstb RC, that order latches a **torn** pointer — the low write commits the new
+low bits and clears EHB while the high dword still holds its previous (often
+mirror-garbage, >4 GiB) value. The controller then computes a dequeue pointer with a
+stale high dword, decides the event ring is full, and stops posting transfer events:
+the interrupt-IN HID pipe delivers **exactly one report, then goes silent** (the P31b
+residual). The polled drain papers over it briefly — `has_event` reads the cycle bit
+straight from DRAM regardless of EHB — until the controller's producer catches the
+stale ERDP and halts.
+
+Fix (`write_erdp`, mod.rs): write the **high dword first, then the low dword** (EHB +
+latch) last, so the full 64-bit pointer is in place before the controller latches.
+Used at both ERDP sites — `init_interrupter` (initial dequeue = ring base) and
+`advance_erdp` (per-event advance with EHB clear). x86 is byte-visible identical (no
+RC replication; both stores land, Intel/AMD re-evaluate on the complete pointer either
+order) — the MISSION-SUCCESS storage gate is unchanged. Witness `[xhciint] ERDP
+initialized to <phys> (hi-first, EHB clear)` at bring-up on both arches; per-event
+advances log `[xhciint] ERDP advanced to <phys>` under the xdbg gate. QEMU raspi4b
+models no PCIe RC/VL805, so the Pi witness is metal-only; the aarch64 `virt` MISSION
+gate exercises the path and carries the witness.
+
 ---
 
 ## 3. Interrupt model (MSI → local APIC)
