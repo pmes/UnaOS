@@ -276,6 +276,9 @@ fn bootdiag_dtb() {
 
 #[entry]
 fn main() -> Status {
+    #[cfg(feature = "unaos_ivb")]
+    let (t0, g0) = unsafe { (read_igpu_trace(), read_gmux_trace()) };
+
     uefi::helpers::init().unwrap();
     log::info!("UnaOS UEFI Bootloader Started");
 
@@ -729,9 +732,13 @@ fn main() -> Status {
         edid_source,
         mode_action,
         #[cfg(feature = "unaos_ivb")]
-        igpu_trace_1: [0; 8],
+        igpu_trace_0: t0,
         #[cfg(feature = "unaos_ivb")]
-        igpu_trace_2: [0; 8],
+        gmux_trace_0: g0,
+        #[cfg(feature = "unaos_ivb")]
+        igpu_trace_1: [0; 11],
+        #[cfg(feature = "unaos_ivb")]
+        igpu_trace_2: [0; 11],
         #[cfg(feature = "unaos_ivb")]
         igpu_trace_valid: false,
     });
@@ -1089,17 +1096,17 @@ fn acpi_checksum(bytes: &[u8]) -> u8 {
 }
 
 #[cfg(feature = "unaos_ivb")]
-unsafe fn read_igpu_trace() -> [u32; 8] {
+unsafe fn read_igpu_trace() -> [u32; 11] {
     #[cfg(target_arch = "x86_64")]
-    {
+    unsafe {
         use core::arch::asm;
         
-        let mut outl = |port: u16, val: u32| {
-            asm!("out dx, eax", in("dx") port, in("eax") val, options(nomem, nostack, preserves_flags));
+        let outl = |port: u16, val: u32| {
+            unsafe { asm!("out dx, eax", in("dx") port, in("eax") val, options(nomem, nostack, preserves_flags)); }
         };
-        let mut inl = |port: u16| -> u32 {
+        let inl = |port: u16| -> u32 {
             let mut val: u32;
-            asm!("in eax, dx", out("eax") val, in("dx") port, options(nomem, nostack, preserves_flags));
+            unsafe { asm!("in eax, dx", out("eax") val, in("dx") port, options(nomem, nostack, preserves_flags)); }
             val
         };
         
@@ -1110,11 +1117,11 @@ unsafe fn read_igpu_trace() -> [u32; 8] {
         if bar0 == 0 || bar0 == 0xFFFFFFF0 {
             // Sentinel, NOT zeros: an all-zero trace is also a legitimate all-dark reading,
             // so a failed BAR0 read must be unmistakable in the serial table.
-            return [0xBAD0BA20; 8];
+            return [0xBAD0BA20; 11];
         }
         
         let read_mmio = |offset: u32| -> u32 {
-            core::ptr::read_volatile((bar0 as usize + offset as usize) as *const u32)
+            unsafe { core::ptr::read_volatile((bar0 as usize + offset as usize) as *const u32) }
         };
         
         [
@@ -1126,10 +1133,62 @@ unsafe fn read_igpu_trace() -> [u32; 8] {
             read_mmio(0x72180), // DSPCCNTR
             read_mmio(0x7019C), // DSPASURF
             read_mmio(0x64000), // DP_A
+            read_mmio(0x61200), // PP_STATUS
+            read_mmio(0x61204), // PP_CONTROL
+            read_mmio(0x06014), // DPLL_A_CTRL
         ]
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
-        [0; 8]
+        [0; 11]
+    }
+}
+
+#[cfg(feature = "unaos_ivb")]
+unsafe fn read_gmux_trace() -> [u32; 4] {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use core::arch::asm;
+        
+        let outb = |port: u16, val: u8| {
+            unsafe { asm!("out dx, al", in("dx") port, in("al") val, options(nomem, nostack, preserves_flags)); }
+        };
+        let inb = |port: u16| -> u8 {
+            let mut val: u8;
+            unsafe { asm!("in al, dx", out("al") val, in("dx") port, options(nomem, nostack, preserves_flags)); }
+            val
+        };
+
+        // Indexed read: index -> 0x7D0, value <- 0x7C2
+        let index_read = |reg: u8| -> u32 {
+            outb(0x7D0, reg);
+            let val = inb(0x7C2);
+            if val == 0 || val == 0xFF {
+                0xBAD0BA20
+            } else {
+                val as u32
+            }
+        };
+
+        // Classic read: value <- 0x700 + reg
+        let pio_read = |port: u16| -> u32 {
+            let val = inb(port);
+            if val == 0 || val == 0xFF {
+                0xBAD0BA20
+            } else {
+                val as u32
+            }
+        };
+
+        [
+            index_read(0x10), // Indexed SWITCH_DISPLAY
+            index_read(0x50), // Indexed DISCRETE_POWER
+            pio_read(0x710),  // Classic SWITCH_DISPLAY
+            pio_read(0x750),  // Classic DISCRETE_POWER
+        ]
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        [0; 4]
     }
 }

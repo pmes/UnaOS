@@ -101,9 +101,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     #[cfg(all(feature = "tegra", target_arch = "aarch64"))]
     tegra_early_stop(boot_info);
 
-    #[cfg(all(feature = "unaos_ivb", feature = "intel-ivb", target_arch = "x86_64"))]
+    #[cfg(feature = "unaos_ivb")]
     if boot_info.igpu_trace_valid {
-        unaos_kernel::drivers::gpu::igpu::set_boot_traces(boot_info.igpu_trace_1, boot_info.igpu_trace_2);
+        unaos_kernel::drivers::gpu::igpu::set_boot_traces(
+            boot_info.igpu_trace_0,
+            boot_info.igpu_trace_1, 
+            boot_info.igpu_trace_2,
+            boot_info.gmux_trace_0
+        );
     }
 
     // 1. Core Hardware Init (GDT, IDT, local APIC for x86_64, GIC for aarch64)

@@ -37,6 +37,10 @@ pub mod regs {
     // DP_A (eDP Port)
     pub const DP_A: usize = 0x64000;
 
+    pub const PP_STATUS: usize = 0x61200;
+    pub const PP_CONTROL: usize = 0x61204;
+    pub const DPLL_A_CTRL: usize = 0x06014;
+
     // GTT Window (starts at 2MB offset in BAR0)
     pub const GTT_BASE: usize = 0x200000;
 }
@@ -44,17 +48,54 @@ pub mod regs {
 use core::sync::atomic::{AtomicBool, Ordering};
 
 static PROBED: AtomicBool = AtomicBool::new(false);
-static mut TRACE_1: [u32; 8] = [0; 8];
-static mut TRACE_2: [u32; 8] = [0; 8];
+static mut TRACE_0: [u32; 11] = [0; 11];
+static mut TRACE_1: [u32; 11] = [0; 11];
+static mut TRACE_2: [u32; 11] = [0; 11];
+static mut GMUX_0: [u32; 4] = [0; 4];
 static mut TRACES_VALID: bool = false;
 
-pub fn set_boot_traces(t1: [u32; 8], t2: [u32; 8]) {
+pub fn set_boot_traces(t0: [u32; 11], t1: [u32; 11], t2: [u32; 11], g0: [u32; 4]) {
     unsafe {
+        TRACE_0 = t0;
         TRACE_1 = t1;
         TRACE_2 = t2;
+        GMUX_0 = g0;
         TRACES_VALID = true;
     }
 }
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn read_gmux_trace() -> [u32; 4] {
+    use core::arch::asm;
+    let outb = |port: u16, val: u8| {
+        unsafe { asm!("out dx, al", in("dx") port, in("al") val, options(nomem, nostack, preserves_flags)); }
+    };
+    let inb = |port: u16| -> u8 {
+        let mut val: u8;
+        unsafe { asm!("in al, dx", out("al") val, in("dx") port, options(nomem, nostack, preserves_flags)); }
+        val
+    };
+
+    let index_read = |reg: u8| -> u32 {
+        outb(0x7D0, reg);
+        let val = inb(0x7C2);
+        if val == 0 || val == 0xFF { 0xBAD0BA20 } else { val as u32 }
+    };
+    let pio_read = |port: u16| -> u32 {
+        let val = inb(port);
+        if val == 0 || val == 0xFF { 0xBAD0BA20 } else { val as u32 }
+    };
+
+    [
+        index_read(0x10), // Indexed SWITCH_DISPLAY
+        index_read(0x50), // Indexed DISCRETE_POWER
+        pio_read(0x710),  // Classic SWITCH_DISPLAY
+        pio_read(0x750),  // Classic DISCRETE_POWER
+    ]
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn read_gmux_trace() -> [u32; 4] { [0; 4] }
 
 pub fn init(gpu: &GpuInfo) {
     if PROBED.swap(true, Ordering::SeqCst) {
@@ -85,8 +126,9 @@ pub fn init(gpu: &GpuInfo) {
 
     unsafe {
         if TRACES_VALID {
+            let gmux3 = read_gmux_trace();
             serial_println!(":: igpu: TEARDOWN HUNT TRACE ::");
-            serial_println!(":: igpu: Reg          | Point 1 (Pre-EBS) | Point 2 (Post-EBS)| Point 3 (Kernel) ::");
+            serial_println!(":: igpu: Reg          | Point 0 (Boot)    | Point 1 (Pre-EBS) | Point 2 (Post-EBS)| Point 3 (Kernel) ::");
             let trace3 = [
                 mmio_read(bar0, regs::PIPEACONF),
                 mmio_read(bar0, regs::PIPEBCONF),
@@ -96,11 +138,20 @@ pub fn init(gpu: &GpuInfo) {
                 mmio_read(bar0, regs::DSPCCNTR),
                 mmio_read(bar0, regs::DSPASURF),
                 mmio_read(bar0, regs::DP_A),
+                mmio_read(bar0, regs::PP_STATUS),
+                mmio_read(bar0, regs::PP_CONTROL),
+                mmio_read(bar0, regs::DPLL_A_CTRL),
             ];
-            let names = ["PIPEACONF", "PIPEBCONF", "PIPECCONF", "DSPACNTR", "DSPBCNTR", "DSPCCNTR", "DSPASURF", "DP_A"];
-            for i in 0..8 {
-                serial_println!(":: igpu: {:<12} | 0x{:08X}        | 0x{:08X}        | 0x{:08X} ::",
-                    names[i], TRACE_1[i], TRACE_2[i], trace3[i]);
+            let names = ["PIPEACONF", "PIPEBCONF", "PIPECCONF", "DSPACNTR", "DSPBCNTR", "DSPCCNTR", "DSPASURF", "DP_A", "PP_STATUS", "PP_CTRL", "DPLL_A"];
+            for i in 0..11 {
+                serial_println!(":: igpu: {:<12} | 0x{:08X}        | 0x{:08X}        | 0x{:08X}        | 0x{:08X} ::", 
+                    names[i], TRACE_0[i], TRACE_1[i], TRACE_2[i], trace3[i]);
+            }
+            serial_println!(":: igpu: GMUX TRACE ::");
+            let gnames = ["idx_SWITCH", "idx_POWER", "pio_SWITCH", "pio_POWER"];
+            for i in 0..4 {
+                serial_println!(":: igpu: {:<12} | 0x{:08X}        |                   |                   | 0x{:08X} ::", 
+                    gnames[i], GMUX_0[i], gmux3[i]);
             }
             serial_println!(":: igpu: TRACE END ::");
         }
