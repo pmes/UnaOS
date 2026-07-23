@@ -959,20 +959,18 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // orphaned when a program EXITS holding the last cross-process open of an unlinked file (teardown
             // is the last close, but block I/O is illegal there, so `clear_files_row` queues the chain head and
             // the reaper frees it in this block-I/O-legal context). Spawned at BOOT — never lazily from the
-            // teardown push (which cannot allocate a `Box<Task>` or take `RUN_QUEUES`). Co-located with the
-            // demo VERDICT core (`online.get(1)`), so the U11-reap launcher's bounded `yield_now` poll cedes it
-            // the CPU to drain deterministically under QEMU's cooperative scheduler; falls back to the input
-            // core if only one AP came up (still off the demo core). Additive + aarch64-baremetal-scoped.
-            let reaper_cpu = online.get(1).copied().unwrap_or(input_cpu);
-            unaos_kernel::arch::sched::spawn(
+            // teardown push (which cannot allocate a `Box<Task>` or take `RUN_QUEUES`). SCHED-3b: now adopts
+            // load-balanced placement (spawn_auto) instead of pinned core. The old deterministic placement
+            // onto `online.get(1)` (or `input_cpu` fallback) caused c2=100% while c1=0%; load-balanced spreads
+            // it across least-loaded cores. Additive + aarch64-baremetal-scoped.
+            unaos_kernel::arch::sched::spawn_auto(
                 "orphan-reaper",
                 unaos_kernel::arch::syscall::orphan_reaper,
                 0,
-                reaper_cpu,
             );
             serial_println!(
-                ":: INPUT on core {} + RENDER on core {} + orphan-reaper on core {} scheduled (OS on its own scheduler; BSP idle) ::",
-                input_cpu, render_cpu, reaper_cpu
+                ":: INPUT on core {} + RENDER on core {} + orphan-reaper load-balanced scheduled (OS on its own scheduler; BSP idle) ::",
+                input_cpu, render_cpu
             );
             unaos_kernel::arch::hlt_loop();
         }

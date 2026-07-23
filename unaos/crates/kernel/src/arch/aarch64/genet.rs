@@ -3087,31 +3087,22 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
         // Host the task on a secondary core (never the BSP), like input/render/orphan-reaper. If no AP
         // came up, the service cannot be scheduled — report the degraded state rather than wedge the BSP.
         let online = crate::arch::smp::online_secondaries();
-        // PI-SCHED-1 — net9 is a 4 ms BACKGROUND poll service. The original `online.first()` placement
-        // pinned it to the RENDER core (render is `online.first()`; frame-pacing critical — the skew
-        // net9's own author flagged). At net-arm time every secondary carries the same boot-capstone
-        // load, so there is no live "least-loaded" signal to read yet (`sched::core_load_report()`
-        // exposes the live counts for on-demand checks); instead pin net9 deterministically OFF the
-        // render core, onto the background/orphan-reaper secondary (`online.get(1)` — the most-idle
-        // standing service: the reaper sleeps between orphan teardowns), falling back to the input core
-        // (`last`) and finally the render core only as APs thin out (single-AP boots coincide, exactly
-        // as documented for the input/render split). INPUT/RENDER/reaper placements are untouched
-        // (metal-proven); this only moves net9 off the render core's critical path.
-        let net_cpu = online.get(1).or(online.last()).or(online.first());
-        match net_cpu {
-            Some(&cpu) => {
-                crate::arch::sched::spawn("net9", net_service_poll, 0, cpu);
-                serial_println!(
-                    "{} net service task registered (poll every {} ms, core {} — off render core) ::",
-                    PG, NET9_POLL_MS, cpu
-                );
-            }
-            None => {
-                serial_println!(
-                    "{} net service NOT registered — no secondary core online (interface will not be polled) ::",
-                    PG
-                );
-            }
+        // SCHED-3b — net9 now adopts load-balanced placement (spawn_auto) instead of pinned core.
+        // The old deterministic placement onto `online.get(1).or(online.last()).or(online.first())`
+        // caused c2=100% while c1=0%; load-balanced spreads it across least-loaded cores.
+        // INPUT/RENDER/reaper placements remain untouched (metal-proven). Register net9 if at least
+        // one AP is online; no-secondary case is unchanged (still cannot schedule net9 at all).
+        if !online.is_empty() {
+            crate::arch::sched::spawn_auto("net9", net_service_poll, 0);
+            serial_println!(
+                "{} net service task registered (poll every {} ms, load-balanced across secondaries) ::",
+                PG, NET9_POLL_MS
+            );
+        } else {
+            serial_println!(
+                "{} net service NOT registered — no secondary core online (interface will not be polled) ::",
+                PG
+            );
         }
     }
 
