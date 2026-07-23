@@ -1949,6 +1949,14 @@ static PIUSB24_LAST_LOG_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 static PIUSB26_LAST_LOG_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// PIUSB-28: latched once the first Pi pump pass has armed the FAT mount trigger, so the
+/// `:: piusb28: mount-trigger armed (pi pump path) ::` witness prints exactly once per boot. This
+/// makes the wiring itself visible on serial — proving the mount edge is now polled from a path that
+/// actually runs on Pi baremetal+fb (`usb_pump`/`input_service` poll-fallback), unlike the dead
+/// main/GUI loop where PIUSB-27's original call sites live.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+static PIUSB28_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// GUI-CLICK-1: previous pointer-button bitmask, so the render task acts on PRESS edges only (a new
 /// bit going 0→1) and ignores the matching release. A raw HID button report carries the full set of
 /// currently-held buttons, so without edge detection a press+release would dispatch twice (or a held
@@ -2013,6 +2021,23 @@ fn pump_usb_into_gui() {
             _ => {}
         }
     }
+    // PIUSB-28: fire the FAT mount from the path that ACTUALLY runs on Pi baremetal+fb. PIUSB-27
+    // wired `piusb27_service()` beside `probe_once` in the main/GUI loop — but that loop never runs
+    // on Pi metal (kernel_main spawns services and hlt_loops; the PIUSB-22 structural finding, which
+    // is why `usb_pump` exists), so the mount never fired on hardware (zero `piusb27` lines, P35).
+    // This pump path runs on metal (the `usb_pump` ~4 ms task) and in QEMU raspi4b (the input
+    // service's poll-nap fallback), so the storage-ready edge is finally polled where it matters.
+    //
+    // DEADLOCK: the mount re-locks XHCI_CONTROLLER via `read_block_usb`, so it MUST run outside any
+    // scope holding that lock. The controller guard above is dropped at the end of its `if let`
+    // scope (before the event-drain loop), so we are lock-free here — same discipline as the main
+    // loop, where this call sits after `probe_once` with the guard released. The edge is one-shot
+    // per raise (`take_usb_ready`), so calling it every ~4 ms pass is a cheap no-op until a stick's
+    // bring-up raises it, then it mounts + witnesses once (and again on every hot-plug re-enum).
+    if !PIUSB28_ARMED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        serial_println!(":: piusb28: mount-trigger armed (pi pump path) ::");
+    }
+    unaos_kernel::fs::fat::piusb27_service();
 }
 
 /// PIUSB-24: rate-limited (~4 Hz) `[piusb24]` serial witness of a pointer report reaching the GUI
