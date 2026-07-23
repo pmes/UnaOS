@@ -303,7 +303,18 @@ const V3D_INT_FRDONE: u32 = 1 << 0; // render frame done
 const V3D_INT_FLDONE: u32 = 1 << 1; // binning flush done — the true bin-retire signal
 const V3D_INT_OUTOMEM: u32 = 1 << 2; // binner ran out of tile-alloc memory (needs an overflow block)
 const V3D_INT_SPILLUSE: u32 = 1 << 3; // QPU spill-memory used
+const V3D_INT_TRFB: u32 = 1 << 4; // transform-feedback-block done (v3d_regs.h V3D_INT_TRFB)
 const V3D_INT_GMPV: u32 = 1 << 5; // GMP (memory-protection) violation
+// PI-V3D-45: the top half-word of INT_STS is the per-QPU host-interrupt vector. Transcribed VERBATIM
+// from Linux `drivers/gpu/drm/v3d/v3d_regs.h` (register/hardware facts; GPL-2.0-only header, facts-only):
+//   # define V3D_INT_QPU_MASK   0xffff0000
+//   # define V3D_INT_QPU_SHIFT  16
+// Each bit [16+n] latches when QPU n raises a HOST interrupt — the QPU thread executed an instruction
+// carrying the `sig: thrsw + interrupt` (thread-end-with-host-int) signal (Mesa qpu_instr.h V3D_QPU_SIG,
+// the QPU's `sig.int` / program-end-interrupt path). So INT_STS=0x0001_0000 (bit16, n=0) = "QPU 0 raised
+// a program-end host interrupt" — the QPU RAN and signalled completion, independent of the PTB's FLDONE.
+const V3D_INT_QPU_MASK: u32 = 0xffff_0000; // [31:16] per-QPU host-interrupt vector
+const V3D_INT_QPU_SHIFT: u32 = 16; // bit (16+n) = QPU n raised a host interrupt
 
 // PI-V3D-44 overflow (BPO) pool — the tail of the arena (0x36000, above the probe bin CL at
 // 0x35000+0x1000). The V3D binner requests overflow tile-list memory via the OUTOMEM interrupt;
@@ -1362,22 +1373,71 @@ fn wait_fldone(what: &str) -> (u32, u64, bool) {
         }
         if super::timer::cntpct() >= deadline {
             let waited_us = (super::timer::cntpct().wrapping_sub(start)).saturating_mul(1_000_000) / frq.max(1);
+            let qpu_vec = (sts & V3D_INT_QPU_MASK) >> V3D_INT_QPU_SHIFT; // which QPU(s) raised a host int
             serial_println!(
-                ":: V3D: [v3d44] FLDONE timeout ({}) — INT_STS={:#010x} (FRDONE={} FLDONE={} OUTOMEM={} SPILLUSE={} GMPV={}) — {} ::",
+                ":: V3D: [v3d44] FLDONE timeout ({}) — INT_STS={:#010x} (FRDONE={} FLDONE={} OUTOMEM={} SPILLUSE={} TRFB={} GMPV={} QPU_vec={:#06x}) — {} ::",
                 what, sts,
                 (sts & V3D_INT_FRDONE != 0) as u32,
                 (sts & V3D_INT_FLDONE != 0) as u32,
                 (sts & V3D_INT_OUTOMEM != 0) as u32,
                 (sts & V3D_INT_SPILLUSE != 0) as u32,
+                (sts & V3D_INT_TRFB != 0) as u32,
                 (sts & V3D_INT_GMPV != 0) as u32,
+                qpu_vec,
                 if sts & V3D_INT_OUTOMEM != 0 {
                     "OUTOMEM fired: the binner stalled waiting for overflow tile-alloc memory — the pre-armed BPOA/BPOS block was too small or not honoured"
                 } else if sts & V3D_INT_GMPV != 0 {
                     "GMPV fired: a GMP memory-protection violation blocked the flush"
+                } else if sts & V3D_INT_QPU_MASK != 0 {
+                    "QPU host-interrupt latched but NO FLDONE: the coord shader ran to a program-end-interrupt yet the PTB never flushed — the QPU signalled completion while the bin pipeline stayed open (see [v3d45] CLE/PTB dump for the wedge)"
                 } else if sts == 0 {
                     "no interrupt latched at all: the flush never even began to retire (chase START_TILE_BINNING / PTB bring-up)"
                 } else {
                     "an interrupt other than FLDONE latched — see the raw bits above"
+                }
+            );
+            // [v3d45] — corner the binner: dump the CLE + PTB state machine at the timeout so ONE more boot
+            // names the wedge. Every offset below is already fact-verified in this file (v3d_regs.h lifts,
+            // PI-V3D-7/8/9/13/41). CT{0,1}CS carry the CTRUN busy bit (bit5); CT{0,1}CA are the addresses the
+            // CLE halted at; PCS is the raw pipeline control/status (bin/render busy+empty); CT0LC/CT0PC are
+            // the list/primitive counters the CLE fed; BPCA/BPCS the PTB write pointer + size. A binner that
+            // emitted bytes (BPCA off pool base) but left CTRUN set / PCS busy while the QPU already raised its
+            // program-end interrupt is a wedged-QPU-holding-the-bin-open signature — exactly the null hypothesis.
+            let ct0cs = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CS);
+            let ct1cs = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT1CS);
+            let ct0ca = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CA);
+            let ct1ca = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT1CA);
+            let pcs = mmio_read(V3D_CORE0_BASE, V3D_CLE_PCS);
+            let ct0lc = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0LC);
+            let ct0pc = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0PC);
+            let bpca = mmio_read(V3D_CORE0_BASE, V3D_PTB_BPCA);
+            let bpcs = mmio_read(V3D_CORE0_BASE, V3D_PTB_BPCS);
+            serial_println!(
+                ":: V3D: [v3d45] wedge dump — CT0CS={:#010x}(CTRUN={}) CT0CA={:#010x} | CT1CS={:#010x}(CTRUN={}) CT1CA={:#010x} | PCS={:#010x}(raw) CT0LC={:#010x} CT0PC={:#010x} | BPCA={:#010x} BPCS={:#010x} — {} ::",
+                ct0cs, (ct0cs & V3D_CLE_CTNCS_CTRUN != 0) as u32, ct0ca,
+                ct1cs, (ct1cs & V3D_CLE_CT1CS_CTRUN != 0) as u32, ct1ca,
+                pcs, ct0lc, ct0pc, bpca, bpcs,
+                if ct0cs & V3D_CLE_CTNCS_CTRUN != 0 {
+                    "CT0 CTRUN still set: the BIN CLE never idled — the PTB is holding the bin list open (wedged QPU / unflushed primitive list)"
+                } else {
+                    "CT0 CTRUN clear: the BIN CLE idled but FLDONE never latched — flush stalled DOWNSTREAM of the CLE (PTB drain / tile-state writeback)"
+                }
+            );
+            // Also surface the GMP block state — a silent GMP write-drop leaves STATUS.VIO set with no MMU fault
+            // (see the V3D_GMP_* facts block); reading it here rules that class in or out in the same boot.
+            let gmp_status = mmio_read(V3D_CORE0_BASE, V3D_GMP_STATUS);
+            let gmp_cfg = mmio_read(V3D_CORE0_BASE, V3D_GMP_CFG);
+            serial_println!(
+                ":: V3D: [v3d45] GMP witness — STATUS={:#010x}(VIO={} INVPROT={} GMPRST={}) CFG={:#010x}(PROT_ENABLE={}) — {} ::",
+                gmp_status,
+                (gmp_status & V3D_GMP_STATUS_VIO != 0) as u32,
+                (gmp_status & V3D_GMP_STATUS_INVPROT != 0) as u32,
+                (gmp_status & V3D_GMP_STATUS_GMPRST != 0) as u32,
+                gmp_cfg, (gmp_cfg & V3D_GMP_CFG_PROT_ENABLE != 0) as u32,
+                if gmp_status & V3D_GMP_STATUS_VIO != 0 {
+                    "GMP VIO latched: a memory-protection violation silently dropped an access — a candidate for the missing flush"
+                } else {
+                    "GMP clean: no protection violation latched — the wedge is not a GMP drop"
                 }
             );
             return (sts, waited_us, false);
@@ -2763,6 +2823,8 @@ fn probe_job() {
             "the bin flush RETIRED — the P40 read-too-early wall is closed; the pool read below is post-retire truth"
         } else if fldone_sts & V3D_INT_OUTOMEM != 0 {
             "OUTOMEM despite the pre-armed overflow block — the binner wants MORE (grow BPOS) or the block is not honoured"
+        } else if fldone_sts & V3D_INT_QPU_MASK != 0 {
+            "QPU host-interrupt (bit16+) latched, FLDONE did NOT: the coord shader reached program-end but the PTB never flushed — see the [v3d45] wedge dump above for CTRUN/PCS/BPCA"
         } else {
             "FLDONE never fired — the bin did not retire; see the raw INT_STS bits for what did"
         }

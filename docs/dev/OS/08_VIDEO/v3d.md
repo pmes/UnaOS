@@ -634,3 +634,32 @@ if the binner's 0x3000-byte emission (BPCA evidence) is real — which would ret
 "empty bin" investigation as a readback artifact. Note the **separate, un-conflated** downstream fact: P40's
 `BFC Δ0` (no bin frame *completed*) is not addressed here — the readback fix is orthogonal to whether the
 PTB frame ran to completion.
+
+## 19. FLDONE never fired; a QPU host-interrupt did (V3D-44 → V3D-45)
+
+**P43 metal named a new wall.** The [v3d44] FLDONE poll (§18's downstream: wait for the true bin-retire
+IRQ `V3D_INT_FLDONE`, not the CT0CS run bit) timed out:
+`[v3d44] FLDONE wait — INT_STS=0x00010000 waited=500000us retired=0 BFC Δ0 BPOA(armed)=0x001ba000 BPOS=0x2000 — FLDONE never fired`.
+`OUTOMEM=0` **kills the overflow-exhaustion theory** V3D-44 pre-armed BPOA/BPOS against — the binner did
+not stall for tile-alloc memory. The one bit set was **bit 16**.
+
+**Bit 16 identified.** Per Linux `drivers/gpu/drm/v3d/v3d_regs.h` (V3D 4.x), the top half-word of the
+per-core `V3D_CTL_INT_STS` is the per-QPU host-interrupt vector: `V3D_INT_QPU_MASK = 0xffff0000`,
+`V3D_INT_QPU_SHIFT = 16`. Bit `(16+n)` latches when **QPU n raises a host interrupt** — the QPU thread
+executed a program-end signal carrying the interrupt (`sig.int`, Mesa `qpu_instr.h` `V3D_QPU_SIG`). So
+`INT_STS=0x0001_0000` = **QPU 0 ran to a program-end host interrupt** while **FLDONE (bit 1) never
+latched**. The QPU executed and signalled completion; the PTB never flushed the bin. This decouples
+QPU-execution (finally witnessed positively — the whole V3D-21 "did the CS run" saga) from bin-retire,
+and fits the null hypothesis: a wedged/finished QPU holding the bin pipeline open, the binner having
+emitted 0x3000 bytes (P40 BPCA) that never retired.
+
+**V3D-45 = corner the binner in one more boot.** Instrumentation only (no shader change yet — naming the
+wedge before touching QPU words, per the no-fabricated-fix discipline). At the FLDONE timeout the witness
+now decodes the full INT_STS (adds `TRFB` bit4 + the `QPU_vec` half-word) and dumps the CLE/PTB state
+machine — `[v3d45] wedge dump`: `CT0CS/CT1CS` (CTRUN busy), `CT0CA/CT1CA` (halt addresses), raw `PCS`,
+`CT0LC/CT0PC` (list/primitive counters), `BPCA/BPCS` (PTB write pointer+size) — plus a `[v3d45] GMP
+witness` (`STATUS.VIO/INVPROT/GMPRST`, `CFG.PROT_ENABLE`) to rule a silent GMP write-drop in or out in
+the same boot. **CT0 CTRUN still set** = the BIN CLE never idled, PTB holding the list open (wedged QPU);
+**CT0 CTRUN clear** = CLE idled but the flush stalled downstream (PTB drain / tile-state writeback). QEMU
+raspi4b has no V3D block, so the witness is dormant there — **P44 metal decides** which branch, and that
+read names the fix (shader program-end sequencing vs a downstream PTB/tile-state flush step).
