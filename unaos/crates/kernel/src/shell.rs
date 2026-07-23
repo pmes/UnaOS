@@ -201,6 +201,15 @@ fn joined(parent_canon: &str, leaf: &str) -> String {
     alloc::format!("{}/{}", parent_canon, leaf)
 }
 
+/// PI-UI-3: print a verb's output line to the panel AND mirror it to the serial console as a
+/// `:: ui3:<verb>: <line> ::` witness. On the Pi bench the verb output renders panel-only, so a
+/// headless capture cannot see it; the witness gives the same content on the wire so `date`/`time`/
+/// `netinfo` are verifiable from serial alone. Same content on both sinks, byte-for-byte.
+fn ui3_say(console: &mut Console, verb: &str, line: &str) {
+    console.println(line);
+    serial_println!(":: ui3:{}: {} ::", verb, line);
+}
+
 /// JD6 `touch`: ensure a 0-length file exists at `path` in ANY directory the shell can reach
 /// (create if absent; idempotent no-op if present). Rides the dir-aware `locate_in_dir` /
 /// `create_in_dir` twins — the parent may be the root or any subdirectory.
@@ -2042,13 +2051,25 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             console.println("          get <ip> [port] [path]  (HTTP/1.0 GET)");
         },
         "date" => {
-            // JD17: show the kernel wall clock. UNSET is first-class and honest — the kernel has
-            // no RTC, so until the operator seeds it with `setdate` there is no time to show.
-            match crate::clock::now() {
-                Some(t) => console.println(&alloc::format!(
-                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-                    t.year, t.month, t.day, t.hour, t.min, t.sec)),
-                None => console.println("date: clock not set (setdate YYYY-MM-DD HH:MM:SS)"),
+            // JD17/CLOCK-3/PI-UI-3: show the kernel wall clock. The UNIFIED civil clock is the source of
+            // truth: prefer the Unix anchor (an SNTP sync on the Pi — PI-NET-16 — or a `setdate` seed), so a
+            // networked board shows the REAL date with no operator action. Historically `date` read only the
+            // JD17 FAT anchor (`now()`), which the SNTP path never plants (it anchors the civil clock via
+            // `set_anchor`), so a synced Pi still printed "clock not set" — the bug behind PI-UI-3. Fall back
+            // to the FAT anchor, then to the honest UNSET state. `unix_now()` + `civil_from_unix` mirror the
+            // `time` verb's path so `date` and `time` never disagree.
+            let ymd = match crate::clock::unix_now() {
+                Some(secs) => {
+                    let (y, mo, d, h, mi, s) = crate::clock::civil_from_unix(secs);
+                    Some((y as u32, mo, d, h, mi, s))
+                }
+                None => crate::clock::now()
+                    .map(|t| (t.year, t.month, t.day, t.hour, t.min, t.sec)),
+            };
+            match ymd {
+                Some((y, mo, d, h, mi, s)) => ui3_say(console, "date", &alloc::format!(
+                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, mo, d, h, mi, s)),
+                None => ui3_say(console, "date", "date: clock not set (setdate YYYY-MM-DD HH:MM:SS)"),
             }
         },
         "setdate" => {
@@ -2080,9 +2101,10 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                         crate::clock::ClockSource::Manual => alloc::format!("manual"),
                         crate::clock::ClockSource::Unset => alloc::format!("unsynced"),
                     };
-                    console.println(&alloc::format!("{} ({})", iso, src));
+                    // PI-UI-3: mirror to serial (verb output is panel-only on the bench).
+                    ui3_say(console, "time", &alloc::format!("{} ({})", iso, src));
                 }
-                None => console.println("time: unsynced (no SNTP sync or setdate yet)"),
+                None => ui3_say(console, "time", "time: unsynced (no SNTP sync or setdate yet)"),
             }
         },
         "clear" => {
@@ -2603,6 +2625,47 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             }
         },
         "netinfo" => {
+            // PI-UI-3: the Pi (GENET) has no e1000, so the x86 path below reports "no device" there. Give
+            // the Pi shell an equivalent that reads the GENET interface snapshot — MAC / IP / gateway /
+            // lease state — plus the civil-clock sync state, matching the x86 verb's line shape.
+            #[cfg(all(target_arch = "aarch64", not(feature = "genet")))]
+            ui3_say(console, "netinfo", "No network device ready.");
+            #[cfg(all(target_arch = "aarch64", feature = "genet"))]
+            {
+                match crate::arch::aarch64::genet::netinfo() {
+                    Some(n) => {
+                        ui3_say(console, "netinfo", &alloc::format!(
+                            "NIC: MAC {}  link {}",
+                            crate::drivers::e1000::fmt_mac(&n.mac),
+                            if n.link_up { "UP" } else { "DOWN" }
+                        ));
+                        ui3_say(console, "netinfo", &alloc::format!(
+                            "IP {}.{}.{}.{} ({})  GW {}.{}.{}.{}",
+                            n.ip[0], n.ip[1], n.ip[2], n.ip[3],
+                            if n.leased { "dhcp" } else { "static" },
+                            n.gw[0], n.gw[1], n.gw[2], n.gw[3]
+                        ));
+                        let mut buf = [0u8; 24];
+                        let sync = match crate::clock::iso8601_now(&mut buf) {
+                            Some(len) => {
+                                let iso = core::str::from_utf8(&buf[..len]).unwrap_or("<iso>");
+                                match crate::clock::source() {
+                                    crate::clock::ClockSource::Sntp { stratum } =>
+                                        alloc::format!("{} (sntp, stratum {})", iso, stratum),
+                                    crate::clock::ClockSource::Manual =>
+                                        alloc::format!("{} (manual)", iso),
+                                    crate::clock::ClockSource::Unset =>
+                                        alloc::format!("unsynced"),
+                                }
+                            }
+                            None => alloc::format!("unsynced"),
+                        };
+                        ui3_say(console, "netinfo", &alloc::format!("time: {}", sync));
+                    }
+                    None => ui3_say(console, "netinfo", "No network device ready."),
+                }
+            }
+            #[cfg(not(target_arch = "aarch64"))]
             match crate::drivers::e1000::info() {
                 Some(n) => {
                     console.println(&alloc::format!(

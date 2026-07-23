@@ -362,6 +362,26 @@ re-sync prints `[net16] resync <ip> -> <iso> (stratum N)`. On the status page Pe
 new `time (UTC): 2026-07-22T14:03:07Z` line (or `unsynced (no SNTP yet)` before the first
 sync).
 
+### PI-UI-3 — `date` / `time` / `netinfo` at the Pi shell
+
+The SNTP sync above anchors the *civil* (Unix-epoch) clock via `clock::set_anchor` — it does
+**not** plant the JD17 FAT anchor (`clock::set`). The `date` verb historically read only the FAT
+anchor (`clock::now()`), so on a synced Pi — lease + SNTP both logged — `date` still printed
+`clock not set` while `time` (which reads the civil anchor) showed the real UTC. PI-UI-3 makes
+`date` read the **unified** clock: `clock::unix_now()` → `civil_from_unix` first, falling back to
+the FAT anchor, then to the honest UNSET state. `date` and `time` now agree, and a networked board
+shows the real date with zero operator action.
+
+`netinfo` on the Pi previously reached for `drivers::e1000::info()` (the x86 Intel NIC) and always
+printed "No network device ready." PI-UI-3 gives it a GENET backend — `genet::netinfo()` reads the
+settled IPv4 + lease flag from `net_phy::settled_ipv4()`, the registered MAC from `GENET_DEVICE`,
+and the gateway recorded at `bind_smoltcp` (a new `NET_GW` atomic) — printing MAC/link, IP(dhcp|
+static)/gateway, and the civil-clock sync state, matching the x86 verb's line shape.
+
+Verb output renders panel-only on the bench, so each of `date`/`time`/`netinfo` also emits a
+`:: ui3:<verb>: <line> ::` serial witness with identical content (via the shell's `ui3_say`
+helper) — a headless capture can verify the values without the panel.
+
 ---
 
 ## 4b. "UnaOS is discoverable" — DNS-SD service advertisement (PI-NET-17)
