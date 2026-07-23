@@ -2177,30 +2177,37 @@ fn build_probe_shader_record() -> u32 {
     sf(&mut rec, 64, 32, defaults); // Address of default attribute values
     // FS / VS slots (never executed in a bin-only job) — point at the probe code + uniforms so every
     // address field is a valid arena pointer.
-    // V3D-32: the probe is a threads=2 program (artifact line 76 "threads=2 tmu_count=1"), NOT threads=4
-    // like the working coord/vertex shaders. In the GL Shader State Record's per-shader flag group the
-    // low three bits are, per Mesa's `v3dX(pack)` of "GL Shader State Record" (v3d_packet_v42.xml, driver
-    // `v3d_emit.c`): bit0 = N-way threadable where `_4_way_threadable = (prog_data.base.threads == 4)`,
-    // bit1 = `_2_way_threadable = (prog_data.base.threads == 2)`, bit2 = propagate NaNs. V3D-31 set the
-    // 4-WAY bit (offset 0) for this threads=2 program — a mis-declared thread count: the hardware's
-    // thread scheduler was told to run 4-way when the compiler laid the code out for 2, so the terminal
-    // [22] tmuwt segment never executed and the store never drained. The correct declaration for a
-    // threads=2 shader is the 2-WAY bit (offset 1), 4-way clear. All three record slots point at the same
-    // threads=2 probe code, so all three carry the 2-way flag (FS/VS are unexecuted in a bin-only job,
-    // but declaring them correctly costs nothing). PROBE_WORDS stays byte-verbatim (§5 untouched).
-    sf(&mut rec, 97, 1, 1); // FS 2-way threadable (threads=2)
+    // GL Shader State Record per-shader flag group (Mesa `v3dX(pack)`, v3d_packet_v42.xml / v3d_emit.c):
+    // bit0 = 4-way threadable = (prog_data.base.threads == 4), bit1 = 2-way threadable = (threads == 2),
+    // bit2 = propagate NaNs.
+    //
+    // V3D-36 (THIS arc): the P34 capture proved the probe coord shader NEVER DISPATCHES — the
+    // probe-scoped PCTR battery read valid_instr=0 / cycle_count=508 (SHADER NEVER RAN) while the SAME
+    // boot's M4 coord shader read valid_instr=55 (SHADER RAN). The [v3d36] CL decode (probe_job +
+    // triangle_job) shows the two binning CLs are byte-for-byte identical — same build_bin_cl_generic,
+    // same NUMBER_OF_LAYERS / TILE_BINNING_MODE_CFG / clip+viewport state / VCM_CACHE_SIZE /
+    // GL_SHADER_STATE / VERTEX_ARRAY_PRIMS(mode=4,count=3) / FLUSH — differing only in the 27-bit
+    // GL_SHADER_STATE record pointer. So the control list is EXONERATED; the dispatch gate is in the
+    // shader-state record the pointer selects. The ONE dispatch-governing field that differs from the
+    // confirmed-dispatching M4 coord shader is threadability: M4 declares the CS 4-WAY (bit 224) and its
+    // coord shader dispatches; V3D-32 flipped the probe CS to 2-WAY (bit 225, 4-way clear) and — per the
+    // only probe-scoped reading we have — its coord shader stopped dispatching entirely. The V3D-31→32
+    // threadability flip is exactly where the dispatch regressed, so restore the CS (and, to mirror the
+    // working record, the FS/VS slots) to 4-WAY threadable. The store-drain concern V3D-32 raised is a
+    // DOWNSTREAM symptom that only bites once the thread runs; getting valid_instr>0 is the gate this arc
+    // targets, and the next boot's [v3d35] reading is its verdict. PROBE_WORDS stays byte-verbatim.
+    sf(&mut rec, 96, 1, 1); // FS 4-way threadable (mirror the M4 record)
     sf(&mut rec, 98, 1, 1); // FS propagate NaNs (v42)
     sf(&mut rec, 99, 29, code >> 3); // FS code address
     sf(&mut rec, 128, 32, unif); // FS uniforms address
-    sf(&mut rec, 161, 1, 1); // VS 2-way threadable (threads=2)
+    sf(&mut rec, 160, 1, 1); // VS 4-way threadable (mirror the M4 record)
     sf(&mut rec, 162, 1, 1); // VS propagate NaNs (v42)
     sf(&mut rec, 163, 29, code >> 3); // VS code address
     sf(&mut rec, 192, 32, unif); // VS uniforms address
-    // Coord shader — the one the bin runs. V3D-32: 2-WAY threadable (threads=2), matching the Mesa
-    // compile; NOT 4-way (V3D-31's bug). This makes the hardware run the program with the 2-thread
-    // segmentation the compiler emitted — the [18]/[19] thrsw pair is the single 2-way thread switch to
-    // the final segment, which runs on to [22] tmuwt where the store at [9] finally drains.
-    sf(&mut rec, 225, 1, 1); // CS 2-way threadable (threads=2)
+    // Coord shader — the one the bin runs. V3D-36: 4-WAY threadable, matching the M4 coord shader that
+    // provably dispatches (valid_instr=55). The 2-way declaration (V3D-32) is the dispatch regression the
+    // P34 capture caught (valid_instr=0).
+    sf(&mut rec, 224, 1, 1); // CS 4-way threadable (mirror the dispatching M4 coord shader)
     sf(&mut rec, 226, 1, 1); // CS propagate NaNs (v42)
     sf(&mut rec, 227, 29, code >> 3); // CS code address
     sf(&mut rec, 256, 32, unif); // CS uniforms address (probe stream: indices + UBO_ADDR + scales)
@@ -2254,6 +2261,14 @@ fn probe_job() {
     cache::clean_range(arena_phys() + OFF_VTXDATA, TRI_VERTS.len() * 16);
     cache::clean_range(arena_phys() + OFF_DEFAULT_ATTRS, 16);
 
+    // ── [v3d36] PROBE bin CL structural decode ──────────────────────────────────────────────────
+    // Put the probe's binning CL on serial packet-by-packet, so it can be diffed against the M4 bin CL
+    // (decoded from triangle_job under the same [v3d36] tag). Both come from build_bin_cl_generic, so
+    // they must agree packet-for-packet except the GL_SHADER_STATE `record` pointer. If they do, the
+    // control list is EXONERATED as the cause of the coord shader never dispatching (valid_instr=0) and
+    // the difference lives in the shader-state record — see build_probe_shader_record.
+    decode_cl_packets("PROBE", OFF_PROBE_BIN_CL, bin_len);
+
     // ── [v3d30] executed-bytes witness ──────────────────────────────────────────────────────────
     // v3d28 VERDICT store-never-issued (canaries + sentinel intact, no fault) proves the TMU write
     // never drained. Before blaming the TMU config, put the GROUND TRUTH on serial: (a) which code
@@ -2276,8 +2291,8 @@ fn probe_job() {
     let fs_code_pa = rec_w12 & 0xFFFF_FFF8;
     let vs_code_pa = rec_w20 & 0xFFFF_FFF8;
     let cs_code_pa = rec_w28 & 0xFFFF_FFF8;
-    let cs_4way = rec_w28 & 1; // bit 224 (V3D-32: expect 0 for the threads=2 probe)
-    let cs_2way = (rec_w28 >> 1) & 1; // bit 225 (V3D-32: expect 1 for the threads=2 probe)
+    let cs_4way = rec_w28 & 1; // bit 224 (V3D-36: expect 1 — mirror the dispatching M4 coord shader)
+    let cs_2way = (rec_w28 >> 1) & 1; // bit 225 (V3D-36: expect 0 — the 2-way flip killed dispatch)
     let cs_propnan = (rec_w28 >> 2) & 1; // bit 226
     let vs_2way = (rec_w20 >> 1) & 1; // bit 161
     serial_println!(
@@ -2607,6 +2622,10 @@ fn triangle_job(fb: Option<FbTarget>) -> bool {
         VCM_CACHE_BATCHES
     );
     dump_cl_bytes("M4 bin", OFF_BIN_CL, bin_len, 64);
+    // [v3d36] decode the WORKING M4 bin CL packet-by-packet — the reference the PROBE decode (emitted by
+    // probe_job under the same tag) is diffed against. Same builder → same packets; the only field that
+    // may differ is GL_SHADER_STATE `record` (M4 record vs probe record).
+    decode_cl_packets("M4", OFF_BIN_CL, bin_len);
     // PI-V3D-12: the Linux per-job pre-kick cache invalidate (v3d_bin_job_run does this first).
     invalidate_gpu_caches("L2T flush (M4 bin pre-kick)");
     let ct0_cs_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CS);
@@ -3563,6 +3582,116 @@ fn dump_cl_bytes(tag: &str, off: usize, len: usize, cap: usize) {
             line[8], line[9], line[10], line[11], line[12], line[13], line[14], line[15]
         );
         i += 16;
+    }
+}
+
+/// [v3d36] Decode a BINNING control list packet-by-packet to serial — opcode + name + key fields, one
+/// line per packet — so the probe bin CL and the working M4 bin CL can be diffed on the capture.
+///
+/// V3D-36 root fact (P34 capture, cu.usbmodem143302.log): the probe bin's coord shader reads
+/// valid_instr=0 / cycle_count=508 — SHADER NEVER RAN — while the SAME boot's M4 bin reads
+/// valid_instr=55 SHADER RAN. The brief hypothesised the probe was a stripped-down bin whose CL lacked
+/// a dispatch-gating packet (draw/clip/state). This witness settles that hypothesis FROM THE LOG: both
+/// CLs are emitted by the identical `build_bin_cl_generic(cl_off, shadrec_off, num_attrs)`, so this
+/// decode is expected to show them byte-for-byte identical EXCEPT the 27-bit GL_SHADER_STATE record
+/// pointer (probe record vs M4 record). If they match packet-for-packet, the CL is EXONERATED and the
+/// only structural difference gating coord-shader dispatch lives in the shader-state record the pointer
+/// selects (threadability / code / uniforms) — not in the control list.
+///
+/// Field bit offsets follow the build path: `Pkt::f(xml_start, ..)` shifts by +8 (the opcode byte), so
+/// a field documented at XML bit `xml_start` sits at absolute packet bit `xml_start + 8`.
+fn decode_cl_packets(tag: &str, off: usize, len: usize) {
+    serial_println!(
+        ":: V3D: [v3d36] {} bin CL — packet decode ({} bytes @ arena+{:#x}) ::",
+        tag, len, off
+    );
+    // Read `width` bits of the field at XML bit `xml_start` out of the packet whose first byte is arena
+    // byte `p` (absolute packet bit = xml_start + 8 for the opcode-shift).
+    let getb = |p: usize, xml_start: usize, width: usize| -> u64 {
+        let mut abit = xml_start + 8;
+        let mut w = width;
+        let mut got = 0usize;
+        let mut v: u64 = 0;
+        while w > 0 {
+            let byte = arena_byte(p + abit / 8) as u64;
+            let o = abit % 8;
+            let take = core::cmp::min(8 - o, w);
+            let mask = (1u64 << take) - 1;
+            v |= ((byte >> o) & mask) << got;
+            abit += take;
+            got += take;
+            w -= take;
+        }
+        v
+    };
+    let mut i = 0usize;
+    let mut idx = 0u32;
+    while i < len {
+        let p = off + i;
+        let op = arena_byte(p);
+        // Length table for the opcodes build_bin_cl_generic emits (byte length incl. opcode).
+        let plen: usize = match op {
+            P_FLUSH_VCD_CACHE | P_START_TILE_BINNING | P_FLUSH => 1,
+            P_NUMBER_OF_LAYERS | P_VCM_CACHE_SIZE => 2,
+            P_CFG_BITS => 4,
+            P_OCCLUSION_QUERY_COUNTER | P_GL_SHADER_STATE => 5,
+            P_TILE_BINNING_MODE_CFG | P_CLIP_WINDOW | P_VIEWPORT_OFFSET | P_CLIPPER_XY_SCALING
+            | P_CLIPPER_Z_SCALE_AND_OFFSET => 9,
+            P_VERTEX_ARRAY_PRIMS => 10,
+            _ => 1, // unknown → advance one byte; the idx guard below bounds the walk
+        };
+        match op {
+            P_TILE_BINNING_MODE_CFG => serial_println!(
+                "::   [v3d36] [{:2}] op={:3} TILE_BINNING_MODE_CFG      w={} h={} (px) ::",
+                idx, op, getb(p, 32, 16) + 1, getb(p, 48, 16) + 1
+            ),
+            P_CFG_BITS => serial_println!(
+                "::   [v3d36] [{:2}] op={:3} CFG_BITS                   fwd={} rev={} ::",
+                idx, op, getb(p, 0, 1), getb(p, 1, 1)
+            ),
+            P_CLIP_WINDOW => serial_println!(
+                "::   [v3d36] [{:2}] op={:3} CLIP_WINDOW                l={} b={} w={} h={} ::",
+                idx, op, getb(p, 0, 16), getb(p, 16, 16), getb(p, 32, 16), getb(p, 48, 16)
+            ),
+            P_VCM_CACHE_SIZE => serial_println!(
+                "::   [v3d36] [{:2}] op={:3} VCM_CACHE_SIZE             bin={} render={} ::",
+                idx, op, getb(p, 0, 4), getb(p, 4, 4)
+            ),
+            P_GL_SHADER_STATE => serial_println!(
+                "::   [v3d36] [{:2}] op={:3} GL_SHADER_STATE            num_attrs={} record={:#010x} ::",
+                idx, op, getb(p, 0, 5), getb(p, 5, 27) << 5
+            ),
+            P_VERTEX_ARRAY_PRIMS => serial_println!(
+                "::   [v3d36] [{:2}] op={:3} VERTEX_ARRAY_PRIMS         mode={} count={} first={} ::",
+                idx, op, getb(p, 0, 8), getb(p, 8, 32), getb(p, 40, 32)
+            ),
+            _ => {
+                let name = match op {
+                    P_NUMBER_OF_LAYERS => "NUMBER_OF_LAYERS",
+                    P_FLUSH_VCD_CACHE => "FLUSH_VCD_CACHE",
+                    P_OCCLUSION_QUERY_COUNTER => "OCCLUSION_QUERY_COUNTER",
+                    P_START_TILE_BINNING => "START_TILE_BINNING",
+                    P_VIEWPORT_OFFSET => "VIEWPORT_OFFSET",
+                    P_CLIPPER_XY_SCALING => "CLIPPER_XY_SCALING",
+                    P_CLIPPER_Z_SCALE_AND_OFFSET => "CLIPPER_Z_SCALE_AND_OFFSET",
+                    P_FLUSH => "FLUSH (bin terminator)",
+                    _ => "UNKNOWN",
+                };
+                serial_println!(
+                    "::   [v3d36] [{:2}] op={:3} {} (len {}) ::",
+                    idx, op, name, plen
+                );
+            }
+        }
+        if op == P_FLUSH {
+            break; // the bin terminator — end of the binning list
+        }
+        i += plen;
+        idx += 1;
+        if idx > 40 {
+            serial_println!("::   [v3d36] [..] decode guard hit (>40 packets) — stopping ::");
+            break;
+        }
     }
 }
 
