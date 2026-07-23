@@ -2218,26 +2218,67 @@ fn render_service(_: usize) {
     // status_tick Timer pulse (~1 Hz) provides the periodic wake this check rides on.
     let mut cursor_was_visible = false;
 
+    // SCHED-6 — dirty-flag frame pacing. The pre-SCHED-6 loop recomposed the status strip
+    // (`ui_status::draw`: a heap `format!` of host/ip/clock + a full-width band fill + a glyph run)
+    // AND presented (`pal.render`) on EVERY inbound event. A USB mouse re-emits an interrupt-IN
+    // report every 8-10 ms whether or not it moved (and some send a null Mouse{0,0} at rest), so at
+    // idle the render core recomposed the strip ~100-125×/s for no visible change — c0 pegged at
+    // ~96-100% (P33). Now: pointer/button events move only the (cheap) cursor sprite and present;
+    // the strip is recomposed ONLY when its content can have changed — the 1 Hz status-tick Timer
+    // pulse — or when a Key redrew the console beneath it (so it stays on top). No-op pointer reports
+    // (null relative motion / an unchanged absolute position) draw nothing and do not present. A pass
+    // presents at most once, and only if something was actually drawn. Cursor latency is preserved:
+    // a real pointer report still redraws the sprite and presents in the same pass.
+    let mut last_abs: Option<(i32, i32)> = None;
+    // [sched6] witness accumulators (this task is the sole owner of the render core — plain locals,
+    // no atomics). Bracket each pass; report passes/s, presented composites/s, and the mean cycle
+    // cost of a presented pass, rate-limited to once every ~5 s.
+    let mut s6_passes: u64 = 0;
+    let mut s6_composites: u64 = 0;
+    let mut s6_cyc: u64 = 0;
+    let mut s6_last_ms = unaos_kernel::arch::ms();
+
     loop {
-        // Any event wakes a repaint. A Key is dispatched to the shell; a pointer event moves the
-        // shared `pal::cursor` sprite (PIUSB-24 — mirrors the x86 console loop's Mouse/MouseAbsolute
-        // arms so the mouse follows the keyboard here too). An Event::Timer from the status-tick task
-        // (or any other event) falls through to just refresh the strip + present.
-        match GUI_CHANNEL.recv() {
+        // Block until an event arrives (recv parks the task — an idle render core burns nothing).
+        let ev = GUI_CHANNEL.recv();
+        let t0 = unaos_kernel::arch::now_cycles();
+        s6_passes += 1;
+        // `dirty` — did this pass draw anything that must be presented? `strip_dirty` — must the
+        // status strip be (re)composed on top this pass?
+        let mut dirty = false;
+        let mut strip_dirty = false;
+        match ev {
             unaos_kernel::pal::Event::Key(c) => {
                 handle_key(c, &mut console, &mut pal);
+                // The console may repaint into the strip's bottom band — redraw the strip on top.
+                dirty = true;
+                strip_dirty = true;
             }
             unaos_kernel::pal::Event::Mouse { x, y } => {
-                // Relative motion (boot-mouse proto): erase-at-old, move, draw-at-new.
-                unaos_kernel::pal::cursor::erase(&mut pal, 0x001E1E1E);
-                unaos_kernel::pal::cursor::move_rel(x, y, pal.width() as i32, pal.height() as i32);
-                unaos_kernel::pal::cursor::draw(&mut pal);
+                // Relative motion (boot-mouse proto). A null report (no delta) is the idle-mouse
+                // keep-alive — draw nothing, do not present.
+                if x != 0 || y != 0 {
+                    unaos_kernel::pal::cursor::erase(&mut pal, 0x001E1E1E);
+                    unaos_kernel::pal::cursor::move_rel(
+                        x,
+                        y,
+                        pal.width() as i32,
+                        pal.height() as i32,
+                    );
+                    unaos_kernel::pal::cursor::draw(&mut pal);
+                    dirty = true;
+                }
             }
             unaos_kernel::pal::Event::MouseAbsolute { x, y } => {
-                // Absolute report (0..=32767 HID space), same shared sprite.
-                unaos_kernel::pal::cursor::erase(&mut pal, 0x001E1E1E);
-                unaos_kernel::pal::cursor::set_abs(x, y, pal.width() as i32, pal.height() as i32);
-                unaos_kernel::pal::cursor::draw(&mut pal);
+                // Absolute report (0..=32767 HID space), same shared sprite. An unchanged position
+                // is an idle keep-alive — skip it (no motion, no repaint).
+                if last_abs != Some((x, y)) {
+                    last_abs = Some((x, y));
+                    unaos_kernel::pal::cursor::erase(&mut pal, 0x001E1E1E);
+                    unaos_kernel::pal::cursor::set_abs(x, y, pal.width() as i32, pal.height() as i32);
+                    unaos_kernel::pal::cursor::draw(&mut pal);
+                    dirty = true;
+                }
             }
             // GUI-CLICK-1: a Button report carries no cursor motion — dispatch it against the shared
             // GUI model at the current sprite position (hit-test → deliver to the hit view). Press
@@ -2245,8 +2286,15 @@ fn render_service(_: usize) {
             // line. Emits the rate-limited `[click1]` witness. Key/motion paths are untouched.
             unaos_kernel::pal::Event::Button(mask) => {
                 click1_dispatch(mask, &console, &mut pal);
+                dirty = true;
+                // A click may activate/redraw a view under the strip band — keep the strip on top.
+                strip_dirty = true;
             }
-            // Timer / others just refresh below.
+            // Timer (the 1 Hz status-tick pulse) is the strip's own refresh cadence: recompose it so
+            // the clock/lease advance even with no input. Other events carry nothing to draw.
+            unaos_kernel::pal::Event::Timer => {
+                strip_dirty = true;
+            }
             _ => {}
         }
         // CURSOR-HIDE: erase the sprite once when the auto-hide delay expires (reappearance is instant
@@ -2254,10 +2302,40 @@ fn render_service(_: usize) {
         let cursor_vis = unaos_kernel::pal::cursor::visible();
         if cursor_was_visible && !cursor_vis {
             unaos_kernel::pal::cursor::erase(&mut pal, 0x001E1E1E);
+            dirty = true;
         }
         cursor_was_visible = cursor_vis;
-        unaos_kernel::ui_status::draw(&mut pal);
-        pal.render();
+        // Recompose the strip only when it can have changed (Timer) or was overdrawn (Key/Button).
+        if strip_dirty {
+            unaos_kernel::ui_status::draw(&mut pal);
+            dirty = true;
+        }
+        // Present at most once per pass, and only when something was actually drawn — a no-op report
+        // costs a bounded match + a couple of cycle reads, not a composite.
+        if dirty {
+            pal.render();
+            s6_composites += 1;
+        }
+        s6_cyc += unaos_kernel::arch::now_cycles().wrapping_sub(t0);
+        // Rate-limited [sched6] witness: incoming pass rate vs presented-composite rate + mean pass
+        // cost over the window (proves the pacing — presents track real activity, not the event rate).
+        let now = unaos_kernel::arch::ms();
+        let span = now.wrapping_sub(s6_last_ms);
+        if span >= 5000 {
+            let passes_per_s = s6_passes.saturating_mul(1000) / span.max(1);
+            let comps_per_s = s6_composites.saturating_mul(1000) / span.max(1);
+            let mean_cyc = s6_cyc / s6_passes.max(1);
+            serial_println!(
+                "[sched6] passes={}/s composites={}/s mean={} cyc/pass (dirty-paced strip@1Hz)",
+                passes_per_s,
+                comps_per_s,
+                mean_cyc
+            );
+            s6_passes = 0;
+            s6_composites = 0;
+            s6_cyc = 0;
+            s6_last_ms = now;
+        }
     }
 }
 
