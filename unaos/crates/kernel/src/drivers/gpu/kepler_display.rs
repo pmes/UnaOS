@@ -224,79 +224,83 @@ pub unsafe fn takeover_display(
     let capped = if hits > 64 { "true" } else { "false" };
     serial_println!(":: kdisp: evo-scan done range=610000-613FFC hits={} capped={} ::", hits, capped);
 
-    // ── Phase 2: Display takeover (Pull 5: repoint-the-surface) ────────────
+    // ── Phase 2: Assembly-State Hunt (Pull 6) ──────────────────────────────
     if !cfg!(feature = "nvidia-kepler-takeover") {
         serial_println!(":: kdisp: trace-only — takeover feature not set ::");
         return None;
     }
 
-    // Legacy EVO-mirror head matching is refuted history (s11): found_head is
-    // always None on this silicon. Head 0 is the proven-alive head (HEAD_STAT
-    // canon, s11–s14) — default to it honestly instead of aborting.
-    let head = match found_head {
-        Some(h) => h,
-        None => {
-            serial_println!(":: kdisp: head-match absent — using head 0 (HEAD_STAT canon) ::");
-            0
+    // Milestone 1: The gap region (0x610000..=0x6103FC)
+    let mut m1_0x6101e0_val = 0;
+    for pass in 0..2 {
+        let mut rows = 0;
+        for addr in (0x610000..=0x6103FC).step_by(4) {
+            let val = mmio_read(bar0, addr);
+            serial_println!(":: kdisp: gap pass{} off={:03X} val={:08X} ::", pass, addr - 0x610000, val);
+            if pass == 0 && addr == (regs::NV_PDISPLAY_BASE + 0x01E0) {
+                m1_0x6101e0_val = val;
+            }
+            rows += 1;
         }
-    };
+        serial_println!(":: kdisp: gap pass{} done rows={} ::", pass, rows);
 
-    let gop_info = match crate::video::fbcon::current_info() {
-        Some(info) => info,
-        None => {
-            serial_println!(":: kdisp: takeover-abort no-gop-info ::");
-            return None;
+        if pass == 0 {
+            for _ in 0..2_000_000 { core::hint::spin_loop(); }
         }
-    };
-    let expected_width = gop_info.width as u32;
-    let expected_height = gop_info.height as u32;
-    let _ = matched_size; // refuted-mirror data; not a gate (s15 no-match lesson)
-
-    let bar1 = vram_base;
-    let fb_size = (expected_width * expected_height * 4) as usize;
-
-    // 1. Prepare second surface at 0x1600000
-    let surf2_offset = 0x1600000;
-    let dst = (bar1 + surf2_offset) as *mut u32;
-    let dwords = fb_size / 4;
-    for i in 0..dwords {
-        core::ptr::write_volatile(dst.add(i), 0xFF00FF00);
     }
-    serial_println!(":: kdisp: surf2 prep off=01600000 bytes={:08X} fill=FF00FF00 ::", fb_size);
 
-    // 2. Pre-repoint check
+    // Milestone 2: Widened known-value scan
+    const MAX_HITS: usize = 64;
+    let mut hit_addrs = [0usize; MAX_HITS];
+    let mut hit_vals = [0u32; MAX_HITS];
+    let mut hits = 0;
+
+    let scan_ranges = [(0x614000, 0x61FFFC), (0x640000, 0x647FFC)];
+    for (start, end) in scan_ranges.iter() {
+        for addr in (*start..=*end).step_by(4) {
+            let val = mmio_read(bar0, addr);
+            
+            let keyname = match val {
+                0x00000200 => "0x200",
+                0x00020000 => "0x20000",
+                0x90020000 => "0x90020000",
+                0x00002D00 => "pitch2880",
+                0x013C6800 => "fbsize",
+                0x07380BAF | 0x0BAF0738 => "raster",
+                _ if (val & 0xFFF00000) == 0x90000000 => "barshape",
+                _ if (val & 0xFFFF) == 0x0B40 || (val >> 16) == 0x0B40 => "w2880",
+                _ if (val & 0xFFFF) == 0x0708 || (val >> 16) == 0x0708 => "h1800",
+                _ => "",
+            };
+            
+            if !keyname.is_empty() {
+                if hits < MAX_HITS {
+                    hit_addrs[hits] = addr;
+                    hit_vals[hits] = val;
+                    serial_println!(":: kdisp: evo-scan2 hit off={:06X} val={:08X} key={} ::", addr, val, keyname);
+                }
+                hits += 1;
+            }
+        }
+    }
+    let capped = if hits > MAX_HITS { "t" } else { "f" };
+    serial_println!(":: kdisp: evo-scan2 done ranges=614000-61FFFC,640000-647FFC hits={} capped={} ::", hits, capped);
+
+    // Bounded delay before M3
+    for _ in 0..2_000_000 { core::hint::spin_loop(); }
+
+    // Milestone 3: Armed-pair check
     let repoint_reg = regs::NV_PDISPLAY_BASE + 0x01E0; // 0x6101E0
-    let orig_ptr = mmio_read(bar0, repoint_reg);
-    let hs_base = regs::NV_PDISPLAY_BASE + 0x6000 + (head * 0x800);
-    let pre_vert = mmio_read(bar0, hs_base + 0x340);
-    let pre_horz = mmio_read(bar0, hs_base + 0x344);
-    serial_println!(":: kdisp: repoint pre 6101E0={:08X} stat vert={:08X} horz={:08X} ::", orig_ptr, pre_vert, pre_horz);
+    let m3_0x6101e0_val = mmio_read(bar0, repoint_reg);
+    serial_println!(":: kdisp: pair off=6101E0 first={:08X} second={:08X} ::", m1_0x6101e0_val, m3_0x6101e0_val);
 
-    // 3. Repoint
-    let new_ptr = 0x00016000;
-    mmio_write(bar0, repoint_reg, new_ptr);
-    let rb = mmio_read(bar0, repoint_reg);
-    serial_println!(":: kdisp: repoint wrote=00016000 rb={:08X} ::", rb);
-
-    // 4. Bounded panel window (~5s)
-    for t in 1..=5 {
-        for _ in 0..60_000_000 { core::hint::spin_loop(); }
-        let vert = mmio_read(bar0, hs_base + 0x340);
-        let horz = mmio_read(bar0, hs_base + 0x344);
-        serial_println!(":: kdisp: repoint hold t={}s stat vert={:08X} horz={:08X} ::", t, vert, horz);
+    let check_count = if hits > MAX_HITS { MAX_HITS } else { hits };
+    for i in 0..check_count {
+        let addr = hit_addrs[i];
+        let first = hit_vals[i];
+        let second = mmio_read(bar0, addr);
+        serial_println!(":: kdisp: pair off={:06X} first={:08X} second={:08X} ::", addr, first, second);
     }
-
-    // 5. Restore
-    mmio_write(bar0, repoint_reg, orig_ptr);
-    let rb_restored = mmio_read(bar0, repoint_reg);
-    serial_println!(":: kdisp: repoint restored rb={:08X} ::", rb_restored);
-    
-    // Second ~2s hold
-    for _ in 0..120_000_000 { core::hint::spin_loop(); }
-
-    // 6. Verdict
-    let stuck = if rb == new_ptr { "yes" } else { "no" };
-    serial_println!(":: kdisp: repoint verdict rb-stuck={} ::", stuck);
 
     None
 }
