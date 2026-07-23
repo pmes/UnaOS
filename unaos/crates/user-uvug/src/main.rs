@@ -23,17 +23,24 @@
 //   4. On exit (ESC / click, or the interactive frame cap) it signals the workers to leave, JOINs both,
 //      and prints its witness before exiting 0.
 //
-// TWO PATHS — deterministic auto (QEMU) vs interactive (metal):
-//   * QEMU raspi4b delivers no USB HID, so no input ever arrives. If NO input event is seen within the
-//     first DETECT_FRAMES frames, the program COMMITS to the deterministic auto path: it keeps the fixed
-//     idle tumble (yaw += 3, pitch += 1 brad/frame) exactly as it did from frame 0, runs to AUTO_FRAMES
-//     (300) total, computes a deterministic FNV-1a checksum of the final surface (a pure integer function
-//     of the final frame's geometry, independent of thread interleaving), and prints
+// TWO PATHS — deterministic auto (QEMU) vs interactive (metal). The switch is INPUT-DRIVEN, not
+// time-boxed (UVUG-4): the parent polls SYS_INPUT_POLL EVERY frame for the program's whole life, and
+// the FIRST input event AT ANY FRAME flips it to interactive permanently. There is no detection window
+// to race — the old DETECT_FRAMES fallback closed in well under a second at EL0 frame rates, before a
+// human could touch a key.
+//   * QEMU raspi4b delivers no USB HID, so no input ever arrives — zero events ever — and the program
+//     stays on the deterministic auto path: it keeps the fixed idle tumble (yaw += 3, pitch += 1
+//     brad/frame) exactly as it did from frame 0, runs to AUTO_FRAMES (300) total, computes a
+//     deterministic FNV-1a checksum of the final surface (a pure integer function of the final frame's
+//     geometry, independent of thread interleaving), and prints
 //     `:: UVUG: frames=300 threads=2 checksum=<hex> ::` — the existing witness, still green and
 //     deterministic. This is what the kernel's `uvug_witness` boot self-test asserts exit=0 on.
-//   * On metal a keypress/mouse arrives immediately, so the program enters INTERACTIVE mode: WASD/arrows
-//     rotate (TRUE held state from KeyDown/KeyUp), Q/E zoom, a mouse drag rotates, a click or ESC exits.
-//     It runs until an exit event (bounded by INTERACTIVE_CAP = 36000 frames as a safety) and prints
+//   * On metal a keypress/mouse arrives whenever the operator acts, so the program enters INTERACTIVE
+//     mode at that frame: it prints `:: UVUG: interactive takeover at frame <n> ::` (proving the input
+//     arrived on metal), cancels the auto-tumble and the 300-frame cap, and switches to held-state
+//     control — WASD/arrows rotate (TRUE held state from KeyDown/KeyUp), Q/E zoom, a mouse drag rotates
+//     (per-frame clamped delta, full-panel-drag ≈ one revolution), a click or ESC exits. It runs until
+//     an exit event (bounded only by INTERACTIVE_CAP = 36000 frames as a safety) and prints
 //     `:: UVUG: interactive exit=<key|click> frames=<n> ::`. Interactive is metal-only (no HID in QEMU).
 //
 // Barrier direction split (deliberate, robust under QEMU raspi4b's lack of a Group-1 timer IRQ — see
@@ -240,9 +247,16 @@ static mut PX: [i32; 14] = [0; 14]; // projected pixel X per vertex
 static mut PY: [i32; 14] = [0; 14]; // projected pixel Y per vertex
 
 const PHASE_EXIT: u32 = u32::MAX;
-const AUTO_FRAMES: u32 = 300; // deterministic QEMU path length
-const DETECT_FRAMES: u32 = 60; // frames without input before committing to the auto path
+const AUTO_FRAMES: u32 = 300; // deterministic QEMU path length (used only while no input ever arrives)
 const INTERACTIVE_CAP: u32 = 36000; // interactive safety bound
+
+// Drag-rotate sensitivity (UVUG-4). The kernel game-mode (vug.rs) maps pointer motion 1 px = 1 brad
+// with no scaling; Peter found that too twitchy. The panel is ~1920 px wide (mailbox FALLBACK_W), so we
+// scale pointer delta down to make a full-panel drag ≈ one revolution (256 brads over ~2048 px):
+// DRAG_DIV = 8 gives 256 brads per 2048 px. Each per-frame step is clamped so one large HID delta can't
+// spin the crystal past a quarter-turn in a single frame.
+const DRAG_DIV: i32 = 8; // px → brad divisor (full-panel drag ≈ one revolution)
+const DRAG_CLAMP: i32 = 64; // max |brad| a single frame's drag may contribute per axis
 
 // ---------------------------------------------------------------------------------------------
 // Rasterisation (worker side).
@@ -572,21 +586,23 @@ pub extern "C" fn _start() -> ! {
     let mut dragging = false;
     let mut drag_motion: i32 = 0;
 
-    let mut interactive = false; // seen input within the detection window
-    let mut committed_auto = false; // detection window elapsed with no input
+    let mut interactive = false; // flipped permanently by the first input event, at any frame
     let mut exit_key = false;
     let mut exit_click = false;
 
     let mut frame: u32 = 0;
     loop {
-        // --- input ---
+        // --- input (polled EVERY frame for the program's whole life) ---
         let fi = drain_input(&mut held, &mut dragging, &mut drag_motion);
-        if !interactive && !committed_auto {
-            if fi.any {
-                interactive = true;
-            } else if frame >= DETECT_FRAMES {
-                committed_auto = true;
-            }
+        if !interactive && fi.any {
+            // First input at any frame takes over: cancel the auto-tumble + the 300-frame cap and
+            // switch to held-state control. The witness proves the input arrived on metal.
+            interactive = true;
+            let mut tb = Buf::new();
+            tb.put(b":: UVUG: interactive takeover at frame ");
+            tb.put_dec(frame);
+            tb.put(b" ::\n");
+            tb.flush();
         }
         if interactive {
             if fi.exit_key {
@@ -621,8 +637,9 @@ pub extern "C" fn _start() -> ! {
                 dist = (dist + ONE / 16).min(8 * ONE);
             }
             if dragging {
-                yaw += fi.mdx;
-                pit += fi.mdy;
+                // Pointer motion → rotation, scaled + per-frame clamped (see DRAG_DIV/DRAG_CLAMP).
+                yaw += (fi.mdx / DRAG_DIV).clamp(-DRAG_CLAMP, DRAG_CLAMP);
+                pit += (fi.mdy / DRAG_DIV).clamp(-DRAG_CLAMP, DRAG_CLAMP);
             }
             ay = (ay + yaw) & 0xFF;
             ax = (ax + pit) & 0xFF;
@@ -656,7 +673,8 @@ pub extern "C" fn _start() -> ! {
             if exit_key || exit_click || frame >= INTERACTIVE_CAP {
                 break;
             }
-        } else if committed_auto && frame >= AUTO_FRAMES {
+        } else if frame >= AUTO_FRAMES {
+            // No input has ever arrived (QEMU): the deterministic auto path ends at 300 frames.
             break;
         }
     }

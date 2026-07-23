@@ -524,6 +524,21 @@
   mouse, exiting on a click or ESC — the `:: UVUG: interactive exit=… ::` line is the metal-only witness. Lane:
   `crates/user-uvug` only (no kernel/syscall/boot/arroyo change — same crate, linker script, and build/stage
   path) + this doc.
+- **UVUG-4 (landed 2026-07-23)** — makes the interactive switch **input-driven** instead of time-boxed. P46 metal
+  showed UVUG never entered interactive mode: the old `DETECT_FRAMES` (60) fallback window elapsed in well under a
+  second at EL0 frame rates — the auto path committed and the checksum ran before a human could touch a key. The
+  fix drops the detection window entirely: the parent polls **SYS_INPUT_POLL every frame for the program's whole
+  life**, and the FIRST input event AT ANY FRAME flips it to interactive permanently — cancelling the auto-tumble
+  and the 300-frame cap and switching to held-state control. QEMU determinism is preserved automatically: raspi4b
+  has no USB HID, so zero events ever arrive, the 300-frame auto path + FNV-1a checksum run identically, and the
+  witness is byte-for-byte the same (`:: UVUG: frames=300 threads=2 checksum=0x48221e4101db3924 ::`, reproducible
+  across `kernel8-test` and `UNAOS_VUGPAR=1`). Two new/changed witnesses: `:: UVUG: interactive takeover at frame
+  <n> ::` prints at the switch (proving on metal that the input arrived and at which frame), and the exit line is
+  unchanged (`:: UVUG: interactive exit=<key|click> frames=<n> ::`). Drag-rotate is retuned toward the kernel
+  game-mode feel Peter flagged as awkward: the kernel `vug.rs` maps pointer motion 1 px = 1 brad with no scaling,
+  so instead of copying that this arc scales pointer delta down (`DRAG_DIV` = 8) and per-frame clamps it
+  (`DRAG_CLAMP` = 64 brad/axis) so a **full-panel drag ≈ one revolution** (256 brads over ~2048 px, panel ~1920 px
+  wide) and no single HID delta can spin past a quarter-turn in one frame. Lane: `crates/user-uvug` only + this doc.
 - Not yet: **revocation trees** (a derived copy — re-grant or onward re-transfer — escapes
   single-level revoke today; derivation records + `CAP_REVOKE` are that arc), the **bandy Ring-3
   delegation wrapper**, `File` transfer (descriptor migration), real `Socket` fs/net syscalls.
