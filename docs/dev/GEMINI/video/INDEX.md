@@ -6,7 +6,7 @@ Three pull sequences, numbered independently. Every pull = one BRIEF (coordinato
 ## Lane 1: Kepler FENCE (PFIFO/scheduler — kepler.rs) — `video/Kepler/`, files `*kepler-fence-pull<N>*` (pulls ≤13: `*kepler-pull<N>*`)
 | Pull | Files | Status | One-liner |
 |---|---|---|---|
-| 15 | BRIEF-kepler-fence-pull15-mirror-recon | BRIEFED — awaiting proposal (lane wakes: s17 proved the EVO method path) | read-only dense dump of method-mirror header 0x640000–0x6403FC |
+| 15 | BRIEF-kepler-fence-pull15-mirror-recon / PROPOSAL-kepler-fence-pull15 | LANDED 51b98bab (+inline orphan-var fixes) — metal owed s18 | read-only dense dump of method-mirror header 0x640000–0x6403FC; CTRL_ADDR ladder removed |
 | 14 | BRIEF-kepler-fence-pull14-ctrladdr / PROPOSAL-kepler-fence-pull14 | LANDED 384449d7; s13: REFUTED 12/12 (writes stick, witness never latched); recon: EVO 0x490=0D0500A9 live | PBDMA CTRL_ADDR TARGET audit; disp-era USERD = last in-family lead |
 | 13 | BRIEF-kepler-pull13-visibility / PROPOSAL-kepler-pull13 | LANDED d63a1495; s12: REFUTED (flush executed, strip persists) | PFIFO_FLUSH before validate — flush is not the missing step; pull 14 = pre-committed fallbacks |
 | 12 | BRIEF-kepler-pull12-poll-area-2 / PROPOSAL-kepler-pull12 | LANDED; s11: REFUTED (bit persists in inst, err=2) | USERD_HI bit31 test; SNOOP scrubbed |
@@ -20,7 +20,7 @@ Three pull sequences, numbered independently. Every pull = one BRIEF (coordinato
 ## Lane 2: Kepler DISPLAY (scanout — kepler_display.rs after split) — `video/Kepler/`, files `*kepler-display-pull<N>*`
 | Pull | Files | Status | One-liner |
 |---|---|---|---|
-| 8 | BRIEF-kepler-display-pull8-pattern | BRIEFED — awaiting proposal | same latch, quarters+leftbar pattern fill — decodes the bottom-band mapping |
+| 8 | BRIEF-kepler-display-pull8-pattern / PROPOSAL-kepler-display-pull8 | LANDED 3bb0621c — metal owed s18 | same latch, quarters+leftbar pattern fill — decodes the bottom-band mapping |
 | 7 | BRIEF-kepler-display-pull7-latch / PROPOSAL-kepler-display-pull7 | LANDED 9ff1a9c2; s17: ⭐ PROVEN — GREEN ON PANEL (first UnaOS pixels; latch works; armed-readout puzzle logged) | assembly write (0x640460) + UPDATE latch (0x640080), restore-paired |
 | 6 | BRIEF-kepler-display-pull6-assembly / PROPOSAL-kepler-display-pull6 | LANDED 41d26552; s16: DELIVERED — assembly state found (0x640460=0x200 in method-mirror record; UPDATE slot 0x640080) | read-only assembly-state hunt: 0x6101E0 neighborhood + widened scan + armed-pair check |
 | 5 | BRIEF-kepler-display-pull5-repoint / PROPOSAL-kepler-display-pull5 | LANDED 896faee0 (+2 inline fixes); s15: REFUTED — 0x6101E0 is read-only armed-state (write snaps back) | repoint 0x6101E0; arming evidently needs core-channel assembly + UPDATE latch |

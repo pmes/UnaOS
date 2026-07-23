@@ -197,7 +197,7 @@ pub fn init(gpu: &GpuInfo) {
             if let Some(inst_off) = vram_allocator.alloc(0x1000) {
                 if let Some(gpfifo_off) = vram_allocator.alloc(0x1000) {
                     if let Some(userd_off) = vram_allocator.alloc(0x1000) {
-                        if let Some(pb_off) = vram_allocator.alloc(64 * 1024) {
+                        if let Some(_pb_off) = vram_allocator.alloc(64 * 1024) {
                             if let Some(runlist_off) = vram_allocator.alloc(0x1000) {
                                 if let Some(fence_off) = vram_allocator.alloc(0x1000) {
                                     serial_println!("[NVIDIA] Allocated Channel Instance, GPFIFO, USERD, PushBuffer, Runlist, Fence.");
@@ -261,7 +261,7 @@ pub fn init(gpu: &GpuInfo) {
                                         core::ptr::write_volatile((bar1 + runlist_off + 20) as *mut u32, 0);
                                     }
 
-                                    let read_sched_status = |label: &str| {
+                                    let _read_sched_status = |label: &str| {
                                         let err = mmio_read(bar0, 0x252c);
                                         let stat = mmio_read(bar0, 0x263c);
                                         let err_str = if err == 0 || err == 0xFFFFFFFF || err == 0xBAD0BA20 { "absent?" } else { "present" };
@@ -355,7 +355,7 @@ impl PushBuffer {
     }
 
     /// Appends a 32-bit command word to the pushbuffer.
-    pub fn push(&mut self, word: u32) {
+    pub fn push(&mut self, _word: u32) {
         if self.write_ptr < self.capacity {
             // In a real implementation, we would write to the CPU-mapped virtual address of VRAM.
             // unsafe { core::ptr::write_volatile((self.vram_virt + self.write_ptr * 4) as *mut u32, word); }
