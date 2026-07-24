@@ -650,29 +650,11 @@ pub fn present_surface(surf: *const u8, w: u32, h: u32, stride: u32) {
     let x0 = fw.saturating_sub(dw) / 2;
     let y0 = fh.saturating_sub(dh) / 2;
 
-    for row in 0..h {
-        let row_base = row * stride;
-        for col in 0..w {
-            // Unaligned-safe read of the ARGB8888 pixel; low 24 bits are RRGGBB.
-            let px = unsafe {
-                core::ptr::read_unaligned(surf.add(row_base + col * 4) as *const u32)
-            } & 0x00FF_FFFF;
-            // Replicate the source pixel across its scale*scale destination block.
-            for sy in 0..scale {
-                let dy = y0 + row * scale + sy;
-                for sx in 0..scale {
-                    fb.put_pixel(x0 + col * scale + sx, dy, px);
-                }
-            }
-        }
-    }
-
-    // Clean the touched rows for the non-coherent scan-out (superset: whole rows [y0, y0+dh)).
-    let row_bytes = info.stride * info.bytes_per_pixel;
-    let y_end = (y0 + dh).min(fh);
-    if y_end > y0 {
-        fb.flush_range(y0 * row_bytes, (y_end - y0) * row_bytes);
-    }
+    // WC-A: hand the blit to the compositor's compat window. The geometry above is unchanged, and a
+    // compat window carries no chrome and flushes exactly the rows [y0, y0+dh) this path always
+    // flushed, so the panel output is byte-for-byte what the pre-WC present produced — the shim is a
+    // routing change, not a rendering change.
+    super::wm::compat_present(surf as usize, w, h, stride, scale, x0, y0);
 
     // First present only — no per-frame witness spam.
     if !UVUG2_WITNESSED.swap(true, core::sync::atomic::Ordering::Relaxed) {

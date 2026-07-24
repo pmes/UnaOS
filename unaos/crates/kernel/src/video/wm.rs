@@ -115,6 +115,9 @@ struct Window {
     /// window is centered with the legacy scale rule and gets NO chrome, so the pre-WC UVUG present
     /// stays byte-for-byte identical on the panel.
     compat: bool,
+    /// Set by [`move_to`]: the caller placed this window explicitly, so the automatic tiling in
+    /// [`place`] leaves it where it is.
+    pinned: bool,
 }
 
 impl Window {
@@ -135,6 +138,7 @@ impl Window {
             title: [0u8; MAX_TITLE],
             title_len: 0,
             compat: false,
+            pinned: false,
         }
     }
 }
@@ -168,6 +172,53 @@ pub fn create(owner_asid: u64, surf: usize, w: u32, h: u32, stride: u32, title: 
     create_inner(owner_asid, surf, w as usize, h as usize, stride as usize, title, false)
 }
 
+/// The compat window's id (`WIN_NONE` until the first `present_surface` call), so the shim reuses
+/// one table row instead of leaking one per frame.
+static COMPAT_WIN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(WIN_NONE);
+
+/// WC-A — the compat path for [`super::screen::present_surface`] (`SYS_FB_PRESENT`, pre-window
+/// apps). Creates the auto window on first call and thereafter updates it in place, then composites.
+///
+/// The caller supplies the geometry it has always computed (the legacy centered placement and
+/// integer scale), and the compat row is marked `compat` so the compositor draws NO chrome and
+/// flushes exactly the rows the legacy blit did — the panel output stays byte-for-byte what the
+/// pre-WC UVUG run produced.
+pub(super) fn compat_present(
+    surf: usize,
+    w: usize,
+    h: usize,
+    stride: usize,
+    scale: usize,
+    x: usize,
+    y: usize,
+) {
+    use core::sync::atomic::Ordering;
+    let mut id = COMPAT_WIN.load(Ordering::Relaxed);
+    if id == WIN_NONE || owner_of(id).is_none() {
+        id = create_inner(0, surf, w, h, stride, b"", true);
+        if id == WIN_NONE {
+            return;
+        }
+        COMPAT_WIN.store(id, Ordering::Relaxed);
+    }
+    {
+        let mut t = TABLE.lock();
+        let r = match row_mut(&mut t, id) {
+            Some(r) => r,
+            None => return,
+        };
+        r.surf = surf;
+        r.w = w;
+        r.h = h;
+        r.stride = stride;
+        r.scale = scale;
+        r.x = x;
+        r.y = y;
+        r.damaged = true;
+    }
+    composite();
+}
+
 /// Mark `id` damaged and composite. This is the whole present path: WC-B's `SYS_WIN_PRESENT`
 /// performs its ownership check, its checksum and its focused-present accounting, then calls this.
 ///
@@ -194,6 +245,7 @@ pub fn move_to(id: WinId, x: usize, y: usize) -> bool {
         Some(r) => {
             r.x = x.max(BORDER);
             r.y = y.max(TITLE_H + BORDER);
+            r.pinned = true;
             r.damaged = true;
             true
         }
@@ -204,29 +256,73 @@ pub fn move_to(id: WinId, x: usize, y: usize) -> bool {
 /// Close `id`, freeing its table row. The surface itself belongs to the owner's address space and is
 /// not touched here — WC-B unmaps it. Returns `false` if `id` names no live window.
 pub fn close(id: WinId) -> bool {
-    let mut t = TABLE.lock();
-    match row_mut(&mut t, id) {
-        Some(r) => {
-            *r = Window::empty();
-            true
+    let vacated = {
+        let mut t = TABLE.lock();
+        match row_mut(&mut t, id) {
+            Some(r) => {
+                let b = outer_box(r);
+                *r = Window::empty();
+                b
+            }
+            None => return false,
         }
-        None => false,
-    }
+    };
+    #[cfg(feature = "witness")]
+    serial_println!("[wc-a] close win={}", id);
+    erase(&[vacated]);
+    place(WIN_NONE);
+    composite();
+    true
 }
 
 /// Close every window owned by `owner_asid` and return how many rows were freed. Task teardown
 /// (`clear_handle_row`) calls this so a dead ASID can never leave a window compositing from a
 /// surface whose address space is gone.
 pub fn close_owner(owner_asid: u64) -> usize {
-    let mut t = TABLE.lock();
+    let mut vacated = [(0usize, 0usize, 0usize, 0usize); MAX_WINDOWS];
     let mut n = 0;
-    for r in t.rows.iter_mut() {
-        if r.used && r.owner_asid == owner_asid {
-            *r = Window::empty();
-            n += 1;
+    {
+        let mut t = TABLE.lock();
+        for r in t.rows.iter_mut() {
+            if r.used && r.owner_asid == owner_asid {
+                vacated[n] = outer_box(r);
+                *r = Window::empty();
+                n += 1;
+            }
         }
     }
+    if n == 0 {
+        return 0;
+    }
+    #[cfg(feature = "witness")]
+    serial_println!("[wc-a] close_owner asid={:#x} closed={}", owner_asid, n);
+    erase(&vacated[..n]);
+    place(WIN_NONE);
+    composite();
     n
+}
+
+/// Paint the given outer boxes black and clean them for the scan-out — the panel area a closed
+/// window vacated. Windows that overlapped it are repainted by the [`composite`] that follows
+/// (closing damages the whole live set through [`place`]).
+fn erase(boxes: &[(usize, usize, usize, usize)]) {
+    let fb = *super::WRITER.lock();
+    if !fb.is_ready() {
+        return;
+    }
+    let info = fb.info();
+    let row_bytes = info.stride * info.bytes_per_pixel;
+    for &(x, y, w, h) in boxes {
+        if w == 0 || h == 0 {
+            continue;
+        }
+        fb.fill_rect(x, y, w, h, 0);
+        let y0 = y.min(info.height);
+        let y1 = (y + h).min(info.height);
+        if y1 > y0 {
+            fb.flush_range(y0 * row_bytes, (y1 - y0) * row_bytes);
+        }
+    }
 }
 
 /// The ASID owning `id`, or `None` if `id` names no live window. The ownership gate WC-B's verbs use:
@@ -262,13 +358,172 @@ pub fn count() -> usize {
 /// damage flag, and clean the touched rows for the non-coherent scan-out. A no-op when nothing is
 /// damaged or the framebuffer is not ready.
 ///
-/// Implemented in WC-A2; this commit fixes the API so WC-B can code against it.
+/// Occlusion: repainting a damaged window would erase any window stacked ON TOP of it, so the damage
+/// set is closed upwards first — every higher-z window whose outer box overlaps a damaged one is
+/// repainted too (transitively). Back-to-front order then yields the correct stack.
+///
+/// The table lock is taken only to snapshot the rows and clear their damage flags; every framebuffer
+/// write and cache clean happens after it is released, so a present never holds the window lock
+/// across a scan-out flush.
 pub fn composite() {
-    // WC-A2 fills this in. Until then the compat shim in `screen::present_surface` still paints the
-    // panel on its own path, so the existing UVUG present is unaffected by this commit.
-    let mut t = TABLE.lock();
-    for r in t.rows.iter_mut() {
-        r.damaged = false;
+    let (rows, mut dirty) = {
+        let mut t = TABLE.lock();
+        let mut dirty = [false; MAX_WINDOWS];
+        for (i, r) in t.rows.iter_mut().enumerate() {
+            dirty[i] = r.used && r.damaged;
+            r.damaged = false;
+        }
+        (t.rows, dirty)
+    };
+
+    // Close the damage set upwards over occlusion, to a fixed point (at most MAX_WINDOWS passes).
+    for _ in 0..MAX_WINDOWS {
+        let mut grew = false;
+        for i in 0..MAX_WINDOWS {
+            if !dirty[i] {
+                continue;
+            }
+            let bi = outer_box(&rows[i]);
+            for j in 0..MAX_WINDOWS {
+                if dirty[j] || !rows[j].used || rows[j].z <= rows[i].z {
+                    continue;
+                }
+                if boxes_overlap(bi, outer_box(&rows[j])) {
+                    dirty[j] = true;
+                    grew = true;
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+
+    let fb = *super::WRITER.lock();
+    if !fb.is_ready() {
+        return;
+    }
+
+    // Back-to-front: ascending z, ties by id (creation order).
+    let mut order = [0usize; MAX_WINDOWS];
+    for (i, slot) in order.iter_mut().enumerate() {
+        *slot = i;
+    }
+    order.sort_unstable_by_key(|&i| (rows[i].z, rows[i].id));
+
+    let mut drawn = 0usize;
+    for &i in order.iter() {
+        if !rows[i].used || !dirty[i] {
+            continue;
+        }
+        draw_window(&fb, &rows[i]);
+        drawn += 1;
+    }
+
+    #[cfg(feature = "witness")]
+    if drawn > 0 && !COMPOSITE_WITNESSED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        let live = rows.iter().filter(|r| r.used).count();
+        serial_println!("[wc-a] composite windows={} drawn={}", live, drawn);
+    }
+    let _ = drawn;
+}
+
+/// WC-A — whether the first `[wc-a] composite` witness has been emitted (first composite only; a
+/// mini-vug run presents ~300 frames and per-frame witness spam would drown the serial log).
+#[cfg(feature = "witness")]
+static COMPOSITE_WITNESSED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// WC-A — kernel chrome colours (0x00RRGGBB, the `put_pixel` convention; the panel's RGB/BGR layout
+/// is applied by `FrameBuffer`). Deliberately flat and un-host-like: this is UnaOS chrome, not an
+/// imitation of anyone's title bar.
+const CHROME_BORDER: u32 = 0x003A_3A46;
+const CHROME_TITLE_BG: u32 = 0x001E_1E28;
+const CHROME_TITLE_FG: u32 = 0x00C8_C8D8;
+
+/// The outer box `(x, y, w, h)` a window occupies on the panel, chrome included. A compat window
+/// (the `present_surface` shim) has no chrome, so its outer box is exactly its content.
+fn outer_box(r: &Window) -> (usize, usize, usize, usize) {
+    let (cw, ch) = (r.w * r.scale, r.h * r.scale);
+    if r.compat {
+        (r.x, r.y, cw, ch)
+    } else {
+        (
+            r.x.saturating_sub(BORDER),
+            r.y.saturating_sub(TITLE_H + BORDER),
+            cw + 2 * BORDER,
+            ch + TITLE_H + 2 * BORDER,
+        )
+    }
+}
+
+fn boxes_overlap(a: (usize, usize, usize, usize), b: (usize, usize, usize, usize)) -> bool {
+    a.0 < b.0 + b.2 && b.0 < a.0 + a.2 && a.1 < b.1 + b.3 && b.1 < a.1 + a.3
+}
+
+/// Paint one window: chrome (border frame + title strip + title text), then the surface content
+/// nearest-neighbour upscaled by `scale`, then one cache clean over the rows it touched so the
+/// non-coherent Pi 4 HVS scan-out sees the new pixels. All writes are `put_pixel`/`fill_rect` on a
+/// `Copy` `FrameBuffer` handle (volatile stores, no aliased `&mut`), the same discipline
+/// `Screen::flush` and the legacy `present_surface` use.
+fn draw_window(fb: &super::FrameBuffer, r: &Window) {
+    if r.surf == 0 || r.w == 0 || r.h == 0 || r.scale == 0 {
+        return;
+    }
+    let (bx, by, bw, bh) = outer_box(r);
+    if !r.compat {
+        // Frame: fill the whole outer box in the border colour, then lay the title strip and the
+        // content over it. The only pixels that survive are the 1-px frame itself.
+        fb.fill_rect(bx, by, bw, bh, CHROME_BORDER);
+        fb.fill_rect(bx + BORDER, by + BORDER, bw.saturating_sub(2 * BORDER), TITLE_H, CHROME_TITLE_BG);
+        draw_title(fb, r, bx + BORDER + 2, by + BORDER + 2, bw.saturating_sub(2 * BORDER + 4));
+    }
+
+    let surf = r.surf as *const u8;
+    for row in 0..r.h {
+        let row_base = row * r.stride;
+        for col in 0..r.w {
+            // Unaligned-safe read of the ARGB8888 pixel; low 24 bits are RRGGBB (alpha ignored —
+            // this arc composites opaquely).
+            let px = unsafe { core::ptr::read_unaligned(surf.add(row_base + col * 4) as *const u32) }
+                & 0x00FF_FFFF;
+            for sy in 0..r.scale {
+                let dy = r.y + row * r.scale + sy;
+                for sx in 0..r.scale {
+                    fb.put_pixel(r.x + col * r.scale + sx, dy, px);
+                }
+            }
+        }
+    }
+
+    // Clean the touched rows (superset: whole scanlines of the outer box) for the non-coherent
+    // scan-out — one `DC CVAC` sweep per window, not one per scanline. No-op on coherent targets.
+    let info = fb.info();
+    let row_bytes = info.stride * info.bytes_per_pixel;
+    let y0 = by.min(info.height);
+    let y1 = (by + bh).min(info.height);
+    if y1 > y0 {
+        fb.flush_range(y0 * row_bytes, (y1 - y0) * row_bytes);
+    }
+}
+
+/// Draw the kernel's copy of the window title into the title strip, 8x8 glyphs, clipped to `max_w`
+/// pixels. Non-printable bytes render as a space, so a hostile title can only ever paint blanks.
+fn draw_title(fb: &super::FrameBuffer, r: &Window, x: usize, y: usize, max_w: usize) {
+    let cols = max_w / 8;
+    for (i, &b) in r.title[..r.title_len].iter().enumerate() {
+        if i >= cols {
+            break;
+        }
+        let ch = if (0x20..0x7f).contains(&b) { b } else { b' ' };
+        let bitmap = font8x8::legacy::BASIC_LEGACY[ch as usize];
+        for (ry, byte) in bitmap.iter().enumerate() {
+            for rx in 0..8 {
+                if byte & (1 << rx) != 0 {
+                    fb.put_pixel(x + i * 8 + rx, y + ry, CHROME_TITLE_FG);
+                }
+            }
+        }
     }
 }
 
@@ -319,11 +574,65 @@ fn create_inner(
     t.rows[slot] = row;
     drop(t);
     place(id);
+    #[cfg(feature = "witness")]
+    if !compat {
+        if let Some(i) = info(id) {
+            serial_println!(
+                "[wc-a] create win={} asid={:#x} surf={}x{} stride={} scale={}x at ({},{}) z={}",
+                i.id, i.owner_asid, i.w, i.h, stride, i.scale, i.x, i.y, i.z
+            );
+        }
+    }
     id
 }
 
 /// Choose `id`'s scale and on-panel origin. WC-A2 tiles windows left-to-right; the compat window is
 /// placed by the legacy centering rule at composite time and is skipped here.
-fn place(id: WinId) {
-    let _ = id; // WC-A2
+/// WC-A — gap in panel pixels between tiled windows (and from the panel edge).
+const GAP: usize = 8;
+
+/// Lay out every non-compat, non-pinned window: pick each one's integer scale, then pack the outer
+/// boxes left-to-right in id order, wrapping to a new row when the next box would run off the panel.
+/// Called whenever the window set changes, so the tiling stays deterministic (it depends only on the
+/// live set, not on the order of creates and closes). A window the caller has explicitly [`move_to`]d
+/// is pinned and keeps its position.
+///
+/// Scale rule: the largest integer factor whose scaled surface fits half the panel width and half its
+/// height — big enough that a 32x32 surface is legible on a 1920-wide panel, small enough that two
+/// windows sit side-by-side. Never 0.
+fn place(_created: WinId) {
+    // Read the panel geometry BEFORE taking the table lock: `composite` takes the table lock and
+    // releases it before touching `WRITER`, so no path ever holds both — no lock-order inversion.
+    let fb = *super::WRITER.lock();
+    if !fb.is_ready() {
+        return;
+    }
+    let info = fb.info();
+    let (pw, ph) = (info.width, info.height);
+
+    let mut t = TABLE.lock();
+    let mut cx = GAP;
+    let mut cy = GAP + TITLE_H + BORDER;
+    let mut row_h = 0usize;
+    for i in 0..MAX_WINDOWS {
+        let r = &t.rows[i];
+        if !r.used || r.compat || r.pinned {
+            continue;
+        }
+        let (w, h) = (r.w.max(1), r.h.max(1));
+        let scale = ((pw / 2 / w).min(ph / 2 / h)).max(1);
+        let (bw, bh) = (w * scale + 2 * BORDER, h * scale + TITLE_H + 2 * BORDER);
+        if cx + bw > pw && cx > GAP {
+            cx = GAP;
+            cy += row_h + GAP;
+            row_h = 0;
+        }
+        let r = &mut t.rows[i];
+        r.scale = scale;
+        r.x = cx + BORDER;
+        r.y = cy;
+        r.damaged = true;
+        cx += bw + GAP;
+        row_h = row_h.max(bh);
+    }
 }
