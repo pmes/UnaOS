@@ -224,7 +224,7 @@ pub unsafe fn takeover_display(
     let capped = if hits > 64 { "true" } else { "false" };
     serial_println!(":: kdisp: evo-scan done range=610000-613FFC hits={} capped={} ::", hits, capped);
 
-    // ── Phase 2: Assembly Write + UPDATE Latch (Pull 10) ────────────────────
+    // ── Phase 2: Assembly Write + UPDATE Latch (Pull 11) ────────────────────
     if !cfg!(feature = "nvidia-kepler-takeover") {
         serial_println!(":: kdisp: trace-only — takeover feature not set ::");
         return None;
@@ -242,61 +242,17 @@ pub unsafe fn takeover_display(
     let expected_pitch = expected_width * 4;
     let fb_size = (expected_width * expected_height * 4) as usize;
 
-    // 1. Prepare surf2 (pre-swizzled ruler pattern fill at VRAM + 0x1600000)
     let bar1 = vram_base;
     let surf2_offset = 0x1600000;
     let dst = (bar1 + surf2_offset) as *mut u8;
     
     serial_println!(":: kdisp: surf2 geom w={} h={} pitch={} ::", expected_width, expected_height, expected_pitch);
     
-    // GOB transform parameters (Block height = 1 GOB)
+    // GOB dimensions (fixed 64x8 bytes)
     let gob_width_bytes = 64;
     let gob_height = 8;
+    let gob_size_bytes = 512;
     let gobs_per_row = expected_pitch / gob_width_bytes;
-    let gob_size_bytes = gob_width_bytes * gob_height;
-
-    for y in 0..expected_height {
-        let block_color = match (y / 64) % 8 {
-            0 => 0xFFFF0000, // RED
-            1 => 0xFF00FF00, // GREEN
-            2 => 0xFF0000FF, // BLUE
-            3 => 0xFFFFFF00, // YELLOW
-            4 => 0xFF00FFFF, // CYAN
-            5 => 0xFFFF00FF, // MAGENTA
-            6 => 0xFFFFFFFF, // WHITE
-            _ => 0xFF404040, // GRAY
-        };
-        
-        let row_color = if y % 64 == 0 {
-            0xFF000000 // BLACK
-        } else {
-            block_color
-        };
-        
-        let gob_y = y / gob_height;
-        let inner_y = y % gob_height;
-        
-        for x in 0..expected_width {
-            let final_color = if x < 256 {
-                0xFFFFFFFF // WHITE
-            } else if x < 264 {
-                0xFF000000 // BLACK
-            } else {
-                row_color
-            };
-            
-            let px_byte_x = x * 4;
-            let gob_x = px_byte_x / gob_width_bytes;
-            let inner_x = px_byte_x % gob_width_bytes;
-            
-            let gob_index = (gob_y * gobs_per_row) + gob_x;
-            let target_byte_addr = (gob_index * gob_size_bytes) + (inner_y * gob_width_bytes) + inner_x;
-            let target_ptr = dst.add(target_byte_addr as usize) as *mut u32;
-            
-            core::ptr::write_volatile(target_ptr, final_color);
-        }
-    }
-    serial_println!(":: kdisp: surf2 prep off=01600000 bytes={:08X} pattern=ruler64x8-gob64x8 ::", fb_size);
 
     // 2. Pre-state
     let asm_reg = 0x640460;
@@ -309,73 +265,93 @@ pub unsafe fn takeover_display(
     let pre_shadow = mmio_read(bar0, shadow_reg);
     serial_println!(":: kdisp: latch pre asm={:08X} armed={:08X} shadow={:08X} ::", pre_asm, pre_armed, pre_shadow);
 
-    // 3. Write 0x640460 = 0x00016000
+    let bh_steps = [2, 4, 8, 16];
     let new_ptr = 0x00016000;
-    mmio_write(bar0, asm_reg, new_ptr);
-    let rb_asm = mmio_read(bar0, asm_reg);
-    serial_println!(":: kdisp: latch asm-wrote=00016000 rb={:08X} ::", rb_asm);
 
-    // 4. Self-check hold (~2s)
-    for t in 1..=2 {
-        for _ in 0..60_000_000 { core::hint::spin_loop(); }
-        let armed = mmio_read(bar0, armed_reg);
-        serial_println!(":: kdisp: latch selfcheck t={}s armed={:08X} ::", t, armed);
-    }
-
-    if rb_asm != new_ptr {
-        // Honesty rule: skip the update write AND skip restore if asm didn't stick
-        serial_println!(":: kdisp: latch skip — asm rb unchanged ::");
-        
-        // 6 (skip) & 7: Re-read the three registers, report, verdict
-        let final_asm = mmio_read(bar0, asm_reg);
-        let final_armed = mmio_read(bar0, armed_reg);
-        let final_shadow = mmio_read(bar0, shadow_reg);
-        serial_println!(":: kdisp: latch restored asm={:08X} armed={:08X} shadow={:08X} ::", final_asm, final_armed, final_shadow);
-        serial_println!(":: kdisp: latch verdict asm-stuck=n armed-followed=n ::");
-        return None;
-    }
-
-    // 5. UPDATE Latch
-    mmio_write(bar0, update_reg, 0x00000000);
-    let rb_update = mmio_read(bar0, update_reg);
-    serial_println!(":: kdisp: latch update-wrote rb0080={:08X} ::", rb_update);
-
-    // ~8 s hold polling 0x6101E0 and HEAD_STAT vertical once/s.
-    // Head 0 HEAD_STAT base is 0x6000 + 0 = 0x6000, vert is +0x340.
-    let hs_vert_reg = regs::NV_PDISPLAY_BASE + 0x6340; 
-    let mut last_hold_armed = pre_armed;
-    for t in 1..=8 {
-        for _ in 0..60_000_000 { core::hint::spin_loop(); }
-        let armed = mmio_read(bar0, armed_reg);
-        let vert = mmio_read(bar0, hs_vert_reg);
-        last_hold_armed = armed;
-        serial_println!(":: kdisp: latch hold t={}s armed={:08X} stat vert={:08X} ::", t, armed, vert);
-        
-        if t == 4 {
-            let p_616340 = mmio_read(bar0, 0x616340);
-            let p_61634c = mmio_read(bar0, 0x61634C);
-            let p_61d1e0 = mmio_read(bar0, 0x61D1E0);
-            let p_61d014 = mmio_read(bar0, 0x61D014);
-            serial_println!(":: kdisp: latch midhold 616340={:08X} 61634C={:08X} 6101E0={:08X} 61D1E0={:08X} 61D014={:08X} ::",
-                p_616340, p_61634c, armed, p_61d1e0, p_61d014);
+    for &bh in &bh_steps {
+        // Step 1: Prepare surf2 (pre-swizzled ruler pattern fill)
+        for y in 0..expected_height {
+            let block_color = match (y / 64) % 8 {
+                0 => 0xFFFF0000, // RED
+                1 => 0xFF00FF00, // GREEN
+                2 => 0xFF0000FF, // BLUE
+                3 => 0xFFFFFF00, // YELLOW
+                4 => 0xFF00FFFF, // CYAN
+                5 => 0xFFFF00FF, // MAGENTA
+                6 => 0xFFFFFFFF, // WHITE
+                _ => 0xFF404040, // GRAY
+            };
+            
+            let row_color = if y % 64 == 0 {
+                0xFF000000 // BLACK
+            } else {
+                block_color
+            };
+            
+            let gob_y = y / gob_height;
+            let inner_y = y % gob_height;
+            let blk_y = gob_y / bh;
+            let blk_inner = gob_y % bh;
+            
+            for x in 0..expected_width {
+                let final_color = if x < 256 {
+                    0xFFFFFFFF // WHITE
+                } else if x < 264 {
+                    0xFF000000 // BLACK
+                } else {
+                    row_color
+                };
+                
+                let px_byte_x = x * 4;
+                let gob_x = px_byte_x / gob_width_bytes;
+                let inner_x = px_byte_x % gob_width_bytes;
+                
+                let blk_index = (blk_y * gobs_per_row) + gob_x;
+                let target_byte_addr = (blk_index * (bh * gob_size_bytes)) 
+                                     + (blk_inner * gob_size_bytes) 
+                                     + (inner_y * gob_width_bytes) 
+                                     + inner_x;
+                
+                let target_ptr = dst.add(target_byte_addr as usize) as *mut u32;
+                core::ptr::write_volatile(target_ptr, final_color);
+            }
         }
+        serial_println!(":: kdisp: surf2 prep off=01600000 bytes={:08X} pattern=ruler64x8-gob64x8-bh{} ::", fb_size, bh);
+        serial_println!(":: kdisp: bh-step bh={} fill done ::", bh);
+
+        // Step 2: Latch Sequence
+        mmio_write(bar0, asm_reg, new_ptr);
+        let rb_asm = mmio_read(bar0, asm_reg);
+        
+        if rb_asm != new_ptr {
+            serial_println!(":: kdisp: latch skip — asm rb unchanged ::");
+            let final_asm = mmio_read(bar0, asm_reg);
+            let final_armed = mmio_read(bar0, armed_reg);
+            let final_shadow = mmio_read(bar0, shadow_reg);
+            serial_println!(":: kdisp: latch restored asm={:08X} armed={:08X} shadow={:08X} ::", final_asm, final_armed, final_shadow);
+            serial_println!(":: kdisp: latch verdict asm-stuck=n armed-followed=n ::");
+            return None;
+        }
+
+        mmio_write(bar0, update_reg, 0x00000000);
+        
+        // 4 s hold
+        for t in 1..=4 {
+            for _ in 0..60_000_000 { core::hint::spin_loop(); }
+            serial_println!(":: kdisp: bh-step bh={} hold t={}s ::", bh, t);
+        }
+
+        // Step 3: Restore
+        mmio_write(bar0, asm_reg, pre_asm);
+        mmio_write(bar0, update_reg, 0x00000000);
+        
+        // 1 s recovery gap
+        for _ in 0..15_000_000 { core::hint::spin_loop(); }
+        serial_println!(":: kdisp: bh-step bh={} done ::", bh);
     }
-
-    // 6. Restore
-    mmio_write(bar0, asm_reg, pre_asm);
-    mmio_write(bar0, update_reg, 0x00000000);
     
-    for _ in 0..120_000_000 { core::hint::spin_loop(); } // ~2s hold
-
-    let final_asm = mmio_read(bar0, asm_reg);
-    let final_armed = mmio_read(bar0, armed_reg);
-    let final_shadow = mmio_read(bar0, shadow_reg);
-    serial_println!(":: kdisp: latch restored asm={:08X} armed={:08X} shadow={:08X} ::", final_asm, final_armed, final_shadow);
-
     // 7. Verdict
-    let asm_stuck = if rb_asm == new_ptr { "y" } else { "n" };
-    let armed_followed = if last_hold_armed == new_ptr { "y" } else { "n" };
-    serial_println!(":: kdisp: latch verdict asm-stuck={} armed-followed={} ::", asm_stuck, armed_followed);
+    serial_println!(":: kdisp: latch verdict asm-stuck=y ::");
 
     None
 }
