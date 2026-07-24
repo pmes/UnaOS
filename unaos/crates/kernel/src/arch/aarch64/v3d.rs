@@ -1629,17 +1629,159 @@ fn refute_tmuwcf_drain_candidate() {
     );
 }
 
-fn wait_fldone(what: &str) -> (u32, u64, bool) {
+/// PI-V3D-54 (RANK 1) — a single-register transition tracker for the CL-progression time-series.
+/// Instead of retaining the ~500 raw ~1 ms samples across the 0.5 s retire-wait, we fold each register
+/// into first value / last value / number of distinct changes / the µs of the FIRST move off `first` /
+/// the µs of the LAST change (the stall point). Five of these (CT0CA, CT0CS, CT0LC, CT0PC, BPCA) give
+/// the compact `[v3d54] trace` line: start offset, stall offset, end offset — the fetches-but-stalls vs
+/// never-fetches discriminator the single-shot post-wait sampling was hiding (see the design brief).
+#[derive(Clone, Copy)]
+struct TraceReg {
+    first: u32,
+    last: u32,
+    changes: u32,
+    first_move_us: u32,
+    last_change_us: u32,
+}
+
+impl TraceReg {
+    fn new(v: u32) -> Self {
+        Self { first: v, last: v, changes: 0, first_move_us: 0, last_change_us: 0 }
+    }
+    fn update(&mut self, v: u32, us: u32) {
+        if v != self.last {
+            if self.changes == 0 {
+                self.first_move_us = us;
+            }
+            self.changes += 1;
+            self.last_change_us = us;
+            self.last = v;
+        }
+    }
+}
+
+/// PI-V3D-54 (RANK 1) — emit the folded CL-progression time-series for one CT0 bin kick. `ba`/`ea` are the
+/// submitted [begin, end) CL bounds so CT0CA is reported as a byte OFFSET into the list; BPCA is reported
+/// raw + as an advance delta off its first sample (the PTB write pointer climbing = primitive bytes
+/// emitted). The interpretation names the fork: CT0CA never leaves BA (never-fetches → RANK 2 submission
+/// audit decides), CT0CA stalls mid-list (fetches-but-chokes at that offset), or CT0CA reaches EA (CLE
+/// walked the whole list → the wall is downstream of the CLE).
+#[allow(clippy::too_many_arguments)]
+fn emit_v3d54_trace(
+    what: &str,
+    ba: u32,
+    ea: u32,
+    samples: u32,
+    span_us: u64,
+    ca: &TraceReg,
+    cs: &TraceReg,
+    lc: &TraceReg,
+    pc: &TraceReg,
+    bpca: &TraceReg,
+) {
+    let ca_off = |v: u32| v.wrapping_sub(ba);
+    let ca_first_off = ca_off(ca.first);
+    let ca_last_off = ca_off(ca.last);
+    let reached_ea = ca.last == ea;
+    let never_left_ba = ca.changes == 0 && ca.last == ba;
+    let bpca_adv = bpca.last.wrapping_sub(bpca.first);
+    let interp: &str = if never_left_ba {
+        "CT0CA NEVER left BA across the whole wait — the CLE never fetched the list; the GO was a no-op or the list is mis-submitted (the [v3d54] submit audit decides BA/EA/length)"
+    } else if reached_ea {
+        if bpca_adv != 0 {
+            "CT0CA walked BA->EA (whole list consumed) and BPCA advanced — the CLE ran the list and the PTB emitted primitive bytes; the missing retire is downstream (FLDONE/BFC generation), not the CLE walk"
+        } else {
+            "CT0CA walked BA->EA (whole list consumed) but BPCA never advanced — the CLE stepped every packet yet the PTB wrote no primitive-list bytes; the wall is the PTB write / frame-close, not the CLE walk"
+        }
+    } else {
+        "CT0CA advanced off BA then STALLED mid-list at the offset above — the CLE choked on the packet at that byte offset (fetches-but-stalls)"
+    };
+    serial_println!(
+        ":: V3D: [v3d54] trace ({}) samples={} span={}us BA={:#010x} EA={:#010x}(len={}) | CT0CA off {:#x}->{:#x}{} moves={} first_move={}us stall@{}us | CT0CS first={:#010x} last={:#010x}(CTRUN {}->{}) changes={} | CT0LC {:#x}->{:#x} | CT0PC {:#x}->{:#x} | BPCA {:#010x}->{:#010x} adv={:#x} moves={} — {} ::",
+        what, samples, span_us, ba, ea, ea.wrapping_sub(ba),
+        ca_first_off, ca_last_off,
+        if reached_ea { "(=EA)" } else if never_left_ba { "(=BA)" } else { "(mid)" },
+        ca.changes, ca.first_move_us, ca.last_change_us,
+        cs.first, cs.last,
+        (cs.first & V3D_CLE_CTNCS_CTRUN != 0) as u32,
+        (cs.last & V3D_CLE_CTNCS_CTRUN != 0) as u32,
+        cs.changes,
+        lc.first, lc.last,
+        pc.first, pc.last,
+        bpca.first, bpca.last, bpca_adv, bpca.changes,
+        interp,
+    );
+}
+
+/// PI-V3D-54 (RANK 2) — the empty-bisect submission audit. Read BACK the latched CT0 queue registers
+/// (CT0QBA/CT0QEA) after the GO and compare against the intended [BA,EA) and the CL byte length we built.
+/// Returns whether the latched span is SOUND (CT0QBA==BA, CT0QEA==EA, EA−BA == built length, non-empty).
+/// A mis-latched EA (==BA, or a span that does not match the built length) means the CLE was handed a
+/// DIFFERENT list than we composed — a non-retire is then a submission artifact, not a frame-close failure,
+/// and the whole "empty frame must retire" premise is being tested against a list that never ran.
+fn v3d54_submit_audit(what: &str, ba: u32, ea: u32, len: usize) -> bool {
+    let qba = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0QBA);
+    let qea = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0QEA);
+    let latched_span = qea.wrapping_sub(qba);
+    let ba_ok = qba == ba;
+    let ea_ok = qea == ea;
+    let empty_latch = qea == qba;
+    let span_ok = latched_span as usize == len;
+    let sound = ba_ok && ea_ok && span_ok && !empty_latch && len != 0;
+    serial_println!(
+        ":: V3D: [v3d54] submit ({}) — intended BA={:#010x} EA={:#010x} len={} | latched CT0QBA={:#010x} CT0QEA={:#010x} span={} — BA {} EA {} span {} — {} ::",
+        what, ba, ea, len, qba, qea, latched_span,
+        if ba_ok { "OK" } else { "MISMATCH" },
+        if ea_ok { "OK" } else { "MISMATCH" },
+        if span_ok { "OK" } else { "MISMATCH" },
+        if sound {
+            "submission SOUND — the CLE was handed exactly the [BA,EA) list we built; a non-retire here is a genuine frame-close fact, not a submission artifact"
+        } else if empty_latch {
+            "EA==BA LATCHED — the GO enqueued a ZERO-length list; the CLE has nothing to walk. This is a submission defect, NOT a frame-close failure — the empty-frame premise sits on a list that never ran (see the [v3d54] resubmit)"
+        } else {
+            "latched span != built length — the CLE will walk a DIFFERENT list than we composed; the retire verdict is a submission artifact (see the [v3d54] resubmit)"
+        }
+    );
+    sound
+}
+
+/// PI-V3D-54 (RANK 1): poll the CL-progression time-series across the retire-wait (not once after it).
+/// `trace_ba`/`trace_ea` are the submitted CL bounds for the `[v3d54] trace` fold; sampling runs at ~1 ms
+/// cadence and is summarised (transitions, not raw samples) on BOTH the FLDONE-retire and timeout exits.
+fn wait_fldone(what: &str, trace_ba: u32, trace_ea: u32) -> (u32, u64, bool) {
     let frq = super::timer::cntfrq();
     let start = super::timer::cntpct();
     let deadline = start + frq / 2; // ~0.5 s, matching wait_bit_clear's backstop
+    // PI-V3D-54: ~1 ms sampling cadence in counter units; fold the five CL/PTB progression registers.
+    let sample_tick = (frq / 1000).max(1);
+    let mut next_sample = start;
+    let mut samples: u32 = 0;
+    let mut t_ca = TraceReg::new(mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CA));
+    let mut t_cs = TraceReg::new(mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CS));
+    let mut t_lc = TraceReg::new(mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0LC));
+    let mut t_pc = TraceReg::new(mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0PC));
+    let mut t_bpca = TraceReg::new(mmio_read(V3D_CORE0_BASE, V3D_PTB_BPCA));
     loop {
+        let now = super::timer::cntpct();
+        // PI-V3D-54: fold a progression sample at the ~1 ms cadence (bounded work — five reads, no logging).
+        if now >= next_sample {
+            let us = (now.wrapping_sub(start)).saturating_mul(1_000_000) / frq.max(1);
+            let us32 = us.min(u32::MAX as u64) as u32;
+            t_ca.update(mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CA), us32);
+            t_cs.update(mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CS), us32);
+            t_lc.update(mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0LC), us32);
+            t_pc.update(mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0PC), us32);
+            t_bpca.update(mmio_read(V3D_CORE0_BASE, V3D_PTB_BPCA), us32);
+            samples = samples.saturating_add(1);
+            next_sample = now + sample_tick;
+        }
         let sts = mmio_read(V3D_CORE0_BASE, V3D_CTL_INT_STS);
         if sts & V3D_INT_FLDONE != 0 {
             let waited_us = (super::timer::cntpct().wrapping_sub(start)).saturating_mul(1_000_000) / frq.max(1);
             // W1C the latched status so a stale FLDONE from a prior kick never masquerades as this one's.
             mmio_write(V3D_CORE0_BASE, V3D_CTL_INT_CLR, sts);
             dsb();
+            emit_v3d54_trace(what, trace_ba, trace_ea, samples, waited_us, &t_ca, &t_cs, &t_lc, &t_pc, &t_bpca);
             return (sts, waited_us, true);
         }
         if super::timer::cntpct() >= deadline {
@@ -1737,6 +1879,7 @@ fn wait_fldone(what: &str) -> (u32, u64, bool) {
                     "GMP clean: no protection violation latched — the wedge is not a GMP drop"
                 }
             );
+            emit_v3d54_trace(what, trace_ba, trace_ea, samples, waited_us, &t_ca, &t_cs, &t_lc, &t_pc, &t_bpca);
             return (sts, waited_us, false);
         }
         core::hint::spin_loop();
@@ -3323,7 +3466,12 @@ fn probe_job() {
     // reflects a RETIRED bin, not the P40 pre-retire snapshot (BFC Δ0, PCS bit0=1). The witness the
     // brief names carries the raw INT_STS, the microseconds waited, whether FLDONE retired, and the
     // BFC pre/post pair (BFC advancing is the independent frame-completed corroboration of FLDONE).
-    let (fldone_sts, fldone_us, fldone_retired) = wait_fldone("v3d44 PROBE bin flush");
+    // PI-V3D-54 (RANK 2): audit the actually-latched CT0 queue registers vs the intended [BA,EA) and the
+    // real CL byte length, BEFORE trusting any retire verdict — a mis-latched EA (==BA / truncated) would
+    // make the CLE walk a different list than we built (or none). Echo them under `[v3d54] submit`.
+    v3d54_submit_audit("v3d40 PROBE", bin_ba, bin_ea, bin_len);
+    // PI-V3D-54 (RANK 1): trace the CL progression across this retire-wait (BA/EA fold the CT0CA offset).
+    let (fldone_sts, fldone_us, fldone_retired) = wait_fldone("v3d44 PROBE bin flush", bin_ba, bin_ea);
     let bfc_after_flush = mmio_read(V3D_CORE0_BASE, V3D_CLE_BFC);
     serial_println!(
         ":: V3D: [v3d44] FLDONE wait — INT_STS={:#010x} waited={}us retired={} BFC={:#010x}->{:#010x} (Δ{}) BPOA={:#010x} BPOS={:#010x} (V3D-49: BPOS=0 at frame start, kernel-exact) — {} ::",
@@ -3580,8 +3728,13 @@ fn submit_bisect_rung_tagged(tag: &str, rung: &str, content: BinContent, shadrec
     let bfc_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_BFC);
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QEA, bin_ea); // GO
     dsb();
+    // PI-V3D-54 (RANK 2): audit the latched queue registers vs the intended [BA,EA) + built length BEFORE
+    // the retire-wait — the whole empty-frame premise turns on the CLE having been handed the list we
+    // built. EA==BA / a wrong span means the "empty did not retire" verdict is a submission artifact.
+    let submit_sound = v3d54_submit_audit(tag, bin_ba, bin_ea, bin_len);
     let idled = wait_bit_clear(V3D_CORE0_BASE, V3D_CLE_CT0CS, V3D_CLE_CT1CS_CTRUN, "CT0 v3d48 bisect");
-    let (sts, us, retired) = wait_fldone("v3d48 bisect");
+    // PI-V3D-54 (RANK 1): trace the CL progression across this rung's retire-wait.
+    let (sts, us, retired) = wait_fldone("v3d48 bisect", bin_ba, bin_ea);
     let bfc_after = mmio_read(V3D_CORE0_BASE, V3D_CLE_BFC);
     let pcs = mmio_read(V3D_CORE0_BASE, V3D_CLE_PCS);
     // The empty-frame verdict is the discriminator the whole arc turns on; every richer rung's verdict is
@@ -3609,6 +3762,51 @@ fn submit_bisect_rung_tagged(tag: &str, rung: &str, content: BinContent, shadrec
         (pcs & V3D_PCS_BMOOM != 0) as u32,
         idled as u32, sts, us, verdict
     );
+    // PI-V3D-54 (RANK 2): the FIX-and-re-run leg. If the submission audit above proved the CLE was handed
+    // a mis-latched list (EA==BA / wrong span) AND this is an Empty rung that did NOT retire, the non-retire
+    // is a submission artifact, not a frame-close fact. Re-latch the queue registers with strict fencing and
+    // re-GO ONCE in the same boot, then re-audit + re-trace under the `[v3d54] resubmit` tag. If the re-latch
+    // reads sound and the rung now retires, the wedge WAS the submission (retract the empty-frame premise);
+    // if EA==BA persists through a clean re-latch, the defect is upstream of the queue write (the GO itself),
+    // still a submission fact, not a frame-close one. Metal-gated: dormant on QEMU raspi4b (no V3D block, so
+    // `submit_sound` cannot be observed false there) and a strict no-op whenever the first submission is sound.
+    if !submit_sound && content == BinContent::Empty && !retired {
+        serial_println!(
+            ":: V3D: [v3d54] resubmit ({}) — first submission was UNSOUND and the empty rung did not retire; re-latching CT0QMA/QMS/QTS/QBA with strict fencing and re-issuing the GO to decide submission-artifact vs GO-itself ::",
+            tag
+        );
+        let qts_val = ts | V3D_CLE_CT0QTS_ENABLE;
+        mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QMA, tile_alloc);
+        dsb();
+        mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QMS, BIN_TILEALLOC_BYTES as u32);
+        dsb();
+        mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QTS, qts_val);
+        dsb();
+        mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QBA, bin_ba);
+        dsb();
+        mmio_write(V3D_CORE0_BASE, V3D_PTB_BPOS, 0);
+        mmio_write(V3D_CORE0_BASE, V3D_CTL_INT_CLR, mmio_read(V3D_CORE0_BASE, V3D_CTL_INT_STS));
+        dsb();
+        let bfc_pre2 = mmio_read(V3D_CORE0_BASE, V3D_CLE_BFC);
+        mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QEA, bin_ea); // re-GO
+        dsb();
+        let sound2 = v3d54_submit_audit("v3d54 resubmit", bin_ba, bin_ea, bin_len);
+        let idled2 = wait_bit_clear(V3D_CORE0_BASE, V3D_CLE_CT0CS, V3D_CLE_CT1CS_CTRUN, "CT0 v3d54 resubmit");
+        let (sts2, us2, retired2) = wait_fldone("v3d54 resubmit", bin_ba, bin_ea);
+        let bfc_after2 = mmio_read(V3D_CORE0_BASE, V3D_CLE_BFC);
+        serial_println!(
+            ":: V3D: [v3d54] resubmit ({}) — re-latch sound={} retired={} BFC {:#010x}->{:#010x} (Δ{}) idled={} INT_STS={:#010x} waited={}us — {} ::",
+            tag, sound2 as u32, retired2 as u32, bfc_pre2, bfc_after2, bfc_after2.wrapping_sub(bfc_pre2),
+            idled2 as u32, sts2, us2,
+            if sound2 && retired2 {
+                "the re-latch was SOUND and the empty rung RETIRED — the original wedge WAS the submission; retract the empty-frame non-retire premise"
+            } else if sound2 {
+                "the re-latch read SOUND yet the empty rung STILL did not retire — the queue registers were not the wall; a genuine frame-close fact stands"
+            } else {
+                "EA==BA / wrong span persisted through a strictly-fenced re-latch — the defect is upstream of the queue write (the GO path), still a submission fact"
+            }
+        );
+    }
     clear_mmu_fault_latch("v3d48 bisect post-kick");
 }
 

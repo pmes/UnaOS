@@ -1095,3 +1095,57 @@ retained `[v3d44/45/46]` dump names the next layer (below the CLE→PTB FLDONE g
 
 QEMU `raspi4b` models no V3D block (the run returns at `BLOCK-DOWN` before the probe), so the whole V3D-53
 step is dormant there — **P52 metal decides.**
+
+## 28. The next probe class — CL-progression time-series + empty-bisect submission audit (V3D-54)
+
+Through §27 every **mirror-able** probe register is kernel-byte-exact (per-job §10–23, reset §24, L2T window
+§25, hub-INT §26, CLEAR invalidate §27), and each landed a **confirmed no-op** on metal. The prior single-shot
+sampling — read the CLE/PTB registers **once**, after the 500 ms `wait_fldone` returns — hid **two different
+wedge signatures** the scout survey pulled out of the P52 capture:
+
+| Job | CT0CS | CT0CA | reading |
+| --- | --- | --- | --- |
+| **PROBE bin** | `CTRUN=0` | **`=EA`** | CLE walked the whole list, QPU ran, `BPCA` advanced off pool base (PTB emitted bytes) — then FLDONE/`BFC` never fired. |
+| **Empty bisect** | `CTRUN=1` | **`=BA`** | CLE **never advanced off BA** — GO accepted but the list was never stepped; backstop timeout. |
+
+**Same begin address, opposite outcome.** The whole "empty frame MUST retire" premise (§22–27) is being tested
+against a frame whose CLE **never ran** — so "empty did not retire" may be a submission/harness artifact, not a
+frame-close failure. V3D-54 attacks that contradiction directly, not with another mirror.
+
+**RANK 1 — CL-progression time-series (`[v3d54] trace`).** `wait_fldone` now takes the submitted `[BA,EA)` and
+polls `CT0CA`/`CT0CS`/`CT0LC`/`CT0PC`/`BPCA` at a **~1 ms cadence across** the retire-wait, not once after it.
+Each register is folded into a `TraceReg` (first / last / #changes / µs-of-first-move / µs-of-last-change), so
+the log carries a **compact transition summary** — start offset, stall offset, end offset — **not** 500 raw
+samples. One `[v3d54] trace` line fires on **both** exit paths (FLDONE-retire and timeout), for **both** the
+full PROBE bin and **every** bisect rung. Its interpretation names the fork:
+- `CT0CA` never leaves BA ⇒ the CLE never fetched; GO a no-op / list mis-submitted → **RANK 2 decides**.
+- `CT0CA` advances then stalls at offset *N* ⇒ the CLE choked on the packet at that byte offset.
+- `CT0CA` reaches EA ⇒ CLE walked the whole list; `BPCA` advance vs freeze then splits *PTB-emitted-bytes* from
+  *nothing-written* — the wall is downstream (FLDONE/BFC generation), not the CLE walk.
+
+**RANK 2 — empty-bisect submission audit (`[v3d54] submit` + `[v3d54] resubmit`).** After each GO the latched
+`CT0QBA`/`CT0QEA` are read **back** and checked against the intended `[BA,EA)` and the **built CL byte length**
+(the Empty rung is 14 B: `NUMBER_OF_LAYERS`+`TILE_BINNING_MODE_CFG`+`FLUSH_VCD_CACHE`+`START_TILE_BINNING`+`FLUSH`).
+`v3d54_submit_audit` returns *sound* only when `CT0QBA==BA ∧ CT0QEA==EA ∧ EA−BA==len ∧ EA≠BA`. If an **Empty**
+rung's submission is **unsound** *and* it did **not** retire, the FIX-and-re-run leg re-latches
+`QMA/QMS/QTS/QBA` with strict per-write `dsb` fencing and re-issues the GO **once in the same boot**, then
+re-audits + re-traces under `[v3d54] resubmit`. The three outcomes are self-labelling: re-latch sound + retires
+⇒ the wedge **was** the submission (retract the empty-frame premise); re-latch sound + still wedged ⇒ the queue
+registers were not the wall (a genuine frame-close fact stands); `EA==BA` persists through a fenced re-latch ⇒
+the defect is **upstream of the queue write** (the GO path itself), still a submission fact.
+
+**Scope.** Read-only MMIO except the metal-gated re-GO, which fires **only** when the audit proves the first
+submission unsound — a strict no-op whenever it reads sound (and unobservable on QEMU, where no V3D block means
+`submit_sound` is never false). The metal-confirmed job paths are otherwise unperturbed; the trace fold is
+bounded (five reads per ~1 ms tick, no per-sample logging).
+
+**Expected P53 witnesses (metal).**
+- `[v3d54] submit (v3d40 PROBE / <rung>) — intended BA=… EA=… len=… | latched CT0QBA=… CT0QEA=… span=… — …` —
+  the per-kick submission audit; the Empty-rung lines are the load-bearing ones.
+- `[v3d54] trace (<what>) samples=N span=…us … CT0CA off …->… moves=… stall@…us … BPCA …->… adv=… — <fork>` —
+  the folded progression for the PROBE bin and each rung.
+- `[v3d54] resubmit (<rung>) — re-latch sound=? retired=? …` — **only** if an Empty rung's first submission read
+  unsound and it did not retire.
+
+QEMU `raspi4b` models no V3D block (the run returns at `BLOCK-DOWN` before the probe), so the whole V3D-54 step
+is dormant there — **P53 metal reads the trace + audit.**
