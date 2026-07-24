@@ -2137,7 +2137,22 @@ fn input_router_selftest() {
     unaos_kernel::pal::push_event(unaos_kernel::pal::Event::Timer); // non-deliverable — must be dropped
     let routed = route_input_to_active_el0();
     let sent1 = GUI_SENT.load(Ordering::Relaxed);
+    // UVUG-8: delivering real input to the focused ring is the interactive-takeover edge — the takeover latch
+    // must now name ASID 1. This is the exact kernel-observable signal `run_user_image`'s deadline suspends on.
+    let takeover_engaged = sc::el0_takeover_active() == 1;
+    // UVUG-8: simulate the takeover-aware deadline decision (the pure `run_deadline_timed_out` the wait loop
+    // uses) across a suspend -> re-arm cycle, so QEMU proves the logic HID cannot exercise here:
+    //   (S) in takeover: even FAR past the deadline the run must NOT time out (window suspended);
+    //   (R) left takeover, budget re-armed to `now`: not yet timed out at the re-arm instant, but timed out
+    //       once a full deadline has elapsed past it.
+    let deadline: u64 = 1_000;
+    let suspend_holds = !sc::run_deadline_timed_out(true, 10_000, 0, deadline); // way past, but suspended
+    let rearm_start: u64 = 10_000; // budget_start reset to `now` on the takeover->non-takeover edge
+    let rearm_fresh = !sc::run_deadline_timed_out(false, rearm_start, rearm_start, deadline); // 0 elapsed
+    let rearm_fires = sc::run_deadline_timed_out(false, rearm_start + deadline + 1, rearm_start, deadline);
+    // A focus change clears the latch — a fresh `run` always starts disengaged (deadline fully armed).
     sc::el0_input_set_active(0); // restore: no active EL0 focus for the real boot
+    let takeover_cleared = sc::el0_takeover_active() == 0;
     if routed == 2 && sent1 == sent0 {
         serial_println!(
             ":: EL0: input router — routed=2 (key+mouse) to active-focus ring, Timer dropped, GUI_CHANNEL bypassed :: PASS ::"
@@ -2147,6 +2162,16 @@ fn input_router_selftest() {
             ":: EL0: input router — routed={} gui_sent_delta={} :: FAIL ::",
             routed,
             sent1.wrapping_sub(sent0)
+        );
+    }
+    if takeover_engaged && suspend_holds && rearm_fresh && rearm_fires && takeover_cleared {
+        serial_println!(
+            "[uvug8] takeover deadline — engage-on-input, suspend-holds-past-deadline, re-arm-on-leave, clear-on-focus-change :: PASS ::"
+        );
+    } else {
+        serial_println!(
+            "[uvug8] takeover deadline — engaged={} suspend_holds={} rearm_fresh={} rearm_fires={} cleared={} :: FAIL ::",
+            takeover_engaged, suspend_holds, rearm_fresh, rearm_fires, takeover_cleared
         );
     }
 }
