@@ -2880,6 +2880,15 @@ static M6G_LOADER_DONE: AtomicBool = AtomicBool::new(false);
 const PFREE: u8 = 0; // entry unused
 const PRUNNING: u8 = 1; // claimed; a child is (or is about to be) running under `pid`
 const PEXITED: u8 = 2; // the child exited/was killed; `status` is valid, awaiting reap by sys_wait
+/// UVUG-8r2: the parent gave up on a still-RUNNING child (`run_user_image` hit its deadline and returned
+/// `Timeout`), but the task is alive and still owns this row. The row must NOT go back to `PFREE`: `proc_reserve`
+/// would hand it to a new `run`, and the orphan's eventual SYS_EXIT/kill would then land on a REUSED entry,
+/// posting a bogus status to an unrelated program's parent. `PORPHANED` is terminal-but-owned — invisible to
+/// `proc_find_running` (so the orphan's exit cannot corrupt anything) and unclaimable by `proc_reserve` (which
+/// only CASes from `PFREE`). It is RECLAIMED, not leaked: the exit and kill paths look for it by pid via
+/// `proc_find_orphaned` and free the row at the moment the orphan actually dies. A row stays parked only for a
+/// task that never dies at all — the honest cost of having no asynchronous kill primitive on this arch.
+const PORPHANED: u8 = 3;
 
 /// The process table: parent + up to a few children. Static so it OUTLIVES each child's `Task` Box (which is
 /// freed on exit) and each child's slot teardown — the reap accounting must survive both. `MAX_PROCS` is a
@@ -3154,6 +3163,31 @@ fn proc_find_child(pid: u64) -> Option<usize> {
     (0..MAX_PROCS).find(|&i| {
         PROCS[i].state.load(Ordering::Acquire) != PFREE && PROCS[i].pid.load(Ordering::Acquire) == pid
     })
+}
+
+/// UVUG-8r2: find the ORPHANED Proc entry whose pid matches — the reclaim lookup used by the exit and kill
+/// paths. A hit means `run_user_image` timed out on this task and abandoned the row while the task kept
+/// running; now that the task is finally dying, the row can safely go back to `PFREE`. Kept separate from
+/// `proc_find_running` so the orphan's exit takes the reclaim path and NEVER the status/`done`-post path —
+/// there is no parent left waiting, and the row must not be treated as a live child.
+fn proc_find_orphaned(pid: u64) -> Option<usize> {
+    (0..MAX_PROCS).find(|&i| {
+        PROCS[i].state.load(Ordering::Acquire) == PORPHANED && PROCS[i].pid.load(Ordering::Acquire) == pid
+    })
+}
+
+/// UVUG-8r2: park a Proc entry as `PORPHANED` — the `Timeout` twin of `proc_free`, for a row whose task is
+/// STILL RUNNING. `pid` is deliberately RETAINED (it is the key `proc_find_orphaned` reclaims by); `asid` is
+/// retained too, so a late `sys_xfer`-style pid->ASID lookup still resolves truthfully rather than to a
+/// silently recycled slot. Emits the `[uvug8]` witness so an orphaned run is visible on the serial log.
+fn proc_orphan(i: usize) {
+    PROCS[i].state.store(PORPHANED, Ordering::Release);
+    serial_println!(
+        "[uvug8] run deadline expired with the EL0 task STILL ALIVE — Proc row {} parked PORPHANED (pid={}, asid={}); row is reclaimed when the task dies, never reused while it lives",
+        i,
+        PROCS[i].pid.load(Ordering::Acquire),
+        PROCS[i].asid.load(Ordering::Acquire)
+    );
 }
 
 /// Release a Proc entry to FREE — after reaping in sys_wait, or unwinding a failed sys_spawn claim.
@@ -5216,6 +5250,14 @@ pub fn record_el0_kill(name: &str, ec: u64, far: u64, far_valid: bool) {
     // program is CONTAINED, not an M6b regression. Byte-identical for the boot battery: every Proc-tracked
     // fixture is already matched by a name arm above, so no existing task reaches here with a live Proc entry.
     if let Some(id) = super::sched::current_id() {
+        // UVUG-8r2: an ORPHANED row's task faulting is the other way a timed-out run finally dies. Reclaim the
+        // row (no status, no `done` post — no parent is waiting) and route the kill off the M6b accounting,
+        // exactly as the live-child arm below does.
+        if let Some(i) = proc_find_orphaned(id) {
+            serial_println!("[uvug8] orphaned EL0 task killed by fault — Proc row {} reclaimed", i);
+            proc_free(i);
+            return;
+        }
         if let Some(i) = proc_find_running(id) {
             PROCS[i].status.store(EXEC_KILLED_STATUS, Ordering::Release);
             PROCS[i].state.store(PEXITED, Ordering::Release);
@@ -5742,6 +5784,18 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
                             PROCS[i].state.store(PEXITED, Ordering::Release);
                         }
                     }
+                    super::sched::exit(); // never returns
+                }
+            }
+            // UVUG-8r2: an ORPHANED row (its `run_user_image` parent timed out and returned while this task
+            // kept running) is reclaimed here, BEFORE the live-child short-circuit below. No status store and
+            // no `done` post: the parent is long gone, the shell already took its screen and keyboard back, and
+            // posting would signal a semaphore nobody waits on. Freeing the row here is what keeps a wedged-app
+            // Timeout from permanently consuming one of the MAX_PROCS entries.
+            if let Some(id) = super::sched::current_id() {
+                if let Some(i) = proc_find_orphaned(id) {
+                    serial_println!("[uvug8] orphaned EL0 task exited (status={}) — Proc row {} reclaimed", a0 as i32, i);
+                    proc_free(i);
                     super::sched::exit(); // never returns
                 }
             }
@@ -6474,6 +6528,16 @@ pub fn run_user_image(
     // Heartbeat staleness bound: how long the takeover app may go without a SYS_INPUT_POLL before it stops
     // counting as "live in takeover". A frame-driven app polls many times a second, so this is generous.
     let stale_ticks = super::timer::cntfrq().saturating_mul(TAKEOVER_STALE_SECS);
+    // UVUG-8r2 HARD CEILING on total suspended time. The heartbeat proves the app is EXECUTING, not that it is
+    // USEFUL: `loop { sys_input_poll(); }` (broken quit handling), or a poller on a cadence just under
+    // `stale_ticks` oscillating suspend->re-arm forever, keeps the heartbeat fresh and would strand the shell
+    // indefinitely. `gui_watchdog` cannot break the tie — it is fed by the very same heartbeat. So bound the
+    // thing the app CANNOT fake by spinning: cumulative wall time this run has spent suspended. Past the cap we
+    // simply stop honouring takeover; the ordinary 5 s window then runs out and the run ends `Timeout`.
+    let suspend_cap_ticks = super::timer::cntfrq().saturating_mul(TAKEOVER_SUSPEND_MAX_SECS);
+    let mut suspended_ticks: u64 = 0;
+    let mut prev = start;
+    let mut capped_witnessed = false;
     let mut budget_start = start;
     let mut suspended = false;
     loop {
@@ -6481,13 +6545,32 @@ pub fn run_user_image(
             break;
         }
         let now = super::timer::cntpct();
-        let in_takeover = takeover_suspends(
+        // Accrue wall time against the suspension cap for every pass we were ACTUALLY suspended. Measured from
+        // the previous pass, so it tracks real elapsed time and cannot be diluted by polling faster.
+        let delta = now.wrapping_sub(prev);
+        prev = now;
+        if suspended {
+            suspended_ticks = suspended_ticks.saturating_add(delta);
+        }
+        let gate = takeover_suspends(
             el0_takeover_active(),
             asid,
             now,
             el0_takeover_heartbeat(),
             stale_ticks,
         );
+        let capped = suspended_ticks >= suspend_cap_ticks;
+        if capped && !capped_witnessed {
+            capped_witnessed = true;
+            serial_println!(
+                "[uvug8] suspend CAP reached — EL0 app asid={} held the deadline suspended {}s; takeover no longer suspends, normal window now runs out",
+                asid,
+                TAKEOVER_SUSPEND_MAX_SECS
+            );
+        }
+        // Batch path is byte-inert: `gate` is never true there, so `suspended_ticks` stays 0, `capped` stays
+        // false, and this is exactly the original fixed bound.
+        let in_takeover = gate && !capped;
         if in_takeover {
             if !suspended {
                 suspended = true;
@@ -6531,7 +6614,20 @@ pub fn run_user_image(
     el0_input_set_active(0);
     // Reap the Proc entry. The scheduler's exit path already repointed THIS core to the boot root (ASID 0)
     // and dispatched back to the caller (the shell task), so the shell's ASID-0 invariant holds on return.
-    proc_free(pi);
+    //
+    // UVUG-8r2: only a row whose task is actually DEAD may be freed. On the `Timeout` path the EL0 task is
+    // still RUNNING — `run_user_image` gives up on it, but this arch has no asynchronous kill primitive
+    // (`sched::exit` retires only the CALLING task), so the task keeps running as an orphan. Freeing its row
+    // here would let `proc_reserve` hand the same entry to the next `run`, and the orphan's eventual
+    // SYS_EXIT would post a bogus status onto that unrelated program's parent. Park it `PORPHANED` instead;
+    // the exit/kill paths reclaim it when the orphan really dies. (Pre-r2 this was unreachable in practice —
+    // the deadline only expired on a batch program that had already stopped — but the heartbeat gate makes
+    // Timeout reachable mid-interaction, so the row hazard is now live.)
+    if matches!(outcome, RunOutcome::Timeout) {
+        proc_orphan(pi);
+    } else {
+        proc_free(pi);
+    }
     Ok((outcome, mapped.base))
 }
 
@@ -9097,6 +9193,16 @@ static EL0_TAKEOVER_HB: AtomicU64 = AtomicU64::new(0);
 /// strand for a hung app bounded at `TAKEOVER_STALE_SECS + deadline` ≈ 7 s instead of forever.
 pub const TAKEOVER_STALE_SECS: u64 = 2;
 
+/// UVUG-8r2: the HARD CEILING on cumulative time one `run` may hold its deadline suspended. The heartbeat
+/// gate bounds a *silent* wedge, but not a *noisy* one: an app spinning on `SYS_INPUT_POLL` keeps the
+/// heartbeat perfectly fresh while doing nothing useful, and an app polling on a cadence just under
+/// `TAKEOVER_STALE_SECS` can oscillate suspend->re-arm forever without ever letting a full deadline window
+/// elapse. Neither can be distinguished from a live session by any signal the app itself produces — so the
+/// bound has to be on something it cannot fake by spinning, namely total suspended WALL TIME. Sixty seconds
+/// is far longer than any interaction this shell's `run` is meant to host, and it converts an unbounded
+/// strand into a guaranteed return to the prompt.
+pub const TAKEOVER_SUSPEND_MAX_SECS: u64 = 60;
+
 /// Pack a `pal::Event` into the ELF-5 u64 wire form, or `None` for a non-deliverable event (Timer/None/
 /// Unknown carry nothing for EL0). Bit 63 is always clear, so `sys_input_poll` can hand the packed value
 /// straight back as a non-negative i64 distinct from `-EAGAIN`.
@@ -9183,11 +9289,22 @@ pub fn el0_input_set_active(asid: u64) {
     //
     // UVUG-8r2 ORDERING: publish the new focus FIRST, then clear the latch. The reverse order left a window in
     // which a concurrent router push could re-store the OUTGOING asid into the latch after we cleared it. With
-    // the engage edge moved to the consumer side that push can no longer write the latch at all, but the
-    // clear-after-publish order is the one that is correct independent of that, so it is what we do: after this
-    // store, the only writer that could re-latch is an app polling under the NEW focus, which is exactly right.
+    // the engage edge moved to the consumer side that push can no longer write the latch at all, and this order
+    // narrows the remaining window to near-nothing — but it does NOT close it. `sys_input_poll` reads
+    // `EL0_INPUT_ACTIVE` and writes the latch as two separate atomics, so a poll that read the OLD focus just
+    // before this store can still land its write after the clear below (a TOCTOU on the focus-drop edge). The
+    // residue is harmless and self-healing: the stale latch names the OUTGOING asid, `takeover_suspends` only
+    // suspends when the latch matches the asid the wait loop is watching, and the next `el0_input_set_active`
+    // clears it again. Closing it properly would need focus+latch under one atomic or a seqlock, which is not
+    // worth it for a window this narrow and this benign.
     EL0_INPUT_ACTIVE.store(asid, Ordering::Release);
     EL0_TAKEOVER_ASID.store(0, Ordering::Release);
+    // Heartbeat reset to 0 as an "unset" sentinel. NOTE it is a value, not a tombstone: `takeover_suspends`
+    // treats it as a real timestamp, so within the first `TAKEOVER_STALE_SECS` after CNTPCT origin a 0 reads as
+    // *fresh* rather than *absent*. That is unreachable in practice (the counter is already deep into billions
+    // of ticks by the time any shell `run` happens) and harmless if it were reached, since the latch is cleared
+    // on the line above and `takeover_suspends` requires a non-zero MATCHING latch before the heartbeat is even
+    // consulted. Flagged rather than fixed: an Option-shaped sentinel would buy nothing real here.
     EL0_TAKEOVER_HB.store(0, Ordering::Release);
 }
 
