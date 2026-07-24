@@ -1,4 +1,4 @@
-STATUS: PROPOSED
+STATUS: APPROVED (2026-07-24 — clean match; dropping the midhold dump is fine, the brief didn't ask for it)
 
 # PROPOSAL — kepler-display pull 11: block-height step ladder
 

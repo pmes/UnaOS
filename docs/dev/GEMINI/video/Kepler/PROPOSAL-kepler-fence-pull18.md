@@ -1,4 +1,4 @@
-STATUS: PROPOSED
+STATUS: APPROVED WITH ONE AMENDMENT (2026-07-24): use the lane's established bounded spin-loop idiom for the inter-pass delay, NOT `crate::timer::delay_ms` — do not introduce a new timing dependency into the GPU path. Otherwise clean match.
 
 # Proposal: kepler-fence pull 18 — PGRAPH Falcon recon (read-only)
 
