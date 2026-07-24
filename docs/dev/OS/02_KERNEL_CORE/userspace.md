@@ -471,12 +471,18 @@
     already clears the designation on slot teardown (verified — ELF-5's `EL0_INPUT_ACTIVE` compare-exchange), so
     the explicit clear is belt-and-suspenders for the exit/kill path and the **sole** clear on the Timeout path
     (task still alive, no teardown). The shell regains input the instant the program returns.
-  - **Watchdog / escape hatch — decision (documented).** The heartbeat for a focused EL0 app is **`run_user_image`'s
-    own deadline**, NOT a new per-process drain-counter seam. The shell's `run` gives a **5 s deadline**
-    (`shell.rs`), which EQUALS `gui_watchdog::WATCHDOG_TIMEOUT_SECS`, so a wedged EL0 app loses the screen after
-    5 s by that bound — the simplest sound choice. The `gui_watchdog` `note_progress`/`poll` path is left
-    **byte-untouched** (it stays exact for kernel apps, which call `note_progress`); the shell's escape hatch (the
-    deadline return, and the watchdog's `SCREEN_APP_ACTIVE` reclaim at the same 5 s) is preserved.
+  - **Watchdog / escape hatch — decision (UVUG-5 correction).** The original ELF-5 decision left the
+    `gui_watchdog` `note_progress`/`poll` path **byte-untouched**, reasoning that `run_user_image`'s 5 s deadline
+    (`shell.rs`, equal to `gui_watchdog::WATCHDOG_TIMEOUT_SECS`) is the sole liveness bound for a focused EL0 app.
+    That was **wrong in practice** (P47): the `run` command sets `SCREEN_APP_ACTIVE` and calls
+    `gui_watchdog::on_app_enter`, so the wedge watchdog is *also* armed for the EL0 program — but an EL0 app drains
+    input through `SYS_INPUT_POLL`, not the kernel `pump_and_poll` that feeds `note_progress`, so the watchdog saw
+    **no heartbeat** and FALSELY reclaimed a healthy, polling UVUG at 5 s (`[gui] watchdog app wedged 5s (no drain
+    since …)` — the app never lost its poll but the shell was handed the keyboard back mid-run). **Fix:**
+    `sys_input_poll` now calls `gui_watchdog::note_progress()` on **every** poll (before the empty-ring return) —
+    the EL0 twin of the kernel app's per-drain heartbeat: a program calling `SYS_INPUT_POLL` IS making drain
+    progress. A live EL0 app is never falsely wedged; a genuinely dead one still loses the screen at the timeout.
+    `note_progress` is a no-op when no app owns the screen, so the call is safe on any caller.
   - **QEMU proof.** A new BSP-side `input_router_selftest()` runs the REAL router drain against a fake active
     focus (ASID 1, before any service task or EL0 slot is live, `EVENT_QUEUE` empty): a Key + a Mouse pushed into
     `EVENT_QUEUE` are routed to the focused ring (`routed == 2`), a Timer is dropped, and `GUI_CHANNEL` is bypassed
@@ -539,6 +545,27 @@
   so instead of copying that this arc scales pointer delta down (`DRAG_DIV` = 8) and per-frame clamps it
   (`DRAG_CLAMP` = 64 brad/axis) so a **full-panel drag ≈ one revolution** (256 brads over ~2048 px, panel ~1920 px
   wide) and no single HID delta can spin past a quarter-turn in one frame. Lane: `crates/user-uvug` only + this doc.
+- **UVUG-5 (this arc)** — two input-side corrections after the P47 metal capture (`run /fat/UVUG.ELF` ran the
+  300-frame auto batch to `exit=0` with the unchanged checksum, but showed **no interactive takeover** and a
+  spurious `[gui] watchdog app wedged 5s`). (1) **Watchdog false-fire** — the `run` command arms `gui_watchdog`
+  via `on_app_enter`, but nothing fed `note_progress` on the EL0 path, so a healthy polling app was declared
+  wedged at 5 s and the shell was handed the keyboard back mid-run; fixed by feeding `gui_watchdog::note_progress`
+  from `sys_input_poll` (see the corrected ELF-5 decision above). (2) **Router-delivery witness** — the
+  router→ring code path is verified correct (`el0_input_active()` precedence in `pump_usb_into_gui`;
+  `current_asid()` == the `el0_input_set_active` ASID both derive from `TTBR0_EL1[63:48]`), so the metal
+  no-takeover is a HID-delivery/timing question QEMU (no HID) cannot reproduce; a rate-limited
+  `[el0in] routed N event(s) to active EL0 ring` line now fires the instant the router hands the active EL0 app
+  real input, so the next sitting reads delivery directly instead of inferring it. (3) **Host-side typematic** —
+  a USB HID boot keyboard under `SET_IDLE(0)` (which the held-state contract requires) never auto-repeats, so a
+  held key produced exactly one `Event::Key` everywhere; key repeat is the host's job. The USB pump
+  (`pump_usb_into_gui`, ~250×/s) now tracks the most-recently-pressed key from the Key/KeyUp edges it drains and,
+  once it has been held past `TYPEMATIC_DELAY_MS` (400 ms), injects a fresh `Event::Key` into `EVENT_QUEUE` at
+  `TYPEMATIC_RATE_MS` (40 ms ≈ 25 chars/s). Injecting into `EVENT_QUEUE` means the repeat rides the SAME routing
+  every real key takes — shell (`GUI_CHANNEL`), a kernel full-screen app's own `pump_and_poll` drain, AND an EL0
+  app's per-process ring — with no per-path code. Newest key wins; releasing the repeating key stops it. QEMU
+  raspi4b delivers no HID, so no key is ever held and no repeat is synthesised — the deterministic auto paths stay
+  byte-identical (`checksum=0x48221e4101db3924`, verified on `kernel8-test`). Lane: `arch/aarch64/syscall.rs`
+  (`sys_input_poll` heartbeat) + `main.rs` (typematic + `[el0in]` witness) + this doc.
 - Not yet: **revocation trees** (a derived copy — re-grant or onward re-transfer — escapes
   single-level revoke today; derivation records + `CAP_REVOKE` are that arc), the **bandy Ring-3
   delegation wrapper**, `File` transfer (descriptor migration), real `Socket` fs/net syscalls.

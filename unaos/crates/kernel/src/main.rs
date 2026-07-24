@@ -1992,6 +1992,94 @@ static PIUSB24_LAST_LOG_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 static PIUSB26_LAST_LOG_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// UVUG-5: ms() timestamp of the last `[el0in]` router-delivery witness. The metal `no interactive takeover`
+/// question (P47) is un-reproducible in QEMU (no HID), so this line PROVES on the next sitting whether real
+/// HID edges actually reached the active EL0 app's input ring — `route_input_to_active_el0` returning >0 is
+/// the router delivering keys/mouse the EL0 app's SYS_INPUT_POLL then drains. Rate-limited to ~2 Hz so a
+/// held key or a moving mouse never floods serial. 0 = never logged.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+static EL0IN_LAST_LOG_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+// UVUG-5 / typematic — host-side key repeat. A USB HID boot keyboard under SET_IDLE(0) (which we arm, so a
+// held key sends ONE press report and NO further reports until release — the GAME-MODE held-state contract
+// depends on it) never auto-repeats. So a held key produced exactly one `Event::Key` everywhere in the stack:
+// the shell line editor advanced one char and stopped, and Peter noticed the dead repeat at the bench. Key
+// repeat is therefore the HOST's job. We synthesise it in the USB pump (the one periodic seam that already
+// runs ~250×/s and owns `EVENT_QUEUE`): track the most-recently-pressed key from the Key/KeyUp EDGES the HID
+// decode already emits, and once it has been held past an initial delay, push a fresh `Event::Key` into
+// `pal::EVENT_QUEUE` at the pump's repeat rate. Injecting into EVENT_QUEUE means the repeat rides the SAME
+// routing every real key takes — the shell path (GUI_CHANNEL), a kernel full-screen app's own pump_and_poll
+// drain, AND an EL0 app's per-process ring — with no per-path code. Newest key wins (standard typematic);
+// releasing the repeating key stops it; a different key's release is ignored. QEMU raspi4b delivers no HID, so
+// no key is ever held and no repeat is ever synthesised — the deterministic auto paths stay byte-identical.
+/// The ASCII of the key currently eligible to repeat, +1 (so 0 = none — a real key can be 0x00-ish only via
+/// unmapped scancodes, which never reach here). Newest press wins.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+static TYPEMATIC_KEY_P1: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// `ms()` at which the next repeat of `TYPEMATIC_KEY_P1` is due. Set to press-time + initial delay on the
+/// press edge, then advanced by the repeat period on each synthesised repeat.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+static TYPEMATIC_NEXT_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Typematic initial delay: how long a key must be held before the FIRST synthesised repeat. ~400 ms is the
+/// familiar desktop feel (long enough that a normal tap never repeats, short enough to feel responsive).
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+const TYPEMATIC_DELAY_MS: u64 = 400;
+/// Typematic repeat period once repeating: ~40 ms ≈ 25 chars/s, a steady desktop-grade rate.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+const TYPEMATIC_RATE_MS: u64 = 40;
+
+/// Feed the typematic tracker a Key/KeyUp EDGE seen in the pump's drain. A press (`Event::Key`) arms/rearms
+/// the repeat on that key (newest wins) after the initial delay; the matching release (`Event::KeyUp`) disarms
+/// it. A synthesised repeat re-enters the drain as `Event::Key(same)` — that is harmless: it just re-arms the
+/// same key at delay again, but `typematic_tick` has already scheduled the next repeat at the RATE, and it
+/// runs before the drain each pass, so the rate cadence is what actually governs (the re-arm only matters when
+/// the key genuinely changes). Other event kinds are ignored.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn typematic_observe(ev: unaos_kernel::pal::Event) {
+    use core::sync::atomic::Ordering;
+    match ev {
+        unaos_kernel::pal::Event::Key(k) => {
+            let cur = TYPEMATIC_KEY_P1.load(Ordering::Relaxed);
+            // Only (re)arm on a genuinely new key press — a synthesised repeat echoing back as the SAME held
+            // key must not reset the delay (that would stall the repeat forever at the initial delay).
+            if cur != k as u32 + 1 {
+                TYPEMATIC_KEY_P1.store(k as u32 + 1, Ordering::Relaxed);
+                TYPEMATIC_NEXT_MS.store(
+                    unaos_kernel::arch::ms().wrapping_add(TYPEMATIC_DELAY_MS),
+                    Ordering::Relaxed,
+                );
+            }
+        }
+        unaos_kernel::pal::Event::KeyUp(k) => {
+            if TYPEMATIC_KEY_P1.load(Ordering::Relaxed) == k as u32 + 1 {
+                TYPEMATIC_KEY_P1.store(0, Ordering::Relaxed); // release the repeating key -> stop
+            }
+        }
+        _ => {}
+    }
+}
+
+/// If a held key's next repeat is due, return its ASCII and schedule the following repeat one RATE period out.
+/// Called once per pump pass BEFORE the drain, so the synthesised `Event::Key` is enqueued into EVENT_QUEUE in
+/// time to ride this pass's routing. `None` when no key is held or the next repeat is not yet due.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn typematic_tick() -> Option<u8> {
+    use core::sync::atomic::Ordering;
+    let kp1 = TYPEMATIC_KEY_P1.load(Ordering::Relaxed);
+    if kp1 == 0 {
+        return None;
+    }
+    let now = unaos_kernel::arch::ms();
+    let due = TYPEMATIC_NEXT_MS.load(Ordering::Relaxed);
+    // `ms()` is monotonic (250 Hz tick*4); guard the wrap window so a stuck/rolled clock cannot spew repeats.
+    if now.wrapping_sub(due) < (1u64 << 62) && now >= due {
+        TYPEMATIC_NEXT_MS.store(now.wrapping_add(TYPEMATIC_RATE_MS), Ordering::Relaxed);
+        return Some((kp1 - 1) as u8);
+    }
+    None
+}
+
 /// PIUSB-28: latched once the first Pi pump pass has armed the FAT mount trigger, so the
 /// `:: piusb28: mount-trigger armed (pi pump path) ::` witness prints exactly once per boot. This
 /// makes the wiring itself visible on serial — proving the mount edge is now polled from a path that
@@ -2063,8 +2151,22 @@ fn gui_send(ev: unaos_kernel::pal::Event) {
 fn route_input_to_active_el0() -> usize {
     let mut routed = 0usize;
     while let Some(ev) = unaos_kernel::pal::next_event() {
+        typematic_observe(ev); // UVUG-5: track held-key edges for host-side repeat (EL0-focus path)
         if unaos_kernel::arch::aarch64::syscall::el0_input_enqueue(ev) {
             routed += 1;
+        }
+    }
+    // UVUG-5: prove router->ring delivery on metal. The `no interactive takeover` P47 symptom left it open
+    // whether HID edges reached the EL0 ring at all (QEMU can't test the HID edge). A rate-limited `[el0in]`
+    // line here fires the instant the router hands the active EL0 app real input, so the next sitting reads
+    // delivery directly instead of inferring it. Silent when nothing routed (the common empty-pass case).
+    if routed > 0 {
+        use core::sync::atomic::Ordering;
+        let now = unaos_kernel::arch::ms();
+        let last = EL0IN_LAST_LOG_MS.load(Ordering::Relaxed);
+        if now.wrapping_sub(last) >= 500 || last == 0 {
+            EL0IN_LAST_LOG_MS.store(now.max(1), Ordering::Relaxed);
+            serial_println!("[el0in] routed {} event(s) to active EL0 ring", routed);
         }
     }
     routed
@@ -2135,6 +2237,12 @@ fn pump_usb_into_gui() {
         x.service_slot_disposal();
         x.service_enum();
     }
+    // UVUG-5 typematic: BEFORE the drain, synthesise a held key's repeat into EVENT_QUEUE so it rides this
+    // pass's routing exactly like a real key edge (`poll_events()` above already re-armed the HID rings and
+    // pushed any genuine edges). No key held / not yet due -> no-op; QEMU has no HID so this never fires.
+    if let Some(k) = typematic_tick() {
+        unaos_kernel::pal::push_event(unaos_kernel::pal::Event::Key(k));
+    }
     // PIUSB-24: bridge decoded KEYS **and** POINTER events (Mouse/MouseAbsolute/Button) into the GUI
     // channel — the render task now moves the shared `pal::cursor` sprite from them (mirroring the x86
     // console loop). The MOUSE-1 witness confirmed relative boot-mouse reports arrive on metal; before
@@ -2162,12 +2270,14 @@ fn pump_usb_into_gui() {
     // EL0 `run`, and the EL0 ring is the real sink. `poll_events()` above already re-armed the HID rings and
     // filled EVENT_QUEUE; only the destination changes.
     //
-    // Watchdog / escape hatch: an EL0 program runs under `run_user_image`'s 5 s deadline (shell.rs), which
-    // EQUALS `gui_watchdog::WATCHDOG_TIMEOUT_SECS`, so a wedged EL0 app loses the screen after 5 s by that
-    // bound — no per-process drain-counter seam is added, and the `gui_watchdog` note_progress/poll path is
-    // left byte-untouched (it stays exact for kernel apps, which DO call `note_progress`). `run_user_image`
-    // clears the focus on return, so the router reverts to the GUI_CHANNEL / SCREEN_APP_ACTIVE paths the
-    // instant the program exits — the shell regains the keyboard immediately.
+    // Watchdog / escape hatch (UVUG-5 correction): the `run` command sets SCREEN_APP_ACTIVE and calls
+    // `gui_watchdog::on_app_enter`, arming the 5 s wedge watchdog for the EL0 program too. But an EL0 app
+    // drains input through SYS_INPUT_POLL, NOT the kernel `pump_and_poll` that feeds `note_progress` — so the
+    // watchdog saw no heartbeat and FALSELY reclaimed a healthy, polling UVUG at 5 s (P47's `[gui] watchdog
+    // app wedged 5s`). `sys_input_poll` now calls `note_progress` on every poll (the EL0 twin of the kernel
+    // app's per-drain heartbeat), so a live EL0 app is never falsely wedged; a genuinely dead one still loses
+    // the screen at the timeout. `run_user_image` clears the focus on return, so the router reverts to the
+    // GUI_CHANNEL / SCREEN_APP_ACTIVE paths the instant the program exits — the shell regains the keyboard.
     if unaos_kernel::arch::aarch64::syscall::el0_input_active() != 0 {
         route_input_to_active_el0();
         click2_depth_witness();
@@ -2185,6 +2295,7 @@ fn pump_usb_into_gui() {
         while n < buf.len() {
             match unaos_kernel::pal::next_event() {
                 Some(ev) => {
+                    typematic_observe(ev); // UVUG-5: track held-key edges (kernel full-screen-app path)
                     if matches!(ev, unaos_kernel::pal::Event::Button(_)) {
                         saw_button = true;
                     }
@@ -2204,6 +2315,7 @@ fn pump_usb_into_gui() {
         return;
     }
     while let Some(ev) = unaos_kernel::pal::next_event() {
+        typematic_observe(ev); // UVUG-5: track held-key edges (shell path) for host-side repeat
         match ev {
             unaos_kernel::pal::Event::Key(_) => gui_send(ev),
             unaos_kernel::pal::Event::Mouse { x, y } => {

@@ -9071,6 +9071,16 @@ fn clear_input_row(asid: u64) {
 /// event (>= 0) or `-EAGAIN` when the ring is empty (or the caller has no private slot — ASID 0). The SPSC
 /// consumer half: this EL0 task is the sole consumer of its own ring.
 fn sys_input_poll() -> i64 {
+    // UVUG-5: an EL0 full-screen app (`run /fat/UVUG.ELF`) drives input through THIS syscall every frame —
+    // it never touches the kernel `pal::pump_and_poll` path that feeds `gui_watchdog::note_progress`. So the
+    // watchdog, armed by `on_app_enter` when the `run` command took the screen, never saw a heartbeat and
+    // FALSELY declared the healthy, polling UVUG app wedged at 5 s (`[gui] watchdog app wedged 5s (no drain
+    // since …)`, P47) — returning input to the shell mid-run. The EL0 twin of the kernel app's per-drain
+    // heartbeat is this poll itself: a program calling SYS_INPUT_POLL IS making drain progress, whether or
+    // not the ring has an event this instant. Feed the heartbeat on EVERY poll (before the empty-ring return),
+    // so a live EL0 app is never reclaimed and the `run_user_image` deadline stays the sole liveness bound.
+    // No-op when no app owns the screen, so this is safe on any caller.
+    crate::gui_watchdog::note_progress();
     let asid = current_asid();
     if asid == 0 || asid as usize > super::boot::USER_SLOTS {
         return EAGAIN;
