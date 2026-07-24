@@ -1282,3 +1282,196 @@ of the metal-confirmed kick path and is recorded here so a P54 divergence has th
 QEMU `raspi4b` models no V3D block — the run returns at `BLOCK-DOWN` before the probe, so **no** `[v3d55]` line
 appears there and the `kernel8-test` battery green means *no regression*, not probe verification. **P54 metal
 reads the clock-domain and tile-state verdicts.**
+
+## 30. The phantom retracted — BPCA is an allocation pointer, not a write pointer (V3D-56)
+
+P54b metal plus the V3D-55 probes left the arc holding a hard verdict: **BPCA is a phantom/aliased write
+pointer.** Its evidence was:
+
+- submission sound, CLE walks `BA→EA`, QPU runs, `FLDONE` never fires, `CTRUN` stays `1`;
+- firmware V3D clock **ACTIVE at exactly 500 MHz**; `MISCCFG=0x6` (`QRMAXCNT=3`, sane); `CYCLE_COUNT` advanced
+  **249 M** over the 500 ms wait — the core is clocked, so "clocked but never triggered";
+- GPU MMU `CTL=0x00090801`, `ENABLE=1`, no fault bits, `PT_PA_BASE` matching our table, PTEs identity-mapped
+  valid + writeable as published;
+- and the pivot: the tile-state array (192 B) **entirely zero** and the full 32 KiB tile-alloc pool **entirely
+  zero** after a *completed* L2T write-back — yet `BPCA=0x001fa000`, advanced `0x3000` off the pool base
+  `0x001f7000`, with `BPCS=0x5000` and `BFC=0`.
+
+Advanced pointer, empty pool, healthy MMU. The only reading left seemed to be that the bytes landed somewhere
+we were not reading. **That inference was wrong, and this section retracts it.**
+
+### The register-semantics check that collapsed it
+
+`BPCA`/`BPCS` sit at core offsets `0x300`/`0x304` on v42 — identical to VC4/V3D 2.x (Linux
+`drivers/gpu/drm/v3d/v3d_regs.h`: `V3D_PTB_BPCA 0x00300`, `V3D_PTB_BPCS 0x00304`; the same offsets appear in
+`drivers/gpu/drm/vc4/vc4_regs.h`). The upstream headers are comment-free; the field text is the VideoCore IV 3D
+Architecture Reference Guide's, and v42 keeps it:
+
+| Register | ARG description | Kind |
+|---|---|---|
+| `V3D_BPCA` | "Current Address Of Binning Memory Pool" | read-only **allocation pointer** (byte address) |
+| `V3D_BPCS` | "Remaining Size Of Binning Memory Pool" | read-only **bytes remaining** |
+| `V3D_BPOA` | "Address Of Overspill Binning Memory Block" | overspill base |
+| `V3D_BPOS` | "Size Of Overspill Binning Memory Block" | overspill size (`0` = disarmed) |
+
+Neither is a bytes-*written* counter. The ISA's written-work counters are `CT0LC`/`CT0PC`. **This driver read an
+allocation pointer as a write pointer** — that single conflation is the whole phantom.
+
+The decisive mechanism is in Mesa `src/broadcom/common/v3d_util.c` (`v3d_tile_alloc_sizes`), quoted:
+
+> The PTB will request the tile alloc initial size per tile at start of tile binning. The size must match the
+> initial block size configured in the `TILE_BINNING_MODE_CFG` packet.
+> […] The PTB allocates in aligned 4k chunks after the initial setup.
+> […] Include the first two chunk allocations that the PTB does so that we definitely clear the OOM condition
+> before triggering one (the HW won't trigger OOM during the first allocations).
+
+```c
+uint32_t tiles_size = layers * tiles_x * tiles_y * V3D_TILE_ALLOC_INITIAL_BLOCK_SIZE;
+uint32_t alloc_size = align(tiles_size, 4096);
+alloc_size += 8192;
+```
+
+So `START_TILE_BINNING` makes the PTB **reserve** per-tile initial blocks unconditionally — before, and
+independent of, any primitive — then take aligned 4 KiB chunks, at least two of them up front.
+**Reservation moves `BPCA` and writes nothing.**
+
+### The arithmetic matches to the byte
+
+Our frame is 64×64 with 64×64 tiles, one layer, so `tiles_x = tiles_y = 1`, and our `TILE_BINNING_MODE_CFG`
+programs the 128 B initial block (`V3D_TILE_ALLOC_INITIAL_BLOCK_SIZE`, `src/broadcom/common/v3d_limits.h`):
+
+```
+tiles_size            = 1 × 1 × 1 × 128   =    128 B
+align(128, 4096)                          = 0x1000
++ two up-front 4 KiB chunk allocations    = 0x2000
+──────────────────────────────────────────────────
+predicted BPCA advance, EMPTY bin         = 0x3000
+```
+
+Measured at V3D-40 and again at V3D-55: **exactly `0x3000`**. Not approximately — the formula's value to the
+byte, over a pool that reads entirely zero. That is precisely what pure reservation predicts and precisely what
+a real write would not produce.
+
+**Verdict: `BPCA` advancing `0x3000` with an untouched pool is ARCHITECTURAL for an empty bin frame.** There are
+no phantom bytes because there were never any bytes. The address question does **not** reopen, and the V3D-55
+MMU evidence (enabled, fault-free, our table latched, PTEs valid) stands unchallenged.
+
+The defect collapses back to where §23–§27 had it: **`FLDONE` generation on an empty frame.**
+
+### Item 1 — poison the pool, so a zero-valued write stops being invisible
+
+Every boot from V3D-40 to V3D-55 **pre-zeroed** the pool and tile-state, then concluded from an all-zero
+readback that the PTB wrote nothing. That inference has a blind spot: a zeroed region cannot distinguish *never
+written* from *written with zeros* — and zero-valued output is exactly what an empty tile list emits.
+
+V3D-56 replaces the zero fill with an index-encoding poison over the same two regions (same bytes touched, only
+the value differs), cleaned to PoC so the GPU sees it:
+
+```
+word[i] = 0xA5A5A5A5 ^ i
+```
+
+Recognisable by its high half, and self-locating — a word found displaced still names the pool index it came
+from. After the job every word classifies as **INTACT** / **ZEROED** (`v == 0`, the class no prior boot could
+observe) / **OVERWRITTEN**, reported with first- and last-touched index and byte span.
+
+`V3D56_POISON` (default `true`) gates it; set `false` to restore the historical pre-zeroed pool for a
+like-for-like diff against the V3D-40..55 logs.
+
+### Item 2 — the alias question, and why the brief's form of it does not apply
+
+The arc brief asked for a CPU read of the pool's page through the BCM2711 `0xC0000000` uncached-SDRAM alias and
+the `0x80000000` alias. **That premise does not hold on this part, and acting on it would have manufactured a
+false positive:**
+
+- The `0x0`/`0x4`/`0x8`/`0xC0000000` quadrant aliases are **VideoCore bus** addresses — the cache-behaviour
+  selectors the VPU's MMU applies. They are what the mailbox returns for a firmware buffer and what a VPU-side
+  peripheral consumes.
+- **V3D on BCM2711 does not issue VC bus addresses.** It issues IOVAs into its *own* MMU (`V3D_MMU_CTL` /
+  `PT_PA_BASE` — the table this driver publishes), and the translated result goes onto the SoC fabric as a plain
+  physical address. There is no VC-alias stage anywhere in that path.
+- On a 4 GiB Pi 4, ARM physical `0xC0000000` is **real, distinct DRAM** (BCM2711 puts the low peripheral window
+  at `0xFC000000` and main peripherals at `0xFE000000`; everything below is contiguous RAM). Reading it and
+  finding nonzero bytes would prove only that some unrelated part of the system owns that memory.
+- Establishing such a mapping needs `memory.rs`, **outside this arc's lane** — a STOP tripwire independent of
+  the above.
+
+The in-lane substitute is strictly stronger for the actual question ("where did the bytes land?"). The **only**
+addresses the V3D MMU grants this job are the identity-mapped arena pages, so if the PTB wrote anywhere the GPU
+can reach, the bytes are in the arena. `[v3d56] landing` digests **every** arena page (order-sensitive, so a
+permutation still registers) immediately before the GO and again after the post-retire readback, and reports
+which pages changed — separating the pool/tile-state pages from **STRAY** changes elsewhere.
+
+A stray page names the landing zone by offset. No stray page, with `BPCA` advanced, is the reservation reading
+confirmed over the whole reachable address space rather than inferred from two pre-zeroed regions.
+
+The post-job invalidate here is `cache::invalidate_range`, **not** `clean_invalidate_range`: the arena was
+cleaned to PoC before the kick and the CPU has not written it since, so there are no dirty lines to preserve —
+and a clean pass would risk writing CPU-stale zeros back over GPU-written bytes, destroying the evidence.
+
+### Item 4 — the FLDONE interrupt triple
+
+With item 3 collapsing the defect back onto empty-frame `FLDONE`, `[v3d56] int` dumps the status/mask/masked
+triple at wait **entry** and **exit**, on *both* `wait_fldone` exits (the timeout exit is the one the empty rung
+takes, so it is the one that must speak).
+
+Mask polarity is confirmed upstream — `v3d_irq_enable` (`drivers/gpu/drm/v3d/v3d_irq.c`) writes
+`INT_MSK_SET = ~V3D_CORE_IRQS` then `INT_MSK_CLR = V3D_CORE_IRQS`, so **1 = MASKED**, as this driver has assumed
+since V3D-49. Note the line's own caveat: `wait_fldone` polls `INT_STS`, the **raw** latch, which the mask does
+not gate — so a masked-but-latched `FLDONE` would already have been visible. The triple puts that reasoning on
+serial with numbers instead of leaving it implicit, and discriminates *flush never happened* from *flush
+happened, delivery masked*.
+
+Two further upstream facts fold in, and both **exonerate** current code:
+
+- **`FLDONE` is asserted by the binning FLUSH completing, not by `CT0CA` reaching `CT0EA`.** `CT0CA==CT0EA` says
+  only that the CLE consumed the list. The required BCL shape is `TILE_BINNING_MODE_CFG` → `START_TILE_BINNING`
+  → (draws) → `FLUSH` (packet code 4, `src/broadcom/cle/v3d_packet.xml`), kicked by `CT0QBA` then `CT0QEA`.
+  This driver's empty rung already emits exactly that chain (`P_START_TILE_BINNING = 6`, `P_FLUSH = 4`) — **the
+  list shape is not the gap.**
+- **`ETFILT`/`ETPROC`/`ETSFLUSH` cannot be the cause.** Those empty-tile controls live in `V3D_CLE_CT1QCFG` —
+  **render-side (CT1)** config (`v3d_regs.h`) — and cannot suppress a bin-side `FLDONE`.
+
+Also corrected against §19/§23: mainline `v3d_regs.h` defines **no bit fields at all** for `V3D_CLE_CT0CS`
+(`0x00100`) — no `CTRUN`, no `CTRSTA`, no flush bits. Any `CTRUN`-based retire test is driver folklore, not an
+upstream-sanctioned interface; `FLDONE` is the only bin-retire signal the kernel consumes.
+
+### Witness formats
+
+```
+:: V3D: [v3d56] armed — tile-state (<n> B) + tile-alloc pool (<n> B) filled with poison
+        word[i] = 0xa5a5a5a5^i (was: zeroed) and cleaned to PoC. … ::
+:: V3D: [v3d56] poison (<tag>) <region> iova=0x……… words=<n> — INTACT=<n> ZEROED=<n> OVERWRITTEN=<n>
+        touched=<n> | first_touched=[<i>] (got 0x……… expected 0x………) last_touched=[<i>]
+        | byte span [0x…,0x…] | L2T write-back completed=<0|1> — <verdict> ::
+:: V3D: [v3d56] bpca-vs-bytes (<tag>) — BPCA=0x……… pool_base=0x……… advance=0x… (<n> B)
+        | Mesa v3d_tile_alloc_sizes predicts 0x3000 for an EMPTY bin on this 1x1-tile frame
+        (align(1*1*1*128,4096)+8192) — match=<0|1> | poison says touched through byte 0x… (<n> B)
+        | delta=<n> — <verdict> ::
+:: V3D: [v3d56] landing (<tag>) — arena <n> pages (0x40000 B @ 0x………, the ENTIRE address space the
+        V3D MMU grants this job) | changed=<n> (pool/tile-state pages <a>..<b>,<c> : <n>
+        | STRAY elsewhere: <n>) first_stray_page=<i> (off 0x…) last_stray_page=<i> — <verdict> ::
+:: V3D: [v3d56] int (<what>) — ENTRY INT_STS=0x……… INT_MSK_STS=0x……… | EXIT INT_STS=0x………
+        INT_MSK_STS=0x……… (1=MASKED) | FLDONE(bit1): latched=<0|1> masked=<0|1>
+        | working-set V3D_IRQS=0x……… unmasked_now=0x……… | latched-but-masked=0x……… — <verdict> ::
+```
+
+`armed` fires once per probe; `poison` twice (tile-state, tile-alloc); `bpca-vs-bytes` and `landing` once each;
+`int` on both `wait_fldone` exits.
+
+### What P56 metal decides
+
+The BPCA question is **already closed by source** — metal only confirms the `0x3000` match on the
+`bpca-vs-bytes` line. What metal genuinely decides is the poison:
+
+- **Poison fully INTACT** → the PTB wrote nothing at all, reservation-only, and the arc's whole remaining
+  surface is empty-frame `FLDONE` generation.
+- **Poison ZEROED** → the PTB *did* write, with zeros, and the "nothing was written" premise under V3D-40..55
+  was false for the entire series.
+- **Poison OVERWRITTEN** → real primitive output exists and the defect was always frame-close.
+
+Any **STRAY** page on `[v3d56] landing` overrides all three and reopens the address question with an offset
+attached.
+
+QEMU `raspi4b` models no V3D block — the run returns at `BLOCK-DOWN` before the probe, so **no** `[v3d56]` line
+appears there, and `kernel8-test` green means *no regression*, not probe verification.

@@ -2070,6 +2070,322 @@ fn v3d55_tilestate_readback(tag: &str, cl_iova: u32, ts_iova: u32, pool_iova: u3
     v3d55_pte_line(tag, "tile-alloc ", pool_iova);
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════════
+// PI-V3D-56 — make the phantom bytes FINDABLE.
+//
+// Standing V3D-55 evidence: the CLE walks BA→EA, the QPU runs, the core is clocked (CYCLE_COUNT +249M
+// over the 500 ms wait), the GPU MMU is enabled and fault-free with our identity table latched — and
+// yet the 32 KiB tile-alloc pool and the 192 B tile-state array read ENTIRELY ZERO after a COMPLETED
+// L2T write-back, while BPCA sits 0x3000 bytes off the pool base. The recorded verdict was "BPCA is a
+// phantom/aliased write pointer".
+//
+// That verdict rests on an inference this arc removes: a pool that STARTS all-zero cannot distinguish
+// "the PTB never wrote" from "the PTB wrote zeros". Every witness to date pre-zeroed the pool, so a
+// PTB write of zero bytes — precisely what an EMPTY tile list would emit — has been INVISIBLE. Poison
+// the pool and the tile-state before the kick with an index-encoding pattern and ANY touch, zero or
+// not, becomes a positive observation.
+//
+// Read-only except the poison fill itself (which replaces the existing zero fill of the same two
+// regions — same bytes touched, different value; no new region is written).
+// ══════════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Arm the V3D-56 poison. ON by default: it is this arc's primary witness, and it is strictly more
+/// informative than the zero fill it replaces (a zeroed pool cannot witness a zero-valued write).
+/// Flip to `false` to restore the historical pre-zeroed pool for a like-for-like diff against the
+/// V3D-40..55 logs.
+const V3D56_POISON: bool = true;
+/// Poison base pattern. The stored word is `V3D56_POISON_SEED ^ index`, so every word is (a) instantly
+/// recognisable by its high half (0xA5A5….) and (b) self-locating — a word found displaced elsewhere
+/// still names the pool index it came from. `^` (not `+`) keeps the high half clean for pool indices
+/// up to 0xFFFF, i.e. the whole 32 KiB / 8192-word pool.
+const V3D56_POISON_SEED: u32 = 0xA5A5_A5A5;
+
+#[inline]
+fn v3d56_poison_word(i: usize) -> u32 {
+    V3D56_POISON_SEED ^ (i as u32)
+}
+
+// ── The BPCA-semantics finding (V3D-56 item 3) — the phantom verdict RETRACTED on source evidence ──
+//
+// BPCA/BPCS are documented, and v42 keeps the VC4 (V3D 2.x) meaning at the same offsets 0x300/0x304
+// (Linux `drivers/gpu/drm/v3d/v3d_regs.h`: `V3D_PTB_BPCA 0x00300` / `BPCS 0x00304`; identical in
+// `drivers/gpu/drm/vc4/vc4_regs.h`). The upstream headers carry no comments; the field text is the
+// VideoCore IV 3D Architecture Reference Guide's:
+//
+//     V3D_BPCA — "Current Address Of Binning Memory Pool"   (read-only)
+//     V3D_BPCS — "Remaining Size Of Binning Memory Pool"    (read-only)
+//
+// i.e. BPCA is the pool's **allocation pointer** (a byte address; on v42 an MMU virtual address), and
+// BPCS the **bytes remaining**. Neither is a bytes-WRITTEN counter — the ISA's written-work counters
+// are CT0LC/CT0PC. This is the load-bearing distinction the phantom verdict missed.
+//
+// The decisive fact, from Mesa `src/broadcom/common/v3d_util.c` (`v3d_tile_alloc_sizes`), quoted:
+//
+//     /* The PTB will request the tile alloc initial size per tile at start
+//      * of tile binning. The size must match the initial block size
+//      * configured in the TILE_BINNING_MODE_CFG packet. */
+//     uint32_t tiles_size = layers * tiles_x * tiles_y * V3D_TILE_ALLOC_INITIAL_BLOCK_SIZE;
+//     /* The PTB allocates in aligned 4k chunks after the initial setup. */
+//     uint32_t alloc_size = align(tiles_size, 4096);
+//     /* Include the first two chunk allocations that the PTB does so that
+//      * we definitely clear the OOM condition before triggering one (the HW
+//      * won't trigger OOM during the first allocations). */
+//     alloc_size += 8192;
+//
+// So the PTB RESERVES per-tile initial blocks at START_TILE_BINNING — unconditionally, before and
+// independent of any primitive — and thereafter grabs memory in aligned 4 KiB chunks, performing at
+// least two such chunk allocations up front. **Reservation moves BPCA and writes nothing.**
+//
+// Apply the formula to our frame. 64×64 target, 64×64 tiles, 1 layer → tiles_x = tiles_y = 1:
+//
+//     tiles_size  = 1 × 1 × 1 × 128                  = 128 B   (V3D_TILE_ALLOC_INITIAL_BLOCK_SIZE,
+//                                                               `src/broadcom/common/v3d_limits.h`,
+//                                                               and the block size our
+//                                                               TILE_BINNING_MODE_CFG programs)
+//     align(128, 4096)                               = 0x1000
+//     + the two up-front 4 KiB chunk allocations     = 0x2000
+//     ────────────────────────────────────────────────────────
+//     expected BPCA advance on an EMPTY bin          = 0x3000
+//
+// The V3D-40 and V3D-55 metal boots measured BPCA advanced by **exactly 0x3000** off the pool base.
+// That is not an approximate match — it is the formula's value to the byte, over a pool that reads
+// entirely zero, which is precisely what pure reservation predicts.
+//
+// CONCLUSION: BPCA advancing 0x3000 with an untouched pool is ARCHITECTURAL for an empty bin frame.
+// The "phantom/aliased write pointer" verdict is RETRACTED — there are no phantom bytes, because
+// there were never any bytes: BPCA was reporting reserved space, and the driver read it as written
+// space. The address question does NOT reopen; the GPU MMU evidence (enabled, fault-free, our table
+// latched) stands unchallenged. The defect collapses back to FLDONE generation on an empty frame,
+// which is what `v3d56_emit_int_triple` below instruments.
+//
+// Corroborating detail for the FLDONE hunt (same sources): FLDONE is asserted by the binning FLUSH
+// completing, not by CT0CA reaching CT0EA — CT0CA==CT0EA says only that the CLE consumed the list.
+// The required BCL shape is TILE_BINNING_MODE_CFG → START_TILE_BINNING → (draws) → FLUSH (packet
+// code 4, `src/broadcom/cle/v3d_packet.xml`), kicked by CT0QBA then CT0QEA. This driver's empty rung
+// already emits exactly that chain (`P_START_TILE_BINNING` = 6, `P_FLUSH` = 4 below), so the list
+// shape is not the gap either. Mask polarity, from `v3d_irq_enable` (`v3d_irq.c`) —
+// `INT_MSK_SET = ~V3D_CORE_IRQS` then `INT_MSK_CLR = V3D_CORE_IRQS` — confirms **1 = MASKED**, as
+// this driver has assumed since V3D-49.
+/// The BPCA advance the Mesa reservation formula predicts for this frame on an EMPTY bin:
+/// `align(layers × tiles_x × tiles_y × 128, 4096) + 8192`, with 1×1 tiles → `0x1000 + 0x2000`.
+/// Reported alongside the measured advance so the match (or a divergence) is on serial, not in a
+/// comment.
+const V3D56_EXPECTED_EMPTY_BPCA_ADVANCE: u32 = 0x1000 + 0x2000;
+
+/// Fill `bytes` at arena offset `off` with the index-encoding poison and clean it to PoC so the GPU
+/// (which reads DRAM behind its own L2T, not the CPU's caches) sees the poison and not a stale line.
+fn v3d56_poison_region(off: usize, bytes: usize) {
+    for i in 0..(bytes / 4) {
+        arena_write_u32(off + i * 4, v3d56_poison_word(i));
+    }
+    cache::clean_range(arena_phys() + off, bytes);
+}
+
+/// Outcome of one poisoned-region scan. `first`/`last` are word indices, −1 when untouched.
+struct V3d56Scan {
+    words: usize,
+    intact: u32,
+    zeroed: u32,
+    overwritten: u32,
+    first: i32,
+    last: i32,
+    first_got: u32,
+    first_exp: u32,
+}
+
+/// Scan a poisoned region for disturbance. Reads through `iova` — identity-mapped to the arena VA, so
+/// this is literally the address the GPU was handed, the same property `[v3d55] pte` publishes. The
+/// caller is responsible for the L2T write-back + CPU invalidate that make DRAM authoritative.
+///
+/// Classifies every word into INTACT (poison as written), ZEROED (v == 0 — the write an empty tile
+/// list would make, and the class no prior witness could see) or OVERWRITTEN (any other value).
+fn v3d56_scan(iova: u32, bytes: usize) -> V3d56Scan {
+    let words = bytes / 4;
+    let mut s = V3d56Scan {
+        words,
+        intact: 0,
+        zeroed: 0,
+        overwritten: 0,
+        first: -1,
+        last: -1,
+        first_got: 0,
+        first_exp: 0,
+    };
+    for i in 0..words {
+        let v = unsafe { core::ptr::read_volatile((iova as usize + i * 4) as *const u32) };
+        let exp = v3d56_poison_word(i);
+        if v == exp {
+            s.intact += 1;
+            continue;
+        }
+        if v == 0 {
+            s.zeroed += 1;
+        } else {
+            s.overwritten += 1;
+        }
+        if s.first < 0 {
+            s.first = i as i32;
+            s.first_got = v;
+            s.first_exp = exp;
+        }
+        s.last = i as i32;
+    }
+    s
+}
+
+/// Emit one `[v3d56] poison` witness for a scanned region.
+fn v3d56_emit_scan(tag: &str, what: &str, iova: u32, s: &V3d56Scan, flush_done: bool) {
+    let touched = s.zeroed + s.overwritten;
+    serial_println!(
+        ":: V3D: [v3d56] poison ({}) {} iova={:#010x} words={} — INTACT={} ZEROED={} OVERWRITTEN={} touched={} | first_touched=[{}] (got {:#010x} expected {:#010x}) last_touched=[{}] | byte span [{:#x},{:#x}] | L2T write-back completed={} — {} ::",
+        tag, what, iova, s.words, s.intact, s.zeroed, s.overwritten, touched,
+        s.first, s.first_got, s.first_exp, s.last,
+        if s.first < 0 { 0 } else { s.first as usize * 4 },
+        if s.last < 0 { 0 } else { s.last as usize * 4 + 3 },
+        flush_done as u32,
+        if !flush_done {
+            "L2T WRITE-BACK DID NOT COMPLETE — no touched/untouched verdict from this line at all; the bytes may still be parked in L2T (same caveat [v3d55] tilestate carries)"
+        } else if touched == 0 {
+            "POISON FULLY INTACT after a completed write-back: the PTB wrote NOTHING here — not primitives, not zeros, not a header. This is the first witness able to say that, because a pre-zeroed region could never distinguish 'never written' from 'written with zeros'"
+        } else if s.overwritten == 0 {
+            "POISON ZEROED (and only zeroed): the PTB DID write this region — with zero bytes. Every previous boot pre-zeroed the pool, so this write has been invisible for the entire V3D-40..55 series and the 'nothing was written' premise under the phantom-BPCA verdict is FALSE. Zero-valued tile-list output is what an EMPTY bin frame emits; cross-read the BPCA-semantics note below"
+        } else {
+            "POISON OVERWRITTEN with non-zero data: the PTB emitted real bytes here. The pool is NOT empty and the phantom-BPCA verdict is RETRACTED for this region — the defect is downstream of the write, at frame-close (FLDONE/BFC)"
+        }
+    );
+}
+
+// ── The landing-zone sweep (the in-lane form of the alias question) ────────────────────────────────
+//
+// The brief asks for a CPU read of the pool's physical page "through the other BCM2711 aliases — the
+// 0xC0000000 uncached-SDRAM alias window and the 0x80000000 alias". That premise does not hold on this
+// part, and acting on it would manufacture a false positive:
+//
+//   * The 0x0/0x4/0x8/0xC0000000 quadrant aliases are **VideoCore bus** addresses (the L1/L2 cache
+//     behaviour selectors the VPU's MMU applies), not ARM physical addresses. They are what the
+//     mailbox hands back for a firmware buffer, and what a VPU-side peripheral consumes.
+//   * V3D on BCM2711 does not issue VC bus addresses. It issues IOVAs into its OWN MMU (V3D_MMU_CTL /
+//     PT_PA_BASE — the table this driver publishes), and the translated result goes straight onto the
+//     SoC fabric as a plain physical address. There is no VC-alias stage in that path.
+//   * On a 4 GiB Pi 4 the ARM physical address 0xC0000000 is REAL, DISTINCT DRAM (BCM2711 places the
+//     low peripheral window at 0xFC00_0000 and main peripherals at 0xFE00_0000; everything below is
+//     contiguous RAM). Mapping it and finding nonzero bytes would prove only that some unrelated part
+//     of the system owns that memory — it could not be evidence about our pool.
+//   * Establishing such a mapping would require `memory.rs`, which is outside this arc's lane
+//     (v3d.rs + v3d.md, mailbox additive) — a STOP tripwire even if the premise had held.
+//
+// The sound in-lane substitute is strictly stronger for the actual question ("where did the bytes
+// land?"): the ONLY addresses the V3D MMU grants this job are the identity-mapped arena pages. If the
+// PTB wrote anywhere the GPU can reach, the bytes are in the arena. So digest EVERY arena page across
+// the bin window (immediately before the GO, again after the post-retire readback) and report which
+// pages CHANGED. A change outside the pool + tile-state pages IS the phantom landing zone, named by
+// page. A change in NO page, with BPCA advanced, is the phantom verdict standing — but now on a
+// whole-address-space observation rather than an inference from two pre-zeroed regions.
+
+/// Per-page digest of the whole arena: (nonzero-word count, order-sensitive checksum) per 4 KiB page.
+/// Order-sensitive so a permutation of the same bytes still registers as a change.
+struct V3d56ArenaDigest {
+    pages: usize,
+    sum: [u32; V3D56_DIGEST_MAX_PAGES],
+}
+
+/// Static cap on the digest table. `ARENA_BYTES / PAGE` today; the const assert below keeps it honest
+/// if the arena ever grows.
+const V3D56_DIGEST_MAX_PAGES: usize = 64;
+const _: () = assert!(ARENA_BYTES / PAGE <= V3D56_DIGEST_MAX_PAGES);
+
+/// Digest every arena page. Pure CPU reads of DRAM; the caller does the cache maintenance that makes
+/// DRAM authoritative (pre-kick the arena is CPU-clean by construction, post-kick the L2T write-back +
+/// `clean_invalidate_range` in the readback path have already run).
+fn v3d56_arena_digest() -> V3d56ArenaDigest {
+    let pages = ARENA_BYTES / PAGE;
+    let mut d = V3d56ArenaDigest { pages, sum: [0u32; V3D56_DIGEST_MAX_PAGES] };
+    let base = arena_phys();
+    for p in 0..pages {
+        let mut acc: u32 = 0x811c_9dc5; // FNV-1a offset basis; any order-sensitive mix would do
+        for i in 0..(PAGE / 4) {
+            let v = unsafe { core::ptr::read_volatile((base + p * PAGE + i * 4) as *const u32) };
+            acc = (acc ^ v).wrapping_mul(0x0100_0193);
+        }
+        d.sum[p] = acc;
+    }
+    d
+}
+
+/// Compare two arena digests and emit the `[v3d56] landing` witness. `pool_off`/`ts_off` name the two
+/// pages a legitimate bin write is allowed to change, so anything else is called out by name.
+fn v3d56_emit_landing(tag: &str, pre: &V3d56ArenaDigest, post: &V3d56ArenaDigest) {
+    let pool_first = OFF_BIN_TILEALLOC / PAGE;
+    let pool_last = (OFF_BIN_TILEALLOC + BIN_TILEALLOC_BYTES - 1) / PAGE;
+    let ts_page = OFF_TILESTATE / PAGE;
+    let mut changed = 0u32;
+    let mut expected = 0u32; // changes inside pool / tile-state pages
+    let mut stray = 0u32; // changes ANYWHERE else — the phantom landing zone
+    let mut first_stray: i32 = -1;
+    let mut last_stray: i32 = -1;
+    let pages = pre.pages.min(post.pages);
+    for p in 0..pages {
+        if pre.sum[p] == post.sum[p] {
+            continue;
+        }
+        changed += 1;
+        if (p >= pool_first && p <= pool_last) || p == ts_page {
+            expected += 1;
+        } else {
+            stray += 1;
+            if first_stray < 0 {
+                first_stray = p as i32;
+            }
+            last_stray = p as i32;
+        }
+    }
+    serial_println!(
+        ":: V3D: [v3d56] landing ({}) — arena {} pages ({:#x} B @ {:#010x}, the ENTIRE address space the V3D MMU grants this job) | changed={} (pool/tile-state pages {}..{},{} : {} | STRAY elsewhere: {}) first_stray_page={} (off {:#x}) last_stray_page={} — {} ::",
+        tag, pages, ARENA_BYTES, arena_phys(),
+        changed, pool_first, pool_last, ts_page, expected, stray,
+        first_stray,
+        if first_stray < 0 { 0 } else { first_stray as usize * PAGE },
+        last_stray,
+        if stray != 0 {
+            "STRAY PAGE CHANGED across the bin window: the PTB's bytes landed OUTSIDE the pool and tile-state, inside the mapped arena. The phantom is located — read the offset above against the arena layout to name the region, and against BPCA to derive the pointer's true base"
+        } else if changed != 0 {
+            "the only pages that changed are the pool / tile-state pages — the PTB wrote exactly where it was told to; nothing is displaced, and the [v3d56] poison lines above say WHAT it wrote there"
+        } else {
+            "NO arena page changed across the bin window. Since the V3D MMU grants this job no other addresses, the PTB wrote NOWHERE the GPU can reach — BPCA advanced without any accompanying memory traffic at all. Read this together with the BPCA-semantics finding: an advance with no write is the signature of a pointer that is reserved/pre-allocated rather than consumed"
+        }
+    );
+}
+
+/// PI-V3D-56 (item 4): the interrupt enable/status/masked triple across the retire wait. Emitted from
+/// `wait_fldone` on both exits. `msk` is the CURRENT mask read from `V3D_CTL_INT_MSK_STS`, where a SET
+/// bit means MASKED (disabled) — the `MSK_SET`/`MSK_CLR` pair this driver has used since V3D-49.
+/// `masked_out` is the delivery-relevant product: bits latched in STS that the mask is suppressing.
+///
+/// This discriminates the two readings of "FLDONE never fires": the flush never happens (STS bit1 never
+/// latches, mask irrelevant), versus the flush happens but delivery is masked (STS bit1 latches while
+/// MSK bit1 is set). Note `wait_fldone` polls INT_STS directly — the RAW latch, which the mask does NOT
+/// gate — so a masked-but-latched FLDONE would already have been seen; this line puts that reasoning on
+/// serial with the numbers instead of leaving it implicit.
+fn v3d56_emit_int_triple(what: &str, sts_entry: u32, msk_entry: u32, sts_exit: u32, msk_exit: u32) {
+    let masked_out_exit = sts_exit & msk_exit;
+    serial_println!(
+        ":: V3D: [v3d56] int ({}) — ENTRY INT_STS={:#010x} INT_MSK_STS={:#010x} | EXIT INT_STS={:#010x} INT_MSK_STS={:#010x} (1=MASKED) | FLDONE(bit1): latched={} masked={} | working-set V3D_IRQS={:#010x} unmasked_now={:#010x} | latched-but-masked={:#010x} — {} ::",
+        what, sts_entry, msk_entry, sts_exit, msk_exit,
+        (sts_exit & V3D_INT_FLDONE != 0) as u32,
+        (msk_exit & V3D_INT_FLDONE != 0) as u32,
+        V3D_IRQS,
+        !msk_exit & V3D_IRQS,
+        masked_out_exit,
+        if sts_exit & V3D_INT_FLDONE != 0 {
+            "FLDONE LATCHED in the raw status — the flush completed; whatever else is wrong, it is not the flush"
+        } else if msk_exit & V3D_INT_FLDONE != 0 {
+            "FLDONE is MASKED — but INT_STS is the RAW latch and the mask does not gate it, so a masked FLDONE would still have shown here. The mask is not the reason bit1 is clear; the flush genuinely did not complete. (Unmask it anyway for the CPU-delivery path: MSK_CLR = V3D_IRQS.)"
+        } else {
+            "FLDONE is UNMASKED and NOT latched across the whole wait: the flush never completed. The wall is the flush/frame-close unit itself, not interrupt routing — no mask, enable or delivery change can move this"
+        }
+    );
+}
+
 /// PI-V3D-54 (RANK 1): poll the CL-progression time-series across the retire-wait (not once after it).
 /// `trace_ba`/`trace_ea` are the submitted CL bounds for the `[v3d54] trace` fold; sampling runs at ~1 ms
 /// cadence and is summarised (transitions, not raw samples) on BOTH the FLDONE-retire and timeout exits.
@@ -2091,6 +2407,10 @@ fn wait_fldone(what: &str, trace_ba: u32, trace_ea: u32) -> (u32, u64, bool) {
     // verdict can say "not armed" instead of fabricating a flat-clock reading on an unarmed wait.
     let pctr_en = mmio_read(V3D_CORE0_BASE, V3D_V4_PCTR_0_EN);
     let mut t_cyc = TraceReg::new(mmio_read(V3D_CORE0_BASE, V3D_PCTR_0_PCTR0 + 8));
+    // PI-V3D-56 (item 4): capture the interrupt status/mask pair at wait ENTRY so the exit line can
+    // report the triple across the window rather than a single end-of-wait snapshot.
+    let sts_entry = mmio_read(V3D_CORE0_BASE, V3D_CTL_INT_STS);
+    let msk_entry = mmio_read(V3D_CORE0_BASE, V3D_CTL_INT_MSK_STS);
     loop {
         let now = super::timer::cntpct();
         // PI-V3D-54: fold a progression sample at the ~1 ms cadence (bounded work — five reads, no logging).
@@ -2109,6 +2429,8 @@ fn wait_fldone(what: &str, trace_ba: u32, trace_ea: u32) -> (u32, u64, bool) {
         let sts = mmio_read(V3D_CORE0_BASE, V3D_CTL_INT_STS);
         if sts & V3D_INT_FLDONE != 0 {
             let waited_us = (super::timer::cntpct().wrapping_sub(start)).saturating_mul(1_000_000) / frq.max(1);
+            // PI-V3D-56 (item 4): the enable/status/masked triple — read the mask BEFORE the W1C below.
+            v3d56_emit_int_triple(what, sts_entry, msk_entry, sts, mmio_read(V3D_CORE0_BASE, V3D_CTL_INT_MSK_STS));
             // W1C the latched status so a stale FLDONE from a prior kick never masquerades as this one's.
             mmio_write(V3D_CORE0_BASE, V3D_CTL_INT_CLR, sts);
             dsb();
@@ -2118,6 +2440,9 @@ fn wait_fldone(what: &str, trace_ba: u32, trace_ea: u32) -> (u32, u64, bool) {
         }
         if super::timer::cntpct() >= deadline {
             let waited_us = (super::timer::cntpct().wrapping_sub(start)).saturating_mul(1_000_000) / frq.max(1);
+            // PI-V3D-56 (item 4): the triple on the TIMEOUT exit too — this is the exit the empty rung
+            // actually takes, so it is the one that has to name flush-vs-delivery.
+            v3d56_emit_int_triple(what, sts_entry, msk_entry, sts, mmio_read(V3D_CORE0_BASE, V3D_CTL_INT_MSK_STS));
             let qpu_vec = (sts & V3D_INT_QPU_MASK) >> V3D_INT_QPU_SHIFT; // which QPU(s) raised a host int
             serial_println!(
                 ":: V3D: [v3d44] FLDONE timeout ({}) — INT_STS={:#010x} (FRDONE={} FLDONE={} OUTOMEM={} SPILLUSE={} TRFB={} GMPV={} QPU_vec={:#06x}) — {} ::",
@@ -3686,11 +4011,23 @@ fn probe_job() {
     }
     // ─────────────────────────────────────────────────────────────────────────────────────────────
 
-    // Bin scratch (reused from M4): zero + clean.
-    fill_region(OFF_TILESTATE, TILE_STATE_BYTES, 0);
-    fill_region(OFF_BIN_TILEALLOC, BIN_TILEALLOC_BYTES, 0);
-    cache::clean_range(arena_phys() + OFF_TILESTATE, TILE_STATE_BYTES);
-    cache::clean_range(arena_phys() + OFF_BIN_TILEALLOC, BIN_TILEALLOC_BYTES);
+    // Bin scratch (reused from M4): zero + clean — or, since PI-V3D-56, POISON + clean. Same two
+    // regions, same bytes touched; the only change is the value. A zeroed pool cannot witness a
+    // zero-valued PTB write, which is exactly the write an empty tile list makes — see the V3D-56
+    // block above for why that blind spot underwrites the whole phantom-BPCA verdict.
+    if V3D56_POISON {
+        v3d56_poison_region(OFF_TILESTATE, TILE_STATE_BYTES);
+        v3d56_poison_region(OFF_BIN_TILEALLOC, BIN_TILEALLOC_BYTES);
+        serial_println!(
+            ":: V3D: [v3d56] armed — tile-state ({} B) + tile-alloc pool ({} B) filled with poison word[i] = {:#010x}^i (was: zeroed) and cleaned to PoC. Post-job any word reading 0 is a PTB write of ZERO — a class every boot from V3D-40 to V3D-55 was structurally unable to observe ::",
+            TILE_STATE_BYTES, BIN_TILEALLOC_BYTES, V3D56_POISON_SEED
+        );
+    } else {
+        fill_region(OFF_TILESTATE, TILE_STATE_BYTES, 0);
+        fill_region(OFF_BIN_TILEALLOC, BIN_TILEALLOC_BYTES, 0);
+        cache::clean_range(arena_phys() + OFF_TILESTATE, TILE_STATE_BYTES);
+        cache::clean_range(arena_phys() + OFF_BIN_TILEALLOC, BIN_TILEALLOC_BYTES);
+    }
     // PI-V3D-44: zero + publish the overflow tile-list pool so the pre-armed BPOA/BPOS block below
     // is fresh, coherent memory the PTB can spill into if the 128 B initial block runs out.
     for i in (0..PROBE_BIN_OVERFLOW_BYTES).step_by(4) {
@@ -3781,6 +4118,10 @@ fn probe_job() {
     // (ptb_frame_witness below) is the started-vs-never-started discriminator for the V3D-40 wall.
     let bfc_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_BFC);
     let rfc_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_RFC);
+    // PI-V3D-56: digest EVERY arena page immediately before the GO. The arena is the entire address
+    // space the V3D MMU grants this job, so the post-job diff answers "where did the bytes land?" over
+    // the whole reachable space, not just the two regions we happen to read back.
+    let arena_pre = v3d56_arena_digest();
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QEA, bin_ea); // GO
     dsb();
     // [v3d40] tight kick witness: sample CT0CS + CT0CA the instant after the GO write — a started CLE
@@ -3841,6 +4182,54 @@ fn probe_job() {
     // tile-state but no FLDONE" from "PTB never wrote". Scan the WHOLE tile-state array + pool head and
     // dump the PTEs covering the CL / tile-state / pool iovas so the aliasing question closes by bytes.
     v3d55_tilestate_readback("v3d40 PROBE post-bin", bin_ba, ts, tile_alloc);
+    // ── [v3d56] the poison scan + the whole-arena landing sweep ───────────────────────────────────
+    // Run our own L2T write-back and KEEP the completion bit (the V3D-55 evidence-integrity rule: an
+    // "untouched" readback is only evidence if the drain actually finished), then invalidate the CPU's
+    // view of the WHOLE arena. `invalidate_range`, not `clean_invalidate_range`: the arena was cleaned
+    // to PoC before the kick and the CPU has not written it since, so there are no dirty lines to
+    // preserve — and a clean pass here could write CPU-stale zeros back over GPU-written bytes, which
+    // would destroy the very evidence this sweep exists to find.
+    if V3D56_POISON {
+        mmio_write(V3D_CORE0_BASE, V3D_CTL_L2TCACTL, V3D_L2TCACTL_L2TFLS | V3D_L2TCACTL_FLM_FLUSH);
+        let flush_done =
+            wait_bit_clear(V3D_CORE0_BASE, V3D_CTL_L2TCACTL, V3D_L2TCACTL_L2TFLS, "L2T write-back (v3d56 poison scan)");
+        mmio_write(V3D_CORE0_BASE, V3D_CTL_SLCACTL, V3D_SLCACTL_INVALIDATE_ALL);
+        dsb();
+        cache::invalidate_range(arena_phys(), ARENA_BYTES);
+        dsb();
+        let ts_scan = v3d56_scan(ts, TILE_STATE_BYTES);
+        let pool_scan = v3d56_scan(tile_alloc, BIN_TILEALLOC_BYTES);
+        v3d56_emit_scan("v3d40 PROBE post-bin", "tile-state", ts, &ts_scan, flush_done);
+        v3d56_emit_scan("v3d40 PROBE post-bin", "tile-alloc", tile_alloc, &pool_scan, flush_done);
+        // Cross-read the pool scan against BPCA: BPCA's advance is a claim about how far the PTB's
+        // write pointer moved; the poison says how far it actually WROTE. Naming the two side by side
+        // is what settles the phantom question — see docs/dev/OS/08_VIDEO/v3d.md §30 for the
+        // BPCA-semantics finding this line has to be read against.
+        let bpca = mmio_read(V3D_CORE0_BASE, V3D_PTB_BPCA);
+        let adv = bpca.wrapping_sub(tile_alloc);
+        let touched_bytes = if pool_scan.last < 0 { 0 } else { (pool_scan.last as u32 + 1) * 4 };
+        serial_println!(
+            ":: V3D: [v3d56] bpca-vs-bytes (v3d40 PROBE post-bin) — BPCA={:#010x} pool_base={:#010x} advance={:#x} ({} B) | Mesa v3d_tile_alloc_sizes predicts {:#x} for an EMPTY bin on this 1x1-tile frame (align(1*1*1*128,4096)+8192) — match={} | poison says touched through byte {:#x} ({} B) | delta={} — {} ::",
+            bpca, tile_alloc, adv, adv,
+            V3D56_EXPECTED_EMPTY_BPCA_ADVANCE,
+            (adv == V3D56_EXPECTED_EMPTY_BPCA_ADVANCE) as u32,
+            touched_bytes, touched_bytes,
+            adv as i64 - touched_bytes as i64,
+            if pool_scan.zeroed + pool_scan.overwritten == 0 && adv == V3D56_EXPECTED_EMPTY_BPCA_ADVANCE {
+                "PHANTOM VERDICT RETRACTED. BPCA advanced by EXACTLY the reservation the Mesa formula predicts for an empty bin, over a pool the poison proves the PTB never touched. BPCA is the pool ALLOCATION pointer (VC4/v42 ARG: 'Current Address Of Binning Memory Pool'), not a bytes-written counter — reservation moves it and writes nothing. There are no phantom bytes because there were never any bytes; the address question does NOT reopen and the MMU evidence stands. The defect is FLDONE generation on an empty frame — see [v3d56] int"
+            } else if pool_scan.zeroed + pool_scan.overwritten == 0 && adv != 0 {
+                "BPCA advanced over a pool the PTB provably never touched (poison fully intact), but NOT by the predicted reservation size. Reservation-without-write is still the leading reading — BPCA is an allocation pointer, so an advance is not evidence of a write — yet the size mismatch means our tile geometry or the programmed initial block size differs from what the formula assumed; re-derive tiles_x/tiles_y and the TILE_BINNING_MODE_CFG block size before drawing a conclusion"
+            } else if adv >= touched_bytes && touched_bytes != 0 {
+                "the PTB both advanced AND wrote, with the advance at or ahead of the last touched byte — consistent, unremarkable pointer behaviour. BPCA is NOT a phantom; the bytes were findable all along and the missing step is frame-close"
+            } else if touched_bytes != 0 {
+                "touched bytes extend BEYOND the BPCA advance — the PTB wrote further than its reported pointer. THIS is a genuine pointer/address inconsistency and the phantom line stays open"
+            } else {
+                "BPCA at the pool base with the poison intact: the PTB neither moved nor wrote. Nothing was reserved and nothing was emitted — the bin frame did not begin"
+            }
+        );
+        let arena_post = v3d56_arena_digest();
+        v3d56_emit_landing("v3d40 PROBE post-bin", &arena_pre, &arena_post);
+    }
     // [v3d41] the decisive discriminator: with the pool + tile-state proven zero above and the coord
     // shader proven to have RUN (v3d35), did START_TILE_BINNING actually complete a PTB bin FRAME? BFC's
     // pre→post delta answers "started vs never-started"; BPCA (the PTB write pointer vs the pool base)
