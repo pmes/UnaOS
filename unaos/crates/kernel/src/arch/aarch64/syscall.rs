@@ -3179,15 +3179,48 @@ fn proc_find_orphaned(pid: u64) -> Option<usize> {
 /// UVUG-8r2: park a Proc entry as `PORPHANED` — the `Timeout` twin of `proc_free`, for a row whose task is
 /// STILL RUNNING. `pid` is deliberately RETAINED (it is the key `proc_find_orphaned` reclaims by); `asid` is
 /// retained too, so a late `sys_xfer`-style pid->ASID lookup still resolves truthfully rather than to a
-/// silently recycled slot. Emits the `[uvug8]` witness so an orphaned run is visible on the serial log.
-fn proc_orphan(i: usize) {
-    PROCS[i].state.store(PORPHANED, Ordering::Release);
+/// silently recycled slot.
+///
+/// The park MUST be a CAS from `PRUNNING`, not a plain store. The scheduler is preemptive and the run-image
+/// task is co-located, so between `run_user_image` reading `state` to decide the outcome and reaching this
+/// call, the app can reach SYS_EXIT: it takes the live-child arm (the row is still `PRUNNING`), stores
+/// `PEXITED`, posts `done`, and retires. A blind store would then park a row whose task is already DEAD, and
+/// nothing would ever reclaim it — `proc_find_orphaned` is consulted only from the task's own exit/kill paths,
+/// which never run again. Four such races would exhaust `MAX_PROCS` until reboot. On CAS failure the task
+/// died in the window, so the row is simply FREED here (returning `false` so the caller can report honestly).
+///
+/// The stray `done` permit that death posted must be consumed before the row is recycled, or the
+/// "reaped-then-reused entry always starts at 0 permits" invariant on `Proc::done` breaks and a later
+/// `sys_wait` on the recycled row would return a bogus status immediately. Both run-image death paths (the
+/// generic SYS_EXIT arm and the EXEC-1 kill arm) post exactly once, so `wait()` acquires promptly and cannot
+/// hang — it is the same reap `sys_wait` performs, just with the status discarded.
+/// Returns `None` when the row was genuinely parked (the task is alive), or `Some(status)` when the task died
+/// in the race window — in which case the row has already been reaped here and `status` is its true exit
+/// status, read BEFORE the row was freed so it cannot be observed after a recycle.
+fn proc_orphan(i: usize) -> Option<i32> {
+    if PROCS[i]
+        .state
+        .compare_exchange(PRUNNING, PORPHANED, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        // Lost the race: the task exited or was killed between the outcome decision and here.
+        let status = PROCS[i].status.load(Ordering::Acquire); // read BEFORE freeing the row
+        let _ = PROCS[i].done.wait(); // consume the permit its death posted (guaranteed, so no hang)
+        serial_println!(
+            "[uvug8] run deadline expired but the EL0 task died in the same window — Proc row {} reaped normally (status={}), not orphaned",
+            i,
+            status
+        );
+        proc_free(i);
+        return Some(status);
+    }
     serial_println!(
         "[uvug8] run deadline expired with the EL0 task STILL ALIVE — Proc row {} parked PORPHANED (pid={}, asid={}); row is reclaimed when the task dies, never reused while it lives",
         i,
         PROCS[i].pid.load(Ordering::Acquire),
         PROCS[i].asid.load(Ordering::Acquire)
     );
+    None
 }
 
 /// Release a Proc entry to FREE — after reaping in sys_wait, or unwinding a failed sys_spawn claim.
@@ -6528,16 +6561,27 @@ pub fn run_user_image(
     // Heartbeat staleness bound: how long the takeover app may go without a SYS_INPUT_POLL before it stops
     // counting as "live in takeover". A frame-driven app polls many times a second, so this is generous.
     let stale_ticks = super::timer::cntfrq().saturating_mul(TAKEOVER_STALE_SECS);
-    // UVUG-8r2 HARD CEILING on total suspended time. The heartbeat proves the app is EXECUTING, not that it is
-    // USEFUL: `loop { sys_input_poll(); }` (broken quit handling), or a poller on a cadence just under
-    // `stale_ticks` oscillating suspend->re-arm forever, keeps the heartbeat fresh and would strand the shell
-    // indefinitely. `gui_watchdog` cannot break the tie — it is fed by the very same heartbeat. So bound the
-    // thing the app CANNOT fake by spinning: cumulative wall time this run has spent suspended. Past the cap we
-    // simply stop honouring takeover; the ordinary 5 s window then runs out and the run ends `Timeout`.
+    // UVUG-8r2 SUSPENSION CAP, on SUSPICION rather than wall clock. The heartbeat proves the app is EXECUTING,
+    // not that it is USEFUL: `loop { sys_input_poll(); }` (broken quit handling), or a poller on a cadence just
+    // under `stale_ticks` oscillating suspend->re-arm forever, keeps the heartbeat fresh and would strand the
+    // shell indefinitely. `gui_watchdog` cannot break the tie — it is fed by the very same heartbeat.
+    //
+    // A pure wall-clock cap was WRONG, though: it would end every genuine interactive session at ~65 s
+    // mid-use, leaving the orphan owning the screen — Timeout-plus-orphan as the normal end state of ordinary
+    // desktop use. So the cap counts only suspended time during which the app produced NO FRAME. `SYS_FB_PRESENT`
+    // is the discriminator: it is the app's actual work product, and — unlike the heartbeat — it cannot be
+    // advanced by spinning on `sys_input_poll`. Any present resets the accumulator, so:
+    //   * a rendering interactive session suspends INDEFINITELY and never times out, however long it runs;
+    //   * an app that polls but renders nothing for `TAKEOVER_SUSPEND_MAX_SECS` of suspended time caps out,
+    //     after which takeover stops suspending and the ordinary 5 s window runs to `Timeout`.
+    // `FB_PRESENT_COUNT` is global rather than per-ASID, but during a `run` the focused app is the only
+    // presenter (the shell is blocked in this loop), and a stray present by anyone else could only be
+    // GENEROUS — it can extend a session, never cut one short.
     let suspend_cap_ticks = super::timer::cntfrq().saturating_mul(TAKEOVER_SUSPEND_MAX_SECS);
     let mut suspended_ticks: u64 = 0;
     let mut prev = start;
     let mut capped_witnessed = false;
+    let mut last_presents = FB_PRESENT_COUNT.load(Ordering::Acquire);
     let mut budget_start = start;
     let mut suspended = false;
     loop {
@@ -6552,6 +6596,15 @@ pub fn run_user_image(
         if suspended {
             suspended_ticks = suspended_ticks.saturating_add(delta);
         }
+        // FRAME PROGRESS clears the suspicion. A present is work the app cannot fake by spinning on
+        // `sys_input_poll`, so any new frame means this is a real rendering session: forgive all suspended time
+        // accrued so far and re-arm the witness. A live desktop session therefore never approaches the cap.
+        let presents = FB_PRESENT_COUNT.load(Ordering::Acquire);
+        if presents != last_presents {
+            last_presents = presents;
+            suspended_ticks = 0;
+            capped_witnessed = false;
+        }
         let gate = takeover_suspends(
             el0_takeover_active(),
             asid,
@@ -6563,7 +6616,7 @@ pub fn run_user_image(
         if capped && !capped_witnessed {
             capped_witnessed = true;
             serial_println!(
-                "[uvug8] suspend CAP reached — EL0 app asid={} held the deadline suspended {}s; takeover no longer suspends, normal window now runs out",
+                "[uvug8] suspend CAP reached — EL0 app asid={} polled for {}s of suspended time WITHOUT PRESENTING A FRAME; takeover no longer suspends, normal window now runs out",
                 asid,
                 TAKEOVER_SUSPEND_MAX_SECS
             );
@@ -6623,11 +6676,25 @@ pub fn run_user_image(
     // the exit/kill paths reclaim it when the orphan really dies. (Pre-r2 this was unreachable in practice —
     // the deadline only expired on a batch program that had already stopped — but the heartbeat gate makes
     // Timeout reachable mid-interaction, so the row hazard is now live.)
-    if matches!(outcome, RunOutcome::Timeout) {
-        proc_orphan(pi);
+    let outcome = if matches!(outcome, RunOutcome::Timeout) {
+        // `proc_orphan` CASes PRUNNING->PORPHANED. `Some(status)` means the task actually died in the race
+        // window, so this was not a real timeout after all: it already freed the row and consumed the `done`
+        // permit, and we report the true exit status rather than a phantom Timeout.
+        match proc_orphan(pi) {
+            None => RunOutcome::Timeout,
+            Some(EXEC_KILLED_STATUS) => RunOutcome::Faulted,
+            Some(s) => RunOutcome::Exited(s),
+        }
     } else {
+        // The task is dead and posted `done` on its way out, but `run_user_image` reaps by polling `state`,
+        // not by `sys_wait` — so that permit is never awaited. Consume it before recycling the row, or the
+        // `Proc::done` "reused entry starts at 0 permits" invariant breaks and a later `sys_wait` on this row
+        // would return immediately with someone else's status. (Pre-existing on this path; it becomes
+        // reachable-in-anger now that rows recycle around timed-out interactive runs.)
+        let _ = PROCS[pi].done.wait();
         proc_free(pi);
-    }
+        outcome
+    };
     Ok((outcome, mapped.base))
 }
 
@@ -9193,14 +9260,17 @@ static EL0_TAKEOVER_HB: AtomicU64 = AtomicU64::new(0);
 /// strand for a hung app bounded at `TAKEOVER_STALE_SECS + deadline` ≈ 7 s instead of forever.
 pub const TAKEOVER_STALE_SECS: u64 = 2;
 
-/// UVUG-8r2: the HARD CEILING on cumulative time one `run` may hold its deadline suspended. The heartbeat
-/// gate bounds a *silent* wedge, but not a *noisy* one: an app spinning on `SYS_INPUT_POLL` keeps the
-/// heartbeat perfectly fresh while doing nothing useful, and an app polling on a cadence just under
-/// `TAKEOVER_STALE_SECS` can oscillate suspend->re-arm forever without ever letting a full deadline window
-/// elapse. Neither can be distinguished from a live session by any signal the app itself produces — so the
-/// bound has to be on something it cannot fake by spinning, namely total suspended WALL TIME. Sixty seconds
-/// is far longer than any interaction this shell's `run` is meant to host, and it converts an unbounded
-/// strand into a guaranteed return to the prompt.
+/// UVUG-8r2: how much suspended time one `run` may accumulate WITHOUT PRESENTING A FRAME before takeover
+/// stops suspending its deadline. The heartbeat gate bounds a *silent* wedge, but not a *noisy* one: an app
+/// spinning on `SYS_INPUT_POLL` keeps the heartbeat perfectly fresh while doing nothing useful, and an app
+/// polling on a cadence just under `TAKEOVER_STALE_SECS` can oscillate suspend->re-arm forever without ever
+/// letting a full deadline window elapse.
+///
+/// The bound is therefore on rendering, not on the clock: `SYS_FB_PRESENT` is the app's real work product and
+/// cannot be advanced by spinning on the input syscall, so any present resets the accumulator (see the wait
+/// loop). This is deliberately NOT a session length limit — a genuine interactive session renders continuously
+/// and runs forever. Sixty seconds of polling with nothing drawn, by contrast, is not a session anyone is
+/// having; that is a wedge, and it ends at the prompt instead of at a reboot.
 pub const TAKEOVER_SUSPEND_MAX_SECS: u64 = 60;
 
 /// Pack a `pal::Event` into the ELF-5 u64 wire form, or `None` for a non-deliverable event (Timer/None/
