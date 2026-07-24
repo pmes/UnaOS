@@ -3,6 +3,35 @@
 Hard-won silicon facts from the fox-metal sitting series. Trust these over any
 QEMU behavior. Newest sitting first.
 
+## Sitting #21 (display pull 11 + fence pull 18, UnaOS-gemini@f9e987f6/366e5b05, 2026-07-24, fox-metal-r23s1j)
+
+**Fence — Falcon ground truth: PGRAPH IS POWERED OFF AT PMC.** Every
+falcon/pgraph register (cpuctl, bootvec, core block, imemc/dmemc, all 32
+status rows) reads **0xBADF1200** on both passes, both boots — the NVIDIA
+pri-error pattern for a clock/power-gated engine, not garbage. And the
+cause is in our own reprint: **PMC_ENABLE = 0xE011216D has bit 12 (PGRAPH)
+CLEAR.** We never enabled the engine; nothing behind it can respond. This
+also retro-explains the whole fence wall shape: PFIFO accepts config but
+strips VALID/POLL for a channel whose target engine is powered off.
+Pull 19 = set PMC_ENABLE bit 12 (single write + readback), re-dump the
+Falcon block, expect BADF1200 → real values. First genuinely hopeful fence
+step since s7.
+
+**Display — bh ladder: NO rung clean; a second parameter rides along.**
+Monotonic structure across bh 2/4/8/16 (photos, notes in
+`capture/rmbp-s18/s21boot2-panel-observations.md`): seam count halves as bh
+doubles (~6 @bh4, ~3-4 @bh8, ~2 @bh16), shear per seam grows with bh,
+stripe thickness scales with bh. White column never assembled. Read: GOB
+64B×8 stands (s20), block stacking is real, but our blocks-per-row term is
+wrong — prime suspect is PITCH ALIGNMENT (hw aligns the surface to a
+block-column granularity; 180 GOBs/row is not aligned). Pull 12 = two-axis
+mini-ladder: bh ∈ {4,8} × pitch_gobs ∈ {192, 256} (aligned candidates),
+four cycles, 5 s holds. Seam count → 0 at the right pitch.
+
+Beacons re-confirmed none-seen; mirror-hdr 256-row passes present (window
+still parked). 5 s holds (366e5b05 revision) gave the bench camera time —
+keep that as the standing hold length.
+
 ## Sitting #20 (display pull 10 + fence pull 17, UnaOS-gemini@1e68c270, 2026-07-24, fox-metal-r23s1j)
 
 **Display — BLOCK-LINEAR CONFIRMED.** The GOB 64B×8 pre-swizzle killed the
