@@ -1,4 +1,4 @@
-STATUS: PROPOSED
+STATUS: APPROVED (2026-07-24 — clean match to brief, no amendments)
 
 # Proposal: kepler-fence pull 17 — window-vs-latch correlation (read-only)
 

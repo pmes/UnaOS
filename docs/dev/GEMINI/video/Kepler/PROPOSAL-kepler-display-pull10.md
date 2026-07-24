@@ -1,4 +1,4 @@
-STATUS: PROPOSED
+STATUS: APPROVED (2026-07-24 — clean match to brief; transform arithmetic verified: 180 GOBs/row, block-height 1)
 
 # PROPOSAL — kepler-display pull 10: pre-swizzled ruler (block-linear proof)
 
