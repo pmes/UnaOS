@@ -336,7 +336,9 @@ pub unsafe fn takeover_display(
         mmio_write(bar0, update_reg, 0x00000000);
         
         // 4 s hold
-        for t in 1..=4 {
+        // 5 s per hold — bench needs camera time between the four bh cycles
+        // (Peter, s21 prep: 4 s was too fast to photograph).
+        for t in 1..=5 {
             for _ in 0..60_000_000 { core::hint::spin_loop(); }
             serial_println!(":: kdisp: bh-step bh={} hold t={}s ::", bh, t);
         }
