@@ -22,6 +22,8 @@
 //!   `FrameBuffer`s (the framebuffer + a cached-RAM back buffer). The steady-state GUI renderer.
 //! - [`fbcon`] — the boot/panic text console (a log sink for hardware with no serial port),
 //!   drawn straight to its own `FrameBuffer` handle (it runs pre-heap, so no back buffer).
+//! - [`wm`] — the window table and compositor: EL0 surfaces composited onto the panel with
+//!   kernel-drawn chrome. `screen::present_surface` is a compat shim over its window 0.
 //! - [`WRITER`] — the framebuffer the GUI's `Screen` flushes to and that fbcon mirrors onto.
 //!
 //! `WRITER` and `fbcon` are handles to the *same* physical framebuffer; they are used at
@@ -31,6 +33,9 @@
 pub mod fbcon;
 pub mod framebuffer;
 pub mod screen;
+// WC-A: the window table + compositor. Owns which pixels of which surface reach the panel; the
+// aarch64 window syscalls (WC-B) are thin fail-closed wrappers over its API.
+pub mod wm;
 // VWIT: headless regression witness for the damage-tracked `Screen` present path (arch-neutral;
 // runs only when the `tste` self-test is invoked). See `docs/dev/OS/08_VIDEO/engine.md` §7.
 pub mod witness;
