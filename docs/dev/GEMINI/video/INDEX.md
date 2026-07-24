@@ -6,7 +6,7 @@ Three pull sequences, numbered independently. Every pull = one BRIEF (coordinato
 ## Lane 1: Kepler FENCE (PFIFO/scheduler — kepler.rs) — `video/Kepler/`, files `*kepler-fence-pull<N>*` (pulls ≤13: `*kepler-pull<N>*`)
 | Pull | Files | Status | One-liner |
 |---|---|---|---|
-| 18 | BRIEF-kepler-fence-pull18-falcon-recon | BRIEFED — awaiting proposal (K-GPU-4 arc OPEN, Peter-ruled 2026-07-24) | read-only PGRAPH Falcon ground-truth dump (CPUCTL/BOOTVEC/IMEMC/status) |
+| 18 | BRIEF-kepler-fence-pull18-falcon-recon / PROPOSAL-kepler-fence-pull18 | LANDED 9dacbd8c — metal owed s21 (K-GPU-4 arc) | read-only PGRAPH Falcon ground-truth dump (CPUCTL/BOOTVEC/IMEMC/status) |
 | 17 | BRIEF-kepler-fence-pull17-latch-correlation / PROPOSAL-kepler-fence-pull17 | LANDED 7ac404d8; s20: latch-delta NONE + pre all-zero — window DEAD ROAD, parked; fallback ladder EXHAUSTED → PGRAPH/ucode pivot is a Peter call | pre-takeover window dump + latch-delta diff |
 | 16 | BRIEF-kepler-fence-pull16-beacon / PROPOSAL-kepler-fence-pull16 | LANDED 200be275; s19: NONE-SEEN (not our structures); window stable in-boot (p1→p2 zero deltas) | VRAM beacons in our channel structures |
 | 15 | BRIEF-kepler-fence-pull15-mirror-recon / PROPOSAL-kepler-fence-pull15 | LANDED 51b98bab; s18: DELIVERED — window VOLATILE (fill grew 62→158 rows; memory-backed hypothesis) | read-only dense dump of method-mirror header 0x640000–0x6403FC |
@@ -23,7 +23,7 @@ Three pull sequences, numbered independently. Every pull = one BRIEF (coordinato
 ## Lane 2: Kepler DISPLAY (scanout — kepler_display.rs after split) — `video/Kepler/`, files `*kepler-display-pull<N>*`
 | Pull | Files | Status | One-liner |
 |---|---|---|---|
-| 11 | BRIEF-kepler-display-pull11-blockheight | BRIEFED — awaiting proposal | four-hold block-height ladder (bh 2/4/8/16) — clean photo names the real bh |
+| 11 | BRIEF-kepler-display-pull11-blockheight / PROPOSAL-kepler-display-pull11 | LANDED 410996eb — metal owed s21 | four-hold block-height ladder (bh 2/4/8/16) — clean photo names the real bh |
 | 10 | BRIEF-kepler-display-pull10-swizzle / PROPOSAL-kepler-display-pull10 | LANDED fec4b73f; s20: BLOCK-LINEAR CONFIRMED (checkerboard gone; brick-seams = block-height wrong) | pre-swizzled ruler (GOB 64B×8) |
 | 9 | BRIEF-kepler-display-pull9-ruler / PROPOSAL-kepler-display-pull9 | LANDED 3ce77eda; s19: DELIVERED — full cycle compressed ~8×, 16-px checkerboard, no white column → BLOCK-LINEAR hypothesis | ruler fill (64-row color cycle + wide left marker) |
 | 8 | BRIEF-kepler-display-pull8-pattern / PROPOSAL-kepler-display-pull8 | LANDED 3bb0621c; s18: DELIVERED — early rows → bottom band; left-bar wraps as dashes (pitch≠11520 hypothesis); no blue/white | same latch, quarters+leftbar pattern fill |
