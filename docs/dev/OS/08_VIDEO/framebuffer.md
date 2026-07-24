@@ -121,6 +121,42 @@ ballooning both the raster fill and the flush bytes as the frame time decayed.
 
 This is what the console / `pal::TargetPal` draws through in steady state.
 
+### VUG-FPS-4 — the flush is already per-rect; the missing frame time is the tail
+
+A P47 reading of the steady-state `[vugfps]` line (`rects≈4 union≈1380×1180`,
+`~3 MB/frame`, `raster 23–30 ms + flush ~19 ms`, `~5–6 fps`) raised the question
+of whether the four disjoint rects were collapsing to one panel-spanning *flush*.
+They are not. `flush()` iterates the damage rects and blits each independently
+(the serial path in `Screen::flush`, and the VUG-PAR band path likewise clips each
+rect into its band), so `last_flush_bytes` is the **sum of the rects' areas**, not
+the union bbox's area. The proof rides the existing witness: `union=1380×1180`
+(≈1.6 M px ≈ 6.5 MB) while `bytes/frame ≈ 3 MB` — the flush already moves only
+~half the union, i.e. the true per-rect sum. The 3 MB is dominated by the
+crystal's own full-height bounding box (a real, moving region that must be
+repainted), so there is no disjoint-union flush to eliminate — VUG-FPS/-3 already
+collapsed the bytes to the per-rect sum. `union=WxH` is a *diagnostic bbox* the
+witness reports, never the quantity flushed.
+
+That left P47's bigger puzzle: raster + flush explained only ~45 ms of a ~172 ms
+frame. The missing ~130 ms is **outside** the raster+flush bracket the `[vugfps]`
+line timed — it is the post-present **tail**: the accounting after `pal.render()`
+plus the `yield_now()` cooperative-reschedule gap before the next frame's loop
+head, during which the crystal task is de-scheduled while `CNTVCT` free-runs. To
+name it rather than infer it, the `vug` loop now also emits (~1×/s):
+
+```
+[vugfps4] drain=Aus draw=Bus flush=Cus tail=Dus  sum=Sus (=1e6/fps) — tail is the post-present yield/reschedule gap
+```
+
+`drain` (input pump), `draw` (all rasterisation after the drain), `flush`
+(`pal.render()`, identical to `[vugfps]`'s `flush`) and `tail` are **disjoint**
+and tile the whole frame, so `sum` tracks `1000000/fps`: every microsecond is
+attributed. On the next metal capture the ~130 ms lands in `tail`, confirming the
+frame is neither raster- nor bandwidth-bound but **reschedule-bound** — the
+cooperative single-present-per-frame loop yielding a full scheduler round-trip
+between frames. (QEMU raspi4b cannot reproduce the metal scheduler timing; the
+split ships on the same serial line the metal capture reads.)
+
 ---
 
 ## 5. `fbcon` — boot and panic console

@@ -619,6 +619,23 @@ pub fn run_crystal(pal: &mut TargetPal, mode: Mode) {
     let mut wit_rects: usize = 0;
     let mut wit_uw: usize = 0;
     let mut wit_uh: usize = 0;
+    // VUG-FPS-4: the end-to-end per-frame budget. P46/P47 showed raster+flush explained only ~45 ms of a
+    // ~172 ms frame — the bigger half was OUTSIDE the raster+flush bracket the `[vugfps]` witness timed.
+    // Split the frame into four DISJOINT phases so a metal capture NAMES where every microsecond goes:
+    //   * `drain` — input drain (`drain_game_input`: the pump of the event queue this frame),
+    //   * `draw`  — all back-buffer rasterisation after the drain (erase + triangles + HUD + meters + cursor),
+    //   * `flush` — the present span (`pal.render()`, the bandwidth path; same value `[vugfps]` reports),
+    //   * `tail`  — from `pal.render()` returning to the NEXT frame's loop head: the witness/meter accounting
+    //               AND the `yield_now()` reschedule gap. On metal that gap — the cooperative scheduler
+    //               round-trip between frames — is the ~130 ms `[vugfps]` never bracketed; it accrues real
+    //               wall-clock (CNTVCT free-runs) while the crystal task is DE-SCHEDULED between frames.
+    // `tail` is measured across the loop boundary (`prev_flush_end` → this frame's `top`); the other three
+    // come from in-frame `now_cycles()` reads. Together they sum to the whole frame period, so the four
+    // µs/frame numbers add up to 1000000/fps — the missing time has nowhere left to hide.
+    let mut wit_drain_cyc: u64 = 0;
+    let mut wit_draw_cyc: u64 = 0;
+    let mut wit_tail_cyc: u64 = 0;
+    let mut prev_flush_end = crate::arch::now_cycles();
 
     // GAME-MODE TRUE held-key model (GAME-MODE-2b). Since HID-KEYS the HID path delivers a Key on the
     // PRESS edge and a KeyUp on the RELEASE edge, so a key's held bit is set on press and cleared on
@@ -639,10 +656,15 @@ pub fn run_crystal(pal: &mut TargetPal, mode: Mode) {
 
     loop {
         let top = crate::arch::now_cycles();
+        // VUG-FPS-4: the frame boundary. `top - prev_flush_end` is the `tail` phase of the PRIOR frame —
+        // the accounting + `yield_now()` reschedule gap between the last present and this loop head, the
+        // span outside the raster+flush bracket where the metal capture's missing ~130 ms lives.
+        wit_tail_cyc += top.wrapping_sub(prev_flush_end);
         // --- GAME-MODE input: held-key stepping + drag-rotate, frame-paced -----------------
         // Drain ALL pending events this frame (a burst never backs up one-per-frame; each drain
         // pass feeds the app-input watchdog via note_progress). A non-mapped key or a click exits.
         let gi = drain_game_input(pal);
+        let after_drain = crate::arch::now_cycles(); // VUG-FPS-4: end of the `drain` phase
         if gi.exit {
             serial_println!(":: [game] exit=key ::");
             break;
@@ -910,6 +932,12 @@ pub fn run_crystal(pal: &mut TargetPal, mode: Mode) {
         let flush_end = crate::arch::now_cycles();
         wit_flush_cyc += flush_end.wrapping_sub(flush_t0);
         wit_raster_cyc += flush_t0.wrapping_sub(top);
+        // VUG-FPS-4: the fine-grained split. `drain` = drain span; `draw` = raster after the drain; the
+        // `tail` of THIS frame is folded in at the next loop head (`top - prev_flush_end`), so record the
+        // present-end timestamp for that boundary measurement.
+        wit_drain_cyc += after_drain.wrapping_sub(top);
+        wit_draw_cyc += flush_t0.wrapping_sub(after_drain);
+        prev_flush_end = flush_end;
 
         // VUG-FPS witness: accumulate this frame's flushed bytes and print a `[vugfps]` line ~1x/s.
         wit_bytes += pal.last_flush_bytes();
@@ -957,6 +985,25 @@ pub fn run_crystal(pal: &mut TargetPal, mode: Mode) {
                     wit_frames,
                     wdt
                 );
+                // VUG-FPS-4: the end-to-end phase breakdown. drain + draw + flush + tail sum to the whole
+                // frame period, so `sum` should track 1000000/fps to within rounding — if it does, the four
+                // numbers account for 100% of the frame and the "missing ~130 ms" is named, not inferred.
+                // `tail` is the accounting + `yield_now()` reschedule gap between present and the next frame.
+                let drain_us = wit_drain_cyc / wit_frames as u64 / cyc_per_us;
+                let draw_us = wit_draw_cyc / wit_frames as u64 / cyc_per_us;
+                let tail_us = wit_tail_cyc / wit_frames as u64 / cyc_per_us;
+                let sum_us = drain_us + draw_us + flush_us + tail_us;
+                serial_println!(
+                    ":: [vugfps4] drain={}us draw={}us flush={}us tail={}us  sum={}us (=1e6/fps) \
+                     — tail is the post-present yield/reschedule gap ({} frames / {} ms) ::",
+                    drain_us,
+                    draw_us,
+                    flush_us,
+                    tail_us,
+                    sum_us,
+                    wit_frames,
+                    wdt
+                );
                 wit_ms = wnow;
                 wit_frames = 0;
                 wit_bytes = 0;
@@ -966,6 +1013,9 @@ pub fn run_crystal(pal: &mut TargetPal, mode: Mode) {
                 wit_uh = 0;
                 wit_raster_cyc = 0;
                 wit_flush_cyc = 0;
+                wit_drain_cyc = 0;
+                wit_draw_cyc = 0;
+                wit_tail_cyc = 0;
             }
         }
 
