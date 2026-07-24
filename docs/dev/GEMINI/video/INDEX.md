@@ -6,6 +6,7 @@ Three pull sequences, numbered independently. Every pull = one BRIEF (coordinato
 ## Lane 1: Kepler FENCE (PFIFO/scheduler — kepler.rs) — `video/Kepler/`, files `*kepler-fence-pull<N>*` (pulls ≤13: `*kepler-pull<N>*`)
 | Pull | Files | Status | One-liner |
 |---|---|---|---|
+| 18 | BRIEF-kepler-fence-pull18-falcon-recon | BRIEFED — awaiting proposal (K-GPU-4 arc OPEN, Peter-ruled 2026-07-24) | read-only PGRAPH Falcon ground-truth dump (CPUCTL/BOOTVEC/IMEMC/status) |
 | 17 | BRIEF-kepler-fence-pull17-latch-correlation / PROPOSAL-kepler-fence-pull17 | LANDED 7ac404d8; s20: latch-delta NONE + pre all-zero — window DEAD ROAD, parked; fallback ladder EXHAUSTED → PGRAPH/ucode pivot is a Peter call | pre-takeover window dump + latch-delta diff |
 | 16 | BRIEF-kepler-fence-pull16-beacon / PROPOSAL-kepler-fence-pull16 | LANDED 200be275; s19: NONE-SEEN (not our structures); window stable in-boot (p1→p2 zero deltas) | VRAM beacons in our channel structures |
 | 15 | BRIEF-kepler-fence-pull15-mirror-recon / PROPOSAL-kepler-fence-pull15 | LANDED 51b98bab; s18: DELIVERED — window VOLATILE (fill grew 62→158 rows; memory-backed hypothesis) | read-only dense dump of method-mirror header 0x640000–0x6403FC |
