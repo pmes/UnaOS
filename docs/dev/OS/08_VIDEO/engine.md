@@ -584,3 +584,61 @@ over `create` / `present` / `move_to` / `close`; the per-ASID ownership gate rea
 `clear_handle_row` calls **both** `close_owner` (for the ASID's own windows) and `close_compat` (for
 the ownerless shim row). `create` must be passed the mapped slot's real byte length as `surf_len`.
 `SYS_FB_MAP` / `SYS_FB_PRESENT` stay as compat wrappers over the compat window.
+
+### WC-INT — the wired seam
+
+The two units are joined. WC-B's `WINDOWS` table stays authoritative for id allocation and ownership;
+`wm::create` mints its own `WinId` out of its own table, and WC-B stores that id in the row's `wm_id`
+field. The two id spaces are never assumed to line up — every later `wm` call goes through `wm_id`.
+`WIN_NONE` is a legal value everywhere, so a window the compositor refused (full table, or geometry
+the extent contract rejects) simply has no compositor presence and its verbs still succeed at the
+WC-B layer. `surf_len` is WC-B's `pages * 0x1000`, the real mapped-slot byte length, never a
+recomputed `h * stride`.
+
+`SYS_FB_MAP`'s compat row deliberately gets **no** `wm` window (`wm_id` stays `WIN_NONE`): the compat
+window is minted lazily by `compat_present` and reaped by `close_compat`. A `wm::create` there would
+mint a chrome-bearing, tiled window and the pre-WC UVUG panel output would change.
+
+**One forwarding, not two.** Before integration, both the syscall present body and
+`screen::present_surface` ended in a present. Now the two cases are exclusive: `wm_id != WIN_NONE`
+damage-marks and composites through `wm::present` and never touches the ELF-3 hook; `wm_id ==
+WIN_NONE` forwards to the hook, whose target computes the legacy geometry and hands off to
+`compat_present`. Both sit *below* the focus-guarded `EL0_FOCUSED_PRESENT_COUNT` bump and the
+`FB_PRESENT_COUNT`/checksum witness, so the UVUG-8 suspension cap and the ELF-3 fb-test `present == 1`
+verdict are driven by one accounting block whichever path renders.
+
+#### Lock order across the seam
+
+The global order is **`WINDOWS` ⊃ `wm::TABLE` ⊃ `video::WRITER`**, and it is verified, not assumed:
+
+- `WINDOWS` (WC-B's `SpinMutex`, always taken IRQ-masked) is the outermost lock. `sys_win_present`
+  holds it across the whole present *including* the composite — deliberately, so the id handed to the
+  compositor is provably the id the ownership gate validated (a `close` + `create` pair on other cores
+  could otherwise recycle the id in the gap and land the caller's pixels under a new owner's identity).
+- Nothing in `video/wm.rs` or `video/screen.rs` references the syscall layer at all, so **no path
+  acquires `WINDOWS` from inside `wm`**. The edge is one-way by construction, and the cycle that would
+  make the held-across-composite hold dangerous cannot be formed.
+- The `TABLE ⊃ WRITER` half is stronger than stated: the two are **never held simultaneously**. Every
+  `WRITER` acquisition in the lane is the statement form `let fb = *WRITER.lock();` — `FrameBuffer` is
+  `Copy`, so the guard is a temporary dropped at the end of that statement, and what survives is a
+  value. `move_to`, `erase`, `composite`, `place` and `present_surface` all read the panel geometry
+  that way *before* or *after* their table critical section, never inside it. So a present never holds
+  the window lock across a scan-out cache clean, and there is no order to invert.
+- `COMPAT_CREATE` sits strictly outside `TABLE` (it is taken only in `compat_present`, around the
+  check-and-create) and is never taken while `TABLE` is held.
+
+**The drain barrier is safe under this order.** `close`/`close_owner` spin until in-flight composites
+finish. Every caller invokes them with `WINDOWS` *released* — `sys_win_close` and `win_close_asid`
+collect the `wm_id`s inside the lock and destroy outside it, and `clear_handle_row` calls
+`close_owner`/`close_compat` after `win_close_asid` has returned. Even if a drain *did* run under
+`WINDOWS`, it would still terminate: a composite blocked waiting on `WINDOWS` has not yet reached
+`wm`, so it has not incremented `BLIT_ACTIVE` and is not a member of the drain set. Registration
+happens inside `wm::TABLE`, strictly after `WINDOWS` is acquired. Combined with `DRAIN_PENDING` —
+which makes any composite that takes `TABLE` after the barrier goes up skip without registering — the
+wait set is fixed at entry, finite, and every member is running a bounded panel-clipped blit. **The
+drain set is closed.** That matters because teardown (`sched::exit` → `clear_handle_row` →
+`close_owner`) spins IRQ-masked and unpreemptible: a livelock here would be a dead core, not a slow one.
+
+Teardown order is WC-B first, then `wm`: `win_close_asid` unmaps the surfaces and frees the rows, then
+`close_owner` sweeps any compositor row whose WC-B row a racing `sys_win_close` already freed, and
+`close_compat` reaps the one row that has no owner ASID to match on.

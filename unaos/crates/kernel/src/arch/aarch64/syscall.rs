@@ -3599,6 +3599,22 @@ pub fn clear_handle_row(asid: u64) {
     // frame the slot's NEXT tenant gets, so the next program's private memory would be composited to the
     // panel. Unmaps the surfaces too, so the reused ASID starts with the reserved EL1-only leaves.
     win_close_asid(asid);
+    // WC-INT: the COMPOSITOR-side teardown, after WC-B's table teardown above and never before it. Order is
+    // load-bearing in both directions:
+    //   * WC-B first — `win_close_asid` unmaps the surfaces and frees the rows while holding `WINDOWS`, then
+    //     closes each bound `wm` window OUTSIDE that hold. Doing wm first would leave WC-B rows briefly naming
+    //     windows the compositor has already reaped.
+    //   * `close_owner` then `close_compat` — a belt-and-braces sweep for anything `win_close_asid` could not
+    //     reach. `close_owner(asid)` catches a compositor row whose WC-B row was already freed by a racing
+    //     `sys_win_close` that had not yet run its `destroy`. `close_compat()` is the one WC-A explicitly
+    //     cannot reap on its own: the compat row is minted through the `SYS_FB_PRESENT` hook, whose signature
+    //     carries no ASID, so it has no owner for `close_owner` to match. Without this call it is IMMORTAL —
+    //     every later composite would re-blit whatever now lives in the dead surface's backing frame, i.e. the
+    //     next tenant of this slot's private memory, straight onto the panel.
+    // Both run with `WINDOWS` released (`win_close_asid` has returned), so their drain barriers cannot spin
+    // inside a lock a presenter is waiting on.
+    crate::video::wm::close_owner(asid);
+    crate::video::wm::close_compat();
 }
 
 /// The ASID of the address space the caller is running in, read from `TTBR0_EL1[63:48]`. A syscall executes
@@ -9211,7 +9227,16 @@ fn sys_fb_present() -> i64 {
     // table lock, for the same reason `sys_win_present` does — see the note there.
     let _irq = IrqGuard::mask_save();
     let t = WINDOWS.lock();
+    // WC-INT: the compat verb always presents through the compat path (`WIN_NONE`), whatever the caller's
+    // region-slot-0 row says — `win_bind_compat` never binds a `wm` window, and this is the path whose panel
+    // output the pre-WC UVUG baseline pins. Looking the row up is still worth doing (it is the F2 identity
+    // hold WC-B documents), but its `wm_id` is `WIN_NONE` by construction; asserted rather than assumed.
     let win = (0..WIN_MAX).find(|&i| t[i].owner == asid && t[i].rslot == 0);
+    debug_assert!(
+        win.map(|i| t[i].wm_id == crate::video::wm::WIN_NONE).unwrap_or(true),
+        "compat row must carry no wm window"
+    );
+    let _ = win;
     present_surface_common(
         asid,
         super::boot::slot_fb_surface_ptr(slot),
@@ -9219,7 +9244,7 @@ fn sys_fb_present() -> i64 {
         super::boot::FB_SURFACE_H,
         super::boot::FB_SURFACE_STRIDE,
         super::boot::FB_SURFACE_SIZE,
-        win,
+        crate::video::wm::WIN_NONE,
     );
     drop(t);
     0
@@ -9235,7 +9260,7 @@ fn present_surface_common(
     h: u32,
     stride: u32,
     size: usize,
-    win: Option<usize>,
+    wm_id: crate::video::wm::WinId,
 ) {
     let sum = fb_checksum(surf, size);
     FB_PRESENT_CHECKSUM.store(sum, Ordering::Release);
@@ -9253,10 +9278,24 @@ fn present_surface_common(
     if EL0_INPUT_ACTIVE.load(Ordering::Acquire) == asid {
         EL0_FOCUSED_PRESENT_COUNT.fetch_add(1, Ordering::AcqRel);
     }
-    // WC-INTEGRATION: `wc_shim::present` stands in for `video::wm::present(win, surf, w, h, stride)` —
-    // damage-mark the window and run the compositor pass. Until WC-A lands, the shim forwards to the
-    // ELF-3 present hook (the single-surface centred blit), which is exactly today's behaviour.
-    wc_shim::present(win, surf as *const u8, w, h, stride);
+    // WC-INT — ONE forwarding, not two. Before integration both this body and `video::screen::present_surface`
+    // ended in a present: this one called the ELF-3 hook, and the hook's target then ran its own centred blit.
+    // With WC-A in, `present_surface` no longer blits — it computes the legacy geometry and hands off to
+    // `wm::compat_present` — so calling the hook AND `wm::present` here would composite the same frame twice.
+    // The duplicate is dropped by making the two cases exclusive:
+    //   * `wm_id != WIN_NONE` — a real window (SYS_WIN_PRESENT). Damage-mark it and composite, WITH chrome,
+    //     at the compositor's tiled placement. The hook is not involved.
+    //   * `wm_id == WIN_NONE` — the compat surface (SYS_FB_PRESENT, and any window whose `wm::create` was
+    //     refused). Forward to the ELF-3 hook exactly as before; `present_surface` -> `wm::compat_present`
+    //     reaches the compositor's chrome-less compat row, so the panel stays byte-identical to pre-WC.
+    // Both cases sit BELOW the focus-guarded `EL0_FOCUSED_PRESENT_COUNT` bump and the `FB_PRESENT_COUNT` /
+    // checksum witness above, so the UVUG-8 suspension cap and the ELF-3 fb-test `present == 1` verdict are
+    // driven by the single accounting block regardless of which path renders.
+    if wm_id != crate::video::wm::WIN_NONE {
+        wc_shim::present(wm_id);
+    } else {
+        wc_shim::present_compat(surf as *const u8, w, h, stride);
+    }
 }
 
 // =============================================================================================
@@ -9301,10 +9340,27 @@ struct WinEntry {
     h: u16,
     x: i32,
     y: i32,
+    /// WC-INT: the compositor's OWN id for this window (`video::wm::WinId`), or `wm::WIN_NONE` when this
+    /// row has no compositor window. The two id spaces are deliberately separate: THIS table is
+    /// authoritative for allocation and ownership (EL0 passes the index of this array to the verbs), while
+    /// `video::wm::create` mints its own [`video::wm::WinId`] out of its own fixed table. Storing wm's id
+    /// here is the whole binding — every later `wm` call goes through this field, never through a
+    /// coincidence of the two indices lining up (they do NOT: wm ids are `1..=MAX_WINDOWS`, and wm's
+    /// compat row can occupy a slot no WC-B row corresponds to).
+    wm_id: crate::video::wm::WinId,
 }
 
 impl WinEntry {
-    const FREE: WinEntry = WinEntry { owner: 0, rslot: 0, pages: 0, w: 0, h: 0, x: 0, y: 0 };
+    const FREE: WinEntry = WinEntry {
+        owner: 0,
+        rslot: 0,
+        pages: 0,
+        w: 0,
+        h: 0,
+        x: 0,
+        y: 0,
+        wm_id: crate::video::wm::WIN_NONE,
+    };
 }
 
 /// WC-B: the window table. A `SpinMutex` on the OWNED_FILES idiom (const-new, `Copy` rows), taken
@@ -9341,6 +9397,13 @@ fn win_pages_for(w: u32, h: u32) -> Option<usize> {
 /// a window. Returns the id, or `None` when region slot 0 is already the caller's (idempotent re-map — a
 /// second call must not mint a second window) or when the table is full (the legacy map still succeeds;
 /// see `sys_fb_map`).
+///
+/// WC-INT — this row deliberately gets NO `video::wm` window (`wm_id` stays `WIN_NONE`). The compat
+/// surface's compositor window is minted lazily by `wm::compat_present` (and reaped by `wm::close_compat`),
+/// which is what keeps the legacy `SYS_FB_MAP` + `SYS_FB_PRESENT` pair byte-for-byte identical on the
+/// panel: a `wm::create` here would mint a CHROME-BEARING, TILED window and the pre-WC UVUG output would
+/// change. The WC-B row still exists so the window table reports the caller's compat window and so
+/// teardown unmaps its pages; only the compositor binding is left to `wm`'s compat path.
 fn win_bind_compat(asid: u64, _slot: usize) -> Option<usize> {
     let _irq = IrqGuard::mask_save();
     let mut t = WINDOWS.lock();
@@ -9356,17 +9419,9 @@ fn win_bind_compat(asid: u64, _slot: usize) -> Option<usize> {
         h: super::boot::FB_SURFACE_H as u16,
         x: 0,
         y: 0,
+        // WC-INT: see the doc comment — the compat window belongs to `wm::compat_present`, not to us.
+        wm_id: crate::video::wm::WIN_NONE,
     };
-    // WC-INTEGRATION: `video::wm::create(id, asid, x, y, w, h, surface_ptr, stride)`.
-    wc_shim::create(
-        id,
-        asid,
-        0,
-        0,
-        super::boot::FB_SURFACE_W,
-        super::boot::FB_SURFACE_H,
-        super::boot::FB_SURFACE_STRIDE,
-    );
     Some(id)
 }
 
@@ -9455,7 +9510,7 @@ fn sys_win_create(w: u64, h: u64) -> i64 {
         Some(i) => i,
         None => return ENFILE,
     };
-    let e = WinEntry {
+    let mut e = WinEntry {
         owner: asid,
         rslot: rslot as u8,
         pages: pages as u8,
@@ -9463,6 +9518,7 @@ fn sys_win_create(w: u64, h: u64) -> i64 {
         h: h32 as u16,
         x: 0,
         y: 0,
+        wm_id: crate::video::wm::WIN_NONE,
     };
     // Map the info page (idempotent) and exactly the negotiated pages of this window's surface slot.
     // Under the table lock, so no concurrent close on another core can break-before-make the same leaves.
@@ -9470,6 +9526,21 @@ fn sys_win_create(w: u64, h: u64) -> i64 {
         super::boot::map_slot_fb_info(slot);
         super::boot::map_slot_fb_win(slot, rslot, pages);
     }
+    // WC-INT: bind the compositor window BEFORE publishing the row, so the row is never visible to another
+    // core with a stale `wm_id`. The surface pointer is the kernel's identity-mapped view of the leaves
+    // just mapped above, and `surf_len` is the REAL byte length of that mapped slot (`pages * 0x1000`, the
+    // page-multiple this verb negotiated) — never a recomputed `h * stride`. That distinction is WC-A's F1
+    // contract: `h`/`stride` are EL0-influenced, `pages` comes from the mapping code, and it is `surf_len`
+    // that bounds every source read the compositor performs.
+    e.wm_id = wc_shim::create(
+        asid,
+        super::boot::slot_fb_win_surface_ptr(slot, rslot) as usize,
+        pages * 0x1000,
+        w32,
+        h32,
+        w32 * 4,
+        id,
+    );
     t[id] = e;
     if rslot == 0 {
         // Region slot 0 is what the LEGACY header describes; keep it truthful for this geometry.
@@ -9483,8 +9554,6 @@ fn sys_win_create(w: u64, h: u64) -> i64 {
         }
     }
     fb_info_write_win(slot, id, &e);
-    // WC-INTEGRATION: `video::wm::create(id, asid, x, y, w, h, surface_ptr, stride)`.
-    wc_shim::create(id, asid, 0, 0, w32, h32, w32 * 4);
     id as i64
 }
 
@@ -9503,9 +9572,17 @@ fn sys_win_create(w: u64, h: u64) -> i64 {
 /// IRQ-masked spinlock — the same class of hold the MMU maintenance in create/close already takes, and
 /// bounded by the 64 KiB surface cap.
 ///
-/// LOCK ORDER for the integrator: `WINDOWS` is a LEAF lock here, and `video::wm`'s own state is acquired
-/// strictly INSIDE it (`wc_shim::present` is called with `WINDOWS` held, never the reverse). Nothing under
-/// `wm` may call back into a window verb.
+/// LOCK ORDER — VERIFIED at integration (WC-INT; the argument is written out in engine.md §8). The global
+/// order is `WINDOWS` ⊃ `video::wm::TABLE` ⊃ `video::WRITER`. `WINDOWS` is the OUTERMOST lock and `wm`'s own
+/// state is acquired strictly inside it (`wc_shim::present` is called with `WINDOWS` held, never the
+/// reverse). The reverse edge does not exist by construction: neither `video/wm.rs` nor `video/screen.rs`
+/// references the syscall layer, so nothing under `wm` can call back into a window verb. The inner half is
+/// stronger than the order states — `wm` never holds `TABLE` and `WRITER` at the same time (every `WRITER`
+/// acquisition there is a `let fb = *WRITER.lock();` statement whose guard drops immediately, `FrameBuffer`
+/// being `Copy`), so a present never holds a window lock across a scan-out cache clean.
+///
+/// The one hold that must NOT be taken with `WINDOWS` is `wm::close`/`close_owner`: they run a drain barrier
+/// that spins on in-flight composites. Every call site here releases `WINDOWS` first — see `sys_win_close`.
 fn sys_win_present(win: u64) -> i64 {
     let asid = match win_caller_slot() {
         Ok(v) => v,
@@ -9533,7 +9610,7 @@ fn sys_win_present(win: u64) -> i64 {
         e.h as u32,
         e.w as u32 * 4,
         e.pages as usize * 0x1000,
-        Some(id),
+        e.wm_id,
     );
     drop(t);
     0
@@ -9555,7 +9632,7 @@ fn sys_win_move(win: u64, x: u64, y: u64) -> i64 {
         Ok(v) => v,
         Err(err) => return err,
     };
-    {
+    let wm_id = {
         let _irq = IrqGuard::mask_save();
         let mut t = WINDOWS.lock();
         // Re-check under the lock: a teardown on another core could have freed the row since resolve.
@@ -9564,9 +9641,12 @@ fn sys_win_move(win: u64, x: u64, y: u64) -> i64 {
         }
         t[id].x = xi as i32;
         t[id].y = yi as i32;
-    }
-    // WC-INTEGRATION: `video::wm::move_window(id, x, y)`.
-    wc_shim::move_window(id, xi as i32, yi as i32);
+        t[id].wm_id
+    };
+    // WC-INT: `video::wm::move_to`. Negative coordinates are the caller's to ask for and the compositor's to
+    // refuse — `move_to` clamps on BOTH bounds against the live panel geometry, so the saturating cast here
+    // lands a negative request at the compositor's minimum origin rather than at `usize::MAX` (WC-A's F5).
+    wc_shim::move_window(wm_id, xi.max(0) as usize, yi.max(0) as usize);
     0
 }
 
@@ -9583,7 +9663,7 @@ fn sys_win_close(win: u64) -> i64 {
         Err(err) => return err,
     };
     let slot = (asid - 1) as usize;
-    {
+    let wm_id = {
         let _irq = IrqGuard::mask_save();
         let mut t = WINDOWS.lock();
         if t[id].owner != asid {
@@ -9593,9 +9673,12 @@ fn sys_win_close(win: u64) -> i64 {
         unsafe { super::boot::unmap_slot_fb_win(slot, e.rslot as usize, e.pages as usize) };
         fb_info_clear_win(slot, e.rslot as usize);
         t[id] = WinEntry::FREE;
-    }
-    // WC-INTEGRATION: `video::wm::destroy(id)`.
-    wc_shim::destroy(id);
+        e.wm_id
+    };
+    // WC-INT: `video::wm::close`. Deliberately OUTSIDE the `WINDOWS` hold — `wm::close` runs a drain barrier
+    // that spins until in-flight composites finish, and the surface it is draining has just been unmapped
+    // above, so the drain must not be nested inside the lock a racing presenter may be waiting on.
+    wc_shim::destroy(wm_id);
     0
 }
 
@@ -9609,7 +9692,7 @@ pub fn win_close_asid(asid: u64) {
         return;
     }
     let slot = (asid - 1) as usize;
-    let mut closed = [false; WIN_MAX];
+    let mut closed = [crate::video::wm::WIN_NONE; WIN_MAX];
     {
         let _irq = IrqGuard::mask_save();
         let mut t = WINDOWS.lock();
@@ -9621,34 +9704,62 @@ pub fn win_close_asid(asid: u64) {
             unsafe { super::boot::unmap_slot_fb_win(slot, e.rslot as usize, e.pages as usize) };
             fb_info_clear_win(slot, e.rslot as usize);
             t[id] = WinEntry::FREE;
-            closed[id] = true;
+            closed[id] = e.wm_id;
         }
     }
-    for (id, &c) in closed.iter().enumerate() {
-        if c {
-            // WC-INTEGRATION: `video::wm::destroy(id)`.
-            wc_shim::destroy(id);
-        }
+    // WC-INT: outside the `WINDOWS` hold, for the drain-barrier reason spelled out in `sys_win_close`.
+    for &wm_id in closed.iter() {
+        wc_shim::destroy(wm_id);
     }
 }
 
-/// WC-B ↔ WC-A INTEGRATION SEAM. This module is a deliberately minimal stand-in for `video::wm` (unit
-/// WC-A's compositor core), which does not exist in this worktree — the two units are developed in
-/// parallel, lane-disjoint. Every call site into it is marked `// WC-INTEGRATION:` with the real API call
-/// it stands for, so the integrator's job is a mechanical swap of four function bodies:
-///   `create(id, asid, x, y, w, h, stride)`  -> `video::wm::create(...)`
-///   `present(win, surf, w, h, stride)`      -> `video::wm::present(...)` (damage-mark + composite)
-///   `move_window(id, x, y)`                 -> `video::wm::move_window(...)`
-///   `destroy(id)`                           -> `video::wm::destroy(...)`
-/// The shim carries NO state and NO policy: ownership, geometry validation and the surface mapping all
-/// live above, in the syscall gates, so swapping it in cannot move any security check. Until then
-/// `present` forwards to the ELF-3 present hook, which is byte-for-byte today's behaviour.
+/// WC-B ↔ WC-A INTEGRATION SEAM — **wired** (WC-INT). This module was a stand-in while the two units were
+/// developed in parallel and lane-disjoint; the stub bodies are now the real `video::wm` calls. It survives
+/// as the seam itself: exactly four functions, no state and no policy. Ownership, geometry validation and
+/// the surface mapping all live above in the syscall gates, so nothing here carries security weight — the
+/// only thing it does is translate WC-B's table row into a `video::wm::WinId` call.
+///
+/// `WIN_NONE` is accepted (and ignored) by every entry point, so callers never have to branch: a window
+/// whose `wm::create` was refused — a full compositor table, a geometry the extent contract rejects — simply
+/// has no compositor presence, and its verbs still succeed at the WC-B layer. That is the fail-closed
+/// direction: nothing extra reaches the panel.
+///
+/// LOCK ORDER (see `sys_win_present` and engine.md §8): every function here EXCEPT `destroy` may be called
+/// with `WINDOWS` held; `wm`'s own `TABLE` and `video::WRITER` are therefore strictly inside it.
 mod wc_shim {
     use super::{FbPresentFn, Ordering, FB_PRESENT_HOOK};
+    use crate::video::wm::{self, WinId, WIN_NONE};
 
-    pub fn create(_id: usize, _asid: u64, _x: i32, _y: i32, _w: u32, _h: u32, _stride: u32) {}
+    /// `video::wm::create`. `surf_len` is the REAL mapped-slot byte length (WC-B's `pages * 0x1000`), the
+    /// bound WC-A's F1 extent contract requires; `id` is WC-B's own row index, used only to build the
+    /// kernel-owned title (an app never supplies its window's title — chrome is kernel-drawn, always).
+    /// Returns wm's id, or `WIN_NONE` if the compositor refused.
+    pub fn create(
+        asid: u64,
+        surf: usize,
+        surf_len: usize,
+        w: u32,
+        h: u32,
+        stride: u32,
+        id: usize,
+    ) -> WinId {
+        // Kernel-owned title: "el0 win N". Built here, from the kernel's own id, never from EL0 bytes.
+        let title = [b'e', b'l', b'0', b' ', b'w', b'i', b'n', b' ', b'0' + (id as u8 % 10)];
+        wm::create(asid, surf, surf_len, w, h, stride, &title)
+    }
 
-    pub fn present(_win: Option<usize>, surf: *const u8, w: u32, h: u32, stride: u32) {
+    /// `video::wm::present` — damage-mark and run the compositor pass. Called with `WINDOWS` held (WC-B
+    /// holds it across the composite so the id it validated is provably still the id wm is handed).
+    pub fn present(id: WinId) {
+        if id != WIN_NONE {
+            wm::present(id);
+        }
+    }
+
+    /// The COMPAT present: forward to the ELF-3 hook (`video::screen::present_surface`), which computes the
+    /// legacy centred geometry and hands it to `wm::compat_present` — a chrome-less compositor row that
+    /// flushes exactly the rows the pre-WC blit did. The one place the hook is still called.
+    pub fn present_compat(surf: *const u8, w: u32, h: u32, stride: u32) {
         let hook = FB_PRESENT_HOOK.load(Ordering::Acquire);
         if hook != 0 {
             // SAFETY: only `register_fb_present_hook` ever stores here, always a valid `FbPresentFn`.
@@ -9657,9 +9768,19 @@ mod wc_shim {
         }
     }
 
-    pub fn move_window(_id: usize, _x: i32, _y: i32) {}
+    /// `video::wm::move_to`. The compositor clamps the origin to the live panel on both bounds.
+    pub fn move_window(id: WinId, x: usize, y: usize) {
+        if id != WIN_NONE {
+            wm::move_to(id, x, y);
+        }
+    }
 
-    pub fn destroy(_id: usize) {}
+    /// `video::wm::close`. Runs a drain barrier, so every caller invokes it with `WINDOWS` RELEASED.
+    pub fn destroy(id: WinId) {
+        if id != WIN_NONE {
+            wm::close(id);
+        }
+    }
 }
 
 /// SYS_FUTEX(uaddr, op, val): a physical-address-keyed EL0 wait/wake. Validates `uaddr` (4-aligned, inside
