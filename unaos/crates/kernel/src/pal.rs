@@ -283,6 +283,9 @@ pub mod cursor {
 
 // --- EVENT QUEUE ---
 const QUEUE_SIZE: usize = 64;
+/// UVUG-6 — public mirror of the ring capacity so the QEMU typematic selftest can size its fill relative to
+/// the real backpressure threshold (`QUEUE_SIZE / 2`) instead of a magic number.
+pub const QUEUE_SIZE_PUB: usize = QUEUE_SIZE;
 
 struct EventQueue {
     buffer: [Event; QUEUE_SIZE],
@@ -314,6 +317,11 @@ impl EventQueue {
             Some(event)
         }
     }
+    /// UVUG-6 — current occupancy (0..QUEUE_SIZE-1). `head - tail` modulo the ring size; correct across wrap
+    /// because 2^bits ≡ 0 (mod QUEUE_SIZE) makes the wrapping subtraction agree with the true difference.
+    fn len(&self) -> usize {
+        self.head.wrapping_sub(self.tail) % QUEUE_SIZE
+    }
 }
 
 lazy_static! {
@@ -324,6 +332,13 @@ pub fn push_event(event: Event) {
     crate::arch::without_interrupts(|| {
         EVENT_QUEUE.lock().push(event);
     });
+}
+
+/// UVUG-6 — live EVENT_QUEUE occupancy, read by the host-side typematic backpressure guard so a synthesised
+/// key repeat is never injected while the ring is past half full (a stuck/phantom repeat must not be able to
+/// starve real HID edges — the self-sustaining wedge symptom).
+pub fn event_queue_depth() -> usize {
+    crate::arch::without_interrupts(|| EVENT_QUEUE.lock().len())
 }
 
 /// UVUG-5 — monotonically bumped every time a HID keyboard slot is torn down (a detach / disconnect /
@@ -345,6 +360,125 @@ pub fn note_keyboard_detached() {
 /// last observed and, on a change, drops any held key (whose `KeyUp` a detach guarantees will never arrive).
 pub fn keyboard_detach_gen() -> u64 {
     KEYBOARD_DETACH_GEN.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+// --- UVUG-6: host-side typematic key-repeat tracker (HID-report-level) ---
+//
+// UVUG-5 synthesised a held key's repeat by tracking Key/KeyUp edges as they were DRAINED out of EVENT_QUEUE.
+// That was the hole behind the P51 boot wedge: `EventQueue::push` silently DROPS on a full ring, so a `KeyUp`
+// pushed while the 64-slot queue was saturated was never enqueued — hence never drained, never observed. The
+// tracker then held the key forever and injected `Event::Key` every RATE_MS, which kept the queue full, which
+// dropped every subsequent real edge (including new keys and their releases): a self-sustaining wedge that
+// exactly matches the capture (keyboard events stop, no detach, key repeat broken).
+//
+// UVUG-6 moves the observation to the HID REPORT level, BEFORE any EVENT_QUEUE push. The xHCI HID decode calls
+// `typematic_note_report` once per keyboard report with the newest press and the FULL currently-held ascii set.
+// A release is now learned by the armed key being ABSENT from the latest report's held set — a fact that can
+// never be dropped by the queue. Three independent safety layers close every remaining miss class:
+//   1. report-level release: armed key not in `held` -> disarm (covers a dropped/missed KeyUp on the queue);
+//   2. keyboard-detach generation (UVUG-5): an unplug mid-hold never sends a release report -> disarm;
+//   3. positive liveness: no HID report from the keyboard for ~1 s while a key is still "held" -> disarm
+//      (covers a release report that never reached the decode at all, or a wedged endpoint).
+// Plus a backpressure guard: `typematic_tick` refuses to inject while EVENT_QUEUE is past half full, so even a
+// momentarily-stuck repeat can never saturate the ring and starve real input.
+//
+// State lives HERE (the kernel lib) rather than in the `main` binary so the xHCI decode — which is in the lib
+// and cannot call into `main` — can feed it directly at the report level. `main`'s pump calls `typematic_tick`.
+//
+// LIVENESS/SET_IDLE(0) NOTE: on a keyboard that truly sends ZERO reports while a key is held still (strict
+// SET_IDLE(0), no idle re-reports), the 1 s liveness will stop an ongoing repeat while the key is physically
+// held. That is a benign, self-correcting degradation (re-press resumes it) and is deliberately preferred over
+// the catastrophic, self-sustaining wedge it guards against. The P51-class hardware streams periodic reports,
+// so liveness there simply confirms the keyboard is alive.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+mod typematic {
+    use core::sync::atomic::{AtomicU32, AtomicU64};
+    /// ASCII of the key eligible to repeat, +1 (0 = none). Newest press wins.
+    pub(super) static KEY_P1: AtomicU32 = AtomicU32::new(0);
+    /// `ms()` at which the next repeat is due.
+    pub(super) static NEXT_MS: AtomicU64 = AtomicU64::new(0);
+    /// `ms()` of the most recent HID keyboard report seen (0 = none yet) — the liveness signal.
+    pub(super) static LAST_REPORT_MS: AtomicU64 = AtomicU64::new(0);
+    /// Last `keyboard_detach_gen()` folded by `typematic_tick`; an advance means an unplug -> drop held key.
+    pub(super) static SEEN_DETACH_GEN: AtomicU64 = AtomicU64::new(0);
+    /// Hold time before the FIRST synthesised repeat (~desktop feel; a tap never repeats).
+    pub(super) const DELAY_MS: u64 = 400;
+    /// Repeat period once repeating (~25 chars/s).
+    pub(super) const RATE_MS: u64 = 40;
+    /// Liveness window: a "held" key with no HID report for this long is stale -> drop.
+    pub(super) const LIVENESS_MS: u64 = 1000;
+}
+
+/// UVUG-6 — feed the typematic tracker one HID keyboard report at the REPORT LEVEL (before any EVENT_QUEUE
+/// push). `newest_press` is an ascii that went down THIS report (0 = none); `held` is every ascii currently
+/// down. Observing releases here (armed key absent from `held`) rather than from the drained event stream is
+/// what closes the UVUG-5 dropped-`KeyUp` hole. A synthesised repeat never comes through here (it is not a HID
+/// report), so the initial delay is honoured exactly once per physical press.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+pub fn typematic_note_report(newest_press: u8, held: &[u8]) {
+    use core::sync::atomic::Ordering;
+    let now = crate::arch::ms();
+    typematic::LAST_REPORT_MS.store(now.max(1), Ordering::Relaxed);
+    // Report-level release: if the currently-armed key is not in this report's held set, it was released
+    // (or was never really held) — disarm. This is the primary, queue-independent release path.
+    let kp1 = typematic::KEY_P1.load(Ordering::Relaxed);
+    if kp1 != 0 {
+        let k = (kp1 - 1) as u8;
+        if !held.contains(&k) {
+            typematic::KEY_P1.store(0, Ordering::Relaxed);
+        }
+    }
+    // Arm the newest press (newest-wins typematic) and (re)start the initial delay.
+    if newest_press != 0 {
+        typematic::KEY_P1.store(newest_press as u32 + 1, Ordering::Relaxed);
+        typematic::NEXT_MS.store(now.wrapping_add(typematic::DELAY_MS), Ordering::Relaxed);
+    }
+}
+
+/// UVUG-6 — if a held key's repeat is due, return its ascii and schedule the next one. Returns `None` when no
+/// key is held, the repeat is not yet due, the keyboard detached, liveness lapsed, or EVENT_QUEUE is past half
+/// full. Called once per USB pump pass, BEFORE the drain, by the host pump in `main`.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+pub fn typematic_tick() -> Option<u8> {
+    use core::sync::atomic::Ordering;
+    // (2) detach guard: a keyboard unplugged mid-hold never sends its release report.
+    let dg = keyboard_detach_gen();
+    if typematic::SEEN_DETACH_GEN.swap(dg, Ordering::Relaxed) != dg {
+        typematic::KEY_P1.store(0, Ordering::Relaxed);
+        return None;
+    }
+    let kp1 = typematic::KEY_P1.load(Ordering::Relaxed);
+    if kp1 == 0 {
+        return None;
+    }
+    let now = crate::arch::ms();
+    // (3) positive liveness: a still-"held" key whose keyboard has gone silent for ~1 s is stale -> drop it.
+    let last = typematic::LAST_REPORT_MS.load(Ordering::Relaxed);
+    if last != 0 && now.wrapping_sub(last) > typematic::LIVENESS_MS && now >= last {
+        typematic::KEY_P1.store(0, Ordering::Relaxed);
+        return None;
+    }
+    // backpressure guard: never inject while the ring is past half full (starvation / wedge guard).
+    if event_queue_depth() > QUEUE_SIZE / 2 {
+        return None;
+    }
+    let due = typematic::NEXT_MS.load(Ordering::Relaxed);
+    // `ms()` is monotonic; guard the wrap window so a rolled clock cannot spew repeats.
+    if now.wrapping_sub(due) < (1u64 << 62) && now >= due {
+        typematic::NEXT_MS.store(now.wrapping_add(typematic::RATE_MS), Ordering::Relaxed);
+        return Some((kp1 - 1) as u8);
+    }
+    None
+}
+
+/// UVUG-6 test aid — force the next repeat "due" now, so the QEMU selftest can exercise the inject/suppress
+/// decision deterministically without waiting out the real delay. Not used on any boot path.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+pub fn typematic_test_force_due() {
+    use core::sync::atomic::Ordering;
+    typematic::NEXT_MS.store(crate::arch::ms(), Ordering::Relaxed);
+    // keep liveness satisfied so the force-due path exercises the backpressure/arm logic, not the liveness drop
+    typematic::LAST_REPORT_MS.store(crate::arch::ms().max(1), Ordering::Relaxed);
 }
 
 fn pop_event() -> Option<Event> {

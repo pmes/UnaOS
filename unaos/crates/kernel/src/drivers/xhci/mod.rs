@@ -2292,6 +2292,34 @@ impl XhciController {
                                                 }
                                             }
 
+                                            // UVUG-6: feed the host-side typematic tracker at the HID REPORT
+                                            // level — BEFORE any EVENT_QUEUE push, so a release the queue may
+                                            // later DROP (full 64-slot ring) can never strand a held key. Pass
+                                            // the newest ascii pressed this report and the FULL currently-held
+                                            // ascii set; the tracker disarms the moment its key leaves the set.
+                                            #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+                                            {
+                                                let mut held: [u8; 6] = [0; 6];
+                                                let mut hn = 0usize;
+                                                let mut newest_press: u8 = 0;
+                                                for i in 2..8 {
+                                                    let keycode = report[i];
+                                                    if keycode == 0 || keycode == 1 { continue; }
+                                                    if (keycode as usize) < HID_SCANCODE_TO_ASCII.len() {
+                                                        let (unshifted, shifted) = HID_SCANCODE_TO_ASCII[keycode as usize];
+                                                        let is_letter = (0x04..=0x1D).contains(&keycode);
+                                                        let eff_shift = shift ^ (caps & is_letter);
+                                                        let ascii = if eff_shift { shifted } else { unshifted };
+                                                        if ascii != 0 {
+                                                            held[hn] = ascii;
+                                                            hn += 1;
+                                                            if !prev_keys.contains(&keycode) { newest_press = ascii; }
+                                                        }
+                                                    }
+                                                }
+                                                crate::pal::typematic_note_report(newest_press, &held[..hn]);
+                                            }
+
                                             // HID-KEYS: key-UP edges. A boot report carries the FULL
                                             // pressed-key set, so any keycode in the previous report
                                             // that is absent now was released — emit KeyUp(ascii)

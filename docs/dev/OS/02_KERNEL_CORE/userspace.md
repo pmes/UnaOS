@@ -566,6 +566,26 @@
   raspi4b delivers no HID, so no key is ever held and no repeat is synthesised — the deterministic auto paths stay
   byte-identical (`checksum=0x48221e4101db3924`, verified on `kernel8-test`). Lane: `arch/aarch64/syscall.rs`
   (`sys_input_poll` heartbeat) + `main.rs` (typematic + `[el0in]` witness) + this doc.
+- **UVUG-6 (this arc)** — the UVUG-5 typematic tracker observed Key/KeyUp edges as they were **drained out of**
+  `EVENT_QUEUE`. `EventQueue::push` silently **drops** on a full 64-slot ring, so a `KeyUp` pushed while the
+  queue was saturated was never enqueued, never drained, never observed: the tracker held the key forever and
+  injected `Event::Key` every 40 ms, which kept the queue full, which dropped every subsequent real edge — a
+  **self-sustaining wedge** matching the P51 metal capture (keyboard events stop, no detach, repeat broken).
+  Fix — re-root the observation at the **HID report level, before any queue push**. The state + logic moved into
+  `pal` (`typematic_note_report` / `typematic_tick`); `drivers::xhci` feeds each keyboard report's newest press
+  and full held-ascii set directly, so a **release is learned from the report** (armed key absent from the held
+  set) and cannot be dropped by the queue. Three disarm layers cover every miss class: (1) report-level release;
+  (2) keyboard-detach generation (UVUG-5, unplug-mid-hold); (3) **positive liveness** — a still-"held" key with
+  no HID report for ~1 s is dropped (catches a release report that never reached the decode). Plus a
+  **backpressure guard**: `typematic_tick` refuses to inject while `EVENT_QUEUE` is past half full, so a stuck
+  repeat can never saturate the ring and starve real input. The drain-fed `typematic_observe` is gone. A QEMU
+  witness (`typematic_selftest`, run once on the BSP) proves all three legs — baseline repeat, backpressure
+  suppression, and dropped-`KeyUp` disarm — emitting `:: uvug6: typematic … :: PASS ::`. QEMU delivers no HID,
+  so no report is ever fed on the boot path and the deterministic auto paths stay byte-identical. Liveness note:
+  on a keyboard that sends **zero** reports while a key is held still (strict `SET_IDLE(0)`, no idle re-reports),
+  the 1 s liveness stops an ongoing repeat while physically held — a benign, self-correcting degradation
+  deliberately preferred over the catastrophic wedge it guards. Lane: `pal.rs` (tracker + queue depth) +
+  `drivers/xhci/mod.rs` (report-level feed) + `main.rs` (pump call + selftest) + this doc.
 - Not yet: **revocation trees** (a derived copy — re-grant or onward re-transfer — escapes
   single-level revoke today; derivation records + `CAP_REVOKE` are that arc), the **bandy Ring-3
   delegation wrapper**, `File` transfer (descriptor migration), real `Socket` fs/net syscalls.
