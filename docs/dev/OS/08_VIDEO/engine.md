@@ -451,3 +451,94 @@ Serial evidence (headless-gate visible; drive `tste` with `scripts/qmp_type.py -
 
 These are QEMU-provable regressions only — a real GPU/present is not involved; on metal the same rows
 run under `tste` and mirror to whatever console the target exposes (§4/§6 console-path rule applies).
+
+## 8. WC — the window compositor (`video/wm.rs`, WC-A)
+
+Before WC, `SYS_FB_PRESENT` had exactly one destination: `screen::present_surface` centered the
+caller's single 32x32 surface on the panel. There was no window state anywhere, so two EL0 programs
+could not be on screen at once. `video::wm` is the seam that fixes that.
+
+### The table
+
+A fixed array of `MAX_WINDOWS = 8` rows, statically allocated behind one `spin::Mutex`. The
+compositor runs from syscall context on a non-coherent scan-out path, where a heap allocation would
+be both a latency cost and a failure mode. Each row carries: id (`1..=8`; `0` is `WIN_NONE`, the
+fail-closed return of every operation), owner ASID (opaque here — `wm` never reads task state),
+content origin and source extent, integer scale, z-order, surface pointer + stride, a damage flag,
+and a title truncated to `MAX_TITLE = 16` bytes at create time.
+
+### Composite on present, no thread
+
+`present(id)` marks the row damaged and composites inline, from the presenting task's own context.
+This is the discipline `present_surface` has always used and it is forced: while a full-screen EL0
+program owns the panel the render task is parked in `dispatch_command`, so routing through it would
+present nothing. There is no compositor thread in this arc.
+
+Two properties the pass has to get right:
+
+- **Occlusion closure.** Repainting a damaged window would erase anything stacked on top of it, so
+  the damage set is closed upwards to a fixed point — every higher-z window whose outer box overlaps
+  a damaged one is repainted too, transitively — and the draw order is ascending z (ties by id, i.e.
+  creation order).
+- **No lock across the scan-out.** The table lock is held only to snapshot the rows and clear their
+  damage flags. Every framebuffer write and every `flush_range` happens after it is released. `place`
+  reads the panel geometry *before* taking the table lock, so no path ever holds both locks and there
+  is no order to invert.
+
+Each composited window gets one `flush_range` over the scanlines of its outer box — one `DC CVAC`
+sweep per window rather than one per row, the same present discipline as `Screen::flush`. A no-op on
+coherent targets.
+
+### Chrome is kernel-drawn, always
+
+Each window gets a 1-px border and a `TITLE_H = 12` title strip, painted by the compositor from the
+kernel's own copy of the title (8x8 `font8x8` glyphs; non-printable bytes render as spaces). Apps
+draw only inside their own surface. A hostile EL0 program therefore cannot forge another window's
+frame or paint a convincing system dialog, and the presentation-modes law — never fake host chrome —
+holds structurally rather than by convention. Colours are flat and deliberately un-host-like.
+
+### Layout
+
+`place` tiles the non-compat windows left-to-right in id order with an 8-px gap, wrapping to a new
+row when the next outer box would run off the panel, and picks each window's scale as the largest
+integer factor fitting half the panel in each axis (so a 32x32 surface is legible on a 1920-wide
+panel and two windows still sit side-by-side). Layout depends only on the live set, not on the order
+of creates and closes, so it is deterministic. `move_to` pins a window out of the automatic layout.
+`close`/`close_owner` erase the vacated box, relayout and recomposite; `close_owner` is what task
+teardown calls, so a dead ASID can never leave a window compositing from a freed address space.
+
+### The compat shim
+
+`screen::present_surface` keeps its geometry math verbatim (legacy centering + the UVUG-7 integer
+scale rule) and hands the blit to `wm::compat_present`, which creates one `compat` window on first
+call and updates it in place afterwards. A compat window draws **no** chrome and flushes exactly the
+rows `[y0, y0+dh)` the legacy path flushed, so pre-window apps are byte-identical: the `kernel8-test`
+panel capture matches the pre-WC baseline `pi-screen.png` sha256 exactly, with MBENCH 46/46 and 0
+forbidden.
+
+### Serial evidence (`witness` feature)
+
+```
+[wc-a] composite windows=1 drawn=1
+```
+
+That is the line a `kernel8-test` run emits today: the compat window presenting through the shim. The
+other three formats are **not yet exercised** — nothing calls `create`/`close` until WC-B lands the
+window syscalls — so they are given here as formats, with the values a 32x32 surface on the QEMU
+640x480 panel would produce (scale = `min(640/2/32, 480/2/32)` = 7, origin = the first tile slot):
+
+```
+[wc-a] create win=1 asid=0x1 surf=32x32 stride=128 scale=7x at (9,21) z=1
+[wc-a] close win=1
+[wc-a] close_owner asid=0x1 closed=1
+```
+
+`composite` witnesses the **first** pass only — a mini-vug run presents ~300 frames and per-frame
+lines would drown the log (the same reason `[uvug2]` fires once).
+
+### Seam for the window syscalls (WC-B)
+
+`SYS_WIN_CREATE` / `SYS_WIN_PRESENT` / `SYS_WIN_MOVE` / `SYS_WIN_CLOSE` are thin fail-closed wrappers
+over `create` / `present` / `move_to` / `close`; the per-ASID ownership gate reads `owner_of`, and
+`clear_handle_row` calls `close_owner`. `SYS_FB_MAP` / `SYS_FB_PRESENT` stay as compat wrappers over
+the compat window.
