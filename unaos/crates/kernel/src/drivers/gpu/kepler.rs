@@ -197,7 +197,7 @@ pub fn init(gpu: &GpuInfo) {
             if let Some(inst_off) = vram_allocator.alloc(0x1000) {
                 if let Some(gpfifo_off) = vram_allocator.alloc(0x1000) {
                     if let Some(userd_off) = vram_allocator.alloc(0x1000) {
-                        if let Some(_pb_off) = vram_allocator.alloc(64 * 1024) {
+                        if let Some(pb_off) = vram_allocator.alloc(64 * 1024) {
                             if let Some(runlist_off) = vram_allocator.alloc(0x1000) {
                                 if let Some(fence_off) = vram_allocator.alloc(0x1000) {
                                     serial_println!("[NVIDIA] Allocated Channel Instance, GPFIFO, USERD, PushBuffer, Runlist, Fence.");
@@ -268,20 +268,70 @@ pub fn init(gpu: &GpuInfo) {
                                         serial_println!(":: kepler: sched-status {} err={:08X} ({}) stat={:08X} ::", label, err, err_str, stat);
                                     };
 
-                                    // Milestone 1: Method-Mirror Header Recon (Read-Only)
-                                    for pass in 0..2 {
-                                        let mut rows = 0;
-                                        for offset in (0..=0x3FC).step_by(4) {
-                                            let val = mmio_read(bar0, 0x640000 + offset);
-                                            serial_println!(":: kepler: mirror-hdr pass{} off={:03X} val={:08X} ::", pass, offset, val);
-                                            rows += 1;
-                                        }
-                                        serial_println!(":: kepler: mirror-hdr pass{} done rows={} ::", pass, rows);
-                                        
-                                        if pass == 0 {
-                                            for _ in 0..2_000_000 { core::hint::spin_loop(); }
-                                        }
+                                    // Milestone 1: Method-Mirror Backing-Store Beacon Test
+                                    // Pass 0: Baseline dump
+                                    let mut rows = 0;
+                                    for offset in (0..=0x3FC).step_by(4) {
+                                        let val = mmio_read(bar0, 0x640000 + offset);
+                                        serial_println!(":: kepler: mirror-hdr pass0 off={:03X} val={:08X} ::", offset, val);
+                                        rows += 1;
                                     }
+                                    serial_println!(":: kepler: mirror-hdr pass0 done rows={} ::", rows);
+
+                                    // Plant Beacons
+                                    let pattern = [
+                                        0xBEAC0001, 0xBEAC0002, 0xBEAC0003, 0xBEAC0004,
+                                        0xBEAC0005, 0xBEAC0006, 0xBEAC0007, 0xBEAC0008,
+                                    ];
+                                    
+                                    unsafe {
+                                        // userd
+                                        for (i, val) in pattern.iter().enumerate() {
+                                            core::ptr::write_volatile((bar1 + userd_off + i * 4) as *mut u32, *val);
+                                        }
+                                        serial_println!(":: kepler: beacon planted at=userd off={:08X} ::", userd_off);
+                                        
+                                        // pushbuffer
+                                        for (i, val) in pattern.iter().enumerate() {
+                                            core::ptr::write_volatile((bar1 + pb_off + i * 4) as *mut u32, *val);
+                                        }
+                                        serial_println!(":: kepler: beacon planted at=pb off={:08X} ::", pb_off);
+                                        
+                                        // runlist
+                                        for (i, val) in pattern.iter().enumerate() {
+                                            core::ptr::write_volatile((bar1 + runlist_off + i * 4) as *mut u32, *val);
+                                        }
+                                        serial_println!(":: kepler: beacon planted at=runlist off={:08X} ::", runlist_off);
+                                    }
+
+                                    // Pass 1: Post-Plant Dump & Scan
+                                    let mut rows_pass1 = 0;
+                                    let mut beacons_seen = 0;
+                                    for offset in (0..=0x3FC).step_by(4) {
+                                        let val = mmio_read(bar0, 0x640000 + offset);
+                                        serial_println!(":: kepler: mirror-hdr pass1 off={:03X} val={:08X} ::", offset, val);
+                                        if val >= 0xBEAC0001 && val <= 0xBEAC0008 {
+                                            serial_println!(":: kepler: beacon SEEN off={:03X} val={:08X} ::", offset, val);
+                                            beacons_seen += 1;
+                                        }
+                                        rows_pass1 += 1;
+                                    }
+                                    serial_println!(":: kepler: mirror-hdr pass1 done rows={} ::", rows_pass1);
+                                    if beacons_seen == 0 {
+                                        serial_println!(":: kepler: beacon none-seen ::");
+                                    }
+
+                                    // Delay
+                                    for _ in 0..2_000_000 { core::hint::spin_loop(); }
+
+                                    // Pass 2: Volatility Re-Check
+                                    let mut rows_pass2 = 0;
+                                    for offset in (0..=0x3FC).step_by(4) {
+                                        let val = mmio_read(bar0, 0x640000 + offset);
+                                        serial_println!(":: kepler: mirror-hdr pass2 off={:03X} val={:08X} ::", offset, val);
+                                        rows_pass2 += 1;
+                                    }
+                                    serial_println!(":: kepler: mirror-hdr pass2 done rows={} ::", rows_pass2);
                                     
                                     // M2: Disp-Era USERD Reconnaissance (Read-Only)
                                     let disp_base = 0x610000;
