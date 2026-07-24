@@ -3198,6 +3198,10 @@ fn proc_find_orphaned(pid: u64) -> Option<usize> {
 /// in the race window — in which case the row has already been reaped here and `status` is its true exit
 /// status, read BEFORE the row was freed so it cannot be observed after a recycle.
 fn proc_orphan(i: usize) -> Option<i32> {
+    // Read the identifying fields BEFORE the park. Reading them after would race a same-instant death whose
+    // teardown clears pid/asid, printing a misleading `pid=0` in the witness for a row that really was parked.
+    let pid = PROCS[i].pid.load(Ordering::Acquire);
+    let row_asid = PROCS[i].asid.load(Ordering::Acquire);
     if PROCS[i]
         .state
         .compare_exchange(PRUNNING, PORPHANED, Ordering::AcqRel, Ordering::Acquire)
@@ -3205,7 +3209,12 @@ fn proc_orphan(i: usize) -> Option<i32> {
     {
         // Lost the race: the task exited or was killed between the outcome decision and here.
         let status = PROCS[i].status.load(Ordering::Acquire); // read BEFORE freeing the row
-        let _ = PROCS[i].done.wait(); // consume the permit its death posted (guaranteed, so no hang)
+        // Consume the permit its death posted (guaranteed, so no hang). `Semaphore::wait` returns false
+        // WITHOUT acquiring when called off a scheduled task — that would silently leave the permit behind and
+        // recycle the row dirty, so assert it like `sys_wait` does. `run_user_image` always runs on the shell
+        // task, so this holds.
+        let woken = PROCS[i].done.wait();
+        debug_assert!(woken, "proc_orphan: reap called off a scheduled task");
         serial_println!(
             "[uvug8] run deadline expired but the EL0 task died in the same window — Proc row {} reaped normally (status={}), not orphaned",
             i,
@@ -3216,9 +3225,7 @@ fn proc_orphan(i: usize) -> Option<i32> {
     }
     serial_println!(
         "[uvug8] run deadline expired with the EL0 task STILL ALIVE — Proc row {} parked PORPHANED (pid={}, asid={}); row is reclaimed when the task dies, never reused while it lives",
-        i,
-        PROCS[i].pid.load(Ordering::Acquire),
-        PROCS[i].asid.load(Ordering::Acquire)
+        i, pid, row_asid
     );
     None
 }
@@ -6574,14 +6581,18 @@ pub fn run_user_image(
     //   * a rendering interactive session suspends INDEFINITELY and never times out, however long it runs;
     //   * an app that polls but renders nothing for `TAKEOVER_SUSPEND_MAX_SECS` of suspended time caps out,
     //     after which takeover stops suspending and the ordinary 5 s window runs to `Timeout`.
-    // `FB_PRESENT_COUNT` is global rather than per-ASID, but during a `run` the focused app is the only
-    // presenter (the shell is blocked in this loop), and a stray present by anyone else could only be
-    // GENEROUS — it can extend a session, never cut one short.
+    // The counter read here is FOCUS-SCOPED (`EL0_FOCUSED_PRESENT_COUNT`), not the global
+    // `FB_PRESENT_COUNT`. That distinction is load-bearing: a previous run that timed out leaves an orphan
+    // task still rendering forever (the known residue), and against a GLOBAL counter the orphan's presents
+    // would read as this run's progress — resetting the accumulator every pass, so the cap could never fire
+    // and a poll-spin wedge would strand the shell until reboot. Because one timeout would arm that defeat
+    // for every later run of the boot, it is exactly the case where the cap matters most. Scoping to the
+    // focused ASID means only the app this loop is actually waiting on can clear its own suspicion.
     let suspend_cap_ticks = super::timer::cntfrq().saturating_mul(TAKEOVER_SUSPEND_MAX_SECS);
     let mut suspended_ticks: u64 = 0;
     let mut prev = start;
     let mut capped_witnessed = false;
-    let mut last_presents = FB_PRESENT_COUNT.load(Ordering::Acquire);
+    let mut last_presents = EL0_FOCUSED_PRESENT_COUNT.load(Ordering::Acquire);
     let mut budget_start = start;
     let mut suspended = false;
     loop {
@@ -6599,7 +6610,8 @@ pub fn run_user_image(
         // FRAME PROGRESS clears the suspicion. A present is work the app cannot fake by spinning on
         // `sys_input_poll`, so any new frame means this is a real rendering session: forgive all suspended time
         // accrued so far and re-arm the witness. A live desktop session therefore never approaches the cap.
-        let presents = FB_PRESENT_COUNT.load(Ordering::Acquire);
+        // Focus-scoped, so only THIS app's frames count (see the counter's definition).
+        let presents = EL0_FOCUSED_PRESENT_COUNT.load(Ordering::Acquire);
         if presents != last_presents {
             last_presents = presents;
             suspended_ticks = 0;
@@ -9143,6 +9155,19 @@ fn sys_fb_present() -> i64 {
     let sum = fb_checksum(surf, super::boot::FB_SURFACE_SIZE);
     FB_PRESENT_CHECKSUM.store(sum, Ordering::Release);
     FB_PRESENT_COUNT.fetch_add(1, Ordering::AcqRel);
+    // UVUG-8r2: bump the FOCUS-SCOPED present counter too — the one `run_user_image`'s suspension cap reads.
+    // It must count only the app that currently OWNS INPUT, exactly as the `sys_input_poll` heartbeat stamp
+    // does and for the same reason. `FB_PRESENT_COUNT` above is global and deliberately stays that way (the
+    // ELF-3 fb-test witness asserts `present == 1` on a task that never takes input focus), but a global
+    // counter is actively WRONG for the cap: after a timed-out run leaves an orphan rendering forever (the
+    // known residue), the orphan's presents would look like progress to EVERY later run — a poll-spin wedge
+    // would have its accumulator reset on every pass, the cap would never fire, and the shell would be
+    // stranded until reboot. Worse, it is sticky: one timeout arms that defeat for the rest of the boot.
+    // Scoping to the focused ASID makes an unfocused orphan's presents invisible here, which is what keeps
+    // the cap honest.
+    if EL0_INPUT_ACTIVE.load(Ordering::Acquire) == asid {
+        EL0_FOCUSED_PRESENT_COUNT.fetch_add(1, Ordering::AcqRel);
+    }
     let hook = FB_PRESENT_HOOK.load(Ordering::Acquire);
     if hook != 0 {
         // SAFETY: only `register_fb_present_hook` ever stores here, always a valid `FbPresentFn`.
@@ -9617,6 +9642,13 @@ fn input_launcher(_demo_cpu: usize) {
 // ELF-3 fb-test witnesses (captured kernel-side, printed by `fb_launcher`).
 static FB_PARENT_DONE: AtomicBool = AtomicBool::new(false); // the parent reached its clean sys_exit(0)
 static FB_PRESENT_COUNT: AtomicU64 = AtomicU64::new(0); // SYS_FB_PRESENT calls (want 1)
+
+/// UVUG-8r2: SYS_FB_PRESENT calls made by the app that HELD INPUT FOCUS at the time — the frame-progress
+/// signal `run_user_image`'s suspension cap resets on. Deliberately separate from the global
+/// `FB_PRESENT_COUNT` (which the fb-test witness pins at exactly 1 for an unfocused task): the cap needs a
+/// counter that a still-rendering ORPHAN from an earlier timed-out run cannot advance, or it would be
+/// defeated for every subsequent run of the boot. See `sys_fb_present`.
+static EL0_FOCUSED_PRESENT_COUNT: AtomicU64 = AtomicU64::new(0);
 static FB_PRESENT_CHECKSUM: AtomicU64 = AtomicU64::new(0); // checksum of the surface at present time
 static FB_REPORTED_GEOM: AtomicU64 = AtomicU64::new(0); // (width<<16 | height) the parent read from the info page
 
