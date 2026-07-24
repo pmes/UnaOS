@@ -1,4 +1,4 @@
-STATUS: PROPOSED
+STATUS: APPROVED (2026-07-24 — clean match to brief, no amendments)
 
 # PROPOSAL — kepler-display pull 9: ruler pattern (pitch + row-mapping solve)
 

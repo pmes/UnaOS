@@ -1,4 +1,4 @@
-STATUS: PROPOSED
+STATUS: APPROVED (2026-07-24 — clean match to brief; beacons overwrite only OUR dead-channel structures, acceptable)
 
 # Proposal: kepler-fence pull 16 — mirror-window backing-store beacon test
 
