@@ -387,16 +387,32 @@ Three reasons, all load-bearing:
 * **EL2, not EL1.** `CPUECTLR_EL1` is IMPLEMENTATION DEFINED and an EL1 access can be trapped to EL2
   by `ACTLR_EL2`, which we never program (it resets UNKNOWN). Taking an unexpected exception on a
   secondary is the very failure under investigation, so the access must happen where it cannot trap.
+  One residual dependency remains and is worth naming: an EL2 access to `CPUECTLR_EL1` still requires
+  that EL3 has not trapped it, i.e. that the armstub left the IMPDEF-register grant in `ACTLR_EL3`
+  open — the standard convention for a stub that hands the machine to an OS at EL2, but not something
+  QEMU can verify (it models neither the register nor the trap). If the grant were absent the very
+  first core would take an EL3 exception in `drop_to_el1` at power-on, before serial is up: the
+  failure is deterministic and fail-fast, so **read a totally silent boot with no serial output at all
+  as this**, not as an SMP symptom.
 * **One insertion covers all four cores.** The BSP reaches `drop_to_el1` from `__rust_boot`; every AP
   reaches it from `__secondary_rust`. Identical code, identical point in each core's life.
 * **MMU and caches still off**, which is where the TRM wants the bit set.
 
-The probe is spliced in via a `#[cfg(feature = "pi")]` macro that expands to nothing otherwise:
-`drop_to_el1` is shared with the Jetson (`tegra`) path, and on the A78AE the same architectural
-register lives at `S3_0_C15_C1_4` — issuing the A72 encoding (`S3_1_C15_C2_1`) there would touch a
-different, possibly UNDEFined register. It uses **x1–x5 only**; x0 (the stub's own scratch) and x30
-(the `eret` target) are untouched, and `drop_to_el1` is called as a no-argument `extern "C"` fn so
-x1–x5 are dead on entry. Verified in the disassembly of the shipped `kernel8` image.
+The probe is spliced in via a `#[cfg(feature = "pi")]` macro that expands to nothing otherwise. Note
+what that cfg is and is not about: `boot::drop_to_el1` is the **Pi/A72** drop and is called only by
+`__rust_boot` and `__secondary_rust` — `virt` uses `boot_virt::drop_to_el1`, the Jetson uses
+`boot_tegra::drop_to_el1`. But `mod boot` is declared unconditionally in `arch/aarch64/mod.rs`, so
+this asm is *assembled into* `virt` and `tegra` images even though nothing there calls it, and
+`CPUECTLR_EL1` is IMPDEF with a per-core encoding (`S3_0_C15_C1_4` on the A78AE, not the A72's
+`S3_1_C15_C2_1`). The cfg keeps an A72-specific encoding out of every non-A72 image; it is about what
+gets assembled, not about who calls it.
+
+**Register and index discipline.** The probe uses **x1–x5 only**; x0 (the stub's own scratch) and x30
+(the `eret` target) are untouched, and `drop_to_el1` is a no-argument `extern "C"` fn so x1–x5 are
+dead on entry. The Aff0 mask admits 0–255 while the record is 4 slots, so the index is **bounds-checked
+before it indexes anything** (`cmp x1,#4 / b.hs`) rather than resting on the platform fact that the Pi
+4 is one cluster of four — an out-of-range core skips the *record* only and still gets SMPEN set, which
+must never be conditional. Both verified in the disassembly of the shipped `kernel8` image.
 
 **Recording the pre-fix value across the MMU-off boundary.** Each core stores its **raw, pre-fix**
 `CPUECTLR_EL1` into `boot::SMP8_CPUECTLR[Aff0]`, plus a magic word into `[4 + Aff0]` — because a

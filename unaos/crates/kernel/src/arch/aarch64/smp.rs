@@ -402,6 +402,8 @@ fn report(t0: u64, freq: u64) {
         smp7::ms_since(t0, timer::cntpct(), freq),
         detail.trim_end()
     );
+}
+
 /// SMP-8 witness (feature `smp8`, armed by `UNAOS_SMP8=1`; DEFAULT OFF — knob-off images are
 /// byte-identical apart from the always-on SMPEN set, which is required configuration, not telemetry).
 ///

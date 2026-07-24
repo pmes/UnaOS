@@ -816,12 +816,19 @@ pub static mut SMP8_CPUECTLR: Smp8Slots = Smp8Slots([0; 8]);
 // reload x30 and adjust SP around the `eret`, and the eret skips the epilogue — corrupting the frame.
 // Runs at EL2, MMU OFF, no stack traffic, x30 untouched; `eret`s back to the caller now at EL1 (same
 // SP/frame — the standard "return to x30" drop trick). ---
-// The SMP-8 probe body, spliced into `drop_to_el1` below. Cortex-A72 ONLY (`pi`): CPUECTLR_EL1 is
-// IMPLEMENTATION DEFINED, and its encoding differs per core — on the A78AE (Jetson/`tegra`, which
-// shares this `drop_to_el1`) the same register lives at `S3_0_C15_C1_4`, so issuing the A72 encoding
-// there would access a different (possibly UNDEFined) register. Hence the empty non-`pi` expansion.
-// Uses x1-x5 only: `drop_to_el1` is called as an ordinary `extern "C"` fn with no arguments, so those
-// are dead on entry, and x0 (the stub's own scratch) and x30 (the eret target) are left untouched.
+// The SMP-8 probe body, spliced into `drop_to_el1` below.
+//
+// Why `#[cfg(feature = "pi")]`: this `drop_to_el1` is the **Pi/A72** drop — its only callers are
+// `__rust_boot` (BSP) and `__secondary_rust` (APs), both bare-metal Pi. The other platforms have
+// their own: `virt` uses `boot_virt::drop_to_el1` and the Jetson uses `boot_tegra::drop_to_el1`.
+// But `mod boot` itself is NOT feature-gated (`arch/aarch64/mod.rs` declares it unconditionally),
+// so this asm is *assembled into* `virt` and `tegra` images even though nothing there calls it —
+// and `CPUECTLR_EL1` is IMPLEMENTATION DEFINED with a per-core encoding (on the A78AE it is
+// `S3_0_C15_C1_4`, not the A72's `S3_1_C15_C2_1`). The cfg keeps an A72-specific system-register
+// encoding out of every non-A72 image; it is about what gets assembled, not about who calls it.
+//
+// Register discipline: x1-x5 only. `drop_to_el1` is called as an ordinary no-argument `extern "C"`
+// fn, so x1-x5 are dead on entry; x0 (the stub's own scratch) and x30 (the eret target) are untouched.
 #[cfg(feature = "pi")]
 macro_rules! smp8_probe {
     () => {
@@ -830,6 +837,14 @@ macro_rules! smp8_probe {
     mrs   x1, mpidr_el1
     and   x1, x1, #0xff              // x1 = Aff0 (this core's slot index)
     mrs   x2, s3_1_c15_c2_1          // x2 = CPUECTLR_EL1 (A72 IMPDEF) — at EL2 this cannot trap
+    // Bound the slot index BEFORE it indexes anything. The mask above admits Aff0 up to 255, and the
+    // scaled store would then write up to 2040 bytes past the 64-byte record into adjacent BSS. The
+    // Pi 4 is one cluster of 4, so this can't fire — but a store whose bound rests on a platform fact
+    // rather than on a check is exactly the kind of latent corruption this arc exists to remove. An
+    // out-of-range core skips the RECORD only; it still gets SMPEN set, which is the part that must
+    // never be conditional.
+    cmp   x1, #4
+    b.hs  .Lsmp8_set
     adrp  x3, SMP8_CPUECTLR
     add   x3, x3, #:lo12:SMP8_CPUECTLR
     str   x2, [x3, x1, lsl #3]       // raw PRE-fix value -> slots[core]
@@ -838,6 +853,7 @@ macro_rules! smp8_probe {
     movk  x5, #0x534d, lsl #16       // "SMP8"
     str   x5, [x4, x1, lsl #3]       // validity magic -> slots[4+core] (0 is a legal reading)
     dsb   sy                         // both stores complete to DRAM before we touch the register
+.Lsmp8_set:
     tst   x2, #(1 << 6)              // SMPEN already set by firmware?
     b.ne  .Lsmp8_done
     orr   x2, x2, #(1 << 6)
