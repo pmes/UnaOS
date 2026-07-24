@@ -93,6 +93,11 @@ fn main() {
     // gated by UNAOS_KEPLER_TAKEOVER / UNAOS_KEPLER_FIFO (option_env!, compile-time). Kept in sync
     // with arroyo's mapping. (The builder rebuilds the kernel, so this MUST be here or the feature
     // never reaches the kernel binary.)
+    // BENCH-RIDE: read-only rMBP sitting ride-along probes (drivers/bench_ride.rs). Kept in sync
+    // with arroyo's mapping. therm implies smc via the feature graph; all default OFF => unlinked.
+    if std::env::var("UNAOS_THERM").is_ok() { feats.push("thermprobe"); }
+    if std::env::var("UNAOS_PCILINK").is_ok() { feats.push("pcilink"); }
+    if std::env::var("UNAOS_VROM").is_ok() { feats.push("vromprobe"); }
     if std::env::var("UNAOS_KEPLER").is_ok() { feats.push("nvidia-kepler"); }
     if std::env::var("UNAOS_KEPLER_TAKEOVER").is_ok() { feats.push("nvidia-kepler-takeover"); }
     if std::env::var("UNAOS_KEPLER_FIFO").is_ok() { feats.push("nvidia-kepler-fifo"); }

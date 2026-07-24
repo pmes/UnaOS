@@ -300,6 +300,15 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
         }
     }
 
+    // BENCH-RIDE probes run here — serial is live (post-xHCI) and the GPU dispatch hasn't run,
+    // so their evidence survives a GPU-init wedge. All read-only, knob-gated, one-shot.
+    #[cfg(all(target_arch = "x86_64", feature = "thermprobe"))]
+    crate::drivers::bench_ride::therm_snapshot();
+    #[cfg(all(target_arch = "x86_64", feature = "pcilink"))]
+    crate::drivers::bench_ride::pcilink_snapshot();
+    #[cfg(all(target_arch = "x86_64", feature = "vromprobe"))]
+    crate::drivers::bench_ride::vrom_sniff();
+
     // GPU init runs AFTER the xHCI block: bench serial on the rMBP is the usbdebug FTDI behind
     // xHCI, so any GPU-init wedge before this point is invisible (zero serial from power-on —
     // sitting #7 boot 2 hard-hang signature). After xHCI is up, a wedge leaves breadcrumbs.

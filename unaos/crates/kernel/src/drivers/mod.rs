@@ -20,3 +20,8 @@ pub mod emmc2;
 
 #[cfg(all(target_arch = "x86_64", any(feature = "nvidia-kepler", feature = "intel-ivb")))]
 pub mod gpu;
+
+// BENCH-RIDE: read-only knob-gated evidence probes riding the rMBP sitting boots (therm/pcilink/
+// vrom). x86_64-only; all knobs off => unlinked, media byte-identical.
+#[cfg(all(target_arch = "x86_64", any(feature = "thermprobe", feature = "pcilink", feature = "vromprobe")))]
+pub mod bench_ride;

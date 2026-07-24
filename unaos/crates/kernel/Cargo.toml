@@ -217,6 +217,18 @@ xcarve_relink = ["tegra"]
 # §ORIN-NET-1 and scripts/orin-net1-bench.md.
 pcieprobe = []
 
+# BENCH-RIDE (drivers/bench_ride.rs): read-only evidence probes that ride the rMBP kepler sitting
+# boots — one grep-able serial block each, printed after xHCI (serial live) and BEFORE the GPU
+# dispatch so the evidence survives a GPU-init wedge. Zero device writes. OFF (default) => the
+# module and call sites vanish, media byte-identical to baseline.
+# `thermprobe` (UNAOS_THERM=1, implies `smc`): SMC thermal + fan snapshot (SP78 temps, fpe2 RPM).
+# `pcilink` (UNAOS_PCILINK=1): display-class PCIe PM D-state + negotiated vs max link gen/width.
+# `vromprobe` (UNAOS_VROM=1): dGPU expansion-ROM header sniff — reports the ROM BAR as firmware
+#   left it; reads the 0x55AA/PCIR header ONLY if already assigned+enabled (never enables decode).
+thermprobe = ["smc"]
+pcilink = []
+vromprobe = []
+
 # ORIN-NET-2: the `UNAOS_PCIE2=1` controller-0 link + device-enumeration recon
 # (arch/aarch64/pcie_probe.rs, `census2`). Extends ORIN-NET-1's census with the last recon step before
 # a real driver arc: it reads controller-0's LINK STATE from the root port's DBI config space (the

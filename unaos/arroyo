@@ -121,6 +121,12 @@ _feats=""
 # VPERF M2: the fbcon viewport-cap bench lever (implies videobench). x86_64 only.
 [ -n "${UNAOS_VIDEOCAP:-}" ] && _feats="${_feats}videocap,"
 
+# BENCH-RIDE: read-only rMBP sitting ride-along probes (drivers/bench_ride.rs). Kept in sync
+# with builder/src/main.rs. therm implies smc (SMC key reads); all default OFF => unlinked.
+[ -n "${UNAOS_THERM:-}" ] && _feats="${_feats}thermprobe,"
+[ -n "${UNAOS_PCILINK:-}" ] && _feats="${_feats}pcilink,"
+[ -n "${UNAOS_VROM:-}" ] && _feats="${_feats}vromprobe,"
+
 # GPU drivers
 [ -n "${UNAOS_KEPLER:-}" ] && _feats="${_feats}nvidia-kepler,"
 [ -n "${UNAOS_KEPLER_TAKEOVER:-}" ] && _feats="${_feats}nvidia-kepler-takeover,"
