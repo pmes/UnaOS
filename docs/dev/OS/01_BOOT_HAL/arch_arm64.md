@@ -364,6 +364,74 @@ recovers is losing itself after arrival, and `stage` says where.
 and QEMU raspi4b still brings up 4/4 (`online=0xf missed=0x0`). QEMU has never reproduced any of
 this — the verdict is metal, on the next attended Pi sitting, with `UNAOS_SMP7=1` (observation) or
 `UNAOS_SMP7_RETRY=1` (observation + recovery experiment).
+#### SMP-8 — CPUECTLR_EL1.SMPEN: required A72 configuration we never set, and its witness
+
+**Where this comes from.** The SMP-7 audit refuted the release path (slot addresses, the single-line
+`DC CVAC`, `DSB`-before-`SEV` ordering, low-RAM overlap, secondary-stack arithmetic, the GICv2
+`IGROUPR` "race") and hardened the MMU-off stack window, but named one lead it deliberately did not
+ship: **`CPUECTLR_EL1.SMPEN` (Cortex-A72 IMPDEF, bit 6) is never set or checked by us.** SMP-8 both
+sets it and instruments it.
+
+**Why it is required configuration, not a workaround.** The A72 TRM makes SMPEN mandatory for any
+code that owns a core: it must be set *before* the caches or the MMU are enabled, and while it is
+clear the core does not participate in cluster coherency — its lines are not snooped and its
+exclusive monitor does not work across the cluster, so the **first `ldaxr`/`stlxr` pair it executes
+can spin forever**. Every Linux boot/PSCI stub sets it for exactly this reason. A core handed to us
+with SMPEN clear therefore *arrives and never reports* — precisely the P53 shape ("only procs 2 & 4
+running regularly"). The set is consequently **always on, no knob**: it weakens nothing and it is
+what the hardware documentation requires. Only the *witness* is gated (default-quiet).
+
+**Where the probe lives, and why: `drop_to_el1`, at EL2, before the `eret`** (`arch/aarch64/boot.rs`).
+Three reasons, all load-bearing:
+
+* **EL2, not EL1.** `CPUECTLR_EL1` is IMPLEMENTATION DEFINED and an EL1 access can be trapped to EL2
+  by `ACTLR_EL2`, which we never program (it resets UNKNOWN). Taking an unexpected exception on a
+  secondary is the very failure under investigation, so the access must happen where it cannot trap.
+* **One insertion covers all four cores.** The BSP reaches `drop_to_el1` from `__rust_boot`; every AP
+  reaches it from `__secondary_rust`. Identical code, identical point in each core's life.
+* **MMU and caches still off**, which is where the TRM wants the bit set.
+
+The probe is spliced in via a `#[cfg(feature = "pi")]` macro that expands to nothing otherwise:
+`drop_to_el1` is shared with the Jetson (`tegra`) path, and on the A78AE the same architectural
+register lives at `S3_0_C15_C1_4` — issuing the A72 encoding (`S3_1_C15_C2_1`) there would touch a
+different, possibly UNDEFined register. It uses **x1–x5 only**; x0 (the stub's own scratch) and x30
+(the `eret` target) are untouched, and `drop_to_el1` is called as a no-argument `extern "C"` fn so
+x1–x5 are dead on entry. Verified in the disassembly of the shipped `kernel8` image.
+
+**Recording the pre-fix value across the MMU-off boundary.** Each core stores its **raw, pre-fix**
+`CPUECTLR_EL1` into `boot::SMP8_CPUECTLR[Aff0]`, plus a magic word into `[4 + Aff0]` — because a
+genuinely all-zero reading (SMPEN clear, everything else clear) is the single most interesting result
+and must not be indistinguishable from an untouched BSS slot. These stores are MMU-off and
+DRAM-direct while every later read is Normal-cacheable, the mismatched-attributes hazard of
+§CORE3-SMP. Two properties make the read sound: the object is **exactly one dedicated 64-byte cache
+line** (aligned, nothing else ever shares it, so invalidating it can discard nothing), and the reader
+clean+invalidates that line to the PoC before loading it.
+
+**The witness (feature `smp8`, `UNAOS_SMP8=1`; DEFAULT OFF).** After bring-up settles,
+`smp::report_smp8` prints one line per core plus a verdict:
+
+```
+[smp8] core N cpuectlr(pre-fix)=0x… smpen=0|1
+[smp8] core N raw=- (not recorded — never reached drop_to_el1)
+[smp8] verdict: SMPEN was CLEAR on cores <mask> (recorded <mask>) — …
+[smp8] verdict: SMPEN was ALREADY SET on every core recorded (<mask>) — … REFUTED …
+[smp8] verdict: every core read 0x0 INCLUDING the BSP … RAZ/WI here …
+```
+
+**Core 0 is the control.** The BSP has been taking locks and running atomics for the whole boot, so
+it *is* coherent; a reading of `smpen=0` on core 0 cannot be true of the hardware and brands the
+whole set as a model artefact. That is what QEMU produces (below). Only when core 0 reads back a
+plausible value do the AP readings carry evidence — and then `pre-clear=<mask>` answers the P53
+question directly: any AP with SMPEN clear is the smoking gun for 2/4, and the always-on set is the
+fix; every core already set refutes the lead and sends the search elsewhere.
+
+**Gates.** `./arroyo check` green both arches; `./arroyo kernel8` clean; `kernel8-test 45` **0
+forbidden, CAPSTONE 6/6, 4/4 cores online** both knob-off and with `UNAOS_SMP8=1` — the always-on
+SMPEN set does not regress QEMU bring-up. **QEMU raspi4b does not model this IMPDEF register:** all
+four cores read `0x0` (RAZ/WI), the write is silently dropped, and the reporter says so rather than
+claiming firmware left the cores non-coherent. The whole probe path is nonetheless exercised there —
+all four magic words land, so the MMU-off record + invalidating read are proven end-to-end. **The
+reading itself is metal-only**, on the next attended Pi sitting with `UNAOS_SMP8=1`.
 
 **Scheduler on the `virt` path — the boot core, since JC3.** The aarch64 scheduler
 was `#[cfg(feature = "baremetal")]`-gated and coupled to EL1 (`ELR_EL1`/`SPSR_EL1`

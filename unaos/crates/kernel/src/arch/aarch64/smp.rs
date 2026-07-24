@@ -402,6 +402,81 @@ fn report(t0: u64, freq: u64) {
         smp7::ms_since(t0, timer::cntpct(), freq),
         detail.trim_end()
     );
+/// SMP-8 witness (feature `smp8`, armed by `UNAOS_SMP8=1`; DEFAULT OFF — knob-off images are
+/// byte-identical apart from the always-on SMPEN set, which is required configuration, not telemetry).
+///
+/// Reports, per core, the raw CPUECTLR_EL1 that core read at EL2 in `drop_to_el1` BEFORE we touched it
+/// and whether SMPEN (Cortex-A72 IMPDEF bit 6) was already set there. That single bit decides the P53
+/// metal question: if any AP reads `smpen=0`, firmware handed us a non-coherent core whose exclusive
+/// monitor does not work cluster-wide — the smoking gun for "arrives, never reports" and so for 2/4 —
+/// and the always-on set in `drop_to_el1` is the fix. If every core reads `smpen=1`, the lead is
+/// refuted and the 2/4 cause is elsewhere.
+///
+/// Coherency: `boot::SMP8_CPUECTLR` is written MMU-off (DRAM-direct) by each core, and read here with
+/// the MMU on and RAM Normal-cacheable, so the BSP could be holding a stale line for it. The object is
+/// exactly one dedicated 64-byte line, so clean+invalidating it to the PoC first can discard nothing
+/// and forces every load below to come from DRAM.
+///
+/// `raw=- (not recorded)` means the core never reached `drop_to_el1` at all — on QEMU it can also mean
+/// the model treats the IMPDEF register as RAZ/WI, which shows up as `raw=0x0 smpen=0` on EVERY core
+/// including the BSP. A BSP reading of `smpen=0` is therefore read as "model artefact", not evidence:
+/// the BSP is demonstrably coherent, since it has been running locks and atomics all boot.
+#[cfg(feature = "smp8")]
+fn report_smp8() {
+    let base = &raw const boot::SMP8_CPUECTLR as usize;
+    cache::clean_invalidate_range(base, 64);
+    let slots: [u64; 8] = unsafe { core::ptr::read_volatile(base as *const [u64; 8]) };
+    let mut recorded = 0u32;
+    let mut all_zero = true;
+    let mut clear_mask = 0u32;
+    for core in 0..NUM_CORES {
+        if slots[4 + core] != boot::SMP8_MAGIC {
+            serial_println!("[smp8] core {} raw=- (not recorded — never reached drop_to_el1)", core);
+            continue;
+        }
+        let raw = slots[core];
+        recorded |= 1 << core;
+        if raw != 0 {
+            all_zero = false;
+        }
+        if (raw >> 6) & 1 == 0 {
+            clear_mask |= 1 << core;
+        }
+        serial_println!(
+            "[smp8] core {} cpuectlr(pre-fix)={:#x} smpen={}",
+            core,
+            raw,
+            (raw >> 6) & 1
+        );
+    }
+    // The verdict. Core 0 is the control: it has been taking locks and running atomics for the whole
+    // boot, so it IS coherent — a reading of `smpen=0` on core 0 cannot be true of the hardware and
+    // brands the whole set as a model artefact (QEMU raspi4b does not implement this IMPDEF register
+    // and returns RAZ/WI). Only when core 0 reads back a plausible value do the AP readings carry
+    // evidence, and then `pre-clear=<mask>` is the answer to the P53 question.
+    if recorded == 0 {
+        serial_println!("[smp8] verdict: no core recorded a reading — the probe never ran");
+    } else if all_zero {
+        serial_println!(
+            "[smp8] verdict: every core read 0x0 INCLUDING the BSP, which is demonstrably coherent \
+             — the register is RAZ/WI here (QEMU does not model A72 CPUECTLR_EL1). No evidence \
+             either way; this reading is metal-only."
+        );
+    } else if clear_mask == 0 {
+        serial_println!(
+            "[smp8] verdict: SMPEN was ALREADY SET on every core recorded ({:#x}) — firmware left no \
+             core outside coherency, so SMPEN is REFUTED as the cause of a missing AP.",
+            recorded
+        );
+    } else {
+        serial_println!(
+            "[smp8] verdict: SMPEN was CLEAR on cores {:#x} (recorded {:#x}) — firmware handed those \
+             cores to us outside cluster coherency, with a non-working exclusive monitor. That is the \
+             cause of an AP that arrives and never reports; SMP-8's always-on set at EL2 fixes it.",
+            clear_mask,
+            recorded
+        );
+    }
 }
 
 /// The secondary cores that came online (MPIDR Aff0), for the BSP to place a scheduler workload on.
@@ -520,6 +595,11 @@ pub fn start_secondaries() {
 
     #[cfg(feature = "smp7")]
     report(t0, freq);
+
+    // SMP-8: with bring-up settled, report the per-core CPUECTLR/SMPEN readings taken at EL2 — so a
+    // missing core is read against whether firmware had left that core out of coherency.
+    #[cfg(feature = "smp8")]
+    report_smp8();
 
     // IPI smoke test: ping each online core with SGI 0 and confirm its per-CPU counter ticks — proof
     // the GIC delivers a software interrupt from the BSP to another core's CPU interface.

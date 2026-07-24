@@ -992,6 +992,17 @@ kernel8() {
         K8_FEATS="${K8_FEATS},vugpar"
         echo -e "${COLOR_YELLOW}  • UNAOS_VUGPAR: band-parallel flush across free secondary cores (bands=N in [vugfps]; serial fallback)${COLOR_RESET}"
     fi
+    # SMP-8: UNAOS_SMP8=1 adds the `smp8` feature — the `[smp8]` witness printing, per core, the raw
+    # CPUECTLR_EL1 that core read at EL2 in drop_to_el1 BEFORE any fix and whether the Cortex-A72 SMPEN
+    # bit (6) was already set by firmware. `smpen=0` on an AP = that core was handed to us outside
+    # cluster coherency (dead exclusive monitor => hangs on its first atomic), the candidate cause of
+    # the P53 "only 2 of 4 cores" report. The SMPEN *set* is always on (required config per the A72
+    # TRM); only the witness is knob-gated. OFF => the reporter + call site vanish. QEMU raspi4b may
+    # model the IMPDEF register as RAZ/WI (all cores read 0x0) — positive verification is metal.
+    if [ -n "${UNAOS_SMP8:-}" ]; then
+        K8_FEATS="${K8_FEATS},smp8"
+        echo -e "${COLOR_YELLOW}  • UNAOS_SMP8: [smp8] per-core pre-fix CPUECTLR_EL1 + SMPEN witness (the set itself is always on)${COLOR_RESET}"
+    fi
     # PI-USB-1: UNAOS_PIUSB=1 adds the `piusb` feature — the BCM2711 PCIe root complex + VL805 xHCI attach
     # (RC bridge reset / link-up / MEM-window, VL805 1106:3483 enumeration + BAR sizing, NOTIFY_XHCI_RESET
     # mailbox, polled shared-xHCI attach to the halted-but-decoding + ports-powered honesty line). The VL805

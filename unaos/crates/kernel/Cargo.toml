@@ -72,6 +72,13 @@ smp7_retry = ["smp7"]
 # row across the power-cycle (owner admitted BY NAME / impostor denied), then cleans. For the ATTENDED Pi bench
 # only. Enable via `UNAOS_K2_LEAVE=1 ./arroyo kernel8`. OFF => the normal same-boot proof (battery byte-identical).
 k2_leave = []
+# SMP-8 witness: print the raw CPUECTLR_EL1 each core read at EL2 in `drop_to_el1` BEFORE any fix, plus
+# whether the Cortex-A72 SMPEN bit (6) was already set by firmware — the `[smp8]` lines. A core that
+# reads `smpen=0` was handed to us OUTSIDE cluster coherency, with a non-working exclusive monitor, and
+# would hang on its first atomic: the candidate cause of the P53 "only 2 of 4 cores" metal report.
+# Read-only telemetry; DEFAULT OFF => the reporter and its call site vanish. The SMPEN *set* itself is
+# always on (required configuration per the A72 TRM, not a workaround). Enable via `UNAOS_SMP8=1`.
+smp8 = []
 # Run the SMP scheduler demo/self-test at boot (spawns demo threads across the APs, incl. the RwLock
 # torn-read check). Opt-in via `UNAOS_SCHED_DEMO=1`: it's a QEMU-verified smoke test whose tick-based
 # timing stalls boot for minutes on real hardware (uncalibrated APIC timer). Off => scheduler still

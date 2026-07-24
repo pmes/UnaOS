@@ -771,15 +771,96 @@ pub unsafe fn probe_slot_isolation(a: usize, b: usize, off: u64, expect_a: u64, 
     r_a == expect_a && r_b == expect_b && expect_a != expect_b
 }
 
+// --- SMP-8: CPUECTLR_EL1.SMPEN (Cortex-A72 IMPDEF bit 6) — required config, plus its witness. ---
+//
+// The A72 TRM makes SMPEN required configuration, not an option: it must be set BEFORE the caches or
+// the MMU are enabled on a core, and while it is clear that core does not participate in coherency —
+// its cache lines are not snooped and, crucially, its exclusive monitor does not work across the
+// cluster, so the FIRST `ldaxr/stlxr` pair it executes can spin forever. That is exactly the shape of
+// the P53 metal report ("only procs 2 & 4 running regularly"): an AP that arrives and never reports.
+// We have never set it and never checked it, so if the GPU firmware's armstub leaves it clear on some
+// APs, those APs are non-coherent from the moment they reach us. Linux's boot/PSCI stubs set this bit
+// for the same reason; setting it is what the hardware documentation requires of any code that owns
+// the core, so the SET below is ALWAYS ON — it protects nothing and weakens nothing.
+//
+// Where: at EL2, in `drop_to_el1`, before the `eret`. That placement is deliberate on three counts.
+//   * CPUECTLR_EL1 is IMPLEMENTATION DEFINED; an EL1 read can be trapped to EL2 by ACTLR_EL2, which
+//     we never program (it resets UNKNOWN). Taking an unexpected exception on a secondary is the very
+//     failure under investigation, so the access must happen at EL2, where it cannot trap.
+//   * `drop_to_el1` is on BOTH paths — the BSP reaches it from `__rust_boot`, every AP from
+//     `__secondary_rust` — so one insertion covers all four cores with identical code.
+//   * It runs with the MMU and caches still off, which is where the TRM wants the bit set.
+//
+// The raw PRE-fix value is recorded per core in `SMP8_CPUECTLR` so `[smp8]` can report whether
+// firmware had already set SMPEN. These stores happen MMU-off (DRAM-direct) while every later read is
+// Normal-cacheable — the mismatched-attributes hazard of §CORE3-SMP. Two things make the read sound:
+// the object is exactly one 64-byte line, aligned and dedicated (nothing else ever shares it, so
+// invalidating it can discard nothing), and the reader (`smp::report_smp8`) clean+invalidates that
+// line to the PoC before loading it. A per-core magic word distinguishes "recorded 0" from "never
+// recorded" — a genuinely all-zero CPUECTLR (SMPEN clear, everything else clear) is the single most
+// interesting reading, so it must not be indistinguishable from an untouched BSS slot.
+/// SMP-8 scratch: `[0..4]` = the raw CPUECTLR_EL1 each core read at EL2 before any fix, indexed by
+/// MPIDR Aff0; `[4..8]` = `SMP8_MAGIC` once that core has written its slot. Exactly one cache line,
+/// dedicated: `smp::report_smp8` invalidates it wholesale before reading.
+#[repr(C, align(64))]
+pub struct Smp8Slots(pub [u64; 8]);
+
+/// Written by every core into `SMP8_CPUECTLR[4 + core]` to mark its reading as real.
+pub const SMP8_MAGIC: u64 = 0x534d_5038; // "SMP8"
+
+#[unsafe(no_mangle)]
+pub static mut SMP8_CPUECTLR: Smp8Slots = Smp8Slots([0; 8]);
+
 // --- EL2 -> EL1 drop. Every core is handed off at EL2; a normal OS runs at EL1, so we drop each core
 // before it enables its MMU. MUST be naked asm: an ordinary Rust fn's prologue/epilogue would spill/
 // reload x30 and adjust SP around the `eret`, and the eret skips the epilogue — corrupting the frame.
 // Runs at EL2, MMU OFF, no stack traffic, x30 untouched; `eret`s back to the caller now at EL1 (same
 // SP/frame — the standard "return to x30" drop trick). ---
+// The SMP-8 probe body, spliced into `drop_to_el1` below. Cortex-A72 ONLY (`pi`): CPUECTLR_EL1 is
+// IMPLEMENTATION DEFINED, and its encoding differs per core — on the A78AE (Jetson/`tegra`, which
+// shares this `drop_to_el1`) the same register lives at `S3_0_C15_C1_4`, so issuing the A72 encoding
+// there would access a different (possibly UNDEFined) register. Hence the empty non-`pi` expansion.
+// Uses x1-x5 only: `drop_to_el1` is called as an ordinary `extern "C"` fn with no arguments, so those
+// are dead on entry, and x0 (the stub's own scratch) and x30 (the eret target) are left untouched.
+#[cfg(feature = "pi")]
+macro_rules! smp8_probe {
+    () => {
+        r#"
+    // --- SMP-8: record + set CPUECTLR_EL1.SMPEN at EL2, MMU/caches off (see the comment above). ---
+    mrs   x1, mpidr_el1
+    and   x1, x1, #0xff              // x1 = Aff0 (this core's slot index)
+    mrs   x2, s3_1_c15_c2_1          // x2 = CPUECTLR_EL1 (A72 IMPDEF) — at EL2 this cannot trap
+    adrp  x3, SMP8_CPUECTLR
+    add   x3, x3, #:lo12:SMP8_CPUECTLR
+    str   x2, [x3, x1, lsl #3]       // raw PRE-fix value -> slots[core]
+    add   x4, x3, #32
+    mov   x5, #0x5038
+    movk  x5, #0x534d, lsl #16       // "SMP8"
+    str   x5, [x4, x1, lsl #3]       // validity magic -> slots[4+core] (0 is a legal reading)
+    dsb   sy                         // both stores complete to DRAM before we touch the register
+    tst   x2, #(1 << 6)              // SMPEN already set by firmware?
+    b.ne  .Lsmp8_done
+    orr   x2, x2, #(1 << 6)
+    msr   s3_1_c15_c2_1, x2          // required config: coherency + a working cluster monitor
+    isb
+.Lsmp8_done:
+"#
+    };
+}
+#[cfg(not(feature = "pi"))]
+macro_rules! smp8_probe {
+    () => {
+        ""
+    };
+}
+
 core::arch::global_asm!(
     r#"
     .globl drop_to_el1
 drop_to_el1:
+"#,
+    smp8_probe!(),
+    r#"
     // MPIDR_EL1/MIDR_EL1 read at EL1 return VMPIDR_EL2/VPIDR_EL2 — seed them with the real values so
     // the SMP core-id read (smp.rs) stays correct at EL1.
     mrs   x0, mpidr_el1
