@@ -54,8 +54,11 @@ vugpar = []
 # SMP-7: per-core secondary bring-up evidence on the Pi spin-table path (`arch/aarch64/smp.rs`).
 # Records, for each AP, the release-write timestamp, whether/when it checked in (MMU on), the MPIDR it
 # derived for itself, how far through bring-up it got, and any re-release count — then prints one
-# `[smp7] cores online=<mask> missed=<mask> …` verdict after bring-up settles. Read-only telemetry;
-# DEFAULT OFF => every call site vanishes and the boot is byte-identical. Enable via `UNAOS_SMP7=1`.
+# `[smp7] cores online=<mask> missed=<mask> …` snapshot after bring-up settles. Read-only telemetry;
+# DEFAULT OFF => every call site vanishes and no [smp7] line is emitted. NOTE this feature's knob-off
+# state is byte-identical *to the rest of SMP-7*, not to the pre-arc image: the arc also ships an
+# ALWAYS-ON change (the pre-release `DC CIVAC` over SECONDARY_STACKS + the release-loop refactor that
+# the retry path shares), which is in every image regardless of this feature. Enable via `UNAOS_SMP7=1`.
 smp7 = []
 # SMP-7 recovery experiment: re-issue the spin-table release (write + DC CVAC + DSB + SEV) for an AP
 # that has NOT checked in at all after its first wait, up to 3 times. Never applied to a core that

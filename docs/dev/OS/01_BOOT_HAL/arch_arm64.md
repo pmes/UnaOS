@@ -321,22 +321,36 @@ at boot, and the BSP never touches those stacks again.
 * **Nothing distinguishes "never left the spin-table" from "arrived and died".** That is what the
   telemetry below now settles, and it is the prerequisite for any further fix.
 
-**Telemetry (`smp7`, `UNAOS_SMP7=1`; DEFAULT OFF, knob-off is byte-identical).** Per AP the kernel
-records the release-write timestamp, the check-in time and the MPIDR the core derived **for itself**,
-the bring-up stage reached (`rust → vectors → percpu → gic → timer → ready`), and any re-release
-count; the BSP then prints one detail line per core plus the verdict, after bring-up settles and
-before the IPI smoke test. Every stamp is taken with the MMU already on — instrumenting the MMU-off
-window with cacheable stores would re-open the very hazard being hardened; the pre-MMU window is
-still the `core3probe` raw-PL011 stub's job.
+**Telemetry (`smp7`, `UNAOS_SMP7=1`; DEFAULT OFF).** Per AP the kernel records the release-write
+timestamp (per core, re-stamped by any retry — a core re-released at +500 ms reports +500 ms, not the
+first release's instant), the check-in time and the MPIDR the core derived **for itself**, the
+bring-up stage reached (`rust → vectors → percpu → gic → timer → ready`), and any re-release count;
+the BSP then prints one detail line per core plus the summary, after bring-up settles and before the
+IPI smoke test. Every stamp is taken with the MMU already on — instrumenting the MMU-off window with
+cacheable stores would re-open the very hazard being hardened; the pre-MMU window is still the
+`core3probe` raw-PL011 stub's job. Knob-off removes every `[smp7]` line and the retry, but **not** the
+arc's always-on `DC CIVAC` above — knob-off is byte-identical to the rest of SMP-7, not to the
+pre-arc image.
 
 ```
 [smp7] core 1 released=+0ms checkin=+1ms ready=+6ms mpidr=0x80000001 stage=ready retries=0
-[smp7] core 3 released=+0ms checkin=-    ready=-    mpidr=0x0        stage=none  retries=3
-[smp7] cores online=0xf missed=0x0 core1 ok +6ms; core2 ok +9ms; core3 ok +8ms
+[smp7] core 3 released=+312ms checkin=-  ready=-   mpidr=0x0        stage=none  retries=3
+[smp7] cores online=0xf missed=0x0 at +12ms core1 ok +6ms; core2 ok +9ms; core3 ok +8ms
 ```
 
 A missing core now reads directly: `stage=none` = never arrived (release/wake path), any other stage
-= arrived and died at that step, and the derived `mpidr` catches an id-confusion recurrence.
+= arrived and died at that step, and the derived `mpidr` catches an id-confusion recurrence. The
+summary line is a **snapshot, not a verdict** — an AP can publish `CORE_READY` just after it prints
+and then be IPI'd and scheduled by the following lines — so it carries the `at +Nms` instant its
+masks describe, and those masks are read as late as possible before the line is formatted.
+
+**Known residual (pre-existing, NOT closed by this arc).** An AP arriving with `MPIDR_EL1 & 0xff >= 4`
+computes `SP` past the end of `SECONDARY_STACKS` in `_secondary_start` and writes its MMU-off
+prologue there, before `__secondary_rust`'s bounds check can park it — the new stack maintenance
+covers only the four legitimate slots, so it does not harden that case. It cannot arise on a
+four-core BCM2711 with correct affinity delivery, which is why it stays a noted residual rather than
+an arc item; hardening it means bounds-checking Aff0 in the asm stub (no stack, EL2, before the first
+store) and parking out-of-range cores there.
 
 **Retry (`smp7_retry`, `UNAOS_SMP7_RETRY=1`; DEFAULT OFF, implies `smp7`).** For an AP that has
 **not checked in at all** after its first wait, re-issue the identical write + `DC CVAC` + `DSB` +

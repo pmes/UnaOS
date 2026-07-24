@@ -333,12 +333,18 @@ extern "C" fn __secondary_rust(_advisory: u64) -> ! {
     sched::wait_and_run(core)
 }
 
-/// SMP-7: print the per-core bring-up evidence, then the one-line verdict. Called by the BSP once the
+/// SMP-7: print the per-core bring-up evidence, then the one-line summary. Called by the BSP once the
 /// bring-up waits (and any retries) have settled, before the IPI smoke test — so the summary describes
 /// *bring-up*, and the IPI lines that follow are read against it.
 ///
-/// Times are milliseconds from the release write, computed from CNTPCT at the measured CNTFRQ (no
-/// tick-count assumptions — the AP timers are only armed at stage `timer`).
+/// It is a SNAPSHOT, not a verdict, and says so: nothing stops an AP from publishing `CORE_READY` a
+/// microsecond after this runs (it would then be IPI'd and scheduled by the very next lines, which
+/// would contradict a "MISSED" claim). Hence the `at +Nms` stamp on the summary — the reader is told
+/// exactly which instant the masks describe, and the online/missed masks are taken as late as
+/// possible, immediately before the line is formatted.
+///
+/// Times are milliseconds from the first release write, computed from CNTPCT at the measured CNTFRQ
+/// (no tick-count assumptions — the AP timers are only armed at stage `timer`).
 #[cfg(feature = "smp7")]
 fn report(t0: u64, freq: u64) {
     for core in 1..NUM_CORES {
@@ -388,10 +394,12 @@ fn report(t0: u64, freq: u64) {
             ));
         }
     }
+    // Timestamp taken AFTER the masks, so `at +Nms` is never earlier than the instant they describe.
     serial_println!(
-        "[smp7] cores online={:#x} missed={:#x} {}",
+        "[smp7] cores online={:#x} missed={:#x} at +{}ms {}",
         online,
         missed,
+        smp7::ms_since(t0, timer::cntpct(), freq),
         detail.trim_end()
     );
 }
@@ -454,6 +462,10 @@ pub fn start_secondaries() {
     let release_all = |cores: &[usize]| unsafe {
         for &core in cores {
             core::ptr::write_volatile(RELEASE_ADDR[core] as *mut u64, entry);
+            // SMP-7: stamp the release PER CORE and on EVERY release, so `released=` carries real
+            // information — a core re-released at +500ms must not report the first release's instant.
+            #[cfg(feature = "smp7")]
+            smp7::EV[core].released_at.store(timer::cntpct(), Ordering::Relaxed);
         }
         // All four slots (0xD8..0xF0) fall in one 64-byte cache line, so this single clean covers
         // cores 1-3; DSB completes it before the SEV makes the wake observable.
@@ -462,13 +474,11 @@ pub fn start_secondaries() {
         core::arch::asm!("dsb sy", "sev", options(nostack, preserves_flags));
     };
 
+    // `t0` is the zero of the [smp7] time axis (the instant of the FIRST release); each core's own
+    // `released_at` is stamped inside `release_all`, and re-stamped by any retry.
     #[cfg(feature = "smp7")]
     let t0 = timer::cntpct();
     release_all(&[1, 2, 3]);
-    #[cfg(feature = "smp7")]
-    for core in 1..NUM_CORES {
-        smp7::EV[core].released_at.store(t0, Ordering::Relaxed);
-    }
     serial_println!(":: AARCH64 SMP: released cores 1-3 via spin-table (0xE0/0xE8/0xF0) ::");
 
     let freq = timer::cntfrq();

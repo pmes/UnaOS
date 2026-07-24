@@ -955,7 +955,9 @@ kernel8() {
     # re-release count) and one `[smp7] cores online=<mask> missed=<mask> …` verdict after bring-up
     # settles. Answers the P53 metal report ("only procs 2 & 4 running regularly") by separating "never
     # left the spin-table" from "arrived and died in its own bring-up". UNAOS_SMP7_RETRY=1 additionally
-    # re-releases a NEVER-ARRIVED AP up to 3x (implies smp7). Both OFF => byte-identical.
+    # re-releases a NEVER-ARRIVED AP up to 3x (implies smp7). Both OFF => no [smp7] line and no retry;
+    # note the arc's ALWAYS-ON part (pre-release DC CIVAC over SECONDARY_STACKS) ships either way, so
+    # knob-off is byte-identical to the rest of SMP-7, not to the pre-arc image.
     if [ -n "${UNAOS_SMP7_RETRY:-}" ]; then
         K8_FEATS="${K8_FEATS},smp7_retry"
         echo -e "${COLOR_YELLOW}  • UNAOS_SMP7_RETRY: re-release a never-arrived AP (3x) + the [smp7] bring-up evidence${COLOR_RESET}"
