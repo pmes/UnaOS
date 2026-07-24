@@ -262,6 +262,95 @@ again (second consecutive full-core >1 MiB boot), the whole created-file family 
 riders re-captured.** Serial: `~/unaos-bench/pi-serial-2026-07-15-core3fix-32of32.log`.
 Core-3-down on >1 MiB images is no longer an expected signature.
 
+#### SMP-7 — the P53 "only 2 of 4 cores" report: bring-up audit + per-core evidence
+
+**Trigger (metal, 2026-07-24, P53 on a real Pi 4):** *"smp needs serious work. only procs 2 & 4
+running regularly."* That is worse than the previously documented intermittent 3/4 (an AP missing
+the spin-table release, usually recovered by a power-cycle) and worse than the CORE3-SMP regression
+above, which was metal-confirmed fixed. Null hypothesis, as always: **our code**.
+
+**Audit of the release path (`smp.rs`, `boot.rs::_start`/`drop_to_el1`/`enable_mmu`, `cache.rs`,
+`gic.rs`).** Read end-to-end against the P53 build. What was checked and what it showed:
+
+*Refuted / clean (no defect found):*
+
+* **Release slots + cache maintenance.** `RELEASE_ADDR = 0xD8/0xE0/0xE8/0xF0` matches the BCM2711
+  DTB `cpu-release-addr`; all four lie in the single 64-byte line at `0xC0`, so the one
+  `clean_range(0xE0, 0x18)` + `DSB` before `SEV` genuinely publishes all three slots. Order is
+  correct (write → clean → DSB → SEV), and the event register is sticky, so an AP that is not yet
+  in `WFE` when the `SEV` lands still wakes on its next `WFE`.
+* **Low-RAM overlap.** Nothing the kernel places can land on the spin-table page: the image loads at
+  `0x80000` with `__bss_end = 0x21B140` (~2.2 MiB) and `__stack_top = 0x29C000`, and the bare-metal
+  heap region is fixed at `0x0200_0000` (32 MiB) + 64 MiB. The parked cores execute armstub code in
+  page 0 undisturbed, and the P47→P53 growth is nowhere near either boundary.
+* **Secondary stack arithmetic.** `_secondary_start` sets `SP = &SECONDARY_STACKS + (Aff0+1)*64 KiB`;
+  slot 0 is unused, cores 1-3 take disjoint slots 1-3, core 3's top is the array end. No overlap,
+  no off-by-one, and the array is `align(16)` so `SP` stays 16-aligned as AArch64 requires.
+* **Per-core GIC init is not a cross-core race.** `enable_banked` does an RMW of `GICD_IGROUPR` on
+  the Pi path, which looks like an unsynchronised distributor RMW across four cores — but for
+  INTID < 32 `IGROUPR0`/`ISENABLER0`/`IPRIORITYR0-7` are **banked per CPU interface** on GICv2, so
+  each core is reading and writing its own copy. Not a defect.
+* **The CORE3-SMP hazard is not live in this build.** Disassembling `<__secondary_rust>` from the
+  P53 kernel: the id is still re-derived by `mrs x8, MPIDR_EL1` *after* the `SCTLR_EL1` write, and
+  nothing stored with the MMU off is reloaded afterwards. The 2026-07-15 fix is intact.
+
+*Confirmed weakness (fixed here) — the MMU-off stack window still exists:*
+
+The AP's prologue runs before `drop_to_el1`/`enable_mmu` and **does** write the stack with the MMU
+and caches off: `sub sp,sp,#0x30; str x30,[sp,#0x10]; stp x20,x19,[sp,#0x20]`. Those stores go
+straight to DRAM while every later access to the same lines is Normal-cacheable — the exact
+mismatched-attributes window that produced the phantom "core 0", and the BSP, which has run
+cacheable over all of RAM for the whole boot, can hold stale lines covering `SECONDARY_STACKS` in
+the cluster-shared 1 MiB L2. Today no MMU-off spill happens to be reloaded, so this is **latent, not
+live** — but that property is pure codegen luck, and codegen shifts every time the image does, which
+is precisely the layout-dependence the original regression showed. **Fix (always on, no knob, it is
+cache maintenance rather than a behaviour change):** the BSP `clean_invalidate_range`s the whole
+256 KiB `SECONDARY_STACKS` array to the PoC immediately before the release, so no stale line for any
+AP stack can survive into its MMU-off window. `DC CIVAC` is inner-shareable-broadcast, it runs once
+at boot, and the BSP never touches those stacks again.
+
+*Suspect, deliberately NOT changed (read-only until metal says otherwise):*
+
+* **`CPUECTLR_EL1.SMPEN` (A72 bit 6) is never set or checked by us** — we inherit whatever the
+  VideoCore firmware/armstub left. On Cortex-A72 SMPEN must be set before caches/MMU are enabled for
+  the core to participate in coherency, and a non-coherent AP would hang on its first lock or
+  atomic — a plausible shape for "core arrives, never reports". It is not instrumented here because
+  the register is IMPDEF: an EL1 read can trap to EL2 (we never program `ACTLR_EL2`), and taking an
+  exception on a secondary is the failure being investigated. The sound probe is a read/set in the
+  asm stub while still at EL2, no stack involved — proposed, not shipped.
+* **Nothing distinguishes "never left the spin-table" from "arrived and died".** That is what the
+  telemetry below now settles, and it is the prerequisite for any further fix.
+
+**Telemetry (`smp7`, `UNAOS_SMP7=1`; DEFAULT OFF, knob-off is byte-identical).** Per AP the kernel
+records the release-write timestamp, the check-in time and the MPIDR the core derived **for itself**,
+the bring-up stage reached (`rust → vectors → percpu → gic → timer → ready`), and any re-release
+count; the BSP then prints one detail line per core plus the verdict, after bring-up settles and
+before the IPI smoke test. Every stamp is taken with the MMU already on — instrumenting the MMU-off
+window with cacheable stores would re-open the very hazard being hardened; the pre-MMU window is
+still the `core3probe` raw-PL011 stub's job.
+
+```
+[smp7] core 1 released=+0ms checkin=+1ms ready=+6ms mpidr=0x80000001 stage=ready retries=0
+[smp7] core 3 released=+0ms checkin=-    ready=-    mpidr=0x0        stage=none  retries=3
+[smp7] cores online=0xf missed=0x0 core1 ok +6ms; core2 ok +9ms; core3 ok +8ms
+```
+
+A missing core now reads directly: `stage=none` = never arrived (release/wake path), any other stage
+= arrived and died at that step, and the derived `mpidr` catches an id-confusion recurrence.
+
+**Retry (`smp7_retry`, `UNAOS_SMP7_RETRY=1`; DEFAULT OFF, implies `smp7`).** For an AP that has
+**not checked in at all** after its first wait, re-issue the identical write + `DC CVAC` + `DSB` +
+`SEV`, up to 3× at ~100 ms. Never applied to a core that arrived and then stopped — that core has
+already left the spin-table and re-releasing it would be actively wrong. It is as much an instrument
+as a recovery: a core that a re-release recovers indicts the release/wake path; one that never
+recovers is losing itself after arrival, and `stage` says where.
+
+**Gates:** `./arroyo check` green both arches; `./arroyo kernel8` builds clean; `kernel8-test 45`
+**46/46 required witnesses, 0 forbidden** both knob-off and with `UNAOS_SMP7_RETRY=1`, CAPSTONE 6/6,
+and QEMU raspi4b still brings up 4/4 (`online=0xf missed=0x0`). QEMU has never reproduced any of
+this — the verdict is metal, on the next attended Pi sitting, with `UNAOS_SMP7=1` (observation) or
+`UNAOS_SMP7_RETRY=1` (observation + recovery experiment).
+
 **Scheduler on the `virt` path — the boot core, since JC3.** The aarch64 scheduler
 was `#[cfg(feature = "baremetal")]`-gated and coupled to EL1 (`ELR_EL1`/`SPSR_EL1`
 eret paths), while the `virt` kernel runs at EL2. **Arc JC3** un-gates it: after the

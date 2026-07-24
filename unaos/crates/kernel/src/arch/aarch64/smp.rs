@@ -156,6 +156,105 @@ unsafe extern "C" {
     fn _secondary_start();
 }
 
+// ---------------------------------------------------------------------------------------------
+// SMP-7 telemetry (feature `smp7`, armed by `UNAOS_SMP7=1`; DEFAULT OFF — every call site below is
+// `#[cfg]`-gated, so a default image is byte-identical to the pre-arc one).
+//
+// Metal observation 2026-07-24 (P53): "only procs 2 & 4 running regularly" — 2 of 4 cores online on a
+// real Pi 4, worse than the previously documented intermittent 3/4. The pre-arc kernel prints exactly
+// one bit of evidence per missing core ("WARNING core N did not come online"), which cannot tell
+// "never left the firmware spin-table" from "arrived and died inside its own bring-up". This module
+// records, per AP, when it was released, whether/when it checked in, the MPIDR it actually derived,
+// how far through bring-up it got, and how many re-releases it took — then prints one summary line.
+//
+// Everything here is written by a core with its MMU already ON (the check-in point is placed after
+// `enable_mmu`, deliberately: an MMU-off store to a cacheable-mapped address is the CORE3-SMP hazard
+// class, and telemetry must not re-open it). Pre-MMU evidence remains the `core3probe` raw-PL011 stub
+// above — the only sound way to observe that window.
+#[cfg(feature = "smp7")]
+mod smp7 {
+    use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+    /// Bring-up stages an AP passes through, published in order. A core that never checks in stays at
+    /// `NONE`; a core stuck at `N` died between stage N and N+1 — that is the diagnostic.
+    pub const STAGE_NONE: u32 = 0;
+    pub const STAGE_RUST: u32 = 1; // MMU on, id re-derived from MPIDR_EL1, bounds-checked
+    pub const STAGE_VECTORS: u32 = 2; // VBAR installed
+    pub const STAGE_PERCPU: u32 = 3; // TPIDR per-CPU block live
+    pub const STAGE_GIC: u32 = 4; // CPU interface + IPI SGI + IRQ unmasked
+    pub const STAGE_TIMER: u32 = 5; // this core's periodic tick armed
+    pub const STAGE_READY: u32 = 6; // CORE_READY published
+
+    pub fn stage_name(s: u32) -> &'static str {
+        match s {
+            STAGE_NONE => "none",
+            STAGE_RUST => "rust",
+            STAGE_VECTORS => "vectors",
+            STAGE_PERCPU => "percpu",
+            STAGE_GIC => "gic",
+            STAGE_TIMER => "timer",
+            _ => "ready",
+        }
+    }
+
+    pub struct CoreEvidence {
+        /// CNTPCT when the BSP wrote this core's release slot (0 = never released).
+        pub released_at: AtomicU64,
+        /// CNTPCT at the AP's first MMU-on instruction in `__secondary_rust` (0 = never arrived).
+        pub checkin_at: AtomicU64,
+        /// CNTPCT when the AP published `CORE_READY` (0 = never).
+        pub ready_at: AtomicU64,
+        /// The full MPIDR_EL1 the AP read for itself, MMU on (0 = never checked in).
+        pub mpidr: AtomicU64,
+        /// Highest stage reached.
+        pub stage: AtomicU32,
+        /// Re-releases the BSP issued for this core (`smp7_retry` only).
+        pub retries: AtomicU32,
+    }
+
+    impl CoreEvidence {
+        pub const fn new() -> Self {
+            Self {
+                released_at: AtomicU64::new(0),
+                checkin_at: AtomicU64::new(0),
+                ready_at: AtomicU64::new(0),
+                mpidr: AtomicU64::new(0),
+                stage: AtomicU32::new(STAGE_NONE),
+                retries: AtomicU32::new(0),
+            }
+        }
+    }
+
+    pub static EV: [CoreEvidence; super::NUM_CORES] =
+        [const { CoreEvidence::new() }; super::NUM_CORES];
+
+    /// An AP records that it arrived, with the id it derived for itself. Relaxed is enough: the BSP
+    /// only reads these after its own bounded wait, and `CORE_READY`'s Release/Acquire pair is the
+    /// real ordering edge for everything that matters.
+    pub fn checkin(core: usize, mpidr: u64) {
+        EV[core].mpidr.store(mpidr, Ordering::Relaxed);
+        EV[core].checkin_at.store(super::timer::cntpct(), Ordering::Relaxed);
+        EV[core].stage.store(STAGE_RUST, Ordering::Relaxed);
+    }
+
+    pub fn stage(core: usize, s: u32) {
+        EV[core].stage.store(s, Ordering::Relaxed);
+        if s == STAGE_READY {
+            EV[core].ready_at.store(super::timer::cntpct(), Ordering::Relaxed);
+        }
+    }
+
+    /// Milliseconds from `t0` to `t` at the counter frequency (0 if `t` is unset/earlier). Integer
+    /// math only — no FP on the boot path.
+    pub fn ms_since(t0: u64, t: u64, freq: u64) -> u64 {
+        if t == 0 || t <= t0 || freq == 0 {
+            0
+        } else {
+            (t - t0).saturating_mul(1000) / freq
+        }
+    }
+}
+
 /// Rust entry for a released secondary core. Called from `_secondary_start` with the **MMU still
 /// off** and this core's stack set. Turns the MMU on FIRST (before any lock/atomic — `serial_println`
 /// takes a spinlock), then brings up this core's private state: exception vectors, per-CPU block
@@ -195,19 +294,36 @@ extern "C" fn __secondary_rust(_advisory: u64) -> ! {
             unsafe { core::arch::asm!("wfe", options(nomem, nostack, preserves_flags)) };
         }
     }
+    // SMP-7: first evidence this core exists at all, taken with the MMU on (see the module comment).
+    // From here every stage bump narrows a lost core to the step it died in.
+    #[cfg(feature = "smp7")]
+    smp7::checkin(core, mpidr);
     // Per-core VBAR_EL2 so a fault on this core is caught rather than jumping to a stale vector.
     exceptions::install();
+    #[cfg(feature = "smp7")]
+    smp7::stage(core, smp7::STAGE_VECTORS);
     // Per-CPU data reachable via TPIDR_EL2 (the IPI handler resolves its counter through this).
     percpu::init(core);
+    #[cfg(feature = "smp7")]
+    smp7::stage(core, smp7::STAGE_PERCPU);
     // This core's GIC CPU interface + the IPI SGI (both banked per-core), then unmask IRQ.
     gic::init_cpu_interface();
     gic::enable_sgi(IPI_RESCHED);
     exceptions::enable_irq();
+    #[cfg(feature = "smp7")]
+    smp7::stage(core, smp7::STAGE_GIC);
     // This core's own periodic tick, for scheduler preemption (`INTERVAL` was set by the BSP's
     // timer::init). Also wakes this core's WFI in the scheduler's wait/idle loops.
     timer::arm_this_core();
+    #[cfg(feature = "smp7")]
+    smp7::stage(core, smp7::STAGE_TIMER);
 
     serial_println!(":: AARCH64 SMP: core {} online (EL1, MMU on, GIC+IPI+timer ready) ::", core);
+    // SMP-7: stamp READY *before* the publish, so a core that is counted online always has a ready
+    // timestamp (the BSP reads the evidence only after observing CORE_READY, so it cannot see the
+    // stage without the stamp — the reverse order could).
+    #[cfg(feature = "smp7")]
+    smp7::stage(core, smp7::STAGE_READY);
     // Publish readiness AFTER everything above (Release pairs with the BSP's Acquire), so the BSP
     // only sends an SGI once this core can actually take it.
     CORE_READY[core].store(true, Ordering::Release);
@@ -215,6 +331,69 @@ extern "C" fn __secondary_rust(_advisory: u64) -> ! {
     // Enter the scheduler: wait for the BSP to turn scheduling on, then run this core's run queue
     // forever (idling in WFI when empty). Never returns.
     sched::wait_and_run(core)
+}
+
+/// SMP-7: print the per-core bring-up evidence, then the one-line verdict. Called by the BSP once the
+/// bring-up waits (and any retries) have settled, before the IPI smoke test — so the summary describes
+/// *bring-up*, and the IPI lines that follow are read against it.
+///
+/// Times are milliseconds from the release write, computed from CNTPCT at the measured CNTFRQ (no
+/// tick-count assumptions — the AP timers are only armed at stage `timer`).
+#[cfg(feature = "smp7")]
+fn report(t0: u64, freq: u64) {
+    for core in 1..NUM_CORES {
+        let e = &smp7::EV[core];
+        let checkin = e.checkin_at.load(Ordering::Relaxed);
+        let ready = e.ready_at.load(Ordering::Relaxed);
+        serial_println!(
+            "[smp7] core {} released=+{}ms checkin={} ready={} mpidr={:#x} stage={} retries={}",
+            core,
+            smp7::ms_since(t0, e.released_at.load(Ordering::Relaxed), freq),
+            if checkin == 0 {
+                alloc::format!("-")
+            } else {
+                alloc::format!("+{}ms", smp7::ms_since(t0, checkin, freq))
+            },
+            if ready == 0 {
+                alloc::format!("-")
+            } else {
+                alloc::format!("+{}ms", smp7::ms_since(t0, ready, freq))
+            },
+            e.mpidr.load(Ordering::Relaxed),
+            smp7::stage_name(e.stage.load(Ordering::Relaxed)),
+            e.retries.load(Ordering::Relaxed),
+        );
+    }
+
+    // Masks are by MPIDR Aff0: bit 0 is the BSP, which is online by construction.
+    let mut online: u32 = 1;
+    let mut missed: u32 = 0;
+    let mut detail = alloc::string::String::new();
+    for core in 1..NUM_CORES {
+        let e = &smp7::EV[core];
+        if CORE_READY[core].load(Ordering::Acquire) {
+            online |= 1 << core;
+            detail.push_str(&alloc::format!(
+                "core{} ok +{}ms; ",
+                core,
+                smp7::ms_since(t0, e.ready_at.load(Ordering::Relaxed), freq)
+            ));
+        } else {
+            missed |= 1 << core;
+            detail.push_str(&alloc::format!(
+                "core{} MISSED stage={} retries={}; ",
+                core,
+                smp7::stage_name(e.stage.load(Ordering::Relaxed)),
+                e.retries.load(Ordering::Relaxed)
+            ));
+        }
+    }
+    serial_println!(
+        "[smp7] cores online={:#x} missed={:#x} {}",
+        online,
+        missed,
+        detail.trim_end()
+    );
 }
 
 /// The secondary cores that came online (MPIDR Aff0), for the BSP to place a scheduler workload on.
@@ -246,8 +425,34 @@ pub fn start_secondaries() {
     gic::enable_sgi(IPI_RESCHED);
 
     let entry = _secondary_start as usize as u64;
+
+    // SMP-7 HARDENING (always on, no knob — cache maintenance, not a behaviour change).
+    //
+    // Each AP arrives with its MMU and caches OFF and immediately uses its stack: the compiler's
+    // prologue for `__secondary_rust` stores x30/x19/x20 there (`str x30,[sp,#0x10]` /
+    // `stp x20,x19,[sp,#0x20]` in the P53 build) BEFORE `drop_to_el1`/`enable_mmu`. Those stores go
+    // straight to DRAM, while every access to the same lines after `enable_mmu` is Normal-cacheable —
+    // exactly the mismatched-attributes window that produced the CORE3-SMP phantom (arch_arm64.md
+    // §CORE3-SMP FIX). The BSP has been running cacheable over all of RAM for the whole boot and can
+    // have (speculatively or otherwise) allocated lines covering `SECONDARY_STACKS` into the
+    // cluster-shared 1 MiB L2; a stale hit there poisons whatever the AP reloads. The CORE3 fix
+    // deleted the one *known* load-bearing reload (the core id); disassembly of this build shows no
+    // MMU-off spill is reloaded today, so this is hardening rather than a live-bug fix — but the
+    // property currently rests on codegen, and codegen moves every time the image does. Clean +
+    // invalidate the whole stack array to PoC here, immediately before the release, so no stale line
+    // for any AP stack can survive into its MMU-off window. `DC CIVAC` is broadcast in the
+    // inner-shareable domain, the range is 256 KiB (a few thousand ops, once, at boot), and the BSP
+    // never touches these stacks again.
     unsafe {
-        for core in 1..NUM_CORES {
+        let stacks = &raw const SECONDARY_STACKS as usize;
+        cache::clean_invalidate_range(stacks, SEC_STACK_SIZE * NUM_CORES);
+    }
+
+    // Write every AP's release slot, push it to the Point of Coherency (the parked cores read it with
+    // their MMU off), then one broadcast SEV. Factored out so the retry path below re-issues the exact
+    // same sequence — a retry that skipped the clean or the DSB would be a different experiment.
+    let release_all = |cores: &[usize]| unsafe {
+        for &core in cores {
             core::ptr::write_volatile(RELEASE_ADDR[core] as *mut u64, entry);
         }
         // All four slots (0xD8..0xF0) fall in one 64-byte cache line, so this single clean covers
@@ -255,6 +460,14 @@ pub fn start_secondaries() {
         let span = (RELEASE_ADDR[NUM_CORES - 1] + 8) - RELEASE_ADDR[1];
         cache::clean_range(RELEASE_ADDR[1], span);
         core::arch::asm!("dsb sy", "sev", options(nostack, preserves_flags));
+    };
+
+    #[cfg(feature = "smp7")]
+    let t0 = timer::cntpct();
+    release_all(&[1, 2, 3]);
+    #[cfg(feature = "smp7")]
+    for core in 1..NUM_CORES {
+        smp7::EV[core].released_at.store(t0, Ordering::Relaxed);
     }
     serial_println!(":: AARCH64 SMP: released cores 1-3 via spin-table (0xE0/0xE8/0xF0) ::");
 
@@ -263,9 +476,40 @@ pub fn start_secondaries() {
     for core in 1..NUM_CORES {
         let deadline = timer::cntpct() + freq / 2;
         if !wait_until(deadline, || CORE_READY[core].load(Ordering::Acquire)) {
-            serial_println!(":: AARCH64 SMP: WARNING core {} did not come online ::", core);
+            // SMP-7 RETRY (feature `smp7_retry`, armed by `UNAOS_SMP7_RETRY=1`; DEFAULT OFF, and a
+            // strict superset of `smp7` so the retry never runs without the evidence that explains
+            // it). A core that has not checked in at all may simply have missed the release; one that
+            // checked in and then stopped is dead somewhere in its own bring-up and re-releasing it
+            // would be actively wrong (it is not in the spin-table any more). So retry ONLY the
+            // never-arrived case, re-issuing the identical write+clean+DSB+SEV. This is a diagnostic
+            // instrument as much as a recovery: if a re-release recovers a core, the defect is in the
+            // release/wake path; if it never does, the core is losing itself after arrival, and the
+            // stage field says where.
+            #[cfg(feature = "smp7_retry")]
+            {
+                const MAX_RETRIES: u32 = 3;
+                let mut n = 0;
+                while n < MAX_RETRIES
+                    && !CORE_READY[core].load(Ordering::Acquire)
+                    && smp7::EV[core].checkin_at.load(Ordering::Relaxed) == 0
+                {
+                    n += 1;
+                    smp7::EV[core].retries.store(n, Ordering::Relaxed);
+                    release_all(&[core]);
+                    let d = timer::cntpct() + freq / 10; // ~100 ms per attempt
+                    if wait_until(d, || CORE_READY[core].load(Ordering::Acquire)) {
+                        break;
+                    }
+                }
+            }
+            if !CORE_READY[core].load(Ordering::Acquire) {
+                serial_println!(":: AARCH64 SMP: WARNING core {} did not come online ::", core);
+            }
         }
     }
+
+    #[cfg(feature = "smp7")]
+    report(t0, freq);
 
     // IPI smoke test: ping each online core with SGI 0 and confirm its per-CPU counter ticks — proof
     // the GIC delivers a software interrupt from the BSP to another core's CPU interface.

@@ -51,6 +51,18 @@ baremetal = ["pi"]
 # raspi4b stays deterministic (the join barrier is a correctness barrier; band count tracks the
 # actually-scheduled cores). Enable via `UNAOS_VUGPAR=1`. See scripts/pi-vugpar-bench.md.
 vugpar = []
+# SMP-7: per-core secondary bring-up evidence on the Pi spin-table path (`arch/aarch64/smp.rs`).
+# Records, for each AP, the release-write timestamp, whether/when it checked in (MMU on), the MPIDR it
+# derived for itself, how far through bring-up it got, and any re-release count — then prints one
+# `[smp7] cores online=<mask> missed=<mask> …` verdict after bring-up settles. Read-only telemetry;
+# DEFAULT OFF => every call site vanishes and the boot is byte-identical. Enable via `UNAOS_SMP7=1`.
+smp7 = []
+# SMP-7 recovery experiment: re-issue the spin-table release (write + DC CVAC + DSB + SEV) for an AP
+# that has NOT checked in at all after its first wait, up to 3 times. Never applied to a core that
+# arrived and then stopped (it has already left the spin-table — re-releasing it would be wrong).
+# Implies `smp7`, so the retry count is always reported alongside the evidence that explains it.
+# DEFAULT OFF. Enable via `UNAOS_SMP7_RETRY=1`.
+smp7_retry = ["smp7"]
 # K2 metal money-shot: turn k2_liveenf_launcher into a REAL two-boot cross-reboot power-cycle proof (instead of
 # the same-boot simulate). One image, flashed once, booted twice: boot-1 (K2PRIV.BIN absent) creates+persists+
 # LEAVES an owned file; power-cycle; boot-2 (K2PRIV.BIN present) verifies the LIVE boot rebuild reinstalled the
