@@ -142,6 +142,16 @@ const V3D_CTL_SLCACTL: usize = 0x0024; // slice-cache control (TMU-vertex/TMU-da
 const V3D_CTL_L2TCACTL: usize = 0x0030; // L2T cache control
 const V3D_L2TCACTL_L2TFLS: u32 = 1 << 0; // flush start; reads 1 while the flush is in progress
 const V3D_L2TCACTL_FLM_FLUSH: u32 = 0 << 1; // FLM field [2:1] = FLUSH (write-back + invalidate)
+// PI-V3D-51: the L2T flush ADDRESS-RANGE bounds the L2TCACTL flush above walks. Offsets transcribed from
+// Linux `v3d_regs.h` (register facts; GPL-2.0-only header, facts-only): V3D_CTL_L2TFLSTA=0x034,
+// V3D_CTL_L2TFLEND=0x038. `v3d_init_core` writes STA=0 and END=~0 (flush the WHOLE address space) for
+// EVERY V3D version — it is NOT the ver<41 MISCCFG branch, it runs unconditionally — and `v3d_init_hw_state`
+// is called at the tail of EVERY `v3d_reset_v3d`. UnaOS's V3D-50 OFF→ON power-cycle returns these to their
+// power-on-reset value and nothing re-established them, so the per-kick L2TCACTL FLM=FLUSH in
+// `invalidate_gpu_caches` walked an unestablished (POR) range — the exact core-init step §24's audit table
+// missed (it accounted only for the ver<40 MISCCFG write, not the unconditional L2TFL* pair).
+const V3D_CTL_L2TFLSTA: usize = 0x0034; // L2T flush start address (v3d_regs.h)
+const V3D_CTL_L2TFLEND: usize = 0x0038; // L2T flush end address   (v3d_regs.h)
 const V3D_SLCACTL_INVALIDATE_ALL: u32 = (0xF << 24) | (0xF << 16) | (0xF << 8) | 0xF;
 
 // ─── PI-V3D-34: TMU/GMP block-state witness constants. Offsets + bits transcribed VERBATIM from Linux
@@ -606,6 +616,13 @@ pub fn bringup(fb: Option<FbTarget>) {
         (hub1 & 0xF).max(1)
     );
     serial_println!(":: V3D: M1 probe PASS (powered, clocked, IDENT live) ::");
+
+    // PI-V3D-51: the post-reset core-init the kernel runs at the tail of EVERY v3d_reset_v3d (via
+    // v3d_init_hw_state → v3d_init_core): establish the L2T flush address window (L2TFLSTA=0,
+    // L2TFLEND=~0). Our V3D-50 power-cycle reset left these at POR and nothing re-established them, so
+    // the per-kick L2TCACTL FLM=FLUSH walked an unestablished range. Kernel order is reset → init_hw_state
+    // → MMU reinit, so this sits between the reset/probe and M2. Core-relative — safe now the block is UP.
+    v3d_init_hw_state();
 
     // ── M2: MMU. ────────────────────────────────────────────────────────────────────────────────
     if !program_mmu() {
@@ -1733,6 +1750,46 @@ fn v3d_irq_enable() {
             "FLDONE was MASKED at power-on-reset — every prior boot polled a gated retire signal; this unmask is the empty-frame fix"
         } else {
             "FLDONE was already unmasked at reset — INT_STS latches raw, so masking never inverted the FLDONE=0 verdict; the wedge is downstream of the frame enables"
+        }
+    );
+}
+
+/// PI-V3D-51: the post-reset core init step the kernel runs after EVERY reset and UnaOS never did.
+///
+/// The kernel's `v3d_reset_v3d` (`v3d_gem.c`) ends by calling `v3d_init_hw_state` → `v3d_init_core`,
+/// which — for EVERY V3D version, unconditionally — writes the L2T flush ADDRESS RANGE:
+///     V3D_CORE_WRITE(core, V3D_CTL_L2TFLSTA, 0);
+///     V3D_CORE_WRITE(core, V3D_CTL_L2TFLEND, ~0);
+/// (The ver<41-only MISCCFG=OVRTMUOUT write is a SEPARATE, conditional step — the one §24's audit table
+/// accounted for; the L2TFL* pair it MISSED.) STA=0/END=~0 establishes the flush window as the WHOLE
+/// address space, so every subsequent `V3D_CTL_L2TCACTL` FLM=FLUSH (our `invalidate_gpu_caches`, run
+/// before every kick, and the frame-completion write-back the binner drives) walks the full range.
+///
+/// UnaOS's V3D-50 OFF→ON power-cycle returns L2TFLSTA/L2TFLEND to their power-on-reset value; nothing
+/// re-established them, so every per-kick L2T flush operated over an UNESTABLISHED range. This is the
+/// first divergence BELOW the byte-exact per-job programming (§10–23) and the reset cycle (§24): the
+/// bin frame's flush/write-back depends on an L2T flush window the kernel guarantees and we never set.
+///
+/// Sequenced to mirror the kernel: AFTER the reset cycle and BEFORE the MMU re-program (kernel order is
+/// `v3d_reset_v3d`[incl. init_hw_state] → MMU reinit). Core-relative writes, so it runs only after the
+/// BLOCK-UP probe verdict (an absent block would abort a core read). Echoes both registers back so the
+/// P48 metal boot confirms the CLE latched the window. Idempotent; QEMU raspi4b returns at BLOCK-DOWN
+/// before this point, so the step is dormant there — metal decides whether it unwedges the empty frame.
+fn v3d_init_hw_state() {
+    let sta_por = mmio_read(V3D_CORE0_BASE, V3D_CTL_L2TFLSTA);
+    let end_por = mmio_read(V3D_CORE0_BASE, V3D_CTL_L2TFLEND);
+    mmio_write(V3D_CORE0_BASE, V3D_CTL_L2TFLSTA, 0);
+    mmio_write(V3D_CORE0_BASE, V3D_CTL_L2TFLEND, !0);
+    dsb();
+    let sta_now = mmio_read(V3D_CORE0_BASE, V3D_CTL_L2TFLSTA);
+    let end_now = mmio_read(V3D_CORE0_BASE, V3D_CTL_L2TFLEND);
+    serial_println!(
+        ":: V3D: [v3d51] init-hw-state — L2TFLSTA por={:#010x}->{:#010x} (want 0) | L2TFLEND por={:#010x}->{:#010x} (want 0xffffffff) — kernel `v3d_init_core` writes STA=0/END=~0 unconditionally after EVERY reset; the L2T flush window our per-kick FLM=FLUSH walks was at POR, never established — {} ::",
+        sta_por, sta_now, end_por, end_now,
+        if sta_por == 0 && end_por == !0 {
+            "POR already matched the kernel window (firmware left it established) — this write is a no-op and the empty-frame wedge sits below the L2T flush range too"
+        } else {
+            "POR did NOT match the kernel window — the reset left the L2T flush range unestablished; this is the missing v3d_init_hw_state step and the empty-frame fix candidate"
         }
     );
 }
@@ -3380,7 +3437,7 @@ fn submit_bisect_rung_tagged(tag: &str, rung: &str, content: BinContent, shadrec
             BinContent::Full => "full draw RETIRED",
         }
     } else if content == BinContent::Empty {
-        "empty frame did NOT retire — the frame handshake itself never worked; audit the frame-level enables (CT0QTS ENABLE-bit semantics, QMS size encoding, CT1/RENDER-config ordering) — see the [v3d44/45/46] wedge dump above"
+        "empty frame did NOT retire — the frame handshake itself never worked; the frame-level enables (CT0QTS/QMS/CT1-order §23) and the reset cycle (§24) are audited byte-exact, and V3D-51 established the L2T flush window (L2TFLSTA=0/L2TFLEND=~0, the [v3d51] init-hw-state step) — if it still wedges the break is below the CLE→PTB FLDONE generation; see the [v3d44/45/46] wedge dump above"
     } else {
         "did NOT retire — this rung's added packet class is the offending one (the rung below it retired); localise there"
     };
@@ -3436,6 +3493,14 @@ fn empty_frame_bisection() {
     // retiring the whole seven-layer empty-bin investigation. If it still reads `retired=0 BFC Δ0
     // BMACTIVE=1`, the reset cycle was not the wall and the wedge sits below the CLE→PTB FLDONE generation.
     submit_bisect_rung_tagged("v3d50", "empty-after-fix", BinContent::Empty, OFF_SHADREC);
+    // PI-V3D-51: re-run the EMPTY rung again, tagged [v3d51], as the direct before/after witness for the
+    // missing post-reset core-init (`v3d_init_hw_state` established L2TFLSTA=0/L2TFLEND=~0 in bring-up this
+    // boot — the L2T flush window the per-kick FLM=FLUSH walks). If establishing that window unwedged the
+    // frame flush/write-back, THIS reads `retired=1 BFC Δ1 PCS=…BMACTIVE=0`, retiring the empty-bin
+    // investigation as an un-init'd L2T flush range. If it still reads `retired=0 BFC Δ0 BMACTIVE=1` with
+    // the [v3d51] init-hw-state witness confirming the window latched, the wedge sits below the L2T flush
+    // range too and the retained [v3d44/45/46] dump names the next layer.
+    submit_bisect_rung_tagged("v3d51", "empty-after-init-hw-state", BinContent::Empty, OFF_SHADREC);
     submit_bisect_rung("empty-frame", BinContent::Empty, OFF_SHADREC);
     submit_bisect_rung("state-no-prims", BinContent::StateNoPrims, OFF_SHADREC);
     submit_bisect_rung("prims-null-shader", BinContent::PrimsNullShader, OFF_BISECT_NULL_SHADREC);

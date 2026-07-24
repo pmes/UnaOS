@@ -913,3 +913,65 @@ cycle.
   `retired=0 BFC Δ0 …BMACTIVE=1` with the reset cycle proven applied, the wedge sits **below the CLE→PTB
   FLDONE generation itself** (a deeper hub/tile-state-flush step), and the retained `[v3d44/45/46]` wedge
   dump the `Empty` rung emits names it.
+
+## 25. The missing post-reset core init — the L2T flush window (V3D-51)
+
+**P47 delivered the reset-cycle verdict: the empty frame STILL does not retire.** The full OFF→ON ASB reset
+cycle (§24) executed cleanly on metal — both bridges ACK-stopped, `V3DRSTN` asserted, `PM_GRAFX`
+pre=`0x00001000` — and the empty rung read
+`retired=0 BFC Δ0 PCS=0x00000001 (BMACTIVE=1 BMBUSY=0) idled=1 INT_STS=0 waited=500000us`. So the wedge is
+**not** power/reset state: the CLE consumed the list and the binner claims active (`BMACTIVE=1`) but never
+consumes/retires the CL (`BMBUSY=0`, `BFC` never increments). Everything the kernel writes **per job** (§10–23)
+and the reset cycle (§24) are byte-exact — so V3D-51 re-audited the kernel's **post-reset core init**, the
+step that runs between reset and the first job.
+
+**The one factual error in §24's audit table — the unconditional `L2TFL*` writes.** §24 concluded
+"`v3d_init_core` writes `MISCCFG` only for `ver < 40` (not us), and there is no probe-time
+`AXICFG`/hub-ident write." That accounts only for the **conditional** MISCCFG branch. The kernel's
+`v3d_init_core` (`v3d_gem.c`), for **every** V3D version, unconditionally writes the **L2T flush address
+range**:
+
+```
+V3D_CORE_WRITE(core, V3D_CTL_L2TFLSTA, 0);      // 0x034 — flush window start
+V3D_CORE_WRITE(core, V3D_CTL_L2TFLEND, ~0);     // 0x038 — flush window end
+```
+
+`v3d_init_core` is reached via `v3d_init_hw_state`, which the kernel calls at the **tail of every**
+`v3d_reset_v3d`. STA=0/END=~0 establishes the flush window as the **whole address space**, so every
+subsequent `V3D_CTL_L2TCACTL` `FLM=FLUSH` — both our per-kick `invalidate_gpu_caches` and the
+frame-completion write-back the binner drives — walks the full range. `AXICFG` (also flagged in §24 as
+un-audited) is written **only** in `v3d_reset_by_bridge`; UnaOS uses the ASB-power reset path
+(`reset_control_reset`, proven on metal at P47), which the kernel does **not** follow with an AXICFG write
+either — so `AXICFG` is *not* a divergence and is correctly left untouched.
+
+**The differential — first divergence marked.**
+
+| # | Kernel (post-reset, pre-job) | UnaOS (pre-V3D-51) | Verdict |
+| --- | --- | --- | --- |
+| 1 | `v3d_reset_v3d` tail → `v3d_init_hw_state` → `v3d_init_core`: **`L2TFLSTA=0`**, **`L2TFLEND=~0`** (all versions) | reset cycle (§24) then straight to MMU program — **L2TFL* never written**, left at POR | **DEFECT — the V3D-51 fix.** The per-kick `L2TCACTL FLM=FLUSH` walked an unestablished window. |
+| 2 | `v3d_init_core` `MISCCFG=OVRTMUOUT` **only** `ver<41` | never writes MISCCFG (ver 42 ≥ 41) | Match (§24, re-confirmed). |
+| 3 | `AXICFG=MAX_LEN_MASK` **only** in `v3d_reset_by_bridge` | ASB-power reset path, no AXICFG | Match — kernel's reset_control path skips it too. |
+| 4 | per-job `CT0QMA→QMS→QTS\|ENABLE→QBA→BPOS=0→QEA`, `INT_MSK` unmasked once | byte-exact (§23) | Match. |
+
+The V3D-50 power-cycle reset (§24) actively returns `L2TFLSTA/L2TFLEND` to POR — so adding the reset
+without the init that the kernel **always** pairs with it left the L2T flush window in a state the kernel is
+never in at job start. This is the first divergence **below** the byte-exact per-job programming.
+
+**The fix.** `v3d_init_hw_state` (`arch/aarch64/v3d.rs`) writes `L2TFLSTA=0`/`L2TFLEND=~0`, sequenced to
+mirror the kernel (`reset → init_hw_state → MMU reinit`): after the BLOCK-UP probe verdict (core-relative
+writes are only safe once the block is confirmed up) and before M2. The `[v3d51]` witness echoes both
+registers **before and after** — settling on metal whether the reset left the window at POR (the fix) or
+firmware had established it (the wedge is below the L2T range too). The empty rung is then **re-run first in
+the bisection ladder, tagged `[v3d51] empty-after-init-hw-state`**, as the direct before/after retire
+witness.
+
+**Expected P48 witnesses.**
+- `[v3d51] init-hw-state — L2TFLSTA por=<x>->0x00000000 (want 0) | L2TFLEND por=<y>->0xffffffff …` — `por`
+  values settle whether the reset left the window unestablished.
+- `[v3d51] empty-after-init-hw-state — retired=1 BFC Δ1 PCS=…BMACTIVE=0` **if** the L2T flush window was the
+  wall — retiring the empty-bin investigation as an un-init'd L2T flush range. If it still reads
+  `retired=0 BFC Δ0 …BMACTIVE=1` with the window proven latched, the wedge sits **below the L2T flush range**
+  too and the retained `[v3d44/45/46]` dump names the next layer.
+
+QEMU `raspi4b` models no V3D block (the run returns at `BLOCK-DOWN` before the probe), so the whole V3D-51
+step is dormant there — **P48 metal decides.**
