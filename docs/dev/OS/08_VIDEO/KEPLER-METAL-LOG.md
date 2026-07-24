@@ -3,6 +3,29 @@
 Hard-won silicon facts from the fox-metal sitting series. Trust these over any
 QEMU behavior. Newest sitting first.
 
+## Sitting #20 (display pull 10 + fence pull 17, UnaOS-gemini@1e68c270, 2026-07-24, fox-metal-r23s1j)
+
+**Display — BLOCK-LINEAR CONFIRMED.** The GOB 64B×8 pre-swizzle killed the
+s19 checkerboard: colors now run as continuous full-width bands in correct
+cycle order. Remaining artifact: periodic brick-seam x-step offsets (whole
+runs shifted horizontally, strongest in red) → the GOB-level transform is
+RIGHT and the higher-order BLOCK-HEIGHT is wrong (block-height 1 assumed;
+real surfaces stack 2/4/8/16 GOBs per block before advancing x). Band
+placement + missing white column unchanged (both downstream of block-height;
+re-read after pull 11). Latch ladder unchanged (asm-stuck=y,
+armed-followed=n). Pull 11 = block-height step ladder.
+Photo notes: `capture/rmbp-s18/s20boot1-panel-observation.md`.
+
+**Fence — the 0x640000 window is a dead road, triple-refuted:**
+(1) beacons none-seen twice (not our structures), (2) `latch-delta none` —
+fully decoupled from the display UPDATE, (3) the pre dump was ALL-ZERO this
+boot vs 158 nonzero rows in s19 — contents are boot-dependent residue, not
+live state we can steer. Window parked. The fence lane's pre-committed
+fallback ladder is now EXHAUSTED (runlist encodings s8, SNOOP s10, HI-bit
+s11, flush s12, CTRL_ADDR s13, disp-era USERD anchor s19–s20). Next move is
+the PGRAPH/ucode pivot (K-GPU-4) — Peter strategy call, per the standing
+campaign frame.
+
 ## Sitting #19 (display pull 9 + fence pull 16, UnaOS-gemini@ae5ce2b2, 2026-07-24, fox-metal-r23s1j)
 
 **Display — ruler flew; ONE hypothesis now explains every panel fact:
