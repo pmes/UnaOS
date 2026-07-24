@@ -158,6 +158,16 @@ pub fn init(gpu: &GpuInfo) {
 
         // 6. Display Engine — read-only trace + optional takeover
         let mut kdisp_trace = [0u32; 7];
+        
+        // Milestone 1: Method-Mirror Backing-Store Beacon Test - Pre-Takeover Dump
+        let mut mirror_hdr_pre = [0u32; 256];
+        for (i, offset) in (0..=0x3FC).step_by(4).enumerate() {
+            let val = mmio_read(bar0, 0x640000 + offset);
+            mirror_hdr_pre[i] = val;
+            serial_println!(":: kepler: mirror-hdr pre off={:03X} val={:08X} ::", offset, val);
+        }
+        serial_println!(":: kepler: mirror-hdr pre done rows=256 ::");
+
         let _fb_offset = crate::drivers::gpu::kepler_display::takeover_display(
             gpu, bar0, &mut vram_allocator, &mut kdisp_trace,
         );
@@ -271,12 +281,21 @@ pub fn init(gpu: &GpuInfo) {
                                     // Milestone 1: Method-Mirror Backing-Store Beacon Test
                                     // Pass 0: Baseline dump
                                     let mut rows = 0;
-                                    for offset in (0..=0x3FC).step_by(4) {
+                                    let mut diff_found = false;
+                                    for (i, offset) in (0..=0x3FC).step_by(4).enumerate() {
                                         let val = mmio_read(bar0, 0x640000 + offset);
+                                        let pre_val = mirror_hdr_pre[i];
                                         serial_println!(":: kepler: mirror-hdr pass0 off={:03X} val={:08X} ::", offset, val);
+                                        if val != pre_val {
+                                            serial_println!(":: kepler: latch-delta off={:03X} pre={:08X} post={:08X} ::", offset, pre_val, val);
+                                            diff_found = true;
+                                        }
                                         rows += 1;
                                     }
                                     serial_println!(":: kepler: mirror-hdr pass0 done rows={} ::", rows);
+                                    if !diff_found {
+                                        serial_println!(":: kepler: latch-delta none ::");
+                                    }
 
                                     // Plant Beacons
                                     let pattern = [
