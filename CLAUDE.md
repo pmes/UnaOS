@@ -17,6 +17,8 @@ several sessions can work in parallel without stepping on each other.
   bytes in the logs break it).
 - Direction: [`docs/ROADMAP.md`](docs/ROADMAP.md). Security model + hardening
   ledger: [`docs/SECURITY.md`](docs/SECURITY.md). Subsystem docs: `docs/dev/OS/`.
+- Standing operational laws (verification, bench/media, code & history):
+  [`docs/dev/LAWS.md`](docs/dev/LAWS.md) — binding in every session.
 
 ## Worktrees & lanes
 
