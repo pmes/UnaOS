@@ -224,7 +224,7 @@ pub unsafe fn takeover_display(
     let capped = if hits > 64 { "true" } else { "false" };
     serial_println!(":: kdisp: evo-scan done range=610000-613FFC hits={} capped={} ::", hits, capped);
 
-    // ── Phase 2: Assembly Write + UPDATE Latch (Pull 9) ────────────────────
+    // ── Phase 2: Assembly Write + UPDATE Latch (Pull 10) ────────────────────
     if !cfg!(feature = "nvidia-kepler-takeover") {
         serial_println!(":: kdisp: trace-only — takeover feature not set ::");
         return None;
@@ -242,12 +242,19 @@ pub unsafe fn takeover_display(
     let expected_pitch = expected_width * 4;
     let fb_size = (expected_width * expected_height * 4) as usize;
 
-    // 1. Prepare surf2 (ruler pattern fill at VRAM + 0x1600000)
+    // 1. Prepare surf2 (pre-swizzled ruler pattern fill at VRAM + 0x1600000)
     let bar1 = vram_base;
     let surf2_offset = 0x1600000;
-    let dst = (bar1 + surf2_offset) as *mut u32;
+    let dst = (bar1 + surf2_offset) as *mut u8;
     
     serial_println!(":: kdisp: surf2 geom w={} h={} pitch={} ::", expected_width, expected_height, expected_pitch);
+    
+    // GOB transform parameters (Block height = 1 GOB)
+    let gob_width_bytes = 64;
+    let gob_height = 8;
+    let gobs_per_row = expected_pitch / gob_width_bytes;
+    let gob_size_bytes = gob_width_bytes * gob_height;
+
     for y in 0..expected_height {
         let block_color = match (y / 64) % 8 {
             0 => 0xFFFF0000, // RED
@@ -266,7 +273,9 @@ pub unsafe fn takeover_display(
             block_color
         };
         
-        let row_ptr = dst.add((y * expected_width) as usize);
+        let gob_y = y / gob_height;
+        let inner_y = y % gob_height;
+        
         for x in 0..expected_width {
             let final_color = if x < 256 {
                 0xFFFFFFFF // WHITE
@@ -275,10 +284,19 @@ pub unsafe fn takeover_display(
             } else {
                 row_color
             };
-            core::ptr::write_volatile(row_ptr.add(x as usize), final_color);
+            
+            let px_byte_x = x * 4;
+            let gob_x = px_byte_x / gob_width_bytes;
+            let inner_x = px_byte_x % gob_width_bytes;
+            
+            let gob_index = (gob_y * gobs_per_row) + gob_x;
+            let target_byte_addr = (gob_index * gob_size_bytes) + (inner_y * gob_width_bytes) + inner_x;
+            let target_ptr = dst.add(target_byte_addr as usize) as *mut u32;
+            
+            core::ptr::write_volatile(target_ptr, final_color);
         }
     }
-    serial_println!(":: kdisp: surf2 prep off=01600000 bytes={:08X} pattern=ruler64x8 ::", fb_size);
+    serial_println!(":: kdisp: surf2 prep off=01600000 bytes={:08X} pattern=ruler64x8-gob64x8 ::", fb_size);
 
     // 2. Pre-state
     let asm_reg = 0x640460;
