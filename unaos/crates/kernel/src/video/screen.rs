@@ -637,9 +637,18 @@ pub fn present_surface(surf: *const u8, w: u32, h: u32, stride: u32) {
     let info = fb.info();
     let (fw, fh) = (info.width, info.height);
     let (w, h, stride) = (w as usize, h as usize, stride as usize);
+
+    // UVUG-7: integer nearest-neighbour upscale. A 32x32 surface blitted 1:1 is ~1 cm on a 1920-wide
+    // panel — invisible. Pick the largest integer factor whose scaled surface still fits the panel,
+    // capped so it occupies ~40% of the panel's shorter dimension (a comfortably-visible crystal
+    // rather than a screen-filling wall). Nearest-neighbour keeps it crisp and cheap (no filtering).
+    let cap_factor = (fw.min(fh) * 40 / 100 / w.max(h).max(1)).max(1);
+    let fit_factor = (fw / w.max(1)).min(fh / h.max(1)).max(1);
+    let scale = cap_factor.min(fit_factor).max(1);
+    let (dw, dh) = (w * scale, h * scale);
     // Centered, clamped to (0,0) so an over-large surface pins to the top-left and clips.
-    let x0 = fw.saturating_sub(w) / 2;
-    let y0 = fh.saturating_sub(h) / 2;
+    let x0 = fw.saturating_sub(dw) / 2;
+    let y0 = fh.saturating_sub(dh) / 2;
 
     for row in 0..h {
         let row_base = row * stride;
@@ -647,14 +656,20 @@ pub fn present_surface(surf: *const u8, w: u32, h: u32, stride: u32) {
             // Unaligned-safe read of the ARGB8888 pixel; low 24 bits are RRGGBB.
             let px = unsafe {
                 core::ptr::read_unaligned(surf.add(row_base + col * 4) as *const u32)
-            };
-            fb.put_pixel(x0 + col, y0 + row, px & 0x00FF_FFFF);
+            } & 0x00FF_FFFF;
+            // Replicate the source pixel across its scale*scale destination block.
+            for sy in 0..scale {
+                let dy = y0 + row * scale + sy;
+                for sx in 0..scale {
+                    fb.put_pixel(x0 + col * scale + sx, dy, px);
+                }
+            }
         }
     }
 
-    // Clean the touched rows for the non-coherent scan-out (superset: whole rows [y0, y0+h)).
+    // Clean the touched rows for the non-coherent scan-out (superset: whole rows [y0, y0+dh)).
     let row_bytes = info.stride * info.bytes_per_pixel;
-    let y_end = (y0 + h).min(fh);
+    let y_end = (y0 + dh).min(fh);
     if y_end > y0 {
         fb.flush_range(y0 * row_bytes, (y_end - y0) * row_bytes);
     }
@@ -662,5 +677,10 @@ pub fn present_surface(surf: *const u8, w: u32, h: u32, stride: u32) {
     // First present only — no per-frame witness spam.
     if !UVUG2_WITNESSED.swap(true, core::sync::atomic::Ordering::Relaxed) {
         serial_println!("[uvug2] present {}x{} -> blit at ({},{})", w, h, x0, y0);
+        #[cfg(feature = "witness")]
+        serial_println!(
+            "[uvug7] surface {}x{} scaled {}x -> {}x{} at ({},{}) on {}x{} panel",
+            w, h, scale, dw, dh, x0, y0, fw, fh
+        );
     }
 }

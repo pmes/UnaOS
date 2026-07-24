@@ -255,11 +255,21 @@ pub fn ticks() -> u64 {
     timer::ticks()
 }
 
-/// Milliseconds since boot. pi/virt: generic-timer heartbeat (ticks()*4 at 250 Hz). tegra (VUGFIX):
-/// see §VUGFIX — timerless EL1 falls back to CNTVCT/(CNTFRQ/1000); cfg on one line keeps pi/virt byte-identical.
+/// Milliseconds since boot, derived DIRECTLY from the free-running virtual counter (CNTVCT_EL0) and
+/// its rate (CNTFRQ_EL0): `ms = CNTVCT / (CNTFRQ/1000)`. Frequency-independent and core-count
+/// independent, correct on every path (pi / QEMU virt / tegra) with no cfg split.
+///
+/// UVUG-7 (P52, metal): the old `ticks()*4` assumed a single 250 Hz tick source. But `ticks()`
+/// (timer::TICKS) is bumped by EVERY core's periodic timer IRQ (see `timer::on_tick`), so on 4-core
+/// BCM2711 metal it advanced ~4x faster than 250 Hz — making `ms()` run ~4x fast, which drove
+/// typematic key-repeat ~4x too fast (one keypress emitted ~7 chars). CNTVCT counts at CNTFRQ
+/// regardless of how many cores tick or whether the tick IRQ is delivered at all, so this is immune
+/// to both faults. It also fixes QEMU raspi4b, where the tick IRQ is never delivered and `ticks()`
+/// (hence the old `ms()`) stayed frozen at 0.
 #[inline]
 pub fn ms() -> u64 {
-    { #[cfg(not(feature = "tegra"))] { ticks() * 4 } #[cfg(feature = "tegra")] { if timer::is_live() { ticks() * 4 } else { let khz = timer::cntfrq() / 1000; if khz == 0 { 0 } else { now_cycles() / khz } } } }
+    let khz = timer::cntfrq() / 1000;
+    if khz == 0 { 0 } else { now_cycles() / khz }
 }
 
 /// Free-running virtual cycle counter (CNTVCT_EL0). Monotonic and interrupt-flag-independent, like
