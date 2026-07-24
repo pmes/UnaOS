@@ -1745,6 +1745,255 @@ fn v3d54_submit_audit(what: &str, ba: u32, ea: u32, len: usize) -> bool {
     sound
 }
 
+// ─── PI-V3D-55: RANK 3 (clock-domain / flush liveness) + RANK 4 (tile-state readback) ─────────────
+//
+// P53/P54 closed the register-mirror line: submission is SOUND (CT0QBA/CT0QEA latch exact), the first
+// kick's CLE walks BA→EA in full, the QPU runs (INT_STS bit16 latches), and every mirror-able probe
+// register (L2T window §25, hub-INT §26, CLEAR invalidate §27, TMUWCF §27) landed a byte-exact no-op.
+// What never happens is the CLE→PTB frame close: BPCA never advances, FLDONE never fires, CTRUN stays
+// set so every later kick no-ops. Two orthogonal questions survive, and V3D-55 asks both in one boot:
+//
+//   RANK 3 — is the flush domain even CLOCKED? The QPU provably executes, but QPU execution and the
+//     CLE/PTB flush unit need not share a live clock domain. (a) CYCLE_COUNT (PCTR src32) sampled as a
+//     DELTA across the retire-wait says whether the core clock free-runs while FLDONE stays dead;
+//     (b) the firmware V3D clock is COMMANDED to 500 MHz by `bringup` and never read back — read the
+//     granted rate + gate state; (c) MISCCFG.QRMAXCNT[3:1] (queued-request max count) is declared in
+//     this file and has never been programmed or even audited against its reset/DT default — a floored
+//     request queue could starve the PTB. Reads only; the QRMAXCNT write stays DISARMED (below).
+//
+//   RANK 4 — did the PTB WRITE anything? bin_pool_witness reads only the first 8 bytes of the pool and
+//     of the tile-state array. Read the WHOLE tile-state array plus the pool head after the L2T
+//     write-back, and dump the V3D PTEs covering the CL / tile-state / pool iovas. Tile-state written
+//     but BFC Δ0 narrows the defect to the FLDONE/BFC latch itself; nothing written despite a BPCA that
+//     once advanced (P40) means BPCA is a phantom pointer and the address question reopens.
+//
+// Every line below is a new `[v3d55]` serial witness on the existing probe path (default-quiet law: it
+// fires only where the V3D probe battery already runs) and is READ-ONLY MMIO, with the single exception
+// of the explicitly-disarmed QRMAXCNT write.
+
+/// PI-V3D-55 (RANK 3c): arm the scoped MISCCFG QRMAXCNT write. **DISARMED by default and left that way
+/// by this arc** — the brief permits the write ONLY behind evidence of divergence, and V3D-55 is the
+/// boot that first *collects* that evidence. The audit below reports the latched QRMAXCNT every boot;
+/// if metal shows it floored at 0 (a starved PTB request queue), the next arc flips this const and the
+/// write fires. Flipping it alone is not enough — the write is additionally gated on the divergence
+/// actually being observed at runtime, so an armed-but-clean block is still never written.
+const V3D55_ARM_QRMAXCNT: bool = false;
+/// The QRMAXCNT[3:1] value the armed write would program: the field maximum (7 queued requests), i.e.
+/// the least-starved setting. Only ever written when `V3D55_ARM_QRMAXCNT` AND a floored read coincide.
+const V3D55_QRMAXCNT_WANT: u32 = 0x7;
+
+/// PI-V3D-55 (RANK 3b + 3c): the clock-domain audit. Reads back what the FIRMWARE actually granted for
+/// `CLOCK_ID_V3D` (rate + gate state) against the 500 MHz `bringup` commanded but never verified, and
+/// audits `MISCCFG` — specifically QRMAXCNT[3:1], declared in this file since V3D-34 and never once
+/// programmed. Linux `v3d_init_core` writes MISCCFG only on ver<41 (the Pi 4 is v42), and the bcm2711
+/// DT programs no QRMAXCNT for v3d, so the EXPECTED value is whatever the block's reset default is —
+/// this line puts that default on serial for the first time. Pure reads unless `V3D55_ARM_QRMAXCNT`.
+fn v3d55_clock_domain_audit(tag: &str) {
+    // (b) firmware clock readback — the half `bringup` never did.
+    let rate = mailbox::get_clock_rate(mailbox::CLOCK_ID_V3D);
+    let state = mailbox::get_clock_state(mailbox::CLOCK_ID_V3D);
+    let rate_hz = rate.unwrap_or(0);
+    let state_w = state.unwrap_or(0);
+    let active = state_w & 0x1 != 0;
+    let notexist = state_w & 0x2 != 0;
+    serial_println!(
+        ":: V3D: [v3d55] clkdom ({}) — commanded=500000000 Hz | GET_CLOCK_RATE={} Hz (mailbox {}) GET_CLOCK_STATE={:#010x} (active={} not_exist={}, mailbox {}) — {} ::",
+        tag,
+        rate_hz,
+        if rate.is_some() { "OK" } else { "FAILED" },
+        state_w,
+        active as u32,
+        notexist as u32,
+        if state.is_some() { "OK" } else { "FAILED" },
+        if rate.is_none() || state.is_none() {
+            "clock readback FAILED — no clock-domain verdict from firmware this boot (QEMU has no V3D clock; metal decides)"
+        } else if !active || notexist {
+            "the firmware reports the V3D clock GATED OFF (or absent) DESPITE bringup's set_clock_state(true) ACK — the block is powered but unclocked, which alone explains a dead flush unit"
+        } else if rate_hz == 0 {
+            "clock gate ACTIVE but the granted RATE reads 0 Hz — the block is gated on at a null frequency; the flush domain cannot tick"
+        } else if rate_hz != 500_000_000 {
+            "clock ACTIVE but the GRANTED rate differs from the commanded 500 MHz — firmware clamped/substituted the V3D clock; not fatal on its own, but the commanded-vs-granted gap was never visible before"
+        } else {
+            "clock ACTIVE at exactly the commanded 500 MHz — the firmware side of the clock domain is clean; any dead-flush verdict must come from the CYCLE_COUNT delta ([v3d55] clkliv) or the core config below"
+        }
+    );
+
+    // (c) MISCCFG / QRMAXCNT audit.
+    let misccfg = mmio_read(V3D_CORE0_BASE, V3D_CTL_MISCCFG);
+    let qrmaxcnt = (misccfg & V3D_CTL_MISCCFG_QRMAXCNT_MASK) >> 1;
+    let floored = qrmaxcnt == 0;
+    serial_println!(
+        ":: V3D: [v3d55] misccfg ({}) — MISCCFG={:#010x} OVRTMUOUT(bit0)={} QRMAXCNT[3:1]={} — EXPECTED: reset default (Linux v3d_init_core writes MISCCFG only on ver<41; the Pi 4 is v42, and the bcm2711 DT programs no QRMAXCNT for v3d) — {} — scoped QRMAXCNT write {} ::",
+        tag,
+        misccfg,
+        (misccfg & V3D_MISCCFG_OVRTMUOUT != 0) as u32,
+        qrmaxcnt,
+        if floored {
+            "QRMAXCNT reads 0 (FLOORED): the core will queue the minimum number of outstanding requests — a starved PTB request queue is a live BCM2711 candidate for a bin that emits nothing"
+        } else {
+            "QRMAXCNT nonzero: the request queue is not floored — no divergence from a sane default, so no QoS write is justified (the flush wall is elsewhere)"
+        },
+        if V3D55_ARM_QRMAXCNT && floored {
+            "ARMED + divergence observed: writing the field maximum below"
+        } else if V3D55_ARM_QRMAXCNT {
+            "ARMED but no divergence observed — NOT written (the write is gated on a floored read, never issued blind)"
+        } else {
+            "DISARMED (V3D-55 collects the evidence; the write is a next-arc decision — see V3D55_ARM_QRMAXCNT)"
+        }
+    );
+
+    // The ONLY non-read in this arc, and it is doubly gated: the const must be flipped by a future arc
+    // AND the block must actually read floored. Scoped + reversible: a single read-modify-write of the
+    // QRMAXCNT field, every other MISCCFG bit preserved, echoed back.
+    if V3D55_ARM_QRMAXCNT && floored {
+        let want = (misccfg & !V3D_CTL_MISCCFG_QRMAXCNT_MASK)
+            | ((V3D55_QRMAXCNT_WANT << 1) & V3D_CTL_MISCCFG_QRMAXCNT_MASK);
+        mmio_write(V3D_CORE0_BASE, V3D_CTL_MISCCFG, want);
+        dsb();
+        let echo = mmio_read(V3D_CORE0_BASE, V3D_CTL_MISCCFG);
+        serial_println!(
+            ":: V3D: [v3d55] qrmaxcnt ({}) — MISCCFG {:#010x} -> wrote {:#010x} -> echo {:#010x} (QRMAXCNT {} -> {}) — {} ::",
+            tag, misccfg, want, echo,
+            qrmaxcnt,
+            (echo & V3D_CTL_MISCCFG_QRMAXCNT_MASK) >> 1,
+            if echo == want {
+                "the field LATCHED — if this boot's bin now retires, the floored request queue was the wall"
+            } else {
+                "the write did NOT latch — QRMAXCNT is read-only/ignored on this silicon; refute the QoS branch"
+            }
+        );
+    }
+}
+
+/// PI-V3D-55 (RANK 3a): the clock-liveness verdict folded from the retire-wait's CYCLE_COUNT samples.
+/// `en` is the PCTR enable mask read at the start of the wait — counter 2 carries src32 CYCLE_COUNT and
+/// is armed only where `pctr_setup_cs_witness` ran (the PROBE bin), so an unarmed wait yields NO verdict
+/// rather than a fabricated "flat clock". A flat CYCLE_COUNT across a 0.5 s wait is the strongest
+/// possible statement that the core/flush domain is not ticking; a climbing one moves the whole
+/// investigation back onto the CL/PTB frame-close path with the clock branch closed.
+fn emit_v3d55_clock_liveness(what: &str, en: u32, cyc: &TraceReg, span_us: u64, samples: u32) {
+    let armed = en & (1 << 2) != 0;
+    let delta = cyc.last.wrapping_sub(cyc.first);
+    serial_println!(
+        ":: V3D: [v3d55] clkliv ({}) — PCTR_EN={:#010x} counter2(src32 CYCLE_COUNT) armed={} {:#010x}->{:#010x} Δ={} moves={} first_move={}us last_change={}us over {}us ({} samples) — {} ::",
+        what, en, armed as u32, cyc.first, cyc.last, delta, cyc.changes,
+        cyc.first_move_us, cyc.last_change_us, span_us, samples,
+        if !armed {
+            "counter 2 was NOT enabled across this wait — no clock verdict here (the PCTR battery is armed only around the PROBE bin; read the PROBE line for the domain answer)"
+        } else if delta == 0 {
+            "CYCLE_COUNT FLAT across the whole wait: the V3D core clock is NOT advancing while we wait for the flush — the flush domain is unclocked/half-clocked, and the fix is a clock/QoS one, NOT a CL-packet one (cross-check [v3d55] clkdom)"
+        } else {
+            "CYCLE_COUNT ADVANCED while FLDONE stayed dead: the core is clocked and free-running, so the flush logic is CLOCKED BUT NEVER TRIGGERED — the clock-domain branch is closed and the wall is back on the CLE→PTB frame-close path"
+        }
+    );
+}
+
+/// PI-V3D-55 (RANK 4): decode one V3D PTE for a given iova out of the page table we programmed, so the
+/// aliasing question is closed at the byte level rather than by the identity-map argument alone.
+fn v3d55_pte_line(tag: &str, what: &str, iova: u32) {
+    let idx = (iova as usize) >> V3D_MMU_PAGE_SHIFT;
+    let in_range = idx < PT_CAP;
+    let pte = if in_range { unsafe { (*(&raw const V3D_PT)).ptes[idx] } } else { 0 };
+    let valid = pte & V3D_PTE_VALID != 0;
+    let writeable = pte & V3D_PTE_WRITEABLE != 0;
+    let pfn = pte & !(V3D_PTE_VALID | V3D_PTE_WRITEABLE);
+    let identity = valid && ((pfn as usize) << V3D_MMU_PAGE_SHIFT) == (iova as usize & !(PAGE - 1));
+    serial_println!(
+        ":: V3D: [v3d55] pte ({}) {} iova={:#010x} — PT[{}]={:#010x} VALID={} WRITEABLE={} pfn={:#x} (maps phys {:#010x}) — {} ::",
+        tag, what, iova, idx, pte, valid as u32, writeable as u32, pfn,
+        (pfn as usize) << V3D_MMU_PAGE_SHIFT,
+        if !in_range {
+            "iova is BEYOND the page table's capacity — the GPU cannot reach this address at all"
+        } else if !valid {
+            "PTE INVALID — the GPU would fault on this address; a silent no-write here is an addressing defect, not a frame-close one"
+        } else if !identity {
+            "PTE VALID but NOT identity — the GPU sees a DIFFERENT physical page than the CPU reads; every CPU readback of this region has been reading the wrong memory"
+        } else if !writeable {
+            "PTE valid + identity but READ-ONLY — a PTB write here is dropped by the MMU"
+        } else {
+            "PTE valid, writeable, identity-mapped — the GPU and the CPU address the same physical page"
+        }
+    );
+}
+
+/// PI-V3D-55 (RANK 4): the tile-state readback. `bin_pool_witness` reads only the first 8 bytes of the
+/// pool and of the tile-state array; that is too coarse to distinguish "the PTB wrote tile-state but no
+/// FLDONE fired" from "the PTB never wrote anything". Read the WHOLE tile-state array (TILE_STATE_BYTES,
+/// the 48-B-per-tile TSDA generously sized for the single 64×64 tile) plus the pool head, AFTER an L2T
+/// write-back so the binner's L2T-parked bytes reach DRAM (the V3D-42 mechanism), and count nonzero
+/// words rather than eyeballing a prefix. Then dump the PTEs covering the CL, tile-state and pool iovas.
+/// Read-only: an L2T write-back plus CPU-side cache maintenance and loads.
+fn v3d55_tilestate_readback(tag: &str, cl_iova: u32, ts_iova: u32, pool_iova: u32) {
+    // Drain the binner's writes out of L2T into DRAM, then drop the CPU's stale lines (V3D-42 order).
+    invalidate_gpu_caches("L2T write-back (v3d55 tile-state readback)");
+    cache::clean_invalidate_range(arena_phys() + OFF_TILESTATE, TILE_STATE_BYTES);
+    cache::clean_invalidate_range(arena_phys() + OFF_BIN_TILEALLOC, 64);
+    dsb();
+
+    // Full tile-state array scan. The iova is identity-mapped to the arena VA, so the CPU load address
+    // is literally the address the GPU was handed in CT0QTS — the same-page property [v3d42] prints.
+    let words = TILE_STATE_BYTES / 4;
+    let mut nonzero = 0u32;
+    let mut first_nz_word = -1i32;
+    let mut w = [0u32; 8];
+    for i in 0..words {
+        let v = unsafe { core::ptr::read_volatile((ts_iova as usize + i * 4) as *const u32) };
+        if v != 0 {
+            nonzero += 1;
+            if first_nz_word < 0 {
+                first_nz_word = i as i32;
+            }
+        }
+        if i < 8 {
+            w[i] = v;
+        }
+    }
+    // Pool head + the PTB write pointer, side by side: BPCA off the pool base says the PTB CLAIMED to
+    // emit bytes; a zero pool head with an advanced BPCA is the P40 phantom-pointer signature.
+    let bpca = mmio_read(V3D_CORE0_BASE, V3D_PTB_BPCA);
+    let bpcs = mmio_read(V3D_CORE0_BASE, V3D_PTB_BPCS);
+    let mut pool_nonzero = 0u32;
+    let mut p = [0u32; 8];
+    for i in 0..16 {
+        let v = unsafe { core::ptr::read_volatile((pool_iova as usize + i * 4) as *const u32) };
+        if v != 0 {
+            pool_nonzero += 1;
+        }
+        if i < 8 {
+            p[i] = v;
+        }
+    }
+    let bfc = mmio_read(V3D_CORE0_BASE, V3D_CLE_BFC);
+
+    serial_println!(
+        ":: V3D: [v3d55] tilestate ({}) — TSDA iova={:#010x} bytes={} words={} nonzero_words={} first_nz=[{}] | head w0..w7 = {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} — {} ::",
+        tag, ts_iova, TILE_STATE_BYTES, words, nonzero, first_nz_word,
+        w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7],
+        if nonzero != 0 {
+            "the PTB WROTE tile-state: a bin frame demonstrably produced per-tile output, so the defect is DOWNSTREAM of the write — isolated to the FLDONE/BFC frame-close latch itself (the narrowest target yet)"
+        } else {
+            "tile-state is ENTIRELY ZERO after the L2T write-back: the PTB never wrote a byte of per-tile state — the defect is UPSTREAM of frame-close (the bin frame never produced output at all)"
+        }
+    );
+    serial_println!(
+        ":: V3D: [v3d55] pool ({}) — pool iova={:#010x} nonzero_words(first 64B)={} head w0..w7 = {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} | BPCA={:#010x} (adv {:#x} off pool base) BPCS={:#010x} BFC={:#010x} — {} ::",
+        tag, pool_iova, pool_nonzero,
+        p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
+        bpca, bpca.wrapping_sub(pool_iova), bpcs, bfc,
+        if pool_nonzero == 0 && bpca != 0 && bpca != pool_iova {
+            "BPCA ADVANCED off the pool base yet the pool reads all-zero even after the L2T write-back — BPCA is a PHANTOM/aliased write pointer; the address question reopens (see the [v3d55] pte lines)"
+        } else if pool_nonzero != 0 {
+            "the pool carries binner bytes — primitive-list output exists in DRAM; frame-close is the only missing step"
+        } else {
+            "pool all-zero and BPCA still at the pool base — the PTB emitted nothing and never even moved its write pointer this kick"
+        }
+    );
+    // Close the aliasing question at the byte level for all three regions the bin touches.
+    v3d55_pte_line(tag, "bin CL     ", cl_iova);
+    v3d55_pte_line(tag, "tile-state ", ts_iova);
+    v3d55_pte_line(tag, "tile-alloc ", pool_iova);
+}
+
 /// PI-V3D-54 (RANK 1): poll the CL-progression time-series across the retire-wait (not once after it).
 /// `trace_ba`/`trace_ea` are the submitted CL bounds for the `[v3d54] trace` fold; sampling runs at ~1 ms
 /// cadence and is summarised (transitions, not raw samples) on BOTH the FLDONE-retire and timeout exits.
@@ -1761,6 +2010,11 @@ fn wait_fldone(what: &str, trace_ba: u32, trace_ea: u32) -> (u32, u64, bool) {
     let mut t_lc = TraceReg::new(mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0LC));
     let mut t_pc = TraceReg::new(mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0PC));
     let mut t_bpca = TraceReg::new(mmio_read(V3D_CORE0_BASE, V3D_PTB_BPCA));
+    // PI-V3D-55 (RANK 3a): fold CYCLE_COUNT (PCTR counter 2, src32) on the SAME cadence — the delta
+    // across this wait is the clock-domain liveness verdict. The enable mask is captured once so the
+    // verdict can say "not armed" instead of fabricating a flat-clock reading on an unarmed wait.
+    let pctr_en = mmio_read(V3D_CORE0_BASE, V3D_V4_PCTR_0_EN);
+    let mut t_cyc = TraceReg::new(mmio_read(V3D_CORE0_BASE, V3D_PCTR_0_PCTR0 + 8));
     loop {
         let now = super::timer::cntpct();
         // PI-V3D-54: fold a progression sample at the ~1 ms cadence (bounded work — five reads, no logging).
@@ -1772,6 +2026,7 @@ fn wait_fldone(what: &str, trace_ba: u32, trace_ea: u32) -> (u32, u64, bool) {
             t_lc.update(mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0LC), us32);
             t_pc.update(mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0PC), us32);
             t_bpca.update(mmio_read(V3D_CORE0_BASE, V3D_PTB_BPCA), us32);
+            t_cyc.update(mmio_read(V3D_CORE0_BASE, V3D_PCTR_0_PCTR0 + 8), us32); // [v3d55] RANK 3a
             samples = samples.saturating_add(1);
             next_sample = now + sample_tick;
         }
@@ -1782,6 +2037,7 @@ fn wait_fldone(what: &str, trace_ba: u32, trace_ea: u32) -> (u32, u64, bool) {
             mmio_write(V3D_CORE0_BASE, V3D_CTL_INT_CLR, sts);
             dsb();
             emit_v3d54_trace(what, trace_ba, trace_ea, samples, waited_us, &t_ca, &t_cs, &t_lc, &t_pc, &t_bpca);
+            emit_v3d55_clock_liveness(what, pctr_en, &t_cyc, waited_us, samples);
             return (sts, waited_us, true);
         }
         if super::timer::cntpct() >= deadline {
@@ -1880,6 +2136,9 @@ fn wait_fldone(what: &str, trace_ba: u32, trace_ea: u32) -> (u32, u64, bool) {
                 }
             );
             emit_v3d54_trace(what, trace_ba, trace_ea, samples, waited_us, &t_ca, &t_cs, &t_lc, &t_pc, &t_bpca);
+            // PI-V3D-55 (RANK 3a): the timeout path is where the clock verdict matters most — 0.5 s of
+            // wall clock elapsed with no flush; did the core clock advance at all across it?
+            emit_v3d55_clock_liveness(what, pctr_en, &t_cyc, waited_us, samples);
             return (sts, waited_us, false);
         }
         core::hint::spin_loop();
@@ -3398,6 +3657,12 @@ fn probe_job() {
     // means the thread died before [9] and the store word never executed — chase thread lifetime/dispatch.
     clear_mmu_fault_latch("v3d28 pre-probe");
     invalidate_gpu_caches("L2T flush (probe bin pre-kick)");
+    // ── [v3d55] RANK 3b/3c: audit the clock domain + MISCCFG BEFORE the kick ─────────────────────────
+    // The QPU provably executes yet the flush unit never fires; before blaming another packet, read the
+    // clock the block was GRANTED (bringup commands 500 MHz and never reads back) and the QRMAXCNT
+    // request-queue depth that has been declared-but-never-audited since V3D-34. Pure reads (the scoped
+    // QRMAXCNT write is disarmed — see V3D55_ARM_QRMAXCNT).
+    v3d55_clock_domain_audit("v3d40 PROBE pre-kick");
     // ── [v3d40] the probe kick was the ONE CT0 kick without a CT0CA-progression witness ──────────────
     // V3D-40 root fact: after v3d36 (CLs byte-identical), v3d38 (records field-identical bar cs_uniforms)
     // and v3d39 (M4's OWN CS program in the probe slot) the probe STILL reads valid_instr=0 while M4 —
@@ -3496,6 +3761,10 @@ fn probe_job() {
     // witness reports? A probe that reached EA (CT0CA above) but left the pool all-zero — while M4's pool
     // goes nonzero — localises the divergence to the bin run itself, not the kick.
     bin_pool_witness("v3d40 PROBE post-bin");
+    // [v3d55] RANK 4: the 8-byte prefix bin_pool_witness reads is too coarse to separate "PTB wrote
+    // tile-state but no FLDONE" from "PTB never wrote". Scan the WHOLE tile-state array + pool head and
+    // dump the PTEs covering the CL / tile-state / pool iovas so the aliasing question closes by bytes.
+    v3d55_tilestate_readback("v3d40 PROBE post-bin", bin_ba, ts, tile_alloc);
     // [v3d41] the decisive discriminator: with the pool + tile-state proven zero above and the coord
     // shader proven to have RUN (v3d35), did START_TILE_BINNING actually complete a PTB bin FRAME? BFC's
     // pre→post delta answers "started vs never-started"; BPCA (the PTB write pointer vs the pool base)
