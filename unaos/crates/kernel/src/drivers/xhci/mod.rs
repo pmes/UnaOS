@@ -1007,6 +1007,14 @@ impl DeviceSlot {
         self.mouse_expect_phys = 0;
         self.mouse_report_count = 0;
         self.mouse_prev_buttons = 0;
+        // UVUG-5: a keyboard slot is being torn down (detach / disconnect / enum-recovery). Signal the
+        // host-side typematic tracker BEFORE clearing `is_keyboard`, so it can drop a key held at unplug —
+        // under SET_IDLE(0) that key's `KeyUp` will NEVER arrive, and without this the repeat synthesiser
+        // would inject `Event::Key` forever at the repeat rate. This is the single chokepoint every teardown
+        // path funnels through (dispose_disconnected_slots / recovery / dispose_downstream_slot).
+        if self.is_keyboard {
+            crate::pal::note_keyboard_detached();
+        }
         self.is_keyboard = false;
         self.keyboard_ep = 0;
         self.keyboard_mps = 0;

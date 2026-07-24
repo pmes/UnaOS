@@ -2020,6 +2020,11 @@ static TYPEMATIC_KEY_P1: core::sync::atomic::AtomicU32 = core::sync::atomic::Ato
 /// press edge, then advanced by the repeat period on each synthesised repeat.
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 static TYPEMATIC_NEXT_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The `pal::keyboard_detach_gen()` value last observed by the typematic tracker. When it advances, a HID
+/// keyboard was torn down — and a key held at unplug will never see its `KeyUp` (SET_IDLE(0) sends none while
+/// down), so the held key is dropped to stop the synthesiser injecting `Event::Key` forever.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+static TYPEMATIC_SEEN_DETACH_GEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Typematic initial delay: how long a key must be held before the FIRST synthesised repeat. ~400 ms is the
 /// familiar desktop feel (long enough that a normal tap never repeats, short enough to feel responsive).
@@ -2066,6 +2071,14 @@ fn typematic_observe(ev: unaos_kernel::pal::Event) {
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 fn typematic_tick() -> Option<u8> {
     use core::sync::atomic::Ordering;
+    // Keyboard-detach guard: if a HID keyboard was torn down since the last check, drop any held key — its
+    // `KeyUp` will never arrive (SET_IDLE(0) sends none while down), so without this the repeat would loop
+    // forever after an unplug-mid-hold. Fold the current generation in every pass so the compare stays cheap.
+    let detach_gen = unaos_kernel::pal::keyboard_detach_gen();
+    if TYPEMATIC_SEEN_DETACH_GEN.swap(detach_gen, Ordering::Relaxed) != detach_gen {
+        TYPEMATIC_KEY_P1.store(0, Ordering::Relaxed);
+        return None;
+    }
     let kp1 = TYPEMATIC_KEY_P1.load(Ordering::Relaxed);
     if kp1 == 0 {
         return None;

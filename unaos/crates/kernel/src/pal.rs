@@ -326,6 +326,27 @@ pub fn push_event(event: Event) {
     });
 }
 
+/// UVUG-5 — monotonically bumped every time a HID keyboard slot is torn down (a detach / disconnect /
+/// enumeration-recovery teardown), read by the host-side typematic tracker so it can drop a held key that
+/// will NEVER see its `Event::KeyUp`. A boot keyboard under `SET_IDLE(0)` sends one press and no further
+/// reports until release, so if the device is UNPLUGGED mid-hold there is no release edge — without this the
+/// typematic synthesiser would inject `Event::Key` forever at the repeat rate. The xHCI teardown chokepoint
+/// (`Slot::reset_soft_state`) bumps this for any slot that was a keyboard; the consumer clears its state when
+/// the generation advances. Arch-neutral (a plain counter); harmless on targets with no typematic consumer.
+static KEYBOARD_DETACH_GEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Record that a HID keyboard slot was torn down (see [`KEYBOARD_DETACH_GEN`]). Called from the xHCI slot
+/// teardown path; idempotent and lock-free, safe from any context.
+pub fn note_keyboard_detached() {
+    KEYBOARD_DETACH_GEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// The current keyboard-detach generation. The host-side typematic tracker compares this against the value it
+/// last observed and, on a change, drops any held key (whose `KeyUp` a detach guarantees will never arrive).
+pub fn keyboard_detach_gen() -> u64 {
+    KEYBOARD_DETACH_GEN.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 fn pop_event() -> Option<Event> {
     crate::arch::without_interrupts(|| EVENT_QUEUE.lock().pop())
 }
