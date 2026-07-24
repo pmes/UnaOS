@@ -975,3 +975,62 @@ witness.
 
 QEMU `raspi4b` models no V3D block (the run returns at `BLOCK-DOWN` before the probe), so the whole V3D-51
 step is dormant there — **P48 metal decides.**
+
+## 26. The contingency rungs below the L2T window — hub-INT unmask + config audit (V3D-52)
+
+**P48/P49 verdict: the L2T window fix was a NO-OP.** V3D-51's `[v3d51] init-hw-state` readback showed
+firmware had **already** established `STA=0/END≈0` at POR — the reset never disturbed the window — so
+`retired=0` stands. Wire decode (P49): the QPU program-end host interrupt latches (`INT_STS` bit16) but the
+PTB never generates `FLDONE`; the break is in the **CLE→PTB frame-close handshake**, below the byte-exact
+per-job programming (§10–23), the reset cycle (§24) and the L2T flush window (§25). V3D-52 works the ranked
+contingency rungs below that floor. All three are dormant on QEMU (`BLOCK-DOWN`) — **metal decides.**
+
+**Rung 1 — the hub-INT half of `v3d_irq_enable` (the last unmirrored byte-exact kernel probe write).**
+The kernel's `v3d_irq_enable` (`v3d_irq.c`) is **four** register writes, not two: the per-core
+`INT_MSK_SET=~V3D_CORE_IRQS` / `INT_MSK_CLR=V3D_CORE_IRQS` (mirrored since V3D-49) **and** the hub
+`HUB_INT_MSK_SET=~V3D_HUB_IRQS` / `HUB_INT_MSK_CLR=V3D_HUB_IRQS`, both once at probe. `V3D_HUB_IRQS`
+(ver<71) = `MMU_WRV|MMU_PTI|MMU_CAP|TFUC` = `0x3a`; hub `INT_MSK_STS/SET/CLR` sit at `0x5c/0x60/0x64`
+relative to `V3D_HUB_BASE` (the same low slots as the core INT block but a **distinct** MMIO block; the
+file's own hub `IDENT0..3` at `0x08..0x14` confirm the layout). UnaOS had never touched the hub mask — the
+single remaining unmirrored probe divergence. `v3d_irq_enable` now writes the hub half after the core half,
+with the `[v3d52] hub-irq-enable` witness echoing `HUB_MSK_STS` before/after. **Rationale, honestly
+weighted:** §23 established that core `INT_STS` latches *raw* regardless of the core mask, so the hub likely
+latches raw too — faithful-but-maybe-not-the-fix — but it is the last byte-exact divergence and the method
+is "mirror exactly, then metal decides." If the hub aggregates/gates the core's frame-completion latch,
+unmasking lets the Empty frame retire.
+
+**Rung 2 — the `TILE_BINNING_MODE_CFG` (code 120) tile-state auto-init audit — finding: no such bit in
+v42.** The contingency hypothesis was that a naked config+START+FLUSH never retires because the tile-state
+array is auto-initialised by a config-packet bit the Empty rung leaves clear. **Audited against the
+authoritative in-repo v42 field map** (the §V3D-46 8-field enumeration, byte-verified vs Mesa
+`v3d_packet.xml` gen 4.2): the v42 code-120 packet has **no** auto-initialise-tile-state field. That field
+existed only in the pre-v41 (v3.3) packet and was removed in the v41+ restructure — on V3D 4.2 the
+tile-state array is initialised implicitly by `START_TILE_BINNING`, not by a config bit. The v42 field set
+is exactly `{initial-block@2, block@4, RT-count@8, max-BPP@12, MSAA-4x@14, double-buffer@15, width@32,
+height@48}`; bits 14/15 are correctly clear for our single-sample, single-buffer 64×64 frame. So the Empty
+rung's config is **complete and byte-exact — no divergent bit, no behavioural change** (instrument-and-name
+per the no-fabricated-fix rule). The `[v3d52] tile-binning-mode-cfg auto-init audit` witness records the
+finding; the ladder's own differential stays the live test — if `state-no-prims` retires while `empty-frame`
+does not, the gap is a **prologue/state packet**, not a config bit, and is named directly there.
+
+**Rung 3 — the TMU write-combiner (TMUWCF) drain candidate, witness-staged (NOT armed).** The binner's
+tile-list/tile-state writeback lands in L2T; the frame-flush completion the Empty rung waits on needs that
+writeback drained through the L2T write-combiner. `invalidate_gpu_caches` writes `L2TCACTL FLM=FLUSH`
+**pre-kick** and polls `L2TFLS` clear, but there is **no** post-START/pre-`FLDONE` combiner drain and
+`V3D_L2TCACTL_TMUWCF` (bit8) is never written. Because QEMU cannot verify a flush-path change, Rung 3 is
+**named, not armed**: the `[v3d52] tmuwcf-drain candidate` witness anchors the current `L2TCACTL` state so
+that, if Rungs 1+2 read clean, the next boot can arm a post-flush `TMUWCF` drain inside the frame path with
+a before-anchor. Weaker than #1/#2 — the wedge is `BMACTIVE` (frame open), not a stale readback.
+
+**Expected witnesses (metal).**
+- `[v3d52] hub-irq-enable — HUB_MSK_STS por=<x> -> now=<y> unmasked set=0x0000003a …` — `por` settles
+  whether the hub working set was masked at reset; if unmasking retires the Empty rung it reads
+  `[v3d52] empty-… retired=1 BFC Δ1 PCS=…BMACTIVE=0` in the ladder below.
+- `[v3d52] tile-binning-mode-cfg auto-init audit — … MSAA-4x@14=0 double-buffer@15=0 … config is COMPLETE`
+  — the audit is a pure finding; it changes no submitted byte.
+- `[v3d52] tmuwcf-drain candidate (Rung 3, NOT armed) — L2TCACTL=<z> …` — the before-anchor for the
+  next-boot drain.
+
+If, with the hub set proven unmasked, the Empty rung still reads `retired=0 BFC Δ0 …BMACTIVE=1`, the wedge
+is confirmed below all mirror-able kernel probe state and the retained `[v3d44/45/46]` dump + Rung 3 name
+the next layer.

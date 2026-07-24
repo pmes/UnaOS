@@ -87,6 +87,29 @@ const V3D_HUB_IDENT1: usize = 0x000C;
 const V3D_HUB_IDENT2: usize = 0x0010;
 const V3D_HUB_IDENT3: usize = 0x0014;
 
+// PI-V3D-52 (Rung 1): the HUB interrupt MASK block. The kernel's `v3d_irq_enable`
+// (`drivers/gpu/drm/v3d/v3d_irq.c`) is FOUR register writes, not two: after the per-core
+// INT_MSK_SET/CLR (mirrored in `v3d_irq_enable` below since V3D-49) it ALSO unmasks the HUB
+// interrupt working set once at probe — `V3D_HUB_INT_MSK_SET = ~V3D_HUB_IRQS`,
+// `V3D_HUB_INT_MSK_CLR = V3D_HUB_IRQS`. UnaOS had never touched the hub mask; the hub-INT half of
+// the kernel probe was the last unmirrored byte-exact bring-up divergence (v3d.md §26). Offsets are
+// the SAME low slots as the core INT block (0x50–0x64) but relative to V3D_HUB_BASE — a DISTINCT
+// MMIO block from the core registers. Transcribed from Linux `v3d_regs.h` (register facts only,
+// GPL-2.0-only header): the hub IDENT0..3 at 0x08..0x14 already in this file confirm the layout, and
+// the INT block follows the TFU region at 0x50. (1 = that hub interrupt is MASKED/disabled.)
+const V3D_HUB_INT_MSK_STS: usize = 0x005c; // current hub interrupt mask (V3D_HUB_INT_MSK_STS)
+const V3D_HUB_INT_MSK_SET: usize = 0x0060; // write-1-to-MASK (disable) a hub interrupt (V3D_HUB_INT_MSK_SET)
+const V3D_HUB_INT_MSK_CLR: usize = 0x0064; // write-1-to-UNMASK (enable) a hub interrupt (V3D_HUB_INT_MSK_CLR)
+// Hub interrupt bit layout (v3d_regs.h, ver<71 block):
+const V3D_HUB_INT_TFUC: u32 = 1 << 1; // TFU (texture-format-utility) conversion complete
+const V3D_HUB_INT_MMU_CAP: u32 = 1 << 3; // hub-MMU address-cap exceeded
+const V3D_HUB_INT_MMU_PTI: u32 = 1 << 4; // hub-MMU page-table invalid
+const V3D_HUB_INT_MMU_WRV: u32 = 1 << 5; // hub-MMU write violation
+// The kernel's hub working set for V3D 4.2 (`V3D_HUB_IRQS`, v3d_irq.c, ver<71 path):
+// MMU_WRV | MMU_PTI | MMU_CAP | TFUC = 0x3a. This is the exact bitset `v3d_irq_enable` UNMASKS on the
+// hub (MSK_CLR) and everything else it MASKS (MSK_SET = ~this).
+const V3D_HUB_IRQS: u32 = V3D_HUB_INT_MMU_WRV | V3D_HUB_INT_MMU_PTI | V3D_HUB_INT_MMU_CAP | V3D_HUB_INT_TFUC;
+
 // V3D MMU (in the hub), per v3d_regs.h / v3d_mmu.c. The register OFFSETS and the V3D_MMU_CTL BIT
 // FIELDS below are transcribed verbatim from Linux `drivers/gpu/drm/v3d/v3d_regs.h` (torvalds/linux
 // master). PI-V3D-4 root cause: the earlier constants here were fabricated. V3D_MMU_VIO_ADDR/
@@ -639,6 +662,8 @@ pub fn bringup(fb: Option<FbTarget>) {
     // block is powered and MMU-mapped and before any CT0/CT1 kick. FLDONE (the bin-retire signal every
     // kick's wait_fldone polls) had never been unmasked; every prior boot ran the frame at the mask's
     // power-on-reset value. See v3d.md §23 for why this is the empty-frame verdict's named frame-level fix.
+    // PI-V3D-52 (Rung 1): `v3d_irq_enable` now also mirrors the HUB-INT half of the kernel probe (the
+    // last unmirrored byte-exact divergence) — see v3d.md §26.
     v3d_irq_enable();
 
     // ── M3: clear job. ──────────────────────────────────────────────────────────────────────────
@@ -1540,6 +1565,61 @@ fn dump_bin_mode_cfg_bytes() {
     );
 }
 
+/// PI-V3D-52 (Rung 2): audit the TILE_BINNING_MODE_CFG (v42, code 120) field set for a "tile-state
+/// auto-initialise" enable bit an EMPTY bin frame would uniquely depend on. The contingency hypothesis
+/// was that Mesa/the kernel never submits a naked config+START+FLUSH because the tile-state array is
+/// auto-initialised by a config-packet bit our Empty rung leaves clear — with tile state never
+/// initialised the FLUSH has nothing to write back and BMACTIVE never clears.
+///
+/// FINDING (audited against the authoritative in-repo v42 field map — the §V3D-46 8-field enumeration
+/// dumped by `dump_bin_mode_cfg_bytes`, which is byte-verified against Mesa `v3d_packet.xml` gen 4.2):
+/// the v42 code-120 packet has NO auto-initialise-tile-state field. That field existed only in the
+/// pre-v41 (v3.3) TILE_BINNING_MODE_CFG and was REMOVED in the v41+ restructure — on V3D 4.2 the
+/// tile-state array is initialised implicitly by START_TILE_BINNING, not by a config bit. The v42
+/// field set is exactly {initial-block-size@2, block-size@4, RT-count@8, max-BPP@12, MSAA-4x@14,
+/// double-buffer@15, width@32, height@48}; bits 14/15 are correctly clear for our single-sample,
+/// single-buffer 64×64 frame. So the Empty rung's config is COMPLETE and byte-exact — there is no
+/// divergent tile-state-init bit to set, and no behavioural change is warranted (instrument-and-name).
+/// The ladder's own differential remains the live test: if `state-no-prims` retires while `empty-frame`
+/// does not, the missing packet is a PROLOGUE/state packet, not a config bit — named directly there.
+fn audit_bin_mode_cfg_autoinit() {
+    // Rebuild the exact v42 config we submit and confirm bits 14 (MSAA) and 15 (double-buffer) — the only
+    // config flags an empty frame could differ on — are clear, and report the auto-init audit verdict.
+    let mut p = Pkt::new(P_TILE_BINNING_MODE_CFG, 9);
+    p.f(2, 2, TILE_ALLOC_BLOCK_SIZE_128B)
+        .f(4, 2, TILE_ALLOC_BLOCK_SIZE_64B)
+        .f(8, 4, 0)
+        .f(12, 2, INTERNAL_BPP_32)
+        .f(32, 16, (TARGET_W - 1) as u64)
+        .f(48, 16, (TARGET_H - 1) as u64);
+    let (buf, _len) = p.done();
+    // byte 1 carries bits 8..16: MSAA@14 → bit6 of buf[1], double-buffer@15 → bit7 of buf[1].
+    let msaa = (buf[1] >> 6) & 1;
+    let dbuf = (buf[1] >> 7) & 1;
+    serial_println!(
+        ":: V3D: [v3d52] tile-binning-mode-cfg auto-init audit — v42 code-120 has NO auto-initialise-tile-state field (that bit is pre-v41/v3.3-only; on 4.2 START_TILE_BINNING inits tile state). Empty-rung config MSAA-4x@14={} double-buffer@15={} (both want 0), 8/8 v42 fields byte-exact — config is COMPLETE, no divergent bit; Empty's non-retire is NOT a missing config flag. If state-no-prims retires while empty wedges, the gap is a prologue/state packet ::",
+        msaa, dbuf,
+    );
+}
+
+/// PI-V3D-52 (Rung 3, witness-staged): name the TMU write-combiner drain candidate WITHOUT a behavioural
+/// change (instrument-and-name; QEMU raspi4b models no V3D so any flush-path change is metal-unverifiable
+/// and must be named before it is armed). The binner's tile-list / tile-state writeback lands in L2T; the
+/// frame-flush completion the empty rung waits on (FLDONE) needs that writeback drained through the L2T
+/// write-combiner. `invalidate_gpu_caches` writes L2TCACTL FLM=FLUSH PRE-kick and polls L2TFLS clear, but
+/// there is NO post-START/pre-FLDONE combiner drain and `V3D_L2TCACTL_TMUWCF` (bit8) is never written. If
+/// Rungs 1+2 come back clean on metal, the next boot arms a post-flush TMUWCF drain inside the frame path;
+/// this witness records the current L2TCACTL state so that change has a before-anchor.
+fn stage_tmuwcf_drain_candidate() {
+    let l2tcactl = mmio_read(V3D_CORE0_BASE, V3D_CTL_L2TCACTL);
+    serial_println!(
+        ":: V3D: [v3d52] tmuwcf-drain candidate (Rung 3, NOT armed) — L2TCACTL={:#010x} (L2TFLS={} TMUWCF={}) — the frame's own post-START writeback is never combiner-flushed (TMUWCF bit8 never written; no post-flush drain). Staged as the fallback if Rungs 1+2 read clean; arming it is next-boot ::",
+        l2tcactl,
+        (l2tcactl & V3D_L2TCACTL_L2TFLS != 0) as u32,
+        (l2tcactl & V3D_L2TCACTL_TMUWCF != 0) as u32,
+    );
+}
+
 fn wait_fldone(what: &str) -> (u32, u64, bool) {
     let frq = super::timer::cntfrq();
     let start = super::timer::cntpct();
@@ -1750,6 +1830,32 @@ fn v3d_irq_enable() {
             "FLDONE was MASKED at power-on-reset — every prior boot polled a gated retire signal; this unmask is the empty-frame fix"
         } else {
             "FLDONE was already unmasked at reset — INT_STS latches raw, so masking never inverted the FLDONE=0 verdict; the wedge is downstream of the frame enables"
+        }
+    );
+
+    // PI-V3D-52 (Rung 1): the HUB-INT half of `v3d_irq_enable` — the second, last unmirrored byte-exact
+    // kernel probe write. The kernel unmasks BOTH the per-core set (above) AND the hub set once at probe;
+    // UnaOS mirrored only the core half (V3D-49). If this silicon gates the CLE→PTB frame-close FLDONE
+    // latch behind the hub's aggregate interrupt path (the hub aggregates the core's completion signal),
+    // unmasking the hub working set is what lets the Empty frame retire. Weakened by §23 (raw INT_STS
+    // latches regardless of the CORE mask, so the hub likely latches raw too) — faithful-but-maybe-not-
+    // the-fix — but it is the LAST kernel divergence; the method is "mirror exactly, then metal decides."
+    // Idempotent; no hub ISR is installed (we poll core INT_STS), so unmasking bits we don't service is
+    // safe. Reads MSK_STS before/after so the boot records the hub mask's power-on-reset state.
+    let hub_msk_por = mmio_read(V3D_HUB_BASE, V3D_HUB_INT_MSK_STS);
+    mmio_write(V3D_HUB_BASE, V3D_HUB_INT_MSK_SET, !V3D_HUB_IRQS);
+    mmio_write(V3D_HUB_BASE, V3D_HUB_INT_MSK_CLR, V3D_HUB_IRQS);
+    dsb();
+    let hub_msk_now = mmio_read(V3D_HUB_BASE, V3D_HUB_INT_MSK_STS);
+    serial_println!(
+        ":: V3D: [v3d52] hub-irq-enable — HUB_MSK_STS por={:#010x} -> now={:#010x} unmasked set={:#010x} (MMU_WRV|MMU_PTI|MMU_CAP|TFUC) — mirrors the hub half of the kernel v3d_irq_enable (was NEVER written before V3D-52; the last byte-exact probe divergence). {} ::",
+        hub_msk_por,
+        hub_msk_now,
+        V3D_HUB_IRQS,
+        if hub_msk_por & V3D_HUB_IRQS == V3D_HUB_IRQS {
+            "hub working set was fully MASKED at reset — this unmask is a genuine state change; if the hub gates the core FLDONE latch, the Empty frame now retires"
+        } else {
+            "hub working set was NOT fully masked at reset — firmware left part of it open; unmasking completes the kernel-exact set regardless"
         }
     );
 }
@@ -3486,6 +3592,12 @@ fn empty_frame_bisection() {
     cache::clean_range(arena_phys() + OFF_BISECT_NULL_SHADREC, 36 + 16);
     // OFF_SHADREC (the real M4 record) was already published + cleaned by probe_job; StateNoPrims reuses it.
     cs_tail_witness("v3d48 NULL", OFF_BISECT_NULL_CODE, NULL_CS_WORDS.len());
+
+    // PI-V3D-52 (Rung 2): audit the v42 TILE_BINNING_MODE_CFG for a tile-state auto-init bit the Empty
+    // rung might leave clear (contingency hypothesis) — finding: no such bit in v42, config is complete.
+    audit_bin_mode_cfg_autoinit();
+    // PI-V3D-52 (Rung 3, witness-staged): name the TMU write-combiner drain candidate + anchor L2TCACTL.
+    stage_tmuwcf_drain_candidate();
 
     // PI-V3D-50: re-run the EMPTY rung first, tagged [v3d50], as the direct before/after witness for the
     // new kernel-faithful reset cycle (`v3d_reset_cycle` ran in bring-up this boot). If the OFF→ON core
