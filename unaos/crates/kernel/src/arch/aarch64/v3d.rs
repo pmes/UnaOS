@@ -165,6 +165,11 @@ const V3D_CTL_SLCACTL: usize = 0x0024; // slice-cache control (TMU-vertex/TMU-da
 const V3D_CTL_L2TCACTL: usize = 0x0030; // L2T cache control
 const V3D_L2TCACTL_L2TFLS: u32 = 1 << 0; // flush start; reads 1 while the flush is in progress
 const V3D_L2TCACTL_FLM_FLUSH: u32 = 0 << 1; // FLM field [2:1] = FLUSH (write-back + invalidate)
+// PI-V3D-53: FLM=CLEAR (invalidate-only, mode 1) — the mode the kernel's per-job INPUT invalidate uses.
+// `v3d_invalidate_l2t` (v3d_gem.c, GPL-2.0-only, facts-only) writes L2TFLSTA=0/L2TFLEND=~0 then
+// `L2TCACTL = L2TFLS | FLM=CLEAR` — NOT FLM=FLUSH. FLM values (v3d_regs.h): 0=FLUSH(wb+inv),
+// 1=CLEAR(inv-only), 2=CLEAN(wb-only).
+const V3D_L2TCACTL_FLM_CLEAR: u32 = 1 << 1; // FLM field [2:1] = CLEAR (invalidate-only)
 // PI-V3D-51: the L2T flush ADDRESS-RANGE bounds the L2TCACTL flush above walks. Offsets transcribed from
 // Linux `v3d_regs.h` (register facts; GPL-2.0-only header, facts-only): V3D_CTL_L2TFLSTA=0x034,
 // V3D_CTL_L2TFLEND=0x038. `v3d_init_core` writes STA=0 and END=~0 (flush the WHOLE address space) for
@@ -1602,18 +1607,22 @@ fn audit_bin_mode_cfg_autoinit() {
     );
 }
 
-/// PI-V3D-52 (Rung 3, witness-staged): name the TMU write-combiner drain candidate WITHOUT a behavioural
-/// change (instrument-and-name; QEMU raspi4b models no V3D so any flush-path change is metal-unverifiable
-/// and must be named before it is armed). The binner's tile-list / tile-state writeback lands in L2T; the
-/// frame-flush completion the empty rung waits on (FLDONE) needs that writeback drained through the L2T
-/// write-combiner. `invalidate_gpu_caches` writes L2TCACTL FLM=FLUSH PRE-kick and polls L2TFLS clear, but
-/// there is NO post-START/pre-FLDONE combiner drain and `V3D_L2TCACTL_TMUWCF` (bit8) is never written. If
-/// Rungs 1+2 come back clean on metal, the next boot arms a post-flush TMUWCF drain inside the frame path;
-/// this witness records the current L2TCACTL state so that change has a before-anchor.
-fn stage_tmuwcf_drain_candidate() {
+/// PI-V3D-53: the honest verdict on the Rung 3 TMUWCF drain candidate V3D-52 staged. Sourced against the
+/// kernel (v3d_gem.c / v3d_sched.c / v3d_irq.c, GPL-2.0-only, facts-only): `V3D_L2TCACTL_TMUWCF` (bit8) is
+/// written in exactly ONE place — `v3d_clean_caches()`, which (1) writes `L2TCACTL=TMUWCF` and polls it
+/// clear, then (2) writes `L2TCACTL=FLM=CLEAN` and polls L2TFLS clear. `v3d_clean_caches` runs ONLY as the
+/// dedicated `V3D_CACHE_CLEAN` job (`v3d_cache_clean_job_run`), scheduled AFTER the render job and gated on
+/// the userspace `DRM_V3D_SUBMIT_CL_FLUSH_CACHE` flag. It is NOT in `v3d_bin_job_run`, NOT in
+/// `v3d_render_job_run`, NOT in `v3d_irq`. So TMUWCF is a POST-RENDER cache-clean op — downstream of the
+/// bin FLDONE / BFC++ handshake the empty rung wedges on (`BMACTIVE=1`, frame still open). Arming a TMUWCF
+/// drain in the bin frame path would run a rung the kernel PROVABLY does not run for bin jobs — a
+/// fabricated fix. Per the no-fabricated-fix law it is NOT armed. This witness records L2TCACTL + the
+/// sourced verdict; the actually-derived next candidate (kernel-exact FLM=CLEAR pre-job invalidate,
+/// `bin_prejob_invalidate_kernel_exact`) is the `[v3d53]` empty rung below.
+fn refute_tmuwcf_drain_candidate() {
     let l2tcactl = mmio_read(V3D_CORE0_BASE, V3D_CTL_L2TCACTL);
     serial_println!(
-        ":: V3D: [v3d52] tmuwcf-drain candidate (Rung 3, NOT armed) — L2TCACTL={:#010x} (L2TFLS={} TMUWCF={}) — the frame's own post-START writeback is never combiner-flushed (TMUWCF bit8 never written; no post-flush drain). Staged as the fallback if Rungs 1+2 read clean; arming it is next-boot ::",
+        ":: V3D: [v3d53] tmuwcf-drain REFUTED for bin path — TMUWCF(bit8) is written ONLY in kernel v3d_clean_caches (V3D_CACHE_CLEAN job, post-RENDER, DRM_V3D_SUBMIT_CL_FLUSH_CACHE-gated); NEVER in v3d_bin_job_run/v3d_render_job_run/v3d_irq. The empty rung wedges at the bin FLDONE handshake (BMACTIVE=1), UPSTREAM of any post-render clean — arming TMUWCF here runs a rung the kernel never runs for bin jobs (fabricated fix). NOT armed. L2TCACTL={:#010x} (L2TFLS={} TMUWCF={}). Derived next candidate = kernel-exact FLM=CLEAR pre-job invalidate (see [v3d53] empty-after-clear-invalidate rung) ::",
         l2tcactl,
         (l2tcactl & V3D_L2TCACTL_L2TFLS != 0) as u32,
         (l2tcactl & V3D_L2TCACTL_TMUWCF != 0) as u32,
@@ -1798,6 +1807,32 @@ fn invalidate_gpu_caches(what: &str) {
     let _ = wait_bit_clear(V3D_CORE0_BASE, V3D_CTL_L2TCACTL, V3D_L2TCACTL_L2TFLS, what);
     mmio_write(V3D_CORE0_BASE, V3D_CTL_SLCACTL, V3D_SLCACTL_INVALIDATE_ALL);
     dsb();
+}
+
+/// PI-V3D-53: the kernel-EXACT per-job INPUT cache invalidate — the last L2TCACTL flush-mode / sequence
+/// divergence around a bin job. The kernel's `v3d_invalidate_caches` (v3d_gem.c, GPL-2.0-only, facts-only)
+/// is `v3d_flush_l3` (no-op on BCM2711 — no L3) → `v3d_invalidate_slices` (SLCACTL all-0xF) →
+/// `v3d_invalidate_l2t` (`L2TFLSTA=0`; `L2TFLEND=~0`; `L2TCACTL = L2TFLS | FLM=CLEAR`). It differs from
+/// `invalidate_gpu_caches` (above) in THREE ways: (a) SLCACTL runs FIRST, then L2T (we do L2T then SLCACTL);
+/// (b) the flush window is re-established per invalidate (we set it once in `v3d_init_hw_state`);
+/// (c) **FLM=CLEAR** (invalidate-only) — NOT FLM=FLUSH (writeback+invalidate). For a bin job the inputs
+/// (CL, tile-state, shader records, VBO) are ALL CPU-published to DRAM via `cache::clean_range`, so an
+/// invalidate-only re-fetch is exactly correct and byte-faithful to the kernel; on a freshly-reset core the
+/// L2T holds no dirty lines, so CLEAR and FLUSH converge — faithful-but-weak-prior (like §26 Rung 1),
+/// mirror-exact-then-metal-decides. Distinct from the render-side `invalidate_gpu_caches` FLM=FLUSH, which
+/// is the metal-CONFIRMED V3D-12 fix (it PUBLISHES the binner's tile lists to the render CLE) and is left
+/// untouched. Returns L2TCACTL before/after for the `[v3d53]` witness. The poll on L2TFLS is our standard
+/// finite backstop (the kernel's per-job invalidate is fire-and-forget; polling is a safe superset).
+fn bin_prejob_invalidate_kernel_exact(what: &str) -> (u32, u32) {
+    let before = mmio_read(V3D_CORE0_BASE, V3D_CTL_L2TCACTL);
+    mmio_write(V3D_CORE0_BASE, V3D_CTL_SLCACTL, V3D_SLCACTL_INVALIDATE_ALL);
+    mmio_write(V3D_CORE0_BASE, V3D_CTL_L2TFLSTA, 0);
+    mmio_write(V3D_CORE0_BASE, V3D_CTL_L2TFLEND, !0);
+    mmio_write(V3D_CORE0_BASE, V3D_CTL_L2TCACTL, V3D_L2TCACTL_L2TFLS | V3D_L2TCACTL_FLM_CLEAR);
+    let _ = wait_bit_clear(V3D_CORE0_BASE, V3D_CTL_L2TCACTL, V3D_L2TCACTL_L2TFLS, what);
+    let after = mmio_read(V3D_CORE0_BASE, V3D_CTL_L2TCACTL);
+    dsb();
+    (before, after)
 }
 
 /// PI-V3D-49: unmask the core interrupt working set once at bring-up, byte-for-byte as the kernel's
@@ -3494,7 +3529,23 @@ fn submit_bisect_rung_tagged(tag: &str, rung: &str, content: BinContent, shadrec
     decode_cl_packets("v3d48 bisect", OFF_PROBE_BIN_CL, bin_len);
 
     clear_mmu_fault_latch("v3d48 bisect pre-kick");
-    invalidate_gpu_caches("L2T flush (v3d48 bisect pre-kick)");
+    // PI-V3D-53: the `v3d53`-tagged rung runs the KERNEL-EXACT per-job input invalidate
+    // (`v3d_invalidate_caches`: slices-first → L2T window re-established → FLM=CLEAR) instead of our
+    // `invalidate_gpu_caches` FLM=FLUSH, and witnesses L2TCACTL before/after. This is the derived next
+    // candidate after the TMUWCF drain was refuted for the bin path (post-render clean only). Every other
+    // rung keeps FLM=FLUSH, so the v3d51(FLUSH) vs v3d53(CLEAR) empty rungs are a controlled differential:
+    // if v3d53 retires while v3d51 wedges, the pre-job invalidate mode/sequence was the wall; if both wedge,
+    // cache sequencing is exonerated and the break sits below all mirror-able L2TCACTL state.
+    if tag == "v3d53" {
+        let (l2t_before, l2t_after) =
+            bin_prejob_invalidate_kernel_exact("L2T CLEAR (v3d53 bisect pre-kick)");
+        serial_println!(
+            ":: V3D: [v3d53] {} kernel-exact pre-job invalidate — L2TCACTL {:#010x}->{:#010x} (FLM: ours=FLUSH(0) -> kernel=CLEAR(1); SLCACTL-first + L2TFLSTA=0/L2TFLEND=~0 re-established) — mirrors v3d_invalidate_caches byte-for-byte; TMUWCF(bit8) NOT armed (post-render clean only, not bin path) ::",
+            rung, l2t_before, l2t_after,
+        );
+    } else {
+        invalidate_gpu_caches("L2T flush (v3d48 bisect pre-kick)");
+    }
     let qts_val = ts | V3D_CLE_CT0QTS_ENABLE;
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QMA, tile_alloc);
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QMS, BIN_TILEALLOC_BYTES as u32);
@@ -3596,8 +3647,11 @@ fn empty_frame_bisection() {
     // PI-V3D-52 (Rung 2): audit the v42 TILE_BINNING_MODE_CFG for a tile-state auto-init bit the Empty
     // rung might leave clear (contingency hypothesis) — finding: no such bit in v42, config is complete.
     audit_bin_mode_cfg_autoinit();
-    // PI-V3D-52 (Rung 3, witness-staged): name the TMU write-combiner drain candidate + anchor L2TCACTL.
-    stage_tmuwcf_drain_candidate();
+    // PI-V3D-53 (Rung 3 verdict): the TMU write-combiner drain candidate V3D-52 staged is REFUTED for the
+    // bin path — TMUWCF is a post-render clean-caches op, never run for bin jobs. Record the sourced verdict
+    // (not armed). The derived next candidate — the kernel-exact FLM=CLEAR pre-job invalidate — runs as the
+    // [v3d53] empty rung below.
+    refute_tmuwcf_drain_candidate();
 
     // PI-V3D-50: re-run the EMPTY rung first, tagged [v3d50], as the direct before/after witness for the
     // new kernel-faithful reset cycle (`v3d_reset_cycle` ran in bring-up this boot). If the OFF→ON core
@@ -3613,6 +3667,14 @@ fn empty_frame_bisection() {
     // the [v3d51] init-hw-state witness confirming the window latched, the wedge sits below the L2T flush
     // range too and the retained [v3d44/45/46] dump names the next layer.
     submit_bisect_rung_tagged("v3d51", "empty-after-init-hw-state", BinContent::Empty, OFF_SHADREC);
+    // PI-V3D-53: the EMPTY rung once more, tagged [v3d53], but with the KERNEL-EXACT per-job input
+    // invalidate (`v3d_invalidate_caches`: SLCACTL-first → L2T window re-established → FLM=CLEAR) in place of
+    // our FLM=FLUSH — the last L2TCACTL flush-mode/sequence divergence around a bin job, and the derived
+    // candidate after the TMUWCF drain was refuted for the bin path. Read as a differential against the
+    // v3d51 empty rung directly above (identical except FLM mode/sequence): if THIS retires while v3d51
+    // wedged, the pre-job invalidate was the wall; if both wedge, the wedge is confirmed below all
+    // mirror-able L2TCACTL state and the retained [v3d44/45/46] dump names the next layer.
+    submit_bisect_rung_tagged("v3d53", "empty-after-clear-invalidate", BinContent::Empty, OFF_SHADREC);
     submit_bisect_rung("empty-frame", BinContent::Empty, OFF_SHADREC);
     submit_bisect_rung("state-no-prims", BinContent::StateNoPrims, OFF_SHADREC);
     submit_bisect_rung("prims-null-shader", BinContent::PrimsNullShader, OFF_BISECT_NULL_SHADREC);

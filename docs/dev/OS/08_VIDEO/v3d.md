@@ -1034,3 +1034,64 @@ a before-anchor. Weaker than #1/#2 — the wedge is `BMACTIVE` (frame open), not
 If, with the hub set proven unmasked, the Empty rung still reads `retired=0 BFC Δ0 …BMACTIVE=1`, the wedge
 is confirmed below all mirror-able kernel probe state and the retained `[v3d44/45/46]` dump + Rung 3 name
 the next layer.
+
+## 27. Rung 3 refuted for the bin path; the kernel-exact FLM=CLEAR pre-job invalidate (V3D-53)
+
+**P51 verdict: Rungs 1+2 read clean, the Empty frame still does not retire.** The hub-INT unmask (§26 Rung 1)
+executed on metal — `HUB_MSK_STS por=0 -> 0x5`, set `0x3a` written — and the code-120 config audit (§26
+Rung 2) found the Empty rung's config **complete**. Yet the Empty frame still read
+`retired=0 BFC Δ0 BMACTIVE=1 BMBUSY=0 INT_STS=0` after 500 ms. §26's staging said: Rungs 1+2 clean → arm
+Rung 3, the TMUWCF combiner-drain candidate. V3D-53 went to arm it — and, sourcing the kernel first,
+**refuted it for the bin path.**
+
+**The TMUWCF drain is a post-render clean-caches op, never run for a bin job.** Sourced against the kernel
+(`v3d_gem.c` / `v3d_sched.c` / `v3d_irq.c`, GPL-2.0-only, facts only), `V3D_L2TCACTL_TMUWCF` (bit 8) is
+written in **exactly one** function — `v3d_clean_caches()`, which writes `L2TCACTL=TMUWCF` and polls it
+clear, then writes `L2TCACTL` FLM=`CLEAN` and polls `L2TFLS` clear. `v3d_clean_caches` runs **only** as the
+dedicated `V3D_CACHE_CLEAN` job (`v3d_cache_clean_job_run`), scheduled **after** the render job and gated on
+the userspace `DRM_V3D_SUBMIT_CL_FLUSH_CACHE` flag. It is **not** in `v3d_bin_job_run`, **not** in
+`v3d_render_job_run`, **not** in `v3d_irq`. So TMUWCF sits **downstream** of the bin FLDONE / BFC++ handshake
+the Empty rung wedges on (`BMACTIVE=1`, frame still open). Arming a TMUWCF drain inside the bin frame path
+would run a rung the kernel provably never runs for bin jobs — a fabricated fix. Per the no-fabricated-fix
+law it is **NOT armed**; the `[v3d53] tmuwcf-drain REFUTED for bin path` witness records the sourced verdict.
+
+**The derived next candidate — the kernel-exact FLM=CLEAR pre-job invalidate.** The last L2TCACTL
+flush-mode / sequence divergence around a bin job is the per-job **input** invalidate. The kernel's
+`v3d_invalidate_caches` (called before both bin and render jobs) is:
+
+```
+v3d_flush_l3(v3d);                 // no-op on BCM2711 — no L3
+v3d_invalidate_slices(v3d, 0);     // SLCACTL <= all-0xF
+v3d_invalidate_l2t(v3d, 0);        // L2TFLSTA=0; L2TFLEND=~0; L2TCACTL = L2TFLS | FLM=CLEAR
+```
+
+UnaOS's `invalidate_gpu_caches` diverges in **three** ways: (a) it writes L2T **first**, then SLCACTL (kernel
+does slices first); (b) it does **not** re-establish the flush window per invalidate (we set it once in
+`v3d_init_hw_state`, §25); (c) it uses **FLM=FLUSH** (writeback+invalidate, mode 0) — **not** FLM=CLEAR
+(invalidate-only, mode 1). For a bin job every input (CL, tile-state, shader records, VBO) is CPU-published
+to DRAM via `cache::clean_range`, so an invalidate-only re-fetch is exactly what the kernel does and is
+byte-faithful. On a freshly-reset core the L2T holds no dirty lines, so CLEAR and FLUSH converge —
+**faithful-but-weak-prior** (like §26 Rung 1), mirror-exact-then-metal-decides.
+
+**Scope — the render-side FLUSH is left untouched.** `invalidate_gpu_caches` FLM=FLUSH is the metal-CONFIRMED
+V3D-12 fix on the **render** pre-kick: it *publishes* the binner's tile lists to the render CLE (boot-P7 root
+cause). V3D-53 does **not** touch it. The kernel-exact CLEAR path is added as a distinct helper
+(`bin_prejob_invalidate_kernel_exact`) and wired **only** into the `[v3d53]`-tagged Empty rung, so the
+metal-confirmed job paths (probe / M4 / battery) are unperturbed and the change is a controlled diagnostic.
+
+**The differential.** The bisection ladder now runs the Empty rung twice back-to-back, identical except for
+the invalidate: `[v3d51] empty-after-init-hw-state` (FLM=FLUSH, L2T-first) and
+`[v3d53] empty-after-clear-invalidate` (FLM=CLEAR, slices-first, window re-established). If `[v3d53]` retires
+while `[v3d51]` wedges, the pre-job invalidate mode/sequence was the wall. If **both** wedge, the pre-job
+cache invalidate is exonerated and the wedge is confirmed **below all mirror-able L2TCACTL state** — the
+retained `[v3d44/45/46]` dump names the next layer (below the CLE→PTB FLDONE generation).
+
+**Expected P52 witnesses (metal).**
+- `[v3d53] tmuwcf-drain REFUTED for bin path — … NOT armed. L2TCACTL=<z> …` — the sourced Rung 3 verdict.
+- `[v3d53] empty-after-clear-invalidate kernel-exact pre-job invalidate — L2TCACTL <a>-><b> (FLM: ours=FLUSH(0)
+  -> kernel=CLEAR(1); SLCACTL-first + L2TFLSTA=0/L2TFLEND=~0 re-established) …` — the before/after anchor.
+- `[v3d53] empty-after-clear-invalidate — retired=? BFC Δ? PCS=…` — the differential verdict against the
+  `[v3d51]` empty rung directly above.
+
+QEMU `raspi4b` models no V3D block (the run returns at `BLOCK-DOWN` before the probe), so the whole V3D-53
+step is dormant there — **P52 metal decides.**
