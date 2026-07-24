@@ -2137,17 +2137,35 @@ fn input_router_selftest() {
     unaos_kernel::pal::push_event(unaos_kernel::pal::Event::Timer); // non-deliverable — must be dropped
     let routed = route_input_to_active_el0();
     let sent1 = GUI_SENT.load(Ordering::Relaxed);
-    // UVUG-8: delivering real input to the focused ring is the interactive-takeover edge — the takeover latch
-    // must now name ASID 1. This is the exact kernel-observable signal `run_user_image`'s deadline suspends on.
-    let takeover_engaged = sc::el0_takeover_active() == 1;
-    // UVUG-8: simulate the takeover-aware deadline decision (the pure `run_deadline_timed_out` the wait loop
-    // uses) across a suspend -> re-arm cycle, so QEMU proves the logic HID cannot exercise here:
-    //   (S) in takeover: even FAR past the deadline the run must NOT time out (window suspended);
-    //   (R) left takeover, budget re-armed to `now`: not yet timed out at the re-arm instant, but timed out
-    //       once a full deadline has elapsed past it.
+    // UVUG-8r2 (a): DELIVERY IS NOT TAKEOVER. Two real events just landed in ASID 1's ring, and the latch must
+    // still be 0 — takeover is engaged by the app CONSUMING an event via SYS_INPUT_POLL, not by the router
+    // pushing one. Pre-r2 this latched here, which is exactly how the stale launch keystroke handed every
+    // keyboard-started run a suspended deadline at t≈0. (The consume edge itself needs a live EL0 task, so it
+    // is metal-only; this asserts the half QEMU can see.)
+    let push_does_not_engage = sc::el0_takeover_active() == 0;
+    // UVUG-8r2 (b): STALE PRE-LAUNCH EVENTS ARE DISCARDED ON FOCUS. This is the metal `run /fat/UVUG.ELF`
+    // scenario in miniature: an event sits in EVENT_QUEUE from before the app existed (the Enter KeyUp that
+    // launched it), then focus is granted. `el0_input_set_active` must drain it, so the very next router pass
+    // finds nothing to deliver — the app cannot mistake its own launch keystroke for in-app interaction.
+    unaos_kernel::pal::push_event(unaos_kernel::pal::Event::Key(b'\n')); // the "launch" keystroke
+    sc::el0_input_set_active(1); // fresh focus — must discard it
+    let stale_dropped = route_input_to_active_el0() == 0;
+    // UVUG-8r2 (c): the pure decisions the wait loop uses, over a suspend -> WEDGE -> re-arm cycle. QEMU
+    // raspi4b delivers no HID, so the live path cannot be driven here; these prove the logic instead.
     let deadline: u64 = 1_000;
-    let suspend_holds = !sc::run_deadline_timed_out(true, 10_000, 0, deadline); // way past, but suspended
-    let rearm_start: u64 = 10_000; // budget_start reset to `now` on the takeover->non-takeover edge
+    let stale: u64 = 200; // heartbeat staleness bound, in the same synthetic tick unit
+    //   (S) latched on this asid with a FRESH heartbeat -> suspended, so even far past the deadline: no timeout.
+    let live_suspends = sc::takeover_suspends(1, 1, 10_000, 9_900, stale);
+    let suspend_holds = !sc::run_deadline_timed_out(live_suspends, 10_000, 0, deadline);
+    //   (W) THE r2 FIX: same latch, but the app stopped polling — heartbeat older than `stale`. Takeover must
+    //       no longer suspend, or a hung app strands the shell forever (the wedge the first cut introduced).
+    let hung_releases = !sc::takeover_suspends(1, 1, 10_000, 9_000, stale);
+    //   (X) a latch naming a DIFFERENT asid never suspends this run; an empty latch never suspends.
+    let other_asid_ignored = !sc::takeover_suspends(2, 1, 10_000, 9_990, stale);
+    let unlatched_ignored = !sc::takeover_suspends(0, 1, 10_000, 9_990, stale);
+    //   (R) once released, the budget re-arms to `now`: not timed out at that instant, timed out a full
+    //       deadline later — the liveness bound is genuinely restored, not merely deferred.
+    let rearm_start: u64 = 10_000;
     let rearm_fresh = !sc::run_deadline_timed_out(false, rearm_start, rearm_start, deadline); // 0 elapsed
     let rearm_fires = sc::run_deadline_timed_out(false, rearm_start + deadline + 1, rearm_start, deadline);
     // A focus change clears the latch — a fresh `run` always starts disengaged (deadline fully armed).
@@ -2164,14 +2182,25 @@ fn input_router_selftest() {
             sent1.wrapping_sub(sent0)
         );
     }
-    if takeover_engaged && suspend_holds && rearm_fresh && rearm_fires && takeover_cleared {
+    if push_does_not_engage
+        && stale_dropped
+        && live_suspends
+        && suspend_holds
+        && hung_releases
+        && other_asid_ignored
+        && unlatched_ignored
+        && rearm_fresh
+        && rearm_fires
+        && takeover_cleared
+    {
         serial_println!(
-            "[uvug8] takeover deadline — engage-on-input, suspend-holds-past-deadline, re-arm-on-leave, clear-on-focus-change :: PASS ::"
+            "[uvug8] takeover deadline — push-does-not-engage, stale-launch-event-dropped, live-suspends, hung-app-releases (liveness bound restored), foreign/empty-latch-ignored, re-arm-fires, clear-on-focus-change :: PASS ::"
         );
     } else {
         serial_println!(
-            "[uvug8] takeover deadline — engaged={} suspend_holds={} rearm_fresh={} rearm_fires={} cleared={} :: FAIL ::",
-            takeover_engaged, suspend_holds, rearm_fresh, rearm_fires, takeover_cleared
+            "[uvug8] takeover deadline — push_no_engage={} stale_dropped={} live_suspends={} suspend_holds={} hung_releases={} other={} unlatched={} rearm_fresh={} rearm_fires={} cleared={} :: FAIL ::",
+            push_does_not_engage, stale_dropped, live_suspends, suspend_holds, hung_releases,
+            other_asid_ignored, unlatched_ignored, rearm_fresh, rearm_fires, takeover_cleared
         );
     }
 }

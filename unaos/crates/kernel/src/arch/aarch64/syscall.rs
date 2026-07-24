@@ -3491,6 +3491,12 @@ pub fn clear_handle_row(asid: u64) {
     // registered active input target, clear the designation so the router stops enqueueing to a dead slot.
     clear_input_row(asid);
     let _ = EL0_INPUT_ACTIVE.compare_exchange(asid, 0, Ordering::AcqRel, Ordering::Acquire);
+    // UVUG-8r2: companion clear for the takeover latch. Without it a torn-down ASID could leave its takeover
+    // engaged, and a REUSED ASID would inherit it — the next `run` into the same slot would start with its
+    // deadline already suspended. CAS on `asid` so we only ever clear OUR OWN latch, never a live one belonging
+    // to a different process. (The heartbeat needs no clear: `takeover_suspends` ignores it once the latch is 0,
+    // and `el0_input_set_active` resets it on the next focus anyway.)
+    let _ = EL0_TAKEOVER_ASID.compare_exchange(asid, 0, Ordering::AcqRel, Ordering::Acquire);
 }
 
 /// The ASID of the address space the caller is running in, read from `TTBR0_EL1[63:48]`. A syscall executes
@@ -6439,15 +6445,35 @@ pub fn run_user_image(
     // Deadline-bounded cooperative wait: yield so the co-located task runs; its SYS_EXIT (or the fault-kill
     // path) marks PROCS[pi] EXITED and records the status via the GENERIC child-reap short-circuit.
     //
-    // UVUG-8 — TAKEOVER-AWARE deadline. The batch (no-HID) path never delivers an input event, so
-    // `el0_takeover_active()` stays 0 and this behaves exactly as the original fixed 5 s bound: the auto UVUG
-    // run (300 frames, exit=0) and the wedged-app Timeout are unchanged. On metal the app flips to interactive
-    // takeover the instant the router delivers its first event (the same edge it announces with `:: UVUG:
-    // interactive takeover ::`); from then on the deadline is SUSPENDED — `budget_start` is dragged forward to
-    // `now` every takeover pass, so time held in takeover never accrues. If the app ever LEAVES takeover
-    // without exiting (a focus change clears the latch), a full fresh window re-arms from that moment. Witness
-    // `[uvug8]` marks both edges. The wedged-app watchdog (`gui_watchdog`) is independent and unaffected.
+    // UVUG-8 — TAKEOVER-AWARE deadline, UVUG-8r2 — heartbeat-GATED so it can never strand the shell.
+    //
+    // The batch (no-HID) path never CONSUMES an input event, so `el0_takeover_active()` stays 0 and this
+    // behaves exactly as the original fixed 5 s bound: the auto UVUG run (300 frames, exit=0) and the
+    // wedged-app Timeout are unchanged. On metal the app enters interactive takeover when it actually DRAINS a
+    // real event through `SYS_INPUT_POLL` (the same edge it announces with `:: UVUG: interactive takeover ::`).
+    //
+    // UVUG-8r2 fixes the liveness hole in the first cut. There, takeover was latched by `el0_input_push` (an
+    // event merely REACHING the ring) and cleared only by a focus change — which, on the real `run` path, only
+    // happens after this loop exits. So a HUNG interactive app (stops polling, never exits) suspended the
+    // deadline FOREVER: `run_user_image` spun in `yield_now()` with no bound, the shell never came back, and
+    // `gui_watchdog::poll()` — which only clears `SCREEN_APP_ACTIVE` — could not release it either. Reboot was
+    // the only way out; the fixed 5 s deadline this arc replaced had been the sole escape hatch.
+    //
+    // The gate is the app's own liveness heartbeat: `sys_input_poll` stamps `EL0_TAKEOVER_HB` on EVERY poll
+    // (the EL0 twin of `gui_watchdog::note_progress`). The deadline suspends only while the latch names THIS
+    // asid AND that heartbeat is fresher than `stale_ticks`. So:
+    //   * a live interactive app (polls every frame) keeps the heartbeat fresh -> suspended -> never times out.
+    //     This is the P53 behaviour the arc exists to deliver, preserved exactly.
+    //   * a HUNG app stops polling -> the heartbeat ages past `stale_ticks` -> `in_takeover` goes false, the
+    //     re-arm edge fires, and a full fresh deadline window runs to completion -> `RunOutcome::Timeout` ->
+    //     focus and screen return to the shell. Worst-case strand is bounded by `stale_ticks + deadline_ticks`.
+    // `budget_start` is dragged forward to `now` every suspended pass, so time in takeover never accrues.
+    // Witness `[uvug8]` marks both edges. The wedged-app watchdog (`gui_watchdog`) is independent and
+    // unaffected — this is the `run`-side bound, that is the screen-side one.
     let start = super::timer::cntpct();
+    // Heartbeat staleness bound: how long the takeover app may go without a SYS_INPUT_POLL before it stops
+    // counting as "live in takeover". A frame-driven app polls many times a second, so this is generous.
+    let stale_ticks = super::timer::cntfrq().saturating_mul(TAKEOVER_STALE_SECS);
     let mut budget_start = start;
     let mut suspended = false;
     loop {
@@ -6455,24 +6481,33 @@ pub fn run_user_image(
             break;
         }
         let now = super::timer::cntpct();
-        let in_takeover = el0_takeover_active() == asid;
+        let in_takeover = takeover_suspends(
+            el0_takeover_active(),
+            asid,
+            now,
+            el0_takeover_heartbeat(),
+            stale_ticks,
+        );
         if in_takeover {
             if !suspended {
                 suspended = true;
                 serial_println!(
-                    "[uvug8] deadline suspended — EL0 app asid={} in interactive takeover (real input routed)",
+                    "[uvug8] deadline suspended — EL0 app asid={} in interactive takeover (event drained, heartbeat live)",
                     asid
                 );
             }
             // Hold the window open while takeover persists: no elapsed time accrues against the deadline.
             budget_start = now;
         } else if suspended {
-            // takeover -> non-takeover edge: the app relinquished input without exiting; re-arm a FULL fresh
-            // deadline window from this instant (time spent in takeover is not charged against it).
+            // takeover -> non-takeover edge. REACHABLE on the real path (UVUG-8r2): the heartbeat gate flips
+            // this edge whenever the app stops polling for `stale_ticks`, with no focus change involved — that
+            // is precisely the hung-app case, and re-arming here is what restores the liveness bound. (It also
+            // covers a genuine relinquish.) Re-arm a FULL fresh deadline window from this instant; time spent
+            // in takeover is not charged against it.
             suspended = false;
             budget_start = now;
             serial_println!(
-                "[uvug8] deadline re-armed — EL0 app asid={} left takeover without exiting",
+                "[uvug8] deadline re-armed — EL0 app asid={} left takeover (heartbeat stale or focus dropped)",
                 asid
             );
         }
@@ -9032,15 +9067,35 @@ static EL0_INPUT_TAIL: [AtomicU32; super::boot::USER_SLOTS + 1] =
 static EL0_INPUT_ACTIVE: AtomicU64 = AtomicU64::new(0);
 
 /// UVUG-8: the ASID of the EL0 app that has entered INTERACTIVE TAKEOVER (0 = none). An EL0 full-screen app
-/// (`run /fat/UVUG.ELF`) flips to interactive mode the instant the router delivers its FIRST real input event
-/// (the UVUG-4 input-driven switch) — the same edge the app announces with `:: UVUG: interactive takeover ::`.
-/// The kernel-observable twin of that edge is a successful `el0_input_push`: real HID reached the app's ring,
-/// which happens only on metal (QEMU raspi4b delivers no HID). This latch is the `run_user_image` deadline's
-/// signal to SUSPEND — while it holds `asid`, the app is a live interactive session, not a stuck batch run, so
-/// the 5 s exit deadline must not fire. Set on the first delivered event (`el0_input_push`), cleared on ANY
-/// focus change (`el0_input_set_active`) — so a fresh `run` always starts disengaged and the deadline is fully
-/// intact for the batch (no-HID) path, which never delivers an event and never trips this latch.
+/// (`run /fat/UVUG.ELF`) flips to interactive mode the instant it drains its FIRST real input event (the
+/// UVUG-4 input-driven switch) — the same edge the app announces with `:: UVUG: interactive takeover ::`.
+///
+/// UVUG-8r2 moves the engage edge from PRODUCER to CONSUMER. The first cut latched in `el0_input_push` — an
+/// event merely REACHING the ring. That mis-fired on metal at t≈0: `el0_input_set_active` reset the per-ASID
+/// ring but NOT `pal::EVENT_QUEUE`, so the Enter KeyUp left over from typing `run /fat/UVUG.ELF` drained
+/// straight into the new app's ring and engaged takeover before the app had run a single frame — giving EVERY
+/// keyboard-launched run (batch apps included, which never poll at all) a suspended deadline. Now the latch is
+/// set by `sys_input_poll` only when the app ACTUALLY CONSUMES a packed event, so it reflects the app's own
+/// behaviour rather than the router's; and `el0_input_set_active` drains the stale `pal::EVENT_QUEUE` so the
+/// launch keystroke cannot be mistaken for in-app interaction in the first place.
+///
+/// This latch is the `run_user_image` deadline's signal to SUSPEND — but only in conjunction with a fresh
+/// `EL0_TAKEOVER_HB` heartbeat (see `takeover_suspends`), so a hung app cannot suspend the deadline forever.
+/// Cleared on ANY focus change (`el0_input_set_active`) and on slot teardown (`clear_handle_row`), so a fresh
+/// `run` always starts disengaged and the deadline is fully intact for the batch (no-HID) path.
 static EL0_TAKEOVER_ASID: AtomicU64 = AtomicU64::new(0);
+
+/// UVUG-8r2: CNTPCT tick of the takeover app's most recent `SYS_INPUT_POLL` — the EL0 liveness heartbeat, the
+/// per-`run` twin of `gui_watchdog`'s `LAST_PROGRESS_SECS`. Stamped on EVERY poll (an app calling the syscall
+/// IS making progress, empty ring or not). `run_user_image` suspends its deadline only while this is fresh, so
+/// an app that stops polling loses the suspension and the run regains a hard liveness bound.
+static EL0_TAKEOVER_HB: AtomicU64 = AtomicU64::new(0);
+
+/// UVUG-8r2: how long the takeover app may go without a `SYS_INPUT_POLL` before its takeover stops suspending
+/// the `run` deadline. Whole seconds, scaled by `timer::cntfrq()` at the use site. Two seconds is far longer
+/// than any plausible frame (a frame-driven app polls many times a second) yet keeps the worst-case shell
+/// strand for a hung app bounded at `TAKEOVER_STALE_SECS + deadline` ≈ 7 s instead of forever.
+pub const TAKEOVER_STALE_SECS: u64 = 2;
 
 /// Pack a `pal::Event` into the ELF-5 u64 wire form, or `None` for a non-deliverable event (Timer/None/
 /// Unknown carry nothing for EL0). Bit 63 is always clear, so `sys_input_poll` can hand the packed value
@@ -9087,9 +9142,9 @@ fn el0_input_push(asid: u64, packed: u64) -> bool {
     }
     EL0_INPUT_BUF[a][(tail as usize) & (INPUT_RING_CAP - 1)].store(packed, Ordering::Release);
     EL0_INPUT_TAIL[a].store(tail.wrapping_add(1), Ordering::Release); // publish AFTER the slot store
-    // UVUG-8: a real input event just reached this app's ring — the kernel-observable interactive-takeover
-    // edge. Latch it so the `run_user_image` deadline suspends for as long as `asid` holds focus. Idempotent.
-    EL0_TAKEOVER_ASID.store(asid, Ordering::Release);
+    // UVUG-8r2: deliberately NO takeover latch here. Delivery into the ring proves only that the ROUTER acted;
+    // it says nothing about whether the app is interactive (or even running). The latch is set on the CONSUMER
+    // side, in `sys_input_poll`, when the app actually drains the event. See `EL0_TAKEOVER_ASID`.
     true
 }
 
@@ -9098,15 +9153,42 @@ fn el0_input_push(asid: u64, packed: u64) -> bool {
 /// focus); passing 0 clears the designation (no EL0 target — enqueues become no-ops). Called by the focus
 /// owner (today the witness; on the folded router, the shell/compositor on a focus change).
 pub fn el0_input_set_active(asid: u64) {
+    // UVUG-8r2: a fresh focus must also start with an empty UPSTREAM queue. `clear_input_row` resets only the
+    // per-ASID ring; `pal::EVENT_QUEUE` sits in front of it and, on metal, still holds the tail of the
+    // keystroke that LAUNCHED this program — the Enter KeyUp from typing `run /fat/UVUG.ELF`. Left there, the
+    // router drains it into the new app's ring microseconds after launch, and the app's first poll reads it as
+    // genuine in-app interaction (pre-r2, the push itself engaged takeover, so every keyboard-launched run —
+    // batch programs included — got a suspended deadline at t≈0). Drain and DISCARD it here: events queued
+    // BEFORE the app existed were never meant for it. Bounded by the queue's own 64-slot cap, so this
+    // terminates even against a live producer. Only on a real focus (asid != 0); clearing focus leaves the
+    // queue alone, since from then on those events legitimately belong to the shell/GUI channel.
     if asid != 0 && (asid as usize) <= super::boot::USER_SLOTS {
         clear_input_row(asid); // fresh focus starts clean
+        let mut drained = 0u32;
+        while drained < 64 && crate::pal::next_event().is_some() {
+            drained = drained.wrapping_add(1);
+        }
+        if drained != 0 {
+            serial_println!(
+                "[uvug8] focus asid={} — discarded {} pre-launch event(s) from EVENT_QUEUE",
+                asid,
+                drained
+            );
+        }
     }
-    // UVUG-8: a focus change RESETS interactive takeover — a freshly-focused app has delivered nothing yet, so
-    // it starts as a batch run with the deadline fully armed; it re-engages takeover only when the router next
-    // delivers a real event to it. This is also what makes a `run` (which calls set_active(asid) then, on
+    // UVUG-8: a focus change RESETS interactive takeover — a freshly-focused app has consumed nothing yet, so
+    // it starts as a batch run with the deadline fully armed; it engages takeover only once it actually drains
+    // a real event via SYS_INPUT_POLL. This is also what makes a `run` (which calls set_active(asid) then, on
     // return, set_active(0)) start and end cleanly disengaged.
-    EL0_TAKEOVER_ASID.store(0, Ordering::Release);
+    //
+    // UVUG-8r2 ORDERING: publish the new focus FIRST, then clear the latch. The reverse order left a window in
+    // which a concurrent router push could re-store the OUTGOING asid into the latch after we cleared it. With
+    // the engage edge moved to the consumer side that push can no longer write the latch at all, but the
+    // clear-after-publish order is the one that is correct independent of that, so it is what we do: after this
+    // store, the only writer that could re-latch is an app polling under the NEW focus, which is exactly right.
     EL0_INPUT_ACTIVE.store(asid, Ordering::Release);
+    EL0_TAKEOVER_ASID.store(0, Ordering::Release);
+    EL0_TAKEOVER_HB.store(0, Ordering::Release);
 }
 
 /// The ASID currently designated to receive input (0 = none) — the read side of `el0_input_set_active`.
@@ -9115,10 +9197,26 @@ pub fn el0_input_active() -> u64 {
 }
 
 /// UVUG-8: the ASID currently in interactive takeover (0 = none) — the read side of the takeover latch. The
-/// `run_user_image` deadline reads this each wait pass: while it equals the running app's ASID, the app is a
-/// live interactive session and the deadline is suspended.
+/// `run_user_image` deadline reads this each wait pass; combined with a fresh heartbeat (`takeover_suspends`)
+/// it means the app is a live interactive session and the deadline is suspended.
 pub fn el0_takeover_active() -> u64 {
     EL0_TAKEOVER_ASID.load(Ordering::Acquire)
+}
+
+/// UVUG-8r2: the takeover app's last `SYS_INPUT_POLL` timestamp in CNTPCT ticks — the read side of the EL0
+/// liveness heartbeat. Meaningful only alongside `el0_takeover_active()`; both are reset on a focus change.
+pub fn el0_takeover_heartbeat() -> u64 {
+    EL0_TAKEOVER_HB.load(Ordering::Acquire)
+}
+
+/// UVUG-8r2: the pure "is the deadline suspended?" decision, factored out of `run_user_image`'s wait loop so
+/// it can be reasoned about (and self-tested) with no global state or clock. Returns `true` iff `latched` names
+/// THIS run's `asid` (the app drained a real event — it is interactive) AND its heartbeat is no older than
+/// `stale_ticks` (it is still polling — it is ALIVE). Both halves are required, and the second is the whole
+/// point of r2: without it a hung app suspends the deadline forever and strands the shell until reboot.
+/// `wrapping_sub` matches the CNTPCT counter's wrap-safe math.
+pub fn takeover_suspends(latched: u64, asid: u64, now: u64, heartbeat: u64, stale_ticks: u64) -> bool {
+    latched != 0 && latched == asid && now.wrapping_sub(heartbeat) <= stale_ticks
 }
 
 /// UVUG-8: the pure takeover-aware deadline decision, factored out of `run_user_image`'s wait loop so it can be
@@ -9158,6 +9256,14 @@ fn sys_input_poll() -> i64 {
     if asid == 0 || asid as usize > super::boot::USER_SLOTS {
         return EAGAIN;
     }
+    // UVUG-8r2: stamp the EL0 takeover HEARTBEAT on every poll, empty ring or not — the per-`run` twin of the
+    // `note_progress` call above. Reaching this syscall IS proof of liveness; `run_user_image` suspends its
+    // deadline only while this stays fresh, so an app that wedges mid-takeover stops holding the deadline open
+    // and the run regains its bound. Stamped only for the FOCUSED app so an unfocused EL0 task's polling can
+    // never keep another process's takeover alive.
+    if EL0_INPUT_ACTIVE.load(Ordering::Acquire) == asid {
+        EL0_TAKEOVER_HB.store(super::timer::cntpct(), Ordering::Release);
+    }
     let a = asid as usize;
     let head = EL0_INPUT_HEAD[a].load(Ordering::Relaxed); // this task is the sole consumer
     let tail = EL0_INPUT_TAIL[a].load(Ordering::Acquire);
@@ -9166,6 +9272,12 @@ fn sys_input_poll() -> i64 {
     }
     let packed = EL0_INPUT_BUF[a][(head as usize) & (INPUT_RING_CAP - 1)].load(Ordering::Acquire);
     EL0_INPUT_HEAD[a].store(head.wrapping_add(1), Ordering::Release); // consume AFTER the load
+    // UVUG-8r2: the app just CONSUMED a real input event — the interactive-takeover edge, observed on the
+    // consumer side (see `EL0_TAKEOVER_ASID` for why the producer side was wrong). Latch it, but only for the
+    // FOCUSED app: a background EL0 task draining its own stale ring is not taking over the screen. Idempotent.
+    if EL0_INPUT_ACTIVE.load(Ordering::Acquire) == asid {
+        EL0_TAKEOVER_ASID.store(asid, Ordering::Release);
+    }
     packed as i64
 }
 
