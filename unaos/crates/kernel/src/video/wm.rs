@@ -40,8 +40,24 @@
 //! ### Seam for WC-B (the syscall side)
 //! `SYS_WIN_CREATE` / `SYS_WIN_PRESENT` / `SYS_WIN_MOVE` / `SYS_WIN_CLOSE` are thin, fail-closed
 //! wrappers over [`create`], [`present`], [`move_to`] and [`close`]; per-ASID ownership is checked
-//! with [`owner_of`], and task teardown calls [`close_owner`]. Nothing in this module reads task
-//! state or touches the syscall layer — the ASID is passed in as an opaque tag.
+//! with [`owner_of`], and task teardown calls [`close_owner`] **and** [`close_compat`]. Nothing in
+//! this module reads task state or touches the syscall layer — the ASID is passed in as an opaque
+//! tag.
+//!
+//! Two obligations WC-B cannot skip:
+//! - [`create`] takes `surf_len`, the **real byte length of the mapped slot**. It must come from the
+//!   mapping code, never from EL0-supplied dimensions; it is what bounds every source read the
+//!   compositor performs.
+//! - [`close_compat`] must be called from the EL0 teardown seam next to [`close_owner`]. The compat
+//!   window has no owner ASID (the `SYS_FB_PRESENT` hook signature carries none), so `close_owner`
+//!   can never reap it.
+//!
+//! **Untrusted geometry.** `w`, `h`, `stride`, and the [`move_to`] origin may all come from an app.
+//! They are validated against the slot at create time, clamped to the panel at move time, saturating
+//! everywhere in between, and every composite loop is clipped to the panel intersection BEFORE it
+//! runs — `put_pixel` clips writes but would still iterate a hostile extent. The kernel builds
+//! without overflow checks, so wrapping arithmetic is a real failure mode here, not a theoretical
+//! one.
 
 use spin::Mutex;
 
@@ -106,6 +122,12 @@ struct Window {
     stride: usize,
     /// EL1-visible address of the owner's ARGB8888 surface. Held as a `usize` so the table is `Send`.
     surf: usize,
+    /// F1 — length in BYTES of the mapped surface slot at `surf`. The compositor never reads past
+    /// `surf + surf_len`; [`create`] rejects any geometry that could. Without this the extent came
+    /// from EL0 and a `w=h=10000, stride=40000` window over a 4 KiB slot would have the compositor
+    /// read ~400 MB of EL1 memory and paint kernel bytes onto the panel (`put_pixel` clips WRITES,
+    /// never the source READ).
+    surf_len: usize,
     scale: usize,
     z: u32,
     damaged: bool,
@@ -132,6 +154,7 @@ impl Window {
             h: 0,
             stride: 0,
             surf: 0,
+            surf_len: 0,
             scale: 1,
             z: 0,
             damaged: false,
@@ -158,18 +181,42 @@ static TABLE: Mutex<Table> = Mutex::new(Table {
 });
 
 /// Create a window owned by `owner_asid` over the caller's ARGB8888 surface at `surf` (EL1-visible
-/// address, `stride` bytes per row) with source dimensions `w` x `h` and a short `title` (truncated
-/// to [`MAX_TITLE`]).
+/// address, `surf_len` bytes long, `stride` bytes per row) with source dimensions `w` x `h` and a
+/// short `title` (truncated to [`MAX_TITLE`]).
 ///
 /// Geometry is chosen by the kernel: a fresh window is tiled into the next free column so multiple
 /// apps are visible side-by-side, at the largest integer scale that keeps it legible and on-panel.
 /// The caller may relocate it afterwards with [`move_to`].
 ///
-/// Returns the new [`WinId`], or [`WIN_NONE`] when the table is full or the arguments are degenerate
-/// (null surface, zero extent) — fail-closed, never a panic, so the syscall wrapper maps a single
-/// error case.
-pub fn create(owner_asid: u64, surf: usize, w: u32, h: u32, stride: u32, title: &[u8]) -> WinId {
-    create_inner(owner_asid, surf, w as usize, h as usize, stride as usize, title, false)
+/// # Surface-extent contract (F1) — WC-B MUST honour this
+/// `surf_len` is the **real byte length of the mapped slot**, as the mapping code knows it — never a
+/// value derived from EL0-supplied dimensions. `w`, `h` and `stride` may come straight from the
+/// caller; this function rejects any combination that would read outside the slot
+/// (`w * 4 > stride`, or `h * stride > surf_len`), so the compositor's source reads are bounded by
+/// construction rather than by trusting the app.
+///
+/// Returns the new [`WinId`], or [`WIN_NONE`] when the table is full, the arguments are degenerate
+/// (null surface, zero extent) or the geometry does not fit the slot — fail-closed, never a panic,
+/// so the syscall wrapper maps a single error case.
+pub fn create(
+    owner_asid: u64,
+    surf: usize,
+    surf_len: usize,
+    w: u32,
+    h: u32,
+    stride: u32,
+    title: &[u8],
+) -> WinId {
+    create_inner(
+        owner_asid,
+        surf,
+        surf_len,
+        w as usize,
+        h as usize,
+        stride as usize,
+        title,
+        false,
+    )
 }
 
 /// The compat window's id (`WIN_NONE` until the first `present_surface` call), so the shim reuses
@@ -193,9 +240,22 @@ pub(super) fn compat_present(
     y: usize,
 ) {
     use core::sync::atomic::Ordering;
+    // F1 — the compat path's extent is not EL0-supplied: `present_surface` is called from the
+    // `SYS_FB_PRESENT` hook with the kernel's own `boot::FB_SURFACE_*` constants, so `h * stride` IS
+    // the mapped slot's length. Passing it explicitly keeps the row's bound honest and lets the same
+    // clamp in `draw_window` cover both paths.
+    let surf_len = h.saturating_mul(stride);
+
+    // F2 — ids are slot aliases with no generation, so "is this still MY window?" cannot be answered
+    // by liveness alone: after the compat row is closed and slot 0 is recycled to a real app, the row
+    // is live again under a new owner and a liveness test would have the shim overwrite that app's
+    // surface pointer and geometry while `owner_of` still reported the app. Test the `compat` FLAG
+    // instead — the one property no recycled row can accidentally have (only `compat_present` ever
+    // sets it). Chosen over widening `WinId` with a generation counter because the flag is exact for
+    // this hazard and keeps the id a plain slot number for WC-B's syscall ABI.
     let mut id = COMPAT_WIN.load(Ordering::Relaxed);
-    if id == WIN_NONE || owner_of(id).is_none() {
-        id = create_inner(0, surf, w, h, stride, b"", true);
+    if id == WIN_NONE || !is_compat_row(id) {
+        id = create_inner(0, surf, surf_len, w, h, stride, b"", true);
         if id == WIN_NONE {
             return;
         }
@@ -204,10 +264,16 @@ pub(super) fn compat_present(
     {
         let mut t = TABLE.lock();
         let r = match row_mut(&mut t, id) {
-            Some(r) => r,
-            None => return,
+            // F2 — re-check under the lock: the row could have been closed and recycled between the
+            // guard above and here.
+            Some(r) if r.compat => r,
+            _ => return,
         };
+        if w.saturating_mul(4) > stride || h.saturating_mul(stride) > surf_len {
+            return;
+        }
         r.surf = surf;
+        r.surf_len = surf_len;
         r.w = w;
         r.h = h;
         r.stride = stride;
@@ -217,6 +283,29 @@ pub(super) fn compat_present(
         r.damaged = true;
     }
     composite();
+}
+
+/// Whether `id` names a live row that is the compat window (F2's identity test).
+fn is_compat_row(id: WinId) -> bool {
+    let t = TABLE.lock();
+    row(&t, id).map(|r| r.compat).unwrap_or(false)
+}
+
+/// WC-A / F3 — close the compat window, if one exists. **WC-B must call this from the EL0 teardown
+/// seam** — the same place in `clear_handle_row` that calls [`close_owner`] — because the compat row
+/// has no real owner ASID (`present_surface` is reached through the `SYS_FB_PRESENT` hook, whose
+/// signature carries no ASID, so the shim cannot learn who is presenting) and therefore
+/// [`close_owner`] can never reap it.
+///
+/// Without that call the compat row is immortal: after the app exits, every later composite re-blits
+/// whatever now lives in the dead surface buffer, and the panel keeps showing a window whose owner is
+/// gone. Returns `true` if a compat window was closed.
+pub fn close_compat() -> bool {
+    let id = COMPAT_WIN.swap(WIN_NONE, core::sync::atomic::Ordering::Relaxed);
+    if id == WIN_NONE || !is_compat_row(id) {
+        return false;
+    }
+    close(id)
 }
 
 /// Mark `id` damaged and composite. This is the whole present path: WC-B's `SYS_WIN_PRESENT`
@@ -235,16 +324,40 @@ pub fn present(id: WinId) -> bool {
     true
 }
 
-/// Move `id`'s content origin to `(x, y)` on the panel, clamped so the window (with its chrome)
-/// stays addressable. Marks it damaged; the next [`present`] or [`composite`] repaints it.
+/// Move `id`'s content origin to `(x, y)` on the panel, clamped on BOTH bounds so the window (with
+/// its chrome) stays on the panel. Marks it damaged; the next [`present`] or [`composite`] repaints
+/// it.
 ///
-/// Returns `false` if `id` names no live window.
+/// F5 — the upper clamp is not cosmetic: an unclamped `usize::MAX` would feed the geometry
+/// arithmetic in `outer_box`/`draw_window`, and the kernel builds without overflow checks, so the
+/// additions would wrap in release rather than trap.
+///
+/// Returns `false` if `id` names no live window, or if the framebuffer is not ready (nothing sane to
+/// clamp against).
 pub fn move_to(id: WinId, x: usize, y: usize) -> bool {
+    let fb = *super::WRITER.lock();
+    // Guard intentionally dropped before the table lock: `place`/`composite` never hold the table
+    // lock while touching `WRITER`, so keeping WRITER-then-TABLE strictly non-overlapping here is
+    // what makes the two orders unable to interleave into a cycle.
+    if !fb.is_ready() {
+        return false;
+    }
+    let info = fb.info();
+
     let mut t = TABLE.lock();
     match row_mut(&mut t, id) {
         Some(r) => {
-            r.x = x.max(BORDER);
-            r.y = y.max(TITLE_H + BORDER);
+            // Largest origin that keeps the whole window (content + chrome) on the panel; falls back
+            // to the minimum when the window is wider/taller than the panel.
+            let cw = r.w.saturating_mul(r.scale);
+            let ch = r.h.saturating_mul(r.scale);
+            let max_x = info.width.saturating_sub(cw + BORDER).max(BORDER);
+            let max_y = info
+                .height
+                .saturating_sub(ch + BORDER)
+                .max(TITLE_H + BORDER);
+            r.x = x.clamp(BORDER, max_x);
+            r.y = y.clamp(TITLE_H + BORDER, max_y);
             r.pinned = true;
             r.damaged = true;
             true
@@ -267,6 +380,8 @@ pub fn close(id: WinId) -> bool {
             None => return false,
         }
     };
+    // F4 — same drain as `close_owner`: this row's surface may be under an in-flight blit.
+    drain_blits();
     #[cfg(feature = "witness")]
     serial_println!("[wc-a] close win={}", id);
     erase(&[vacated]);
@@ -294,6 +409,11 @@ pub fn close_owner(owner_asid: u64) -> usize {
     if n == 0 {
         return 0;
     }
+    // F4 — the rows are gone, but a composite on another core may have snapshotted them a moment ago
+    // and still be reading those surfaces. Drain before returning: the caller is about to unmap the
+    // ASID's memory, and today that would be a stale read, but under WC-B's per-ASID surface mappings
+    // it becomes an EL1 abort mid-blit.
+    drain_blits();
     #[cfg(feature = "witness")]
     serial_println!("[wc-a] close_owner asid={:#x} closed={}", owner_asid, n);
     erase(&vacated[..n]);
@@ -307,15 +427,19 @@ pub fn close_owner(owner_asid: u64) -> usize {
 /// (closing damages the whole live set through [`place`]).
 fn erase(boxes: &[(usize, usize, usize, usize)]) {
     let fb = *super::WRITER.lock();
+    // Guard intentionally dropped here: this function never takes the table lock, so it cannot
+    // participate in a WRITER/TABLE cycle.
     if !fb.is_ready() {
         return;
     }
     let info = fb.info();
     let row_bytes = info.stride * info.bytes_per_pixel;
     for &(x, y, w, h) in boxes {
-        if w == 0 || h == 0 {
+        if w == 0 || h == 0 || x >= info.width || y >= info.height {
             continue;
         }
+        // F6 — clip before iterating, as in `draw_window`.
+        let (w, h) = (w.min(info.width - x), h.min(info.height - y));
         fb.fill_rect(x, y, w, h, 0);
         let y0 = y.min(info.height);
         let y1 = (y + h).min(info.height);
@@ -366,14 +490,18 @@ pub fn count() -> usize {
 /// write and cache clean happens after it is released, so a present never holds the window lock
 /// across a scan-out flush.
 pub fn composite() {
-    let (rows, mut dirty) = {
+    // F4 — the drain barrier. Register this composite as in-flight WHILE STILL HOLDING the table
+    // lock, so the registration is ordered against any teardown that takes the lock afterwards: a
+    // `close_owner` that clears rows can then tell whether some other core snapshotted those rows
+    // before the clear and is still blitting from their (about to be unmapped) surfaces.
+    let (rows, mut dirty, _blit) = {
         let mut t = TABLE.lock();
         let mut dirty = [false; MAX_WINDOWS];
         for (i, r) in t.rows.iter_mut().enumerate() {
             dirty[i] = r.used && r.damaged;
             r.damaged = false;
         }
-        (t.rows, dirty)
+        (t.rows, dirty, BlitGuard::enter())
     };
 
     // Close the damage set upwards over occlusion, to a fixed point (at most MAX_WINDOWS passes).
@@ -428,6 +556,40 @@ pub fn composite() {
     let _ = drawn;
 }
 
+/// F4 — number of composites that have snapshotted the table and may still be blitting from the
+/// surfaces they snapshotted. Teardown drains this to zero before it returns.
+static BLIT_ACTIVE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// F4 — RAII registration for an in-flight composite. Constructed under the table lock (so it is
+/// ordered against teardown's own lock acquisition) and dropped when the blit is done, on every exit
+/// path including the early `!fb.is_ready()` return.
+struct BlitGuard;
+
+impl BlitGuard {
+    fn enter() -> Self {
+        BLIT_ACTIVE.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        BlitGuard
+    }
+}
+
+impl Drop for BlitGuard {
+    fn drop(&mut self) {
+        BLIT_ACTIVE.fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// F4 — block until every composite that snapshotted the table BEFORE the caller's own row-clearing
+/// critical section has finished blitting. Called by teardown after it has cleared the rows and
+/// released the lock, so any composite starting from here on already sees the rows gone; only the
+/// ones that snapshotted earlier can still be reading the doomed surfaces, and this drains exactly
+/// those. Terminates: the set it waits on is finite and each member is making forward progress
+/// through a bounded, panel-clipped blit.
+fn drain_blits() {
+    while BLIT_ACTIVE.load(core::sync::atomic::Ordering::Acquire) != 0 {
+        core::hint::spin_loop();
+    }
+}
+
 /// WC-A — whether the first `[wc-a] composite` witness has been emitted (first composite only; a
 /// mini-vug run presents ~300 frames and per-frame witness spam would drown the serial log).
 #[cfg(feature = "witness")]
@@ -443,22 +605,29 @@ const CHROME_TITLE_FG: u32 = 0x00C8_C8D8;
 
 /// The outer box `(x, y, w, h)` a window occupies on the panel, chrome included. A compat window
 /// (the `present_surface` shim) has no chrome, so its outer box is exactly its content.
+/// F5 — every product and sum here saturates. The kernel builds with overflow checks off, so a
+/// wrapping `w * scale` would silently produce a SMALL box that then fails to damage the region it
+/// actually paints; saturation degrades to "absurdly large box", which the panel clip then bounds.
 fn outer_box(r: &Window) -> (usize, usize, usize, usize) {
-    let (cw, ch) = (r.w * r.scale, r.h * r.scale);
+    let cw = r.w.saturating_mul(r.scale);
+    let ch = r.h.saturating_mul(r.scale);
     if r.compat {
         (r.x, r.y, cw, ch)
     } else {
         (
             r.x.saturating_sub(BORDER),
             r.y.saturating_sub(TITLE_H + BORDER),
-            cw + 2 * BORDER,
-            ch + TITLE_H + 2 * BORDER,
+            cw.saturating_add(2 * BORDER),
+            ch.saturating_add(TITLE_H + 2 * BORDER),
         )
     }
 }
 
 fn boxes_overlap(a: (usize, usize, usize, usize), b: (usize, usize, usize, usize)) -> bool {
-    a.0 < b.0 + b.2 && b.0 < a.0 + a.2 && a.1 < b.1 + b.3 && b.1 < a.1 + a.3
+    a.0 < b.0.saturating_add(b.2)
+        && b.0 < a.0.saturating_add(a.2)
+        && a.1 < b.1.saturating_add(b.3)
+        && b.1 < a.1.saturating_add(a.3)
 }
 
 /// Paint one window: chrome (border frame + title strip + title text), then the surface content
@@ -467,10 +636,23 @@ fn boxes_overlap(a: (usize, usize, usize, usize), b: (usize, usize, usize, usize
 /// `Copy` `FrameBuffer` handle (volatile stores, no aliased `&mut`), the same discipline
 /// `Screen::flush` and the legacy `present_surface` use.
 fn draw_window(fb: &super::FrameBuffer, r: &Window) {
-    if r.surf == 0 || r.w == 0 || r.h == 0 || r.scale == 0 {
+    // `stride`/`scale` are divisors below and `surf_len` bounds the reads, so all four are checked
+    // here rather than trusted from the row.
+    if r.surf == 0 || r.w == 0 || r.h == 0 || r.scale == 0 || r.stride < 4 || r.surf_len == 0 {
         return;
     }
+    let info = fb.info();
+    let (pw, ph) = (info.width, info.height);
     let (bx, by, bw, bh) = outer_box(r);
+    if bx >= pw || by >= ph {
+        return;
+    }
+    // F6 — clip the outer box to the panel BEFORE any loop runs over it. `put_pixel`/`fill_rect`
+    // clip per pixel, which keeps the writes safe but still ITERATES the full extent: a window
+    // claiming 10000x10000 would spin ~1e8 clipped pokes per present, from syscall context.
+    let bw = bw.min(pw - bx);
+    let bh = bh.min(ph - by);
+
     if !r.compat {
         // Frame: fill the whole outer box in the border colour, then lay the title strip and the
         // content over it. The only pixels that survive are the 1-px frame itself.
@@ -479,12 +661,27 @@ fn draw_window(fb: &super::FrameBuffer, r: &Window) {
         draw_title(fb, r, bx + BORDER + 2, by + BORDER + 2, bw.saturating_sub(2 * BORDER + 4));
     }
 
+    if r.x >= pw || r.y >= ph {
+        return;
+    }
+    // F6 — how many source rows/columns can actually land on the panel: each source pixel occupies
+    // `scale` destination pixels, so `ceil(remaining_panel / scale)` source units are visible.
+    let vis_cols = (pw - r.x).div_ceil(r.scale).min(r.w);
+    let vis_rows = (ph - r.y).div_ceil(r.scale).min(r.h);
+    // F1 — and never read outside the mapped slot, whatever the row says. `create` already rejects
+    // geometry that would (and `compat_present` re-checks), so this is the belt to that braces: the
+    // read bound is derived from `surf_len`, the length the MAPPING code supplied, not from the
+    // app's dimensions.
+    let cols = vis_cols.min(r.stride / 4);
+    let rows = vis_rows.min(r.surf_len / r.stride);
+
     let surf = r.surf as *const u8;
-    for row in 0..r.h {
+    for row in 0..rows {
         let row_base = row * r.stride;
-        for col in 0..r.w {
+        for col in 0..cols {
             // Unaligned-safe read of the ARGB8888 pixel; low 24 bits are RRGGBB (alpha ignored —
-            // this arc composites opaquely).
+            // this arc composites opaquely). In bounds by construction: `row < surf_len / stride`
+            // and `col < stride / 4`, so `row_base + col * 4 + 4 <= surf_len`.
             let px = unsafe { core::ptr::read_unaligned(surf.add(row_base + col * 4) as *const u32) }
                 & 0x00FF_FFFF;
             for sy in 0..r.scale {
@@ -498,7 +695,6 @@ fn draw_window(fb: &super::FrameBuffer, r: &Window) {
 
     // Clean the touched rows (superset: whole scanlines of the outer box) for the non-coherent
     // scan-out — one `DC CVAC` sweep per window, not one per scanline. No-op on coherent targets.
-    let info = fb.info();
     let row_bytes = info.stride * info.bytes_per_pixel;
     let y0 = by.min(info.height);
     let y1 = (by + bh).min(info.height);
@@ -541,13 +737,20 @@ fn row_mut(t: &mut Table, id: WinId) -> Option<&mut Window> {
 fn create_inner(
     owner_asid: u64,
     surf: usize,
+    surf_len: usize,
     w: usize,
     h: usize,
     stride: usize,
     title: &[u8],
     compat: bool,
 ) -> WinId {
-    if surf == 0 || w == 0 || h == 0 || stride == 0 {
+    if surf == 0 || w == 0 || h == 0 || stride == 0 || surf_len == 0 {
+        return WIN_NONE;
+    }
+    // F1 — the surface-extent contract. A row must fit its stride and the rows must fit the slot;
+    // saturating arithmetic so a hostile `h`/`stride` overflows into a rejection, not a wrap (the
+    // kernel builds with overflow checks off, so `h * stride` alone could wrap to something small).
+    if w.saturating_mul(4) > stride || h.saturating_mul(stride) > surf_len {
         return WIN_NONE;
     }
     let mut t = TABLE.lock();
@@ -566,6 +769,7 @@ fn create_inner(
     row.h = h;
     row.stride = stride;
     row.surf = surf;
+    row.surf_len = surf_len;
     row.z = z;
     row.damaged = true;
     row.compat = compat;
@@ -603,6 +807,8 @@ const GAP: usize = 8;
 fn place(_created: WinId) {
     // Read the panel geometry BEFORE taking the table lock: `composite` takes the table lock and
     // releases it before touching `WRITER`, so no path ever holds both — no lock-order inversion.
+    // The WRITER guard is intentionally dropped at the end of this statement (`FrameBuffer` is
+    // `Copy`); the table lock below is therefore never nested inside it.
     let fb = *super::WRITER.lock();
     if !fb.is_ready() {
         return;
@@ -621,10 +827,14 @@ fn place(_created: WinId) {
         }
         let (w, h) = (r.w.max(1), r.h.max(1));
         let scale = ((pw / 2 / w).min(ph / 2 / h)).max(1);
-        let (bw, bh) = (w * scale + 2 * BORDER, h * scale + TITLE_H + 2 * BORDER);
-        if cx + bw > pw && cx > GAP {
+        // F5 — saturating throughout; `w`/`h` come from the caller via `create`.
+        let bw = w.saturating_mul(scale).saturating_add(2 * BORDER);
+        let bh = h
+            .saturating_mul(scale)
+            .saturating_add(TITLE_H + 2 * BORDER);
+        if cx.saturating_add(bw) > pw && cx > GAP {
             cx = GAP;
-            cy += row_h + GAP;
+            cy = cy.saturating_add(row_h).saturating_add(GAP);
             row_h = 0;
         }
         let r = &mut t.rows[i];
@@ -632,7 +842,7 @@ fn place(_created: WinId) {
         r.x = cx + BORDER;
         r.y = cy;
         r.damaged = true;
-        cx += bw + GAP;
+        cx = cx.saturating_add(bw).saturating_add(GAP);
         row_h = row_h.max(bh);
     }
 }

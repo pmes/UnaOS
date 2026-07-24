@@ -536,9 +536,43 @@ window syscalls — so they are given here as formats, with the values a 32x32 s
 `composite` witnesses the **first** pass only — a mini-vug run presents ~300 frames and per-frame
 lines would drown the log (the same reason `[uvug2]` fires once).
 
+### Treating window geometry as hostile
+
+Everything the app supplies — `w`, `h`, `stride`, the `move_to` origin — is attacker-controlled once
+WC-B exposes the verbs, and the compositor is the one place that turns those numbers into memory
+reads. The memory-safety lens on WC-A found six defects here; all are fixed, and the invariants they
+established are the ones to preserve:
+
+- **Surface-extent contract.** `create` takes `surf_len`, the real byte length of the mapped slot,
+  supplied by the mapping code and never derived from EL0 dimensions. Geometry that would read
+  outside it (`w * 4 > stride`, `h * stride > surf_len`, saturating) is rejected at create. Without
+  this, a `w=h=10000, stride=40000` window over a 4 KiB slot has the compositor read ~400 MB of EL1
+  memory and paint kernel bytes onto the panel — `put_pixel` clips *writes*, never the source read.
+- **Panel-clipped loops.** Every composite loop is clipped to the panel intersection before it runs.
+  Per-pixel clipping keeps the writes safe but still iterates: the same hostile window would spin
+  ~1e8 clipped pokes per present, from syscall context.
+- **Saturating geometry.** The kernel builds with overflow checks off, so `w * scale` wrapping would
+  silently produce a small damage box for a large paint. All of it saturates, and `move_to` clamps
+  the origin on both bounds against the panel.
+- **Ids are slot aliases.** There is no generation counter, so "is this still my window?" cannot be
+  answered by liveness: a closed row's id is immediately valid again under a new owner. The compat
+  shim therefore keys on the row's `compat` flag — a property no recycled row can accidentally have —
+  and re-checks it under the lock. (A generation-widened `WinId` was the alternative; the flag is
+  exact for this hazard and keeps the id a plain slot number for WC-B's syscall ABI.)
+- **Teardown drains in-flight blits.** `composite` registers itself as in-flight *while holding the
+  table lock*, so the registration is ordered against any later teardown's own lock acquisition.
+  `close`/`close_owner` clear the rows, then spin until that count reaches zero before returning.
+  Any composite starting after the clear cannot see the doomed rows; only one that snapshotted
+  earlier can still be reading those surfaces, and that is exactly what the drain waits for. Today
+  the race is a stale read; under WC-B's per-ASID surface mappings it becomes an EL1 abort mid-blit.
+- **The compat window has a lifecycle.** It has no owner ASID, so `close_owner` can never reap it;
+  `wm::close_compat()` exists for that and WC-B must call it from the EL0 teardown seam. Otherwise
+  the row is immortal and every later composite re-blits a dead app's buffer.
+
 ### Seam for the window syscalls (WC-B)
 
 `SYS_WIN_CREATE` / `SYS_WIN_PRESENT` / `SYS_WIN_MOVE` / `SYS_WIN_CLOSE` are thin fail-closed wrappers
 over `create` / `present` / `move_to` / `close`; the per-ASID ownership gate reads `owner_of`, and
-`clear_handle_row` calls `close_owner`. `SYS_FB_MAP` / `SYS_FB_PRESENT` stay as compat wrappers over
-the compat window.
+`clear_handle_row` calls **both** `close_owner` (for the ASID's own windows) and `close_compat` (for
+the ownerless shim row). `create` must be passed the mapped slot's real byte length as `surf_len`.
+`SYS_FB_MAP` / `SYS_FB_PRESENT` stay as compat wrappers over the compat window.
