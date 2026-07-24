@@ -600,9 +600,18 @@
     Normal-cacheable, nG) the single ELF-3 surface page had — no MMU attribute changed.
     `map_slot_fb_win` / `unmap_slot_fb_win` do proper **break-before-make** per page; unmap restores the
     boot `L3_USER` descriptor, so a closed surface is unreachable from EL0 the instant the TLBI completes.
+    `map_slot_fb_info` is **idempotent** — it skips the leaf edit entirely when the descriptor is already
+    correct, because `SYS_WIN_CREATE` (unlike `SYS_FB_MAP`) carries no "before any thread spawns" ordering,
+    and a break-before-make on a live info page would fault a sibling thread on a correct program.
     The VA anchor `USER_REGION` is now `align(0x100000)` (≥ its `0x85000` size) so the region still cannot
     straddle a 2 MiB `L3_USER` block; the per-slot **backings** got their own page-aligned type, since a
     backing is consumed one page at a time and does not need the anchor's alignment.
+  - **Slot recycling scrubs the FB region.** `build_slot` zeroes `[USER_REGION_SIZE, USER_STATIC_SIZE)` of
+    the slot's backing. Teardown retires the ASID and its mappings but never the backing bytes, and the
+    loader only writes the 16 KiB program window — so without this a recycled slot's `SYS_WIN_CREATE` would
+    map up to 16 pages of the PREVIOUS tenant's frame back in, EL0-RW. Build (not map) is the scrub point:
+    it is exactly the recycle boundary, runs once per tenant, and cannot wipe a caller's own pixels the way
+    zeroing on map would for a second (documented-idempotent) `SYS_FB_MAP`.
   - **Two indices, deliberately distinct.** The **window id** (0..8) is global — what EL0 passes and what
     the compositor names a window by. The **region slot** (0..8) is per-address-space — which 64 KiB
     surface slot of the *owner's own* FB region backs it. Region slots are allocated lowest-first per
@@ -621,7 +630,10 @@
     `sys_close` shape), `-EACCES` for a live window owned by another ASID (the rights-denial shape). The
     table is a `SpinMutex` taken IRQ-masked via `IrqGuard` on every access (syscall context AND the
     IRQ-masked teardown path), held across the MMU maintenance so a create and a close on two cores cannot
-    interleave break-before-make on the same leaf.
+    interleave break-before-make on the same leaf. **Both present verbs hold that lock across the composite
+    itself**, not merely across the ownership check: a close+create pair on other cores can recycle a window
+    id, and a validate-then-drop-then-present would land the caller's pixels under the new owner's window
+    identity. `WINDOWS` is a leaf lock and `video::wm` state is acquired strictly inside it.
   - **Teardown.** `clear_handle_row` closes every window the dying ASID still owns — the window twin of the
     handle/file/input/latch clears, and for the same reason: a surviving row would name a surface inside a
     backing frame the slot's NEXT tenant gets, compositing the next program's private memory to the panel.

@@ -527,6 +527,23 @@ unsafe fn build_slot(s: usize) {
     let sl2 = unsafe { (&raw mut SLOT_L2).cast::<PageTable>().add(s).cast::<u64>() };
     let sl3 = unsafe { (&raw mut SLOT_L3).cast::<PageTable>().add(s).cast::<u64>() };
     unsafe {
+        // WC-B (F1): SCRUB this slot's FB REGION before the new tenant can reach it. A slot is RECYCLED —
+        // `teardown_user_slot` retires the ASID and its mappings but never touches the backing bytes, and
+        // the ELF/blob load only writes the 16 KiB PROGRAM window, so the FB region carries the PREVIOUS
+        // tenant's frame. Under ELF-3 that was one stale 4 KiB surface; WC-B makes it 512 KiB across 8
+        // window slots AND directly verb-reachable (`SYS_WIN_CREATE` maps up to 16 of those pages EL0-RW),
+        // so the leak is closed here rather than left as a documented class.
+        //
+        // BUILD is the right point, not map: it is exactly the slot-recycle boundary the leak lives on, it
+        // runs once per tenant instead of once per map, and — unlike zeroing inside `map_slot_fb_win` — it
+        // cannot wipe a caller's OWN pixels, which zeroing on map would do to any second `SYS_FB_MAP`
+        // (documented idempotent) or re-create. The program window is deliberately NOT scrubbed here: the
+        // loader owns it and already writes/zeroes what it needs, and that path is unchanged.
+        core::ptr::write_bytes(
+            slot_backing_ptr(s).add(USER_REGION_SIZE),
+            0,
+            USER_STATIC_SIZE - USER_REGION_SIZE,
+        );
         for i in 0..512 {
             sl1.add(i).write_volatile(boot_l1.add(i).read_volatile());
             sl2.add(i).write_volatile(boot_l2.add(i).read_volatile());
@@ -658,12 +675,24 @@ pub unsafe fn map_slot_fb(s: usize) {
 
 /// WC-B: map slot `s`'s RO info page alone (the half of `map_slot_fb` every window path shares). Same
 /// break-before-make sequence and the same `user_ro_page` shape the combined ELF-3 call used.
+///
+/// WC-B (F3): IDEMPOTENT — if the leaf is ALREADY the wanted descriptor this returns without touching it.
+/// That is not an optimisation, it is a correctness requirement now that `SYS_WIN_CREATE` reaches this
+/// path: ELF-3's break-before-make was safe only because `SYS_FB_MAP` ran before the process spawned any
+/// drawing thread, and a window create carries no such ordering — a sibling thread reading the info page
+/// during the BREAK window would take a spurious, FATAL data abort on a perfectly correct program. Since
+/// the descriptor is a pure function of the slot, a no-op re-map is the whole fix; a leaf that differs
+/// (the first map, from the reserved identity descriptor) has by definition never been a valid EL0 info
+/// page for this tenant, so the BBM below is unreachable by a legitimate concurrent reader.
 pub unsafe fn map_slot_fb_info(s: usize) {
     debug_assert!(s < USER_SLOTS);
     let info_va = fb_info_va();
     let info_pa = slot_fb_info_ptr(s) as u64;
     let sl3 = unsafe { (&raw mut SLOT_L3).cast::<PageTable>().add(s).cast::<u64>() };
     let info_idx = ((info_va >> 12) & 0x1FF) as usize;
+    if unsafe { sl3.add(info_idx).read_volatile() } == user_ro_page(info_pa) {
+        return; // already mapped for this slot — no leaf edit, so no break window
+    }
     unsafe {
         sl3.add(info_idx).write_volatile(0); // break
         core::arch::asm!("dsb ishst", options(nostack, preserves_flags));

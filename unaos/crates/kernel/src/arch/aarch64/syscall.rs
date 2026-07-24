@@ -9206,7 +9206,12 @@ fn sys_fb_present() -> i64 {
     // with the legacy witness accounting, whether or not a window entry was ever bound (a window entry
     // only adds the compositor-visible damage mark). Deliberately independent of the window table so this
     // path cannot regress on table exhaustion — the ELF-3 fb-test verdict rides on it.
-    let win = win_lookup_compat(asid);
+    //
+    // WC-B (F2): the compat window's ID is resolved and USED under one continuous hold of the window
+    // table lock, for the same reason `sys_win_present` does — see the note there.
+    let _irq = IrqGuard::mask_save();
+    let t = WINDOWS.lock();
+    let win = (0..WIN_MAX).find(|&i| t[i].owner == asid && t[i].rslot == 0);
     present_surface_common(
         asid,
         super::boot::slot_fb_surface_ptr(slot),
@@ -9216,6 +9221,7 @@ fn sys_fb_present() -> i64 {
         super::boot::FB_SURFACE_SIZE,
         win,
     );
+    drop(t);
     0
 }
 
@@ -9328,13 +9334,6 @@ fn win_pages_for(w: u32, h: u32) -> Option<usize> {
     }
     let bytes = (w as usize) * 4 * (h as usize);
     Some(bytes.div_ceil(0x1000))
-}
-
-/// WC-B: the id of the caller's COMPAT window (the one on region slot 0), if it holds one.
-fn win_lookup_compat(asid: u64) -> Option<usize> {
-    let _irq = IrqGuard::mask_save();
-    let t = WINDOWS.lock();
-    (0..WIN_MAX).find(|&i| t[i].owner == asid && t[i].rslot == 0)
 }
 
 /// WC-B: bind (or re-confirm) the caller's compat window — the window-table half of `SYS_FB_MAP`. The
@@ -9493,16 +9492,39 @@ fn sys_win_create(w: u64, h: u64) -> i64 {
 /// Runs the SAME body as `SYS_FB_PRESENT`, so the UVUG-8r2 focus-scoped present bump — the input the
 /// suspension cap in `run_user_image` reads — happens here too, under the same focus guard. A window verb
 /// that skipped it would hand a focused app a way to render forever without counting as progress.
+///
+/// WC-B (F2): the ownership check, the geometry snapshot AND the present itself run under ONE continuous
+/// hold of the window table lock — unlike `SYS_WIN_MOVE`/`_CLOSE`, which only need a re-check because the
+/// value they write is re-validated at the moment it lands. Resolving the row, dropping the lock, then
+/// presenting would leave a real window: a `SYS_WIN_CLOSE` + `SYS_WIN_CREATE` pair on other cores can
+/// recycle this id to a DIFFERENT process in the gap, and the composite would then land the caller's
+/// pixels under the new owner's window identity. Holding across the composite is what makes the id the
+/// compositor is handed provably still the id we validated. The cost is a bounded blit inside an
+/// IRQ-masked spinlock — the same class of hold the MMU maintenance in create/close already takes, and
+/// bounded by the 64 KiB surface cap.
+///
+/// LOCK ORDER for the integrator: `WINDOWS` is a LEAF lock here, and `video::wm`'s own state is acquired
+/// strictly INSIDE it (`wc_shim::present` is called with `WINDOWS` held, never the reverse). Nothing under
+/// `wm` may call back into a window verb.
 fn sys_win_present(win: u64) -> i64 {
     let asid = match win_caller_slot() {
         Ok(v) => v,
         Err(e) => return e,
     };
-    let (id, e) = match win_resolve(asid, win) {
-        Ok(v) => v,
-        Err(err) => return err,
-    };
+    if win >= WIN_MAX as u64 {
+        return EBADF;
+    }
+    let id = win as usize;
     let slot = (asid - 1) as usize;
+    let _irq = IrqGuard::mask_save();
+    let t = WINDOWS.lock();
+    if t[id].owner == 0 {
+        return EBADF;
+    }
+    if t[id].owner != asid {
+        return EACCES;
+    }
+    let e = t[id];
     let surf = super::boot::slot_fb_win_surface_ptr(slot, e.rslot as usize);
     present_surface_common(
         asid,
@@ -9513,6 +9535,7 @@ fn sys_win_present(win: u64) -> i64 {
         e.pages as usize * 0x1000,
         Some(id),
     );
+    drop(t);
     0
 }
 
