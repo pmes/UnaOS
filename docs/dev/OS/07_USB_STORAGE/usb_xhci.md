@@ -386,6 +386,65 @@ Witness lines: `:: PIUSB: [piusb36] step<N>-<label> buf=… CSW=… residue=… 
 run reads the verdicts as the decision tree — step 2 splits never-lands from lands-zeros,
 step 6 confirms/refutes the posted-write race, steps 3–5 localize region/threshold/TD-shape.
 
+### 5d. PIUSB-37 — chase the command into the CBW/sense (read-only)
+
+With §5a–§5c pointing away from our transport, `piusb37_matrix` (aarch64-only, read-only)
+corners the residual on the SCSI-command side in one boot: (1) a **CBW audit** — build the
+exact 31-byte CBW and spec-check every field + decode the READ(10) CDB (a wrong LUN,
+byte-swapped LBA, or zero blocks each produce the same zeros+`Passed` signature); (2) a
+command-set / known-nonzero-LBA matrix (READ(10) of LBA 8192/16384, plus READ(12)/READ(16)
+of LBA0); (3) **REQUEST SENSE** immediately after a zeros-read (a pending UNIT ATTENTION,
+key 0x06, is the bridge-returns-zeros-then-GOOD candidate); (4) a **TUR drain + retry**.
+The P47 capture read the CBW as **byte-perfect** (`command is NOT the fault`) and LBA
+8192/16384 returned real non-zero data with `residue 0` — proving the transport/DMA/BOT are
+sound and the wedge is confined to the low-LBA region — while READ(12)/READ(16) STALLed
+(unsupported by the bridge, expected). Witness: `:: PIUSB: [piusb37] … ::`.
+
+### 5e. PIUSB-38 — BOT stall recovery + event-ring resilience + low-LBA bisect
+
+The P47 boot exposed the real defect the §5d probes uncovered: after the READ(12)/READ(16)
+STALLs, **every** later command on the storage slot — REQUEST SENSE, TEST UNIT READY (×8),
+the retry READ(10) — **timed out**. The bulk pipe halted and never recovered: our stack ran
+a per-endpoint clear-stall but never completed BOT **Reset Recovery**, so the device and host
+BOT state machines stayed out of phase and the storage slot's transfer events stopped. (HID
+recovered independently via a hub re-enumeration in the same boot, so the interrupter was
+**not** globally wedged — the shared single-owner event drain kept advancing ERDP and
+clearing `IMAN.IP` for HID; only the storage slot's *transfer* path was dead.)
+
+**Stall recovery (`bot_transfer` + `recover_bot_full`).** On a bulk STALL/Babble the driver
+now follows the USB Mass-Storage Bulk-Only Reset-Recovery contract:
+
+- **Data-phase stall (§6.7.2):** clear the halt on the bulk pipe (`recover_bulk_stall`:
+  Reset Endpoint → Set TR Dequeue → device CLEAR_FEATURE(ENDPOINT_HALT)), then **still
+  collect the CSW** so both state machines resync — the device stalled the data, not the
+  command, so it is in its status phase and returns a `Failed` CSW. Skipping this CSW was the
+  P47 wedge.
+- **Status-phase stall, or a data-phase stall whose CSW also fails (§6.7.3 / §5.3.4):**
+  escalate to **full Reset Recovery** (`recover_bot_full`): a **Bulk-Only Mass Storage Reset**
+  (class request `bmRequestType 0x21`, `bRequest 0xFF`, `wIndex =` the captured MSC
+  `bInterfaceNumber` — `DeviceSlot::storage_intf`), then Reset-Endpoint + Set-TR-Dequeue +
+  CLEAR_FEATURE(ENDPOINT_HALT) on **both** bulk endpoints. Host and device toggles/ring
+  dequeues realign, so the next CBW starts clean.
+
+**Event-ring resilience.** Error/stall transfer TRBs are dispatched through the same single
+`drain_event_ring_once` owner as every other event, which advances the ERDP and clears
+`IMAN.IP` **unconditionally** after each `handle_event_trb` — so one bad pipe can never starve
+the interrupter, and recovery (which itself pumps the event ring via the synchronous command /
+control paths) lets unrelated HID `xHCI: KEY` events keep draining during an induced storage
+stall.
+
+**Low-LBA bisect.** `piusb38_matrix` (aarch64-only, read-only) then proves recovery and
+localizes the §5c/§5d wedge in one boot: it (1) **induces** a stall (READ(16)) and confirms
+TEST UNIT READY + REQUEST SENSE **complete** afterwards (`PIPE RECOVERED`), (2) exercises
+`recover_bot_full` explicitly and re-proves TUR, and (3) reads a ladder **LBA 0,1,2,4,…,8192**
+(same READ(10) CDB shape, only the LBA field varies) with a per-LBA zeros/data verdict, then
+reports the zeros→data **boundary** and the first byte at which LBA0 and LBA8192 differ.
+Because only the LBA field changes, any zeros-vs-data split is **region-specific, not a
+command-shape fault** (null-hypothesis-our-code: a buffer/cache/aliasing effect on the low
+region). Witness: `:: PIUSB: [piusb38] … ::`. Inert on QEMU raspi4b (no VL805 → no storage
+slot); QEMU virt exercises the whole path (the full-reset TUR passes and the ladder reads real
+LBA0 data), byte-identical no-op on x86.
+
 ---
 
 ## 6. Enumeration robustness (metal-informed)

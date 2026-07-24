@@ -873,6 +873,11 @@ pub struct DeviceSlot {
     pub scsi_data_buffer: Option<*mut u8>, // data-stage buffer (>= one block)
     pub bulk_in_ep: u8,                    // bulk IN endpoint address (e.g. 0x81)
     pub bulk_out_ep: u8,                   // bulk OUT endpoint address (e.g. 0x02)
+    /// bInterfaceNumber of the Mass-Storage interface (SCSI Bulk-Only). This is the `wIndex` a
+    /// Bulk-Only Mass Storage Reset (`recover_bot_full`, PIUSB-38) targets. Captured in the config
+    /// walk when the class-0x08 interface is detected; 0 until then (the near-universal single-
+    /// interface stick, so 0 is also a safe default when the walk didn't record it).
+    pub storage_intf: u8,
 
     // --- XENUM-2: hub Status Change Endpoint (hot-plug behind a hub) ---
     /// True once this slot has been marked as a USB hub (set in `set_hub_slot_context`). Lets the
@@ -948,6 +953,7 @@ impl DeviceSlot {
             scsi_data_buffer: None,
             bulk_in_ep: 0,
             bulk_out_ep: 0,
+            storage_intf: 0,
             is_hub: false,
             hub_nbr_ports: 0,
             hub_int_ep: 0,
@@ -1974,6 +1980,10 @@ impl XhciController {
                                                     // collect its bulk endpoints below and configure after the walk.
                                                     serial_println!("xHCI: >>> MASS STORAGE INTERFACE DETECTED (Class 0x08) <<<");
                                                     is_mass_storage = true;
+                                                    // PIUSB-38: remember the MSC bInterfaceNumber
+                                                    // (descriptor byte +2) — the `wIndex` a Bulk-Only
+                                                    // Mass Storage Reset targets during reset recovery.
+                                                    self.slots[slot_id as usize].storage_intf = desc_data[offset + 2];
                                                 } else if current_intf_class == 0xFF {
                                                     // U2.5: a vendor-specific interface. The FTDI FT232 (device
                                                     // class 0x00 → Composite branch) exposes exactly one such
@@ -3920,6 +3930,10 @@ impl XhciController {
         let in_dci = ((in_addr & 0x0F) * 2) + 1;
         let out_dci = (out_addr & 0x0F) * 2;
 
+        // PIUSB-38: latched when the data stage halts (STALL/Babble). It steers the status stage
+        // into Reset Recovery: on a data-phase stall we still collect the CSW (resync), and if the
+        // CSW itself fails we escalate to a full Bulk-Only Mass Storage Reset.
+        let mut data_stalled = false;
         let tag = self.build_cbw(cbw_phys as *mut u8, data_len, dir, cdb);
         unsafe { core::ptr::write_bytes(csw_phys as *mut u8, 0, 13); }
         // XHCI-COHERENCE: the CBW is CPU-written and DMA-read by the controller (bulk OUT) — clean it
@@ -3978,17 +3992,26 @@ impl XhciController {
             if code != 1 && code != 13 {
                 serial_println!("xHCI: BOT data stage error, completion code {}", code);
                 if code == 4 || code == 6 {
-                    // USB-WRITE-2: the data endpoint halted (STALL/Babble). Recover the pipe NOW so
-                    // this faulted transfer cannot poison every later BOT command on the same slot.
+                    // PIUSB-38 / USB MSC BOT §6.7.2 (Reset Recovery, data-phase stall): the data
+                    // endpoint halted (STALL/Babble). Clear the halt on this bulk pipe, then STILL
+                    // proceed to the status stage below to collect the CSW — the device stalled the
+                    // DATA phase, not the command, so it is in its status phase and returns a Failed
+                    // CSW; reading it resynchronises both BOT state machines so the NEXT command
+                    // starts clean. An unrecovered data-phase stall that skipped the CSW was the P47
+                    // wedge (every later READ/SENSE/TUR on the slot then timed out). If the status
+                    // stage ALSO fails, we escalate to a full Bulk-Only reset below.
                     self.recover_bulk_stall(slot_id, !data_out);
-                    return Err(BotError::Stall);
+                    data_stalled = true;
+                } else {
+                    return Err(BotError::TransferError(code));
                 }
-                return Err(BotError::TransferError(code));
             }
             // XHCI-COHERENCE: consumer boundary — an IN data stage's buffer was DMA-written by the
             // controller; invalidate it here (ONE chokepoint for every SCSI IN reader: INQUIRY,
-            // READ CAPACITY, block reads) so callers parse fresh DRAM. No-op x86.
-            if !data_out {
+            // READ CAPACITY, block reads) so callers parse fresh DRAM. No-op x86. Skip after a
+            // data-phase stall: the buffer holds no valid transfer, and the CSW below carries the
+            // real (Failed) verdict.
+            if !data_out && !data_stalled {
                 dma_coherency::inval(data_phys as usize, data_len as usize);
             }
         } else {
@@ -4006,13 +4029,26 @@ impl XhciController {
         };
         self.ring_doorbell(slot_id, in_dci as u32);
 
-        let code = self.run_bot_stage(slot_id, in_dci, out_dci, csw_trb_phys)?;
+        // PIUSB-38: if the status stage cannot even complete (times out) after a data-phase stall,
+        // the pipe is wedged — escalate to full Bulk-Only Reset Recovery before surfacing the error
+        // so the next command is not born onto a dead pipe.
+        let code = match self.run_bot_stage(slot_id, in_dci, out_dci, csw_trb_phys) {
+            Ok(c) => c,
+            Err(e) => {
+                if data_stalled { self.recover_bot_full(slot_id); }
+                return Err(e);
+            }
+        };
         if code != 1 && code != 13 {
             serial_println!("xHCI: BOT transfer error, completion code {}", code);
             if code == 4 || code == 6 {
-                // USB-WRITE-2: the CSW rides the bulk IN pipe; a halt here leaves the IN endpoint
-                // dead. Recover it before returning so subsequent reads/writes aren't poisoned.
+                // PIUSB-38 / USB MSC BOT §6.7.3 (status-phase stall): the CSW rides the bulk IN pipe;
+                // a halt here — or a status-phase halt after the data phase already stalled — leaves
+                // the IN endpoint dead. Clear this endpoint's halt, then perform FULL Bulk-Only Reset
+                // Recovery (device BOT reset + clear BOTH halts) so both state machines resync and no
+                // later command inherits the wedge.
                 self.recover_bulk_stall(slot_id, true);
+                self.recover_bot_full(slot_id);
                 return Err(BotError::Stall);
             }
             return Err(BotError::TransferError(code));
@@ -4030,10 +4066,14 @@ impl XhciController {
 
             if sig != 0x53425355 {
                 serial_println!("xHCI: BOT bad CSW signature {:#x}", sig);
+                // PIUSB-38: a garbage CSW after a data-phase stall means the resync attempt did not
+                // land a valid status — the pipe is out of phase, so do full Reset Recovery.
+                if data_stalled { self.recover_bot_full(slot_id); }
                 return Err(BotError::BadCswSignature);
             }
             if csw_tag != tag {
                 serial_println!("xHCI: BOT CSW tag mismatch (got {:#x}, want {:#x})", csw_tag, tag);
+                if data_stalled { self.recover_bot_full(slot_id); }
                 return Err(BotError::TagMismatch);
             }
             let status = match bstatus {
@@ -4465,6 +4505,131 @@ impl XhciController {
         serial_println!(":: PIUSB: [piusb37] === chase-the-command matrix complete === ::");
     }
 
+    // ==================== PIUSB-38: stall recovery + low-LBA-zeros bisect ====================
+
+    /// PIUSB-38: prove BOT Reset Recovery on the storage pipe, then run the low-LBA-zeros bisect.
+    /// Three read-only phases in one boot (each witnessed `:: PIUSB: [piusb38] ... ::`):
+    ///
+    ///   * **Phase 1 — induced-stall recovery.** Issue an UNSUPPORTED command (READ(16), opcode
+    ///     0x88) which the bench VL805 stick STALLs (completion code 4). `bot_transfer` now runs
+    ///     BOT Reset Recovery inline (clear the halt, collect the CSW to resync, escalate to a full
+    ///     Bulk-Only Mass Storage Reset if the status phase also fails). We then prove the pipe is
+    ///     ALIVE: TEST UNIT READY and REQUEST SENSE must COMPLETE (not Timeout) afterwards. Pre-P48
+    ///     the stall left the pipe wedged and every later command timed out (the P47 wall).
+    ///   * **Phase 2 — explicit full reset.** Call `recover_bot_full` directly and re-prove TUR, so
+    ///     the class-level reset path is exercised end to end even when Phase 1's inline recovery
+    ///     already sufficed.
+    ///   * **Phase 3 — low-LBA-zeros bisect.** Read a ladder LBA 0,1,2,4,8,…,8192 (same READ(10)
+    ///     CDB shape, only the LBA field differs), each with a zeros/data verdict + residue, to find
+    ///     the zeros→data boundary; then diff the LBA0 vs LBA8192 buffers (first differing byte).
+    ///     Because only the LBA field changes, any zeros-vs-data split is region-specific, not a
+    ///     command-shape fault (null-hypothesis-our-code: a buffer/cache/aliasing effect on the low
+    ///     region, not the SCSI command).
+    ///
+    /// Read-only (no WRITE(10)); bounded (≈20 transfers + a couple of resets). aarch64-only; never
+    /// compiled on x86. Inert in QEMU raspi4b (no VL805 → no storage slot); virt exercises every
+    /// step (READ(16) may be supported there — the recovery path stays correct either way).
+    #[cfg(target_arch = "aarch64")]
+    fn piusb38_matrix(&mut self) {
+        let slot = self.storage_slot;
+        if slot == 0 { serial_println!(":: PIUSB: [piusb38] no storage slot — matrix skipped ::"); return; }
+        let databuf = match self.slots[slot as usize].scsi_data_buffer {
+            Some(p) => p as u64,
+            None => { serial_println!(":: PIUSB: [piusb38] no scsi_data_buffer — matrix skipped ::"); return; }
+        };
+
+        serial_println!(":: PIUSB: [piusb38] === stall-recovery + low-LBA bisect (read-only, one boot) === ::");
+
+        // --- Phase 1: induce a stall, then prove the pipe recovered. ---
+        // READ(16), opcode 0x88, LBA0, 1 block — unsupported by many bulk bridges (STALL, code 4).
+        let read16_lba0 = [0x88u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0];
+        unsafe { core::ptr::write_bytes(databuf as *mut u8, 0xA5, 512); }
+        match self.bot_transfer(slot, &read16_lba0, databuf, 512, Direction::In) {
+            Ok(r) => serial_println!(
+                ":: PIUSB: [piusb38] induced-read16 CSW={:?} residue={} (no stall — device accepted READ16) ::",
+                r.status, r.residue),
+            Err(BotError::Stall) => serial_println!(
+                ":: PIUSB: [piusb38] induced-read16 STALL — inline BOT reset-recovery ran ::"),
+            Err(e) => serial_println!(":: PIUSB: [piusb38] induced-read16 ERR {:?} (recovery ran) ::", e),
+        }
+        // The pipe must be ALIVE now: TUR + REQUEST SENSE must COMPLETE (not Timeout).
+        let tur1 = self.scsi_test_unit_ready(slot);
+        let sense_cdb = [0x03u8, 0, 0, 0, 18, 0];
+        unsafe { core::ptr::write_bytes(databuf as *mut u8, 0, 18); }
+        let sense1 = self.bot_transfer(slot, &sense_cdb, databuf, 18, Direction::In);
+        let recovered = !matches!(tur1, Err(BotError::Timeout))
+            && !matches!(sense1, Err(BotError::Timeout));
+        serial_println!(
+            ":: PIUSB: [piusb38] post-stall TUR={:?} REQUEST-SENSE={:?} — {} ::",
+            tur1, sense1.as_ref().map(|r| r.status),
+            if recovered { "PIPE RECOVERED (TUR+SENSE completed — stall no longer wedges the pipe)" }
+            else { "PIPE STILL WEDGED (a command timed out after the stall)" });
+
+        // --- Phase 2: exercise the full Bulk-Only Reset Recovery path explicitly, then re-prove. ---
+        self.recover_bot_full(slot);
+        let tur2 = self.scsi_test_unit_ready(slot);
+        serial_println!(
+            ":: PIUSB: [piusb38] post-full-reset TUR={:?} — {} ::",
+            tur2,
+            if matches!(tur2, Err(BotError::Timeout)) { "pipe dead after full reset" }
+            else { "pipe alive after full Bulk-Only Reset Recovery" });
+
+        // --- Phase 3: low-LBA-zeros bisect. Read ladder; find the zeros→data boundary. ---
+        let ladder: [u32; 15] = [0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192];
+        let mut first_data_lba: Option<u32> = None;
+        let mut last_zero_lba: Option<u32> = None;
+        let mut lba0_first16 = [0u8; 16];
+        let mut lba8192_first16 = [0u8; 16];
+        for &lba in &ladder {
+            let cdb = [0x28u8, 0,
+                (lba >> 24) as u8, (lba >> 16) as u8, (lba >> 8) as u8, lba as u8,
+                0, 0, 1, 0]; // READ(10), 1 block
+            unsafe { core::ptr::write_bytes(databuf as *mut u8, 0xA5, 512); }
+            match self.bot_transfer(slot, &cdb, databuf, 512, Direction::In) {
+                Ok(r) => {
+                    let d = unsafe { core::slice::from_raw_parts(databuf as *const u8, 16) };
+                    let all_zero = d.iter().all(|&b| b == 0);
+                    let all_a5 = d.iter().all(|&b| b == 0xA5);
+                    let verdict = if all_a5 { "PATTERN-SURVIVED(device-never-wrote)" }
+                        else if all_zero { "ZEROS" } else { "DATA(real-bytes-landed)" };
+                    if lba == 0 { lba0_first16.copy_from_slice(d); }
+                    if lba == 8192 { lba8192_first16.copy_from_slice(d); }
+                    if !all_zero && !all_a5 && first_data_lba.is_none() { first_data_lba = Some(lba); }
+                    if all_zero { last_zero_lba = Some(lba); }
+                    serial_println!(
+                        ":: PIUSB: [piusb38] ladder-lba{} CSW={:?} residue={} verdict={} — {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
+                        lba, r.status, r.residue, verdict,
+                        d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7],
+                        d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15]);
+                }
+                Err(e) => serial_println!(":: PIUSB: [piusb38] ladder-lba{} ERR {:?} ::", lba, e),
+            }
+        }
+        // Boundary verdict.
+        match (last_zero_lba, first_data_lba) {
+            (Some(z), Some(d)) => serial_println!(
+                ":: PIUSB: [piusb38] bisect boundary: last-zeros=LBA{} first-data=LBA{} — zeros→data split IS region-specific (same CDB shape) ::", z, d),
+            (Some(z), None) => serial_println!(
+                ":: PIUSB: [piusb38] bisect boundary: ALL ladder LBAs zeros (last=LBA{}) — no data landed on any low LBA ::", z),
+            (None, Some(d)) => serial_println!(
+                ":: PIUSB: [piusb38] bisect boundary: data from the first LBA (LBA{}) — no low-LBA zeros this boot ::", d),
+            (None, None) => serial_println!(
+                ":: PIUSB: [piusb38] bisect boundary: no zeros and no data (pattern survived / errors) — see per-LBA lines ::"),
+        }
+        // Diff LBA0 vs LBA8192 (same READ(10) shape, only the LBA field differs).
+        let first_diff = (0..16).find(|&i| lba0_first16[i] != lba8192_first16[i]);
+        match first_diff {
+            Some(i) => serial_println!(
+                ":: PIUSB: [piusb38] lba0-vs-lba8192 diff: first differ at byte {} (lba0={:#04x} lba8192={:#04x}) — identical command path, divergent data ⇒ region/buffer effect not command-shape ::",
+                i, lba0_first16[i], lba8192_first16[i]),
+            None => serial_println!(
+                ":: PIUSB: [piusb38] lba0-vs-lba8192 diff: first-16 IDENTICAL (both {}) ::",
+                if lba0_first16.iter().all(|&b| b == 0) { "zeros" } else { "equal-nonzero" }),
+        }
+
+        serial_println!(":: PIUSB: [piusb38] === stall-recovery + low-LBA bisect complete === ::");
+    }
+
     /// USB-WRITE-2: recover a halted bulk endpoint after a STALL (completion code 4) or Babble
     /// (6) so one faulted transfer cannot dead-line every later BOT command on the slot. This is
     /// the standard USB BOT clear-stall sequence, host + device side:
@@ -4485,12 +4650,33 @@ impl XhciController {
             if ep_in { slot.bulk_in_ep } else { slot.bulk_out_ep }
         };
         if ep_addr == 0 { return; }
-        let dci: u32 = if ep_in {
-            (((ep_addr as u32) & 0x0F) * 2) + 1
-        } else {
-            ((ep_addr as u32) & 0x0F) * 2
-        };
+        let dci = ((ep_addr as u32) & 0x0F) * 2 + if ep_in { 1 } else { 0 };
         serial_println!("xHCI: [usbw] bulk STALL recovery slot {} ep {:#04x} (dci {})", slot_id, ep_addr, dci);
+
+        // 1+2) Host-side: Reset Endpoint (Halted -> Stopped) + Set TR Dequeue past the faulted TRB.
+        self.reset_bulk_endpoint_host(slot_id, ep_in);
+
+        // 3) Device-side CLEAR_FEATURE(ENDPOINT_HALT) on EP0. wIndex carries the full endpoint
+        //    address (with the direction bit for an IN endpoint).
+        match self.sync_control(slot_id, 0x02, 0x01, 0x0000, ep_addr as u16, 0, 0, false) {
+            Ok(1) => {}
+            other => serial_println!("xHCI: [usbw] CLEAR_FEATURE(HALT) unexpected {:?}", other),
+        }
+    }
+
+    /// Host-side half of clearing a halted bulk endpoint: **Reset Endpoint** (command TRB type 14,
+    /// Halted -> Stopped, clears the host data-toggle/sequence) then **Set TR Dequeue Pointer**
+    /// (command TRB type 16, repoints the transfer ring past the faulted TRB). Shared by the
+    /// per-endpoint `recover_bulk_stall` and the class-level `recover_bot_full` (PIUSB-38) so both
+    /// resync the host ring state identically. Best-effort + logged; the caller issues the device-
+    /// side CLEAR_FEATURE(ENDPOINT_HALT) that pairs with it.
+    fn reset_bulk_endpoint_host(&mut self, slot_id: u8, ep_in: bool) {
+        let ep_addr = {
+            let slot = &self.slots[slot_id as usize];
+            if ep_in { slot.bulk_in_ep } else { slot.bulk_out_ep }
+        };
+        if ep_addr == 0 { return; }
+        let dci: u32 = ((ep_addr as u32) & 0x0F) * 2 + if ep_in { 1 } else { 0 };
 
         // 1) Reset Endpoint: Halted -> Stopped, clears host sequence/toggle.
         let reset_trb = Trb { parameter: 0, status: 0,
@@ -4514,12 +4700,47 @@ impl XhciController {
                 other => serial_println!("xHCI: [usbw] Set TR Dequeue unexpected {:?}", other),
             }
         }
+    }
 
-        // 3) Device-side CLEAR_FEATURE(ENDPOINT_HALT) on EP0. wIndex carries the full endpoint
-        //    address (with the direction bit for an IN endpoint).
-        match self.sync_control(slot_id, 0x02, 0x01, 0x0000, ep_addr as u16, 0, 0, false) {
-            Ok(1) => {}
-            other => serial_println!("xHCI: [usbw] CLEAR_FEATURE(HALT) unexpected {:?}", other),
+    /// PIUSB-38: FULL BOT **Reset Recovery** — the class-level escalation the USB Mass-Storage
+    /// Bulk-Only Transport spec (§5.3.4) prescribes when clearing one endpoint's halt does not
+    /// un-wedge the pipe (the P47 wall: after an unrecovered stall on the storage slot, every later
+    /// READ / REQUEST-SENSE / TEST-UNIT-READY on that pipe timed out — the bulk pipe halted and
+    /// never recovered, while HID kept flowing, so the interrupter was NOT globally wedged; the
+    /// transfer path of the storage slot alone was dead). The sequence:
+    ///   1. **Bulk-Only Mass Storage Reset** — class request `bmRequestType 0x21` (host->device,
+    ///      class, interface), `bRequest 0xFF`, `wValue 0`, `wIndex = bInterfaceNumber`, no data.
+    ///      Resets the device's BOT state machine (it re-synchronises to expect a fresh CBW).
+    ///   2. For each bulk endpoint (IN, then OUT): host-side Reset Endpoint + Set TR Dequeue
+    ///      (`reset_bulk_endpoint_host`), then device-side CLEAR_FEATURE(ENDPOINT_HALT). Clearing
+    ///      both halts + resetting both host toggles leaves host and device agreeing on toggle and
+    ///      ring dequeue, so the NEXT CBW starts clean.
+    /// Best-effort: each step logs but the sequence proceeds — a device that NAKs one step must not
+    /// block the others. Runs in the same safe synchronous polled context as the BOT pump itself.
+    fn recover_bot_full(&mut self, slot_id: u8) {
+        let (in_ep, out_ep, intf) = {
+            let s = &self.slots[slot_id as usize];
+            (s.bulk_in_ep, s.bulk_out_ep, s.storage_intf)
+        };
+        serial_println!(
+            "xHCI: [usbw] FULL BOT reset-recovery slot {} (intf {}, bulk in {:#04x}/out {:#04x})",
+            slot_id, intf, in_ep, out_ep);
+
+        // 1) Bulk-Only Mass Storage Reset (class, targets the MSC interface).
+        match self.sync_control(slot_id, 0x21, 0xFF, 0x0000, intf as u16, 0, 0, false) {
+            Ok(1) => serial_println!("xHCI: [usbw] Bulk-Only Mass Storage Reset OK (slot {})", slot_id),
+            other => serial_println!("xHCI: [usbw] Bulk-Only Mass Storage Reset unexpected {:?}", other),
+        }
+
+        // 2) Clear both bulk halts (host ring reset + device CLEAR_FEATURE) — IN first, then OUT.
+        for ep_in in [true, false] {
+            let ep_addr = if ep_in { in_ep } else { out_ep };
+            if ep_addr == 0 { continue; }
+            self.reset_bulk_endpoint_host(slot_id, ep_in);
+            match self.sync_control(slot_id, 0x02, 0x01, 0x0000, ep_addr as u16, 0, 0, false) {
+                Ok(1) => {}
+                other => serial_println!("xHCI: [usbw] CLEAR_FEATURE(HALT) ep {:#04x} unexpected {:?}", ep_addr, other),
+            }
         }
     }
 
@@ -4971,6 +5192,13 @@ impl XhciController {
         // piusb36 matrix so it sits on the same enumerated slot.
         #[cfg(target_arch = "aarch64")]
         self.piusb37_matrix();
+
+        // PIUSB-38: prove BOT Reset Recovery (induce a stall, then TUR/REQUEST-SENSE must still
+        // complete — the P47 wedge fix) and run the low-LBA-zeros bisect (read ladder 0..8192,
+        // zeros→data boundary, LBA0-vs-LBA8192 diff). Read-only; aarch64 witness only (no-op on
+        // x86). Runs after piusb37 on the same enumerated slot, before the write self-test.
+        #[cfg(target_arch = "aarch64")]
+        self.piusb38_matrix();
 
         // USB-WRITE: prove the BOT WRITE(10) OUT path on the enumerated stick with a
         // read-modify-write-restore of one scratch sector (byte-identical afterward).
@@ -6378,13 +6606,14 @@ impl XhciController {
         // at the device level — the interface descriptor is the only place to detect it. This
         // used to be HID-only, leaving a hubbed MSC device `other/unconfigured` forever (the
         // photographed metal failure). One storage device is supported, mirroring the root path.
-        if let Some(((in_addr, in_mps), (out_addr, out_mps))) = self.parse_msc_config(buf) {
+        if let Some(((in_addr, in_mps), (out_addr, out_mps), msc_intf)) = self.parse_msc_config(buf) {
             serial_println!(
                 "xHCI: >>> HUB DOWNSTREAM MASS STORAGE (slot {}, bulk in {:#x}/{} out {:#x}/{}) <<<",
                 slot_id, in_addr, in_mps, out_addr, out_mps);
             if self.storage_slot != 0 {
                 serial_println!("xHCI: storage slot {} already active; ignoring the hubbed device.", self.storage_slot);
             } else if self.configure_bulk_endpoints_sync(slot_id, in_addr, in_mps, out_addr, out_mps) {
+                self.slots[slot_id as usize].storage_intf = msc_intf; // PIUSB-38 reset-recovery wIndex
                 // Defer SET_CONFIGURATION + SCSI bring-up to service_storage (same main-loop
                 // context, next hook) — identical hand-off to the root path's async completion.
                 self.storage_slot = slot_id;
@@ -6409,12 +6638,16 @@ impl XhciController {
     /// Parse a configuration descriptor (in `buf`) for a Mass-Storage-Class interface
     /// (bInterfaceClass 0x08 — matched at ANY subclass/protocol, like the root path) and collect
     /// its bulk IN/OUT endpoint pair. Returns ((in_addr, in_mps), (out_addr, out_mps)) or None.
-    fn parse_msc_config(&self, buf: u64) -> Option<((u8, u16), (u8, u16))> {
+    fn parse_msc_config(&self, buf: u64) -> Option<((u8, u16), (u8, u16), u8)> {
         unsafe {
             let p = buf as *const u8;
             let total = ((*p.add(2) as usize) | ((*p.add(3) as usize) << 8)).min(64);
             let mut off = 0usize;
             let mut in_msc = false;
+            // PIUSB-38: the MSC bInterfaceNumber (descriptor byte +2) — the Bulk-Only Mass Storage
+            // Reset `wIndex`. Captured when the class-0x08 interface is seen so reset recovery
+            // targets the right interface for a hub-downstream stick.
+            let mut msc_intf: u8 = 0;
             let mut bulk_in: Option<(u8, u16)> = None;
             let mut bulk_out: Option<(u8, u16)> = None;
             while off + 2 <= total {
@@ -6423,6 +6656,7 @@ impl XhciController {
                 if len == 0 { break; }
                 if dtype == 0x04 && off + 8 <= total {
                     in_msc = *p.add(off + 5) == 0x08;
+                    if in_msc { msc_intf = *p.add(off + 2); }
                 } else if dtype == 0x05 && in_msc && off + 6 <= total {
                     let ep_addr = *p.add(off + 2);
                     let attr = *p.add(off + 3);
@@ -6439,7 +6673,7 @@ impl XhciController {
                 off += len;
             }
             match (bulk_in, bulk_out) {
-                (Some(i), Some(o)) => Some((i, o)),
+                (Some(i), Some(o)) => Some((i, o, msc_intf)),
                 _ => None,
             }
         }
