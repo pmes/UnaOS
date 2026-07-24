@@ -559,12 +559,20 @@ established are the ones to preserve:
   shim therefore keys on the row's `compat` flag — a property no recycled row can accidentally have —
   and re-checks it under the lock. (A generation-widened `WinId` was the alternative; the flag is
   exact for this hazard and keeps the id a plain slot number for WC-B's syscall ABI.)
-- **Teardown drains in-flight blits.** `composite` registers itself as in-flight *while holding the
-  table lock*, so the registration is ordered against any later teardown's own lock acquisition.
-  `close`/`close_owner` clear the rows, then spin until that count reaches zero before returning.
-  Any composite starting after the clear cannot see the doomed rows; only one that snapshotted
-  earlier can still be reading those surfaces, and that is exactly what the drain waits for. Today
-  the race is a stale read; under WC-B's per-ASID surface mappings it becomes an EL1 abort mid-blit.
+- **Teardown drains in-flight blits, behind a phase barrier.** `composite` checks a drain flag and
+  registers itself as in-flight in the *same* table-lock critical section, so both are ordered
+  against any later teardown's lock acquisition. `close`/`close_owner` clear their rows, raise the
+  barrier, and spin until the in-flight count reaches zero. A composite that takes the lock while the
+  barrier is up skips entirely — correct, since the rows it would have drawn are gone and teardown
+  recomposites when it is done, and *necessary*, because it is what makes the wait terminate: the
+  in-flight count can only fall while the barrier is up. A plain "wait for idle" loop would not
+  terminate under continuous presents, and the teardown path (`sched::exit` → `clear_handle_row` →
+  `close_owner`) spins IRQ-masked and unpreemptible, so that livelock would be a dead core rather
+  than a slow one. Today the underlying race is a stale read; under WC-B's per-ASID surface mappings
+  it becomes an EL1 abort mid-blit.
+- **The compat window's check-and-create is serialised.** `COMPAT_WIN` alone is check-then-act: two
+  `SYS_FB_PRESENT`s on different cores could each create a compat row, and the loser's would be an
+  ownerless, unreferenced window nothing can close — F3 again, through a race.
 - **The compat window has a lifecycle.** It has no owner ASID, so `close_owner` can never reap it;
   `wm::close_compat()` exists for that and WC-B must call it from the EL0 teardown seam. Otherwise
   the row is immortal and every later composite re-blits a dead app's buffer.

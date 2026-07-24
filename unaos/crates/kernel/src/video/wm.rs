@@ -223,6 +223,11 @@ pub fn create(
 /// one table row instead of leaking one per frame.
 static COMPAT_WIN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(WIN_NONE);
 
+/// Serialises the compat window's check-and-create so concurrent presents cannot each create one
+/// (the loser's row would be ownerless and unreachable — an immortal window). Never held while the
+/// table lock is held.
+static COMPAT_CREATE: Mutex<()> = Mutex::new(());
+
 /// WC-A — the compat path for [`super::screen::present_surface`] (`SYS_FB_PRESENT`, pre-window
 /// apps). Creates the auto window on first call and thereafter updates it in place, then composites.
 ///
@@ -240,10 +245,14 @@ pub(super) fn compat_present(
     y: usize,
 ) {
     use core::sync::atomic::Ordering;
-    // F1 — the compat path's extent is not EL0-supplied: `present_surface` is called from the
-    // `SYS_FB_PRESENT` hook with the kernel's own `boot::FB_SURFACE_*` constants, so `h * stride` IS
-    // the mapped slot's length. Passing it explicitly keeps the row's bound honest and lets the same
-    // clamp in `draw_window` cover both paths.
+    // F1 — the compat path's dimensions are NOT EL0-supplied: `present_surface` is reached through
+    // the `SYS_FB_PRESENT` hook, which passes the kernel's own `boot::FB_SURFACE_*` constants. The
+    // hook signature carries no slot length, so the tightest bound available here is the extent those
+    // constants describe. That makes `surf_len` a restatement of `h * stride` rather than an
+    // independent bound — it is what lets `draw_window`'s single `surf_len`-derived clamp cover both
+    // paths, not a validation of this path. The real check for the compat row is `w * 4 <= stride`
+    // below; the slot-length check is the one that has teeth on `create`, where the length comes from
+    // the mapping code.
     let surf_len = h.saturating_mul(stride);
 
     // F2 — ids are slot aliases with no generation, so "is this still MY window?" cannot be answered
@@ -253,14 +262,24 @@ pub(super) fn compat_present(
     // instead — the one property no recycled row can accidentally have (only `compat_present` ever
     // sets it). Chosen over widening `WinId` with a generation counter because the flag is exact for
     // this hazard and keeps the id a plain slot number for WC-B's syscall ABI.
-    let mut id = COMPAT_WIN.load(Ordering::Relaxed);
-    if id == WIN_NONE || !is_compat_row(id) {
-        id = create_inner(0, surf, surf_len, w, h, stride, b"", true);
-        if id == WIN_NONE {
-            return;
+    //
+    // The check-and-create is serialised: `COMPAT_WIN` alone would be check-then-act, and two
+    // `SYS_FB_PRESENT`s landing on different cores could each see no compat row and each create one.
+    // The loser's row would then be an ownerless, unreferenced window that nothing can ever close —
+    // re-opening F3 through a race. `COMPAT_CREATE` is taken ONLY here and never while holding the
+    // table lock, so it sits strictly outside the WRITER/TABLE ordering.
+    let id = {
+        let _claim = COMPAT_CREATE.lock();
+        let mut id = COMPAT_WIN.load(Ordering::Relaxed);
+        if id == WIN_NONE || !is_compat_row(id) {
+            id = create_inner(0, surf, surf_len, w, h, stride, b"", true);
+            if id == WIN_NONE {
+                return;
+            }
+            COMPAT_WIN.store(id, Ordering::Relaxed);
         }
-        COMPAT_WIN.store(id, Ordering::Relaxed);
-    }
+        id
+    };
     {
         let mut t = TABLE.lock();
         let r = match row_mut(&mut t, id) {
@@ -269,7 +288,8 @@ pub(super) fn compat_present(
             Some(r) if r.compat => r,
             _ => return,
         };
-        if w.saturating_mul(4) > stride || h.saturating_mul(stride) > surf_len {
+        // Rows-fit-slot is tautological here (see above); pixels-fit-stride is the real constraint.
+        if w.saturating_mul(4) > stride {
             return;
         }
         r.surf = surf;
@@ -380,12 +400,14 @@ pub fn close(id: WinId) -> bool {
             None => return false,
         }
     };
-    // F4 — same drain as `close_owner`: this row's surface may be under an in-flight blit.
-    drain_blits();
+    // F4 — same barrier as `close_owner`: this row's surface may be under an in-flight blit.
+    let barrier = DrainBarrier::drain();
     #[cfg(feature = "witness")]
     serial_println!("[wc-a] close win={}", id);
     erase(&[vacated]);
     place(WIN_NONE);
+    // Re-open the barrier before recompositing — a composite under a raised barrier is a no-op.
+    drop(barrier);
     composite();
     true
 }
@@ -410,14 +432,16 @@ pub fn close_owner(owner_asid: u64) -> usize {
         return 0;
     }
     // F4 — the rows are gone, but a composite on another core may have snapshotted them a moment ago
-    // and still be reading those surfaces. Drain before returning: the caller is about to unmap the
-    // ASID's memory, and today that would be a stale read, but under WC-B's per-ASID surface mappings
-    // it becomes an EL1 abort mid-blit.
-    drain_blits();
+    // and still be reading those surfaces. Raise the phase barrier and drain before returning: the
+    // caller is about to unmap the ASID's memory, and today that would be a stale read, but under
+    // WC-B's per-ASID surface mappings it becomes an EL1 abort mid-blit.
+    let barrier = DrainBarrier::drain();
     #[cfg(feature = "witness")]
     serial_println!("[wc-a] close_owner asid={:#x} closed={}", owner_asid, n);
     erase(&vacated[..n]);
     place(WIN_NONE);
+    // Re-open the barrier before recompositing — a composite under a raised barrier is a no-op.
+    drop(barrier);
     composite();
     n
 }
@@ -496,6 +520,13 @@ pub fn composite() {
     // before the clear and is still blitting from their (about to be unmapped) surfaces.
     let (rows, mut dirty, _blit) = {
         let mut t = TABLE.lock();
+        // F4 — the barrier, observed in the SAME critical section as the registration below. A
+        // teardown raises it after clearing its rows, so seeing it up means there is nothing of that
+        // ASID's left to draw and the teardown will recomposite when it finishes: skipping is both
+        // correct and what makes the drain terminate (`BLIT_ACTIVE` can only fall while it is up).
+        if DRAIN_PENDING.load(core::sync::atomic::Ordering::Acquire) != 0 {
+            return;
+        }
         let mut dirty = [false; MAX_WINDOWS];
         for (i, r) in t.rows.iter_mut().enumerate() {
             dirty[i] = r.used && r.damaged;
@@ -578,15 +609,44 @@ impl Drop for BlitGuard {
     }
 }
 
-/// F4 — block until every composite that snapshotted the table BEFORE the caller's own row-clearing
-/// critical section has finished blitting. Called by teardown after it has cleared the rows and
-/// released the lock, so any composite starting from here on already sees the rows gone; only the
-/// ones that snapshotted earlier can still be reading the doomed surfaces, and this drains exactly
-/// those. Terminates: the set it waits on is finite and each member is making forward progress
-/// through a bounded, panel-clipped blit.
-fn drain_blits() {
-    while BLIT_ACTIVE.load(core::sync::atomic::Ordering::Acquire) != 0 {
-        core::hint::spin_loop();
+/// F4 — number of teardowns currently draining. Non-zero closes the barrier: a composite that sees
+/// it (under the table lock, where teardown also raises it) does not register and does not blit.
+static DRAIN_PENDING: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// F4 — a teardown's phase barrier, RAII so the barrier always re-opens. Raised by
+/// [`close`]/[`close_owner`] and dropped once the drain has completed.
+struct DrainBarrier;
+
+impl DrainBarrier {
+    /// Raise the barrier and wait out the composites that snapshotted before it went up.
+    ///
+    /// The caller must already have cleared its rows and released the table lock. Any composite that
+    /// takes the lock from here on observes `DRAIN_PENDING != 0` and skips entirely (it would have
+    /// nothing of the caller's to draw anyway — the rows are gone, and teardown recomposites when it
+    /// is done). So `BLIT_ACTIVE` can only fall.
+    ///
+    /// **Termination.** This is a phase barrier, not a "wait for idle" loop. The earlier form spun
+    /// on `BLIT_ACTIVE == 0` with nothing stopping new composites from re-raising it, so a stream of
+    /// presents could keep it above zero forever — and the teardown path (`sched::exit` →
+    /// `clear_handle_row` → `close_owner`) spins IRQ-MASKED and unpreemptible on its core, so that
+    /// livelock would have been a dead core rather than a slow one. With the barrier up the wait set
+    /// is fixed at entry, finite, and every member is running a bounded panel-clipped blit.
+    fn drain() -> Self {
+        use core::sync::atomic::Ordering;
+        DRAIN_PENDING.fetch_add(1, Ordering::AcqRel);
+        // Ordered against the composite registration by the table lock: a composite either took the
+        // lock BEFORE the clearing critical section (so it registered, and is counted here) or AFTER
+        // (so it sees the raised barrier and never registers).
+        while BLIT_ACTIVE.load(Ordering::Acquire) != 0 {
+            core::hint::spin_loop();
+        }
+        DrainBarrier
+    }
+}
+
+impl Drop for DrainBarrier {
+    fn drop(&mut self) {
+        DRAIN_PENDING.fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
     }
 }
 
