@@ -6,7 +6,7 @@ Three pull sequences, numbered independently. Every pull = one BRIEF (coordinato
 ## Lane 1: Kepler FENCE (PFIFO/scheduler — kepler.rs) — `video/Kepler/`, files `*kepler-fence-pull<N>*` (pulls ≤13: `*kepler-pull<N>*`)
 | Pull | Files | Status | One-liner |
 |---|---|---|---|
-| 17 | BRIEF-kepler-fence-pull17-latch-correlation | BRIEFED — awaiting proposal | pre-takeover window dump + latch-delta diff — does UPDATE perturb the aperture? |
+| 17 | BRIEF-kepler-fence-pull17-latch-correlation / PROPOSAL-kepler-fence-pull17 | LANDED 7ac404d8 — metal owed s20 | pre-takeover window dump + latch-delta diff — does UPDATE perturb the aperture? |
 | 16 | BRIEF-kepler-fence-pull16-beacon / PROPOSAL-kepler-fence-pull16 | LANDED 200be275; s19: NONE-SEEN (not our structures); window stable in-boot (p1→p2 zero deltas) | VRAM beacons in our channel structures |
 | 15 | BRIEF-kepler-fence-pull15-mirror-recon / PROPOSAL-kepler-fence-pull15 | LANDED 51b98bab; s18: DELIVERED — window VOLATILE (fill grew 62→158 rows; memory-backed hypothesis) | read-only dense dump of method-mirror header 0x640000–0x6403FC |
 | 14 | BRIEF-kepler-fence-pull14-ctrladdr / PROPOSAL-kepler-fence-pull14 | LANDED 384449d7; s13: REFUTED 12/12 (writes stick, witness never latched); recon: EVO 0x490=0D0500A9 live | PBDMA CTRL_ADDR TARGET audit; disp-era USERD = last in-family lead |
@@ -22,7 +22,7 @@ Three pull sequences, numbered independently. Every pull = one BRIEF (coordinato
 ## Lane 2: Kepler DISPLAY (scanout — kepler_display.rs after split) — `video/Kepler/`, files `*kepler-display-pull<N>*`
 | Pull | Files | Status | One-liner |
 |---|---|---|---|
-| 10 | BRIEF-kepler-display-pull10-swizzle | BRIEFED — awaiting proposal | pre-swizzled ruler (GOB 64B×8) — clean stripes on panel = block-linear PROVEN |
+| 10 | BRIEF-kepler-display-pull10-swizzle / PROPOSAL-kepler-display-pull10 | LANDED fec4b73f — metal owed s20 | pre-swizzled ruler (GOB 64B×8) — clean stripes on panel = block-linear PROVEN |
 | 9 | BRIEF-kepler-display-pull9-ruler / PROPOSAL-kepler-display-pull9 | LANDED 3ce77eda; s19: DELIVERED — full cycle compressed ~8×, 16-px checkerboard, no white column → BLOCK-LINEAR hypothesis | ruler fill (64-row color cycle + wide left marker) |
 | 8 | BRIEF-kepler-display-pull8-pattern / PROPOSAL-kepler-display-pull8 | LANDED 3bb0621c; s18: DELIVERED — early rows → bottom band; left-bar wraps as dashes (pitch≠11520 hypothesis); no blue/white | same latch, quarters+leftbar pattern fill |
 | 7 | BRIEF-kepler-display-pull7-latch / PROPOSAL-kepler-display-pull7 | LANDED 9ff1a9c2; s17: ⭐ PROVEN — GREEN ON PANEL (first UnaOS pixels; latch works; armed-readout puzzle logged) | assembly write (0x640460) + UPDATE latch (0x640080), restore-paired |
