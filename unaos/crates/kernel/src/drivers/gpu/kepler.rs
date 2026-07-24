@@ -359,6 +359,44 @@ pub fn init(gpu: &GpuInfo) {
                                     let evo_core = mmio_read(bar0, disp_base + 0x490);
                                     let evo_userd_ptr = mmio_read(bar0, disp_base + 0x494);
                                     serial_println!(":: kepler: disp-userd-recon pdisplay_0={:08X} +40={:08X} evo_0x490={:08X} evo_0x494={:08X} ::", pdisplay_0, pdisplay_1, evo_core, evo_userd_ptr);
+
+                                    // Milestone 2: PGRAPH Falcon Reconnaissance (Pull 18)
+                                    let pmc_en = mmio_read(bar0, regs::NV_PMC_ENABLE);
+                                    serial_println!(":: kepler: pmc-enable val={:08X} ::", pmc_en);
+
+                                    for pass in 0..2 {
+                                        if pass == 1 {
+                                            for _ in 0..2_000_000 { core::hint::spin_loop(); }
+                                        }
+
+                                        let cpuctl = mmio_read(bar0, 0x400100);
+                                        let bootvec = mmio_read(bar0, 0x400104);
+                                        serial_println!(":: kepler: falcon pass{} cpuctl={:08X} bootvec={:08X} ::", pass, cpuctl, bootvec);
+
+                                        let mut falcon_rows = 0;
+                                        for offset in (0..=0x1C).step_by(4) {
+                                            let val = mmio_read(bar0, 0x400100 + offset);
+                                            let abs = if val == 0xFFFFFFFF || val == 0xBAD0BA20 { " ABSENT?" } else { "" };
+                                            serial_println!(":: kepler: falcon core off={:03X} val={:08X}{} ::", 0x100 + offset, val, abs);
+                                            falcon_rows += 1;
+                                        }
+                                        serial_println!(":: kepler: falcon core done rows={} ::", falcon_rows);
+
+                                        let imemc = mmio_read(bar0, 0x400180);
+                                        let dmemc = mmio_read(bar0, 0x4001C0);
+                                        let abs_i = if imemc == 0xFFFFFFFF || imemc == 0xBAD0BA20 { " ABSENT?" } else { "" };
+                                        let abs_d = if dmemc == 0xFFFFFFFF || dmemc == 0xBAD0BA20 { " ABSENT?" } else { "" };
+                                        serial_println!(":: kepler: falcon mem imemc={:08X}{} dmemc={:08X}{} ::", imemc, abs_i, dmemc, abs_d);
+
+                                        let mut pgraph_rows = 0;
+                                        for offset in (0..=0x7C).step_by(4) {
+                                            let val = mmio_read(bar0, 0x400000 + offset);
+                                            let abs = if val == 0xFFFFFFFF || val == 0xBAD0BA20 { " ABSENT?" } else { "" };
+                                            serial_println!(":: kepler: pgraph stat off={:03X} val={:08X}{} ::", offset, val, abs);
+                                            pgraph_rows += 1;
+                                        }
+                                        serial_println!(":: kepler: pgraph stat done rows={} ::", pgraph_rows);
+                                    }
                                 }
                             }
                         }
