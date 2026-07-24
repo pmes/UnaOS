@@ -1790,7 +1790,13 @@ const V3D55_QRMAXCNT_WANT: u32 = 0x7;
 /// this line puts that default on serial for the first time. Pure reads unless `V3D55_ARM_QRMAXCNT`.
 fn v3d55_clock_domain_audit(tag: &str) {
     // (b) firmware clock readback — the half `bringup` never did.
-    let rate = mailbox::get_clock_rate(mailbox::CLOCK_ID_V3D);
+    //
+    // PI-V3D-55 evidence-integrity fix: use `get_clock_rate_RAW`. The ordinary `get_clock_rate` folds a
+    // successful transaction reporting rate==0 into `None` (its EMMC2 caller wants "usable rate or
+    // nothing"), which would make the single most diagnostic reading available here — the firmware
+    // granting the V3D clock 0 Hz — print as a mailbox FAILURE and leave the 0 Hz verdict unreachable.
+    // The raw query returns `None` ONLY for a transport failure, so `Some(0)` is a real zero grant.
+    let rate = mailbox::get_clock_rate_raw(mailbox::CLOCK_ID_V3D);
     let state = mailbox::get_clock_state(mailbox::CLOCK_ID_V3D);
     let rate_hz = rate.unwrap_or(0);
     let state_w = state.unwrap_or(0);
@@ -1800,7 +1806,9 @@ fn v3d55_clock_domain_audit(tag: &str) {
         ":: V3D: [v3d55] clkdom ({}) — commanded=500000000 Hz | GET_CLOCK_RATE={} Hz (mailbox {}) GET_CLOCK_STATE={:#010x} (active={} not_exist={}, mailbox {}) — {} ::",
         tag,
         rate_hz,
-        if rate.is_some() { "OK" } else { "FAILED" },
+        // OK means the TRANSACTION succeeded; the Hz field is then the granted rate verbatim, 0
+        // included. On FAILED the Hz field is a placeholder and carries no information.
+        if rate.is_some() { "OK (rate verbatim, 0 = a real 0 Hz grant)" } else { "FAILED (Hz field meaningless)" },
         state_w,
         active as u32,
         notexist as u32,
@@ -1883,13 +1891,47 @@ fn emit_v3d55_clock_liveness(what: &str, en: u32, cyc: &TraceReg, span_us: u64, 
         } else if delta == 0 {
             "CYCLE_COUNT FLAT across the whole wait: the V3D core clock is NOT advancing while we wait for the flush — the flush domain is unclocked/half-clocked, and the fix is a clock/QoS one, NOT a CL-packet one (cross-check [v3d55] clkdom)"
         } else {
-            "CYCLE_COUNT ADVANCED while FLDONE stayed dead: the core is clocked and free-running, so the flush logic is CLOCKED BUT NEVER TRIGGERED — the clock-domain branch is closed and the wall is back on the CLE→PTB frame-close path"
+            "CYCLE_COUNT ADVANCED while FLDONE stayed dead: the CORE COUNTER domain is live and free-running. This does NOT close the clock branch — the CLE/PTB flush unit may sit on a separately-gated sub-domain that this counter does not observe; it only rules out a wholly-unclocked core. Reading it together with [v3d55] clkdom: a clean firmware grant + a live core counter makes 'clocked but never TRIGGERED' the leading reading, and the CLE→PTB frame-close path the next place to look"
         }
     );
 }
 
-/// PI-V3D-55 (RANK 4): decode one V3D PTE for a given iova out of the page table we programmed, so the
-/// aliasing question is closed at the byte level rather than by the identity-map argument alone.
+/// PI-V3D-55 (RANK 4): the MMU-translation preamble to the PTE dump. The `[v3d55] pte` lines below read
+/// OUR CPU-side `V3D_PT` static — the table we *intended* to publish — and therefore cannot, on their
+/// own, detect a table that never reached DRAM, a `PT_PA_BASE` pointing somewhere else, or an MMU that
+/// is not enabled at all. This line supplies exactly that missing half by reading back the GPU's own
+/// translation configuration: `MMU_CTL.ENABLE`, the latched `PT_PA_BASE` (in pages) against the physical
+/// address of the table we programmed, and the standing fault bits. Together the two halves are a real
+/// discrimination; either alone is not.
+fn v3d55_mmu_config_witness(tag: &str) {
+    let ctl = mmio_read(V3D_HUB_BASE, V3D_MMU_CTL);
+    let pt_base = mmio_read(V3D_HUB_BASE, V3D_MMU_PT_PA_BASE);
+    let want_base = (pt_phys() >> V3D_MMU_PAGE_SHIFT) as u32;
+    let enabled = ctl & V3D_MMU_CTL_ENABLE != 0;
+    let base_ok = pt_base == want_base;
+    let faults = ctl & (V3D_MMU_CTL_PT_INVALID | V3D_MMU_CTL_WRITE_VIOLATION | V3D_MMU_CTL_CAP_EXCEEDED);
+    serial_println!(
+        ":: V3D: [v3d55] mmucfg ({}) — MMU_CTL={:#010x} ENABLE={} fault_bits={:#010x} | PT_PA_BASE={:#010x} (pages) vs ours={:#010x} (table phys {:#010x}) — {} ::",
+        tag, ctl, enabled as u32, faults, pt_base, want_base, pt_phys(),
+        if !enabled {
+            "the V3D MMU is NOT ENABLED — the PTEs below describe a table the hardware is not consulting; every address the GPU issues is untranslated and the aliasing question is WIDE OPEN"
+        } else if !base_ok {
+            "MMU enabled but PT_PA_BASE does NOT point at the table we filled — the GPU is walking DIFFERENT page tables than the PTEs below decode; those lines describe memory the hardware never reads"
+        } else if faults != 0 {
+            "MMU enabled, base correct, but a FAULT is latched in MMU_CTL — a translation actually failed this run; the PTE lines below name which region"
+        } else {
+            "MMU enabled and PT_PA_BASE matches the table we programmed — the PTE decodes below are describing the SAME table the hardware walks (still a CPU-side read of what we published, not a hardware translation probe)"
+        }
+    );
+}
+
+/// PI-V3D-55 (RANK 4): decode one V3D PTE for a given iova out of the page table we programmed.
+///
+/// **Scope caveat, stated at the read site:** this reads the CPU-side `V3D_PT` static — our INTENDED
+/// mapping — and is NOT a hardware translation probe. It cannot by itself detect a table whose cleaned
+/// bytes never reached DRAM, a mis-latched `PT_PA_BASE`, or a disabled MMU; `[v3d55] mmucfg` above
+/// covers those, and the two lines must be read together. What this line does establish is whether the
+/// mapping we published is itself valid, writeable and truly identity for the regions the bin touches.
 fn v3d55_pte_line(tag: &str, what: &str, iova: u32) {
     let idx = (iova as usize) >> V3D_MMU_PAGE_SHIFT;
     let in_range = idx < PT_CAP;
@@ -1899,7 +1941,7 @@ fn v3d55_pte_line(tag: &str, what: &str, iova: u32) {
     let pfn = pte & !(V3D_PTE_VALID | V3D_PTE_WRITEABLE);
     let identity = valid && ((pfn as usize) << V3D_MMU_PAGE_SHIFT) == (iova as usize & !(PAGE - 1));
     serial_println!(
-        ":: V3D: [v3d55] pte ({}) {} iova={:#010x} — PT[{}]={:#010x} VALID={} WRITEABLE={} pfn={:#x} (maps phys {:#010x}) — {} ::",
+        ":: V3D: [v3d55] pte ({}) {} iova={:#010x} — CPU-side PT[{}]={:#010x} (our PUBLISHED table, not a hardware translation — pair with [v3d55] mmucfg) VALID={} WRITEABLE={} pfn={:#x} (maps phys {:#010x}) — {} ::",
         tag, what, iova, idx, pte, valid as u32, writeable as u32, pfn,
         (pfn as usize) << V3D_MMU_PAGE_SHIFT,
         if !in_range {
@@ -1911,7 +1953,7 @@ fn v3d55_pte_line(tag: &str, what: &str, iova: u32) {
         } else if !writeable {
             "PTE valid + identity but READ-ONLY — a PTB write here is dropped by the MMU"
         } else {
-            "PTE valid, writeable, identity-mapped — the GPU and the CPU address the same physical page"
+            "PTE valid, writeable, identity-mapped AS PUBLISHED — the mapping we intended is correct; whether the GPU actually walks this table is the [v3d55] mmucfg line's question, not this one's"
         }
     );
 }
@@ -1925,9 +1967,21 @@ fn v3d55_pte_line(tag: &str, what: &str, iova: u32) {
 /// Read-only: an L2T write-back plus CPU-side cache maintenance and loads.
 fn v3d55_tilestate_readback(tag: &str, cl_iova: u32, ts_iova: u32, pool_iova: u32) {
     // Drain the binner's writes out of L2T into DRAM, then drop the CPU's stale lines (V3D-42 order).
-    invalidate_gpu_caches("L2T write-back (v3d55 tile-state readback)");
+    //
+    // PI-V3D-55 evidence-integrity fix: `invalidate_gpu_caches` DISCARDS the L2TFLS poll result, and an
+    // all-zero readback is only evidence of "the PTB never wrote" if the write-back actually COMPLETED.
+    // Under precisely the failure this arc hunts — a dead/half-clocked flush domain — the flush silently
+    // no-ops, L2TFLS never clears, the binner's bytes stay parked in L2T and DRAM reads zero for a reason
+    // that has nothing to do with the PTB. So run the same sequence inline and KEEP the completion bit,
+    // then thread it into the verdict below. (Byte-identical to `invalidate_gpu_caches`, result retained.)
+    mmio_write(V3D_CORE0_BASE, V3D_CTL_L2TCACTL, V3D_L2TCACTL_L2TFLS | V3D_L2TCACTL_FLM_FLUSH);
+    let flush_done =
+        wait_bit_clear(V3D_CORE0_BASE, V3D_CTL_L2TCACTL, V3D_L2TCACTL_L2TFLS, "L2T write-back (v3d55 tile-state readback)");
+    mmio_write(V3D_CORE0_BASE, V3D_CTL_SLCACTL, V3D_SLCACTL_INVALIDATE_ALL);
+    dsb();
+    let l2t_after = mmio_read(V3D_CORE0_BASE, V3D_CTL_L2TCACTL);
     cache::clean_invalidate_range(arena_phys() + OFF_TILESTATE, TILE_STATE_BYTES);
-    cache::clean_invalidate_range(arena_phys() + OFF_BIN_TILEALLOC, 64);
+    cache::clean_invalidate_range(arena_phys() + OFF_BIN_TILEALLOC, BIN_TILEALLOC_BYTES);
     dsb();
 
     // Full tile-state array scan. The iova is identity-mapped to the arena VA, so the CPU load address
@@ -1952,12 +2006,21 @@ fn v3d55_tilestate_readback(tag: &str, cl_iova: u32, ts_iova: u32, pool_iova: u3
     // emit bytes; a zero pool head with an advanced BPCA is the P40 phantom-pointer signature.
     let bpca = mmio_read(V3D_CORE0_BASE, V3D_PTB_BPCA);
     let bpcs = mmio_read(V3D_CORE0_BASE, V3D_PTB_BPCS);
+    // PI-V3D-55 evidence-integrity fix: scan the WHOLE tile-alloc pool, not a 64-byte prefix. The
+    // "the pool reads all-zero therefore BPCA is a phantom" reading below is a claim about the whole
+    // pool, and BPCA was observed at P40 some 0x3000 bytes IN — far past any prefix. A prefix scan
+    // could not have seen those bytes, so the prefix could never have supported the claim.
+    let pool_words = BIN_TILEALLOC_BYTES / 4;
     let mut pool_nonzero = 0u32;
+    let mut pool_first_nz = -1i32;
     let mut p = [0u32; 8];
-    for i in 0..16 {
+    for i in 0..pool_words {
         let v = unsafe { core::ptr::read_volatile((pool_iova as usize + i * 4) as *const u32) };
         if v != 0 {
             pool_nonzero += 1;
+            if pool_first_nz < 0 {
+                pool_first_nz = i as i32;
+            }
         }
         if i < 8 {
             p[i] = v;
@@ -1966,29 +2029,42 @@ fn v3d55_tilestate_readback(tag: &str, cl_iova: u32, ts_iova: u32, pool_iova: u3
     let bfc = mmio_read(V3D_CORE0_BASE, V3D_CLE_BFC);
 
     serial_println!(
-        ":: V3D: [v3d55] tilestate ({}) — TSDA iova={:#010x} bytes={} words={} nonzero_words={} first_nz=[{}] | head w0..w7 = {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} — {} ::",
+        ":: V3D: [v3d55] tilestate ({}) — TSDA iova={:#010x} bytes={} words={} nonzero_words={} first_nz=[{}] | L2T write-back completed={} (L2TCACTL after={:#010x}) | head w0..w7 = {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} — {} ::",
         tag, ts_iova, TILE_STATE_BYTES, words, nonzero, first_nz_word,
+        flush_done as u32, l2t_after,
         w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7],
         if nonzero != 0 {
+            // A nonzero readback is positive evidence regardless of the flush outcome — bytes are there.
             "the PTB WROTE tile-state: a bin frame demonstrably produced per-tile output, so the defect is DOWNSTREAM of the write — isolated to the FLDONE/BFC frame-close latch itself (the narrowest target yet)"
+        } else if !flush_done {
+            // The negative reading is only as good as the drain that produced it.
+            "tile-state reads zero BUT THE L2T WRITE-BACK DID NOT COMPLETE (L2TFLS never cleared before the backstop) — this is NOT evidence that the PTB wrote nothing: the binner's bytes may still be parked in L2T, exactly as a dead/half-clocked flush domain would leave them. NO upstream/downstream verdict from this line; read [v3d55] clkliv and clkdom first"
         } else {
-            "tile-state is ENTIRELY ZERO after the L2T write-back: the PTB never wrote a byte of per-tile state — the defect is UPSTREAM of frame-close (the bin frame never produced output at all)"
+            "tile-state is ENTIRELY ZERO after a COMPLETED L2T write-back: on this evidence the PTB wrote no per-tile state, placing the defect UPSTREAM of frame-close (the bin frame produced no output at all)"
         }
     );
     serial_println!(
-        ":: V3D: [v3d55] pool ({}) — pool iova={:#010x} nonzero_words(first 64B)={} head w0..w7 = {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} | BPCA={:#010x} (adv {:#x} off pool base) BPCS={:#010x} BFC={:#010x} — {} ::",
-        tag, pool_iova, pool_nonzero,
+        ":: V3D: [v3d55] pool ({}) — pool iova={:#010x} bytes={} words={} nonzero_words={} first_nz=[{}] (FULL-pool scan) | L2T write-back completed={} | head w0..w7 = {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} | BPCA={:#010x} (adv {:#x} off pool base) BPCS={:#010x} BFC={:#010x} — {} ::",
+        tag, pool_iova, BIN_TILEALLOC_BYTES, pool_words, pool_nonzero, pool_first_nz,
+        flush_done as u32,
         p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
         bpca, bpca.wrapping_sub(pool_iova), bpcs, bfc,
-        if pool_nonzero == 0 && bpca != 0 && bpca != pool_iova {
-            "BPCA ADVANCED off the pool base yet the pool reads all-zero even after the L2T write-back — BPCA is a PHANTOM/aliased write pointer; the address question reopens (see the [v3d55] pte lines)"
-        } else if pool_nonzero != 0 {
+        if pool_nonzero != 0 {
             "the pool carries binner bytes — primitive-list output exists in DRAM; frame-close is the only missing step"
+        } else if !flush_done {
+            "pool reads all-zero BUT THE L2T WRITE-BACK DID NOT COMPLETE — no PTB-write verdict from this line (the bytes may still be parked in L2T); see [v3d55] tilestate and the clock witnesses"
+        } else if bpca == 0 {
+            // A block whose registers read 0x0 is not a PTB parked at the pool base — do not conflate.
+            "BPCA reads 0x0, which is NOT the pool base — the register is either genuinely reset or the block is not returning live values; this says nothing about where a PTB write pointer stands (check the other CLE/PTB registers in the [v3d45] dump for a block-wide zero/poison pattern)"
+        } else if bpca != pool_iova {
+            "BPCA ADVANCED off the pool base yet the FULL pool reads all-zero after a COMPLETED L2T write-back — on this evidence BPCA is a PHANTOM/aliased write pointer and the address question reopens (see [v3d55] mmucfg + the pte lines)"
         } else {
-            "pool all-zero and BPCA still at the pool base — the PTB emitted nothing and never even moved its write pointer this kick"
+            "pool all-zero with BPCA exactly at the pool base after a completed write-back — the PTB emitted nothing and never moved its write pointer this kick"
         }
     );
-    // Close the aliasing question at the byte level for all three regions the bin touches.
+    // The MMU configuration readback (what the GPU actually walks) FIRST, then our published PTEs —
+    // neither half is a translation probe on its own; the pair is what carries the discrimination.
+    v3d55_mmu_config_witness(tag);
     v3d55_pte_line(tag, "bin CL     ", cl_iova);
     v3d55_pte_line(tag, "tile-state ", ts_iova);
     v3d55_pte_line(tag, "tile-alloc ", pool_iova);

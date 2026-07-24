@@ -1181,6 +1181,15 @@ verdict* rather than fabricating a flat-clock reading (the battery is armed only
 never read back what firmware **granted**. `GET_CLOCK_RATE` + `GET_CLOCK_STATE` for `CLOCK_ID_V3D` now print
 the granted rate, the gate-active bit and the does-not-exist bit against the commanded value.
 
+> **Transport failure ≠ a 0 Hz grant.** The existing `mailbox::get_clock_rate` deliberately folds *both* a
+> failed transaction and a successful one reporting `rate == 0` into `None` — correct for its EMMC2 caller
+> ("a usable rate or nothing"), fatal here: a firmware that grants the V3D clock **0 Hz** is the single most
+> diagnostic RANK-3 reading available, and collapsing it would print it as a dead mailbox and leave the 0 Hz
+> verdict unreachable. V3D-55 adds `mailbox::get_clock_rate_raw`, which returns `None` **only** on an
+> `mbox_call` failure so `Some(0)` is a real zero grant. Additive — `get_clock_rate`'s contract and its
+> existing callers are untouched. (`get_clock_state` is likewise now compiled for the `v3d` feature, not
+> only `piusb`, so the audit does not depend on `piusb` happening to be enabled in the same build.)
+
 **(c) `MISCCFG.QRMAXCNT[3:1]` audit (`[v3d55] misccfg`).** The queued-request max count has been *declared* in
 `v3d.rs` since V3D-34 and never programmed **or audited**. Linux `v3d_init_core` writes `MISCCFG` only on
 `ver<41` (the Pi 4 is v42) and the bcm2711 DT programs no QRMAXCNT for v3d, so the expected value is the
@@ -1198,29 +1207,52 @@ would mean a starved PTB request queue: a genuine BCM2711 knob never touched.
 `bin_pool_witness` reads only the **first 8 bytes** of the pool and of the tile-state array — too coarse to
 separate *PTB-wrote-but-no-FLDONE* from *PTB-never-wrote*. After the PROBE bin, `v3d55_tilestate_readback`
 performs an L2T write-back (the §18/V3D-42 order: drain the binner's L2T-parked bytes to DRAM, *then* drop the
-CPU's stale lines), scans the **whole** `TILE_STATE_BYTES` TSDA counting nonzero words plus the first-nonzero
-index, re-reads the pool head, and prints `BPCA`/`BPCS`/`BFC` alongside. It then dumps the V3D **PTEs** covering
-the CL, tile-state and tile-alloc iovas — validity, writeability, and whether the PTE is truly identity — so the
-aliasing question closes at the byte level rather than by the identity-map argument alone.
+CPU's stale lines), scans the **whole** `TILE_STATE_BYTES` TSDA **and the whole `BIN_TILEALLOC_BYTES` pool**
+counting nonzero words plus the first-nonzero index, and prints `BPCA`/`BPCS`/`BFC` alongside.
+
+Two integrity properties this readback must carry, because the negative reading is the interesting one:
+
+- **The write-back's completion is threaded into the verdict.** `invalidate_gpu_caches` discards its `L2TFLS`
+  poll result; V3D-55 runs the byte-identical sequence inline and **keeps** the completion bit. Under exactly
+  the failure this arc hunts — a dead or half-clocked flush domain — the flush silently no-ops, the binner's
+  bytes stay parked in L2T and DRAM reads zero *for a reason that has nothing to do with the PTB*. When
+  `flush_done == false` the line issues **no** upstream/downstream verdict at all.
+- **The pool scan covers the whole pool.** A "the pool is empty, therefore `BPCA` is a phantom" claim is a
+  claim about the *whole* pool, and P40 observed `BPCA` some `0x3000` bytes in — past any prefix. A prefix
+  scan could never have supported that claim, so the scan matches the claim's scope.
+
+It then dumps the V3D **PTEs** covering the CL, tile-state and tile-alloc iovas — validity, writeability and
+true identity.
+
+> **What the PTE lines are and are not.** They read our CPU-side `V3D_PT` static: the mapping we *intended and
+> published*. They are **not** a hardware translation probe and cannot, alone, detect a table whose cleaned
+> bytes never reached DRAM, a mis-latched `PT_PA_BASE`, or an MMU that is not enabled. V3D-55 therefore emits
+> `[v3d55] mmucfg` first — `MMU_CTL.ENABLE`, the latched `PT_PA_BASE` (pages) against the table we programmed,
+> and the standing fault bits — read back from the GPU's own configuration. The **pair** carries a real
+> discrimination; either half alone does not, and the §29 claim is scoped accordingly.
 
 ### Expected discriminations
 
 | Witness | Reading | Verdict |
 | --- | --- | --- |
 | `[v3d55] clkliv` | `CYCLE_COUNT` **flat** across the 0.5 s wait | The core/flush domain is **not ticking** — the fix is a clock/QoS one, not a packet one. Cross-check `clkdom`. |
-| `[v3d55] clkliv` | `CYCLE_COUNT` **advances**, FLDONE still dead | The clock branch **closes**: flush logic is clocked but never **triggered** — back to the CLE→PTB frame-close path. |
+| `[v3d55] clkliv` | `CYCLE_COUNT` **advances**, FLDONE still dead | The **core counter domain** is live. This does **not** close the clock branch — the CLE/PTB flush unit may sit on a separately-gated sub-domain this counter cannot observe; it rules out a wholly-unclocked core. With a clean `clkdom`, "clocked but never **triggered**" becomes the leading reading. |
 | `[v3d55] clkdom` | gate inactive / rate 0 / granted ≠ 500 MHz | Powered-but-unclocked (or clamped) — alone sufficient to explain a dead flush unit. |
 | `[v3d55] misccfg` | `QRMAXCNT == 0` | Request queue **floored** — arm `V3D55_ARM_QRMAXCNT` next arc and re-run. |
 | `[v3d55] misccfg` | `QRMAXCNT != 0` | No divergence; the QoS branch is **not** justified — refuted without a write. |
 | `[v3d55] tilestate` | nonzero words **> 0** | The PTB **wrote** per-tile output ⇒ the defect is isolated to the **FLDONE/BFC frame-close latch itself** — the narrowest target the campaign has ever had. |
-| `[v3d55] tilestate` | **all zero** after the L2T write-back | The PTB never wrote a byte ⇒ the defect is **upstream** of frame-close; the bin frame produced nothing at all. |
-| `[v3d55] pool` | pool all-zero **but** `BPCA` advanced off base | `BPCA` is a **phantom/aliased** write pointer — the P40 contradiction is an addressing one; the `pte` lines below decide. |
-| `[v3d55] pte` | any PTE invalid / non-identity / read-only | A silent no-write is an **addressing** defect, not a frame-close one — reopens the aliasing question the identity-map argument had closed. |
+| `[v3d55] tilestate` | **all zero**, `flush_done = 1` | On this evidence the PTB wrote nothing ⇒ the defect is **upstream** of frame-close. |
+| `[v3d55] tilestate` / `pool` | **all zero**, `flush_done = 0` | **No verdict.** `L2TFLS` never cleared, so the bytes may still be parked in L2T — read `clkliv`/`clkdom` first. |
+| `[v3d55] pool` | full pool all-zero, `flush_done = 1`, `BPCA` advanced off base | `BPCA` is a **phantom/aliased** write pointer — the P40 contradiction is an addressing one; `mmucfg` + the `pte` lines decide. |
+| `[v3d55] pool` | `BPCA == 0x0` | **Not** "parked at the pool base" — `0x0` is not the pool base. Either a genuinely reset register or a block not returning live values; check the `[v3d45]` dump for a block-wide zero/poison pattern. |
+| `[v3d55] mmucfg` | `ENABLE = 0`, or `PT_PA_BASE` ≠ ours | The GPU is not consulting (or not walking) the table the `pte` lines decode — the aliasing question is wide open and those lines describe memory the hardware never reads. |
+| `[v3d55] pte` | any PTE invalid / non-identity / read-only | The mapping we **published** is wrong for that region ⇒ a silent no-write is an **addressing** defect, not a frame-close one. |
 
 ### Witness line formats
 
 ```
-:: V3D: [v3d55] clkdom (<tag>) — commanded=500000000 Hz | GET_CLOCK_RATE=<hz> (mailbox OK|FAILED)
+:: V3D: [v3d55] clkdom (<tag>) — commanded=500000000 Hz | GET_CLOCK_RATE=<hz> (mailbox OK (rate verbatim,
+        0 = a real 0 Hz grant) | FAILED (Hz field meaningless))
         GET_CLOCK_STATE=0x……… (active=<0|1> not_exist=<0|1>, mailbox OK|FAILED) — <verdict> ::
 :: V3D: [v3d55] misccfg (<tag>) — MISCCFG=0x……… OVRTMUOUT(bit0)=<0|1> QRMAXCNT[3:1]=<n>
         — EXPECTED: reset default … — <verdict> — scoped QRMAXCNT write DISARMED|ARMED… ::
@@ -1228,15 +1260,24 @@ aliasing question closes at the byte level rather than by the identity-map argum
 :: V3D: [v3d55] clkliv (<what>) — PCTR_EN=0x……… counter2(src32 CYCLE_COUNT) armed=<0|1>
         0x………->0x……… Δ=<n> moves=<n> first_move=<n>us last_change=<n>us over <n>us (<n> samples) — <verdict> ::
 :: V3D: [v3d55] tilestate (<tag>) — TSDA iova=0x……… bytes=<n> words=<n> nonzero_words=<n> first_nz=[<i|-1>]
-        | head w0..w7 = 0x……… ×8 — <verdict> ::
-:: V3D: [v3d55] pool (<tag>) — pool iova=0x……… nonzero_words(first 64B)=<n> head w0..w7 = 0x……… ×8
+        | L2T write-back completed=<0|1> (L2TCACTL after=0x………) | head w0..w7 = 0x……… ×8 — <verdict> ::
+:: V3D: [v3d55] pool (<tag>) — pool iova=0x……… bytes=<n> words=<n> nonzero_words=<n> first_nz=[<i|-1>]
+        (FULL-pool scan) | L2T write-back completed=<0|1> | head w0..w7 = 0x……… ×8
         | BPCA=0x……… (adv 0x… off pool base) BPCS=0x……… BFC=0x……… — <verdict> ::
-:: V3D: [v3d55] pte (<tag>) <region> iova=0x……… — PT[<idx>]=0x……… VALID=<0|1> WRITEABLE=<0|1>
+:: V3D: [v3d55] mmucfg (<tag>) — MMU_CTL=0x……… ENABLE=<0|1> fault_bits=0x……… | PT_PA_BASE=0x……… (pages)
+        vs ours=0x……… (table phys 0x………) — <verdict> ::
+:: V3D: [v3d55] pte (<tag>) <region> iova=0x……… — CPU-side PT[<idx>]=0x……… (our PUBLISHED table, not a
+        hardware translation — pair with [v3d55] mmucfg) VALID=<0|1> WRITEABLE=<0|1>
         pfn=0x… (maps phys 0x………) — <verdict> ::
 ```
 
-`[v3d55] qrmaxcnt` fires only under the doubly-gated arm; `clkliv` fires on both `wait_fldone` exits; the three
-`pte` lines cover `bin CL`, `tile-state` and `tile-alloc`.
+`[v3d55] qrmaxcnt` fires only under the doubly-gated arm; `clkliv` fires on both `wait_fldone` exits; `mmucfg`
+precedes the three `pte` lines, which cover `bin CL`, `tile-state` and `tile-alloc`.
+
+**Noted perturbation.** `[v3d55] clkdom` runs two mailbox round-trips, so a firmware transaction now interposes
+between the pre-kick L2T flush and the GO. Acknowledged and judged low-risk — the mailbox touches no V3D state
+and the CL/tile-state/pool are all CPU-published-and-cleaned before it — but it is a real change to the timing
+of the metal-confirmed kick path and is recorded here so a P54 divergence has this on the suspect list.
 
 QEMU `raspi4b` models no V3D block — the run returns at `BLOCK-DOWN` before the probe, so **no** `[v3d55]` line
 appears there and the `kernel8-test` battery green means *no regression*, not probe verification. **P54 metal

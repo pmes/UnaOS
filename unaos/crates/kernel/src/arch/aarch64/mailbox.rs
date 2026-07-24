@@ -361,7 +361,9 @@ pub fn get_domain_state(domain: u32) -> Option<u32> {
 
 /// PIUSB-32: read-only CLOCK gate state (the clock-id namespace `set_clock_state` writes — e.g.
 /// `CLOCK_ID_V3D`). Returns the firmware `state` word (bit0 active, bit1 does-not-exist).
-#[cfg(feature = "piusb")]
+/// PI-V3D-55: also compiled for the `v3d` feature — the clock-domain audit reads the V3D gate state
+/// directly, and must not depend on `piusb` happening to be enabled in the same build.
+#[cfg(any(feature = "piusb", feature = "v3d"))]
 pub fn get_clock_state(clock_id: u32) -> Option<u32> {
     request(0, 8 * 4);
     request(1, 0);
@@ -375,6 +377,31 @@ pub fn get_clock_state(clock_id: u32) -> Option<u32> {
         return None;
     }
     Some(reply(6))
+}
+
+/// PI-V3D-55: the RAW `GET_CLOCK_RATE` query — transport failure and a genuine **0 Hz grant** are
+/// DIFFERENT facts and this is the only caller that must tell them apart. `get_clock_rate` above
+/// deliberately collapses both into `None` (its EMMC2 caller wants "usable rate or nothing"), which
+/// would make the single most diagnostic V3D reading — the firmware granting the V3D clock 0 Hz —
+/// indistinguishable from a dead mailbox, and would render the 0 Hz verdict arm unreachable.
+///
+/// Returns `None` **only** when `mbox_call` itself fails (no reply / bad response code); `Some(0)` is a
+/// SUCCESSFUL transaction reporting a real zero rate. Additive: `get_clock_rate`'s existing contract
+/// and its callers are untouched.
+#[cfg(feature = "v3d")]
+pub fn get_clock_rate_raw(clock_id: u32) -> Option<u32> {
+    request(0, 8 * 4); // total size (8 words used)
+    request(1, 0); // request
+    request(2, TAG_GET_CLOCK_RATE);
+    request(3, 8); // value buffer size (2 words: clock_id, rate)
+    request(4, 0); // request code
+    request(5, clock_id); // clock id (reply preserves it)
+    request(6, 0); // rate (reply)
+    request(7, TAG_END);
+    if !mbox_call(8) {
+        return None; // transport failure — NOT a 0 Hz grant
+    }
+    Some(reply(6)) // a successful transaction, rate verbatim (0 included)
 }
 
 /// PI-V3D-1: set a firmware-managed clock's rate in Hz. Returns the rate the firmware actually
