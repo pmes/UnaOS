@@ -6,8 +6,28 @@ QEMU behavior. Newest sitting first.
 ## Sitting #18 (display pull 8 + fence pull 15, UnaOS-gemini@c4dbbbb6, 2026-07-24, fox-metal-r23s1j)
 
 **Single all-knob boot, both lanes served. Serial side capture-verified;
-PANEL OBSERVATION PENDING (Peter's color/position report — entry will be
-amended; the pattern mapping verdict waits on it).**
+panel photographed (Peter).**
+
+**Panel facts (photo, pattern boot):**
+1. Visible band sits at the BOTTOM ~fifth of the panel (same region as
+   s17's green): RED above GREEN, red roughly twice the green's height. No
+   blue, no white anywhere → only EARLY surface rows (red quarter + part of
+   the green quarter) ever reach the panel.
+2. **No continuous black left column** — the 64-px left bar appears instead
+   as periodic dark DASHES drifting across the band. Deduction: the
+   hardware scan pitch ≠ our assumed 11520 (w×4); the left-bar marker wraps
+   to drifting x positions row by row. Pitch is the primary unknown.
+3. Band interior shows staggered brick-patterned dark dashes through red
+   and green (bench read: "tears"; coordinator read: the black left-bar
+   fragments wrapping at drifting x — a spatial pitch artifact, not
+   temporal tearing, since the pattern is stable in a still frame). The
+   dash stagger is itself pitch data; pull 9's ruler resolves which read
+   is right and yields the number.
+
+Mapping verdict: the latch scans a SUB-RANGE of our surface (early rows)
+into a fixed bottom band, at a pitch we have wrong. Pull 9 = ruler pattern
+(row-coded color cycling + thin black row-markers + wide white left column)
+to solve pitch and row-mapping arithmetically from the next photo.
 
 **Display pull 8 (serial side):** geom w=2880 h=1800 pitch=11520; full latch
 ladder identical to s17 (asm-stuck=y, armed never followed, raster ticking
