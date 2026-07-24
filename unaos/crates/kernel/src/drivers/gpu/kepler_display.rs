@@ -224,7 +224,7 @@ pub unsafe fn takeover_display(
     let capped = if hits > 64 { "true" } else { "false" };
     serial_println!(":: kdisp: evo-scan done range=610000-613FFC hits={} capped={} ::", hits, capped);
 
-    // ── Phase 2: Assembly Write + UPDATE Latch (Pull 8) ────────────────────
+    // ── Phase 2: Assembly Write + UPDATE Latch (Pull 9) ────────────────────
     if !cfg!(feature = "nvidia-kepler-takeover") {
         serial_println!(":: kdisp: trace-only — takeover feature not set ::");
         return None;
@@ -242,30 +242,43 @@ pub unsafe fn takeover_display(
     let expected_pitch = expected_width * 4;
     let fb_size = (expected_width * expected_height * 4) as usize;
 
-    // 1. Prepare surf2 (pattern fill at VRAM + 0x1600000)
+    // 1. Prepare surf2 (ruler pattern fill at VRAM + 0x1600000)
     let bar1 = vram_base;
     let surf2_offset = 0x1600000;
     let dst = (bar1 + surf2_offset) as *mut u32;
     
     serial_println!(":: kdisp: surf2 geom w={} h={} pitch={} ::", expected_width, expected_height, expected_pitch);
     for y in 0..expected_height {
-        let color = if y < expected_height / 4 {
-            0xFFFF0000 // RED
-        } else if y < expected_height / 2 {
-            0xFF00FF00 // GREEN
-        } else if y < (expected_height * 3) / 4 {
-            0xFF0000FF // BLUE
+        let block_color = match (y / 64) % 8 {
+            0 => 0xFFFF0000, // RED
+            1 => 0xFF00FF00, // GREEN
+            2 => 0xFF0000FF, // BLUE
+            3 => 0xFFFFFF00, // YELLOW
+            4 => 0xFF00FFFF, // CYAN
+            5 => 0xFFFF00FF, // MAGENTA
+            6 => 0xFFFFFFFF, // WHITE
+            _ => 0xFF404040, // GRAY
+        };
+        
+        let row_color = if y % 64 == 0 {
+            0xFF000000 // BLACK
         } else {
-            0xFFFFFFFF // WHITE
+            block_color
         };
         
         let row_ptr = dst.add((y * expected_width) as usize);
         for x in 0..expected_width {
-            let final_color = if x < 64 { 0xFF000000 } else { color };
+            let final_color = if x < 256 {
+                0xFFFFFFFF // WHITE
+            } else if x < 264 {
+                0xFF000000 // BLACK
+            } else {
+                row_color
+            };
             core::ptr::write_volatile(row_ptr.add(x as usize), final_color);
         }
     }
-    serial_println!(":: kdisp: surf2 prep off=01600000 bytes={:08X} pattern=quarters+leftbar ::", fb_size);
+    serial_println!(":: kdisp: surf2 prep off=01600000 bytes={:08X} pattern=ruler64x8 ::", fb_size);
 
     // 2. Pre-state
     let asm_reg = 0x640460;
