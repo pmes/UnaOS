@@ -3,6 +3,40 @@
 Hard-won silicon facts from the fox-metal sitting series. Trust these over any
 QEMU behavior. Newest sitting first.
 
+## Sitting #19 (display pull 9 + fence pull 16, UnaOS-gemini@ae5ce2b2, 2026-07-24, fox-metal-r23s1j)
+
+**Display — ruler flew; ONE hypothesis now explains every panel fact:
+the scanout window reads the surface BLOCK-LINEAR (GOB 64 B × 8 rows) while
+we fill linear.** (Coordinator decode from Peter's photo + notes at
+`capture/rmbp-s18/s19boot1-panel-observation.md`.)
+- Full 8-color cycle visible in-order inside the same bottom ~1/8 band,
+  whole cycle compressed — each 64-row block only a few panel rows tall →
+  ~8× vertical compression = GOB height 8.
+- Red stripes dashed/checkerboarded at short regular periods → 64-byte
+  (16-px) chunks of our linear rows stacking vertically under the swizzle.
+- White 256-px left column invisible → 1 KB of white per row shatters into
+  scattered 64 B blocks. Per-row notch unresolvable, same reason.
+- Retro-consistency: s17 solid green (swizzle-invariant) showed a clean
+  band; s18 quarters kept coarse order. Latch ladder identical
+  (asm-stuck=y, armed-followed=n, all boots).
+- Bottom-band placement REMAINS a separate unknown (viewport/window offset).
+- Pull 10 = pre-swizzled ruler (linear→GOB transform in the fill): clean
+  stripes + solid white column on the panel would PROVE tiling + params.
+
+**Fence — beacon verdict: NONE-SEEN; window is NOT a mirror of our channel
+structures.** Beacons planted at userd 0x2002000 / pb 0x2003000 / runlist
+0x2013000 (BAR1); pass1 clean of beacons (158 nonzero rows); **pass1→pass2:
+ZERO words changed** — the window is stable within a boot; s18's
+"volatility" was across boots/boot-phase, not continuous churn. Standing
+read: engine-private memory aperture, contents boot-dependent. Pull 17 =
+latch-correlation probe (dump the window BEFORE takeover_display and after,
+same boot, read-only — does the display UPDATE perturb it?).
+
+**s18 completion note (fox-metal-r23s1j):** three s18 boots total, ladders
+identical; bench corrected its own count — mirror-hdr pass1 nonzero rows =
+158 (matches the coordinator's fold; the 159 in the first relay counted the
+done line).
+
 ## Sitting #18 (display pull 8 + fence pull 15, UnaOS-gemini@c4dbbbb6, 2026-07-24, fox-metal-r23s1j)
 
 **Single all-knob boot, both lanes served. Serial side capture-verified;
