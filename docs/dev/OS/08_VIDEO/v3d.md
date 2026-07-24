@@ -1348,15 +1348,39 @@ align(128, 4096)                          = 0x1000
 predicted BPCA advance, EMPTY bin         = 0x3000
 ```
 
-Measured at V3D-40 and again at V3D-55: **exactly `0x3000`**. Not approximately — the formula's value to the
-byte, over a pool that reads entirely zero. That is precisely what pure reservation predicts and precisely what
-a real write would not produce.
+Measured at V3D-40 and again at V3D-55: **exactly `0x3000`** — the formula's value to the byte.
 
-**Verdict: `BPCA` advancing `0x3000` with an untouched pool is ARCHITECTURAL for an empty bin frame.** There are
-no phantom bytes because there were never any bytes. The address question does **not** reopen, and the V3D-55
-MMU evidence (enabled, fault-free, our table latched, PTEs valid) stands unchallenged.
+#### Two scope limits, both load-bearing
+
+Neither may be dropped when this finding is quoted.
+
+**(1) The `0x3000` match is NON-DISCRIMINATING on its own.** Reservation rounds up to 4 KiB, so a bin that wrote
+a *small tile list inside the reserved initial block* leaves `BPCA` at exactly the same `0x3000`. Advance-matches-
+prediction is therefore consistent with both "wrote nothing" and "wrote a little", and cannot separate them.
+**Only the poison separates them.** Accordingly the retraction verdict in `[v3d56] bpca-vs-bytes` is gated on the
+**conjunction** — advance `==` predicted **AND** poison fully intact — never on the advance alone. A match with a
+*disturbed* poison is a different (and much more interesting) result, and the witness says so.
+
+**(2) The `0x3000` was measured on the FULL probe draw list, not an empty one.** The probe kicks
+`build_bin_cl_generic` — a complete draw list with geometry — which is only *effectively* empty because the coord
+shader never dispatches (`valid_instr=0`, the §14/§17 wall). So the honest statement is: the advance is
+architectural for a frame that **binned no primitives**, whatever the list nominally contained. Whether the §22
+bisect *Empty* rung produces the same `0x3000` has never been measured, and that measurement would close the gap.
+
+#### Verdict, scoped
+
+**`BPCA` advancing `0x3000` over a pool the poison proves untouched is ARCHITECTURAL for a frame that binned no
+primitives.** On that conjunction the phantom verdict is **retracted** — there would be no phantom bytes because
+there were never any bytes; `BPCA` reports *reserved* space and this driver read it as *written* space. The
+address question does **not** reopen, and the V3D-55 MMU evidence (enabled, fault-free, our table latched, PTEs
+valid) stands unchallenged.
 
 The defect collapses back to where §23–§27 had it: **`FLDONE` generation on an empty frame.**
+
+> **STATUS: PENDING FIRST METAL BOOT.** The register semantics and the Mesa formula are settled from source and
+> need no confirmation. But the retraction's second conjunct — *poison intact* — has never been observed, because
+> **no `[v3d56]` line has ever run**. Until a P56 metal boot prints one, everything in this section downstream of
+> the source citations is a well-supported **prediction, not a measured result**.
 
 ### Item 1 — poison the pool, so a zero-valued write stops being invisible
 
@@ -1400,14 +1424,35 @@ The in-lane substitute is strictly stronger for the actual question ("where did 
 addresses the V3D MMU grants this job are the identity-mapped arena pages, so if the PTB wrote anywhere the GPU
 can reach, the bytes are in the arena. `[v3d56] landing` digests **every** arena page (order-sensitive, so a
 permutation still registers) immediately before the GO and again after the post-retire readback, and reports
-which pages changed — separating the pool/tile-state pages from **STRAY** changes elsewhere.
+which pages changed.
+
+Changes are classified against a labelled whitelist of the regions a **correctly-functioning** job writes; only
+the remainder is **STRAY**:
+
+| Region | Pages | Why it is expected |
+|---|---|---|
+| tile-state | `OFF_TILESTATE` | bin output under test |
+| tile-alloc pool | `OFF_BIN_TILEALLOC` +32 KiB | bin output under test |
+| probe TMU scratch | `OFF_PROBE_SCRATCH` | **the write the probe series exists to produce** (§13/§17) |
+| PTB overspill | `OFF_PROBE_BIN_OVERFLOW` +8 KiB | architectural `BPOA` spill; the `OUTOMEM` path services it |
+
+The last two matter for evidence integrity. The probe's TMU-store target is written *by definition* when the
+probe finally works, and an overspill write is the PTB doing exactly what the architecture specifies. Treating
+either as STRAY would make the sweep shout "the phantom is located" **precisely when the GPU started working** —
+so both are whitelisted with labels, and the "everything changed is expected" verdict states outright that a
+scratch or overspill hit is what *success* looks like. A misplaced store is still adjudicated, by the separate
+§13 canary scan that covers the scratch page's tail.
 
 A stray page names the landing zone by offset. No stray page, with `BPCA` advanced, is the reservation reading
 confirmed over the whole reachable address space rather than inferred from two pre-zeroed regions.
 
-The post-job invalidate here is `cache::invalidate_range`, **not** `clean_invalidate_range`: the arena was
-cleaned to PoC before the kick and the CPU has not written it since, so there are no dirty lines to preserve —
-and a clean pass would risk writing CPU-stale zeros back over GPU-written bytes, destroying the evidence.
+The post-job invalidate uses `cache::invalidate_range` rather than `clean_invalidate_range`. This is a
+belt-and-braces preference, **not** a claim that the clean variant is unsafe — `v3d55_tilestate_readback` calls
+`clean_invalidate_range` over the same regions one call earlier in this path, and that call is correct. Every
+arena writer in this file cleans to PoC after writing (the poison fill included), so no dirty CPU lines exist
+over the arena here and the two primitives are equivalent. The plain invalidate is chosen only because it cannot
+*become* wrong if a future writer forgets its clean: a clean pass would then write CPU-stale bytes back over
+GPU-written ones, destroying the evidence this sweep exists to find.
 
 ### Item 4 — the FLDONE interrupt triple
 
@@ -1449,29 +1494,41 @@ upstream-sanctioned interface; `FLDONE` is the only bin-retire signal the kernel
         (align(1*1*1*128,4096)+8192) — match=<0|1> | poison says touched through byte 0x… (<n> B)
         | delta=<n> — <verdict> ::
 :: V3D: [v3d56] landing (<tag>) — arena <n> pages (0x40000 B @ 0x………, the ENTIRE address space the
-        V3D MMU grants this job) | changed=<n> (pool/tile-state pages <a>..<b>,<c> : <n>
-        | STRAY elsewhere: <n>) first_stray_page=<i> (off 0x…) last_stray_page=<i> — <verdict> ::
+        V3D MMU grants this job) | changed=<n> expected=<n> STRAY=<n> | per-region:
+        tile-state (bin output) p[<a>..<b>]=<n> · tile-alloc pool (bin output) p[<a>..<b>]=<n>
+        · probe TMU scratch (expected) p[<a>..<b>]=<n> · PTB overspill (expected) p[<a>..<b>]=<n>
+        | first_stray_page=<i> (off 0x…) last_stray_page=<i> — <verdict> ::
 :: V3D: [v3d56] int (<what>) — ENTRY INT_STS=0x……… INT_MSK_STS=0x……… | EXIT INT_STS=0x………
         INT_MSK_STS=0x……… (1=MASKED) | FLDONE(bit1): latched=<0|1> masked=<0|1>
         | working-set V3D_IRQS=0x……… unmasked_now=0x……… | latched-but-masked=0x……… — <verdict> ::
 ```
 
-`armed` fires once per probe; `poison` twice (tile-state, tile-alloc); `bpca-vs-bytes` and `landing` once each;
-`int` on both `wait_fldone` exits.
+`armed` fires once per probe; `poison` twice (tile-state, tile-alloc); `bpca-vs-bytes` and `landing` once each.
+
+`int` is gated on `V3D56_INT_TRIPLE` (default `true`) and fires on **every** `wait_fldone` exit, not only the
+probe's — one line per bin kick, deliberately. Every caller of `wait_fldone` *is* a bin-retire wait (probe, the
+§22 bisect rungs, the §28 resubmit, M4); the arc's remaining question is why `FLDONE` never asserts, and the
+bisect rungs are exactly where a rung-to-rung difference in the mask or the latch would show. Scoping it to the
+probe would blind the comparison that matters most. The enclosing V3D battery is itself default-quiet
+(`BLOCK-DOWN` short-circuit), so none of it reaches a non-metal log.
 
 ### What P56 metal decides
 
-The BPCA question is **already closed by source** — metal only confirms the `0x3000` match on the
-`bpca-vs-bytes` line. What metal genuinely decides is the poison:
+The **register-semantics** half is closed by source and needs no boot. Everything else here is a prediction
+awaiting its first `[v3d56]` line. Metal decides:
 
-- **Poison fully INTACT** → the PTB wrote nothing at all, reservation-only, and the arc's whole remaining
-  surface is empty-frame `FLDONE` generation.
-- **Poison ZEROED** → the PTB *did* write, with zeros, and the "nothing was written" premise under V3D-40..55
-  was false for the entire series.
-- **Poison OVERWRITTEN** → real primitive output exists and the defect was always frame-close.
+- **The poison** — the discriminator the `0x3000` advance cannot be:
+  - **fully INTACT** → the PTB wrote nothing at all, reservation-only; the retraction's conjunction holds and
+    the arc's whole remaining surface is empty-frame `FLDONE` generation.
+  - **ZEROED** → the PTB *did* write, with zeros, and the "nothing was written" premise under V3D-40..55 was
+    false for the entire series.
+  - **OVERWRITTEN** → real primitive output exists and the defect was always frame-close.
+- **Whether `bpca-vs-bytes` reports `match=1`** on this frame, and — the open measurement noted above — whether
+  the §22 bisect *Empty* rung yields the same `0x3000` as the effectively-empty full draw list.
 
-Any **STRAY** page on `[v3d56] landing` overrides all three and reopens the address question with an offset
-attached.
+Any **STRAY** page on `[v3d56] landing` overrides all of it and reopens the address question with an offset
+attached. Note that `expected` hits are *not* failures: a probe-scratch or overspill hit is what success looks
+like.
 
 QEMU `raspi4b` models no V3D block — the run returns at `BLOCK-DOWN` before the probe, so **no** `[v3d56]` line
 appears there, and `kernel8-test` green means *no regression*, not probe verification.

@@ -2147,16 +2147,36 @@ fn v3d56_poison_word(i: usize) -> u32 {
 //     ────────────────────────────────────────────────────────
 //     expected BPCA advance on an EMPTY bin          = 0x3000
 //
-// The V3D-40 and V3D-55 metal boots measured BPCA advanced by **exactly 0x3000** off the pool base.
-// That is not an approximate match — it is the formula's value to the byte, over a pool that reads
-// entirely zero, which is precisely what pure reservation predicts.
+// The V3D-40 and V3D-55 metal boots measured BPCA advanced by **exactly 0x3000** off the pool base —
+// the formula's value to the byte.
 //
-// CONCLUSION: BPCA advancing 0x3000 with an untouched pool is ARCHITECTURAL for an empty bin frame.
-// The "phantom/aliased write pointer" verdict is RETRACTED — there are no phantom bytes, because
-// there were never any bytes: BPCA was reporting reserved space, and the driver read it as written
-// space. The address question does NOT reopen; the GPU MMU evidence (enabled, fault-free, our table
-// latched) stands unchallenged. The defect collapses back to FLDONE generation on an empty frame,
-// which is what `v3d56_emit_int_triple` below instruments.
+// TWO SCOPE LIMITS, both load-bearing; neither may be dropped when this finding is quoted:
+//
+//  (1) **The 0x3000 match is NON-DISCRIMINATING on its own.** Reservation rounds up to 4 KiB, so a bin
+//      that wrote a SMALL tile list *inside* the reserved initial block leaves BPCA at exactly the same
+//      0x3000. Advance-matches-prediction is therefore consistent with both "wrote nothing" and "wrote
+//      a little", and cannot separate them. Only the POISON separates them — which is why the
+//      retraction verdict in `[v3d56] bpca-vs-bytes` is gated on the CONJUNCTION (advance == predicted
+//      AND poison fully intact) and never on the advance alone.
+//
+//  (2) **The 0x3000 was measured on the FULL probe draw list, not on an empty one.** The probe kicks
+//      `build_bin_cl_generic` — a complete draw list with geometry — which is only *effectively* empty
+//      because the coord shader never dispatches (`valid_instr=0`, the V3D-35/V3D-40 wall). So the
+//      honest statement is: the advance is architectural for a bin frame that BINNED NO PRIMITIVES,
+//      whatever the list nominally contained. Whether the §22 bisect Empty rung produces the same
+//      0x3000 has never been measured; that measurement would close the gap.
+//
+// CONCLUSION (scoped as above): BPCA advancing 0x3000 over a pool the poison proves untouched is
+// ARCHITECTURAL for a frame that binned no primitives. On that conjunction the "phantom/aliased write
+// pointer" verdict is RETRACTED — there would be no phantom bytes because there were never any bytes:
+// BPCA reports reserved space, and this driver read it as written space. The address question does not
+// reopen; the GPU MMU evidence (enabled, fault-free, our table latched) stands unchallenged, and the
+// defect collapses back to FLDONE generation, which `v3d56_emit_int_triple` below instruments.
+//
+// STATUS: **PENDING FIRST METAL BOOT.** The register semantics and the Mesa formula are settled from
+// source and need no confirmation. The retraction's second conjunct — poison intact — has never been
+// observed, because no `[v3d56]` line has ever run. Until a P56 boot prints one, this is a
+// well-supported prediction, not a measured result.
 //
 // Corroborating detail for the FLDONE hunt (same sources): FLDONE is asserted by the binning FLUSH
 // completing, not by CT0CA reaching CT0EA — CT0CA==CT0EA says only that the CLE consumed the list.
@@ -2312,24 +2332,78 @@ fn v3d56_arena_digest() -> V3d56ArenaDigest {
     d
 }
 
-/// Compare two arena digests and emit the `[v3d56] landing` witness. `pool_off`/`ts_off` name the two
-/// pages a legitimate bin write is allowed to change, so anything else is called out by name.
+/// One whitelisted (legitimately-writable) arena region for the landing sweep, with the label the
+/// witness prints when it changes.
+struct V3d56Expected {
+    label: &'static str,
+    first: usize, // first page index, inclusive
+    last: usize,  // last page index, inclusive
+}
+
+/// The regions a CORRECTLY-FUNCTIONING probe job is allowed to write. Anything outside these is the
+/// phantom landing zone.
+///
+/// The first two are the bin outputs under test. The last two are the V3D-56 evidence-integrity fix:
+/// they are *targets of the probe*, not anomalies, and whitelisting them is what keeps this witness
+/// from crying "phantom" at success —
+///
+///   * `OFF_PROBE_SCRATCH` is the TMU-store target — the four words the probe's coord shader writes
+///     and `probe_word` reads back. Producing that write is the entire reason the probe series exists
+///     (V3D-28/V3D-35). A WORKING probe changes this page BY DEFINITION; flagging it STRAY would make
+///     the sweep report its loudest failure verdict precisely when the GPU finally started working.
+///     The canary tail lives in the same page and is scanned separately by the existing V3D-28 canary
+///     check, which is the witness that actually adjudicates a misplaced store.
+///   * `OFF_PROBE_BIN_OVERFLOW` is the PTB overspill pool (`BPOA`). A PTB that exhausts the initial
+///     tile-alloc block and spills into its overflow block is doing exactly what the architecture
+///     specifies; the `OUTOMEM` path exists to service it. That is an architectural write to a page
+///     we handed the hardware on purpose, not a displaced one.
+const V3D56_EXPECTED_REGIONS: [V3d56Expected; 4] = [
+    V3d56Expected {
+        label: "tile-state (bin output)",
+        first: OFF_TILESTATE / PAGE,
+        last: (OFF_TILESTATE + TILE_STATE_BYTES - 1) / PAGE,
+    },
+    V3d56Expected {
+        label: "tile-alloc pool (bin output)",
+        first: OFF_BIN_TILEALLOC / PAGE,
+        last: (OFF_BIN_TILEALLOC + BIN_TILEALLOC_BYTES - 1) / PAGE,
+    },
+    V3d56Expected {
+        label: "probe TMU scratch (expected)",
+        first: OFF_PROBE_SCRATCH / PAGE,
+        last: (OFF_PROBE_SCRATCH + PROBE_CANARY_BYTES - 1) / PAGE,
+    },
+    V3d56Expected {
+        label: "PTB overspill (expected)",
+        first: OFF_PROBE_BIN_OVERFLOW / PAGE,
+        last: (OFF_PROBE_BIN_OVERFLOW + PROBE_BIN_OVERFLOW_BYTES - 1) / PAGE,
+    },
+];
+
+/// Compare two arena digests and emit the `[v3d56] landing` witness. Changes inside
+/// `V3D56_EXPECTED_REGIONS` are reported with their label; everything else is STRAY.
 fn v3d56_emit_landing(tag: &str, pre: &V3d56ArenaDigest, post: &V3d56ArenaDigest) {
-    let pool_first = OFF_BIN_TILEALLOC / PAGE;
-    let pool_last = (OFF_BIN_TILEALLOC + BIN_TILEALLOC_BYTES - 1) / PAGE;
-    let ts_page = OFF_TILESTATE / PAGE;
     let mut changed = 0u32;
-    let mut expected = 0u32; // changes inside pool / tile-state pages
+    let mut expected = 0u32; // changes inside a whitelisted region
     let mut stray = 0u32; // changes ANYWHERE else — the phantom landing zone
     let mut first_stray: i32 = -1;
     let mut last_stray: i32 = -1;
+    let mut hit = [0u32; V3D56_EXPECTED_REGIONS.len()]; // per-region changed-page counts
     let pages = pre.pages.min(post.pages);
     for p in 0..pages {
         if pre.sum[p] == post.sum[p] {
             continue;
         }
         changed += 1;
-        if (p >= pool_first && p <= pool_last) || p == ts_page {
+        let mut whitelisted = false;
+        for (r, region) in V3D56_EXPECTED_REGIONS.iter().enumerate() {
+            if p >= region.first && p <= region.last {
+                hit[r] += 1;
+                whitelisted = true;
+                break;
+            }
+        }
+        if whitelisted {
             expected += 1;
         } else {
             stray += 1;
@@ -2340,18 +2414,22 @@ fn v3d56_emit_landing(tag: &str, pre: &V3d56ArenaDigest, post: &V3d56ArenaDigest
         }
     }
     serial_println!(
-        ":: V3D: [v3d56] landing ({}) — arena {} pages ({:#x} B @ {:#010x}, the ENTIRE address space the V3D MMU grants this job) | changed={} (pool/tile-state pages {}..{},{} : {} | STRAY elsewhere: {}) first_stray_page={} (off {:#x}) last_stray_page={} — {} ::",
+        ":: V3D: [v3d56] landing ({}) — arena {} pages ({:#x} B @ {:#010x}, the ENTIRE address space the V3D MMU grants this job) | changed={} expected={} STRAY={} | per-region: {} p[{}..{}]={} · {} p[{}..{}]={} · {} p[{}..{}]={} · {} p[{}..{}]={} | first_stray_page={} (off {:#x}) last_stray_page={} — {} ::",
         tag, pages, ARENA_BYTES, arena_phys(),
-        changed, pool_first, pool_last, ts_page, expected, stray,
+        changed, expected, stray,
+        V3D56_EXPECTED_REGIONS[0].label, V3D56_EXPECTED_REGIONS[0].first, V3D56_EXPECTED_REGIONS[0].last, hit[0],
+        V3D56_EXPECTED_REGIONS[1].label, V3D56_EXPECTED_REGIONS[1].first, V3D56_EXPECTED_REGIONS[1].last, hit[1],
+        V3D56_EXPECTED_REGIONS[2].label, V3D56_EXPECTED_REGIONS[2].first, V3D56_EXPECTED_REGIONS[2].last, hit[2],
+        V3D56_EXPECTED_REGIONS[3].label, V3D56_EXPECTED_REGIONS[3].first, V3D56_EXPECTED_REGIONS[3].last, hit[3],
         first_stray,
         if first_stray < 0 { 0 } else { first_stray as usize * PAGE },
         last_stray,
         if stray != 0 {
-            "STRAY PAGE CHANGED across the bin window: the PTB's bytes landed OUTSIDE the pool and tile-state, inside the mapped arena. The phantom is located — read the offset above against the arena layout to name the region, and against BPCA to derive the pointer's true base"
+            "STRAY PAGE CHANGED across the bin window: bytes landed OUTSIDE every region this job legitimately writes (bin outputs, the probe TMU scratch, the PTB overspill pool), inside the mapped arena. Read the offset above against the arena layout to name the region, and against BPCA to derive the pointer's true base"
         } else if changed != 0 {
-            "the only pages that changed are the pool / tile-state pages — the PTB wrote exactly where it was told to; nothing is displaced, and the [v3d56] poison lines above say WHAT it wrote there"
+            "every changed page is a region this job is SUPPOSED to write (see the per-region counts) — nothing is displaced. Note this is NOT by itself a failure reading: a probe TMU-scratch or overspill hit is what SUCCESS looks like. The [v3d56] poison lines say what landed in the bin outputs"
         } else {
-            "NO arena page changed across the bin window. Since the V3D MMU grants this job no other addresses, the PTB wrote NOWHERE the GPU can reach — BPCA advanced without any accompanying memory traffic at all. Read this together with the BPCA-semantics finding: an advance with no write is the signature of a pointer that is reserved/pre-allocated rather than consumed"
+            "NO arena page changed across the bin window. Since the V3D MMU grants this job no other addresses, the PTB wrote NOWHERE the GPU can reach — BPCA advanced without any accompanying memory traffic at all. Read this together with the BPCA-semantics finding: an advance with no write is consistent with a pointer that is reserved/pre-allocated rather than consumed"
         }
     );
 }
@@ -2366,7 +2444,21 @@ fn v3d56_emit_landing(tag: &str, pre: &V3d56ArenaDigest, post: &V3d56ArenaDigest
 /// MSK bit1 is set). Note `wait_fldone` polls INT_STS directly — the RAW latch, which the mask does NOT
 /// gate — so a masked-but-latched FLDONE would already have been seen; this line puts that reasoning on
 /// serial with the numbers instead of leaving it implicit.
+///
+/// **Scope (default-quiet).** Gated on `V3D56_INT_TRIPLE`, and deliberately fired on EVERY `wait_fldone`
+/// exit rather than only the probe's. That is one line per bin kick, which is the intended cost: every
+/// caller of `wait_fldone` *is* a bin-retire wait (the probe, the §22 bisect rungs, the §28 resubmit,
+/// M4), the arc's whole remaining question is why FLDONE never asserts, and the bisect rungs are exactly
+/// where a rung-to-rung difference in the mask or the latch would show. Restricting it to the probe
+/// would blind the comparison that matters most. The enclosing V3D battery is itself default-quiet — it
+/// returns at `BLOCK-DOWN` wherever no V3D block exists (all of QEMU), so none of this reaches a
+/// non-metal log.
+const V3D56_INT_TRIPLE: bool = true;
+
 fn v3d56_emit_int_triple(what: &str, sts_entry: u32, msk_entry: u32, sts_exit: u32, msk_exit: u32) {
+    if !V3D56_INT_TRIPLE {
+        return;
+    }
     let masked_out_exit = sts_exit & msk_exit;
     serial_println!(
         ":: V3D: [v3d56] int ({}) — ENTRY INT_STS={:#010x} INT_MSK_STS={:#010x} | EXIT INT_STS={:#010x} INT_MSK_STS={:#010x} (1=MASKED) | FLDONE(bit1): latched={} masked={} | working-set V3D_IRQS={:#010x} unmasked_now={:#010x} | latched-but-masked={:#010x} — {} ::",
@@ -2442,7 +2534,14 @@ fn wait_fldone(what: &str, trace_ba: u32, trace_ea: u32) -> (u32, u64, bool) {
             let waited_us = (super::timer::cntpct().wrapping_sub(start)).saturating_mul(1_000_000) / frq.max(1);
             // PI-V3D-56 (item 4): the triple on the TIMEOUT exit too — this is the exit the empty rung
             // actually takes, so it is the one that has to name flush-vs-delivery.
-            v3d56_emit_int_triple(what, sts_entry, msk_entry, sts, mmio_read(V3D_CORE0_BASE, V3D_CTL_INT_MSK_STS));
+            //
+            // Re-read INT_STS here rather than reusing the loop's `sts`: that sample was taken before
+            // the deadline check and can be up to one poll-iteration stale. On the exit whose whole
+            // claim is "FLDONE never latched across the entire wait", a stale final sample could miss a
+            // bit that set in the last microseconds and turn a near-miss into a false negative. The
+            // mask is read at the same instant so the pair is coherent.
+            let sts_final = mmio_read(V3D_CORE0_BASE, V3D_CTL_INT_STS);
+            v3d56_emit_int_triple(what, sts_entry, msk_entry, sts_final, mmio_read(V3D_CORE0_BASE, V3D_CTL_INT_MSK_STS));
             let qpu_vec = (sts & V3D_INT_QPU_MASK) >> V3D_INT_QPU_SHIFT; // which QPU(s) raised a host int
             serial_println!(
                 ":: V3D: [v3d44] FLDONE timeout ({}) — INT_STS={:#010x} (FRDONE={} FLDONE={} OUTOMEM={} SPILLUSE={} TRFB={} GMPV={} QPU_vec={:#06x}) — {} ::",
@@ -4185,10 +4284,16 @@ fn probe_job() {
     // ── [v3d56] the poison scan + the whole-arena landing sweep ───────────────────────────────────
     // Run our own L2T write-back and KEEP the completion bit (the V3D-55 evidence-integrity rule: an
     // "untouched" readback is only evidence if the drain actually finished), then invalidate the CPU's
-    // view of the WHOLE arena. `invalidate_range`, not `clean_invalidate_range`: the arena was cleaned
-    // to PoC before the kick and the CPU has not written it since, so there are no dirty lines to
-    // preserve — and a clean pass here could write CPU-stale zeros back over GPU-written bytes, which
-    // would destroy the very evidence this sweep exists to find.
+    // view of the WHOLE arena.
+    //
+    // `invalidate_range` rather than `clean_invalidate_range` is a belt-and-braces preference here, NOT
+    // a claim that the clean variant is unsafe — `v3d55_tilestate_readback` calls `clean_invalidate_range`
+    // over the pool and tile-state one call earlier in this very path, and that call is correct. Every
+    // arena writer in this file cleans to PoC after writing (the poison fill included), so at this point
+    // there are no dirty CPU lines over the arena and the two primitives are equivalent. The plain
+    // invalidate is chosen only because it cannot become wrong if that invariant is ever broken by a
+    // future writer that forgets its clean: a clean pass would then write CPU-stale bytes back over
+    // GPU-written ones, destroying exactly the evidence this sweep exists to find.
     if V3D56_POISON {
         mmio_write(V3D_CORE0_BASE, V3D_CTL_L2TCACTL, V3D_L2TCACTL_L2TFLS | V3D_L2TCACTL_FLM_FLUSH);
         let flush_done =
