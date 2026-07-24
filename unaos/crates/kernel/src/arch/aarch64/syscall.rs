@@ -182,6 +182,29 @@ const SYS_INPUT_POLL: u64 = 27;
 /// Semaphore that `el0_input_enqueue` posts; QEMU has no real input source, so POLL is the QEMU-provable
 /// rung this arc lands.
 
+/// WC-B: the WINDOW verbs — the multi-surface successor to the single-surface `SYS_FB_MAP`/`SYS_FB_PRESENT`
+/// pair. Numbers start at 29 (28 is the reserved-DEFERRED `SYS_INPUT_WAIT` id, deliberately left unused).
+///
+///   SYS_WIN_CREATE(w, h) -> win id (0..WIN_MAX) / -errno
+///     Allocate a window owned by the CALLER's ASID and map its surface into the caller's EL0 window.
+///     `w`/`h` are pixels, 1..=128 each (`boot::FB_WIN_MAX_W/H`); the surface is ARGB8888 with
+///     `stride = w * 4`, and the mapping is negotiated PAGE-MULTIPLE (`ceil(w*4*h / 4096)` pages of the
+///     window's 64 KiB VA slot). The surface VA is published in the RO info page (see `fb_info_write`);
+///     `SYS_FB_MAP` remains the way to get it back as a return value for the compat window.
+///   SYS_WIN_PRESENT(win) -> 0 / -errno
+///     Damage-mark + composite the window. Fail-closed on a free id (`-EBADF`) or a window owned by
+///     another ASID (`-EACCES`). Bumps the focus-scoped present counter under the SAME focus guard
+///     `sys_fb_present` uses — the UVUG-8r2 suspension cap reads it (see `sys_fb_present`'s note).
+///   SYS_WIN_MOVE(win, x, y) -> 0 / -errno
+///     Reposition the window's top-left in screen space. Same ownership gate.
+///   SYS_WIN_CLOSE(win) -> 0 / -errno
+///     Unmap the surface (leaves revert to the reserved EL1-only identity descriptors) and free the
+///     window. Same ownership gate. Teardown (`clear_handle_row`) closes every window an ASID still owns.
+const SYS_WIN_CREATE: u64 = 29;
+const SYS_WIN_PRESENT: u64 = 30;
+const SYS_WIN_MOVE: u64 = 31;
+const SYS_WIN_CLOSE: u64 = 32;
+
 /// M6e demo: the sentinel `sys_exit` status the preemption spinner uses so its exit is accounted to
 /// `EL0_SPIN_DONE` and never perturbs the M6b `exited/killed` counters. Demo-only — there is no real
 /// userspace yet, so overloading one status value for demo bookkeeping is safe and documented here.
@@ -3571,6 +3594,11 @@ pub fn clear_handle_row(asid: u64) {
     // to a different process. (The heartbeat needs no clear: `takeover_suspends` ignores it once the latch is 0,
     // and `el0_input_set_active` resets it on the next focus anyway.)
     let _ = EL0_TAKEOVER_ASID.compare_exchange(asid, 0, Ordering::AcqRel, Ordering::Acquire);
+    // WC-B: close every WINDOW this ASID still owns — the window twin of the handle/file/input rows above,
+    // and for the same reason: a window row outliving its owner would name a surface inside a backing
+    // frame the slot's NEXT tenant gets, so the next program's private memory would be composited to the
+    // panel. Unmaps the surfaces too, so the reused ASID starts with the reserved EL1-only leaves.
+    win_close_asid(asid);
 }
 
 /// The ASID of the address space the caller is running in, read from `TTBR0_EL1[63:48]`. A syscall executes
@@ -5707,6 +5735,7 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
             elf1_report(a0);
             threads_report(a0);
             fb_report(a0);
+            wcb_report(a0);
             input_report(a0);
             0
         }
@@ -5734,6 +5763,10 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
         SYS_FB_PRESENT => sys_fb_present(),
         SYS_FUTEX => sys_futex(a0, a1, a2),
         SYS_INPUT_POLL => sys_input_poll(),
+        SYS_WIN_CREATE => sys_win_create(a0, a1),
+        SYS_WIN_PRESENT => sys_win_present(a0),
+        SYS_WIN_MOVE => sys_win_move(a0, a1, a2),
+        SYS_WIN_CLOSE => sys_win_close(a0),
         SYS_EXIT => {
             // Demo accounting BEFORE the no-return exit. The sentinel statuses are routed to their own
             // counters so the M6b (`exited=1 killed=3`) and M6e (`completed=1`) verdicts stay byte-
@@ -5878,6 +5911,10 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
                 // event, and polling empty again. Route by NAME so it lands in the ELF-5 witness, never the
                 // M6b `EL0_EXITED_OK` accounting.
                 INPUT_PARENT_DONE.store(a0 == 0, Ordering::Release);
+            } else if super::sched::current_name() == Some("el0-wcb") {
+                // WC-B: the window-verb fixture exits (status 0) after running its whole script. Route by
+                // NAME so it lands in the WC-B witness, never the M6b `EL0_EXITED_OK` accounting.
+                WCB_DONE.store(a0 == 0, Ordering::Release);
             } else if a0 == M6E_SPIN_STATUS {
                 EL0_SPIN_DONE.fetch_add(1, Ordering::AcqRel);
             } else if a0 == M6D_EXIT_STATUS {
@@ -9109,14 +9146,29 @@ fn user_va_to_phys(va: u64) -> u64 {
 /// surface VA. Requires a per-process slot (ASID != 0); `-EINVAL` from the shared/boot context. Idempotent
 /// (re-mapping re-writes the same leaves + info). The info page carries the geometry EL0 needs to draw.
 fn sys_fb_map() -> i64 {
-    let asid = current_asid();
-    if asid == 0 || asid as usize > super::boot::USER_SLOTS {
-        return EINVAL;
-    }
+    let asid = match win_caller_slot() {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
     let slot = (asid - 1) as usize;
+    // WC-B: SYS_FB_MAP is now a COMPAT WRAPPER over the caller's window 0 — "window 0" meaning the
+    // window occupying REGION SLOT 0 of this process's FB region, whose surface VA is byte-identical to
+    // the single ELF-3 surface's. Idempotent exactly as before: if the caller already holds that window
+    // (from an earlier SYS_FB_MAP or the first SYS_WIN_CREATE) we re-map and re-publish, we do not
+    // allocate a second one. If the global window table is full the map still succeeds — the legacy
+    // contract is "a mapped surface", and the surface is the process's OWN backing either way; only the
+    // compositor-visible window is missed, which is exactly the fail-closed direction (nothing extra is
+    // exposed to EL0).
     unsafe { super::boot::map_slot_fb(slot) };
-    // Write the geometry into the RO info page through the kernel identity pointer (EL1-RW; the EL0 alias
-    // is read-only). u32 fields: [magic, width, height, stride, format, size, surface_offset].
+    let _ = win_bind_compat(asid, slot);
+    fb_info_write_legacy(slot);
+    super::boot::fb_surface_va() as i64
+}
+
+/// WC-B: write the LEGACY info-page header — the ELF-3 field layout, byte-for-byte, describing region
+/// slot 0 at the 32×32 compat geometry. u32 fields: [magic, width, height, stride, format, size,
+/// surface_offset]. Written through the kernel identity pointer (EL1-RW; the EL0 alias is read-only).
+fn fb_info_write_legacy(slot: usize) {
     let info = super::boot::slot_fb_info_ptr(slot) as *mut u32;
     unsafe {
         info.add(0).write_volatile(FB_MAGIC);
@@ -9127,7 +9179,6 @@ fn sys_fb_map() -> i64 {
         info.add(5).write_volatile(super::boot::FB_SURFACE_SIZE as u32);
         info.add(6).write_volatile(super::boot::FB_INFO_SIZE as u32); // surface offset from the info base
     }
-    super::boot::fb_surface_va() as i64
 }
 
 /// FNV-1a 64-bit over `n` bytes at `p` — the surface checksum for the self-verifying witness.
@@ -9146,13 +9197,41 @@ fn fb_checksum(p: *const u8, n: usize) -> u64 {
 /// SYS_FB_PRESENT(): composite the caller's surface to the real screen (registered hook) and record its
 /// checksum for the witness. Requires a per-process slot. EL0 never sees the scan-out.
 fn sys_fb_present() -> i64 {
-    let asid = current_asid();
-    if asid == 0 || asid as usize > super::boot::USER_SLOTS {
-        return EINVAL;
-    }
+    let asid = match win_caller_slot() {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
     let slot = (asid - 1) as usize;
-    let surf = super::boot::slot_fb_surface_ptr(slot);
-    let sum = fb_checksum(surf, super::boot::FB_SURFACE_SIZE);
+    // WC-B: the compat wrapper presents the caller's REGION SLOT 0 surface at the legacy 32×32 geometry,
+    // with the legacy witness accounting, whether or not a window entry was ever bound (a window entry
+    // only adds the compositor-visible damage mark). Deliberately independent of the window table so this
+    // path cannot regress on table exhaustion — the ELF-3 fb-test verdict rides on it.
+    let win = win_lookup_compat(asid);
+    present_surface_common(
+        asid,
+        super::boot::slot_fb_surface_ptr(slot),
+        super::boot::FB_SURFACE_W,
+        super::boot::FB_SURFACE_H,
+        super::boot::FB_SURFACE_STRIDE,
+        super::boot::FB_SURFACE_SIZE,
+        win,
+    );
+    0
+}
+
+/// WC-B: the ONE present body both `SYS_FB_PRESENT` and `SYS_WIN_PRESENT` run — witness accounting, the
+/// UVUG-8r2 focus-scoped counter bump, the compositor damage mark, and the blit. Factored so the two
+/// verbs cannot drift; every ELF-3/UVUG-8 invariant below is unchanged from the single-surface version.
+fn present_surface_common(
+    asid: u64,
+    surf: *mut u8,
+    w: u32,
+    h: u32,
+    stride: u32,
+    size: usize,
+    win: Option<usize>,
+) {
+    let sum = fb_checksum(surf, size);
     FB_PRESENT_CHECKSUM.store(sum, Ordering::Release);
     FB_PRESENT_COUNT.fetch_add(1, Ordering::AcqRel);
     // UVUG-8r2: bump the FOCUS-SCOPED present counter too — the one `run_user_image`'s suspension cap reads.
@@ -9168,13 +9247,396 @@ fn sys_fb_present() -> i64 {
     if EL0_INPUT_ACTIVE.load(Ordering::Acquire) == asid {
         EL0_FOCUSED_PRESENT_COUNT.fetch_add(1, Ordering::AcqRel);
     }
-    let hook = FB_PRESENT_HOOK.load(Ordering::Acquire);
-    if hook != 0 {
-        // SAFETY: only `register_fb_present_hook` ever stores here, always a valid `FbPresentFn`.
-        let f: FbPresentFn = unsafe { core::mem::transmute(hook as usize) };
-        f(surf as *const u8, super::boot::FB_SURFACE_W, super::boot::FB_SURFACE_H, super::boot::FB_SURFACE_STRIDE);
+    // WC-INTEGRATION: `wc_shim::present` stands in for `video::wm::present(win, surf, w, h, stride)` —
+    // damage-mark the window and run the compositor pass. Until WC-A lands, the shim forwards to the
+    // ELF-3 present hook (the single-surface centred blit), which is exactly today's behaviour.
+    wc_shim::present(win, surf as *const u8, w, h, stride);
+}
+
+// =============================================================================================
+// WC-B — the WINDOW SURFACE/VERB SEAM (window compositor arc).
+//
+// A fixed table of WIN_MAX windows, each owned by exactly one ASID. Two indices, deliberately distinct:
+//   * the WINDOW ID (0..WIN_MAX) — GLOBAL, what EL0 passes to the WIN verbs and what the compositor
+//     names a window by;
+//   * the REGION SLOT (0..FB_WIN_SLOTS) — PER-ADDRESS-SPACE, which 64 KiB surface slot of the owner's
+//     own FB region backs it. Region slots are allocated lowest-first per ASID, so a process's FIRST
+//     window always lands on region slot 0 — the VA the single ELF-3 surface occupied, which is what
+//     makes `SYS_FB_MAP`'s returned VA byte-identical for the existing UVUG.ELF binary.
+// Collapsing the two would be wrong in both directions: a global surface index would leak one process's
+// surface VA layout into another's address space, and a per-ASID window id would make ids ambiguous to
+// the compositor.
+//
+// OWNERSHIP is authoritative HERE, not in the compositor: every verb resolves the caller's ASID from
+// TTBR0 (`current_asid`, the same read every handle gate uses) and refuses a window it does not own,
+// errno-for-errno with the handle gates — `-EBADF` for an id that is out of range or free (the
+// `sys_close` shape), `-EACCES` for a live window belonging to another ASID (the rights-denial shape).
+// Keeping the check on this side means the seam to WC-A carries no security weight.
+// =============================================================================================
+
+/// WC-B: the fixed window count. Matches `boot::FB_WIN_SLOTS` (asserted below) and the compositor's
+/// fixed table. STOP tripwire: a deliberate cap, like `USER_SLOTS` — do not raise it for a demo.
+const WIN_MAX: usize = 8;
+const _: () = assert!(WIN_MAX == super::boot::FB_WIN_SLOTS);
+/// WC-B: a 128×128 ARGB8888 surface must fit a window's 64 KiB VA slot exactly.
+const _: () = assert!(
+    (super::boot::FB_WIN_MAX_W * super::boot::FB_WIN_MAX_H * 4) as usize
+        == super::boot::FB_WIN_SLOT_SIZE
+);
+
+/// WC-B: one window table row. `owner == 0` means FREE (ASID 0 is the shared/boot context, which can
+/// never own a window — it has no per-process FB region), so the table needs no separate live flag.
+#[derive(Clone, Copy)]
+struct WinEntry {
+    owner: u64,
+    rslot: u8,
+    pages: u8,
+    w: u16,
+    h: u16,
+    x: i32,
+    y: i32,
+}
+
+impl WinEntry {
+    const FREE: WinEntry = WinEntry { owner: 0, rslot: 0, pages: 0, w: 0, h: 0, x: 0, y: 0 };
+}
+
+/// WC-B: the window table. A `SpinMutex` on the OWNED_FILES idiom (const-new, `Copy` rows), taken
+/// IRQ-masked via `IrqGuard` on EVERY access — it is acquired from syscall context (IRQs enabled,
+/// preemptible) AND from the IRQ-masked teardown path (`clear_handle_row` -> `win_close_asid`), the exact
+/// asymmetry `IrqGuard` exists to close. Held across the `map`/`unmap` MMU maintenance so a create and a
+/// close on two cores can never interleave their break-before-make sequences on the same leaf; it is a
+/// LEAF lock (nothing inside it calls back into any other lock).
+static WINDOWS: SpinMutex<[WinEntry; WIN_MAX]> = SpinMutex::new([WinEntry::FREE; WIN_MAX]);
+
+/// WC-B: resolve + range-check the caller's ASID for a window verb. `-EINVAL` from the shared/boot
+/// context (ASID 0) or an out-of-range ASID — the same refusal `SYS_FB_MAP` has always given, kept
+/// identical so no existing caller sees a new errno.
+fn win_caller_slot() -> Result<u64, i64> {
+    let asid = current_asid();
+    if asid == 0 || asid as usize > super::boot::USER_SLOTS {
+        return Err(EINVAL);
     }
+    Ok(asid)
+}
+
+/// WC-B: pages needed for a `w`×`h` ARGB8888 surface — the negotiated PAGE-MULTIPLE size. `None` if the
+/// geometry is out of range (0, or beyond `FB_WIN_MAX_W/H`), so every caller is fail-closed by shape.
+fn win_pages_for(w: u32, h: u32) -> Option<usize> {
+    if w == 0 || h == 0 || w > super::boot::FB_WIN_MAX_W || h > super::boot::FB_WIN_MAX_H {
+        return None;
+    }
+    let bytes = (w as usize) * 4 * (h as usize);
+    Some(bytes.div_ceil(0x1000))
+}
+
+/// WC-B: the id of the caller's COMPAT window (the one on region slot 0), if it holds one.
+fn win_lookup_compat(asid: u64) -> Option<usize> {
+    let _irq = IrqGuard::mask_save();
+    let t = WINDOWS.lock();
+    (0..WIN_MAX).find(|&i| t[i].owner == asid && t[i].rslot == 0)
+}
+
+/// WC-B: bind (or re-confirm) the caller's compat window — the window-table half of `SYS_FB_MAP`. The
+/// surface pages are already mapped by the caller; this only claims the table row so the compositor sees
+/// a window. Returns the id, or `None` when region slot 0 is already the caller's (idempotent re-map — a
+/// second call must not mint a second window) or when the table is full (the legacy map still succeeds;
+/// see `sys_fb_map`).
+fn win_bind_compat(asid: u64, _slot: usize) -> Option<usize> {
+    let _irq = IrqGuard::mask_save();
+    let mut t = WINDOWS.lock();
+    if let Some(i) = (0..WIN_MAX).find(|&i| t[i].owner == asid && t[i].rslot == 0) {
+        return Some(i);
+    }
+    let id = (0..WIN_MAX).find(|&i| t[i].owner == 0)?;
+    t[id] = WinEntry {
+        owner: asid,
+        rslot: 0,
+        pages: (super::boot::FB_SURFACE_SIZE / 0x1000) as u8,
+        w: super::boot::FB_SURFACE_W as u16,
+        h: super::boot::FB_SURFACE_H as u16,
+        x: 0,
+        y: 0,
+    };
+    // WC-INTEGRATION: `video::wm::create(id, asid, x, y, w, h, surface_ptr, stride)`.
+    wc_shim::create(
+        id,
+        asid,
+        0,
+        0,
+        super::boot::FB_SURFACE_W,
+        super::boot::FB_SURFACE_H,
+        super::boot::FB_SURFACE_STRIDE,
+    );
+    Some(id)
+}
+
+/// WC-B: resolve `win` as a LIVE window the CALLER owns. `-EBADF` out of range / free (the `sys_close`
+/// shape for an unresolvable id); `-EACCES` live but owned by another ASID (the rights-denial shape).
+/// Returns the row by value — every verb re-reads the table under the lock before mutating.
+fn win_resolve(asid: u64, win: u64) -> Result<(usize, WinEntry), i64> {
+    if win >= WIN_MAX as u64 {
+        return Err(EBADF);
+    }
+    let id = win as usize;
+    let _irq = IrqGuard::mask_save();
+    let t = WINDOWS.lock();
+    if t[id].owner == 0 {
+        return Err(EBADF);
+    }
+    if t[id].owner != asid {
+        return Err(EACCES);
+    }
+    Ok((id, t[id]))
+}
+
+/// WC-B: publish window `id`'s geometry into the owner's RO info page, at the PER-WINDOW entry for its
+/// region slot. Layout of the page (all u32, little-endian):
+///   [0x00..0x1C] the LEGACY ELF-3 header — magic, w, h, stride, format, size, surface_offset — which
+///                keeps describing region slot 0 so the existing UVUG.ELF reads exactly what it always did;
+///   [0x40 + r*0x20] per region slot `r`: magic, win_id, w, h, stride, size, surface_offset-from-info-base.
+/// A region slot with no live window keeps a zeroed entry (magic 0), so EL0 can tell live from stale.
+fn fb_info_write_win(slot: usize, id: usize, e: &WinEntry) {
+    let info = super::boot::slot_fb_info_ptr(slot) as *mut u32;
+    let stride = e.w as u32 * 4;
+    let off = super::boot::FB_INFO_SIZE + (e.rslot as usize) * super::boot::FB_WIN_SLOT_SIZE;
+    unsafe {
+        let p = info.add(0x40 / 4 + (e.rslot as usize) * (0x20 / 4));
+        p.add(0).write_volatile(FB_MAGIC);
+        p.add(1).write_volatile(id as u32);
+        p.add(2).write_volatile(e.w as u32);
+        p.add(3).write_volatile(e.h as u32);
+        p.add(4).write_volatile(stride);
+        p.add(5).write_volatile(FB_FORMAT_ARGB8888);
+        p.add(6).write_volatile(off as u32);
+    }
+}
+
+/// WC-B: zero window `id`'s per-window info entry on close, so EL0 cannot mistake a closed window's
+/// stale geometry for a live one (the info page outlives the window; only teardown zeroes the backing).
+fn fb_info_clear_win(slot: usize, rslot: usize) {
+    let info = super::boot::slot_fb_info_ptr(slot) as *mut u32;
+    unsafe {
+        let p = info.add(0x40 / 4 + rslot * (0x20 / 4));
+        for k in 0..(0x20 / 4) {
+            p.add(k).write_volatile(0);
+        }
+    }
+}
+
+/// SYS_WIN_CREATE(w, h): allocate a window for the caller, map its negotiated surface, return the id.
+/// `-EINVAL` bad geometry or no per-process slot; `-EMFILE` the caller has used every region slot of its
+/// own FB region; `-ENFILE` the GLOBAL window table is full (the `sys_open` errno pair, same meanings).
+fn sys_win_create(w: u64, h: u64) -> i64 {
+    let asid = match win_caller_slot() {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let slot = (asid - 1) as usize;
+    let (w32, h32) = (w as u32, h as u32);
+    // Reject BEFORE any truncation could hide an out-of-range request (a 64-bit arg cast to u32 could
+    // otherwise wrap a huge value into a legal one).
+    if w > super::boot::FB_WIN_MAX_W as u64 || h > super::boot::FB_WIN_MAX_H as u64 {
+        return EINVAL;
+    }
+    let pages = match win_pages_for(w32, h32) {
+        Some(p) => p,
+        None => return EINVAL,
+    };
+    let _irq = IrqGuard::mask_save();
+    let mut t = WINDOWS.lock();
+    // Lowest-free REGION slot for this ASID (so a process's first window is region slot 0 — the compat VA).
+    let rslot = match (0..WIN_MAX)
+        .find(|&r| !(0..WIN_MAX).any(|i| t[i].owner == asid && t[i].rslot as usize == r))
+    {
+        Some(r) => r,
+        None => return EMFILE,
+    };
+    let id = match (0..WIN_MAX).find(|&i| t[i].owner == 0) {
+        Some(i) => i,
+        None => return ENFILE,
+    };
+    let e = WinEntry {
+        owner: asid,
+        rslot: rslot as u8,
+        pages: pages as u8,
+        w: w32 as u16,
+        h: h32 as u16,
+        x: 0,
+        y: 0,
+    };
+    // Map the info page (idempotent) and exactly the negotiated pages of this window's surface slot.
+    // Under the table lock, so no concurrent close on another core can break-before-make the same leaves.
+    unsafe {
+        super::boot::map_slot_fb_info(slot);
+        super::boot::map_slot_fb_win(slot, rslot, pages);
+    }
+    t[id] = e;
+    if rslot == 0 {
+        // Region slot 0 is what the LEGACY header describes; keep it truthful for this geometry.
+        fb_info_write_legacy(slot);
+        let info = super::boot::slot_fb_info_ptr(slot) as *mut u32;
+        unsafe {
+            info.add(1).write_volatile(w32);
+            info.add(2).write_volatile(h32);
+            info.add(3).write_volatile(w32 * 4);
+            info.add(5).write_volatile((pages * 0x1000) as u32);
+        }
+    }
+    fb_info_write_win(slot, id, &e);
+    // WC-INTEGRATION: `video::wm::create(id, asid, x, y, w, h, surface_ptr, stride)`.
+    wc_shim::create(id, asid, 0, 0, w32, h32, w32 * 4);
+    id as i64
+}
+
+/// SYS_WIN_PRESENT(win): damage-mark + composite the caller's window. Ownership-gated (`-EBADF`/`-EACCES`).
+/// Runs the SAME body as `SYS_FB_PRESENT`, so the UVUG-8r2 focus-scoped present bump — the input the
+/// suspension cap in `run_user_image` reads — happens here too, under the same focus guard. A window verb
+/// that skipped it would hand a focused app a way to render forever without counting as progress.
+fn sys_win_present(win: u64) -> i64 {
+    let asid = match win_caller_slot() {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let (id, e) = match win_resolve(asid, win) {
+        Ok(v) => v,
+        Err(err) => return err,
+    };
+    let slot = (asid - 1) as usize;
+    let surf = super::boot::slot_fb_win_surface_ptr(slot, e.rslot as usize);
+    present_surface_common(
+        asid,
+        surf,
+        e.w as u32,
+        e.h as u32,
+        e.w as u32 * 4,
+        e.pages as usize * 0x1000,
+        Some(id),
+    );
     0
+}
+
+/// SYS_WIN_MOVE(win, x, y): reposition the caller's window (top-left, screen space). Ownership-gated.
+/// `-EINVAL` for a position outside the sane screen range — fail-closed rather than letting EL0 hand the
+/// compositor a coordinate it would have to defend against.
+fn sys_win_move(win: u64, x: u64, y: u64) -> i64 {
+    let asid = match win_caller_slot() {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let (xi, yi) = (x as i64, y as i64);
+    if !(-4096..=4096).contains(&xi) || !(-4096..=4096).contains(&yi) {
+        return EINVAL;
+    }
+    let (id, _) = match win_resolve(asid, win) {
+        Ok(v) => v,
+        Err(err) => return err,
+    };
+    {
+        let _irq = IrqGuard::mask_save();
+        let mut t = WINDOWS.lock();
+        // Re-check under the lock: a teardown on another core could have freed the row since resolve.
+        if t[id].owner != asid {
+            return EBADF;
+        }
+        t[id].x = xi as i32;
+        t[id].y = yi as i32;
+    }
+    // WC-INTEGRATION: `video::wm::move_window(id, x, y)`.
+    wc_shim::move_window(id, xi as i32, yi as i32);
+    0
+}
+
+/// SYS_WIN_CLOSE(win): unmap the caller's window surface and free the row. Ownership-gated. The unmap
+/// happens under the table lock and BEFORE the row is freed, so the surface is unreachable from EL0 the
+/// instant the row could be re-allocated to anyone else.
+fn sys_win_close(win: u64) -> i64 {
+    let asid = match win_caller_slot() {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let (id, _) = match win_resolve(asid, win) {
+        Ok(v) => v,
+        Err(err) => return err,
+    };
+    let slot = (asid - 1) as usize;
+    {
+        let _irq = IrqGuard::mask_save();
+        let mut t = WINDOWS.lock();
+        if t[id].owner != asid {
+            return EBADF; // freed under us by a racing teardown — already closed, nothing to do
+        }
+        let e = t[id];
+        unsafe { super::boot::unmap_slot_fb_win(slot, e.rslot as usize, e.pages as usize) };
+        fb_info_clear_win(slot, e.rslot as usize);
+        t[id] = WinEntry::FREE;
+    }
+    // WC-INTEGRATION: `video::wm::destroy(id)`.
+    wc_shim::destroy(id);
+    0
+}
+
+/// WC-B: close every window still owned by `asid` — the teardown half, called from `clear_handle_row`
+/// (already IRQ-masked; `IrqGuard` nests). A dying process must not leave a window in the compositor's
+/// table: the row would name a surface in a backing frame the slot's NEXT tenant owns, so the next
+/// program's private memory would be composited to the panel under the dead program's window. Unmaps
+/// first, exactly as `SYS_WIN_CLOSE` does, so a REUSED ASID starts with the reserved (EL1-only) leaves.
+pub fn win_close_asid(asid: u64) {
+    if asid == 0 || asid as usize > super::boot::USER_SLOTS {
+        return;
+    }
+    let slot = (asid - 1) as usize;
+    let mut closed = [false; WIN_MAX];
+    {
+        let _irq = IrqGuard::mask_save();
+        let mut t = WINDOWS.lock();
+        for id in 0..WIN_MAX {
+            if t[id].owner != asid {
+                continue;
+            }
+            let e = t[id];
+            unsafe { super::boot::unmap_slot_fb_win(slot, e.rslot as usize, e.pages as usize) };
+            fb_info_clear_win(slot, e.rslot as usize);
+            t[id] = WinEntry::FREE;
+            closed[id] = true;
+        }
+    }
+    for (id, &c) in closed.iter().enumerate() {
+        if c {
+            // WC-INTEGRATION: `video::wm::destroy(id)`.
+            wc_shim::destroy(id);
+        }
+    }
+}
+
+/// WC-B ↔ WC-A INTEGRATION SEAM. This module is a deliberately minimal stand-in for `video::wm` (unit
+/// WC-A's compositor core), which does not exist in this worktree — the two units are developed in
+/// parallel, lane-disjoint. Every call site into it is marked `// WC-INTEGRATION:` with the real API call
+/// it stands for, so the integrator's job is a mechanical swap of four function bodies:
+///   `create(id, asid, x, y, w, h, stride)`  -> `video::wm::create(...)`
+///   `present(win, surf, w, h, stride)`      -> `video::wm::present(...)` (damage-mark + composite)
+///   `move_window(id, x, y)`                 -> `video::wm::move_window(...)`
+///   `destroy(id)`                           -> `video::wm::destroy(...)`
+/// The shim carries NO state and NO policy: ownership, geometry validation and the surface mapping all
+/// live above, in the syscall gates, so swapping it in cannot move any security check. Until then
+/// `present` forwards to the ELF-3 present hook, which is byte-for-byte today's behaviour.
+mod wc_shim {
+    use super::{FbPresentFn, Ordering, FB_PRESENT_HOOK};
+
+    pub fn create(_id: usize, _asid: u64, _x: i32, _y: i32, _w: u32, _h: u32, _stride: u32) {}
+
+    pub fn present(_win: Option<usize>, surf: *const u8, w: u32, h: u32, stride: u32) {
+        let hook = FB_PRESENT_HOOK.load(Ordering::Acquire);
+        if hook != 0 {
+            // SAFETY: only `register_fb_present_hook` ever stores here, always a valid `FbPresentFn`.
+            let f: FbPresentFn = unsafe { core::mem::transmute(hook as usize) };
+            f(surf, w, h, stride);
+        }
+    }
+
+    pub fn move_window(_id: usize, _x: i32, _y: i32) {}
+
+    pub fn destroy(_id: usize) {}
 }
 
 /// SYS_FUTEX(uaddr, op, val): a physical-address-keyed EL0 wait/wake. Validates `uaddr` (4-aligned, inside
@@ -9862,6 +10324,243 @@ fn fb_launcher(_demo_cpu: usize) {
             ":: EL0: fb test — mapped={}x{} threads=2 present={} checksum={:#x} (want {}x{}/1/{:#x} done={}) :: FAIL ::",
             w, h, present, checksum,
             super::boot::FB_SURFACE_W, super::boot::FB_SURFACE_H, expect, done
+        );
+    }
+}
+
+// =============================================================================================
+// WC-B: the WINDOW-VERB fixture — an EL0 program that drives SYS_WIN_CREATE/_PRESENT/_MOVE/_CLOSE
+// through their happy paths AND their refusals, then reports a witness bitmask the kernel verdict
+// self-verifies. Single-threaded and register-only apart from its own surface, so it can never perturb
+// the ELF-2/ELF-3 accounting (it runs AFTER those verdicts print).
+//
+// Bit ledger (all ten must be set):
+//   b0 create(128,128) -> id >= 0            b5 present(8)         -> -EBADF (unknown id)
+//   b1 the per-window info entry reads back  b6 create(0,0)        -> -EINVAL
+//      magic/128/128 for region slot 0       b7 create(129,10)     -> -EINVAL (over FB_WIN_MAX_W)
+//   b2 present(id) -> 0                      b8 close(id)          -> 0
+//   b3 move(id,40,24) -> 0                   b9 close(id) again    -> -EBADF (row already free)
+//   b4 move(id,8192,0) -> -EINVAL
+// The verdict ALSO checks the kernel-side checksum of the presented surface against the expected FNV-1a
+// of 64 KiB of 0xC3 — so b2 cannot pass on a present that composited the wrong (or a stale) surface,
+// which is the property that actually proves the 16-page negotiated mapping landed.
+// =============================================================================================
+
+static WCB_DONE: AtomicBool = AtomicBool::new(false); // the fixture reached its clean sys_exit(0)
+static WCB_WITNESS: AtomicU64 = AtomicU64::new(0); // its reported bitmask
+/// WC-B: every bit of the ledger above.
+const WCB_WITNESS_ALL: u64 = 0x3FF;
+/// WC-B: the byte the fixture fills its whole 128×128 surface with.
+const WCB_FILL: u8 = 0xC3;
+
+/// WC-B: capture the fixture's `SYS_REPORT` (its witness bitmask), keyed by name. Ignores other tasks.
+fn wcb_report(value: u64) {
+    if super::sched::current_name() == Some("el0-wcb") {
+        WCB_WITNESS.store(value, Ordering::Release);
+    }
+}
+
+/// WC-B: the kernel-computed expected checksum of the presented surface — FNV-1a over a full
+/// 128×128 ARGB8888 surface (16 pages) of `WCB_FILL`. Mirrors `fb_expected_checksum`.
+fn wcb_expected_checksum() -> u64 {
+    let n = (super::boot::FB_WIN_MAX_W * super::boot::FB_WIN_MAX_H * 4) as usize;
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut i = 0usize;
+    while i < n {
+        h ^= WCB_FILL as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        i += 1;
+    }
+    h
+}
+
+// The WC-B fixture blob. Position-independent (`adr __wcb_blob_start` recovers the window base). Window
+// layout: page 0 code, parent stack the launcher-set window top. The RO info page is at base+0x4000 and
+// window region slot 0's surface at base+0x5000 — the same VAs the ELF-3 fixture uses, which is the
+// compat property this fixture also happens to prove. Numeric labels are reused deliberately: every
+// `b.* 9f` targets the NEXT `9:`, so each check falls through to the next on failure.
+core::arch::global_asm!(
+    r#"
+    .balign 4
+    .globl __wcb_blob_start
+__wcb_blob_start:
+    .globl __wcb_prog
+__wcb_prog:
+    adr  x9, __wcb_blob_start              // x9 = window base (PC-relative), preserved across svc
+    mov  x23, #0                           // x23 = witness bitmask
+    mov  x22, #0                           // x22 = window id
+
+    mov  x0, #128                          // (b0) SYS_WIN_CREATE(128, 128)
+    mov  x1, #128
+    mov  x8, #29
+    svc  #0
+    mov  x22, x0
+    cmp  x0, #0
+    b.lt 9f
+    orr  x23, x23, #(1 << 0)
+9:
+    add  x10, x9, #0x4000                  // (b1) the RO info page; per-window entry for region slot 0
+    ldr  w11, [x10, #0x40]                 // magic
+    ldr  w12, [x10, #0x48]                 // width
+    ldr  w13, [x10, #0x4c]                 // height
+    movz w14, #0
+    movk w14, #0xFB01, lsl #16             // FB_MAGIC
+    cmp  w11, w14
+    b.ne 9f
+    cmp  w12, #128
+    b.ne 9f
+    cmp  w13, #128
+    b.ne 9f
+    orr  x23, x23, #(1 << 1)
+9:
+    add  x12, x9, #0x5000                  // (b2) fill the WHOLE 64 KiB surface, then present
+    mov  w14, #0xC3
+    orr  w14, w14, w14, lsl #8
+    orr  w14, w14, w14, lsl #16
+    mov  x15, #0
+    movz x16, #1, lsl #16                  // 65536 bytes
+8:  str  w14, [x12, x15]
+    add  x15, x15, #4
+    cmp  x15, x16
+    b.lt 8b
+    dmb  ish                               // publish the drawn bytes before the present reads them
+    mov  x0, x22
+    mov  x8, #30                           // SYS_WIN_PRESENT(id)
+    svc  #0
+    cmp  x0, #0
+    b.ne 9f
+    orr  x23, x23, #(1 << 2)
+9:
+    mov  x0, x22                           // (b3) SYS_WIN_MOVE(id, 40, 24) -> 0
+    mov  x1, #40
+    mov  x2, #24
+    mov  x8, #31
+    svc  #0
+    cmp  x0, #0
+    b.ne 9f
+    orr  x23, x23, #(1 << 3)
+9:
+    mov  x0, x22                           // (b4) SYS_WIN_MOVE(id, 8192, 0) -> -EINVAL
+    mov  x1, #8192
+    mov  x2, #0
+    mov  x8, #31
+    svc  #0
+    cmn  x0, #22
+    b.ne 9f
+    orr  x23, x23, #(1 << 4)
+9:
+    mov  x0, #8                            // (b5) SYS_WIN_PRESENT(8) — off the end of the table -> -EBADF
+    mov  x8, #30
+    svc  #0
+    cmn  x0, #9
+    b.ne 9f
+    orr  x23, x23, #(1 << 5)
+9:
+    mov  x0, #0                            // (b6) SYS_WIN_CREATE(0, 0) -> -EINVAL
+    mov  x1, #0
+    mov  x8, #29
+    svc  #0
+    cmn  x0, #22
+    b.ne 9f
+    orr  x23, x23, #(1 << 6)
+9:
+    mov  x0, #129                          // (b7) SYS_WIN_CREATE(129, 10) -> -EINVAL (over the max edge)
+    mov  x1, #10
+    mov  x8, #29
+    svc  #0
+    cmn  x0, #22
+    b.ne 9f
+    orr  x23, x23, #(1 << 7)
+9:
+    mov  x0, x22                           // (b8) SYS_WIN_CLOSE(id) -> 0
+    mov  x8, #32
+    svc  #0
+    cmp  x0, #0
+    b.ne 9f
+    orr  x23, x23, #(1 << 8)
+9:
+    mov  x0, x22                           // (b9) SYS_WIN_CLOSE(id) again -> -EBADF (row already free)
+    mov  x8, #32
+    svc  #0
+    cmn  x0, #9
+    b.ne 9f
+    orr  x23, x23, #(1 << 9)
+9:
+    mov  x0, x23                           // SYS_REPORT(witness bitmask)
+    mov  x8, #3
+    svc  #0
+    mov  x0, #0                            // SYS_EXIT(0) -> routed to the WC-B witness by name
+    mov  x8, #2
+    svc  #0
+7:  b 7b
+
+    .balign 4
+    .globl __wcb_blob_end
+__wcb_blob_end:
+"#
+);
+
+unsafe extern "C" {
+    static __wcb_blob_start: u8;
+    static __wcb_blob_end: u8;
+    static __wcb_prog: u8;
+}
+
+/// WC-B launcher + verdict (the `fb_launcher` shape: one gated kernel task, self-contained, its own
+/// uncounted `:: EL0: window verbs — … ::` line). Placed AFTER the ELF-3 fb verdict and the UVUG witness
+/// have printed, so its presents cannot perturb their counters; in-RAM, so it never touches the FAT
+/// fixture battery. The fixture's slot is torn down at its exit, which also exercises the
+/// `clear_handle_row` -> `win_close_asid` teardown path (its window is already closed by then, so the
+/// sweep is a no-op — the honest limit of what a single-process fixture can show).
+fn wcb_launcher(_demo_cpu: usize) {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let bstart = &raw const __wcb_blob_start as usize;
+    let bend = &raw const __wcb_blob_end as usize;
+    let blen = bend - bstart;
+    if blen > super::boot::USER_CODE_SIZE {
+        serial_println!(":: EL0: window verbs — blob {} B > code page, SKIP ::", blen);
+        return;
+    }
+    let (base, size) = super::boot::user_region();
+    let sp = (base + size as u64) & !0xF; // 16-aligned window top = the fixture's initial SP_EL0
+    let Some(slot) = super::boot::alloc_user_slot() else {
+        serial_println!(":: EL0: window verbs — no free address-space slot, SKIP ::");
+        return;
+    };
+    let backing = super::boot::slot_backing_ptr(slot);
+    unsafe { core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen) };
+    super::cache::icache_sync_range(backing as usize, blen);
+    unsafe { super::boot::protect_user_slot_code(slot, super::boot::USER_CODE_SIZE) };
+    let ttbr0 = super::boot::slot_ttbr0(slot);
+    install_console_cap(ttbr0 >> 48);
+    let entry = base + (&raw const __wcb_prog as usize - bstart) as u64;
+    let run_cpu = super::percpu::this_cpu().cpu_index as usize;
+    super::sched::spawn_user_slot("el0-wcb", entry, sp, ttbr0, run_cpu);
+
+    // Verdict: yield (bounded ~2 s) so `el0-wcb` runs to its exit on this core.
+    let vstart = super::timer::cntpct();
+    let vdeadline = 2 * super::timer::cntfrq();
+    while !WCB_DONE.load(Ordering::Acquire)
+        && super::timer::cntpct().wrapping_sub(vstart) <= vdeadline
+    {
+        super::sched::yield_now();
+    }
+    let done = WCB_DONE.load(Ordering::Acquire);
+    let w = WCB_WITNESS.load(Ordering::Acquire);
+    let checksum = FB_PRESENT_CHECKSUM.load(Ordering::Acquire);
+    let expect = wcb_expected_checksum();
+    if done && w == WCB_WITNESS_ALL && checksum == expect {
+        serial_println!(
+            ":: EL0: window verbs — create/present/move/close witness={:#x} surface=128x128 checksum={:#x} :: PASS ::",
+            w, checksum
+        );
+    } else {
+        serial_println!(
+            ":: EL0: window verbs — witness={:#x} checksum={:#x} (want {:#x}/{:#x} done={}) :: FAIL ::",
+            w, checksum, WCB_WITNESS_ALL, expect, done
         );
     }
 }
@@ -10664,6 +11363,12 @@ pub fn u7_launcher(demo_cpu: usize) {
     // line. Placed after the EL0 graphics/thread ladder (the primitives it complements are proven). QEMU has
     // no real HID, so the kernel-injected event is what proves the enqueue->drain path (honest by design).
     input_launcher(demo_cpu);
+    // WC-B: the window verbs — SYS_WIN_CREATE/_PRESENT/_MOVE/_CLOSE, happy paths AND refusals, with the
+    // presented 128×128 surface self-verified against the kernel-computed checksum (which is what proves
+    // the 16-page negotiated mapping actually landed). In-RAM (no disk), and placed AFTER the ELF-3 fb
+    // verdict and the UVUG witness have printed, so its presents cannot perturb their counters; its own
+    // uncounted `:: EL0: window verbs — … ::` line.
+    wcb_launcher(demo_cpu);
     // K3: the revoke-persist commit-ordering proof — a named-owner file's SYS_FGRANT revoke commits to disk
     // BEFORE the in-RAM removal, so it SURVIVES REBOOT and fails CLOSED on a persist failure. Its own uncounted
     // `:: K3-revoke: … PASS ::` line; fully self-cleaning (leaves no owned row on the metal card).

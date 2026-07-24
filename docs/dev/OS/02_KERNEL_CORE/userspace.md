@@ -586,6 +586,56 @@
   the 1 s liveness stops an ongoing repeat while physically held — a benign, self-correcting degradation
   deliberately preferred over the catastrophic wedge it guards. Lane: `pal.rs` (tracker + queue depth) +
   `drivers/xhci/mod.rs` (report-level feed) + `main.rs` (pump call + selftest) + this doc.
+- **WC-B (this arc)** — the **window surface/verb seam**: the syscall half of the window-compositor arc
+  (unit WC-A owns the compositor core in `video/`). Four new verbs, `SYS_WIN_CREATE = 29`,
+  `SYS_WIN_PRESENT = 30`, `SYS_WIN_MOVE = 31`, `SYS_WIN_CLOSE = 32` (28 stays reserved for the deferred
+  `SYS_INPUT_WAIT`). ELF-3 exposed exactly ONE 4 KiB surface per process; WC-B turns that into **8 window
+  surface slots of 64 KiB each**.
+  - **FB region.** The reserved VA hole above the 16 KiB program window grew from `0x2000` to `0x81000`:
+    the RO info page, then 8 × 64 KiB window slots (`boot::FB_WIN_SLOTS`, `FB_WIN_SLOT_SIZE`). 64 KiB is
+    exactly a 128×128 ARGB8888 surface — the arc's maximum (`FB_WIN_MAX_W/H`). A surface's size is
+    **negotiated at create** and only its `ceil(w*4*h / 4096)` pages are mapped; the rest of the slot keeps
+    its reserved EL1-only identity leaf, so a process that asked for 32×32 cannot reach the remainder of
+    its own slot. Every mapped surface page uses the **same `user_data_page` shape** (EL0+EL1 RW, UXN,
+    Normal-cacheable, nG) the single ELF-3 surface page had — no MMU attribute changed.
+    `map_slot_fb_win` / `unmap_slot_fb_win` do proper **break-before-make** per page; unmap restores the
+    boot `L3_USER` descriptor, so a closed surface is unreachable from EL0 the instant the TLBI completes.
+    The VA anchor `USER_REGION` is now `align(0x100000)` (≥ its `0x85000` size) so the region still cannot
+    straddle a 2 MiB `L3_USER` block; the per-slot **backings** got their own page-aligned type, since a
+    backing is consumed one page at a time and does not need the anchor's alignment.
+  - **Two indices, deliberately distinct.** The **window id** (0..8) is global — what EL0 passes and what
+    the compositor names a window by. The **region slot** (0..8) is per-address-space — which 64 KiB
+    surface slot of the *owner's own* FB region backs it. Region slots are allocated lowest-first per
+    ASID, so a process's first window is always region slot 0, at the VA the single ELF-3 surface used.
+  - **Compat is exact.** `SYS_FB_MAP` and `SYS_FB_PRESENT` are wrappers over "window 0" = the caller's
+    region slot 0: `SYS_FB_MAP` returns the **same VA** as before and writes the **same legacy info-page
+    header** (magic, w, h, stride, format, size, surface-offset at offset 0), so the existing `UVUG.ELF`
+    binary runs unchanged. Per-window geometry is published alongside it at `0x40 + rslot*0x20`
+    (magic, win id, w, h, stride, format, surface-offset), zeroed on close so EL0 can tell live from stale.
+    `SYS_FB_PRESENT` deliberately does **not** require a window-table row — it presents the region-slot-0
+    surface with the legacy accounting either way, so the ELF-3 fb-test verdict cannot regress on table
+    exhaustion.
+  - **Ownership is authoritative in the syscall layer**, not the compositor: every verb resolves the
+    caller's ASID from `TTBR0` (`current_asid`, the same read the handle gates use) and refuses a window
+    it does not own, errno-for-errno with those gates — `-EBADF` for an out-of-range or free id (the
+    `sys_close` shape), `-EACCES` for a live window owned by another ASID (the rights-denial shape). The
+    table is a `SpinMutex` taken IRQ-masked via `IrqGuard` on every access (syscall context AND the
+    IRQ-masked teardown path), held across the MMU maintenance so a create and a close on two cores cannot
+    interleave break-before-make on the same leaf.
+  - **Teardown.** `clear_handle_row` closes every window the dying ASID still owns — the window twin of the
+    handle/file/input/latch clears, and for the same reason: a surviving row would name a surface inside a
+    backing frame the slot's NEXT tenant gets, compositing the next program's private memory to the panel.
+  - **UVUG-8 invariants preserved.** `SYS_WIN_PRESENT` and `SYS_FB_PRESENT` run one shared body, so the
+    **focus-scoped** `EL0_FOCUSED_PRESENT_COUNT` bump (under the same `EL0_INPUT_ACTIVE == asid` guard)
+    happens for window presents too — a window verb that skipped it would hand a focused app a way to
+    render forever without counting as progress, defeating the UVUG-8r2 suspension cap. Takeover latch,
+    heartbeat and orphan lifecycle are untouched.
+  - **Integration seam.** WC-A's `video::wm` does not exist in this unit's worktree (the units are
+    lane-disjoint and concurrent), so the four compositor calls go through a stateless private `wc_shim`
+    module, each call site marked `// WC-INTEGRATION:` with the real API it stands for
+    (`create`/`present`/`move_window`/`destroy`). The shim carries no state and no policy — ownership,
+    geometry validation and surface mapping all live in the gates above it — so the swap cannot move a
+    security check. Until then `present` forwards to the ELF-3 present hook, i.e. today's behaviour.
 - Not yet: **revocation trees** (a derived copy — re-grant or onward re-transfer — escapes
   single-level revoke today; derivation records + `CAP_REVOKE` are that arc), the **bandy Ring-3
   delegation wrapper**, `File` transfer (descriptor migration), real `Socket` fs/net syscalls.
@@ -751,6 +801,11 @@ Conventions shared across arches:
   | 25 | `SYS_FB_PRESENT` | — | 0 / `-errno` | aarch64 **ELF-3** — kernel composites the surface to the screen (present hook); records the surface checksum |
   | 26 | `SYS_FUTEX` | uaddr, op, val | op-specific / `-errno` | aarch64 **ELF-3** — op 0 WAIT (block iff `*uaddr==val`), op 1 WAKE (wake ≤`val`); phys-addr-keyed wait queue |
   | 27 | `SYS_INPUT_POLL` | — | packed event ≥ 0 / `-EAGAIN` | aarch64 **ELF-5** — nonblocking next input event for the caller (packed u64: `[55:48]`=type, low 32=payload), `-EAGAIN` when its per-process ring is empty; the router fills the ACTIVE process's ring via `el0_input_enqueue` |
+  | 28 | *(reserved)* | — | — | `SYS_INPUT_WAIT` — DEFERRED blocking twin of 27; the number stays unused |
+  | 29 | `SYS_WIN_CREATE` | w, h | win id ≥ 0 / `-errno` | aarch64 **WC-B** — allocate a window owned by the caller's ASID and map its negotiated (page-multiple) ARGB8888 surface; `w`,`h` ∈ 1..=128; `-EINVAL` bad geometry / no per-process slot, `-EMFILE` the caller used all 8 of its own region slots, `-ENFILE` the global 8-window table is full |
+  | 30 | `SYS_WIN_PRESENT` | win | 0 / `-errno` | aarch64 **WC-B** — damage-mark + composite the window; `-EBADF` unknown/free id, `-EACCES` owned by another ASID. Bumps the focus-scoped present counter under the same focus guard as `SYS_FB_PRESENT` (the UVUG-8r2 cap reads it) |
+  | 31 | `SYS_WIN_MOVE` | win, x, y | 0 / `-errno` | aarch64 **WC-B** — reposition the window's top-left in screen space; same ownership gate, `-EINVAL` outside ±4096 |
+  | 32 | `SYS_WIN_CLOSE` | win | 0 / `-errno` | aarch64 **WC-B** — unmap the surface (leaves revert to the reserved EL1-only descriptors) and free the row; same ownership gate |
 
   aarch64 leads 4–9 (M6f 4–7, M7 8–9) and 21–23 (ELF-2 threading); the x86 U-side port adopts the same
   numbers so the arches stay aligned (x86 adds SMAP considerations aarch64's PAN-less A72 lacks).

@@ -63,22 +63,50 @@ pub const USER_CODE_SIZE: usize = 0x1000;
 // only after `map_slot_fb` is called (from SYS_FB_MAP). EL0 NEVER gets the real scan-out: the kernel
 // composites the surface to the screen through SYS_FB_PRESENT (a public present hook the video
 // subsystem registers). Small (a 32×32 ARGB8888 surface = one page) — the point is the mechanism, not
-// resolution. Layout in the hole: [+0x4000] RO info page (1 page), [+0x5000] RW surface (1 page).
+// resolution.
+//
+// WC-B: the hole now carries N WINDOW SURFACE SLOTS, not one surface. Layout in the hole:
+//   [+0x4000]                             RO info page (1 page)
+//   [+0x5000 + w * FB_WIN_SLOT_SIZE]      window `w`'s RW surface slot (16 pages), w in 0..FB_WIN_SLOTS
+// Window slot 0 begins at exactly the VA the single ELF-3 surface used to occupy, so `fb_surface_va()`
+// (what `SYS_FB_MAP` returns) is BYTE-IDENTICAL to before and the existing UVUG.ELF binary is unaffected.
+// Each slot is 64 KiB = 16 pages, which covers the largest surface this arc admits (128×128 ARGB8888 =
+// 65536 B). A surface is negotiated at map time and only its PAGE-MULTIPLE size is actually mapped — the
+// rest of the slot stays at its reserved (EL1-only identity) leaf, so nothing beyond the negotiated
+// surface is reachable from EL0. Every mapped surface page uses `user_data_page` — the SAME MMU
+// attributes (EL0+EL1 RW, UXN, Normal-cacheable, nG) as the single ELF-3 surface page had.
 pub const FB_INFO_SIZE: usize = 0x1000; // the read-only geometry page (1 page)
 pub const FB_SURFACE_W: u32 = 32;
 pub const FB_SURFACE_H: u32 = 32;
 pub const FB_SURFACE_STRIDE: u32 = FB_SURFACE_W * 4; // ARGB8888, 4 bytes/pixel
 pub const FB_SURFACE_SIZE: usize = (FB_SURFACE_STRIDE * FB_SURFACE_H) as usize; // 4096 = 1 page
-/// The FB info + surface VA hole reserved above the program window.
-pub const FB_REGION_SIZE: usize = FB_INFO_SIZE + FB_SURFACE_SIZE; // 0x2000
+/// WC-B: window surface slots per process address space. Matches the compositor's fixed window table
+/// size (STOP tripwire: like `USER_SLOTS` this cap is deliberate — do not raise it for a demo).
+pub const FB_WIN_SLOTS: usize = 8;
+/// WC-B: bytes of VA reserved per window surface slot — 64 KiB = 16 pages = a 128×128 ARGB8888 surface.
+pub const FB_WIN_SLOT_SIZE: usize = 0x1_0000;
+/// WC-B: the largest surface edge a window may negotiate (128×128×4 == `FB_WIN_SLOT_SIZE`).
+pub const FB_WIN_MAX_W: u32 = 128;
+pub const FB_WIN_MAX_H: u32 = 128;
+/// The FB info + window-surface VA hole reserved above the program window.
+pub const FB_REGION_SIZE: usize = FB_INFO_SIZE + FB_WIN_SLOTS * FB_WIN_SLOT_SIZE; // 0x81000
 
-/// Total per-slot reserved region: the 16 KiB EL0 program window + the FB info/surface hole. Aligned to
-/// 0x8000 (>= the 0x6000 size) so the whole region is STRUCTURALLY guaranteed to fall inside one 2 MiB
-/// L3_USER block (0x8000 divides 2 MiB, and size <= 0x8000, so it can never straddle a 2 MiB boundary).
-const USER_STATIC_SIZE: usize = USER_REGION_SIZE + FB_REGION_SIZE; // 0x6000
-#[repr(C, align(0x8000))]
+/// Total per-slot reserved region: the 16 KiB EL0 program window + the FB info/window-surface hole.
+/// The VA ANCHOR (`USER_REGION`) is aligned to 0x100000 (>= the 0x85000 size) so the whole region is
+/// STRUCTURALLY guaranteed to fall inside one 2 MiB L3_USER block (0x100000 divides 2 MiB, and the size
+/// is <= 0x100000, so it can never straddle a 2 MiB boundary) — the single per-slot L3 covers it all.
+const USER_STATIC_SIZE: usize = USER_REGION_SIZE + FB_REGION_SIZE; // 0x85000
+#[repr(C, align(0x100000))]
 struct UserRegion([u8; USER_STATIC_SIZE]);
 static mut USER_REGION: UserRegion = UserRegion([0; USER_STATIC_SIZE]);
+
+/// The per-slot BACKING frames. Deliberately a distinct type from the VA anchor: only the anchor needs
+/// the 1 MiB alignment (it defines the VA hole and must not straddle 2 MiB). A backing is consumed one
+/// PAGE at a time (`build_slot`/`map_slot_fb*` install one leaf per page), so page alignment is the real
+/// requirement — and `USER_STATIC_SIZE` is itself a page multiple, so the array stride keeps every slot
+/// page-aligned. Using the anchor's alignment here would burn ~0.5 MiB of BSS per slot for nothing.
+#[repr(C, align(0x1000))]
+struct SlotBacking([u8; USER_STATIC_SIZE]);
 
 // --- Translation attributes (ARM ARM DDI0487). We drop to EL1 (see `drop_to_el1`) before enabling
 // the MMU, so these program the EL1&0 regime (TTBR0_EL1/TCR_EL1/MAIR_EL1/SCTLR_EL1). ---
@@ -201,7 +229,7 @@ fn build_l1() {
     // USER_REGION must be 4 KiB-aligned (whole L3 pages) and in the first 1 GiB (under L1[0]).
     debug_assert!(user_pa & 0xFFF == 0, "USER_REGION not 4 KiB aligned");
     debug_assert!(user_pa >> 30 == 0, "USER_REGION not in the first 1 GiB");
-    // Structurally guaranteed by align(0x4000) == the region size; documents that every page falls
+    // Structurally guaranteed by `UserRegion`'s align(0x100000) >= the region size; documents that every page falls
     // inside the ONE 2 MiB block L3_USER covers (a straddling tail would silently stay EL1-only).
     debug_assert!(
         user_pa >> 21 == (user_pa + USER_STATIC_SIZE as u64 - 1) >> 21,
@@ -373,8 +401,8 @@ pub const USER_SLOTS: usize = 8;
 static mut SLOT_L1: [PageTable; USER_SLOTS] = [const { PageTable([0; 512]) }; USER_SLOTS];
 static mut SLOT_L2: [PageTable; USER_SLOTS] = [const { PageTable([0; 512]) }; USER_SLOTS];
 static mut SLOT_L3: [PageTable; USER_SLOTS] = [const { PageTable([0; 512]) }; USER_SLOTS];
-static mut SLOT_BACKING: [UserRegion; USER_SLOTS] =
-    [const { UserRegion([0; USER_STATIC_SIZE]) }; USER_SLOTS];
+static mut SLOT_BACKING: [SlotBacking; USER_SLOTS] =
+    [const { SlotBacking([0; USER_STATIC_SIZE]) }; USER_SLOTS];
 /// Allocation state, one flag per slot. Atomic so `alloc`/`teardown` are race-free across cores.
 static SLOT_USED: [AtomicBool; USER_SLOTS] = [const { AtomicBool::new(false) }; USER_SLOTS];
 
@@ -423,7 +451,7 @@ pub fn slot_ttbr0(s: usize) -> u64 {
 /// coherent with the EL0 fetch/read of the same frame at the aliased user VA.
 pub fn slot_backing_ptr(s: usize) -> *mut u8 {
     debug_assert!(s < USER_SLOTS);
-    unsafe { (&raw mut SLOT_BACKING).cast::<UserRegion>().add(s).cast::<u8>() }
+    unsafe { (&raw mut SLOT_BACKING).cast::<SlotBacking>().add(s).cast::<u8>() }
 }
 
 /// Claim a free slot and build its private translation tables, returning the slot id. Pool-only (no heap),
@@ -578,9 +606,25 @@ pub fn fb_info_va() -> u64 {
     (&raw const USER_REGION as u64) + USER_REGION_SIZE as u64
 }
 /// ELF-3: the EL0 VA of slot `s`'s FB surface (EL0-RW off-screen draw target), one page above the info
-/// page. This is what SYS_FB_MAP returns to EL0.
+/// page. This is what SYS_FB_MAP returns to EL0. WC-B: identical to `fb_win_surface_va(0)` — the compat
+/// surface IS window slot 0, at the same VA it always had.
 pub fn fb_surface_va() -> u64 {
     fb_info_va() + FB_INFO_SIZE as u64
+}
+
+/// WC-B: the EL0 VA of window surface slot `w` (0..FB_WIN_SLOTS) in the caller's address space. Same VA
+/// in every process slot; the FRAME differs per process (its own backing), installed by `map_slot_fb_win`.
+pub fn fb_win_surface_va(w: usize) -> u64 {
+    debug_assert!(w < FB_WIN_SLOTS);
+    fb_info_va() + FB_INFO_SIZE as u64 + (w * FB_WIN_SLOT_SIZE) as u64
+}
+
+/// WC-B: kernel-side identity pointer to process-slot `s`'s window surface slot `w` (EL1-RW; the kernel
+/// reads it to composite / checksum, EL0 draws through the aliased EL0-RW VA — A72 PIPT caches keep the
+/// two coherent, exactly as for the single ELF-3 surface).
+pub fn slot_fb_win_surface_ptr(s: usize, w: usize) -> *mut u8 {
+    debug_assert!(s < USER_SLOTS && w < FB_WIN_SLOTS);
+    unsafe { slot_backing_ptr(s).add(USER_REGION_SIZE + FB_INFO_SIZE + w * FB_WIN_SLOT_SIZE) }
 }
 /// ELF-3: kernel-side identity pointer to slot `s`'s FB info page (EL1-RW, the kernel writes geometry
 /// here; the EL0 alias is read-only).
@@ -607,24 +651,95 @@ pub fn slot_fb_surface_ptr(s: usize) -> *mut u8 {
 /// freeze note in `build_slot` is about KERNEL mappings).
 pub unsafe fn map_slot_fb(s: usize) {
     debug_assert!(s < USER_SLOTS);
+    unsafe { map_slot_fb_info(s) };
+    // WC-B: the ELF-3 compat surface is window slot 0's FIRST page — byte-identical mapping to before.
+    unsafe { map_slot_fb_win(s, 0, FB_SURFACE_SIZE / 0x1000) };
+}
+
+/// WC-B: map slot `s`'s RO info page alone (the half of `map_slot_fb` every window path shares). Same
+/// break-before-make sequence and the same `user_ro_page` shape the combined ELF-3 call used.
+pub unsafe fn map_slot_fb_info(s: usize) {
+    debug_assert!(s < USER_SLOTS);
     let info_va = fb_info_va();
-    let surf_va = fb_surface_va();
     let info_pa = slot_fb_info_ptr(s) as u64;
-    let surf_pa = slot_fb_surface_ptr(s) as u64;
     let sl3 = unsafe { (&raw mut SLOT_L3).cast::<PageTable>().add(s).cast::<u64>() };
     let info_idx = ((info_va >> 12) & 0x1FF) as usize;
-    let surf_idx = ((surf_va >> 12) & 0x1FF) as usize;
     unsafe {
-        // Break: invalidate the old (identity, EL1-only) leaves.
-        sl3.add(info_idx).write_volatile(0);
-        sl3.add(surf_idx).write_volatile(0);
+        sl3.add(info_idx).write_volatile(0); // break
         core::arch::asm!("dsb ishst", options(nostack, preserves_flags));
         core::arch::asm!("tlbi vaae1is, {}", in(reg) (info_va >> 12), options(nostack, preserves_flags));
-        core::arch::asm!("tlbi vaae1is, {}", in(reg) (surf_va >> 12), options(nostack, preserves_flags));
         core::arch::asm!("dsb ish", options(nostack, preserves_flags));
-        // Make: install the FB frames (info EL0-RO, surface EL0-RW), then publish + sync this core.
-        sl3.add(info_idx).write_volatile(user_ro_page(info_pa));
-        sl3.add(surf_idx).write_volatile(user_data_page(surf_pa));
+        sl3.add(info_idx).write_volatile(user_ro_page(info_pa)); // make
+        core::arch::asm!("dsb ishst", "isb", options(nostack, preserves_flags));
+    }
+}
+
+/// WC-B: map the first `pages` pages of process-slot `s`'s window surface slot `w` into its EL0 window,
+/// EL0-RW Normal-cacheable (`user_data_page`) — the SAME leaf shape, and therefore the same MMU
+/// attributes, the single ELF-3 surface page has always had. `pages` is the NEGOTIATED page-multiple size
+/// (`w*h*4` rounded up), never the whole 16-page slot: the remainder keeps its reserved EL1-only identity
+/// leaf, so a process that asked for 32×32 cannot reach the rest of its own slot, let alone another's.
+///
+/// Same proper BREAK-BEFORE-MAKE as `map_slot_fb` (the output address changes on a live valid leaf):
+/// invalidate, broadcast-TLBI, then write the new leaf and publish.
+pub unsafe fn map_slot_fb_win(s: usize, w: usize, pages: usize) {
+    debug_assert!(s < USER_SLOTS && w < FB_WIN_SLOTS);
+    debug_assert!(pages >= 1 && pages <= FB_WIN_SLOT_SIZE / 0x1000);
+    let base_va = fb_win_surface_va(w);
+    let base_pa = slot_fb_win_surface_ptr(s, w) as u64;
+    let sl3 = unsafe { (&raw mut SLOT_L3).cast::<PageTable>().add(s).cast::<u64>() };
+    unsafe {
+        // Break: invalidate the old (reserved identity, EL1-only) leaves for the whole negotiated range.
+        for p in 0..pages {
+            let va = base_va + (p * 0x1000) as u64;
+            sl3.add(((va >> 12) & 0x1FF) as usize).write_volatile(0);
+        }
+        core::arch::asm!("dsb ishst", options(nostack, preserves_flags));
+        for p in 0..pages {
+            let va = base_va + (p * 0x1000) as u64;
+            core::arch::asm!("tlbi vaae1is, {}", in(reg) (va >> 12), options(nostack, preserves_flags));
+        }
+        core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+        // Make: install this window's surface frames EL0-RW, then publish + sync this core.
+        for p in 0..pages {
+            let va = base_va + (p * 0x1000) as u64;
+            let pa = base_pa + (p * 0x1000) as u64;
+            sl3.add(((va >> 12) & 0x1FF) as usize).write_volatile(user_data_page(pa));
+        }
+        core::arch::asm!("dsb ishst", "isb", options(nostack, preserves_flags));
+    }
+}
+
+/// WC-B: the `map_slot_fb_win` inverse, for `SYS_WIN_CLOSE` and ASID teardown. Restores the leaves to
+/// their RESERVED state — the boot L3's own descriptors for these VAs (identity RAM, EL1-only), exactly
+/// what `build_slot` copied in — so a closed window's surface is unreachable from EL0 the instant the
+/// TLBI completes, and a later re-create goes through the same break-before-make path as the first.
+///
+/// Unlike the map path this may run while the owner still has threads live (a close is a syscall a
+/// drawing sibling cannot be ordered against), so the invalidate-then-broadcast-TLBI-then-`dsb ish`
+/// ORDER is load-bearing: any concurrent EL0 access to a closed surface must fault, never read a stale
+/// mapping. That fault is the intended fail-closed outcome, not a regression.
+pub unsafe fn unmap_slot_fb_win(s: usize, w: usize, pages: usize) {
+    debug_assert!(s < USER_SLOTS && w < FB_WIN_SLOTS);
+    debug_assert!(pages >= 1 && pages <= FB_WIN_SLOT_SIZE / 0x1000);
+    let base_va = fb_win_surface_va(w);
+    let sl3 = unsafe { (&raw mut SLOT_L3).cast::<PageTable>().add(s).cast::<u64>() };
+    let boot_l3 = &raw const L3_USER as *const u64;
+    unsafe {
+        for p in 0..pages {
+            let va = base_va + (p * 0x1000) as u64;
+            sl3.add(((va >> 12) & 0x1FF) as usize).write_volatile(0);
+        }
+        core::arch::asm!("dsb ishst", options(nostack, preserves_flags));
+        for p in 0..pages {
+            let va = base_va + (p * 0x1000) as u64;
+            core::arch::asm!("tlbi vaae1is, {}", in(reg) (va >> 12), options(nostack, preserves_flags));
+        }
+        core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+        for p in 0..pages {
+            let idx = (((base_va + (p * 0x1000) as u64) >> 12) & 0x1FF) as usize;
+            sl3.add(idx).write_volatile(boot_l3.add(idx).read_volatile());
+        }
         core::arch::asm!("dsb ishst", "isb", options(nostack, preserves_flags));
     }
 }
