@@ -3,6 +3,39 @@
 Hard-won silicon facts from the fox-metal sitting series. Trust these over any
 QEMU behavior. Newest sitting first.
 
+## Sitting #18 (display pull 8 + fence pull 15, UnaOS-gemini@c4dbbbb6, 2026-07-24, fox-metal-r23s1j)
+
+**Single all-knob boot, both lanes served. Serial side capture-verified;
+PANEL OBSERVATION PENDING (Peter's color/position report — entry will be
+amended; the pattern mapping verdict waits on it).**
+
+**Display pull 8 (serial side):** geom w=2880 h=1800 pitch=11520; full latch
+ladder identical to s17 (asm-stuck=y, armed never followed, raster ticking
+t=1..8). **Mid-hold fact: 0x61634C read 0x00050008 while the pattern surface
+was latched — s13/s16 read 0x07380BAF (raster totals) at that same offset
+pre-latch.** The timing-cluster word CHANGES under an active latch (it took
+the value shape head 1 shows at reset). 0x616340 stayed raster-consistent;
+0x6101E0/0x61D1E0/0x61D014 all unmoved. Interpretation open until the panel
+report lands.
+
+**Fence pull 15 (method-mirror header 0x640000–0x6403FC, read-only):**
+- Structure (pass 0): zeros 0x000–0x088; lone 0x08C=0x2CB23507; solid
+  0xFF114D95 fill 0x090–0x168; five high-entropy words 0x16C–0x17C
+  (F3EEF6EE/8FD5136D/EE76BF7D/3642C748/CD3A5D9D); 0x240=0x00000801;
+  zeros elsewhere.
+- **The region is VOLATILE: pass 1 has 158 non-zero rows vs pass 0's ~62**
+  (the 0xFF114D95 fill GREW between passes; 302 fill-rows total across both).
+  This does not read like a stable register file — hypothesis (labeled as
+  such): the window is an aperture onto live memory (core-channel
+  pushbuffer/USERD territory), not config MMIO. Fence pull 16 design should
+  treat it as memory-backed and correlate against the display lane's latch
+  activity.
+- Coordinator row-count note: my capture count says pass1=158 non-zero
+  (bench said 159); rows=256 both passes confirmed.
+
+Head-scan preamble: all four heads evo=0 skip (expected, refuted mirrors);
+evo-core 32-row dumps present both passes.
+
 ## Sitting #17 (display pull 7, UnaOS-gemini@11f06ded, 2026-07-23, fox-metal-r23s1i) — ⭐ MILESTONE
 
 **FIRST DELIBERATE UNAOS PIXELS ON THE rMBP INTERNAL PANEL. The EVO
