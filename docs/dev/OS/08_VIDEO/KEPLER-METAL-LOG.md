@@ -16,8 +16,15 @@ row offset from our surface pointer (the old s18 "early rows → bottom
 band" mystery, now linearly measurable). Pull 17 = row-offset
 calibration: distinctive single white marker rows at known indices on
 black; photo names the offset; then adjust the pointer/fill and the full
-panel is ours. (Fox mid-boot worry about lin-step ordering: resolved —
-the display leg fired later in the boot; no gate issue.)
+panel is ours.
+**CAPTURE CAVEAT (coordinator awk, post-close):** the s26boot1 capture
+attached MID-GPU-INIT — zero early-init lines present (no Initializing
+Kepler / VRAM / therm / mirror-hdr; first GPU line is pgraph-pulse pre).
+Fox's "0 lin-step lines" is true of the CAPTURE, not the boot: the
+display leg is unconditional in code and the hold photo matches pull 16's
+prediction exactly. Serial proof of lin-step owed at s26boot2 (capture
+attached from power-on; presence check = "Initializing Kepler" +
+mirror-hdr rows in-capture before the kdisp block).
 
 **Fence — ⭐ THE FALCONS ARE FOUND: FECS 0x409000 + GPCCS 0x41A000 both
 REAL.** Verdict lines: cpuctl=00000010 at BOTH bases, imemc/dmemc =
