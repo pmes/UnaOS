@@ -3199,9 +3199,26 @@ fn proc_find_running(pid: u64) -> Option<usize> {
 /// the row from the exiting task's live `TTBR0_EL1`. The match is deliberately narrow — `PRUNNING` **and**
 /// `pid == 0` — so it can only ever name a row that is mid-publish. A row that is still `pid == 0` carries a
 /// non-zero `asid` only between those two stores, and a live EL0 ASID is unique to one slot, so there is no
-/// other candidate: an ELF-2 sibling thread's process row already has its pid published and is matched by
-/// `proc_find_running` as before. `asid == 0` (a freshly claimed, not-yet-endowed row) can never match,
-/// because only EL0 tasks reach SYS_EXIT and their ASIDs are non-zero.
+/// ambiguity about WHICH process a match names. `asid == 0` (a freshly claimed, not-yet-endowed row) can
+/// never match, because only EL0 tasks reach SYS_EXIT and their ASIDs are non-zero.
+///
+/// **`run_user_image` is not the only publisher this arm can match, and that is CORRECT — not an accident
+/// to be defended against.** `sys_spawn` (and the U7 / U6-grants launchers, which follow the same
+/// discipline) also spawn first and then store `asid` before `pid`, so their rows are `PRUNNING`,
+/// `pid == 0` and carrying the CHILD's asid for the same kind of window. An earlier draft of this comment
+/// asserted those rows "read `asid == 0` through their window so the arm cannot match them". That was
+/// simply false — they store the real child asid — and it planted an invariant the code does not have.
+/// What is true is that a match there is always the **child's own row**, because the exiting task IS that
+/// child, so posting its status and `done` is exactly what the parent's `sys_wait` is blocked waiting for.
+/// The arm therefore closes the identical latent race on the spawn path for free. It is left implicit
+/// rather than given its own witness because that path has never been observed to fail: `sys_spawn` returns
+/// to EL0 immediately after publishing, so its window is a handful of instructions with no UART write in
+/// it — the metal-width window is peculiar to `run_user_image`'s in-kernel launcher.
+///
+/// The two remaining publishers are made unmatchable at their source instead, because for them a match
+/// would be WRONG rather than helpful: `proc_free` clears `asid` before `pid` (see there), and
+/// `u8_kernel_check` plants its synthetic rows pid-first, since its scratch ASIDs are real allocatable
+/// values that a genuine unrelated process could be running under.
 fn proc_find_unpublished(asid: u64) -> Option<usize> {
     if asid == 0 {
         return None;
@@ -3309,8 +3326,18 @@ pub fn note_killed_task_retired(pid: u64) {
 
 /// Release a Proc entry to FREE — after reaping in sys_wait, or unwinding a failed sys_spawn claim.
 fn proc_free(i: usize) {
-    PROCS[i].pid.store(0, Ordering::Release);
+    // EXEC1-M — CLEAR THE ASID FIRST. The reverse order left a transient in which the row is still
+    // `PRUNNING` (the state store is last) with `pid == 0` and the OLD asid still present: precisely the
+    // shape `proc_find_unpublished` matches. A task of that address space exiting inside the transient
+    // would have been rescued onto a row that is being recycled, posting a stray `done` permit and breaking
+    // the "a reaped-then-reused entry always starts at 0 permits" invariant `proc_orphan` documents (a
+    // later `sys_wait` on the recycled row would then return a bogus status immediately). Clearing the
+    // asid first makes the row unmatchable for the whole teardown: `proc_find_unpublished` rejects
+    // `asid == 0` outright, and `proc_find_running`/`proc_find_child` never match `pid == 0` against a live
+    // task id. The window is narrow but real — the same class of two-store window this arc exists to close,
+    // and worth closing here for the same reason.
     PROCS[i].asid.store(0, Ordering::Release); // U7: drop the pid->ASID map with the entry
+    PROCS[i].pid.store(0, Ordering::Release);
     PROCS[i].state.store(PFREE, Ordering::Release);
 }
 
@@ -6683,6 +6710,14 @@ pub fn run_user_image(
     // lookup — wait, kill, orphan reclaim — uses); it is simply no longer load-bearing for correctness of the
     // exit path. Ordering is Release/Acquire throughout, so the endowed ASID is visible to any core that can
     // observe the task at all.
+    //
+    // NOTE, so the next reader does not conclude this window is unique: `sys_spawn` and the U7 / U6-grants
+    // launchers publish in the SAME order this one used to (spawn, then asid, then pid), so they have the
+    // same shape of window and the SYS_EXIT rescue arm CAN match their rows. There, matching is correct —
+    // the row is the exiting child's own, and the post is what its parent's `sys_wait` is waiting for — so
+    // they are deliberately left alone rather than reordered. Their windows are also a few instructions
+    // wide with no UART write inside, which is why only this launcher ever failed on metal. See
+    // `proc_find_unpublished` for the full accounting of which publishers can match and why.
     PROCS[pi].asid.store(asid, Ordering::Release);
     let pid = super::sched::spawn_user_slot(name, mapped.base, mapped.sp, mapped.ttbr0, cpu);
     // Publish the pid. The row may ALREADY be `PEXITED` by now (the late-publish rescue fired inside the
@@ -6692,8 +6727,14 @@ pub fn run_user_image(
     // INPUT-WIRE (ELF-5 router fold): register this program as the ACTIVE input target so the GUI router
     // (main.rs `pump_usb_into_gui`) delivers real keys/mouse into ITS per-process ring while it runs. Set
     // AFTER the slot exists and the pid is published (the router only enqueues to a live, resolvable ASID),
-    // and BEFORE the wait loop yields (the co-located task cannot be dispatched until we yield below, so no
-    // input is missed). Cleared on return just below — and `clear_handle_row` already clears the designation
+    // and BEFORE the wait loop. EXEC1-M correction: the original rationale here — "the co-located task
+    // cannot be dispatched until we yield below, so no input is missed" — is the same false cooperative
+    // claim this arc removed above; a tick can dispatch the task before this line runs, and the P56 capture
+    // shows exactly that (the program's output precedes this call's `[uvug8] focus asid=…` line). The
+    // consequence is benign and unchanged: a program that beats us here simply sees an empty ring for its
+    // first poll or two, which is indistinguishable from starting before any input arrived. Nothing is
+    // dropped that a caller could observe — setting a focus RESETS the ring in any case. Cleared on return
+    // just below — and `clear_handle_row` already clears the designation
     // on the slot's teardown, so an exited program's focus never lingers; the explicit clear covers the
     // Timeout path (task still alive, no teardown yet). Setting a focus RESETS the ring, so a fresh program
     // starts with an empty input queue.
@@ -16023,10 +16064,20 @@ fn u8_kernel_check() -> bool {
         proc_free(p1);
         return false;
     };
-    PROCS[p1].asid.store(R1, Ordering::Release);
+    // EXEC1-M — PLANT PID-FIRST, the reverse of the live spawn paths' order, and deliberately so. `R1`/`R2`
+    // (7, 8) are REAL allocatable ASID values, not reserved sentinels, so a genuine unrelated EL0 process
+    // can be running under one of them while this check plants its rows. Publishing the asid first would
+    // expose a `PRUNNING`/`pid == 0`/`asid == 7` row for the two instructions in between, which the SYS_EXIT
+    // late-publish rescue would match — posting that process's exit status and a `done` permit onto a
+    // SYNTHETIC row that belongs to no parent and is about to be freed here. Unlike the `sys_spawn` window
+    // (where a match names the exiting task's own row and the post is exactly right), a match here would be
+    // pure mis-attribution. Pid-first closes it: `proc_find_unpublished` rejects `asid == 0`, and the
+    // planted pids `0xE1`/`0xE2` are not live task ids, so `proc_find_running` cannot match them either.
+    // Order-only; the visible state once both stores land is identical.
     PROCS[p1].pid.store(PID1, Ordering::Release);
-    PROCS[p2].asid.store(R2, Ordering::Release);
+    PROCS[p1].asid.store(R1, Ordering::Release);
     PROCS[p2].pid.store(PID2, Ordering::Release);
+    PROCS[p2].asid.store(R2, Ordering::Release);
     // The sender's table: a delegable console cap at 0, Child handles naming R1/R2's tenants at 2 (R1)
     // and — in R1's own row — at 2 (R2), for the onward hop.
     install_cap(S, 0, KIND_CONSOLE, HANDLE_CONSOLE, CAP_WRITE | CAP_GRANT);

@@ -919,9 +919,28 @@
     one slot and an ELF-2 sibling's process row already has its pid published. The status and `done` post
     are identical to the live-child arm, so the parent observes `PEXITED` on its next pass. The pid store
     still happens (it remains the key for wait/kill/orphan-reclaim); it is simply no longer load-bearing
-    for the correctness of the exit path. Publish order elsewhere (`sys_spawn`, U7, U6-grants) is
-    deliberately **unchanged**: those rows still read `asid == 0` through their own window, so the new arm
-    cannot match them and their behaviour is byte-identical.
+    for the correctness of the exit path.
+  - **Which other publishers the arm can match — corrected.** The first cut of this write-up claimed
+    `sys_spawn` / U7 / U6-grants rows "read `asid == 0` through their own window, so the new arm cannot
+    match them". **That was false**, and is recorded here rather than quietly deleted because it planted an
+    invariant the code does not have. Those paths spawn first and then store `asid` *before* `pid` — the
+    same order `run_user_image` used to — so mid-publish their rows genuinely are `PRUNNING`, `pid == 0`,
+    carrying the child's ASID, with the child already dispatchable. **They can match, and matching is
+    correct there:** the row is the exiting child's own, so posting its status and `done` is precisely what
+    the parent's `sys_wait` is blocked on. The arm silently closes the identical latent race on the spawn
+    path. Those windows are a handful of instructions with no UART write inside them, which is why only
+    `run_user_image` — whose window contains `spawn_user_slot`'s placement print — was ever wide enough to
+    fail on metal.
+  - **The two publishers where a match *would* be wrong are fixed at the source.** `proc_free` stored
+    `pid = 0` before `asid = 0`, leaving a transient `PRUNNING` / `pid == 0` / *old* asid row — matchable,
+    and a match would post a stray `done` permit onto a row about to be recycled, breaking the
+    "reaped-then-reused entry always starts at 0 permits" invariant `proc_orphan` documents. It now clears
+    the **asid first**, making the row unmatchable for the whole teardown. `u8_kernel_check` plants
+    synthetic rows under scratch ASIDs 6/7/8, which are **real allocatable ASIDs** — a genuine unrelated
+    process under ASID 7 exiting in the two-instruction window would have been mis-attributed onto a
+    synthetic row belonging to no parent. It now plants **pid-first**, so the row is never
+    `asid`-matchable; the planted pids (`0xE1`/`0xE2`) are not live task ids, so the pid lookup cannot
+    match either. Both are order-only changes with identical settled state.
   - **Proven in QEMU by widening the window, not by argument.** A temporary 100 ms delay inserted between
     the spawn and the pid store reproduces the metal failure in QEMU **exactly**, down to the SKILL-1
     signature: `[uvug8] run deadline expired … parked PORPHANED (pid=102, asid=1)`,
@@ -939,7 +958,8 @@
   - Gates: `./arroyo check` green x86_64 + aarch64; `./arroyo kernel8` builds; `./arroyo kernel8-test 120`
     **49/49 required witnesses, 0 forbidden**, `:: EXEC1: run /fat/ELFHELLO.ELF — loaded 8560 bytes, entry
     0x300000, exit=0 -> PASS ::`; `./arroyo test-arm` green. Lane: `arch/aarch64/syscall.rs`
-    (`run_user_image` publish order, `proc_find_unpublished`, the `SYS_EXIT` rescue arm) + this doc.
+    (`run_user_image` publish order, `proc_find_unpublished`, the `SYS_EXIT` rescue arm, `proc_free` and
+    `u8_kernel_check` store order) + this doc.
 - **WC-C (window compositor, clients + focus)** — the arc where real EL0 programs use the window verbs.
   Full write-up: `docs/dev/OS/08_VIDEO/engine.md` §8 "WC-C". Userspace-visible changes:
   - **UVUG is windowed.** `crates/user-uvug` drops `SYS_FB_MAP`/`SYS_FB_PRESENT` for
