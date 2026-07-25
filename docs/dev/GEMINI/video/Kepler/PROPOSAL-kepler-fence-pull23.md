@@ -1,4 +1,6 @@
-STATUS: PROPOSED
+STATUS: APPROVED (2026-07-25, coordinator GR4). No amendments — read-only
+two-pass recon of both cited bases, zero writes, baselines retained,
+envytools citation present. All brief gates apply.
 
 # PROPOSAL: kepler-fence pull 23 - FECS/GPCCS base recon
 

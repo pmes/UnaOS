@@ -1,4 +1,6 @@
-STATUS: PROPOSED
+STATUS: APPROVED (2026-07-25, coordinator GR4). No amendments — single
+linear cycle at the mirror-decoded pitch, math checks (0x1C20000), recon
+kept gated, storage regs untouched. All brief gates apply.
 
 # Proposal — kepler-display pull 16: linear 16k fill
 
