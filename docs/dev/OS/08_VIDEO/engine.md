@@ -502,10 +502,34 @@ holds structurally rather than by convention. Colours are flat and deliberately 
 `place` tiles the non-compat windows left-to-right in id order with an 8-px gap, wrapping to a new
 row when the next outer box would run off the panel, and picks each window's scale as the largest
 integer factor fitting half the panel in each axis (so a 32x32 surface is legible on a 1920-wide
-panel and two windows still sit side-by-side). Layout depends only on the live set, not on the order
+panel and two windows still sit side-by-side), **capped at a legibility ceiling**. Layout depends
+only on the live set, not on the order
 of creates and closes, so it is deterministic. `move_to` pins a window out of the automatic layout.
 `close`/`close_owner` erase the vacated box, relayout and recomposite; `close_owner` is what task
 teardown calls, so a dead ASID can never leave a window compositing from a freed address space.
+
+#### The legibility ceiling (WC-SCALE)
+
+The fit rule alone is a function of the *surface*, so the smaller the surface the larger the
+magnification — midden's 24×16 status readout landed at `scale=37x` on the 1920×1200 bench panel,
+which is ~100 panel pixels per font pixel and reads as an abstract pattern rather than as digits.
+`wm::legibility_cap` bounds it: `scale ≤ ui::SCALE_MAX · ui::Metrics::for_height(panel_h).scale`.
+
+Both halves are pre-existing answers, not new constants — THE METRICS RULE holds, no absolute pixel
+size appears. `SCALE_MAX` is already the kernel's stated limit for magnifying bitmap content
+("beyond 4× legibility gains nothing and glyph blocks get blocky-huge") and `Metrics::for_height` is
+how every other UI dimension tracks the panel, so the ceiling is *four font-scale steps*: 4× on a
+≤ 1799-row panel, 8× on an 1800p-class one. It is the same **kind** of cap `screen::present_surface`
+applies on the compat path (there: ~40 % of the panel's shorter dimension); that path keeps its own
+rule, because a compat surface is a full-screen app's whole canvas and wants to be as large as it
+comfortably can, whereas a tiled window is one of several and wants to be as *readable* as it can.
+
+The cap shrinks the window's outer box, so tiling stays exactly as deterministic as before — no
+letterboxing, no reserved slot. Nothing here can move a checksum: `[wc-c]`/`[wc-d]` `cksum=` is FNV
+over the **source** `surf_len`, which no scale change touches. Concretely: on the 640×480 gate panel
+128×128 stays 1× and 64×64 stays 3× (both already under the cap, so the gate log is byte-identical);
+on the 1920×1200 bench panel 128×128 stays 4×, 64×64 comes down 9× → 4×, and 24×16 comes down
+37× → 4× (96×64 panel pixels — a status readout at a readable size).
 
 ### The compat shim
 
@@ -842,10 +866,10 @@ window-table lock before drawing, so nothing prevents another core's painter (th
 from writing into the rect between the blit and the verification. Such an overwrite is reported as
 `bad_cache>0` and is indistinguishable from a genuine blit defect; `first=` is the disambiguator to reach for.
 
-The boot-time "indecipherable" auto-launch surfaces are a **separate, cosmetic** matter and not this defect:
-`wm::place`'s scale rule maximises legibility, so midden's 24×16 surface lands at `scale=37x` on a 1920×1200
-panel — a few characters at enormous magnification, exactly as designed. If that is unwanted, the fix is a
-cap in `place` (as `screen::present_surface` already applies for the compat path), not a correctness change.
+The boot-time "indecipherable" auto-launch surfaces were a **separate, cosmetic** matter and not this defect:
+`wm::place`'s scale rule maximised legibility without bound, so midden's 24×16 surface landed at `scale=37x`
+on a 1920×1200 panel — a few characters at enormous magnification, exactly as designed. **WC-SCALE fixed
+that with the cap described under Layout above** (`wm::legibility_cap`), not with a correctness change.
 
 #### WC-D gate results (2026-07-25, QEMU raspi4b)
 

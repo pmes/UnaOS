@@ -229,8 +229,10 @@ REQUIRE \[wc-c\] side-by-side windows=2 drawn=2
 # ---    scanlines over the outer_box, a strict superset of the blitted pixels.
 # ---    The FORBID is the half with teeth: a FAIL verdict fails the gate wherever it appears.
 # ---    NOTE: the QEMU panel is 640x480 and the bench Pi drives 1920x1200, and the compositor's
-# ---    upscale is a FUNCTION of the panel — so this gate exercises scale 1x/3x/13x while the bench
-# ---    runs 4x. Run `UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test` to reproduce the bench
+# ---    upscale is a FUNCTION of the panel — so this gate exercises scale 1x/3x/4x while the bench
+# ---    runs 4x (WC-SCALE's legibility ceiling is 4x at both panel heights, and it is what brings the
+# ---    24x16 window down from the old 13x here / 37x there). Run
+# ---    `UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test` to reproduce the bench
 # ---    geometry here; that is the configuration in which the scaled blit was cleared (see
 # ---    docs/dev/OS/08_VIDEO/engine.md §WC-D).
 REQUIRE \[wc-d\] verify win=.*bad_cache=0 bad_ram=0.*-> PASS

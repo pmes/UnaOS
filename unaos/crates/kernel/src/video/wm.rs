@@ -1246,6 +1246,35 @@ fn create_inner(
 /// WC-A — gap in panel pixels between tiled windows (and from the panel edge).
 const GAP: usize = 8;
 
+/// WC-SCALE — the LEGIBILITY CEILING on a window's integer upscale, for a panel `ph` pixels tall.
+///
+/// The fit rule alone ("largest factor fitting half the panel") is a function of the *surface*, so the
+/// smaller the surface the larger the magnification: midden's 24x16 status readout landed at `scale=37x`
+/// on a 1920x1200 panel — a handful of 3x5 glyphs blown up to ~100 px per font pixel, which reads as an
+/// abstract pattern rather than as digits. Past a point, magnification stops adding legibility and starts
+/// removing it, and the surface's own content (bitmap glyphs, 1-px rules) is what sets that point.
+///
+/// THE METRICS RULE: no absolute pixel constant here. [`ui::SCALE_MAX`] is the kernel's existing answer to
+/// exactly this question for text — *"beyond 4x legibility gains nothing and glyph blocks get blocky-huge"* —
+/// and [`ui::Metrics::for_height`] is how every other UI dimension tracks the panel. So the ceiling is
+/// `SCALE_MAX` font-scale steps: `SCALE_MAX * metrics.scale`, i.e. 4x on a ≤1799-row panel and 8x on an
+/// 1800p-class one, growing with panel density the same way the console's type does.
+///
+/// This is the same *kind* of cap `screen::present_surface` applies on the compat path (there: "~40% of the
+/// panel's shorter dimension", a window-size ceiling); that path keeps its own rule, because a compat
+/// surface is a full-screen app's canvas and wants to be as big as it can comfortably be, whereas a tiled
+/// window is one of several and wants to be as *readable* as it can be.
+///
+/// Effect on the existing witness geometry (nothing here perturbs a checksum — `cksum` is FNV over the
+/// SOURCE `surf_len`, which no scale change touches): on the 640x480 gate panel the 128x128 window stays
+/// 1x and the 64x64 stays 3x, both already under the cap; on the 1920x1200 bench panel the 128x128 window
+/// stays 4x, the 64x64 comes down 9x → 4x, and the 24x16 comes down 37x → 4x.
+fn legibility_cap(ph: usize) -> usize {
+    crate::ui::SCALE_MAX
+        .saturating_mul(crate::ui::Metrics::for_height(ph).scale)
+        .max(1)
+}
+
 /// Lay out every non-compat, non-pinned window: pick each one's integer scale, then pack the outer
 /// boxes left-to-right in id order, wrapping to a new row when the next box would run off the panel.
 /// Called whenever the window set changes, so the tiling stays deterministic (it depends only on the
@@ -1254,7 +1283,7 @@ const GAP: usize = 8;
 ///
 /// Scale rule: the largest integer factor whose scaled surface fits half the panel width and half its
 /// height — big enough that a 32x32 surface is legible on a 1920-wide panel, small enough that two
-/// windows sit side-by-side. Never 0.
+/// windows sit side-by-side — **capped by [`legibility_cap`]**. Never 0.
 fn place(_created: WinId) {
     // Read the panel geometry BEFORE taking the table lock: `composite` takes the table lock and
     // releases it before touching `WRITER`, so no path ever holds both — no lock-order inversion.
@@ -1267,6 +1296,8 @@ fn place(_created: WinId) {
     let info = fb.info();
     let (pw, ph) = (info.width, info.height);
 
+    let cap = legibility_cap(ph);
+
     let mut t = TABLE.lock();
     let mut cx = GAP;
     let mut cy = GAP + TITLE_H + BORDER;
@@ -1277,7 +1308,7 @@ fn place(_created: WinId) {
             continue;
         }
         let (w, h) = (r.w.max(1), r.h.max(1));
-        let scale = ((pw / 2 / w).min(ph / 2 / h)).max(1);
+        let scale = ((pw / 2 / w).min(ph / 2 / h)).min(cap).max(1);
         // F5 — saturating throughout; `w`/`h` come from the caller via `create`.
         let bw = w.saturating_mul(scale).saturating_add(2 * BORDER);
         let bh = h
