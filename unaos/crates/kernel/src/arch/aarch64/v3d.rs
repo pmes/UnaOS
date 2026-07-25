@@ -123,10 +123,15 @@ const V3D_CTL_IDENT1_REV_MASK: u32 = 0xF;
 
 /// Decode HUB_IDENT1 / CORE IDENT0 / CORE IDENT1 into the mainline version NUMBER
 /// (`tver * 10 + rev`), the core count, and the two corroborating witnesses. Pure function, no MMIO.
+///
+/// `ncores` is returned RAW. The pre-V3D-61 code clamped it with `.max(1)` — a defensible hedge when
+/// the field being read was the wrong one, but under the corrected map an `NCORES` of 0 is a genuine
+/// anomaly (a hub reporting no cores behind it) and laundering it into a plausible 1 would hide exactly
+/// the class of thing this arc exists to stop hiding.
 fn v3d_ident_version(hub1: u32, c0: u32, c1: u32) -> (u32, u32, u32, u32, bool, bool) {
     let tver = (hub1 >> V3D_HUB_IDENT1_TVER_SHIFT) & V3D_HUB_IDENT1_NIB_MASK;
     let rev = (hub1 >> V3D_HUB_IDENT1_REV_SHIFT) & V3D_HUB_IDENT1_NIB_MASK;
-    let ncores = ((hub1 >> V3D_HUB_IDENT1_NCORES_SHIFT) & V3D_HUB_IDENT1_NIB_MASK).max(1);
+    let ncores = (hub1 >> V3D_HUB_IDENT1_NCORES_SHIFT) & V3D_HUB_IDENT1_NIB_MASK;
     let ver = tver * 10 + rev;
     let sig_ok = (c0 & 0x00FF_FFFF) == V3D_CTL_IDENT0_SIG;
     let core_ver_ok =
@@ -5105,7 +5110,11 @@ fn v3d60_ident(hub1: u32, hub2: u32, hub3: u32, c0: u32, c1: u32, c2: u32) {
         if ver_ok && sig_ok && core_ver_ok {
             "version CONFIRMED on three independent witnesses (hub TVER/REV, core IDENT0 'V3D' signature + major byte, core IDENT1 revision nibble): the silicon is the generation the CL packing, the shader-word encoding and the register offsets were all audited against. The campaign's foundation holds. (V3D-61: the pre-V3D-61 probe read this version from HUB_IDENT1's TOP BYTE and compared it against the HEX 0x42; both were wrong, and P59's 'VERSION MISMATCH' was that decode's artifact — RETRACTED)"
         } else if ver_ok {
-            "version field reads 4.2 but a CORROBORATING witness disagrees — either the core signature is absent or the core's own version nibbles do not match the hub's. Treat the identity as UNSETTLED and resolve before trusting further PTB readings"
+            if !sig_ok {
+                "version field reads 4.2 but the CORE SIGNATURE witness disagrees — CORE0 IDENT0's low three bytes are not the ASCII 'V3D' mark, so the core register window may not be the block the hub describes. Treat the identity as UNSETTLED and resolve before trusting further PTB readings"
+            } else {
+                "version field reads 4.2 and the core signature is present, but the CORE VERSION witness disagrees — CORE0 IDENT0's major byte and/or CORE0 IDENT1's revision nibble do not match the hub's TVER/REV. Treat the identity as UNSETTLED and resolve before trusting further PTB readings"
+            }
         } else {
             "VERSION MISMATCH — under the V3D-61-corrected field map (version = HUB_IDENT1 TVER*10 + REV, decimal) the block does NOT report 42. This driver's packet encoding, QPU word packing and register map were all audited against V3D 4.2; a genuine mismatch invalidates the campaign's foundation and MUST be resolved before any further PTB reading is trusted"
         }

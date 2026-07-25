@@ -2173,6 +2173,18 @@ line state the version from the right field and report its corroboration explici
 read-only; `CTRSTA` stays disarmed. On metal the corrected line will read version `4.2 (ver=42)`,
 `cores=1`, signature `OK`, core-version-agrees `1`, and the CONFIRMED verdict.
 
+`ncores` is printed **raw** — the pre-V3D-61 `.max(1)` clamp is dropped. Under the corrected map an
+`NCORES` of 0 is a genuine anomaly, and laundering it into a plausible 1 would conceal precisely the
+class of defect this arc exists to expose.
+
+**Future-proofing note.** The `CONFIRMED` verdict requires **all three** witnesses to agree — the hub's
+`TVER`/`REV`, the core's `'V3D'` signature, and the core's own version bytes. A future silicon revision
+that bumped the core's `IDENT1` revision nibble *independently* of the hub's would therefore read
+`UNSETTLED` on a perfectly healthy part. That is the right trade for a bench probe, where a hedged
+reading costs an operator one line of log; it would be the wrong trade if this check ever **gated boot**.
+If the verdict is ever promoted from a witness to a gate, split it: the hub version decides, and the
+core witnesses annotate.
+
 ### Discipline
 
 Every V3D-60 probe is **read-only** — no register is written, so no write needs justifying, and `CTRSTA`
