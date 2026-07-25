@@ -428,7 +428,7 @@ pub fn init(gpu: &GpuInfo) {
                                     // Witness check
                                     if (ch_1_0_pre & 0xC0000000) != 0xC0000000 {
                                         serial_println!(":: kepler: WITNESS FAILED - bits stripped. Restoring inst_off+0x0C ::");
-                                        unsafe { core::ptr::write_volatile((bar1 + inst_off + 0x0C) as *mut u32, (userd_off >> 32) as u32); }
+                                        core::ptr::write_volatile((bar1 + inst_off + 0x0C) as *mut u32, (userd_off >> 32) as u32);
                                         // Re-test PFIFO_CHAN[1] to clear state
                                         mmio_write(bar0, 0x800000 + (1 * 8), 0);
                                         mmio_write(bar0, 0x800004 + (1 * 8), 0x00000400);
