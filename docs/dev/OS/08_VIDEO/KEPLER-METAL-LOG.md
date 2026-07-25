@@ -3,6 +3,40 @@
 Hard-won silicon facts from the fox-metal sitting series. Trust these over any
 QEMU behavior. Newest sitting first.
 
+## Sitting #27 (display pull 17 + fence pull 24, UnaOS-gemini@b9f3d9bf/f2dbb032, 2026-07-25, fox-metal-r23s1m, s27boot1)
+
+**Fence — ⭐ UCODE UPLOAD PATH PROVEN, BOTH FALCONS.** All sixteen
+sentinel words returned exactly (DEADBEEF/CAFEF00D/12345678/A5A55A5A,
+imem AND dmem, FECS 0x409000 AND GPCCS 0x41A000); IMEMC/DMEMC control
+readbacks real (rb=01000000). AINCW(24)/AINCR(25) discipline works as
+specced. K-GPU-4 milestone 1 complete. Pull 25 = MILESTONE 2: first
+from-scratch Falcon microcode — a minimal hand-assembled program (≤16
+words: write a magic to MAILBOX0 at base+0x040, then EXIT), uploaded via
+IMEMC/IMEMD (+IMEMT tag per 256B block, per envytools falcon docs),
+BOOTVEC=0, CPUCTL=2, bounded poll for halt, read MAILBOX0 from the host.
+Magic in MAILBOX0 = first UnaOS-authored code executed on GPU silicon.
+FECS first; GPCCS only after FECS behaves. CLEANROOM notice binding —
+instruction encodings cited from envytools falcon ISA docs only.
+
+**Display — ROW-CAL PHOTO VERDICT: only WHITE (rows 0–7) visible, a
+single line ~62–66% down the panel; RED@448, GREEN@896, BLUE@1344,
+MAGENTA@1792 all ABSENT.** That refutes simple 1:1-with-offset: at 1:1,
+red@448 would land ~600 panel rows below the white line and still be
+on-screen. Also note the arithmetic bound: our pointer 0x1600000 is only
+352 rows (×16384) above VRAM 0, so a 1:1 scan placing our row 0 at panel
+~1190 is impossible — the placement model involves scaling, a partial
+scan window, or a wrap. Candidates for the specialist to discriminate:
+(a) vertical scaling (fw mode < native, line-doubling), (b) scan window
+smaller than 1800 rows, (c) pointer-latch granularity. Pull 18 =
+specialist-designed placement-model probe (single latch cycle,
+restore-paired) whose pattern discriminates those hypotheses in one
+photo. Serial side of pull 17 clean (fill 01C20000, holds, done,
+late-recap ran=true).
+
+Boot from staged s27boot1-rowcal-falport-20260725T1619Z-b9f3d9bf,
+coordinator ESP sha-verified afd16f36 (no self-build). Capture from byte
+1130795.
+
 ## Sitting #26 (display pull 16 + fence pull 23, UnaOS-gemini@5e962ee1, 2026-07-25, fox-metal-r23s1m, s26boot1)
 
 **Display — ⭐⭐ MAPPING SOLVED: LINEAR, PITCH 0x4000, CONFIRMED ON PANEL.**
