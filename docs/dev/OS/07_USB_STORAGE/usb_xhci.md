@@ -562,6 +562,7 @@ counter — always live, no init, no interrupt dependency) and emits exactly one
 | --- | --- | --- |
 | `census-power-clock` | the `[piusb32]` mailbox power/clock census | 3 mailbox calls, 500 ms each on timeout |
 | `fw-state-dump` | PIUSB-5 read-only pre-reset dump | RC-own reads; CAP ladder only when link-up |
+| `entry-link-discriminator` | the PIUSB-16 entry PCIE_STATUS/RGR1 reads | 2 RC-own reads |
 | `dump-linkdown-rc-claim` | the link-down fall-through's `witness_rc_cpu_claim` | RC-own MISC/BAR2 reads |
 | `dump-linkdown-serror-drain` | the fall-through's SError drain window | no loop; bounded by construction |
 | `m1-rc-bringup` | whole M1 (bridge reset → windows → PERST → link) | sum of the two below plus ~2 ms of pulses |
@@ -600,24 +601,40 @@ that put the link-down MMIO gate in). A ladder that reads as a 40 ms budget can 
 explanation for the three minutes, and the `m2-mmio-verify` / `m3-cap-probe` lines now measure it
 directly.
 
-All three now route through one helper, `mmio_settle_read`, which is bounded three ways:
+All three now route through one helper, `mmio_settle_read`, bounded three ways — and it matters which
+one is load-bearing:
 
 1. the original try count (unchanged — a healthy decode still completes identically);
-2. a **total wall-clock cap**, `MMIO_LADDER_BUDGET_MS = 60` (≈12× the 5 ms inter-try settle these
-   ladders were written around, so it never bites on a link that answers at all);
-3. a **per-read cost check**, `MMIO_ABORT_COST_MS = 20` — the ladder measures each individual read
-   and stops the moment one exceeds it, emitting
+2. **the safety bound**: a total wall-clock cap, `MMIO_LADDER_BUDGET_MS = 60`. This is what actually
+   bounds the ladder. It is ≈12× the 5 ms inter-try settle these ladders were written around, so it
+   never bites on a link that answers at all;
+3. **a diagnostic label**, not a second bound: a per-read cost check, `MMIO_ABORT_COST_MS = 20`. The
+   ladder measures each read and, when one exceeds it, stops early and *names why*:
 
    ```
-   [piusb40] mmio-ladder @ 0x…: try N took …ms (>= 20ms) — the RC is absorbing this read as a
-   completion timeout, not answering it; … Ladder STOPPED at …ms (fail-fast to the honest no-USB path)
+   [piusb40] mmio-ladder @ 0x…: try N took …ms (>= 20ms) — consistent with the RC absorbing this read
+   as a completion timeout rather than answering it; … Ladder STOPPED at …ms
    ```
 
-A read that expensive is a master-abort being absorbed; every further try buys the same abort at the
-same price, so continuing is pure dead time. 20 ms is far above any honest Device-nGnRnE read
-(sub-microsecond off a decoding BAR) and far below the multi-second stalls metal has shown, so it
-separates the two cases without ever cutting a real answer short. The caller's fail-closed branch is
-unchanged in every case — the ladder only reaches its verdict sooner.
+The honest reading of (3): a read that expensive is *consistent with* a master-abort being absorbed,
+and continuing would buy the same abort at the same price — but the check is there to **explain** the
+time, not to be the thing that limits it. Strip it out and the wall budget still holds. 20 ms is far
+above any honest Device-nGnRnE read (sub-microsecond off a decoding BAR) and far below the
+multi-second stalls metal has shown, so it separates the cases without cutting a real answer short.
+Because `MRS CNTPCT_EL0` is not ordered against a Device load, the measured load is `dsb sy`-bracketed
+on both sides — without that the cost can under-report an absorbed read and the diagnostic silently
+never fires (the wall budget would still catch it, but the diagnostic is the point of the arc).
+
+Both terminal arms log. The exhaustion arm distinguishes "wall budget reached" from "try count reached
+within budget", and the M2/M3 fail-closed messages carry the ladder's elapsed ms and whether it was cut
+on per-read cost. The callers' fail-closed branches are unchanged — the verdict just arrives sooner.
+
+**The residual is not zero.** The cost check fires *after* the offending read has already been paid,
+and there are three ladders on the cold-build path, so the trimmed path still absorbs on the order of
+**~3× one completion timeout** (plus the 60 ms caps) rather than the ~8+8+4 aborts the fixed ladders
+could pay. If one completion timeout is itself seconds, the pause shrinks substantially but does not
+vanish — and the true per-abort cost is exactly what the `took=` figure in the `mmio-ladder` line will
+report for the first time. That residual is on the metal watch-list below, not claimed as fixed.
 
 **What was deliberately NOT trimmed.**
 
@@ -651,8 +668,11 @@ downstream MMIO on this path, and no new guard is warranted there.
 What remains unproven is *which* of three silent candidates ate the boot: the MISC_CTRL/RC_BAR2
 reads, the SError drain window, or the caller's next stage (M1). None of them printed anything, which
 is why P59a's log could not separate them. The three brackets `dump-linkdown-rc-claim`,
-`dump-linkdown-serror-drain` and `m1-rc-bringup` now make the next boot name it: **whichever
-`[piusb40]` line is missing is the stage that wedged.**
+`dump-linkdown-serror-drain`, `entry-link-discriminator` and `m1-rc-bringup` now make the next boot
+name it: **whichever `[piusb40]` line is missing is the stage that wedged.** The bracket chain is
+gap-free from the census through the end of M3, so a wedge cannot be misattributed to a neighbouring
+stage — the PIUSB-16 entry reads in particular used to sit in an unbracketed gap that would have
+pointed the finger at M1.
 
 #### Metal watch-list
 
@@ -665,6 +685,14 @@ is why P59a's log could not separate them. The three brackets `dump-linkdown-rc-
 - Whether the ladder cap ever fires on a boot that *would* have succeeded (it should not — the
   budget is ≫ the healthy path's cost; a `STOPPED` line on an otherwise-good boot would mean
   `MMIO_ABORT_COST_MS` is too tight).
+- **The residual.** The trim does not take the cold-build path to zero: the cost check fires only
+  after the offending read is paid, so ~3× one completion timeout (one per ladder) plus the caps
+  remains. The `took=…ms` figure in the first `mmio-ladder` line is the first real measurement of what
+  one absorbed read costs on this silicon — it turns the remaining pause from an estimate into a
+  number, and decides whether a further arc is warranted.
+- Whether the `exhausted … WALL BUDGET reached` arm appears instead of the cost-cut arm: that would
+  mean the aborts are individually cheap but numerous, a different shape of problem than the one this
+  arc reasoned from.
 
 ---
 

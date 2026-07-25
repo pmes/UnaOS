@@ -250,24 +250,45 @@ fn mmio_settle_read(addr: u64, max_tries: u32) -> (u32, u32, u64, bool) {
     let mut tries = 0u32;
     let mut v;
     loop {
+        // LENS FIX (1): `MRS CNTPCT_EL0` is NOT ordered against a Device load, so without a barrier the
+        // closing counter read may retire BEFORE the load's completion and the measured cost
+        // UNDER-REPORTS an absorbed read — silently disarming the abort diagnostic, which is this arc's
+        // whole point. `dsb sy` on both sides pins the load inside the measured interval. (The 60 ms wall
+        // budget below is unaffected either way: it is the real safety bound. The barrier is what makes
+        // the DIAGNOSTIC trustworthy.)
+        dsb();
         let read_at = super::timer::cntpct();
         v = r(addr);
+        dsb();
         let cost = super::timer::cntpct().wrapping_sub(read_at);
         tries += 1;
+        let elapsed_ms = || super::timer::cntpct().wrapping_sub(start).saturating_mul(1000) / freq;
         if !is_poison(v) && v != 0 {
-            let el = super::timer::cntpct().wrapping_sub(start).saturating_mul(1000) / freq;
-            return (v, tries, el, false);
+            return (v, tries, elapsed_ms(), false);
         }
         if cost >= abort_cost {
-            let el = super::timer::cntpct().wrapping_sub(start).saturating_mul(1000) / freq;
+            let el = elapsed_ms();
             serial_println!(
-                "{} [piusb40] mmio-ladder @ {:#x}: try {} took {}ms (>= {}ms) — the RC is absorbing this read as a completion timeout, not answering it; further tries buy the same abort at the same price. Ladder STOPPED at {}ms (fail-fast to the honest no-USB path) ::",
+                "{} [piusb40] mmio-ladder @ {:#x}: try {} took {}ms (>= {}ms) — consistent with the RC absorbing this read as a completion timeout rather than answering it; further tries would buy the same abort at the same price. Ladder STOPPED at {}ms (fail-fast to the honest no-USB path) ::",
                 P, addr, tries, cost.saturating_mul(1000) / freq, MMIO_ABORT_COST_MS, el
             );
             return (v, tries, el, true);
         }
-        if tries >= max_tries || super::timer::cntpct().wrapping_sub(start) >= budget {
-            let el = super::timer::cntpct().wrapping_sub(start).saturating_mul(1000) / freq;
+        let out_of_tries = tries >= max_tries;
+        let out_of_budget = super::timer::cntpct().wrapping_sub(start) >= budget;
+        if out_of_tries || out_of_budget {
+            // LENS FIX (2): this arm used to return UNLOGGED, so a ladder that hit the wall budget — the
+            // arm that actually bounds the cold-build path — left no trace at all. Say which wall was hit.
+            let el = elapsed_ms();
+            serial_println!(
+                "{} [piusb40] mmio-ladder @ {:#x}: exhausted after {} tries ({}ms), last read {:#010x} — {} ::",
+                P, addr, tries, el, v,
+                if out_of_budget {
+                    "WALL BUDGET reached (the ladder's true safety bound); no single read was slow enough to trip the abort diagnostic"
+                } else {
+                    "try count reached within budget (reads are answering promptly — the BAR simply is not decoding yet)"
+                }
+            );
             return (v, tries, el, false);
         }
         settle_ms(5);
@@ -840,6 +861,10 @@ fn dump_firmware_state() {
     unsafe { super::boot::map_device_1gib(cap_cpu_base) };
     serial_println!("{} piusb31: map_device_1gib exit; CAP-read enter ::", P);
     // PIUSB-40: cost-aware ladder (was a fixed 4-try / 2 ms-settle loop). See `mmio_settle_read`.
+    // NOTE: folding this site into the shared helper changed its inter-try settle 2 ms -> 5 ms (the
+    // helper's single value, matching the other two ladders). Harmless and deliberate: this is a
+    // "has the decode woken up" poll, not a mandated settle, its worst case is 4 tries, and the whole
+    // ladder is capped by MMIO_LADDER_BUDGET_MS regardless. Recorded so the change is not silent.
     let (cap0, tries, ladder_ms, _bailed) = mmio_settle_read(cap_cpu_base, 4);
     if is_poison(cap0) || cap0 == 0 {
         serial_println!(
@@ -986,7 +1011,7 @@ fn bringup_inner(dtb: u64) {
     //    firmware tears PCIe down before handoff (RC left fully in reset, no child config, no live
     //    decode), so the adopt path is retired — the dump is a record; we always take the reset path. ──
     dump_firmware_state();
-    let _t = stage_end("fw-state-dump", t);
+    let t = stage_end("fw-state-dump", t);
 
     // ── PIUSB-16: the ENTRY link-state discriminator — the one-boot lever verdict. ────────────────
     //    Read the RC's own reset + status registers exactly as the firmware left them (both are safe
@@ -999,8 +1024,14 @@ fn bringup_inner(dtb: u64) {
     //      * RC still in reset (RGR1 INIT_GENERIC|PERST set, PCIE_STATUS=0) => the new firmware still did
     //        NOT init PCIe before handoff — the FW_TAG swap was not the lever; take the COLD-BUILD path
     //        (M1 reset → M2 → M3) exactly as before, and the next lever is up for evaluation.
+    //
+    //    LENS FIX (3): these two RC reads sat in the BRACKET GAP between `fw-state-dump` and
+    //    `m1-rc-bringup`. They are RC-own APB reads on a path we have just proven can wedge silently, so
+    //    an unbracketed gap here would misattribute a wedge to M1 — exactly the misreading the P59a audit
+    //    is trying to prevent. Bracketed, the chain is now gap-free from the census to the end of M3.
     let entry_status = r(RC_BASE + PCIE_MISC_PCIE_STATUS);
     let entry_swinit = r(RC_BASE + PCIE_RGR1_SW_INIT_1);
+    stage_end("entry-link-discriminator", t);
     let up_mask = PCIE_MISC_PCIE_STATUS_PHYLINKUP | PCIE_MISC_PCIE_STATUS_DL_ACTIVE;
     let link_up_at_entry = !is_poison(entry_status) && (entry_status & up_mask) == up_mask;
     serial_println!(
@@ -1602,12 +1633,13 @@ fn m2_enumerate_vl805() -> Option<u64> {
     // PIUSB-40: cost-aware ladder (was a fixed 8-try / 5 ms-settle loop, i.e. a "40 ms" budget that on the
     // COLD-BUILD path could be eight serial RC completion timeouts instead). See `mmio_settle_read`.
     let t_verify = stage_begin();
-    let (precap, ptries, _ladder_ms, _bailed) = mmio_settle_read(OUTBOUND_CPU_BASE, 8);
+    let (precap, ptries, ladder_ms, bailed) = mmio_settle_read(OUTBOUND_CPU_BASE, 8);
     stage_end("m2-mmio-verify", t_verify);
     if is_poison(precap) || precap == 0 {
         serial_println!(
-            "{}   PIUSB-15 pre-NOTIFY MMIO verify: CAP[0]={:#010x} @ {:#x} after {} tries — BAR does NOT decode MMIO yet (theory (c): the load path may not be BAR-MMIO; proceeding to NOTIFY to capture the CNR verdict) ::",
-            P, precap, OUTBOUND_CPU_BASE, ptries
+            "{}   PIUSB-15 pre-NOTIFY MMIO verify: CAP[0]={:#010x} @ {:#x} after {} tries ({}ms{}) — BAR does NOT decode MMIO yet (theory (c): the load path may not be BAR-MMIO; proceeding to NOTIFY to capture the CNR verdict) ::",
+            P, precap, OUTBOUND_CPU_BASE, ptries, ladder_ms,
+            if bailed { ", ladder cut on per-read cost" } else { "" }
         );
     } else {
         serial_println!(
@@ -1798,12 +1830,13 @@ fn m3_attach_xhci(cpu_base: u64, _bar0_pcie: u64) {
     // PIUSB-40: cost-aware ladder (was a fixed 8-try / 5 ms-settle loop). See `mmio_settle_read`.
     const CAP_TRIES: u32 = 8;
     let t_cap = stage_begin();
-    let (cap0, tries, _ladder_ms, _bailed) = mmio_settle_read(outbound_cpu_base, CAP_TRIES);
+    let (cap0, tries, ladder_ms, bailed) = mmio_settle_read(outbound_cpu_base, CAP_TRIES);
     stage_end("m3-cap-probe", t_cap);
     if is_poison(cap0) || cap0 == 0 {
         serial_println!(
-            "{}   xHCI CAP register reads {:#010x} @ {:#x} after {} tries — BAR not decoding (window/BAR mismatch or firmware not loaded); attach SKIPPED, fail-closed ::",
-            P, cap0, outbound_cpu_base, tries
+            "{}   xHCI CAP register reads {:#010x} @ {:#x} after {} tries ({}ms{}) — BAR not decoding (window/BAR mismatch or firmware not loaded); attach SKIPPED, fail-closed ::",
+            P, cap0, outbound_cpu_base, tries, ladder_ms,
+            if bailed { ", ladder cut on per-read cost" } else { "" }
         );
         return;
     }
