@@ -2330,6 +2330,10 @@ fn pump_usb_into_gui() {
     if let Some(k) = unaos_kernel::pal::typematic_tick() {
         unaos_kernel::pal::push_event(unaos_kernel::pal::Event::Key(k));
     }
+    // UVUG-10: producer/consumer accounting for EVENT_QUEUE itself. Placed BEFORE the routing branches so it
+    // reports on every pass regardless of which sink owns input this instant — the question it answers ("was
+    // a pointer event ever produced at all?") is independent of where events are being routed.
+    uvug10_evq_witness();
     // PIUSB-24: bridge decoded KEYS **and** POINTER events (Mouse/MouseAbsolute/Button) into the GUI
     // channel — the render task now moves the shared `pal::cursor` sprite from them (mirroring the x86
     // console loop). The MOUSE-1 witness confirmed relative boot-mouse reports arrive on metal; before
@@ -2508,6 +2512,68 @@ fn uvug9_shell_input_witness(is_key: bool) {
         );
     }
 }
+
+/// UVUG-10 — the PRODUCER-side half of the pointer bisect, and the line that decides ownership of the P55b
+/// dead-mouse symptom in a single boot.
+///
+/// `[uvug9] shell-path` (below) counts pointer events at the router DRAIN and read `ptr=0` on metal forever,
+/// from boot, while the xHCI `MOUSE-1` witness reported a live pointer. Those two witnesses bracket
+/// `pal::EVENT_QUEUE` without measuring it, so the two candidate explanations — "no pointer event was ever
+/// produced" (the xHCI HID decode, another lane) and "a pointer event was produced and then lost" (this
+/// lane) — were indistinguishable. `pal::event_queue_stats` now counts both sides of the queue, classified,
+/// including the drops `EventQueue::push` silently swallows on a full ring; this prints them.
+///
+/// Rate-limited by a PASS COUNTER, not wall-clock, for the same reason `[click2] depth` is: this pump also
+/// runs from the raspi4b poll-nap fallback where `arch::ms()` is pinned at 0 and a wall-clock throttle never
+/// holds. Printed only when a counter actually MOVED since the last line, so an idle machine (and the QEMU
+/// battery, where the only producer is the one-shot router selftest) stays quiet after the first report
+/// instead of adding a periodic line to every log.
+///
+/// Verdict table, read against the `[uvug9]` line:
+///   * `push ptr=0`                     -> the pointer was never produced. Upstream of this file — the xHCI
+///                                         pointer decode never reached its `pal::push_event`.
+///   * `push ptr=N drop ptr≈N`          -> produced, then discarded by a saturated ring (a stalled drain).
+///   * `push ptr=N drop ptr=0`, `[uvug9] ptr=0` -> produced and stored, but consumed by a SECOND consumer
+///                                         before the shell drain (an EL0 focus ring, or the focus-change
+///                                         pre-launch discard) — squarely this lane.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn uvug10_evq_witness() {
+    use core::sync::atomic::Ordering;
+    let pass = UVUG10_EVQ_PASSES.fetch_add(1, Ordering::Relaxed);
+    if pass % UVUG10_EVQ_EVERY != 0 {
+        return;
+    }
+    let (push_ptr, push_key, drop_ptr, drop_key, pop) = unaos_kernel::pal::event_queue_stats();
+    // Fold the five totals into one value purely to detect "nothing moved" cheaply; the sum can alias in
+    // principle, but only across a window in which the counters changed by exactly offsetting amounts —
+    // impossible here, since every counter is monotonically increasing.
+    let fold = push_ptr
+        .wrapping_add(push_key)
+        .wrapping_add(drop_ptr)
+        .wrapping_add(drop_key)
+        .wrapping_add(pop);
+    if fold == UVUG10_EVQ_LAST_FOLD.swap(fold, Ordering::Relaxed) {
+        return; // nothing was produced or consumed since the last line — stay silent
+    }
+    serial_println!(
+        "[uvug10] evq push ptr={} key={} / drop ptr={} key={} / pop={} depth={}",
+        push_ptr,
+        push_key,
+        drop_ptr,
+        drop_key,
+        pop,
+        unaos_kernel::pal::event_queue_depth()
+    );
+}
+
+/// UVUG-10 `[uvug10] evq` pass throttle (~5 s at the metal ~250 Hz pump cadence) + the last-reported fold,
+/// so an unchanged snapshot is not reprinted.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+static UVUG10_EVQ_PASSES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+const UVUG10_EVQ_EVERY: u64 = 1250;
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+static UVUG10_EVQ_LAST_FOLD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// UVUG-9 shell-path input counters + throttle (see `uvug9_shell_input_witness`).
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]

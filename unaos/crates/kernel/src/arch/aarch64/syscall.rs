@@ -10185,6 +10185,36 @@ fn input_launcher(_demo_cpu: usize) {
     if DONE.swap(true, Ordering::Relaxed) {
         return;
     }
+    // UVUG-10: DO NOT RUN THIS FIXTURE ON METAL.
+    //
+    // The fixture is a REAL interactive takeover: it registers itself as the active input target
+    // (`el0_input_set_active`) and spawns an EL0 program that spins on SYS_INPUT_POLL until it sees the one
+    // event the launcher injects. In QEMU raspi4b that is airtight — there is no USB HID, so the ONLY
+    // producer is the kernel injection and the program drains it, reports, and exits 0. On metal with real
+    // HID attached the premise collapses: live keyboard/pointer traffic is routed into the same ring before
+    // the injection lands, the program's fixed three-observation script no longer matches what it drains,
+    // and the launcher's 2 s bounded wait expires with the EL0 task STILL ALIVE. This arch has no
+    // asynchronous kill primitive (`sched::exit` retires only the calling task), so the abandoned program
+    // spins its `SYS_INPUT_POLL`/`SYS_YIELD` loop for the rest of the boot — the orphan Peter observes as a
+    // pause during boot followed by a core pegged at 100%, every boot, plus the starvation of later runs.
+    //
+    // The gate is `timer::is_live()` — the same metal/QEMU discriminator `main` already uses to decide which
+    // service tasks to spawn (the Group-1 timer IRQ is delivered on hardware and never in QEMU raspi4b). It
+    // is chosen over HID-presence for two reasons: HID enumeration is asynchronous, so a presence check
+    // raced against a slow device would sometimes run the fixture on metal anyway; and the fixture's real
+    // problem is not "a mouse is plugged in" but "this is an interactive machine whose input belongs to the
+    // user". A compile-time knob was the other candidate and was rejected because the metal image and the
+    // QEMU battery image are built from the same feature set — a knob would have to be remembered at every
+    // flash, and a forgotten knob reintroduces a boot-time core leak.
+    //
+    // QEMU keeps the fixture and its `:: EL0: input test — … ::` verdict verbatim, so the battery is
+    // unchanged. Metal prints an honest, uncounted SKIP naming the reason.
+    if super::timer::is_live() {
+        serial_println!(
+            ":: EL0: input test — SKIP on metal (real interactive takeover would orphan an EL0 poller; QEMU covers this path) ::"
+        );
+        return;
+    }
     let bstart = &raw const __input_blob_start as usize;
     let bend = &raw const __input_blob_end as usize;
     let blen = bend - bstart;

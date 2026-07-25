@@ -301,11 +301,17 @@ impl EventQueue {
             tail: 0,
         }
     }
-    fn push(&mut self, event: Event) {
+    /// Returns `true` if the event was stored, `false` if the ring was full and it was dropped.
+    /// UVUG-10 — the drop verdict used to be swallowed here; it is now reported so `push_event`
+    /// can account for it (see `EVQ_*`).
+    fn push(&mut self, event: Event) -> bool {
         let next = (self.head + 1) % QUEUE_SIZE;
         if next != self.tail {
             self.buffer[self.head] = event;
             self.head = next;
+            true
+        } else {
+            false
         }
     }
     fn pop(&mut self) -> Option<Event> {
@@ -328,10 +334,73 @@ lazy_static! {
     static ref EVENT_QUEUE: Mutex<EventQueue> = Mutex::new(EventQueue::new());
 }
 
+// --- UVUG-10: EVENT_QUEUE PRODUCER/CONSUMER ACCOUNTING ---
+//
+// P55b left one question open that no existing witness can answer. `MOUSE-1` counts pointer reports at the
+// xHCI decode; `[uvug9] shell-path` counts pointer events at the ROUTER DRAIN (`main::pump_usb_into_gui`).
+// On metal the first streams and the second reads `ptr=0` forever, from boot. Between them sit exactly two
+// steps — `push_event` (producer) and `pop_event` (consumer) — and the existing instrumentation brackets
+// them without ever measuring either, so "the driver never pushed a pointer event" and "the pointer event
+// was pushed and then lost" are indistinguishable on the wire. They have completely different owners: the
+// first is the xHCI HID decode, the second is this router lane.
+//
+// These counters close that gap at the ONE choke point every producer must pass. They are deliberately
+// classified (pointer vs key vs other) and deliberately count DROPS separately: `EventQueue::push` silently
+// discards on a full ring, and pointer traffic (~125 reports/s from a moving mouse) outnumbers keystrokes by
+// two orders of magnitude — so a stalled drain saturates the ring with pointer events and starves the very
+// class we are hunting, a failure mode that would otherwise be invisible. Plain relaxed atomics, no lock, no
+// cfg gate: arch-neutral, and the cost is one `fetch_add` on a path that already takes a spinlock.
+//
+// Reading the `[uvug10] evq` line against `[uvug9] shell-path` at P56 decides the ownership question in ONE
+// boot:
+//   * `push ptr=0`            -> nothing ever produced a pointer event. The loss is UPSTREAM of this file
+//                                (the xHCI pointer decode / its dup-Success guard). Not this lane.
+//   * `push ptr=N, drop ptr=N` -> produced and dropped by a saturated ring: the drain is not keeping up.
+//   * `push ptr=N, drop ptr=0` while `[uvug9] ptr=0` -> produced, stored, and consumed by SOMEONE ELSE
+//                                before the shell drain (an EL0 focus ring / the focus-change discard).
+/// Pointer-class events (Mouse / MouseAbsolute / Button) offered to the queue.
+static EVQ_PUSH_PTR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Key-class events (Key / KeyUp) offered to the queue.
+static EVQ_PUSH_KEY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Pointer-class events DROPPED because the ring was full.
+static EVQ_DROP_PTR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Key-class events DROPPED because the ring was full.
+static EVQ_DROP_KEY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Events successfully popped by ANY consumer (the router drain, an EL0 focus discard, `pump_and_poll`, …).
+static EVQ_POP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// UVUG-10 — `(push_ptr, push_key, drop_ptr, drop_key, pop)`. Read by the router's `[uvug10] evq` witness.
+pub fn event_queue_stats() -> (u64, u64, u64, u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        EVQ_PUSH_PTR.load(Relaxed),
+        EVQ_PUSH_KEY.load(Relaxed),
+        EVQ_DROP_PTR.load(Relaxed),
+        EVQ_DROP_KEY.load(Relaxed),
+        EVQ_POP.load(Relaxed),
+    )
+}
+
 pub fn push_event(event: Event) {
-    crate::arch::without_interrupts(|| {
-        EVENT_QUEUE.lock().push(event);
-    });
+    use core::sync::atomic::Ordering::Relaxed;
+    let is_ptr = matches!(
+        event,
+        Event::Mouse { .. } | Event::MouseAbsolute { .. } | Event::Button(_)
+    );
+    let is_key = matches!(event, Event::Key(_) | Event::KeyUp(_));
+    if is_ptr {
+        EVQ_PUSH_PTR.fetch_add(1, Relaxed);
+    } else if is_key {
+        EVQ_PUSH_KEY.fetch_add(1, Relaxed);
+    }
+    let stored = crate::arch::without_interrupts(|| EVENT_QUEUE.lock().push(event));
+    if !stored {
+        if is_ptr {
+            EVQ_DROP_PTR.fetch_add(1, Relaxed);
+        } else if is_key {
+            EVQ_DROP_KEY.fetch_add(1, Relaxed);
+        }
+    }
 }
 
 /// UVUG-6 — live EVENT_QUEUE occupancy, read by the host-side typematic backpressure guard so a synthesised
@@ -622,7 +691,14 @@ pub fn typematic_test_reset() {
 pub const TYPEMATIC_IDLE_RUN_TO_LATCH: u32 = typematic::IDLE_RUN_TO_LATCH;
 
 fn pop_event() -> Option<Event> {
-    crate::arch::without_interrupts(|| EVENT_QUEUE.lock().pop())
+    let ev = crate::arch::without_interrupts(|| EVENT_QUEUE.lock().pop());
+    if ev.is_some() {
+        // UVUG-10: total consumption, across EVERY consumer — the router drain, the EL0 focus-change
+        // discard, `pump_and_poll`. `push - drop - pop` is the live ring occupancy; a `pop` count far
+        // above the router drain's own `[uvug9]` totals names a second consumer as the thief.
+        EVQ_POP.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    ev
 }
 
 /// Drain one queued input event without a GUI surface. Used by the `usbdebug` boot mode to print
