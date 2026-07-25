@@ -361,6 +361,15 @@ core3probe = ["pi"]
 # kernel8`. See arch_arm64.md §PI-V3D and scripts/pi-v3d-bench.md.
 v3d = ["baremetal"]
 
+# V3D-DEEP: the SLOW half of the V3D diagnostic battery — the probes whose verdicts are already BANKED
+# on metal and that cost multi-second anti-hang backstops (and metres of serial) on every armed boot:
+# the `[v3d48]` empty-frame bisection ladder (6 rungs x a ~0.5 s FLDONE backstop each), the
+# `[v3d59] frameclose` post-wedge time series (64 x 1 ms + its verdict line), and the `[v3d58] rerender`
+# negative control (an extra full CT1 clear job). Requires `v3d`; OFF (default) an armed V3D boot runs
+# the FAST probes only and prints one honest `[v3d] deep=off …` line naming what was skipped. Enable via
+# `UNAOS_V3D=1 UNAOS_V3D_DEEP=1 UNAOS_PI=1 ./arroyo kernel8`. See docs/dev/OS/08_VIDEO/v3d.md.
+v3d_deep = ["v3d"]
+
 # PI-USB-1: the BCM2711 PCIe root complex + VL805 xHCI attach (arch/aarch64/piusb.rs) — brcmstb RC
 # bridge reset / link-up / MEM-window + inbound-BAR config, VL805 (1106:3483) enumeration + BAR sizing,
 # the NOTIFY_XHCI_RESET mailbox, and the polled shared-xHCI attach to the "controller halted-but-decoding

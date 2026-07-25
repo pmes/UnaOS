@@ -1984,3 +1984,46 @@ neither a bit-3 latch nor a frame open at S0. This arc collects; the next one wr
 QEMU `raspi4b` models no V3D block — the run short-circuits at `BLOCK-DOWN`, so no `[v3d59]` line appears
 there and `kernel8-test` green means *no regression*, nothing more. **P59 metal reads the `CTnCS` decode,
 the three never-sampled registers and the post-wedge time series.**
+
+---
+
+## 34. The probe budget — `UNAOS_V3D_DEEP` gates the banked-verdict probes
+
+An armed `UNAOS_V3D=1` boot visibly **stalled at the M3 square** on the panel for several seconds while
+the diagnostic battery ran. The stall was not the GPU: it was the battery's own anti-hang backstops. On
+metal the bin never retires, so every `wait_fldone` runs its full ~0.5 s budget to timeout, and the
+`[v3d48]` ladder does that six times in a row.
+
+The probes that cost the time are also the ones whose verdicts are already **banked** — re-running them
+every boot buys no new information:
+
+| Probe | Budget on metal | Banked verdict |
+| --- | --- | --- |
+| `[v3d48]` empty-frame bisection ladder | 6 rungs × ~0.5 s FLDONE backstop ≈ **3.0 s** (plus a full CL decode + Mesa diff per rung on the serial line) | every rung wedges, `Empty` included |
+| `[v3d59] frameclose` | 64 × 1 ms ≈ **64 ms** + its verdict line | **DEAD-OPEN** — not one bit changed across the whole extra window |
+| `[v3d58] rerender` | one extra full CT1 clear job | clean — the render engine still works after the wedge |
+
+### The knob
+
+| Knob | Feature | Effect |
+| --- | --- | --- |
+| `UNAOS_V3D=1` | `v3d` | The V3D bring-up + the **fast** probe battery: the `[v3d40]` probe kick and its single FLDONE wait, and all the pure-read decodes (`[v3d54]` submit/trace, `[v3d55]` clkliv/tilestate, `[v3d56]` poison/landing/int, `[v3d57]` Mesa diff, `[v3d58]` stations/xengine, `[v3d59]` mainline/ctstate). |
+| `UNAOS_V3D_DEEP=1` | `v3d_deep` (implies `v3d`) | **Adds** the three banked-verdict probes above — ~3.5 s of extra boot. Arm it only when the bench is deliberately re-opening one of those questions. |
+
+Off (the default for an armed boot), the bring-up prints one line right after the `M1 probe PASS` gate:
+
+```
+:: V3D: [v3d] deep=off (banked verdicts skipped) — NOT run this boot: [v3d48] empty-frame bisection
+   ladder (all 6 rungs banked non-retire), [v3d59] frameclose (banked DEAD-OPEN, zero bit changes),
+   [v3d58] rerender (banked clean). Fast probes only; re-arm with UNAOS_V3D_DEEP=1 ::
+```
+
+with the `deep=on` counterpart naming the same three when armed. A shorter log is only trustworthy if it
+says what is missing from it, so the line is printed unconditionally on a block that came up — never
+silently. It sits **past** the presence gate, so QEMU `raspi4b` (which returns at `BLOCK-DOWN`) prints
+neither variant and the default-quiet boot is unchanged.
+
+`check` is blind to knob-gated code: the gating is verified by building `kernel8` **both** ways and
+strings-proofing the images. Armed-without-deep carries only the `deep=off` line; the ladder header,
+the `frameclose` verdict strings and the `rerender` strings are all absent, and the image is ~12 KiB
+smaller.

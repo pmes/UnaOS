@@ -995,6 +995,17 @@ kernel8() {
         K8_FEATS="${K8_FEATS},v3d"
         echo -e "${COLOR_YELLOW}  • UNAOS_V3D: V3D GPU foundation bring-up (probe/MMU/clear; attended-metal for positive verify)${COLOR_RESET}"
     fi
+    # V3D-DEEP: UNAOS_V3D_DEEP=1 adds the `v3d_deep` (+`v3d`) features — the SLOW half of the V3D
+    # diagnostic battery, whose verdicts are already banked on metal: the `[v3d48]` empty-frame bisection
+    # ladder (6 rungs x a ~0.5 s FLDONE anti-hang backstop each), the `[v3d59] frameclose` post-wedge time
+    # series (64 x 1 ms — banked DEAD-OPEN, zero bit changes), and the `[v3d58] rerender` negative control
+    # (an extra full CT1 clear job — banked clean). OFF (default) an armed V3D boot runs the FAST probes
+    # only — no multi-second stall at the M3 square — and prints one `[v3d] deep=off …` line naming what
+    # was skipped, so a wire read stays honest. Implies UNAOS_V3D.
+    if [ -n "${UNAOS_V3D_DEEP:-}" ]; then
+        K8_FEATS="${K8_FEATS},v3d_deep,v3d"
+        echo -e "${COLOR_YELLOW}  • UNAOS_V3D_DEEP: the slow banked-verdict V3D probes (v3d48 ladder / v3d59 frameclose / v3d58 rerender) — adds ~3.5 s to an armed boot${COLOR_RESET}"
+    fi
     # VUG-PAR: UNAOS_VUGPAR=1 adds the `vugpar` feature — band-parallel Screen::flush that splits the
     # damaged row-copy blit into disjoint scanline bands dispatched to free secondary cores (sched::
     # spawn_joinable + JoinHandle join barrier), falling back to the single-core serial flush when no

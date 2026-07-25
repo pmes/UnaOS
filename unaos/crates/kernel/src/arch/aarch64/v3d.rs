@@ -731,6 +731,19 @@ pub fn bringup(fb: Option<FbTarget>) {
     );
     serial_println!(":: V3D: M1 probe PASS (powered, clocked, IDENT live) ::");
 
+    // V3D-DEEP probe-budget note. Printed HERE — past the presence gate, before any job — so the wire
+    // read always states which half of the battery this boot ran. Honesty over silence: a shorter log is
+    // only trustworthy if it says what is missing from it.
+    if V3D_DEEP {
+        serial_println!(
+            ":: V3D: [v3d] deep=on — slow banked-verdict probes ARMED: [v3d48] bisection ladder (6 rungs x ~0.5 s FLDONE backstop), [v3d59] frameclose (64 x 1 ms), [v3d58] rerender (extra CT1 job). Expect ~3.5 s of extra boot ::"
+        );
+    } else {
+        serial_println!(
+            ":: V3D: [v3d] deep=off (banked verdicts skipped) — NOT run this boot: [v3d48] empty-frame bisection ladder (all 6 rungs banked non-retire), [v3d59] frameclose (banked DEAD-OPEN, zero bit changes), [v3d58] rerender (banked clean). Fast probes only; re-arm with UNAOS_V3D_DEEP=1 ::"
+        );
+    }
+
     // PI-V3D-51: the post-reset core-init the kernel runs at the tail of EVERY v3d_reset_v3d (via
     // v3d_init_hw_state → v3d_init_core): establish the L2T flush address window (L2TFLSTA=0,
     // L2TFLEND=~0). Our V3D-50 power-cycle reset left these at POR and nothing re-established them, so
@@ -4140,13 +4153,31 @@ fn build_probe_shader_record() -> u32 {
 // inside the V3D probe battery, which short-circuits at `BLOCK-DOWN` on QEMU, so none of it reaches a
 // default boot log (quiet-boot law).
 
+/// V3D-DEEP — the probe-budget line. Every diagnostic in this file is cheap EXCEPT three, whose
+/// verdicts are already BANKED on metal and which together cost ~3.5 s of anti-hang backstop (plus
+/// metres of serial) on every armed boot — the visible "stall at the M3 square":
+///
+///   * the `[v3d48]` empty-frame bisection ladder — 6 rungs, each ending in a ~0.5 s FLDONE backstop
+///     that always times out (~3.0 s), all six verdicts banked as non-retire;
+///   * `[v3d59] frameclose` — 64 x 1 ms post-wedge samples (~64 ms), banked DEAD-OPEN: zero bit
+///     changes across the whole extra window, so re-running it every boot buys nothing;
+///   * `[v3d58] rerender` — one extra full CT1 clear job, banked clean.
+///
+/// The fast probes (the `[v3d40]` probe kick and its single FLDONE wait, all the pure-read decodes —
+/// `[v3d54/55/56/57/58/59] ctstate`, stations, poison, landing) stay on by default: they are the live
+/// wire read of THIS boot. Arm the slow half with `UNAOS_V3D_DEEP=1` (feature `v3d_deep`) when the
+/// bench is deliberately re-opening one of the banked questions. When it is off, `bringup` prints one
+/// `[v3d] deep=off …` line naming exactly what was skipped, so a wire read is never silently short.
+const V3D_DEEP: bool = cfg!(feature = "v3d_deep");
+
 /// Gate for the `[v3d58] station` progression sampling and the `[v3d58] xengine` asymmetry line.
-/// Read-only MMIO; one flip to `false` silences both.
+/// Read-only MMIO; one flip to `false` silences both. Cheap — default-on.
 const V3D58_STATIONS: bool = true;
 
 /// Gate for the `[v3d58] rerender` negative control (re-runs the M3 clear job after the wedged bin).
-/// Costs one extra CT1 job on metal and repaints nothing (`clear_job(None)`).
-const V3D58_RERENDER_CONTROL: bool = true;
+/// Costs one extra CT1 job on metal and repaints nothing (`clear_job(None)`). Banked clean on metal —
+/// V3D-DEEP only.
+const V3D58_RERENDER_CONTROL: bool = V3D_DEEP;
 
 /// Captured at M3: did the RENDER engine (CT1) complete a frame and land a byte-verified store?
 /// This is the reference the `[v3d58] xengine` line is drawn against — see R1 above.
@@ -4433,7 +4464,8 @@ fn v3d58_rerender_control(what: &str) {
 /// `CT0SYNC`/`CT1SYNC`/`BXCF`/`BPOA`/`BPOS`/`CT0LC`/`CT0PC`. Pure reads.
 const V3D59_CTSTATE: bool = true;
 /// `[v3d59] frameclose` — post-wedge time series of the bin-frame registers. Pure reads; ~64 ms.
-const V3D59_FRAMECLOSE: bool = true;
+/// Banked FROZEN/DEAD-OPEN on metal (zero bit changes across the whole extra window) — V3D-DEEP only.
+const V3D59_FRAMECLOSE: bool = V3D_DEEP;
 /// `[v3d59] mainline` — the refutation ledger, so the metal log carries its own citations.
 const V3D59_LEDGER: bool = true;
 /// **DISARMED.** Arm a PTB overflow block (`BPOA`/`BPOS`) before the GO. Mainline provably never does
@@ -5496,7 +5528,16 @@ fn submit_bisect_rung_tagged(tag: &str, rung: &str, content: BinContent, shadrec
 /// brackets the M4 bin from below. Diagnostic-only: reuses the M4 bin-scratch regions (re-zeroed here and
 /// again by triangle_job before the real kick), touches no real-draw CL, never gates M4. QEMU raspi4b
 /// models no V3D block, so the ladder is dormant there — P45 metal reads the decision tree.
+///
+/// V3D-DEEP: the ladder is the single most expensive diagnostic in this file — six rungs, each ending in
+/// a ~0.5 s FLDONE anti-hang backstop that always times out (~3.0 s of wall clock), plus a full CL decode
+/// + Mesa diff per rung on the serial line. All six verdicts are banked on metal (every rung wedges,
+/// including `Empty`), so re-walking the ladder on every armed boot buys nothing and is most of the
+/// visible boot stall. Gated behind `v3d_deep`; the caller prints what was skipped.
 fn empty_frame_bisection() {
+    if !V3D_DEEP {
+        return;
+    }
     serial_println!(
         ":: V3D: [v3d48] empty-frame bisection — walk the wedge down: Empty (config+START+FLUSH) → StateNoPrims → PrimsNullShader, each with the M4 QMA/QMS/QTS/BPOA setup + FLDONE wait. Empty MUST retire (kernel v3d_bin_job_run); if it does, the frame handshake is sound and the offending packet is the first rung that stops retiring ::"
     );
