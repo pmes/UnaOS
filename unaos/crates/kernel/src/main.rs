@@ -2379,12 +2379,18 @@ fn pump_usb_into_gui() {
         // hand every event back to the app untouched. Drain into a fixed buffer (queue is bounded to
         // 64), scan for a Button, re-push in original order. No heap; the queue is empty for only the
         // few instructions between drain and re-push (the app's next pump_and_poll pass re-reads it).
+        //
+        // UVUG-10: this peek runs through the UNCOUNTED re-circulation seam
+        // (`peek_event_uncounted` / `requeue_event`). Nothing is produced or consumed here — the same
+        // events go round again every pass, ~250×/s for as long as a kernel app owns the panel — so
+        // counting them would inflate `[uvug10] evq`'s push/pop (and, on a deep ring, drop) precisely in
+        // the state where a stalled drain is the hypothesis under test.
         let mut buf: [unaos_kernel::pal::Event; 64] =
             [unaos_kernel::pal::Event::None; 64];
         let mut n = 0usize;
         let mut saw_button = false;
         while n < buf.len() {
-            match unaos_kernel::pal::next_event() {
+            match unaos_kernel::pal::peek_event_uncounted() {
                 Some(ev) => {
                     // UVUG-6: typematic is fed at the HID report level, not from this drain.
                     if matches!(ev, unaos_kernel::pal::Event::Button(_)) {
@@ -2397,7 +2403,7 @@ fn pump_usb_into_gui() {
             }
         }
         for ev in buf.iter().take(n) {
-            unaos_kernel::pal::push_event(*ev);
+            unaos_kernel::pal::requeue_event(*ev);
         }
         if saw_button {
             click2_left_witness();
@@ -2517,25 +2523,42 @@ fn uvug9_shell_input_witness(is_key: bool) {
 /// dead-mouse symptom in a single boot.
 ///
 /// `[uvug9] shell-path` (below) counts pointer events at the router DRAIN and read `ptr=0` on metal forever,
-/// from boot, while the xHCI `MOUSE-1` witness reported a live pointer. Those two witnesses bracket
-/// `pal::EVENT_QUEUE` without measuring it, so the two candidate explanations — "no pointer event was ever
-/// produced" (the xHCI HID decode, another lane) and "a pointer event was produced and then lost" (this
-/// lane) — were indistinguishable. `pal::event_queue_stats` now counts both sides of the queue, classified,
-/// including the drops `EventQueue::push` silently swallows on a full ring; this prints them.
+/// from boot, while the xHCI `MOUSE-1` witness reported a live pointer WITH REAL DELTAS. Those two witnesses
+/// bracket `pal::EVENT_QUEUE` without measuring it. The upstream half is now settled: the driver's
+/// `push_event(Event::Mouse)` precedes the `MOUSE-1` print in straight-line code with no fork between them,
+/// so `last dx=3 dy=5` proves the pointer events were pushed — **the loss is at or after the queue**.
+///
+/// The leading theory is the one this arc's fixture gate already kills: the boot `input_launcher` orphan
+/// held `el0_input_active()` for the whole boot, so `route_input_to_active_el0` (above) swallowed the queue
+/// into a ring nothing would read, while keys still reached the shell through `input_service`'s direct
+/// `gui_send` — a path that bypasses EVENT_QUEUE entirely. This witness is what proves or refutes that on
+/// the wire instead of by argument.
 ///
 /// Rate-limited by a PASS COUNTER, not wall-clock, for the same reason `[click2] depth` is: this pump also
 /// runs from the raspi4b poll-nap fallback where `arch::ms()` is pinned at 0 and a wall-clock throttle never
 /// holds. Printed only when a counter actually MOVED since the last line, so an idle machine (and the QEMU
-/// battery, where the only producer is the one-shot router selftest) stays quiet after the first report
-/// instead of adding a periodic line to every log.
+/// battery, where the only producers are the one-shot selftests) stays quiet after the first report instead
+/// of adding a periodic line to every log.
 ///
-/// Verdict table, read against the `[uvug9]` line:
-///   * `push ptr=0`                     -> the pointer was never produced. Upstream of this file — the xHCI
-///                                         pointer decode never reached its `pal::push_event`.
-///   * `push ptr=N drop ptr≈N`          -> produced, then discarded by a saturated ring (a stalled drain).
-///   * `push ptr=N drop ptr=0`, `[uvug9] ptr=0` -> produced and stored, but consumed by a SECOND consumer
-///                                         before the shell drain (an EL0 focus ring, or the focus-change
-///                                         pre-launch discard) — squarely this lane.
+/// BASELINE: the boot selftests produce events too — `input_router_selftest` alone pushes a synthetic
+/// `Mouse{3,-4}`. "Never produced" therefore reads `push ptr=1`, not `push ptr=0` (QEMU's own line is
+/// `push ptr=1 key=38 / drop ptr=0 key=0 / pop=40`). Re-circulated events from the `SCREEN_APP_ACTIVE` peek
+/// are excluded at the source (`pal::requeue_event`), so these totals never inflate while an app owns the
+/// panel.
+///
+/// P56 verdict table, read against the `[uvug9]` line (fixture now gated off metal, so no orphan should
+/// exist and `el0_input_active()` should be 0 all boot):
+///   * EXPECTED: `[uvug9] ptr` climbs with a moving mouse, `push ptr` climbs with it -> the orphan theory
+///     held and the fixture gate was also the mouse fix.
+///   * `[uvug9] ptr=0` STILL, no orphan alive -> orphan theory refuted, hunt resumes at/after the queue:
+///       - `push ptr>1`, `drop ptr≈push ptr` -> saturated ring behind a stalled drain (cross-read `depth`
+///         and `[click2] depth`).
+///       - `push ptr>1`, `drop ptr=0` -> a SECOND consumer takes them before the shell drain; `pop` far
+///         above the router's own `[uvug9]` totals names it (an EL0 focus ring, or the focus-change
+///         pre-launch discard).
+///       - `push ptr=1` (selftest floor, unmoved) -> should be unreachable given the settled xHCI finding;
+///         if seen, the pointer endpoint stopped completing and the question returns to the driver lane.
+///         Confirm against `MOUSE-1`'s report count before concluding that.
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 fn uvug10_evq_witness() {
     use core::sync::atomic::Ordering;

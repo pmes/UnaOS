@@ -729,32 +729,43 @@
     stopped being decoded" and "the pointer is decoded but does not reach the shell path", but the two
     witnesses bracket `pal::EVENT_QUEUE` without measuring it, so the reading was not actually decisive: both
     the driver's `push_event` and the queue itself sit inside the unmeasured gap.
-  - **What the code review settled, and what it did not.** Settled: the router drain is not the thief. Its
-    three sinks are exhaustive and every one of them is disproved by `key=` climbing — the EL0-focus branch
-    (`el0_input_active() != 0`) and the `SCREEN_APP_ACTIVE` branch both `return` *before* the shell drain, so
-    neither can drop pointer events while letting keys through, and `uvug9_shell_input_witness` is called
-    ahead of `gui_send` in every arm, so even a backpressured `GUI_CHANNEL` would still have counted the
-    event. Input focus is also cleared on **every** `run_user_image` exit path including `Timeout`, so a
-    timed-out run leaves no standing focus to divert the pointer. Not settled: whether a pointer `pal::Event`
-    is ever produced. **Leading suspect (unconfirmed): it is not** — the pointer report buffer decodes as
-    all-zero, so `dx == 0 && dy == 0` skips the motion push and an unchanging `buttons` byte skips the button
-    push, while the endpoint keeps completing and re-arming and `MOUSE-1` keeps streaming. That single
-    hypothesis explains every observed fact, including "from boot" and "PIUSB-39 working". The competing
-    dup-Success-guard theory UVUG-9 named is **weakened**: `queue_mouse_read` and `queue_keyboard_read` are
-    structurally identical in their `expect_phys`/`prev_phys` bookkeeping, so a guard that mis-fires on the
-    pointer would mis-fire on the working keyboard too.
-  - **`[uvug10] evq` — the measurement that closes the gap.** `pal::push_event` now classifies every offered
-    event (pointer / key) and, because `EventQueue::push` silently discards on a full ring, counts the
-    **drops** separately; `pop_event` counts consumption across *every* consumer. `pal::event_queue_stats`
-    exposes the five totals and the router prints them as
+  - **The loss is at or after `EVENT_QUEUE` — settled, not suspected.** The driver's
+    `push_event(Event::Mouse)` (`drivers/xhci/mod.rs:2278/2286`) precedes the `MOUSE-1` print in
+    straight-line code with **no platform fork between them**, so P55b's `last dx=3 dy=5` is direct proof
+    that pointer events were pushed. An earlier all-zero-report-buffer suspect is refuted by that same fact,
+    and UVUG-9's dup-Success-guard theory is independently weakened (`queue_mouse_read` and
+    `queue_keyboard_read` are structurally identical in their `expect_phys`/`prev_phys` bookkeeping, so a
+    guard mis-firing on the pointer would mis-fire on the working keyboard).
+  - **Unified theory — and this arc's fixture gate is probably also the mouse fix.** The boot
+    `input_launcher` orphan held `el0_input_active()` for the *entire* boot, so the router's EL0 branch
+    (`route_input_to_active_el0`) swallowed the whole queue into a ring nothing would ever read. Keys still
+    reached the shell because `input_service`'s UART path calls `gui_send` **directly** and never touches
+    `EVENT_QUEUE` at all. One mechanism, no second defect, and it accounts for every observed fact including
+    "from boot" and "keys but never pointer". Gating the fixture off metal removes the orphan, and with it
+    the standing focus.
+  - **`[uvug10] evq` — the measurement that decides it on the wire.** `pal::push_event` classifies every
+    offered event (pointer / key) and, because `EventQueue::push` silently discards on a full ring, counts
+    the **drops** separately; `pop_event` counts consumption across *every* consumer. `event_queue_stats`
+    exposes the five totals and the router prints
     `[uvug10] evq push ptr=<n> key=<n> / drop ptr=<n> key=<n> / pop=<n> depth=<n>`, throttled by a pass
     counter (raspi4b's `ms()` is pinned at 0, so a wall-clock throttle would flood) and emitted only when a
-    counter actually moved. Read against `[uvug9]` it is a one-boot verdict: `push ptr=0` puts the loss
-    upstream in the xHCI HID decode (**not this lane** — a STOP, reported rather than patched);
-    `drop ptr≈push ptr` means a saturated ring behind a stalled drain; `push ptr=n, drop ptr=0` with
-    `[uvug9] ptr=0` means a second consumer is taking them before the shell drain, which *is* this lane.
-    Drop accounting matters on its own: a moving mouse produces ~125 events/s against a handful of
-    keystrokes, so any drain stall starves the pointer class first and did so invisibly before this arc.
+    counter moved. Two calibrations the reader needs. **Baseline:** the boot selftests are producers —
+    `input_router_selftest` pushes a synthetic `Mouse{3,-4}` — so "never produced" reads **`push ptr=1`**,
+    not `0`; QEMU's own line is `push ptr=1 key=38 / drop ptr=0 key=0 / pop=40`. **Re-circulation:** the
+    `SCREEN_APP_ACTIVE` peek drains and re-pushes the ring every pump pass (~250×/s) while a kernel app owns
+    the panel; that is neither production nor consumption, and counting it would inflate push/pop/drop
+    exactly in the state where a stalled drain is the hypothesis under test — so the peek now runs through
+    an uncounted seam (`pal::peek_event_uncounted` / `pal::requeue_event`) and the totals keep meaning
+    "entered the pipeline once" / "left it for good". Drop accounting earns its place regardless: a moving
+    mouse produces ~125 events/s against a handful of keystrokes, so any drain stall starves the pointer
+    class first, and did so invisibly before this arc.
+  - **P56 verdict table.** Expected: `[uvug9] ptr` climbs normally with a moving mouse and no orphan is
+    alive — the orphan theory held and nothing further is owed. If `[uvug9] ptr` is **still 0 with no
+    orphan**, the theory is refuted and the hunt resumes at or after the queue: `push ptr>1` with
+    `drop ptr≈push ptr` is a saturated ring behind a stalled drain; `push ptr>1` with `drop ptr=0` means a
+    second consumer takes them first (`pop` far above the router's own `[uvug9]` totals names it — an EL0
+    focus ring, or the focus-change pre-launch discard); `push ptr=1` unmoved should be unreachable given
+    the settled xHCI finding, and would put the question back in the driver lane.
   - **The boot interactive-launcher fixture no longer runs on metal.** ELF-5's `input_launcher` is a *real*
     interactive takeover — it registers itself as the active input target and spawns an EL0 program that
     spins on `SYS_INPUT_POLL` until it drains the one event the launcher injects. That premise holds only
@@ -770,6 +781,13 @@
     belongs to the user"; a compile-time knob was rejected because the metal image and the QEMU battery
     image are built from one feature set, so the knob would have to be remembered at every flash and a
     forgotten knob silently restores a boot-time core leak. QEMU keeps the fixture and its verdict verbatim.
+    **Recorded residual:** `timer::is_live()` is a *proxy* — it asserts "the Group-1 timer IRQ was observed
+    delivering", not "this is hardware", so a metal boot whose Group-1 delivery failed reads `false` and
+    reinstates the orphan. Accepted rather than papered over: the same proxy already gates `rx_backstop` /
+    `status_tick` / `usb_pump`, so a board where it lies has already lost its timer-driven services and the
+    orphan is not what the bench would be chasing, and the failure is loud (`AARCH64: timer heartbeat live`
+    is absent from such a capture). A real "am I on hardware" predicate belongs with platform
+    identification, not with a fixture gate.
   - Gates: `./arroyo check` green x86_64 + aarch64; `./arroyo kernel8` builds; `./arroyo kernel8-test 120`
     **46/46 required witnesses, 0 forbidden**, UVUG batch `checksum=0x48221e4101db3924` **unchanged**,
     `:: uvug6: typematic … PASS ::` green, `:: EL0: input test … PASS ::` still green in QEMU. Lane:

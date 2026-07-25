@@ -336,28 +336,50 @@ lazy_static! {
 
 // --- UVUG-10: EVENT_QUEUE PRODUCER/CONSUMER ACCOUNTING ---
 //
-// P55b left one question open that no existing witness can answer. `MOUSE-1` counts pointer reports at the
-// xHCI decode; `[uvug9] shell-path` counts pointer events at the ROUTER DRAIN (`main::pump_usb_into_gui`).
-// On metal the first streams and the second reads `ptr=0` forever, from boot. Between them sit exactly two
-// steps — `push_event` (producer) and `pop_event` (consumer) — and the existing instrumentation brackets
-// them without ever measuring either, so "the driver never pushed a pointer event" and "the pointer event
-// was pushed and then lost" are indistinguishable on the wire. They have completely different owners: the
-// first is the xHCI HID decode, the second is this router lane.
+// P55b read `[uvug9] shell-path input key=<climbing> ptr=0` on metal for the whole boot, while the xHCI
+// `MOUSE-1` witness reported a live pointer with real deltas.
 //
-// These counters close that gap at the ONE choke point every producer must pass. They are deliberately
-// classified (pointer vs key vs other) and deliberately count DROPS separately: `EventQueue::push` silently
-// discards on a full ring, and pointer traffic (~125 reports/s from a moving mouse) outnumbers keystrokes by
-// two orders of magnitude — so a stalled drain saturates the ring with pointer events and starves the very
-// class we are hunting, a failure mode that would otherwise be invisible. Plain relaxed atomics, no lock, no
-// cfg gate: arch-neutral, and the cost is one `fetch_add` on a path that already takes a spinlock.
+// THE LOSS IS AT OR AFTER THIS QUEUE — that much is now settled, not suspected. `push_event(Event::Mouse)`
+// (drivers/xhci/mod.rs:2278/2286) precedes the `MOUSE-1` print in straight-line code with no platform fork
+// between them, so P55b's `last dx=3 dy=5` is direct proof that pointer events WERE pushed. The earlier
+// all-zero-report-buffer theory is refuted by that same fact.
 //
-// Reading the `[uvug10] evq` line against `[uvug9] shell-path` at P56 decides the ownership question in ONE
-// boot:
-//   * `push ptr=0`            -> nothing ever produced a pointer event. The loss is UPSTREAM of this file
-//                                (the xHCI pointer decode / its dup-Success guard). Not this lane.
-//   * `push ptr=N, drop ptr=N` -> produced and dropped by a saturated ring: the drain is not keeping up.
-//   * `push ptr=N, drop ptr=0` while `[uvug9] ptr=0` -> produced, stored, and consumed by SOMEONE ELSE
-//                                before the shell drain (an EL0 focus ring / the focus-change discard).
+// LEADING THEORY (unified, and the one UVUG-10's fixture gate already kills): the boot `input_launcher`
+// fixture's orphan held `el0_input_active()` for the entire boot, so the router's EL0 branch
+// (`route_input_to_active_el0`, main.rs) swallowed the whole queue into a ring nothing would ever read —
+// while KEYS still reached the shell, because `input_service`'s UART path calls `gui_send` DIRECTLY and
+// never touches EVENT_QUEUE at all. That single mechanism explains "ptr=0 but key climbs", explains "from
+// boot", and requires no defect anywhere else. If it is right, gating the fixture off metal is also the
+// mouse fix.
+//
+// These counters exist to prove or refute that in ONE boot rather than by argument. They sit at the one
+// choke point every producer must pass, are classified (pointer vs key), and count DROPS separately:
+// `EventQueue::push` silently discards on a full ring, and pointer traffic (~125 reports/s from a moving
+// mouse) outnumbers keystrokes by two orders of magnitude, so a stalled drain starves the very class under
+// investigation — invisibly, before this arc. Re-circulated events are deliberately EXCLUDED (see
+// `requeue_event`). Plain relaxed atomics, no lock, no cfg gate: arch-neutral, one `fetch_add` on a path
+// that already takes a spinlock.
+//
+// BASELINE — the boot selftests are producers too. `main::input_router_selftest` pushes a synthetic
+// `Mouse{3,-4}` plus two `Key`s, and the typematic/uvug6 selftests push more keys, all before any HID
+// traffic exists. So "nothing was ever produced" reads as **`push ptr=1`**, NOT `push ptr=0`; the QEMU
+// battery's own line is `push ptr=1 key=38 / drop ptr=0 key=0 / pop=40`. Read the pointer counter against
+// that floor of 1, or a healthy zero-HID boot looks like a live pointer.
+//
+// P56 VERDICT TABLE — read `[uvug10] evq` against `[uvug9] shell-path`, with the fixture now gated off
+// metal (so no orphan should exist and `el0_input_active()` should be 0 all boot):
+//   * EXPECTED: `[uvug9] ptr` climbs normally with a moving mouse and `push ptr` climbs with it. The orphan
+//     theory was right and the fixture gate was the fix; nothing further is owed.
+//   * `[uvug9] ptr=0` STILL, with no orphan alive -> the orphan theory is refuted and the hunt RESUMES at
+//     or after this queue. These counters then discriminate:
+//       - `push ptr > 1` with `drop ptr ≈ push ptr` -> produced, then discarded by a saturated ring: the
+//         drain is not keeping up (check `depth` and the `[click2]` channel depth alongside).
+//       - `push ptr > 1` with `drop ptr = 0` -> produced and stored, then consumed by SOMEONE ELSE before
+//         the shell drain. `pop` far above the router's own `[uvug9]` totals names that second consumer;
+//         the candidates are an EL0 focus ring and `el0_input_set_active`'s pre-launch discard.
+//       - `push ptr = 1` (the selftest floor, unmoved) -> against the settled xHCI finding this should be
+//         unreachable; if it happens, the pointer endpoint itself stopped completing this boot and the
+//         question is back in the driver lane. Confirm against `MOUSE-1`'s report count before concluding.
 /// Pointer-class events (Mouse / MouseAbsolute / Button) offered to the queue.
 static EVQ_PUSH_PTR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// Key-class events (Key / KeyUp) offered to the queue.
@@ -699,6 +721,28 @@ fn pop_event() -> Option<Event> {
         EVQ_POP.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
     ev
+}
+
+/// UVUG-10 — the RE-CIRCULATION seam: pop / re-push an event WITHOUT touching the accounting counters.
+///
+/// `main::pump_usb_into_gui`'s `SCREEN_APP_ACTIVE` branch does a non-destructive PEEK: it drains the ring
+/// into a fixed buffer to look for a pending Button, then re-pushes every event in its original order and
+/// hands the queue back to the full-screen app's own drain. That is not production and not consumption —
+/// the same events go round again on the next pass, ~250×/s while a kernel app owns the panel. Counted
+/// through `push_event`/`pop_event` it would inflate `push`, `pop` AND (once the ring is deep) `drop` by
+/// orders of magnitude, in exactly the state where a stalled drain is the thing under suspicion — the
+/// witness would manufacture its own false positive. These two functions keep the peek invisible to the
+/// counters, so `push`/`pop` continue to mean "entered the pipeline once" / "left the pipeline for good".
+pub fn requeue_event(event: Event) {
+    crate::arch::without_interrupts(|| {
+        EVENT_QUEUE.lock().push(event);
+    });
+}
+
+/// The pop half of the re-circulation seam (see [`requeue_event`]). Every event taken with this MUST be
+/// returned with `requeue_event`, or the accounting silently loses it.
+pub fn peek_event_uncounted() -> Option<Event> {
+    crate::arch::without_interrupts(|| EVENT_QUEUE.lock().pop())
 }
 
 /// Drain one queued input event without a GUI surface. Used by the `usbdebug` boot mode to print

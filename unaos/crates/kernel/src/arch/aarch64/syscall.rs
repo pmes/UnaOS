@@ -10209,6 +10209,16 @@ fn input_launcher(_demo_cpu: usize) {
     //
     // QEMU keeps the fixture and its `:: EL0: input test — … ::` verdict verbatim, so the battery is
     // unchanged. Metal prints an honest, uncounted SKIP naming the reason.
+    //
+    // RESIDUAL (accepted, recorded rather than papered over): `timer::is_live()` is a proxy. It asserts
+    // "the Group-1 timer IRQ was observed delivering", not "this is hardware". A metal boot on which
+    // Group-1 delivery FAILED would read `false` here and reinstate the orphan — the leak returns exactly
+    // on the boots that are already degraded. Two things make that acceptable rather than merely tolerated:
+    // the same proxy already gates `rx_backstop` / `status_tick` / `usb_pump` in `main`, so a board where
+    // it lies has lost its timer-driven services and the orphan is not what the bench would be chasing;
+    // and the failure is loud, since `AARCH64: timer heartbeat live (first tick).` is absent from such a
+    // capture. A direct "am I on real hardware" predicate is the honest fix and belongs with whoever owns
+    // platform identification, not with a fixture gate.
     if super::timer::is_live() {
         serial_println!(
             ":: EL0: input test — SKIP on metal (real interactive takeover would orphan an EL0 poller; QEMU covers this path) ::"
