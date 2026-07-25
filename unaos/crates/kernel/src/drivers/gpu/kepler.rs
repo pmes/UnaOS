@@ -362,14 +362,20 @@ pub fn init(gpu: &GpuInfo) {
 
                                     // Milestone 2: PGRAPH Falcon Reconnaissance (Pull 18 + Pull 19)
                                     let pmc_en_pre = mmio_read(bar0, regs::NV_PMC_ENABLE);
-                                    serial_println!(":: kepler: pgraph-enable pre={:08X} ::", pmc_en_pre);
+                                    serial_println!(":: kepler: pgraph-pulse pre={:08X} ::", pmc_en_pre);
 
+                                    mmio_write(bar0, regs::NV_PMC_ENABLE, pmc_en_pre & !(1 << 12));
+                                    let pmc_en_off = mmio_read(bar0, regs::NV_PMC_ENABLE);
+                                    serial_println!(":: kepler: pgraph-pulse off rb={:08X} ::", pmc_en_off);
+                                    
+                                    for _ in 0..2_000_000 { core::hint::spin_loop(); }
+                                    
                                     mmio_write(bar0, regs::NV_PMC_ENABLE, pmc_en_pre | (1 << 12));
-                                    let pmc_en_rb = mmio_read(bar0, regs::NV_PMC_ENABLE);
-                                    serial_println!(":: kepler: pgraph-enable wrote={:08X} rb={:08X} ::", pmc_en_pre | (1 << 12), pmc_en_rb);
+                                    let pmc_en_on = mmio_read(bar0, regs::NV_PMC_ENABLE);
+                                    serial_println!(":: kepler: pgraph-pulse on rb={:08X} ::", pmc_en_on);
 
-                                    if (pmc_en_rb & (1 << 12)) == 0 {
-                                        serial_println!(":: kepler: pgraph-enable REFUSED ::");
+                                    if (pmc_en_on & (1 << 12)) == 0 {
+                                        serial_println!(":: kepler: pgraph-pulse REFUSED ::");
                                     } else {
                                         for _ in 0..2_000_000 { core::hint::spin_loop(); }
 
