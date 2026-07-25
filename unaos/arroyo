@@ -1550,7 +1550,7 @@ battery() {
     _step "x86 usb-write witness"      "usbw. write lba=.* ok" "$blog_dir/usbw-x86.log"    cat "$blog_dir/test-x86.log"
     _step "arm usb-write witness"      "usbw. write lba=.* ok" "$blog_dir/usbw-arm.log"    cat "$blog_dir/test-arm-v2.log"
     _step "arm virt v3 (CAPSTONE 6/6)" "CAPSTONE COMPLETE"   "$blog_dir/test-arm-v3.log"  env UNAOS_GICV3=1 "$0" test-arm 40
-    _step "pi4 kernel8-test 35"        "CAPSTONE COMPLETE"   "$blog_dir/kernel8.log:target/serial-pi.log" "$0" kernel8-test 35
+    _step "pi4 kernel8-test 60"        "CAPSTONE COMPLETE"   "$blog_dir/kernel8.log:target/serial-pi.log" "$0" kernel8-test 60
     _step "esp-jetson (links)"         ""                    "$blog_dir/esp-jetson.log"   env UNAOS_TEGRA=1 "$0" esp-jetson
 
     local passes; passes=$(awk '/-> PASS|: PASS/{n++} END{print n+0}' "$blog_dir/test-fat.log" target/serial-pi.log 2>/dev/null || echo '?')

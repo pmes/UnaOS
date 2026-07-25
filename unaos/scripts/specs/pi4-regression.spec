@@ -1,5 +1,14 @@
 # pi4-regression.spec — the Pi 4 kernel8 chain.
-#   QEMU gate:  ./arroyo kernel8-test 35   → unaos/target/serial-pi.log
+#   QEMU gate:  ./arroyo kernel8-test 60   → unaos/target/serial-pi.log
+#     35 -> 60 at BGRUN-2. The old 35 s was ~10% of headroom over the chain and the margin was
+#     MACHINE-DEPENDENT, not fixed: BGRUN-2's leg-3 dwell (2 s, plus STAT.ELF's yield-amplified cost
+#     while QEMU's degraded SYS_SLEEP_MS makes it spin) tipped slower hosts past the end, dropping the
+#     twelve witnesses that print LAST (K8b-snap, K8c-snapread, K6-migrate, all BANDY-*) — a truncation
+#     that reads as a regression in arcs nobody touched. Measured on the arc branch: 24 s and 27 s ->
+#     44/54, 30 s/35 s/45 s/60 s -> 54/54 on one host while another host failed at 35; at 60 s the last
+#     required witness lands ~40% into the log (line 763 of 1917), so the margin is now ~1.5x the chain
+#     rather than a tenth. Do not trim this back toward the chain length — the tail is what breaks first
+#     and it breaks SILENTLY.
 #   Metal:      ~/pi-serial.log (pi-bench-connect.sh bridge capture)
 #
 # Metal caveat (unaos-hazards): some real-Pi boots bring up only 3 of 4 cores and

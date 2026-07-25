@@ -946,6 +946,16 @@
     Headless, `BGRUN-ST` leg 3 spawns it detached, dwells 2 s (comfortably longer than UVUG's entire
     300-frame auto run, so "still running" cannot be confused with "has not got round to exiting"),
     REQUIREs `Running`, kills it and requires the row settles: `:: BGRUN-ST: persist+kill PASS (pid=…) ::`.
+  - **Gate length: the QEMU window moved 35 s → 60 s with this arc**, in `pi4-regression.spec`'s header and
+    in `arroyo`'s `battery` step. Leg 3's dwell (2 s, plus STAT's yield-amplified cost while QEMU's
+    degraded `SYS_SLEEP_MS` makes it spin) consumed headroom that was only ~10% to begin with AND was
+    machine-dependent: one host still read 54/54 at 35 s while another dropped to 42/54, losing the twelve
+    witnesses that print LAST (K8b-snap, K8c-snapread, K6-migrate, all BANDY-*) — a truncation that reads
+    as a regression in arcs nobody touched. Measured on this branch: 24 s / 27 s → 44/54; 30 / 35 / 45 /
+    60 s → 54/54; at 60 s the last required witness lands ~40% into the log. **Known hazard, unfixed and
+    out of this lane:** `battery`'s pi4 step pattern-matches `CAPSTONE COMPLETE` only, which prints EARLY
+    — so a truncated log still reports the step GREEN. The battery cannot currently go red on a short
+    window; only an explicit `mbench --replay … --spec` can. Assert the spec, not the battery step.
   - **Bench recipe (the TAB test, at last).** At the panel shell:
     `bg /fat/STAT.ELF` → `bg /fat/STAT.ELF` → `jobs` (two `running` rows; note the pids) → press `TAB`
     repeatedly and watch focus walk shell → window A → window B → shell, checking the large pid against the
