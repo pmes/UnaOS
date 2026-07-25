@@ -3205,7 +3205,91 @@ fn proc_reserve() -> Option<usize> {
             return Some(i);
         }
     }
+    // KILLBOUND — no FREE row and no EXITED corpse. The last resort is a PORPHANED row: a row whose
+    // owner timed out or was killed WITHOUT the kill confirming, parked terminal-but-owned. Pre-arc such
+    // a row was IMMORTAL unless the victim happened to die through one of the two reclaim hooks
+    // (`note_killed_task_retired`, which needs an ARMED kill slot, or the orphan's own SYS_EXIT). Neither
+    // fires when the kill table was exhausted at arm time (`KILL_EXHAUSTED`), so four such rows wedge
+    // `bg` for the rest of the boot — the hard, user-visible end of the P60 report.
+    //
+    // SMP SAFETY — the reclaim is gated on a POSITIVE QUIESCENCE WITNESS, never on elapsed time and
+    // never on an assumption about what the victim is doing. `asid_live_threads(row.asid) == 0` means
+    // NO EL0 task exists under that address space, and that is a proof, not an estimate:
+    //   * every EL0 task is counted by `asid_thread_enter` BEFORE its run-queue push, so it is countable
+    //     strictly before it can be dispatched on any core — a task that could still execute is counted;
+    //   * the count is decremented by `asid_thread_leave` only from `sched::exit` (after the slot
+    //     teardown and the joiner post — past every syscall the task can make, with only the final
+    //     `switch_context` left) and from `retire_killed` (after the Box, and with it the kernel stack,
+    //     has been dropped). Reaching zero therefore means every task ever entered under this ASID has
+    //     passed the point where it can touch a `Proc` row — including on cores 1-3.
+    //   * ASID REUSE cannot forge the witness in the unsafe direction: a NEW tenant of the same ASID
+    //     re-enters the count, so a live successor reads non-zero and we refuse. And a successor can
+    //     only exist at all if the slot was freed, which requires `SLOT_REFCOUNT` to have hit 0, which
+    //     requires our victim to have exited first. Either reading is safe.
+    // So the answer to "could the victim be mid-execution on another core?" is: not while this returns
+    // Some(i) — the witness is exactly the negation of that. A still-parked (living) victim reads
+    // non-zero and its row is NOT reclaimed here; that case is closed at the source instead, by the
+    // kill-aware waits (`sched::kill_wake_parked`), which is why the two halves are complementary.
+    //
+    // The CAS PORPHANED->PRUNNING claims the row exclusively, exactly as the BGRUN-SCAV CAS above does.
+    // No `done` permit is consumed: a PORPHANED row's task never posts one (`sys_exit`'s orphan arm and
+    // `note_killed_task_retired` both free the row without posting), so waiting here would hang.
+    for i in 0..MAX_PROCS {
+        if PROCS[i].state.load(Ordering::Acquire) != PORPHANED {
+            continue;
+        }
+        let asid = PROCS[i].asid.load(Ordering::Acquire);
+        if super::sched::asid_live_threads(asid) != 0 {
+            continue; // the victim (or a successor tenant) is alive — refuse, fail closed
+        }
+        if PROCS[i]
+            .state
+            .compare_exchange(PORPHANED, PRUNNING, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let stale_pid = PROCS[i].pid.load(Ordering::Acquire);
+            PROCS[i].pid.store(0, Ordering::Release);
+            PROCS[i].status.store(0, Ordering::Release);
+            PROCS[i].asid.store(0, Ordering::Release);
+            serial_println!(
+                "[killbound] process table full — reclaimed row {} from PORPHANED pid={} asid={} (quiescence witness: 0 live EL0 tasks under that ASID; the task is provably retired)",
+                i, stale_pid, asid
+            );
+            return Some(i);
+        }
+    }
     None
+}
+
+/// KILLBOUND: the operator string for a `proc_reserve` refusal, naming the state that actually caused it.
+fn proc_table_full_reason() -> &'static str {
+    // `proc_reserve` has already tried BOTH scavenges by the time a caller reaches this, so whatever the
+    // census reports is genuinely un-reclaimable right now. The old message unconditionally advised
+    // `jobs`, which is right for a table of EXITED corpses and a LIE for a table of PORPHANED rows —
+    // `jobs` cannot reap those and never could, so an operator following the advice learns nothing and
+    // blames the wrong resource. That cost real bench time on P60; say what actually ran out.
+    let (porphaned, exited) = proc_table_census();
+    if porphaned > 0 {
+        "process table full — rows held by killed programs that have not yet reached a boundary (`jobs` cannot reap these; they free themselves as their tasks retire)"
+    } else if exited > 0 {
+        "process table full (run `jobs` to reap exited background programs)"
+    } else {
+        "process table full — every row holds a live background program (`kill <pid>` one, or wait for it to exit)"
+    }
+}
+
+/// KILLBOUND: how many `Proc` rows are in each lifecycle state — `(porphaned, exited_unreaped)`.
+fn proc_table_census() -> (usize, usize) {
+    let mut porphaned = 0usize;
+    let mut exited = 0usize;
+    for i in 0..MAX_PROCS {
+        match PROCS[i].state.load(Ordering::Acquire) {
+            PORPHANED => porphaned += 1,
+            PEXITED => exited += 1,
+            _ => {}
+        }
+    }
+    (porphaned, exited)
 }
 
 /// Find the RUNNING Proc entry whose pid matches — the child-exit / child-kill lookup. Called with a live
@@ -3358,6 +3442,43 @@ pub fn note_killed_task_retired(pid: u64) {
         );
         proc_free(i);
     }
+}
+
+/// KILLBOUND — the `syscall`-owned half of `sched::kill_wake_parked`: evict every task an ARMED kill
+/// names from the SEMAPHORES this module owns, and re-ready it so the off-CPU dispatch boundary retires
+/// it. Returns how many were evicted. The futex half lives in `sched` (see `futex_wake_killed`).
+///
+/// THE ENUMERATION IS THE POINT — these are every `Semaphore` an EL0 task can be parked on:
+///   * `Proc::done`  — `SYS_WAIT` blocking on a spawned child (`sys_wait`, this file).
+///   * `BUS_SEM[asid]` — `SYS_MRECV` blocking on an empty bus mailbox (`sys_mrecv`, this file).
+///   * a `ThreadRec`'s `JoinHandle` — `SYS_THREAD_JOIN` blocking on a worker's completion.
+/// Everything else in the kernel that blocks on a `Semaphore` (`REAPER_SEM`, the `Mutex`/`Condvar`
+/// internals) is reachable only from kernel tasks, which are never `kill` targets.
+///
+/// `THREAD_TABLE` is taken with `try_lock`, never `lock`: this runs from an arbitrary requester's
+/// context (the shell task, or an EL0 task's SVC), and blocking a kill behind a spinlock held by a
+/// preempted task on the SAME core would be a new deadlock in exchange for a rarely-taken sweep. A
+/// missed pass is not a correctness hole — the pre-park check in `Semaphore::wait` covers the arm-then-
+/// park order, and the row-reclaim half (`proc_scavenge_orphaned`) covers the residue either way.
+#[cfg_attr(not(feature = "baremetal"), allow(dead_code))]
+pub fn kill_wake_parked_semaphores() -> u32 {
+    let mut n = 0u32;
+    for i in 0..MAX_PROCS {
+        n += PROCS[i].done.wake_killed();
+    }
+    // Only mailboxes that were actually initialised can hold a parked waiter (`sys_mrecv` calls
+    // `bus_sem_init_once` before it can block), so this is a no-op on a boot with no bus traffic.
+    if BUS_SEM_INIT.load(Ordering::Acquire) == 2 {
+        for s in &BUS_SEM {
+            n += s.wake_killed();
+        }
+    }
+    if let Some(tab) = THREAD_TABLE.try_lock() {
+        for rec in tab.iter().flatten() {
+            n += rec.join.wake_killed();
+        }
+    }
+    n
 }
 
 /// Release a Proc entry to FREE — after reaping in sys_wait, or unwinding a failed sys_spawn claim.
@@ -6710,7 +6831,7 @@ pub fn run_user_image(
     // Claim the Proc entry FIRST so a failed map frees nothing but the entry (no slot is allocated on any
     // map-failure path), and so the pid slot exists before the co-located task can be dispatched.
     let Some(pi) = proc_reserve() else {
-        return Err("process table full (run `jobs` to reap exited background programs)");
+        return Err(proc_table_full_reason());
     };
     let mapped = match map_image_into_slot(bytes) {
         Ok(m) => m,
@@ -7136,7 +7257,7 @@ pub fn spawn_user_image_bg(bytes: &[u8]) -> Result<(u64, u64, u64), &'static str
         return Err("image larger than the 16 KiB user window");
     }
     let Some(pi) = proc_reserve() else {
-        return Err("process table full (run `jobs` to reap exited background programs)");
+        return Err(proc_table_full_reason());
     };
     let mapped = match map_image_into_slot(bytes) {
         Ok(m) => m,
@@ -7222,7 +7343,7 @@ pub fn bg_kill(pid: u64, asid: u64) -> &'static str {
         // window" branch, whose `done.wait()` has NO permit for a still-alive orphan: the shell task
         // parks forever and the console dies. `proc_orphan`'s contract is "the caller just observed
         // PRUNNING"; honour it here instead of assuming it.
-        PORPHANED => return "already killed — row parked PORPHANED; it settles at the task's next boundary",
+        PORPHANED => return "already killed — the kill is still armed; the row frees itself when the task retires, and is reclaimed under table pressure once it has",
         _ => {}
     }
     let Some(ticket) = super::sched::kill(pid, asid) else {
@@ -7272,8 +7393,16 @@ pub fn bg_kill(pid: u64, asid: u64) -> &'static str {
         // Guarded by the PORPHANED early-out above: this row was observed PRUNNING this call, so
         // `proc_orphan`'s CAS either parks it or reports a genuine race-window death.
         let _ = proc_orphan(pi);
-        serial_println!("[skill] killed pid={} asid={} confirmed=0 row=orphaned (bg)", pid, asid);
-        "kill armed but unconfirmed — row parked PORPHANED; it settles at the task's next boundary"
+        serial_println!(
+            "[skill] killed pid={} asid={} confirmed=0 row=orphaned (bg) — {} live EL0 task(s) still under the ASID",
+            pid, asid, super::sched::asid_live_threads(asid)
+        );
+        // KILLBOUND: the old string promised the row "settles at the task's next boundary", which was
+        // exactly the untrue part when the target was parked in a kernel wait — it had no next boundary,
+        // and the row was immortal. The waits are kill-aware now, so a target that still has not
+        // confirmed inside the bounded window is one that is genuinely slow to reach a boundary rather
+        // than one that can never reach one; and the row is reclaimable under pressure either way.
+        "kill armed but unconfirmed — the request stays armed and the target dies at its next boundary; the row frees itself then, and is reclaimed under table pressure once the ASID is quiescent"
     }
 }
 
@@ -9265,6 +9394,10 @@ fn bgrun_witness(_demo_cpu: usize) {
     if DONE.swap(true, Ordering::Relaxed) {
         return;
     }
+    // KILLBOUND runs FIRST and unconditionally: its fixture is an in-kernel blob, so unlike every leg
+    // below it needs no SD card and no staged .ELF, and a card-less boot must not silently drop the one
+    // leg that covers the P60 wedge. It leaves the process table exactly as it found it.
+    killbound_witness();
     if crate::drivers::block::info().is_none() {
         serial_println!(":: BGRUN-ST: no SD card found — skipped ::");
         return;
@@ -9451,6 +9584,102 @@ fn bgrun_witness(_demo_cpu: usize) {
     }
 }
 
+/// KILLBOUND — the regression leg for the P60 wedge, run as the last `bgrun_witness` leg (it needs the
+/// process table clean, and it leaves it clean).
+///
+/// WHAT THE EXISTING LEGS COULD NOT CATCH. Legs 2 and 3 kill programs that are RUNNABLE: VUG makes
+/// syscalls every frame, KVUG spins. Both reach a SKILL-1 boundary the moment the request is armed, so
+/// both passed all the way through the boot on which Peter's Pi wedged. The property they never touched
+/// is a target that is PARKED — and a parked task reaches neither boundary, which is why the operator's
+/// `kill` on a relaunched vug printed "armed but unconfirmed" and then "already killed", forever, while
+/// `jobs` listed it as running and the fourth such row denied every later `bg`.
+///
+/// THE LEG. `NKB` rounds of: `bg` the KILLBOUND fixture; WAIT FOR A POSITIVE PARK WITNESS (the futex
+/// waiter census must rise by 3 — the parent plus both workers — so a round that passes cannot be
+/// passing because the fixture died early or never blocked); kill it; require the kill to CONFIRM and
+/// the row to be GONE and the ASID to be drained inside a bounded window. Every round must pass.
+///
+/// WHY `NKB` ROUNDS AND NOT ONE. Each round spawns 2 threads and is killed before it can join them, so
+/// each round leaks 2 `THREAD_TABLE` rows on the pre-fix code — the root of the P60 chain. `NTHREAD` is
+/// 8, so rounds 1-4 fill the table and round 5 is the one that must scavenge. A single round would
+/// witness the kill-awareness half and miss the reclamation half entirely.
+///
+/// TEETH: on the unfixed kernel round 1 already fails — the parked fixture never confirms, `bg_kill`
+/// falls back to PORPHANED, and the row is never gone.
+fn killbound_witness() {
+    /// Rounds: `NTHREAD / 2` rounds fill the global thread table (2 threads each), and one more forces
+    /// the scavenge. Deliberately derived from `NTHREAD` so the leg keeps its teeth if the pool changes.
+    const NKB: usize = NTHREAD / 2 + 1;
+
+    let bstart = &raw const __killbound_blob_start as usize;
+    let bend = &raw const __killbound_blob_end as usize;
+    let blob = unsafe { core::slice::from_raw_parts(bstart as *const u8, bend - bstart) };
+    if blob.len() > super::boot::USER_CODE_SIZE {
+        serial_println!(":: KILLBOUND: blob {} B > code page — skipped ::", blob.len());
+        return;
+    }
+    let mut rounds_ok = 0usize;
+    let mut parked_ok = 0usize;
+    let mut first_fail = "";
+    for _ in 0..NKB {
+        let before = super::sched::futex_parked_total();
+        let (pid, asid, _entry) = match spawn_user_image_bg(blob) {
+            Ok(v) => v,
+            Err(why) => {
+                if first_fail.is_empty() {
+                    first_fail = why;
+                }
+                break;
+            }
+        };
+        // Positive park witness: all three tasks must reach `futex_wait` and STAY there. Bounded, and
+        // wall-clock (CNTPCT advances under QEMU, where no timer IRQ is delivered).
+        let t0 = super::timer::cntpct();
+        let budget = super::timer::cntfrq().saturating_mul(5);
+        let parked = loop {
+            if super::sched::futex_parked_total() >= before + 3 {
+                break true;
+            }
+            if super::timer::cntpct().wrapping_sub(t0) >= budget {
+                break false;
+            }
+            super::sched::yield_now();
+        };
+        if parked {
+            parked_ok += 1;
+        }
+        // The kill under test. Nothing can wake these tasks: the words they wait on are only ever
+        // written by the fixture itself, before it parks.
+        let verdict = bg_kill(pid, asid);
+        let t1 = super::timer::cntpct();
+        let settled = loop {
+            if matches!(bg_poll(pid, true), BgPoll::Gone) && super::sched::asid_live_threads(asid) == 0 {
+                break true;
+            }
+            if super::timer::cntpct().wrapping_sub(t1) >= budget {
+                break false;
+            }
+            super::sched::yield_now();
+        };
+        if parked && settled {
+            rounds_ok += 1;
+        } else if first_fail.is_empty() {
+            first_fail = verdict;
+        }
+    }
+    if rounds_ok == NKB && parked_ok == NKB {
+        serial_println!(
+            ":: KILLBOUND: {}/{} rounds — a bg program parked in futex_wait (parent + 2 threads, no waker) killed, confirmed and row-reaped every round; the global thread table survived {} un-joined pairs PASS ::",
+            rounds_ok, NKB, NKB
+        );
+    } else {
+        serial_println!(
+            ":: KILLBOUND: rounds_ok={} parked_ok={} of {} ({}) -> FAIL ::",
+            rounds_ok, parked_ok, NKB, first_fail
+        );
+    }
+}
+
 /// UVUG-1 witness: prove the mini-vug EL0 graphics program end-to-end at boot. Reads VUG.ELF through the
 /// VFS `MountTable` (the same namespace the panel `run` verb builds) and executes it via `run_user_image` —
 /// the identical path the operator drives with `run /fat/VUG.ELF`. The program maps its off-screen surface
@@ -9541,6 +9770,12 @@ const NTHREAD: usize = 8;
 /// the join (single-shot), and by construction never observed by two joiners (one live parent per ASID).
 struct ThreadRec {
     owner: u64,
+    /// KILLBOUND: the owner ASID's GENERATION at spawn time (`ASID_GEN[owner]`). ASIDs are RECYCLED, so
+    /// `owner` alone does not identify a tenant — and `clear_handle_row` bumps this word on the slot's
+    /// 1->0 teardown edge, which makes `ASID_GEN[owner] != gen` a POSITIVE proof that the tenant that
+    /// spawned this thread is entirely gone. That is both the scavenge witness and the fail-closed check
+    /// that stops a recycled-ASID successor from joining (and reaping) its predecessor's thread handle.
+    agen: u64,
     join: super::sched::JoinHandle,
 }
 
@@ -9596,12 +9831,56 @@ fn sys_thread_spawn(entry: u64, sp: u64, arg: u64, place: u64) -> i64 {
     // thread's own exit balances it (`teardown_user_slot`). The lock spans the spawn (a brief critical
     // section, no cross-core contention) so the returned handle index is stable before EL0 sees it.
     let mut tab = THREAD_TABLE.lock();
-    let Some(idx) = tab.iter().position(|s| s.is_none()) else {
-        return EAGAIN;
+    let idx = match tab.iter().position(|s| s.is_none()) {
+        Some(i) => i,
+        // KILLBOUND — the THREAD-TABLE half of the reclaim, and the ROOT of the P60 wedge. A row is
+        // released only by the owner's own voluntary `SYS_THREAD_JOIN`, so a program that is KILLED
+        // before its join leaks every row it holds, permanently, from a table that is GLOBAL (8 rows for
+        // the whole machine). Four killed two-thread programs exhaust it; from then on every
+        // `SYS_THREAD_SPAWN` returns `-EAGAIN` and a windowed app that does not check the return blocks
+        // at its first frame barrier forever — the empty window, the unkillable pid, and the permanent
+        // `bg` refusal, all from this one leak.
+        //
+        // The scavenge is the `BGRUN-SCAV` discipline applied to this table, gated on the same kind of
+        // POSITIVE QUIESCENCE WITNESS as `proc_reserve`'s: `ASID_GEN[owner] != rec.agen` means the slot
+        // that owned the row reached `teardown_user_slot`'s 1->0 edge (`clear_handle_row` bumps the gen
+        // there), which happens only after the LAST live task under that ASID has retired. The thread
+        // this row tracks therefore cannot be mid-execution on ANY core — it is not merely idle, it is
+        // gone, and the `SLOT_REFCOUNT` that proves it is decremented by the task itself.
+        //
+        // Deliberately LAZY (reclaim under pressure) rather than eager at teardown: `teardown_user_slot`
+        // runs IRQ-masked, sometimes on the scheduler's own stack (`retire_killed`), and taking this
+        // `SpinMutex` there would add a lock-order hazard to the teardown path in exchange for nothing —
+        // here the lock is already held, in the one context that needs the rows.
+        None => {
+            let mut freed = usize::MAX;
+            for (i, slot) in tab.iter_mut().enumerate() {
+                let dead = match slot {
+                    Some(r) => ASID_GEN[r.owner as usize].load(Ordering::Acquire) != r.agen,
+                    None => false,
+                };
+                if dead {
+                    let owner = slot.as_ref().map(|r| r.owner).unwrap_or(0);
+                    *slot = None; // drops the JoinHandle's Arc clone with the row
+                    serial_println!(
+                        "[killbound] thread table full — reclaimed row {} from dead ASID {} (quiescence witness: the slot was torn down, so every task under it has retired)",
+                        i, owner
+                    );
+                    if freed == usize::MAX {
+                        freed = i;
+                    }
+                }
+            }
+            if freed == usize::MAX {
+                return EAGAIN;
+            }
+            freed
+        }
     };
     super::boot::slot_thread_retain(asid);
     let join = super::sched::spawn_user_thread("el0-thread-w", entry, sp, arg, ttbr0, cpu);
-    tab[idx] = Some(ThreadRec { owner: asid, join });
+    let agen = ASID_GEN[asid as usize].load(Ordering::Acquire);
+    tab[idx] = Some(ThreadRec { owner: asid, agen, join });
     drop(tab);
     THREADS_SPAWNED.fetch_add(1, Ordering::AcqRel);
     idx as i64
@@ -9617,7 +9896,15 @@ fn sys_thread_join(handle: u64) -> i64 {
     let idx = handle as usize;
     let rec = {
         let mut tab = THREAD_TABLE.lock();
-        if idx >= NTHREAD || tab[idx].as_ref().map(|r| r.owner) != Some(asid) {
+        // KILLBOUND: the owner check is now (asid, gen), not asid alone. ASIDs are recycled, and a
+        // killed program's rows outlive it until the scavenge above reclaims them — so a NEW tenant of
+        // the same ASID could otherwise join, block on, and reap its predecessor's thread handle. The
+        // gen word makes the row identify a TENANT rather than a slot number. Fail-closed: `-ESRCH`.
+        if idx >= NTHREAD {
+            return ESRCH;
+        }
+        let agen = ASID_GEN[asid as usize].load(Ordering::Acquire);
+        if !tab[idx].as_ref().is_some_and(|r| r.owner == asid && r.agen == agen) {
             return ESRCH;
         }
         tab[idx].take().unwrap()
@@ -9734,6 +10021,74 @@ unsafe extern "C" {
     static __threads_blob_start: u8;
     static __threads_blob_end: u8;
     static __threads_prog_parent: u8;
+}
+
+// =============================================================================================
+// KILLBOUND fixture — the smallest program that reproduces the P60 wedge, headless.
+//
+// It is `user-vug` with everything but the fault removed: zero two futex words, spawn two worker
+// threads, and block in `SYS_FUTEX(FUTEX_WAIT)` on a word NOBODY EVER WAKES. The workers do the same
+// on a second word. All three tasks are then parked in futex buckets — in no run queue, no core's
+// `current` — which is exactly the state a real vug reaches at its frame barrier when its workers are
+// absent, and exactly the state that made the operator's `kill` report "armed but unconfirmed" forever.
+//
+// FLAT image (no ELF magic), one code page, position-independent via `adr` — the historical loader
+// path, so it rides `spawn_user_image_bg` with no fixture files on the card. The data page is NOT
+// zeroed by the flat loader and slot backings are RECYCLED, so the blob zeroes its own futex words
+// before touching them; without that a stale non-zero word would make `futex_wait` return `Mismatch`
+// and the fixture would spin instead of park — a leg that tests nothing.
+// =============================================================================================
+core::arch::global_asm!(
+    r#"
+    .balign 4
+    .globl __killbound_blob_start
+__killbound_blob_start:
+    adr  x20, __killbound_blob_start      // x20 = window base (PC-relative)
+    add  x21, x20, #0x1000                // x21 = the futex words (RW data page 1)
+    str  xzr, [x21]                       // parent's word = 0
+    str  xzr, [x21, #8]                   // workers' word = 0
+    dmb  ish                              // publish both zeroes before any thread can read them
+    adr  x0, __killbound_worker           // SYS_THREAD_SPAWN(entry, sp, arg=0, place=0 this core)
+    add  x1, x20, #0x3000
+    mov  x2, #0
+    mov  x3, #0
+    mov  x8, #21
+    svc  #0
+    adr  x0, __killbound_worker           // SYS_THREAD_SPAWN(entry, sp, arg=1, place=1 sibling core)
+    add  x1, x20, #0x3000                 // (two adds: ADD imm12 cannot encode 0x3800 directly)
+    add  x1, x1, #0x800
+    mov  x2, #1
+    mov  x3, #1
+    mov  x8, #21
+    svc  #0
+    add  x0, x20, #0x1000                 // SYS_FUTEX(uaddr, FUTEX_WAIT=0, expect=0) -> parks forever
+    mov  x1, #0
+    mov  x2, #0
+    mov  x8, #26
+    svc  #0
+1:  b 1b                                  // a wake would be a bug; spin rather than fall off the page
+
+    .balign 4
+    .globl __killbound_worker
+__killbound_worker:
+    adr  x20, __killbound_blob_start      // recover the window base
+    add  x0, x20, #0x1000                 // a SECOND key, so the parent and the workers park on
+    add  x0, x0, #8                       // different buckets (proves the sweep walks the whole pool)
+    mov  x1, #0
+    mov  x2, #0
+    mov  x8, #26
+    svc  #0
+2:  b 2b
+
+    .balign 4
+    .globl __killbound_blob_end
+__killbound_blob_end:
+"#
+);
+
+unsafe extern "C" {
+    static __killbound_blob_start: u8;
+    static __killbound_blob_end: u8;
 }
 
 /// ELF-2 threads-test launcher + verdict (the `elf1_launcher` shape: one gated kernel task, self-contained,

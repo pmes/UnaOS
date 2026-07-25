@@ -319,6 +319,18 @@ REQUIRE BGRUN-ST: slot reclaim PASS
 REQUIRE BGRUN-ST: kill mid-run PASS \(pid=[0-9]+, killed — row reaped
 REQUIRE BGRUN-ST: persist\+kill PASS \(pid=[0-9]+,
 FORBID BGRUN-ST: .*-> FAIL
+
+# --- KILLBOUND: a kill must reach a target PARKED in a kernel wait, and neither of the two bounded
+# --- tables may be wedged by killing programs that never got to clean up after themselves. The three
+# --- BGRUN-ST legs above all kill RUNNABLE targets (VUG makes syscalls every frame, KVUG spins), so
+# --- they passed on the very boot where the operator's Pi wedged. This leg kills a target parked in
+# --- `futex_wait` with no waker — the state a windowed app reaches at its frame barrier when its
+# --- worker threads are absent — five rounds deep, which is one more than the global thread table
+# --- holds. Each round REQUIREs a positive park witness (3 futex waiters) before the kill, then
+# --- kill-confirmed + row reaped + ASID drained. Uncounted (no `-> PASS`). QEMU-proven; metal rides
+# --- the attended sitting.
+REQUIRE KILLBOUND: 5/5 rounds .*PASS
+FORBID KILLBOUND: .*-> FAIL
 #
 # --- 5. WC-E: the SCAN-OUT GROUND TRUTH. Every directive above this one checks a number the KERNEL
 # ---    computed; even WC-D's read-back goes through the same `info.stride` it wrote through, so it

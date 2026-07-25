@@ -925,6 +925,11 @@
     of a task that reaches no boundary at all (the QEMU case; on metal the quantum tick always arrives).
     Both are bounded and **visible**: the table is four entries, every other path returns its slot, and the
     resulting exhaustion is witnessed rather than silent.
+    > **Superseded by KILLBOUND (below).** The first limitation was not a bounded inconvenience — it was
+    > the P60 wedge, and it was reachable by an ordinary operator in an ordinary session. It is now closed
+    > from both sides, and **the lock-order objection recorded above was simply wrong**: the eviction takes
+    > exactly the lock `futex_wake`/`Semaphore::post` already take, in the same order, and calls
+    > `make_ready` outside it. The second limitation (no boundary at all) is genuine and stands.
   - **QEMU proves both arms; only the timer *trigger* is metal-only.** The new `:: SKILL-1: async kill …
     :: PASS ::` witness runs cooperatively on the boot core (before `SCHED_ACTIVE`, self-contained and
     bounded, like the `prio_mix`/`load_accounting` witnesses beside it) and drives `dispatch_next` by hand,
@@ -1072,6 +1077,88 @@
       the windows of the ASID that is LOSING focus, which the raise never touches (and which the shell
       branch does not raise at all). Without that the old holder would keep the bright chrome until
       something unrelated happened to damage it.
+- **KILLBOUND (this arc)** — the **unkillable parked task**, and the two bounded tables it wedged. P60 was
+  an attended sitting on a real Pi 4, and the failure was reached by hand, not by a fixture: after several
+  `bg` vug launches and kills, `kill <pid>` stopped working. The shell printed `kill armed but unconfirmed`
+  and then, on retry, `already killed`; `jobs` listed the pids as `running` indefinitely; no
+  `[skill] killed … confirmed=1` line ever reached the wire for them; the relaunched programs showed an
+  **empty window** even though their creation blit byte-verified `PASS`; and once four such rows had piled
+  up, `bg` refused **every** further launch with `process table full`. Three faces, one fault.
+  - **The chain, end to end.** `THREAD_TABLE` (`syscall.rs`) is **global** and holds `NTHREAD = 8` rows for
+    the whole machine, and a row is released *only* by the owning program's own voluntary
+    `SYS_THREAD_JOIN`. A program that is **killed** never reaches its joins, so it leaks every row it
+    holds, permanently. `user-vug` spawns two workers, so **four killed vugs exhaust the table**; from then
+    on every `SYS_THREAD_SPAWN` returns `-EAGAIN`. vug does not check that return (its handles are used
+    only for the join), so the next launch runs with **no workers**, its `DONE` word never reaches 2, and
+    its per-frame barrier blocks in `futex_wait` **forever — before its first `SYS_WIN_PRESENT`**. That is
+    the empty window. And a task parked in a futex bucket is in no run queue and is no core's `current`, so
+    **neither SKILL-1 boundary can see it**: `asid_thread_leave` never runs, the ASID-scoped request is
+    never settled, the row is parked `PORPHANED` for the rest of the boot. That is the unkillable pid, and
+    four of them are the permanent `process table full`.
+  - **Refuted while measuring.** `slot_thread_retain(asid)` was reported as never balanced. It **is**
+    balanced — every spawned thread's own death path (`sched::exit` and the off-CPU `retire_killed`) calls
+    `teardown_user_slot(asid)`, which decrements `SLOT_REFCOUNT`. The leak is the `ThreadRec` row, not the
+    slot refcount. Worth recording, because a refcount "fix" here would have been a real bug.
+  - **Fix (a) — the waits are kill-aware, from both sides.** *Before parking*, `Semaphore::wait` and
+    `futex_wait` test the armed-kill flag and route the task straight into `exit()` — the wait's own
+    predicate is the right place for it, and those call sites qualify as kill boundaries for exactly the
+    reasons `kill_check_current`'s do (IRQ-masked, on the task's own kernel stack); the raw lock is
+    released first, since `exit()` never returns. *After parking*, `sched::kill` **evicts** already-parked
+    targets: `futex_wake_killed` walks all 16 buckets and `kill_wake_parked_semaphores` walks every
+    `Semaphore` an EL0 task can reach (`Proc::done`/`SYS_WAIT`, `BUS_SEM`/`SYS_MRECV`, a `ThreadRec`'s
+    join handle/`SYS_THREAD_JOIN` — the set is enumerable, which is why this is a sweep and not a
+    registry), re-readying each so the **off-CPU dispatch boundary** retires it before it executes another
+    instruction. The two orders — arm-then-park and park-then-arm — are covered one each; together the
+    property is total. No permit is handed over on eviction, and that is sound because an evicted task
+    **provably never resumes**: the request that matched it cannot be cleared while it is alive
+    (`kill_release` needs the target retired, `kill_settle` withholds that while the task is still counted,
+    `kill_retract` needs the requester to have observed it dead). `THREAD_TABLE` is swept under `try_lock`,
+    never `lock` — a kill must not be able to block behind a spinlock held by a preempted task.
+  - **Fix (b) — both bounded tables reclaim, each on a POSITIVE QUIESCENCE WITNESS.** Neither reclaim uses
+    elapsed time, and neither ever frees a resource whose task could still be executing on cores 1-3.
+    - *`Proc` rows.* `proc_reserve`'s last resort reclaims a `PORPHANED` row iff
+      `sched::asid_live_threads(row.asid) == 0`. That is a proof, not an estimate: every EL0 task is
+      counted by `asid_thread_enter` **before** its run-queue push (so a task that could still execute is
+      counted), and the count is decremented only from `sched::exit` — past the slot teardown, the joiner
+      post, and every syscall the task can make, with only the final `switch_context` left — or from
+      `retire_killed`, after the Box and its kernel stack have been dropped. Zero therefore means every
+      task ever entered under that ASID has passed the point where it can touch a `Proc` row. ASID reuse
+      cannot forge it in the unsafe direction: a live successor re-enters the count and reads non-zero, and
+      a successor can only exist if the slot was freed, which required our victim to exit first.
+    - *Thread rows.* `sys_thread_spawn` scavenges when the table is full, reclaiming any row whose
+      `ASID_GEN[owner] != rec.agen` — the gen word is bumped by `clear_handle_row` on
+      `teardown_user_slot`'s 1→0 edge, so a bump proves the **last live task under that ASID has retired**.
+      Deliberately lazy (reclaim under pressure) rather than eager at teardown: `teardown_user_slot` runs
+      IRQ-masked, sometimes on the scheduler's own stack, and taking that `SpinMutex` there would add a
+      lock-order hazard in exchange for nothing. The same gen word also makes `SYS_THREAD_JOIN` fail closed
+      (`-ESRCH`) when a **recycled-ASID successor** would otherwise have joined and reaped its
+      predecessor's thread handle.
+    - A still-*living* parked victim is reclaimed by **neither** — correctly. That case is closed at the
+      source by fix (a), which is why the two halves are complementary rather than redundant.
+  - **The operator messages now tell the truth.** `process table full (run `jobs` to reap …)` was right for
+    a table of corpses and a **lie** for a table of `PORPHANED` rows — `jobs` cannot reap those and never
+    could, so following the advice taught the operator nothing and blamed the wrong resource (this cost
+    real bench time). The refusal now names the state that actually caused it, and `bg_kill`'s unconfirmed
+    string no longer promises that the row "settles at the task's next boundary" — the untrue part when the
+    target had no next boundary.
+  - **Witness: `BGRUN-ST` leg 0 / `:: KILLBOUND: …`,** `+1` spec REQUIRE and `+1` FORBID (63 → 64). The
+    three existing BGRUN legs all kill **runnable** targets (VUG makes syscalls every frame, KVUG spins),
+    which is why all three passed green on the very boot where the operator's Pi wedged. The new leg kills
+    a target that is **parked**: an in-kernel flat blob (no SD card, no staged `.ELF`) zeroes two futex
+    words, spawns two worker threads, and every one of the three blocks in `SYS_FUTEX(FUTEX_WAIT)` on a
+    word nobody ever wakes. Each round waits for a **positive park witness** — `sched::futex_parked_total`
+    must rise by 3 — so a passing round cannot be passing vacuously, then kills and requires
+    kill-confirmed + row `Gone` + ASID drained inside a bounded window. It runs `NTHREAD/2 + 1 = 5` rounds
+    because each round leaks two thread rows on the pre-fix code: rounds 1–4 fill the global table and
+    round 5 is the one that must scavenge. **Verified to have teeth**: with the kill-awareness disabled and
+    nothing else changed, the leg reports `rounds_ok=0 parked_ok=4 of 5 (kill armed but unconfirmed …) ->
+    FAIL` — and `parked_ok=4` is the P60 chain reproducing itself in QEMU, round 5 unable even to reach the
+    parked state because the thread table was exhausted by the four leaked pairs.
+  - Gates: `./arroyo check` green x86_64 + aarch64; `UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test 60`
+    → **64/64 required witnesses, 0 forbidden**; `./arroyo test-arm` MISSION SUCCESS. Lane:
+    `arch/aarch64/sched.rs` (the kill primitive + the two wait primitives) + `arch/aarch64/syscall.rs`
+    (proc/thread row lifecycle, the fixture and the leg) + the spec + this doc. QEMU-green ≠ correct: the
+    metal confirmation rides the attended sitting.
 - **BGRUN-SCAV (this arc)** — P59b sent back two bench observations. **One of them is not a bug**, and
   saying so is the more useful finding; the other is real and is fixed here.
   - **NOT A BUG: "`jobs` reports `running` for a process that already exited."** The proposed mechanism

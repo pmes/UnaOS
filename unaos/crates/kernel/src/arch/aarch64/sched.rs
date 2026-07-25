@@ -1172,6 +1172,12 @@ impl JoinHandle {
         self.id
     }
 
+    /// KILLBOUND: evict any killed task parked on THIS completion semaphore (a `SYS_THREAD_JOIN`er).
+    /// Delegates to `Semaphore::wake_killed`; see there for why no permit is handed over.
+    pub fn wake_killed(&self) -> u32 {
+        self.done.wake_killed()
+    }
+
     /// Block the current task until the joined task finishes. MUST be called from a scheduled task
     /// (it blocks); the `assert` rejects a call off the scheduler (e.g. the unscheduled BSP) loudly
     /// rather than silently returning as if the task had finished.
@@ -1490,6 +1496,18 @@ pub fn kill(tid: u64, asid: u64) -> Option<KillTicket> {
             // means "no match yet", never a match on the wrong task.
             KILLS[i].asid.store(asid, Ordering::Release);
             KILLS[i].tid.store(tid, Ordering::Release);
+            // KILLBOUND — evict any target already PARKED in a kernel wait, strictly AFTER the publish
+            // above (so `kill_slot_for` matches) and BEFORE the pokes (so a core woken by the poke finds
+            // the evicted task already on its run queue and retires it in that same dispatch pass). A
+            // parked task reaches neither SKILL-1 boundary on its own; without this the request stays
+            // armed forever and the row it owns is immortal. See `futex_wake_killed`.
+            let evicted = kill_wake_parked();
+            if evicted > 0 {
+                serial_println!(
+                    "[killbound] kill tid={} asid={} — {} task(s) evicted from a kernel wait to reach the boundary",
+                    tid, asid, evicted
+                );
+            }
             for cpu in 0..NUM_CPUS {
                 if ONLINE_MASK[cpu].load(Ordering::Acquire) {
                     poke_cpu(cpu);
@@ -1548,15 +1566,18 @@ pub fn kill_retract(ticket: KillTicket) {
 /// `kill_settle` when that finally happens. The caller has already fallen back to PORPHANED.
 ///
 /// WHICH TARGETS CAN HOLD A SLOT FOREVER — the honest limits of a boundary-driven kill:
-///   * A task **blocked on a wake that never comes** (a semaphore nobody posts, a futex nobody wakes) is
-///     in neither a run queue nor on a CPU: it reaches no dispatch and no preemption, so NEITHER arm can
-///     see it. Its slot stays `KILL_DETACHED` for the rest of the boot. Sweeping the wait lists at detach
-///     time is the real fix and is deliberately NOT attempted here: the waiters live behind `Semaphore`'s
-///     and `FutexBucket`'s own raw spinlocks, and reaching into them from an arbitrary requester context
-///     would invert the lock order the park-side handoff depends on (`Semaphore::wait` pushes the Box
-///     while holding that lock). That is a wait-queue-ownership change, not a scheduler-kill change.
+///   * ~~A task blocked on a wake that never comes~~ — **CLOSED by KILLBOUND.** This was the real bug,
+///     not a theoretical limit: a task parked on a futex nobody wakes is in neither a run queue nor on a
+///     CPU, so neither arm saw it, and the operator's `kill` reported "armed but unconfirmed" forever
+///     (P60, a `bg`'d vug whose worker threads never spawned and whose frame barrier therefore blocked in
+///     `futex_wait` before its first present). It is now closed from BOTH sides: `Semaphore::wait` and
+///     `futex_wait` test the armed-kill flag before parking, and `kill` evicts already-parked targets via
+///     `kill_wake_parked`. The lock-order objection recorded here was WRONG — the eviction takes exactly
+///     the lock `futex_wake`/`Semaphore::post` already take, in the same order, and calls `make_ready`
+///     outside it; the park-side handoff releases that lock from the scheduler, so a requester spinning
+///     on it always makes progress.
 ///   * A task that **never reaches any boundary at all** — no yield, no syscall, and no timer (the QEMU
-///     case; on metal the quantum tick always arrives).
+///     case; on metal the quantum tick always arrives). This one is genuine and remains.
 /// Both are bounded and visible rather than silent: the table is four entries, and the exhaustion that
 /// results is witnessed once per boot by the caller (`KILL_EXHAUSTED`). Every OTHER path returns its slot
 /// — a confirmed kill via `kill_release`, a detached-then-landed kill inline in `kill_settle`, and a
@@ -2311,6 +2332,19 @@ impl Semaphore {
             return false;
         }
 
+        // KILLBOUND — the PRE-PARK kill boundary. A parked task is in neither a run queue nor any
+        // core's `current`, so NEITHER of SKILL-1's boundaries can reach it: parking here with a kill
+        // already armed would make the task permanently unkillable (see `kill_detach`'s limits note).
+        // The wait's own predicate is the right place to test the flag, and this call site qualifies as
+        // a kill boundary for exactly the reasons `kill_check_current`'s do — IRQ-masked, on the task's
+        // own kernel stack. RELEASE the raw lock first: `exit()` never returns, and a lock held across
+        // it would wedge every future waiter/poster on this semaphore.
+        let (id, ttbr0) = unsafe { ((*raw).id, (*raw).user_ttbr0) };
+        if kill_slot_for(id, ttbr0).is_some() {
+            self.unlock_raw();
+            exit(); // diverges
+        }
+
         // The lock is held continuously until the scheduler pushes, so the length cannot change
         // before then; asserting it here proves the park-side push won't reallocate.
         assert!(
@@ -2356,6 +2390,47 @@ impl Semaphore {
             }
         }
         irq_restore(daif);
+    }
+
+    /// KILLBOUND — the POST-PARK half: evict every waiter on this semaphore that an ARMED kill names,
+    /// and re-ready it so it reaches the off-CPU dispatch boundary (where `dispatch_next` retires it
+    /// before it can execute another instruction). Returns how many were evicted.
+    ///
+    /// The pre-park check in `wait` closes "kill armed, then park"; this closes "park, then kill" —
+    /// the operator case, where the app has been sitting at its barrier for minutes before anyone
+    /// types `kill`. Together they make the property total: an armed kill always reaches its target.
+    ///
+    /// NO PERMIT IS HANDED OVER (unlike `post`), and that is sound only because an evicted task
+    /// provably never resumes: the request that matched it cannot be cleared while it is alive
+    /// (`kill_release` needs `KILL_DONE`, i.e. the target retired; `kill_settle` withholds that while
+    /// `asid_thread_leave` still counts this task; `kill_retract` is only reachable once the requester
+    /// has independently observed the target dead). So the task is retired at its next dispatch,
+    /// having executed nothing — it never returns from `wait` to act on a permit it does not hold.
+    ///
+    /// `make_ready` is called with the raw lock RELEASED, the same rule `post` follows (the run-queue
+    /// lock must never nest under this one).
+    pub fn wake_killed(&self) -> u32 {
+        let daif = irq_save_mask();
+        let mut evicted = 0u32;
+        loop {
+            self.lock_raw();
+            let found = unsafe {
+                let q = &mut *self.waiters.get();
+                q.iter()
+                    .position(|t| kill_slot_for(t.id, t.user_ttbr0).is_some())
+                    .and_then(|i| q.remove(i))
+            };
+            self.unlock_raw();
+            match found {
+                Some(task) => {
+                    make_ready(task);
+                    evicted += 1;
+                }
+                None => break,
+            }
+        }
+        irq_restore(daif);
+        evicted
     }
 }
 
@@ -2499,6 +2574,17 @@ pub fn futex_wait(key: u64, uaddr: u64, expected: u32) -> FutexWait {
         irq_restore(daif);
         return FutexWait::NoTask;
     }
+    // KILLBOUND — the PRE-PARK kill boundary; the `Semaphore::wait` twin, and the one that matters
+    // most in anger: the frame barrier of a windowed EL0 app (`user-vug`) blocks HERE, and a task
+    // parked in a futex bucket is invisible to both SKILL-1 boundaries. Release the bucket (dropping
+    // the key if we claimed it and are not going to park on it) before the never-returning `exit()`.
+    if kill_slot_for(unsafe { (*raw).id }, unsafe { (*raw).user_ttbr0 }).is_some() {
+        if b.waiters_empty() {
+            b.key.store(0, Ordering::Relaxed);
+        }
+        b.unlock_raw();
+        exit(); // diverges
+    }
     assert!(
         unsafe { (*b.waiters.get()).len() } < WAIT_CAPACITY,
         "futex waiter overflow (raise WAIT_CAPACITY)"
@@ -2554,6 +2640,80 @@ pub fn futex_wake(key: u64, n: usize) -> usize {
     }
     irq_restore(daif);
     woken
+}
+
+/// KILLBOUND — the futex twin of `Semaphore::wake_killed`: evict every futex waiter that an ARMED kill
+/// names, across every bucket, and re-ready it so the off-CPU dispatch boundary retires it. Returns how
+/// many were evicted.
+///
+/// This is the load-bearing one. `user-vug`'s per-frame barrier blocks in `futex_wait` (main.rs:799-810),
+/// and when its workers are absent — the THREAD_TABLE-exhaustion chain — it blocks there FOREVER, before
+/// its first present. That task is in no run queue and is no core's `current`, so both SKILL-1 boundaries
+/// miss it, `asid_thread_leave` never runs, the ASID-scoped request is never settled, and the operator's
+/// `kill` reports "armed but unconfirmed" for the rest of the boot. Evicting it here is what turns the
+/// armed request into an actual death.
+///
+/// Same lock discipline as `futex_wake`: scan+remove under the bucket lock, `make_ready` outside it, and
+/// release a bucket whose last waiter has left so the key does not strand a pool entry.
+fn futex_wake_killed() -> u32 {
+    let daif = irq_save_mask();
+    let mut evicted = 0u32;
+    for b in FUTEX.iter() {
+        loop {
+            b.lock_raw();
+            let found = unsafe {
+                let q = &mut *b.waiters.get();
+                q.iter()
+                    .position(|t| kill_slot_for(t.id, t.user_ttbr0).is_some())
+                    .and_then(|i| q.remove(i))
+            };
+            if found.is_some() && b.waiters_empty() {
+                b.key.store(0, Ordering::Relaxed); // last waiter gone — release the bucket
+            }
+            b.unlock_raw();
+            match found {
+                Some(task) => {
+                    make_ready(task);
+                    evicted += 1;
+                }
+                None => break,
+            }
+        }
+    }
+    irq_restore(daif);
+    evicted
+}
+
+/// KILLBOUND introspection: how many tasks are parked across every futex bucket right now. Used by the
+/// `[killbound]` regression leg as a POSITIVE witness that its fixture really reached the futex park (the
+/// condition under test) before the kill is issued — so a leg that passes cannot be passing vacuously.
+pub fn futex_parked_total() -> usize {
+    let daif = irq_save_mask();
+    let mut n = 0usize;
+    for b in FUTEX.iter() {
+        b.lock_raw();
+        n += unsafe { (*b.waiters.get()).len() };
+        b.unlock_raw();
+    }
+    irq_restore(daif);
+    n
+}
+
+/// KILLBOUND — sweep every wait an EL0 task can be parked in and evict the ones an armed kill names.
+/// Called by `kill` once the request is published, so the predicate (`kill_slot_for`) already matches.
+///
+/// The set is enumerable because every blocking wait an EL0 program can reach is one of exactly two
+/// shapes: a futex bucket (`SYS_FUTEX`), or a `Semaphore` the syscall layer owns (`SYS_THREAD_JOIN`'s
+/// join handle, `SYS_WAIT`'s `Proc::done`, `SYS_MRECV`'s per-ASID bus mailbox). The futex half lives
+/// here; the semaphore half is delegated to `syscall`, which owns those tables — the same hook shape
+/// `note_killed_task_retired` already uses.
+fn kill_wake_parked() -> u32 {
+    let mut n = futex_wake_killed();
+    #[cfg(feature = "baremetal")]
+    {
+        n += super::syscall::kill_wake_parked_semaphores();
+    }
+    n
 }
 
 // ---------------------------------------------------------------------------------------------
