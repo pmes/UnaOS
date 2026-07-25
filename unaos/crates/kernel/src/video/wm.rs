@@ -438,8 +438,21 @@ pub fn move_to(id: WinId, x: usize, y: usize) -> bool {
     // desktop colour, then re-damage whatever the erase reached so the surviving windows repaint over
     // it — because it is the same event: those pixels stopped belonging to this window.
     if let Some(b) = vacated {
+        // F4 — the same phase barrier `close`/`close_owner` raise, and for the same reason. A composite
+        // on another core may have snapshotted this row at its OLD geometry a moment ago and still be
+        // blitting it; without the barrier that in-flight blit lands AFTER the erase below and paints
+        // the ghost straight back. The row is live (unlike the teardown paths) so nothing is being
+        // unmapped and the stale frame would self-heal at WC-E's next flush — but "self-heals within a
+        // frame" is exactly the standard the ghost fails, and the barrier is the mechanism this module
+        // already has for "a snapshot of this row is in flight and its pixels are no longer wanted".
+        //
+        // Raised AFTER the table lock is released, as `drain`'s contract requires: a composite that
+        // takes the lock from here on sees the barrier and skips, so `BLIT_ACTIVE` can only fall.
+        let barrier = DrainBarrier::drain();
         erase(&[b]);
         damage_intersecting(b.0, b.1, b.2, b.3);
+        // Re-open before recompositing — a composite under a raised barrier is a no-op.
+        drop(barrier);
         composite();
     }
     true
@@ -697,10 +710,10 @@ pub fn focus_changed(asid: u64) {
     }
     #[cfg(feature = "witness")]
     if asid == 0 {
-        serial_println!("[wc-g] focus shell z={} hidden={}", newz, nhidden);
+        serial_println!("[wc-fv] focus shell z={} hidden={}", newz, nhidden);
     } else {
         serial_println!(
-            "[wc-g] focus raise asid={:#x} windows={} top_win={} z={} shell_z={}",
+            "[wc-fv] focus raise asid={:#x} windows={} top_win={} z={} shell_z={}",
             asid, raised, first_id, newz, shell_z()
         );
     }
@@ -1420,13 +1433,13 @@ pub fn focusvis_selftest() {
 
     let fb = *super::WRITER.lock();
     if !fb.is_ready() {
-        serial_println!("[wc-g] focus-vis -> SKIP (framebuffer not ready)");
+        serial_println!("[wc-fv] focus-vis -> SKIP (framebuffer not ready)");
         return;
     }
     let info = fb.info();
     if info.width < 128 || info.height < 128 {
         serial_println!(
-            "[wc-g] focus-vis -> SKIP (panel {}x{} too small)",
+            "[wc-fv] focus-vis -> SKIP (panel {}x{} too small)",
             info.width, info.height
         );
         return;
@@ -1443,7 +1456,7 @@ pub fn focusvis_selftest() {
     let wa = create(ASID_A, sa, len, 8, 8, 32, b"fv-a");
     let wb = create(ASID_B, sb, len, 8, 8, 32, b"fv-b");
     if wa == WIN_NONE || wb == WIN_NONE {
-        serial_println!("[wc-g] focus-vis -> SKIP (window table full: a={} b={})", wa, wb);
+        serial_println!("[wc-fv] focus-vis -> SKIP (window table full: a={} b={})", wa, wb);
         close(wa);
         close(wb);
         return;
@@ -1478,7 +1491,7 @@ pub fn focusvis_selftest() {
     let reraise_ok = got_reraise == b_col;
     let ok = stack_ok && raise_ok && shell_ok && reraise_ok;
     serial_println!(
-        "[wc-g] focus-vis at ({},{}) a={:#08x} b={:#08x} stack={:#08x}/{} raise={:#08x}/{} shell={:#08x}/{} reraise={:#08x}/{} -> {}",
+        "[wc-fv] focus-vis at ({},{}) a={:#08x} b={:#08x} stack={:#08x}/{} raise={:#08x}/{} shell={:#08x}/{} reraise={:#08x}/{} -> {}",
         px, py, a_col, b_col,
         got_stack, stack_ok, got_raise, raise_ok, got_shell, shell_ok, got_reraise, reraise_ok,
         if ok { "PASS" } else { "FAIL" }
@@ -1487,9 +1500,18 @@ pub fn focusvis_selftest() {
     close(wa);
     close(wb);
     // Leave the shell where the operator's boot left it: at the bottom, so ordinary windows composite.
-    // (Not a reset to 0 — `next_z` only moves forward, so any window created after this is above it
-    // either way; this keeps the invariant readable rather than relying on that.)
+    // (Not a strict necessity — `next_z` only moves forward, so any window created after this is above
+    // it either way; this keeps the invariant readable rather than relying on that.)
     SHELL_Z.store(0, Ordering::Release);
+    // ...and REPAINT, because the store alone leaves a hole. This selftest's `focus_changed(0)` leg
+    // pushed EVERY live window below the shell, not only its own two: a window belonging to a real
+    // backgrounded app was erased to the desktop colour, and `composite_inner` consumed its damage flag
+    // on the way past (damage is cleared under the table lock, BEFORE the `above_shell` skip). So
+    // dropping the shell back to 0 makes those windows drawable again while nothing is left marked
+    // damaged to actually draw them — a blank rectangle on the panel until WC-E's next desktop flush
+    // happened to heal it. `repaint` re-damages the whole live set and composites, which is exactly the
+    // restore this owes; it is a no-op on the gate, where the table is empty by now.
+    repaint();
 }
 
 // ---- internals -------------------------------------------------------------------------------

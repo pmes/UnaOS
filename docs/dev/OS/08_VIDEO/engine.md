@@ -1234,6 +1234,18 @@ Compat rows are exempt from the shell test (`above_shell`): a compat window IS t
 path, it carries owner ASID `0` and is not addressable as a focus target, so it could never be raised
 back above a shell that overtook it — hiding it would strand a full-screen app's output permanently.
 
+> **Residual, stated as a limitation.** The exemption is sound in its own terms and it is not free: a
+> **backgrounded** compat (full-screen) app still composites over the console after a TAB to the shell,
+> so the "read your command's output" case is only fully delivered for *windowed* apps. The foreground
+> case is unaffected — a full-screen app run in the foreground parks the shell, so there is no prompt to
+> read behind it — and this is the same shape as the residual BGRUN-1 already recorded on `wm::repaint`
+> (a bg compat app shimmers while the operator is TABbed into some other app). The cause is shared and
+> so is the fix: a compat row has **no owner ASID** to key on (the `SYS_FB_PRESENT` hook signature
+> carries none), so it cannot be made a focus target, cannot be raised, and therefore cannot honestly be
+> lowered either. Giving compat rows a real owner is a change to the `SYS_FB_PRESENT` seam, not to the
+> z-order — flagged here rather than worked around, because every available workaround keys on something
+> coarser than ownership and would strand a full-screen app's output in some other state instead.
+
 #### Three smaller defects the same arc closes
 
 * **`create` now composites.** A window's kernel chrome reaches the panel when the row exists, not at the
@@ -1260,7 +1272,11 @@ create-time pass and verify a **blank** surface — a vacuous `-> PASS` that sat
 while the app's real content is never checked. `Window::presented` (set by `present` / `compat_present`)
 makes the verdict wait for content the owner actually put there.
 
-#### The witness: `[wc-g] focus-vis` — a READ-BACK, not a state dump
+#### The witness: `[wc-fv] focus-vis` — a READ-BACK, not a state dump
+
+> **Tag:** `[wc-fv]`, not `[wc-g]`. `WC-G` belongs to the concurrent garble arc (`video/wcg.rs`); the
+> regexes would not cross-match, but two subsystems answering to one letter in the ledger is a cost paid
+> at every future integration rather than once here.
 
 Every pre-existing focus witness is a statement about kernel state, and `[wc-c] focus tab-cycle` printed
 correctly on the bench for a panel that never changed. `wm::focusvis_selftest` never asks the table who
@@ -1279,10 +1295,10 @@ cannot collide with WC-F's reserved probe boxes at the bottom edge, and run from
 `wcb_launcher` so it cannot burn the one-shot `[wc-c] side-by-side` / `[wc-d] verify` latches.
 
 ```
-[wc-g] focus raise asid=0xf0a windows=1 top_win=1 z=7 shell_z=0
-[wc-g] focus shell z=8 hidden=2
-[wc-g] focus raise asid=0xf0b windows=1 top_win=2 z=9 shell_z=8
-[wc-g] focus-vis at (641,314) a=0xff2020 b=0x20ff20 stack=0x20ff20/true raise=0xff2020/true shell=0x2d2b55/true reraise=0x20ff20/true -> PASS
+[wc-fv] focus raise asid=0xf0a windows=1 top_win=1 z=7 shell_z=0
+[wc-fv] focus shell z=8 hidden=2
+[wc-fv] focus raise asid=0xf0b windows=1 top_win=2 z=9 shell_z=8
+[wc-fv] focus-vis at (641,314) a=0xff2020 b=0x20ff20 stack=0x20ff20/true raise=0xff2020/true shell=0x2d2b55/true reraise=0x20ff20/true -> PASS
 ```
 
 The `shell` leg reads `0x2d2b55` — `DESKTOP_BG` exactly — which is the erase landing, i.e. the window
@@ -1291,7 +1307,7 @@ layer genuinely stopped owning those pixels rather than merely being reordered a
 #### FOCUS-VIS gate results (2026-07-25, QEMU raspi4b @ `UNAOS_FBW=1920 UNAOS_FBH=1200`)
 
 `./arroyo check` green both arches · `kernel8` builds clean · `kernel8-test 60`
-**57/57 required, 0 forbidden** (56 → 57: the one new `[wc-g] focus-vis` REQUIRE, with a matching
+**57/57 required, 0 forbidden** (56 → 57: the one new `[wc-fv] focus-vis` REQUIRE, with a matching
 FORBID).
 
 > `./arroyo test-arm` does **not** build at this tip, and not because of this arc: the aarch64-virt
