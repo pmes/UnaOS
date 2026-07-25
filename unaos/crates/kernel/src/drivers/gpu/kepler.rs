@@ -168,7 +168,7 @@ pub fn init(gpu: &GpuInfo) {
         }
         serial_println!(":: kepler: mirror-hdr pre done rows=256 ::");
 
-        let _fb_offset = crate::drivers::gpu::kepler_display::takeover_display(
+        let fb_offset = crate::drivers::gpu::kepler_display::takeover_display(
             gpu, bar0, &mut vram_allocator, &mut kdisp_trace,
         );
         serial_println!(":: kdisp: landed trace [{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}] ::",
@@ -380,26 +380,32 @@ pub fn init(gpu: &GpuInfo) {
                                         for _ in 0..2_000_000 { core::hint::spin_loop(); }
 
                                         // --- K-GPU-4 Pull 23: FECS / GPCCS Falcon Base Recon ---
+                                        // s26 fold: dense fal-base dumps are historic (verdicts folded);
+                                        // gated off to keep early serial inside the 64K FTDI ring.
+                                        let fal_base_dense = false;
                                         for &base in &[0x409000, 0x41A000] {
-                                            for pass in 0..2 {
+                                            if fal_base_dense { for pass in 0..2 {
                                                 if pass == 1 {
                                                     for _ in 0..2_000_000 { core::hint::spin_loop(); }
                                                 }
                                                 let tag = if pass == 0 { "fal-base" } else { "fal-base2" };
-                                                
+
                                                 for offset in (0..=0x1FC).step_by(4) {
                                                     let val = mmio_read(bar0, base + offset);
                                                     let abs = if val == 0xFFFFFFFF || val == 0xBAD0BA20 || val == 0xBADF1000 { " ABSENT?" } else { "" };
                                                     serial_println!(":: kepler: {} b={:06X} off={:03X} val={:08X}{} ::", tag, base, offset, val, abs);
                                                 }
-                                            }
+                                            } }
                                             let cpuctl = mmio_read(bar0, base + 0x100);
                                             let imemc = mmio_read(bar0, base + 0x180);
                                             let dmemc = mmio_read(bar0, base + 0x1C0);
                                             serial_println!(":: kepler: fal-base b={:06X} verdict cpuctl={:08X} imemc={:08X} dmemc={:08X} ::", base, cpuctl, imemc, dmemc);
                                         }
 
-                                        for pass in 0..2 {
+                                        // s25/s26 fold: 0x400100 base is proven nonexistent on GK107;
+                                        // dense old-base recon gated off (FTDI-ring budget).
+                                        let old_base_dense = false;
+                                        if old_base_dense { for pass in 0..2 {
                                             if pass == 1 {
                                                 for _ in 0..2_000_000 { core::hint::spin_loop(); }
                                             }
@@ -431,7 +437,7 @@ pub fn init(gpu: &GpuInfo) {
                                                 pgraph_rows += 1;
                                             }
                                             serial_println!(":: kepler: pgraph stat done rows={} ::", pgraph_rows);
-                                        }
+                                        } }
                                     }
 
                                     // --- Witness Rematch ---
@@ -508,6 +514,9 @@ pub fn init(gpu: &GpuInfo) {
                                     serial_println!(":: kepler: witness-rematch end err={:08X} stat={:08X} valid={:08X} ::", final_err, final_stat, ch_1_0_post);
 
                                     // --- K-GPU-4 Milestone 1: Falcon IMEM/DMEM Probe ---
+                                    // s26 fold: old base nonexistent; probe gated off (FTDI-ring budget).
+                                    let old_base_probe = false;
+                                    if old_base_probe {
                                     // 1. IMEM probe
                                     mmio_write(bar0, 0x400180, 1 << 24); // IMEMC offset=0, auto-increment
                                     let imemc_rb = mmio_read(bar0, 0x400180);
@@ -541,6 +550,17 @@ pub fn init(gpu: &GpuInfo) {
                                     let dmem_w2 = mmio_read(bar0, 0x4001C4);
                                     let dmem_w3 = mmio_read(bar0, 0x4001C4);
                                     serial_println!(":: kepler: falcon dmem rb w0={:08X} w1={:08X} w2={:08X} w3={:08X} ::", dmem_w0, dmem_w1, dmem_w2, dmem_w3);
+                                    }
+
+                                    // --- s26 LATE DISPLAY RECAP (FTDI-ring workaround) ---
+                                    // The display leg runs before the FTDI link is live and its
+                                    // lines can fall off the 64K drop-oldest boot ring. Re-emit
+                                    // the display verdict here, inside the surviving window.
+                                    serial_println!(":: kdisp: late-recap fb={:08X} ran={} trace [{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}] ::",
+                                        fb_offset.unwrap_or(0xFFFFFFFF) as u32,
+                                        fb_offset.is_some(),
+                                        kdisp_trace[0], kdisp_trace[1], kdisp_trace[2], kdisp_trace[3],
+                                        kdisp_trace[4], kdisp_trace[5], kdisp_trace[6]);
                                 }
                             }
                         }

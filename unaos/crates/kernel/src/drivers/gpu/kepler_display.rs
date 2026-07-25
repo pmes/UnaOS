@@ -387,7 +387,9 @@ pub unsafe fn takeover_display(
     // 7. Verdict
     serial_println!(":: kdisp: latch verdict asm-stuck=y ::");
 
-    None
+    // Completed lin cycle: return the latched pointer so the late recap
+    // (kepler.rs, printed inside the FTDI-ring window) can prove this leg ran.
+    Some(new_ptr as usize)
 }
 
 /// Returns false for zero, 0xFFFFFFFF, and the 0xBAD0xxxx pattern that our
