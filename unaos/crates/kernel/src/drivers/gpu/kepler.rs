@@ -690,6 +690,7 @@ pub fn init(gpu: &GpuInfo) {
                                         // Error-clear writes (W1C observed bits)
                                         let intr_addr = mmio_read(bar0, 0x120120);
                                         serial_println!(":: kepler: recon PIBUS_INTR_ADDR={:08X} ::", intr_addr);
+                                        serial_println!(":: kepler: recon PIBUS_INTR_VALUE={:08X} ::", mmio_read(bar0, 0x120124));
                                         if intr_addr != 0 { mmio_write(bar0, 0x120120, intr_addr); }
                                         
                                         let pibus_intr = mmio_read(bar0, 0x120128);
