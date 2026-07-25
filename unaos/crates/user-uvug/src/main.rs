@@ -390,6 +390,28 @@ fn key_bit(k: u8) -> u32 {
     }
 }
 
+/// UVUG-9 — the per-frame cap on how many input events one frame may consume.
+///
+/// ROOT CAUSE (P54b freeze). The UVUG-8 drain was an UNBOUNDED `loop { poll() }`: it ran until the ring
+/// reported empty, with no bound whatsoever. That is the only phase of this program's frame loop that can
+/// call `SYS_INPUT_POLL` indefinitely WITHOUT reaching `SYS_FB_PRESENT`, and the kernel's own UVUG-8r2
+/// instrumentation proves that is exactly where P54b sat: the run held its takeover suspension for the full
+/// `TAKEOVER_SUSPEND_MAX_SECS` (60 s), which requires the heartbeat — stamped ONLY by `sys_input_poll` — to
+/// have stayed fresher than `TAKEOVER_STALE_SECS` (2 s) on every pass, while `EL0_FOCUSED_PRESENT_COUNT` —
+/// bumped by `sys_fb_present` under the IDENTICAL focus predicate — never moved once. Polling forever,
+/// presenting never, is not a state any other phase of this loop can occupy. Hence: the drain spun.
+///
+/// A drain that outlives its frame is a rendering freeze even though nothing is deadlocked: the workers stay
+/// parked on `phase`, the surface keeps its last frame, the screen shows a static crystal, and the kernel's
+/// no-render cap eventually ends the run. Bounding the drain converts that hard freeze into, at worst, input
+/// latency — the leftovers are simply consumed by the NEXT frame's drain, which is what a frame budget is for.
+///
+/// The cap is 2x the kernel's `INPUT_RING_CAP` (32), so a frame can always empty a completely full ring plus a
+/// full ring's worth of concurrent arrivals; hitting it means the producer is outrunning a tight EL0 syscall
+/// loop, which no HID device can legitimately do. That anomaly is witnessed (`[uvug9] drain saturated`) rather
+/// than absorbed silently — it names the remaining upstream suspect for P55 instead of hiding it.
+const MAX_DRAIN_PER_FRAME: u32 = 64;
+
 /// Accumulated input for one frame.
 #[derive(Default)]
 struct FrameInput {
@@ -398,14 +420,24 @@ struct FrameInput {
     exit_click: bool, // a click (button press+release under the motion threshold)
     mdx: i32,         // summed relative mouse dx while dragging
     mdy: i32,         // summed relative mouse dy while dragging
+    /// UVUG-9: the drain hit `MAX_DRAIN_PER_FRAME` with the ring still non-empty — the freeze signature.
+    saturated: bool,
 }
 
-/// Drain every queued input event this frame. Updates `held`/`dragging`/`drag_motion` in place and
-/// returns the per-frame accumulation.
+/// Drain this frame's queued input events. Updates `held`/`dragging`/`drag_motion` in place and returns the
+/// per-frame accumulation. BOUNDED at `MAX_DRAIN_PER_FRAME` events (see that constant for the P54b root
+/// cause): whatever is left stays in the ring for the next frame, so the render/present half of the loop is
+/// always reached.
 fn drain_input(held: &mut u32, dragging: &mut bool, drag_motion: &mut i32) -> FrameInput {
     const CLICK_THRESH: i32 = 6;
     let mut fi = FrameInput::default();
+    let mut budget = MAX_DRAIN_PER_FRAME;
     loop {
+        if budget == 0 {
+            fi.saturated = true;
+            break; // frame budget spent — the rest waits for the next frame (never spin here)
+        }
+        budget -= 1;
         let ev = input_poll();
         if ev >> 63 != 0 {
             break; // -EAGAIN: ring empty
@@ -457,6 +489,61 @@ fn drain_input(held: &mut u32, dragging: &mut bool, drag_motion: &mut i32) -> Fr
         }
     }
     fi
+}
+
+// ---------------------------------------------------------------------------------------------
+// UVUG-9 — the per-frame STALL WITNESS.
+//
+// P54b showed a rendering freeze with no crash, no fault and no deadlock report: the crystal stopped moving
+// while the program kept polling. From the outside, "stopped presenting" is all you can see; from in here we
+// can say WHICH PHASE of the frame stopped making progress. The loop has exactly three phases that can fail
+// to complete, and this witness names them:
+//
+//   [uvug9] stall frame=<n> phase=poll drained=<64> — the drain hit its frame budget with the ring still
+//       non-empty. The P54b signature. Post-fix this is no longer fatal (the frame proceeds), so the line is a
+//       DIAGNOSIS of a runaway upstream producer, not a symptom of this program.
+//   [uvug9] stall frame=<n> phase=barrier done=<0|1> — the frame-barrier wait burned its pass budget with
+//       fewer than both workers arrived; `done` names WHICH half is missing (0 = neither worker ran, 1 = one
+//       worker wedged). Distinguishes a worker-side wedge from an input-side one.
+//   [uvug9] stall frame=<n> phase=present rc=<errno> — SYS_FB_PRESENT returned an error. UVUG-8 IGNORED this
+//       syscall's return entirely, so a present that started failing mid-run would have looked exactly like a
+//       freeze: frames advancing, nothing on screen, and the kernel's no-render cap firing. Now it is visible.
+//
+// GATING. There is no env/knob channel into EL0, so each phase self-gates on its own ANOMALY and latches after
+// the first report. Consequences: a healthy run prints nothing new, and — decisive for the gates — the
+// deterministic QEMU auto path (no HID, no events, workers always arrive, present always succeeds) reaches no
+// anomaly at all, so its 300-frame surface checksum is untouched.
+//
+// The barrier budget is expressed in PASSES, not milliseconds: EL0 has no clock syscall (SYS_GETINFO's tick
+// field would need a copy_to_user round trip per pass, which would itself distort the thing being measured),
+// and a pass budget is both deterministic and precisely what "made no progress" means here. LIMITATION, stated
+// rather than papered over: this catches a barrier that is SPINNING (futex_wait returning -EAGAIN on a value
+// mismatch), not one PARKED forever on a lost wakeup. A parked parent cannot execute a witness at all, and the
+// kernel's futex compares `*uaddr` against `val` under the same bucket lock `futex_wake` takes, so that park is
+// race-free by construction — a lost wakeup here is refuted in the kernel, not monitored from EL0.
+const BARRIER_PASS_BUDGET: u32 = 1 << 20;
+
+/// One-shot latches, one per phase, so a witness fires at most once per program run.
+static W_POLL: AtomicU32 = AtomicU32::new(0);
+static W_BARRIER: AtomicU32 = AtomicU32::new(0);
+static W_PRESENT: AtomicU32 = AtomicU32::new(0);
+
+/// Emit one `[uvug9] stall` line: `frame`, the phase name, and one labelled detail value.
+fn stall_witness(latch: &AtomicU32, frame: u32, phase: &[u8], label: &[u8], value: u32) {
+    if latch.swap(1, Ordering::Relaxed) != 0 {
+        return; // already reported this phase — never flood the serial line
+    }
+    let mut b = Buf::new();
+    b.put(b"[uvug9] stall frame=");
+    b.put_dec(frame);
+    b.put(b" phase=");
+    b.put(phase);
+    b.put(b" ");
+    b.put(label);
+    b.put(b"=");
+    b.put_dec(value);
+    b.put(b"\n");
+    b.flush();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -594,6 +681,11 @@ pub extern "C" fn _start() -> ! {
     loop {
         // --- input (polled EVERY frame for the program's whole life) ---
         let fi = drain_input(&mut held, &mut dragging, &mut drag_motion);
+        if fi.saturated {
+            // UVUG-9: the drain spent its whole frame budget with events still queued. Pre-fix this loop had
+            // no budget to spend and simply never returned — the P54b freeze. Report once and carry on.
+            stall_witness(&W_POLL, frame, b"poll", b"drained", MAX_DRAIN_PER_FRAME);
+        }
         if !interactive && fi.any {
             // First input at any frame takes over: cancel the auto-tumble + the 300-frame cap and
             // switch to held-state control. The witness proves the input arrived on metal.
@@ -656,16 +748,30 @@ pub extern "C" fn _start() -> ! {
         PHASE.store(frame + 1, Ordering::Release); // 1-based; never PHASE_EXIT (frame < cap)
 
         // --- barrier: wait for both workers to arrive (FUTEX) ---
+        // UVUG-9: the wait itself is unchanged (re-check + compare-and-block is lost-wakeup-safe); only a pass
+        // counter is added, so a barrier that spins without both workers arriving names itself once.
+        let mut passes: u32 = 0;
         loop {
             let d = DONE.load(Ordering::Acquire);
             if d >= 2 {
                 break;
             }
+            passes = passes.wrapping_add(1);
+            if passes == BARRIER_PASS_BUDGET {
+                stall_witness(&W_BARRIER, frame, b"barrier", b"done", d);
+            }
             futex_wait(core::ptr::addr_of!(DONE), d);
         }
 
         // --- present ---
-        unsafe { sys0(SYS_FB_PRESENT) };
+        // UVUG-9: CHECK the return. UVUG-8 discarded it, so a `sys_fb_present` that began failing mid-run (a
+        // lost per-process slot, a torn-down surface) would present as an unexplained freeze — frames still
+        // advancing here, nothing changing on screen, and the kernel's no-render cap firing on a program that
+        // believed it was drawing. An error has bit 63 set (negative errno), exactly like an empty input poll.
+        let rc = unsafe { sys0(SYS_FB_PRESENT) };
+        if rc >> 63 != 0 {
+            stall_witness(&W_PRESENT, frame, b"present", b"rc", (rc as i64).unsigned_abs() as u32);
+        }
         frame += 1;
 
         // --- exit conditions ---

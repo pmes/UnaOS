@@ -2362,16 +2362,22 @@ fn pump_usb_into_gui() {
     while let Some(ev) = unaos_kernel::pal::next_event() {
         // UVUG-6: typematic is fed at the HID report level (see pal::typematic_note_report), not this drain.
         match ev {
-            unaos_kernel::pal::Event::Key(_) => gui_send(ev),
+            unaos_kernel::pal::Event::Key(_) => {
+                uvug9_shell_input_witness(true);
+                gui_send(ev)
+            }
             unaos_kernel::pal::Event::Mouse { x, y } => {
+                uvug9_shell_input_witness(false);
                 piusb24_pointer_witness(x, y, None);
                 gui_send(ev);
             }
             unaos_kernel::pal::Event::MouseAbsolute { x, y } => {
+                uvug9_shell_input_witness(false);
                 piusb24_pointer_witness(x, y, None);
                 gui_send(ev);
             }
             unaos_kernel::pal::Event::Button(mask) => {
+                uvug9_shell_input_witness(false);
                 piusb24_pointer_witness(0, 0, Some(mask));
                 gui_send(ev);
             }
@@ -2416,6 +2422,58 @@ fn piusb24_pointer_witness(dx: i32, dy: i32, buttons: Option<u8>) {
         serial_println!("[piusb24] pointer dx={} dy={}", dx, dy);
     }
 }
+
+/// UVUG-9 — the SHELL-PATH input bisect for the dead-mouse-after-timeout symptom (P54b metal fact 2: once a
+/// UVUG run timed out, arrow keys still reached the shell but the mouse produced no cursor and no effect, for
+/// the rest of the boot).
+///
+/// The pointer's journey to the shell has four stages: xHCI decodes the interrupt-IN report and pushes a
+/// `pal::Event`; the router drains `EVENT_QUEUE`; `gui_send` forwards into `GUI_CHANNEL`; `render_service`
+/// moves the cursor sprite. Existing witnesses bracket the ends — `MOUSE-1` counts reports at the xHCI decode,
+/// `[click2] depth` counts `GUI_CHANNEL` traffic — but neither separates "the pointer stopped being decoded"
+/// from "the pointer is decoded but no longer reaches the shell path", and those two have completely different
+/// owners. This line closes that gap by counting keys and pointer events SEPARATELY at the shell-destined
+/// drain, which is precisely the branch that resumes when `run_user_image` drops focus.
+///
+/// Reading it at P55, with the mouse dead at the shell:
+///   * `MOUSE-1` still counting while `ptr=` here is frozen -> the loss is between the decode and this drain
+///     (the EL0 ring / router / EVENT_QUEUE seam) — this lane.
+///   * `MOUSE-1` ALSO frozen while `key=` here keeps advancing -> the pointer interrupt-IN endpoint stopped
+///     completing or stopped being re-armed, and the loss is upstream of every input path in this file. Note
+///     that `drivers::xhci`'s dup-Success guard (`mouse_expect_phys`) returns from the transfer dispatch
+///     WITHOUT calling `queue_mouse_read`, so a single mismatched completion retires the pointer read forever
+///     while the keyboard's independently-armed endpoint carries on — the exact asymmetry P54b describes, on
+///     the endpoint that generates by far the most traffic. That file is outside this arc's lane, so this arc
+///     instruments the question rather than changing the driver; P55's reading of these two counters decides it.
+/// Rate-limited to ~2 s and printed only when something actually arrived, so an idle shell stays silent.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn uvug9_shell_input_witness(is_key: bool) {
+    use core::sync::atomic::Ordering;
+    let n = if is_key {
+        UVUG9_SHELL_KEYS.fetch_add(1, Ordering::Relaxed) + 1
+    } else {
+        UVUG9_SHELL_PTRS.fetch_add(1, Ordering::Relaxed) + 1
+    };
+    let _ = n;
+    let now = unaos_kernel::arch::ms();
+    let last = UVUG9_SHELL_LAST_MS.load(Ordering::Relaxed);
+    if now.wrapping_sub(last) >= 2000 || last == 0 {
+        UVUG9_SHELL_LAST_MS.store(now.max(1), Ordering::Relaxed);
+        serial_println!(
+            "[uvug9] shell-path input key={} ptr={} (EVENT_QUEUE -> GUI_CHANNEL)",
+            UVUG9_SHELL_KEYS.load(Ordering::Relaxed),
+            UVUG9_SHELL_PTRS.load(Ordering::Relaxed)
+        );
+    }
+}
+
+/// UVUG-9 shell-path input counters + throttle (see `uvug9_shell_input_witness`).
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+static UVUG9_SHELL_KEYS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+static UVUG9_SHELL_PTRS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+static UVUG9_SHELL_LAST_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// GUI-CLICK-2: rate-limited (~5 s) `[click2] input left for app` witness — proves a press edge
 /// arrived while a full-screen app owned the screen and was LEFT in EVENT_QUEUE for the app's own

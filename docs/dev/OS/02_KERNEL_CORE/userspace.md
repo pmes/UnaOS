@@ -584,8 +584,9 @@
   so no report is ever fed on the boot path and the deterministic auto paths stay byte-identical. Liveness note:
   on a keyboard that sends **zero** reports while a key is held still (strict `SET_IDLE(0)`, no idle re-reports),
   the 1 s liveness stops an ongoing repeat while physically held — a benign, self-correcting degradation
-  deliberately preferred over the catastrophic wedge it guards. Lane: `pal.rs` (tracker + queue depth) +
-  `drivers/xhci/mod.rs` (report-level feed) + `main.rs` (pump call + selftest) + this doc.
+  deliberately preferred over the catastrophic wedge it guards. **UVUG-9 retired that trade** — see below.
+  Lane: `pal.rs` (tracker + queue depth) + `drivers/xhci/mod.rs` (report-level feed) + `main.rs` (pump call +
+  selftest) + this doc.
 - **WC-B (this arc)** — the **window surface/verb seam**: the syscall half of the window-compositor arc
   (unit WC-A owns the compositor core in `video/`). Four new verbs, `SYS_WIN_CREATE = 29`,
   `SYS_WIN_PRESENT = 30`, `SYS_WIN_MOVE = 31`, `SYS_WIN_CLOSE = 32` (28 stays reserved for the deferred
@@ -648,6 +649,64 @@
     (`create`/`present`/`move_window`/`destroy`). The shim carries no state and no policy — ownership,
     geometry validation and surface mapping all live in the gates above it — so the swap cannot move a
     security check. Until then `present` forwards to the ELF-3 present hook, i.e. today's behaviour.
+- **UVUG-9 (this arc)** — three P54b metal defects, root-caused from the instrumentation the previous arcs
+  installed rather than from fresh guesses. QEMU raspi4b delivers no HID, so all three are metal-verified only;
+  the gates below prove no regression.
+  - **The interactive freeze** (crystal stops mid-animation, program keeps polling, presents stop, the 60 s
+    no-render cap fires). Confirmed **by the kernel's own witness algebra**: holding the takeover suspension for
+    `TAKEOVER_SUSPEND_MAX_SECS` requires the heartbeat — stamped *only* by `sys_input_poll` — to stay fresher
+    than `TAKEOVER_STALE_SECS` on every pass, while `EL0_FOCUSED_PRESENT_COUNT`, bumped by `sys_fb_present`
+    under the **identical focus predicate**, never moves. Polling forever while presenting never is a state only
+    one phase of UVUG's frame loop can occupy: the input drain, which UVUG-8 wrote as an **unbounded**
+    `loop { poll() }` running until the ring reported empty. Fix — a per-frame drain budget
+    (`MAX_DRAIN_PER_FRAME` = 64, twice the kernel's `INPUT_RING_CAP`); leftovers are consumed by the next
+    frame, so the render/present half of the loop is always reached and the freeze becomes input latency at
+    worst. The futex barrier was **refuted** as the cause, not merely doubted: `sched::futex_wait` compares
+    `*uaddr` against `val` under the same bucket lock `futex_wake` takes, so the park is race-free by
+    construction, and a parked parent could not have kept the heartbeat fresh anyway.
+  - **Present errors were invisible.** UVUG-8 discarded `SYS_FB_PRESENT`'s return, so a present that began
+    failing mid-run would have been indistinguishable from a freeze. It is now checked and witnessed.
+  - **`[uvug9]` stall witness** — an app-side, per-phase progress witness naming *which* phase stopped:
+    `[uvug9] stall frame=<n> phase=poll drained=<n>` (drain budget spent with the ring still non-empty — the
+    freeze signature, now a diagnosis of a runaway producer rather than a hang), `phase=barrier done=<0|1>`
+    (which worker half is missing), `phase=present rc=<errno>`. EL0 has no clock syscall, so the barrier budget
+    is counted in **passes**, which is both deterministic and exactly what "made no progress" means here; the
+    stated limitation is that it catches a *spinning* barrier, not a *parked* one (that case is refuted in the
+    kernel, above). There is no knob channel into EL0, so each phase **self-gates on its own anomaly** and
+    latches after one report — a healthy run prints nothing, and the QEMU auto path reaches no anomaly at all,
+    which is why its 300-frame checksum is untouched.
+  - **Key repeat stopped after ~10 characters at the shell.** Not a mystery: UVUG-6's liveness layer (3) firing
+    on a healthy keyboard. A strict `SET_IDLE(0)` boot keyboard sends one report on the press and then
+    **nothing** while the key is held still, so `LAST_REPORT_MS` freezes at the press; repeats run from
+    `DELAY_MS` (400 ms) to `LIVENESS_MS` (1000 ms) at `RATE_MS` (40 ms) — ~15, fewer once the press report's own
+    latency counts. The guard inferred "wedged" from silence on a device class whose correct behaviour *is*
+    silence, so it could never have been sound there. Fix — **evidence-gate** it: `typematic_note_report` sets a
+    sticky `STREAMS_WHILE_HELD` when it sees a report that is neither a fresh press nor a release while the
+    armed key is still down (positive proof this device re-reports during a hold, i.e. the P51-class hardware
+    layer 3 was written for). With that evidence the 1 s window applies unchanged and the P51 wedge stays shut;
+    without it the bound becomes `HOLD_MAX_MS` (30 s), a coarse backstop that keeps the pathological case finite
+    while letting a held key repeat as long as anyone actually holds one. Cleared on keyboard detach, so a
+    swapped device re-earns the verdict. Layers 1 and 2 are untouched and remain the real release paths.
+  - **Orphan residue: the GUI watchdog was silently disarmed for the rest of the boot.** `sys_input_poll` called
+    `gui_watchdog::note_progress()` **unscoped**. A timed-out run leaves its EL0 task alive and spinning on that
+    very syscall (this arch has no asynchronous kill primitive), so one timeout kept feeding the watchdog
+    forever — disabling the escape hatch that hands the screen back when a *later* full-screen app wedges. Fix —
+    focus-scope it, joining the takeover heartbeat under one `EL0_INPUT_ACTIVE == asid` test; they were always
+    the same question. This is the part of the orphan residue that outlives the run.
+  - **Mouse dead at the shell after a timeout while arrow keys still work** — **instrumented, not fixed.** The
+    asymmetry's likeliest owner is `drivers::xhci`: the dup-Success guard (`mouse_expect_phys`) returns from the
+    transfer dispatch **without** calling `queue_mouse_read`, so a single mismatched completion retires the
+    pointer read permanently while the keyboard's independently-armed endpoint carries on — on the endpoint that
+    generates by far the most traffic. That file is **outside this arc's lane**, so this arc adds the witness
+    that decides it instead of changing the driver: `[uvug9] shell-path input key=<n> ptr=<n>` counts keys and
+    pointer events separately at the shell-destined drain. Read against the existing `MOUSE-1` xHCI decode
+    counter: `MOUSE-1` advancing while `ptr=` is frozen puts the loss in the router/queue seam (this lane);
+    both frozen while `key=` advances puts it on the pointer interrupt-IN endpoint (the driver lane).
+  - Gates: `./arroyo check` green x86_64 + aarch64; `./arroyo kernel8` builds; `./arroyo kernel8-test` 46 PASS /
+    0 FAIL, UVUG batch `frames=300 checksum=0x48221e4101db3924 exit=0` **unchanged**, `:: uvug6: typematic … ::
+    PASS ::` still green (the evidence gate leaves all three selftest legs on their original verdicts). Lane:
+    `crates/user-uvug/src/main.rs` + `pal.rs` (typematic liveness) + `arch/aarch64/syscall.rs`
+    (`sys_input_poll` focus scope) + `main.rs` (shell-path witness) + this doc.
 - Not yet: **revocation trees** (a derived copy — re-grant or onward re-transfer — escapes
   single-level revoke today; derivation records + `CAP_REVOKE` are that arc), the **bandy Ring-3
   delegation wrapper**, `File` transfer (descriptor migration), real `Socket` fs/net syscalls.

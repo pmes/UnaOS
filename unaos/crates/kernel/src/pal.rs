@@ -385,11 +385,32 @@ pub fn keyboard_detach_gen() -> u64 {
 // State lives HERE (the kernel lib) rather than in the `main` binary so the xHCI decode — which is in the lib
 // and cannot call into `main` — can feed it directly at the report level. `main`'s pump calls `typematic_tick`.
 //
-// LIVENESS/SET_IDLE(0) NOTE: on a keyboard that truly sends ZERO reports while a key is held still (strict
-// SET_IDLE(0), no idle re-reports), the 1 s liveness will stop an ongoing repeat while the key is physically
-// held. That is a benign, self-correcting degradation (re-press resumes it) and is deliberately preferred over
-// the catastrophic, self-sustaining wedge it guards against. The P51-class hardware streams periodic reports,
-// so liveness there simply confirms the keyboard is alive.
+// UVUG-9 — LIVENESS IS NOW EVIDENCE-GATED (the ~10-repeat stop, P54b metal fact 3).
+//
+// UVUG-6 flagged this exact failure as a "benign, self-correcting degradation" and shipped it. P54b measured
+// it: holding a key at the shell repeated about ten times and then stopped dead. That is layer 3 firing on a
+// perfectly healthy keyboard, and the arithmetic matches the constants precisely — a strict SET_IDLE(0) boot
+// keyboard sends ONE report on the press and then nothing at all while the key is held still, so
+// `LAST_REPORT_MS` freezes at the press. Repeats begin at `DELAY_MS` (400 ms) and run every `RATE_MS` (40 ms)
+// until `now - last > LIVENESS_MS` (1000 ms) disarms the key: the window is 400..1000 ms, i.e. ~15 repeats,
+// and shorter once the press report's own latency is counted. "About ten, then it stops" is not a mystery
+// symptom; it is this guard's designed behaviour meeting hardware the guard was never valid for.
+//
+// The flaw is that layer 3 infers "the keyboard is wedged" from silence, on a device class whose CORRECT
+// behaviour under SET_IDLE(0) is silence. Silence carries no information here, so the guard cannot be sound.
+//
+// Fix: only trust silence from a keyboard that has DEMONSTRATED it does not stay silent. `typematic_note_report`
+// sets `STREAMS_WHILE_HELD` when it sees a report that is not a fresh press while the armed key is still down —
+// positive proof that this device re-reports during a hold, which is exactly the P51-class hardware layer 3 was
+// written for. With that evidence the 1 s window applies unchanged and the P51 wedge stays shut. Without it,
+// silence is expected and the bound becomes `HOLD_MAX_MS`, a coarse backstop that still keeps the catastrophic
+// case finite while letting a held key repeat for as long as anyone actually holds one.
+//
+// Layers 1 and 2 are untouched and are the real release paths for a SET_IDLE(0) keyboard: the release EDGE does
+// produce a report (that is what ends a hold), layer 1 reads it directly from the report's held set, and a
+// mid-hold unplug is layer 2's. Layer 3 only ever covered the residue where a release report never reaches the
+// decode at all — and the backpressure guard independently prevents a stuck repeat from starving real input in
+// the meantime. The evidence gate is cleared on a keyboard detach, so a swapped device re-earns its own verdict.
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 mod typematic {
     use core::sync::atomic::{AtomicU32, AtomicU64};
@@ -405,8 +426,18 @@ mod typematic {
     pub(super) const DELAY_MS: u64 = 400;
     /// Repeat period once repeating (~25 chars/s).
     pub(super) const RATE_MS: u64 = 40;
-    /// Liveness window: a "held" key with no HID report for this long is stale -> drop.
+    /// Liveness window for a keyboard PROVEN to re-report during a hold (see `STREAMS_WHILE_HELD`): silence
+    /// this long from such a device is genuinely anomalous -> drop the held key.
     pub(super) const LIVENESS_MS: u64 = 1000;
+    /// UVUG-9 — the backstop window for a keyboard that has NOT proven it re-reports during a hold (a strict
+    /// `SET_IDLE(0)` device, whose correct behaviour is total silence while a key is held still). Silence says
+    /// nothing about health there, so it cannot be read as a wedge; this bound exists only so the pathological
+    /// case stays finite. Thirty seconds is far longer than any real key hold and far shorter than forever.
+    pub(super) const HOLD_MAX_MS: u64 = 30_000;
+    /// UVUG-9 — sticky evidence that THIS keyboard emits HID reports while a key is held down (0 = not yet
+    /// observed, 1 = observed). Set by `typematic_note_report` on a report that is neither a fresh press nor a
+    /// release of the armed key; cleared on a keyboard detach so a newly attached device re-earns the verdict.
+    pub(super) static STREAMS_WHILE_HELD: AtomicU32 = AtomicU32::new(0);
 }
 
 /// UVUG-6 — feed the typematic tracker one HID keyboard report at the REPORT LEVEL (before any EVENT_QUEUE
@@ -426,6 +457,12 @@ pub fn typematic_note_report(newest_press: u8, held: &[u8]) {
         let k = (kp1 - 1) as u8;
         if !held.contains(&k) {
             typematic::KEY_P1.store(0, Ordering::Relaxed);
+        } else if newest_press == 0 {
+            // UVUG-9: a report arrived that neither pressed anything new nor released the armed key, while that
+            // key is still down — positive proof this keyboard re-reports during a hold. That is the ONLY device
+            // class for which `LIVENESS_MS` (silence == wedge) is a sound inference, so record it and let
+            // `typematic_tick` use the tight window. Sticky until the device detaches.
+            typematic::STREAMS_WHILE_HELD.store(1, Ordering::Relaxed);
         }
     }
     // Arm the newest press (newest-wins typematic) and (re)start the initial delay.
@@ -445,6 +482,9 @@ pub fn typematic_tick() -> Option<u8> {
     let dg = keyboard_detach_gen();
     if typematic::SEEN_DETACH_GEN.swap(dg, Ordering::Relaxed) != dg {
         typematic::KEY_P1.store(0, Ordering::Relaxed);
+        // UVUG-9: the streaming verdict belongs to the DEVICE, not the boot — a detach means the next report
+        // may come from different hardware, which must earn its own verdict rather than inherit this one.
+        typematic::STREAMS_WHILE_HELD.store(0, Ordering::Relaxed);
         return None;
     }
     let kp1 = typematic::KEY_P1.load(Ordering::Relaxed);
@@ -452,9 +492,16 @@ pub fn typematic_tick() -> Option<u8> {
         return None;
     }
     let now = crate::arch::ms();
-    // (3) positive liveness: a still-"held" key whose keyboard has gone silent for ~1 s is stale -> drop it.
+    // (3) positive liveness, UVUG-9 evidence-gated: silence only means "wedged" on a keyboard that has PROVEN
+    // it re-reports during a hold. On a strict SET_IDLE(0) device silence is the correct behaviour of a key
+    // being held, and reading it as a wedge is what stopped repeat after ~10 characters on metal (P54b).
     let last = typematic::LAST_REPORT_MS.load(Ordering::Relaxed);
-    if last != 0 && now.wrapping_sub(last) > typematic::LIVENESS_MS && now >= last {
+    let window = if typematic::STREAMS_WHILE_HELD.load(Ordering::Relaxed) != 0 {
+        typematic::LIVENESS_MS
+    } else {
+        typematic::HOLD_MAX_MS
+    };
+    if last != 0 && now.wrapping_sub(last) > window && now >= last {
         typematic::KEY_P1.store(0, Ordering::Relaxed);
         return None;
     }

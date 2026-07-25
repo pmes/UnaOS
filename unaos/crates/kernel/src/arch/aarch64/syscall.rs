@@ -10068,18 +10068,26 @@ fn sys_input_poll() -> i64 {
     // heartbeat is this poll itself: a program calling SYS_INPUT_POLL IS making drain progress, whether or
     // not the ring has an event this instant. Feed the heartbeat on EVERY poll (before the empty-ring return),
     // so a live EL0 app is never reclaimed and the `run_user_image` deadline stays the sole liveness bound.
-    // No-op when no app owns the screen, so this is safe on any caller.
-    crate::gui_watchdog::note_progress();
+    // UVUG-9 — FOCUS-SCOPED, for the same reason the takeover heartbeat and `EL0_FOCUSED_PRESENT_COUNT` are.
+    // Unscoped, this fed the watchdog from ANY EL0 caller, including a `PORPHANED` orphan: a timed-out run
+    // leaves its task alive and spinning on this very syscall (no asynchronous kill primitive on this arch), so
+    // a single timeout kept `note_progress` firing for the rest of the boot. That silently disarms the GUI
+    // wedge watchdog — the escape hatch that hands the screen back when a full-screen app dies — for every
+    // LATER app of that boot, and it is the one part of the P54b orphan residue that outlives the run. Only the
+    // app that actually OWNS INPUT can be making screen progress, which is exactly this predicate.
     let asid = current_asid();
     if asid == 0 || asid as usize > super::boot::USER_SLOTS {
         return EAGAIN;
     }
-    // UVUG-8r2: stamp the EL0 takeover HEARTBEAT on every poll, empty ring or not — the per-`run` twin of the
-    // `note_progress` call above. Reaching this syscall IS proof of liveness; `run_user_image` suspends its
+    //
+    // UVUG-8r2: the EL0 takeover HEARTBEAT is stamped on the same edge and under the same predicate — every
+    // poll, empty ring or not. Reaching this syscall IS proof of liveness; `run_user_image` suspends its
     // deadline only while this stays fresh, so an app that wedges mid-takeover stops holding the deadline open
     // and the run regains its bound. Stamped only for the FOCUSED app so an unfocused EL0 task's polling can
-    // never keep another process's takeover alive.
+    // never keep another process's takeover alive. One focus test now serves both (they were always the same
+    // question — "is the caller the app that owns the screen?").
     if EL0_INPUT_ACTIVE.load(Ordering::Acquire) == asid {
+        crate::gui_watchdog::note_progress();
         EL0_TAKEOVER_HB.store(super::timer::cntpct(), Ordering::Release);
     }
     let a = asid as usize;
