@@ -1044,6 +1044,9 @@ fn spawn_user_inner(
         // SMP-BAL: EL0/slot tasks carry per-core TTBR0/ASID state — always pinned, never stolen.
         steal_ok: false,
     });
+    // SKILL-1: count this task against its address-space slot BEFORE the push, so it is countable before
+    // it can ever be dispatched (and thus before any ASID-scoped kill could observe a short count).
+    asid_thread_enter(user_ttbr0);
     RUN_QUEUES[cpu].lock().push(task);
     // PI-SCHED-1 — placement witness for EL0 tasks (the vug/midden GUI-app loads land here — the
     // "all vug load on core 2" sighting). Same `pi`-gating + rationale as `spawn_inner`.
@@ -1107,6 +1110,9 @@ pub fn spawn_user_thread(
         // SMP-BAL: shared-ASID EL0 thread — per-core address-space state, always pinned.
         steal_ok: false,
     });
+    // SKILL-1: this is the path that MAKES a slot multi-threaded, so it is the one the ASID-scoped kill
+    // exists for — count the sibling before it can be dispatched.
+    asid_thread_enter(user_ttbr0);
     RUN_QUEUES[cpu].lock().push(task);
     #[cfg(feature = "pi")]
     serial_println!(
@@ -1309,7 +1315,7 @@ pub fn current_id() -> Option<u64> {
 /// How many kills may be in flight at once. Small on purpose: the only requester is the single-threaded
 /// `run_user_image` deadline path, and `MAX_PROCS` (4) bounds how many rows can be at risk. Exhaustion
 /// returns `None` and the caller falls back to PORPHANED — it never grows the table (a STOP tripwire).
-const MAX_KILL_REQS: usize = 4;
+pub const MAX_KILL_REQS: usize = 4;
 
 const KILL_FREE: u8 = 0;
 /// Armed and owned by a live requester; the retiring task publishes `KILL_DONE` for it to observe.
@@ -1324,13 +1330,73 @@ const KILL_DETACHED: u8 = 3;
 struct KillReq {
     /// The target task id. Only meaningful while `state != KILL_FREE`.
     tid: AtomicU64,
+    /// The target's address-space ASID, or 0 for a kernel task / a tid-only request. NON-ZERO makes the
+    /// request ADDRESS-SPACE SCOPED: it names every EL0 thread sharing that ASID, not just `tid`. See
+    /// `kill` for why that is the correct unit.
+    asid: AtomicU64,
     /// `KILL_*`. The ownership token: a requester CASes FREE->PENDING to claim.
     state: AtomicU8,
 }
 
 static KILLS: [KillReq; MAX_KILL_REQS] = [const {
-    KillReq { tid: AtomicU64::new(0), state: AtomicU8::new(KILL_FREE) }
+    KillReq {
+        tid: AtomicU64::new(0),
+        asid: AtomicU64::new(0),
+        state: AtomicU8::new(KILL_FREE),
+    }
 }; MAX_KILL_REQS];
+
+/// SKILL-1 — LIVE EL0 THREADS PER ADDRESS-SPACE SLOT, indexed by ASID.
+///
+/// An ELF-2 process can hold several tasks under one ASID (`spawn_user_thread`), and a kill must be scoped
+/// to the ADDRESS SPACE, not to one thread: retiring the tid that `run_user_image` happens to know while
+/// its siblings keep running would leave the program alive — still spinning, still rendering — under a row
+/// we had just reported reaped. (There is no memory-unsafety in that: `teardown_user_slot` is refcounted
+/// and only the last thread out retires the slot. The lie is in the accounting, which is worse for being
+/// silent.) This counter is what lets the ASID-scoped request know when the LAST of the set has retired,
+/// and it is the reason a confirmation can be trusted for a multi-threaded target.
+///
+/// Sized for ASID 0 (never counted — kernel tasks and the shared window) plus `boot::USER_SLOTS` (8).
+/// Kept here rather than reading `boot::SLOT_REFCOUNT` because that is private, is baremetal-only, and
+/// counts slot RETAINS (which include the pre-spawn retain `SYS_THREAD_SPAWN` takes before a task exists);
+/// this counts TASKS, which is exactly the set a kill has to drain.
+const KILL_ASID_SLOTS: usize = 9;
+static ASID_THREADS: [AtomicU32; KILL_ASID_SLOTS] =
+    [const { AtomicU32::new(0) }; KILL_ASID_SLOTS];
+
+/// Count a freshly spawned EL0 task against its slot. Called from both user-task spawn paths BEFORE the
+/// run-queue push, so the task is countable before it can ever be dispatched. Kernel tasks (ASID 0) and
+/// out-of-range ASIDs are ignored, which makes this inert on `virt` (every task there is a kernel thread).
+#[cfg_attr(not(feature = "baremetal"), allow(dead_code))] // both user-spawn paths are baremetal-only
+fn asid_thread_enter(user_ttbr0: u64) {
+    let asid = (user_ttbr0 >> 48) as usize;
+    if asid != 0 && asid < KILL_ASID_SLOTS {
+        ASID_THREADS[asid].fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// Retire an EL0 task from its slot's live count, returning how many threads REMAIN under that ASID.
+/// Called from every task-death path (`exit` and the off-CPU `retire_killed`) beside the slot teardown, so
+/// the count tracks live tasks exactly. Returns 0 for kernel tasks, which is also the right answer for a
+/// tid-scoped request: "no siblings outstanding".
+fn asid_thread_leave(user_ttbr0: u64) -> u32 {
+    let asid = (user_ttbr0 >> 48) as usize;
+    if asid == 0 || asid >= KILL_ASID_SLOTS {
+        return 0;
+    }
+    let prev = ASID_THREADS[asid].fetch_sub(1, Ordering::AcqRel);
+    debug_assert!(prev > 0, "asid_thread_leave: underflow (a task retired twice?)");
+    prev.saturating_sub(1)
+}
+
+/// How many EL0 tasks are still live under `asid`. Introspection for the kill witness.
+pub fn asid_live_threads(asid: u64) -> u32 {
+    let a = asid as usize;
+    if a == 0 || a >= KILL_ASID_SLOTS {
+        return 0;
+    }
+    ASID_THREADS[a].load(Ordering::Acquire)
+}
 
 /// A requester's claim on one `KILLS` slot. Not `Copy`: it must be surrendered exactly once, via
 /// `kill_release` (confirmed) or `kill_detach` (gave up), so a slot can never be double-freed.
@@ -1338,41 +1404,78 @@ pub struct KillTicket {
     idx: usize,
 }
 
-/// The index of the ARMED kill request naming `tid`, if any. Lock-free scan of a 4-entry table —
-/// cheap enough for the dispatch fast path (`state` is `KILL_FREE` on every entry in the common case,
-/// so this is four relaxed loads and no branch mispredict of consequence).
-fn kill_slot_for(tid: u64) -> Option<usize> {
+/// The index of the ARMED kill request naming this task, if any — matched by TID, or by ASID when the
+/// request is address-space scoped (so every sibling thread of a killed process is caught by the same
+/// request). Lock-free scan of a 4-entry table: in the common case every entry is `KILL_FREE` and this is
+/// four acquire loads, cheap enough for the dispatch fast path.
+fn kill_slot_for(tid: u64, user_ttbr0: u64) -> Option<usize> {
+    let asid = user_ttbr0 >> 48;
     (0..MAX_KILL_REQS).find(|&i| {
         let st = KILLS[i].state.load(Ordering::Acquire);
-        (st == KILL_PENDING || st == KILL_DETACHED) && KILLS[i].tid.load(Ordering::Acquire) == tid
+        if st != KILL_PENDING && st != KILL_DETACHED {
+            return false;
+        }
+        KILLS[i].tid.load(Ordering::Acquire) == tid
+            || (asid != 0 && KILLS[i].asid.load(Ordering::Acquire) == asid)
     })
 }
 
-/// Settle slot `idx` from the RETIRING side — the last act of a killed task's teardown. A `KILL_PENDING`
-/// slot becomes `KILL_DONE` (its owner observes that and releases it); a `KILL_DETACHED` slot has no
-/// owner left, so it is freed here.
+/// Settle slot `idx` from the RETIRING side — the last act of a killed task's teardown.
+///
+/// `remaining` is how many sibling threads still live under the request's ASID. A non-zero count means the
+/// address space is NOT yet drained, so the request stays ARMED and un-settled: the siblings are caught by
+/// the same request at their own next boundaries, and only the last one out settles the slot. That is what
+/// makes a confirmation on a multi-threaded target honest rather than a claim about one thread of several.
+///
+/// The state transition is a **compare_exchange, not a load-then-store**. It races `kill_detach`, and does
+/// so at precisely the worst moment — the requester's bounded wait expiring is exactly when a slow kill
+/// lands. A load-then-store would read PENDING, lose to the detach's CAS, then stamp `KILL_DONE` over
+/// `KILL_DETACHED`, stranding the slot in a terminal state with no owner left to release it: a permanently
+/// consumed entry, four of which retire the primitive for the rest of the boot. With the CAS, losing the
+/// race means the state is `KILL_DETACHED` and the slot is freed inline here — the owner-less path.
 ///
 /// The `Proc`-row hook runs FIRST, while the slot is still un-settled: it reclaims a row that was parked
 /// PORPHANED because this very kill did not confirm in time. Restricted to PORPHANED rows, so it can
 /// never race the confirmed path (where the row is still PRUNNING and the requester frees it itself).
-fn kill_settle(idx: usize, tid: u64) {
+fn kill_settle(idx: usize, tid: u64, remaining: u32) {
+    if remaining > 0 {
+        return; // siblings still live under this ASID — the request stays armed for them
+    }
     #[cfg(feature = "baremetal")]
     super::syscall::note_killed_task_retired(tid);
     #[cfg(not(feature = "baremetal"))]
     let _ = tid;
-    match KILLS[idx].state.load(Ordering::Acquire) {
-        KILL_DETACHED => {
-            KILLS[idx].tid.store(0, Ordering::Release);
-            KILLS[idx].state.store(KILL_FREE, Ordering::Release);
-        }
-        _ => KILLS[idx].state.store(KILL_DONE, Ordering::Release),
+    if KILLS[idx]
+        .state
+        .compare_exchange(KILL_PENDING, KILL_DONE, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        // Not PENDING. Free the slot ONLY if it is genuinely owner-less (`KILL_DETACHED`) — and do that
+        // with a CAS too, so a slot some other requester has meanwhile re-armed can never be clobbered by
+        // a late settle. Any other state (already FREE because the owner retracted, already DONE) is
+        // someone else's to dispose of; leave it alone.
+        let _ = KILLS[idx].state.compare_exchange(
+            KILL_DETACHED,
+            KILL_FREE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 }
 
-/// Request that task `tid` be killed. Returns a ticket to confirm against, or `None` if the request
-/// table is full (caller must fail closed). Pokes every online core so a killed task sitting in an idle
-/// core's run queue is dispatched — and thus reaped — promptly rather than at that core's next tick.
-pub fn kill(tid: u64) -> Option<KillTicket> {
+/// Request that a task be killed. Returns a ticket to confirm against, or `None` if the request table is
+/// full (the caller MUST fail closed — see `KILL_EXHAUSTED`). Pokes every online core so a killed task
+/// sitting in an idle core's run queue is dispatched — and thus reaped — promptly rather than at that
+/// core's next tick.
+///
+/// SCOPE. `tid` names the task the caller knows about; `asid` (non-zero) widens the request to EVERY EL0
+/// task sharing that address space. Pass the ASID whenever the target is a user process: an ELF-2 program
+/// may hold several tasks under one slot (`SYS_THREAD_SPAWN`), and killing only the tid the caller happens
+/// to hold would leave the program running under a row the caller is about to reclaim. With the ASID set,
+/// each sibling is matched by this same request at its own boundary and `kill_settle` withholds the
+/// confirmation until the LAST of them has retired — so a confirmation means the PROCESS is gone, not one
+/// thread of it. Pass 0 for a kernel task (no address space to scope to).
+pub fn kill(tid: u64, asid: u64) -> Option<KillTicket> {
     if tid == 0 {
         return None;
     }
@@ -1383,8 +1486,9 @@ pub fn kill(tid: u64) -> Option<KillTicket> {
             .is_ok()
         {
             // Publish the target BEFORE any reader can match it: the CAS made the slot non-FREE, so
-            // `kill_slot_for` could already be scanning it — it compares the tid, and a stale 0 simply
+            // `kill_slot_for` could already be scanning it — it compares tid/asid, and a stale 0 simply
             // means "no match yet", never a match on the wrong task.
+            KILLS[i].asid.store(asid, Ordering::Release);
             KILLS[i].tid.store(tid, Ordering::Release);
             for cpu in 0..NUM_CPUS {
                 if ONLINE_MASK[cpu].load(Ordering::Acquire) {
@@ -1411,13 +1515,52 @@ pub fn kill_release(ticket: KillTicket) {
         "kill_release on an unconfirmed ticket"
     );
     KILLS[ticket.idx].tid.store(0, Ordering::Release);
+    KILLS[ticket.idx].asid.store(0, Ordering::Release);
     KILLS[ticket.idx].state.store(KILL_FREE, Ordering::Release);
+}
+
+/// RETRACT a request whose target turns out to be already gone — the requester has independently observed
+/// that nothing is left alive to kill (for `run_user_image`: the `Proc` row reached `PEXITED` and the slot
+/// holds no live threads). Without this, a request armed in the sampling gap between "row reads PRUNNING"
+/// and `kill` — during which the task can complete its entire `SYS_EXIT` — could never be settled by
+/// anyone, and four such leaks would exhaust the table for the rest of the boot.
+///
+/// CAS from `KILL_PENDING`, never a blind store: a retirement may be settling this very slot concurrently.
+/// If the CAS fails the state is `KILL_DONE` (the kill landed after all) and the slot is freed anyway —
+/// either way it returns to the pool exactly once.
+pub fn kill_retract(ticket: KillTicket) {
+    if KILLS[ticket.idx]
+        .state
+        .compare_exchange(KILL_PENDING, KILL_FREE, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        let _ = KILLS[ticket.idx].state.compare_exchange(
+            KILL_DONE,
+            KILL_FREE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
 }
 
 /// Surrender an UNCONFIRMED ticket: the requester's bounded wait expired. The request stays ARMED — the
 /// task is still owed its death and will take it at its next boundary — and the slot is freed by
-/// `kill_settle` when that finally happens. A task that never reaches any boundary at all holds the slot
-/// forever; that is the honest accounting, and the caller has already fallen back to PORPHANED.
+/// `kill_settle` when that finally happens. The caller has already fallen back to PORPHANED.
+///
+/// WHICH TARGETS CAN HOLD A SLOT FOREVER — the honest limits of a boundary-driven kill:
+///   * A task **blocked on a wake that never comes** (a semaphore nobody posts, a futex nobody wakes) is
+///     in neither a run queue nor on a CPU: it reaches no dispatch and no preemption, so NEITHER arm can
+///     see it. Its slot stays `KILL_DETACHED` for the rest of the boot. Sweeping the wait lists at detach
+///     time is the real fix and is deliberately NOT attempted here: the waiters live behind `Semaphore`'s
+///     and `FutexBucket`'s own raw spinlocks, and reaching into them from an arbitrary requester context
+///     would invert the lock order the park-side handoff depends on (`Semaphore::wait` pushes the Box
+///     while holding that lock). That is a wait-queue-ownership change, not a scheduler-kill change.
+///   * A task that **never reaches any boundary at all** — no yield, no syscall, and no timer (the QEMU
+///     case; on metal the quantum tick always arrives).
+/// Both are bounded and visible rather than silent: the table is four entries, and the exhaustion that
+/// results is witnessed once per boot by the caller (`KILL_EXHAUSTED`). Every OTHER path returns its slot
+/// — a confirmed kill via `kill_release`, a detached-then-landed kill inline in `kill_settle`, and a
+/// request armed against an already-dead task via the requester's own post-arm re-check.
 pub fn kill_detach(ticket: KillTicket) {
     let _ = KILLS[ticket.idx].state.compare_exchange(
         KILL_PENDING,
@@ -1427,6 +1570,7 @@ pub fn kill_detach(ticket: KillTicket) {
     ); // a DONE slot lost the race (the task died just now) — leave it for the owner-less free below
     if KILLS[ticket.idx].state.load(Ordering::Acquire) == KILL_DONE {
         KILLS[ticket.idx].tid.store(0, Ordering::Release);
+        KILLS[ticket.idx].asid.store(0, Ordering::Release);
         KILLS[ticket.idx].state.store(KILL_FREE, Ordering::Release);
     }
 }
@@ -1444,19 +1588,27 @@ pub fn kill_check_current() {
     if raw.is_null() {
         return;
     }
-    let id = unsafe { (*raw).id };
-    if kill_slot_for(id).is_some() {
+    let (id, ttbr0) = unsafe { ((*raw).id, (*raw).user_ttbr0) };
+    if kill_slot_for(id, ttbr0).is_some() {
         exit();
     }
 }
 
 /// OFF-CPU kill boundary: retire `task` from the scheduler's own context, without ever switching into
-/// it. Mirrors `exit()`'s teardown exactly — slot teardown first (it repoints THIS core's TTBR0 off the
-/// dead root before the ASID is flushed), then the joiner signal, then the Box drop that frees the
-/// kernel stack — and settles the kill slot last, so `KILL_DONE` is only ever published after every
-/// resource the task owned is gone.
+/// it. Mirrors `exit()`'s teardown — slot teardown first (it repoints THIS core's TTBR0 off the dead root
+/// before the ASID is flushed), then the joiner signal, then the Box drop that frees the kernel stack —
+/// and settles the kill slot LAST.
+///
+/// ORDERING NOTE (the two arms differ, deliberately): here the kernel stack is already freed when
+/// `KILL_DONE` is published, because the scheduler owns the Box and can drop it outright. The `exit()` arm
+/// cannot — it is still executing ON that stack — so there the confirmation is published with the state
+/// store and the final `switch_context` still to come, and the stack is freed a moment later by whichever
+/// core reclaims the Box. The guarantee both arms actually make, and the only one a requester may rely on,
+/// is: **the address-space slot is torn down, the joiner is released, and the task will never execute
+/// again.** Kernel-stack reclamation is scheduler-internal and is NOT part of the confirmation contract.
 fn retire_killed(idx: usize, task: Box<Task>) {
     let tid = task.id;
+    let ttbr0 = task.user_ttbr0;
     // M6d: the same slot retirement `exit()` performs, executed on the scheduler stack. Legal here for
     // the same reason it is legal there — the kernel half of every root is Global and identical, so
     // repointing TTBR0 to the boot root pulls nothing out from under the running (scheduler) context.
@@ -1474,7 +1626,10 @@ fn retire_killed(idx: usize, task: Box<Task>) {
     }
     task.state.store(STATE_FINISHED, Ordering::Release);
     drop(task); // frees the kernel stack
-    kill_settle(idx, tid);
+    // Drop this task out of its slot's live count, then settle — which withholds the confirmation while
+    // sibling threads of the same address space are still alive (they are caught by this same request).
+    let remaining = asid_thread_leave(ttbr0);
+    kill_settle(idx, tid, remaining);
 }
 
 /// Terminate the current task: mark it finished and switch to the scheduler for good (which frees
@@ -1509,13 +1664,20 @@ pub fn exit() -> ! {
         if let Some(sem) = &(*raw).done_sem {
             sem.post();
         }
-        // SKILL-1: settle any kill request naming this task. Placed HERE — after the slot teardown and
-        // the joiner post, with only the state store and the final switch left — so `KILL_DONE` means
-        // every resource this task owned is already released and nothing it can still execute observes
-        // anything. (The kernel stack is freed by the scheduler when it drops the Box a moment later;
-        // the requester's contract is "will never run again", which holds from this point on.)
-        if let Some(idx) = kill_slot_for((*raw).id) {
-            kill_settle(idx, (*raw).id);
+        // SKILL-1: drop this task out of its address space's live-thread count — on EVERY exit path, not
+        // just the killed one, or the count drifts and a later ASID-scoped kill would never confirm.
+        let remaining = asid_thread_leave((*raw).user_ttbr0);
+        // Settle any kill request naming this task (by tid, or by ASID for a whole-process kill). Placed
+        // HERE — after the slot teardown and the joiner post, with only the state store and the final
+        // switch left.
+        //
+        // ORDERING (asymmetric with the off-CPU arm, deliberately — see `retire_killed`): this task is
+        // still executing on its own kernel stack, so that stack is NOT yet freed when `KILL_DONE` is
+        // published; the scheduler reclaims the Box a moment later, after the `switch_context` below.
+        // What IS guaranteed at this point — and all the requester's contract claims — is that the
+        // address-space slot is retired, the joiner is released, and this task will never execute again.
+        if let Some(idx) = kill_slot_for((*raw).id, (*raw).user_ttbr0) {
+            kill_settle(idx, (*raw).id, remaining);
         }
         (*raw).state.store(STATE_FINISHED, Ordering::Release);
         // `old_sp` is a throwaway on the dying stack — the scheduler never reads it back and never
@@ -1640,7 +1802,7 @@ fn dispatch_next(cpu: usize) -> bool {
     // target at all, and it covers ready, sleeping and wait-queued tasks alike: they all come back
     // through a dispatch. IRQ is masked and the run-queue lock was dropped above, so the teardown inside
     // is on the same footing as `exit()`'s. Returning `true` re-enters the loop for a real pass.
-    if let Some(idx) = kill_slot_for(task.id) {
+    if let Some(idx) = kill_slot_for(task.id, task.user_ttbr0) {
         retire_killed(idx, task);
         return true; // leaves IRQ MASKED, exactly like the ordinary busy return below
     }
@@ -2983,7 +3145,7 @@ fn skill_victim_body(_: usize) {
 fn skill_self_body(_: usize) {
     SKILL_SELF_TICKS.fetch_add(1, Ordering::AcqRel);
     let id = current_id().expect("skill: self victim has no id");
-    let ticket = kill(id).expect("skill: no kill slot for the self victim");
+    let ticket = kill(id, 0).expect("skill: no kill slot for the self victim");
     // Hand the slot index to the witness and forget the ticket: this task is about to stop existing
     // mid-function, so it cannot be the one to surrender it. (The index is all a ticket ever was.)
     SKILL_SELF_SLOT.store(ticket.idx as u32 + 1, Ordering::Release);
@@ -3030,7 +3192,7 @@ pub fn skill_kill_witness(cpu: usize) {
     let alive_ticks = SKILL_VICTIM_TICKS.load(Ordering::Acquire);
     let was_alive = alive_ticks >= 3;
 
-    let ticket = kill(vid);
+    let ticket = kill(vid, 0);
     let mut off_passes = 0u32;
     let off_confirmed = match &ticket {
         None => false,
@@ -3079,6 +3241,34 @@ pub fn skill_kill_witness(cpu: usize) {
     }
     let self_drained = queue_empty();
 
+    // --- 3b: the DETACH/SETTLE INTERLEAVE (the F1 hazard, made deterministic) --------------------
+    // The cooperative harness can express the exact ordering that used to strand a slot: arm a kill, let
+    // the requester's bounded wait "expire" (detach) while the victim is still off-CPU and un-reaped, and
+    // only THEN let the retirement land. Under the old load-then-store settle, the retiring side read
+    // PENDING, lost to the detach's CAS, and stamped KILL_DONE over KILL_DETACHED — a terminal state with
+    // no owner left to release it, i.e. a permanently consumed slot. With the CAS settle the retirement
+    // discovers the detach and frees the slot inline, so the pool comes back whole. Asserting the slot is
+    // FREE (not DONE, not still DETACHED) after the reap is exactly that distinction.
+    SKILL_VICTIM_TICKS.store(0, Ordering::Release);
+    let did = spawn("skill-detach", skill_victim_body, 0, cpu);
+    dispatch_next(cpu); // victim runs once, then parks back in the run queue (off-CPU, un-reaped)
+    let dticket = kill(did, 0);
+    let detach_armed = dticket.is_some();
+    if let Some(t) = dticket {
+        kill_detach(t); // the requester gives up BEFORE the kill lands — the F1 interleave
+    }
+    let mut detach_passes = 0u32;
+    while detach_passes < SKILL_MAX_PASSES {
+        detach_passes += 1;
+        dispatch_next(cpu); // the retirement lands here, against a DETACHED slot
+        if queue_empty() {
+            break;
+        }
+    }
+    let detach_reaped = queue_empty();
+    // The whole point: an owner-less settle must FREE the slot, not strand it in DONE.
+    let detach_slot_freed = slots_free();
+
     // --- 4: reuse -------------------------------------------------------------------------------
     let pool_clean = slots_free();
     let _ = spawn("skill-rerun", skill_rerun_body, 0, cpu);
@@ -3092,18 +3282,21 @@ pub fn skill_kill_witness(cpu: usize) {
         && self_confirmed
         && self_frozen
         && self_drained
+        && detach_armed
+        && detach_reaped
+        && detach_slot_freed
         && pool_clean
         && rerun_ok;
     if pass {
         serial_println!(
-            ":: SKILL-1: async kill — victim ran {} rounds then froze; off-CPU reap confirmed in {} pass(es), on-CPU boundary retire confirmed in {}; queue drained, kill slots returned, rerun OK :: PASS ::",
+            ":: SKILL-1: async kill — victim ran {} rounds then froze; off-CPU reap confirmed in {} pass(es), on-CPU boundary retire confirmed in {}; detach-then-settle interleave freed its slot inline; queue drained, kill slots returned, rerun OK :: PASS ::",
             alive_ticks,
             off_passes,
             self_passes
         );
     } else {
         serial_println!(
-            ":: SKILL-1: async kill — alive={} off_conf={} off_frozen={} off_drained={} self_conf={} self_frozen={} self_drained={} pool={} rerun={} :: FAIL ::",
+            ":: SKILL-1: async kill — alive={} off_conf={} off_frozen={} off_drained={} self_conf={} self_frozen={} self_drained={} det_armed={} det_reaped={} det_freed={} pool={} rerun={} :: FAIL ::",
             was_alive,
             off_confirmed,
             off_frozen,
@@ -3111,6 +3304,9 @@ pub fn skill_kill_witness(cpu: usize) {
             self_confirmed,
             self_frozen,
             self_drained,
+            detach_armed,
+            detach_reaped,
+            detach_slot_freed,
             pool_clean,
             rerun_ok
         );

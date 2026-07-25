@@ -6791,7 +6791,23 @@ pub fn run_user_image(
         // here — arming a request for a dead tid could never confirm, and would burn a slot until reboot.
         // `proc_orphan`'s CAS handles that race correctly on its own.
         let ticket = if PROCS[pi].state.load(Ordering::Acquire) == PRUNNING {
-            super::sched::kill(pid)
+            // ASID-SCOPED (not tid-scoped): an ELF-2 program can hold several tasks under this one slot,
+            // and killing only `pid` would leave its siblings running — still spinning, still rendering —
+            // under a row we were about to report reaped. The request names the address space, so every
+            // sibling is caught, and `sched` withholds the confirmation until the last of them retires.
+            let t = super::sched::kill(pid, asid);
+            if t.is_none() {
+                // Exhaustion must never be silent: four un-settleable requests (see `kill_detach`'s limits)
+                // retire the primitive for the rest of the boot, and the only visible symptom would be
+                // timeouts quietly going back to orphaning. Once per boot is enough to name the cause.
+                if !KILL_EXHAUSTED.swap(true, Ordering::AcqRel) {
+                    serial_println!(
+                        "[skill] slot table EXHAUSTED — reverting to PORPHANED (all {} kill requests consumed by targets that never reached a boundary)",
+                        super::sched::MAX_KILL_REQS
+                    );
+                }
+            }
+            t
         } else {
             None
         };
@@ -6805,9 +6821,23 @@ pub fn run_user_image(
                 let t0 = super::timer::cntpct();
                 let budget = super::timer::cntfrq().saturating_mul(KILL_CONFIRM_SECS);
                 let mut ok = false;
+                // POST-ARM RE-CHECK — the dead-target slot leak. The `PRUNNING` guard above is a sampled
+                // read: the task can complete its whole SYS_EXIT (row -> PEXITED, `done` posted, task
+                // retired) in the gap between that read and the `kill` call, and a request armed against an
+                // already-retired task can never be settled by anyone — it would sit `KILL_DETACHED` for
+                // the rest of the boot, and four such leaks exhaust the table. Re-reading the row AFTER
+                // arming closes it: `PEXITED` is published by the dying task strictly before it retires, so
+                // observing it here means the request has no live target and the slot is released at once.
+                let mut already_dead = false;
                 loop {
                     if super::sched::kill_confirmed(&ticket) {
                         ok = true;
+                        break;
+                    }
+                    if PROCS[pi].state.load(Ordering::Acquire) == PEXITED
+                        && super::sched::asid_live_threads(asid) == 0
+                    {
+                        already_dead = true;
                         break;
                     }
                     if super::timer::cntpct().wrapping_sub(t0) >= budget {
@@ -6817,6 +6847,12 @@ pub fn run_user_image(
                 }
                 if ok {
                     super::sched::kill_release(ticket);
+                } else if already_dead {
+                    // Nothing is left to kill, so the request is retracted rather than detached — the slot
+                    // goes straight back to the pool. The row is reaped by the `PEXITED` arm below, which
+                    // `already_dead` implies, so this still reports `confirmed` truthfully.
+                    super::sched::kill_retract(ticket);
+                    ok = true;
                 } else {
                     super::sched::kill_detach(ticket); // stays armed; the row is parked below
                 }
@@ -6842,6 +6878,22 @@ pub fn run_user_image(
                 RunOutcome::Timeout
             };
             serial_println!("[skill] killed pid={} asid={} confirmed=1 row=reaped", pid, asid);
+            out
+        } else if super::sched::asid_live_threads(asid) > 0 {
+            // Not confirmed AND the address space still holds live threads — say so rather than letting the
+            // bare `confirmed=0` imply a single stubborn task. This is the multi-threaded case: some
+            // siblings retired, at least one did not, and the row must stay parked for exactly that reason.
+            let out = match proc_orphan(pi) {
+                None => RunOutcome::Timeout,
+                Some(EXEC_KILLED_STATUS) => RunOutcome::Faulted,
+                Some(s) => RunOutcome::Exited(s),
+            };
+            serial_println!(
+                "[skill] killed pid={} asid={} confirmed=0 row=orphaned — {} sibling thread(s) survive",
+                pid,
+                asid,
+                super::sched::asid_live_threads(asid)
+            );
             out
         } else {
             // `proc_orphan` CASes PRUNNING->PORPHANED. `Some(status)` means the task actually died in the
@@ -10006,6 +10058,12 @@ pub const TAKEOVER_STALE_SECS: u64 = 2;
 /// the other direction: whatever happens, the shell is back within `KILL_CONFIRM_SECS` of the deadline, having
 /// fallen back to exactly the pre-SKILL-1 behaviour.
 const KILL_CONFIRM_SECS: u64 = 2;
+
+/// SKILL-1: latched once the kill-request table has been observed FULL. The table is small and every
+/// ordinary path returns its slot, so exhaustion can only mean targets that reached no boundary at all
+/// (see `sched::kill_detach`'s documented limits) — a condition whose only other symptom would be timeouts
+/// silently reverting to orphaning. One line per boot names it.
+static KILL_EXHAUSTED: AtomicBool = AtomicBool::new(false);
 
 /// UVUG-8r2: how much suspended time one `run` may accumulate WITHOUT PRESENTING A FRAME before takeover
 /// stops suspending its deadline. The heartbeat gate bounds a *silent* wedge, but not a *noisy* one: an app

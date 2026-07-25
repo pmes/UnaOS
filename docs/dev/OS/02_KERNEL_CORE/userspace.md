@@ -800,10 +800,32 @@
   — the abandoned EL0 task kept **spinning a core at 100 % forever**, kept **rendering over the shell's
   screen**, and starved every later run (observed on two boots as `EXEC1 … did not exit in time` on the run
   *after* a timeout). UVUG-9's watchdog fix above ("orphan residue") treated one symptom of exactly this.
-  - **A kill is a request, never register surgery.** `sched::kill(tid)` publishes an entry in a four-slot
-    table keyed by task id; the target retires **itself, on its own core**, at a boundary where switching
-    away for good is already proven safe. No cross-CPU stack or register is ever touched. Task ids are
-    monotonic and never reused, so a request cannot be mis-delivered to a later task.
+  - **A kill is a request, never register surgery.** `sched::kill(tid, asid)` publishes an entry in a
+    four-slot table; the target retires **itself, on its own core**, at a boundary where switching away for
+    good is already proven safe. No cross-CPU stack or register is ever touched. Task ids are monotonic and
+    never reused, so a request cannot be mis-delivered to a later task.
+  - **The unit of a kill is the ADDRESS SPACE, not the thread.** An ELF-2 program can hold several tasks
+    under one ASID (`SYS_THREAD_SPAWN`), so a request that named only the tid `run_user_image` happens to
+    hold would retire one thread while its siblings kept running — still spinning, still rendering — under
+    a row we had just reported *reaped*. (Nothing unsafe: `teardown_user_slot` is refcounted and only the
+    last thread out retires the slot. The defect is a **false claim**, which is worse for being silent.) A
+    non-zero `asid` widens the request to every task in the slot; both arms match on it, and a per-ASID
+    live-task count (`ASID_THREADS`, maintained at every user spawn and every task death) makes
+    `kill_settle` **withhold the confirmation until the last sibling has retired**. If some sibling never
+    does, the witness says so outright — `confirmed=0 row=orphaned — <n> sibling thread(s) survive` — and
+    the row stays parked. A reap is only ever reported when the whole process is gone.
+  - **Slot-protocol races, all resolved by CAS.** `kill_settle` transitions with a
+    `compare_exchange(PENDING → DONE)`, never a load-then-store: it races `kill_detach` at precisely the
+    worst moment (a requester's bounded wait expiring is exactly when a slow kill lands), and a
+    load-then-store would stamp `KILL_DONE` over `KILL_DETACHED` — a terminal state with no owner left to
+    release it, four of which retire the primitive for the boot. Losing the CAS now means the state is
+    `DETACHED` and the slot is freed **inline**, on the owner-less path. A late settle likewise frees only
+    a slot it can CAS out of `DETACHED`, so a slot another requester has re-armed can never be clobbered.
+    `kill_retract` closes the mirror-image leak: the `PRUNNING` guard before arming is a *sampled* read,
+    and the task can complete its whole `SYS_EXIT` in the gap, leaving a request nothing can ever settle —
+    so the requester **re-checks the row after arming** and releases the slot at once if the target is
+    already gone. Exhaustion is never silent: `[skill] slot table EXHAUSTED — reverting to PORPHANED`
+    prints once per boot.
   - **Two arms.** *(a) OFF-CPU* — `dispatch_next` checks the table after popping a task and **before**
     switching into it: a killed task is never dispatched again, and is torn down on the scheduler's own
     stack. This arm needs no cooperation from the target at all and covers ready, sleeping and wait-queued
@@ -813,11 +835,16 @@
     EL0 task ever reaches**, and it is what turns the 100 %-core orphan into an actual death (~one tick,
     ≈4 ms, on metal). All three call sites already run IRQ-masked on the task's own kernel stack and
     already tolerate a never-returning `exit()` — that is precisely what the M6b EL0 fault-kill path does.
-  - **Teardown mirrors `exit()` exactly**, in both arms: `boot::teardown_user_slot(asid)` first (it
-    repoints the core's `TTBR0` off the dead root before the ASID broadcast-flush and the slot release),
-    then the `done_sem` post so a `JoinHandle` is never left blocked, then the Box drop that frees the
-    kernel stack. The kill slot is settled **last**, so `confirmed` means every resource the task owned is
-    already released and nothing of it will execute again.
+  - **Teardown mirrors `exit()`** in both arms: `boot::teardown_user_slot(asid)` first (it repoints the
+    core's `TTBR0` off the dead root before the ASID broadcast-flush and the slot release), then the
+    `done_sem` post so a `JoinHandle` is never left blocked, then the kernel stack, and the kill slot is
+    settled **last**. The two arms are **deliberately asymmetric about the stack**, and the confirmation
+    contract is written to the weaker of them: the off-CPU arm owns the Box and drops it before publishing
+    `KILL_DONE`, whereas `exit()` is still *executing on* that stack and cannot, so there the stack is
+    reclaimed moments later by whichever core takes the Box. What both arms guarantee at confirmation — and
+    all a requester may rely on — is: **the address-space slot is torn down, the joiner is released, and
+    the task will never execute again.** Kernel-stack reclamation is scheduler-internal and explicitly not
+    part of the contract.
   - **Confirmation is what licenses the reap.** `run_user_image` now kills **before** it parks:
     `kill` → bounded wait (`KILL_CONFIRM_SECS` = 2 s, wall-clock off CNTPCT, yielding so the co-located
     target reaches a dispatch) → on confirmation the row is **reaped outright**, because nothing is left
@@ -830,14 +857,30 @@
     `note_killed_task_retired` reclaims the parked row when it does (scoped to `PORPHANED` rows only, so it
     can never race the confirmed path or touch a live parent/child row). Witness, printed only when a kill
     actually happens: `[skill] killed pid=<n> asid=<n> confirmed=<0|1> row=<reaped|orphaned>`.
+  - **What a boundary-driven kill cannot reach — stated, not glossed.** A task **blocked on a wake that
+    never comes** (a semaphore nobody posts, a futex nobody wakes) is in neither a run queue nor on a CPU:
+    it reaches no dispatch and no preemption, so *neither* arm can see it, and its request stays
+    `KILL_DETACHED` for the boot. Sweeping the wait lists at detach time is the real fix and is
+    deliberately **not** attempted here — the waiters live behind `Semaphore`'s and `FutexBucket`'s own raw
+    spinlocks, and reaching into them from an arbitrary requester context would invert the lock order the
+    park-side handoff depends on (`Semaphore::wait` pushes the Box *while holding* that lock). That is a
+    wait-queue-ownership change, not a scheduler-kill change, and belongs to its own arc. The same is true
+    of a task that reaches no boundary at all (the QEMU case; on metal the quantum tick always arrives).
+    Both are bounded and **visible**: the table is four entries, every other path returns its slot, and the
+    resulting exhaustion is witnessed rather than silent.
   - **QEMU proves both arms; only the timer *trigger* is metal-only.** The new `:: SKILL-1: async kill …
     :: PASS ::` witness runs cooperatively on the boot core (before `SCHED_ACTIVE`, self-contained and
     bounded, like the `prio_mix`/`load_accounting` witnesses beside it) and drives `dispatch_next` by hand,
     so every step is observed rather than raced: an immortal victim is shown **running**, then killed and
     shown **frozen** (never dispatched again — the actual claim, not merely "eventually stopped"), the
     request confirms in **one pass**, the queue drains; a second victim arms its own kill *while running*
-    and is retired by `kill_check_current`; both tickets release, the slot pool returns clean, and a fresh
-    task then spawns, runs and exits. What QEMU raspi4b **cannot** show is the timer-driven trigger: it
+    and is retired by `kill_check_current`; a third leg drives the **detach-vs-settle interleave** (arm,
+    detach while the victim is still off-CPU and un-reaped, *then* let the retirement land) and asserts the
+    slot comes back `KILL_FREE` — the exact ordering that stranded a slot before the CAS settle, and
+    verified to have teeth by a negative control (restoring the load-then-store settle fails that leg, and
+    only that leg: `det_freed=false pool=false`, everything else still true). Both tickets release, the
+    slot pool returns clean, and a fresh task then spawns, runs and exits. What QEMU raspi4b **cannot**
+    show is the timer-driven trigger: it
     delivers no Group-1 timer IRQ, so `timer_preempt` never fires and a genuinely spinning task (no yield,
     no syscall) could not be interrupted there at all — it would wedge the single cooperative core. That
     trigger rides the bench.
