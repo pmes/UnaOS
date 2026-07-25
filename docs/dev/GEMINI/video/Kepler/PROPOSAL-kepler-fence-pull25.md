@@ -1,4 +1,24 @@
-STATUS: PROPOSED
+STATUS: APPROVED (2026-07-25, coordinator GR4) WITH ONE BINDING AMENDMENT.
+
+**AMENDMENT (binding) — IO port number.** The proposal derives the iowr
+target as `0x040 / 4 = 0x10`. That divide-by-4 is an assumption, and the
+Falcon IO-space convention in the nouveau/envytools fuc sources is a BYTE
+offset matching the host MMIO offset (`iowr I[$r1]` with $r1 = 0x40 for a
+register at base+0x040). Use **0x40**, not 0x10:
+  `mov $r1, 0x40`  (I8 immediate, same encoding form)
+and re-emit the annotated listing + packed words for that change (only
+the first instruction's immediate byte changes).
+Also print the immediate you used in a marker so the boot is
+self-documenting: `:: kepler: ucode ioport=0x40 ::`.
+If MAILBOX0 stays unchanged on metal while cpuctl shows a clean halt, the
+next pull tries the /4 variant (0x10) as a single-variable follow-up —
+do NOT write both ports in one program; one variable per boot.
+
+Everything else as proposed: word packing verified self-consistent
+(f0 17 10 / f1 27 ce fa / f1 23 0d f0 / d0 12 00 / f8 02 → LE u32s
+f11017f0, f1face27, d0f00d23, 02f80012 — the byte stream and the const
+array agree), FECS only, readback-verify gates execution, honest null on
+failure, no retries.
 
 # PROPOSAL: kepler-fence pull 25 - K-GPU-4 Milestone 2 (First Ucode)
 

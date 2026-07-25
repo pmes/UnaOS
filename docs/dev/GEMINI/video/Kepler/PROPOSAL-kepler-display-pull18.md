@@ -1,4 +1,6 @@
-STATUS: PROPOSED
+STATUS: APPROVED (2026-07-25, coordinator GR4). No amendments — the
+barcode pattern plus the post-latch reg dump discriminates all three
+hypotheses, and the falsification table is exactly what was asked for.
 
 # Proposal — kepler-display pull 18: placement-model probe
 
