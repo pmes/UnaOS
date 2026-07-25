@@ -714,8 +714,9 @@ Which path carries it is the whole substance of the fix. `handle_key` sets `SCRE
 `dispatch_command`, and `run_user_image` parks the shell task for the entire EL0 run — so while apps are
 live *and* focus is at the shell, both the `SCREEN_APP_ACTIVE` branch and the shell drain are in play,
 and the former returns first. The interception therefore sits inside that branch's existing
-peek/requeue scan: a consumed TAB is simply not requeued, and the rest of the buffer is dropped rather
-than forwarded. It must not be sent onward — `render_service` is blocked inside the same
+peek/requeue scan: a consumed TAB is simply not requeued, and on a real focus cycle the rest of the
+buffer is dropped rather than forwarded (a swallowed release edge keeps the buffer — it is requeued and
+the scan continues). It must not be sent onward — `render_service` is blocked inside the same
 `dispatch_command`, so pushing into the 64-slot `GUI_CHANNEL` would saturate it and block the pump task,
 exactly what that branch exists to prevent. Dropping the buffer is not a new policy either: it is what
 `el0_input_set_active` would have done to those same events itself, since it drains `pal::EVENT_QUEUE`
