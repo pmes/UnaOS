@@ -3,6 +3,36 @@
 Hard-won silicon facts from the fox-metal sitting series. Trust these over any
 QEMU behavior. Newest sitting first.
 
+## Sitting #26 (display pull 16 + fence pull 23, UnaOS-gemini@5e962ee1, 2026-07-25, fox-metal-r23s1m, s26boot1)
+
+**Display — ⭐⭐ MAPPING SOLVED: LINEAR, PITCH 0x4000, CONFIRMED ON PANEL.**
+Peter's hold photo of the single lin-step cycle: ZERO seams, SOLID white
+left column, clean unbroken 64-row color bands with crisp black
+separators. The s25 mirror decode was the truth; block-linear is retired
+for good. Remaining variable — the LAST one: vertical placement. One
+band-cycle's worth of rows (~450–512) displays at the bottom ~quarter of
+the panel; horizontal mapping is perfect, so the scan start sits a fixed
+row offset from our surface pointer (the old s18 "early rows → bottom
+band" mystery, now linearly measurable). Pull 17 = row-offset
+calibration: distinctive single white marker rows at known indices on
+black; photo names the offset; then adjust the pointer/fill and the full
+panel is ours. (Fox mid-boot worry about lin-step ordering: resolved —
+the display leg fired later in the boot; no gate issue.)
+
+**Fence — ⭐ THE FALCONS ARE FOUND: FECS 0x409000 + GPCCS 0x41A000 both
+REAL.** Verdict lines: cpuctl=00000010 at BOTH bases, imemc/dmemc =
+00000000 true zeros — first non-poison Falcon reads of the campaign
+(cpuctl 0x10 = a real state bit, likely HALTED). The spec's 0x400180 base
+is formally dead; spec doc correction stands. Pull 24 = sentinel port
+probe at the REAL bases (IMEMC/DMEMC +0x180/+0x1C0 with AINCW/AINCR
+discipline), zero execution — sentinels back opens the ucode road at
+last. Witness baseline unchanged (err=2, stat=5), as expected.
+
+Boot from Fox rebuild of tip 5e962ee1 (coordinator ESP was clobbered;
+same 8-knob line; kernel sha 28a9ec13…). Capture: rmbp-s18/, mark
+s26boot1 (awk-verify at sitting close). Flash staged
+s26boot1-lin16k-falbase-20260725T1540Z-5e962ee1.
+
 ## Sitting #25 (display pull 15 recon + fence pull 22, UnaOS-gemini@e9d20bd2/30a6a8dd, 2026-07-25, fox-metal-r23s1l, s25boot1, serial-only)
 
 **Display — ⭐ THE MIRROR TALKED: FW SURFACE IS LINEAR, PITCH 0x4000.**
