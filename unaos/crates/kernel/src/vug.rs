@@ -218,12 +218,12 @@ const MAX_METER_CPUS: usize = 16;
 
 /// Fixed segment count of every CPU pulse bar (UI1-M2, Peter's sketch): filled ∝ load, and the
 /// EMPTY segments draw dim — an idle core reads alive-but-empty, never blank.
-const PULSE_SEGS: usize = 10;
+pub(crate) const PULSE_SEGS: usize = 10;
 
 // Meter palette (shared by the vug corner meters and the `pulse` full-screen monitor).
 const METER_DIM: u32 = 0x00_2A2432;
 const METER_LILAC: u32 = 0x00_B36BFF;
-const METER_PURPLE: u32 = 0x00_9B59B6;
+pub(crate) const METER_PURPLE: u32 = 0x00_9B59B6;
 const METER_LABEL: u32 = 0x00_8A8296;
 /// PULSE-ALIVE breath colour — clearly brighter than `METER_DIM`, dimmer than a load fill: the one
 /// sweeping segment an idle-but-scheduled core lights so "alive and idle" reads at a glance.
@@ -236,7 +236,7 @@ const METER_PARKED: u32 = 0x00_3A3550;
 /// never-scheduled: the display must not fabricate load for it. `load[c] == PARKED` selects a distinct
 /// DASHED bar (see [`draw_pulse_bar`]) — visually separable from an idle 0% bar (a solid dim track) so
 /// "idle" and "never woken" never read alike, and `run_pulse` prints `park` instead of a percent.
-const PARKED: u32 = u32::MAX;
+pub(crate) const PARKED: u32 = u32::MAX;
 
 /// VUG-HONESTY — the pure per-core display decision. Given one core's per-window busy/idle tick deltas
 /// (`db`/`di`), whether it is the *demo core* (the core executing this render loop), and that loop's own
@@ -252,7 +252,7 @@ const PARKED: u32 = u32::MAX;
 ///                      samples per-window deltas: a parked EL2 secondary gets no periodic wake, so its
 ///                      counters are frozen between windows and this fallback still fabricated.) Report
 ///                      PARKED instead.
-fn classify_load(db: u64, di: u64, is_demo: bool, own_load: u32) -> u32 {
+pub(crate) fn classify_load(db: u64, di: u64, is_demo: bool, own_load: u32) -> u32 {
     if db + di > 0 {
         ((db * 100) / (db + di)) as u32
     } else if is_demo {
@@ -355,10 +355,11 @@ impl CpuPulse {
 
 /// UI1-M2 — one segmented pulse bar: `PULSE_SEGS` fixed segments at `(x, y)`, filled ∝ `load`
 /// (rounded; any nonzero load lights at least one), the rest drawn `METER_DIM` so an idle bar
-/// reads alive-but-empty. `seg_w`/`seg_h`/`gap` come from the caller's metrics (the corner meter
-/// and the full-screen `pulse` reuse this at two sizes). Returns the x just past the bar.
-fn draw_pulse_bar(
-    pal: &mut TargetPal,
+/// reads alive-but-empty. `seg_w`/`seg_h`/`gap` come from the caller's metrics (the corner meter, the
+/// full-screen `pulse` and — PULSE-STRIP — the bottom status strip reuse this at three sizes, which is
+/// why it is generic over the PAL rather than tied to `TargetPal`). Returns the x just past the bar.
+pub(crate) fn draw_pulse_bar<P: crate::pal::GneissPal>(
+    pal: &mut P,
     x: usize,
     y: usize,
     seg_w: usize,

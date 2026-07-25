@@ -539,3 +539,28 @@ FORBID \[wc-k\] .*contig=no
 FORBID \[wc-k\] .*-> SPLIT
 FORBID \[wc-k\] .*-> AT-RISK
 FORBID \[wc-k\] .*-> UNSTAGED
+# --- PULSE-STRIP: the always-running per-core CPU pulse, docked in the PI-UI-2 bottom status strip.
+# ---    EXTENDS that strip rather than adding a second bottom band or a windowed app: the band is
+# ---    already the panel's bottom chrome and already refreshes at 1 Hz on the render task, so the
+# ---    pulse costs no thread (KILLBOUND bounds the table at 8), no window (nothing focusable, nothing
+# ---    killable, nothing in the z-order) and -- this is the point of the second directive -- no extra
+# ---    present. WC-I occlusion is inherited unchanged: the strip draws into the `Screen` back buffer
+# ---    and `present_background` subtracts `wm::occluders()` from every damaged row, so a bar has
+# ---    never been written under a window.
+# ---
+# ---    The `armed` line is the creation geometry, and it is the one thing a replay can check about
+# ---    the LOOK of a strip nobody can see headless: the band's origin and size, the bars' right-
+# ---    aligned x and total width, and the per-segment metrics -- all derived from `ui::Metrics`, so
+# ---    the line changes with the panel and a hard-coded pixel would show up here as a constant.
+REQUIRE \[pstrip\] armed cores=[0-9]+ band=\(0,[0-9]+,[0-9]+x[0-9]+\) bars=\(x=[0-9]+,w=[0-9]+\)
+# ---    The rollup is the DIRTY-PACING assertion. `samples` counts meter reads (one a second);
+# ---    `redraws` counts frames actually drawn and presented. They are deliberately different
+# ---    numbers: a second in which no core's load moved a bar segment and the text line did not
+# ---    change draws nothing at all. Requiring a rollup whose `skipped=` is non-zero pins that the
+# ---    always-running pulse is genuinely paced and not a 1 Hz repaint wearing a flag.
+REQUIRE \[pstrip\] rollup samples=[0-9]+ redraws=[0-9]+ skipped=[1-9]
+# ---    The busy-loop FORBID. The rate is printed in tenths precisely so this can bite: anything at
+# ---    or above 5.0 presents/s sustained over a rollup window is the strip having become a spinner
+# ---    on the render core -- the SCHED-6 regression, re-entered through the pulse. 4.x and below is
+# ---    left legal so a genuinely churning machine is not called a bug.
+FORBID \[pstrip\] rollup .*rate=([5-9]|[1-9][0-9]+)\.[0-9]/s

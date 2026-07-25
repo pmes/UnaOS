@@ -197,6 +197,97 @@ Serial evidence on entry/exit (headless-gate visible when scripted):
 :: PULSE: exit clean — N frames ::
 ```
 
+## 4c. PULSE-STRIP — the always-running pulse in the bottom status strip
+
+Peter's ask was "an always running pulse in a strip window/app at the bottom".
+It is answered by **extending the PI-UI-2 status strip** (`ui_status.rs`), not by
+adding a second bottom band and not by adding a windowed app.
+
+**Why extend, not add.** The panel already has exactly one piece of bottom
+chrome: the PI-UI-2 strip — one `line_h` band pinned to the last row-pitch,
+already always-on, already refreshed at ~1 Hz, already drawn by the render task
+*after* the console so it sits on top, and already the console's bottom-row
+neighbour (the console layout, the `click1_hit_test` regions and the compositor's
+view of the band are all written against it). A second band would either fight
+that one for the same rows or push the console up a line. A window would be
+worse: a window is focusable, is in the z-order, is killable, and costs a task in
+a thread table KILLBOUND has just bounded at `NTHREAD=8` — which is precisely the
+list of things the ask says the pulse must *not* be. Extending the strip gives an
+always-visible, never-focusable, unkillable pulse for **zero new threads, zero new
+windows and zero new presents**.
+
+**Geometry** — all from `ui::Metrics` (§0), so it tracks the panel:
+
+| quantity | derivation |
+| --- | --- |
+| band | `(0, height − line_h, width, line_h)` — unchanged, the strip's own band |
+| segment | `seg_w = max(cell_w/3, 2)`, `seg_h = max(cell_h/2, 3)`, `gap = max(scale,1)` |
+| bar | `PULSE_SEGS · (seg_w + gap)`, one per core, `cell_w` of air between cores |
+| bars origin | right-aligned: `x = width − margin − total_w`, vertically centred in the band |
+
+Measured on the gate's 1920×1200 surface: `band=(0,1188,1920x12)`,
+`bars=(x=1764,w=144)`, `bar=30x4`, `seg=2x4`, `gap=1` — 4 cores. The bars are
+skipped entirely for a frame if the panel is too narrow to seat them one cell
+clear of the host/ip/clock text, so a 640×480 surface with a seeded clock degrades
+to the pre-arc strip rather than overprinting it.
+
+**Data path.** The same per-core busy/idle counters `pulse` and `top` read:
+`sched::meter_cpu_count` / `meter_cpu_ticks` / `meter_current_cpu`, classified by
+vug's `classify_load` (VUG-HONESTY, §4) and drawn by vug's `draw_pulse_bar` —
+which this arc made generic over `GneissPal` so the strip and the full-screen
+monitor share one widget and one palette. Lock-free relaxed loads, never on a
+scheduler path. `own_load` is passed as `0`: the strip is drawn by a *scheduled*
+task, so its core's counters tick like any other's and the demo-core fallback
+cannot fire; feeding it a render load would fabricate exactly what VUG-HONESTY
+closed.
+
+**Coexistence.** Focus is untouched — nothing here is a view, so nothing here can
+take TAB or steal a click. WC-I occlusion is inherited rather than re-implemented:
+the strip draws into the `Screen` back buffer, and `Screen::present_background`
+subtracts `wm::occluders()` from every damaged row, so a bar has never been a
+pixel under a window and still is not.
+
+**Dirty pacing.** `ui_status` now has two entry points, and the split *is* the
+pacing:
+
+* `draw()` — unconditional, from cached loads. Taken on Key/Button, where the
+  console has just repainted over the band and the strip owes a redraw on top
+  regardless. No resample, so a keystroke storm cannot become a telemetry storm.
+* `tick()` — the paced path, taken on the 1 Hz `Event::Timer`. Samples at most
+  once per `PSTRIP_PERIOD_MS`, then redraws **only if** the composed text line or a
+  per-core load *quantized to a bar segment* changed, and returns whether it drew.
+  The render loop presents only on `true`.
+
+Quantizing to the segment is what makes "unchanged" mean "identical frame" rather
+than "identical number"; `PARKED` gets its own bucket so a park↔idle transition is
+never quantized away.
+
+**The 1 Hz pulse itself** is `status_tick` on metal. That task is timer-gated and
+is *not* spawned under QEMU raspi4b (no Group-1 IRQ), which before this arc meant
+the strip only ever refreshed on a keystroke there — an always-running pulse would
+have been a frozen picture under the gate. The input service's QEMU poll-nap
+branch now carries the same 1 Hz post itself (a wall-clock compare per cooperative
+pass, gated on `SCREEN_APP_ACTIVE` exactly as `status_tick` is), so the cadence is
+real on both paths and still costs no task.
+
+**Serial evidence** (`[pstrip]`), and the gate directives in
+`scripts/specs/pi4-regression.spec`:
+
+```
+[pstrip] armed cores=4 band=(0,1188,1920x12) bars=(x=1764,w=144) bar=30x4 seg=2x4 gap=1 period=1000ms
+[pstrip] rollup samples=10 redraws=1 skipped=9 rate=0.1/s period=1000ms
+```
+
+The `armed` line is the creation geometry — the only checkable statement about how
+a strip nobody can see headless actually *looks*, and the place a hard-coded pixel
+would show up as a constant. The rollup is the pacing assertion: `samples` counts
+meter reads, `redraws` counts frames actually drawn and presented, and the spec
+REQUIREs a rollup with a non-zero `skipped=` — a second in which nothing moved a
+bar segment draws nothing at all. The rate is printed in **tenths** so the FORBID
+can bite: `rate=` at or above `5.0/s` sustained is the strip having become a
+spinner on the render core, i.e. the SCHED-6 regression re-entered through the
+pulse. Visual verdict is the bench's.
+
 ## 5. Serial evidence
 
 `run_crystal` emits, when invoked:

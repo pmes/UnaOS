@@ -2815,9 +2815,26 @@ fn input_service(_: usize) {
     } else {
         // Poll-nap fallback (QEMU raspi4b: the RX ISR never fires). Cooperative — the AP's run() keeps
         // re-dispatching us; sleep_ticks would park forever with no timer IRQ to wake it.
+        //
+        // PULSE-STRIP: this branch also carries the strip's 1 Hz refresh pulse. On metal that pulse is
+        // the `status-tick` task, which is timer-gated and therefore NOT spawned here — so before this
+        // arc the status strip only ever refreshed in QEMU when a key arrived, and an always-running
+        // pulse would have been a frozen picture under the gate. Riding the existing poll-nap costs no
+        // task (KILLBOUND bounds the table at 8) and no timer: a wall-clock compare per cooperative
+        // pass. Gated on SCREEN_APP_ACTIVE for the same reason `status_tick` is — while a full-screen
+        // app owns the panel the render task is blocked inside dispatch_command and cannot drain
+        // GUI_CHANNEL, so an ungated 1 Hz post would slowly fill the 64-slot channel.
+        let mut strip_pulse_ms = unaos_kernel::arch::ms();
         loop {
             while let Some(byte) = unaos_kernel::arch::poll_input() {
                 gui_send(unaos_kernel::pal::Event::Key(byte));
+            }
+            let now = unaos_kernel::arch::ms();
+            if now.wrapping_sub(strip_pulse_ms) >= unaos_kernel::ui_status::PSTRIP_PERIOD_MS {
+                strip_pulse_ms = now;
+                if !SCREEN_APP_ACTIVE.load(Ordering::Relaxed) {
+                    gui_send(unaos_kernel::pal::Event::Timer);
+                }
             }
             // PIUSB-23: pump xHCI + bridge decoded HID keys into GUI_CHANNEL each cooperative pass
             // (QEMU raspi4b delivers no USB HID, so this is a cheap no-op there; on metal it consumes
@@ -3000,7 +3017,13 @@ fn render_service(_: usize) {
         // `dirty` — did this pass draw anything that must be presented? `strip_dirty` — must the
         // status strip be (re)composed on top this pass?
         let mut dirty = false;
+        // PULSE-STRIP: the strip has two redraw reasons and they are NOT the same reason.
+        // `strip_force` — something repainted the band underneath it (a console redraw on Key, a view
+        // redraw on Button); the strip owes an unconditional redraw on top, from cached loads.
+        // `strip_tick`  — the 1 Hz refresh pulse; sample the meters and redraw ONLY if the composed
+        // line or a quantized per-core load changed. This is the dirty-pacing split.
         let mut strip_dirty = false;
+        let mut strip_tick = false;
         match ev {
             unaos_kernel::pal::Event::Key(c) => {
                 handle_key(c, &mut console, &mut pal);
@@ -3051,7 +3074,7 @@ fn render_service(_: usize) {
             // Timer (the 1 Hz status-tick pulse) is the strip's own refresh cadence: recompose it so
             // the clock/lease advance even with no input. Other events carry nothing to draw.
             unaos_kernel::pal::Event::Timer => {
-                strip_dirty = true;
+                strip_tick = true;
             }
             _ => {}
         }
@@ -3064,10 +3087,15 @@ fn render_service(_: usize) {
             unaos_kernel::video::cursor::undraw();
         }
         cursor_was_visible = cursor_vis;
-        // Recompose the strip only when it can have changed (Timer) or was overdrawn (Key/Button).
+        // Recompose the strip only when it was overdrawn (Key/Button) — unconditional, cached loads.
         if strip_dirty {
             unaos_kernel::ui_status::draw(&mut pal);
             dirty = true;
+        } else if strip_tick {
+            // PULSE-STRIP: the paced path. `tick` samples the per-core meters at most once a second
+            // and returns whether it actually drew; an unchanged strip on an unchanged panel adds no
+            // present at all, which is what keeps the always-running pulse off the render core's back.
+            dirty |= unaos_kernel::ui_status::tick(&mut pal);
         }
         // Present at most once per pass, and only when something was actually drawn — a no-op report
         // costs a bounded match + a couple of cycle reads, not a composite.
