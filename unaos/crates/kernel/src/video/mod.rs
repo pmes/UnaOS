@@ -43,6 +43,12 @@ pub mod cursor;
 // VWIT: headless regression witness for the damage-tracked `Screen` present path (arch-neutral;
 // runs only when the `tste` self-test is invoked). See `docs/dev/OS/08_VIDEO/engine.md` §7.
 pub mod witness;
+// WC-F: the scan-out ground-truth probe — the live FrameBuffer checked against the firmware's own
+// geometry, plus a twin-pattern render (compositor addressing vs firmware-pitch addressing) that
+// discriminates a blit-path defect from a scan-out one. `witness`-gated AND aarch64-only, so the
+// flashable Pi media and every x86 artifact are byte-identical with it absent.
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+pub mod wcf;
 // VPERF instrumentation (counters, fbmem readout, PCI display probe, scripted scroll scenario).
 // x86-only AND knob-gated: with the feature off — or on aarch64 regardless — nothing here
 // compiles, so those artifacts stay byte-identical.

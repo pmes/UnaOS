@@ -257,3 +257,23 @@ FORBID BGRUN-ST: .*-> FAIL
 # ---    See docs/dev/OS/08_VIDEO/engine.md §WC-E.
 REQUIRE \[wc-e\] fb-geometry .*row_ok=true fit_ok=true
 FORBID \[wc-e\] fb-geometry query FAILED
+#
+# --- 6. WC-F: the INDEPENDENT read. WC-E states the firmware's geometry; nothing checked it against
+# ---    the `FrameBuffer` the compositor actually addresses through, which is a separate object and
+# ---    can diverge in base, mapped length or stride with no witness able to see it. `[wc-f] scanout`
+# ---    puts the live handle beside the firmware's record and names each identity — `base_match`
+# ---    (we store into the buffer the firmware allocated), `rowbytes_match` (`stride * bpp` equals
+# ---    the pitch the HVS steps by — the row-phase identity a garble breaks), `pitch_match` (the
+# ---    allocation pitch survives an independent re-query), `panel_match`, `fits`.
+# ---    `[wc-f] twin` renders one known pattern TWICE at the bench's 4x upscale — left through
+# ---    `put_pixel`/`info.stride` (the compositor's addressing), right through raw stores at the
+# ---    FIRMWARE pitch — and cross-reads each block through the other path. `comp_bad`/`direct_bad`
+# ---    are the two addressings disagreeing, as a count; on the bench panel the same probe reads as
+# ---    a photo (left garbled + right clean ⇒ blit path; both garbled ⇒ HVS/pitch).
+# ---    Both lines exist under the `witness` feature only. See docs/dev/OS/08_VIDEO/engine.md §WC-F.
+REQUIRE \[wc-f\] scanout .*-> PASS
+FORBID \[wc-f\] scanout .*-> FAIL
+FORBID \[wc-f\] scanout -> SKIP
+REQUIRE \[wc-f\] twin .*-> PASS
+FORBID \[wc-f\] twin .*-> FAIL
+FORBID \[wc-f\] twin -> SKIP

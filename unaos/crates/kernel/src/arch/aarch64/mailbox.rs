@@ -623,6 +623,107 @@ fn witness_fb_geometry(base: u64, size: u32, pitch: u32, req_w: u32, req_h: u32)
         pitch, base, size, base & 0xFFF,
         row_ok, fit_ok
     );
+
+    // WC-F — record the firmware's answers, and add the one field WC-E never asked for: a pitch read
+    // back in a TRANSACTION OF ITS OWN. Every pitch on the line above descends from the allocation
+    // reply; a firmware that reported one pitch while programming the HVS with another would be
+    // self-consistent there and wrong on the panel. This second `GET_PITCH` is the cheapest possible
+    // independent read of the same number. Recording (rather than only printing) is what lets the
+    // compositor-side witness compare the LIVE `FrameBuffer` — the object the blit path actually
+    // addresses through — against the display pipe, which nothing in WC-D/WC-E ever did.
+    #[cfg(feature = "witness")]
+    {
+        let get_pitch = query_pitch();
+        // SAFETY: single-core boot, before SMP/interrupts (same discipline as `MBOX` itself).
+        unsafe {
+            core::ptr::write_volatile(
+                &raw mut SCANOUT,
+                ScanoutTruth {
+                    valid: true,
+                    alloc_base: base,
+                    alloc_size: size,
+                    alloc_pitch: pitch,
+                    get_pitch,
+                    phys_w, phys_h, virt_w, virt_h, off_x, off_y,
+                    depth, order, alpha,
+                },
+            );
+        }
+    }
+}
+
+/// WC-F — the firmware's scan-out geometry, captured once at framebuffer bring-up.
+///
+/// Why a record and not just a log line: WC-E prints these numbers, and a human comparing them to the
+/// compositor's numbers by eye is not a gate. The `FrameBuffer` the blit path addresses through is
+/// built from the allocation reply and then lives on its own — its `base`, `len` and `stride` could
+/// each drift from what the HVS scans (a remap, a clamp, a rounding) with nothing in WC-D or WC-E able
+/// to notice, because both of those read through the very numbers under suspicion. Holding the
+/// firmware's answers lets `video::wcf` put the two side by side on one line.
+#[cfg(feature = "witness")]
+#[derive(Clone, Copy)]
+pub struct ScanoutTruth {
+    /// False when the framebuffer never came up (or its geometry query failed): consumers must skip.
+    pub valid: bool,
+    /// ARM-physical base from the allocation reply (bus alias already masked off).
+    pub alloc_base: u64,
+    pub alloc_size: u32,
+    /// Pitch as reported alongside the allocation.
+    pub alloc_pitch: u32,
+    /// Pitch re-read in a separate, query-only transaction. Must equal `alloc_pitch`.
+    pub get_pitch: u32,
+    pub phys_w: u32,
+    pub phys_h: u32,
+    pub virt_w: u32,
+    pub virt_h: u32,
+    pub off_x: u32,
+    pub off_y: u32,
+    pub depth: u32,
+    pub order: u32,
+    pub alpha: u32,
+}
+
+#[cfg(feature = "witness")]
+static mut SCANOUT: ScanoutTruth = ScanoutTruth {
+    valid: false,
+    alloc_base: 0,
+    alloc_size: 0,
+    alloc_pitch: 0,
+    get_pitch: 0,
+    phys_w: 0,
+    phys_h: 0,
+    virt_w: 0,
+    virt_h: 0,
+    off_x: 0,
+    off_y: 0,
+    depth: 0,
+    order: 0,
+    alpha: 0,
+};
+
+/// WC-F — the recorded scan-out truth. `valid == false` means "never captured"; callers must not
+/// invent a verdict from the zeroes.
+#[cfg(feature = "witness")]
+pub fn scanout_truth() -> ScanoutTruth {
+    // SAFETY: written once during single-core boot, read-only afterwards.
+    unsafe { core::ptr::read_volatile(&raw const SCANOUT) }
+}
+
+/// WC-F — pitch, asked on its own. Returns 0 if the query fails, which reads as a mismatch rather
+/// than as agreement: a diagnostic must fail loud, never silently agree with the thing it checks.
+#[cfg(feature = "witness")]
+fn query_pitch() -> u32 {
+    request(0, 7 * 4);
+    request(1, 0);
+    request(2, TAG_GET_PITCH);
+    request(3, 4);
+    request(4, 0);
+    request(5, 0);
+    request(6, TAG_END);
+    if !mbox_call(7) {
+        return 0;
+    }
+    reply(5)
 }
 
 /// Bring up the VideoCore framebuffer: pick a resolution (the firmware's current mode if sane,

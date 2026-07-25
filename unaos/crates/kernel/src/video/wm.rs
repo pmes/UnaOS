@@ -795,6 +795,12 @@ fn composite_inner() {
             }
         }
     }
+    // WC-F — the scan-out ground-truth probe, at the TAIL of the pass so its twin blocks are the last
+    // thing written and no compositor writer can erase them mid-frame. Repainted every pass (the
+    // panel must still carry them when the bench operator photographs it); prints once. See
+    // `video::wcf` and docs/dev/OS/08_VIDEO/engine.md §WC-F.
+    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    super::wcf::run(&fb);
     let _ = drawn;
 }
 
