@@ -2392,7 +2392,10 @@ fn pump_usb_into_gui() {
         // run: `run_user_image` parks the shell task in its wait loop until the program returns. So with
         // apps live and focus TAB'd out to the shell, BOTH flags were live, this branch returned first,
         // and the TAB was requeued forever — the exit stayed one-way. (The complement, focus 0 with
-        // SCREEN_APP_ACTIVE clear, cannot hold two ring entries at all: a live app implies a parked shell.)
+        // SCREEN_APP_ACTIVE clear, could not hold two ring entries BEFORE BGRUN-1: a live app implied a
+        // parked shell. BGRUN-1 falsifies that — `bg` apps live across the prompt, so focus 0 + flag
+        // clear + a full ring is now the NORMAL state; it is handled because this drain calls
+        // `wc_shell_focus_key` too, not because the state cannot arise.)
         //
         // It has to be done HERE and not by forwarding the remainder onward: `render_service` is blocked
         // inside the same `dispatch_command`, so anything pushed into the 64-slot GUI_CHANNEL would sit

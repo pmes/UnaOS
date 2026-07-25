@@ -7055,8 +7055,12 @@ pub fn run_user_image(
 //     exactly as the foreground path does. There is no focus to restore on exit either: the slot
 //     teardown's `clear_handle_row` clears the designation iff the dying app held it.
 //   * NO deadline / UVUG-8 machinery — nothing is waiting, so there is nothing to strand. A hung bg
-//     app is the operator's to `kill <pid>` (the SKILL-1 primitive), and a windowed one is still
-//     bounded by the compositor's own 60 s no-render cap.
+//     app is the operator's to `kill <pid>` (the SKILL-1 primitive) — and that is the ONLY bound.
+//     LENS CORRECTION (round 1): the first cut claimed a windowed bg app was "still bounded by the
+//     compositor's 60 s no-render cap"; no such compositor cap exists (the 60 s constant is
+//     TAKEOVER_SUSPEND_MAX_SECS, read inside run_user_image's wait loop — the loop bg deliberately
+//     does not have). Nothing bounds a bg app; `kill` is the whole remedy, which is why the focus
+//     ring guard below it must never weld the operator away from the shell.
 //   * The Proc row stays claimed after exit (PEXITED, `done` posted) until `bg_poll(reap=true)`
 //     consumes it — the `jobs` verb is the reaper. Rows are a bounded resource (MAX_PROCS), which
 //     is honest: a shell that never runs `jobs` eventually gets "process table full", not silent loss.
@@ -7160,8 +7164,15 @@ pub fn bg_kill(pid: u64, asid: u64) -> &'static str {
     let Some(pi) = row else {
         return "no such job (already reaped?)";
     };
-    if PROCS[pi].state.load(Ordering::Acquire) == PEXITED {
-        return "already exited — run `jobs` to reap it";
+    match PROCS[pi].state.load(Ordering::Acquire) {
+        PEXITED => return "already exited — run `jobs` to reap it",
+        // LENS MUST-FIX (round 1): a second `kill` on an already-parked row must NOT reach
+        // `proc_orphan` below — its PRUNNING->PORPHANED CAS would fail, taking the "died in the race
+        // window" branch, whose `done.wait()` has NO permit for a still-alive orphan: the shell task
+        // parks forever and the console dies. `proc_orphan`'s contract is "the caller just observed
+        // PRUNNING"; honour it here instead of assuming it.
+        PORPHANED => return "already killed — row parked PORPHANED; it settles at the task's next boundary",
+        _ => {}
     }
     let Some(ticket) = super::sched::kill(pid, asid) else {
         return "kill slot table exhausted (see [skill])";
@@ -7190,13 +7201,25 @@ pub fn bg_kill(pid: u64, asid: u64) -> &'static str {
     }
     if ok {
         super::sched::kill_release(ticket);
-        serial_println!("[skill] killed pid={} asid={} confirmed=1 row=bg", pid, asid);
-        "killed — run `jobs` to reap the row"
+        // LENS MUST-FIX (round 1): a CONFIRMED kill must reap the row HERE, both arms — exactly
+        // `run_user_image`'s confirmed arm. A task killed at the off-CPU dispatch boundary never
+        // reaches SYS_EXIT, so its row stays PRUNNING with a dead task under it; left to `jobs` it
+        // would read as "running" forever and the row (one of only MAX_PROCS) leaks until reboot.
+        // PEXITED (it got a real exit in on the way out) -> consume the posted permit and free;
+        // PRUNNING (dispatch-reap kill) -> no permit outstanding, simply free.
+        if PROCS[pi].state.load(Ordering::Acquire) == PEXITED {
+            let _ = PROCS[pi].done.wait();
+        }
+        proc_free(pi);
+        serial_println!("[skill] killed pid={} asid={} confirmed=1 row=reaped (bg)", pid, asid);
+        "killed — row reaped (`jobs` will drop the entry)"
     } else if already_dead {
         super::sched::kill_retract(ticket);
         "already exited — run `jobs` to reap it"
     } else {
         super::sched::kill_detach(ticket);
+        // Guarded by the PORPHANED early-out above: this row was observed PRUNNING this call, so
+        // `proc_orphan`'s CAS either parks it or reports a genuine race-window death.
         let _ = proc_orphan(pi);
         serial_println!("[skill] killed pid={} asid={} confirmed=0 row=orphaned (bg)", pid, asid);
         "kill armed but unconfirmed — row parked PORPHANED; it settles at the task's next boundary"
@@ -9185,6 +9208,103 @@ fn exec1_witness(_demo_cpu: usize) {
     }
 }
 
+/// BGRUN-ST: the background-run contract, headless. Two legs, each a spec REQUIRE:
+///  1. spawn -> exit -> reap: `bg` ELFHELLO detached, poll (no reap) until `Exited(0)`, then reap and
+///     verify a second poll reads `Gone` — the sole-reaper contract end-to-end with no HID involved.
+///  2. kill mid-run: `bg` UVUG (a real multi-second program), `bg_kill` it, and require the row to be
+///     GONE afterwards — this drives the confirmed-kill arm that must reap in place (round-1 lens
+///     must-fix 2: a dispatch-boundary kill never reaches SYS_EXIT, so a kill that defers to `jobs`
+///     reads "running" forever). Either kill outcome is legal (`confirmed` reaps here; `already exited`
+///     leaves a PEXITED row we then reap by poll) — what the witness REQUIREs is that the row is not
+///     leaked and not lying. An honest skip without the SD/fixtures.
+fn bgrun_witness(_demo_cpu: usize) {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if crate::drivers::block::info().is_none() {
+        serial_println!(":: BGRUN-ST: no SD card found — skipped ::");
+        return;
+    }
+    use crate::fs::vfs::{FatBackend, MountTable, KERNEL_PRINCIPAL};
+    let mut mt = MountTable::new();
+    mt.mount("/fat", alloc::boxed::Box::new(FatBackend::new("fat", KERNEL_PRINCIPAL, true)));
+    let read = |mt: &MountTable, path: &str| -> Option<alloc::vec::Vec<u8>> {
+        let st = mt.stat(path).ok()?;
+        mt.read(path, 0, st.size as usize).ok()
+    };
+    // Leg 1: spawn -> exit -> reap on the three-syscall hello program.
+    let Some(hello) = read(&mt, "/fat/ELFHELLO.ELF") else {
+        serial_println!(":: BGRUN-ST: /fat/ELFHELLO.ELF not found — skipped ::");
+        return;
+    };
+    match spawn_user_image_bg(&hello) {
+        Err(why) => serial_println!(":: BGRUN-ST: spawn rejected ({}) -> FAIL ::", why),
+        Ok((pid, _asid, _entry)) => {
+            let t0 = super::timer::cntpct();
+            let budget = super::timer::cntfrq().saturating_mul(5);
+            let exited = loop {
+                match bg_poll(pid, false) {
+                    BgPoll::Exited(0) => break true,
+                    BgPoll::Exited(_) | BgPoll::Faulted | BgPoll::Gone => break false,
+                    BgPoll::Running => {}
+                }
+                if super::timer::cntpct().wrapping_sub(t0) >= budget {
+                    break false;
+                }
+                super::sched::yield_now();
+            };
+            // Reap (consumes the permit, frees the row), then the row must be gone.
+            let reaped = matches!(bg_poll(pid, true), BgPoll::Exited(0));
+            let gone = matches!(bg_poll(pid, false), BgPoll::Gone);
+            if exited && reaped && gone {
+                serial_println!(":: BGRUN-ST: spawn->exit->reap PASS (pid={}) ::", pid);
+            } else {
+                serial_println!(
+                    ":: BGRUN-ST: spawn->exit->reap exited={} reaped={} gone={} -> FAIL ::",
+                    exited, reaped, gone
+                );
+            }
+        }
+    }
+    // Leg 2: kill mid-run. UVUG runs 300 frames — seconds of runtime, syscalls every frame, so the
+    // kill lands on a live target with abundant boundaries.
+    let Some(uvug) = read(&mt, "/fat/UVUG.ELF") else {
+        serial_println!(":: BGRUN-ST: /fat/UVUG.ELF not found — kill leg skipped ::");
+        return;
+    };
+    match spawn_user_image_bg(&uvug) {
+        Err(why) => serial_println!(":: BGRUN-ST: kill-leg spawn rejected ({}) -> FAIL ::", why),
+        Ok((pid, asid, _entry)) => {
+            let verdict = bg_kill(pid, asid);
+            // Whatever arm the kill took, the contract is: within a bounded window the row is either
+            // already reaped (confirmed arm) or reapable right now (already-exited arm) — never a
+            // leaked PRUNNING row under a dead task, never a permanent "running" lie.
+            let t0 = super::timer::cntpct();
+            let budget = super::timer::cntfrq().saturating_mul(5);
+            let settled = loop {
+                match bg_poll(pid, true) {
+                    BgPoll::Gone => break true,
+                    BgPoll::Exited(_) | BgPoll::Faulted => {} // reaped this pass; next poll reads Gone
+                    BgPoll::Running => {}                     // PORPHANED fallback settles at a boundary
+                }
+                if super::timer::cntpct().wrapping_sub(t0) >= budget {
+                    break false;
+                }
+                super::sched::yield_now();
+            };
+            if settled {
+                serial_println!(":: BGRUN-ST: kill mid-run PASS (pid={}, {}) ::", pid, verdict);
+            } else {
+                serial_println!(
+                    ":: BGRUN-ST: kill mid-run — row never settled ({}) -> FAIL ::",
+                    verdict
+                );
+            }
+        }
+    }
+}
+
 /// UVUG-1 witness: prove the mini-vug EL0 graphics program end-to-end at boot. Reads UVUG.ELF through the
 /// VFS `MountTable` (the same namespace the panel `run` verb builds) and executes it via `run_user_image` —
 /// the identical path the operator drives with `run /fat/UVUG.ELF`. The program maps its off-screen surface
@@ -10458,13 +10578,23 @@ fn wc_focus_key(ev: crate::pal::Event) -> bool {
     };
     let mut ring = [0u64; crate::video::wm::MAX_WINDOWS];
     let n = crate::video::wm::focus_ring(&mut ring);
-    if n < 2 {
-        return false; // nowhere to cycle to — TAB stays an ordinary key
+    let cur = EL0_INPUT_ACTIVE.load(Ordering::Acquire);
+    // BGRUN-1 GUARD REWRITE (supersedes WC-TAB's shared `n < 2`, deliberately). The old guard was
+    // justified when windows could not outlive `run`: a lone window meant a parked shell, so consuming
+    // TAB there could only rebuild the one-way trap. BGRUN-1 makes "focused window + free shell" the
+    // NORMAL state, and under the old guard it was a weld: TAB out of window A requires n >= 2, so the
+    // moment a second window closed (or the focused app closed its own, n == 0) the operator was stuck
+    // in A with the shell — and `kill` — unreachable forever. The rule now keys on where focus IS:
+    //   * at the SHELL (cur == 0): consume TAB only if there is a window to enter (n >= 1). With the
+    //     window side fixed below this is no longer a trap — window -> shell always works.
+    //   * in a WINDOW (cur != 0): ALWAYS consumable — the shell slot is a destination at any n,
+    //     including n == 0 (the focused app closed its own window; fall back to the shell).
+    if cur == 0 && n == 0 {
+        return false; // shell, no windows — TAB stays an ordinary key
     }
     if !down {
         return true; // swallow the release edge of a Tab whose press we consumed
     }
-    let cur = EL0_INPUT_ACTIVE.load(Ordering::Acquire);
     let at = ring[..n].iter().position(|&a| a == cur);
     // The ring has n WINDOW slots plus ONE MORE: slot `n` is the SHELL (`EL0_INPUT_ACTIVE == 0`, no EL0
     // target). Without it the cycle is a closed loop over the live apps and the keyboard can never be
@@ -10472,12 +10602,15 @@ fn wc_focus_key(ev: crate::pal::Event) -> bool {
     // wedge watchdog as the only other way out. That is a trap, not a window manager, so "no app has
     // focus" is a first-class position in the rotation rather than an absence.
     //
-    // Unknown current focus (the focused app owns no window of its own) -> start at the ring's head
-    // rather than refusing; the operator pressed a key and must see something happen.
+    // Unknown current focus (the focused app owns no window of its own, or the ring emptied under it)
+    // -> the ring's head when one exists, else the shell; the operator pressed a key and must see
+    // something happen.
     let next = match at {
         Some(i) if i + 1 == n => 0, // last window -> the shell
         Some(i) => ring[i + 1],
-        None => ring[0],
+        None if n > 0 && cur == 0 => ring[0], // shell -> first window
+        None if n > 0 => ring[0],             // focused app owns no window -> ring head
+        None => 0,                            // no windows at all -> the shell
     };
     if next == cur {
         return true;
@@ -12206,6 +12339,12 @@ pub fn u7_launcher(demo_cpu: usize) {
     // verdict and the UVUG witness have printed, so its presents cannot perturb their counters; its own
     // uncounted `:: EL0: window verbs — … ::` line.
     wcb_launcher(demo_cpu);
+    // BGRUN-ST: the background-run contract, headless — bg spawn -> exit -> reap (ELFHELLO), then a
+    // kill mid-run (UVUG) proving the confirmed-kill arm reaps the row in place. Placed AFTER the UVUG
+    // witness and WC-B (their counters/checksums are already printed, so a partial bg UVUG cannot
+    // perturb them); its own `:: BGRUN-ST: … ::` lines, spec-REQUIREd (the round-1 lens showed the
+    // interactive excuse did not cover the headless-observable core of the contract).
+    bgrun_witness(demo_cpu);
     // K3: the revoke-persist commit-ordering proof — a named-owner file's SYS_FGRANT revoke commits to disk
     // BEFORE the in-RAM removal, so it SURVIVES REBOOT and fails CLOSED on a persist failure. Its own uncounted
     // `:: K3-revoke: … PASS ::` line; fully self-cleaning (leaves no owned row on the metal card).

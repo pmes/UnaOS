@@ -3575,9 +3575,11 @@ struct BgJob {
     nlen: u8,
 }
 
-/// BGRUN-1: the shell's job table. Bounded like every table in this kernel; slot count matches the
-/// EL0 address-space slots (8) — more jobs than slots could never spawn anyway. Shell access is
-/// single-task, but the Mutex keeps the invariant explicit rather than relying on that.
+/// BGRUN-1: the shell's job table. Bounded like every table in this kernel. LENS CORRECTION
+/// (round 1): the binding resource is the Proc table (`MAX_PROCS` = 4), not the 8 EL0 address-space
+/// slots — so the real ceiling is 3 bg jobs alongside one foreground `run`, and this table's
+/// full arm is reachable only if MAX_PROCS grows past it. 8 slots kept (harmless headroom).
+/// Shell access is single-task, but the Mutex keeps the invariant explicit rather than relying on it.
 #[cfg(feature = "baremetal")]
 static BG_JOBS: spin::Mutex<[Option<BgJob>; 8]> = spin::Mutex::new([None; 8]);
 

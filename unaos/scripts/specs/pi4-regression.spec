@@ -235,3 +235,12 @@ REQUIRE \[wc-c\] side-by-side windows=2 drawn=2
 # ---    docs/dev/OS/08_VIDEO/engine.md §WC-D).
 REQUIRE \[wc-d\] verify win=.*bad_cache=0 bad_ram=0.*-> PASS
 FORBID \[wc-d\] verify .*-> FAIL
+
+# --- BGRUN-1: background EL0 runs (bg/jobs/kill). Headless-observable core of the contract,
+# ---   REQUIREd per the round-1 lens: leg 1 proves spawn->exit->reap (the sole-reaper contract);
+# ---   leg 2 proves a killed bg row settles (confirmed-kill reaps in place; no leaked PRUNNING row
+# ---   lying "running" under a dead task). The interactive half (TAB between two bg windows) is
+# ---   bench-only — QEMU has no HID.
+REQUIRE BGRUN-ST: spawn->exit->reap PASS
+REQUIRE BGRUN-ST: kill mid-run PASS
+FORBID BGRUN-ST: .*-> FAIL

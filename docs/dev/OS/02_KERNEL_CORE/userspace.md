@@ -897,14 +897,21 @@
     same mid-publish window here, correctly) — and then RETURNS `(pid, asid, entry)` instead of waiting.
     Deliberate non-inheritances: no `el0_input_set_active` (focus stays put; the operator TABs into a bg
     window, which resets its ring exactly as the foreground path does), and no deadline/UVUG-8 machinery
-    (nothing waits, so nothing can strand; a hung bg app is `kill`able, and a windowed one still meets the
-    compositor's 60 s no-render cap).
+    (nothing waits, so nothing can strand the SHELL; and — stated plainly, lens-corrected — NOTHING bounds
+    a bg app: no deadline, no watchdog, no compositor cap. `kill <pid>` is the sole remedy, which is why
+    the focus-ring guard keys on where focus is (a focused window can ALWAYS TAB out, even at n = 0) —
+    the shell, and therefore `kill`, must be unreachable never.)
   - **`jobs` is the SOLE reaper**: a bg row stays claimed after exit (`PEXITED`, `done` posted) until
     `bg_poll(reap=true)` consumes the permit and frees it — bounded and honest (a shell that never reaps
     eventually reads "process table full", not silent loss). The shell records jobs in a bounded 8-slot
-    table (= the EL0 address-space slot count); a spawn the table cannot record is killed, not leaked.
+    table (8 — headroom over the true ceiling, the Proc table's MAX_PROCS = 4, which binds first: 3 bg
+    jobs alongside one foreground `run`); a spawn the table cannot record is killed, not leaked.
   - **`kill <pid>`** is the SKILL-1 primitive (ASID-scoped so ELF-2 siblings die too), condensed: bounded
-    confirm wait, post-arm already-dead retract, `PORPHANED` fallback with the kill left armed.
+    confirm wait, post-arm already-dead retract, `PORPHANED` fallback with the kill left armed. A
+    CONFIRMED kill reaps the row in place, both arms (a dispatch-boundary kill never reaches SYS_EXIT,
+    so waiting for `jobs` would read "running" forever); a repeat `kill` on a parked row returns early
+    (`proc_orphan`'s PRUNNING precondition is honoured — the round-1 lens showed the alternative parks
+    the shell task forever on a permitless `done.wait`).
   - Witnesses: `:: BGRUN: bg <path> — … DETACHED ::` on spawn, `:: BGRUN: jobs — pid=… reaped ::` on reap.
     No spec REQUIRE: QEMU has no HID to drive an interactive session, and the batch fixtures exercise the
     foreground path; the bench proof is `bg /fat/uvug.elf` twice → TAB between two live crystals.
