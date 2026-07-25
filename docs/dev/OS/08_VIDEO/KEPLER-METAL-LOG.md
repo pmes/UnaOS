@@ -12,8 +12,17 @@ awk-verified:
 :: kdisp: console-repaint rows=4 ::
 ```
 base and pitch are exactly the scanned GOP surface; the repaint replayed
-4 bootlog rows. Panel photo verdict from Peter PENDING — fold it when it
-arrives, not before.
+4 bootlog rows. **PANEL VERDICT (Peter, direct): the console "prints text
+very well" — glyphs legible, text flowing. ⭐⭐ THE DISPLAY LANE
+GRADUATES:** thirteen-plus sittings from first pixel to a working kernel
+console on the rMBP panel — measurement (pull 20) → mapping (s26) →
+ownership (s29) → console (here).
+
+Product finding that rode the photo (Peter, watching the live panel): the
+SMC-BATT witness (~1/s, endless) scrolls on the console forever and reads
+as the machine being stuck. Fine as serial idle chatter; wrong on a user
+surface. Routed as a follow-on work item (default-quiet-boot law: gate
+batteries behind knobs) — SMC lane, not this lane's code.
 
 **⭐ HEARTBEAT BOUND TERMINATION OBSERVED — pull 27's amendment finally
 closes.** mb1 froze at exactly 0x00500000 (the authored iteration bound)
