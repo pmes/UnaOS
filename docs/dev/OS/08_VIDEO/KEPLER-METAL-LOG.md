@@ -3,6 +3,46 @@
 Hard-won silicon facts from the fox-metal sitting series. Trust these over any
 QEMU behavior. Newest sitting first.
 
+## Sitting #34 (fence pull 30 chain probe, UnaOS-gemini@beb7292d, 2026-07-25, fox-metal-r23s1n, s34boot1)
+
+**⭐ 0x409504 (WRCMD_CMD) CONVICTED BY ELIMINATION — ALL FIVE REMAINING
+OFFSETS EXIST AND READ ZERO.** Coordinator awk-verified. The chain, real
+values end to end, control bracket identical both ends (cpuctl=00000010):
+```
+:: kepler: recon CC_SCRATCH[1] (0x804)=00000000 ::
+:: kepler: recon CHAN_CUR (0xB00)=00000000 ::
+:: kepler: recon CHAN_NEXT (0xB04)=00000000 ::
+:: kepler: recon ENGINE_STATUS (0xC00)=00000000 ::
+:: kepler: recon ENGINE_TRIGGER (0xC08)=00000000 ::
+```
+Banked facts: (1) the GK107 FECS host-interface surface is now mapped —
+SIX of the study's seven gf100-era offsets exist and are 0 at rest
+(0x800/0x804/0xb00/0xb04/0xc00/0xc08); exactly ONE, 0x409504 WRCMD_CMD,
+faults-and-poisons, confirmed by elimination. (2) The un-wedge experiment
+remains UNEXERCISED (nothing wedged — the price of the conviction).
+(3) "A context exists" per the study = CHAN_CUR populated + ENGINE_STATUS
+CHAN_VALID; both read 0 — consistent with PFIFO's err=2 refusal:
+NO CONTEXT IS BOUND, and the register surface to change that exists and
+is reachable. (4) Regression exact s33boot2 shape (bound-terminated hb,
+console markers, witness signature unchanged).
+
+Open next (pull 31, proposal-first REQUIRED): the deliberate
+0x409504-then-PRING-clear boot — the promised un-wedge one-liner — and/or
+the first WRITE experiment against the now-proven context surface
+(CHAN_CUR/ENGINE_TRIGGER), each with its own control frame. Specialist
+still owes the PBUS_INTR bits 2+3 decode with citation.
+
+Capture from mark s34boot1. ESP by coordinator (beb7292d…), Fox
+sha-verified, flashed only. Panel: console text as s33boot2.
+
+**PHOTO OF RECORD (Peter, s34):** the kernel console live on the panel —
+`glyphs-active base=90020000 pitch=16384 cell=48x48` as the top line,
+followed by ehci/portsw bootlog replay, the landed trace, PFIFO init,
+beacon plants, pgraph-pulse, and the falcon verdicts, all legible in
+scale-6 grey-on-black. Peter's size verdict: "still looks great albeit
+slightly large" → PANEL_SCALE 6→4 committed (32 px cell, ~3.2 mm, 90×56
+grid); rides the next ESP.
+
 ## Sitting #33 boot 2 (v2 ESP: console-on-panel + pull 29, UnaOS-gemini@4e266472, 2026-07-25, fox-metal-r23s1n, s33boot2)
 
 **CONSOLE MARKERS: SUCCESS FORM, EXACT EXPECTED VALUES.** Coordinator

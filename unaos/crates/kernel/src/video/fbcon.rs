@@ -57,10 +57,10 @@ const CELL_H: usize = 8;
 
 /// PANEL-CONSOLE glyph scale. The 2012 rMBP panel is 2880 px across ~286 mm (~0.1 mm/px), so an
 /// unscaled 8x8 cell is ~0.8 mm — metal (sitting #30) confirmed marks that small are simply not
-/// visible to the naked eye at bench distance. 6x gives a 48x48 px cell (~4.8 mm) with a 0.6 mm
-/// stroke, and still leaves 60 columns x 37 rows on the panel.
+/// visible to the naked eye at bench distance. 4x gives a 32x32 px cell (~3.2 mm) with a 0.4 mm
+/// stroke — 90 columns x 56 rows (metal s34 verdict on 6x: "great, slightly large").
 #[cfg(target_arch = "x86_64")]
-const PANEL_SCALE: usize = 6;
+const PANEL_SCALE: usize = 4;
 
 const FG_DEFAULT: u32 = 0x00C0_C0C0; // light grey text
 const BG_DEFAULT: u32 = 0x0000_0000; // black background
