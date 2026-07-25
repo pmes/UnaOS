@@ -360,3 +360,36 @@ REQUIRE \[wc-g\] rollup win=.* scope=window .*frame_us=.* ->
 FORBID \[wc-g\] .*-> COHER
 FORBID \[wc-g\] .*-> RACE
 FORBID \[wc-g\] .*-> BLIT
+
+# --- WC-H: the fix WC-G's localization called for — the window layer gets a back buffer.
+# ---    WC-G's finding was CLEAN+SLOW: every byte correct at every moment, and the copy still
+# ---    guaranteed to be overtaken by the beam (`us=15524` against `rectscan_us=7111`), because a
+# ---    window's pixels were poked one at a time into the LIVE scan-out with no vblank sync. WC-H
+# ---    composes each window — chrome, title, upscaled content — into a cached-RAM back layer and
+# ---    presents its box as contiguous per-row bulk copies, which is the discipline that has always
+# ---    made the desktop path (`Screen`'s back buffer + damage-rect flush) clean.
+# ---
+# ---    `[wc-h]` splits the operation into the two halves that now have different meanings:
+# ---    `compose_us` — off-screen, no scan-out can observe it — and `present_us`, the row copies,
+# ---    which is the ONLY phase that can still tear. `torn=` compares THAT against the beam's time
+# ---    on the box (`rectscan_us`, computed exactly as WC-G computes it, with the same deliberate
+# ---    bias toward not reporting a tear). The FORBID on `AT-RISK` is the arc's real assertion: it
+# ---    fires if any window's present phase ever outruns the beam again — a regression back to the
+# ---    tearing regime, caught in any window at any point in the boot.
+# ---
+# ---    WHY THE WC-G FORBIDS AND ITS `slow=` LEG ARE UNCHANGED. `[wc-g] us=` brackets the whole of
+# ---    `draw_window`, and WC-H did not change what that bracket means — it changed what the copy
+# ---    DOES. `slow=yes` therefore no longer implies a torn panel: it says the whole operation
+# ---    outran the beam, most of which the beam cannot see. Re-scoping or deleting the leg would
+# ---    have destroyed a checksum instrument that is still the only thing separating a source race
+# ---    from a coherency fault; the tear question moved to `[wc-h] torn=` instead, which is narrower
+# ---    and true. CLEAN+SLOW stays green for the same reason it did under WC-G.
+# ---
+# ---    Per-sample lines are a best-effort trace and can be FEWER than the rollup's `samples=`:
+# ---    there is one pending slot per window id, so two cores compositing the same window
+# ---    concurrently lose one line. The rollup's counters are updated at record time and miss
+# ---    nothing, which is why the tear assertion is pinned on the rollup verdict.
+# ---    Witness-feature only. See docs/dev/OS/08_VIDEO/engine.md §WC-H.
+REQUIRE \[wc-h\] win=.* compose_us=.* present_us=.* torn=.* -> BUFFERED
+REQUIRE \[wc-h\] rollup win=.* scope=window .*maxpresent_us=.* -> TEAR-FREE
+FORBID \[wc-h\] .*-> AT-RISK

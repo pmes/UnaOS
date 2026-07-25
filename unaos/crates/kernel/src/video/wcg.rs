@@ -100,6 +100,14 @@
 //!
 //! WC-G does not fix anything. It says which of the four it is, with a number for each.
 //!
+//! **Read `slow=` with WC-H in mind.** The paragraph above describes the path as WC-G found it, and
+//! that description is now historical: WC-H gave the window layer a back buffer, so `draw_window`
+//! composes off-screen and reaches the panel through contiguous row copies. WC-G's bracket still
+//! contains the copy and nothing else, but the copy is now two phases and only the second is visible
+//! to the scan-out — so `slow=yes` means "the whole operation outran the beam", not "the panel
+//! tore". The tear question lives in [`stage_note`]'s `[wc-h] torn=`, which measures the present
+//! phase alone. The four checksum legs are unaffected and keep their original meanings.
+//!
 //! ## Scope and cost
 //!
 //! `witness`-gated AND aarch64-only, like `wcf`: knob-off this module does not compile and the
@@ -170,6 +178,139 @@ static W_BLIT: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
 static W_CLEAN: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
 static W_SLOW: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
 static W_MAXUS: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+
+// ---- WC-H — the back-layer's own witness -------------------------------------------------------
+
+/// Per-id: `[wc-h]` samples taken, capped at [`SAMPLES`].
+static H_TAKEN: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+/// Per-id: samples whose PRESENT phase alone outran the beam's time on the box.
+static H_TORN: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+/// Per-id: the largest present-phase duration seen, in microseconds.
+static H_MAXPRES: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+/// Per-id: a recorded-but-not-yet-printed sample. See [`stage_flush`] for why the print is deferred.
+static H_PEND: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+static H_BOX: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+static H_BYTES: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+static H_COMPOSE: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+static H_PRESENT: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+static H_RECTSCAN: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+
+/// WC-H — report one staged window composite: how long the off-screen compose took, how long the
+/// row-copy present into the live scan-out took, and whether that present alone is still longer than
+/// the beam's time on the window's box.
+///
+/// ### Why this line exists next to `[wc-g] slow=`
+///
+/// WC-G's `us=` brackets the whole of `draw_window`, and WC-H did not change what that bracket
+/// means: `blit` is still the surface as the copy found it, `after` still as the copy left it, and
+/// the interval still contains the copy and nothing else. What WC-H changed is what the copy DOES —
+/// it is now a compose into cached RAM followed by a present, and only the second half is visible to
+/// the scan-out. So `[wc-g] slow=yes` after WC-H no longer means "the panel will tear": it means
+/// "the whole operation outran the beam", most of which the beam cannot observe. That is why the
+/// `slow` leg is not re-scoped and the WC-G FORBIDs are untouched — the checksum verdicts they guard
+/// are unaffected — and why the tear question moves HERE, to the only phase that can still tear.
+///
+/// `torn=yes` is therefore the honest, narrowed successor to `slow=yes`: the present phase measured
+/// against `rectscan_us`, computed exactly as WC-G computes it (`FRAME_US * rows / panel_height`,
+/// with the same deliberate bias toward NOT reporting a tear — the frame period includes blanking
+/// the beam does not spend on visible rows, so the real scan time of the box is shorter than the
+/// figure it is compared against, and a `torn=no` near the threshold is not a proof of safety).
+///
+/// Budgeted per window id like the rest of this module, and the rollup is scoped to ONE window for
+/// the same reason: nothing observable inside a boot can tell "sampling finished" from "the next app
+/// has not launched yet", so a global summary would be a completeness claim the instrument cannot
+/// support. See [`W_SAMPLES`].
+#[allow(clippy::too_many_arguments)]
+pub fn stage_note(
+    id: u32,
+    bw: usize,
+    bh: usize,
+    bytes: usize,
+    t_end: u64,
+    t0: u64,
+    t1: u64,
+    panel_h: usize,
+) {
+    let i = id as usize;
+    if i >= IDS {
+        return;
+    }
+    let n = H_TAKEN[i].fetch_add(1, Ordering::Relaxed) + 1;
+    if n > SAMPLES {
+        H_TAKEN[i].store(SAMPLES + 1, Ordering::Relaxed);
+        return;
+    }
+    let compose_us = cycles_to_us(t1.saturating_sub(t0));
+    let present_us = cycles_to_us(t_end.saturating_sub(t1));
+    let rectscan_us = if panel_h == 0 { 0 } else { FRAME_US * bh as u64 / panel_h as u64 };
+    if present_us > rectscan_us {
+        H_TORN[i].fetch_add(1, Ordering::Relaxed);
+    }
+    H_MAXPRES[i].fetch_max(present_us, Ordering::Relaxed);
+    H_BOX[i].store(((bw as u64) << 32) | bh as u64, Ordering::Relaxed);
+    H_BYTES[i].store(bytes as u64, Ordering::Relaxed);
+    H_COMPOSE[i].store(compose_us, Ordering::Relaxed);
+    H_PRESENT[i].store(present_us, Ordering::Relaxed);
+    H_RECTSCAN[i].store(rectscan_us, Ordering::Relaxed);
+    H_PEND[i].store(n, Ordering::Release);
+}
+
+/// WC-H — print whatever [`stage_note`] recorded for `id`, if anything.
+///
+/// **Why the print is deferred to here instead of happening at the measurement.** The first cut
+/// emitted the `[wc-h]` line from inside `stage_window`, which is inside `draw_window`, which is
+/// inside WC-G's clock — so every serial character of this witness was charged to `[wc-g] us=`. It
+/// showed up immediately and unmistakably: `us=` rose from a baseline max of 15524 to 23468 on the
+/// same work, while the compose and present numbers the line itself reported summed to about half of
+/// that. An instrument that inflates the measurement it appears next to is worse than no
+/// instrument — the arc's own cost delta would have been unreadable.
+///
+/// So the sample is RECORDED where it is taken and PRINTED from here, which the compositor calls
+/// after `wcg::end` has stopped the clock. Both witnesses then measure only the copy.
+///
+/// **The printed lines are a SUBSET of the samples, by design.** There is one pending slot per id, so
+/// if two cores composite the same window concurrently (a present on one, a desktop-flush repaint on
+/// the other) the second recording overwrites the first before either is printed, and one line is
+/// lost. That is why the per-sample line count can be less than the rollup's `samples=`: the counters
+/// the rollup reports — `torn`, `maxpresent_us` — are updated at RECORD time and miss nothing, while
+/// the per-sample lines are a best-effort trace. A queue would fix the trace at the cost of putting
+/// allocation or a lock on the present path, which is not a trade this witness is worth.
+pub fn stage_flush(id: u32) {
+    let i = id as usize;
+    if i >= IDS {
+        return;
+    }
+    let n = H_PEND[i].swap(0, Ordering::AcqRel);
+    if n == 0 {
+        return;
+    }
+    let bx = H_BOX[i].load(Ordering::Relaxed);
+    let present_us = H_PRESENT[i].load(Ordering::Relaxed);
+    let rectscan_us = H_RECTSCAN[i].load(Ordering::Relaxed);
+    serial_println!(
+        "[wc-h] win={} box={}x{} bytes={} compose_us={} present_us={} rectscan_us={} torn={} -> BUFFERED",
+        id,
+        bx >> 32,
+        bx & 0xFFFF_FFFF,
+        H_BYTES[i].load(Ordering::Relaxed),
+        H_COMPOSE[i].load(Ordering::Relaxed),
+        present_us,
+        rectscan_us,
+        if present_us > rectscan_us { "yes" } else { "no" }
+    );
+    if n == SAMPLES {
+        let torn_n = H_TORN[i].load(Ordering::Relaxed);
+        serial_println!(
+            "[wc-h] rollup win={} scope=window samples={} torn={} maxpresent_us={} frame_us={} -> {}",
+            id,
+            n,
+            torn_n,
+            H_MAXPRES[i].load(Ordering::Relaxed),
+            FRAME_US,
+            if torn_n > 0 { "AT-RISK" } else { "TEAR-FREE" }
+        );
+    }
+}
 
 /// FNV-1a 64 over a mapped surface slot, bounded by the length the MAPPING code supplied — the same
 /// bound `draw_window` reads under, so the checksum can never walk past the slot. Volatile, so the

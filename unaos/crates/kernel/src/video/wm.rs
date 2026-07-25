@@ -1002,6 +1002,11 @@ fn composite_inner() {
             let r = &rows[i];
             super::wcg::end(p, &fb, r.x, r.y, r.w, r.h, r.stride, r.scale);
         }
+        // WC-H — print the back-layer sample the blit above recorded, if any. Deliberately AFTER
+        // `wcg::end`: this emits to the serial UART, and inside the bracket it would be charged to
+        // `[wc-g] us=`. See `wcg::stage_flush`.
+        #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+        super::wcg::stage_flush(rows[i].id);
         // WC-D — verify this window's blit against the scan-out, once per window id, from inside the pass
         // that drew it (the only place both the source surface and the destination rows are known).
         #[cfg(feature = "witness")]
@@ -1362,11 +1367,95 @@ fn boxes_overlap(a: (usize, usize, usize, usize), b: (usize, usize, usize, usize
         && b.1 < a.1.saturating_add(a.3)
 }
 
+// ---- WC-H: the window back-layer ---------------------------------------------------------------
+
+/// WC-H — hard ceiling on the staging buffer, in bytes. A window whose clipped outer box needs more
+/// than this composes on the DIRECT path instead (the pre-WC-H behaviour): the fallback is always
+/// available, so the cap bounds the compositor's memory rather than its correctness. 4 MiB covers a
+/// 1024x1024 box at 4 bytes/pixel — comfortably past the bench's 128x128@4x window (~514x526, 1.08
+/// MiB) and far short of a panel-sized allocation.
+const MAX_STAGE_BYTES: usize = 4 * 1024 * 1024;
+
+/// WC-H — the window back-layer's memory: one buffer, allocated on first use at the size the largest
+/// window needs and reused by every composite thereafter.
+///
+/// This is the one heap allocation this module makes, and the module header's "no heap in the
+/// compositor" note is narrowed rather than contradicted: the allocation happens on GROWTH only (the
+/// steady state is a lock, a paint and a copy, with no allocator involvement), it uses `try_reserve`
+/// so exhaustion returns an error instead of panicking from present context, and every failure —
+/// exhaustion, over-cap geometry, or another core holding the lock — falls back to the direct path.
+/// A window can therefore never fail to be drawn because of the back-layer.
+///
+/// `try_lock`, never `lock`: two cores can composite at once (a present on one, a desktop-flush
+/// repaint on the other). The loser takes the direct path rather than blocking a present behind
+/// another core's copy, which keeps the buffer single-writer without adding a wait to the path.
+///
+/// The buffer is zero-initialised and only ever written through `put_pixel`, which writes the 3
+/// colour bytes of a 4-byte pixel and never the pad byte — so pad bytes stay 0 for the life of the
+/// buffer, and the rows copied to the front carry the same zero pad `Screen`'s back buffer has
+/// always presented.
+static STAGE: Mutex<alloc::vec::Vec<u8>> = Mutex::new(alloc::vec::Vec::new());
+
 /// Paint one window: chrome (border frame + title strip + title text), then the surface content
 /// nearest-neighbour upscaled by `scale`, then one cache clean over the rows it touched so the
 /// non-coherent Pi 4 HVS scan-out sees the new pixels. All writes are `put_pixel`/`fill_rect` on a
 /// `Copy` `FrameBuffer` handle (volatile stores, no aliased `&mut`), the same discipline
 /// `Screen::flush` and the legacy `present_surface` use.
+///
+/// ### WC-H — why the paint no longer lands in the scan-out
+///
+/// WC-G localized the garble to the one suspect no checksum can reach. Every byte was correct at
+/// every moment (`coher=0 race=0 blit=0`) and the copy still took ~15 ms while the beam crosses the
+/// window's own rows in ~7 ms: the copy is structurally overtaken by the scan-out, and what the
+/// panel latches is part-old and part-new, split at whatever scanline the beam held — horizontal
+/// tearing, and exactly the shape in the bench photograph.
+///
+/// The cause is not the copy's *content* but its *destination*. A window's pixels were poked one at
+/// a time into the live front framebuffer, upscaled — at 4x, each source pixel is 16 separate
+/// bounds-checked `put_pixel` calls into memory the HVS is scanning right now — with no vblank
+/// synchronisation anywhere. The desktop has never had this problem because it does not write the
+/// front at all: it draws into `Screen`'s cached back buffer and reaches the panel through a
+/// contiguous per-row damage-rect flush.
+///
+/// WC-H gives the window layer the same treatment, in the only form available to it:
+///
+/// * **Compose** the whole window — chrome, title, upscaled content — into a cached-RAM back layer
+///   ([`STAGE`]) sized to the window's clipped outer box. Every expensive, scattered, per-pixel
+///   write happens here, where no scan-out can observe a partial result.
+/// * **Present** it as contiguous full-box rows: one `blit` (a bulk `copy_nonoverlapping`) per row,
+///   then the same single `flush_range` over the touched scanlines. This is byte-for-byte the
+///   discipline `Screen::present_background` uses, and it is the ONLY part of the operation the
+///   panel can catch mid-flight.
+///
+/// The exposure window therefore shrinks from "the entire upscale" to "`bh` bulk row copies" —
+/// the identical mechanism, and the identical bound, that makes the desktop path clean.
+///
+/// ### The trade, stated: why not route windows through `Screen` itself
+///
+/// The obvious "do it right" answer is to hand the window layer to the same `Screen` the desktop
+/// flushes, and it is structurally blocked, not merely inconvenient. There is no global `Screen`:
+/// each render task constructs its OWN (`main.rs` builds four, `witness.rs` a fifth) over the shared
+/// `WRITER` framebuffer, and none is reachable from here. The compositor runs from the presenting
+/// task's syscall context on an arbitrary core, while the render task that owns a `Screen` may be
+/// parked inside `dispatch_command` (the compat/full-screen case) and flushing nothing at all —
+/// which is precisely why `present_surface` never routed through it either. Reaching a `Screen`
+/// would mean promoting one to a global, giving it a lock taken from syscall context, and making
+/// every window present wait on the desktop's frame cadence. This arc takes the second option from
+/// the brief instead — a dedicated window back-layer with the same present discipline — which buys
+/// the same tear-free property with no ownership change and no new cross-subsystem lock.
+///
+/// **Cost.** One extra full copy of the window's box per composite (compose to RAM, then RAM to
+/// panel). The panel-facing half gets cheaper, not dearer: bulk row copies replace ~`scale²`
+/// bounds-checked pokes per source pixel. `[wc-h]` reports both halves separately so the trade is on
+/// the wire rather than asserted.
+///
+/// **Compat rows keep the direct path, deliberately.** A compat window is the full-screen
+/// `present_surface` shim: its box is the whole panel, so staging it would cost a panel-sized
+/// allocation and a full extra panel copy per present — enough, on the evidence of the `repaint`
+/// exclusion that preceded it, to blow the `EXEC-UVUG` frame deadline. It also does not need it:
+/// while a foreground full-screen EL0 program owns the panel the render task is parked, so the
+/// contention this arc exists to remove is not present. `wcg::begin` already returns `None` for
+/// compat rows, so the instrumented population and the staged population are the same set.
 fn draw_window(fb: &super::FrameBuffer, r: &Window, focused: bool) {
     // `stride`/`scale` are divisors below and `surf_len` bounds the reads, so all four are checked
     // here rather than trusted from the row.
@@ -1385,9 +1474,52 @@ fn draw_window(fb: &super::FrameBuffer, r: &Window, focused: bool) {
     let bw = bw.min(pw - bx);
     let bh = bh.min(ph - by);
 
+    // WC-H — compose off-screen and present the box as contiguous rows. Returns false when the
+    // back-layer is unavailable (compat row, over-cap geometry, another core holding it, or the
+    // allocator declining), in which case the direct path below runs exactly as it always has.
+    if !stage_window(fb, r, bx, by, bw, bh, pw, ph, focused) {
+        paint_window(fb, r, 0, 0, bx, by, bw, bh, pw, ph, focused, false);
+    }
+
+    // Clean the touched rows (superset: whole scanlines of the outer box) for the non-coherent
+    // scan-out — one `DC CVAC` sweep per window, not one per scanline. No-op on coherent targets.
+    // Unchanged by WC-H: staged or direct, the same panel rows were written by the time we get here.
+    let row_bytes = info.stride * info.bytes_per_pixel;
+    let y0 = by.min(info.height);
+    let y1 = (by + bh).min(info.height);
+    if y1 > y0 {
+        fb.flush_range(y0 * row_bytes, (y1 - y0) * row_bytes);
+    }
+}
+
+/// WC-H — paint the window's chrome and upscaled content into `dst`, whose origin sits at panel
+/// coordinate `(ox, oy)`. The two callers differ only in that origin: the direct path passes the
+/// front framebuffer with `(0, 0)`, the staged path passes the back layer with the outer box's
+/// top-left. Every clip bound is still derived from the PANEL (`pw`/`ph`), so both paths draw the
+/// identical pixel set — the back layer is exactly `bw x bh` of it, addressed from a different zero.
+#[allow(clippy::too_many_arguments)]
+fn paint_window(
+    dst: &super::FrameBuffer,
+    r: &Window,
+    ox: usize,
+    oy: usize,
+    bx: usize,
+    by: usize,
+    bw: usize,
+    bh: usize,
+    pw: usize,
+    ph: usize,
+    focused: bool,
+    dup: bool,
+) {
+    let (lbx, lby) = (bx.saturating_sub(ox), by.saturating_sub(oy));
     if !r.compat {
         // Frame: fill the whole outer box in the border colour, then lay the title strip and the
         // content over it. The only pixels that survive are the 1-px frame itself.
+        //
+        // WC-H relies on this fill being DENSE over the whole clipped box: it is what guarantees the
+        // back layer carries no residue from the window it staged last. Every pixel the present
+        // copies was written by this pass.
         // FOCUS-HL: the ONLY difference the focused window's chrome carries is these two colours. The
         // geometry is identical either way, so focus never moves a pixel — it just repaints the frame
         // and strip that were already going to be painted, at no extra cost per present.
@@ -1396,9 +1528,9 @@ fn draw_window(fb: &super::FrameBuffer, r: &Window, focused: bool) {
         } else {
             (CHROME_BORDER, CHROME_TITLE_BG)
         };
-        fb.fill_rect(bx, by, bw, bh, border);
-        fb.fill_rect(bx + BORDER, by + BORDER, bw.saturating_sub(2 * BORDER), TITLE_H, title_bg);
-        draw_title(fb, r, bx + BORDER + 2, by + BORDER + 2, bw.saturating_sub(2 * BORDER + 4));
+        dst.fill_rect(lbx, lby, bw, bh, border);
+        dst.fill_rect(lbx + BORDER, lby + BORDER, bw.saturating_sub(2 * BORDER), TITLE_H, title_bg);
+        draw_title(dst, r, lbx + BORDER + 2, lby + BORDER + 2, bw.saturating_sub(2 * BORDER + 4));
     }
 
     if r.x >= pw || r.y >= ph {
@@ -1415,32 +1547,159 @@ fn draw_window(fb: &super::FrameBuffer, r: &Window, focused: bool) {
     let cols = vis_cols.min(r.stride / 4);
     let rows = vis_rows.min(r.surf_len / r.stride);
 
+    let (cx, cy) = (r.x.saturating_sub(ox), r.y.saturating_sub(oy));
+    let dinfo = dst.info();
+    let (dw, dh, dbpp) = (dinfo.width, dinfo.height, dinfo.bytes_per_pixel);
+    // WC-H — the upscale's vertical runs, written once and replicated. A nearest-neighbour upscale
+    // emits `scale` IDENTICAL destination lines per source row; encoding and storing each of them
+    // pixel-by-pixel does the same work `scale` times over. On the back layer the destination lines
+    // are contiguous byte runs at a known stride, so the first line can be composed per-pixel and the
+    // rest produced with one bulk copy each — the same `blit` the present uses.
+    //
+    // `dup` is the caller's, not inferred, and only the staged caller sets it. On the DIRECT path the
+    // replication would copy the front buffer's existing PAD bytes from the first line onto the
+    // others (`put_pixel` writes 3 of 4 bytes), so the fallback stays a pure per-pixel write and
+    // remains byte-for-byte the pre-WC-H path. On the back layer every pad byte is 0 by construction,
+    // so the copy reproduces exactly what the per-pixel loop would have left.
+    let dup = dup && r.scale > 1 && dbpp != 0 && dinfo.stride == dw;
     let surf = r.surf as *const u8;
     for row in 0..rows {
         let row_base = row * r.stride;
+        let lines = if dup { 1 } else { r.scale };
         for col in 0..cols {
             // Unaligned-safe read of the ARGB8888 pixel; low 24 bits are RRGGBB (alpha ignored —
             // this arc composites opaquely). In bounds by construction: `row < surf_len / stride`
             // and `col < stride / 4`, so `row_base + col * 4 + 4 <= surf_len`.
             let px = unsafe { core::ptr::read_unaligned(surf.add(row_base + col * 4) as *const u32) }
                 & 0x00FF_FFFF;
-            for sy in 0..r.scale {
-                let dy = r.y + row * r.scale + sy;
+            for sy in 0..lines {
+                let dy = cy + row * r.scale + sy;
                 for sx in 0..r.scale {
-                    fb.put_pixel(r.x + col * r.scale + sx, dy, px);
+                    dst.put_pixel(cx + col * r.scale + sx, dy, px);
                 }
             }
         }
+        if !dup {
+            continue;
+        }
+        // Replicate the composed line over the remaining `scale - 1` lines of this source row. The
+        // segment is exactly the span `put_pixel` accepted above: the clip is the destination's own
+        // width, the same bound that decided which pokes landed.
+        let y0 = cy + row * r.scale;
+        if y0 >= dh || cx >= dw {
+            continue;
+        }
+        let seg = (cols * r.scale).min(dw - cx) * dbpp;
+        let src_off = (y0 * dw + cx) * dbpp;
+        if seg == 0 || src_off + seg > dst.len() {
+            continue;
+        }
+        // SAFETY: `src_off + seg <= dst.len()`, and `dst` is a plain byte surface over the back
+        // layer — the same memory `blit` writes, read here as the source of the copy. `blit` itself
+        // bounds-checks the destination and uses `copy_nonoverlapping`; the ranges are disjoint
+        // because `y` is strictly greater than `y0`.
+        let line = unsafe { core::slice::from_raw_parts((dst.base_addr() + src_off) as *const u8, seg) };
+        for sy in 1..r.scale {
+            let y = y0 + sy;
+            if y >= dh {
+                break;
+            }
+            dst.blit((y * dw + cx) * dbpp, line);
+        }
+    }
+}
+
+/// WC-H — the back-layer path: compose the window into cached RAM, then present its clipped outer
+/// box to the front framebuffer as `bh` contiguous row copies. Returns `false` when the back layer
+/// is unavailable, leaving the front untouched so the caller can run the direct path.
+///
+/// The four declines are all "fall back", never "fail": a compat row (see [`draw_window`]), a box
+/// over [`MAX_STAGE_BYTES`], a lock another core holds, and an allocator that cannot grow the
+/// buffer. None of them can lose a window.
+#[allow(clippy::too_many_arguments)]
+fn stage_window(
+    fb: &super::FrameBuffer,
+    r: &Window,
+    bx: usize,
+    by: usize,
+    bw: usize,
+    bh: usize,
+    pw: usize,
+    ph: usize,
+    focused: bool,
+) -> bool {
+    if r.compat || bw == 0 || bh == 0 {
+        return false;
+    }
+    let info = fb.info();
+    let bpp = info.bytes_per_pixel;
+    if bpp == 0 {
+        return false;
+    }
+    // `bw <= pw` and `bh <= ph` (both clipped by the caller), so neither product can wrap.
+    let row_bytes = bw * bpp;
+    let need = row_bytes * bh;
+    if need == 0 || need > MAX_STAGE_BYTES {
+        return false;
+    }
+    let mut stage = match STAGE.try_lock() {
+        Some(g) => g,
+        None => return false,
+    };
+    if stage.len() < need {
+        let add = need - stage.len();
+        // `try_reserve` + `resize`: an exhausted heap returns here instead of panicking from present
+        // context. The buffer only ever grows, so a steady window size allocates exactly once.
+        if stage.try_reserve(add).is_err() {
+            return false;
+        }
+        stage.resize(need, 0);
     }
 
-    // Clean the touched rows (superset: whole scanlines of the outer box) for the non-coherent
-    // scan-out — one `DC CVAC` sweep per window, not one per scanline. No-op on coherent targets.
-    let row_bytes = info.stride * info.bytes_per_pixel;
-    let y0 = by.min(info.height);
-    let y1 = (by + bh).min(info.height);
-    if y1 > y0 {
-        fb.flush_range(y0 * row_bytes, (y1 - y0) * row_bytes);
+    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    let t0 = crate::arch::aarch64::now_cycles();
+
+    // The back layer: same pixel format and bytes/pixel as the panel (so the composed bytes ARE the
+    // panel's bytes and the present is a straight copy), but its own stride — the box width, with no
+    // panel margin — which is what makes each row a single contiguous run.
+    let mut layer = super::FrameBuffer::new();
+    layer.init(
+        stage.as_mut_ptr() as usize,
+        need,
+        unaos_boot_info::FrameBufferInfo {
+            width: bw,
+            height: bh,
+            stride: bw,
+            bytes_per_pixel: bpp,
+            pixel_format: info.pixel_format,
+        },
+    );
+    paint_window(&layer, r, bx, by, bx, by, bw, bh, pw, ph, focused, true);
+
+    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    let t1 = crate::arch::aarch64::now_cycles();
+
+    // Present: one bulk copy per row. This is the whole of what the scan-out can catch mid-flight,
+    // and it is the same primitive and the same shape as `Screen::present_background`'s damage-rect
+    // flush.
+    let fb_row = info.stride * bpp;
+    for y in 0..bh {
+        let src = y * row_bytes;
+        fb.blit((by + y) * fb_row + bx * bpp, &stage[src..src + row_bytes]);
     }
+
+    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    super::wcg::stage_note(
+        r.id,
+        bw,
+        bh,
+        need,
+        crate::arch::aarch64::now_cycles(),
+        t0,
+        t1,
+        ph,
+    );
+    true
 }
 
 /// Draw the kernel's copy of the window title into the title strip, 8x8 glyphs, clipped to `max_w`

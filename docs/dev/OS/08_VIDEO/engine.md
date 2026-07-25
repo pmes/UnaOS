@@ -1534,3 +1534,149 @@ evidence and must be re-read on metal — a coherency or race defect can only ap
 the opposite: `us=` is measured against `CNTVCT` on the same per-pixel code path the bench runs, and metal
 is expected to be **slower**, not faster (real non-coherent framebuffer stores plus a real `DC CVAC`
 sweep). The overtake the gate measures is therefore a lower bound on the bench's.
+
+### WC-H — the window layer gets a back buffer
+
+WC-G ended with a verdict and no fix: `coher=0 race=0 blit=0 clean=4 slow=4 -> CLEAN+SLOW`. Every byte
+of the surface was correct at every moment around the copy, the scan-out read-back matched the source
+everywhere, and the panel still garbled — because the copy took `us=15524` while the beam crosses the
+window's own destination rows in `rectscan_us=7111`. Being overtaken was not a risk, it was arithmetic.
+
+The mechanism is not re-litigated here (see §WC-G). What matters for the fix is *where* the copy landed:
+`draw_window` wrote the **live front framebuffer**, one `put_pixel` at a time, upscaled — at 4x, sixteen
+separate bounds-checked stores per source pixel — into memory the HVS was scanning at that moment, with
+no vblank synchronisation anywhere in the path. The desktop has never had this problem, and not by luck:
+it draws into `Screen`'s cached back buffer and reaches the panel through a contiguous per-row damage-rect
+flush. Two layers, one scan-out, and only one of them was buffered.
+
+#### The design trade
+
+Three routes were on the table.
+
+**(a) Route window blits through `Screen`.** The "do it right" answer on its face, and structurally
+blocked — not merely inconvenient. There is no global `Screen`: each render task constructs its own
+(`main.rs` builds four, `video::witness` a fifth) over the shared `WRITER` framebuffer, and none is
+reachable from the compositor. The compositor runs from the presenting task's syscall context on an
+arbitrary core, while the render task that owns a `Screen` may be parked inside `dispatch_command` and
+flushing nothing at all — which is exactly why `present_surface` never routed through it either. Taking
+this route means promoting one `Screen` to a global, giving it a lock acquired from syscall context, and
+making every window present wait on the desktop's frame cadence. Three structural changes, one of them a
+new cross-subsystem lock on a hot path, to buy a property route (b) buys outright.
+
+**(c) Beam-race avoidance.** Bound or schedule the copy against the scan-out position. Rejected as the
+brief anticipated: it needs a scan-position source the Pi 4 path does not expose, it degrades rather than
+eliminates (a copy that must finish inside a bounded window either fits or tears), and it would make
+correctness a function of window size and CPU load.
+
+**(b) A dedicated window back-layer — chosen.** Compose the whole window (chrome, title strip, upscaled
+content) into a cached-RAM layer sized to its clipped outer box, then present that box as contiguous
+full-width row copies followed by the same single `flush_range`. This is the *same discipline* as the
+desktop path — bulk sequential `blit` per row onto the framebuffer, one cache clean over the span — with
+no ownership change and no new lock. The layer is one reused buffer (`wm::STAGE`), grown on demand with
+`try_reserve`, capped at 4 MiB.
+
+Every decline falls back to the pre-WC-H direct path rather than failing: a compat row, a box over the
+cap, another core holding the buffer (`try_lock`, never `lock` — a present must not queue behind another
+core's copy), or an allocator that cannot grow it. A window can never be lost to the back-layer.
+
+**Compat rows keep the direct path deliberately.** A compat window is the full-screen `present_surface`
+shim; its box is the whole panel, so staging it costs a panel-sized allocation and a full extra panel copy
+per present — on the evidence of the `repaint` compat exclusion that preceded it, enough to blow the
+`EXEC-UVUG` frame deadline. It also does not need it: while a foreground full-screen EL0 program owns the
+panel the render task is parked, so the two-writer contention this arc removes is not present. WC-F's
+direct-path probe likewise still bypasses the compositor, unchanged and intentionally.
+
+#### The upscale's vertical runs, written once
+
+A nearest-neighbour upscale emits `scale` **identical** destination lines per source row. On the front
+buffer there was no cheap way to exploit that; on the back layer the lines are contiguous byte runs at a
+known stride, so the first is composed per-pixel and the rest are produced with one bulk copy each. The
+compose phase roughly halved (win 1: ~21000 µs → ~6300 µs). The replication is applied **only** on the
+staged path: on the front, copying a composed line would carry that line's existing pad bytes onto the
+others (`put_pixel` writes 3 bytes of 4), so the fallback stays a pure per-pixel write and remains
+byte-for-byte the pre-WC-H path. On the back layer every pad byte is 0 by construction — the same zero pad
+`Screen`'s back buffer has always presented — so the copy reproduces exactly what the per-pixel loop
+would have left.
+
+The back layer carries no residue between windows because the chrome fill is dense over the whole clipped
+box: every pixel the present copies was written by the pass that composed it.
+
+#### `[wc-h]` — the witness, and why WC-G's `slow=` was not re-scoped
+
+`[wc-h]` splits the operation into the two halves that now mean different things:
+
+```
+[wc-h] win=1 box=514x526 bytes=1081456 compose_us=6075 present_us=1084 rectscan_us=7305 torn=no -> BUFFERED
+[wc-h] rollup win=1 scope=window samples=4 torn=0 maxpresent_us=1634 frame_us=16667 -> TEAR-FREE
+```
+
+`compose_us` happens off-screen where no scan-out can observe a partial result. `present_us` is the row
+copies — the only phase that can still tear — and `torn=` compares *that* against the beam's time on the
+box, computed exactly as WC-G computes `rectscan_us` and with the same deliberate bias toward **not**
+reporting a tear (`frame_us` includes blanking the beam does not spend on visible rows, so the box is
+credited with more beam time than it gets; a `torn=no` near the threshold is not a proof of safety).
+
+WC-G's `us=`/`slow=` leg and all three of its FORBIDs are **unchanged**. Its bracket still contains the
+copy and nothing else — `blit` is still the surface as the copy found it, `after` as the copy left it —
+but the copy is now two phases, so `slow=yes` says "the whole operation outran the beam", most of which
+the beam cannot see. It no longer implies a torn panel. Deleting or re-scoping the leg would have damaged
+the only instrument separating a source race from a coherency fault to fix a sentence of interpretation;
+the tear question moved to `[wc-h] torn=` instead, which is narrower and true.
+
+**The witness had to be moved out of its own measurement.** The first cut printed the `[wc-h]` line from
+inside `stage_window` — inside `draw_window`, inside WC-G's clock — so every serial character of it was
+charged to `[wc-g] us=`, which rose from a baseline max of 15524 to 23468 on the same work while the
+compose and present figures the line reported summed to about half that. The sample is now *recorded*
+where it is taken and *printed* from `wcg::stage_flush`, which the compositor calls after `wcg::end` has
+stopped the clock. Consequence, stated: there is one pending slot per window id, so two cores compositing
+the same window concurrently lose one printed line — the per-sample lines are a best-effort trace and can
+be fewer than the rollup's `samples=`. The rollup's counters are updated at record time and miss nothing,
+which is why the tear assertion is pinned on the rollup verdict (`FORBID -> AT-RISK`).
+
+#### WC-H gate results (2026-07-25, QEMU raspi4b, forced bench geometry)
+
+QEMU raspi4b, forced bench geometry — **no metal in this arc**.
+
+`./arroyo check` green both arches · `./arroyo kernel8` clean, **zero `wc-h` / `wc-g` / `BUFFERED`
+strings** knob-off · `./arroyo test-arm` → xHCI MISSION SUCCESS · `UNAOS_FBW=1920 UNAOS_FBH=1200
+./arroyo kernel8-test 60` → MBENCH **61/61 required, 0 forbidden** (59 before this arc → **61** with its
+two REQUIREs; one new FORBID).
+
+Cost, on the wire, same geometry, before → after (`[wc-g] us=` is the whole copy; `[wc-h] present_us=`
+is the panel-facing part of it):
+
+| window | box | WC-G `maxus` before | WC-G `maxus` after | present max after | `rectscan_us` | verdict |
+|---|---|---|---|---|---|---|
+| 1 (crystal, 128x128@4x) | 514x526 | 15524 µs | 11294 µs | **1634 µs** | 7305 | TEAR-FREE |
+| 2 (`stat.elf`, 64x64@4x) | 258x270 | 4088 µs | 3279 µs | **332 µs** | 3750 | TEAR-FREE |
+
+The panel-facing exposure fell **~9x** (15524 → 1634 µs for the crystal) and now sits at **22%** of the
+beam's time on the box, where before it was 218% of it. The total copy did not merely stay within a modest
+budget — it got *faster*, because the row-run replication more than paid for the extra copy: window 1's
+ceiling dropped from 15524 µs to 11294 µs, and window 2's `[wc-g]` rollup went from `slow=1` to `slow=0`
+(`-> CLEAN`, no longer `CLEAN+SLOW`).
+
+`[vugfps]`, honestly: **it does not appear on this gate and cannot**. It is emitted by the `vug` render
+loop, which is reachable only through the interactive `vug` shell verb (`shell.rs`), so a headless
+battery never runs it — the baseline capture has zero `[vugfps]` lines, before and after. The bandwidth
+question it would answer is instead answered directly by `[wc-h] bytes=` (1081456 per staged composite for
+window 1) plus the compose/present split above, which is a finer-grained account of the same cost on the
+path this arc actually changed.
+
+#### Metal watch-list
+
+* **The crystal is SHARP.** The money reading, and the only one that settles the arc: a 128x128 window at
+  4x, repainting continuously, with no horizontal band boundaries. WC-G's photograph is the before.
+* `[wc-h] rollup ... -> TEAR-FREE` for every window. Metal is expected to be **slower** than QEMU on both
+  phases (real non-coherent framebuffer stores, a real `DC CVAC` sweep), so `present_us` will rise; the
+  margin to watch is 1634 µs against 7305 µs — a 4.5x headroom on the gate that metal must not consume.
+  An `AT-RISK` rollup on the bench means the row copies alone are still losing the race and the next step
+  is fewer bytes per present (damage sub-rects within the window box), not a bigger buffer.
+* `[wc-g]` verdicts stay `CLEAN` or `CLEAN+SLOW`. A `COHER` or `RACE` on metal would be a *new* finding
+  about the surface, unrelated to this arc — the back layer changed the destination, not the source.
+* The chrome: border and title strip must land in the same place they did, since they are now composed
+  through a different origin. A one-pixel offset would show as a shifted frame.
+* Cursor and FOCUS-VIS are unchanged above the buffering: the sprite is still taken off the panel for the
+  whole pass, and `erase` still fills the desktop directly. `erase` is *not* staged — it is a one-shot
+  solid fill on close/raise rather than a continuous repaint, so it can flash but cannot produce the
+  standing tear this arc removes. If the bench sees a torn erase, that is the follow-on.
