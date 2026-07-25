@@ -407,6 +407,79 @@ pub fn init(gpu: &GpuInfo) {
                                             serial_println!(":: kepler: pgraph stat done rows={} ::", pgraph_rows);
                                         }
                                     }
+
+                                    // --- Witness Rematch ---
+                                    serial_println!(":: kepler: witness-rematch begin (pgraph on) ::");
+
+                                    // 2. Bind and Enable PFIFO_CHAN for channel 1
+                                    mmio_write(bar0, 0x800000 + (1 * 8), 0); 
+                                    mmio_write(bar0, 0x800004 + (1 * 8), 0x00000400); 
+                                    mmio_write(bar0, 0x800000 + (1 * 8), 0xC0000000 | ((inst_off as u32) >> 12)); 
+
+                                    let err = mmio_read(bar0, 0x252c);
+                                    let stat = mmio_read(bar0, 0x263c);
+                                    let err_str = if err == 0 || err == 0xFFFFFFFF || err == 0xBAD0BA20 { "absent?" } else { "present" };
+                                    serial_println!(":: kepler: sched-status post-init err={:08X} ({}) stat={:08X} ::", err, err_str, stat);
+
+                                    let ch_1_0_pre = mmio_read(bar0, 0x800000 + (1 * 8));
+                                    let ch_1_4_pre = mmio_read(bar0, 0x800004 + (1 * 8));
+                                    serial_println!(":: kepler: PFIFO_CHAN[1] pre-submit: 00={:08X} 04={:08X} ::", ch_1_0_pre, ch_1_4_pre);
+                                    
+                                    // Witness check
+                                    if (ch_1_0_pre & 0xC0000000) != 0xC0000000 {
+                                        serial_println!(":: kepler: WITNESS FAILED - bits stripped. Restoring inst_off+0x0C ::");
+                                        unsafe { core::ptr::write_volatile((bar1 + inst_off + 0x0C) as *mut u32, (userd_off >> 32) as u32); }
+                                        // Re-test PFIFO_CHAN[1] to clear state
+                                        mmio_write(bar0, 0x800000 + (1 * 8), 0);
+                                        mmio_write(bar0, 0x800004 + (1 * 8), 0x00000400);
+                                        mmio_write(bar0, 0x800000 + (1 * 8), 0xC0000000 | ((inst_off as u32) >> 12));
+                                        
+                                        let err = mmio_read(bar0, 0x252c);
+                                        let stat = mmio_read(bar0, 0x263c);
+                                        let err_str = if err == 0 || err == 0xFFFFFFFF || err == 0xBAD0BA20 { "absent?" } else { "present" };
+                                        serial_println!(":: kepler: sched-status post-restore err={:08X} ({}) stat={:08X} ::", err, err_str, stat);
+                                    } else {
+                                        serial_println!(":: kepler: WITNESS PASSED - bits stuck! ::");
+                                    }
+
+                                    // 3. Submit Runlist
+                                    mmio_write(bar0, 0x2270, (runlist_off as u32) >> 12); // target=0 (VRAM), addr
+                                    mmio_write(bar0, 0x2274, 3); // LEN=3, ENG=0
+                                    serial_println!("[NVIDIA] Configured Runlist and bound channel.");
+
+                                    // Wait for PLAYLIST_RD to accept the runlist
+                                    let mut pl_rd = 0;
+                                    let mut pl_rd_len = 0;
+                                    for _ in 0..100_000 {
+                                        pl_rd = mmio_read(bar0, 0x2280);
+                                        pl_rd_len = mmio_read(bar0, 0x2284);
+                                        if pl_rd == ((runlist_off as u32) >> 12) && (pl_rd_len & 0xFFF) == 1 {
+                                            break;
+                                        }
+                                    }
+                                    serial_println!(":: kepler: post-bind playlist_rd={:08X} playlist_rd_len={:08X} ::", pl_rd, pl_rd_len);
+                                    
+                                    let err = mmio_read(bar0, 0x252c);
+                                    let stat = mmio_read(bar0, 0x263c);
+                                    let err_str = if err == 0 || err == 0xFFFFFFFF || err == 0xBAD0BA20 { "absent?" } else { "present" };
+                                    serial_println!(":: kepler: sched-status post-submit err={:08X} ({}) stat={:08X} ::", err, err_str, stat);
+
+                                    let ch_1_0_post = mmio_read(bar0, 0x800000 + (1 * 8));
+                                    let ch_1_4_post = mmio_read(bar0, 0x800004 + (1 * 8));
+                                    serial_println!(":: kepler: PFIFO_CHAN[1] post-submit: 00={:08X} 04={:08X} ::", ch_1_0_post, ch_1_4_post);
+
+                                    // Discriminator readback
+                                    for i in 0..3 {
+                                        let pbdma_base_i = 0x40000 + (i * 0x2000);
+                                        let ch = mmio_read(bar0, pbdma_base_i + 0x120);
+                                        let chid_active = ch & 0xFFF;
+                                        let is_active = (ch >> 13) & 1;
+                                        serial_println!(":: kepler: DISCRIMINATOR pbdma{} ch={:08X} (CHID={} ACTIVE={}) ::", i, ch, chid_active, is_active);
+                                    }
+
+                                    let final_err = mmio_read(bar0, 0x252c);
+                                    let final_stat = mmio_read(bar0, 0x263c);
+                                    serial_println!(":: kepler: witness-rematch end err={:08X} stat={:08X} valid={:08X} ::", final_err, final_stat, ch_1_0_post);
                                 }
                             }
                         }
