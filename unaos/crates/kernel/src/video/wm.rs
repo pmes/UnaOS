@@ -506,8 +506,12 @@ pub fn close(id: WinId) -> bool {
     let barrier = DrainBarrier::drain();
     #[cfg(feature = "witness")]
     serial_println!("[wc-a] close win={}", id);
-    erase(&[vacated]);
-    place(WIN_NONE);
+    // WC-J — reclaim the closed window's own box AND every box the re-tile takes from a survivor.
+    // `erase` above only covers the first; without the second, closing one of several windows leaves a
+    // full copy of each survivor standing at its previous tile for the rest of the boot.
+    let (nv, moved) = place(WIN_NONE);
+    reclaim(&[vacated]);
+    reclaim(&moved[..nv]);
     // Re-open the barrier before recompositing — a composite under a raised barrier is a no-op.
     drop(barrier);
     composite();
@@ -540,8 +544,12 @@ pub fn close_owner(owner_asid: u64) -> usize {
     let barrier = DrainBarrier::drain();
     #[cfg(feature = "witness")]
     serial_println!("[wc-a] close_owner asid={:#x} closed={}", owner_asid, n);
-    erase(&vacated[..n]);
-    place(WIN_NONE);
+    // WC-J — the EXIT-TEARDOWN twin of `close`'s reclaim, and the path P61 actually took: a
+    // backgrounded app reaches its exit with a window open, `clear_handle_row` lands here, and every
+    // OTHER app's window is re-tiled by the `place` below. Same two sets, same treatment.
+    let (nv, moved) = place(WIN_NONE);
+    reclaim(&vacated[..n]);
+    reclaim(&moved[..nv]);
     // Re-open the barrier before recompositing — a composite under a raised barrier is a no-op.
     drop(barrier);
     composite();
@@ -2512,6 +2520,203 @@ pub fn reopen_selftest() {
     close(wb);
     close(wc);
     repaint();
+
+    // WC-J: the VACATE read-back, invoked here (rather than from the arch selftest driver) because it
+    // has exactly this witness's preconditions — every one-shot per-window latch already spent, the
+    // shell z restored, the live set repainted — and because a close/damage question belongs to the
+    // window layer, not to the syscall layer that happens to sequence the video selftests.
+    vacate_selftest();
+}
+
+/// WC-J — the CLOSE→VACATE witness: do the rows a closed window occupied come back as DESKTOP?
+///
+/// ### Why this exists (P61, bench, attended)
+/// Several background vugs were launched and some killed. The operator reported one crash, two
+/// FROZEN windows and one still running; `jobs` then showed all four pids `exited 0 (reaped)`. The
+/// process story was clean, so the "frozen" windows were not frozen processes — they were panel
+/// pixels belonging to windows whose owners had already exited and been reaped. A GHOST is a window
+/// layer defect by construction: nothing alive was drawing those pixels.
+///
+/// Before WC-I the desktop ran a blanket `wm::repaint()` every tick, which re-blitted the whole live
+/// set and, on the desktop's own present, re-copied the background — so a vacated box healed within a
+/// second whether or not the close path had actually reclaimed it. WC-I removed that blanket pass in
+/// favour of `service_damage` plus occlusion subtraction, which makes the reclaim load-bearing: if a
+/// close frees the row without restoring the pixels, nothing else ever will.
+///
+/// ### The legs (both closes that a dying app can take)
+/// 1. **close** — the explicit `SYS_WIN_CLOSE` path (`wc_shim::destroy` → [`close`]).
+/// 2. **owner** — the EXIT-TEARDOWN path (`clear_handle_row` → [`close_owner`]), which is the exact
+///    P61 scenario: a backgrounded app reaches its exit with a window still open.
+///
+/// Each leg presents a window, proves the panel took its colour (a vacate check over a box that was
+/// never painted proves nothing), closes it, and then reads the vacated box back at five points — the
+/// content origin, the two content diagonals and both chrome bands (title strip and lower border),
+/// since chrome is kernel-drawn and leaks exactly as visibly as content. Every point must equal
+/// [`DESKTOP_BG`], byte-for-byte, with no tolerance.
+#[cfg(feature = "witness")]
+pub fn vacate_selftest() {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    let fb = *super::WRITER.lock();
+    if !fb.is_ready() {
+        serial_println!("[wc-j] vacate -> SKIP (framebuffer not ready)");
+        return;
+    }
+    let info = fb.info();
+    if info.width < 256 || info.height < 128 {
+        serial_println!("[wc-j] vacate -> SKIP (panel {}x{} too small)", info.width, info.height);
+        return;
+    }
+
+    const ASID_J: u64 = 0xE0D;
+    let sa = &raw const FV_SURF_A as usize;
+    let len = core::mem::size_of_val(&FV_SURF_A);
+    let a_col = FV_SURF_A[0];
+    let read = |x: usize, y: usize| super::WRITER.lock().read_pixel(x, y).unwrap_or(0);
+
+    // Upper-middle, clear of WC-F's bottom-edge reserved probe boxes, as the sibling witnesses are.
+    let oy = info.height / 4 + TITLE_H + BORDER;
+    let ox = info.width / 4;
+
+    // One leg: place a window at (ox, oy), prove it owns its box, close it by `f`, and count how many
+    // of the five sample points came back as desktop.
+    let leg = |f: &dyn Fn(WinId, u64), name: &str| -> (bool, bool, usize) {
+        let w = create(ASID_J, sa, len, 8, 8, 32, b"vc-a");
+        if w == WIN_NONE {
+            return (false, false, 0);
+        }
+        move_to(w, ox, oy);
+        present(w);
+        // The outer box, recomputed from the row so the sample points track the real chrome geometry.
+        let b = match info_box(w) {
+            Some(b) => b,
+            None => {
+                close(w);
+                return (false, false, 0);
+            }
+        };
+        let painted = read(ox + 1, oy + 1) == a_col;
+        f(w, ASID_J);
+        // Five points: content origin, both content diagonals, the title strip and the lower border.
+        let pts = [
+            (ox + 1, oy + 1),
+            (ox + 2, oy + 2),
+            (ox + 5, oy + 5),
+            (b.0 + b.2 / 2, b.1 + TITLE_H / 2),
+            (b.0 + b.2 / 2, b.1 + b.3 - 1),
+        ];
+        let mut clean = 0usize;
+        for &(x, y) in pts.iter() {
+            if read(x, y) == DESKTOP_BG {
+                clean += 1;
+            }
+        }
+        let _ = name;
+        (painted, clean == pts.len(), clean)
+    };
+
+    let (p1, v1, n1) = leg(&|w, _| { close(w); }, "close");
+    let (p2, v2, n2) = leg(&|_, asid| { close_owner(asid); }, "owner");
+
+    let ok = p1 && v1 && p2 && v2;
+    serial_println!(
+        "[wc-j] vacate close_painted={} close_desktop={} ({}/5) owner_painted={} owner_desktop={} ({}/5) -> {}",
+        p1, v1, n1, p2, v2, n2,
+        if ok { "PASS" } else { "FAIL" }
+    );
+    retile_selftest();
+    repaint();
+}
+
+/// WC-J — the RETILE-GHOST witness: when one window closes, do the SURVIVORS the tiler moves leave
+/// their previous frame behind?
+///
+/// ### Why this is the P61 shape and the single-window vacate is not
+/// [`vacate_selftest`]'s two legs place their window explicitly (`move_to`, which PINS the row) and
+/// close it alone, so the only box in play is the one the closer erases. A real app's window is never
+/// pinned — nothing in EL0 moves a window, so every real window is laid out by the TILER — and a
+/// tiled window's position is a function of HOW MANY windows exist. `close` calls `place(WIN_NONE)`
+/// after freeing the row, which re-tiles every surviving unpinned window into the compacted layout:
+/// the survivors MOVE, and the closer erases only the box the CLOSED window vacated, never the boxes
+/// the survivors vacated by moving.
+///
+/// [`move_to`] already knows this (FOCUS-VIS gave it an erase of its old box); the tiler does not.
+/// Before WC-I the desktop's per-tick blanket present covered the difference within a second. With
+/// WC-I the desktop presents only its own damage and nothing marks those rows, so an abandoned tile
+/// is permanent — a full copy of a window standing where the window no longer is. That is what the
+/// operator reads as a FROZEN window, and it is why P61 saw several of them the moment one bg vug of
+/// four was killed while all four processes were provably clean.
+///
+/// The leg: two tiled windows, both presented; note where B is; close A; B must have MOVED (otherwise
+/// the leg proves nothing about the tiler), B's NEW box must hold B's colour, and B's OLD box must be
+/// back to [`DESKTOP_BG`].
+#[cfg(feature = "witness")]
+fn retile_selftest() {
+    const ASID_A: u64 = 0xE1A;
+    const ASID_B: u64 = 0xE1B;
+    let sa = &raw const FV_SURF_A as usize;
+    let sb = &raw const FV_SURF_B as usize;
+    let len = core::mem::size_of_val(&FV_SURF_A);
+    let b_col = FV_SURF_B[0];
+    let read = |x: usize, y: usize| super::WRITER.lock().read_pixel(x, y).unwrap_or(0);
+
+    let wa = create(ASID_A, sa, len, 8, 8, 32, b"rt-a");
+    let wb = create(ASID_B, sb, len, 8, 8, 32, b"rt-b");
+    if wa == WIN_NONE || wb == WIN_NONE {
+        serial_println!("[wc-j] retile -> SKIP (window table full: a={} b={})", wa, wb);
+        close(wa);
+        close(wb);
+        return;
+    }
+    present(wa);
+    present(wb);
+    let before = match info_box(wb) {
+        Some(b) => b,
+        None => {
+            serial_println!("[wc-j] retile -> SKIP (no row for the survivor)");
+            close(wa);
+            close(wb);
+            return;
+        }
+    };
+    // Sample the survivor's CONTENT origin, not its chrome: chrome is redrawn identically at the new
+    // position, so a chrome pixel cannot distinguish "moved" from "still there".
+    let (bx0, by0) = (before.0 + BORDER, before.1 + TITLE_H);
+    let painted = read(bx0 + 1, by0 + 1) == b_col;
+
+    close(wa);
+
+    let after = info_box(wb).unwrap_or(before);
+    let moved = after != before;
+    // The survivor still reaches the panel at its NEW box...
+    let live_ok = read(after.0 + BORDER + 1, after.1 + TITLE_H + 1) == b_col;
+    // ...and its OLD box is desktop again. Three points inside the abandoned content area.
+    let mut clean = 0usize;
+    let pts = [(bx0 + 1, by0 + 1), (bx0 + 2, by0 + 2), (bx0 + 5, by0 + 5)];
+    for &(x, y) in pts.iter() {
+        if read(x, y) == DESKTOP_BG {
+            clean += 1;
+        }
+    }
+    let ghost_free = !moved || clean == pts.len();
+    let ok = painted && live_ok && ghost_free;
+    serial_println!(
+        "[wc-j] retile survivor={} moved={} painted={} live={} old_desktop={} ({}/3) -> {}",
+        wb, moved, painted, live_ok, ghost_free, clean,
+        if ok { "PASS" } else { "FAIL" }
+    );
+    close(wb);
+}
+
+/// The outer (chrome-inclusive) panel box of `id`, or `None` if `id` names no live window.
+#[cfg(feature = "witness")]
+fn info_box(id: WinId) -> Option<(usize, usize, usize, usize)> {
+    let t = TABLE.lock();
+    row(&t, id).map(outer_box)
 }
 
 // ---- internals -------------------------------------------------------------------------------
@@ -2575,7 +2780,13 @@ fn create_inner(
     if id < 32 {
         VERIFIED.fetch_and(!(1u32 << id), core::sync::atomic::Ordering::Relaxed);
     }
-    place(id);
+    // WC-J — a CREATE re-tiles the existing windows exactly as a close does (the layout is a function
+    // of the live set), so it abandons their old boxes in the same way and they are reclaimed the same
+    // way. No drain barrier here: no row is being freed and no surface unmapped, so there is nothing an
+    // in-flight blit could be reading that is about to disappear — the composite below re-establishes
+    // every moved window over the erase.
+    let (nv, moved) = place(id);
+    reclaim(&moved[..nv]);
     #[cfg(feature = "witness")]
     if !compat {
         if let Some(i) = info(id) {
@@ -2649,14 +2860,16 @@ fn legibility_cap(ph: usize) -> usize {
 /// Scale rule: the largest integer factor whose scaled surface fits half the panel width and half its
 /// height — big enough that a 32x32 surface is legible on a 1920-wide panel, small enough that two
 /// windows sit side-by-side — **capped by [`legibility_cap`]**. Never 0.
-fn place(_created: WinId) {
+fn place(_created: WinId) -> (usize, [(usize, usize, usize, usize); MAX_WINDOWS]) {
+    let mut vacated = [(0usize, 0usize, 0usize, 0usize); MAX_WINDOWS];
+    let mut nv = 0usize;
     // Read the panel geometry BEFORE taking the table lock: `composite` takes the table lock and
     // releases it before touching `WRITER`, so no path ever holds both — no lock-order inversion.
     // The WRITER guard is intentionally dropped at the end of this statement (`FrameBuffer` is
     // `Copy`); the table lock below is therefore never nested inside it.
     let fb = *super::WRITER.lock();
     if !fb.is_ready() {
-        return;
+        return (0, vacated);
     }
     let info = fb.info();
     let (pw, ph) = (info.width, info.height);
@@ -2685,11 +2898,68 @@ fn place(_created: WinId) {
             row_h = 0;
         }
         let r = &mut t.rows[i];
+        // WC-J — the box this row occupied BEFORE the tiler moved it. A tiled window's position is a
+        // function of how many windows exist, so every create and every close re-tiles the survivors;
+        // the pixels they leave behind belong to nobody afterwards, and nothing else in this module
+        // knows they were abandoned. Recorded here (the one place that can see both geometries) and
+        // reclaimed by `reclaim` at every `place` call site.
+        let before = outer_box(r);
         r.scale = scale;
         r.x = cx + BORDER;
         r.y = cy;
         r.damaged = true;
+        if outer_box(r) != before && before.2 != 0 && before.3 != 0 {
+            vacated[nv] = before;
+            nv += 1;
+        }
         cx = cx.saturating_add(bw).saturating_add(GAP);
         row_h = row_h.max(bh);
     }
+    drop(t);
+    (nv, vacated)
+}
+
+/// WC-J — RECLAIM panel rows the window layer has stopped owning: paint them desktop, re-damage the
+/// windows the paint reached, and ask the desktop for its own content back.
+///
+/// ### Why this is a separate step and not "the closer erases its box"
+/// A close reclaims two disjoint things. The box the CLOSED window occupied — which [`close`] and
+/// [`close_owner`] already erase — and the boxes the SURVIVING windows vacate when [`place`] re-tiles
+/// them into the compacted layout, which nothing erased. The second set is invisible to every caller:
+/// only the tiler sees both the old and the new geometry, so only the tiler can report it.
+///
+/// ### Why it became permanent (P61)
+/// Before WC-I the desktop presented its whole damage set every tick and `wm::repaint` re-blitted the
+/// whole live set on top, so an abandoned tile was overwritten within about a second whether or not
+/// anything had reclaimed it. WC-I subtracts the window layer from the desktop's damage and drops the
+/// blanket re-blit — correctly, that is what removed the 1 Hz blip — and with it the accident that was
+/// covering this. The abandoned tile now belongs to nobody: not to the window (which moved), not to
+/// the desktop (whose damage for those rows was discarded while a window sat there). It stays on the
+/// panel for the rest of the boot, showing the last frame of a window that is no longer there — which
+/// is exactly what the P61 operator read as a FROZEN vug while `jobs` showed every pid already exited
+/// and reaped.
+///
+/// ### The three steps, and why all three
+/// * **erase** — desktop colour on the panel NOW, so the ghost is gone within this call rather than at
+///   the desktop's next tick. Same immediate-response argument `focus_changed` makes for its hidden
+///   boxes.
+/// * **damage_intersecting** — a survivor whose box OVERLAPS a reclaimed one just had a bite taken out
+///   of it by the erase; it must be repainted by the composite the caller runs next.
+/// * **request_full_present** — the desktop's own content (the console's text, the status strip) is
+///   what actually belongs under a departed window, and only the desktop can put it there: the erase
+///   above can only paint [`DESKTOP_BG`]. The flag is the mechanism FOCUS-VIS already built for
+///   precisely this hand-off, and it is consumed by the render task's next flush, on its own thread.
+///   Not raised when there is nothing to reclaim, so an ordinary windowless boot never asks for one.
+///
+/// Callers run this INSIDE their drain barrier (the pixels must not race an in-flight blit of the old
+/// geometry) and composite after dropping it.
+fn reclaim(vacated: &[(usize, usize, usize, usize)]) {
+    if vacated.is_empty() {
+        return;
+    }
+    erase(vacated);
+    for &(x, y, w, h) in vacated.iter() {
+        damage_intersecting(x, y, w, h);
+    }
+    super::screen::request_full_present();
 }

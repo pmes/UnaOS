@@ -463,3 +463,29 @@ REQUIRE \[wc-h\] win=.* staged=no reason=fixture -> DIRECT
 REQUIRE \[wc-h\] rollup win=.* scope=window .*declines=.* -> TEAR-FREE
 FORBID \[wc-h\] .*-> AT-RISK
 FORBID \[wc-h\] .*-> UNSTAGED
+
+# --- WC-J — a closed window gives its panel rows BACK ------------------------------------------
+# ---    P61 (attended): four background vugs, some killed; the operator reported one crash, two
+# ---    FROZEN windows and one still running, and `jobs` then showed all four pids exited 0 and
+# ---    reaped. The process story was clean, so the frozen windows were pixels, not processes —
+# ---    window content still on the panel for owners that were already gone.
+# ---
+# ---    `[wc-j] vacate` is the single-window half: present a window, prove the panel took its
+# ---    colour, close it (once by the explicit `SYS_WIN_CLOSE` path, once by the exit-teardown
+# ---    `close_owner` path), and read the vacated box back at five points — content origin, two
+# ---    diagonals, title strip, lower border. All five must be DESKTOP_BG byte-for-byte. This half
+# ---    passed on the unfixed tip and is kept as the regression floor.
+# ---
+# ---    `[wc-j] retile` is the half that FAILED there (`old_desktop=false (0/3)`), and it is the
+# ---    P61 shape: a real window is never pinned, so the TILER owns its position, and the layout is
+# ---    a function of how many windows exist. Closing one window re-tiles the survivors, and the
+# ---    closer erased only the box the CLOSED window vacated — never the boxes the survivors
+# ---    vacated by MOVING. Before WC-I the desktop's blanket per-tick present and `wm::repaint`
+# ---    overwrote those rows within a second; WC-I subtracts the window layer from the desktop's
+# ---    damage and drops the blanket re-blit, so the abandoned tile belongs to nobody and stays for
+# ---    the rest of the boot. The leg closes one of two tiled windows and requires that the
+# ---    survivor MOVED, still reaches the panel at its new box, and left desktop behind at its old
+# ---    one. See docs/dev/OS/08_VIDEO/engine.md §WC-J.
+REQUIRE \[wc-j\] vacate close_painted=true close_desktop=true .* owner_painted=true owner_desktop=true .* -> PASS
+REQUIRE \[wc-j\] retile survivor=.* moved=true painted=true live=true old_desktop=true .* -> PASS
+FORBID \[wc-j\] .*-> FAIL

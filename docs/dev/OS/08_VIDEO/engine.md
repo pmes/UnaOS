@@ -2047,3 +2047,114 @@ exists so a pointerless run can never be read as evidence for the mechanism.
   a visible step in flicker at the frame is the containment rule doing its job, not a defect.
 * A cursor left over a window while WC-D or WC-G spends its one-shot budget will bracket for those
   few passes. Early-boot only, and `[cursor3] present tail=repaint` names it.
+### WC-J — a closed window gives its panel rows back
+
+#### The observation (P61, attended bench)
+
+The operator launched several background vugs, killed some, and watched: "one vug crashed, two frozen,
+at least one still going". `jobs` then reported all four pids `exited 0 (reaped)` — corroborated by a
+panel photograph. The kernel's process story was completely clean, which means the "frozen" windows were
+not frozen processes at all. They were **ghosts**: window pixels still on the panel for owners that had
+already exited and been reaped. Nothing alive was drawing them, so the defect is in the window layer by
+elimination before any code is read.
+
+#### Why WC-I made it permanent (and why it is not a WC-I regression)
+
+The tiler owns a real window's position. Nothing in EL0 moves a window — `move_to` is what PINS a row,
+and only kernel-side fixtures call it — so every real window is laid out by `place`, whose layout is a
+function of **how many windows exist**. Closing one window therefore re-tiles all the survivors, and
+creating one does the same in the other direction.
+
+`close`/`close_owner` erased the box the *closed* window vacated. Nothing erased the boxes the
+*survivors* vacated by moving. That set is invisible to every caller: only the tiler ever sees both the
+old and the new geometry.
+
+Before WC-I this was covered by accident. The desktop presented its whole damage set each tick and
+`wm::repaint` re-blitted the entire live set on top, so an abandoned tile was overwritten within about a
+second whether or not anything had reclaimed it. WC-I removed both — correctly; that is what killed the
+1 Hz blip — by subtracting the window layer from the desktop's damage and replacing the blanket re-blit
+with `service_damage`. The abandoned tile then belongs to nobody: not to the window (which moved), and
+not to the desktop (whose damage for those rows was discarded while a window still sat there). It stays
+for the rest of the boot. Killing one of four vugs leaves three full window copies standing where the
+windows no longer are — exactly the "two frozen vugs" the operator reported.
+
+#### The mechanism
+
+`place` now RETURNS the boxes it took from the windows it moved — the one place that can see both
+geometries — and every call site reclaims them through `wm::reclaim`, which does three things:
+
+* **erase** — desktop colour on the panel immediately, so the ghost is gone within the call rather than
+  at the desktop's next tick (the same immediate-response argument `focus_changed` makes for its hidden
+  boxes);
+* **`damage_intersecting`** — a survivor whose box overlaps a reclaimed one just had a bite taken out of
+  it by that erase, so it is re-damaged for the composite the caller runs next;
+* **`screen::request_full_present`** — only the desktop can put its OWN content (console text, status
+  strip) back under a departed window; `erase` can paint nothing but `DESKTOP_BG`. This is the hand-off
+  flag FOCUS-VIS already built for precisely this case, consumed by the render task's next flush on its
+  own thread. Raised only when something was actually reclaimed, so a windowless boot never asks.
+
+Three call sites, all covered:
+
+| path | trigger | reclaimed |
+| --- | --- | --- |
+| `close` | `SYS_WIN_CLOSE` → `wc_shim::destroy` | the closed window's box **+** every re-tiled survivor's old box |
+| `close_owner` | exit teardown: `clear_handle_row` → `win_close_asid` | same two sets — **this is the P61 path**, a bg app reaching its exit with a window open |
+| `create_inner` | `SYS_WIN_CREATE` | the re-tiled survivors' old boxes (no drain barrier: no row is freed and no surface unmapped) |
+
+The close paths reclaim INSIDE their existing F4 drain barrier — the pixels must not race an in-flight
+blit of the old geometry — and composite after dropping it, unchanged from WC-A.
+
+#### The witness
+
+`[wc-j] vacate` (two legs) and `[wc-j] retile`, driven from `reopen_selftest`'s tail so they inherit its
+preconditions (every one-shot per-window latch already spent, shell z restored, live set repainted).
+Read-back against the scan-out, byte-for-byte against `DESKTOP_BG`, no tolerance — kernel state was
+already correct in the bench report, so only the framebuffer is asked.
+
+* **vacate/close** and **vacate/owner** — present a window, prove the panel took its colour, close it by
+  each of the two paths, and read the vacated box at five points (content origin, two diagonals, title
+  strip, lower border; chrome is kernel-drawn and leaks exactly as visibly as content).
+* **retile** — two tiled windows; close one; the survivor must have MOVED (else the leg proves nothing),
+  must still reach the panel at its new box, and must have left desktop behind at its old one.
+
+#### WC-J gate results (2026-07-25, QEMU raspi4b, forced bench geometry)
+
+The vacate legs **passed on the unfixed tip** — a lone close does reclaim its own box — and are kept as
+the regression floor. The retile leg is where the defect lives, and on the unfixed tip it read:
+
+```
+[wc-j] vacate close_painted=true close_desktop=true (5/5) owner_painted=true owner_desktop=true (5/5) -> PASS
+[wc-j] retile survivor=2 moved=true painted=true live=true old_desktop=false (0/3) -> FAIL
+```
+
+`0/3` — the survivor's abandoned tile held its window content at every sampled point. With the reclaim
+in place, on the same geometry:
+
+```
+[wc-j] vacate close_painted=true close_desktop=true (5/5) owner_painted=true owner_desktop=true (5/5) -> PASS
+[wc-j] retile survivor=2 moved=true painted=true live=true old_desktop=true (3/3) -> PASS
+```
+
+#### The c1=99% measured alongside the ghosts — not the window layer
+
+P61 also measured `SCHED: load c1=99%` sustained while at least one ghost was on the panel, with every
+vug exited. Nothing in the window layer can account for it, and this is stated as a negative result
+rather than force-fitted: `video/` contains no loop outside the framebuffer's init poll; the compositor
+is entirely event-driven (`present`, `close`, `focus_changed`, and `service_damage`, which returns after
+one eight-row table scan when nothing is damaged); the GUI/render task parks in `GUI_CHANNEL.recv()` and
+burns nothing at idle; and a ghost is by construction inert — the rows are freed (`[wc-a] close_owner`
+prints, and the vacate legs prove those rows stop compositing), so no live loop stands behind those
+pixels. The remaining candidates are all outside this lane (a task still runnable on c1 after its
+parent's exit, or a poll cadence in the shell/scheduler); the bench measurement that would name it is
+`top` while a ghost is present, which reports the last task per core.
+
+#### Metal watch-list
+
+* Kill one of several background vugs: the survivors re-tile and leave **nothing** behind at their old
+  positions — the reported "frozen vug" must not appear.
+* Under the re-tile, the console text and status strip come back where the abandoned tile was, within
+  about a second (the `request_full_present` hand-off), not merely flat `DESKTOP_BG`.
+* Launching a vug while others are up re-tiles them too, and leaves no residue either — `create` is on
+  the same reclaim path as `close`.
+* `erase` is still unstaged (unchanged by this arc), so a torn erase on a large reclaim remains the WC-H
+  follow-on it has always been.
