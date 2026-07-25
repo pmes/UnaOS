@@ -42,8 +42,25 @@ static GUI_ACTIVE: AtomicBool = AtomicBool::new(false);
 #[cfg(target_arch = "x86_64")]
 static PANIC_MIRROR: AtomicBool = AtomicBool::new(false);
 
+/// PANEL-CONSOLE (x86, kepler-takeover lane only): the QUIET-PANEL override. When set, `_print`
+/// mirrors onto the panel again on builds that otherwise paint nothing (the metal `usbdebug` media
+/// is exactly that build — see `_print`), so kernel console text lands on glass after the Kepler
+/// takeover's calibration draw has finished with the surface. Set ONLY by `panel_console_resume`,
+/// which is called from one seam at the end of `kepler_display::takeover_display`; every other boot
+/// path leaves it false and is byte-for-byte unchanged in behaviour.
+#[cfg(target_arch = "x86_64")]
+static PANEL_CONSOLE: AtomicBool = AtomicBool::new(false);
+
+/// Base font cell (font8x8). The live cell is `FbCon::cell_w/cell_h` = this times the scale.
 const CELL_W: usize = 8;
 const CELL_H: usize = 8;
+
+/// PANEL-CONSOLE glyph scale. The 2012 rMBP panel is 2880 px across ~286 mm (~0.1 mm/px), so an
+/// unscaled 8x8 cell is ~0.8 mm — metal (sitting #30) confirmed marks that small are simply not
+/// visible to the naked eye at bench distance. 6x gives a 48x48 px cell (~4.8 mm) with a 0.6 mm
+/// stroke, and still leaves 60 columns x 37 rows on the panel.
+#[cfg(target_arch = "x86_64")]
+const PANEL_SCALE: usize = 6;
 
 const FG_DEFAULT: u32 = 0x00C0_C0C0; // light grey text
 const BG_DEFAULT: u32 = 0x0000_0000; // black background
@@ -75,6 +92,13 @@ struct FbCon {
     shadow: FrameBuffer,
     cols: usize,
     rows: usize,
+    /// Live glyph cell size in pixels. `CELL_W`/`CELL_H` (the raw font8x8 cell) everywhere by
+    /// default; PANEL-CONSOLE multiplies both by `PANEL_SCALE` so text is legible on a Retina panel.
+    cell_w: usize,
+    cell_h: usize,
+    /// Integer glyph magnification (1 = raw font8x8). Each set font bit paints a `scale`x`scale`
+    /// block, so no font data or new asset is needed.
+    scale: usize,
     col: usize,
     row: usize,
     fg: u32,
@@ -99,6 +123,9 @@ impl FbCon {
             shadow: FrameBuffer::new(),
             cols: 0,
             rows: 0,
+            cell_w: CELL_W,
+            cell_h: CELL_H,
+            scale: 1,
             col: 0,
             row: 0,
             fg: FG_DEFAULT,
@@ -180,6 +207,7 @@ impl FbCon {
     fn glyph(&self, ch: u8, cx: usize, cy: usize) {
         let surf = self.draw_fb();
         let bitmap = font8x8::legacy::BASIC_LEGACY[ch as usize];
+        let s = self.scale;
         // VPERF M4 (x86): hoist the per-pixel format decode out of the 8x8 bit loop — encode the
         // foreground once, poke pre-encoded 4-byte pixels (bounds checks stay per pixel).
         #[cfg(target_arch = "x86_64")]
@@ -187,7 +215,12 @@ impl FbCon {
             for (ry, byte) in bitmap.iter().enumerate() {
                 for rx in 0..8 {
                     if byte & (1 << rx) != 0 {
-                        surf.put_raw4(cx + rx, cy + ry, raw);
+                        // scale == 1 collapses to the original single poke.
+                        for dy in 0..s {
+                            for dx in 0..s {
+                                surf.put_raw4(cx + rx * s + dx, cy + ry * s + dy, raw);
+                            }
+                        }
                     }
                 }
             }
@@ -196,7 +229,11 @@ impl FbCon {
         for (ry, byte) in bitmap.iter().enumerate() {
             for rx in 0..8 {
                 if byte & (1 << rx) != 0 {
-                    surf.put_pixel(cx + rx, cy + ry, self.fg);
+                    for dy in 0..s {
+                        for dx in 0..s {
+                            surf.put_pixel(cx + rx * s + dx, cy + ry * s + dy, self.fg);
+                        }
+                    }
                 }
             }
         }
@@ -212,13 +249,14 @@ impl FbCon {
         self.col = 0;
         self.row = if self.row + 1 >= self.rows { 0 } else { self.row + 1 };
         let next = if self.row + 1 >= self.rows { 0 } else { self.row + 1 };
-        let y = self.row * CELL_H;
-        self.draw_fb().fill_rows(y, y + CELL_H, self.bg);
-        self.mark_rows(y, y + CELL_H);
+        let ch = self.cell_h;
+        let y = self.row * ch;
+        self.draw_fb().fill_rows(y, y + ch, self.bg);
+        self.mark_rows(y, y + ch);
         if next != self.row {
-            let ny = next * CELL_H;
-            self.draw_fb().fill_rows(ny, ny + CELL_H, self.bg);
-            self.mark_rows(ny, ny + CELL_H);
+            let ny = next * ch;
+            self.draw_fb().fill_rows(ny, ny + ch, self.bg);
+            self.mark_rows(ny, ny + ch);
         }
     }
 
@@ -230,9 +268,9 @@ impl FbCon {
                 if self.col >= self.cols {
                     self.newline();
                 }
-                let cy = self.row * CELL_H;
-                self.glyph(b, self.col * CELL_W, cy);
-                self.mark_rows(cy, cy + CELL_H);
+                let cy = self.row * self.cell_h;
+                self.glyph(b, self.col * self.cell_w, cy);
+                self.mark_rows(cy, cy + self.cell_h);
                 self.col += 1;
             }
             _ => {} // ignore other control bytes
@@ -297,6 +335,9 @@ pub fn init(fb_addr: u64, fb_len: usize, info: FrameBufferInfo) {
             c.cols = info.width / CELL_W;
             c.rows = info.height / CELL_H;
         }
+        c.cell_w = CELL_W;
+        c.cell_h = CELL_H;
+        c.scale = 1;
         c.col = 0;
         c.row = 0;
         c.fg = FG_DEFAULT;
@@ -327,8 +368,10 @@ pub fn _print(args: core::fmt::Arguments) {
     // GUI boots paint only milestone lines (see `milestone`). The `bootlog` build keeps the full
     // mirror — holding the whole log on the panel is its entire purpose — and a panic re-enables
     // it so the panic text lands on the red backdrop.
+    // PANEL-CONSOLE is the third override (alongside the panic mirror): once the Kepler takeover
+    // has handed the GOP surface back, kernel console text is meant to be ON the panel.
     #[cfg(all(target_arch = "x86_64", not(feature = "bootlog")))]
-    if !PANIC_MIRROR.load(Ordering::Relaxed) {
+    if !PANIC_MIRROR.load(Ordering::Relaxed) && !PANEL_CONSOLE.load(Ordering::Relaxed) {
         return;
     }
     crate::arch::without_interrupts(|| {
@@ -480,6 +523,84 @@ pub fn attach_shadow() {
     if attached {
         serial_println!(":: fbcon: cached-RAM shadow attached — VRAM is now write-only ::");
     }
+}
+
+/// PANEL-CONSOLE — put the kernel console back on glass after the Kepler takeover.
+///
+/// ROOT CAUSE this exists for: fbcon's geometry was never wrong (its `current_info()` already
+/// matches the scanned GOP surface — stride 4096 px / 16384 B rows). fbcon simply never DREW on
+/// the metal media build. QUIET-PANEL makes `_print` return early on x86 builds without `bootlog`,
+/// and `milestone` — the one remaining on-panel leg — is `cfg`'d out entirely when `usbdebug` or
+/// `witness` is on. The metal Kepler media is a `usbdebug` build, so after the initial black fill
+/// fbcon painted exactly zero pixels for the whole boot. Nothing about the framebuffer, the stride
+/// or the takeover was hiding the text; there was no text.
+///
+/// This call is the seam that turns it back on, once — at the END of
+/// `kepler_display::takeover_display`, after its calibration pattern has been drawn, held and
+/// photographed. It:
+///   1. drops the cached-RAM shadow if one is attached, so drawing goes straight at the surface
+///      the panel is scanning (no stale full-surface blit can resurrect the calibration pattern);
+///   2. re-scales the glyph cell to `PANEL_SCALE` (8x8 is ~0.8 mm on this panel — invisible, per
+///      metal sitting #30) and recomputes the column/row grid;
+///   3. clears the panel (removing the calibration pattern) and homes the cursor;
+///   4. flips `PANEL_CONSOLE`, so every subsequent `serial_println!` mirrors onto the panel;
+///   5. replays the boot-milestone ring so the panel carries the boot's history, not just whatever
+///      happens to print next.
+///
+/// Returns the number of text rows painted by the replay. Gated to the Kepler-takeover call site,
+/// so no other boot path changes behaviour.
+#[cfg(target_arch = "x86_64")]
+pub fn panel_console_resume() -> usize {
+    let mut base = 0u64;
+    let mut pitch = 0usize;
+    let mut cell = (0usize, 0usize);
+    let mut grid = (0usize, 0usize);
+    GUI_ACTIVE.store(false, Ordering::Relaxed);
+    crate::arch::without_interrupts(|| {
+        if let Some(mut c) = FBCON.try_lock() {
+            if !c.ready {
+                return;
+            }
+            // (1) direct-VRAM from here on.
+            c.shadow_store = None;
+            // (2) legible cell.
+            c.scale = PANEL_SCALE;
+            c.cell_w = CELL_W * PANEL_SCALE;
+            c.cell_h = CELL_H * PANEL_SCALE;
+            let info = c.fb.info();
+            c.cols = (info.width / c.cell_w).max(1);
+            c.rows = (info.height / c.cell_h).max(1);
+            // (3) clear the calibration pattern off the whole real surface, home the cursor.
+            c.col = 0;
+            c.row = 0;
+            c.fg = FG_DEFAULT;
+            c.bg = BG_DEFAULT;
+            c.full_fb().fill_screen(BG_DEFAULT);
+            c.full_fb().flush_all();
+            base = c.fb.base() as u64;
+            pitch = info.stride * info.bytes_per_pixel;
+            cell = (c.cell_w, c.cell_h);
+            grid = (c.cols, c.rows);
+        }
+    });
+    if base == 0 {
+        serial_println!(":: fbcon: glyphs-active ABORT console-not-ready ::");
+        return 0;
+    }
+    // (4) from this line on, serial output is mirrored onto the panel — this marker is itself the
+    // first thing drawn, so seeing it on glass is the proof that glyph rendering reaches the panel.
+    PANEL_CONSOLE.store(true, Ordering::Relaxed);
+    serial_println!(
+        ":: fbcon: glyphs-active base={:08X} pitch={} cell={}x{} cols={} rows={} scale={} ::",
+        base, pitch, cell.0, cell.1, grid.0, grid.1, PANEL_SCALE
+    );
+    // (5) replay the boot-milestone ring.
+    let mut buf = [(0u64, ""); crate::bootlog::capacity()];
+    let n = crate::bootlog::snapshot(&mut buf);
+    for (ms, tag) in &buf[..n] {
+        serial_println!(":: [{:>8} ms] {} ::", ms, tag);
+    }
+    n + 1
 }
 
 /// Repaint the screen as a panic backdrop (dark red) and home the cursor, so the panic message

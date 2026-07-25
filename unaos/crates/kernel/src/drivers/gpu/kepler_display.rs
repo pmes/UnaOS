@@ -436,6 +436,14 @@ pub unsafe fn takeover_display(
 
     serial_println!(":: kdisp: fb-draw done ::");
 
+    // CONSOLE-ON-PANEL seam. The calibration pattern above has been drawn, held for its 5 s photo
+    // window and probed; the surface is now free. Hand it to the kernel console: fbcon clears the
+    // pattern, switches to a legible glyph cell and starts mirroring serial output onto the panel
+    // (see `fbcon::panel_console_resume` for why it was painting nothing before). Everything above
+    // this line — the draw, the hold, the register dumps — is untouched.
+    let repainted = crate::video::fbcon::panel_console_resume();
+    serial_println!(":: kdisp: console-repaint rows={} ::", repainted);
+
     // Completed fb-draw cycle: return the gop pointer so the late recap
     // (kepler.rs, printed inside the FTDI-ring window) can prove this leg ran.
     Some(gop_vram_offset)
