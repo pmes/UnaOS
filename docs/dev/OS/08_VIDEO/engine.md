@@ -812,7 +812,9 @@ boot is its first real exercise, and a `bad_ram=0` there is the first datum that
 
 > **Hazard — an instrumented build is not a neutral observer.** `IVAC` discards anything dirty-and-unclean
 > in those full scanlines, which in a correct build is nothing (`draw_window` just cleaned a strict superset)
-> but in a broken one can drop pixels, including console pixels sharing the edge cache lines.
+> but in a broken one can drop pixels — and the invalidated extent is full-width panel scanlines, not the
+> window's columns, so the concrete exposure is `fbcon`'s deferred dirty band (`mark_rows`/`flush_dirty`):
+> unflushed console glyphs on those rows are discarded and the redraw restores only the window, not them.
 > `verify_window` therefore redraws and re-flushes the window before returning. Consequence: in the presence
 > of a flush defect a `witness` build can differ visibly from a default build, in either direction. Do not
 > read a witness build's panel as evidence about a default build's panel.

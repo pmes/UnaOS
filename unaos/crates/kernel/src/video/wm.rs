@@ -702,9 +702,12 @@ pub fn composite() {
 ///
 /// **Consequence, accepted deliberately.** `IVAC` over these rows discards anything in them that was
 /// dirty-and-unclean, which in a correct build is nothing (`draw_window` just cleaned a strict superset of
-/// them). In a BROKEN build it can drop pixels — including console pixels sharing the edge cache lines of
-/// these full scanlines. That is why this function REDRAWS the window afterwards: the rect is restored and
-/// re-flushed before returning. The residue is bounded, `witness`-gated, and strictly preferable to an
+/// them). In a BROKEN build it can drop pixels — and the invalidated extent is FULL-WIDTH panel scanlines,
+/// not this window's columns, so the concrete exposure is `fbcon`'s deferred dirty band (`mark_rows` →
+/// `flush_dirty`): console glyphs written on another core but not yet flushed lose their pixels, and the
+/// redraw below restores only THIS window's rect, not theirs. That is why this function REDRAWS the window
+/// afterwards: the window's rect is restored and re-flushed before returning; any co-resident console
+/// residue is transient and repaired by the console's next flush. The residue is bounded, `witness`-gated, and strictly preferable to an
 /// instrument that lies. See the hazard note in `engine.md` §WC-D: a witness build can therefore look
 /// DIFFERENT from a default build in the presence of a flush defect, in both directions.
 ///
@@ -811,9 +814,11 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window) {
 }
 
 /// WC-D — window ids whose [`verify_window`] verdict has already been emitted (bit `id`), so the read-back
-/// runs once per window rather than once per frame. Set only AFTER a verdict was actually printed — a
-/// guarded-out window that burned its latch would leave the gate's REQUIRE failing with no line to explain
-/// why.
+/// runs once per window rather than once per frame. The latch is set BEFORE `verify_window` runs (the
+/// `fetch_or` in `composite` claims the bit), so the invariant that keeps the gate diagnosable is carried
+/// by `verify_window` itself: EVERY path through it emits a line — PASS, FAIL, or `-> SKIP` with a reason.
+/// A future early return added without a line would burn the latch silently and leave the spec's REQUIRE
+/// failing with nothing to explain why.
 #[cfg(feature = "witness")]
 static VERIFIED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
