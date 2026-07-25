@@ -1,4 +1,7 @@
-STATUS: PROPOSED
+STATUS: APPROVED (2026-07-25, coordinator GR4). No amendments — matches the
+brief exactly: probe writes confined to the four Falcon memory-port
+registers, zero execution, witness rematch retained as per-boot baseline.
+All brief gates apply.
 
 # PROPOSAL: kepler-fence pull 21 - K-GPU-4 milestone 1 — Falcon IMEM/DMEM access probe
 

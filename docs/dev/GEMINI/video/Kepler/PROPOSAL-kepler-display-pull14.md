@@ -1,4 +1,6 @@
-STATUS: PROPOSED
+STATUS: APPROVED (2026-07-25, coordinator GR4). No amendments — matrix,
+index math, and byte math all check out (worst case 0x1C80000, inside
+scratch). Implement exactly as written; all brief gates apply.
 
 # Proposal — kepler-display pull 14: block-width × aligned-pitch matrix
 
