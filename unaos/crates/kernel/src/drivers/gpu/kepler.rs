@@ -508,6 +508,17 @@ pub fn init(gpu: &GpuInfo) {
                                                 break;
                                             }
                                         
+                                            let dmactl_pre = mmio_read(bar0, base + 0x10C);
+                                            serial_println!(":: kepler: dmactl pre={:08X} ::", dmactl_pre);
+                                            mmio_write(bar0, base + 0x10C, dmactl_pre & !1);
+                                            let dmactl_post = mmio_read(bar0, base + 0x10C);
+                                            serial_println!(":: kepler: dmactl post={:08X} ::", dmactl_post);
+
+                                            if (dmactl_post & 1) != 0 {
+                                                serial_println!(":: kepler: dmactl REFUSED ::");
+                                                continue;
+                                            }
+
                                             mmio_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                             mmio_write(bar0, base + 0x100, 2); // CPUCTL START_TRIGGER
                                             serial_println!(":: kepler: ucode start cpuctl<=00000002 ::");
