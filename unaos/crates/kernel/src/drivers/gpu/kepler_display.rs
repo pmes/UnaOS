@@ -266,150 +266,126 @@ pub unsafe fn takeover_display(
     serial_println!(":: kdisp: latch pre asm={:08X} armed={:08X} shadow={:08X} ::", pre_asm, pre_armed, pre_shadow);
 
     // --- Pull 15: Mirror Surface Params (Recon) ---
-    // Pass 1: Dense Dump
-    for offset in (0x400..=0x5FC).step_by(4) {
-        let val = mmio_read(bar0, 0x640000 + offset);
-        let abs = if val == 0xFFFFFFFF || (val & 0xFFFF0000) == 0xBAD00000 { " ABSENT?" } else { "" };
-        serial_println!(":: kdisp: mirror-sp off={:03X} val={:08X}{} ::", offset, val, abs);
-    }
-
-    // Settle
-    for _ in 0..1_500_000 { core::hint::spin_loop(); }
-
-    // Pass 2: Volatility Check
-    for offset in (0x400..=0x5FC).step_by(4) {
-        let val = mmio_read(bar0, 0x640000 + offset);
-        let abs = if val == 0xFFFFFFFF || (val & 0xFFFF0000) == 0xBAD00000 { " ABSENT?" } else { "" };
-        serial_println!(":: kdisp: mirror-sp2 off={:03X} val={:08X}{} ::", offset, val, abs);
-    }
-
-    // Pass 3: Cross-Check Candidates
-    let ptr_val = mmio_read(bar0, 0x640460);
-    serial_println!(":: kdisp: mirror-sp ptr-slot val={:08X} expect=00090000-ish (fw surface ptr>>8?) ::", ptr_val);
-
-    for offset in (0x400..=0x5FC).step_by(4) {
-        let val = mmio_read(bar0, 0x640000 + offset);
-        if val == 0xFFFFFFFF || (val & 0xFFFF0000) == 0xBAD00000 || val == 0 { continue; }
-        
-        let mut kind = "";
-        if val == 11520 || val == 46080 || val == 720 || val == 180 || val == 192 || val == 256 || val == (11520<<8) {
-            kind = "pitch";
-        } else if (val & 0xFFFF) == 2880 || (val >> 16) == 2880 || (val & 0xFFFF) == 1800 || (val >> 16) == 1800 {
-            kind = "wh";
-        } else if val < 0x100 {
-            kind = "blockmode";
+    let run_recon = false;
+    if run_recon {
+        // Pass 1: Dense Dump
+        for offset in (0x400..=0x5FC).step_by(4) {
+            let val = mmio_read(bar0, 0x640000 + offset);
+            let abs = if val == 0xFFFFFFFF || (val & 0xFFFF0000) == 0xBAD00000 { " ABSENT?" } else { "" };
+            serial_println!(":: kdisp: mirror-sp off={:03X} val={:08X}{} ::", offset, val, abs);
         }
-        
-        if !kind.is_empty() {
-            serial_println!(":: kdisp: mirror-sp cand off={:03X} val={:08X} kind={} ::", offset, val, kind);
+
+        // Settle
+        for _ in 0..1_500_000 { core::hint::spin_loop(); }
+
+        // Pass 2: Volatility Check
+        for offset in (0x400..=0x5FC).step_by(4) {
+            let val = mmio_read(bar0, 0x640000 + offset);
+            let abs = if val == 0xFFFFFFFF || (val & 0xFFFF0000) == 0xBAD00000 { " ABSENT?" } else { "" };
+            serial_println!(":: kdisp: mirror-sp2 off={:03X} val={:08X}{} ::", offset, val, abs);
+        }
+
+        // Pass 3: Cross-Check Candidates
+        let ptr_val = mmio_read(bar0, 0x640460);
+        serial_println!(":: kdisp: mirror-sp ptr-slot val={:08X} expect=00090000-ish (fw surface ptr>>8?) ::", ptr_val);
+
+        for offset in (0x400..=0x5FC).step_by(4) {
+            let val = mmio_read(bar0, 0x640000 + offset);
+            if val == 0xFFFFFFFF || (val & 0xFFFF0000) == 0xBAD00000 || val == 0 { continue; }
+            
+            let mut kind = "";
+            if val == 11520 || val == 46080 || val == 720 || val == 180 || val == 192 || val == 256 || val == (11520<<8) {
+                kind = "pitch";
+            } else if (val & 0xFFFF) == 2880 || (val >> 16) == 2880 || (val & 0xFFFF) == 1800 || (val >> 16) == 1800 {
+                kind = "wh";
+            } else if val < 0x100 {
+                kind = "blockmode";
+            }
+            
+            if !kind.is_empty() {
+                serial_println!(":: kdisp: mirror-sp cand off={:03X} val={:08X} kind={} ::", offset, val, kind);
+            }
         }
     }
     
-    let do_takeover = false;
+    let do_takeover = true;
     if !do_takeover {
         return None;
     }
     // --- End Pull 15 ---
 
-    let cycles = [(2, 192), (2, 256), (4, 192), (4, 256)];
+    let pitch_bytes = 16384;
+    let total_bytes = expected_height * pitch_bytes;
     let new_ptr = 0x00016000;
-    let bh = 4;
 
-    for &(bw, pg) in &cycles {
-        let blocks_per_row = pg / bw;
-        let padded_width_px = pg * 16;
-        let gob_rows = (expected_height + gob_height - 1) / gob_height;
-        let num_block_rows = (gob_rows + bh - 1) / bh;
-        let total_bytes = num_block_rows * bw * bh * blocks_per_row * gob_size_bytes;
-
-        // Step 1: Prepare surf2 (pre-swizzled ruler pattern fill)
-        for y in 0..expected_height {
-            let block_color = match (y / 64) % 8 {
-                0 => 0xFFFF0000, // RED
-                1 => 0xFF00FF00, // GREEN
-                2 => 0xFF0000FF, // BLUE
-                3 => 0xFFFFFF00, // YELLOW
-                4 => 0xFF00FFFF, // CYAN
-                5 => 0xFFFF00FF, // MAGENTA
-                6 => 0xFFFFFFFF, // WHITE
-                _ => 0xFF404040, // GRAY
-            };
-            
-            let row_color = if y % 64 == 0 {
+    // Step 1: Prepare surf2 (linear fill)
+    for y in 0..expected_height {
+        let block_color = match (y / 64) % 8 {
+            0 => 0xFFFF0000, // RED
+            1 => 0xFF00FF00, // GREEN
+            2 => 0xFF0000FF, // BLUE
+            3 => 0xFFFFFF00, // YELLOW
+            4 => 0xFF00FFFF, // CYAN
+            5 => 0xFFFF00FF, // MAGENTA
+            6 => 0xFFFFFFFF, // WHITE
+            _ => 0xFF404040, // GRAY
+        };
+        
+        let row_color = if y % 64 == 0 {
+            0xFF000000 // BLACK
+        } else {
+            block_color
+        };
+        
+        let row_base = y * pitch_bytes;
+        
+        for x in 0..(pitch_bytes / 4) {
+            let final_color = if x >= 2880 {
+                0xFF000000 // BLACK
+            } else if x < 256 {
+                0xFFFFFFFF // WHITE
+            } else if x < 264 {
                 0xFF000000 // BLACK
             } else {
-                block_color
+                row_color
             };
             
-            let gob_y = y / gob_height;
-            let inner_y = y % gob_height;
-            let blk_y = gob_y / bh;
-            let gob_inner_y = gob_y % bh;
-            
-            for x in 0..padded_width_px {
-                let final_color = if x >= 2880 {
-                    0xFF000000 // BLACK
-                } else if x < 256 {
-                    0xFFFFFFFF // WHITE
-                } else if x < 264 {
-                    0xFF000000 // BLACK
-                } else {
-                    row_color
-                };
-                
-                let px_byte_x = x * 4;
-                let gob_x = px_byte_x / gob_width_bytes;
-                let inner_x = px_byte_x % gob_width_bytes;
-                
-                let blk_col = gob_x / bw;
-                let gob_inner_x = gob_x % bw;
-                
-                let blk_index = (blk_y * blocks_per_row) + blk_col;
-                let gob_inner_index = (gob_inner_y * bw) + gob_inner_x;
-                
-                let target_byte_addr = (blk_index * bw * bh * gob_size_bytes) 
-                                     + (gob_inner_index * gob_size_bytes) 
-                                     + (inner_y * gob_width_bytes) 
-                                     + inner_x;
-                
-                let target_ptr = dst.add(target_byte_addr as usize) as *mut u32;
-                core::ptr::write_volatile(target_ptr, final_color);
-            }
+            let target_byte_addr = row_base + (x * 4);
+            let target_ptr = dst.add(target_byte_addr as usize) as *mut u32;
+            core::ptr::write_volatile(target_ptr, final_color);
         }
-        serial_println!(":: kdisp: bwpg-step bw={} bh=4 pg={} fill done bytes={:08X} ::", bw, pg, total_bytes);
-
-        // Step 2: Latch Sequence
-        mmio_write(bar0, asm_reg, new_ptr);
-        let rb_asm = mmio_read(bar0, asm_reg);
-        
-        if rb_asm != new_ptr {
-            serial_println!(":: kdisp: latch skip — asm rb unchanged ::");
-            let final_asm = mmio_read(bar0, asm_reg);
-            let final_armed = mmio_read(bar0, armed_reg);
-            let final_shadow = mmio_read(bar0, shadow_reg);
-            serial_println!(":: kdisp: latch restored asm={:08X} armed={:08X} shadow={:08X} ::", final_asm, final_armed, final_shadow);
-            serial_println!(":: kdisp: latch verdict asm-stuck=n armed-followed=n ::");
-            return None;
-        }
-
-        mmio_write(bar0, update_reg, 0x00000000);
-        
-        // 4 s hold
-        // 5 s per hold — bench needs camera time between the four bh cycles
-        // (Peter, s21 prep: 4 s was too fast to photograph).
-        for t in 1..=5 {
-            for _ in 0..60_000_000 { core::hint::spin_loop(); }
-            serial_println!(":: kdisp: bwpg-step bw={} bh=4 pg={} hold t={}s ::", bw, pg, t);
-        }
-
-        // Step 3: Restore
-        mmio_write(bar0, asm_reg, pre_asm);
-        mmio_write(bar0, update_reg, 0x00000000);
-        
-        // 1 s recovery gap
-        for _ in 0..15_000_000 { core::hint::spin_loop(); }
-        serial_println!(":: kdisp: bwpg-step bw={} bh=4 pg={} done ::", bw, pg);
     }
+    serial_println!(":: kdisp: lin-step pitch=4000 fill done bytes={:08X} ::", total_bytes);
+
+    // Step 2: Latch Sequence
+    mmio_write(bar0, asm_reg, new_ptr);
+    let rb_asm = mmio_read(bar0, asm_reg);
+    
+    if rb_asm != new_ptr {
+        serial_println!(":: kdisp: latch skip — asm rb unchanged ::");
+        let final_asm = mmio_read(bar0, asm_reg);
+        let final_armed = mmio_read(bar0, armed_reg);
+        let final_shadow = mmio_read(bar0, shadow_reg);
+        serial_println!(":: kdisp: latch restored asm={:08X} armed={:08X} shadow={:08X} ::", final_asm, final_armed, final_shadow);
+        serial_println!(":: kdisp: latch verdict asm-stuck=n armed-followed=n ::");
+        return None;
+    }
+
+    mmio_write(bar0, update_reg, 0x00000000);
+    
+    // 5 s hold
+    for t in 1..=5 {
+        for _ in 0..60_000_000 { core::hint::spin_loop(); }
+        serial_println!(":: kdisp: lin-step pitch=4000 hold t={}s ::", t);
+    }
+
+    // Step 3: Restore
+    mmio_write(bar0, asm_reg, pre_asm);
+    mmio_write(bar0, update_reg, 0x00000000);
+    
+    // 1 s recovery gap
+    for _ in 0..15_000_000 { core::hint::spin_loop(); }
+    serial_println!(":: kdisp: lin-step pitch=4000 done ::");
     
     // 7. Verdict
     serial_println!(":: kdisp: latch verdict asm-stuck=y ::");

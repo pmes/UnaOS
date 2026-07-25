@@ -379,6 +379,26 @@ pub fn init(gpu: &GpuInfo) {
                                     } else {
                                         for _ in 0..2_000_000 { core::hint::spin_loop(); }
 
+                                        // --- K-GPU-4 Pull 23: FECS / GPCCS Falcon Base Recon ---
+                                        for &base in &[0x409000, 0x41A000] {
+                                            for pass in 0..2 {
+                                                if pass == 1 {
+                                                    for _ in 0..2_000_000 { core::hint::spin_loop(); }
+                                                }
+                                                let tag = if pass == 0 { "fal-base" } else { "fal-base2" };
+                                                
+                                                for offset in (0..=0x1FC).step_by(4) {
+                                                    let val = mmio_read(bar0, base + offset);
+                                                    let abs = if val == 0xFFFFFFFF || val == 0xBAD0BA20 || val == 0xBADF1000 { " ABSENT?" } else { "" };
+                                                    serial_println!(":: kepler: {} b={:06X} off={:03X} val={:08X}{} ::", tag, base, offset, val, abs);
+                                                }
+                                            }
+                                            let cpuctl = mmio_read(bar0, base + 0x100);
+                                            let imemc = mmio_read(bar0, base + 0x180);
+                                            let dmemc = mmio_read(bar0, base + 0x1C0);
+                                            serial_println!(":: kepler: fal-base b={:06X} verdict cpuctl={:08X} imemc={:08X} dmemc={:08X} ::", base, cpuctl, imemc, dmemc);
+                                        }
+
                                         for pass in 0..2 {
                                             if pass == 1 {
                                                 for _ in 0..2_000_000 { core::hint::spin_loop(); }
