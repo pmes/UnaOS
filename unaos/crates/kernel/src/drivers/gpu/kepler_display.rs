@@ -318,7 +318,9 @@ pub unsafe fn takeover_display(
     // Step 1: Prepare surf2 (linear fill, placement-model probe)
     for y in 0..expected_height {
         let band_idx = y / 16;
-        let band_color = match band_idx % 8 {
+        // Band 0 gets a colour no other band uses, so "our row 0" is
+        // identifiable in the photo without decoding the barcode.
+        let band_color = if band_idx == 0 { 0xFFFF8000 } else { match band_idx % 8 {
             0 => 0xFFFF0000,
             1 => 0xFF00FF00,
             2 => 0xFF0000FF,
@@ -327,26 +329,45 @@ pub unsafe fn takeover_display(
             5 => 0xFFFF00FF,
             6 => 0xFFFFFFFF,
             _ => 0xFF404040,
-        };
+        } };
         
         let row_base = y * pitch_bytes;
         
         for x in 0..(pitch_bytes / 4) {
-            let final_color = if x >= 2880 {
-                0xFF000000 // BLACK padding
+            // Diagonal ramp: x advances linearly with y across the whole
+            // surface, so its slope measures the src-row -> panel-row map
+            // globally. Survives blur and exposure error where 16 px band
+            // heights do not; a truncated diagonal gives the window height,
+            // a non-zero start x gives the base offset.
+            let diag_x = 176 + (y * 2560 / expected_height);
+
+            let final_color = if x >= expected_width {
+                0xFF000000 // BLACK padding (real bytes the hw scans)
+            } else if y < 4 || y >= expected_height - 4 {
+                0xFFFFFFFF // FIDUCIAL: surface top/bottom edges, unmistakable
             } else if x < 16 {
                 0xFFFFFFFF // WHITE left-edge alignment marker
             } else if x < 32 {
                 0xFF000000 // BLACK spacer
             } else if x < 144 {
-                let bit_idx = 6 - ((x - 32) / 16);
-                if (band_idx >> bit_idx) & 1 == 1 {
-                    0xFFFFFFFF // WHITE
+                // 7-bit barcode of band_idx, 16 px cells with a 4 px gutter so
+                // adjacent equal bits stay countable (without the gutter,
+                // 0b1110000 reads as one 48 px run and aliases to 0b1100000).
+                let cell = (x - 32) % 16;
+                if cell >= 12 {
+                    0xFF000000 // gutter
                 } else {
-                    0xFF000000 // BLACK
+                    let bit_idx = 6 - ((x - 32) / 16);
+                    if (band_idx >> bit_idx) & 1 == 1 {
+                        0xFFFFFFFF // WHITE
+                    } else {
+                        0xFF000000 // BLACK
+                    }
                 }
             } else if x < 160 {
                 0xFF000000 // BLACK spacer
+            } else if x >= diag_x && x < diag_x + 16 {
+                0xFFFFFFFF // diagonal ramp
             } else {
                 band_color
             };
@@ -356,14 +377,37 @@ pub unsafe fn takeover_display(
             core::ptr::write_volatile(target_ptr, final_color);
         }
     }
-    serial_println!(":: kdisp: pm-step fill done bytes={:08X} ::", total_bytes);
+    serial_println!(":: kdisp: pm-step fill done bytes={:08X} fill_pitch={} ::", total_bytes, pitch_bytes);
+
+    // Overlap check: if our scratch surface intersects the firmware's GOP
+    // framebuffer, a photo of our pattern proves nothing about the latch —
+    // we would simply have painted into the surface already being scanned.
+    // Log it, never abort (an abort would kill the sitting).
+    let gop_bytes = (expected_height * pitch_bytes) as usize;
+    let surf2_bytes = total_bytes as usize;
+    let overlap = surf2_offset < gop_vram_offset + gop_bytes
+        && gop_vram_offset < surf2_offset + surf2_bytes;
+    serial_println!(":: kdisp: pm-step gop-overlap={} surf2={:08X}+{:08X} gop={:08X}+{:08X} ::",
+        if overlap { "YES-RESULT-VOID" } else { "no" },
+        surf2_offset, total_bytes, gop_vram_offset, gop_bytes);
+
+    // Pre-latch control frame: the surface is painted but NOT yet armed, so
+    // this hold shows whatever the head is scanning right now. Photo A here
+    // vs photo B after the latch is the actual experiment — if A already
+    // shows our bands, the latch is not what put them there.
+    serial_println!(":: kdisp: pm-step pre-latch-hold begin (photo A — expect firmware console) ::");
+    for t in 1..=3 {
+        for _ in 0..60_000_000 { core::hint::spin_loop(); }
+        serial_println!(":: kdisp: pm-step pre-latch-hold t={}s ::", t);
+    }
+    serial_println!(":: kdisp: pm-step pre-latch-hold end ::");
 
     // Step 2: Latch Sequence
     mmio_write(bar0, asm_reg, new_ptr);
     let rb_asm = mmio_read(bar0, asm_reg);
-    
+
     if rb_asm != new_ptr {
-        serial_println!(":: kdisp: latch skip — asm rb unchanged ::");
+        serial_println!(":: kdisp: latch skip — asm rb={:08X} want={:08X} ::", rb_asm, new_ptr);
         let final_asm = mmio_read(bar0, asm_reg);
         let final_armed = mmio_read(bar0, armed_reg);
         let final_shadow = mmio_read(bar0, shadow_reg);
@@ -374,23 +418,36 @@ pub unsafe fn takeover_display(
 
     mmio_write(bar0, update_reg, 0x00000000);
     
-    // 5 s hold
-    let mut dumped = false;
+    // 5 s hold (standing length — Peter's camera calibration, s21)
+    serial_println!(":: kdisp: pm-step hold begin (photo B — post-latch) ::");
     for t in 1..=5 {
         for _ in 0..60_000_000 { core::hint::spin_loop(); }
         serial_println!(":: kdisp: pm-step hold t={}s ::", t);
-        if !dumped {
-            serial_println!(":: kdisp: pm-step reg-dump ptr={:08X} size={:08X} store={:08X} fmt={:08X} ::",
+        // Dump on the FIRST and LAST tick: a latch that reverts mid-hold is
+        // invisible to a single sample.
+        if t == 1 || t == 5 {
+            serial_println!(":: kdisp: pm-step reg-dump t={} ptr={:08X} ptr_hi={:08X} size={:08X} store={:08X} fmt={:08X} ::",
+                t,
                 mmio_read(bar0, 0x640460),
+                mmio_read(bar0, 0x640464),
                 mmio_read(bar0, 0x640468),
                 mmio_read(bar0, 0x64046C),
                 mmio_read(bar0, 0x640470));
+            // Armed/shadow readouts separate "armed a truncated value" from
+            // "UPDATE never propagated" — currently byte-identical states.
+            serial_println!(":: kdisp: pm-step reg-dump t={} armed={:08X} shadow={:08X} ::",
+                t, mmio_read(bar0, armed_reg), mmio_read(bar0, shadow_reg));
             for off in (0x4B8..=0x4C8).step_by(4) {
                 serial_println!(":: kdisp: pm-step reg-dump off={:03X} val={:08X} ::", off, mmio_read(bar0, 0x640000 + off));
             }
-            dumped = true;
+            // Which head is actually live: the one whose vline/vblank advances.
+            for h in 0..4usize {
+                let vert = mmio_read(bar0, 0x610000 + 0x6000 + h * 0x800 + 0x340);
+                serial_println!(":: kdisp: pm-step head-stat t={} h={} vert={:08X} ::", t, h, vert);
+            }
         }
     }
+    serial_println!(":: kdisp: pm-step hold end ::");
 
     // Step 3: Restore
     mmio_write(bar0, asm_reg, pre_asm);

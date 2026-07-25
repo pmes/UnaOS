@@ -28,6 +28,13 @@ pub mod regs {
     pub const NV_PDISPLAY_SIZE: usize = 0x0001_0000; // Scan 64KB of display engine regs
 }
 
+/// s26/s28 FTDI-ring budget: the 0x640000 window is PARKED (triple-refuted),
+/// and its four 256-row dumps cost ~54 KiB of the 64 KiB drop-oldest boot ring
+/// (drivers/xhci/ftdi.rs) — enough to evict the display and ucode legs from the
+/// capture. Values are still collected and summarised; only the dense rows are
+/// silenced. Flip to re-enable the raw dumps.
+const MIRROR_HDR_DENSE: bool = false;
+
 pub fn init(gpu: &GpuInfo) {
     serial_println!("[NVIDIA] Initializing Kepler GPU at BDF {}:{}:{}", gpu.bus, gpu.slot, gpu.func);
 
@@ -164,7 +171,7 @@ pub fn init(gpu: &GpuInfo) {
         for (i, offset) in (0..=0x3FC).step_by(4).enumerate() {
             let val = mmio_read(bar0, 0x640000 + offset);
             mirror_hdr_pre[i] = val;
-            serial_println!(":: kepler: mirror-hdr pre off={:03X} val={:08X} ::", offset, val);
+            if MIRROR_HDR_DENSE { serial_println!(":: kepler: mirror-hdr pre off={:03X} val={:08X} ::", offset, val); }
         }
         serial_println!(":: kepler: mirror-hdr pre done rows=256 ::");
 
@@ -285,7 +292,7 @@ pub fn init(gpu: &GpuInfo) {
                                     for (i, offset) in (0..=0x3FC).step_by(4).enumerate() {
                                         let val = mmio_read(bar0, 0x640000 + offset);
                                         let pre_val = mirror_hdr_pre[i];
-                                        serial_println!(":: kepler: mirror-hdr pass0 off={:03X} val={:08X} ::", offset, val);
+                                        if MIRROR_HDR_DENSE { serial_println!(":: kepler: mirror-hdr pass0 off={:03X} val={:08X} ::", offset, val); }
                                         if val != pre_val {
                                             serial_println!(":: kepler: latch-delta off={:03X} pre={:08X} post={:08X} ::", offset, pre_val, val);
                                             diff_found = true;
@@ -328,7 +335,7 @@ pub fn init(gpu: &GpuInfo) {
                                     let mut beacons_seen = 0;
                                     for offset in (0..=0x3FC).step_by(4) {
                                         let val = mmio_read(bar0, 0x640000 + offset);
-                                        serial_println!(":: kepler: mirror-hdr pass1 off={:03X} val={:08X} ::", offset, val);
+                                        if MIRROR_HDR_DENSE { serial_println!(":: kepler: mirror-hdr pass1 off={:03X} val={:08X} ::", offset, val); }
                                         if val >= 0xBEAC0001 && val <= 0xBEAC0008 {
                                             serial_println!(":: kepler: beacon SEEN off={:03X} val={:08X} ::", offset, val);
                                             beacons_seen += 1;
@@ -347,7 +354,7 @@ pub fn init(gpu: &GpuInfo) {
                                     let mut rows_pass2 = 0;
                                     for offset in (0..=0x3FC).step_by(4) {
                                         let val = mmio_read(bar0, 0x640000 + offset);
-                                        serial_println!(":: kepler: mirror-hdr pass2 off={:03X} val={:08X} ::", offset, val);
+                                        if MIRROR_HDR_DENSE { serial_println!(":: kepler: mirror-hdr pass2 off={:03X} val={:08X} ::", offset, val); }
                                         rows_pass2 += 1;
                                     }
                                     serial_println!(":: kepler: mirror-hdr pass2 done rows={} ::", rows_pass2);
@@ -436,66 +443,104 @@ pub fn init(gpu: &GpuInfo) {
                                         }
 
                                         // --- K-GPU-4 Milestone 2: First Ucode Execution (FECS ONLY) ---
+                                        // Two candidate IO-port encodings, run A-then-B-only-if-needed (one
+                                        // variable per shot, distinct magics so the mailbox names the winner):
+                                        //   A: falcon I[0x1000] — the INDEXED scheme, host reg X -> (X & 0xffc) << 6,
+                                        //      as nouveau's Kepler FECS/GPCCS ucode computes it (macros.fuc nv_mkio).
+                                        //   B: falcon I[0x0040] — the FLAT scheme (host offset used directly), the
+                                        //      "GF119+ some engines stopped using indexed accesses" escape hatch.
+                                        // s28 correction: the s27 approval amendment specified B only; the indexed
+                                        // scheme is the better-evidenced default, so A goes first.
+                                        //
+                                        // Assembly (envytools Falcon ISA v4; docs/hw/falcon/{arith,io,proc}.rst):
+                                        //   f1 17 <lo> <hi>  mov   $r1, PORT     I16 immediate
+                                        //   f1 27 ce fa      mov   $r2, 0xface   I16 sign-extended
+                                        //   f1 23 0d f0      sethi $r2, 0xf00d   replaces the high half
+                                        //   d1 12 00         iowrs I[$r1], $r2   synchronous IO write
+                                        //   f8 02            exit
+                                        const UCODE_A: [u32; 5] = [0x100017f1, 0xface27f1, 0xf00d23f1, 0xf80012d1, 0x00000002];
+                                        const UCODE_B: [u32; 5] = [0x004017f1, 0xbeef27f1, 0xf00d23f1, 0xf80012d1, 0x00000002];
+                                        const MB_SEED: u32 = 0xA5A5_0000;
+                                        // IMEM page granularity: the code TLB marks a page usable only when the
+                                        // last word of the 0x40-word page is written (nouveau pads for this reason).
+                                        const IMEM_PAGE_WORDS: usize = 0x40;
+                                        
                                         let base = 0x409000;
                                         
-                                        // Envytools Falcon ISA v4 encodings
-                                        // 0x0000   | f0 17 40    | mov $r1, 0x40      | docs/hw/falcon/arith.rst (Form: R2, I8)
-                                        // 0x0003   | f1 27 ce fa | mov $r2, -0x532    | docs/hw/falcon/arith.rst (Form: R2, I16 sign-ext, -0x532 = 0xface)
-                                        // 0x0007   | f1 23 0d f0 | sethi $r2, 0xf00d  | docs/hw/falcon/arith.rst (Form: R2, I16 zero-ext)
-                                        // 0x000b   | d0 12 00    | iowr I[$r1], $r2   | docs/hw/falcon/io.rst (Form: R2, I8, R1)
-                                        // 0x000e   | f8 02       | exit               | docs/hw/falcon/proc.rst
-                                        const UCODE_M2: [u32; 4] = [
-                                            0xf14017f0, 
-                                            0xf1face27, 
-                                            0xd0f00d23, 
-                                            0x02f80012, 
-                                        ];
-
-                                        serial_println!(":: kepler: ucode ioport=0x40 ::");
-
-                                        let pre_mb0 = mmio_read(bar0, base + 0x040);
-                                        let pre_cpuctl = mmio_read(bar0, base + 0x100);
-                                        serial_println!(":: kepler: ucode pre mailbox0={:08X} cpuctl={:08X} ::", pre_mb0, pre_cpuctl);
-
-                                        mmio_write(bar0, base + 0x180, 1 << 24); // IMEMC offset=0, AINCW
-                                        mmio_write(bar0, base + 0x188, 0); // IMEMT tag=0 per 256B block
+                                        for &(img_label, img, want) in &[("A", &UCODE_A, 0xF00DFACEu32), ("B", &UCODE_B, 0xF00DBEEFu32)] {
+                                            let port = if img_label == "A" { 0x1000 } else { 0x0040 };
+                                            serial_println!(":: kepler: ucode img={} ioport={:04X} want={:08X} ::", img_label, port, want);
                                         
-                                        for &word in &UCODE_M2 {
-                                            mmio_write(bar0, base + 0x184, word);
-                                        }
-                                        serial_println!(":: kepler: ucode uploaded words=4 ::");
-
-                                        mmio_write(bar0, base + 0x180, 1 << 25); // IMEMC offset=0, AINCR
-                                        let mut verify_ok = true;
-                                        let w0 = mmio_read(bar0, base + 0x184);
-                                        if w0 != UCODE_M2[0] { verify_ok = false; }
-                                        let w1 = mmio_read(bar0, base + 0x184);
-                                        if w1 != UCODE_M2[1] { verify_ok = false; }
-                                        let w2 = mmio_read(bar0, base + 0x184);
-                                        if w2 != UCODE_M2[2] { verify_ok = false; }
-                                        let w3 = mmio_read(bar0, base + 0x184);
-                                        if w3 != UCODE_M2[3] { verify_ok = false; }
-
-                                        serial_println!(":: kepler: ucode verify ok={} w0={:08X} ::", if verify_ok { "Y" } else { "N" }, w0);
-
-                                        if verify_ok {
+                                            // Seed the mailbox so "unchanged" has exactly one meaning.
+                                            mmio_write(bar0, base + 0x040, MB_SEED);
+                                            let pre_mb0 = mmio_read(bar0, base + 0x040);
+                                            let pre_cpuctl = mmio_read(bar0, base + 0x100);
+                                            serial_println!(":: kepler: ucode pre mailbox0={:08X} cpuctl={:08X} ::", pre_mb0, pre_cpuctl);
+                                        
+                                            // Upload, padding the full IMEM page so the code TLB marks it usable.
+                                            mmio_write(bar0, base + 0x180, 1 << 24); // IMEMC offset=0, AINCW
+                                            mmio_write(bar0, base + 0x188, 0);       // IMEMT tag=0 (matches BOOTVEC=0)
+                                            for &word in img.iter() {
+                                                mmio_write(bar0, base + 0x184, word);
+                                            }
+                                            for _ in img.len()..IMEM_PAGE_WORDS {
+                                                mmio_write(bar0, base + 0x184, 0);
+                                            }
+                                            serial_println!(":: kepler: ucode uploaded words={} padded={} ::", img.len(), IMEM_PAGE_WORDS);
+                                        
+                                            // Page-usable attestation: TLB_CMD PTLB query on virtual page 0.
+                                            mmio_write(bar0, base + 0x140, 0x0200_0000);
+                                            let tlb_rd = mmio_read(bar0, base + 0x144);
+                                            serial_println!(":: kepler: ucode tlb page0={:08X} ::", tlb_rd);
+                                        
+                                            mmio_write(bar0, base + 0x180, 1 << 25); // IMEMC offset=0, AINCR
+                                            let mut verify_ok = true;
+                                            let mut rb = [0u32; 5];
+                                            for k in 0..img.len() {
+                                                rb[k] = mmio_read(bar0, base + 0x184);
+                                                if rb[k] != img[k] { verify_ok = false; }
+                                            }
+                                            serial_println!(":: kepler: ucode verify ok={} w0={:08X} w1={:08X} w2={:08X} w3={:08X} w4={:08X} ::",
+                                                if verify_ok { "Y" } else { "N" }, rb[0], rb[1], rb[2], rb[3], rb[4]);
+                                        
+                                            if !verify_ok {
+                                                serial_println!(":: kepler: ucode ABORT verify-mismatch — BOOTVEC/CPUCTL NOT written ::");
+                                                break;
+                                            }
+                                        
                                             mmio_write(bar0, base + 0x104, 0); // BOOTVEC=0
-                                            mmio_write(bar0, base + 0x100, 2); // CPUCTL=STARTCPU
-                                            serial_println!(":: kepler: ucode start cpuctl-wr=00000002 ::");
-
-                                            for _ in 0..2_000_000 {
+                                            mmio_write(bar0, base + 0x100, 2); // CPUCTL START_TRIGGER
+                                            serial_println!(":: kepler: ucode start cpuctl<=00000002 ::");
+                                        
+                                            // Bounded poll for STOPPED (bit 4). halt-iters is the discriminator:
+                                            // 0 = the poll proved nothing; >0 = the core demonstrably left the idle
+                                            // state; max = started and stalled.
+                                            let mut halt_iters = 0u32;
+                                            for i in 0..100_000u32 {
                                                 let c = mmio_read(bar0, base + 0x100);
-                                                if (c & 0x10) != 0 {
-                                                    break; // halted
-                                                }
+                                                halt_iters = i;
+                                                if (c & 0x10) != 0 { break; }
                                                 core::hint::spin_loop();
                                             }
-
+                                        
                                             let post_cpuctl = mmio_read(bar0, base + 0x100);
                                             let post_mb0 = mmio_read(bar0, base + 0x040);
-                                            serial_println!(":: kepler: ucode end cpuctl={:08X} mailbox0={:08X} ::", post_cpuctl, post_mb0);
-                                        } else {
-                                            serial_println!(":: kepler: ucode end cpuctl=VERIFY_FAIL mailbox0=VERIFY_FAIL ::");
+                                            serial_println!(":: kepler: ucode end img={} cpuctl={:08X} mailbox0={:08X} halt-iters={} ::",
+                                                img_label, post_cpuctl, post_mb0, halt_iters);
+                                        
+                                            if post_mb0 != MB_SEED {
+                                                serial_println!(":: kepler: ucode EXECUTED img={} mailbox0={:08X} ::", img_label, post_mb0);
+                                                break;
+                                            }
+                                            serial_println!(":: kepler: ucode img={} mailbox unchanged — trying next encoding ::", img_label);
+                                        }
+                                        
+                                        // Read-only sweep of the unit window: locates either sentinel wherever it
+                                        // actually landed (MAILBOX1 on an off-by-one, INTR on a wrong-port write).
+                                        for off in (0..=0x1FC).step_by(4) {
+                                            let val = mmio_read(bar0, base + off);
+                                            let tag = if val == 0xF00DFACE || val == 0xF00DBEEF { " SENTINEL" } else { "" };
+                                            serial_println!(":: kepler: ucode-post off={:03X} val={:08X}{} ::", off, val, tag);
                                         }
                                         // dense old-base recon gated off (FTDI-ring budget).
                                         let old_base_dense = false;
