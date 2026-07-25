@@ -212,6 +212,19 @@ fn boot_diagnostics() {
         if sctlr & 1 != 0 { "on" } else { "off" },
         (daif >> 6) & 0b1111,
     );
+    // UVUG7-W — WITNESS-STATE HONESTY. The `witness` cargo feature is DEFAULT-QUIET: `./arroyo kernel8`
+    // (the flashable media command) leaves it OFF, so every `#[cfg(feature = "witness")]` call site —
+    // including both `[uvug7]` sites — is compiled clean out of the image. Without this line a default
+    // boot log is INDISTINGUISHABLE from a witness-armed boot whose gate never became true, and a
+    // missing `[uvugN]` reads as a live bug rather than as absent code. That ambiguity is exactly what
+    // let P53's "[uvug7] never printed" mystery survive four metal boots (P53-P56) before the P57
+    // capture — staged from a witness-armed image — printed all four `[uvug7]` lines normally.
+    // Unconditional and self-describing, so the answer is always in the log itself.
+    serial_println!(
+        ":: AARCH64 build: witness={} — witness-gated [uvugN]/fixture lines are {} in this image ::",
+        if cfg!(feature = "witness") { "on" } else { "off" },
+        if cfg!(feature = "witness") { "PRESENT" } else { "ABSENT BY CONSTRUCTION (not failures)" },
+    );
 }
 
 pub fn hlt_loop() -> ! {

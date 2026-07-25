@@ -66,8 +66,13 @@ KERNEL_FEATURES=""
 _feats=""
 # DEFAULT-QUIET: UNAOS_WITNESS=1 arms the `witness` fixture-battery feature (auto-set above for the battery
 # commands; default OFF for boot/media builds). On x86 the builder re-derives features from env, so this
-# also flows through UNAOS_WITNESS there; on aarch64 virt/tegra `witness` gates nothing (all its call sites
-# are x86- or baremetal-scoped), so arming it for test-arm is a functional no-op that only reflects intent.
+# also flows through UNAOS_WITNESS there. NOTE (UVUG7-W): `witness` is NOT inert on aarch64 — an earlier
+# comment here claimed all its call sites were x86- or baremetal-scoped, and that was false. UVUG-7 added
+# two arch-wide aarch64 sites (`arch/aarch64/timer.rs::init` and `video/screen.rs::present_surface`), so
+# `test-arm` really does emit `[uvug7] ms clock` and `kernel8-test` emits both `[uvug7]` lines. The flip
+# side is what bit P53: `./arroyo kernel8` leaves the feature OFF, so a default flashable image contains
+# ZERO `uvug7` strings and the witness cannot fire. Every boot now states its own witness build state on
+# the `:: AARCH64 build: witness=... ::` line, so absence is never mistaken for failure again.
 [ -n "${UNAOS_WITNESS:-}" ] && _feats="${_feats}witness,"
 [ -n "${UNAOS_SKIP_XHCI:-}" ] && _feats="${_feats}skip_xhci,"
 [ -n "${UNAOS_BOOTLOG:-}" ] && _feats="${_feats}bootlog,"

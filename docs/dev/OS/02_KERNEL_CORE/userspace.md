@@ -1075,6 +1075,47 @@
     new sha256 `2686a884320dbc389d6c33b1f37b097fa15eba769b51a751449e2c91a986bc19`. Lane:
     `video/wm.rs`, `crates/user-uvug/src/main.rs`, `crates/user-blob` (midden + profile),
     `arch/aarch64/syscall.rs` (TAB seam + the `el0-wcb` fixture) + this doc + `08_VIDEO/engine.md`.
+- **UVUG7-W (witness-state honesty)** — the closing of the s1j residual: *"the `[uvug7]` witness NEVER
+  printed on the P53 metal wire."* No code was broken. The witness is **kept**, not retired.
+  - **What `[uvug7]` proves.** Two arch-wide aarch64 sites, both added by UVUG-7 and both
+    `#[cfg(feature = "witness")]`. (1) `arch/aarch64/timer.rs::init` — `[uvug7] ms clock: CNTFRQ=<f> Hz …
+    core-count-independent`, the standing record that `arch::ms()` is derived from `CNTVCT/CNTFRQ` and
+    **not** from `ticks()*4`; the global tick counter sums every core's timer IRQ, so on 4-core BCM2711
+    metal the old derivation ran `ms` ~4× fast and typematic repeated ~4× too fast. (2)
+    `video/screen.rs::present_surface` — `[uvug7] surface <w>x<h> scaled <n>x -> …`, the integer
+    nearest-neighbour upscale factor and centred placement actually chosen for the panel in hand. Both are
+    one-shot; neither is duplicated by the uvug8/9/10 family (those cover takeover deadlines, shell-path
+    input and event-queue algebra — nothing about the ms derivation or the present geometry).
+  - **Why it never printed on metal: default-quiet, not a dead gate.** `witness` is armed only for the
+    battery commands (`test`/`test-fat`/`test-arm`/`kernel8-test`). `./arroyo kernel8` — the **flashable
+    media** command, which is what P53 was staged from — leaves it OFF, so both call sites are compiled
+    clean out. Proven at the byte level: a default `kernel8` image contains **zero** `uvug7` strings
+    (`strings -a target/UnaOS-pi4-baremetal.img | grep -c uvug7` → 0).
+  - **It fires correctly on metal — audited, not assumed.** The P57 capture
+    (`rmbp-s18/cu.usbmodem143302.log`, staged from a witness-armed image at `hw-pi4@91bcc2d7`) carries
+    **4 `[uvug7]` hits** — both sites, across two boots: `ms clock: CNTFRQ=54000000 Hz` and
+    `surface 32x32 scaled 15x -> 480x480 at (720,360) on 1920x1200 panel`. So the witness is honest on
+    silicon; only the P53 *image* could not carry it. (Note the metal panel is 1920×1200 → scale 15,
+    versus QEMU raspi4b's 640×480 → scale 6 — the present witness is genuinely geometry-dependent, which
+    is most of its value and is unreachable from the gate alone.)
+  - **The real defect, and the fix.** Nothing named the build's witness state, so a default boot log was
+    **indistinguishable** from a witness-armed boot whose gate never became true: a missing `[uvugN]` read
+    as a live bug rather than as absent code. That ambiguity is what let the mystery survive four boots
+    (P53–P56). `arch/aarch64/mod.rs::boot_diag` now emits, unconditionally,
+    `:: AARCH64 build: witness=<on|off> — witness-gated [uvugN]/fixture lines are <PRESENT|ABSENT BY
+    CONSTRUCTION (not failures)> in this image ::`. The answer is now always in the log itself. A stale comment in `arroyo` that
+    claimed `witness` "gates nothing" on aarch64 and that arming it for `test-arm` was "a functional
+    no-op" was **false** (UVUG-7 added the two arch-wide sites above) and is corrected — `test-arm` does
+    emit `[uvug7] ms clock`, verified in `target/serial-arm.log`.
+  - **Retirement considered and rejected.** `[uvug7]` proves something no other witness does, and it
+    demonstrably fires. It is referenced by **no** `pi4-regression.spec` directive, so it is left unpinned
+    (pinning it would force every future metal image to be witness-armed). The ms-clock line stays
+    `witness`-gated rather than promoted to a boot-honesty line, because the adjacent unconditional
+    `:: AARCH64 generic timer armed (CNTFRQ=… ) ::` already publishes `CNTFRQ` — `[uvug7]` adds only the
+    derivation restatement, which is re-proof, exactly what DEFAULT-QUIET exists to silence.
+  - Gates: `./arroyo check` green both arches; `./arroyo kernel8` builds; `./arroyo kernel8-test 120`
+    MBENCH **50/50 required, 0 forbidden**; `./arroyo test-arm` green. Lane: `arch/aarch64/mod.rs`
+    (the witness-state line) + `arroyo` (comment correction) + this doc.
 - Not yet: **revocation trees** (a derived copy — re-grant or onward re-transfer — escapes
   single-level revoke today; derivation records + `CAP_REVOKE` are that arc), the **bandy Ring-3
   delegation wrapper**, `File` transfer (descriptor migration), real `Socket` fs/net syscalls.
