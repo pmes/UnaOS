@@ -434,10 +434,43 @@ mod typematic {
     /// nothing about health there, so it cannot be read as a wedge; this bound exists only so the pathological
     /// case stays finite. Thirty seconds is far longer than any real key hold and far shorter than forever.
     pub(super) const HOLD_MAX_MS: u64 = 30_000;
-    /// UVUG-9 — sticky evidence that THIS keyboard emits HID reports while a key is held down (0 = not yet
-    /// observed, 1 = observed). Set by `typematic_note_report` on a report that is neither a fresh press nor a
-    /// release of the armed key; cleared on a keyboard detach so a newly attached device re-earns the verdict.
+    /// UVUG-9 — sticky evidence that THIS keyboard emits genuine IDLE RE-REPORTS while a key is held down
+    /// (0 = not yet observed, 1 = observed). Cleared on a keyboard detach so a newly attached device re-earns
+    /// the verdict. See `typematic_note_report` for why the test is "held set byte-identical to the previous
+    /// report" and not merely "no press edge".
     pub(super) static STREAMS_WHILE_HELD: AtomicU32 = AtomicU32::new(0);
+    /// UVUG-9 — the PREVIOUS report's held-ascii set, packed (see `pack_held`), so an idle re-report can be
+    /// told apart from a report that merely carried no PRESS edge. Bit 63 marks the value valid (no previous
+    /// report yet == 0). Cleared on detach alongside the verdict it feeds.
+    pub(super) static PREV_HELD: AtomicU64 = AtomicU64::new(0);
+    /// UVUG-9 — how many CONSECUTIVE reports have arrived with the held set unchanged and no press edge. Reset
+    /// by any change to the held set. See `IDLE_RUN_TO_LATCH`.
+    pub(super) static IDLE_RUN: AtomicU32 = AtomicU32::new(0);
+    /// UVUG-9 — consecutive unchanged-held reports required before believing this keyboard idle-re-reports.
+    ///
+    /// One such report is not proof, and the residual case the byte-identical test alone cannot see is a key
+    /// that maps to ascii 0 (F-keys, and anything else absent from `HID_SCANCODE_TO_ASCII`) being tapped while
+    /// another key is held: the ascii projection this function receives discards the very keycode that changed,
+    /// so press and release both look like unchanged-held reports. Closing that properly would mean feeding the
+    /// tracker raw KEYCODES, which is a `drivers::xhci` signature change and outside this arc's lane. A run
+    /// threshold closes it from this side instead: a tap yields two such reports, whereas a keyboard that truly
+    /// idle-re-reports produces them continuously for as long as the key is held. Four is comfortably above a
+    /// tap (or a double-tap) and is reached within a few report periods of a genuine hold.
+    pub(super) const IDLE_RUN_TO_LATCH: u32 = 4;
+}
+
+/// UVUG-9 — pack a held-ascii set into one word for exact comparison against the previous report: bit 63 =
+/// valid, bits 56..62 = length, bytes 0..5 = the set in report order. A HID boot report carries at most six
+/// keycodes, so nothing is lost. Order-sensitive by design: a reordered set compares unequal, which only ever
+/// costs a missed latch (the safe direction — the conservative `HOLD_MAX_MS` window stays in force).
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn pack_held(held: &[u8]) -> u64 {
+    let n = held.len().min(6);
+    let mut v: u64 = (1 << 63) | ((n as u64) << 56);
+    for (i, &b) in held.iter().take(n).enumerate() {
+        v |= (b as u64) << (i * 8);
+    }
+    v
 }
 
 /// UVUG-6 — feed the typematic tracker one HID keyboard report at the REPORT LEVEL (before any EVENT_QUEUE
@@ -452,16 +485,38 @@ pub fn typematic_note_report(newest_press: u8, held: &[u8]) {
     typematic::LAST_REPORT_MS.store(now.max(1), Ordering::Relaxed);
     // Report-level release: if the currently-armed key is not in this report's held set, it was released
     // (or was never really held) — disarm. This is the primary, queue-independent release path.
+    // UVUG-9: snapshot this report's held set and the previous one, for the idle-re-report test below.
+    let cur_packed = pack_held(held);
+    let prev_packed = typematic::PREV_HELD.swap(cur_packed, Ordering::Relaxed);
+    // UVUG-9: maintain the consecutive-idle-re-report run. Any press edge, or any change to the held set,
+    // means this report carried real user action and breaks the run.
+    let idle_report = newest_press == 0 && prev_packed == cur_packed;
+    let idle_run = if idle_report {
+        typematic::IDLE_RUN.fetch_add(1, Ordering::Relaxed) + 1
+    } else {
+        typematic::IDLE_RUN.store(0, Ordering::Relaxed);
+        0
+    };
     let kp1 = typematic::KEY_P1.load(Ordering::Relaxed);
     if kp1 != 0 {
         let k = (kp1 - 1) as u8;
         if !held.contains(&k) {
             typematic::KEY_P1.store(0, Ordering::Relaxed);
-        } else if newest_press == 0 {
-            // UVUG-9: a report arrived that neither pressed anything new nor released the armed key, while that
-            // key is still down — positive proof this keyboard re-reports during a hold. That is the ONLY device
-            // class for which `LIVENESS_MS` (silence == wedge) is a sound inference, so record it and let
-            // `typematic_tick` use the tight window. Sticky until the device detaches.
+        } else if idle_run >= typematic::IDLE_RUN_TO_LATCH {
+            // UVUG-9: a TRUE IDLE RE-REPORT — the armed key is still down and this report's held set is
+            // byte-identical to the previous one, so the report carried no press edge AND no release edge. It
+            // conveys nothing except that the keyboard is still talking, which is precisely the evidence
+            // `LIVENESS_MS` (silence == wedge) needs to be a sound inference. Sticky until the device detaches.
+            //
+            // "No PRESS edge" alone would NOT have been sound, and the difference is the whole point: it also
+            // matches (a) a two-key rollover RELEASE (press a, press b, release a — no press edge, armed b
+            // still held) and (b) tapping any key that maps to ascii 0, e.g. an F-key, while holding. Both are
+            // ordinary things a strict `SET_IDLE(0)` keyboard does, and either one latching just once would
+            // re-impose the 1 s window for the rest of the boot — resurrecting the exact ~10-repeat stop this
+            // arc exists to remove. Requiring the held set to be UNCHANGED excludes (a) outright: a rollover
+            // release shrinks the set. It does NOT by itself exclude (b) — the ascii projection this function
+            // receives has already discarded the non-ascii keycode, so its press and release both arrive as
+            // unchanged-held reports — which is what `IDLE_RUN_TO_LATCH` is for.
             typematic::STREAMS_WHILE_HELD.store(1, Ordering::Relaxed);
         }
     }
@@ -483,8 +538,12 @@ pub fn typematic_tick() -> Option<u8> {
     if typematic::SEEN_DETACH_GEN.swap(dg, Ordering::Relaxed) != dg {
         typematic::KEY_P1.store(0, Ordering::Relaxed);
         // UVUG-9: the streaming verdict belongs to the DEVICE, not the boot — a detach means the next report
-        // may come from different hardware, which must earn its own verdict rather than inherit this one.
+        // may come from different hardware, which must earn its own verdict rather than inherit this one. The
+        // evidence it was derived from goes with it, or a run straddling the detach could re-latch on a mix of
+        // two keyboards' reports.
         typematic::STREAMS_WHILE_HELD.store(0, Ordering::Relaxed);
+        typematic::PREV_HELD.store(0, Ordering::Relaxed);
+        typematic::IDLE_RUN.store(0, Ordering::Relaxed);
         return None;
     }
     let kp1 = typematic::KEY_P1.load(Ordering::Relaxed);
@@ -503,6 +562,16 @@ pub fn typematic_tick() -> Option<u8> {
     };
     if last != 0 && now.wrapping_sub(last) > window && now >= last {
         typematic::KEY_P1.store(0, Ordering::Relaxed);
+        // UVUG-9: name the BACKSTOP when it is what fired. A repeat that simply stops is indistinguishable at
+        // the bench from the bug this arc fixed, so the coarse 30 s bound must say so out loud — one line per
+        // disarm, which is self-limiting at a minimum of `HOLD_MAX_MS` apart. The tight `LIVENESS_MS` disarm
+        // stays silent: it is the ordinary, expected end of a hold on a streaming keyboard.
+        if window == typematic::HOLD_MAX_MS {
+            serial_println!(
+                "[uvug9] typematic hold-max — key held {}s without an idle re-report from this keyboard; repeat disarmed by the BACKSTOP, not by a release (re-press resumes)",
+                typematic::HOLD_MAX_MS / 1000
+            );
+        }
         return None;
     }
     // backpressure guard: never inject while the ring is past half full (starvation / wedge guard).
@@ -527,6 +596,30 @@ pub fn typematic_test_force_due() {
     // keep liveness satisfied so the force-due path exercises the backpressure/arm logic, not the liveness drop
     typematic::LAST_REPORT_MS.store(crate::arch::ms().max(1), Ordering::Relaxed);
 }
+
+/// UVUG-9 test aid — read the `STREAMS_WHILE_HELD` verdict, so the selftest can assert that ordinary hold-time
+/// traffic (a rollover release, a non-ascii tap) does NOT latch it. Not used on any boot path.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+pub fn typematic_test_streams_latched() -> bool {
+    typematic::STREAMS_WHILE_HELD.load(core::sync::atomic::Ordering::Relaxed) != 0
+}
+
+/// UVUG-9 test aid — clear all typematic tracker state so a selftest leg starts from a known baseline
+/// (equivalent to a fresh keyboard, without faking a detach generation). Not used on any boot path.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+pub fn typematic_test_reset() {
+    use core::sync::atomic::Ordering;
+    typematic::KEY_P1.store(0, Ordering::Relaxed);
+    typematic::STREAMS_WHILE_HELD.store(0, Ordering::Relaxed);
+    typematic::PREV_HELD.store(0, Ordering::Relaxed);
+    typematic::IDLE_RUN.store(0, Ordering::Relaxed);
+    typematic::LAST_REPORT_MS.store(0, Ordering::Relaxed);
+}
+
+/// UVUG-9 — the consecutive unchanged-held reports required to latch the streaming verdict, mirrored so the
+/// selftest sizes its idle-re-report run against the real threshold rather than a magic number.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+pub const TYPEMATIC_IDLE_RUN_TO_LATCH: u32 = typematic::IDLE_RUN_TO_LATCH;
 
 fn pop_event() -> Option<Event> {
     crate::arch::without_interrupts(|| EVENT_QUEUE.lock().pop())

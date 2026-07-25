@@ -2212,6 +2212,16 @@ fn input_router_selftest() {
 ///       stuck repeat from saturating the ring and starving real input);
 ///   (C) dropped-KeyUp — the release NEVER rides the queue; only a report-level release (empty held set) is
 ///       fed. The tracker disarms, and no repeat is EVER produced across many due ticks — the P51 wedge shut.
+/// UVUG-9 adds the fix-DURABILITY legs for the evidence gate that decides which liveness window applies. The
+/// gate must latch on a genuine idle re-report and on nothing else, because one false latch re-imposes the 1 s
+/// window for the whole boot and brings the ~10-repeat stop straight back:
+///   (D) two-key ROLLOVER RELEASE (press a, press b, release a) — no press edge and the armed key still held,
+///       which is exactly the shape of an idle re-report except that the held SET shrank. Must NOT latch.
+///   (E) NON-ASCII TAP while holding (an F-key maps to ascii 0, so both its press and its release reach the
+///       tracker as unchanged-held reports and the byte-identical test alone cannot see them). Must NOT latch,
+///       which is what the `IDLE_RUN_TO_LATCH` run threshold buys.
+///   (F) genuine idle re-reports — an unchanged held set repeated past the threshold. MUST latch, so the P51
+///       wedge guard still arms on the hardware it was written for.
 /// Runs once on the BSP before any input/render service task, when EVENT_QUEUE is empty; drains what it pushes.
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 fn typematic_selftest() {
@@ -2241,16 +2251,48 @@ fn typematic_selftest() {
         }
     }
     while pal::next_event().is_some() {}
-    if baseline && suppressed && !repeated {
+
+    // --- UVUG-9: evidence-gate durability. Each leg starts from a clean tracker. ---
+    // (D) rollover release: 'a' down, 'b' down, 'a' released. The final report has no press edge and the armed
+    //     key ('b') is still held — an idle re-report's shape — but the held set changed, so it must not latch.
+    pal::typematic_test_reset();
+    pal::typematic_note_report(b'a', &[b'a']);
+    pal::typematic_note_report(b'b', &[b'a', b'b']);
+    pal::typematic_note_report(0, &[b'b']); // 'a' released; no press edge; 'b' still armed + held
+    let rollover_clean = !pal::typematic_test_streams_latched();
+
+    // (E) non-ascii tap while holding: an F-key contributes no ascii, so its press and release both arrive as
+    //     unchanged-held reports. Two of them must stay under the run threshold and must not latch.
+    pal::typematic_test_reset();
+    pal::typematic_note_report(b'b', &[b'b']);
+    pal::typematic_note_report(0, &[b'b']); // F-key down  — invisible in the ascii projection
+    pal::typematic_note_report(0, &[b'b']); // F-key up    — likewise
+    let nonascii_clean = !pal::typematic_test_streams_latched();
+
+    // (F) genuine idle re-reports: the same held set, repeated past the threshold, MUST latch — otherwise the
+    //     P51 wedge guard would never arm on the streaming hardware it exists for.
+    pal::typematic_test_reset();
+    pal::typematic_note_report(b'b', &[b'b']);
+    for _ in 0..(pal::TYPEMATIC_IDLE_RUN_TO_LATCH + 1) {
+        pal::typematic_note_report(0, &[b'b']);
+    }
+    let idle_latches = pal::typematic_test_streams_latched();
+    pal::typematic_test_reset();
+    while pal::next_event().is_some() {}
+
+    if baseline && suppressed && !repeated && rollover_clean && nonascii_clean && idle_latches {
         serial_println!(
-            ":: uvug6: typematic — baseline repeat OK, backpressure suppressed inject, report-level release disarmed dropped-KeyUp hold :: PASS ::"
+            ":: uvug6: typematic — baseline repeat OK, backpressure suppressed inject, report-level release disarmed dropped-KeyUp hold; UVUG-9 evidence gate: rollover-release + non-ascii-tap did NOT latch, genuine idle re-reports DID :: PASS ::"
         );
     } else {
         serial_println!(
-            ":: uvug6: typematic — baseline={} suppressed={} repeated={} :: FAIL ::",
+            ":: uvug6: typematic — baseline={} suppressed={} repeated={} rollover_clean={} nonascii_clean={} idle_latches={} :: FAIL ::",
             baseline,
             suppressed,
-            repeated
+            repeated,
+            rollover_clean,
+            nonascii_clean,
+            idle_latches
         );
     }
 }

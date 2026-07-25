@@ -681,12 +681,26 @@
     `DELAY_MS` (400 ms) to `LIVENESS_MS` (1000 ms) at `RATE_MS` (40 ms) — ~15, fewer once the press report's own
     latency counts. The guard inferred "wedged" from silence on a device class whose correct behaviour *is*
     silence, so it could never have been sound there. Fix — **evidence-gate** it: `typematic_note_report` sets a
-    sticky `STREAMS_WHILE_HELD` when it sees a report that is neither a fresh press nor a release while the
-    armed key is still down (positive proof this device re-reports during a hold, i.e. the P51-class hardware
-    layer 3 was written for). With that evidence the 1 s window applies unchanged and the P51 wedge stays shut;
-    without it the bound becomes `HOLD_MAX_MS` (30 s), a coarse backstop that keeps the pathological case finite
-    while letting a held key repeat as long as anyone actually holds one. Cleared on keyboard detach, so a
-    swapped device re-earns the verdict. Layers 1 and 2 are untouched and remain the real release paths.
+    sticky `STREAMS_WHILE_HELD` only on a **true idle re-report** — the armed key still down, no press edge, and
+    the held set **byte-identical** to the previous report's — sustained for `IDLE_RUN_TO_LATCH` (4) consecutive
+    reports. With that evidence the 1 s window applies unchanged and the P51 wedge stays shut; without it the
+    bound becomes `HOLD_MAX_MS` (30 s), a coarse backstop that keeps the pathological case finite while letting
+    a held key repeat as long as anyone actually holds one. Cleared on keyboard detach (along with the evidence
+    it was derived from), so a swapped device re-earns the verdict. Layers 1 and 2 are untouched and remain the
+    real release paths.
+    **Why the gate is that strict** — one false latch re-imposes the 1 s window for the whole boot and brings
+    the ~10-repeat stop straight back, so the gate is a fix-durability surface in its own right. "No press edge"
+    alone would have latched on (a) a two-key **rollover release** (press a, press b, release a — no press edge,
+    armed b still held) and (b) a **non-ascii tap** while holding (F-keys map to ascii 0). The byte-identical
+    test excludes (a); it cannot see (b), because the ascii projection the tracker receives has already
+    discarded the keycode that changed, so both the tap's press and its release arrive as unchanged-held
+    reports. The run threshold closes (b) from this side — a tap yields two such reports, a genuinely
+    idle-re-reporting keyboard yields them continuously. (Feeding raw keycodes would close it at the source, but
+    that is a `drivers::xhci` signature change and outside this arc's lane.) All three cases are now asserted by
+    the `uvug6` selftest: legs **(D)** rollover-release and **(E)** non-ascii-tap must NOT latch, leg **(F)**
+    genuine idle re-reports MUST — so the wedge guard still arms on the hardware it exists for.
+    A `[uvug9] typematic hold-max` line fires when the 30 s backstop is what disarmed a key, so the bench can
+    tell backstop from bug; the tight `LIVENESS_MS` disarm stays silent (it is the ordinary end of a hold).
   - **Orphan residue: the GUI watchdog was silently disarmed for the rest of the boot.** `sys_input_poll` called
     `gui_watchdog::note_progress()` **unscoped**. A timed-out run leaves its EL0 task alive and spinning on that
     very syscall (this arch has no asynchronous kill primitive), so one timeout kept feeding the watchdog
