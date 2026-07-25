@@ -26,7 +26,8 @@ Three pull sequences, numbered independently. Every pull = one BRIEF (coordinato
 ## Lane 2: Kepler DISPLAY (scanout — kepler_display.rs after split) — `video/Kepler/`, files `*kepler-display-pull<N>*`
 | Pull | Files | Status | One-liner |
 |---|---|---|---|
-| 13 | BRIEF-kepler-display-pull13-blockwidth | LANDED; s23: all 4 cycles ran clean (serial verified) — VERDICT AWAITS PANEL PHOTOS | bw {2,4} × bh {4,8} — block wider than 1 GOB is the surviving suspect |
+| 14 | BRIEF-kepler-display-pull14-bw-pitch | BRIEFED — awaiting proposal | bw {2,4} @ bh=4 × pg {192,256} — pitch padding × bw never tested together |
+| 13 | BRIEF-kepler-display-pull13-blockwidth | LANDED; s23: **BW REAL** — periodic seams gone, clusters remain; cleanest (2,4); pitch×bw next | bw {2,4} × bh {4,8} — block wider than 1 GOB is the surviving suspect |
 | 12 | BRIEF-kepler-display-pull12-pitchalign | LANDED; s22: **PITCH REFUTED** (identical seams at pg 192 vs 256; count still scales with bh) | bh {4,8} × pitch_gobs {192,256} mini-ladder — zero seams names the real pair |
 | 11 | BRIEF-kepler-display-pull11-blockheight / PROPOSAL-kepler-display-pull11 | LANDED 410996eb/366e5b05; s21: no rung clean — monotonic seams → pitch-alignment is the second parameter | four-hold block-height ladder (bh 2/4/8/16) |
 | 10 | BRIEF-kepler-display-pull10-swizzle / PROPOSAL-kepler-display-pull10 | LANDED fec4b73f; s20: BLOCK-LINEAR CONFIRMED (checkerboard gone; brick-seams = block-height wrong) | pre-swizzled ruler (GOB 64B×8) |

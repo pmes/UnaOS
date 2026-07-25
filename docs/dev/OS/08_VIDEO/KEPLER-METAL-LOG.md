@@ -22,10 +22,22 @@ the first ucode milestone tests exactly that. Note for the arc: imemc/
 dmemc still read BADF1000 post-enable (s22) — Falcon memory ports gated;
 first milestone must probe IMEM/DMEM accessibility before any upload.
 
-**Display — all four bw-step cycles ran clean** (pg=180; bytes 0140A000
+**Display — PANEL VERDICT (Peter's four photos): BLOCK WIDTH IS REAL but
+no pair clean yet — the artifact changed class.** With bw>1 the uniform
+periodic full-width brick seams of s21/s22 are GONE; every cycle shows
+long clean continuous band runs with seams CLUSTERED in narrow x-regions
+((2,4): clean across ~85% of width, cluster only at far left; (2,8): more
+clusters, clean middle; (4,4): clean middle, clusters near edges; (4,8):
+two narrow clusters, large clean runs). Read: bw>1 moved the geometry
+qualitatively where pitch (at bw=1) moved nothing — the mapping is close;
+one interaction remains wrong. Prime suspect: PITCH PADDING × BW —
+pitch-align was refuted only at bw=1; at bw=2/4 the natural 180 GOBs/row
+gives 90/45 blocks/row (45 odd), and hw may pad blocks-per-row. Cleanest
+config: (bw=2,bh=4). Pull 14 = bw {2,4} at bh=4 × pg {192,256}.
+
+**Serial: all four bw-step cycles ran clean** (pg=180; bytes 0140A000
 @bh4 / 01464000 @bh8, matching computed for both bw values; holds and
-restores clean). **Verdict awaits Peter's four panel photos** — zero
-seams + solid white column names (bw,bh).
+restores clean).
 
 Capture: rmbp-s18/cu.usbserial-ABAFUJCO.log, mark s23boot1. Flash staged
 s23-20260725T*Z-80184a20.
