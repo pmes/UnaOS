@@ -1907,3 +1907,143 @@ pointer report, so the sprite is never drawn. Both numbers carry their claim onl
   through it.
 * `erase` is still unstaged and still fills the desktop directly (unchanged by this arc), so a torn
   erase on close/raise remains the WC-H follow-on it always was.
+
+### CURSOR-3 — the sprite rides the present
+
+**P61 (attended, Pi 4 1920×1200) confirmed WC-I's cursor half and bounded what it left.** The verdict
+list: the cursor no longer flickers over the desktop or the status strip — but it is still *spotty
+over a vug*, i.e. specifically while the pointer sits on a live window presenting at ~60 fps. That is
+not a regression in WC-I; it is the case WC-I documented as remaining, arriving on the bench with a
+name.
+
+#### The remaining case is a duty cycle, not a race
+
+WC-I made the bracket conditional: `composite` takes the sprite off the panel only when
+`cursor::sprite_box()` intersects a live window above the shell. Over the desktop that is never, and
+the flicker went with it. Over a window it is *every present* — and between the `undraw` and the
+`repaint` sits the whole of `draw_window`: a full off-screen compose plus `bh` row copies,
+milliseconds during which the sprite is simply **not on the panel**. At 60 presents a second the
+sprite is absent for a large and irregular fraction of every second, and with two vugs the two cores'
+brackets interleave. No amount of care *inside* the bracket shortens that interval, and
+`undraw_locked`'s colour guard — correctly — declines to restore pixels the other presenter has since
+taken. Holes, moving. The bracket's cost is structural: it is a hole in time, and the fix has to
+remove the hole rather than narrow it.
+
+#### The mechanism: compose the cursor into the back layer
+
+WC-H already composes each window into a cached-RAM back layer and presents it as contiguous
+full-box rows. CURSOR-3 paints the sprite **into that layer**, after the window is composed and
+before the rows are copied:
+
+```
+stage_window:   paint_window(layer)            # window chrome + upscaled content
+                cursor::compose_into(layer)    # <- CURSOR-3: sprite, last into the layer
+                for y in 0..bh { fb.blit(row) }  # unchanged WC-H present
+```
+
+The cursor therefore reaches the panel **inside the same row copies the window does**. There is no
+undraw phase for those pixels and no interval in which they are window-only: the present is atomic to
+exactly the degree the window's own pixels are, which is WC-H's whole claim. Nothing extra is written
+to the front buffer, and the trailing `flush_range` already covers the sprite because it is inside
+those rows — WC-H's contiguous-row present discipline is untouched.
+
+The save-under must come from the **layer**, and that is the load-bearing detail. The pixels the
+sprite hides are the window's, and at overlay time they exist only in the layer — the front still
+holds the previous frame. Reading them back from the front afterwards (what `draw_locked` does) would
+capture the sprite's own `FILL`, and the next restore would stamp a white arrow permanently into the
+window's rect. So `compose_into` saves from the layer into a published plan (`cursor::OVERLAY`), and
+the composite's tail *installs* that plan instead of painting.
+
+#### Three tails, and the new one writes no pixels
+
+`composite_inner` now returns `CursorTail`:
+
+| tail | meaning | cost |
+| --- | --- | --- |
+| `Untouched` | the pass never went near the sprite (WC-I) | `ensure_drawn` — one lock, one bool |
+| `Repaint` | the bracket ran to completion (WC-I) | restore → save → draw |
+| `Adopt` | the pass carried the sprite through a staged present | install the plan; **zero framebuffer writes** in the common case |
+
+`adopt_overlay` takes `SPRITE`, installs the plan (geometry + the layer-derived save-under) and marks
+the sprite drawn — the panel already holds it. Two things are then normalised under the same
+acquisition: a sprite another core drew in the meantime is taken down *before* the plan is installed
+(its `saved` is front-derived and correct, so restoring it first leaves exactly one sprite on the
+panel), and a pointer that has **moved** since the plan was taken falls through to the ordinary
+`refresh_locked`. Installing the plan first is precisely what makes that second case safe: the module
+now knows those panel pixels are the sprite's and what the window had under them, so the undraw puts
+the window's pixels back instead of a save-under capturing the overlay's own `FILL`.
+
+#### Whole-box containment, deliberately
+
+The overlay is taken only when the sprite's box lies **entirely** inside the window's clipped outer
+box. A straddling sprite would need per-pixel bookkeeping of which pixels came from a layer and which
+from the front, merged across the several windows and the desktop one sprite can span — bookkeeping
+whose failure mode is a stamped arrow. A straddling sprite keeps WC-I's bracket unchanged: correct,
+and no worse than before. The sprite is one glyph cell plus a shadow block (36 px at the 4× cap), so
+it is wholly inside the window it is pointing at for all but its own width at the frame.
+
+#### Every WC-I invariant, preserved and stated
+
+* **`SPRITE` never joins F4's drain wait set.** The plan is snapshotted (and the sprite undrawn) in
+  exactly the place WC-I put the bracket decision — *before* the `BlitGuard` registration.
+  `compose_into` runs inside the guard but takes only `OVERLAY`, and only with `try_lock`, which is
+  the same discipline and the same reason WC-H's `STAGE` uses one: a contended pass declines the
+  overlay and falls back to the bracket. `adopt_overlay` takes `SPRITE` in the tail, after the guard
+  has been dropped. Lock order `SPRITE → OVERLAY`, never the reverse.
+* **The no-intersect path is unchanged.** A pass with no sprite on the panel does one
+  `sprite_plan()` — the same acquisition `sprite_box()` was, now also carrying the block scale so the
+  geometry is one snapshot rather than two — and takes the `Untouched` tail.
+* **`ensure_drawn` semantics are untouched**, including `erase`'s contract that the composite which
+  follows puts the sprite back.
+* **No verified pixel is ever read with the sprite on it.** `wcg::end`'s `fbbad` count and
+  `verify_window`'s scan-out verdict both read this window's destination pixels back and compare them
+  against its *source* surface, and a cursor legitimately composited into those pixels would read as
+  a blit defect. So the plan is withheld from any window with a live WC-G probe or an unspent WC-D
+  bit, and from a sprite overlapping a WC-F reserved box (the probe paints into the front *after* the
+  pass, so it would overwrite pixels the plan claims). All three are budgeted one-shots: they cost
+  those few passes WC-I's bracket and nothing else.
+
+#### Witnesses
+
+```
+[cursor3] present tail=adopt offers=1 taken=1 -> COMPOSED     # first 8 passes that touched the sprite
+[cursor3] rollup scope={fixture|desktop} planned= offers= taken= adopt= repaint= ensure= -> VERDICT
+```
+
+`planned` counts passes that took the bracket *and* had an eligible plan to hand down; `offers`/`taken`
+are per-window overlay attempts and successes (`offers - taken` is a straddling sprite, a contended
+plan lock, or an unreadable layer — every one a **missed improvement**, never a defect); `adopt` /
+`repaint` / `ensure` are the three tails. Verdict: `COMPOSED` when the mechanism ran, `BRACKETED` when
+it was offered and never landed, `UNWITNESSED` when it was never offered, `INCOHERENT` if `taken`
+exceeds `offers` (an overlay that landed without being offered — a wiring defect). The rollup is
+printed alongside `[wc-i]`'s, from the same harness and at the same two scopes.
+
+#### Gate scope, stated honestly
+
+```
+[cursor3] rollup scope=fixture planned=0 offers=0 taken=0 adopt=0 repaint=0 ensure=335 -> UNWITNESSED
+```
+
+**QEMU cannot witness this fix, and the verdict says so.** raspi4b delivers no HID pointer report, so
+`pal::cursor::visible()` is false for the whole boot, the sprite is never drawn, `sprite_plan()` is
+always `None`, and every counter is 0. The gate proves **no-regression only**: the window path still
+runs its passes (`ensure=335` — all of them through WC-I's cheap tail), settles every one through a
+tail, and never took an overlay it was never offered. `UNWITNESSED` is the correct outcome, and it
+exists so a pointerless run can never be read as evidence for the mechanism.
+
+`UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test 60` → MBENCH **64/64 required, 0 forbidden**;
+`./arroyo test-arm` → MISSION SUCCESS; `./arroyo check` green both arches. Every `[wc-d]` / `[wc-g]` /
+`[wc-h]` / `[wc-i]` witness unchanged.
+
+#### Metal watch-list
+
+* **The verdict is `taken > 0` with `offers == taken` while the pointer rests on a vug**, and the
+  operator reading is a cursor that stays solid — no holes, no flicker — while the window presents
+  under it.
+* `adopt` should dominate `repaint` while the pointer is over a window. A high `repaint` with
+  `offers > 0` means the overlay is being offered and declined; `offers - taken` names which of the
+  three declines, and a straddling sprite at a window edge is the expected benign one.
+* Dragging the pointer *across* a window edge should degrade smoothly to WC-I's behaviour and back —
+  a visible step in flicker at the frame is the containment rule doing its job, not a defect.
+* A cursor left over a window while WC-D or WC-G spends its one-shot budget will bracket for those
+  few passes. Early-boot only, and `[cursor3] present tail=repaint` names it.

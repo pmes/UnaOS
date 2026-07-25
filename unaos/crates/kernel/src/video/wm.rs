@@ -984,18 +984,39 @@ pub fn count() -> usize {
 ///
 /// `ensure_drawn` and not "nothing" on the false branch, because `erase` takes the sprite down and
 /// leaves the composite that follows to put it back — that contract predates WC-I and is unchanged.
+///
+/// CURSOR-3 — a third tail. When the pass carried the sprite through a staged present (see
+/// [`super::cursor::compose_into`]) the panel already has it, and the tail's job is to tell the
+/// sprite module so rather than to paint anything: [`super::cursor::adopt_overlay`] installs the
+/// plan and, in the common case, writes no pixels at all.
 pub fn composite() {
-    let disturbed = composite_inner();
-    if disturbed {
-        super::cursor::repaint();
-    } else {
-        super::cursor::ensure_drawn();
+    let tail = composite_inner();
+    #[cfg(feature = "witness")]
+    note_cursor_tail(tail);
+    match tail {
+        CursorTail::Adopt => super::cursor::adopt_overlay(),
+        CursorTail::Repaint => super::cursor::repaint(),
+        CursorTail::Untouched => super::cursor::ensure_drawn(),
     }
+}
+
+/// What [`composite_inner`] owes the sprite when it returns.
+///
+/// `Untouched` and `Repaint` are WC-I's two answers, unchanged and with unchanged meanings.
+/// `Adopt` is CURSOR-3's: the pass undrew the sprite AND painted it back inside a staged present, so
+/// the panel is already correct and only the module's bookkeeping is outstanding. Every early exit
+/// from the pass owes `Repaint` once the bracket has been taken — `Adopt` is reachable only from the
+/// one path that actually composed the sprite into a back layer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CursorTail {
+    Untouched,
+    Repaint,
+    Adopt,
 }
 
 /// The composite pass proper. Private so the cursor bracket above cannot be bypassed — every caller
 /// (including this module's own teardown paths) goes through [`composite`].
-fn composite_inner() -> bool {
+fn composite_inner() -> CursorTail {
     // WC-I — THE CURSOR BRACKET, decided BEFORE anything is registered as an in-flight blit.
     //
     // Before WC-I `composite` undrew the sprite unconditionally on every call — and `composite` runs
@@ -1023,8 +1044,15 @@ fn composite_inner() -> bool {
     // Lock order: `SPRITE` → `TABLE` (stated in `cursor::repair`). The table access below is a
     // statement of its own whose guard is dropped before `undraw` is called, so nothing of ours is
     // held across it.
+    //
+    // CURSOR-3 — this is also where the OVERLAY PLAN is taken, and for the same reason. The plan is
+    // the sprite's geometry, snapshotted under the same acquisition as the box we test with; the
+    // staged present later paints the sprite from it, with no lock of the sprite module's in the
+    // guard's wait set at all (`compose_into` touches only `OVERLAY`, and only with `try_lock`).
     let mut disturbed = false;
-    if let Some(sbox) = super::cursor::sprite_box() {
+    let mut plan: Option<super::cursor::Plan> = None;
+    if let Some(p) = super::cursor::sprite_plan() {
+        let sbox = (p.bx, p.by, p.bw, p.bh);
         let shell = shell_z();
         #[allow(unused_mut)]
         let mut hit = {
@@ -1036,19 +1064,33 @@ fn composite_inner() -> bool {
         // WC-F's ground-truth probe paints at the TAIL of this pass and is outside the window layer,
         // so `repair` (which damages WINDOWS) can never mend a sprite pixel it took. Treat its
         // reserved boxes as painted extents too. Witness/baremetal-only, like the probe itself.
+        //
+        // CURSOR-3: a sprite over a reserved box also gives up the overlay. The probe paints into the
+        // FRONT buffer after this pass, so pixels the overlay would have delivered inside a staged
+        // present are pixels the probe overwrites — the sprite module's plan would then describe a
+        // panel that no longer holds it, and the colour guard would decline the restore. The bracket
+        // handles this case as it did before; the probe is witness/baremetal-only and one region.
+        #[allow(unused_mut)]
+        let mut reserved_hit = false;
         #[cfg(all(target_arch = "aarch64", feature = "witness", feature = "baremetal"))]
-        if !hit {
+        {
             let fb = *super::WRITER.lock();
             if fb.is_ready() {
                 let (pw, ph) = (fb.info().width, fb.info().height);
                 if let Some(boxes) = super::wcf::reserved(pw, ph) {
-                    hit = boxes.iter().any(|b| boxes_overlap(sbox, *b));
+                    reserved_hit = boxes.iter().any(|b| boxes_overlap(sbox, *b));
                 }
             }
+            hit |= reserved_hit;
         }
         if hit {
             super::cursor::undraw();
             disturbed = true;
+            if !reserved_hit {
+                plan = Some(p);
+                #[cfg(feature = "witness")]
+                CUR3_PLANNED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
         }
     }
     #[cfg(feature = "witness")]
@@ -1073,7 +1115,7 @@ fn composite_inner() -> bool {
         // panel, and the caller's tail is what puts it back. Every early exit from here on owes the
         // same answer.
         if DRAIN_PENDING.load(core::sync::atomic::Ordering::Acquire) != 0 {
-            return disturbed;
+            return tail_of(disturbed, false);
         }
         let mut dirty = [false; MAX_WINDOWS];
         for (i, r) in t.rows.iter_mut().enumerate() {
@@ -1108,7 +1150,7 @@ fn composite_inner() -> bool {
 
     let fb = *super::WRITER.lock();
     if !fb.is_ready() {
-        return disturbed;
+        return tail_of(disturbed, false);
     }
 
     // Back-to-front: ascending z, ties by id (creation order).
@@ -1127,6 +1169,11 @@ fn composite_inner() -> bool {
     let focus = focus_asid();
 
     let mut drawn = 0usize;
+    // CURSOR-3 — did any window in this pass carry the sprite through its staged present? Back-to-
+    // front order means the LAST window to take the overlay is the topmost one that fully contains
+    // the sprite, and its plan is the one `OVERLAY` ends up holding — which is the window the
+    // operator is pointing at.
+    let mut overlaid = false;
     for &i in order.iter() {
         if !rows[i].used || !dirty[i] {
             continue;
@@ -1145,9 +1192,38 @@ fn composite_inner() -> bool {
         // measure into something other than the copy. Budgeted per window id; `None` once spent.
         #[cfg(all(target_arch = "aarch64", feature = "witness"))]
         let wcg_probe = super::wcg::begin(rows[i].id, rows[i].surf, rows[i].surf_len, rows[i].compat);
+        // CURSOR-3 — WHICH WINDOWS MAY CARRY THE SPRITE. WC-I's invariant "no verified pixel is ever
+        // read with the sprite on the panel" is preserved here rather than weakened: this pass may
+        // read this window's destination pixels back and compare them against its SOURCE surface —
+        // `wcg::end`'s `fbbad` count and `verify_window`'s scan-out verdict both do exactly that — and
+        // a cursor legitimately composited into those pixels would read as a blit defect. Both
+        // instruments are budgeted one-shots, so declining the overlay for the handful of passes they
+        // run on costs those passes WC-I's bracket and nothing else. Non-witness builds have neither
+        // instrument and no condition to test.
+        #[allow(unused_mut)]
+        let mut window_plan = plan;
+        #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+        if wcg_probe.is_some() {
+            window_plan = None;
+        }
+        #[cfg(feature = "witness")]
+        {
+            let r = &rows[i];
+            if !r.compat && r.presented && r.id < 32 {
+                let bit = 1u32 << r.id;
+                if VERIFIED.load(core::sync::atomic::Ordering::Relaxed) & bit == 0 {
+                    window_plan = None;
+                }
+            }
+        }
         // FOCUS-HL: `focus == 0` is shell focus and highlights nothing — and the explicit `!= 0` also
         // keeps a compat row (owner ASID 0) from matching it by accident.
-        draw_window(&fb, &rows[i], focus != 0 && focus == rows[i].owner_asid);
+        overlaid |= draw_window(
+            &fb,
+            &rows[i],
+            focus != 0 && focus == rows[i].owner_asid,
+            window_plan,
+        );
         #[cfg(all(target_arch = "aarch64", feature = "witness"))]
         if let Some(p) = wcg_probe {
             let r = &rows[i];
@@ -1227,7 +1303,24 @@ fn composite_inner() -> bool {
         super::wcf::run(&fb, clear);
     }
     let _ = drawn;
-    disturbed
+    tail_of(disturbed, overlaid)
+}
+
+/// CURSOR-3 — what the pass owes the sprite, from the two facts the pass records.
+///
+/// `overlaid` implies `disturbed` by construction (the plan is only ever handed down on the branch
+/// that undrew), and the assertion is cheap enough to keep as a debug one: an `Adopt` returned by a
+/// pass that never took the sprite off the panel would install a plan describing pixels some other
+/// painter owns.
+fn tail_of(disturbed: bool, overlaid: bool) -> CursorTail {
+    debug_assert!(!overlaid || disturbed);
+    if overlaid && disturbed {
+        CursorTail::Adopt
+    } else if disturbed {
+        CursorTail::Repaint
+    } else {
+        CursorTail::Untouched
+    }
 }
 
 /// WC-D — the SCALED-BLIT / SCAN-OUT VERDICT. One line per window, once, from inside the composite that
@@ -1369,7 +1462,9 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window) {
     // FOCUS-HL: ONE snapshot, as `composite_inner` takes. Reading the atomic twice in a single expression
     // could straddle a focus change and evaluate the two halves against different owners.
     let focus = focus_asid();
-    draw_window(fb, r, focus != 0 && focus == r.owner_asid);
+    // CURSOR-3: `None` — this redraw exists to put the window's OWN pixels back after the invalidate,
+    // and it runs on the one pass whose read-back forbade the overlay in the first place.
+    draw_window(fb, r, focus != 0 && focus == r.owner_asid, None);
 }
 
 /// WC-D — window ids whose [`verify_window`] verdict has already been emitted (bit `id`), so the read-back
@@ -1575,6 +1670,128 @@ fn wci_rollup_scoped(scope: &str) {
         "[wc-i] rollup scope={} windowed_flushes={} intrusions={} cursor_passes={} cursor_brackets={} -> {}",
         scope, windowed, intrusions, passes, brackets, verdict
     );
+    cursor3_rollup(scope);
+}
+
+// ---- CURSOR-3 witnesses ------------------------------------------------------------------------
+
+/// CURSOR-3 — composite passes that took WC-I's bracket AND still had an eligible overlay plan to
+/// hand down. The denominator for `taken`: a bracket with no plan is a pass the overlay was never
+/// offered on (the sprite is over a reserved probe box, or over a window an instrument is reading),
+/// and counting it against the mechanism would understate it.
+#[cfg(feature = "witness")]
+static CUR3_PLANNED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// CURSOR-3 — per-window overlay offers and the subset that landed. `offers - taken` is the
+/// straddling sprite, the contended plan lock, and the unreadable layer — every one of which falls
+/// back to WC-I's bracket, so the difference is a MISSED IMPROVEMENT and never a defect.
+#[cfg(feature = "witness")]
+static CUR3_OFFERS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "witness")]
+static CUR3_TAKEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// CURSOR-3 — how each pass's tail was settled: `adopt` (the panel already carried the sprite, the
+/// module only had to agree), `repaint` (WC-I's bracket ran to completion), `ensure` (the pass never
+/// touched the sprite — WC-I's cheap tail, and the desktop case).
+#[cfg(feature = "witness")]
+static CUR3_ADOPT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "witness")]
+static CUR3_REPAINT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "witness")]
+static CUR3_ENSURE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// CURSOR-3 — record one overlay offer and whether the layer took it. Called from `stage_window`,
+/// which is inside the `BlitGuard` window: relaxed atomics only, no lock, no allocation, no serial.
+#[cfg(feature = "witness")]
+fn note_cursor_overlay(took: bool) {
+    use core::sync::atomic::Ordering::Relaxed;
+    CUR3_OFFERS.fetch_add(1, Relaxed);
+    if took {
+        CUR3_TAKEN.fetch_add(1, Relaxed);
+    }
+}
+
+/// CURSOR-3 — per-present samples printed before the budget is spent. The mechanism is a per-present
+/// decision, so the rollup alone would leave a bench operator unable to see WHICH presents took which
+/// tail while the pointer was where; a handful of lines makes the sequence readable and then stops,
+/// because a present path at ~60 Hz per window cannot afford a line per frame.
+///
+/// Only passes that actually touched the sprite print — a pass with no sprite anywhere near a window
+/// is the overwhelming majority and says nothing. On QEMU that is EVERY pass, so this prints nothing
+/// at all there and default-quiet boot is unchanged.
+#[cfg(feature = "witness")]
+const CUR3_SAMPLES: u64 = 8;
+
+#[cfg(feature = "witness")]
+static CUR3_SAMPLED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// CURSOR-3 — record which tail a pass took, from [`composite`] and nowhere else.
+///
+/// Called with no lock of this module's or the sprite module's held, and outside the `BlitGuard`
+/// window — which is what makes the sampled `serial_println!` admissible here at all.
+#[cfg(feature = "witness")]
+fn note_cursor_tail(tail: CursorTail) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let name = match tail {
+        CursorTail::Adopt => {
+            CUR3_ADOPT.fetch_add(1, Relaxed);
+            "adopt"
+        }
+        CursorTail::Repaint => {
+            CUR3_REPAINT.fetch_add(1, Relaxed);
+            "repaint"
+        }
+        CursorTail::Untouched => {
+            CUR3_ENSURE.fetch_add(1, Relaxed);
+            return;
+        }
+    };
+    if CUR3_SAMPLED.fetch_add(1, Relaxed) < CUR3_SAMPLES {
+        serial_println!(
+            "[cursor3] present tail={} offers={} taken={} -> {}",
+            name,
+            CUR3_OFFERS.load(Relaxed),
+            CUR3_TAKEN.load(Relaxed),
+            if tail == CursorTail::Adopt { "COMPOSED" } else { "BRACKETED" }
+        );
+    }
+}
+
+/// CURSOR-3 — the arc's rollup, printed alongside `[wc-i]`'s (same scopes, same harness, one arc's
+/// worth of cursor evidence in two lines that can be read together).
+///
+/// **What the QEMU gate can and cannot witness, stated rather than implied.** QEMU raspi4b delivers
+/// no HID pointer report, so `pal::cursor::visible()` is false for the whole boot, the sprite is
+/// never drawn, `sprite_plan()` is always `None`, and every counter below is 0. The gate therefore
+/// proves NO-REGRESSION only: the window path still runs its passes, still settles every one of them
+/// through a tail, and never took an overlay it was never offered. The verdict says `UNWITNESSED` in
+/// exactly that case, so a run with no pointer can never be read as evidence for the mechanism. The
+/// number that carries the fix is `taken > 0` with `offers == taken` on the bench, where a pointer
+/// exists and the operator can hold it over a presenting window.
+#[cfg(feature = "witness")]
+fn cursor3_rollup(scope: &str) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let planned = CUR3_PLANNED.load(Relaxed);
+    let offers = CUR3_OFFERS.load(Relaxed);
+    let taken = CUR3_TAKEN.load(Relaxed);
+    let adopt = CUR3_ADOPT.load(Relaxed);
+    let repaint = CUR3_REPAINT.load(Relaxed);
+    let ensure = CUR3_ENSURE.load(Relaxed);
+    // `taken > offers` would mean an overlay landed without being offered — a wiring defect, and the
+    // only outcome here that is a defect rather than an absence of evidence.
+    let verdict = if taken > offers || adopt > taken {
+        "INCOHERENT"
+    } else if offers == 0 {
+        "UNWITNESSED"
+    } else if taken == 0 {
+        "BRACKETED"
+    } else {
+        "COMPOSED"
+    };
+    serial_println!(
+        "[cursor3] rollup scope={} planned={} offers={} taken={} adopt={} repaint={} ensure={} -> {}",
+        scope, planned, offers, taken, adopt, repaint, ensure, verdict
+    );
 }
 
 /// WC-A — whether the first `[wc-a] composite` witness has been emitted (first composite only; a
@@ -1724,17 +1941,33 @@ static FALLBACK_FIXTURE: core::sync::atomic::AtomicBool =
 /// while a foreground full-screen EL0 program owns the panel the render task is parked, so the
 /// contention this arc exists to remove is not present. `wcg::begin` already returns `None` for
 /// compat rows, so the instrumented population and the staged population are the same set.
-fn draw_window(fb: &super::FrameBuffer, r: &Window, focused: bool) {
+///
+/// ### CURSOR-3 — the sprite rides the present
+///
+/// `cur` is the compositor's overlay plan (`None` when the pointer is elsewhere, when the pass did
+/// not take the sprite off the panel, or when an instrument on this window forbids it). When the
+/// staged path runs and the sprite's box lies wholly inside this window's clipped outer box, the
+/// sprite is painted into the BACK LAYER after the window is composed and before the rows are
+/// copied — so it reaches the panel inside the same contiguous row copies, and the window's pixels
+/// are never on the panel without it. Returns whether that happened; the direct fallback path never
+/// takes the overlay (it has no back layer to save from), and reports `false` so the caller's tail
+/// falls back to WC-I's repaint.
+fn draw_window(
+    fb: &super::FrameBuffer,
+    r: &Window,
+    focused: bool,
+    cur: Option<super::cursor::Plan>,
+) -> bool {
     // `stride`/`scale` are divisors below and `surf_len` bounds the reads, so all four are checked
     // here rather than trusted from the row.
     if r.surf == 0 || r.w == 0 || r.h == 0 || r.scale == 0 || r.stride < 4 || r.surf_len == 0 {
-        return;
+        return false;
     }
     let info = fb.info();
     let (pw, ph) = (info.width, info.height);
     let (bx, by, bw, bh) = outer_box(r);
     if bx >= pw || by >= ph {
-        return;
+        return false;
     }
     // F6 — clip the outer box to the panel BEFORE any loop runs over it. `put_pixel`/`fill_rect`
     // clip per pixel, which keeps the writes safe but still ITERATES the full extent: a window
@@ -1745,7 +1978,8 @@ fn draw_window(fb: &super::FrameBuffer, r: &Window, focused: bool) {
     // WC-H — compose off-screen and present the box as contiguous rows. Returns false when the
     // back-layer is unavailable (compat row, over-cap geometry, another core holding it, or the
     // allocator declining), in which case the direct path below runs exactly as it always has.
-    if !stage_window(fb, r, bx, by, bw, bh, pw, ph, focused) {
+    let mut overlaid = false;
+    if !stage_window(fb, r, bx, by, bw, bh, pw, ph, focused, cur, &mut overlaid) {
         paint_window(fb, r, 0, 0, bx, by, bw, bh, pw, ph, focused, false);
     }
 
@@ -1758,6 +1992,10 @@ fn draw_window(fb: &super::FrameBuffer, r: &Window, focused: bool) {
     if y1 > y0 {
         fb.flush_range(y0 * row_bytes, (y1 - y0) * row_bytes);
     }
+    // CURSOR-3: the cache clean above covers the sprite's pixels for free — they are inside these
+    // rows, which is the whole point of composing them into the layer rather than poking them into
+    // the front afterwards. Nothing extra is written to the front buffer on this path.
+    overlaid
 }
 
 /// WC-H — paint the window's chrome and upscaled content into `dst`, whose origin sits at panel
@@ -1895,6 +2133,8 @@ fn stage_window(
     pw: usize,
     ph: usize,
     focused: bool,
+    cur: Option<super::cursor::Plan>,
+    overlaid: &mut bool,
 ) -> bool {
     if r.compat {
         // Not a decline: compat rows are out of scope by design (see `draw_window`), and counting
@@ -1976,6 +2216,18 @@ fn stage_window(
         },
     );
     paint_window(&layer, r, bx, by, bx, by, bw, bh, pw, ph, focused, true);
+
+    // CURSOR-3 — the sprite, LAST into the layer and therefore on top of the window's own content,
+    // and still before a single byte reaches the panel. `compose_into` declines (leaving the layer
+    // exactly as `paint_window` left it) unless the sprite's box is wholly inside this box; it takes
+    // no lock of the sprite module's, only the plan's own `try_lock`, so nothing here enters F4's
+    // drain wait set. Counted either way, so a boot that never manages the overlay says so.
+    if let Some(plan) = cur {
+        let took = super::cursor::compose_into(&layer, bx, by, plan);
+        *overlaid |= took;
+        #[cfg(feature = "witness")]
+        note_cursor_overlay(took);
+    }
 
     #[cfg(all(target_arch = "aarch64", feature = "witness"))]
     let t1 = crate::arch::aarch64::now_cycles();
