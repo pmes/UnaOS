@@ -5485,6 +5485,33 @@ pub fn record_el0_kill(name: &str, ec: u64, far: u64, far_valid: bool) {
     }
 }
 
+/// The witness-wait primitive: poll `cond` on this core, yielding cooperatively between passes, until
+/// it reads false ("the witness landed") or `secs` seconds of CNTPCT have elapsed since entry.
+/// Returns `true` if `cond` cleared within the budget, `false` on timeout.
+///
+/// This is the one shape every bounded verdict/gate wait in this file used to hand-roll:
+/// `let s = cntpct(); let d = N * cntfrq(); while <cond> && cntpct().wrapping_sub(s) <= d {
+/// yield_now(); }`. Evaluation order is preserved exactly — `cond` first, then the deadline test,
+/// then one `yield_now()` per pass — so converted sites keep their deadlines, their poll cadence and
+/// their timeout semantics unchanged. Callers that need the witness VALUE still re-read their atomics
+/// after the wait (the return is only "cleared vs timed out"), which is why most sites discard it.
+///
+/// Time-bounded via CNTPCT, which advances under QEMU even when the timer IRQ never fires, so a wedged
+/// peer core still yields a timeout FAIL line rather than a silent hang.
+fn wait_while_secs(secs: u64, mut cond: impl FnMut() -> bool) -> bool {
+    let start = super::timer::cntpct();
+    let deadline = secs.saturating_mul(super::timer::cntfrq());
+    loop {
+        if !cond() {
+            return true;
+        }
+        if super::timer::cntpct().wrapping_sub(start) > deadline {
+            return false;
+        }
+        super::sched::yield_now();
+    }
+}
+
 /// M6b verdict task: wait (bounded) for all four M6b EL0 programs (hello + three fault fixtures) to
 /// terminate, then print one PASS/FAIL line with the full accounting. Spawned on a DIFFERENT core than
 /// the demo tasks so a wedged demo core (the fingerprint of a broken TLBI) still produces a verdict —
@@ -5493,18 +5520,14 @@ pub fn record_el0_kill(name: &str, ec: u64, far: u64, far_valid: bool) {
 /// via CNTPCT (which advances in QEMU even though the timer IRQ never fires there), not a yield count
 /// (meaningless on a core with other work).
 pub fn verdict(_: usize) {
-    let start = super::timer::cntpct();
-    let deadline = 5 * super::timer::cntfrq(); // ~5 s; the whole demo completes in well under 1 s
-    loop {
-        let done = EL0_EXITED_OK.load(Ordering::Acquire)
+    // ~5 s; the whole demo completes in well under 1 s
+    let _ = wait_while_secs(5, || {
+        EL0_EXITED_OK.load(Ordering::Acquire)
             + EL0_EXITED_ERR.load(Ordering::Acquire)
             + EL0_KILLED_EXPECTED.load(Ordering::Acquire)
-            + EL0_KILLED_UNEXPECTED.load(Ordering::Acquire);
-        if done >= 4 || super::timer::cntpct().wrapping_sub(start) > deadline {
-            break;
-        }
-        super::sched::yield_now();
-    }
+            + EL0_KILLED_UNEXPECTED.load(Ordering::Acquire)
+            < 4
+    });
     let ok = EL0_EXITED_OK.load(Ordering::Acquire);
     let err = EL0_EXITED_ERR.load(Ordering::Acquire);
     let exp = EL0_KILLED_EXPECTED.load(Ordering::Acquire);
@@ -5535,13 +5558,8 @@ pub fn verdict(_: usize) {
 /// the distinct proof that SP_EL0 banking resumed it with the right user stack pointer. Time-bounded
 /// via CNTPCT (advances in QEMU even without the timer IRQ), matching the M6b verdict.
 pub fn m6e_verdict(_: usize) {
-    let start = super::timer::cntpct();
-    let deadline = 5 * super::timer::cntfrq(); // ~5 s; the spinner finishes in well under 1 s either way
-    while EL0_SPIN_DONE.load(Ordering::Acquire) == 0
-        && super::timer::cntpct().wrapping_sub(start) <= deadline
-    {
-        super::sched::yield_now();
-    }
+    // ~5 s; the spinner finishes in well under 1 s either way
+    let _ = wait_while_secs(5, || EL0_SPIN_DONE.load(Ordering::Acquire) == 0);
     let done = EL0_SPIN_DONE.load(Ordering::Acquire);
     let irqs = EL0_IRQS_AT_EL0.load(Ordering::Relaxed);
     serial_println!(
@@ -5644,13 +5662,8 @@ pub fn m6d_setup() -> Option<M6dDemo> {
 /// `stack_write` and `sp_sentinel` are path-liveness checks (the stack is writable; SP_EL0 addresses the
 /// slot after preemption). A killed M6d task never reports, so its line FAILs (bounded by the deadline).
 pub fn m6d_verdict(_: usize) {
-    let start = super::timer::cntpct();
-    let deadline = 5 * super::timer::cntfrq(); // ~5 s; the whole demo completes well under 1 s
-    while EL0_M6D_DONE.load(Ordering::Acquire) < 4
-        && super::timer::cntpct().wrapping_sub(start) <= deadline
-    {
-        super::sched::yield_now();
-    }
+    // ~5 s; the whole demo completes well under 1 s
+    let _ = wait_while_secs(5, || EL0_M6D_DONE.load(Ordering::Acquire) < 4);
     let a = M6D_REPORT_A.load(Ordering::Acquire);
     let b = M6D_REPORT_B.load(Ordering::Acquire);
     let st = M6D_REPORT_STACK.load(Ordering::Acquire);
@@ -5766,13 +5779,8 @@ pub fn m6f_setup() -> Option<M6fDemo> {
 /// iterations AND the kernel observed > 0 runner switches between them. The preempt line is QEMU-0 /
 /// metal->0, so the next reflash reads exact per-slot-task preemption (the M6d ledger's aggregate refined).
 pub fn m6f_verdict(_: usize) {
-    let start = super::timer::cntpct();
-    let deadline = 5 * super::timer::cntfrq(); // ~5 s; the whole demo completes well under 1 s
-    while EL0_M6F_DONE.load(Ordering::Acquire) < 4
-        && super::timer::cntpct().wrapping_sub(start) <= deadline
-    {
-        super::sched::yield_now();
-    }
+    // ~5 s; the whole demo completes well under 1 s
+    let _ = wait_while_secs(5, || EL0_M6F_DONE.load(Ordering::Acquire) < 4);
     let getinfo = M6F_GETINFO_WITNESS.load(Ordering::Acquire);
     let hostile = M6F_HOSTILE_REFUSED.load(Ordering::Acquire);
     let ydone = M6F_YIELD_DONE.load(Ordering::Acquire);
@@ -8968,13 +8976,7 @@ pub fn m6g_loader(arg: usize) {
 fn m6g_loader_run(_: usize) {
     // 1. Wait (bounded ~8 s CNTPCT, yielding — the m6d_verdict idiom) for the M6f verdict to publish, so
     //    the loader's lines follow every prior verdict line rather than racing into the middle of them.
-    let wstart = super::timer::cntpct();
-    let wdeadline = 8 * super::timer::cntfrq();
-    while !M6F_VERDICT_PRINTED.load(Ordering::Acquire)
-        && super::timer::cntpct().wrapping_sub(wstart) <= wdeadline
-    {
-        super::sched::yield_now();
-    }
+    let _ = wait_while_secs(8, || !M6F_VERDICT_PRINTED.load(Ordering::Acquire));
 
     // One-shot from here (spawned once, but guard defensively like u2_probe_once).
     static DONE: AtomicBool = AtomicBool::new(false);
@@ -9052,16 +9054,12 @@ fn m6g_loader_run(_: usize) {
     // 7. Verdict (folded in — no extra task): wait (bounded ~2 s, yielding so m6g-hello runs on this core)
     //    for the disk program to terminate, then print PASS/FAIL. The disk blob's `sys_exit(0)` is routed
     //    by name into EL0_M6G_DONE; a fault into EL0_M6G_KILLED; a nonzero exit into EL0_M6G_ERR.
-    let vstart = super::timer::cntpct();
-    let vdeadline = 2 * super::timer::cntfrq();
-    while EL0_M6G_DONE.load(Ordering::Acquire)
-        + EL0_M6G_ERR.load(Ordering::Acquire)
-        + EL0_M6G_KILLED.load(Ordering::Acquire)
-        == 0
-        && super::timer::cntpct().wrapping_sub(vstart) <= vdeadline
-    {
-        super::sched::yield_now();
-    }
+    let _ = wait_while_secs(2, || {
+        EL0_M6G_DONE.load(Ordering::Acquire)
+            + EL0_M6G_ERR.load(Ordering::Acquire)
+            + EL0_M6G_KILLED.load(Ordering::Acquire)
+            == 0
+    });
     let done = EL0_M6G_DONE.load(Ordering::Acquire);
     let err = EL0_M6G_ERR.load(Ordering::Acquire);
     let killed = EL0_M6G_KILLED.load(Ordering::Acquire);
@@ -9168,13 +9166,9 @@ fn elf1_launcher(_demo_cpu: usize) {
     super::sched::spawn_user_slot("elf1-hello", loaded.base, loaded.sp, loaded.ttbr0, run_cpu);
 
     // Verdict: wait (bounded ~2 s, yielding so elf1-hello runs on this core) for the program to terminate.
-    let vstart = super::timer::cntpct();
-    let vdeadline = 2 * super::timer::cntfrq();
-    while EL0_ELF1_DONE.load(Ordering::Acquire) + EL0_ELF1_ERR.load(Ordering::Acquire) == 0
-        && super::timer::cntpct().wrapping_sub(vstart) <= vdeadline
-    {
-        super::sched::yield_now();
-    }
+    let _ = wait_while_secs(2, || {
+        EL0_ELF1_DONE.load(Ordering::Acquire) + EL0_ELF1_ERR.load(Ordering::Acquire) == 0
+    });
     let done = EL0_ELF1_DONE.load(Ordering::Acquire);
     let err = EL0_ELF1_ERR.load(Ordering::Acquire);
     let token = ELF1_WITNESS.load(Ordering::Acquire);
@@ -9779,13 +9773,7 @@ fn threads_launcher(_demo_cpu: usize) {
 
     // Verdict: wait (bounded ~2 s, yielding so el0-threads + its co-located worker run on this core) for the
     // parent to reach its clean exit.
-    let vstart = super::timer::cntpct();
-    let vdeadline = 2 * super::timer::cntfrq();
-    while !THREADS_PARENT_DONE.load(Ordering::Acquire)
-        && super::timer::cntpct().wrapping_sub(vstart) <= vdeadline
-    {
-        super::sched::yield_now();
-    }
+    let _ = wait_while_secs(2, || !THREADS_PARENT_DONE.load(Ordering::Acquire));
     let spawned = THREADS_SPAWNED.load(Ordering::Acquire);
     let joined = THREADS_JOINED.load(Ordering::Acquire);
     let counter = THREADS_COUNTER.load(Ordering::Acquire);
@@ -11431,13 +11419,7 @@ fn fb_launcher(_demo_cpu: usize) {
     super::sched::spawn_user_slot("el0-fb", entry, sp, ttbr0, run_cpu);
 
     // Verdict: yield (bounded ~2 s) so el0-fb + its co-located worker run on this core until the parent exits.
-    let vstart = super::timer::cntpct();
-    let vdeadline = 2 * super::timer::cntfrq();
-    while !FB_PARENT_DONE.load(Ordering::Acquire)
-        && super::timer::cntpct().wrapping_sub(vstart) <= vdeadline
-    {
-        super::sched::yield_now();
-    }
+    let _ = wait_while_secs(2, || !FB_PARENT_DONE.load(Ordering::Acquire));
     let done = FB_PARENT_DONE.load(Ordering::Acquire);
     let present = FB_PRESENT_COUNT.load(Ordering::Acquire);
     let checksum = FB_PRESENT_CHECKSUM.load(Ordering::Acquire);
@@ -11731,13 +11713,7 @@ fn wcb_launcher(_demo_cpu: usize) {
     super::sched::spawn_user_slot("el0-wcb", entry, sp, ttbr0, run_cpu);
 
     // Verdict: yield (bounded ~2 s) so `el0-wcb` runs to its exit on this core.
-    let vstart = super::timer::cntpct();
-    let vdeadline = 2 * super::timer::cntfrq();
-    while !WCB_DONE.load(Ordering::Acquire)
-        && super::timer::cntpct().wrapping_sub(vstart) <= vdeadline
-    {
-        super::sched::yield_now();
-    }
+    let _ = wait_while_secs(2, || !WCB_DONE.load(Ordering::Acquire));
     let done = WCB_DONE.load(Ordering::Acquire);
     let w = WCB_WITNESS.load(Ordering::Acquire);
     let checksum = FB_PRESENT_CHECKSUM.load(Ordering::Acquire);
@@ -11851,13 +11827,7 @@ fn u4_setup() -> Option<U4Demo> {
 /// precede the parent's exit, which precedes EL0_U4_DONE reaching 2, which the verdict polls before PASS).
 pub fn u4_launcher(demo_cpu: usize) {
     // 1. Gate on the M6g loader (its lines printed + its/M6d's/M6f's slots freed).
-    let wstart = super::timer::cntpct();
-    let wdeadline = 10 * super::timer::cntfrq();
-    while !M6G_LOADER_DONE.load(Ordering::Acquire)
-        && super::timer::cntpct().wrapping_sub(wstart) <= wdeadline
-    {
-        super::sched::yield_now();
-    }
+    let _ = wait_while_secs(10, || !M6G_LOADER_DONE.load(Ordering::Acquire));
 
     // One-shot (spawned once; guard defensively).
     static DONE: AtomicBool = AtomicBool::new(false);
@@ -11883,13 +11853,7 @@ pub fn u4_launcher(demo_cpu: usize) {
 
     // 4. Folded verdict: wait (bounded ~5 s, yielding) for BOTH fixtures to reach their sentinel exit, then
     //    judge. Two children (two disk loads) + the orphan complete well under this budget under QEMU.
-    let vstart = super::timer::cntpct();
-    let vdeadline = 5 * super::timer::cntfrq();
-    while EL0_U4_DONE.load(Ordering::Acquire) < 2
-        && super::timer::cntpct().wrapping_sub(vstart) <= vdeadline
-    {
-        super::sched::yield_now();
-    }
+    let _ = wait_while_secs(5, || EL0_U4_DONE.load(Ordering::Acquire) < 2);
     let witness = U4_PARENT_WITNESS.load(Ordering::Acquire);
     let orphan = U4_ORPHAN_ECHILD.load(Ordering::Acquire);
     let killed = EL0_U4_KILLED.load(Ordering::Acquire);
@@ -11978,13 +11942,7 @@ fn u5_setup() -> Option<U5Demo> {
 ///      row cleared AND no U5 kill. Prints ONE PASS line.
 pub fn u5_launcher(demo_cpu: usize) {
     // 1. Gate on the U4 launcher (its verdict printed + the U4 slots freed).
-    let wstart = super::timer::cntpct();
-    let wdeadline = 10 * super::timer::cntfrq();
-    while !U4_LAUNCH_DONE.load(Ordering::Acquire)
-        && super::timer::cntpct().wrapping_sub(wstart) <= wdeadline
-    {
-        super::sched::yield_now();
-    }
+    let _ = wait_while_secs(10, || !U4_LAUNCH_DONE.load(Ordering::Acquire));
 
     // One-shot (spawned once; guard defensively).
     static DONE: AtomicBool = AtomicBool::new(false);
@@ -12008,26 +11966,14 @@ pub fn u5_launcher(demo_cpu: usize) {
     super::sched::spawn_user_slot("el0-u5cap", u5.cap, u5.sp, u5.ttbr0, demo_cpu);
 
     // 4a. Wait (bounded ~5 s, yielding) for the fixture to reach its sentinel exit, then snapshot the witness.
-    let vstart = super::timer::cntpct();
-    let vdeadline = 5 * super::timer::cntfrq();
-    while EL0_U5_DONE.load(Ordering::Acquire) < 1
-        && super::timer::cntpct().wrapping_sub(vstart) <= vdeadline
-    {
-        super::sched::yield_now();
-    }
+    let _ = wait_while_secs(5, || EL0_U5_DONE.load(Ordering::Acquire) < 1);
     let witness = U5_WITNESS.load(Ordering::Acquire);
     let killed = EL0_U5_KILLED.load(Ordering::Acquire);
 
     // 4b. Teardown-clear proof: the fixture exited above, so its exit path cleared its handle row. That clear
     //     runs just AFTER the sentinel increment, so poll (bounded) until the row is clear — false->true when
     //     teardown runs. Nothing reuses the slot after (U5 is the last demo), so once clear it stays clear.
-    let tstart = super::timer::cntpct();
-    let tdeadline = 2 * super::timer::cntfrq();
-    while !handle_row_is_clear(u5.asid)
-        && super::timer::cntpct().wrapping_sub(tstart) <= tdeadline
-    {
-        super::sched::yield_now();
-    }
+    let _ = wait_while_secs(2, || !handle_row_is_clear(u5.asid));
     let cleared = handle_row_is_clear(u5.asid);
 
     if witness == U5_WITNESS_ALL && cleared && killed == 0 {
@@ -12147,13 +12093,7 @@ fn u6_kernel_check(asid: u64) -> bool {
 ///      last demo, so it releases no further gate.
 pub fn u6_launcher(demo_cpu: usize) {
     // 1. Gate on the U5 launcher (its verdict printed + the U5 slot freed).
-    let wstart = super::timer::cntpct();
-    let wdeadline = 10 * super::timer::cntfrq();
-    while !U5_LAUNCH_DONE.load(Ordering::Acquire)
-        && super::timer::cntpct().wrapping_sub(wstart) <= wdeadline
-    {
-        super::sched::yield_now();
-    }
+    let _ = wait_while_secs(10, || !U5_LAUNCH_DONE.load(Ordering::Acquire));
 
     // One-shot (spawned once; guard defensively).
     static DONE: AtomicBool = AtomicBool::new(false);
@@ -12180,13 +12120,7 @@ pub fn u6_launcher(demo_cpu: usize) {
 
     // 4. Folded verdict: wait (bounded ~5 s, yielding) for the fixture's sentinel exit, then judge. Two children
     //    (two disk loads) + the parent complete well under this budget under QEMU.
-    let vstart = super::timer::cntpct();
-    let vdeadline = 5 * super::timer::cntfrq();
-    while EL0_U6_DONE.load(Ordering::Acquire) < 1
-        && super::timer::cntpct().wrapping_sub(vstart) <= vdeadline
-    {
-        super::sched::yield_now();
-    }
+    let _ = wait_while_secs(5, || EL0_U6_DONE.load(Ordering::Acquire) < 1);
     let witness = U6_WITNESS.load(Ordering::Acquire);
     let kinds_ok = U6_KINDS_OK.load(Ordering::Acquire);
     let killed = EL0_U6_KILLED.load(Ordering::Acquire);
@@ -12278,13 +12212,7 @@ fn u6b_setup() -> Option<U6bDemo> {
 ///      transfer demo orders after this one.
 pub fn u6b_launcher(demo_cpu: usize) {
     // 1. Gate on the U6 launcher (its verdict printed + the U6 slot freed).
-    let wstart = super::timer::cntpct();
-    let wdeadline = 10 * super::timer::cntfrq();
-    while !U6_LAUNCH_DONE.load(Ordering::Acquire)
-        && super::timer::cntpct().wrapping_sub(wstart) <= wdeadline
-    {
-        super::sched::yield_now();
-    }
+    let _ = wait_while_secs(10, || !U6_LAUNCH_DONE.load(Ordering::Acquire));
 
     // One-shot (spawned once; guard defensively).
     static DONE: AtomicBool = AtomicBool::new(false);
@@ -12349,26 +12277,14 @@ pub fn u6b_launcher(demo_cpu: usize) {
     super::sched::spawn_user_slot("el0-u6bfile", u6b.file, u6b.sp, u6b.ttbr0, demo_cpu);
 
     // 4a. Wait (bounded ~5 s, yielding) for the fixture to reach its sentinel exit, then snapshot the witness.
-    let vstart = super::timer::cntpct();
-    let vdeadline = 5 * super::timer::cntfrq();
-    while EL0_U6B_DONE.load(Ordering::Acquire) < 1
-        && super::timer::cntpct().wrapping_sub(vstart) <= vdeadline
-    {
-        super::sched::yield_now();
-    }
+    let _ = wait_while_secs(5, || EL0_U6B_DONE.load(Ordering::Acquire) < 1);
     let witness = U6B_WITNESS.load(Ordering::Acquire);
     let killed = EL0_U6B_KILLED.load(Ordering::Acquire);
 
     // 4b. File-row teardown-clear proof: the fixture exited holding two live descriptors, so its exit path
     //     cleared the FILES row (via `clear_handle_row` -> `clear_files_row`). Poll (bounded) until it clears —
     //     false->true when teardown runs. Nothing reuses the slot after (U6b is the last demo), so it stays clear.
-    let tstart = super::timer::cntpct();
-    let tdeadline = 2 * super::timer::cntfrq();
-    while !files_row_is_clear(u6b.asid)
-        && super::timer::cntpct().wrapping_sub(tstart) <= tdeadline
-    {
-        super::sched::yield_now();
-    }
+    let _ = wait_while_secs(2, || !files_row_is_clear(u6b.asid));
     let files_cleared = files_row_is_clear(u6b.asid);
 
     if witness == U6B_WITNESS_ALL && files_cleared && killed == 0 {
@@ -16077,13 +15993,7 @@ fn k2_run_program(name: &str, taskname: &'static str, demo_cpu: usize, want: u32
     let asid = loaded.ttbr0 >> 48;
     let stamped = slot_ppid_of(asid); // the real stamp from load_program_into_slot, read before the program runs
     super::sched::spawn_user_slot(taskname, loaded.base, loaded.sp, loaded.ttbr0, demo_cpu);
-    let start = super::timer::cntpct();
-    let deadline = 5 * super::timer::cntfrq();
-    while EL0_K2_DONE.load(Ordering::Acquire) < want
-        && super::timer::cntpct().wrapping_sub(start) <= deadline
-    {
-        super::sched::yield_now();
-    }
+    let _ = wait_while_secs(5, || EL0_K2_DONE.load(Ordering::Acquire) < want);
     Some(stamped)
 }
 
@@ -16435,13 +16345,7 @@ fn k2_metal_verify(demo_cpu: usize) {
 
 fn u7_run(demo_cpu: usize) {
     // 1. Gate on the U6b launcher (its verdict printed + its slot freed).
-    let wstart = super::timer::cntpct();
-    let wdeadline = 10 * super::timer::cntfrq();
-    while !U6B_LAUNCH_DONE.load(Ordering::Acquire)
-        && super::timer::cntpct().wrapping_sub(wstart) <= wdeadline
-    {
-        super::sched::yield_now();
-    }
+    let _ = wait_while_secs(10, || !U6B_LAUNCH_DONE.load(Ordering::Acquire));
 
     // One-shot (spawned once; guard defensively).
     static DONE: AtomicBool = AtomicBool::new(false);
@@ -16486,41 +16390,23 @@ fn u7_run(demo_cpu: usize) {
 
     // 4. The single-writer witness: t1 pending in the child's inbox + the child's row still untouched
     //    (the child is provably pre-RECV — it is parked on the GO word this launcher has not released).
-    let dstart = super::timer::cntpct();
-    let ddeadline = 5 * super::timer::cntfrq();
-    let mut deposit_seen = false;
-    while !deposit_seen && super::timer::cntpct().wrapping_sub(dstart) <= ddeadline {
-        deposit_seen = (0..NXFER).any(|k| {
+    let deposit_seen = wait_while_secs(5, || {
+        !(0..NXFER).any(|k| {
             let t = XFER_SLOT_TX[child.asid as usize][k].load(Ordering::Acquire);
             t != 0 && t != HANDLE_RESERVING
-        });
-        if !deposit_seen {
-            super::sched::yield_now();
-        }
-    }
+        })
+    });
     let snap_ok = deposit_seen && handle_row_is_clear(child.asid);
     u7_release_go(child.slot);
 
     // 5. Use-then-revoke sequencing: wait for the child's first successful write through the cap, then
     //    let the parent revoke.
-    let ustart = super::timer::cntpct();
-    let udeadline = 5 * super::timer::cntfrq();
-    while U7_CHILD_USED.load(Ordering::Acquire) == 0
-        && super::timer::cntpct().wrapping_sub(ustart) <= udeadline
-    {
-        super::sched::yield_now();
-    }
+    let _ = wait_while_secs(5, || U7_CHILD_USED.load(Ordering::Acquire) == 0);
     let used = U7_CHILD_USED.load(Ordering::Acquire);
     u7_release_go(parent.slot);
 
     // 6a. Wait (bounded) for both sentinel exits, then snapshot the witnesses.
-    let vstart = super::timer::cntpct();
-    let vdeadline = 8 * super::timer::cntfrq();
-    while EL0_U7_DONE.load(Ordering::Acquire) < 2
-        && super::timer::cntpct().wrapping_sub(vstart) <= vdeadline
-    {
-        super::sched::yield_now();
-    }
+    let _ = wait_while_secs(8, || EL0_U7_DONE.load(Ordering::Acquire) < 2);
     let pw = U7_PARENT_WITNESS.load(Ordering::Acquire);
     let cw = U7_CHILD_WITNESS.load(Ordering::Acquire);
     let killed = EL0_U7_KILLED.load(Ordering::Acquire);
@@ -16735,26 +16621,14 @@ fn u8_launcher(demo_cpu: usize) {
     super::sched::spawn_user_slot("el0-u8tree", fix.entry, fix.sp, fix.ttbr0, demo_cpu);
 
     // Wait (bounded ~5 s, yielding) for the fixture's sentinel exit, then snapshot the witness.
-    let vstart = super::timer::cntpct();
-    let vdeadline = 5 * super::timer::cntfrq();
-    while EL0_U8_DONE.load(Ordering::Acquire) < 1
-        && super::timer::cntpct().wrapping_sub(vstart) <= vdeadline
-    {
-        super::sched::yield_now();
-    }
+    let _ = wait_while_secs(5, || EL0_U8_DONE.load(Ordering::Acquire) < 1);
     let witness = U8_WITNESS.load(Ordering::Acquire);
     let killed = EL0_U8_KILLED.load(Ordering::Acquire);
 
     // Teardown proof: the fixture exited holding live derived handles (g1/g2/g4 and the two endowed
     // sources — g1/g2 already stale, but their NODES persist as tombstones until the row clears), so its
     // teardown must drain BOTH the handle row and the derivation ledger. Poll bounded; false->true.
-    let tstart = super::timer::cntpct();
-    let tdeadline = 2 * super::timer::cntfrq();
-    while !(handle_row_is_clear(fix.asid) && deriv_all_free())
-        && super::timer::cntpct().wrapping_sub(tstart) <= tdeadline
-    {
-        super::sched::yield_now();
-    }
+    let _ = wait_while_secs(2, || !(handle_row_is_clear(fix.asid) && deriv_all_free()));
     let cleared = handle_row_is_clear(fix.asid) && deriv_all_free();
 
     // Kernel-side cross-process checks (they require the drained ledgers the wait above establishes).
@@ -16920,25 +16794,13 @@ fn u9_launcher(demo_cpu: usize) {
     super::sched::spawn_user_slot("el0-u9write", fix.entry, fix.sp, fix.ttbr0, demo_cpu);
 
     // Wait (bounded ~5 s, yielding) for the fixture's sentinel exit, then snapshot the witness.
-    let vstart = super::timer::cntpct();
-    let vdeadline = 5 * super::timer::cntfrq();
-    while EL0_U9_DONE.load(Ordering::Acquire) < 1
-        && super::timer::cntpct().wrapping_sub(vstart) <= vdeadline
-    {
-        super::sched::yield_now();
-    }
+    let _ = wait_while_secs(5, || EL0_U9_DONE.load(Ordering::Acquire) < 1);
     let witness = U9_WITNESS.load(Ordering::Acquire);
     let killed = EL0_U9_KILLED.load(Ordering::Acquire);
 
     // Teardown proof: the fixture exited holding two live descriptors (its RW + RO opens) and the pre-endowed
     // Socket handle, so its exit cleared BOTH the FILES row and the handle row. Poll bounded; false->true.
-    let tstart = super::timer::cntpct();
-    let tdeadline = 2 * super::timer::cntfrq();
-    while !(files_row_is_clear(fix.asid) && handle_row_is_clear(fix.asid))
-        && super::timer::cntpct().wrapping_sub(tstart) <= tdeadline
-    {
-        super::sched::yield_now();
-    }
+    let _ = wait_while_secs(2, || !(files_row_is_clear(fix.asid) && handle_row_is_clear(fix.asid)));
     let cleared = files_row_is_clear(fix.asid) && handle_row_is_clear(fix.asid);
 
     // Kernel-side "the write actually hit the disk" checks: re-read SCRATCH.BIN from a fresh mount. The size
@@ -17097,25 +16959,13 @@ fn u10_launcher(demo_cpu: usize) {
     super::sched::spawn_user_slot("el0-u10grow", fix.entry, fix.sp, fix.ttbr0, demo_cpu);
 
     // Wait (bounded ~5 s, yielding) for the fixture's sentinel exit, then snapshot the witness.
-    let vstart = super::timer::cntpct();
-    let vdeadline = 5 * super::timer::cntfrq();
-    while EL0_U10_DONE.load(Ordering::Acquire) < 1
-        && super::timer::cntpct().wrapping_sub(vstart) <= vdeadline
-    {
-        super::sched::yield_now();
-    }
+    let _ = wait_while_secs(5, || EL0_U10_DONE.load(Ordering::Acquire) < 1);
     let witness = U10_WITNESS.load(Ordering::Acquire);
     let killed = EL0_U10_KILLED.load(Ordering::Acquire);
 
     // Teardown proof: the fixture exited holding two live descriptors (its RW + RO opens), so its exit cleared
     // BOTH the FILES row and the handle row. Poll bounded; false->true.
-    let tstart = super::timer::cntpct();
-    let tdeadline = 2 * super::timer::cntfrq();
-    while !(files_row_is_clear(fix.asid) && handle_row_is_clear(fix.asid))
-        && super::timer::cntpct().wrapping_sub(tstart) <= tdeadline
-    {
-        super::sched::yield_now();
-    }
+    let _ = wait_while_secs(2, || !(files_row_is_clear(fix.asid) && handle_row_is_clear(fix.asid)));
     let cleared = files_row_is_clear(fix.asid) && handle_row_is_clear(fix.asid);
 
     // Kernel-side "the grow actually hit the disk" checks: re-read GROW.BIN from a fresh mount. The size must
@@ -17235,23 +17085,11 @@ fn u10c_launcher(demo_cpu: usize) {
     );
     super::sched::spawn_user_slot("el0-u10create", fix.entry, fix.sp, fix.ttbr0, demo_cpu);
 
-    let vstart = super::timer::cntpct();
-    let vdeadline = 5 * super::timer::cntfrq();
-    while EL0_U10C_DONE.load(Ordering::Acquire) < 1
-        && super::timer::cntpct().wrapping_sub(vstart) <= vdeadline
-    {
-        super::sched::yield_now();
-    }
+    let _ = wait_while_secs(5, || EL0_U10C_DONE.load(Ordering::Acquire) < 1);
     let witness = U10C_WITNESS.load(Ordering::Acquire);
     let killed = EL0_U10C_KILLED.load(Ordering::Acquire);
 
-    let tstart = super::timer::cntpct();
-    let tdeadline = 2 * super::timer::cntfrq();
-    while !(files_row_is_clear(fix.asid) && handle_row_is_clear(fix.asid))
-        && super::timer::cntpct().wrapping_sub(tstart) <= tdeadline
-    {
-        super::sched::yield_now();
-    }
+    let _ = wait_while_secs(2, || !(files_row_is_clear(fix.asid) && handle_row_is_clear(fix.asid)));
     let cleared = files_row_is_clear(fix.asid) && handle_row_is_clear(fix.asid);
 
     // Kernel-side "the create actually hit the disk" checks: re-mount and find FRESH.BIN. It must EXIST with the
@@ -17381,23 +17219,11 @@ fn u10d_launcher(demo_cpu: usize) {
     );
     super::sched::spawn_user_slot("el0-u10delete", fix.entry, fix.sp, fix.ttbr0, demo_cpu);
 
-    let vstart = super::timer::cntpct();
-    let vdeadline = 5 * super::timer::cntfrq();
-    while EL0_U10D_DONE.load(Ordering::Acquire) < 1
-        && super::timer::cntpct().wrapping_sub(vstart) <= vdeadline
-    {
-        super::sched::yield_now();
-    }
+    let _ = wait_while_secs(5, || EL0_U10D_DONE.load(Ordering::Acquire) < 1);
     let witness = U10D_WITNESS.load(Ordering::Acquire);
     let killed = EL0_U10D_KILLED.load(Ordering::Acquire);
 
-    let tstart = super::timer::cntpct();
-    let tdeadline = 2 * super::timer::cntfrq();
-    while !(files_row_is_clear(fix.asid) && handle_row_is_clear(fix.asid))
-        && super::timer::cntpct().wrapping_sub(tstart) <= tdeadline
-    {
-        super::sched::yield_now();
-    }
+    let _ = wait_while_secs(2, || !(files_row_is_clear(fix.asid) && handle_row_is_clear(fix.asid)));
     let cleared = files_row_is_clear(fix.asid) && handle_row_is_clear(fix.asid);
 
     // Kernel-side "the delete actually hit the disk" checks: re-mount, and verify DELME.BIN is GONE, its data
@@ -17542,23 +17368,11 @@ fn u11_launcher(demo_cpu: usize) {
     );
     super::sched::spawn_user_slot("el0-u11close", fix.entry, fix.sp, fix.ttbr0, demo_cpu);
 
-    let vstart = super::timer::cntpct();
-    let vdeadline = 5 * super::timer::cntfrq();
-    while EL0_U11_DONE.load(Ordering::Acquire) < 1
-        && super::timer::cntpct().wrapping_sub(vstart) <= vdeadline
-    {
-        super::sched::yield_now();
-    }
+    let _ = wait_while_secs(5, || EL0_U11_DONE.load(Ordering::Acquire) < 1);
     let witness = U11_WITNESS.load(Ordering::Acquire);
     let killed = EL0_U11_KILLED.load(Ordering::Acquire);
 
-    let tstart = super::timer::cntpct();
-    let tdeadline = 2 * super::timer::cntfrq();
-    while !(files_row_is_clear(fix.asid) && handle_row_is_clear(fix.asid))
-        && super::timer::cntpct().wrapping_sub(tstart) <= tdeadline
-    {
-        super::sched::yield_now();
-    }
+    let _ = wait_while_secs(2, || !(files_row_is_clear(fix.asid) && handle_row_is_clear(fix.asid)));
     let cleared = files_row_is_clear(fix.asid) && handle_row_is_clear(fix.asid);
 
     // Kernel-side mechanistic proof of the gen-tag (isolated from disk/EL0 timing) — runs AFTER teardown so
@@ -17705,13 +17519,7 @@ fn u11defer_run(demo_cpu: usize) {
     // Bounded flag-wait (deadline in cntfrq units), yielding cooperatively — the `u7_run` idiom. Returns whether
     // the flag was set within the deadline.
     let wait_flag = |flag: &AtomicU32, secs: u64| -> bool {
-        let start = super::timer::cntpct();
-        let deadline = secs * super::timer::cntfrq();
-        while flag.load(Ordering::Acquire) == 0
-            && super::timer::cntpct().wrapping_sub(start) <= deadline
-        {
-            super::sched::yield_now();
-        }
+        wait_while_secs(secs, || flag.load(Ordering::Acquire) == 0);
         flag.load(Ordering::Acquire) != 0
     };
     // Fresh-mount FAT snapshot: is DEFER.BIN's chain head `f0` still allocated in ALL FAT copies (non-zero)?
@@ -17752,28 +17560,18 @@ fn u11defer_run(demo_cpu: usize) {
     u11defer_release_go(a.slot, 0x3018);
 
     // Verdict: wait for both sentinel exits, read witnesses + kills, wait teardown-clear, then CHECKPOINT-3.
-    let vstart = super::timer::cntpct();
-    let vdeadline = 5 * super::timer::cntfrq();
-    while EL0_U11DEFER_DONE.load(Ordering::Acquire) < 2
-        && super::timer::cntpct().wrapping_sub(vstart) <= vdeadline
-    {
-        super::sched::yield_now();
-    }
+    let _ = wait_while_secs(5, || EL0_U11DEFER_DONE.load(Ordering::Acquire) < 2);
     let a_witness = U11DEFER_A_WITNESS.load(Ordering::Acquire);
     let b_witness = U11DEFER_B_WITNESS.load(Ordering::Acquire);
     let done = EL0_U11DEFER_DONE.load(Ordering::Acquire);
     let killed = EL0_U11DEFER_KILLED.load(Ordering::Acquire);
 
-    let tstart = super::timer::cntpct();
-    let tdeadline = 2 * super::timer::cntfrq();
-    while !(files_row_is_clear(a.asid)
-        && files_row_is_clear(b.asid)
-        && handle_row_is_clear(a.asid)
-        && handle_row_is_clear(b.asid))
-        && super::timer::cntpct().wrapping_sub(tstart) <= tdeadline
-    {
-        super::sched::yield_now();
-    }
+    let _ = wait_while_secs(2, || {
+        !(files_row_is_clear(a.asid)
+            && files_row_is_clear(b.asid)
+            && handle_row_is_clear(a.asid)
+            && handle_row_is_clear(b.asid))
+    });
     let cleared = files_row_is_clear(a.asid)
         && files_row_is_clear(b.asid)
         && handle_row_is_clear(a.asid)
@@ -18062,13 +17860,7 @@ fn u11reap_run(demo_cpu: usize) {
 
     // Bounded flag-wait (the `u11defer_run` idiom), yielding cooperatively.
     let wait_flag = |flag: &AtomicU32, secs: u64| -> bool {
-        let start = super::timer::cntpct();
-        let deadline = secs * super::timer::cntfrq();
-        while flag.load(Ordering::Acquire) == 0
-            && super::timer::cntpct().wrapping_sub(start) <= deadline
-        {
-            super::sched::yield_now();
-        }
+        wait_while_secs(secs, || flag.load(Ordering::Acquire) == 0);
         flag.load(Ordering::Acquire) != 0
     };
     // Fresh-mount FAT snapshot: is DEFER2.BIN's chain head `f0` still allocated in ALL FAT copies (non-zero)?
@@ -18109,28 +17901,18 @@ fn u11reap_run(demo_cpu: usize) {
     u11defer_release_go(a.slot, 0x3018); // release A's EXIT GO — A now exits WITHOUT closing
 
     // Verdict: wait for both sentinel exits, read witnesses + kills, wait teardown-clear, then CHECKPOINT-3.
-    let vstart = super::timer::cntpct();
-    let vdeadline = 5 * super::timer::cntfrq();
-    while EL0_U11REAP_DONE.load(Ordering::Acquire) < 2
-        && super::timer::cntpct().wrapping_sub(vstart) <= vdeadline
-    {
-        super::sched::yield_now();
-    }
+    let _ = wait_while_secs(5, || EL0_U11REAP_DONE.load(Ordering::Acquire) < 2);
     let a_witness = U11REAP_A_WITNESS.load(Ordering::Acquire);
     let b_witness = U11REAP_B_WITNESS.load(Ordering::Acquire);
     let done = EL0_U11REAP_DONE.load(Ordering::Acquire);
     let killed = EL0_U11REAP_KILLED.load(Ordering::Acquire);
 
-    let tstart = super::timer::cntpct();
-    let tdeadline = 2 * super::timer::cntfrq();
-    while !(files_row_is_clear(a.asid)
-        && files_row_is_clear(b.asid)
-        && handle_row_is_clear(a.asid)
-        && handle_row_is_clear(b.asid))
-        && super::timer::cntpct().wrapping_sub(tstart) <= tdeadline
-    {
-        super::sched::yield_now();
-    }
+    let _ = wait_while_secs(2, || {
+        !(files_row_is_clear(a.asid)
+            && files_row_is_clear(b.asid)
+            && handle_row_is_clear(a.asid)
+            && handle_row_is_clear(b.asid))
+    });
     let cleared = files_row_is_clear(a.asid)
         && files_row_is_clear(b.asid)
         && handle_row_is_clear(a.asid)
@@ -18320,11 +18102,7 @@ fn uowner_run(demo_cpu: usize) {
 
     // Bounded flag-wait (the u11defer/u7 idiom), yielding cooperatively.
     let wait_flag = |flag: &AtomicU32, secs: u64| -> bool {
-        let start = super::timer::cntpct();
-        let deadline = secs * super::timer::cntfrq();
-        while flag.load(Ordering::Acquire) == 0 && super::timer::cntpct().wrapping_sub(start) <= deadline {
-            super::sched::yield_now();
-        }
+        wait_while_secs(secs, || flag.load(Ordering::Acquire) == 0);
         flag.load(Ordering::Acquire) != 0
     };
 
@@ -18363,16 +18141,12 @@ fn uowner_run(demo_cpu: usize) {
     let done = EL0_UOWNER_DONE.load(Ordering::Acquire);
     let killed = EL0_UOWNER_KILLED.load(Ordering::Acquire);
 
-    let tstart = super::timer::cntpct();
-    let tdeadline = 2 * super::timer::cntfrq();
-    while !(files_row_is_clear(a.asid)
-        && files_row_is_clear(b.asid)
-        && handle_row_is_clear(a.asid)
-        && handle_row_is_clear(b.asid))
-        && super::timer::cntpct().wrapping_sub(tstart) <= tdeadline
-    {
-        super::sched::yield_now();
-    }
+    let _ = wait_while_secs(2, || {
+        !(files_row_is_clear(a.asid)
+            && files_row_is_clear(b.asid)
+            && handle_row_is_clear(a.asid)
+            && handle_row_is_clear(b.asid))
+    });
     let cleared = files_row_is_clear(a.asid)
         && files_row_is_clear(b.asid)
         && handle_row_is_clear(a.asid)
