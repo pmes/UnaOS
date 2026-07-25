@@ -31,6 +31,8 @@ Three pull sequences, numbered independently. Every pull = one BRIEF (coordinato
 | 7 | BRIEF-kepler-pull7-pfifo / PROPOSAL-kepler-pull7 | LANDED 0715c94c; s6-7 | PBDMA base/clock instrumentation |
 | 4–6 | PROPOSAL-kepler-pull4/5/6(+v2), WALKTHROUGHs, REVIEW-pull6-REJECTED | LANDED (pre-lane-split history) | VRAM/GOP/EVO era |
 
+**Coordinator arc CONSOLE-ON-PANEL (b5918496, GR5 executor): LANDED, gated green, rides s33.** Root cause: fbcon never drew on the metal media — `_print` QUIET-PANEL-gated off without `bootlog`, `milestone` cfg'd out under `usbdebug`; geometry was always right. Fix: `PANEL_CONSOLE` override + scale-6 glyphs + `panel_console_resume()` seam after fb-draw done. Markers: `fbcon: glyphs-active …`, `kdisp: console-repaint rows=N`. Arc note: `Kepler/ARC-console-on-panel.md`. (Sibling arc SERIAL-ON-GUI: executor tripwired correctly — premise false, FTDI mirror is unconditional and works on GUI features in QEMU; metal fork test = run `bootlog` verb at a GUI sitting, check `ftdi:console-up` tag. No code.)
+
 ## Lane 2: Kepler DISPLAY (scanout — kepler_display.rs after split) — `video/Kepler/`, files `*kepler-display-pull<N>*`
 | Pull | Files | Status | One-liner |
 |---|---|---|---|
