@@ -265,6 +265,52 @@ pub unsafe fn takeover_display(
     let pre_shadow = mmio_read(bar0, shadow_reg);
     serial_println!(":: kdisp: latch pre asm={:08X} armed={:08X} shadow={:08X} ::", pre_asm, pre_armed, pre_shadow);
 
+    // --- Pull 15: Mirror Surface Params (Recon) ---
+    // Pass 1: Dense Dump
+    for offset in (0x400..=0x5FC).step_by(4) {
+        let val = mmio_read(bar0, 0x640000 + offset);
+        let abs = if val == 0xFFFFFFFF || (val & 0xFFFF0000) == 0xBAD00000 { " ABSENT?" } else { "" };
+        serial_println!(":: kdisp: mirror-sp off={:03X} val={:08X}{} ::", offset, val, abs);
+    }
+
+    // Settle
+    for _ in 0..1_500_000 { core::hint::spin_loop(); }
+
+    // Pass 2: Volatility Check
+    for offset in (0x400..=0x5FC).step_by(4) {
+        let val = mmio_read(bar0, 0x640000 + offset);
+        let abs = if val == 0xFFFFFFFF || (val & 0xFFFF0000) == 0xBAD00000 { " ABSENT?" } else { "" };
+        serial_println!(":: kdisp: mirror-sp2 off={:03X} val={:08X}{} ::", offset, val, abs);
+    }
+
+    // Pass 3: Cross-Check Candidates
+    let ptr_val = mmio_read(bar0, 0x640460);
+    serial_println!(":: kdisp: mirror-sp ptr-slot val={:08X} expect=00090000-ish (fw surface ptr>>8?) ::", ptr_val);
+
+    for offset in (0x400..=0x5FC).step_by(4) {
+        let val = mmio_read(bar0, 0x640000 + offset);
+        if val == 0xFFFFFFFF || (val & 0xFFFF0000) == 0xBAD00000 || val == 0 { continue; }
+        
+        let mut kind = "";
+        if val == 11520 || val == 46080 || val == 720 || val == 180 || val == 192 || val == 256 || val == (11520<<8) {
+            kind = "pitch";
+        } else if (val & 0xFFFF) == 2880 || (val >> 16) == 2880 || (val & 0xFFFF) == 1800 || (val >> 16) == 1800 {
+            kind = "wh";
+        } else if val < 0x100 {
+            kind = "blockmode";
+        }
+        
+        if !kind.is_empty() {
+            serial_println!(":: kdisp: mirror-sp cand off={:03X} val={:08X} kind={} ::", offset, val, kind);
+        }
+    }
+    
+    let do_takeover = false;
+    if !do_takeover {
+        return None;
+    }
+    // --- End Pull 15 ---
+
     let cycles = [(2, 192), (2, 256), (4, 192), (4, 256)];
     let new_ptr = 0x00016000;
     let bh = 4;
