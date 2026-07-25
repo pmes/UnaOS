@@ -19294,7 +19294,11 @@ const STOLEN_NAME: &str = "STOLEN.BIN"; // the mv-of-foreign DENIED target (must
 
 static EL0_MIDDEN_DONE: AtomicU32 = AtomicU32::new(0); // midden sentinel exits (want 1)
 static BANDY_MIDDEN_WITNESS: AtomicU64 = AtomicU64::new(0); // midden's SYS_REPORT bits
-static BANDY_MIDDEN_YIELDS: AtomicU64 = AtomicU64::new(0); // launcher yields spent waiting (diag)
+/// Launcher yields spent waiting on midden (diagnostic, printed on the FAIL line only).
+/// INVARIANT: `u64::MAX` is the sentinel for "the wait was never entered" — the counter is written
+/// exactly once, at the bottom of the wait loop. Without the sentinel an early-return FAIL would
+/// print `yields=0` and read as "midden hung instantly", which is the opposite of what happened.
+static BANDY_MIDDEN_YIELDS: AtomicU64 = AtomicU64::new(u64::MAX);
 
 // ---- BANDY load-immunity: the witness verdicts on WORK DONE, not on wall-clock ----------------
 //
@@ -19316,19 +19320,27 @@ static BANDY_MIDDEN_YIELDS: AtomicU64 = AtomicU64::new(0); // launcher yields sp
 //     so the wait can never truncate EARLIER than the old deadline did — load can only make it
 //     wait longer, never shorter;
 //   * `MIDDEN_HARD_BACKSTOP_SECS` is an absolute ceiling for the pathological case where yields
-//     stop costing guest work at all, set an order of magnitude above the observed completion so
-//     ordinary host load can never reach it.
+//     stop costing guest work at all.
+//
+// HONEST MARGIN — which bound actually binds. The two guards are not independent: the wait can only
+// spend as many yields as 45 s of wall-clock affords it, and host dilation lowers the yield RATE. So
+// under saturation the WALL CEILING binds first, not the yield budget — the effective budget
+// truncates to roughly 500-700 k yields. Against a measured loaded completion of ~107 k yields the
+// real immunity margin is therefore ~5-6x, NOT the ~13x the nominal budget suggests. That is still
+// ample for the observed failure mode, but the nominal 1 000 000 is a ceiling the loaded case never
+// reaches, and it should not be quoted as the margin.
 //
 /// Scheduling opportunities granted to midden before the launcher gives up. A measured
-/// `kernel8-test` completion spends ~74 k yields (and 4.7 s of a 5.0 s wall budget — the false red
-/// was that close); this is ~13x that, and the count is guest-denominated so host load barely
-/// moves it.
+/// `kernel8-test` completion spends ~74 k yields unloaded (in 4.7 s of a 5.0 s wall budget — the
+/// false red was that close) and ~107 k saturated. Nominally ~13x the unloaded count, but see the
+/// HONEST MARGIN note above: under saturation the 45 s ceiling binds first and the effective margin
+/// is ~5-6x.
 const MIDDEN_YIELD_BUDGET: u64 = 1_000_000;
 /// The old wall-clock deadline, kept as a FLOOR: the budget cannot fire before this, so the wait
 /// can never truncate earlier than it did before this change.
 const MIDDEN_MIN_WAIT_SECS: u64 = 5;
-/// Absolute ceiling — hang detection of last resort (9x the measured completion), for the
-/// pathological case where yields stop costing guest work at all.
+/// Absolute ceiling — hang detection of last resort (9x the measured unloaded completion). Note
+/// this is the guard that actually BINDS under a saturated host; it is not merely a backstop.
 const MIDDEN_HARD_BACKSTOP_SECS: u64 = 45;
 
 /// Whether the launcher's wait on midden has expired. `start` is a CNTPCT stamp; `yields` is the
@@ -19533,13 +19545,19 @@ fn bandy_rt_launcher(demo_cpu: usize) {
             ":: BANDY-EQ: equivalence — denied-via-bus == denied-via-syscall (byte-same -EACCES) and allowed == allowed, both legs at EL0 through the production paths PASS ::"
         );
     } else {
+        // `yields` distinguishes the failure shapes at a glance: a value at MIDDEN_YIELD_BUDGET
+        // means the wait genuinely ran out of scheduling opportunities (a real hang); anything well
+        // below it means midden finished and failed on merit. The sentinel prints as `n/a` rather
+        // than a bare 0, which would misread as "midden hung instantly" — see BANDY_MIDDEN_YIELDS.
+        let spent = BANDY_MIDDEN_YIELDS.load(Ordering::Acquire);
+        let yields: alloc::string::String = if spent == u64::MAX {
+            alloc::string::String::from("n/a (wait not entered)")
+        } else {
+            alloc::format!("{}", spent)
+        };
         serial_println!(
-            // `yields` distinguishes the two failure shapes at a glance: a value at
-            // MIDDEN_YIELD_BUDGET means the wait genuinely ran out of scheduling opportunities
-            // (a real hang); anything well below it means midden finished and failed on merit.
             ":: BANDY-RT: FAIL — w={:#x}/{:#x} midden_w={:#x}/{:#x} done={} yields={} ::",
-            w, ALL, mw, MIDDEN_ALL, done,
-            BANDY_MIDDEN_YIELDS.load(Ordering::Acquire)
+            w, ALL, mw, MIDDEN_ALL, done, yields
         );
     }
 

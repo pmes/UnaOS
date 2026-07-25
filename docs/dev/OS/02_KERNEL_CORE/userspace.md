@@ -1127,14 +1127,22 @@
     `MIDDEN_YIELD_BUDGET` (1 000 000) bounds the wait in units host load does not dilate. Measured:
     an unloaded completion spends **~74 k yields** (in 4.7 s of the old 5.0 s budget — the false red
     was *that* close); the same completion under a saturated host spends **~107 k yields**. The
-    wall-clock blew straight past its budget; the yield count moved by 1.45×, and both sit two
-    orders of magnitude under the ceiling. That ratio *is* the argument for the design.
+    wall-clock blew straight past its budget; the yield count moved by only 1.45×. That ratio *is*
+    the argument for the design.
+  - **Honest margin — which bound actually binds.** The two guards are not independent: the wait can
+    only spend as many yields as 45 s of wall-clock affords it, and host dilation lowers the yield
+    *rate*. So under saturation the **wall ceiling binds first, not the yield budget** — the
+    effective budget truncates to roughly **500–700 k yields**. Against the measured loaded
+    completion of ~107 k, the real immunity margin is therefore **~5–6×, not the ~13× the nominal
+    1 000 000 budget suggests**. That is still ample for the observed failure mode, but the nominal
+    budget is a ceiling the loaded case never reaches and must not be quoted as the margin. A future
+    arc wanting true wall-clock independence would have to raise `MIDDEN_HARD_BACKSTOP_SECS` in step.
   - **What this does not weaken.** A genuine hang still FAILs, and still within a bounded time — a
     wedged midden burns the budget and falls through to the same `done=0` FAIL line. Two guards keep
     the bound honest in both directions: `MIDDEN_MIN_WAIT_SECS` (5 s) is a **floor** the budget may
     not fire before, so the wait can never truncate *earlier* than it did before this change; and
-    `MIDDEN_HARD_BACKSTOP_SECS` (45 s, 9× the measured completion) is an absolute ceiling for the
-    pathological case where yields stop costing guest work at all. The PASS line and its
+    `MIDDEN_HARD_BACKSTOP_SECS` (45 s, 9× the measured unloaded completion) is an absolute ceiling —
+    and, per the honest-margin note above, the guard that actually binds under load. The PASS line and its
     `[w=…/mw=…]` ledger are byte-identical — the witness proves exactly what it proved before. The
     FAIL line gains `yields=`, which separates the two failure shapes at a glance: a value at the
     budget means the wait genuinely ran out of scheduling opportunities (a real hang), anything well
