@@ -733,6 +733,51 @@
     PASS ::` still green (the evidence gate leaves all three selftest legs on their original verdicts). Lane:
     `crates/user-vug/src/main.rs` + `pal.rs` (typematic liveness) + `arch/aarch64/syscall.rs`
     (`sys_input_poll` focus scope) + `main.rs` (shell-path witness) + this doc.
+- **VUGGUARD — an app must not proceed as though a requested resource was granted** (`crates/user-vug` only;
+  the kernel-side thread-row reclamation and kill-aware futex are a separate arc). Attended P60 on a Pi 4:
+  after a few kill/relaunch cycles, new vugs came up as **empty windows** that could not be killed, and
+  eventually nothing would launch at all. The app's share of that chain is one omission. `SYS_THREAD_SPAWN`
+  draws from a **fixed, GLOBAL** 8-row thread-handle table (`NTHREAD`) whose rows are freed only by the owner's
+  voluntary `SYS_THREAD_JOIN`; UVUG joins its two workers only *after* its main loop, so a killed vug leaks both
+  rows and four such kills exhaust the table. From then on every spawn returns `-EAGAIN` — and UVUG **never read
+  the return**, capturing the two values only to join them later. A vug that got zero workers therefore entered
+  the frame barrier waiting for a `done` count of 2 that no living thread would ever bump, and parked in
+  `futex_wait` **before its first `SYS_WIN_PRESENT`**: kernel-drawn chrome, no content, and a process wedged in
+  a wait no kill reached.
+  - **Both returns are now checked**, and the failure behaviour is **DEGRADE**, not fail-fast. Every band no
+    worker owns is rasterised **inline by the parent** with the same `render_band` over the same published
+    projection, placed between the worker release and the barrier — exactly where the parent otherwise idles,
+    so with one worker alive the two halves still draw concurrently. A vug launched while the table is full
+    still comes up, still draws, still takes input and still exits 0; it is only single-threaded. Fail-fast was
+    the alternative and was rejected: table exhaustion is a *transient* condition, and refusing to launch would
+    convert a recoverable system into a hard one at exactly the moment the operator is trying to get a window
+    back. Because the inline raster is the same code over the same geometry, the **final surface is
+    byte-identical** to a two-worker run — the deterministic auto-path checksum is a property of the frame
+    count, not of how many threads drew it.
+  - **The barrier waits for the workers that EXIST**, never a hard-coded 2 — with none it is not entered at all.
+    That closes P60's class *structurally*: no pass budget could ever have caught it, because a parked parent
+    executes nothing. UVUG-9's `BARRIER_PASS_BUDGET` survives for the narrower case it can see — a thread that
+    exists and stops arriving — and is now a **deadline as well as a witness**: on the pass that prints
+    `[uvug9] stall … phase=barrier`, the parent signals `PHASE_EXIT`, retires the pool and takes both bands
+    inline for the rest of the run. UVUG-9 printed that line and then went straight back into the same wait.
+    The line now marks the one frame that presents partially-stale content, not a permanent state.
+  - **A retired worker is not joined.** `sys_thread_join` blocks until the thread finishes, so joining the very
+    thread that just failed to arrive would park the parent forever at exit — the symptom being removed. Its
+    kernel row is deliberately leaked instead: a leaked row is reclaimable from the kernel, a parked process is
+    not reclaimable from anywhere.
+  - The exit witness reports the workers the run actually **got** (`threads=<n>`) rather than the two it asked
+    for; on the healthy path that is the literal `2` the pi4 spec `REQUIRE`s. A degraded launch also names the
+    denied resource up front: `:: UVUG: SYS_THREAD_SPAWN denied a=<errno> b=<errno> workers=<n> -> inline
+    raster ::` — the diagnostic whose absence made P60 read as a compositor fault.
+  - **Healthy path untouched by construction.** The additions are two `if` predicates that are false when both
+    spawns succeed, one `live > 0` guard on the release, and `d >= live` in place of `d >= 2`. No syscall is
+    added, removed or reordered anywhere in the frame, so the WC-H present discipline is unchanged.
+  - Gates: `./arroyo check` green x86_64 + aarch64; `UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test 60`
+    replayed through `scripts/specs/pi4-regression.spec` → **63/63 required, 0 forbidden**; `./arroyo test-arm`
+    MISSION SUCCESS. Healthy-path evidence: the auto witness is byte-identical to the pre-change baseline
+    (`:: UVUG: frames=300 threads=2 checksum=0xe68285b85121ac7c ::`), `EXEC-UVUG … exit=0 -> PASS`, and no
+    `[uvug9] stall` or spawn-denied line appears anywhere in a healthy boot. Lane:
+    `crates/user-vug/src/main.rs` + this doc.
 - **UVUG-10 (this arc)** — the P55b pointer bisect, and the boot fixture that was costing a core every metal
   boot.
   - **`ptr=0` forever, from boot.** P55b read `[uvug9] shell-path input key=<n climbing> ptr=0` on metal for

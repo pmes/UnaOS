@@ -17,6 +17,11 @@
 //      CORE — each of which rasterises HALF of the surface (worker A: rows 0..64, worker B: rows 64..128):
 //      it clears its band to the background and Bresenham-draws every crystal edge clipped to its band,
 //      from the projected vertex coordinates the parent publishes each frame.
+//      VUGGUARD: both spawns are CHECKED, and the thread pool is a request, not a guarantee — the
+//      kernel's thread-handle table is a small GLOBAL pool that returns -EAGAIN when full. Any band
+//      without a worker (spawn refused, or a live worker that misses the frame barrier's pass budget)
+//      is rasterised INLINE by the parent instead, so the program degrades to single-threaded and
+//      keeps drawing rather than blocking on a barrier that can never complete. See `_start`.
 //   3. Each frame the PARENT reads input (SYS_INPUT_POLL), folds it into per-frame rotation/zoom state,
 //      rotates + projects the 14 crystal vertices (integer Q16.16 math reimplemented from the kernel
 //      vug.rs — no float), publishes the pixel coordinates, RELEASES both workers (the `phase` word),
@@ -523,8 +528,11 @@ fn drain_input(held: &mut u32, dragging: &mut bool, drag_motion: &mut i32) -> Fr
 //       non-empty. The P54b signature. Post-fix this is no longer fatal (the frame proceeds), so the line is a
 //       DIAGNOSIS of a runaway upstream producer, not a symptom of this program.
 //   [uvug9] stall frame=<n> phase=barrier done=<0|1> — the frame-barrier wait burned its pass budget with
-//       fewer than both workers arrived; `done` names WHICH half is missing (0 = neither worker ran, 1 = one
-//       worker wedged). Distinguishes a worker-side wedge from an input-side one.
+//       fewer than its live workers arrived; `done` says how many did (0 = neither worker ran, 1 = one worker
+//       wedged). Distinguishes a worker-side wedge from an input-side one. VUGGUARD: this is now a DEADLINE
+//       as well as a witness — on the pass that prints it, the parent retires the worker pool and takes every
+//       band inline, so the line marks the ONE frame that presents partially-stale content, not a permanent
+//       state. A worker that was merely slow rather than wedged sees PHASE_EXIT and leaves.
 //   [uvug9] stall frame=<n> phase=present rc=<errno> — SYS_WIN_PRESENT returned an error. UVUG-8 IGNORED this
 //       syscall's return entirely, so a present that started failing mid-run would have looked exactly like a
 //       freeze: frames advancing, nothing on screen, and the kernel's no-render cap firing. Now it is visible.
@@ -541,6 +549,12 @@ fn drain_input(held: &mut u32, dragging: &mut bool, drag_motion: &mut i32) -> Fr
 // mismatch), not one PARKED forever on a lost wakeup. A parked parent cannot execute a witness at all, and the
 // kernel's futex compares `*uaddr` against `val` under the same bucket lock `futex_wake` takes, so that park is
 // race-free by construction — a lost wakeup here is refuted in the kernel, not monitored from EL0.
+//
+// VUGGUARD, on that limitation: P60's wedge WAS a park, and no pass budget could ever have caught it — the
+// parent was blocked in `futex_wait` on a `done` count that no living thread would ever bump, because the
+// spawns had been refused and it had not looked. That class is closed STRUCTURALLY, not by monitoring: the
+// barrier's target is the number of workers that exist, so with none it is never entered. The budget below
+// remains for the narrower case it can see — a thread that exists and stops arriving.
 const BARRIER_PASS_BUDGET: u32 = 1 << 20;
 
 /// One-shot latches, one per phase, so a witness fires at most once per program run.
@@ -704,9 +718,55 @@ pub extern "C" fn _start() -> ! {
 
     // Spawn the two worker threads (one co-located, one on a sibling core). Stacks carved from the
     // window: A top = B+0x3000, B top = B+0x3800 (identical layout to UVUG-1).
+    //
+    // VUGGUARD: CHECK BOTH RETURNS. `SYS_THREAD_SPAWN` returns a negative errno when it cannot give
+    // this process a thread — notably `-EAGAIN` when the kernel's fixed thread-handle table is full,
+    // which is a GLOBAL, system-wide resource, not a per-process one. Until this arc the two returns
+    // were captured only to be joined at exit, so a vug that got NO workers ran the whole frame loop
+    // as though it had them: `DONE` could never reach 2, the frame barrier below blocked forever, and
+    // the process parked in `futex_wait` BEFORE its first `SYS_WIN_PRESENT` — kernel-drawn chrome with
+    // no content, unkillable from the shell. That is P60's empty window, and its root in this program
+    // is exactly one thing: the app proceeded as though a resource it requested had been granted.
+    //
+    // The chosen behaviour is DEGRADE, not fail-fast. Every band a worker does not own, the parent
+    // rasterises INLINE with the identical `render_band` on the identical published projection — so a
+    // vug launched while the thread table is full still comes up, still draws, still responds to
+    // input and still exits cleanly; it is merely single-threaded. It costs no restructuring of the
+    // frame loop (the inline raster sits between the release and the barrier, exactly where the
+    // parent otherwise idles) and therefore leaves the WC-H present discipline untouched. Because the
+    // raster is the same function over the same coordinates, the final surface — and so the
+    // deterministic auto-path CHECKSUM — is byte-identical to the two-worker run.
     let entry = uvug_worker as *const () as u64;
-    let handle_a = unsafe { sys4(SYS_THREAD_SPAWN, entry, base + 0x3000, 0, 0) };
-    let handle_b = unsafe { sys4(SYS_THREAD_SPAWN, entry, base + 0x3800, 1, 1) };
+    let rc_a = unsafe { sys4(SYS_THREAD_SPAWN, entry, base + 0x3000, 0, 0) };
+    let rc_b = unsafe { sys4(SYS_THREAD_SPAWN, entry, base + 0x3800, 1, 1) };
+    let ok_a = rc_a >> 63 == 0;
+    let ok_b = rc_b >> 63 == 0;
+    let spawned = ok_a as u32 + ok_b as u32;
+
+    // Bands the PARENT must rasterise itself this run (top = rows 0..64, bottom = rows 64..128).
+    let mut inline_top = !ok_a;
+    let mut inline_bot = !ok_b;
+    // How many worker arrivals the frame barrier may legitimately wait for. Never more than the number
+    // of threads that actually exist — a barrier target that cannot be reached is the wedge itself.
+    let mut live: u32 = spawned;
+    // Handles are joinable only if they are real. Joining a value that is a negative errno is a bogus
+    // syscall; joining a thread that never started would be a lie about what was reclaimed.
+    let mut join_a = ok_a;
+    let mut join_b = ok_b;
+
+    if spawned < 2 {
+        // Name the denied resource on the serial line. This is the diagnostic whose absence made P60
+        // look like a compositor fault: the app knew it had been refused and said nothing.
+        let mut sb = Buf::new();
+        sb.put(b":: UVUG: SYS_THREAD_SPAWN denied a=");
+        sb.put_dec(if ok_a { 0 } else { (rc_a as i64).unsigned_abs() as u32 });
+        sb.put(b" b=");
+        sb.put_dec(if ok_b { 0 } else { (rc_b as i64).unsigned_abs() as u32 });
+        sb.put(b" workers=");
+        sb.put_dec(spawned);
+        sb.put(b" -> inline raster ::\n");
+        sb.flush();
+    }
 
     let vbase = crystal_vertices();
 
@@ -787,23 +847,61 @@ pub extern "C" fn _start() -> ! {
             ax = (ax + 1) & 0xFF;
         }
 
-        // --- transform + publish, then release both workers ---
+        // --- transform + publish, then release any LIVE workers ---
+        // VUGGUARD: the release is conditional on there being someone to release. With `live == 0` the
+        // phase word is nobody's signal, and storing to it would be the only remaining way for this
+        // program to advertise a frame it is rendering entirely by itself.
         project(&vbase, ay, ax, dist);
-        DONE.store(0, Ordering::Relaxed);
-        PHASE.store(frame + 1, Ordering::Release); // 1-based; never PHASE_EXIT (frame < cap)
+        if live > 0 {
+            DONE.store(0, Ordering::Relaxed);
+            PHASE.store(frame + 1, Ordering::Release); // 1-based; never PHASE_EXIT (frame < cap)
+        }
 
-        // --- barrier: wait for both workers to arrive (FUTEX) ---
-        // UVUG-9: the wait itself is unchanged (re-check + compare-and-block is lost-wakeup-safe); only a pass
-        // counter is added, so a barrier that spins without both workers arriving names itself once.
+        // --- VUGGUARD: rasterise every band no worker owns, inline, while the workers run ---
+        // Placed AFTER the release and BEFORE the barrier so the healthy path is untouched (both
+        // predicates false, no work) and the degraded path keeps whatever parallelism it still has:
+        // with one worker alive, the parent draws the other half concurrently with it. The bands are
+        // disjoint by construction and `draw_line`/`put_px` clip to the band, so no two writers ever
+        // touch a pixel.
+        if inline_top {
+            unsafe { render_band(surf, 0, SH / 2) };
+        }
+        if inline_bot {
+            unsafe { render_band(surf, SH / 2, SH) };
+        }
+
+        // --- barrier: wait for the live workers to arrive (FUTEX) ---
+        // UVUG-9: the wait itself is unchanged (re-check + compare-and-block is lost-wakeup-safe); a pass
+        // counter is added, so a barrier that spins without its workers arriving names itself once.
+        //
+        // VUGGUARD makes the barrier honest in two ways. First, it waits for `live`, never a fixed 2:
+        // with no workers it does not execute at all, and with one it waits for one. Second, the pass
+        // budget is now a DEADLINE, not just a printed observation — burning it means a thread that
+        // does exist is not arriving, so the parent RETIRES the worker pool: it signals PHASE_EXIT,
+        // drops `live` to zero and takes both bands inline for the rest of the run. Every later frame
+        // then renders and presents with no wait at all. UVUG-9 printed the same witness and went
+        // straight back into `futex_wait`, i.e. it diagnosed the wedge and then re-entered it.
         let mut passes: u32 = 0;
-        loop {
+        while live > 0 {
             let d = DONE.load(Ordering::Acquire);
-            if d >= 2 {
+            if d >= live {
                 break;
             }
             passes = passes.wrapping_add(1);
             if passes == BARRIER_PASS_BUDGET {
                 stall_witness(&W_BARRIER, frame, b"barrier", b"done", d);
+                PHASE.store(PHASE_EXIT, Ordering::Release); // a worker still alive will see this and leave
+                live = 0;
+                inline_top = true;
+                inline_bot = true;
+                // Do NOT join a retired worker. `sys_thread_join` blocks until the thread finishes, so
+                // joining the very thread that just failed to arrive would park this parent forever at
+                // exit — the exact symptom this arc removes. The kernel handle it holds is leaked, and
+                // that is the deliberate trade: a leaked row is the kernel's to reclaim, a parked
+                // process is not recoverable from anywhere.
+                join_a = false;
+                join_b = false;
+                break;
             }
             futex_wait(core::ptr::addr_of!(DONE), d);
         }
@@ -834,10 +932,14 @@ pub extern "C" fn _start() -> ! {
         }
     }
 
-    // Signal the workers to exit, then join both.
+    // Signal the workers to exit, then join the ones that exist and are still expected to answer.
     PHASE.store(PHASE_EXIT, Ordering::Release);
-    unsafe { sys1(SYS_THREAD_JOIN, handle_a) };
-    unsafe { sys1(SYS_THREAD_JOIN, handle_b) };
+    if join_a {
+        unsafe { sys1(SYS_THREAD_JOIN, rc_a) };
+    }
+    if join_b {
+        unsafe { sys1(SYS_THREAD_JOIN, rc_b) };
+    }
 
     // Witness.
     let mut buf = Buf::new();
@@ -851,7 +953,13 @@ pub extern "C" fn _start() -> ! {
         let cksum = surface_checksum(surf);
         buf.put(b":: UVUG: frames=");
         buf.put_dec(frame);
-        buf.put(b" threads=2 checksum=0x");
+        // VUGGUARD: report the workers this run actually GOT, not the two it asked for. On the healthy
+        // path that is the literal `2` this line has always carried (the gate REQUIREs the exact
+        // string); on a degraded run it is the honest count, and the checksum beside it is unchanged
+        // because the parent rasterised the orphaned bands with the same code over the same geometry.
+        buf.put(b" threads=");
+        buf.put_dec(spawned);
+        buf.put(b" checksum=0x");
         buf.put_hex64(cksum);
         buf.put(b" ::\n");
     }
