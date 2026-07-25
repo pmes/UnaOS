@@ -2461,17 +2461,17 @@ fn v3d56_emit_int_triple(what: &str, sts_entry: u32, msk_entry: u32, sts_exit: u
     }
     let masked_out_exit = sts_exit & msk_exit;
     serial_println!(
-        ":: V3D: [v3d56] int ({}) — ENTRY INT_STS={:#010x} INT_MSK_STS={:#010x} | EXIT INT_STS={:#010x} INT_MSK_STS={:#010x} (1=MASKED) | FLDONE(bit1): latched={} masked={} | working-set V3D_IRQS={:#010x} unmasked_now={:#010x} | latched-but-masked={:#010x} — {} ::",
+        ":: V3D: [v3d56] int ({}) — ENTRY INT_STS={:#010x} INT_MSK_STS={:#010x} | EXIT INT_STS={:#010x} INT_MSK_STS={:#010x} (1=MASKED) | FLDONE(bit1): latched={} masked={} | working-set V3D_CORE_IRQS={:#010x} unmasked_now={:#010x} | latched-but-masked={:#010x} — {} ::",
         what, sts_entry, msk_entry, sts_exit, msk_exit,
         (sts_exit & V3D_INT_FLDONE != 0) as u32,
         (msk_exit & V3D_INT_FLDONE != 0) as u32,
-        V3D_IRQS,
-        !msk_exit & V3D_IRQS,
+        V3D_CORE_IRQS,
+        !msk_exit & V3D_CORE_IRQS,
         masked_out_exit,
         if sts_exit & V3D_INT_FLDONE != 0 {
             "FLDONE LATCHED in the raw status — the flush completed; whatever else is wrong, it is not the flush"
         } else if msk_exit & V3D_INT_FLDONE != 0 {
-            "FLDONE is MASKED — but INT_STS is the RAW latch and the mask does not gate it, so a masked FLDONE would still have shown here. The mask is not the reason bit1 is clear; the flush genuinely did not complete. (Unmask it anyway for the CPU-delivery path: MSK_CLR = V3D_IRQS.)"
+            "FLDONE is MASKED — but INT_STS is the RAW latch and the mask does not gate it, so a masked FLDONE would still have shown here. The mask is not the reason bit1 is clear; the flush genuinely did not complete. (Unmask it anyway for the CPU-delivery path: MSK_CLR = V3D_CORE_IRQS.)"
         } else {
             "FLDONE is UNMASKED and NOT latched across the whole wait: the flush never completed. The wall is the flush/frame-close unit itself, not interrupt routing — no mask, enable or delivery change can move this"
         }
