@@ -1371,6 +1371,65 @@
   Not yet (M8): an arbitrary program-by-name `sys_spawn`, and a code-signing / allowlist gate on the
   loader (`SECURITY.md`).
 
+- **MBENCH-HONEST (the pi4 gate stops being able to lie)** — a **test-tooling** arc; zero kernel
+  source touched. The pi4 gate had two independent ways to report something it had not established,
+  and both were paid for repeatedly.
+  - **The truncation trap.** `./arroyo kernel8-test` defaulted to an **8 s** window. 8 s does not
+    finish a pi4 boot on this class of host: QEMU is killed part-way through the `u7_launcher`
+    fixture cascade and the witnesses that print LAST — K3/K4/K8/K6/BANDY and others — never get a
+    chance. The capture then replays at 25–41 of 63 witnesses (25–34 as reported this round; 41 when
+    re-measured on this host, 501 lines against a 60 s run's 1682) — which reads *exactly* like a
+    regression. Four separate executors investigated it independently in one round; one settled it
+    by gating a **clean base** and getting the identical shortfall. The spec header already carried
+    the warning and people still lost an hour to it — which is the evidence that the warning belonged
+    in the **tool**, not the prose.
+  - **The unfalsifiable battery step.** `battery()`'s pi4 step asserted one `awk` for
+    `CAPSTONE COMPLETE` against the serial log. CAPSTONE prints at **line 111** of a ~1700-line
+    capture, so *every* truncation this gate exists to catch still satisfied it while dozens of tail
+    witnesses were absent. The step could not go red on a short log — which is why the track's
+    standing law became "gate claims are evidenced by the runner's OWN mbench replay only", after two
+    false-greens in one round.
+  - **The fix — a third verdict.** `mbench.py` gains a `COMPLETE <regex>` spec directive: an
+    **end-of-run marker**. A capture that reaches no declared marker, *or* that ends mid-line (no
+    terminating newline — direct evidence the writer was killed mid-write), is **TRUNCATED /
+    INCONCLUSIVE**, exit code **3**: never a pass, and explicitly *not* a regression. Precedence is
+    one function (`Matcher.run_verdict`): a FORBID hit outranks everything (a `PANIC` in a short log
+    is still a fault); then truncation; then a short REQUIRE/COUNT in a **complete** capture, which
+    is a genuine regression and still FAILs; then PASS. **PASS semantics are unchanged** — 63/63
+    required, 0 forbidden — and a spec that declares no `COMPLETE` line can never be truncated, so
+    the x86/arm/jetson replays keep their exact prior behaviour and exit codes.
+  - **The markers, and why they are trustworthy.** `pi4-regression.spec` declares
+    `:: SCHED: task 'el0-midden' -> core` and `:: BANDY-RT:`. The first is `spawn_user_slot`'s own
+    placement line for MIDDEN.BIN, and `bandy_rt_launcher` is documented in `syscall.rs` as **LAST in
+    the chain** — reaching it means the boot got through every earlier fixture in the spec. It is
+    **structural, not a verdict**: no regression in any witness can suppress it, so a real regression
+    still reads FAIL instead of hiding behind "inconclusive". The second covers the launcher's honest
+    early exits (no card / MIDDEN.BIN absent / staging failed), which are also complete runs and must
+    fail on their missing witnesses. The residual is stated in the spec rather than hidden: a capture
+    severed inside the ~79-line window between the midden spawn and the five BANDY verdicts, exactly
+    on a newline, reports FAIL rather than TRUNCATED. Both are red; pinning anything later would mean
+    pinning a *verdict*, which is precisely what would let a genuine regression disguise itself.
+  - **The gate can now go red.** `kernel8-test`'s default window is **60 s** (the measured floor;
+    `kernel8-test` is pi4-only, so no x86/arm caller is affected), and it now **replays the spec
+    itself and propagates mbench's exit status** instead of printing a path and always exiting 0.
+    `UNAOS_K8T_ASSERT=0` opts out for deliberately off-spec configurations (`UNAOS_SDIMG=0` no-card
+    control, single-subsystem knob runs). `battery()`'s pi4 step therefore derives its verdict from
+    that exit status, and prints a distinct TRUNCATED line in the summary so a short boot is never
+    bisected as a regression.
+  - **Gates:** `./arroyo check` green both arches; `./arroyo kernel8-test 60` MBENCH **63/63
+    required, 0 forbidden**; `./arroyo test-arm 22` MISSION SUCCESS (the x86/arm replay paths
+    unregressed); `mbench --self-test` **28/28** (was 25), the ten new cases asserting the three
+    verdicts as genuinely *distinct* in both replay and follow — complete+all-witnesses → PASS,
+    cut-before-marker → TRUNCATED, complete-minus-one-witness → FAIL, mid-line cut → TRUNCATED, a
+    `PANIC` in a short log → FAIL (never "inconclusive"), and a marker-less spec keeping its plain
+    exit codes. Reproduced end-to-end on real captures: `kernel8-test 60` → **PASS 63/63** (markers
+    seen at lines 943 and 1016 of 1488); `kernel8-test 8` → **TRUNCATED 41/63, exit 3**, and the
+    command says so in words instead of printing a witness count; that same 60 s capture with one
+    `K3-mount` line deleted → **FAIL 62/63, exit 1**, annotated "the end-of-run marker was seen — the
+    run completed, so a missing witness here is a GENUINE regression". Lane: `scripts/mbench.py`,
+    `scripts/specs/pi4-regression.spec`, the `kernel8-test`/`battery` stanzas of `arroyo`, and this
+    doc.
+
 ### x86_64 (branch `hw-rmbp`)
 
 - **U1a** — first ring-3 round-trip (the x86 mirror of aarch64 M6a). A

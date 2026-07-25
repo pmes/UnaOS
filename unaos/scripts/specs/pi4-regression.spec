@@ -1,14 +1,22 @@
 # pi4-regression.spec — the Pi 4 kernel8 chain.
-#   QEMU gate:  ./arroyo kernel8-test 60   → unaos/target/serial-pi.log
+#   QEMU gate:  ./arroyo kernel8-test      → unaos/target/serial-pi.log   (default window: 60 s)
+#     MBENCH-HONEST (2026-07-25): the window is no longer something the reader has to remember. The
+#     `kernel8-test` DEFAULT is 60 s (it was 8 s, which never finished a boot), the command REPLAYS this
+#     spec itself and exits with mbench's status, and a capture that stops short is reported TRUNCATED /
+#     INCONCLUSIVE (exit 3) rather than as a pass or a regression — see the END-OF-RUN MARKERS below.
+#     The measurements that fixed the window are kept here because they are the evidence:
 #     35 -> 60 at BGRUN-2. The old 35 s was ~10% of headroom over the chain and the margin was
 #     MACHINE-DEPENDENT, not fixed: BGRUN-2's leg-3 dwell (2 s, plus STAT.ELF's yield-amplified cost
 #     while QEMU's degraded SYS_SLEEP_MS makes it spin) tipped slower hosts past the end, dropping the
 #     twelve witnesses that print LAST (K8b-snap, K8c-snapread, K6-migrate, all BANDY-*) — a truncation
 #     that reads as a regression in arcs nobody touched. Measured on the arc branch: 24 s and 27 s ->
 #     44/54, 30 s/35 s/45 s/60 s -> 54/54 on one host while another host failed at 35; at 60 s the last
-#     required witness lands ~40% into the log (line 763 of 1917), so the margin is now ~1.5x the chain
+#     required witness landed ~40% into the log (line 763 of 1917), so the margin is ~1.5x the chain
 #     rather than a tenth. Do not trim this back toward the chain length — the tail is what breaks first
 #     and it breaks SILENTLY.
+#     Re-measured 2026-07-25 (MBENCH-HONEST, this host, 63 witnesses): 8 s -> 41/63 TRUNCATED;
+#     60 s -> 63/63 PASS, last required witness (`BANDY-ACL`) at line 1035 of 1682. The 8 s default
+#     this arc removed was not marginal — it stopped less than a third of the way through the chain.
 #   Metal:      ~/pi-serial.log (pi-bench-connect.sh bridge capture)
 #
 # Metal caveat (unaos-hazards): some real-Pi boots bring up only 3 of 4 cores and
@@ -16,6 +24,37 @@
 # variance, orthogonal to the syscall chain. A power-cycle usually restores 6/6.
 # On such a boot the CAPSTONE directives below report as misses; the 23-PASS chain
 # and the K1/F2/F3 witnesses must still hold.
+
+# --- END-OF-RUN MARKERS (MBENCH-HONEST) --------------------------------------------
+# The header above documents the truncation trap; these two lines are what let the TOOL
+# enforce it instead of the reader remembering. A capture that reaches neither is
+# reported TRUNCATED / INCONCLUSIVE (exit 3) — never PASS, and never FAIL — so a short
+# log can no longer be read as a regression in an arc that touched nothing.
+#
+# WHY THESE TWO, and why they are trustworthy:
+#   1. `:: SCHED: task 'el0-midden' -> core N ::` is the scheduler's own placement line
+#      for MIDDEN.BIN, and `bandy_rt_launcher` — which spawns it — is documented in
+#      arch/aarch64/syscall.rs as LAST IN THE CHAIN of the u7_launcher fixture cascade.
+#      Reaching it means the boot got through every earlier fixture in this spec. It is
+#      emitted by `sched::spawn_user_slot` under `#[cfg(feature = "pi")]`, i.e. on the
+#      Pi target and on `kernel8-test` alike, and it is STRUCTURAL, not a verdict: no
+#      regression in any witness below can suppress it, so a real regression still
+#      reads FAIL rather than hiding behind "inconclusive".
+#   2. `:: BANDY-RT:` covers the launcher's honest early exits (no card / MIDDEN.BIN
+#      absent / staging failed / midden failed to load). Those boots also ran to the end
+#      of the chain, so they must fail on their missing witnesses — not read as short.
+# A capture that ends MID-LINE (no terminating newline) is truncated regardless: that is
+# direct evidence QEMU was killed while the kernel was still writing.
+#
+# Known narrow gap, stated rather than hidden: marker 1 lands at the midden SPAWN, and
+# the five BANDY-RT/EQ/WR/EQ2/ACL verdicts print when midden EXITS (measured 2026-07-25:
+# spawn at line 956, last verdict at line 1035 of a 1682-line 60 s capture). A capture
+# severed inside that ~79-line window, exactly on a newline, reports FAIL rather than
+# TRUNCATED. The bias is deliberate: both are red, and marker 1 is the last STRUCTURAL
+# line available — pinning anything later would mean pinning a verdict, which is what
+# would let a genuine regression disguise itself as a short log.
+COMPLETE :: SCHED: task 'el0-midden' -> core
+COMPLETE :: BANDY-RT:
 
 # --- the aggregate: 23 fixture verdicts -------------------------------------------
 COUNT 23 -> PASS

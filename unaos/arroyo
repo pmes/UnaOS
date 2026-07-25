@@ -1240,8 +1240,15 @@ run_kernel8() {
 
 # Headless raspi4b test: boot kernel8.img, capture PL011 -> target/serial-pi.log and a QMP
 # screendump of the mailbox framebuffer -> target/pi-screen.png, then self-terminate.
+# MBENCH-HONEST: the DEFAULT WINDOW is 60 s, not the old 8 s. 8 s does not finish a pi4 boot on this
+# class of host — it kills QEMU part-way through the fixture cascade, so the twelve-plus witnesses that
+# print LAST never get a chance to. That shortfall reads as a regression in arcs that touched nothing,
+# and it cost four separate executors an investigation each in one round (one of them confirmed it by
+# gating a CLEAN base and getting the identical shortfall). The measured floor is 60 s; the spec header
+# in scripts/specs/pi4-regression.spec carries the per-window measurements. `kernel8-test` is pi4-only —
+# no x86/arm caller reaches this function — so raising the default changes nothing for them.
 test_kernel8() {
-    local secs="${1:-8}"
+    local secs="${1:-60}"
     kernel8 # always rebuild from current source (incremental; ~seconds) so we never test a stale image
     local logf="${WORKSPACE_DIR}/target/serial-pi.log"
     local png="${WORKSPACE_DIR}/target/pi-screen.png"
@@ -1268,6 +1275,29 @@ test_kernel8() {
     kill "$qpid" 2>/dev/null || true
     wait "$qpid" 2>/dev/null || true
     echo -e "${COLOR_GREEN}✅ Serial:${COLOR_RESET} ${logf}    ${COLOR_GREEN}Screen:${COLOR_RESET} ${png}"
+
+    # MBENCH-HONEST: ASSERT the capture we just took, and make this command's EXIT STATUS say so.
+    # Before this, `kernel8-test` printed a path and always exited 0 — the verdict lived in whatever
+    # the reader chose to grep for afterwards, which is precisely how a short boot came to be read as
+    # either a pass or a regression. mbench replays the checked-in witness spec and returns
+    #   0 PASS (63/63 required, 0 forbidden) | 1 FAIL (a genuine regression) | 3 TRUNCATED (the boot
+    #   was cut short — INCONCLUSIVE, neither a pass nor a regression; re-run with a longer window).
+    # UNAOS_K8T_ASSERT=0 opts out, for the deliberate off-spec configurations (UNAOS_SDIMG=0 no-card
+    # control, single-subsystem knob runs) where the full pi4 spec is not the contract being tested.
+    if [ "${UNAOS_K8T_ASSERT:-1}" != "0" ]; then
+        echo -e "${COLOR_CYAN}⚡ mbench: asserting the capture against scripts/specs/pi4-regression.spec${COLOR_RESET}"
+        # `|| mrc=$?` rather than a bare call + `$?`: this script runs under `set -e`, so a FAIL (1) or
+        # TRUNCATED (3) exit would otherwise abort here and swallow the explanation below.
+        local mrc=0
+        python3 "${WORKSPACE_DIR}/scripts/mbench.py" --replay "$logf" \
+            --spec "${WORKSPACE_DIR}/scripts/specs/pi4-regression.spec" --platform pi || mrc=$?
+        if [ "$mrc" -eq 3 ]; then
+            echo -e "${COLOR_YELLOW}⚠ kernel8-test: the boot was TRUNCATED at ${secs}s — this run proves NOTHING."
+            echo -e "  Missing witnesses here are NOT a regression. Re-run with a longer window: ./arroyo kernel8-test 60${COLOR_RESET}"
+        fi
+        return $mrc
+    fi
+    echo -e "${COLOR_YELLOW}  • UNAOS_K8T_ASSERT=0 — spec assertion SKIPPED; this run carries no verdict${COLOR_RESET}"
 }
 
 # INSTALL-PI live witness: the installer engine's FIRST full end-to-end execution that needs no bench.
@@ -1550,7 +1580,20 @@ battery() {
     _step "x86 usb-write witness"      "usbw. write lba=.* ok" "$blog_dir/usbw-x86.log"    cat "$blog_dir/test-x86.log"
     _step "arm usb-write witness"      "usbw. write lba=.* ok" "$blog_dir/usbw-arm.log"    cat "$blog_dir/test-arm-v2.log"
     _step "arm virt v3 (CAPSTONE 6/6)" "CAPSTONE COMPLETE"   "$blog_dir/test-arm-v3.log"  env UNAOS_GICV3=1 "$0" test-arm 40
-    _step "pi4 kernel8-test 60"        "CAPSTONE COMPLETE"   "$blog_dir/kernel8.log:target/serial-pi.log" "$0" kernel8-test 60
+    # MBENCH-HONEST: this step's verdict is now the MBENCH REPLAY's exit status, which `kernel8-test`
+    # propagates (see test_kernel8). It used to be a single `awk` for CAPSTONE COMPLETE against the
+    # serial log, and that assertion COULD NOT GO RED on a short boot: CAPSTONE prints ~line 111 of a
+    # ~1700-line capture, so every truncation this gate exists to catch still satisfied it while dozens
+    # of tail witnesses were missing. The pattern argument is deliberately EMPTY — the spec's 63
+    # REQUIRE/COUNT directives are the assertion now, and the generic `-> FAIL`/`FAIL ::` scan still
+    # runs against target/serial-pi.log (NOT against the step log, which quotes those strings as FORBID
+    # PATTERN TEXT in the verdict table and would false-red on every run).
+    _step "pi4 kernel8-test 60 (mbench 63/63)" ""            "$blog_dir/kernel8.log:target/serial-pi.log" "$0" kernel8-test 60
+    # A TRUNCATED pi4 step is red — but it is a DIFFERENT red from a regression, and the summary says so
+    # rather than leaving the reader to open the log and guess.
+    if awk 'BEGIN{f=1} /MBENCH TRUNCATED/{f=0} END{exit f}' "$blog_dir/kernel8.log" 2>/dev/null; then
+        results="${results}       ↳ TRUNCATED (INCONCLUSIVE): the pi boot was CUT SHORT, not regressed — re-run before bisecting (${blog_dir}/kernel8.log)\n"
+    fi
     _step "esp-jetson (links)"         ""                    "$blog_dir/esp-jetson.log"   env UNAOS_TEGRA=1 "$0" esp-jetson
 
     local passes; passes=$(awk '/-> PASS|: PASS/{n++} END{print n+0}' "$blog_dir/test-fat.log" target/serial-pi.log 2>/dev/null || echo '?')
@@ -1613,7 +1656,7 @@ case "${1:-}" in
         run_kernel8
         ;;
     kernel8-test|test-pi)
-        test_kernel8 "${2:-8}"
+        test_kernel8 "${2:-60}"   # MBENCH-HONEST: 8 s never finished a pi4 boot — see test_kernel8
         ;;
     kernel8-install|install-pi)
         install_pi "${2:-12}"
