@@ -245,7 +245,7 @@ pub unsafe fn takeover_display(
     let fbcon_bpp = gop_info.bytes_per_pixel as u32;
     let fbcon_row_bytes = fbcon_stride * fbcon_bpp;
     serial_println!(":: kdisp: fbcon-view base={:016X} stride_px={} bpp={} w={} h={} row_bytes={} ::",
-        gop_info.framebuffer_addr, fbcon_stride, fbcon_bpp, expected_width, expected_height, fbcon_row_bytes);
+        crate::video::fbcon::current_base().unwrap_or(0), fbcon_stride, fbcon_bpp, expected_width, expected_height, fbcon_row_bytes);
     
     let hw_pitch = 16384;
     serial_println!(":: kdisp: fbcon-vs-hw row_bytes={} hw_pitch={} match={} ::",
