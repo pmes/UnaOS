@@ -328,9 +328,29 @@ FORBID \[wc-f\] twin -> SKIP
 # ---    own present or was collateral damage-closure repaint (the case where the owner is running
 # ---    free at EL0 with nothing serialising it against the copy of its surface).
 # ---
-# ---    These REQUIREs assert that the INSTRUMENT RAN, deliberately not what it found: the finding is
-# ---    the arc's output, and a FORBID on any verdict would encode a conclusion the chain has not yet
-# ---    reached. Read the `-> ` verdict on the `[wc-g] verdict` line, and the per-sample lines under
-# ---    it, as data. Witness-feature only. See docs/dev/OS/08_VIDEO/engine.md §WC-G.
+# ---    SCOPE, and why there is no global summary line. Three cuts of one were tried and all three
+# ---    lied in the same direction. (1) Fire when the FIRST window spends its budget: printed the
+# ---    summary before window 2 was sampled at all, including before its own=no collateral-repaint
+# ---    sample. (2) Fire when every SAMPLED window has spent its budget: same bug in new clothes —
+# ---    the sampled set only holds windows seen so far, so it is trivially true the instant the first
+# ---    window finishes, and it reproduced exactly (`scope=exhausted samples=4 windows=1`, before
+# ---    window 2 existed). (3) Fire on quiescence: the gate's two apps start more than 3 s apart, so
+# ---    an idle gap is not evidence sampling is over — it fired early too (`idle_us=3011902`).
+# ---    The lesson is structural: nothing observable inside a boot distinguishes "sampling finished"
+# ---    from "the next app has not launched yet". Any global summary is a completeness claim the
+# ---    instrument cannot support, and one that overstates its scope is worse than none — it makes
+# ---    later contrary evidence look already accounted for. So the rollup is scoped to ONE window and
+# ---    fires when that window spends its budget: deterministic, no timer, scope == its own `win=`.
+# ---
+# ---    The REQUIREs assert the INSTRUMENT RAN, deliberately not what it found: the finding is the
+# ---    arc's output. The FORBIDs are the other half, and they are what the global summary was
+# ---    reaching for — "no suspect fired anywhere, ever". A FORBID needs no completeness claim: it
+# ---    catches a COHER/RACE/BLIT verdict in any window at any point in the boot, including one that
+# ---    appears long after every rollup has printed. CLEAN and CLEAN+SLOW stay green — the timing
+# ---    finding is this arc's result, not a regression. Witness-feature only.
+# ---    See docs/dev/OS/08_VIDEO/engine.md §WC-G.
 REQUIRE \[wc-g\] win=.* fbbad=.* slow=.* ->
-REQUIRE \[wc-g\] verdict samples=.* frame_us=.* ->
+REQUIRE \[wc-g\] rollup win=.* scope=window .*frame_us=.* ->
+FORBID \[wc-g\] .*-> COHER
+FORBID \[wc-g\] .*-> RACE
+FORBID \[wc-g\] .*-> BLIT

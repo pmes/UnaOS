@@ -1388,36 +1388,80 @@ byte-identical.
 `UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test 60`:
 
 ```
-[wc-g] win=1 seq=1 own=yes scale=4x app=0xa1cf…8449 blit=0xa1cf…8449 civac=0xa1cf…8449 after=0xa1cf…8449 fbbad=0/16384 us=13331 rectscan_us=7111 slow=yes -> CLEAN
-[wc-g] verdict samples=4 windows=1 coher=0 race=0 blit=0 clean=4 slow=4 maxus=13617 frame_us=16667 -> CLEAN+SLOW
-[wc-g] win=2 seq=1 own=no  scale=4x … fbbad=0/4096 us=3520 rectscan_us=3555 slow=no -> CLEAN
+[wc-g] win=1 seq=1 own=yes scale=4x app=0xa1cf…8449 blit=0xa1cf…8449 civac=0xa1cf…8449 after=0xa1cf…8449 fbbad=0/16384 us=12808 rectscan_us=7111 slow=yes -> CLEAN
+[wc-g] rollup win=1 scope=window samples=4 coher=0 race=0 blit=0 clean=4 slow=4 maxus=13052 frame_us=16667 -> CLEAN+SLOW
+[wc-g] win=2 seq=1 own=no  scale=4x … fbbad=0/4096 us=3060 rectscan_us=3555 slow=no -> CLEAN
 ```
 
-All three named suspects are **negative**: no coherency divergence, no source race (in either the `own=yes`
+All three named suspects are **negative**: no `civac` divergence, no source race (in either the `own=yes`
 or the `own=no` case), no blit-path or upscale error — `fbbad=0` over every probe. Every byte was correct
 at every moment.
+
+`coher=0` should be read narrowly. The compositor's read is a normal cacheable read of Normal
+Inner-Shareable memory and the caches are PIPT, so against another core's cacheable writes to the same PA
+it is coherent *by construction* — that was never in doubt and needs no witness. What the `civac` leg
+tests is the part that is not guaranteed: an **alias-attribute mismatch**, the surface reached through two
+mappings whose attributes or shareability disagree (the EL0 `user_data_page` leaf vs the kernel identity
+leaf), or a non-cacheable alias in the chain. So `coher=0` means "no alias-attribute mismatch on this
+surface", not "coherency is fine in general".
 
 The residual is timing, and the code says why. `draw_window` writes **per-pixel, with `put_pixel`, directly
 into the front framebuffer** — the live scan-out — with no vblank synchronisation anywhere in the path.
 The desktop does not: it reaches the panel through `Screen`'s back buffer and a contiguous per-row
-damage-rect flush, which is why direct desktop writes are clean and only windows garble. At bench geometry
-a 128×128 window at 4× takes **13.3 ms to copy against 7.1 ms of beam time on its own rows** — a 1.9×
-overtake, so the HVS latches the rect part-old and part-new, at whatever scanline it held when the copy
-passed it. That is a horizontal band boundary, which is the shape in the photograph. It also explains
-"cycling faster looks a little better": a faster cycle does not remove the tear, it shortens the interval
-any one torn frame stays on the panel. The 64×64 window sits right at its own threshold (3.2 ms vs 3.6 ms),
-consistent with smaller windows looking better.
+damage-rect flush, which is why direct desktop writes are clean and only windows garble. That asymmetry is
+structural and is the finding; it does not depend on any measured number.
+
+The number puts a size on it, and needs its provenance stated. **The machine was QEMU raspi4b at forced
+bench geometry (`UNAOS_FBW=1920 UNAOS_FBH=1200`) — not silicon.** There, a 128×128 window at 4× copies for
+13.3 ms against 7.1 ms of beam time on its own rows: a **1.9× overtake**. That figure is QEMU wall clock
+and it is not stable across runs — a lens re-run of the same build measured **1.71×**. What both runs
+agree on, and all the arc claims, is that **the ratio exceeds 1**, which is the condition for the scan-out
+to overtake the copy inside the rect and latch it part-old/part-new at whatever scanline the beam held —
+a horizontal band boundary, the shape in the photograph. It also explains "cycling faster looks a little
+better": a faster cycle does not remove the tear, it shortens the interval any one torn frame stays on the
+panel. The 64×64 window sits right at its own threshold (3.2 ms vs 3.6 ms), consistent with smaller
+windows looking better.
+
+**On an A72 the ratio may fall below 1**, and if it does, that falsifies *the number*, not the mechanism:
+an unsynchronised per-pixel copy into a live scan-out tears whenever it loses the race, and a ratio under
+1 on metal would mean only that it loses less often than QEMU suggested — the bench photograph already
+establishes that it loses. `rectscan_us` is itself conservative in the same direction: `frame_us` includes
+blanking while `ph` counts only visible lines, so the rect is credited with beam time the beam does not
+spend on it, every `slow=yes` understates the problem, and a `slow=no` near the threshold may still tear.
 
 WC-G fixes nothing — it is the localization. The fix is a design question for the next arc (double-buffer
 the window layer, or bound the copy under the rect's scan time), not a knob.
 
 #### WC-G gate results (2026-07-25, QEMU raspi4b, forced bench geometry)
 
-`./arroyo check` green both arches · `./arroyo kernel8` clean, **zero `wc-g` strings** (armed build: two) ·
-`UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test 60` → MBENCH **58/58 required, 0 forbidden**, on a
-spec grown by this arc's two REQUIREs. Those REQUIREs assert that the instrument *ran*, deliberately not
-what it found: the finding is the arc's output, and a FORBID on any verdict would encode a conclusion the
-chain has not yet reached.
+QEMU raspi4b, forced bench geometry — **no metal in this arc**.
+
+`./arroyo check` green both arches · `./arroyo kernel8` clean, **zero `wc-g` strings** knob-off (armed
+build: two) · `UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test 60` → MBENCH **58/58 required,
+0 forbidden**, on a spec grown by this arc's two REQUIREs and three FORBIDs. The REQUIREs assert that
+the instrument *ran*, deliberately not what it found: the finding is the arc's output.
+
+**There is no global summary line, and that is the result of three failed attempts rather than an
+omission.** (1) Fire when the first window spends its budget: printed the summary *before* window 2 was
+sampled at all, including before its `own=no` collateral-repaint sample — a metal race there would have
+sat on the wire underneath a green summary contradicting it. (2) Fire when every *sampled* window has
+spent its budget: the same bug in new clothes, since the sampled set only holds windows seen so far, so it
+is trivially true the instant the first window finishes; it reproduced exactly, printing
+`scope=exhausted samples=4 windows=1` before window 2 existed. (3) Fire on quiescence: the gate's two apps
+start more than 3 s apart, so an idle gap is not evidence that sampling is over — it fired early too, at
+`idle_us=3011902`.
+
+The lesson is structural, not a tuning problem: **nothing observable inside a boot distinguishes "sampling
+is finished" from "the next app has not launched yet."** Any global summary is therefore a completeness
+claim the instrument cannot support, and one that overstates its scope is worse than none — it is the one
+artifact that can make later contrary evidence look already accounted for.
+
+So the rollup is scoped to **one window** and fires when that window spends its budget: deterministic, no
+timer, and its scope is exactly what its `win=` says. The job the global line was reaching for — "no
+suspect fired anywhere, ever" — moved to the spec as **FORBIDs on `-> COHER`, `-> RACE`, `-> BLIT`**. A
+FORBID needs no completeness claim: it catches an anomaly in any window at any point in the boot, including
+one appearing long after every rollup has printed. `CLEAN` and `CLEAN+SLOW` stay green, because the timing
+finding is this arc's result and not a regression.
 
 Unlike WC-F, the QEMU result here is **not** a formality. The three checksum legs are cache- and
 race-sensitive and QEMU models neither caches nor the HVS, so their `CLEAN` verdict on the gate is weak

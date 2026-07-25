@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Architect & Una
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 //! WC-G — the window-path garble, localized to ONE of three suspects, on the wire.
 //!
 //! ## What the verdict chain already settled (do not re-derive here)
@@ -29,6 +45,17 @@
 //!
 //! That table is the whole instrument. `blit != civac` and `blit != after` cannot both be explained
 //! by one mechanism, which is what makes suspect 2 and suspect 1 separable rather than a shrug.
+//!
+//! **What `coher` can and cannot claim.** The compositor's own read of the surface is a normal
+//! cacheable read of Normal Inner-Shareable memory, and the caches are PIPT: against another core's
+//! cacheable writes to the same PA it is coherent *by construction*, and no witness is needed to say
+//! so. What the `civac` leg actually tests is narrower and is the part that is not guaranteed — an
+//! **alias-attribute mismatch**: the surface reached through two mappings whose memory attributes or
+//! shareability disagree (the EL0 `user_data_page` leaf vs the kernel's identity leaf), or a
+//! non-cacheable/mismatched alias somewhere in the chain, either of which puts the two views outside
+//! the architecture's coherency guarantee. So `coher=0` means "no alias-attribute mismatch on this
+//! surface", NOT "coherency is fine in general" — the latter was never in doubt for the plain
+//! same-attribute case, and reading the counter as a broader clearance would overclaim.
 //!
 //! **Why `CIVAC` here, when WC-D was required to use a bare `IVAC`.** WC-D's rule was about the
 //! FRAMEBUFFER, which the kernel itself writes: cleaning it before reading would have written the
@@ -81,7 +108,7 @@
 //! pixel, from present context at EL0 frame rates, so an unbudgeted version would perturb the very
 //! timing it reports. Every sample prints; the terminal `verdict` line is one-shot.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use super::FrameBuffer;
 use crate::arch::aarch64::{cache, now_cycles};
@@ -112,19 +139,37 @@ static SEEN_SEQ: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
 /// Per-id: instrumented blits taken so far, capped at [`SAMPLES`].
 static TAKEN: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
 
-/// Tally across every sample, for the terminal verdict line.
-static N_SAMPLES: AtomicUsize = AtomicUsize::new(0);
-static N_WINDOWS: AtomicU32 = AtomicU32::new(0);
-static N_COHER: AtomicUsize = AtomicUsize::new(0);
-static N_RACE: AtomicUsize = AtomicUsize::new(0);
-static N_BLIT: AtomicUsize = AtomicUsize::new(0);
-static N_CLEAN: AtomicUsize = AtomicUsize::new(0);
-static N_SLOW: AtomicUsize = AtomicUsize::new(0);
-static MAX_US: AtomicU64 = AtomicU64::new(0);
-/// The terminal verdict is one-shot: it fires when the FIRST window exhausts its own budget, so a
-/// boot that ever composites a single real window produces it. Waiting for every window would make
-/// the line conditional on how many apps happened to run.
-static SUMMARISED: AtomicBool = AtomicBool::new(false);
+/// Per-window tallies, rolled up into that window's own `rollup` line.
+///
+/// **There is no global "all windows are done" summary, and that is a deliberate reversal.** Two
+/// cuts of one were tried and both were dishonest in the same way. The first fired when the FIRST
+/// window spent its budget — printing the summary before window 2 had been sampled at all, including
+/// before its `own=no` collateral-repaint sample, so a metal race on that path would have sat on the
+/// wire UNDERNEATH a green `CLEAN+SLOW` verdict the spec REQUIREs. The second tried "every window
+/// that has been SAMPLED has spent its budget", which is the same bug in different clothes: the
+/// sampled set only holds windows seen so far, so the predicate is trivially true the instant the
+/// first window finishes. It reproduced exactly, printing `scope=exhausted samples=4 windows=1`
+/// before window 2 existed. A quiescence timer was tried third and also fired early — the gate's two
+/// apps start more than 3 s apart, so an idle gap is not evidence that sampling is over.
+///
+/// The lesson is structural, not a tuning problem: **nothing observable inside the boot can
+/// distinguish "sampling is finished" from "the next app has not launched yet."** Any global summary
+/// is therefore a completeness claim the instrument cannot support, and a summary that overstates
+/// its scope is worse than no summary — it is the one artifact that can make later contrary evidence
+/// look already accounted for.
+///
+/// So the rollup is scoped to ONE window and fires when that window spends its budget: deterministic,
+/// no timer, and its scope is exactly what its `win=` says. The job the global line was reaching for
+/// — "no suspect fired anywhere, ever" — belongs to the spec instead, as FORBIDs on the suspect
+/// verdicts. A FORBID needs no completeness claim: it catches an anomaly in any window at any point
+/// in the boot, including one that appears long after every rollup has printed.
+static W_SAMPLES: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+static W_COHER: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+static W_RACE: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+static W_BLIT: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+static W_CLEAN: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+static W_SLOW: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+static W_MAXUS: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
 
 /// FNV-1a 64 over a mapped surface slot, bounded by the length the MAPPING code supplied — the same
 /// bound `draw_window` reads under, so the checksum can never walk past the slot. Volatile, so the
@@ -226,6 +271,13 @@ pub fn begin(id: u32, surf: usize, surf_len: usize, compat: bool) -> Option<Prob
         cks_app: APP_CKS[i].load(Ordering::Relaxed),
         cks_blit,
         cks_civac,
+        // LOAD-BEARING ORDERING: the clock starts AFTER the `civac` re-read, and must stay there.
+        // `clean_invalidate_range` drops every line of the surface, and the `cks_civac` checksum
+        // immediately re-reads all of it — which is precisely what re-warms the source for the blit
+        // that follows. Start `t0` before that re-read (say, alongside `cks_blit`) and `us=` silently
+        // absorbs a full 64 KiB cache refill that the uninstrumented path never pays, inflating the
+        // very number the timing verdict rests on. The measured interval must contain the copy and
+        // nothing else.
         t0: now_cycles(),
     })
 }
@@ -273,20 +325,21 @@ pub fn end(p: Probe, fb: &FrameBuffer, x: usize, y: usize, w: usize, h: usize, s
     // read-back's expectation (it was re-derived from bytes the blit never saw), so RACE outranks
     // BLIT rather than being reported alongside it — `fbbad` is still printed, so the raw number is
     // never hidden by the verdict drawn from it.
+    let w = p.id as usize;
     let verdict = if p.cks_blit != p.cks_civac {
-        N_COHER.fetch_add(1, Ordering::Relaxed);
+        W_COHER[w].fetch_add(1, Ordering::Relaxed);
         "COHER"
     } else if p.cks_blit != cks_after {
-        N_RACE.fetch_add(1, Ordering::Relaxed);
+        W_RACE[w].fetch_add(1, Ordering::Relaxed);
         "RACE-BLIT"
     } else if p.own && p.cks_app != p.cks_blit {
-        N_RACE.fetch_add(1, Ordering::Relaxed);
+        W_RACE[w].fetch_add(1, Ordering::Relaxed);
         "RACE-PRESENT"
     } else if bad != 0 {
-        N_BLIT.fetch_add(1, Ordering::Relaxed);
+        W_BLIT[w].fetch_add(1, Ordering::Relaxed);
         "BLIT"
     } else {
-        N_CLEAN.fetch_add(1, Ordering::Relaxed);
+        W_CLEAN[w].fetch_add(1, Ordering::Relaxed);
         "CLEAN"
     };
     // The tearing criterion. NOT "longer than a frame" — that threshold is arbitrary and sits on a
@@ -297,15 +350,20 @@ pub fn end(p: Probe, fb: &FrameBuffer, x: usize, y: usize, w: usize, h: usize, s
     // and the artifact that produces is a horizontal band boundary at whatever scanline the beam
     // held when the copy passed it. There is no vblank synchronisation anywhere in this path to
     // prevent it: `draw_window` pokes the live front buffer the moment a present asks it to.
+    //
+    // The estimate errs toward NOT reporting a tear. `FRAME_US` is the whole frame period, blanking
+    // included, but `ph` counts only VISIBLE lines — so this divides the blanking interval among the
+    // visible rows and credits the rect with beam time the beam does not actually spend on it. The
+    // real scan time of the rect is therefore SHORTER than `rectscan_us`, every `slow=yes` is
+    // conservative, and a `slow=no` near the threshold may still be tearing.
     let rows_dst = (h * scale).min(ph.saturating_sub(y));
     let rectscan_us = if ph == 0 { 0 } else { FRAME_US * rows_dst as u64 / ph as u64 };
     let slow = us > rectscan_us;
     if slow {
-        N_SLOW.fetch_add(1, Ordering::Relaxed);
+        W_SLOW[w].fetch_add(1, Ordering::Relaxed);
     }
-    N_SAMPLES.fetch_add(1, Ordering::Relaxed);
-    N_WINDOWS.fetch_or(1u32 << (p.id & 31), Ordering::Relaxed);
-    MAX_US.fetch_max(us, Ordering::Relaxed);
+    let n = W_SAMPLES[w].fetch_add(1, Ordering::Relaxed) + 1;
+    W_MAXUS[w].fetch_max(us, Ordering::Relaxed);
 
     serial_println!(
         "[wc-g] win={} seq={} own={} scale={}x app={:#018x} blit={:#018x} civac={:#018x} after={:#018x} fbbad={}/{} us={} rectscan_us={} slow={} -> {}",
@@ -325,25 +383,24 @@ pub fn end(p: Probe, fb: &FrameBuffer, x: usize, y: usize, w: usize, h: usize, s
         verdict
     );
 
-    // Terminal line, one-shot, fired by the first window to exhaust its budget.
-    if TAKEN[p.id as usize].load(Ordering::Relaxed) >= SAMPLES
-        && !SUMMARISED.swap(true, Ordering::Relaxed)
-    {
-        let coher = N_COHER.load(Ordering::Relaxed);
-        let race = N_RACE.load(Ordering::Relaxed);
-        let blit = N_BLIT.load(Ordering::Relaxed);
-        let clean = N_CLEAN.load(Ordering::Relaxed);
-        let slown = N_SLOW.load(Ordering::Relaxed);
-        let maxus = MAX_US.load(Ordering::Relaxed);
-        // The dominant finding, in the same precedence the per-sample verdict uses. `CLEAN+SLOW` is
-        // the load-bearing outcome: every byte correct at every moment, and the unbuffered
-        // per-pixel copy into the live scan-out still longer than a frame — the timing suspect,
-        // which no checksum can reach and which the other three verdicts would have masked.
+    // This window's rollup, once, when it spends its budget. Scoped to ONE window and deterministic
+    // — no timer, and no claim about any window but this one. See [`W_SAMPLES`] for why there is no
+    // global summary and why the "did any suspect ever fire" question is the spec's FORBIDs instead.
+    if n == SAMPLES {
+        let coher = W_COHER[w].load(Ordering::Relaxed);
+        let race = W_RACE[w].load(Ordering::Relaxed);
+        let blitn = W_BLIT[w].load(Ordering::Relaxed);
+        let clean = W_CLEAN[w].load(Ordering::Relaxed);
+        let slown = W_SLOW[w].load(Ordering::Relaxed);
+        // Same precedence as the per-sample verdict. `CLEAN+SLOW` is the load-bearing outcome: every
+        // byte correct at every moment, and the unbuffered per-pixel copy into the live scan-out
+        // still longer than the beam's time on the rect — the timing suspect, which no checksum can
+        // reach and which any of the other three verdicts would have masked.
         let dominant = if coher > 0 {
             "COHER"
         } else if race > 0 {
             "RACE"
-        } else if blit > 0 {
+        } else if blitn > 0 {
             "BLIT"
         } else if slown > 0 {
             "CLEAN+SLOW"
@@ -351,15 +408,15 @@ pub fn end(p: Probe, fb: &FrameBuffer, x: usize, y: usize, w: usize, h: usize, s
             "CLEAN"
         };
         serial_println!(
-            "[wc-g] verdict samples={} windows={} coher={} race={} blit={} clean={} slow={} maxus={} frame_us={} -> {}",
-            N_SAMPLES.load(Ordering::Relaxed),
-            N_WINDOWS.load(Ordering::Relaxed).count_ones(),
+            "[wc-g] rollup win={} scope=window samples={} coher={} race={} blit={} clean={} slow={} maxus={} frame_us={} -> {}",
+            p.id,
+            n,
             coher,
             race,
-            blit,
+            blitn,
             clean,
             slown,
-            maxus,
+            W_MAXUS[w].load(Ordering::Relaxed),
             FRAME_US,
             dominant
         );
