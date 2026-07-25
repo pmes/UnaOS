@@ -76,7 +76,11 @@ const TAG_SET_CLOCK_RATE: u32 = 0x0003_8002; // set a clock's rate (value {clock
 const TAG_GET_POWER_STATE: u32 = 0x0002_0001; // get a firmware DEVICE's power state (value {device_id, state})
 #[cfg(feature = "piusb")]
 const TAG_GET_DOMAIN_STATE: u32 = 0x0003_0030; // get a power-DOMAIN's on/off state (value {domain, state})
-#[cfg(feature = "piusb")]
+// PI-V3D-58: widened to match its only consumer. V3D-55 made `get_clock_state` compile for `v3d` as
+// well as `piusb` (so the clock-domain audit cannot depend on `piusb` being enabled in the same build)
+// but left this tag `piusb`-only, so a `v3d`-without-`piusb` build failed to compile at E0425. The two
+// cfgs must agree or the widening is a no-op that only breaks the build it was meant to enable.
+#[cfg(any(feature = "piusb", feature = "v3d"))]
 const TAG_GET_CLOCK_STATE: u32 = 0x0003_0001; // get a clock's GATE state (value {clock_id, state})
 // PI-USB-1: notify the VideoCore firmware to reset (and reload the SPI-EEPROM firmware into) the VIA
 // VL805 xHCI behind the BCM2711 PCIe RC. The RPi bootloader normally loads the VL805 firmware at power-on;

@@ -1661,3 +1661,134 @@ itself — with no encoding candidate left to blame.
 
 QEMU `raspi4b` models no V3D block — the run short-circuits at `BLOCK-DOWN` before any of this, so no
 `[v3d57]` line appears there and `kernel8-test` green means *no regression*, nothing more.
+
+## 32. Two refutations already on the wire, and the window nobody sampled (V3D-58)
+
+P56 metal ran the V3D-57 audit and returned `packets=14 packing-diverged=0 prologue-order=OK`,
+`tile-STATE bytes ours=256 mesa=256 OK`, `tile-ALLOC ours=32768 mesa-min=12288 OK`, and the reordered
+`pre-job BPOS=0 (kernel-exact ORDER)`. With a byte-exact-to-Mesa control list, a Mesa-sized tile-state
+array and kernel-ordered register writes, the poison still came back **fully INTACT** — tile-state 64/64
+words, pool 8192/8192 words — and `[v3d56] landing` reported **zero** changed pages across the whole
+64-page arena. `FLDONE` is unmasked and never latches.
+
+The encoding branch is closed. What V3D-58 found is that **two large families of hypothesis were already
+refuted by readings sitting unremarked in the same capture**, and that one window in the kick sequence
+has never been sampled at all.
+
+### R1 — the V3D store path is not dead. The render engine proves it.
+
+The boot that wedges the bin prints, forty lines earlier:
+
+```
+:: V3D: M3 clear-job PASS (GPU cleared buffer; CPU byte-verified) ::
+:: V3D: M3 clue — CT1CS pre=0x00000000 kicked=0x00000020 done=0x00000000
+        CT1CA pre=0x00000000 kicked=0x00215000 done=0x0021506a — RAN-OK ::
+```
+
+and `[v3d41]` reports `RFC 0x00000001`. The render CLE (CT1) executed an RCL, its
+`STORE_TILE_BUFFER_GENERAL` landed in arena memory, the CPU byte-verified it against a `0xDEADBEEF`
+sentinel, and the render frame counter advanced.
+
+That store went through the **same** V3D MMU (same `MMU_CTL=0x00090801`, same `PT_PA_BASE`, same
+identity-mapped arena), the **same** L2T/slice cache configuration, the **same** GMP (`PROT_ENABLE=0`),
+the **same** AXI fabric and the **same** firmware-granted 500 MHz clock as the bin that writes nothing.
+
+So every hypothesis that blocks V3D writes *globally* is refuted **by a working engine rather than by
+argument**: MMU write-permission, a GMP silent drop, L2T/slice flush ordering, a dead or half-clocked
+write domain, an AXI/QoS floor. None of them can be true of a block that just byte-verified a GPU store.
+Whatever is wrong is **bin-path-exclusive**.
+
+This retires the brief's suspect (b)/(c)/(e) surface — hub/supply enables, L2T ordering around the kick,
+and GMP-blocked stores — without a single new register read.
+
+### R2 — "the PTB never starts" is refuted *as stated*; `BPCS` is the witness
+
+`[v3d55] pool` reports `BPCS=0x00005000` against a pool of `0x8000` bytes, exactly complementing the
+`0x3000` `BPCA` advance. `BPCS` is the PTB's **remaining-bytes** register (§30, VC4/v42 ARG: "Remaining
+Size Of Binning Memory Pool"). A pool the PTB never entered would still read the `0x8000` we latched into
+`CT0QMS`. The PTB therefore *did* act: it performed the per-tile initial-block reservation and the two
+up-front 4 KiB chunk allocations `v3d_tile_alloc_sizes` describes.
+
+The surviving statement is narrower than either horn of the arc brief's fork:
+
+> **The bin frame OPENS — `PCS.BMACTIVE=1`, pool reserved — and never CLOSES: `FLDONE` dead, `BFC` Δ0,
+> `BMACTIVE` stuck set — while a render frame on the same block opens, writes and retires cleanly.**
+
+### The unsampled window — `[v3d58] station`
+
+`PCS`, `BPCA` and `BPCS` have only ever been read in the post-wait wedge dump, so **when** `BMACTIVE`
+sets and **when** the pool reservation happens have always been inferred, never measured. R2 above is an
+inference of exactly that kind, and it is falsifiable.
+
+Five stations now bracket the CT0 kick, each sampling `PCS`/`BPCA`/`BPCS`/`BFC`/`CT0CS`/`CT0CA`:
+
+| Station | Point in the kick sequence |
+| --- | --- |
+| **S0** | before this driver touches **any** CT0 or PTB register for the job |
+| **S1** | after the `CT0QMA`/`QMS`/`QTS` latch, before `CT0QBA` |
+| **S2** | after `CT0QBA`, before the GO |
+| **S3** | the instant after the `CT0QEA` GO write |
+| **S4** | at `wait_fldone` exit, before any cache maintenance |
+
+S0 is the load-bearing one. The probe is the **first CT0 bin kick of the boot** (M3 kicks CT1 only), so
+`BMACTIVE` reading `1` at S0 means the block left the reset cycle — or the preceding CT1 render frame —
+with a **bin frame still open**, and every `START_TILE_BINNING` since has been stacking onto a frame
+nobody closed. That single reading would explain the entire campaign: the list walks, the pool reserves,
+and the `FLUSH` never closes a frame it did not open.
+
+### The probe matrix — what each outcome proves
+
+| Witness | Reading | Verdict |
+| --- | --- | --- |
+| `[v3d58] station` | `BMACTIVE=1` at **S0** | A bin frame was left open by the reset path or by M3's render frame. The defect is **upstream of everything V3D-40..57 audited** — a bring-up/frame-abort gap, not a packet, register-order or sizing gap. |
+| `[v3d58] station` | `BMACTIVE=0` at S0 **and** at S4 | The frame never opened. `START_TILE_BINNING` did not put the pipeline into binning mode, so the missing `FLDONE` is a **consequence, not the defect** — chase what gates `BMACTIVE`. |
+| `[v3d58] station` | `BMACTIVE` sets at S3/S4, `BPCS` first drops at S3/S4 | `START_TILE_BINNING` genuinely executed; **R2 stands**. The remaining surface is the bin FLUSH/frame-close step alone. |
+| `[v3d58] station` | `BPCS` already dropped at **S0/S1** | The `0x3000` advance is a **register-latch artifact** of the `CT0QMA`/`QMS` write, not the PTB acting. **R2 is wrong** and "the binner never started" returns to the table. |
+| `[v3d58] xengine` | render verified + bin neither retired nor wrote | **Asymmetry confirmed** — the global-write-failure family is refuted by demonstration. Bin-path-exclusive. |
+| `[v3d58] xengine` | render did **not** verify | **Not** the bin-exclusive asymmetry. A block on which even the proven-good clear job fails is broken upstream; fix M3 before reading any bin verdict. |
+| `[v3d58] rerender` | post-bin clear job **passes** | The wedge is **confined to CT0/PTB**. Every post-bin readback in this file — `[v3d55]` tilestate/pool, `[v3d56]` poison/landing — was taken on a sound block, so their "the PTB wrote nothing" readings stand. |
+| `[v3d58] rerender` | post-bin clear job **fails** | The bin wedge has a **blast radius** beyond CT0: shared state (CLE, pipeline, L2T, MMU) is left broken by the failed frame, and every post-bin readback above was taken inside it. Those readings must be re-examined. |
+
+`[v3d58] rerender` is the negative control the campaign never ran, and it costs one re-run of an
+already-verified job. It is called with `clear_job(None)` so the panel is not repainted, and it runs
+*after* every bin readback has been taken.
+
+### What is deliberately NOT armed
+
+A CT0 thread/frame reset (`CTRSTA`) is the obvious follow-on if S0 reads `BMACTIVE=1`. It is **not**
+implemented. Mainline `v3d_regs.h` defines **no** bit fields for `V3D_CLE_CT0CS` (§30), so any `CTnCS`
+bit beyond the `CTRUN` this driver already relies on would be a fabricated constant — the exact class of
+bug PI-V3D-4 and PI-V3D-6 were. V3D-58 *collects the evidence* that would justify the write; issuing it
+is a next-arc decision taken against a corroborated bit position.
+
+### Witness formats
+
+```
+:: V3D: [v3d58] xengine (<tag>) — RENDER(CT1) ran=<0|1> verified-store=<0|1> RFC=0x………
+        | BIN(CT0) retired=<0|1> wrote-any-arena-byte=<0|1> BFC=0x………
+        | SHARED at bin time: MMU_CTL=0x……… (ENABLE=<0|1> faults=0x…) PT_PA_BASE=0x………
+        L2TCACTL=0x……… arena=0x…+0x… — <verdict> ::
+::   [v3d58] S<n> <station> — PCS=0x……… (BMACTIVE=<0|1> BMBUSY=<0|1> RMACTIVE=<0|1> RMBUSY=<0|1>
+        BMOOM=<0|1>) BPCA=0x……… BPCS=0x……… BFC=0x……… CT0CS=0x……… CT0CA=0x……… ::
+:: V3D: [v3d58] station (<tag>) — pool base=0x……… size=0x… (as latched into CT0QMA/CT0QMS)
+        | BMACTIVE S0..S4 = <00000..11111> | BPCS 0x…->0x… first-drop-station=<n|-1>
+        | BPCA advance at S4 = 0x… | BFC 0x………->0x……… (Δ<n>) — <verdict> ::
+:: V3D: [v3d58] rerender (<tag>) — M3 clear job re-run AFTER the wedged bin: pre-bin=<0|1>
+        post-bin=<0|1> (CT1, panel blit suppressed) — <verdict> ::
+```
+
+`station` emits five indented sample lines plus one verdict line; `xengine` and `rerender` are one line
+each. Gated on `V3D58_STATIONS` and `V3D58_RERENDER_CONTROL` (both plain `const`, default `true`).
+
+### A latent build break fixed in passing
+
+V3D-55 widened `mailbox::get_clock_state` to compile for the `v3d` feature as well as `piusb`, but left
+its `TAG_GET_CLOCK_STATE` constant `piusb`-gated. A `v3d`-without-`piusb` build therefore failed to
+compile at `E0425` — the widening was a no-op that only broke the build it was meant to enable. The two
+`cfg`s now agree. This was invisible to `./arroyo check`, which does not enable the `v3d` feature at all:
+**the V3D probe battery is only type-checked by an armed `UNAOS_V3D=1 ./arroyo kernel8` build**, and that
+build is now part of this arc's gate.
+
+QEMU `raspi4b` models no V3D block — the run short-circuits at `BLOCK-DOWN` before any of this, so no
+`[v3d58]` line appears there and `kernel8-test` green means *no regression*, nothing more. **P58 metal
+reads the station progression, the cross-engine asymmetry and the post-bin render control.**
