@@ -295,6 +295,57 @@ fn repair(restored: Option<(usize, usize, usize, usize)>) {
     }
 }
 
+/// WC-I — the sprite's CURRENT panel box, or `None` when it is not on the panel.
+///
+/// The compositor uses it to decide whether a pass needs the cursor bracket at all. Before WC-I every
+/// `composite` took the sprite off the panel and put it back, unconditionally — and `composite` runs
+/// once per window present, from the presenting task's own core. With several high-rate windows the
+/// sprite spent most of its life mid-restore, on one core or another, and the colour guard in
+/// [`undraw_locked`] means a pixel another painter has taken is simply not put back: the panel showed
+/// a sprite with holes in it that moved from report to report. That is the "spotty/flickery cursor"
+/// of the P60 bench run, and it is a cost paid by every present regardless of where the pointer is.
+///
+/// A snapshot, never a handle: the sprite can move the instant the lock is dropped. The compositor
+/// uses it only to answer "could this pass touch the sprite?", and a stale answer degrades to an
+/// unnecessary bracket (the pre-WC-I behaviour), never to a missed one — a sprite that MOVED between
+/// this read and the draw was moved by `repaint`, which redraws it on top afterwards.
+pub fn sprite_box() -> Option<(usize, usize, usize, usize)> {
+    let sp = SPRITE.lock();
+    if sp.drawn {
+        Some((sp.bx, sp.by, sp.bw, sp.bh))
+    } else {
+        None
+    }
+}
+
+/// WC-I — put the sprite on the panel if it is not already there, and do nothing at all if it is.
+///
+/// The tail of a composite that did NOT disturb the sprite. [`repaint`] would restore-then-redraw at
+/// the same position — a full save-under cycle per present, which is exactly the churn WC-I removes —
+/// whereas this is one lock acquisition and a boolean test in the common case. The case where it does
+/// work is the one that needs it: `wm::erase` takes the sprite down and leaves it to the composite
+/// that follows to put it back.
+pub fn ensure_drawn() {
+    let mut armed_at: Option<(i32, i32)> = None;
+    let mut unsupported_now = false;
+    {
+        let mut sp = SPRITE.lock();
+        if sp.drawn || sp.unsupported || !crate::pal::cursor::visible() {
+            return;
+        }
+        match draw_locked(&mut sp) {
+            Ok(pos) => armed_at = pos,
+            Err(()) => unsupported_now = true,
+        }
+    }
+    if unsupported_now && !UNSUPPORTED_REPORTED.swap(true, Ordering::Relaxed) {
+        serial_println!("[cursor] disabled: panel format has no read-back inverse");
+    }
+    if let Some((px, py)) = armed_at {
+        serial_println!("[cursor] armed x={} y={}", px, py);
+    }
+}
+
 /// Draw the system cursor at the pointer's current position, saving what it covers first.
 ///
 /// Undraws any previous sprite under the SAME lock acquisition, so the whole restore → save → draw

@@ -232,6 +232,51 @@ pub fn request_full_present() {
     FULL_PRESENT.store(true, core::sync::atomic::Ordering::Release);
 }
 
+/// WC-I — one step of the row-span walk that subtracts the window layer from a damage rect.
+///
+/// Given the occluder boxes, a scanline `y`, a cursor `xs` and the rect's right edge `x1`, returns
+/// `(gap_end, next)`: the background is copied over `[xs, gap_end)` and the walk resumes at `next`.
+/// `next` is always strictly greater than `xs`, which is what bounds the caller's loop.
+///
+/// Two cases, and no set arithmetic:
+///  * some occluder COVERS `xs` — the gap is empty and the walk jumps to the furthest right edge of
+///    the occluders covering it, so a pile of overlapping windows costs one step, not one per window;
+///  * none does — the gap runs to the nearest occluder start to the right of `xs` on this row, or to
+///    `x1` when there is none.
+///
+/// Deliberately not a sorted-interval merge: `MAX_WINDOWS` is 8 and this runs per scanline of a
+/// damage rect, so a linear scan over at most eight boxes beats building any structure, and it needs
+/// no allocation on a path that must not allocate.
+fn next_visible_span(
+    occ: &[(usize, usize, usize, usize)],
+    y: usize,
+    xs: usize,
+    x1: usize,
+) -> (usize, usize) {
+    let mut cover_end = xs;
+    for &(bx, by, bw, bh) in occ {
+        if y < by || y >= by.saturating_add(bh) {
+            continue;
+        }
+        if xs >= bx && xs < bx.saturating_add(bw) {
+            cover_end = cover_end.max(bx.saturating_add(bw));
+        }
+    }
+    if cover_end > xs {
+        return (xs, cover_end.min(x1).max(xs + 1));
+    }
+    let mut gap_end = x1;
+    for &(bx, by, bw, bh) in occ {
+        if y < by || y >= by.saturating_add(bh) || bw == 0 {
+            continue;
+        }
+        if bx > xs && bx < gap_end {
+            gap_end = bx;
+        }
+    }
+    (gap_end, gap_end.max(xs + 1))
+}
+
 pub struct Screen {
     /// The real framebuffer (flush target).
     front: FrameBuffer,
@@ -467,13 +512,40 @@ impl Screen {
     /// by a scan-out that lands between the two steps. Eliminating that needs the flush to SKIP the
     /// rows a window owns (or a full double-buffered composite), which is a larger change than this
     /// arc; what this removes is the unbounded, every-frame erasure.
+    ///
+    /// ### WC-I — the residual above is now closed, and it had a period
+    ///
+    /// "A window can still be caught mid-repaint by a scan-out that lands between the two steps" was
+    /// written as a bounded, occasional cost. On the bench it is neither: `main.rs::status_tick` posts
+    /// an `Event::Timer` once a second, the render task recomposes the PI-UI-2 status strip and calls
+    /// `pal.render`, and this function's `wm::repaint()` then re-blitted EVERY live window. That is the
+    /// P60 report exactly — a blip in every vug window at the same instant, a little faster than once a
+    /// second (Key and Button passes mark the strip dirty too), with the desktop, the console and the
+    /// low-rate stat window clean because none of them is being written by two painters at once.
+    ///
+    /// It was also worse than one overwrite-and-restore. The repaint runs a full composite from the
+    /// RENDER task's core while the vug windows present from theirs, so `wm`'s single `STAGE` back
+    /// layer is contended: `try_lock` declines, and a declining window takes the pre-WC-H direct path —
+    /// per-pixel writes into live scan-out, the tearing regime WC-H was built to leave. One window
+    /// rarely collides; N windows collide N times per tick, which is why the symptom needed several
+    /// vugs to appear.
+    ///
+    /// WC-I removes the overwrite instead of sequencing it: [`present_background`] subtracts the window
+    /// layer's boxes from its own damage, so desktop pixels are never written where a window is. There
+    /// is then nothing for a repaint to undo, and the blanket re-blit goes with it — what remains is
+    /// [`wm::service_damage`](super::wm::service_damage), which composites only rows something else
+    /// actually marked (chiefly `cursor::repair`, whose "marks only" contract needs a pass within a
+    /// frame). `wm::repaint` is still called on the one path that could still intrude: a present that
+    /// reports it did not apply the subtraction exactly.
     pub fn flush(&mut self) {
-        self.present_background();
-        // Only when background pixels actually landed. `repaint` self-guards on there being a window
-        // layer to restore (one table-lock acquisition, then out), so a windowless desktop frame pays
-        // a lock and nothing else.
-        if self.last_flush_rects > 0 {
+        let intruded = self.present_background();
+        // Only when background pixels actually landed ON a window — which, with the subtraction in
+        // place, is the fallback path only. `repaint` self-guards on there being a window layer to
+        // restore (one table-lock acquisition, then out).
+        if intruded {
             super::wm::repaint();
+        } else {
+            super::wm::service_damage();
         }
     }
 
@@ -485,7 +557,10 @@ impl Screen {
     /// The DESKTOP half of [`flush`] — it knows nothing about windows; see that function for the
     /// layering. Split out so both of its exits (the parallel band path and the serial fallback) are
     /// covered by the window repaint without either having to remember to call it.
-    fn present_background(&mut self) {
+    /// WC-I — returns whether this present wrote background pixels INTO the window layer (an
+    /// "intrusion"). `false` is the normal answer and means the caller owes the window layer nothing;
+    /// `true` means the subtraction could not be applied and WC-E's restore is still required.
+    fn present_background(&mut self) -> bool {
         // FOCUS-VIS: honour a pending whole-panel repaint request BEFORE the damage set is read. This
         // is how the console comes back out from under a window layer that stopped drawing (see
         // `request_full_present`) — the back buffer already holds the right pixels; only the damage
@@ -501,8 +576,15 @@ impl Screen {
         self.last_union_w = 0;
         self.last_union_h = 0;
         if n == 0 || !self.front.is_ready() {
-            return;
+            return false;
         }
+        // WC-I — the window layer's boxes, snapshotted ONCE for the whole present so every rect of
+        // this frame is subtracted against the same layout (a window that moves mid-present is
+        // repainted by the mover's own composite either way). Empty on a windowless desktop, which is
+        // every full-screen VUG frame and every gate boot before the window fixtures run.
+        let mut occ = [(0usize, 0usize, 0usize, 0usize); super::wm::MAX_WINDOWS];
+        let nocc = super::wm::occluders(&mut occ);
+        let occ = &occ[..nocc];
         // VUG-FPS-2 witness: the merged rect count and the union bbox of all damage this frame. The
         // rects array still holds the pre-clear data (clear() only zeroed len), so read [0..n].
         {
@@ -530,10 +612,17 @@ impl Screen {
         // VUG-PAR: try to fan the row-copy work across free secondary cores. Returns true when it
         // handled the flush (>= 2 bands); false to fall through to the byte-identical serial path
         // (no free AP, or too little work to amortize the spawn/join).
+        //
+        // WC-I: only when the window layer is EMPTY. The band workers copy whole clipped rects and
+        // know nothing about occluders; teaching them the subtraction would put the span walk on
+        // three cores for no benefit, because the case that needs the subtraction (several windowed
+        // apps on the panel) is also the case where the desktop's own damage is small — a status
+        // strip, a console line — and the parallel path declines it as too little work anyway. The
+        // full-screen VUG frame, which is what VUG-PAR was built for, has no windows and is unchanged.
         #[cfg(all(feature = "vugpar", feature = "baremetal"))]
-        {
+        if occ.is_empty() {
             if self.flush_parallel(n) {
-                return;
+                return false;
             }
         }
         let bpp = self.info.bytes_per_pixel;
@@ -546,12 +635,29 @@ impl Screen {
             if d.x0 >= x1 || d.y0 >= y1 {
                 continue;
             }
-            let seg = (x1 - d.x0) * bpp;
             for y in d.y0..y1 {
-                let off = (y * stride + d.x0) * bpp;
-                if off + seg <= self.back_store.len() {
-                    self.front.blit(off, &self.back_store[off..off + seg]);
-                    flushed += seg as u64;
+                // WC-I — copy this row of the rect in the sub-spans the window layer does NOT own.
+                // Row granularity is the natural unit here: the copy is already one bulk `blit` per
+                // row, so subtracting a window turns one `blit` into at most `nocc + 1` shorter ones
+                // and never into a per-pixel loop. `next_visible_span` merges a pile of overlapping
+                // windows in one step, so no sort and no interval set is needed for eight boxes.
+                let mut xs = d.x0;
+                let mut guard = 0usize;
+                // At most one step per occluder edge, plus the final gap — a hard bound on a loop
+                // whose progress already comes from `next > xs`, so a future occluder shape can never
+                // spin the render task.
+                while xs < x1 && guard <= 2 * occ.len() + 2 {
+                    guard += 1;
+                    let (gap_end, next) = next_visible_span(occ, y, xs, x1);
+                    if gap_end > xs {
+                        let off = (y * stride + xs) * bpp;
+                        let seg = (gap_end - xs) * bpp;
+                        if off + seg <= self.back_store.len() {
+                            self.front.blit(off, &self.back_store[off..off + seg]);
+                            flushed += seg as u64;
+                        }
+                    }
+                    xs = next;
                 }
             }
             // Present to a non-coherent scan-out (the Pi 4 HVS) with a single cache clean over this
@@ -564,6 +670,13 @@ impl Screen {
             self.front.flush_range(span_start, span_end - span_start);
         }
         self.last_flush_bytes = flushed;
+        #[cfg(feature = "witness")]
+        super::wm::note_desktop_flush(!occ.is_empty(), false);
+        // WC-I — the subtraction is exact: every span this loop copied was tested against the window
+        // layer, so no background pixel landed inside a window. Nothing is owed to WC-E's restore.
+        // (The `true` branch is kept live by the parallel path above, which returns its own `false`
+        // only because it runs exclusively when there are no occluders at all.)
+        false
     }
 
     /// VUG-PAR — band-parallel flush. Clips the damage set, decides a band count from the currently

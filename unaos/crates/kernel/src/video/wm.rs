@@ -839,6 +839,77 @@ pub fn repaint() {
     composite();
 }
 
+/// WC-I — the panel boxes the WINDOW LAYER currently owns, written into `out` and returned by count.
+///
+/// ### Why the desktop needs this (P60: the ~1 Hz synchronized blip)
+/// WC-E ordered the two writers by making the desktop's present be FOLLOWED by a window repaint, and
+/// named its own residual (`Screen::flush`): the window pixels are overwritten and then repainted
+/// rather than never being overwritten at all, so a scan-out landing between the two steps catches
+/// the window mid-restore. On the bench that residual has a period and a trigger — the PI-UI-2 status
+/// strip's 1 Hz tick (`main.rs::status_tick` → `Event::Timer` → `ui_status::draw` → `pal.render`).
+/// One tick repaints EVERY window on the panel, which is exactly the reported fingerprint: a blip in
+/// every vug window at the same instant, slightly faster than once a second (the tick's own period
+/// plus the Key/Button passes that also mark the strip dirty), while the desktop and the console —
+/// single-writer surfaces — stay clean. A window that presents rarely (the stat window) is almost
+/// never mid-present when the repaint lands and reads clean too; the high-rate vug windows are hit
+/// every time, and each hit ALSO puts a second compositor on a second core, so `STAGE`'s `try_lock`
+/// declines and those windows fall back to the pre-WC-H direct, tearing path.
+///
+/// The fix is to stop the overwrite happening at all: the desktop subtracts these boxes from its own
+/// damage before it copies, so a window's pixels are never desktop pixels for any interval, however
+/// short. `Screen::present_background` is the only caller.
+///
+/// **Compat rows are excluded.** A compat row IS the full-screen present path: its box is the panel,
+/// subtracting it would suppress the desktop entirely, and while a foreground full-screen program
+/// owns the panel the render task is parked and not flushing anyway. That is the same population
+/// `stage_window` and `wcg::begin` already scope themselves to, so the staged set, the instrumented
+/// set and the occluding set are one set.
+///
+/// **Rows the shell hides are excluded**, because the console owns those pixels — subtracting them
+/// would leave a permanently stale rectangle where a hidden window used to be, which is the opposite
+/// of what FOCUS-VIS's erase established.
+///
+/// A snapshot, never a handle. It is read without the desktop holding anything of ours, and a window
+/// that moves or closes immediately afterwards is repainted by the mover/closer's own composite.
+pub fn occluders(out: &mut [(usize, usize, usize, usize); MAX_WINDOWS]) -> usize {
+    let shell = shell_z();
+    let t = TABLE.lock();
+    let mut n = 0usize;
+    for r in t.rows.iter() {
+        if !r.used || r.compat || !above_shell(r, shell) {
+            continue;
+        }
+        let b = outer_box(r);
+        if b.2 == 0 || b.3 == 0 {
+            continue;
+        }
+        out[n] = b;
+        n += 1;
+    }
+    n
+}
+
+/// WC-I — composite whatever is ALREADY marked damaged, and nothing else.
+///
+/// The desktop's post-present call once WC-I's subtraction is in place. [`repaint`] exists to undo an
+/// overwrite the desktop performed, so it damages the whole live set; with the overwrite gone there
+/// is nothing to undo, and re-blitting every window once per desktop frame would keep the exact cost
+/// and the exact multi-core contention the blip is made of. What still has to be serviced on the
+/// desktop's cadence is damage some OTHER path recorded — chiefly `cursor::repair`, whose contract
+/// ("marks only; never composites") depends on someone else running the pass within a frame.
+///
+/// Cheap when idle: one table-lock acquisition and a scan of eight rows, then out. The pass itself
+/// only runs when a row is genuinely damaged.
+pub fn service_damage() {
+    {
+        let t = TABLE.lock();
+        if !t.rows.iter().any(|r| r.used && r.damaged) {
+            return;
+        }
+    }
+    composite();
+}
+
 /// CURSOR-1 — mark every window whose outer box overlaps `(x, y, w, h)` damaged, so the next
 /// composite redraws it from its source surface. Returns the number marked.
 ///
@@ -849,8 +920,9 @@ pub fn repaint() {
 /// windows are damaged, and the next composite overwrites the lot from the app's surface.
 ///
 /// **Marks only; never composites.** [`composite`] brackets itself with `video::cursor`, so a
-/// composite from the cursor path would recurse. Under WC-E every desktop flush composites, so the
-/// repair lands within a frame; without it, at the next present.
+/// composite from the cursor path would recurse. WC-I keeps the "within a frame" guarantee that
+/// depends on: the desktop no longer runs a blanket [`repaint`], but [`service_damage`] on the same
+/// cadence composites exactly the rows this function marked. Without a desktop, at the next present.
 ///
 /// Compat rows are included: they are a full-screen present whose rect covers the panel, so a stale
 /// patch there is exactly as visible as anywhere else.
@@ -892,25 +964,101 @@ pub fn count() -> usize {
 /// across a scan-out flush.
 /// CURSOR-1 — the composite pass, bracketed by the system cursor.
 ///
-/// The sprite is taken OFF the panel before any window pixel is drawn or read, and put back only
-/// after the last `draw_window` / `verify_window` has returned. That ordering is what makes the
-/// cursor free of consequences for the witnesses: `[wc-d]`'s scan-out read-back never sees a sprite
-/// pixel in a window's rect, and `[wc-c]`'s checksum reads the source surface, which the cursor
-/// never touches. (The second, independent guarantee is that the sprite is drawn only after a real
-/// pointer report — see `video::cursor`.)
+/// Whenever the sprite could be over a pixel this pass writes, it is taken OFF the panel before any
+/// window pixel is drawn or read, and put back only after the last `draw_window` / `verify_window`
+/// has returned. That ordering is what makes the cursor free of consequences for the witnesses:
+/// `[wc-d]`'s scan-out read-back never sees a sprite pixel in a window's rect, and `[wc-c]`'s
+/// checksum reads the source surface, which the cursor never touches. (The second, independent
+/// guarantee is that the sprite is drawn only after a real pointer report — see `video::cursor`.)
 ///
-/// Wrapping rather than inlining the pair keeps the ordering true through every early return in the
-/// pass body (the drain barrier, a framebuffer that is not ready): there is no path that can paint
-/// or verify with the sprite still on the panel, and none that returns having left it off.
+/// Every early return in the pass body (the drain barrier, a framebuffer that is not ready) reports
+/// the same `disturbed` answer the full pass does, so there is no path that can paint or verify with
+/// the sprite still on the panel, and none that returns having left it off.
+///
+/// WC-I — the bracket is now CONDITIONAL, and the tail is the cheap form. See
+/// [`super::cursor::sprite_box`] for the panel symptom: an unconditional restore→save→draw per
+/// present, at several windows' present rate across several cores, is what made the sprite spotty.
+/// [`composite_inner`] undraws only when the sprite's box actually intersects a window this pass is
+/// going to paint, and reports whether it did; the tail then either restores the sprite properly
+/// (we moved its pixels) or merely makes sure it is on the panel (we did not).
+///
+/// `ensure_drawn` and not "nothing" on the false branch, because `erase` takes the sprite down and
+/// leaves the composite that follows to put it back — that contract predates WC-I and is unchanged.
 pub fn composite() {
-    super::cursor::undraw();
-    composite_inner();
-    super::cursor::repaint();
+    let disturbed = composite_inner();
+    if disturbed {
+        super::cursor::repaint();
+    } else {
+        super::cursor::ensure_drawn();
+    }
 }
 
 /// The composite pass proper. Private so the cursor bracket above cannot be bypassed — every caller
 /// (including this module's own teardown paths) goes through [`composite`].
-fn composite_inner() {
+fn composite_inner() -> bool {
+    // WC-I — THE CURSOR BRACKET, decided BEFORE anything is registered as an in-flight blit.
+    //
+    // Before WC-I `composite` undrew the sprite unconditionally on every call — and `composite` runs
+    // once per window present, from the presenting task's own core. With several high-rate windows the
+    // sprite spent its life mid restore→save→draw on one core or another, and `cursor::undraw_locked`'s
+    // colour guard DECLINES to restore a pixel another painter has taken, which under that contention
+    // is most of them: the sprite reads as spotty and flickering, which is the second P60 symptom. The
+    // cost was paid on every present regardless of where the pointer actually was.
+    //
+    // **Placement is a correctness constraint, not a preference.** `undraw` takes the SPRITE lock, and
+    // `F4`'s drain barrier is a teardown spinning IRQ-MASKED and unpreemptible until `BLIT_ACTIVE`
+    // reaches zero. Acquiring SPRITE from inside the `BlitGuard` window would put a second lock into
+    // that wait set, so a core preempted while holding SPRITE would stall the draining core forever
+    // rather than for the length of a bounded blit. Deciding here — before the snapshot that registers
+    // the guard — keeps the drain's wait set exactly what its termination argument assumes.
+    //
+    // The test is therefore against every live window ABOVE THE SHELL rather than only the damaged
+    // ones: the dirty set is closed upwards over occlusion inside the pass, which this pre-pass cannot
+    // see, and a conservative answer here degrades to the pre-WC-I behaviour for one pass while a
+    // narrow one would leave sprite-coloured pixels inside a window's rect. The sprite's BOX is used
+    // for the same reason (it is a snapshot taken without the sprite lock held, so it must be the
+    // conservative extent). There is no false negative: every pixel the sprite paints lies inside the
+    // box it reports.
+    //
+    // Lock order: `SPRITE` → `TABLE` (stated in `cursor::repair`). The table access below is a
+    // statement of its own whose guard is dropped before `undraw` is called, so nothing of ours is
+    // held across it.
+    let mut disturbed = false;
+    if let Some(sbox) = super::cursor::sprite_box() {
+        let shell = shell_z();
+        #[allow(unused_mut)]
+        let mut hit = {
+            let t = TABLE.lock();
+            t.rows
+                .iter()
+                .any(|r| r.used && above_shell(r, shell) && boxes_overlap(sbox, outer_box(r)))
+        };
+        // WC-F's ground-truth probe paints at the TAIL of this pass and is outside the window layer,
+        // so `repair` (which damages WINDOWS) can never mend a sprite pixel it took. Treat its
+        // reserved boxes as painted extents too. Witness/baremetal-only, like the probe itself.
+        #[cfg(all(target_arch = "aarch64", feature = "witness", feature = "baremetal"))]
+        if !hit {
+            let fb = *super::WRITER.lock();
+            if fb.is_ready() {
+                let (pw, ph) = (fb.info().width, fb.info().height);
+                if let Some(boxes) = super::wcf::reserved(pw, ph) {
+                    hit = boxes.iter().any(|b| boxes_overlap(sbox, *b));
+                }
+            }
+        }
+        if hit {
+            super::cursor::undraw();
+            disturbed = true;
+        }
+    }
+    #[cfg(feature = "witness")]
+    {
+        WCI_CURSOR_PASSES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if disturbed {
+            WCI_CURSOR_BRACKETS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     // F4 — the drain barrier. Register this composite as in-flight WHILE STILL HOLDING the table
     // lock, so the registration is ordered against any teardown that takes the lock afterwards: a
     // `close_owner` that clears rows can then tell whether some other core snapshotted those rows
@@ -921,8 +1069,11 @@ fn composite_inner() {
         // teardown raises it after clearing its rows, so seeing it up means there is nothing of that
         // ASID's left to draw and the teardown will recomposite when it finishes: skipping is both
         // correct and what makes the drain terminate (`BLIT_ACTIVE` can only fall while it is up).
+        // WC-I: `disturbed`, not `false` — the bracket above may already have taken the sprite off the
+        // panel, and the caller's tail is what puts it back. Every early exit from here on owes the
+        // same answer.
         if DRAIN_PENDING.load(core::sync::atomic::Ordering::Acquire) != 0 {
-            return;
+            return disturbed;
         }
         let mut dirty = [false; MAX_WINDOWS];
         for (i, r) in t.rows.iter_mut().enumerate() {
@@ -957,7 +1108,7 @@ fn composite_inner() {
 
     let fb = *super::WRITER.lock();
     if !fb.is_ready() {
-        return;
+        return disturbed;
     }
 
     // Back-to-front: ascending z, ties by id (creation order).
@@ -1076,6 +1227,7 @@ fn composite_inner() {
         super::wcf::run(&fb, clear);
     }
     let _ = drawn;
+    disturbed
 }
 
 /// WC-D — the SCALED-BLIT / SCAN-OUT VERDICT. One line per window, once, from inside the composite that
@@ -1315,6 +1467,114 @@ impl Drop for DrainBarrier {
     fn drop(&mut self) {
         DRAIN_PENDING.fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
     }
+}
+
+// ---- WC-I witnesses ----------------------------------------------------------------------------
+
+/// WC-I — composite passes that ran, and the subset that had to take the sprite off the panel.
+///
+/// The pair is the whole claim of the cursor half of this arc: before WC-I `brackets == passes` by
+/// construction, because `composite` undrew unconditionally. Reported by [`wci_rollup`].
+///
+/// **Honest scope on the gate.** QEMU raspi4b delivers no HID pointer report, so the sprite is never
+/// drawn there and `brackets` is trivially 0 — the QEMU line proves the counter is wired and that the
+/// window path did not start bracketing for some other reason, and nothing more. The number that
+/// carries the fix is `brackets < passes` on the bench, where a pointer exists.
+#[cfg(feature = "witness")]
+static WCI_CURSOR_PASSES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "witness")]
+static WCI_CURSOR_BRACKETS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// WC-I — desktop presents that wrote background pixels INTO a live window's box. This is the
+/// ~1 Hz blip, counted: every one of these is a window that was erased and then restored, and the
+/// arc's claim is that after the subtraction in `Screen::present_background` the count is zero.
+///
+/// Bumped by [`note_desktop_flush`] from the desktop's own present path, so a future change that
+/// reintroduces the overwrite (a new flush path, a parallel band that forgets the occluders) shows up
+/// as a non-zero rollup rather than as a panel artefact nobody can reproduce in QEMU.
+#[cfg(feature = "witness")]
+static WCI_INTRUSIONS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// WC-I — desktop presents that ran with at least one live window on the panel. The denominator the
+/// intrusion count is meaningful against: `windowed=0 intrusions=0` proves nothing, and the rollup
+/// says so in its verdict rather than leaving a reader to notice.
+#[cfg(feature = "witness")]
+static WCI_WINDOWED_FLUSHES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// WC-I — record one desktop present that ran over a live window layer, and whether it intruded on
+/// it. Called by `Screen::present_background`, the only writer.
+#[cfg(feature = "witness")]
+pub(super) fn note_desktop_flush(windowed: bool, intruded: bool) {
+    use core::sync::atomic::Ordering::Relaxed;
+    if intruded {
+        WCI_INTRUSIONS.fetch_add(1, Relaxed);
+    }
+    if !windowed {
+        return;
+    }
+    let n = WCI_WINDOWED_FLUSHES.fetch_add(1, Relaxed) + 1;
+    // Fire the desktop-scoped rollup once, at the point the evidence exists. The fixture-time call in
+    // the WC-B witness block proves the counters are WIRED; only this one can say the desktop ran over
+    // a live window layer and did not intrude, because only here has that actually happened.
+    //
+    // `WCI_EVIDENCE` samples is the threshold and it is deliberately well past one: the blip is a
+    // PERIODIC event at the status strip's ~1 Hz, so a verdict taken after a couple of flushes could
+    // miss it by luck. At the bench's ~20 fps desktop that is a few seconds of panel time and several
+    // strip ticks; on the QEMU gate — where `status_tick` is not spawned (no Group-1 IRQ) and there is
+    // no input to flush on — it never fires at all, which is the honest outcome and why the
+    // fixture-time line reports `UNWITNESSED` there rather than a vacuous `CLEAN`.
+    if n == WCI_EVIDENCE && !WCI_DESKTOP_ROLLED.swap(true, Relaxed) {
+        wci_rollup_scoped("desktop");
+    }
+}
+
+/// WC-I — windowed desktop presents required before the desktop-scoped rollup is worth printing.
+#[cfg(feature = "witness")]
+const WCI_EVIDENCE: u64 = 64;
+
+#[cfg(feature = "witness")]
+static WCI_DESKTOP_ROLLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// WC-I — the arc's rollup, printed once per boot from the witness harness.
+///
+/// Two independent claims on one line, because they are two faces of one defect — the periodic
+/// full-desktop repaint that overwrote every window at once, and the unconditional cursor bracket
+/// that every one of those repaints then ran on top:
+///  * `intrusions` — desktop presents that wrote background pixels inside a live window's box. The
+///    P60 blip is this number being one per status-strip tick; the fix makes it 0.
+///  * `brackets`/`passes` — composite passes that had to take the sprite off the panel. See
+///    [`WCI_CURSOR_PASSES`] for why the gate can only witness the wiring of this half.
+///
+/// The verdict is `CLEAN` only when the desktop ran over a window layer at least once AND never
+/// intruded; a boot that never had a window on the panel while the desktop flushed reports
+/// `UNWITNESSED`, so an empty run can never be read as a pass.
+#[cfg(feature = "witness")]
+pub fn wci_rollup() {
+    wci_rollup_scoped("fixture");
+}
+
+/// WC-I — the rollup body. `scope` names WHICH evidence the line was taken on: `fixture` at the end of
+/// the window-verb witness block (the counters are wired), `desktop` after the desktop layer has
+/// presented over a live window layer enough times for the verdict to mean something.
+#[cfg(feature = "witness")]
+fn wci_rollup_scoped(scope: &str) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let windowed = WCI_WINDOWED_FLUSHES.load(Relaxed);
+    let intrusions = WCI_INTRUSIONS.load(Relaxed);
+    let passes = WCI_CURSOR_PASSES.load(Relaxed);
+    let brackets = WCI_CURSOR_BRACKETS.load(Relaxed);
+    let verdict = if intrusions > 0 {
+        "INTRUDED"
+    } else if windowed == 0 {
+        "UNWITNESSED"
+    } else {
+        "CLEAN"
+    };
+    serial_println!(
+        "[wc-i] rollup scope={} windowed_flushes={} intrusions={} cursor_passes={} cursor_brackets={} -> {}",
+        scope, windowed, intrusions, passes, brackets, verdict
+    );
 }
 
 /// WC-A — whether the first `[wc-a] composite` witness has been emitted (first composite only; a
@@ -1901,6 +2161,104 @@ pub fn focusvis_selftest() {
     // damaged to actually draw them — a blank rectangle on the panel until WC-E's next desktop flush
     // happened to heal it. `repaint` re-damages the whole live set and composites, which is exactly the
     // restore this owes; it is a no-op on the gate, where the table is empty by now.
+    repaint();
+}
+
+/// WC-I — the CLOSE→REOPEN witness: does a surviving window still reach the panel after a SIBLING
+/// window is closed and its table slot is recycled?
+///
+/// ### Why this exists
+/// The P60 bench report has a third face: after killing a vug and relaunching it, the relaunched
+/// window shows EMPTY and no further vug displays. One hypothesis put to this arc was that WC-H's
+/// back layer carries per-window state that teardown fails to rebind, so a recycled slot presents
+/// into a dead layer. This is the falsifier for the compositor half of that hypothesis, and it is
+/// drivable in QEMU (unlike the 1 Hz blip, which needs the bench's timing, or the cursor, which needs
+/// HID): close a window, recycle its slot with a new one, and then read the SCAN-OUT back at the
+/// content origin of the window that survived and of the window that took the freed slot.
+///
+/// Read-back at a pixel, for the same reason `focusvis_selftest` uses one: every other instrument
+/// here reports kernel state, and kernel state was correct in the bench report — `[wc-d] verify`
+/// printed `PASS` with `nonzero=262144` for a window the operator saw as empty. Only the framebuffer
+/// can contradict that, so only the framebuffer is asked.
+///
+/// ### The three legs
+/// 1. **both** — A and B live and presented: each origin holds its own colour. (Baseline.)
+/// 2. **reopen** — close A, create C into the freed slot, present it: C's origin holds C's colour.
+///    This is the "relaunched window is empty" case at the compositor layer.
+/// 3. **survivor** — B, which was never touched, still holds B's colour after the close and the
+///    recycle. This is the "no further vug displays" case.
+///
+/// Self-cleaning and one-shot, on the same terms as `focusvis_selftest`: explicit placement clear of
+/// WC-F's reserved boxes, both survivors closed at the end, and the live set repainted.
+#[cfg(feature = "witness")]
+pub fn reopen_selftest() {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    let fb = *super::WRITER.lock();
+    if !fb.is_ready() {
+        serial_println!("[wc-i] reopen -> SKIP (framebuffer not ready)");
+        return;
+    }
+    let info = fb.info();
+    if info.width < 256 || info.height < 128 {
+        serial_println!("[wc-i] reopen -> SKIP (panel {}x{} too small)", info.width, info.height);
+        return;
+    }
+
+    const ASID_A: u64 = 0xE0A;
+    const ASID_B: u64 = 0xE0B;
+    const ASID_C: u64 = 0xE0C;
+    let sa = &raw const FV_SURF_A as usize;
+    let sb = &raw const FV_SURF_B as usize;
+    let len = core::mem::size_of_val(&FV_SURF_A);
+    let (a_col, b_col) = (FV_SURF_A[0], FV_SURF_B[0]);
+
+    let wa = create(ASID_A, sa, len, 8, 8, 32, b"re-a");
+    let wb = create(ASID_B, sb, len, 8, 8, 32, b"re-b");
+    if wa == WIN_NONE || wb == WIN_NONE {
+        serial_println!("[wc-i] reopen -> SKIP (window table full: a={} b={})", wa, wb);
+        close(wa);
+        close(wb);
+        return;
+    }
+    // Two distinct origins, upper-middle, clear of WC-F's bottom-edge probe boxes and of each other.
+    let oy = info.height / 4 + TITLE_H + BORDER;
+    let (ax, bx) = (info.width / 4, info.width / 2);
+    move_to(wa, ax, oy);
+    move_to(wb, bx, oy);
+    present(wa);
+    present(wb);
+    let read = |x: usize, y: usize| super::WRITER.lock().read_pixel(x, y).unwrap_or(0);
+    let both_ok = read(ax + 1, oy + 1) == a_col && read(bx + 1, oy + 1) == b_col;
+
+    // Recycle A's slot. `close` frees the row and `create` takes the lowest free one, so C lands on
+    // exactly the slot A vacated — which is the id-aliasing the bench report's `close win=1` /
+    // `create win=1` pair shows, reproduced deliberately.
+    close(wa);
+    let wc = create(ASID_C, sa, len, 8, 8, 32, b"re-c");
+    if wc == WIN_NONE {
+        serial_println!("[wc-i] reopen -> SKIP (no row for the reopened window)");
+        close(wb);
+        return;
+    }
+    move_to(wc, ax, oy);
+    present(wc);
+    let reopen_ok = read(ax + 1, oy + 1) == a_col;
+    let survivor_ok = read(bx + 1, oy + 1) == b_col;
+
+    let ok = both_ok && reopen_ok && survivor_ok;
+    serial_println!(
+        "[wc-i] reopen closed={} reopened={} survivor={} both={} reopen={} survivor_px={} -> {}",
+        wa, wc, wb, both_ok, reopen_ok, survivor_ok,
+        if ok { "PASS" } else { "FAIL" }
+    );
+
+    close(wb);
+    close(wc);
     repaint();
 }
 

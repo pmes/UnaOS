@@ -1728,3 +1728,182 @@ path this arc actually changed.
   whole pass, and `erase` still fills the desktop directly. `erase` is *not* staged — it is a one-shot
   solid fill on close/raise rather than a continuous repaint, so it can flash but cannot produce the
   standing tear this arc removes. If the bench sees a torn erase, that is the follow-on.
+
+### WC-I — the periodic full-desktop repaint, and the cursor bracket that rode on it
+
+P60 (Pi 4, 1920x1200, attended) confirmed WC-H: a single vug window is crystal sharp, `[wc-h] rollup
+... torn=0 declines=0`, present ~1.2-1.6 ms. It also produced two symptoms WC-H does not cover, and
+neither is reproducible in QEMU (one needs the bench's timing, the other needs HID):
+
+1. with **several** vug windows, a fuzz blip in **every** vug window **simultaneously**, slightly faster
+   than once a second, while the stat window, the desktop and the console stayed clean;
+2. the mouse cursor visible but **spotty and flickering**.
+
+#### The blip: one periodic painter, named
+
+The synchronization across windows and the ~1 Hz period are the fingerprint of a single caller that
+repaints the whole window layer, and there is exactly one:
+
+* `main.rs::status_tick` posts an `Event::Timer` to `GUI_CHANNEL` once a second (metal only — QEMU
+  raspi4b has no Group-1 IRQ, so the task is not spawned there at all, which is why the gate cannot see
+  this);
+* the render task's `Event::Timer` arm sets `strip_dirty`, `ui_status::draw` recomposes the PI-UI-2
+  status strip, and `pal.render` → `Screen::flush` presents;
+* `Screen::flush` then called `wm::repaint()`, which marks **every** live window damaged and composites
+  the lot.
+
+That is WC-E's own stated residual — "the window pixels are overwritten and repainted within the same
+present rather than never being overwritten at all" — with a period and a trigger attached. Two
+consequences, not one:
+
+* every window is erased to desktop content and restored once per tick, so a scan-out landing between
+  the two steps catches all of them at once;
+* the repaint runs a composite from the **render** core while the vug windows present from **theirs**,
+  so `wm`'s single `STAGE` back layer is contended. `try_lock` declines, and a declining window takes
+  the pre-WC-H direct path — per-pixel writes into live scan-out, the tearing regime. One window rarely
+  collides; N windows collide N times per tick, which is why the symptom needed several vugs.
+
+The stat window reads clean for a mundane reason: it presents rarely, so it is almost never mid-present
+when the repaint lands. The desktop and the console are single-writer surfaces and were never at risk.
+
+**The fix removes the overwrite instead of sequencing it.** `wm::occluders` publishes the panel boxes
+the window layer owns (live, non-compat, above the shell — the same population `stage_window` and
+`wcg::begin` scope to), and `Screen::present_background` subtracts them from its own damage: each
+damaged row is copied in the sub-spans no window covers (`next_visible_span`, a linear walk over at
+most `MAX_WINDOWS` boxes, at most `2n+2` steps per row, no allocation). Desktop pixels are then never
+written where a window is, for any interval however short.
+
+With nothing to undo, the blanket re-blit goes too: `Screen::flush` now calls `wm::service_damage`,
+which composites only rows something *else* marked — chiefly `cursor::repair`, whose "marks only, never
+composites" contract needs a pass within a frame. `wm::repaint` survives for the one path that can
+still intrude, and `present_background` reports which it took.
+
+VUG-PAR's band-parallel flush is taken only when the window layer is **empty**. The band workers copy
+whole clipped rects and know nothing about occluders; the case that needs the subtraction (several
+windowed apps) is also the case where the desktop's own damage is a strip or a console line, which the
+parallel path declines as too little work anyway. The full-screen VUG frame it was built for has no
+windows and is byte-for-byte unchanged.
+
+#### The cursor: an unconditional bracket at present rate
+
+`wm::composite` was `cursor::undraw()` → pass → `cursor::repaint()`, unconditionally. `composite` runs
+once per window present from the presenting task's own core, so with several high-rate windows the
+sprite was in a restore→save→draw cycle on one core or another essentially continuously — and
+`cursor::undraw_locked`'s colour guard *declines* to restore a pixel another painter has taken, which
+under that contention is most of them. The panel shows a sprite with holes that move from frame to
+frame. The cost was paid on every present regardless of where the pointer was.
+
+WC-I makes the bracket **conditional**: `composite_inner` takes it only when `cursor::sprite_box()`
+intersects a live window above the shell — plus WC-F's reserved probe boxes, which paint at the tail of
+the pass and lie outside the window layer, so `repair` could never mend a sprite pixel they took. The
+tail is `cursor::repaint()` when the pass disturbed the sprite and the new `cursor::ensure_drawn()`
+when it did not (one lock and a boolean in the common case; the work it does do covers `erase`, which
+takes the sprite down and leaves the following composite to put it back).
+
+**Where the decision runs is a correctness constraint, not a preference.** It is taken at the very top
+of `composite_inner`, *before* the snapshot that registers the pass as an in-flight blit. `undraw`
+takes the SPRITE lock, and F4's drain barrier is a teardown spinning IRQ-masked and unpreemptible
+until `BLIT_ACTIVE` reaches zero; acquiring SPRITE inside the `BlitGuard` window would add a second
+lock to that wait set, so a core preempted while holding SPRITE would stall the draining core
+indefinitely instead of for the length of a bounded blit. Deciding before the guard keeps the drain's
+wait set exactly what its termination argument assumes.
+
+The consequence is that the test is deliberately **conservative in two directions**: against every
+live window above the shell rather than only the damaged ones (the dirty set is closed upwards over
+occlusion *inside* the pass, which this pre-pass cannot see), and against the sprite's **box** rather
+than its painted mask (the box is snapshotted without the sprite lock, so it must be the outer
+extent). A false positive costs the pre-WC-I behaviour for one pass; there is no false negative,
+because every pixel the sprite paints lies inside the box it reports and every window the pass can
+paint is a window the test considered.
+
+Nothing WC-D depends on moved: a window this pass paints is a window whose intersection test ran, so
+`verify_window` still never reads a rect with the sprite on it.
+
+#### Witnesses
+
+`[wc-i] rollup scope={fixture|desktop} windowed_flushes=N intrusions=N cursor_passes=N
+cursor_brackets=N -> {CLEAN|INTRUDED|UNWITNESSED}`
+
+* `intrusions` — desktop presents that wrote background pixels inside a live window's box. The blip is
+  this number being one per strip tick; the fix makes it 0.
+* `cursor_brackets`/`cursor_passes` — before WC-I these were equal by construction.
+* `scope=fixture` fires at the end of the window-verb witness block and proves the counters are wired.
+  `scope=desktop` fires once the desktop has presented over a live window layer 64 times, which is the
+  first point the verdict means anything. The verdict is `CLEAN` only when the desktop ran over a
+  window layer **and** never intruded; a boot where that never happened reports `UNWITNESSED`, so an
+  empty run can never be read as a pass.
+
+`[wc-i] reopen closed=W reopened=W survivor=W both=B reopen=B survivor_px=B -> PASS|FAIL` — the
+close→reopen scan-out read-back (see below).
+
+#### The close→reopen / undying-vug cluster: what this arc can and cannot say
+
+P60 also reported that a relaunched vug shows an **empty** window, that no further vug then displays,
+and that those same relaunched vugs are **unkillable** (`kill armed but unconfirmed`, no
+`[skill] killed ... confirmed=1`). A hypothesis put to this arc was that WC-H's back layer carries
+per-window state that teardown fails to rebind, so a recycled slot presents into a dead layer.
+
+**That hypothesis is refuted, twice over.**
+
+*By inspection*: `STAGE` carries no window identity at all. It is one global `Vec<u8>`, `try_lock`ed
+per composite, grown-only, and `paint_window`'s opening `fill_rect` covers the whole clipped box dense
+before the present — so every byte a present copies was written by that present. Nothing in `close`,
+`close_owner`, `close_compat` or `win_close_asid` touches it, and there is nothing there to rebind.
+The only per-id compositor state is `VERIFIED` (a WC-D one-shot latch, already cleared in
+`create_inner` precisely because ids are recycled slot aliases) and `wcg`'s per-id sample budgets;
+neither writes a pixel.
+
+*By read-back*: `wm::reopen_selftest` (`[wc-i] reopen`) drives the exact sequence in QEMU — create A
+and B, present both, close A, create C into the slot A vacated (the `close win=1` / `create win=1`
+aliasing the bench log shows), present C — and reads the **scan-out** back at each content origin. It
+reports `PASS` on the gate: the reopened window's pixels are on the panel and the untouched survivor's
+still are.
+
+So the compositor is not where those pixels are lost. The bench evidence points the same way once the
+fourth symptom is added: the relaunched vug never crosses the kill boundary, and an app that never
+reaches its checkpoint also never reaches its first `SYS_WIN_PRESENT`. A window whose owner has not
+presented shows kernel chrome over a **zeroed** surface — `boot::build_slot` scrubs the slot's FB
+region on recycle — which is precisely "an empty window". `[wc-d] verify ... nonzero=262144 -> PASS`
+in the bench log is not a contradiction: it is the *one* vug that did present.
+
+**Out of lane, reported not touched.** The remaining thread is where a relaunched vug on a recycled
+slot/ASID spins before its first present, and why an armed kill never confirms against it. That lives
+in the EL0 launcher / slot-recycle / task-teardown path (`arch/aarch64/boot.rs::build_slot` +
+`teardown_user_slot`, `sched.rs`'s kill boundary, the shell's `skill`), not in the WC-* files this arc
+owns. It needs its own arc and its own witness.
+
+#### WC-I gate results (2026-07-25, QEMU raspi4b, forced bench geometry)
+
+QEMU raspi4b, forced bench geometry — **no metal in this arc**; final verification is attended metal.
+
+`./arroyo check` green both arches · `./arroyo test-arm` → xHCI MISSION SUCCESS ·
+`UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test 60` → MBENCH **63/63 required, 0 forbidden**, with
+every `[wc-g]` / `[wc-h]` / `[wc-d]` / `[wc-fv]` witness unchanged and green.
+
+```
+[wc-i] reopen closed=1 reopened=1 survivor=2 both=true reopen=true survivor_px=true -> PASS
+[wc-i] rollup scope=fixture windowed_flushes=0 intrusions=0 cursor_passes=335 cursor_brackets=0 -> UNWITNESSED
+```
+
+`UNWITNESSED` is the correct and expected gate verdict, not a weak pass: `status_tick` is not spawned
+under QEMU and the headless battery delivers no input, so the desktop never presents over a live window
+layer there. `cursor_brackets=0` against 335 passes is likewise wiring only — raspi4b delivers no HID
+pointer report, so the sprite is never drawn. Both numbers carry their claim only on the bench.
+
+#### Metal watch-list
+
+* **The blip is gone.** Several vugs running: no simultaneous per-second fuzz. `[wc-i] rollup
+  scope=desktop ... intrusions=0 -> CLEAN` on the wire is the assertion; a non-zero `intrusions` means
+  a desktop path is still writing into a window box and names it as the cause rather than leaving it to
+  a photograph.
+* **`[wc-h] rollup ... declines=0` should now hold with several windows**, not just one. The
+  `reason=lock` declines WC-H anticipated were largely the desktop repaint compositing on a second
+  core; with the blanket repaint gone, that contention source is gone with it. Residual declines are
+  genuine two-app concurrency.
+* **The cursor is solid.** `cursor_brackets` far below `cursor_passes` is the number; the operator
+  reading is a sprite that stops flickering while vugs render.
+* The status strip and console must still repaint normally *around* windows — the subtraction is
+  per-row-span, so a window overlapping the strip should show the strip either side of it and never
+  through it.
+* `erase` is still unstaged and still fills the desktop directly (unchanged by this arc), so a torn
+  erase on close/raise remains the WC-H follow-on it always was.

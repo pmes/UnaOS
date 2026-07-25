@@ -11735,6 +11735,15 @@ fn wcb_launcher(_demo_cpu: usize) {
     // burn them and the arc's real per-window checksums would never print.
     #[cfg(feature = "witness")]
     crate::video::wm::focusvis_selftest();
+    // WC-I: the close->reopen read-back, for the same reason and in the same place — it mints and
+    // recycles its own rows, so it must run after every one-shot per-window latch above is spent.
+    // Ordered AFTER `focusvis_selftest` because that one leaves the shell z restored and the live set
+    // repainted, which is the state this witness assumes on entry.
+    #[cfg(feature = "witness")]
+    crate::video::wm::reopen_selftest();
+    // WC-I: the arc's rollup, last — it reports counters the two selftests above contribute to.
+    #[cfg(feature = "witness")]
+    crate::video::wm::wci_rollup();
 }
 
 // =============================================================================================
