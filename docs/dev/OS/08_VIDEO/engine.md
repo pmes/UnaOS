@@ -1330,3 +1330,98 @@ nothing on a gate with no pointer, exactly as CURSOR-1 promised.
 visibly front → the cursor is visible throughout. The raise, the shell raise and the cursor's survival of
 a window create are all gate-checkable; the *legibility* of the console under the full present, and the
 sprite itself (QEMU has no pointer), remain bench-only.
+
+### WC-G — the window-path garble, localized
+
+WC-D, WC-E and WC-F between them exonerated everything global. On silicon the scan-out identities are all
+true, both twin blocks are clean at 8192/8192, and the ramp photographs straight. And still a live 128×128
+window garbles, in horizontal bands, less badly when the app cycles faster.
+
+Every instrument in that chain shares one property: it measures **converged** content. A one-shot
+read-back, a static twin, a photographed ramp — each samples after the writing stopped. A window that
+repaints forever never converges, and that is exactly the population that garbles. WC-G instruments the
+non-converged case: the present path *while it is running*.
+
+#### The instrument
+
+Four checksums of the same surface taken at four moments around one blit, plus a read-back of what that
+blit landed, plus the blit's duration:
+
+| leg | when | a divergence means |
+|-----|------|--------------------|
+| `app` | at `SYS_WIN_PRESENT` entry, owner parked in the syscall | the frame the owner declared finished |
+| `blit` | immediately before `draw_window` reads it | `app != blit` — the surface moved between present and copy |
+| `civac` | after `DC CIVAC` over the surface | `blit != civac` — **coherency**: the kernel's lines did not match the coherent view |
+| `after` | immediately after `draw_window` returns | `blit != after` — **race**: the owner wrote it *mid-copy* |
+| `fbbad` | source re-derived and compared against `read_pixel` over the content rect | non-zero — the **blit/upscale** path landed a wrong pixel |
+| `us` vs `rectscan_us` | wall clock of the blit vs the beam's time on the window's own rows | `slow=yes` — the scan-out is **guaranteed** to overtake the copy inside the rect |
+
+`blit != civac` and `blit != after` cannot both be explained by one mechanism, which is what makes the
+coherency and race suspects separable rather than a shrug.
+
+**Why `CIVAC` here, when WC-D was required to use a bare `IVAC`.** WC-D's rule was about the framebuffer,
+which the kernel itself writes: cleaning before reading would have written the blit's own dirty lines out
+and healed the short-flush defect the witness existed to catch. The surface is the mirror image — the
+kernel only ever *reads* it, so there are no kernel-dirty lines to write back and `CIVAC` cannot repair a
+compositor defect; what it can do is force the read from the coherent view, which is the question. A bare
+`IVAC` would additionally risk discarding the owner's un-cleaned lines, destroying app data to answer a
+question `CIVAC` answers safely. The rulings differ because the buffers differ.
+
+**`own=`** records *why* the window was blitted. `own=yes`: the blit follows this window's own present, so
+its owner is inside the syscall and cannot be writing. `own=no`: collateral repaint — the damage set is
+closed upward over occlusion, so presenting window A repaints every higher-z window overlapping it, and
+B's owner is running free at EL0 with nothing serialising it against the copy of its surface. `own=no`
+with `blit != after` is source tearing caught in the act. Both cases occur in the gate.
+
+**`rectscan_us`** is the threshold that matters, and it is derived, not chosen: the beam only has to cross
+*this rect* to latch it part-old and part-new, so the criterion is `frame_us × rows_on_panel ÷
+panel_height`, not a whole frame period.
+
+Budgeted at four samples per window id (the checksums are 64 KiB reads and the read-back is one probe per
+source pixel, from present context at EL0 frame rates — an unbudgeted version would perturb the timing it
+reports). Per-window, not per-window-0, so the shared-path claim is provable on the wire. `witness`-gated
+and aarch64-only like `wcf`: knob-off, `video/wcg.rs` does not compile and the flashable media are
+byte-identical.
+
+#### What the gate found
+
+`UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test 60`:
+
+```
+[wc-g] win=1 seq=1 own=yes scale=4x app=0xa1cf…8449 blit=0xa1cf…8449 civac=0xa1cf…8449 after=0xa1cf…8449 fbbad=0/16384 us=13331 rectscan_us=7111 slow=yes -> CLEAN
+[wc-g] verdict samples=4 windows=1 coher=0 race=0 blit=0 clean=4 slow=4 maxus=13617 frame_us=16667 -> CLEAN+SLOW
+[wc-g] win=2 seq=1 own=no  scale=4x … fbbad=0/4096 us=3520 rectscan_us=3555 slow=no -> CLEAN
+```
+
+All three named suspects are **negative**: no coherency divergence, no source race (in either the `own=yes`
+or the `own=no` case), no blit-path or upscale error — `fbbad=0` over every probe. Every byte was correct
+at every moment.
+
+The residual is timing, and the code says why. `draw_window` writes **per-pixel, with `put_pixel`, directly
+into the front framebuffer** — the live scan-out — with no vblank synchronisation anywhere in the path.
+The desktop does not: it reaches the panel through `Screen`'s back buffer and a contiguous per-row
+damage-rect flush, which is why direct desktop writes are clean and only windows garble. At bench geometry
+a 128×128 window at 4× takes **13.3 ms to copy against 7.1 ms of beam time on its own rows** — a 1.9×
+overtake, so the HVS latches the rect part-old and part-new, at whatever scanline it held when the copy
+passed it. That is a horizontal band boundary, which is the shape in the photograph. It also explains
+"cycling faster looks a little better": a faster cycle does not remove the tear, it shortens the interval
+any one torn frame stays on the panel. The 64×64 window sits right at its own threshold (3.2 ms vs 3.6 ms),
+consistent with smaller windows looking better.
+
+WC-G fixes nothing — it is the localization. The fix is a design question for the next arc (double-buffer
+the window layer, or bound the copy under the rect's scan time), not a knob.
+
+#### WC-G gate results (2026-07-25, QEMU raspi4b, forced bench geometry)
+
+`./arroyo check` green both arches · `./arroyo kernel8` clean, **zero `wc-g` strings** (armed build: two) ·
+`UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test 60` → MBENCH **58/58 required, 0 forbidden**, on a
+spec grown by this arc's two REQUIREs. Those REQUIREs assert that the instrument *ran*, deliberately not
+what it found: the finding is the arc's output, and a FORBID on any verdict would encode a conclusion the
+chain has not yet reached.
+
+Unlike WC-F, the QEMU result here is **not** a formality. The three checksum legs are cache- and
+race-sensitive and QEMU models neither caches nor the HVS, so their `CLEAN` verdict on the gate is weak
+evidence and must be re-read on metal — a coherency or race defect can only appear there. The timing leg is
+the opposite: `us=` is measured against `CNTVCT` on the same per-pixel code path the bench runs, and metal
+is expected to be **slower**, not faster (real non-coherent framebuffer stores plus a real `DC CVAC`
+sweep). The overtake the gate measures is therefore a lower bound on the bench's.

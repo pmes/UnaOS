@@ -315,3 +315,22 @@ FORBID \[wc-f\] scanout -> SKIP
 REQUIRE \[wc-f\] twin .*-> PASS
 FORBID \[wc-f\] twin .*-> FAIL
 FORBID \[wc-f\] twin -> SKIP
+
+# --- WC-G: the window PRESENT path, instrumented WHILE IT RUNS.
+# ---    Every earlier instrument in this chain measured CONVERGED content — a one-shot read-back, a
+# ---    static twin, a photographed ramp — and all of them passed while a live window still garbled.
+# ---    WC-G samples the non-converged case: four checksums of one surface taken around one blit
+# ---    (`app` at the owner's present, `blit` as the copy finds it, `civac` through the coherent
+# ---    view, `after` as the copy leaves it), a scan-out read-back of the content rect (`fbbad`), and
+# ---    the blit's wall-clock duration (`us`/`slow`). Those legs separate a source race from a
+# ---    coherency fault from a blit-path defect from an unbuffered-copy TIMING defect.
+# ---    Budgeted at 4 samples per window id; `own=` records whether the blit followed that window's
+# ---    own present or was collateral damage-closure repaint (the case where the owner is running
+# ---    free at EL0 with nothing serialising it against the copy of its surface).
+# ---
+# ---    These REQUIREs assert that the INSTRUMENT RAN, deliberately not what it found: the finding is
+# ---    the arc's output, and a FORBID on any verdict would encode a conclusion the chain has not yet
+# ---    reached. Read the `-> ` verdict on the `[wc-g] verdict` line, and the per-sample lines under
+# ---    it, as data. Witness-feature only. See docs/dev/OS/08_VIDEO/engine.md §WC-G.
+REQUIRE \[wc-g\] win=.* fbbad=.* slow=.* ->
+REQUIRE \[wc-g\] verdict samples=.* frame_us=.* ->

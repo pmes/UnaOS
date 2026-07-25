@@ -374,15 +374,30 @@ pub fn close_compat() -> bool {
 ///
 /// Returns `false` if `id` names no live window.
 pub fn present(id: WinId) -> bool {
+    // WC-G — the surface as the OWNER declared it finished. Taken here and nowhere else: this is the
+    // one moment the owner is provably not writing (it is parked inside `SYS_WIN_PRESENT`), so it is
+    // the only honest baseline for the `app` leg. The identity is captured under the table lock and
+    // the checksum taken after it drops — a 64 KiB read is not something to hold the window table
+    // across, and the surface cannot be unmapped underneath it while the owner is in the syscall.
+    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    let mut probe: Option<(usize, usize)> = None;
     {
         let mut t = TABLE.lock();
         match row_mut(&mut t, id) {
             Some(r) => {
                 r.damaged = true;
                 r.presented = true;
+                #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+                if !r.compat {
+                    probe = Some((r.surf, r.surf_len));
+                }
             }
             None => return false,
         }
+    }
+    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    if let Some((surf, surf_len)) = probe {
+        super::wcg::on_present(id, surf, surf_len);
     }
     composite();
     true
@@ -936,11 +951,23 @@ fn composite_inner() {
         // FOCUS-VIS: below the shell, so the console owns these pixels — do not draw. The damage flag
         // was already cleared above, which is right: `focus_changed` re-damages every window it raises,
         // so a window coming back up repaints from its source surface rather than inheriting a stale
-        // flag from while it was hidden.
+        // flag from while it was hidden. Outermost of the per-window guards: WC-G's sampler below
+        // must never bracket a window this skip declines to draw.
         if !above_shell(&rows[i], shell) {
             continue;
         }
+        // WC-G — bracket the blit. `begin` must be the last thing before `draw_window` and `end` the
+        // first thing after it: the `blit`/`after` checksums mean "the surface as the copy found it"
+        // and "as the copy left it", and anything inserted between them widens the interval they
+        // measure into something other than the copy. Budgeted per window id; `None` once spent.
+        #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+        let wcg_probe = super::wcg::begin(rows[i].id, rows[i].surf, rows[i].surf_len, rows[i].compat);
         draw_window(&fb, &rows[i]);
+        #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+        if let Some(p) = wcg_probe {
+            let r = &rows[i];
+            super::wcg::end(p, &fb, r.x, r.y, r.w, r.h, r.stride, r.scale);
+        }
         // WC-D — verify this window's blit against the scan-out, once per window id, from inside the pass
         // that drew it (the only place both the source surface and the destination rows are known).
         #[cfg(feature = "witness")]
