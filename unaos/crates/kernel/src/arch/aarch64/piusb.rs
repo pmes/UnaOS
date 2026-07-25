@@ -764,11 +764,50 @@ fn witness_link_speed_width(ctx: &str) {
 /// (PHYLINKUP=false DL_ACTIVE=false, all windows zero), and an MMIO probe into a link-down RC does not
 /// fault — it STALLS the CPU on the bus for a pathologically long time (the run appeared frozen; a
 /// power-cycled rerun eventually returned 0). Adopt is retired: there is nothing live to adopt here.
-fn dump_firmware_state() {
-    serial_println!("{} PIUSB-5: pre-reset firmware reference dump (read-only; BEFORE any RC reset) ::", P);
+///
+/// PIUSB-41 — WHY THIS DUMP IS NOW KNOB-GATED. P60 is the first real cold-boot measurement of the
+/// bracket chain, and it indicts this function, not the bring-up: total PCIe/VL805 bringup 141.8s, of
+/// which `stage=fw-state-dump took=129688ms` and (nested inside it) `stage=dump-linkdown-rc-claim
+/// took=32410ms`, while every FUNCTIONAL stage is fast (m1-rc-bringup 340ms, m2-enumerate-vl805 564ms,
+/// m3-attach-xhci 332ms, xhci handoffs 18/21ms — no 2.8s multiple, so the budget-escalation theory is
+/// refuted). Arithmetic names the mechanism: this path performs 13 bare RC-APB reads (10 here + 3 in
+/// `witness_rc_cpu_claim`) and 129.7s/13 ≈ 10s PER READ. When the firmware hands us the RC still held
+/// in reset (RGR1_SW_INIT_1=0x3 = INIT_GENERIC|PERST, PHYLINKUP=false) the RC's OWN APB block does not
+/// answer promptly either — each 32-bit load is absorbed by the bridge's completion-timeout machinery
+/// and stalls the CPU for ~10s. These are bare `r()` loads, so `MMIO_LADDER_BUDGET_MS` (60 ms) does not
+/// apply to them: that wall only caps `mmio_settle_read` ladders. The cost is therefore LINEAR IN THE
+/// NUMBER OF REGISTERS WE CHOOSE TO DUMP — and a dump of a confirmed family is exactly what the
+/// default-quiet-boot law says must not run by default. So: the full register dump and the RC-claim
+/// witness now require the `usbdebug` feature (`UNAOS_USBDEBUG=1`); the default path reads only the TWO
+/// registers the link-down gate genuinely needs (RGR1_SW_INIT_1 + PCIE_STATUS — the gate decision and
+/// PIUSB-16's discriminator are both driven off them) and prints ONE summary line. Nothing functional
+/// changed: no bring-up step, wait, ordering or protection is touched, the gate is the same gate, and
+/// every `[piusb40]` bracket still emits `stage=… took=…` so the chain stays gap-free.
+///
+/// PIUSB-42 — RETURNS `(RGR1_SW_INIT_1, PCIE_MISC_PCIE_STATUS)`, the two gate registers this function
+/// reads unconditionally on EVERY path (including both early returns, and in BOTH modes — the pair is
+/// on the always-read path above the `deep` gate, so the knob cannot change what is threaded out). It
+/// returns them because the caller's PIUSB-16 entry-link discriminator needs exactly these two values
+/// and used to re-read them microseconds later. On the cold-boot link-down path each bare RC-APB read
+/// costs ~10s (PIUSB-41's measurement: the RC is held in reset and the load is absorbed by the bridge's
+/// completion-timeout machinery), so that duplicate pair was pure waste — worth AT MOST ~10.9s, which is
+/// all P60's total leaves for it once the dump and the functional stages are subtracted (a uniform
+/// 2 × ~10s extrapolation would say ~21s, but that exceeds the residual; see 5h). Threading them out is
+/// behaviour-preserving by construction — see the discriminator's own note on why the staleness is
+/// sound; the longer DEEP-mode dwell between the read and the discriminator does not weaken that
+/// argument, which turns on there being no WRITER in between, not on how little time passes.
+fn dump_firmware_state() -> (u32, u32) {
+    // The knob. `usbdebug` is the established USB-diagnostics feature (`UNAOS_USBDEBUG=1 ./arroyo …`).
+    let deep = cfg!(feature = "usbdebug");
+    serial_println!(
+        "{} PIUSB-5: pre-reset firmware reference dump (read-only; BEFORE any RC reset) — mode={} ::",
+        P,
+        if deep { "DEEP (usbdebug: full RC register dump + RC-claim witness)" } else { "SUMMARY (default-quiet: 2 gate registers only; build UNAOS_USBDEBUG=1 for the full dump — PIUSB-41: each RC-APB read costs ~10s while the fw holds the RC in reset)" }
+    );
 
-    // (1) RC bridge + window registers, exactly as the firmware left them. These are the RC's OWN
-    //     register block (the 0xFD50_0000 MMIO the CPU always claims) — safe to read link-down.
+    // (1) The TWO registers the gate needs, always. These are the RC's OWN register block (the
+    //     0xFD50_0000 MMIO the CPU always claims) — safe to read link-down, just slow when the RC is
+    //     held in reset.
     // PIUSB-31 pinpoint witness: metal P40 printed the PIUSB-5 header (above) then wedged silently
     // with no further line and no MAILBOX-timeout — an UNBOUNDED CPU bus stall, not the (timeout-
     // guarded) mailbox. The very first RC-register MMIO read is the prime suspect: safe in P38's
@@ -777,25 +816,33 @@ fn dump_firmware_state() {
     serial_println!("{} piusb31: RC-reg-read enter (RGR1_SW_INIT_1 @ {:#x}) ::", P, RC_BASE + PCIE_RGR1_SW_INIT_1);
     let swinit = r(RC_BASE + PCIE_RGR1_SW_INIT_1);
     let status = r(RC_BASE + PCIE_MISC_PCIE_STATUS);
-    let buses = r(RC_BASE + 0x18);
-    let win_lo = r(RC_BASE + PCIE_MISC_CPU_2_PCIE_MEM_WIN0_LO);
-    let win_hi = r(RC_BASE + PCIE_MISC_CPU_2_PCIE_MEM_WIN0_HI);
-    let win_bl = r(RC_BASE + PCIE_MISC_CPU_2_PCIE_MEM_WIN0_BASE_LIMIT);
-    let win_bhi = r(RC_BASE + PCIE_MISC_CPU_2_PCIE_MEM_WIN0_BASE_HI);
-    let win_lhi = r(RC_BASE + PCIE_MISC_CPU_2_PCIE_MEM_WIN0_LIMIT_HI);
-    let bar2_lo = r(RC_BASE + PCIE_MISC_RC_BAR2_CONFIG_LO);
-    let bar2_hi = r(RC_BASE + PCIE_MISC_RC_BAR2_CONFIG_HI);
-    serial_println!("{} piusb31: RC-reg-read exit (10 RC-own registers read OK) ::", P);
+    serial_println!("{} piusb31: RC-reg-read exit (2 gate registers read OK) ::", P);
     let phylinkup = status & PCIE_MISC_PCIE_STATUS_PHYLINKUP != 0;
     let dl_active = status & PCIE_MISC_PCIE_STATUS_DL_ACTIVE != 0;
     serial_println!(
-        "{}   fw RC: RGR1_SW_INIT_1={:#010x} PCIE_STATUS={:#010x} (PHYLINKUP={} DL_ACTIVE={}) bus_window[0x18]={:#010x} ::",
-        P, swinit, status, phylinkup, dl_active, buses
+        "{}   fw RC: RGR1_SW_INIT_1={:#010x} PCIE_STATUS={:#010x} (PHYLINKUP={} DL_ACTIVE={}) ::",
+        P, swinit, status, phylinkup, dl_active
     );
-    serial_println!(
-        "{}   fw WIN0: LO={:#010x} HI={:#010x} BASE_LIMIT={:#010x} BASE_HI={:#010x} LIMIT_HI={:#010x} | RC_BAR2 LO={:#010x} HI={:#010x} ::",
-        P, win_lo, win_hi, win_bl, win_bhi, win_lhi, bar2_lo, bar2_hi
-    );
+
+    // (1b) The other EIGHT RC-own registers — the bus/window/BAR2 record. Diagnostic only: nothing
+    //      below reads these, and M1 reprograms every one of them from scratch moments later. At
+    //      ~10s per absorbed read on the cold-boot link-down path they are ~80s of the P60 pause,
+    //      so they run only under the knob.
+    if deep {
+        let buses = r(RC_BASE + 0x18);
+        let win_lo = r(RC_BASE + PCIE_MISC_CPU_2_PCIE_MEM_WIN0_LO);
+        let win_hi = r(RC_BASE + PCIE_MISC_CPU_2_PCIE_MEM_WIN0_HI);
+        let win_bl = r(RC_BASE + PCIE_MISC_CPU_2_PCIE_MEM_WIN0_BASE_LIMIT);
+        let win_bhi = r(RC_BASE + PCIE_MISC_CPU_2_PCIE_MEM_WIN0_BASE_HI);
+        let win_lhi = r(RC_BASE + PCIE_MISC_CPU_2_PCIE_MEM_WIN0_LIMIT_HI);
+        let bar2_lo = r(RC_BASE + PCIE_MISC_RC_BAR2_CONFIG_LO);
+        let bar2_hi = r(RC_BASE + PCIE_MISC_RC_BAR2_CONFIG_HI);
+        serial_println!("{}   fw RC (deep): bus_window[0x18]={:#010x} ::", P, buses);
+        serial_println!(
+            "{}   fw WIN0: LO={:#010x} HI={:#010x} BASE_LIMIT={:#010x} BASE_HI={:#010x} LIMIT_HI={:#010x} | RC_BAR2 LO={:#010x} HI={:#010x} ::",
+            P, win_lo, win_hi, win_bl, win_bhi, win_lhi, bar2_lo, bar2_hi
+        );
+    }
 
     // (2) LINK-DOWN GATE (the boot-P4 lesson, now law). PHYLINKUP && DL_ACTIVE are BOTH required before
     //     ANY probe past the RC register block — the child config goes through EXT_CFG forwarding to the
@@ -820,14 +867,29 @@ fn dump_firmware_state() {
         //    cannot separate them and neither could P59a's log, because none of them printed anything.
         //    These three brackets make the next boot name it: whichever `[piusb40]` line is MISSING is the
         //    stage that wedged. They are pure counter reads + serial — they add no bus traffic of their own.
+        //    PIUSB-41: P60 finally timed this witness — `stage=dump-linkdown-rc-claim took=32410ms`
+        //    for its THREE RC-APB reads (MISC_CTRL + RC_BAR2_CONFIG_LO/HI), ~10.8s each, matching the
+        //    per-read cost the enclosing dump shows. It is a pure diagnostic (read-only; M1 reprograms
+        //    MISC_CTRL/RC_BAR2 itself and proves the result with its own readback line), and its family
+        //    is confirmed — on the fw-left-RC-in-reset path it has only ever reported the firmware's
+        //    teardown. So it runs under the knob only. The BRACKET stays unconditional: the chain must
+        //    remain gap-free, and a near-zero `took=` here is itself the evidence that the stage was
+        //    skipped rather than wedged.
         let t_w = stage_begin();
-        witness_rc_cpu_claim();
+        if deep {
+            witness_rc_cpu_claim();
+        } else {
+            serial_println!(
+                "{}   RC-claim witness SKIPPED (default-quiet): 3 RC-APB reads cost ~32s on this path (P60) and only re-report the firmware teardown — build UNAOS_USBDEBUG=1 to take it ::",
+                P
+            );
+        }
         let t_w = stage_end("dump-linkdown-rc-claim", t_w);
         // Drain any latent async abort the RC-register reads could have set (the R22 sitting-2 class);
         // this dump runs BEFORE M1's reset, so nothing latent may survive into the reset sequence.
         super::exceptions::serror_drain_request("piusb: PIUSB-5 dump link-down");
         stage_end("dump-linkdown-serror-drain", t_w);
-        return;
+        return (swinit, status);
     }
     serial_println!(
         "{}   fw RC link UP (PHYLINKUP && DL_ACTIVE) — firmware left the RC live; probing child config + CAP (read-only) ::",
@@ -873,7 +935,7 @@ fn dump_firmware_state() {
         );
         witness_rc_cpu_claim();
         super::exceptions::serror_drain_request("piusb: PIUSB-5 dump poison");
-        return;
+        return (swinit, status);
     }
     let cap_length = (cap0 & 0xff) as u8;
     let hci_version = (cap0 >> 16) as u16;
@@ -883,6 +945,7 @@ fn dump_firmware_state() {
         P, cap_cpu_base, cap0, cap_length, hci_version, hcsparams1
     );
     super::exceptions::serror_drain_request("piusb: PIUSB-5 dump exit");
+    (swinit, status)
 }
 
 /// PIUSB-29: firmware DTB pointer stashed by `bringup` (the pre-heap `build_boot_info` call) for the
@@ -1010,7 +1073,9 @@ fn bringup_inner(dtb: u64) {
     //    firmware-left state before M1 destroys it with the bridge/PERST reset. boot-P4 proved the
     //    firmware tears PCIe down before handoff (RC left fully in reset, no child config, no live
     //    decode), so the adopt path is retired — the dump is a record; we always take the reset path. ──
-    dump_firmware_state();
+    //    PIUSB-42: the dump also HANDS BACK the two gate registers it reads unconditionally
+    //    (RGR1_SW_INIT_1 + PCIE_STATUS) so the discriminator below does not pay for them twice.
+    let (dump_swinit, dump_status) = dump_firmware_state();
     let t = stage_end("fw-state-dump", t);
 
     // ── PIUSB-16: the ENTRY link-state discriminator — the one-boot lever verdict. ────────────────
@@ -1029,8 +1094,26 @@ fn bringup_inner(dtb: u64) {
     //    `m1-rc-bringup`. They are RC-own APB reads on a path we have just proven can wedge silently, so
     //    an unbracketed gap here would misattribute a wedge to M1 — exactly the misreading the P59a audit
     //    is trying to prevent. Bracketed, the chain is now gap-free from the census to the end of M3.
-    let entry_status = r(RC_BASE + PCIE_MISC_PCIE_STATUS);
-    let entry_swinit = r(RC_BASE + PCIE_RGR1_SW_INIT_1);
+    //    LENS FIX (PIUSB-42): the two reads are GONE. They are now the values `dump_firmware_state`
+    //    already read, handed back from the site it reads them at unconditionally. These values are
+    //    STALE by however long the dump took — on the cold-boot link-down path that is seconds, not
+    //    microseconds. That is sound, and provably so rather than by hope: RGR1_SW_INIT_1 and
+    //    PCIE_STATUS are written by NOTHING between the two points. The dump is read-only by
+    //    construction (its whole contract is "BEFORE any RC reset"), the only writer of
+    //    RGR1_SW_INIT_1 in this file is M1, which runs strictly AFTER this discriminator and is
+    //    gated ON its verdict, and PCIE_STATUS is read-only status the RC updates only in response
+    //    to a link event M1 has not yet triggered. So the re-read could only ever have returned the
+    //    same bits — while the firmware holds the RC in reset each absorbed RC-APB read runs ~10s
+    //    (PIUSB-41), so this bought AT MOST ~10.9s of nothing: that is the whole residual P60's
+    //    141.8s total leaves after the 129.688s dump and the 1.236s of m1/m2/m3, and it is SHARED
+    //    with `census-power-clock`, which P60 never separated from it. Do not quote ~21s (the naive
+    //    2 × ~10s) as measured — it exceeds that residual. This stage's own `took=`, which the
+    //    bracket still emits, is what settles the split. The witness line below is unchanged and prints the
+    //    same values it always did; only their provenance moved. The BRACKET stays: the chain must
+    //    remain gap-free, and this stage's `took=` collapsing to ~0 is itself the evidence the
+    //    duplication is gone.
+    let entry_status = dump_status;
+    let entry_swinit = dump_swinit;
     stage_end("entry-link-discriminator", t);
     let up_mask = PCIE_MISC_PCIE_STATUS_PHYLINKUP | PCIE_MISC_PCIE_STATUS_DL_ACTIVE;
     let link_up_at_entry = !is_poison(entry_status) && (entry_status & up_mask) == up_mask;

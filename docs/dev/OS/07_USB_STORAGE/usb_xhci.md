@@ -694,6 +694,84 @@ pointed the finger at M1.
   mean the aborts are individually cheap but numerous, a different shape of problem than the one this
   arc reasoned from.
 
+### 5h. PIUSB-41/42 — the P60 verdict: the pause was our own diagnostic dump
+
+**The measurement.** P60 is the first real cold-boot run of the 5g bracket chain, and it settles the
+watch-list above. Total PCIe/VL805 bring-up: **141.8 s**. The stage table:
+
+| Stage | `took=` | Reading |
+| --- | --- | --- |
+| `fw-state-dump` | **129 688 ms** | the pause |
+| `dump-linkdown-rc-claim` | **32 410 ms** | nested inside the above |
+| `m1-rc-bringup` | 340 ms | functional, fast |
+| `m2-enumerate-vl805` | 564 ms | functional, fast |
+| `m3-attach-xhci` | 332 ms | functional, fast |
+| `m3-xhci-handoff` / `enum-xhci-handoff` | 18 ms / 21 ms | no 2.8 s multiple |
+
+Three prior hypotheses die on this table. The `m2-mmio-verify` + `m3-cap-probe` ladders are **not**
+where the time goes — M2 and M3 together are under a second. The shared `hw_wait_budget()` escalation
+is **refuted**: the handoffs cost tens of milliseconds, not 2.8 s multiples, so nothing needs to go to
+the owning lane. And the pause is not in bring-up at all: **every functional stage is fast.** The
+carriers are both *our own read-only diagnostic dump* on the link-down path.
+
+**The mechanism.** `dump_firmware_state`'s link-down path performs **13 bare RC-APB reads** — ten in
+the register dump plus three in `witness_rc_cpu_claim`. 129.7 s / 13 ≈ **10 s per read**, and the
+nested figure agrees independently: 32.41 s / 3 ≈ 10.8 s per read. So when the firmware hands us
+`RGR1_SW_INIT_1=0x3` (INIT_GENERIC|PERST — the RC held in reset, `PHYLINKUP=false`), the RC's **own**
+APB block does not answer promptly either: each 32-bit load is absorbed by the bridge's
+completion-timeout machinery and stalls the CPU ~10 s. This is the boot-P4 mechanism, but applied to
+the RC register block rather than to downstream/outbound cycles — the link-down gate never claimed to
+protect against it, because RC-own reads had always been assumed safe *and* cheap. They are safe. They
+are not cheap.
+
+Two consequences follow. First, `MMIO_LADDER_BUDGET_MS` does **not** apply here: these are bare `r()`
+loads, and the 60 ms wall only caps `mmio_settle_read` ladders. Second — the important one — the cost
+is **linear in the number of registers we choose to dump**. The pause was never a hardware budget; it
+was a per-register price multiplied by a diagnostic we had no reason to keep paying every boot.
+
+**The fix (default-quiet law).** The dump's family is confirmed: on the fw-left-RC-in-reset path it
+has only ever reported the firmware's teardown, and M1 reprograms every register it reads moments
+later, proving the result with its own readback line. So:
+
+- the eight extra RC-own register reads (bus window, WIN0 ×5, RC_BAR2 ×2) and the whole
+  `witness_rc_cpu_claim` witness now require the **`usbdebug`** feature (`UNAOS_USBDEBUG=1`);
+- the default path reads only the **two** registers the gate genuinely needs — `RGR1_SW_INIT_1` and
+  `PCIE_MISC_PCIE_STATUS`, which drive both the link-down gate and PIUSB-16's discriminator — and
+  prints one summary line naming the mode and the knob;
+- the skipped witness prints a one-line placeholder saying what it would have cost and how to get it.
+
+Expected cold-boot effect: the link-down path's **13 slow reads become 2**, so `fw-state-dump` should
+fall from 129 688 ms to **~20 s** (2 × ~10 s). The per-read price is self-consistent inside P60 and is
+not a single division: the dump's *own* ten reads cost 129.688 − 32.410 = **97.3 s ≈ 9.7 s each**, and
+the nested witness's three cost **32.41 / 3 ≈ 10.8 s each**.
+
+**What did not change.** No bring-up step, mandated settle, ordering, or protection is touched; the
+link-down gate is the same gate reading the same two registers; the fail-closed branches are
+unchanged. Every `[piusb40]` bracket still emits `stage=… took=…`, so the 5g wedge-localization
+property survives intact — and on the skipped path a near-zero `dump-linkdown-rc-claim took=` is now
+itself the evidence that the stage was *skipped* rather than *wedged*.
+
+**Composed with PIUSB-42 — the discriminator stops paying twice.** PIUSB-41 left one residual: PIUSB-16's
+`entry-link-discriminator` re-read the same two registers microseconds after the dump read them, with no
+intervening write. That is now fixed in the same change. `dump_firmware_state` **returns**
+`(RGR1_SW_INIT_1, PCIE_STATUS)` — the pair it reads unconditionally, above the `deep` gate, on every path
+including both early returns — and the discriminator consumes it instead of re-reading. The values are
+seconds stale by then, and that is sound by construction rather than by hope: the dump is read-only
+("BEFORE any RC reset" is its whole contract), the only writer of `RGR1_SW_INIT_1` here is M1, which runs
+strictly *after* the discriminator and gated *on* its verdict, and `PCIE_STATUS` only moves on a link event
+M1 has not yet triggered. Same gate, same verdict, same PIUSB-16 witness line with the same values.
+
+**How much that second fix is worth is bounded, not extrapolated — and the two numbers disagree.** A
+uniform 2 × ~10 s per-read extrapolation predicts ~21 s, but P60's own total does not leave room for it:
+141.8 s − 129.688 s (dump) − 1.236 s (m1 340 + m2 564 + m3 332) = **10.9 s for `census-power-clock` *plus*
+the discriminator combined**. So the duplicated pair cost **at most ~10.9 s**, and ~21 s must not be
+quoted as measured. P60's table does not cite the stage's own `took=` — the stage *is* bracketed (5g added
+it), the figure simply was not carried across — so the split between the census and the discriminator is
+unresolved in the evidence we have. Consequently the expected composed cold-boot total is a **band, ~21 s
+to ~32 s** (down from 141.8 s), its width being exactly that unresolved split. The next cold boot settles
+it directly: the bracket stays, so `entry-link-discriminator took=` collapsing to ~0 while
+`census-power-clock` shows its true cost separates the two for good.
+
 ---
 
 ## 6. Enumeration robustness (metal-informed)
