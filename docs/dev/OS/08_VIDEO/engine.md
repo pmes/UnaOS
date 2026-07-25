@@ -1019,10 +1019,27 @@ reason of one having zeroed the fourth byte under an alpha mode that reads it.
 - **both clean, crystal still garbled** ⇒ neither addressing nor geometry; the defect is specific to the
   window path (surface contents at scan time, or a writer WC-E did not order).
 
+In the **divergent** case the right-hand block deliberately leaves its rectangle: `pad > 0` means
+`geom_row < k_row`, so each row lands at a lower offset and the block drifts *upward* out of the bottom
+strip. That is the displacement the probe exists to make visible — clamping it would erase the finding —
+so it is accepted rather than fixed, at the cost of the overlap guard's coverage on a padded boot.
+`direct_lands_row=` states where the block's first row actually came out under the kernel's row step, so
+the operator knows which part of the panel to photograph and which garble is the probe's own.
+
 **A comparison that cannot be made is counted, never dropped.** An out-of-range offset increments
 `skipped`; `PASS` requires `skipped == 0`, `lost == 0`, and `checked` equal to the full expected count
 (8192). Without that, a probe whose every read fell outside the mapping would report `comp_bad=0` — which
 reads exactly like agreement, the one way a witness can lie.
+
+**Every line is one-shot, and a retryable condition never prints SKIP.** The probe fires from a path
+that runs hundreds of times per boot, so this is not tidiness. `SKIP` is reserved for **terminal** causes
+— no framebuffer, no recorded firmware truth, a layout with no 4-byte RGB pixel, a panel too small — which
+nothing later in the boot can change; it prints once and latches. A window sitting over the probe strip is
+**retryable**: it emits a one-shot `-> DEFER` (which the spec deliberately does not forbid) and the probe
+keeps trying every composite. Conflating the two broke twice over: a run that deferred early and passed
+later would carry both lines and trip the unconditional `FORBID … -> SKIP` while being perfectly healthy,
+and a window that never moves — a full-screen compat surface — would emit one line per composite pass,
+unbounded. The geometry report latches independently of both, so it fires on the first pass regardless.
 
 **Cost and collision discipline.** The probe runs only from composite passes that already drew something,
 so its ~12 K stores and row cleans fall where work is happening anyway rather than being charged to every
@@ -1045,7 +1062,7 @@ and is safe only during single-core boot — so the read happens at bring-up and
 
 #### WC-F gate results (2026-07-25, QEMU raspi4b, forced bench geometry)
 
-`./arroyo check` green both arches · `./arroyo kernel8` clean, zero `wc-f` strings (armed build: five) ·
+`./arroyo check` green both arches · `./arroyo kernel8` clean, zero `wc-f` strings (armed build: six) ·
 `UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test 120` → MBENCH **55/55 required, 0 forbidden**, on a
 spec grown by this arc's two REQUIREs. Both verdicts PASS.
 

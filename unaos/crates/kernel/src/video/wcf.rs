@@ -72,9 +72,14 @@
 //!
 //! `witness`-gated and aarch64-only: knob-off, this module does not compile and the Pi media are
 //! byte-identical. It runs only from composite passes that already drew something (so it adds no work
-//! to an idle desktop), only when no live window overlaps its region, repaints so a later flush cannot
-//! erase it before the panel is photographed, and prints exactly once — latching only on a pass that
-//! actually produced a verdict. Every path emits a line: `PASS`, `FAIL`, or `-> SKIP` with a reason.
+//! to an idle desktop), only when no live window overlaps its region, and repaints so a later flush
+//! cannot erase it before the panel is photographed.
+//!
+//! **Every line is one-shot, and a retryable condition never prints `SKIP`.** The probe runs from a
+//! path that executes hundreds of times per boot, so an unlatched print is a flood and a `SKIP` emitted
+//! before a later `PASS` is a false red against the spec's `FORBID`. See [`WITNESSED`] for the
+//! terminal-vs-retryable split: terminal causes latch a one-shot `SKIP`, an overlapping window emits a
+//! one-shot `DEFER` and keeps retrying, and the geometry report latches independently of both.
 //!
 //! Firmware is not re-queried from here: the property mailbox uses one static buffer with no lock and
 //! is safe only during single-core boot, while this runs from composite (post-SMP, syscall context).
@@ -183,10 +188,30 @@ fn load3(base: usize, len: usize, off: usize) -> Option<[u8; 3]> {
     }
 }
 
-/// Whether a verdict has been printed. Set only by a pass that produced one — a SKIP pass must not
-/// burn the latch, or a transient condition (a window sitting over the region on the first composite)
-/// would silence the witness for the whole boot.
+/// Whether the twin probe has said its final word — a verdict, or a TERMINAL skip.
+///
+/// Three latches, not one, because the three lines have three different lifetimes and conflating them
+/// is how a diagnostic starts lying. The distinction that matters is **terminal vs retryable**:
+///
+/// - *Terminal* — no framebuffer, no recorded firmware truth, a layout with no 4-byte RGB pixel, a
+///   panel too small. Nothing later in the boot changes any of these, so `SKIP` is the final answer:
+///   print it once and latch.
+/// - *Retryable* — a live window is sitting over the strip. That is a property of this instant, not of
+///   the boot; the next composite may well be clear. Printing `SKIP` here would be wrong twice over: a
+///   run that later PASSes would carry both lines, tripping the spec's unconditional
+///   `FORBID … -> SKIP` on a perfectly good boot, and a window that stays put (a full-screen compat
+///   surface never moves) would emit one line per composite pass, unbounded. So the retryable case
+///   emits a one-shot `DEFER` token the spec does not forbid, then stays silent and keeps trying.
 static WITNESSED: AtomicBool = AtomicBool::new(false);
+
+/// Whether the one-shot `DEFER` token has been emitted. Separate from [`WITNESSED`]: deferring must not
+/// prevent the verdict that a later, clear pass can still produce.
+static DEFERRED: AtomicBool = AtomicBool::new(false);
+
+/// Whether the `[wc-f] scanout` line has been printed. Separate again: the geometry report answers a
+/// question that has nothing to do with whether the strip happens to be clear this instant, so it must
+/// fire on the first pass regardless — and exactly once, however many passes defer afterwards.
+static GEOM_WITNESSED: AtomicBool = AtomicBool::new(false);
 
 /// The panel rectangles WC-F paints into: the twin blocks, then the slope marker. `None` when the
 /// panel is too small to hold them. The caller (`wm::composite_inner`) uses these to refuse to run the
@@ -222,7 +247,7 @@ pub fn run(fb: &FrameBuffer, region_clear: bool) {
     let len = fb.len();
     let truth = mailbox::scanout_truth();
 
-    if !done {
+    if !GEOM_WITNESSED.swap(true, Ordering::Relaxed) {
         report_geometry(&truth, base, len, pw, ph, info.stride, bpp);
     }
 
@@ -236,11 +261,22 @@ pub fn run(fb: &FrameBuffer, region_clear: bool) {
     let paintable =
         base != 0 && truth.valid && bpp == 4 && fmt_ok && geom_row != 0 && boxes.is_some();
 
-    if !paintable || !region_clear {
-        if !done {
+    // Terminal: nothing later in this boot can change any of these. Say so once and stop.
+    if !paintable {
+        if !WITNESSED.swap(true, Ordering::Relaxed) {
             serial_println!(
-                "[wc-f] twin -> SKIP (panel={}x{} bpp={} fmt_ok={} truth_valid={} geom_row={} fits={} region_clear={})",
-                pw, ph, bpp, fmt_ok, truth.valid, geom_row, boxes.is_some(), region_clear
+                "[wc-f] twin -> SKIP (panel={}x{} bpp={} fmt_ok={} truth_valid={} geom_row={} fits={})",
+                pw, ph, bpp, fmt_ok, truth.valid, geom_row, boxes.is_some()
+            );
+        }
+        return;
+    }
+    // Retryable: a window is over the strip right now. One token, then silence — and no latch, so a
+    // later clear pass still produces the verdict.
+    if !region_clear {
+        if !DEFERRED.swap(true, Ordering::Relaxed) {
+            serial_println!(
+                "[wc-f] twin -> DEFER (a live window overlaps the probe strip; retrying every composite until it clears)"
             );
         }
         return;
@@ -266,6 +302,16 @@ pub fn run(fb: &FrameBuffer, region_clear: bool) {
     }
 
     // --- RIGHT: the same pattern, stepped by the GEOMETRY row, straight into the mapping.
+    //
+    // In the DIVERGENT case this block deliberately leaves the reserved rectangle, and that is the
+    // point rather than a bug: `pad > 0` means `geom_row < k_row`, so each successive row lands at a
+    // lower offset than the compositor would have used and the block drifts UPWARD out of the bottom
+    // strip. Clamping it back would erase the very displacement the probe exists to make visible. What
+    // that costs is the overlap guard's coverage — a divergent boot can scribble this block over a
+    // window higher up the panel. Accepted, and bounded three ways: it only happens when the firmware
+    // pads (`pad=` says so on the scanout line, which prints first), it is a `witness` build only, and
+    // `direct_lands_row=` below states where the block's first row actually came out under the kernel's
+    // row step, so the operator knows which part of the panel to photograph and which garble is ours.
     let mut direct_lost = 0usize;
     for row in 0..BLK {
         for col in 0..BLK {
@@ -283,7 +329,7 @@ pub fn run(fb: &FrameBuffer, region_clear: bool) {
     }
 
     // --- The slope marker, whose PHOTOGRAPHED slope is the hardware's row step.
-    ramp(base, len, info.pixel_format, k_row, rax, ray);
+    let ramp_lost = ramp(base, len, info.pixel_format, k_row, rax, ray);
 
     // Push the touched regions out to the memory the HVS scans. The ranges are cleaned — and later
     // invalidated — SEPARATELY, never as one convex hull: when `geom_row > k_row` the hull spans rows
@@ -366,16 +412,16 @@ pub fn run(fb: &FrameBuffer, region_clear: bool) {
     let ok =
         comp_bad == 0 && direct_bad == 0 && skipped == 0 && direct_lost == 0 && checked == EXPECTED;
     serial_println!(
-        "[wc-f] twin left=comp@stride({},{}) right=direct@geomrow({},{}) blk={}x{} scale={}x panel={}x{} k_row={}B geom_row={}B alloc_pitch={}B checked={}/{} skipped={} lost={} comp_bad={} direct_bad={} first=({},{}) got={:#08x} want={:#08x} -> {}",
-        lx, ly, rx, ly, BLK, BLK, SCALE, pw, ph,
+        "[wc-f] twin left=comp@stride({},{}) right=direct@geomrow({},{}) direct_lands_row={} blk={}x{} scale={}x panel={}x{} k_row={}B geom_row={}B alloc_pitch={}B checked={}/{} skipped={} lost={} comp_bad={} direct_bad={} first=({},{}) got={:#08x} want={:#08x} -> {}",
+        lx, ly, rx, ly, (ly * geom_row) / k_row.max(1), BLK, BLK, SCALE, pw, ph,
         k_row, geom_row, truth.alloc_pitch,
         checked, EXPECTED, skipped, direct_lost, comp_bad, direct_bad,
         first_bad.0, first_bad.1, first_bad.2, first_bad.3,
         if ok { "PASS" } else { "FAIL" }
     );
     serial_println!(
-        "[wc-f] ramp origin=({},{}) rows={} byte_step={}B nominal=1px/row :: photograph the slope — a bend of d/4 px per row means the HVS row step is k_row+d, whatever the firmware reported",
-        rax, ray, RAMP_ROWS, k_row + 4
+        "[wc-f] ramp origin=({},{}) rows={} byte_step={}B nominal=1px/row marks={} lost={} :: photograph the slope — a bend of d/4 px per row means the HVS row step is k_row+d, whatever the firmware reported",
+        rax, ray, RAMP_ROWS, k_row + 4, RAMP_ROWS * 2, ramp_lost
     );
 
     // Latch only now, on a pass that actually produced a verdict.
@@ -390,19 +436,30 @@ pub fn run(fb: &FrameBuffer, region_clear: bool) {
 /// number on the serial wire can be, since every one of those is the firmware describing itself.
 ///
 /// Ticked white every 16th mark so rows can be counted off the photograph.
-fn ramp(base: usize, len: usize, fmt: PixelFormat, k_row: usize, x0: usize, y0: usize) {
+///
+/// Returns the number of marks that did NOT land (offset past the mapping). The whole value of this
+/// construct is what it looks like on a photograph, so "is the marker actually on the panel?" has to be
+/// answerable from the log — otherwise an operator photographs a blank strip and cannot tell a clean
+/// scan-out from a marker that was never drawn.
+fn ramp(base: usize, len: usize, fmt: PixelFormat, k_row: usize, x0: usize, y0: usize) -> usize {
     let start = y0 * k_row + x0 * 4;
+    let mut lost = 0usize;
     for i in 0..RAMP_ROWS {
         let color =
             if i % 16 == 0 { 0x00FF_FFFF } else { 0x0000_FF80 | ((i as u32 & 0xFF) << 16) };
         let px = match bytes_of(fmt, color) {
             Some(p) => p,
-            None => return,
+            None => return lost + (RAMP_ROWS - i) * 2,
         };
         let off = start + i * (k_row + 4);
-        store3(base, len, off, px);
-        store3(base, len, off + 4, px);
+        if !store3(base, len, off, px) {
+            lost += 1;
+        }
+        if !store3(base, len, off + 4, px) {
+            lost += 1;
+        }
     }
+    lost
 }
 
 /// The geometry half: the live `FrameBuffer` beside the firmware's recorded answers.

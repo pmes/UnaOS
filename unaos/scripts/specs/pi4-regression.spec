@@ -260,17 +260,27 @@ FORBID \[wc-e\] fb-geometry query FAILED
 #
 # --- 6. WC-F: the INDEPENDENT read. WC-E states the firmware's geometry; nothing checked it against
 # ---    the `FrameBuffer` the compositor actually addresses through, which is a separate object and
-# ---    can diverge in base, mapped length or stride with no witness able to see it. `[wc-f] scanout`
-# ---    puts the live handle beside the firmware's record and names each identity — `base_match`
-# ---    (we store into the buffer the firmware allocated), `rowbytes_match` (`stride * bpp` equals
-# ---    the pitch the HVS steps by — the row-phase identity a garble breaks), `pitch_match` (the
-# ---    allocation pitch survives an independent re-query), `panel_match`, `fits`.
+# ---    can diverge in base, mapped length or row step with no witness able to see it.
+# ---    NOTE what is deliberately NOT pinned here: `stride * bpp == pitch` is an IDENTITY of
+# ---    init_framebuffer (`stride = pitch / 4`), not an observation — it cannot be false, and the
+# ---    arc's first cut pinned exactly that and proved nothing. The load-bearing field on
+# ---    `[wc-f] scanout` is `rowstep_match`: `stride * bpp` against `virt_w * 4`, a row step derived
+# ---    from the reported GEOMETRY rather than from the pitch reply, false exactly when the firmware
+# ---    pads a row the compositor ignores (`pad=` gives the bytes).
 # ---    `[wc-f] twin` renders one known pattern TWICE at the bench's 4x upscale — left through
-# ---    `put_pixel`/`info.stride` (the compositor's addressing), right through raw stores at the
-# ---    FIRMWARE pitch — and cross-reads each block through the other path. `comp_bad`/`direct_bad`
-# ---    are the two addressings disagreeing, as a count; on the bench panel the same probe reads as
-# ---    a photo (left garbled + right clean ⇒ blit path; both garbled ⇒ HVS/pitch).
-# ---    Both lines exist under the `witness` feature only. See docs/dev/OS/08_VIDEO/engine.md §WC-F.
+# ---    put_pixel/info.stride (the compositor's addressing), right through raw stores stepped by
+# ---    `virt_w * 4` — and cross-reads each block through the other path. comp_bad/direct_bad are the
+# ---    two addressings disagreeing; PASS also requires skipped=0, lost=0 and the full checked count,
+# ---    so a probe that compared nothing cannot read as agreement.
+# ---    A third line, `[wc-f] ramp`, carries no verdict and is not pinned: its value is the
+# ---    PHOTOGRAPHED slope of a marker stepped k_row+4 bytes per mark, which measures the row step the
+# ---    HVS actually uses — the one reading no serial number can give, since every number on this wire
+# ---    is downstream of the firmware's own claim. `lost=` on it says the marker reached the panel.
+# ---    SKIP is TERMINAL only (no framebuffer, no firmware truth, unusable layout, panel too small) and
+# ---    is therefore forbidden. A window sitting over the probe strip is retryable, not terminal: it
+# ---    emits a one-shot `-> DEFER` — deliberately NOT forbidden — and the probe keeps trying, so a run
+# ---    that defers early and passes later stays green.
+# ---    All three lines exist under the `witness` feature only. See docs/dev/OS/08_VIDEO/engine.md §WC-F.
 REQUIRE \[wc-f\] scanout .*-> PASS
 FORBID \[wc-f\] scanout .*-> FAIL
 FORBID \[wc-f\] scanout -> SKIP
