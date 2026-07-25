@@ -855,6 +855,15 @@ pub unsafe fn teardown_user_slot(asid: u64) {
     // ASID is already off this core's live TTBR0 (repointed above), and no task runs under it (the owner is
     // exiting), so nothing observes a torn intermediate state.
     super::syscall::clear_handle_row(asid);
+    // VUG-BG teardown-clear: same funnel, same ordering rationale, same reason. The DETACHED bit is
+    // per-ASID state, and ASIDs are RECYCLED — so a slot last used by a `bg` spawn would otherwise hand
+    // its stale bit to whatever claims the slot next, and that next tenant would read "I was launched
+    // detached" and (for VUG.ELF) never stop. `run_user_image` and `spawn_user_image_bg` both write the
+    // bit explicitly, which covers the two paths that can launch a FAT-loaded image; this clear is what
+    // covers every OTHER producer of an EL0 address space — `sys_spawn`'s `load_program_into_slot` and
+    // the dozen in-kernel `alloc_user_slot` fixture launchers — without asking each of them to remember.
+    // One durable line at the funnel beats a rule every future launcher has to be told about.
+    super::syscall::clear_detached(asid);
     SLOT_USED[(asid - 1) as usize].store(false, Ordering::Release);
 }
 

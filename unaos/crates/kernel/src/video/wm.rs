@@ -1209,7 +1209,10 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window) {
 
     // Restore what the `IVAC` may have dropped: redraw the window and re-run its flush. In a correct build
     // this is a no-op repaint; in a broken one it is what keeps the diagnostic from being destructive.
-    draw_window(fb, r, focus_asid() != 0 && focus_asid() == r.owner_asid);
+    // FOCUS-HL: ONE snapshot, as `composite_inner` takes. Reading the atomic twice in a single expression
+    // could straddle a focus change and evaluate the two halves against different owners.
+    let focus = focus_asid();
+    draw_window(fb, r, focus != 0 && focus == r.owner_asid);
 }
 
 /// WC-D — window ids whose [`verify_window`] verdict has already been emitted (bit `id`), so the read-back
@@ -1582,6 +1585,14 @@ pub fn focusvis_selftest() {
     // (Not a strict necessity — `next_z` only moves forward, so any window created after this is above
     // it either way; this keeps the invariant readable rather than relying on that.)
     SHELL_Z.store(0, Ordering::Release);
+    // FOCUS-HL: restore the focus owner for the same reason, and in the same breath. This selftest calls
+    // `focus_changed` with SYNTHETIC ASIDs (0xF0A/0xF0B), so it leaves `FOCUS_ASID` naming an address
+    // space that does not exist and never will. It is inert in practice — no real ASID can collide with
+    // those values, so no window is wrongly highlighted — but it makes the documented invariant ("0 means
+    // the shell holds focus") false for the rest of the boot, and the `repaint` immediately below would
+    // composite the whole live set against a focus owner that is pure fiction. Restoring it costs one
+    // store and keeps the selftest's footprint at zero, which is what a selftest owes.
+    FOCUS_ASID.store(0, Ordering::Release);
     // ...and REPAINT, because the store alone leaves a hole. This selftest's `focus_changed(0)` leg
     // pushed EVERY live window below the shell, not only its own two: a window belonging to a real
     // backgrounded app was erased to the desktop colour, and `composite_inner` consumed its damage flag

@@ -3169,6 +3169,42 @@ fn proc_reserve() -> Option<usize> {
             return Some(i);
         }
     }
+    // BGRUN-SCAV: no FREE row. Before failing, reclaim a row belonging to a program that has ALREADY
+    // EXITED and that nobody has reaped. BGRUN-1's stated position was that holding those rows is
+    // "honest: a shell that never runs `jobs` eventually gets 'process table full', not silent loss" —
+    // and that is right about the STATUS, but it makes a table of CORPSES indistinguishable from a table
+    // of running programs at the point where it matters most: `MAX_PROCS` is 4, so four short-lived
+    // launches with no intervening `jobs` deny the operator the very shell verb that would clear them.
+    //
+    // The trade is explicit, and it is the lesser loss: an unobserved EXIT STATUS is dropped (a later
+    // `jobs` prints `gone` for that pid rather than `exited N`), and in exchange a launch that the
+    // machine has the resources to satisfy is not refused. Never silent — the reclaim prints.
+    //
+    // Ordering matters. The CAS PEXITED->PRUNNING is what makes this safe to race against `jobs`: the row
+    // is claimed by exactly ONE of the two, so the reap-once invariant is preserved rather than weakened
+    // (a scavenged row's `jobs` entry takes the `Gone` arm, which already exists for exactly this case).
+    // The `done` permit is consumed here for the same reason `bg_poll(reap=true)` consumes it — a reused
+    // entry must start at zero permits. It cannot block: `PEXITED` is published strictly AFTER the permit
+    // is posted on every path that sets it, and the CAS means no one else can have taken it.
+    for i in 0..MAX_PROCS {
+        if PROCS[i]
+            .state
+            .compare_exchange(PEXITED, PRUNNING, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let stale_pid = PROCS[i].pid.load(Ordering::Acquire);
+            let stale_status = PROCS[i].status.load(Ordering::Acquire);
+            let _ = PROCS[i].done.wait();
+            PROCS[i].pid.store(0, Ordering::Release);
+            PROCS[i].status.store(0, Ordering::Release);
+            PROCS[i].asid.store(0, Ordering::Release);
+            serial_println!(
+                ":: BGRUN-SCAV: process table full — reclaimed row {} from EXITED unreaped pid={} (status={} DISCARDED; `jobs` will read `gone`) ::",
+                i, stale_pid, stale_status
+            );
+            return Some(i);
+        }
+    }
     None
 }
 
@@ -9280,6 +9316,59 @@ fn bgrun_witness(_demo_cpu: usize) {
             }
         }
     }
+    // Leg 1b (BGRUN-SCAV): SLOT RECLAIM. Leg 1 proves ONE exited row reaps. It cannot prove the property
+    // the operator actually hit: launch short-lived bg programs WITHOUT running `jobs` between them, and
+    // the exited-unreaped rows accumulate until `proc_reserve` has nothing left to hand out — a table of
+    // corpses reads exactly like a table of running programs, and the spawn fails with
+    // "process table full (run `jobs` to reap exited background programs)". With MAX_PROCS = 4 that is
+    // four launches deep.
+    //
+    // The leg spawns ELFHELLO `MAX_PROCS + 2` times, waiting for each to EXIT but deliberately never
+    // reaping, and REQUIREs every spawn to succeed. Without the scavenge in `proc_reserve` this fails on
+    // the launch after the table fills — which is the point: the leg is written to go red on the bug.
+    {
+        let mut spawned = 0usize;
+        let mut failed_at = usize::MAX;
+        for n in 0..(MAX_PROCS + 2) {
+            match spawn_user_image_bg(&hello) {
+                Err(_) => {
+                    failed_at = n;
+                    break;
+                }
+                Ok((pid, _asid, _entry)) => {
+                    spawned += 1;
+                    // Wait for it to EXIT, and pointedly do NOT reap it — leaving the row claimed is the
+                    // condition under test.
+                    let t0 = super::timer::cntpct();
+                    let budget = super::timer::cntfrq().saturating_mul(5);
+                    while matches!(bg_poll(pid, false), BgPoll::Running) {
+                        if super::timer::cntpct().wrapping_sub(t0) >= budget {
+                            break;
+                        }
+                        super::sched::yield_now();
+                    }
+                }
+            }
+        }
+        if spawned == MAX_PROCS + 2 {
+            serial_println!(
+                ":: BGRUN-ST: slot reclaim PASS ({} bg launches, none reaped, no false table-full) ::",
+                spawned
+            );
+        } else {
+            serial_println!(
+                ":: BGRUN-ST: slot reclaim — spawn {} of {} refused (table full on corpses) -> FAIL ::",
+                failed_at, MAX_PROCS + 2
+            );
+        }
+        // Leave the table clean for the legs below: reap whatever this leg left behind.
+        for pi in 0..PROCS.len() {
+            if PROCS[pi].state.load(Ordering::Acquire) == PEXITED {
+                let pid = PROCS[pi].pid.load(Ordering::Acquire);
+                let _ = bg_poll(pid, true);
+            }
+        }
+    }
     // Leg 2: kill mid-run. UVUG runs 300 frames — seconds of runtime, syscalls every frame, so the
     // kill lands on a live target with abundant boundaries.
     let Some(uvug) = read(&mt, "/fat/VUG.ELF") else {
@@ -9829,6 +9918,14 @@ fn set_detached(asid: u64, on: bool) {
     } else {
         DETACHED_ASIDS.fetch_and(!bit, Ordering::Release);
     }
+}
+
+/// VUG-BG — clear ASID `asid`'s detached bit. Called from `boot::teardown_user_slot`'s FINAL-release arm
+/// (beside `clear_handle_row`, and before `SLOT_USED` is released for the same ordering reason), so every
+/// address space starts its life not-detached regardless of which launcher created it.
+#[cfg(feature = "baremetal")]
+pub fn clear_detached(asid: u64) {
+    set_detached(asid, false);
 }
 
 /// VUG-BG — is ASID `asid` a detached (backgrounded) address space?

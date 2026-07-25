@@ -274,6 +274,9 @@ FORBID \[wc-fv\] focus-vis .*-> FAIL
 # ---   races its own exit. Leg 3 keeps the persistence proof regardless: KVUG.ELF has no exit condition
 # ---   AT ALL, focused or not, where VUG's persistence is conditional on the detached bit.
 REQUIRE BGRUN-ST: spawn->exit->reap PASS
+# --- BGRUN-SCAV: exited-but-unreaped rows must not deny a launch the machine can satisfy. MAX_PROCS+2
+# ---   bg launches with NO intervening reap; every one must succeed. Goes red on the pre-fix kernel.
+REQUIRE BGRUN-ST: slot reclaim PASS
 REQUIRE BGRUN-ST: kill mid-run PASS \(pid=[0-9]+, killed — row reaped
 REQUIRE BGRUN-ST: persist\+kill PASS \(pid=[0-9]+,
 FORBID BGRUN-ST: .*-> FAIL

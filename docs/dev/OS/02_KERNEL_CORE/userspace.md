@@ -622,6 +622,18 @@
     header** (magic, w, h, stride, format, size, surface-offset at offset 0), so the existing `VUG.ELF`
     binary runs unchanged. Per-window geometry is published alongside it at `0x40 + rslot*0x20`
     (magic, win id, w, h, stride, format, surface-offset), zeroed on close so EL0 can tell live from stale.
+    The **canonical info-page layout**, in one place:
+
+    | offset | contents |
+    | :--- | :--- |
+    | `0x00`–`0x1B` | legacy ELF-3 header — magic, w, h, stride, format, size, surface-offset (describes region slot 0) |
+    | `0x20` | **VUG-BG process flags** — bit 0 = `DETACHED` (launched by `bg`, not `run`); rest reserved, zero |
+    | `0x24`–`0x3F` | reserved, zero |
+    | `0x40 + rslot*0x20` | per region slot — magic, win id, w, h, stride, format, surface-offset; magic 0 = no live window |
+
+    Both info-page publishers write the flags word (the legacy header is only refreshed for region slot 0,
+    so the per-window publisher writes it too — a process whose first window landed on a higher slot would
+    otherwise read a zeroed, i.e. wrongly "not detached", word).
     `SYS_FB_PRESENT` deliberately does **not** require a window-table row — it presents the region-slot-0
     surface with the legacy accounting either way, so the ELF-3 fb-test verdict cannot regress on table
     exhaustion.
@@ -1014,6 +1026,50 @@
       the windows of the ASID that is LOSING focus, which the raise never touches (and which the shell
       branch does not raise at all). Without that the old holder would keep the bright chrome until
       something unrelated happened to damage it.
+- **BGRUN-SCAV (this arc)** — P59b sent back two bench observations. **One of them is not a bug**, and
+  saying so is the more useful finding; the other is real and is fixed here.
+  - **NOT A BUG: "`jobs` reports `running` for a process that already exited."** The proposed mechanism
+    was that a row's state is only updated when something reaps it. **Measured, and false.** `SYS_EXIT`
+    stores `PEXITED` and posts `done` before the task retires, and `BGRUN-ST` leg 1 already asserts
+    exactly the claimed-broken property — a **non-reaping** `bg_poll` on an exited bg ELFHELLO returns
+    `Exited(0)` — and has passed on every gate run in this repo's history.
+    - The multithreaded case (a bg'd `VUG.ELF`, which is what the operator actually launched) was the one
+      genuinely untested gap, so it was measured directly rather than argued: with the detached bit
+      temporarily disabled to restore pre-arc behaviour, a probe polled a backgrounded vug non-reapingly
+      until it flipped. It **flipped to non-running at ~3 s**, and the vug's own
+      `:: UVUG: frames=300 … ::` witness printed. The row is not stale; the program was simply still
+      running.
+    - **Why 3 s and not "instant".** An unfocused vug still renders all 300 frames; it just gets less CPU
+      and no input. So `jobs` saying `running` 1–3 s after the launch was **honest**, and `kill` finding a
+      live target "every time" is the consistent reading, not a contradiction of it.
+    - **Where the `dur=0s` came from.** `[gui] app-exit … dur=0s wedged=false` is emitted by
+      `gui_watchdog`, which tracks the **foreground GUI session** (`main.rs`'s `on_app_enter`/
+      `on_app_exit` around the screen handover). It says nothing about background processes. Correlating
+      those lines with the two bg'd vugs is what produced the "they exited instantly" reading.
+  - **REAL, and fixed: exited-unreaped rows deny launches.** BGRUN-1 held that a row stays claimed until
+    `jobs` reaps it, and called the resulting "process table full" *honest* — right about the exit STATUS,
+    wrong about the ergonomics. `MAX_PROCS` is **4**, so four short-lived `bg` launches with no
+    intervening `jobs` exhaust the table, and the operator is refused by a table of corpses with the exact
+    message `process table full (run `jobs` to reap exited background programs)`.
+    - **The fix (`BGRUN-SCAV`)** is the minimal one: when `proc_reserve` finds no `PFREE` row it makes a
+      second pass and reclaims a `PEXITED` one, via a `PEXITED -> PRUNNING` **CAS**. The CAS is what keeps
+      reap-once intact — the row is claimed by exactly one of the scavenger and `jobs`, and a scavenged
+      job's later `jobs` entry takes the pre-existing `Gone` arm. The `done` permit is consumed here for
+      the same reason the reap arm consumes it (a reused entry must start at zero permits); it cannot
+      block, because `PEXITED` is published strictly after the permit is posted on every path that sets it.
+    - **The trade, stated:** an **unobserved exit status is discarded** (a later `jobs` prints `gone`
+      rather than `exited N`) in exchange for not refusing a launch the machine can satisfy. Never silent
+      — the reclaim prints `:: BGRUN-SCAV: process table full — reclaimed row N from EXITED unreaped
+      pid=… (status=… DISCARDED; `jobs` will read `gone`) ::`.
+    - **Witness: `BGRUN-ST` leg 1b**, `+1` spec REQUIRE (59 → 60). It spawns ELFHELLO `MAX_PROCS + 2`
+      times, waits for each to exit, and pointedly **never reaps**, requiring all six to succeed. It was
+      verified to be a real instrument rather than a decoration: with the scavenge disabled the leg goes
+      **red at the fifth launch** — `slot reclaim — spawn 4 of 6 refused (table full on corpses) -> FAIL`.
+  - **VUG-BG lifecycle (lens):** the detached bit is now cleared in `boot::teardown_user_slot`'s
+    final-release arm, beside `clear_handle_row` and before `SLOT_USED` is released. ASIDs recycle, and
+    `run_user_image`/`spawn_user_image_bg` only cover the two FAT-image launchers — `sys_spawn`'s
+    `load_program_into_slot` and the in-kernel fixture launchers produce address spaces too. One line at
+    the teardown funnel beats a rule every future launcher has to remember.
 - **EXEC1-M** — the **late-publish window** in `run_user_image`, and the end of the metal-only
   `EXEC1` failure. On every real Pi 4 boot (P55b, P56) the run-path witness reported
   `:: EXEC1: run /fat/ELFHELLO.ELF — EL0 program did not exit in time -> FAIL ::`, while QEMU raspi4b
