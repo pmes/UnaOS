@@ -960,6 +960,26 @@
     0x300000, exit=0 -> PASS ::`; `./arroyo test-arm` green. Lane: `arch/aarch64/syscall.rs`
     (`run_user_image` publish order, `proc_find_unpublished`, the `SYS_EXIT` rescue arm, `proc_free` and
     `u8_kernel_check` store order) + this doc.
+- **WC-D (scan-out verification)** — the answer to a P56 bench report of a **garbled** 128×128 windowed
+  crystal while every serial witness was green. Full write-up: `docs/dev/OS/08_VIDEO/engine.md` §8 "WC-D".
+  Nothing in the userspace ABI changes; what changes is what the kernel can *prove* about it:
+  - **`[wc-d] verify` — a panel verdict, not another surface checksum.** `[wc-c]`'s checksum hashes the
+    surface an app wrote, so it can only say the app drew; it is blind to every defect between that surface
+    and the scan-out. `wm::verify_window` re-derives each destination pixel of a window's content rect from
+    the source and reads the framebuffer back **twice** — once from cache, then again after a
+    clean+invalidate so the reads come from the RAM the HVS scans. `bad_cache` isolates the blit (stride,
+    upscale indexing, colour encoding, clipping); `bad_ram` isolates the cache flush. One-shot per window,
+    `witness`-gated, and pinned in `pi4-regression.spec` as a REQUIRE plus a `-> FAIL` FORBID.
+  - **`UNAOS_FBW` / `UNAOS_FBH` — force the panel geometry.** QEMU raspi4b is 640×480 and the bench Pi is
+    1920×1200, and `wm::place` derives a window's integer upscale FROM the panel: the same 128×128 window
+    is scale **1** on the gate and scale **4** on the bench. The gate could not reach the bench's blit path
+    at all. These compile-time knobs (default off — the firmware mode is queried, unchanged) override the
+    mailbox request so `UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test` reproduces bench geometry.
+  - **What it settled.** At the bench's exact geometry the verdict is `checked=262144 bad_cache=0
+    bad_ram=0 -> PASS`, so stride/pitch, scale-blit indexing, pixel format and flush extent are *excluded*
+    as causes of the P56 garble. The remaining suspect is the part only real caches and a real HVS
+    exercise, and `bad_ram` reports it in one line on the next bench boot.
+
 - **WC-C (window compositor, clients + focus)** — the arc where real EL0 programs use the window verbs.
   Full write-up: `docs/dev/OS/08_VIDEO/engine.md` §8 "WC-C". Userspace-visible changes:
   - **UVUG is windowed.** `crates/user-uvug` drops `SYS_FB_MAP`/`SYS_FB_PRESENT` for

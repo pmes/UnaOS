@@ -136,6 +136,49 @@ impl FrameBuffer {
         }
     }
 
+    /// WC-D: the mapped base address of this surface. Needed by callers that must run cache maintenance
+    /// over a sub-range they computed themselves (the compositor's scan-out verification), which
+    /// [`flush_range`](Self::flush_range) cannot express — it only cleans, and the verification needs an
+    /// invalidate so its reads come from RAM.
+    #[inline]
+    pub fn base_addr(&self) -> usize {
+        self.base
+    }
+
+    /// WC-D: read one panel pixel back as `0x00RRGGBB` — the exact inverse of [`put_pixel`](Self::put_pixel)'s
+    /// encoding, so `read_pixel(x, y) == color` for any `color` a `put_pixel(x, y, color)` landed.
+    /// `None` when the coordinate is off-panel, past the mapped length, or the layout has no colour
+    /// inverse (`U8` is lossy — averaging is not invertible, so it refuses rather than inventing one).
+    ///
+    /// This exists so the compositor can VERIFY its own blit against the source surface instead of
+    /// asserting it (see `wm::verify_window`). A checksum of what we intended to draw proves nothing
+    /// about the panel; a read-back of what is actually in the scan-out buffer does.
+    #[inline]
+    pub fn read_pixel(&self, x: usize, y: usize) -> Option<u32> {
+        if self.base == 0 || x >= self.info.width || y >= self.info.height {
+            return None;
+        }
+        let offset = (y * self.info.stride + x) * self.info.bytes_per_pixel;
+        if offset + 3 > self.len {
+            return None;
+        }
+        let p = (self.base + offset) as *const u8;
+        // SAFETY: bounds-checked against `self.len` above; volatile so the read is not hoisted or
+        // folded with the stores the blit just performed.
+        let (a, b, c) = unsafe {
+            (
+                core::ptr::read_volatile(p),
+                core::ptr::read_volatile(p.add(1)),
+                core::ptr::read_volatile(p.add(2)),
+            )
+        };
+        match self.info.pixel_format {
+            PixelFormat::Rgb => Some(((a as u32) << 16) | ((b as u32) << 8) | c as u32),
+            PixelFormat::Bgr => Some(((c as u32) << 16) | ((b as u32) << 8) | a as u32),
+            _ => None,
+        }
+    }
+
     /// VPERF M4 (x86 only): encode `color` as the little-endian 4-byte pixel this surface
     /// stores, when the layout is a full 4-byte pixel (bpp 4, Rgb/Bgr). Lets callers hoist the
     /// per-pixel format decode out of their inner loops (`put_raw4` / the `fill_rows` fast

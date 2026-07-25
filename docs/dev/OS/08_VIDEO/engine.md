@@ -762,3 +762,53 @@ checksums below it) · `:: EL0: window verbs — … witness=0x1fff … :: PASS 
 
 `target/pi-screen.png` is **re-baselined by design** — the WC-INT residue this arc removes was the whole
 point of the desktop repaint. New sha256 `2686a884320dbc389d6c33b1f37b097fa15eba769b51a751449e2c91a986bc19`.
+
+### WC-D — the scan-out verdict, and why a 640×480 gate could not see the bench
+
+The P56 bench reported the 128×128 windowed crystal rendering **garbled on the panel** while every serial
+witness was green. That combination is the whole problem: `[wc-c]`'s per-window checksum hashes the SOURCE
+surface, so it proves the app drew something and says nothing whatsoever about the pixels that reached the
+panel. Everything between the surface and the scan-out — the upscale's indexing, `put_pixel`'s colour
+encoding, the clip, and the cache clean that makes the non-coherent HVS see the result — was unwitnessed.
+
+**Why the gate was blind by construction.** QEMU raspi4b's mailbox panel is 640×480; the bench Pi drives
+1920×1200. `wm::place` derives each window's integer upscale FROM the panel, so those are not the same code
+path: a 128×128 window lands at **scale 1** on 640×480 and **scale 4** on 1920×1200. The gate was running a
+1:1 copy while the bench ran a 4× nearest-neighbour expansion — every scaled-blit defect was invisible to it
+for free. `mailbox::FORCE_W` / `FORCE_H` (`UNAOS_FBW` / `UNAOS_FBH`, default off) close that gap: they
+override the firmware-queried mode so the gate can be run at the bench's geometry.
+
+**The instrument.** `wm::verify_window` runs once per window, from inside the composite pass that drew it,
+and re-derives every destination pixel of the content rect from the source surface, comparing it against the
+scan-out buffer **twice**:
+
+| verdict | meaning |
+|---|---|
+| `bad_cache=0 bad_ram=0` | the window on the panel is what the app drew |
+| `bad_cache=0 bad_ram>0` | the blit is correct and the **flush** is the defect — cache-maintenance extent or coherency |
+| `bad_cache>0` | the **blit** is wrong, or another painter overwrote the rect mid-composite; `first=` names the pixel |
+
+The second pass follows a `clean_invalidate_range` over the same rows, so its reads miss every line the blit
+dirtied and come from the RAM the HVS scans. Clean+invalidate, never a bare invalidate — a bare `DC IVAC`
+would discard the pixels under test and make the instrument the defect. One-shot per window id (the latch is
+cleared in `create_inner`, since ids are recycled slot aliases and a new window deserves its own verdict);
+`witness`-gated, because a 128×128 surface at 4× is 262144 comparisons per pass.
+
+**What this established, and what it did not.** At the bench's exact geometry — `panel=1920x1200`,
+`surf=128x128 scale=4x at (9,21)`, matching the P56 log line for line — the verdict is
+`checked=262144 bad_cache=0 bad_ram=0 -> PASS`. The scaled blit, the stride/pitch relationship, the pixel
+format and the flush extent are therefore **excluded** as causes of the P56 garble; they are correct at the
+geometry that garbled. What QEMU cannot decide is the part that only real caches and a real HVS exercise, and
+that is precisely what the `bad_ram` column answers in one line on the next bench boot.
+
+The boot-time "indecipherable" auto-launch surfaces are a **separate, cosmetic** matter and not this defect:
+`wm::place`'s scale rule maximises legibility, so midden's 24×16 surface lands at `scale=37x` on a 1920×1200
+panel — a few characters at enormous magnification, exactly as designed. If that is unwanted, the fix is a
+cap in `place` (as `screen::present_surface` already applies for the compat path), not a correctness change.
+
+#### WC-D gate results (2026-07-25, QEMU raspi4b)
+
+`./arroyo check` green both arches · `kernel8` builds · `kernel8-test 120` MBENCH **50/50 required,
+0 forbidden** (the arc adds the `[wc-d] … -> PASS` REQUIRE and the `-> FAIL` FORBID) · `test-arm` green ·
+and, at forced bench geometry (`UNAOS_FBW=1920 UNAOS_FBH=1200`), `[wc-d] verify win=1 surf=128x128 scale=4x
+at (9,21) panel=1920x1200 checked=262144 bad_cache=0 bad_ram=0 -> PASS`.

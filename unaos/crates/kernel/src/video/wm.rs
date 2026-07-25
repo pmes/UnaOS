@@ -625,6 +625,18 @@ pub fn composite() {
             continue;
         }
         draw_window(&fb, &rows[i]);
+        // WC-D — verify this window's blit against the scan-out, once per window id, from inside the pass
+        // that drew it (the only place both the source surface and the destination rows are known).
+        #[cfg(feature = "witness")]
+        {
+            let r = &rows[i];
+            if !r.compat && r.id < 32 {
+                let bit = 1u32 << r.id;
+                if VERIFIED.fetch_or(bit, core::sync::atomic::Ordering::Relaxed) & bit == 0 {
+                    verify_window(&fb, r);
+                }
+            }
+        }
         drawn += 1;
     }
 
@@ -661,6 +673,121 @@ pub fn composite() {
     }
     let _ = drawn;
 }
+
+/// WC-D — the SCALED-BLIT / SCAN-OUT VERDICT. One line per window, once, from inside the composite that
+/// drew it: re-derive every destination pixel of the window's content rect from the SOURCE surface and
+/// compare it against what is actually in the scan-out buffer, AFTER the cache clean.
+///
+/// Why a read-back and not another checksum. `[wc-c]`'s checksum hashes the surface — the bytes the app
+/// wrote — so it answers "did the app draw?" and nothing else. Every failure mode between that surface and
+/// the panel is invisible to it: a stride or index error in the upscale, a `put_pixel` colour-order
+/// mismatch, a flush whose extent misses rows the blit touched. Those are precisely the bugs that show up
+/// as garble on a panel and as nothing at all in a serial log, and the compositor is the only place that
+/// knows both sides of the comparison.
+///
+/// **The cache step is the point on the Pi 4.** `flush_range` cleans the touched rows to the PoC because the
+/// HVS scan-out is not coherent with the CPU's caches. A plain read-back after that would hit those same
+/// dirty-then-clean lines and agree with the blit no matter what reached RAM — it would verify arithmetic
+/// and silently pass a broken flush. So on aarch64 the content rows are CLEAN+INVALIDATEd first (the safe
+/// superset — dirty lines are written back, never discarded), which forces every comparison read to re-fetch
+/// from the RAM the HVS reads. A PASS here therefore means: the pixels are correct AND they are in memory,
+/// not merely in a cache. That is the one-line metal verdict.
+///
+/// One-shot per window id and `witness`-gated: this walks the whole content rect (a 128x128 surface at 4x is
+/// 262144 comparisons) from present context, which is a per-frame cost nothing should pay twice.
+#[cfg(feature = "witness")]
+fn verify_window(fb: &super::FrameBuffer, r: &Window) {
+    let info = fb.info();
+    if r.surf == 0 || r.scale == 0 || r.stride < 4 || r.x >= info.width || r.y >= info.height {
+        return;
+    }
+    // The same bounds `draw_window` blitted under — verify exactly what was drawn, never more.
+    let cols = (info.width - r.x).div_ceil(r.scale).min(r.w).min(r.stride / 4);
+    let rows = (info.height - r.y).div_ceil(r.scale).min(r.h).min(r.surf_len / r.stride);
+    if cols == 0 || rows == 0 {
+        return;
+    }
+
+    // TWO passes over the same rect, and the pair is what makes the verdict decisive rather than merely
+    // alarming. `cache` is read straight after the blit, so it sees the CPU's own dirty lines: it answers
+    // "did the compositor compute the right pixels?" — stride, upscale indexing, colour encoding, clipping.
+    // `ram` is read after a CLEAN+INVALIDATE of the same rows, so every line is re-fetched from the memory
+    // the HVS scans: it answers "did those pixels reach the scan-out?". The two together separate the only
+    // hypotheses a serial log otherwise cannot tell apart:
+    //   cache=0 ram=0    the window on the panel is what the app drew.
+    //   cache=0 ram>0    the blit is right and the FLUSH is the defect — cache-maintenance extent/coherency.
+    //   cache>0          the BLIT itself is wrong (or another painter overwrote the rect mid-composite);
+    //                    `first` names the pixel, and ram's count says whether it also reached memory.
+    // On a coherent target both passes read the same bytes and the second is redundant — deliberately so:
+    // the instrument must be the SAME instrument on the gate and on the bench.
+    let mut pass = |fb: &super::FrameBuffer| {
+        let surf = r.surf as *const u8;
+        let mut checked = 0usize;
+        let mut bad = 0usize;
+        let mut first = (0usize, 0usize, 0u32, 0u32);
+        for row in 0..rows {
+            let row_base = row * r.stride;
+            for col in 0..cols {
+                // SAFETY: identical bound to `draw_window`'s read — `row < surf_len / stride` and
+                // `col < stride / 4`, so `row_base + col * 4 + 4 <= surf_len`.
+                let want =
+                    unsafe { core::ptr::read_unaligned(surf.add(row_base + col * 4) as *const u32) }
+                        & 0x00FF_FFFF;
+                for sy in 0..r.scale {
+                    let dy = r.y + row * r.scale + sy;
+                    for sx in 0..r.scale {
+                        let dx = r.x + col * r.scale + sx;
+                        // Off-panel destinations were clipped by `put_pixel`, not lost — not a defect.
+                        let got = match fb.read_pixel(dx, dy) {
+                            Some(g) => g,
+                            None => continue,
+                        };
+                        checked += 1;
+                        if got != want {
+                            if bad == 0 {
+                                first = (dx, dy, got, want);
+                            }
+                            bad += 1;
+                        }
+                    }
+                }
+            }
+        }
+        (checked, bad, first)
+    };
+
+    let (checked, bad_cache, first_cache) = pass(fb);
+
+    // Force the second pass to miss every line the blit dirtied, so it reads the RAM the scan-out reads.
+    // CLEAN+invalidate, never a bare invalidate: a bare `DC IVAC` would DISCARD the pixels we are trying to
+    // verify and turn the instrument into the defect.
+    #[cfg(target_arch = "aarch64")]
+    {
+        let row_bytes = info.stride * info.bytes_per_pixel;
+        let y0 = r.y;
+        let y1 = (r.y + rows * r.scale).min(info.height);
+        if y1 > y0 {
+            crate::arch::cache::clean_invalidate_range(
+                fb.base_addr() + y0 * row_bytes,
+                (y1 - y0) * row_bytes,
+            );
+        }
+    }
+
+    let (_, bad_ram, first_ram) = pass(fb);
+    let first = if bad_cache > 0 { first_cache } else { first_ram };
+    serial_println!(
+        "[wc-d] verify win={} surf={}x{} scale={}x at ({},{}) panel={}x{} checked={} bad_cache={} bad_ram={} first=({},{}) got={:#08x} want={:#08x} -> {}",
+        r.id, r.w, r.h, r.scale, r.x, r.y, info.width, info.height,
+        checked, bad_cache, bad_ram, first.0, first.1, first.2, first.3,
+        if bad_cache == 0 && bad_ram == 0 { "PASS" } else { "FAIL" }
+    );
+}
+
+/// WC-D — window ids whose [`verify_window`] verdict has already been emitted (bit `id`), so the read-back
+/// runs once per window rather than once per frame.
+#[cfg(feature = "witness")]
+static VERIFIED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// WC-C — FNV-1a 64 over a window's mapped surface slot, for the side-by-side witness. Bounded by
 /// `surf_len` (the length the MAPPING code supplied), so it shares `draw_window`'s F1 read bound; a null
@@ -937,6 +1064,13 @@ fn create_inner(
     row.title[..row.title_len].copy_from_slice(&title[..row.title_len]);
     t.rows[slot] = row;
     drop(t);
+    // WC-D: ids are recycled slot aliases, so a fresh window in a used slot is a DIFFERENT window and
+    // deserves its own verdict — clear the one-shot latch here rather than at close, which is the point
+    // where the id demonstrably names something new.
+    #[cfg(feature = "witness")]
+    if id < 32 {
+        VERIFIED.fetch_and(!(1u32 << id), core::sync::atomic::Ordering::Relaxed);
+    }
     place(id);
     #[cfg(feature = "witness")]
     if !compat {

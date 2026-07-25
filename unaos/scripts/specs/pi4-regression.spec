@@ -217,3 +217,17 @@ REQUIRE EL0: window verbs.*witness=0x1fff.*PASS
 # ---    it. Without this REQUIRE a fixture whose second window presented BLANK would still pass
 # ---    every other directive, because nothing else reads those checksums.
 REQUIRE \[wc-c\] side-by-side windows=2 drawn=2
+#
+# --- 4. WC-D: the SCAN-OUT VERDICT. Every directive above this one checks a number the kernel
+# ---    computed about a surface; none of them looks at the panel. This one re-derives the window's
+# ---    destination pixels from the source surface and reads the scan-out buffer back — twice, once
+# ---    from cache and once from RAM after a clean+invalidate — so `bad_cache=0 bad_ram=0` says the
+# ---    blit is right AND the pixels reached the memory the HVS scans. The FORBID below is the half
+# ---    that has teeth: a FAIL verdict fails the gate wherever it appears, on any window.
+# ---    NOTE: the QEMU panel is 640x480 and the bench Pi drives 1920x1200, and the compositor's
+# ---    upscale is a FUNCTION of the panel — so this gate exercises scale 1x/3x/13x while the bench
+# ---    runs 4x. Run `UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test` to reproduce the bench
+# ---    geometry here; that is the configuration in which the scaled blit was cleared (see
+# ---    docs/dev/OS/08_VIDEO/engine.md §WC-D).
+REQUIRE \[wc-d\] verify win=.*bad_cache=0 bad_ram=0.*-> PASS
+FORBID \[wc-d\] verify .*-> FAIL

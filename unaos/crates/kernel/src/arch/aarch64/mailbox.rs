@@ -109,6 +109,34 @@ const BYTES_PER_PIXEL: u32 = DEPTH_BITS / 8;
 const FALLBACK_W: u32 = 1920;
 const FALLBACK_H: u32 = 1080;
 
+/// WC-D — the compile-time PANEL OVERRIDE (`UNAOS_FBW` / `UNAOS_FBH`), 0 = off (query the firmware).
+/// See [`init_framebuffer`] for why a size knob is a correctness tool and not a convenience: the window
+/// compositor's upscale factor is a function of the panel, so a 640x480 QEMU gate cannot reach the blit
+/// path a 1920x1200 bench panel runs. Default-quiet: unset => the const is 0 => not one instruction of
+/// behaviour changes.
+pub const FORCE_W: u32 = parse_u32(option_env!("UNAOS_FBW"));
+pub const FORCE_H: u32 = parse_u32(option_env!("UNAOS_FBH"));
+
+/// Decimal `u32` parse usable in a `const` initialiser (no `str::parse` in const context). Any
+/// non-digit or absent value yields 0, which is the "override off" value — fail-closed to the
+/// firmware-queried mode rather than to an invented resolution.
+const fn parse_u32(s: Option<&str>) -> u32 {
+    let b = match s {
+        Some(s) => s.as_bytes(),
+        None => return 0,
+    };
+    let mut v: u32 = 0;
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] < b'0' || b[i] > b'9' {
+            return 0;
+        }
+        v = v * 10 + (b[i] - b'0') as u32;
+        i += 1;
+    }
+    v
+}
+
 /// The property message buffer. One static buffer, used only during single-core boot
 /// (build_boot_info, before SMP/interrupts), so no locking is needed. The framebuffer message is
 /// 35 words; 48 words (192 bytes) rounds the allocation up to whole 64-byte cache lines so the
@@ -487,7 +515,17 @@ pub fn notify_xhci_reset(dev_addr: u32) -> NotifyResp {
 /// and pitch. Returns the ARM-physical framebuffer for BootInfo, or `None` on any failure (the
 /// caller then boots serial-only).
 pub fn init_framebuffer() -> Option<FbAlloc> {
-    let (width, height) = query_display_size().unwrap_or((FALLBACK_W, FALLBACK_H));
+    let (width, height) = match (FORCE_W, FORCE_H) {
+        // WC-D: a compile-time PANEL OVERRIDE, so the QEMU gate can run the compositor at the bench
+        // panel's geometry. QEMU raspi4b's mode is 640x480; the bench Pi drives 1920x1200. The window
+        // compositor's placement rule (`video::wm::place`) derives each window's integer upscale FROM
+        // the panel size, so those two panels do not exercise the same code: a 128x128 window lands at
+        // scale 1 on 640x480 and scale 4 on 1920x1200. Every scaled-blit defect is therefore invisible
+        // to a 640x480 gate BY CONSTRUCTION. Forcing the geometry is what makes the gate able to see
+        // what the bench sees. Off by default (0,0 => query the firmware, unchanged behaviour).
+        (w, h) if w != 0 && h != 0 => (w, h),
+        _ => query_display_size().unwrap_or((FALLBACK_W, FALLBACK_H)),
+    };
 
     // A single message carrying every framebuffer tag. Layout per tag: id, value-buffer-size,
     // request-code(0), value words… A local macro (not a closure) appends words so we can still
