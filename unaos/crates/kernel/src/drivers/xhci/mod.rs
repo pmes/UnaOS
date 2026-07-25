@@ -5295,7 +5295,12 @@ impl XhciController {
                         // (0x55AA signature, FAT/GPT hints). Read-only — never a write.
                         #[cfg(target_arch = "aarch64")]
                         {
-                            let (bs, nb, mib) = match crate::drivers::block::BLOCK_DEVICE.lock().as_ref() {
+                            // USBW-1: report the USB device's OWN geometry. Reading the global
+                            // BLOCK_DEVICE here made this line print the microSD's 500224000 blocks
+                            // (244250 MiB) under a "storage enumerated" label on P57, two lines below
+                            // the true READ CAPACITY of 29120 blocks (14 MiB) — the mix-up that sent
+                            // the write self-test off the end of the reader.
+                            let (bs, nb, mib) = match crate::drivers::block::USB_BLOCK_DEVICE.lock().as_ref() {
                                 Some(d) => (d.block_size, d.num_blocks,
                                             (d.num_blocks.saturating_mul(d.block_size as u64)) / (1024 * 1024)),
                                 None => (0, 0, 0),
@@ -5381,7 +5386,16 @@ impl XhciController {
     /// catches) and NO success is claimed — no partial-write lie. Runs in the same safe non-event
     /// context as the LBA0 sanity read; single-sector, bounded to the storage slot's own DMA buffer.
     fn mission_write_selftest(&mut self) {
-        let nb = match crate::drivers::block::info() {
+        // USBW-1: the scratch LBA MUST come from the USB stick's own READ CAPACITY, never from the
+        // global `block::info()`. On the Pi the microSD registers first and (since PIUSB-28) KEEPS the
+        // global, so `info()` returns the SD's geometry — P57 read 500224000 blocks (244250 MiB, the
+        // eMMC card) while the enumerated 'USB SD Reader' is 29120 blocks (14 MiB). The probe then
+        // addressed lba=500223999 over BOT, ~17000x past the reader's last LBA; the device answered
+        // correctly with CHECK CONDITION (CSW Failed, residue 512) after halting the data-IN, and the
+        // test mislabeled that honest out-of-range rejection as a transport stall. `usb_info()` is the
+        // dedicated USB handle published by the same enumeration that owns this BOT pipe. On x86
+        // `publish_usb_geometry` writes both handles, so this is byte-identical there.
+        let nb = match crate::drivers::block::usb_info() {
             Some(d) => d.num_blocks,
             None => return,
         };
@@ -5400,6 +5414,10 @@ impl XhciController {
             let mut ncand = 1usize;
             if nb > 8  { candidates[ncand] = (nb - 8) as u32;  ncand += 1; }
             if nb > 64 { candidates[ncand] = (nb - 64) as u32; ncand += 1; }
+            // USBW-1: witness the geometry this probe is actually addressing, so a future capacity
+            // mix-up is visible on the wire instead of hiding behind a generic failure line.
+            serial_println!(
+                ":: PIUSB: [usbw] scratch geometry: USB last_lba={} (num_blocks={}) ::", nb - 1, nb);
             let mut chosen: Option<u32> = None;
             for i in 0..ncand {
                 let cand = candidates[i];
@@ -5419,8 +5437,13 @@ impl XhciController {
                     lba = c;
                 }
                 None => {
+                    // USBW-1: do NOT call this "stalled" — that verdict was wrong on P57. Every
+                    // candidate came back as a COMPLETED BOT round trip whose CSW said Failed
+                    // (residue 512), i.e. the device rejected the command; stall recovery had already
+                    // run and cleared the halt, which is why the next candidate got a CSW at all.
                     serial_println!(
-                        ":: PIUSB: [usbw] write lba={} -> FAIL (pre-read all candidates stalled) ::", lba);
+                        ":: PIUSB: [usbw] write lba={} -> FAIL (no readable scratch candidate; see per-candidate CSW above) ::",
+                        lba);
                     return;
                 }
             }

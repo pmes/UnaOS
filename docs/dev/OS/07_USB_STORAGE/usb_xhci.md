@@ -445,6 +445,49 @@ region). Witness: `:: PIUSB: [piusb38] … ::`. Inert on QEMU raspi4b (no VL805 
 slot); QEMU virt exercises the whole path (the full-reset TUR passes and the ladder reads real
 LBA0 data), byte-identical no-op on x86.
 
+### 5f. USBW-1 — the write self-test addressed the wrong disk (P57)
+
+P57 ended the MISSION write proof with
+
+```
+:: PIUSB: [usbw] write lba=500223999 -> FAIL (pre-read all candidates stalled) ::
+```
+
+Both halves of that line were wrong, and the cause was **ours**, not the reader's.
+
+**The geometry mix-up.** `mission_write_selftest` picked its scratch sector from the *global*
+`block::info()`. On the Pi that global belongs to the **microSD**: the BSP registers the eMMC2
+card at probe time (`:: M6g: SD card @0xfe340000 identified — 500224000 blocks (244250 MiB) ::`),
+and PIUSB-28 deliberately keeps `BLOCK_DEVICE` pinned to the SD so a later-enumerated stick
+cannot clobber it. The enumerated USB device is a different disk entirely — its own READ
+CAPACITY, printed two lines earlier in the same boot, is
+`Disk 'Generic' 'USB SD Reader' block_size=512 num_blocks=29120 (14 MiB)`, and the FAT16 volume
+that mounts from it is likewise 14 MiB. The probe therefore aimed `lba = 500224000 - 1` — the
+SD's last block — down the **USB BOT pipe**, roughly 17,000× past the reader's last LBA of
+29119. All three fallback candidates (last, last-8, last-64) were equally out of range.
+
+**The device was right.** Each candidate came back `Ok(BotResult { status: Failed, residue: 512 })`
+— a *completed* BOT round trip whose CSW reports CHECK CONDITION. The reader halted the data-IN,
+our §5e stall recovery cleared the halt and still collected the CSW exactly as designed (the
+`[usbw] bulk STALL recovery slot 2 ep 0x82` lines preceding each verdict), which is precisely why
+the next candidate got a clean pipe and its own CSW. Recovery **engaged and worked**; the failure
+label "all candidates stalled" described a transport fault that never happened. **Not** a
+device quirk, and unrelated to the separate s1j finding that this card's front sectors read as
+zeros.
+
+**Fix.** `mission_write_selftest` now sources its geometry from `block::usb_info()` — the
+dedicated `USB_BLOCK_DEVICE` handle published by the very enumeration that owns this BOT pipe —
+so the scratch LBA is always bounded by the stick's own capacity. The PIUSB-25 "storage
+enumerated" witness had the same defect (it read `BLOCK_DEVICE`, so it reported the SD's
+500224000 blocks under a USB label, contradicting the READ CAPACITY line just above it) and now
+reads `USB_BLOCK_DEVICE` too. A new `[usbw] scratch geometry: USB last_lba=… (num_blocks=…)`
+line states the bound the probe is working from, and the all-candidates-exhausted verdict no
+longer claims "stalled" — it points at the per-candidate CSWs above it. On x86
+`publish_usb_geometry` writes both handles, so that path is byte-identical.
+
+The genuine end-of-medium fallback ladder from USB-WRITE-2 (P44: some sticks STALL a READ(10)
+against the very last LBA they report) is retained — it is now applied to the right disk.
+
 ---
 
 ## 6. Enumeration robustness (metal-informed)
