@@ -517,14 +517,38 @@ still types). The guard stays (the dup hazard is real); its exit now discriminat
 
 The same two dead-pipeline holes existed on the *error* side: a completion code other
 than 1/13 on either HID interrupt-IN endpoint fell through the success gate without a
-re-arm. Both now re-arm and trace, mirroring the hub Status Change Endpoint (§7d). The
-keyboard guard carries the identical fix (`keyboard_prev_phys`); only its lower traffic
-kept the defect from being observed on metal.
+re-arm. Both now trace and recover, and the recovery is **split by completion code**,
+because a bare re-queue is a no-op on a halted endpoint (it ignores the doorbell until
+Reset Endpoint):
 
-*Witness (knob-gated, `usbdebug`).* `[piusb39] mouse rearm=<n> discarded=<n>` — printed on
-the first re-arm and every 256th thereafter, plus on every discarded-but-re-armed
-completion. `discarded > 0` on a metal capture is direct proof the pipeline-preserving
-exit fired where the old code would have killed the pointer.
+- **Halting codes** — 2 (Data Buffer Error), 3 (Babble), 4 (USB Transaction Error),
+  5 (TRB Error), 6 (Stall). The endpoint is Halted, so `(slot, is_mouse)` is queued on
+  `hid_halt_pending` and the main-loop `service_hid_halts` runs the full un-halt:
+  **Reset Endpoint** (TRB 14) → **Set TR Dequeue Pointer** (TRB 16, past the faulted
+  TRB) → device `CLEAR_FEATURE(ENDPOINT_HALT)` → clear the stale `*_expect_phys`/
+  `*_prev_phys` (the ring dequeue moved) → arm the read. This is the same pair the bulk
+  clear-halt path uses (`reset_bulk_endpoint_host`, §7g), generalised over any DCI. It is
+  deferred to the main loop for the same reason `SET_PROTOCOL(boot)` is: the sequence is
+  synchronous command + EP0 traffic and must never run re-entrantly inside the event-ring
+  dispatch that noticed the error. A slot that unplugged in between is skipped
+  (root `PORTSC.CCS`), and slot teardown drops its queued entries.
+- **Non-halting codes** — the endpoint is still Running; the read is re-armed inline, as
+  the hub Status Change Endpoint does (§7d).
+
+The keyboard guard carries the identical fix (`keyboard_prev_phys`); only its lower
+traffic kept the defect from being observed on metal.
+
+*Witness (knob-gated, `usbdebug`, rate-limited to one line per 250 ms).*
+`[piusb39] mouse rearm=<n> discarded=<n> errrearm=<n> (<tag>)` — the three counters are
+distinct populations and the tag names which one moved: `poll` (a normal armed read;
+printed on the first arm and every 256th), `guard` (the dup-Success guard discarded a
+completion and re-armed anyway), `halt` (a halted endpoint was un-halted and re-armed).
+`discarded > 0` on a metal capture is direct proof the *guard's* pipeline-preserving exit
+fired where the old code would have killed the pointer; `errrearm > 0` proves the *error*
+path recovered. The error trace itself (`xHCI: pointer interrupt-IN error ...`) is
+unconditional but capped at one line per 500 ms with a `[+N suppressed]` tail — the
+pointer is the highest-rate endpoint and a Running-state error class self-sustains at
+report rate.
 
 ### 7b. Serial mouse-witness (bench-assertable)
 

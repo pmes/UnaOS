@@ -486,7 +486,14 @@ pub static XHCI_IRQ_COUNT: AtomicU64 = AtomicU64::new(0);
 /// but which STILL re-armed the interrupt-IN read (the pipeline-preserving exit the P54b metal
 /// fact needed). Bumped unconditionally (cheap relaxed adds); only the knob-gated witness prints.
 pub static MOUSE_REARM_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Completions the dup-Success GUARD discarded and re-armed (mismatching `param`, not the known
+/// dup) — the population the P54b fix is about.
 pub static MOUSE_DISCARD_REARM_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Re-arms driven by a non-halting ERROR completion on the pointer endpoint. A different
+/// population from `MOUSE_DISCARD_REARM_COUNT`: counted (and printed) separately so a metal
+/// capture can tell which hole it just watched get plugged. Halting errors are NOT counted here —
+/// they go to `service_hid_halts`, which prints its own line.
+pub static MOUSE_ERROR_REARM_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Acknowledge an xHCI interrupt at the hardware level so the interrupter can raise again.
 /// Safe to call from interrupt context: it takes NO locks and does NO allocation — it clears
@@ -1144,6 +1151,12 @@ pub struct XhciController {
     /// protocol is the fixed [buttons, dx, dy] / [mods, resv, keys..] the decoders expect. Deferred
     /// to the main loop because it is a synchronous EP0 transfer (must not run in the event handler).
     hid_setproto_pending: Vec<u8>,
+    /// PIUSB-39 F1: HID interrupt-IN endpoints that completed with a HALTING error code and need
+    /// the full un-halt sequence before they can be re-armed. `(slot_id, is_mouse)`. Deferred to
+    /// the main loop for the same reason as `hid_setproto_pending`: the recovery is SYNCHRONOUS
+    /// (Reset Endpoint + Set TR Dequeue command TRBs, then an EP0 CLEAR_FEATURE) and must never
+    /// run re-entrantly inside the event-ring dispatch that noticed the error.
+    hid_halt_pending: Vec<(u8, bool)>,
     /// True while a port is mid-enumeration. Enumeration is serialized (one port at a time);
     /// this lets a hot-plug Connect Status Change event know whether to kick `start_next_port`
     /// immediately or just queue the port (the in-flight device's completion will drain it).
@@ -1272,6 +1285,7 @@ impl XhciController {
             hubs_pending: Vec::new(),
             hub_changes_pending: Vec::new(),
             hid_setproto_pending: Vec::new(),
+            hid_halt_pending: Vec::new(),
             enum_active: false,
             enumerating_port: 0,
             enum_saw_disconnect: false,
@@ -1862,19 +1876,40 @@ impl XhciController {
                                 (m, k, s.mouse_data_buffer.is_some() && s.mouse_ring.is_some(),
                                  s.data_buffer.is_some() && s.keyboard_ring.is_some())
                             };
+                            // A HALTING code leaves the endpoint in the Halted state, where it
+                            // IGNORES the doorbell: a bare re-queue would be a no-op and the
+                            // pointer would stay dead anyway. Those need the full un-halt
+                            // (Reset Endpoint + Set TR Dequeue + device CLEAR_FEATURE(HALT)),
+                            // which is synchronous and must not run inside this dispatch — queue
+                            // it for the main loop (`service_hid_halts`). Codes that leave the
+                            // endpoint RUNNING (e.g. 21 Ring Underrun / 22 Ring Overrun, 8 NAK,
+                            // vendor codes) just need the read re-armed here.
+                            // Halting: 2 Data Buffer Error, 3 Babble, 4 USB Transaction Error,
+                            // 5 TRB Error, 6 Stall (xHCI 1.1 Table 6-90 / §4.10.2.1).
+                            let halting = matches!(completion_code, 2 | 3 | 4 | 5 | 6);
                             if m_dci == Some(endpoint_id as u8) && has_mbuf {
-                                serial_println!(
-                                    "xHCI: pointer interrupt-IN error (slot {}, code {}); re-arming.",
-                                    slot_id, completion_code);
-                                MOUSE_DISCARD_REARM_COUNT.fetch_add(1, Ordering::Relaxed);
-                                self.queue_mouse_read(slot_id as u8);
+                                Self::hid_error_witness(
+                                    "pointer", slot_id, completion_code, halting);
+                                if halting {
+                                    if !self.hid_halt_pending.contains(&(slot_id as u8, true)) {
+                                        self.hid_halt_pending.push((slot_id as u8, true));
+                                    }
+                                } else {
+                                    MOUSE_ERROR_REARM_COUNT.fetch_add(1, Ordering::Relaxed);
+                                    self.queue_mouse_read(slot_id as u8);
+                                }
                                 return;
                             }
                             if k_dci == Some(endpoint_id as u8) && has_kbuf {
-                                serial_println!(
-                                    "xHCI: keyboard interrupt-IN error (slot {}, code {}); re-arming.",
-                                    slot_id, completion_code);
-                                self.queue_keyboard_read(slot_id as u8);
+                                Self::hid_error_witness(
+                                    "keyboard", slot_id, completion_code, halting);
+                                if halting {
+                                    if !self.hid_halt_pending.contains(&(slot_id as u8, false)) {
+                                        self.hid_halt_pending.push((slot_id as u8, false));
+                                    }
+                                } else {
+                                    self.queue_keyboard_read(slot_id as u8);
+                                }
                                 return;
                             }
                         }
@@ -2188,11 +2223,7 @@ impl XhciController {
                                                 // Not the known dup — re-arm rather than lose the pointer.
                                                 MOUSE_DISCARD_REARM_COUNT.fetch_add(1, Ordering::Relaxed);
                                                 self.queue_mouse_read(slot_id as u8);
-                                                #[cfg(feature = "usbdebug")]
-                                                serial_println!(
-                                                    "[piusb39] mouse rearm={} discarded={}",
-                                                    MOUSE_REARM_COUNT.load(Ordering::Relaxed),
-                                                    MOUSE_DISCARD_REARM_COUNT.load(Ordering::Relaxed));
+                                                Self::piusb39_witness("guard");
                                             }
                                             return;
                                         }
@@ -3109,6 +3140,7 @@ impl XhciController {
                 ftdi::set_live(false);
             }
             self.hid_setproto_pending.retain(|s| *s != i as u8);
+            self.hid_halt_pending.retain(|(s, _)| *s != i as u8);
             self.hubs_pending.retain(|s| *s != i as u8);
             self.hub_changes_pending.retain(|(hs, _)| *hs != i as u8); // XENUM-2
             self.pending_ports.retain(|p| *p != port);
@@ -3270,6 +3302,7 @@ impl XhciController {
                 ftdi::set_live(false); // the console's slot is torn down — stop the drain
             }
             self.hid_setproto_pending.retain(|s| *s != i as u8);
+            self.hid_halt_pending.retain(|(s, _)| *s != i as u8);
             self.hubs_pending.retain(|s| *s != i as u8);
             self.hub_changes_pending.retain(|(hs, _)| *hs != i as u8); // XENUM-2
             self.slots[i].reset_soft_state();
@@ -5779,6 +5812,10 @@ impl XhciController {
     /// bring-up (safe polled context); the interrupt reads are already armed and keep delivering —
     /// the device just changes report format once this completes.
     pub fn service_hid_setproto(&mut self) {
+        // PIUSB-39 F1: drain any halted HID interrupt-IN endpoints first — they are dead until
+        // un-halted, and the recovery is synchronous like everything else in this hook. Hooked
+        // here so no caller outside the driver changes.
+        self.service_hid_halts();
         while let Some(slot) = self.hid_setproto_pending.pop() {
             // Only BOOT interfaces accept SET_PROTOCOL: proto 1 (keyboard) and proto 2 (relative
             // boot mouse). The absolute-pointer path (proto 0, e.g. usb-tablet / consumer-control)
@@ -6390,6 +6427,7 @@ impl XhciController {
                 ftdi::set_live(false);
             }
             self.hid_setproto_pending.retain(|s| *s != i as u8);
+            self.hid_halt_pending.retain(|(s, _)| *s != i as u8);
             self.hubs_pending.retain(|s| *s != i as u8);
             // A nested hub going away takes its own queued port changes with it.
             self.hub_changes_pending.retain(|(hs, _)| *hs != i as u8);
@@ -7402,6 +7440,130 @@ impl XhciController {
         }
     }
 
+    /// PIUSB-39 witness — one bounded line naming which population moved:
+    /// `[piusb39] mouse rearm=<n> discarded=<n> errrearm=<n> (<tag>)`. `tag` is `poll` (a normal
+    /// armed read), `guard` (the dup-Success guard discarded a completion and re-armed anyway) or
+    /// `halt` (a halted endpoint was un-halted and re-armed). Split counters because the three are
+    /// different populations: only `discarded` proves the guard's pipeline-preserving exit fired.
+    /// Knob-gated (`usbdebug`) and rate-limited — the pointer is the highest-traffic endpoint and
+    /// a self-sustaining error class would otherwise flood the FTDI at report rate.
+    #[allow(unused_variables)]
+    fn piusb39_witness(tag: &str) {
+        #[cfg(feature = "usbdebug")]
+        {
+            static LAST_MS: AtomicU64 = AtomicU64::new(0);
+            let now = crate::arch::ticks();
+            // First line always prints (LAST_MS == 0); after that, at most one per 250 ms.
+            let last = LAST_MS.load(Ordering::Relaxed);
+            if last != 0 && now.wrapping_sub(last) < 250 { return; }
+            LAST_MS.store(now.max(1), Ordering::Relaxed);
+            serial_println!(
+                "[piusb39] mouse rearm={} discarded={} errrearm={} ({})",
+                MOUSE_REARM_COUNT.load(Ordering::Relaxed),
+                MOUSE_DISCARD_REARM_COUNT.load(Ordering::Relaxed),
+                MOUSE_ERROR_REARM_COUNT.load(Ordering::Relaxed),
+                tag);
+        }
+    }
+
+    /// PIUSB-39 F3: rate-limited trace for a HID interrupt-IN error completion. Unconditional
+    /// (not knob-gated — a halted pointer is a real fault worth one line on any boot) but capped
+    /// at one line per 500 ms across both endpoints, because a non-halting error class repeats at
+    /// the endpoint's poll rate and would otherwise saturate the serial link.
+    fn hid_error_witness(what: &str, slot_id: u32, code: u32, halting: bool) {
+        static LAST_MS: AtomicU64 = AtomicU64::new(0);
+        static SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+        let now = crate::arch::ticks();
+        let last = LAST_MS.load(Ordering::Relaxed);
+        if last != 0 && now.wrapping_sub(last) < 500 {
+            SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        LAST_MS.store(now.max(1), Ordering::Relaxed);
+        let dropped = SUPPRESSED.swap(0, Ordering::Relaxed);
+        serial_println!(
+            "xHCI: {} interrupt-IN error (slot {}, code {}); {} [+{} suppressed]",
+            what, slot_id, code,
+            if halting { "endpoint HALTED, queued for un-halt recovery" } else { "re-arming" },
+            dropped);
+    }
+
+    /// Main-loop hook (PIUSB-39 F1): un-halt and re-arm any HID interrupt-IN endpoint that took a
+    /// halting error completion. A Halted endpoint ignores the doorbell, so the plain re-queue the
+    /// event dispatch does for non-halting codes would be a silent no-op here — the pointer would
+    /// stay dead, which is the P54b-class hole for a stalling mouse. The sequence is the same pair
+    /// the bulk path uses (`reset_bulk_endpoint_host`), generalised over any DCI: **Reset
+    /// Endpoint** (TRB 14: Halted -> Stopped, clears the host sequence/toggle), **Set TR Dequeue
+    /// Pointer** (TRB 16: past the faulted TRB), then the device-side
+    /// `CLEAR_FEATURE(ENDPOINT_HALT)`, and finally the read is armed again. Synchronous, so it runs
+    /// here in the safe polled context rather than inside the event dispatch that noticed the error.
+    pub fn service_hid_halts(&mut self) {
+        while let Some((slot, is_mouse)) = self.hid_halt_pending.pop() {
+            if (slot as usize) >= self.slots.len() { continue; }
+            let (ep_addr, port, deq) = {
+                let s = &self.slots[slot as usize];
+                let ep = if is_mouse { s.mouse_ep } else { s.keyboard_ep };
+                let ring = if is_mouse { s.mouse_ring.as_ref() } else { s.keyboard_ring.as_ref() };
+                (ep, s.port_id, ring.map(|r| r.dequeue_reset_target()))
+            };
+            if ep_addr == 0 { continue; }
+            // A device that unplugged between the error and now: recovery would ring a doorbell
+            // for a completion that never arrives and burn the EP0 pump budget (same guard as
+            // `service_hid_setproto`). Hub-downstream slots carry port_id 0 -> treat as present.
+            if port != 0 && (self.read_portsc(port) & 1) == 0 {
+                serial_println!("xHCI: HID un-halt skipped for slot {} (device disconnected).", slot);
+                continue;
+            }
+            let dci: u32 = ((ep_addr as u32) & 0x0F) * 2 + if (ep_addr & 0x80) != 0 { 1 } else { 0 };
+            serial_println!(
+                "xHCI: [piusb39] un-halting {} interrupt-IN slot {} ep {:#04x} (dci {})",
+                if is_mouse { "pointer" } else { "keyboard" }, slot, ep_addr, dci);
+
+            // 1) Reset Endpoint: Halted -> Stopped.
+            let reset_trb = Trb { parameter: 0, status: 0,
+                control: (14 << 10) | (dci << 16) | ((slot as u32) << 24) };
+            match self.run_command_sync(reset_trb) {
+                Ok((1, _)) => {}
+                other => serial_println!("xHCI: [piusb39] Reset Endpoint unexpected {:?}", other),
+            }
+            // 2) Set TR Dequeue Pointer to the ring's current enqueue slot (past the faulted TRB).
+            if let Some((phys, dcs)) = deq {
+                let deq_trb = Trb { parameter: phys | (dcs as u64), status: 0,
+                    control: (16 << 10) | (dci << 16) | ((slot as u32) << 24) };
+                match self.run_command_sync(deq_trb) {
+                    Ok((1, _)) => {}
+                    other => serial_println!("xHCI: [piusb39] Set TR Dequeue unexpected {:?}", other),
+                }
+            }
+            // 3) Device-side CLEAR_FEATURE(ENDPOINT_HALT); wIndex = full endpoint address.
+            match self.sync_control(slot, 0x02, 0x01, 0x0000, ep_addr as u16, 0, 0, false) {
+                Ok(1) => {}
+                other => serial_println!("xHCI: [piusb39] CLEAR_FEATURE(HALT) unexpected {:?}", other),
+            }
+            // 4) The host ring dequeue moved; the old expectation is stale. Clear it so the first
+            //    completion after recovery is accepted, then arm the read.
+            {
+                let s = &mut self.slots[slot as usize];
+                if is_mouse { s.mouse_expect_phys = 0; s.mouse_prev_phys = 0; }
+                else { s.keyboard_expect_phys = 0; s.keyboard_prev_phys = 0; }
+            }
+            let armable = {
+                let s = &self.slots[slot as usize];
+                if is_mouse { s.mouse_data_buffer.is_some() && s.mouse_ring.is_some() }
+                else { s.data_buffer.is_some() && s.keyboard_ring.is_some() }
+            };
+            if armable {
+                if is_mouse {
+                    MOUSE_ERROR_REARM_COUNT.fetch_add(1, Ordering::Relaxed);
+                    self.queue_mouse_read(slot);
+                    Self::piusb39_witness("halt");
+                } else {
+                    self.queue_keyboard_read(slot);
+                }
+            }
+        }
+    }
+
     pub fn queue_mouse_read(&mut self, slot_id: u8) {
         unsafe {
             let ep_num = self.slots[slot_id as usize].mouse_ep & 0x0F;
@@ -7434,14 +7596,9 @@ impl XhciController {
             let rearms = MOUSE_REARM_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
             // PIUSB-39 witness — knob-gated (usbdebug) and BOUNDED (first arm + every 256th), so a
             // metal capture can read the pointer pipeline's liveness without flooding the FTDI.
-            #[cfg(feature = "usbdebug")]
             if rearms == 1 || rearms % 256 == 0 {
-                serial_println!(
-                    "[piusb39] mouse rearm={} discarded={}",
-                    rearms, MOUSE_DISCARD_REARM_COUNT.load(Ordering::Relaxed));
+                Self::piusb39_witness("poll");
             }
-            #[cfg(not(feature = "usbdebug"))]
-            let _ = rearms;
             self.ring_doorbell(slot_id, dci as u32);
             xdbg!("xHCI: Mouse Read Queued.");
         }
