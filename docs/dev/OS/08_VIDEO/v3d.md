@@ -1533,13 +1533,22 @@ like.
 QEMU `raspi4b` models no V3D block — the run returns at `BLOCK-DOWN` before the probe, so **no** `[v3d56]` line
 appears there, and `kernel8-test` green means *no regression*, not probe verification.
 
-## 31. The bin CL vs Mesa, field by field — the encoding is exonerated (V3D-57)
+## 31. The bin CL audited against v3d_packet.xml — the encoding is exonerated (V3D-57)
 
 P55b left the verdict "the flush/frame-close unit is clocked but never triggered", with one diagnostic rider:
 the PTB writes **nothing**, not even the initial tile-state, which would also be the signature of a binner that
-never truly starts. V3D-57 tests that rider the only way it can be tested off-metal — by diffing our binning
-control list against what Mesa v42 and Linux `v3d` actually emit, **field by field**, rather than against a
-comment claiming they were checked.
+never truly starts. V3D-57 tests that rider the only way it can be tested off-metal — by checking our binning
+control list against Mesa's v42 packet definitions **field by field**, rather than against a comment claiming
+they were checked.
+
+Two distinct things are reported below, and they must not be confused:
+
+- **the off-metal AUDIT** — an independent check: Mesa's XML was fetched and parsed, and our packets checked
+  against it. This is what exonerates the encoding.
+- **the on-metal `[v3d57]` WITNESS** — a **packing-consistency** check: its `mesa=` column is written from the
+  same audited constants the emitter uses, so a matching line proves the bytes *in arena memory* carry the
+  intended value at the audited offset. It is not a second opinion on Mesa, and its `0 diverged` is not
+  independent evidence about Mesa's encoding.
 
 The audit was run mechanically, not by eye: Mesa's own `src/broadcom/cle/v3d_packet.xml` (the file
 `gen_pack_header.py` generates every `V3DXX_*_pack` from) was parsed, every packet's v42-applicable variant
@@ -1547,9 +1556,14 @@ reduced to `(code, byte length, {(field start, width)})` using the generator's o
 (`max(field.end)//8 + 1`, field starts shifted by the 8-bit opcode), and **every `Pkt::new(...)` chain in
 `v3d.rs`** — binning and render side, all three builders — checked against it.
 
-### Result: 0 divergences in the control list
+### Audit result: 0 divergences in the control list
 
-| Packet (code) | Our length | Mesa length | Fields checked | Verdict |
+Verified against `v3d_packet.xml` v42 semantics: opcode, byte length, field `(start, width)` and encoding
+**form** (which fields are `minus_one`, which are enums). The load-bearing rows — code 120 is 9 bytes,
+width/height are pixels-MINUS-ONE at bits 32/48 (the v41+ form, not the pre-4.1 tile-count form), block enums
+1/128 B and 0/64 B — were each confirmed at the XML directly.
+
+| Packet (code) | Our length | XML length | Fields checked | Verdict |
 | --- | --- | --- | --- | --- |
 | `NUMBER_OF_LAYERS` (119) | 2 | 2 | layers@0 w8, **minus_one** → 1 layer packs as 0 | exact |
 | `TILE_BINNING_MODE_CFG` (120, `max_ver=42`) | 9 | 9 | init block@2 w2 =1(128 B) · overflow block@4 w2 =0(64 B) · RTs@8 w4 minus_one =0 · max BPP@12 w2 =0(32) · MSAA 4x@14 w1 =0 · double-buffer@15 w1 =0 · width@32 w16 minus_one =63 · height@48 w16 minus_one =63 | exact, 8/8 |
@@ -1574,8 +1588,8 @@ START_TILE_BINNING`, which is our prologue verbatim (the `Empty` rung's omission
 hasn't been validated"*. `FLUSH_ALL_STATE` (5) is **not** used, and `INCREMENT_SEMAPHORE` (7) is a VC4-era idiom
 no v3d 4.x emitter touches. Our `P_FLUSH = 4` terminator is correct and no semaphore is owed.
 
-So the "the binner never starts because the CL is malformed" branch of the P55b rider is **closed**: the bytes
-we hand the CLE are the bytes Mesa hands it.
+So the "the binner never starts because the CL is malformed" branch of the P55b rider is **closed**: opcode,
+length, ordering and encoding form all match what Mesa emits for the same frame.
 
 ### Two real divergences found — both outside the CL, both fixed
 
@@ -1606,24 +1620,35 @@ both were invisible to every prior audit because they live in the register path,
 ### Witness format
 
 ```
-:: V3D: [v3d57] <tag> bin CL — Mesa-v42 field diff (<n> bytes @ arena+0x…); expected column =
-        v3d_packet.xml + v3dX(start_binning)/bcl_epilogue ::
+:: V3D: [v3d57] <tag> bin CL — packing check vs the audited v42 encoding (<n> bytes @ arena+0x…);
+        read back from the PUBLISHED bytes, expected column = this driver's audited constants
+        (audit authority: v3d_packet.xml v42 + v3dX(start_binning)/bcl_epilogue) ::
 ::   [v3d57] [ i] +0x…… op=<n> <PACKET_NAME> len=<n> bytes=xx xx xx xx xx xx xx xx xx xx ::
 ::     [v3d57]   <field name>                    ours=<v>       mesa=<v>       OK|DIVERGE ::
+        (ours = read back from arena memory; mesa = the audited expected encoding)
 ::     [v3d57]   GL_SHADER_STATE (frame data)    record=0x……… attrs=<n> 32B-aligned=<0|1> ::
-:: V3D: [v3d57] <tag> verdict — packets=<n> field-diverged=<n> prologue-order=OK|DIVERGE
+:: V3D: [v3d57] <tag> verdict — packets=<n> packing-diverged=<n> prologue-order=OK|DIVERGE
         (CFG->[VCD]->[OQ]->START, terminator FLUSH/4 not FLUSH_ALL_STATE/5, no INCREMENT_SEMAPHORE)
-        | tile-STATE bytes ours=<n> mesa=<n> (<n> tile x 256) OK|DIVERGE
+        | tile-STATE bytes ours=<n> mesa=<n> (<n> tile x 256, v3d_tile_alloc_sizes) OK|DIVERGE
         | tile-ALLOC bytes ours=<n> mesa-min=<n> (align(tiles*128,4096)+8192) OK|DIVERGE ::
 :: V3D: [v3d57] <what> pre-job BPOS=0 (kernel-exact ORDER: first write of v3d_bin_job_run, before
         cache-invalidate and before the CT0QMA/QMS/QTS latch) — BPOA=0x……… BPOS=0x……… ::
 ```
 
-Every field line carries **both** columns, so one metal capture shows the diff without a rebuild — a packet
-whose encoding drifts later announces itself as `DIVERGE` next to the value Mesa would have written. Gated on
-`V3D57_CL_AUDIT` (default `true`); it fires for the PROBE, the bisect rungs and M4 — the three lists whose
-byte-equality is the standing claim. The per-frame battery kick issues the reordered `BPOS` write quietly
-(quiet-boot law).
+Read the columns honestly. `ours` is read back out of the **published arena bytes** — the bytes the CLE will
+actually fetch — while `mesa` is the audited expected encoding written from this driver's own constants. A
+matching line therefore proves *packing consistency* (builder intent survived into memory at the audited
+offset), and a `DIVERGE` line says the published bytes are not what our audited packing says they should be.
+It is deliberately **not** an independent re-derivation of Mesa: that check is the off-metal audit above, and
+`packing-diverged=0` is not extra evidence about Mesa's encoding. The one genuinely external comparison on the
+verdict line is the tile-**memory** sizing, which is compared against the literal `v3d_tile_alloc_sizes`
+formula (`tiles · 256`) rather than against the constant derived from it.
+
+Gated on `V3D57_CL_AUDIT`, a plain `const` (default `true`); it fires for the PROBE, the bisect rungs and M4 —
+the three lists whose byte-equality is the standing claim. Volume is **~60–100 lines per boot**, one shot per
+CL: deliberate, within the `V3D-46`/`-54`/`-56` one-shot-witness precedent, and **one flip to `false`** silences
+the whole battery once the metal capture has been taken. The per-frame battery kick issues the reordered `BPOS`
+write quietly (quiet-boot law).
 
 ### What P57 metal decides
 

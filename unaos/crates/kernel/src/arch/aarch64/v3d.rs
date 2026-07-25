@@ -4034,7 +4034,8 @@ fn probe_job() {
     // control list is EXONERATED as the cause of the coord shader never dispatching (valid_instr=0) and
     // the difference lives in the shader-state record — see build_probe_shader_record.
     decode_cl_packets("PROBE", OFF_PROBE_BIN_CL, bin_len);
-    // PI-V3D-57: the same list again, field-by-field against Mesa v42 (expected column beside ours).
+    // PI-V3D-57: the same list again, read back from the published bytes and packing-checked field by
+    // field against the audited v42 encoding (see the packing-consistency note on v3d57_cl_mesa_diff).
     v3d57_cl_mesa_diff("PROBE", OFF_PROBE_BIN_CL, bin_len);
 
     // ── [v3d30] executed-bytes witness ──────────────────────────────────────────────────────────
@@ -4556,7 +4557,8 @@ fn submit_bisect_rung_tagged(tag: &str, rung: &str, content: BinContent, shadrec
     }
     // Decode the rung's CL packet-by-packet so the log shows exactly which packets this rung submitted.
     decode_cl_packets("v3d48 bisect", OFF_PROBE_BIN_CL, bin_len);
-    // PI-V3D-57: the same list again, field-by-field against Mesa v42 (expected column beside ours).
+    // PI-V3D-57: the same list again, read back from the published bytes and packing-checked field by
+    // field against the audited v42 encoding (see the packing-consistency note on v3d57_cl_mesa_diff).
     v3d57_cl_mesa_diff("v3d48 bisect", OFF_PROBE_BIN_CL, bin_len);
 
     clear_mmu_fault_latch("v3d48 bisect pre-kick");
@@ -4871,7 +4873,8 @@ fn triangle_job(fb: Option<FbTarget>) -> bool {
     // probe_job under the same tag) is diffed against. Same builder → same packets; the only field that
     // may differ is GL_SHADER_STATE `record` (M4 record vs probe record).
     decode_cl_packets("M4", OFF_BIN_CL, bin_len);
-    // PI-V3D-57: the same list again, field-by-field against Mesa v42 (expected column beside ours).
+    // PI-V3D-57: the same list again, read back from the published bytes and packing-checked field by
+    // field against the audited v42 encoding (see the packing-consistency note on v3d57_cl_mesa_diff).
     v3d57_cl_mesa_diff("M4", OFF_BIN_CL, bin_len);
     // PI-V3D-57: kernel-exact ORDER — `v3d_bin_job_run`'s FIRST write is BPOS=0, and only then the
     // per-job cache invalidate below. (V3D-12 read "invalidate first" from the middle of that function.)
@@ -6088,16 +6091,22 @@ fn decode_cl_packets(tag: &str, off: usize, len: usize) {
     }
 }
 
-// ─── PI-V3D-57: the bin-CL ↔ Mesa byte-for-byte witness ────────────────────────────────────────────
+// ─── PI-V3D-57: the bin-CL packing witness ─────────────────────────────────────────────────────────
 //
-// V3D-57 brief: "why does the binner not start?" — settle it by diffing our bin CL against what Mesa
-// v42 + Linux v3d actually emit, FIELD BY FIELD, on the capture rather than in a comment. Off-metal the
-// audit was run mechanically against Mesa's own `src/broadcom/cle/v3d_packet.xml` (the file the packers
-// are generated from) for EVERY `Pkt::new` in this driver — every packet's byte length and every field's
-// (start, width) matched a v42-applicable XML variant, so the CL encoding is exonerated (see v3d.md §31
-// for the table). What could NOT be settled off-metal is what the hardware was actually handed, so this
-// witness prints the built bytes with, beside each field, the value Mesa emits for the same frame and an
-// OK/DIVERGE verdict — one metal boot shows the diff without a rebuild.
+// V3D-57 brief: "why does the binner not start?" — settle the CL half of that question. The AUDIT was
+// done off-metal and mechanically, against Mesa's own `src/broadcom/cle/v3d_packet.xml` (the file the
+// packers are generated from): every `Pkt::new` in this driver had its byte length and every field's
+// (start, width) checked against a v42-applicable XML variant, and the load-bearing facts — code 120 is
+// 9 bytes, width/height are pixels-MINUS-ONE at bits 32/48 (the v41+ form), the block enums are 1/128B
+// and 0/64B — were confirmed there. See v3d.md §31 for the table.
+//
+// WHAT THIS WITNESS IS, PRECISELY. It is NOT an independent re-derivation of Mesa's encoding: the
+// `mesa=` column is written from the same audited constants the emitter uses, so a matching line proves
+// the bytes IN ARENA MEMORY carry the value the builder intended at the offset the audit blessed —
+// a PACKING-CONSISTENCY check (builder vs the bytes the CLE will actually fetch), not a second opinion
+// on Mesa. That is still the thing no off-metal check can give: it reads the published list back out of
+// the arena. Read the `mesa=` column as "the audited expected encoding", and a DIVERGE line as "the
+// bytes in memory are not what this driver's own audited packing says they should be".
 //
 // Mesa authorities for the expected column (all MIT, attributed):
 //   · prologue + order: `v3dX(start_binning)` (gallium v3dx_draw.c) and `v3dX(job_emit_binning_prolog)`
@@ -6110,10 +6119,16 @@ fn decode_cl_packets(tag: &str, off: usize, len: usize) {
 //   · block sizes: v3d_limits.h — INITIAL=128 (enum 1), OVERFLOW=64 (enum 0), enum = size >> 7.
 //   · tile memory: `v3d_tile_alloc_sizes` (v3d_util.c) — tile_state = tiles·256, tile_alloc =
 //     align(tiles·128, 4096) + 8192 (+ a draw-scaled continuation pool).
+//
+// Volume: ~60–100 lines per boot, one shot per CL (PROBE, each bisect rung, M4) — deliberate, and in the
+// V3D-46/54/56 one-shot-witness precedent. `V3D57_CL_AUDIT` is a plain const: ONE flip to `false`
+// silences the whole battery once the metal capture has been taken.
 const V3D57_CL_AUDIT: bool = true;
 
-/// One field line of the [v3d57] witness: name, our value, Mesa's expected value, verdict. Returns 1
-/// when the field DIVERGES, so the caller can total the divergences for the verdict line.
+/// One field line of the [v3d57] witness: name, the value read back out of the published bytes, the
+/// audited expected encoding, verdict. Returns 1 when the field DIVERGES, so the caller can total the
+/// divergences for the verdict line. (The expected column comes from this driver's audited constants —
+/// see the packing-consistency note above; it is not an independent re-derivation of Mesa.)
 #[must_use]
 fn v3d57_field(name: &str, ours: u64, want: u64) -> u32 {
     let bad = ours != want;
@@ -6134,7 +6149,7 @@ fn v3d57_cl_mesa_diff(tag: &str, off: usize, len: usize) {
         return;
     }
     serial_println!(
-        ":: V3D: [v3d57] {} bin CL — Mesa-v42 field diff ({} bytes @ arena+{:#x}); expected column = v3d_packet.xml + v3dX(start_binning)/bcl_epilogue ::",
+        ":: V3D: [v3d57] {} bin CL — packing check vs the audited v42 encoding ({} bytes @ arena+{:#x}); read back from the PUBLISHED bytes, expected column = this driver's audited constants (audit authority: v3d_packet.xml v42 + v3dX(start_binning)/bcl_epilogue) ::",
         tag, len, off
     );
     // Field read: XML `start` is relative to the bit AFTER the opcode byte, so absolute bit = start + 8.
@@ -6292,9 +6307,13 @@ fn v3d57_cl_mesa_diff(tag: &str, off: usize, len: usize) {
     // The two facts the CL bytes cannot carry: the prologue order, and the tile memory the REGISTERS
     // (not the packets) hand the PTB on v42 — v3d_job.c: "On V3D 4.1, the tile alloc/state setup moved
     // to register writes instead of binner packets."
-    let ts_want = TILE_STATE_TILES * TILE_STATE_BYTES_PER_TILE;
+    // Tile-STATE sizing, compared against the LITERAL Mesa formula rather than against the constant that
+    // is derived from it — `TILE_STATE_BYTES == TILE_STATE_TILES * TILE_STATE_BYTES_PER_TILE` holds by
+    // definition, so comparing those two would print an unreachable DIVERGE arm. The literal 256 is the
+    // closing line of Mesa `v3d_tile_alloc_sizes` (v3d_util.c): tile_state = layers·tiles_x·tiles_y·256.
+    let ts_want = TILE_STATE_TILES * 256;
     serial_println!(
-        ":: V3D: [v3d57] {} verdict — packets={} field-diverged={} prologue-order={} (CFG->[VCD]->[OQ]->START, terminator FLUSH/4 not FLUSH_ALL_STATE/5, no INCREMENT_SEMAPHORE) | tile-STATE bytes ours={} mesa={} ({} tile x 256) {} | tile-ALLOC bytes ours={} mesa-min={} (align(tiles*128,4096)+8192) {} ::",
+        ":: V3D: [v3d57] {} verdict — packets={} packing-diverged={} prologue-order={} (CFG->[VCD]->[OQ]->START, terminator FLUSH/4 not FLUSH_ALL_STATE/5, no INCREMENT_SEMAPHORE) | tile-STATE bytes ours={} mesa={} ({} tile x 256, v3d_tile_alloc_sizes) {} | tile-ALLOC bytes ours={} mesa-min={} (align(tiles*128,4096)+8192) {} ::",
         tag, idx, diverged,
         if order_ok { "OK" } else { "DIVERGE" },
         TILE_STATE_BYTES, ts_want, TILE_STATE_TILES,
