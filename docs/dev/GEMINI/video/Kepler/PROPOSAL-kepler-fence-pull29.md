@@ -1,4 +1,23 @@
-STATUS: PROPOSED
+STATUS: APPROVED (GR5, 2026-07-25) with FOUR BINDING AMENDMENTS:
+1. PLACEMENT — the entire block runs where the relocated s32 recon ran (AFTER
+   `hb final`), keeping every s30-proven read ahead of any unverified access.
+   Keep the recon-pre/recon-post cpuctl control-bracket discipline: cpuctl
+   before the rotated read, and the recovery re-read after the clear attempt
+   doubles as recon-post. Print every value raw.
+2. ERROR-CLEAR WRITES are write-back-of-observed-bits ONLY — read the
+   register, print it, write back exactly the value read (W1C of what is
+   actually set). Never a blanket 0xFFFFFFFF, never a constant.
+3. DO NOT WRITE THE CTXCTL ENABLE BIT this pull. Step 1 is a READ of
+   0x122104 only. If it reads with bit 4 clear, that is the headline fact and
+   the enable-set is pull 30's one-line experiment, not an inline extra.
+4. ORDER THE NEW SPACES DEFENSIVELY — read 0x122104 (PIBUS) BEFORE touching
+   0x409800, and print it immediately; if PIBUS itself returns BADF-family,
+   STOP the block there (skip the rotation and clear legs) and let the boot
+   continue — do not risk poisoning a second unit blind. A skipped leg prints
+   an explicit `:: kepler: pring skip <reason> ::` so the capture is
+   self-explaining.
+Everything else as proposed, including the rotation target CC_SCRATCH[0]
+(0x409800) as the boot's one clean datum.
 
 # PROPOSAL: kepler-fence pull 29 - PRING Poison, Subunit Gating & Truth Recovery
 

@@ -1,19 +1,21 @@
 # PETER'S RELAY SHEET — not for specialists. Coordinator overwrites this with
 # the message(s) Peter posts into each Gemini chat, verbatim.
-# (updated 2026-07-25: s31+s32 folded — pull 28 CLOSED, PRI-poison law found and double-confirmed; pull 29 invited)
+# (updated 2026-07-25: fence pull 29 APPROVED with four binding amendments)
 
 ## → kepler-fence session
 
-Fence: pull 28 is closed, and your probe found something sharper than what it went looking for. Two sittings of results:
+Fence: pull 29 proposal APPROVED — and it's a good one. The CTXCTL-subunit-gating theory is the first explanation that accounts for both facts at once (base 0x000–0x3FF works, everything at 0x400+ faults), it names a testable enable bit, and the PRING error registers give us observation AND a recovery path in one boot. Four binding amendments, all about not paying for the answer twice:
 
-s31: the very first recon read (WRCMD_CMD, 0x409504) returned BADF1000 — and then EVERY subsequent read of the 0x409xxx unit returned BADF1000 for the rest of the boot, including registers that read real values seconds earlier (cpuctl was 00000010 right before the block) and everything s30 had proven (mailboxes, IMEM readback). Your verify-gates did exactly their job: ucode A and HB both ABORTED cleanly on readback mismatch rather than starting blind. PFIFO was untouched.
+1. PLACEMENT: the whole block runs where the s32 relocated recon ran — AFTER `hb final`, so every proven read completes first. Keep the control-bracket discipline: cpuctl read before the rotated first read; your recovery re-read after the clear doubles as the closing bracket. Print every value raw.
 
-s32 (coordinator relocated the block after `hb final` and bracketed it with cpuctl control reads): s30 behavior FULLY RESTORED — ucode A executed again (mailbox0=F00DFACE), heartbeat mb1 0x4 → 0x57C9 → 0x5B2E → 0x343B4 across the witness, signature unchanged. Then the control frame: `recon-pre cpuctl=00000000` (real — your HB was still running) … all seven recon offsets BADF1000 … `recon-post cpuctl=BADF1000`, the SAME register, microseconds apart.
+2. ERROR-CLEAR WRITES: write-back-of-observed-bits only — read, print, write back exactly what you read (W1C of what is actually set). Never a blanket 0xFFFFFFFF.
 
-THE NEW SILICON LAW: on this GK107, the first access to a bad 0x409xxx offset faults immediately and poisons all subsequent reads of the FECS unit for the rest of the boot. Consequences: (1) the only clean per-offset datum is 0x409504 = absent-or-faulting; the other six gf100-era ctxctl offsets are CONFOUNDED, not disproven; (2) the s24/s25 all-BADF1000 sweeps are retroactively suspect for the same reason; (3) the pull-28 amendment stands — no hypothesis writes against any offset not proven readable.
+3. DO NOT write the CTXCTL enable bit this pull. Step 1 reads 0x122104 only. If bit 4 is clear, that's the headline — setting it is pull 30's one-line experiment with its own control frame, not an inline extra.
 
-PULL 29 INVITATION — propose a per-offset truth strategy, cleanroom as always. Candidate directions (pick, combine, or better them): (a) rotate which offset is read FIRST across boots — one clean datum per boot, slow but certain; (b) cleanroom study of the PRI fault/error mechanism on Kepler — is there a host-visible error-clear (PPRI/ringmaster family) that un-wedges the unit so several offsets can be probed per boot? cite sections; (c) re-derive where the GK107 FECS host-interface actually lives — nouveau drives 0x409504 on gk104, so a fault HERE is surprising; is there a Kepler-specific layout difference, an enable prerequisite (clock/priv gating), or an access-width requirement? A proposal that explains WHY 0x409504 faults on a part whose siblings use it may be worth more than the six remaining values.
+4. DEFENSIVE ORDER on the new space: read 0x122104 (PIBUS) FIRST and print it immediately. If PIBUS itself answers BADF-family, STOP the block there — skip the rotation and clear legs, print `:: kepler: pring skip <reason> ::`, and let the boot continue. We are not poisoning a second unit blind.
+
+Everything else as proposed, including CC_SCRATCH[0] (0x409800) as the rotation target — worst case the boot still banks one clean datum. Implement as approved + amendments, commit ALL docs+code, delete scratch, no push. Report "PUSH OWED: n". (I run all builds and gates.)
 
 ## → kepler-display session
 
-Display: no change since the last relay — s31/s32 were fence sittings; the panel showed the calibration draw unchanged, as expected. Your lane remains idle pending the coordinator's console wiring. Nothing owed from you.
+Display: no change — lane idle pending coordinator console wiring (in progress coordinator-side). Nothing owed from you.
