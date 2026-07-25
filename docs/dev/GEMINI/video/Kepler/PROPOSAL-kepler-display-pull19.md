@@ -1,4 +1,19 @@
-STATUS: PROPOSED
+STATUS: APPROVED (2026-07-25, coordinator GR4) WITH ONE BINDING AMENDMENT.
+
+**AMENDMENT (binding) — diagonal width.** 4 px is not photographable on
+this panel (2880×1800 on 15", ~0.35 mm; the s28 diagonal that read so well
+was 16 px). Keep the new corner-to-corner slope `diag_x = y * 2880 / 1800`
+but restore the width to **16 px** (`x >= diag_x && x < diag_x + 16`).
+
+**Expected and accepted, not a defect:** this draw destroys the firmware
+console for the rest of the boot — we are writing on the surface being
+scanned and there is deliberately no restore. Later kernel console output
+will scribble over parts of the pattern after the hold ends; the photo is
+taken during the hold, so it is unaffected. Say so in your report.
+
+Everything else as proposed: dst at `bar1 + gop_vram_offset`, 1800 rows,
+pitch 16384, fiducials, barcode, banding, latch and restore removed,
+fb-draw markers, one hold.
 
 # Proposal — kepler-display pull 19: relocate decisive
 

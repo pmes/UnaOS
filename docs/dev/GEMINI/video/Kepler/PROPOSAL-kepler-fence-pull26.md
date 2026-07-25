@@ -1,4 +1,5 @@
-STATUS: PROPOSED
+STATUS: APPROVED (2026-07-25, coordinator GR4). No amendments — one write,
+honest-null on refusal, baseline untouched.
 
 # PROPOSAL: kepler-fence pull 26 - Clear DMACTL REQUIRE_CTX
 
