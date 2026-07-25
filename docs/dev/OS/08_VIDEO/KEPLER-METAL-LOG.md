@@ -17,7 +17,17 @@ band" mystery, now linearly measurable). Pull 17 = row-offset
 calibration: distinctive single white marker rows at known indices on
 black; photo names the offset; then adjust the pointer/fill and the full
 panel is ours.
-**CAPTURE CAVEAT (coordinator awk, post-close):** the s26boot1 capture
+**s26boot3 CLOSE (coordinator awk-verified): SERIAL PROOF CLOSED, RING
+WORKAROUND CONFIRMED.** Full ladder in-capture: lin-step fill done
+bytes=01C20000 exact + holds 1–5 + done; late-recap fb=00016000 ran=true
+(trace head 917D0210 — the EVO core class id, a nice bonus witness);
+fal-base verdicts byte-identical to boot1 (stable, not a fluke); witness
+baseline unchanged; ZERO dense fal-base rows (trim verified). Pull 16 is
+now closed on BOTH channels (boot1 photo + boot3 serial). Boot from
+s26boot3-latereap-trim-20260725T1603Z-b5f273c4, coordinator ESP
+sha-matched (70870709…), capture from byte 1063936.
+
+**Original boot1 capture caveat (coordinator awk, post-close):** the s26boot1 capture
 attached MID-GPU-INIT — zero early-init lines present (no Initializing
 Kepler / VRAM / therm / mirror-hdr; first GPU line is pgraph-pulse pre).
 Fox's "0 lin-step lines" is true of the CAPTURE, not the boot: the
