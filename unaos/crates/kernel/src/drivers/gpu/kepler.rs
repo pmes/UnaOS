@@ -677,29 +677,45 @@ pub fn init(gpu: &GpuInfo) {
                                     // poisoning is observed in-boot rather than inferred.
                                     serial_println!(":: kepler: recon-pre cpuctl={:08X} ::", mmio_read(bar0, 0x409000 + 0x100));
                                     
-                                    // Pull 29: read PIBUS first (defensive order)
-                                    let pibus_en1 = mmio_read(bar0, 0x122104);
-                                    serial_println!(":: kepler: recon PIBUS_MMIO_HUB_ENABLE1={:08X} ::", pibus_en1);
-                                    
-                                    if (pibus_en1 >> 16) == 0xBADF {
-                                        serial_println!(":: kepler: pring skip PIBUS itself answered BADF-family ::");
-                                    } else {
-                                        // Rotate to CC_SCRATCH[0] to test the gating theory
-                                        serial_println!(":: kepler: recon CC_SCRATCH[0]={:08X} ::", mmio_read(bar0, 0x409000 + 0x800));
-                                        
-                                        // Error-clear writes (W1C observed bits)
-                                        let intr_addr = mmio_read(bar0, 0x120120);
-                                        serial_println!(":: kepler: recon PIBUS_INTR_ADDR={:08X} ::", intr_addr);
-                                        serial_println!(":: kepler: recon PIBUS_INTR_VALUE={:08X} ::", mmio_read(bar0, 0x120124));
-                                        if intr_addr != 0 { mmio_write(bar0, 0x120120, intr_addr); }
-                                        
-                                        let pibus_intr = mmio_read(bar0, 0x120128);
-                                        serial_println!(":: kepler: recon PIBUS_INTR={:08X} ::", pibus_intr);
-                                        if pibus_intr != 0 { mmio_write(bar0, 0x120128, pibus_intr); }
-                                        
-                                        let pbus_intr = mmio_read(bar0, 0x1100);
-                                        serial_println!(":: kepler: recon PBUS_INTR={:08X} ::", pbus_intr);
-                                        if pbus_intr != 0 { mmio_write(bar0, 0x1100, pbus_intr); }
+                                    // Pull 30: Chain Experiment (Safest First)
+                                    let offsets = [
+                                        ("CC_SCRATCH[1]", 0x804),
+                                        ("CHAN_CUR", 0xb00),
+                                        ("CHAN_NEXT", 0xb04),
+                                        ("ENGINE_STATUS", 0xc00),
+                                        ("ENGINE_TRIGGER", 0xc08),
+                                    ];
+
+                                    let mut wedged = false;
+                                    for &(name, off) in &offsets {
+                                        if wedged {
+                                            serial_println!(":: kepler: recon {} (0x{:03X}) SKIP (tainted) ::", name, off);
+                                            continue;
+                                        }
+
+                                        let val = mmio_read(bar0, 0x409000 + off);
+                                        if (val >> 16) == 0xBADF {
+                                            serial_println!(":: kepler: recon {} (0x{:03X})={:08X} FAULT ::", name, off, val);
+                                            wedged = true;
+                                            
+                                            // PRING Observe/Clear sequence
+                                            let intr_addr = mmio_read(bar0, 0x120120);
+                                            let intr_val = mmio_read(bar0, 0x120124);
+                                            let pibus_intr = mmio_read(bar0, 0x120128);
+                                            let pbus_intr = mmio_read(bar0, 0x1100);
+                                            
+                                            serial_println!(":: kepler: recon PRING-clear INTR_ADDR={:08X} INTR_VALUE={:08X} PIBUS_INTR={:08X} PBUS_INTR={:08X} ::", intr_addr, intr_val, pibus_intr, pbus_intr);
+                                            
+                                            if intr_addr != 0 { mmio_write(bar0, 0x120120, intr_addr); }
+                                            if intr_val != 0 { mmio_write(bar0, 0x120124, intr_val); }
+                                            if pibus_intr != 0 { mmio_write(bar0, 0x120128, pibus_intr); }
+                                            if pbus_intr != 0 { mmio_write(bar0, 0x1100, pbus_intr); }
+                                            
+                                            // Test un-wedge
+                                            serial_println!(":: kepler: recon un-wedge-test cpuctl={:08X} ::", mmio_read(bar0, 0x409000 + 0x100));
+                                        } else {
+                                            serial_println!(":: kepler: recon {} (0x{:03X})={:08X} ::", name, off, val);
+                                        }
                                     }
                                     
                                     serial_println!(":: kepler: recon-post cpuctl={:08X} ::", mmio_read(bar0, 0x409000 + 0x100));
