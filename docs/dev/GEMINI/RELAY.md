@@ -1,19 +1,19 @@
 # PETER'S RELAY SHEET — not for specialists. Coordinator overwrites this with
 # the message(s) Peter posts into each Gemini chat, verbatim.
-# (updated 2026-07-25: pull 31 APPROVED with three binding amendments; pull-30 backfill accepted)
+# (updated 2026-07-25: s35 folded — bind TOOK / CHAN_VALID no / post-bind leg VOID by coordinator error; pull 32 invited)
 
 ## → kepler-fence session
 
-Fence: pull 31 proposal APPROVED — and thank you for the pull-30 backfill and the PBUS_INTR decode; both accepted, the record is whole again (bit 2 MMIO_RING_ERR + bit 3 MMIO_FAULT naming our BADF1000 as a PRING "target refused transaction" is a satisfying close on that thread). Direction (a) is the right call, and the g80_channel derivation (inst_off>>12, consistent with our own runlist encoding) is exactly the kind of cited value amendments exist to check. Three binding amendments:
+Fence: s35 results — two real findings, one void line, and the void is the coordinator's fault, not yours.
 
-1. WRITE SAFETY: these are the first writes ever aimed at FECS offsets. After EACH write (CHAN_CUR, then CHAN_NEXT), read the register back immediately and print it. Any BADF-family readback → print FAULT, skip the rest of the block, no inline clear — bank the data. Control bracket closes as usual.
+REAL: your bind writes TOOK. `bind CHAN_CUR=00002000` and `bind CHAN_NEXT=00002000` — real echoes of inst_off>>12, no fault, no poison. The first successful writes into the CTXCTL surface. And `bind-post ENGINE_STATUS=00000000` — CHAN_VALID does not assert from a bare MMIO bind. That is your amendment-3 finding branch, cleanly: CTXCTL state is not built by poking its registers; per your own study, the FECS context ucode is what accepts a context.
 
-2. ORDERING HONESTY + EXPLICIT POST-BIND WITNESS LEG: your block runs after `hb final` — AFTER the strip test, BEFORE the runlist submit, so "naturally proceed to witness-rematch" only covers the post-submit reading. Add ONE explicit leg after the bind: re-apply the VALID/POLL bits to the channel word exactly as the existing witness does (the same inst_off+0x0C write), read back, print. Strip recurs = bind didn't satisfy PFIFO; bits hold = breakthrough. Label the markers pre-bind vs post-bind so the capture is self-explaining. Then the existing submit runs unchanged.
+VOID: `witness post-bind=80000000` observed nothing. The amendment directed that leg at `inst_off+0x0C` — which is the instance block in PLAIN VRAM; RAM holds whatever you write. The historic strip lives in the PFIFO channel-table REGISTER: write 0xC0000000|inst>>12 to 0x800000+(1*8), read it back, see 00002000. You implemented the amendment faithfully; the amendment was wrong. Logged in the metal log against the coordinator, alongside the pull-25 port error.
 
-3. EXPECTATION DISCIPLINE: print ENGINE_STATUS raw, pre and post. CHAN_VALID (bit 1) is the hypothesis, not an assertion — if ENGINE_STATUS stays 0, that IS the finding (bare MMIO bind doesn't take; the arc's next question becomes what makes CTXCTL accept one, likely the FECS ucode itself per your study §3).
+UNCHANGED: `witness-rematch end err=00000002 stat=00000005 valid=00002000` — the strip's ninth confirmation, now known to persist even with CHAN_CUR/CHAN_NEXT populated.
 
-Implement as approved + amendments, commit ALL docs+code, delete scratch, no push. Report "PUSH OWED: n". (I run all builds and gates.)
+PULL 32 INVITATION — the corrected one-liner, propose it (short proposal is fine): after the bind (keep pull 31's sequence exactly as landed), add the REGISTER-side strip test: rewrite PFIFO_CHAN[1] word 0 (0xC0000000 | inst_off>>12) at 0x800000+(1*8), read it back immediately, print pre-bind-style and post-bind-style labels. That is the actual question pull 31 meant to ask: does a populated CHAN_CUR change what PFIFO's channel-table does with the VALID/POLL bits? Also relay the bonus line we captured for your read: `post-bind playlist_rd=00002013 playlist_rd_len=00100003` — decode 0x2013/0x00100003 against your PFIFO knowledge in the proposal if you can (playlist readback: entry visible? length field?).
 
 ## → kepler-display session
 
-Display: lane graduated and idle; the scale-4 console tweak rides the next ESP. Nothing owed from you.
+Display: scale-4 confirmed on glass — Peter: "text looks great." The console question is fully closed; lane idle, nothing owed.

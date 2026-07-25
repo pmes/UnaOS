@@ -3,6 +3,57 @@
 Hard-won silicon facts from the fox-metal sitting series. Trust these over any
 QEMU behavior. Newest sitting first.
 
+## Sitting #35 (fence pull 31 first context-bind + SMC derived-ac + scale-4 console, UnaOS-gemini@6fbbb939, 2026-07-25, fox-metal-r23s1n, s35boot1)
+
+**FENCE — THE BIND TAKES; CHAN_VALID DOES NOT; AND THE "VALID BIT HELD"
+LINE IS VOID — CORDINATOR AMENDMENT ERROR, STATED PLAINLY FOR THE
+RECORD.** Coordinator awk-verified:
+```
+:: kepler: bind-pre CHAN_CUR=00000000 CHAN_NEXT=00000000 ENGINE_STATUS=00000000 ::
+:: kepler: bind CHAN_CUR=00002000 ::        <- write TOOK (echo = inst_off>>12)
+:: kepler: bind CHAN_NEXT=00002000 ::       <- write TOOK
+:: kepler: bind-post ENGINE_STATUS=00000000 ::   <- CHAN_VALID NOT asserted
+:: kepler: witness post-bind=80000000 ::         <- VOID (see below)
+:: kepler: witness-rematch end err=00000002 stat=00000005 valid=00002000 ::  <- stripped, NINTH confirmation
+```
+REAL findings banked: (1) **CHAN_CUR/CHAN_NEXT are host-writable and hold
+a channel id** — the first successful writes into the FECS CTXCTL surface,
+no fault, no poison. (2) **Bare MMIO bind does NOT assert CHAN_VALID** —
+ENGINE_STATUS stays 0. The finding branch: CTXCTL state is not built by
+poking its registers; something (per the study, the FECS context ucode
+itself) must run to accept a context. (3) The PFIFO strip is UNCHANGED
+with CHAN_CUR/CHAN_NEXT populated — err=2/stat=5/valid=2000, ninth
+confirmation.
+
+**THE AMENDMENT ERROR (GR5, logged like its predecessors):** amendment 2
+directed the post-bind witness leg at `inst_off+0x0C` — but that word is
+the instance block in PLAIN VRAM; a readback of RAM trivially returns
+what was written. The historic strip lives in the PFIFO channel-table
+REGISTER (0x800008: write 0xC0000000|inst>>12, read back 00002000). The
+`witness post-bind=80000000` line therefore observed nothing. The correct
+post-bind strip test — rewrite PFIFO_CHAN[1] word 0 after the bind and
+read it back — was NOT run this boot and is pull 32's one-liner. Fox
+relayed exactly per the brief's (wrong) decision table; the misread was
+mine at brief time, caught at fold time. Amendments must be derived
+against the code, not from memory of it.
+
+Bonus line relayed verbatim (not in the brief's expected set):
+`post-bind playlist_rd=00002013 playlist_rd_len=00100003`.
+
+**Console — scale-4 CONFIRMED on glass.** `glyphs-active … cell=32x32
+cols=90 rows=56 scale=4` and Peter's verdict: "text looks great." Size
+question closed.
+
+**SMC — the robustness arc earned its keep on first metal.** New fields
+live: `ac=derived:discharging retries=6/8` — six retries in one sweep on
+real hardware, a mid-line dropout hole visible (`rem=-mAh`), and the
+hold/release machinery observed cycling (`sweep aborted — first key BRSC
+stuck` → `holding last good reading (age 1000 ms)` → `good reading
+returned — hold released`). The flakiness is real and now measured.
+
+Capture from mark s35boot1. ESP by coordinator (6fbbb939…), Fox
+sha-verified, flashed only.
+
 ## Sitting #34 (fence pull 30 chain probe, UnaOS-gemini@beb7292d, 2026-07-25, fox-metal-r23s1n, s34boot1)
 
 **⭐ 0x409504 (WRCMD_CMD) CONVICTED BY ELIMINATION — ALL FIVE REMAINING
