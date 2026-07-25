@@ -18,14 +18,21 @@ Magic in MAILBOX0 = first UnaOS-authored code executed on GPU silicon.
 FECS first; GPCCS only after FECS behaves. CLEANROOM notice binding —
 instruction encodings cited from envytools falcon ISA docs only.
 
-**Display — ROW-CAL PHOTO VERDICT: only WHITE (rows 0–7) visible, a
-single line ~62–66% down the panel; RED@448, GREEN@896, BLUE@1344,
-MAGENTA@1792 all ABSENT.** That refutes simple 1:1-with-offset: at 1:1,
-red@448 would land ~600 panel rows below the white line and still be
-on-screen. Also note the arithmetic bound: our pointer 0x1600000 is only
-352 rows (×16384) above VRAM 0, so a 1:1 scan placing our row 0 at panel
-~1190 is impossible — the placement model involves scaling, a partial
-scan window, or a wrap. Candidates for the specialist to discriminate:
+**Display — ROW-CAL PHOTO: only WHITE (rows 0–7) visible, a single line
+~62–66% down the panel; RED@448, GREEN@896, BLUE@1344, MAGENTA@1792 all
+absent. RECORD THIS AS INCONCLUSIVE, NOT AS A MEASURED NULL** (revised
+2026-07-25 after s28 land-review; the first fold over-concluded twice):
+- A mostly-black surface with five 8-row lines is photographically
+  indistinguishable from a mostly-black FIRMWARE CONSOLE — a thin white
+  line ~⅔ down is exactly where a boot-log cursor sits — and phone
+  auto-exposure locked to a blown-out white line would bury four 0.9 mm
+  saturated colour lines. We may have photographed the console, not us.
+- **Arithmetic correction:** the first fold said our pointer sits "352
+  rows above VRAM 0". Wrong — 0x1600000 / 16384 = **1408 rows**. There is
+  no impossibility; that argument is withdrawn.
+So 1:1-with-offset is NOT refuted, merely unconfirmed. Hypotheses still
+live, and pull 18 must first prove the latch does anything at all
+(pre-latch control frame):
 (a) vertical scaling (fw mode < native, line-doubling), (b) scan window
 smaller than 1800 rows, (c) pointer-latch granularity. Pull 18 =
 specialist-designed placement-model probe (single latch cycle,
