@@ -700,11 +700,15 @@ pub fn init(gpu: &GpuInfo) {
                                             
                                             serial_println!(":: kepler: bind-post ENGINE_STATUS={:08X} ::", mmio_read(bar0, 0x409C00));
                                             
-                                            // Explicit post-bind witness leg
-                                            let witness_val = ((userd_off >> 32) as u32) | 0x80000000;
-                                            unsafe { core::ptr::write_volatile((bar1 + inst_off + 0x0C) as *mut u32, witness_val) };
-                                            let witness_post = unsafe { core::ptr::read_volatile((bar1 + inst_off + 0x0C) as *const u32) };
-                                            serial_println!(":: kepler: witness post-bind={:08X} ::", witness_post);
+                                            // Explicit post-bind witness leg (PFIFO_CHAN[1] Register)
+                                            let pre_rw = mmio_read(bar0, 0x800000 + (1 * 8));
+                                            serial_println!(":: kepler: witness pre-rewrite PFIFO_CHAN[1]={:08X} ::", pre_rw);
+                                            
+                                            let witness_val = 0xC0000000 | ((inst_off as u32) >> 12);
+                                            mmio_write(bar0, 0x800000 + (1 * 8), witness_val);
+                                            
+                                            let witness_post = mmio_read(bar0, 0x800000 + (1 * 8));
+                                            serial_println!(":: kepler: witness post-bind PFIFO_CHAN[1]={:08X} ::", witness_post);
                                         }
                                     }
                                     
