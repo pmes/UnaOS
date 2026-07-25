@@ -480,6 +480,41 @@ pub fn init(gpu: &GpuInfo) {
                                     let final_err = mmio_read(bar0, 0x252c);
                                     let final_stat = mmio_read(bar0, 0x263c);
                                     serial_println!(":: kepler: witness-rematch end err={:08X} stat={:08X} valid={:08X} ::", final_err, final_stat, ch_1_0_post);
+
+                                    // --- K-GPU-4 Milestone 1: Falcon IMEM/DMEM Probe ---
+                                    // 1. IMEM probe
+                                    mmio_write(bar0, 0x400180, 1 << 24); // IMEMC offset=0, auto-increment
+                                    let imemc_rb = mmio_read(bar0, 0x400180);
+                                    serial_println!(":: kepler: falcon imemc wr=01000000 rb={:08X} ::", imemc_rb);
+                                    
+                                    mmio_write(bar0, 0x400184, 0xDEADBEEF);
+                                    mmio_write(bar0, 0x400184, 0xCAFEF00D);
+                                    mmio_write(bar0, 0x400184, 0x12345678);
+                                    mmio_write(bar0, 0x400184, 0xA5A55A5A);
+                                    
+                                    mmio_write(bar0, 0x400180, 1 << 24); // reset offset
+                                    let imem_w0 = mmio_read(bar0, 0x400184);
+                                    let imem_w1 = mmio_read(bar0, 0x400184);
+                                    let imem_w2 = mmio_read(bar0, 0x400184);
+                                    let imem_w3 = mmio_read(bar0, 0x400184);
+                                    serial_println!(":: kepler: falcon imem rb w0={:08X} w1={:08X} w2={:08X} w3={:08X} ::", imem_w0, imem_w1, imem_w2, imem_w3);
+                                    
+                                    // 2. DMEM probe
+                                    mmio_write(bar0, 0x4001C0, 1 << 24); // DMEMC offset=0, auto-increment
+                                    let dmemc_rb = mmio_read(bar0, 0x4001C0);
+                                    serial_println!(":: kepler: falcon dmemc wr=01000000 rb={:08X} ::", dmemc_rb);
+                                    
+                                    mmio_write(bar0, 0x4001C4, 0xDEADBEEF);
+                                    mmio_write(bar0, 0x4001C4, 0xCAFEF00D);
+                                    mmio_write(bar0, 0x4001C4, 0x12345678);
+                                    mmio_write(bar0, 0x4001C4, 0xA5A55A5A);
+                                    
+                                    mmio_write(bar0, 0x4001C0, 1 << 24); // reset offset
+                                    let dmem_w0 = mmio_read(bar0, 0x4001C4);
+                                    let dmem_w1 = mmio_read(bar0, 0x4001C4);
+                                    let dmem_w2 = mmio_read(bar0, 0x4001C4);
+                                    let dmem_w3 = mmio_read(bar0, 0x4001C4);
+                                    serial_println!(":: kepler: falcon dmem rb w0={:08X} w1={:08X} w2={:08X} w3={:08X} ::", dmem_w0, dmem_w1, dmem_w2, dmem_w3);
                                 }
                             }
                         }
