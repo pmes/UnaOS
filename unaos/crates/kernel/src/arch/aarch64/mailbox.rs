@@ -57,6 +57,16 @@ const TAG_SET_DEPTH: u32 = 0x0004_8005;
 const TAG_SET_PIXEL_ORDER: u32 = 0x0004_8006;
 const TAG_ALLOCATE_FB: u32 = 0x0004_0001;
 const TAG_GET_PITCH: u32 = 0x0004_0008;
+// WC-E: the READ-side companions of the framebuffer setters. `init_framebuffer` programs the geometry
+// and then keeps the values it REQUESTED; the firmware is free to clamp, round or refuse any of them,
+// and every one of those divergences is a scan-out defect that looks like garble on the panel and like
+// nothing at all in the serial log. These tags ask the firmware what it actually settled on, so the
+// wire carries the scan-out ground truth (see `witness_fb_geometry`). Query-only — they set nothing.
+const TAG_GET_VIRT_WH: u32 = 0x0004_0004; // get virtual (framebuffer) width/height
+const TAG_GET_VIRT_OFFSET: u32 = 0x0004_0009; // get the virtual viewport offset {x, y}
+const TAG_GET_DEPTH: u32 = 0x0004_0005; // get bits per pixel
+const TAG_GET_PIXEL_ORDER: u32 = 0x0004_0006; // get pixel order (0 = BGR, 1 = RGB)
+const TAG_GET_ALPHA_MODE: u32 = 0x0004_0007; // get alpha mode (0 = enabled/0-opaque, 1 = reversed, 2 = ignored)
 const TAG_GET_CLOCK_RATE: u32 = 0x0003_0002; // M6g: query a clock's current rate (value buffer {id, rate})
 // PI-V3D-1: firmware property tags for powering + clocking the VideoCore VI (V3D) block. These are
 // the Pi-4/VC6 path (the legacy VC4 `Enable_QPU`/set-power tags are NOT used here). See
@@ -510,6 +520,111 @@ pub fn notify_xhci_reset(dev_addr: u32) -> NotifyResp {
     NotifyResp { ok, overall: reply(1), tag_code: reply(4), echo: reply(5), buf_pa: mbox_phys() }
 }
 
+/// WC-E — the SCAN-OUT GROUND TRUTH witness. One line, once, at framebuffer bring-up, carrying every
+/// geometry field the display pipe actually scans with, read back FROM THE FIRMWARE rather than echoed
+/// from what we asked for.
+///
+/// ### Why this exists
+/// `init_framebuffer` sends five setters and keeps the values it REQUESTED (`width`/`height`/
+/// `DEPTH_BITS`/`PIXEL_ORDER_BGR`/offset 0,0), reading back only base, size and pitch. The firmware may
+/// clamp a size to the panel's mode, round a pitch up for alignment, refuse a depth, or ignore a pixel
+/// order — and every one of those leaves our `FrameBufferInfo` describing a framebuffer that is not the
+/// one the HVS is scanning. The whole class shows up on the panel as garble (a pitch or virtual-width
+/// divergence shifts every row's phase) or as wrong colours (an order divergence), and shows up in the
+/// serial log as absolutely nothing: the compositor's own read-back witness (`wm::verify_window`) reads
+/// through the SAME `info.stride` it wrote through, so it agrees with itself no matter what the hardware
+/// is doing. A witness that asks OUR numbers can never falsify our numbers. This one asks the firmware's.
+///
+/// ### What a reader can conclude
+/// `req=` is what we asked for; every other field is the firmware's answer. Agreement retires the whole
+/// scan-out-geometry suspect surface for that boot — pitch, depth, order, virtual size, viewport offset,
+/// base alignment — and is the precondition for blaming anything downstream. A divergence names itself.
+/// `pitch` is repeated from the allocation reply so one line carries the complete picture, and
+/// `pitch == virt_w * bpp` is the specific identity a row-phase garble breaks.
+///
+/// Query-only tags: this changes no firmware state and is safe to run after the allocation. Failure to
+/// call is non-fatal — it prints a FAIL line and returns, because a diagnostic must never be able to
+/// take down the boot it is diagnosing.
+fn witness_fb_geometry(base: u64, size: u32, pitch: u32, req_w: u32, req_h: u32) {
+    let mut i = 0usize;
+    macro_rules! put {
+        ($val:expr) => {{
+            request(i, $val);
+            i += 1;
+        }};
+    }
+    put!(0); // total size, patched below
+    put!(0); // request
+
+    put!(TAG_GET_PHYS_WH);
+    put!(8);
+    put!(0);
+    let phys_idx = i;
+    put!(0);
+    put!(0);
+
+    put!(TAG_GET_VIRT_WH);
+    put!(8);
+    put!(0);
+    let virt_idx = i;
+    put!(0);
+    put!(0);
+
+    put!(TAG_GET_VIRT_OFFSET);
+    put!(8);
+    put!(0);
+    let off_idx = i;
+    put!(0);
+    put!(0);
+
+    put!(TAG_GET_DEPTH);
+    put!(4);
+    put!(0);
+    let depth_idx = i;
+    put!(0);
+
+    put!(TAG_GET_PIXEL_ORDER);
+    put!(4);
+    put!(0);
+    let order_idx = i;
+    put!(0);
+
+    put!(TAG_GET_ALPHA_MODE);
+    put!(4);
+    put!(0);
+    let alpha_idx = i;
+    put!(0);
+
+    put!(TAG_END);
+
+    let total = i;
+    request(0, (total * 4) as u32);
+    if !mbox_call(total) {
+        serial_println!("[wc-e] fb-geometry query FAILED — scan-out ground truth unavailable");
+        return;
+    }
+
+    let (phys_w, phys_h) = (reply(phys_idx), reply(phys_idx + 1));
+    let (virt_w, virt_h) = (reply(virt_idx), reply(virt_idx + 1));
+    let (off_x, off_y) = (reply(off_idx), reply(off_idx + 1));
+    let depth = reply(depth_idx);
+    let order = reply(order_idx);
+    let alpha = reply(alpha_idx);
+    let bpp = (depth / 8).max(1);
+    // The two identities a scan-out defect breaks. `row_ok`: the pitch the HVS steps by must be exactly
+    // one virtual row of pixels — anything else shears every row against the one above it. `fit_ok`: the
+    // allocation must hold the whole visible image, or the bottom rows scan out of somebody else's memory.
+    let row_ok = pitch == virt_w * bpp;
+    let fit_ok = (size as u64) >= (pitch as u64) * (virt_h as u64);
+    serial_println!(
+        "[wc-e] fb-geometry req={}x{}@{}bpp order={} :: firmware phys={}x{} virt={}x{} offset=({},{}) depth={} order={} alpha={} pitch={}B base={:#x} size={} align={} row_ok={} fit_ok={}",
+        req_w, req_h, DEPTH_BITS, PIXEL_ORDER_BGR,
+        phys_w, phys_h, virt_w, virt_h, off_x, off_y, depth, order, alpha,
+        pitch, base, size, base & 0xFFF,
+        row_ok, fit_ok
+    );
+}
+
 /// Bring up the VideoCore framebuffer: pick a resolution (the firmware's current mode if sane,
 /// else 1920×1080), then set size/depth/pixel-order, allocate the buffer, and read back its base
 /// and pitch. Returns the ARM-physical framebuffer for BootInfo, or `None` on any failure (the
@@ -616,6 +731,9 @@ pub fn init_framebuffer() -> Option<FbAlloc> {
         ":: MAILBOX: framebuffer {}x{} pitch={}B stride={}px base={:#x} size={} ::",
         width, height, pitch, stride_px, base, fb_size
     );
+    // WC-E: and immediately ask the firmware what it ACTUALLY set, so the line above (which reports what
+    // we requested) can be checked against the display pipe instead of trusted. Runs on every boot.
+    witness_fb_geometry(base, fb_size, pitch, width, height);
 
     // PI-V3D-1: with the framebuffer resolved, bring up the V3D (VideoCore VI) GPU — probe → MMU →
     // clear job — and blit the CPU-verified clear into THIS framebuffer as a visible witness. This is

@@ -415,11 +415,52 @@ impl Screen {
         (self.last_union_w, self.last_union_h)
     }
 
+    /// Present this frame: paint the desktop (the back buffer) and then re-composite the window
+    /// layer over it.
+    ///
+    /// ### WC-E — why the second step is not optional
+    /// There are TWO writers to the one scan-out buffer, and until WC-E nothing ordered them. This
+    /// `Screen` is the desktop layer: the VUG render task draws into a back buffer and flushes the
+    /// damaged rectangles here, ~20 times a second, with damage unions that routinely span the whole
+    /// panel. The window compositor (`video::wm`) is the window layer: it pokes window pixels
+    /// DIRECTLY into the same framebuffer from the presenting task's syscall context, and it runs
+    /// only when a window presents. Neither knew about the other. The consequence on a real panel is
+    /// that every desktop flush silently erased whatever windows had drawn, and the next window
+    /// present drew them back — the window region alternating between window content and desktop
+    /// content at the render task's frame rate, in whatever partial bands the two writers' timing
+    /// happened to interleave. That is the Pi 4 "window garble": not a scan-out defect, an ordering
+    /// one. (It survived every witness the compositor had because those read the framebuffer back
+    /// microseconds after the blit, inside the same present, long before the next desktop flush.)
+    ///
+    /// The fix is the layering the two paths always implied: the desktop is the background, so the
+    /// window layer is restored ON TOP of it at the end of every present that painted background.
+    /// Ordering — background then windows, in one call — is what makes "windows are above the
+    /// desktop" true continuously instead of only until the next frame.
+    ///
+    /// Residual, stated honestly: the window pixels are overwritten and repainted within the same
+    /// present rather than never being overwritten at all, so a window can still be caught mid-repaint
+    /// by a scan-out that lands between the two steps. Eliminating that needs the flush to SKIP the
+    /// rows a window owns (or a full double-buffered composite), which is a larger change than this
+    /// arc; what this removes is the unbounded, every-frame erasure.
+    pub fn flush(&mut self) {
+        self.present_background();
+        // Only when background pixels actually landed. `repaint` self-guards on there being a window
+        // layer to restore (one table-lock acquisition, then out), so a windowless desktop frame pays
+        // a lock and nothing else.
+        if self.last_flush_rects > 0 {
+            super::wm::repaint();
+        }
+    }
+
     /// Present the back buffer: copy each damaged rectangle to the framebuffer, row by row (each
     /// row a single bulk copy), then clear the damage. No-op if nothing changed. VUG-FPS: the set
     /// holds disjoint dirty regions, so a rotating crystal plus two corner widgets blit as a few
     /// tight rectangles instead of one panel-spanning box.
-    pub fn flush(&mut self) {
+    ///
+    /// The DESKTOP half of [`flush`] — it knows nothing about windows; see that function for the
+    /// layering. Split out so both of its exits (the parallel band path and the serial fallback) are
+    /// covered by the window repaint without either having to remember to call it.
+    fn present_background(&mut self) {
         let n = self.damage.len;
         self.damage.clear();
         self.last_flush_bytes = 0;

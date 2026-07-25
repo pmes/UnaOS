@@ -545,6 +545,48 @@ pub fn focus_ring(out: &mut [u64; MAX_WINDOWS]) -> usize {
     n
 }
 
+/// WC-E — restore the whole window layer over a background that was just repainted underneath it.
+///
+/// The desktop (`video::screen::Screen`, driven by the VUG render task) presents by copying its back
+/// buffer's damaged rectangles straight into the scan-out framebuffer. That back buffer contains no
+/// windows — the compositor writes windows to the framebuffer directly, from the presenting task's
+/// syscall context — so every desktop present erases the window pixels inside the rectangles it
+/// copied. `Screen::flush` calls this immediately afterwards to put them back; see the layering note
+/// there for the panel symptom this ordering removes.
+///
+/// Marks the affected windows damaged rather than intersecting against the flushed rectangles: the
+/// desktop's damage unions on the Pi routinely span most of the panel, so the intersection test would
+/// nearly always answer "yes" while costing a rect-set walk to say so. Repainting is idempotent, and
+/// [`composite`] already closes the damage set upwards over occlusion, so the restored stack is
+/// correct back-to-front.
+///
+/// **COMPAT windows are excluded, and that exclusion is what makes this affordable.** A compat row is
+/// the full-screen present path (`screen::present_surface`), and while a full-screen EL0 program owns
+/// the panel the render task is parked inside `dispatch_command` and is not flushing at all — there is
+/// no second writer to order against, so a repaint there would be pure cost with nothing to fix. It is
+/// not a small cost either: the first cut of this function repainted compat rows too, and re-blitting
+/// UVUG's 32x32 surface at 15x on every frame was enough to push its 300-frame run past the
+/// `EXEC-UVUG` deadline and fail the gate. The collision this function exists for is specifically the
+/// WC-C case — a *windowed* app drawn alongside a live desktop.
+///
+/// Cheap when there is nothing to do: one table-lock acquisition, no live real window, return without
+/// touching the framebuffer. That is the per-frame cost on an ordinary windowless desktop.
+pub fn repaint() {
+    {
+        let mut t = TABLE.lock();
+        if !t.rows.iter().any(|r| r.used && !r.compat) {
+            return;
+        }
+        for r in t.rows.iter_mut() {
+            if r.used && !r.compat {
+                r.damaged = true;
+            }
+        }
+    }
+    // Lock released FIRST: `composite` takes the table lock itself, and the lock is not reentrant.
+    composite();
+}
+
 /// Number of live windows.
 pub fn count() -> usize {
     let t = TABLE.lock();

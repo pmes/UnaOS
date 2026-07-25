@@ -244,3 +244,14 @@ FORBID \[wc-d\] verify .*-> FAIL
 REQUIRE BGRUN-ST: spawn->exit->reap PASS
 REQUIRE BGRUN-ST: kill mid-run PASS \(pid=[0-9]+, killed — row reaped
 FORBID BGRUN-ST: .*-> FAIL
+#
+# --- 5. WC-E: the SCAN-OUT GROUND TRUTH. Every directive above this one checks a number the KERNEL
+# ---    computed; even WC-D's read-back goes through the same `info.stride` it wrote through, so it
+# ---    agrees with itself no matter what the display pipe is doing. This one carries what the
+# ---    FIRMWARE says it programmed. `row_ok=true` is `pitch == virt_w * bpp` — the identity a
+# ---    row-phase garble breaks — and `fit_ok=true` says the allocation holds the whole visible
+# ---    image. Pinning both means a firmware that clamps, rounds or refuses any part of the geometry
+# ---    we requested fails the gate instead of reaching a panel as unexplained garble.
+# ---    See docs/dev/OS/08_VIDEO/engine.md §WC-E.
+REQUIRE \[wc-e\] fb-geometry .*row_ok=true fit_ok=true
+FORBID \[wc-e\] fb-geometry query FAILED

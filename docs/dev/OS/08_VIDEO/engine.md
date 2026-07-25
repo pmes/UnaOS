@@ -853,3 +853,91 @@ cap in `place` (as `screen::present_surface` already applies for the compat path
 0 forbidden** (the arc adds the `[wc-d] … -> PASS` REQUIRE and the `-> FAIL` FORBID) · `test-arm` green ·
 and, at forced bench geometry (`UNAOS_FBW=1920 UNAOS_FBH=1200`), `[wc-d] verify win=1 surf=128x128 scale=4x
 at (9,21) panel=1920x1200 checked=262144 bad_cache=0 bad_ram=0 -> PASS`.
+
+### WC-E — the garble was never in the pixels: two writers, one scan-out, no ordering
+
+WC-D left the defect cornered and unexplained. The composited pixels were byte-correct in the RAM the HVS
+scans (`bad_cache=0 bad_ram=0 nonzero=full` on every window, at the bench's exact geometry), and the panel
+still garbled. The remaining suspects were all scan-out geometry — pitch, depth, pixel order, virtual size,
+viewport offset, base alignment. WC-E retired every one of them and found the cause somewhere else.
+
+**What the evidence actually said.** Three facts, taken together, leave exactly one explanation.
+
+1. **The geometry is self-consistent and correct.** P57 metal: `pitch=7680B` for a 1920-wide 32-bpp panel
+   (`= width × bpp`, no padding), `size=9216000` (`= 1920 × 1200 × 4`, exact). Nothing to shear a row
+   against. Suspect 1 is dead on the wire, and 3 and 4 with it.
+2. **The console renders correctly while the windows garble.** Console text and window content go through
+   the *same* `put_pixel`, the *same* `info.stride` and the *same* framebuffer base. Any scan-out geometry
+   error is common to both and would shear the text identically. A defect that afflicts one and not the
+   other cannot live in the geometry — it must live in what is *different* about the two paths.
+3. **The composited bytes are identical on QEMU and on metal.** The gate at forced bench geometry produces
+   the same `[wc-c]` source checksums as the P57 metal boot, window for window
+   (`0xa1cf4a91b6138449`, `0xfabe809492cf2325`, `0x591f6cbe80502325`, `0x377ffc1fbd89557d`). The content is
+   not corrupted anywhere. Identical bytes, different panel ⇒ the divergence is **temporal**, not spatial:
+   the question is not what was written, it is who wrote *last*.
+
+And point 2's difference between the two paths is the answer. **The console is back-buffered; the windows
+are not.** `Screen` owns a back buffer in cached RAM, and `flush` copies its damaged rectangles into the
+scan-out. The window compositor writes windows **directly** into the scan-out from the presenting task's
+syscall context — `screen::present_surface` documents this choice, and reasons it sound for the case it was
+written for (a *full-screen* EL0 program parks the render task, so nothing else is flushing). WC-C's
+*windowed* apps break that premise: the desktop keeps rendering alongside them. The two writers never knew
+about each other, and nothing ordered them.
+
+The bench log measures the collision precisely. `[vugfps] 20.3 fps 3996743 bytes/frame flushed rects=4
+union=1920x1200` — the render task presents ~20 times a second with damage unions spanning the **entire
+panel**, for the whole life of the boot. So: a window presents; the compositor pokes it into the scan-out;
+`verify_window` reads it back microseconds later and correctly reports `bad_cache=0 bad_ram=0`; and then,
+within 50 ms, the desktop flush copies desktop content over every pixel of it. Repeat at 20 Hz, in four
+parallel bands whose boundaries fall wherever the scheduler puts them, and the window region on the panel
+is a shimmer of window content and rotating VUG scene. "Noise-like indecipherability" is exactly what that
+looks like. Every witness stays green because every witness reads the framebuffer back *inside the present
+that wrote it*, long before the next desktop frame lands. WC-D even named the mechanism as an unguarded
+possibility — another core's painter writing into the rect — and only missed it because it looked for the
+overwrite *during* the verification window rather than after it.
+
+**The fix is the layering the code always implied.** The desktop is the background layer; the window
+compositor is the layer above it. `Screen::flush` now presents the background and then calls `wm::repaint`,
+which marks the live windows damaged and re-composites — background, then windows, in one call, so
+"windows are above the desktop" is continuously true instead of true only until the next frame.
+`composite` already closes the damage set upwards over occlusion, so the restored stack is correct
+back-to-front.
+
+**COMPAT windows are excluded, and that exclusion is load-bearing.** A compat row is the full-screen
+present path, and while a full-screen EL0 program owns the panel the render task is parked and is not
+flushing — there is no second writer to order against, so a repaint there fixes nothing. It also is not
+free: the first cut repainted compat rows too, and re-blitting UVUG's 32×32 surface at 15× on every
+desktop frame pushed its 300-frame run past the `EXEC-UVUG` deadline —
+`45/51 required, 6 forbidden` (the UVUG timeout cascading into all four BANDY verdicts). Scoping the
+repaint to *real* (windowed) rows is what the collision actually requires and what restores the gate. On
+a windowless desktop frame the whole mechanism costs one table-lock acquisition and a return.
+
+> **Residual, stated plainly.** Window pixels are now overwritten and repainted *within the same present*
+> rather than never being overwritten. A scan-out that lands between the two steps can still catch a window
+> mid-repaint, so a single-frame tear remains possible. Removing that needs the flush to skip the rows a
+> window owns, or a fully double-buffered composite; what this change removes is the *unbounded, every-frame
+> erasure*, which is the difference between a window that flickers and a window that is unreadable.
+
+**`[wc-e]` — the scan-out ground truth, on every boot.** `init_framebuffer` programs five setters and then
+keeps the values it *requested*; the firmware is free to clamp, round or refuse any of them. `mailbox::
+witness_fb_geometry` now asks the firmware what it actually settled on — `GET_PHYS_WH`, `GET_VIRT_WH`,
+`GET_VIRT_OFFSET`, `GET_DEPTH`, `GET_PIXEL_ORDER`, `GET_ALPHA_MODE` — and prints one unconditional line
+carrying `req=` beside every firmware answer, plus base, size, base alignment, and two derived identities:
+`row_ok` (`pitch == virt_w × bpp`, the identity a row-phase garble breaks) and `fit_ok` (the allocation
+holds the whole visible image). Query-only tags; a failed call prints a FAIL line and returns, because a
+diagnostic must not be able to take down the boot it is diagnosing.
+
+This exists because of a specific blind spot WC-D had. `verify_window` reads the framebuffer back through
+the **same `info.stride` it wrote through**, so it agrees with itself no matter what the display pipe is
+doing: a witness that asks our numbers can never falsify our numbers. `[wc-e]` asks the firmware's. When it
+agrees with `req=`, the entire scan-out geometry suspect surface is retired for that boot and anything
+downstream can be blamed honestly; when it diverges, it names the field.
+
+#### WC-E gate results (2026-07-25, QEMU raspi4b)
+
+`./arroyo check` green both arches · `kernel8` builds · `kernel8-test 120` at forced bench geometry
+(`UNAOS_FBW=1920 UNAOS_FBH=1200`) MBENCH **50/50 required, 0 forbidden** · `test-arm` green. The pre-fix
+baseline run at the same geometry is what established fact 3 above (identical `[wc-c]` checksums to P57
+metal). **The fix's effect is not observable in QEMU** — the collision is a race between the render task
+and the presenting task, and the gate's screenshot samples one instant — so bench verification at the next
+Pi 4 boot is what confirms it, with the `[wc-e]` line as the standing geometry check on the same wire.
