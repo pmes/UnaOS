@@ -31,8 +31,8 @@ Three pull sequences, numbered independently. Every pull = one BRIEF (coordinato
 ## Lane 2: Kepler DISPLAY (scanout — kepler_display.rs after split) — `video/Kepler/`, files `*kepler-display-pull<N>*`
 | Pull | Files | Status | One-liner |
 |---|---|---|---|
-| 19 | BRIEF-kepler-display-pull19-relocate-decisive | BRIEFED — awaiting proposal | move surf2 to 0x4000000 clear of the GOP FB — decides whether the EVO latch has ever worked |
-| 18 | BRIEF-kepler-display-pull18-placement-model | LANDED; s28: ⭐⭐ **GOP OVERLAP FOUND** — surf2 sits 1400 rows inside the fw framebuffer; photo matches the direct-paint model to the pixel (1:1, no scaling) | specialist-designed probe discriminating scaling / scan-window / latch-granularity in one photo |
+| 19 | BRIEF-kepler-display-pull19-relocate-decisive | BRIEFED (re-scoped) — awaiting proposal | full-panel draw at the GOP base, NO latch — make the working framebuffer first-class |
+| 18 | BRIEF-kepler-display-pull18-placement-model | LANDED; s28: ⭐⭐ **EVO LATCH REFUTED / FRAMEBUFFER WON** — graphic drew before fill-done, armed=0200 (=GOP FB) never followed; we paint the fw FB directly and it works | specialist-designed probe discriminating scaling / scan-window / latch-granularity in one photo |
 | 17 | BRIEF-kepler-display-pull17-row-offset | LANDED; s27: only WHITE visible ~2/3 down — **INCONCLUSIVE** (indistinguishable from fw console; my "impossible" arithmetic was wrong) | marker-row calibration — measure the scan-start row offset; the LAST display variable |
 | 16 | BRIEF-kepler-display-pull16-linear-16k | LANDED; s26: ⭐⭐ **MAPPING SOLVED** — seam-free, solid white column (linear pitch 0x4000 confirmed on panel) | ONE linear fill, pitch 16384 — seam-free = MAPPING SOLVED |
 | 15 | BRIEF-kepler-display-pull15-mirror-surface-params | LANDED; s25: ⭐ **FW SURFACE IS LINEAR pitch=0x4000** (storage 01004000, size 07080B40) — block-linear road retired | STOP GUESSING: read-only decode of 0x640400–0x6405FC — fw's own pitch/block-mode/size |

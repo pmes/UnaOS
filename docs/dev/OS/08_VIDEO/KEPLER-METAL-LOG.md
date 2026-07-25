@@ -47,14 +47,34 @@ Supporting reads this boot: armed=shadow=00000200 (unchanged by our
 write), head 0 VERT advancing 0684051D→06BA04A3 across the hold (h1–h3
 dead), ptr readback 00016000 stable at t=1 and t=5, storage/size/format
 cluster identical to s25.
-**OPEN (one question, settled by pull 19):** whether this pattern was
-already on the panel during the PRE-LATCH hold. If yes, the latch is
-proven irrelevant outright. Either way pull 19's relocation decides it,
-and if the relocated surface goes dark while the GOP-resident one paints,
-then UnaOS already has a working framebuffer on this machine — write
-linear at pitch 16384 into the GOP FB at VRAM 0x20000 — which is the
-capability the whole display lane was chasing, reached by a different
-door than the EVO latch.
+**SETTLED SAME SITTING — THE EVO LATCH HAS NEVER WORKED, AND WE ALREADY
+HAVE A FRAMEBUFFER.** Peter watched the wire live: **the graphic came up
+BEFORE `pm-step fill done` printed** — i.e. during the fill itself,
+pixels appearing as we wrote them, a full latch-cycle before the latch.
+The register dump closes it independently: `armed=00000200` and
+`shadow=00000200` at both t=1 and t=5 — and 0x200 << 8 = **VRAM 0x20000 =
+the GOP framebuffer**. The head was scanning the firmware's surface the
+whole time and never took our 0x016000 pointer, exactly as the s15
+"0x6101E0 never follows" puzzle has said since the beginning.
+Consequences, recorded plainly:
+- **Refuted:** the EVO arm+UPDATE path (0x640460 + 0x640080) as a means of
+  repointing scanout. s17 "FIRST UNAOS PIXELS" was real pixels but the
+  wrong mechanism — direct painting into the firmware FB, not a latch.
+  Everything s18–s26 (block-linear, GOB, bw/bh/pitch ladders) was
+  aliasing against the GOP's own linear/16384 layout; s26 "mapping
+  solved" was us matching that layout, not decoding the hardware's.
+- **Won, and it is the bigger half:** UnaOS can put arbitrary pixels on
+  this panel *today* — linear, pitch 16384, into the GOP framebuffer at
+  VRAM 0x20000 (phys 0x90020000, already exposed by
+  `video::fbcon::current_base()`). s28 drew a 25-band barcode with a
+  correctly-sloped diagonal at exactly the predicted geometry. That is a
+  working framebuffer, reached through a different door than the one we
+  were knocking on.
+Pull 19 is therefore re-scoped: not "relocate to prove the latch" (already
+decided) but **draw the full panel at the correct origin** — base
+`gop_vram_offset`, all 1800 rows, no latch at all. The EVO repoint becomes
+a separate, honestly-labelled known-unknown for later (the armed register
+never follows our writes; the real arming path is elsewhere).
 
 **Fence — upload and page-usability PROVEN; the core still refuses to
 run, and the blocker is now named.** Both images verified byte-exact
