@@ -1023,7 +1023,7 @@ In the **divergent** case the right-hand block deliberately leaves its rectangle
 `geom_row < k_row`, so each row lands at a lower offset and the block drifts *upward* out of the bottom
 strip. That is the displacement the probe exists to make visible — clamping it would erase the finding —
 so it is accepted rather than fixed, at the cost of the overlap guard's coverage on a padded boot.
-`direct_lands_row=` states where the block's first row actually came out under the kernel's row step, so
+`direct_lands=(col,row)` states where the block's first row actually comes out under the kernel's row step — a padded boot displaces it both vertically and sideways — so
 the operator knows which part of the panel to photograph and which garble is the probe's own.
 
 **A comparison that cannot be made is counted, never dropped.** An out-of-range offset increments

@@ -239,7 +239,6 @@ pub fn reserved(pw: usize, ph: usize) -> Option<[(usize, usize, usize, usize); 2
 /// `region_clear` is the caller's assurance that no live window overlaps [`reserved`]; `false` skips
 /// the paint entirely rather than scribble over a window's content.
 pub fn run(fb: &FrameBuffer, region_clear: bool) {
-    let done = WITNESSED.load(Ordering::Relaxed);
     let info = fb.info();
     let (pw, ph) = (info.width, info.height);
     let bpp = info.bytes_per_pixel;
@@ -347,7 +346,19 @@ pub fn run(fb: &FrameBuffer, region_clear: bool) {
         }
     }
 
-    if done {
+    // CLAIM the readback half — atomically, not with the load/store pair this used to be. Composite
+    // runs on any core, so two could otherwise clear a `load` that had not yet been `store`d and both
+    // proceed: duplicate `twin`/`ramp` lines, and worse, one core's bare `DC IVAC` discarding the
+    // other's not-yet-cleaned stores and reporting the loss as a FAIL. A spurious FAIL on metal is the
+    // most expensive thing a diagnostic can produce. Same swap discipline as the other three latches.
+    //
+    // Painting above stays multiply-entrant, and safely so: every painter writes the same deterministic
+    // bytes, and the winner cleans before it invalidates, so a loser's discarded lines are identical to
+    // what is already in RAM.
+    if WITNESSED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
         return;
     }
 
@@ -412,8 +423,14 @@ pub fn run(fb: &FrameBuffer, region_clear: bool) {
     let ok =
         comp_bad == 0 && direct_bad == 0 && skipped == 0 && direct_lost == 0 && checked == EXPECTED;
     serial_println!(
-        "[wc-f] twin left=comp@stride({},{}) right=direct@geomrow({},{}) direct_lands_row={} blk={}x{} scale={}x panel={}x{} k_row={}B geom_row={}B alloc_pitch={}B checked={}/{} skipped={} lost={} comp_bad={} direct_bad={} first=({},{}) got={:#08x} want={:#08x} -> {}",
-        lx, ly, rx, ly, (ly * geom_row) / k_row.max(1), BLK, BLK, SCALE, pw, ph,
+        "[wc-f] twin left=comp@stride({},{}) right=direct@geomrow({},{}) direct_lands=({},{}) blk={}x{} scale={}x panel={}x{} k_row={}B geom_row={}B alloc_pitch={}B checked={}/{} skipped={} lost={} comp_bad={} direct_bad={} first=({},{}) got={:#08x} want={:#08x} -> {}",
+        lx, ly, rx, ly,
+        // Where the right block's first row actually comes out under the kernel's row step. On a
+        // padded boot the byte offset the direct path computed is not a whole number of kernel rows,
+        // so the block lands both higher AND shifted sideways; the column is the remainder. Both
+        // components, or the operator is hunting half-located.
+        ((ly * geom_row) % k_row.max(1)) / 4, (ly * geom_row) / k_row.max(1),
+        BLK, BLK, SCALE, pw, ph,
         k_row, geom_row, truth.alloc_pitch,
         checked, EXPECTED, skipped, direct_lost, comp_bad, direct_bad,
         first_bad.0, first_bad.1, first_bad.2, first_bad.3,
@@ -423,9 +440,8 @@ pub fn run(fb: &FrameBuffer, region_clear: bool) {
         "[wc-f] ramp origin=({},{}) rows={} byte_step={}B nominal=1px/row marks={} lost={} :: photograph the slope — a bend of d/4 px per row means the HVS row step is k_row+d, whatever the firmware reported",
         rax, ray, RAMP_ROWS, k_row + 4, RAMP_ROWS * 2, ramp_lost
     );
-
-    // Latch only now, on a pass that actually produced a verdict.
-    WITNESSED.store(true, Ordering::Relaxed);
+    // No latch here: the `compare_exchange` above already claimed it, which is what makes this half
+    // single-entrant rather than merely once-reported.
 }
 
 /// The slope marker. One two-pixel mark per row, placed by PURE BYTE ARITHMETIC: each successive mark
