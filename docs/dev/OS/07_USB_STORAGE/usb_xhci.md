@@ -1238,6 +1238,125 @@ The click behaviour is a **metal-only** verdict, taken at the attended rMBP sitt
 
 ---
 
+## 11. IVY — the delete-behind-a-hub investigation (BOT pump headroom)
+
+**The metal fact under investigation** (rmbp track, 2026-07-17 three-leg sitting).
+With the SD card reader on a **direct root port**, the whole storage chain passes
+(S3–S9 + create/write/grow/delete). With the same reader **behind a hub**
+(route `0x2`), create/write/grow and S3–S9 still pass, but the **DELETE family**
+(`U10d`, `U11m2`) fails `deleted_ok=false` with a **BOT-pump TIMEOUT**.
+
+### What the delete path does differently
+
+Delete is not a different kind of I/O — it is *more of the same* I/O, in the
+longest unbroken run in the chain. `fat::delete_located` is
+`chain_clusters` (a read-only pre-validation walk) → `mark_dir_deleted` (one
+directory-sector read-modify-**write**) → `free_chain`, and `free_chain` calls
+`set_fat_entry` **once per cluster**, each of which is a read+write of the FAT
+sector in **every FAT copy** (`num_fats`, normally 2). So an *N*-cluster file costs
+roughly `N + 1 + 4N` single-sector BOT transactions, each of which is a full
+CBW → \[DATA\] → CSW round trip with **two** synchronous pump waits (the DATA stage
+and the CSW stage). Create/write/grow touch the FAT too, but they do not walk and
+re-write a whole chain. Delete is therefore the first operation to expose any
+per-transfer latency the pump budget cannot absorb — which is exactly what a
+"fails only behind a hub" signature looks like.
+
+### QEMU reproduction: NEGATIVE
+
+`UNAOS_HUBSTORAGE=1 ./arroyo test-fat sf 300` puts the usb-storage behind a
+`usb-hub` (slot 2, `route=0x1 depth=1`) and runs the full chain. **Both delete
+witnesses PASS behind the hub, 0 FAIL** — byte-identical verdict lines to the
+direct-attach run. The metal failure does **not** reproduce in emulation.
+
+### Audit verdict: the pump budget is not the cause
+
+The brief's leading hypothesis was an **iteration** budget that suffices direct
+but starves behind a hub (more hops per transfer). Audited and **refuted for the
+BOT path**: `pump_until_bot_done` has been a **wall-clock** `now_cycles` deadline
+of `hw_wait_budget() * 3` since the tegra timerless-core work — it measures real
+time, not yields, so extra hub hops cannot shrink it.
+
+The instrumentation added here quantifies how far from the cause it is. Behind
+the hub, over 2691 pump waits across the whole storage chain:
+
+```
+:: BOT: pump budget=14396988690 peak=32724164 n=2691 timeouts=0 storage_slot=2 route=0x1 depth=1 result=SUMMARY ::
+```
+
+The worst single wait used **32.7 M cycles against a 14.4 G budget — ~440x
+headroom**, with the direct-attach run peaking at 35.2 M against the same budget.
+Hub routing moved the worst case by *noise*, not by orders of magnitude. A budget
+with 440x headroom is not the thing that timed out on metal.
+
+**So what did?** The instrumentation is built to answer that at the next sitting
+rather than guess now. On a timeout the pump prints `used` beside `peak`:
+
+- `used == budget` while `peak` sits orders of magnitude below it ⇒ the completion
+  event was **lost** (a wedged endpoint / a dropped Transfer Event), not a tight
+  budget. Raising the budget would change nothing.
+- `peak` creeping up toward `budget` across the run ⇒ genuine latency growth, and
+  the budget (or per-hop scaling) is the right lever.
+
+Everything currently known points at the first branch, which is consistent with
+the sitting having logged this as a **reseat watch-item**. No driver-side cause
+for the delete-behind-hub failure was found; the honest landing is
+**instrumentation + the two bound conversions below**, not a speculative fix.
+
+### Known gap, deliberately not closed here
+
+There is **no BOT error recovery**. `run_bot_stage` returns `Err` on a timeout and
+nothing resets the endpoint (no Reset Endpoint / Set TR Dequeue, no Bulk-Only Mass
+Storage Reset, no CLEAR_FEATURE(ENDPOINT_HALT)), and `block.rs` does not retry. A
+single marginal timeout is therefore **terminal and desynchronising**: the stage's
+TRB stays queued, the device is left mid-BOT, and later transactions see tag
+mismatches. That plausibly turns *one* hiccup behind a hub into a whole failing
+delete family. Closing it needs Reset-Endpoint + Set-TR-Dequeue plumbing that
+**no gate in this repo can exercise** (QEMU never times out — `timeouts=0` in every
+run above), so it is recorded here as the next storage arc rather than landed
+blind.
+
+### Changes
+
+- `pump_until_bot_done` / `note_bot_pump` (`drivers/xhci/mod.rs`) — per-wait cycle
+  accounting, a high-water mark, and the `:: BOT: … ::` witness. The OK witness
+  prints only when the peak **doubles** the last reported peak, so the line count is
+  logarithmic in the budget (5 lines across 3949 transactions) and the default-quiet
+  boot stays quiet, while the last such line still carries the true worst case.
+  `route`/`depth`/`slot` make a direct-attach log and a behind-hub log diffable.
+- `pump_until_ep0_done` / `pump_until_cmd_done` — converted from raw **2000-iteration**
+  budgets to `now_cycles` wall-clock deadlines. These were the last iteration budgets
+  on the path to a hub-routed block device (`run_command_sync` carries hub bring-up's
+  ENABLE_SLOT / ADDRESS_DEVICE / CONFIGURE_ENDPOINT; `sync_control` carries the
+  descriptor fetches and the storage SET_CONFIGURATION). An iteration budget bounds
+  *yields*, whose duration depends entirely on what `hlt()` does — so the brief's
+  per-hop-starvation hypothesis, false for BOT, was **live here**. Both remain
+  strictly bounded.
+
+### Witnesses
+
+```
+:: BOT: pump budget=… used=… peak=… route=… depth=… slot=… n=… timeouts=… result=OK ::
+:: BOT: pump budget=… used=… peak=… route=… depth=… slot=… n=… timeouts=… result=TIMEOUT ::
+:: BOT: pump budget=… peak=… n=… timeouts=… storage_slot=… route=… depth=… result=SUMMARY ::
+```
+
+### What metal must verify
+
+Re-run the behind-hub leg and read the `:: BOT: … ::` lines. If the delete family
+fails again, the timeout line's `used` vs `peak` decides lost-completion vs
+tight-budget (above) — that is the whole point of this arc. If it passes after a
+reseat, the watch-item closes as a contact/reseat issue with the headroom numbers
+on record.
+
+### Gates (IVY)
+
+`./arroyo check` green both arches. `./arroyo test 120` 0 FAIL.
+`UNAOS_IRQSTORAGE=1 UNAOS_FATIMG=sf ./arroyo test 200` 0 FAIL. `UNAOS_HUBSTORAGE=1
+./arroyo test-fat sf 300` 0 FAIL, `U10d` + `U11m2` both PASS behind the hub.
+`./arroyo test-arm 120` 0 FAIL.
+
+---
+
 ## See also
 - `unaos/crates/kernel/src/drivers/xhci/`, `drivers/block.rs` — the implementation.
 - `unaos/crates/kernel/src/drivers/ehci/`, `drivers/ehci_scout.rs` — the EHCI-3 HID driver (§10) and the EHCI-1/2 scout + shared wake (§9/§9a).

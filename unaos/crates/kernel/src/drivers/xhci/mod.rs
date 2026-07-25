@@ -396,6 +396,17 @@ pub fn log_summary_once() {
         for line in x.port_slot_summary() {
             serial_println!("xHCI: {}", line);
         }
+        // IVY: BOT pump headroom alongside the topology it was measured on. This is a SNAPSHOT at
+        // summary time (the main loop's 2000th pass), not an end-of-run tally — the authoritative
+        // worst case is the LAST `:: BOT: … result=OK ::` line in the log, which `note_bot_pump`
+        // emits whenever the peak doubles. Both carry route/depth, so a direct-attach boot and a
+        // behind-hub boot can be diffed line for line.
+        let (peak, budget) = (BOT_PUMP_PEAK.load(Ordering::Relaxed), BOT_PUMP_BUDGET.load(Ordering::Relaxed));
+        serial_println!(
+            ":: BOT: pump budget={} peak={} n={} timeouts={} storage_slot={} route={:#x} depth={} result=SUMMARY ::",
+            budget, peak, BOT_PUMP_COUNT.load(Ordering::Relaxed), BOT_PUMP_TIMEOUTS.load(Ordering::Relaxed),
+            x.storage_slot,
+            x.slots[x.storage_slot as usize].route_string, x.slots[x.storage_slot as usize].route_depth);
     }
 }
 
@@ -420,6 +431,30 @@ pub static XHCI_IR0_BASE: AtomicUsize = AtomicUsize::new(0);
 pub static XHCI_OP_BASE: AtomicUsize = AtomicUsize::new(0);
 /// Count of xHCI interrupts taken — a diagnostic to confirm the MSI-X path is live.
 pub static XHCI_IRQ_COUNT: AtomicU64 = AtomicU64::new(0);
+
+// --- IVY: BOT pump headroom accounting -------------------------------------------------
+// The metal rMBP sitting of 2026-07-17 saw the FAT DELETE family (U10d / U11m2) fail with a
+// BOT-pump TIMEOUT when the card reader sat BEHIND a hub (route 0x2), while the very same
+// witnesses passed on a direct root port. The delete family is the LONGEST unbroken run of BOT
+// transactions in the storage chain (see `pump_until_bot_done`), so it is the first op to expose
+// any per-transfer latency the budget cannot absorb — but nothing in the log said HOW MUCH of the
+// budget a transfer actually used, so "the budget is too tight behind a hub" could only ever be
+// guessed at. These counters make the next sitting MEASURE it: the pump records the cycles each
+// transaction actually consumed, keeps the high-water mark, and prints a `:: BOT: …` witness
+// whenever the peak DOUBLES (a handful of lines per boot — log-scale, so default-quiet) and
+// unconditionally on a timeout. `route`/`depth` are the storage slot's route string and hub depth,
+// so a direct-attach log and a behind-hub log are directly comparable.
+/// High-water mark, in `now_cycles` units, of the time ONE BOT stage spent in the pump.
+pub static BOT_PUMP_PEAK: AtomicU64 = AtomicU64::new(0);
+/// Total BOT pump waits that completed (any stage, any slot).
+pub static BOT_PUMP_COUNT: AtomicU64 = AtomicU64::new(0);
+/// BOT pump waits that hit the wall-clock deadline.
+pub static BOT_PUMP_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+/// The wall-clock budget (cycles) the most recent pump ran under — 0 until the first BOT transfer.
+pub static BOT_PUMP_BUDGET: AtomicU64 = AtomicU64::new(0);
+/// The peak last PRINTED as a `:: BOT: … result=OK ::` witness — the throttle reference, so a peak
+/// that creeps up in small steps still gets reported once it has doubled overall.
+static BOT_PUMP_REPORTED: AtomicU64 = AtomicU64::new(0);
 
 /// Acknowledge an xHCI interrupt at the hardware level so the interrupter can raise again.
 /// Safe to call from interrupt context: it takes NO locks and does NO allocation — it clears
@@ -3637,10 +3672,27 @@ impl XhciController {
         // the base handshake budget; only a FAILING transfer (dead DMA / wedged endpoint) ever pays
         // the full wait — the happy path returns the instant the completion event drains.
         let budget = crate::arch::hw_wait_budget().saturating_mul(3);
+        BOT_PUMP_BUDGET.store(budget, Ordering::Relaxed);
+        // IVY: snapshot the waiting slot's topology up front, so the witness (and any timeout line)
+        // says whether this transfer rode a root port or a hub route — the one fact the 2026-07-17
+        // metal delete failure could not be read off the log.
+        let (route, depth, slot) = match &self.bot_pending {
+            Some(p) => {
+                let s = &self.slots[p.slot_id as usize];
+                (s.route_string, s.route_depth, p.slot_id)
+            }
+            None => (0, 0, 0),
+        };
         loop {
             match &self.bot_pending {
-                Some(p) if p.done => return Ok(()),
-                None => return Ok(()),
+                Some(p) if p.done => {
+                    Self::note_bot_pump(start, budget, route, depth, slot);
+                    return Ok(());
+                }
+                None => {
+                    Self::note_bot_pump(start, budget, route, depth, slot);
+                    return Ok(());
+                }
                 _ => {}
             }
             if self.drain_event_ring_once() {
@@ -3653,6 +3705,7 @@ impl XhciController {
             crate::hlt();
             let elapsed = crate::arch::now_cycles().wrapping_sub(start);
             if elapsed >= budget {
+                BOT_PUMP_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
                 unsafe {
                     let ir0 = XHCI_IR0_BASE.load(Ordering::Acquire);
                     let op = XHCI_OP_BASE.load(Ordering::Acquire);
@@ -3662,8 +3715,44 @@ impl XhciController {
                         "xHCI: BOT pump TIMEOUT after {} cycles (IRQ_COUNT={} IMAN={:#x} USBSTS={:#x})",
                         elapsed, XHCI_IRQ_COUNT.load(Ordering::Relaxed), iman, usbsts);
                 }
+                // IVY: the measurable half of the timeout — how the exhausted budget compares to the
+                // largest wait this boot ever needed. `used == budget` with a `peak` far below it says
+                // the completion event was LOST (a wedged endpoint), not that the budget was tight;
+                // a `peak` sitting just under `budget` says the opposite. Metal reads the verdict off
+                // this one line instead of guessing.
+                serial_println!(
+                    ":: BOT: pump budget={} used={} peak={} route={:#x} depth={} slot={} n={} timeouts={} result=TIMEOUT ::",
+                    budget, elapsed, BOT_PUMP_PEAK.load(Ordering::Relaxed), route, depth, slot,
+                    BOT_PUMP_COUNT.load(Ordering::Relaxed), BOT_PUMP_TIMEOUTS.load(Ordering::Relaxed));
                 return Err(BotError::Timeout);
             }
+        }
+    }
+
+    /// IVY: fold ONE completed BOT pump wait into the headroom counters, and print the
+    /// `:: BOT: … result=OK ::` witness when it sets a new high-water mark that at least DOUBLES the
+    /// previous one. Doubling (not every peak) keeps the line count logarithmic in the budget — a
+    /// handful of lines across a whole boot even though the storage chain runs thousands of BOT
+    /// transactions — so the default-quiet boot stays quiet while the LAST such line still reports
+    /// the true worst-case wait the run ever needed. Read against `budget`, that is the headroom the
+    /// next metal sitting measures instead of guesses at.
+    fn note_bot_pump(start: u64, budget: u64, route: u32, depth: u8, slot: u8) {
+        let used = crate::arch::now_cycles().wrapping_sub(start);
+        BOT_PUMP_COUNT.fetch_add(1, Ordering::Relaxed);
+        let prev = BOT_PUMP_PEAK.load(Ordering::Relaxed);
+        if used <= prev {
+            return;
+        }
+        BOT_PUMP_PEAK.store(used, Ordering::Relaxed);
+        // Throttle against the last REPORTED peak, not the last peak: a peak that creeps up in small
+        // increments would otherwise never double its immediate predecessor and never print at all.
+        let reported = BOT_PUMP_REPORTED.load(Ordering::Relaxed);
+        if used >= reported.saturating_mul(2).max(1) {
+            BOT_PUMP_REPORTED.store(used, Ordering::Relaxed);
+            serial_println!(
+                ":: BOT: pump budget={} used={} peak={} route={:#x} depth={} slot={} n={} timeouts={} result=OK ::",
+                budget, used, used, route, depth, slot,
+                BOT_PUMP_COUNT.load(Ordering::Relaxed), BOT_PUMP_TIMEOUTS.load(Ordering::Relaxed));
         }
     }
 
@@ -4116,7 +4205,7 @@ impl XhciController {
         });
         self.ring_doorbell(slot_id, 1);
 
-        let pump = self.pump_until_ep0_done(2000);
+        let pump = self.pump_until_ep0_done();
         let pending = self.ep0_pending.take();
         pump?;
         let p = pending.ok_or(())?;
@@ -4130,10 +4219,21 @@ impl XhciController {
         Ok(p.completion_code)
     }
 
-    /// Pump the event ring until the in-flight synchronous EP0 transfer reports done (or the
-    /// iteration budget is exhausted). Unrelated events are dispatched normally during the wait.
-    fn pump_until_ep0_done(&mut self, max_iters: u64) -> Result<(), ()> {
-        let mut iters: u64 = 0;
+    /// Pump the event ring until the in-flight synchronous EP0 transfer reports done, or a
+    /// WALL-CLOCK budget is exhausted. Unrelated events are dispatched normally during the wait.
+    ///
+    /// IVY: this was a raw 2000-ITERATION budget, the last one left on the storage path — and it is
+    /// reached by hub-downstream bring-up (`bring_up_hub` → descriptor fetches → the storage
+    /// SET_CONFIGURATION), where every control transfer costs extra hops through the hub's TT. An
+    /// iteration budget measures YIELDS, not time: how long 2000 of them last depends entirely on
+    /// what `hlt()` does (a timer tick on x86/Pi, a busy spin on a timerless core), so the same
+    /// number bounds wildly different real intervals. `pump_until_bot_done` moved to a `now_cycles`
+    /// deadline for exactly this reason; EP0 and the command pump now follow, so no wait on the path
+    /// to a hub-routed block device is denominated in yields. Still strictly bounded — a free-running
+    /// counter deadline, never unbounded.
+    fn pump_until_ep0_done(&mut self) -> Result<(), ()> {
+        let start = crate::arch::now_cycles();
+        let budget = crate::arch::hw_wait_budget();
         loop {
             match &self.ep0_pending {
                 Some(p) if p.done => return Ok(()),
@@ -4144,9 +4244,9 @@ impl XhciController {
                 continue;
             }
             crate::hlt(); // yield to QEMU so it can DMA the completion into the event ring
-            iters += 1;
-            if iters >= max_iters {
-                serial_println!("xHCI: EP0 sync pump TIMEOUT after {} yields", iters);
+            let elapsed = crate::arch::now_cycles().wrapping_sub(start);
+            if elapsed >= budget {
+                serial_println!("xHCI: EP0 sync pump TIMEOUT after {} cycles (budget {})", elapsed, budget);
                 return Err(());
             }
         }
@@ -4170,15 +4270,20 @@ impl XhciController {
         };
         self.ring_doorbell(0, 0);
         self.cmd_pending = Some(CmdPending { cmd_trb_phys: cmd_phys, done: false, completion_code: 0, slot_id: 0 });
-        let pump = self.pump_until_cmd_done(2000);
+        let pump = self.pump_until_cmd_done();
         let pending = self.cmd_pending.take();
         pump?;
         let p = pending.ok_or(())?;
         Ok((p.completion_code, p.slot_id))
     }
 
-    fn pump_until_cmd_done(&mut self, max_iters: u64) -> Result<(), ()> {
-        let mut iters: u64 = 0;
+    /// Pump the event ring until the in-flight synchronous COMMAND completes, or a WALL-CLOCK budget
+    /// is exhausted. IVY: converted from a 2000-iteration budget for the same reason as
+    /// `pump_until_ep0_done` — `run_command_sync` carries hub bring-up's ENABLE_SLOT /
+    /// ADDRESS_DEVICE / CONFIGURE_ENDPOINT, i.e. every command a behind-hub block device needs.
+    fn pump_until_cmd_done(&mut self) -> Result<(), ()> {
+        let start = crate::arch::now_cycles();
+        let budget = crate::arch::hw_wait_budget();
         loop {
             match &self.cmd_pending {
                 Some(p) if p.done => return Ok(()),
@@ -4189,9 +4294,9 @@ impl XhciController {
                 continue;
             }
             crate::hlt();
-            iters += 1;
-            if iters >= max_iters {
-                serial_println!("xHCI: command sync pump TIMEOUT after {} yields", iters);
+            let elapsed = crate::arch::now_cycles().wrapping_sub(start);
+            if elapsed >= budget {
+                serial_println!("xHCI: command sync pump TIMEOUT after {} cycles (budget {})", elapsed, budget);
                 return Err(());
             }
         }
