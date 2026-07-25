@@ -1,4 +1,10 @@
-STATUS: PROPOSED
+STATUS: APPROVED (2026-07-25, coordinator GR4). AMENDMENTS (binding):
+(1) The strings proof runs against `target/x86_64_esp/kernel.elf` after
+    `UNAOS_USBDEBUG=1 UNAOS_IVB=1 UNAOS_KEPLER=1 UNAOS_KEPLER_TAKEOVER=1
+    UNAOS_KEPLER_FIFO=1 ./arroyo esp-x86` — there is no `arroyo build
+    esp-x86` subcommand and no `target/x86_64-unaos` kernel path.
+(2) Default `./arroyo test` + `./arroyo test-arm` green are also gates,
+    per the brief. Everything else as proposed.
 
 # PROPOSAL: kepler-fence pull 19 - PGRAPH power-on (single PMC write)
 

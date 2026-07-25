@@ -1,4 +1,11 @@
-STATUS: PROPOSED
+STATUS: APPROVED (2026-07-25, coordinator GR4). AMENDMENTS (binding):
+(1) Lane file is `unaos/crates/kernel/src/gpu/kepler_display.rs` — NOT
+    `drivers/gpu/`. Same file as pulls 5–11; do not create a new path.
+(2) All brief gates apply verbatim: full-knob `./arroyo check` both arches,
+    default `./arroyo test` + `test-arm` green, builder-path
+    `UNAOS_USBDEBUG=1 UNAOS_IVB=1 UNAOS_KEPLER=1 UNAOS_KEPLER_TAKEOVER=1
+    UNAOS_KEPLER_FIFO=1 ./arroyo esp-x86`, strings proof of the new
+    `pa-step` markers in `target/x86_64_esp/kernel.elf`.
 
 # Proposal — kepler-display pull 12: pitch-alignment × block-height mini-ladder
 
