@@ -1532,3 +1532,107 @@ like.
 
 QEMU `raspi4b` models no V3D block — the run returns at `BLOCK-DOWN` before the probe, so **no** `[v3d56]` line
 appears there, and `kernel8-test` green means *no regression*, not probe verification.
+
+## 31. The bin CL vs Mesa, field by field — the encoding is exonerated (V3D-57)
+
+P55b left the verdict "the flush/frame-close unit is clocked but never triggered", with one diagnostic rider:
+the PTB writes **nothing**, not even the initial tile-state, which would also be the signature of a binner that
+never truly starts. V3D-57 tests that rider the only way it can be tested off-metal — by diffing our binning
+control list against what Mesa v42 and Linux `v3d` actually emit, **field by field**, rather than against a
+comment claiming they were checked.
+
+The audit was run mechanically, not by eye: Mesa's own `src/broadcom/cle/v3d_packet.xml` (the file
+`gen_pack_header.py` generates every `V3DXX_*_pack` from) was parsed, every packet's v42-applicable variant
+reduced to `(code, byte length, {(field start, width)})` using the generator's own length rule
+(`max(field.end)//8 + 1`, field starts shifted by the 8-bit opcode), and **every `Pkt::new(...)` chain in
+`v3d.rs`** — binning and render side, all three builders — checked against it.
+
+### Result: 0 divergences in the control list
+
+| Packet (code) | Our length | Mesa length | Fields checked | Verdict |
+| --- | --- | --- | --- | --- |
+| `NUMBER_OF_LAYERS` (119) | 2 | 2 | layers@0 w8, **minus_one** → 1 layer packs as 0 | exact |
+| `TILE_BINNING_MODE_CFG` (120, `max_ver=42`) | 9 | 9 | init block@2 w2 =1(128 B) · overflow block@4 w2 =0(64 B) · RTs@8 w4 minus_one =0 · max BPP@12 w2 =0(32) · MSAA 4x@14 w1 =0 · double-buffer@15 w1 =0 · width@32 w16 minus_one =63 · height@48 w16 minus_one =63 | exact, 8/8 |
+| `FLUSH_VCD_CACHE` (19) | 1 | 1 | — | exact |
+| `OCCLUSION_QUERY_COUNTER` (92) | 5 | 5 | address@0 w32 = 0 (Mesa's OQ-disable) | exact |
+| `START_TILE_BINNING` (6) | 1 | 1 | — | exact |
+| `CFG_BITS` (96) · `CLIP_WINDOW` (107) · `VIEWPORT_OFFSET` (108) · `CLIPPER_XY_SCALING` (110) · `CLIPPER_Z_SCALE_AND_OFFSET` (111) · `VCM_CACHE_SIZE` (71) · `GL_SHADER_STATE` (64) · `VERTEX_ARRAY_PRIMS` (36) | 4/9/9/9/9/2/5/10 | same | all field starts+widths | exact |
+| `FLUSH` (4) | 1 | 1 | — | exact |
+
+The block-size enums are confirmed at their source rather than inferred: `v3d_limits.h` defines
+`V3D_TILE_ALLOC_INITIAL_BLOCK_SIZE 128` / `..._OVERFLOW_BLOCK_SIZE 64` with `ENUM = size >> 7`, i.e. **1** and
+**0** — exactly what we emit.
+
+**Ordering** is also Mesa-exact. `v3dX(start_binning)` (gallium `v3dx_draw.c`) and
+`v3dX(job_emit_binning_prolog)` (v3dv `v3dvx_cmd_buffer.c`) both emit
+`NUMBER_OF_LAYERS → TILE_BINNING_MODE_CFG → FLUSH_VCD_CACHE → [OCCLUSION_QUERY_COUNTER, gallium only] →
+START_TILE_BINNING`, which is our prologue verbatim (the `Empty` rung's omission of the OQ-disable is the
+*Vulkan* prologue, also legal).
+
+**Terminator** settled: Mesa ends every bin CL with a bare `FLUSH` (code 4) — `v3dX(bcl_epilogue)`
+(`v3dx_job.c`), whose own comment rules out the alternative: *"you would need FLUSH_ALL for that, but the HW
+hasn't been validated"*. `FLUSH_ALL_STATE` (5) is **not** used, and `INCREMENT_SEMAPHORE` (7) is a VC4-era idiom
+no v3d 4.x emitter touches. Our `P_FLUSH = 4` terminator is correct and no semaphore is owed.
+
+So the "the binner never starts because the CL is malformed" branch of the P55b rider is **closed**: the bytes
+we hand the CLE are the bytes Mesa hands it.
+
+### Two real divergences found — both outside the CL, both fixed
+
+The audit did not come back empty. Both findings are in what the **registers** hand the PTB, which is where v42
+moved this state: `v3d_job.c` — *"On V3D 4.1, the tile alloc/state setup moved to register writes instead of
+binner packets."*
+
+1. **The tile-state data array was under-sized by 25%.** `TILE_STATE_BYTES` was `48 * 4 = 192 B`, from the
+   per-tile TSDA *record* size. Mesa sizes the CT0QTS buffer with `v3d_tile_alloc_sizes`
+   (`src/broadcom/common/v3d_util.c`), whose closing line is `*tile_state_size = layers * tiles_x * tiles_y *
+   256`. For our 64×64 target — 1 RT, 32 bpp, no MSAA, hence Mesa's largest 64×64 tile, one tile — the correct
+   array is **256 B**, not 192. Corrected, with the tile count and the per-tile 256 named as constants and a
+   compile-time assert that the array still fits its dedicated page (`OFF_TILESTATE` 0x11000, next region
+   0x12000). The tile-**allocation** pool was checked against the same function and is fine: Mesa's minimum for
+   this frame is `align(1·128, 4096) + 8192 = 12 KiB` and we hand the PTB 32 KiB — now asserted at compile time.
+2. **`BPOS = 0` was written in the wrong place.** V3D-49 correctly established the *value* (clear the overflow
+   allocation at frame start; never pre-arm it — the kernel arms overflow lazily on `OUTOMEM` in
+   `v3d_overflow_mem_work`). But `v3d_bin_job_run` (`drivers/gpu/drm/v3d/v3d_sched.c`) issues that write as its
+   **first** action — under the queue lock, *before* `v3d_invalidate_caches` and *before* the
+   CT0QMA/QMS/QTS/QBA/QEA latch — precisely so the PTB enters the frame with no carried-over overflow
+   descriptor. Every kick in this driver wrote it *after* CT0QBA, so the PTB was handed its pool with a stale
+   overflow descriptor still live. Moved to the kernel's position at all five CT0 kicks (probe, bisect rung,
+   §28 resubmit, M4, battery) via `bin_prejob_bpos_clear`.
+
+Neither is proven to be the wedge; both are genuine kernel/Mesa divergences removed on their own merits, and
+both were invisible to every prior audit because they live in the register path, not the packet path.
+
+### Witness format
+
+```
+:: V3D: [v3d57] <tag> bin CL — Mesa-v42 field diff (<n> bytes @ arena+0x…); expected column =
+        v3d_packet.xml + v3dX(start_binning)/bcl_epilogue ::
+::   [v3d57] [ i] +0x…… op=<n> <PACKET_NAME> len=<n> bytes=xx xx xx xx xx xx xx xx xx xx ::
+::     [v3d57]   <field name>                    ours=<v>       mesa=<v>       OK|DIVERGE ::
+::     [v3d57]   GL_SHADER_STATE (frame data)    record=0x……… attrs=<n> 32B-aligned=<0|1> ::
+:: V3D: [v3d57] <tag> verdict — packets=<n> field-diverged=<n> prologue-order=OK|DIVERGE
+        (CFG->[VCD]->[OQ]->START, terminator FLUSH/4 not FLUSH_ALL_STATE/5, no INCREMENT_SEMAPHORE)
+        | tile-STATE bytes ours=<n> mesa=<n> (<n> tile x 256) OK|DIVERGE
+        | tile-ALLOC bytes ours=<n> mesa-min=<n> (align(tiles*128,4096)+8192) OK|DIVERGE ::
+:: V3D: [v3d57] <what> pre-job BPOS=0 (kernel-exact ORDER: first write of v3d_bin_job_run, before
+        cache-invalidate and before the CT0QMA/QMS/QTS latch) — BPOA=0x……… BPOS=0x……… ::
+```
+
+Every field line carries **both** columns, so one metal capture shows the diff without a rebuild — a packet
+whose encoding drifts later announces itself as `DIVERGE` next to the value Mesa would have written. Gated on
+`V3D57_CL_AUDIT` (default `true`); it fires for the PROBE, the bisect rungs and M4 — the three lists whose
+byte-equality is the standing claim. The per-frame battery kick issues the reordered `BPOS` write quietly
+(quiet-boot law).
+
+### What P57 metal decides
+
+The encoding half is closed by source and needs no boot; what metal adds is confirmation that the bytes *in
+memory* are the bytes we think we built (the witness reads them back out of the arena, not out of the builder),
+and whether the corrected 256 B tile-state array plus the kernel-ordered `BPOS` clear changes the `[v3d56]`
+poison verdict. If the poison still comes back **fully INTACT** with the sizing and ordering now kernel-exact,
+the CL and its register environment are jointly exonerated and the remaining surface is `FLDONE` generation
+itself — with no encoding candidate left to blame.
+
+QEMU `raspi4b` models no V3D block — the run short-circuits at `BLOCK-DOWN` before any of this, so no
+`[v3d57]` line appears there and `kernel8-test` green means *no regression*, nothing more.

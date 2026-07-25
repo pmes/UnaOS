@@ -495,7 +495,7 @@ const OFF_TILEALLOC: usize = 0xA000; // tile-alloc base (inert: no binned geomet
 // map — a control list referencing any of these iovas is confined by the V3D MMU exactly like M3. ──
 const OFF_M4_TARGET: usize = 0x0C000; // [48 KiB) the 64×64 RGBA8 the render stores the triangle into
 const OFF_BIN_CL: usize = 0x10000; // binning control list (CT0 [BA,EA))
-const OFF_TILESTATE: usize = 0x11000; // bin tile-state data array (CT0QMA; 48 B/tile, 1 tile here)
+const OFF_TILESTATE: usize = 0x11000; // bin tile-state data array (CT0QTS; 256 B/tile, 1 tile here)
 const OFF_BIN_TILEALLOC: usize = 0x12000; // bin tile-allocation memory (binner output; render reads it)
 const OFF_M4_RCL: usize = 0x1A000; // M4 render control list (CT1 [BA,EA))
 const OFF_M4_SUBLIST: usize = 0x1B000; // M4 generic per-tile list (branch-to-implicit + store)
@@ -2890,7 +2890,25 @@ const P_CLIPPER_XY_SCALING: u8 = 110; // "Clipper XY Scaling" (max_ver=42) — h
 const P_CLIPPER_Z_SCALE_AND_OFFSET: u8 = 111; // "Clipper Z Scale and Offset" — z scale/offset, f32
 
 const V3D_PRIM_TRIANGLES: u64 = 4; // VERTEX_ARRAY_PRIMS "mode" (enum Primitive) — NOT the PRIM_LIST value
-const TILE_STATE_BYTES: usize = 48 * 4; // TSDA: 48 B/tile, generous for the single 64×64 tile
+// PI-V3D-57 (confirmed divergence #1): the tile-STATE data array is **256 bytes per tile** on v42, not
+// the 48 this constant assumed (48·4 = 192 B — UNDER-sized for even our single tile). Authority: Mesa
+// `v3d_tile_alloc_sizes` (src/broadcom/common/v3d_util.c), whose closing line is
+//     *tile_state_size = layers * tiles_x * tiles_y * 256;
+// and which every v42 emitter (gallium `alloc_tile_state`, v3dv `cmd_buffer_ensure_tile_state`) sizes
+// the CT0QTS BO with. The 48 came from the per-tile TSDA *record* size, which is not what the PTB is
+// handed. A 64×64 target with a 64×64 tile (1 RT, 32 bpp, no MSAA → Mesa's largest tile) is exactly one
+// tile, so the correct array is 1·1·1·256 = 256 B. Fits the same dedicated page at OFF_TILESTATE
+// (0x11000, next region 0x12000), so poison/scan/zero coverage simply grows to the real extent.
+const TILE_STATE_TILES: usize = 1; // layers · tiles_x · tiles_y for the 64×64 target (one 64×64 tile)
+const TILE_STATE_BYTES_PER_TILE: usize = 256; // Mesa v3d_tile_alloc_sizes: tile_state = tiles · 256
+const TILE_STATE_BYTES: usize = TILE_STATE_TILES * TILE_STATE_BYTES_PER_TILE; // TSDA: 256 B
+const _: () = assert!(OFF_TILESTATE + TILE_STATE_BYTES <= OFF_BIN_TILEALLOC);
+// Mesa's minimum tile-allocation pool for the same frame (v3d_tile_alloc_sizes): the PTB reserves the
+// INITIAL block per tile at START_TILE_BINNING, the driver rounds that to 4 KiB and adds the two 4 KiB
+// chunks the PTB grabs before OOM can fire. Our BIN_TILEALLOC_BYTES (32 KiB) must be at least this.
+const MESA_MIN_TILE_ALLOC_BYTES: usize =
+    (TILE_STATE_TILES * 128).next_multiple_of(4096) + 8192; // = 12 KiB for one tile
+const _: () = assert!(BIN_TILEALLOC_BYTES >= MESA_MIN_TILE_ALLOC_BYTES);
 
 // PI-V3D-23: the VCM (Vertex Cache Manager) cache size — the number of 16-vertex OUTPUT batches the
 // hardware buffers between the coordinate shader's VPM output and the PTB. Prior arcs wrote 1; Mesa's
@@ -3153,6 +3171,27 @@ fn arena_write_u32(off: usize, v: u32) {
 }
 /// Read a single arena byte (for CPU-side witnesses that decode a struct field back out of the arena).
 #[inline]
+/// PI-V3D-57 (confirmed divergence #2 — ORDER): clear the PTB overflow allocation the way the kernel
+/// does. `v3d_bin_job_run` (drivers/gpu/drm/v3d/v3d_sched.c) writes `V3D_PTB_BPOS = 0` as the FIRST
+/// thing it does for a bin job — under the queue lock, BEFORE `v3d_invalidate_caches` and before the
+/// CT0QMA/QMS/QTS/QBA/QEA latch — precisely so the PTB enters the frame with no overflow block carried
+/// over from a previous job. Every kick in this file wrote BPOS=0 *after* CT0QBA instead (V3D-49 got the
+/// value right and the position wrong): between the QMA/QTS latch and the BPOS clear the PTB has already
+/// been handed its pool with a stale overflow descriptor still live. Value-identical, order-divergent —
+/// so this restores the kernel's actual pre-job sequence at every CT0 kick.
+fn bin_prejob_bpos_clear(what: &str) {
+    mmio_write(V3D_CORE0_BASE, V3D_PTB_BPOS, 0);
+    dsb();
+    if V3D57_CL_AUDIT {
+        serial_println!(
+            ":: V3D: [v3d57] {} pre-job BPOS=0 (kernel-exact ORDER: first write of v3d_bin_job_run, before cache-invalidate and before the CT0QMA/QMS/QTS latch) — BPOA={:#010x} BPOS={:#010x} ::",
+            what,
+            mmio_read(V3D_CORE0_BASE, V3D_PTB_BPOA),
+            mmio_read(V3D_CORE0_BASE, V3D_PTB_BPOS)
+        );
+    }
+}
+
 fn arena_byte(off: usize) -> u8 {
     let arena = &raw const V3D_ARENA;
     unsafe { (*arena).bytes[off] }
@@ -3995,6 +4034,8 @@ fn probe_job() {
     // control list is EXONERATED as the cause of the coord shader never dispatching (valid_instr=0) and
     // the difference lives in the shader-state record — see build_probe_shader_record.
     decode_cl_packets("PROBE", OFF_PROBE_BIN_CL, bin_len);
+    // PI-V3D-57: the same list again, field-by-field against Mesa v42 (expected column beside ours).
+    v3d57_cl_mesa_diff("PROBE", OFF_PROBE_BIN_CL, bin_len);
 
     // ── [v3d30] executed-bytes witness ──────────────────────────────────────────────────────────
     // v3d28 VERDICT store-never-issued (canaries + sentinel intact, no fault) proves the TMU write
@@ -4168,6 +4209,9 @@ fn probe_job() {
     // TMU rejected the launch (config/quad-mask/block state) — chase the TMU; a truncated count (< ~9·lanes)
     // means the thread died before [9] and the store word never executed — chase thread lifetime/dispatch.
     clear_mmu_fault_latch("v3d28 pre-probe");
+    // PI-V3D-57: kernel-exact ORDER — BPOS=0 is `v3d_bin_job_run`'s FIRST write, ahead of the cache
+    // invalidate and the CT0 tile-memory latch (see `bin_prejob_bpos_clear`).
+    bin_prejob_bpos_clear("v3d40 PROBE");
     invalidate_gpu_caches("L2T flush (probe bin pre-kick)");
     // ── [v3d55] RANK 3b/3c: audit the clock domain + MISCCFG BEFORE the kick ─────────────────────────
     // The QPU provably executes yet the flush unit never fires; before blaming another packet, read the
@@ -4203,12 +4247,10 @@ fn probe_job() {
     // Arm the execution trio (src14/16/32) + TMU battery (src24/17/25) so they span the probe bin. This is
     // read-only w.r.t. the shader (see pctr_* above) — it cannot perturb execution.
     pctr_setup_cs_witness();
-    // PI-V3D-49: clear the overflow allocation (BPOS=0) exactly as the kernel's `v3d_bin_job_run` does
-    // at bin-job start. The V3D-44 pre-arm of a nonzero BPOA/BPOS block here was a diagnostic for the
-    // OUTOMEM-starvation theory, which P43/P44 REFUTED (OUTOMEM=0, BMOOM=0 — the binner never stalled for
-    // tile-alloc memory). Pre-arming also left the frame in a nonzero-BPOS state the kernel is never in at
-    // frame start, and leaked a stale overflow block into later kicks. Restore the kernel-exact BPOS=0.
-    mmio_write(V3D_CORE0_BASE, V3D_PTB_BPOS, 0);
+    // PI-V3D-49 established the VALUE (BPOS=0, no pre-armed overflow block: the OUTOMEM-starvation theory
+    // was refuted at P43/P44 with OUTOMEM=0/BMOOM=0). PI-V3D-57 moved the WRITE to where the kernel
+    // actually issues it — first, ahead of the cache invalidate and the CT0 tile-memory latch — see
+    // `bin_prejob_bpos_clear` above the pre-kick sequence.
     // Clear any latched interrupts so this kick's FLDONE (and OUTOMEM/GMPV) reads fresh, not a stale
     // bit from a prior job.
     mmio_write(V3D_CORE0_BASE, V3D_CTL_INT_CLR, mmio_read(V3D_CORE0_BASE, V3D_CTL_INT_STS));
@@ -4514,8 +4556,12 @@ fn submit_bisect_rung_tagged(tag: &str, rung: &str, content: BinContent, shadrec
     }
     // Decode the rung's CL packet-by-packet so the log shows exactly which packets this rung submitted.
     decode_cl_packets("v3d48 bisect", OFF_PROBE_BIN_CL, bin_len);
+    // PI-V3D-57: the same list again, field-by-field against Mesa v42 (expected column beside ours).
+    v3d57_cl_mesa_diff("v3d48 bisect", OFF_PROBE_BIN_CL, bin_len);
 
     clear_mmu_fault_latch("v3d48 bisect pre-kick");
+    // PI-V3D-57: kernel-exact ORDER — BPOS=0 before the invalidate and before the CT0 tile-memory latch.
+    bin_prejob_bpos_clear(rung);
     // PI-V3D-53: the `v3d53`-tagged rung runs the KERNEL-EXACT per-job input invalidate
     // (`v3d_invalidate_caches`: slices-first → L2T window re-established → FLM=CLEAR) instead of our
     // `invalidate_gpu_caches` FLM=FLUSH, and witnesses L2TCACTL before/after. This is the derived next
@@ -4554,14 +4600,9 @@ fn submit_bisect_rung_tagged(tag: &str, rung: &str, content: BinContent, shadrec
     );
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QBA, bin_ba);
     dsb();
-    // PI-V3D-49: match `v3d_bin_job_run` — clear the overflow allocation (BPOS=0) so a stale overflow
-    // block from a prior rung/kick is never reused, exactly as the kernel does at bin-job start ("Clear
-    // out the overflow allocation, so we don't reuse the overflow attached to a previous job"). The
-    // kernel does NOT pre-arm BPOA/BPOS before the GO — overflow is armed lazily only on an OUTOMEM
-    // interrupt (v3d_overflow_mem_work). The V3D-44 pre-arm was a diagnostic for the OUTOMEM theory,
-    // which P43/P44 REFUTED (OUTOMEM=0, BMOOM=0); it also put the frame in a nonzero-BPOS state the
-    // kernel is never in at frame start. Restore the kernel-exact BPOS=0.
-    mmio_write(V3D_CORE0_BASE, V3D_PTB_BPOS, 0);
+    // PI-V3D-49 fixed the VALUE (BPOS=0; the kernel never pre-arms BPOA/BPOS before the GO — overflow is
+    // armed lazily on OUTOMEM in `v3d_overflow_mem_work`). PI-V3D-57 fixed the POSITION: the clear is now
+    // issued at the top of this kick, before the invalidate and the QMA/QMS/QTS latch, as the kernel does.
     mmio_write(V3D_CORE0_BASE, V3D_CTL_INT_CLR, mmio_read(V3D_CORE0_BASE, V3D_CTL_INT_STS));
     dsb();
     let bfc_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_BFC);
@@ -4615,6 +4656,8 @@ fn submit_bisect_rung_tagged(tag: &str, rung: &str, content: BinContent, shadrec
             tag
         );
         let qts_val = ts | V3D_CLE_CT0QTS_ENABLE;
+        // PI-V3D-57: kernel-exact ORDER — the overflow clear leads the re-latch, as in `v3d_bin_job_run`.
+        bin_prejob_bpos_clear("v3d54 resubmit");
         mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QMA, tile_alloc);
         dsb();
         mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QMS, BIN_TILEALLOC_BYTES as u32);
@@ -4623,7 +4666,6 @@ fn submit_bisect_rung_tagged(tag: &str, rung: &str, content: BinContent, shadrec
         dsb();
         mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QBA, bin_ba);
         dsb();
-        mmio_write(V3D_CORE0_BASE, V3D_PTB_BPOS, 0);
         mmio_write(V3D_CORE0_BASE, V3D_CTL_INT_CLR, mmio_read(V3D_CORE0_BASE, V3D_CTL_INT_STS));
         dsb();
         let bfc_pre2 = mmio_read(V3D_CORE0_BASE, V3D_CLE_BFC);
@@ -4829,7 +4871,12 @@ fn triangle_job(fb: Option<FbTarget>) -> bool {
     // probe_job under the same tag) is diffed against. Same builder → same packets; the only field that
     // may differ is GL_SHADER_STATE `record` (M4 record vs probe record).
     decode_cl_packets("M4", OFF_BIN_CL, bin_len);
-    // PI-V3D-12: the Linux per-job pre-kick cache invalidate (v3d_bin_job_run does this first).
+    // PI-V3D-57: the same list again, field-by-field against Mesa v42 (expected column beside ours).
+    v3d57_cl_mesa_diff("M4", OFF_BIN_CL, bin_len);
+    // PI-V3D-57: kernel-exact ORDER — `v3d_bin_job_run`'s FIRST write is BPOS=0, and only then the
+    // per-job cache invalidate below. (V3D-12 read "invalidate first" from the middle of that function.)
+    bin_prejob_bpos_clear("M4");
+    // PI-V3D-12: the Linux per-job pre-kick cache invalidate (v3d_bin_job_run, right after the BPOS clear).
     invalidate_gpu_caches("L2T flush (M4 bin pre-kick)");
     let ct0_cs_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CS);
     let ct0_ca_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CA);
@@ -4852,12 +4899,7 @@ fn triangle_job(fb: Option<FbTarget>) -> bool {
     // [v3d47] dump the published coord-shader thread-end bytes right before the GO — P45 confirms WHAT
     // RAN. V3D-47 finding: this tail is byte-for-byte Mesa's own v3d_compile coord tail (no divergence).
     cs_tail_witness("M4", OFF_CS_CODE, CS_VS_WORDS.len());
-    // PI-V3D-49: clear the overflow allocation (BPOS=0) at bin-job start, exactly as the kernel's
-    // `v3d_bin_job_run` ("Clear out the overflow allocation, so we don't reuse the overflow attached to a
-    // previous job"). The real M4 bin never pre-armed BPOA/BPOS, but the probe/bisect kicks that run
-    // BEFORE it used to leave a stale nonzero BPOS latched; this write makes the real draw kernel-exact
-    // and stale-overflow-proof.
-    mmio_write(V3D_CORE0_BASE, V3D_PTB_BPOS, 0);
+    // (The BPOS=0 overflow clear this kick used to issue here now leads the sequence — PI-V3D-57.)
     mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QEA, bin_ea); // GO
     dsb();
     let ct0_cs_kicked = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CS);
@@ -6046,6 +6088,222 @@ fn decode_cl_packets(tag: &str, off: usize, len: usize) {
     }
 }
 
+// ─── PI-V3D-57: the bin-CL ↔ Mesa byte-for-byte witness ────────────────────────────────────────────
+//
+// V3D-57 brief: "why does the binner not start?" — settle it by diffing our bin CL against what Mesa
+// v42 + Linux v3d actually emit, FIELD BY FIELD, on the capture rather than in a comment. Off-metal the
+// audit was run mechanically against Mesa's own `src/broadcom/cle/v3d_packet.xml` (the file the packers
+// are generated from) for EVERY `Pkt::new` in this driver — every packet's byte length and every field's
+// (start, width) matched a v42-applicable XML variant, so the CL encoding is exonerated (see v3d.md §31
+// for the table). What could NOT be settled off-metal is what the hardware was actually handed, so this
+// witness prints the built bytes with, beside each field, the value Mesa emits for the same frame and an
+// OK/DIVERGE verdict — one metal boot shows the diff without a rebuild.
+//
+// Mesa authorities for the expected column (all MIT, attributed):
+//   · prologue + order: `v3dX(start_binning)` (gallium v3dx_draw.c) and `v3dX(job_emit_binning_prolog)`
+//     (v3dv v3dvx_cmd_buffer.c) — NUMBER_OF_LAYERS → TILE_BINNING_MODE_CFG → FLUSH_VCD_CACHE →
+//     [OCCLUSION_QUERY_COUNTER, gallium only] → START_TILE_BINNING → …draws…
+//   · terminator: `v3dX(bcl_epilogue)` (v3dx_job.c) / `v3dX(job_emit_binning_flush)` (v3dvx_cmd_buffer.c)
+//     — a bare FLUSH (code 4). NOT FLUSH_ALL_STATE (5) ("you would need FLUSH_ALL for that, but the HW
+//     hasn't been validated"), and NO INCREMENT_SEMAPHORE (7): the semaphore pair is a VC4-era idiom the
+//     v3d 4.x emitters never use.
+//   · block sizes: v3d_limits.h — INITIAL=128 (enum 1), OVERFLOW=64 (enum 0), enum = size >> 7.
+//   · tile memory: `v3d_tile_alloc_sizes` (v3d_util.c) — tile_state = tiles·256, tile_alloc =
+//     align(tiles·128, 4096) + 8192 (+ a draw-scaled continuation pool).
+const V3D57_CL_AUDIT: bool = true;
+
+/// One field line of the [v3d57] witness: name, our value, Mesa's expected value, verdict. Returns 1
+/// when the field DIVERGES, so the caller can total the divergences for the verdict line.
+#[must_use]
+fn v3d57_field(name: &str, ours: u64, want: u64) -> u32 {
+    let bad = ours != want;
+    serial_println!(
+        "::     [v3d57]   {:<34} ours={:<12} mesa={:<12} {} ::",
+        name, ours, want,
+        if bad { "DIVERGE" } else { "OK" }
+    );
+    bad as u32
+}
+
+/// [v3d57] Dump a BINNING control list packet-by-packet with the per-Mesa expected encoding beside every
+/// field. Prints, per packet: index, byte offset, opcode, name, the raw bytes as built, the XML packet
+/// length we used vs Mesa's, then one `v3d57_field` line per field. Closes with the prologue-ORDER check
+/// and the tile-memory sizing check (the two things the CL bytes alone cannot show). Read-only.
+fn v3d57_cl_mesa_diff(tag: &str, off: usize, len: usize) {
+    if !V3D57_CL_AUDIT {
+        return;
+    }
+    serial_println!(
+        ":: V3D: [v3d57] {} bin CL — Mesa-v42 field diff ({} bytes @ arena+{:#x}); expected column = v3d_packet.xml + v3dX(start_binning)/bcl_epilogue ::",
+        tag, len, off
+    );
+    // Field read: XML `start` is relative to the bit AFTER the opcode byte, so absolute bit = start + 8.
+    let getb = |p: usize, xml_start: usize, width: usize| -> u64 {
+        let mut abit = xml_start + 8;
+        let (mut w, mut got, mut v) = (width, 0usize, 0u64);
+        while w > 0 {
+            let byte = arena_byte(p + abit / 8) as u64;
+            let o = abit % 8;
+            let take = core::cmp::min(8 - o, w);
+            v |= ((byte >> o) & ((1u64 << take) - 1)) << got;
+            abit += take;
+            got += take;
+            w -= take;
+        }
+        v
+    };
+    let mut i = 0usize;
+    let mut idx = 0u32;
+    let mut diverged = 0u32;
+    // Prologue-order tracking: the packet sequence Mesa's binning prolog emits, in order.
+    let mut order_ok = true;
+    let mut seen_cfg = false;
+    let mut seen_start = false;
+    while i < len {
+        let p = off + i;
+        let op = arena_byte(p);
+        let (name, plen): (&str, usize) = match op {
+            P_NUMBER_OF_LAYERS => ("NUMBER_OF_LAYERS", 2),
+            P_TILE_BINNING_MODE_CFG => ("TILE_BINNING_MODE_CFG", 9),
+            P_FLUSH_VCD_CACHE => ("FLUSH_VCD_CACHE", 1),
+            P_OCCLUSION_QUERY_COUNTER => ("OCCLUSION_QUERY_COUNTER", 5),
+            P_START_TILE_BINNING => ("START_TILE_BINNING", 1),
+            P_CFG_BITS => ("CFG_BITS", 4),
+            P_CLIP_WINDOW => ("CLIP_WINDOW", 9),
+            P_VIEWPORT_OFFSET => ("VIEWPORT_OFFSET", 9),
+            P_CLIPPER_XY_SCALING => ("CLIPPER_XY_SCALING", 9),
+            P_CLIPPER_Z_SCALE_AND_OFFSET => ("CLIPPER_Z_SCALE_AND_OFFSET", 9),
+            P_VCM_CACHE_SIZE => ("VCM_CACHE_SIZE", 2),
+            P_GL_SHADER_STATE => ("GL_SHADER_STATE", 5),
+            P_VERTEX_ARRAY_PRIMS => ("VERTEX_ARRAY_PRIMS", 10),
+            P_FLUSH => ("FLUSH (bin terminator)", 1),
+            _ => ("UNKNOWN — NOT A MESA BIN PACKET", 1),
+        };
+        // Raw bytes as built (first up-to-9 payload bytes; every bin packet is <= 10 B).
+        let b = |k: usize| -> u32 { if k < plen { arena_byte(p + k) as u32 } else { 0 } };
+        serial_println!(
+            "::   [v3d57] [{:2}] +{:#05x} op={:3} {} len={} bytes={:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
+            idx, i, op, name, plen,
+            b(0), b(1), b(2), b(3), b(4), b(5), b(6), b(7), b(8), b(9)
+        );
+        match op {
+            P_NUMBER_OF_LAYERS => {
+                // Mesa: config.number_of_layers = layers (=1); the XML field is minus_one, so the
+                // packed value is 0 for a single-layer framebuffer.
+                diverged += v3d57_field("number of layers (minus_one)", getb(p, 0, 8), 0);
+            }
+            P_TILE_BINNING_MODE_CFG => {
+                seen_cfg = true;
+                // v42 variant (code 120, max_ver=42). Widths/starts verbatim from v3d_packet.xml:
+                //   msaa@0(1) dbuf@1(1)?  — NO: v42 places the two mode bits high (see below).
+                //   init_block@2(2) block@4(2) RTs@8(4,minus_one) bpp@12(2) msaa@14(1) dbuf@15(1)
+                //   width@32(16,minus_one) height@48(16,minus_one)
+                diverged += v3d57_field("tile alloc INITIAL block (enum)", getb(p, 2, 2), 1); // 128 B (128>>7)
+                diverged += v3d57_field("tile alloc overflow block (enum)", getb(p, 4, 2), 0); // 64 B (64>>7)
+                diverged += v3d57_field("number of RTs (minus_one)", getb(p, 8, 4), 0); // MAX2(nr_cbufs,1)=1
+                diverged += v3d57_field("max BPP of all RTs (enum)", getb(p, 12, 2), 0); // internal bpp 32
+                diverged += v3d57_field("multisample mode 4x", getb(p, 14, 1), 0); // job->msaa = false
+                diverged += v3d57_field("double-buffer in non-ms", getb(p, 15, 1), 0); // job->double_buffer = false
+                diverged += v3d57_field("width in px (minus_one)", getb(p, 32, 16), (TARGET_W - 1) as u64);
+                diverged += v3d57_field("height in px (minus_one)", getb(p, 48, 16), (TARGET_H - 1) as u64);
+            }
+            P_OCCLUSION_QUERY_COUNTER => {
+                // gallium's OQ-disable: cl_emit(..., counter) with the address left at its 0 default.
+                diverged += v3d57_field("OQ counter address (0=disabled)", getb(p, 0, 32), 0);
+            }
+            P_CFG_BITS => {
+                diverged += v3d57_field("enable fwd-facing primitive", getb(p, 0, 1), 1);
+                diverged += v3d57_field("enable rev-facing primitive", getb(p, 1, 1), 1);
+            }
+            P_CLIP_WINDOW => {
+                diverged += v3d57_field("clip window left px", getb(p, 0, 16), 0);
+                diverged += v3d57_field("clip window bottom px", getb(p, 16, 16), 0);
+                diverged += v3d57_field("clip window width px", getb(p, 32, 16), TARGET_W as u64);
+                diverged += v3d57_field("clip window height px", getb(p, 48, 16), TARGET_H as u64);
+            }
+            P_VIEWPORT_OFFSET => {
+                // v3dx_emit.c: fine = viewport.translate · 256 (u14.8), coarse = 0 for a centred vp.
+                let fine = (TARGET_W as u64 / 2) * 256;
+                diverged += v3d57_field("viewport fine X (u14.8)", getb(p, 0, 22), fine);
+                diverged += v3d57_field("viewport coarse X", getb(p, 22, 10), 0);
+                diverged += v3d57_field("viewport fine Y (u14.8)", getb(p, 32, 22), fine);
+                diverged += v3d57_field("viewport coarse Y", getb(p, 54, 10), 0);
+            }
+            P_CLIPPER_XY_SCALING => {
+                // v3dx_emit.c: viewport.scale · clipper_xy_granularity(256.0f for v42) as f32 bits.
+                let want = (((TARGET_W as f32) / 2.0) * 256.0).to_bits() as u64;
+                diverged += v3d57_field("half-width f32 (1/256 px)", getb(p, 0, 32), want);
+                diverged += v3d57_field("half-height f32 (1/256 px)", getb(p, 32, 32), want);
+            }
+            P_CLIPPER_Z_SCALE_AND_OFFSET => {
+                diverged += v3d57_field("z scale f32", getb(p, 0, 32), (0.5f32).to_bits() as u64);
+                diverged += v3d57_field("z offset f32", getb(p, 32, 32), (0.5f32).to_bits() as u64);
+            }
+            P_VCM_CACHE_SIZE => {
+                // vir.c v3d_vs_set_prog_data: CLAMP(vpm_output_batches - 1, 2, 4) — never 1.
+                diverged += v3d57_field("VCM batches (binning)", getb(p, 0, 4), VCM_CACHE_BATCHES);
+                diverged += v3d57_field("VCM batches (rendering)", getb(p, 4, 4), VCM_CACHE_BATCHES);
+            }
+            P_GL_SHADER_STATE => {
+                // The record pointer is frame data, not a constant — witness the ALIGNMENT invariant
+                // Mesa relies on instead (the 27-bit field holds addr >> 5, so addr must be 32 B aligned).
+                let rec = getb(p, 5, 27) << 5;
+                serial_println!(
+                    "::     [v3d57]   {:<34} record={:#010x} attrs={} 32B-aligned={} ::",
+                    "GL_SHADER_STATE (frame data)", rec, getb(p, 0, 5),
+                    (rec & 31 == 0) as u32
+                );
+            }
+            P_VERTEX_ARRAY_PRIMS => {
+                diverged += v3d57_field("primitive mode (enum Primitive)", getb(p, 0, 8), V3D_PRIM_TRIANGLES);
+                diverged += v3d57_field("vertex count", getb(p, 8, 32), 3);
+                diverged += v3d57_field("index of first vertex", getb(p, 40, 32), 0);
+            }
+            P_START_TILE_BINNING => {
+                seen_start = true;
+                // Order law, quoted in both Mesa emitters: "Binning mode lists must have a Start Tile
+                // Binning item (6) after any prefix state data before the binning list proper starts."
+                if !seen_cfg {
+                    order_ok = false;
+                    serial_println!("::     [v3d57]   START_TILE_BINNING before TILE_BINNING_MODE_CFG — ORDER DIVERGES from Mesa ::");
+                }
+            }
+            P_FLUSH => {
+                // Terminator identity check: Mesa ends every bin CL with FLUSH (4).
+                diverged += v3d57_field("terminator opcode (4=FLUSH)", op as u64, P_FLUSH as u64);
+            }
+            _ => {}
+        }
+        if op == P_FLUSH {
+            i += plen;
+            idx += 1;
+            break;
+        }
+        i += plen;
+        idx += 1;
+        if idx > 40 {
+            serial_println!("::   [v3d57] [..] decode guard hit (>40 packets) — stopping ::");
+            break;
+        }
+    }
+    if !seen_start || !seen_cfg {
+        order_ok = false;
+    }
+    // The two facts the CL bytes cannot carry: the prologue order, and the tile memory the REGISTERS
+    // (not the packets) hand the PTB on v42 — v3d_job.c: "On V3D 4.1, the tile alloc/state setup moved
+    // to register writes instead of binner packets."
+    let ts_want = TILE_STATE_TILES * TILE_STATE_BYTES_PER_TILE;
+    serial_println!(
+        ":: V3D: [v3d57] {} verdict — packets={} field-diverged={} prologue-order={} (CFG->[VCD]->[OQ]->START, terminator FLUSH/4 not FLUSH_ALL_STATE/5, no INCREMENT_SEMAPHORE) | tile-STATE bytes ours={} mesa={} ({} tile x 256) {} | tile-ALLOC bytes ours={} mesa-min={} (align(tiles*128,4096)+8192) {} ::",
+        tag, idx, diverged,
+        if order_ok { "OK" } else { "DIVERGE" },
+        TILE_STATE_BYTES, ts_want, TILE_STATE_TILES,
+        if TILE_STATE_BYTES == ts_want { "OK" } else { "DIVERGE" },
+        BIN_TILEALLOC_BYTES, MESA_MIN_TILE_ALLOC_BYTES,
+        if BIN_TILEALLOC_BYTES >= MESA_MIN_TILE_ALLOC_BYTES { "OK" } else { "DIVERGE" },
+    );
+}
+
 /// Kick one bin (CT0) + render (CT1) job pair over already-built, already-published control lists.
 /// Mirrors the M4 kick sequence exactly (QMA/QMS/QTS → QBA → QEA-GO on CT0; QBA → QEA-GO on CT1;
 /// finite backstops; fault-latch clear between the two) without touching the M4 code — so a V3D-10
@@ -6071,8 +6329,11 @@ fn kick_bin_render(bin_off: usize, bin_len: usize, rcl_off: usize, rcl_len: usiz
     cache::clean_range(arena_phys() + OFF_TILESTATE, TILE_STATE_BYTES);
     cache::clean_range(arena_phys() + OFF_BIN_TILEALLOC, BIN_TILEALLOC_BYTES);
 
-    // CT0 (bin): QMA/QMS/QTS → QBA → QEA (GO), per Linux v3d_sched.c v3d_bin_job_run — which starts
-    // with the per-job cache invalidate (PI-V3D-12 mirror of the M4 kick fix).
+    // CT0 (bin): BPOS=0 → invalidate → QMA/QMS/QTS → QBA → QEA (GO), per Linux v3d_sched.c
+    // v3d_bin_job_run, whose first write is the overflow clear and only then the per-job cache
+    // invalidate (PI-V3D-57 ordering fix; PI-V3D-12 mirror of the M4 kick fix).
+    mmio_write(V3D_CORE0_BASE, V3D_PTB_BPOS, 0); // quiet: the battery runs per-frame (quiet-boot law)
+    dsb();
     invalidate_gpu_caches("L2T flush (battery bin pre-kick)");
     // PI-V3D-15 mirror (V3D-11 law): the M4 kick clears any stale MMU fault BEFORE the bin so a post-
     // bin fault is attributable. Mirror it here QUIETLY — the battery runs per-frame and a verbose
