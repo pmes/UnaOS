@@ -5385,6 +5385,82 @@ impl XhciController {
     /// verifies; ANY divergence emits a `-> FAIL` witness (which the battery's generic FAIL scan
     /// catches) and NO success is claimed — no partial-write lie. Runs in the same safe non-event
     /// context as the LBA0 sanity read; single-sector, bounded to the storage slot's own DMA buffer.
+    /// USBW-1: derive the **keep-out ceiling** — the first LBA on the USB medium that is provably
+    /// NOT claimed by on-disk structures — by parsing sector 0. The scratch sector must sit at or
+    /// above this. Returns `(ceiling, provenance)`; `ceiling == 0` means sector 0 carries no
+    /// recognizable container and the medium is raw.
+    ///
+    /// This exists because "near the end of the medium" is NOT the same as "clear of the
+    /// filesystem". The bench card is a **superfloppy**: the FAT16 BPB sits at LBA 0 with partition
+    /// offset 0, so the volume's LBA space IS the raw medium's and a whole-card volume runs to the
+    /// very last sector. Every top-of-medium candidate lands *inside* the live `/fs/usb` data
+    /// region — where `UNAOS.LOG` grows each boot, so tail clusters are not free by construction.
+    ///
+    /// Cases, fail-closed (an unreadable or ambiguous sector 0 yields the whole medium as keep-out,
+    /// which makes the caller skip rather than guess):
+    /// - **GPT** (protective MBR type 0xEE): the *backup GPT header lives in the last LBA*, so the
+    ///   top of the medium is the worst possible scratch. Whole medium.
+    /// - **MBR**: ceiling = the highest `start + size` over the valid primary entries.
+    /// - **FAT BPB at LBA 0** (superfloppy): ceiling = `BPB_TotSec16`, else `BPB_TotSec32`.
+    /// - **Raw**: ceiling 0.
+    fn usbw_keepout_ceiling(&mut self, nb: u64) -> (u64, &'static str) {
+        let ptr = match self.storage_data_ptr() { Some(p) => p, None => return (nb, "no-dma-buffer") };
+        match self.storage_read10(0, 1) {
+            Ok(r) if r.status == CswStatus::Passed => {}
+            _ => return (nb, "sector0-unreadable"),
+        }
+        let mut s0 = [0u8; 512];
+        unsafe { core::ptr::copy_nonoverlapping(ptr as *const u8, s0.as_mut_ptr(), 512); }
+
+        let le16 = |o: usize| (s0[o] as u32) | ((s0[o + 1] as u32) << 8);
+        let le32 = |o: usize| {
+            (s0[o] as u64) | ((s0[o + 1] as u64) << 8) | ((s0[o + 2] as u64) << 16)
+                | ((s0[o + 3] as u64) << 24)
+        };
+        let signed = s0[510] == 0x55 && s0[511] == 0xAA;
+
+        // A FAT BPB is identified by its structural fields, not by a string: 512-byte sectors, a
+        // power-of-two cluster size, at least one reserved sector and at least one FAT.
+        let bps = le16(11);
+        let spc = s0[13] as u32;
+        let rsvd = le16(14);
+        let nfats = s0[16] as u32;
+        let is_bpb = bps == 512 && spc != 0 && (spc & (spc - 1)) == 0 && rsvd != 0
+            && nfats >= 1 && nfats <= 2;
+
+        if signed {
+            // MBR-shaped table first — a protective 0xEE means GPT.
+            let mut max_end = 0u64;
+            let mut any = false;
+            for i in 0..4 {
+                let e = 446 + i * 16;
+                let ptype = s0[e + 4];
+                if ptype == 0x00 { continue; }
+                if ptype == 0xEE { return (nb, "gpt-protective (backup header in last LBA)"); }
+                let start = le32(e + 8);
+                let size = le32(e + 12);
+                if size == 0 { continue; }
+                any = true;
+                let end = start.saturating_add(size);
+                if end > max_end { max_end = end; }
+            }
+            if any { return (max_end.min(nb), "mbr-partition-table"); }
+            if is_bpb {
+                let tot = if le16(19) != 0 { le16(19) as u64 } else { le32(32) };
+                if tot != 0 { return (tot.min(nb), "fat-bpb superfloppy (BPB_TotSec)"); }
+                return (nb, "fat-bpb superfloppy (TotSec unreadable)");
+            }
+            // Signed, but neither a usable partition table nor a BPB — do not guess.
+            return (nb, "signed-but-unrecognized sector 0");
+        }
+        if is_bpb {
+            let tot = if le16(19) != 0 { le16(19) as u64 } else { le32(32) };
+            if tot != 0 { return (tot.min(nb), "fat-bpb superfloppy (BPB_TotSec, unsigned)"); }
+            return (nb, "fat-bpb superfloppy (TotSec unreadable)");
+        }
+        (0, "raw (no container in sector 0)")
+    }
+
     fn mission_write_selftest(&mut self) {
         // USBW-1: the scratch LBA MUST come from the USB stick's own READ CAPACITY, never from the
         // global `block::info()`. On the Pi the microSD registers first and (since PIUSB-28) KEEPS the
@@ -5397,27 +5473,60 @@ impl XhciController {
         // `publish_usb_geometry` writes both handles, so this is byte-identical there.
         let nb = match crate::drivers::block::usb_info() {
             Some(d) => d.num_blocks,
-            None => return,
+            None => {
+                // USBW-1: never skip silently — an unpublished USB handle used to make the whole
+                // write proof vanish without a trace, which is indistinguishable from "it ran".
+                serial_println!(
+                    ":: PIUSB: [usbw] scratch skipped: no USB block geometry published ::");
+                return;
+            }
         };
-        if nb < 2 { return; }
+        if nb < 2 {
+            serial_println!(":: PIUSB: [usbw] scratch skipped: USB medium too small (num_blocks={}) ::", nb);
+            return;
+        }
+
+        // USBW-1: establish the keep-out ceiling BEFORE choosing a candidate. "Top of the medium" is
+        // not a safe scratch location by itself — on a superfloppy the FAT volume's LBA space IS the
+        // raw medium's, so a whole-card volume reaches the last sector and every top-of-medium
+        // candidate is inside the live data region.
+        let (ceiling, prov) = self.usbw_keepout_ceiling(nb);
         let ptr = match self.storage_data_ptr() { Some(p) => p, None => return };
 
-        // USB-WRITE-2: pick a scratch sector near the END of the medium (well clear of any FS
-        // payload) but fall BACK progressively when the first choice STALLs. Metal reality (P44):
-        // some sticks report a READ CAPACITY last-LBA they will then STALL a READ(10) against — the
-        // very-last sector is not always addressable. Try last, last-8, last-64 in order; each pre-
-        // read that halts is recovered inside `bot_transfer`, so the next candidate rides a clean
-        // pipe. All candidates stay in the top 64 sectors — NEVER near low (filesystem) LBAs.
+        // USB-WRITE-2 (as amended by USBW-1): pick a scratch sector near the end of the medium but
+        // strictly ABOVE the keep-out ceiling, falling BACK progressively when a choice STALLs.
+        // Metal reality (P44): some sticks report a READ CAPACITY last-LBA they will then STALL a
+        // READ(10) against — the very-last sector is not always addressable. Try last, last-8,
+        // last-64 in order, keeping only candidates at/above the ceiling; each pre-read that halts is
+        // recovered inside `bot_transfer`, so the next candidate rides a clean pipe. When the
+        // container spans the medium there is NO safe sector and the probe skips outright — it does
+        // not fall back to writing inside a mounted volume.
+        serial_println!(
+            ":: PIUSB: [usbw] scratch geometry: USB last_lba={} (num_blocks={}), keep-out ceiling={} [{}] ::",
+            nb - 1, nb, ceiling, prov);
+        if ceiling >= nb {
+            serial_println!(
+                ":: PIUSB: [usbw] scratch skipped: on-disk container spans the medium ({}), no sector outside it — refusing to RMW inside a live volume ::",
+                prov);
+            return;
+        }
         let mut lba = (nb - 1) as u32;
         {
-            let mut candidates = [(nb - 1) as u32, 0u32, 0u32];
-            let mut ncand = 1usize;
-            if nb > 8  { candidates[ncand] = (nb - 8) as u32;  ncand += 1; }
-            if nb > 64 { candidates[ncand] = (nb - 64) as u32; ncand += 1; }
-            // USBW-1: witness the geometry this probe is actually addressing, so a future capacity
-            // mix-up is visible on the wire instead of hiding behind a generic failure line.
-            serial_println!(
-                ":: PIUSB: [usbw] scratch geometry: USB last_lba={} (num_blocks={}) ::", nb - 1, nb);
+            let mut candidates = [0u32; 3];
+            let mut ncand = 0usize;
+            for off in [1u64, 8, 64] {
+                if nb >= off && (nb - off) >= ceiling {
+                    candidates[ncand] = (nb - off) as u32;
+                    ncand += 1;
+                }
+            }
+            if ncand == 0 {
+                serial_println!(
+                    ":: PIUSB: [usbw] scratch skipped: no candidate at/above the keep-out ceiling {} ::",
+                    ceiling);
+                return;
+            }
+            lba = candidates[0];
             let mut chosen: Option<u32> = None;
             for i in 0..ncand {
                 let cand = candidates[i];

@@ -461,10 +461,10 @@ card at probe time (`:: M6g: SD card @0xfe340000 identified — 500224000 blocks
 and PIUSB-28 deliberately keeps `BLOCK_DEVICE` pinned to the SD so a later-enumerated stick
 cannot clobber it. The enumerated USB device is a different disk entirely — its own READ
 CAPACITY, printed two lines earlier in the same boot, is
-`Disk 'Generic' 'USB SD Reader' block_size=512 num_blocks=29120 (14 MiB)`, and the FAT16 volume
-that mounts from it is likewise 14 MiB. The probe therefore aimed `lba = 500224000 - 1` — the
-SD's last block — down the **USB BOT pipe**, roughly 17,000× past the reader's last LBA of
-29119. All three fallback candidates (last, last-8, last-64) were equally out of range.
+`Disk 'Generic' 'USB SD Reader' block_size=512 num_blocks=29120 (14 MiB)`. The probe therefore
+aimed `lba = 500224000 - 1` — the SD's last block — down the **USB BOT pipe**, roughly 17,000×
+past the reader's last LBA of 29119. All three fallback candidates (last, last-8, last-64) were
+equally out of range.
 
 **The device was right.** Each candidate came back `Ok(BotResult { status: Failed, residue: 512 })`
 — a *completed* BOT round trip whose CSW reports CHECK CONDITION. The reader halted the data-IN,
@@ -475,18 +475,59 @@ label "all candidates stalled" described a transport fault that never happened. 
 device quirk, and unrelated to the separate s1j finding that this card's front sectors read as
 zeros.
 
-**Fix.** `mission_write_selftest` now sources its geometry from `block::usb_info()` — the
-dedicated `USB_BLOCK_DEVICE` handle published by the very enumeration that owns this BOT pipe —
-so the scratch LBA is always bounded by the stick's own capacity. The PIUSB-25 "storage
-enumerated" witness had the same defect (it read `BLOCK_DEVICE`, so it reported the SD's
-500224000 blocks under a USB label, contradicting the READ CAPACITY line just above it) and now
-reads `USB_BLOCK_DEVICE` too. A new `[usbw] scratch geometry: USB last_lba=… (num_blocks=…)`
-line states the bound the probe is working from, and the all-candidates-exhausted verdict no
-longer claims "stalled" — it points at the per-candidate CSWs above it. On x86
-`publish_usb_geometry` writes both handles, so that path is byte-identical.
+**Fix, part 1 — the right disk.** `mission_write_selftest` now sources its geometry from
+`block::usb_info()` — the dedicated `USB_BLOCK_DEVICE` handle published by the very enumeration
+that owns this BOT pipe — so the scratch LBA is always bounded by the stick's own capacity. The
+PIUSB-25 "storage enumerated" witness had the same defect (it read `BLOCK_DEVICE`, so it reported
+the SD's 500224000 blocks under a USB label, contradicting the READ CAPACITY line just above it)
+and now reads `USB_BLOCK_DEVICE` too. On x86 `publish_usb_geometry` writes both handles, so **the
+geometry source is byte-identical there**; the serial output does gain the new witness lines
+below.
+
+**Fix, part 2 — the right *sector*, which part 1 alone got wrong.** Correcting the disk made the
+scratch write *reachable* for the first time, and it would have landed **inside the live `/fs/usb`
+volume**. The bench reader's card is a **superfloppy**: PIUSB-25 reports sector 0 as
+unrecognized/raw, and `mount_source` succeeds off a BPB at LBA 0 with partition offset 0 — so the
+volume's LBA space **is** the raw medium's. A whole-card FAT16 therefore runs to sector 29119 and
+all three candidates (29119, 29112, 29056) sit within it, the latter two plausibly in the data
+region (1024 B clusters, and `UNAOS.LOG` grows on that volume every boot, so tail clusters are not
+free by construction). A failed `restore_sector` or a power loss mid-RMW would leave 512 bytes of
+XOR pattern in a live file.
+
+"Near the end of the medium" is **not** the same as "clear of the filesystem", and the old
+USB-WRITE-2 comment ("NEVER near low (filesystem) LBAs") encoded exactly that false equivalence.
+The real rule is **above the volume**, not top-of-medium. `usbw_keepout_ceiling` now parses sector
+0 and returns the first LBA provably outside any on-disk container, fail-closed:
+
+| sector 0 | ceiling |
+|---|---|
+| GPT protective MBR (type 0xEE) | whole medium — the **backup GPT header occupies the last LBA**, making top-of-medium the worst possible scratch |
+| MBR partition table | highest `start + size` over the valid primary entries |
+| FAT BPB at LBA 0 (superfloppy) | `BPB_TotSec16`, else `BPB_TotSec32` |
+| raw / no recognizable container | 0 |
+| unreadable or signed-but-unrecognized | whole medium (skip) |
+
+Candidates below the ceiling are discarded; when the container **spans the medium** there is no
+safe sector and the probe **skips outright** with
+`[usbw] scratch skipped: on-disk container spans the medium (…)` rather than falling back to
+writing inside a mounted volume. On the bench reader that is the expected outcome: a whole-card
+FAT16 superfloppy leaves nowhere to scratch, so the metal write proof is **skipped, not faked**.
+Exercising it on metal needs a medium with slack above the volume (or a dedicated scratch stick) —
+flagged for the integrator.
+
+The keep-out ceiling is witnessed on every boot as part of the geometry line
+(`[usbw] scratch geometry: USB last_lba=… (num_blocks=…), keep-out ceiling=… [provenance]`), and
+every skip path — including an unpublished USB handle, which used to `return` silently — now emits
+a `scratch skipped:` line, so the write proof can never vanish traceless. The
+all-candidates-exhausted verdict no longer claims "stalled"; it points at the per-candidate CSWs
+above it.
 
 The genuine end-of-medium fallback ladder from USB-WRITE-2 (P44: some sticks STALL a READ(10)
-against the very last LBA they report) is retained — it is now applied to the right disk.
+against the very last LBA they report) is retained — applied to the right disk, and now clamped to
+the keep-out ceiling.
+
+On the default QEMU media (`builder/usb.img`, a raw pattern image with no container in sector 0)
+the ceiling is 0 and the proof runs at the last LBA exactly as before.
 
 ---
 
