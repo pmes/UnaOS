@@ -243,8 +243,7 @@ pub unsafe fn takeover_display(
     let fb_size = (expected_width * expected_height * 4) as usize;
 
     let bar1 = vram_base;
-    let surf2_offset = 0x1600000;
-    let dst = (bar1 + surf2_offset) as *mut u8;
+    let dst = (bar1 + gop_vram_offset) as *mut u8;
     
     serial_println!(":: kdisp: surf2 geom w={} h={} pitch={} ::", expected_width, expected_height, expected_pitch);
     
@@ -313,7 +312,6 @@ pub unsafe fn takeover_display(
 
     let pitch_bytes = 16384;
     let total_bytes = expected_height * pitch_bytes;
-    let new_ptr = 0x00016000;
 
     // Step 1: Prepare surf2 (linear fill, placement-model probe)
     for y in 0..expected_height {
@@ -334,12 +332,7 @@ pub unsafe fn takeover_display(
         let row_base = y * pitch_bytes;
         
         for x in 0..(pitch_bytes / 4) {
-            // Diagonal ramp: x advances linearly with y across the whole
-            // surface, so its slope measures the src-row -> panel-row map
-            // globally. Survives blur and exposure error where 16 px band
-            // heights do not; a truncated diagonal gives the window height,
-            // a non-zero start x gives the base offset.
-            let diag_x = 176 + (y * 2560 / expected_height);
+            let diag_x = (y * 2880) / expected_height;
 
             let final_color = if x >= expected_width {
                 0xFF000000 // BLACK padding (real bytes the hw scans)
@@ -377,92 +370,50 @@ pub unsafe fn takeover_display(
             core::ptr::write_volatile(target_ptr, final_color);
         }
     }
-    serial_println!(":: kdisp: pm-step fill done bytes={:08X} fill_pitch={} ::", total_bytes, pitch_bytes);
+    serial_println!(":: kdisp: fb-draw base={:08X} pitch={} rows={} bytes={:08X} ::", gop_vram_offset, pitch_bytes, expected_height, total_bytes);
 
-    // Overlap check: if our scratch surface intersects the firmware's GOP
-    // framebuffer, a photo of our pattern proves nothing about the latch —
-    // we would simply have painted into the surface already being scanned.
-    // Log it, never abort (an abort would kill the sitting).
+    // Overlap check (intentional for fb-draw)
     let gop_bytes = (expected_height * pitch_bytes) as usize;
     let surf2_bytes = total_bytes as usize;
-    let overlap = surf2_offset < gop_vram_offset + gop_bytes
-        && gop_vram_offset < surf2_offset + surf2_bytes;
-    serial_println!(":: kdisp: pm-step gop-overlap={} surf2={:08X}+{:08X} gop={:08X}+{:08X} ::",
-        if overlap { "YES-RESULT-VOID" } else { "no" },
-        surf2_offset, total_bytes, gop_vram_offset, gop_bytes);
+    let overlap = gop_vram_offset < gop_vram_offset + gop_bytes
+        && gop_vram_offset < gop_vram_offset + surf2_bytes;
+    serial_println!(":: kdisp: fb-draw gop-overlap={} surf2={:08X}+{:08X} gop={:08X}+{:08X} ::",
+        if overlap { "YES-INTENTIONAL" } else { "no" },
+        gop_vram_offset, total_bytes, gop_vram_offset, gop_bytes);
 
-    // Pre-latch control frame: the surface is painted but NOT yet armed, so
-    // this hold shows whatever the head is scanning right now. Photo A here
-    // vs photo B after the latch is the actual experiment — if A already
-    // shows our bands, the latch is not what put them there.
-    serial_println!(":: kdisp: pm-step pre-latch-hold begin (photo A — expect firmware console) ::");
-    for t in 1..=3 {
-        for _ in 0..60_000_000 { core::hint::spin_loop(); }
-        serial_println!(":: kdisp: pm-step pre-latch-hold t={}s ::", t);
-    }
-    serial_println!(":: kdisp: pm-step pre-latch-hold end ::");
-
-    // Step 2: Latch Sequence
-    mmio_write(bar0, asm_reg, new_ptr);
-    let rb_asm = mmio_read(bar0, asm_reg);
-
-    if rb_asm != new_ptr {
-        serial_println!(":: kdisp: latch skip — asm rb={:08X} want={:08X} ::", rb_asm, new_ptr);
-        let final_asm = mmio_read(bar0, asm_reg);
-        let final_armed = mmio_read(bar0, armed_reg);
-        let final_shadow = mmio_read(bar0, shadow_reg);
-        serial_println!(":: kdisp: latch restored asm={:08X} armed={:08X} shadow={:08X} ::", final_asm, final_armed, final_shadow);
-        serial_println!(":: kdisp: latch verdict asm-stuck=n armed-followed=n ::");
-        return None;
-    }
-
-    mmio_write(bar0, update_reg, 0x00000000);
-    
     // 5 s hold (standing length — Peter's camera calibration, s21)
-    serial_println!(":: kdisp: pm-step hold begin (photo B — post-latch) ::");
+    serial_println!(":: kdisp: fb-draw hold begin (photo A — full panel calibration) ::");
     for t in 1..=5 {
         for _ in 0..60_000_000 { core::hint::spin_loop(); }
-        serial_println!(":: kdisp: pm-step hold t={}s ::", t);
-        // Dump on the FIRST and LAST tick: a latch that reverts mid-hold is
-        // invisible to a single sample.
+        serial_println!(":: kdisp: fb-draw hold t={}s ::", t);
+        // Dump on the FIRST and LAST tick
         if t == 1 || t == 5 {
-            serial_println!(":: kdisp: pm-step reg-dump t={} ptr={:08X} ptr_hi={:08X} size={:08X} store={:08X} fmt={:08X} ::",
+            serial_println!(":: kdisp: fb-draw reg-dump t={} ptr={:08X} ptr_hi={:08X} size={:08X} store={:08X} fmt={:08X} ::",
                 t,
                 mmio_read(bar0, 0x640460),
                 mmio_read(bar0, 0x640464),
                 mmio_read(bar0, 0x640468),
                 mmio_read(bar0, 0x64046C),
                 mmio_read(bar0, 0x640470));
-            // Armed/shadow readouts separate "armed a truncated value" from
-            // "UPDATE never propagated" — currently byte-identical states.
-            serial_println!(":: kdisp: pm-step reg-dump t={} armed={:08X} shadow={:08X} ::",
+            serial_println!(":: kdisp: fb-draw reg-dump t={} armed={:08X} shadow={:08X} ::",
                 t, mmio_read(bar0, armed_reg), mmio_read(bar0, shadow_reg));
             for off in (0x4B8..=0x4C8).step_by(4) {
-                serial_println!(":: kdisp: pm-step reg-dump off={:03X} val={:08X} ::", off, mmio_read(bar0, 0x640000 + off));
+                serial_println!(":: kdisp: fb-draw reg-dump off={:03X} val={:08X} ::", off, mmio_read(bar0, 0x640000 + off));
             }
             // Which head is actually live: the one whose vline/vblank advances.
             for h in 0..4usize {
                 let vert = mmio_read(bar0, 0x610000 + 0x6000 + h * 0x800 + 0x340);
-                serial_println!(":: kdisp: pm-step head-stat t={} h={} vert={:08X} ::", t, h, vert);
+                serial_println!(":: kdisp: fb-draw head-stat t={} h={} vert={:08X} ::", t, h, vert);
             }
         }
     }
-    serial_println!(":: kdisp: pm-step hold end ::");
+    serial_println!(":: kdisp: fb-draw hold end ::");
 
-    // Step 3: Restore
-    mmio_write(bar0, asm_reg, pre_asm);
-    mmio_write(bar0, update_reg, 0x00000000);
-    
-    // 1 s recovery gap
-    for _ in 0..15_000_000 { core::hint::spin_loop(); }
-    serial_println!(":: kdisp: pm-step done ::");
-    
-    // 7. Verdict
-    serial_println!(":: kdisp: latch verdict asm-stuck=y ::");
+    serial_println!(":: kdisp: fb-draw done ::");
 
-    // Completed lin cycle: return the latched pointer so the late recap
+    // Completed fb-draw cycle: return the gop pointer so the late recap
     // (kepler.rs, printed inside the FTDI-ring window) can prove this leg ran.
-    Some(new_ptr as usize)
+    Some(gop_vram_offset)
 }
 
 /// Returns false for zero, 0xFFFFFFFF, and the 0xBAD0xxxx pattern that our
