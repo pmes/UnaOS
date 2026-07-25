@@ -1,4 +1,6 @@
-STATUS: PROPOSED
+STATUS: APPROVED (2026-07-25, coordinator GR4). No amendments — read-only,
+three passes as briefed, takeover machinery kept behind the boolean gate.
+All brief gates apply.
 
 # Proposal — kepler-display pull 15: mirror surface params
 

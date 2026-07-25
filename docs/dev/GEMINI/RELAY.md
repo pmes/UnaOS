@@ -1,11 +1,11 @@
 # PETER'S RELAY SHEET — not for specialists. Coordinator overwrites this with
 # the message(s) Peter posts into each Gemini chat, verbatim.
-# (updated 2026-07-25, after s24boot1: falcon ports still gated → pull 22 reset pulse briefed; display verdict awaits photos)
-
-## → kepler-fence session
-
-Fence: s24 verdict — FALCON MEMORY PORTS STILL GATED. With PMC bit 12 set, every access to IMEMC/IMEMD/DMEMC/DMEMD returned BADF1000 — control readbacks included, no sentinel came back. (Note: the readback path in your pull-21 code was corrected at land-review to use bit 25 AINCR for reads — bit 24 only auto-increments writes; the spec doc now says so. The verdict stands regardless: even the control-register readbacks are dead.) The witness baseline printed unchanged (err=2). Conclusion: enable-alone doesn't open the Falcon sub-block; there is a second gate. Pull 22 is briefed — git pull, read `docs/dev/GEMINI/video/Kepler/BRIEF-kepler-fence-pull22-pgraph-reset-pulse.md`: replace the plain enable with a RESET PULSE of the same PMC bit (clear bit 12, ~100 ms settle, set bit 12, settle; markers pgraph-pulse pre/off rb/on rb), then re-run your pull-18 recon AND pull-21 port probe unchanged. Reset-then-enable is standard init discipline for this hardware class; the diff against s24's all-BADF1000 baseline is the deliverable. Writes stay confined to PMC_ENABLE + the four ports. Proposal first. PUSH OWED reminder stands.
+# (updated 2026-07-25: pulls 15 + 22 APPROVED clean — go implement)
 
 ## → kepler-display session
 
-Display: s24 verdict — PITCH×BW REFUTED. All four (bw,pg) combos still cluster-seamed, no white column. The parameter ladder is exhausted, and that's the tell: we've been GUESSING values the hardware can be ASKED for. Our latch only swaps the surface pointer (0x640460) — the pitch/block-mode/size the scanout actually uses are still firmware's own, programmed in the same EVO core method mirror we latch through. Pull 15 is briefed — git pull, read `docs/dev/GEMINI/video/Kepler/BRIEF-kepler-display-pull15-mirror-surface-params.md`: READ-ONLY dense dump of 0x640400–0x6405FC, two passes (volatility check), plus a candidate-flagging pass for pitch/WxH/block-mode shaped values (mirror-sp markers). Zero writes this pull; recon-only boot. Deliverable: the decoded params firmware scans with — pull 16 then fills to match them exactly, and if the mirror is the scan config, that cycle is seam-free. Proposal first. PUSH OWED reminder stands.
+Display: pull 15 proposal APPROVED, no amendments. Implement exactly as proposed: read-only, `do_takeover = false` gate keeps the fill/latch machinery intact, dense dump 0x640400–0x6405FC pass 1, ~100 ms settle, identical pass 2 (mirror-sp2), then the candidate-flagging pass (ptr-slot line + pitch/wh/blockmode cand lines, skipping absent/zero values). Zero writes this pull. Run every gate from the brief (full-knob check both arches, default test + test-arm green, full-knob esp-x86, strings-proof the mirror-sp markers). Commit ALL docs+code, delete scratch, no push. Report "PUSH OWED: n".
+
+## → kepler-fence session
+
+Fence: pull 22 proposal APPROVED, no amendments. Implement exactly as proposed: replace the plain enable with the pulse (pre / off rb / settle / on rb / settle markers), then the pull-18 recon and pull-21 port probe completely unchanged, witness rematch stays as landed. Writes confined to PMC_ENABLE + the four memory ports, zero execution. Run every gate, commit ALL docs+code, delete scratch, no push. Report "PUSH OWED: 8".

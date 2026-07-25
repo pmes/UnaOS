@@ -1,4 +1,6 @@
-STATUS: PROPOSED
+STATUS: APPROVED (2026-07-25, coordinator GR4). No amendments — pulse
+sequence, unchanged recon+probe, writes confined as briefed. All brief
+gates apply.
 
 # PROPOSAL: kepler-fence pull 22 - PGRAPH reset pulse
 
