@@ -3253,6 +3253,27 @@ fn proc_orphan(i: usize) -> Option<i32> {
     None
 }
 
+/// SKILL-1: the scheduler's hook, called as a task killed through `sched::kill` retires (from either the
+/// off-CPU dispatch reap or its own on-CPU boundary `exit()`). It exists for exactly one case: a kill that
+/// did NOT confirm inside `run_user_image`'s bounded wait, so the row was parked `PORPHANED` as the
+/// fallback and the requester walked away. When the task finally dies, the row must come back.
+///
+/// Deliberately scoped to `PORPHANED` rows. On the CONFIRMED path the row is still `PRUNNING` and
+/// `run_user_image` frees it itself — reclaiming it here would race that, and a `PRUNNING` row can also
+/// belong to a live parent/child relationship this hook has no business touching. Fail-closed: an
+/// unmatched pid is a silent no-op.
+#[allow(dead_code)] // no caller on the `virt` build (the kill path's syscall hook is baremetal-only)
+pub fn note_killed_task_retired(pid: u64) {
+    if let Some(i) = proc_find_orphaned(pid) {
+        serial_println!(
+            "[skill] orphaned EL0 task retired by the async kill — Proc row {} reclaimed (pid={})",
+            i,
+            pid
+        );
+        proc_free(i);
+    }
+}
+
 /// Release a Proc entry to FREE — after reaping in sys_wait, or unwinding a failed sys_spawn claim.
 fn proc_free(i: usize) {
     PROCS[i].pid.store(0, Ordering::Release);
@@ -5720,6 +5741,13 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
     let a2 = unsafe { *frame.add(2) }; // x2
     let a3 = unsafe { *frame.add(3) }; // x3 (ELF-2: SYS_THREAD_SPAWN placement hint)
 
+    // SKILL-1: the syscall kill boundary. A task that has been asynchronously killed must not be granted
+    // one more kernel service — least of all a side-effecting one — so the check precedes the dispatch
+    // (and the one-shot SVC log, which would otherwise be spent on a dead task's last call). Never
+    // returns for a killed task: it retires here, on its own kernel stack, IRQ-masked, exactly as
+    // SYS_EXIT / SYS_THREAD_EXIT already do from this same frame. Four relaxed loads otherwise.
+    super::sched::kill_check_current();
+
     if !SVC_LOGGED.swap(true, Ordering::Relaxed) {
         serial_println!(":: SVC: EC=0x15 nr={} — EL0->EL1 syscall path live ::", nr);
     }
@@ -6742,13 +6770,90 @@ pub fn run_user_image(
     // the deadline only expired on a batch program that had already stopped — but the heartbeat gate makes
     // Timeout reachable mid-interaction, so the row hazard is now live.)
     let outcome = if matches!(outcome, RunOutcome::Timeout) {
-        // `proc_orphan` CASes PRUNNING->PORPHANED. `Some(status)` means the task actually died in the race
-        // window, so this was not a real timeout after all: it already freed the row and consumed the `done`
-        // permit, and we report the true exit status rather than a phantom Timeout.
-        match proc_orphan(pi) {
-            None => RunOutcome::Timeout,
-            Some(EXEC_KILLED_STATUS) => RunOutcome::Faulted,
-            Some(s) => RunOutcome::Exited(s),
+        // SKILL-1: KILL FIRST, park only as the fallback.
+        //
+        // Pre-arc this path went straight to `proc_orphan`, because there was no way to stop the task. On
+        // metal that cost was severe and cumulative: the abandoned EL0 task kept SPINNING at 100% on its
+        // core forever, kept rendering over the shell's screen, and starved every later run (observed as
+        // EXEC1 "did not exit in time" on the run AFTER a timeout, on two boots). Parking the row contained
+        // the bookkeeping hazard; it did nothing about the task.
+        //
+        // Now the task is killed first (`sched::kill` — see the SKILL-1 block in sched.rs), and the row's
+        // fate follows the kill's outcome:
+        //   * CONFIRMED — the task is provably off every CPU, its slot torn down, its stack freed. The row
+        //     may then be REAPED outright: nothing is left alive to post a late status onto a recycled
+        //     entry, which was the entire reason PORPHANED existed.
+        //   * NOT confirmed inside the bounded wait (or no kill slot available) — fail closed to exactly
+        //     the pre-arc behaviour: park PORPHANED. The kill stays armed, so the task still dies at its
+        //     next boundary, and `note_killed_task_retired` reclaims the row when it does.
+        let pid = PROCS[pi].pid.load(Ordering::Acquire);
+        // Skip the kill entirely if the task already died in the window between the outcome decision and
+        // here — arming a request for a dead tid could never confirm, and would burn a slot until reboot.
+        // `proc_orphan`'s CAS handles that race correctly on its own.
+        let ticket = if PROCS[pi].state.load(Ordering::Acquire) == PRUNNING {
+            super::sched::kill(pid)
+        } else {
+            None
+        };
+        let confirmed = match ticket {
+            None => false,
+            Some(ticket) => {
+                // Bounded cooperative wait for the retirement. We yield, which both lets the co-located
+                // target reach a dispatch boundary (the off-CPU arm) and keeps the shell responsive. The
+                // bound is wall-clock (CNTPCT advances in QEMU too), so a target that never reaches any
+                // boundary cannot strand the shell — it degrades to the PORPHANED fallback.
+                let t0 = super::timer::cntpct();
+                let budget = super::timer::cntfrq().saturating_mul(KILL_CONFIRM_SECS);
+                let mut ok = false;
+                loop {
+                    if super::sched::kill_confirmed(&ticket) {
+                        ok = true;
+                        break;
+                    }
+                    if super::timer::cntpct().wrapping_sub(t0) >= budget {
+                        break;
+                    }
+                    super::sched::yield_now();
+                }
+                if ok {
+                    super::sched::kill_release(ticket);
+                } else {
+                    super::sched::kill_detach(ticket); // stays armed; the row is parked below
+                }
+                ok
+            }
+        };
+        if confirmed {
+            // The task is dead. If it managed a real SYS_EXIT / fault-kill on its way out (it reached a
+            // boundary, and a boundary is also where those land), the row is already PEXITED with a status
+            // and a posted `done` permit — reap it the same way the non-timeout arm below does, and report
+            // the true status. Otherwise the row is untouched PRUNNING with no permit outstanding, so it is
+            // simply freed.
+            let out = if PROCS[pi].state.load(Ordering::Acquire) == PEXITED {
+                let status = PROCS[pi].status.load(Ordering::Acquire);
+                let _ = PROCS[pi].done.wait();
+                proc_free(pi);
+                match status {
+                    EXEC_KILLED_STATUS => RunOutcome::Faulted,
+                    s => RunOutcome::Exited(s),
+                }
+            } else {
+                proc_free(pi);
+                RunOutcome::Timeout
+            };
+            serial_println!("[skill] killed pid={} asid={} confirmed=1 row=reaped", pid, asid);
+            out
+        } else {
+            // `proc_orphan` CASes PRUNNING->PORPHANED. `Some(status)` means the task actually died in the
+            // race window, so this was not a real timeout after all: it already freed the row and consumed
+            // the `done` permit, and we report the true exit status rather than a phantom Timeout.
+            let out = match proc_orphan(pi) {
+                None => RunOutcome::Timeout,
+                Some(EXEC_KILLED_STATUS) => RunOutcome::Faulted,
+                Some(s) => RunOutcome::Exited(s),
+            };
+            serial_println!("[skill] killed pid={} asid={} confirmed=0 row=orphaned", pid, asid);
+            out
         }
     } else {
         // The task is dead and posted `done` on its way out, but `run_user_image` reaps by polling `state`,
@@ -9890,6 +9995,17 @@ static EL0_TAKEOVER_HB: AtomicU64 = AtomicU64::new(0);
 /// than any plausible frame (a frame-driven app polls many times a second) yet keeps the worst-case shell
 /// strand for a hung app bounded at `TAKEOVER_STALE_SECS + deadline` ≈ 7 s instead of forever.
 pub const TAKEOVER_STALE_SECS: u64 = 2;
+
+/// SKILL-1: how long `run_user_image` waits for an asynchronous kill to CONFIRM before falling back to parking
+/// the row `PORPHANED`. Whole seconds, scaled by `timer::cntfrq()` at the use site.
+///
+/// Two seconds is enormous against every path that can actually deliver the kill: a task sitting in a run queue
+/// dies at the very next `dispatch_next` (microseconds — and the requester yields into that dispatch itself), a
+/// spinning EL0 task dies at the next quantum tick (~4 ms on metal), a syscalling task at its next SVC. The
+/// margin is deliberate slack for a loaded multi-core boot, not a real expectation. It is also a HARD ceiling in
+/// the other direction: whatever happens, the shell is back within `KILL_CONFIRM_SECS` of the deadline, having
+/// fallen back to exactly the pre-SKILL-1 behaviour.
+const KILL_CONFIRM_SECS: u64 = 2;
 
 /// UVUG-8r2: how much suspended time one `run` may accumulate WITHOUT PRESENTING A FRAME before takeover
 /// stops suspending its deadline. The heartbeat gate bounds a *silent* wedge, but not a *noisy* one: an app

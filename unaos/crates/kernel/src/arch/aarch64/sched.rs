@@ -1238,6 +1238,8 @@ fn make_ready(task: Box<Task>) {
 pub fn yield_now() {
     let cpu = percpu::this_cpu().cpu_index as usize;
     mask_irq();
+    // SKILL-1 on-CPU kill boundary: a cooperative yield is as good a retirement point as a preemption.
+    kill_check_current(); // never returns if this task has been killed
     let raw = SCHED[cpu].current.load(Ordering::Acquire) as *mut Task;
     if !raw.is_null() {
         unsafe {
@@ -1268,6 +1270,211 @@ pub fn current_id() -> Option<u64> {
     let cpu = percpu::this_cpu().cpu_index as usize;
     let raw = SCHED[cpu].current.load(Ordering::Acquire) as *const Task;
     if raw.is_null() { None } else { Some(unsafe { (*raw).id }) }
+}
+
+// =============================================================================================
+// SKILL-1 — the ASYNCHRONOUS KILL primitive.
+//
+// Until this arc `exit()` was the only way a task could die, and it retires the CALLING task only.
+// A timed-out `run_user_image` therefore had no way to stop the EL0 task it had given up on: the
+// task kept running (observed on metal spinning a core at 100% forever, still rendering over the
+// screen, starving every later run), and the only containment was parking its `Proc` row PORPHANED.
+//
+// The design deliberately does NO cross-CPU register surgery. A kill is a REQUEST published in a
+// tiny fixed table keyed by task id; the target retires ITSELF, on its own core, at a boundary where
+// switching away is already proven safe:
+//
+//   (a) OFF-CPU — `dispatch_next` checks the request table after popping a task and BEFORE switching
+//       into it. A killed task is never dispatched again: it is torn down and dropped right there,
+//       on the scheduler's own stack. This covers every ready, sleeping, or wait-queued task (they
+//       all re-enter through a dispatch) and needs no cooperation from the target at all.
+//   (b) ON-CPU — `timer_preempt` (the per-core quantum tick, the only involuntary boundary a spinning
+//       EL0 task ever reaches), `yield_now`, and the SVC dispatcher (`aarch64_svc_handler`) call
+//       `kill_check_current`, which routes a killed current task straight into `exit()`. Both call
+//       sites already run IRQ-masked on the task's own kernel stack and already tolerate a
+//       never-returning `exit()` — that is exactly what the M6b EL0 fault-kill path does.
+//
+// Task ids are monotonic (`NEXT_TID`) and never reused, so a request can never be mis-delivered to a
+// later task that happened to inherit a number.
+//
+// CONFIRMATION is the point of the ticket: the requester needs to know the task is provably off every
+// CPU and will never run again before it reclaims resources the task owns (its `Proc` row). The
+// retiring side settles the slot as its LAST act before switching away for good / before its Box is
+// dropped, so `KILL_DONE` means "torn down; nothing of this task will execute again".
+//
+// FAIL-CLOSED throughout: no free slot, or a kill that does not confirm inside the caller's bounded
+// wait, degrades to exactly the pre-arc PORPHANED behaviour — never to freeing a row under a live task.
+// =============================================================================================
+
+/// How many kills may be in flight at once. Small on purpose: the only requester is the single-threaded
+/// `run_user_image` deadline path, and `MAX_PROCS` (4) bounds how many rows can be at risk. Exhaustion
+/// returns `None` and the caller falls back to PORPHANED — it never grows the table (a STOP tripwire).
+const MAX_KILL_REQS: usize = 4;
+
+const KILL_FREE: u8 = 0;
+/// Armed and owned by a live requester; the retiring task publishes `KILL_DONE` for it to observe.
+const KILL_PENDING: u8 = 1;
+/// The target retired. Terminal until the OWNER releases the slot (`kill_release`).
+const KILL_DONE: u8 = 2;
+/// The requester's bounded wait expired and it walked away, but the kill STAYS ARMED — the task is
+/// still owed a death, and its row is parked PORPHANED meanwhile. Whoever finally retires the task
+/// frees the slot directly (no owner is left to observe a `KILL_DONE`).
+const KILL_DETACHED: u8 = 3;
+
+struct KillReq {
+    /// The target task id. Only meaningful while `state != KILL_FREE`.
+    tid: AtomicU64,
+    /// `KILL_*`. The ownership token: a requester CASes FREE->PENDING to claim.
+    state: AtomicU8,
+}
+
+static KILLS: [KillReq; MAX_KILL_REQS] = [const {
+    KillReq { tid: AtomicU64::new(0), state: AtomicU8::new(KILL_FREE) }
+}; MAX_KILL_REQS];
+
+/// A requester's claim on one `KILLS` slot. Not `Copy`: it must be surrendered exactly once, via
+/// `kill_release` (confirmed) or `kill_detach` (gave up), so a slot can never be double-freed.
+pub struct KillTicket {
+    idx: usize,
+}
+
+/// The index of the ARMED kill request naming `tid`, if any. Lock-free scan of a 4-entry table —
+/// cheap enough for the dispatch fast path (`state` is `KILL_FREE` on every entry in the common case,
+/// so this is four relaxed loads and no branch mispredict of consequence).
+fn kill_slot_for(tid: u64) -> Option<usize> {
+    (0..MAX_KILL_REQS).find(|&i| {
+        let st = KILLS[i].state.load(Ordering::Acquire);
+        (st == KILL_PENDING || st == KILL_DETACHED) && KILLS[i].tid.load(Ordering::Acquire) == tid
+    })
+}
+
+/// Settle slot `idx` from the RETIRING side — the last act of a killed task's teardown. A `KILL_PENDING`
+/// slot becomes `KILL_DONE` (its owner observes that and releases it); a `KILL_DETACHED` slot has no
+/// owner left, so it is freed here.
+///
+/// The `Proc`-row hook runs FIRST, while the slot is still un-settled: it reclaims a row that was parked
+/// PORPHANED because this very kill did not confirm in time. Restricted to PORPHANED rows, so it can
+/// never race the confirmed path (where the row is still PRUNNING and the requester frees it itself).
+fn kill_settle(idx: usize, tid: u64) {
+    #[cfg(feature = "baremetal")]
+    super::syscall::note_killed_task_retired(tid);
+    #[cfg(not(feature = "baremetal"))]
+    let _ = tid;
+    match KILLS[idx].state.load(Ordering::Acquire) {
+        KILL_DETACHED => {
+            KILLS[idx].tid.store(0, Ordering::Release);
+            KILLS[idx].state.store(KILL_FREE, Ordering::Release);
+        }
+        _ => KILLS[idx].state.store(KILL_DONE, Ordering::Release),
+    }
+}
+
+/// Request that task `tid` be killed. Returns a ticket to confirm against, or `None` if the request
+/// table is full (caller must fail closed). Pokes every online core so a killed task sitting in an idle
+/// core's run queue is dispatched — and thus reaped — promptly rather than at that core's next tick.
+pub fn kill(tid: u64) -> Option<KillTicket> {
+    if tid == 0 {
+        return None;
+    }
+    for i in 0..MAX_KILL_REQS {
+        if KILLS[i]
+            .state
+            .compare_exchange(KILL_FREE, KILL_PENDING, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            // Publish the target BEFORE any reader can match it: the CAS made the slot non-FREE, so
+            // `kill_slot_for` could already be scanning it — it compares the tid, and a stale 0 simply
+            // means "no match yet", never a match on the wrong task.
+            KILLS[i].tid.store(tid, Ordering::Release);
+            for cpu in 0..NUM_CPUS {
+                if ONLINE_MASK[cpu].load(Ordering::Acquire) {
+                    poke_cpu(cpu);
+                }
+            }
+            return Some(KillTicket { idx: i });
+        }
+    }
+    None
+}
+
+/// Has the target of `ticket` provably retired? `true` means it is off every CPU, its address-space
+/// slot is torn down, and it will never execute again — the precondition for reclaiming its resources.
+pub fn kill_confirmed(ticket: &KillTicket) -> bool {
+    KILLS[ticket.idx].state.load(Ordering::Acquire) == KILL_DONE
+}
+
+/// Surrender a CONFIRMED ticket, returning the slot to the pool.
+pub fn kill_release(ticket: KillTicket) {
+    debug_assert_eq!(
+        KILLS[ticket.idx].state.load(Ordering::Acquire),
+        KILL_DONE,
+        "kill_release on an unconfirmed ticket"
+    );
+    KILLS[ticket.idx].tid.store(0, Ordering::Release);
+    KILLS[ticket.idx].state.store(KILL_FREE, Ordering::Release);
+}
+
+/// Surrender an UNCONFIRMED ticket: the requester's bounded wait expired. The request stays ARMED — the
+/// task is still owed its death and will take it at its next boundary — and the slot is freed by
+/// `kill_settle` when that finally happens. A task that never reaches any boundary at all holds the slot
+/// forever; that is the honest accounting, and the caller has already fallen back to PORPHANED.
+pub fn kill_detach(ticket: KillTicket) {
+    let _ = KILLS[ticket.idx].state.compare_exchange(
+        KILL_PENDING,
+        KILL_DETACHED,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ); // a DONE slot lost the race (the task died just now) — leave it for the owner-less free below
+    if KILLS[ticket.idx].state.load(Ordering::Acquire) == KILL_DONE {
+        KILLS[ticket.idx].tid.store(0, Ordering::Release);
+        KILLS[ticket.idx].state.store(KILL_FREE, Ordering::Release);
+    }
+}
+
+/// ON-CPU kill boundary. If the task running on THIS core has been killed, retire it here and now —
+/// `exit()` never returns, which is exactly what the M6b EL0 fault-kill path already does from the
+/// synchronous exception handler. No-op (and just four relaxed loads) otherwise.
+///
+/// Callers must be at a point where switching away for good is safe: IRQ-masked, on the task's own
+/// kernel stack, holding no scheduler lock. `timer_preempt`, `yield_now` and the SVC dispatcher all
+/// qualify — each already tolerates a `switch_context` that may never come back.
+pub fn kill_check_current() {
+    let cpu = percpu::this_cpu().cpu_index as usize;
+    let raw = SCHED[cpu].current.load(Ordering::Acquire) as *const Task;
+    if raw.is_null() {
+        return;
+    }
+    let id = unsafe { (*raw).id };
+    if kill_slot_for(id).is_some() {
+        exit();
+    }
+}
+
+/// OFF-CPU kill boundary: retire `task` from the scheduler's own context, without ever switching into
+/// it. Mirrors `exit()`'s teardown exactly — slot teardown first (it repoints THIS core's TTBR0 off the
+/// dead root before the ASID is flushed), then the joiner signal, then the Box drop that frees the
+/// kernel stack — and settles the kill slot last, so `KILL_DONE` is only ever published after every
+/// resource the task owned is gone.
+fn retire_killed(idx: usize, task: Box<Task>) {
+    let tid = task.id;
+    // M6d: the same slot retirement `exit()` performs, executed on the scheduler stack. Legal here for
+    // the same reason it is legal there — the kernel half of every root is Global and identical, so
+    // repointing TTBR0 to the boot root pulls nothing out from under the running (scheduler) context.
+    #[cfg(feature = "baremetal")]
+    {
+        let asid = task.user_ttbr0 >> 48;
+        if asid != 0 {
+            unsafe { super::boot::teardown_user_slot(asid) };
+        }
+    }
+    // Release any joiner: a killed task must not leave a `JoinHandle` blocked forever. Same single-post
+    // discipline as `exit()` — borrow, never move, so the Box's own Arc keeps the semaphore alive.
+    if let Some(sem) = &task.done_sem {
+        sem.post();
+    }
+    task.state.store(STATE_FINISHED, Ordering::Release);
+    drop(task); // frees the kernel stack
+    kill_settle(idx, tid);
 }
 
 /// Terminate the current task: mark it finished and switch to the scheduler for good (which frees
@@ -1301,6 +1508,14 @@ pub fn exit() -> ! {
         // other task carries `None`, so this is a no-op for them (byte-identical to the pre-ELF-2 path).
         if let Some(sem) = &(*raw).done_sem {
             sem.post();
+        }
+        // SKILL-1: settle any kill request naming this task. Placed HERE — after the slot teardown and
+        // the joiner post, with only the state store and the final switch left — so `KILL_DONE` means
+        // every resource this task owned is already released and nothing it can still execute observes
+        // anything. (The kernel stack is freed by the scheduler when it drops the Box a moment later;
+        // the requester's contract is "will never run again", which holds from this point on.)
+        if let Some(idx) = kill_slot_for((*raw).id) {
+            kill_settle(idx, (*raw).id);
         }
         (*raw).state.store(STATE_FINISHED, Ordering::Release);
         // `old_sp` is a throwaway on the dying stack — the scheduler never reads it back and never
@@ -1365,6 +1580,13 @@ pub fn timer_preempt() {
     if raw.is_null() {
         return; // scheduler/idle context, or an unscheduled core (the BSP)
     }
+    // SKILL-1 on-CPU kill boundary — the load-bearing one. The quantum tick is the ONLY involuntary
+    // boundary a spinning EL0 task ever reaches (it makes no syscalls and never yields), so this is what
+    // turns "parked PORPHANED but still burning a core at 100%" into an actual death. Checked BEFORE the
+    // quantum countdown so a killed task dies at the very next tick rather than at its next full quantum.
+    // Never returns if this task has been killed; the abandoned IRQ frame is harmless — EOI already ran
+    // (see `gic::handle_irq`) and the stack it sits on is freed with the task's Box.
+    kill_check_current();
     let remaining = SCHED[cpu].quantum.load(Ordering::Relaxed);
     if remaining > 1 {
         SCHED[cpu].quantum.store(remaining - 1, Ordering::Relaxed);
@@ -1412,6 +1634,16 @@ fn dispatch_next(cpu: usize) -> bool {
         unmask_irq();
         return false;
     };
+    // SKILL-1 OFF-CPU kill boundary. A killed task is retired HERE — after the pop (so it is off every
+    // run queue), before the switch (so it never executes another instruction) and before any accounting
+    // (a task that does not run is not a dispatch). This is the arm that needs no cooperation from the
+    // target at all, and it covers ready, sleeping and wait-queued tasks alike: they all come back
+    // through a dispatch. IRQ is masked and the run-queue lock was dropped above, so the teardown inside
+    // is on the same footing as `exit()`'s. Returning `true` re-enters the loop for a real pass.
+    if let Some(idx) = kill_slot_for(task.id) {
+        retire_killed(idx, task);
+        return true; // leaves IRQ MASKED, exactly like the ordinary busy return below
+    }
     CPU_BUSY[cpu].fetch_add(1, Ordering::Relaxed); // M3b CPU-pulse meter (introspection)
     // SCHED-2/SCHED-5: busy dispatch — one context switch into a task; record it + the last-task
     // identity. The task's EXECUTION TIME is folded into the window AFTER `switch_context` returns
@@ -2705,6 +2937,184 @@ pub fn demo_cooperative() {
     // jetson/virt builds that diverge into `run_capstone_boot_core` before reaching here.
     #[cfg(feature = "pi")]
     load_accounting_witness();
+
+    // SKILL-1: prove the asynchronous kill primitive. Runs here for the same reason the two witnesses
+    // above do — cooperatively on the boot core, before `start_aps` flips `SCHED_ACTIVE`, self-contained
+    // and bounded, leaving the run queue empty. `pi`-gated, so the virt/Orin builds (which diverge into
+    // `run_capstone_boot_core` before reaching here) stay byte-identical.
+    #[cfg(feature = "pi")]
+    skill_kill_witness(0);
+}
+
+// --- SKILL-1 witness: the asynchronous kill primitive, exercised deterministically in QEMU ----------
+/// Dispatch passes the witness allows a kill to confirm in. Generous: the expected cost is ONE pass.
+#[cfg(feature = "pi")]
+const SKILL_MAX_PASSES: u32 = 32;
+/// The off-CPU victim's liveness counter — must ADVANCE before the kill and FREEZE after it.
+#[cfg(feature = "pi")]
+static SKILL_VICTIM_TICKS: AtomicU32 = AtomicU32::new(0);
+/// The on-CPU victim's liveness counter, same contract.
+#[cfg(feature = "pi")]
+static SKILL_SELF_TICKS: AtomicU32 = AtomicU32::new(0);
+/// The on-CPU victim publishes its own kill slot here (`idx + 1`; 0 = not yet armed) so the witness can
+/// release the ticket the victim could not carry across its own retirement.
+#[cfg(feature = "pi")]
+static SKILL_SELF_SLOT: AtomicU32 = AtomicU32::new(0);
+/// Set by the post-kill task: proves the scheduler still runs ordinary work after two reaps.
+#[cfg(feature = "pi")]
+static SKILL_RERUN_DONE: AtomicBool = AtomicBool::new(false);
+
+/// The OFF-CPU victim: an immortal cooperative loop. It never exits on its own, so the only thing that
+/// can retire it is the kill — which is precisely the property under test.
+#[cfg(feature = "pi")]
+fn skill_victim_body(_: usize) {
+    loop {
+        SKILL_VICTIM_TICKS.fetch_add(1, Ordering::AcqRel);
+        yield_now();
+    }
+}
+
+/// The ON-CPU victim: arms its OWN kill while it is the running task, then hits a boundary. It cannot be
+/// caught by the off-CPU dispatch arm (the request did not exist when it was dispatched), so the retire
+/// must come from `kill_check_current` — the same code path `timer_preempt` uses against a spinning EL0
+/// task on metal. This is the closest a timer-less QEMU can get to the metal case: the ARM is identical,
+/// only the trigger differs (a cooperative `yield_now` here, the quantum tick there).
+#[cfg(feature = "pi")]
+fn skill_self_body(_: usize) {
+    SKILL_SELF_TICKS.fetch_add(1, Ordering::AcqRel);
+    let id = current_id().expect("skill: self victim has no id");
+    let ticket = kill(id).expect("skill: no kill slot for the self victim");
+    // Hand the slot index to the witness and forget the ticket: this task is about to stop existing
+    // mid-function, so it cannot be the one to surrender it. (The index is all a ticket ever was.)
+    SKILL_SELF_SLOT.store(ticket.idx as u32 + 1, Ordering::Release);
+    core::mem::forget(ticket);
+    SKILL_SELF_TICKS.fetch_add(1, Ordering::AcqRel);
+    yield_now(); // never returns — `kill_check_current` retires this task here
+    SKILL_SELF_TICKS.fetch_add(100, Ordering::AcqRel); // MUST NOT run; a huge step makes a leak obvious
+}
+
+/// A plain task spawned after both kills: it must run and exit normally.
+#[cfg(feature = "pi")]
+fn skill_rerun_body(_: usize) {
+    SKILL_RERUN_DONE.store(true, Ordering::Release);
+}
+
+/// SKILL-1 — the asynchronous-kill witness. Cooperative and fully deterministic under QEMU raspi4b (no
+/// timer, no IRQ, no SMP required): it drives `dispatch_next` by hand, so every step is observed rather
+/// than raced.
+///
+/// What it proves:
+///   1. LIVENESS — the victim really is running before the kill (its counter advances).
+///   2. OFF-CPU REAP — after `kill`, the victim is never dispatched again (counter frozen), the request
+///      confirms, and the run queue drains. This is the arm that needs no cooperation from the target.
+///   3. ON-CPU RETIRE — a task that is killed while it is the CURRENT task retires at its next boundary
+///      via `kill_check_current` (the same call `timer_preempt` makes on metal) and confirms.
+///   4. REUSE — both tickets release, every kill slot returns to the pool, and ordinary scheduling
+///      continues (a fresh task spawns, runs and exits). This is the "rerun after a kill" half.
+///
+/// What it CANNOT prove here: the TIMER-driven trigger. QEMU raspi4b delivers no Group-1 timer IRQ, so
+/// `timer_preempt` never fires and a genuinely spinning task (one that neither yields nor syscalls) can
+/// never be interrupted — it would wedge this single cooperative core. That trigger is metal-only.
+#[cfg(feature = "pi")]
+pub fn skill_kill_witness(cpu: usize) {
+    let queue_empty = || RUN_QUEUES[cpu].lock().len() == 0;
+    let slots_free = || {
+        (0..MAX_KILL_REQS).all(|i| KILLS[i].state.load(Ordering::Acquire) == KILL_FREE)
+    };
+
+    // --- 1 + 2: the OFF-CPU arm -----------------------------------------------------------------
+    let vid = spawn("skill-victim", skill_victim_body, 0, cpu);
+    for _ in 0..3 {
+        dispatch_next(cpu); // let it run a few cooperative rounds
+    }
+    let alive_ticks = SKILL_VICTIM_TICKS.load(Ordering::Acquire);
+    let was_alive = alive_ticks >= 3;
+
+    let ticket = kill(vid);
+    let mut off_passes = 0u32;
+    let off_confirmed = match &ticket {
+        None => false,
+        Some(t) => {
+            let mut ok = false;
+            while off_passes < SKILL_MAX_PASSES {
+                off_passes += 1;
+                dispatch_next(cpu);
+                if kill_confirmed(t) {
+                    ok = true;
+                    break;
+                }
+            }
+            ok
+        }
+    };
+    // FROZEN is the real claim: "never scheduled again", not merely "eventually stopped".
+    let off_frozen = SKILL_VICTIM_TICKS.load(Ordering::Acquire) == alive_ticks;
+    let off_drained = queue_empty();
+    if let Some(t) = ticket {
+        if off_confirmed {
+            kill_release(t);
+        } else {
+            kill_detach(t);
+        }
+    }
+
+    // --- 3: the ON-CPU arm ----------------------------------------------------------------------
+    let _ = spawn("skill-self", skill_self_body, 0, cpu);
+    let mut self_passes = 0u32;
+    let mut self_confirmed = false;
+    while self_passes < SKILL_MAX_PASSES {
+        self_passes += 1;
+        dispatch_next(cpu);
+        let slot = SKILL_SELF_SLOT.load(Ordering::Acquire);
+        if slot != 0 && KILLS[(slot - 1) as usize].state.load(Ordering::Acquire) == KILL_DONE {
+            self_confirmed = true;
+            break;
+        }
+    }
+    // Exactly 2 = it reached the arm-and-yield point once and never came back past the yield.
+    let self_frozen = SKILL_SELF_TICKS.load(Ordering::Acquire) == 2;
+    let self_slot = SKILL_SELF_SLOT.load(Ordering::Acquire);
+    if self_confirmed && self_slot != 0 {
+        kill_release(KillTicket { idx: (self_slot - 1) as usize });
+    }
+    let self_drained = queue_empty();
+
+    // --- 4: reuse -------------------------------------------------------------------------------
+    let pool_clean = slots_free();
+    let _ = spawn("skill-rerun", skill_rerun_body, 0, cpu);
+    run_until_empty(cpu);
+    let rerun_ok = SKILL_RERUN_DONE.load(Ordering::Acquire);
+
+    let pass = was_alive
+        && off_confirmed
+        && off_frozen
+        && off_drained
+        && self_confirmed
+        && self_frozen
+        && self_drained
+        && pool_clean
+        && rerun_ok;
+    if pass {
+        serial_println!(
+            ":: SKILL-1: async kill — victim ran {} rounds then froze; off-CPU reap confirmed in {} pass(es), on-CPU boundary retire confirmed in {}; queue drained, kill slots returned, rerun OK :: PASS ::",
+            alive_ticks,
+            off_passes,
+            self_passes
+        );
+    } else {
+        serial_println!(
+            ":: SKILL-1: async kill — alive={} off_conf={} off_frozen={} off_drained={} self_conf={} self_frozen={} self_drained={} pool={} rerun={} :: FAIL ::",
+            was_alive,
+            off_confirmed,
+            off_frozen,
+            off_drained,
+            self_confirmed,
+            self_frozen,
+            self_drained,
+            pool_clean,
+            rerun_ok
+        );
+    }
 }
 
 /// Busy-wait `ms` milliseconds off the free-running CNTPCT (works even where the timer IRQ isn't

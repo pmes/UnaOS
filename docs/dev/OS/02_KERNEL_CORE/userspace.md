@@ -793,6 +793,58 @@
     `:: uvug6: typematic … PASS ::` green, `:: EL0: input test … PASS ::` still green in QEMU. Lane:
     `pal.rs` (queue accounting) + `main.rs` (router witness) + `arch/aarch64/syscall.rs` (fixture gate) +
     this doc.
+- **SKILL-1 (this arc)** — the **asynchronous kill primitive**, and the retirement of the orphan.
+  Every arc above had to work around the same missing piece: `sched::exit` retires only the **calling**
+  task, so nothing could stop a task that had stopped cooperating. `run_user_image`'s `Timeout` path could
+  only park the `Proc` row `PORPHANED` and walk away, and the metal cost of that was severe and cumulative
+  — the abandoned EL0 task kept **spinning a core at 100 % forever**, kept **rendering over the shell's
+  screen**, and starved every later run (observed on two boots as `EXEC1 … did not exit in time` on the run
+  *after* a timeout). UVUG-9's watchdog fix above ("orphan residue") treated one symptom of exactly this.
+  - **A kill is a request, never register surgery.** `sched::kill(tid)` publishes an entry in a four-slot
+    table keyed by task id; the target retires **itself, on its own core**, at a boundary where switching
+    away for good is already proven safe. No cross-CPU stack or register is ever touched. Task ids are
+    monotonic and never reused, so a request cannot be mis-delivered to a later task.
+  - **Two arms.** *(a) OFF-CPU* — `dispatch_next` checks the table after popping a task and **before**
+    switching into it: a killed task is never dispatched again, and is torn down on the scheduler's own
+    stack. This arm needs no cooperation from the target at all and covers ready, sleeping and wait-queued
+    tasks alike, since they all re-enter through a dispatch. *(b) ON-CPU* — `timer_preempt`, `yield_now`
+    and the SVC dispatcher call `kill_check_current`, which routes a killed current task straight into
+    `exit()`. The quantum tick is the load-bearing one: it is the **only involuntary boundary a spinning
+    EL0 task ever reaches**, and it is what turns the 100 %-core orphan into an actual death (~one tick,
+    ≈4 ms, on metal). All three call sites already run IRQ-masked on the task's own kernel stack and
+    already tolerate a never-returning `exit()` — that is precisely what the M6b EL0 fault-kill path does.
+  - **Teardown mirrors `exit()` exactly**, in both arms: `boot::teardown_user_slot(asid)` first (it
+    repoints the core's `TTBR0` off the dead root before the ASID broadcast-flush and the slot release),
+    then the `done_sem` post so a `JoinHandle` is never left blocked, then the Box drop that frees the
+    kernel stack. The kill slot is settled **last**, so `confirmed` means every resource the task owned is
+    already released and nothing of it will execute again.
+  - **Confirmation is what licenses the reap.** `run_user_image` now kills **before** it parks:
+    `kill` → bounded wait (`KILL_CONFIRM_SECS` = 2 s, wall-clock off CNTPCT, yielding so the co-located
+    target reaches a dispatch) → on confirmation the row is **reaped outright**, because nothing is left
+    alive to post a late status onto a recycled entry, which was the entire reason `PORPHANED` existed. If
+    the task *did* manage a real `SYS_EXIT` or fault-kill on its way out (a boundary is where those land
+    too), the row is already `PEXITED` and is reaped through the ordinary status+`done` path instead.
+  - **Fail-closed everywhere.** No free kill slot, or a kill that does not confirm inside the bounded wait,
+    degrades to **exactly** the pre-arc `PORPHANED` behaviour — never to freeing a row under a live task.
+    A detached request stays **armed**, so the task still dies at its next boundary, and
+    `note_killed_task_retired` reclaims the parked row when it does (scoped to `PORPHANED` rows only, so it
+    can never race the confirmed path or touch a live parent/child row). Witness, printed only when a kill
+    actually happens: `[skill] killed pid=<n> asid=<n> confirmed=<0|1> row=<reaped|orphaned>`.
+  - **QEMU proves both arms; only the timer *trigger* is metal-only.** The new `:: SKILL-1: async kill …
+    :: PASS ::` witness runs cooperatively on the boot core (before `SCHED_ACTIVE`, self-contained and
+    bounded, like the `prio_mix`/`load_accounting` witnesses beside it) and drives `dispatch_next` by hand,
+    so every step is observed rather than raced: an immortal victim is shown **running**, then killed and
+    shown **frozen** (never dispatched again — the actual claim, not merely "eventually stopped"), the
+    request confirms in **one pass**, the queue drains; a second victim arms its own kill *while running*
+    and is retired by `kill_check_current`; both tickets release, the slot pool returns clean, and a fresh
+    task then spawns, runs and exits. What QEMU raspi4b **cannot** show is the timer-driven trigger: it
+    delivers no Group-1 timer IRQ, so `timer_preempt` never fires and a genuinely spinning task (no yield,
+    no syscall) could not be interrupted there at all — it would wedge the single cooperative core. That
+    trigger rides the bench.
+  - Gates: `./arroyo check` green x86_64 + aarch64; `./arroyo kernel8` builds; `./arroyo kernel8-test 120`
+    **46/46 required witnesses, 0 forbidden**, UVUG batch `frames=300 checksum=0x48221e4101db3924 exit=0`
+    **unchanged**. Lane: `arch/aarch64/sched.rs` + the `run_user_image` `Timeout` path and the SVC boundary
+    in `arch/aarch64/syscall.rs` + this doc.
 - Not yet: **revocation trees** (a derived copy — re-grant or onward re-transfer — escapes
   single-level revoke today; derivation records + `CAP_REVOKE` are that arc), the **bandy Ring-3
   delegation wrapper**, `File` transfer (descriptor migration), real `Socket` fs/net syscalls.
