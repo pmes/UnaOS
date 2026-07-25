@@ -1,4 +1,25 @@
-STATUS: PROPOSED
+STATUS: APPROVED (GR5, 2026-07-25) with THREE BINDING AMENDMENTS:
+1. WRITE SAFETY — these are the first-ever writes to FECS offsets. After EACH
+   write (CHAN_CUR, CHAN_NEXT), read the register back immediately and print
+   it. If any readback returns BADF-family, print `FAULT` and SKIP the rest of
+   the block (no inline clear attempt — bank the data); the control bracket
+   closes as usual.
+2. ORDERING HONESTY + EXPLICIT POST-BIND WITNESS LEG — the block runs after
+   `hb final`, which is AFTER the strip test but BEFORE the runlist submit.
+   "Naturally proceed to witness-rematch" therefore only covers the post-submit
+   reading. Add ONE explicit post-bind leg: re-apply the VALID/POLL bits to the
+   channel word exactly as the existing witness sequence does (same
+   inst_off+0x0C write it already performs), read back, and print — the strip
+   either recurs (bind did not satisfy PFIFO) or holds (breakthrough). Then let
+   the existing submit + sched-status run unchanged. State in the markers which
+   reading is pre-bind baseline and which is post-bind.
+3. EXPECTATION DISCIPLINE — print ENGINE_STATUS raw pre and post; the
+   CHAN_VALID claim (bit 1) is the hypothesis under test, not an assertion.
+   If ENGINE_STATUS stays 0 after the write, that is the finding: the bind
+   does not take via bare MMIO writes, and the arc's next question is what
+   makes CTXCTL accept one (likely the FECS ucode itself — spec §3 loop).
+Everything else as proposed, including the g80_channel value (inst_off>>12 —
+consistent with our runlist entry encoding) and no 0x409504 anywhere.
 
 # PROPOSAL: kepler-fence pull 31 - The First Context-Bind Experiment
 

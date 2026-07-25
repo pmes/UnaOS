@@ -1,20 +1,19 @@
 # PETER'S RELAY SHEET — not for specialists. Coordinator overwrites this with
 # the message(s) Peter posts into each Gemini chat, verbatim.
-# (updated 2026-07-25: s34 folded — 0x409504 convicted by elimination, context surface mapped; pull 31 invited, PROPOSAL-FIRST)
+# (updated 2026-07-25: pull 31 APPROVED with three binding amendments; pull-30 backfill accepted)
 
 ## → kepler-fence session
 
-Fence: s34 results — your chain came back ALL FIVE CLEAN. Verbatim: CC_SCRATCH[1] (0x804)=00000000, CHAN_CUR (0xB00)=00000000, CHAN_NEXT (0xB04)=00000000, ENGINE_STATUS (0xC00)=00000000, ENGINE_TRIGGER (0xC08)=00000000, with the cpuctl bracket real and identical (00000010) both ends. Consequences:
+Fence: pull 31 proposal APPROVED — and thank you for the pull-30 backfill and the PBUS_INTR decode; both accepted, the record is whole again (bit 2 MMIO_RING_ERR + bit 3 MMIO_FAULT naming our BADF1000 as a PRING "target refused transaction" is a satisfying close on that thread). Direction (a) is the right call, and the g80_channel derivation (inst_off>>12, consistent with our own runlist encoding) is exactly the kind of cited value amendments exist to check. Three binding amendments:
 
-1. **0x409504 (WRCMD_CMD) is CONVICTED by elimination** — the unique fault-and-poison trigger in the surveyed surface. Six of your study's seven offsets exist on GK107 and read zero at rest.
-2. **The context surface is real, reachable, and EMPTY.** Your study's own definition — "a context exists when CHAN_CUR holds a channel and ENGINE_STATUS asserts CHAN_VALID" — reads as: no context is bound. That is now the cleanest available account of PFIFO's err=2: it refuses because nothing was ever context-bound, and the registers to change that are in our hands.
-3. The un-wedge experiment is still unexercised — the price of a fully clean chain.
+1. WRITE SAFETY: these are the first writes ever aimed at FECS offsets. After EACH write (CHAN_CUR, then CHAN_NEXT), read the register back immediately and print it. Any BADF-family readback → print FAULT, skip the rest of the block, no inline clear — bank the data. Control bracket closes as usual.
 
-PULL 31 INVITATION — **PROPOSAL FIRST this time; code without an approved proposal will not land.** Two candidate directions; propose one (or argue a better sequencing):
-(a) **First context-bind write experiment**: write a channel identifier into CHAN_CUR (and/or the study's Hypothesis-1 shape), with a full control frame — read-before, write, read-back, then re-run the witness sequence and report whether the strip signature moves off err=2 for the first time in eight refutations. Derive the value to write from citations, not guesses; state what CHAN_VALID in ENGINE_STATUS should do if the bind takes.
-(b) **The deliberate un-wedge boot**: read 0x409504 on purpose, then the PRING observe/clear, then cpuctl re-read — closes the recovery question and names the WRCMD fault mechanism.
-Also STILL OWED, third ask: PBUS_INTR bits 2+3 decode with citation (0x0C latched, reproducible).
+2. ORDERING HONESTY + EXPLICIT POST-BIND WITNESS LEG: your block runs after `hb final` — AFTER the strip test, BEFORE the runlist submit, so "naturally proceed to witness-rematch" only covers the post-submit reading. Add ONE explicit leg after the bind: re-apply the VALID/POLL bits to the channel word exactly as the existing witness does (the same inst_off+0x0C write), read back, print. Strip recurs = bind didn't satisfy PFIFO; bits hold = breakthrough. Label the markers pre-bind vs post-bind so the capture is self-explaining. Then the existing submit runs unchanged.
+
+3. EXPECTATION DISCIPLINE: print ENGINE_STATUS raw, pre and post. CHAN_VALID (bit 1) is the hypothesis, not an assertion — if ENGINE_STATUS stays 0, that IS the finding (bare MMIO bind doesn't take; the arc's next question becomes what makes CTXCTL accept one, likely the FECS ucode itself per your study §3).
+
+Implement as approved + amendments, commit ALL docs+code, delete scratch, no push. Report "PUSH OWED: n". (I run all builds and gates.)
 
 ## → kepler-display session
 
-Display: lane remains graduated and idle; console confirmed again on s34 (same markers, same panel). Nothing owed from you.
+Display: lane graduated and idle; the scale-4 console tweak rides the next ESP. Nothing owed from you.

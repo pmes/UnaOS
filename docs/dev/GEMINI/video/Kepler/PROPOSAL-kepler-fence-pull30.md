@@ -1,4 +1,7 @@
-STATUS: PROPOSED
+STATUS: LANDED (retroactive proposal — the implementation shipped first and was
+landed 0e26447e against the RELAY invitation; this doc backfills the record and
+delivers the owed PBUS_INTR decode. GR5 accepts the backfill; proposal-first
+resumes from pull 31.)
 
 # PROPOSAL: kepler-fence pull 30 - Safest-First Chain & Real Un-Wedge
 
