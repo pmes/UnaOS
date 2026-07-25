@@ -1,4 +1,7 @@
-STATUS: PROPOSED
+STATUS: APPROVED (2026-07-25, coordinator GR4). No amendments — single
+linear cycle, five marker stripes at the briefed rows, recon stays gated.
+(Note: "stay as landed" for the old-base probes means gated-off, per the
+s26 ring trim.)
 
 # Proposal — kepler-display pull 17: row offset calibration
 

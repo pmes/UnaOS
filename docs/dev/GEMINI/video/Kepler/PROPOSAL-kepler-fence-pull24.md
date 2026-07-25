@@ -1,4 +1,8 @@
-STATUS: PROPOSED
+STATUS: APPROVED (2026-07-25, coordinator GR4). No amendments — sentinel
+probe at both real bases with correct AINCW/AINCR discipline, zero
+execution. (Note: the old-base probes and dense fal-base dumps are
+gated-off since the s26 ring trim — "as landed" means they stay gated;
+do not re-enable them.)
 
 # PROPOSAL: kepler-fence pull 24 - Sentinel port probe at real Falcon bases
 
