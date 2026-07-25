@@ -17,9 +17,21 @@ clear at power-on and may be latched dead; a full pulse re-initializes the
 fabric interface (nouveau-class init does reset-then-enable, and this
 stays inside the register/class we already own).
 
-**Display — all four bwpg-step cycles ran clean** (bh=4; bytes 01560000
+**Display — PANEL VERDICT (Peter's four photos): PITCH×BW REFUTED — all
+four (bw,pg) combos still cluster-seamed, no white column.** The
+parameter-ladder road is exhausted: GOB proven, bh/bw/pg permutations all
+leave residual clustered seams. NEW READ (pull 15): we only ever swap the
+surface POINTER (0x640460); pitch/block-mode/size methods in the EVO core
+mirror stay as FIRMWARE configured them for its own surface — the hw is
+scanning our surface through firmware's storage params. Those params are
+READABLE: the method mirror at 0x640400+ (head-0 window that contains the
+0x460 slot) should hold the real pitch/block values. Pull 15 = read-only
+dense dump + decode of 0x640400–0x6405FC; match the fill to what the hw
+actually says instead of laddering guesses.
+
+**Serial: all four bwpg-step cycles ran clean** (bh=4; bytes 01560000
 @pg192 / 01C80000 @pg256 for both bw values, matching computed; restores
-clean). **Verdict awaits Peter's four panel photos.**
+clean).
 
 Capture: rmbp-s18/cu.usbserial-ABAFUJCO.log, mark s24boot1. Flash staged
 s24-20260725T*Z-b2aea033.
