@@ -297,6 +297,13 @@ const V3D_CLE_CT0QTS_ENABLE: u32 = 1 << 1; // v3d_regs.h V3D_CLE_CT0QTS_ENABLE �
 // witnesses so the next metal sitting sees exactly which half of that story the silicon disputes.
 // CTnCS status: only CTRUN (bit5) is corroborated across sources for V3D 4.x; the remaining bits differ
 // from the VideoCore-IV layout and are reported raw rather than guessed (no fabricated bit names).
+//
+// PI-V3D-59 AMENDMENT — this finding STANDS and is not refuted. What V3D-59 adds is a decode of the
+// remaining bits under the VC4-era map anyway, explicitly labelled a hedged inference, used for
+// DIAGNOSTIC OUTPUT ONLY and gating no behaviour (the CTRSTA write it makes possible stays disarmed).
+// The "remaining bits differ from the VideoCore-IV layout" caution above is the reason those readings
+// are hedged and the reason CTSEMA/CTRTSD are printed as raw windows rather than booleans — see the
+// PI-V3D-59 bit-map block further down, which carries the full lineage and the falsifier.
 const V3D_CLE_CTNCS_CTRUN: u32 = 1 << 5;
 
 // ── V3D-41 PTB / frame-completion witness registers ──────────────────────────────────────────────
@@ -363,28 +370,61 @@ const V3D_PTB_BXCF: usize = 0x0310; // PTB binner extra config (v3d_regs.h V3D_P
 const V3D_PTB_BXCF_CLIPDISA: u32 = 1 << 0; // v3d_regs.h V3D_PTB_BXCF_CLIPDISA
 const V3D_PTB_BXCF_RWORDERDISA: u32 = 1 << 1; // v3d_regs.h V3D_PTB_BXCF_RWORDERDISA
 
-// ── PI-V3D-59: the CTnCS bit decode, corroborated at last ────────────────────────────────────────
-// §32 declined to decode `CTnCS` past `CTRUN`, and declined to issue a CT0 thread reset, on the ground
-// that mainline `v3d/v3d_regs.h` defines no `V3D_CLE_CT0CS` bit fields and any constant beyond CTRUN
-// would be fabricated (the PI-V3D-4/-6 bug class). That objection is now VOID, and for a reason this
-// file already accepts elsewhere: Linux `drivers/gpu/drm/vc4/vc4_regs.h` DOES publish the field layout
-// for the register at the same offset in the same CLE block —
+// ── PI-V3D-59: the CTnCS bit map — a HEDGED VC4-family INFERENCE, not a corroboration ────────────
 //
-//     V3D_CT0CS 0x00100 / V3D_CTNCS(n)  ·  CTRSTA BIT(15) · CTSEMA BIT(12) · CTRTSD BIT(8)
-//                                          CTRUN  BIT(5)  · CTSUBS BIT(4)  · CTERR  BIT(3) · CTMODE BIT(0)
+// §32 declined to decode `CTnCS` past `CTRUN` because mainline `v3d/v3d_regs.h` defines no
+// `V3D_CLE_CT0CS` bit fields, and line ~299 of this file records the stronger finding that only CTRUN
+// "is corroborated across sources for V3D 4.x; the remaining bits differ from the VideoCore-IV layout."
+// **This block does NOT refute that finding, and must not be read as doing so.** It borrows the VC4-era
+// map anyway, on a stated and falsifiable basis, and every reading it produces is hedged accordingly.
 //
-// and that is the SAME header this driver already sources `V3D_PCS` (0x130) BMACTIVE/BMBUSY/RMACTIVE/
-// RMBUSY/BMOOM from, and the same header §30 used to establish `BPCA`/`BPCS` semantics at 0x300/0x304.
-// A bit position is either good enough for all three uses or none of them; CTRUN itself already comes
-// from it (`V3D_CLE_CTNCS_CTRUN` above cites v3d_regs.h, whose value is identical). So the decode below
-// is corroborated, not fabricated — and `CTERR` in particular is a bit the campaign has been reading as
-// part of a raw hex word for nineteen probes without ever naming it.
-const V3D_CLE_CTNCS_CTRSTA: u32 = 1 << 15; // reset the control thread (write-1)
-const V3D_CLE_CTNCS_CTSEMA: u32 = 1 << 12; // control thread semaphore state
-const V3D_CLE_CTNCS_CTRTSD: u32 = 1 << 8; // control thread return-to-sub-list depth
-const V3D_CLE_CTNCS_CTSUBS: u32 = 1 << 4; // control thread executing a SUB-list
-const V3D_CLE_CTNCS_CTERR: u32 = 1 << 3; // control thread ERROR
-const V3D_CLE_CTNCS_CTMODE: u32 = 1 << 0; // control thread mode
+// What the borrow actually rests on — stated truthfully, because the first draft of this block got the
+// lineage wrong and claimed a precedent that does not exist:
+//
+//   * This driver's rule has always been **offsets from the headers, semantics from the ARG**. The
+//     `V3D_PCS` decode at ~304 above says in terms that Linux `v3d_regs.h` treats PCS as OPAQUE and
+//     takes BMACTIVE/BMBUSY/RMACTIVE/RMBUSY/BMOOM from the Broadcom VideoCore IV 3D Architecture
+//     Reference Guide (VideoCoreIV-AG100-R). §30 did the same for `BPCA`/`BPCS`: ARG for the field
+//     meaning, `vc4_regs.h`/`v3d_regs.h` cited only to establish OFFSET IDENTITY at 0x300/0x304.
+//   * So the honest description of what follows is: `drivers/gpu/drm/vc4/vc4_regs.h` publishes a bit
+//     map for the register at offset 0x100, an offset identical across the VC4 and V3D 4.x CLE —
+//
+//       V3D_CT0CS 0x00100 / V3D_CTNCS(n) · CTRSTA BIT(15) · CTSEMA BIT(12) · CTRTSD BIT(8)
+//                                          CTRUN  BIT(5)  · CTSUBS BIT(4)  · CTERR BIT(3) · CTMODE BIT(0)
+//
+//     and this is a **VC4-era ARG-family map carried across on offset identity alone**. That is the same
+//     *class* of inference §30 and the PCS decode rest on, but it is weaker in one specific way: for PCS
+//     and BPCA/BPCS the ARG text and the header agree, whereas here line ~299 records that the 4.x
+//     layout diverges from VideoCore IV somewhere past CTRUN, without saying where.
+//   * A live corroboration crack, found while re-checking the header for this arc: `vc4_regs.h` declares
+//     `CTSEMA` and `CTRTSD` as single-bit `BIT(12)`/`BIT(8)`, while the ARG describes the semaphore and
+//     return-to-sub-list-depth as MULTI-BIT count fields. The two published sources for the same
+//     register disagree about field WIDTH. That is exactly the divergence ~299 warns about, so this file
+//     prints those two as raw masked WINDOWS (see `V3D_CLE_CTNCS_CTSEMA_WIN`/`CTRTSD_WIN`) and promises
+//     no boolean and no depth.
+//
+// **The falsifier.** The borrowed map is indicted — not merely unconfirmed — if `[v3d59] ctstate` reads
+// `CTERR` SET at S0 on a block that has just come through a fresh OFF->ON reset cycle and that then
+// renders a clean CT1 frame. A control thread cannot be both errored-from-birth and healthy enough to
+// retire a render frame; that combination means bit 3 is not CTERR on 4.x and the whole map is wrong.
+// The `[v3d59] ctstate` verdict logic checks for exactly that and says so.
+//
+// Nothing here is used to gate behaviour. `CTRSTA` stays disarmed (V3D59_ARM_CT0_RESET); the decode is
+// diagnostic output whose every verdict names its own hedge. Under that constraint a hedged inference is
+// worth printing where a fabricated constant driving a register write would not be — the PI-V3D-4/-6 bug
+// class was fabricated values steering the hardware, not labelled guesses in a log line.
+const V3D_CLE_CTNCS_CTRSTA: u32 = 1 << 15; // reset the control thread (write-1) — INFERRED, disarmed
+const V3D_CLE_CTNCS_CTSUBS: u32 = 1 << 4; // control thread executing a SUB-list — INFERRED
+const V3D_CLE_CTNCS_CTERR: u32 = 1 << 3; // control thread ERROR — INFERRED
+const V3D_CLE_CTNCS_CTMODE: u32 = 1 << 0; // control thread mode — INFERRED
+// The two fields whose published widths DISAGREE between vc4_regs.h (single-bit) and the ARG
+// (multi-bit). Printed as raw windows and reported as values, never as booleans: on the ARG reading a
+// semaphore count of 2 or a sub-list depth of 2 would read `0` through a BIT(12)/BIT(8) test, which is
+// precisely how a wrong decode manufactures a reassuring log line.
+const V3D_CLE_CTNCS_CTSEMA_WIN: u32 = 0b111 << 12; // ARG: semaphore count, bits 14:12 (vc4_regs.h: BIT(12) only)
+const V3D_CLE_CTNCS_CTSEMA_SHIFT: u32 = 12;
+const V3D_CLE_CTNCS_CTRTSD_WIN: u32 = 0b11 << 8; // ARG: return-to-sub-list depth, bits 9:8 (vc4_regs.h: BIT(8) only)
+const V3D_CLE_CTNCS_CTRTSD_SHIFT: u32 = 8;
 
 // PI-V3D-44: per-CORE interrupt status/clear registers (v3d_regs.h V3D_CTL_INT_*, read via
 // V3D_CORE_READ in v3d_irq.c on the 4.x path). The kernel driver treats a completed bin as
@@ -4332,8 +4372,10 @@ fn v3d58_rerender_control(what: &str) {
 //
 // T1 — "BPOS=0 starves the PTB; mainline arms an overflow pool BEFORE the frame."  **REFUTED.**
 //      `v3d_bin_job_run` writes `V3D_PTB_BPOS = 0` as its FIRST register write of every bin job, under
-//      the queue lock, with the comment *"Clear out the overflow allocation, so we don't reuse the
-//      overflow attached to a previous job."* `BPOA`/`BPOS` are written NOWHERE else in the driver
+//      the queue lock; its comment there gives the reason as clearing the overflow allocation so a
+//      previous job's overflow block is not carried into this one (paraphrased — the kernel is
+//      GPL-2.0-only and UnaOS is GPL-3.0-or-later, so its comment TEXT cannot ride in this tree; the
+//      FACT it states is not copyrightable and is what we rely on). `BPOA`/`BPOS` are written NOWHERE else in the driver
 //      except `v3d_overflow_mem_work`, which runs only in RESPONSE to the `V3D_INT_OUTOMEM` interrupt.
 //      Every Mesa frame on every Pi 4 therefore enters binning with `BPOS=0` and no overflow block.
 //      A zero overflow pool cannot be what stops the PTB from starting — mainline never has one either.
@@ -4407,14 +4449,16 @@ const V3D59_ARM_CT0_RESET: bool = false;
 const V3D59_FRAMECLOSE_SAMPLES: u32 = 64;
 const V3D59_FRAMECLOSE_STEP_MS: u64 = 1;
 
-/// Render the corroborated `CTnCS` decode as a compact flag string.
+/// Render the INFERRED `CTnCS` decode. `CTRUN` is the only corroborated bit; the rest are the hedged
+/// VC4-family borrow documented at the bit-map block. `CTSEMA`/`CTRTSD` come back as field VALUES from
+/// their raw windows, never as booleans — the two published sources disagree on their widths.
 fn v3d59_ctncs_flags(cs: u32) -> (u32, u32, u32, u32, u32, u32) {
     (
         (cs & V3D_CLE_CTNCS_CTRUN != 0) as u32,
         (cs & V3D_CLE_CTNCS_CTERR != 0) as u32,
         (cs & V3D_CLE_CTNCS_CTSUBS != 0) as u32,
-        (cs & V3D_CLE_CTNCS_CTRTSD != 0) as u32,
-        (cs & V3D_CLE_CTNCS_CTSEMA != 0) as u32,
+        (cs & V3D_CLE_CTNCS_CTRTSD_WIN) >> V3D_CLE_CTNCS_CTRTSD_SHIFT,
+        (cs & V3D_CLE_CTNCS_CTSEMA_WIN) >> V3D_CLE_CTNCS_CTSEMA_SHIFT,
         (cs & V3D_CLE_CTNCS_CTMODE != 0) as u32,
     )
 }
@@ -4426,7 +4470,7 @@ fn v3d59_mainline_ledger() {
         return;
     }
     serial_println!(
-        ":: V3D: [v3d59] mainline — audited against Linux v3d_sched.c/v3d_regs.h/vc4_regs.h + Mesa v3dx_draw.c/v3dx_job.c/v3d_job.c/v3d_packet.xml. CLOSED: (T1) BPOS=0 is v3d_bin_job_run's FIRST write on EVERY bin job (\"clear out the overflow allocation\"); BPOA/BPOS are written ONLY by v3d_overflow_mem_work in response to OUTOMEM — mainline NEVER pre-arms an overflow pool, so BPOS=0 cannot be what stops the PTB. (T2) QMA/QMS then QTS|ENABLE then QBA then QEA, per-frame, our exact order — the S1 BPCS drop is the CT0QMS latch reloading the remaining-size register, benign. (T3) qts = tile_state BO ADDRESS (v3d_job.c), not a count. (T4) v3dX(bcl_epilogue) emits FLUSH alone (no INCREMENT_SEMAPHORE, no FLUSH_ALL_STATE) and v3dX(start_binning) is NUMBER_OF_LAYERS/TILE_BINNING_MODE_CFG/FLUSH_VCD_CACHE/OCCLUSION_QUERY_COUNTER/START_TILE_BINNING — our CL verbatim; v3d_packet.xml code 120 max_ver=42 has NO auto-init-tile-state field. Register protocol and packet stream are both mainline-exact; the unread surface is the CLE control-thread state — see [v3d59] ctstate ::"
+        ":: V3D: [v3d59] mainline — audited against Linux v3d_sched.c/v3d_regs.h/vc4_regs.h (GPL-2.0-only: FACTS ONLY, no comment text reproduced) + Mesa v3dx_draw.c/v3dx_job.c/v3d_job.c/v3d_packet.xml. CLOSED: (T1) BPOS=0 is v3d_bin_job_run's FIRST write on EVERY bin job, done so no previous job's overflow block carries in; BPOA/BPOS are written ONLY by v3d_overflow_mem_work in response to OUTOMEM — mainline NEVER pre-arms an overflow pool, so BPOS=0 cannot be what stops the PTB. (T2) QMA/QMS then QTS|ENABLE then QBA then QEA, per-frame, our exact order — the S1 BPCS drop is the CT0QMS latch reloading the remaining-size register: benign AS A DIVERGENCE (it is not a divergence at all), which says nothing about whether the PTB is healthy — it only removes the write ORDER from the suspect list. (T3) qts = tile_state BO ADDRESS (v3d_job.c), not a count. (T4) v3dX(bcl_epilogue) emits FLUSH alone (no INCREMENT_SEMAPHORE, no FLUSH_ALL_STATE) and v3dX(start_binning) is NUMBER_OF_LAYERS/TILE_BINNING_MODE_CFG/FLUSH_VCD_CACHE/OCCLUSION_QUERY_COUNTER/START_TILE_BINNING — our CL verbatim; v3d_packet.xml code 120 max_ver=42 has NO auto-init-tile-state field. Register protocol and packet stream are both mainline-exact; the unread surface is the CLE control-thread state — see [v3d59] ctstate ::"
     );
 }
 
@@ -4440,7 +4484,7 @@ fn v3d59_emit_ctstate(what: &str, s: &[V3d58Station; 5]) {
     for (i, st) in s.iter().enumerate() {
         let (run, err, subs, rtsd, sema, mode) = v3d59_ctncs_flags(st.ct0cs);
         serial_println!(
-            "::   [v3d59] {} — CT0CS={:#010x} (CTRUN={} CTERR={} CTSUBS={} CTRTSD={} CTSEMA={} CTMODE={}) CT0SYNC={:#010x} CT1SYNC={:#010x} CT0LC={:#x} CT0PC={:#x} | BPOA={:#010x} BPOS={:#010x} BXCF={:#010x} (CLIPDISA={} RWORDERDISA={}) ::",
+            "::   [v3d59] {} — CT0CS={:#010x} (CTRUN={} | INFERRED: CTERR={} CTSUBS={} CTRTSD[9:8]={} CTSEMA[14:12]={} CTMODE={}) CT0SYNC={:#010x} CT1SYNC={:#010x} CT0LC={:#x} CT0PC={:#x} | BPOA={:#010x} BPOS={:#010x} BXCF={:#010x} (CLIPDISA={} RWORDERDISA={}) ::",
             names[i], st.ct0cs, run, err, subs, rtsd, sema, mode,
             st.ct0sync, st.ct1sync, st.ct0lc, st.ct0pc,
             st.bpoa, st.bpos, st.bxcf,
@@ -4450,33 +4494,43 @@ fn v3d59_emit_ctstate(what: &str, s: &[V3d58Station; 5]) {
     }
     let err_any = s.iter().any(|st| st.ct0cs & V3D_CLE_CTNCS_CTERR != 0);
     let err_at = s.iter().position(|st| st.ct0cs & V3D_CLE_CTNCS_CTERR != 0);
+    let err_at_s0 = s[0].ct0cs & V3D_CLE_CTNCS_CTERR != 0;
     let subs4 = s[4].ct0cs & V3D_CLE_CTNCS_CTSUBS != 0;
     let sema_moved = s[0].ct0sync != s[4].ct0sync || s[0].ct1sync != s[4].ct1sync;
     let sync0_nonzero = s[0].ct0sync != 0 || s[0].ct1sync != 0;
     let bxcf_set = s[0].bxcf != 0;
     let lc_moved = s[4].ct0lc != s[0].ct0lc;
     let pc_moved = s[4].ct0pc != s[0].ct0pc;
-    let verdict = if err_any {
-        "CTERR IS SET. The CT0 control thread latched an ERROR — the CLE did not merely fail to produce work, it FAULTED. That single bit accounts for the whole paradox (list walked to EA, CTRUN dropped, no PTB write, no FLDONE, frame left open) and it has been sitting inside the raw CT0CS word since PI-V3D-13, undecoded. The station index above says WHEN it latched; next arc: a CTRSTA (bit15) thread reset before the kick (V3D59_ARM_CT0_RESET), and a hunt for what the CLE rejected at that station"
+    // The BORROWED-MAP FALSIFIER, checked before any verdict that leans on the map. The probe is the
+    // first CT0 kick after a fresh reset cycle, and M3's CT1 render frame retires cleanly on this block
+    // (see [v3d58] xengine). A control thread cannot be errored-from-birth AND healthy enough to retire
+    // a render frame — so bit 3 reading SET at S0 in that situation indicts the VC4-era map itself.
+    let map_indicted = err_at_s0 && V3D58_RENDER_OK.load(Ordering::Acquire);
+    let verdict = if map_indicted {
+        "THE BORROWED BIT MAP IS INDICTED, NOT THE HARDWARE. Bit 3 reads SET at S0 — before this driver touched a single CT0 register, on a block that had just come through a fresh reset cycle and whose CT1 render frame retired cleanly this boot. A control thread cannot be errored-from-birth and simultaneously healthy enough to complete a render frame. So bit 3 is NOT CTERR on V3D 4.x, the VC4-era CTnCS map carried across on offset identity is WRONG for this block, and every INFERRED column on the station lines above must be discarded (this file's line ~299 caution was right). Do NOT arm V3D59_ARM_CT0_RESET on this reading — CTRSTA's position is from the same discredited map"
+    } else if err_any {
+        "bit 3 (INFERRED CTERR) IS SET. On the borrowed VC4-family map that means the CT0 control thread latched an ERROR — the CLE did not merely fail to produce work, it FAULTED — and that single bit would account for the whole paradox (list walked to EA, CTRUN dropped, no PTB write, no FLDONE, frame left open). HEDGE: the map is an inference carried on offset identity and this file's line ~299 records that the 4.x layout diverges from VideoCore IV somewhere past CTRUN, so this is a LEAD, not a verdict. It did NOT read set at S0, so the falsifier above does not fire. The station index says when it latched; next arc: corroborate bit 3 independently, then consider CTRSTA (V3D59_ARM_CT0_RESET) and hunt what the CLE rejected at that station"
     } else if subs4 {
-        "CTSUBS is SET at wait exit — the CT0 thread believes it is still inside a SUB-LIST at the end of a list that walked to EA. A thread parked in a sub-list has not reached the top-level FLUSH's completion semantics, which is exactly a frame that opens and never closes. Read CTRTSD for the nesting depth and audit every BRANCH/RETURN in the bin CL"
+        "bit 4 (INFERRED CTSUBS) is SET at wait exit — on the borrowed map, the CT0 thread believes it is still inside a SUB-LIST at the end of a list that walked to EA, and a thread parked in a sub-list never reaches the top-level FLUSH's completion semantics: exactly a frame that opens and never closes. Read the CTRTSD[9:8] window on the station lines for a candidate nesting depth — but note the two published sources disagree on that field's WIDTH, so treat the number as raw bits, not an established depth. Audit every BRANCH/RETURN in the bin CL"
     } else if sync0_nonzero || sema_moved {
-        "the CLE SEMAPHORE registers are NOT at rest. Mesa emits no INCREMENT_SEMAPHORE/WAIT_ON_SEMAPHORE on the modern V3D path (see [v3d59] mainline), so CT0SYNC/CT1SYNC should be reset-valued and static across our frames. They are not — the block is carrying CLE rendezvous state (from the reset path or from M3's CT1 render frame) into the bin, and a binner waiting on a semaphore nobody increments would open a frame and never close it"
+        "the CLE SEMAPHORE registers are NOT at rest. Mesa emits no INCREMENT_SEMAPHORE/WAIT_ON_SEMAPHORE on the modern V3D path (see [v3d59] mainline), so CT0SYNC/CT1SYNC should be reset-valued and static across our frames. HEDGE — TWO reasons this row is weaker than it looks: (1) the READ SIDE EFFECTS of CT0SYNC/CT1SYNC are unverified, and a semaphore register that decrements or clears on read would be MOVED BY THIS PROBE ITSELF (five stations = five reads per register), manufacturing the sema_moved=1 it reports; (2) their reset values are unknown, so 'non-zero at S0' is not by itself abnormal. Confirm with a single-read boot before concluding the block carries CLE rendezvous state into the bin"
     } else if bxcf_set {
         "the PTB BXCF (binner extra config) is NON-ZERO on a block we reset ourselves, and mainline writes it from no path. Whatever set it (reset default, firmware, or the preceding CT1 frame) is configuring the PTB behind us — read the CLIPDISA/RWORDERDISA columns above and treat this as a bring-up fact"
     } else if !lc_moved && !pc_moved {
         "clean CT0CS at every station, semaphores at rest, BXCF zero — and CT0LC/CT0PC BOTH unmoved across the whole kick: the CLE walked BA->EA without the list-item or primitive counters registering a single item. A CLE that consumed the address range but counted nothing is not executing the list it fetched; the next surface is the CLE's fetch/decode path (address-space aliasing of the CL itself), not the PTB"
     } else {
-        "no CTERR, no sub-list parking, semaphores at rest, BXCF zero, and CT0LC/CT0PC DID move — the control thread executed the list cleanly and by its own accounting fed items to the PTB, yet the PTB wrote nothing and the frame never closed. Every CLE-side explanation is now excluded by decode: the wall is inside the PTB itself, between item-accept and pool-write. Read [v3d59] frameclose for whether it is stalled or dead"
+        "no inferred-CTERR, no sub-list parking, semaphores at rest, BXCF zero, and CT0LC/CT0PC DID move — the control thread executed the list cleanly and by its own accounting fed items to the PTB, yet the PTB wrote nothing and the frame never closed. Every CLE-side explanation this decode can reach is excluded — with the standing caveat that the decode itself is a hedged VC4-family borrow, so 'clean CT0CS' means 'clean under a map we have not independently confirmed for 4.x'. On that reading the wall is inside the PTB, between item-accept and pool-write. Read [v3d59] frameclose for whether it is stalled or dead"
     };
     serial_println!(
-        ":: V3D: [v3d59] ctstate ({}) — CTERR seen={} (first station={}) | CTSUBS@S4={} CTRTSD@S4={} CTSEMA@S4={} | CT0SYNC {:#010x}->{:#010x} CT1SYNC {:#010x}->{:#010x} (at-rest-at-S0={}) | BXCF S0={:#010x} S4={:#010x} | CT0LC {:#x}->{:#x} (moved={}) CT0PC {:#x}->{:#x} (moved={}) — {} ::",
+        ":: V3D: [v3d59] ctstate ({}) — [decode past CTRUN is an INFERRED VC4-family map, see the PI-V3D-59 bit-map block; map-indicted={}] bit3/CTERR seen={} (first station={}, at-S0={}) | CTSUBS@S4={} CTRTSD[9:8]@S4={} CTSEMA[14:12]@S4={} (widths DISPUTED between vc4_regs.h and the ARG — raw windows, not booleans) | CT0SYNC {:#010x}->{:#010x} CT1SYNC {:#010x}->{:#010x} (at-rest-at-S0={}; read side effects UNVERIFIED — 5 reads/register) | BXCF S0={:#010x} S4={:#010x} | CT0LC {:#x}->{:#x} (moved={}) CT0PC {:#x}->{:#x} (moved={}) — {} ::",
         what,
+        map_indicted as u32,
         err_any as u32,
         match err_at { Some(i) => i as i32, None => -1 },
+        err_at_s0 as u32,
         subs4 as u32,
-        (s[4].ct0cs & V3D_CLE_CTNCS_CTRTSD != 0) as u32,
-        (s[4].ct0cs & V3D_CLE_CTNCS_CTSEMA != 0) as u32,
+        (s[4].ct0cs & V3D_CLE_CTNCS_CTRTSD_WIN) >> V3D_CLE_CTNCS_CTRTSD_SHIFT,
+        (s[4].ct0cs & V3D_CLE_CTNCS_CTSEMA_WIN) >> V3D_CLE_CTNCS_CTSEMA_SHIFT,
         s[0].ct0sync, s[4].ct0sync, s[0].ct1sync, s[4].ct1sync,
         (!sync0_nonzero) as u32,
         s[0].bxcf, s[4].bxcf,
@@ -4512,8 +4566,6 @@ fn v3d59_frameclose_poll(what: &str) {
     let mut bpcs_moved = false;
     let mut last_pcs = pcs0;
     let mut last_cs = cs0;
-    let mut pcs_last = pcs0;
-    let mut cs_last = cs0;
     for _ in 0..V3D59_FRAMECLOSE_SAMPLES {
         settle_ms(V3D59_FRAMECLOSE_STEP_MS);
         let pcs = mmio_read(V3D_CORE0_BASE, V3D_CLE_PCS);
@@ -4544,9 +4596,8 @@ fn v3d59_frameclose_poll(what: &str) {
         if mmio_read(V3D_CORE0_BASE, V3D_PTB_BPCS) != bpcs0 {
             bpcs_moved = true;
         }
-        pcs_last = pcs;
-        cs_last = cs;
     }
+    let (pcs_last, cs_last) = (last_pcs, last_cs);
     let span_ms = V3D59_FRAMECLOSE_SAMPLES as u64 * V3D59_FRAMECLOSE_STEP_MS;
     let any_motion = pcs_changes > 0 || cs_changes > 0 || bfc_moved || bpca_moved || bpcs_moved;
     let verdict = if bmactive_cleared && bfc_moved {
@@ -4557,8 +4608,10 @@ fn v3d59_frameclose_poll(what: &str) {
         "BMOOM latched during the extra window — the PTB IS out of binning memory after all, just later than any single-shot sample could see. This reopens the overflow question the OUTOMEM reads at P43/P44 closed; flip V3D59_ARM_OVERFLOW and re-run"
     } else if any_motion {
         "the frame is still open but the block is NOT frozen — at least one bin-frame register moved during the extra window. The binner is making (or attempting) progress with the frame open; read the change counts above and extend the window before calling it a hang"
+    } else if bmbusy_seen {
+        "FROZEN WITH BMBUSY SET. Across the extra window not one of PCS, CT0CS, BFC, BPCA or BPCS changed by a single bit — but BMACTIVE and BMBUSY are BOTH held set. The block says a binning operation is IN PROGRESS and that operation has made no observable progress for the whole window: a hard STALL mid-op, not an idle open frame. Whatever the PTB is waiting on, it is not the CLE (CT0CS is static) and not overflow memory (BMOOM clear)"
     } else {
-        "FROZEN. Across the extra window not one of PCS, CT0CS, BFC, BPCA or BPCS changed by a single bit, with BMACTIVE held set and BMBUSY clear throughout. This is not a slow binner and not an overflow stall: the bin frame is DEAD-OPEN — opened by START_TILE_BINNING, never advanced, never closed, with nothing in flight. Combined with [v3d58] rerender (CT1 still renders afterwards) the target is the PTB frame unit alone, and the discriminator left is [v3d59] ctstate's CTERR/CTSUBS decode"
+        "FROZEN. Across the extra window not one of PCS, CT0CS, BFC, BPCA or BPCS changed by a single bit, with BMACTIVE held set and BMBUSY clear at every sample. This is not a slow binner and not an overflow stall: the bin frame is DEAD-OPEN — opened by START_TILE_BINNING, never advanced, never closed, with nothing in flight. Combined with [v3d58] rerender (CT1 still renders afterwards) the target is the PTB frame unit alone, and the discriminator left is [v3d59] ctstate's inferred CTERR/CTSUBS decode"
     };
     serial_println!(
         ":: V3D: [v3d59] frameclose ({}) — extra window {}ms x{} samples AFTER the FLDONE backstop | PCS {:#010x}->{:#010x} changes={} (BMACTIVE-ever-cleared={} BMBUSY-ever-set={} BMOOM-ever-set={}) | CT0CS {:#010x}->{:#010x} changes={} | BFC moved={} BPCA moved={} BPCS moved={} — {} ::",
@@ -4598,9 +4651,11 @@ fn v3d59_arm_overflow(what: &str) {
 }
 
 /// Optional arm: reset the CT0 control thread before programming the job. **Off by default.** The bit
-/// is `CTRSTA` (15), corroborated by `vc4_regs.h` at the same register offset this file already sources
-/// `PCS` and `CTRUN` from — so it is no longer the fabricated constant §32 declined to write. It is
-/// still not JUSTIFIED until `[v3d59] ctstate` shows `CTERR` set or a frame open at S0.
+/// is `CTRSTA` (15) from the VC4-era `vc4_regs.h` map, carried across on offset identity — a hedged
+/// inference, not a corroboration (see the PI-V3D-59 bit-map block, and line ~299's standing caution
+/// that the 4.x layout diverges past `CTRUN`). It is not JUSTIFIED until `[v3d59] ctstate` shows the
+/// inferred `CTERR` set away from S0, or a frame open at S0 — and if bit 3 reads set AT S0 on a block
+/// whose CT1 renders cleanly, the map is indicted and this write must not be issued at all.
 fn v3d59_ct0_frame_reset(what: &str) {
     if !V3D59_CTSTATE {
         return;
@@ -4622,7 +4677,7 @@ fn v3d59_ct0_frame_reset(what: &str) {
         );
     } else {
         serial_println!(
-            ":: V3D: [v3d59] ct0-reset ({}) — DISARMED: CT0CS={:#010x} (CTERR={} CTSUBS={}). CTRSTA(bit15) is now a CORROBORATED bit (vc4_regs.h, same register offset this file already sources PCS/CTRUN from), so §32's fabricated-constant objection no longer applies — but the write stays unjustified until [v3d59] ctstate reads CTERR set or a frame already open at S0. Evidence first ::",
+            ":: V3D: [v3d59] ct0-reset ({}) — DISARMED: CT0CS={:#010x} (INFERRED CTERR={} CTSUBS={}). CTRSTA(bit15) comes from the VC4-era vc4_regs.h map carried across on OFFSET IDENTITY — an inference of the same class as this driver's PCS/BPCA decodes, but weaker, because line ~299 records that the 4.x CTnCS layout diverges from VideoCore IV somewhere past CTRUN. So §32's objection is SOFTENED, not void: the write stays unjustified until [v3d59] ctstate reads bit3 set (and NOT at S0, which would indict the map instead) or a frame already open at S0. Evidence first ::",
             what, pre,
             (pre & V3D_CLE_CTNCS_CTERR != 0) as u32,
             (pre & V3D_CLE_CTNCS_CTSUBS != 0) as u32,
