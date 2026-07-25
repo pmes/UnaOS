@@ -24,7 +24,16 @@ REFUSED.** Post-enable recon (both passes, identical, stable):
   (pull 20): if PFIFO stops stripping VALID/POLL with the engine merely
   enabled at PMC, the fence wall is over without any ucode work.
 
-**Display — all four pa-step cycles ran clean end-to-end** (fill/hold×5/
+**Display — PANEL VERDICT (Peter's four photos): PITCH ALIGNMENT REFUTED.**
+No (bh,pg) pair clean; white column never assembled. Seam count scales with
+bh as in s21 (~6–7 seams @bh4, 2–3 @bh8) but is IDENTICAL between pg=192
+and pg=256 at the same bh — seams sit at the same x positions in both
+pitch variants (clearest at bh8: two seams at ~1/3 and ~2/3 in both).
+That is the brief's refutation key verbatim: the blocks-per-row term is
+not a padding problem. Next suspect (standing plan): BLOCK WIDTH > 1 GOB
+— pull 13. Bottom-band placement unchanged (known-unknown stands).
+
+**Serial: all four pa-step cycles ran clean end-to-end** (fill/hold×5/
 done, restore between): bytes per cycle 01560000 (4,192), 01C80000 (4,256),
 015C0000 (8,192), 01D00000 (8,256) — matching computed sizes exactly
 (Fox's "all 01D00000" was a misread; capture verified). **Verdict awaits
