@@ -265,15 +265,16 @@ pub unsafe fn takeover_display(
     let pre_shadow = mmio_read(bar0, shadow_reg);
     serial_println!(":: kdisp: latch pre asm={:08X} armed={:08X} shadow={:08X} ::", pre_asm, pre_armed, pre_shadow);
 
-    let cycles = [(4, 192), (4, 256), (8, 192), (8, 256)];
+    let cycles = [(2, 4), (2, 8), (4, 4), (4, 8)];
     let new_ptr = 0x00016000;
 
-    for &(bh, pg) in &cycles {
-        let gobs_per_row = pg;
+    for &(bw, bh) in &cycles {
+        let pg = ((180 + bw - 1) / bw) * bw;
+        let blocks_per_row = pg / bw;
         let padded_width_px = pg * 16;
         let gob_rows = (expected_height + gob_height - 1) / gob_height;
         let num_block_rows = (gob_rows + bh - 1) / bh;
-        let total_bytes = num_block_rows * bh * pg * gob_size_bytes;
+        let total_bytes = num_block_rows * bw * bh * blocks_per_row * gob_size_bytes;
 
         // Step 1: Prepare surf2 (pre-swizzled ruler pattern fill)
         for y in 0..expected_height {
@@ -297,7 +298,7 @@ pub unsafe fn takeover_display(
             let gob_y = y / gob_height;
             let inner_y = y % gob_height;
             let blk_y = gob_y / bh;
-            let blk_inner = gob_y % bh;
+            let gob_inner_y = gob_y % bh;
             
             for x in 0..padded_width_px {
                 let final_color = if x >= 2880 {
@@ -314,9 +315,14 @@ pub unsafe fn takeover_display(
                 let gob_x = px_byte_x / gob_width_bytes;
                 let inner_x = px_byte_x % gob_width_bytes;
                 
-                let blk_index = (blk_y * gobs_per_row) + gob_x;
-                let target_byte_addr = (blk_index * (bh * gob_size_bytes)) 
-                                     + (blk_inner * gob_size_bytes) 
+                let blk_col = gob_x / bw;
+                let gob_inner_x = gob_x % bw;
+                
+                let blk_index = (blk_y * blocks_per_row) + blk_col;
+                let gob_inner_index = (gob_inner_y * bw) + gob_inner_x;
+                
+                let target_byte_addr = (blk_index * bw * bh * gob_size_bytes) 
+                                     + (gob_inner_index * gob_size_bytes) 
                                      + (inner_y * gob_width_bytes) 
                                      + inner_x;
                 
@@ -324,7 +330,7 @@ pub unsafe fn takeover_display(
                 core::ptr::write_volatile(target_ptr, final_color);
             }
         }
-        serial_println!(":: kdisp: pa-step bh={} pg={} fill done bytes={:08X} ::", bh, pg, total_bytes);
+        serial_println!(":: kdisp: bw-step bw={} bh={} pg={} fill done bytes={:08X} ::", bw, bh, pg, total_bytes);
 
         // Step 2: Latch Sequence
         mmio_write(bar0, asm_reg, new_ptr);
@@ -347,7 +353,7 @@ pub unsafe fn takeover_display(
         // (Peter, s21 prep: 4 s was too fast to photograph).
         for t in 1..=5 {
             for _ in 0..60_000_000 { core::hint::spin_loop(); }
-            serial_println!(":: kdisp: pa-step bh={} pg={} hold t={}s ::", bh, pg, t);
+            serial_println!(":: kdisp: bw-step bw={} bh={} pg={} hold t={}s ::", bw, bh, pg, t);
         }
 
         // Step 3: Restore
@@ -356,7 +362,7 @@ pub unsafe fn takeover_display(
         
         // 1 s recovery gap
         for _ in 0..15_000_000 { core::hint::spin_loop(); }
-        serial_println!(":: kdisp: pa-step bh={} pg={} done ::", bh, pg);
+        serial_println!(":: kdisp: bw-step bw={} bh={} pg={} done ::", bw, bh, pg);
     }
     
     // 7. Verdict
