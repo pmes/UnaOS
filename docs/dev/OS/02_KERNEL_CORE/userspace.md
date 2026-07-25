@@ -888,6 +888,26 @@
     **46/46 required witnesses, 0 forbidden**, UVUG batch `frames=300 checksum=0x48221e4101db3924 exit=0`
     **unchanged**. Lane: `arch/aarch64/sched.rs` + the `run_user_image` `Timeout` path and the SVC boundary
     in `arch/aarch64/syscall.rs` + this doc.
+- **BGRUN-1 (background EL0 runs)** — `bg <path>` / `jobs` / `kill <pid>`: the concurrent-apps line.
+  `run` blocks the shell in `run_user_image`'s wait loop until the program dies, so two real windows never
+  coexisted longer than the `el0-wcb` fixture's split second — the WC-TAB focus ring was mechanism without
+  a workflow (bench-observed: windows open for a fraction of a second, nothing to TAB between).
+  - **`spawn_user_image_bg`** (syscall.rs) is `run_user_image`'s front half, verbatim — same bounds, same
+    console-cap endowment, same EXEC1-M asid-before-spawn publish order (the SYS_EXIT rescue arm covers the
+    same mid-publish window here, correctly) — and then RETURNS `(pid, asid, entry)` instead of waiting.
+    Deliberate non-inheritances: no `el0_input_set_active` (focus stays put; the operator TABs into a bg
+    window, which resets its ring exactly as the foreground path does), and no deadline/UVUG-8 machinery
+    (nothing waits, so nothing can strand; a hung bg app is `kill`able, and a windowed one still meets the
+    compositor's 60 s no-render cap).
+  - **`jobs` is the SOLE reaper**: a bg row stays claimed after exit (`PEXITED`, `done` posted) until
+    `bg_poll(reap=true)` consumes the permit and frees it — bounded and honest (a shell that never reaps
+    eventually reads "process table full", not silent loss). The shell records jobs in a bounded 8-slot
+    table (= the EL0 address-space slot count); a spawn the table cannot record is killed, not leaked.
+  - **`kill <pid>`** is the SKILL-1 primitive (ASID-scoped so ELF-2 siblings die too), condensed: bounded
+    confirm wait, post-arm already-dead retract, `PORPHANED` fallback with the kill left armed.
+  - Witnesses: `:: BGRUN: bg <path> — … DETACHED ::` on spawn, `:: BGRUN: jobs — pid=… reaped ::` on reap.
+    No spec REQUIRE: QEMU has no HID to drive an interactive session, and the batch fixtures exercise the
+    foreground path; the bench proof is `bg /fat/uvug.elf` twice → TAB between two live crystals.
 - **EXEC1-M (this arc)** — the **late-publish window** in `run_user_image`, and the end of the metal-only
   `EXEC1` failure. On every real Pi 4 boot (P55b, P56) the run-path witness reported
   `:: EXEC1: run /fat/ELFHELLO.ELF — EL0 program did not exit in time -> FAIL ::`, while QEMU raspi4b
