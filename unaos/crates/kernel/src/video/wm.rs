@@ -615,6 +615,40 @@ pub fn repaint() {
     composite();
 }
 
+/// CURSOR-1 — mark every window whose outer box overlaps `(x, y, w, h)` damaged, so the next
+/// composite redraws it from its source surface. Returns the number marked.
+///
+/// The system cursor's save-under restore writes into the scan-out from outside the compositor. Its
+/// colour guard means a pixel another painter has taken is left alone, but a painter whose content
+/// happens to equal the sprite's own colour is indistinguishable from the sprite — so a restore CAN,
+/// narrowly, put stale pixels inside a window's rect. This is how that is repaired: the affected
+/// windows are damaged, and the next composite overwrites the lot from the app's surface.
+///
+/// **Marks only; never composites.** [`composite`] brackets itself with `video::cursor`, so a
+/// composite from the cursor path would recurse. Under WC-E every desktop flush composites, so the
+/// repair lands within a frame; without it, at the next present.
+///
+/// Compat rows are included: they are a full-screen present whose rect covers the panel, so a stale
+/// patch there is exactly as visible as anywhere else.
+pub fn damage_intersecting(x: usize, y: usize, w: usize, h: usize) -> usize {
+    if w == 0 || h == 0 {
+        return 0;
+    }
+    let rect = (x, y, w, h);
+    let mut t = TABLE.lock();
+    let mut n = 0usize;
+    for i in 0..MAX_WINDOWS {
+        if !t.rows[i].used || t.rows[i].damaged {
+            continue;
+        }
+        if boxes_overlap(rect, outer_box(&t.rows[i])) {
+            t.rows[i].damaged = true;
+            n += 1;
+        }
+    }
+    n
+}
+
 /// Number of live windows.
 pub fn count() -> usize {
     let t = TABLE.lock();

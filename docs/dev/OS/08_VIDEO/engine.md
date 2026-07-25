@@ -958,7 +958,16 @@ last painter of every pass.
 `set_abs`, fed from the same `pal::EVENT_QUEUE` drain the `[uvug10]` counters watch, clamped to the panel)
 and visibility (`visible()`: some report has ever arrived, and the last one is younger than the ~1.5 s
 auto-hide). `video::cursor` is only a painter, and reads both. `click1_dispatch`'s hit test keeps reading
-`pal::cursor::pos`, so the click and the drawn arrow can never disagree about where the pointer is.
+`pal::cursor::pos`, and the sprite's box ORIGIN is that same position — the arrow's tip is the box's top-left
+pixel — so the click lands where the tip is drawn. That equality is why the sprite is **clipped** at the panel
+edge rather than shifted inward: shifting the box to keep it whole would move the drawn tip up to `side - 1`
+px away from the hot spot the click uses, and near the right or bottom edge the operator would be aiming with
+an arrow that is not where the click goes. Clipping draws less of the tail and keeps the tip exact.
+
+The arrow SHAPE is shared with `pal::cursor`; the SIZE is not. `pal::cursor` magnifies by `scale + 1` (a
+deliberate step above the text scale for a full-screen demo), `video::cursor` by `scale`, which makes the
+desktop sprite exactly one glyph cell. The two never coexist — a demo owns the screen while it runs — so this
+is a size change across modes, not two cursors at once.
 
 **Three calls, and everyone who paints uses them.** `undraw()` restores the pixels under the sprite and
 forgets them; `repaint()` is `undraw()` then save-under-and-draw; `armed()` is the witness latch. The
@@ -969,12 +978,20 @@ callers are exactly the front-framebuffer painters:
 | `wm::composite` | `undraw()` before the table lock, `repaint()` after the last `draw_window`/`verify_window` — the pass body is a private `composite_inner`, so every early return keeps the ordering |
 | `wm::erase` (desktop repaint on close) | `undraw()` first; the `composite()` each caller runs next redraws |
 | `render_service` (Pi) | `undraw()` / `repaint()` around `pal.render()` (`Screen::flush` overwrites the front buffer's damaged rects); `repaint()` on each real pointer report; `undraw()` on the auto-hide edge |
+| `fbcon` (boot console mirror) | **no bracket, by exclusion** — `fbcon::detach()` at GUI takeover stops it painting the framebuffer, and it is out of the GUI's life cycle thereafter. A panic re-attaches it, which is a state where a stale cursor patch is not the problem to solve. This is the one front-buffer painter that is ordered by *not running* rather than by a bracket, and the reason both of this module's `serial_println!`s are emitted with the sprite lock released |
+
+Composed with **WC-E** the bracket count goes up sharply: `Screen::flush` now calls `wm::repaint` → `composite`
+on every desktop present, so the cursor is undrawn and redrawn ~20×/s on the bench even with the pointer at
+rest. That is what forced the save-under to read back only the pixels the arrow PAINTS (~50 at scale 1) rather
+than the whole 36×36 box (1296 `read_pixel` calls/frame). The composed per-frame cost of the save-under is a
+**bench-read item** — it has never been measured on hardware.
 
 **Damage: save-under, sized by the metrics.** The sprite is 8×8 blocks at `Metrics::scale`, i.e. exactly
 one glyph cell (`cell_w`×`cell_h` — the derivation `ui.rs` already states for the text cursor), plus one
 block of drop shadow: 36 px square at the 4× cap and nothing named in pixels anywhere (THE METRICS RULE).
-Its box is saved with `FrameBuffer::read_pixel` before drawing and written back on `undraw`, and only its
-scanlines are cleaned for the non-coherent HVS. The alternative — marking the box damaged and driving a
+Only the pixels the arrow PAINTS are saved with `FrameBuffer::read_pixel` before drawing and written back on
+`undraw` — the rest of the box was never modified, so restoring it would be a write, and a race, with nothing
+to fix — and only its scanlines are cleaned for the non-coherent HVS. The alternative — marking the box damaged and driving a
 desktop+window recomposite — would run a composite pass at HID report rate (~125 Hz) to move an arrow three
 pixels. Pointer motion therefore does **not** set the render loop's `dirty` flag at all: the sprite bypasses
 the `Screen` and its flush entirely, which also removes the pre-CURSOR-1 erase-to-`0x1E1E1E` (neither the
@@ -984,11 +1001,30 @@ A panel whose format has no colour inverse (`read_pixel` returns `None` — the 
 the cursor for the boot** with a one-line reason, rather than restoring pixels it could not read. Fail-closed:
 no cursor beats a trail of wrong pixels across the desktop.
 
-**The one race, stated.** The front framebuffer has no single owner. If another core paints into the sprite's
-box between the draw and the `undraw`, the restore puts back pixels that are no longer current — a stale patch
-at most one cell across, repaired by that painter's next pass. This is the same non-exclusive-framebuffer
-caveat WC-D records for its verify rect, and the reason `undraw` is called by the painters rather than by a
-timer.
+**The race is the RESTORE, not just the sprite — say it plainly.** The front framebuffer has no single owner,
+and WC-E makes the collision routine rather than exceptional: the compositor repaints the window layer on
+every desktop flush, from another core's syscall context. The dangerous ordering is not "a window covers the
+arrow" but its inverse — the render task draws the sprite at P and saves PRE-window pixels; the compositor
+then draws a window over P and verifies it; the compositor's own bracket then undraws, and a naive restore
+**stamps those pre-window pixels back INTO the verified window rect**. Nothing would repair it (a composite
+repaints damaged windows, not arbitrary rows) and a later `[wc-d] verify` could read it as `bad_cache > 0` —
+a line the Pi spec FORBIDs. Three mechanisms, together, close it:
+
+1. **Atomicity.** Every entry point holds the sprite lock across the whole restore → save → draw sequence. The
+   earlier split (`repaint` calling a self-locking `undraw`, then re-locking to save) left a window in which
+   another core's draw could be captured AS the save-under — which would stamp a permanent white arrow into
+   whatever was beneath it.
+2. **A colour-guarded restore.** A saved pixel is written back only if the framebuffer still holds the exact
+   colour the sprite painted there. A window drawn over the sprite fails that test, so its pixels are left
+   alone: the restore cannot touch a rect another painter has taken.
+3. **Damage repair.** Whatever rect a restore touched is handed to `wm::damage_intersecting`, which marks every
+   overlapping window damaged so the next composite redraws it from its source surface. This closes the colour
+   guard's residual hole — a painter whose new content happens to be exactly the sprite's own `FILL` or
+   `SHADOW` is indistinguishable from the sprite. It marks only, never composites (composite brackets this
+   module; compositing from here would recurse), so the repair lands within one WC-E frame.
+
+Lock order is stated once and must hold: **`SPRITE` → `TABLE`, never the reverse** — nothing in `wm` calls
+into the cursor while holding the window table, and the repair runs with the sprite lock released.
 
 **Why no checksum or witness moves — two independent reasons.** *Ordering:* no verified pixel is ever read
 with the sprite on the panel (`composite` puts it back only after the last `verify_window` returns), and
