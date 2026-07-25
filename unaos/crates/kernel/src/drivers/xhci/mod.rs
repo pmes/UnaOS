@@ -5515,7 +5515,10 @@ impl XhciController {
             let mut candidates = [0u32; 3];
             let mut ncand = 0usize;
             for off in [1u64, 8, 64] {
-                if nb >= off && (nb - off) >= ceiling {
+                // Strict `>` (lens fold): with nb == off the candidate would be LBA 0 — the boot
+                // sector, the one sector everything else treats as sacred. Only reachable on a raw
+                // 8/64-sector medium, but the "near the END of the medium" intent is absolute.
+                if nb > off && (nb - off) >= ceiling {
                     candidates[ncand] = (nb - off) as u32;
                     ncand += 1;
                 }
