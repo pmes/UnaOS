@@ -2082,6 +2082,22 @@ fn gui_send(ev: unaos_kernel::pal::Event) {
     GUI_CHANNEL.send(ev);
 }
 
+/// FOCUS-VIS — panel dimensions for the router's cursor keep-alive, read straight from the scan-out
+/// framebuffer. The router has no `TargetPal` (that lives in the render task), and `pal::cursor` needs
+/// bounds to clamp the hot spot against; `video::WRITER` is the same surface the sprite is drawn into,
+/// so the two can never disagree. Zero while the framebuffer is unset, which clamps to (0,0) — harmless,
+/// and unreachable in practice since a pointer report implies a booted display.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn pal_width_hint() -> i32 {
+    unaos_kernel::video::WRITER.lock().info().width as i32
+}
+
+/// FOCUS-VIS — see [`pal_width_hint`].
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn pal_height_hint() -> i32 {
+    unaos_kernel::video::WRITER.lock().info().height as i32
+}
+
 /// INPUT-WIRE (ELF-5 router fold): drain every pending pal event into the ACTIVE EL0 program's per-process
 /// input ring via the `el0_input_enqueue` seam. The single choke point for router->ring delivery — called by
 /// `pump_usb_into_gui` when an EL0 app holds input focus, and exercised directly by `input_router_selftest`.
@@ -2093,6 +2109,41 @@ fn route_input_to_active_el0() -> usize {
     while let Some(ev) = unaos_kernel::pal::next_event() {
         // UVUG-6: no drain-fed typematic observe here — the tracker is fed at the HID report level
         // (drivers::xhci -> pal::typematic_note_report), which a dropped queue event cannot defeat.
+        //
+        // FOCUS-VIS — the SYSTEM CURSOR IS SYSTEM-WIDE, so it must survive this branch. Everything
+        // below routes the event onward to the focused app's ring and returns; the shell loop's
+        // `Mouse`/`MouseAbsolute` arms — the ONLY code that moved the shared pointer state and repainted
+        // `video::cursor` — are not reached at all while an app holds focus. The sprite therefore froze
+        // where it was and auto-hid 1.5 s later, and no amount of mouse movement brought it back: the
+        // reports were all going to the app. That is a system cursor disappearing because of who owns
+        // the KEYBOARD, which is not a relationship that should exist.
+        //
+        // Delivery is unchanged — the event still goes to the app, which is what focus means; this only
+        // keeps the kernel's own pointer state and its top-most sprite current alongside it.
+        //
+        // Gated on `has_reported()`: the boot-time `input_router_selftest` drives this exact function
+        // with a SYNTHETIC `Event::Mouse` against a fake focus, and on a QEMU gate with no HID that
+        // would otherwise be the first "pointer report" of the boot — arming a cursor, painting a sprite
+        // and printing `[cursor] armed` on a panel that has no pointer. A machine with a real pointer
+        // has always armed it through the shell loop first (focus is the shell at boot).
+        if unaos_kernel::pal::cursor::has_reported() {
+            match ev {
+                unaos_kernel::pal::Event::Mouse { x, y } if x != 0 || y != 0 => {
+                    unaos_kernel::pal::cursor::move_rel(
+                        x,
+                        y,
+                        pal_width_hint(),
+                        pal_height_hint(),
+                    );
+                    unaos_kernel::video::cursor::repaint();
+                }
+                unaos_kernel::pal::Event::MouseAbsolute { x, y } => {
+                    unaos_kernel::pal::cursor::set_abs(x, y, pal_width_hint(), pal_height_hint());
+                    unaos_kernel::video::cursor::repaint();
+                }
+                _ => {}
+            }
+        }
         if unaos_kernel::arch::aarch64::syscall::el0_input_enqueue(ev) {
             routed += 1;
         }

@@ -1186,3 +1186,131 @@ and `[wc-c] win=… cksum=`, `[wc-d] verify … -> PASS`, `:: UVUG: frames=300 �
 and the compat `mapped=32x32 … checksum=0x8d99530ca96d4b25` are unchanged. Not one `[cursor]` line appears.
 What QEMU therefore cannot exercise is the sprite itself: the first draw, the save-under restore and the
 `[cursor] armed` line are **unverified until the next bench boot**, exactly as WC-D's `bad_ram` column is.
+
+### FOCUS-VIS — focus you can SEE, and a shell you can read
+
+P59 (bench, 2026-07-25) put two backgrounded windows on the panel — the UVUG crystal and `STAT.ELF` —
+and produced two observations that turn out to be one defect:
+
+1. **TAB provably cycled focus and the panel never moved.** `[wc-c] focus tab-cycle 0->1->2->0 (ring of
+   2 + shell)` fired on every press, and `STAT` stayed entirely covered by the UVUG window.
+2. **The shell was unreadable.** With windows up, the console — prompt, command line, command output —
+   was underneath them. The operator could type and could not read.
+
+The common cause: **focus was a pure input-routing fact.** `el0_input_set_active` moved where keystrokes
+went and nothing else, and the shell had no position in the z-order at all — it was the surface the
+window layer got painted *onto*. Nothing raised a focused window, and nothing could put the console in
+front of anything, because "in front of the console" was the only thing a window could be.
+
+#### The shell is a member of the z-order
+
+`wm::SHELL_Z` is the shell's z, allocated out of **the same monotonic `next_z` counter** every window
+raise uses. That single fact makes both halves the ordinary comparison:
+
+* a window with `z > SHELL_Z` is above the shell and composites normally;
+* a window with `z < SHELL_Z` is below it and is **not drawn** — the console owns those pixels.
+
+`SHELL_Z` starts at `0` ("the shell is at the very bottom"), which is exactly the pre-FOCUS-VIS
+behaviour, so a boot that never TABs composites byte-identically to before. That is every QEMU gate run:
+raspi4b has no HID.
+
+#### One seam: `wm::focus_changed(asid)`
+
+Called by `wc_focus_key` immediately after `el0_input_set_active`, with `asid == 0` meaning the ring's
+SHELL slot.
+
+| `asid` | what happens |
+|---|---|
+| a window owner | **every** live non-compat window of that ASID takes a fresh z (above all windows *and* above the shell), is marked damaged, and the pass composites. All of the owner's windows, because the ring is keyed by ASID — raising a subset would leave an app half in front. |
+| `0` (the shell) | `SHELL_Z` takes the fresh z. Every window is now below it: their outer boxes are erased to `DESKTOP_BG` **immediately** (instant response), and `screen::request_full_present()` asks the desktop layer to repaint the whole panel so the console's *text* comes back over that erase. |
+
+`request_full_present` is a flag rather than a call because the `Screen` is owned by the render task —
+there is no global handle, and inventing one would hand a second core a `&mut Screen`. The compositor
+raises it from syscall context; `Screen::present_background` consumes it, on its own thread, before it
+reads its damage set. Latency floor is the 1 Hz status-strip tick; the erase is what makes the response
+look instant regardless.
+
+Compat rows are exempt from the shell test (`above_shell`): a compat window IS the full-screen present
+path, it carries owner ASID `0` and is not addressable as a focus target, so it could never be raised
+back above a shell that overtook it — hiding it would strand a full-screen app's output permanently.
+
+#### Three smaller defects the same arc closes
+
+* **`create` now composites.** A window's kernel chrome reaches the panel when the row exists, not at the
+  owner's first present (which, for an app that maps a surface and then blocks, may be never). It also
+  puts window creation *inside the cursor bracket*: before this, the first thing to touch the panel after
+  a create was the owner's `draw_window` on another core, with the sprite down and its save-under holding
+  pre-window pixels. Not on the compat path — `create_inner` is only the first half of `compat_present`,
+  and a composite there would flash the surface once at the row's defaults (1× at the origin).
+* **`move_to` now erases the box it vacates.** The compositor draws windows and never the desktop, so a
+  moved window used to leave a full copy of itself — content, border and title strip — at its old
+  position forever. Same treatment `close` gives a vacated box, because it is the same event.
+* **The system cursor survives an app holding focus.** `route_input_to_active_el0` returns after routing,
+  so the shell loop's `Mouse`/`MouseAbsolute` arms — the only code that moved `pal::cursor` and repainted
+  `video::cursor` — were unreachable while any app had focus. The sprite froze and auto-hid 1.5 s later,
+  and no amount of mouse movement brought it back. The router now updates the shared pointer state and
+  repaints the sprite alongside delivery (delivery itself is unchanged), gated on
+  `pal::cursor::has_reported()` so the boot-time `input_router_selftest`'s **synthetic** `Event::Mouse`
+  cannot arm a cursor on a gate that has no pointer.
+
+#### WC-D's one-shot needed a gate
+
+`create` compositing means WC-D's per-window read-back latch would otherwise be claimed by the
+create-time pass and verify a **blank** surface — a vacuous `-> PASS` that satisfies the spec's REQUIRE
+while the app's real content is never checked. `Window::presented` (set by `present` / `compat_present`)
+makes the verdict wait for content the owner actually put there.
+
+#### The witness: `[wc-g] focus-vis` — a READ-BACK, not a state dump
+
+Every pre-existing focus witness is a statement about kernel state, and `[wc-c] focus tab-cycle` printed
+correctly on the bench for a panel that never changed. `wm::focusvis_selftest` never asks the table who
+is in front; it asks the **framebuffer what colour is actually there**. Two solid-colour 8×8 windows are
+placed at the SAME origin, so exactly one of them can own the probe pixel:
+
+| leg | action | expected pixel |
+|---|---|---|
+| `stack` | B created after A | B's colour (baseline) |
+| `raise` | `focus_changed(A)` | A's colour — **defect 1** |
+| `shell` | `focus_changed(0)` | neither colour — the window layer stopped owning those pixels |
+| `reraise` | `focus_changed(B)` | B's colour — the shell is a POSITION in the rotation, not a terminus |
+
+Self-cleaning (both windows closed, boxes erased, `SHELL_Z` returned to 0), placed upper-middle so it
+cannot collide with WC-F's reserved probe boxes at the bottom edge, and run from the tail of
+`wcb_launcher` so it cannot burn the one-shot `[wc-c] side-by-side` / `[wc-d] verify` latches.
+
+```
+[wc-g] focus raise asid=0xf0a windows=1 top_win=1 z=7 shell_z=0
+[wc-g] focus shell z=8 hidden=2
+[wc-g] focus raise asid=0xf0b windows=1 top_win=2 z=9 shell_z=8
+[wc-g] focus-vis at (641,314) a=0xff2020 b=0x20ff20 stack=0x20ff20/true raise=0xff2020/true shell=0x2d2b55/true reraise=0x20ff20/true -> PASS
+```
+
+The `shell` leg reads `0x2d2b55` — `DESKTOP_BG` exactly — which is the erase landing, i.e. the window
+layer genuinely stopped owning those pixels rather than merely being reordered among itself.
+
+#### FOCUS-VIS gate results (2026-07-25, QEMU raspi4b @ `UNAOS_FBW=1920 UNAOS_FBH=1200`)
+
+`./arroyo check` green both arches · `kernel8` builds clean · `kernel8-test 60`
+**57/57 required, 0 forbidden** (56 → 57: the one new `[wc-g] focus-vis` REQUIRE, with a matching
+FORBID).
+
+> `./arroyo test-arm` does **not** build at this tip, and not because of this arc: the aarch64-virt
+> profile is `witness` **without** `baremetal`, and `video/wcf.rs` is gated on
+> `all(target_arch = "aarch64", feature = "witness")` while importing `arch::aarch64::mailbox`, which is
+> gated on `baremetal`. Both files are untouched by FOCUS-VIS (last changed by WC-F, `49e7d5f5`);
+> recorded here rather than fixed, since the fix is a WC-F cfg correction outside this arc's lane.
+
+Every pre-existing witness is byte-identical: `:: UVUG: frames=300 threads=2
+checksum=0xe68285b85121ac7c ::`, `:: EL0: window verbs — … witness=0x1fff …
+checksum=0xfabe809492cf2325 :: PASS ::`, the compat `mapped=32x32 … checksum=0x8d99530ca96d4b25`,
+`[wc-c] side-by-side windows=2 drawn=2`, and every `[wc-d] verify … bad_cache=0 bad_ram=0 -> PASS`
+including the two the selftest's own 8×8 rows now add. No `[cursor]` line appears — the router
+keep-alive is `has_reported()`-gated, so the synthetic router-selftest `Event::Mouse` still arms
+nothing on a gate with no pointer, exactly as CURSOR-1 promised.
+
+#### The bench operator test (what must pass on the next boot)
+
+`bg` two apps → TAB to the shell, **type a command and read its output** → TAB to a window, the window is
+visibly front → the cursor is visible throughout. The raise, the shell raise and the cursor's survival of
+a window create are all gate-checkable; the *legibility* of the console under the full present, and the
+sprite itself (QEMU has no pointer), remain bench-only.

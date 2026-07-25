@@ -247,6 +247,20 @@ REQUIRE \[wc-c\] side-by-side windows=2 drawn=2
 REQUIRE \[wc-d\] verify win=.*bad_cache=0 bad_ram=0.*-> PASS
 FORBID \[wc-d\] verify .*-> FAIL
 
+# --- 4b. FOCUS-VIS: FOCUS IS VISIBLE, and the SHELL is in the z-order. Every other focus directive
+# ---    in this file reports KERNEL STATE — `[wc-c] focus tab-cycle` printed a correct rotation on
+# ---    the P59 bench for a panel that never changed, which is exactly the failure this catches.
+# ---    `[wc-g] focus-vis` places two solid-colour windows at ONE origin (so exactly one can own the
+# ---    probe pixel) and READS THE SCAN-OUT BACK after each focus move: stack (later window in
+# ---    front), raise (focusing the covered window brings it forward), shell (focusing the shell
+# ---    slot takes both windows out of those pixels — the "TAB to the prompt and read your output"
+# ---    case), reraise (a window comes back from under the shell). All four legs are in the one
+# ---    verdict, so a partial regression cannot pass by satisfying a prefix.
+# ---    The interactive path that reaches this on metal is TAB, which QEMU cannot press; the
+# ---    selftest drives `wm::focus_changed` directly, which is the same seam `wc_focus_key` calls.
+REQUIRE \[wc-g\] focus-vis .*-> PASS
+FORBID \[wc-g\] focus-vis .*-> FAIL
+
 # --- BGRUN-1: background EL0 runs (bg/jobs/kill). Headless-observable core of the contract,
 # ---   REQUIREd per the round-1 lens: leg 1 proves spawn->exit->reap (the sole-reaper contract);
 # ---   leg 2 proves a killed bg row settles (confirmed-kill reaps in place; no leaked PRUNNING row

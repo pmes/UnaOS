@@ -193,6 +193,19 @@ pub mod cursor {
         t != 0 && crate::arch::ms().wrapping_sub(t) < HIDE_AFTER_MS
     }
 
+    /// FOCUS-VIS — whether a REAL pointer report has ever arrived this boot (the `visible()` predicate
+    /// without the auto-hide half). Distinct from `visible()` because it answers a different question:
+    /// "does this machine have a working pointer?", not "should the arrow be on screen right now?".
+    ///
+    /// It exists so the EL0 input router can keep the sprite alive while an app holds focus WITHOUT
+    /// arming a cursor that never existed. QEMU raspi4b delivers no HID pointer, but the boot-time
+    /// `input_router_selftest` pushes a synthetic `Event::Mouse` through the real router to prove the
+    /// routing path; gating on this keeps that synthetic event from stamping the activity clock,
+    /// drawing a sprite, and printing `[cursor] armed` on a gate that has no pointer at all.
+    pub fn has_reported() -> bool {
+        LAST_INPUT_MS.load(Ordering::Relaxed) != 0
+    }
+
     /// Sprite magnification: one step above the text scale so the cursor reads at a glance
     /// (16 px at the 480p QEMU panel, 24 px on the 2880×1800 Retina).
     fn sprite_scale(pal: &impl GneissPal) -> usize {

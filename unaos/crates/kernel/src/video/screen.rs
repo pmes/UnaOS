@@ -207,6 +207,31 @@ fn band_worker(arg: usize) {
     band_run(unsafe { &*(arg as *const BandJob) });
 }
 
+/// FOCUS-VIS — a pending request for the NEXT desktop present to repaint the WHOLE panel.
+///
+/// The desktop (`Screen`) presents only its own damage, so a region the *window layer* overwrote is
+/// never repainted by the desktop: nothing in `Screen` knows a window covered it. That is exactly the
+/// state `wm::focus_changed(0)` creates when the operator TABs to the shell — the console's text is
+/// intact in the back buffer and stale on the panel, with no damage to make it move.
+///
+/// A flag rather than a call because the `Screen` is OWNED by the render task (it lives in that task's
+/// `TargetPal`); there is no global handle the compositor could reach it through, and inventing one
+/// would give a second core a `&mut Screen`. The compositor raises this from syscall context; the
+/// render task's own next present consumes it, on its own thread, under its own ownership.
+static FULL_PRESENT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// FOCUS-VIS — ask the desktop layer to repaint the whole panel on its next present. Idempotent; the
+/// request is consumed by the first [`Screen::flush`] that follows.
+///
+/// Latency, stated: the render task presents only when something marked it dirty, and the 1 Hz status
+/// strip tick is the floor — so an otherwise idle desktop repaints within ~1 s of the request. The
+/// caller (`wm::focus_changed`) does not rely on that for its own visible effect: it erases the
+/// windows' boxes to the desktop colour immediately, and this restores the console's *text* on top of
+/// that erase when the desktop next runs.
+pub fn request_full_present() {
+    FULL_PRESENT.store(true, core::sync::atomic::Ordering::Release);
+}
+
 pub struct Screen {
     /// The real framebuffer (flush target).
     front: FrameBuffer,
@@ -461,6 +486,13 @@ impl Screen {
     /// layering. Split out so both of its exits (the parallel band path and the serial fallback) are
     /// covered by the window repaint without either having to remember to call it.
     fn present_background(&mut self) {
+        // FOCUS-VIS: honour a pending whole-panel repaint request BEFORE the damage set is read. This
+        // is how the console comes back out from under a window layer that stopped drawing (see
+        // `request_full_present`) — the back buffer already holds the right pixels; only the damage
+        // that would carry them forward is missing.
+        if FULL_PRESENT.swap(false, core::sync::atomic::Ordering::AcqRel) {
+            self.mark_full();
+        }
         let n = self.damage.len;
         self.damage.clear();
         self.last_flush_bytes = 0;

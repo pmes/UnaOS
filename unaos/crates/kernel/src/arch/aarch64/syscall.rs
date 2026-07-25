@@ -10676,6 +10676,13 @@ fn wc_focus_key(ev: crate::pal::Event) -> bool {
         return true;
     }
     el0_input_set_active(next);
+    // FOCUS-VIS — the other half of a focus change. `el0_input_set_active` moves where KEYSTROKES go;
+    // this moves what the PANEL shows. P59's bench report is what happens when only the first exists:
+    // `[wc-c] focus tab-cycle` fired on every press and nothing on screen moved, so the newly focused
+    // window stayed buried and the shell stayed covered. `next == 0` is the shell slot, and
+    // `focus_changed` treats it as a first-class member of the z-order (raise the shell, drop the
+    // windows below it, ask the desktop for a full present) rather than as "no window focused".
+    crate::video::wm::focus_changed(next);
     serial_println!(
         "[wc-c] focus tab-cycle {} -> {} (ring of {} + shell)",
         cur,
@@ -11593,6 +11600,12 @@ fn wcb_launcher(_demo_cpu: usize) {
             w, checksum, WCB_WITNESS_ALL, expect, done
         );
     }
+    // FOCUS-VIS: the raise-is-visible read-back witness, run HERE and not earlier. It puts two of its
+    // own rows in the window table, and the one-shot `[wc-c] side-by-side` / `[wc-d] verify` latches
+    // must already have been claimed by the fixture above — otherwise this selftest's windows would
+    // burn them and the arc's real per-window checksums would never print.
+    #[cfg(feature = "witness")]
+    crate::video::wm::focusvis_selftest();
 }
 
 // =============================================================================================

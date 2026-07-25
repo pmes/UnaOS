@@ -140,6 +140,15 @@ struct Window {
     /// Set by [`move_to`]: the caller placed this window explicitly, so the automatic tiling in
     /// [`place`] leaves it where it is.
     pinned: bool,
+    /// FOCUS-VIS — has the OWNER ever presented this window? False between [`create`] and the first
+    /// [`present`], when the surface still holds whatever the mapping code left there (zeros).
+    ///
+    /// Only WC-D reads it, and it matters because FOCUS-VIS made `create` composite. WC-D's read-back
+    /// verdict is one-shot per window id, so without this gate the latch would be claimed by that
+    /// create-time composite and would verify a BLANK surface — a vacuous `-> PASS` that satisfies the
+    /// spec's REQUIRE while the app's real content is never checked at all. The verdict waits for
+    /// content the app actually put there.
+    presented: bool,
 }
 
 impl Window {
@@ -162,6 +171,7 @@ impl Window {
             title_len: 0,
             compat: false,
             pinned: false,
+            presented: false,
         }
     }
 }
@@ -179,6 +189,36 @@ static TABLE: Mutex<Table> = Mutex::new(Table {
     rows: [Window::empty(); MAX_WINDOWS],
     next_z: 1,
 });
+
+/// FOCUS-VIS — **the SHELL's position in the z-order.** The desktop/console is a member of the stack the
+/// TAB ring already cycles through, not a backdrop the stack is painted onto.
+///
+/// Until FOCUS-VIS the shell had no z at all, and the consequence was the two halves of the P59 bench
+/// report. Focus provably cycled (`[wc-c] focus tab-cycle`) and the panel never changed, because focus
+/// was a pure *input-routing* fact: nothing raised the newly focused window, so a window covered by
+/// another stayed covered. And when focus reached the shell slot the windows kept compositing over the
+/// console, so the prompt and its output were unreadable — the operator could type but not read.
+///
+/// One value fixes both, because both are the same missing fact. `SHELL_Z` is allocated out of the SAME
+/// monotonic `next_z` counter every window raise uses, so "the shell is in front of window W" and
+/// "window W is in front of the shell" are the ordinary z comparison, evaluated the ordinary way:
+///  * a window with `z > SHELL_Z` is ABOVE the shell and composites normally;
+///  * a window with `z < SHELL_Z` is BELOW it and is not drawn at all — the console owns those pixels.
+///
+/// `0` is the initial value and means "the shell is at the very bottom", which is exactly the pre-
+/// FOCUS-VIS behaviour: every window (z >= 1) is above it. Nothing changes until a focus change
+/// actually happens, so a boot that never TABs — every QEMU gate run, since raspi4b has no HID —
+/// composites byte-identically to before.
+///
+/// Read outside the table lock deliberately: it is a single monotonic value with no invariant tying it
+/// to any row, and the composite pass snapshots it once per pass so the whole pass judges every window
+/// against one shell position.
+static SHELL_Z: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// FOCUS-VIS — the shell's current z. See [`SHELL_Z`].
+pub fn shell_z() -> u32 {
+    SHELL_Z.load(core::sync::atomic::Ordering::Acquire)
+}
 
 /// Create a window owned by `owner_asid` over the caller's ARGB8888 surface at `surf` (EL1-visible
 /// address, `surf_len` bytes long, `stride` bytes per row) with source dimensions `w` x `h` and a
@@ -301,6 +341,7 @@ pub(super) fn compat_present(
         r.x = x;
         r.y = y;
         r.damaged = true;
+        r.presented = true;
     }
     composite();
 }
@@ -336,7 +377,10 @@ pub fn present(id: WinId) -> bool {
     {
         let mut t = TABLE.lock();
         match row_mut(&mut t, id) {
-            Some(r) => r.damaged = true,
+            Some(r) => {
+                r.damaged = true;
+                r.presented = true;
+            }
             None => return false,
         }
     }
@@ -364,26 +408,41 @@ pub fn move_to(id: WinId, x: usize, y: usize) -> bool {
     }
     let info = fb.info();
 
-    let mut t = TABLE.lock();
-    match row_mut(&mut t, id) {
-        Some(r) => {
-            // Largest origin that keeps the whole window (content + chrome) on the panel; falls back
-            // to the minimum when the window is wider/taller than the panel.
-            let cw = r.w.saturating_mul(r.scale);
-            let ch = r.h.saturating_mul(r.scale);
-            let max_x = info.width.saturating_sub(cw + BORDER).max(BORDER);
-            let max_y = info
-                .height
-                .saturating_sub(ch + BORDER)
-                .max(TITLE_H + BORDER);
-            r.x = x.clamp(BORDER, max_x);
-            r.y = y.clamp(TITLE_H + BORDER, max_y);
-            r.pinned = true;
-            r.damaged = true;
-            true
+    let vacated = {
+        let mut t = TABLE.lock();
+        match row_mut(&mut t, id) {
+            Some(r) => {
+                let before = outer_box(r);
+                // Largest origin that keeps the whole window (content + chrome) on the panel; falls back
+                // to the minimum when the window is wider/taller than the panel.
+                let cw = r.w.saturating_mul(r.scale);
+                let ch = r.h.saturating_mul(r.scale);
+                let max_x = info.width.saturating_sub(cw + BORDER).max(BORDER);
+                let max_y = info
+                    .height
+                    .saturating_sub(ch + BORDER)
+                    .max(TITLE_H + BORDER);
+                r.x = x.clamp(BORDER, max_x);
+                r.y = y.clamp(TITLE_H + BORDER, max_y);
+                r.pinned = true;
+                r.damaged = true;
+                if outer_box(r) == before { None } else { Some(before) }
+            }
+            None => return false,
         }
-        None => false,
+    };
+    // FOCUS-VIS — a move VACATES its old box, and nothing was repainting it. The compositor draws
+    // windows and never the desktop, so before this the window's previous position kept its last frame
+    // on the panel forever: an app that moved its window left a full copy of itself behind, and a
+    // kernel-drawn title strip and border to go with it. Same treatment `close` gives a vacated box —
+    // desktop colour, then re-damage whatever the erase reached so the surviving windows repaint over
+    // it — because it is the same event: those pixels stopped belonging to this window.
+    if let Some(b) = vacated {
+        erase(&[b]);
+        damage_intersecting(b.0, b.1, b.2, b.3);
+        composite();
     }
+    true
 }
 
 /// Close `id`, freeing its table row. The surface itself belongs to the owner's address space and is
@@ -549,6 +608,114 @@ pub fn focus_ring(out: &mut [u64; MAX_WINDOWS]) -> usize {
         }
     }
     n
+}
+
+/// FOCUS-VIS — **make a focus change VISIBLE.** The one seam the focus owner calls after
+/// `el0_input_set_active`; `asid == 0` means the SHELL slot of the ring.
+///
+/// ### Why this exists (P59, bench)
+/// WC-C shipped the tab-cycle as an input-routing change and nothing else: `[wc-c] focus tab-cycle`
+/// fired on every press, and the panel did not move. Two windows up, the covered one stayed covered
+/// after being focused, and the shell stayed buried under both. Focus that cannot be SEEN is not focus
+/// — the operator has no way to know where their keystrokes are going, which is the whole content of
+/// the concept.
+///
+/// ### What it does
+/// * **A focused window is raised.** Every live, non-compat window owned by `asid` takes a fresh z off
+///   the same allocator `create` uses, so it lands above every other window *and* above the shell. All
+///   of the owner's windows are raised, not just one: the focus ring is keyed by ASID (an app may own
+///   several windows and they focus together), so raising a subset would leave an app half in front.
+/// * **The shell is raised the same way.** `asid == 0` gives [`SHELL_Z`] the fresh z, which puts every
+///   existing window BELOW the shell; those windows stop compositing, their boxes are erased to the
+///   desktop colour immediately, and the desktop is asked for a whole-panel present so the console's
+///   text comes back over the erase. That is the "TAB to the shell, then read your command's output"
+///   case, and it is a z-order fact rather than a special case.
+/// * **Both ends repaint.** The raise marks the affected windows damaged and composites, so the change
+///   is on the panel before this returns rather than at the focused app's next present — which, for a
+///   window whose app is idle or blocked in a read, might be never.
+///
+/// Ordering note: the erase and the composite both bracket the system cursor (`erase` undraws, and
+/// `composite` undraws-then-repaints), so the sprite is off the panel while these pixels move and back
+/// on top of them afterwards. The cursor stays top-most across a focus change for the same reason it
+/// does across any other composite.
+///
+/// Cheap and idempotent: focusing an ASID that owns no window still raises nothing and composites only
+/// what was already damaged. Safe to call on every focus change, including no-op ones.
+pub fn focus_changed(asid: u64) {
+    use core::sync::atomic::Ordering;
+    let mut raised = 0usize;
+    let mut first_id = WIN_NONE;
+    let mut newz = 0u32;
+    // Boxes of windows this call pushed BELOW the shell — the pixels the console is about to own.
+    let mut hidden = [(0usize, 0usize, 0usize, 0usize); MAX_WINDOWS];
+    let mut nhidden = 0usize;
+
+    {
+        let mut t = TABLE.lock();
+        if asid == 0 {
+            // The SHELL takes the top of the stack. Every window is now below it; collect the boxes so
+            // the panel stops showing them at once rather than at the desktop's next flush.
+            let z = t.next_z;
+            t.next_z = t.next_z.wrapping_add(1).max(1);
+            SHELL_Z.store(z, Ordering::Release);
+            newz = z;
+            for r in t.rows.iter_mut() {
+                if r.used && r.z < z {
+                    hidden[nhidden] = outer_box(r);
+                    nhidden += 1;
+                    // Damaged so that a later raise repaints from the source surface rather than
+                    // trusting whatever survived on the panel.
+                    r.damaged = true;
+                }
+            }
+        } else {
+            for i in 0..MAX_WINDOWS {
+                if !t.rows[i].used || t.rows[i].compat || t.rows[i].owner_asid != asid {
+                    continue;
+                }
+                let z = t.next_z;
+                t.next_z = t.next_z.wrapping_add(1).max(1);
+                t.rows[i].z = z;
+                t.rows[i].damaged = true;
+                if first_id == WIN_NONE {
+                    first_id = t.rows[i].id;
+                }
+                newz = z;
+                raised += 1;
+            }
+        }
+    }
+
+    if nhidden > 0 {
+        // Desktop colour under the vacated boxes NOW (visible immediately), console TEXT over it at the
+        // desktop's next present. Splitting it that way is what keeps the response instant without this
+        // path needing a `&mut Screen` it has no right to.
+        erase(&hidden[..nhidden]);
+    }
+    if asid == 0 {
+        super::screen::request_full_present();
+    }
+    #[cfg(feature = "witness")]
+    if asid == 0 {
+        serial_println!("[wc-g] focus shell z={} hidden={}", newz, nhidden);
+    } else {
+        serial_println!(
+            "[wc-g] focus raise asid={:#x} windows={} top_win={} z={} shell_z={}",
+            asid, raised, first_id, newz, shell_z()
+        );
+    }
+    let _ = (raised, first_id, newz);
+    composite();
+}
+
+/// FOCUS-VIS — whether `r` composites at all, i.e. whether it sits ABOVE the shell in the one z-order
+/// windows and the shell share. `shell` is the pass's single snapshot of [`SHELL_Z`].
+///
+/// Compat rows are exempt: a compat window IS the full-screen present path, it carries owner ASID 0 and
+/// is not addressable as a focus target at all (see [`focus_ring`]), so it can never be raised back
+/// above a shell that overtook it — hiding it would strand a full-screen app's output permanently.
+fn above_shell(r: &Window, shell: u32) -> bool {
+    r.compat || r.z > shell
 }
 
 /// WC-E — restore the whole window layer over a background that was just repainted underneath it.
@@ -743,9 +910,21 @@ fn composite_inner() {
     }
     order.sort_unstable_by_key(|&i| (rows[i].z, rows[i].id));
 
+    // FOCUS-VIS — one snapshot of the shell's z for the whole pass, so every window in it is judged
+    // against the same shell position (a concurrent focus change either lands wholly before this pass
+    // or is serviced by the composite that change performs itself).
+    let shell = shell_z();
+
     let mut drawn = 0usize;
     for &i in order.iter() {
         if !rows[i].used || !dirty[i] {
+            continue;
+        }
+        // FOCUS-VIS: below the shell, so the console owns these pixels — do not draw. The damage flag
+        // was already cleared above, which is right: `focus_changed` re-damages every window it raises,
+        // so a window coming back up repaints from its source surface rather than inheriting a stale
+        // flag from while it was hidden.
+        if !above_shell(&rows[i], shell) {
             continue;
         }
         draw_window(&fb, &rows[i]);
@@ -754,7 +933,7 @@ fn composite_inner() {
         #[cfg(feature = "witness")]
         {
             let r = &rows[i];
-            if !r.compat && r.id < 32 {
+            if !r.compat && r.presented && r.id < 32 {
                 let bit = 1u32 << r.id;
                 if VERIFIED.fetch_or(bit, core::sync::atomic::Ordering::Relaxed) & bit == 0 {
                     verify_window(&fb, r);
@@ -1189,6 +1368,130 @@ fn draw_title(fb: &super::FrameBuffer, r: &Window, x: usize, y: usize, max_w: us
     }
 }
 
+// ---- FOCUS-VIS witness -------------------------------------------------------------------------
+
+/// FOCUS-VIS witness surfaces: two solid 8x8 ARGB8888 patches in kernel rodata. Static rather than
+/// heaped so the selftest allocates nothing on a path that runs from a boot task, and READ-ONLY because
+/// the compositor only ever reads a window's surface.
+///
+/// The colours are chosen to be distinguishable from each other AND from [`DESKTOP_BG`], because
+/// telling those three apart at one pixel is the entire verdict.
+#[cfg(feature = "witness")]
+static FV_SURF_A: [u32; 64] = [0x00FF_2020; 64];
+#[cfg(feature = "witness")]
+static FV_SURF_B: [u32; 64] = [0x0020_FF20; 64];
+
+/// FOCUS-VIS — the RAISE-IS-VISIBLE witness. Four legs, each a scan-out READ-BACK at one pixel: the
+/// content origin of two windows placed at the SAME point, so exactly one of them can own that pixel and
+/// the panel itself says which.
+///
+/// ### Why a read-back, and why at that pixel
+/// Every existing focus witness is a statement about kernel state — `[wc-c] focus tab-cycle` prints the
+/// ring transition, and it printed correctly on the bench for a panel that never changed. That is the
+/// precise failure this witness is built to catch: it never asks the table who is in front, it asks the
+/// FRAMEBUFFER what colour is actually there. Two windows at one origin turn "is the focused window
+/// frontmost?" into a single equality, with no tolerance and nothing to interpret.
+///
+/// ### The four legs
+/// 1. **stack** — B created after A, so B is in front: the pixel is B's colour. (Baseline; if this fails
+///    the other three prove nothing about focus.)
+/// 2. **raise** — `focus_changed(A)`: the pixel becomes A's colour. This is defect 1 of the arc.
+/// 3. **shell** — `focus_changed(0)`: the pixel is neither window's colour. The shell took the top of
+///    the z-order, both windows dropped below it and their boxes were erased. This is the "TAB to the
+///    shell and READ your output" case, reduced to the one thing a headless gate can check — that the
+///    window layer stopped owning those pixels.
+/// 4. **reraise** — `focus_changed(B)`: B comes back from under the shell. Proves the shell is a
+///    POSITION in the rotation and not a terminus for the window layer.
+///
+/// Self-cleaning: both windows are closed at the end, which erases their boxes to the desktop colour and
+/// recomposites, so the panel is left as it was found. Placement is explicit (`move_to`, which pins the
+/// rows against the tiler) at a point clear of WC-F's reserved probe boxes — those sit at the BOTTOM of
+/// the panel, so an upper-middle origin cannot collide with them at either gate or bench geometry.
+///
+/// `witness`-gated and one-shot. Runs on the real panel, so it must be invoked AFTER the one-shot
+/// `[wc-c]`/`[wc-d]` window witnesses have fired, or it would burn their latches with its own rows.
+#[cfg(feature = "witness")]
+pub fn focusvis_selftest() {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    let fb = *super::WRITER.lock();
+    if !fb.is_ready() {
+        serial_println!("[wc-g] focus-vis -> SKIP (framebuffer not ready)");
+        return;
+    }
+    let info = fb.info();
+    if info.width < 128 || info.height < 128 {
+        serial_println!(
+            "[wc-g] focus-vis -> SKIP (panel {}x{} too small)",
+            info.width, info.height
+        );
+        return;
+    }
+
+    const ASID_A: u64 = 0xF0A;
+    const ASID_B: u64 = 0xF0B;
+    let a_col = FV_SURF_A[0];
+    let b_col = FV_SURF_B[0];
+    let sa = &raw const FV_SURF_A as usize;
+    let sb = &raw const FV_SURF_B as usize;
+    let len = core::mem::size_of_val(&FV_SURF_A);
+
+    let wa = create(ASID_A, sa, len, 8, 8, 32, b"fv-a");
+    let wb = create(ASID_B, sb, len, 8, 8, 32, b"fv-b");
+    if wa == WIN_NONE || wb == WIN_NONE {
+        serial_println!("[wc-g] focus-vis -> SKIP (window table full: a={} b={})", wa, wb);
+        close(wa);
+        close(wb);
+        return;
+    }
+
+    // One origin for both, upper-middle: WC-F's reserved boxes hug the bottom edge, and the tiler is
+    // disarmed for these rows by `move_to`'s pin.
+    let ox = info.width / 3;
+    let oy = info.height / 4 + TITLE_H + BORDER;
+    move_to(wa, ox, oy);
+    move_to(wb, ox, oy);
+    // The rows carry content from creation (static surfaces), so a present is the honest way to say
+    // "this content is the owner's" — it is also what arms WC-D for these ids.
+    present(wa);
+    present(wb);
+
+    // The probe pixel: one scaled block inside the content origin, clear of the 1-px chrome border.
+    let (px, py) = (ox + 1, oy + 1);
+    let read = || super::WRITER.lock().read_pixel(px, py).unwrap_or(0);
+
+    let got_stack = read();
+    focus_changed(ASID_A);
+    let got_raise = read();
+    focus_changed(0);
+    let got_shell = read();
+    focus_changed(ASID_B);
+    let got_reraise = read();
+
+    let stack_ok = got_stack == b_col;
+    let raise_ok = got_raise == a_col;
+    let shell_ok = got_shell != a_col && got_shell != b_col;
+    let reraise_ok = got_reraise == b_col;
+    let ok = stack_ok && raise_ok && shell_ok && reraise_ok;
+    serial_println!(
+        "[wc-g] focus-vis at ({},{}) a={:#08x} b={:#08x} stack={:#08x}/{} raise={:#08x}/{} shell={:#08x}/{} reraise={:#08x}/{} -> {}",
+        px, py, a_col, b_col,
+        got_stack, stack_ok, got_raise, raise_ok, got_shell, shell_ok, got_reraise, reraise_ok,
+        if ok { "PASS" } else { "FAIL" }
+    );
+
+    close(wa);
+    close(wb);
+    // Leave the shell where the operator's boot left it: at the bottom, so ordinary windows composite.
+    // (Not a reset to 0 — `next_z` only moves forward, so any window created after this is above it
+    // either way; this keeps the invariant readable rather than relying on that.)
+    SHELL_Z.store(0, Ordering::Release);
+}
+
 // ---- internals -------------------------------------------------------------------------------
 
 fn row(t: &Table, id: WinId) -> Option<&Window> {
@@ -1259,6 +1562,24 @@ fn create_inner(
                 i.id, i.owner_asid, i.w, i.h, stride, i.scale, i.x, i.y, i.z
             );
         }
+    }
+    // FOCUS-VIS / CURSOR — composite the creation, instead of leaving the new row to the owner's first
+    // present. Two things follow, and the second is the one the P59 bench report is about:
+    //  * the window's kernel chrome is on the panel the moment the row exists, so `create` is visible
+    //    even for an app that maps a surface and then blocks before presenting;
+    //  * the create runs INSIDE the cursor bracket (`composite` = undraw -> paint -> repaint). Before
+    //    this, `create` -> `place` mutated the layout and the FIRST thing to touch the panel afterwards
+    //    was the owner's `draw_window`, on another core, with the sprite still down and its save-under
+    //    holding pre-window pixels. The sprite came back only if the pointer happened to move again.
+    //    Now every window creation ends with the cursor re-saved and re-drawn on top.
+    // Called with the table lock released (`place` released it) — `composite` takes it itself.
+    //
+    // NOT on the compat path: `create_inner` is only the first half of `compat_present`, which sets the
+    // row's real scale and centred origin in a SECOND critical section and composites itself. A
+    // composite here would blit that surface once at the row's defaults (1x at the origin) — a visible
+    // flash of mis-scaled content, for a row that is about to be composited correctly anyway.
+    if !compat {
+        composite();
     }
     id
 }
