@@ -888,6 +888,42 @@
     **46/46 required witnesses, 0 forbidden**, UVUG batch `frames=300 checksum=0x48221e4101db3924 exit=0`
     **unchanged**. Lane: `arch/aarch64/sched.rs` + the `run_user_image` `Timeout` path and the SVC boundary
     in `arch/aarch64/syscall.rs` + this doc.
+- **WC-C (window compositor, clients + focus)** — the arc where real EL0 programs use the window verbs.
+  Full write-up: `docs/dev/OS/08_VIDEO/engine.md` §8 "WC-C". Userspace-visible changes:
+  - **UVUG is windowed.** `crates/user-uvug` drops `SYS_FB_MAP`/`SYS_FB_PRESENT` for
+    `SYS_WIN_CREATE(128, 128)` + `SYS_WIN_PRESENT(id)`. It reads its surface at its own window base +
+    `0x5000` (window region slot 0 — the VA `SYS_FB_MAP` returned), which is part of the window ABI, not a
+    guess; the kernel also publishes the geometry in the RO info page at base + `0x4000`. `FOCAL` scales
+    6 → 24 so the crystal keeps its framing at 4× the linear resolution.
+  - **SPEC UPDATE, deliberate — the 300-frame auto checksum changes.** It is a pure function of the
+    surface, so a 128×128 surface produces a new one:
+    `:: UVUG: frames=300 threads=2 checksum=0xe68285b85121ac7c ::`, **superseding
+    `0x48221e4101db3924`** wherever it appears in the UVUG-1..9 records above. The brief allowed either a
+    compat shim that kept the old value or a deliberate spec change; this is the spec change, because a
+    shim would mean shipping the 32×32 render forever to protect a constant. What *is* preserved
+    byte-for-byte is the **compat path itself** — `SYS_FB_MAP` + `SYS_FB_PRESENT` still produce the
+    identical centred, chrome-less blit, and the ELF-3 fb test's `mapped=32x32 …
+    checksum=0x8d99530ca96d4b25` is unchanged. The UVUG-8 takeover/cap line is unaffected:
+    `sys_win_present` runs the same present body as `sys_fb_present`, so the focus-guarded
+    `EL0_FOCUSED_PRESENT_COUNT` bump happens per window.
+  - **midden owns a window.** `MIDDEN.BIN` creates a 24×16 window and renders its own bus stats — two
+    rows of four hex digits (live witness bitmask; legs passed) from a packed 3×5 font, blitted 1:1 at
+    EL0. Kernel draws border + title strip and nothing else. A refused create makes every repaint a
+    no-op, so the bus witnesses never depend on the compositor. Fitting the 4 KiB flat-blob code page
+    moved `crates/user-blob`'s release profile from `opt-level = "s"` to `"z"` (3792 B).
+  - **TAB is the window system's key.** Reserved at `el0_input_enqueue` (the single router→ring choke
+    point, so no app can withhold it) whenever two or more windows are in `wm::focus_ring`; it advances
+    `EL0_INPUT_ACTIVE` to the next owner ASID in window-id order via `el0_input_set_active`, so the ring
+    reset, the takeover-latch clear and the UVUG-8 cap all keep working per window. The matching KeyUp is
+    swallowed with it. Fewer than two windows: TAB is delivered as an ordinary key.
+  - Gates: `./arroyo check` green both arches; `./arroyo kernel8` builds (per-blob page assertions);
+    `./arroyo kernel8-test 120` MBENCH **46/46 required, 0 forbidden**;
+    `:: EL0: window verbs — … witness=0x1fff … :: PASS ::` (the `el0-wcb` ledger widened 10 → 13 bits by
+    the side-by-side leg); `:: EXEC-UVUG: … exit=0 -> PASS ::`; all four BANDY verdicts PASS.
+    `target/pi-screen.png` **re-baselined by design** (the desktop repaint removes the WC-INT residue) —
+    new sha256 `2686a884320dbc389d6c33b1f37b097fa15eba769b51a751449e2c91a986bc19`. Lane:
+    `video/wm.rs`, `crates/user-uvug/src/main.rs`, `crates/user-blob` (midden + profile),
+    `arch/aarch64/syscall.rs` (TAB seam + the `el0-wcb` fixture) + this doc + `08_VIDEO/engine.md`.
 - Not yet: **revocation trees** (a derived copy — re-grant or onward re-transfer — escapes
   single-level revoke today; derivation records + `CAP_REVOKE` are that arc), the **bandy Ring-3
   delegation wrapper**, `File` transfer (descriptor migration), real `Socket` fs/net syscalls.

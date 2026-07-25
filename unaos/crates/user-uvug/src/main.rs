@@ -9,17 +9,18 @@
 // EL0 — the identical path the operator drives with `run /fat/UVUG.ELF`.
 //
 // WHAT IT DOES
-//   1. Maps its dedicated 32x32 ARGB8888 off-screen surface via SYS_FB_MAP (a 4 KiB surface page + a
-//      read-only info page). 32x32 is the surface size the kernel's SYS_FB_MAP exposes (one page; see
-//      boot.rs FB_SURFACE_W/FB_REGION_SIZE) — the crystal projection is screen-space-scaled to it.
+//   1. WC-C: creates its own 128x128 ARGB8888 WINDOW via SYS_WIN_CREATE — a real compositor window with
+//      kernel-drawn chrome, tiled beside whatever else is on the panel, rather than the single 32x32
+//      full-screen-centred compat surface SYS_FB_MAP exposed. 128x128 is `boot::FB_WIN_MAX_W/H` (one
+//      64 KiB window slot); the crystal projection is screen-space-scaled to it.
 //   2. Spawns TWO PERSISTENT EL0 worker threads via SYS_THREAD_SPAWN — one co-located, one on a SIBLING
-//      CORE — each of which rasterises HALF of the surface (worker A: rows 0..16, worker B: rows 16..32):
+//      CORE — each of which rasterises HALF of the surface (worker A: rows 0..64, worker B: rows 64..128):
 //      it clears its band to the background and Bresenham-draws every crystal edge clipped to its band,
 //      from the projected vertex coordinates the parent publishes each frame.
 //   3. Each frame the PARENT reads input (SYS_INPUT_POLL), folds it into per-frame rotation/zoom state,
 //      rotates + projects the 14 crystal vertices (integer Q16.16 math reimplemented from the kernel
 //      vug.rs — no float), publishes the pixel coordinates, RELEASES both workers (the `phase` word),
-//      blocks on a FUTEX until both have ARRIVED (the `done` word), and PRESENTS (SYS_FB_PRESENT).
+//      blocks on a FUTEX until both have ARRIVED (the `done` word), and PRESENTS (SYS_WIN_PRESENT).
 //   4. On exit (ESC / click, or the interactive frame cap) it signals the workers to leave, JOINs both,
 //      and prints its witness before exiting 0.
 //
@@ -50,7 +51,8 @@
 // condition, so the barrier is lost-wakeup-safe. On metal (real timer IRQs) either direction works.
 //
 // EL0 owns only the OFF-SCREEN surface bytes — never the scan-out, never a physical address, never a
-// kernel mapping (SYS_FB_PRESENT is the only surface->screen path, and it runs in the kernel).
+// kernel mapping (SYS_WIN_PRESENT is the only surface->screen path, and it runs in the kernel). Window
+// CHROME is drawn by the kernel from its own copy of the title, so this program cannot forge a frame.
 // Page-permission laws (per-page perms, WXN) are untouched.
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -65,10 +67,11 @@ const SYS_YIELD: u64 = 4;
 const SYS_THREAD_SPAWN: u64 = 21;
 const SYS_THREAD_EXIT: u64 = 22;
 const SYS_THREAD_JOIN: u64 = 23;
-const SYS_FB_MAP: u64 = 24;
-const SYS_FB_PRESENT: u64 = 25;
 const SYS_FUTEX: u64 = 26;
 const SYS_INPUT_POLL: u64 = 27;
+// WC-C: the WINDOW verbs replace the single-surface SYS_FB_MAP/SYS_FB_PRESENT compat pair.
+const SYS_WIN_CREATE: u64 = 29;
+const SYS_WIN_PRESENT: u64 = 30;
 
 #[inline(always)]
 unsafe fn sys0(n: u64) -> u64 {
@@ -80,6 +83,18 @@ unsafe fn sys0(n: u64) -> u64 {
 unsafe fn sys1(n: u64, a0: u64) -> u64 {
     let mut r: u64;
     core::arch::asm!("svc #0", inout("x0") a0 => r, in("x8") n, options(nostack));
+    r
+}
+#[inline(always)]
+unsafe fn sys2(n: u64, a0: u64, a1: u64) -> u64 {
+    let mut r: u64;
+    core::arch::asm!(
+        "svc #0",
+        inout("x0") a0 => r,
+        in("x1") a1,
+        in("x8") n,
+        options(nostack),
+    );
     r
 }
 #[inline(always)]
@@ -228,10 +243,15 @@ static EDGES: [(u8, u8); 30] = [
 // ---------------------------------------------------------------------------------------------
 // Surface geometry + palette.
 // ---------------------------------------------------------------------------------------------
-const SW: i32 = 32; // surface width  (px)
-const SH: i32 = 32; // surface height (px)
-const STRIDE: usize = 128; // ARGB8888 row stride (bytes)
-const FOCAL: i32 = 6; // pixels-per-unit at the crystal's centre depth
+// WC-C: the crystal renders into a 128x128 WINDOW surface (SYS_WIN_CREATE), not the 32x32 compat page.
+// 128x128 is `boot::FB_WIN_MAX_W/H` — exactly one 64 KiB window slot — and is 4x the linear resolution
+// the compat path allowed, so the wireframe is drawn rather than approximated. FOCAL scales with it (6 ->
+// 24 px/unit) so the crystal occupies the SAME fraction of its surface as before; the visible change is
+// sharpness, not framing.
+const SW: i32 = 128; // surface width  (px)
+const SH: i32 = 128; // surface height (px)
+const STRIDE: usize = 512; // ARGB8888 row stride (bytes)
+const FOCAL: i32 = 24; // pixels-per-unit at the crystal's centre depth
 const BG: u32 = 0xFF1E_1E1E; // opaque Can-Am dark grey
 const EDGE: u32 = 0xFFC9_A6E8; // opaque paler lilac seam
 
@@ -394,7 +414,7 @@ fn key_bit(k: u8) -> u32 {
 ///
 /// ROOT CAUSE (P54b freeze). The UVUG-8 drain was an UNBOUNDED `loop { poll() }`: it ran until the ring
 /// reported empty, with no bound whatsoever. That is the only phase of this program's frame loop that can
-/// call `SYS_INPUT_POLL` indefinitely WITHOUT reaching `SYS_FB_PRESENT`, and the kernel's own UVUG-8r2
+/// call `SYS_INPUT_POLL` indefinitely WITHOUT reaching the present, and the kernel's own UVUG-8r2
 /// instrumentation proves that is exactly where P54b sat: the run held its takeover suspension for the full
 /// `TAKEOVER_SUSPEND_MAX_SECS` (60 s), which requires the heartbeat — stamped ONLY by `sys_input_poll` — to
 /// have stayed fresher than `TAKEOVER_STALE_SECS` (2 s) on every pass, while `EL0_FOCUSED_PRESENT_COUNT` —
@@ -505,7 +525,7 @@ fn drain_input(held: &mut u32, dragging: &mut bool, drag_motion: &mut i32) -> Fr
 //   [uvug9] stall frame=<n> phase=barrier done=<0|1> — the frame-barrier wait burned its pass budget with
 //       fewer than both workers arrived; `done` names WHICH half is missing (0 = neither worker ran, 1 = one
 //       worker wedged). Distinguishes a worker-side wedge from an input-side one.
-//   [uvug9] stall frame=<n> phase=present rc=<errno> — SYS_FB_PRESENT returned an error. UVUG-8 IGNORED this
+//   [uvug9] stall frame=<n> phase=present rc=<errno> — SYS_WIN_PRESENT returned an error. UVUG-8 IGNORED this
 //       syscall's return entirely, so a present that started failing mid-run would have looked exactly like a
 //       freeze: frames advancing, nothing on screen, and the kernel's no-render cap firing. Now it is visible.
 //
@@ -652,8 +672,23 @@ impl Buf {
 pub extern "C" fn _start() -> ! {
     let base = _start as *const () as u64; // the window base B (entry VA == base, e_entry offset 0)
 
-    // Map the off-screen surface.
-    let surf_va = unsafe { sys0(SYS_FB_MAP) };
+    // WC-C: create a 128x128 WINDOW instead of mapping the 32x32 compat surface. `SYS_WIN_CREATE`
+    // returns the window ID (>= 0) and maps the negotiated 16-page surface slot; the surface VA is the
+    // window region's slot 0, at a FIXED offset from the program's own window base (base + 0x5000 —
+    // `boot::fb_info_va() + FB_INFO_SIZE`), which is the same VA `SYS_FB_MAP` used to return. Nothing is
+    // guessed: the kernel publishes the geometry in the RO info page at base + 0x4000, and the surface
+    // slot layout is part of the window ABI (userspace.md).
+    //
+    // Fail-closed: a negative return means no window (no free slot, no per-process FB region). There is
+    // nothing to draw into, so exit rather than write to an unmapped VA and take a fatal EL0 abort.
+    let win = unsafe { sys2(SYS_WIN_CREATE, SW as u64, SH as u64) };
+    if win >> 63 != 0 {
+        let mut b = Buf::new();
+        b.put(b":: UVUG: SYS_WIN_CREATE failed ::\n");
+        b.flush();
+        exit(1);
+    }
+    let surf_va = base + 0x5000;
     SURF.store(surf_va, Ordering::Release);
     let surf = surf_va as *mut u8;
 
@@ -768,7 +803,7 @@ pub extern "C" fn _start() -> ! {
         // lost per-process slot, a torn-down surface) would present as an unexplained freeze — frames still
         // advancing here, nothing changing on screen, and the kernel's no-render cap firing on a program that
         // believed it was drawing. An error has bit 63 set (negative errno), exactly like an empty input poll.
-        let rc = unsafe { sys0(SYS_FB_PRESENT) };
+        let rc = unsafe { sys1(SYS_WIN_PRESENT, win) };
         if rc >> 63 != 0 {
             stall_witness(&W_PRESENT, frame, b"present", b"rc", (rc as i64).unsigned_abs() as u32);
         }

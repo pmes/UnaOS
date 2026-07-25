@@ -642,3 +642,87 @@ drain set is closed.** That matters because teardown (`sched::exit` → `clear_h
 Teardown order is WC-B first, then `wm`: `win_close_asid` unmaps the surfaces and frees the rows, then
 `close_owner` sweeps any compositor row whose WC-B row a racing `sys_win_close` already freed, and
 `close_compat` reaps the one row that has no owner ASID to match on.
+
+### WC-C — the desktop, the clients, and focus
+
+WC-A built the compositor and WC-B the verbs; WC-C is the arc where real programs use them.
+
+**The desktop is painted, not left blank.** `wm::erase` filled vacated boxes with black, which on a
+panel is a *colour*, not an absence: every closed window left a black rectangle over the console's
+Moonstone background and the kernel chrome's close-box left a black hole mid-desktop. `erase` now fills
+`wm::DESKTOP_BG`, and the WC-INT panel residue is gone — the `kernel8-test` capture is a clean desktop
+plus the status strip. `DESKTOP_BG` restates the console's private `Console::BG` rather than importing
+it, so the compositor owns its own theme value (the crispy theme will replace it with real desktop
+data); a drift between the two is immediately visible as a rectangle where a window used to be.
+
+**UVUG is windowed.** `crates/user-uvug` no longer maps the 32×32 compat surface. It calls
+`SYS_WIN_CREATE(128, 128)` — `boot::FB_WIN_MAX_W/H`, exactly one 64 KiB window slot — reads its surface
+at its own window base + `0x5000` (window region slot 0, the VA `SYS_FB_MAP` used to return), and
+presents with `SYS_WIN_PRESENT`. `FOCAL` scales 6 → 24 so the crystal keeps the same framing at 4× the
+linear resolution. The UVUG-8 takeover/cap line is unaffected: `sys_win_present` runs the *same* present
+body as `sys_fb_present`, so the focus-guarded `EL0_FOCUSED_PRESENT_COUNT` bump still happens per
+window, and the QEMU run still reaches `exit=0` through `run_user_image`'s deadline.
+
+> **Spec change, deliberate.** The 300-frame auto-path checksum is a pure function of the surface, so a
+> 128×128 surface necessarily produces a new one: `:: UVUG: frames=300 threads=2
+> checksum=0xe68285b85121ac7c ::`, replacing the 32×32 `0x48221e4101db3924`. This is the *second* of the
+> two options the brief allowed — the spec is updated with the new value rather than the geometry being
+> kept compat — because a compat shim here would mean shipping the 32×32 render forever to protect a
+> constant. The invariant that *is* preserved byte-for-byte is the **compat path**: `SYS_FB_MAP` +
+> `SYS_FB_PRESENT` still produce the identical centred, chrome-less blit (the ELF-3 fb test's
+> `mapped=32x32 … checksum=0x8d99530ca96d4b25` is unchanged).
+
+**midden has a window.** `crates/user-blob/src/midden.rs` creates a 24×16 window and renders its own
+bus stats into it: two rows of four hex digits (the live witness bitmask, and the number of legs passed)
+from a 3×5 bitmap font packed one `u16` per glyph, blitted 1:1 at EL0. The kernel draws the border and
+the title strip and *nothing else* — app content is app-drawn, chrome is kernel-drawn, and neither can
+forge the other. The compositor's integer upscale (13× on the QEMU 640×480 panel, ~30× on a 1920-wide
+one) is what makes it legible, so midden never learns the panel geometry. A refused `SYS_WIN_CREATE`
+makes every repaint a no-op, so midden's bus witnesses never depend on the compositor. Fitting this in
+the flat blob's single 4 KiB code page needed the crate's release profile to move from `opt-level = "s"`
+to `"z"` (3792 B, ~300 B of headroom); the per-blob page assertion in `arroyo kernel8` is what catches
+a regression.
+
+**Focus is a key.** TAB is reserved *by the window system*, intercepted at `el0_input_enqueue` — the one
+choke point every event bound for an EL0 ring passes through, so no app can hold focus hostage by not
+implementing it. It walks `wm::focus_ring` (the distinct owner ASIDs of the live non-compat windows, in
+window-id order — a stable rotation, not a reordering stack) and hands focus to the next entry via
+`el0_input_set_active`, which is still the only way focus moves: the incoming ring is reset, the
+interactive-takeover latch is cleared, and the UVUG-8 cap therefore keeps holding *per window*. The
+matching KeyUp is swallowed on the same predicate (a lone release edge for a press the app never saw is
+exactly the shape UVUG-6 removed from the typematic path). With fewer than two windows in the ring the
+key falls through as an ordinary TAB.
+
+#### The side-by-side witness
+
+The arc's claim is two windows composited together. A screenshot shows that to a human and proves
+nothing to a gate, and the `[wc-a] create` lines say only that rows *existed*. So `composite` emits, once,
+from inside the pass that actually drew them:
+
+```
+[wc-c] side-by-side windows=2 drawn=2
+[wc-c] win=1 asid=0x1 surf=128x128 scale=1x at (9,21) z=3 cksum=0xfabe809492cf2325
+[wc-c] win=2 asid=0x1 surf=64x64 scale=3x at (147,21) z=4 cksum=0x591f6cbe80502325
+```
+
+The per-window checksum is FNV-1a over `surf_len` — the mapping-code length, the same bound
+`draw_window` reads under — so a window that is present-but-blank, or that composited a stale or
+recycled surface, is distinguishable from one that drew real content.
+
+**Honest limit on what drives it.** The boot's real programs cannot overlap: `uvug_witness` and
+`bandy_rt_launcher` each run their program to completion, so UVUG's window and midden's window are never
+live at the same instant. The vehicle is therefore the `el0-wcb` fixture, widened from 10 witness bits to
+13: it creates a second 64×64 window filled with a different byte and presents it **while the first is
+still live and still holding its content**, which is the only state in the boot where two real windows
+composite in one pass. Window A is re-presented before the closes, so `FB_PRESENT_CHECKSUM` at verdict
+time is still A's 128×128 `0xC3` surface and the pre-WC-C verdict line is unchanged. Two live EL0
+programs at once is a scheduler question, not a compositor one, and is left to a later arc.
+
+#### WC-C gate results (2026-07-24, QEMU raspi4b)
+
+`./arroyo check` green both arches · `kernel8` builds (midden 3792 B ≤ 4096) · `kernel8-test 120`
+MBENCH **46/46 required, 0 forbidden** · `:: EL0: window verbs — … witness=0x1fff … :: PASS ::` ·
+`:: EXEC-UVUG: … exit=0 -> PASS ::` · all four BANDY verdicts PASS.
+
+`target/pi-screen.png` is **re-baselined by design** — the WC-INT residue this arc removes was the whole
+point of the desktop repaint. New sha256 `2686a884320dbc389d6c33b1f37b097fa15eba769b51a751449e2c91a986bc19`.

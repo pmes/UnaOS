@@ -33,6 +33,11 @@
 //         bus, byte-same as a direct SYS_OPEN(RW) of it (-EACCES) — owner authority holds both ways
 // then SYS_EXIT(0xB5) — the midden sentinel, routed to EL0_MIDDEN_DONE.
 //
+// WC-C: midden also owns a COMPOSITOR WINDOW — a 24x16 surface via SYS_WIN_CREATE into which it renders
+// its own bus stats as hex digits (see the window section below). The kernel draws the border and the
+// title strip; midden draws the content. A refused create makes every repaint a no-op, so the witness
+// bits above never depend on the compositor.
+//
 // Build discipline (the K2OWN build-lane idiom): an extra `[[bin]]` of crates/user-blob, flat
 // blob <= one 4 KiB code page, fully position-independent, .text+.rodata only (NO .data/.bss —
 // no mutable statics), and NO panic paths: every buffer access below goes through raw-pointer
@@ -75,6 +80,9 @@ const SYS_OPEN: u64 = 11;
 const SYS_CLOSE: u64 = 17;
 const SYS_MSEND: u64 = 19;
 const SYS_MRECV: u64 = 20;
+/// WC-C: the window verbs. midden is the first NON-fixture program to own a compositor window.
+const SYS_WIN_CREATE: u64 = 29;
+const SYS_WIN_PRESENT: u64 = 30;
 
 const MIDDEN_EXIT_STATUS: u64 = 0xB5;
 
@@ -166,6 +174,44 @@ fn check_reply(rep: &[u8; FRAME_MAX], n: usize, verb: u8, corr: u32) -> (i64, us
     }
 }
 
+/// Build a TWO-NAME request (`cp SRC DST`, `mv SRC DST`) into `req`: body is `[src_len u8][src][dst]`,
+/// the space dropped. Returns the frame length, or 0 when the argument tail is not a valid pair
+/// (missing separator, either name empty or over the 12-byte 8.3 bound).
+///
+/// `cp` and `mv` had byte-identical builders; the flat blob has a hard 4 KiB code-page budget and paid
+/// for both copies, so they share one here. Verb-parameterised, not verb-aware — the kernel decides what
+/// the verb MEANS; this only shapes the frame.
+#[inline(never)]
+fn build_pair(req: &mut [u8; 96], verb: u8, corr: u32, rest: &[u8]) -> usize {
+    let mut sp2 = rest.len();
+    let mut j = 0;
+    while j < rest.len() {
+        if unsafe { get(rest.as_ptr(), j) } == b' ' {
+            sp2 = j;
+            break;
+        }
+        j += 1;
+    }
+    if sp2 == 0 || sp2 > 12 || sp2 + 1 >= rest.len() || rest.len() - sp2 - 1 > 12 {
+        return 0;
+    }
+    let mut body = [0u8; 26];
+    let bp = body.as_mut_ptr();
+    unsafe {
+        put(bp, 0, sp2 as u8);
+        let mut k = 0;
+        while k < rest.len() && k < 25 {
+            if k != sp2 {
+                // src bytes land at 1..=sp2, dst bytes at sp2+1.. (the space is dropped)
+                let dst_i = if k < sp2 { 1 + k } else { k };
+                put(bp, dst_i, get(rest.as_ptr(), k));
+            }
+            k += 1;
+        }
+    }
+    build_req(req, verb, corr, &body[..rest.len()])
+}
+
 /// PARSE one command line (the E verdict's text->typed seam): split on ' ', map the verb token
 /// to a typed request, and send it. Returns (status, body_len) from the reply, or i64::MIN on
 /// a transport/parse failure. `rep` receives the reply frame.
@@ -192,34 +238,10 @@ fn run_command(line: &[u8], corr: u32, rep: &mut [u8; FRAME_MAX]) -> (i64, usize
         }
         build_req(&mut req, VERB_CAT, corr, rest)
     } else if eq(verb_tok, b"cp") {
-        // cp SRC DST -> body [src_len u8][src][dst]
-        let mut sp2 = rest.len();
-        let mut j = 0;
-        while j < rest.len() {
-            if unsafe { get(rest.as_ptr(), j) } == b' ' {
-                sp2 = j;
-                break;
-            }
-            j += 1;
+        match build_pair(&mut req, VERB_CP, corr, rest) {
+            0 => return (i64::MIN, 0),
+            n => n,
         }
-        if sp2 == 0 || sp2 > 12 || sp2 + 1 >= rest.len() || rest.len() - sp2 - 1 > 12 {
-            return (i64::MIN, 0);
-        }
-        let mut body = [0u8; 26];
-        let bp = body.as_mut_ptr();
-        unsafe {
-            put(bp, 0, sp2 as u8);
-            let mut k = 0;
-            while k < rest.len() && k < 25 {
-                if k != sp2 {
-                    // src bytes land at 1..=sp2, dst bytes at sp2+1.. (the space is dropped)
-                    let dst_i = if k < sp2 { 1 + k } else { k };
-                    put(bp, dst_i, get(rest.as_ptr(), k));
-                }
-                k += 1;
-            }
-        }
-        build_req(&mut req, VERB_CP, corr, &body[..rest.len()])
     } else if eq(verb_tok, b"rm") {
         // rm NAME -> bare 8.3 name (same shape as cat)
         if rest.is_empty() || rest.len() > 12 {
@@ -227,33 +249,10 @@ fn run_command(line: &[u8], corr: u32, rep: &mut [u8; FRAME_MAX]) -> (i64, usize
         }
         build_req(&mut req, VERB_RM, corr, rest)
     } else if eq(verb_tok, b"mv") {
-        // mv SRC DST -> body [src_len u8][src][dst] (same shape as cp)
-        let mut sp2 = rest.len();
-        let mut j = 0;
-        while j < rest.len() {
-            if unsafe { get(rest.as_ptr(), j) } == b' ' {
-                sp2 = j;
-                break;
-            }
-            j += 1;
+        match build_pair(&mut req, VERB_MV, corr, rest) {
+            0 => return (i64::MIN, 0),
+            n => n,
         }
-        if sp2 == 0 || sp2 > 12 || sp2 + 1 >= rest.len() || rest.len() - sp2 - 1 > 12 {
-            return (i64::MIN, 0);
-        }
-        let mut body = [0u8; 26];
-        let bp = body.as_mut_ptr();
-        unsafe {
-            put(bp, 0, sp2 as u8);
-            let mut k = 0;
-            while k < rest.len() && k < 25 {
-                if k != sp2 {
-                    let dst_i = if k < sp2 { 1 + k } else { k };
-                    put(bp, dst_i, get(rest.as_ptr(), k));
-                }
-                k += 1;
-            }
-        }
-        build_req(&mut req, VERB_MV, corr, &body[..rest.len()])
     } else if eq(verb_tok, b"write") {
         // write NAME CONTENT -> body [name_len u8][name][content]. Split the argument tail on the
         // FIRST space: name = up to it, content = the remainder (may itself contain spaces).
@@ -333,10 +332,133 @@ const WR_CONTENT: &[u8] = b"middenwrote";
 /// (not the old longer content) confirms a genuine truncate, not a stale-tail overwrite-in-place.
 const WR2_CONTENT: &[u8] = b"again";
 
+// --- WC-C: midden's bus-stats WINDOW ------------------------------------------------------------
+//
+// midden owns a real compositor window and renders its OWN content into it — the kernel draws the
+// border and the title strip and NOTHING else. That is the whole point of the WC seam: app content is
+// app-drawn, chrome is kernel-drawn, and neither can forge the other. So the digits below are blitted
+// here, at EL0, from a bitmap font this program carries in its own .rodata.
+//
+// It shows two rows of four hex digits: the live witness bitmask (row 0) and the number of witness legs
+// passed (row 1) — the same numbers the serial verdict prints, so panel and log cross-check by eye.
+//
+// Geometry: 24x16 ARGB8888 = 1536 B, which `SYS_WIN_CREATE` negotiates down to a SINGLE page of the
+// 64 KiB window slot. Tiny on purpose — a status readout, not a canvas, drawn 1:1 — and the compositor's
+// integer upscale (~30x on a 1920-wide panel) is what makes it legible, so this program never needs to
+// learn the panel geometry. EL0 sees only its own surface; it always has.
+//
+// SIZE DISCIPLINE. This whole feature had ~230 bytes of the 4 KiB code page left to live in, so every
+// choice here is the cheap one: the font is packed 3x5 bits into ONE u16 per glyph (32 B of .rodata, not
+// 80), the two rows are one loop over eight nibbles of a packed u32 rather than two calls, the glyphs are
+// blitted 1:1 (no upscale loops — the compositor upscales), and the blit writes without a per-pixel bound
+// test because the call-site geometry is a compile-time constant that keeps every glyph box inside the
+// surface.
+const WIN_W: usize = 24;
+const WIN_H: usize = 16;
+const WIN_STRIDE: usize = WIN_W * 4;
+/// Surface offset from this program's own window base: `USER_REGION_SIZE + FB_INFO_SIZE` (boot.rs) —
+/// window region slot 0, the same VA the compat `SYS_FB_MAP` used to return. Part of the window ABI.
+const WIN_SURF_OFF: u64 = 0x5000;
+/// Window interior — a shade off the desktop so the kernel's frame reads. All four bytes are EQUAL on
+/// purpose: it makes the background clear a single `write_bytes`, i.e. one call to the `memset` this blob
+/// already links (the `rep` frame buffer needs it), instead of a 2048-iteration store loop LLVM unrolls
+/// into a few hundred bytes we do not have.
+const WIN_BG: u8 = 0x1A;
+const WIN_FG: u32 = 0xFFC9_A6E8; // the UnaOS lilac the vug seams use
+
+/// The 16 hex digits as 3x5 bitmaps, packed row-major into one u16 each: bit `row * 3 + col`, col 0
+/// leftmost, row 0 top. Bit 15 is unused.
+static HEX_GLYPHS: [u16; 16] = [
+    0b0_111_101_101_101_111, // 0
+    0b0_111_010_010_110_010, // 1
+    0b0_111_001_111_100_111, // 2
+    0b0_111_100_111_100_111, // 3
+    0b0_100_100_111_101_101, // 4
+    0b0_111_100_111_001_111, // 5
+    0b0_111_101_111_001_111, // 6
+    0b0_100_100_100_100_111, // 7
+    0b0_111_101_111_101_111, // 8
+    0b0_111_100_111_101_111, // 9
+    0b0_101_101_111_101_111, // A
+    0b0_011_101_011_101_011, // b
+    0b0_111_001_001_001_111, // C
+    0b0_011_101_101_101_011, // d
+    0b0_111_001_111_001_111, // E
+    0b0_001_001_111_001_111, // F
+];
+
+/// This program's own window base VA. `adr` is PC-relative and byte-granular, so it is correct at
+/// whatever address the kernel copied the flat blob to — the blob begins exactly at `_start`, which the
+/// linker script forces to offset 0 of the EL0 window.
+#[inline(always)]
+fn window_base() -> u64 {
+    let v: u64;
+    unsafe {
+        core::arch::asm!("adr {0}, _start", out(reg) v, options(nomem, nostack, preserves_flags));
+    }
+    v
+}
+
+/// Blit one 3x5 glyph 1:1 at `(x0, y0)`. `#[inline(never)]` is load-bearing, not a style choice: inlined,
+/// LLVM unrolls the eight-digit caller around this 15-bit nest and `win_paint` triples — which this blob's
+/// 4 KiB code page cannot pay for. Emitted once, called eight times.
+///
+/// Nested row/col rather than one loop over the 15 bits: `b % 3` / `b / 3` would each compile to a
+/// multiply-shift sequence. 1:1 pixels for the same reason — the compositor's integer upscale is what
+/// makes the glyphs big on the panel, not this loop.
+#[inline(never)]
+unsafe fn draw_glyph(surf: *mut u8, x0: usize, y0: usize, bits: u16) {
+    let mut ry = 0usize;
+    while ry < 5 {
+        let mut rx = 0usize;
+        while rx < 3 {
+            if bits >> (ry * 3 + rx) & 1 != 0 {
+                let off = (y0 + ry) * WIN_STRIDE + (x0 + rx) * 4;
+                unsafe { (surf.add(off) as *mut u32).write_volatile(WIN_FG) };
+            }
+            rx += 1;
+        }
+        ry += 1;
+    }
+}
+
+/// Repaint the surface and present it. `stats` is the two rows packed as `(top << 16) | bottom`; a
+/// negative `id` (create refused) makes this a no-op, so midden's bus witnesses never depend on the
+/// compositor being able to give it a window.
+#[inline(never)]
+fn win_paint(id: i64, surf: *mut u8, stats: u32) {
+    if id < 0 {
+        return;
+    }
+    // Non-volatile on purpose (see WIN_BG): `svc` clobbers memory, so these stores cannot be sunk past
+    // the present below, which is the only ordering this needs.
+    unsafe { core::ptr::write_bytes(surf, WIN_BG, WIN_W * WIN_H * 4) };
+    // Eight nibbles, most-significant first: n 0..4 -> row 0 (top), n 4..8 -> row 1 (bottom).
+    let mut n = 0usize;
+    while n < 8 {
+        let nib = ((stats >> (28 - 4 * n)) & 0xF) as usize;
+        // `get` rather than indexing: a bounds-checked index compiles a `core::panicking` call into a
+        // blob that must contain no panic path at all. `nib` is masked, so the None arm is unreachable.
+        let Some(&bits) = HEX_GLYPHS.get(nib) else {
+            return;
+        };
+        let x0 = 1 + (n & 3) * 6;
+        let y0 = 1 + (n >> 2) * 7;
+        unsafe { draw_glyph(surf, x0, y0, bits) };
+        n += 1;
+    }
+    let _ = svc(SYS_WIN_PRESENT, id as u64, 0, 0);
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn midden_main() -> ! {
     let mut w: u64 = 0;
     let mut rep = [0u8; FRAME_MAX];
+    // WC-C: open midden's window FIRST, so the panel shows the stats readout for the whole run rather
+    // than only at the end. Every `paint` below is a no-op if the create failed — the bus witnesses this
+    // program exists to produce never depend on the compositor.
+    let win = svc(SYS_WIN_CREATE, WIN_W as u64, WIN_H as u64, 0);
+    let wsurf = (window_base() + WIN_SURF_OFF) as *mut u8;
 
     // (0) "ls" — parse, send, print the listing
     let (st, bl) = run_command(b"ls", 1, &mut rep);
@@ -384,6 +506,8 @@ extern "C" fn midden_main() -> ! {
     if st_bus_denied == st_direct_denied && st_bus_denied == EACCES && allowed_agree {
         w |= 1 << 5;
     }
+
+    win_paint(win, wsurf, (w as u32) << 16 | w.count_ones());
 
     // ===== BANDY-2 write-side legs =====================================================
 
@@ -440,6 +564,10 @@ extern "C" fn midden_main() -> ! {
     {
         w |= 1 << 9;
     }
+
+    // WC-C: final repaint — the panel readout ends on the SAME bitmask the serial verdict reports, so
+    // the two witnesses are cross-checkable by eye (row 0 = the bitmask in hex, row 1 = legs passed).
+    win_paint(win, wsurf, (w as u32) << 16 | w.count_ones());
 
     let _ = svc(SYS_REPORT, w, 0, 0);
     let _ = svc(SYS_EXIT, MIDDEN_EXIT_STATUS, 0, 0);

@@ -10102,6 +10102,17 @@ fn pack_input(ev: crate::pal::Event) -> Option<u64> {
 /// Returns `true` if the event was queued, `false` if there is no active EL0 target, the event is not
 /// deliverable, or the ring is full (drop-newest — an unread event is never overwritten). Single producer.
 pub fn el0_input_enqueue(ev: crate::pal::Event) -> bool {
+    // WC-C: TAB is the COMPOSITOR's key, not the focused app's — the one keystroke the window system
+    // reserves for itself, so an operator can always reach the other window even from an app that has
+    // taken over the keyboard. Intercepted HERE, at the router seam, because this is the single choke
+    // point through which every event destined for an EL0 ring passes; a per-app opt-in would mean any
+    // app could hold focus hostage simply by not implementing it.
+    //
+    // Reserved only while there is somewhere to go: with fewer than two windows in the focus ring the key
+    // falls through and is delivered as an ordinary TAB, so a single-window app keeps a normal keyboard.
+    if wc_focus_key(ev) {
+        return true;
+    }
     let asid = EL0_INPUT_ACTIVE.load(Ordering::Acquire);
     if asid == 0 || asid as usize > super::boot::USER_SLOTS {
         return false;
@@ -10110,6 +10121,51 @@ pub fn el0_input_enqueue(ev: crate::pal::Event) -> bool {
         return false;
     };
     el0_input_push(asid, packed)
+}
+
+/// WC-C — the TAB focus-cycle. Returns `true` when the event was CONSUMED by the window system and must
+/// not reach any app's ring.
+///
+/// Cycling means: take the compositor's focus ring (`video::wm::focus_ring` — the distinct owner ASIDs of
+/// the live windows, in window-id order), find where the current `EL0_INPUT_ACTIVE` sits in it, and hand
+/// focus to the next entry, wrapping. `el0_input_set_active` is the ONE way focus moves, so the tab-cycle
+/// inherits everything that already hangs off it: the incoming ring is reset, the interactive-takeover
+/// latch is cleared (the newly-focused app has consumed nothing yet, so its `run` deadline re-arms and the
+/// UVUG-8 cap keeps holding PER WINDOW), and the outgoing app simply stops receiving events.
+///
+/// Two deliberate consequences, neither hidden:
+///  * `el0_input_set_active` also drains `pal::EVENT_QUEUE`. We are called from inside the router's drain
+///    loop, so anything typed BEHIND the Tab is discarded rather than delivered to the new focus. That is
+///    the wanted semantics — those keystrokes were aimed at the window the operator was leaving — and it
+///    is the same discard a launch already performs.
+///  * The KeyUp is swallowed too, on the same predicate. Delivering a lone KeyUp for a KeyDown the app
+///    never saw is exactly the dropped-edge shape UVUG-6 spent an arc removing from the typematic path.
+fn wc_focus_key(ev: crate::pal::Event) -> bool {
+    const K_TAB: u8 = b'\t';
+    let down = match ev {
+        crate::pal::Event::Key(K_TAB) => true,
+        crate::pal::Event::KeyUp(K_TAB) => false,
+        _ => return false,
+    };
+    let mut ring = [0u64; crate::video::wm::MAX_WINDOWS];
+    let n = crate::video::wm::focus_ring(&mut ring);
+    if n < 2 {
+        return false; // nowhere to cycle to — TAB stays an ordinary key
+    }
+    if !down {
+        return true; // swallow the release edge of a Tab whose press we consumed
+    }
+    let cur = EL0_INPUT_ACTIVE.load(Ordering::Acquire);
+    let at = ring[..n].iter().position(|&a| a == cur);
+    // Unknown current focus (the focused app has no window of its own) -> start the rotation at the
+    // ring's head rather than refusing; the operator pressed a key and must see something happen.
+    let next = ring[at.map(|i| (i + 1) % n).unwrap_or(0)];
+    if next == cur {
+        return true;
+    }
+    el0_input_set_active(next);
+    serial_println!("[wc-c] focus tab-cycle {} -> {} (ring of {})", cur, next, n);
+    true
 }
 
 /// Push a pre-packed event into `asid`'s ring (the SPSC producer half). Drop-newest on a full ring so a
@@ -10700,22 +10756,40 @@ fn fb_launcher(_demo_cpu: usize) {
 // self-verifies. Single-threaded and register-only apart from its own surface, so it can never perturb
 // the ELF-2/ELF-3 accounting (it runs AFTER those verdicts print).
 //
-// Bit ledger (all ten must be set):
-//   b0 create(128,128) -> id >= 0            b5 present(8)         -> -EBADF (unknown id)
-//   b1 the per-window info entry reads back  b6 create(0,0)        -> -EINVAL
-//      magic/128/128 for region slot 0       b7 create(129,10)     -> -EINVAL (over FB_WIN_MAX_W)
-//   b2 present(id) -> 0                      b8 close(id)          -> 0
-//   b3 move(id,40,24) -> 0                   b9 close(id) again    -> -EBADF (row already free)
-//   b4 move(id,8192,0) -> -EINVAL
+// Bit ledger (all thirteen must be set):
+//   b0  create(128,128) -> id >= 0           b6  create(0,0)        -> -EINVAL
+//   b1  the per-window info entry reads back b7  create(129,10)     -> -EINVAL (over FB_WIN_MAX_W)
+//       magic/128/128 for region slot 0      b8  close(A)           -> 0
+//   b2  present(A) -> 0                      b9  close(A) again     -> -EBADF (row already free)
+//   b3  move(A,40,24) -> 0                   b10 create(64,64) -> a SECOND id >= 0
+//   b4  move(A,8192,0) -> -EINVAL            b11 present(B) -> 0 with A STILL LIVE
+//   b5  present(8) -> -EBADF (unknown id)    b12 close(B)           -> 0
 // The verdict ALSO checks the kernel-side checksum of the presented surface against the expected FNV-1a
 // of 64 KiB of 0xC3 — so b2 cannot pass on a present that composited the wrong (or a stale) surface,
 // which is the property that actually proves the 16-page negotiated mapping landed.
+//
+// WC-C — the SIDE-BY-SIDE leg (b10/b11). Everything above proves ONE window's verbs; the compositor's
+// actual claim is that two windows owned by a live program are composited TOGETHER, tiled, in one pass.
+// So the fixture now creates a second, differently-sized window (64x64, filled with a different byte),
+// fills and presents it WHILE the first is still live and still holding its own content, which is the
+// only state in the boot in which `video::wm` composites two real windows at once — the boot's real
+// programs (UVUG, midden) run strictly one after another, so they can never overlap. That composite is
+// what emits the `[wc-c] side-by-side windows=2` witness plus one checksummed line per window; this
+// fixture is the vehicle, and the checksums are computed by the compositor over the surfaces it read.
+// Window A is then RE-PRESENTED before the closes, so `FB_PRESENT_CHECKSUM` at verdict time is still
+// A's 128x128 0xC3 surface and the pre-WC-C verdict line is unchanged.
 // =============================================================================================
 
 static WCB_DONE: AtomicBool = AtomicBool::new(false); // the fixture reached its clean sys_exit(0)
 static WCB_WITNESS: AtomicU64 = AtomicU64::new(0); // its reported bitmask
-/// WC-B: every bit of the ledger above.
-const WCB_WITNESS_ALL: u64 = 0x3FF;
+/// WC-B: every bit of the ledger above (WC-C widened it from 10 to 13 with the side-by-side leg).
+const WCB_WITNESS_ALL: u64 = 0x1FFF;
+/// WC-C: the byte the fixture fills its SECOND (64x64) window with — deliberately different from
+/// `WCB_FILL`, so the two `[wc-c]` per-window checksums cannot coincide and a composite that read the
+/// wrong surface for either window is visible in the witness.
+const WCB_FILL_B: u8 = 0x5A;
+/// WC-C: the second window's edge, in pixels. 64x64x4 = 16 KiB = 4 pages of its 64 KiB slot.
+const WCB_W_B: usize = 64;
 /// WC-B: the byte the fixture fills its whole 128×128 surface with.
 const WCB_FILL: u8 = 0xC3;
 
@@ -10754,7 +10828,8 @@ __wcb_blob_start:
 __wcb_prog:
     adr  x9, __wcb_blob_start              // x9 = window base (PC-relative), preserved across svc
     mov  x23, #0                           // x23 = witness bitmask
-    mov  x22, #0                           // x22 = window id
+    mov  x22, #0                           // x22 = window A's id
+    movn x21, #0                           // x21 = window B's id (WC-C); -1 until created
 
     mov  x0, #128                          // (b0) SYS_WIN_CREATE(128, 128)
     mov  x1, #128
@@ -10797,6 +10872,35 @@ __wcb_prog:
     b.ne 9f
     orr  x23, x23, #(1 << 2)
 9:
+    mov  x0, #64                           // (b10) a SECOND window, 64x64, while A is STILL LIVE
+    mov  x1, #64
+    mov  x8, #29
+    svc  #0
+    mov  x21, x0                           // x21 = window B's id
+    cmp  x0, #0
+    b.lt 9f
+    orr  x23, x23, #(1 << 10)
+9:
+    cmp  x21, #0                           // (b11) fill B with a DIFFERENT byte, then present it
+    b.lt 9f                                // no B -> nothing to fill; leave the bit clear
+    add  x12, x9, #0x15, lsl #12           // region slot 1's surface: base + 0x5000 + 0x10000
+    mov  w14, #0x5A
+    orr  w14, w14, w14, lsl #8
+    orr  w14, w14, w14, lsl #16
+    mov  x15, #0
+    movz x16, #0x4000                      // 64*64*4 = 16384 bytes
+8:  str  w14, [x12, x15]
+    add  x15, x15, #4
+    cmp  x15, x16
+    b.lt 8b
+    dmb  ish                               // publish the drawn bytes before the present reads them
+    mov  x0, x21
+    mov  x8, #30                           // SYS_WIN_PRESENT(B) — the SIDE-BY-SIDE composite
+    svc  #0
+    cmp  x0, #0
+    b.ne 9f
+    orr  x23, x23, #(1 << 11)
+9:
     mov  x0, x22                           // (b3) SYS_WIN_MOVE(id, 40, 24) -> 0
     mov  x1, #40
     mov  x2, #24
@@ -10837,6 +10941,16 @@ __wcb_prog:
     cmn  x0, #22
     b.ne 9f
     orr  x23, x23, #(1 << 7)
+9:
+    mov  x0, x22                           // WC-C: re-present A so the LAST present the kernel checksums
+    mov  x8, #30                           // is A's 128x128 0xC3 surface again — the verdict's expected
+    svc  #0                                // value is therefore unchanged by the side-by-side leg.
+    mov  x0, x21                           // (b12) SYS_WIN_CLOSE(B) -> 0
+    mov  x8, #32
+    svc  #0
+    cmp  x0, #0
+    b.ne 9f
+    orr  x23, x23, #(1 << 12)
 9:
     mov  x0, x22                           // (b8) SYS_WIN_CLOSE(id) -> 0
     mov  x8, #32

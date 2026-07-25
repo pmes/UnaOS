@@ -446,9 +446,27 @@ pub fn close_owner(owner_asid: u64) -> usize {
     n
 }
 
-/// Paint the given outer boxes black and clean them for the scan-out — the panel area a closed
-/// window vacated. Windows that overlapped it are repainted by the [`composite`] that follows
-/// (closing damages the whole live set through [`place`]).
+/// WC-C — the DESKTOP background colour, painted wherever no window is. Flat and theme-y today (the
+/// crispy theme will supply real desktop data later); the point of the constant is that "no window
+/// here" is a POSITIVE state the compositor paints, not the absence of paint.
+///
+/// Erasing to black (the WC-A behaviour) was wrong in a way only the panel showed: a closed window left
+/// a black rectangle over whatever the console had drawn, and the kernel chrome's close-box left a black
+/// hole in the middle of the desktop. Black is not "nothing" on a panel — it is a colour, and it read as
+/// damage. Repainting the desktop colour makes a vacated box indistinguishable from panel that never had
+/// a window on it, which is the invariant the compositor actually wants.
+///
+/// The value is the console's Moonstone (`console.rs`'s private `Console::BG`), because that is what the
+/// desktop under these windows IS today. Deliberately RESTATED rather than imported: reaching into the
+/// console from the compositor would make the compositor's notion of "desktop" mean "whatever the text
+/// console happens to paint". The crispy theme will hand the compositor real desktop data; until then
+/// this is the compositor's own theme value that happens to agree — and any drift between the two shows
+/// up instantly, as a visible rectangle where a window used to be.
+pub const DESKTOP_BG: u32 = 0x002D_2B55;
+
+/// Paint the given outer boxes with the desktop background and clean them for the scan-out — the panel
+/// area a closed window vacated. Windows that overlapped it are repainted by the [`composite`] that
+/// follows (closing damages the whole live set through [`place`]).
 fn erase(boxes: &[(usize, usize, usize, usize)]) {
     let fb = *super::WRITER.lock();
     // Guard intentionally dropped here: this function never takes the table lock, so it cannot
@@ -464,7 +482,7 @@ fn erase(boxes: &[(usize, usize, usize, usize)]) {
         }
         // F6 — clip before iterating, as in `draw_window`.
         let (w, h) = (w.min(info.width - x), h.min(info.height - y));
-        fb.fill_rect(x, y, w, h, 0);
+        fb.fill_rect(x, y, w, h, DESKTOP_BG);
         let y0 = y.min(info.height);
         let y1 = (y + h).min(info.height);
         if y1 > y0 {
@@ -494,6 +512,37 @@ pub fn info(id: WinId) -> Option<WindowInfo> {
         z: r.z,
         damaged: r.damaged,
     })
+}
+
+/// WC-C — the FOCUS RING: the distinct owner ASIDs of the live, non-compat windows, in window-id order,
+/// written into `out` and returned by count. Deterministic (id order, not z-order) so the tab-cycle is a
+/// stable rotation an operator can predict rather than a walk over a stack that reorders under them.
+///
+/// Compat windows are excluded deliberately: their row carries owner ASID 0 (the `SYS_FB_PRESENT` hook
+/// signature has no ASID to pass), so they are not addressable as a focus target at all. An app that
+/// still uses the compat path keeps whatever focus the launcher gave it.
+///
+/// A snapshot, never a handle — the caller re-validates before acting on it. Used by the syscall layer's
+/// tab-cycle to pick the next `EL0_INPUT_ACTIVE`; nothing in this module reads input state.
+pub fn focus_ring(out: &mut [u64; MAX_WINDOWS]) -> usize {
+    let t = TABLE.lock();
+    let mut n = 0usize;
+    let mut ids = [(0u32, 0u64); MAX_WINDOWS];
+    let mut m = 0usize;
+    for r in t.rows.iter() {
+        if r.used && !r.compat && r.owner_asid != 0 {
+            ids[m] = (r.id, r.owner_asid);
+            m += 1;
+        }
+    }
+    ids[..m].sort_unstable_by_key(|&(id, _)| id);
+    for &(_, asid) in ids[..m].iter() {
+        if !out[..n].contains(&asid) {
+            out[n] = asid;
+            n += 1;
+        }
+    }
+    n
 }
 
 /// Number of live windows.
@@ -584,8 +633,59 @@ pub fn composite() {
         let live = rows.iter().filter(|r| r.used).count();
         serial_println!("[wc-a] composite windows={} drawn={}", live, drawn);
     }
+    // WC-C — the SIDE-BY-SIDE witness. The arc's claim is "two EL0 programs, two windows, both on the
+    // panel at once"; a screenshot shows it to a human but proves nothing to a gate, and the per-window
+    // `[wc-a] create` lines say only that rows EXISTED, never that two were composited in one pass. This
+    // fires from inside the pass that actually drew them, and checksums each window's SOURCE bytes, so a
+    // window that is present-but-blank (or that composited a stale/recycled surface) is distinguishable
+    // from one that drew real content. FNV-1a over `surf_len` — the mapping-code length, the same bound
+    // `draw_window` reads under, so the checksum can never walk past the slot.
+    //
+    // One-shot: this runs from present context at EL0 frame rates, and the checksum is a 64 KiB read.
+    #[cfg(feature = "witness")]
+    if drawn > 0 {
+        let real = rows.iter().filter(|r| r.used && !r.compat).count();
+        if real >= 2 && !SIDEBYSIDE_WITNESSED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+            serial_println!("[wc-c] side-by-side windows={} drawn={}", real, drawn);
+            for &i in order.iter() {
+                let r = &rows[i];
+                if !r.used || r.compat {
+                    continue;
+                }
+                serial_println!(
+                    "[wc-c] win={} asid={:#x} surf={}x{} scale={}x at ({},{}) z={} cksum={:#018x}",
+                    r.id, r.owner_asid, r.w, r.h, r.scale, r.x, r.y, r.z, surface_checksum(r)
+                );
+            }
+        }
+    }
     let _ = drawn;
 }
+
+/// WC-C — FNV-1a 64 over a window's mapped surface slot, for the side-by-side witness. Bounded by
+/// `surf_len` (the length the MAPPING code supplied), so it shares `draw_window`'s F1 read bound; a null
+/// or zero-length surface hashes to the FNV offset basis, which is a value no drawn surface produces.
+#[cfg(feature = "witness")]
+fn surface_checksum(r: &Window) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    if r.surf == 0 {
+        return h;
+    }
+    let p = r.surf as *const u8;
+    let mut i = 0usize;
+    while i < r.surf_len {
+        // SAFETY: `i < surf_len`, and `surf_len` is the real byte length of the mapped slot.
+        h ^= unsafe { core::ptr::read_volatile(p.add(i)) } as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        i += 1;
+    }
+    h
+}
+
+/// WC-C — whether the one-shot side-by-side witness has fired.
+#[cfg(feature = "witness")]
+static SIDEBYSIDE_WITNESSED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 /// F4 — number of composites that have snapshotted the table and may still be blitting from the
 /// surfaces they snapshotted. Teardown drains this to zero before it returns.
