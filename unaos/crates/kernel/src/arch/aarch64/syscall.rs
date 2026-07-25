@@ -6037,6 +6037,51 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
         SYS_WIN_MOVE => sys_win_move(a0, a1, a2),
         SYS_WIN_CLOSE => sys_win_close(a0),
         SYS_EXIT => {
+            // SPINHUNT — PROCESS exit terminates the ADDRESS SPACE, not just this task. Placed at the
+            // very top of the arm, before every name-routed short-circuit below (each of which ends in
+            // its own `sched::exit()`), so there is exactly one insertion point for all of them.
+            //
+            // `SYS_EXIT` is the process terminus; `SYS_THREAD_EXIT` is the thread terminus. Until now
+            // only the second one actually retired anything: a leader that called `SYS_EXIT` with
+            // `SYS_THREAD_SPAWN`ed workers still running left those workers alive under a slot that
+            // `slot_thread_retain` keeps mapped, with no parent, no joiner, and no terminus. A worker
+            // whose release signal is a yield-poll then pegs its core forever — and the `Proc` row the
+            // operator can see was reaped by the leader's own exit, so `jobs` reads clean while a core
+            // reads 99%. It is also unrecoverable: the orphan's `THREAD_TABLE` row can only be
+            // scavenged after the slot's `ASID_GEN` bump, which needs the teardown the orphan prevents.
+            //
+            // Unjoined siblings are therefore reaped by the SAME armed-kill machinery a `kill` uses —
+            // each retires at its own next boundary, through its own `exit()`, decrementing the slot
+            // refcount itself. No row and no slot is reclaimed here; this only makes the 1->0 teardown
+            // edge REACHABLE, so KILLBOUND's quiescence-witness discipline is untouched.
+            //
+            // The `live > 1` guard means the healthy path (a leader that joined everything, or a
+            // single-task program) costs one TTBR0 read and one atomic load and prints nothing.
+            {
+                let asid = current_asid();
+                if asid != 0 {
+                    let live = super::sched::asid_live_threads(asid);
+                    if live > 1 {
+                        // Race-free positive witness for the SPINHUNT leg. A poller on another core
+                        // cannot reliably catch the "leader + 2 workers all live" instant — the whole
+                        // fixture can run between two of its samples — but the exiting leader can
+                        // state it exactly, here, at the only moment it is true.
+                        ORPHAN_LAST_ASID.store(asid, Ordering::Release);
+                        ORPHAN_LAST_COUNT.store((live - 1) as u64, Ordering::Release);
+                        let armed = super::sched::orphan_kill(asid);
+                        serial_println!(
+                            "[spinhunt] SYS_EXIT asid={} — {} sibling thread(s) left unjoined; orphan-reap {}",
+                            asid,
+                            live - 1,
+                            if armed {
+                                "armed (address-space scoped, owner-less)"
+                            } else {
+                                "NOT ARMED: kill request table full — the orphans will spin"
+                            }
+                        );
+                    }
+                }
+            }
             // Demo accounting BEFORE the no-return exit. The sentinel statuses are routed to their own
             // counters so the M6b (`exited=1 killed=3`) and M6e (`completed=1`) verdicts stay byte-
             // identical: M6E_SPIN_STATUS -> EL0_SPIN_DONE, M6D_EXIT_STATUS -> EL0_M6D_DONE, M6F_EXIT_STATUS
@@ -9398,6 +9443,11 @@ fn bgrun_witness(_demo_cpu: usize) {
     // below it needs no SD card and no staged .ELF, and a card-less boot must not silently drop the one
     // leg that covers the P60 wedge. It leaves the process table exactly as it found it.
     killbound_witness();
+    // SPINHUNT rides the same rationale and immediately follows: in-kernel blob, no card, no staged
+    // .ELF, and it leaves the process table as it found it. Placed AFTER KILLBOUND deliberately — that
+    // leg leaves the thread table freshly scavenged, so SPINHUNT's two spawns are served from known-
+    // clean rows and a `-EAGAIN` here would be a real regression rather than KILLBOUND's leftovers.
+    spinhunt_witness();
     if crate::drivers::block::info().is_none() {
         serial_println!(":: BGRUN-ST: no SD card found — skipped ::");
         return;
@@ -10089,6 +10139,237 @@ __killbound_blob_end:
 unsafe extern "C" {
     static __killbound_blob_start: u8;
     static __killbound_blob_end: u8;
+}
+
+// =============================================================================================
+// SPINHUNT fixture — the smallest program that reproduces the P61 pegged core, headless.
+//
+// It is `user-vug`'s thread topology with everything but the ORPHANING removed: the leader spawns
+// two workers whose frame-release wait is a SYS_YIELD POLL (the shape `uvug_worker` uses — RELEASE
+// is a poll, only ARRIVE is a futex), waits until BOTH have signed in, then calls SYS_EXIT WITHOUT
+// JOINING EITHER. That un-joined exit is not a contrived case: VUGGUARD made it the deliberate,
+// documented behaviour of a killed vug, because joining a worker that is not answering would park
+// the parent forever.
+//
+// The workers therefore differ from KILLBOUND's in exactly the way that matters. KILLBOUND's park
+// in `futex_wait` — off every run queue, invisible to a load meter, and the thing `kill_wake_parked`
+// was built to evict. These are RUNNABLE: in a run queue, dispatched every pass, burning their
+// core. They are why the P61 load line read 99% on one core while `jobs` read clean.
+//
+// FLAT image (no ELF magic), one code page, position-independent via `adr` — rides
+// `spawn_user_image_bg` with no fixture files on the card. The flat loader does not zero the data
+// page and slot backings are RECYCLED, so the leader zeroes the sign-in counter before any worker
+// can touch it; without that a stale non-zero word would let the leader exit before the workers
+// existed and the leg would witness nothing.
+// =============================================================================================
+core::arch::global_asm!(
+    r#"
+    .balign 4
+    .globl __spinhunt_blob_start
+__spinhunt_blob_start:
+    adr  x20, __spinhunt_blob_start       // x20 = window base (PC-relative)
+    add  x21, x20, #0x1000                // x21 = the sign-in counter (RW data page 1)
+    str  xzr, [x21]                       // counter = 0
+    dmb  ish                              // publish the zero before either worker can read it
+    adr  x0, __spinhunt_worker            // SYS_THREAD_SPAWN(entry, sp, arg=0, place=1 sibling core)
+    add  x1, x20, #0x3000
+    mov  x2, #0
+    mov  x3, #1
+    mov  x8, #21
+    svc  #0
+    adr  x0, __spinhunt_worker            // SYS_THREAD_SPAWN(entry, sp, arg=1, place=1 sibling core)
+    add  x1, x20, #0x3000                 // (two adds: ADD imm12 cannot encode 0x3800 directly)
+    add  x1, x1, #0x800
+    mov  x2, #1
+    mov  x3, #1
+    mov  x8, #21
+    svc  #0
+    // Wait for BOTH workers to sign in, so the exit below is provably an exit WITH live siblings
+    // rather than a race the leg could pass by accident.
+1:  ldar x9, [x21]
+    cmp  x9, #2
+    b.ge 2f
+    mov  x8, #4                           // SYS_YIELD
+    svc  #0
+    b    1b
+2:  mov  x0, #0                           // SYS_EXIT(0) — deliberately NO SYS_THREAD_JOIN
+    mov  x8, #2
+    svc  #0
+3:  b 3b                                  // never reached
+
+    .balign 4
+    .globl __spinhunt_worker
+__spinhunt_worker:
+    adr  x20, __spinhunt_blob_start       // recover the window base
+    add  x21, x20, #0x1000
+4:  ldxr x9, [x21]                        // A72 = ARMv8.0: LL/SC exclusive (no LSE atomics)
+    add  x9, x9, #1
+    stxr w10, x9, [x21]
+    cbnz w10, 4b                          // monitor lost -> retry
+    dmb  ish                              // publish the sign-in to the leader's core
+    // The wedge itself: a RUNNABLE forever-loop whose only kernel touch is a yield. Nothing in this
+    // loop can ever end it — no wake to miss, no word anyone still alive will write.
+5:  mov  x8, #4                           // SYS_YIELD
+    svc  #0
+    b    5b
+
+    .balign 4
+    .globl __spinhunt_blob_end
+__spinhunt_blob_end:
+"#
+);
+
+unsafe extern "C" {
+    static __spinhunt_blob_start: u8;
+    static __spinhunt_blob_end: u8;
+}
+
+/// SPINHUNT — the ASID of the most recent `SYS_EXIT` that left un-joined sibling threads behind, and
+/// how many it left. Written by the SYS_EXIT orphan hook (the one instant at which the count is
+/// exactly true), read by `spinhunt_witness` as its positive witness. Global and last-writer-wins:
+/// on the healthy system the hook fires for the SPINHUNT fixture and nothing else.
+static ORPHAN_LAST_ASID: AtomicU64 = AtomicU64::new(0);
+static ORPHAN_LAST_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// SPINHUNT — the regression leg for the P61 pegged core. Run as a `bgrun_witness` leg (it needs a
+/// free process row and an address-space slot, and it leaves both clean).
+///
+/// WHAT THE EXISTING LEGS COULD NOT CATCH. KILLBOUND proved a PARKED process can be killed and its
+/// rows reclaimed. Every one of its targets is asleep in `futex_wait`. The property no leg touched is
+/// a task that is RUNNABLE and ORPHANED: its leader exited normally (status 0, row reaped, `jobs`
+/// clean) while it kept spinning. That is invisible to every process-table assertion in the suite,
+/// because an EL0 worker thread has no process row to assert about — the only thing it moves is a
+/// core's load, which is why P61 surfaced as a load line and not as a failure.
+///
+/// THE LEG.
+///   1. `bg` the SPINHUNT fixture and WAIT FOR A POSITIVE LIVENESS WITNESS: `asid_live_threads` must
+///      reach 3 (leader + 2 workers), so a round cannot pass because the fixture died early or the
+///      spawns were refused.
+///   2. Sample every core's busy percent while the orphans are guaranteed live — the BEFORE row.
+///   3. Let the leader exit and reap its `Proc` row, mirroring what the operator's `jobs` sees.
+///   4. THE ASSERTION: within a bounded window, `asid_live_threads(asid)` must reach ZERO. That is
+///      the orphan TERMINUS — every worker retired through its own `exit()`, dropped the slot
+///      refcount, and the slot reached its teardown edge.
+///   5. Sample every core again — the AFTER row.
+///
+/// TEETH (the A/B). On the unfixed kernel step 4 never happens: nothing in the kernel ever ended an
+/// un-joined worker, so `asid_live_threads` stays pinned at 2 for the whole budget, the leg FAILs,
+/// and the AFTER row still shows the orphans' core pegged. The load rows are evidence, not
+/// assertions — QEMU raspi4b delivers no timer IRQ, so the percentages there are a coarse read of
+/// the dispatch-span accounting rather than the metal load line; the ZERO in step 4 is what the
+/// verdict rests on and it is exact on both.
+fn spinhunt_witness() {
+    let bstart = &raw const __spinhunt_blob_start as usize;
+    let bend = &raw const __spinhunt_blob_end as usize;
+    let blob = unsafe { core::slice::from_raw_parts(bstart as *const u8, bend - bstart) };
+    if blob.len() > super::boot::USER_CODE_SIZE {
+        serial_println!(":: SPINHUNT: blob {} B > code page — skipped ::", blob.len());
+        return;
+    }
+    /// One core's busy percent, or `-1` when its accounting slot is not live (`--` in the load line).
+    fn pct(cpu: usize) -> i32 {
+        let ld = super::sched::core_load(cpu);
+        if ld.tracked { ld.busy_pct_recent as i32 } else { -1 }
+    }
+    fn load_row(tag: &str) {
+        serial_println!(
+            "[spinhunt] load {} c0={} c1={} c2={} c3={}",
+            tag, pct(0), pct(1), pct(2), pct(3)
+        );
+    }
+
+    /// Yield-dwell for `ms` of wall clock. Long enough (>= 2 load windows) that the busy-percent the
+    /// row after it reports is a FRESH window rather than a stale carry-over from before the leg.
+    fn dwell(ms: u64) {
+        let hz = super::timer::cntfrq();
+        let want = hz.saturating_mul(ms) / 1000;
+        let t = super::timer::cntpct();
+        while super::timer::cntpct().wrapping_sub(t) < want {
+            super::sched::yield_now();
+        }
+    }
+    /// One dwell's worth of load window, ~2x the ~250 ms accounting window.
+    const DWELL_MS: u64 = 600;
+
+    ORPHAN_LAST_ASID.store(0, Ordering::Release);
+    ORPHAN_LAST_COUNT.store(0, Ordering::Release);
+    let (pid, asid, _entry) = match spawn_user_image_bg(blob) {
+        Ok(v) => v,
+        Err(why) => {
+            serial_println!(":: SPINHUNT: fixture would not launch ({}) -> FAIL ::", why);
+            return;
+        }
+    };
+    // Wall-clock budgets: CNTPCT advances under QEMU, where no timer IRQ is delivered.
+    let budget = super::timer::cntfrq().saturating_mul(5);
+
+    // (1)+(3) The leader runs its whole course — spawn both workers, wait for both sign-ins, exit
+    // WITHOUT joining — and we reap its row exactly as the operator's `jobs` does. Deliberately not
+    // polled for a "3 live tasks" instant: a sampler on this core can miss that window entirely, and a
+    // leg whose positive witness is a race is a leg that passes for the wrong reason. The exact count
+    // comes from (2) below instead, stated by the leader itself at the only moment it is true.
+    let t1 = super::timer::cntpct();
+    let mut leader_status: i64 = -1;
+    let reaped = loop {
+        match bg_poll(pid, true) {
+            BgPoll::Exited(st) => {
+                leader_status = st as i64;
+                break true;
+            }
+            BgPoll::Gone => break true, // already reaped by a scavenge — still a clean leader exit
+            _ => {}
+        }
+        if super::timer::cntpct().wrapping_sub(t1) >= budget {
+            break false;
+        }
+        super::sched::yield_now();
+    };
+
+    // (2) POSITIVE WITNESS: the leader really did exit leaving exactly 2 live siblings under THIS
+    // address space. Without this a run where both spawns were refused would sail through the drain
+    // assertion below (nothing alive, nothing to drain) and witness nothing at all.
+    let orphaned = if ORPHAN_LAST_ASID.load(Ordering::Acquire) == asid {
+        ORPHAN_LAST_COUNT.load(Ordering::Acquire)
+    } else {
+        0
+    };
+
+    // (4) The ORPHAN WINDOW row: a full fresh load window taken with the leader gone. On the unfixed
+    // kernel the two workers are still here, still runnable, still yield-polling — this row is where
+    // their core reads pegged. With the terminus in place they are already gone and it reads quiet.
+    dwell(DWELL_MS);
+    load_row("orphan-window(leader gone)");
+
+    // (5) THE ASSERTION: the orphaned workers must reach a terminus.
+    let t2 = super::timer::cntpct();
+    let mut drained_cyc = 0u64;
+    let drained = loop {
+        if super::sched::asid_live_threads(asid) == 0 {
+            drained_cyc = super::timer::cntpct().wrapping_sub(t2);
+            break true;
+        }
+        if super::timer::cntpct().wrapping_sub(t2) >= budget {
+            break false;
+        }
+        super::sched::yield_now();
+    };
+    let leftover = super::sched::asid_live_threads(asid);
+    // (6) The settled row, one fresh window later.
+    dwell(DWELL_MS);
+    load_row("settled");
+
+    if orphaned == 2 && reaped && drained {
+        let ms = drained_cyc.saturating_mul(1000) / super::timer::cntfrq().max(1);
+        serial_println!(
+            ":: SPINHUNT: leader exited status={} with 2 un-joined yield-polling workers (row reaped, `jobs` clean) and BOTH orphans reached a terminus within {} ms — asid {} drained to 0 live tasks PASS ::",
+            leader_status, ms, asid
+        );
+    } else {
+        serial_println!(
+            ":: SPINHUNT: orphaned={} (want 2) reaped={} drained={} leftover={} live task(s) under asid {} -> FAIL ::",
+            orphaned, reaped, drained, leftover, asid
+        );
+    }
 }
 
 /// ELF-2 threads-test launcher + verdict (the `elf1_launcher` shape: one gated kernel task, self-contained,

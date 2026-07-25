@@ -1077,6 +1077,66 @@
       the windows of the ASID that is LOSING focus, which the raise never touches (and which the shell
       branch does not raise at all). Without that the old holder would keep the bright chrome until
       something unrelated happened to damage it.
+- **SPINHUNT (this arc)** — the **orphaned worker thread**: `SYS_EXIT` retired one task, not the address
+  space, so a leader that exited without joining its workers left them running forever. P61 was an attended
+  sitting: with several bg vugs launched, killed and relaunched, `:: SCHED: load c0=68% c1=99% c2=0% c3=0% ::`
+  was **sustained** — one core pegged — while `jobs` listed every vug pid as `exited 0 (reaped)`.
+  - **Why the process table was clean and the core was not.** Everything the operator can inspect is keyed
+    on a `Proc` row, and an EL0 **worker thread** has none — `SYS_THREAD_SPAWN` creates a task under the
+    caller's existing slot, tracked only by a `THREAD_TABLE` row and the slot's live-task count. So `jobs`
+    was telling the truth about every row it had; the thing burning core 1 was not in it. WC-J had already
+    ruled the compositor out by construction, and that was correct: the spinner was never kernel code.
+  - **The lifecycle gap.** `boot::slot_thread_retain` keeps a slot mapped until the **last** thread under it
+    exits. Nothing in the kernel ever made the last one exit. `SYS_THREAD_EXIT` retired a thread and
+    `SYS_EXIT` retired the calling task — neither retired the *address space*. An unjoined worker therefore
+    outlived its leader with no parent, no joiner, and no terminus.
+  - **Why it burns a core rather than idling.** `user-vug`'s barrier is asymmetric by design: ARRIVE
+    (worker → parent) is a futex, but RELEASE (parent → worker) is a **`SYS_YIELD` poll** on the phase word
+    (`uvug_worker`). A parked orphan would have been invisible and harmless; a polling orphan is
+    **runnable** — in a run queue, dispatched every pass, at 100% of its pinned core for the rest of the
+    boot. `place = 1` sends it to a sibling core, which is why the load landed on one core and stayed there.
+  - **And it is self-sealing.** KILLBOUND's `THREAD_TABLE` scavenge is gated on `ASID_GEN[owner]` having
+    been bumped, which happens on the slot's 1→0 teardown edge, which requires the last thread under the
+    slot to exit — the very thing the orphan will never do. The row is unreclaimable, the slot unrecyclable
+    and the core pegged, permanently. This is the one shape KILLBOUND's discipline could not reach: it made
+    every *reclaim* wait for a positive quiescence witness, and here quiescence never arrives.
+  - **Fix: `SYS_EXIT` terminates the address space.** At the top of the `SYS_EXIT` arm — before every
+    name-routed short-circuit, so there is one insertion point for all of them — if the caller's ASID still
+    holds live siblings, `sched::orphan_kill(asid)` arms an **address-space-scoped** kill through exactly
+    the machinery a `kill` uses. Each orphan is matched at its own next boundary (an EL0 syscall — a
+    yield-polling worker reaches one every pass — or a preemption on metal) and retires through its own
+    `exit()`. The request is **owner-less**: there is no requester to confirm to (the leader is on its way
+    into `exit()`), so the ticket is armed and immediately `kill_detach`ed — `kill_slot_for` still matches
+    `KILL_DETACHED`, and the last orphan out CASes the slot `KILL_DETACHED → KILL_FREE` inline, returning
+    it to the four-entry pool exactly once. A full request table is an honest, witnessed, bounded failure,
+    not a silent one.
+  - **KILLBOUND's discipline is preserved, not weakened.** Nothing is reclaimed at the leader's exit. Each
+    orphan decrements `SLOT_REFCOUNT` itself; only at zero does `teardown_user_slot` bump `ASID_GEN`, and
+    only then does the thread-table scavenge consider the row dead. The fix makes that edge **reachable**;
+    it does not move it earlier, and no row is ever freed while its task could be mid-execution on any core.
+  - **Semantics.** `SYS_EXIT` is the *process* terminus; `SYS_THREAD_EXIT` is the *thread* terminus. Only
+    the second one previously did anything. `user-vug`'s own `PHASE_EXIT`-then-join is now belt-and-braces
+    rather than the sole guarantee — which matters because VUGGUARD deliberately makes a killed vug skip the
+    join (joining a worker that is not answering would park the parent forever).
+  - **Witness: `BGRUN-ST` leg 0b / `:: SPINHUNT: …`,** `+4` spec REQUIREs and `+1` FORBID (66 → 70). The
+    fixture is an in-kernel flat blob (no SD card, no staged `.ELF`): the leader spawns two workers that
+    sign in and then yield-poll forever, waits for both sign-ins, and calls `SYS_EXIT(0)` with **no**
+    `SYS_THREAD_JOIN`. The positive witness — `2 sibling thread(s) left unjoined` — is stated by the
+    **leader itself** at the only instant it is exactly true; a poller on the witness core can miss that
+    window entirely, and a leg whose positive witness is a race is a leg that passes for the wrong reason.
+    The verdict is that the ASID drains to **zero** live tasks inside a bounded window. Two load rows
+    bracket it (evidence, not assertions — QEMU raspi4b delivers no timer IRQ, so the percentages there
+    read the dispatch-span accounting rather than the metal load line).
+  - **Verified to have teeth (A/B).** With `orphan_kill` disabled and nothing else changed, the leg reports
+    `orphaned=2 (want 2) reaped=true drained=false leftover=2 live task(s) under asid 1 -> FAIL`, and the
+    orphan-window row reads `c0=58 … / settled c0=61` where the fixed kernel reads `c0=0` on both — the P61
+    pegged core, reproduced in QEMU, with the leader's row already reaped. The leader's status is `0` in
+    both arms, so `jobs` reads clean in both: the A/B *is* the P61 symptom.
+  - Gates: `./arroyo check` green x86_64 + aarch64; `UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test 90`
+    → **70/70 required witnesses, 0 forbidden**; `./arroyo test-arm` MISSION SUCCESS. Lane:
+    `arch/aarch64/sched.rs` (`orphan_kill`) + `arch/aarch64/syscall.rs` (the `SYS_EXIT` hook, the fixture
+    and the leg) + the spec + this doc. QEMU-green ≠ correct: the metal confirmation rides the attended
+    sitting, where the property to watch is the `SCHED: load` line after a vug is killed and relaunched.
 - **KILLBOUND (this arc)** — the **unkillable parked task**, and the two bounded tables it wedged. P60 was
   an attended sitting on a real Pi 4, and the failure was reached by hand, not by a fixture: after several
   `bg` vug launches and kills, `kill <pid>` stopped working. The shell printed `kill armed but unconfirmed`

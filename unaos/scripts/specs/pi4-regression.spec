@@ -564,3 +564,37 @@ REQUIRE \[pstrip\] rollup samples=[0-9]+ redraws=[0-9]+ skipped=[1-9]
 # ---    on the render core -- the SCHED-6 regression, re-entered through the pulse. 4.x and below is
 # ---    left legal so a genuinely churning machine is not called a bug.
 FORBID \[pstrip\] rollup .*rate=([5-9]|[1-9][0-9]+)\.[0-9]/s
+# --- SPINHUNT: a worker thread whose leader exited without joining it must reach a terminus.
+# ---
+# ---    P61: with several bg vugs launched, killed and relaunched, one core read a SUSTAINED 99%
+# ---    while `jobs` listed every vug pid as `exited 0 (reaped)`. Nothing in the process table was
+# ---    wrong, because the thing burning the core had no process row: an EL0 WORKER THREAD.
+# ---
+# ---    `SYS_THREAD_SPAWN` puts several tasks under one address-space slot, and the slot lives until
+# ---    the LAST of them exits. Nothing ever made the last one exit. `SYS_EXIT` retired only the
+# ---    calling task, so a leader that exited without joining its workers — which VUGGUARD made the
+# ---    deliberate behaviour of a killed vug, since joining a non-answering worker parks the parent
+# ---    forever — left them running against a parent that no longer existed. A worker whose release
+# ---    signal is a yield-poll (`uvug_worker`, and any barrier of that shape) is RUNNABLE, not
+# ---    parked: it stays in a run queue and burns its pinned core for the rest of the boot. It is
+# ---    also self-sealing — its `THREAD_TABLE` row can only be scavenged after the slot's ASID_GEN
+# ---    bump, which needs the teardown the orphan itself prevents.
+# ---
+# ---    `SYS_EXIT` now terminates the ADDRESS SPACE: un-joined siblings are reaped by the same
+# ---    armed-kill machinery a `kill` uses, address-space scoped and owner-less (armed then detached,
+# ---    so the last orphan out returns the request slot itself). Nothing is reclaimed early — each
+# ---    orphan retires through its own `exit()` and drops the slot refcount itself, so KILLBOUND's
+# ---    quiescence-witness discipline is untouched; the fix only makes the 1->0 edge REACHABLE.
+# ---
+# ---    The leg `bg`s a fixture whose leader spawns two yield-polling workers, waits for both to
+# ---    sign in, and exits WITHOUT joining. The positive witness (`2 sibling thread(s) left
+# ---    unjoined`) is stated by the leader itself at the only instant it is exactly true — a poller
+# ---    on another core can miss that window entirely. The verdict is that the ASID drains to ZERO
+# ---    live tasks. A/B with the terminus disabled: `drained=false leftover=2`, and the
+# ---    orphan-window load row reads 58-61% on the orphans' core against 0% with the fix. See
+# ---    docs/dev/OS/02_KERNEL_CORE/userspace.md SPINHUNT.
+REQUIRE \[spinhunt\] SYS_EXIT asid=.* 2 sibling thread\(s\) left unjoined; orphan-reap armed
+REQUIRE \[spinhunt\] load orphan-window\(leader gone\)
+REQUIRE \[spinhunt\] load settled
+REQUIRE SPINHUNT: leader exited status=0 with 2 un-joined yield-polling workers .* drained to 0 live tasks PASS
+FORBID SPINHUNT: .*-> FAIL

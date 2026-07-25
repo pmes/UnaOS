@@ -1596,6 +1596,60 @@ pub fn kill_detach(ticket: KillTicket) {
     }
 }
 
+/// SPINHUNT — the sentinel `tid` an ORPHAN-REAP request is armed with. Task ids are handed out by a
+/// monotone counter that starts at 1, so `u64::MAX` can never name a live task: the request therefore
+/// matches purely on its ASID, which is exactly its scope (every sibling thread of a dead leader).
+const ORPHAN_KILL_TID: u64 = u64::MAX;
+
+/// SPINHUNT — arm an OWNER-LESS, address-space-scoped kill against everything still alive under `asid`.
+///
+/// THE HOLE THIS CLOSES. `SYS_THREAD_SPAWN` gives an EL0 process several tasks under one slot, and
+/// `boot::slot_thread_retain` keeps that slot alive until the LAST of them exits. Nothing in the kernel
+/// ever made the last one exit. When a leader called `SYS_EXIT` without joining its workers — which is
+/// not a userspace bug but the DOCUMENTED VUGGUARD path, since joining a worker that is not answering
+/// would park the parent forever — the workers simply kept running. A worker whose release signal is a
+/// yield-poll (`user-vug`'s `uvug_worker`, and any barrier of that shape) then burns its pinned core at
+/// 100% for the rest of the boot against a parent that no longer exists.
+///
+/// AND IT IS SELF-SEALING WITHOUT THIS. The orphan holds a `THREAD_TABLE` row, and KILLBOUND's scavenge
+/// of that table is gated on `ASID_GEN[owner]` having been bumped — which happens on the slot's 1->0
+/// teardown edge, which requires the last thread under the slot to exit, which is the very thing the
+/// orphan will never do. So the leak is permanent by construction: the row is unreclaimable, the slot is
+/// unrecyclable, and the core stays pegged. Exactly the sustained one-core load with a clean `jobs`
+/// table (the leader's `Proc` row IS reaped; an orphaned worker never had one) that P61 observed.
+///
+/// WHY THE EXISTING MACHINERY, AND WHY DETACHED. `kill(_, asid)` is already address-space scoped: every
+/// sibling is matched by the one request at its own next boundary (an EL0 syscall — a yield-polling
+/// worker reaches one every pass — or a preemption on metal), and `kill_settle` withholds settlement
+/// while any sibling is still live. But there is no requester here to confirm to and none to hand the
+/// slot back: the leader is on its way into `exit()`. So the ticket is DETACHED immediately, which is
+/// the owner-less path `kill_settle` already implements — `kill_slot_for` still matches a `KILL_DETACHED`
+/// request, and the LAST orphan out CASes the slot `KILL_DETACHED -> KILL_FREE` inline. The request
+/// therefore returns to the four-entry pool exactly once, with nobody holding it.
+///
+/// QUIESCENCE IS PRESERVED, NOT WEAKENED. Nothing is reclaimed here. Each orphan retires through its own
+/// `exit()`/`retire_killed`, decrementing `SLOT_REFCOUNT` itself; only when that reaches zero does
+/// `teardown_user_slot` bump `ASID_GEN`, and only then does the KILLBOUND scavenge consider the row dead.
+/// This fix makes that edge REACHABLE; it does not move it earlier.
+///
+/// Returns `true` if a request was armed. `false` means the four-entry table is full — the honest,
+/// bounded failure the caller must WITNESS rather than paper over (the orphans then live on until some
+/// later kill happens to name their ASID, exactly as before this fix).
+pub fn orphan_kill(asid: u64) -> bool {
+    if asid == 0 {
+        return false;
+    }
+    match kill(ORPHAN_KILL_TID, asid) {
+        Some(ticket) => {
+            // Surrender it at once: the request stays ARMED (`KILL_DETACHED` matches in
+            // `kill_slot_for`) and frees itself when the last orphan under this ASID retires.
+            kill_detach(ticket);
+            true
+        }
+        None => false,
+    }
+}
+
 /// ON-CPU kill boundary. If the task running on THIS core has been killed, retire it here and now —
 /// `exit()` never returns, which is exactly what the M6b EL0 fault-kill path already does from the
 /// synchronous exception handler. No-op (and just four relaxed loads) otherwise.
