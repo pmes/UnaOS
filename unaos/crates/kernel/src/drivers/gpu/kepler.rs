@@ -471,16 +471,6 @@ pub fn init(gpu: &GpuInfo) {
                                         
                                         let base = 0x409000;
                                         
-                                        // --- Pull 28: FECS CTXCTL Handshake Recon ---
-                                        serial_println!(":: kepler: recon CTXCTL/host-interface reset values ::");
-                                        serial_println!(":: kepler: recon WRCMD_CMD={:08X} ::", mmio_read(bar0, base + 0x504));
-                                        serial_println!(":: kepler: recon CC_SCRATCH[0]={:08X} ::", mmio_read(bar0, base + 0x800));
-                                        serial_println!(":: kepler: recon CC_SCRATCH[1]={:08X} ::", mmio_read(bar0, base + 0x804));
-                                        serial_println!(":: kepler: recon CHAN_CUR={:08X} ::", mmio_read(bar0, base + 0xb00));
-                                        serial_println!(":: kepler: recon CHAN_NEXT={:08X} ::", mmio_read(bar0, base + 0xb04));
-                                        serial_println!(":: kepler: recon ENGINE_STATUS={:08X} ::", mmio_read(bar0, base + 0xc00));
-                                        serial_println!(":: kepler: recon ENGINE_TRIGGER={:08X} ::", mmio_read(bar0, base + 0xc08));
-
                                         for &(img_label, img, want) in &[("A", &UCODE_A, 0xF00DFACEu32), ("B", &UCODE_B, 0xF00DBEEFu32)] {
                                             let port = if img_label == "A" { 0x1000 } else { 0x0040 };
                                             serial_println!(":: kepler: ucode img={} ioport={:04X} want={:08X} ::", img_label, port, want);
@@ -678,6 +668,23 @@ pub fn init(gpu: &GpuInfo) {
                                     let final_mb1 = mmio_read(bar0, 0x409000 + 0x044);
                                     let final_cpu = mmio_read(bar0, 0x409000 + 0x100);
                                     serial_println!(":: kepler: hb final mb1={:08X} cpuctl={:08X} ::", final_mb1, final_cpu);
+
+                                    // --- Pull 28 recon, relocated (GR5, s31 fold): the first access to an
+                                    // absent 0x409xxx offset latches a sticky PRI fault and every later read
+                                    // of the unit returns BADF1000 (s31: fal-base read real, then all
+                                    // post-0x409504 reads poisoned, s30 markers included). Run the recon LAST,
+                                    // after every proven read, and bracket it with cpuctl control reads so
+                                    // poisoning is observed in-boot rather than inferred.
+                                    serial_println!(":: kepler: recon-pre cpuctl={:08X} ::", mmio_read(bar0, 0x409000 + 0x100));
+                                    serial_println!(":: kepler: recon CTXCTL/host-interface reset values ::");
+                                    serial_println!(":: kepler: recon WRCMD_CMD={:08X} ::", mmio_read(bar0, 0x409000 + 0x504));
+                                    serial_println!(":: kepler: recon CC_SCRATCH[0]={:08X} ::", mmio_read(bar0, 0x409000 + 0x800));
+                                    serial_println!(":: kepler: recon CC_SCRATCH[1]={:08X} ::", mmio_read(bar0, 0x409000 + 0x804));
+                                    serial_println!(":: kepler: recon CHAN_CUR={:08X} ::", mmio_read(bar0, 0x409000 + 0xb00));
+                                    serial_println!(":: kepler: recon CHAN_NEXT={:08X} ::", mmio_read(bar0, 0x409000 + 0xb04));
+                                    serial_println!(":: kepler: recon ENGINE_STATUS={:08X} ::", mmio_read(bar0, 0x409000 + 0xc00));
+                                    serial_println!(":: kepler: recon ENGINE_TRIGGER={:08X} ::", mmio_read(bar0, 0x409000 + 0xc08));
+                                    serial_println!(":: kepler: recon-post cpuctl={:08X} ::", mmio_read(bar0, 0x409000 + 0x100));
 
                                     // 3. Submit Runlist
                                     mmio_write(bar0, 0x2270, (runlist_off as u32) >> 12); // target=0 (VRAM), addr

@@ -3,6 +3,45 @@
 Hard-won silicon facts from the fox-metal sitting series. Trust these over any
 QEMU behavior. Newest sitting first.
 
+## Sitting #31 (fence pull 28 CTXCTL recon, UnaOS-gemini@c6b0e3cf, 2026-07-25, fox-metal-r23s1n, s31boot1)
+
+**⚠ NEW SILICON LAW: A BAD 0x409xxx OFFSET READ POISONS THE WHOLE FECS
+UNIT FOR THE REST OF THE BOOT.** Coordinator awk-verified. The boot
+stream shows the mechanism exactly:
+```
+:: kepler: fal-base b=409000 verdict cpuctl=00000010 imemc=00000000 dmemc=00000000 ::   <- real values
+:: kepler: recon WRCMD_CMD=BADF1000 ::                                                  <- first 0x409504 read
+:: kepler: recon CC_SCRATCH[0]=BADF1000 ::  (…all seven recon reads BADF1000…)
+:: kepler: ucode pre mailbox0=BADF1000 cpuctl=BADF1000 ::   <- s30-proven reads now BADF1000
+:: kepler: ucode ABORT verify-mismatch — BOOTVEC/CPUCTL NOT written ::
+:: kepler: hb ABORT verify-mismatch ::
+:: kepler: witness-rematch end err=00000002 stat=00000005 valid=00002000 ::   <- PFIFO untouched
+```
+cpuctl read 0x10 (real) immediately before the recon block; the first
+access to 0x409504 returned BADF1000 and EVERY subsequent 0x409xxx read
+— mailboxes, cpuctl, IMEM readback, GPCCS untested — returned BADF1000
+for the rest of the boot. The verify-gates did their job: with readback
+poisoned, ucode A and HB both ABORTED cleanly, nothing was started blind.
+PFIFO (0x2xxx) was unaffected — the witness signature printed unchanged.
+**Interpretation limits: only the FIRST recon datum is clean (0x409504 →
+absent-or-faulting on GK107); the other six offsets are CONFOUNDED, not
+proven absent. The "s30 regression" is fully explained as probe-induced
+poisoning — nothing else broke.** This retroactively colors s24/s25:
+"all BADF1000" sweeps there may equally have been first-fault poison, not
+per-offset truth.
+
+Coordinator fix (in-lane, land-review breakage authority): recon block
+RELOCATED to after `hb final` — every proven read completes before any
+unverified offset is touched — and bracketed with `recon-pre cpuctl=` /
+`recon-post cpuctl=` control reads so poisoning is observed in-boot, not
+inferred. s32 expected shape: recon-pre=00000010 real; if recon-post is
+BADF1000 the poison law is confirmed by its own control frame, and the
+first recon value is the only per-offset datum banked per boot.
+
+Capture from mark s31boot1. ESP by coordinator (sha c6b0e3cf…), Fox
+sha-verified, staged, flashed only. Panel: calibration draw as s30,
+expected.
+
 ## Sitting #30 (display pull 20 + fence pull 27, UnaOS-gemini@913a200e, 2026-07-25, fox-metal-r23s1m, s30boot1)
 
 **FENCE — ⭐ REFUTATION #8, THE CLEANEST: THE WALL IS NOT ENGINE LIVENESS.**
