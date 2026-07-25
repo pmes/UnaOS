@@ -6,7 +6,8 @@ Three pull sequences, numbered independently. Every pull = one BRIEF (coordinato
 ## Lane 1: Kepler FENCE (PFIFO/scheduler — kepler.rs) — `video/Kepler/`, files `*kepler-fence-pull<N>*` (pulls ≤13: `*kepler-pull<N>*`)
 | Pull | Files | Status | One-liner |
 |---|---|---|---|
-| 19 | BRIEF-kepler-fence-pull19-pgraph-enable | LANDED (523a50c2) — metal owed s22 | set PMC_ENABLE bit12 (one write) + re-run recon — BADF1200 should become real values |
+| 20 | BRIEF-kepler-fence-pull20-witness-rematch | BRIEFED — awaiting proposal | re-run s7–s10 witness sequence verbatim with PGRAPH on — zero new writes; either outcome decisive |
+| 19 | BRIEF-kepler-fence-pull19-pgraph-enable | LANDED; s22: **ENABLE TOOK** (rb bit12 set) — BADF1200 wall gone, BADF1000+real zeros, Falcon halted/no-ucode | set PMC_ENABLE bit12 (one write) + re-run recon — BADF1200 should become real values |
 | 18 | BRIEF-kepler-fence-pull18-falcon-recon / PROPOSAL-kepler-fence-pull18 | LANDED 9dacbd8c; s21: GROUND TRUTH — all-BADF1200, PMC_ENABLE bit12 CLEAR (PGRAPH never powered) | read-only PGRAPH Falcon ground-truth dump |
 | 17 | BRIEF-kepler-fence-pull17-latch-correlation / PROPOSAL-kepler-fence-pull17 | LANDED 7ac404d8; s20: latch-delta NONE + pre all-zero — window DEAD ROAD, parked; fallback ladder EXHAUSTED → PGRAPH/ucode pivot is a Peter call | pre-takeover window dump + latch-delta diff |
 | 16 | BRIEF-kepler-fence-pull16-beacon / PROPOSAL-kepler-fence-pull16 | LANDED 200be275; s19: NONE-SEEN (not our structures); window stable in-boot (p1→p2 zero deltas) | VRAM beacons in our channel structures |
@@ -24,7 +25,7 @@ Three pull sequences, numbered independently. Every pull = one BRIEF (coordinato
 ## Lane 2: Kepler DISPLAY (scanout — kepler_display.rs after split) — `video/Kepler/`, files `*kepler-display-pull<N>*`
 | Pull | Files | Status | One-liner |
 |---|---|---|---|
-| 12 | BRIEF-kepler-display-pull12-pitchalign | LANDED (523a50c2) — metal owed s22 | bh {4,8} × pitch_gobs {192,256} mini-ladder — zero seams names the real pair |
+| 12 | BRIEF-kepler-display-pull12-pitchalign | LANDED; s22: all 4 cycles ran clean (serial verified) — VERDICT AWAITS PANEL PHOTOS | bh {4,8} × pitch_gobs {192,256} mini-ladder — zero seams names the real pair |
 | 11 | BRIEF-kepler-display-pull11-blockheight / PROPOSAL-kepler-display-pull11 | LANDED 410996eb/366e5b05; s21: no rung clean — monotonic seams → pitch-alignment is the second parameter | four-hold block-height ladder (bh 2/4/8/16) |
 | 10 | BRIEF-kepler-display-pull10-swizzle / PROPOSAL-kepler-display-pull10 | LANDED fec4b73f; s20: BLOCK-LINEAR CONFIRMED (checkerboard gone; brick-seams = block-height wrong) | pre-swizzled ruler (GOB 64B×8) |
 | 9 | BRIEF-kepler-display-pull9-ruler / PROPOSAL-kepler-display-pull9 | LANDED 3ce77eda; s19: DELIVERED — full cycle compressed ~8×, 16-px checkerboard, no white column → BLOCK-LINEAR hypothesis | ruler fill (64-row color cycle + wide left marker) |

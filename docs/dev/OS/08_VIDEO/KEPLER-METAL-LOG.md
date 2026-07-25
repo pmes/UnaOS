@@ -3,6 +3,38 @@
 Hard-won silicon facts from the fox-metal sitting series. Trust these over any
 QEMU behavior. Newest sitting first.
 
+## Sitting #22 (display pull 12 + fence pull 19, UnaOS-gemini@523a50c2, 2026-07-25, fox-metal-r23s1l, s22boot1)
+
+**Fence — PGRAPH ENABLE TOOK; engine changed class from gated to
+partially-readable.** `pgraph-enable pre=E011216D` (bit 12 clear, exactly
+the s21 value) → `wrote=E011316D rb=E011316D` — **bit 12 stuck, not
+REFUSED.** Post-enable recon (both passes, identical, stable):
+- The all-BADF1200 wall is GONE. Registers now read **BADF1000** (a
+  different pri-error class — engine no longer PMC-gated, but not fully
+  out of reset/clocked) interleaved with **real zeros**:
+  - falcon core: 0x400100/108/110/118/11C = 00000000 (cpuctl=00000000 —
+    Falcon present, halted, no ucode); 104/10C/114 = BADF1000.
+  - pgraph stat: off 050–064, 074, 078 = 00000000; rest BADF1000.
+  - imemc/dmemc = BADF1000 (memory ports still gated).
+- The init-time "PGRAPH Engine Status: 0xBADF1200" line in this log
+  predates the enable (ordering verified in capture) — not a contradiction.
+- Read: register-granular decode exists now; the engine responds but wants
+  a further ungating step (engine-level reset release / clock enable).
+  Per the standing plan, the FIRST check is the s10 witness-ladder rematch
+  (pull 20): if PFIFO stops stripping VALID/POLL with the engine merely
+  enabled at PMC, the fence wall is over without any ucode work.
+
+**Display — all four pa-step cycles ran clean end-to-end** (fill/hold×5/
+done, restore between): bytes per cycle 01560000 (4,192), 01C80000 (4,256),
+015C0000 (8,192), 01D00000 (8,256) — matching computed sizes exactly
+(Fox's "all 01D00000" was a misread; capture verified). **Verdict awaits
+Peter's four panel photos** — zero seams + solid white column names the
+real (bh,pg) pair. Bench-ride therm/pcilink/vrom blocks printed pre-dispatch
+(ours, first sitting they ride).
+
+Capture: rmbp-s18/cu.usbserial-ABAFUJCO.log, mark s22boot1. Flash MANIFEST
+s22-20260725T1340Z-523a50c2.
+
 ## Sitting #21 (display pull 11 + fence pull 18, UnaOS-gemini@f9e987f6/366e5b05, 2026-07-24, fox-metal-r23s1j)
 
 **Fence — Falcon ground truth: PGRAPH IS POWERED OFF AT PMC.** Every

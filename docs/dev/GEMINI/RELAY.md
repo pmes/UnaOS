@@ -1,23 +1,11 @@
 # PETER'S RELAY SHEET — not for specialists. Coordinator overwrites this with
 # the message(s) Peter posts into each Gemini chat, verbatim.
-# (updated 2026-07-25: pulls 12 + 19 APPROVED — full approval text inline, post-ready)
-
-## → kepler-display session
-
-Display: pull 12 proposal APPROVED with two binding amendments:
-
-(1) The lane file is `unaos/crates/kernel/src/gpu/kepler_display.rs` — NOT `drivers/gpu/kepler_display.rs` as your proposal wrote. It is the same file you modified for pulls 5–11; do not create a new path.
-
-(2) The full gate set applies: full-knob `UNAOS_IVB=1 UNAOS_KEPLER=1 UNAOS_KEPLER_TAKEOVER=1 UNAOS_KEPLER_FIFO=1 ./arroyo check` (both arches), default `./arroyo test` and `./arroyo test-arm` green, then `UNAOS_USBDEBUG=1 UNAOS_IVB=1 UNAOS_KEPLER=1 UNAOS_KEPLER_TAKEOVER=1 UNAOS_KEPLER_FIFO=1 ./arroyo esp-x86`, and strings-proof the new `pa-step` markers in `target/x86_64_esp/kernel.elf`.
-
-Everything else exactly as you proposed: four cycles (bh=4,pg=192), (bh=4,pg=256), (bh=8,pg=192), (bh=8,pg=256); padded pixels x>=2880 filled black; `gobs_per_row = pg` in the index math; bytes value printed in the fill-done marker; 5 s holds, 1 s recovery gaps; writes remain exactly 0x640460 + 0x640080. Implement now, commit ALL docs+code, delete scratch, no push. Report "PUSH OWED: n".
+# (updated 2026-07-25, after s22boot1: pgraph enable TOOK; fence pull 20 briefed; display verdict awaits photos)
 
 ## → kepler-fence session
 
-Fence: pull 19 proposal APPROVED with two binding amendments:
+Fence: s22 verdict — YOUR ENABLE TOOK. pre=E011216D → rb=E011316D, bit 12 stuck, not refused. The all-BADF1200 wall is GONE: post-enable the block reads BADF1000 interleaved with REAL ZEROS (cpuctl=00000000 — Falcon present, halted, no ucode; pgraph stat off 050–064/074/078 read zero; imemc/dmemc still gated). Both passes identical and stable. The engine exists on the pri bus now. Pull 20 is briefed and it's the decisive one: re-run your s7–s10 channel witness sequence VERBATIM with the engine on — zero new register writes, resequence only, keep your original witness markers and add a framing pair `:: kepler: witness-rematch begin (pgraph on) ::` / `:: kepler: witness-rematch end err=X stat=X valid=X ::`. If PFIFO stops stripping VALID, the fence wall ends with no ucode work; if it still strips, that's the cleanest refutation yet and the ucode arc begins. git pull for the full brief (BRIEF-kepler-fence-pull20-witness-rematch.md). Proposal first. PUSH OWED reminder stands.
 
-(1) Your strings-proof command is wrong: there is no `arroyo build esp-x86` subcommand and no `target/x86_64-unaos` kernel path. The correct proof: build with `UNAOS_USBDEBUG=1 UNAOS_IVB=1 UNAOS_KEPLER=1 UNAOS_KEPLER_TAKEOVER=1 UNAOS_KEPLER_FIFO=1 ./arroyo esp-x86`, then verify the `pgraph-enable` markers appear in `strings target/x86_64_esp/kernel.elf`.
+## → kepler-display session
 
-(2) Default `./arroyo test` and `./arroyo test-arm` green are also gates, alongside the full-knob check you listed.
-
-Everything else exactly as you proposed: ONE new register write (PMC_ENABLE |= 1<<12), pre/wrote/rb markers, REFUSED marker + skip-recon branch if bit 12 doesn't stick, ~100 ms spin settle, re-run the ENTIRE pull-18 recon unchanged (both passes, same markers), leave PGRAPH enabled. Implement now, commit ALL docs+code, delete scratch, no push. Report "PUSH OWED: 5".
+Display: s22 — all four of your pa-step cycles ran clean end-to-end on metal, serial verified (bytes per cycle 01560000 / 01C80000 / 015C0000 / 01D00000, exactly as computed; holds and restores all clean). The mapping verdict awaits the four panel photos — zero seams + solid white left column names the real (bh,pg) pair. Hold for the photo verdict; no new work yet.
