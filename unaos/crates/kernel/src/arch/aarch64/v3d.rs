@@ -4121,16 +4121,26 @@ fn v3d58_emit_stations(what: &str, s: &[V3d58Station; 5], pool_base: u32, pool_s
     }
     let bm0 = s[0].pcs & V3D_PCS_BMACTIVE != 0; // frame already open BEFORE we touched CT0?
     let bm4 = s[4].pcs & V3D_PCS_BMACTIVE != 0;
-    // Where did the pool reservation happen? BPCS is the PTB's REMAINING-bytes register (§30), so a drop
-    // below the size we latched is the PTB consuming the pool. Which station it drops at is the whole
-    // question: at S1 it is a side effect of the CT0QMS write, at S3/S4 it is START_TILE_BINNING acting.
+    // Where did the pool reservation happen? On the reading this driver carries from §30, BPCS is the
+    // PTB's REMAINING-bytes register, so a drop below the size we latched is the PTB consuming the pool.
+    // Which station it drops at is the whole question: at S1 it is a side effect of the CT0QMS write, at
+    // S3/S4 it is START_TILE_BINNING acting.
+    //
+    // **S0 is EXCLUDED from this scan.** At S0 nothing has been latched into CT0QMS yet, so whatever BPCS
+    // reads there is the block's reset/stale value and is NOT comparable to `pool_size`. Including it
+    // would let any small leftover value score as `resv_at=0` and fire the "CT0QMA/QMS latch artifact"
+    // verdict for a write that had not happened. S0's BPCS is reported on its own terms instead.
+    let s0_bpcs_below = s[0].bpcs < pool_size; // stale/reset — descriptive only, never a verdict input
+    // A drop **to zero** is FULL consumption — the strongest "the PTB acted" reading there is — so the
+    // test is "below the latched size, zero included", not "nonzero and below".
     let mut resv_at: i32 = -1;
-    for (i, st) in s.iter().enumerate() {
-        if st.bpcs != 0 && st.bpcs < pool_size {
+    for (i, st) in s.iter().enumerate().skip(1) {
+        if st.bpcs < pool_size {
             resv_at = i as i32;
             break;
         }
     }
+    let resv_full = resv_at >= 0 && s[resv_at as usize].bpcs == 0;
     let adv4 = s[4].bpca.wrapping_sub(pool_base);
     let verdict = if bm0 {
         "BMACTIVE was ALREADY SET at S0 — before this driver wrote a single CT0 register. A bin frame was left OPEN by the reset path or by the preceding CT1 job, and every START_TILE_BINNING since has been stacking onto a frame that was never closed. This is a bring-up defect UPSTREAM of everything V3D-40..57 audited, and it would produce exactly the observed signature (list walks, pool reserves, FLUSH never closes a frame it did not open). Next arc: a corroborated CT0 frame/thread abort before the kick — NOT the fabricated CTRSTA bit (see the V3D-58 facts block)"
@@ -4138,21 +4148,24 @@ fn v3d58_emit_stations(what: &str, s: &[V3d58Station; 5], pool_base: u32, pool_s
         "BMACTIVE is CLEAR at S0 and STILL CLEAR at S4 — the bin frame never opened at all. START_TILE_BINNING did not put the pipeline into binning mode, so the missing FLDONE is a CONSEQUENCE, not the defect: chase what gates BMACTIVE (frame enables / PTB bring-up), not the flush unit"
     } else if resv_at >= 3 {
         "BMACTIVE set only after the GO and the pool reservation happened at/after S3 — START_TILE_BINNING genuinely EXECUTED: the PTB opened the frame and consumed the pool. The frame then never closed. Combined with [v3d58] xengine (the render engine writes and retires on this same block), the remaining surface is the BIN FLUSH/frame-close step alone"
-    } else if resv_at >= 0 && resv_at <= 1 {
-        "the pool reservation was ALREADY VISIBLE at S0/S1 — BPCS dropped below the size we latched before the GO, so the 0x3000 advance is a register-latch artifact of the CT0QMA/QMS write and NOT evidence that the PTB ran. The V3D-56 'the PTB reserved' reading is then wrong and 'the binner never started' is back on the table"
+    } else if resv_at == 1 {
+        "the pool reservation was ALREADY VISIBLE at S1 — BPCS dropped below the size we latched by the CT0QMA/QMS/QTS write alone, before CT0QBA and before the GO. The 0x3000 advance is then a register-latch artifact and NOT evidence that the PTB ran: the V3D-56 'the PTB reserved' reading is wrong and 'the binner never started' is back on the table"
+    } else if resv_at == 2 {
+        "BPCS dropped at S2 — after CT0QBA but still BEFORE the GO. Neither a pure latch artifact nor START_TILE_BINNING acting; the queue-begin write itself is moving PTB state, which no model of this block predicts. Treat as a NEW fact and re-read the raw stations"
     } else {
         "mixed reading — BMACTIVE opened after the GO but the pool reservation station is ambiguous; read BPCS across the five stations by hand before drawing a verdict"
     };
     serial_println!(
-        ":: V3D: [v3d58] station ({}) — pool base={:#010x} size={:#x} (as latched into CT0QMA/CT0QMS) | BMACTIVE S0..S4 = {}{}{}{}{} | BPCS {:#x}->{:#x} first-drop-station={} | BPCA advance at S4 = {:#x} | BFC {:#010x}->{:#010x} (Δ{}) — {} ::",
+        ":: V3D: [v3d58] station ({}) — pool base={:#010x} size={:#x} (as latched into CT0QMA/CT0QMS) | BMACTIVE S0..S4 = {}{}{}{}{} | BPCS S0={:#x} (PRE-LATCH: reset/stale, below-size={} carries NO verdict) S1={:#x} -> S4={:#x} | first-drop-station={} (S1..S4 only{}) | BPCA advance at S4 = {:#x} | BFC {:#010x}->{:#010x} (Δ{}) — {} ::",
         what, pool_base, pool_size,
         (s[0].pcs & V3D_PCS_BMACTIVE != 0) as u32,
         (s[1].pcs & V3D_PCS_BMACTIVE != 0) as u32,
         (s[2].pcs & V3D_PCS_BMACTIVE != 0) as u32,
         (s[3].pcs & V3D_PCS_BMACTIVE != 0) as u32,
         (s[4].pcs & V3D_PCS_BMACTIVE != 0) as u32,
-        s[0].bpcs, s[4].bpcs,
+        s[0].bpcs, s0_bpcs_below as u32, s[1].bpcs, s[4].bpcs,
         if resv_at < 0 { -1 } else { resv_at },
+        if resv_full { ", dropped to ZERO = FULL pool consumption" } else { "" },
         adv4,
         s[0].bfc, s[4].bfc, s[4].bfc.wrapping_sub(s[0].bfc),
         verdict
@@ -4203,7 +4216,14 @@ fn v3d58_xengine(what: &str, bin_retired: bool, bin_wrote: bool) {
 ///
 /// `clear_job(None)` re-seeds its own target with the `0xDEADBEEF` sentinel and byte-verifies the GPU's
 /// store; passing `None` suppresses the panel blit so this control is invisible on screen. It touches
-/// only M3's arena buffers, and it is called after every `[v3d55]`/`[v3d56]` bin readback has been taken.
+/// only M3's arena buffers (`0x0`/`0x8000`/`0x9000`, disjoint from the pool at `0x12000`, the tile-state
+/// array at `0x11000` and the probe scratch at `0x34C00`).
+///
+/// **It must be called LAST in `probe_job`**, after `[v3d41]`, the `[v3d28]` MMU-fault read and the
+/// V3D-28 post-bin L2T drain — not merely after the `[v3d55]`/`[v3d56]` readbacks. A CT1 job retires a
+/// render frame (inflating an RFC delta measured against a pre-GO snapshot), can raise its own MMU
+/// fault, and puts L2T traffic between bin idle and the TMU drain. The memory regions are disjoint, so
+/// the contamination is register/cache state only — which ordering alone fixes.
 fn v3d58_rerender_control(what: &str) {
     if !V3D58_RERENDER_CONTROL {
         return;
@@ -4223,7 +4243,7 @@ fn v3d58_rerender_control(what: &str) {
         if after_ok {
             "the RENDER engine STILL works after the bin wedge — the wedge is CONFINED to CT0/PTB and leaves the CLE, MMU, L2T and store path healthy. Every post-bin readback this file takes is therefore being taken on a sound block, and the remaining surface really is the bin frame-close unit alone"
         } else {
-            "the RENDER engine has STOPPED WORKING since the bin kick — the bin wedge has a BLAST RADIUS beyond CT0. Shared state (CLE, pipeline, L2T or MMU) is left broken by the failed bin frame, which means every post-bin readback in this file — [v3d55] tilestate/pool, [v3d56] poison/landing — was taken on a block already in a bad state, and their 'the PTB wrote nothing' readings must be re-examined under that light"
+            "the RENDER engine has STOPPED WORKING since the M3 baseline. TWO readings fit and this line does NOT choose between them: (a) the BIN WEDGE has a blast radius beyond CT0, leaving shared state (CLE, pipeline, L2T or MMU) broken — in which case every bin readback in this file ([v3d55] tilestate/pool, [v3d56] poison/landing, [v3d41], [v3d28]) was taken on a block already in a bad state and must be re-examined; or (b) something OTHER than the bin frame between M3 and here broke CT1 — bin_prejob_bpos_clear, pctr_setup_cs_witness (which re-arms the PCTR block), the v3d55 clock/MISCCFG audit with its two mailbox round-trips, the L2T/SLC flushes, or the whole-arena cache invalidate. Bisect by re-running this control at each of those points before attributing the failure to the bin"
         }
     );
 }
@@ -4681,9 +4701,12 @@ fn probe_job() {
     // on the same block with the same MMU table, L2T config, clock and arena consumes its list and writes
     // nothing. That refutes every global-write-failure hypothesis by demonstration.
     v3d58_xengine("v3d40 PROBE post-bin", fldone_retired, bin_wrote_any);
-    // `rerender` then asks whether the block is STILL healthy after the wedge — the control that decides
-    // whether the readbacks above were taken on a sound block or inside a blast radius.
-    v3d58_rerender_control("v3d40 PROBE post-bin");
+    // NOTE: the `[v3d58] rerender` control does NOT belong here. It runs a full CT1 job, and everything
+    // below still reads bin state: `ptb_frame_witness` diffs RFC against an `rfc_pre` latched before the
+    // CT0 GO (a control render would inflate that delta), the MMU fault latch read below feeds the
+    // `[v3d28]` verdict (a fault from the control job's store would be attributed to the bin), and the
+    // V3D-28 TMU drain wants no intervening L2T traffic between bin idle and its flush. It is called at
+    // the very END of this function instead — see the call after `clear_mmu_fault_latch`.
     // [v3d41] the decisive discriminator: with the pool + tile-state proven zero above and the coord
     // shader proven to have RUN (v3d35), did START_TILE_BINNING actually complete a PTB bin FRAME? BFC's
     // pre→post delta answers "started vs never-started"; BPCA (the PTB write pointer vs the pool base)
@@ -4772,6 +4795,13 @@ fn probe_job() {
     // Leave the M4 bin registers untouched here — triangle_job reprograms QMA/QMS/QTS/QBA/QEA and
     // re-arms the PCTR counters for the real bin below.
     clear_mmu_fault_latch("v3d28 post-probe");
+    // ── [v3d58] the post-bin render control — LAST, after every bin readback in this function ────────
+    // Placed here and nowhere earlier: it kicks a real CT1 job, so it must not run before `[v3d41]`
+    // (whose RFC delta is measured against a pre-GO snapshot), before the MMU fault read that feeds
+    // `[v3d28]`, or before the V3D-28 post-bin L2T drain. Every bin-state readback in `probe_job` —
+    // `[v3d54]`, `[v3d55]`, `[v3d56]`, `[v3d41]`, `[v3d34]` and `[v3d28]` — is now complete and captured
+    // before this control perturbs a single register.
+    v3d58_rerender_control("v3d40 PROBE post-bin");
 }
 
 /// PI-V3D-48 — build the NULL coord-shader record at OFF_BISECT_NULL_SHADREC. Structurally identical to

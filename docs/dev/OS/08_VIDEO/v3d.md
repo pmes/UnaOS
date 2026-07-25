@@ -1704,10 +1704,18 @@ and GMP-blocked stores — without a single new register read.
 ### R2 — "the PTB never starts" is refuted *as stated*; `BPCS` is the witness
 
 `[v3d55] pool` reports `BPCS=0x00005000` against a pool of `0x8000` bytes, exactly complementing the
-`0x3000` `BPCA` advance. `BPCS` is the PTB's **remaining-bytes** register (§30, VC4/v42 ARG: "Remaining
-Size Of Binning Memory Pool"). A pool the PTB never entered would still read the `0x8000` we latched into
-`CT0QMS`. The PTB therefore *did* act: it performed the per-tile initial-block reservation and the two
-up-front 4 KiB chunk allocations `v3d_tile_alloc_sizes` describes.
+`0x3000` `BPCA` advance.
+
+The reading rests on `BPCS` being the PTB's **remaining-bytes** register. That is *inferred*, not
+established: §30 takes it from the VideoCore IV ARG's "Remaining Size Of Binning Memory Pool" for the
+VC4-era register at the same offset, carried forward to v42 on the `BPOA`/`BPOS` analogy, and mainline
+`v3d_regs.h` is comment-free on the point. **On that reading** a pool the PTB never entered would still
+read the `0x8000` we latched into `CT0QMS`, so the PTB *did* act — per-tile initial-block reservation
+plus the two up-front 4 KiB chunk allocations `v3d_tile_alloc_sizes` describes.
+
+The inference is exactly as strong as the register-semantics assumption under it, which is why R2 gets a
+falsifying probe (RANK 1's drop-station test) rather than a verdict — and why the matrix below carries an
+arm in which **R2 is wrong**.
 
 The surviving statement is narrower than either horn of the arc brief's fork:
 
@@ -1730,7 +1738,17 @@ Five stations now bracket the CT0 kick, each sampling `PCS`/`BPCA`/`BPCS`/`BFC`/
 | **S3** | the instant after the `CT0QEA` GO write |
 | **S4** | at `wait_fldone` exit, before any cache maintenance |
 
-S0 is the load-bearing one. The probe is the **first CT0 bin kick of the boot** (M3 kicks CT1 only), so
+Two reading rules the verdict logic enforces, because both are easy to get wrong:
+
+* **S0's `BPCS` is excluded from the drop scan.** Nothing has been latched into `CT0QMS` at S0, so the
+  value there is the block's reset/stale content and is not comparable to the pool size. Counting it
+  would let any small leftover score as a drop and fire the "latch artifact" verdict for a write that had
+  not happened. S0's `BPCS` is printed with an explicit *carries no verdict* tag instead.
+* **A drop to exactly zero counts.** `BPCS→0` is *full* pool consumption — the strongest possible "the
+  PTB acted" reading — so the test is "below the latched size, zero included", and a zero drop is called
+  out on the line.
+
+S0 is the load-bearing station. The probe is the **first CT0 bin kick of the boot** (M3 kicks CT1 only), so
 `BMACTIVE` reading `1` at S0 means the block left the reset cycle — or the preceding CT1 render frame —
 with a **bin frame still open**, and every `START_TILE_BINNING` since has been stacking onto a frame
 nobody closed. That single reading would explain the entire campaign: the list walks, the pool reserves,
@@ -1743,15 +1761,25 @@ and the `FLUSH` never closes a frame it did not open.
 | `[v3d58] station` | `BMACTIVE=1` at **S0** | A bin frame was left open by the reset path or by M3's render frame. The defect is **upstream of everything V3D-40..57 audited** — a bring-up/frame-abort gap, not a packet, register-order or sizing gap. |
 | `[v3d58] station` | `BMACTIVE=0` at S0 **and** at S4 | The frame never opened. `START_TILE_BINNING` did not put the pipeline into binning mode, so the missing `FLDONE` is a **consequence, not the defect** — chase what gates `BMACTIVE`. |
 | `[v3d58] station` | `BMACTIVE` sets at S3/S4, `BPCS` first drops at S3/S4 | `START_TILE_BINNING` genuinely executed; **R2 stands**. The remaining surface is the bin FLUSH/frame-close step alone. |
-| `[v3d58] station` | `BPCS` already dropped at **S0/S1** | The `0x3000` advance is a **register-latch artifact** of the `CT0QMA`/`QMS` write, not the PTB acting. **R2 is wrong** and "the binner never started" returns to the table. |
+| `[v3d58] station` | `BPCS` dropped below the latched size at **S1** | The `0x3000` advance is a **register-latch artifact** of the `CT0QMA`/`QMS`/`QTS` write — it happened before `CT0QBA` and before the GO. **R2 is wrong** and "the binner never started" returns to the table. |
+| `[v3d58] station` | `BPCS` dropped at **S2** (post-`QBA`, pre-GO) | Neither a latch artifact nor `START_TILE_BINNING`: the queue-begin write is moving PTB state, which no model of this block predicts. A new fact — re-read the raw stations. |
 | `[v3d58] xengine` | render verified + bin neither retired nor wrote | **Asymmetry confirmed** — the global-write-failure family is refuted by demonstration. Bin-path-exclusive. |
 | `[v3d58] xengine` | render did **not** verify | **Not** the bin-exclusive asymmetry. A block on which even the proven-good clear job fails is broken upstream; fix M3 before reading any bin verdict. |
-| `[v3d58] rerender` | post-bin clear job **passes** | The wedge is **confined to CT0/PTB**. Every post-bin readback in this file — `[v3d55]` tilestate/pool, `[v3d56]` poison/landing — was taken on a sound block, so their "the PTB wrote nothing" readings stand. |
-| `[v3d58] rerender` | post-bin clear job **fails** | The bin wedge has a **blast radius** beyond CT0: shared state (CLE, pipeline, L2T, MMU) is left broken by the failed frame, and every post-bin readback above was taken inside it. Those readings must be re-examined. |
+| `[v3d58] rerender` | post-bin clear job **passes** | The wedge is **confined to CT0/PTB**. Every bin readback in this file — `[v3d54]` submit/trace, `[v3d55]` tilestate/pool/mmucfg, `[v3d56]` poison/landing/int, `[v3d41]`, `[v3d34]` and `[v3d28]`, all of which now complete *before* this control runs — was taken on a sound block, so their "the PTB wrote nothing" readings stand. |
+| `[v3d58] rerender` | post-bin clear job **fails** | CT1 has broken since the M3 baseline, and the line does **not** choose between two readings: **(a)** the bin wedge has a **blast radius** beyond CT0, leaving shared state (CLE, pipeline, L2T, MMU) broken — in which case every readback in the row above was taken inside it; or **(b)** something *other* than the bin frame between M3 and here broke it — `bin_prejob_bpos_clear`, `pctr_setup_cs_witness` (which re-arms the PCTR block), the `[v3d55]` clock audit and its two mailbox round-trips, the L2T/SLC flushes, or the whole-arena cache invalidate. Bisect by moving the control earlier before blaming the bin. |
 
 `[v3d58] rerender` is the negative control the campaign never ran, and it costs one re-run of an
-already-verified job. It is called with `clear_job(None)` so the panel is not repainted, and it runs
-*after* every bin readback has been taken.
+already-verified job. It is called with `clear_job(None)` so the panel is not repainted.
+
+**Placement is load-bearing.** It runs a real CT1 job, so it is called at the very **end** of
+`probe_job` — after `[v3d54]`, `[v3d55]`, `[v3d56]`, `[v3d41]`, `[v3d34]` *and* `[v3d28]`. Anywhere
+earlier it would corrupt the post-mortem it exists to validate: `ptb_frame_witness` diffs `RFC` against a
+snapshot latched **before** the CT0 GO, so a retired control frame would print Δ1 on a boot where the bin
+did nothing; the MMU fault latch feeding `[v3d28]` would attribute a fault from the control job's store
+to the bin; and the V3D-28 post-bin L2T drain would have a whole CT1 job's cache traffic between bin idle
+and the flush. The *memory* regions are disjoint (M3's buffers at `0x0`/`0x8000`/`0x9000` versus the pool
+at `0x12000`, tile-state at `0x11000`, probe scratch at `0x34C00`, with the `[v3d56]` arena digest taken
+earlier still), so ordering alone is sufficient — the contamination was register and cache state only.
 
 ### What is deliberately NOT armed
 
@@ -1771,7 +1799,9 @@ is a next-arc decision taken against a corroborated bit position.
 ::   [v3d58] S<n> <station> — PCS=0x……… (BMACTIVE=<0|1> BMBUSY=<0|1> RMACTIVE=<0|1> RMBUSY=<0|1>
         BMOOM=<0|1>) BPCA=0x……… BPCS=0x……… BFC=0x……… CT0CS=0x……… CT0CA=0x……… ::
 :: V3D: [v3d58] station (<tag>) — pool base=0x……… size=0x… (as latched into CT0QMA/CT0QMS)
-        | BMACTIVE S0..S4 = <00000..11111> | BPCS 0x…->0x… first-drop-station=<n|-1>
+        | BMACTIVE S0..S4 = <00000..11111>
+        | BPCS S0=0x… (PRE-LATCH: reset/stale, below-size=<0|1> carries NO verdict) S1=0x… -> S4=0x…
+        | first-drop-station=<n|-1> (S1..S4 only[, dropped to ZERO = FULL pool consumption])
         | BPCA advance at S4 = 0x… | BFC 0x………->0x……… (Δ<n>) — <verdict> ::
 :: V3D: [v3d58] rerender (<tag>) — M3 clear job re-run AFTER the wedged bin: pre-bin=<0|1>
         post-bin=<0|1> (CT1, panel blit suppressed) — <verdict> ::
