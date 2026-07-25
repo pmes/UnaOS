@@ -36,6 +36,10 @@ pub mod screen;
 // WC-A: the window table + compositor. Owns which pixels of which surface reach the panel; the
 // aarch64 window syscalls (WC-B) are thin fail-closed wrappers over its API.
 pub mod wm;
+// CURSOR-1: the system cursor sprite, drawn into the FRONT framebuffer as the last painter of a
+// pass (save-under, not a recomposite) so it sits on top of both the console and every window.
+// Pointer position + auto-hide state stay in `pal::cursor`; this module only paints.
+pub mod cursor;
 // VWIT: headless regression witness for the damage-tracked `Screen` present path (arch-neutral;
 // runs only when the `tste` self-test is invoked). See `docs/dev/OS/08_VIDEO/engine.md` §7.
 pub mod witness;

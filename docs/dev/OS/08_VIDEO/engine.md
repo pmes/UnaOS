@@ -942,3 +942,79 @@ baseline run at the same geometry is what established fact 3 above (identical `[
 metal). **The fix's effect is not observable in QEMU** — the collision is a race between the render task
 and the presenting task, and the gate's screenshot samples one instant — so bench verification at the next
 Pi 4 boot is what confirms it, with the `[wc-e]` line as the standing geometry check on the same wire.
+
+### CURSOR-1 — the system cursor
+
+The Pi 4 mouse pipeline reached the shell in PIUSB-39 / UVUG-10 (reports decoded, routed, `drop=0`,
+click-to-exit working on metal) with **no cursor on the panel**: the operator was pointing blind. The
+sprite code existed — `pal::cursor` has owned an arrow, a hot spot and an auto-hide clock since
+CURSOR-HIDE — but it draws through a `GneissPal`, i.e. into whatever surface the caller owns, and on the
+windowed desktop that surface is the render task's `Screen` **back buffer**. `wm::composite` blits windows
+straight into the front framebuffer, so a back-buffer sprite is on top of the console only, until the next
+present. `video/cursor.rs` draws where "on top" is structural instead: into the front framebuffer, as the
+last painter of every pass.
+
+**The split of duties is the point.** `pal::cursor` remains the pointer's STATE — position (`move_rel` /
+`set_abs`, fed from the same `pal::EVENT_QUEUE` drain the `[uvug10]` counters watch, clamped to the panel)
+and visibility (`visible()`: some report has ever arrived, and the last one is younger than the ~1.5 s
+auto-hide). `video::cursor` is only a painter, and reads both. `click1_dispatch`'s hit test keeps reading
+`pal::cursor::pos`, so the click and the drawn arrow can never disagree about where the pointer is.
+
+**Three calls, and everyone who paints uses them.** `undraw()` restores the pixels under the sprite and
+forgets them; `repaint()` is `undraw()` then save-under-and-draw; `armed()` is the witness latch. The
+callers are exactly the front-framebuffer painters:
+
+| painter | bracket |
+|---|---|
+| `wm::composite` | `undraw()` before the table lock, `repaint()` after the last `draw_window`/`verify_window` — the pass body is a private `composite_inner`, so every early return keeps the ordering |
+| `wm::erase` (desktop repaint on close) | `undraw()` first; the `composite()` each caller runs next redraws |
+| `render_service` (Pi) | `undraw()` / `repaint()` around `pal.render()` (`Screen::flush` overwrites the front buffer's damaged rects); `repaint()` on each real pointer report; `undraw()` on the auto-hide edge |
+
+**Damage: save-under, sized by the metrics.** The sprite is 8×8 blocks at `Metrics::scale`, i.e. exactly
+one glyph cell (`cell_w`×`cell_h` — the derivation `ui.rs` already states for the text cursor), plus one
+block of drop shadow: 36 px square at the 4× cap and nothing named in pixels anywhere (THE METRICS RULE).
+Its box is saved with `FrameBuffer::read_pixel` before drawing and written back on `undraw`, and only its
+scanlines are cleaned for the non-coherent HVS. The alternative — marking the box damaged and driving a
+desktop+window recomposite — would run a composite pass at HID report rate (~125 Hz) to move an arrow three
+pixels. Pointer motion therefore does **not** set the render loop's `dirty` flag at all: the sprite bypasses
+the `Screen` and its flush entirely, which also removes the pre-CURSOR-1 erase-to-`0x1E1E1E` (neither the
+desktop colour nor on top of a window).
+
+A panel whose format has no colour inverse (`read_pixel` returns `None` — the lossy `U8` layout) **disables
+the cursor for the boot** with a one-line reason, rather than restoring pixels it could not read. Fail-closed:
+no cursor beats a trail of wrong pixels across the desktop.
+
+**The one race, stated.** The front framebuffer has no single owner. If another core paints into the sprite's
+box between the draw and the `undraw`, the restore puts back pixels that are no longer current — a stale patch
+at most one cell across, repaired by that painter's next pass. This is the same non-exclusive-framebuffer
+caveat WC-D records for its verify rect, and the reason `undraw` is called by the painters rather than by a
+timer.
+
+**Why no checksum or witness moves — two independent reasons.** *Ordering:* no verified pixel is ever read
+with the sprite on the panel (`composite` puts it back only after the last `verify_window` returns), and
+`[wc-c]`'s checksum hashes the SOURCE surface, which this module never touches. *Arming:* the sprite is drawn
+only while `pal::cursor::visible()`, which requires a real pointer report — QEMU raspi4b delivers no HID
+pointer input, so on the gate this code writes zero pixels and prints nothing for the whole boot. The
+`kernel8-test` capture and every `[wc-c]` / `[wc-d]` / UVUG checksum are therefore unchanged by construction,
+which is what the gate below confirms.
+
+Witness, printed once, at the first draw of the boot (input-driven, so quiet boot is preserved):
+
+```
+[cursor] armed x=320 y=240
+```
+
+#### CURSOR-1 gate results (2026-07-25, QEMU raspi4b)
+
+`./arroyo check` green both arches · `kernel8` builds · `kernel8-test 120` MBENCH **50/50 required,
+0 forbidden**, with every pre-existing checksum and witness byte-identical (the arc adds no spec directive:
+`[cursor] armed` cannot fire without a pointer device, and a REQUIRE for it would be a line the gate can
+never satisfy) · `test-arm` green.
+
+The **evidence that the cursor is inert on the gate** is the strongest form available off-metal: the
+`target/pi-screen.png` capture is sha256
+`2686a884320dbc389d6c33b1f37b097fa15eba769b51a751449e2c91a986bc19` — bit-identical to the WC-C baseline —
+and `[wc-c] win=… cksum=`, `[wc-d] verify … -> PASS`, `:: UVUG: frames=300 … checksum=0xe68285b85121ac7c ::`
+and the compat `mapped=32x32 … checksum=0x8d99530ca96d4b25` are unchanged. Not one `[cursor]` line appears.
+What QEMU therefore cannot exercise is the sprite itself: the first draw, the save-under restore and the
+`[cursor] armed` line are **unverified until the next bench boot**, exactly as WC-D's `bad_ram` column is.

@@ -2957,19 +2957,25 @@ fn render_service(_: usize) {
                 dirty = true;
                 strip_dirty = true;
             }
+            // CURSOR-1: pointer motion moves the SHARED pointer state (`pal::cursor`, which
+            // `click1_dispatch` and the compositor both read) and repaints the system cursor into
+            // the FRONT framebuffer via `video::cursor` — save-under, one glyph cell, on top of the
+            // console and every window. It deliberately does NOT set `dirty`: the sprite bypasses
+            // the `Screen` back buffer entirely, so a pointer report costs a save + a few small
+            // fills over one cell, not a `Screen::flush` of the sprite's damage box. The pre-CURSOR-1
+            // code drew into the back buffer and erased with a hard-coded 0x1E1E1E, which is neither
+            // the desktop colour nor on top of a window.
             unaos_kernel::pal::Event::Mouse { x, y } => {
                 // Relative motion (boot-mouse proto). A null report (no delta) is the idle-mouse
                 // keep-alive — draw nothing, do not present.
                 if x != 0 || y != 0 {
-                    unaos_kernel::pal::cursor::erase(&mut pal, 0x001E1E1E);
                     unaos_kernel::pal::cursor::move_rel(
                         x,
                         y,
                         pal.width() as i32,
                         pal.height() as i32,
                     );
-                    unaos_kernel::pal::cursor::draw(&mut pal);
-                    dirty = true;
+                    unaos_kernel::video::cursor::repaint();
                 }
             }
             unaos_kernel::pal::Event::MouseAbsolute { x, y } => {
@@ -2977,10 +2983,8 @@ fn render_service(_: usize) {
                 // is an idle keep-alive — skip it (no motion, no repaint).
                 if last_abs != Some((x, y)) {
                     last_abs = Some((x, y));
-                    unaos_kernel::pal::cursor::erase(&mut pal, 0x001E1E1E);
                     unaos_kernel::pal::cursor::set_abs(x, y, pal.width() as i32, pal.height() as i32);
-                    unaos_kernel::pal::cursor::draw(&mut pal);
-                    dirty = true;
+                    unaos_kernel::video::cursor::repaint();
                 }
             }
             // GUI-CLICK-1: a Button report carries no cursor motion — dispatch it against the shared
@@ -3000,12 +3004,13 @@ fn render_service(_: usize) {
             }
             _ => {}
         }
-        // CURSOR-HIDE: erase the sprite once when the auto-hide delay expires (reappearance is instant
-        // — the move_rel/set_abs arms above stamp the activity clock before drawing).
+        // CURSOR-HIDE: take the sprite off the panel once when the auto-hide delay expires
+        // (reappearance is instant — the move_rel/set_abs arms above stamp the activity clock before
+        // drawing). CURSOR-1: `undraw` restores exactly the pixels the sprite covered, so the hide
+        // needs no present of its own — hence no `dirty`.
         let cursor_vis = unaos_kernel::pal::cursor::visible();
         if cursor_was_visible && !cursor_vis {
-            unaos_kernel::pal::cursor::erase(&mut pal, 0x001E1E1E);
-            dirty = true;
+            unaos_kernel::video::cursor::undraw();
         }
         cursor_was_visible = cursor_vis;
         // Recompose the strip only when it can have changed (Timer) or was overdrawn (Key/Button).
@@ -3016,7 +3021,13 @@ fn render_service(_: usize) {
         // Present at most once per pass, and only when something was actually drawn — a no-op report
         // costs a bounded match + a couple of cycle reads, not a composite.
         if dirty {
+            // CURSOR-1: `Screen::flush` copies back-buffer pixels over the front framebuffer's
+            // damaged rects, which would both clobber the sprite and invalidate its save-under. Take
+            // it off first, present, put it back on top — the render task's own ordering, matching
+            // the bracket `wm::composite` applies on the window side.
+            unaos_kernel::video::cursor::undraw();
             pal.render();
+            unaos_kernel::video::cursor::repaint();
             s6_composites += 1;
         }
         s6_cyc += unaos_kernel::arch::now_cycles().wrapping_sub(t0);

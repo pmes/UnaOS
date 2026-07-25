@@ -468,6 +468,12 @@ pub const DESKTOP_BG: u32 = 0x002D_2B55;
 /// area a closed window vacated. Windows that overlapped it are repainted by the [`composite`] that
 /// follows (closing damages the whole live set through [`place`]).
 fn erase(boxes: &[(usize, usize, usize, usize)]) {
+    // CURSOR-1: take the sprite off the panel before repainting desktop under it. Without this the
+    // fills below would overwrite the sprite, and the save-under would later restore pre-erase
+    // pixels over freshly-painted desktop — a stale patch the following composite would not repaint
+    // (composite repaints windows, not the desktop). The `composite()` that every erase caller runs
+    // next puts the sprite back.
+    super::cursor::undraw();
     let fb = *super::WRITER.lock();
     // Guard intentionally dropped here: this function never takes the table lock, so it cannot
     // participate in a WRITER/TABLE cycle.
@@ -626,7 +632,27 @@ pub fn count() -> usize {
 /// The table lock is taken only to snapshot the rows and clear their damage flags; every framebuffer
 /// write and cache clean happens after it is released, so a present never holds the window lock
 /// across a scan-out flush.
+/// CURSOR-1 — the composite pass, bracketed by the system cursor.
+///
+/// The sprite is taken OFF the panel before any window pixel is drawn or read, and put back only
+/// after the last `draw_window` / `verify_window` has returned. That ordering is what makes the
+/// cursor free of consequences for the witnesses: `[wc-d]`'s scan-out read-back never sees a sprite
+/// pixel in a window's rect, and `[wc-c]`'s checksum reads the source surface, which the cursor
+/// never touches. (The second, independent guarantee is that the sprite is drawn only after a real
+/// pointer report — see `video::cursor`.)
+///
+/// Wrapping rather than inlining the pair keeps the ordering true through every early return in the
+/// pass body (the drain barrier, a framebuffer that is not ready): there is no path that can paint
+/// or verify with the sprite still on the panel, and none that returns having left it off.
 pub fn composite() {
+    super::cursor::undraw();
+    composite_inner();
+    super::cursor::repaint();
+}
+
+/// The composite pass proper. Private so the cursor bracket above cannot be bypassed — every caller
+/// (including this module's own teardown paths) goes through [`composite`].
+fn composite_inner() {
     // F4 — the drain barrier. Register this composite as in-flight WHILE STILL HOLDING the table
     // lock, so the registration is ordered against any teardown that takes the lock afterwards: a
     // `close_owner` that clears rows can then tell whether some other core snapshotted those rows
