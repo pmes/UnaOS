@@ -29,9 +29,16 @@ mailbox is the proof, not the poll.)
 **Display — full-panel framebuffer draw, `cover=exact`.** base=00020000
 pitch=16384 rows=1800 bytes=01C20000, ours == gop exactly; hold ladder and
 reg-dumps clean; ptr now reads 00000200 (the GOP base, by design),
-armed=shadow=00000200, head 0 VERT live, h1–h3 dead. Peter's full-panel
-photo is the panel record. UnaOS owns the rMBP panel through the GOP
-framebuffer: linear, 16384 B/row, at VRAM 0x20000.
+armed=shadow=00000200, head 0 VERT live, h1–h3 dead. UnaOS owns the rMBP
+panel through the GOP framebuffer: linear, 16384 B/row, at VRAM 0x20000.
+**PHOTO (Peter): edge to edge, everything predicted, nothing missing** —
+white fiducial bars flush against the very top and very bottom of the
+panel, the 7-bit barcode column counting monotonically 0→112 down the
+left edge, the diagonal running unbroken corner to corner, and the 16-row
+colour bands filling the full 2880 px width. No shear, no wrap, no seam,
+no clipped edge. Thirteen sittings after the first green pixel, the
+display lane's question is closed: **we can put any image we want on that
+screen.**
 
 Next: fence pull 27 attacks the fence wall with the new capability — a
 bounded heartbeat ucode that keeps FECS RUNNING across the witness
