@@ -3,6 +3,80 @@
 Hard-won silicon facts from the fox-metal sitting series. Trust these over any
 QEMU behavior. Newest sitting first.
 
+## Sitting #28 (display pull 18 + fence pull 25, UnaOS-gemini@754cca75/833ff9f0 + GR4 land-review, 2026-07-25, fox-metal-r23s1m, s28boot1)
+
+**Display — ⭐⭐ THE CONFOUND IS NAMED: WE HAVE BEEN PAINTING THE
+FIRMWARE'S FRAMEBUFFER, NOT LATCHING OUR OWN.** The overlap detector added
+at land-review fired on its first boot:
+`gop-overlap=YES-RESULT-VOID surf2=01600000+01C20000 gop=00020000+01C20000`.
+The GOP framebuffer is VRAM 0x20000 … 0x1C40000 — 1800 rows × 16384 B,
+i.e. **the firmware FB has exactly the geometry we "discovered" in s25**.
+Our scratch surface at 0x1600000 sits INSIDE it, 0x15E0000 bytes in =
+**GOP row 1400**. The model this forces, with no free parameters:
+- our row r appears at panel row 1400 + r; only r = 0…399 land on screen,
+  in the bottom 22% of the panel (starting 77.8% down);
+- so s27 must show ONLY the row 0–7 white stripe, with 448/896/1344/1792
+  all off the end. **That is exactly what s27 photographed.**
+It also retro-explains s18 ("early rows → bottom band"), the entire
+block-linear seam campaign (we were writing swizzled bytes into a linear
+FB the firmware was already scanning), and why s26 "solved" the mapping
+the moment we switched to linear/16384 — we had matched the GOP's own
+layout, not discovered the hardware's.
+**Therefore: the latch (0x640460 + 0x640080) has NEVER been proven to do
+anything, and s17 "first pixels" is now in question.** Pull 19 settles it
+in one boot: relocate the scratch surface clear of the GOP window
+(0x4000000; BAR1 visible = 256 MB, VRAM 512 MB, allocator hands out from
+32 MB, so 64 MB + 29.6 MB is clear of both) and re-run. Pattern on panel
+⇒ the latch is real. Console unchanged ⇒ every panel result since s17 was
+direct FB painting — which is itself a working framebuffer path worth
+keeping, just not the one we thought we had.
+**PHOTO CONFIRMS THE MODEL QUANTITATIVELY** (Peter, s28boot1 — "the only
+visible thing to photograph"): the band/barcode/diagonal pattern occupies
+the bottom ~22% of the panel, starting ~77–78% down. Predicted: 77.8%.
+Counted bands ≈ 25 = 400 visible rows / 16 rows per band. Predicted: rows
+0–399 visible, 25 bands. The diagonal ramp is present, straight, and
+TRUNCATED: it runs from the band region's top-left and stops at ≈19% of
+the image width at the bottom edge — the fill puts diag_x at 176 + r·2560/1800,
+so r=399 → x=744 of 2880 = 25.8% of the visible width, and 744 px measured
+into a 2880-px row that is itself inset in the photo lands exactly where
+the photo shows it. A straight, unscaled, unwrapped diagonal is a direct
+measurement: **the row map is 1:1 with no vertical scaling** — hypotheses
+(a) scaling and (b) short scan window are both refuted; the geometry is
+purely the 1400-row base offset that the GOP overlap predicts.
+Supporting reads this boot: armed=shadow=00000200 (unchanged by our
+write), head 0 VERT advancing 0684051D→06BA04A3 across the hold (h1–h3
+dead), ptr readback 00016000 stable at t=1 and t=5, storage/size/format
+cluster identical to s25.
+**OPEN (one question, settled by pull 19):** whether this pattern was
+already on the panel during the PRE-LATCH hold. If yes, the latch is
+proven irrelevant outright. Either way pull 19's relocation decides it,
+and if the relocated surface goes dark while the GOP-resident one paints,
+then UnaOS already has a working framebuffer on this machine — write
+linear at pitch 16384 into the GOP FB at VRAM 0x20000 — which is the
+capability the whole display lane was chasing, reached by a different
+door than the EVO latch.
+
+**Fence — upload and page-usability PROVEN; the core still refuses to
+run, and the blocker is now named.** Both images verified byte-exact
+(A: 100017F1…, B: 004017F1…), `tlb page0=01000000` = **usable** (the
+land-review page-pad worked), yet `cpuctl 00000010 → 00000012` and
+mailbox0 never left the A5A50000 seed, halt-iters=0, zero SENTINEL in the
+128-row post-sweep. Reading CPUCTL as rnndb does (bit1 START_TRIGGER,
+bit4 STOPPED): **the start trigger latched and the core stayed stopped.**
+The post-sweep we already had names the cause: **DMACTL (base+0x10C) =
+0x00000001 — REQUIRE_CTX is SET**, so the Falcon demands a bound context
+before it will run; scrub bits (1,2) are clear, consistent with our
+successful IMEM writes. CPUCTL bit 6 is clear, so writing 0x100 directly
+(not the GM107+ alias at 0x130) was correct. Pull 26 = clear DMACTL bit 0
+(one write, mask-clear, pre/post printed) and re-run image A unchanged.
+Nouveau clears exactly this bit in its no-context falcon path.
+Other post-sweep facts logged for the arc: IDLESTATE(0x108)=20402050,
+0x12C=00081103, IMEMC(0x180)=02000014, DMEMC(0x1C0)=02000010.
+
+Capture from byte 1203639 (mark s28boot1), full early boot present in the
+ring — the s28 mirror-hdr gating held. ESP built by coordinator
+(sha b9c3e60c…), Fox flashed only.
+
 ## Sitting #27 (display pull 17 + fence pull 24, UnaOS-gemini@b9f3d9bf/f2dbb032, 2026-07-25, fox-metal-r23s1m, s27boot1)
 
 **Fence — ⭐ UCODE UPLOAD PATH PROVEN, BOTH FALCONS.** All sixteen

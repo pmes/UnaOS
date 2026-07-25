@@ -6,7 +6,8 @@ Three pull sequences, numbered independently. Every pull = one BRIEF (coordinato
 ## Lane 1: Kepler FENCE (PFIFO/scheduler — kepler.rs) — `video/Kepler/`, files `*kepler-fence-pull<N>*` (pulls ≤13: `*kepler-pull<N>*`)
 | Pull | Files | Status | One-liner |
 |---|---|---|---|
-| 25 | BRIEF-kepler-fence-pull25-first-ucode | LANDED (754cca75 + GR4 IO-port/page-pad fix) — metal owed s28 | K-GPU-4 m2: first from-scratch ucode — magic to MAILBOX0 + EXIT, FECS only, full citations required |
+| 26 | BRIEF-kepler-fence-pull26-dmactl-require-ctx | BRIEFED — awaiting proposal | clear DMACTL bit0 REQUIRE_CTX (one write) then re-run image A — the named blocker |
+| 25 | BRIEF-kepler-fence-pull25-first-ucode | LANDED; s28: upload+page PROVEN (tlb usable, verify exact) but core stays STOPPED (cpuctl 10→12); DMACTL REQUIRE_CTX=1 named | K-GPU-4 m2: first from-scratch ucode — magic to MAILBOX0 + EXIT, FECS only, full citations required |
 | 24 | BRIEF-kepler-fence-pull24-falcon-port-probe-real-base | LANDED; s27: ⭐ **UPLOAD PATH PROVEN** — 16/16 sentinels back, both falcons, imem+dmem | sentinel probe at REAL bases (FECS/GPCCS), AINCW/AINCR discipline, zero execution |
 | 23 | BRIEF-kepler-fence-pull23-falcon-base-recon | LANDED; s26: ⭐ **FALCONS FOUND** — FECS 0x409000 + GPCCS 0x41A000 real (cpuctl=10 both) | read-only recon of 0x409000 (FECS) + 0x41A000 (GPCCS) — find the real Falcon |
 | 22 | BRIEF-kepler-fence-pull22-pgraph-reset-pulse | LANDED; s25: pulse clean, ports STILL dead — BADF1000 = nonexistent-reg signature; spec base wrong? | PMC bit-12 reset PULSE (off→settle→on) then identical port probe — reset-then-enable, not enable-alone |
@@ -30,7 +31,8 @@ Three pull sequences, numbered independently. Every pull = one BRIEF (coordinato
 ## Lane 2: Kepler DISPLAY (scanout — kepler_display.rs after split) — `video/Kepler/`, files `*kepler-display-pull<N>*`
 | Pull | Files | Status | One-liner |
 |---|---|---|---|
-| 18 | BRIEF-kepler-display-pull18-placement-model | LANDED (833ff9f0 + GR4 gutter/fiducial/control-frame fix) — metal owed s28 | specialist-designed probe discriminating scaling / scan-window / latch-granularity in one photo |
+| 19 | BRIEF-kepler-display-pull19-relocate-decisive | BRIEFED — awaiting proposal | move surf2 to 0x4000000 clear of the GOP FB — decides whether the EVO latch has ever worked |
+| 18 | BRIEF-kepler-display-pull18-placement-model | LANDED; s28: ⭐⭐ **GOP OVERLAP FOUND** — surf2 sits 1400 rows inside the fw framebuffer; photo matches the direct-paint model to the pixel (1:1, no scaling) | specialist-designed probe discriminating scaling / scan-window / latch-granularity in one photo |
 | 17 | BRIEF-kepler-display-pull17-row-offset | LANDED; s27: only WHITE visible ~2/3 down — **INCONCLUSIVE** (indistinguishable from fw console; my "impossible" arithmetic was wrong) | marker-row calibration — measure the scan-start row offset; the LAST display variable |
 | 16 | BRIEF-kepler-display-pull16-linear-16k | LANDED; s26: ⭐⭐ **MAPPING SOLVED** — seam-free, solid white column (linear pitch 0x4000 confirmed on panel) | ONE linear fill, pitch 16384 — seam-free = MAPPING SOLVED |
 | 15 | BRIEF-kepler-display-pull15-mirror-surface-params | LANDED; s25: ⭐ **FW SURFACE IS LINEAR pitch=0x4000** (storage 01004000, size 07080B40) — block-linear road retired | STOP GUESSING: read-only decode of 0x640400–0x6405FC — fw's own pitch/block-mode/size |
