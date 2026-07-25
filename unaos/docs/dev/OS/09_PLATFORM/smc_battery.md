@@ -206,3 +206,88 @@ on the vug meter cadence, every second. Now a sweep whose FIRST key comes back S
 rest (one-shot noted line), and consecutive failed sweeps back the refresh interval off 1 s → 32 s
 (reset by any good sweep). Clean-`Absent` sweeps (QEMU) still probe every key — the QEMU witness
 lines are unchanged apart from the additive SMC-DIAG lines.
+
+## IVY — read robustness against the three standing metal caveats (2026-07-25)
+
+Three caveats survived every earlier arc, all metal-observed, none reproducible on QEMU. This arc
+addresses two of them and deliberately leaves the third alone.
+
+### Caveat 1 — `AC-W` is ABSENT on this machine ⇒ derived AC state
+
+The 2012 rMBP's SMC carries **no `AC-W` key**: the read comes back a clean `Absent` (the SMC looked
+it up and said no), not a wedge. So `ac_present` can never resolve there, and the witness printed a
+bare `ac=?` on every line forever — a hole where the most user-visible fact belongs.
+
+AC presence is nonetheless *inferable*, because the `B0AC` amperage is signed and its sign is
+metal-confirmed to flip correctly with the adapter (BATMON M2 sitting):
+
+| `B0AC` (mA) | `AcDerived` | what it means |
+|---|---|---|
+| `> +32` | `charging` | charge flowing INTO the pack ⇒ adapter present and sourcing |
+| `< −32` | `discharging` | pack sourcing the machine ⇒ adapter not carrying the load |
+| within ±32 | `idle` | **ambiguous** — see below |
+| no reading | `unknown` | `B0AC` was a hole this sweep; nothing to infer from |
+
+**The ambiguity is real and is not papered over.** A full pack on the adapter settles at ~0 mA,
+which is indistinguishable *from amperage alone* from a machine resting on battery below the noise
+floor. Both land in `idle`, which asserts nothing about AC presence — `idle` is a refusal to guess,
+not a claim. The ±32 mA deadband exists because the reading dithers by a few mA at rest; without it
+the state would flap between `charging` and `discharging` on sensor noise alone.
+
+The inference **never overrides a direct answer**: `ac_present` (from `AC-W`) remains the truth on
+any machine that carries the key, and the witness only falls back to the derived state when `AC-W`
+did not answer. The serial field is tagged so the two can never be confused:
+
+* `ac=yes` / `ac=no` — direct, from `AC-W`;
+* `ac=derived:charging|discharging|idle` — inferred from the `B0AC` sign (the rMBP's normal case);
+* `ac=?` — neither an `AC-W` answer nor a `B0AC` reading. This should now be rare.
+
+### Caveat 2 — per-read field drop-out ⇒ counted bounded retry
+
+Individual keys intermittently fail a given sweep on the real SMC while their neighbours succeed,
+so a telemetry line can carry holes (`-`) that mean "this read missed", not "this machine lacks the
+key". The numeric keys already re-read on failure (`READ_ATTEMPTS`, each attempt itself bounded by
+the `rdtsc` budget, a clean `Absent` never retried). This arc:
+
+* extends the same bounded retry to the `AC-W` read, which previously got exactly one shot, so a
+  wedged handshake there no longer masquerades as an absent key;
+* **counts** every re-read and reports it, because the caveat was previously invisible in the
+  telemetry — holes were observable, but their *frequency* and how often a retry rescued a read
+  were not. The witness now ends `retries=SWEEP/TOTAL`: re-reads consumed by the sweep that
+  produced this line, and re-reads since boot. A metal sitting can now read drop-out rate directly:
+  `retries=0/0` means the SMC answered first-try throughout; a climbing total with `present=true`
+  means retries are doing their job; a climbing total *with holes* means the budget is undersized.
+
+The retry budget itself is deliberately **unchanged** — this is instrumentation plus one gap-fill,
+not a loosening. Total work per sweep stays bounded and no re-read can become a spin.
+
+### Caveat 3 — the `#KEY` bounded wedge is LEFT EXACTLY AS IS
+
+`#KEY` enumeration wedges at a handshake step on this machine; the driver already bounds it
+(`SMC_WAIT_CYCLES` + `MAX_ENUM_KEYS`) so the wedge is finite and reported, never forced. That bound
+is a protection and this arc does not touch it, relax it, or route around it.
+
+### Witness format (the only line that changed; nothing new is periodic)
+
+```
+:: SMC-BATT: present=true soc=51% volt=11540mV amp=-1820mA full=9962mAh rem=5081mAh ac=derived:discharging retries=0/3 == witness ::
+```
+
+Two additive fields on the existing ~1 s SMC-BATT line: `ac=` gained the `derived:` form, and
+`retries=` is new. No new periodic output was introduced.
+
+### What only metal can verify
+
+QEMU's `isa-applesmc` has **no battery keys at all**, so on QEMU the sweep aborts on the first key
+and the witness line never exercises either change with real data. Specifically, only the 2012 rMBP
+can confirm:
+
+1. `ac=derived:` actually appears (i.e. `AC-W` is still absent and `B0AC` still reads);
+2. the derived state matches physical reality — `discharging` on battery, flipping to `charging`
+   within a sweep or two of plugging the adapter in;
+3. the deadband is correctly sized — a resting machine reads `idle` rather than flapping;
+4. `retries=` is non-trivial, quantifying the drop-out rate for the first time;
+5. holes (`-`) become rarer than the pre-IVY baseline, if the retry is in fact rescuing reads.
+
+The build gates (`arroyo check` both arches, `test`, `test-arm`) prove only that the code compiles
+and that the non-SMC kernel is unregressed.

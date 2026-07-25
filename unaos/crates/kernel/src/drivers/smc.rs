@@ -464,7 +464,82 @@ pub fn scout() {
 /// an honest empty state — never fabricated numbers.
 pub mod battery {
     use super::{read_key, SmcError};
+    use core::sync::atomic::{AtomicU32, Ordering};
     use spin::Mutex;
+
+    /// IVY-AC — charge state *inferred* from the `B0AC` amperage sign, for machines where the
+    /// `AC-W` key is ABSENT (metal fact: the 2012 rMBP has no AC-W, so `ac_present` can never
+    /// resolve there and the witness printed a bare `?` forever).
+    ///
+    /// Inference and its limits, stated plainly:
+    ///   * `B0AC` is a signed mA reading. Metal-confirmed on the 2012 rMBP that the sign flips
+    ///     correctly with the adapter: **negative = discharging** (battery sourcing the machine),
+    ///     **positive = charging** (adapter sourcing charge into the pack).
+    ///   * Therefore `Discharging` implies the adapter is NOT carrying the load; `Charging`
+    ///     implies it IS. That is an inference about the *adapter*, derived from the *battery*.
+    ///   * **Ambiguity around 0 mA.** A pack that is full while the adapter is attached settles at
+    ///     ~0 mA — indistinguishable, from amperage alone, from a machine idling on a battery that
+    ///     happens to be drawing under the noise floor. Both land in `Idle`, which asserts nothing
+    ///     about AC presence. `Idle` is a refusal to guess, not a claim.
+    ///   * The deadband exists because the reading dithers by a few mA at rest; without it the
+    ///     state would flap between charging and discharging on sensor noise.
+    /// This never overrides a real `AC-W` answer — on a machine that carries the key, `ac_present`
+    /// remains the truth and the derived state is only supplementary.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+    pub enum AcDerived {
+        /// No `B0AC` reading this sweep — nothing to infer from.
+        #[default]
+        Unknown,
+        /// `B0AC` positive beyond the deadband: charge flowing INTO the pack ⇒ adapter present.
+        Charging,
+        /// `B0AC` negative beyond the deadband: pack sourcing the machine ⇒ adapter not carrying.
+        Discharging,
+        /// `|B0AC|` within the deadband: full-on-adapter or resting-on-battery — indistinguishable.
+        Idle,
+    }
+
+    impl AcDerived {
+        pub fn as_str(self) -> &'static str {
+            match self {
+                AcDerived::Unknown => "unknown",
+                AcDerived::Charging => "charging",
+                AcDerived::Discharging => "discharging",
+                AcDerived::Idle => "idle",
+            }
+        }
+    }
+
+    /// Deadband (mA) around zero inside which the amperage sign carries no information. Chosen
+    /// above the observed at-rest dither of the 2012 pack and far below any real charge/discharge
+    /// current (which runs hundreds to thousands of mA).
+    const AC_IDLE_DEADBAND_MA: i16 = 32;
+
+    fn derive_ac(amp_ma: Option<i16>) -> AcDerived {
+        match amp_ma {
+            None => AcDerived::Unknown,
+            Some(ma) if ma > AC_IDLE_DEADBAND_MA => AcDerived::Charging,
+            Some(ma) if ma < -AC_IDLE_DEADBAND_MA => AcDerived::Discharging,
+            Some(_) => AcDerived::Idle,
+        }
+    }
+
+    /// IVY-RETRY — re-reads consumed by the sweep currently in flight (reset at sweep start), and
+    /// the cumulative count since boot. Both appear on the SMC-BATT witness as `retries=SWEEP/TOTAL`
+    /// so a metal sitting can read *how often* the per-read drop-out caveat actually bites, rather
+    /// than only seeing the holes it leaves behind. Counted, never acted on: the retry budget itself
+    /// is unchanged and bounded.
+    static RETRIES_SWEEP: AtomicU32 = AtomicU32::new(0);
+    static RETRIES_TOTAL: AtomicU32 = AtomicU32::new(0);
+
+    fn note_retry() {
+        RETRIES_SWEEP.fetch_add(1, Ordering::Relaxed);
+        RETRIES_TOTAL.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `(retries consumed by the last sweep, retries since boot)`.
+    pub fn retry_counts() -> (u32, u32) {
+        (RETRIES_SWEEP.load(Ordering::Relaxed), RETRIES_TOTAL.load(Ordering::Relaxed))
+    }
 
     /// A decoded battery reading. Every field is `Option` — a key the SMC lacks stays `None`
     /// (honest absence), never a placeholder value.
@@ -482,8 +557,12 @@ pub mod battery {
         pub full_mah: Option<u16>,
         /// Remaining capacity, mAh (`B0RM`).
         pub rem_mah: Option<u16>,
-        /// AC adapter present (`AC-W` answered with a non-zero payload).
+        /// AC adapter present (`AC-W` answered with a non-zero payload). Stays `None` on machines
+        /// that lack the key entirely — the 2012 rMBP among them; see `ac_derived`.
         pub ac_present: Option<bool>,
+        /// Charge state INFERRED from the `B0AC` sign when `AC-W` cannot answer (IVY-AC). Never a
+        /// substitute for `ac_present` where that resolves; see [`AcDerived`] for the ambiguity.
+        pub ac_derived: AcDerived,
     }
 
     static CACHE: Mutex<BatterySnapshot> = Mutex::new(BatterySnapshot {
@@ -494,6 +573,7 @@ pub mod battery {
         full_mah: None,
         rem_mah: None,
         ac_present: None,
+        ac_derived: AcDerived::Unknown,
     });
     /// Last refresh time (ms); 0 = never. Throttles the port I/O off the per-frame path.
     static LAST_MS: Mutex<u64> = Mutex::new(0);
@@ -522,8 +602,15 @@ pub mod battery {
         Stuck,
     }
 
+    /// Read a 2-byte key with the bounded retry budget. Every attempt after the first is a RETRY
+    /// and is counted (IVY-RETRY) so the witness can report drop-out frequency; the budget itself
+    /// is unchanged — `READ_ATTEMPTS` attempts max, each individually deadline-bounded, so total
+    /// work stays bounded and no re-read can turn into a spin.
     fn read_u16k(key: &[u8; 4]) -> KeyRead {
-        for _ in 0..READ_ATTEMPTS {
+        for attempt in 0..READ_ATTEMPTS {
+            if attempt > 0 {
+                note_retry(); // this pass is a re-read of a key that failed the previous one
+            }
             let mut b = [0u8; 2];
             match read_key(key, &mut b) {
                 Ok(2) => return KeyRead::Val(((b[0] as u16) << 8) | b[1] as u16),
@@ -551,6 +638,7 @@ pub mod battery {
     /// stall was THIS, not the sprite. A clean `Absent` (QEMU) still sweeps every key, unchanged.
     pub fn snapshot() -> BatterySnapshot {
         let mut s = BatterySnapshot::default();
+        RETRIES_SWEEP.store(0, Ordering::Relaxed); // per-sweep retry counter (IVY-RETRY)
         let first = read_u16k(b"BRSC");
         if matches!(first, KeyRead::Stuck) {
             use core::sync::atomic::{AtomicBool, Ordering};
@@ -567,13 +655,27 @@ pub mod battery {
         s.amp_ma = opt(read_u16k(b"B0AC")).map(|u| u as i16);
         s.full_mah = opt(read_u16k(b"B0FC"));
         s.rem_mah = opt(read_u16k(b"B0RM"));
-        // AC presence: any non-zero AC-W payload => adapter attached.
-        let mut acw = [0u8; 2];
-        s.ac_present = match read_key(b"AC-W", &mut acw) {
-            Ok(n) if n >= 1 => Some(acw[..n].iter().any(|&x| x != 0)),
-            Err(SmcError::Absent) => None,
-            _ => None,
+        // AC presence: any non-zero AC-W payload => adapter attached. Same bounded, counted retry
+        // discipline as the numeric keys — a Stuck handshake gets one more chance before the field
+        // becomes a hole; a clean Absent (the 2012 rMBP's answer: this machine has no AC-W) stops
+        // immediately, and the derived state below takes over.
+        s.ac_present = 'acw: {
+            for attempt in 0..READ_ATTEMPTS {
+                if attempt > 0 {
+                    note_retry();
+                }
+                let mut acw = [0u8; 2];
+                match read_key(b"AC-W", &mut acw) {
+                    Ok(n) if n >= 1 => break 'acw Some(acw[..n].iter().any(|&x| x != 0)),
+                    Err(SmcError::Absent) => break 'acw None, // key does not exist here — no retry
+                    _ => {}
+                }
+            }
+            None
         };
+        // IVY-AC: infer charge state from the B0AC sign. Computed always (it is cheap and costs no
+        // port I/O); it is only *reported in place of* ac_present when AC-W could not answer.
+        s.ac_derived = derive_ac(s.amp_ma);
         s.present = s.soc_pct.is_some() || s.volt_mv.is_some() || s.rem_mah.is_some();
         s
     }
@@ -647,15 +749,27 @@ pub mod battery {
             // keeps the honest `None`; only this human-facing witness applies the sentinel.
             let fu = |o: Option<u16>| o.map(|v| alloc::format!("{}", v)).unwrap_or_else(|| "-".into());
             let fi = |o: Option<i16>| o.map(|v| alloc::format!("{}", v)).unwrap_or_else(|| "-".into());
+            // `ac=` reports the DIRECT reading when AC-W answered; otherwise the IVY-AC inference
+            // from the B0AC sign, tagged `derived:` so no reader can mistake it for a direct one.
+            // `ac=?` now only appears when there is neither an AC-W answer nor a B0AC reading.
+            let ac = match (s.ac_present, s.ac_derived) {
+                (Some(true), _) => alloc::string::String::from("yes"),
+                (Some(false), _) => alloc::string::String::from("no"),
+                (None, AcDerived::Unknown) => alloc::string::String::from("?"),
+                (None, d) => alloc::format!("derived:{}", d.as_str()),
+            };
+            let (rsweep, rtotal) = retry_counts();
             serial_println!(
-                ":: SMC-BATT: present={} soc={}% volt={}mV amp={}mA full={}mAh rem={}mAh ac={} == witness ::",
+                ":: SMC-BATT: present={} soc={}% volt={}mV amp={}mA full={}mAh rem={}mAh ac={} retries={}/{} == witness ::",
                 s.present,
                 fu(s.soc_pct),
                 fu(s.volt_mv),
                 fi(s.amp_ma),
                 fu(s.full_mah),
                 fu(s.rem_mah),
-                match s.ac_present { Some(true) => "yes", Some(false) => "no", None => "?" },
+                ac,
+                rsweep,
+                rtotal,
             );
         }
     }
