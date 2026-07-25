@@ -265,11 +265,11 @@ pub unsafe fn takeover_display(
     let pre_shadow = mmio_read(bar0, shadow_reg);
     serial_println!(":: kdisp: latch pre asm={:08X} armed={:08X} shadow={:08X} ::", pre_asm, pre_armed, pre_shadow);
 
-    let cycles = [(2, 4), (2, 8), (4, 4), (4, 8)];
+    let cycles = [(2, 192), (2, 256), (4, 192), (4, 256)];
     let new_ptr = 0x00016000;
+    let bh = 4;
 
-    for &(bw, bh) in &cycles {
-        let pg = ((180 + bw - 1) / bw) * bw;
+    for &(bw, pg) in &cycles {
         let blocks_per_row = pg / bw;
         let padded_width_px = pg * 16;
         let gob_rows = (expected_height + gob_height - 1) / gob_height;
@@ -330,7 +330,7 @@ pub unsafe fn takeover_display(
                 core::ptr::write_volatile(target_ptr, final_color);
             }
         }
-        serial_println!(":: kdisp: bw-step bw={} bh={} pg={} fill done bytes={:08X} ::", bw, bh, pg, total_bytes);
+        serial_println!(":: kdisp: bwpg-step bw={} bh=4 pg={} fill done bytes={:08X} ::", bw, pg, total_bytes);
 
         // Step 2: Latch Sequence
         mmio_write(bar0, asm_reg, new_ptr);
@@ -353,7 +353,7 @@ pub unsafe fn takeover_display(
         // (Peter, s21 prep: 4 s was too fast to photograph).
         for t in 1..=5 {
             for _ in 0..60_000_000 { core::hint::spin_loop(); }
-            serial_println!(":: kdisp: bw-step bw={} bh={} pg={} hold t={}s ::", bw, bh, pg, t);
+            serial_println!(":: kdisp: bwpg-step bw={} bh=4 pg={} hold t={}s ::", bw, pg, t);
         }
 
         // Step 3: Restore
@@ -362,7 +362,7 @@ pub unsafe fn takeover_display(
         
         // 1 s recovery gap
         for _ in 0..15_000_000 { core::hint::spin_loop(); }
-        serial_println!(":: kdisp: bw-step bw={} bh={} pg={} done ::", bw, bh, pg);
+        serial_println!(":: kdisp: bwpg-step bw={} bh=4 pg={} done ::", bw, pg);
     }
     
     // 7. Verdict
