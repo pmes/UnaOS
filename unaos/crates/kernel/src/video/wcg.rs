@@ -108,6 +108,13 @@
 //! tore". The tear question lives in [`stage_note`]'s `[wc-h] torn=`, which measures the present
 //! phase alone. The four checksum legs are unaffected and keep their original meanings.
 //!
+//! **WC-K lives here too.** The back-layer discipline WC-H built for a window's pixels was extended
+//! by WC-K to the desktop FILL that a close, a move or a re-tile paints over a vacated box — the last
+//! writer in the window lifecycle that still poked the live front buffer per pixel. Its witness
+//! ([`erase_note`] / [`erase_decline`]) is in this module because it answers the same question with
+//! the same units and the same thresholds, and splitting it into a fourth file would only let the two
+//! `rectscan_us` derivations drift apart.
+//!
 //! ## Scope and cost
 //!
 //! `witness`-gated AND aarch64-only, like `wcf`: knob-off this module does not compile and the
@@ -400,6 +407,161 @@ pub fn stage_flush(id: u32) {
             decl_n,
             H_FIXTURE[i].load(Ordering::Relaxed),
             H_MAXPRES[i].load(Ordering::Relaxed),
+            FRAME_US,
+            verdict
+        );
+    }
+}
+
+// ---- WC-K — the staged DESKTOP FILL's own witness ----------------------------------------------
+
+/// Staged erase fills to report per boot. The erase path has no window id to budget against — an
+/// erase belongs to a box that no longer has an owner — so the budget is global, and four is the
+/// same figure the per-window witnesses use for the same reason: enough to tell a steady state from
+/// a one-off, few enough that the serial writes do not perturb a close path.
+const E_SAMPLES: u32 = 4;
+
+/// Decline lines to print before going quiet. Deliberately LARGER than [`E_SAMPLES`], and
+/// deliberately NOT the same budget.
+///
+/// WC-H's `stage_decline` shares one budget between successes and declines, which leaves a real
+/// blind spot: a boot that stages its first four composites and declines every one thereafter stops
+/// printing, and the rollup that already fired cannot retract. That is survivable there because a
+/// window composites continuously and the counters keep moving. It is not survivable here, because
+/// the FORBID on a direct fill is this arc's whole verdict — WC-G convicted this exact writing
+/// pattern, and a direct fill that appears only after the rollup has printed must still fail the
+/// gate. So a decline is printed whether or not the sample budget is spent, and only a boot that
+/// declines pathologically (more than this many) goes quiet, with the counter still running.
+const E_DECL_LINES: u32 = 16;
+
+/// Staged fills recorded so far, capped at [`E_SAMPLES`] for line purposes.
+static E_TAKEN: AtomicU32 = AtomicU32::new(0);
+/// Staged fills whose PRESENT phase alone outran the beam's time on the box.
+static E_TORN: AtomicU32 = AtomicU32::new(0);
+/// Staged fills whose present was not `h` contiguous, row-stepped runs. Structural, not timing.
+static E_NONCONTIG: AtomicU32 = AtomicU32::new(0);
+/// Fills that fell back to the direct `fill_rect` — the pre-WC-K tearing regime.
+static E_DECLINE: AtomicU32 = AtomicU32::new(0);
+/// Decline lines emitted, capped at [`E_DECL_LINES`].
+static E_DECL_LINES_OUT: AtomicU32 = AtomicU32::new(0);
+/// The largest present-phase duration seen across staged fills, in microseconds.
+static E_MAXPRES: AtomicU64 = AtomicU64::new(0);
+/// Total panel rows presented by staged fills — the size of what this discipline now covers.
+static E_ROWS: AtomicU64 = AtomicU64::new(0);
+
+/// WC-K — record a desktop fill that did NOT reach the back layer and ran the direct `fill_rect`.
+///
+/// The reasons are [`super::wm::stage_window`]'s, reused rather than duplicated: the two staging
+/// paths decline for the same four causes and a separate vocabulary would only invite the two to
+/// drift.
+pub fn erase_decline(w: usize, h: usize, reason: u32) {
+    E_DECLINE.fetch_add(1, Ordering::Relaxed);
+    let n = E_DECL_LINES_OUT.fetch_add(1, Ordering::Relaxed) + 1;
+    if n > E_DECL_LINES {
+        E_DECL_LINES_OUT.store(E_DECL_LINES + 1, Ordering::Relaxed);
+        return;
+    }
+    serial_println!(
+        "[wc-k] erase box={}x{} staged=no reason={} -> DIRECT",
+        w,
+        h,
+        decl_name(reason)
+    );
+}
+
+/// WC-K — report one staged desktop fill: the box, the composed row, how long the compose and the
+/// row-copy present took, whether the present alone outran the beam's time on those rows, and
+/// whether the present was in fact `h` contiguous row-stepped runs.
+///
+/// ### Why `contig=` is a leg and not a comment
+///
+/// The tear-free claim WC-H established rests on a specific SHAPE — bulk `copy_nonoverlapping` runs,
+/// one per scanline, each wholly inside its row — and not on the mere fact that a staging buffer was
+/// involved. A staged path whose present dribbled out in fragments, or whose runs overhung into the
+/// next scanline, would report perfectly good `compose_us`/`present_us` numbers and still be back in
+/// the regime this arc removes. So the shape is CHECKED at the present (see
+/// [`super::wm::stage_fill`]) and reported here, and the spec FORBIDs `contig=no` independently of
+/// the timing verdict.
+///
+/// `rectscan_us` is computed exactly as [`stage_note`] and WC-G compute it, with the same deliberate
+/// bias toward NOT reporting a tear: `FRAME_US` includes blanking the beam does not spend on visible
+/// rows, so the box's real scan time is shorter than the figure the present is compared against and
+/// a `torn=no` near the threshold is not a proof of safety.
+#[allow(clippy::too_many_arguments)]
+pub fn erase_note(
+    w: usize,
+    h: usize,
+    row_bytes: usize,
+    contig: bool,
+    t_end: u64,
+    t0: u64,
+    t1: u64,
+    panel_h: usize,
+) {
+    let compose_us = cycles_to_us(t1.saturating_sub(t0));
+    let present_us = cycles_to_us(t_end.saturating_sub(t1));
+    let rectscan_us = if panel_h == 0 { 0 } else { FRAME_US * h as u64 / panel_h as u64 };
+    let torn = present_us > rectscan_us;
+    if torn {
+        E_TORN.fetch_add(1, Ordering::Relaxed);
+    }
+    if !contig {
+        E_NONCONTIG.fetch_add(1, Ordering::Relaxed);
+    }
+    E_MAXPRES.fetch_max(present_us, Ordering::Relaxed);
+    E_ROWS.fetch_add(h as u64, Ordering::Relaxed);
+    let n = E_TAKEN.fetch_add(1, Ordering::Relaxed) + 1;
+    if n > E_SAMPLES {
+        // Past budget the LINE stops and the counters above keep running, so a tear or a fragmented
+        // present that only appears late in the boot is still counted — and, because the declines
+        // print unbudgeted, still reachable by a FORBID.
+        E_TAKEN.store(E_SAMPLES + 1, Ordering::Relaxed);
+        return;
+    }
+    serial_println!(
+        "[wc-k] erase box={}x{} staged=yes rowbytes={} runs={} contig={} compose_us={} present_us={} rectscan_us={} torn={} -> BUFFERED",
+        w,
+        h,
+        row_bytes,
+        h,
+        if contig { "yes" } else { "no" },
+        compose_us,
+        present_us,
+        rectscan_us,
+        if torn { "yes" } else { "no" }
+    );
+    if n == E_SAMPLES {
+        // Precedence, most specific first: a present that was not the right SHAPE invalidates the
+        // tear-free argument regardless of what the clock said, so `SPLIT` outranks a measured tear;
+        // a measured tear outranks an unmeasured one; `UNSTAGED` means fills reached the panel
+        // through the direct path and the staged samples do not cover the erase path's behaviour.
+        //
+        // `scope=fills` is not `scope=boot`, and the distinction is WC-G's lesson repeated: nothing
+        // observable inside a boot can distinguish "the erase path is finished" from "the next app
+        // has not closed a window yet", so this line claims only the fills it has SEEN. The
+        // "did a direct fill ever happen, anywhere, at any point" question is the spec's FORBID on
+        // `-> DIRECT`, which needs no completeness claim and which the unbudgeted decline lines keep
+        // reachable for the whole boot.
+        let torn_n = E_TORN.load(Ordering::Relaxed);
+        let nc = E_NONCONTIG.load(Ordering::Relaxed);
+        let decl = E_DECLINE.load(Ordering::Relaxed);
+        let verdict = if nc > 0 {
+            "SPLIT"
+        } else if torn_n > 0 {
+            "AT-RISK"
+        } else if decl > 0 {
+            "UNSTAGED"
+        } else {
+            "TEAR-FREE"
+        };
+        serial_println!(
+            "[wc-k] rollup scope=fills samples={} rows={} torn={} noncontig={} declines={} maxpresent_us={} frame_us={} -> {}",
+            n,
+            E_ROWS.load(Ordering::Relaxed),
+            torn_n,
+            nc,
+            decl,
+            E_MAXPRES.load(Ordering::Relaxed),
             FRAME_US,
             verdict
         );

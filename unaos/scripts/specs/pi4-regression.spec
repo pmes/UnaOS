@@ -494,3 +494,48 @@ REQUIRE \[cursor3\] rollup scope=.* planned=.* offers=.* taken=.* adopt=.* repai
 REQUIRE \[wc-j\] vacate close_painted=true close_desktop=true .* owner_painted=true owner_desktop=true .* -> PASS
 REQUIRE \[wc-j\] retile survivor=.* moved=true painted=true live=true old_desktop=true .* -> PASS
 FORBID \[wc-j\] .*-> FAIL
+
+# --- WC-K — the DESKTOP FILL gets the back buffer too -------------------------------------------
+# ---    WC-G convicted a SHAPE, not a writer: per-pixel `put_pixel` into the live front framebuffer,
+# ---    with no vblank synchronisation, is structurally overtaken by the scan-out (~2x beam overtake
+# ---    measured) and latches part-old/part-new. WC-H removed that shape from a window's own pixels.
+# ---    `wm::erase` — the desktop-colour fill a close, a move or a re-tile paints over a vacated box
+# ---    — kept it: `fill_rect` is `w * h` bounds-checked pokes straight into the memory the HVS is
+# ---    scanning. WC-I's own standing note named it as outstanding debt, and WC-J made it heavier by
+# ---    routing three more paths (close, close_owner, create_inner retile) through `reclaim`, whose
+# ---    first step is that fill — over boxes as large as a whole tile.
+# ---
+# ---    WC-K stages it, reusing WC-H's machinery rather than inventing a third discipline: the same
+# ---    STAGE buffer, the same `try_lock`, the same 4 MiB cap, the same four decline reasons, and the
+# ---    same present primitive — bulk `copy_nonoverlapping` runs, one per scanline. Only the composed
+# ---    artifact differs: a fill's rows are identical by construction, so ONE row is composed and
+# ---    presented `h` times. That is also what lets a full-panel erase (7.6 MB at 1920x1200) stage at
+# ---    all instead of declining on the cap — i.e. falling back to the tearing regime for exactly the
+# ---    largest boxes, which tear worst.
+# ---
+# ---    `contig=` IS A LEG, not a comment. The tear-free claim rests on the SHAPE of the present, not
+# ---    on the mere presence of a staging buffer: a staged path whose runs fragmented, or overhung
+# ---    into the next scanline, would report perfectly good compose/present numbers and still be back
+# ---    in the convicted regime. So `stage_fill` CHECKS, per fill, that each run is exactly
+# ---    `w * bpp` bytes, fits inside its scanline, and steps by exactly one panel row — and the
+# ---    FORBID below stands independently of the timing verdict.
+# ---
+# ---    DECLINE LINES ARE UNBUDGETED, and that is a deliberate divergence from `[wc-h]`. There the
+# ---    successes and declines share one budget, which leaves a boot that starts declining after
+# ---    sample 4 silent behind an already-printed rollup. Survivable for a window (which composites
+# ---    continuously); not survivable here, because "a direct fill happened" IS this arc's verdict.
+# ---    A decline therefore prints whenever it occurs (to a 16-line spam bound), so the FORBID stays
+# ---    reachable for the whole boot rather than only until the rollup fires.
+# ---
+# ---    `scope=fills`, not `scope=boot`: WC-G's lesson repeated — nothing observable inside a boot
+# ---    can tell "the erase path is finished" from "the next app has not closed a window yet", so
+# ---    the rollup claims only the fills it has seen and the completeness question is the FORBIDs'.
+# ---    Witness-feature only. See docs/dev/OS/08_VIDEO/engine.md §WC-K.
+REQUIRE \[wc-k\] erase box=.* staged=yes .* contig=yes .* torn=.* -> BUFFERED
+REQUIRE \[wc-k\] rollup scope=fills samples=.* noncontig=.* declines=.* -> TEAR-FREE
+FORBID \[wc-k\] .*staged=no
+FORBID \[wc-k\] .*-> DIRECT
+FORBID \[wc-k\] .*contig=no
+FORBID \[wc-k\] .*-> SPLIT
+FORBID \[wc-k\] .*-> AT-RISK
+FORBID \[wc-k\] .*-> UNSTAGED

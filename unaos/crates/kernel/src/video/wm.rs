@@ -577,6 +577,36 @@ pub const DESKTOP_BG: u32 = 0x002D_2B55;
 /// Paint the given outer boxes with the desktop background and clean them for the scan-out — the panel
 /// area a closed window vacated. Windows that overlapped it are repainted by the [`composite`] that
 /// follows (closing damages the whole live set through [`place`]).
+///
+/// ### WC-K — why this fill is staged too
+///
+/// WC-H convicted the *shape* of a write, not the identity of its writer: per-pixel `put_pixel` into
+/// the live front framebuffer, unsynchronised against the beam, is structurally overtaken by the
+/// scan-out and latches part-old/part-new. `fill_rect` is exactly that shape — `w * h`
+/// bounds-checked pokes into memory the HVS is scanning right now — and until this arc `erase` was
+/// the last writer in the window lifecycle still doing it. WC-I's standing note named the debt
+/// ("`erase` is still unstaged and still fills the desktop directly"); WC-J made it heavier by
+/// calling `erase` on three more paths through [`reclaim`], so every close and every re-tile ran a
+/// direct fill over boxes as large as a whole tile.
+///
+/// [`stage_fill`] gives it the WC-H discipline, and deliberately not a third one: compose in cached
+/// RAM, present as contiguous full-width row copies out of the same [`STAGE`] buffer, under the same
+/// cap, the same `try_lock`, and the same four fall-back declines. The fallback direct fill remains
+/// as the last resort, and — per WC-H's `stage_decline` precedent — a decline is a SAMPLE that says
+/// so on the wire, because a silent fallback here is precisely the tearing regime the arc removes.
+///
+/// ### Cursor coherence
+///
+/// Unchanged, and unchanged on purpose. The `undraw()` below takes the sprite off the panel before
+/// the FIRST byte of any fill lands (staged or direct — staging moves where the composing writes go,
+/// never when the panel writes happen relative to this bracket), and the `composite()` that every
+/// `erase` caller runs next puts it back. The staged fill does NOT take CURSOR-3's overlay: that
+/// path exists for a window whose staged box wholly contains the sprite and whose compositor pass
+/// handed `draw_window` a `cursor::Plan`. `erase` has no plan — it is not a compositor pass, it
+/// holds no claim on the sprite's state machine, and inventing one here would mean a second,
+/// unsynchronised writer of the save-under. So the overlay decision this path takes is the same one
+/// `stage_window` takes when `cur` is `None`: compose no sprite, and leave the repaint to the
+/// following composite. That is CURSOR-3's own fallback, not a new rule.
 fn erase(boxes: &[(usize, usize, usize, usize)]) {
     // CURSOR-1: take the sprite off the panel before repainting desktop under it. Without this the
     // fills below would overwrite the sprite, and the save-under would later restore pre-erase
@@ -598,7 +628,11 @@ fn erase(boxes: &[(usize, usize, usize, usize)]) {
         }
         // F6 — clip before iterating, as in `draw_window`.
         let (w, h) = (w.min(info.width - x), h.min(info.height - y));
-        fb.fill_rect(x, y, w, h, DESKTOP_BG);
+        // WC-K — staged first; the direct fill is the fallback, and `stage_fill` has already said on
+        // the wire which one this was.
+        if !stage_fill(&fb, x, y, w, h, DESKTOP_BG) {
+            fb.fill_rect(x, y, w, h, DESKTOP_BG);
+        }
         let y0 = y.min(info.height);
         let y1 = (y + h).min(info.height);
         if y1 > y0 {
@@ -2260,6 +2294,120 @@ fn stage_window(
         t1,
         ph,
     );
+    true
+}
+
+/// WC-K — the back-layer path for a SOLID fill: compose one row of `color` in cached RAM, then
+/// present the box to the front framebuffer as `h` contiguous row copies. Returns `false` when the
+/// back layer is unavailable, leaving the front untouched so [`erase`] can run the direct fill.
+///
+/// ### Why one row and not the whole box
+///
+/// [`stage_window`] stages `bw x bh` because every one of those rows is different. A desktop fill's
+/// rows are *identical by construction*, so the composed artifact that the present copies is a
+/// single row — and the present is then byte-for-byte the same operation `stage_window` performs:
+/// `h` bulk `copy_nonoverlapping` calls of `w * bpp` bytes at the panel's row stride, which is the
+/// only part of the operation the scan-out can catch mid-flight. This is the same discipline, not a
+/// third one: same buffer, same lock, same cap, same decline set, same present primitive. What it is
+/// not is a full-box staging, and refusing to allocate `w * h` bytes to hold `h` copies of one row
+/// is not a shortcut — it is what makes a full-panel erase (7.6 MB at the bench's 1920x1200) fit
+/// under [`MAX_STAGE_BYTES`] at all instead of declining on the cap and falling straight back into
+/// the tearing regime for the largest boxes, which are exactly the ones that tear worst.
+///
+/// The composed row is ZEROED before it is filled. `put_pixel` writes 3 of 4 bytes, so without this
+/// the pad byte of the previous tenant of [`STAGE`] — a window's staged pixels — would be presented
+/// into the desktop's pad. Invisible on this panel (the pad is not scanned), but the back layer's
+/// "every pixel the present copies was written by this pass" invariant is load-bearing and cheap to
+/// keep honest for one row.
+fn stage_fill(fb: &super::FrameBuffer, x: usize, y: usize, w: usize, h: usize, color: u32) -> bool {
+    // Every exit below is a DECLINE: this fill reaches the panel through the pre-WC-K direct
+    // `fill_rect` — the tearing regime — and the witness must say so.
+    macro_rules! decline {
+        ($reason:expr) => {{
+            #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+            super::wcg::erase_decline(w, h, $reason);
+            return false;
+        }};
+    }
+    let info = fb.info();
+    let bpp = info.bytes_per_pixel;
+    if w == 0 || h == 0 || bpp == 0 {
+        decline!(super::wcg::DECL_GEOM);
+    }
+    // Caller clipped `(x, y, w, h)` to the panel, so neither product can wrap.
+    let row_bytes = w * bpp;
+    let fb_row = info.stride * bpp;
+    if row_bytes == 0 || row_bytes > MAX_STAGE_BYTES {
+        decline!(super::wcg::DECL_CAP);
+    }
+    let mut stage = match STAGE.try_lock() {
+        Some(g) => g,
+        None => decline!(super::wcg::DECL_LOCK),
+    };
+    if stage.len() < row_bytes {
+        let add = row_bytes - stage.len();
+        // Same `try_reserve` + `resize` contract as `stage_window`: an exhausted heap declines here
+        // rather than panicking from a close path.
+        if stage.try_reserve(add).is_err() {
+            decline!(super::wcg::DECL_ALLOC);
+        }
+        stage.resize(row_bytes, 0);
+    }
+
+    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    let t0 = crate::arch::aarch64::now_cycles();
+
+    // Compose: one row, in the panel's own pixel format so the present is a straight copy.
+    for b in stage[..row_bytes].iter_mut() {
+        *b = 0;
+    }
+    let mut layer = super::FrameBuffer::new();
+    layer.init(
+        stage.as_mut_ptr() as usize,
+        row_bytes,
+        unaos_boot_info::FrameBufferInfo {
+            width: w,
+            height: 1,
+            stride: w,
+            bytes_per_pixel: bpp,
+            pixel_format: info.pixel_format,
+        },
+    );
+    layer.fill_rect(0, 0, w, 1, color);
+
+    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    let t1 = crate::arch::aarch64::now_cycles();
+
+    // Present: one bulk copy per row. ROW-CONTIGUITY is checked here rather than asserted in a
+    // comment — each destination run must be exactly `row_bytes` long, must fit inside its scanline
+    // (`x * bpp + row_bytes <= fb_row`, so no run wraps into the next row), and consecutive runs must
+    // step by exactly one panel row. A `contig=no` would mean the present is no longer the shape
+    // WC-H's tear-free argument rests on, whatever the timings say.
+    let mut contig = x * bpp + row_bytes <= fb_row;
+    let mut prev = usize::MAX;
+    for r in 0..h {
+        let off = (y + r) * fb_row + x * bpp;
+        if prev != usize::MAX && off != prev + fb_row {
+            contig = false;
+        }
+        prev = off;
+        fb.blit(off, &stage[..row_bytes]);
+    }
+
+    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    super::wcg::erase_note(
+        w,
+        h,
+        row_bytes,
+        contig,
+        crate::arch::aarch64::now_cycles(),
+        t0,
+        t1,
+        info.height,
+    );
+    // Read on every build so the contiguity check is not compiled out of the non-witness kernels: the
+    // check is cheap and its absence would make the two builds structurally different here.
+    let _ = contig;
     true
 }
 

@@ -1906,7 +1906,8 @@ pointer report, so the sprite is never drawn. Both numbers carry their claim onl
   per-row-span, so a window overlapping the strip should show the strip either side of it and never
   through it.
 * `erase` is still unstaged and still fills the desktop directly (unchanged by this arc), so a torn
-  erase on close/raise remains the WC-H follow-on it always was.
+  erase on close/raise remains the WC-H follow-on it always was. **Settled by WC-K**, which staged the
+  fill through the same back layer; this item is kept as the record of the debt, not as open work.
 
 ### CURSOR-3 — the sprite rides the present
 
@@ -2157,4 +2158,124 @@ parent's exit, or a poll cadence in the shell/scheduler); the bench measurement 
 * Launching a vug while others are up re-tiles them too, and leaves no residue either — `create` is on
   the same reclaim path as `close`.
 * `erase` is still unstaged (unchanged by this arc), so a torn erase on a large reclaim remains the WC-H
-  follow-on it has always been.
+  follow-on it has always been. **Settled by WC-K** — the reclaim's fill is staged and row-contiguous;
+  kept here as the record of what WC-J left behind.
+
+### WC-K — the desktop fill gets the back buffer too, and the last direct writer is gone
+
+WC-G's verdict was about a **shape**, not about a writer. Per-pixel `put_pixel` into the live front
+framebuffer, with no vblank synchronisation anywhere in the path, is structurally overtaken by the
+scan-out — measured at ~2x the beam's time on the rect — and what the panel latches is part-old and
+part-new, split at whatever scanline the beam held. WC-H removed that shape from a window's own pixels
+by giving the window layer a back buffer.
+
+`wm::erase` kept it. Its `fill_rect` is `w * h` bounds-checked pokes straight into the memory the HVS
+is scanning, and it is the fill that repaints a vacated box on every close, every move and every
+re-tile. WC-I's own section named it as outstanding debt ("`erase` is still unstaged and still fills
+the desktop directly"), and WC-J then made the debt heavier rather than lighter: `reclaim` — whose
+first step is that fill — is now reached from `close`, `close_owner` and `create_inner`'s re-tile, over
+boxes as large as a whole tile. `erase` was the last unstaged front-buffer writer in the window
+lifecycle.
+
+#### The writer survey (what was left, and what WC-K did to it)
+
+| writer | destination | before WC-K | after |
+|---|---|---|---|
+| `wm::erase` → `fill_rect` (`wm.rs`) | FRONT | direct per-pixel over the whole box | staged via `stage_fill` |
+| `wm::draw_window` → `stage_window` | FRONT | staged (WC-H) | unchanged |
+| `wm::paint_window` (fallback leg) | FRONT | direct — WC-H's documented last resort | unchanged |
+| `cursor::undraw` / `draw` | FRONT | direct, 12x20 sprite under the OVERLAY lock | unchanged (see below) |
+| `Screen::flush` / `present_background` | FRONT | back buffer + contiguous row flush | unchanged |
+| `fbcon` | FRONT | pre-heap boot console, bulk `blit` restores | unchanged |
+| `wcf` twin probe | FRONT | deliberate raw-addressing fixture | unchanged |
+
+#### The staging, and why it is not a third discipline
+
+`stage_fill` reuses WC-H's machinery outright: the same `STAGE` buffer, the same `try_lock`, the same
+`MAX_STAGE_BYTES` cap, the same four decline reasons, and the same present primitive — bulk
+`copy_nonoverlapping` runs, one per scanline, which is the only part of the operation the scan-out can
+catch mid-flight.
+
+One thing differs, and it is the fill's own nature rather than a new rule: a solid fill's rows are
+**identical by construction**, so the composed artifact is ONE row, presented `h` times. That is not a
+shortcut. Staging `w * h` bytes to hold `h` copies of one row would put a full-panel erase (7.6 MB at
+the bench's 1920x1200) over the 4 MiB cap, declining it straight back into the tearing regime for
+exactly the largest boxes — the ones that tear worst. The composed row is zeroed before it is filled,
+because `put_pixel` writes 3 of 4 bytes and the previous tenant of `STAGE` is a window's staged pixels;
+the pad is not scanned out, but the back layer's "every byte the present copies was written by this
+pass" invariant is worth one row of `memset` to keep true.
+
+**Row-contiguity is checked, not asserted.** The tear-free property rests on the shape of the present,
+not on the presence of a staging buffer: a staged path whose runs fragmented, or overhung into the next
+scanline, would report perfectly good compose/present numbers and still be back in the convicted
+regime. `stage_fill` verifies per fill that each run is exactly `w * bpp` bytes, that it fits inside
+its scanline (`x * bpp + row_bytes <= fb_row`, so no run wraps), and that consecutive runs step by
+exactly one panel row. `[wc-k] contig=` reports the result and the spec FORBIDs `contig=no`
+independently of the timing verdict.
+
+#### Cursor coherence
+
+Unchanged, deliberately. `erase` still calls `cursor::undraw()` before the first byte of any fill
+reaches the panel and still leaves the repaint to the `composite()` every caller runs next; staging
+moves where the *composing* writes go, never when the *panel* writes happen relative to that bracket.
+WC-J's noted interaction (reclaim → erase brackets the cursor via `undraw`) therefore holds
+byte-for-byte.
+
+The staged fill does **not** take CURSOR-3's overlay, and that is the same decision the present path
+takes rather than a new one. CURSOR-3 composes the sprite into a back layer only when the compositor
+handed `draw_window` a `cursor::Plan` — a claim on the sprite's state machine, taken under the OVERLAY
+lock by a pass that undrew the sprite itself. `erase` is not a compositor pass, holds no such plan, and
+inventing one here would make it a second, unsynchronised writer of the save-under. So `stage_fill`
+takes the branch `stage_window` takes when `cur` is `None`: compose no sprite, leave the repaint to the
+following composite. CURSOR-3's own fallback, unchanged.
+
+#### The witness: `[wc-k]`
+
+Per staged fill — box, composed row bytes, run count, the contiguity verdict, the compose and present
+phases separately, and the present measured against `rectscan_us` (computed exactly as `[wc-g]` and
+`[wc-h]` compute it, with the same bias toward *not* reporting a tear). Plus one rollup.
+
+Two divergences from `[wc-h]`, both corrections rather than style:
+
+* **Decline lines are unbudgeted** (to a 16-line spam bound), where `[wc-h]` shares one budget between
+  successes and declines. That sharing leaves a boot that starts declining *after* sample 4 silent
+  behind an already-printed rollup — survivable for a window, which composites continuously, and not
+  survivable here, because "a direct fill happened" *is* this arc's verdict. `FORBID -> DIRECT` stays
+  reachable for the whole boot.
+* **`scope=fills`, not `scope=boot`.** WC-G's lesson repeated: nothing observable inside a boot can
+  distinguish "the erase path is finished" from "the next app has not closed a window yet", so the
+  rollup claims only the fills it has seen and the completeness question belongs to the FORBIDs.
+
+#### WC-K gate results (2026-07-25, QEMU raspi4b, forced bench geometry)
+
+`UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test 90` — **68/68 required witnesses, 0 forbidden**:
+
+```
+[wc-k] erase box=480x480 staged=yes rowbytes=1920 runs=480 contig=yes compose_us=143 present_us=1378 rectscan_us=6666 torn=no -> BUFFERED
+[wc-k] erase box=514x526 staged=yes rowbytes=2056 runs=526 contig=yes compose_us=48 present_us=1883 rectscan_us=7305 torn=no -> BUFFERED
+[wc-k] erase box=130x142 staged=yes rowbytes=520 runs=142 contig=yes compose_us=10 present_us=154 rectscan_us=1972 torn=no -> BUFFERED
+[wc-k] rollup scope=fills samples=4 rows=1290 torn=0 noncontig=0 declines=0 maxpresent_us=1883 frame_us=16667 -> TEAR-FREE
+```
+
+Zero declines: every fill in the boot reached the back layer, including the 514x526 tile. The present
+phase runs at roughly a quarter of the beam's time on the same rows (1883 vs 7305 µs on the largest
+box), and the compose phase — one row, whatever the box height — is 10–143 µs, so the trade WC-H paid
+for windows (a full extra box-sized copy) does not exist here at all: the total is *cheaper* than the
+direct fill it replaces, because `h - 1` of the `h` rows cost a bulk copy instead of `w` bounds-checked
+pokes. `[wc-h]`, `[wc-j]`, `[wc-g]` and `[wc-d]` are unchanged and green, and WC-J's read-backs still
+find `DESKTOP_BG` byte-for-byte at 5/5 and 3/3 — the staged fill lands the identical pixels.
+
+`./arroyo test-arm`: `MISSION SUCCESS`. `./arroyo check`: both arches clean.
+
+#### Metal watch-list
+
+* Close or kill a large window and watch the vacated box: the fill must appear as one clean rectangle,
+  with no horizontal band boundary and no flash of a partially-filled box.
+* Re-tile with several large windows up (launch or kill one of four vugs): every survivor's abandoned
+  tile fills at once; a torn *reclaim* would show as a band across an abandoned tile, distinct from a
+  torn *window paint*.
+* `[wc-k] rollup ... -> TEAR-FREE` with `declines=0` on the bench's real 1920x1200 geometry — a decline
+  there would most likely be `lock` (a concurrent desktop flush holding `STAGE`), which is loud by
+  construction and falls back correctly rather than losing pixels.
+* The cursor over a closing window: the sprite must reappear after the fill, never be erased into the
+  desktop and never leave a stale patch — the `undraw`/composite bracket is the thing being watched.
