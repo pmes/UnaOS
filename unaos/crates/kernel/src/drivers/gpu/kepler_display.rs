@@ -315,33 +315,21 @@ pub unsafe fn takeover_display(
     let total_bytes = expected_height * pitch_bytes;
     let new_ptr = 0x00016000;
 
-    // Step 1: Prepare surf2 (linear fill)
+    // Step 1: Prepare surf2 (linear fill, row offset calibration)
     for y in 0..expected_height {
-        let block_color = match (y / 64) % 8 {
-            0 => 0xFFFF0000, // RED
-            1 => 0xFF00FF00, // GREEN
-            2 => 0xFF0000FF, // BLUE
-            3 => 0xFFFFFF00, // YELLOW
-            4 => 0xFF00FFFF, // CYAN
-            5 => 0xFFFF00FF, // MAGENTA
-            6 => 0xFFFFFFFF, // WHITE
-            _ => 0xFF404040, // GRAY
-        };
-        
-        let row_color = if y % 64 == 0 {
-            0xFF000000 // BLACK
-        } else {
-            block_color
+        let row_color = match y {
+            0..=7 => 0xFFFFFFFF,
+            448..=455 => 0xFFFF0000,
+            896..=903 => 0xFF00FF00,
+            1344..=1351 => 0xFF0000FF,
+            1792..=1799 => 0xFFFF00FF,
+            _ => 0xFF000000,
         };
         
         let row_base = y * pitch_bytes;
         
         for x in 0..(pitch_bytes / 4) {
             let final_color = if x >= 2880 {
-                0xFF000000 // BLACK
-            } else if x < 256 {
-                0xFFFFFFFF // WHITE
-            } else if x < 264 {
                 0xFF000000 // BLACK
             } else {
                 row_color
@@ -352,7 +340,7 @@ pub unsafe fn takeover_display(
             core::ptr::write_volatile(target_ptr, final_color);
         }
     }
-    serial_println!(":: kdisp: lin-step pitch=4000 fill done bytes={:08X} ::", total_bytes);
+    serial_println!(":: kdisp: row-cal fill done bytes={:08X} ::", total_bytes);
 
     // Step 2: Latch Sequence
     mmio_write(bar0, asm_reg, new_ptr);
@@ -373,7 +361,7 @@ pub unsafe fn takeover_display(
     // 5 s hold
     for t in 1..=5 {
         for _ in 0..60_000_000 { core::hint::spin_loop(); }
-        serial_println!(":: kdisp: lin-step pitch=4000 hold t={}s ::", t);
+        serial_println!(":: kdisp: row-cal hold t={}s ::", t);
     }
 
     // Step 3: Restore
@@ -382,7 +370,7 @@ pub unsafe fn takeover_display(
     
     // 1 s recovery gap
     for _ in 0..15_000_000 { core::hint::spin_loop(); }
-    serial_println!(":: kdisp: lin-step pitch=4000 done ::");
+    serial_println!(":: kdisp: row-cal done ::");
     
     // 7. Verdict
     serial_println!(":: kdisp: latch verdict asm-stuck=y ::");
