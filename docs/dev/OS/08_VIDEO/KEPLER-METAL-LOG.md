@@ -3,6 +3,40 @@
 Hard-won silicon facts from the fox-metal sitting series. Trust these over any
 QEMU behavior. Newest sitting first.
 
+## Sitting #25 (display pull 15 recon + fence pull 22, UnaOS-gemini@e9d20bd2/30a6a8dd, 2026-07-25, fox-metal-r23s1l, s25boot1, serial-only)
+
+**Display — ⭐ THE MIRROR TALKED: FW SURFACE IS LINEAR, PITCH 0x4000.**
+Mirror window 0x640400–0x6405FC dumped twice, ZERO volatility. The ISO
+surface method cluster at head0:
+- 0x460 = 00000200 → offset>>8 → fw surface at VRAM +0x20000 (consistent
+  with the 0x90020000 GOP story; our >>8 pointer convention confirmed).
+- 0x468 = 07080B40 → SET_SIZE h=1800 w=2880. Exact.
+- 0x46C = 01004000 → SET_STORAGE: bit24 LAYOUT=1 = **PITCH (LINEAR)**;
+  pitch>>8 = 0x40 → **pitch = 0x4000 = 16384 bytes/row**; block fields 0.
+- 0x470 = 0000CF00 → SET_PARAMS format=0xCF (<<8).
+Read: the scanout is NOT block-linear — every seam/checkerboard artifact
+since s19 was aliasing of linear-16384 vs our assumed layouts (s18's
+"left-bar wraps as dashes, pitch≠11520" was the truth the whole time; the
+GOB "confirmation" at s20 was coincidental structure). Pull 16 = ONE
+linear fill cycle, rows strided 16384 bytes (2880×4 visible + padding),
+no swizzle. If the mirror is the scan config, that cycle is seam-free and
+the mapping war is OVER. Other candidates logged: 07080B40 repeats at
+4B8–4C8 (viewport/raster cluster), 0x494=9, 0x498=00040000, 0x55C=2.
+
+**Fence — reset pulse ELECTRICALLY CLEAN, ports STILL DEAD → the spec's
+Falcon base is probably WRONG.** pre=E011216D → off rb=E011216D (bit 12
+reads clear when cleared) → on rb=E011316D; post-pulse imem/dmem probe
+still BADF1000 ×8, recon unchanged. New read: BADF1000 on EVERY access
+incl. control readbacks is the nonexistent-pri-register signature, not a
+gate. On GK104-family the GR Falcons sit at 0x409000 (FECS) and 0x41A000
+(GPCCS) — 0x400180/0x4001C0 (spec §2) likely don't exist on GK107.
+Pull 23 = read-only recon of 0x409000–0x40915C and 0x41A000–0x41A15C
+under the existing enable; if real falcon registers appear there, the
+port probe moves to that base. Spec doc annotated.
+
+Capture: rmbp-s18/cu.usbserial-ABAFUJCO.log, mark s25boot1. Flash staged
+s25-20260725T*Z-f317d3f9.
+
 ## Sitting #24 (display pull 14 + fence pull 21, UnaOS-gemini@3d12d5f5/c8993e2c+AINCR fix, 2026-07-25, fox-metal-r23s1l, s24boot1)
 
 **Fence — K-GPU-4 M1: FALCON MEMORY PORTS STILL GATED.** With PMC bit 12

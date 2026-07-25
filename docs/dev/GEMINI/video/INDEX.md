@@ -6,7 +6,8 @@ Three pull sequences, numbered independently. Every pull = one BRIEF (coordinato
 ## Lane 1: Kepler FENCE (PFIFO/scheduler — kepler.rs) — `video/Kepler/`, files `*kepler-fence-pull<N>*` (pulls ≤13: `*kepler-pull<N>*`)
 | Pull | Files | Status | One-liner |
 |---|---|---|---|
-| 22 | BRIEF-kepler-fence-pull22-pgraph-reset-pulse | LANDED (30a6a8dd) — metal owed s25 | PMC bit-12 reset PULSE (off→settle→on) then identical port probe — reset-then-enable, not enable-alone |
+| 23 | BRIEF-kepler-fence-pull23-falcon-base-recon | BRIEFED — awaiting proposal | read-only recon of 0x409000 (FECS) + 0x41A000 (GPCCS) — find the real Falcon |
+| 22 | BRIEF-kepler-fence-pull22-pgraph-reset-pulse | LANDED; s25: pulse clean, ports STILL dead — BADF1000 = nonexistent-reg signature; spec base wrong? | PMC bit-12 reset PULSE (off→settle→on) then identical port probe — reset-then-enable, not enable-alone |
 | 21 | BRIEF-kepler-fence-pull21-falcon-memprobe | LANDED; s24: **PORTS GATED** — all IMEM/DMEM accesses BADF1000 with bit12 set; second gate exists | K-GPU-4 m1: IMEM/DMEM sentinel probe (zero execution) — are Falcon memory ports live post-enable? |
 | 20 | BRIEF-kepler-fence-pull20-witness-rematch | LANDED; s23: **REFUTED #7** — strip signature identical with PGRAPH on (err=2, valid stripped) — K-GPU-4 arc begins | re-run s7–s10 witness sequence verbatim with PGRAPH on — zero new writes; either outcome decisive |
 | 19 | BRIEF-kepler-fence-pull19-pgraph-enable | LANDED; s22: **ENABLE TOOK** (rb bit12 set) — BADF1200 wall gone, BADF1000+real zeros, Falcon halted/no-ucode | set PMC_ENABLE bit12 (one write) + re-run recon — BADF1200 should become real values |
@@ -27,7 +28,8 @@ Three pull sequences, numbered independently. Every pull = one BRIEF (coordinato
 ## Lane 2: Kepler DISPLAY (scanout — kepler_display.rs after split) — `video/Kepler/`, files `*kepler-display-pull<N>*`
 | Pull | Files | Status | One-liner |
 |---|---|---|---|
-| 15 | BRIEF-kepler-display-pull15-mirror-surface-params | LANDED (e9d20bd2) — metal owed s25 | STOP GUESSING: read-only decode of 0x640400–0x6405FC — fw's own pitch/block-mode/size |
+| 16 | BRIEF-kepler-display-pull16-linear-16k | BRIEFED — awaiting proposal | ONE linear fill, pitch 16384 — seam-free = MAPPING SOLVED |
+| 15 | BRIEF-kepler-display-pull15-mirror-surface-params | LANDED; s25: ⭐ **FW SURFACE IS LINEAR pitch=0x4000** (storage 01004000, size 07080B40) — block-linear road retired | STOP GUESSING: read-only decode of 0x640400–0x6405FC — fw's own pitch/block-mode/size |
 | 14 | BRIEF-kepler-display-pull14-bw-pitch | LANDED; s24: **PITCH×BW REFUTED** — all 4 combos cluster-seamed; ladder exhausted → read the mirror | bw {2,4} @ bh=4 × pg {192,256} — pitch padding × bw never tested together |
 | 13 | BRIEF-kepler-display-pull13-blockwidth | LANDED; s23: **BW REAL** — periodic seams gone, clusters remain; cleanest (2,4); pitch×bw next | bw {2,4} × bh {4,8} — block wider than 1 GOB is the surviving suspect |
 | 12 | BRIEF-kepler-display-pull12-pitchalign | LANDED; s22: **PITCH REFUTED** (identical seams at pg 192 vs 256; count still scales with bh) | bh {4,8} × pitch_gobs {192,256} mini-ladder — zero seams names the real pair |

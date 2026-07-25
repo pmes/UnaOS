@@ -15,6 +15,16 @@ When the GPU boots, `PGRAPH` is in a reset state. It refuses to process any comm
 To load firmware into the Falcon, the host OS must upload the payload into the Falcon's Instruction Memory (IMEM) and Data Memory (DMEM) using MMIO registers mapped in BAR0.
 
 ### PGRAPH Falcon Registers (Base `0x400000`)
+
+> [!CAUTION]
+> **s25 METAL FINDING (2026-07-25): this base is likely WRONG for GK107.**
+> Every register below returned the nonexistent-pri signature (BADF1000 on
+> all accesses) on real hardware with PGRAPH enabled. On the GK104 family
+> the PGRAPH context-switch Falcons live at **0x409000 (FECS)** and
+> **0x41A000 (GPCCS)**, with the Falcon register file (CPUCTL +0x100,
+> BOOTVEC +0x104, IMEMC +0x180, IMEMD +0x184, DMEMC +0x1C0, DMEMD +0x1C4)
+> offset from the unit base. Pull 23 recon confirms/refutes on metal;
+> update this section with the proven base when it lands.
 - **IMEM Upload**:
   - `NV_PGRAPH_FALCON_IMEMC` (`0x400180`): Instruction Memory Control (set upload offset here, e.g., `(offset >> 8) | 1 << 24` for auto-increment). Bit 24 (AINCW) auto-increments on WRITES only; bit 25 (AINCR) auto-increments on READS — set bit 25 when reading back through the data port.
   - `NV_PGRAPH_FALCON_IMEMD` (`0x400184`): Instruction Memory Data (write 32-bit firmware instructions here).
