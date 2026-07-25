@@ -1822,3 +1822,107 @@ build is now part of this arc's gate.
 QEMU `raspi4b` models no V3D block — the run short-circuits at `BLOCK-DOWN` before any of this, so no
 `[v3d58]` line appears there and `kernel8-test` green means *no regression*, nothing more. **P58 metal
 reads the station progression, the cross-engine asymmetry and the post-bin render control.**
+
+## 33. The mainline audit that closed four theories, and the register nobody decoded (V3D-59)
+
+P57 metal returned the five-station progression V3D-58 armed, and it produced a paradox rather than a
+suspect:
+
+- `BMACTIVE` S0..S4 = `00001` — the bin frame **opens**, and only after the GO. No frame was left open
+  by the reset path or by M3's CT1 render job.
+- `BPCS` dropped below the latched pool size **already at S1** — after the `CT0QMA`/`QMS`/`QTS` write,
+  before `CT0QBA`, before the GO. Per §32's own matrix that makes the `0x3000` advance a
+  **register-latch artifact**: §30's R2 falls and V3D-56's "the PTB reserved the pool" is **retracted**.
+- `CT0CA` walks `BA→EA`, `CT0CS` reads `0` after, `BFC` Δ0, `FLDONE` never latches, and the poison in
+  both the tile-state array and the 32 KiB pool is fully **intact** — no PTB memory write ever happens.
+- `[v3d58] xengine` and `[v3d58] rerender` both came back clean: a CT1 render frame on the same block
+  byte-verifies a store before the bin **and again after it**. The block is sound; the wedge is
+  bin-path-exclusive and has no blast radius.
+
+So `START_TILE_BINNING` opens a frame and initialises no tile state, and `FLUSH` closes nothing.
+
+### The mainline audit — four theories closed by citation
+
+Sources read for this arc, facts-only: Linux `drivers/gpu/drm/v3d/v3d_sched.c`, `v3d_regs.h` and
+`drivers/gpu/drm/vc4/vc4_regs.h` (GPL-2.0-only); Mesa `src/gallium/drivers/v3d/v3dx_draw.c`,
+`v3dx_job.c`, `v3d_job.c` and `src/broadcom/cle/v3d_packet.xml` (MIT).
+
+| # | Theory | Verdict | Citation |
+|---|---|---|---|
+| **T1** | A zero overflow pool makes the PTB refuse to start writing (the brief's HIGH rank) | **REFUTED** | `v3d_bin_job_run` writes `V3D_PTB_BPOS = 0` as its **first** register write of **every** bin job, under the queue lock, commented *"Clear out the overflow allocation, so we don't reuse the overflow attached to a previous job."* `BPOA`/`BPOS` are written nowhere else except `v3d_overflow_mem_work`, which runs only in **response** to `V3D_INT_OUTOMEM`. Every Mesa frame on every Pi 4 enters binning with no overflow block. |
+| **T2** | The per-frame `QMA`/`QMS`/`QTS` latch resets an open frame; they should be written once | **REFUTED as a divergence** | `v3d_bin_job_run` writes `CT0QMA`+`CT0QMS` (guarded by `job->qma`), then `CT0QTS \| V3D_CLE_CT0QTS_ENABLE` (guarded by `job->qts`), then `CT0QBA`, then `CT0QEA` — per-frame, our exact order. The S1 artifact is explained and benign: latching `CT0QMS` reloads the PTB's remaining-size register, so `BPCS` tracking the write is the register doing its job. |
+| **T3** | `CT0QTS` is a tile **count**, not the tile-state **address** | **REFUTED** | Mesa `v3d_job.c`: `job->submit.qts = job->tile_state->offset`, beside `qma = tile_alloc->offset` and `qms = tile_alloc->size`, under *"On V3D 4.1, the tile alloc/state setup moved to register writes instead of binner packets."* |
+| **T4** | The bin CL is missing a terminator or semaphore packet | **REFUTED** | `v3dX(bcl_epilogue)` (v3dx_job.c) emits exactly one packet for a job without transform feedback — `FLUSH` — commented *"you would need FLUSH_ALL for that, but the HW for hasn't been validated"*. No semaphore packet is emitted on the modern V3D path at all. `v3dX(start_binning)` is `[NUMBER_OF_LAYERS] → TILE_BINNING_MODE_CFG → FLUSH_VCD_CACHE → OCCLUSION_QUERY_COUNTER → START_TILE_BINNING` — our prologue verbatim. V3D-52's auto-init audit re-confirms against the real XML: `v3d_packet.xml` code 120 `max_ver="42"` carries eight fields and **no** auto-initialise-tile-state bit. |
+
+The register protocol and the packet stream are now **both mainline-exact, end to end**. That is the
+arc's substantive result: every remaining explanation has to live somewhere neither of them describes.
+
+### What has never been read — the CTnCS decode
+
+`CT0CS` has been printed as a raw hex word since PI-V3D-13 and decoded only for `CTRUN`. §32 declined to
+go further, and declined to issue a CT0 thread reset, because mainline `v3d/v3d_regs.h` defines no
+`V3D_CLE_CT0CS` bit fields and any constant beyond `CTRUN` would be fabricated — the PI-V3D-4/-6 bug
+class. **That objection is now void.** Linux `drivers/gpu/drm/vc4/vc4_regs.h` publishes the field layout
+for the register at the same offset in the same CLE block:
+
+```
+V3D_CT0CS 0x00100 / V3D_CTNCS(n)
+  CTRSTA BIT(15) · CTSEMA BIT(12) · CTRTSD BIT(8) · CTRUN BIT(5) · CTSUBS BIT(4) · CTERR BIT(3) · CTMODE BIT(0)
+```
+
+and that is the **same header** this driver already sources `V3D_PCS` (0x130) `BMACTIVE`/`BMBUSY`/
+`RMACTIVE`/`RMBUSY`/`BMOOM` from, and the same header §30 used to establish `BPCA`/`BPCS` semantics at
+0x300/0x304. A bit position is either good enough for all three uses or for none of them.
+
+`CTERR` (bit 3) is the reading that would explain the entire paradox in one bit: a CLE that latched an
+error would walk to `EA`, drop `CTRUN`, emit nothing and leave the frame open — the exact signature. It
+has been inside every `CT0CS` hex word this campaign printed, unnamed, for nineteen probes.
+
+Three more registers have never been sampled at all. `V3D_CLE_CT0SYNC` (0x154) and `CT1SYNC` (0x158) are
+the CLE per-thread semaphores that `CTSEMA` reflects; since modern Mesa emits no semaphore packets they
+should sit at their reset value and never move across our frames. `V3D_PTB_BXCF` (0x310,
+`CLIPDISA` bit 0 / `RWORDERDISA` bit 1) is the PTB's extra-config register — defined upstream, written by
+no mainline path, and never read here.
+
+### The `[v3d59]` battery
+
+| Witness | What it does |
+| --- | --- |
+| `[v3d59] mainline` | The T1..T4 refutation ledger, emitted before the kick so the metal capture carries its own citations. |
+| `[v3d59] ctstate` | The `CT0CS`/`PCS` bit decode at all five V3D-58 stations, plus `CT0SYNC`/`CT1SYNC`/`BXCF`/`BPOA`/`BPOS`/`CT0LC`/`CT0PC`. Pure reads. |
+| `[v3d59] frameclose` | 64 further samples at 1 ms spacing **after** the FLDONE backstop gives up, watching `PCS`, `CT0CS`, `BFC`, `BPCA`, `BPCS`. Pure reads. |
+| `[v3d59] arm-overflow` | **Disarmed.** Optional pre-armed `BPOA`/`BPOS` — the T1 refutation by demonstration rather than by citation. Prints its disarmed state too, so a capture always says which rung ran. |
+| `[v3d59] ct0-reset` | **Disarmed.** Optional `CTRSTA` (bit 15) thread reset before the job. The constant is now corroborated; the write stays unjustified until `ctstate` reads `CTERR` set or a frame open at S0. |
+
+Placement is deliberate: the ledger and the reset arm run **after** the S0 sample (so S0 stays a true
+pre-program reading) and before `bin_prejob_bpos_clear`; the overflow arm sits **after** S1 (so the S1
+latch-artifact reading is not contaminated by a `BPOS` write) and before `CT0QBA`; `ctstate` and
+`frameclose` run immediately after the five-station verdict, before any cache maintenance.
+
+### The probe matrix — what each outcome proves
+
+| Witness | Reading | Verdict |
+| --- | --- | --- |
+| `[v3d59] ctstate` | `CTERR` set at any station | The CT0 control thread **faulted**. The whole paradox collapses to one undecoded bit; the station index says when it latched. Next: arm `V3D59_ARM_CT0_RESET` and hunt what the CLE rejected at that station. |
+| `[v3d59] ctstate` | `CTSUBS` set at S4 | The thread believes it is still inside a **sub-list** at the end of a list that reached `EA`. A thread parked in a sub-list never reaches the top-level `FLUSH`'s completion semantics — audit every `BRANCH`/`RETURN` in the bin CL, and read `CTRTSD` for the depth. |
+| `[v3d59] ctstate` | `CT0SYNC`/`CT1SYNC` non-zero at S0, or moving across the kick | The block carries CLE **rendezvous state** into the bin, from the reset path or from M3's render frame. Mesa emits no semaphore packets, so nothing in our frames should touch these. |
+| `[v3d59] ctstate` | `BXCF` non-zero | Something is configuring the PTB behind us on a block we reset ourselves. A bring-up fact, not a packet fact. |
+| `[v3d59] ctstate` | Clean `CT0CS`, semaphores at rest, `BXCF` zero, **`CT0LC` and `CT0PC` both unmoved** | The CLE consumed the address range without its list-item or primitive counters registering anything — it is not executing the list it fetched. Next surface is CL **fetch/decode**, not the PTB. |
+| `[v3d59] ctstate` | Clean `CT0CS`, semaphores at rest, `BXCF` zero, **counters moved** | Every CLE-side explanation is excluded by decode. The wall is inside the **PTB**, between item-accept and pool-write. |
+| `[v3d59] frameclose` | `BMACTIVE` clears **and** `BFC` advances | The bin is **slow, not wedged**. Every "never retires" verdict in this file was measured with too short a backstop — re-run the campaign before reading any of them. |
+| `[v3d59] frameclose` | `BMACTIVE` clears, `BFC` does **not** | An **aborted** frame, not a hung one: teardown runs, completion does not. Target the `BFC`/`FLDONE` latch. |
+| `[v3d59] frameclose` | `BMOOM` latches during the extra window | The PTB **is** out of binning memory, later than any single-shot sample could see. Reopens the overflow question P43/P44 closed — flip `V3D59_ARM_OVERFLOW`. |
+| `[v3d59] frameclose` | Some register moves, frame stays open | Not frozen; the binner is attempting progress with the frame open. Extend the window before calling it a hang. |
+| `[v3d59] frameclose` | Nothing moves at all | **Dead-open.** Not slow, not an overflow stall: opened by `START_TILE_BINNING`, never advanced, never closed, nothing in flight. With `[v3d58] rerender` clean, the target is the PTB frame unit alone. |
+| `[v3d59] arm-overflow` | Armed, and the bin retires | This silicon needs an overflow block up front and mainline's `BPOS=0` is insufficient for us — a genuine divergence from the kernel, worth a doc of its own. |
+
+### What is deliberately NOT armed
+
+Both behavioural arms default off. `V3D59_ARM_OVERFLOW` would run a rung mainline provably does not run
+(T1); `V3D59_ARM_CT0_RESET` is now writable with a corroborated constant but is not yet **justified** —
+§32's rule was to collect the evidence first and issue the write against a reading, and P57 saw neither
+`CTERR` nor a frame open at S0. This arc collects; the next one writes, if `ctstate` says so.
+
+QEMU `raspi4b` models no V3D block — the run short-circuits at `BLOCK-DOWN`, so no `[v3d59]` line appears
+there and `kernel8-test` green means *no regression*, nothing more. **P59 metal reads the `CTnCS` decode,
+the three never-sampled registers and the post-wedge time series.**
