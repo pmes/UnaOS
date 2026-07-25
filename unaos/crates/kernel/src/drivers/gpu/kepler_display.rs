@@ -248,11 +248,8 @@ pub unsafe fn takeover_display(
     
     serial_println!(":: kdisp: surf2 geom w={} h={} pitch={} ::", expected_width, expected_height, expected_pitch);
     
-    // GOB dimensions (fixed 64x8 bytes)
-    let gob_width_bytes = 64;
-    let gob_height = 8;
-    let gob_size_bytes = 512;
-    // We define gobs_per_row dynamically inside the loop now.
+    // (GOB constants removed — s25 mirror decode proved the scanout is
+    // LINEAR pitch 0x4000; block-linear road retired.)
     
     // 2. Pre-state
     let asm_reg = 0x640460;
