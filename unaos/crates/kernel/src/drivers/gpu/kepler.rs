@@ -676,15 +676,33 @@ pub fn init(gpu: &GpuInfo) {
                                     // after every proven read, and bracket it with cpuctl control reads so
                                     // poisoning is observed in-boot rather than inferred.
                                     serial_println!(":: kepler: recon-pre cpuctl={:08X} ::", mmio_read(bar0, 0x409000 + 0x100));
-                                    serial_println!(":: kepler: recon CTXCTL/host-interface reset values ::");
-                                    serial_println!(":: kepler: recon WRCMD_CMD={:08X} ::", mmio_read(bar0, 0x409000 + 0x504));
-                                    serial_println!(":: kepler: recon CC_SCRATCH[0]={:08X} ::", mmio_read(bar0, 0x409000 + 0x800));
-                                    serial_println!(":: kepler: recon CC_SCRATCH[1]={:08X} ::", mmio_read(bar0, 0x409000 + 0x804));
-                                    serial_println!(":: kepler: recon CHAN_CUR={:08X} ::", mmio_read(bar0, 0x409000 + 0xb00));
-                                    serial_println!(":: kepler: recon CHAN_NEXT={:08X} ::", mmio_read(bar0, 0x409000 + 0xb04));
-                                    serial_println!(":: kepler: recon ENGINE_STATUS={:08X} ::", mmio_read(bar0, 0x409000 + 0xc00));
-                                    serial_println!(":: kepler: recon ENGINE_TRIGGER={:08X} ::", mmio_read(bar0, 0x409000 + 0xc08));
+                                    
+                                    // Pull 29: read PIBUS first (defensive order)
+                                    let pibus_en1 = mmio_read(bar0, 0x122104);
+                                    serial_println!(":: kepler: recon PIBUS_MMIO_HUB_ENABLE1={:08X} ::", pibus_en1);
+                                    
+                                    if (pibus_en1 >> 16) == 0xBADF {
+                                        serial_println!(":: kepler: pring skip PIBUS itself answered BADF-family ::");
+                                    } else {
+                                        // Rotate to CC_SCRATCH[0] to test the gating theory
+                                        serial_println!(":: kepler: recon CC_SCRATCH[0]={:08X} ::", mmio_read(bar0, 0x409000 + 0x800));
+                                        
+                                        // Error-clear writes (W1C observed bits)
+                                        let intr_addr = mmio_read(bar0, 0x120120);
+                                        serial_println!(":: kepler: recon PIBUS_INTR_ADDR={:08X} ::", intr_addr);
+                                        if intr_addr != 0 { mmio_write(bar0, 0x120120, intr_addr); }
+                                        
+                                        let pibus_intr = mmio_read(bar0, 0x120128);
+                                        serial_println!(":: kepler: recon PIBUS_INTR={:08X} ::", pibus_intr);
+                                        if pibus_intr != 0 { mmio_write(bar0, 0x120128, pibus_intr); }
+                                        
+                                        let pbus_intr = mmio_read(bar0, 0x1100);
+                                        serial_println!(":: kepler: recon PBUS_INTR={:08X} ::", pbus_intr);
+                                        if pbus_intr != 0 { mmio_write(bar0, 0x1100, pbus_intr); }
+                                    }
+                                    
                                     serial_println!(":: kepler: recon-post cpuctl={:08X} ::", mmio_read(bar0, 0x409000 + 0x100));
+
 
                                     // 3. Submit Runlist
                                     mmio_write(bar0, 0x2270, (runlist_off as u32) >> 12); // target=0 (VRAM), addr
