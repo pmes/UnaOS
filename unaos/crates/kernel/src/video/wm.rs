@@ -806,7 +806,7 @@ fn composite_inner() {
     // that already drew and flushed are the ones where its cost disappears into work being done
     // anyway. The overlap test: the probe paints LAST, so anything it covers it wins, and a window
     // under its region would silently show WC-F's pattern instead of the app's content.
-    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    #[cfg(all(target_arch = "aarch64", feature = "witness", feature = "baremetal"))]
     if drawn > 0 {
         let (pw, ph) = (fb.info().width, fb.info().height);
         let clear = match super::wcf::reserved(pw, ph) {

@@ -47,7 +47,7 @@ pub mod witness;
 // geometry, plus a twin-pattern render (compositor addressing vs firmware-pitch addressing) that
 // discriminates a blit-path defect from a scan-out one. `witness`-gated AND aarch64-only, so the
 // flashable Pi media and every x86 artifact are byte-identical with it absent.
-#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+#[cfg(all(target_arch = "aarch64", feature = "witness", feature = "baremetal"))]
 pub mod wcf;
 // VPERF instrumentation (counters, fbmem readout, PCI display probe, scripted scroll scenario).
 // x86-only AND knob-gated: with the feature off — or on aarch64 regardless — nothing here
