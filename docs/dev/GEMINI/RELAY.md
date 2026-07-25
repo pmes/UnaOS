@@ -1,17 +1,15 @@
 # PETER'S RELAY SHEET — not for specialists. Coordinator overwrites this with
 # the message(s) Peter posts into each Gemini chat, verbatim.
-# (updated 2026-07-25: pull 26 APPROVED clean; pull 19 APPROVED with a binding diagonal-width amendment)
-
-## → kepler-display session
-
-Display: pull 19 proposal APPROVED with ONE BINDING AMENDMENT — the diagonal. You dropped it to 4 px wide; on a 2880×1800 15" panel that's ~0.35 mm and won't photograph. Keep your new corner-to-corner slope (diag_x = y * 2880 / 1800) but restore the width to 16 px, which is what made the s28 diagonal readable. Everything else as proposed: dst at bar1 + gop_vram_offset, 1800 rows, pitch 16384, fiducials at y<4 and y>=1796, barcode, 16-row banding, EVO latch and restore removed, fb-draw markers, one hold.
-
-One thing to state in your report so nobody reads it as a bug: this draw DESTROYS the firmware console for the rest of the boot. That's intended — we're writing on the surface being scanned and there is deliberately no restore. Kernel console output after the hold will scribble over parts of the pattern; the photo is taken during the hold, so it doesn't matter.
-
-Commit ALL docs+code, delete scratch, no push. Report "PUSH OWED: n". (I run all builds and gates.)
+# (updated 2026-07-25, after s29boot1: ⭐⭐⭐ UCODE EXECUTED + full panel owned; pulls 20 + 27 briefed)
 
 ## → kepler-fence session
 
-Fence: pull 26 proposal APPROVED, no amendments — one new write (DMACTL mask-clear), honest-null skip if bit 0 refuses to clear, baseline untouched, image A re-run exactly as landed. Implement it. If mailbox0 leaves the A5A50000 seed on this boot, that is the first UnaOS-authored code ever executed on GPU silicon.
+Fence: s29 verdict — ⭐⭐⭐ YOUR MICROCODE RAN ON THE GPU. dmactl pre=00000001 → post=00000000, and then: `ucode end img=A cpuctl=00000010 mailbox0=F00DFACE halt-iters=0` / `ucode EXECUTED img=A` / `ucode-post off=040 val=F00DFACE SENTINEL`. Not merely "the mailbox changed" — the EXACT magic you authored, twice in the same boot, with a clean halt back to cpuctl=00000010. DMACTL REQUIRE_CTX was the entire block. It also settles the IO-space question empirically: the indexed scheme is correct, image B never had to run. Five instructions written from ISA documentation, executing on GK107 silicon. s27 proved the port, s28 proved the upload and named the blocker, s29 ran it.
 
-Commit ALL docs+code, delete scratch, no push. Report "PUSH OWED: 12". (I run all builds and gates.)
+Pull 27 turns that capability on the fence wall itself — git pull, read `docs/dev/GEMINI/video/Kepler/BRIEF-kepler-fence-pull27-live-engine-witness.md`. The wall has been tested against a powered-off engine, a powered engine and a reset-pulsed engine — never a RUNNING one, because we couldn't run code. Author a BOUNDED heartbeat image that increments MAILBOX1 (derive its falcon IO address from the confirmed indexed scheme and show your work), start it without polling to completion, then print MAILBOX1 immediately before and after the existing witness block. MAILBOX1 advancing across those reads proves the engine was alive during the witness — that's the pull's central evidence. The witness sequence itself stays byte-for-byte unchanged. Bounded loop only; no unbounded spin. Full annotated listing with citations again — that's what made pull 25 approvable. Commit ALL docs+code, no push. Report "PUSH OWED: n". (I run all builds and gates.)
+
+## → kepler-display session
+
+Display: s29 verdict — ⭐⭐ FULL PANEL, cover=exact. base=00020000 pitch=16384 rows=1800 bytes=01C20000, ours == gop exactly, and Peter has the full-panel photo. UnaOS owns the rMBP display: linear, 16384 bytes per row, at VRAM 0x20000. That is the capability the lane has been chasing since s17, and your calibration pattern is now our reference frame.
+
+Pull 20 graduates it to a real console — git pull, read `docs/dev/GEMINI/video/Kepler/BRIEF-kepler-display-pull20-fbcon-on-panel.md`. There's a discrepancy to resolve first: our module has carried expected_pitch = 11520 (2880×4) since the early pulls, while the hardware's real stride is 16384, and `video::fbcon` derives its own stride from GOP mode info (fbcon.rs:157) — with the kernel console currently not visible on this panel. Measure before changing: print fbcon's own base/stride/bpp/row_bytes and compare against hw 16384, then make our side use the hardware truth. IMPORTANT: if the correction genuinely belongs inside video/fbcon.rs, that is OUTSIDE your lane — say so in the proposal and stop, and I'll route it. Then prove it visually with text-shaped output at a console-like origin. Commit ALL docs+code, no push. Report "PUSH OWED: n". (I run all builds and gates.)

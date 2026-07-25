@@ -3,6 +3,47 @@
 Hard-won silicon facts from the fox-metal sitting series. Trust these over any
 QEMU behavior. Newest sitting first.
 
+## Sitting #29 (display pull 19 + fence pull 26, UnaOS-gemini@d56c0e87, 2026-07-25, fox-metal-r23s1m, s29boot1)
+
+**⭐⭐⭐ FENCE — FIRST UNAOS CODE EXECUTED ON GPU SILICON.** Coordinator
+awk-verified in the capture, twice in the same boot:
+```
+:: kepler: dmactl pre=00000001 ::
+:: kepler: dmactl post=00000000 ::
+:: kepler: ucode end img=A cpuctl=00000010 mailbox0=F00DFACE halt-iters=0 ::
+:: kepler: ucode EXECUTED img=A mailbox0=F00DFACE ::
+:: kepler: ucode-post off=040 val=F00DFACE SENTINEL ::
+```
+**DMACTL bit 0 (REQUIRE_CTX) was the entire block** — clearing it let the
+core run on the first attempt. The mailbox holds the EXACT authored magic,
+not merely a changed value: the seed was A5A50000, so five instructions we
+wrote from ISA documentation ran on the GK107's FECS Falcon and stored
+0xF00DFACE through `iowrs I[0x1000]`. That also settles the IO-space
+question empirically: **the INDEXED scheme is correct** (host reg X →
+falcon `(X & 0xffc) << 6`), image B never needed to run. Clean halt back to
+cpuctl=00000010. K-GPU-4 milestone 2 COMPLETE. The three-sitting arc:
+s27 proved the port, s28 proved the upload and named DMACTL, s29 ran it.
+(`halt-iters=0` is uninformative as designed — the exact magic in the
+mailbox is the proof, not the poll.)
+
+**Display — full-panel framebuffer draw, `cover=exact`.** base=00020000
+pitch=16384 rows=1800 bytes=01C20000, ours == gop exactly; hold ladder and
+reg-dumps clean; ptr now reads 00000200 (the GOP base, by design),
+armed=shadow=00000200, head 0 VERT live, h1–h3 dead. Peter's full-panel
+photo is the panel record. UnaOS owns the rMBP panel through the GOP
+framebuffer: linear, 16384 B/row, at VRAM 0x20000.
+
+Next: fence pull 27 attacks the fence wall with the new capability — a
+bounded heartbeat ucode that keeps FECS RUNNING across the witness
+sequence, so PFIFO is tested against a live engine for the first time
+(the last untested variable behind err=2). Display pull 20 graduates the
+lane: `video::fbcon` currently derives its stride from GOP mode info while
+`kepler_display` assumed 11520 B/row (2880×4) against the hardware's real
+16384 — reconcile and get the kernel console rendering on the panel.
+
+Capture from byte 1347398 (mark s29boot1). ESP built by coordinator
+(sha d56c0e87…), Fox flashed only.
+
 ## Sitting #28 (display pull 18 + fence pull 25, UnaOS-gemini@754cca75/833ff9f0 + GR4 land-review, 2026-07-25, fox-metal-r23s1m, s28boot1)
 
 **Display — ⭐⭐ THE CONFOUND IS NAMED: WE HAVE BEEN PAINTING THE
