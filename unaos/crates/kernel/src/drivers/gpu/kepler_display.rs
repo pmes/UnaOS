@@ -375,10 +375,12 @@ pub unsafe fn takeover_display(
     // Overlap check (intentional for fb-draw)
     let gop_bytes = (expected_height * pitch_bytes) as usize;
     let surf2_bytes = total_bytes as usize;
-    let overlap = gop_vram_offset < gop_vram_offset + gop_bytes
-        && gop_vram_offset < gop_vram_offset + surf2_bytes;
-    serial_println!(":: kdisp: fb-draw gop-overlap={} surf2={:08X}+{:08X} gop={:08X}+{:08X} ::",
-        if overlap { "YES-INTENTIONAL" } else { "no" },
+    // We now draw AT the GOP base by design, so "do we overlap" is trivially
+    // yes and no longer informative. The live question is whether our extent
+    // exactly covers the scanned surface — a mismatch means rows are missing
+    // off the bottom or we are writing past the FB into allocator territory.
+    serial_println!(":: kdisp: fb-draw cover={} ours={:08X}+{:08X} gop={:08X}+{:08X} ::",
+        if surf2_bytes == gop_bytes { "exact" } else { "SIZE-MISMATCH" },
         gop_vram_offset, total_bytes, gop_vram_offset, gop_bytes);
 
     // 5 s hold (standing length — Peter's camera calibration, s21)
