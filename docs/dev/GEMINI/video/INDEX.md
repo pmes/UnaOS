@@ -6,7 +6,8 @@ Three pull sequences, numbered independently. Every pull = one BRIEF (coordinato
 ## Lane 1: Kepler FENCE (PFIFO/scheduler — kepler.rs) — `video/Kepler/`, files `*kepler-fence-pull<N>*` (pulls ≤13: `*kepler-pull<N>*`)
 | Pull | Files | Status | One-liner |
 |---|---|---|---|
-| 27 | BRIEF-kepler-fence-pull27-live-engine-witness | LANDED 311d4268; gated green (check/test/test-arm/esp); awaiting s30 | heartbeat ucode keeps FECS RUNNING across the witness — the last untested variable behind err=2 |
+| 28 | BRIEF-kepler-fence-pull28-fecs-ctx-study | BRIEFED — awaiting proposal | cleanroom STUDY of FECS context/init ucode (spec §3) + read-only CTXCTL recon — what does REQUIRE_CTX guard? |
+| 27 | BRIEF-kepler-fence-pull27-live-engine-witness | LANDED 311d4268; s30: ⭐ **REFUTED #8 — wall is not engine liveness** (mb1 advanced 0x5750→0x5AA5 across the strip, cpuctl=0 throughout; err=2 signature unchanged) | heartbeat ucode keeps FECS RUNNING across the witness — the last untested variable behind err=2 |
 | 26 | BRIEF-kepler-fence-pull26-dmactl-require-ctx | LANDED; s29: ⭐⭐⭐ **UCODE EXECUTED** — dmactl 1→0 unblocked it; mailbox0=F00DFACE exact, twice; indexed IO scheme confirmed | clear DMACTL bit0 REQUIRE_CTX (one write) then re-run image A — the named blocker |
 | 25 | BRIEF-kepler-fence-pull25-first-ucode | LANDED; s28: upload+page PROVEN (tlb usable, verify exact) but core stays STOPPED (cpuctl 10→12); DMACTL REQUIRE_CTX=1 named | K-GPU-4 m2: first from-scratch ucode — magic to MAILBOX0 + EXIT, FECS only, full citations required |
 | 24 | BRIEF-kepler-fence-pull24-falcon-port-probe-real-base | LANDED; s27: ⭐ **UPLOAD PATH PROVEN** — 16/16 sentinels back, both falcons, imem+dmem | sentinel probe at REAL bases (FECS/GPCCS), AINCW/AINCR discipline, zero execution |
@@ -32,7 +33,7 @@ Three pull sequences, numbered independently. Every pull = one BRIEF (coordinato
 ## Lane 2: Kepler DISPLAY (scanout — kepler_display.rs after split) — `video/Kepler/`, files `*kepler-display-pull<N>*`
 | Pull | Files | Status | One-liner |
 |---|---|---|---|
-| 20 | BRIEF-kepler-display-pull20-fbcon-on-panel | LANDED e7db05e4 (+coordinator inline fix: fbcon-view base via `current_base()`, no `framebuffer_addr` field); gated green; awaiting s30 | reconcile fbcon stride vs hw 16384 and get console-shaped output on the panel |
+| 20 | BRIEF-kepler-display-pull20-fbcon-on-panel | LANDED e7db05e4 (+inline fix: base via `current_base()`); s30: **HYPOTHESIS REFUTED — GOP reports 4096-px stride, match=true; fbcon is NOT mis-strided**; console failure is elsewhere; glyph photo pending | reconcile fbcon stride vs hw 16384 and get console-shaped output on the panel |
 | 19 | BRIEF-kepler-display-pull19-relocate-decisive | LANDED; s29: ⭐⭐ **FULL PANEL, cover=exact** — UnaOS owns the rMBP panel via the GOP FB (linear, 16384 B/row @ VRAM 0x20000) | full-panel draw at the GOP base, NO latch — make the working framebuffer first-class |
 | 18 | BRIEF-kepler-display-pull18-placement-model | LANDED; s28: ⭐⭐ **EVO LATCH REFUTED / FRAMEBUFFER WON** — graphic drew before fill-done, armed=0200 (=GOP FB) never followed; we paint the fw FB directly and it works | specialist-designed probe discriminating scaling / scan-window / latch-granularity in one photo |
 | 17 | BRIEF-kepler-display-pull17-row-offset | LANDED; s27: only WHITE visible ~2/3 down — **INCONCLUSIVE** (indistinguishable from fw console; my "impossible" arithmetic was wrong) | marker-row calibration — measure the scan-start row offset; the LAST display variable |

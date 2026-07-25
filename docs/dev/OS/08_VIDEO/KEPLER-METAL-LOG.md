@@ -3,6 +3,56 @@
 Hard-won silicon facts from the fox-metal sitting series. Trust these over any
 QEMU behavior. Newest sitting first.
 
+## Sitting #30 (display pull 20 + fence pull 27, UnaOS-gemini@913a200e, 2026-07-25, fox-metal-r23s1m, s30boot1)
+
+**FENCE — ⭐ REFUTATION #8, THE CLEANEST: THE WALL IS NOT ENGINE LIVENESS.**
+Coordinator awk-verified from mark s30boot1 (byte 1485655). The bounded
+heartbeat ucode (UCODE_HB, 0x500000-iteration loop incrementing MAILBOX1
+via `iowrs I[0x1100]`) ran continuously across the entire witness sequence:
+```
+:: kepler: hb start mb1=00000004 ::
+:: kepler: hb pre-witness mb1=00005750 cpuctl=00000000 ::
+:: kepler: WITNESS FAILED - bits stripped. Restoring inst_off+0x0C ::
+:: kepler: hb post-witness mb1=00005AA5 cpuctl=00000000 ::
+:: kepler: hb final mb1=00034328 cpuctl=00000000 ::
+:: kepler: witness-rematch end err=00000002 stat=00000005 valid=00002000 ::
+```
+MAILBOX1 monotonic 0x4 → 0x5750 → 0x5AA5 → 0x34328; cpuctl=00000000
+throughout (running, never halted — bit4 STOPPED clear the whole time).
+The strip signature is byte-identical to the s25 baseline: bits stripped,
+err=00000002, stat=00000005, valid=00002000. **PFIFO stripped the channel
+while FECS was demonstrably alive and executing.** Engine liveness joins
+the refutation ledger (#8). Precision notes: (a) stream order shows the
+pre→post bracket covers the strip+restore; `hb final` printed BEFORE the
+runlist submit lines, so the submit itself is outside the bracket — but
+the strip is the wall, and the strip was bracketed; (b) at `hb final` the
+loop was still running (0x34328 < 0x500000, cpuctl=0), so termination of
+the bound was not itself observed in-capture — the bound stands by
+construction, not observation. The fence arc now turns to what the real
+FECS context/init microcode must do (falcon_microcode_spec §3): the chip
+wants a context, not a heartbeat (DMACTL REQUIRE_CTX was the hint all
+along).
+
+**Display — HYPOTHESIS REFUTED: GOP DOES NOT REPORT 2880-STRIDE.**
+```
+:: kdisp: fbcon-view base=0000000090020000 stride_px=4096 bpp=4 w=2880 h=1800 row_bytes=16384 ::
+:: kdisp: fbcon-vs-hw row_bytes=16384 hw_pitch=16384 match=true ::
+:: kdisp: fbcon-probe drawn rows=8 ::
+```
+GOP mode info already reports stride 4096 px = 16384 B/row, exactly the
+hardware pitch, at base 0x90020000 (the GOP FB). **`video::fbcon` is NOT
+mis-strided; no fbcon stride fix is needed.** The console's failure to
+appear on the panel is therefore elsewhere (candidates: console renders
+before/behind the takeover fill; output path never targets the FB; the
+takeover draw overwrites it). Glyph-block photo (top-left, y≈64,
+x≈64/80/96): pending from Peter — verdict to be folded when it arrives,
+not presumed.
+
+Capture from byte 1485655 (mark s30boot1). ESP built by coordinator
+(sha 913a200e…), Fox sha-verified and flashed only. Coordinator inline
+fix at land-review: fbcon-view base printed via `fbcon::current_base()`
+(`FrameBufferInfo` has no `framebuffer_addr` field).
+
 ## Sitting #29 (display pull 19 + fence pull 26, UnaOS-gemini@d56c0e87, 2026-07-25, fox-metal-r23s1m, s29boot1)
 
 **⭐⭐⭐ FENCE — FIRST UNAOS CODE EXECUTED ON GPU SILICON.** Coordinator
