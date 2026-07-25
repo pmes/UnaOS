@@ -3,6 +3,47 @@
 Hard-won silicon facts from the fox-metal sitting series. Trust these over any
 QEMU behavior. Newest sitting first.
 
+## Sitting #33 boot 1 (fence pull 29 PIBUS/PRING probe, UnaOS-gemini@7f23bab5 [v1 ESP — console arc NOT aboard], 2026-07-25, fox-metal-r23s1n, s33boot1)
+
+**⭐ GATING THEORY REFUTED — THE POISON IS OFFSET-SPECIFIC, AND CC_SCRATCH
+EXISTS.** Coordinator awk-verified. Boot caveat: this boot ran the v1 ESP
+(7f23bab5) — pull 29 only; the console-on-panel arc (v2, 4e266472) missed
+the card and its panel deliverable is OWED on s33boot2. Fence results
+complete and unaffected. s30/s32 regression intact (ucode EXECUTED, hb
+mb1 0x4 → 0x574B → 0x5AB1 → 0x34335, witness signature unchanged).
+
+The pull-29 block, verbatim — NO poison fired this boot, every read real:
+```
+:: kepler: recon PIBUS_MMIO_HUB_ENABLE1=FFF9F4B0 ::   <- REAL; bit 4 (CTXCTL enable) SET
+:: kepler: recon CC_SCRATCH[0]=00000000 ::            <- rotated FIRST; REAL ZERO, not BADF
+:: kepler: recon PIBUS_INTR_ADDR=00000000 ::  VALUE=00000000  INTR=00000000
+:: kepler: recon PBUS_INTR=0000000C ::                <- only nonzero; bits 2+3 latched; W1C'd
+:: kepler: recon-post cpuctl=00000000 ::              <- real (HB running)
+```
+Banked facts: (1) **CTXCTL subunit-gating hypothesis REFUTED both ways** —
+the enable bit is already SET, and 0x409800 read FIRST returns a real
+value, so the 0x400+ space is not disabled wholesale. (2) **The poison
+trigger is per-offset**: the same CC_SCRATCH[0] that read BADF1000 in
+s31/s32 (behind WRCMD_CMD) reads clean when first. 0x409504 (WRCMD_CMD)
+is the standing suspect — the only offset ever observed to fault when
+accessed first. (3) **CC_SCRATCH[0] exists on GK107 and is 0 at rest** —
+first real per-offset datum banked; five offsets remain unknown
+(0x804/0xb00/0xb04/0xc00/0xc08). (4) PBUS_INTR held two latched bits
+(0x0C) with all PIBUS fault registers zero — recorded, cleared by
+write-back, meaning TBD. (5) **The un-wedge question is still open** —
+nothing wedged this boot, so "PRING clear recovers the unit" was not
+exercised; it needs a boot where the poison deliberately fires.
+
+Next (pull 30 shape): chain-read the five unknown offsets in one boot —
+the first BADF identifies the next faulting offset, everything after it
+is tainted, and the PRING observe/clear + cpuctl re-read right after the
+fault is the REAL un-wedge experiment. Avoid 0x409504 until the chain has
+drained the safe offsets.
+
+Capture from mark s33boot1. v1 ESP by coordinator (7f23bab5), Fox
+sha-verified, flashed. v2 (4e266472) staged for boot 2. Panel:
+calibration pattern (expected on v1).
+
 ## Sitting #32 (pull-28 recon relocated + control-bracketed, UnaOS-gemini@ee3c955a, 2026-07-25, fox-metal-r23s1n, s32boot1)
 
 **POISON LAW CONFIRMED BY ITS OWN CONTROL FRAME — and the boot cost
