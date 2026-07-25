@@ -464,6 +464,11 @@ REQUIRE \[wc-h\] rollup win=.* scope=window .*declines=.* -> TEAR-FREE
 FORBID \[wc-h\] .*-> AT-RISK
 FORBID \[wc-h\] .*-> UNSTAGED
 
+# --- CURSOR-3 — overlay-present path (printed alongside [wc-i], witness-feature only) ----------
+#     The rollup reports the sprite mechanism across composite passes: UNWITNESSED on QEMU (no
+#     pointer), COMPOSED on metal (overlay taken). See docs/dev/OS/08_VIDEO/engine.md §CURSOR-3.
+REQUIRE \[cursor3\] rollup scope=.* planned=.* offers=.* taken=.* adopt=.* repaint=.* ensure=.* ->
+
 # --- WC-J — a closed window gives its panel rows BACK ------------------------------------------
 # ---    P61 (attended): four background vugs, some killed; the operator reported one crash, two
 # ---    FROZEN windows and one still running, and `jobs` then showed all four pids exited 0 and

@@ -859,9 +859,11 @@ fn dump_firmware_state() -> (u32, u32) {
         //    after the line above and was power-cycled; the brief asked whether this fall-through performs
         //    an MMIO the skip was supposed to avoid. AUDIT RESULT: it does not. Everything below this
         //    point touches only the RC's OWN register block (`witness_rc_cpu_claim` reads MISC_CTRL +
-        //    RC_BAR2_CONFIG_LO/HI) — the same MISC block the ten reads above already answered, bracketed
-        //    by the `piusb31` enter/exit pair that printed. No child config, no outbound-window memory
-        //    cycle, no mailbox. So the wedge is NOT a mis-skipped downstream MMIO on this path.
+        //    RC_BAR2_CONFIG_LO/HI) — in DEEP mode the same MISC block the ten reads above already answered
+        //    (2 piusb31 gate reads + 8 deep diagnostic reads); in SUMMARY mode only 2 gate registers, and
+        //    witness_rc_cpu_claim is skipped. The reads are bracketed by the `piusb31` enter/exit pair that
+        //    printed. No child config, no outbound-window memory cycle, no mailbox. So the wedge is NOT a
+        //    mis-skipped downstream MMIO on this path.
         //    What is left unproven is WHICH of the three remaining candidates ate the boot: the
         //    MISC_CTRL/RC_BAR2 reads, the SError drain window, or the caller's next stage (M1). A stopwatch
         //    cannot separate them and neither could P59a's log, because none of them printed anything.
