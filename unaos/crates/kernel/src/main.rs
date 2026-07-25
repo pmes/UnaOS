@@ -2411,9 +2411,28 @@ fn pump_usb_into_gui() {
         while n < buf.len() {
             match unaos_kernel::pal::peek_event_uncounted() {
                 Some(ev) => {
+                    // WC-TAB: `true` from `wc_shell_focus_key` means CONSUMED, which is not the same as
+                    // FOCUS MOVED. Its swallow arm also returns true for the RELEASE edge of a Tab whose
+                    // press was consumed — no `el0_input_set_active`, hence no focus change and no
+                    // compensating EVENT_QUEUE drain. That edge arrives on a LATER poll than the press
+                    // and can be batched behind real input: TAB out of the ring, then a click, and the
+                    // queue is [Button, Mouse, KeyUp(9)]. Treating the swallow as a cycle would drop the
+                    // held buffer and suppress the click witness — destroying a mouse click on every TAB
+                    // out of the ring, since every such TAB produces this release edge.
+                    //
+                    // So gate on an ACTUAL transition: snapshot the active ASID and compare. This is the
+                    // same test the bare-shell drain below makes before it breaks, which is the symmetry
+                    // that was the point of having one shared body.
+                    let before = unaos_kernel::arch::aarch64::syscall::el0_input_active();
                     if unaos_kernel::arch::aarch64::syscall::wc_shell_focus_key(ev) {
-                        cycled = true;
-                        break; // focus has moved; the next pass routes to the newly-focused app
+                        if unaos_kernel::arch::aarch64::syscall::el0_input_active() != before {
+                            cycled = true;
+                            break; // focus moved; the next pass routes to the newly-focused app
+                        }
+                        // Swallow-only: the event is gone (never requeued, so account it), but the
+                        // buffer is still the app's and the scan carries on exactly as before.
+                        unaos_kernel::pal::note_uncounted_discard(1);
+                        continue;
                     }
                     // UVUG-6: typematic is fed at the HID report level, not from this drain.
                     if matches!(ev, unaos_kernel::pal::Event::Button(_)) {
@@ -2425,7 +2444,12 @@ fn pump_usb_into_gui() {
                 None => break,
             }
         }
-        if !cycled {
+        if cycled {
+            // The buffered events and the consumed TAB leave the pipeline here and are never requeued.
+            // They were counted on the way in by `push_event`, so count them out too — otherwise
+            // `[uvug10] evq`'s `push - drop - pop` occupancy reads permanently high by `n + 1` per cycle.
+            unaos_kernel::pal::note_uncounted_discard(n + 1);
+        } else {
             for ev in buf.iter().take(n) {
                 unaos_kernel::pal::requeue_event(*ev);
             }
@@ -2450,8 +2474,13 @@ fn pump_usb_into_gui() {
         // self-correcting — it re-reads the active ASID per event — but this loop's destination is fixed
         // at `gui_send`, so it would keep posting the new focus's keystrokes to the console. Re-read the
         // active ASID and leave the loop; the next pump pass takes the routing branch.
+        // Same transition test as the branch above, written the same way: a consumed TAB may be the
+        // swallowed release edge rather than a cycle, and only a real move invalidates this loop's
+        // destination. (Events here come off the COUNTED `next_event`, so no discard accounting is owed —
+        // unlike the uncounted peek above.)
+        let before = unaos_kernel::arch::aarch64::syscall::el0_input_active();
         if unaos_kernel::arch::aarch64::syscall::wc_shell_focus_key(ev) {
-            if unaos_kernel::arch::aarch64::syscall::el0_input_active() != 0 {
+            if unaos_kernel::arch::aarch64::syscall::el0_input_active() != before {
                 break;
             }
             continue;

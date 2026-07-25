@@ -739,8 +739,26 @@ pub fn requeue_event(event: Event) {
     });
 }
 
+/// WC-TAB — the THIRD outcome of the re-circulation seam: an event taken with `peek_event_uncounted` that
+/// is deliberately NOT returned.
+///
+/// The seam was written for a strict peek: pop uncounted, re-push uncounted, nothing enters or leaves the
+/// pipeline. The compositor's shell-side TAB breaks that symmetry — the TAB itself is consumed by the
+/// window system, and on a real focus change the events held in the peek buffer are discarded (they are
+/// out of the queue only because the peek holds them; `el0_input_set_active` drains `EVENT_QUEUE` on every
+/// focus change and would have taken them itself). Those events entered through `push_event` and were
+/// COUNTED, so leaving them uncounted on the way out drifts `[uvug10] evq`'s `push - drop - pop`
+/// occupancy permanently high — by the buffer size plus one per consumed cycle. Call this with the number
+/// actually dropped so `pop` keeps meaning "left the pipeline for good".
+pub fn note_uncounted_discard(count: usize) {
+    if count > 0 {
+        EVQ_POP.fetch_add(count as u64, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// The pop half of the re-circulation seam (see [`requeue_event`]). Every event taken with this MUST be
-/// returned with `requeue_event`, or the accounting silently loses it.
+/// returned with `requeue_event` — or, if it is deliberately consumed, accounted with
+/// [`note_uncounted_discard`]; otherwise the accounting silently loses it.
 pub fn peek_event_uncounted() -> Option<Event> {
     crate::arch::without_interrupts(|| EVENT_QUEUE.lock().pop())
 }
