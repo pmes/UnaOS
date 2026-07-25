@@ -1,4 +1,13 @@
-STATUS: PROPOSED
+STATUS: APPROVED (GR5, 2026-07-25) with ONE BINDING AMENDMENT — the study's
+register offsets are gf100-era ctxctl claims, not yet verified on GK107.
+Interpretation rule for the probe results: any value reading BADF1000 means
+the offset DOES NOT EXIST on this part (the s25 lesson — nonexistent-reg
+signature, not a gate), and NO Hypothesis write may be proposed against an
+offset until this probe has shown it returns a real value. Hypothesis 2
+(writing a bit into ENGINE_STATUS) is additionally flagged: status registers
+are typically read-only; if H2 is ever proposed, it must cite evidence the
+bit is host-writable. Probe code approved as committed (read-only, ring-safe,
+pre-ucode placement correct).
 
 # PROPOSAL: kepler-fence pull 28 - FECS Context/Init Study & Recon
 
