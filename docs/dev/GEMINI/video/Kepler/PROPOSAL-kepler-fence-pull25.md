@@ -27,15 +27,15 @@ The previous pull verified that the Falcon memory ports at the correct bases (`0
 
 ## Assembly Listing & Citations
 We author the microcode from scratch using the `envytools` Falcon ISA v4 (`fuc4`) specifications.
-`FALCON_MAILBOX0` is mapped at offset `0x040` in the host MMIO window, which corresponds to IO port `0x10` in the Falcon's internal IO space (`0x040 / 4 = 0x10`). 
+`FALCON_MAILBOX0` is mapped at offset `0x040` in the host MMIO window, which corresponds to IO port `0x40` in the Falcon's internal IO space. 
 
 **Program bytes (16 bytes = 4 words):**
 ```assembly
 // Address  | Bytes       | Instruction        | Citations (envytools)
 // ---------|-------------|--------------------|---------------------------------------
-// 0x0000   | f0 17 10    | mov $r1, 0x10      | docs/hw/falcon/arith.rst ("Loading immediates: mov, sethi", Form: R2, I8)
-// 0x0003   | f1 27 ce fa | mov $r2, -0x532    | docs/hw/falcon/arith.rst ("Loading immediates: mov, sethi", Form: R2, I16 sign-extended, -0x532 = 0xface)
-// 0x0007   | f1 23 0d f0 | sethi $r2, 0xf00d  | docs/hw/falcon/arith.rst ("Loading immediates: mov, sethi", Form: R2, I16 zero-extended)
+// 0x0000   | f0 17 40    | mov $r1, 0x40      | docs/hw/falcon/arith.rst ("Loading immediates: mov, sethi", Form: R2, I8)
+// 0x0003   | f1 27 ce fa | mov $r2, -0x532    | docs/hw/falcon/arith.rst ("Loading immediates: mov, sethi", Form: R2, I16 sign-ext, -0x532 = 0xface)
+// 0x0007   | f1 23 0d f0 | sethi $r2, 0xf00d  | docs/hw/falcon/arith.rst ("Loading immediates: mov, sethi", Form: R2, I16 zero-ext)
 // 0x000b   | d0 12 00    | iowr I[$r1], $r2   | docs/hw/falcon/io.rst ("IO space writes: iowr", Form: R2, I8, R1)
 // 0x000e   | f8 02       | exit               | docs/hw/falcon/proc.rst ("Halting microcode execution: exit")
 ```
@@ -44,7 +44,7 @@ We author the microcode from scratch using the `envytools` Falcon ISA v4 (`fuc4`
 These 16 bytes will be encoded into `u32` words in `kepler.rs` as:
 ```rust
 const UCODE_M2: [u32; 4] = [
-    0xf11017f0, 
+    0xf14017f0, 
     0xf1face27, 
     0xd0f00d23, 
     0x02f80012, 

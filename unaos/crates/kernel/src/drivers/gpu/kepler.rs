@@ -435,7 +435,68 @@ pub fn init(gpu: &GpuInfo) {
                                             serial_println!(":: kepler: fal-port b={:06X} dmem rb w0={:08X} w1={:08X} w2={:08X} w3={:08X} ::", base, dmem_w0, dmem_w1, dmem_w2, dmem_w3);
                                         }
 
-                                        // s25/s26 fold: 0x400100 base is proven nonexistent on GK107;
+                                        // --- K-GPU-4 Milestone 2: First Ucode Execution (FECS ONLY) ---
+                                        let base = 0x409000;
+                                        
+                                        // Envytools Falcon ISA v4 encodings
+                                        // 0x0000   | f0 17 40    | mov $r1, 0x40      | docs/hw/falcon/arith.rst (Form: R2, I8)
+                                        // 0x0003   | f1 27 ce fa | mov $r2, -0x532    | docs/hw/falcon/arith.rst (Form: R2, I16 sign-ext, -0x532 = 0xface)
+                                        // 0x0007   | f1 23 0d f0 | sethi $r2, 0xf00d  | docs/hw/falcon/arith.rst (Form: R2, I16 zero-ext)
+                                        // 0x000b   | d0 12 00    | iowr I[$r1], $r2   | docs/hw/falcon/io.rst (Form: R2, I8, R1)
+                                        // 0x000e   | f8 02       | exit               | docs/hw/falcon/proc.rst
+                                        const UCODE_M2: [u32; 4] = [
+                                            0xf14017f0, 
+                                            0xf1face27, 
+                                            0xd0f00d23, 
+                                            0x02f80012, 
+                                        ];
+
+                                        serial_println!(":: kepler: ucode ioport=0x40 ::");
+
+                                        let pre_mb0 = mmio_read(bar0, base + 0x040);
+                                        let pre_cpuctl = mmio_read(bar0, base + 0x100);
+                                        serial_println!(":: kepler: ucode pre mailbox0={:08X} cpuctl={:08X} ::", pre_mb0, pre_cpuctl);
+
+                                        mmio_write(bar0, base + 0x180, 1 << 24); // IMEMC offset=0, AINCW
+                                        mmio_write(bar0, base + 0x188, 0); // IMEMT tag=0 per 256B block
+                                        
+                                        for &word in &UCODE_M2 {
+                                            mmio_write(bar0, base + 0x184, word);
+                                        }
+                                        serial_println!(":: kepler: ucode uploaded words=4 ::");
+
+                                        mmio_write(bar0, base + 0x180, 1 << 25); // IMEMC offset=0, AINCR
+                                        let mut verify_ok = true;
+                                        let w0 = mmio_read(bar0, base + 0x184);
+                                        if w0 != UCODE_M2[0] { verify_ok = false; }
+                                        let w1 = mmio_read(bar0, base + 0x184);
+                                        if w1 != UCODE_M2[1] { verify_ok = false; }
+                                        let w2 = mmio_read(bar0, base + 0x184);
+                                        if w2 != UCODE_M2[2] { verify_ok = false; }
+                                        let w3 = mmio_read(bar0, base + 0x184);
+                                        if w3 != UCODE_M2[3] { verify_ok = false; }
+
+                                        serial_println!(":: kepler: ucode verify ok={} w0={:08X} ::", if verify_ok { "Y" } else { "N" }, w0);
+
+                                        if verify_ok {
+                                            mmio_write(bar0, base + 0x104, 0); // BOOTVEC=0
+                                            mmio_write(bar0, base + 0x100, 2); // CPUCTL=STARTCPU
+                                            serial_println!(":: kepler: ucode start cpuctl-wr=00000002 ::");
+
+                                            for _ in 0..2_000_000 {
+                                                let c = mmio_read(bar0, base + 0x100);
+                                                if (c & 0x10) != 0 {
+                                                    break; // halted
+                                                }
+                                                core::hint::spin_loop();
+                                            }
+
+                                            let post_cpuctl = mmio_read(bar0, base + 0x100);
+                                            let post_mb0 = mmio_read(bar0, base + 0x040);
+                                            serial_println!(":: kepler: ucode end cpuctl={:08X} mailbox0={:08X} ::", post_cpuctl, post_mb0);
+                                        } else {
+                                            serial_println!(":: kepler: ucode end cpuctl=VERIFY_FAIL mailbox0=VERIFY_FAIL ::");
+                                        }
                                         // dense old-base recon gated off (FTDI-ring budget).
                                         let old_base_dense = false;
                                         if old_base_dense { for pass in 0..2 {
