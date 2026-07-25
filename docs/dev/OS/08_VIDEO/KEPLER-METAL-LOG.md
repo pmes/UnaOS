@@ -3,6 +3,37 @@
 Hard-won silicon facts from the fox-metal sitting series. Trust these over any
 QEMU behavior. Newest sitting first.
 
+## Sitting #33 boot 2 (v2 ESP: console-on-panel + pull 29, UnaOS-gemini@4e266472, 2026-07-25, fox-metal-r23s1n, s33boot2)
+
+**CONSOLE MARKERS: SUCCESS FORM, EXACT EXPECTED VALUES.** Coordinator
+awk-verified:
+```
+:: fbcon: glyphs-active base=90020000 pitch=16384 cell=48x48 cols=60 rows=37 scale=6 ::
+:: kdisp: console-repaint rows=4 ::
+```
+base and pitch are exactly the scanned GOP surface; the repaint replayed
+4 bootlog rows. Panel photo verdict from Peter PENDING — fold it when it
+arrives, not before.
+
+**⭐ HEARTBEAT BOUND TERMINATION OBSERVED — pull 27's amendment finally
+closes.** mb1 froze at exactly 0x00500000 (the authored iteration bound)
+with cpuctl=00000010 (clean halt, STOPPED bit) from pre-witness onward.
+Reading: the console repaint runs BEFORE the fence block and added enough
+wall-clock for the bounded loop to run to completion — the loop
+terminates at its exact authored count and the core parks cleanly. Not an
+anomaly; the missing observation from s30/s32 (where the loop was still
+mid-count at hb final). Bonus datum: this boot's witness ran against a
+HALTED FECS and the strip signature is still byte-identical
+(err=2/stat=5/valid=00002000) — running (s30/s32) vs halted (here), same
+wall, consistent with refutation #8 from the other side.
+
+Pull-29 block: clean repeat of boot1 (enable FFF9F4B0 bit4 SET,
+CC_SCRATCH[0]=0 real, PIBUS fault regs zero, PBUS_INTR=0x0C latched again
+— reproducible across boots, still unnamed; cpuctl bracket real 0x10 both
+ends, no poison, un-wedge still unexercised).
+
+Capture from mark s33boot2. v2 ESP (4e266472), Fox sha-verified on-card.
+
 ## Sitting #33 boot 1 (fence pull 29 PIBUS/PRING probe, UnaOS-gemini@7f23bab5 [v1 ESP — console arc NOT aboard], 2026-07-25, fox-metal-r23s1n, s33boot1)
 
 **⭐ GATING THEORY REFUTED — THE POISON IS OFFSET-SPECIFIC, AND CC_SCRATCH
