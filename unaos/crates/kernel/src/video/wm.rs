@@ -587,7 +587,12 @@ pub fn repaint() {
     // sets focus before its wait loop, so the EXEC-UVUG deadline case stays excluded. Residual,
     // stated: a bg compat app still shimmers while the operator is TABbed into some OTHER app
     // (focused != 0 excludes all compat rows); cosmetic, bounded by TABbing back to the shell.
+    // Focus lives in the baremetal EL0 input router (syscall.rs is baremetal-gated); elsewhere 0
+    // means every compat row repaints, which is vacuous there (compat_present is unreachable).
+    #[cfg(feature = "baremetal")]
     let focused = crate::arch::syscall::el0_input_active();
+    #[cfg(not(feature = "baremetal"))]
+    let focused: u64 = 0;
     {
         let mut t = TABLE.lock();
         let repaintable = |r: &Window| r.used && (!r.compat || focused == 0);
