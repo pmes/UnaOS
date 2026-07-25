@@ -677,44 +677,34 @@ pub fn init(gpu: &GpuInfo) {
                                     // poisoning is observed in-boot rather than inferred.
                                     serial_println!(":: kepler: recon-pre cpuctl={:08X} ::", mmio_read(bar0, 0x409000 + 0x100));
                                     
-                                    // Pull 30: Chain Experiment (Safest First)
-                                    let offsets = [
-                                        ("CC_SCRATCH[1]", 0x804),
-                                        ("CHAN_CUR", 0xb00),
-                                        ("CHAN_NEXT", 0xb04),
-                                        ("ENGINE_STATUS", 0xc00),
-                                        ("ENGINE_TRIGGER", 0xc08),
-                                    ];
-
-                                    let mut wedged = false;
-                                    for &(name, off) in &offsets {
-                                        if wedged {
-                                            serial_println!(":: kepler: recon {} (0x{:03X}) SKIP (tainted) ::", name, off);
-                                            continue;
-                                        }
-
-                                        let val = mmio_read(bar0, 0x409000 + off);
-                                        if (val >> 16) == 0xBADF {
-                                            serial_println!(":: kepler: recon {} (0x{:03X})={:08X} FAULT ::", name, off, val);
-                                            wedged = true;
-                                            
-                                            // PRING Observe/Clear sequence
-                                            let intr_addr = mmio_read(bar0, 0x120120);
-                                            let intr_val = mmio_read(bar0, 0x120124);
-                                            let pibus_intr = mmio_read(bar0, 0x120128);
-                                            let pbus_intr = mmio_read(bar0, 0x1100);
-                                            
-                                            serial_println!(":: kepler: recon PRING-clear INTR_ADDR={:08X} INTR_VALUE={:08X} PIBUS_INTR={:08X} PBUS_INTR={:08X} ::", intr_addr, intr_val, pibus_intr, pbus_intr);
-                                            
-                                            if intr_addr != 0 { mmio_write(bar0, 0x120120, intr_addr); }
-                                            if intr_val != 0 { mmio_write(bar0, 0x120124, intr_val); }
-                                            if pibus_intr != 0 { mmio_write(bar0, 0x120128, pibus_intr); }
-                                            if pbus_intr != 0 { mmio_write(bar0, 0x1100, pbus_intr); }
-                                            
-                                            // Test un-wedge
-                                            serial_println!(":: kepler: recon un-wedge-test cpuctl={:08X} ::", mmio_read(bar0, 0x409000 + 0x100));
+                                    // Pull 31: Context-Bind Experiment
+                                    let ch_id = (inst_off as u32) >> 12;
+                                    serial_println!(":: kepler: bind-pre CHAN_CUR={:08X} CHAN_NEXT={:08X} ENGINE_STATUS={:08X} ::",
+                                        mmio_read(bar0, 0x409B00), mmio_read(bar0, 0x409B04), mmio_read(bar0, 0x409C00));
+                                    
+                                    // Write CHAN_CUR and verify
+                                    mmio_write(bar0, 0x409B00, ch_id);
+                                    let c_cur = mmio_read(bar0, 0x409B00);
+                                    if (c_cur >> 16) == 0xBADF {
+                                        serial_println!(":: kepler: bind CHAN_CUR FAULT={:08X} (skip rest) ::", c_cur);
+                                    } else {
+                                        serial_println!(":: kepler: bind CHAN_CUR={:08X} ::", c_cur);
+                                        
+                                        // Write CHAN_NEXT and verify
+                                        mmio_write(bar0, 0x409B04, ch_id);
+                                        let c_next = mmio_read(bar0, 0x409B04);
+                                        if (c_next >> 16) == 0xBADF {
+                                            serial_println!(":: kepler: bind CHAN_NEXT FAULT={:08X} (skip rest) ::", c_next);
                                         } else {
-                                            serial_println!(":: kepler: recon {} (0x{:03X})={:08X} ::", name, off, val);
+                                            serial_println!(":: kepler: bind CHAN_NEXT={:08X} ::", c_next);
+                                            
+                                            serial_println!(":: kepler: bind-post ENGINE_STATUS={:08X} ::", mmio_read(bar0, 0x409C00));
+                                            
+                                            // Explicit post-bind witness leg
+                                            let witness_val = ((userd_off >> 32) as u32) | 0x80000000;
+                                            unsafe { core::ptr::write_volatile((bar1 + inst_off + 0x0C) as *mut u32, witness_val) };
+                                            let witness_post = unsafe { core::ptr::read_volatile((bar1 + inst_off + 0x0C) as *const u32) };
+                                            serial_println!(":: kepler: witness post-bind={:08X} ::", witness_post);
                                         }
                                     }
                                     
