@@ -2412,6 +2412,18 @@ fn pump_usb_into_gui() {
         return;
     }
     while let Some(ev) = unaos_kernel::pal::next_event() {
+        // WC-TAB: the shell half of the compositor's TAB ring. This is the drain that runs when NO EL0
+        // app holds focus — i.e. when focus sits in the ring's shell slot — and it is the only point at
+        // which a TAB pressed at the shell is visible to the window system, since the `el0_input_active()
+        // != 0` gate above means `el0_input_enqueue` (where WC-C intercepts TAB) is never reached from
+        // here. Without this call the ring was a one-way exit: an operator could TAB out to the shell and
+        // never back in. `wc_shell_focus_key` shares the in-ring predicate, so TAB is consumed ONLY when
+        // there are at least two windows to rotate through; otherwise it falls through untouched and
+        // reaches the console exactly as before (`handle_key` ignores byte 9 — there is no completion or
+        // other shell binding on TAB to clobber).
+        if unaos_kernel::arch::aarch64::syscall::wc_shell_focus_key(ev) {
+            continue;
+        }
         // UVUG-6: typematic is fed at the HID report level (see pal::typematic_note_report), not this drain.
         match ev {
             unaos_kernel::pal::Event::Key(_) => {

@@ -988,9 +988,11 @@
     `EL0_INPUT_ACTIVE` to the next owner ASID in window-id order via `el0_input_set_active`, so the ring
     reset, the takeover-latch clear and the UVUG-8 cap all keep working per window. The matching KeyUp is
     swallowed with it. Fewer than two windows: TAB is delivered as an ordinary key. The ring carries one
-    slot beyond the windows — **the shell** (focus 0) — so tabbing into a window is not a trap; it is a
-    one-way exit today, since with focus 0 the router never calls the seam (re-entering needs a
-    shell-side TAB binding in `main.rs`, out of lane).
+    slot beyond the windows — **the shell** (focus 0) — so tabbing into a window is not a trap. WC-C
+    shipped that as a one-way exit (with focus 0 the router never calls the seam); **WC-TAB** closed the
+    loop by calling `syscall::wc_shell_focus_key` from the shell's own drain in `pump_usb_into_gui` — a
+    second entry point onto the same cycle body, sharing its `n < 2` guard, so TAB re-enters the ring at
+    its head and a system with fewer than two windows keeps an ordinary TAB at the shell.
   - Gates: `./arroyo check` green both arches; `./arroyo kernel8` builds (per-blob page assertions);
     `./arroyo kernel8-test 120` MBENCH **49/49 required, 0 forbidden** (three new
     `pi4-regression.spec` directives pin the UVUG checksum, the `witness=0x1fff` ledger and the

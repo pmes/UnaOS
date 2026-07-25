@@ -10268,11 +10268,11 @@ pub fn el0_input_enqueue(ev: crate::pal::Event) -> bool {
 /// watchdog would be the only way out of a perfectly healthy app. So "no app has focus" is a position in
 /// the rotation, not an absence.
 ///
-/// HONEST ASYMMETRY, stated rather than papered over: this is a one-way exit today. Once focus is the
-/// shell, `route_input_to_active_el0` is not called at all (`main.rs` gates on
-/// `el0_input_active() != 0`), so no TAB reaches this function and the operator re-enters a window the
-/// way they entered the first one. Closing the loop needs a shell-side TAB binding in `main.rs`, which is
-/// outside this arc's lane.
+/// WC-TAB closed the loop. WC-C shipped this as a one-way exit: once focus was the shell,
+/// `route_input_to_active_el0` was not called at all (`main.rs` gates on `el0_input_active() != 0`), so
+/// no TAB ever reached this function. The shell's own event drain now calls `wc_shell_focus_key`, the
+/// second entry point onto this same body, so the shell slot is a full position in the rotation —
+/// leavable and re-enterable — rather than a terminus.
 ///
 /// Two further deliberate consequences, neither hidden:
 ///  * `el0_input_set_active` also drains `pal::EVENT_QUEUE`. We are called from inside the router's drain
@@ -10393,6 +10393,32 @@ pub fn el0_input_set_active(asid: u64) {
     // on the line above and `takeover_suspends` requires a non-zero MATCHING latch before the heartbeat is even
     // consulted. Flagged rather than fixed: an Option-shaped sentinel would buy nothing real here.
     EL0_TAKEOVER_HB.store(0, Ordering::Release);
+}
+
+/// WC-TAB — the SHELL half of the focus ring, closing the one-way exit WC-C left open.
+///
+/// When focus is the shell slot, `el0_input_active()` is 0 and `main.rs` never calls
+/// `route_input_to_active_el0`, so `el0_input_enqueue` (and with it the TAB interception) is never
+/// reached: TAB got as far as the console's `handle_key`, which ignores byte 9 outright — no completion,
+/// no binding, nothing. The rotation could be left but not re-entered. The shell's own drain calls this
+/// first, so TAB there hands focus back INTO the ring on exactly the same terms.
+///
+/// Same predicate, same body, same witness as the in-ring cycle — this is a second entry point onto
+/// `wc_focus_key`, not a second implementation. Two consequences follow from that, both wanted:
+///  * With `EL0_INPUT_ACTIVE == 0` the current focus is in no window's slot, so the cycle takes the
+///    "unknown focus" arm and lands on the ring's head — the first window in window-id order.
+///  * The `n < 2` guard is shared, so a system with one window (or none) leaves TAB an ordinary key
+///    here too. That is deliberate symmetry, not an oversight: a lone window does not consume TAB, so
+///    letting the shell push focus into it would re-create the trap this arc exists to remove. Zero
+///    windows is likewise a plain fall-through — the key reaches the console exactly as before.
+///
+/// Returns `true` when the window system consumed the event; the caller must not forward it.
+/// A non-TAB event, or TAB with focus already on an app, returns `false` untouched.
+pub fn wc_shell_focus_key(ev: crate::pal::Event) -> bool {
+    if EL0_INPUT_ACTIVE.load(Ordering::Acquire) != 0 {
+        return false; // an app owns input — the router seam handles TAB, not us
+    }
+    wc_focus_key(ev)
 }
 
 /// The ASID currently designated to receive input (0 = none) — the read side of `el0_input_set_active`.

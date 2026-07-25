@@ -696,10 +696,19 @@ key falls through as an ordinary TAB.
 The ring carries **one slot beyond the windows: the shell** (`EL0_INPUT_ACTIVE == 0`). Without it the
 cycle is a closed loop over the live apps — an operator who tabs into a window can never get the keyboard
 back, and the wedge watchdog becomes the only exit from a perfectly healthy app. So "no app has focus" is
-a position in the rotation, not an absence. **Honest asymmetry:** it is a one-way exit today. Once focus
-is the shell, `route_input_to_active_el0` is not called at all (`main.rs` gates on
-`el0_input_active() != 0`), so no TAB reaches the seam and the operator re-enters a window the way they
-entered the first one. Closing the loop needs a shell-side TAB binding in `main.rs` — outside this lane.
+a position in the rotation, not an absence.
+
+**WC-TAB closed the loop.** WC-C shipped the shell slot as a one-way exit: with focus 0,
+`route_input_to_active_el0` is not called at all (`main.rs` gates on `el0_input_active() != 0`), so no
+TAB reached the seam — the ring could be left but not re-entered. The shell's own event drain in
+`pump_usb_into_gui` now calls `syscall::wc_shell_focus_key` before forwarding anything to
+`GUI_CHANNEL`. That is a second *entry point* onto the same `wc_focus_key` body, not a second
+implementation: same predicate, same `el0_input_set_active` move, same `[wc-c] focus tab-cycle` witness.
+With focus 0 in no window's slot the cycle takes its "unknown focus" arm and lands on the ring's head,
+the first window in window-id order. The `n < 2` guard is shared, so with one window (or none) TAB
+remains an ordinary key at the shell too — deliberate symmetry, since a lone window does not consume TAB
+and pushing focus into it would re-create the trap. Nothing was clobbered: the console's `handle_key`
+ignores byte 9 outright, so TAB had no shell binding before this.
 
 #### The side-by-side witness
 
