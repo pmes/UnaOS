@@ -3,6 +3,27 @@
 Hard-won silicon facts from the fox-metal sitting series. Trust these over any
 QEMU behavior. Newest sitting first.
 
+## Sitting #24 (display pull 14 + fence pull 21, UnaOS-gemini@3d12d5f5/c8993e2c+AINCR fix, 2026-07-25, fox-metal-r23s1l, s24boot1)
+
+**Fence — K-GPU-4 M1: FALCON MEMORY PORTS STILL GATED.** With PMC bit 12
+set, every access to IMEMC/IMEMD (0x400180/184) and DMEMC/DMEMD
+(0x4001C0/1C4) returns BADF1000 — control readbacks included, no sentinel
+returned. The PMC enable alone does not open the Falcon sub-block; it sits
+behind a second gate (engine-level reset/clock). Witness-rematch baseline
+unchanged (err=2, stat=5, valid=00002000), as every boot. Next (pull 22):
+PMC bit-12 RESET PULSE — clear bit 12, settle, set it, settle, then re-run
+the identical port probe + falcon core recon. Rationale: the engine was
+clear at power-on and may be latched dead; a full pulse re-initializes the
+fabric interface (nouveau-class init does reset-then-enable, and this
+stays inside the register/class we already own).
+
+**Display — all four bwpg-step cycles ran clean** (bh=4; bytes 01560000
+@pg192 / 01C80000 @pg256 for both bw values, matching computed; restores
+clean). **Verdict awaits Peter's four panel photos.**
+
+Capture: rmbp-s18/cu.usbserial-ABAFUJCO.log, mark s24boot1. Flash staged
+s24-20260725T*Z-b2aea033.
+
 ## Sitting #23 (display pull 13 + fence pull 20, UnaOS-gemini@85a4a492/504f7f80, 2026-07-25, fox-metal-r23s1l, s23boot1)
 
 **Fence — WITNESS REMATCH: REFUTED (decisive, refutation #7).** With
