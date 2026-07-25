@@ -531,6 +531,143 @@ the ceiling is 0 and the proof runs at the last LBA exactly as before.
 
 ---
 
+### 5g. PIUSB-40 — stage timing on the Pi 4 COLD-BUILD path, and the ladders that were bounded
+
+**The observation (metal P59b, two data points).** When the Pi 4 firmware hands the kernel a PCIe
+root complex still held in reset —
+
+```
+fw RC: RGR1_SW_INIT_1=0x00000003 PCIE_STATUS=0x00000000 (PHYLINKUP=false DL_ACTIVE=false)
+PIUSB-16: ENTRY link state ... -> VC left RC in reset — COLD-BUILD path (M1 reset → M2 → M3)
+```
+
+— boot **visibly pauses for roughly three minutes** (operator-timed). When the firmware leaves the
+link up (the ADOPT path), boot is fast. Whether the RC comes up in reset varies boot to boot; the
+cold-vs-warm power pattern behind it is not yet characterized.
+
+**Why a stopwatch could not localize it.** The COLD-BUILD path is a serial chain of stages, several
+of which emit no serial output between entry and exit. An operator can time the whole chain but not
+attribute it. The instrumentation below closes that gap.
+
+#### The stage-timing instrument
+
+Every bring-up stage in `arch/aarch64/piusb.rs` is bracketed off `CNTVCT` (the free-running generic
+counter — always live, no init, no interrupt dependency) and emits exactly one line:
+
+```
+:: PIUSB: [piusb40] stage=<name> took=<ms>ms (t=<ms>ms) ::
+```
+
+| Stage | What it covers | Budget on the wire |
+| --- | --- | --- |
+| `census-power-clock` | the `[piusb32]` mailbox power/clock census | 3 mailbox calls, 500 ms each on timeout |
+| `fw-state-dump` | PIUSB-5 read-only pre-reset dump | RC-own reads; CAP ladder only when link-up |
+| `dump-linkdown-rc-claim` | the link-down fall-through's `witness_rc_cpu_claim` | RC-own MISC/BAR2 reads |
+| `dump-linkdown-serror-drain` | the fall-through's SError drain window | no loop; bounded by construction |
+| `m1-rc-bringup` | whole M1 (bridge reset → windows → PERST → link) | sum of the two below plus ~2 ms of pulses |
+| `m1-perst-settle` | the mandated post-PERST-deassert wait | fixed 100 ms (Linux `PCIE_RESET_CONFIG_WAIT_MS`) |
+| `m1-link-train-poll` | PHYLINKUP+DL_ACTIVE poll | 100 ms backstop |
+| `m2-enumerate-vl805` | whole M2 (bus/mem windows, BAR sizing, NOTIFY) | ~210 ms of settles + mailbox |
+| `m2-mmio-verify` | pre-NOTIFY CAP[0] ladder over the outbound window | see ladder cap below |
+| `m3-attach-xhci` | whole M3 | sum of the three below |
+| `m3-cap-probe` | CAP[0] ladder at the assigned BAR | see ladder cap below |
+| `m3-notify` | pre-HCRST NOTIFY + decode re-assert | mailbox + ~10 ms |
+| `m3-xhci-handoff` | `xhci::init` — halt, HCRST, CNR | **3 × `hw_wait_budget()` ≈ 8.3 s worst** |
+| `enum-notify` / `enum-xhci-handoff` | the deferred half's reload + second handoff | as above |
+| `enum-rings-rs1` | rings, interrupter, RS=1 | CNR wait ≈ 2.8 s worst |
+| `enum-pump` | the bounded polled enumeration walk | 30 s backstop, early exit on armed/ready |
+| `bringup-total` / `enum-total` | the two halves end to end | — |
+
+The instrument is always-on **within the `piusb` knob** and costs one counter read plus one serial
+line per stage. It performs **no MMIO of its own**, so it is safe at every point it is placed. Every
+`[piusb40]` line sits past a gate QEMU `raspi4b` never crosses (`bringup_inner` returns at the
+`pcie@` DTB census; `enumerate` returns at the `XHCI_READY` gate), so a QEMU boot — knob on or off —
+emits **zero** `[piusb40]` lines and a byte-identical log.
+
+#### What was trimmed: the cost-blind poison-retry ladders
+
+Three places read the **outbound memory window** in a fixed retry loop shaped
+`while tries < N { settle_ms(5); read; }` — the PIUSB-5 fw-CAP probe (4 tries), the PIUSB-15
+pre-NOTIFY MMIO verify (8), and the M3 CAP probe (8). Each was *budgeted as if a try cost its
+settle*, i.e. "8 tries ≈ 40 ms".
+
+That accounting is wrong on the COLD-BUILD path. These are **memory** cycles into the RC's outbound
+window, not RC-own APB reads. A memory cycle the RC cannot forward is not answered — it is absorbed
+by the bridge's completion-timeout machinery, and this is the same mechanism already documented in
+this subsystem as stalling the CPU on the bus "for a pathologically long time" (the boot-P4 lesson
+that put the link-down MMIO gate in). A ladder that reads as a 40 ms budget can therefore spend
+**minutes**, serially, printing nothing between tries. Two such ladders back to back are the leading
+explanation for the three minutes, and the `m2-mmio-verify` / `m3-cap-probe` lines now measure it
+directly.
+
+All three now route through one helper, `mmio_settle_read`, which is bounded three ways:
+
+1. the original try count (unchanged — a healthy decode still completes identically);
+2. a **total wall-clock cap**, `MMIO_LADDER_BUDGET_MS = 60` (≈12× the 5 ms inter-try settle these
+   ladders were written around, so it never bites on a link that answers at all);
+3. a **per-read cost check**, `MMIO_ABORT_COST_MS = 20` — the ladder measures each individual read
+   and stops the moment one exceeds it, emitting
+
+   ```
+   [piusb40] mmio-ladder @ 0x…: try N took …ms (>= 20ms) — the RC is absorbing this read as a
+   completion timeout, not answering it; … Ladder STOPPED at …ms (fail-fast to the honest no-USB path)
+   ```
+
+A read that expensive is a master-abort being absorbed; every further try buys the same abort at the
+same price, so continuing is pure dead time. 20 ms is far above any honest Device-nGnRnE read
+(sub-microsecond off a decoding BAR) and far below the multi-second stalls metal has shown, so it
+separates the two cases without ever cutting a real answer short. The caller's fail-closed branch is
+unchanged in every case — the ladder only reaches its verdict sooner.
+
+**What was deliberately NOT trimmed.**
+
+- The **100 ms post-PERST-deassert settle** (`m1-perst-settle`). Mandated by the PCIe CEM T_PVPERL /
+  device-ready window and by Linux `brcm_pcie_start_link`; PIUSB-17 exists precisely because
+  skipping it produced the CNR wall. Bracketed only, so the log accounts for it honestly.
+- The **100 ms PCIe config-request window** in M2 and the SCB/CNR settles from PIUSB-16/17/18.
+- The **`xhci::init` timeouts** (`m3-xhci-handoff`, ~8.3 s worst on a firmwareless controller, paid
+  **twice** — once early, once in the deferred half). These come from `hw_wait_budget()`
+  (150e6 CNTVCT ticks ≈ 2.8 s at the Pi's 54 MHz) in `drivers/xhci` and `arch/aarch64/mod.rs` —
+  **shared kernel-core, outside the Pi track's lane**. This arc measures the stage instead of
+  re-cutting it, so the owning lane gets evidence before a shared timeout is touched.
+
+#### Wedge-path audit (the P59a full boot wedge)
+
+An earlier same-day boot did not merely pause — the wire went dead immediately after
+
+```
+fw left RC in reset — nothing to adopt/probe (…); skipping child-config + CAP probe (…)
+```
+
+and the machine was power-cycled. The audit question was whether that fall-through performs an MMIO
+the skip was supposed to avoid.
+
+**Verdict: it does not.** Everything after that line touches only the RC's **own** register block —
+`witness_rc_cpu_claim` reads `MISC_CTRL` and `RC_BAR2_CONFIG_LO/HI`, the same MISC block whose ten
+reads immediately above already answered (bracketed by the `piusb31` enter/exit pair, which printed).
+No child config, no outbound-window memory cycle, no mailbox. The wedge is **not** a mis-skipped
+downstream MMIO on this path, and no new guard is warranted there.
+
+What remains unproven is *which* of three silent candidates ate the boot: the MISC_CTRL/RC_BAR2
+reads, the SError drain window, or the caller's next stage (M1). None of them printed anything, which
+is why P59a's log could not separate them. The three brackets `dump-linkdown-rc-claim`,
+`dump-linkdown-serror-drain` and `m1-rc-bringup` now make the next boot name it: **whichever
+`[piusb40]` line is missing is the stage that wedged.**
+
+#### Metal watch-list
+
+- Which `[piusb40]` stage carries the bulk of the pause — the expectation is
+  `m2-mmio-verify` + `m3-cap-probe`, and a `mmio-ladder … STOPPED` line would confirm the
+  completion-timeout mechanism outright.
+- `m3-xhci-handoff` and `enum-xhci-handoff`: if these show ~2.8 s multiples, the shared
+  `hw_wait_budget` is a real share of the pause and the finding goes to the owning lane.
+- On the wedge path: which of the three link-down brackets fails to print.
+- Whether the ladder cap ever fires on a boot that *would* have succeeded (it should not — the
+  budget is ≫ the healthy path's cost; a `STOPPED` line on an otherwise-good boot would mean
+  `MMIO_ABORT_COST_MS` is too tight).
+
+---
+
 ## 6. Enumeration robustness (metal-informed)
 
 Root-port enumeration is a staged FSM (`debounce → await-reset → reset-settle →

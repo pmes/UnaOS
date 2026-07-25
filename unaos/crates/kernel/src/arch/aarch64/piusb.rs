@@ -192,6 +192,88 @@ fn settle_us(us: u64) {
     }
 }
 
+// ── PIUSB-40: stage timing. Metal P59b timed a ~3-minute boot pause on the COLD-BUILD path with a
+//    stopwatch; an operator stopwatch cannot name WHICH stage spent it. These two helpers bracket every
+//    bring-up stage off CNTVCT (the same free-running counter `settle_ms`/`ms_now` use — always live, no
+//    init, no interrupt dependency) and print ONE line per stage:
+//        :: PIUSB: [piusb40] stage=<name> took=<ms>ms (t=<ms>ms) ::
+//    Cost is one counter read per stage plus one serial line — always-on within the `piusb` knob, and
+//    (deliberately) emitted only on paths the DTB census already admitted to metal, so a QEMU raspi4b
+//    boot (no `pcie@` node → `bringup_inner` returns before the first stage; `XHCI_READY` false →
+//    `enumerate` returns before the first stage) produces ZERO `[piusb40]` lines and a byte-identical log.
+//    No stage helper performs MMIO — they are safe wherever they are placed.
+#[inline]
+fn stage_begin() -> u64 {
+    super::timer::cntpct()
+}
+
+/// Close a stage opened by `stage_begin` and print its wall-clock cost. Returns the closing timestamp so
+/// a caller can chain stages back-to-back without re-reading the counter.
+fn stage_end(name: &str, t0: u64) -> u64 {
+    let now = super::timer::cntpct();
+    let freq = super::timer::cntfrq().max(1);
+    let took = now.wrapping_sub(t0).saturating_mul(1000) / freq;
+    serial_println!("{} [piusb40] stage={} took={}ms (t={}ms) ::", P, name, took, now.saturating_mul(1000) / freq);
+    now
+}
+
+/// PIUSB-40: how long ONE MMIO read into the outbound window may take before we treat the RC as eating a
+/// completion timeout rather than answering. A healthy Device-nGnRnE read off a decoding BAR is sub-
+/// microsecond; a read the RC cannot forward is absorbed by the bridge's completion-timeout machinery and
+/// costs orders of magnitude more. 20 ms is far above any honest read and far below the multi-second
+/// stalls metal has shown, so it separates the two without ever cutting a real answer short.
+const MMIO_ABORT_COST_MS: u64 = 20;
+
+/// PIUSB-40: total wall-clock a poison-retry ladder over the outbound window may spend. The ladders this
+/// caps are pure "has the freshly-enabled decode woken up yet" polls — the PCIe-mandated settles
+/// (T_PVPERL, the 100 ms config-request window) are SEPARATE and untouched. 60 ms is ~12x the 5 ms
+/// inter-try settle these ladders were written around, so on a link that answers at all the ladder still
+/// completes exactly as before; it only bites when every try is being absorbed.
+const MMIO_LADDER_BUDGET_MS: u64 = 60;
+
+/// PIUSB-40: read `addr` until it returns a live (non-poison, non-zero) word, bounded BOTH by a total
+/// wall-clock budget and by a per-read cost check. Returns `(value, tries, elapsed_ms, bailed_on_cost)`.
+///
+/// Why this replaced the fixed `while tries < N { settle_ms(5); }` ladders: those ladders were budgeted as
+/// if a try cost `5 ms` (the settle) — but on the COLD-BUILD path a try that the RC cannot forward costs
+/// the RC's own completion timeout, which metal has shown reaching seconds. A ladder that "obviously"
+/// spends 40 ms can therefore spend minutes, serially, with no output between tries. So: measure each
+/// read; the moment ONE read costs more than `MMIO_ABORT_COST_MS` the ladder stops — a read that
+/// expensive is a master-abort being absorbed, and every further try buys the same abort at the same
+/// price. That is fail-fast to the honest no-USB path, not a weakened wait: nothing here is a settle the
+/// PCIe/Linux sequence mandates, and the caller's fail-closed branch is unchanged.
+fn mmio_settle_read(addr: u64, max_tries: u32) -> (u32, u32, u64, bool) {
+    let freq = super::timer::cntfrq().max(1);
+    let budget = (freq * MMIO_LADDER_BUDGET_MS) / 1000;
+    let abort_cost = (freq * MMIO_ABORT_COST_MS) / 1000;
+    let start = super::timer::cntpct();
+    let mut tries = 0u32;
+    let mut v;
+    loop {
+        let read_at = super::timer::cntpct();
+        v = r(addr);
+        let cost = super::timer::cntpct().wrapping_sub(read_at);
+        tries += 1;
+        if !is_poison(v) && v != 0 {
+            let el = super::timer::cntpct().wrapping_sub(start).saturating_mul(1000) / freq;
+            return (v, tries, el, false);
+        }
+        if cost >= abort_cost {
+            let el = super::timer::cntpct().wrapping_sub(start).saturating_mul(1000) / freq;
+            serial_println!(
+                "{} [piusb40] mmio-ladder @ {:#x}: try {} took {}ms (>= {}ms) — the RC is absorbing this read as a completion timeout, not answering it; further tries buy the same abort at the same price. Ladder STOPPED at {}ms (fail-fast to the honest no-USB path) ::",
+                P, addr, tries, cost.saturating_mul(1000) / freq, MMIO_ABORT_COST_MS, el
+            );
+            return (v, tries, el, true);
+        }
+        if tries >= max_tries || super::timer::cntpct().wrapping_sub(start) >= budget {
+            let el = super::timer::cntpct().wrapping_sub(start).saturating_mul(1000) / freq;
+            return (v, tries, el, false);
+        }
+        settle_ms(5);
+    }
+}
+
 // ── Child (VL805) config access via the brcmstb EXT_CFG window. Root-port (bus 0) config is at the RC
 // base directly; a downstream device (bus 1) is reached by writing its BDF to EXT_CFG_INDEX then
 // reading/writing at EXT_CFG_DATA + offset. ──
@@ -705,10 +787,25 @@ fn dump_firmware_state() {
             "{}   fw left RC in reset — nothing to adopt/probe (PHYLINKUP={} DL_ACTIVE={}); skipping child-config + CAP probe (MMIO into a link-down RC stalls the bus — boot-P4 stalled here) ::",
             P, phylinkup, dl_active
         );
+        // ── PIUSB-40 WEDGE AUDIT (the P59a full wedge). Metal P59a died with the wire silent immediately
+        //    after the line above and was power-cycled; the brief asked whether this fall-through performs
+        //    an MMIO the skip was supposed to avoid. AUDIT RESULT: it does not. Everything below this
+        //    point touches only the RC's OWN register block (`witness_rc_cpu_claim` reads MISC_CTRL +
+        //    RC_BAR2_CONFIG_LO/HI) — the same MISC block the ten reads above already answered, bracketed
+        //    by the `piusb31` enter/exit pair that printed. No child config, no outbound-window memory
+        //    cycle, no mailbox. So the wedge is NOT a mis-skipped downstream MMIO on this path.
+        //    What is left unproven is WHICH of the three remaining candidates ate the boot: the
+        //    MISC_CTRL/RC_BAR2 reads, the SError drain window, or the caller's next stage (M1). A stopwatch
+        //    cannot separate them and neither could P59a's log, because none of them printed anything.
+        //    These three brackets make the next boot name it: whichever `[piusb40]` line is MISSING is the
+        //    stage that wedged. They are pure counter reads + serial — they add no bus traffic of their own.
+        let t_w = stage_begin();
         witness_rc_cpu_claim();
+        let t_w = stage_end("dump-linkdown-rc-claim", t_w);
         // Drain any latent async abort the RC-register reads could have set (the R22 sitting-2 class);
         // this dump runs BEFORE M1's reset, so nothing latent may survive into the reset sequence.
         super::exceptions::serror_drain_request("piusb: PIUSB-5 dump link-down");
+        stage_end("dump-linkdown-serror-drain", t_w);
         return;
     }
     serial_println!(
@@ -742,17 +839,12 @@ fn dump_firmware_state() {
     serial_println!("{} piusb31: map_device_1gib enter (@ {:#x}, post-SMP) ::", P, cap_cpu_base);
     unsafe { super::boot::map_device_1gib(cap_cpu_base) };
     serial_println!("{} piusb31: map_device_1gib exit; CAP-read enter ::", P);
-    let mut cap0 = r(cap_cpu_base);
-    let mut tries = 1u32;
-    while (is_poison(cap0) || cap0 == 0) && tries < 4 {
-        settle_ms(2);
-        cap0 = r(cap_cpu_base);
-        tries += 1;
-    }
+    // PIUSB-40: cost-aware ladder (was a fixed 4-try / 2 ms-settle loop). See `mmio_settle_read`.
+    let (cap0, tries, ladder_ms, _bailed) = mmio_settle_read(cap_cpu_base, 4);
     if is_poison(cap0) || cap0 == 0 {
         serial_println!(
-            "{}   fw CAP probe @ {:#x} = {:#010x} after {} tries — the firmware-left state does not decode memory cycles here; the wall is upstream of the BAR ::",
-            P, cap_cpu_base, cap0, tries
+            "{}   fw CAP probe @ {:#x} = {:#010x} after {} tries ({}ms) — the firmware-left state does not decode memory cycles here; the wall is upstream of the BAR ::",
+            P, cap_cpu_base, cap0, tries, ladder_ms
         );
         witness_rc_cpu_claim();
         super::exceptions::serror_drain_request("piusb: PIUSB-5 dump poison");
@@ -882,13 +974,19 @@ fn bringup_inner(dtb: u64) {
     //    the early-vs-deferred census IDENTICAL (firmware power/clock exonerated: the DTB carries no
     //    clocks/power-domains on `pcie@`), so this line is now steady-state instrumentation, not a
     //    diagnostic diff-target.
+    // PIUSB-40: from here on every stage is bracketed. This point is PAST the DTB census, so a QEMU
+    // raspi4b boot has already returned and emits no `[piusb40]` line at all.
+    let t_total = stage_begin();
+    let t = stage_begin();
     power_clock_census("early/bringup_inner (P38 context, right before the first RC read)");
+    let t = stage_end("census-power-clock", t);
 
     // ── PIUSB-5/6: read-only reference dump FIRST (link-up-gated), reset SECOND. Capture the
     //    firmware-left state before M1 destroys it with the bridge/PERST reset. boot-P4 proved the
     //    firmware tears PCIe down before handoff (RC left fully in reset, no child config, no live
     //    decode), so the adopt path is retired — the dump is a record; we always take the reset path. ──
     dump_firmware_state();
+    let _t = stage_end("fw-state-dump", t);
 
     // ── PIUSB-16: the ENTRY link-state discriminator — the one-boot lever verdict. ────────────────
     //    Read the RC's own reset + status registers exactly as the firmware left them (both are safe
@@ -922,11 +1020,15 @@ fn bringup_inner(dtb: u64) {
     //    down the very link the VC trained and forcing a VL805 fw reload from cold (the wall this arc
     //    exists to avoid). ─────────────────────────────────────────────────────────────────────────────
     if !link_up_at_entry {
-        if !m1_rc_bringup() {
+        let t_m1 = stage_begin();
+        let m1_ok = m1_rc_bringup();
+        stage_end("m1-rc-bringup", t_m1);
+        if !m1_ok {
             serial_println!("{} M1 RC bring-up did not reach link-up — USB bring-up skipped (see lines above) ::", P);
             // SError-drain class rule (R22 sitting 2): the RC accesses above may have left a latent
             // async abort pending; a fail-closed exit must leave the machine clean.
             super::exceptions::serror_drain_request("piusb: M1 fail-closed");
+            stage_end("bringup-total (M1 fail-closed)", t_total);
             return;
         }
     } else {
@@ -935,16 +1037,23 @@ fn bringup_inner(dtb: u64) {
 
     // ── M2: VL805 enumeration + BAR sizing + firmware reset. Config-space + mailbox only — it does NOT
     //    reset the PCIe link, so it is safe on BOTH paths (cold-built or adopted). ────────────────────
-    let Some(bar0_pcie) = m2_enumerate_vl805() else {
+    let t_m2 = stage_begin();
+    let m2 = m2_enumerate_vl805();
+    stage_end("m2-enumerate-vl805", t_m2);
+    let Some(bar0_pcie) = m2 else {
         serial_println!("{} M2 VL805 enumeration failed — USB bring-up skipped (see lines above) ::", P);
         // The poisoned downstream config read (`0xdeaddead`) is the R22 sitting-2 metal offender:
         // it left a pending async external abort that detonated at the first DAIF unmask. Drain.
         super::exceptions::serror_drain_request("piusb: M2 fail-closed (poisoned cfg read)");
+        stage_end("bringup-total (M2 fail-closed)", t_total);
         return;
     };
 
     // ── M3: map the outbound window, attach the shared xHCI to the honesty line. ──────────────────
+    let t_m3 = stage_begin();
     m3_attach_xhci(OUTBOUND_CPU_BASE, bar0_pcie);
+    stage_end("m3-attach-xhci", t_m3);
+    stage_end("bringup-total", t_total);
 
     // Belt-and-suspenders: no latent async abort from any RC/BAR access may outlive the bring-up
     // (M3's fail-closed CAP-poison branch included — it returns into this drain).
@@ -1196,8 +1305,15 @@ fn m1_rc_bringup() -> bool {
     //     controller while the 8051 was still coming out of reset. That is the "MMIO live (PCIe core),
     //     state machine dead (CNR wedged)" signature this arc chases: link-trained ≠ device-ready.
     //     Wait the spec window first, exactly as Linux does. Bounded, finite (the anti-hang rule).
+    //
+    //     PIUSB-40 NOTE — this settle is NOT trimmable and was not trimmed. It is a Linux/PCIe-CEM
+    //     mandated window (`PCIE_RESET_CONFIG_WAIT_MS`), and PIUSB-17 exists precisely because skipping it
+    //     produced the CNR wall. It is bracketed so the metal log accounts for its 100 ms honestly rather
+    //     than leaving it inside an unattributed gap.
     const PERST_DEASSERT_SETTLE_MS: u64 = 100; // Linux PCIE_RESET_CONFIG_WAIT_MS
+    let t_perst = stage_begin();
     settle_ms(PERST_DEASSERT_SETTLE_MS);
+    stage_end("m1-perst-settle", t_perst);
     serial_println!(
         "{}   PIUSB-17: waited {} ms post-PERST-deassert BEFORE link poll (Linux PCIE_RESET_CONFIG_WAIT_MS; device-ready/T_PVPERL window — the 8051 fw engine needs this even though the link trains sooner) ::",
         P, PERST_DEASSERT_SETTLE_MS
@@ -1207,6 +1323,7 @@ fn m1_rc_bringup() -> bool {
     //     for up to ~500 ms; we keep a bounded 100 ms budget ON TOP of the fixed settle above). An honest
     //     DOWN after the budget is a real result, not a hang.
     let up_mask = PCIE_MISC_PCIE_STATUS_PHYLINKUP | PCIE_MISC_PCIE_STATUS_DL_ACTIVE;
+    let t_poll = stage_begin();
     let deadline = super::timer::cntpct() + super::timer::cntfrq() / 10; // ~100 ms
     let mut status = 0u32;
     let mut up = false;
@@ -1220,6 +1337,7 @@ fn m1_rc_bringup() -> bool {
         }
         core::hint::spin_loop();
     }
+    stage_end("m1-link-train-poll", t_poll);
     if !up {
         serial_println!(
             "{} M1: link DOWN after training budget (PCIE_STATUS = {:#010x}; PHYLINKUP={} DL_ACTIVE={}) — honest hardware result, no device below the RC ::",
@@ -1481,13 +1599,11 @@ fn m2_enumerate_vl805() -> Option<u64> {
     //    confirms the BAR is a real MMIO target. A poison read is recorded LOUDLY but does NOT abort:
     //    issuing the NOTIFY anyway is what captures the CNR verdict that discriminates the theories. ──
     unsafe { super::boot::map_device_1gib(OUTBOUND_CPU_BASE) };
-    let mut precap = r(OUTBOUND_CPU_BASE);
-    let mut ptries = 1u32;
-    while (is_poison(precap) || precap == 0) && ptries < 8 {
-        settle_ms(5);
-        precap = r(OUTBOUND_CPU_BASE);
-        ptries += 1;
-    }
+    // PIUSB-40: cost-aware ladder (was a fixed 8-try / 5 ms-settle loop, i.e. a "40 ms" budget that on the
+    // COLD-BUILD path could be eight serial RC completion timeouts instead). See `mmio_settle_read`.
+    let t_verify = stage_begin();
+    let (precap, ptries, _ladder_ms, _bailed) = mmio_settle_read(OUTBOUND_CPU_BASE, 8);
+    stage_end("m2-mmio-verify", t_verify);
     if is_poison(precap) || precap == 0 {
         serial_println!(
             "{}   PIUSB-15 pre-NOTIFY MMIO verify: CAP[0]={:#010x} @ {:#x} after {} tries — BAR does NOT decode MMIO yet (theory (c): the load path may not be BAR-MMIO; proceeding to NOTIFY to capture the CNR verdict) ::",
@@ -1679,14 +1795,11 @@ fn m3_attach_xhci(cpu_base: u64, _bar0_pcie: u64) {
     // Bounded settle+retry on the FIRST MMIO read (the ORIN readback-ritual idiom): a freshly-enabled
     // decode path can take a few cycles to answer. Try up to N times with a short settle between; a
     // still-poisoned read after the budget is an honest fail-closed, not a hang. Fail-closed after N.
+    // PIUSB-40: cost-aware ladder (was a fixed 8-try / 5 ms-settle loop). See `mmio_settle_read`.
     const CAP_TRIES: u32 = 8;
-    let mut cap0 = r(outbound_cpu_base);
-    let mut tries = 1u32;
-    while (is_poison(cap0) || cap0 == 0) && tries < CAP_TRIES {
-        settle_ms(5);
-        cap0 = r(outbound_cpu_base);
-        tries += 1;
-    }
+    let t_cap = stage_begin();
+    let (cap0, tries, _ladder_ms, _bailed) = mmio_settle_read(outbound_cpu_base, CAP_TRIES);
+    stage_end("m3-cap-probe", t_cap);
     if is_poison(cap0) || cap0 == 0 {
         serial_println!(
             "{}   xHCI CAP register reads {:#010x} @ {:#x} after {} tries — BAR not decoding (window/BAR mismatch or firmware not loaded); attach SKIPPED, fail-closed ::",
@@ -1731,7 +1844,9 @@ fn m3_attach_xhci(cpu_base: u64, _bar0_pcie: u64) {
     // PIUSB-19: witness link speed/width IMMEDIATELY BEFORE the M3 pre-HCRST NOTIFY (candidate-(a)) — the
     // last read of the link geometry the VC's fw (re)load engine sees before the controller is HCRST'd.
     witness_link_speed_width("M3-pre-NOTIFY");
+    let t_notify = stage_begin();
     notify_before_reset("M3 attach");
+    stage_end("m3-notify", t_notify);
     let cap_post = r(outbound_cpu_base);
     let usbsts_post = r(op_base_probe + 0x04);
     serial_println!(
@@ -1743,7 +1858,16 @@ fn m3_attach_xhci(cpu_base: u64, _bar0_pcie: u64) {
             "controller state UNCHANGED across NOTIFY (fw load did NOT alter the controller via this BAR path)"
         }
     );
+    // PIUSB-40: the xHCI handoff is the single biggest UNTRIMMABLE-FROM-HERE budget on this path —
+    // `xhci::init` runs three `wait_until` waits (HCH=1, HCRST=0, CNR=0), each bounded by
+    // `arch::hw_wait_budget()` = 150e6 CNTVCT ticks ≈ 2.8 s at the Pi's 54 MHz, so a controller whose
+    // firmware never loaded pays ~8.3 s here. Those budgets live in `drivers/xhci` + `arch/aarch64/mod.rs`
+    // (shared kernel-core, NOT this track's lane), so this arc MEASURES the stage rather than re-cutting
+    // it: the metal line below says whether the handoff is a material share of the pause, which is the
+    // evidence the owning lane would need before touching a shared timeout.
+    let t_xhci = stage_begin();
     xhci::init(outbound_cpu_base);
+    stage_end("m3-xhci-handoff", t_xhci);
 
     // Power the root ports: set PORTSC.PP (bit 9) on each port register (operational base +0x400 +
     // 0x10*port). A powered port can detect a device connect; the metal arc pumps the connect events.
@@ -1976,12 +2100,19 @@ pub fn enumerate() {
     // CRCR/DCBAAP/ERST/RS write (boot-P18..P21). Linux reloads the fw on EVERY probe immediately before
     // the HCRST (reset_control_reset → rpi_reset_reset, then xhci_gen_setup's reset); we mirror that
     // here so the CNR wait (PIUSB-10) has a running firmware to clear against.
+    // PIUSB-40: the deferred half's stages. Reached only past the `XHCI_READY` gate, so QEMU raspi4b
+    // emits none of these.
+    let t_enum_total = stage_begin();
+    let t = stage_begin();
     notify_before_reset("enumerate");
+    let t = stage_end("enum-notify", t);
     xhci::init(base);
+    stage_end("enum-xhci-handoff", t);
 
     // (2) Rings / DCBAA / interrupter via the driver's existing init paths (heap-backed). Exactly the
     //     JB2b sequence: construct the controller, seat the command + event rings, point the
     //     interrupter's ERST at the event ring, seat the command-ring pointer, then RS=1.
+    let t_rings = stage_begin();
     unsafe {
         let mut x = xhci::XhciController::new(base as usize);
         let (event_ring_phys, command_ring_phys) = {
@@ -2006,6 +2137,7 @@ pub fn enumerate() {
         x.start();
         *xhci::XHCI_CONTROLLER.lock() = Some(x);
     }
+    stage_end("enum-rings-rs1", t_rings);
 
     // XHCI-COHERENCE witness: the shared driver now self-maintains every DMA structure through its
     // internal `dma_coherency` seam (command/transfer TRBs cleaned at push, the event ring
@@ -2089,6 +2221,9 @@ pub fn enumerate() {
         }
         core::hint::spin_loop();
     }
+
+    stage_end("enum-pump", pump_start);
+    stage_end("enum-total", t_enum_total);
 
     // (4) Per-device identity lines — whatever the polled walk enumerated (kbd/mouse/storage), one
     //     line each, so the boot's serial names the topology it reached (honest even on a no-device or
