@@ -1,4 +1,10 @@
-STATUS: PROPOSED
+STATUS: APPROVED (GR5, 2026-07-25) with ONE BINDING AMENDMENT: read and
+print PFIFO_CHAN[1] word 0 BEFORE the rewrite as well (label
+`witness pre-rewrite PFIFO_CHAN[1]=…`), so the capture carries the
+resting value and the post-rewrite value side by side — self-explaining
+pre/post, no inference needed. Everything else as proposed, including the
+PLAYLIST_RD decode (accepted — the hardware reads our exact runlist) and
+keeping pull 31's bind block byte-identical.
 
 # PROPOSAL: kepler-fence pull 32 - The Register-Side Witness Strip Test
 
