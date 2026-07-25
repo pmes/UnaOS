@@ -390,6 +390,25 @@ FORBID \[wc-g\] .*-> BLIT
 # ---    concurrently lose one line. The rollup's counters are updated at record time and miss
 # ---    nothing, which is why the tear assertion is pinned on the rollup verdict.
 # ---    Witness-feature only. See docs/dev/OS/08_VIDEO/engine.md §WC-H.
+# ---    DECLINES ARE SAMPLES, and that is a correction to this witness's first cut. `stage_window`
+# ---    has four fall-back exits — box over the 4 MiB cap, `try_lock` lost to another core,
+# ---    allocator refusal, degenerate geometry — and each runs the DIRECT, pre-WC-H path, i.e. the
+# ---    tearing regime. Firing only on staged success made the verdict an overclaim: a boot in which
+# ---    96 of 100 composites lost the lock to a concurrent desktop flush would have torn
+# ---    continuously and still printed TEAR-FREE from its four staged samples, with nothing to
+# ---    catch it. So a decline spends budget, prints `-> DIRECT reason=`, and forces the rollup to
+# ---    `UNSTAGED` — which the FORBID below catches, and which makes a permanent cap fallback loud
+# ---    for free. `fixture` is counted apart and excluded from `declines=`: it is the kernel's own
+# ---    one-shot fallback (below), not a failure.
+# ---
+# ---    THE FIXTURE, and the coverage it restores. Before WC-H every `[wc-d] verify` read a
+# ---    directly-drawn window; afterwards every one of them read a staged present, so the fallback
+# ---    path stopped being verified against the scan-out at all — coverage traded away silently. A
+# ---    witness-only global one-shot latch forces the FIRST composite WC-D is about to verify onto
+# ---    the direct path. The gate runs two windows, so exactly one is verified on each path, and the
+# ---    REQUIRE below asserts the fallback was actually exercised.
 REQUIRE \[wc-h\] win=.* compose_us=.* present_us=.* torn=.* -> BUFFERED
-REQUIRE \[wc-h\] rollup win=.* scope=window .*maxpresent_us=.* -> TEAR-FREE
+REQUIRE \[wc-h\] win=.* staged=no reason=fixture -> DIRECT
+REQUIRE \[wc-h\] rollup win=.* scope=window .*declines=.* -> TEAR-FREE
 FORBID \[wc-h\] .*-> AT-RISK
+FORBID \[wc-h\] .*-> UNSTAGED

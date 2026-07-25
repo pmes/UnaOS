@@ -1396,6 +1396,14 @@ const MAX_STAGE_BYTES: usize = 4 * 1024 * 1024;
 /// always presented.
 static STAGE: Mutex<alloc::vec::Vec<u8>> = Mutex::new(alloc::vec::Vec::new());
 
+/// WC-H — whether the one-shot fallback fixture has been spent. See the fixture block in
+/// [`stage_window`]: it forces exactly one non-compat composite onto the direct path so WC-D's
+/// scan-out read-back covers the fallback as well as the staged present. `witness`-gated and
+/// aarch64-only, so the flashable media are unaffected.
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+static FALLBACK_FIXTURE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Paint one window: chrome (border frame + title strip + title text), then the surface content
 /// nearest-neighbour upscaled by `scale`, then one cache clean over the rows it touched so the
 /// non-coherent Pi 4 HVS scan-out sees the new pixels. All writes are `put_pixel`/`fill_rect` on a
@@ -1628,30 +1636,63 @@ fn stage_window(
     ph: usize,
     focused: bool,
 ) -> bool {
-    if r.compat || bw == 0 || bh == 0 {
+    if r.compat {
+        // Not a decline: compat rows are out of scope by design (see `draw_window`), and counting
+        // them would make the back layer look like it was failing when it was never asked.
         return false;
+    }
+    // Every exit below is a DECLINE: this window reaches the panel through the pre-WC-H direct
+    // path — the tearing regime — and the witness must say so, or a boot that declines
+    // continuously prints `TEAR-FREE` from whatever handful of composites did get staged. See
+    // `wcg::stage_decline`.
+    macro_rules! decline {
+        ($reason:expr) => {{
+            #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+            super::wcg::stage_decline(r.id, $reason);
+            return false;
+        }};
+    }
+    // WC-H FALLBACK FIXTURE (witness builds only) — take the direct path exactly once per boot, so
+    // WC-D's scan-out read-back verifies the FALLBACK as well as the staged path. Before WC-H every
+    // `[wc-d] verify` read a directly-drawn window; afterwards every one of them read a staged
+    // present, and that coverage would have been traded away silently. The latch is global and
+    // one-shot, and the gate runs two windows, so exactly one window is verified on each path.
+    //
+    // Armed on the composite WC-D is about to verify — the same predicate `composite_inner` tests
+    // afterwards — so the fixture and the verification cannot land in different passes.
+    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    {
+        if r.presented && r.id < 32 {
+            let bit = 1u32 << r.id;
+            if VERIFIED.load(core::sync::atomic::Ordering::Relaxed) & bit == 0
+                && !FALLBACK_FIXTURE.swap(true, core::sync::atomic::Ordering::Relaxed)
+            {
+                super::wcg::stage_decline(r.id, super::wcg::DECL_FIXTURE);
+                return false;
+            }
+        }
     }
     let info = fb.info();
     let bpp = info.bytes_per_pixel;
-    if bpp == 0 {
-        return false;
+    if bw == 0 || bh == 0 || bpp == 0 {
+        decline!(super::wcg::DECL_GEOM);
     }
     // `bw <= pw` and `bh <= ph` (both clipped by the caller), so neither product can wrap.
     let row_bytes = bw * bpp;
     let need = row_bytes * bh;
     if need == 0 || need > MAX_STAGE_BYTES {
-        return false;
+        decline!(super::wcg::DECL_CAP);
     }
     let mut stage = match STAGE.try_lock() {
         Some(g) => g,
-        None => return false,
+        None => decline!(super::wcg::DECL_LOCK),
     };
     if stage.len() < need {
         let add = need - stage.len();
         // `try_reserve` + `resize`: an exhausted heap returns here instead of panicking from present
         // context. The buffer only ever grows, so a steady window size allocates exactly once.
         if stage.try_reserve(add).is_err() {
-            return false;
+            decline!(super::wcg::DECL_ALLOC);
         }
         stage.resize(need, 0);
     }

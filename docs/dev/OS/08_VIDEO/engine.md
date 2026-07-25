@@ -1601,13 +1601,56 @@ would have left.
 The back layer carries no residue between windows because the chrome fill is dense over the whole clipped
 box: every pixel the present copies was written by the pass that composed it.
 
+One caveat on the byte-for-byte claim above, which is about the *fallback* path and not the staged one:
+the staged present writes **4 bytes per pixel** (the composed colour plus a zeroed pad byte) where the
+direct path wrote 3 and left the pad as it found it. That is not pixel-visible — the pad byte is ignored
+by the HVS on an XRGB scan-out, and it is the same zero pad `Screen`'s back buffer has always flushed to
+the front — and WC-D is unaffected, since `read_pixel` decodes the three colour bytes. But the staged
+output is byte-identical to the direct output only in the colour bytes, not in every byte of the
+framebuffer.
+
+#### Declines are samples, not non-events
+
+`stage_window` has four fall-back exits — box over the cap, `try_lock` lost, allocator refusal,
+degenerate geometry — and each runs the direct, pre-WC-H path: the tearing regime. The first cut of
+`[wc-h]` fired only on staged success, which made its verdict an overclaim. The failing scenario is
+concrete, not hypothetical: if 96 of 100 composites lost the lock to a concurrent desktop flush (a ~6 ms
+hold window, which is exactly the contention the `try_lock` exists to sidestep), the window would have
+torn continuously and the four staged samples would still have printed `TEAR-FREE`, with the FORBID
+never firing. The same blind spot would have hidden a window whose box exceeds the 4 MiB cap falling back
+*permanently*.
+
+So a decline spends sample budget, prints its own line with its reason, and forces the rollup verdict to
+`UNSTAGED` — which the spec FORBIDs alongside `AT-RISK`. `UNSTAGED` is not a softer finding than
+`AT-RISK`: it says composites reached the panel unbuffered, so the tear-free claim the staged samples
+support does not describe what the window actually did. The cap fallback becomes loud for free.
+
+```
+[wc-h] win=1 staged=no reason=fixture -> DIRECT
+[wc-h] rollup win=1 scope=window samples=4 torn=0 declines=0 fixture=1 maxpresent_us=1444 ... -> TEAR-FREE
+```
+
+#### The fallback fixture — coverage that was nearly traded away
+
+Before WC-H, every `[wc-d] verify` read a directly-drawn window. Afterwards every one of them read a
+staged present, and for non-compat windows the fallback path stopped being verified against the scan-out
+at all (WC-D skips compat rows, which are the only rows still on the direct path in normal operation).
+That is a real regression in coverage, and it would have been silent.
+
+A witness-only global one-shot latch forces the *first* composite WC-D is about to verify onto the direct
+path, armed on the same predicate `composite_inner` tests afterwards so the fixture and the verification
+cannot land in different passes. The gate runs two windows, so exactly one is verified on each path — the
+log above shows `win=1` verified after its `reason=fixture` decline and `win=2` verified on a staged
+present. `fixture` is counted apart from `declines` (the kernel asked for it) and printed separately so
+the exclusion is visible rather than assumed, and a REQUIRE asserts the fallback was actually exercised.
+
 #### `[wc-h]` — the witness, and why WC-G's `slow=` was not re-scoped
 
 `[wc-h]` splits the operation into the two halves that now mean different things:
 
 ```
 [wc-h] win=1 box=514x526 bytes=1081456 compose_us=6075 present_us=1084 rectscan_us=7305 torn=no -> BUFFERED
-[wc-h] rollup win=1 scope=window samples=4 torn=0 maxpresent_us=1634 frame_us=16667 -> TEAR-FREE
+[wc-h] rollup win=1 scope=window samples=4 torn=0 declines=0 fixture=1 maxpresent_us=1444 frame_us=16667 -> TEAR-FREE
 ```
 
 `compose_us` happens off-screen where no scan-out can observe a partial result. `present_us` is the row
@@ -1639,18 +1682,18 @@ QEMU raspi4b, forced bench geometry — **no metal in this arc**.
 
 `./arroyo check` green both arches · `./arroyo kernel8` clean, **zero `wc-h` / `wc-g` / `BUFFERED`
 strings** knob-off · `./arroyo test-arm` → xHCI MISSION SUCCESS · `UNAOS_FBW=1920 UNAOS_FBH=1200
-./arroyo kernel8-test 60` → MBENCH **61/61 required, 0 forbidden** (59 before this arc → **61** with its
-two REQUIREs; one new FORBID).
+./arroyo kernel8-test 60` → MBENCH **62/62 required, 0 forbidden** (59 before this arc → **62** with its
+three REQUIREs; two new FORBIDs, `-> AT-RISK` and `-> UNSTAGED`).
 
 Cost, on the wire, same geometry, before → after (`[wc-g] us=` is the whole copy; `[wc-h] present_us=`
 is the panel-facing part of it):
 
 | window | box | WC-G `maxus` before | WC-G `maxus` after | present max after | `rectscan_us` | verdict |
 |---|---|---|---|---|---|---|
-| 1 (crystal, 128x128@4x) | 514x526 | 15524 µs | 11294 µs | **1634 µs** | 7305 | TEAR-FREE |
-| 2 (`stat.elf`, 64x64@4x) | 258x270 | 4088 µs | 3279 µs | **332 µs** | 3750 | TEAR-FREE |
+| 1 (crystal, 128x128@4x) | 514x526 | 15524 µs | 11294 µs | **1444 µs** | 7305 | TEAR-FREE |
+| 2 (`stat.elf`, 64x64@4x) | 258x270 | 4088 µs | 3279 µs | **306 µs** | 3750 | TEAR-FREE |
 
-The panel-facing exposure fell **~9x** (15524 → 1634 µs for the crystal) and now sits at **22%** of the
+The panel-facing exposure fell **~11x** (15524 → 1444 µs for the crystal) and now sits at **20%** of the
 beam's time on the box, where before it was 218% of it. The total copy did not merely stay within a modest
 budget — it got *faster*, because the row-run replication more than paid for the extra copy: window 1's
 ceiling dropped from 15524 µs to 11294 µs, and window 2's `[wc-g]` rollup went from `slow=1` to `slow=0`
@@ -1669,9 +1712,13 @@ path this arc actually changed.
   4x, repainting continuously, with no horizontal band boundaries. WC-G's photograph is the before.
 * `[wc-h] rollup ... -> TEAR-FREE` for every window. Metal is expected to be **slower** than QEMU on both
   phases (real non-coherent framebuffer stores, a real `DC CVAC` sweep), so `present_us` will rise; the
-  margin to watch is 1634 µs against 7305 µs — a 4.5x headroom on the gate that metal must not consume.
+  margin to watch is 1444 µs against 7305 µs — a 5x headroom on the gate that metal must not consume.
   An `AT-RISK` rollup on the bench means the row copies alone are still losing the race and the next step
   is fewer bytes per present (damage sub-rects within the window box), not a bigger buffer.
+* `[wc-h] rollup ... declines=0`. A non-zero `declines=` on the bench means composites are reaching
+  the panel unbuffered — most likely `reason=lock`, i.e. real contention with the desktop flush that
+  QEMU's timing does not reproduce. That is the one number most likely to differ on metal, and it now
+  fails the gate rather than hiding behind the staged samples.
 * `[wc-g]` verdicts stay `CLEAN` or `CLEAN+SLOW`. A `COHER` or `RACE` on metal would be a *new* finding
   about the surface, unrelated to this arc — the back layer changed the destination, not the source.
 * The chrome: border and title strip must land in the same place they did, since they are now composed

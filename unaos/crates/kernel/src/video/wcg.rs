@@ -187,8 +187,78 @@ static H_TAKEN: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
 static H_TORN: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
 /// Per-id: the largest present-phase duration seen, in microseconds.
 static H_MAXPRES: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+/// Per-id: composites that did NOT reach the back layer and ran on the direct (pre-WC-H) path — the
+/// tearing regime. Excludes the deliberate fixture decline, which is counted separately.
+static H_DECLINE: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+/// Per-id: declines the KERNEL asked for, to keep the fallback path covered ([`DECL_FIXTURE`]).
+static H_FIXTURE: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
 /// Per-id: a recorded-but-not-yet-printed sample. See [`stage_flush`] for why the print is deferred.
 static H_PEND: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+/// Per-id: what the pending sample IS — [`KIND_STAGED`] or one of the decline reasons.
+static H_KIND: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+
+/// The pending sample is a staged composite; the timing fields are meaningful.
+const KIND_STAGED: u32 = 0;
+/// Decline reasons, in the order [`super::wm::stage_window`] can produce them.
+pub const DECL_GEOM: u32 = 1;
+pub const DECL_CAP: u32 = 2;
+pub const DECL_LOCK: u32 = 3;
+pub const DECL_ALLOC: u32 = 4;
+/// Not a failure: the witness build's deliberate one-shot fallback, so WC-D verifies the direct path
+/// at least once per boot. Counted apart from the real declines and never affects the verdict.
+pub const DECL_FIXTURE: u32 = 5;
+
+fn decl_name(kind: u32) -> &'static str {
+    match kind {
+        DECL_GEOM => "geom",
+        DECL_CAP => "cap",
+        DECL_LOCK => "lock",
+        DECL_ALLOC => "alloc",
+        DECL_FIXTURE => "fixture",
+        _ => "?",
+    }
+}
+
+/// WC-H — record a composite that did NOT reach the back layer.
+///
+/// **Why this exists, and what it fixes.** The first cut of this witness fired only on staged
+/// success, and the verdict it printed was an overclaim in a way that mattered: `stage_window` has
+/// four fall-back exits — a box over [`super::wm::MAX_STAGE_BYTES`], a `try_lock` lost to another
+/// core, an allocator that will not grow the buffer, degenerate geometry — and each one silently
+/// runs the DIRECT, pre-WC-H path, which is the tearing regime this arc exists to leave. A boot in
+/// which 96 of 100 composites lost the lock to a concurrent desktop flush (a ~6 ms hold window, which
+/// the compositor's own note names as expected contention) would have torn continuously and still
+/// printed `TEAR-FREE` from its four staged samples, with the FORBID never firing. The same blind
+/// spot would hide a window whose box exceeds the cap falling back *permanently*.
+///
+/// So a decline is a SAMPLE, not a non-event: it spends budget, it prints its own line with its
+/// reason, and it makes the rollup say `UNSTAGED` instead of `TEAR-FREE`. The cap fallback becomes
+/// loud for free.
+pub fn stage_decline(id: u32, reason: u32) {
+    let i = id as usize;
+    if i >= IDS {
+        return;
+    }
+    let n = H_TAKEN[i].fetch_add(1, Ordering::Relaxed) + 1;
+    if n > SAMPLES {
+        H_TAKEN[i].store(SAMPLES + 1, Ordering::Relaxed);
+        // Past budget the LINE stops but the count must not: an unstaged composite is the thing the
+        // verdict is about, and a boot that starts declining after sample 4 has to remain visible.
+        if reason == DECL_FIXTURE {
+            H_FIXTURE[i].fetch_add(1, Ordering::Relaxed);
+        } else {
+            H_DECLINE[i].fetch_add(1, Ordering::Relaxed);
+        }
+        return;
+    }
+    if reason == DECL_FIXTURE {
+        H_FIXTURE[i].fetch_add(1, Ordering::Relaxed);
+    } else {
+        H_DECLINE[i].fetch_add(1, Ordering::Relaxed);
+    }
+    H_KIND[i].store(reason, Ordering::Relaxed);
+    H_PEND[i].store(n, Ordering::Release);
+}
 static H_BOX: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
 static H_BYTES: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
 static H_COMPOSE: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
@@ -247,6 +317,7 @@ pub fn stage_note(
         H_TORN[i].fetch_add(1, Ordering::Relaxed);
     }
     H_MAXPRES[i].fetch_max(present_us, Ordering::Relaxed);
+    H_KIND[i].store(KIND_STAGED, Ordering::Relaxed);
     H_BOX[i].store(((bw as u64) << 32) | bh as u64, Ordering::Relaxed);
     H_BYTES[i].store(bytes as u64, Ordering::Relaxed);
     H_COMPOSE[i].store(compose_us, Ordering::Relaxed);
@@ -284,30 +355,53 @@ pub fn stage_flush(id: u32) {
     if n == 0 {
         return;
     }
-    let bx = H_BOX[i].load(Ordering::Relaxed);
-    let present_us = H_PRESENT[i].load(Ordering::Relaxed);
-    let rectscan_us = H_RECTSCAN[i].load(Ordering::Relaxed);
-    serial_println!(
-        "[wc-h] win={} box={}x{} bytes={} compose_us={} present_us={} rectscan_us={} torn={} -> BUFFERED",
-        id,
-        bx >> 32,
-        bx & 0xFFFF_FFFF,
-        H_BYTES[i].load(Ordering::Relaxed),
-        H_COMPOSE[i].load(Ordering::Relaxed),
-        present_us,
-        rectscan_us,
-        if present_us > rectscan_us { "yes" } else { "no" }
-    );
+    let kind = H_KIND[i].load(Ordering::Relaxed);
+    if kind == KIND_STAGED {
+        let bx = H_BOX[i].load(Ordering::Relaxed);
+        let present_us = H_PRESENT[i].load(Ordering::Relaxed);
+        let rectscan_us = H_RECTSCAN[i].load(Ordering::Relaxed);
+        serial_println!(
+            "[wc-h] win={} box={}x{} bytes={} compose_us={} present_us={} rectscan_us={} torn={} -> BUFFERED",
+            id,
+            bx >> 32,
+            bx & 0xFFFF_FFFF,
+            H_BYTES[i].load(Ordering::Relaxed),
+            H_COMPOSE[i].load(Ordering::Relaxed),
+            present_us,
+            rectscan_us,
+            if present_us > rectscan_us { "yes" } else { "no" }
+        );
+    } else {
+        // A composite that ran on the pre-WC-H direct path. `-> DIRECT` deliberately does NOT carry
+        // the rollup's verdict strings: one decline is a fact to report, not a boot to fail, and the
+        // FORBIDs sit on the rollup where the aggregate lives.
+        serial_println!("[wc-h] win={} staged=no reason={} -> DIRECT", id, decl_name(kind));
+    }
     if n == SAMPLES {
         let torn_n = H_TORN[i].load(Ordering::Relaxed);
+        let decl_n = H_DECLINE[i].load(Ordering::Relaxed);
+        // Precedence: a measured tear outranks an unmeasured one. `UNSTAGED` is not a lesser verdict
+        // — it says composites reached the panel through the unbuffered path, so the TEAR-FREE claim
+        // the staged samples support does not cover the window's actual behaviour. `fixture` is
+        // excluded from `declines` because the kernel asked for it (see `DECL_FIXTURE`); it is
+        // printed separately so the exclusion is visible rather than assumed.
+        let verdict = if torn_n > 0 {
+            "AT-RISK"
+        } else if decl_n > 0 {
+            "UNSTAGED"
+        } else {
+            "TEAR-FREE"
+        };
         serial_println!(
-            "[wc-h] rollup win={} scope=window samples={} torn={} maxpresent_us={} frame_us={} -> {}",
+            "[wc-h] rollup win={} scope=window samples={} torn={} declines={} fixture={} maxpresent_us={} frame_us={} -> {}",
             id,
             n,
             torn_n,
+            decl_n,
+            H_FIXTURE[i].load(Ordering::Relaxed),
             H_MAXPRES[i].load(Ordering::Relaxed),
             FRAME_US,
-            if torn_n > 0 { "AT-RISK" } else { "TEAR-FREE" }
+            verdict
         );
     }
 }
