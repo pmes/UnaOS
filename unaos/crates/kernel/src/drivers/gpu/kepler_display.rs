@@ -240,6 +240,16 @@ pub unsafe fn takeover_display(
     let expected_width = gop_info.width as u32;
     let expected_height = gop_info.height as u32;
     let expected_pitch = expected_width * 4;
+    
+    let fbcon_stride = gop_info.stride as u32;
+    let fbcon_bpp = gop_info.bytes_per_pixel as u32;
+    let fbcon_row_bytes = fbcon_stride * fbcon_bpp;
+    serial_println!(":: kdisp: fbcon-view base={:016X} stride_px={} bpp={} w={} h={} row_bytes={} ::",
+        gop_info.framebuffer_addr, fbcon_stride, fbcon_bpp, expected_width, expected_height, fbcon_row_bytes);
+    
+    let hw_pitch = 16384;
+    serial_println!(":: kdisp: fbcon-vs-hw row_bytes={} hw_pitch={} match={} ::",
+        fbcon_row_bytes, hw_pitch, fbcon_row_bytes == hw_pitch);
     let fb_size = (expected_width * expected_height * 4) as usize;
 
     let bar1 = vram_base;
@@ -410,6 +420,19 @@ pub unsafe fn takeover_display(
         }
     }
     serial_println!(":: kdisp: fb-draw hold end ::");
+
+    // Pull 20: Draw console-like glyph blocks using the true 16384 pitch
+    for y in 64..72 {
+        let row_base = y * pitch_bytes;
+        for x in 0..(pitch_bytes / 4) {
+            if (x >= 64 && x < 72) || (x >= 80 && x < 88) || (x >= 96 && x < 104) {
+                let target_byte_addr = row_base + (x * 4);
+                let target_ptr = dst.add(target_byte_addr as usize) as *mut u32;
+                core::ptr::write_volatile(target_ptr, 0xFFFFFFFF);
+            }
+        }
+    }
+    serial_println!(":: kdisp: fbcon-probe drawn rows=8 ::");
 
     serial_println!(":: kdisp: fb-draw done ::");
 
