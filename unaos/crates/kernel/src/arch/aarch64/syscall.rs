@@ -9208,7 +9208,7 @@ fn exec1_witness(_demo_cpu: usize) {
     }
 }
 
-/// BGRUN-ST: the background-run contract, headless. Two legs, each a spec REQUIRE:
+/// BGRUN-ST: the background-run contract, headless. Three legs, each a spec REQUIRE:
 ///  1. spawn -> exit -> reap: `bg` ELFHELLO detached, poll (no reap) until `Exited(0)`, then reap and
 ///     verify a second poll reads `Gone` — the sole-reaper contract end-to-end with no HID involved.
 ///  2. kill mid-run: `bg` UVUG (a real multi-second program), `bg_kill` it, and require the row to be
@@ -9216,7 +9216,13 @@ fn exec1_witness(_demo_cpu: usize) {
 ///     must-fix 2: a dispatch-boundary kill never reaches SYS_EXIT, so a kill that defers to `jobs`
 ///     reads "running" forever). Either kill outcome is legal (`confirmed` reaps here; `already exited`
 ///     leaves a PEXITED row we then reap by poll) — what the witness REQUIREs is that the row is not
-///     leaked and not lying. An honest skip without the SD/fixtures.
+///     leaked and not lying.
+///  3. persistence + kill (BGRUN-2): `bg` STAT.ELF — a windowed app with NO exit condition — dwell 2 s,
+///     REQUIRE the row still reads `Running` (it did not batch-exit on unfocus and did not fault), then
+///     kill it and require the row settles as in leg 2. This is the property the WC-TAB ring needs and
+///     that legs 1 and 2 structurally cannot witness: both of their programs end by themselves.
+///
+/// An honest skip without the SD/fixtures.
 fn bgrun_witness(_demo_cpu: usize) {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -9299,6 +9305,56 @@ fn bgrun_witness(_demo_cpu: usize) {
                 serial_println!(
                     ":: BGRUN-ST: kill mid-run — row never settled ({}) -> FAIL ::",
                     verdict
+                );
+            }
+        }
+    }
+    // Leg 3 (BGRUN-2): PERSISTENCE. Legs 1 and 2 both lean on programs that end by themselves — ELFHELLO
+    // exits in three syscalls, UVUG exits after 300 auto frames. Neither can witness the property the TAB
+    // ring actually needs: a bg app that is STILL THERE later. That gap was not academic — it is exactly
+    // why the bench could not test TAB at all, because the backgrounded UVUG is unfocused, never leaves its
+    // auto path, and is gone in seconds.
+    //
+    // STAT.ELF has no exit condition at all, so the leg is: spawn detached, let it run a real interval,
+    // REQUIRE the row still reads Running (it did NOT batch-exit on unfocus, and it did not fault), then
+    // kill it and require the row settles exactly as leg 2 does. The interval is timer-derived (2 s of
+    // `cntpct`), comfortably longer than UVUG's whole 300-frame auto run — so "still running" here cannot
+    // be confused with "has not got round to exiting yet".
+    let Some(stat) = read(&mt, "/fat/STAT.ELF") else {
+        serial_println!(":: BGRUN-ST: /fat/STAT.ELF not found — persistence leg skipped ::");
+        return;
+    };
+    match spawn_user_image_bg(&stat) {
+        Err(why) => serial_println!(":: BGRUN-ST: persist-leg spawn rejected ({}) -> FAIL ::", why),
+        Ok((pid, asid, _entry)) => {
+            let t0 = super::timer::cntpct();
+            let dwell = super::timer::cntfrq().saturating_mul(2);
+            while super::timer::cntpct().wrapping_sub(t0) < dwell {
+                super::sched::yield_now();
+            }
+            // The whole point of the leg: after a real interval the app is neither exited nor faulted.
+            // Poll WITHOUT reaping — a reap here would consume the row we are about to kill.
+            let alive = matches!(bg_poll(pid, false), BgPoll::Running);
+            let verdict = bg_kill(pid, asid);
+            let t1 = super::timer::cntpct();
+            let budget = super::timer::cntfrq().saturating_mul(5);
+            let settled = loop {
+                match bg_poll(pid, true) {
+                    BgPoll::Gone => break true,
+                    BgPoll::Exited(_) | BgPoll::Faulted => {} // reaped this pass; next poll reads Gone
+                    BgPoll::Running => {}                     // PORPHANED fallback settles at a boundary
+                }
+                if super::timer::cntpct().wrapping_sub(t1) >= budget {
+                    break false;
+                }
+                super::sched::yield_now();
+            };
+            if alive && settled {
+                serial_println!(":: BGRUN-ST: persist+kill PASS (pid={}, {}) ::", pid, verdict);
+            } else {
+                serial_println!(
+                    ":: BGRUN-ST: persist+kill alive={} settled={} ({}) -> FAIL ::",
+                    alive, settled, verdict
                 );
             }
         }

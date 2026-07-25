@@ -241,10 +241,15 @@ FORBID \[wc-d\] verify .*-> FAIL
 # --- BGRUN-1: background EL0 runs (bg/jobs/kill). Headless-observable core of the contract,
 # ---   REQUIREd per the round-1 lens: leg 1 proves spawn->exit->reap (the sole-reaper contract);
 # ---   leg 2 proves a killed bg row settles (confirmed-kill reaps in place; no leaked PRUNNING row
-# ---   lying "running" under a dead task). The interactive half (TAB between two bg windows) is
-# ---   bench-only — QEMU has no HID.
+# ---   lying "running" under a dead task); leg 3 (BGRUN-2) proves PERSISTENCE — STAT.ELF, an EL0
+# ---   window app with no exit condition, is still `Running` after a 2 s dwell and then settles when
+# ---   killed. Legs 1 and 2 structurally cannot prove that: ELFHELLO exits in three syscalls and UVUG
+# ---   exits after 300 auto frames, which is precisely why the bench could not test TAB before — a
+# ---   backgrounded UVUG is unfocused, never leaves its auto path, and is gone in seconds. The
+# ---   interactive half (TAB between two bg windows) is still bench-only — QEMU has no HID.
 REQUIRE BGRUN-ST: spawn->exit->reap PASS
 REQUIRE BGRUN-ST: kill mid-run PASS \(pid=[0-9]+, killed — row reaped
+REQUIRE BGRUN-ST: persist\+kill PASS \(pid=[0-9]+,
 FORBID BGRUN-ST: .*-> FAIL
 #
 # --- 5. WC-E: the SCAN-OUT GROUND TRUTH. Every directive above this one checks a number the KERNEL

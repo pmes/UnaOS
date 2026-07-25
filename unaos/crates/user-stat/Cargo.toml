@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 The Architect & Una
+#
+# BGRUN-2: the PERSISTENCE app — a tiny EL0 program that opens a compositor window, repaints a visibly
+# changing readout, and NEVER exits on its own. Like `user-elf` (ELFHELLO) and `user-uvug`, this crate's
+# link product is kept AS AN ELF64 and handed to the kernel's aarch64 loader (validate + walk the PT_LOAD
+# program headers + map each segment with per-segment permissions).
+#
+# WHY IT EXISTS. BGRUN-1 landed `bg`/`jobs`/`kill`, but the WC-TAB window ring stayed un-testable at the
+# bench: the only windowed EL0 app was UVUG, and a BACKGROUNDED uvug is unfocused, so it never leaves its
+# deterministic auto path and exits after 300 frames — seconds. Two windows flashed past before an operator
+# could press TAB. `stat.elf` is the missing fixture: it runs until it is KILLED, so `bg` twice gives two
+# coexisting windows that stay on the panel for as long as the operator wants.
+#
+# The empty [workspace] table makes this crate its OWN workspace root, so the parent UnaOS workspace never
+# tries to build this no_std/no_main EL0 program for the host toolchain during `./arroyo check`.
+[workspace]
+
+[package]
+name = "user-stat"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "user-stat"
+path = "src/main.rs"
+
+# Tiny freestanding program: size-optimised, panic=abort (no unwinder in a no_std EL0 program), lto folds
+# the routines. No dependencies.
+[profile.release]
+opt-level = "s"
+panic = "abort"
+lto = true

@@ -934,6 +934,32 @@ kernel8() {
     [ "$usz" -le 16384 ] || { echo -e "${COLOR_RED}ERROR: UVUG.ELF ${usz} bytes > USER_REGION_SIZE (16384)${COLOR_RESET}"; exit 1; }
     echo -e "${COLOR_GREEN}✅ static-ELF EL0 mini-vug program: UVUG.ELF (${usz} B)${COLOR_RESET}"
 
+    # BGRUN-2: build the static ELF64 EL0 PERSISTENCE program (crates/user-stat) exactly like UVUG/ELFHELLO
+    # — keep it AS AN ELF (strip-all preserves the ELF header + program headers + the two PT_LOAD segments).
+    # It creates one 128x128 compositor window (SYS_WIN_CREATE), repaints its own pid + a frame counter + a
+    # sweep block, and NEVER exits on its own — `kill <pid>` is the whole remedy. That is what makes the
+    # WC-TAB window ring operator-verifiable: a backgrounded UVUG is unfocused, stays on its deterministic
+    # auto path and is gone in 300 frames, so two windows never coexisted long enough to TAB between them.
+    # Same linker script shape as UVUG (crates/user-stat/user-stat.ld — two PT_LOAD segments via a PHDRS
+    # clause); `-z max-page-size=0x1000` packs the segments on 4 KiB boundaries so the image fits the
+    # kernel's 16 KiB slot window.
+    echo -e "${COLOR_YELLOW}⚡ Building EL0 persistence static-ELF program (crates/user-stat → target/STAT.ELF)...${COLOR_RESET}"
+    cd "$WORKSPACE_DIR/crates/user-stat"
+    RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-stat/user-stat.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
+      cargo +nightly build --release -Z json-target-spec
+    cd "$WORKSPACE_DIR"
+    "$TOOLBIN/llvm-objcopy" --strip-all \
+      "${WORKSPACE_DIR}/crates/user-stat/target/aarch64-base/release/user-stat" \
+      "${WORKSPACE_DIR}/target/STAT.ELF"
+    # Same three checks as UVUG: it must exist, begin with the ELF magic (\x7fELF), and fit the slot window
+    # (USER_REGION_SIZE = 16 KiB; a larger image is BadSize at load).
+    [ -s "${WORKSPACE_DIR}/target/STAT.ELF" ] || { echo -e "${COLOR_RED}ERROR: STAT.ELF missing/empty — STAT build failed${COLOR_RESET}"; exit 1; }
+    smag="$(head -c 4 "${WORKSPACE_DIR}/target/STAT.ELF" | od -An -tx1 | tr -d ' \n')"
+    [ "$smag" = "7f454c46" ] || { echo -e "${COLOR_RED}ERROR: STAT.ELF does not start with the ELF magic; first 4 bytes = ${smag}${COLOR_RESET}"; exit 1; }
+    ssz="$(wc -c < "${WORKSPACE_DIR}/target/STAT.ELF" | tr -d ' ')"
+    [ "$ssz" -le 16384 ] || { echo -e "${COLOR_RED}ERROR: STAT.ELF ${ssz} bytes > USER_REGION_SIZE (16384)${COLOR_RESET}"; exit 1; }
+    echo -e "${COLOR_GREEN}✅ static-ELF EL0 persistence program: STAT.ELF (${ssz} B)${COLOR_RESET}"
+
     # K2 metal money-shot: UNAOS_K2_LEAVE=1 adds the `k2_leave` feature — k2_liveenf becomes a two-boot
     # cross-reboot power-cycle proof (boot-1 leaves a persisted owned file; boot-2 verifies the live boot
     # rebuild). OFF => the normal same-boot battery (byte-identical). For the ATTENDED Pi bench only.
@@ -1143,6 +1169,12 @@ kernel8() {
     # runs the same bytes live. Distinct 8.3 name => its own IMAGE_SHA256 principal; never collides with the
     # flat fixtures or ELFHELLO.ELF.
     cp "${WORKSPACE_DIR}/target/UVUG.ELF" "$KERNEL8_DIR/UVUG.ELF"
+
+    # BGRUN-2: carry the persistence static ELF64 onto the boot media as STAT.ELF (make-pi-img.sh ditto's
+    # the whole staging dir). The BGRUN-ST persistence leg reads it back off the SD through the VFS and
+    # spawns it detached; the operator drives the same bytes with `bg /fat/STAT.ELF`. Distinct 8.3 name =>
+    # its own IMAGE_SHA256 principal; never collides with the flat fixtures, ELFHELLO.ELF or UVUG.ELF.
+    cp "${WORKSPACE_DIR}/target/STAT.ELF" "$KERNEL8_DIR/STAT.ELF"
 
     # U9: plant a DEDICATED writable scratch file (NEVER HELLO.BIN — other fixtures load that as EL0 code).
     # 1 KiB (> 512 so fat::probe_once never cats it) of a known 0xEE filler; the u9 File-write demo opens it

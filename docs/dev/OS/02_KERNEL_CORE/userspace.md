@@ -913,14 +913,46 @@
     (`proc_orphan`'s PRUNNING precondition is honoured — the round-1 lens showed the alternative parks
     the shell task forever on a permitless `done.wait`).
   - Witnesses: `:: BGRUN: bg <path> — … DETACHED ::` on spawn, `:: BGRUN: jobs — pid=… reaped ::` on reap,
-    and the boot-time `BGRUN-ST` selftest pair, spec-REQUIREd (spawn->exit->reap + kill-mid-run, plus a
-    `-> FAIL` FORBID) — the round-1 lens showed the headless-observable core of the contract was gateable
-    after all. Only the INTERACTIVE half is bench-only (QEMU has no HID): `bg /fat/uvug.elf` twice → TAB
-    between two live crystals. One widening worth knowing at the bench: the shell now consumes TAB at
+    and the boot-time `BGRUN-ST` selftest (spawn->exit->reap + kill-mid-run + BGRUN-2's persist+kill),
+    each spec-REQUIREd plus a `-> FAIL` FORBID — the round-1 lens showed the headless-observable core of
+    the contract was gateable after all. Only the INTERACTIVE half is bench-only (QEMU has no HID): see
+    BGRUN-2 below for the app that makes it testable. One widening worth knowing at the bench: the shell now consumes TAB at
     n == 1, so TABbing during a single-window foreground `run` drops focus to the parked shell — TAB back
     re-enters; linger instead and the takeover re-arm can SKILL-1 the app ~5 s later. The safety property
     (never weld the operator away from `kill`) outranks that exposure, deliberately.
-- **EXEC1-M (this arc)** — the **late-publish window** in `run_user_image`, and the end of the metal-only
+- **BGRUN-2 (`stat.elf` — the persistence app)** — the fixture BGRUN-1 was missing. BGRUN-1's bench recipe
+  was "`bg /fat/uvug.elf` twice → TAB between two live crystals", and it does not work: a BACKGROUNDED UVUG
+  is UNFOCUSED, so no HID event ever reaches it, so it never leaves its deterministic auto path — 300 frames
+  and gone. Both windows flash past before a hand reaches TAB. The window ring was untestable at the bench
+  not because of a compositor defect but because there was no app that STAYS.
+  - **`crates/user-stat` → `STAT.ELF`** is that app: a static ELF64 EL0 program built and staged exactly
+    like `UVUG.ELF` (own workspace + `user-stat.ld` PHDRS: R+X text, R+W data; `arroyo kernel8` builds it,
+    checks the ELF magic and the 16 KiB `USER_REGION_SIZE` bound, and copies it to the FAT staging dir).
+    ~8.5 KiB. It creates one 128x128 window (`SYS_WIN_CREATE`, the same one-slot geometry UVUG negotiates),
+    and each frame repaints its **own pid in large digits** (from `SYS_GETINFO`), a **frame counter** and a
+    **sweep block**, then `SYS_WIN_PRESENT`s and `SYS_SLEEP_MS(50)`s (~20 fps; on metal that is a real timed
+    sleep, so it costs nearly nothing sitting on the panel).
+  - **It has no exit condition.** Not on unfocus, not on a frame cap, not on ESC. `kill <pid>` is the whole
+    remedy — which is not a shortcut but BGRUN-1's stated contract for a bg app, now exercised rather than
+    described. It also does **not poll input**, so it behaves identically focused and unfocused (its ring
+    fills and drops, bounded and harmless) — the precise property the TAB walk depends on. The only
+    non-kill path out is a failed `SYS_WIN_CREATE`, which prints and exits 1 rather than writing an unmapped
+    VA.
+  - **The pid on screen is the point.** Two instances of the same image are otherwise pixel-identical; the
+    large pid is what lets the operator say WHICH window TAB just focused, and it is the same number `jobs`
+    prints and `kill` takes.
+  - Witnesses: `:: STAT: start pid=<n> win=<id> ::` and, once, `:: STAT: alive pid=<n> frames=40 ::` —
+    two one-shot lines and then silence forever (a program with no exit must never be a serial firehose).
+    Headless, `BGRUN-ST` leg 3 spawns it detached, dwells 2 s (comfortably longer than UVUG's entire
+    300-frame auto run, so "still running" cannot be confused with "has not got round to exiting"),
+    REQUIREs `Running`, kills it and requires the row settles: `:: BGRUN-ST: persist+kill PASS (pid=…) ::`.
+  - **Bench recipe (the TAB test, at last).** At the panel shell:
+    `bg /fat/STAT.ELF` → `bg /fat/STAT.ELF` → `jobs` (two `running` rows; note the pids) → press `TAB`
+    repeatedly and watch focus walk shell → window A → window B → shell, checking the large pid against the
+    `jobs` list each stop → `kill <pidA>` (its window vanishes; the line reads `killed — row reaped`) →
+    `jobs` (one row left) → `kill <pidB>` → `jobs` (`none`). Use `bg`, never `run`: a foreground `run` of a
+    program that never exits ends at `run_user_image`'s deadline with a SKILL-1 kill.
+- **EXEC1-M** — the **late-publish window** in `run_user_image`, and the end of the metal-only
   `EXEC1` failure. On every real Pi 4 boot (P55b, P56) the run-path witness reported
   `:: EXEC1: run /fat/ELFHELLO.ELF — EL0 program did not exit in time -> FAIL ::`, while QEMU raspi4b
   reported `exit=0 -> PASS` from the same image. UVUG-10's fixture gate above removed the boot-time input
