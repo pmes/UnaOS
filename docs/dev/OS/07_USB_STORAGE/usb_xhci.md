@@ -501,6 +501,31 @@ and the transfer dispatch processes only the completion whose TRB matches — a 
 twice (which would double cursor motion) and the ring is never over-armed. QEMU posts
 no dup, so `param` always matches and the guard is transparent there.
 
+**PIUSB-39 — the guard must discard the data, never the pipeline.** As first written the
+guard's only exit was `return`, which skipped the `queue_mouse_read` re-arm. A *single*
+mismatching completion therefore retired the pointer interrupt-IN endpoint permanently,
+while the keyboard's independently-armed endpoint carried on — exactly the P54b metal
+fact (after an EL0 app's interactive takeover ends, the mouse is dead and the keyboard
+still types). The guard stays (the dup hazard is real); its exit now discriminates using
+`mouse_prev_phys`, the address of the TD `queue_mouse_read` last retired:
+
+- `param == mouse_prev_phys` — a genuine Panther-Point dup for the already-consumed TD.
+  A fresh read is *already* armed, so the dup is discarded **without** re-arming (that is
+  the original UI1-MOUSE M2 protection, preserved unchanged).
+- any other mismatch — the endpoint retired a TD we cannot account for, so nothing is
+  guaranteed armed. The report is discarded and the read is **re-armed**.
+
+The same two dead-pipeline holes existed on the *error* side: a completion code other
+than 1/13 on either HID interrupt-IN endpoint fell through the success gate without a
+re-arm. Both now re-arm and trace, mirroring the hub Status Change Endpoint (§7d). The
+keyboard guard carries the identical fix (`keyboard_prev_phys`); only its lower traffic
+kept the defect from being observed on metal.
+
+*Witness (knob-gated, `usbdebug`).* `[piusb39] mouse rearm=<n> discarded=<n>` — printed on
+the first re-arm and every 256th thereafter, plus on every discarded-but-re-armed
+completion. `discarded > 0` on a metal capture is direct proof the pipeline-preserving
+exit fired where the old code would have killed the pointer.
+
 ### 7b. Serial mouse-witness (bench-assertable)
 
 Because the cursor is invisible on a serial-only capture (the metal bench reads the

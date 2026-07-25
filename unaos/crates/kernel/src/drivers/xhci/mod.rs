@@ -481,6 +481,13 @@ pub static XHCI_OP_BASE: AtomicUsize = AtomicUsize::new(0);
 /// Count of xHCI interrupts taken — a diagnostic to confirm the MSI-X path is live.
 pub static XHCI_IRQ_COUNT: AtomicU64 = AtomicU64::new(0);
 
+/// PIUSB-39 witness counters. `MOUSE_REARM_COUNT` = every `queue_mouse_read` the transfer
+/// dispatch issued; `MOUSE_DISCARD_REARM_COUNT` = completions the dup-Success guard threw away
+/// but which STILL re-armed the interrupt-IN read (the pipeline-preserving exit the P54b metal
+/// fact needed). Bumped unconditionally (cheap relaxed adds); only the knob-gated witness prints.
+pub static MOUSE_REARM_COUNT: AtomicU64 = AtomicU64::new(0);
+pub static MOUSE_DISCARD_REARM_COUNT: AtomicU64 = AtomicU64::new(0);
+
 /// Acknowledge an xHCI interrupt at the hardware level so the interrupter can raise again.
 /// Safe to call from interrupt context: it takes NO locks and does NO allocation — it clears
 /// IMAN.IP (bit 0, RW1C) preserving IMAN.IE, and USBSTS.EINT (bit 3, RW1C). It does NOT drain
@@ -795,6 +802,14 @@ pub struct DeviceSlot {
     /// report (double cursor motion) AND re-arm a second read (ring over-arm). Set in
     /// `queue_mouse_read`, matched in `poll_events`/`handle_event_trb`.
     pub mouse_expect_phys: u64,
+    /// PIUSB-39: physical address of the PREVIOUS armed pointer TRB (the TD that was just
+    /// consumed, 0 = none yet). A genuine Panther-Point dup-Success names *that* TD — by then a
+    /// fresh read is already armed, so the dup must be discarded WITHOUT re-arming (re-arming
+    /// would over-arm the ring: the original UI1-MOUSE M2 hazard). Any OTHER mismatching `param`
+    /// is not a dup: it means the completion the endpoint just retired is one we cannot account
+    /// for, and the old `return` left the interrupt-IN endpoint permanently un-armed — the P54b
+    /// metal fact (mouse dead after an EL0 focus drop, keyboard alive). Those re-arm.
+    pub mouse_prev_phys: u64,
     /// Count of REAL (non-dup) pointer reports serviced since arming — drives the bounded serial
     /// mouse-witness (first report + every Nth), never one-line-per-report.
     pub mouse_report_count: u32,
@@ -824,6 +839,10 @@ pub struct DeviceSlot {
     /// mirrors the pointer path pre-emptively. Set in `queue_keyboard_read`, matched in the
     /// interrupt-IN transfer dispatch. On QEMU (no dup) `param` always matches, so it never trips.
     pub keyboard_expect_phys: u64,
+    /// PIUSB-39: physical address of the PREVIOUS armed keyboard TRB. Same discrimination as
+    /// `mouse_prev_phys`: a dup-Success for the consumed TD is discarded silently (a read is
+    /// already armed), any other mismatch discards the data but RE-ARMS the read.
+    pub keyboard_prev_phys: u64,
     /// Count of boot-keyboard interrupt-IN reports serviced since the read was armed. Mirrors
     /// `mouse_report_count`; drives the Pi-side PIUSB-13 `[enum]` first-report witness (the 0→1
     /// edge is "the keyboard is live"). Inert on x86 (nothing reads it there).
@@ -930,6 +949,7 @@ impl DeviceSlot {
             mouse_state: 0,
             mouse_ring: None,
             mouse_expect_phys: 0,
+            mouse_prev_phys: 0,
             mouse_report_count: 0,
             mouse_prev_buttons: 0,
             is_keyboard: false,
@@ -940,6 +960,7 @@ impl DeviceSlot {
             keyboard_state: 0,
             keyboard_ring: None,
             keyboard_expect_phys: 0,
+            keyboard_prev_phys: 0,
             keyboard_report_count: 0,
             keyboard_prev_keys: [0; 6],
             keyboard_leds: 0,
@@ -1005,6 +1026,7 @@ impl DeviceSlot {
         self.mouse_intf = 0;
         self.mouse_state = 0;
         self.mouse_expect_phys = 0;
+        self.mouse_prev_phys = 0;
         self.mouse_report_count = 0;
         self.mouse_prev_buttons = 0;
         // UVUG-5: a keyboard slot is being torn down (detach / disconnect / enum-recovery). Signal the
@@ -1022,6 +1044,7 @@ impl DeviceSlot {
         self.keyboard_intf = 0;
         self.keyboard_state = 0;
         self.keyboard_expect_phys = 0;
+        self.keyboard_prev_phys = 0;
         self.keyboard_report_count = 0;
         self.keyboard_prev_keys = [0; 6];
         self.keyboard_leds = 0;
@@ -1818,6 +1841,42 @@ impl XhciController {
                                 self.queue_hub_change_read(slot_id as u8);
                                 return;
                             }
+
+                            // PIUSB-39: the SAME hole on the HID interrupt-IN endpoints. An ERROR
+                            // completion (STALL / transaction error / babble) on the pointer or
+                            // keyboard read falls straight through the success gate below, so the
+                            // read was never re-armed and the device went permanently dead — the
+                            // other half of the P54b metal fact (the mouse endpoint carries by far
+                            // the most traffic, so it is the one that loses this race). Trace and
+                            // re-arm, exactly as the hub Status Change Endpoint does; CErr=3 lets
+                            // the controller absorb transient errors itself, and the bounded
+                            // TransferRing keeps a truly wedged endpoint from looping the CPU.
+                            let (m_dci, k_dci, has_mbuf, has_kbuf) = {
+                                let s = &self.slots[slot_id as usize];
+                                let m = if s.is_mouse && s.mouse_ep != 0 {
+                                    Some((s.mouse_ep & 0x0F) * 2 + if (s.mouse_ep & 0x80) != 0 { 1 } else { 0 })
+                                } else { None };
+                                let k = if s.is_keyboard && s.keyboard_ep != 0 {
+                                    Some((s.keyboard_ep & 0x0F) * 2 + if (s.keyboard_ep & 0x80) != 0 { 1 } else { 0 })
+                                } else { None };
+                                (m, k, s.mouse_data_buffer.is_some() && s.mouse_ring.is_some(),
+                                 s.data_buffer.is_some() && s.keyboard_ring.is_some())
+                            };
+                            if m_dci == Some(endpoint_id as u8) && has_mbuf {
+                                serial_println!(
+                                    "xHCI: pointer interrupt-IN error (slot {}, code {}); re-arming.",
+                                    slot_id, completion_code);
+                                MOUSE_DISCARD_REARM_COUNT.fetch_add(1, Ordering::Relaxed);
+                                self.queue_mouse_read(slot_id as u8);
+                                return;
+                            }
+                            if k_dci == Some(endpoint_id as u8) && has_kbuf {
+                                serial_println!(
+                                    "xHCI: keyboard interrupt-IN error (slot {}, code {}); re-arming.",
+                                    slot_id, completion_code);
+                                self.queue_keyboard_read(slot_id as u8);
+                                return;
+                            }
                         }
 
                         // UNA-19-REVEAL: If success or short packet, check buffer
@@ -2103,9 +2162,38 @@ impl XhciController {
                                         // cursor motion and over-arm the interrupt-IN ring — the exact
                                         // EP0 hazard (`ep0_expect_phys`), applied to interrupt-IN. On
                                         // QEMU (no dup) `param` always matches, so this never trips.
+                                        //
+                                        // PIUSB-39: the guard STAYS (the dup hazard is real), but its
+                                        // exit must discard the DATA, never the PIPELINE. The old
+                                        // unconditional `return` retired the pointer interrupt-IN
+                                        // endpoint forever on ANY mismatched completion — the P54b
+                                        // metal fact (after an EL0 app's focus drop the mouse is
+                                        // permanently dead while the independently-armed keyboard
+                                        // keeps working). Discriminate:
+                                        //   * `param == mouse_prev_phys` — a genuine Panther-Point dup
+                                        //     for the TD we already consumed. A fresh read is ALREADY
+                                        //     armed, so re-arming here would over-arm the ring (the
+                                        //     exact UI1-MOUSE M2 hazard). Discard, do not re-arm.
+                                        //   * any other mismatch — the endpoint retired a TD we cannot
+                                        //     account for; nothing is guaranteed armed. Discard the
+                                        //     report, then RE-ARM so the pointer survives.
                                         if slot.mouse_expect_phys != 0 && param != slot.mouse_expect_phys {
+                                            let prev = slot.mouse_prev_phys;
+                                            let expect = slot.mouse_expect_phys;
+                                            let have_buf = slot.mouse_data_buffer.is_some()
+                                                && slot.mouse_ring.is_some();
                                             xdbg!("xHCI: stale/spurious pointer event (slot {}, trb {:#x}, expected {:#x}); ignoring.",
-                                                slot_id, param, slot.mouse_expect_phys);
+                                                slot_id, param, expect);
+                                            if param != prev && have_buf {
+                                                // Not the known dup — re-arm rather than lose the pointer.
+                                                MOUSE_DISCARD_REARM_COUNT.fetch_add(1, Ordering::Relaxed);
+                                                self.queue_mouse_read(slot_id as u8);
+                                                #[cfg(feature = "usbdebug")]
+                                                serial_println!(
+                                                    "[piusb39] mouse rearm={} discarded={}",
+                                                    MOUSE_REARM_COUNT.load(Ordering::Relaxed),
+                                                    MOUSE_DISCARD_REARM_COUNT.load(Ordering::Relaxed));
+                                            }
                                             return;
                                         }
                                         if let Some(data_buf_ptr) = slot.mouse_data_buffer {
@@ -2221,9 +2309,19 @@ impl XhciController {
                                         // matches the armed read is real; a dup would double-inject
                                         // the keystrokes and over-arm the interrupt-IN ring. On QEMU
                                         // (no dup) `param` always matches, so this never trips.
+                                        // PIUSB-39: same pipeline-preserving exit as the pointer path
+                                        // (the keyboard carried the identical defect — only its lower
+                                        // traffic kept it from being observed on metal).
                                         if slot.keyboard_expect_phys != 0 && param != slot.keyboard_expect_phys {
+                                            let prev = slot.keyboard_prev_phys;
+                                            let expect = slot.keyboard_expect_phys;
+                                            let have_buf = slot.data_buffer.is_some()
+                                                && slot.keyboard_ring.is_some();
                                             xdbg!("xHCI: stale/spurious keyboard event (slot {}, trb {:#x}, expected {:#x}); ignoring.",
-                                                slot_id, param, slot.keyboard_expect_phys);
+                                                slot_id, param, expect);
+                                            if param != prev && have_buf {
+                                                self.queue_keyboard_read(slot_id as u8);
+                                            }
                                             return;
                                         }
                                         if let Some(data_buf_ptr) = slot.data_buffer {
@@ -7326,8 +7424,24 @@ impl XhciController {
             // dispatch can match a real completion against it and reject a Panther-Point
             // dup-Success for the already-consumed TD (see `mouse_expect_phys`).
             let ring_base = self.slots[slot_id as usize].mouse_ring.as_ref().unwrap().get_ptr();
+            // PIUSB-39: remember the TD we are retiring before overwriting the expectation — a
+            // genuine Panther-Point dup-Success names THAT address, and only that address may be
+            // discarded without a re-arm.
+            self.slots[slot_id as usize].mouse_prev_phys =
+                self.slots[slot_id as usize].mouse_expect_phys;
             self.slots[slot_id as usize].mouse_expect_phys =
                 ring_base + (idx as u64 * core::mem::size_of::<Trb>() as u64);
+            let rearms = MOUSE_REARM_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            // PIUSB-39 witness — knob-gated (usbdebug) and BOUNDED (first arm + every 256th), so a
+            // metal capture can read the pointer pipeline's liveness without flooding the FTDI.
+            #[cfg(feature = "usbdebug")]
+            if rearms == 1 || rearms % 256 == 0 {
+                serial_println!(
+                    "[piusb39] mouse rearm={} discarded={}",
+                    rearms, MOUSE_DISCARD_REARM_COUNT.load(Ordering::Relaxed));
+            }
+            #[cfg(not(feature = "usbdebug"))]
+            let _ = rearms;
             self.ring_doorbell(slot_id, dci as u32);
             xdbg!("xHCI: Mouse Read Queued.");
         }
@@ -7355,6 +7469,9 @@ impl XhciController {
             // can match a real completion against it and reject a Panther-Point dup-Success for the
             // already-consumed TD (see `keyboard_expect_phys`). Mirrors `queue_mouse_read`.
             let ring_base = self.slots[slot_id as usize].keyboard_ring.as_ref().unwrap().get_ptr();
+            // PIUSB-39: mirror of `queue_mouse_read` — remember the TD being retired.
+            self.slots[slot_id as usize].keyboard_prev_phys =
+                self.slots[slot_id as usize].keyboard_expect_phys;
             self.slots[slot_id as usize].keyboard_expect_phys =
                 ring_base + (idx as u64 * core::mem::size_of::<Trb>() as u64);
             self.ring_doorbell(slot_id, dci as u32);
