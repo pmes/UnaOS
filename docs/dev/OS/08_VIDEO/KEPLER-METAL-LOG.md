@@ -3,6 +3,45 @@
 Hard-won silicon facts from the fox-metal sitting series. Trust these over any
 QEMU behavior. Newest sitting first.
 
+## Sitting #32 (pull-28 recon relocated + control-bracketed, UnaOS-gemini@ee3c955a, 2026-07-25, fox-metal-r23s1n, s32boot1)
+
+**POISON LAW CONFIRMED BY ITS OWN CONTROL FRAME — and the boot cost
+nothing.** Coordinator awk-verified. The relocation fully restored s30:
+ucode A EXECUTED again (mailbox0=F00DFACE, tlb page0=01000000, clean
+halt), heartbeat same shape as s30 (mb1 0x4 → 0x57C9 → 0x5B2E → 0x343B4,
+cpuctl=0 running throughout), witness signature unchanged
+(err=2/stat=5/valid=00002000). Then the recon block, now last:
+```
+:: kepler: recon-pre cpuctl=00000000 ::     <- REAL (0 = HB still running; the control read)
+:: kepler: recon WRCMD_CMD=BADF1000 ::      <- first access to 0x409504 faults immediately
+   (…all seven recon offsets BADF1000…)
+:: kepler: recon-post cpuctl=BADF1000 ::    <- SAME register as recon-pre, poisoned
+```
+recon-pre real and recon-post BADF1000 on the same register microseconds
+apart is the in-boot proof: **the first access to 0x409504 faults
+immediately (not cumulatively) and wedges all subsequent FECS-unit reads
+for the boot.** Banked facts: (1) the poison law is now double-confirmed
+(s31 inference + s32 control frame); (2) the ONLY clean per-offset datum
+remains 0x409504 = absent-or-faulting on GK107 — the six other gf100-era
+ctxctl offsets (0x800/0x804/0xb00/0xb04/0xc00/0xc08) are STILL
+UNTESTED, confounded behind the first fault; (3) everything before the
+block reads real all boot — poison is strictly confined to and after the
+recon accessors; (4) note gf100 ctxctl docs place FECS host-interface
+regs exactly here and nouveau drives 0x409504 on gk104, so a faulting
+0x409504 on GK107 is itself a surprising, load-bearing observation.
+Pull 28's probe deliverable is COMPLETE — it answered with a different,
+sharper fact than the one it went looking for.
+
+Open per-offset question routes to pull 29 (specialist): candidate
+strategies — rotate which offset is read FIRST across boots (one clean
+datum per boot); cleanroom hunt for the PRI-fault clear mechanism so
+multiple offsets can be probed per boot; or re-derive where GK107 FECS
+host-interface actually lives. Amendment from pull 28 stands: no
+hypothesis writes against any offset not yet proven readable.
+
+Capture from mark s32boot1. ESP by coordinator (sha ee3c955a…), Fox
+sha-verified, flashed only. Panel unchanged (expected).
+
 ## Sitting #31 (fence pull 28 CTXCTL recon, UnaOS-gemini@c6b0e3cf, 2026-07-25, fox-metal-r23s1n, s31boot1)
 
 **⚠ NEW SILICON LAW: A BAD 0x409xxx OFFSET READ POISONS THE WHOLE FECS
