@@ -492,7 +492,7 @@ pub fn init(gpu: &GpuInfo) {
                                     mmio_write(bar0, 0x400184, 0x12345678);
                                     mmio_write(bar0, 0x400184, 0xA5A55A5A);
                                     
-                                    mmio_write(bar0, 0x400180, 1 << 24); // reset offset
+                                    mmio_write(bar0, 0x400180, 1 << 25); // reset offset, AINCR (bit25 = read auto-increment; bit24 only increments on writes)
                                     let imem_w0 = mmio_read(bar0, 0x400184);
                                     let imem_w1 = mmio_read(bar0, 0x400184);
                                     let imem_w2 = mmio_read(bar0, 0x400184);
@@ -509,7 +509,7 @@ pub fn init(gpu: &GpuInfo) {
                                     mmio_write(bar0, 0x4001C4, 0x12345678);
                                     mmio_write(bar0, 0x4001C4, 0xA5A55A5A);
                                     
-                                    mmio_write(bar0, 0x4001C0, 1 << 24); // reset offset
+                                    mmio_write(bar0, 0x4001C0, 1 << 25); // reset offset, AINCR (read auto-increment)
                                     let dmem_w0 = mmio_read(bar0, 0x4001C4);
                                     let dmem_w1 = mmio_read(bar0, 0x4001C4);
                                     let dmem_w2 = mmio_read(bar0, 0x4001C4);

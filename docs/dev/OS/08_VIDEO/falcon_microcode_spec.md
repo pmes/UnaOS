@@ -16,7 +16,7 @@ To load firmware into the Falcon, the host OS must upload the payload into the F
 
 ### PGRAPH Falcon Registers (Base `0x400000`)
 - **IMEM Upload**:
-  - `NV_PGRAPH_FALCON_IMEMC` (`0x400180`): Instruction Memory Control (set upload offset here, e.g., `(offset >> 8) | 1 << 24` for auto-increment).
+  - `NV_PGRAPH_FALCON_IMEMC` (`0x400180`): Instruction Memory Control (set upload offset here, e.g., `(offset >> 8) | 1 << 24` for auto-increment). Bit 24 (AINCW) auto-increments on WRITES only; bit 25 (AINCR) auto-increments on READS — set bit 25 when reading back through the data port.
   - `NV_PGRAPH_FALCON_IMEMD` (`0x400184`): Instruction Memory Data (write 32-bit firmware instructions here).
 - **DMEM Upload**:
   - `NV_PGRAPH_FALCON_DMEMC` (`0x4001C0`): Data Memory Control.
