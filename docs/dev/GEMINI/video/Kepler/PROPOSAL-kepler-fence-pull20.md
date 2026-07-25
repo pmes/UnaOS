@@ -1,4 +1,6 @@
-STATUS: PROPOSED
+STATUS: APPROVED (2026-07-25, coordinator GR4). No amendments — matches the
+brief exactly, zero new writes, gates correct. Keep the original per-step
+witness markers unchanged between the framing pair, per the brief.
 
 # PROPOSAL: kepler-fence pull 20 - witness-ladder rematch against a live engine
 

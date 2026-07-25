@@ -1,4 +1,6 @@
-STATUS: PROPOSED
+STATUS: APPROVED (2026-07-25, coordinator GR4). No amendments — index math,
+byte math, and the cited x-fastest within-block ordering all check out.
+Implement exactly as written; all brief gates apply.
 
 # Proposal — kepler-display pull 13: block-width ladder (block > 1 GOB wide)
 
