@@ -69,7 +69,7 @@ pub const USER_CODE_SIZE: usize = 0x1000;
 //   [+0x4000]                             RO info page (1 page)
 //   [+0x5000 + w * FB_WIN_SLOT_SIZE]      window `w`'s RW surface slot (16 pages), w in 0..FB_WIN_SLOTS
 // Window slot 0 begins at exactly the VA the single ELF-3 surface used to occupy, so `fb_surface_va()`
-// (what `SYS_FB_MAP` returns) is BYTE-IDENTICAL to before and the existing UVUG.ELF binary is unaffected.
+// (what `SYS_FB_MAP` returns) is BYTE-IDENTICAL to before and the existing VUG.ELF binary is unaffected.
 // Each slot is 64 KiB = 16 pages, which covers the largest surface this arc admits (128×128 ARGB8888 =
 // 65536 B). A surface is negotiated at map time and only its PAGE-MULTIPLE size is actually mapped — the
 // rest of the slot stays at its reserved (EL1-only identity) leaf, so nothing beyond the negotiated

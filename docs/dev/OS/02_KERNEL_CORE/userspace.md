@@ -388,9 +388,9 @@
   prints its own `elf hello from EL0`).
 - **UVUG-1 (landed 2026-07-23)** — the first REAL EL0 graphics program: a userspace **mini-vug**, and the
   affirmative answer to "is it possible to make EL0 vug more multi-threaded?". A static ELF64 program
-  (`crates/user-uvug`, staged onto the FAT media as **UVUG.ELF** by `arroyo`, same build path as ELFHELLO)
+  (`crates/user-vug`, staged onto the FAT media as **VUG.ELF** by `arroyo`, same build path as ELFHELLO)
   loaded and run through the EXEC-1 `run_user_image` machinery — the identical path the panel `run
-  /fat/UVUG.ELF` drives. It maps its off-screen surface (`SYS_FB_MAP`), spawns **two persistent EL0 worker
+  /fat/VUG.ELF` drives. It maps its off-screen surface (`SYS_FB_MAP`), spawns **two persistent EL0 worker
   threads** (`SYS_THREAD_SPAWN` — one co-located, one on a **sibling core**) that each render HALF of an
   animated integer-math gradient into the shared surface, drives a **per-frame barrier**, `SYS_FB_PRESENT`s
   each of 300 frames, then `SYS_THREAD_JOIN`s both, computes a deterministic FNV-1a checksum of the final
@@ -407,15 +407,15 @@
   surface bytes — never the scan-out, a physical address, or a kernel mapping; page-permission laws (WXN,
   per-page perms) are untouched. Kernel side is a small additive fix only: `run_user_image` now calls the
   idempotent `sched::futex_init()` (so a plain non-witness boot arms the futex pool before an EL0 program
-  can call `SYS_FUTEX`), plus a `uvug_witness` battery self-test that reads UVUG.ELF through the VFS and runs
+  can call `SYS_FUTEX`), plus a `uvug_witness` battery self-test that reads VUG.ELF through the VFS and runs
   it, asserting `exit=0`. QEMU-verified (`UNAOS_V3D=1 UNAOS_GENET=1 UNAOS_PIUSB=1 ./arroyo kernel8-test`,
   reproducible across runs): `:: UVUG: frames=300 threads=2 checksum=0x0313e510f24daae5 ::` then
-  `:: EXEC-UVUG: run /fat/UVUG.ELF — loaded 8544 bytes, entry 0x270000, exit=0 -> PASS ::`, with the workers
+  `:: EXEC-UVUG: run /fat/VUG.ELF — loaded 8544 bytes, entry 0x270000, exit=0 -> PASS ::`, with the workers
   scheduled on cores 2 (co-located) + 1 (sibling) and the whole prior battery (CAPSTONE 6/6, EXEC1,
   ELF-2/-3) byte-equivalent. **DEFERRED (out of this lane):** the live panel animation still needs the
   ELF-3 present-hook wiring (the 3-line `video/screen.rs` `register_fb_present_hook` registration) — until
   it lands, `SYS_FB_PRESENT` composites nothing to the screen, so the panel run prints the witness and exits
-  cleanly but shows no pixels. Lane: `crates/user-uvug` + `arroyo` (build/stage) + an additive
+  cleanly but shows no pixels. Lane: `crates/user-vug` + `arroyo` (build/stage) + an additive
   `arch/aarch64/syscall.rs` (`futex_init` in `run_user_image` + the `uvug_witness` self-test) + this doc.
 - **ELF-5 (landed 2026-07-23)** — rung 4 of the EL0-vug ladder: **input into EL0**. An interactive EL0 app
   (built on ELF-3's surface + ELF-2's threads + ELF-3's futex) needs keys/mouse; this is the delivery half.
@@ -495,7 +495,7 @@
     `SYS_INPUT_POLL`, drawing/responding to input — the last delivery gap in the EL0-vug ladder.
     Lane: `main.rs` (the router branch + `route_input_to_active_el0` + `input_router_selftest`) + the
     `run_user_image` focus-registration call site in `arch/aarch64/syscall.rs` + this doc.
-- **UVUG-3 (landed 2026-07-23)** — the mini-vug becomes the first **interactive** EL0 application. `crates/user-uvug`
+- **UVUG-3 (landed 2026-07-23)** — the mini-vug becomes the first **interactive** EL0 application. `crates/user-vug`
   is rewritten from the UVUG-1 animated gradient into a real **vug-style wireframe quartz crystal**: the Q16.16
   fixed-point sin table, rotation (yaw-then-pitch), and the 14-vertex elongated hexagonal bipyramid are
   reimplemented in the user crate from the kernel `vug.rs` geometry (integer math, no float), projected
@@ -521,14 +521,14 @@
   position-independent (relocation-model=static → adrp/add, **zero relocations** in the linked image; verified)
   and fitting the 16 KiB window (12568-byte ELF, two PT_LOAD segments, per-segment W^X). QEMU-verified
   (`UNAOS_V3D=1 UNAOS_GENET=1 UNAOS_PIUSB=1 ./arroyo kernel8-test`, and again with `UNAOS_VUGPAR=1`; reproducible):
-  `:: UVUG: frames=300 threads=2 checksum=0x48221e4101db3924 ::` *(superseded by WC-C -> `0xe68285b85121ac7c`)* then `:: EXEC-UVUG: run /fat/UVUG.ELF — loaded
+  `:: UVUG: frames=300 threads=2 checksum=0x48221e4101db3924 ::` *(superseded by WC-C -> `0xe68285b85121ac7c`)* then `:: EXEC-UVUG: run /fat/VUG.ELF — loaded
   12568 bytes, entry 0x270000, exit=0 -> PASS ::`, with the whole prior battery (CAPSTONE 6/6, EXEC1, ELF-2
   threads, ELF-3 fb, ELF-5/INPUT-WIRE input router+drain) byte-equivalent. The auto checksum is a NEW deterministic
   value (0x48221e4101db3924 *(superseded by WC-C -> `0xe68285b85121ac7c`)*, vs UVUG-1's gradient 0x0313e510f24daae5 — the rendered content changed from gradient
-  to wireframe). **Metal is where the interactive path lights up:** at the panel, `run /fat/UVUG.ELF` now shows a
+  to wireframe). **Metal is where the interactive path lights up:** at the panel, `run /fat/VUG.ELF` now shows a
   rotating wireframe crystal (via the UVUG-2 present hook) that the operator drives with WASD/arrows/Q/E and the
   mouse, exiting on a click or ESC — the `:: UVUG: interactive exit=… ::` line is the metal-only witness. Lane:
-  `crates/user-uvug` only (no kernel/syscall/boot/arroyo change — same crate, linker script, and build/stage
+  `crates/user-vug` only (no kernel/syscall/boot/arroyo change — same crate, linker script, and build/stage
   path) + this doc.
 - **UVUG-4 (landed 2026-07-23)** — makes the interactive switch **input-driven** instead of time-boxed. P46 metal
   showed UVUG never entered interactive mode: the old `DETECT_FRAMES` (60) fallback window elapsed in well under a
@@ -544,8 +544,8 @@
   game-mode feel Peter flagged as awkward: the kernel `vug.rs` maps pointer motion 1 px = 1 brad with no scaling,
   so instead of copying that this arc scales pointer delta down (`DRAG_DIV` = 8) and per-frame clamps it
   (`DRAG_CLAMP` = 64 brad/axis) so a **full-panel drag ≈ one revolution** (256 brads over ~2048 px, panel ~1920 px
-  wide) and no single HID delta can spin past a quarter-turn in one frame. Lane: `crates/user-uvug` only + this doc.
-- **UVUG-5 (this arc)** — two input-side corrections after the P47 metal capture (`run /fat/UVUG.ELF` ran the
+  wide) and no single HID delta can spin past a quarter-turn in one frame. Lane: `crates/user-vug` only + this doc.
+- **UVUG-5 (this arc)** — two input-side corrections after the P47 metal capture (`run /fat/VUG.ELF` ran the
   300-frame auto batch to `exit=0` with the unchanged checksum, but showed **no interactive takeover** and a
   spurious `[gui] watchdog app wedged 5s`). (1) **Watchdog false-fire** — the `run` command arms `gui_watchdog`
   via `on_app_enter`, but nothing fed `note_progress` on the EL0 path, so a healthy polling app was declared
@@ -619,7 +619,7 @@
     ASID, so a process's first window is always region slot 0, at the VA the single ELF-3 surface used.
   - **Compat is exact.** `SYS_FB_MAP` and `SYS_FB_PRESENT` are wrappers over "window 0" = the caller's
     region slot 0: `SYS_FB_MAP` returns the **same VA** as before and writes the **same legacy info-page
-    header** (magic, w, h, stride, format, size, surface-offset at offset 0), so the existing `UVUG.ELF`
+    header** (magic, w, h, stride, format, size, surface-offset at offset 0), so the existing `VUG.ELF`
     binary runs unchanged. Per-window geometry is published alongside it at `0x40 + rslot*0x20`
     (magic, win id, w, h, stride, format, surface-offset), zeroed on close so EL0 can tell live from stale.
     `SYS_FB_PRESENT` deliberately does **not** require a window-table row — it presents the region-slot-0
@@ -719,7 +719,7 @@
   - Gates: `./arroyo check` green x86_64 + aarch64; `./arroyo kernel8` builds; `./arroyo kernel8-test` 46 PASS /
     0 FAIL, UVUG batch `frames=300 checksum=0x48221e4101db3924 exit=0` **unchanged** *(superseded by WC-C -> `0xe68285b85121ac7c`)*, `:: uvug6: typematic … ::
     PASS ::` still green (the evidence gate leaves all three selftest legs on their original verdicts). Lane:
-    `crates/user-uvug/src/main.rs` + `pal.rs` (typematic liveness) + `arch/aarch64/syscall.rs`
+    `crates/user-vug/src/main.rs` + `pal.rs` (typematic liveness) + `arch/aarch64/syscall.rs`
     (`sys_input_poll` focus scope) + `main.rs` (shell-path witness) + this doc.
 - **UVUG-10 (this arc)** — the P55b pointer bisect, and the boot fixture that was costing a core every metal
   boot.
@@ -920,13 +920,18 @@
     n == 1, so TABbing during a single-window foreground `run` drops focus to the parked shell — TAB back
     re-enters; linger instead and the takeover re-arm can SKILL-1 the app ~5 s later. The safety property
     (never weld the operator away from `kill`) outranks that exposure, deliberately.
-- **BGRUN-2 (`stat.elf` — the persistence app)** — the fixture BGRUN-1 was missing. BGRUN-1's bench recipe
+- **BGRUN-2 (`kvug.elf` — the persistence app)** — the fixture BGRUN-1 was missing. BGRUN-1's bench recipe
   was "`bg /fat/uvug.elf` twice → TAB between two live crystals", and it does not work: a BACKGROUNDED UVUG
   is UNFOCUSED, so no HID event ever reaches it, so it never leaves its deterministic auto path — 300 frames
   and gone. Both windows flash past before a hand reaches TAB. The window ring was untestable at the bench
   not because of a compositor defect but because there was no app that STAYS.
-  - **`crates/user-stat` → `STAT.ELF`** is that app: a static ELF64 EL0 program built and staged exactly
-    like `UVUG.ELF` (own workspace + `user-stat.ld` PHDRS: R+X text, R+W data; `arroyo kernel8` builds it,
+  > **Superseded in part by VUG-BG (below):** a backgrounded `VUG.ELF` now persists too, so the original
+  > "`bg` the vug twice" recipe works after all. `KVUG.ELF` is not thereby redundant — it has no exit
+  > condition *at all*, focused or not, which is a stronger property than VUG's conditional persistence,
+  > and it is what `BGRUN-ST` leg 3 rests on. It also puts its pid on screen, which is what makes the TAB
+  > walk checkable against `jobs`.
+  - **`crates/user-kvug` → `KVUG.ELF`** is that app: a static ELF64 EL0 program built and staged exactly
+    like `VUG.ELF` (own workspace + `user-kvug.ld` PHDRS: R+X text, R+W data; `arroyo kernel8` builds it,
     checks the ELF magic and the 16 KiB `USER_REGION_SIZE` bound, and copies it to the FAT staging dir).
     ~8.5 KiB. It creates one 128x128 window (`SYS_WIN_CREATE`, the same one-slot geometry UVUG negotiates),
     and each frame repaints its **own pid in large digits** (from `SYS_GETINFO`), a **frame counter** and a
@@ -957,11 +962,58 @@
     — so a truncated log still reports the step GREEN. The battery cannot currently go red on a short
     window; only an explicit `mbench --replay … --spec` can. Assert the spec, not the battery step.
   - **Bench recipe (the TAB test, at last).** At the panel shell:
-    `bg /fat/STAT.ELF` → `bg /fat/STAT.ELF` → `jobs` (two `running` rows; note the pids) → press `TAB`
+    `bg /fat/KVUG.ELF` → `bg /fat/KVUG.ELF` → `jobs` (two `running` rows; note the pids) → press `TAB`
     repeatedly and watch focus walk shell → window A → window B → shell, checking the large pid against the
     `jobs` list each stop → `kill <pidA>` (its window vanishes; the line reads `killed — row reaped`) →
     `jobs` (one row left) → `kill <pidB>` → `jobs` (`none`). Use `bg`, never `run`: a foreground `run` of a
     program that never exits ends at `run_user_image`'s deadline with a SKILL-1 kill.
+- **VUG/KVUG (this arc)** — the two EL0 apps get their real names, a backgrounded vug stops looking like a
+  crash, and the compositor says which window has the keyboard. Three folds, one arc; app UX only.
+  - **Fold 1 — the rename.** `crates/user-uvug` → **`crates/user-vug`** (`UVUG.ELF` → **`VUG.ELF`**,
+    `user-uvug.ld` → `user-vug.ld`) and `crates/user-stat` → **`crates/user-kvug`** (`STAT.ELF` →
+    **`KVUG.ELF`**, `user-stat.ld` → `user-kvug.ld`). Swept through `arroyo`'s build and staging stanzas,
+    the FAT staging names, the in-kernel witness paths that load the images by name (`uvug_witness`'s
+    `/fat/VUG.ELF`, `BGRUN-ST`'s kill and persistence legs), and the doc mentions here and in
+    `08_VIDEO/engine.md`.
+    - **The serial witness TAGS did NOT change, deliberately** — `UVUG:`, `EXEC-UVUG:`, `BGRUN-ST:`,
+      `STAT:` and the `UVUG-1`..`UVUG-10` arc identifiers all stand. Those name **arcs and witnesses**,
+      not files: they are the keys `pi4-regression.spec` matches on and the labels every landing report,
+      capture and hazard note in this repo already uses, and silently repointing them would make the
+      historical record unsearchable to buy nothing. The rename is of the *artifacts*; the ledger keeps
+      its names. Consequence, stated so it is not read as an oversight: `run /fat/VUG.ELF` prints
+      `:: EXEC-UVUG: …`, and `pi4-regression.spec` needed **no pattern change** for this fold.
+  - **Fold 2 — VUG-BG: a backgrounded vug persists.** `bg /fat/VUG.ELF` used to look like a crash. The
+    app was fine; the design was wrong. A bg'd vug is UNFOCUSED, so no input ever reaches it, so it never
+    left its deterministic auto path — 300 frames, `[gui] app-exit dur=0s wedged=false`, gone. The read
+    from the bench ("it crashes") was the only reasonable one.
+    - **Mechanism: the kernel tells the process how it was launched.** A per-ASID bit (`DETACHED_ASIDS`
+      in `arch/aarch64/syscall.rs`) is **set** by `spawn_user_image_bg` and explicitly **cleared** by
+      `run_user_image` — cleared rather than merely left alone, because ASIDs recycle and a slot last used
+      by a `bg` spawn must not hand its stale answer to the next foreground program that inherits the
+      number. It is published to EL0 in the **RO info page** as a process-flags `u32` at offset **`0x20`**
+      (bit 0 = `DETACHED`), in the reserved gap between the legacy ELF-3 header and the per-window
+      entries, so no existing field moves. Written by both info-page publishers (the legacy header, and
+      the per-window entry — the latter because the legacy header is only refreshed for region slot 0).
+    - **What the app does with it.** `crates/user-vug` reads the word once, after `SYS_WIN_CREATE` (which
+      is what maps the page), and a detached vug **skips the 300-frame cap** — same deterministic tumble,
+      no end. `kill <pid>` is the whole remedy, exactly as for `KVUG.ELF`. Focused `run` is byte-identical
+      to before.
+    - **The checksum witness is untouched, structurally.** `uvug_witness` runs `VUG.ELF` through
+      `run_user_image` — the FOREGROUND launcher, which clears the bit — so `REQUIRE UVUG: frames=300
+      threads=2 checksum=0xe68285b85121ac7c` cannot be reached by this branch. `BGRUN-ST` leg 2 (kill a
+      bg'd vug mid-run) gets strictly *more* robust: its target no longer races its own exit.
+  - **Fold 3 — FOCUS-HL: the focused window is visible.** `video/wm.rs` records the focused ASID in
+    `FOCUS_ASID` (set only by `focus_changed`, `0` = the shell) and the composite pass snapshots it once,
+    for the same reason it snapshots `SHELL_Z` once — one pass, one focus owner, so no pass can draw two
+    highlights. `draw_window` takes a `focused` flag and swaps **only two colours**: `CHROME_BORDER` →
+    `CHROME_BORDER_FOCUS` and `CHROME_TITLE_BG` → `CHROME_TITLE_BG_FOCUS`. No geometry changes, so focus
+    never moves a pixel and costs nothing per present — it repaints the frame and strip that were going to
+    be painted anyway.
+    - **Shell-focused highlights nothing**, which is the honest reading: no app has the keyboard.
+    - **Both ends repaint.** `focus_changed` already damages the windows it raises; it now also damages
+      the windows of the ASID that is LOSING focus, which the raise never touches (and which the shell
+      branch does not raise at all). Without that the old holder would keep the bright chrome until
+      something unrelated happened to damage it.
 - **EXEC1-M** — the **late-publish window** in `run_user_image`, and the end of the metal-only
   `EXEC1` failure. On every real Pi 4 boot (P55b, P56) the run-path witness reported
   `:: EXEC1: run /fat/ELFHELLO.ELF — EL0 program did not exit in time -> FAIL ::`, while QEMU raspi4b
@@ -1070,7 +1122,7 @@
 
 - **WC-C (window compositor, clients + focus)** — the arc where real EL0 programs use the window verbs.
   Full write-up: `docs/dev/OS/08_VIDEO/engine.md` §8 "WC-C". Userspace-visible changes:
-  - **UVUG is windowed.** `crates/user-uvug` drops `SYS_FB_MAP`/`SYS_FB_PRESENT` for
+  - **UVUG is windowed.** `crates/user-vug` drops `SYS_FB_MAP`/`SYS_FB_PRESENT` for
     `SYS_WIN_CREATE(128, 128)` + `SYS_WIN_PRESENT(id)`. It reads its surface at its own window base +
     `0x5000` (window region slot 0 — the VA `SYS_FB_MAP` returned), which is part of the window ABI, not a
     guess; the kernel also publishes the geometry in the RO info page at base + `0x4000`. `FOCAL` scales
@@ -1115,7 +1167,7 @@
     the side-by-side leg); `:: EXEC-UVUG: … exit=0 -> PASS ::`; all four BANDY verdicts PASS.
     `target/pi-screen.png` **re-baselined by design** (the desktop repaint removes the WC-INT residue) —
     new sha256 `2686a884320dbc389d6c33b1f37b097fa15eba769b51a751449e2c91a986bc19`. Lane:
-    `video/wm.rs`, `crates/user-uvug/src/main.rs`, `crates/user-blob` (midden + profile),
+    `video/wm.rs`, `crates/user-vug/src/main.rs`, `crates/user-blob` (midden + profile),
     `arch/aarch64/syscall.rs` (TAB seam + the `el0-wcb` fixture) + this doc + `08_VIDEO/engine.md`.
 - **UVUG7-W (witness-state honesty)** — the closing of the s1j residual: *"the `[uvug7]` witness NEVER
   printed on the P53 metal wire."* No code was broken. The witness is **kept**, not retired.

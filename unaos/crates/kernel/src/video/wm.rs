@@ -215,6 +215,21 @@ static TABLE: Mutex<Table> = Mutex::new(Table {
 /// against one shell position.
 static SHELL_Z: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+/// FOCUS-HL — the ASID that currently holds focus, or `0` for the SHELL. The compositor draws the
+/// chrome of a window whose `owner_asid` matches this in the highlight colours, and every other window
+/// in the resting colours; shell focus (`0`) therefore highlights nothing, which is the honest reading
+/// — no app has the keyboard.
+///
+/// Set only by [`focus_changed`], and read only by the composite pass, which snapshots it once so a
+/// single pass judges every window against one focus owner. `0` is also the initial value, so a boot
+/// that never changes focus draws exactly the resting chrome it always did.
+static FOCUS_ASID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// FOCUS-HL — the ASID that currently holds focus (`0` = the shell). See [`FOCUS_ASID`].
+pub fn focus_asid() -> u64 {
+    FOCUS_ASID.load(core::sync::atomic::Ordering::Acquire)
+}
+
 /// FOCUS-VIS — the shell's current z. See [`SHELL_Z`].
 pub fn shell_z() -> u32 {
     SHELL_Z.load(core::sync::atomic::Ordering::Acquire)
@@ -678,8 +693,22 @@ pub fn focus_changed(asid: u64) {
     let mut hidden = [(0usize, 0usize, 0usize, 0usize); MAX_WINDOWS];
     let mut nhidden = 0usize;
 
+    // FOCUS-HL: take the focus owner BEFORE the table lock, so the composite at the end of this call
+    // already draws the new highlight. The window that is LOSING focus must be repainted too — the raise
+    // below only damages the windows it raises, and the old holder is not among them when focus moves to
+    // a different ASID (or to the shell, which raises nothing at all). Without this its chrome would keep
+    // the highlight colours until something else happened to damage it.
+    let prev = FOCUS_ASID.swap(asid, Ordering::Release);
+
     {
         let mut t = TABLE.lock();
+        if prev != asid && prev != 0 {
+            for r in t.rows.iter_mut() {
+                if r.used && !r.compat && r.owner_asid == prev {
+                    r.damaged = true;
+                }
+            }
+        }
         if asid == 0 {
             // The SHELL takes the top of the stack. Every window is now below it; collect the boxes so
             // the panel stops showing them at once rather than at the desktop's next flush.
@@ -942,6 +971,9 @@ fn composite_inner() {
     // against the same shell position (a concurrent focus change either lands wholly before this pass
     // or is serviced by the composite that change performs itself).
     let shell = shell_z();
+    // FOCUS-HL: one snapshot per pass, for the same reason `shell` is one snapshot per pass — every
+    // window in this pass is judged against a single focus owner, so no pass can draw two highlights.
+    let focus = focus_asid();
 
     let mut drawn = 0usize;
     for &i in order.iter() {
@@ -962,7 +994,9 @@ fn composite_inner() {
         // measure into something other than the copy. Budgeted per window id; `None` once spent.
         #[cfg(all(target_arch = "aarch64", feature = "witness"))]
         let wcg_probe = super::wcg::begin(rows[i].id, rows[i].surf, rows[i].surf_len, rows[i].compat);
-        draw_window(&fb, &rows[i]);
+        // FOCUS-HL: `focus == 0` is shell focus and highlights nothing — and the explicit `!= 0` also
+        // keeps a compat row (owner ASID 0) from matching it by accident.
+        draw_window(&fb, &rows[i], focus != 0 && focus == rows[i].owner_asid);
         #[cfg(all(target_arch = "aarch64", feature = "witness"))]
         if let Some(p) = wcg_probe {
             let r = &rows[i];
@@ -1175,7 +1209,7 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window) {
 
     // Restore what the `IVAC` may have dropped: redraw the window and re-run its flush. In a correct build
     // this is a no-op repaint; in a broken one it is what keeps the diagnostic from being destructive.
-    draw_window(fb, r);
+    draw_window(fb, r, focus_asid() != 0 && focus_asid() == r.owner_asid);
 }
 
 /// WC-D — window ids whose [`verify_window`] verdict has already been emitted (bit `id`), so the read-back
@@ -1288,6 +1322,16 @@ const CHROME_BORDER: u32 = 0x003A_3A46;
 const CHROME_TITLE_BG: u32 = 0x001E_1E28;
 const CHROME_TITLE_FG: u32 = 0x00C8_C8D8;
 
+/// FOCUS-HL — the same three chrome colours, brightened, for the window that currently holds focus.
+/// The border carries most of the signal (it frames the whole window, so it reads at a glance from
+/// across the bench) and the title strip lifts with it so the two do not disagree.
+///
+/// Chosen to stay in the same flat, un-host-like family as the resting colours — this marks focus, it
+/// does not imitate anyone's title bar — while clearing a wide enough gap to be unambiguous on the
+/// bench panel rather than only on a screenshot.
+const CHROME_BORDER_FOCUS: u32 = 0x008C_8CB4;
+const CHROME_TITLE_BG_FOCUS: u32 = 0x003A_3A5A;
+
 /// The outer box `(x, y, w, h)` a window occupies on the panel, chrome included. A compat window
 /// (the `present_surface` shim) has no chrome, so its outer box is exactly its content.
 /// F5 — every product and sum here saturates. The kernel builds with overflow checks off, so a
@@ -1320,7 +1364,7 @@ fn boxes_overlap(a: (usize, usize, usize, usize), b: (usize, usize, usize, usize
 /// non-coherent Pi 4 HVS scan-out sees the new pixels. All writes are `put_pixel`/`fill_rect` on a
 /// `Copy` `FrameBuffer` handle (volatile stores, no aliased `&mut`), the same discipline
 /// `Screen::flush` and the legacy `present_surface` use.
-fn draw_window(fb: &super::FrameBuffer, r: &Window) {
+fn draw_window(fb: &super::FrameBuffer, r: &Window, focused: bool) {
     // `stride`/`scale` are divisors below and `surf_len` bounds the reads, so all four are checked
     // here rather than trusted from the row.
     if r.surf == 0 || r.w == 0 || r.h == 0 || r.scale == 0 || r.stride < 4 || r.surf_len == 0 {
@@ -1341,8 +1385,16 @@ fn draw_window(fb: &super::FrameBuffer, r: &Window) {
     if !r.compat {
         // Frame: fill the whole outer box in the border colour, then lay the title strip and the
         // content over it. The only pixels that survive are the 1-px frame itself.
-        fb.fill_rect(bx, by, bw, bh, CHROME_BORDER);
-        fb.fill_rect(bx + BORDER, by + BORDER, bw.saturating_sub(2 * BORDER), TITLE_H, CHROME_TITLE_BG);
+        // FOCUS-HL: the ONLY difference the focused window's chrome carries is these two colours. The
+        // geometry is identical either way, so focus never moves a pixel — it just repaints the frame
+        // and strip that were already going to be painted, at no extra cost per present.
+        let (border, title_bg) = if focused {
+            (CHROME_BORDER_FOCUS, CHROME_TITLE_BG_FOCUS)
+        } else {
+            (CHROME_BORDER, CHROME_TITLE_BG)
+        };
+        fb.fill_rect(bx, by, bw, bh, border);
+        fb.fill_rect(bx + BORDER, by + BORDER, bw.saturating_sub(2 * BORDER), TITLE_H, title_bg);
         draw_title(fb, r, bx + BORDER + 2, by + BORDER + 2, bw.saturating_sub(2 * BORDER + 4));
     }
 

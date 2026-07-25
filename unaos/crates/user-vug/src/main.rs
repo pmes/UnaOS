@@ -6,7 +6,7 @@
 // UVUG-3: the first INTERACTIVE EL0 application — a userspace mini-vug that draws a real vug-style
 // wireframe quartz crystal and responds to live keyboard/mouse. A static ELF64 (aarch64) program,
 // loaded by the kernel's EXEC-1 machinery (`run_user_image`) into a fresh per-process slot and run at
-// EL0 — the identical path the operator drives with `run /fat/UVUG.ELF`.
+// EL0 — the identical path the operator drives with `run /fat/VUG.ELF`.
 //
 // WHAT IT DOES
 //   1. WC-C: creates its own 128x128 ARGB8888 WINDOW via SYS_WIN_CREATE — a real compositor window with
@@ -688,6 +688,16 @@ pub extern "C" fn _start() -> ! {
         b.flush();
         exit(1);
     }
+    // VUG-BG: read the process-flags word the kernel publishes in the RO info page (base + 0x4000, u32
+    // index 0x20/4 — see the info-page layout in userspace.md). Bit 0 says this process was started
+    // DETACHED, i.e. by `bg /fat/VUG.ELF` rather than `run`. A detached vug has no operator to press ESC
+    // and, being unfocused, never receives input — so the 300-frame auto cap would end it in about a
+    // second, which is exactly what read as "the app crashed" on the bench. Detached therefore means: run
+    // the SAME deterministic auto path, but with no frame cap, until `kill` takes it down.
+    //
+    // Read AFTER SYS_WIN_CREATE, which is what maps the info page and publishes the word — reading it
+    // before the window exists would fault on an unmapped VA.
+    let detached = unsafe { ((base + 0x4000) as *const u32).add(0x20 / 4).read_volatile() } & 1 != 0;
     let surf_va = base + 0x5000;
     SURF.store(surf_va, Ordering::Release);
     let surf = surf_va as *mut u8;
@@ -814,8 +824,12 @@ pub extern "C" fn _start() -> ! {
             if exit_key || exit_click || frame >= INTERACTIVE_CAP {
                 break;
             }
-        } else if frame >= AUTO_FRAMES {
-            // No input has ever arrived (QEMU): the deterministic auto path ends at 300 frames.
+        } else if !detached && frame >= AUTO_FRAMES {
+            // No input has ever arrived (QEMU): the deterministic auto path ends at 300 frames — the
+            // surface at that frame is what the checksum witness asserts. VUG-BG: a DETACHED launch skips
+            // this cap entirely and tumbles until it is killed. The two are disjoint by construction —
+            // the checksum witness runs through `run_user_image` (foreground), which clears the detached
+            // bit — so the 300-frame checksum is untouched by this branch.
             break;
         }
     }

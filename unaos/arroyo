@@ -910,55 +910,55 @@ kernel8() {
     [ "$esz" -le 16384 ] || { echo -e "${COLOR_RED}ERROR: ELFHELLO.ELF ${esz} bytes > USER_REGION_SIZE (16384)${COLOR_RESET}"; exit 1; }
     echo -e "${COLOR_GREEN}✅ static-ELF EL0 program: ELFHELLO.ELF (${esz} B)${COLOR_RESET}"
 
-    # UVUG-1: build the static ELF64 EL0 mini-vug program (crates/user-uvug) the SAME way as ELFHELLO — keep
+    # UVUG-1: build the static ELF64 EL0 mini-vug program (crates/user-vug) the SAME way as ELFHELLO — keep
     # it AS AN ELF (strip-all preserves the ELF header + program headers + the two PT_LOAD segments). It maps
     # an off-screen surface (SYS_FB_MAP), spawns 2 EL0 worker threads (SYS_THREAD_SPAWN) that render halves of
     # an animated pattern under a FUTEX frame barrier, presents each frame (SYS_FB_PRESENT), then joins both
     # (SYS_THREAD_JOIN) and prints its `:: UVUG: … ::` witness before exiting 0. Same linker script shape as
-    # ELFHELLO (user-uvug.ld's PHDRS: a R+X text segment + a R+W data segment); `-z max-page-size=0x1000`
+    # ELFHELLO (user-vug.ld's PHDRS: a R+X text segment + a R+W data segment); `-z max-page-size=0x1000`
     # packs the segments on 4 KiB boundaries so the whole image fits the kernel's 16 KiB slot window.
-    echo -e "${COLOR_YELLOW}⚡ Building EL0 mini-vug static-ELF program (crates/user-uvug → target/UVUG.ELF)...${COLOR_RESET}"
-    cd "$WORKSPACE_DIR/crates/user-uvug"
-    RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-uvug/user-uvug.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
+    echo -e "${COLOR_YELLOW}⚡ Building EL0 mini-vug static-ELF program (crates/user-vug → target/VUG.ELF)...${COLOR_RESET}"
+    cd "$WORKSPACE_DIR/crates/user-vug"
+    RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-vug/user-vug.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
       cargo +nightly build --release -Z json-target-spec
     cd "$WORKSPACE_DIR"
     "$TOOLBIN/llvm-objcopy" --strip-all \
-      "${WORKSPACE_DIR}/crates/user-uvug/target/aarch64-base/release/user-uvug" \
-      "${WORKSPACE_DIR}/target/UVUG.ELF"
+      "${WORKSPACE_DIR}/crates/user-vug/target/aarch64-base/release/user-vug" \
+      "${WORKSPACE_DIR}/target/VUG.ELF"
     # It must exist, begin with the ELF magic (\x7fELF), and fit the slot window (USER_REGION_SIZE = 16 KiB;
     # a larger image is BadSize at load). A wrong magic or oversize image is a build failure caught here.
-    [ -s "${WORKSPACE_DIR}/target/UVUG.ELF" ] || { echo -e "${COLOR_RED}ERROR: UVUG.ELF missing/empty — UVUG build failed${COLOR_RESET}"; exit 1; }
-    umag="$(head -c 4 "${WORKSPACE_DIR}/target/UVUG.ELF" | od -An -tx1 | tr -d ' \n')"
-    [ "$umag" = "7f454c46" ] || { echo -e "${COLOR_RED}ERROR: UVUG.ELF does not start with the ELF magic; first 4 bytes = ${umag}${COLOR_RESET}"; exit 1; }
-    usz="$(wc -c < "${WORKSPACE_DIR}/target/UVUG.ELF" | tr -d ' ')"
-    [ "$usz" -le 16384 ] || { echo -e "${COLOR_RED}ERROR: UVUG.ELF ${usz} bytes > USER_REGION_SIZE (16384)${COLOR_RESET}"; exit 1; }
-    echo -e "${COLOR_GREEN}✅ static-ELF EL0 mini-vug program: UVUG.ELF (${usz} B)${COLOR_RESET}"
+    [ -s "${WORKSPACE_DIR}/target/VUG.ELF" ] || { echo -e "${COLOR_RED}ERROR: VUG.ELF missing/empty — UVUG build failed${COLOR_RESET}"; exit 1; }
+    umag="$(head -c 4 "${WORKSPACE_DIR}/target/VUG.ELF" | od -An -tx1 | tr -d ' \n')"
+    [ "$umag" = "7f454c46" ] || { echo -e "${COLOR_RED}ERROR: VUG.ELF does not start with the ELF magic; first 4 bytes = ${umag}${COLOR_RESET}"; exit 1; }
+    usz="$(wc -c < "${WORKSPACE_DIR}/target/VUG.ELF" | tr -d ' ')"
+    [ "$usz" -le 16384 ] || { echo -e "${COLOR_RED}ERROR: VUG.ELF ${usz} bytes > USER_REGION_SIZE (16384)${COLOR_RESET}"; exit 1; }
+    echo -e "${COLOR_GREEN}✅ static-ELF EL0 mini-vug program: VUG.ELF (${usz} B)${COLOR_RESET}"
 
-    # BGRUN-2: build the static ELF64 EL0 PERSISTENCE program (crates/user-stat) exactly like UVUG/ELFHELLO
+    # BGRUN-2: build the static ELF64 EL0 PERSISTENCE program (crates/user-kvug) exactly like UVUG/ELFHELLO
     # — keep it AS AN ELF (strip-all preserves the ELF header + program headers + the two PT_LOAD segments).
     # It creates one 128x128 compositor window (SYS_WIN_CREATE), repaints its own pid + a frame counter + a
     # sweep block, and NEVER exits on its own — `kill <pid>` is the whole remedy. That is what makes the
     # WC-TAB window ring operator-verifiable: a backgrounded UVUG is unfocused, stays on its deterministic
     # auto path and is gone in 300 frames, so two windows never coexisted long enough to TAB between them.
-    # Same linker script shape as UVUG (crates/user-stat/user-stat.ld — two PT_LOAD segments via a PHDRS
+    # Same linker script shape as UVUG (crates/user-kvug/user-kvug.ld — two PT_LOAD segments via a PHDRS
     # clause); `-z max-page-size=0x1000` packs the segments on 4 KiB boundaries so the image fits the
     # kernel's 16 KiB slot window.
-    echo -e "${COLOR_YELLOW}⚡ Building EL0 persistence static-ELF program (crates/user-stat → target/STAT.ELF)...${COLOR_RESET}"
-    cd "$WORKSPACE_DIR/crates/user-stat"
-    RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-stat/user-stat.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
+    echo -e "${COLOR_YELLOW}⚡ Building EL0 persistence static-ELF program (crates/user-kvug → target/KVUG.ELF)...${COLOR_RESET}"
+    cd "$WORKSPACE_DIR/crates/user-kvug"
+    RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-kvug/user-kvug.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
       cargo +nightly build --release -Z json-target-spec
     cd "$WORKSPACE_DIR"
     "$TOOLBIN/llvm-objcopy" --strip-all \
-      "${WORKSPACE_DIR}/crates/user-stat/target/aarch64-base/release/user-stat" \
-      "${WORKSPACE_DIR}/target/STAT.ELF"
-    # Same three checks as UVUG: it must exist, begin with the ELF magic (\x7fELF), and fit the slot window
+      "${WORKSPACE_DIR}/crates/user-kvug/target/aarch64-base/release/user-kvug" \
+      "${WORKSPACE_DIR}/target/KVUG.ELF"
+    # Same three checks as VUG: it must exist, begin with the ELF magic (\x7fELF), and fit the slot window
     # (USER_REGION_SIZE = 16 KiB; a larger image is BadSize at load).
-    [ -s "${WORKSPACE_DIR}/target/STAT.ELF" ] || { echo -e "${COLOR_RED}ERROR: STAT.ELF missing/empty — STAT build failed${COLOR_RESET}"; exit 1; }
-    smag="$(head -c 4 "${WORKSPACE_DIR}/target/STAT.ELF" | od -An -tx1 | tr -d ' \n')"
-    [ "$smag" = "7f454c46" ] || { echo -e "${COLOR_RED}ERROR: STAT.ELF does not start with the ELF magic; first 4 bytes = ${smag}${COLOR_RESET}"; exit 1; }
-    ssz="$(wc -c < "${WORKSPACE_DIR}/target/STAT.ELF" | tr -d ' ')"
-    [ "$ssz" -le 16384 ] || { echo -e "${COLOR_RED}ERROR: STAT.ELF ${ssz} bytes > USER_REGION_SIZE (16384)${COLOR_RESET}"; exit 1; }
-    echo -e "${COLOR_GREEN}✅ static-ELF EL0 persistence program: STAT.ELF (${ssz} B)${COLOR_RESET}"
+    [ -s "${WORKSPACE_DIR}/target/KVUG.ELF" ] || { echo -e "${COLOR_RED}ERROR: KVUG.ELF missing/empty — KVUG build failed${COLOR_RESET}"; exit 1; }
+    smag="$(head -c 4 "${WORKSPACE_DIR}/target/KVUG.ELF" | od -An -tx1 | tr -d ' \n')"
+    [ "$smag" = "7f454c46" ] || { echo -e "${COLOR_RED}ERROR: KVUG.ELF does not start with the ELF magic; first 4 bytes = ${smag}${COLOR_RESET}"; exit 1; }
+    ssz="$(wc -c < "${WORKSPACE_DIR}/target/KVUG.ELF" | tr -d ' ')"
+    [ "$ssz" -le 16384 ] || { echo -e "${COLOR_RED}ERROR: KVUG.ELF ${ssz} bytes > USER_REGION_SIZE (16384)${COLOR_RESET}"; exit 1; }
+    echo -e "${COLOR_GREEN}✅ static-ELF EL0 persistence program: KVUG.ELF (${ssz} B)${COLOR_RESET}"
 
     # K2 metal money-shot: UNAOS_K2_LEAVE=1 adds the `k2_leave` feature — k2_liveenf becomes a two-boot
     # cross-reboot power-cycle proof (boot-1 leaves a persisted owned file; boot-2 verifies the live boot
@@ -1163,18 +1163,18 @@ kernel8() {
     # the sole mint path. NEVER collides with the flat fixtures (HELLO/K2*/MIDDEN/SCRATCH/GROW .BIN).
     cp "${WORKSPACE_DIR}/target/ELFHELLO.ELF" "$KERNEL8_DIR/ELFHELLO.ELF"
 
-    # UVUG-1: carry the mini-vug static ELF64 onto the boot media as UVUG.ELF (make-pi-img.sh ditto's the
+    # UVUG-1: carry the mini-vug static ELF64 onto the boot media as VUG.ELF (make-pi-img.sh ditto's the
     # whole staging dir). The kernel's UVUG witness reads it back off the SD through the VFS and runs it via
-    # the EXEC-1 `run_user_image` path (2 PT_LOAD segments, per-segment W^X); the panel `run /fat/UVUG.ELF`
+    # the EXEC-1 `run_user_image` path (2 PT_LOAD segments, per-segment W^X); the panel `run /fat/VUG.ELF`
     # runs the same bytes live. Distinct 8.3 name => its own IMAGE_SHA256 principal; never collides with the
     # flat fixtures or ELFHELLO.ELF.
-    cp "${WORKSPACE_DIR}/target/UVUG.ELF" "$KERNEL8_DIR/UVUG.ELF"
+    cp "${WORKSPACE_DIR}/target/VUG.ELF" "$KERNEL8_DIR/VUG.ELF"
 
-    # BGRUN-2: carry the persistence static ELF64 onto the boot media as STAT.ELF (make-pi-img.sh ditto's
+    # BGRUN-2: carry the persistence static ELF64 onto the boot media as KVUG.ELF (make-pi-img.sh ditto's
     # the whole staging dir). The BGRUN-ST persistence leg reads it back off the SD through the VFS and
-    # spawns it detached; the operator drives the same bytes with `bg /fat/STAT.ELF`. Distinct 8.3 name =>
-    # its own IMAGE_SHA256 principal; never collides with the flat fixtures, ELFHELLO.ELF or UVUG.ELF.
-    cp "${WORKSPACE_DIR}/target/STAT.ELF" "$KERNEL8_DIR/STAT.ELF"
+    # spawns it detached; the operator drives the same bytes with `bg /fat/KVUG.ELF`. Distinct 8.3 name =>
+    # its own IMAGE_SHA256 principal; never collides with the flat fixtures, ELFHELLO.ELF or VUG.ELF.
+    cp "${WORKSPACE_DIR}/target/KVUG.ELF" "$KERNEL8_DIR/KVUG.ELF"
 
     # U9: plant a DEDICATED writable scratch file (NEVER HELLO.BIN — other fixtures load that as EL0 code).
     # 1 KiB (> 512 so fat::probe_once never cats it) of a known 0xEE filler; the u9 File-write demo opens it

@@ -68,7 +68,7 @@
 //!
 //! ## `own=` — the leg the bench observation demanded
 //!
-//! Two EL0 apps with unrelated paint loops (the uvug crystal's 300-frame renderer and `stat.elf`'s
+//! Two EL0 apps with unrelated paint loops (the uvug crystal's 300-frame renderer and `kvug.elf`'s
 //! trivial ~20 fps counter repaint) garble the same way, so the defect is in the SHARED path. This
 //! witness runs per WINDOW ID, not for window 0, so that claim is provable on the wire rather than
 //! asserted.

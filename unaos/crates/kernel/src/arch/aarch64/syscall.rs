@@ -6681,6 +6681,10 @@ pub fn run_user_image(
         }
     };
     let asid = mapped.ttbr0 >> 48;
+    // VUG-BG: this is the FOREGROUND launcher, so the new address space is explicitly NOT detached.
+    // Cleared rather than merely "not set": ASIDs recycle, and a slot last used by a `bg` spawn would
+    // otherwise hand its stale detached bit to the next foreground program that inherits the number.
+    set_detached(asid, false);
     // Ensure the FUTEX waiter pool is initialised before the program can run: an EL0 program loaded through
     // this path (e.g. the UVUG mini-vug) may call SYS_FUTEX, and on a plain (non-witness) boot the in-kernel
     // fb-test launcher — the other futex_init caller — never runs. `futex_init` is idempotent (it only
@@ -7103,6 +7107,9 @@ pub fn spawn_user_image_bg(bytes: &[u8]) -> Result<(u64, u64, u64), &'static str
         }
     };
     let asid = mapped.ttbr0 >> 48;
+    // VUG-BG: mark the address space DETACHED before the task can be dispatched, so the program observes
+    // the bit on its very first info-page read rather than racing the launcher. See `set_detached`.
+    set_detached(asid, true);
     // Same rationale as `run_user_image`: the program may call SYS_FUTEX on a plain boot where no
     // other `futex_init` caller ran; idempotent, cheap.
     super::sched::futex_init();
@@ -9217,7 +9224,7 @@ fn exec1_witness(_demo_cpu: usize) {
 ///     reads "running" forever). Either kill outcome is legal (`confirmed` reaps here; `already exited`
 ///     leaves a PEXITED row we then reap by poll) — what the witness REQUIREs is that the row is not
 ///     leaked and not lying.
-///  3. persistence + kill (BGRUN-2): `bg` STAT.ELF — a windowed app with NO exit condition — dwell 2 s,
+///  3. persistence + kill (BGRUN-2): `bg` KVUG.ELF — a windowed app with NO exit condition — dwell 2 s,
 ///     REQUIRE the row still reads `Running` (it did not batch-exit on unfocus and did not fault), then
 ///     kill it and require the row settles as in leg 2. This is the property the WC-TAB ring needs and
 ///     that legs 1 and 2 structurally cannot witness: both of their programs end by themselves.
@@ -9275,8 +9282,8 @@ fn bgrun_witness(_demo_cpu: usize) {
     }
     // Leg 2: kill mid-run. UVUG runs 300 frames — seconds of runtime, syscalls every frame, so the
     // kill lands on a live target with abundant boundaries.
-    let Some(uvug) = read(&mt, "/fat/UVUG.ELF") else {
-        serial_println!(":: BGRUN-ST: /fat/UVUG.ELF not found — kill leg skipped ::");
+    let Some(uvug) = read(&mt, "/fat/VUG.ELF") else {
+        serial_println!(":: BGRUN-ST: /fat/VUG.ELF not found — kill leg skipped ::");
         return;
     };
     match spawn_user_image_bg(&uvug) {
@@ -9315,13 +9322,13 @@ fn bgrun_witness(_demo_cpu: usize) {
     // why the bench could not test TAB at all, because the backgrounded UVUG is unfocused, never leaves its
     // auto path, and is gone in seconds.
     //
-    // STAT.ELF has no exit condition at all, so the leg is: spawn detached, let it run a real interval,
+    // KVUG.ELF has no exit condition at all, so the leg is: spawn detached, let it run a real interval,
     // REQUIRE the row still reads Running (it did NOT batch-exit on unfocus, and it did not fault), then
     // kill it and require the row settles exactly as leg 2 does. The interval is timer-derived (2 s of
     // `cntpct`), comfortably longer than UVUG's whole 300-frame auto run — so "still running" here cannot
     // be confused with "has not got round to exiting yet".
-    let Some(stat) = read(&mt, "/fat/STAT.ELF") else {
-        serial_println!(":: BGRUN-ST: /fat/STAT.ELF not found — persistence leg skipped ::");
+    let Some(stat) = read(&mt, "/fat/KVUG.ELF") else {
+        serial_println!(":: BGRUN-ST: /fat/KVUG.ELF not found — persistence leg skipped ::");
         return;
     };
     match spawn_user_image_bg(&stat) {
@@ -9361,9 +9368,9 @@ fn bgrun_witness(_demo_cpu: usize) {
     }
 }
 
-/// UVUG-1 witness: prove the mini-vug EL0 graphics program end-to-end at boot. Reads UVUG.ELF through the
+/// UVUG-1 witness: prove the mini-vug EL0 graphics program end-to-end at boot. Reads VUG.ELF through the
 /// VFS `MountTable` (the same namespace the panel `run` verb builds) and executes it via `run_user_image` —
-/// the identical path the operator drives with `run /fat/UVUG.ELF`. The program maps its off-screen surface
+/// the identical path the operator drives with `run /fat/VUG.ELF`. The program maps its off-screen surface
 /// (SYS_FB_MAP), spawns 2 EL0 worker threads that render halves of an animated pattern under a FUTEX frame
 /// barrier, presents each frame (SYS_FB_PRESENT), joins both (SYS_THREAD_JOIN), and prints its OWN witness
 /// line `:: UVUG: frames=300 threads=2 checksum=<hex> ::` before exiting 0. This launcher only asserts the
@@ -9384,7 +9391,7 @@ fn uvug_witness(_demo_cpu: usize) {
     use crate::fs::vfs::{FatBackend, MountTable, KERNEL_PRINCIPAL};
     let mut mt = MountTable::new();
     mt.mount("/fat", alloc::boxed::Box::new(FatBackend::new("fat", KERNEL_PRINCIPAL, true)));
-    let path = "/fat/UVUG.ELF";
+    let path = "/fat/VUG.ELF";
     let st = match mt.stat(path) {
         Ok(s) => s,
         Err(e) => {
@@ -9800,9 +9807,52 @@ fn sys_fb_map() -> i64 {
 /// WC-B: write the LEGACY info-page header — the ELF-3 field layout, byte-for-byte, describing region
 /// slot 0 at the 32×32 compat geometry. u32 fields: [magic, width, height, stride, format, size,
 /// surface_offset]. Written through the kernel identity pointer (EL1-RW; the EL0 alias is read-only).
+/// VUG-BG — one bit per ASID: set while that address space was launched DETACHED (`bg <path>`), clear
+/// for a foreground `run`. Both launchers write it explicitly, so a recycled ASID never inherits the
+/// previous tenant's answer. Read-only to EL0, and only through the info page (`FB_INFO_FLAGS`).
+///
+/// A bitmask rather than a `Proc` field because the reader is the FB info-page writer, which is reached
+/// from `sys_win_create`/`sys_fb_map` with the window table lock held — it has an ASID in hand and no
+/// business walking the process table under that lock.
+static DETACHED_ASIDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// VUG-BG — record whether ASID `asid` was launched detached. ASIDs outside the bitmask's 64-bit range
+/// are ignored (the process table is far smaller; this is a bound, not an expected case), which fails in
+/// the safe direction: an unrepresentable ASID simply reads back "not detached" — the current behaviour.
+fn set_detached(asid: u64, on: bool) {
+    if asid == 0 || asid >= 64 {
+        return;
+    }
+    let bit = 1u64 << asid;
+    if on {
+        DETACHED_ASIDS.fetch_or(bit, Ordering::Release);
+    } else {
+        DETACHED_ASIDS.fetch_and(!bit, Ordering::Release);
+    }
+}
+
+/// VUG-BG — is ASID `asid` a detached (backgrounded) address space?
+fn is_detached(asid: u64) -> bool {
+    if asid == 0 || asid >= 64 {
+        return false;
+    }
+    DETACHED_ASIDS.load(Ordering::Acquire) & (1u64 << asid) != 0
+}
+
+/// VUG-BG — u32 index of the PROCESS-FLAGS word in the RO info page, in the reserved gap between the
+/// legacy ELF-3 header (`[0x00..0x1C]`) and the per-window entries (`0x40 + r*0x20`). Bit 0 = DETACHED.
+const FB_INFO_FLAGS: usize = 0x20 / 4;
+/// VUG-BG — bit 0 of `FB_INFO_FLAGS`: this process was launched by `bg`, not by `run`.
+const FB_FLAG_DETACHED: u32 = 1 << 0;
+
 fn fb_info_write_legacy(slot: usize) {
     let info = super::boot::slot_fb_info_ptr(slot) as *mut u32;
+    // VUG-BG: the process-flags word rides along with every legacy-header publication, so it is present
+    // by the time any window verb has returned a mapped surface to the caller. `slot + 1` is the ASID
+    // (`win_caller_slot` returns the ASID and every caller derives `slot = asid - 1`).
+    let flags = if is_detached(slot as u64 + 1) { FB_FLAG_DETACHED } else { 0 };
     unsafe {
+        info.add(FB_INFO_FLAGS).write_volatile(flags);
         info.add(0).write_volatile(FB_MAGIC);
         info.add(1).write_volatile(super::boot::FB_SURFACE_W);
         info.add(2).write_volatile(super::boot::FB_SURFACE_H);
@@ -9923,7 +9973,7 @@ fn present_surface_common(
 //   * the REGION SLOT (0..FB_WIN_SLOTS) — PER-ADDRESS-SPACE, which 64 KiB surface slot of the owner's
 //     own FB region backs it. Region slots are allocated lowest-first per ASID, so a process's FIRST
 //     window always lands on region slot 0 — the VA the single ELF-3 surface occupied, which is what
-//     makes `SYS_FB_MAP`'s returned VA byte-identical for the existing UVUG.ELF binary.
+//     makes `SYS_FB_MAP`'s returned VA byte-identical for the existing VUG.ELF binary.
 // Collapsing the two would be wrong in both directions: a global surface index would leak one process's
 // surface VA layout into another's address space, and a per-ASID window id would make ids ambiguous to
 // the compositor.
@@ -10063,14 +10113,20 @@ fn win_resolve(asid: u64, win: u64) -> Result<(usize, WinEntry), i64> {
 /// WC-B: publish window `id`'s geometry into the owner's RO info page, at the PER-WINDOW entry for its
 /// region slot. Layout of the page (all u32, little-endian):
 ///   [0x00..0x1C] the LEGACY ELF-3 header — magic, w, h, stride, format, size, surface_offset — which
-///                keeps describing region slot 0 so the existing UVUG.ELF reads exactly what it always did;
+///                keeps describing region slot 0 so the existing VUG.ELF reads exactly what it always did;
+///   [0x20]       VUG-BG process flags — bit 0 = DETACHED (the process was launched by `bg`, not `run`);
 ///   [0x40 + r*0x20] per region slot `r`: magic, win_id, w, h, stride, size, surface_offset-from-info-base.
 /// A region slot with no live window keeps a zeroed entry (magic 0), so EL0 can tell live from stale.
 fn fb_info_write_win(slot: usize, id: usize, e: &WinEntry) {
     let info = super::boot::slot_fb_info_ptr(slot) as *mut u32;
     let stride = e.w as u32 * 4;
     let off = super::boot::FB_INFO_SIZE + (e.rslot as usize) * super::boot::FB_WIN_SLOT_SIZE;
+    // VUG-BG: publish the process-flags word here too. The legacy header (which also writes it) is only
+    // refreshed for region slot 0, so a process whose FIRST window landed on a higher slot would
+    // otherwise read a zeroed — i.e. wrongly "not detached" — flags word.
+    let flags = if is_detached(slot as u64 + 1) { FB_FLAG_DETACHED } else { 0 };
     unsafe {
+        info.add(FB_INFO_FLAGS).write_volatile(flags);
         let p = info.add(0x40 / 4 + (e.rslot as usize) * (0x20 / 4));
         p.add(0).write_volatile(FB_MAGIC);
         p.add(1).write_volatile(id as u32);
@@ -10477,12 +10533,12 @@ static EL0_INPUT_TAIL: [AtomicU32; super::boot::USER_SLOTS + 1] =
 static EL0_INPUT_ACTIVE: AtomicU64 = AtomicU64::new(0);
 
 /// UVUG-8: the ASID of the EL0 app that has entered INTERACTIVE TAKEOVER (0 = none). An EL0 full-screen app
-/// (`run /fat/UVUG.ELF`) flips to interactive mode the instant it drains its FIRST real input event (the
+/// (`run /fat/VUG.ELF`) flips to interactive mode the instant it drains its FIRST real input event (the
 /// UVUG-4 input-driven switch) — the same edge the app announces with `:: UVUG: interactive takeover ::`.
 ///
 /// UVUG-8r2 moves the engage edge from PRODUCER to CONSUMER. The first cut latched in `el0_input_push` — an
 /// event merely REACHING the ring. That mis-fired on metal at t≈0: `el0_input_set_active` reset the per-ASID
-/// ring but NOT `pal::EVENT_QUEUE`, so the Enter KeyUp left over from typing `run /fat/UVUG.ELF` drained
+/// ring but NOT `pal::EVENT_QUEUE`, so the Enter KeyUp left over from typing `run /fat/VUG.ELF` drained
 /// straight into the new app's ring and engaged takeover before the app had run a single frame — giving EVERY
 /// keyboard-launched run (batch apps included, which never poll at all) a suspended deadline. Now the latch is
 /// set by `sys_input_poll` only when the app ACTUALLY CONSUMES a packed event, so it reflects the app's own
@@ -10716,7 +10772,7 @@ fn el0_input_push(asid: u64, packed: u64) -> bool {
 pub fn el0_input_set_active(asid: u64) {
     // UVUG-8r2: a fresh focus must also start with an empty UPSTREAM queue. `clear_input_row` resets only the
     // per-ASID ring; `pal::EVENT_QUEUE` sits in front of it and, on metal, still holds the tail of the
-    // keystroke that LAUNCHED this program — the Enter KeyUp from typing `run /fat/UVUG.ELF`. Left there, the
+    // keystroke that LAUNCHED this program — the Enter KeyUp from typing `run /fat/VUG.ELF`. Left there, the
     // router drains it into the new app's ring microseconds after launch, and the app's first poll reads it as
     // genuine in-app interaction (pre-r2, the push itself engaged takeover, so every keyboard-launched run —
     // batch programs included — got a suspended deadline at t≈0). Drain and DISCARD it here: events queued
@@ -10847,7 +10903,7 @@ fn clear_input_row(asid: u64) {
 /// event (>= 0) or `-EAGAIN` when the ring is empty (or the caller has no private slot — ASID 0). The SPSC
 /// consumer half: this EL0 task is the sole consumer of its own ring.
 fn sys_input_poll() -> i64 {
-    // UVUG-5: an EL0 full-screen app (`run /fat/UVUG.ELF`) drives input through THIS syscall every frame —
+    // UVUG-5: an EL0 full-screen app (`run /fat/VUG.ELF`) drives input through THIS syscall every frame —
     // it never touches the kernel `pal::pump_and_poll` path that feeds `gui_watchdog::note_progress`. So the
     // watchdog, armed by `on_app_enter` when the `run` command took the screen, never saw a heartbeat and
     // FALSELY declared the healthy, polling UVUG app wedged at 5 s (`[gui] watchdog app wedged 5s (no drain
@@ -12391,8 +12447,8 @@ pub fn u7_launcher(demo_cpu: usize) {
     // drawn bytes against the expected checksum. In-RAM (no disk), so it can never perturb the fixture battery;
     // its own uncounted `:: EL0: fb test — … ::` line. Placed after ELF-2 (the thread primitives it builds on).
     fb_launcher(demo_cpu);
-    // UVUG-1: the first REAL EL0 graphics program — the mini-vug. Reads UVUG.ELF through the VFS and runs it
-    // via the EXEC-1 `run_user_image` path (the same path `run /fat/UVUG.ELF` drives at the panel): it maps an
+    // UVUG-1: the first REAL EL0 graphics program — the mini-vug. Reads VUG.ELF through the VFS and runs it
+    // via the EXEC-1 `run_user_image` path (the same path `run /fat/VUG.ELF` drives at the panel): it maps an
     // off-screen surface, spawns 2 EL0 worker threads that render halves of an animated pattern under a FUTEX
     // frame barrier, presents each frame, joins both, and prints its OWN deterministic
     // `:: UVUG: frames=300 threads=2 checksum=<hex> ::` witness before exiting 0. Placed after `fb_launcher`

@@ -679,7 +679,7 @@ plus the status strip. `DESKTOP_BG` restates the console's private `Console::BG`
 it, so the compositor owns its own theme value (the crispy theme will replace it with real desktop
 data); a drift between the two is immediately visible as a rectangle where a window used to be.
 
-**UVUG is windowed.** `crates/user-uvug` no longer maps the 32×32 compat surface. It calls
+**UVUG is windowed.** `crates/user-vug` no longer maps the 32×32 compat surface. It calls
 `SYS_WIN_CREATE(128, 128)` — `boot::FB_WIN_MAX_W/H`, exactly one 64 KiB window slot — reads its surface
 at its own window base + `0x5000` (window region slot 0, the VA `SYS_FB_MAP` used to return), and
 presents with `SYS_WIN_PRESENT`. `FOCAL` scales 6 → 24 so the crystal keeps the same framing at 4× the
@@ -1189,7 +1189,7 @@ What QEMU therefore cannot exercise is the sprite itself: the first draw, the sa
 
 ### FOCUS-VIS — focus you can SEE, and a shell you can read
 
-P59 (bench, 2026-07-25) put two backgrounded windows on the panel — the UVUG crystal and `STAT.ELF` —
+P59 (bench, 2026-07-25) put two backgrounded windows on the panel — the UVUG crystal and `KVUG.ELF` —
 and produced two observations that turn out to be one defect:
 
 1. **TAB provably cycled focus and the panel never moved.** `[wc-c] focus tab-cycle 0->1->2->0 (ring of
@@ -1330,6 +1330,71 @@ nothing on a gate with no pointer, exactly as CURSOR-1 promised.
 visibly front → the cursor is visible throughout. The raise, the shell raise and the cursor's survival of
 a window create are all gate-checkable; the *legibility* of the console under the full present, and the
 sprite itself (QEMU has no pointer), remain bench-only.
+
+### FOCUS-HL — the focused window's chrome says so
+
+FOCUS-VIS made focus *positional*: the focused window raises, the shell raises above everything. That is
+the right primitive and it is not, on its own, an answer at the panel. With two windows that do not
+overlap — which is the normal `bg` × 2 layout, side by side — raising the focused one moves nothing
+visible, so the operator still cannot tell which window has the keyboard without typing into it.
+
+Chrome is the natural carrier, because it is already kernel-drawn and already repainted on every present
+(see WC-A: an app draws only inside its surface, the border and title strip are the compositor's). So the
+indicator costs no new pixels and no new pass.
+
+* **State.** `wm::FOCUS_ASID` — the ASID that holds focus, `0` for the shell. Written only by
+  `focus_changed`, which is already the single seam every focus move passes through, so there is no
+  second place for the compositor's idea of focus to diverge from the router's.
+* **Read once per pass.** `composite` snapshots `FOCUS_ASID` alongside `SHELL_Z`, for the same reason:
+  one pass judges every window against one focus owner, so a pass structurally cannot paint two
+  highlights.
+* **Two colours, no geometry.** `draw_window(fb, r, focused)` swaps `CHROME_BORDER` →
+  `CHROME_BORDER_FOCUS` (`0x8C8CB4`) and `CHROME_TITLE_BG` → `CHROME_TITLE_BG_FOCUS` (`0x3A3A5A`). The
+  `outer_box` is unchanged, so focus never moves a pixel — no reflow, no re-damage of neighbours beyond
+  what focus already causes, and the highlight is free relative to a present that was going to fill those
+  rects anyway. The colours stay in the flat, deliberately un-host-like family WC-A chose: this marks
+  focus, it does not imitate a title bar.
+* **Shell focus highlights nothing.** `focus == 0` matches no window, which is the honest reading — no
+  app has the keyboard. The explicit `!= 0` test also stops a compat row (owner ASID `0`) matching by
+  accident, though a compat window draws no chrome to highlight in the first place.
+* **The losing window repaints too.** `focus_changed` already damages the windows it *raises*; it now
+  also damages the windows of the ASID losing focus. That set is disjoint from the raise (and empty on
+  the shell branch, which raises nothing), so without it the previous holder would keep the bright chrome
+  until something unrelated damaged it — the same "both ends repaint" property FOCUS-VIS established for
+  position, now extended to colour.
+
+Damage is still focus-change-scoped: no per-frame cost, and a boot that never TABs — every QEMU gate run,
+since raspi4b has no HID — composites byte-identically to before, which is why the existing surface
+checksums are untouched.
+
+**And that is also the limit of what the gate can say about this fold.** raspi4b has no HID, so no QEMU
+run ever changes focus, so no QEMU run ever draws the highlight. The gate proves the change is *inert*
+where it should be inert (59/59, every checksum unchanged); the highlight itself is **bench-only** and
+unverified. The bench test is the FOCUS-VIS recipe with one addition: `bg /fat/VUG.ELF` → `bg
+/fat/KVUG.ELF` → TAB, and at each stop the front window's border and title strip must be visibly
+brighter than the other's, with **neither** highlighted at the shell stop.
+
+#### VUG/KVUG gate results (2026-07-25, QEMU raspi4b @ `UNAOS_FBW=1920 UNAOS_FBH=1200`)
+
+`./arroyo check` green both arches · `kernel8` builds clean, staging `VUG.ELF` (12568 B) and `KVUG.ELF`
+(8472 B) under their new names · `kernel8-test 60` **59/59 required, 0 forbidden** (unchanged — this arc
+adds no spec pattern and renames none) · `./arroyo test-arm` reaches
+`>>> MISSION SUCCESS (BOT + CSW). TARGET ACQUIRED. <<<`.
+
+> Correction to the FOCUS-VIS note above: **`./arroyo test-arm` does build and pass at this tip.** The
+> `wcf.rs` / `mailbox` cfg mismatch recorded there was fixed by a later arc; the note is kept for the
+> history but should not be read as a live defect.
+
+The renamed load paths are witnessed in the log rather than inferred:
+`:: EXEC-UVUG: run /fat/VUG.ELF — loaded 12568 bytes, entry 0x300000, exit=0 -> PASS ::`, all three
+`BGRUN-ST` legs PASS, and `:: UVUG: frames=300 threads=2 checksum=0xe68285b85121ac7c ::` is byte-identical
+to before the arc.
+
+**VUG-BG was verified by measurement, not by reading the diff.** A temporary probe in `BGRUN-ST`'s
+kill leg dwelled 4 s before killing the backgrounded `VUG.ELF` and printed
+`:: TEMP-VUGBG: after 4s bg VUG alive=true ::`. Four seconds is several times the ~1 s that same boot
+takes to run 300 frames in the foreground, so "still running" cannot be "has not finished the auto path
+yet". The probe was reverted and the gate re-run clean on the reverted tree.
 
 ### WC-G — the window-path garble, localized
 

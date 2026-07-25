@@ -2194,7 +2194,7 @@ fn input_router_selftest() {
     // keyboard-started run a suspended deadline at t≈0. (The consume edge itself needs a live EL0 task, so it
     // is metal-only; this asserts the half QEMU can see.)
     let push_does_not_engage = sc::el0_takeover_active() == 0;
-    // UVUG-8r2 (b): STALE PRE-LAUNCH EVENTS ARE DISCARDED ON FOCUS. This is the metal `run /fat/UVUG.ELF`
+    // UVUG-8r2 (b): STALE PRE-LAUNCH EVENTS ARE DISCARDED ON FOCUS. This is the metal `run /fat/VUG.ELF`
     // scenario in miniature: an event sits in EVENT_QUEUE from before the app existed (the Enter KeyUp that
     // launched it), then focus is granted. `el0_input_set_active` must drain it, so the very next router pass
     // finds nothing to deliver — the app cannot mistake its own launch keystroke for in-app interaction.
