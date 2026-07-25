@@ -315,24 +315,40 @@ pub unsafe fn takeover_display(
     let total_bytes = expected_height * pitch_bytes;
     let new_ptr = 0x00016000;
 
-    // Step 1: Prepare surf2 (linear fill, row offset calibration)
+    // Step 1: Prepare surf2 (linear fill, placement-model probe)
     for y in 0..expected_height {
-        let row_color = match y {
-            0..=7 => 0xFFFFFFFF,
-            448..=455 => 0xFFFF0000,
-            896..=903 => 0xFF00FF00,
-            1344..=1351 => 0xFF0000FF,
-            1792..=1799 => 0xFFFF00FF,
-            _ => 0xFF000000,
+        let band_idx = y / 16;
+        let band_color = match band_idx % 8 {
+            0 => 0xFFFF0000,
+            1 => 0xFF00FF00,
+            2 => 0xFF0000FF,
+            3 => 0xFFFFFF00,
+            4 => 0xFF00FFFF,
+            5 => 0xFFFF00FF,
+            6 => 0xFFFFFFFF,
+            _ => 0xFF404040,
         };
         
         let row_base = y * pitch_bytes;
         
         for x in 0..(pitch_bytes / 4) {
             let final_color = if x >= 2880 {
-                0xFF000000 // BLACK
+                0xFF000000 // BLACK padding
+            } else if x < 16 {
+                0xFFFFFFFF // WHITE left-edge alignment marker
+            } else if x < 32 {
+                0xFF000000 // BLACK spacer
+            } else if x < 144 {
+                let bit_idx = 6 - ((x - 32) / 16);
+                if (band_idx >> bit_idx) & 1 == 1 {
+                    0xFFFFFFFF // WHITE
+                } else {
+                    0xFF000000 // BLACK
+                }
+            } else if x < 160 {
+                0xFF000000 // BLACK spacer
             } else {
-                row_color
+                band_color
             };
             
             let target_byte_addr = row_base + (x * 4);
@@ -340,7 +356,7 @@ pub unsafe fn takeover_display(
             core::ptr::write_volatile(target_ptr, final_color);
         }
     }
-    serial_println!(":: kdisp: row-cal fill done bytes={:08X} ::", total_bytes);
+    serial_println!(":: kdisp: pm-step fill done bytes={:08X} ::", total_bytes);
 
     // Step 2: Latch Sequence
     mmio_write(bar0, asm_reg, new_ptr);
@@ -359,9 +375,21 @@ pub unsafe fn takeover_display(
     mmio_write(bar0, update_reg, 0x00000000);
     
     // 5 s hold
+    let mut dumped = false;
     for t in 1..=5 {
         for _ in 0..60_000_000 { core::hint::spin_loop(); }
-        serial_println!(":: kdisp: row-cal hold t={}s ::", t);
+        serial_println!(":: kdisp: pm-step hold t={}s ::", t);
+        if !dumped {
+            serial_println!(":: kdisp: pm-step reg-dump ptr={:08X} size={:08X} store={:08X} fmt={:08X} ::",
+                mmio_read(bar0, 0x640460),
+                mmio_read(bar0, 0x640468),
+                mmio_read(bar0, 0x64046C),
+                mmio_read(bar0, 0x640470));
+            for off in (0x4B8..=0x4C8).step_by(4) {
+                serial_println!(":: kdisp: pm-step reg-dump off={:03X} val={:08X} ::", off, mmio_read(bar0, 0x640000 + off));
+            }
+            dumped = true;
+        }
     }
 
     // Step 3: Restore
@@ -370,7 +398,7 @@ pub unsafe fn takeover_display(
     
     // 1 s recovery gap
     for _ in 0..15_000_000 { core::hint::spin_loop(); }
-    serial_println!(":: kdisp: row-cal done ::");
+    serial_println!(":: kdisp: pm-step done ::");
     
     // 7. Verdict
     serial_println!(":: kdisp: latch verdict asm-stuck=y ::");
