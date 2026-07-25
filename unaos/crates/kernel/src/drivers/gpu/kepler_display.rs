@@ -252,8 +252,8 @@ pub unsafe fn takeover_display(
     let gob_width_bytes = 64;
     let gob_height = 8;
     let gob_size_bytes = 512;
-    let gobs_per_row = expected_pitch / gob_width_bytes;
-
+    // We define gobs_per_row dynamically inside the loop now.
+    
     // 2. Pre-state
     let asm_reg = 0x640460;
     let armed_reg = 0x6101E0;
@@ -265,10 +265,16 @@ pub unsafe fn takeover_display(
     let pre_shadow = mmio_read(bar0, shadow_reg);
     serial_println!(":: kdisp: latch pre asm={:08X} armed={:08X} shadow={:08X} ::", pre_asm, pre_armed, pre_shadow);
 
-    let bh_steps = [2, 4, 8, 16];
+    let cycles = [(4, 192), (4, 256), (8, 192), (8, 256)];
     let new_ptr = 0x00016000;
 
-    for &bh in &bh_steps {
+    for &(bh, pg) in &cycles {
+        let gobs_per_row = pg;
+        let padded_width_px = pg * 16;
+        let gob_rows = (expected_height + gob_height - 1) / gob_height;
+        let num_block_rows = (gob_rows + bh - 1) / bh;
+        let total_bytes = num_block_rows * bh * pg * gob_size_bytes;
+
         // Step 1: Prepare surf2 (pre-swizzled ruler pattern fill)
         for y in 0..expected_height {
             let block_color = match (y / 64) % 8 {
@@ -293,8 +299,10 @@ pub unsafe fn takeover_display(
             let blk_y = gob_y / bh;
             let blk_inner = gob_y % bh;
             
-            for x in 0..expected_width {
-                let final_color = if x < 256 {
+            for x in 0..padded_width_px {
+                let final_color = if x >= 2880 {
+                    0xFF000000 // BLACK
+                } else if x < 256 {
                     0xFFFFFFFF // WHITE
                 } else if x < 264 {
                     0xFF000000 // BLACK
@@ -316,8 +324,7 @@ pub unsafe fn takeover_display(
                 core::ptr::write_volatile(target_ptr, final_color);
             }
         }
-        serial_println!(":: kdisp: surf2 prep off=01600000 bytes={:08X} pattern=ruler64x8-gob64x8-bh{} ::", fb_size, bh);
-        serial_println!(":: kdisp: bh-step bh={} fill done ::", bh);
+        serial_println!(":: kdisp: pa-step bh={} pg={} fill done bytes={:08X} ::", bh, pg, total_bytes);
 
         // Step 2: Latch Sequence
         mmio_write(bar0, asm_reg, new_ptr);
@@ -340,7 +347,7 @@ pub unsafe fn takeover_display(
         // (Peter, s21 prep: 4 s was too fast to photograph).
         for t in 1..=5 {
             for _ in 0..60_000_000 { core::hint::spin_loop(); }
-            serial_println!(":: kdisp: bh-step bh={} hold t={}s ::", bh, t);
+            serial_println!(":: kdisp: pa-step bh={} pg={} hold t={}s ::", bh, pg, t);
         }
 
         // Step 3: Restore
@@ -349,7 +356,7 @@ pub unsafe fn takeover_display(
         
         // 1 s recovery gap
         for _ in 0..15_000_000 { core::hint::spin_loop(); }
-        serial_println!(":: kdisp: bh-step bh={} done ::", bh);
+        serial_println!(":: kdisp: pa-step bh={} pg={} done ::", bh, pg);
     }
     
     // 7. Verdict
