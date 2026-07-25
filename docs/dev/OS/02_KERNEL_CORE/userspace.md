@@ -1116,6 +1116,41 @@
   - Gates: `./arroyo check` green both arches; `./arroyo kernel8` builds; `./arroyo kernel8-test 120`
     MBENCH **50/50 required, 0 forbidden**; `./arroyo test-arm` green. Lane: `arch/aarch64/mod.rs`
     (the witness-state line) + `arroyo` (comment correction) + this doc.
+- **BANDY-LOAD (witness load-immunity)** — the `BANDY-RT` launcher's wait on midden used to be a bare
+  5 s `CNTPCT` deadline. Under QEMU that is a **host-load thermometer, not a guest-progress measure**:
+  when the host is busy (parallel worktree builds), the guest gets fewer cycles per wall-second, so
+  midden's work — unchanged in guest terms — no longer fits the window. The run *completed*; the
+  verdict simply arrived after the launcher had given up (`done=0`, `midden_w=0x0`). That is budget
+  truncation, and it recurred as a **false red** in the battery.
+  - **The fix: verdict on work done, backstop denominated in scheduling opportunities.** Every
+    iteration of the wait calls `yield_now()`, so each iteration is one chance for midden to run.
+    `MIDDEN_YIELD_BUDGET` (1 000 000) bounds the wait in units host load does not dilate. Measured:
+    an unloaded completion spends **~74 k yields** (in 4.7 s of the old 5.0 s budget — the false red
+    was *that* close); the same completion under a saturated host spends **~107 k yields**. The
+    wall-clock blew straight past its budget; the yield count moved by 1.45×, and both sit two
+    orders of magnitude under the ceiling. That ratio *is* the argument for the design.
+  - **What this does not weaken.** A genuine hang still FAILs, and still within a bounded time — a
+    wedged midden burns the budget and falls through to the same `done=0` FAIL line. Two guards keep
+    the bound honest in both directions: `MIDDEN_MIN_WAIT_SECS` (5 s) is a **floor** the budget may
+    not fire before, so the wait can never truncate *earlier* than it did before this change; and
+    `MIDDEN_HARD_BACKSTOP_SECS` (45 s, 9× the measured completion) is an absolute ceiling for the
+    pathological case where yields stop costing guest work at all. The PASS line and its
+    `[w=…/mw=…]` ledger are byte-identical — the witness proves exactly what it proved before. The
+    FAIL line gains `yields=`, which separates the two failure shapes at a glance: a value at the
+    budget means the wait genuinely ran out of scheduling opportunities (a real hang), anything well
+    below it means midden finished and failed on merit.
+  - **Gates:** `./arroyo check` green both arches; `./arroyo kernel8` builds; `./arroyo kernel8-test`
+    MBENCH **53/53 required, 0 forbidden** unloaded (1816 lines) **and under a saturated host**
+    (1083 lines, load average ~200–310). The immunity was proven by A/B under the *same* load: with
+    the budget forced to 0 (the old wall-clock behaviour reproduced exactly) the witness FAILs
+    `done=0 yields=107432`; with the budget restored it PASSes. Lane: `arch/aarch64/syscall.rs`
+    (the `bandy_rt_launcher` wait + `bandy_wait_expired`) + this doc.
+  - **Siblings sharing the hazard (NOT touched — out of this arc's scope).** The bare
+    `N * timer::cntfrq()` wait is the house idiom across the aarch64 witness family: ~40 sites in
+    `arch/aarch64/syscall.rs` alone (the `wdeadline`/`vdeadline`/`tdeadline` spawn-and-wait triads at
+    U-line, K-line and window-compositor fixtures, 2–15 s each). They are all load-sensitive by the
+    same mechanism; `BANDY-RT` is simply the one whose margin was thinnest (94% consumed). Promoting
+    `bandy_wait_expired` into a shared witness-wait helper is the obvious follow-on arc.
 - Not yet: **revocation trees** (a derived copy — re-grant or onward re-transfer — escapes
   single-level revoke today; derivation records + `CAP_REVOKE` are that arc), the **bandy Ring-3
   delegation wrapper**, `File` transfer (descriptor migration), real `Socket` fs/net syscalls.

@@ -19294,6 +19294,53 @@ const STOLEN_NAME: &str = "STOLEN.BIN"; // the mv-of-foreign DENIED target (must
 
 static EL0_MIDDEN_DONE: AtomicU32 = AtomicU32::new(0); // midden sentinel exits (want 1)
 static BANDY_MIDDEN_WITNESS: AtomicU64 = AtomicU64::new(0); // midden's SYS_REPORT bits
+static BANDY_MIDDEN_YIELDS: AtomicU64 = AtomicU64::new(0); // launcher yields spent waiting (diag)
+
+// ---- BANDY load-immunity: the witness verdicts on WORK DONE, not on wall-clock ----------------
+//
+// The launcher's wait used to be a bare 5 s CNTPCT deadline. Under QEMU that is a HOST-LOAD
+// thermometer, not a guest-progress measure: when the host is busy (parallel worktree builds), the
+// guest gets fewer cycles per wall-second, so midden's work — unchanged in guest terms — no longer
+// fits the window. The run completed; the verdict simply arrived after the launcher had already
+// given up (`done=0`). That is budget truncation, and it recurred as a false red in the battery.
+//
+// The fix denominates the backstop in SCHEDULING OPPORTUNITIES instead. Every iteration of the wait
+// yields, so each iteration is one chance for midden to run: `MIDDEN_YIELD_BUDGET` bounds the wait
+// in units host load does not dilate. Host load stretches the wall time the same budget takes, and
+// that is exactly the property we want.
+//
+// What this does NOT weaken: a genuine hang still FAILs, and still within a bounded time — a wedged
+// midden burns the whole budget and falls through to the same `done=0` FAIL line. Two guards keep
+// the bound honest in both directions:
+//   * the budget may only fire once at least `MIDDEN_MIN_WAIT_SECS` of wall-clock has ALSO elapsed,
+//     so the wait can never truncate EARLIER than the old deadline did — load can only make it
+//     wait longer, never shorter;
+//   * `MIDDEN_HARD_BACKSTOP_SECS` is an absolute ceiling for the pathological case where yields
+//     stop costing guest work at all, set an order of magnitude above the observed completion so
+//     ordinary host load can never reach it.
+//
+/// Scheduling opportunities granted to midden before the launcher gives up. A measured
+/// `kernel8-test` completion spends ~74 k yields (and 4.7 s of a 5.0 s wall budget — the false red
+/// was that close); this is ~13x that, and the count is guest-denominated so host load barely
+/// moves it.
+const MIDDEN_YIELD_BUDGET: u64 = 1_000_000;
+/// The old wall-clock deadline, kept as a FLOOR: the budget cannot fire before this, so the wait
+/// can never truncate earlier than it did before this change.
+const MIDDEN_MIN_WAIT_SECS: u64 = 5;
+/// Absolute ceiling — hang detection of last resort (9x the measured completion), for the
+/// pathological case where yields stop costing guest work at all.
+const MIDDEN_HARD_BACKSTOP_SECS: u64 = 45;
+
+/// Whether the launcher's wait on midden has expired. `start` is a CNTPCT stamp; `yields` is the
+/// number of scheduling opportunities already granted.
+fn bandy_wait_expired(start: u64, yields: u64) -> bool {
+    let elapsed = super::timer::cntpct().wrapping_sub(start);
+    let hz = super::timer::cntfrq();
+    if elapsed >= hz.saturating_mul(MIDDEN_HARD_BACKSTOP_SECS) {
+        return true;
+    }
+    yields >= MIDDEN_YIELD_BUDGET && elapsed >= hz.saturating_mul(MIDDEN_MIN_WAIT_SECS)
+}
 
 /// SYS_REPORT router for midden (the k2_report idiom — keyed on the task name).
 fn bandy_report(value: u64) {
@@ -19393,12 +19440,14 @@ fn bandy_rt_launcher(demo_cpu: usize) {
             install_console_cap(asid);
             super::sched::spawn_user_slot("el0-midden", loaded.base, loaded.sp, loaded.ttbr0, demo_cpu);
             let start = super::timer::cntpct();
-            let deadline = 5 * super::timer::cntfrq();
+            let mut yields: u64 = 0;
             while EL0_MIDDEN_DONE.load(Ordering::Acquire) < 1
-                && super::timer::cntpct().wrapping_sub(start) <= deadline
+                && !bandy_wait_expired(start, yields)
             {
                 super::sched::yield_now();
+                yields = yields.saturating_add(1);
             }
+            BANDY_MIDDEN_YIELDS.store(yields, Ordering::Release);
             Some(s)
         }
         Err(_) => None,
@@ -19485,8 +19534,12 @@ fn bandy_rt_launcher(demo_cpu: usize) {
         );
     } else {
         serial_println!(
-            ":: BANDY-RT: FAIL — w={:#x}/{:#x} midden_w={:#x}/{:#x} done={} ::",
-            w, ALL, mw, MIDDEN_ALL, done
+            // `yields` distinguishes the two failure shapes at a glance: a value at
+            // MIDDEN_YIELD_BUDGET means the wait genuinely ran out of scheduling opportunities
+            // (a real hang); anything well below it means midden finished and failed on merit.
+            ":: BANDY-RT: FAIL — w={:#x}/{:#x} midden_w={:#x}/{:#x} done={} yields={} ::",
+            w, ALL, mw, MIDDEN_ALL, done,
+            BANDY_MIDDEN_YIELDS.load(Ordering::Acquire)
         );
     }
 
