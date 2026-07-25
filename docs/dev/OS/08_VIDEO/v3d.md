@@ -2070,7 +2070,7 @@ boot-state register set there, and again after the reset, and diffs them field b
 also answers a question no boot has asked — does our OFF→ON cycle actually **reach** the PTB frame unit,
 or does it leave those registers exactly as it found them?
 
-### The init ledger — two genuine gaps
+### The init ledger — two genuine gaps (both CLOSED by V3D-62)
 
 `[v3d60] initdelta` walks the registers the mainline kernel driver programs before its first bin job and
 prints ours beside the expectation (facts restated in our own words; no kernel comment text reproduced).
@@ -2081,13 +2081,17 @@ Most rows agree — the MMU table base, the L2T flush window (V3D-51), both inte
    the illegal-address catcher — memory belonging to no job, mapped by nothing else. UnaOS aims it at
    **arena page 0**, inside the very address space the PTB writes, mapped VALID+WRITEABLE by our own
    page table. An illegal access then becomes indistinguishable, at the memory it lands on, from a legal
-   one. Read-only this arc; the fix (a page outside the mapping) is a next-arc call.
+   one. Read-only this arc; the fix (a page outside the mapping) is a next-arc call. **Fixed in V3D-62.**
 2. **`MMU_CTL` carries the abort halves of the fault policy only.** Mainline enables both the abort and
    the **interrupt** response for the page-table-invalid and write-violation conditions. The interrupt
    companions' bit positions are not in this file's audited constant set, so the row prints the raw word
    and **names** the gap rather than inventing two bit numbers (the standing no-fabricated-constants
    rule). A write the MMU swallows without reporting is precisely the failure class a fault-*reporting*
-   policy exists to surface.
+   policy exists to surface. **Fixed in V3D-62.**
+
+Both gaps are now closed — see *The fault-reporting instrument (V3D-62)* below. The two ledger rows
+survive as ordinary readback checks, and `[v3d60] initdelta`'s expected reading is now
+`MEASURED divergences=0 STANDING gaps=0`.
 
 ### The probe matrix — what each `[v3d60]` line discriminates
 
@@ -2100,9 +2104,8 @@ Most rows agree — the MMU table base, the L2T flush window (V3D-51), both inte
 | `[v3d60] residue (post-reset)` | `BMACTIVE` still set after the cycle | Our OFF→ON power cycle does **not** close (or does not reach) an open PTB frame. |
 | `[v3d60] residue (post-reset)` | Zero fields moved | The reset changed **nothing**. Cross-read the `[v3d50]` ASB/PM lines: bridges ACKed ⇒ the registers were already clean; bridges silent ⇒ this driver has never actually reset the V3D. |
 | `[v3d60] ident` | Version (`TVER*10+REV`) ≠ `42` | **Campaign foundation invalid** — the CL packing, QPU word encoding and register map were all audited against V3D 4.2. Resolve before trusting any further PTB reading. (P59's mismatch was a *decode* artifact — see "The IDENT mismatch, resolved" below.) |
-| `[v3d60] initdelta` | `MEASURED divergences=0`, `STANDING gaps=0` | Our pre-first-job register state matches every checkable row of the mainline ledger. No boot-state divergence remains to explain the dead-open frame. |
-| `[v3d60] initdelta` | `MEASURED=0`, `STANDING=1` | Every readback row matches mainline; what remains is the gap this build carries on **every** boot — the MMU fault policy armed to **abort** but not to **report**. A write the MMU swallows silently would be invisible to every witness in this file. **This is the expected reading today.** |
-| `[v3d60] initdelta` | `MEASURED>0` | A readback actually diverged this boot. The rows marked **GAP** are mechanisms by which a refused PTB write would land — or vanish — without ever being reported. Exactly the shape of the wall. |
+| `[v3d60] initdelta` | `MEASURED divergences=0`, `STANDING gaps=0` | Our pre-first-job register state matches every checkable row of the mainline ledger, including the two V3D-60 found open. No boot-state divergence remains to explain the dead-open frame. **This is the expected reading from V3D-62 onward.** |
+| `[v3d60] initdelta` | `MEASURED>0` | A readback actually diverged this boot. If either MMU row is among them the fault-reporting instrument is not fully established, and `[v3d62] fault`'s exoneration branch must **not** be read as conclusive. |
 
 The two counts are kept separate deliberately. `MEASURED` covers rows whose verdict comes from a register
 readback and could go either way on any boot; `STANDING` covers rows that are a property of this build
@@ -2185,6 +2188,69 @@ reading costs an operator one line of log; it would be the wrong trade if this c
 If the verdict is ever promoted from a witness to a gate, split it: the hub version decides, and the
 core witnesses annotate.
 
+## The fault-reporting instrument (V3D-62)
+
+V3D-60 measured two standing gaps against the state mainline hands its first bin job and named both as
+*mechanisms by which a refused PTB write lands, or vanishes, unreported*. V3D-62 closes them and builds
+the instrument that reads the resulting reports. The campaign's standing facts are unchanged: V3D 4.2,
+`cores=1`, `RENDER`(CT1) writes fine, `BIN`(CT0) consumes its list but writes nothing.
+
+### What changed in the programming
+
+**The illegal-address catcher now aims at a dedicated scratch page.** `V3D_MMU_ILLEGAL_ADDR` takes a
+*physical* page number, not an iova — the MMU steers a refused access to that page instead of to
+translated memory. `V3D_MMU_SCRATCH` is a new page-aligned static outside the arena; `program_mmu` never
+writes a PTE for it, so its page-table entry stays invalid and no job can reach it through translation.
+That is the property the register wants, and it is what arena page 0 could never have: the landing site
+of an illegal access is now distinguishable from every legal write.
+
+**`MMU_CTL` now carries mainline's full fault policy.** The interrupt companions of the abort bits, plus
+the address-cap pair, were the halves V3D-60 declined to guess. Read off the same audited register source
+as every other constant in the driver (`v3d_regs.h`, register/hardware facts only — no GPL-2.0-only code
+reproduced), they sit in a descending quartet per condition:
+
+| Condition | status | `_ABORT` | `_INT` | `_ENABLE` |
+|---|---|---|---|---|
+| `CAP_EXCEEDED` | 27 | 26 | 25 | — |
+| `PT_INVALID` | 20 | 19 | 18 | 16 |
+| `WRITE_VIOLATION` | 12 | 11 | 10 | — |
+
+Mainline's `v3d_mmu_set_page_table` writes `ENABLE | PT_INVALID_{ENABLE,ABORT,INT} |
+WRITE_VIOLATION_{ABORT,INT} | CAP_EXCEEDED_{ABORT,INT} | TLB_CLEAR`. The `_EXCEPTION` halves are not in
+its set and are not mirrored. UnaOS previously wrote `0x00090801` (ENABLE + the two aborts + the
+pt-invalid enable); it now writes **`0x060d0c01`**. This changes fault *reporting* only — it grants the
+GPU no address it could not already reach, so the arena-only confinement invariant is untouched.
+
+### The three channels
+
+`[v3d62] arm` runs pre-kick (after the stale-latch clear): it clears the hub interrupt vector and seeds
+the scratch page with a sentinel, so everything read afterwards belongs to *this* frame.
+`[v3d62] fault` runs at wait-exit, deliberately **before** the post-bin `clear_mmu_fault_latch` that would
+erase the evidence, and reports:
+
+| Channel | What it proves |
+|---|---|
+| `MMU_CTL` fault latches + `VIO_ADDR`/`VIO_ID`/`DEBUG_INFO` | The address a refusal was issued for and the client that issued it. Newly meaningful now the address-cap condition is armed at all. |
+| `HUB_INT_STS` MMU bits (PTI/WRV/CAP) | The interrupt half, latched raw regardless of the mask. **This channel did not exist before this arc** — with the `_INT` bits unset the hub never latched. |
+| The scratch page's sentinel | A sentinel that is **gone** is direct evidence that a refused access *landed* — the "write goes somewhere unaccounted" branch no register can show. Only sound now the catcher stops pointing into the arena, where legal traffic would have overwritten it. |
+
+`[v3d62] mmufix` (at `program_mmu`) prints the scratch page's PA/PFN, proves its PTE reads zero, and shows
+`MMU_CTL` and `ILLEGAL_ADDR` before and after. It self-invalidates: if the scratch page turns out mapped
+or in-arena, or if `MMU_CTL` fails to echo the policy, the line says so and marks the frame witness
+inconclusive rather than letting a silent instrument failure read as an exoneration.
+
+### Reading the next boot
+
+| Reading | Verdict |
+|---|---|
+| Scratch sentinel **dirty** | An access was redirected to the catcher during the frame. A GPU access the MMU refused still carried a write, and the catcher absorbed it — the PTB's pool write going here rather than to the pool would explain "`BPCA` advances, pool stays empty" exactly. |
+| Fault latched / hub MMU int set, scratch **clean** | The refusal raised a fault without a write landing. `MMU_VIO_ADDR`/`VIO_ID` name the address and the issuing client. |
+| No fault, scratch **pristine** | A materially stronger exoneration than V3D-60's: the MMU is armed to report on both channels for all three conditions and the catcher aims where no legal access can touch. The MMU is exonerated **with the instrument that could have convicted it**, and the PTB frame open/close unit stands further alone as the wall. |
+
+V3D-60's `gmpdelta` already exonerated GMP + MMU across the frame, but it did so under the *unarmed*
+config — which is precisely why that reading could not be final. This arc gives the next boot the
+instrument to make the call definitively.
+
 ### Discipline
 
 Every V3D-60 probe is **read-only** — no register is written, so no write needs justifying, and `CTRSTA`
@@ -2203,3 +2269,11 @@ before touching any core register unless that word is live, which is the same po
 short-circuits at `BLOCK-DOWN`. `kernel8-test` green therefore means *no regression*, nothing more —
 **P60 metal reads the residue pair, the IDENT check, the init ledger, the sync read-test and the
 protection delta.**
+
+V3D-62 is the exception to the read-only rule above, and it is a narrow one. It writes exactly two
+registers that `program_mmu` already wrote — `MMU_CTL` and `MMU_ILLEGAL_ADDR` — with values that widen
+fault *reporting* and move the illegal-address landing site off mapped memory. No address the GPU could
+not previously reach becomes reachable, and no CLE or PTB state is touched. Its own witnesses are pure
+reads plus a sentinel seed into an unmapped page no job can address. The same poison-honest hub-identity
+gate applies, so QEMU `raspi4b` prints none of it — **P62 metal reads `[v3d62] mmufix` and
+`[v3d62] fault`.**

@@ -149,6 +149,13 @@ fn v3d_ident_version(hub1: u32, c0: u32, c1: u32) -> (u32, u32, u32, u32, bool, 
 // MMIO block from the core registers. Transcribed from Linux `v3d_regs.h` (register facts only,
 // GPL-2.0-only header): the hub IDENT0..3 at 0x08..0x14 already in this file confirm the layout, and
 // the INT block follows the TFU region at 0x50. (1 = that hub interrupt is MASKED/disabled.)
+// PI-V3D-62: the hub interrupt STATUS/CLEAR slots, needed to witness the MMU fault interrupts this arc
+// arms. Same audited source and same layout family as the mask trio below (v3d_regs.h): the block runs
+// STS 0x50, SET 0x54, CLR 0x58, MSK_STS 0x5c, MSK_SET 0x60, MSK_CLR 0x64. STS is the RAW latched vector
+// (the mask gates CPU delivery, not the latch), and CLR is write-1-to-clear — the same read-then-echo
+// idiom `clear_mmu_fault_latch` already uses on V3D_MMU_CTL.
+const V3D_HUB_INT_STS: usize = 0x0050; // latched hub interrupt status (V3D_HUB_INT_STS)
+const V3D_HUB_INT_CLR: usize = 0x0058; // write-1-to-CLEAR a latched hub interrupt (V3D_HUB_INT_CLR)
 const V3D_HUB_INT_MSK_STS: usize = 0x005c; // current hub interrupt mask (V3D_HUB_INT_MSK_STS)
 const V3D_HUB_INT_MSK_SET: usize = 0x0060; // write-1-to-MASK (disable) a hub interrupt (V3D_HUB_INT_MSK_SET)
 const V3D_HUB_INT_MSK_CLR: usize = 0x0064; // write-1-to-UNMASK (enable) a hub interrupt (V3D_HUB_INT_MSK_CLR)
@@ -187,6 +194,21 @@ const V3D_MMU_CTL_ENABLE: u32 = 1 << 0;
 const V3D_MMU_CTL_PT_INVALID_ENABLE: u32 = 1 << 16;
 const V3D_MMU_CTL_PT_INVALID_ABORT: u32 = 1 << 19;
 const V3D_MMU_CTL_WRITE_VIOLATION_ABORT: u32 = 1 << 11;
+// PI-V3D-62: the INTERRUPT companions of the abort bits, plus the address-cap pair. `[v3d60] initdelta`
+// named these as a STANDING gap and deliberately refused to guess their positions; they are now read off
+// the same audited source as every other constant in this block (Linux `drivers/gpu/drm/v3d/v3d_regs.h`,
+// torvalds/linux master — register/hardware facts only, no GPL-2.0-only code reproduced). The
+// enable/abort/int/exception quartet for each condition sits in a descending run:
+//   CAP_EXCEEDED 27 / _ABORT 26 / _INT 25 / _EXCEPTION 24
+//   PT_INVALID   20 / _ABORT 19 / _INT 18 / _EXCEPTION 17 / _ENABLE 16
+//   WRITE_VIOLATION 12 / _ABORT 11 / _INT 10 / _EXCEPTION 9
+// `v3d_mmu_set_page_table` writes ENABLE | PT_INVALID_{ENABLE,ABORT,INT} | WRITE_VIOLATION_{ABORT,INT} |
+// CAP_EXCEEDED_{ABORT,INT} | TLB_CLEAR. The _EXCEPTION halves are NOT in mainline's set and are not
+// mirrored here. Arming the _INT halves is what makes a refused write REPORT instead of vanish.
+const V3D_MMU_CTL_PT_INVALID_INT: u32 = 1 << 18;
+const V3D_MMU_CTL_WRITE_VIOLATION_INT: u32 = 1 << 10;
+const V3D_MMU_CTL_CAP_EXCEEDED_ABORT: u32 = 1 << 26;
+const V3D_MMU_CTL_CAP_EXCEEDED_INT: u32 = 1 << 25;
 const V3D_MMU_CTL_TLB_CLEAR: u32 = 1 << 2;
 const V3D_MMU_CTL_TLB_CLEARING: u32 = 1 << 7;
 const V3D_MMU_ILLEGAL_ADDR_ENABLE: u32 = 1 << 31;
@@ -567,6 +589,25 @@ struct PageTable {
 }
 static mut V3D_PT: PageTable = PageTable { ptes: [0; PT_CAP] };
 
+// PI-V3D-62: the MMU illegal-address SCRATCH page. Mainline allocates one page for this and points
+// V3D_MMU_ILLEGAL_ADDR at its physical page number; the register is a PHYSICAL redirect, not an iova, so
+// an access the MMU refuses is steered to this page instead of to translated memory. The defining
+// property is that the page belongs to NO job and is mapped by NOTHING: `program_mmu` never writes a PTE
+// for it, so its page-table entry stays invalid, and it lies outside the arena. That makes the landing
+// site of an illegal access DISTINGUISHABLE from every legal write — which arena page 0 (mapped
+// VALID+WRITEABLE, and inside the very space the PTB writes) was not. It also turns the page into a
+// witness: pre-seed it with a sentinel, and a sentinel that is gone after the frame is direct evidence
+// that a refused access LANDED here.
+#[repr(C, align(4096))]
+struct MmuScratch {
+    bytes: [u8; PAGE],
+}
+static mut V3D_MMU_SCRATCH: MmuScratch = MmuScratch { bytes: [0; PAGE] };
+
+/// The sentinel word pre-seeded across the illegal-address scratch page before a bin frame. Chosen
+/// distinct from the arena's own 0xDEADBEEF fill so the two witnesses can never be confused.
+const V3D62_SCRATCH_SENTINEL: u32 = 0x5C_A7_C4_11; // "SCRATCH" — arbitrary, only its uniqueness matters
+
 #[inline]
 fn mmio_read(base: usize, off: usize) -> u32 {
     unsafe { core::ptr::read_volatile((base + off) as *const u32) }
@@ -591,6 +632,11 @@ fn arena_phys() -> usize {
 #[inline]
 fn pt_phys() -> usize {
     &raw const V3D_PT as usize
+}
+/// ARM physical base of the MMU illegal-address scratch page (== its VA under the identity map).
+#[inline]
+fn mmu_scratch_phys() -> usize {
+    &raw const V3D_MMU_SCRATCH as usize
 }
 
 /// A caller-supplied handle to the panel framebuffer, for the M3 visible witness (metal only).
@@ -1113,20 +1159,72 @@ fn program_mmu() -> bool {
     // Program the MMU: table base (in pages), fault-abort policy, illegal-address catcher, enable +
     // flush. Sequence per v3d_mmu.c::v3d_mmu_set_page_table + v3d_mmu_flush_all.
     let pt_base_pages = (pt_phys() >> V3D_MMU_PAGE_SHIFT) as u32;
+    // PI-V3D-62 gap (2) CLOSED: arm the fault-REPORTING halves alongside the aborts. Mainline's
+    // `v3d_mmu_set_page_table` writes ENABLE | PT_INVALID_{ENABLE,ABORT,INT} | WRITE_VIOLATION_{ABORT,INT}
+    // | CAP_EXCEEDED_{ABORT,INT}; UnaOS wrote the ABORT halves only, so a refused access aborted SILENTLY
+    // — no hub interrupt latched, and the campaign's whole instrument set was blind to it. The address-cap
+    // pair joins the set for the same reason: an over-cap access was previously neither aborted nor
+    // reported. This changes fault REPORTING only; it grants the GPU no address it could not already
+    // reach, so the arena-only confinement invariant is untouched.
     let ctl_want = V3D_MMU_CTL_ENABLE
         | V3D_MMU_CTL_PT_INVALID_ENABLE
         | V3D_MMU_CTL_PT_INVALID_ABORT
-        | V3D_MMU_CTL_WRITE_VIOLATION_ABORT;
-    let illegal_want = ((base >> V3D_MMU_PAGE_SHIFT) as u32) | V3D_MMU_ILLEGAL_ADDR_ENABLE;
+        | V3D_MMU_CTL_PT_INVALID_INT
+        | V3D_MMU_CTL_WRITE_VIOLATION_ABORT
+        | V3D_MMU_CTL_WRITE_VIOLATION_INT
+        | V3D_MMU_CTL_CAP_EXCEEDED_ABORT
+        | V3D_MMU_CTL_CAP_EXCEEDED_INT;
+    // PI-V3D-62 gap (1) CLOSED: aim the illegal-address catcher at the DEDICATED scratch page instead of
+    // arena page 0. ILLEGAL_ADDR takes a PHYSICAL page number (mainline passes `mmu_scratch_paddr >>
+    // V3D_MMU_PAGE_SHIFT`), and the page it names must belong to no job and be mapped by nothing — see
+    // V3D_MMU_SCRATCH. Aimed into the arena, an illegal access was indistinguishable, at the memory it
+    // landed on, from a legal one; aimed here, the landing site is unambiguous and observable.
+    let scratch = mmu_scratch_phys();
+    let scratch_pfn = scratch >> V3D_MMU_PAGE_SHIFT;
+    let illegal_want = (scratch_pfn as u32) | V3D_MMU_ILLEGAL_ADDR_ENABLE;
+    let ctl_before = mmio_read(V3D_HUB_BASE, V3D_MMU_CTL);
+    let illegal_before = mmio_read(V3D_HUB_BASE, V3D_MMU_ILLEGAL_ADDR);
     serial_println!(
         ":: V3D: MMU program — PT_PA_BASE<={:#010x} (pt@{:#x}) CTL<={:#010x} ILLEGAL_ADDR<={:#010x} ::",
         pt_base_pages, pt_phys(), ctl_want, illegal_want
     );
     mmio_write(V3D_HUB_BASE, V3D_MMU_PT_PA_BASE, pt_base_pages);
     mmio_write(V3D_HUB_BASE, V3D_MMU_CTL, ctl_want);
-    // Illegal-address trap points at arena page 0 (a benign in-arena page) with the enable bit; a
-    // stray access lands there instead of undefined RAM.
     mmio_write(V3D_HUB_BASE, V3D_MMU_ILLEGAL_ADDR, illegal_want);
+    dsb();
+
+    // [v3d62] the two closed gaps, stated as programmed values with their before/after — the line the
+    // next boot is read for. The scratch page's own PTE is proved invalid rather than assumed: it is a
+    // separate static from the arena, so the fill loop above either zeroed its slot (pfn < top_page) or
+    // never touched it (pfn >= top_page, where the table's zero-init stands and is published by the
+    // full-table clean). Either way the entry must read 0; a non-zero reading would mean the scratch page
+    // is reachable through translation and the catcher has been aimed at mapped memory again.
+    let scratch_pte = if scratch_pfn < PT_CAP {
+        unsafe { (&raw const V3D_PT).cast::<u32>().add(scratch_pfn).read_volatile() }
+    } else {
+        0 // beyond the table entirely — unmapped by construction, nothing to read
+    };
+    let scratch_in_arena = scratch_pfn >= (base >> V3D_MMU_PAGE_SHIFT)
+        && scratch_pfn < (base >> V3D_MMU_PAGE_SHIFT) + ARENA_PAGES;
+    let ctl_after = mmio_read(V3D_HUB_BASE, V3D_MMU_CTL);
+    serial_println!(
+        ":: V3D: [v3d62] mmufix — ILLEGAL_ADDR scratch page PA={:#x} (pfn={:#x}) PTE={:#010x} unmapped={} in-arena={} | ILLEGAL_ADDR {:#010x}->{:#010x} (was arena page {:#x}) | MMU_CTL {:#010x}->{:#010x} (wrote {:#010x}: PT_INVALID_INT={} WRITE_VIOLATION_INT={} CAP_EXCEEDED_ABORT={} CAP_EXCEEDED_INT={} newly armed vs the abort-only policy) — {} ::",
+        scratch, scratch_pfn, scratch_pte, (scratch_pte == 0) as u32, scratch_in_arena as u32,
+        illegal_before, mmio_read(V3D_HUB_BASE, V3D_MMU_ILLEGAL_ADDR),
+        base >> V3D_MMU_PAGE_SHIFT,
+        ctl_before, ctl_after, ctl_want,
+        (ctl_after & V3D_MMU_CTL_PT_INVALID_INT != 0) as u32,
+        (ctl_after & V3D_MMU_CTL_WRITE_VIOLATION_INT != 0) as u32,
+        (ctl_after & V3D_MMU_CTL_CAP_EXCEEDED_ABORT != 0) as u32,
+        (ctl_after & V3D_MMU_CTL_CAP_EXCEEDED_INT != 0) as u32,
+        if scratch_pte != 0 || scratch_in_arena {
+            "SCRATCH PAGE IS NOT ISOLATED — it is mapped, or it lies inside the arena. The catcher is aimed at memory a job can reach and the v3d62 instrument is NOT trustworthy this boot; treat any scratch-page witness below as inconclusive"
+        } else if ctl_after & ctl_want != ctl_want {
+            "MMU_CTL DID NOT ECHO the fault-reporting policy. The block accepted the write only in part (or reads back stale): the interrupt halves may not be armed, so an absence of reported faults below proves nothing"
+        } else {
+            "both V3D-60 standing gaps are closed: the illegal-address catcher now lands on an unmapped page belonging to no job, and the MMU is armed to REPORT (interrupt) as well as abort on page-table-invalid, write-violation and address-cap. A refused PTB write can no longer vanish unwitnessed"
+        }
+    );
 
     // Flush the MMU cache + TLB. Finite backstop on the TLB-clearing bit (never an unbounded spin).
     mmio_write(V3D_HUB_BASE, V3D_MMUC_CONTROL, V3D_MMUC_CONTROL_FLUSH | V3D_MMUC_CONTROL_ENABLE);
@@ -4839,21 +4937,27 @@ fn v3d59_ct0_frame_reset(what: &str) {
 // ── (c) The INIT-DELTA ledger ────────────────────────────────────────────────────────────────────
 // `[v3d60] initdelta` walks, row by row, the registers the mainline kernel driver programs before its
 // first bin job and prints OUR value beside the expectation. All facts, in our own words — no GPL
-// comment text is reproduced. Two rows are GENUINE GAPS this audit found:
+// comment text is reproduced. Two rows were GENUINE GAPS this audit found; PI-V3D-62 closed both, and
+// they are now ordinary readback checks:
 //
 //   (1) `MMU_ILLEGAL_ADDR`. Mainline allocates a DEDICATED scratch page for this — memory that belongs
 //       to no job and that nothing else maps — and points the illegal-address catcher at it. UnaOS
-//       points it at ARENA PAGE 0, which is inside the very address space the PTB writes and is mapped
-//       VALID+WRITEABLE in our page table. Aiming the catcher into the job's own arena is not what the
-//       register is for, and it makes "an illegal access" indistinguishable from "a legal access" at
-//       the memory it lands on. Read-only here; the fix (a page outside the mapping) is a next-arc call.
+//       pointed it at ARENA PAGE 0, which is inside the very address space the PTB writes and is mapped
+//       VALID+WRITEABLE in our page table, making "an illegal access" indistinguishable from "a legal
+//       access" at the memory it lands on. V3D-62 added `V3D_MMU_SCRATCH`, an unmapped page outside the
+//       arena, and aims the catcher there — which also turns the page into a witness (see below).
 //
 //   (2) `MMU_CTL` fault policy. Mainline enables BOTH the abort and the INTERRUPT response for the
-//       page-table-invalid and write-violation conditions; UnaOS writes the ABORT halves only. The bit
-//       positions of the interrupt companions are NOT in this file's audited constant set, so this row
-//       reports the raw `MMU_CTL` word and the abort bits we do set, and NAMES the gap — it does not
-//       invent two bit numbers. A silently-swallowed PTB write is exactly the class of failure a
+//       page-table-invalid, write-violation AND address-cap conditions; UnaOS wrote the ABORT halves of
+//       the first two only. V3D-60 declined to guess the interrupt-companion bit positions rather than
+//       invent them (this driver has been convicted three times for fabricated constants); V3D-62 read
+//       them off the same audited register source as the rest of this file and `program_mmu` now writes
+//       mainline's full set. A silently-swallowed PTB write is exactly the class of failure a
 //       fault-reporting policy exists to surface.
+//
+// The instrument that reads those reports is `[v3d62] fault` — three independent channels across the bin
+// frame (MMU fault latches + VIO address/ID, the hub interrupt vector, and the scratch page's sentinel).
+// See the PI-V3D-62 section further down for what each channel proves.
 //
 // ── (d) The two cheap discriminators [v3d59] left owed ───────────────────────────────────────────
 // `[v3d60] syncrd` — `[v3d59] ctstate` hedged its semaphore row because it read `CT0SYNC`/`CT1SYNC`
@@ -5130,10 +5234,12 @@ fn v3d60_initdelta(tag: &str) {
     }
     // `gaps` counts MEASURED divergences — rows whose verdict comes from a register readback and could
     // read either way on any given boot. `standing_gaps` counts rows that are a property of this build
-    // and read the same every boot (today: the missing MMU fault-INTERRUPT policy). Keeping them apart
-    // is what makes `gaps=0` a reachable, meaningful verdict.
+    // and read the same every boot. The only such row was the missing MMU fault-INTERRUPT policy, which
+    // PI-V3D-62 closed by writing mainline's full set; the counter stays (the ledger will grow again) but
+    // reads zero, and both former GAP rows are now ordinary MEASURED readback checks. Keeping the two
+    // counts apart is what makes `gaps=0` a reachable, meaningful verdict.
     let mut gaps = 0u32;
-    let mut standing_gaps = 0u32;
+    let standing_gaps = 0u32;
     serial_println!(
         ":: V3D: [v3d60] initdelta ({}) — every register mainline programs before its FIRST bin job, ours beside the expectation. Read-only audit; facts restated in our own words ::",
         tag
@@ -5151,31 +5257,37 @@ fn v3d60_initdelta(tag: &str) {
 
     // ── MMU control / fault policy — GAP (2) ─────────────────────────────────────────────────────
     let ctl = mmio_read(V3D_HUB_BASE, V3D_MMU_CTL);
-    let abort_want = V3D_MMU_CTL_ENABLE
+    // PI-V3D-62 CLOSED this row: the expectation is now mainline's FULL set — the abort halves plus the
+    // interrupt companions plus the address-cap pair — so a shortfall here is a MEASURED divergence
+    // (the block did not accept what we wrote), not a standing property of the build.
+    let ctl_want = V3D_MMU_CTL_ENABLE
         | V3D_MMU_CTL_PT_INVALID_ENABLE
         | V3D_MMU_CTL_PT_INVALID_ABORT
-        | V3D_MMU_CTL_WRITE_VIOLATION_ABORT;
-    let abort_ok = ctl & abort_want == abort_want;
+        | V3D_MMU_CTL_PT_INVALID_INT
+        | V3D_MMU_CTL_WRITE_VIOLATION_ABORT
+        | V3D_MMU_CTL_WRITE_VIOLATION_INT
+        | V3D_MMU_CTL_CAP_EXCEEDED_ABORT
+        | V3D_MMU_CTL_CAP_EXCEEDED_INT;
+    let policy_ok = ctl & ctl_want == ctl_want;
     let latched = ctl & (V3D_MMU_CTL_PT_INVALID | V3D_MMU_CTL_WRITE_VIOLATION | V3D_MMU_CTL_CAP_EXCEEDED);
-    // The missing interrupt-response halves are a STANDING gap — true of this build regardless of any
-    // register readback — so it is counted separately from the MEASURED divergences. Folding it into
-    // `gaps` would make the "no divergence remains" verdict unreachable and the row uninformative.
-    standing_gaps += 1;
+    gaps += !policy_ok as u32;
     serial_println!(
-        "::   [v3d60] MMU_CTL ours={:#010x} abort-set-present={} fault-latched={:#010x} — **GAP**: mainline enables BOTH the abort AND the INTERRUPT response for the page-table-invalid and write-violation conditions; UnaOS writes the ABORT halves only. The two interrupt-companion bit positions are NOT in this file's audited constant set, so this row NAMES the gap and prints the raw word rather than inventing two bit numbers. A write the MMU swallows without reporting is exactly the failure class a fault-REPORTING policy exists to surface ::",
-        ctl, abort_ok as u32, latched
+        "::   [v3d60] MMU_CTL ours={:#010x} want={:#010x} full-fault-policy-present={} (abort+INTERRUPT for pt-invalid/write-violation/address-cap) fault-latched={:#010x} — V3D-60 named the missing interrupt halves a STANDING gap and declined to guess their bit positions; V3D-62 read them off the audited register source and `program_mmu` now writes mainline's full set. This row is CLOSED: it is a plain readback check from here on ::",
+        ctl, ctl_want, policy_ok as u32, latched
     );
 
-    // ── MMU illegal-address catcher — GAP (1) ────────────────────────────────────────────────────
+    // ── MMU illegal-address catcher — CLOSED by PI-V3D-62 ────────────────────────────────────────
     let illegal = mmio_read(V3D_HUB_BASE, V3D_MMU_ILLEGAL_ADDR);
     let illegal_page = (illegal & !V3D_MMU_ILLEGAL_ADDR_ENABLE) as usize;
     let arena_page0 = arena_phys() >> V3D_MMU_PAGE_SHIFT;
     let points_into_arena = illegal_page >= arena_page0 && illegal_page < arena_page0 + ARENA_PAGES;
-    gaps += points_into_arena as u32;
+    let scratch_pfn = mmu_scratch_phys() >> V3D_MMU_PAGE_SHIFT;
+    let points_at_scratch = illegal_page == scratch_pfn;
+    gaps += (points_into_arena || !points_at_scratch) as u32;
     serial_println!(
-        "::   [v3d60] MMU_ILLEGAL_ADDR ours={:#010x} (page {:#x}, enable={}) points-INTO-our-arena={} — **GAP**: mainline points the illegal-address catcher at a DEDICATED SCRATCH page that belongs to no job and that nothing else maps. Ours aims it at ARENA PAGE 0 — inside the very address space the PTB writes, mapped VALID+WRITEABLE by our own page table. An illegal access is then indistinguishable, at the memory it lands on, from a legal one ::",
+        "::   [v3d60] MMU_ILLEGAL_ADDR ours={:#010x} (page {:#x}, enable={}) points-at-dedicated-scratch={} (scratch pfn {:#x}) points-INTO-our-arena={} — V3D-62 CLOSED this row: the catcher now names a page that belongs to no job and that our page table does not map, matching mainline's dedicated-scratch allocation. An illegal access is distinguishable from a legal one at the memory it lands on, and `[v3d62] fault` reads that page as a witness ::",
         illegal, illegal_page, (illegal & V3D_MMU_ILLEGAL_ADDR_ENABLE != 0) as u32,
-        points_into_arena as u32
+        points_at_scratch as u32, scratch_pfn, points_into_arena as u32
     );
 
     // ── L2T flush window (V3D-51 established this) ───────────────────────────────────────────────
@@ -5218,11 +5330,11 @@ fn v3d60_initdelta(tag: &str) {
         ":: V3D: [v3d60] initdelta ({}) verdict — MEASURED divergences={} STANDING gaps={} (total {}) — {} ::",
         tag, gaps, standing_gaps, gaps + standing_gaps,
         if gaps == 0 && standing_gaps == 0 {
-            "our pre-first-bin-job register state matches every row of the mainline ledger this audit can check. No boot-state divergence remains to explain the dead-open frame"
+            "our pre-first-bin-job register state matches every row of the mainline ledger this audit can check, INCLUDING the two rows V3D-60 found open — the fault-reporting policy and the dedicated illegal-address scratch page are both in place (V3D-62). No boot-state divergence remains to explain the dead-open frame, and the MMU can no longer refuse a write unreported"
         } else if gaps == 0 {
-            "every MEASURED row matches mainline — no readback on this boot diverged. What remains is the STANDING gap this build carries on every boot: the MMU fault policy is armed to ABORT but not to REPORT. A write the MMU swallows silently is exactly the failure class a fault-reporting policy exists to surface, and it would be invisible to every witness in this file"
+            "every MEASURED row matches mainline and no standing gap remains in this ledger"
         } else {
-            "the rows marked **GAP** are real differences between our boot state and the state mainline hands its first bin job. The illegal-address catcher aimed into the job's own arena and the missing fault-INTERRUPT policy are both mechanisms by which a refused PTB write would land, or vanish, WITHOUT ever being reported — the exact shape of the wall. Neither is fixed here (read-only arc); both are next-arc candidates"
+            "the rows whose check reads 0 are real differences between our boot state and the state mainline hands its first bin job. If either MMU row is among them, the V3D-62 fault-reporting instrument is not fully established this boot and `[v3d62] fault`'s exoneration branch must NOT be read as conclusive"
         }
     );
 }
@@ -5305,6 +5417,125 @@ fn v3d60_emit_gmpdelta(tag: &str, pre: &V3d60Prot, post: &V3d60Prot) {
         mmu_pre, mmu_post, mmu_new,
         pre.mmu_vio_addr, post.mmu_vio_addr,
         pre.mmu_vio_id, post.mmu_vio_id,
+        verdict
+    );
+}
+
+// ═══ PI-V3D-62: the fault-REPORTING instrument ═══════════════════════════════════════════════════
+//
+// V3D-60 measured two STANDING gaps against the state mainline hands its first bin job, and named both
+// as "mechanisms by which a refused PTB write lands, or vanishes, unreported". `program_mmu` above now
+// closes them. This pair of witnesses is what makes the closure USEFUL: arming a fault-reporting policy
+// buys nothing unless something reads the report.
+//
+// `v3d62_arm` runs at the pre-kick station, after the stale-latch clear. It clears the hub's latched
+// interrupt vector (so anything seen afterwards belongs to THIS frame) and seeds the scratch page with a
+// sentinel. `v3d62_frame_witness` runs at wait-exit, BEFORE the post-bin latch clear that would destroy
+// the evidence, and reports three independent channels:
+//
+//   (1) MMU_CTL fault latches + VIO_ADDR/VIO_ID/DEBUG_INFO — the address a refusal was issued for and
+//       the client that issued it. Newly meaningful now the address-cap condition is armed at all.
+//   (2) HUB_INT_STS MMU bits (PTI/WRV/CAP) — the interrupt half, latched RAW regardless of the mask.
+//       This channel did not exist before this arc: with the _INT bits unset, the hub never latched.
+//   (3) The scratch page. A sentinel that survives means nothing was redirected there; a sentinel that
+//       is GONE is direct evidence that a refused access LANDED, which is the "write goes somewhere
+//       unaccounted" branch no register can show. This channel only became sound once the catcher stopped
+//       pointing into the arena — a scratch page inside the job's own mapped space would be overwritten
+//       by legal traffic and the reading would be meaningless.
+//
+// Read-only w.r.t. the job: the hub-interrupt clear and the sentinel seed touch no CLE or PTB state, and
+// the scratch page is unmapped memory no job can address through translation. Both are gated on the hub
+// identity word being live, so QEMU raspi4b (which models no V3D) skips them.
+
+/// `[v3d62] fault` — the across-frame fault-report witness (all three channels).
+const V3D62_FAULT: bool = true;
+
+/// Pre-kick: clear the hub interrupt latch and seed the illegal-address scratch page with the sentinel,
+/// so the wait-exit reading is attributable to THIS frame.
+fn v3d62_arm(tag: &str) {
+    if !V3D62_FAULT {
+        return;
+    }
+    let sts_entry = mmio_read(V3D_HUB_BASE, V3D_HUB_INT_STS);
+    // W1C: echo back what is latched (the same idiom `clear_mmu_fault_latch` uses on MMU_CTL).
+    if sts_entry != 0 {
+        mmio_write(V3D_HUB_BASE, V3D_HUB_INT_CLR, sts_entry);
+    }
+    // Seed the scratch page. It is ordinary cacheable RAM to the CPU; clean it so the sentinel is in DRAM
+    // where a GPU-side redirect would overwrite it, rather than sitting in the D-cache masking the test.
+    let scratch = mmu_scratch_phys();
+    unsafe {
+        let p = (&raw mut V3D_MMU_SCRATCH).cast::<u32>();
+        for i in 0..PAGE / 4 {
+            p.add(i).write_volatile(V3D62_SCRATCH_SENTINEL);
+        }
+    }
+    cache::clean_range(scratch, PAGE);
+    dsb();
+    let sts_now = mmio_read(V3D_HUB_BASE, V3D_HUB_INT_STS);
+    serial_println!(
+        ":: V3D: [v3d62] arm ({}) — HUB_INT_STS {:#010x}->{:#010x} (MMU bits cleared: PTI/WRV/CAP mask {:#010x}) | scratch page {:#x} seeded with {:#010x} x{} words — anything reported at wait-exit belongs to THIS frame ::",
+        tag, sts_entry, sts_now,
+        V3D_HUB_INT_MMU_PTI | V3D_HUB_INT_MMU_WRV | V3D_HUB_INT_MMU_CAP,
+        scratch, V3D62_SCRATCH_SENTINEL, PAGE / 4
+    );
+}
+
+/// Wait-exit: read all three fault-report channels and deliver the verdict. MUST be called BEFORE the
+/// post-frame `clear_mmu_fault_latch`, which is write-1-to-clear and would erase channel (1).
+fn v3d62_frame_witness(tag: &str) {
+    if !V3D62_FAULT {
+        return;
+    }
+    let ctl = mmio_read(V3D_HUB_BASE, V3D_MMU_CTL);
+    let fault = ctl & (V3D_MMU_CTL_PT_INVALID | V3D_MMU_CTL_WRITE_VIOLATION | V3D_MMU_CTL_CAP_EXCEEDED);
+    let vio_addr = mmio_read(V3D_HUB_BASE, V3D_MMU_VIO_ADDR);
+    let vio_id = mmio_read(V3D_HUB_BASE, V3D_MMU_VIO_ID);
+    let dbg = mmio_read(V3D_HUB_BASE, V3D_MMU_DEBUG_INFO);
+    let hub_sts = mmio_read(V3D_HUB_BASE, V3D_HUB_INT_STS);
+    let hub_mmu = hub_sts & (V3D_HUB_INT_MMU_PTI | V3D_HUB_INT_MMU_WRV | V3D_HUB_INT_MMU_CAP);
+
+    // Channel (3): did anything land on the unmapped scratch page? Invalidate first — the GPU is
+    // non-coherent, so a CPU read without invalidation could return our own cached sentinel and report a
+    // clean page over a dirtied one (a false negative on the ONE channel that catches a silent landing).
+    let scratch = mmu_scratch_phys();
+    cache::invalidate_range(scratch, PAGE);
+    let mut dirty_words = 0usize;
+    let mut first_dirty_off = 0usize;
+    let mut first_dirty_val = 0u32;
+    unsafe {
+        let p = (&raw const V3D_MMU_SCRATCH).cast::<u32>();
+        for i in 0..PAGE / 4 {
+            let w = p.add(i).read_volatile();
+            if w != V3D62_SCRATCH_SENTINEL {
+                if dirty_words == 0 {
+                    first_dirty_off = i * 4;
+                    first_dirty_val = w;
+                }
+                dirty_words += 1;
+            }
+        }
+    }
+
+    let verdict = if dirty_words != 0 {
+        "AN ACCESS WAS REDIRECTED TO THE ILLEGAL-ADDRESS SCRATCH PAGE DURING THIS FRAME. The sentinel is gone from an unmapped page belonging to no job, so a GPU access the MMU REFUSED still carried a write, and the catcher absorbed it. This is the 'refused write lands somewhere unaccounted' mechanism V3D-60 named — the PTB's pool write going to the catcher rather than to the pool would explain 'BPCA advances, pool stays empty' exactly. The dirty offset and the MMU_VIO_ADDR/VIO_ID columns say what was reaching for what"
+    } else if fault != 0 || hub_mmu != 0 {
+        "AN MMU FAULT WAS REPORTED ACROSS THIS FRAME, but the scratch page is untouched — the refusal raised a fault without an accompanying write landing. Read MMU_VIO_ADDR for the address refused and MMU_VIO_ID for the client that issued it; the interrupt half (HUB_INT_STS) is the channel this arc armed and it is now carrying information"
+    } else {
+        "NO FAULT REPORTED AND THE SCRATCH PAGE IS PRISTINE — under the ARMED policy. This is a materially stronger exoneration than V3D-60's: the MMU is now configured to report page-table-invalid, write-violation and address-cap on both the abort and interrupt channels, and the illegal-address catcher aims at an unmapped page that no legal access can touch. The bin frame's missing PTB write was therefore neither refused by translation nor silently absorbed by the catcher. The MMU is exonerated with the instrument that could have convicted it"
+    };
+    serial_println!(
+        ":: V3D: [v3d62] fault ({}) — MMU_CTL={:#010x} fault-latched={:#010x} (PT_INVALID={} WRITE_VIOLATION={} CAP_EXCEEDED={}) VIO_ADDR={:#010x} VIO_ID={:#010x} DEBUG_INFO={:#010x} | HUB_INT_STS={:#010x} MMU-int bits={:#010x} (PTI={} WRV={} CAP={}) | scratch page {:#x}: dirty words={}/{} first-dirty off={:#x} val={:#010x} — {} ::",
+        tag, ctl, fault,
+        (fault & V3D_MMU_CTL_PT_INVALID != 0) as u32,
+        (fault & V3D_MMU_CTL_WRITE_VIOLATION != 0) as u32,
+        (fault & V3D_MMU_CTL_CAP_EXCEEDED != 0) as u32,
+        vio_addr, vio_id, dbg,
+        hub_sts, hub_mmu,
+        (hub_mmu & V3D_HUB_INT_MMU_PTI != 0) as u32,
+        (hub_mmu & V3D_HUB_INT_MMU_WRV != 0) as u32,
+        (hub_mmu & V3D_HUB_INT_MMU_CAP != 0) as u32,
+        scratch, dirty_words, PAGE / 4, first_dirty_off, first_dirty_val,
         verdict
     );
 }
@@ -6301,6 +6532,11 @@ fn triangle_job(fb: Option<FbTarget>) -> bool {
     // (brief lead #2): dump the exact bin CL byte stream the binner will parse, to read against Mesa's
     // emit order for a mis-sized packet shifting an opcode into an address field (PI-V3D-10 class).
     clear_mmu_fault_latch("v3d15 pre-bin (attribution)");
+    // PI-V3D-62: arm the fault-REPORTING instrument for this bin frame — clear the hub interrupt latch
+    // and seed the (now unmapped, job-less) illegal-address scratch page. Must follow the MMU-latch clear
+    // above so all three channels share one attribution window. Closed at wait-exit by
+    // `v3d62_frame_witness`, which runs BEFORE the post-bin W1C clear that would erase channel (1).
+    v3d62_arm("M4 bin");
     // PI-V3D-23: announce the two Mesa-conformance corrections this arc applies to the bin CL, so the
     // metal log names the change under test. VCM Vc: 1 → 4 (GFXH-1744 floor is 2; Mesa computes 4 for
     // this draw), + OCCLUSION_QUERY_COUNTER(addr=0) added to the prologue (Mesa's OQ-disable). The
@@ -6378,6 +6614,10 @@ fn triangle_job(fb: Option<FbTarget>) -> bool {
     // but never the address. With the latch cleared pre-kick, a fault here is THIS bin's, and its VA
     // tells whether the binner walked off the arena (our encoding bug) or idled legally in-bounds.
     bin_fault_witness("M4 bin");
+    // PI-V3D-62: close the fault-reporting window while the evidence is still standing. Deliberately
+    // placed BEFORE `clear_mmu_fault_latch("post-bin")` below — that clear is write-1-to-clear on exactly
+    // the bits this witness reads.
+    v3d62_frame_witness("M4 bin");
     super::exceptions::serror_drain_request("v3d: M4 bin kick window");
 
     // PI-V3D-9 boot-P5 fix: clear any latched V3D-MMU fault BEFORE the render kick. Boot-P5 showed the
