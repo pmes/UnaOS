@@ -7043,6 +7043,167 @@ pub fn run_user_image(
 }
 
 // =============================================================================================
+// BGRUN-1: BACKGROUND EL0 runs — the front half of `run_user_image` without the wait loop, so the
+// shell keeps running while the program does. This is what makes the WC-TAB focus ring an operator
+// workflow rather than a fixture-only mechanism: `run` blocks until its app dies, so two real
+// windows never coexist longer than the el0-wcb fixture's split second; `bg` lets them coexist for
+// as long as the operator wants, and TAB walks between them.
+//
+// Contract differences from `run_user_image`, each deliberate:
+//   * NO `el0_input_set_active` — focus stays wherever it is. A windowed bg app receives input when
+//     the operator TABs into it (the WC-TAB shell binding / in-ring cycle), which resets its ring
+//     exactly as the foreground path does. There is no focus to restore on exit either: the slot
+//     teardown's `clear_handle_row` clears the designation iff the dying app held it.
+//   * NO deadline / UVUG-8 machinery — nothing is waiting, so there is nothing to strand. A hung bg
+//     app is the operator's to `kill <pid>` (the SKILL-1 primitive), and a windowed one is still
+//     bounded by the compositor's own 60 s no-render cap.
+//   * The Proc row stays claimed after exit (PEXITED, `done` posted) until `bg_poll(reap=true)`
+//     consumes it — the `jobs` verb is the reaper. Rows are a bounded resource (MAX_PROCS), which
+//     is honest: a shell that never runs `jobs` eventually gets "process table full", not silent loss.
+// The publish order is EXEC1-M's (asid before spawn, pid after): the SYS_EXIT rescue arm covers the
+// same mid-publish window here, and matching is correct for the same reason it is on the spawn path.
+
+/// BGRUN-1: what `bg_poll` found for a pid.
+pub enum BgPoll {
+    /// The task (or an ELF-2 sibling in its address space) is still running.
+    Running,
+    /// Exited with this status; if `reap` was set the row has been freed.
+    Exited(i32),
+    /// Killed by the fault-kill net (contained fault); if `reap` was set the row has been freed.
+    Faulted,
+    /// No row holds this pid (already reaped, or never existed).
+    Gone,
+}
+
+/// BGRUN-1: load an EL0 image and spawn it WITHOUT waiting. Returns `(pid, asid, entry)`; the caller
+/// (the shell's `bg` verb) records the pid and reaps it later via [`bg_poll`]. Mirrors
+/// `run_user_image`'s front half exactly — same bounds, same console-cap endowment, same EXEC1-M
+/// publish order — and diverges only where the contract block above says it does.
+pub fn spawn_user_image_bg(bytes: &[u8]) -> Result<(u64, u64, u64), &'static str> {
+    if bytes.len() > super::boot::USER_REGION_SIZE {
+        return Err("image larger than the 16 KiB user window");
+    }
+    let Some(pi) = proc_reserve() else {
+        return Err("process table full (run `jobs` to reap exited background programs)");
+    };
+    let mapped = match map_image_into_slot(bytes) {
+        Ok(m) => m,
+        Err(e) => {
+            proc_free(pi);
+            return Err(match e {
+                MapErr::Empty => "empty image",
+                MapErr::BadSize(_) => "flat blob larger than one code page",
+                MapErr::BadElf(why) => why,
+                MapErr::NoSlot => "no free address-space slot",
+            });
+        }
+    };
+    let asid = mapped.ttbr0 >> 48;
+    // Same rationale as `run_user_image`: the program may call SYS_FUTEX on a plain boot where no
+    // other `futex_init` caller ran; idempotent, cheap.
+    super::sched::futex_init();
+    install_console_cap(asid);
+    let cpu = super::percpu::this_cpu().cpu_index as usize;
+    // EXEC1-M publish order — see the block comment in `run_user_image`; identical window, identical fix.
+    PROCS[pi].asid.store(asid, Ordering::Release);
+    let pid = super::sched::spawn_user_slot("bg-el0", mapped.base, mapped.sp, mapped.ttbr0, cpu);
+    PROCS[pi].pid.store(pid, Ordering::Release);
+    Ok((pid, asid, mapped.base))
+}
+
+/// BGRUN-1: poll a background pid. With `reap` set, a `PEXITED` row is consumed here — the posted
+/// `done` permit is awaited (it is already posted, so this does not block) and the row freed, exactly
+/// the non-timeout reap in `run_user_image`; the "reused entry starts at 0 permits" invariant holds.
+/// Scans by pid rather than trusting a cached index: rows recycle, and a stale index could name a row
+/// that now belongs to someone else — the pid is the key every other lookup uses.
+pub fn bg_poll(pid: u64, reap: bool) -> BgPoll {
+    for pi in 0..PROCS.len() {
+        if PROCS[pi].state.load(Ordering::Acquire) == PFREE {
+            continue;
+        }
+        if PROCS[pi].pid.load(Ordering::Acquire) != pid {
+            continue;
+        }
+        return match PROCS[pi].state.load(Ordering::Acquire) {
+            PEXITED => {
+                let status = PROCS[pi].status.load(Ordering::Acquire);
+                if reap {
+                    let _ = PROCS[pi].done.wait();
+                    proc_free(pi);
+                }
+                if status == EXEC_KILLED_STATUS {
+                    BgPoll::Faulted
+                } else {
+                    BgPoll::Exited(status)
+                }
+            }
+            // PRUNNING and PORPHANED both mean "something is still alive under this row".
+            _ => BgPoll::Running,
+        };
+    }
+    BgPoll::Gone
+}
+
+/// BGRUN-1: kill a background pid via the SKILL-1 primitive — the condensed form of
+/// `run_user_image`'s Timeout arm (ASID-scoped so ELF-2 siblings die too, bounded confirm wait,
+/// PORPHANED fallback with the kill left armed). Returns an operator string for the shell.
+pub fn bg_kill(pid: u64, asid: u64) -> &'static str {
+    let mut row: Option<usize> = None;
+    for pi in 0..PROCS.len() {
+        if PROCS[pi].state.load(Ordering::Acquire) != PFREE
+            && PROCS[pi].pid.load(Ordering::Acquire) == pid
+        {
+            row = Some(pi);
+            break;
+        }
+    }
+    let Some(pi) = row else {
+        return "no such job (already reaped?)";
+    };
+    if PROCS[pi].state.load(Ordering::Acquire) == PEXITED {
+        return "already exited — run `jobs` to reap it";
+    }
+    let Some(ticket) = super::sched::kill(pid, asid) else {
+        return "kill slot table exhausted (see [skill])";
+    };
+    let t0 = super::timer::cntpct();
+    let budget = super::timer::cntfrq().saturating_mul(KILL_CONFIRM_SECS);
+    let mut ok = false;
+    let mut already_dead = false;
+    loop {
+        if super::sched::kill_confirmed(&ticket) {
+            ok = true;
+            break;
+        }
+        // Post-arm re-check, same as the Timeout arm: a target that completed SYS_EXIT between the
+        // state read and the arm can never settle the request — retract rather than leak the slot.
+        if PROCS[pi].state.load(Ordering::Acquire) == PEXITED
+            && super::sched::asid_live_threads(asid) == 0
+        {
+            already_dead = true;
+            break;
+        }
+        if super::timer::cntpct().wrapping_sub(t0) >= budget {
+            break;
+        }
+        super::sched::yield_now();
+    }
+    if ok {
+        super::sched::kill_release(ticket);
+        serial_println!("[skill] killed pid={} asid={} confirmed=1 row=bg", pid, asid);
+        "killed — run `jobs` to reap the row"
+    } else if already_dead {
+        super::sched::kill_retract(ticket);
+        "already exited — run `jobs` to reap it"
+    } else {
+        super::sched::kill_detach(ticket);
+        let _ = proc_orphan(pi);
+        serial_println!("[skill] killed pid={} asid={} confirmed=0 row=orphaned (bg)", pid, asid);
+        "kill armed but unconfirmed — row parked PORPHANED; it settles at the task's next boundary"
+    }
+}
+
+// =============================================================================================
 // ELF-1: a minimal static ELF64 (aarch64) loader. Validates the ident + type + machine, walks the
 // PT_LOAD program headers, and (in `load_program_into_slot`) maps each segment into a slot's 16 KiB user
 // window with per-segment permissions. Deliberately minimal: ET_EXEC only, no dynamic linking, no

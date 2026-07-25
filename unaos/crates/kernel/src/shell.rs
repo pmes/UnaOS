@@ -2342,6 +2342,9 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // PI-APP-1: v3d-gated so the knob-off build's help text stays byte-identical to baseline.
             #[cfg(all(target_arch = "aarch64", feature = "v3d"))]
             console.println("APPS:     vug (3D sculptor), v3d (replay the visible GPU graphics battery)");
+            // BGRUN-1: background EL0 runs — the concurrent-apps line (windows coexist; TAB cycles).
+            #[cfg(feature = "baremetal")]
+            console.println("PROC:     run <path> (foreground), bg <path> (background), jobs (list+reap), kill <pid>");
             console.println("POWER:    batmon (SMC battery snapshot; x86 UNAOS_SMC=1 only)");
             console.println("WITNESS:  bootlog (boot-milestone ring: PORTSW / FTDI console / EHCI HID / block / GUI handoff)");
             console.println("TEST:     tste (in-OS self-test suite: boot-replay + live checks)");
@@ -3331,6 +3334,33 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
              crate::hlt_loop();
              crate::hlt_loop();
         },
+        #[cfg(feature = "baremetal")]
+        "bg" => {
+            // BGRUN-1: run an EL0 program in the BACKGROUND — the shell returns to its prompt at once and
+            // the program keeps running (and, if windowed, its window stays OPEN, so TAB has a ring to
+            // walk — this is what turns the WC-TAB binding into a workflow: `run` blocks until its app
+            // dies, so real windows never coexisted before this verb). `bg <path>`.
+            match args.first() {
+                None => console.println("usage: bg <path>   (run an ELF64 EL0 program in the background)"),
+                Some(&path) => bg_program(console, path),
+            }
+        },
+        #[cfg(feature = "baremetal")]
+        "jobs" => {
+            // BGRUN-1: list background programs and REAP the exited ones (this verb is the reaper — a
+            // PEXITED row stays claimed until it is polled here, and the table is bounded). `jobs`.
+            bg_jobs(console);
+        },
+        #[cfg(feature = "baremetal")]
+        "kill" => {
+            // BGRUN-1: kill a background program by pid (SKILL-1 underneath — ASID-scoped, so ELF-2
+            // sibling threads die with it; unconfirmed kills park the row PORPHANED and settle at the
+            // task's next boundary). `kill <pid>`.
+            match args.first().and_then(|s| s.parse::<u64>().ok()) {
+                None => console.println("usage: kill <pid>   (see `jobs` for pids)"),
+                Some(pid) => bg_kill_cmd(console, pid),
+            }
+        },
         "" => {}, // Ignore empty enter
         _ => {
             console.println("Unknown command. Type 'help' for assistance.");
@@ -3430,8 +3460,11 @@ fn parse_num(s: &str) -> Option<u64> {
 /// authority: this pre-check only sharpens the error text; `run_user_image` re-validates from scratch.
 ///
 /// Witness (headless-capturable): `:: EXEC: run <path> — loaded <n> bytes, entry 0x<..>, exit=<code> ::`.
+/// EXEC-1/BGRUN-1: the shared read-and-precheck front of `run` and `bg` — stat + bound + read off the
+/// VFS, then the friendly ELF64/aarch64 pre-check (the kernel loader is the real gate; a flat blob
+/// passes through to the position-independent flat path). `verb` names the caller in every message.
 #[cfg(feature = "baremetal")]
-fn run_program(console: &mut Console, path: &str) {
+fn read_el0_image(console: &mut Console, verb: &str, path: &str) -> Option<alloc::vec::Vec<u8>> {
     use crate::fs::vfs::NodeKind;
     // Cap = the kernel user window; a file at or under it may still be rejected by the loader (a flat blob
     // is re-bounded to one code page), but this is the hard read ceiling — we never read past it.
@@ -3440,51 +3473,57 @@ fn run_program(console: &mut Console, path: &str) {
     let st = match mt.stat(path) {
         Ok(s) => s,
         Err(e) => {
-            console.println(&alloc::format!("run: {}: {}", path, vfs_err(e)));
-            return;
+            console.println(&alloc::format!("{}: {}: {}", verb, path, vfs_err(e)));
+            return None;
         }
     };
     if matches!(st.kind, NodeKind::Dir) {
-        console.println(&alloc::format!("run: {}: is a directory (-EISDIR)", path));
-        return;
+        console.println(&alloc::format!("{}: {}: is a directory (-EISDIR)", verb, path));
+        return None;
     }
     if st.size == 0 {
-        console.println(&alloc::format!("run: {}: empty file", path));
-        return;
+        console.println(&alloc::format!("{}: {}: empty file", verb, path));
+        return None;
     }
     if st.size > CAP {
         console.println(&alloc::format!(
-            "run: {}: {} bytes exceeds the {}-byte EL0 user window (-E2BIG)",
-            path, st.size, CAP
+            "{}: {}: {} bytes exceeds the {}-byte EL0 user window (-E2BIG)",
+            verb, path, st.size, CAP
         ));
-        return;
+        return None;
     }
     let bytes = match mt.read(path, 0, st.size as usize) {
         Ok(b) => b,
         Err(e) => {
-            console.println(&alloc::format!("run: {}: {}", path, vfs_err(e)));
-            return;
+            console.println(&alloc::format!("{}: {}: {}", verb, path, vfs_err(e)));
+            return None;
         }
     };
-    // Early ELF64/aarch64 pre-check for a friendly reason (the kernel loader is the real gate). A flat blob
-    // (no ELF magic) is allowed through — the loader routes it to the position-independent flat path.
     if bytes.len() >= 20 && bytes[0..4] == [0x7F, b'E', b'L', b'F'] {
         if bytes[4] != 2 {
-            console.println(&alloc::format!("run: {}: not an ELF64 image (EI_CLASS != 2)", path));
-            return;
+            console.println(&alloc::format!("{}: {}: not an ELF64 image (EI_CLASS != 2)", verb, path));
+            return None;
         }
         if bytes[5] != 1 {
-            console.println(&alloc::format!("run: {}: not little-endian (EI_DATA != 1)", path));
-            return;
+            console.println(&alloc::format!("{}: {}: not little-endian (EI_DATA != 1)", verb, path));
+            return None;
         }
         let machine = u16::from_le_bytes([bytes[18], bytes[19]]);
         if machine != 183 {
             console.println(&alloc::format!(
-                "run: {}: not an aarch64 image (e_machine {} != 183)", path, machine
+                "{}: {}: not an aarch64 image (e_machine {} != 183)", verb, path, machine
             ));
-            return;
+            return None;
         }
     }
+    Some(bytes)
+}
+
+#[cfg(feature = "baremetal")]
+fn run_program(console: &mut Console, path: &str) {
+    let Some(bytes) = read_el0_image(console, "run", path) else {
+        return;
+    };
     // Hand the bytes to the kernel loader: map into a fresh EL0 slot, run co-located, wait (bounded 5 s) for
     // the program to exit or fault. The image length + entry are reported for the witness.
     let n = bytes.len();
@@ -3523,6 +3562,118 @@ fn run_program(console: &mut Console, path: &str) {
             serial_println!(":: EXEC: run {} — rejected ({}) ::", path, why);
         }
     }
+}
+
+/// BGRUN-1: one shell-side background job. The PATH is copied (bounded) so `jobs` can name it — the
+/// kernel row carries only the fixed task name. The pid is the durable key; asid rides for `kill`.
+#[cfg(feature = "baremetal")]
+#[derive(Clone, Copy)]
+struct BgJob {
+    pid: u64,
+    asid: u64,
+    name: [u8; 32],
+    nlen: u8,
+}
+
+/// BGRUN-1: the shell's job table. Bounded like every table in this kernel; slot count matches the
+/// EL0 address-space slots (8) — more jobs than slots could never spawn anyway. Shell access is
+/// single-task, but the Mutex keeps the invariant explicit rather than relying on that.
+#[cfg(feature = "baremetal")]
+static BG_JOBS: spin::Mutex<[Option<BgJob>; 8]> = spin::Mutex::new([None; 8]);
+
+/// BGRUN-1: `bg <path>` — read the image, spawn it detached, record the job. The shell prompt is
+/// back the moment this returns; the program (and its window, if it creates one) keeps running.
+#[cfg(feature = "baremetal")]
+fn bg_program(console: &mut Console, path: &str) {
+    let Some(bytes) = read_el0_image(console, "bg", path) else {
+        return;
+    };
+    let n = bytes.len();
+    match crate::arch::syscall::spawn_user_image_bg(&bytes) {
+        Ok((pid, asid, entry)) => {
+            let mut jobs = BG_JOBS.lock();
+            let Some(slot) = jobs.iter_mut().find(|s| s.is_none()) else {
+                // The kernel row exists but the shell can no longer track it; kill it rather than
+                // leak an untrackable job (`jobs` could never reap what it never recorded).
+                drop(jobs);
+                let why = crate::arch::syscall::bg_kill(pid, asid);
+                console.println(&alloc::format!(
+                    "bg: {}: job table full — spawned pid {} was killed ({})",
+                    path, pid, why
+                ));
+                return;
+            };
+            let mut name = [0u8; 32];
+            let nlen = path.len().min(32);
+            name[..nlen].copy_from_slice(&path.as_bytes()[..nlen]);
+            *slot = Some(BgJob { pid, asid, name, nlen: nlen as u8 });
+            console.println(&alloc::format!("bg: {} started — pid {} (see `jobs`)", path, pid));
+            serial_println!(
+                ":: BGRUN: bg {} — loaded {} bytes, entry {:#x}, pid={} asid={} DETACHED ::",
+                path, n, entry, pid, asid
+            );
+        }
+        Err(why) => {
+            console.println(&alloc::format!("bg: {}: {}", path, why));
+            serial_println!(":: BGRUN: bg {} — rejected ({}) ::", path, why);
+        }
+    }
+}
+
+/// BGRUN-1: `jobs` — list background jobs and reap the exited ones. This is the SOLE reaper for
+/// bg rows: an exited job's kernel row stays claimed (PEXITED) until it is polled here.
+#[cfg(feature = "baremetal")]
+fn bg_jobs(console: &mut Console) {
+    use crate::arch::syscall::BgPoll;
+    let mut jobs = BG_JOBS.lock();
+    let mut any = false;
+    for slot in jobs.iter_mut() {
+        let Some(job) = *slot else { continue };
+        any = true;
+        let name = core::str::from_utf8(&job.name[..job.nlen as usize]).unwrap_or("?");
+        match crate::arch::syscall::bg_poll(job.pid, true) {
+            BgPoll::Running => {
+                console.println(&alloc::format!("  pid {:>3}  running  {}", job.pid, name));
+            }
+            BgPoll::Exited(code) => {
+                console.println(&alloc::format!(
+                    "  pid {:>3}  exited {} (reaped)  {}", job.pid, code, name
+                ));
+                serial_println!(":: BGRUN: jobs — pid={} exit={} reaped ::", job.pid, code);
+                *slot = None;
+            }
+            BgPoll::Faulted => {
+                console.println(&alloc::format!(
+                    "  pid {:>3}  FAULTED (contained; reaped)  {}", job.pid, name
+                ));
+                serial_println!(":: BGRUN: jobs — pid={} exit=FAULT reaped ::", job.pid);
+                *slot = None;
+            }
+            BgPoll::Gone => {
+                // Row already gone (e.g. a kill reaped it, or PORPHANED settled and was reclaimed by
+                // the exit path). Drop the stale entry honestly.
+                console.println(&alloc::format!("  pid {:>3}  gone  {}", job.pid, name));
+                *slot = None;
+            }
+        }
+    }
+    if !any {
+        console.println("jobs: none");
+    }
+}
+
+/// BGRUN-1: `kill <pid>` — kill a recorded background job (SKILL-1 underneath). The row is reaped by
+/// the next `jobs`; the table entry stays until then so the operator sees the outcome there.
+#[cfg(feature = "baremetal")]
+fn bg_kill_cmd(console: &mut Console, pid: u64) {
+    let jobs = BG_JOBS.lock();
+    let Some(job) = jobs.iter().flatten().find(|j| j.pid == pid).copied() else {
+        console.println(&alloc::format!("kill: no background job with pid {} (see `jobs`)", pid));
+        return;
+    };
+    drop(jobs); // bg_kill yields while confirming; never hold the table lock across that.
+    let verdict = crate::arch::syscall::bg_kill(job.pid, job.asid);
+    console.println(&alloc::format!("kill: pid {}: {}", pid, verdict));
 }
 
 #[cfg(target_arch = "aarch64")]
