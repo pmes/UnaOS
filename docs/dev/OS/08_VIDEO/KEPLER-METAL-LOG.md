@@ -44,9 +44,16 @@ hardware pitch, at base 0x90020000 (the GOP FB). **`video::fbcon` is NOT
 mis-strided; no fbcon stride fix is needed.** The console's failure to
 appear on the panel is therefore elsewhere (candidates: console renders
 before/behind the takeover fill; output path never targets the FB; the
-takeover draw overwrites it). Glyph-block photo (top-left, y≈64,
-x≈64/80/96): pending from Peter — verdict to be folded when it arrives,
-not presumed.
+takeover draw overwrites it). Glyph-block verdict (Peter, direct):
+**NO graphic visible — only the main calibration draw from before; no
+photo to take.** Serial confirms the draw executed (`fbcon-probe drawn
+rows=8` in the capture), so the writes went out through the same pointer
+and pitch as the visible full-panel fill. Ruling: **probe under-sized —
+INCONCLUSIVE on visibility, not a mapping refutation.** Three 8×8-px
+blocks at 220 ppi are ~0.7 mm dots atop the calibration colour bands;
+plausibly invisible even where they landed. The mapping stands on s29's
+edge-to-edge `cover=exact` evidence. The real visibility test arrives
+with the coordinator's console wiring (human-scale text).
 
 Capture from byte 1485655 (mark s30boot1). ESP built by coordinator
 (sha 913a200e…), Fox sha-verified and flashed only. Coordinator inline
