@@ -2385,13 +2385,36 @@ fn pump_usb_into_gui() {
         // events go round again every pass, ~250×/s for as long as a kernel app owns the panel — so
         // counting them would inflate `[uvug10] evq`'s push/pop (and, on a deep ring, drop) precisely in
         // the state where a stalled drain is the hypothesis under test.
+        // WC-TAB: the TAB interception lives INSIDE this scan, not below the branch. This gate — not the
+        // `el0_input_active() != 0` one above — is the gate that actually holds while focus sits in the
+        // ring's shell slot, and getting that backwards is what made the first cut of this fix a no-op.
+        // `handle_key` sets SCREEN_APP_ACTIVE around `dispatch_command` and it stays set for the WHOLE EL0
+        // run: `run_user_image` parks the shell task in its wait loop until the program returns. So with
+        // apps live and focus TAB'd out to the shell, BOTH flags were live, this branch returned first,
+        // and the TAB was requeued forever — the exit stayed one-way. (The complement, focus 0 with
+        // SCREEN_APP_ACTIVE clear, cannot hold two ring entries at all: a live app implies a parked shell.)
+        //
+        // It has to be done HERE and not by forwarding the remainder onward: `render_service` is blocked
+        // inside the same `dispatch_command`, so anything pushed into the 64-slot GUI_CHANNEL would sit
+        // there until `send` blocks this pump task. That saturation is precisely what this branch exists
+        // to prevent, so the fix stays within its discipline — peek, consume, requeue — and never sends.
+        //
+        // A consumed TAB DISCARDS the whole buffer rather than requeuing it. That is not a new policy: it
+        // is exactly what `el0_input_set_active` would have done to these same events itself, since it
+        // drains `pal::EVENT_QUEUE` on every real focus change. They are outside the queue for a few
+        // instructions only because this uncounted peek is holding them, and a fresh focus starts clean.
         let mut buf: [unaos_kernel::pal::Event; 64] =
             [unaos_kernel::pal::Event::None; 64];
         let mut n = 0usize;
         let mut saw_button = false;
+        let mut cycled = false;
         while n < buf.len() {
             match unaos_kernel::pal::peek_event_uncounted() {
                 Some(ev) => {
+                    if unaos_kernel::arch::aarch64::syscall::wc_shell_focus_key(ev) {
+                        cycled = true;
+                        break; // focus has moved; the next pass routes to the newly-focused app
+                    }
                     // UVUG-6: typematic is fed at the HID report level, not from this drain.
                     if matches!(ev, unaos_kernel::pal::Event::Button(_)) {
                         saw_button = true;
@@ -2402,26 +2425,35 @@ fn pump_usb_into_gui() {
                 None => break,
             }
         }
-        for ev in buf.iter().take(n) {
-            unaos_kernel::pal::requeue_event(*ev);
+        if !cycled {
+            for ev in buf.iter().take(n) {
+                unaos_kernel::pal::requeue_event(*ev);
+            }
         }
-        if saw_button {
+        if saw_button && !cycled {
             click2_left_witness();
         }
         click2_depth_witness();
         return;
     }
     while let Some(ev) = unaos_kernel::pal::next_event() {
-        // WC-TAB: the shell half of the compositor's TAB ring. This is the drain that runs when NO EL0
-        // app holds focus — i.e. when focus sits in the ring's shell slot — and it is the only point at
-        // which a TAB pressed at the shell is visible to the window system, since the `el0_input_active()
-        // != 0` gate above means `el0_input_enqueue` (where WC-C intercepts TAB) is never reached from
-        // here. Without this call the ring was a one-way exit: an operator could TAB out to the shell and
-        // never back in. `wc_shell_focus_key` shares the in-ring predicate, so TAB is consumed ONLY when
-        // there are at least two windows to rotate through; otherwise it falls through untouched and
-        // reaches the console exactly as before (`handle_key` ignores byte 9 — there is no completion or
-        // other shell binding on TAB to clobber).
+        // WC-TAB: the same interception on the bare-shell drain — no EL0 focus AND no screen app. The
+        // SCREEN_APP_ACTIVE branch above carries the case that matters for a live ring; this one keeps
+        // the two shell paths behaving identically rather than leaving a second, subtly different TAB.
+        // `wc_shell_focus_key` shares the in-ring predicate, so TAB is consumed ONLY when there are at
+        // least two windows to rotate through; otherwise it falls through untouched and reaches the
+        // console exactly as before (`handle_key` ignores byte 9 — there is no completion or other shell
+        // binding on TAB to clobber).
+        //
+        // BREAK, not continue: a consumed TAB has just moved focus, so every remaining event in this
+        // drain now belongs to the newly-focused app, not to GUI_CHANNEL. The in-ring path is
+        // self-correcting — it re-reads the active ASID per event — but this loop's destination is fixed
+        // at `gui_send`, so it would keep posting the new focus's keystrokes to the console. Re-read the
+        // active ASID and leave the loop; the next pump pass takes the routing branch.
         if unaos_kernel::arch::aarch64::syscall::wc_shell_focus_key(ev) {
+            if unaos_kernel::arch::aarch64::syscall::el0_input_active() != 0 {
+                break;
+            }
             continue;
         }
         // UVUG-6: typematic is fed at the HID report level (see pal::typematic_note_report), not this drain.

@@ -990,9 +990,15 @@
     swallowed with it. Fewer than two windows: TAB is delivered as an ordinary key. The ring carries one
     slot beyond the windows — **the shell** (focus 0) — so tabbing into a window is not a trap. WC-C
     shipped that as a one-way exit (with focus 0 the router never calls the seam); **WC-TAB** closed the
-    loop by calling `syscall::wc_shell_focus_key` from the shell's own drain in `pump_usb_into_gui` — a
-    second entry point onto the same cycle body, sharing its `n < 2` guard, so TAB re-enters the ring at
-    its head and a system with fewer than two windows keeps an ordinary TAB at the shell.
+    loop by calling `syscall::wc_shell_focus_key` from `pump_usb_into_gui`'s non-routing paths — a second
+    entry point onto the same cycle body, sharing its `n < 2` guard, so TAB re-enters the ring at its
+    head and a system with fewer than two windows keeps an ordinary TAB at the shell. The load-bearing
+    site is the `SCREEN_APP_ACTIVE` peek/requeue branch, since `run_user_image` parks the shell task for
+    the whole EL0 run and that branch returns first; the TAB is consumed inside the scan and the buffer
+    dropped, never forwarded (`render_service` is blocked, so a `GUI_CHANNEL` send would saturate it).
+    Scope, as WC-C already conceded: the boot's real programs do not overlap, so a ring of two or more
+    exists today only under the `el0-wcb` fixture — this completes the mechanism, not yet an operator
+    workflow.
   - Gates: `./arroyo check` green both arches; `./arroyo kernel8` builds (per-blob page assertions);
     `./arroyo kernel8-test 120` MBENCH **49/49 required, 0 forbidden** (three new
     `pi4-regression.spec` directives pin the UVUG checksum, the `witness=0x1fff` ledger and the

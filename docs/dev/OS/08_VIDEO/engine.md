@@ -700,15 +700,31 @@ a position in the rotation, not an absence.
 
 **WC-TAB closed the loop.** WC-C shipped the shell slot as a one-way exit: with focus 0,
 `route_input_to_active_el0` is not called at all (`main.rs` gates on `el0_input_active() != 0`), so no
-TAB reached the seam — the ring could be left but not re-entered. The shell's own event drain in
-`pump_usb_into_gui` now calls `syscall::wc_shell_focus_key` before forwarding anything to
-`GUI_CHANNEL`. That is a second *entry point* onto the same `wc_focus_key` body, not a second
-implementation: same predicate, same `el0_input_set_active` move, same `[wc-c] focus tab-cycle` witness.
-With focus 0 in no window's slot the cycle takes its "unknown focus" arm and lands on the ring's head,
-the first window in window-id order. The `n < 2` guard is shared, so with one window (or none) TAB
-remains an ordinary key at the shell too — deliberate symmetry, since a lone window does not consume TAB
-and pushing focus into it would re-create the trap. Nothing was clobbered: the console's `handle_key`
-ignores byte 9 outright, so TAB had no shell binding before this.
+TAB reached the seam — the ring could be left but not re-entered. `pump_usb_into_gui` now calls
+`syscall::wc_shell_focus_key` from both of its non-routing paths. That is a second *entry point* onto
+the same `wc_focus_key` body, not a second implementation: same predicate, same `el0_input_set_active`
+move, same `[wc-c] focus tab-cycle` witness. With focus 0 in no window's slot the cycle takes its
+"unknown focus" arm and lands on the ring's head, the first window in window-id order. The `n < 2` guard
+is shared, so with one window (or none) TAB remains an ordinary key at the shell too — deliberate
+symmetry, since a lone window does not consume TAB and pushing focus into it would re-create the trap.
+Nothing was clobbered: the console's `handle_key` ignores byte 9 outright, so TAB had no shell binding
+before this.
+
+Which path carries it is the whole substance of the fix. `handle_key` sets `SCREEN_APP_ACTIVE` around
+`dispatch_command`, and `run_user_image` parks the shell task for the entire EL0 run — so while apps are
+live *and* focus is at the shell, both the `SCREEN_APP_ACTIVE` branch and the shell drain are in play,
+and the former returns first. The interception therefore sits inside that branch's existing
+peek/requeue scan: a consumed TAB is simply not requeued, and the rest of the buffer is dropped rather
+than forwarded. It must not be sent onward — `render_service` is blocked inside the same
+`dispatch_command`, so pushing into the 64-slot `GUI_CHANNEL` would saturate it and block the pump task,
+exactly what that branch exists to prevent. Dropping the buffer is not a new policy either: it is what
+`el0_input_set_active` would have done to those same events itself, since it drains `pal::EVENT_QUEUE`
+on every real focus change; they are outside the queue only because the uncounted peek is holding them.
+
+**Scope, plainly:** as WC-C already conceded, the boot's own programs do not overlap in time, so a ring
+of two or more windows arises today only under the `el0-wcb` fixture that creates them deliberately.
+This is the mechanism made whole and symmetric — not yet a workflow a metal operator falls into. A
+single-window boot sees no behaviour change at all: TAB stays an ordinary key end to end.
 
 #### The side-by-side witness
 

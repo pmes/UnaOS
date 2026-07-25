@@ -10275,10 +10275,17 @@ pub fn el0_input_enqueue(ev: crate::pal::Event) -> bool {
 /// leavable and re-enterable — rather than a terminus.
 ///
 /// Two further deliberate consequences, neither hidden:
-///  * `el0_input_set_active` also drains `pal::EVENT_QUEUE`. We are called from inside the router's drain
-///    loop, so anything typed BEHIND the Tab is discarded rather than delivered to the new focus. That is
-///    the wanted semantics — those keystrokes were aimed at the window the operator was leaving — and it
-///    is the same discard a launch already performs.
+///  * `el0_input_set_active` also drains `pal::EVENT_QUEUE`. We are called from inside a drain loop, so
+///    anything typed BEHIND the Tab is discarded rather than delivered to the new focus, and it is the
+///    same discard a launch already performs. WC-TAB note on PROVENANCE, since there are now two callers
+///    and they do not share one: from the in-ring entry point those keystrokes were aimed at the window
+///    the operator is leaving, so discarding them is plainly right. From the SHELL entry point they were
+///    aimed at the PROMPT — type `ls`, then TAB quickly, and the `ls` bytes are dropped before the
+///    console ever sees them. Kept anyway, and flagged rather than quietly fixed: the alternative is to
+///    let pre-TAB shell bytes survive into a window's ring, which is a worse leak than losing a partial
+///    command line, and `el0_input_set_active`'s "a fresh focus starts clean" contract is relied on by
+///    the UVUG-8r2 takeover reasoning. Splitting the discard by direction means splitting that contract,
+///    which is an arc-sized change to the focus primitive, not a keybinding fix.
 ///  * The KeyUp is swallowed too, on the same predicate. Delivering a lone KeyUp for a KeyDown the app
 ///    never saw is exactly the dropped-edge shape UVUG-6 spent an arc removing from the typematic path.
 fn wc_focus_key(ev: crate::pal::Event) -> bool {
@@ -10400,8 +10407,15 @@ pub fn el0_input_set_active(asid: u64) {
 /// When focus is the shell slot, `el0_input_active()` is 0 and `main.rs` never calls
 /// `route_input_to_active_el0`, so `el0_input_enqueue` (and with it the TAB interception) is never
 /// reached: TAB got as far as the console's `handle_key`, which ignores byte 9 outright — no completion,
-/// no binding, nothing. The rotation could be left but not re-entered. The shell's own drain calls this
-/// first, so TAB there hands focus back INTO the ring on exactly the same terms.
+/// no binding, nothing. The rotation could be left but not re-entered.
+///
+/// `pump_usb_into_gui` calls this from BOTH of its non-routing paths, and the one that carries the real
+/// case is the SCREEN_APP_ACTIVE peek/requeue branch — not the bare-shell drain below it. While any EL0
+/// program runs, `run_user_image` parks the shell task, so SCREEN_APP_ACTIVE stays set for the whole run;
+/// with focus tabbed out to the shell that branch is the one that fires, and it must consume the TAB
+/// in place. It cannot forward the remainder onward instead: `render_service` is blocked in the same
+/// `dispatch_command`, so a send would saturate the 64-slot GUI_CHANNEL — the very thing the branch
+/// exists to avoid.
 ///
 /// Same predicate, same body, same witness as the in-ring cycle — this is a second entry point onto
 /// `wc_focus_key`, not a second implementation. Two consequences follow from that, both wanted:
