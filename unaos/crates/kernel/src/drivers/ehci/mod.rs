@@ -1028,9 +1028,11 @@ impl Controller {
         }
     }
 
-    /// EHCI-TRACKPAD M1 — the bcm5974 "Wellspring" vendor mode switch. Mirrors the Linux bcm5974
-    /// driver's `bcm5974_wellspring_mode(on=true)`, run over EP0 through the same overlay-direct /
-    /// chain-mode control path every other request uses:
+    /// EHCI-TRACKPAD M1 — the Apple "Wellspring" vendor mode switch. A standard HID class
+    /// feature-report read-modify-write (see the PROVENANCE note on `BCM5974_MODE_READ_REQ` for
+    /// why every value here is spec-derived or metal-observed, never taken from GPLv2 driver
+    /// code), run over EP0 through the same overlay-direct / chain-mode control path every other
+    /// request uses:
     ///   1. GET_REPORT(Feature): bmRequestType 0xA1 (IN|CLASS|INTERFACE), bRequest 0x01,
     ///      wValue 0x0300 (Feature report, id 0), wIndex 0, read 8 bytes into `data_buf`.
     ///   2. `data_buf[0] = 0x01` (VENDOR/wellspring mode; 0x08 is the NORMAL single-touch mode).
@@ -1056,8 +1058,8 @@ impl Controller {
                 );
             }
             Err(e) => {
-                // A device may not answer the read yet still accept the write (Linux ignores a
-                // short/failed read too). Seed the buffer to a known state and press on.
+                // A device may not answer the read yet still accept the write, so a failed GET is
+                // not a reason to skip the SET. Seed the buffer to a known state and press on.
                 serial_println!(
                     ":: EHCI-HID: [{}] M1 bcm5974 GET_REPORT(feature) addr={} intf={} FAILED ({}) — writing anyway ::",
                     self.idx, t.addr, intf, e
@@ -1412,14 +1414,21 @@ const UP_VENDOR: u16 = 0xFF00;
 /// stray one-byte vendor field — 8 bytes. Below this we do NOT claim the interface is a trackpad.
 const VMT_MIN_VENDOR_BITS: u32 = 64;
 
-// EHCI-TRACKPAD M1 — the bcm5974 "Wellspring" vendor mode switch (CONFIRM AT METAL).
-// The Apple internal trackpad (05ac:0262) enumerates and ARMS, but its vendor-multitouch
-// interface stays SILENT until this class feature-report handshake flips it out of the
-// single-touch compatibility mode into the raw multitouch stream. The constants are the Linux
-// bcm5974 driver's (`bcm5974_wellspring_mode`): read the feature report, overwrite byte 0 with
-// the mode selector, write it back. wIndex is the driver's REQUEST_INDEX (0) verbatim — the
-// value proven on real MacBooks; the interface number is logged alongside so a sitting can
-// retry with `intf` if index 0 STALLs on this exact 0262.
+// EHCI-TRACKPAD M1 — the Apple "Wellspring" vendor mode switch (CONFIRMED AT METAL 2026-07-18).
+// The Apple internal trackpad (05ac:0262) enumerates and ARMS, but its vendor interface stays
+// SILENT until this class feature-report handshake flips it out of the single-touch
+// compatibility mode into the vendor stream.
+//
+// PROVENANCE (cleanroom — UnaOS is GPL-3.0-or-later and the Linux bcm5974 driver is GPLv2-only,
+// so NO Linux driver code is copied or paraphrased here; only protocol facts are used):
+//   * 0x01 GET_REPORT / 0x09 SET_REPORT / wValue 0x0300 (report type 3 = Feature, report id 0)
+//     are verbatim USB HID Class Definition 1.11 §7.2 values — open specification, not driver code.
+//   * The 8-byte feature-report length and the NORMAL mode byte 0x08 are OUR OWN metal
+//     observation: the GET_REPORT witness on this exact 0262 returned got=8b byte0=0x08.
+//   * The VENDOR mode byte 0x01 is confirmed by OUR OWN metal result — after writing it, the
+//     endpoint streamed 736+ reports where it had previously been silent (see doc §10e).
+//   * wIndex 0 is likewise confirmed by that same successful sitting. The interface number is
+//     logged alongside so a future sitting can retry with `intf` if index 0 ever STALLs.
 const BCM5974_MODE_READ_REQ: u8 = 0x01; // HID class GET_REPORT
 const BCM5974_MODE_WRITE_REQ: u8 = 0x09; // HID class SET_REPORT
 const BCM5974_MODE_REQ_VALUE: u16 = 0x0300; // wValue: report type 3 (Feature), report id 0

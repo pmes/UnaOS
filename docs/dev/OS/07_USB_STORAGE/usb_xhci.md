@@ -1193,9 +1193,7 @@ the hot path.
 (`len >= 4`), gates on `report[0] == 0x02` (`TRACKPAD_REPORT_ID`; a short or non-`0x02` report yields
 `None` → no event, no state change), and reads `buttons`, `dx` (int8), `dy` (int8) straight into the
 relative `pal::Event::Mouse` seam — the same path the boot-mouse uses. A bounded one-line **format
-witness** prints on the first decoded report. `buttons` is decoded and witnessed but no click event is
-emitted (parity with the `is_rel_mouse` boot-mouse path — the relative pointer seam carries no button
-today). The refuted `decode_vendor_first_finger` + `VMT_FINGER_*` constants + `vendor_multitouch_selftest`
+witness** prints on the first decoded report. The refuted `decode_vendor_first_finger` + `VMT_FINGER_*` constants + `vendor_multitouch_selftest`
 are **kept as documented reverse-engineering history** (per the never-trash rule) — the self-test still
 runs and passes at init, exercising that decode's mechanics; it is simply no longer the live path.
 
@@ -1213,6 +1211,30 @@ demo) accrues to the next attended sitting.
 **Gates (RMBP-FIX).** `./arroyo check` green both arches. `./arroyo test 22` + `UNAOS_CPU=qemu64 test 22`
 MISSION SUCCESS, keyboard + vendor self-test unregressed, 0 FAIL. `UNAOS_EHCITABLET=1 test 22` MISSION
 SUCCESS, the `usb-tablet` report-pointer path arms unchanged. `./arroyo test-arm 22` 0 FAIL / 0 PANIC.
+
+### 10f. CLICK-1 — the trackpad click became an event
+
+§10e decoded `buttons` but deliberately emitted no click event. The GUI sitting-1 verdict closed that
+gap: `service`'s `vendor_mt` branch now emits exactly **one** `pal::Event::Button(buttons)` per button
+**DOWN edge** (`prev_buttons & 0x01 == 0 && buttons & 0x01 != 0`, tracked per-endpoint in
+`IntEp::prev_buttons`). Release emits nothing, and a held press emits nothing further — the edge test is
+what keeps a ~100 Hz report stream from becoming a ~100 Hz click storm. The observable: a trackpad click
+while `vug` or `pulse` is running exits the demo exactly like a keystroke.
+
+One bounded serial line prints per press (human-rate, so it cannot flood the framebuffer console the way
+the §10e M1 dump did):
+
+```
+:: EHCI-HID: [i] trackpad click (button-down edge, buttons=0x01) == witness ::
+```
+
+Because the decode is gated inside `decode_trackpad_rel`, a short or non-`0x02` report still yields
+`None` — no event, and `prev_buttons` is left untouched, so a malformed report can neither synthesize a
+click nor desynchronize the edge state.
+
+**QEMU vs metal.** QEMU never sets `vendor_mt` (its `usb-tablet` is a standard absolute pointer) and has
+no EHCI HID controller, so **no** QEMU gate can exercise this branch — QEMU proves non-regression only.
+The click behaviour is a **metal-only** verdict, taken at the attended rMBP sitting.
 
 ---
 
