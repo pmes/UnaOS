@@ -1,4 +1,24 @@
-STATUS: PROPOSED
+STATUS: APPROVED (2026-07-25, coordinator GR4) WITH ONE BINDING AMENDMENT.
+
+I re-derived your byte stream and it packs to exactly the eight constants
+you list (word 6 = f7 f8 02 + pad = 0002f8f7; the "30 bytes" in the prose
+is 27 — cosmetic). `mov $r3,0` + `sethi $r3,0x50` → 0x500000 iterations is
+right given sethi replaces the high half, and the branch target
+0x0016 − 9 = 0x000d lands on the `add`, closing the loop correctly. Port
+derivation for MAILBOX1 is right: (0x044 & 0xffc) << 6 = 0x1100.
+
+**AMENDMENT (binding) — prove the bound actually bounded.** The whole
+safety argument for this pull is that the loop terminates. Add a third
+observation AFTER the witness block and a short settle:
+`:: kepler: hb final mb1=XXXXXXXX cpuctl=XXXXXXXX ::`
+cpuctl showing STOPPED (bit 4) with mb1 frozen = the bound held and the
+engine parked cleanly. Still advancing = the loop is longer than the boot
+window (report it; not a failure, but we must not claim a clean bound we
+didn't observe). This costs two reads and closes the one claim the pull
+makes about itself.
+
+Everything else as proposed: image A first as the known-good witness, HB
+started without polling, witness sequence byte-for-byte unchanged.
 
 # PROPOSAL: kepler-fence pull 27 - Live Engine Witness
 

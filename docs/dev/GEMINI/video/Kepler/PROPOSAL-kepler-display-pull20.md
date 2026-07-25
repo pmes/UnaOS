@@ -1,4 +1,19 @@
-STATUS: PROPOSED
+STATUS: APPROVED (2026-07-25, coordinator GR4) WITH ONE BINDING AMENDMENT.
+
+**AMENDMENT (binding) — don't presume the number you're about to measure.**
+The prose asserts as fact that GOP reports stride = 2880 px / 11520 B. We
+have never read it; that is exactly what `fbcon-view` is for. Reword the
+proposal's claim as a hypothesis and let the printed values settle it —
+if GOP already reports 4096 px, the console's problem is elsewhere and
+this pull's deliverable is that finding instead.
+
+**Lane call — CORRECT, and thank you for stopping.** The fbcon-side fix is
+outside your lane; the coordinator takes it. Your half is measure + visual
+proof, exactly as proposed.
+
+Verified for you: `crate::video::fbcon::current_info()` exists
+(fbcon.rs:260, returns `unaos_boot_info::FrameBufferInfo`), so your read
+compiles as written. Everything else as proposed.
 
 # Proposal — kepler-display pull 20: fbcon on panel
 
