@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright (C) 2026 The Architect & Una
 
-   BGRUN-2 link script for the static ELF64 EL0 persistence program (crates/user-kvug). Same shape as the
+   BGRUN-2 link script for the static ELF64 EL0 persistence program (crates/user-stat). Same shape as the
    ELFHELLO link (user-elf.ld): the link product is kept AS AN ELF and handed to the kernel's aarch64 ELF
    loader. We declare TWO PT_LOAD program headers via PHDRS so the loader has distinct segments to map
    with distinct permissions:

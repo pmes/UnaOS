@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 //
-// BGRUN-2: `kvug.elf` — the PERSISTENCE app. A static ELF64 (aarch64) EL0 program that creates one
+// BGRUN-2: `stat.elf` — the PERSISTENCE app. A static ELF64 (aarch64) EL0 program that creates one
 // compositor window, repaints a visibly changing readout, and RUNS UNTIL IT IS KILLED. It has no exit
 // condition of its own: no frame cap, no timeout, no input-driven quit. `kill <pid>` is the whole remedy,
 // which is exactly the BGRUN-1 contract ("nothing bounds a bg app; `kill` is the whole remedy").
@@ -12,7 +12,7 @@
 // spawn->exit->reap and kill-mid-run legs on silicon. What it could NOT make operator-verifiable was the
 // WC-TAB window ring: the only windowed EL0 app was UVUG, and a BACKGROUNDED uvug is UNFOCUSED, so no HID
 // event ever reaches it, so it never leaves its deterministic auto path — 300 frames and gone. Two windows
-// flashed past before a hand could reach TAB. This program is the missing fixture: `bg /fat/KVUG.ELF`
+// flashed past before a hand could reach TAB. This program is the missing fixture: `bg /fat/STAT.ELF`
 // twice puts two windows on the panel that STAY there, and TAB walks between them for as long as the
 // operator likes.
 //

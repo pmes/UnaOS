@@ -932,18 +932,18 @@
     n == 1, so TABbing during a single-window foreground `run` drops focus to the parked shell — TAB back
     re-enters; linger instead and the takeover re-arm can SKILL-1 the app ~5 s later. The safety property
     (never weld the operator away from `kill`) outranks that exposure, deliberately.
-- **BGRUN-2 (`kvug.elf` — the persistence app)** — the fixture BGRUN-1 was missing. BGRUN-1's bench recipe
+- **BGRUN-2 (`stat.elf` — the persistence app)** — the fixture BGRUN-1 was missing. BGRUN-1's bench recipe
   was "`bg /fat/uvug.elf` twice → TAB between two live crystals", and it does not work: a BACKGROUNDED UVUG
   is UNFOCUSED, so no HID event ever reaches it, so it never leaves its deterministic auto path — 300 frames
   and gone. Both windows flash past before a hand reaches TAB. The window ring was untestable at the bench
   not because of a compositor defect but because there was no app that STAYS.
   > **Superseded in part by VUG-BG (below):** a backgrounded `VUG.ELF` now persists too, so the original
-  > "`bg` the vug twice" recipe works after all. `KVUG.ELF` is not thereby redundant — it has no exit
+  > "`bg` the vug twice" recipe works after all. `STAT.ELF` is not thereby redundant — it has no exit
   > condition *at all*, focused or not, which is a stronger property than VUG's conditional persistence,
   > and it is what `BGRUN-ST` leg 3 rests on. It also puts its pid on screen, which is what makes the TAB
   > walk checkable against `jobs`.
-  - **`crates/user-kvug` → `KVUG.ELF`** is that app: a static ELF64 EL0 program built and staged exactly
-    like `VUG.ELF` (own workspace + `user-kvug.ld` PHDRS: R+X text, R+W data; `arroyo kernel8` builds it,
+  - **`crates/user-stat` → `STAT.ELF`** is that app: a static ELF64 EL0 program built and staged exactly
+    like `VUG.ELF` (own workspace + `user-stat.ld` PHDRS: R+X text, R+W data; `arroyo kernel8` builds it,
     checks the ELF magic and the 16 KiB `USER_REGION_SIZE` bound, and copies it to the FAT staging dir).
     ~8.5 KiB. It creates one 128x128 window (`SYS_WIN_CREATE`, the same one-slot geometry UVUG negotiates),
     and each frame repaints its **own pid in large digits** (from `SYS_GETINFO`), a **frame counter** and a
@@ -974,16 +974,17 @@
     — so a truncated log still reports the step GREEN. The battery cannot currently go red on a short
     window; only an explicit `mbench --replay … --spec` can. Assert the spec, not the battery step.
   - **Bench recipe (the TAB test, at last).** At the panel shell:
-    `bg /fat/KVUG.ELF` → `bg /fat/KVUG.ELF` → `jobs` (two `running` rows; note the pids) → press `TAB`
+    `bg /fat/STAT.ELF` → `bg /fat/STAT.ELF` → `jobs` (two `running` rows; note the pids) → press `TAB`
     repeatedly and watch focus walk shell → window A → window B → shell, checking the large pid against the
     `jobs` list each stop → `kill <pidA>` (its window vanishes; the line reads `killed — row reaped`) →
     `jobs` (one row left) → `kill <pidB>` → `jobs` (`none`). Use `bg`, never `run`: a foreground `run` of a
     program that never exits ends at `run_user_image`'s deadline with a SKILL-1 kill.
-- **VUG/KVUG (this arc)** — the two EL0 apps get their real names, a backgrounded vug stops looking like a
+- **VUG/STAT** — the two EL0 apps get their real names, a backgrounded vug stops looking like a
   crash, and the compositor says which window has the keyboard. Three folds, one arc; app UX only.
   - **Fold 1 — the rename.** `crates/user-uvug` → **`crates/user-vug`** (`UVUG.ELF` → **`VUG.ELF`**,
-    `user-uvug.ld` → `user-vug.ld`) and `crates/user-stat` → **`crates/user-kvug`** (`STAT.ELF` →
-    **`KVUG.ELF`**, `user-stat.ld` → `user-kvug.ld`). Swept through `arroyo`'s build and staging stanzas,
+    `user-uvug.ld` → `user-vug.ld`). The persistence app was renamed to `KVUG` in the same fold and that
+    half was **reverted by STAT-NAME (below)**: it is `crates/user-stat` → **`STAT.ELF`** again, the name
+    it has here throughout. Swept through `arroyo`'s build and staging stanzas,
     the FAT staging names, the in-kernel witness paths that load the images by name (`uvug_witness`'s
     `/fat/VUG.ELF`, `BGRUN-ST`'s kill and persistence legs), and the doc mentions here and in
     `08_VIDEO/engine.md`.
@@ -1008,7 +1009,7 @@
       the per-window entry — the latter because the legacy header is only refreshed for region slot 0).
     - **What the app does with it.** `crates/user-vug` reads the word once, after `SYS_WIN_CREATE` (which
       is what maps the page), and a detached vug **skips the 300-frame cap** — same deterministic tumble,
-      no end. `kill <pid>` is the whole remedy, exactly as for `KVUG.ELF`. Focused `run` is byte-identical
+      no end. `kill <pid>` is the whole remedy, exactly as for `STAT.ELF`. Focused `run` is byte-identical
       to before.
     - **The checksum witness is untouched, structurally.** `uvug_witness` runs `VUG.ELF` through
       `run_user_image` — the FOREGROUND launcher, which clears the bit — so `REQUIRE UVUG: frames=300
@@ -1070,6 +1071,16 @@
     `run_user_image`/`spawn_user_image_bg` only cover the two FAT-image launchers — `sys_spawn`'s
     `load_program_into_slot` and the in-kernel fixture launchers produce address spaces too. One line at
     the teardown funnel beats a rule every future launcher has to remember.
+- **STAT-NAME (this arc)** — the persistence app is the **stats viewer**, and its name is **STAT**. The
+  VUG/STAT rename above also renamed it `crates/user-stat` → `crates/user-kvug` (`STAT.ELF` →
+  `KVUG.ELF`); the K-for-kernel prefix is simply wrong for an EL0 app that draws its own pid and a frame
+  counter. This arc is the exact reverse sweep of that half: `crates/user-kvug` → **`crates/user-stat`**,
+  `KVUG.ELF` → **`STAT.ELF`**, `user-kvug.ld` → `user-stat.ld`, through `arroyo`'s build and staging
+  stanzas, the FAT staging name, `BGRUN-ST`'s persistence leg (which loads `/fat/STAT.ELF` by name), and
+  the docs here and in `08_VIDEO/engine.md`. The `VUG.ELF` half of that arc is untouched.
+  - **The serial witness tags are unchanged, for the same reason they were unchanged then**: `STAT:`,
+    `BGRUN-ST:`, `UVUG:` and friends name arcs and witnesses, not files, so `pi4-regression.spec` needed
+    **no pattern change** — only the file names inside its comments.
 - **EXEC1-M** — the **late-publish window** in `run_user_image`, and the end of the metal-only
   `EXEC1` failure. On every real Pi 4 boot (P55b, P56) the run-path witness reported
   `:: EXEC1: run /fat/ELFHELLO.ELF — EL0 program did not exit in time -> FAIL ::`, while QEMU raspi4b

@@ -1189,7 +1189,7 @@ What QEMU therefore cannot exercise is the sprite itself: the first draw, the sa
 
 ### FOCUS-VIS — focus you can SEE, and a shell you can read
 
-P59 (bench, 2026-07-25) put two backgrounded windows on the panel — the UVUG crystal and `KVUG.ELF` —
+P59 (bench, 2026-07-25) put two backgrounded windows on the panel — the UVUG crystal and `STAT.ELF` —
 and produced two observations that turn out to be one defect:
 
 1. **TAB provably cycled focus and the panel never moved.** `[wc-c] focus tab-cycle 0->1->2->0 (ring of
@@ -1371,13 +1371,14 @@ checksums are untouched.
 run ever changes focus, so no QEMU run ever draws the highlight. The gate proves the change is *inert*
 where it should be inert (59/59, every checksum unchanged); the highlight itself is **bench-only** and
 unverified. The bench test is the FOCUS-VIS recipe with one addition: `bg /fat/VUG.ELF` → `bg
-/fat/KVUG.ELF` → TAB, and at each stop the front window's border and title strip must be visibly
+/fat/STAT.ELF` → TAB, and at each stop the front window's border and title strip must be visibly
 brighter than the other's, with **neither** highlighted at the shell stop.
 
-#### VUG/KVUG gate results (2026-07-25, QEMU raspi4b @ `UNAOS_FBW=1920 UNAOS_FBH=1200`)
+#### VUG/STAT gate results (2026-07-25, QEMU raspi4b @ `UNAOS_FBW=1920 UNAOS_FBH=1200`)
 
-`./arroyo check` green both arches · `kernel8` builds clean, staging `VUG.ELF` (12568 B) and `KVUG.ELF`
-(8472 B) under their new names · `kernel8-test 60` **59/59 required, 0 forbidden** (unchanged — this arc
+`./arroyo check` green both arches · `kernel8` builds clean, staging `VUG.ELF` (12568 B) and `STAT.ELF`
+(8472 B) under their new names (the persistence app was `KVUG.ELF` at that arc; STAT-NAME later restored
+`STAT.ELF`, byte-identical at 8472 B) · `kernel8-test 60` **59/59 required, 0 forbidden** (unchanged — this arc
 adds no spec pattern and renames none) · `./arroyo test-arm` reaches
 `>>> MISSION SUCCESS (BOT + CSW). TARGET ACQUIRED. <<<`.
 

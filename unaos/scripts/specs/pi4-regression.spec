@@ -1,7 +1,7 @@
 # pi4-regression.spec — the Pi 4 kernel8 chain.
 #   QEMU gate:  ./arroyo kernel8-test 60   → unaos/target/serial-pi.log
 #     35 -> 60 at BGRUN-2. The old 35 s was ~10% of headroom over the chain and the margin was
-#     MACHINE-DEPENDENT, not fixed: BGRUN-2's leg-3 dwell (2 s, plus KVUG.ELF's yield-amplified cost
+#     MACHINE-DEPENDENT, not fixed: BGRUN-2's leg-3 dwell (2 s, plus STAT.ELF's yield-amplified cost
 #     while QEMU's degraded SYS_SLEEP_MS makes it spin) tipped slower hosts past the end, dropping the
 #     twelve witnesses that print LAST (K8b-snap, K8c-snapread, K6-migrate, all BANDY-*) — a truncation
 #     that reads as a regression in arcs nobody touched. Measured on the arc branch: 24 s and 27 s ->
@@ -264,14 +264,14 @@ FORBID \[wc-fv\] focus-vis .*-> FAIL
 # --- BGRUN-1: background EL0 runs (bg/jobs/kill). Headless-observable core of the contract,
 # ---   REQUIREd per the round-1 lens: leg 1 proves spawn->exit->reap (the sole-reaper contract);
 # ---   leg 2 proves a killed bg row settles (confirmed-kill reaps in place; no leaked PRUNNING row
-# ---   lying "running" under a dead task); leg 3 (BGRUN-2) proves PERSISTENCE — KVUG.ELF, an EL0
+# ---   lying "running" under a dead task); leg 3 (BGRUN-2) proves PERSISTENCE — STAT.ELF, an EL0
 # ---   window app with no exit condition, is still `Running` after a 2 s dwell and then settles when
 # ---   killed. Legs 1 and 2 structurally cannot prove that: ELFHELLO exits in three syscalls and UVUG
 # ---   exited after 300 auto frames, which is precisely why the bench could not test TAB before — a
 # ---   backgrounded UVUG was unfocused, never left its auto path, and was gone in seconds. The
 # ---   interactive half (TAB between two bg windows) is still bench-only — QEMU has no HID.
 # --- VUG-BG (this arc): a BACKGROUNDED VUG.ELF now persists as well, so leg 2's kill target no longer
-# ---   races its own exit. Leg 3 keeps the persistence proof regardless: KVUG.ELF has no exit condition
+# ---   races its own exit. Leg 3 keeps the persistence proof regardless: STAT.ELF has no exit condition
 # ---   AT ALL, focused or not, where VUG's persistence is conditional on the detached bit.
 REQUIRE BGRUN-ST: spawn->exit->reap PASS
 # --- BGRUN-SCAV: exited-but-unreaped rows must not deny a launch the machine can satisfy. MAX_PROCS+2

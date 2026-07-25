@@ -9260,7 +9260,7 @@ fn exec1_witness(_demo_cpu: usize) {
 ///     reads "running" forever). Either kill outcome is legal (`confirmed` reaps here; `already exited`
 ///     leaves a PEXITED row we then reap by poll) — what the witness REQUIREs is that the row is not
 ///     leaked and not lying.
-///  3. persistence + kill (BGRUN-2): `bg` KVUG.ELF — a windowed app with NO exit condition — dwell 2 s,
+///  3. persistence + kill (BGRUN-2): `bg` STAT.ELF — a windowed app with NO exit condition — dwell 2 s,
 ///     REQUIRE the row still reads `Running` (it did not batch-exit on unfocus and did not fault), then
 ///     kill it and require the row settles as in leg 2. This is the property the WC-TAB ring needs and
 ///     that legs 1 and 2 structurally cannot witness: both of their programs end by themselves.
@@ -9411,13 +9411,13 @@ fn bgrun_witness(_demo_cpu: usize) {
     // why the bench could not test TAB at all, because the backgrounded UVUG is unfocused, never leaves its
     // auto path, and is gone in seconds.
     //
-    // KVUG.ELF has no exit condition at all, so the leg is: spawn detached, let it run a real interval,
+    // STAT.ELF has no exit condition at all, so the leg is: spawn detached, let it run a real interval,
     // REQUIRE the row still reads Running (it did NOT batch-exit on unfocus, and it did not fault), then
     // kill it and require the row settles exactly as leg 2 does. The interval is timer-derived (2 s of
     // `cntpct`), comfortably longer than UVUG's whole 300-frame auto run — so "still running" here cannot
     // be confused with "has not got round to exiting yet".
-    let Some(stat) = read(&mt, "/fat/KVUG.ELF") else {
-        serial_println!(":: BGRUN-ST: /fat/KVUG.ELF not found — persistence leg skipped ::");
+    let Some(stat) = read(&mt, "/fat/STAT.ELF") else {
+        serial_println!(":: BGRUN-ST: /fat/STAT.ELF not found — persistence leg skipped ::");
         return;
     };
     match spawn_user_image_bg(&stat) {
