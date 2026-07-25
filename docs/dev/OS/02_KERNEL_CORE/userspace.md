@@ -521,10 +521,10 @@
   position-independent (relocation-model=static → adrp/add, **zero relocations** in the linked image; verified)
   and fitting the 16 KiB window (12568-byte ELF, two PT_LOAD segments, per-segment W^X). QEMU-verified
   (`UNAOS_V3D=1 UNAOS_GENET=1 UNAOS_PIUSB=1 ./arroyo kernel8-test`, and again with `UNAOS_VUGPAR=1`; reproducible):
-  `:: UVUG: frames=300 threads=2 checksum=0x48221e4101db3924 ::` then `:: EXEC-UVUG: run /fat/UVUG.ELF — loaded
+  `:: UVUG: frames=300 threads=2 checksum=0x48221e4101db3924 ::` *(superseded by WC-C -> `0xe68285b85121ac7c`)* then `:: EXEC-UVUG: run /fat/UVUG.ELF — loaded
   12568 bytes, entry 0x270000, exit=0 -> PASS ::`, with the whole prior battery (CAPSTONE 6/6, EXEC1, ELF-2
   threads, ELF-3 fb, ELF-5/INPUT-WIRE input router+drain) byte-equivalent. The auto checksum is a NEW deterministic
-  value (0x48221e4101db3924, vs UVUG-1's gradient 0x0313e510f24daae5 — the rendered content changed from gradient
+  value (0x48221e4101db3924 *(superseded by WC-C -> `0xe68285b85121ac7c`)*, vs UVUG-1's gradient 0x0313e510f24daae5 — the rendered content changed from gradient
   to wireframe). **Metal is where the interactive path lights up:** at the panel, `run /fat/UVUG.ELF` now shows a
   rotating wireframe crystal (via the UVUG-2 present hook) that the operator drives with WASD/arrows/Q/E and the
   mouse, exiting on a click or ESC — the `:: UVUG: interactive exit=… ::` line is the metal-only witness. Lane:
@@ -537,7 +537,7 @@
   life**, and the FIRST input event AT ANY FRAME flips it to interactive permanently — cancelling the auto-tumble
   and the 300-frame cap and switching to held-state control. QEMU determinism is preserved automatically: raspi4b
   has no USB HID, so zero events ever arrive, the 300-frame auto path + FNV-1a checksum run identically, and the
-  witness is byte-for-byte the same (`:: UVUG: frames=300 threads=2 checksum=0x48221e4101db3924 ::`, reproducible
+  witness is byte-for-byte the same (`:: UVUG: frames=300 threads=2 checksum=0x48221e4101db3924 ::` *(superseded by WC-C -> `0xe68285b85121ac7c`)*, reproducible
   across `kernel8-test` and `UNAOS_VUGPAR=1`). Two new/changed witnesses: `:: UVUG: interactive takeover at frame
   <n> ::` prints at the switch (proving on metal that the input arrived and at which frame), and the exit line is
   unchanged (`:: UVUG: interactive exit=<key|click> frames=<n> ::`). Drag-rotate is retuned toward the kernel
@@ -564,7 +564,7 @@
   every real key takes — shell (`GUI_CHANNEL`), a kernel full-screen app's own `pump_and_poll` drain, AND an EL0
   app's per-process ring — with no per-path code. Newest key wins; releasing the repeating key stops it. QEMU
   raspi4b delivers no HID, so no key is ever held and no repeat is synthesised — the deterministic auto paths stay
-  byte-identical (`checksum=0x48221e4101db3924`, verified on `kernel8-test`). Lane: `arch/aarch64/syscall.rs`
+  byte-identical (`checksum=0x48221e4101db3924` *(superseded by WC-C -> `0xe68285b85121ac7c`)*, verified on `kernel8-test`). Lane: `arch/aarch64/syscall.rs`
   (`sys_input_poll` heartbeat) + `main.rs` (typematic + `[el0in]` witness) + this doc.
 - **UVUG-6 (this arc)** — the UVUG-5 typematic tracker observed Key/KeyUp edges as they were **drained out of**
   `EVENT_QUEUE`. `EventQueue::push` silently **drops** on a full 64-slot ring, so a `KeyUp` pushed while the
@@ -717,7 +717,7 @@
     counter: `MOUSE-1` advancing while `ptr=` is frozen puts the loss in the router/queue seam (this lane);
     both frozen while `key=` advances puts it on the pointer interrupt-IN endpoint (the driver lane).
   - Gates: `./arroyo check` green x86_64 + aarch64; `./arroyo kernel8` builds; `./arroyo kernel8-test` 46 PASS /
-    0 FAIL, UVUG batch `frames=300 checksum=0x48221e4101db3924 exit=0` **unchanged**, `:: uvug6: typematic … ::
+    0 FAIL, UVUG batch `frames=300 checksum=0x48221e4101db3924 exit=0` **unchanged** *(superseded by WC-C -> `0xe68285b85121ac7c`)*, `:: uvug6: typematic … ::
     PASS ::` still green (the evidence gate leaves all three selftest legs on their original verdicts). Lane:
     `crates/user-uvug/src/main.rs` + `pal.rs` (typematic liveness) + `arch/aarch64/syscall.rs`
     (`sys_input_poll` focus scope) + `main.rs` (shell-path witness) + this doc.
@@ -915,9 +915,14 @@
     point, so no app can withhold it) whenever two or more windows are in `wm::focus_ring`; it advances
     `EL0_INPUT_ACTIVE` to the next owner ASID in window-id order via `el0_input_set_active`, so the ring
     reset, the takeover-latch clear and the UVUG-8 cap all keep working per window. The matching KeyUp is
-    swallowed with it. Fewer than two windows: TAB is delivered as an ordinary key.
+    swallowed with it. Fewer than two windows: TAB is delivered as an ordinary key. The ring carries one
+    slot beyond the windows — **the shell** (focus 0) — so tabbing into a window is not a trap; it is a
+    one-way exit today, since with focus 0 the router never calls the seam (re-entering needs a
+    shell-side TAB binding in `main.rs`, out of lane).
   - Gates: `./arroyo check` green both arches; `./arroyo kernel8` builds (per-blob page assertions);
-    `./arroyo kernel8-test 120` MBENCH **46/46 required, 0 forbidden**;
+    `./arroyo kernel8-test 120` MBENCH **49/49 required, 0 forbidden** (three new
+    `pi4-regression.spec` directives pin the UVUG checksum, the `witness=0x1fff` ledger and the
+    side-by-side line — the contracts this arc changed were machine-checked nowhere);
     `:: EL0: window verbs — … witness=0x1fff … :: PASS ::` (the `el0-wcb` ledger widened 10 → 13 bits by
     the side-by-side leg); `:: EXEC-UVUG: … exit=0 -> PASS ::`; all four BANDY verdicts PASS.
     `target/pi-screen.png` **re-baselined by design** (the desktop repaint removes the WC-INT residue) —

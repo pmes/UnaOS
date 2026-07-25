@@ -10127,13 +10127,25 @@ pub fn el0_input_enqueue(ev: crate::pal::Event) -> bool {
 /// not reach any app's ring.
 ///
 /// Cycling means: take the compositor's focus ring (`video::wm::focus_ring` — the distinct owner ASIDs of
-/// the live windows, in window-id order), find where the current `EL0_INPUT_ACTIVE` sits in it, and hand
-/// focus to the next entry, wrapping. `el0_input_set_active` is the ONE way focus moves, so the tab-cycle
-/// inherits everything that already hangs off it: the incoming ring is reset, the interactive-takeover
-/// latch is cleared (the newly-focused app has consumed nothing yet, so its `run` deadline re-arms and the
-/// UVUG-8 cap keeps holding PER WINDOW), and the outgoing app simply stops receiving events.
+/// the live windows, in window-id order) PLUS one more slot for the SHELL (`EL0_INPUT_ACTIVE == 0`), find
+/// where the current focus sits, and hand focus to the next slot. `el0_input_set_active` is the ONE way
+/// focus moves, so the tab-cycle inherits everything that already hangs off it: the incoming ring is
+/// reset, the interactive-takeover latch is cleared (the newly-focused app has consumed nothing yet, so
+/// its `run` deadline re-arms and the UVUG-8 cap keeps holding PER WINDOW), and the outgoing app simply
+/// stops receiving events.
 ///
-/// Two deliberate consequences, neither hidden:
+/// **The shell slot is what makes this an exit and not a trap.** Cycling only over the live apps would be
+/// a closed loop: an operator who tabs into a window could never get the keyboard back, and the wedge
+/// watchdog would be the only way out of a perfectly healthy app. So "no app has focus" is a position in
+/// the rotation, not an absence.
+///
+/// HONEST ASYMMETRY, stated rather than papered over: this is a one-way exit today. Once focus is the
+/// shell, `route_input_to_active_el0` is not called at all (`main.rs` gates on
+/// `el0_input_active() != 0`), so no TAB reaches this function and the operator re-enters a window the
+/// way they entered the first one. Closing the loop needs a shell-side TAB binding in `main.rs`, which is
+/// outside this arc's lane.
+///
+/// Two further deliberate consequences, neither hidden:
 ///  * `el0_input_set_active` also drains `pal::EVENT_QUEUE`. We are called from inside the router's drain
 ///    loop, so anything typed BEHIND the Tab is discarded rather than delivered to the new focus. That is
 ///    the wanted semantics — those keystrokes were aimed at the window the operator was leaving — and it
@@ -10157,14 +10169,29 @@ fn wc_focus_key(ev: crate::pal::Event) -> bool {
     }
     let cur = EL0_INPUT_ACTIVE.load(Ordering::Acquire);
     let at = ring[..n].iter().position(|&a| a == cur);
-    // Unknown current focus (the focused app has no window of its own) -> start the rotation at the
-    // ring's head rather than refusing; the operator pressed a key and must see something happen.
-    let next = ring[at.map(|i| (i + 1) % n).unwrap_or(0)];
+    // The ring has n WINDOW slots plus ONE MORE: slot `n` is the SHELL (`EL0_INPUT_ACTIVE == 0`, no EL0
+    // target). Without it the cycle is a closed loop over the live apps and the keyboard can never be
+    // handed back — an operator who tabs into a window is stuck there until the app exits, with the
+    // wedge watchdog as the only other way out. That is a trap, not a window manager, so "no app has
+    // focus" is a first-class position in the rotation rather than an absence.
+    //
+    // Unknown current focus (the focused app owns no window of its own) -> start at the ring's head
+    // rather than refusing; the operator pressed a key and must see something happen.
+    let next = match at {
+        Some(i) if i + 1 == n => 0, // last window -> the shell
+        Some(i) => ring[i + 1],
+        None => ring[0],
+    };
     if next == cur {
         return true;
     }
     el0_input_set_active(next);
-    serial_println!("[wc-c] focus tab-cycle {} -> {} (ring of {})", cur, next, n);
+    serial_println!(
+        "[wc-c] focus tab-cycle {} -> {} (ring of {} + shell)",
+        cur,
+        next,
+        n
+    );
     true
 }
 

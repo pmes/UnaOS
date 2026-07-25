@@ -196,3 +196,24 @@ FORBID BANDY-GRANT:.*FAIL
 # NOTE (bench operators): these five are now hard REQUIREs. On a rare no-card / hub-MSC-vid=0000
 # boot the card-dependent selftests won't emit — re-seat the data card and re-boot (that IS the
 # recovery); don't demote the spec. The 3-of-4-core CAPSTONE variance is separate (see the header).
+
+# --- WC-C window-compositor contracts (uncounted, QEMU + metal) --------------------------------
+# --- The WC-C arc changed three things that nothing else machine-checks. Pinned here so a
+# --- regression is a spec miss rather than an eyeball miss.
+#
+# --- 1. UVUG's 300-frame auto checksum. It is a pure function of the final surface, so it is the
+# ---    tightest available assertion that the WINDOWED 128x128 render still produces the exact
+# ---    pixels it did when the arc landed. WC-C deliberately superseded the pre-WC-C 32x32 value
+# ---    0x48221e4101db3924 (see userspace.md); this is the current one.
+REQUIRE UVUG: frames=300 threads=2 checksum=0xe68285b85121ac7c
+#
+# --- 2. The el0-wcb window-verb ledger, ALL THIRTEEN bits. The literal mask matters: a partial
+# ---    mask still prints `witness=0x...` and the verdict already refuses it, but pinning 0x1fff
+# ---    here means a silently NARROWED ledger (bits removed from the fixture) also fails.
+REQUIRE EL0: window verbs.*witness=0x1fff.*PASS
+#
+# --- 3. The side-by-side composite. This is the arc's actual claim — two windows drawn in ONE
+# ---    compositor pass — and it is the line that gates the per-window checksum lines that follow
+# ---    it. Without this REQUIRE a fixture whose second window presented BLANK would still pass
+# ---    every other directive, because nothing else reads those checksums.
+REQUIRE \[wc-c\] side-by-side windows=2 drawn=2

@@ -693,6 +693,14 @@ matching KeyUp is swallowed on the same predicate (a lone release edge for a pre
 exactly the shape UVUG-6 removed from the typematic path). With fewer than two windows in the ring the
 key falls through as an ordinary TAB.
 
+The ring carries **one slot beyond the windows: the shell** (`EL0_INPUT_ACTIVE == 0`). Without it the
+cycle is a closed loop over the live apps — an operator who tabs into a window can never get the keyboard
+back, and the wedge watchdog becomes the only exit from a perfectly healthy app. So "no app has focus" is
+a position in the rotation, not an absence. **Honest asymmetry:** it is a one-way exit today. Once focus
+is the shell, `route_input_to_active_el0` is not called at all (`main.rs` gates on
+`el0_input_active() != 0`), so no TAB reaches the seam and the operator re-enters a window the way they
+entered the first one. Closing the loop needs a shell-side TAB binding in `main.rs` — outside this lane.
+
 #### The side-by-side witness
 
 The arc's claim is two windows composited together. A screenshot shows that to a human and proves
@@ -721,7 +729,9 @@ programs at once is a scheduler question, not a compositor one, and is left to a
 #### WC-C gate results (2026-07-24, QEMU raspi4b)
 
 `./arroyo check` green both arches · `kernel8` builds (midden 3792 B ≤ 4096) · `kernel8-test 120`
-MBENCH **46/46 required, 0 forbidden** · `:: EL0: window verbs — … witness=0x1fff … :: PASS ::` ·
+MBENCH **49/49 required, 0 forbidden** (the arc adds three `pi4-regression.spec` directives — the UVUG
+checksum, the `witness=0x1fff` ledger, and the side-by-side line, which is what gates the per-window
+checksums below it) · `:: EL0: window verbs — … witness=0x1fff … :: PASS ::` ·
 `:: EXEC-UVUG: … exit=0 -> PASS ::` · all four BANDY verdicts PASS.
 
 `target/pi-screen.png` is **re-baselined by design** — the WC-INT residue this arc removes was the whole
