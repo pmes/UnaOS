@@ -58,8 +58,11 @@ pub fn clean_range(addr: usize, len: usize) {
 /// use the buffer was `clean_range`d before the GPU ran and untouched by the CPU since, so its
 /// lines are clean). When in doubt use [`clean_invalidate_range`].
 ///
-/// Currently unused — the mailbox path uses `clean_invalidate_range` for the always-safe variant —
-/// but kept to complete the clean/invalidate/clean+invalidate trio for future DMA drivers.
+/// WC-D uses this deliberately, and the discard is the POINT rather than a hazard to be avoided: the
+/// compositor's scan-out verification must read what is actually in RAM, so it invalidates without
+/// cleaning. A `clean_invalidate_range` there would write the CPU's dirty lines back first and thereby
+/// repair a missing/short framebuffer flush before measuring it — the instrument would heal the defect it
+/// exists to detect. `video::wm::verify_window` redraws the window afterwards to restore the rect.
 #[allow(dead_code)]
 #[inline]
 pub fn invalidate_range(addr: usize, len: usize) {

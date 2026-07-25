@@ -220,10 +220,14 @@ REQUIRE \[wc-c\] side-by-side windows=2 drawn=2
 #
 # --- 4. WC-D: the SCAN-OUT VERDICT. Every directive above this one checks a number the kernel
 # ---    computed about a surface; none of them looks at the panel. This one re-derives the window's
-# ---    destination pixels from the source surface and reads the scan-out buffer back — twice, once
-# ---    from cache and once from RAM after a clean+invalidate — so `bad_cache=0 bad_ram=0` says the
-# ---    blit is right AND the pixels reached the memory the HVS scans. The FORBID below is the half
-# ---    that has teeth: a FAIL verdict fails the gate wherever it appears, on any window.
+# ---    destination pixels from the source surface and reads the scan-out buffer back.
+# ---    `bad_cache=0` is the half this GATE earns: the blit's stride/pitch arithmetic, upscale
+# ---    indexing, colour encoding and clipping are right. `bad_ram` is read after a bare DC IVAC
+# ---    (invalidate, NO write-back) and reports whether the pixels reached the memory the HVS scans
+# ---    — it is only MEANINGFUL ON METAL, because QEMU does not model the non-coherent scan-out.
+# ---    Flush EXTENT is excluded by inspection, not by this directive: draw_window flushes whole
+# ---    scanlines over the outer_box, a strict superset of the blitted pixels.
+# ---    The FORBID is the half with teeth: a FAIL verdict fails the gate wherever it appears.
 # ---    NOTE: the QEMU panel is 640x480 and the bench Pi drives 1920x1200, and the compositor's
 # ---    upscale is a FUNCTION of the panel — so this gate exercises scale 1x/3x/13x while the bench
 # ---    runs 4x. Run `UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test` to reproduce the bench

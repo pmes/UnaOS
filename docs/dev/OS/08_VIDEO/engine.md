@@ -784,22 +784,61 @@ scan-out buffer **twice**:
 
 | verdict | meaning |
 |---|---|
-| `bad_cache=0 bad_ram=0` | the window on the panel is what the app drew |
-| `bad_cache=0 bad_ram>0` | the blit is correct and the **flush** is the defect — cache-maintenance extent or coherency |
+| `bad_cache=0` | the compositor computed the right pixels — stride/pitch arithmetic, upscale indexing, colour encoding, clipping |
 | `bad_cache>0` | the **blit** is wrong, or another painter overwrote the rect mid-composite; `first=` names the pixel |
+| `bad_ram>0` | the pixels did not reach the memory the HVS scans — a cache-maintenance defect |
 
-The second pass follows a `clean_invalidate_range` over the same rows, so its reads miss every line the blit
-dirtied and come from the RAM the HVS scans. Clean+invalidate, never a bare invalidate — a bare `DC IVAC`
-would discard the pixels under test and make the instrument the defect. One-shot per window id (the latch is
-cleared in `create_inner`, since ids are recycled slot aliases and a new window deserves its own verdict);
-`witness`-gated, because a 128×128 surface at 4× is 262144 comparisons per pass.
+The line also carries `cksum=` (the `[wc-c]` FNV over the source slot) and `nonzero=` (destination pixels that
+are not black), so a blank surface faithfully blitted onto a blank rect is distinguishable from a verified
+crystal instead of reading as an equally green PASS. `first=none` is printed on a clean verdict, so a real
+black-on-black mismatch at the origin cannot hide behind an all-zero placeholder. A window refused by a
+guard emits `-> SKIP` with its reason rather than silently consuming its one-shot latch.
 
-**What this established, and what it did not.** At the bench's exact geometry — `panel=1920x1200`,
+**`bad_ram` uses a bare `DC IVAC`, and that is load-bearing.** The first cut of this witness used
+`DC CIVAC`. It was wrong in exactly the way that mattered: `CIVAC` writes dirty lines back before
+invalidating, so had `draw_window`'s trailing `flush_range` been missing or short, the witness would have
+cleaned those very lines to RAM and then read the repaired result — printing `bad_ram=0` for a panel that
+garbles. The falsifier is concrete: delete the `flush_range` call and the `CIVAC` form still passes. A bare
+`IVAC` discards un-cleaned lines instead, so a short flush surfaces as stale RAM.
+
+**The falsifier was run, and it is INCONCLUSIVE off-metal — say so.** The `flush_range` call in
+`draw_window` was deleted and the gate re-run at forced bench geometry; the verdict stayed
+`bad_cache=0 bad_ram=0 -> PASS`. That is **not** evidence the instrument is broken — it is evidence that
+QEMU raspi4b does not model a non-coherent framebuffer at all, so CPU stores reach guest memory whether or
+not `DC CVAC` ran, and `bad_ram` has nothing to detect. The consequence is worth stating plainly: **the
+`bad_ram` column is unvalidated in BOTH directions off-metal.** Its correctness rests on the primitive being
+right by inspection (`IVAC` discards, `CIVAC` would have repaired), not on a passing gate. The next bench
+boot is its first real exercise, and a `bad_ram=0` there is the first datum that means anything.
+
+> **Hazard — an instrumented build is not a neutral observer.** `IVAC` discards anything dirty-and-unclean
+> in those full scanlines, which in a correct build is nothing (`draw_window` just cleaned a strict superset)
+> but in a broken one can drop pixels, including console pixels sharing the edge cache lines.
+> `verify_window` therefore redraws and re-flushes the window before returning. Consequence: in the presence
+> of a flush defect a `witness` build can differ visibly from a default build, in either direction. Do not
+> read a witness build's panel as evidence about a default build's panel.
+
+**What the gate established, and what it did not.** At the bench's exact geometry — `panel=1920x1200`,
 `surf=128x128 scale=4x at (9,21)`, matching the P56 log line for line — the verdict is
-`checked=262144 bad_cache=0 bad_ram=0 -> PASS`. The scaled blit, the stride/pitch relationship, the pixel
-format and the flush extent are therefore **excluded** as causes of the P56 garble; they are correct at the
-geometry that garbled. What QEMU cannot decide is the part that only real caches and a real HVS exercise, and
-that is precisely what the `bad_ram` column answers in one line on the next bench boot.
+`checked=262144 bad_cache=0 bad_ram=0 -> PASS`. What that **earns** is the `bad_cache` half: the scaled
+blit's indexing, the stride/pitch arithmetic and the pixel format are correct at the geometry that garbled,
+so those three suspect classes are excluded. `bad_ram` passing on QEMU earns nothing about metal — QEMU does
+not model the Pi's non-coherent scan-out, so that column is only meaningful on the bench, which is precisely
+what it is there to report.
+
+**Flush extent is excluded by inspection, not by `bad_ram`.** `draw_window` flushes rows
+`[by, by+bh)` of the window's `outer_box`, which spans the title strip and both borders, and `flush_range`
+works in whole scanlines at the panel's full stride — a strict superset of every pixel the blit touched.
+That argument, not the QEMU verdict, is what rules the extent out.
+
+**Scope of the pitch claim.** Verified against the firmware-reported pitch of 7680 B for a 1920-wide,
+4-bytes-per-pixel panel — i.e. pitch == width × bpp with no padding. A bench panel whose firmware returns a
+*padded* pitch is not covered by this run; `put_pixel` and `flush_range` both derive from `info.stride`, so
+the arithmetic is expected to hold, but it is untested at a padded pitch.
+
+**One thing the rect is not guarded against.** `composite` copies the `FrameBuffer` handle and releases the
+window-table lock before drawing, so nothing prevents another core's painter (the console, the render task)
+from writing into the rect between the blit and the verification. Such an overwrite is reported as
+`bad_cache>0` and is indistinguishable from a genuine blit defect; `first=` is the disambiguator to reach for.
 
 The boot-time "indecipherable" auto-launch surfaces are a **separate, cosmetic** matter and not this defect:
 `wm::place`'s scale rule maximises legibility, so midden's 24×16 surface lands at `scale=37x` on a 1920×1200

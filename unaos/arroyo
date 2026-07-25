@@ -53,6 +53,15 @@ NIGHTLY_FLAGS="-Z build-std=core,compiler_builtins,alloc -Z build-std-features=c
 # usb-serial device (VID 0403 PID 6001) whose chardev is target/ftdi.log, so the x86 kernel's U2.5
 # FTDI console driver enumerates it and replays the boot log out the (emulated) cable. `is_ok()`
 # semantics — an EMPTY value counts as SET.
+#
+# WC-D: UNAOS_FBW / UNAOS_FBH are a PANEL-GEOMETRY OVERRIDE, not a cargo feature — they are read with
+# `option_env!` by arch/aarch64/mailbox.rs and replace the firmware-queried display mode (default unset =>
+# query the firmware, unchanged). They exist because QEMU raspi4b reports 640x480 while the bench Pi drives
+# 1920x1200, and the window compositor derives each window's integer upscale FROM the panel: the same
+# 128x128 window is scale 1 on the gate and scale 4 on the bench, so the gate cannot reach the bench's blit
+# path at all. `UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test` reproduces bench geometry, and is the
+# configuration the WC-D `[wc-d] verify` verdict was cleared in. NOTE these change compiled-in behaviour:
+# a build made with them is NOT the flashable default image.
 KERNEL_FEATURES=""
 _feats=""
 # DEFAULT-QUIET: UNAOS_WITNESS=1 arms the `witness` fixture-battery feature (auto-set above for the battery

@@ -676,54 +676,63 @@ pub fn composite() {
 
 /// WC-D — the SCALED-BLIT / SCAN-OUT VERDICT. One line per window, once, from inside the composite that
 /// drew it: re-derive every destination pixel of the window's content rect from the SOURCE surface and
-/// compare it against what is actually in the scan-out buffer, AFTER the cache clean.
+/// compare it against what is actually in the scan-out buffer.
 ///
 /// Why a read-back and not another checksum. `[wc-c]`'s checksum hashes the surface — the bytes the app
 /// wrote — so it answers "did the app draw?" and nothing else. Every failure mode between that surface and
 /// the panel is invisible to it: a stride or index error in the upscale, a `put_pixel` colour-order
-/// mismatch, a flush whose extent misses rows the blit touched. Those are precisely the bugs that show up
-/// as garble on a panel and as nothing at all in a serial log, and the compositor is the only place that
-/// knows both sides of the comparison.
+/// mismatch, a clip that drops columns. Those show up as garble on a panel and as nothing at all in a
+/// serial log, and the compositor is the only place that knows both sides of the comparison.
 ///
-/// **The cache step is the point on the Pi 4.** `flush_range` cleans the touched rows to the PoC because the
-/// HVS scan-out is not coherent with the CPU's caches. A plain read-back after that would hit those same
-/// dirty-then-clean lines and agree with the blit no matter what reached RAM — it would verify arithmetic
-/// and silently pass a broken flush. So on aarch64 the content rows are CLEAN+INVALIDATEd first (the safe
-/// superset — dirty lines are written back, never discarded), which forces every comparison read to re-fetch
-/// from the RAM the HVS reads. A PASS here therefore means: the pixels are correct AND they are in memory,
-/// not merely in a cache. That is the one-line metal verdict.
+/// ### The two passes, and what each one is ALLOWED to conclude
+/// * **`bad_cache`** — read straight after the blit, so it sees the CPU's own (possibly still dirty) lines.
+///   This is the honest verdict on the BLIT: stride/pitch arithmetic, upscale indexing, colour encoding,
+///   clipping. Everything WC-D actually earns about the compositor's arithmetic is earned here.
+/// * **`bad_ram`** — read after a bare **`DC IVAC`** (invalidate, NO write-back) over the same rows, so
+///   every line is re-fetched from the memory the HVS scans. This is the verdict on whether the pixels
+///   REACHED that memory.
 ///
-/// One-shot per window id and `witness`-gated: this walks the whole content rect (a 128x128 surface at 4x is
-/// 262144 comparisons) from present context, which is a per-frame cost nothing should pay twice.
+/// **The invalidate must not clean.** The first cut of this witness used `DC CIVAC`, and it was wrong in
+/// the exact way that mattered: `CIVAC` writes dirty lines back before invalidating them, so if
+/// `draw_window`'s trailing `flush_range` were missing or short, the witness would clean those very lines
+/// to RAM and then read the repaired result — the instrument would heal the defect it claims to measure,
+/// and print `bad_ram=0` for a panel that garbles. The falsifier is concrete: delete the `flush_range`
+/// call, and the CIVAC form still passes. A bare `IVAC` DISCARDS un-cleaned lines instead, so a short
+/// flush surfaces as stale RAM and `bad_ram > 0` — which is the whole point.
+///
+/// **Consequence, accepted deliberately.** `IVAC` over these rows discards anything in them that was
+/// dirty-and-unclean, which in a correct build is nothing (`draw_window` just cleaned a strict superset of
+/// them). In a BROKEN build it can drop pixels — including console pixels sharing the edge cache lines of
+/// these full scanlines. That is why this function REDRAWS the window afterwards: the rect is restored and
+/// re-flushed before returning. The residue is bounded, `witness`-gated, and strictly preferable to an
+/// instrument that lies. See the hazard note in `engine.md` §WC-D: a witness build can therefore look
+/// DIFFERENT from a default build in the presence of a flush defect, in both directions.
+///
+/// One-shot per window id and `witness`-gated: this walks the content rect twice (a 128x128 surface at 4x
+/// is 262144 comparisons per pass) from present context — a cost nothing should pay per frame.
+///
+/// A guarded-out window still EMITS — a `-> SKIP` line naming the reason — so the one-shot latch is never
+/// burned silently. A gate whose REQUIRE fails then has a line saying why, instead of nothing at all.
 #[cfg(feature = "witness")]
 fn verify_window(fb: &super::FrameBuffer, r: &Window) {
     let info = fb.info();
     if r.surf == 0 || r.scale == 0 || r.stride < 4 || r.x >= info.width || r.y >= info.height {
+        serial_println!("[wc-d] verify win={} -> SKIP (degenerate row/geometry)", r.id);
         return;
     }
     // The same bounds `draw_window` blitted under — verify exactly what was drawn, never more.
     let cols = (info.width - r.x).div_ceil(r.scale).min(r.w).min(r.stride / 4);
     let rows = (info.height - r.y).div_ceil(r.scale).min(r.h).min(r.surf_len / r.stride);
     if cols == 0 || rows == 0 {
+        serial_println!("[wc-d] verify win={} -> SKIP (no visible content rect)", r.id);
         return;
     }
 
-    // TWO passes over the same rect, and the pair is what makes the verdict decisive rather than merely
-    // alarming. `cache` is read straight after the blit, so it sees the CPU's own dirty lines: it answers
-    // "did the compositor compute the right pixels?" — stride, upscale indexing, colour encoding, clipping.
-    // `ram` is read after a CLEAN+INVALIDATE of the same rows, so every line is re-fetched from the memory
-    // the HVS scans: it answers "did those pixels reach the scan-out?". The two together separate the only
-    // hypotheses a serial log otherwise cannot tell apart:
-    //   cache=0 ram=0    the window on the panel is what the app drew.
-    //   cache=0 ram>0    the blit is right and the FLUSH is the defect — cache-maintenance extent/coherency.
-    //   cache>0          the BLIT itself is wrong (or another painter overwrote the rect mid-composite);
-    //                    `first` names the pixel, and ram's count says whether it also reached memory.
-    // On a coherent target both passes read the same bytes and the second is redundant — deliberately so:
-    // the instrument must be the SAME instrument on the gate and on the bench.
-    let mut pass = |fb: &super::FrameBuffer| {
+    let pass = |fb: &super::FrameBuffer| {
         let surf = r.surf as *const u8;
         let mut checked = 0usize;
         let mut bad = 0usize;
+        let mut nonzero = 0usize;
         let mut first = (0usize, 0usize, 0u32, 0u32);
         for row in 0..rows {
             let row_base = row * r.stride;
@@ -743,6 +752,9 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window) {
                             None => continue,
                         };
                         checked += 1;
+                        if got != 0 {
+                            nonzero += 1;
+                        }
                         if got != want {
                             if bad == 0 {
                                 first = (dx, dy, got, want);
@@ -753,39 +765,55 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window) {
                 }
             }
         }
-        (checked, bad, first)
+        (checked, bad, nonzero, first)
     };
 
-    let (checked, bad_cache, first_cache) = pass(fb);
+    let (checked, bad_cache, nonzero, first_cache) = pass(fb);
 
-    // Force the second pass to miss every line the blit dirtied, so it reads the RAM the scan-out reads.
-    // CLEAN+invalidate, never a bare invalidate: a bare `DC IVAC` would DISCARD the pixels we are trying to
-    // verify and turn the instrument into the defect.
+    // Discard, never clean — see the doc comment. Bare `IVAC` is what makes `bad_ram` able to fail.
     #[cfg(target_arch = "aarch64")]
     {
         let row_bytes = info.stride * info.bytes_per_pixel;
         let y0 = r.y;
         let y1 = (r.y + rows * r.scale).min(info.height);
         if y1 > y0 {
-            crate::arch::cache::clean_invalidate_range(
+            crate::arch::cache::invalidate_range(
                 fb.base_addr() + y0 * row_bytes,
                 (y1 - y0) * row_bytes,
             );
         }
     }
 
-    let (_, bad_ram, first_ram) = pass(fb);
+    let (_, bad_ram, _, first_ram) = pass(fb);
+    let ok = bad_cache == 0 && bad_ram == 0;
     let first = if bad_cache > 0 { first_cache } else { first_ram };
-    serial_println!(
-        "[wc-d] verify win={} surf={}x{} scale={}x at ({},{}) panel={}x{} checked={} bad_cache={} bad_ram={} first=({},{}) got={:#08x} want={:#08x} -> {}",
-        r.id, r.w, r.h, r.scale, r.x, r.y, info.width, info.height,
-        checked, bad_cache, bad_ram, first.0, first.1, first.2, first.3,
-        if bad_cache == 0 && bad_ram == 0 { "PASS" } else { "FAIL" }
-    );
+    // `cksum` is the `[wc-c]` FNV over the SOURCE slot, carried here so a verdict is content-aware: without
+    // it a blank surface blitted faithfully onto a blank rect is a PASS indistinguishable from a verified
+    // crystal. `nonzero` is the same question asked of the DESTINATION.
+    if ok {
+        serial_println!(
+            "[wc-d] verify win={} surf={}x{} scale={}x at ({},{}) panel={}x{} checked={} bad_cache=0 bad_ram=0 nonzero={} cksum={:#018x} first=none -> PASS",
+            r.id, r.w, r.h, r.scale, r.x, r.y, info.width, info.height,
+            checked, nonzero, surface_checksum(r)
+        );
+    } else {
+        serial_println!(
+            "[wc-d] verify win={} surf={}x{} scale={}x at ({},{}) panel={}x{} checked={} bad_cache={} bad_ram={} nonzero={} cksum={:#018x} first=({},{}) got={:#08x} want={:#08x} -> FAIL",
+            r.id, r.w, r.h, r.scale, r.x, r.y, info.width, info.height,
+            checked, bad_cache, bad_ram, nonzero, surface_checksum(r),
+            first.0, first.1, first.2, first.3
+        );
+    }
+
+    // Restore what the `IVAC` may have dropped: redraw the window and re-run its flush. In a correct build
+    // this is a no-op repaint; in a broken one it is what keeps the diagnostic from being destructive.
+    draw_window(fb, r);
 }
 
 /// WC-D — window ids whose [`verify_window`] verdict has already been emitted (bit `id`), so the read-back
-/// runs once per window rather than once per frame.
+/// runs once per window rather than once per frame. Set only AFTER a verdict was actually printed — a
+/// guarded-out window that burned its latch would leave the gate's REQUIRE failing with no line to explain
+/// why.
 #[cfg(feature = "witness")]
 static VERIFIED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 

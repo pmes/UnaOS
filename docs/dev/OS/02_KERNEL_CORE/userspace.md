@@ -966,19 +966,33 @@
   - **`[wc-d] verify` — a panel verdict, not another surface checksum.** `[wc-c]`'s checksum hashes the
     surface an app wrote, so it can only say the app drew; it is blind to every defect between that surface
     and the scan-out. `wm::verify_window` re-derives each destination pixel of a window's content rect from
-    the source and reads the framebuffer back **twice** — once from cache, then again after a
-    clean+invalidate so the reads come from the RAM the HVS scans. `bad_cache` isolates the blit (stride,
-    upscale indexing, colour encoding, clipping); `bad_ram` isolates the cache flush. One-shot per window,
-    `witness`-gated, and pinned in `pi4-regression.spec` as a REQUIRE plus a `-> FAIL` FORBID.
+    the source and reads the framebuffer back **twice**. `bad_cache` is the verdict on the BLIT (stride,
+    upscale indexing, colour encoding, clipping). `bad_ram` is read after a bare `DC IVAC` — invalidate
+    without write-back — so it reports whether those pixels reached the memory the HVS scans; a
+    clean+invalidate there would repair a short flush before measuring it. The line also carries `cksum=`
+    and `nonzero=` so a blank-but-faithful PASS is distinguishable from a verified crystal, and a
+    guarded-out window emits `-> SKIP` rather than silently burning its one-shot latch. Pinned in
+    `pi4-regression.spec` as a REQUIRE plus a `-> FAIL` FORBID.
   - **`UNAOS_FBW` / `UNAOS_FBH` — force the panel geometry.** QEMU raspi4b is 640×480 and the bench Pi is
     1920×1200, and `wm::place` derives a window's integer upscale FROM the panel: the same 128×128 window
     is scale **1** on the gate and scale **4** on the bench. The gate could not reach the bench's blit path
     at all. These compile-time knobs (default off — the firmware mode is queried, unchanged) override the
     mailbox request so `UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test` reproduces bench geometry.
-  - **What it settled.** At the bench's exact geometry the verdict is `checked=262144 bad_cache=0
-    bad_ram=0 -> PASS`, so stride/pitch, scale-blit indexing, pixel format and flush extent are *excluded*
-    as causes of the P56 garble. The remaining suspect is the part only real caches and a real HVS
-    exercise, and `bad_ram` reports it in one line on the next bench boot.
+  - **What it settled — and what it did not.** At the bench's exact geometry the verdict is
+    `checked=262144 bad_cache=0 bad_ram=0 -> PASS`. The `bad_cache` half **earns** the exclusion of
+    scale-blit indexing, stride/pitch arithmetic and pixel format as causes of the P56 garble. `bad_ram`
+    passing under QEMU earns nothing about metal — QEMU does not model the non-coherent scan-out — so
+    coherency remains the live suspect, and that column is what reports it in one line on the next bench
+    boot. Flush *extent* is excluded separately, by inspection: `draw_window` flushes whole scanlines over
+    the `outer_box`, a strict superset of the blitted pixels.
+  - **`bad_ram` is unvalidated off-metal, in both directions.** The falsifier (delete `draw_window`'s
+    `flush_range`, re-run at bench geometry) still reports PASS under QEMU — because QEMU raspi4b does not
+    model a non-coherent framebuffer, so there is nothing for `bad_ram` to detect. Its correctness rests on
+    the primitive being right by inspection, not on a green gate; the next bench boot is its first real
+    exercise.
+  - **Hazard: a `witness` build is not a neutral observer.** The `IVAC` can drop un-flushed pixels, so
+    `verify_window` redraws the window afterwards. In the presence of a flush defect an instrumented
+    build's panel can differ from a default build's, in either direction.
 
 - **WC-C (window compositor, clients + focus)** — the arc where real EL0 programs use the window verbs.
   Full write-up: `docs/dev/OS/08_VIDEO/engine.md` §8 "WC-C". Userspace-visible changes:
