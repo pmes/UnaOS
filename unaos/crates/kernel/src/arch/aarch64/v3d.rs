@@ -87,6 +87,53 @@ const V3D_HUB_IDENT1: usize = 0x000C;
 const V3D_HUB_IDENT2: usize = 0x0010;
 const V3D_HUB_IDENT3: usize = 0x0014;
 
+// PI-V3D-61: the HUB_IDENT1 field map, corrected. Up to V3D-60 this file read the technology version
+// as the TOP BYTE of HUB_IDENT1 and compared it against the literal `0x42` — both halves of that were
+// wrong, and the metal reading (HUB_IDENT1=0x000e1124 -> "raw=0x00, expects 0x42") was a decode
+// artifact, not a silicon mismatch. The mainline driver's field map for this register puts the
+// identity in the LOW half-word, in four-bit fields, and derives its single version NUMBER as
+// `tver * 10 + rev` — a DECIMAL composition, so "V3D 4.2" is the number **42**, never the hex byte
+// 0x42. Field positions restated in our own words from `v3d_regs.h`'s HUB_IDENT1 masks; the shifts
+// below are corroborated by the bench word itself (see v3d.md §35): 0x000e1124 decodes to tver=4,
+// rev=2 (=> 4.2, the generation every packet encoding in this file targets), ncores=1, nhosts=1, and
+// the three feature bits TFU/TSY/MSO set with L3C clear — a coherent single-core 4.2 configuration,
+// where the old decode produced the incoherent "version 0x00, 4 cores".
+const V3D_HUB_IDENT1_TVER_SHIFT: u32 = 0; // bits 3:0 — technology version, MAJOR
+const V3D_HUB_IDENT1_REV_SHIFT: u32 = 4; // bits 7:4 — technology revision, MINOR
+const V3D_HUB_IDENT1_NCORES_SHIFT: u32 = 8; // bits 11:8 — number of V3D cores behind this hub
+const V3D_HUB_IDENT1_NHOSTS_SHIFT: u32 = 12; // bits 15:12 — number of host interfaces
+const V3D_HUB_IDENT1_NIB_MASK: u32 = 0xF; // every field above is one nibble wide
+const V3D_HUB_IDENT1_WITH_L3C: u32 = 1 << 16;
+const V3D_HUB_IDENT1_WITH_TFU: u32 = 1 << 17;
+const V3D_HUB_IDENT1_WITH_TSY: u32 = 1 << 18;
+const V3D_HUB_IDENT1_WITH_MSO: u32 = 1 << 19;
+/// The generation this driver's CL packing, QPU word encoding and register map were audited against,
+/// in the mainline `tver * 10 + rev` composition: V3D 4.2 == 42 (decimal).
+const V3D_VERSION_EXPECTED: u32 = 42;
+// HUB_IDENT2 bit 8 — the hub reports whether an MMU is present. The only field of that word this file
+// has a corroborated position for; the rest stays raw.
+const V3D_HUB_IDENT2_WITH_MMU: u32 = 1 << 8;
+// CORE IDENT0: the low three bytes are the ASCII signature 'V','3','D' (0x00443356 as a word),
+// and the top byte carries the core's MAJOR version — a second, independent witness to the hub's
+// TVER field. The signature check is what makes "these words came from a live V3D" falsifiable.
+const V3D_CTL_IDENT0_VER_SHIFT: u32 = 24;
+const V3D_CTL_IDENT0_SIG: u32 = 0x00443356; // 'V'=0x56, '3'=0x33, 'D'=0x44
+// CORE IDENT1 bits 3:0 — the core's own revision nibble; must agree with the hub's REV.
+const V3D_CTL_IDENT1_REV_MASK: u32 = 0xF;
+
+/// Decode HUB_IDENT1 / CORE IDENT0 / CORE IDENT1 into the mainline version NUMBER
+/// (`tver * 10 + rev`), the core count, and the two corroborating witnesses. Pure function, no MMIO.
+fn v3d_ident_version(hub1: u32, c0: u32, c1: u32) -> (u32, u32, u32, u32, bool, bool) {
+    let tver = (hub1 >> V3D_HUB_IDENT1_TVER_SHIFT) & V3D_HUB_IDENT1_NIB_MASK;
+    let rev = (hub1 >> V3D_HUB_IDENT1_REV_SHIFT) & V3D_HUB_IDENT1_NIB_MASK;
+    let ncores = ((hub1 >> V3D_HUB_IDENT1_NCORES_SHIFT) & V3D_HUB_IDENT1_NIB_MASK).max(1);
+    let ver = tver * 10 + rev;
+    let sig_ok = (c0 & 0x00FF_FFFF) == V3D_CTL_IDENT0_SIG;
+    let core_ver_ok =
+        ((c0 >> V3D_CTL_IDENT0_VER_SHIFT) & 0xFF) == tver && (c1 & V3D_CTL_IDENT1_REV_MASK) == rev;
+    (ver, tver, rev, ncores, sig_ok, core_ver_ok)
+}
+
 // PI-V3D-52 (Rung 1): the HUB interrupt MASK block. The kernel's `v3d_irq_enable`
 // (`drivers/gpu/drm/v3d/v3d_irq.c`) is FOUR register writes, not two: after the per-core
 // INT_MSK_SET/CLR (mirrored in `v3d_irq_enable` below since V3D-49) it ALSO unmasks the HUB
@@ -727,13 +774,16 @@ pub fn bringup(fb: Option<FbTarget>) {
     );
     serial_println!(":: V3D: CTL_IDENT0..2 = {:#010x} {:#010x} {:#010x} ::", c0, c1, c2);
 
-    // Decode the technology version from HUB_IDENT1 (per v3d_regs.h: tech version is a byte field;
-    // the Pi-4 V3D reports 4.2). Reported raw + decoded for the attended metal log.
-    let tver = (hub1 >> 24) & 0xFF;
+    // Decode the version from HUB_IDENT1's low nibbles (V3D-61 corrected map): major = TVER (3:0),
+    // minor = REV (7:4), and the mainline single-number form is `tver * 10 + rev` — decimal 42 on a
+    // Pi 4's V3D 4.2. Core count is bits 11:8, NOT the low nibble the pre-V3D-61 code read.
+    let (ver, tver, rev, ncores, _, _) = v3d_ident_version(hub1, c0, c1);
     serial_println!(
-        ":: V3D: PRESENT — tech version raw {:#04x} (expect V3D 4.2 on Pi 4); cores={} ::",
+        ":: V3D: PRESENT — tech version {}.{} (ver={}, expect V3D 4.2 = 42 on Pi 4); cores={} ::",
         tver,
-        (hub1 & 0xF).max(1)
+        rev,
+        ver,
+        ncores
     );
     serial_println!(":: V3D: M1 probe PASS (powered, clocked, IDENT live) ::");
 
@@ -4776,7 +4826,9 @@ fn v3d59_ct0_frame_reset(what: &str) {
 // off that number. This file has printed the raw IDENT words since PI-V3D-1 and decoded exactly two
 // fields. `[v3d60] ident` restates the decode as an explicit CHECK — is the technology version the 4.2
 // this driver's whole CL packing targets, is core 0 the core we drive — because a version mismatch
-// would silently invalidate the campaign's foundation. Fields beyond the two this file has audited are
+// would silently invalidate the campaign's foundation. PI-V3D-61: the CHECK itself was miscoded (top
+// byte vs low nibbles, hex 0x42 vs decimal 42) and P59's mismatch reading is retracted; the version now
+// comes from `v3d_ident_version` and is corroborated by the core signature. Fields beyond those audited are
 // printed RAW: no fabricated bit names (the standing rule; this driver has been convicted three times).
 //
 // ── (c) The INIT-DELTA ledger ────────────────────────────────────────────────────────────────────
@@ -5025,25 +5077,37 @@ fn v3d60_residue_post() {
 
 /// `[v3d60] ident` — the hub/core identity read as a CHECK rather than a dump: is this the 4.2 silicon
 /// every packet encoding in this file targets, and is core 0 the core we drive? Fields beyond the two
-/// this file has audited (`HUB_IDENT1` technology version and core count) are reported RAW — the
-/// no-fabricated-bit-names rule applies here as everywhere in this module.
+/// this file has audited are reported RAW — the no-fabricated-bit-names rule applies here as everywhere
+/// in this module. V3D-61 corrected the version decode itself: the number lives in `HUB_IDENT1`'s low
+/// nibbles as `TVER*10 + REV` (decimal 42 for V3D 4.2), not in the register's top byte, and it is
+/// cross-checked against the core's `'V3D'` ASCII signature and its own version nibbles.
 fn v3d60_ident(hub1: u32, hub2: u32, hub3: u32, c0: u32, c1: u32, c2: u32) {
     if !V3D60_IDENT {
         return;
     }
-    let tver = (hub1 >> 24) & 0xFF;
-    let ncores = (hub1 & 0xF).max(1);
+    let (ver, tver, rev, ncores, sig_ok, core_ver_ok) = v3d_ident_version(hub1, c0, c1);
+    let nhosts = (hub1 >> V3D_HUB_IDENT1_NHOSTS_SHIFT) & V3D_HUB_IDENT1_NIB_MASK;
     // This driver's whole CL packing is the v42 (V3D 4.2) variant set — see the packet-facts block and
-    // every `v3d_packet.xml max_ver=42` citation. The kernel driver derives the same number from this
-    // register and gates its version-conditional paths on it.
-    let ver_ok = tver == 0x42;
+    // every `v3d_packet.xml max_ver=42` citation. The kernel driver derives the SAME number from this
+    // register — `tver * 10 + rev`, decimal — and gates its version-conditional paths on it.
+    let ver_ok = ver == V3D_VERSION_EXPECTED;
     serial_println!(
-        ":: V3D: [v3d60] ident — HUB_IDENT1={:#010x} -> tech-version raw={:#04x} (ours-expects 0x42 = V3D 4.2, the variant EVERY packet encoding in this file targets) cores={} (we drive core 0) | HUB_IDENT2={:#010x} HUB_IDENT3={:#010x} | CORE0 IDENT0={:#010x} IDENT1={:#010x} IDENT2={:#010x} (raw — this file has no corroborated field map past the two decoded above, and does not invent one) — {} ::",
-        hub1, tver, ncores, hub2, hub3, c0, c1, c2,
-        if ver_ok {
-            "version CONFIRMED: the silicon is the generation the CL packing, the shader-word encoding and the register offsets were all audited against. The campaign's foundation holds"
+        ":: V3D: [v3d60] ident — HUB_IDENT1={:#010x} -> version {}.{} (ver={}, ours-expects {} = V3D 4.2, the variant EVERY packet encoding in this file targets) cores={} (we drive core 0) hosts={} | feats L3C={} TFU={} TSY={} MSO={} | HUB_IDENT2={:#010x} (MMU-present={}) HUB_IDENT3={:#010x} | CORE0 IDENT0={:#010x} ('V3D' signature {}, core-major={}) IDENT1={:#010x} IDENT2={:#010x} (rest raw — this file decodes only corroborated fields and invents none) | corroboration: signature={} core-version-agrees-with-hub={} — {} ::",
+        hub1, tver, rev, ver, V3D_VERSION_EXPECTED, ncores, nhosts,
+        (hub1 & V3D_HUB_IDENT1_WITH_L3C != 0) as u32,
+        (hub1 & V3D_HUB_IDENT1_WITH_TFU != 0) as u32,
+        (hub1 & V3D_HUB_IDENT1_WITH_TSY != 0) as u32,
+        (hub1 & V3D_HUB_IDENT1_WITH_MSO != 0) as u32,
+        hub2, (hub2 & V3D_HUB_IDENT2_WITH_MMU != 0) as u32, hub3,
+        c0, if sig_ok { "OK" } else { "ABSENT" }, (c0 >> V3D_CTL_IDENT0_VER_SHIFT) & 0xFF,
+        c1, c2,
+        sig_ok as u32, core_ver_ok as u32,
+        if ver_ok && sig_ok && core_ver_ok {
+            "version CONFIRMED on three independent witnesses (hub TVER/REV, core IDENT0 'V3D' signature + major byte, core IDENT1 revision nibble): the silicon is the generation the CL packing, the shader-word encoding and the register offsets were all audited against. The campaign's foundation holds. (V3D-61: the pre-V3D-61 probe read this version from HUB_IDENT1's TOP BYTE and compared it against the HEX 0x42; both were wrong, and P59's 'VERSION MISMATCH' was that decode's artifact — RETRACTED)"
+        } else if ver_ok {
+            "version field reads 4.2 but a CORROBORATING witness disagrees — either the core signature is absent or the core's own version nibbles do not match the hub's. Treat the identity as UNSETTLED and resolve before trusting further PTB readings"
         } else {
-            "VERSION MISMATCH — the block does NOT report the 4.2 technology version this driver's packet encoding, QPU word packing and register map were audited against. That would invalidate the whole campaign's foundation and MUST be resolved before any further PTB reading is trusted"
+            "VERSION MISMATCH — under the V3D-61-corrected field map (version = HUB_IDENT1 TVER*10 + REV, decimal) the block does NOT report 42. This driver's packet encoding, QPU word packing and register map were all audited against V3D 4.2; a genuine mismatch invalidates the campaign's foundation and MUST be resolved before any further PTB reading is trusted"
         }
     );
 }

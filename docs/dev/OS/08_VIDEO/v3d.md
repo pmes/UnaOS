@@ -2099,7 +2099,7 @@ Most rows agree — the MMU table base, the L2T flush window (V3D-51), both inte
 | `[v3d60] residue (pre-reset)` | Everything at reset value | The block is **virgin at our entry**. The firmware never drove a bin frame through this PTB, so there is nothing warm to inherit and the warm-handoff hypothesis is **dead**. The PTB must be startable from cold by register programming alone. |
 | `[v3d60] residue (post-reset)` | `BMACTIVE` still set after the cycle | Our OFF→ON power cycle does **not** close (or does not reach) an open PTB frame. |
 | `[v3d60] residue (post-reset)` | Zero fields moved | The reset changed **nothing**. Cross-read the `[v3d50]` ASB/PM lines: bridges ACKed ⇒ the registers were already clean; bridges silent ⇒ this driver has never actually reset the V3D. |
-| `[v3d60] ident` | Technology version ≠ `0x42` | **Campaign foundation invalid** — the CL packing, QPU word encoding and register map were all audited against V3D 4.2. Resolve before trusting any further PTB reading. |
+| `[v3d60] ident` | Version (`TVER*10+REV`) ≠ `42` | **Campaign foundation invalid** — the CL packing, QPU word encoding and register map were all audited against V3D 4.2. Resolve before trusting any further PTB reading. (P59's mismatch was a *decode* artifact — see "The IDENT mismatch, resolved" below.) |
 | `[v3d60] initdelta` | `MEASURED divergences=0`, `STANDING gaps=0` | Our pre-first-job register state matches every checkable row of the mainline ledger. No boot-state divergence remains to explain the dead-open frame. |
 | `[v3d60] initdelta` | `MEASURED=0`, `STANDING=1` | Every readback row matches mainline; what remains is the gap this build carries on **every** boot — the MMU fault policy armed to **abort** but not to **report**. A write the MMU swallows silently would be invisible to every witness in this file. **This is the expected reading today.** |
 | `[v3d60] initdelta` | `MEASURED>0` | A readback actually diverged this boot. The rows marked **GAP** are mechanisms by which a refused PTB write would land — or vanish — without ever being reported. Exactly the shape of the wall. |
@@ -2115,6 +2115,63 @@ uninformative.
 | `[v3d60] gmpdelta` | `CAP_EXCEEDED` newly set | The PTB issued an address **beyond the page-table cap** — capped, not translated. Reconciles "`BPCA` advances" with "no traffic anywhere the MMU grants". |
 | `[v3d60] gmpdelta` | Page-table-invalid / write-violation newly set | The PTB's write was refused by **translation**; read `MMU_VIO_ADDR`/`VIO_ID` for the address and the issuing client. |
 | `[v3d60] gmpdelta` | Clean across the frame | Neither the protection block nor the MMU refused anything during this frame. Both **exonerated**, and the PTB frame open/close unit stands alone as the wall. |
+
+### The IDENT mismatch, resolved — the decode was wrong, the silicon is not (V3D-61)
+
+P59 metal printed, exactly:
+
+```
+[v3d60] ident — HUB_IDENT1=0x000e1124 -> tech-version raw=0x00 (expects 0x42) cores=4 |
+HUB_IDENT2=0x00000100 HUB_IDENT3=0x00000e00 |
+CORE0 IDENT0=0x04443356 IDENT1=0x81001422 IDENT2=0x40078121
+```
+
+A real 4.2 mismatch would have invalidated the campaign's whole packet/register audit. It is **not** a
+mismatch. The V3D-60 probe decoded the wrong field, in the wrong base, and its core-count field too.
+
+**What the pre-V3D-61 code did.** `tver = (hub1 >> 24) & 0xFF` — the register's *top byte* — compared
+against the literal `0x42`; and `ncores = hub1 & 0xF` — the *low* nibble.
+
+**The correct map.** The mainline driver's `HUB_IDENT1` field set places the identity in the register's
+low half-word, in four-bit fields — technology version at bits 3:0, revision at 7:4, core count at 11:8,
+host count at 15:12 — with four feature-presence bits above (L3C 16, TFU 17, TSY 18, MSO 19). Crucially,
+the driver's single version *number* is composed **decimally**: `tver * 10 + rev`. "V3D 4.2" is therefore
+the number **42**, and never the hex byte `0x42`. The V3D-60 check compared a field it had not read
+against a constant in the wrong base — two independent errors that happened to both point at "mismatch".
+
+**The bench word decodes cleanly.** `HUB_IDENT1 = 0x000e1124`:
+
+| Field | Bits | Value | Reading |
+| --- | --- | --- | --- |
+| TVER | 3:0 | `4` | major |
+| REV | 7:4 | `2` | minor → version = 4*10+2 = **42** |
+| NCORES | 11:8 | `1` | **one** core — not four. We drive core 0; there is no other. |
+| NHOSTS | 15:12 | `1` | one host interface |
+| L3C/TFU/TSY/MSO | 19:16 | `0xe` | L3C absent; TFU, TSY, MSO present |
+
+Two independent witnesses corroborate, from a *different* register file (the core's, not the hub's):
+
+- `CORE0 IDENT0 = 0x04443356`. Its low three bytes are the ASCII signature `V` `3` `D`
+  (`0x56 0x33 0x44`) — the block identifying itself. Its top byte is `0x04`: the core's own **major**
+  version, agreeing with the hub's TVER of 4.
+- `CORE0 IDENT1 = 0x81001422`. Its low nibble is `2` — the core's revision, agreeing with the hub's REV
+  of 2. The rest of that word (`0x81001422`) is a plausible per-core configuration and stays raw.
+- `HUB_IDENT2 = 0x00000100` sets the hub's MMU-present bit (8) — consistent with a block whose MMU this
+  driver programs and reads faults from.
+
+The old decode's output was internally incoherent on its face — a technology version of `0x00` beside
+four cores on a part that ships one — which is what a wrong field map produces and a wrong *part* does
+not.
+
+**Verdict: the "VERSION MISMATCH" is RETRACTED.** The bench silicon is V3D 4.2, single-core, MMU-present,
+exactly the generation this file's CL packing, QPU word packing and register offsets were audited
+against. The campaign's foundation **holds**; nothing downstream of it needs re-auditing.
+
+V3D-61 fixes the decode at both sites that carried it (the `PRESENT` bring-up line and the `[v3d60]
+ident` check), adds the field constants and a pure `v3d_ident_version` decoder, and makes the verdict
+line state the version from the right field and report its corroboration explicitly. The probe stays
+read-only; `CTRSTA` stays disarmed. On metal the corrected line will read version `4.2 (ver=42)`,
+`cores=1`, signature `OK`, core-version-agrees `1`, and the CONFIRMED verdict.
 
 ### Discipline
 
