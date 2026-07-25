@@ -970,85 +970,93 @@ Pi 4 boot is what confirms it, with the `[wc-e]` line as the standing geometry c
 ### WC-F — an independent read of what the HVS actually scans
 
 WC-E fixed a real two-writer ordering bug, and the bench panel garbled the 128×128 crystal anyway on the
-P58 boot. That leaves a chain with one loose end: the window's content is byte-correct in RAM (WC-D), the
-writers are ordered (WC-E), the garble persists. The remaining suspect surface is scan-out-side — or a
-per-window blit path that **both prior witnesses share blind**. WC-D reads back through `info.stride`, the
-same number the blit writes through. WC-E asks the firmware, but only prints the answer; nothing ever put
-that answer beside the `FrameBuffer` the compositor actually addresses through. WC-F closes both gaps.
+P58 boot. Content byte-correct in RAM (WC-D), writers ordered (WC-E), garble persisting: the remaining
+surface is scan-out-side, and it is the side both prior witnesses are constitutionally unable to see. Both
+address the framebuffer through `info.stride`, the same number the blit writes through.
 
-**Why the live handle is a separate suspect.** `FrameBufferInfo` is built from the allocation reply and
-then lives on its own — `base`, `len`, `stride`, `bytes_per_pixel`, `pixel_format`, plus a panel geometry
-that on the gate comes from a compile-time override. Any of those can drift from the firmware's answer with
-nothing downstream able to notice, because everything downstream reads through them. `[wc-f] scanout` puts
-the two side by side, once per boot, with each identity named and evaluated:
+**What independence is not.** The first cut of this arc failed its own review, and the failure is the most
+useful thing in this section. It compared `stride × bpp` against the firmware's pitch — but
+`init_framebuffer` *defines* `stride = pitch / 4`, so those are the same number for every possible
+firmware, and the check could not fail. It then re-asked `GET_PITCH` and compared that to the allocation's
+pitch: the same firmware answering the same question, which confirms the reply and nothing about the
+hardware. Both twin paths ended up computing byte-identical offsets, `comp_bad`/`direct_bad` were
+structurally zero, and the photograph's "left garbled, right clean" arm was unreachable. **A witness whose
+failing branch cannot be reached is decoration.**
 
-| field | the identity |
+Two constructs here are genuinely independent of the pitch reply:
+
+**1. A row step derived from geometry.** `virt_w × 4` is what one row of the reported virtual width
+occupies. It equals the pitch when the firmware allocates unpadded and diverges *by the padding* when it
+does not — so `rowstep_match` (`stride × bpp` vs `virt_w × 4`) is a real question with a reachable `false`,
+and `pad=` states the divergence in bytes. The right-hand twin block is addressed with it, so on a padded
+framebuffer the two blocks genuinely land at different addresses and the panel shows it.
+
+| field on `[wc-f] scanout` | the identity |
 |---|---|
 | `base_match` | the mapping we store into **is** the buffer the firmware allocated |
-| `rowbytes_match` | `stride × bpp` equals the pitch the HVS steps by — the row-phase identity a garble breaks |
-| `pitch_match` | the allocation's pitch survives an independent, query-only re-read (`GET_PITCH` in a transaction of its own) |
+| `rowstep_match` | `stride × bpp` equals `virt_w × 4` — false exactly when the firmware pads a row the compositor ignores |
+| `pad` | that padding, in bytes per row |
+| `pitch_match` | the allocation pitch survives an independent re-query (weak alone; a divergence would be decisive) |
 | `panel_match` | the geometry `wm::place` lays windows out in is the mode being scanned |
 | `fits` | the mapping covers every row the pipe scans |
 
-The extra `GET_PITCH` matters because every pitch on the `[wc-e]` line descends from the allocation reply: a
-firmware that reported one pitch and programmed the HVS with another would be self-consistent there and
-wrong on the panel. Firmware is **not** re-queried from composite context — the property mailbox uses one
-static buffer with no lock and is safe only during single-core boot — so the read happens at framebuffer
-bring-up, where it is safe, and is *recorded* (`mailbox::scanout_truth`) for the compositor side to compare.
+**2. A marker whose photographed slope IS the hardware's row step.** Every number on the serial wire —
+ours and the firmware's alike — is downstream of the firmware's own claim, so no serial line can observe
+*"the HVS steps differently than it reported"*. The ramp can. It writes one two-pixel mark per row by pure
+byte arithmetic, each `k_row + 4` bytes after the last. If the hardware advances a row by exactly `k_row`,
+the marks photograph as a diagonal moving exactly one pixel right per row; if its real step is `k_row + d`,
+the marks drift `d/4` px per row and the diagonal visibly bends. 256 rows, ticked white every 16th so rows
+can be counted off the photo. **This is measured off the panel, not off the log.**
 
-**The twin-pattern probe** answers the other question: blit path, or scan-out? `video::wcf` renders one
-known 16×16 pattern **twice**, at the bench's 4× upscale, side by side in an unused strip at the bottom
-right of the panel:
-
-- **left** through `FrameBuffer::put_pixel`, indexed by `info.stride` — byte-for-byte the addressing of
-  `wm::draw_window`'s inner loop;
-- **right** through raw stores whose offsets are computed from the **firmware's pitch**, touching neither
-  `info.stride` nor `put_pixel`.
-
-The pattern gives every source pixel a distinct colour (R and G ramp on the two axes, B alternates at the
-grid's highest frequency), so no shift — row, column, or sub-pixel byte — can map it onto itself and pass
-quietly. Both blocks are cleaned out to RAM under *both* pitches, since which one describes the real rows is
-exactly the open question, then each is invalidated and **cross-read through the other path's addressing**:
-`comp_bad` is the left block read at the firmware pitch, `direct_bad` is the right block read at
-`info.stride`. The verdict is therefore complete on the wire, no photo required — and on the bench it is
-*also* legible as a photograph, which is the point of rendering it rather than only computing it:
+**The twin probe.** One known 16×16 pattern rendered twice at the bench's 4× upscale, side by side: left
+through `put_pixel`/`info.stride` (byte-for-byte `wm::draw_window`'s inner loop), right through raw stores
+stepped by `virt_w × 4`. Each block is cross-read through the other path's addressing. The direct path
+stores **three** bytes, exactly as `put_pixel` does, so the blocks cannot differ for the non-addressing
+reason of one having zeroed the fourth byte under an alpha mode that reads it.
 
 - **left garbled, right clean** ⇒ the compositor's addressing; the defect is in the blit path.
-- **both garbled** ⇒ the HVS or the pitch; the blit is faithfully filling a surface nobody scans correctly.
+- **both garbled** ⇒ the HVS or the pitch; the blit is faithfully filling a surface nobody scans right.
 - **both clean, crystal still garbled** ⇒ neither addressing nor geometry; the defect is specific to the
   window path (surface contents at scan time, or a writer WC-E did not order).
 
-`witness`-gated **and** aarch64-only: knob-off, `video/wcf.rs` does not compile, the flashable Pi media are
-byte-identical, and every x86 artifact is untouched. The probe repaints on every composite pass (so nothing
-running after a composite can erase it before the panel is photographed) and prints exactly once. Every path
-through `run` emits a line — `PASS`, `FAIL`, or `-> SKIP` with its reason — so a missing verdict is never
-ambiguous; the spec `FORBID`s the SKIPs as well as the FAILs.
+**A comparison that cannot be made is counted, never dropped.** An out-of-range offset increments
+`skipped`; `PASS` requires `skipped == 0`, `lost == 0`, and `checked` equal to the full expected count
+(8192). Without that, a probe whose every read fell outside the mapping would report `comp_bad=0` — which
+reads exactly like agreement, the one way a witness can lie.
+
+**Cost and collision discipline.** The probe runs only from composite passes that already drew something,
+so its ~12 K stores and row cleans fall where work is happening anyway rather than being charged to every
+idle repaint — it instruments the path it runs in, and perturbing that path is a real cost. It refuses to
+paint while any live window overlaps its region (it paints last, so it would win, and a window under it
+would silently show WC-F's pattern instead of the app's content). Both marks sit in the bottom strip —
+twins hard right, ramp hard left — because stacking them put the ramp where `wm::place` lands its first
+window at 640×480, and a witness that habitually skips is no witness. The cleaned ranges are invalidated
+**separately, never as one convex hull**: when `geom_row > k_row` the hull spans rows this probe never
+wrote, and a bare `DC IVAC` over those would discard another writer's still-dirty lines — manufacturing
+the exact garble we are hunting. The one-shot latch is set only by a pass that produced a verdict, so a
+transient skip cannot silence the witness for the boot.
+
+`witness`-gated **and** aarch64-only: knob-off, `video/wcf.rs` does not compile, the flashable Pi media
+are byte-identical (zero `wc-f` strings), every x86 artifact untouched.
+
+Firmware is not re-queried from composite context — the property mailbox has one unlocked static buffer
+and is safe only during single-core boot — so the read happens at bring-up and is recorded
+(`mailbox::scanout_truth`).
 
 #### WC-F gate results (2026-07-25, QEMU raspi4b, forced bench geometry)
 
-`./arroyo check` green both arches · `./arroyo kernel8` clean · `UNAOS_FBW=1920 UNAOS_FBH=1200
-./arroyo kernel8-test`, MBENCH green on a spec grown to 55 required witnesses by this arc's two
-`[wc-f]` REQUIREs. Both verdicts PASS in QEMU:
+`./arroyo check` green both arches · `./arroyo kernel8` clean, zero `wc-f` strings (armed build: five) ·
+`UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test 120` → MBENCH **55/55 required, 0 forbidden**, on a
+spec grown by this arc's two REQUIREs. Both verdicts PASS.
 
-```
-[wc-f] scanout kernel base=0x3c100000 len=9216000 panel=1920x1200 stride=1920px bpp=4 row_bytes=7680B ::
-       firmware base=0x3c100000 size=9216000 alloc_pitch=7680B get_pitch=7680B virt=1920x1200 phys=1920x1200
-       off=(0,0) depth=32 order=0 alpha=2 :: base_match=true rowbytes_match=true pitch_match=true
-       panel_match=true fits=true -> PASS
-[wc-f] twin left=comp@stride(1760,1120) right=direct@pitch(1840,1120) blk=16x16 scale=4x panel=1920x1200
-       k_row=7680B fw_pitch=7680B checked=4096 comp_bad=0 direct_bad=0 -> PASS
-```
+A QEMU PASS carries no news and is not the arc's evidence: QEMU allocates unpadded, so `geom_row == k_row`
+there and the divergent branch is unexercised by construction. What the gate establishes is that the probe
+runs, addresses both paths, counts what it could not check, and states a verdict — so a bench divergence
+appears as a number rather than as silence. **The evidence is the metal boot.**
 
-A QEMU PASS is the *expected* result and carries no news: QEMU's firmware answers with the geometry it was
-asked for and models no non-coherent scan-out. What the gate establishes is that the probe runs, addresses
-both paths, and states a verdict — so a bench divergence appears as a number rather than as silence. **The
-arc's evidence is the metal boot**, where three things are worth reading in order: whether `[wc-f] scanout`
-still says `rowbytes_match=true` (a `false` there is the garble, named); whether `comp_bad`/`direct_bad`
-part company; and, on the panel itself, whether the two twin blocks at the bottom right are identical.
-Also carried forward from WC-E and still unactioned: the P58 boot reported `alpha=0` on metal where QEMU
-reports `alpha=2` (ignored). `[wc-f] scanout` repeats the field so the divergence stays on the wire beside
-the identities, but this arc does not act on it — alpha mode cannot shift a row's phase, and the panel
-composites opaquely.
+Carried forward from WC-E and still unactioned: the P58 boot reported `alpha=0` on metal where QEMU reports
+`alpha=2` (ignored). `[wc-f] scanout` repeats the field so the divergence stays on the wire, but this arc
+does not act on it — alpha mode cannot shift a row's phase, and the compositor composites opaquely.
 
 ### CURSOR-1 — the system cursor
 

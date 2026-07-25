@@ -18,52 +18,67 @@
 //!
 //! ## The blind spot this exists to break
 //!
-//! WC-D proved a window's pixels are byte-correct in RAM (`bad_cache=0 bad_ram=0` on every window at
-//! bench geometry). WC-E fixed a real two-writer ordering bug. The bench panel still garbles the
-//! 128x128 crystal. Content correct + writers ordered + garble surviving leaves exactly one class of
-//! suspect standing, and it is the class BOTH prior witnesses are constitutionally unable to see:
-//! they address the framebuffer through `info.stride`, the same number the blit writes through, so
-//! they agree with the blit no matter what geometry the display pipe is programmed with. A witness
-//! that asks our numbers can never falsify our numbers.
+//! WC-D proved a window's pixels are byte-correct in RAM. WC-E fixed a real two-writer ordering bug.
+//! The bench panel still garbles the 128x128 crystal. Content correct + writers ordered + garble
+//! surviving leaves the scan-out side standing, and it is the side both prior witnesses are
+//! constitutionally unable to see: they address the framebuffer through `info.stride`, the same number
+//! the blit writes through, so they agree with the blit whatever the display pipe is programmed with.
 //!
-//! This module asks two questions neither prior arc could:
+//! ## What counts as independent, and what does not
 //!
-//! 1. **Does the LIVE `FrameBuffer` describe the surface the firmware allocated?** WC-E printed the
-//!    firmware's geometry at bring-up and stopped there. The `FrameBuffer` the compositor addresses
-//!    through is a separate object built from that reply — its `base`, `len` and `stride` can each
-//!    diverge (a remap, a clamp, a rounding, an override) with nothing downstream able to notice.
-//!    [`ScanoutTruth`](crate::arch::aarch64::mailbox::ScanoutTruth) is put beside the live handle on
-//!    one line, with the identities named: `base_match`, `rowbytes_match`, `pitch_match`, `fits`.
+//! The first cut of this module was **tautological**, and the reason is worth keeping written down.
+//! `mailbox::init_framebuffer` defines `info.stride = pitch / 4`. So `stride * bpp == pitch`
+//! identically, for every possible firmware — comparing them compares a number to itself. Re-asking
+//! `GET_PITCH` does not help either: it is the same firmware answering the same question, so a second
+//! agreeing reply adds no information about what the hardware is *doing*. Any witness built on the
+//! pitch reply can only ever confirm the pitch reply.
 //!
-//! 2. **Is the defect in the blit path or in the scan-out?** The twin-pattern probe below renders the
-//!    SAME known 16x16 pattern twice, at the same 4x upscale the bench window gets, side by side:
-//!    - the LEFT block through the compositor's own primitive (`FrameBuffer::put_pixel`, indexed by
-//!      `info.stride`) — the exact addressing `wm::draw_window` uses;
-//!    - the RIGHT block through raw stores computed from the FIRMWARE'S PITCH, touching neither
-//!      `info.stride` nor `put_pixel`.
+//! Two things here are genuinely independent of it:
 //!
-//!    If the two numbers agree, the two blocks are byte-identical and land aligned on the panel. If
-//!    they disagree, the compositor's block shears against the direct block by exactly the phase
-//!    error, and a bench photo reads the verdict off the panel without a serial cable:
-//!    **left garbled / right clean ⇒ the blit path's addressing; both garbled ⇒ HVS or pitch.**
+//! 1. **A row step derived from GEOMETRY, not from the pitch reply.** `virt_w * 4` is what one row of
+//!    the reported virtual width occupies. It equals the pitch exactly when the firmware allocates
+//!    unpadded, and diverges — by the padding — when it does not. `rowstep_match` is therefore a real
+//!    question with a reachable `false`, which `stride * bpp == pitch` never was. The right-hand twin
+//!    block is addressed with it, so when the firmware pads, the two blocks are written to genuinely
+//!    different addresses and the panel shows it.
+//! 2. **A marker whose photographed slope IS the hardware's row step.** [`ramp`] writes one two-pixel
+//!    mark per row by pure byte arithmetic, stepping `k_row + 4` bytes each time. If the HVS advances
+//!    a row by exactly `k_row`, the marks photograph as a diagonal moving exactly one pixel right per
+//!    row. If the hardware's real step is `k_row + d`, the marks drift by `d/4` pixels per row and the
+//!    diagonal visibly bends. This is the only construct here that can observe *"the HVS steps
+//!    differently than the firmware reported"* — every number on the serial line, ours and the
+//!    firmware's alike, is downstream of the firmware's own claim. It is measured off the photograph.
 //!
-//! The verdict is also readable on the wire alone, which is the point of doing it as a cross-read:
-//! each block is read back through the OTHER path's addressing and compared to the reference. A
-//! nonzero `comp_bad` (left block, read at firmware pitch) or `direct_bad` (right block, read at
-//! `info.stride`) is the two paths disagreeing, stated as a count, no photo needed.
+//! ## The twin probe
+//!
+//! One known 16x16 pattern rendered twice, at the bench's 4x upscale, side by side:
+//!
+//! - **left** through `FrameBuffer::put_pixel` (indexed by `info.stride`) — byte-for-byte the
+//!   addressing of `wm::draw_window`'s inner loop;
+//! - **right** through raw stores whose row step is `virt_w * 4`, touching neither `info.stride` nor
+//!   the pitch reply.
+//!
+//! Both are cross-read through the other path's addressing. On a padded framebuffer the two disagree
+//! and say so as a count; on the panel the same probe reads as a photo — **left garbled / right clean
+//! ⇒ the blit path; both garbled ⇒ HVS or pitch.** The direct path stores three bytes, exactly like
+//! `put_pixel`, so the two blocks cannot differ for the non-addressing reason of one of them having
+//! zeroed the fourth byte under an alpha mode that reads it.
+//!
+//! A comparison that cannot be made is counted as `skipped`, never silently dropped: a `comp_bad=0`
+//! reached by skipping every pixel would read as agreement, which is the one way a witness can lie.
+//! `PASS` requires `skipped == 0` **and** `checked` equal to the full expected count.
 //!
 //! ## Scope and safety
 //!
 //! `witness`-gated and aarch64-only: knob-off, this module does not compile and the Pi media are
-//! byte-identical. The probe paints into an unused strip at the bottom-right of the panel, is
-//! redrawn by every composite pass (so a later desktop flush cannot erase it before the operator
-//! photographs it), and prints exactly once. Every path through [`run`] emits a line — PASS, FAIL or
-//! `-> SKIP` with a reason — so a missing verdict is never ambiguous.
+//! byte-identical. It runs only from composite passes that already drew something (so it adds no work
+//! to an idle desktop), only when no live window overlaps its region, repaints so a later flush cannot
+//! erase it before the panel is photographed, and prints exactly once — latching only on a pass that
+//! actually produced a verdict. Every path emits a line: `PASS`, `FAIL`, or `-> SKIP` with a reason.
 //!
 //! Firmware is not re-queried from here: the property mailbox uses one static buffer with no lock and
 //! is safe only during single-core boot, while this runs from composite (post-SMP, syscall context).
-//! The firmware read therefore happens where it is safe — at framebuffer bring-up, in
-//! `mailbox::witness_fb_geometry` — and is *recorded* for this module to compare against.
+//! The firmware read happens where it is safe — at framebuffer bring-up — and is *recorded*.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -72,7 +87,7 @@ use unaos_boot_info::PixelFormat;
 use super::FrameBuffer;
 use crate::arch::aarch64::mailbox;
 
-/// Reference pattern edge, in SOURCE pixels. 16x16 matches the granularity a crystal's content has.
+/// Reference pattern edge, in SOURCE pixels.
 const BLK: usize = 16;
 /// Upscale. 4x is what `wm::place` gives a 128x128 window on the 1920x1200 bench panel (WC-SCALE's
 /// legibility ceiling), so the probe exercises the bench's blit, not a 1x special case.
@@ -83,12 +98,21 @@ const SIDE: usize = BLK * SCALE;
 const GAP: usize = 16;
 /// Distance kept from the panel edges.
 const MARGIN: usize = 16;
+/// Rows spanned by the slope marker. Each row moves the mark one nominal pixel right, so this is also
+/// its horizontal travel; 256 is enough for a padding of a single pixel to accumulate into an
+/// unmistakable bend (256 rows x 1 px = a quarter of the bench panel's width), and small enough to fit
+/// beside the twins on a 640x480 gate panel.
+const RAMP_ROWS: usize = 256;
+/// Width the marker reserves: its travel plus the two-pixel mark itself.
+const RAMP_W: usize = RAMP_ROWS + 8;
+
+/// Total comparisons the cross-read must make (both blocks, every destination pixel).
+const EXPECTED: usize = BLK * BLK * SCALE * SCALE * 2;
 
 /// The reference pattern: a distinct colour per source pixel, so NO shift of the image — by a row, a
 /// column, or a sub-pixel byte — can map onto itself. A flat or striped pattern would survive some
 /// phase errors unchanged and quietly pass; this one cannot. R and G ramp on the two axes (a shear
-/// tilts the ramp visibly), B alternates per pixel at the highest frequency the grid allows (a
-/// one-pixel phase error inverts it across the whole block).
+/// tilts the ramp visibly), B alternates per pixel at the highest frequency the grid allows.
 #[inline]
 fn reference(x: usize, y: usize) -> u32 {
     let r = ((x * 15 + 16) & 0xFF) as u32;
@@ -97,71 +121,136 @@ fn reference(x: usize, y: usize) -> u32 {
     (r << 16) | (g << 8) | b
 }
 
-/// Encode `0x00RRGGBB` into the little-endian 4-byte word this surface stores. `None` for any layout
-/// without a full 4-byte pixel — the direct path must reproduce `put_pixel`'s encoding exactly or the
-/// comparison would measure our own encoder instead of the addressing under test.
+/// The three colour bytes in the order this surface stores them — `put_pixel`'s encoding, reproduced
+/// so the direct path differs from the compositor path in ADDRESSING ONLY. `None` for any layout
+/// without a full 4-byte RGB pixel; the probe skips rather than invent one.
 #[inline]
-fn encode(fmt: PixelFormat, color: u32) -> Option<u32> {
-    let r = (color >> 16) & 0xFF;
-    let g = (color >> 8) & 0xFF;
-    let b = color & 0xFF;
+fn bytes_of(fmt: PixelFormat, color: u32) -> Option<[u8; 3]> {
+    let r = ((color >> 16) & 0xFF) as u8;
+    let g = ((color >> 8) & 0xFF) as u8;
+    let b = (color & 0xFF) as u8;
     match fmt {
-        PixelFormat::Rgb => Some(r | (g << 8) | (b << 16)),
-        PixelFormat::Bgr => Some(b | (g << 8) | (r << 16)),
+        PixelFormat::Rgb => Some([r, g, b]),
+        PixelFormat::Bgr => Some([b, g, r]),
         _ => None,
     }
 }
 
-/// Inverse of [`encode`].
+/// Inverse of [`bytes_of`].
 #[inline]
-fn decode(fmt: PixelFormat, raw: u32) -> Option<u32> {
-    let (a, b, c) = (raw & 0xFF, (raw >> 8) & 0xFF, (raw >> 16) & 0xFF);
+fn color_of(fmt: PixelFormat, b: [u8; 3]) -> Option<u32> {
     match fmt {
-        PixelFormat::Rgb => Some((a << 16) | (b << 8) | c),
-        PixelFormat::Bgr => Some((c << 16) | (b << 8) | a),
+        PixelFormat::Rgb => Some(((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32),
+        PixelFormat::Bgr => Some(((b[2] as u32) << 16) | ((b[1] as u32) << 8) | b[0] as u32),
         _ => None,
     }
 }
 
-/// Whether the one-shot verdict has been printed.
+/// Store one pixel as THREE bytes at a raw framebuffer offset — `put_pixel`'s write, addressed by
+/// byte arithmetic instead of by `info.stride`. Leaves the fourth byte exactly as `put_pixel` does
+/// (untouched), so an alpha mode that reads it cannot make the two paths differ for a reason that has
+/// nothing to do with addressing. Returns whether the store landed.
+#[inline]
+fn store3(base: usize, len: usize, off: usize, px: [u8; 3]) -> bool {
+    if off + 3 > len {
+        return false;
+    }
+    // SAFETY: `off + 3 <= len`, and `base..base+len` is the mapped framebuffer.
+    unsafe {
+        let p = (base + off) as *mut u8;
+        p.write(px[0]);
+        p.add(1).write(px[1]);
+        p.add(2).write(px[2]);
+    }
+    true
+}
+
+/// Read one pixel's three colour bytes back from a raw framebuffer offset. `None` when out of range —
+/// the caller must COUNT that, never treat it as agreement.
+#[inline]
+fn load3(base: usize, len: usize, off: usize) -> Option<[u8; 3]> {
+    if off + 3 > len {
+        return None;
+    }
+    // SAFETY: bounds-checked above; volatile so the loads are not folded with the stores above.
+    unsafe {
+        let p = (base + off) as *const u8;
+        Some([
+            core::ptr::read_volatile(p),
+            core::ptr::read_volatile(p.add(1)),
+            core::ptr::read_volatile(p.add(2)),
+        ])
+    }
+}
+
+/// Whether a verdict has been printed. Set only by a pass that produced one — a SKIP pass must not
+/// burn the latch, or a transient condition (a window sitting over the region on the first composite)
+/// would silence the witness for the whole boot.
 static WITNESSED: AtomicBool = AtomicBool::new(false);
 
-/// The whole WC-F probe. Called at the tail of every composite pass: the twins are repainted each
-/// time (so nothing that runs after a composite can erase them before the panel is photographed) and
-/// the verdict is printed on the first pass only.
-pub fn run(fb: &FrameBuffer) {
-    let first = !WITNESSED.swap(true, Ordering::Relaxed);
+/// The panel rectangles WC-F paints into: the twin blocks, then the slope marker. `None` when the
+/// panel is too small to hold them. The caller (`wm::composite_inner`) uses these to refuse to run the
+/// probe while a live window overlaps — the probe paints last and would otherwise corrupt what a
+/// window is showing.
+/// Both marks live in the BOTTOM strip, side by side — twins hard right, marker hard left — rather
+/// than stacked. Stacking them put the marker's 256 rows into the middle of the panel, where on the
+/// 640x480 default gate geometry `wm::place` lands its first window: the overlap test below would then
+/// refuse to run the probe on every ordinary boot, and a witness that habitually skips is no witness.
+/// Side by side, both clear the window flow at 640x480 and at 1920x1200 alike.
+pub fn reserved(pw: usize, ph: usize) -> Option<[(usize, usize, usize, usize); 2]> {
+    let need_w = RAMP_W + (2 * SIDE + GAP) + 3 * MARGIN;
+    let need_h = RAMP_ROWS.max(SIDE) + 2 * MARGIN;
+    if pw < need_w || ph < need_h {
+        return None;
+    }
+    let ty = ph - MARGIN - SIDE;
+    let tx = pw - MARGIN - (2 * SIDE + GAP);
+    let ry = ph - MARGIN - RAMP_ROWS;
+    Some([(tx, ty, 2 * SIDE + GAP, SIDE), (MARGIN, ry, RAMP_W, RAMP_ROWS)])
+}
+
+/// The whole WC-F probe.
+///
+/// `region_clear` is the caller's assurance that no live window overlaps [`reserved`]; `false` skips
+/// the paint entirely rather than scribble over a window's content.
+pub fn run(fb: &FrameBuffer, region_clear: bool) {
+    let done = WITNESSED.load(Ordering::Relaxed);
     let info = fb.info();
     let (pw, ph) = (info.width, info.height);
     let bpp = info.bytes_per_pixel;
     let base = fb.base_addr();
     let len = fb.len();
-
     let truth = mailbox::scanout_truth();
-    if first {
+
+    if !done {
         report_geometry(&truth, base, len, pw, ph, info.stride, bpp);
     }
 
-    // The direct path needs a byte pitch from OUTSIDE the kernel's own bookkeeping. `get_pitch` is
-    // the independently-read one; fall back to the allocation's only if that query failed.
-    let fw_pitch = if truth.get_pitch != 0 { truth.get_pitch } else { truth.alloc_pitch } as usize;
+    // The row step the RIGHT-hand block is addressed with: one row of the firmware's reported virtual
+    // width. Independent of the pitch reply by construction — it equals the pitch exactly when the
+    // allocation is unpadded, and differs by the padding when it is not.
+    let geom_row = truth.virt_w as usize * 4;
+    let k_row = info.stride * bpp;
+    let boxes = reserved(pw, ph);
+    let fmt_ok = bytes_of(info.pixel_format, 0).is_some();
+    let paintable =
+        base != 0 && truth.valid && bpp == 4 && fmt_ok && geom_row != 0 && boxes.is_some();
 
-    let need_w = 2 * SIDE + GAP + 2 * MARGIN;
-    let need_h = SIDE + 2 * MARGIN;
-    let encodable = bpp == 4 && encode(info.pixel_format, 0).is_some();
-    if base == 0 || !truth.valid || fw_pitch == 0 || !encodable || pw < need_w || ph < need_h {
-        if first {
+    if !paintable || !region_clear {
+        if !done {
             serial_println!(
-                "[wc-f] twin -> SKIP (panel={}x{} need={}x{} bpp={} fw_pitch={} truth_valid={} encodable={})",
-                pw, ph, need_w, need_h, bpp, fw_pitch, truth.valid, encodable
+                "[wc-f] twin -> SKIP (panel={}x{} bpp={} fmt_ok={} truth_valid={} geom_row={} fits={} region_clear={})",
+                pw, ph, bpp, fmt_ok, truth.valid, geom_row, boxes.is_some(), region_clear
             );
         }
         return;
     }
-
-    // Bottom-right, clear of the desktop's chrome and of where `wm::place` puts windows.
-    let ly = ph - MARGIN - SIDE;
-    let lx = pw - MARGIN - (2 * SIDE + GAP);
+    let boxes = match boxes {
+        Some(b) => b,
+        None => return,
+    };
+    let (lx, ly, _, _) = boxes[0];
+    let (rax, ray, _, _) = boxes[1];
     let rx = lx + SIDE + GAP;
 
     // --- LEFT: the compositor's own addressing. Byte-for-byte the inner loop of `wm::draw_window`.
@@ -176,56 +265,59 @@ pub fn run(fb: &FrameBuffer) {
         }
     }
 
-    // --- RIGHT: the same pattern, addressed at the firmware's pitch, straight into the mapping.
-    let raw_of = |c: u32| encode(info.pixel_format, c).unwrap_or(0);
+    // --- RIGHT: the same pattern, stepped by the GEOMETRY row, straight into the mapping.
+    let mut direct_lost = 0usize;
     for row in 0..BLK {
         for col in 0..BLK {
-            let raw = raw_of(reference(col, row));
+            let px = bytes_of(info.pixel_format, reference(col, row)).unwrap_or([0; 3]);
             for sy in 0..SCALE {
                 let dy = ly + row * SCALE + sy;
                 for sx in 0..SCALE {
-                    let dx = rx + col * SCALE + sx;
-                    let off = dy * fw_pitch + dx * 4;
-                    // Bounds-checked against the MAPPED length, never against the geometry under
-                    // test: a wrong pitch must show up as a wrong picture, not as a fault.
-                    if off + 4 > len {
-                        continue;
+                    let off = dy * geom_row + (rx + col * SCALE + sx) * 4;
+                    if !store3(base, len, off, px) {
+                        direct_lost += 1;
                     }
-                    // SAFETY: `off + 4 <= len`, and `base..base+len` is the mapped framebuffer.
-                    unsafe { core::ptr::write_volatile((base + off) as *mut u32, raw) };
                 }
             }
         }
     }
 
-    // Push both blocks out to the memory the HVS scans. Rows are cleaned by BOTH pitches, because
-    // which one describes the real rows is precisely the open question.
-    let rows_lo = ly;
-    let rows_hi = (ly + SIDE).min(ph);
-    let k_row = info.stride * bpp;
-    fb.flush_range(rows_lo * k_row, (rows_hi - rows_lo) * k_row);
-    let fw_lo = rows_lo * fw_pitch;
-    let fw_hi = ((rows_hi * fw_pitch) + fw_pitch).min(len);
-    if fw_hi > fw_lo {
-        crate::arch::flush_framebuffer_range(base + fw_lo, fw_hi - fw_lo);
+    // --- The slope marker, whose PHOTOGRAPHED slope is the hardware's row step.
+    ramp(base, len, info.pixel_format, k_row, rax, ray);
+
+    // Push the touched regions out to the memory the HVS scans. The ranges are cleaned — and later
+    // invalidated — SEPARATELY, never as one convex hull: when `geom_row > k_row` the hull spans rows
+    // between them that this probe never wrote, and a bare invalidate over those would discard
+    // somebody else's still-dirty lines, manufacturing the very garble we are hunting.
+    let (twin_lo, twin_hi) = (ly, (ly + SIDE).min(ph));
+    let (ramp_lo, ramp_hi) = (ray, (ray + RAMP_ROWS).min(ph));
+    let k_twin = (twin_lo * k_row, (twin_hi * k_row).min(len));
+    let g_twin = (twin_lo * geom_row, ((twin_hi + 1) * geom_row).min(len));
+    let k_ramp = (ramp_lo * k_row, ((ramp_hi + 1) * k_row).min(len));
+    let ranges = [k_twin, g_twin, k_ramp];
+    for &(lo, hi) in ranges.iter() {
+        if hi > lo {
+            crate::arch::flush_framebuffer_range(base + lo, hi - lo);
+        }
     }
 
-    if !first {
+    if done {
         return;
     }
 
-    // Read back from RAM, not from our own dirty lines — the same discipline WC-D's `bad_ram` pass
-    // uses, and the only way the read can disagree with the write.
-    let lo = fw_lo.min(rows_lo * k_row);
-    let hi = fw_hi.max(rows_hi * k_row).min(len);
-    if hi > lo {
-        crate::arch::cache::invalidate_range(base + lo, hi - lo);
+    // Read back from RAM, not from our own dirty lines — WC-D's `bad_ram` discipline. Same ranges,
+    // same separation, same reason.
+    for &(lo, hi) in ranges.iter() {
+        if hi > lo {
+            crate::arch::cache::invalidate_range(base + lo, hi - lo);
+        }
     }
 
-    // The cross-read. Each block is checked through the OTHER path's addressing; agreement of the
-    // two pitches is exactly the condition under which both counts are zero.
+    // The cross-read. Each block is checked through the OTHER path's addressing, so the two counts are
+    // zero exactly when `k_row` and `geom_row` describe the same rows.
     let mut checked = 0usize;
-    let mut comp_bad = 0usize; // left block (compositor-written) read at FIRMWARE pitch
+    let mut skipped = 0usize;
+    let mut comp_bad = 0usize; // left block (compositor-written) read at the GEOMETRY row step
     let mut direct_bad = 0usize; // right block (directly written) read at info.stride
     let mut first_bad = (0usize, 0usize, 0u32, 0u32);
     for row in 0..BLK {
@@ -234,47 +326,93 @@ pub fn run(fb: &FrameBuffer) {
             for sy in 0..SCALE {
                 let dy = ly + row * SCALE + sy;
                 for sx in 0..SCALE {
-                    checked += 1;
-                    // left, at firmware pitch
-                    let off = dy * fw_pitch + (lx + col * SCALE + sx) * 4;
-                    if off + 4 <= len {
-                        // SAFETY: bounds-checked above; volatile so the load is not folded with the
-                        // stores this function just issued.
-                        let raw = unsafe { core::ptr::read_volatile((base + off) as *const u32) };
-                        let got = decode(info.pixel_format, raw).unwrap_or(0);
-                        if got != want {
-                            if comp_bad == 0 && direct_bad == 0 {
-                                first_bad = (lx + col * SCALE + sx, dy, got, want);
+                    // left, at the geometry row step
+                    let x = lx + col * SCALE + sx;
+                    match load3(base, len, dy * geom_row + x * 4)
+                        .and_then(|b| color_of(info.pixel_format, b))
+                    {
+                        Some(got) => {
+                            checked += 1;
+                            if got != want {
+                                if comp_bad + direct_bad == 0 {
+                                    first_bad = (x, dy, got, want);
+                                }
+                                comp_bad += 1;
                             }
-                            comp_bad += 1;
                         }
+                        // A comparison that could not be made. Counted, never dropped: a `comp_bad=0`
+                        // arrived at by skipping every pixel would read exactly like agreement.
+                        None => skipped += 1,
                     }
                     // right, at info.stride
-                    if let Some(got) = fb.read_pixel(rx + col * SCALE + sx, dy) {
-                        if got != want {
-                            if comp_bad == 0 && direct_bad == 0 {
-                                first_bad = (rx + col * SCALE + sx, dy, got, want);
+                    let x = rx + col * SCALE + sx;
+                    match fb.read_pixel(x, dy) {
+                        Some(got) => {
+                            checked += 1;
+                            if got != want {
+                                if comp_bad + direct_bad == 0 {
+                                    first_bad = (x, dy, got, want);
+                                }
+                                direct_bad += 1;
                             }
-                            direct_bad += 1;
                         }
+                        None => skipped += 1,
                     }
                 }
             }
         }
     }
 
-    let ok = comp_bad == 0 && direct_bad == 0;
+    let ok =
+        comp_bad == 0 && direct_bad == 0 && skipped == 0 && direct_lost == 0 && checked == EXPECTED;
     serial_println!(
-        "[wc-f] twin left=comp@stride({},{}) right=direct@pitch({},{}) blk={}x{} scale={}x panel={}x{} k_row={}B fw_pitch={}B checked={} comp_bad={} direct_bad={} first=({},{}) got={:#08x} want={:#08x} -> {}",
-        lx, ly, rx, ly, BLK, BLK, SCALE, pw, ph, k_row, fw_pitch,
-        checked, comp_bad, direct_bad,
+        "[wc-f] twin left=comp@stride({},{}) right=direct@geomrow({},{}) blk={}x{} scale={}x panel={}x{} k_row={}B geom_row={}B alloc_pitch={}B checked={}/{} skipped={} lost={} comp_bad={} direct_bad={} first=({},{}) got={:#08x} want={:#08x} -> {}",
+        lx, ly, rx, ly, BLK, BLK, SCALE, pw, ph,
+        k_row, geom_row, truth.alloc_pitch,
+        checked, EXPECTED, skipped, direct_lost, comp_bad, direct_bad,
         first_bad.0, first_bad.1, first_bad.2, first_bad.3,
         if ok { "PASS" } else { "FAIL" }
     );
+    serial_println!(
+        "[wc-f] ramp origin=({},{}) rows={} byte_step={}B nominal=1px/row :: photograph the slope — a bend of d/4 px per row means the HVS row step is k_row+d, whatever the firmware reported",
+        rax, ray, RAMP_ROWS, k_row + 4
+    );
+
+    // Latch only now, on a pass that actually produced a verdict.
+    WITNESSED.store(true, Ordering::Relaxed);
 }
 
-/// The geometry half: the live `FrameBuffer` beside the firmware's recorded answers, with every
-/// identity a scan-out defect breaks named and evaluated, so the verdict survives without a photo.
+/// The slope marker. One two-pixel mark per row, placed by PURE BYTE ARITHMETIC: each successive mark
+/// sits `k_row + 4` bytes after the last. Under the kernel's assumed row step that is "one row down,
+/// one pixel right", so the marks photograph as an exact 1 px/row diagonal. If the hardware's real row
+/// step is `k_row + d`, each mark lands `d/4` pixels further left than intended and the diagonal bends
+/// — the slope on the photograph is a direct measurement of the step the HVS actually uses, which no
+/// number on the serial wire can be, since every one of those is the firmware describing itself.
+///
+/// Ticked white every 16th mark so rows can be counted off the photograph.
+fn ramp(base: usize, len: usize, fmt: PixelFormat, k_row: usize, x0: usize, y0: usize) {
+    let start = y0 * k_row + x0 * 4;
+    for i in 0..RAMP_ROWS {
+        let color =
+            if i % 16 == 0 { 0x00FF_FFFF } else { 0x0000_FF80 | ((i as u32 & 0xFF) << 16) };
+        let px = match bytes_of(fmt, color) {
+            Some(p) => p,
+            None => return,
+        };
+        let off = start + i * (k_row + 4);
+        store3(base, len, off, px);
+        store3(base, len, off + 4, px);
+    }
+}
+
+/// The geometry half: the live `FrameBuffer` beside the firmware's recorded answers.
+///
+/// Note what is and is not claimed here. `stride * bpp == pitch` is an IDENTITY of `init_framebuffer`
+/// (`stride = pitch / 4`), not an observation, so it is not reported as a check — it can never be
+/// false, and a witness that "passes" it is decoration. The load-bearing field is `rowstep_match`:
+/// `stride * bpp` against `virt_w * 4`, a row step derived from the reported GEOMETRY rather than from
+/// the pitch reply. It goes false exactly when the firmware pads a row — which is the padding the
+/// compositor would then be ignoring.
 fn report_geometry(
     truth: &mailbox::ScanoutTruth,
     base: usize,
@@ -292,26 +430,29 @@ fn report_geometry(
         return;
     }
     let k_row = stride * bpp;
-    // `base_match`: the mapping the compositor stores into is the buffer the firmware allocated.
+    let geom_row = truth.virt_w as usize * 4;
+    // The mapping we store into IS the buffer the firmware allocated.
     let base_match = base as u64 == truth.alloc_base;
-    // `rowbytes_match`: THE identity under suspicion. The compositor advances one row by
-    // `stride * bpp` bytes; the HVS advances by the firmware's pitch. Any difference shifts every
-    // row's phase against the one above it — the signature of the bench garble.
-    let rowbytes_match = truth.get_pitch != 0 && k_row == truth.get_pitch as usize;
-    // `pitch_match`: the allocation's pitch and an independently-queried pitch are the same number.
+    // THE row-step question, asked against geometry rather than against the pitch reply.
+    let rowstep_match = geom_row != 0 && k_row == geom_row;
+    // How many bytes per row the firmware allocated beyond the visible pixels. Padding the compositor
+    // does not know about is a row-phase garble, stated as a number.
+    let pad = (truth.alloc_pitch as usize).saturating_sub(geom_row);
+    // The allocation's pitch survives an independent, query-only re-read. Weak on its own (the same
+    // firmware answering the same question) but a divergence would be decisive.
     let pitch_match = truth.get_pitch == truth.alloc_pitch;
-    // `panel_match`: the geometry the compositor lays windows out in is the mode being scanned.
+    // The geometry `wm::place` lays windows out in is the mode being scanned.
     let panel_match = pw == truth.virt_w as usize && ph == truth.virt_h as usize;
-    // `fits`: the mapping we write through covers every row the pipe scans.
-    let fits = len >= truth.get_pitch.max(truth.alloc_pitch) as usize * truth.virt_h as usize;
-    let ok = base_match && rowbytes_match && pitch_match && panel_match && fits;
+    // The mapping covers every row the pipe scans.
+    let fits = len >= truth.alloc_pitch as usize * truth.virt_h as usize;
+    let ok = base_match && rowstep_match && pad == 0 && pitch_match && panel_match && fits;
     serial_println!(
-        "[wc-f] scanout kernel base={:#x} len={} panel={}x{} stride={}px bpp={} row_bytes={}B :: firmware base={:#x} size={} alloc_pitch={}B get_pitch={}B virt={}x{} phys={}x{} off=({},{}) depth={} order={} alpha={} :: base_match={} rowbytes_match={} pitch_match={} panel_match={} fits={} -> {}",
+        "[wc-f] scanout kernel base={:#x} len={} panel={}x{} stride={}px bpp={} k_row={}B :: firmware base={:#x} size={} alloc_pitch={}B get_pitch={}B geom_row={}B pad={}B virt={}x{} phys={}x{} off=({},{}) depth={} order={} alpha={} :: base_match={} rowstep_match={} pitch_match={} panel_match={} fits={} -> {}",
         base, len, pw, ph, stride, bpp, k_row,
-        truth.alloc_base, truth.alloc_size, truth.alloc_pitch, truth.get_pitch,
+        truth.alloc_base, truth.alloc_size, truth.alloc_pitch, truth.get_pitch, geom_row, pad,
         truth.virt_w, truth.virt_h, truth.phys_w, truth.phys_h, truth.off_x, truth.off_y,
         truth.depth, truth.order, truth.alpha,
-        base_match, rowbytes_match, pitch_match, panel_match, fits,
+        base_match, rowstep_match, pitch_match, panel_match, fits,
         if ok { "PASS" } else { "FAIL" }
     );
 }

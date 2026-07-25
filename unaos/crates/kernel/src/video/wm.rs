@@ -795,12 +795,28 @@ fn composite_inner() {
             }
         }
     }
-    // WC-F — the scan-out ground-truth probe, at the TAIL of the pass so its twin blocks are the last
-    // thing written and no compositor writer can erase them mid-frame. Repainted every pass (the
-    // panel must still carry them when the bench operator photographs it); prints once. See
-    // `video::wcf` and docs/dev/OS/08_VIDEO/engine.md §WC-F.
+    // WC-F — the scan-out ground-truth probe, at the TAIL of the pass so its marks are the last thing
+    // written and no compositor writer can erase them mid-frame. Repainted so the panel still carries
+    // them when the bench operator photographs it; prints once. See `video::wcf` and
+    // docs/dev/OS/08_VIDEO/engine.md §WC-F.
+    //
+    // Two conditions, both here rather than in `wcf` because this is where the table snapshot lives.
+    // `drawn > 0`: the probe writes ~12 K pixels and cleans its rows, and it is instrumenting the very
+    // path it runs in — charging that to every idle repaint would perturb what it measures. Passes
+    // that already drew and flushed are the ones where its cost disappears into work being done
+    // anyway. The overlap test: the probe paints LAST, so anything it covers it wins, and a window
+    // under its region would silently show WC-F's pattern instead of the app's content.
     #[cfg(all(target_arch = "aarch64", feature = "witness"))]
-    super::wcf::run(&fb);
+    if drawn > 0 {
+        let (pw, ph) = (fb.info().width, fb.info().height);
+        let clear = match super::wcf::reserved(pw, ph) {
+            None => false,
+            Some(boxes) => !rows
+                .iter()
+                .any(|r| r.used && boxes.iter().any(|b| boxes_overlap(*b, outer_box(r)))),
+        };
+        super::wcf::run(&fb, clear);
+    }
     let _ = drawn;
 }
 
