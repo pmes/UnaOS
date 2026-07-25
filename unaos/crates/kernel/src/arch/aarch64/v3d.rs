@@ -4477,11 +4477,13 @@ fn v3d58_rerender_control(what: &str) {
 const V3D59_CTSTATE: bool = true;
 /// `[v3d59] frameclose` — post-wedge time series of the bin-frame registers. Pure reads; ~64 ms.
 ///
-/// **PI-V3D-60: BANKED.** Its verdict is delivered and standing — across the extended window not one
-/// of `PCS`, `CT0CS`, `BFC`, `BPCA`, `BPCS` changed by a single bit, with `BMACTIVE` held set and
-/// `BMBUSY` clear: the bin frame is DEAD-OPEN, not slow and not overflow-stalled. Re-running it every
-/// boot buys nothing and costs a visible stall in the boot square. Gated behind `UNAOS_V3D_DEEP`
-/// (the probe-budget-trim knob) — arm deep only to re-measure that specific verdict.
+/// **PI-V3D-60: BANKED — a DEEP probe, not a default one.** Its verdict is delivered and standing:
+/// across the extended window not one of `PCS`, `CT0CS`, `BFC`, `BPCA`, `BPCS` changed by a single bit,
+/// with `BMACTIVE` held set and `BMBUSY` clear — the bin frame is DEAD-OPEN, not slow and not
+/// overflow-stalled. Re-running it every boot buys nothing and costs a visible stall in the boot square
+/// (which the bench operator reads as a hang). Gated behind the budget-trim arc's `UNAOS_V3D_DEEP`
+/// knob — arm deep only to re-measure that specific verdict. The V3D-60 `V3D60_*` constants stay
+/// unconditionally true, being fast probes with no wait at all.
 const V3D59_FRAMECLOSE: bool = V3D_DEEP;
 /// `[v3d59] mainline` — the refutation ledger, so the metal log carries its own citations.
 const V3D59_LEDGER: bool = true;
@@ -4924,6 +4926,14 @@ fn v3d60_residue_pre() {
     if !V3D60_RESIDUE {
         return;
     }
+    // Settle before the very first register read of the boot. The clock gate was opened microseconds
+    // ago and a freshly gated block can take a moment to answer; `probe_hub_ident0` gets this settle
+    // from `bringup` (a 2 ms wait plus a poison-retry window) and we sit BEFORE both. Without it a
+    // transient identity word could either send us into core reads on a block that is not answering
+    // yet, or — worse — hand the verdict logic garbage that reads as "the firmware ran frames". One
+    // bounded 2 ms wait off CNTPCT, matching bringup's own post-reset settle; no retry loop, because a
+    // single honest read is the whole point of this station.
+    settle_ms(2);
     let id0 = mmio_read(V3D_HUB_BASE, V3D_HUB_IDENT0);
     if id0 == 0 || is_poison(id0) {
         serial_println!(
@@ -5045,7 +5055,12 @@ fn v3d60_initdelta(tag: &str) {
     if !V3D60_INITDELTA {
         return;
     }
+    // `gaps` counts MEASURED divergences — rows whose verdict comes from a register readback and could
+    // read either way on any given boot. `standing_gaps` counts rows that are a property of this build
+    // and read the same every boot (today: the missing MMU fault-INTERRUPT policy). Keeping them apart
+    // is what makes `gaps=0` a reachable, meaningful verdict.
     let mut gaps = 0u32;
+    let mut standing_gaps = 0u32;
     serial_println!(
         ":: V3D: [v3d60] initdelta ({}) — every register mainline programs before its FIRST bin job, ours beside the expectation. Read-only audit; facts restated in our own words ::",
         tag
@@ -5069,7 +5084,10 @@ fn v3d60_initdelta(tag: &str) {
         | V3D_MMU_CTL_WRITE_VIOLATION_ABORT;
     let abort_ok = ctl & abort_want == abort_want;
     let latched = ctl & (V3D_MMU_CTL_PT_INVALID | V3D_MMU_CTL_WRITE_VIOLATION | V3D_MMU_CTL_CAP_EXCEEDED);
-    gaps += 1; // the interrupt-response halves are a standing gap regardless of the abort bits
+    // The missing interrupt-response halves are a STANDING gap — true of this build regardless of any
+    // register readback — so it is counted separately from the MEASURED divergences. Folding it into
+    // `gaps` would make the "no divergence remains" verdict unreachable and the row uninformative.
+    standing_gaps += 1;
     serial_println!(
         "::   [v3d60] MMU_CTL ours={:#010x} abort-set-present={} fault-latched={:#010x} — **GAP**: mainline enables BOTH the abort AND the INTERRUPT response for the page-table-invalid and write-violation conditions; UnaOS writes the ABORT halves only. The two interrupt-companion bit positions are NOT in this file's audited constant set, so this row NAMES the gap and prints the raw word rather than inventing two bit numbers. A write the MMU swallows without reporting is exactly the failure class a fault-REPORTING policy exists to surface ::",
         ctl, abort_ok as u32, latched
@@ -5124,10 +5142,12 @@ fn v3d60_initdelta(tag: &str) {
     );
 
     serial_println!(
-        ":: V3D: [v3d60] initdelta ({}) verdict — divergences/gaps={} — {} ::",
-        tag, gaps,
-        if gaps == 0 {
+        ":: V3D: [v3d60] initdelta ({}) verdict — MEASURED divergences={} STANDING gaps={} (total {}) — {} ::",
+        tag, gaps, standing_gaps, gaps + standing_gaps,
+        if gaps == 0 && standing_gaps == 0 {
             "our pre-first-bin-job register state matches every row of the mainline ledger this audit can check. No boot-state divergence remains to explain the dead-open frame"
+        } else if gaps == 0 {
+            "every MEASURED row matches mainline — no readback on this boot diverged. What remains is the STANDING gap this build carries on every boot: the MMU fault policy is armed to ABORT but not to REPORT. A write the MMU swallows silently is exactly the failure class a fault-reporting policy exists to surface, and it would be invisible to every witness in this file"
         } else {
             "the rows marked **GAP** are real differences between our boot state and the state mainline hands its first bin job. The illegal-address catcher aimed into the job's own arena and the missing fault-INTERRUPT policy are both mechanisms by which a refused PTB write would land, or vanish, WITHOUT ever being reported — the exact shape of the wall. Neither is fixed here (read-only arc); both are next-arc candidates"
         }
@@ -5469,12 +5489,11 @@ fn probe_job() {
     // so the capture carries its own mainline provenance; the reset is DISARMED and reports the virgin
     // CT0CS decode either way (it must run after S0 so the S0 sample stays a true pre-program reading).
     v3d59_mainline_ledger();
-    // [v3d60] the boot-state discriminators, all read-only and all taken at this quiescent pre-kick
-    // station: the ours-vs-mainline init ledger, the back-to-back CTnSYNC read-side-effect test (which
-    // settles the hedge [v3d59] ctstate left on its semaphore row), and the PRE half of the
-    // protection/translation fault-latch delta that closes at wait-exit below.
+    // [v3d60] the ours-vs-mainline init ledger — read-only, taken at this quiescent pre-kick station.
+    // (`v3d60_syncrd`, the CTnSYNC read-side-effect adjudicator, deliberately does NOT sit here: it
+    // would add two reads per register INSIDE the S0..S4 window whose semaphore readings it exists to
+    // adjudicate. It runs after `v3d59_emit_ctstate`, once that series is closed — see below.)
     v3d60_initdelta("v3d40 PROBE pre-kick");
-    v3d60_syncrd("v3d40 PROBE pre-kick");
     v3d59_ct0_frame_reset("v3d40 PROBE");
     clear_mmu_fault_latch("v3d28 pre-probe");
     // [v3d60] the PRE half of the fault-latch delta — taken AFTER the MMU fault latch is cleared, so
@@ -5611,10 +5630,19 @@ fn probe_job() {
     // (CTERR/CTSUBS/CTSEMA — never named until this arc) plus the never-read CT0SYNC/CT1SYNC/BXCF, and
     // then a second look at the wedged block to separate "stalled" from "dead-open". Both pure reads.
     v3d59_emit_ctstate("v3d40 PROBE", &[st0, st1, st2, st3, st4]);
+    // [v3d60] the read-side-effect adjudicator runs HERE — after the S0..S4 series is sampled AND
+    // emitted, never inside it. `[v3d59] ctstate` hedged its semaphore row on the possibility that its
+    // own five reads per register moved what they measured; a probe that answers that question must not
+    // itself add reads to the window under adjudication. The block is quiescent at this point (the
+    // frame is wedged open, CT0CS static), which is exactly the condition the test needs: two
+    // back-to-back reads with nothing between them but the reads.
+    // (ordered after the fault-latch delta below, whose post sample must sit as close to wait-exit as
+    // it can — see the `v3d60_syncrd` call following it.)
     // [v3d60] close the fault-latch delta at wait-exit, BEFORE the L2T flushes and cache maintenance
     // below can perturb anything: what did the memory-protection block or the MMU refuse DURING the
     // frame? Every prior reading of these registers was a single post-hoc sample.
     v3d60_emit_gmpdelta("v3d40 PROBE", &prot_pre, &v3d60_prot_sample());
+    v3d60_syncrd("v3d40 PROBE post-ctstate");
     v3d59_frameclose_poll("v3d40 PROBE post-bin");
     // Read the battery now the probe has idled — THE decisive witness for V3D-35. valid_instr says how far
     // the probe thread got (reached the [9] store word or died before it); tcache_access says whether the

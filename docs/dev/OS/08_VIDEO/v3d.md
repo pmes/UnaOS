@@ -2100,8 +2100,15 @@ Most rows agree — the MMU table base, the L2T flush window (V3D-51), both inte
 | `[v3d60] residue (post-reset)` | `BMACTIVE` still set after the cycle | Our OFF→ON power cycle does **not** close (or does not reach) an open PTB frame. |
 | `[v3d60] residue (post-reset)` | Zero fields moved | The reset changed **nothing**. Cross-read the `[v3d50]` ASB/PM lines: bridges ACKed ⇒ the registers were already clean; bridges silent ⇒ this driver has never actually reset the V3D. |
 | `[v3d60] ident` | Technology version ≠ `0x42` | **Campaign foundation invalid** — the CL packing, QPU word encoding and register map were all audited against V3D 4.2. Resolve before trusting any further PTB reading. |
-| `[v3d60] initdelta` | `gaps=0` | Our pre-first-job register state matches every checkable row of the mainline ledger. No boot-state divergence remains to explain the dead-open frame. |
-| `[v3d60] initdelta` | `gaps>0` | The rows marked **GAP** are mechanisms by which a refused PTB write would land — or vanish — without ever being reported. Exactly the shape of the wall. |
+| `[v3d60] initdelta` | `MEASURED divergences=0`, `STANDING gaps=0` | Our pre-first-job register state matches every checkable row of the mainline ledger. No boot-state divergence remains to explain the dead-open frame. |
+| `[v3d60] initdelta` | `MEASURED=0`, `STANDING=1` | Every readback row matches mainline; what remains is the gap this build carries on **every** boot — the MMU fault policy armed to **abort** but not to **report**. A write the MMU swallows silently would be invisible to every witness in this file. **This is the expected reading today.** |
+| `[v3d60] initdelta` | `MEASURED>0` | A readback actually diverged this boot. The rows marked **GAP** are mechanisms by which a refused PTB write would land — or vanish — without ever being reported. Exactly the shape of the wall. |
+
+The two counts are kept separate deliberately. `MEASURED` covers rows whose verdict comes from a register
+readback and could go either way on any boot; `STANDING` covers rows that are a property of this build
+and read identically every time (today: exactly one, the missing fault-interrupt policy). Folding the
+standing row into the measured count would make "no divergence remains" unreachable and the row
+uninformative.
 | `[v3d60] syncrd` | Back-to-back reads differ | The CLE semaphore registers **self-modify on read**. `[v3d59] ctstate`'s `sema_moved` row is a probe artifact and is **retracted**; future decodes must sample them at most once per boot. |
 | `[v3d60] syncrd` | Back-to-back reads identical | No read side effect. `[v3d59]`'s semaphore row stands as measured and its five-reads hedge can be dropped. |
 | `[v3d60] gmpdelta` | A protection violation latches **during** the frame | **The silent-drop mechanism.** The protection block refuses the PTB's pool write; nothing lands, no MMU fault and no `CTERR` is raised — item-accept-without-pool-write, exactly. |
@@ -2114,10 +2121,12 @@ Most rows agree — the MMU table base, the L2T flush window (V3D-51), both inte
 Every V3D-60 probe is **read-only** — no register is written, so no write needs justifying, and `CTRSTA`
 stays disarmed. None of them waits on anything: no deadline, no polling window, no added boot stall.
 
-`[v3d59] frameclose` is **banked and switched off** by this arc (`V3D59_FRAMECLOSE = false`). Its verdict
-is delivered and standing — dead-open, not slow and not overflow-stalled — and re-running its extended
-window every boot buys nothing while costing a visible stall in the boot square. Flip it back only to
-re-measure that specific verdict.
+`[v3d59] frameclose` is **banked as a deep probe** by this arc. Its verdict is delivered and standing —
+dead-open, not slow and not overflow-stalled — and re-running its extended window every boot buys
+nothing while costing a visible stall in the boot square. It belongs behind the deep-probe knob
+(`UNAOS_V3D_DEEP`) introduced by the concurrent budget-trim arc, which owns that knob; at integration
+`V3D59_FRAMECLOSE` resolves to `V3D_DEEP`, and until then the constant carries the knob-off value. The
+V3D-60 probes themselves stay unconditionally on — they are fast probes with no wait at all.
 
 QEMU `raspi4b` models no V3D. The pre-reset probe reads the hub identity word **first** and returns
 before touching any core register unless that word is live, which is the same poison-honest gate
