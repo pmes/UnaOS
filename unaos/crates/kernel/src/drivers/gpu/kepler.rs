@@ -460,6 +460,10 @@ pub fn init(gpu: &GpuInfo) {
                                         //   f8 02            exit
                                         const UCODE_A: [u32; 5] = [0x100017f1, 0xface27f1, 0xf00d23f1, 0xf80012d1, 0x00000002];
                                         const UCODE_B: [u32; 5] = [0x004017f1, 0xbeef27f1, 0xf00d23f1, 0xf80012d1, 0x00000002];
+                                        const UCODE_HB: [u32; 8] = [
+                                            0x110017f1, 0xf00037f0, 0x27f05033, 0x0120b600,
+                                            0xb60012d0, 0x1bf40132, 0x0002f8f7, 0x00000000,
+                                        ];
                                         const MB_SEED: u32 = 0xA5A5_0000;
                                         // IMEM page granularity: the code TLB marks a page usable only when the
                                         // last word of the 0x40-word page is written (nouveau pads for this reason).
@@ -546,6 +550,34 @@ pub fn init(gpu: &GpuInfo) {
                                             serial_println!(":: kepler: ucode img={} mailbox unchanged — trying next encoding ::", img_label);
                                         }
                                         
+                                        // --- UCODE_HB (Live Engine Witness) ---
+                                        mmio_write(bar0, base + 0x044, MB_SEED);
+                                        
+                                        mmio_write(bar0, base + 0x180, 1 << 24); // IMEMC AINCW
+                                        mmio_write(bar0, base + 0x188, 0); // IMEMT tag=0
+                                        for &word in UCODE_HB.iter() { mmio_write(bar0, base + 0x184, word); }
+                                        for _ in UCODE_HB.len()..IMEM_PAGE_WORDS { mmio_write(bar0, base + 0x184, 0); }
+                                        
+                                        mmio_write(bar0, base + 0x180, 1 << 25); // IMEMC AINCR
+                                        let mut verify_hb = true;
+                                        for k in 0..UCODE_HB.len() {
+                                            if mmio_read(bar0, base + 0x184) != UCODE_HB[k] { verify_hb = false; }
+                                        }
+                                        if !verify_hb {
+                                            serial_println!(":: kepler: hb ABORT verify-mismatch ::");
+                                        } else {
+                                            let dmactl_pre = mmio_read(bar0, base + 0x10C);
+                                            mmio_write(bar0, base + 0x10C, dmactl_pre & !1);
+                                            if (mmio_read(bar0, base + 0x10C) & 1) == 0 {
+                                                mmio_write(bar0, base + 0x104, 0); // BOOTVEC=0
+                                                mmio_write(bar0, base + 0x100, 2); // CPUCTL START_TRIGGER
+                                                let pre_mb1 = mmio_read(bar0, base + 0x044);
+                                                serial_println!(":: kepler: hb start mb1={:08X} ::", pre_mb1);
+                                            } else {
+                                                serial_println!(":: kepler: hb dmactl REFUSED ::");
+                                            }
+                                        }
+
                                         // Read-only sweep of the unit window: locates either sentinel wherever it
                                         // actually landed (MAILBOX1 on an off-by-one, INTR on a wrong-port write).
                                         for off in (0..=0x1FC).step_by(4) {
@@ -590,6 +622,10 @@ pub fn init(gpu: &GpuInfo) {
                                         } }
                                     }
 
+                                    let pre_wit_mb1 = mmio_read(bar0, 0x409000 + 0x044);
+                                    let pre_wit_cpu = mmio_read(bar0, 0x409000 + 0x100);
+                                    serial_println!(":: kepler: hb pre-witness mb1={:08X} cpuctl={:08X} ::", pre_wit_mb1, pre_wit_cpu);
+
                                     // --- Witness Rematch ---
                                     serial_println!(":: kepler: witness-rematch begin (pgraph on) ::");
 
@@ -623,6 +659,15 @@ pub fn init(gpu: &GpuInfo) {
                                     } else {
                                         serial_println!(":: kepler: WITNESS PASSED - bits stuck! ::");
                                     }
+
+                                    let post_wit_mb1 = mmio_read(bar0, 0x409000 + 0x044);
+                                    let post_wit_cpu = mmio_read(bar0, 0x409000 + 0x100);
+                                    serial_println!(":: kepler: hb post-witness mb1={:08X} cpuctl={:08X} ::", post_wit_mb1, post_wit_cpu);
+                                    
+                                    for _ in 0..1_000_000 { core::hint::spin_loop(); }
+                                    let final_mb1 = mmio_read(bar0, 0x409000 + 0x044);
+                                    let final_cpu = mmio_read(bar0, 0x409000 + 0x100);
+                                    serial_println!(":: kepler: hb final mb1={:08X} cpuctl={:08X} ::", final_mb1, final_cpu);
 
                                     // 3. Submit Runlist
                                     mmio_write(bar0, 0x2270, (runlist_off as u32) >> 12); // target=0 (VRAM), addr
