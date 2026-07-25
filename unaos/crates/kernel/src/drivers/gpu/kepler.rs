@@ -400,6 +400,39 @@ pub fn init(gpu: &GpuInfo) {
                                             let imemc = mmio_read(bar0, base + 0x180);
                                             let dmemc = mmio_read(bar0, base + 0x1C0);
                                             serial_println!(":: kepler: fal-base b={:06X} verdict cpuctl={:08X} imemc={:08X} dmemc={:08X} ::", base, cpuctl, imemc, dmemc);
+
+                                            // K-GPU-4 Pull 24: Falcon Sentinel Port Probe
+                                            mmio_write(bar0, base + 0x180, 1 << 24); // IMEMC offset=0, AINCW
+                                            let imemc_rb = mmio_read(bar0, base + 0x180);
+                                            serial_println!(":: kepler: fal-port b={:06X} imemc wr=01000000 rb={:08X} ::", base, imemc_rb);
+                                            
+                                            mmio_write(bar0, base + 0x184, 0xDEADBEEF);
+                                            mmio_write(bar0, base + 0x184, 0xCAFEF00D);
+                                            mmio_write(bar0, base + 0x184, 0x12345678);
+                                            mmio_write(bar0, base + 0x184, 0xA5A55A5A);
+                                            
+                                            mmio_write(bar0, base + 0x180, 1 << 25); // reset offset, AINCR
+                                            let imem_w0 = mmio_read(bar0, base + 0x184);
+                                            let imem_w1 = mmio_read(bar0, base + 0x184);
+                                            let imem_w2 = mmio_read(bar0, base + 0x184);
+                                            let imem_w3 = mmio_read(bar0, base + 0x184);
+                                            serial_println!(":: kepler: fal-port b={:06X} imem rb w0={:08X} w1={:08X} w2={:08X} w3={:08X} ::", base, imem_w0, imem_w1, imem_w2, imem_w3);
+                                            
+                                            mmio_write(bar0, base + 0x1C0, 1 << 24); // DMEMC offset=0, AINCW
+                                            let dmemc_rb = mmio_read(bar0, base + 0x1C0);
+                                            serial_println!(":: kepler: fal-port b={:06X} dmemc wr=01000000 rb={:08X} ::", base, dmemc_rb);
+                                            
+                                            mmio_write(bar0, base + 0x1C4, 0xDEADBEEF);
+                                            mmio_write(bar0, base + 0x1C4, 0xCAFEF00D);
+                                            mmio_write(bar0, base + 0x1C4, 0x12345678);
+                                            mmio_write(bar0, base + 0x1C4, 0xA5A55A5A);
+                                            
+                                            mmio_write(bar0, base + 0x1C0, 1 << 25); // reset offset, AINCR
+                                            let dmem_w0 = mmio_read(bar0, base + 0x1C4);
+                                            let dmem_w1 = mmio_read(bar0, base + 0x1C4);
+                                            let dmem_w2 = mmio_read(bar0, base + 0x1C4);
+                                            let dmem_w3 = mmio_read(bar0, base + 0x1C4);
+                                            serial_println!(":: kepler: fal-port b={:06X} dmem rb w0={:08X} w1={:08X} w2={:08X} w3={:08X} ::", base, dmem_w0, dmem_w1, dmem_w2, dmem_w3);
                                         }
 
                                         // s25/s26 fold: 0x400100 base is proven nonexistent on GK107;
