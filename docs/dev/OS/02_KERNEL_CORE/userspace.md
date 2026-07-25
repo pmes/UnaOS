@@ -888,6 +888,58 @@
     **46/46 required witnesses, 0 forbidden**, UVUG batch `frames=300 checksum=0x48221e4101db3924 exit=0`
     **unchanged**. Lane: `arch/aarch64/sched.rs` + the `run_user_image` `Timeout` path and the SVC boundary
     in `arch/aarch64/syscall.rs` + this doc.
+- **EXEC1-M (this arc)** — the **late-publish window** in `run_user_image`, and the end of the metal-only
+  `EXEC1` failure. On every real Pi 4 boot (P55b, P56) the run-path witness reported
+  `:: EXEC1: run /fat/ELFHELLO.ELF — EL0 program did not exit in time -> FAIL ::`, while QEMU raspi4b
+  reported `exit=0 -> PASS` from the same image. UVUG-10's fixture gate above removed the boot-time input
+  orphan and left cpu2 idle at boot, and `EXEC1` still failed — so orphan starvation was never the cause.
+  - **What actually happened.** `run_user_image` cannot know the pid until `sched::spawn_user_slot`
+    returns, so it spawned first and published `PROCS[pi].asid` / `.pid` afterwards. The comment justifying
+    that order — "the caller yields only in the wait loop below, so the pid is always stored before the
+    exit path's `proc_find_running` lookup" — is the *cooperative* reading of the `sys_spawn` co-location
+    invariant, and this scheduler is **preemptive**: a quantum tick dispatches the co-located EL0 task with
+    no yield involved. The window is therefore real, and on metal it is **milliseconds wide**, because
+    `spawn_user_slot` pushes the task onto the run queue and only *then* emits its
+    `:: SCHED: task '…' -> core N ::` placement line — a ~70-byte 115200-baud UART write, ≈6 ms. ELFHELLO
+    is three syscalls long (write, report, exit), so it ran to completion inside that print. Its `SYS_EXIT`
+    found no row keyed by its pid, fell through to the generic counters, and retired. The row stayed
+    `PRUNNING` forever; `run_user_image` waited out its whole 5 s deadline **on a task that had already
+    exited correctly** and returned `Timeout`. The SKILL-1 kill that follows then targeted an
+    already-retired task and could never confirm — which is exactly the
+    `[skill] killed pid=108 asid=1 confirmed=0 row=orphaned` in the P56 capture, and why the kill primitive
+    looked like it was failing when it was in fact being handed a corpse.
+  - **Why QEMU was green.** Nothing about the code differs; only the width of the window does. QEMU's
+    serial write is effectively free, so the gap between the run-queue push and the pid store is
+    nanoseconds and the tick essentially never lands there. This is the ordinary timing class — the null
+    hypothesis was our code throughout, and it held.
+  - **The fix: make the ASID the key that survives the window.** The ASID is known *before* the task can
+    exist, so it is now stored **before** the spawn. `SYS_EXIT` gains a rescue arm after the pid lookup:
+    `proc_find_unpublished(current_asid())` matches a row that is `PRUNNING` **and** `pid == 0` **and**
+    carries our ASID — by construction only a row that is mid-publish, since a live EL0 ASID names exactly
+    one slot and an ELF-2 sibling's process row already has its pid published. The status and `done` post
+    are identical to the live-child arm, so the parent observes `PEXITED` on its next pass. The pid store
+    still happens (it remains the key for wait/kill/orphan-reclaim); it is simply no longer load-bearing
+    for the correctness of the exit path. Publish order elsewhere (`sys_spawn`, U7, U6-grants) is
+    deliberately **unchanged**: those rows still read `asid == 0` through their own window, so the new arm
+    cannot match them and their behaviour is byte-identical.
+  - **Proven in QEMU by widening the window, not by argument.** A temporary 100 ms delay inserted between
+    the spawn and the pid store reproduces the metal failure in QEMU **exactly**, down to the SKILL-1
+    signature: `[uvug8] run deadline expired … parked PORPHANED (pid=102, asid=1)`,
+    `[skill] killed pid=102 asid=1 confirmed=0 row=orphaned`,
+    `:: EXEC1: … did not exit in time -> FAIL ::`. With the rescue arm restored and the same delay in
+    place, the run reports `[exec1] LATE-PUBLISH rescue — EL0 task exited (status=0) before its parent
+    stored the pid; Proc row 0 resolved by asid=1 and reaped normally` followed by
+    `:: EXEC1: … exit=0 -> PASS ::`. Both probes were removed before the commit; they are recorded here
+    because the negative control is what makes the diagnosis a proof rather than a plausible story.
+  - **Metal telemetry.** The `[exec1] LATE-PUBLISH rescue …` line is latched once per boot and is the
+    arc's one-line verdict on the bench: its **presence** means the window opened on that boot and was
+    handled instead of costing a spurious `Timeout`; its **absence** alongside `:: EXEC1: … PASS ::` means
+    the window never opened. Either way the FAIL line is gone, and it remains covered by the spec's
+    always-on `-> FAIL` forbid, so a regression fails the harness without a spec change.
+  - Gates: `./arroyo check` green x86_64 + aarch64; `./arroyo kernel8` builds; `./arroyo kernel8-test 120`
+    **49/49 required witnesses, 0 forbidden**, `:: EXEC1: run /fat/ELFHELLO.ELF — loaded 8560 bytes, entry
+    0x300000, exit=0 -> PASS ::`; `./arroyo test-arm` green. Lane: `arch/aarch64/syscall.rs`
+    (`run_user_image` publish order, `proc_find_unpublished`, the `SYS_EXIT` rescue arm) + this doc.
 - **WC-C (window compositor, clients + focus)** — the arc where real EL0 programs use the window verbs.
   Full write-up: `docs/dev/OS/08_VIDEO/engine.md` §8 "WC-C". Userspace-visible changes:
   - **UVUG is windowed.** `crates/user-uvug` drops `SYS_FB_MAP`/`SYS_FB_PRESENT` for

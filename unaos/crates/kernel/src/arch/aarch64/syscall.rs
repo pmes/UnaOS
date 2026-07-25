@@ -3180,6 +3180,39 @@ fn proc_find_running(pid: u64) -> Option<usize> {
     })
 }
 
+/// EXEC1-M — find the RUNNING Proc entry that has been claimed for `asid` but whose **pid is not published
+/// yet** (`pid == 0`). This is the ASID-keyed twin of `proc_find_running`, and it exists to close the
+/// LATE-PUBLISH window in `run_user_image`.
+///
+/// `run_user_image` must call `sched::spawn_user_slot` before it can know the pid, so there is an unavoidable
+/// window between the run-queue push (the instant the task becomes dispatchable) and `PROCS[pi].pid.store`.
+/// The scheduler is PREEMPTIVE and the task is co-located, so a timer tick inside that window dispatches the
+/// EL0 program immediately. On metal the window is milliseconds wide — `spawn_user_slot` itself emits the
+/// `:: SCHED: task '…' -> core N ::` placement line, a ~70-byte 115200-baud UART write (~6 ms) that happens
+/// AFTER the push — so the tick lands there essentially every boot. A short EL0 program (ELFHELLO: write,
+/// report, exit) then ran to completion before the pid was ever stored, its SYS_EXIT's `proc_find_running`
+/// missed the row, the row stayed `PRUNNING` forever, and `run_user_image` always reported `Timeout`. That is
+/// the metal-only `:: EXEC1: … EL0 program did not exit in time -> FAIL ::`. In QEMU the same UART write is
+/// effectively free, the window is nanoseconds, and the race is never observed — hence QEMU-green.
+///
+/// The ASID is known BEFORE the spawn, so `run_user_image` now publishes it first and this lookup resolves
+/// the row from the exiting task's live `TTBR0_EL1`. The match is deliberately narrow — `PRUNNING` **and**
+/// `pid == 0` — so it can only ever name a row that is mid-publish. A row that is still `pid == 0` carries a
+/// non-zero `asid` only between those two stores, and a live EL0 ASID is unique to one slot, so there is no
+/// other candidate: an ELF-2 sibling thread's process row already has its pid published and is matched by
+/// `proc_find_running` as before. `asid == 0` (a freshly claimed, not-yet-endowed row) can never match,
+/// because only EL0 tasks reach SYS_EXIT and their ASIDs are non-zero.
+fn proc_find_unpublished(asid: u64) -> Option<usize> {
+    if asid == 0 {
+        return None;
+    }
+    (0..MAX_PROCS).find(|&i| {
+        PROCS[i].state.load(Ordering::Acquire) == PRUNNING
+            && PROCS[i].pid.load(Ordering::Acquire) == 0
+            && PROCS[i].asid.load(Ordering::Acquire) == asid
+    })
+}
+
 /// Find the non-FREE (RUNNING or EXITED) Proc entry whose pid matches — the sys_wait lookup. `None` => the
 /// caller has no such child (`-ECHILD`).
 fn proc_find_child(pid: u64) -> Option<usize> {
@@ -5924,6 +5957,34 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
                     super::sched::exit(); // never returns
                 }
             }
+            // EXEC1-M: LATE-PUBLISH rescue. The pid lookup above missed, but this task may still belong to a
+            // `run_user_image` row that was claimed and endowed with our ASID and simply has not stored its
+            // pid yet — the preemption window described on `proc_find_unpublished`. Without this arm the exit
+            // is silently swallowed by the generic counters below, the row never leaves `PRUNNING`, and the
+            // parent burns its whole deadline and reports `Timeout` on a program that exited correctly. That
+            // was the metal-only EXEC1 failure. Post the status exactly as the live-child arm does; the
+            // parent's store of the (now irrelevant) pid afterwards is harmless.
+            //
+            // The witness fires ONCE per boot. It is the arc's metal verdict line: `run_user_image` publishes
+            // the ASID before the spawn precisely so this arm can catch the race, so seeing it means the race
+            // is real and was handled — and NOT seeing it, with EXEC1 PASSing, means the window never opened.
+            {
+                let asid = current_asid();
+                if let Some(i) = proc_find_unpublished(asid) {
+                    if !LATE_PUBLISH_WITNESSED.swap(true, Ordering::AcqRel) {
+                        serial_println!(
+                            "[exec1] LATE-PUBLISH rescue — EL0 task exited (status={}) before its parent stored the pid; Proc row {} resolved by asid={} and reaped normally",
+                            a0 as i32,
+                            i,
+                            asid
+                        );
+                    }
+                    PROCS[i].status.store(a0 as i32, Ordering::Release);
+                    PROCS[i].state.store(PEXITED, Ordering::Release);
+                    PROCS[i].done.post();
+                    super::sched::exit(); // never returns
+                }
+            }
             // M6g: the disk-loaded program (the M6c `hello` bytes off the SD card) exits with status 0.
             // Route by NAME, BEFORE the sentinel-status checks, so its exit lands in the M6g counters and
             // never corrupts the M6b `EL0_EXITED_OK` accounting (which `exited=1` depends on).
@@ -6602,11 +6663,31 @@ pub fn run_user_image(
     // Done BEFORE the spawn, on a slot no other core can resolve yet (the co-location invariant below).
     install_console_cap(asid);
     let cpu = super::percpu::this_cpu().cpu_index as usize;
-    let pid = super::sched::spawn_user_slot(name, mapped.base, mapped.sp, mapped.ttbr0, cpu);
-    // Publish the Proc key (ASID before pid — the entry's live word) BEFORE the co-located task can be
-    // dispatched: the caller yields only in the wait loop below, so the pid is always stored before the
-    // exit/kill path's `proc_find_running` lookup (the sys_spawn co-location invariant, reused here).
+    // EXEC1-M — PUBLISH THE ASID BEFORE THE SPAWN.
+    //
+    // The pre-arc order (spawn, then store asid, then store pid) rested on the claim that "the caller yields
+    // only in the wait loop below, so the pid is always stored before the exit path's `proc_find_running`
+    // lookup". That is the COOPERATIVE reading of the sys_spawn co-location invariant, and it is false here:
+    // this scheduler is preemptive (a timer tick dispatches the co-located task without any yield), and
+    // `spawn_user_slot` pushes the task onto the run queue and only THEN emits its `:: SCHED: task … ::`
+    // placement line — a multi-millisecond UART write on metal. A short EL0 program dispatched by a tick in
+    // that window ran to completion, and its SYS_EXIT found no row keyed by its pid. `run_user_image` then
+    // waited out the full deadline on an already-dead task and returned `Timeout`; the SKILL-1 kill that
+    // follows could never confirm, because its target had already retired (the observed
+    // `[skill] killed pid=… confirmed=0 row=orphaned`). That is the metal-only EXEC1 FAIL, and QEMU never
+    // showed it only because a free UART narrows the window to nanoseconds.
+    //
+    // The ASID is known here, before the task can exist, so it is stored FIRST. It is now the key that
+    // survives the whole window: `proc_find_unpublished` resolves the row from the exiting task's live
+    // `TTBR0_EL1` whenever the pid has not landed yet. The pid store still happens (it is the key every other
+    // lookup — wait, kill, orphan reclaim — uses); it is simply no longer load-bearing for correctness of the
+    // exit path. Ordering is Release/Acquire throughout, so the endowed ASID is visible to any core that can
+    // observe the task at all.
     PROCS[pi].asid.store(asid, Ordering::Release);
+    let pid = super::sched::spawn_user_slot(name, mapped.base, mapped.sp, mapped.ttbr0, cpu);
+    // Publish the pid. The row may ALREADY be `PEXITED` by now (the late-publish rescue fired inside the
+    // window); storing the pid onto a reaped-but-not-yet-freed row is harmless — the row is not recycled
+    // until `proc_free`, and the wait loop below observes `PEXITED` on its very first pass.
     PROCS[pi].pid.store(pid, Ordering::Release);
     // INPUT-WIRE (ELF-5 router fold): register this program as the ACTIVE input target so the GUI router
     // (main.rs `pump_usb_into_gui`) delivers real keys/mouse into ITS per-process ring while it runs. Set
@@ -10064,6 +10145,13 @@ const KILL_CONFIRM_SECS: u64 = 2;
 /// (see `sched::kill_detach`'s documented limits) — a condition whose only other symptom would be timeouts
 /// silently reverting to orphaning. One line per boot names it.
 static KILL_EXHAUSTED: AtomicBool = AtomicBool::new(false);
+
+/// EXEC1-M: latched the first time the SYS_EXIT late-publish rescue resolves a Proc row by ASID because the
+/// pid had not been stored yet (see `proc_find_unpublished`). One line per boot: it is the metal telemetry
+/// for the preemption window that made EXEC1 fail on hardware and pass in QEMU. Its ABSENCE alongside an
+/// `:: EXEC1: … PASS ::` means the window never opened on that boot; its PRESENCE means it opened and was
+/// handled correctly rather than costing a spurious `Timeout`.
+static LATE_PUBLISH_WITNESSED: AtomicBool = AtomicBool::new(false);
 
 /// UVUG-8r2: how much suspended time one `run` may accumulate WITHOUT PRESENTING A FRAME before takeover
 /// stops suspending its deadline. The heartbeat gate bounds a *silent* wedge, but not a *noisy* one: an app
