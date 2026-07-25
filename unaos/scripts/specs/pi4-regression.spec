@@ -242,5 +242,5 @@ FORBID \[wc-d\] verify .*-> FAIL
 # ---   lying "running" under a dead task). The interactive half (TAB between two bg windows) is
 # ---   bench-only — QEMU has no HID.
 REQUIRE BGRUN-ST: spawn->exit->reap PASS
-REQUIRE BGRUN-ST: kill mid-run PASS
+REQUIRE BGRUN-ST: kill mid-run PASS \(pid=[0-9]+, killed — row reaped
 FORBID BGRUN-ST: .*-> FAIL

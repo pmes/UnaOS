@@ -912,9 +912,14 @@
     so waiting for `jobs` would read "running" forever); a repeat `kill` on a parked row returns early
     (`proc_orphan`'s PRUNNING precondition is honoured — the round-1 lens showed the alternative parks
     the shell task forever on a permitless `done.wait`).
-  - Witnesses: `:: BGRUN: bg <path> — … DETACHED ::` on spawn, `:: BGRUN: jobs — pid=… reaped ::` on reap.
-    No spec REQUIRE: QEMU has no HID to drive an interactive session, and the batch fixtures exercise the
-    foreground path; the bench proof is `bg /fat/uvug.elf` twice → TAB between two live crystals.
+  - Witnesses: `:: BGRUN: bg <path> — … DETACHED ::` on spawn, `:: BGRUN: jobs — pid=… reaped ::` on reap,
+    and the boot-time `BGRUN-ST` selftest pair, spec-REQUIREd (spawn->exit->reap + kill-mid-run, plus a
+    `-> FAIL` FORBID) — the round-1 lens showed the headless-observable core of the contract was gateable
+    after all. Only the INTERACTIVE half is bench-only (QEMU has no HID): `bg /fat/uvug.elf` twice → TAB
+    between two live crystals. One widening worth knowing at the bench: the shell now consumes TAB at
+    n == 1, so TABbing during a single-window foreground `run` drops focus to the parked shell — TAB back
+    re-enters; linger instead and the takeover re-arm can SKILL-1 the app ~5 s later. The safety property
+    (never weld the operator away from `kill`) outranks that exposure, deliberately.
 - **EXEC1-M (this arc)** — the **late-publish window** in `run_user_image`, and the end of the metal-only
   `EXEC1` failure. On every real Pi 4 boot (P55b, P56) the run-path witness reported
   `:: EXEC1: run /fat/ELFHELLO.ELF — EL0 program did not exit in time -> FAIL ::`, while QEMU raspi4b

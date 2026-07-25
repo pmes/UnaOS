@@ -6666,7 +6666,7 @@ pub fn run_user_image(
     // Claim the Proc entry FIRST so a failed map frees nothing but the entry (no slot is allocated on any
     // map-failure path), and so the pid slot exists before the co-located task can be dispatched.
     let Some(pi) = proc_reserve() else {
-        return Err("process table full");
+        return Err("process table full (run `jobs` to reap exited background programs)");
     };
     let mapped = match map_image_into_slot(bytes) {
         Ok(m) => m,
@@ -10608,6 +10608,10 @@ fn wc_focus_key(ev: crate::pal::Event) -> bool {
     let next = match at {
         Some(i) if i + 1 == n => 0, // last window -> the shell
         Some(i) => ring[i + 1],
+        // The two n > 0 arms share a body on purpose — they are distinct CASES (shell entering the
+        // ring vs a windowless focused app being rescued to the ring head) that happen to share a
+        // destination; keeping them separate keeps the case analysis readable and the n == 0 arm's
+        // ordering-based memory safety visible.
         None if n > 0 && cur == 0 => ring[0], // shell -> first window
         None if n > 0 => ring[0],             // focused app owns no window -> ring head
         None => 0,                            // no windows at all -> the shell

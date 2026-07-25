@@ -3633,6 +3633,11 @@ fn bg_jobs(console: &mut Console) {
         let Some(job) = *slot else { continue };
         any = true;
         let name = core::str::from_utf8(&job.name[..job.nlen as usize]).unwrap_or("?");
+        // LOCK-ACROSS-REAP (lens should-fix, written down): this holds the BG_JOBS spinlock across
+        // `bg_poll(reap=true)` -> `done.wait()`. Safe because the reap arm runs ONLY on a row observed
+        // PEXITED, and SYS_EXIT posts the `done` permit strictly before publishing PEXITED — so the
+        // wait takes the count>0 fast path and cannot park under the held lock. The one state where
+        // that permit assumption fails (PORPHANED, the round-1 deadlock) never reaches the reap arm.
         match crate::arch::syscall::bg_poll(job.pid, true) {
             BgPoll::Running => {
                 console.println(&alloc::format!("  pid {:>3}  running  {}", job.pid, name));
@@ -3676,6 +3681,17 @@ fn bg_kill_cmd(console: &mut Console, pid: u64) {
     drop(jobs); // bg_kill yields while confirming; never hold the table lock across that.
     let verdict = crate::arch::syscall::bg_kill(job.pid, job.asid);
     console.println(&alloc::format!("kill: pid {}: {}", pid, verdict));
+    // Lens should-fix (c): a CONFIRMED kill reaps the row in place, so a later `jobs` could only say
+    // "gone" — drop the table entry here instead, so the operator's record of the outcome is THIS
+    // line ("killed — row reaped") rather than an uninformative gone.
+    if verdict.starts_with("killed") {
+        let mut jobs = BG_JOBS.lock();
+        for slot in jobs.iter_mut() {
+            if matches!(slot, Some(j) if j.pid == pid) {
+                *slot = None;
+            }
+        }
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
