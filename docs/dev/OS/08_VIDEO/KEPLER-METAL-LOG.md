@@ -3,6 +3,33 @@
 Hard-won silicon facts from the fox-metal sitting series. Trust these over any
 QEMU behavior. Newest sitting first.
 
+## Sitting #23 (display pull 13 + fence pull 20, UnaOS-gemini@85a4a492/504f7f80, 2026-07-25, fox-metal-r23s1l, s23boot1)
+
+**Fence — WITNESS REMATCH: REFUTED (decisive, refutation #7).** With
+PGRAPH enabled (pre=E011216D → rb=E011316D, bit 12 accepted, same as
+s22), the historic strip signature reproduces EXACTLY: PFIFO_CHAN[1]
+pre-submit 00=00002000 (VALID/POLL 0xC0000000 stripped), err=00000002
+post-init/post-restore/post-submit, stat=00000005 post-submit,
+playlist_rd=00002013 len=00100003 (runlist accepted, as always),
+all three pbdma discriminators 00000000. Capture awk-verified.
+**The fence wall is NOT pgraph-power-gating.** The engine-off theory is
+dead; the wall survives a powered (halted, no-ucode) engine. Per the
+standing s21 ruling, **K-GPU-4 begins: cleanroom Falcon microcode**
+(spec docs/dev/OS/08_VIDEO/falcon_microcode_spec.md, CLEANROOM notice
+binding). Plausible residual theory folded into the arc: PFIFO may
+require a RUNNING engine (ucode heartbeat), not merely an ungated one —
+the first ucode milestone tests exactly that. Note for the arc: imemc/
+dmemc still read BADF1000 post-enable (s22) — Falcon memory ports gated;
+first milestone must probe IMEM/DMEM accessibility before any upload.
+
+**Display — all four bw-step cycles ran clean** (pg=180; bytes 0140A000
+@bh4 / 01464000 @bh8, matching computed for both bw values; holds and
+restores clean). **Verdict awaits Peter's four panel photos** — zero
+seams + solid white column names (bw,bh).
+
+Capture: rmbp-s18/cu.usbserial-ABAFUJCO.log, mark s23boot1. Flash staged
+s23-20260725T*Z-80184a20.
+
 ## Sitting #22 (display pull 12 + fence pull 19, UnaOS-gemini@523a50c2, 2026-07-25, fox-metal-r23s1l, s22boot1)
 
 **Fence — PGRAPH ENABLE TOOK; engine changed class from gated to

@@ -6,7 +6,8 @@ Three pull sequences, numbered independently. Every pull = one BRIEF (coordinato
 ## Lane 1: Kepler FENCE (PFIFO/scheduler — kepler.rs) — `video/Kepler/`, files `*kepler-fence-pull<N>*` (pulls ≤13: `*kepler-pull<N>*`)
 | Pull | Files | Status | One-liner |
 |---|---|---|---|
-| 20 | BRIEF-kepler-fence-pull20-witness-rematch | LANDED (504f7f80) — metal owed s23 | re-run s7–s10 witness sequence verbatim with PGRAPH on — zero new writes; either outcome decisive |
+| 21 | BRIEF-kepler-fence-pull21-falcon-memprobe | BRIEFED — awaiting proposal | K-GPU-4 m1: IMEM/DMEM sentinel probe (zero execution) — are Falcon memory ports live post-enable? |
+| 20 | BRIEF-kepler-fence-pull20-witness-rematch | LANDED; s23: **REFUTED #7** — strip signature identical with PGRAPH on (err=2, valid stripped) — K-GPU-4 arc begins | re-run s7–s10 witness sequence verbatim with PGRAPH on — zero new writes; either outcome decisive |
 | 19 | BRIEF-kepler-fence-pull19-pgraph-enable | LANDED; s22: **ENABLE TOOK** (rb bit12 set) — BADF1200 wall gone, BADF1000+real zeros, Falcon halted/no-ucode | set PMC_ENABLE bit12 (one write) + re-run recon — BADF1200 should become real values |
 | 18 | BRIEF-kepler-fence-pull18-falcon-recon / PROPOSAL-kepler-fence-pull18 | LANDED 9dacbd8c; s21: GROUND TRUTH — all-BADF1200, PMC_ENABLE bit12 CLEAR (PGRAPH never powered) | read-only PGRAPH Falcon ground-truth dump |
 | 17 | BRIEF-kepler-fence-pull17-latch-correlation / PROPOSAL-kepler-fence-pull17 | LANDED 7ac404d8; s20: latch-delta NONE + pre all-zero — window DEAD ROAD, parked; fallback ladder EXHAUSTED → PGRAPH/ucode pivot is a Peter call | pre-takeover window dump + latch-delta diff |
@@ -25,7 +26,7 @@ Three pull sequences, numbered independently. Every pull = one BRIEF (coordinato
 ## Lane 2: Kepler DISPLAY (scanout — kepler_display.rs after split) — `video/Kepler/`, files `*kepler-display-pull<N>*`
 | Pull | Files | Status | One-liner |
 |---|---|---|---|
-| 13 | BRIEF-kepler-display-pull13-blockwidth | LANDED (85a4a492) — metal owed s23 | bw {2,4} × bh {4,8} — block wider than 1 GOB is the surviving suspect |
+| 13 | BRIEF-kepler-display-pull13-blockwidth | LANDED; s23: all 4 cycles ran clean (serial verified) — VERDICT AWAITS PANEL PHOTOS | bw {2,4} × bh {4,8} — block wider than 1 GOB is the surviving suspect |
 | 12 | BRIEF-kepler-display-pull12-pitchalign | LANDED; s22: **PITCH REFUTED** (identical seams at pg 192 vs 256; count still scales with bh) | bh {4,8} × pitch_gobs {192,256} mini-ladder — zero seams names the real pair |
 | 11 | BRIEF-kepler-display-pull11-blockheight / PROPOSAL-kepler-display-pull11 | LANDED 410996eb/366e5b05; s21: no rung clean — monotonic seams → pitch-alignment is the second parameter | four-hold block-height ladder (bh 2/4/8/16) |
 | 10 | BRIEF-kepler-display-pull10-swizzle / PROPOSAL-kepler-display-pull10 | LANDED fec4b73f; s20: BLOCK-LINEAR CONFIRMED (checkerboard gone; brick-seams = block-height wrong) | pre-swizzled ruler (GOB 64B×8) |
