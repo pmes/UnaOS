@@ -572,13 +572,30 @@ pub fn focus_ring(out: &mut [u64; MAX_WINDOWS]) -> usize {
 /// Cheap when there is nothing to do: one table-lock acquisition, no live real window, return without
 /// touching the framebuffer. That is the per-frame cost on an ordinary windowless desktop.
 pub fn repaint() {
+    // BGRUN-1 COMPOSITION FIX (WC-E lens should-fix 2): the compat exclusion's premise — "compat
+    // implies the render task is parked, so there is no second writer" — was true when the ONLY way
+    // to run a compat (full-screen) EL0 app was the blocking foreground `run`. `bg` breaks it: a
+    // background compat app presents directly to the scan-out while the desktop keeps flushing —
+    // exactly the two-writer collision this function exists to order. The exclusion key is therefore
+    // the FOCUSED compat surface, not the compat flag: the foreground case (incl. the boot-time
+    // EXEC-UVUG witness, whose 300-frame deadline the first cut blew) always holds input focus
+    // (`run_user_image` sets it before its wait loop), while a bg compat app can never acquire it
+    // (the TAB ring walks windows only). A compat row cannot be keyed by OWNER — `compat_present`
+    // creates it with owner_asid 0 (the SYS_FB_PRESENT hook carries none) — so the key is coarser:
+    // repaint compat rows only while NO EL0 program holds input focus (`focused == 0`, the
+    // bg-app-at-the-prompt state). Every foreground run — `run` verb and the boot witnesses alike —
+    // sets focus before its wait loop, so the EXEC-UVUG deadline case stays excluded. Residual,
+    // stated: a bg compat app still shimmers while the operator is TABbed into some OTHER app
+    // (focused != 0 excludes all compat rows); cosmetic, bounded by TABbing back to the shell.
+    let focused = crate::arch::syscall::el0_input_active();
     {
         let mut t = TABLE.lock();
-        if !t.rows.iter().any(|r| r.used && !r.compat) {
+        let repaintable = |r: &Window| r.used && (!r.compat || focused == 0);
+        if !t.rows.iter().any(|r| repaintable(r)) {
             return;
         }
         for r in t.rows.iter_mut() {
-            if r.used && !r.compat {
+            if repaintable(r) {
                 r.damaged = true;
             }
         }

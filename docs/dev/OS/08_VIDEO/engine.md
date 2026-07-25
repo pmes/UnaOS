@@ -935,8 +935,9 @@ downstream can be blamed honestly; when it diverges, it names the field.
 
 #### WC-E gate results (2026-07-25, QEMU raspi4b)
 
-`./arroyo check` green both arches · `kernel8` builds · `kernel8-test 120` at forced bench geometry
-(`UNAOS_FBW=1920 UNAOS_FBH=1200`) MBENCH **50/50 required, 0 forbidden** · `test-arm` green. The pre-fix
+`./arroyo check` green both arches · `kernel8` builds · `kernel8-test 120` at BOTH default (640×480) and
+forced bench geometry (`UNAOS_FBW=1920 UNAOS_FBH=1200`), MBENCH **51/51 required, 0 forbidden** each
+(the count includes this arc's own `[wc-e]` REQUIRE; the lens re-measured both) · `test-arm` green. The pre-fix
 baseline run at the same geometry is what established fact 3 above (identical `[wc-c]` checksums to P57
 metal). **The fix's effect is not observable in QEMU** — the collision is a race between the render task
 and the presenting task, and the gate's screenshot samples one instant — so bench verification at the next
