@@ -2034,3 +2034,94 @@ fall-through verdict's cross-reference to `frameclose`. That cross-reference car
 DEEP-only caveat inline, so it points the reader at `UNAOS_V3D_DEEP=1` rather than at a line that
 cannot appear. A `strings | grep frameclose` on the armed-without-deep image therefore returns hits;
 the check that matters is that no probe *output* string survives.
+---
+
+## 35. The boot-state surface — warm handoff, the IDENT check and the init ledger (V3D-60)
+
+P59 metal delivered the isolation the campaign had been converging on for ten arcs, and it left exactly
+one wall standing:
+
+- The bin control list **is sound and executes** — `CT0LC` `0x0`→`0x10000` and `CT0PC` `0x0`→`0x3` both
+  MOVED. The control thread walked the list and, by its own accounting, fed items to the PTB.
+- A CT1 **render** frame on the same memory block is byte-verified, and a re-render *after* the wedge
+  still passes. Every global-write-blocker theory is refuted; the block is sound.
+- The PTB frame unit is **dead-open**: the frame opens at S4, `BMACTIVE` sticks set, `BMBUSY` never
+  sets, `[v3d59] frameclose` saw **zero** bit changes across its extended window, `BPCA` advances with
+  no traffic anywhere the V3D MMU grants, `BFC` stays 0, no `CTERR`, no sub-list, semaphores at rest.
+- `CTRSTA` stays **disarmed** — no `CTERR` reading ever justified it. V3D-56's `0x3000` "reservation" is
+  retracted as a latch artifact.
+
+The wall is **item-accept-without-pool-write, inside the PTB frame open/close unit alone**. Every CL-side
+and per-job-register explanation is closed. What has never been examined is the state the block is in
+*before* the first bin job.
+
+### The warm-handoff hypothesis
+
+UnaOS is a **cold-boot** driver. `bringup` powers the domain, sets the clock, and then power-cycles the
+V3D (the V3D-50 OFF→ON `GRAFX_V3D` cycle) before reading a single register. Linux runs the same reset —
+but it attaches to a block the VideoCore firmware has already been driving, whose own graphics stack has
+run frames through this PTB. If any part of the frame unit is established by a **first frame** rather
+than by register programming, a driver that only ever cold-starts would never get it, and no amount of
+per-job byte-exactness would help.
+
+`[v3d60] residue` tests this in one boot, read-only, in the only window where firmware state is still
+observable: **after power/clock/gate, before our reset cycle**. It samples the whole bin-frame and
+boot-state register set there, and again after the reset, and diffs them field by field. The second half
+also answers a question no boot has asked — does our OFF→ON cycle actually **reach** the PTB frame unit,
+or does it leave those registers exactly as it found them?
+
+### The init ledger — two genuine gaps
+
+`[v3d60] initdelta` walks the registers the mainline kernel driver programs before its first bin job and
+prints ours beside the expectation (facts restated in our own words; no kernel comment text reproduced).
+Most rows agree — the MMU table base, the L2T flush window (V3D-51), both interrupt working sets
+(V3D-49/V3D-52), `MISCCFG` left alone on 4.2, GMP never written. **Two rows are real gaps:**
+
+1. **`MMU_ILLEGAL_ADDR` points into our own arena.** Mainline allocates a *dedicated scratch page* for
+   the illegal-address catcher — memory belonging to no job, mapped by nothing else. UnaOS aims it at
+   **arena page 0**, inside the very address space the PTB writes, mapped VALID+WRITEABLE by our own
+   page table. An illegal access then becomes indistinguishable, at the memory it lands on, from a legal
+   one. Read-only this arc; the fix (a page outside the mapping) is a next-arc call.
+2. **`MMU_CTL` carries the abort halves of the fault policy only.** Mainline enables both the abort and
+   the **interrupt** response for the page-table-invalid and write-violation conditions. The interrupt
+   companions' bit positions are not in this file's audited constant set, so the row prints the raw word
+   and **names** the gap rather than inventing two bit numbers (the standing no-fabricated-constants
+   rule). A write the MMU swallows without reporting is precisely the failure class a fault-*reporting*
+   policy exists to surface.
+
+### The probe matrix — what each `[v3d60]` line discriminates
+
+| Witness | Reading | Verdict |
+| --- | --- | --- |
+| `[v3d60] residue (pre-reset)` | `BMACTIVE` set before we touch anything | A bin frame is **already open at cold boot**. Every `START_TILE_BINNING` we have ever issued has been stacking onto a frame that predates us — a bring-up-level defect and a direct candidate for the dead-open wall. |
+| `[v3d60] residue (pre-reset)` | `BFC`/`RFC` non-zero | The **firmware has driven frames** through this block. The warm-handoff hypothesis is **live**: whatever a first firmware frame establishes, our power cycle destroys and we never re-establish. |
+| `[v3d60] residue (pre-reset)` | MMU or CT0-queue state established, no frame counted | **Partial handoff** — the firmware configured the block without completing a bin frame. The hypothesis narrows from "first frame" to "configuration". |
+| `[v3d60] residue (pre-reset)` | Everything at reset value | The block is **virgin at our entry**. The firmware never drove a bin frame through this PTB, so there is nothing warm to inherit and the warm-handoff hypothesis is **dead**. The PTB must be startable from cold by register programming alone. |
+| `[v3d60] residue (post-reset)` | `BMACTIVE` still set after the cycle | Our OFF→ON power cycle does **not** close (or does not reach) an open PTB frame. |
+| `[v3d60] residue (post-reset)` | Zero fields moved | The reset changed **nothing**. Cross-read the `[v3d50]` ASB/PM lines: bridges ACKed ⇒ the registers were already clean; bridges silent ⇒ this driver has never actually reset the V3D. |
+| `[v3d60] ident` | Technology version ≠ `0x42` | **Campaign foundation invalid** — the CL packing, QPU word encoding and register map were all audited against V3D 4.2. Resolve before trusting any further PTB reading. |
+| `[v3d60] initdelta` | `gaps=0` | Our pre-first-job register state matches every checkable row of the mainline ledger. No boot-state divergence remains to explain the dead-open frame. |
+| `[v3d60] initdelta` | `gaps>0` | The rows marked **GAP** are mechanisms by which a refused PTB write would land — or vanish — without ever being reported. Exactly the shape of the wall. |
+| `[v3d60] syncrd` | Back-to-back reads differ | The CLE semaphore registers **self-modify on read**. `[v3d59] ctstate`'s `sema_moved` row is a probe artifact and is **retracted**; future decodes must sample them at most once per boot. |
+| `[v3d60] syncrd` | Back-to-back reads identical | No read side effect. `[v3d59]`'s semaphore row stands as measured and its five-reads hedge can be dropped. |
+| `[v3d60] gmpdelta` | A protection violation latches **during** the frame | **The silent-drop mechanism.** The protection block refuses the PTB's pool write; nothing lands, no MMU fault and no `CTERR` is raised — item-accept-without-pool-write, exactly. |
+| `[v3d60] gmpdelta` | `CAP_EXCEEDED` newly set | The PTB issued an address **beyond the page-table cap** — capped, not translated. Reconciles "`BPCA` advances" with "no traffic anywhere the MMU grants". |
+| `[v3d60] gmpdelta` | Page-table-invalid / write-violation newly set | The PTB's write was refused by **translation**; read `MMU_VIO_ADDR`/`VIO_ID` for the address and the issuing client. |
+| `[v3d60] gmpdelta` | Clean across the frame | Neither the protection block nor the MMU refused anything during this frame. Both **exonerated**, and the PTB frame open/close unit stands alone as the wall. |
+
+### Discipline
+
+Every V3D-60 probe is **read-only** — no register is written, so no write needs justifying, and `CTRSTA`
+stays disarmed. None of them waits on anything: no deadline, no polling window, no added boot stall.
+
+`[v3d59] frameclose` is **banked and switched off** by this arc (`V3D59_FRAMECLOSE = false`). Its verdict
+is delivered and standing — dead-open, not slow and not overflow-stalled — and re-running its extended
+window every boot buys nothing while costing a visible stall in the boot square. Flip it back only to
+re-measure that specific verdict.
+
+QEMU `raspi4b` models no V3D. The pre-reset probe reads the hub identity word **first** and returns
+before touching any core register unless that word is live, which is the same poison-honest gate
+`probe_hub_ident0` uses; the armed QEMU run prints the `SKIPPED` line and the rest of the bring-up
+short-circuits at `BLOCK-DOWN`. `kernel8-test` green therefore means *no regression*, nothing more —
+**P60 metal reads the residue pair, the IDENT check, the init ledger, the sync read-test and the
+protection delta.**

@@ -664,6 +664,12 @@ pub fn bringup(fb: Option<FbTarget>) {
     // Best-effort + poison-honest: on QEMU these registers are absent and every wait is a finite backstop,
     // so the run still lands on the honest BLOCK-DOWN below; on metal this is what turns BUS-POISON into
     // BLOCK-UP and (the V3D-50 hypothesis) unwedges the empty-frame retire.
+    // PI-V3D-60: the ONLY window in which VideoCore-firmware V3D state is still observable — after
+    // power/clock/gate, before our OFF->ON cycle wipes it. Read-only, no budget, and it reads the hub
+    // identity word first so an absent/poison block (QEMU raspi4b) is never followed into a core
+    // register. This is the warm-handoff discriminator; see the PI-V3D-60 block.
+    v3d60_residue_pre();
+
     v3d_reset_cycle();
 
     // Let the freshly powered + clocked + bridged block settle before its first register read (a
@@ -743,6 +749,12 @@ pub fn bringup(fb: Option<FbTarget>) {
             ":: V3D: [v3d] deep=off (banked verdicts skipped) — NOT run this boot: [v3d48] empty-frame bisection ladder (all 6 rungs banked non-retire), [v3d59] frameclose (banked DEAD-OPEN, zero bit changes), [v3d58] rerender (banked clean). Fast probes only; re-arm with UNAOS_V3D_DEEP=1 ::"
         );
     }
+
+    // PI-V3D-60: the identity read as an explicit boot-state CHECK (is this the 4.2 the whole packet
+    // encoding targets?), then the post-reset half of the warm-handoff pair — the same registers the
+    // pre-reset station sampled, diffed field by field, so the log states what our reset actually did.
+    v3d60_ident(hub1, hub2, hub3, c0, c1, c2);
+    v3d60_residue_post();
 
     // PI-V3D-51: the post-reset core-init the kernel runs at the tail of EVERY v3d_reset_v3d (via
     // v3d_init_hw_state → v3d_init_core): establish the L2T flush address window (L2TFLSTA=0,
@@ -4464,7 +4476,12 @@ fn v3d58_rerender_control(what: &str) {
 /// `CT0SYNC`/`CT1SYNC`/`BXCF`/`BPOA`/`BPOS`/`CT0LC`/`CT0PC`. Pure reads.
 const V3D59_CTSTATE: bool = true;
 /// `[v3d59] frameclose` — post-wedge time series of the bin-frame registers. Pure reads; ~64 ms.
-/// Banked FROZEN/DEAD-OPEN on metal (zero bit changes across the whole extra window) — V3D-DEEP only.
+///
+/// **PI-V3D-60: BANKED.** Its verdict is delivered and standing — across the extended window not one
+/// of `PCS`, `CT0CS`, `BFC`, `BPCA`, `BPCS` changed by a single bit, with `BMACTIVE` held set and
+/// `BMBUSY` clear: the bin frame is DEAD-OPEN, not slow and not overflow-stalled. Re-running it every
+/// boot buys nothing and costs a visible stall in the boot square. Gated behind `UNAOS_V3D_DEEP`
+/// (the probe-budget-trim knob) — arm deep only to re-measure that specific verdict.
 const V3D59_FRAMECLOSE: bool = V3D_DEEP;
 /// `[v3d59] mainline` — the refutation ledger, so the metal log carries its own citations.
 const V3D59_LEDGER: bool = true;
@@ -4715,6 +4732,488 @@ fn v3d59_ct0_frame_reset(what: &str) {
             (pre & V3D_CLE_CTNCS_CTSUBS != 0) as u32,
         );
     }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// PI-V3D-60 — the boot-state / warm-handoff discriminators for the PTB frame unit.
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+//
+// STANDING METAL FACTS this arc builds on (established, NOT re-litigated here):
+//   * The bin control list is SOUND and EXECUTES — `CT0LC` 0x0→0x10000 and `CT0PC` 0x0→0x3 both MOVED,
+//     so the control thread walked the list and by its own accounting fed items to the PTB.
+//   * A CT1 RENDER frame on the SAME memory block is byte-verified, and a post-wedge re-render still
+//     passes — the block's write path, clock, MMU and arena are all live. No global write blocker.
+//   * The PTB frame unit is DEAD-OPEN: the frame opens at station S4, `BMACTIVE` sticks set, `BMBUSY`
+//     never sets, `[v3d59] frameclose` saw ZERO bit changes across its extended window, `BPCA` advances
+//     with no traffic anywhere the V3D MMU grants, `BFC` stays 0, no `CTERR`, no sub-list, semaphores
+//     at rest. The wall is item-accept-WITHOUT-pool-write, inside the PTB frame open/close unit alone.
+//   * V3D-56's "0x3000 reservation" reading is RETRACTED (a register-latch artifact).
+//
+// Every CL-side and per-job-register explanation is therefore closed. What has NEVER been examined is
+// the state the block is in BEFORE the first bin job — the boot/handoff surface:
+//
+// ── (a) The WARM-HANDOFF hypothesis ──────────────────────────────────────────────────────────────
+// UnaOS is a COLD-BOOT bare-metal driver: `bringup` powers the domain, sets the clock, and then
+// POWER-CYCLES the V3D (`v3d_reset_cycle`, the OFF→ON GRAFX_V3D cycle) before reading a single
+// register. Linux does the same reset — but it attaches to a block the VideoCore firmware has already
+// been driving, and the firmware's own graphics stack has run frames through this PTB. If any part of
+// the PTB frame unit is established by a FIRST frame rather than by register programming, a driver that
+// only ever cold-starts would never get it, and no amount of per-job byte-exactness would help.
+//
+// The hypothesis is testable in one boot, read-only: sample the whole bin-frame register set BEFORE our
+// reset cycle (the first V3D read of the boot) and again after it. `BFC`/`RFC` non-zero at that first
+// read means the firmware HAS driven frames through this block. Everything at reset value means the
+// block arrives virgin, the firmware never opened a PTB frame, and there is nothing warm to inherit —
+// which KILLS the hypothesis rather than leaving it hanging. The second half of the pair also answers a
+// question no boot has asked: does our OFF→ON cycle actually CHANGE the PTB registers, or is the
+// "reset" a no-op that never reaches the frame unit?
+//
+// ── (b) The IDENT / boot-state checks ────────────────────────────────────────────────────────────
+// The kernel driver reads the hub and core identity registers at probe and derives its VERSION from
+// them; every version-conditional path (and, on our side, every v42 packet encoding in this file) hangs
+// off that number. This file has printed the raw IDENT words since PI-V3D-1 and decoded exactly two
+// fields. `[v3d60] ident` restates the decode as an explicit CHECK — is the technology version the 4.2
+// this driver's whole CL packing targets, is core 0 the core we drive — because a version mismatch
+// would silently invalidate the campaign's foundation. Fields beyond the two this file has audited are
+// printed RAW: no fabricated bit names (the standing rule; this driver has been convicted three times).
+//
+// ── (c) The INIT-DELTA ledger ────────────────────────────────────────────────────────────────────
+// `[v3d60] initdelta` walks, row by row, the registers the mainline kernel driver programs before its
+// first bin job and prints OUR value beside the expectation. All facts, in our own words — no GPL
+// comment text is reproduced. Two rows are GENUINE GAPS this audit found:
+//
+//   (1) `MMU_ILLEGAL_ADDR`. Mainline allocates a DEDICATED scratch page for this — memory that belongs
+//       to no job and that nothing else maps — and points the illegal-address catcher at it. UnaOS
+//       points it at ARENA PAGE 0, which is inside the very address space the PTB writes and is mapped
+//       VALID+WRITEABLE in our page table. Aiming the catcher into the job's own arena is not what the
+//       register is for, and it makes "an illegal access" indistinguishable from "a legal access" at
+//       the memory it lands on. Read-only here; the fix (a page outside the mapping) is a next-arc call.
+//
+//   (2) `MMU_CTL` fault policy. Mainline enables BOTH the abort and the INTERRUPT response for the
+//       page-table-invalid and write-violation conditions; UnaOS writes the ABORT halves only. The bit
+//       positions of the interrupt companions are NOT in this file's audited constant set, so this row
+//       reports the raw `MMU_CTL` word and the abort bits we do set, and NAMES the gap — it does not
+//       invent two bit numbers. A silently-swallowed PTB write is exactly the class of failure a
+//       fault-reporting policy exists to surface.
+//
+// ── (d) The two cheap discriminators [v3d59] left owed ───────────────────────────────────────────
+// `[v3d60] syncrd` — `[v3d59] ctstate` hedged its semaphore row because it read `CT0SYNC`/`CT1SYNC`
+// five times per boot and a register with read side effects would be moved BY THE PROBE. A pair of
+// BACK-TO-BACK reads at a quiescent station settles it: if read #2 differs from read #1 with nothing
+// happening in between, the registers self-modify on read and `[v3d59]`'s `sema_moved` is an artifact.
+//
+// `[v3d60] gmpdelta` — the GMP (memory-protection) block and the MMU fault latches have been read once,
+// post-probe. A silent drop is a DELTA question: sample both PRE-kick and at wait-exit and report what
+// latched DURING the frame. A GMP violation or an MMU cap/PT-invalid latch across the frame would be
+// the silent-drop mechanism the campaign has been hunting; clean across the frame leaves the PTB frame
+// unit standing alone as the wall.
+//
+// Everything in this section is READ-ONLY. No register is written, so no write needs justifying, and
+// `CTRSTA` stays disarmed. QEMU raspi4b models no V3D: the pre-reset probe reads the hub identity word
+// first and returns before touching a core register unless that word is live, which is the same
+// poison-honest gate `probe_hub_ident0` uses (QEMU reads 0x00000000 there and every V3D-60 line is
+// skipped). Budgets: none of these probes waits on anything — no deadline, no polling window.
+
+/// `[v3d60] residue` — the pre-reset / post-reset bin-frame snapshot pair (the warm-handoff test).
+const V3D60_RESIDUE: bool = true;
+/// `[v3d60] ident` — hub/core identity as an explicit boot-state CHECK, not a raw dump.
+const V3D60_IDENT: bool = true;
+/// `[v3d60] initdelta` — the ours-vs-mainline init ledger, emitted pre-kick.
+const V3D60_INITDELTA: bool = true;
+/// `[v3d60] syncrd` — the back-to-back CTnSYNC read-side-effect test.
+const V3D60_SYNCRD: bool = true;
+/// `[v3d60] gmpdelta` — GMP + MMU fault-latch delta ACROSS the bin frame.
+const V3D60_GMPDELTA: bool = true;
+
+/// The bin-frame + boot-state register set, sampled as one snapshot. Pure reads.
+#[derive(Clone, Copy)]
+struct V3d60Snap {
+    hub_ident0: u32,
+    hub_ident1: u32,
+    mmu_ctl: u32,
+    mmu_pt_base: u32,
+    pcs: u32,
+    ct0cs: u32,
+    ct1cs: u32,
+    bfc: u32,
+    rfc: u32,
+    bpca: u32,
+    bpcs: u32,
+    bpoa: u32,
+    bpos: u32,
+    bxcf: u32,
+    ct0qma: u32,
+    ct0qms: u32,
+    ct0qts: u32,
+    l2tflsta: u32,
+    l2tflend: u32,
+    misccfg: u32,
+    gmp_cfg: u32,
+    gmp_status: u32,
+    int_msk_sts: u32,
+    hub_int_msk_sts: u32,
+}
+
+/// The pre-reset snapshot, carried from `bringup`'s pre-reset station to the post-reset station.
+/// Single-threaded BSP bring-up; `static mut` matches this module's existing idiom (`V3D_REPLAY_FB`).
+static mut V3D60_PRE: Option<V3d60Snap> = None;
+
+/// Take the full snapshot. CORE-relative reads — the caller MUST have established that the hub
+/// identity word is live (an absent block aborts on a core read).
+fn v3d60_snap() -> V3d60Snap {
+    V3d60Snap {
+        hub_ident0: mmio_read(V3D_HUB_BASE, V3D_HUB_IDENT0),
+        hub_ident1: mmio_read(V3D_HUB_BASE, V3D_HUB_IDENT1),
+        mmu_ctl: mmio_read(V3D_HUB_BASE, V3D_MMU_CTL),
+        mmu_pt_base: mmio_read(V3D_HUB_BASE, V3D_MMU_PT_PA_BASE),
+        pcs: mmio_read(V3D_CORE0_BASE, V3D_CLE_PCS),
+        ct0cs: mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CS),
+        ct1cs: mmio_read(V3D_CORE0_BASE, V3D_CLE_CT1CS),
+        bfc: mmio_read(V3D_CORE0_BASE, V3D_CLE_BFC),
+        rfc: mmio_read(V3D_CORE0_BASE, V3D_CLE_RFC),
+        bpca: mmio_read(V3D_CORE0_BASE, V3D_PTB_BPCA),
+        bpcs: mmio_read(V3D_CORE0_BASE, V3D_PTB_BPCS),
+        bpoa: mmio_read(V3D_CORE0_BASE, V3D_PTB_BPOA),
+        bpos: mmio_read(V3D_CORE0_BASE, V3D_PTB_BPOS),
+        bxcf: mmio_read(V3D_CORE0_BASE, V3D_PTB_BXCF),
+        ct0qma: mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0QMA),
+        ct0qms: mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0QMS),
+        ct0qts: mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0QTS),
+        l2tflsta: mmio_read(V3D_CORE0_BASE, V3D_CTL_L2TFLSTA),
+        l2tflend: mmio_read(V3D_CORE0_BASE, V3D_CTL_L2TFLEND),
+        misccfg: mmio_read(V3D_CORE0_BASE, V3D_CTL_MISCCFG),
+        gmp_cfg: mmio_read(V3D_CORE0_BASE, V3D_GMP_CFG),
+        gmp_status: mmio_read(V3D_CORE0_BASE, V3D_GMP_STATUS),
+        int_msk_sts: mmio_read(V3D_CORE0_BASE, V3D_CTL_INT_MSK_STS),
+        hub_int_msk_sts: mmio_read(V3D_HUB_BASE, V3D_HUB_INT_MSK_STS),
+    }
+}
+
+/// Print one snapshot as two dense lines (hub/boot state, then the bin-frame set).
+fn v3d60_emit_snap(station: &str, s: &V3d60Snap) {
+    serial_println!(
+        "::   [v3d60] {} boot-state — HUB_IDENT0={:#010x} HUB_IDENT1={:#010x} | MMU_CTL={:#010x} (ENABLE={}) MMU_PT_PA_BASE={:#010x} | L2TFLSTA={:#010x} L2TFLEND={:#010x} MISCCFG={:#010x} | GMP_CFG={:#010x} GMP_STATUS={:#010x} | INT_MSK_STS={:#010x} (FLDONE {}) HUB_INT_MSK_STS={:#010x} ::",
+        station, s.hub_ident0, s.hub_ident1,
+        s.mmu_ctl, (s.mmu_ctl & V3D_MMU_CTL_ENABLE != 0) as u32, s.mmu_pt_base,
+        s.l2tflsta, s.l2tflend, s.misccfg,
+        s.gmp_cfg, s.gmp_status,
+        s.int_msk_sts,
+        if s.int_msk_sts & V3D_INT_FLDONE != 0 { "MASKED" } else { "unmasked" },
+        s.hub_int_msk_sts,
+    );
+    serial_println!(
+        "::   [v3d60] {} bin-frame — PCS={:#010x} (BMACTIVE={} BMBUSY={} BMOOM={}) CT0CS={:#010x} CT1CS={:#010x} | BFC={:#010x} RFC={:#010x} | BPCA={:#010x} BPCS={:#010x} BPOA={:#010x} BPOS={:#010x} BXCF={:#010x} | CT0QMA={:#010x} CT0QMS={:#010x} CT0QTS={:#010x} ::",
+        station, s.pcs,
+        (s.pcs & V3D_PCS_BMACTIVE != 0) as u32,
+        (s.pcs & V3D_PCS_BMBUSY != 0) as u32,
+        (s.pcs & V3D_PCS_BMOOM != 0) as u32,
+        s.ct0cs, s.ct1cs, s.bfc, s.rfc,
+        s.bpca, s.bpcs, s.bpoa, s.bpos, s.bxcf,
+        s.ct0qma, s.ct0qms, s.ct0qts,
+    );
+}
+
+/// `[v3d60] residue (pre-reset)` — the FIRST V3D register read of the boot, taken after power/clock/gate
+/// and BEFORE `v3d_reset_cycle`. This is the only window in which firmware state is still observable:
+/// our own OFF→ON power cycle is the next thing that happens.
+///
+/// Poison-honest and QEMU-safe: one hub IDENT0 read decides (no retry loop, no budget). Zero = block
+/// absent (QEMU raspi4b), poison = block not decoding — either way we return WITHOUT touching a core
+/// register, exactly like the `probe_hub_ident0` gate.
+fn v3d60_residue_pre() {
+    if !V3D60_RESIDUE {
+        return;
+    }
+    let id0 = mmio_read(V3D_HUB_BASE, V3D_HUB_IDENT0);
+    if id0 == 0 || is_poison(id0) {
+        serial_println!(
+            ":: V3D: [v3d60] residue (pre-reset) — SKIPPED: hub IDENT0 reads {:#010x} ({}) before our reset cycle, so no core register may be read here. The warm-handoff question is UNANSWERED this boot (expected on QEMU raspi4b, which models no V3D) ::",
+            id0,
+            if id0 == 0 { "block absent/unpowered" } else { "open-bus/firmware poison" }
+        );
+        return;
+    }
+    let s = v3d60_snap();
+    serial_println!(
+        ":: V3D: [v3d60] residue (pre-reset) — the FIRST V3D read of the boot, taken after power/clock/gate and BEFORE the OFF->ON reset cycle. This is the only window where VideoCore-firmware state is still observable ::"
+    );
+    v3d60_emit_snap("pre-reset", &s);
+    let fw_ran_frames = s.bfc != 0 || s.rfc != 0;
+    let fw_mmu = s.mmu_ctl & V3D_MMU_CTL_ENABLE != 0 || s.mmu_pt_base != 0;
+    let fw_frame_open = s.pcs & V3D_PCS_BMACTIVE != 0;
+    let fw_queue = s.ct0qma != 0 || s.ct0qms != 0 || s.ct0qts != 0 || s.bpca != 0 || s.bpcs != 0;
+    let verdict = if fw_frame_open {
+        "A BIN FRAME IS ALREADY OPEN at cold boot, before this driver has touched anything. The firmware left the PTB mid-frame and our reset cycle is the only thing that could close it — check the post-reset line below for whether it did. If BMACTIVE survives our reset, every START_TILE_BINNING we have ever issued has been stacking onto a frame that was open before we arrived"
+    } else if fw_ran_frames {
+        "THE FIRMWARE HAS DRIVEN FRAMES THROUGH THIS BLOCK — a frame counter is non-zero before we touch it. The warm-handoff hypothesis is LIVE: whatever a first firmware frame establishes in the PTB, we then destroy with our OFF->ON power cycle and never re-establish. Compare the post-reset line: any field the reset returns to zero is state a warm-attached driver would have kept"
+    } else if fw_mmu || fw_queue {
+        "no frame counted, but the block is NOT virgin — the firmware left MMU and/or CT0-queue state established. Partial handoff: the firmware configured the block without completing a bin frame, so the warm-handoff hypothesis narrows to configuration rather than to a first frame"
+    } else {
+        "THE BLOCK IS VIRGIN AT OUR ENTRY — no frame counted, no MMU established, no CT0 queue state, no open frame. The VideoCore firmware never drove a bin frame through this PTB, so there is NOTHING WARM TO INHERIT and the firmware-warm-handoff hypothesis is DEAD as an explanation for the dead-open frame. The PTB must be startable from cold by register programming alone, and the wall stays where [v3d59] left it"
+    };
+    serial_println!(
+        ":: V3D: [v3d60] residue (pre-reset) verdict — firmware-ran-frames={} (BFC={:#x} RFC={:#x}) firmware-MMU-established={} firmware-CT0-queue-state={} frame-already-open={} — {} ::",
+        fw_ran_frames as u32, s.bfc, s.rfc, fw_mmu as u32, fw_queue as u32, fw_frame_open as u32, verdict
+    );
+    unsafe {
+        V3D60_PRE = Some(s);
+    }
+}
+
+/// `[v3d60] residue (post-reset)` — the same registers after the OFF→ON cycle, diffed field by field
+/// against the pre-reset snapshot. Answers a question no boot has asked: does our reset cycle actually
+/// REACH the PTB frame unit, or does it leave those registers exactly as it found them?
+fn v3d60_residue_post() {
+    if !V3D60_RESIDUE {
+        return;
+    }
+    let pre = match unsafe { V3D60_PRE } {
+        Some(p) => p,
+        None => return, // pre-reset station never ran (block absent/poison) — nothing to diff.
+    };
+    let s = v3d60_snap();
+    v3d60_emit_snap("post-reset", &s);
+    // Count how many of the bin-frame + boot-state fields our reset cycle actually moved.
+    let frame_fields: [(&str, u32, u32); 10] = [
+        ("PCS", pre.pcs, s.pcs),
+        ("CT0CS", pre.ct0cs, s.ct0cs),
+        ("BFC", pre.bfc, s.bfc),
+        ("RFC", pre.rfc, s.rfc),
+        ("BPCA", pre.bpca, s.bpca),
+        ("BPCS", pre.bpcs, s.bpcs),
+        ("BPOA", pre.bpoa, s.bpoa),
+        ("BPOS", pre.bpos, s.bpos),
+        ("BXCF", pre.bxcf, s.bxcf),
+        ("CT0QMA", pre.ct0qma, s.ct0qma),
+    ];
+    let mut moved = 0u32;
+    for (_, a, b) in frame_fields.iter() {
+        if a != b {
+            moved += 1;
+        }
+    }
+    let boot_moved = (pre.mmu_ctl != s.mmu_ctl) as u32
+        + (pre.l2tflsta != s.l2tflsta) as u32
+        + (pre.l2tflend != s.l2tflend) as u32
+        + (pre.int_msk_sts != s.int_msk_sts) as u32;
+    let frame_still_open = s.pcs & V3D_PCS_BMACTIVE != 0;
+    let verdict = if frame_still_open {
+        "BMACTIVE IS STILL SET AFTER OUR RESET CYCLE. The OFF->ON GRAFX_V3D power cycle does not close (or does not reach) an open PTB bin frame — the block enters every job of every boot with a frame already open. That is a bring-up-level defect and a direct candidate for the dead-open wall"
+    } else if moved == 0 && boot_moved == 0 {
+        "OUR RESET CYCLE CHANGED NOTHING. Not one bin-frame or boot-state register differs across the OFF->ON power cycle. Either the block was already at these values (consistent with a virgin pre-reset reading) or the cycle never reached the core at all — cross-read the [v3d50] ASB/PM lines: if the bridges ACKed, the reset ran and the registers were simply already clean; if they did not, this driver has never actually reset the V3D"
+    } else {
+        "the reset cycle DID move block state — the fields that changed are the ones the OFF->ON cycle returns to reset value. Any field that was non-zero pre-reset and zero after is precisely the state a warm-attached driver (firmware first, kernel second) would have kept and we discard"
+    };
+    serial_println!(
+        ":: V3D: [v3d60] residue (post-reset) verdict — bin-frame fields moved by the reset={}/10 boot-state fields moved={}/4 | BMACTIVE pre={} post={} | BFC {:#x}->{:#x} RFC {:#x}->{:#x} BPCA {:#x}->{:#x} — {} ::",
+        moved, boot_moved,
+        (pre.pcs & V3D_PCS_BMACTIVE != 0) as u32, frame_still_open as u32,
+        pre.bfc, s.bfc, pre.rfc, s.rfc, pre.bpca, s.bpca,
+        verdict
+    );
+}
+
+/// `[v3d60] ident` — the hub/core identity read as a CHECK rather than a dump: is this the 4.2 silicon
+/// every packet encoding in this file targets, and is core 0 the core we drive? Fields beyond the two
+/// this file has audited (`HUB_IDENT1` technology version and core count) are reported RAW — the
+/// no-fabricated-bit-names rule applies here as everywhere in this module.
+fn v3d60_ident(hub1: u32, hub2: u32, hub3: u32, c0: u32, c1: u32, c2: u32) {
+    if !V3D60_IDENT {
+        return;
+    }
+    let tver = (hub1 >> 24) & 0xFF;
+    let ncores = (hub1 & 0xF).max(1);
+    // This driver's whole CL packing is the v42 (V3D 4.2) variant set — see the packet-facts block and
+    // every `v3d_packet.xml max_ver=42` citation. The kernel driver derives the same number from this
+    // register and gates its version-conditional paths on it.
+    let ver_ok = tver == 0x42;
+    serial_println!(
+        ":: V3D: [v3d60] ident — HUB_IDENT1={:#010x} -> tech-version raw={:#04x} (ours-expects 0x42 = V3D 4.2, the variant EVERY packet encoding in this file targets) cores={} (we drive core 0) | HUB_IDENT2={:#010x} HUB_IDENT3={:#010x} | CORE0 IDENT0={:#010x} IDENT1={:#010x} IDENT2={:#010x} (raw — this file has no corroborated field map past the two decoded above, and does not invent one) — {} ::",
+        hub1, tver, ncores, hub2, hub3, c0, c1, c2,
+        if ver_ok {
+            "version CONFIRMED: the silicon is the generation the CL packing, the shader-word encoding and the register offsets were all audited against. The campaign's foundation holds"
+        } else {
+            "VERSION MISMATCH — the block does NOT report the 4.2 technology version this driver's packet encoding, QPU word packing and register map were audited against. That would invalidate the whole campaign's foundation and MUST be resolved before any further PTB reading is trusted"
+        }
+    );
+}
+
+/// `[v3d60] initdelta` — the init ledger: for every register the mainline kernel driver programs before
+/// its first bin job, print OUR value beside the expectation and mark whether they agree. Facts stated
+/// in our own words; no kernel comment text is reproduced. Pure reads.
+fn v3d60_initdelta(tag: &str) {
+    if !V3D60_INITDELTA {
+        return;
+    }
+    let mut gaps = 0u32;
+    serial_println!(
+        ":: V3D: [v3d60] initdelta ({}) — every register mainline programs before its FIRST bin job, ours beside the expectation. Read-only audit; facts restated in our own words ::",
+        tag
+    );
+
+    // ── MMU page table base ──────────────────────────────────────────────────────────────────────
+    let pt_base = mmio_read(V3D_HUB_BASE, V3D_MMU_PT_PA_BASE);
+    let pt_want = (pt_phys() >> V3D_MMU_PAGE_SHIFT) as u32;
+    let pt_ok = pt_base == pt_want;
+    gaps += !pt_ok as u32;
+    serial_println!(
+        "::   [v3d60] MMU_PT_PA_BASE ours={:#010x} want={:#010x} match={} — mainline programs the table base in PAGES before enabling the MMU; ours is the confined arena-only table ::",
+        pt_base, pt_want, pt_ok as u32
+    );
+
+    // ── MMU control / fault policy — GAP (2) ─────────────────────────────────────────────────────
+    let ctl = mmio_read(V3D_HUB_BASE, V3D_MMU_CTL);
+    let abort_want = V3D_MMU_CTL_ENABLE
+        | V3D_MMU_CTL_PT_INVALID_ENABLE
+        | V3D_MMU_CTL_PT_INVALID_ABORT
+        | V3D_MMU_CTL_WRITE_VIOLATION_ABORT;
+    let abort_ok = ctl & abort_want == abort_want;
+    let latched = ctl & (V3D_MMU_CTL_PT_INVALID | V3D_MMU_CTL_WRITE_VIOLATION | V3D_MMU_CTL_CAP_EXCEEDED);
+    gaps += 1; // the interrupt-response halves are a standing gap regardless of the abort bits
+    serial_println!(
+        "::   [v3d60] MMU_CTL ours={:#010x} abort-set-present={} fault-latched={:#010x} — **GAP**: mainline enables BOTH the abort AND the INTERRUPT response for the page-table-invalid and write-violation conditions; UnaOS writes the ABORT halves only. The two interrupt-companion bit positions are NOT in this file's audited constant set, so this row NAMES the gap and prints the raw word rather than inventing two bit numbers. A write the MMU swallows without reporting is exactly the failure class a fault-REPORTING policy exists to surface ::",
+        ctl, abort_ok as u32, latched
+    );
+
+    // ── MMU illegal-address catcher — GAP (1) ────────────────────────────────────────────────────
+    let illegal = mmio_read(V3D_HUB_BASE, V3D_MMU_ILLEGAL_ADDR);
+    let illegal_page = (illegal & !V3D_MMU_ILLEGAL_ADDR_ENABLE) as usize;
+    let arena_page0 = arena_phys() >> V3D_MMU_PAGE_SHIFT;
+    let points_into_arena = illegal_page >= arena_page0 && illegal_page < arena_page0 + ARENA_PAGES;
+    gaps += points_into_arena as u32;
+    serial_println!(
+        "::   [v3d60] MMU_ILLEGAL_ADDR ours={:#010x} (page {:#x}, enable={}) points-INTO-our-arena={} — **GAP**: mainline points the illegal-address catcher at a DEDICATED SCRATCH page that belongs to no job and that nothing else maps. Ours aims it at ARENA PAGE 0 — inside the very address space the PTB writes, mapped VALID+WRITEABLE by our own page table. An illegal access is then indistinguishable, at the memory it lands on, from a legal one ::",
+        illegal, illegal_page, (illegal & V3D_MMU_ILLEGAL_ADDR_ENABLE != 0) as u32,
+        points_into_arena as u32
+    );
+
+    // ── L2T flush window (V3D-51 established this) ───────────────────────────────────────────────
+    let sta = mmio_read(V3D_CORE0_BASE, V3D_CTL_L2TFLSTA);
+    let end = mmio_read(V3D_CORE0_BASE, V3D_CTL_L2TFLEND);
+    let l2t_ok = sta == 0 && end == !0;
+    gaps += !l2t_ok as u32;
+    serial_println!(
+        "::   [v3d60] L2TFLSTA/L2TFLEND ours={:#010x}/{:#010x} want=0x00000000/0xffffffff match={} — mainline establishes the whole-address-space L2T flush window after every reset (the V3D-51 step) ::",
+        sta, end, l2t_ok as u32
+    );
+
+    // ── Interrupt working sets (V3D-49 core half, V3D-52 hub half) ───────────────────────────────
+    let msk = mmio_read(V3D_CORE0_BASE, V3D_CTL_INT_MSK_STS);
+    let hub_msk = mmio_read(V3D_HUB_BASE, V3D_HUB_INT_MSK_STS);
+    let fldone_open = msk & V3D_INT_FLDONE == 0;
+    gaps += !fldone_open as u32;
+    serial_println!(
+        "::   [v3d60] INT_MSK_STS ours={:#010x} FLDONE-unmasked={} | HUB_INT_MSK_STS ours={:#010x} — mainline unmasks its core and hub working sets once at probe; both halves are mirrored here (V3D-49 / V3D-52) ::",
+        msk, fldone_open as u32, hub_msk
+    );
+
+    // ── MISCCFG — mainline leaves it alone on this generation ────────────────────────────────────
+    let misccfg = mmio_read(V3D_CORE0_BASE, V3D_CTL_MISCCFG);
+    serial_println!(
+        "::   [v3d60] MISCCFG ours={:#010x} (OVRTMUOUT={}) — mainline writes the TMU-output override only on the pre-4.1 path; on 4.2 the register stays at its reset value and UnaOS never writes it. No divergence, recorded for completeness ::",
+        misccfg, (misccfg & V3D_MISCCFG_OVRTMUOUT != 0) as u32
+    );
+
+    // ── GMP — mainline never writes it; reset state is allow-all ─────────────────────────────────
+    let gmp_cfg = mmio_read(V3D_CORE0_BASE, V3D_GMP_CFG);
+    let prot_on = gmp_cfg & V3D_GMP_CFG_PROT_ENABLE != 0;
+    gaps += prot_on as u32;
+    serial_println!(
+        "::   [v3d60] GMP_CFG ours={:#010x} PROT_ENABLE={} — mainline writes NO memory-protection register at init; the reset state has protection disabled (allow-all, not default-deny). Protection reading ENABLED here would mean something outside this driver armed it ::",
+        gmp_cfg, prot_on as u32
+    );
+
+    serial_println!(
+        ":: V3D: [v3d60] initdelta ({}) verdict — divergences/gaps={} — {} ::",
+        tag, gaps,
+        if gaps == 0 {
+            "our pre-first-bin-job register state matches every row of the mainline ledger this audit can check. No boot-state divergence remains to explain the dead-open frame"
+        } else {
+            "the rows marked **GAP** are real differences between our boot state and the state mainline hands its first bin job. The illegal-address catcher aimed into the job's own arena and the missing fault-INTERRUPT policy are both mechanisms by which a refused PTB write would land, or vanish, WITHOUT ever being reported — the exact shape of the wall. Neither is fixed here (read-only arc); both are next-arc candidates"
+        }
+    );
+}
+
+/// `[v3d60] syncrd` — settle the read-side-effect question `[v3d59] ctstate` hedged on. Two BACK-TO-BACK
+/// reads of each CLE semaphore register at a quiescent station, nothing in between. A difference can
+/// only be the read itself.
+fn v3d60_syncrd(tag: &str) {
+    if !V3D60_SYNCRD {
+        return;
+    }
+    let a1 = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0SYNC);
+    let a2 = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0SYNC);
+    let b1 = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT1SYNC);
+    let b2 = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT1SYNC);
+    let self_modifying = a1 != a2 || b1 != b2;
+    serial_println!(
+        ":: V3D: [v3d60] syncrd ({}) — back-to-back reads at a QUIESCENT station, no write and no kick in between: CT0SYNC {:#010x} then {:#010x} | CT1SYNC {:#010x} then {:#010x} — {} ::",
+        tag, a1, a2, b1, b2,
+        if self_modifying {
+            "THE SEMAPHORE REGISTERS SELF-MODIFY ON READ. Nothing happened between the two reads but the read itself, so [v3d59] ctstate's `sema_moved` row is a PROBE ARTIFACT (five stations = five reads per register) and is RETRACTED. Any future decode must sample these registers at most once per boot"
+        } else {
+            "the semaphore registers are STABLE under back-to-back reads — no read side effect. [v3d59] ctstate's semaphore row therefore stands as measured, and its five-reads-per-register hedge can be dropped: whatever it reported about CT0SYNC/CT1SYNC motion was real block state, not the probe moving what it measured"
+        }
+    );
+}
+
+/// `[v3d60] gmpdelta` — the memory-protection and MMU fault latches, sampled PRE-kick and again at
+/// wait-exit, reported as what latched DURING the frame. A silent drop is a delta question, and every
+/// prior reading of these registers was a single post-hoc sample.
+#[derive(Clone, Copy)]
+struct V3d60Prot {
+    gmp_status: u32,
+    gmp_vio_addr: u32,
+    gmp_vio_type: u32,
+    mmu_ctl: u32,
+    mmu_vio_addr: u32,
+    mmu_vio_id: u32,
+}
+
+fn v3d60_prot_sample() -> V3d60Prot {
+    V3d60Prot {
+        gmp_status: mmio_read(V3D_CORE0_BASE, V3D_GMP_STATUS),
+        gmp_vio_addr: mmio_read(V3D_CORE0_BASE, V3D_GMP_VIO_ADDR),
+        gmp_vio_type: mmio_read(V3D_CORE0_BASE, V3D_GMP_VIO_TYPE),
+        mmu_ctl: mmio_read(V3D_HUB_BASE, V3D_MMU_CTL),
+        mmu_vio_addr: mmio_read(V3D_HUB_BASE, V3D_MMU_VIO_ADDR),
+        mmu_vio_id: mmio_read(V3D_HUB_BASE, V3D_MMU_VIO_ID),
+    }
+}
+
+fn v3d60_emit_gmpdelta(tag: &str, pre: &V3d60Prot, post: &V3d60Prot) {
+    if !V3D60_GMPDELTA {
+        return;
+    }
+    let fault_mask = V3D_MMU_CTL_PT_INVALID | V3D_MMU_CTL_WRITE_VIOLATION | V3D_MMU_CTL_CAP_EXCEEDED;
+    let mmu_pre = pre.mmu_ctl & fault_mask;
+    let mmu_post = post.mmu_ctl & fault_mask;
+    let mmu_new = mmu_post & !mmu_pre;
+    let gmp_vio_pre = pre.gmp_status & (V3D_GMP_STATUS_VIO | V3D_GMP_STATUS_INVPROT);
+    let gmp_vio_post = post.gmp_status & (V3D_GMP_STATUS_VIO | V3D_GMP_STATUS_INVPROT);
+    let gmp_new = gmp_vio_post & !gmp_vio_pre;
+    let verdict = if gmp_new != 0 {
+        "A MEMORY-PROTECTION VIOLATION LATCHED DURING THE BIN FRAME. This is the silent-drop mechanism the campaign has been hunting: the protection block refuses the PTB's pool write, the write never lands, and no MMU fault and no CTERR is ever raised — item-accept-without-pool-write, exactly. Read the violation address/type columns for what the PTB was reaching for"
+    } else if mmu_new & V3D_MMU_CTL_CAP_EXCEEDED != 0 {
+        "THE MMU ADDRESS CAP WAS EXCEEDED DURING THE FRAME. The PTB issued an address beyond the page-table cap — the access is capped, not translated, and the pool write goes nowhere our page table describes. That reconciles 'BPCA advances' with 'no traffic anywhere the MMU grants'"
+    } else if mmu_new != 0 {
+        "AN MMU FAULT LATCHED DURING THE BIN FRAME (page-table-invalid and/or write-violation) that was NOT latched before the kick. The PTB's write was refused by translation; read MMU_VIO_ADDR/VIO_ID for the address and the client that issued it"
+    } else if gmp_vio_post != 0 || mmu_post != 0 {
+        "a protection/translation fault is latched, but it was ALREADY latched before this kick — it belongs to an earlier job (or to the reset state), not to this bin frame. Nothing new was refused during the frame"
+    } else {
+        "CLEAN ACROSS THE FRAME — no protection violation, no page-table-invalid, no write-violation, no address-cap event latched between the pre-kick sample and wait-exit. The PTB's missing pool write was NOT refused by the memory-protection block and NOT refused by the MMU; both are exonerated for this frame, and the PTB frame open/close unit stands alone as the wall"
+    };
+    serial_println!(
+        ":: V3D: [v3d60] gmpdelta ({}) — ACROSS the bin frame (pre-kick -> wait-exit) | GMP_STATUS {:#010x}->{:#010x} (violation bits newly set={:#010x}) VIO_ADDR {:#010x}->{:#010x} VIO_TYPE {:#010x}->{:#010x} | MMU_CTL fault bits {:#010x}->{:#010x} (newly set={:#010x}) VIO_ADDR {:#010x}->{:#010x} VIO_ID {:#010x}->{:#010x} — {} ::",
+        tag,
+        pre.gmp_status, post.gmp_status, gmp_new,
+        pre.gmp_vio_addr, post.gmp_vio_addr,
+        pre.gmp_vio_type, post.gmp_vio_type,
+        mmu_pre, mmu_post, mmu_new,
+        pre.mmu_vio_addr, post.mmu_vio_addr,
+        pre.mmu_vio_id, post.mmu_vio_id,
+        verdict
+    );
 }
 
 /// PI-V3D-27: run the Mesa-compiled attribute-DMA probe as a one-off bin job over the real draw's vertex
@@ -4970,8 +5469,17 @@ fn probe_job() {
     // so the capture carries its own mainline provenance; the reset is DISARMED and reports the virgin
     // CT0CS decode either way (it must run after S0 so the S0 sample stays a true pre-program reading).
     v3d59_mainline_ledger();
+    // [v3d60] the boot-state discriminators, all read-only and all taken at this quiescent pre-kick
+    // station: the ours-vs-mainline init ledger, the back-to-back CTnSYNC read-side-effect test (which
+    // settles the hedge [v3d59] ctstate left on its semaphore row), and the PRE half of the
+    // protection/translation fault-latch delta that closes at wait-exit below.
+    v3d60_initdelta("v3d40 PROBE pre-kick");
+    v3d60_syncrd("v3d40 PROBE pre-kick");
     v3d59_ct0_frame_reset("v3d40 PROBE");
     clear_mmu_fault_latch("v3d28 pre-probe");
+    // [v3d60] the PRE half of the fault-latch delta — taken AFTER the MMU fault latch is cleared, so
+    // anything the post-frame sample shows was latched BY THIS FRAME and not inherited.
+    let prot_pre = v3d60_prot_sample();
     // PI-V3D-57: kernel-exact ORDER — BPOS=0 is `v3d_bin_job_run`'s FIRST write, ahead of the cache
     // invalidate and the CT0 tile-memory latch (see `bin_prejob_bpos_clear`).
     bin_prejob_bpos_clear("v3d40 PROBE");
@@ -5103,6 +5611,10 @@ fn probe_job() {
     // (CTERR/CTSUBS/CTSEMA — never named until this arc) plus the never-read CT0SYNC/CT1SYNC/BXCF, and
     // then a second look at the wedged block to separate "stalled" from "dead-open". Both pure reads.
     v3d59_emit_ctstate("v3d40 PROBE", &[st0, st1, st2, st3, st4]);
+    // [v3d60] close the fault-latch delta at wait-exit, BEFORE the L2T flushes and cache maintenance
+    // below can perturb anything: what did the memory-protection block or the MMU refuse DURING the
+    // frame? Every prior reading of these registers was a single post-hoc sample.
+    v3d60_emit_gmpdelta("v3d40 PROBE", &prot_pre, &v3d60_prot_sample());
     v3d59_frameclose_poll("v3d40 PROBE post-bin");
     // Read the battery now the probe has idled — THE decisive witness for V3D-35. valid_instr says how far
     // the probe thread got (reached the [9] store word or died before it); tcache_access says whether the
