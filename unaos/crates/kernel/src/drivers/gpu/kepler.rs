@@ -471,6 +471,16 @@ pub fn init(gpu: &GpuInfo) {
                                         
                                         let base = 0x409000;
                                         
+                                        // --- Pull 28: FECS CTXCTL Handshake Recon ---
+                                        serial_println!(":: kepler: recon CTXCTL/host-interface reset values ::");
+                                        serial_println!(":: kepler: recon WRCMD_CMD={:08X} ::", mmio_read(bar0, base + 0x504));
+                                        serial_println!(":: kepler: recon CC_SCRATCH[0]={:08X} ::", mmio_read(bar0, base + 0x800));
+                                        serial_println!(":: kepler: recon CC_SCRATCH[1]={:08X} ::", mmio_read(bar0, base + 0x804));
+                                        serial_println!(":: kepler: recon CHAN_CUR={:08X} ::", mmio_read(bar0, base + 0xb00));
+                                        serial_println!(":: kepler: recon CHAN_NEXT={:08X} ::", mmio_read(bar0, base + 0xb04));
+                                        serial_println!(":: kepler: recon ENGINE_STATUS={:08X} ::", mmio_read(bar0, base + 0xc00));
+                                        serial_println!(":: kepler: recon ENGINE_TRIGGER={:08X} ::", mmio_read(bar0, base + 0xc08));
+
                                         for &(img_label, img, want) in &[("A", &UCODE_A, 0xF00DFACEu32), ("B", &UCODE_B, 0xF00DBEEFu32)] {
                                             let port = if img_label == "A" { 0x1000 } else { 0x0040 };
                                             serial_println!(":: kepler: ucode img={} ioport={:04X} want={:08X} ::", img_label, port, want);
