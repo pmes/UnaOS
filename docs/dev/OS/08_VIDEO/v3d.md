@@ -2024,6 +2024,13 @@ silently. It sits **past** the presence gate, so QEMU `raspi4b` (which returns a
 neither variant and the default-quiet boot is unchanged.
 
 `check` is blind to knob-gated code: the gating is verified by building `kernel8` **both** ways and
-strings-proofing the images. Armed-without-deep carries only the `deep=off` line; the ladder header,
-the `frameclose` verdict strings and the `rerender` strings are all absent, and the image is ~12 KiB
-smaller.
+strings-proofing the images. In the armed-without-deep image the probe **bodies** are gone — the
+`[v3d48]` ladder header, the `[v3d59] frameclose` verdict strings and the `[v3d58] rerender` strings all
+drop out, 11,904 bytes (~12 KiB) smaller.
+
+What *does* remain, by design, is a handful of **name-references** to those probes: the `deep=off`
+honesty line itself (which has to name what it skipped to be honest) and the `[v3d59] ctstate`
+fall-through verdict's cross-reference to `frameclose`. That cross-reference carries its own
+DEEP-only caveat inline, so it points the reader at `UNAOS_V3D_DEEP=1` rather than at a line that
+cannot appear. A `strings | grep frameclose` on the armed-without-deep image therefore returns hits;
+the check that matters is that no probe *output* string survives.
