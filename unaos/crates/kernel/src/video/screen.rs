@@ -233,6 +233,19 @@ static SPREAD2_ROWS: [core::sync::atomic::AtomicU32; SPREAD2_CORES] =
 #[cfg(all(feature = "vugpar", feature = "baremetal"))]
 static SPREAD2_FRAMES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+/// WEDGE-1 — candidate cores rejected by the FRESHNESS gate in [`Screen::flush_parallel`]: `tracked`
+/// said the core's load number was printable, but it had not folded a dispatch span within
+/// `sched::dispatch_fresh_cyc`, so it was not given a pinned band.
+///
+/// This is the arc's one directly-falsifiable metal number, and it is why it is a counter rather than
+/// a comment. Every increment is a band that WOULD have been pinned — non-stealable, untimed join —
+/// onto a core that was not dispatching. On a calm boot it must stay 0: a live core folds a span
+/// every dispatch pass and cannot trip a ~30 ms bound. A non-zero reading on the bench is the P66
+/// wedge's precondition being reached and declined, and it is the difference between "we believe the
+/// mechanism" and "we watched it happen".
+#[cfg(all(feature = "vugpar", feature = "baremetal"))]
+static WEDGE1_STALE_DECLINED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 /// SPREAD-2 — a core's share weight from its momentary busy fraction. Headroom, floored; an equal
 /// set of weights reproduces the old uniform split exactly.
 #[cfg(all(feature = "vugpar", feature = "baremetal"))]
@@ -292,7 +305,7 @@ fn spread2_note(self_cpu: usize, helpers: &[usize], jobs: &[BandJob]) {
     let ratio = if lo == 0 { 9999 } else { (hi as u64 * 100 / lo as u64) as u32 };
 
     serial_println!(
-        ":: [spread2] window {} frames cores {} bands {},{},{},{} rows {},{},{},{} rpb {},{},{},{} ratio {} ::",
+        ":: [spread2] window {} frames cores {} bands {},{},{},{} rows {},{},{},{} rpb {},{},{},{} ratio {} stale {} ::",
         SPREAD2_WINDOW,
         live,
         bands[0],
@@ -307,7 +320,8 @@ fn spread2_note(self_cpu: usize, helpers: &[usize], jobs: &[BandJob]) {
         rpb[1],
         rpb[2],
         rpb[3],
-        ratio
+        ratio,
+        WEDGE1_STALE_DECLINED.swap(0, core::sync::atomic::Ordering::Relaxed)
     );
 }
 
@@ -907,9 +921,31 @@ impl Screen {
         let mut hbusy = [0u32; MAX_BANDS - 1];
         let mut nh = 0usize;
         let mut c = 0usize;
+        // WEDGE-1 — ELIGIBILITY IS *FRESHNESS*, NOT `tracked`. A band task is spawned PINNED to the
+        // core chosen here (`spawn_joinable` with a concrete cpu sets `steal_ok: false`), so no other
+        // core may ever steal it, and the join below has NO TIMEOUT. Handing a band to a core that has
+        // stopped going round its dispatch loop therefore parks THIS task forever — and the flushing
+        // task is a compositor path, so a forever-parked flusher takes its window's damage, its
+        // `BlitGuard` and eventually a teardown's IRQ-masked drain barrier down with it. That is the
+        // P66 wedge's amplifier: one core stuck (a `DrainBarrier::drain` spin, IRQ-masked from
+        // `sched::exit`) becomes three cores stuck, one per flusher that pinned a band to it.
+        //
+        // `tracked` was the wrong gate for this question and says so in its own doc: its ~2-window
+        // (~500 ms) slack exists to keep a genuinely-scheduled core off the `--` DISPLAY during a slow
+        // rollover. For half a second after a core stops dispatching it still reads `true`, which at
+        // 6 vugs' frame rates is dozens of bands pinned onto a dead core. `dispatch_fresh_cyc` is the
+        // tight bound for "may I give this core work only it can run".
+        //
+        // This does not weaken the parallel path: a live core folds a span every dispatch pass and can
+        // never trip the bound, so the calm and loaded cases alike keep their full fan-out. It only
+        // declines the one placement that could never have completed.
+        let fresh = sched::dispatch_fresh_cyc();
         while c < ncpu {
             let load = sched::core_load(c);
-            if c != self_cpu && load.tracked {
+            if c != self_cpu && load.tracked && load.fold_age_cyc >= fresh {
+                WEDGE1_STALE_DECLINED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+            if c != self_cpu && load.tracked && load.fold_age_cyc < fresh {
                 let busy = load.busy_pct_recent;
                 if nh < MAX_BANDS - 1 {
                     // Insertion sort into the kept set: ascending `busy`.

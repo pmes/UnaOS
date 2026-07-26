@@ -1339,6 +1339,29 @@ fn composite_inner() -> CursorTail {
         }
     }
 
+    // WEDGE-1 — THE FRAMEBUFFER HANDLE IS TAKEN *BEFORE* THE GUARD, and that ordering is a
+    // correctness constraint of exactly the kind stated for `SPRITE` at the head of this function.
+    //
+    // `DrainBarrier::drain` spins IRQ-MASKED and unpreemptible until `BLIT_ACTIVE` reaches zero (see
+    // its termination note), and it reaches that state from `sched::exit` — which calls `mask_irq()`
+    // as its first act — via `boot::teardown_user_slot` -> `syscall::clear_handle_row` ->
+    // `close_owner`. Its termination argument is that every member of the wait set is running "a
+    // bounded panel-clipped blit". A BLOCKING lock acquired after `BlitGuard::enter()` breaks that
+    // argument outright: it puts that lock, and transitively every lock ordered above it, into the
+    // drain's wait set. `WRITER` is ordered UNDER `SPRITE` (`cursor::undraw_locked`, `draw_locked`,
+    // `redraw_off_locked` all take it with the sprite lock held), so taking it inside the guard
+    // admitted `SPRITE` into the wait set through the back door — the very thing the `SPRITE`
+    // placement note above exists to forbid.
+    //
+    // The handle is `Copy` and nothing between here and the old acquisition site consumed it, so
+    // hoisting is a pure ordering change: same value, same early return, one fewer blocking lock
+    // inside the guard. The `is_ready` early return now precedes the registration, which is strictly
+    // better — a pass that cannot draw no longer registers as in-flight at all.
+    let fb = *super::WRITER.lock();
+    if !fb.is_ready() {
+        return tail_of(disturbed, session);
+    }
+
     // F4 — the drain barrier. Register this composite as in-flight WHILE STILL HOLDING the table
     // lock, so the registration is ordered against any teardown that takes the lock afterwards: a
     // `close_owner` that clears rows can then tell whether some other core snapshotted those rows
@@ -1384,11 +1407,6 @@ fn composite_inner() -> CursorTail {
         if !grew {
             break;
         }
-    }
-
-    let fb = *super::WRITER.lock();
-    if !fb.is_ready() {
-        return tail_of(disturbed, session);
     }
 
     // Back-to-front: ascending z, ties by id (creation order).
@@ -1781,6 +1799,19 @@ impl Drop for BlitGuard {
 /// it (under the table lock, where teardown also raises it) does not register and does not blit.
 static DRAIN_PENDING: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
+/// WEDGE-1 — spin iterations past which [`DrainBarrier::drain`] declares itself stalled. The wait it
+/// is bounded against is a handful of panel-clipped `memcpy`s, microseconds each; this is order 10^8
+/// spin hints, i.e. comfortably past a second of real time on the Pi even with the loop fully
+/// unrolled. Deliberately far out: the tripwire's job is to name a HANG, and a threshold a merely
+/// slow drain could reach would put a serial write on a hot IRQ-masked path.
+const DRAIN_STALL_SPINS: u64 = 1 << 27;
+
+/// WEDGE-1 — whether the drain-stall tripwire has already fired. Once per boot, globally: a wedge
+/// takes several cores at once and each would otherwise queue its own line behind a serial lock that
+/// the wedge may itself be holding.
+static DRAIN_STALL_REPORTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// F4 — a teardown's phase barrier, RAII so the barrier always re-opens. Raised by
 /// [`close`]/[`close_owner`] and dropped once the drain has completed.
 struct DrainBarrier;
@@ -1805,8 +1836,34 @@ impl DrainBarrier {
         // Ordered against the composite registration by the table lock: a composite either took the
         // lock BEFORE the clearing critical section (so it registered, and is counted here) or AFTER
         // (so it sees the raised barrier and never registers).
+        //
+        // WEDGE-1 — THE TRIPWIRE. P66 wedged three of four cores here with nothing on the wire: no
+        // panic, no exception, just `SCHED: load c0=-- c1=-- c3=--` and silence. This spin is the
+        // place a wedge of that shape lands, and it was the one place that could not say so.
+        //
+        // The spin is UNCHANGED — the barrier still waits out every registered blit, because
+        // returning early would hand a teardown's about-to-be-unmapped surface to an in-flight blit,
+        // and no diagnostic is worth that. The tripwire only makes the stall AUDIBLE: once, past a
+        // threshold no bounded panel-clipped blit can reach, it names the core and the outstanding
+        // count, then goes back to spinning.
+        //
+        // Honest about its own risk: this core is IRQ-masked, and `serial_println!` takes a blocking
+        // lock. If the wedge is IN the serial path the tripwire blocks — but the alternative on that
+        // path was spinning here forever anyway, so it is strictly no worse, and on every other
+        // shape of wedge it converts a silent hang into a named one.
+        let mut spins: u64 = 0;
         while BLIT_ACTIVE.load(Ordering::Acquire) != 0 {
             core::hint::spin_loop();
+            spins = spins.wrapping_add(1);
+            if spins == DRAIN_STALL_SPINS && !DRAIN_STALL_REPORTED.swap(true, Ordering::Relaxed) {
+                serial_println!(
+                    ":: [wedge1] DRAIN STALLED core={} blit_active={} pending={} spins={} == tripwire ::",
+                    crate::arch::sched::meter_current_cpu(),
+                    BLIT_ACTIVE.load(Ordering::Acquire),
+                    DRAIN_PENDING.load(Ordering::Acquire),
+                    spins
+                );
+            }
         }
         DrainBarrier
     }
