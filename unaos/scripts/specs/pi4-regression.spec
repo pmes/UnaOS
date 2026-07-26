@@ -717,11 +717,21 @@ FORBID \[pstrip\] src .*SKIP-ARCH
 # ---    `srcdelta=0` is a stale feed; a window with a large `srcdelta` and `redraws=0` is the dirty
 # ---    test swallowing real movement. Neither was legible in the P64 capture, and both are now.
 REQUIRE \[pstrip\] rollup .* srcdelta=[0-9]+ rate=
-# ---    The busy-loop FORBID. The rate is printed in tenths precisely so this can bite: anything at
-# ---    or above 5.0 presents/s sustained over a rollup window is the strip having become a spinner
-# ---    on the render core -- the SCHED-6 regression, re-entered through the pulse. 4.x and below is
-# ---    left legal so a genuinely churning machine is not called a bug.
-FORBID \[pstrip\] rollup .*rate=([5-9]|[1-9][0-9]+)\.[0-9]/s
+# ---    The busy-loop FORBID. The rate is printed in tenths precisely so this can bite: a rate
+# ---    sustained above the strip's own legal ceiling over a rollup window is the strip having become
+# ---    a spinner on the render core -- the SCHED-6 regression, re-entered through the pulse.
+# ---    PULSE-4 raised the bound 5.0 -> 6.0, because the ceiling moved and the old bound no longer
+# ---    had headroom above it. Two independent sources feed rate=: the sample-paced load redraws,
+# ---    capped by PSTRIP_PERIOD_MS (4/s at 250 ms), and the status TEXT redraw, which is outside the
+# ---    period gate and fires on the composed line's seconds field (~1/s). A busy 10 s window can
+# ---    therefore reach exactly 5.0/s legitimately -- a false red on a correctly-paced strip.
+# ---    6.0 is deliberately kept as a bound on `rate=` in its full meaning (every present the strip
+# ---    causes, whatever drove it) rather than netting the text redraws out: a spinner that repainted
+# ---    via the text path would be just as much the regression this catches, and excluding a term
+# ---    from the number is how a witness stops measuring the thing it is named after. The margin is
+# ---    now 1.0/s over the legal ceiling, so a real spinner (free-running at the event rate, tens/s)
+# ---    still trips it by a wide margin.
+FORBID \[pstrip\] rollup .*rate=([6-9]|[1-9][0-9]+)\.[0-9]/s
 # --- SPINHUNT: a worker thread whose leader exited without joining it must reach a terminus.
 # ---
 # ---    P61: with several bg vugs launched, killed and relaunched, one core read a SUSTAINED 99%

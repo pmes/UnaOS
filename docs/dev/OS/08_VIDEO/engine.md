@@ -351,7 +351,8 @@ REQUIREd so a revert to percent is caught; `reserved=` is what the tiler subtrac
 The rollup is the pacing assertion: `samples` counts meter reads, `redraws` counts
 frames actually drawn and presented, and the spec REQUIREs a rollup with a non-zero
 `skipped=`. The rate is printed in **tenths** so the FORBID can bite: `rate=` at or
-above `5.0/s` sustained is the panel having become a spinner on the render core,
+above the bound sustained (5.0/s as written here; PULSE-4 raised it to 6.0/s when
+the cadence moved — see that section) is the panel having become a spinner on the render core,
 i.e. the SCHED-6 regression re-entered through the pulse. Visual verdict is the
 bench's.
 
@@ -524,7 +525,28 @@ panel's redraw rate is still set by the status text's seconds field at ~1/s — 
 same as at 1 Hz, four times the samples notwithstanding. The decay converges to an
 exact 0 (a 1‰-per-sample floor under the geometric step) rather than asymptoting, so
 a machine that goes quiet stops redrawing instead of creeping forever. The spec's
-`rate < 5.0/s` FORBID and its non-zero `skipped=` REQUIRE both still hold.
+non-zero `skipped=` REQUIRE still holds.
+
+**Two margins moved with the cadence, and both are stated here rather than
+re-derived later.**
+
+* **The busy-loop FORBID went 5.0 → 6.0/s.** Two independent sources feed `rate=`:
+  sample-paced load redraws, capped by `PSTRIP_PERIOD_MS` at 4/s, and the status
+  *text* redraw, which is outside the period gate and fires on the composed line's
+  seconds field at ~1/s. A busy window can therefore reach exactly 5.0/s
+  legitimately — the old bound had zero headroom over the new legal ceiling and
+  would have gone red on a correctly-paced strip. The bound is raised rather than
+  the text redraws netted out of `rate=`: a spinner repainting via the text path is
+  just as much the regression this catches, and dropping a term from a number is how
+  a witness stops measuring the thing it is named after.
+* **GUI-CLICK-2's saturation deadline went ~64 s → ~16 s.** `status_tick`'s Timer
+  post is gated on `SCREEN_APP_ACTIVE` because `render_service` is blocked inside
+  `dispatch_command` while a full-screen app owns the screen and cannot drain
+  `GUI_CHANNEL`; at 4 Hz an ungated pulse would fill the 64-slot channel four times
+  sooner. The gate is unchanged and still closes it, and the same 4x applies to the
+  `gui_watchdog::poll()` that rides this task — the escape hatch returning input to
+  the shell from a wedged app now fires four times as often, which is the direction
+  that helps. Named so GUI-CLICK-2's sizing is not re-derived blind.
 
 **Witnesses** — the budget as a reading, not as a bench observation:
 
