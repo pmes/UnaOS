@@ -690,6 +690,26 @@ pub fn init(gpu: &GpuInfo) {
                                         serial_println!(":: kepler: WITNESS PASSED - bits stuck! ::");
                                     }
 
+                                    // --- POLL-CONTROL leg (GR5, s37): the one variable never varied WITH an
+                                    // error readback. Every witness write above is 0xC0000000 = VALID|POLL_ENABLE,
+                                    // and the chip's own name for err=2 is NO_POLL ("validated a channel with
+                                    // POLL_ENABLE, but poll area is disabled" — sitting #9). Sitting #8 did write
+                                    // VALID-only (0x80002000) and the bit still stripped, so we do NOT expect the
+                                    // bits to hold — but s8 predates the error readback (pull 10), so nobody has
+                                    // ever read err= with POLL_ENABLE CLEAR. If err stays 00000002 while POLL is
+                                    // clear, the chip's NO_POLL name does not mean what it says and the reason
+                                    // code is a red herring we have honored for 28 sittings. If err CHANGES, the
+                                    // new code names the real precondition. Either way it is decisive, and it is
+                                    // three writes. The legs above are untouched controls.
+                                    mmio_write(bar0, 0x800000 + (1 * 8), 0);
+                                    mmio_write(bar0, 0x800004 + (1 * 8), 0x00000400);
+                                    mmio_write(bar0, 0x800000 + (1 * 8), 0x80000000 | ((inst_off as u32) >> 12));
+                                    let poll_rb = mmio_read(bar0, 0x800000 + (1 * 8));
+                                    let poll_err = mmio_read(bar0, 0x252c);
+                                    let poll_stat = mmio_read(bar0, 0x263c);
+                                    serial_println!(":: kepler: poll-control valid-only chan={:08X} err={:08X} stat={:08X} ::",
+                                        poll_rb, poll_err, poll_stat);
+
                                     let post_wit_scratch = mmio_read(bar0, 0x409000 + 0x804);
                                     let post_wit_cpu = mmio_read(bar0, 0x409000 + 0x100);
                                     serial_println!(":: kepler: ucode-echo post-witness CC_SCRATCH[1]={:08X} cpuctl={:08X} ::", post_wit_scratch, post_wit_cpu);
