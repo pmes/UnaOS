@@ -725,13 +725,57 @@ impl Screen {
         // full-screen VUG frame, which is what VUG-PAR was built for, has no windows and is unchanged.
         #[cfg(all(feature = "vugpar", feature = "baremetal"))]
         if occ.is_empty() {
+            // CURSOR-6 — the band path copies whole clipped rects and returns without reaching the
+            // serial loop's probe, so it owes the same test or the counter would be blind on exactly
+            // the windowless full-screen VUG frame this path exists for. No subtraction applies here
+            // (`occ` is empty), so the clipped rects ARE what lands on the panel. Taken only on the
+            // branch that actually PRESENTED in bands — a declined `flush_parallel` falls through to
+            // the serial loop, which runs its own probe, and counting both would double-count.
+            #[cfg(feature = "witness")]
+            let sbox = super::cursor::live_box_relaxed();
+            #[cfg(feature = "witness")]
+            let banded = {
+                let mut hit = false;
+                if let Some((sx, sy, sw, sh)) = sbox {
+                    for idx in 0..n {
+                        let d = self.damage.rects[idx];
+                        let x1 = d.x1.min(self.info.width);
+                        let y1 = d.y1.min(self.info.height);
+                        if d.x0 < x1
+                            && d.y0 < y1
+                            && d.x0 < sx + sw
+                            && sx < x1
+                            && d.y0 < sy + sh
+                            && sy < y1
+                        {
+                            hit = true;
+                            break;
+                        }
+                    }
+                }
+                hit
+            };
             if self.flush_parallel(n) {
+                #[cfg(feature = "witness")]
+                if banded {
+                    super::cursor::note_desktop_over_sprite();
+                }
                 return false;
             }
         }
         let bpp = self.info.bytes_per_pixel;
         let stride = self.info.stride;
         let mut flushed: u64 = 0;
+        // CURSOR-6 — the sprite's box, once for the whole present, read WITHOUT the sprite lock. The
+        // desktop's flush is bracketed by the render task (`cursor::undraw` → `pal.render` →
+        // `cursor::repaint`), so a live sprite must never be seen here; if one is, the bracket has a
+        // hole and the desktop is erasing the arrow at flush rate — the spotty symptom, from the
+        // other layer. Diagnostic only: nothing below is conditional on it, so a stale answer costs
+        // precision and never a pixel.
+        #[cfg(feature = "witness")]
+        let sprite_box = super::cursor::live_box_relaxed();
+        #[cfg(feature = "witness")]
+        let mut over_sprite = false;
         for idx in 0..n {
             let d = self.damage.rects[idx];
             let x1 = d.x1.min(self.info.width);
@@ -760,6 +804,19 @@ impl Screen {
                             self.front.blit(off, &self.back_store[off..off + seg]);
                             flushed += seg as u64;
                         }
+                        // CURSOR-6 — did this surviving span land on the sprite? Latched, not
+                        // counted per span: the unit that means something is "one desktop present
+                        // erased the arrow", and a per-span count would report the arrow's height
+                        // instead. Short-circuited once latched so a full-panel flush pays the test
+                        // at most once.
+                        #[cfg(feature = "witness")]
+                        if !over_sprite {
+                            if let Some((sx, sy, sw, sh)) = sprite_box {
+                                if y >= sy && y < sy + sh && xs < sx + sw && sx < gap_end {
+                                    over_sprite = true;
+                                }
+                            }
+                        }
                     }
                     xs = next;
                 }
@@ -774,6 +831,10 @@ impl Screen {
             self.front.flush_range(span_start, span_end - span_start);
         }
         self.last_flush_bytes = flushed;
+        #[cfg(feature = "witness")]
+        if over_sprite {
+            super::cursor::note_desktop_over_sprite();
+        }
         #[cfg(feature = "witness")]
         super::wm::note_desktop_flush(!occ.is_empty(), false);
         // WC-I — the subtraction is exact: every span this loop copied was tested against the window

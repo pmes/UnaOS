@@ -511,6 +511,29 @@ REQUIRE \[cursor5\] rollup scope=.* stale_compose=.* adopt_incoh=.* selfsave=.* 
 FORBID \[cursor5\] .*-> REGRESSED
 FORBID \[cursor5\] .*drain_insession=[1-9]
 
+# --- CURSOR-6 — what the PANEL got, which no earlier cursor counter could reach ------------------
+#     P65v2 (attended, pi4-r23s1o): every CURSOR-5 mechanism silent (`-> COHERENT`) while the spotty
+#     cursor and the vug-window flash both survived. That is not a contradiction — every CURSOR-3/4/5
+#     counter is taken from inside the sprite module's own bookkeeping, and a painter that overwrites
+#     the arrow's pixels without consulting the module leaves that bookkeeping self-consistent.
+#
+#     `[cursor6]` measures the overwrite directly, off a lock-free mirror of the sprite's box
+#     (`cursor::live_box_relaxed`) that is readable from inside `wm`'s BlitGuard and the desktop's row
+#     loop, where the SPRITE lock may not be taken.
+#
+#     `desktop_over` must stay 0: the render task brackets its own `Screen::flush` with
+#     undraw/repaint, so a live sprite must never be seen by `present_background`. A non-zero count is
+#     a BROKEN BRACKET — the desktop erasing the arrow at flush rate — not load, which is why it is a
+#     FORBID rather than a watch-list item. `present_over` (window presents over an UNBRACKETED
+#     sprite) is the metal question and is deliberately NOT forbidden: it is the hypothesis this arc
+#     exists to test, and a gate that refused it would refuse the evidence.
+#
+#     UNWITNESSED on QEMU (no HID pointer, so the sprite is never drawn and the mirror is never set).
+#     See docs/dev/OS/08_VIDEO/engine.md §CURSOR-6.
+REQUIRE \[cursor6\] rollup scope=.* present_over=.* masked=.* desktop_over=.* mismatch=.* uncover_lost=.* ->
+FORBID \[cursor6\] .*-> UNBRACKETED
+FORBID \[cursor6\] .*desktop_over=[1-9]
+
 # --- WC-J — a closed window gives its panel rows BACK ------------------------------------------
 # ---    P61 (attended): four background vugs, some killed; the operator reported one crash, two
 # ---    FROZEN windows and one still running, and `jobs` then showed all four pids exited 0 and

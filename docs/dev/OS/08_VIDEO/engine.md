@@ -3313,3 +3313,145 @@ not the argument.
   mechanism B's fix; `[cursor3]`'s `lock=` counts the same passes, so the two must agree.
 * The attended question is unchanged in shape: hold the pointer over a live vug under `vugband` load,
   tweak it, and report whether the flash recurs and whether the spottiness is gone or merely reduced.
+
+### CURSOR-6 — the counters were measuring the module, not the panel
+
+CURSOR-5 shipped five counters and P65v2 (attended, capture `pi4-r23s1o`) returned every one of them
+silent — `[cursor5] rollup scope=desktop stale_compose=0 adopt_incoh=0 selfsave=0 masked_nosession=0
+drain_insession=0 -> COHERENT` — while Peter still saw a spotty cursor and a vug-window flash "if you
+tweak the mouse just so". A `COHERENT` verdict alongside a visibly broken panel is not a contradiction
+to be explained away; it is the shape of the arc's next question, and the answer is that every
+CURSOR-3/4/5 counter is taken from **inside the sprite module's own bookkeeping** — plans, sessions,
+generations, coverage bits. A painter that overwrites the arrow's pixels without ever consulting the
+module leaves all of that bookkeeping perfectly self-consistent. The instruments could not have seen
+the symptom no matter how bad it got.
+
+#### The `48 % decline` was an artefact, and it sent the last two sittings the wrong way
+
+The P64-era desktop wire reads `offers=33790 taken=16111 straddle=18443`, which invites "the overlay
+mechanism declines half the time, and straddling is why". It is not what those numbers say. An offer
+is made to **every staged window of a pass that holds a plan** — `stage_window` has no overlap test,
+deliberately, because a window that paints over sprite pixels without composing them must still clear
+their coverage (`overlay_uncover`). The sprite is over one window; every other window in the pass is
+offered a sprite it misses **entirely**, and `Composed::missed > 0` counted that identically to a
+genuine partial carry. With `offers / planned` ≈ 1.6, the arithmetic is not a mechanism failing — it
+is one window taking the sprite and its neighbours being asked.
+
+`[cursor3]`'s rollup therefore splits the class and keeps the old total beside it:
+
+* `disjoint` — `taken == 0 && missed > 0`. The sprite was nowhere in this window. Not a decline, not a
+  loss; the shape of the offer set.
+* `partial` — `taken > 0 && missed > 0`. A real straddle, composed in part — how often the CURSOR-4
+  split actually runs.
+
+`straddle` is retained as `disjoint + partial` so P64/P65 captures stay comparable line-for-line.
+
+#### The live box: the sprite's geometry, readable by painters
+
+Measuring "a painter took the arrow's pixels" needs the sprite's box readable from inside `wm`'s
+`BlitGuard` window and from the desktop's row loop. Neither may take `SPRITE`: F4's drain barrier
+spins IRQ-masked until every registered blit retires, and a blocking sprite lock there is exactly the
+wait that argument excludes. So the box is **mirrored into relaxed atomics** beside `EPOCH`
+(`cursor::LIVE_ON` / `LIVE_BOX`, read through `cursor::live_box_relaxed`), on the same discipline and
+with the same honesty about what a lock-free read can promise: the answer may be one pointer report
+stale. Nothing in the mechanism reads it — **no pixel decision is taken from it** — and the publish is
+deliberately biased: `draw_locked` publishes *before* the pixels go down and `undraw_locked` retracts
+*after* the restore, so the window in which the mirror disagrees with the panel is always the one
+where it claims a sprite that is not yet there, never the one where it denies a sprite that is. A
+diagnostic that can over-count is usable; one that can under-count the thing it exists to find is not.
+A masked undraw does **not** retract — part of the sprite is still up, and retracting would blind the
+counter to exactly the straddle case.
+
+#### PROVEN and fixed — the dropped coverage clear
+
+`overlay_uncover` `try_lock`s `OVERLAY` (it runs inside the blit guard) and CURSOR-4 discarded a
+contended clear silently, on the argument that "the only writer that could be holding it is another
+pass, which has already declined to share the session — its coverage is not ours to correct". **That
+is not the only writer.** `overlay_open` and `adopt_overlay` both take `OVERLAY` with a blocking
+`lock()` from outside the guard, and another core runs one of those on every composite; a pass merely
+*probing* for the session it is about to be refused holds the lock for as long as it takes to read
+`ov.session`. A clear can therefore be lost while **our** session is the live one.
+
+What that costs is not a missed optimisation. The window has just painted its own content over pixels
+a lower window's `compose_into` claimed, and the coverage bit for those pixels is still set.
+`adopt_overlay` then installs the lower layer's save-under for them and clears their `off` bit: the
+module now believes the arrow is on the panel where this window's content is (**the arrow is
+missing** — spotty), and the next undraw's colour guard sees the lower layer's saved value and writes
+it back into the upper window's rect (**a stale patch inside a live window** — the flash). Both P65
+symptoms, from one dropped `try_lock`, and invisible to every CURSOR-5 counter because neither the
+generation nor the geometry moved.
+
+The fix is the fallback the arc already trusts everywhere else. `overlay_uncover` is now
+`#[must_use] -> bool`; a `false` answer calls `cursor::note_uncover_lost()`, one relaxed store inside
+the guard (no lock, so the drain's wait set is unchanged). `adopt_overlay` **swaps** the flag — per-pass
+state, retired by the tail on every exit — and folds it into the `coherent` term, routing the pass to
+`refresh_locked`, which re-establishes the whole sprite from the finished front buffer. That is
+CURSOR-3's fallback: always available, always correct. A session mismatch still returns `true`, because
+for *that* case CURSOR-4's argument does hold — there is nothing of ours to clear.
+
+`C5_ADOPT_INCOH` is explicitly **not** bumped for a lost-clear decline. `[cursor5]`'s `adopt_incoh`
+names "the generation or the geometry moved mid-pass"; folding a second mechanism into it would make
+the next capture unreadable in precisely the way P65v2 was.
+
+#### INSTRUMENTED — the two overlap counters, and the fifth decline class
+
+`[cursor6] rollup scope=… present_over=N masked=N desktop_over=N mismatch=N uncover_lost=N -> V`
+
+* **`present_over`** — a window present whose front-buffer row blit covered part of the live sprite box
+  while the pass held **no overlay plan at all**, so nothing had handed those pixels back first. This
+  is the spotty mechanism stated as a measurement: they held the arrow before the blit and hold window
+  content after it, and no path tells the sprite module. Taken in `draw_window`, after the blit, from
+  `live_box_relaxed` and two relaxed atomics.
+* **`masked`** — the denominator: the same event with a plan in hand. A plan means `composite_inner`'s
+  masked undraw ran over every window that meets the sprite (the paint set is built independently of
+  the per-window `may_overlay` exclusion), so those pixels were handed back before the blit and the
+  tail owes them a repaint. Healthy. Without it `present_over=0` would be unreadable — no defect and
+  "the pointer was never over a presenting window" look identical.
+* **`desktop_over`** — the same question for the desktop layer, taken in `Screen::present_background`
+  over the spans that **survive** WC-I's occluder subtraction, and separately on the VUG-PAR band path
+  (which returns before the serial loop and would otherwise be blind on the windowless full-screen
+  frame it exists for). The render task brackets its own flush (`cursor::undraw` → `pal.render` →
+  `cursor::repaint`), so this **must be 0**; non-zero means the bracket has a hole and the desktop is
+  erasing the arrow at flush rate. Latched per present, not per span — the unit that means something is
+  "one desktop present erased the arrow", and a per-span count would report the arrow's height.
+* **`mismatch`** — a `compose_into` that declined because the open session did not describe *this* plan.
+  CURSOR-4 left this exit silent, so it was the one decline class absent from `offers - taken`.
+* **`uncover_lost`** — dropped clears, each now absorbed by a whole-sprite refresh rather than left to
+  corrupt a session.
+
+Verdicts: `UNBRACKETED` (`desktop_over > 0` — a broken bracket, not load; stop reading there),
+`UNWITNESSED` (the sprite was never armed — QEMU, always — or no present ever met it, `over == masked
+== 0`), `OVERWRITTEN` (`present_over > 0`), `INTACT` otherwise.
+
+#### CURSOR-6 gate results (2026-07-26, QEMU raspi4b)
+
+`./arroyo check`: both arches clean. `./arroyo kernel8`: clean. `./arroyo kernel8-test 150`: full PASS,
+0 forbidden.
+
+```
+[cursor3] rollup scope=fixture planned=0 offers=0 taken=0 adopt=0 repaint=1 ensure=348 straddle=0 disjoint=0 partial=0 lock=0 budget=0 stale=0 -> UNWITNESSED
+[cursor5] rollup scope=fixture stale_compose=0 adopt_incoh=0 selfsave=0 masked_nosession=0 drain_insession=0 -> UNWITNESSED
+[cursor6] rollup scope=fixture present_over=0 masked=0 desktop_over=0 mismatch=0 uncover_lost=0 -> UNWITNESSED
+```
+
+Same caveat as every cursor arc, and it is load-bearing here: QEMU raspi4b delivers no HID pointer
+report, so the sprite is never drawn, `live_box_relaxed()` is `None` for the whole boot, and every
+counter above is 0 by construction. The gate proves the wiring and no-regression. The dropped-clear
+fix is proven **in code**, by the lock-holder argument above; the two overlap counters are proven only
+in the sense that they are wired and quiet. What rides the next metal boot is the observation.
+
+#### Metal watch-list (CURSOR-6)
+
+* `desktop_over=0` — if this is non-zero, **stop**: the desktop's bracket is broken and that is the
+  whole mechanism, no further hypothesis needed.
+* `present_over` non-zero **names** the mechanism: window presents are erasing an unbracketed arrow.
+  The fix then belongs in the plan snapshot — `composite_inner` takes `sprite_plan()` once, before the
+  dirty set, and a sprite that arrives after it is invisible to the whole pass.
+* `present_over=0` with `masked` large and the symptom still present retires this hypothesis too, and
+  the remaining writers to the arrow's pixels are outside both present paths. That is the next thread.
+  `masked=0` means the question was not asked — get the pointer over a presenting vug and re-run.
+* `disjoint` should account for essentially all of the old `straddle`; `partial` is the honest count of
+  how often the CURSOR-4 split runs. If `partial` turns out to be large after all, the straddle class is
+  back on the table — the P65 reading was simply not able to say.
+* `uncover_lost` non-zero on the bench is the direct measure of the fix: each one is a session that
+  would have installed a stale save and is now taking a whole-sprite refresh instead.
