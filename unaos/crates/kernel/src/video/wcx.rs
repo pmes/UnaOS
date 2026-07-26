@@ -32,14 +32,22 @@
 //! *before* it would put windows on a surface the takeover is about to repoint — the compositor
 //! would be fighting the takeover for the same pixels, and the takeover would win, silently.
 //!
-//! ### Console pixel ownership — an OPEN parameter
+//! ### Console pixel ownership — RULED: the console is a WINDOW
 //!
-//! Whether the console keeps a reserved band or becomes an ordinary window in the table is **not
-//! ruled**; Peter has not decided. This module implements the BAND as the provisional default,
-//! because the band is the answer that requires no change to how the console paints:
-//! [`super::fbcon::panel_console_reserve_band`] shortens the console's row grid and the compositor
-//! places its windows strictly below it. The console is *not* converted into a window here, and
-//! nothing in this module presumes it will or will not be. See [`band_height`].
+//! Peter has ruled (2026-07-26): console-becomes-a-window, not a reserved band. The provisional
+//! band — a clamp on the console's row grid, with the compositor confined below it — is gone, and so
+//! is the `panel_console_reserve_band` call that installed it. What replaces it is
+//! [`super::fbcon::panel_console_window_open`]: the console allocates a cached-RAM surface, opens an
+//! ordinary row in the window table over it, and paints its glyphs there. Z-order now does the job
+//! the band was doing, which is the whole reason the band was only ever provisional.
+//!
+//! The console window is created FIRST and the demo window second, so the demo's later `z` puts it
+//! in front — the sitting shows two real windows with real occlusion between them, rather than two
+//! windows that were carefully arranged never to meet.
+//!
+//! Serial is unaffected by any of this: `serial_println!` still writes the UART on every line, and
+//! the FTDI mirror the bench reads is unconditional in this build. The window is where the text is
+//! *drawn*, not where it is *logged*.
 //!
 //! ### Damage-row present
 //!
@@ -83,23 +91,10 @@ static mut DEMO_SURF: DemoSurface = DemoSurface([0; DEMO_W * DEMO_H]);
 static DEMO_WIN: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(wm::WIN_NONE);
 
-/// PROVISIONAL — the height in panel pixels of the band at the BOTTOM of the panel that the
-/// compositor owns; the console keeps everything above it.
-///
-/// Half the panel, and half for a reason that is arithmetic rather than taste: the band must be able
-/// to hold the compositor's own idea of how big a window is, and that idea is `wm`'s scale rule —
-/// "the largest integer factor whose scaled surface fits half the panel", capped for legibility. A
-/// band shorter than the tallest window that rule can produce would have `move_to` clamp the window
-/// back up into the console's rows, which is exactly the collision the band exists to prevent. Half
-/// the panel is the smallest reserve that cannot be defeated by the rule that places into it, for
-/// any surface, on any panel geometry.
-///
-/// This constant is the whole of the band policy and it disappears with it: if the ruling is
-/// console-as-window, there is no band, no reserve call, and no clamp — the console becomes a row in
-/// the table and z-order does this job instead.
-fn band_height(panel_h: usize) -> usize {
-    panel_h / 2
-}
+/// Gap in panel pixels between the demo window's outer box and the panel edge. Matches `wm`'s own
+/// tiling gap in spirit; it is only used to inset the pinned demo window from the bottom-right
+/// corner, so the frame the compositor draws is visible on all four sides in a bench photograph.
+const EDGE_GAP: usize = 8;
 
 /// Fill [`DEMO_SURF`] with a calibration pattern.
 ///
@@ -167,19 +162,14 @@ pub fn activate() {
         let i = fb.info();
         (i.width, i.height)
     };
-    let band = band_height(ph);
-    let band_y = ph - band;
-
-    // PROVISIONAL — the console band. See `band_height`.
-    let crows = super::fbcon::panel_console_reserve_band(band);
-    if crows == 0 {
-        serial_println!("[wc-x] activate DECLINE reason=console-not-ready");
+    // RULED — the console becomes a window. Opened FIRST so the demo below carries the higher z.
+    // Its own witness lines (`[wc-x] console-window …`) report the geometry and the panic fallback.
+    let cwin = super::fbcon::panel_console_window_open();
+    if cwin == wm::WIN_NONE {
+        serial_println!("[wc-x] activate DECLINE reason=console-window-declined");
         return;
     }
-    serial_println!(
-        "[wc-x] activate panel={}x{} band=(y={},h={}) console_rows={} (band PROVISIONAL)",
-        pw, ph, band_y, band, crows
-    );
+    serial_println!("[wc-x] activate panel={}x{} console_win={}", pw, ph, cwin);
 
     paint_demo();
     // Taking the ADDRESS of a `static mut` is safe — no reference is formed. The one place a
@@ -203,9 +193,11 @@ pub fn activate() {
         return;
     }
 
-    // Centre the window's OUTER box in the band. `move_to` takes the CONTENT origin, so the chrome
-    // offsets come back off the outer origin; it also pins the row, so the automatic tiling leaves
-    // it here (tiling packs from the top-left, i.e. into the console's rows).
+    // Pin the demo's OUTER box into the panel's bottom-right corner. `move_to` takes the CONTENT
+    // origin, so the chrome offsets come back off the outer origin; it also pins the row, so the
+    // automatic tiling leaves it here rather than packing it to the top-left over the console.
+    // Overlapping the console window is intended: the demo was created later, so it has the higher
+    // z, and the overlap is what makes the occlusion visible in a bench photograph.
     let (ow, oh) = match wm::info(id) {
         Some(i) => (
             i.w * i.scale + 2 * wm::BORDER,
@@ -216,8 +208,11 @@ pub fn activate() {
             return;
         }
     };
-    let ox = pw.saturating_sub(ow) / 2;
-    let oy = band_y + band.saturating_sub(oh) / 2;
+    let ox = pw.saturating_sub(ow).saturating_sub(EDGE_GAP);
+    let oy = ph
+        .saturating_sub(crate::ui_status::chrome_h(ph))
+        .saturating_sub(oh)
+        .saturating_sub(EDGE_GAP);
     wm::move_to(id, ox + wm::BORDER, oy + wm::TITLE_H + wm::BORDER);
 
     DEMO_WIN.store(id, Ordering::Relaxed);

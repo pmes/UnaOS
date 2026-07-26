@@ -20,6 +20,8 @@
 // log (or a red panic screen) stays up.
 
 use crate::video::FrameBuffer;
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+use crate::video::wm;
 #[cfg(target_arch = "x86_64")]
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -50,6 +52,28 @@ static PANIC_MIRROR: AtomicBool = AtomicBool::new(false);
 /// path leaves it false and is byte-for-byte unchanged in behaviour.
 #[cfg(target_arch = "x86_64")]
 static PANEL_CONSOLE: AtomicBool = AtomicBool::new(false);
+
+/// CONSOLE-WINDOW (x86, `wc`) — the compositor window the console paints into, or [`wm::WIN_NONE`]
+/// when the console owns panel rows directly (every build without `wc`, and every moment before
+/// [`panel_console_window_open`] and after [`panic_screen`]).
+///
+/// Kept OUTSIDE the `FBCON` mutex on purpose. The damage declaration that follows a paint
+/// ([`route_present`]) runs with the lock released and interrupts enabled — a composite must never
+/// execute under the console lock — so the id it needs has to be readable without that lock.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static CONSOLE_WIN: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(wm::WIN_NONE);
+
+/// CONSOLE-WINDOW re-entry guard. `wm::composite` prints on witness builds, and a print on a routed
+/// console would ask for another composite from inside the one already running. The guard makes the
+/// inner request a no-op; the glyphs it painted are carried by the NEXT line's present, because a
+/// present repaints the window's whole content rather than a sub-rectangle.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static ROUTE_BUSY: AtomicBool = AtomicBool::new(false);
+
+/// CONSOLE-WINDOW — has the first routed paint been announced yet? One-shot witness latch.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static ROUTE_ANNOUNCED: AtomicBool = AtomicBool::new(false);
 
 /// Base font cell (font8x8). The live cell is `FbCon::cell_w/cell_h` = this times the scale.
 const CELL_W: usize = 8;
@@ -170,6 +194,20 @@ struct FbCon {
     /// back-store idiom).
     #[cfg(target_arch = "x86_64")]
     shadow: FrameBuffer,
+    /// CONSOLE-WINDOW (x86, `wc`): the console window's ARGB8888 surface, in kernel-owned cached
+    /// RAM. `Some` exactly while the console is routed into the compositor; the compositor reads it
+    /// as a window source and fbcon is its only writer.
+    ///
+    /// SAFETY/INVARIANT: allocated once at its final size in [`panel_console_window_open`] and never
+    /// grown or shrunk, so the heap buffer never moves and the raw address `wm` holds stays valid —
+    /// the same idiom `shadow_store` and the `Screen` back store use.
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    win_store: Option<Vec<u8>>,
+    /// A surface handle over `win_store`. Its layout is `Bgr`/4 bytes, which makes `put_pixel` store
+    /// the little-endian word `0x00RRGGBB` — precisely the ARGB8888 pixel `wm::draw_window` reads
+    /// back. Nothing converts between the two representations; they are the same bytes.
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    win_fb: FrameBuffer,
     cols: usize,
     rows: usize,
     /// Live glyph cell size in pixels. `CELL_W`/`CELL_H` (the raw font8x8 cell) everywhere by
@@ -201,6 +239,10 @@ impl FbCon {
             shadow_store: None,
             #[cfg(target_arch = "x86_64")]
             shadow: FrameBuffer::new(),
+            #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+            win_store: None,
+            #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+            win_fb: FrameBuffer::new(),
             cols: 0,
             rows: 0,
             cell_w: CELL_W,
@@ -230,11 +272,23 @@ impl FbCon {
         &self.fb
     }
 
-    /// The surface text drawing and scrolling target: the cached-RAM shadow once attached
-    /// (VRAM then only ever sees write-only blits), the framebuffer itself before/without it.
+    /// The surface text drawing and scrolling target: the console WINDOW's surface while the console
+    /// is routed into the compositor, the cached-RAM shadow once attached (VRAM then only ever sees
+    /// write-only blits), the framebuffer itself before/without either.
+    ///
+    /// PANIC PATH LAW. The routed branch is guarded by `PANIC_MIRROR` as well as by the route's own
+    /// existence, and the two guards are independent on purpose: [`panic_screen`] tears the route
+    /// down (so `win_store` is `None`), and this test is the belt to that braces — a panic that
+    /// reaches the console without going through `panic_screen` still paints the PANEL. Panic output
+    /// therefore never depends on the compositor running, on a window existing, or on `wm`'s locks
+    /// being takeable.
     #[cfg(target_arch = "x86_64")]
     #[inline]
     fn draw_fb(&self) -> &FrameBuffer {
+        #[cfg(feature = "wc")]
+        if self.win_store.is_some() && !PANIC_MIRROR.load(Ordering::Relaxed) {
+            return &self.win_fb;
+        }
         if self.shadow_store.is_some() { &self.shadow } else { &self.fb }
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -257,6 +311,15 @@ impl FbCon {
     /// Clean just the dirtied rows out to RAM (for the HVS), then reset the band. No-op when
     /// nothing was drawn or on cache-coherent targets.
     fn flush_dirty(&mut self) {
+        // CONSOLE-WINDOW: the glyphs went into cached kernel RAM that no scan-out reads, and the
+        // panel write belongs to the compositor. There is nothing to clean and nothing to blit here;
+        // the damage is declared by `route_present`, outside this lock.
+        #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+        if self.win_store.is_some() {
+            self.dirty_y0 = 0;
+            self.dirty_y1 = 0;
+            return;
+        }
         if self.dirty_y0 >= self.dirty_y1 {
             return;
         }
@@ -385,8 +448,18 @@ pub fn init(fb_addr: u64, fb_len: usize, info: FrameBufferInfo) {
     // having re-armed it. `panel_console_resume` re-arms it, and it alone.
     #[cfg(target_arch = "x86_64")]
     PANEL_CONSOLE.store(false, Ordering::Relaxed);
+    // CONSOLE-WINDOW: a re-init re-homes the console on the raw panel at scale 1, so any routing is
+    // stale by construction — the window's grid no longer describes this console. Drop the route
+    // (the window row, if any, is left to `wm`; nothing here can composite).
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    CONSOLE_WIN.store(wm::WIN_NONE, Ordering::Relaxed);
     crate::arch::without_interrupts(|| {
         let mut c = FBCON.lock();
+        #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+        {
+            c.win_store = None;
+            c.win_fb = FrameBuffer::new();
+        }
         // VPERF M2 (videocap bench lever): cap the fbcon-PRIVATE handle's height. Capping the
         // `rows` field alone would be a no-op — `scroll_up` sizes its memmove from
         // `info.height` — so the cap must live in the handle's own info. The uncapped twin
@@ -460,9 +533,43 @@ pub fn _print(args: core::fmt::Arguments) {
     print_masked(args);
 }
 
+/// CONSOLE-WINDOW — declare the console window damaged so the compositor presents the glyphs that
+/// were just painted into its surface. The one place fbcon asks `wm` for anything on the print path.
+///
+/// **Call with the `FBCON` lock RELEASED and interrupts ENABLED.** `wm::present` composites, which
+/// takes the window table and `WRITER`; running that under the console lock with interrupts masked
+/// would put a full panel repaint inside the critical section PANEL-DEFER exists to keep short.
+///
+/// No-op when the console is not routed — which is every build without `wc`, every boot before the
+/// window is opened, and every moment after a panic tore the route down.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn route_present() {
+    let id = CONSOLE_WIN.load(Ordering::Relaxed);
+    if id == wm::WIN_NONE {
+        return;
+    }
+    // Re-entry: see `ROUTE_BUSY`.
+    if ROUTE_BUSY
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    let ok = wm::present(id);
+    if ok && !ROUTE_ANNOUNCED.swap(true, Ordering::Relaxed) {
+        serial_println!("[wc-x] console-route first-paint win={} (glyphs -> window surface)", id);
+    }
+    ROUTE_BUSY.store(false, Ordering::Release);
+}
+
+#[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+#[inline]
+fn route_present() {}
+
 /// The classic mirror: format straight into the console with interrupts masked for the whole
 /// line. Kept verbatim for the PANIC path and for aarch64.
 fn print_masked(args: core::fmt::Arguments) {
+    let mut drew = false;
     crate::arch::without_interrupts(|| {
         if let Some(mut c) = FBCON.try_lock() {
             if c.ready {
@@ -471,9 +578,15 @@ fn print_masked(args: core::fmt::Arguments) {
                 // pixels directly rather than via `blit`, so this is what keeps the boot log visible
                 // on the HVS-scanned framebuffer — but only the touched rows, not the whole surface.
                 c.flush_dirty();
+                drew = true;
             }
         }
     });
+    // CONSOLE-WINDOW: outside the mask and the lock, per `route_present`'s contract. Not reached on
+    // the panic path in any meaningful sense — `panic_screen` has already cleared `CONSOLE_WIN`.
+    if drew {
+        route_present();
+    }
 }
 
 /// Bytes buffered before one layout/paint round-trip. Bounds the stack cost of the op buffer
@@ -544,10 +657,17 @@ impl PanelSink {
             for &b in bytes {
                 c.plan_byte(b, &mut ops);
             }
+            // CONSOLE-WINDOW: `draw_fb` has already chosen the window surface if the console is
+            // routed; the flag only tells the paint half how the result reaches the panel — a
+            // compositor present instead of a cache clean of the panel's own rows.
+            #[cfg(feature = "wc")]
+            let routed = c.win_store.is_some();
+            #[cfg(not(feature = "wc"))]
+            let routed = false;
             let band = c.take_dirty();
-            Some((*c.draw_fb(), c.fg, c.bg, c.scale, ops, band))
+            Some((*c.draw_fb(), c.fg, c.bg, c.scale, ops, band, routed))
         });
-        let Some((surf, fg, bg, scale, ops, band)) = plan else {
+        let Some((surf, fg, bg, scale, ops, band, routed)) = plan else {
             if !self.decided {
                 self.decided = true;
                 self.split = false;
@@ -558,6 +678,12 @@ impl PanelSink {
         self.split = true;
         // UNMASKED, UNLOCKED: the expensive half.
         paint_ops(&surf, ops.as_slice(), fg, bg, scale);
+        if routed {
+            // No direct front-buffer write on this path: the surface is cached RAM and `wm` owns
+            // the panel. Damage is declared here, still outside the lock and the mask.
+            route_present();
+            return;
+        }
         if band.1 > band.0 {
             let info = surf.info();
             let row_bytes = info.stride * info.bytes_per_pixel;
@@ -620,6 +746,8 @@ pub fn milestone(ms: u64, tag: &str) {
                 }
             }
         });
+        // CONSOLE-WINDOW: same contract as `print_masked` — present outside the lock and the mask.
+        route_present();
     }
     #[cfg(not(all(target_arch = "x86_64", not(any(feature = "usbdebug", feature = "witness")))))]
     let _ = (ms, tag);
@@ -653,6 +781,14 @@ pub fn clear() {
             if c.ready {
                 c.col = 0;
                 c.row = 0;
+                // CONSOLE-WINDOW: "clear the console" means clear the CONSOLE, and while the console
+                // is a window that is its surface — not the panel, which now belongs to the
+                // compositor and holds other windows' pixels. Presented after the lock drops.
+                #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+                if c.win_store.is_some() {
+                    c.win_fb.fill_screen(BG_DEFAULT);
+                    return;
+                }
                 // VPERF M3: with the shadow attached, clear the WHOLE store in cached RAM (a
                 // full-geometry handle over the same bytes — the capped `shadow` handle would
                 // leave a videocap'd below-cap band unfilled) and present it as one write-only
@@ -674,6 +810,9 @@ pub fn clear() {
             }
         }
     });
+    // CONSOLE-WINDOW: outside the lock and the mask, per `route_present`'s contract. No-op unless
+    // the console is routed.
+    route_present();
 }
 
 /// VPERF M3 — attach the cached-RAM shadow (x86 only; LATE-ATTACH by design). fbcon initialises
@@ -805,50 +944,191 @@ pub fn panel_console_resume() -> usize {
     n + 1
 }
 
-/// WC-X86 — **PROVISIONAL.** Give the bottom `reserve_px` pixels of the panel to the compositor by
-/// shortening the console's ROW GRID, and return the number of text rows the console keeps.
+/// CONSOLE-WINDOW — the compositor's staged-present budget, in PANEL PIXELS, as the console window
+/// may spend it.
 ///
-/// ### Why this exists, and why it is provisional
+/// `wm::stage_window` composes a window's clipped outer box in cached RAM and presents it as
+/// contiguous row copies; a box larger than its private `MAX_STAGE_BYTES` (4 MiB) declines the
+/// staged path and falls back to poking the front buffer pixel by pixel. On the rMBP's WC-mapped GOP
+/// surface that fallback is the regime the whole cached-RAM discipline exists to avoid, and the
+/// console is the one window that presents on every printed line — it is the last window that should
+/// be paying for it.
 ///
-/// Console pixel ownership is an OPEN parameter: the two candidate answers are a reserved band (the
-/// console keeps a contiguous slice of the panel and the compositor owns the rest) and
-/// console-as-window (the console becomes an ordinary row in the window table, composited like any
-/// other surface). Peter has not ruled. **This function is the band answer, chosen as the
-/// provisional default because it is the one that changes nothing about how the console PAINTS** —
-/// the compositor already paints only the boxes its windows occupy (`wm::composite` has no
-/// full-desktop fill), so the only fact the two subsystems must agree on is which rows the console
-/// may scroll into.
-///
-/// It therefore touches exactly one thing: `rows`, the console's grid height. Every glyph, scroll
-/// and clear path is byte-for-byte the code it was — they are all expressed in terms of `rows`, so
-/// clamping it here is the whole of the band. Nothing about this call is load-bearing for the
-/// console-as-window answer; when that ruling lands, this function is deleted, not rewritten.
-///
-/// Best-effort and idempotent-ish: the reserve is measured against the panel's real height each
-/// time, and the console always keeps at least one row (a zero-row console would scroll forever).
-/// Returns `0` if the console is not ready.
+/// So the console's size is chosen against this budget rather than against taste. The number is
+/// `MAX_STAGE_BYTES / 4` restated in pixels; it is duplicated here because it is `wm`-private and
+/// `wm` is not this arc's to change. If `wm` ever raises its cap, this constant follows it — the
+/// console simply gets more generous, and nothing breaks in the meantime.
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
-pub fn panel_console_reserve_band(reserve_px: usize) -> usize {
-    let mut rows = 0usize;
+const WIN_BOX_BUDGET_PX: usize = 4 * 1024 * 1024 / 4;
+
+/// CONSOLE-WINDOW — pick the console window's CONTENT extent for a `pw x ph` panel.
+///
+/// Generous first, budgeted second, aligned last:
+///  1. start at 7/8 of the panel in each axis, less the bottom chrome `ui_status` owns (the tiler's
+///     PULSE-2 reservation does not apply to a pinned window, so the reservation is honoured here or
+///     not at all);
+///  2. shrink both axes together — aspect preserved, 15/16 at a time so no float is needed — until
+///     the OUTER box fits [`WIN_BOX_BUDGET_PX`];
+///  3. round down to whole glyph cells, so the console's grid tiles its surface exactly and no
+///     partial cell column can be left holding stale pixels.
+///
+/// On the 640x480 gate panel step 2 never fires and the console is the full 7/8. On a 1920x1200
+/// bench panel it settles near 1200x760; on the rMBP's 2880x1800 near 1280x800. The window is
+/// therefore "as much of the panel as the compositor can present cheaply", which is what the
+/// generous default actually means once the present path is priced.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn win_content_extent(pw: usize, ph: usize, cell_w: usize, cell_h: usize) -> (usize, usize) {
+    let avail_h = ph.saturating_sub(crate::ui_status::chrome_h(ph)).max(1);
+    let mut w = (pw * 7 / 8).max(cell_w);
+    let mut h = (avail_h * 7 / 8).max(cell_h);
+    // Outer box = content + chrome. Budget the box, not the content: the box is what gets staged.
+    let box_px = |w: usize, h: usize| {
+        (w + 2 * wm::BORDER).saturating_mul(h + wm::TITLE_H + 2 * wm::BORDER)
+    };
+    while box_px(w, h) > WIN_BOX_BUDGET_PX && w > cell_w && h > cell_h {
+        w = (w * 15 / 16).max(cell_w);
+        h = (h * 15 / 16).max(cell_h);
+    }
+    ((w / cell_w).max(1) * cell_w, (h / cell_h).max(1) * cell_h)
+}
+
+/// CONSOLE-WINDOW — turn the panel console into a WINDOW: allocate its surface, open a row in the
+/// window table, and route every subsequent glyph into it. Returns the window id, or
+/// [`wm::WIN_NONE`] if anything declined. Idempotent — a second call returns the existing id.
+///
+/// ### What changes, and what does not
+///
+/// Not one line of the console's *rendering* changes. Glyph drawing, the wrap-around line advance,
+/// the layout/paint split and the dirty band are all expressed against `draw_fb()` and the `cols` /
+/// `rows` grid; this call re-points the first at the window's surface and re-derives the second from
+/// the window's extent. `PANEL_SCALE` is untouched, so a glyph is the same size on glass it was —
+/// the window is composited at scale 1 (the surface is far too large for `wm`'s scale rule to
+/// magnify), so a surface pixel is a panel pixel and the console's own 4x cell is the whole of the
+/// magnification, exactly as before.
+///
+/// ### Front-buffer discipline
+///
+/// The console stops writing the panel here. Its pixels go to cached kernel RAM and reach glass only
+/// through `wm`'s staged present. That is the point of the routing, and it is why the panic path is
+/// arranged the way it is: see [`panic_screen`] and [`FbCon::draw_fb`].
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn panel_console_window_open() -> wm::WinId {
+    let existing = CONSOLE_WIN.load(Ordering::Relaxed);
+    if existing != wm::WIN_NONE {
+        return existing;
+    }
+
+    // Geometry, read from the console's own panel handle — the same surface `wm` composites onto.
+    let (pw, ph, cell_w, cell_h) = {
+        let mut got = None;
+        crate::arch::without_interrupts(|| {
+            if let Some(c) = FBCON.try_lock() {
+                if c.ready && c.cell_w != 0 && c.cell_h != 0 {
+                    let i = c.fb.info();
+                    got = Some((i.width, i.height, c.cell_w, c.cell_h));
+                }
+            }
+        });
+        match got {
+            Some(g) => g,
+            None => {
+                serial_println!("[wc-x] console-window DECLINE reason=console-not-ready");
+                return wm::WIN_NONE;
+            }
+        }
+    };
+    let (cw, ch) = win_content_extent(pw, ph, cell_w, cell_h);
+    let stride = cw * 4;
+    let len = ch * stride;
+
+    // Allocated OUTSIDE the console lock and the interrupt mask: this is a multi-megabyte heap
+    // request and the allocator is not something to enter with interrupts off.
+    let mut store: Vec<u8> = alloc::vec::Vec::new();
+    if store.try_reserve_exact(len).is_err() {
+        serial_println!("[wc-x] console-window DECLINE reason=alloc len={}", len);
+        return wm::WIN_NONE;
+    }
+    store.resize(len, 0);
+    let mut surf_fb = FrameBuffer::new();
+    // `Bgr` + 4 bytes: `put_pixel` stores b,g,r at bytes 0,1,2 and leaves byte 3 as the zero the
+    // allocation gave it — i.e. the little-endian word `0x00RRGGBB`, which is the ARGB8888 pixel
+    // `wm::draw_window` reads. Same bytes, not a conversion.
+    // INVARIANT: `store` is at its final size and never grows, so this address stays valid for the
+    // route's lifetime (the `attach_shadow` / `Screen` back-store idiom).
+    surf_fb.init(
+        store.as_mut_ptr() as usize,
+        len,
+        FrameBufferInfo {
+            width: cw,
+            height: ch,
+            stride: cw,
+            bytes_per_pixel: 4,
+            pixel_format: unaos_boot_info::PixelFormat::Bgr,
+        },
+    );
+    surf_fb.fill_screen(BG_DEFAULT);
+
+    // Owner ASID 0 — the console belongs to the KERNEL. That keeps it out of `focus_ring` and out of
+    // `close_owner`'s reach: no EL0 task can move, present or close the kernel's console.
+    let id = wm::create(
+        0,
+        surf_fb.base(),
+        len,
+        cw as u32,
+        ch as u32,
+        stride as u32,
+        b"console",
+    );
+    if id == wm::WIN_NONE {
+        serial_println!("[wc-x] console-window DECLINE reason=create-failed");
+        return wm::WIN_NONE;
+    }
+    // Centre the OUTER box on the panel and pin it (`move_to` takes the CONTENT origin, so the
+    // chrome offsets come back off the outer origin). Pinning keeps the tiler — which packs from the
+    // top-left as windows come and go — from walking the console around underneath the text.
+    let ow = cw + 2 * wm::BORDER;
+    let oh = ch + wm::TITLE_H + 2 * wm::BORDER;
+    let ox = pw.saturating_sub(ow) / 2;
+    let oy = ph.saturating_sub(crate::ui_status::chrome_h(ph)).saturating_sub(oh) / 2;
+    wm::move_to(id, ox + wm::BORDER, oy + wm::TITLE_H + wm::BORDER);
+
+    // Install the route. From the store's move into `FbCon` onwards, every glyph lands in the
+    // window's surface.
+    let mut installed = false;
     crate::arch::without_interrupts(|| {
         if let Some(mut c) = FBCON.try_lock() {
-            if !c.ready || c.cell_h == 0 {
+            if !c.ready {
                 return;
             }
-            let h = c.fb.info().height;
-            let keep_px = h.saturating_sub(reserve_px);
-            c.rows = (keep_px / c.cell_h).max(1);
-            // The cursor may already be sitting inside the band the compositor is about to own.
-            // Home it rather than clamp it: a clamped row would have the next line overwrite the
-            // console's own last line, which reads as a dropped log line.
-            if c.row >= c.rows {
-                c.row = 0;
-                c.col = 0;
-            }
-            rows = c.rows;
+            c.win_fb = surf_fb;
+            c.win_store = Some(core::mem::take(&mut store));
+            c.cols = (cw / c.cell_w).max(1);
+            c.rows = (ch / c.cell_h).max(1);
+            c.col = 0;
+            c.row = 0;
+            installed = true;
         }
     });
-    rows
+    if !installed {
+        // Fail closed and leave no orphan row: the window is closed and the surface is dropped with
+        // `store` at the end of this scope.
+        wm::close(id);
+        serial_println!("[wc-x] console-window DECLINE reason=install-contended");
+        return wm::WIN_NONE;
+    }
+
+    CONSOLE_WIN.store(id, Ordering::Relaxed);
+    let (gcols, grows) = ((cw / cell_w).max(1), (ch / cell_h).max(1));
+    serial_println!(
+        "[wc-x] console-window win={} panel={}x{} surf={}x{} box={}x{} at ({},{}) cell={}x{} cols={} rows={}",
+        id, pw, ph, cw, ch, ow, oh, ox, oy, cell_w, cell_h, gcols, grows
+    );
+    serial_println!(
+        "[wc-x] console-window panic-fallback armed win={} (panic paints the PANEL, not the window)",
+        id
+    );
+    route_present();
+    id
 }
 
 /// Repaint the screen as a panic backdrop (dark red) and home the cursor, so the panic message
@@ -860,6 +1140,13 @@ pub fn panic_screen() {
     // Re-arm the full mirror on quiet-panel builds: the panic text must paint whatever the build.
     #[cfg(target_arch = "x86_64")]
     PANIC_MIRROR.store(true, Ordering::Relaxed);
+    // PANIC PATH LAW — the panic path does not go through the compositor. `CONSOLE_WIN` is cleared
+    // FIRST, before any panic byte can be printed, so `route_present` can never ask a dying machine
+    // for a composite; the route's surface is then dropped below and `draw_fb` falls back to the
+    // panel handle, which is the pre-window path verbatim. Nothing about panic output depends on
+    // `wm` having a live window, on its locks being takeable, or on the compositor running at all.
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    CONSOLE_WIN.store(wm::WIN_NONE, Ordering::Relaxed);
     crate::arch::without_interrupts(|| {
         if let Some(mut c) = FBCON.try_lock() {
             if c.ready {
@@ -870,6 +1157,23 @@ pub fn panic_screen() {
                 #[cfg(target_arch = "x86_64")]
                 if let Some(s) = c.shadow_store.take() {
                     core::mem::forget(s);
+                }
+                // PANIC PATH LAW: drop the console-window route the same way and for the same
+                // reason — `mem::forget` rather than a free, because the allocator's lock may
+                // already be held by whatever is panicking. The grid is re-derived from the PANEL,
+                // since the window's smaller `cols`/`rows` no longer describe the surface the panic
+                // text is about to land on.
+                #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+                {
+                    if let Some(s) = c.win_store.take() {
+                        core::mem::forget(s);
+                    }
+                    c.win_fb = FrameBuffer::new();
+                    if c.cell_w != 0 && c.cell_h != 0 {
+                        let info = c.fb.info();
+                        c.cols = (info.width / c.cell_w).max(1);
+                        c.rows = (info.height / c.cell_h).max(1);
+                    }
                 }
                 c.bg = PANIC_BG;
                 c.fg = 0x00FF_FFFF;

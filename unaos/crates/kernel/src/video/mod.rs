@@ -61,7 +61,8 @@ pub mod wcg;
 #[cfg(all(target_arch = "x86_64", feature = "videobench"))]
 pub mod vperf;
 // WC-X86: the compositor's ACTIVATION on the x86 panel path — the seam at the end of the Kepler
-// takeover, the provisional console band, and one kernel-drawn demo window. Changes nothing in `wm`
+// takeover, the CONSOLE WINDOW (fbcon's glyphs routed into a compositor window), and one
+// kernel-drawn demo window in front of it. Changes nothing in `wm`
 // or `cursor` (both are already arch-neutral); it only gives them a window to composite. x86-only
 // AND knob-gated (`UNAOS_WC=1`), so aarch64 and every default x86 artifact are byte-identical.
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
