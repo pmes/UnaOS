@@ -94,8 +94,11 @@ _feats=""
 # STOR-1: route x86 storage syscalls through the interrupt-driven storage service task (opt-in;
 # metal-pending). x86_64 only — a no-op on the aarch64 media below.
 [ -n "${UNAOS_IRQSTORAGE:-}" ] && _feats="${_feats}irqstorage,"
-# BOT-RECOVER: inject ONE synthetic BOT failure (first WRITE(10), at the CSW stage) so the headless
-# suite exercises Reset Recovery + the bounded retry. Test-only; never on boot media.
+# BOT-RECOVER / PH-2: inject TWO synthetic BOT failures so the headless suite exercises both error
+# families. (1) A transport fault on the first WRITE(10), at the CSW stage -> Reset Recovery + the
+# bounded retry. (2) A `Failed` CSW on the first >=512 B READ(10) -> the runtime CHECK CONDITION
+# path: REQUEST SENSE (sense rewritten to UNIT ATTENTION) + the single sense-driven retry.
+# Both fire exactly once. Test-only; never on boot media.
 [ -n "${UNAOS_BOTFAULT:-}" ] && _feats="${_feats}botfaultinject,"
 # VPERF: x86 video-path bench instrumentation (scroll/VRAM-read counters, fbmem memory-type
 # readout, display-BAR probe, scripted scroll scenario). x86_64-only module — aarch64 media are

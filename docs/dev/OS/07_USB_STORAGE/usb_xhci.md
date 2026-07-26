@@ -2390,6 +2390,87 @@ finding.
    that is already sick (worst case adds ~3 EP0 budgets + 4 command budgets before the
    terminal `Err` — bounded, but slower to fail than before).
 
+## PH-2 — runtime CHECK CONDITION (sense + one retry)
+
+Reset Recovery above handles **transport** faults — the `Err` arms of
+`bot_transfer_once`. It never fired on the other failure family: a `Failed` CSW. That is a
+transaction that *completed* and which the **device** rejected (SCSI CHECK CONDITION,
+SPC-4 §4.5), leaving sense data pending. `bot_transfer` returned such a result verbatim
+(`Ok(r) => return Ok(r)`), and the only `REQUEST SENSE` in the driver was the one inside
+the bring-up TEST UNIT READY loop. A device that entered CHECK CONDITION at **runtime**
+therefore failed every subsequent command, with nothing in the log saying why. The
+exposure is not theoretical: the flight recorder issues a ~128-sector WRITE(10) burst on
+the boot volume on every x86 boot.
+
+`bot_transfer` now routes a `Failed` CSW to `bot_check_condition`:
+
+1. **One** `REQUEST SENSE`, logged as the `sense` witness below.
+2. **One** retry of the original command — but only if the sense key is `0x6`
+   (UNIT ATTENTION: media/reset state change) or `0x2` (NOT READY: becoming ready). Every
+   other key is a real rejection (ILLEGAL REQUEST, MEDIUM ERROR, DATA PROTECT …) that a
+   retry would only repeat, so the failure propagates exactly as before.
+
+Bounds and boundaries:
+
+- `BOT_SENSE_ACTIVE` latches for the whole handler. Both the sense fetch and the retry go
+  back through `bot_transfer`, so without the latch a device that answered `Failed` to its
+  own sense command would recurse; with it, any nested `Failed` propagates as it did
+  before this arc. **One sense, one retry, all-or-nothing** — there is no loop.
+- The retry is gated on a `now_cycles`/`hw_wait_budget()` **wall-clock** deadline taken at
+  entry (never an iteration count): if the sense fetch alone consumed the budget, the
+  failure propagates rather than spending more of the caller's time.
+- The retry goes through `bot_transfer`, so `recover_bot_full` stays in charge of any
+  transport fault the retry hits. Sense + retry happen **before** — and independently of —
+  Reset Recovery; none of its logic is duplicated.
+- The **bring-up TUR loop is unchanged**: it already *is* a sense-and-retry loop, so it
+  holds the latch across itself and keeps propagating `Failed` verbatim. The new handler
+  owns the runtime path only.
+- `REQUEST SENSE` DMAs into the single per-slot staging buffer, which on a WRITE(10) still
+  holds the caller's payload. The handler saves and restores the 18 bytes it lands in —
+  the "retry re-sends byte-identical data" invariant above is what makes that mandatory.
+
+### Fault injection (same `UNAOS_BOTFAULT=1` knob)
+
+QEMU's `usb-storage` never rejects a well-formed command, so this path would be metal-only
+too. The knob now injects a **second, independent** synthetic failure, also exactly once:
+a `Failed` CSW on the first IN transaction of ≥512 B — a READ(10), so bring-up cannot trip
+it (INQUIRY is 36 B, READ CAPACITY 8 B, REQUEST SENSE 18 B) and the first hit is the FAT
+layer's runtime read. Only the *decoded* status is rewritten; the transaction itself
+really completed, so the device is healthy and the retry must pass. Because the device's
+real sense is then NO SENSE, the handler rewrites it once to UNIT ATTENTION
+(`0x6 / 0x28 / 0x00`) so the **retry** leg is exercised and not just the fetch leg. Both
+injections are `#[cfg]`-compiled out by default — knob-off media are byte-identical.
+**Test-only; never on boot media.**
+
+### Witnesses
+
+```
+:: BOT: sense key=… asc=… ascq=… ::
+:: BOT: sense result=fail err=… ::
+:: BOT: sense-retry result=pass residue=… sense_n=… retry_ok=… retry_fail=… ::
+:: BOT: sense-retry result=fail status=…|err=… sense_n=… retry_ok=… retry_fail=… ::
+:: BOT: sense-retry result=skip key=… ::
+:: BOT: sense-retry result=skip reason=budget key=… ::
+:: BOT: fault-inject synthetic Failed CSW (slot …, once) ::        (UNAOS_BOTFAULT only)
+:: BOT: fault-inject synthetic sense UNIT ATTENTION (once) ::      (UNAOS_BOTFAULT only)
+```
+
+Expected `UNAOS_BOTFAULT=1` sequence: `fault-inject synthetic Failed CSW` →
+`fault-inject synthetic sense UNIT ATTENTION` → `:: BOT: sense key=0x6 asc=0x28 ascq=0x0 ::`
+→ `:: BOT: sense-retry result=pass … retry_ok=1 retry_fail=0 ::`.
+
+Quiet boot: **zero** of these lines when nothing fails; `BOT_SENSE_COUNT` /
+`BOT_SENSE_RETRY_OK` / `BOT_SENSE_RETRY_FAIL` stay at 0, so any non-zero reading is itself
+the finding.
+
+### What metal must verify
+
+1. On the 2012 rMBP, whether the flight recorder's WRITE(10) burst ever produces a
+   `:: BOT: sense … ::` line at all — and with which key. That is the first time the
+   sense of a runtime rejection has been readable.
+2. That a UNIT ATTENTION raised by a real card reader (media change / port reset) is
+   survived by the single retry rather than wedging the volume.
+
 ---
 
 ## See also

@@ -540,6 +540,26 @@ pub static BOT_RETRY_OK: AtomicU64 = AtomicU64::new(0);
 /// Post-recovery retries that failed anyway (the caller still sees the terminal `Err`).
 pub static BOT_RETRY_FAIL: AtomicU64 = AtomicU64::new(0);
 
+// --- PH-2: runtime CHECK CONDITION handling (SCSI SPC-4 §4.5, USB MSC BOT 1.0 §6.5) ---
+//
+// A `Failed` CSW is NOT a transport error: the transaction completed, the device rejected the
+// command and is now holding sense data (CHECK CONDITION). Until this arc `bot_transfer` returned
+// such a result verbatim to the caller and never fetched the sense, so a device left in CHECK
+// CONDITION at runtime failed every subsequent command with nothing in the log saying why. The
+// exposure is real: the flight recorder issues a ~128-sector WRITE(10) burst on the boot volume on
+// every x86 boot. These counters stay at zero on a clean boot, so any non-zero reading is itself
+// the finding.
+/// REQUEST SENSE fetches issued from the runtime `Failed`-CSW path (one per Failed CSW handled).
+pub static BOT_SENSE_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Sense-driven single retries that came back `Passed` — transactions this arc rescued.
+pub static BOT_SENSE_RETRY_OK: AtomicU64 = AtomicU64::new(0);
+/// Sense-driven single retries that failed anyway (the caller still sees the original failure).
+pub static BOT_SENSE_RETRY_FAIL: AtomicU64 = AtomicU64::new(0);
+/// Re-entrancy latch for the CHECK CONDITION handler. REQUEST SENSE and the one retry both run
+/// through `bot_transfer`; while this is set a `Failed` CSW propagates exactly as it did before
+/// this arc. That is what makes the recovery all-or-nothing: one sense, one retry, never a loop.
+static BOT_SENSE_ACTIVE: AtomicBool = AtomicBool::new(false);
+
 /// Test-only deterministic fault injection (`UNAOS_BOTFAULT=1` -> feature `botfaultinject`).
 /// QEMU never times out a BOT transfer, so without this the recovery path is metal-only. Fires
 /// EXACTLY ONCE, on the first BOT transaction with an OUT data stage (a WRITE(10) — after storage
@@ -550,6 +570,20 @@ pub static BOT_RETRY_FAIL: AtomicU64 = AtomicU64::new(0);
 /// CSW and fail on the tag mismatch.
 #[cfg(feature = "botfaultinject")]
 static BOT_FAULT_FIRED: AtomicBool = AtomicBool::new(false);
+
+/// PH-2 companion injection under the same `UNAOS_BOTFAULT=1` knob: a deterministic **Failed CSW**,
+/// so the runtime CHECK CONDITION path (sense fetch + single retry) is QEMU-provable too. QEMU's
+/// usb-storage never rejects a well-formed command, so without this the path is metal-only. Fires
+/// EXACTLY ONCE, on the first IN transaction carrying a full block or more (a READ(10) — INQUIRY is
+/// 36 B, READ CAPACITY 8 B and REQUEST SENSE 18 B, so bring-up cannot trip it and the first hit is
+/// the FAT layer's runtime read). The transaction itself really completed; only the decoded CSW
+/// status is rewritten, so the retry runs against a healthy device and must pass.
+#[cfg(feature = "botfaultinject")]
+static BOT_FAULT_CC_FIRED: AtomicBool = AtomicBool::new(false);
+/// Set by the injection above and consumed by the CHECK CONDITION handler: it marks the ONE
+/// transaction whose failure was synthetic, whose real sense is therefore NO SENSE.
+#[cfg(feature = "botfaultinject")]
+static BOT_FAULT_CC_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// PIUSB-39 witness counters. `MOUSE_REARM_COUNT` = every `queue_mouse_read` the transfer
 /// dispatch issued; `MOUSE_DISCARD_REARM_COUNT` = completions the dup-Success guard threw away
@@ -4212,6 +4246,12 @@ impl XhciController {
     {
         let first = self.bot_transfer_once(slot_id, cdb, data_phys, data_len, dir);
         let cause = match first {
+            // PH-2: a `Failed` CSW is a completed transaction the DEVICE rejected — CHECK
+            // CONDITION, not a transport fault. Reset Recovery is the wrong tool (nothing is
+            // desynchronised); the right one is REQUEST SENSE, which is also what CLEARS the
+            // condition. Handled before, and independently of, `recover_bot_full`.
+            Ok(r) if r.status == CswStatus::Failed =>
+                return self.bot_check_condition(slot_id, cdb, data_phys, data_len, dir, r),
             Ok(r) => return Ok(r),
             Err(BotError::NoDevice) => return Err(BotError::NoDevice),
             Err(e) => e,
@@ -4235,6 +4275,120 @@ impl XhciController {
                     ":: BOT: retry result=fail err={:?} recoveries={} retry_ok={} retry_fail={} ::",
                     e, BOT_RECOVER_COUNT.load(Ordering::Relaxed),
                     BOT_RETRY_OK.load(Ordering::Relaxed), BOT_RETRY_FAIL.load(Ordering::Relaxed));
+            }
+        }
+        again
+    }
+
+    /// PH-2: handle a runtime `Failed` CSW (SCSI CHECK CONDITION) with ONE sense fetch and, when
+    /// the sense says the condition is transient, ONE retry of the original command.
+    ///
+    /// Bounded by construction, in this order:
+    ///   * `BOT_SENSE_ACTIVE` latches for the whole handler. REQUEST SENSE and the retry both go
+    ///     back through `bot_transfer`, so without the latch a device answering `Failed` to its own
+    ///     sense command would recurse; with it, any nested `Failed` propagates exactly as it did
+    ///     before this arc. One sense, one retry, all-or-nothing.
+    ///   * The retry is gated on a `now_cycles`/`hw_wait_budget()` wall-clock deadline taken at
+    ///     entry — if the sense fetch alone consumed the budget (a marginal device on metal), the
+    ///     failure propagates instead of spending more of the caller's time.
+    /// Only UNIT ATTENTION (key 0x6 — media/reset state change, the classic "retry and it works")
+    /// and NOT READY (key 0x2 — becoming ready) earn the retry; every other key is a real rejection
+    /// (ILLEGAL REQUEST, MEDIUM ERROR, DATA PROTECT …) that a retry would only repeat.
+    ///
+    /// The retry re-runs the whole transaction through `bot_transfer`, which is what makes it safe
+    /// for the FAT layer for exactly the reason documented on `bot_transfer`: nothing between the
+    /// attempts re-derives the payload, so a retried WRITE(10) is a byte-identical write of the
+    /// same sector. That invariant is why the sense fetch below saves and restores the bytes it
+    /// lands in — REQUEST SENSE shares the single per-slot staging buffer with the caller's data.
+    fn bot_check_condition(&mut self, slot_id: u8, cdb: &[u8], data_phys: u64, data_len: u32,
+        dir: Direction, failed: BotResult) -> Result<BotResult, BotError>
+    {
+        if BOT_SENSE_ACTIVE.swap(true, Ordering::Relaxed) {
+            return Ok(failed);
+        }
+        let out = self.check_condition_inner(slot_id, cdb, data_phys, data_len, dir, failed);
+        BOT_SENSE_ACTIVE.store(false, Ordering::Relaxed);
+        out
+    }
+
+    /// The body of `bot_check_condition`, split out so the re-entrancy latch is released on every
+    /// exit path without an early `return` being able to leak it.
+    fn check_condition_inner(&mut self, slot_id: u8, cdb: &[u8], data_phys: u64, data_len: u32,
+        dir: Direction, failed: BotResult) -> Result<BotResult, BotError>
+    {
+        let started = crate::arch::now_cycles();
+        let sense_phys = match self.storage_data_phys(slot_id) {
+            Ok(p) => p,
+            Err(_) => return Ok(failed),
+        };
+        // REQUEST SENSE DMAs into the per-slot staging buffer, which on a WRITE(10) still holds the
+        // caller's payload. Save the 18 bytes it will overwrite and put them back before the retry.
+        let mut saved = [0u8; 18];
+        unsafe { core::ptr::copy_nonoverlapping(sense_phys as *const u8, saved.as_mut_ptr(), 18); }
+
+        BOT_SENSE_COUNT.fetch_add(1, Ordering::Relaxed);
+        let sense_result = self.scsi_request_sense(slot_id);
+
+        let sense = unsafe {
+            dma_coherency::inval(sense_phys as usize, 18);
+            let d = core::slice::from_raw_parts(sense_phys as *const u8, 18);
+            // SPC-4 fixed-format sense: byte 2 bits 3:0 = sense key, byte 12 = ASC, byte 13 = ASCQ.
+            (d[2] & 0x0F, d[12], d[13])
+        };
+        // Restore the caller's bytes before anything can re-send them.
+        unsafe { core::ptr::copy_nonoverlapping(saved.as_ptr(), sense_phys as *mut u8, 18); }
+        dma_coherency::clean(sense_phys as usize, 18);
+
+        if let Err(e) = sense_result {
+            serial_println!(":: BOT: sense result=fail err={:?} ::", e);
+            return Ok(failed);
+        }
+
+        #[allow(unused_mut)]
+        let (mut key, mut asc, mut ascq) = sense;
+        // Test-only: the synthetic Failed CSW left the device perfectly healthy, so its real sense
+        // is NO SENSE. Rewrite it to UNIT ATTENTION (0x6 / 0x28 "not ready to ready change") so the
+        // retry leg is exercised as well as the fetch leg.
+        #[cfg(feature = "botfaultinject")]
+        if BOT_FAULT_CC_ACTIVE.swap(false, Ordering::Relaxed) {
+            key = 0x6; asc = 0x28; ascq = 0x00;
+            serial_println!(":: BOT: fault-inject synthetic sense UNIT ATTENTION (once) ::");
+        }
+        serial_println!(":: BOT: sense key={:#x} asc={:#x} ascq={:#x} ::", key, asc, ascq);
+
+        if key != 0x6 && key != 0x2 {
+            serial_println!(":: BOT: sense-retry result=skip key={:#x} ::", key);
+            return Ok(failed);
+        }
+        if crate::arch::now_cycles().wrapping_sub(started) >= hw_wait_budget() {
+            serial_println!(":: BOT: sense-retry result=skip reason=budget key={:#x} ::", key);
+            return Ok(failed);
+        }
+
+        // The latch is still held, so this attempt cannot re-enter the handler however it fails;
+        // going through `bot_transfer` keeps `recover_bot_full` in charge of transport faults.
+        let again = self.bot_transfer(slot_id, cdb, data_phys, data_len, dir);
+        match &again {
+            Ok(r) if r.status == CswStatus::Passed => {
+                BOT_SENSE_RETRY_OK.fetch_add(1, Ordering::Relaxed);
+                serial_println!(
+                    ":: BOT: sense-retry result=pass residue={} sense_n={} retry_ok={} retry_fail={} ::",
+                    r.residue, BOT_SENSE_COUNT.load(Ordering::Relaxed),
+                    BOT_SENSE_RETRY_OK.load(Ordering::Relaxed), BOT_SENSE_RETRY_FAIL.load(Ordering::Relaxed));
+            }
+            Ok(r) => {
+                BOT_SENSE_RETRY_FAIL.fetch_add(1, Ordering::Relaxed);
+                serial_println!(
+                    ":: BOT: sense-retry result=fail status={:?} sense_n={} retry_ok={} retry_fail={} ::",
+                    r.status, BOT_SENSE_COUNT.load(Ordering::Relaxed),
+                    BOT_SENSE_RETRY_OK.load(Ordering::Relaxed), BOT_SENSE_RETRY_FAIL.load(Ordering::Relaxed));
+            }
+            Err(e) => {
+                BOT_SENSE_RETRY_FAIL.fetch_add(1, Ordering::Relaxed);
+                serial_println!(
+                    ":: BOT: sense-retry result=fail err={:?} sense_n={} retry_ok={} retry_fail={} ::",
+                    e, BOT_SENSE_COUNT.load(Ordering::Relaxed),
+                    BOT_SENSE_RETRY_OK.load(Ordering::Relaxed), BOT_SENSE_RETRY_FAIL.load(Ordering::Relaxed));
             }
         }
         again
@@ -4471,10 +4625,20 @@ impl XhciController {
                 serial_println!("xHCI: BOT CSW tag mismatch (got {:#x}, want {:#x})", csw_tag, tag);
                 return Err(BotError::TagMismatch);
             }
-            let status = match bstatus {
+            #[allow(unused_mut)]
+            let mut status = match bstatus {
                 0 => CswStatus::Passed, 1 => CswStatus::Failed,
                 2 => CswStatus::PhaseError, _ => CswStatus::Unknown,
             };
+            // Test-only: deterministic synthetic CHECK CONDITION (see BOT_FAULT_CC_FIRED).
+            #[cfg(feature = "botfaultinject")]
+            if dir == Direction::In && data_len >= 512 && status == CswStatus::Passed
+                && !BOT_FAULT_CC_FIRED.swap(true, Ordering::Relaxed)
+            {
+                serial_println!(":: BOT: fault-inject synthetic Failed CSW (slot {}, once) ::", slot_id);
+                status = CswStatus::Failed;
+                BOT_FAULT_CC_ACTIVE.store(true, Ordering::Relaxed);
+            }
             Ok(BotResult { status, residue })
         }
     }
@@ -5393,6 +5557,11 @@ impl XhciController {
 
         // TEST UNIT READY — USB sticks often report "becoming ready" a few times.
         self.storage_note = "TEST UNIT READY";
+        // PH-2: this loop already IS a sense-and-retry loop — it is the one place a `Failed` CSW was
+        // handled before this arc. Hold the CHECK CONDITION latch across it so `bot_transfer` keeps
+        // propagating `Failed` verbatim here and the loop's own sense/retry cadence is unchanged;
+        // the new handler owns the runtime path only.
+        BOT_SENSE_ACTIVE.store(true, Ordering::Relaxed);
         for attempt in 0..16 {
             match self.scsi_test_unit_ready(slot) {
                 Ok(CswStatus::Passed) => break,
@@ -5400,6 +5569,7 @@ impl XhciController {
                 Err(e) => { serial_println!("xHCI: TUR error {:?} (attempt {})", e, attempt); }
             }
         }
+        BOT_SENSE_ACTIVE.store(false, Ordering::Relaxed);
 
         self.storage_note = "INQUIRY";
         let (vendor, product) = self.scsi_inquiry(slot)?;
