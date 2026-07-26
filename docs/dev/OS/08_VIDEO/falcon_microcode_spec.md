@@ -374,3 +374,161 @@ f0 13 02          sethi $r1, 0x20000   I16 form, sets high 16 bits (pull 33)
 Note that Falcon instructions are variable-length byte sequences. The images
 in `kepler.rs` are `[u32]` arrays of the **packed byte stream**, so
 instructions straddle word boundaries — do not read a word as an instruction.
+
+## 9. Pull 34 (R3-AMEND) — the bounded echo with split observables
+
+This section appends to §3, §5.1 and §8; nothing above it is superseded. It
+records the retrofit of the s37-acked echo skeleton with the three things its
+approval required, and it discharges the standing bound-every-loop defect.
+
+Source of record: `unaos/crates/kernel/src/drivers/gpu/kepler.rs`, module
+`ucode`. The **byte listing is authoritative** there — the `[u32]` images are
+produced from it by `ucode::pack92()` at compile time, so the listing below and
+the words the host uploads cannot drift apart. That is the structural answer to
+the two §3.3 errors: an image whose ports disagree with `regs::falcon_io()` no
+longer compiles.
+
+### 9.1 What was added, and why each is an observable and not a decoration
+
+1. **The split observable.** The s37 ack was a single bit of information:
+   `CC_SCRATCH[1]` moved. That is consistent with "our ucode read the command
+   and echoed it" *and* with "something else wrote that register". The ucode now
+   also writes the **value it read** into `MAILBOX0` via `I[0x1000]`
+   (`falcon_io(0x040)`, PROVEN s29). `ack=1` with `mb0=1` is an echo; `ack=1`
+   with `mb0=A5A50000` (the seed) would be a *different* mechanism, and we would
+   now see that rather than credit it to ourselves.
+2. **The phase counter.** `MAILBOX1` (`I[0x1100]`, `falcon_io(0x044)`, PROVEN
+   s30) is stamped before and after each risky IO step. A ucode that dies mid-
+   sequence now names the instruction it died on instead of returning silence.
+   Image A stamps `0x01..0x04`, image B `0x11..0x14`, so `MAILBOX1` alone
+   identifies the winner without reference to the ack (§5.2 distinct magics).
+3. **The bound.** §5.1's law, owed since land review `bc5fe3fc`. See §9.4.
+
+Host-side, both mailboxes are seeded with `MB_SEED = 0xA5A5_0000` before the
+launch, so "unchanged" keeps its single meaning (§4 step 1) for the new
+observables too.
+
+### 9.2 Image A — indexed ports, down-counting bound (92 bytes = 23 words)
+
+```assembly
+// Addr | Bytes       | Instruction         | Note
+// -----|-------------|---------------------|-------------------------------------
+// 0x00 | f0 17 00    | mov   $r1, 0x00     | low half of I[CC_SCRATCH[0]]
+// 0x03 | f0 13 02    | sethi $r1, 0x02     | $r1 = 0x20000                  (s37)
+// 0x06 | f1 27 00 01 | mov   $r2, 0x0100   | low half of I[CC_SCRATCH[1]]
+// 0x0a | f0 23 02    | sethi $r2, 0x02     | $r2 = 0x20100                  (s37)
+// 0x0d | f0 37 01    | mov   $r3, 0x1      | the ack value
+// 0x10 | f1 67 00 10 | mov   $r6, 0x1000   | $r6 = I[MAILBOX0]              (s29)
+// 0x14 | f1 77 00 11 | mov   $r7, 0x1100   | $r7 = I[MAILBOX1]              (s30)
+// 0x18 | f0 57 00    | mov   $r5, 0x00     | loop counter, low half
+// 0x1b | f1 53 10 00 | sethi $r5, 0x0010   | $r5 = 0x00100000 = ECHO_BOUND
+// 0x1f | f0 07 01    | mov   $r0, 0x01     |
+// 0x22 | d0 70 00    | iowr  I[$r7], $r0   | MAILBOX1 = phase 01 (pre-loop)
+// poll:
+// 0x25 | cf 14 00    | iord  $r4, I[$r1]   | RISKY: read the command word
+// 0x28 | d0 64 00    | iowr  I[$r6], $r4   | MAILBOX0 = VALUE READ  <-- split obs.
+// 0x2b | f0 07 02    | mov   $r0, 0x02     |
+// 0x2e | d0 70 00    | iowr  I[$r7], $r0   | MAILBOX1 = phase 02 (post-read)
+// 0x31 | b0 44 01    | cmpu b32 $r4, 0x1   | is it the test command?
+// 0x34 | f4 1b 14    | bra ne, +0x14       | -> 0x48 (dec), keep polling
+// 0x37 | f0 07 03    | mov   $r0, 0x03     |
+// 0x3a | d0 70 00    | iowr  I[$r7], $r0   | MAILBOX1 = phase 03 (pre-ack)
+// 0x3d | d0 23 00    | iowr  I[$r2], $r3   | RISKY: CC_SCRATCH[1] = 1 (ACK)
+// 0x40 | f0 07 04    | mov   $r0, 0x04     |
+// 0x43 | d0 70 00    | iowr  I[$r7], $r0   | MAILBOX1 = phase 04 (post-ack)
+// 0x46 | f8 02       | exit                | terminal state: ack=1 mb0=1 phase=04
+// dec:
+// 0x48 | b0 52 01    | sub  b32 $r5, 0x1   | A's variable: 0xb0-form subop 2
+// 0x4b | b0 54 00    | cmpu b32 $r5, 0x0   |
+// 0x4e | f4 1b d7    | bra ne, -0x29       | -> 0x25 (poll)
+// 0x51 | f0 07 bd    | mov   $r0, 0xbd     | EXIT BY BOUND
+// 0x54 | d0 70 00    | iowr  I[$r7], $r0   | MAILBOX1 = 0xBD
+// 0x57 | f8 02       | exit                |
+// 0x59 | 00 00 00    | (padding)           | 92 bytes = 23 words
+```
+
+Packed (`ucode::UCODE_CTX_ECHO_A`):
+
+```
+F00017F0 27F10213 23F00100 0137F002 100067F1 110077F1 F10057F0 F0001053
+70D00107 0014CF00 F00064D0 70D00207 0144B000 F0141BF4 70D00307 0023D000
+D00407F0 02F80070 B00152B0 1BF40054 BD07F0D7 F80070D0 00000002
+```
+
+The first four words are byte-identical to the s37 image — the acked prologue
+did not move, and a `const _: () = assert!` in `kepler.rs` holds it there.
+
+### 9.3 Image B — the A/B fallback, on exactly one variable
+
+Every instruction in this program except one has already run on metal or is
+cited in §8. The exception is the counter arithmetic. `cmpu` is metal-proven at
+subopcode **4** in the `0xb0` form (s37, `b0 44 01`), which fixes that form's
+subop table as `0=add, 1=adc, 2=sub, 3=sbb, 4=cmpu`. Image A takes `sub`
+(subop 2) and counts **down** from `+ECHO_BOUND`; image B takes `add`
+(subop 0 — the least disputable entry of any ALU table) and counts **up** from
+`−ECHO_BOUND` = `0xFFF0_0000`. Both exit the loop when `$r5 == 0`; both bound at
+exactly `ECHO_BOUND` iterations. One boot settles the subop question either way
+(§5.2), and if A is wrong we still get the split observables from B.
+
+Deltas from image A — same addresses throughout, since every substituted
+instruction is the same length:
+
+```assembly
+// 0x1b | f1 53 f0 ff | sethi $r5, 0xfff0   | $r5 = -ECHO_BOUND
+// 0x21 |          11 | mov   $r0, 0x11     | phase (pre-loop)
+// 0x2d |          12 | mov   $r0, 0x12     | phase (post-read)
+// 0x39 |          13 | mov   $r0, 0x13     | phase (pre-ack)
+// 0x42 |          14 | mov   $r0, 0x14     | phase (post-ack)
+// 0x48 | b0 50 01    | add b32 $r5, 0x1    | B's variable: 0xb0-form subop 0
+// 0x53 |          be | mov   $r0, 0xbe     | EXIT BY BOUND
+```
+
+Packed (`ucode::UCODE_CTX_ECHO_B`):
+
+```
+F00017F0 27F10213 23F00100 0137F002 100067F1 110077F1 F10057F0 F0FFF053
+70D01107 0014CF00 F00064D0 70D01207 0144B000 F0141BF4 70D01307 0023D000
+D01407F0 02F80070 B00150B0 1BF40054 BE07F0D7 F80070D0 00000002
+```
+
+A `const` block in `kepler.rs` proves the pair diverges at **exactly** eight
+byte positions (the counter seed, the five phase magics, the subop nibble), so
+the A/B experiment cannot silently acquire a second variable.
+
+### 9.4 How the bound was chosen
+
+`ECHO_BOUND = 0x0010_0000` = 1,048,576 iterations.
+
+- The loop body is 8 instructions, so the bound is ~8.4M Falcon instructions —
+  milliseconds of Falcon time.
+- The window it must cover is tiny: the host writes the command word one
+  `mmio_write` plus one `serial_println!` after `CPUCTL <= 2`, and at s37 the
+  ucode had already consumed it by the host's **first** poll (`iters=0`).
+- The bound is therefore ~3 orders of magnitude larger than the window. It
+  exists to guarantee termination (§5.1), not to be reached. `0x0010_0000` also
+  costs nothing to encode: it is one `sethi` immediate, and it is the same
+  order as the heartbeat's authored bound `0x00500000`, which terminated exactly
+  on schedule at s33boot2.
+- If `phase` ever comes back `0xBD`/`0xBE`, the command never arrived. That is a
+  **real finding** about the host↔FECS channel, not a tuning problem — do not
+  raise the bound in response to it.
+
+The echo exits after a successful ack rather than looping back, which gives a
+deterministic terminal state (`ack=1 mb0=1 phase=04`) for the host to read.
+Pull 33's post-ack `bra` back to the poll is what made the loop unbounded; the
+host-commandable exit that would let it keep polling safely is still pull 34+
+work. **The §5.1 defect raised at land review `bc5fe3fc` is discharged by this
+section**: both images terminate by construction, on every path.
+
+### 9.5 The witness line
+
+```
+:: kepler: ctx-echo img=A ack=00000001 mb0=00000001 phase=00000004 ::
+```
+
+printed immediately after the existing `host-ack CC_SCRATCH[1]` line, and, on a
+bound exit only:
+
+```
+:: kepler: ctx-echo EXIT-BY-BOUND img=A iters=1048576 — command never observed ::
+```

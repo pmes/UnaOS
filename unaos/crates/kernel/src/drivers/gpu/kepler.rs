@@ -42,6 +42,263 @@ pub mod regs {
     // The two mappings metal has proven, checked at compile time.
     const _: () = assert!(falcon_io(0x040) == 0x1000); // MAILBOX0, s29
     const _: () = assert!(falcon_io(0x044) == 0x1100); // MAILBOX1, s30 heartbeat
+    const _: () = assert!(falcon_io(0x800) == 0x20000); // CC_SCRATCH[0], s37
+    const _: () = assert!(falcon_io(0x804) == 0x20100); // CC_SCRATCH[1], s37
+}
+
+/// FECS microcode images, byte-exact.
+///
+/// Falcon instructions are variable-length byte sequences; IMEM is written a
+/// `u32` at a time. The **byte listing is authoritative** here — the packed
+/// `[u32]` images are produced from it by [`pack92`] at compile time, so the
+/// listing in `docs/dev/OS/08_VIDEO/falcon_microcode_spec.md` and the words the
+/// host uploads cannot drift apart. Every IO port immediate in the listing is
+/// checked against [`regs::falcon_io`] by const assertion below (§3 of the
+/// spec: derive the port, never hand-write it).
+///
+/// Pull 34 (R3-AMEND) retrofit of the s37-acked pull-33 echo skeleton:
+///   * the ucode reports the **value it read** into MAILBOX0 (`I[0x1000]`), so
+///     the ack is no longer a single undifferentiated observable — a stuck
+///     `CC_SCRATCH[1]` and a genuine echo now look different;
+///   * a **phase counter** is stamped into MAILBOX1 (`I[0x1100]`) before and
+///     after each risky IO step, so a fault localises to an instruction;
+///   * the poll loop is **bounded** (spec §5.1 — the standing defect raised at
+///     land review `bc5fe3fc`), and exit-by-bound reports a distinct phase.
+pub mod ucode {
+    use super::regs::falcon_io;
+
+    /// Falcon IO indices, derived — never hand-written (spec §3).
+    pub const IO_MAILBOX0: u32 = falcon_io(0x040);
+    pub const IO_MAILBOX1: u32 = falcon_io(0x044);
+    pub const IO_CC_SCRATCH0: u32 = falcon_io(0x800);
+    pub const IO_CC_SCRATCH1: u32 = falcon_io(0x804);
+
+    /// Iteration bound on the echo poll loop.
+    ///
+    /// Chosen as `0x0010_0000` = 1_048_576 iterations. Sizing argument: the
+    /// loop body is 8 instructions, so the bound is ~8.4M Falcon instructions —
+    /// milliseconds of Falcon time. The host writes the command word one
+    /// `mmio_write` plus one `serial_println!` after `CPUCTL <= 2`, and at s37
+    /// the ucode had already consumed it by the host's *first* poll
+    /// (`iters=0`). The bound is therefore ~3 orders of magnitude larger than
+    /// the window it must cover: it exists to guarantee termination (spec
+    /// §5.1), not to be reached. If `phase` ever comes back as
+    /// [`PHASE_A_BOUND`]/[`PHASE_B_BOUND`], the command never arrived — that is
+    /// a real finding, not a tuning problem.
+    pub const ECHO_BOUND: u32 = 0x0010_0000;
+
+    // Phase stamps. Image A uses 0x01..0x04, image B 0x11..0x14, so MAILBOX1
+    // alone names which image ran (pull 25 distinct-magic discipline).
+    pub const PHASE_A_PRELOOP: u8 = 0x01;
+    pub const PHASE_A_POSTREAD: u8 = 0x02;
+    pub const PHASE_A_PREACK: u8 = 0x03;
+    pub const PHASE_A_POSTACK: u8 = 0x04;
+    pub const PHASE_A_BOUND: u8 = 0xBD;
+    pub const PHASE_B_PRELOOP: u8 = 0x11;
+    pub const PHASE_B_POSTREAD: u8 = 0x12;
+    pub const PHASE_B_PREACK: u8 = 0x13;
+    pub const PHASE_B_POSTACK: u8 = 0x14;
+    pub const PHASE_B_BOUND: u8 = 0xBE;
+
+    /// Image A — indexed IO ports (s37-proven prologue), **down-counting**
+    /// bound via `sub b32 $r5, 0x1`.
+    ///
+    /// ```text
+    /// // Addr | Bytes       | Instruction         | Note
+    /// // -----|-------------|---------------------|-------------------------------------
+    /// // 0x00 | f0 17 00    | mov   $r1, 0x00     | low half of I[CC_SCRATCH[0]]
+    /// // 0x03 | f0 13 02    | sethi $r1, 0x02     | $r1 = 0x20000                (s37)
+    /// // 0x06 | f1 27 00 01 | mov   $r2, 0x0100   | low half of I[CC_SCRATCH[1]]
+    /// // 0x0a | f0 23 02    | sethi $r2, 0x02     | $r2 = 0x20100                (s37)
+    /// // 0x0d | f0 37 01    | mov   $r3, 0x1      | the ack value
+    /// // 0x10 | f1 67 00 10 | mov   $r6, 0x1000   | $r6 = I[MAILBOX0]            (s29)
+    /// // 0x14 | f1 77 00 11 | mov   $r7, 0x1100   | $r7 = I[MAILBOX1]            (s30)
+    /// // 0x18 | f0 57 00    | mov   $r5, 0x00     | loop counter, low half
+    /// // 0x1b | f1 53 10 00 | sethi $r5, 0x0010   | $r5 = 0x00100000 = ECHO_BOUND
+    /// // 0x1f | f0 07 01    | mov   $r0, 0x01     | phase 0x01
+    /// // 0x22 | d0 70 00    | iowr  I[$r7], $r0   | MAILBOX1 = phase (pre-loop)
+    /// // poll:
+    /// // 0x25 | cf 14 00    | iord  $r4, I[$r1]   | RISKY: read the command word
+    /// // 0x28 | d0 64 00    | iowr  I[$r6], $r4   | MAILBOX0 = VALUE READ  <-- split obs.
+    /// // 0x2b | f0 07 02    | mov   $r0, 0x02     |
+    /// // 0x2e | d0 70 00    | iowr  I[$r7], $r0   | MAILBOX1 = phase (post-read)
+    /// // 0x31 | b0 44 01    | cmpu b32 $r4, 0x1   | is it the test command?
+    /// // 0x34 | f4 1b 14    | bra ne, +0x14       | -> 0x48 (dec), keep polling
+    /// // 0x37 | f0 07 03    | mov   $r0, 0x03     |
+    /// // 0x3a | d0 70 00    | iowr  I[$r7], $r0   | MAILBOX1 = phase (pre-ack)
+    /// // 0x3d | d0 23 00    | iowr  I[$r2], $r3   | RISKY: CC_SCRATCH[1] = 1 (ACK)
+    /// // 0x40 | f0 07 04    | mov   $r0, 0x04     |
+    /// // 0x43 | d0 70 00    | iowr  I[$r7], $r0   | MAILBOX1 = phase (post-ack)
+    /// // 0x46 | f8 02       | exit                | terminal state: phase=04
+    /// // dec:
+    /// // 0x48 | b0 52 01    | sub  b32 $r5, 0x1   | A's variable: subop 2
+    /// // 0x4b | b0 54 00    | cmpu b32 $r5, 0x0   |
+    /// // 0x4e | f4 1b d7    | bra ne, -0x29       | -> 0x25 (poll)
+    /// // 0x51 | f0 07 bd    | mov   $r0, 0xbd     | EXIT BY BOUND
+    /// // 0x54 | d0 70 00    | iowr  I[$r7], $r0   | MAILBOX1 = 0xBD
+    /// // 0x57 | f8 02       | exit                |
+    /// // 0x59 | 00 00 00    | (padding)           | 92 bytes = 23 words
+    /// ```
+    #[rustfmt::skip]
+    pub const ECHO_A_BYTES: [u8; 92] = [
+        0xf0, 0x17, 0x00,             // mov   $r1, 0x00
+        0xf0, 0x13, 0x02,             // sethi $r1, 0x02
+        0xf1, 0x27, 0x00, 0x01,       // mov   $r2, 0x0100
+        0xf0, 0x23, 0x02,             // sethi $r2, 0x02
+        0xf0, 0x37, 0x01,             // mov   $r3, 0x1
+        0xf1, 0x67, 0x00, 0x10,       // mov   $r6, 0x1000
+        0xf1, 0x77, 0x00, 0x11,       // mov   $r7, 0x1100
+        0xf0, 0x57, 0x00,             // mov   $r5, 0x00
+        0xf1, 0x53, 0x10, 0x00,       // sethi $r5, 0x0010
+        0xf0, 0x07, 0x01,             // mov   $r0, 0x01
+        0xd0, 0x70, 0x00,             // iowr  I[$r7], $r0
+        0xcf, 0x14, 0x00,             // poll: iord $r4, I[$r1]
+        0xd0, 0x64, 0x00,             // iowr  I[$r6], $r4
+        0xf0, 0x07, 0x02,             // mov   $r0, 0x02
+        0xd0, 0x70, 0x00,             // iowr  I[$r7], $r0
+        0xb0, 0x44, 0x01,             // cmpu b32 $r4, 0x1
+        0xf4, 0x1b, 0x14,             // bra ne, +0x14 -> dec
+        0xf0, 0x07, 0x03,             // mov   $r0, 0x03
+        0xd0, 0x70, 0x00,             // iowr  I[$r7], $r0
+        0xd0, 0x23, 0x00,             // iowr  I[$r2], $r3   (ACK)
+        0xf0, 0x07, 0x04,             // mov   $r0, 0x04
+        0xd0, 0x70, 0x00,             // iowr  I[$r7], $r0
+        0xf8, 0x02,                   // exit
+        0xb0, 0x52, 0x01,             // dec: sub b32 $r5, 0x1
+        0xb0, 0x54, 0x00,             // cmpu b32 $r5, 0x0
+        0xf4, 0x1b, 0xd7,             // bra ne, -0x29 -> poll
+        0xf0, 0x07, 0xbd,             // mov   $r0, 0xbd
+        0xd0, 0x70, 0x00,             // iowr  I[$r7], $r0
+        0xf8, 0x02,                   // exit
+        0x00, 0x00, 0x00,             // padding
+    ];
+
+    /// Image B — the A/B fallback on the one **new** encoding this pull needs.
+    ///
+    /// A and B are byte-identical except for the counter arithmetic: the
+    /// `sub`/`add` subopcode in the `0xb0` (b32, register + I8 immediate) form
+    /// is the only instruction here that metal has not already run. `cmpu` is
+    /// metal-proven at subop 4 (s37, `b0 44 01`), which fixes the subop table
+    /// as `0=add, 1=adc, 2=sub, 3=sbb, 4=cmpu`. A takes `sub` (subop 2) and
+    /// counts DOWN from `+ECHO_BOUND`; B takes `add` (subop 0, the least
+    /// disputable entry of any ALU table) and counts UP from `-ECHO_BOUND`
+    /// (`0xFFF0_0000`). Both exit the loop when `$r5 == 0`, both bound at
+    /// exactly `ECHO_BOUND` iterations. B also carries the 0x1x phase stamps so
+    /// MAILBOX1 names the winner without reference to the ack.
+    ///
+    /// Deltas from image A (same addresses — every substituted instruction is
+    /// the same length):
+    ///
+    /// ```text
+    /// // 0x1b | f1 53 f0 ff | sethi $r5, 0xfff0   | $r5 = -ECHO_BOUND
+    /// // 0x21 |          11 | mov   $r0, 0x11     | phase (pre-loop)
+    /// // 0x2d |          12 | mov   $r0, 0x12     | phase (post-read)
+    /// // 0x39 |          13 | mov   $r0, 0x13     | phase (pre-ack)
+    /// // 0x42 |          14 | mov   $r0, 0x14     | phase (post-ack)
+    /// // 0x48 | b0 50 01    | add b32 $r5, 0x1    | B's variable: subop 0
+    /// // 0x53 |          be | mov   $r0, 0xbe     | EXIT BY BOUND
+    /// ```
+    #[rustfmt::skip]
+    pub const ECHO_B_BYTES: [u8; 92] = [
+        0xf0, 0x17, 0x00,
+        0xf0, 0x13, 0x02,
+        0xf1, 0x27, 0x00, 0x01,
+        0xf0, 0x23, 0x02,
+        0xf0, 0x37, 0x01,
+        0xf1, 0x67, 0x00, 0x10,
+        0xf1, 0x77, 0x00, 0x11,
+        0xf0, 0x57, 0x00,
+        0xf1, 0x53, 0xf0, 0xff,       // sethi $r5, 0xfff0  (= -ECHO_BOUND)
+        0xf0, 0x07, 0x11,             // mov   $r0, 0x11
+        0xd0, 0x70, 0x00,
+        0xcf, 0x14, 0x00,             // poll:
+        0xd0, 0x64, 0x00,
+        0xf0, 0x07, 0x12,             // mov   $r0, 0x12
+        0xd0, 0x70, 0x00,
+        0xb0, 0x44, 0x01,
+        0xf4, 0x1b, 0x14,
+        0xf0, 0x07, 0x13,             // mov   $r0, 0x13
+        0xd0, 0x70, 0x00,
+        0xd0, 0x23, 0x00,             // (ACK)
+        0xf0, 0x07, 0x14,             // mov   $r0, 0x14
+        0xd0, 0x70, 0x00,
+        0xf8, 0x02,
+        0xb0, 0x50, 0x01,             // dec: add b32 $r5, 0x1
+        0xb0, 0x54, 0x00,
+        0xf4, 0x1b, 0xd7,
+        0xf0, 0x07, 0xbe,             // mov   $r0, 0xbe
+        0xd0, 0x70, 0x00,
+        0xf8, 0x02,
+        0x00, 0x00, 0x00,
+    ];
+
+    /// Pack a 92-byte Falcon instruction stream into the 23 little-endian
+    /// `u32` words IMEMD expects.
+    pub const fn pack92(b: &[u8; 92]) -> [u32; 23] {
+        let mut out = [0u32; 23];
+        let mut w = 0;
+        while w < 23 {
+            let i = w * 4;
+            out[w] = (b[i] as u32)
+                | ((b[i + 1] as u32) << 8)
+                | ((b[i + 2] as u32) << 16)
+                | ((b[i + 3] as u32) << 24);
+            w += 1;
+        }
+        out
+    }
+
+    pub const UCODE_CTX_ECHO_A: [u32; 23] = pack92(&ECHO_A_BYTES);
+    pub const UCODE_CTX_ECHO_B: [u32; 23] = pack92(&ECHO_B_BYTES);
+
+    /// Reconstruct a `mov`(I8)+`sethi`(I8) port pair from the byte listing.
+    const fn port_i8_sethi_i8(b: &[u8; 92], mov_at: usize, sethi_at: usize) -> u32 {
+        (b[mov_at + 2] as u32) | ((b[sethi_at + 2] as u32) << 16)
+    }
+    /// Reconstruct a `mov`(I16) port immediate from the byte listing.
+    const fn port_i16(b: &[u8; 92], mov_at: usize) -> u32 {
+        (b[mov_at + 2] as u32) | ((b[mov_at + 3] as u32) << 8)
+    }
+
+    // ⭐ Spec §3: every port immediate in both images is the derived value.
+    // These are the assertions that would have caught pull 33's raw-host-offset
+    // listing at compile time instead of at proposal review.
+    const _: () = assert!(port_i8_sethi_i8(&ECHO_A_BYTES, 0x00, 0x03) == IO_CC_SCRATCH0);
+    const _: () = assert!(
+        (port_i16(&ECHO_A_BYTES, 0x06) | ((ECHO_A_BYTES[0x0c] as u32) << 16)) == IO_CC_SCRATCH1
+    );
+    const _: () = assert!(port_i16(&ECHO_A_BYTES, 0x10) == IO_MAILBOX0);
+    const _: () = assert!(port_i16(&ECHO_A_BYTES, 0x14) == IO_MAILBOX1);
+    const _: () = assert!(port_i8_sethi_i8(&ECHO_B_BYTES, 0x00, 0x03) == IO_CC_SCRATCH0);
+    const _: () = assert!(
+        (port_i16(&ECHO_B_BYTES, 0x06) | ((ECHO_B_BYTES[0x0c] as u32) << 16)) == IO_CC_SCRATCH1
+    );
+    const _: () = assert!(port_i16(&ECHO_B_BYTES, 0x10) == IO_MAILBOX0);
+    const _: () = assert!(port_i16(&ECHO_B_BYTES, 0x14) == IO_MAILBOX1);
+
+    // The s37-acked prologue is preserved word-for-word (the four words that
+    // executed on metal at sitting #37 must not have moved).
+    const _: () = assert!(UCODE_CTX_ECHO_A[0] == 0xf000_17f0);
+    const _: () = assert!(UCODE_CTX_ECHO_A[1] == 0x27f1_0213);
+    const _: () = assert!(UCODE_CTX_ECHO_A[2] == 0x23f0_0100);
+    const _: () = assert!(UCODE_CTX_ECHO_A[3] == 0x0137_f002);
+
+    // The counter is initialised to exactly ECHO_BOUND (A) / -ECHO_BOUND (B).
+    const _: () = assert!(((ECHO_A_BYTES[0x1d] as u32) | ((ECHO_A_BYTES[0x1e] as u32) << 8)) << 16 == ECHO_BOUND);
+    const _: () = assert!(((ECHO_B_BYTES[0x1d] as u32) | ((ECHO_B_BYTES[0x1e] as u32) << 8)) << 16 == ECHO_BOUND.wrapping_neg());
+
+    // A and B differ only in the counter arithmetic, the counter seed and the
+    // phase magics — nothing else may drift between the pair.
+    const _: () = {
+        let mut i = 0;
+        while i < 92 {
+            let allowed = i == 0x1d || i == 0x1e   // counter seed (sethi imm)
+                || i == 0x21 || i == 0x2d || i == 0x39 || i == 0x42 || i == 0x53 // phase magics
+                || i == 0x49; // sub(2) vs add(0) subopcode
+            assert!(allowed || ECHO_A_BYTES[i] == ECHO_B_BYTES[i]);
+            i += 1;
+        }
+    };
 }
 
 /// s26/s28 FTDI-ring budget: the 0x640000 window is PARKED (triple-refuted),
@@ -476,14 +733,9 @@ pub fn init(gpu: &GpuInfo) {
                                         //   f8 02            exit
                                         const UCODE_A: [u32; 5] = [0x100017f1, 0xface27f1, 0xf00d23f1, 0xf80012d1, 0x00000002];
                                         const UCODE_B: [u32; 5] = [0x004017f1, 0xbeef27f1, 0xf00d23f1, 0xf80012d1, 0x00000002];
-                                        const UCODE_CTX_ECHO_A: [u32; 8] = [
-                                            0xf00017f0, 0x27f10213, 0x23f00100, 0x0137f002,
-                                            0xb00014cf, 0x1bf40144, 0x0023d0fa, 0x00f40ef4,
-                                        ];
-                                        const UCODE_CTX_ECHO_B: [u32; 7] = [
-                                            0x080017f1, 0x080427f1, 0xcf0137f0, 0x44b00014,
-                                            0xfa1bf401, 0xf40023d0, 0x0000f40e,
-                                        ];
+                                        // Pull 34 R3-AMEND: the echo images now live at module scope
+                                        // (byte listings + compile-time port/derivation asserts).
+                                        use ucode::{UCODE_CTX_ECHO_A, UCODE_CTX_ECHO_B};
                                         const MB_SEED: u32 = 0xA5A5_0000;
                                         // IMEM page granularity: the code TLB marks a page usable only when the
                                         // last word of the 0x40-word page is written (nouveau pads for this reason).
@@ -571,19 +823,29 @@ pub fn init(gpu: &GpuInfo) {
                                         }
                                         
                                         // --- Pull 33: FECS Command Echo Skeleton (A/B Fallback) ---
-                                        for &(img_label, img) in &[("A", &UCODE_CTX_ECHO_A[..]), ("B", &UCODE_CTX_ECHO_B[..])] {
-                                            serial_println!(":: kepler: ucode-echo img={} ::", img_label);
-                                            
+                                        // Pull 34 R3-AMEND: split observable (MAILBOX0 = the value the
+                                        // ucode READ) + phase counter (MAILBOX1) + bounded poll loop.
+                                        for &(img_label, img, phase_bound) in &[
+                                            ("A", &UCODE_CTX_ECHO_A[..], ucode::PHASE_A_BOUND),
+                                            ("B", &UCODE_CTX_ECHO_B[..], ucode::PHASE_B_BOUND),
+                                        ] {
+                                            serial_println!(":: kepler: ucode-echo img={} bound={} ::", img_label, ucode::ECHO_BOUND);
+
                                             // Halt engine if running (from previous loop or previous attempt)
                                             let dmactl_pre = mmio_read(bar0, base + 0x10C);
                                             mmio_write(bar0, base + 0x10C, dmactl_pre & !1);
-                                            
+
                                             mmio_write(bar0, base + 0x800, 0); // CC_SCRATCH[0]
                                             mmio_write(bar0, base + 0x804, 0); // CC_SCRATCH[1]
-                                            
-                                            serial_println!(":: kepler: ucode-echo pre CC_SCRATCH[0]={:08X} CC_SCRATCH[1]={:08X} ::",
-                                                mmio_read(bar0, base + 0x800), mmio_read(bar0, base + 0x804));
-                                            
+                                            // Seed both mailboxes so "unchanged" has exactly one meaning
+                                            // (s29 discipline) for the two new observables as well.
+                                            mmio_write(bar0, base + 0x040, MB_SEED); // MAILBOX0 <- value read
+                                            mmio_write(bar0, base + 0x044, MB_SEED); // MAILBOX1 <- phase
+
+                                            serial_println!(":: kepler: ucode-echo pre CC_SCRATCH[0]={:08X} CC_SCRATCH[1]={:08X} mb0={:08X} mb1={:08X} ::",
+                                                mmio_read(bar0, base + 0x800), mmio_read(bar0, base + 0x804),
+                                                mmio_read(bar0, base + 0x040), mmio_read(bar0, base + 0x044));
+
                                             mmio_write(bar0, base + 0x180, 1 << 24); // IMEMC AINCW
                                             mmio_write(bar0, base + 0x188, 0); // IMEMT tag=0
                                             for &word in img.iter() { mmio_write(bar0, base + 0x184, word); }
@@ -616,6 +878,19 @@ pub fn init(gpu: &GpuInfo) {
                                             }
                                             
                                             serial_println!(":: kepler: ucode-echo host-ack CC_SCRATCH[1]={:08X} iters={} ::", ack, ack_iters);
+
+                                            // R3-AMEND split observable: mb0 = the word the ucode READ out
+                                            // of CC_SCRATCH[0]; mb1 = the phase it last reached. An ack with
+                                            // mb0 != 1 would mean CC_SCRATCH[1] moved for some reason other
+                                            // than our echo; no ack with a live phase localises the fault.
+                                            let mb0 = mmio_read(bar0, base + 0x040);
+                                            let phase = mmio_read(bar0, base + 0x044);
+                                            serial_println!(":: kepler: ctx-echo img={} ack={:08X} mb0={:08X} phase={:08X} ::",
+                                                img_label, ack, mb0, phase);
+                                            if phase == phase_bound as u32 {
+                                                serial_println!(":: kepler: ctx-echo EXIT-BY-BOUND img={} iters={} — command never observed ::",
+                                                    img_label, ucode::ECHO_BOUND);
+                                            }
                                             if ack == 1 {
                                                 serial_println!(":: kepler: ucode-echo SUCCESS img={} ::", img_label);
                                                 break;
@@ -995,4 +1270,148 @@ pub unsafe fn mmio_read(base: usize, offset: usize) -> u32 {
 
 pub unsafe fn mmio_write(base: usize, offset: usize, val: u32) {
     core::ptr::write_volatile((base + offset) as *mut u32, val)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::regs::falcon_io;
+    use super::ucode::*;
+
+    /// The IO derivation itself (spec §3), both metal-proven register families.
+    #[test]
+    fn falcon_io_matches_the_proven_mappings() {
+        assert_eq!(falcon_io(0x040), 0x1000); // MAILBOX0, s29
+        assert_eq!(falcon_io(0x044), 0x1100); // MAILBOX1, s30
+        assert_eq!(falcon_io(0x800), 0x20000); // CC_SCRATCH[0], s37
+        assert_eq!(falcon_io(0x804), 0x20100); // CC_SCRATCH[1], s37
+    }
+
+    /// Round-trip: the documented byte listing packs to the words we upload,
+    /// and unpacking those words reproduces the listing byte for byte.
+    #[test]
+    fn echo_images_round_trip_bytes_to_words() {
+        for (bytes, words) in [
+            (&ECHO_A_BYTES, &UCODE_CTX_ECHO_A),
+            (&ECHO_B_BYTES, &UCODE_CTX_ECHO_B),
+        ] {
+            assert_eq!(pack92(bytes), *words);
+            let mut back = [0u8; 92];
+            for (w, word) in words.iter().enumerate() {
+                back[w * 4..w * 4 + 4].copy_from_slice(&word.to_le_bytes());
+            }
+            assert_eq!(&back, bytes);
+        }
+    }
+
+    /// The four words that executed on metal at sitting #37 must not have moved.
+    #[test]
+    fn s37_acked_prologue_is_preserved() {
+        assert_eq!(
+            &UCODE_CTX_ECHO_A[..4],
+            &[0xf000_17f0u32, 0x27f1_0213, 0x23f0_0100, 0x0137_f002]
+        );
+    }
+
+    /// Every port immediate in both images is the value `falcon_io` derives —
+    /// this is the check that would have caught pull 33's raw-host-offset
+    /// listing (`0x800`/`0x804`) at build time.
+    #[test]
+    fn every_port_immediate_is_derived_not_hand_written() {
+        for bytes in [&ECHO_A_BYTES, &ECHO_B_BYTES] {
+            // $r1: mov(I8) @0x00 + sethi(I8) @0x03
+            let r1 = bytes[0x02] as u32 | ((bytes[0x05] as u32) << 16);
+            // $r2: mov(I16) @0x06 + sethi(I8) @0x0a
+            let r2 = bytes[0x08] as u32 | ((bytes[0x09] as u32) << 8) | ((bytes[0x0c] as u32) << 16);
+            // $r6/$r7: mov(I16) @0x10 / @0x14
+            let r6 = bytes[0x12] as u32 | ((bytes[0x13] as u32) << 8);
+            let r7 = bytes[0x16] as u32 | ((bytes[0x17] as u32) << 8);
+            assert_eq!(r1, falcon_io(0x800));
+            assert_eq!(r2, falcon_io(0x804));
+            assert_eq!(r6, falcon_io(0x040));
+            assert_eq!(r7, falcon_io(0x044));
+        }
+    }
+
+    /// Bounded-loop law (spec §5.1): the counter is seeded to exactly
+    /// `ECHO_BOUND` iterations in both images, and the loop's only backward
+    /// branch is the one guarded by that counter.
+    #[test]
+    fn echo_loop_is_bounded() {
+        let seed_a = ((ECHO_A_BYTES[0x1d] as u32) | ((ECHO_A_BYTES[0x1e] as u32) << 8)) << 16;
+        let seed_b = ((ECHO_B_BYTES[0x1d] as u32) | ((ECHO_B_BYTES[0x1e] as u32) << 8)) << 16;
+        assert_eq!(seed_a, ECHO_BOUND); // A counts down from +bound with `sub`
+        assert_eq!(seed_b, ECHO_BOUND.wrapping_neg()); // B counts up from -bound with `add`
+        assert_eq!(ECHO_BOUND, 1_048_576);
+
+        // A: `sub b32 $r5, 0x1` = b0 52 01 ; B: `add b32 $r5, 0x1` = b0 50 01.
+        assert_eq!(&ECHO_A_BYTES[0x48..0x4b], &[0xb0, 0x52, 0x01]);
+        assert_eq!(&ECHO_B_BYTES[0x48..0x4b], &[0xb0, 0x50, 0x01]);
+
+        // The bound test and its backward branch: cmpu $r5,0 ; bra ne,-0x29 -> poll @0x25.
+        for bytes in [&ECHO_A_BYTES, &ECHO_B_BYTES] {
+            assert_eq!(&bytes[0x4b..0x4e], &[0xb0, 0x54, 0x00]);
+            assert_eq!(&bytes[0x4e..0x51], &[0xf4, 0x1b, 0xd7]);
+            let disp = bytes[0x50] as i8 as isize;
+            assert_eq!(0x4e_isize + disp, 0x25); // lands on the `iord`
+            // The forward `bra ne` at 0x34 lands on the decrement block at 0x48.
+            let fwd = bytes[0x36] as i8 as isize;
+            assert_eq!(0x34_isize + fwd, 0x48);
+            // Both exits are a real `exit` (f8 02), not a fall-off-the-page.
+            assert_eq!(&bytes[0x46..0x48], &[0xf8, 0x02]); // after ack
+            assert_eq!(&bytes[0x57..0x59], &[0xf8, 0x02]); // after bound
+        }
+    }
+
+    /// The split observable: MAILBOX0 is written with the value that was read,
+    /// and MAILBOX1 is stamped before and after each risky IO step.
+    #[test]
+    fn split_observable_and_phase_stamps_are_present() {
+        for bytes in [&ECHO_A_BYTES, &ECHO_B_BYTES] {
+            assert_eq!(&bytes[0x25..0x28], &[0xcf, 0x14, 0x00]); // iord  $r4, I[$r1]
+            assert_eq!(&bytes[0x28..0x2b], &[0xd0, 0x64, 0x00]); // iowr  I[$r6], $r4
+            assert_eq!(&bytes[0x3d..0x40], &[0xd0, 0x23, 0x00]); // iowr  I[$r2], $r3 (ack)
+            // five phase stamps, each an `iowr I[$r7], $r0`
+            for at in [0x22usize, 0x2e, 0x3a, 0x43, 0x54] {
+                assert_eq!(&bytes[at..at + 3], &[0xd0, 0x70, 0x00]);
+            }
+        }
+        let a = [
+            PHASE_A_PRELOOP,
+            PHASE_A_POSTREAD,
+            PHASE_A_PREACK,
+            PHASE_A_POSTACK,
+            PHASE_A_BOUND,
+        ];
+        let b = [
+            PHASE_B_PRELOOP,
+            PHASE_B_POSTREAD,
+            PHASE_B_PREACK,
+            PHASE_B_POSTACK,
+            PHASE_B_BOUND,
+        ];
+        for (i, at) in [0x21usize, 0x2d, 0x39, 0x42, 0x53].iter().enumerate() {
+            assert_eq!(ECHO_A_BYTES[*at], a[i]);
+            assert_eq!(ECHO_B_BYTES[*at], b[i]);
+        }
+        // Distinct magics: A and B can never be confused in MAILBOX1.
+        for x in a {
+            assert!(!b.contains(&x));
+        }
+    }
+
+    /// A/B discipline (spec §5.2): one variable per boot. A and B may differ
+    /// only in the counter arithmetic, the counter seed, and the phase magics.
+    #[test]
+    fn ab_pair_differs_on_exactly_one_variable() {
+        let allowed = [0x1dusize, 0x1e, 0x21, 0x2d, 0x39, 0x42, 0x49, 0x53];
+        for i in 0..92 {
+            if ECHO_A_BYTES[i] != ECHO_B_BYTES[i] {
+                assert!(allowed.contains(&i), "unexpected A/B divergence at {i:#x}");
+            }
+        }
+        // The one instruction-level variable: the 0xb0-form subopcode nibble.
+        assert_eq!(ECHO_A_BYTES[0x49] & 0x0f, 2); // sub
+        assert_eq!(ECHO_B_BYTES[0x49] & 0x0f, 0); // add
+        assert_eq!(ECHO_A_BYTES[0x49] >> 4, ECHO_B_BYTES[0x49] >> 4); // same register
+    }
 }
