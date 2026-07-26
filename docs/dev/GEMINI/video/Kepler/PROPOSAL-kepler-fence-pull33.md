@@ -1,3 +1,7 @@
+LANDED (merge 9621bbc9); acked on metal at sitting #37. The corrected listing
+that actually ran is in **[AS-LANDED (CORRECTED)](#as-landed-corrected--the-listing-that-ran-at-sitting-37)**
+at the end of this document — read that, not the listing in the proposal body.
+
 STATUS: APPROVED-WITH-CORRECTION (GR5, 2026-07-26). THREE BINDING AMENDMENTS,
 the first of which is a MUST-FIX defect:
 
@@ -99,3 +103,115 @@ We will then write `0x1` to `CC_SCRATCH[0]` (`0x409800`) after execution starts,
 *   No retries on failure.
 *   All docs+code committed, scratch deleted.
 *   No push. Report "PUSH OWED: 22".
+
+---
+
+# AS-LANDED (CORRECTED) — the listing that ran at sitting #37
+
+Everything above this line is the historical proposal, preserved as written.
+This section records what actually landed (merge `9621bbc9`) and what actually
+executed on metal, after the two land-review corrections were applied. Where
+the two disagree, **this section is authoritative**.
+
+Source of record: `unaos/crates/kernel/src/drivers/gpu/kepler.rs` —
+`UCODE_CTX_ECHO_A` / `UCODE_CTX_ECHO_B` (the packed images) and the
+`// --- Pull 33: FECS Command Echo Skeleton (A/B Fallback) ---` host loop.
+Metal result: `docs/dev/OS/08_VIDEO/KEPLER-METAL-LOG.md`, Sitting #37.
+IO derivation: `docs/dev/OS/08_VIDEO/falcon_microcode_spec.md` §3 (landed at
+commit `010a0d0d`, which upgraded the CC_SCRATCH rows in the §3.2 worked table
+from DERIVED to **PROVEN s37**).
+
+## Correction 1 — the IO ports
+
+The proposal used the host MMIO offsets `0x800`/`0x804` directly as falcon IO
+port indices. That is the refuted flat reading. The proven scheme is indexed:
+
+```
+falcon IO index = (host_register_offset & 0xffc) << 6
+```
+
+so `CC_SCRATCH[0]` host `0x409800` → **I[0x20000]** and `CC_SCRATCH[1]` host
+`0x409804` → **I[0x20100]** (falcon_microcode_spec.md §3, §3.2). Neither value
+fits the I16 immediate form the original listing used, so the landed image
+builds each port as a `mov` (low half) + `sethi` (high half) pair.
+
+## Correction 2 — the branch displacements
+
+The original listing's `bra ne, -9` (from `0x11`) and `bra -15` (from `0x17`)
+did not land on the `iord`; the annotations claimed `0x0b` while the arithmetic
+gave `0x08`. The landed image branches `-6` and `-12`, both resolving to the
+`iord` at `0x10`. Displacements below are relative to the start of the branch
+instruction.
+
+## Image A — the derived indexed ports (this is the image that acked)
+
+```assembly
+// Address | Bytes          | Instruction         | Note
+// --------|----------------|---------------------|--------------------------------
+// 0x00    | f0 17 00       | mov   $r1, 0x00     | I8 immediate, low half of the port
+// 0x03    | f0 13 02       | sethi $r1, 0x02     | $r1 = 0x20000 = I[CC_SCRATCH[0]]
+// 0x06    | f1 27 00 01    | mov   $r2, 0x0100   | I16 immediate, low half
+// 0x0a    | f0 23 02       | sethi $r2, 0x02     | $r2 = 0x20100 = I[CC_SCRATCH[1]]
+// 0x0d    | f0 37 01       | mov   $r3, 0x1      | the ack value
+// 0x10    | cf 14 00       | iord  $r4, I[$r1]   | poll the command word
+// 0x13    | b0 44 01       | cmpu b32 $r4, 0x1   | is it the test command?
+// 0x16    | f4 1b fa       | bra ne, -6          | -> 0x10, keep polling
+// 0x19    | d0 23 00       | iowr  I[$r2], $r3   | acknowledge
+// 0x1c    | f4 0e f4       | bra -12             | -> 0x10, back to polling
+// 0x1f    | 00             | (padding)           | 32 bytes = 8 words
+```
+
+Packed, as in `kepler.rs`:
+
+```rust
+const UCODE_CTX_ECHO_A: [u32; 8] = [
+    0xf00017f0, 0x27f10213, 0x23f00100, 0x0137f002,
+    0xb00014cf, 0x1bf40144, 0x0023d0fa, 0x00f40ef4,
+];
+```
+
+## Image B — the flat ports (fallback; never ran)
+
+Kept per amendment 2 as the A/B fallback. Identical to the original proposal's
+listing except for the corrected branch displacements:
+
+```assembly
+// 0x00 | f1 17 00 08 | mov   $r1, 0x800    | flat reading of the host offset
+// 0x04 | f1 27 04 08 | mov   $r2, 0x804    |
+// 0x08 | f0 37 01    | mov   $r3, 0x1      |
+// 0x0b | cf 14 00    | iord  $r4, I[$r1]   |
+// 0x0e | b0 44 01    | cmpu b32 $r4, 0x1   |
+// 0x11 | f4 1b fa    | bra ne, -6          | -> 0x0b
+// 0x14 | d0 23 00    | iowr  I[$r2], $r3   |
+// 0x17 | f4 0e f4    | bra -12             | -> 0x0b
+// 0x1a | 00 00       | (padding)           | 28 bytes = 7 words
+```
+
+```rust
+const UCODE_CTX_ECHO_B: [u32; 7] = [
+    0x080017f1, 0x080427f1, 0xcf0137f0, 0x44b00014,
+    0xfa1bf401, 0xf40023d0, 0x0000f40e,
+];
+```
+
+## Metal result (Sitting #37, `UnaOS-gemini@f8e3e2f3`, capture `s37boot1v2`)
+
+```
+:: kepler: ucode-echo pre CC_SCRATCH[0]=00000000 CC_SCRATCH[1]=00000000 ::
+:: kepler: ucode-echo host-cmd CC_SCRATCH[0]=00000001 ::
+:: kepler: ucode-echo host-ack CC_SCRATCH[1]=00000001 iters=0 ::
+:: kepler: ucode-echo SUCCESS img=A ::
+```
+
+Image A acked on the first poll (`iters=0`); image B never ran. The indexed IO
+scheme is therefore confirmed for a second register family beyond the s29
+mailbox proof, and the must-fix correction above is the reason the boot
+succeeded.
+
+## Standing defect carried out of land review
+
+The echo loop as landed is **unbounded** — both images branch back to the
+`iord` forever, contrary to the bound-every-loop law
+(`falcon_microcode_spec.md` §5.1) and to the bounded discipline pull 27 used.
+It caused no harm at s37 (the boot stayed healthy through 449+ SMC samples),
+but a host-commandable exit is owed to pull 34.
