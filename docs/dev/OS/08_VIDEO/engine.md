@@ -257,6 +257,9 @@ operator and their geometry is a witnessed constant. So `free_span` narrows the
 instrument to the horizontal span WC-F leaves free rather than fighting it: 1480
 of 1920 px on the bench panel, 200 of 640 on the QEMU surface. Outside the WC-F
 build (x86, non-`baremetal`, no `witness`) the band is the full panel width.
+**SETTLED (Peter, 2026-07-26, P62 sitting): the bottom corners stay with the WC-F
+probes** — the 1480 px centered span is the decided design, not a compromise
+awaiting a WC-F retirement. Do not re-litigate in later arcs.
 
 ### The LED bar — sensitivity from width, smoothness from gradient
 
