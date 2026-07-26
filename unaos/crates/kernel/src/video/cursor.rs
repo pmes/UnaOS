@@ -229,16 +229,37 @@ static SPRITE: Mutex<Sprite> = Mutex::new(Sprite {
 /// for its save-under, captured the overlay's own `FILL`, and the arrow stood in the window's rect
 /// until something else damaged that window. **That is the P64 "flash in the vug display".**
 ///
-/// A relaxed load of one `u64` is admissible everywhere a lock is not: no wait, no wait-set entry,
-/// no ordering obligation beyond "a stale read is a conservative read". Staleness degrades in the
-/// safe direction — a compose that declines costs the pass its overlay for one window and falls back
-/// to the bracket, which is exactly what CURSOR-3 did for every window.
+/// One `u64` load is admissible everywhere a lock is not: no wait, and no entry in the drain
+/// barrier's wait set.
+///
+/// **What this check is, stated honestly (lens SHOULD-FIX 3).** An earlier draft claimed "a stale
+/// read is a conservative read". That is FALSE, and the falsity is worth naming rather than
+/// softening: the failure mode is not "the reader sees a newer value than it should", it is "the
+/// reader sees an OLD value that still equals `plan.epoch`" — which is precisely the retired plan the
+/// check exists to reject, waved through. The generation check therefore **narrows** the window
+/// between a retiring undraw and a compose; it does not close it. It cannot: any lock-free test of a
+/// value that another core is concurrently changing has a residual, and this one is not permitted a
+/// lock.
+///
+/// What closes the residual is the layer BEHIND it, which was always there and is what makes the
+/// narrowing worth having rather than a false floor: `adopt_overlay` re-checks `ov.epoch == sp.epoch`
+/// with the sprite lock HELD, so a compose that slipped through on a stale read is caught at the tail
+/// and settled by a whole-sprite `refresh_locked` instead of by an install. The check turns a
+/// certainty into a race, and the tail turns the race into a repaint. `C5_SELF_SAVE` is what would
+/// show the residual actually biting.
+///
+/// **Release/Acquire, not Relaxed.** The store is what publishes "the sprite is no longer where your
+/// plan says", and the thing a reader must not reorder against it is the undraw's PIXEL WRITES. A
+/// relaxed pair leaves an acquiring reader free to observe the new generation while still seeing
+/// pre-undraw pixels (or, worse, to observe the old generation after the pixels have moved) — so the
+/// ordering is doing real work here even though the value itself is only advisory.
 static EPOCH: AtomicU64 = AtomicU64::new(0);
 
 /// CURSOR-5 — the sprite generation, readable without the sprite lock. Only [`compose_into`] needs
-/// it; every other consumer holds `SPRITE` and reads the field directly.
+/// it; every other consumer holds `SPRITE` and reads the field directly. `Acquire`, paired with
+/// [`bump_epoch`]'s `Release` — see [`EPOCH`] for what the ordering buys and what it does not.
 fn live_epoch() -> u64 {
-    EPOCH.load(Ordering::Relaxed)
+    EPOCH.load(Ordering::Acquire)
 }
 
 /// CURSOR-5 — advance the generation. The ONE place `epoch` moves, so the mirror cannot drift from
@@ -246,7 +267,7 @@ fn live_epoch() -> u64 {
 /// is the defect this arc exists to close.
 fn bump_epoch(sp: &mut Sprite) {
     sp.epoch = sp.epoch.wrapping_add(1);
-    EPOCH.store(sp.epoch, Ordering::Relaxed);
+    EPOCH.store(sp.epoch, Ordering::Release);
 }
 
 // ---- CURSOR-5 witnesses ------------------------------------------------------------------------
@@ -294,17 +315,36 @@ pub fn note_masked_nosession() {
     C5_MASKED_NOSESSION.fetch_add(1, Ordering::Relaxed);
 }
 
-/// CURSOR-5 — is a pass currently holding the overlay session? For WC-L's drain, which must not take
-/// the sprite down inside one. `try_lock`: an answer of "someone holds OVERLAY right now" is itself
-/// evidence a pass is mid-session, and blocking here would put `OVERLAY` into a wait the drain does
+/// CURSOR-5 — does the drain's own pass hold an overlay session right now? For WC-L's drain, which
+/// must not take the sprite down inside one.
+///
+/// ### The invariant is PER-PASS, and the first cut tested it globally (lens SHOULD-FIX 2)
+/// CURSOR-5's ordering fix says: *this* composite pass drains before *this* pass opens a session. It
+/// says nothing whatever about another core, and another core legitimately holding a session while
+/// this one drains is not a defect — it is the VUGPAR steady state, two cores compositing at once,
+/// which is the load this whole arc is about. The first cut tested the GLOBAL session flag and
+/// counted a contended `try_lock` as busy, so a perfectly healthy metal boot would have driven
+/// `drain_insession` up, tripped the spec's `FORBID`, and reported `REGRESSED`. A false red on P65
+/// costs Peter a bench boot to chase a bug that is not there, which is a worse failure than the
+/// counter not existing.
+///
+/// So the test is scoped to the core that opened the session. A pass runs `composite_inner` on one
+/// core and its drain is on that same core, so "the open session belongs to this core" is exactly
+/// "this pass is mid-session" — the invariant, and nothing wider. Cross-core sessions are invisible
+/// here by construction, which is correct: they are absorbed by [`compose_into`]'s generation check
+/// and counted as `stale_compose`, where they read as load rather than as breakage.
+///
+/// `try_lock`, and a contended lock counts NOTHING: this core cannot be the one holding `OVERLAY`
+/// (nothing on this path holds it across the drain), so contention proves the holder is someone
+/// else — the case that must not count. Blocking would also put `OVERLAY` into a wait the drain does
 /// not need.
 #[cfg(feature = "witness")]
 pub fn note_drain_undraw() {
-    let busy = match OVERLAY.try_lock() {
-        Some(g) => g.session,
-        None => true,
+    let mine = match OVERLAY.try_lock() {
+        Some(g) => g.session && g.owner_cpu == crate::arch::sched::meter_current_cpu(),
+        None => false,
     };
-    if busy {
+    if mine {
         C5_DRAIN_INSESSION.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -546,30 +586,88 @@ pub fn sprite_plan() -> Option<Plan> {
 pub fn undraw_within(boxes: &[(usize, usize, usize, usize)]) {
     let restored = {
         let mut sp = SPRITE.lock();
-        undraw_within_locked(&mut sp, boxes)
+        undraw_within_locked(&mut sp, boxes).0
     };
     repair(restored);
 }
 
+/// CURSOR-5 — the masked undraw for a pass that does NOT own the overlay session, which is a
+/// different operation from [`undraw_within`] however identical the pixel work looks.
+///
+/// ### The interleave this exists to close (lens MUST-FIX 1)
+/// CURSOR-5's first cut let a session-less pass call [`undraw_within`] directly, on the argument that
+/// the mask's justification (hand back what THIS pass may paint over) is independent of who owns the
+/// session. The pixel argument is sound; the BOOKKEEPING one is not, and the gap reintroduced both
+/// P64 symptoms on the new path:
+///
+/// * Pass A owns the session, composed sprite pixel `P` into its layer and presented it. `P` is on
+///   the panel, `ov.saved[P]` holds the window content beneath it, `A`'s plan generation is `e`.
+/// * Pass B, having lost the session, mask-undraws `P`. The colour guard passes (the panel really
+///   does hold the sprite's colour at `P` — A just put it there), so B writes `sp.saved[P]` — B's
+///   OWN save-under, captured before A's window ever composed — into A's window rect. A stale pixel,
+///   inside a live window: **the flash**.
+/// * `undraw_within_locked` does not bump the generation, so `sp.epoch` is still `e`. A's
+///   `adopt_overlay` therefore finds its session COHERENT, installs `ov.saved[P]` over B's damage and
+///   clears the off bit — the module now believes the sprite is on the panel at `P`, where B has just
+///   painted something else. **The hole.**
+///
+/// CURSOR-3 and CURSOR-4 were immune only by accident: their decline branch took a FULL undraw, which
+/// bumps the generation, so A's session went incoherent and fell back to a whole-sprite refresh.
+///
+/// ### The fix, and why the generation is the right lever
+/// Any pixel actually handed back here is a pixel whose ownership has changed behind the session
+/// owner's back, and the generation is precisely the channel that says "the sprite you planned
+/// against is not the sprite that exists". Bumping it makes A's `compose_into` decline (`stale`),
+/// A's `adopt_overlay` incoherent, and A's tail a whole-sprite `refresh_locked` — the exact,
+/// already-proven fallback CURSOR-3's full undraw bought by accident, now bought on purpose and only
+/// when a pixel really moved.
+///
+/// The bump is conditional on `handed_back > 0` rather than unconditional, and that is not an
+/// optimisation: the overwhelmingly common case is a pass whose paint set does not meet the sprite at
+/// all (or meets only pixels a previous mask already took), which changes nothing and must not
+/// invalidate a healthy session. A pass that hands nothing back has not disturbed A's premise.
+///
+/// The alternative the lens offered — clearing the open session's `covered` bits for the masked
+/// extents — was rejected as strictly weaker: it repairs the bookkeeping (the hole) but leaves the
+/// stale pixel B already wrote inside A's window rect, since A would then repaint `P` from the front
+/// where B's stale value is sitting. Only invalidating the generation reaches both.
+pub fn undraw_within_nosession(boxes: &[(usize, usize, usize, usize)]) {
+    let restored = {
+        let mut sp = SPRITE.lock();
+        let (restored, handed_back) = undraw_within_locked(&mut sp, boxes);
+        if handed_back > 0 {
+            bump_epoch(&mut sp);
+        }
+        restored
+    };
+    repair(restored);
+}
+
+/// Returns the rect to [`repair`], and how many painted pixels this call newly handed back — the
+/// second is what [`undraw_within_nosession`] keys its generation bump on.
 fn undraw_within_locked(
     sp: &mut Sprite,
     boxes: &[(usize, usize, usize, usize)],
-) -> Option<(usize, usize, usize, usize)> {
+) -> (Option<(usize, usize, usize, usize)>, usize) {
     if !sp.drawn {
-        return None;
+        return (None, 0);
     }
     let fb = *super::WRITER.lock();
     if !fb.is_ready() {
-        return undraw_locked(sp);
+        // The full undraw bumps the generation itself, so the caller's conditional bump would be
+        // redundant — and harmless either way, since it reports zero pixels handed back.
+        return (undraw_locked(sp), 0);
     }
     let (bx, by, bw, bh, s) = (sp.bx, sp.by, sp.bw, sp.bh, sp.s);
     let mut off = sp.off;
+    let mut handed_back = 0usize;
     {
         let saved = &sp.saved;
         for_each_sprite_pixel(bx, by, bw, bh, s, |x, y, color, i| {
             if off.get(i) || !in_any(boxes, x, y) {
                 return;
             }
+            handed_back += 1;
             // Same colour guard as the full undraw, and for the same reason: a pixel another painter
             // has already taken is theirs, and putting our saved value back would be the stale
             // restore. The bit is set either way — guarded or not, this pixel is no longer ours.
@@ -581,7 +679,7 @@ fn undraw_within_locked(
     }
     sp.off = off;
     flush_box(&fb, by, bh);
-    Some((bx, by, bw, bh))
+    (Some((bx, by, bw, bh)), handed_back)
 }
 
 /// WC-I — the sprite's CURRENT panel box, or `None` when it is not on the panel.
@@ -740,6 +838,11 @@ fn refresh_locked(
 struct Overlay {
     /// CURSOR-4 — a pass owns the overlay from [`overlay_open`] to [`adopt_overlay`].
     session: bool,
+    /// CURSOR-5 — the core the owning pass runs on. Diagnostic only: it exists so
+    /// [`note_drain_undraw`] can tell "this pass is mid-session" (a defect) from "another core is
+    /// mid-session" (the VUGPAR steady state), which the session flag alone cannot. Nothing in the
+    /// mechanism reads it.
+    owner_cpu: usize,
     /// The sprite generation the session was opened at (see [`Sprite::epoch`]).
     epoch: u64,
     bx: usize,
@@ -780,6 +883,7 @@ pub struct Composed {
 /// guard; [`compose_into`] takes only this one. No cycle exists and none may be introduced.
 static OVERLAY: Mutex<Overlay> = Mutex::new(Overlay {
     session: false,
+    owner_cpu: 0,
     epoch: 0,
     bx: 0,
     by: 0,
@@ -806,6 +910,7 @@ pub fn overlay_open(plan: &Plan) -> bool {
         return false;
     }
     ov.session = true;
+    ov.owner_cpu = crate::arch::sched::meter_current_cpu();
     ov.epoch = plan.epoch;
     ov.bx = plan.bx;
     ov.by = plan.by;

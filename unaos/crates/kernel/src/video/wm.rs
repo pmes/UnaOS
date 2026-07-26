@@ -1249,7 +1249,11 @@ fn composite_inner() -> CursorTail {
                 // skips the pixels the mask handed back (their `saved` is stale by construction) and
                 // restores the rest, then `draw_locked` re-establishes the whole sprite from the
                 // finished front, where every pixel now holds whichever painter's content is final.
-                super::cursor::undraw_within(&paint[..npaint]);
+                // CURSOR-5 lens MUST-FIX 1 — the SESSIONLESS entry point, not `undraw_within`. A
+                // pixel handed back here has changed owner behind the session-holder's back, and
+                // only a generation bump tells it so; see `cursor::undraw_within_nosession` for the
+                // interleave that proves the distinction is not cosmetic.
+                super::cursor::undraw_within_nosession(&paint[..npaint]);
                 #[cfg(feature = "witness")]
                 {
                     CUR3_DECL_LOCK.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -1901,6 +1905,13 @@ static CUR3_DECL_LOCK: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomi
 #[cfg(feature = "witness")]
 static CUR3_DECL_BUDGET: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// CURSOR-5 (lens NOTE 4) — offers declined because the plan's generation no longer described the
+/// live sprite. A fourth decline class, and it must be VISIBLE here rather than only in `[cursor5]`:
+/// `offers - taken` is the number a reader reconciles the breakdown against, and a class missing from
+/// it reads as an unexplained gap in the mechanism instead of as the absorbed race it is.
+#[cfg(feature = "witness")]
+static CUR3_DECL_STALE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// CURSOR-3 — record one overlay offer and whether the layer took it. Called from `stage_window`,
 /// which is inside the `BlitGuard` window: relaxed atomics only, no lock, no allocation, no serial.
 ///
@@ -1919,6 +1930,9 @@ fn note_cursor_overlay(c: &super::cursor::Composed) {
     }
     if c.locked {
         CUR3_DECL_LOCK.fetch_add(1, Relaxed);
+    }
+    if c.stale {
+        CUR3_DECL_STALE.fetch_add(1, Relaxed);
     }
 }
 
@@ -1991,6 +2005,7 @@ fn cursor3_rollup(scope: &str) {
     let straddle = CUR3_DECL_STRADDLE.load(Relaxed);
     let lock = CUR3_DECL_LOCK.load(Relaxed);
     let budget = CUR3_DECL_BUDGET.load(Relaxed);
+    let stale = CUR3_DECL_STALE.load(Relaxed);
     // `taken > offers` would mean an overlay landed without being offered — a wiring defect, and the
     // only outcome here that is a defect rather than an absence of evidence.
     //
@@ -2008,8 +2023,8 @@ fn cursor3_rollup(scope: &str) {
         "COMPOSED"
     };
     serial_println!(
-        "[cursor3] rollup scope={} planned={} offers={} taken={} adopt={} repaint={} ensure={} straddle={} lock={} budget={} -> {}",
-        scope, planned, offers, taken, adopt, repaint, ensure, straddle, lock, budget, verdict
+        "[cursor3] rollup scope={} planned={} offers={} taken={} adopt={} repaint={} ensure={} straddle={} lock={} budget={} stale={} -> {}",
+        scope, planned, offers, taken, adopt, repaint, ensure, straddle, lock, budget, stale, verdict
     );
     // CURSOR-5 — the coherence residual, immediately after the decline breakdown so a bench capture
     // shows "how often the mechanism ran" and "what it cost when it raced" as one block.

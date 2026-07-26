@@ -2971,11 +2971,24 @@ window. Rare, load-dependent, pointer-dependent: *here and there, if you tweak t
   are not this pass: `wm::erase` on another core, and `repaint` from the render task. `cursor::EPOCH`
   mirrors `Sprite::epoch` into an `AtomicU64`, bumped by the one `bump_epoch` helper every existing
   bump now routes through, and `compose_into` compares `live_epoch()` against `plan.epoch` with a
-  relaxed load — no wait, no wait-set entry, no ordering obligation beyond "a stale read is a
-  conservative read". A mismatch declines the compose *totally*: nothing is written to the layer, and
+  `Acquire` load — no wait and no entry in the drain barrier's wait set. A mismatch declines the
+  compose *totally*: nothing is written to the layer, and
   the coverage bits inside this window's box are cleared so the tail repaints those pixels from the
   finished front. That is CURSOR-3's fallback for one window, which is always available and always
   correct.
+
+  **What the generation check is not.** An earlier draft of this section claimed "a stale read is a
+  conservative read". That is false, and the falsity matters: the failure mode is not a reader seeing
+  a value that is too new, it is a reader seeing an OLD value that still equals `plan.epoch` — exactly
+  the retired plan the check exists to reject, waved through. The check **narrows** the window between
+  a retiring undraw and a compose; it does not close it, and no lock-free test of a concurrently
+  changing value could. What closes the residual is the layer behind it, which was always there:
+  `adopt_overlay` re-checks `ov.epoch == sp.epoch` with the sprite lock *held*, so a compose that
+  slipped through is caught at the tail and settled by a whole-sprite `refresh_locked` rather than by
+  an install. The check turns a certainty into a race; the tail turns the race into a repaint;
+  `selfsave` is what would show the residual actually biting. The store is `Release` and the load
+  `Acquire` because the thing a reader must not reorder against the generation is the undraw's *pixel
+  writes* — the ordering does real work even though the value itself is advisory.
 
 #### Mechanism B — the spottiness: the lock class took the whole sprite down
 
@@ -2990,6 +3003,28 @@ pass* overwrites it, or the save-under goes stale — and `paint` is already the
 exactly those extents. That argument is independent of who owns the overlay, so the mask applies to
 the sessionless path too: pixels this pass can reach come down, pixels it provably cannot stay on the
 panel. **WC-L's shape, exactly — defer the sprite operation, never drop the sprite.**
+
+**The sessionless mask is a different operation from the session owner's, and the first cut missed
+it.** CURSOR-5's initial commit routed the declining pass straight into `undraw_within`, on the
+argument that the mask's justification is independent of who owns the session. The *pixel* argument is
+sound; the *bookkeeping* one is not, and the gap reintroduced both P64 symptoms on the new path.
+Pass A owns the session and has composed and presented sprite pixel `P`; pass B mask-undraws `P`, the
+colour guard passes (the panel really does hold the sprite's colour there — A just put it there), and
+B writes its OWN stale `saved[P]` into A's window rect: **the flash**. `undraw_within_locked` does not
+bump the generation, so A's `adopt_overlay` still finds its session coherent, installs `ov.saved[P]`
+over B's damage and clears the off bit — the module now believes the sprite is on the panel where B
+has painted something else: **the hole**. CURSOR-3 and CURSOR-4 were immune only by accident, because
+their decline branch took a full undraw, which bumps.
+
+So the sessionless path is its own entry point, `cursor::undraw_within_nosession`, and it bumps the
+generation whenever it actually hands a pixel back. Any such pixel has changed owner behind the
+session-holder's back, and the generation is precisely the channel that says so: A's `compose_into`
+then declines, A's `adopt_overlay` goes incoherent, and A's tail is the whole-sprite refresh —
+CURSOR-3's already-proven fallback, now bought on purpose and only when a pixel really moved. The bump
+is conditional rather than unconditional because the common case is a pass whose paint set never meets
+the sprite, and a pass that hands nothing back has not disturbed anyone's premise. Clearing the open
+session's coverage bits instead was rejected as strictly weaker: it repairs the hole but leaves B's
+stale pixel inside A's window rect, since A would repaint `P` from the front where that value sits.
 
 The tail stays `Repaint`, not `Adopt`: no session means no coverage to install, and `refresh_locked`
 settles both classes in one acquisition — `undraw_locked` skips the pixels the mask handed back (their
@@ -3028,6 +3063,17 @@ Printed immediately after `[cursor3]`'s rollup, same scopes, same harness, so a 
   the bracket. It is the one line item that reads as a defect rather than as load, and the verdict says
   `REGRESSED` on it. The spec `FORBID`s both the verdict and the field.
 
+  The invariant it guards is **per-pass**, and scoping it correctly is what keeps it from lying. The
+  first cut tested the global session flag and counted a contended `try_lock` as busy — so a healthy
+  metal boot, where another core is legitimately mid-session while this one drains (the VUGPAR steady
+  state this whole arc is about), would have driven the counter up and reported `REGRESSED`. A false
+  red costs Peter a bench boot chasing a bug that is not there, which is worse than no counter at all.
+  The test is therefore scoped to the core that *opened* the session: a pass composites on one core and
+  its drain is on that same core, so "the open session belongs to this core" is exactly "this pass is
+  mid-session", and nothing wider. Cross-core sessions are invisible here by construction and correctly
+  so — they are absorbed by the generation check and counted as `stale_compose`, where they read as
+  load. `Overlay::owner_cpu` is diagnostic only; nothing in the mechanism reads it.
+
 Verdicts: `REGRESSED` (drain in session), `UNWITNESSED` (the sprite was never armed — QEMU, always),
 `RESIDUAL` (`selfsave > 0`), `COHERENT` otherwise.
 
@@ -3036,9 +3082,14 @@ Verdicts: `REGRESSED` (drain in session), `UNWITNESSED` (the sprite was never ar
 `./arroyo kernel8-test 90` — **82/82 required witnesses, 0 forbidden**, 2192 lines scanned:
 
 ```
-[cursor3] rollup scope=fixture planned=0 offers=0 taken=0 adopt=0 repaint=1 ensure=348 straddle=0 lock=0 budget=0 -> UNWITNESSED
+[cursor3] rollup scope=fixture planned=0 offers=0 taken=0 adopt=0 repaint=1 ensure=348 straddle=0 lock=0 budget=0 stale=0 -> UNWITNESSED
 [cursor5] rollup scope=fixture stale_compose=0 adopt_incoh=0 selfsave=0 masked_nosession=0 drain_insession=0 -> UNWITNESSED
 ```
+
+`[cursor3]`'s rollup gains a fourth decline bucket, `stale=`, fed by `Composed::stale`. A generation
+decline is a real class and `offers - taken` is the number a reader reconciles the breakdown against,
+so leaving it visible only in `[cursor5]` would have read as an unexplained gap in the mechanism
+rather than as the absorbed race it is.
 
 `./arroyo check`: both arches clean. `./arroyo kernel8`: clean.
 

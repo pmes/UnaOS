@@ -490,7 +490,7 @@ FORBID \[wc-h\] .*-> UNSTAGED
 # --- CURSOR-3 — overlay-present path (printed alongside [wc-i], witness-feature only) ----------
 #     The rollup reports the sprite mechanism across composite passes: UNWITNESSED on QEMU (no
 #     pointer), COMPOSED on metal (overlay taken). See docs/dev/OS/08_VIDEO/engine.md §CURSOR-3.
-REQUIRE \[cursor3\] rollup scope=.* planned=.* offers=.* taken=.* adopt=.* repaint=.* ensure=.* ->
+REQUIRE \[cursor3\] rollup scope=.* planned=.* offers=.* taken=.* adopt=.* repaint=.* ensure=.* stale=.* ->
 
 # --- CURSOR-5 — sprite/compositor coherence residual (printed right after [cursor3]'s rollup) ---
 #     P64 (attended): "mouse still spotty [over vug] and causes a flash in the vug display here and
@@ -501,8 +501,11 @@ REQUIRE \[cursor3\] rollup scope=.* planned=.* offers=.* taken=.* adopt=.* repai
 #     bracket and gave `compose_into` a lock-free generation check.
 #
 #     `drain_insession` is the direct detector for the ordering and must stay 0 — a non-zero count
-#     means someone put the drain back inside the bracket. UNWITNESSED on QEMU (no HID pointer, so
-#     the sprite is never drawn); COHERENT/RESIDUAL on metal.
+#     means someone put the drain back inside the bracket. It is scoped to the core that OPENED the
+#     session, so the VUGPAR steady state (another core legitimately mid-session while this one
+#     drains) does not trip it; that case is absorbed by the generation check and shows up as
+#     `stale_compose` instead. UNWITNESSED on QEMU (no HID pointer, so the sprite is never drawn);
+#     COHERENT/RESIDUAL on metal.
 #     See docs/dev/OS/08_VIDEO/engine.md §CURSOR-5.
 REQUIRE \[cursor5\] rollup scope=.* stale_compose=.* adopt_incoh=.* selfsave=.* masked_nosession=.* drain_insession=.* ->
 FORBID \[cursor5\] .*-> REGRESSED
