@@ -1965,6 +1965,49 @@ click nor desynchronize the edge state.
 no EHCI HID controller, so **no** QEMU gate can exercise this branch — QEMU proves non-regression only.
 The click behaviour is a **metal-only** verdict, taken at the attended rMBP sitting.
 
+### 10f-bis. CLICK-3 — the second stationary click (s41 metal defect)
+
+**Observed (s41, Peter at the trackpad).** *Click, pause, click* loses the second click; *click, slide,
+click* works. Motion between two presses is what makes the second one register.
+
+**Traced end to end, and the loss is BEFORE `push_event`.** `pal::push_event` and `EventQueue`
+(`pal.rs`) are a plain ring with drop accounting — no dedup, no single-slot latch — and the consumers act
+on every `Button` they see (`vug::drain_input` exits on any `Button`; the x86 console loop has no
+`Button` arm at all). So the only state on the whole path that both gates a click **and** is cleared by
+pointer *motion* is `IntEp::prev_buttons`: a motion report carries `buttons == 0x00`, which resets the
+latch. That is exactly the observed asymmetry.
+
+**Why the latch goes stale.** The interrupt endpoint is armed for **one** report per service pass, and
+`service_ehci_hid` is polled from the console frame loop (`main.rs`) — i.e. at frame rate, orders of
+magnitude slower than the endpoint interval. A HID report is a **level** (the current button state), so a
+release landing in the gap between two polls is superseded by whatever the pad reports next. Miss one
+release and `prev_buttons` stays latched at `0x01` for the rest of the boot; every subsequent *stationary*
+press then fails the §10f edge test, while any motion at all clears it.
+
+**Fix (`IntEp::note_buttons`, drivers/ehci/mod.rs).** The §10f edge test is kept and a **re-press
+recovery** added that reads the *silence between reports*. A held button either re-reports at the
+endpoint's rate (consecutive pressed reports far closer together than `CLICK_REPRESS_QUIET_MS` = 120 ms)
+or reports nothing until release (no pressed report during the hold). Neither can produce a pressed
+report separated from the previous report by a long quiet gap — a **new press after a missed release**
+always is. So a report that still reads "primary down" after ≥ 120 ms of endpoint silence is treated as a
+new press. No held-button case gains a spurious repeat, the release/hold emit contract is unchanged, and
+the EHCI transfer machinery is untouched. All three EHCI pointer paths (trackpad `0x02`, parsed
+report-pointer, boot mouse) now share this one decision.
+
+**Witness (`UNAOS_USBDEBUG=1` only).** Presses observed at parse vs `Button` events delivered, plus how
+many deliveries only the recovery caught (i.e. clicks silently lost before this arc):
+
+```
+:: PTR: [i] press seen=N delivered=M recovered=K (re-press after quiet gap) == witness ::
+```
+
+`recovered > 0` on an attended boot is direct proof of the defect and of the fix. The §10f per-press line
+still prints unchanged beside it.
+
+**QEMU vs metal.** As with §10f: QEMU has no EHCI HID controller, so the gates prove non-regression only
+(`check` both arches, knob-on and knob-off; `./arroyo test` — QEMU HID pointer still enumerates and
+moves). The click behaviour remains a metal-only verdict.
+
 ### 10g. IVY MT-INVESTIGATION — where does true multitouch actually live? (`UNAOS_MTRAW`)
 
 §10e refuted the "descriptor-advertised 0x44 / 511-byte frame streams as-is" model: 736+ observed

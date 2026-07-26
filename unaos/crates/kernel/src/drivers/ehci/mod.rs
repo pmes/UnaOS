@@ -113,6 +113,10 @@ struct IntEp {
     /// CLICK-1: previous report's button bitmask, for button-DOWN edge detection (one
     /// `pal::Event::Button` per press, nothing on release/hold).
     prev_buttons: u8,
+    /// CLICK-3: `arch::ms()` at the previous report consumed on THIS endpoint (any report — motion,
+    /// button, or idle keep-alive). The re-press recovery below reads the SILENCE between reports,
+    /// so it must be stamped by every report, not only by button ones. 0 = no report yet.
+    last_report_ms: u64,
     /// MT-INVESTIGATION (IVY, `mtraw` only): bytes ONE armed transfer may accept — `mps` for every
     /// endpoint except the vendor-multitouch one, which is armed for the whole (grown) receive
     /// buffer so the controller accumulates a >MPS raw frame into it. See `arm_interrupt_ep`.
@@ -123,6 +127,98 @@ struct IntEp {
     /// touching frame and again on finger-up, so a lift never emits a jump.
     #[cfg(feature = "mtraw_inject")]
     mt_prev: Option<(i32, i32)>,
+}
+
+// ======================================================================================
+// CLICK-3 — "a second stationary click is ignored" (metal, s41 rMBP; Peter at the trackpad:
+// *click, pause, click* loses the second click, while *click, slide, click* works).
+//
+// MECHANISM (traced end to end; the loss is BEFORE `push_event`):
+//   * parse: the pointer paths below emit `pal::Event::Button` on a button-DOWN EDGE only —
+//     `buttons & 0x01 != 0 && prev_buttons & 0x01 == 0` — with `prev_buttons` carried per endpoint.
+//   * `pal::push_event` / `EventQueue` have NO dedup and NO single-slot latch (pal.rs push/pop are a
+//     plain ring with drop accounting), and the consumers act on every Button they see
+//     (`vug::drain_input` exits on any Button; the x86 console loop ignores Button entirely).
+//   * So the only state anywhere on the path that (a) gates a click and (b) is cleared by POINTER
+//     MOTION is `prev_buttons`: a motion report carries `buttons == 0x00`, which resets the latch.
+//     That is exactly the observed asymmetry.
+//
+// WHY THE LATCH GOES STALE: the interrupt endpoint is armed for ONE report per service pass, and
+// `service_ehci_hid` is polled from the console frame loop (main.rs) — i.e. at frame rate, orders of
+// magnitude slower than the endpoint's interval. A report is a LEVEL (the current button state), so
+// a release that lands in the gap between two polls is superseded by whatever the pad reports next:
+// miss the release and `prev_buttons` stays latched at 0x01 forever, and every subsequent stationary
+// press fails the edge test. Any motion at all clears it — hence "slide to register a click".
+//
+// FIX (consumer-side of the transfer machinery; the EHCI transfer path itself is untouched): keep
+// the edge test, and ADD a re-press recovery that reads the SILENCE between reports. A held button
+// either re-reports at the endpoint's rate (so consecutive pressed reports arrive far closer than
+// `CLICK_REPRESS_QUIET_MS`) or reports nothing at all until release (so no pressed report arrives
+// during the hold). Neither can produce a pressed report separated from the previous report by a
+// long quiet gap — but a *new press after a missed release* always is. So: a report that still reads
+// "primary down" after ≥ `CLICK_REPRESS_QUIET_MS` of endpoint silence is a NEW press. No protection
+// is weakened and no held-button case gains a spurious repeat.
+// ======================================================================================
+
+/// CLICK-3 — endpoint silence (ms) after which a still-pressed report counts as a NEW press rather
+/// than a hold. Sits well above any plausible poll interval for this path (the console frame loop
+/// services EHCI HID every frame, tens of ms at worst) and well below the human gap in a
+/// click-pause-click (hundreds of ms), so it cannot alias either case into the other.
+const CLICK_REPRESS_QUIET_MS: u64 = 120;
+
+/// CLICK-3 witness counters (usbdebug builds only) — presses OBSERVED at parse vs Button events
+/// DELIVERED to the event queue, plus how many of those deliveries only the re-press recovery
+/// caught (i.e. clicks that were silently lost before this arc). Read via the `:: PTR:` line.
+#[cfg(feature = "usbdebug")]
+static PTR_PRESS_SEEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "usbdebug")]
+static PTR_PRESS_DELIVERED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "usbdebug")]
+static PTR_PRESS_RECOVERED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+impl IntEp {
+    /// CLICK-3 — the ONE button-transition decision every EHCI pointer path shares (trackpad 0x02,
+    /// parsed report-pointer, boot mouse). Stamps the report clock, decides whether this report is a
+    /// primary-button PRESS, and updates `prev_buttons`. Returns `true` when the caller owes exactly
+    /// one `pal::Event::Button`. Release and hold return `false` — the emit contract is unchanged.
+    fn note_buttons(&mut self, buttons: u8, idx: usize) -> bool {
+        let now = crate::arch::ms();
+        let prev = self.prev_buttons;
+        // Silence since the PREVIOUS report on this endpoint (before this one is stamped). `== 0`
+        // means "no previous report", which cannot be a re-press.
+        let quiet = self.last_report_ms != 0
+            && now.wrapping_sub(self.last_report_ms) >= CLICK_REPRESS_QUIET_MS;
+        self.last_report_ms = now;
+        self.prev_buttons = buttons;
+        let down = buttons & 0x01 != 0;
+        let edge = down && prev & 0x01 == 0;
+        // The recovery arm: still down, was down, and the endpoint was silent across the gap.
+        let repress = down && prev & 0x01 != 0 && quiet;
+        #[cfg(feature = "usbdebug")]
+        {
+            use core::sync::atomic::Ordering::Relaxed;
+            if down {
+                PTR_PRESS_SEEN.fetch_add(1, Relaxed);
+            }
+            if edge || repress {
+                PTR_PRESS_DELIVERED.fetch_add(1, Relaxed);
+                if repress {
+                    PTR_PRESS_RECOVERED.fetch_add(1, Relaxed);
+                }
+                serial_println!(
+                    ":: PTR: [{}] press seen={} delivered={} recovered={} ({}) == witness ::",
+                    idx,
+                    PTR_PRESS_SEEN.load(Relaxed),
+                    PTR_PRESS_DELIVERED.load(Relaxed),
+                    PTR_PRESS_RECOVERED.load(Relaxed),
+                    if repress { "re-press after quiet gap" } else { "down edge" },
+                );
+            }
+        }
+        #[cfg(not(feature = "usbdebug"))]
+        let _ = idx;
+        edge || repress
+    }
 }
 
 /// EHCI-4 M2 — the minimal field map a HID **pointer** report exposes, extracted by
@@ -1362,6 +1458,7 @@ impl Controller {
             reports: 0,
             dead: false,
             prev_buttons: 0,
+            last_report_ms: 0,
             #[cfg(feature = "mtraw")]
             rx_total,
             #[cfg(feature = "mtraw_inject")]
@@ -1498,14 +1595,16 @@ impl Controller {
                             // edge (0x00 -> 0x01 on this pad) — the click observable: a click
                             // while vug/pulse runs exits the demo like a keystroke. Release
                             // emits nothing. Serial line per press (human-rate, bounded).
-                            if buttons & 0x01 != 0 && e.prev_buttons & 0x01 == 0 {
+                            // CLICK-3: the edge test plus re-press recovery (see `note_buttons`) —
+                            // this is the path the rMBP internal trackpad takes, and the one where
+                            // the stale latch swallowed every stationary second click.
+                            if e.note_buttons(buttons, idx) {
                                 crate::pal::push_event(crate::pal::Event::Button(buttons));
                                 serial_println!(
                                     ":: EHCI-HID: [{}] trackpad click (button-down edge, buttons={:#04x}) == witness ::",
                                     idx, buttons
                                 );
                             }
-                            e.prev_buttons = buttons;
                         }
                     } else {
                         // M2 report-pointer path: decode X/Y/buttons from the parsed field map.
@@ -1522,10 +1621,9 @@ impl Controller {
                         // CLICK-1: primary-button DOWN edge → one Button event (same semantic as
                         // the trackpad path above).
                         let btn = (buttons & 0xFF) as u8;
-                        if btn & 0x01 != 0 && e.prev_buttons & 0x01 == 0 {
+                        if e.note_buttons(btn, idx) {
                             crate::pal::push_event(crate::pal::Event::Button(btn));
                         }
-                        e.prev_buttons = btn;
                         if e.reports == 1 || e.reports % 32 == 0 {
                             serial_println!(
                                 ":: EHCI-HID: [{}] report-pointer {} reports, last {} x={} y={} buttons={:#04x} fingers={} == witness ::",
@@ -1549,10 +1647,9 @@ impl Controller {
                         crate::pal::push_event(crate::pal::Event::Mouse { x: dx, y: dy });
                     }
                     // CLICK-1: boot-mouse buttons live in report[0]; primary DOWN edge → Button.
-                    if report[0] & 0x01 != 0 && e.prev_buttons & 0x01 == 0 {
+                    if e.note_buttons(report[0], idx) {
                         crate::pal::push_event(crate::pal::Event::Button(report[0]));
                     }
-                    e.prev_buttons = report[0];
                     if e.reports == 1 || e.reports % 32 == 0 {
                         serial_println!(
                             ":: EHCI-HID: [{}] mouse {} reports, last dx={} dy={} buttons={:#04x} == witness ::",
