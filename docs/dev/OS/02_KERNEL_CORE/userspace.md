@@ -1786,7 +1786,16 @@
   - **Foreground (`run`, and every fixture/battery launch): the bounded budget STAYS.** Gate liveness
     depends on a vug that terminates and the batteries drive foreground launches, so nothing that could
     hang `kernel8-test` was relaxed. When that exit is taken the reason now names its own cause:
-    `:: UVUG: interactive exit=frames (budget, fixture mode) frames=<n> ::`.
+    `:: UVUG: interactive exit=frames_budget frames=<n> (fixture mode) ::`. The reason is deliberately a
+    **single bare token** — bench parsing reads `exit=(\w+)`, so the prose qualifier rides outside every
+    parsed field rather than inside the `exit=` one.
+
+  **Qualifying clause on "detached ⇒ unbounded":** the waiver depends on `set_detached`/`is_detached`,
+  whose backing store is a **64-bit ASID bitmask**; ASIDs ≥ 64 are silently ignored and read back as *not
+  detached*, so such a vug would still die at the cap. This is **unreachable today** — `boot::USER_SLOTS`
+  = 8 and ASID = slot + 1, so ASID ≤ 8 — and a `debug_assert!(asid < 64)` in `set_detached` now pins that
+  relationship, so widening the slot table past 63 without widening the mask trips in debug rather than
+  silently un-waiving desktop vugs.
 
   **Untouched by construction:** the deterministic auto path (`AUTO_FRAMES` = 300 and the checksum
   witness), UVUG-8's takeover/deadline logic, and the `EL0_FOCUSED_PRESENT_COUNT` cap. **Gates:**

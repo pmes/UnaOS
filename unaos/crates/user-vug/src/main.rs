@@ -79,7 +79,8 @@
 //   * FOREGROUND (`run`, and every fixture/battery launch — `uvug_witness`, BGRUN-ST): the bounded
 //     budget STAYS. Gate liveness depends on a vug that terminates, and a foreground run is exactly
 //     what the batteries drive. When that exit is taken it now says
-//     `exit=frames (budget, fixture mode)`, so no future sitting re-diagnoses this as a crash.
+//     `exit=frames_budget frames=<n> (fixture mode)` — a single bare token in the parsed field, the
+//     prose qualifier outside it — so no future sitting re-diagnoses this as a crash.
 // The deterministic AUTO path (AUTO_FRAMES = 300, the checksum witness) is untouched in both modes.
 //
 // Barrier direction split (deliberate, robust under QEMU raspi4b's lack of a Group-1 timer IRQ — see
@@ -1024,13 +1025,19 @@ pub extern "C" fn _start() -> ! {
         // VUGLIFE: the `frames` spelling now names its own cause. Post-arc it can only be reached by a
         // FOREGROUND (fixture/battery) run — a detached desktop vug waives the budget instead — so the
         // line says so, and the next sitting that meets it need not re-derive that this was designed.
+        // The reason stays a SINGLE BARE TOKEN (`frames_budget`, not `frames (budget, …)`): the bench
+        // parses this line with `exit=(\w+)`, and spaces or parens inside the field would break it. The
+        // human-readable qualifier therefore rides AFTER `frames=<n>`, outside every parsed field.
         buf.put(if exit_key {
             b"key" as &[u8]
         } else {
-            b"frames (budget, fixture mode)"
+            b"frames_budget"
         });
         buf.put(b" frames=");
         buf.put_dec(frame);
+        if !exit_key {
+            buf.put(b" (fixture mode)");
+        }
         buf.put(b" ::\n");
     } else {
         let cksum = surface_checksum(surf);

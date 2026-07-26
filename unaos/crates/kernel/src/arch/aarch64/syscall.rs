@@ -10774,6 +10774,15 @@ static DETACHED_ASIDS: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomi
 /// are ignored (the process table is far smaller; this is a bound, not an expected case), which fails in
 /// the safe direction: an unrepresentable ASID simply reads back "not detached" — the current behaviour.
 fn set_detached(asid: u64, on: bool) {
+    // VUGLIFE: the silent no-op above 63 is now load-bearing for USER-VISIBLE behaviour, not just for
+    // `jobs` bookkeeping — a vug reads this bit to decide whether its interactive frame budget is waived,
+    // so an unrepresentable ASID would give the operator a desktop vug that still dies at the cap. It is
+    // unreachable today (`boot::USER_SLOTS` = 8, ASID = slot + 1, so ASID <= 8) and the assert pins that
+    // relationship: if the slot table is ever widened past 63, this bitmask must widen with it.
+    debug_assert!(
+        asid < 64,
+        "VUG-BG detached bitmask is 64-wide; USER_SLOTS grew past it"
+    );
     if asid == 0 || asid >= 64 {
         return;
     }
