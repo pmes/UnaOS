@@ -1023,6 +1023,8 @@ fn spawn_user_inner(
 ) -> u64 {
     let cpu = pick_cpu(requested_cpu);
     assert!(cpu < NUM_CPUS, "spawn_user: cpu out of range");
+    // BG-SPREAD witness aid — record the decision so the caller can read back where its task landed.
+    LAST_USER_PLACEMENT.store(cpu, Ordering::Release);
     let mut stack: Box<[u8]> = alloc::vec![0u8; TASK_STACK_SIZE].into_boxed_slice();
     let ctx_sp = build_initial_frame(&mut stack, user_task_trampoline);
     let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
@@ -1122,6 +1124,26 @@ pub fn spawn_user_thread(
     );
     poke_cpu(cpu);
     JoinHandle { done, id }
+}
+
+/// BG-SPREAD — the core chosen by the most recent EL0-SLOT spawn (`spawn_user_slot`). Witness aid
+/// only: it makes the placement decision readable by the caller that just made it, which the
+/// `pid`-returning signature cannot express. Read it IMMEDIATELY after your own `spawn_user_slot`
+/// call, from the same task — it is a single global, so an interleaved slot spawn on another core
+/// would overwrite it. Never a scheduling input; nothing reads it but the BGSPREAD witness.
+static LAST_USER_PLACEMENT: AtomicUsize = AtomicUsize::new(0);
+
+/// BG-SPREAD — read the core the last `spawn_user_slot` placed its task on. See
+/// [`LAST_USER_PLACEMENT`] for the (deliberately narrow) contract.
+pub fn last_user_placement() -> usize {
+    LAST_USER_PLACEMENT.load(Ordering::Acquire)
+}
+
+/// BG-SPREAD — how many cores are registered online + scheduling (the `CPU_AUTO` candidate set).
+/// Lets a witness skip honestly on a boot that brought up fewer cores than it needs to observe a
+/// spread (the metal 3-of-4-cores variance documented in the pi4 regression spec).
+pub fn online_cpu_count() -> usize {
+    (0..NUM_CPUS).filter(|&c| ONLINE_MASK[c].load(Ordering::Acquire)).count()
 }
 
 /// ELF-2 — pick an online scheduling core DIFFERENT from `not`, for placing a thread on a sibling core (the

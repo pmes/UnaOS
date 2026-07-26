@@ -1167,6 +1167,67 @@
     `arch/aarch64/sched.rs` (`orphan_kill`) + `arch/aarch64/syscall.rs` (the `SYS_EXIT` hook, the fixture
     and the leg) + the spec + this doc. QEMU-green ≠ correct: the metal confirmation rides the attended
     sitting, where the property to watch is the `SCHED: load` line after a vug is killed and relaunched.
+- **BG-SPREAD (this arc)** — the **stacked background parent**: every `bg` launch pinned its parent task to
+  the launcher's core, so background programs piled onto one core no matter how idle the rest of the machine
+  was. P62 was an attended sitting: four bg vugs, each visibly slower than the last, while
+  `SCHED: load c0=51 c1=99 c2=52 c3=0` stayed flat — c1 saturated, **c3 completely idle**.
+  - **The meter was right; the placement was the bug.** This is the inverse of P61. There, the load line was
+    accurate and the *process table* was blind; here the load line is accurate and there is nothing wrong
+    with it at all. The evidence was in the scheduler's own placement witness, which printed the same thing
+    for every launch: `:: SCHED: task 'bg-el0' -> core 1 (policy: caller-pinned EL0, no-migrate) ::`. Every
+    `bg` runs from the same shell context, so "the caller's core" is one fixed core for the whole boot.
+  - **The parents stacked; the workers never did.** A bg vug's ELF-2 worker threads already spread —
+    `SYS_THREAD_SPAWN`'s `place = 1` routes them through `sched::other_online_cpu`, the least-loaded
+    *sibling* core. Only the parent, the task that owns the address space and does the frame work, was
+    pinned. So the symptom was specifically that each new bg program slowed *the ones already running*.
+  - **Why the pin was there — inheritance, not intent.** BGRUN-1 built `spawn_user_image_bg` as a mirror of
+    `run_user_image`'s front half, and copied `let cpu = this_cpu()` with it. In `run_user_image` that line
+    is the sys_spawn **co-location invariant**: the foreground launcher blocks in a wait loop immediately
+    after the spawn, so putting the child on the caller's core guaranteed the child could not be dispatched
+    until the parent yielded — which is what made the pre-EXEC1-M publish order safe. **Neither half of that
+    rationale survives in `bg`.** `bg` does not wait (it returns to the shell at once, so there is no yield
+    to sequence against), and EXEC1-M had already removed the dependence on co-location by publishing the
+    ASID *before* the spawn: the `SYS_EXIT` rescue arm (`proc_find_unpublished`, keyed off the exiting task's
+    live `TTBR0_EL1`) covers a child that runs to completion on another core before the `pid` store lands.
+    The pin bought nothing and cost the entire spread.
+  - **Fix: `CPU_AUTO`.** `spawn_user_image_bg` now passes the SCHED-3 sentinel instead of `this_cpu()`, so
+    `pick_cpu` places the parent on the **least-loaded online core** — minimum ready-queue depth, then the
+    lower rolling-window busy fraction, then a rotating cursor so equal-load cores fill round-robin. This is
+    the same discipline the orphan-reaper (SCHED-3b) and the ELF-2 worker threads already use; nothing new
+    was invented. **Spreading happens at SPAWN only.** Placement is still decided exactly once and the task
+    is still `steal_ok: false` — EL0 slots carry per-core TTBR0/ASID state, so they remain no-migrate. The
+    foreground `run` path deliberately keeps `this_cpu()`: its co-location invariant is real.
+  - **No interaction with SPINHUNT or KILLBOUND**, checked rather than assumed. SPINHUNT's orphan reaping is
+    keyed on the **ASID** (`orphan_kill(asid)`, `asid_live_threads`, the `SLOT_REFCOUNT` 1→0 edge) and its
+    kill requests are matched at each task's own next boundary on whatever core it sits on; KILLBOUND's
+    quiescence witness is likewise ASID-scoped (`ASID_GEN[owner]` bumped only at teardown) and its
+    `kill_wake_parked` sweep walks the futex buckets globally. Neither reads a core index, so a bg parent
+    that starts on a different core changes nothing either of them observes — and both legs pass unchanged
+    in the gate below.
+  - **Witness: `BGRUN-ST` leg 0c / `:: BGSPREAD: …`,** `+1` spec REQUIRE and `+1` FORBID (77 → 78). The
+    single-launch legs structurally cannot catch this: stacking is a relationship *between* launches, and a
+    spec REQUIRE matches one line at a time and cannot count distinct cores across several. The leg launches
+    **3** copies of a new in-kernel flat fixture (KILLBOUND with the threads removed: zero one futex word and
+    park on it forever — no `SYS_THREAD_SPAWN`, so three concurrent copies cannot exhaust the eight-row
+    `THREAD_TABLE` and no worker's own spread muddies a witness whose subject is the parent), records each
+    parent's core from `sched::last_user_placement()`, then kills and reaps all three so the process table is
+    left as it was found. The assertion is **`distinct >= 2`**, not `== 3`: a load-balanced policy may
+    legally reuse a core when it is genuinely still the least loaded, and `== 3` would make a correct
+    scheduler flap.
+  - **Verified to have teeth (A/B).** Reverting the one-line placement change and nothing else, the leg
+    reports `launched=3/3 distinct=1 settled=3 -> FAIL` and the gate drops to **77/78 with 3 forbidden hits**
+    (all three the same line, matched by the generic `-> FAIL` FORBIDs). `distinct=1` there is not luck: all
+    three launches run from one witness task on one core, so co-location can only ever produce 1. With the
+    fix the same run reports `3 bg launches over 4 online cores -> cores 0,0,1 distinct=2 PASS` — core 0 is
+    the idle BSP under QEMU raspi4b (render is on core 1, input on core 3), so "least loaded" correctly
+    prefers it, which is the policy working rather than a new pin.
+  - Gates: `./arroyo check` green x86_64 + aarch64; `UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test 90`
+    → **78/78 required witnesses, 0 forbidden**; `./arroyo test-arm` MISSION SUCCESS. Lane:
+    `arch/aarch64/syscall.rs` (the placement one-liner, the fixture and the leg) +
+    `arch/aarch64/sched.rs` (`last_user_placement` / `online_cpu_count`, witness aids only) + the spec + this
+    doc. QEMU-green ≠ correct: the metal confirmation rides the attended sitting, where the property to watch
+    is the `SCHED: task 'bg-el0' -> core N` lines across several `bg` launches — and then whether the fourth
+    bg vug still slows the first three.
 - **KILLBOUND (this arc)** — the **unkillable parked task**, and the two bounded tables it wedged. P60 was
   an attended sitting on a real Pi 4, and the failure was reached by hand, not by a fixture: after several
   `bg` vug launches and kills, `kill <pid>` stopped working. The shell printed `kill armed but unconfirmed`

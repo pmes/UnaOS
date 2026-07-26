@@ -636,3 +636,27 @@ REQUIRE \[spinhunt\] load orphan-window\(leader gone\)
 REQUIRE \[spinhunt\] load settled
 REQUIRE SPINHUNT: leader exited status=0 with 2 un-joined yield-polling workers .* drained to 0 live tasks PASS
 FORBID SPINHUNT: .*-> FAIL
+# --- BG-SPREAD: `bg` parents must be PLACED by load, not stacked on the launcher's core.
+# ---
+# ---    P62 (attended): four bg vugs, each visibly slower than the last, while the `SCHED: load` row
+# ---    stayed flat at c0=51 c1=99 c2=52 c3=0. The meter was right and nothing in it was the bug:
+# ---    every launch printed `SCHED: task 'bg-el0' -> core 1 (policy: caller-pinned EL0, no-migrate)`,
+# ---    so all four parents shared one core's 100% while c3 idled. Their ELF-2 worker threads already
+# ---    spread (`other_online_cpu`); only the parents piled up.
+# ---
+# ---    CAUSE: `spawn_user_image_bg` inherited `this_cpu()` verbatim from `run_user_image`, where it
+# ---    is the sys_spawn CO-LOCATION invariant (the FOREGROUND launcher blocks right after the spawn,
+# ---    so the child cannot be dispatched until the parent yields). `bg` does not wait, and EXEC1-M
+# ---    already removed the dependence on co-location by publishing the ASID before the spawn — so
+# ---    the pin bought nothing and cost the whole spread. It is `CPU_AUTO` (the SCHED-3 least-loaded
+# ---    placement the orphan-reaper already uses) now. Placement is still decided ONCE, at spawn:
+# ---    EL0 slots stay no-migrate and non-steal-eligible.
+# ---
+# ---    The leg launches 3 parked, thread-free fixtures, records each parent's chosen core, and then
+# ---    kills + reaps all three (table left as found). `distinct >= 2` rather than `== 3`: a
+# ---    load-balanced policy may legally reuse a core, and `== 3` would make a correct scheduler flap.
+# ---    A/B: on the pre-arc code all three launches run from one witness task on one core, so
+# ---    `distinct` is 1 BY CONSTRUCTION and the leg fails on every boot; with CPU_AUTO the rotating
+# ---    tie-break in `pick_cpu` gives 2..=3. See docs/dev/OS/02_KERNEL_CORE/userspace.md BG-SPREAD.
+REQUIRE BGSPREAD: 3 bg launches over [0-9]+ online cores -> cores [0-9]+,[0-9]+,[0-9]+ distinct=[2-9] \(want >= 2\) PASS
+FORBID BGSPREAD: .*-> FAIL

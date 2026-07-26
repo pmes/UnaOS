@@ -7336,10 +7336,37 @@ pub fn spawn_user_image_bg(bytes: &[u8]) -> Result<(u64, u64, u64), &'static str
     // other `futex_init` caller ran; idempotent, cheap.
     super::sched::futex_init();
     install_console_cap(asid);
-    let cpu = super::percpu::this_cpu().cpu_index as usize;
+    // BG-SPREAD: place the bg parent on the LEAST-LOADED online core, not the launcher's.
+    //
+    // BGRUN-1 inherited `this_cpu()` verbatim from `run_user_image`, where it is the sys_spawn
+    // CO-LOCATION invariant: the FOREGROUND launcher blocks in a wait loop right after the spawn, so
+    // putting the child on the caller's core guarantees the child cannot be dispatched until the
+    // parent yields — which is what made the pre-EXEC1-M publish order safe. NEITHER half of that
+    // rationale survives here: `bg` does not wait (it returns to the shell immediately, so there is
+    // no yield to sequence against), and EXEC1-M already removed the dependence on co-location by
+    // publishing the ASID BEFORE the spawn — the SYS_EXIT rescue arm (`proc_find_unpublished`,
+    // keyed off the exiting task's live TTBR0_EL1) covers a child that runs to completion on another
+    // core before the `pid` store below lands. Co-location was therefore pure inheritance, and it
+    // cost: EVERY `bg` launch runs from the same shell context, so every bg parent stacked on that
+    // one core (attended P62: four bg vugs each visibly slowing while `SCHED: load` read
+    // c0=51 c1=99 c2=52 c3=0 — c1 saturated, c3 idle). Their ELF-2 worker threads already spread via
+    // `other_online_cpu`; only the parents piled up.
+    //
+    // `CPU_AUTO` is the existing SCHED-3 discipline (least ready-queue depth, then busy fraction,
+    // then a rotating cursor) — the same "spread at spawn" the orphan-reaper and the ELF-2 threads
+    // use. Placement is still decided ONCE, at spawn: the task stays no-migrate and non-steal-eligible
+    // afterwards (EL0 slots carry per-core TTBR0/ASID state), so this changes only WHERE a bg task
+    // starts, never that it stays put. The foreground `run` path deliberately keeps `this_cpu()` —
+    // its co-location invariant is real.
     // EXEC1-M publish order — see the block comment in `run_user_image`; identical window, identical fix.
     PROCS[pi].asid.store(asid, Ordering::Release);
-    let pid = super::sched::spawn_user_slot("bg-el0", mapped.base, mapped.sp, mapped.ttbr0, cpu);
+    let pid = super::sched::spawn_user_slot(
+        "bg-el0",
+        mapped.base,
+        mapped.sp,
+        mapped.ttbr0,
+        super::sched::CPU_AUTO,
+    );
     PROCS[pi].pid.store(pid, Ordering::Release);
     Ok((pid, asid, mapped.base))
 }
@@ -9460,6 +9487,11 @@ fn bgrun_witness(_demo_cpu: usize) {
     // leg leaves the thread table freshly scavenged, so SPINHUNT's two spawns are served from known-
     // clean rows and a `-EAGAIN` here would be a real regression rather than KILLBOUND's leftovers.
     spinhunt_witness();
+    // BG-SPREAD rides the same rationale and follows: in-kernel blob, no card, no staged .ELF, and it
+    // kills + reaps its own launches so the process table is left as it was found. Placed AFTER
+    // SPINHUNT so the two legs that assert on a DRAINING address space run against a table this leg
+    // has not yet touched.
+    bgspread_witness();
     if crate::drivers::block::info().is_none() {
         serial_println!(":: BGRUN-ST: no SD card found — skipped ::");
         return;
@@ -10154,6 +10186,56 @@ unsafe extern "C" {
 }
 
 // =============================================================================================
+// BGSPREAD fixture — the smallest program that can be BACKGROUNDED and still be alive when the next
+// one is launched. That is the whole requirement: BG-SPREAD is about WHERE a `bg` parent is PLACED,
+// so the fixture only has to exist concurrently with its siblings while three placements are made.
+//
+// It is KILLBOUND with the threads removed: zero one futex word and block in `SYS_FUTEX(FUTEX_WAIT)`
+// on a word nobody wakes. NO `SYS_THREAD_SPAWN` — deliberately, and this is the load-bearing
+// difference from KILLBOUND. Three concurrent copies of KILLBOUND would be nine tasks against an
+// eight-row `THREAD_TABLE`, so the third launch could fail for a reason that has nothing to do with
+// placement; and worker threads spread on their OWN (`other_online_cpu`) discipline, which would
+// muddy a witness whose entire subject is the PARENT's core. One task per launch, three launches,
+// three parent placements.
+//
+// Parking (rather than spinning) also keeps the leg honest about what it does NOT measure: a parked
+// task leaves the run queue, so the three placements are decided against a nearly-flat load and what
+// the witness reads is the PLACEMENT POLICY, not a transient queue-depth artefact.
+//
+// FLAT image (no ELF magic), one code page, position-independent via `adr` — rides
+// `spawn_user_image_bg` with no fixture files on the card. The flat loader does not zero the data
+// page and slot backings are RECYCLED, so the blob zeroes its own futex word before touching it;
+// without that a stale non-zero word would make `futex_wait` return `Mismatch` and the fixture would
+// spin in the run queue instead of parking (KILLBOUND's documented trap, same remedy).
+// =============================================================================================
+core::arch::global_asm!(
+    r#"
+    .balign 4
+    .globl __bgspread_blob_start
+__bgspread_blob_start:
+    adr  x20, __bgspread_blob_start       // x20 = window base (PC-relative)
+    add  x21, x20, #0x1000                // x21 = the futex word (RW data page 1)
+    str  xzr, [x21]                       // word = 0 (the recycled-backing guard)
+    dmb  ish                              // publish the zero before the wait reads it
+    mov  x0, x21                          // SYS_FUTEX(uaddr, FUTEX_WAIT=0, expect=0) -> parks forever
+    mov  x1, #0
+    mov  x2, #0
+    mov  x8, #26
+    svc  #0
+1:  b 1b                                  // a wake would be a bug; spin rather than fall off the page
+
+    .balign 4
+    .globl __bgspread_blob_end
+__bgspread_blob_end:
+"#
+);
+
+unsafe extern "C" {
+    static __bgspread_blob_start: u8;
+    static __bgspread_blob_end: u8;
+}
+
+// =============================================================================================
 // SPINHUNT fixture — the smallest program that reproduces the P61 pegged core, headless.
 //
 // It is `user-vug`'s thread topology with everything but the ORPHANING removed: the leader spawns
@@ -10380,6 +10462,120 @@ fn spinhunt_witness() {
         serial_println!(
             ":: SPINHUNT: orphaned={} (want 2) reaped={} drained={} leftover={} live task(s) under asid {} -> FAIL ::",
             orphaned, reaped, drained, leftover, asid
+        );
+    }
+}
+
+/// BG-SPREAD — the regression leg for the P62 stacking. Launches `NBG` background programs and
+/// REQUIREs that their parent tasks did not all land on the same core.
+///
+/// WHAT THE EXISTING LEGS COULD NOT CATCH. Every `bg` leg in this file launches ONE program at a
+/// time, so none of them can observe a relationship BETWEEN launches — and stacking is only visible
+/// as a relationship. The `:: SCHED: task 'bg-el0' -> core N ::` placement line has always carried
+/// the raw fact, but a spec REQUIRE matches one line at a time and cannot count distinct cores
+/// across several; this leg does the counting in the kernel and states the result in one assertable
+/// line. (The `SCHED: load` row cannot substitute: attended P62 showed it reading a flat
+/// `c0=51 c1=99 c2=52 c3=0` while four bg vugs each visibly slowed — the meter was correct and the
+/// placement was the fault, which is exactly why the assertion has to be on placement.)
+///
+/// THE LEG. Spawn `NBG` copies of the BGSPREAD fixture back to back, reading each one's chosen core
+/// from `sched::last_user_placement()` immediately after its own spawn; then kill and reap all of
+/// them so the process table is left exactly as it was found (the KILLBOUND/SPINHUNT courtesy — this
+/// leg runs inside the same battery). The assertion is `distinct >= 2`.
+///
+/// WHY `>= 2` AND NOT `== NBG`. The property under test is that placement is a function of LOAD, not
+/// of the launcher's core. A load-balanced policy is *allowed* to reuse a core — if two cores are
+/// genuinely the least loaded and one drains first, landing twice on it is correct behaviour, and a
+/// `== NBG` assertion would make a correct scheduler flap. `>= 2` is the strongest claim that is
+/// true for every legal execution, and it is still fatal to the bug: co-location can only ever
+/// produce 1.
+///
+/// TEETH (the A/B). On the pre-arc code `spawn_user_image_bg` passed `this_cpu()`, and all `NBG`
+/// launches run from this one witness task on one core, so `distinct` is 1 BY CONSTRUCTION and the
+/// leg fails on every boot — it cannot pass for a lucky reason. With `CPU_AUTO` the rotating tie-break
+/// in `pick_cpu` fans consecutive equal-load placements across cores, so `distinct` is 2..=NBG.
+///
+/// An honest skip on a boot with fewer than 2 online cores (the metal 3-of-4 variance in the spec
+/// header has a uniprocessor tail): with one candidate core there is no spread to observe, and a
+/// `distinct=1` there would be correct rather than a regression.
+fn bgspread_witness() {
+    /// Launches. Three is the smallest count that distinguishes "spread" from "alternates with the
+    /// launcher's core" — with two, a policy that merely bounced to the sibling would also pass.
+    const NBG: usize = 3;
+
+    let online = super::sched::online_cpu_count();
+    if online < 2 {
+        serial_println!(":: BGSPREAD: {} online core(s) — nothing to spread across, skipped ::", online);
+        return;
+    }
+    let bstart = &raw const __bgspread_blob_start as usize;
+    let bend = &raw const __bgspread_blob_end as usize;
+    let blob = unsafe { core::slice::from_raw_parts(bstart as *const u8, bend - bstart) };
+    if blob.len() > super::boot::USER_CODE_SIZE {
+        serial_println!(":: BGSPREAD: blob {} B > code page — skipped ::", blob.len());
+        return;
+    }
+
+    let mut live: [(u64, u64); NBG] = [(0, 0); NBG]; // (pid, asid)
+    let mut cores = [usize::MAX; NBG];
+    let mut launched = 0usize;
+    let mut first_fail = "";
+    for i in 0..NBG {
+        match spawn_user_image_bg(blob) {
+            Ok((pid, asid, _)) => {
+                // Read the placement the spawn just made. Sound here for the reason
+                // `last_user_placement` documents: this task made the call and reads it back before
+                // yielding, and the fixture-battery context has no other slot spawner running.
+                cores[i] = super::sched::last_user_placement();
+                live[i] = (pid, asid);
+                launched += 1;
+            }
+            Err(why) => {
+                if first_fail.is_empty() {
+                    first_fail = why;
+                }
+                break;
+            }
+        }
+    }
+
+    // Distinct cores among the launches that actually happened. NBG is 3, so an O(n^2) scan is the
+    // clearest way to say it and needs no allocation.
+    let mut distinct = 0usize;
+    for i in 0..launched {
+        if !cores[..i].contains(&cores[i]) {
+            distinct += 1;
+        }
+    }
+
+    // Leave the table as we found it: kill + reap every launch, bounded, before the verdict. A
+    // fixture parked in a futex is precisely KILLBOUND's target shape, so `bg_kill` confirms here.
+    let mut settled = 0usize;
+    for &(pid, asid) in live[..launched].iter() {
+        let _ = bg_kill(pid, asid);
+        let t0 = super::timer::cntpct();
+        let budget = super::timer::cntfrq().saturating_mul(5);
+        loop {
+            if matches!(bg_poll(pid, true), BgPoll::Gone) {
+                settled += 1;
+                break;
+            }
+            if super::timer::cntpct().wrapping_sub(t0) >= budget {
+                break;
+            }
+            super::sched::yield_now();
+        }
+    }
+
+    if launched == NBG && distinct >= 2 && settled == NBG {
+        serial_println!(
+            ":: BGSPREAD: {} bg launches over {} online cores -> cores {},{},{} distinct={} (want >= 2) PASS ::",
+            launched, online, cores[0], cores[1], cores[2], distinct
+        );
+    } else {
+        serial_println!(
+            ":: BGSPREAD: launched={}/{} distinct={} settled={} first_fail='{}' -> FAIL ::",
+            launched, NBG, distinct, settled, first_fail
         );
     }
 }
