@@ -1603,8 +1603,31 @@ panel_height`, not a whole frame period.
 Budgeted at four samples per window id (the checksums are 64 KiB reads and the read-back is one probe per
 source pixel, from present context at EL0 frame rates — an unbudgeted version would perturb the timing it
 reports). Per-window, not per-window-0, so the shared-path claim is provable on the wire. `witness`-gated
-and aarch64-only like `wcf`: knob-off, `video/wcg.rs` does not compile and the flashable media are
-byte-identical.
+and nothing else: knob-off, `video/wcg.rs` does not compile and every artifact — Pi media and x86 ESP
+alike — is byte-identical.
+
+**Both arches, since the port.** `wcg` was `aarch64 + witness` for as long as it imported
+`arch::aarch64::{cache, now_cycles}` directly. The WC-H/WC-K/WC-L staging and erase disciplines it reports
+on are arch-neutral (`wm.rs` has no arch split in them), so gating the *reporting* on aarch64 meant the x86
+compositor ran those disciplines with no witness over them at all. The port replaced the two imports with
+arch-neutral spellings — `crate::arch::now_cycles`, which both arch modules already export as a facade
+(rdtsc / CNTVCT), and a local `clean_invalidate_surface` that is `DC CIVAC` on aarch64 and a no-op on x86,
+the same shape `FrameBuffer::flush_range` already uses for its arch hook — and widened every `wm.rs` call
+site from `all(target_arch = "aarch64", feature = "witness")` to `feature = "witness"`. `cycles_to_us`
+carries the one genuine arch split: `CNTFRQ_EL0` on aarch64, `apic::tsc_hz()` (the ACPI-PM-calibrated rate)
+on x86.
+
+Two gates deliberately did **not** widen, and both are Pi-shaped rather than incidental: the WC-F
+reserved-box interlock in `composite_inner` (that probe talks to the VideoCore mailbox, so `wcf` stays
+`aarch64 + witness + baremetal`), and WC-L's `DEFER_FIXTURE`, whose one-shot forced deferral exists to make
+the DEFERRED→BUFFERED queue round trip reproduce under `kernel8-test`. A native x86 fixture for that round
+trip is its own arc.
+
+Byte-inertness was checked rather than asserted: with `witness` off, the `llvm-objcopy -O binary` image of
+`unaos-kernel` is identical to the pre-port image on **both** targets. (The intermediate that was not — a
+three-line doc comment in `wm.rs` — moved seven `core::panic::Location` line numbers by exactly 3 and
+nothing else, which is why the comment was written line-neutral. Worth remembering: the ELF is not a usable
+inertness oracle here, since DWARF records source offsets the loadable image does not.)
 
 #### What the gate found
 

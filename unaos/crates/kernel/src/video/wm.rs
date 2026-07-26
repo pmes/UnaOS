@@ -394,7 +394,7 @@ pub fn present(id: WinId) -> bool {
     // the only honest baseline for the `app` leg. The identity is captured under the table lock and
     // the checksum taken after it drops — a 64 KiB read is not something to hold the window table
     // across, and the surface cannot be unmapped underneath it while the owner is in the syscall.
-    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    #[cfg(feature = "witness")]
     let mut probe: Option<(usize, usize)> = None;
     {
         let mut t = TABLE.lock();
@@ -402,7 +402,7 @@ pub fn present(id: WinId) -> bool {
             Some(r) => {
                 r.damaged = true;
                 r.presented = true;
-                #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+                #[cfg(feature = "witness")]
                 if !r.compat {
                     probe = Some((r.surf, r.surf_len));
                 }
@@ -410,7 +410,7 @@ pub fn present(id: WinId) -> bool {
             None => return false,
         }
     }
-    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    #[cfg(feature = "witness")]
     if let Some((surf, surf_len)) = probe {
         super::wcg::on_present(id, surf, surf_len);
     }
@@ -1316,7 +1316,7 @@ fn composite_inner() -> CursorTail {
         // first thing after it: the `blit`/`after` checksums mean "the surface as the copy found it"
         // and "as the copy left it", and anything inserted between them widens the interval they
         // measure into something other than the copy. Budgeted per window id; `None` once spent.
-        #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+        #[cfg(feature = "witness")]
         let wcg_probe = super::wcg::begin(rows[i].id, rows[i].surf, rows[i].surf_len, rows[i].compat);
         // CURSOR-3 — WHICH WINDOWS MAY CARRY THE SPRITE. WC-I's invariant "no verified pixel is ever
         // read with the sprite on the panel" is preserved here rather than weakened: this pass may
@@ -1334,7 +1334,7 @@ fn composite_inner() -> CursorTail {
         // repaint them. Excluding the window from the plan entirely is what would break the split.
         #[allow(unused_mut)]
         let mut may_overlay = true;
-        #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+        #[cfg(feature = "witness")]
         if wcg_probe.is_some() {
             may_overlay = false;
         }
@@ -1361,7 +1361,7 @@ fn composite_inner() -> CursorTail {
             plan,
             may_overlay,
         );
-        #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+        #[cfg(feature = "witness")]
         if let Some(p) = wcg_probe {
             let r = &rows[i];
             super::wcg::end(p, &fb, r.x, r.y, r.w, r.h, r.stride, r.scale);
@@ -1369,7 +1369,7 @@ fn composite_inner() -> CursorTail {
         // WC-H — print the back-layer sample the blit above recorded, if any. Deliberately AFTER
         // `wcg::end`: this emits to the serial UART, and inside the bracket it would be charged to
         // `[wc-g] us=`. See `wcg::stage_flush`.
-        #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+        #[cfg(feature = "witness")]
         super::wcg::stage_flush(rows[i].id);
         // WC-D — verify this window's blit against the scan-out, once per window id, from inside the pass
         // that drew it (the only place both the source surface and the destination rows are known).
@@ -2032,7 +2032,7 @@ fn boxes_overlap(a: (usize, usize, usize, usize), b: (usize, usize, usize, usize
 const MAX_DEFER: usize = MAX_WINDOWS;
 
 /// Why a fill could not stage. These mirror `wcg`'s `DECL_*`, and the mirror is not duplication for
-/// its own sake: `wcg` is compiled only for `aarch64 + witness`, while WC-L's decision about what to
+/// its own sake: `wcg` is compiled only under `witness`, while WC-L's decision about what to
 /// do with a fill that cannot stage — defer it or drop it — is a CORRECTNESS decision that every
 /// build makes, witness or not. The reason therefore has to exist outside the witness. The `const`
 /// assertions below tie the two vocabularies together at compile time on the builds that have both,
@@ -2041,7 +2041,7 @@ const DEFER_GEOM: u32 = 1;
 const DEFER_CAP: u32 = 2;
 const DEFER_LOCK: u32 = 3;
 const DEFER_ALLOC: u32 = 4;
-#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+#[cfg(feature = "witness")]
 const _: () = assert!(
     DEFER_GEOM == super::wcg::DECL_GEOM
         && DEFER_CAP == super::wcg::DECL_CAP
@@ -2070,7 +2070,7 @@ static DEFER: Mutex<([(usize, usize, usize, usize); MAX_DEFER], usize)> =
 /// case must cost one relaxed load and no lock traffic at all.
 static DEFER_N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
-/// WC-L — one-shot latch for the deferral fixture in [`stage_fill`]. Witness builds only.
+/// WC-L — latch for the deferral fixture in [`stage_fill`]. Witness + aarch64 only (see that block).
 #[cfg(all(target_arch = "aarch64", feature = "witness"))]
 static DEFER_FIXTURE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
@@ -2124,14 +2124,14 @@ fn defer_erase(x: usize, y: usize, w: usize, h: usize, reason: u32, requeued: bo
                 }
             }
             boxes[best] = union(boxes[best]);
-            #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+            #[cfg(feature = "witness")]
             super::wcg::erase_coalesce();
         }
         DEFER_N.store(*n, core::sync::atomic::Ordering::Relaxed);
     }
-    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    #[cfg(feature = "witness")]
     super::wcg::erase_defer(w, h, reason, requeued);
-    #[cfg(not(all(target_arch = "aarch64", feature = "witness")))]
+    #[cfg(not(feature = "witness"))]
     let _ = (reason, requeued);
 }
 
@@ -2253,9 +2253,9 @@ static STAGE: Mutex<alloc::vec::Vec<u8>> = Mutex::new(alloc::vec::Vec::new());
 
 /// WC-H — whether the one-shot fallback fixture has been spent. See the fixture block in
 /// [`stage_window`]: it forces exactly one non-compat composite onto the direct path so WC-D's
-/// scan-out read-back covers the fallback as well as the staged present. `witness`-gated and
-/// aarch64-only, so the flashable media are unaffected.
-#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+/// scan-out read-back covers the fallback as well as the staged present. `witness`-gated, so every
+/// shipping artifact is unaffected.
+#[cfg(feature = "witness")]
 static FALLBACK_FIXTURE: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
@@ -2536,7 +2536,7 @@ fn stage_window(
     // `wcg::stage_decline`.
     macro_rules! decline {
         ($reason:expr) => {{
-            #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+            #[cfg(feature = "witness")]
             super::wcg::stage_decline(r.id, $reason);
             return false;
         }};
@@ -2549,7 +2549,7 @@ fn stage_window(
     //
     // Armed on the composite WC-D is about to verify — the same predicate `composite_inner` tests
     // afterwards — so the fixture and the verification cannot land in different passes.
-    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    #[cfg(feature = "witness")]
     {
         if r.presented && r.id < 32 {
             let bit = 1u32 << r.id;
@@ -2586,8 +2586,8 @@ fn stage_window(
         stage.resize(need, 0);
     }
 
-    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
-    let t0 = crate::arch::aarch64::now_cycles();
+    #[cfg(feature = "witness")]
+    let t0 = crate::arch::now_cycles();
 
     // The back layer: same pixel format and bytes/pixel as the panel (so the composed bytes ARE the
     // panel's bytes and the present is a straight copy), but its own stride — the box width, with no
@@ -2618,8 +2618,8 @@ fn stage_window(
         note_cursor_overlay(&c);
     }
 
-    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
-    let t1 = crate::arch::aarch64::now_cycles();
+    #[cfg(feature = "witness")]
+    let t1 = crate::arch::now_cycles();
 
     // Present: one bulk copy per row. This is the whole of what the scan-out can catch mid-flight,
     // and it is the same primitive and the same shape as `Screen::present_background`'s damage-rect
@@ -2630,13 +2630,13 @@ fn stage_window(
         fb.blit((by + y) * fb_row + bx * bpp, &stage[src..src + row_bytes]);
     }
 
-    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    #[cfg(feature = "witness")]
     super::wcg::stage_note(
         r.id,
         bw,
         bh,
         need,
-        crate::arch::aarch64::now_cycles(),
+        crate::arch::now_cycles(),
         t0,
         t1,
         ph,
@@ -2702,7 +2702,7 @@ fn stage_fill(
             // Named unconditionally: the reason is part of the CORRECTNESS decision (drop, not
             // defer) on every build, and only its reporting is witness-gated.
             let _reason: u32 = $reason;
-            #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+            #[cfg(feature = "witness")]
             super::wcg::erase_drop(w, h, _reason);
             return false;
         }};
@@ -2756,8 +2756,8 @@ fn stage_fill(
         stage.resize(row_bytes, 0);
     }
 
-    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
-    let t0 = crate::arch::aarch64::now_cycles();
+    #[cfg(feature = "witness")]
+    let t0 = crate::arch::now_cycles();
 
     // Compose: one row, in the panel's own pixel format so the present is a straight copy.
     for b in stage[..row_bytes].iter_mut() {
@@ -2777,8 +2777,8 @@ fn stage_fill(
     );
     layer.fill_rect(0, 0, w, 1, color);
 
-    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
-    let t1 = crate::arch::aarch64::now_cycles();
+    #[cfg(feature = "witness")]
+    let t1 = crate::arch::now_cycles();
 
     // Present: one bulk copy per row. ROW-CONTIGUITY is checked here rather than asserted in a
     // comment — each destination run must be exactly `row_bytes` long, must fit inside its scanline
@@ -2796,13 +2796,13 @@ fn stage_fill(
         fb.blit(off, &stage[..row_bytes]);
     }
 
-    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    #[cfg(feature = "witness")]
     super::wcg::erase_note(
         w,
         h,
         row_bytes,
         contig,
-        crate::arch::aarch64::now_cycles(),
+        crate::arch::now_cycles(),
         t0,
         t1,
         info.height,

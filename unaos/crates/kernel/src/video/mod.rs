@@ -51,9 +51,11 @@ pub mod witness;
 pub mod wcf;
 // WC-G: the window PRESENT path instrumented while it runs — four checksums of one surface around
 // one blit, a scan-out read-back, and the blit's duration, which together separate a source race
-// from a coherency fault from a blit-path defect from an unbuffered-copy timing defect. Same gating
-// as `wcf` (witness + aarch64 only), so the flashable media stay byte-identical.
-#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+// from a coherency fault from a blit-path defect from an unbuffered-copy timing defect. Also carries
+// WC-H's `[wc-h]` staged-composite lines and WC-K/WC-L's `[wc-k]` erase lines. `witness`-gated and
+// nothing else — unlike `wcf`, which stays aarch64-only because it talks to the VideoCore mailbox —
+// so every artifact stays byte-identical with the knob off, on both arches.
+#[cfg(feature = "witness")]
 pub mod wcg;
 // VPERF instrumentation (counters, fbmem readout, PCI display probe, scripted scroll scenario).
 // x86-only AND knob-gated: with the feature off — or on aarch64 regardless — nothing here
