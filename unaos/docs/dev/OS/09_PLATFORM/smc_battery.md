@@ -143,6 +143,23 @@ once it has **persisted** past `HOLD_NOTE_MS` (5 s), i.e. once it is an outage r
 The line carries the hold's own age (`held N ms`) alongside the cached reading's staleness. The
 release line prints only if its hold was announced, so the pair can never appear half-printed.
 
+#### Presence must be held to count (s41)
+
+The s41 metal boot printed the witness every few seconds — better than 1 Hz but not quiet. The wire
+shows why: `present=true` / `present=false` **alternate line to line** (`soc=62%` … `present=false
+soc=-%` … `present=true`, `retries=2/178, 2/180, 2/301 …`). With the raw `present` in the state key,
+every flap was a "state change" and earned a print. It is not one. The key's presence component is
+now the **held/debounced** presence, exactly as `ac_key` carries the settled AC shape: while
+BATMON-HOLD is active and the hold is younger than `HOLD_NOTE_MS` (5 s — the same blip/outage
+threshold the hold notes use), the key keeps the **whole** shape it had. Presence alone would not be
+enough: `soc_pct` reads `None` on precisely those failed sweeps, so a raw-`soc` key would re-print
+regardless.
+
+A **real** removal still prints, once: either the hold outlives `HOLD_NOTE_MS` (an outage, not a
+blip) or there was never a good reading to hold (QEMU / a battery-less machine), and in both cases
+the key resolves to the honest `present=false`. The printed line always reports the **instantaneous**
+sweep — only the fire decision is debounced.
+
 **No information is lost:** every state change and every failing sweep that lasts still prints, and
 retry counts survive on the witness lines plus the rollup. Only identical repeats and sub-threshold
 blips are dropped. Under `UNAOS_BOOTLOG=1` (the `bootlog` feature — boot-log-held-on-screen sitting mode) the

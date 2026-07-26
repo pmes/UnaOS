@@ -842,7 +842,27 @@ pub mod battery {
         } else {
             s.ac_derived
         };
-        let state = (s.present, s.soc_pct, s.ac_present, s.ac_stuck, ac_key);
+        // QUIET-PRESENCE (s41): the state key must carry the HELD presence, never the instantaneous
+        // one — same philosophy as QUIET-AC above. On s41 metal this SMC alternates
+        // `present=true` / `present=false` sweep to sweep (retries=2/178, 2/180, 2/301 …), and with
+        // the raw `present` in the key EVERY flap was a state change, so the witness re-printed every
+        // few seconds. A single failed sweep is not a state change: while BATMON-HOLD is active and
+        // the hold is still younger than `HOLD_NOTE_MS` (the same blip/outage threshold the hold
+        // notes use), the key keeps the WHOLE shape it had — presence and the components that go
+        // dark with it (`soc_pct` reads `None` on exactly those sweeps, so keying on the raw value
+        // would re-print regardless). A real removal still prints once: the hold outlives
+        // `HOLD_NOTE_MS`, or there was never a good reading to hold (no-battery machines / QEMU), and
+        // in both cases the key resolves to the honest `present=false`. The printed line is
+        // untouched — it always reports the instantaneous sweep.
+        let blip = !s.present && {
+            let h = *HOLDING.lock();
+            let since = *HOLD_SINCE.lock();
+            h && now.wrapping_sub(since) < HOLD_NOTE_MS
+        };
+        let state = match (blip, *last) {
+            (true, Some(prev)) => prev,
+            _ => (s.present, s.soc_pct, s.ac_present, s.ac_stuck, ac_key),
+        };
         let changed = last.map_or(true, |l| l != state);
         // Two disjoint predicates, never OR-ed together, so the `bootlog` arm is *byte for byte* the
         // pre-audit condition and that mode's log is unchanged.
