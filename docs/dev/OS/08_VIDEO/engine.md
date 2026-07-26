@@ -2710,10 +2710,33 @@ path drops the `STAGE` guard before queueing. That is what lets `DEFER` use a bl
 repaint outright, and a leaf held across no acquisition cannot invert anything. No new inversion is
 introduced.
 
-On a full queue (`MAX_DEFER` = `MAX_WINDOWS`) a box is unioned into slot 0 rather than dropped. Sound
-for the same reason `reclaim` is: the drain re-damages every window the painted box intersects, so
-enlarging it costs repaint work and can never leave a window with a bite taken out of it. Dropping
-would leave a dead window's last frame on the panel for the rest of the boot — the P61 ghost.
+On a full queue (`MAX_DEFER` = `MAX_WINDOWS`) a box is unioned into an existing entry rather than
+dropped. Sound for the same reason `reclaim` is: the drain re-damages every window the painted box
+intersects, so enlarging it costs repaint work and can never leave a window with a bite taken out of
+it. Dropping would leave a dead window's last frame on the panel for the rest of the boot — the P61
+ghost. The victim is the entry whose union adds the **least area**, not slot 0: always unioning into
+slot 0 grows without bound, dragging one entry's corners out until it covers most of the panel and
+every later drain repaints most of the panel and re-damages every window on it.
+
+#### What guarantees a deferred box is ever painted
+
+The drain runs at the head of `composite_inner`, so the ordinary liveness argument is "some window
+presents, which composites, which drains". That argument is weakest exactly where it is least
+obvious: **a box is deferred because a window was torn down, and if it was the last window there is
+nothing left to present.** The only thing still running is then WC-E's periodic desktop
+flush → `wm::service_damage`.
+
+Checking that path showed the first cut had a real hole, not merely an undocumented assumption:
+`service_damage` early-returned unless some row was `used && damaged`, and with no windows left no
+row is either. A box deferred by the last closing window would have sat on the queue for the rest of
+the boot, showing that window's final frame — the exact P61 ghost WC-J removed, re-entering by a new
+route. `service_damage` therefore now also runs the pass when `DEFER_N` is non-zero.
+
+So: **the desktop's flush cadence, not a window present, is what bounds a deferral's latency in the
+general case.** The dependency is load-bearing and worth restating — if WC-E's periodic flush were
+removed or made conditional on a live window layer, the deferred queue would lose its only guarantee
+in precisely the case it was built for. The cost on the idle path is one relaxed atomic load ahead of
+a table-lock acquisition that was already happening.
 
 **Arch-neutral.** The deferred-erase path — queue, drain, defer/drop decision, the `DEFER_*` reason
 constants — is uncfg'd and compiled on x86 too, because removing a direct front-buffer write is a
@@ -2729,11 +2752,39 @@ boots or force the FORBID to be loosened — and the FORBID is the arc's verdict
 unbudgeted to a 16-line spam bound, on WC-K's reasoning: what they report is a fill the panel has *not
 received yet*, and a boot that starts deferring after the rollup has fired must still be visible.
 
-The rollup gains `defers=`, `redefers=` and `coalesced=`. None of them enters the verdict precedence:
-a deferral arrived through the staged path one pass late, so it neither tore nor went direct, and
-demoting `TEAR-FREE` for it would make the honest report of contention indistinguishable from the
-regime the arc removed. `redefers=` is the one to watch — non-zero means the staging lock is contended
-for longer than a composite interval.
+The rollup gains `defers=`, `redefers=` and `coalesced=`. `defers=` and `coalesced=` do not enter the
+verdict precedence: a deferral that *arrives* came through the staged path one pass late, so it
+neither tore nor went direct, and demoting `TEAR-FREE` for it would make the honest report of
+contention indistinguishable from the regime the arc removed.
+
+`redefers=` does enter it. A requeue is a repaint that has **not happened**, and past `E_REDEFER_MAX`
+(8, one full queue's worth) the honest reading is that the erase path is not draining — which on the
+panel is a dead window's frame where the desktop should be. Printing `TEAR-FREE` over a visible ghost
+would be WC-K's mistake repeated in a new place: a verdict describing the samples it liked rather
+than the panel. The new `-> STARVED` sits below `-> UNSTAGED` in the precedence, because a starved
+box may still arrive (delayed, not lost) where a dropped one provably never will.
+
+Starvation also gets its own one-shot `scope=starve` line. The sampled rollup fires at fill 4, and
+starvation by its nature arrives late — it needs a loaded, long-running desktop, not a boot's first
+four fills — and a rollup that has already printed cannot retract. Same reasoning that makes the
+deferral lines unbudgeted: a FORBID is only worth having if the boot can still trip it.
+
+#### The cursor, and why the drain returns "sprite disturbed" rather than "painted"
+
+`drain_deferred` returns whether it took the sprite off the panel, **not** whether it painted a box.
+The first cut returned `painted`, which was a bug of the same family as the one the arc fixes: the
+drain undrew the sprite, every box then re-deferred, `composite_inner` saw `disturbed = false`, took
+the `Untouched` tail — and the sprite was removed and never restored, every pass, for as long as the
+contention lasted. That is, precisely the conditions this arc exists for. A pointer that vanishes
+under load is not a lesser failure than a torn erase.
+
+The undraw is still lazy, because undrawing on every drain would re-create WC-I's spotty sprite (an
+undraw/repaint per composite, on every core, is what WC-I removed). A `STAGE.try_lock()` probe runs
+*before* the queue is emptied or the sprite touched: if the staging lock is unavailable — the
+dominant contention case, and the one P64 caught — nothing can be painted this pass, so the queue is
+left intact and the sprite is never disturbed. The probe is advisory, not a reservation; the guard is
+dropped and `stage_fill` takes the lock itself. Losing that race costs one wasted pass with the
+bracket taken, which is benign in the direction that matters: it can cost a repaint, never skip one.
 
 #### The QEMU fixture, and what it does not prove
 

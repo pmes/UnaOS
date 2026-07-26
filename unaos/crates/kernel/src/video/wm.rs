@@ -958,10 +958,24 @@ pub fn occluders(out: &mut [(usize, usize, usize, usize); MAX_WINDOWS]) -> usize
 /// desktop's cadence is damage some OTHER path recorded — chiefly `cursor::repair`, whose contract
 /// ("marks only; never composites") depends on someone else running the pass within a frame.
 ///
-/// Cheap when idle: one table-lock acquisition and a scan of eight rows, then out. The pass itself
-/// only runs when a row is genuinely damaged.
+/// Cheap when idle: one relaxed atomic load, then one table-lock acquisition and a scan of eight
+/// rows, then out. The pass itself only runs when a row is genuinely damaged or an erase is owed.
+///
+/// ### WC-L — why the deferred queue is part of the condition
+///
+/// This is the erase queue's LIVENESS GUARANTEE, and without it the queue has none in the case that
+/// matters most. The ordinary argument is "some window presents, which composites, which drains" —
+/// but a box is deferred precisely when a window was torn down, and if it was the LAST window there
+/// is nothing left to present. The desktop's own flush is then the only thing still running, and it
+/// arrives here; before this check, `service_damage` would find no damaged row (there are no rows),
+/// return, and the deferred box would sit on the queue for the rest of the boot with a dead window's
+/// last frame on the panel — the exact P61 ghost WC-J removed, re-entering by a new route.
+///
+/// So the desktop's cadence, not a window present, is what bounds a deferral's latency in the
+/// general case. `DEFER_N` is a relaxed load and the common value is zero, so the added cost on the
+/// idle path is one atomic read ahead of a lock acquisition that was already happening.
 pub fn service_damage() {
-    {
+    if DEFER_N.load(core::sync::atomic::Ordering::Relaxed) == 0 {
         let t = TABLE.lock();
         if !t.rows.iter().any(|r| r.used && r.damaged) {
             return;
@@ -1201,8 +1215,11 @@ fn composite_inner() -> CursorTail {
     // `SPRITE` (through `undraw`) and `TABLE`, and F4's termination argument requires that the only
     // thing a draining teardown waits on is bounded blits, not another core's lock.
     //
-    // The drain reports `disturbed` because it takes the sprite off the panel; the caller's tail is
-    // what puts it back, which is `erase`'s existing contract and not a new one.
+    // The drain reports `disturbed` when it took the sprite off the panel — which is not the same as
+    // "it painted something", and the difference matters: a drain whose boxes all re-defer has still
+    // undrawn the sprite, and reporting `false` there would give the tail `Untouched` and leave the
+    // pointer missing for as long as the contention lasts. The caller's tail is what puts it back,
+    // which is `erase`'s existing contract and not a new one.
     {
         let fb = *super::WRITER.lock();
         if fb.is_ready() && drain_deferred(&fb) {
@@ -2063,11 +2080,19 @@ static DEFER_FIXTURE: core::sync::atomic::AtomicBool = core::sync::atomic::Atomi
 /// could still not stage; both are honest, but a boot doing the second is telling the operator the
 /// staging lock is contended for longer than a composite interval.
 ///
-/// On a full queue the box is UNIONED into slot 0 rather than dropped. The union is sound for the
-/// same reason WC-J's `reclaim` is: the drain re-damages every window the painted box intersects, so
-/// enlarging the box costs repaint work and can never leave a window with a bite taken out of it.
-/// Dropping, by contrast, would leave a dead window's last frame on the panel for the rest of the
-/// boot — the P61 ghost.
+/// On a full queue the box is UNIONED into an existing entry rather than dropped. The union is sound
+/// for the same reason WC-J's `reclaim` is: the drain re-damages every window the painted box
+/// intersects, so enlarging the box costs repaint work and can never leave a window with a bite
+/// taken out of it. Dropping, by contrast, would leave a dead window's last frame on the panel for
+/// the rest of the boot — the P61 ghost.
+///
+/// The victim is the entry whose union with the new box adds the LEAST AREA, not slot 0. Always
+/// unioning into slot 0 is what the first cut did, and it grows without bound in the obvious way: a
+/// full queue plus a stream of scattered boxes drags slot 0's corners outward until it is most of
+/// the panel, and every subsequent drain then repaints most of the panel and re-damages every window
+/// on it. Choosing by added area keeps a union local — a box adjacent to an existing entry costs
+/// almost nothing, and a box far from all of them lands on whichever entry it hurts least. The scan
+/// is `MAX_DEFER` (8) comparisons on a path that only runs when the queue is already full.
 fn defer_erase(x: usize, y: usize, w: usize, h: usize, reason: u32, requeued: bool) {
     if w == 0 || h == 0 {
         return;
@@ -2079,12 +2104,26 @@ fn defer_erase(x: usize, y: usize, w: usize, h: usize, reason: u32, requeued: bo
             boxes[*n] = (x, y, w, h);
             *n += 1;
         } else {
-            let (bx, by, bw, bh) = boxes[0];
-            let x0 = bx.min(x);
-            let y0 = by.min(y);
-            let x1 = (bx + bw).max(x + w);
-            let y1 = (by + bh).max(y + h);
-            boxes[0] = (x0, y0, x1 - x0, y1 - y0);
+            // Pick the entry whose union with this box adds the least area. `usize` throughout: the
+            // union of two panel-clipped boxes is itself panel-bounded, so no product can overflow.
+            let union = |b: (usize, usize, usize, usize)| {
+                let x0 = b.0.min(x);
+                let y0 = b.1.min(y);
+                let x1 = (b.0 + b.2).max(x + w);
+                let y1 = (b.1 + b.3).max(y + h);
+                (x0, y0, x1 - x0, y1 - y0)
+            };
+            let mut best = 0usize;
+            let mut best_growth = usize::MAX;
+            for (i, b) in boxes.iter().enumerate() {
+                let u = union(*b);
+                let growth = (u.2 * u.3) - (b.2 * b.3);
+                if growth < best_growth {
+                    best_growth = growth;
+                    best = i;
+                }
+            }
+            boxes[best] = union(boxes[best]);
             #[cfg(all(target_arch = "aarch64", feature = "witness"))]
             super::wcg::erase_coalesce();
         }
@@ -2097,7 +2136,21 @@ fn defer_erase(x: usize, y: usize, w: usize, h: usize, reason: u32, requeued: bo
 }
 
 /// WC-L — erase the boxes owed from earlier passes, through the staged path, and re-damage what the
-/// paint reached. Returns `true` if anything was painted.
+/// paint reached.
+///
+/// Returns whether the caller owes the SPRITE a repaint — which is `true` whenever this function
+/// took the sprite off the panel, NOT whenever it painted a box. The distinction is the whole of
+/// MUST-FIX 1 from WC-L's lens review, and getting it wrong is worse than the bug the arc fixes: if
+/// the drain undraws and then every box re-defers, returning "nothing painted" leaves
+/// `composite_inner` with `disturbed = false`, the tail is `Untouched`, and the sprite is removed
+/// and never restored — every pass, for as long as contention lasts, which is exactly the situation
+/// this arc exists for. A cursor that vanishes under load is not a lesser failure than a torn erase.
+///
+/// The undraw is nevertheless LAZY, because doing it unconditionally on every drain would re-create
+/// WC-I's spotty sprite: an undraw/repaint per composite, on every core, is what WC-I removed. The
+/// `STAGE` probe below decides. If the staging lock is unavailable — the dominant contention case,
+/// and the one the P64 capture caught — nothing can be painted this pass, so the queue is restored
+/// untouched and the sprite is never disturbed at all.
 ///
 /// Called from [`composite_inner`] BEFORE the dirty-set snapshot, so the windows this re-damages are
 /// repainted by the very pass that did the erasing rather than by some later one. It runs outside
@@ -2111,6 +2164,18 @@ fn drain_deferred(fb: &super::FrameBuffer) -> bool {
     if DEFER_N.load(core::sync::atomic::Ordering::Relaxed) == 0 {
         return false;
     }
+    // Probe the staging lock BEFORE emptying the queue or touching the sprite. A `None` here means
+    // every box in the queue is about to re-defer, so the cheapest and least disruptive thing this
+    // pass can do is nothing at all: leave the queue as it is (no requeue churn, no `redefers`
+    // inflation from a pass that never really tried) and leave the sprite on the panel.
+    //
+    // The probe is advisory, not a reservation — the guard is dropped immediately and `stage_fill`
+    // takes the lock itself. Another core can win it in between, in which case the boxes re-defer
+    // normally and the only cost is one wasted pass with the sprite bracket taken. That race is
+    // benign in the direction that matters: it can cost a repaint, never skip one.
+    if STAGE.try_lock().is_none() {
+        return false;
+    }
     let (boxes, n) = {
         let mut q = DEFER.lock();
         let snap = *q;
@@ -2122,8 +2187,8 @@ fn drain_deferred(fb: &super::FrameBuffer) -> bool {
         return false;
     }
     // The sprite comes off the panel before the first fill byte lands, exactly as `erase` does it,
-    // and the caller's tail puts it back — `composite_inner` reports `disturbed` for this drain so
-    // the tail is `Repaint` rather than `Untouched`.
+    // and the caller's tail puts it back. From here on EVERY return path must report `true`: the
+    // sprite is off the panel whether or not a single box went on to stage successfully.
     super::cursor::undraw();
     let info = fb.info();
     let row_bytes = info.stride * info.bytes_per_pixel;
@@ -2152,7 +2217,9 @@ fn drain_deferred(fb: &super::FrameBuffer) -> bool {
         // back under a departed window; the erase above can only paint `DESKTOP_BG`.
         super::screen::request_full_present();
     }
-    painted
+    // NOT `painted`. The sprite was undrawn above, so the caller owes it a repaint even if every box
+    // re-deferred and nothing reached the panel.
+    true
 }
 
 // ---- WC-H: the window back-layer ---------------------------------------------------------------

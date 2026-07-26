@@ -111,9 +111,10 @@
 //! **WC-K lives here too.** The back-layer discipline WC-H built for a window's pixels was extended
 //! by WC-K to the desktop FILL that a close, a move or a re-tile paints over a vacated box — the last
 //! writer in the window lifecycle that still poked the live front buffer per pixel. Its witness
-//! ([`erase_note`] / [`erase_decline`]) is in this module because it answers the same question with
-//! the same units and the same thresholds, and splitting it into a fourth file would only let the two
-//! `rectscan_us` derivations drift apart.
+//! ([`erase_note`] / [`erase_defer`] / [`erase_drop`]) is in this module because it answers the same
+//! question with the same units and the same thresholds, and splitting it into a fourth file would
+//! only let the two `rectscan_us` derivations drift apart. WC-L then removed that path's direct
+//! fallback outright, so the fill either stages or is owed — never written to the live front buffer.
 //!
 //! ## Scope and cost
 //!
@@ -457,6 +458,21 @@ static E_DEFER: AtomicU32 = AtomicU32::new(0);
 /// on the queue. A steady-state non-zero here means the staging lock is contended for longer than a
 /// composite interval, which is worth seeing even though the outcome is still tear-free.
 static E_REDEFER: AtomicU32 = AtomicU32::new(0);
+
+/// WC-L — how many requeues a boot may accumulate before the rollup calls the erase path STARVED.
+///
+/// A deferral that is delivered is a latency cost and nothing more. A deferral that keeps being
+/// requeued is a repaint that has NOT happened, and on the panel that is a dead window's last frame
+/// sitting where the desktop should be — the P61 ghost, arrived by a new route. Without a threshold
+/// the rollup would print `TEAR-FREE` over exactly that, which is the failure mode WC-K had (a
+/// verdict that described the samples it liked rather than the panel).
+///
+/// Eight is `MAX_DEFER`: a full queue's worth of boxes each missing one drain is the largest requeue
+/// count a single transient contention window can honestly produce. Anything beyond it is either a
+/// second contention window or a box that is not making progress, and both deserve the operator's
+/// attention. Deliberately a low bar — this verdict is meant to be sensitive, because the thing it
+/// guards against is invisible in every other field on the line.
+const E_REDEFER_MAX: u32 = 8;
 /// WC-L — deferred boxes absorbed into an existing queue entry's bounding box because the queue was
 /// full. Sound (the drain re-damages every window the enlarged box reaches, exactly as WC-J's
 /// `reclaim` does), but it repaints more panel than strictly owed, so it is counted.
@@ -491,7 +507,20 @@ static E_ROWS: AtomicU64 = AtomicU64::new(0);
 pub fn erase_defer(w: usize, h: usize, reason: u32, requeued: bool) {
     E_DEFER.fetch_add(1, Ordering::Relaxed);
     if requeued {
-        E_REDEFER.fetch_add(1, Ordering::Relaxed);
+        let r = E_REDEFER.fetch_add(1, Ordering::Relaxed) + 1;
+        // The STARVED verdict has to be reachable for the WHOLE boot, not only until the sample
+        // rollup fires. The rollup prints once, at sample `E_SAMPLES`, and starvation by its nature
+        // arrives LATE — the contention that causes it is a loaded, long-running desktop, not a
+        // boot's first four fills. A rollup that has already printed cannot retract, so the
+        // threshold gets its own one-shot line here, on the same reasoning that makes the deferral
+        // lines unbudgeted: the FORBID is only worth having if the boot can still trip it.
+        if r == E_REDEFER_MAX + 1 {
+            serial_println!(
+                "[wc-k] rollup scope=starve redefers={} limit={} -> STARVED",
+                r,
+                E_REDEFER_MAX
+            );
+        }
     }
     let n = E_DECL_LINES_OUT.fetch_add(1, Ordering::Relaxed) + 1;
     if n > E_DECL_LINES {
@@ -610,20 +639,29 @@ pub fn erase_note(
         // `-> DIRECT`, which needs no completeness claim and which — after WC-L — no emitter in this
         // module can produce at all.
         //
-        // WC-L: `defers`/`redefers`/`coalesced` deliberately do NOT enter the precedence. A deferral
-        // is a fill that arrived through the staged path one pass late, so it neither tore nor went
+        // WC-L: `defers` and `coalesced` deliberately do NOT enter the precedence. A deferral that is
+        // delivered arrived through the staged path one pass late, so it neither tore nor went
         // direct, and demoting the verdict for it would make the honest report of contention
-        // indistinguishable from the regime the arc removed. They are reported as counts because
-        // the operator wants to know contention happened, not because it invalidates TEAR-FREE.
+        // indistinguishable from the regime the arc removed.
+        //
+        // `redefers` is different, and the lens review was right to insist on it. A requeue is a
+        // repaint that has not happened yet, and past `E_REDEFER_MAX` the honest reading is that the
+        // erase path is not draining — which on the panel is a dead window's frame where the desktop
+        // should be. `TEAR-FREE` over a visible ghost would be WC-K's mistake repeated in a new
+        // place. It sits BELOW `UNSTAGED` in the precedence because a starved box may still arrive
+        // (nothing has been lost, only delayed), where a dropped one provably never will.
         let torn_n = E_TORN.load(Ordering::Relaxed);
         let nc = E_NONCONTIG.load(Ordering::Relaxed);
         let decl = E_DECLINE.load(Ordering::Relaxed);
+        let redef = E_REDEFER.load(Ordering::Relaxed);
         let verdict = if nc > 0 {
             "SPLIT"
         } else if torn_n > 0 {
             "AT-RISK"
         } else if decl > 0 {
             "UNSTAGED"
+        } else if redef > E_REDEFER_MAX {
+            "STARVED"
         } else {
             "TEAR-FREE"
         };

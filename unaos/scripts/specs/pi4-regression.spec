@@ -583,8 +583,18 @@ FORBID \[wc-k\] .*-> UNSTAGED
 # ---    `staged=drop`/`-> LOST` is a fill that could neither stage nor defer (permanent `geom`/`cap`
 # ---    reasons, unreachable on any panel this kernel drives). It feeds `declines=` and so the
 # ---    `-> UNSTAGED` FORBID; the explicit FORBID here names the symptom as well as the verdict.
+# ---
+# ---    `-> STARVED` is the DELIVERY verdict, and it is separate from the tearing one on purpose. A
+# ---    deferral that arrives is a latency cost; a deferral that keeps being requeued is a repaint
+# ---    that has NOT happened, which on the panel is a dead window's last frame where the desktop
+# ---    should be -- the P61 ghost by a new route. `TEAR-FREE` printed over that would be exactly
+# ---    WC-K's mistake (a verdict describing the samples it liked rather than the panel), so past
+# ---    `E_REDEFER_MAX` requeues the rollup says STARVED instead. It also gets a one-shot
+# ---    `scope=starve` line of its own, because the sampled rollup fires at fill 4 and starvation
+# ---    by its nature arrives late -- an already-printed rollup cannot retract.
 REQUIRE \[wc-k\] erase box=.* staged=defer reason=.* requeued=no -> DEFERRED
 FORBID \[wc-k\] .*-> LOST
+FORBID \[wc-k\] .*-> STARVED
 # --- PULSE-2: the always-running per-core CPU pulse, as an INSTRUMENT PANEL in the standing gap at
 # ---    the bottom of the panel -- below the tiled windows, above the PI-UI-2 status line.
 # ---
