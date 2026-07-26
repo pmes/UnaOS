@@ -22,6 +22,8 @@
 //!   `FrameBuffer`s (the framebuffer + a cached-RAM back buffer). The steady-state GUI renderer.
 //! - [`fbcon`] — the boot/panic text console (a log sink for hardware with no serial port),
 //!   drawn straight to its own `FrameBuffer` handle (it runs pre-heap, so no back buffer).
+//! - [`wm`] — the window table and compositor: EL0 surfaces composited onto the panel with
+//!   kernel-drawn chrome. `screen::present_surface` is a compat shim over its window 0.
 //! - [`WRITER`] — the framebuffer the GUI's `Screen` flushes to and that fbcon mirrors onto.
 //!
 //! `WRITER` and `fbcon` are handles to the *same* physical framebuffer; they are used at
@@ -31,9 +33,28 @@
 pub mod fbcon;
 pub mod framebuffer;
 pub mod screen;
+// WC-A: the window table + compositor. Owns which pixels of which surface reach the panel; the
+// aarch64 window syscalls (WC-B) are thin fail-closed wrappers over its API.
+pub mod wm;
+// CURSOR-1: the system cursor sprite, drawn into the FRONT framebuffer as the last painter of a
+// pass (save-under, not a recomposite) so it sits on top of both the console and every window.
+// Pointer position + auto-hide state stay in `pal::cursor`; this module only paints.
+pub mod cursor;
 // VWIT: headless regression witness for the damage-tracked `Screen` present path (arch-neutral;
 // runs only when the `tste` self-test is invoked). See `docs/dev/OS/08_VIDEO/engine.md` §7.
 pub mod witness;
+// WC-F: the scan-out ground-truth probe — the live FrameBuffer checked against the firmware's own
+// geometry, plus a twin-pattern render (compositor addressing vs firmware-pitch addressing) that
+// discriminates a blit-path defect from a scan-out one. `witness`-gated AND aarch64-only, so the
+// flashable Pi media and every x86 artifact are byte-identical with it absent.
+#[cfg(all(target_arch = "aarch64", feature = "witness", feature = "baremetal"))]
+pub mod wcf;
+// WC-G: the window PRESENT path instrumented while it runs — four checksums of one surface around
+// one blit, a scan-out read-back, and the blit's duration, which together separate a source race
+// from a coherency fault from a blit-path defect from an unbuffered-copy timing defect. Same gating
+// as `wcf` (witness + aarch64 only), so the flashable media stay byte-identical.
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+pub mod wcg;
 // VPERF instrumentation (counters, fbmem readout, PCI display probe, scripted scroll scenario).
 // x86-only AND knob-gated: with the feature off — or on aarch64 regardless — nothing here
 // compiles, so those artifacts stay byte-identical.

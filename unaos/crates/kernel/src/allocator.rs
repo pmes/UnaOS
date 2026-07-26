@@ -71,6 +71,20 @@ unsafe impl GlobalAlloc for Locked<Heap> {
 #[global_allocator]
 static ALLOCATOR: Locked<Heap> = Locked::new(Heap::empty());
 
+// XCARVE-4 diagnostic surface (mirrors hw-jetson): expose the heap's [lo, hi) so shared
+// consumers (xhci scratchpad bounds guard) can sanity-check placements. (0, 0) pre-init.
+use core::sync::atomic::{AtomicUsize, Ordering};
+static HEAP_LO: AtomicUsize = AtomicUsize::new(0);
+static HEAP_HI: AtomicUsize = AtomicUsize::new(0);
+
+/// The heap's `[lo, hi)` byte span (identity-mapped PA==VA on the metal targets). `(0, 0)` before
+/// `init_heap_raw` has run.
+pub fn heap_bounds() -> (usize, usize) {
+    (HEAP_LO.load(Ordering::Relaxed), HEAP_HI.load(Ordering::Relaxed))
+}
+
 pub unsafe fn init_heap_raw(heap_start: *mut u8, heap_size: usize) {
+    HEAP_LO.store(heap_start as usize, Ordering::Relaxed);
+    HEAP_HI.store(heap_start as usize + heap_size, Ordering::Relaxed);
     unsafe { ALLOCATOR.lock().init(heap_start, heap_size) };
 }

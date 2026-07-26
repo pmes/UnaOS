@@ -71,11 +71,91 @@ framebuffer by physical address (stored as `usize`, so the type is `Send` and
 
 `Screen::new(front)` takes a `FrameBuffer` handle and builds a cached-RAM back
 buffer. All GUI drawing (`put_pixel`, `fill_rect`, `scroll_up`, …) goes to the
-back buffer; `flush()` copies **only the damaged region** to the (slow)
+back buffer; `flush()` copies **only the damaged region(s)** to the (slow)
 framebuffer. The `kernel_main` loop calls the equivalent of `flush()` once per
 frame, so the idle path stays cheap when nothing changed.
 
+Damage is tracked as a small **set** of up to `MAX_DAMAGE_RECTS` (16) independent
+rectangles, not a single bounding box (VUG-FPS). A new dirty rect merges into any
+rect it overlaps (cascading); on overflow it folds into the least-growth
+neighbour, so the set is always a correct **superset** of the true damage — never
+dropping a dirty pixel, only rarely reflushing a clean one. `flush()` blits each
+rect as its own run of bulk row copies. This matters for animated content with
+**disjoint** dirty regions: a full-height rotating crystal plus two corner meters
+plus a moving cursor would, under a single bounding box, collapse to a
+panel-spanning box that reflushed most of the framebuffer every frame — the metal
+`vug` 8–9 fps bottleneck. As separate rects each blits tightly. `Screen`'s
+`last_flush_bytes()` reports the bytes the last flush copied (the `[vugfps]`
+bandwidth witness); `last_flush_rects()` and `last_union_dims()` report the
+merged rect count and the union bounding-box `(w, h)` of that flush's damage
+(VUG-FPS-2), so a metal capture can see whether the disjoint regions really
+stay separate or the merge cascade collapses them to a near-panel box.
+
+The `[vugfps]` line (emitted ~1×/s by the `vug` loop) reads:
+
+```
+[vugfps] F.f fps  N bytes/frame flushed  bands=B  rects=R union=WxH  raster=Xus flush=Yus (n frames / m ms)
+```
+
+where `raster` and `flush` are the per-frame cycle split (VUG-FPS-2) — the draw
+span (input drain + all back-buffer rasterisation) vs the present span
+(`pal.render()`: the row blits + one cache-clean sweep). It names whether a slow
+frame is raster-bound or flush(bandwidth)-bound; µs are derived from the aarch64
+generic-timer rate (raw cycles on x86, where this witness is not the target). The
+copy path itself is already a per-row `copy_nonoverlapping` (a word-wide memcpy),
+not a per-pixel re-encode — so the split, not the copy loop, is where a flush
+regression would show.
+
+The `vug` crystal demo drives this with dirty-rect rendering: instead of clearing
+the whole panel each frame it background-fills the crystal's **vacated** (previous
+projected-vertex bbox) and **current** footprints as *separate* fills — plus the
+cursor's old footprint — and the HUD / corner meters clear their own small blocks.
+Painter's back-to-front face ordering is unchanged. Keeping erase and paint as
+separate damage rects (rather than one `prev ∪ curr` box) is VUG-FPS-3: the
+`DamageSet` merges the two while they overlap — the steady auto-tumble, where
+`prev ≈ curr`, is byte-identical to a single-union erase — but keeps them tight
+and disjoint when the crystal jumps (a drag/zoom, or a wide/tall tumble extreme),
+so the dead gap *between* an old and new position is never filled or flushed. A
+single union rect there was the P46 damage that "grew and never shrank",
+ballooning both the raster fill and the flush bytes as the frame time decayed.
+
 This is what the console / `pal::TargetPal` draws through in steady state.
+
+### VUG-FPS-4 — the flush is already per-rect; the missing frame time is the tail
+
+A P47 reading of the steady-state `[vugfps]` line (`rects≈4 union≈1380×1180`,
+`~3 MB/frame`, `raster 23–30 ms + flush ~19 ms`, `~5–6 fps`) raised the question
+of whether the four disjoint rects were collapsing to one panel-spanning *flush*.
+They are not. `flush()` iterates the damage rects and blits each independently
+(the serial path in `Screen::flush`, and the VUG-PAR band path likewise clips each
+rect into its band), so `last_flush_bytes` is the **sum of the rects' areas**, not
+the union bbox's area. The proof rides the existing witness: `union=1380×1180`
+(≈1.6 M px ≈ 6.5 MB) while `bytes/frame ≈ 3 MB` — the flush already moves only
+~half the union, i.e. the true per-rect sum. The 3 MB is dominated by the
+crystal's own full-height bounding box (a real, moving region that must be
+repainted), so there is no disjoint-union flush to eliminate — VUG-FPS/-3 already
+collapsed the bytes to the per-rect sum. `union=WxH` is a *diagnostic bbox* the
+witness reports, never the quantity flushed.
+
+That left P47's bigger puzzle: raster + flush explained only ~45 ms of a ~172 ms
+frame. The missing ~130 ms is **outside** the raster+flush bracket the `[vugfps]`
+line timed — it is the post-present **tail**: the accounting after `pal.render()`
+plus the `yield_now()` cooperative-reschedule gap before the next frame's loop
+head, during which the crystal task is de-scheduled while `CNTVCT` free-runs. To
+name it rather than infer it, the `vug` loop now also emits (~1×/s):
+
+```
+[vugfps4] drain=Aus draw=Bus flush=Cus tail=Dus  sum=Sus (=1e6/fps) — tail is the post-present yield/reschedule gap
+```
+
+`drain` (input pump), `draw` (all rasterisation after the drain), `flush`
+(`pal.render()`, identical to `[vugfps]`'s `flush`) and `tail` are **disjoint**
+and tile the whole frame, so `sum` tracks `1000000/fps`: every microsecond is
+attributed. On the next metal capture the ~130 ms lands in `tail`, confirming the
+frame is neither raster- nor bandwidth-bound but **reschedule-bound** — the
+cooperative single-present-per-frame loop yielding a full scheduler round-trip
+between frames. (QEMU raspi4b cannot reproduce the metal scheduler timing; the
+split ships on the same serial line the metal capture reads.)
 
 ---
 

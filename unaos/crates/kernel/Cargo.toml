@@ -32,6 +32,13 @@ skip_xhci = []
 # effective framebuffer geometry/format (the result of EDID/GOP mode selection) and halts, so the
 # whole boot log can be photographed on serial-less hardware. Enable via `UNAOS_BOOTLOG=1`.
 bootlog = []
+# CLOCK-2: opt-in log timestamps on the kernel serial log. Prefixes each serial LINE with a compact
+# fixed-width timestamp — monotonic ms since boot (`[  12345ms] `) before a civil anchor exists,
+# flipping to UTC wall time (`[15:04:07Z] `) once SNTP/`setdate` anchors `crate::clock`. UART
+# byte-stream ONLY — the fbcon + capture-ring mirrors keep the raw text, so tste/UNAOS.LOG are
+# unchanged. DEFAULT OFF => module + prefix path vanish and serial is byte-identical (witness/mbench
+# specs parse serial lines and must be unaffected). Enable via `UNAOS_LOGTS=1`.
+logts = []
 # Raspberry Pi 4 build: the BCM2711 PL011 is not at the QEMU `virt` MMIO address the aarch64 serial
 # hardcodes, so don't touch that UART (it would be RAM on the Pi) — rely on fbcon for on-screen
 # output, like the Mac. Enable via `UNAOS_PI=1`.
@@ -41,12 +48,43 @@ pi = []
 # entry for a raw `_start` that sets up a stack, zeroes BSS, enables a minimal MMU (so atomics work),
 # builds a BootInfo, and calls kernel_main. Implies `pi`. Enable via `UNAOS_BAREMETAL=1`.
 baremetal = ["pi"]
+# VUG-PAR: band-parallel Screen::flush — split the damaged row-copy blit (and large clears) into
+# disjoint scanline bands dispatched to free secondary cores via sched::spawn_joinable + a JoinHandle
+# join barrier, falling back to the single-core serial flush when no free AP is scheduled. Only
+# compiled on the Pi bare-metal path (needs `sched`; gated `all(vugpar, baremetal)`). OFF => the
+# parallel machinery + its sched dependency vanish and `Screen::flush` is byte-identical to the
+# serial VUG-FPS path. The `[vugfps]` witness always reports `bands=N` (N=1 when off/serial). QEMU
+# raspi4b stays deterministic (the join barrier is a correctness barrier; band count tracks the
+# actually-scheduled cores). Enable via `UNAOS_VUGPAR=1`. See scripts/pi-vugpar-bench.md.
+vugpar = []
+# SMP-7: per-core secondary bring-up evidence on the Pi spin-table path (`arch/aarch64/smp.rs`).
+# Records, for each AP, the release-write timestamp, whether/when it checked in (MMU on), the MPIDR it
+# derived for itself, how far through bring-up it got, and any re-release count — then prints one
+# `[smp7] cores online=<mask> missed=<mask> …` snapshot after bring-up settles. Read-only telemetry;
+# DEFAULT OFF => every call site vanishes and no [smp7] line is emitted. NOTE this feature's knob-off
+# state is byte-identical *to the rest of SMP-7*, not to the pre-arc image: the arc also ships an
+# ALWAYS-ON change (the pre-release `DC CIVAC` over SECONDARY_STACKS + the release-loop refactor that
+# the retry path shares), which is in every image regardless of this feature. Enable via `UNAOS_SMP7=1`.
+smp7 = []
+# SMP-7 recovery experiment: re-issue the spin-table release (write + DC CVAC + DSB + SEV) for an AP
+# that has NOT checked in at all after its first wait, up to 3 times. Never applied to a core that
+# arrived and then stopped (it has already left the spin-table — re-releasing it would be wrong).
+# Implies `smp7`, so the retry count is always reported alongside the evidence that explains it.
+# DEFAULT OFF. Enable via `UNAOS_SMP7_RETRY=1`.
+smp7_retry = ["smp7"]
 # K2 metal money-shot: turn k2_liveenf_launcher into a REAL two-boot cross-reboot power-cycle proof (instead of
 # the same-boot simulate). One image, flashed once, booted twice: boot-1 (K2PRIV.BIN absent) creates+persists+
 # LEAVES an owned file; power-cycle; boot-2 (K2PRIV.BIN present) verifies the LIVE boot rebuild reinstalled the
 # row across the power-cycle (owner admitted BY NAME / impostor denied), then cleans. For the ATTENDED Pi bench
 # only. Enable via `UNAOS_K2_LEAVE=1 ./arroyo kernel8`. OFF => the normal same-boot proof (battery byte-identical).
 k2_leave = []
+# SMP-8 witness: print the raw CPUECTLR_EL1 each core read at EL2 in `drop_to_el1` BEFORE any fix, plus
+# whether the Cortex-A72 SMPEN bit (6) was already set by firmware — the `[smp8]` lines. A core that
+# reads `smpen=0` was handed to us OUTSIDE cluster coherency, with a non-working exclusive monitor, and
+# would hang on its first atomic: the candidate cause of the P53 "only 2 of 4 cores" metal report.
+# Read-only telemetry; DEFAULT OFF => the reporter and its call site vanish. The SMPEN *set* itself is
+# always on (required configuration per the A72 TRM, not a workaround). Enable via `UNAOS_SMP8=1`.
+smp8 = []
 # Run the SMP scheduler demo/self-test at boot (spawns demo threads across the APs, incl. the RwLock
 # torn-read check). Opt-in via `UNAOS_SCHED_DEMO=1`: it's a QEMU-verified smoke test whose tick-based
 # timing stalls boot for minutes on real hardware (uncalibrated APIC timer). Off => scheduler still
@@ -367,6 +405,15 @@ core3probe = ["pi"]
 # kernel8`. See arch_arm64.md §PI-V3D and scripts/pi-v3d-bench.md.
 v3d = ["baremetal"]
 
+# V3D-DEEP: the SLOW half of the V3D diagnostic battery — the probes whose verdicts are already BANKED
+# on metal and that cost multi-second anti-hang backstops (and metres of serial) on every armed boot:
+# the `[v3d48]` empty-frame bisection ladder (6 rungs x a ~0.5 s FLDONE backstop each), the
+# `[v3d59] frameclose` post-wedge time series (64 x 1 ms + its verdict line), and the `[v3d58] rerender`
+# negative control (an extra full CT1 clear job). Requires `v3d`; OFF (default) an armed V3D boot runs
+# the FAST probes only and prints one honest `[v3d] deep=off …` line naming what was skipped. Enable via
+# `UNAOS_V3D=1 UNAOS_V3D_DEEP=1 UNAOS_PI=1 ./arroyo kernel8`. See docs/dev/OS/08_VIDEO/v3d.md.
+v3d_deep = ["v3d"]
+
 # PI-USB-1: the BCM2711 PCIe root complex + VL805 xHCI attach (arch/aarch64/piusb.rs) — brcmstb RC
 # bridge reset / link-up / MEM-window + inbound-BAR config, VL805 (1106:3483) enumeration + BAR sizing,
 # the NOTIFY_XHCI_RESET mailbox, and the polled shared-xHCI attach to the "controller halted-but-decoding
@@ -393,6 +440,16 @@ piusb = ["baremetal"]
 # kernel8`. QEMU raspi4b MAY model GENET (M1 probes and reports honestly). See arch_arm64.md §PI-GENET and
 # scripts/pi-genet-bench.md.
 genet = ["dep:smoltcp"]
+
+# PI-NET-13: arm the QEMU TCP/HTTP/mDNS regression gate — a hardware-free in-kernel loopback seam + a
+# scripted smoltcp peer that drives the SAME pool/reaper/http/mdns service code the GENET path runs
+# (`NetService` is generic over the smoltcp `Device`). Because the GENET datapath no-ops under QEMU
+# raspi4b (no GENET modelled), this is the ONLY way those TCP behaviors are exercised off metal. Implies
+# `genet` (the module + `NetService` live there). The gate runs at the TOP of `genet_bringup` (before the
+# DTB skip, so raspi4b executes it) and prints a self-checking `:: NET-GATE: ... PASS [w=0x..] ::` witness.
+# Default OFF => the loopback module + its call vanish and the kernel8 image is byte-identical to a plain
+# `genet` build. Enable via `UNAOS_NETTEST=1 UNAOS_PI=1 ./arroyo kernel8-test`.
+nettest = ["genet"]
 
 # NS-SPAN (K7 WATCH rider): instrument the IRQ-masked namespace-lock hold at the three fused K6/K3/K5
 # persist sites (`sys_fgrant_revoke_2phase`, `native_persist_grants`, `native_persist_grow`) — read
@@ -480,7 +537,7 @@ unafs = { path = "../../libs/fs/unafs", default-features = false }
 # ORIN-NET-4: the mature TCP/IP stack for the aarch64/tegra NIC bind — the same crate/version/feature
 # set the x86 `smolnet` uses, declared here (aarch64) as optional so it is pulled ONLY under the
 # `net4` feature (via `dep:smoltcp`). Default-OFF net4 => not compiled => aarch64 media byte-identical.
-smoltcp = { version = "=0.13.1", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-icmp", "socket-udp", "socket-tcp", "socket-dhcpv4"], optional = true }
+smoltcp = { version = "=0.13.1", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-icmp", "socket-udp", "socket-tcp", "socket-dhcpv4", "multicast"], optional = true }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 x86_64 = "0.15.4"
@@ -492,4 +549,4 @@ uart_16550 = "0.6.0"
 #   socket-icmp     — the ICMP echo socket that `ping`/the boot witness drive
 #   socket-udp      — SOCK-2: the UDP sockets behind the sys_socket/bind/sendto/recvfrom family
 #   socket-tcp      — SOCK-3: the TCP client sockets behind sys_connect/sys_send/sys_recv
-smoltcp = { version = "=0.13.1", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-icmp", "socket-udp", "socket-tcp", "socket-dhcpv4"], optional = true }
+smoltcp = { version = "=0.13.1", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-icmp", "socket-udp", "socket-tcp", "socket-dhcpv4", "multicast"], optional = true }

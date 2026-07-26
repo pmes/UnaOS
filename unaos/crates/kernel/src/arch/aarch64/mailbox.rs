@@ -57,17 +57,41 @@ const TAG_SET_DEPTH: u32 = 0x0004_8005;
 const TAG_SET_PIXEL_ORDER: u32 = 0x0004_8006;
 const TAG_ALLOCATE_FB: u32 = 0x0004_0001;
 const TAG_GET_PITCH: u32 = 0x0004_0008;
+// WC-E: the READ-side companions of the framebuffer setters. `init_framebuffer` programs the geometry
+// and then keeps the values it REQUESTED; the firmware is free to clamp, round or refuse any of them,
+// and every one of those divergences is a scan-out defect that looks like garble on the panel and like
+// nothing at all in the serial log. These tags ask the firmware what it actually settled on, so the
+// wire carries the scan-out ground truth (see `witness_fb_geometry`). Query-only — they set nothing.
+const TAG_GET_VIRT_WH: u32 = 0x0004_0004; // get virtual (framebuffer) width/height
+const TAG_GET_VIRT_OFFSET: u32 = 0x0004_0009; // get the virtual viewport offset {x, y}
+const TAG_GET_DEPTH: u32 = 0x0004_0005; // get bits per pixel
+const TAG_GET_PIXEL_ORDER: u32 = 0x0004_0006; // get pixel order (0 = BGR, 1 = RGB)
+const TAG_GET_ALPHA_MODE: u32 = 0x0004_0007; // get alpha mode (0 = enabled/0-opaque, 1 = reversed, 2 = ignored)
 const TAG_GET_CLOCK_RATE: u32 = 0x0003_0002; // M6g: query a clock's current rate (value buffer {id, rate})
 // PI-V3D-1: firmware property tags for powering + clocking the VideoCore VI (V3D) block. These are
 // the Pi-4/VC6 path (the legacy VC4 `Enable_QPU`/set-power tags are NOT used here). See
 // arch_arm64.md §PI-V3D and the scout research of record. `v3d`-gated so a knob-off kernel8 is
 // byte-identical to baseline (these are additive, not called on any default path).
-#[cfg(feature = "v3d")]
+#[cfg(any(feature = "v3d", feature = "piusb"))]
 const TAG_SET_DOMAIN_STATE: u32 = 0x0003_8030; // set a power-domain's on/off state (value {domain, state})
-#[cfg(feature = "v3d")]
+#[cfg(any(feature = "v3d", feature = "piusb"))]
 const TAG_SET_CLOCK_STATE: u32 = 0x0003_8001; // enable/disable a clock's GATE (value {clock_id, state})
 #[cfg(feature = "v3d")]
 const TAG_SET_CLOCK_RATE: u32 = 0x0003_8002; // set a clock's rate (value {clock_id, rate_hz, skip_turbo})
+// PIUSB-32: the READ-side companions the diagnostic census uses to witness the power/clock state of the
+// candidate firmware domains BEFORE the deferred RC APB read (which P39/P40/P41 metal proved hard-stalls
+// the CPU). Query-only tags — they never change firmware state. `{id, state}` value buffers; the reply
+// `state` echoes bit0 = on/active, bit1 = "device/clock/domain does not exist". `piusb`-gated (additive).
+#[cfg(feature = "piusb")]
+const TAG_GET_POWER_STATE: u32 = 0x0002_0001; // get a firmware DEVICE's power state (value {device_id, state})
+#[cfg(feature = "piusb")]
+const TAG_GET_DOMAIN_STATE: u32 = 0x0003_0030; // get a power-DOMAIN's on/off state (value {domain, state})
+// PI-V3D-58: widened to match its only consumer. V3D-55 made `get_clock_state` compile for `v3d` as
+// well as `piusb` (so the clock-domain audit cannot depend on `piusb` being enabled in the same build)
+// but left this tag `piusb`-only, so a `v3d`-without-`piusb` build failed to compile at E0425. The two
+// cfgs must agree or the widening is a no-op that only breaks the build it was meant to enable.
+#[cfg(any(feature = "piusb", feature = "v3d"))]
+const TAG_GET_CLOCK_STATE: u32 = 0x0003_0001; // get a clock's GATE state (value {clock_id, state})
 // PI-USB-1: notify the VideoCore firmware to reset (and reload the SPI-EEPROM firmware into) the VIA
 // VL805 xHCI behind the BCM2711 PCIe RC. The RPi bootloader normally loads the VL805 firmware at power-on;
 // this tag re-issues that reset for an OS bringing the controller up itself. Value buffer = one u32, the
@@ -94,6 +118,34 @@ const BYTES_PER_PIXEL: u32 = DEPTH_BITS / 8;
 /// to the monitor's preferred mode at boot). 1920×1080 is the safe ubiquitous HDMI mode.
 const FALLBACK_W: u32 = 1920;
 const FALLBACK_H: u32 = 1080;
+
+/// WC-D — the compile-time PANEL OVERRIDE (`UNAOS_FBW` / `UNAOS_FBH`), 0 = off (query the firmware).
+/// See [`init_framebuffer`] for why a size knob is a correctness tool and not a convenience: the window
+/// compositor's upscale factor is a function of the panel, so a 640x480 QEMU gate cannot reach the blit
+/// path a 1920x1200 bench panel runs. Default-quiet: unset => the const is 0 => not one instruction of
+/// behaviour changes.
+pub const FORCE_W: u32 = parse_u32(option_env!("UNAOS_FBW"));
+pub const FORCE_H: u32 = parse_u32(option_env!("UNAOS_FBH"));
+
+/// Decimal `u32` parse usable in a `const` initialiser (no `str::parse` in const context). Any
+/// non-digit or absent value yields 0, which is the "override off" value — fail-closed to the
+/// firmware-queried mode rather than to an invented resolution.
+const fn parse_u32(s: Option<&str>) -> u32 {
+    let b = match s {
+        Some(s) => s.as_bytes(),
+        None => return 0,
+    };
+    let mut v: u32 = 0;
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] < b'0' || b[i] > b'9' {
+            return 0;
+        }
+        v = v * 10 + (b[i] - b'0') as u32;
+        i += 1;
+    }
+    v
+}
 
 /// The property message buffer. One static buffer, used only during single-core boot
 /// (build_boot_info, before SMP/interrupts), so no locking is needed. The framebuffer message is
@@ -266,7 +318,7 @@ pub fn get_clock_rate(clock_id: u32) -> Option<u32> {
 /// mailbox failure. Used to power the V3D block (`POWER_DOMAIN_V3D`) before touching its registers —
 /// with the domain off, V3D MMIO reads garbage. Single-user `MBOX` like the other calls: the V3D
 /// bring-up runs single-threaded on the BSP after the boot framebuffer call is long done.
-#[cfg(feature = "v3d")]
+#[cfg(any(feature = "v3d", feature = "piusb"))]
 pub fn set_power_domain(domain: u32, state: u32) -> Option<u32> {
     request(0, 8 * 4); // total size (8 words used)
     request(1, 0); // request
@@ -290,7 +342,7 @@ pub fn set_power_domain(domain: u32, state: u32) -> Option<u32> {
 /// power + rate both ACKed yet the V3D never decoded. Reply `state`: bit0 = clock active, bit1 = clock
 /// not present. Returns `Some(true)` if the firmware reports the clock present AND active,
 /// `Some(false)` if present-but-off, `None` on a mailbox failure or an absent clock.
-#[cfg(feature = "v3d")]
+#[cfg(any(feature = "v3d", feature = "piusb"))]
 pub fn set_clock_state(clock_id: u32, on: bool) -> Option<bool> {
     request(0, 8 * 4); // total size (8 words used)
     request(1, 0); // request
@@ -308,6 +360,90 @@ pub fn set_clock_state(clock_id: u32, on: bool) -> Option<bool> {
         return None; // firmware reports the clock not present
     }
     Some(state & 0x1 != 0)
+}
+
+/// PIUSB-32: the read-only power/clock STATE witnesses. Each returns the raw firmware `state` reply word
+/// (bit0 = on/active, bit1 = "does-not-exist") so the census can print the whole word, or `None` on a
+/// mailbox transport failure. Query-only: none of these three tags mutates firmware state — they are the
+/// diagnostic companions to `set_power_domain` / `set_clock_state`. Single-user `MBOX` like every other
+/// call here (the census runs single-threaded on the BSP, boot framebuffer call long done).
+#[cfg(feature = "piusb")]
+pub fn get_power_state(device_id: u32) -> Option<u32> {
+    request(0, 8 * 4);
+    request(1, 0);
+    request(2, TAG_GET_POWER_STATE);
+    request(3, 8); // value buffer (2 words: device_id, state)
+    request(4, 0);
+    request(5, device_id);
+    request(6, 0); // state (reply)
+    request(7, TAG_END);
+    if !mbox_call(8) {
+        return None;
+    }
+    Some(reply(6))
+}
+
+/// PIUSB-32: read-only power-DOMAIN state (the same domain-id namespace `set_power_domain` writes —
+/// e.g. `POWER_DOMAIN_V3D`). Returns the firmware `state` word (bit0 on, bit1 does-not-exist).
+#[cfg(feature = "piusb")]
+pub fn get_domain_state(domain: u32) -> Option<u32> {
+    request(0, 8 * 4);
+    request(1, 0);
+    request(2, TAG_GET_DOMAIN_STATE);
+    request(3, 8); // value buffer (2 words: domain, state)
+    request(4, 0);
+    request(5, domain);
+    request(6, 0); // state (reply)
+    request(7, TAG_END);
+    if !mbox_call(8) {
+        return None;
+    }
+    Some(reply(6))
+}
+
+/// PIUSB-32: read-only CLOCK gate state (the clock-id namespace `set_clock_state` writes — e.g.
+/// `CLOCK_ID_V3D`). Returns the firmware `state` word (bit0 active, bit1 does-not-exist).
+/// PI-V3D-55: also compiled for the `v3d` feature — the clock-domain audit reads the V3D gate state
+/// directly, and must not depend on `piusb` happening to be enabled in the same build.
+#[cfg(any(feature = "piusb", feature = "v3d"))]
+pub fn get_clock_state(clock_id: u32) -> Option<u32> {
+    request(0, 8 * 4);
+    request(1, 0);
+    request(2, TAG_GET_CLOCK_STATE);
+    request(3, 8); // value buffer (2 words: clock_id, state)
+    request(4, 0);
+    request(5, clock_id);
+    request(6, 0); // state (reply)
+    request(7, TAG_END);
+    if !mbox_call(8) {
+        return None;
+    }
+    Some(reply(6))
+}
+
+/// PI-V3D-55: the RAW `GET_CLOCK_RATE` query — transport failure and a genuine **0 Hz grant** are
+/// DIFFERENT facts and this is the only caller that must tell them apart. `get_clock_rate` above
+/// deliberately collapses both into `None` (its EMMC2 caller wants "usable rate or nothing"), which
+/// would make the single most diagnostic V3D reading — the firmware granting the V3D clock 0 Hz —
+/// indistinguishable from a dead mailbox, and would render the 0 Hz verdict arm unreachable.
+///
+/// Returns `None` **only** when `mbox_call` itself fails (no reply / bad response code); `Some(0)` is a
+/// SUCCESSFUL transaction reporting a real zero rate. Additive: `get_clock_rate`'s existing contract
+/// and its callers are untouched.
+#[cfg(feature = "v3d")]
+pub fn get_clock_rate_raw(clock_id: u32) -> Option<u32> {
+    request(0, 8 * 4); // total size (8 words used)
+    request(1, 0); // request
+    request(2, TAG_GET_CLOCK_RATE);
+    request(3, 8); // value buffer size (2 words: clock_id, rate)
+    request(4, 0); // request code
+    request(5, clock_id); // clock id (reply preserves it)
+    request(6, 0); // rate (reply)
+    request(7, TAG_END);
+    if !mbox_call(8) {
+        return None; // transport failure — NOT a 0 Hz grant
+    }
+    Some(reply(6)) // a successful transaction, rate verbatim (0 included)
 }
 
 /// PI-V3D-1: set a firmware-managed clock's rate in Hz. Returns the rate the firmware actually
@@ -339,16 +475,255 @@ pub fn set_clock_rate(clock_id: u32, rate_hz: u32) -> Option<u32> {
 /// VL805 reset/firmware-load it does at cold boot; a bringing-up OS issues it after enumerating the
 /// controller and before attaching the xHCI driver. Returns whether the mailbox reported success.
 /// Single-user `MBOX` like the other calls (boot-time, single-threaded, framebuffer call long done).
+///
+/// PIUSB-12: the full response witness for one NOTIFY. The RPi property protocol writes THREE
+/// distinct status words the caller must separate to localise a no-op:
+///   * `overall` = buffer word 1: the whole-message code. `0x8000_0000` = processed OK,
+///     `0x8000_0001` = "error parsing request buffer" (malformed message). `ok` is `overall ==
+///     0x8000_0000`. This alone does NOT prove any individual tag was honoured.
+///   * `tag_code` = the tag's own request/response word (our buffer word 4). On REQUEST it is 0;
+///     on a honoured RESPONSE the firmware sets bit 31 and puts the returned byte-length in bits
+///     [30:0] (so a 4-byte response reads `0x8000_0004`). If the firmware does NOT recognise /
+///     act on the tag, it leaves bit 31 CLEAR here. **This is the discriminating word** — it, not
+///     the value echo, says whether the VideoCore actually ran the VL805 reset/load handler.
+///   * `echo` = the value-buffer word (our buffer word 5). For NOTIFY_XHCI_RESET the firmware does
+///     NOT echo `dev_addr` back — it is a command tag, and on metal (boot-P21) it returned 0 even
+///     with the mailbox reporting success. Because we POST `dev_addr` (non-zero) into this slot, a
+///     read-back of 0 also PROVES cache invalidation worked (a stale cached read would return our
+///     own posted `dev_addr`, not 0), so `echo` is a cache-coherency witness, not a load witness.
+/// `buf_pa` is the ARM-physical address of the message buffer (for correlating the raw dump).
 #[cfg(feature = "piusb")]
-pub fn notify_xhci_reset(dev_addr: u32) -> bool {
+pub struct NotifyResp {
+    pub ok: bool,
+    pub overall: u32,
+    pub tag_code: u32,
+    pub echo: u32,
+    pub buf_pa: usize,
+}
+
+/// PI-USB-1 / PIUSB-12: ask the firmware to reset+reload the VL805 xHCI (tag `NOTIFY_XHCI_RESET`,
+/// `0x00030058`), `dev_addr = (bus<<20)|(dev<<15)|(fn<<12)` = `0x0010_0000` for bus1/dev0/fn0.
+/// Returns the full [`NotifyResp`] so the caller can print the per-word witness that discriminates
+/// "tag honoured, VL805 reset ran" (tag_code bit31 set) from "tag silently dropped" (bit31 clear).
+/// Linux (`rpi_reset_reset`) checks only the overall return code; we witness every word because the
+/// CNR-never-clears wall means we must know WHICH layer is failing.
+#[cfg(feature = "piusb")]
+pub fn notify_xhci_reset(dev_addr: u32) -> NotifyResp {
     request(0, 7 * 4); // total size (7 words used)
     request(1, 0); // request
     request(2, TAG_NOTIFY_XHCI_RESET);
     request(3, 4); // value buffer size (1 word: the PCI device address)
-    request(4, 0); // request code
+    request(4, 0); // request code (firmware overwrites with 0x8000_0000|len if honoured)
     request(5, dev_addr);
     request(6, TAG_END);
-    mbox_call(7)
+    let ok = mbox_call(7);
+    NotifyResp { ok, overall: reply(1), tag_code: reply(4), echo: reply(5), buf_pa: mbox_phys() }
+}
+
+/// WC-E — the SCAN-OUT GROUND TRUTH witness. One line, once, at framebuffer bring-up, carrying every
+/// geometry field the display pipe actually scans with, read back FROM THE FIRMWARE rather than echoed
+/// from what we asked for.
+///
+/// ### Why this exists
+/// `init_framebuffer` sends five setters and keeps the values it REQUESTED (`width`/`height`/
+/// `DEPTH_BITS`/`PIXEL_ORDER_BGR`/offset 0,0), reading back only base, size and pitch. The firmware may
+/// clamp a size to the panel's mode, round a pitch up for alignment, refuse a depth, or ignore a pixel
+/// order — and every one of those leaves our `FrameBufferInfo` describing a framebuffer that is not the
+/// one the HVS is scanning. The whole class shows up on the panel as garble (a pitch or virtual-width
+/// divergence shifts every row's phase) or as wrong colours (an order divergence), and shows up in the
+/// serial log as absolutely nothing: the compositor's own read-back witness (`wm::verify_window`) reads
+/// through the SAME `info.stride` it wrote through, so it agrees with itself no matter what the hardware
+/// is doing. A witness that asks OUR numbers can never falsify our numbers. This one asks the firmware's.
+///
+/// ### What a reader can conclude
+/// `req=` is what we asked for; every other field is the firmware's answer. Agreement retires the whole
+/// scan-out-geometry suspect surface for that boot — pitch, depth, order, virtual size, viewport offset,
+/// base alignment — and is the precondition for blaming anything downstream. A divergence names itself.
+/// `pitch` is repeated from the allocation reply so one line carries the complete picture, and
+/// `pitch == virt_w * bpp` is the specific identity a row-phase garble breaks.
+///
+/// Query-only tags: this changes no firmware state and is safe to run after the allocation. Failure to
+/// call is non-fatal — it prints a FAIL line and returns, because a diagnostic must never be able to
+/// take down the boot it is diagnosing.
+fn witness_fb_geometry(base: u64, size: u32, pitch: u32, req_w: u32, req_h: u32) {
+    let mut i = 0usize;
+    macro_rules! put {
+        ($val:expr) => {{
+            request(i, $val);
+            i += 1;
+        }};
+    }
+    put!(0); // total size, patched below
+    put!(0); // request
+
+    put!(TAG_GET_PHYS_WH);
+    put!(8);
+    put!(0);
+    let phys_idx = i;
+    put!(0);
+    put!(0);
+
+    put!(TAG_GET_VIRT_WH);
+    put!(8);
+    put!(0);
+    let virt_idx = i;
+    put!(0);
+    put!(0);
+
+    put!(TAG_GET_VIRT_OFFSET);
+    put!(8);
+    put!(0);
+    let off_idx = i;
+    put!(0);
+    put!(0);
+
+    put!(TAG_GET_DEPTH);
+    put!(4);
+    put!(0);
+    let depth_idx = i;
+    put!(0);
+
+    put!(TAG_GET_PIXEL_ORDER);
+    put!(4);
+    put!(0);
+    let order_idx = i;
+    put!(0);
+
+    put!(TAG_GET_ALPHA_MODE);
+    put!(4);
+    put!(0);
+    let alpha_idx = i;
+    put!(0);
+
+    put!(TAG_END);
+
+    let total = i;
+    request(0, (total * 4) as u32);
+    if !mbox_call(total) {
+        serial_println!("[wc-e] fb-geometry query FAILED — scan-out ground truth unavailable");
+        return;
+    }
+
+    let (phys_w, phys_h) = (reply(phys_idx), reply(phys_idx + 1));
+    let (virt_w, virt_h) = (reply(virt_idx), reply(virt_idx + 1));
+    let (off_x, off_y) = (reply(off_idx), reply(off_idx + 1));
+    let depth = reply(depth_idx);
+    let order = reply(order_idx);
+    let alpha = reply(alpha_idx);
+    let bpp = (depth / 8).max(1);
+    // The two identities a scan-out defect breaks. `row_ok`: the pitch the HVS steps by must be exactly
+    // one virtual row of pixels — anything else shears every row against the one above it. `fit_ok`: the
+    // allocation must hold the whole visible image, or the bottom rows scan out of somebody else's memory.
+    let row_ok = pitch == virt_w * bpp;
+    let fit_ok = (size as u64) >= (pitch as u64) * (virt_h as u64);
+    serial_println!(
+        "[wc-e] fb-geometry req={}x{}@{}bpp order={} :: firmware phys={}x{} virt={}x{} offset=({},{}) depth={} order={} alpha={} pitch={}B base={:#x} size={} align={} row_ok={} fit_ok={}",
+        req_w, req_h, DEPTH_BITS, PIXEL_ORDER_BGR,
+        phys_w, phys_h, virt_w, virt_h, off_x, off_y, depth, order, alpha,
+        pitch, base, size, base & 0xFFF,
+        row_ok, fit_ok
+    );
+
+    // WC-F — record the firmware's answers, and add the one field WC-E never asked for: a pitch read
+    // back in a TRANSACTION OF ITS OWN. Every pitch on the line above descends from the allocation
+    // reply; a firmware that reported one pitch while programming the HVS with another would be
+    // self-consistent there and wrong on the panel. This second `GET_PITCH` is the cheapest possible
+    // independent read of the same number. Recording (rather than only printing) is what lets the
+    // compositor-side witness compare the LIVE `FrameBuffer` — the object the blit path actually
+    // addresses through — against the display pipe, which nothing in WC-D/WC-E ever did.
+    #[cfg(feature = "witness")]
+    {
+        let get_pitch = query_pitch();
+        // SAFETY: single-core boot, before SMP/interrupts (same discipline as `MBOX` itself).
+        unsafe {
+            core::ptr::write_volatile(
+                &raw mut SCANOUT,
+                ScanoutTruth {
+                    valid: true,
+                    alloc_base: base,
+                    alloc_size: size,
+                    alloc_pitch: pitch,
+                    get_pitch,
+                    phys_w, phys_h, virt_w, virt_h, off_x, off_y,
+                    depth, order, alpha,
+                },
+            );
+        }
+    }
+}
+
+/// WC-F — the firmware's scan-out geometry, captured once at framebuffer bring-up.
+///
+/// Why a record and not just a log line: WC-E prints these numbers, and a human comparing them to the
+/// compositor's numbers by eye is not a gate. The `FrameBuffer` the blit path addresses through is
+/// built from the allocation reply and then lives on its own — its `base`, `len` and `stride` could
+/// each drift from what the HVS scans (a remap, a clamp, a rounding) with nothing in WC-D or WC-E able
+/// to notice, because both of those read through the very numbers under suspicion. Holding the
+/// firmware's answers lets `video::wcf` put the two side by side on one line.
+#[cfg(feature = "witness")]
+#[derive(Clone, Copy)]
+pub struct ScanoutTruth {
+    /// False when the framebuffer never came up (or its geometry query failed): consumers must skip.
+    pub valid: bool,
+    /// ARM-physical base from the allocation reply (bus alias already masked off).
+    pub alloc_base: u64,
+    pub alloc_size: u32,
+    /// Pitch as reported alongside the allocation.
+    pub alloc_pitch: u32,
+    /// Pitch re-read in a separate, query-only transaction. Must equal `alloc_pitch`.
+    pub get_pitch: u32,
+    pub phys_w: u32,
+    pub phys_h: u32,
+    pub virt_w: u32,
+    pub virt_h: u32,
+    pub off_x: u32,
+    pub off_y: u32,
+    pub depth: u32,
+    pub order: u32,
+    pub alpha: u32,
+}
+
+#[cfg(feature = "witness")]
+static mut SCANOUT: ScanoutTruth = ScanoutTruth {
+    valid: false,
+    alloc_base: 0,
+    alloc_size: 0,
+    alloc_pitch: 0,
+    get_pitch: 0,
+    phys_w: 0,
+    phys_h: 0,
+    virt_w: 0,
+    virt_h: 0,
+    off_x: 0,
+    off_y: 0,
+    depth: 0,
+    order: 0,
+    alpha: 0,
+};
+
+/// WC-F — the recorded scan-out truth. `valid == false` means "never captured"; callers must not
+/// invent a verdict from the zeroes.
+#[cfg(feature = "witness")]
+pub fn scanout_truth() -> ScanoutTruth {
+    // SAFETY: written once during single-core boot, read-only afterwards.
+    unsafe { core::ptr::read_volatile(&raw const SCANOUT) }
+}
+
+/// WC-F — pitch, asked on its own. Returns 0 if the query fails, which reads as a mismatch rather
+/// than as agreement: a diagnostic must fail loud, never silently agree with the thing it checks.
+#[cfg(feature = "witness")]
+fn query_pitch() -> u32 {
+    request(0, 7 * 4);
+    request(1, 0);
+    request(2, TAG_GET_PITCH);
+    request(3, 4);
+    request(4, 0);
+    request(5, 0);
+    request(6, TAG_END);
+    if !mbox_call(7) {
+        return 0;
+    }
+    reply(5)
 }
 
 /// Bring up the VideoCore framebuffer: pick a resolution (the firmware's current mode if sane,
@@ -356,7 +731,17 @@ pub fn notify_xhci_reset(dev_addr: u32) -> bool {
 /// and pitch. Returns the ARM-physical framebuffer for BootInfo, or `None` on any failure (the
 /// caller then boots serial-only).
 pub fn init_framebuffer() -> Option<FbAlloc> {
-    let (width, height) = query_display_size().unwrap_or((FALLBACK_W, FALLBACK_H));
+    let (width, height) = match (FORCE_W, FORCE_H) {
+        // WC-D: a compile-time PANEL OVERRIDE, so the QEMU gate can run the compositor at the bench
+        // panel's geometry. QEMU raspi4b's mode is 640x480; the bench Pi drives 1920x1200. The window
+        // compositor's placement rule (`video::wm::place`) derives each window's integer upscale FROM
+        // the panel size, so those two panels do not exercise the same code: a 128x128 window lands at
+        // scale 1 on 640x480 and scale 4 on 1920x1200. Every scaled-blit defect is therefore invisible
+        // to a 640x480 gate BY CONSTRUCTION. Forcing the geometry is what makes the gate able to see
+        // what the bench sees. Off by default (0,0 => query the firmware, unchanged behaviour).
+        (w, h) if w != 0 && h != 0 => (w, h),
+        _ => query_display_size().unwrap_or((FALLBACK_W, FALLBACK_H)),
+    };
 
     // A single message carrying every framebuffer tag. Layout per tag: id, value-buffer-size,
     // request-code(0), value words… A local macro (not a closure) appends words so we can still
@@ -447,6 +832,9 @@ pub fn init_framebuffer() -> Option<FbAlloc> {
         ":: MAILBOX: framebuffer {}x{} pitch={}B stride={}px base={:#x} size={} ::",
         width, height, pitch, stride_px, base, fb_size
     );
+    // WC-E: and immediately ask the firmware what it ACTUALLY set, so the line above (which reports what
+    // we requested) can be checked against the display pipe instead of trusted. Runs on every boot.
+    witness_fb_geometry(base, fb_size, pitch, width, height);
 
     // PI-V3D-1: with the framebuffer resolved, bring up the V3D (VideoCore VI) GPU — probe → MMU →
     // clear job — and blit the CPU-verified clear into THIS framebuffer as a visible witness. This is

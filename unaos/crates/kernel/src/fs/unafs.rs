@@ -75,14 +75,28 @@ pub struct SdSectorDevice {
 
 impl SdSectorDevice {
     /// Open the registered block device, if its geometry fits the seam.
+    ///
+    /// PI-FS-2: on the bare-metal Pi the native unafs store is the microSD (emmc2), and
+    /// [`block::read_block`] routes SD reads to the emmc2 backend for as long as the SD backend is
+    /// active — a state the USB storage bring-up never clears. But that bring-up DOES overwrite the
+    /// shared `block::BLOCK_DEVICE` global with the USB stick's geometry, so sizing this device from
+    /// the global would guard SD reads against the stick's block count. A 14 MiB "USB SD Reader"
+    /// (num_blocks 29120) enumerated behind the shell then made `locate` reject the SD's own FAT
+    /// partition (LBA 63, extent 109439 > 29120) as `Part(OutOfBounds(63))`, even though the reads
+    /// themselves would have come off the SD. Bind the sector count to the SD card itself whenever the
+    /// SD supplies the bytes, so the size guard and the data path name the same device.
     pub fn open() -> Result<Self, MountError> {
         let dev = block::info().ok_or(MountError::NoStorage)?;
         if dev.block_size != 512 {
             return Err(MountError::BadSectorSize(dev.block_size));
         }
-        Ok(Self {
-            sectors: dev.num_blocks,
-        })
+        // Prefer the SD card's own block count when the SD backend is live (emmc2 answers the reads);
+        // the global `dev.num_blocks` may have been clobbered by a USB mass-storage enumeration.
+        #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+        let sectors = crate::drivers::emmc2::card_num_blocks().unwrap_or(dev.num_blocks);
+        #[cfg(not(all(target_arch = "aarch64", feature = "baremetal")))]
+        let sectors = dev.num_blocks;
+        Ok(Self { sectors })
     }
 }
 

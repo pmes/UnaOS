@@ -12,7 +12,11 @@ several sessions can work in parallel without stepping on each other.
   `x86` / `arm` (QEMU GUI), `esp-x86` / `esp-arm` (metal boot media),
   `kernel8` / `kernel8-run` / `kernel8-test` (Pi 4 bare-metal image / QEMU raspi4b).
   Env knobs: `UNAOS_PI`, `UNAOS_BAREMETAL`, `UNAOS_SKIP_XHCI`, `UNAOS_BOOTLOG`,
-  `UNAOS_SCHED_DEMO`, `UNAOS_USBDEBUG`.
+  `UNAOS_SCHED_DEMO`, `UNAOS_USBDEBUG`, `UNAOS_FBW`/`UNAOS_FBH` (panel-geometry
+  override — QEMU raspi4b is 640x480 while the bench Pi is 1920x1200, and the
+  window compositor's upscale is a function of the panel, so
+  `UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test` is what reaches the
+  bench's blit path; default unset = query the firmware).
 - Inspect serial logs with `awk '/pattern/' <log>` — **not `grep`** (control
   bytes in the logs break it).
 - **Dependencies: latest stable, always** (Peter, 2026-07-21). This is a brand-new
@@ -20,6 +24,8 @@ several sessions can work in parallel without stepping on each other.
   legacy to protect. Never pin to a pre-release or downgrade below current stable.
 - Direction: [`docs/ROADMAP.md`](docs/ROADMAP.md). Security model + hardening
   ledger: [`docs/SECURITY.md`](docs/SECURITY.md). Subsystem docs: `docs/dev/OS/`.
+- Standing operational laws (verification, bench/media, code & history):
+  [`docs/dev/LAWS.md`](docs/dev/LAWS.md) — binding in every session.
 
 ## Worktrees & lanes
 

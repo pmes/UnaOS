@@ -15,6 +15,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use super::trb::Trb;
+use super::dma_coherency;
 
 #[derive(Debug, Clone, Copy)]
 #[repr(C, packed)]
@@ -60,32 +61,23 @@ impl EventRing {
     // read with a volatile load — a plain read can be hoisted/cached by the compiler,
     // making a tight poll loop spin forever on a stale value.
     pub fn has_event(&self) -> bool {
+        // XHCI-COHERENCE (consumer boundary): the controller DMA-writes event TRBs into this ring.
+        // On a non-coherent bus (Pi 4 PCIe, Tegra XUSB post-EBS) the CPU's cached line for the
+        // current dequeue slot can be stale — the freshly-DMA'd cycle bit never observed — so a
+        // tight poll spins forever. Invalidate the dequeue TRB's line(s) before the volatile read so
+        // the CPU sees DRAM. This is the general aarch64 seam that SUPERSEDES the old tegra-only
+        // `has_event_after_invalidate` (identical `dc civac` + `dsb`, now covering the Pi too). The
+        // ring is CPU-read-only, so clean+invalidate loses nothing; on x86_64 this is a no-op and the
+        // read below is unchanged.
+        dma_coherency::clean_inval(
+            &self.trbs[self.dequeue_index] as *const Trb as usize,
+            core::mem::size_of::<Trb>(),
+        );
         // Read the whole (aligned) TRB volatile — Trb is `packed`, so taking a reference
         // to an individual field is unaligned/illegal; copy it out, then read the field.
         let trb = unsafe { core::ptr::read_volatile(&self.trbs[self.dequeue_index]) };
         let cycle_state = (trb.control & 1) != 0;
         cycle_state == self.cycle_bit
-    }
-
-    /// JB3 boot-8 experiment (Tegra-only): invalidate the CPU's cached copy of the whole
-    /// ring (`dc civac` per line — clean+invalidate, safe for a ring the CPU only reads),
-    /// then re-run the freshness check. If an event MATERIALIZES that the cached read
-    /// missed, the controller's DMA writes are landing in DRAM and the failure is CPU-side
-    /// cache snooping (the `dma-coherent` fabric handoff died with ExitBootServices) — not
-    /// an SMMU/fabric drop.
-    #[cfg(feature = "tegra")]
-    pub fn has_event_after_invalidate(&self) -> bool {
-        let base = self.trbs.as_ptr() as usize;
-        let end = base + core::mem::size_of_val(&self.trbs);
-        let mut p = base & !63;
-        while p < end {
-            unsafe {
-                core::arch::asm!("dc civac, {}", in(reg) p, options(nostack, preserves_flags))
-            };
-            p += 64;
-        }
-        unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
-        self.has_event()
     }
 
     pub fn pop(&mut self) -> Option<Trb> {

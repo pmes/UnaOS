@@ -311,11 +311,1388 @@
   transfer refused, the child prints through the transferred cap, the revoked cap denies with
   `-EACCES`, and the launcher proves the child's row byte-clear while the deposit was pending. See
   the `SECURITY.md` U7 ledger entry for the full mechanism.
+- **ELF-1 (landed 2026-07-22)** — the loader graduated from flat blob to a minimal static **ELF64**
+  (`load_program_into_slot` dispatches on the magic; `validate_elf` walks the PT_LOAD program headers and
+  maps each segment into the 16 KiB slot window with per-segment permissions — R+X → code page, R+W → data
+  page). The flat path stays the fallback for magic-less `.BIN` fixtures. Witness: `:: ELF1: static ELF64
+  loaded (… bytes, 2 PT_LOAD segs) -> EL0 ran … -> PASS ::`.
+- **ELF-2 (landed 2026-07-23)** — first rung of the **EL0-threading** ladder: multiple EL0 tasks SHARING one
+  address space (the parent's slot `ttbr0`/ASID), the substrate for multi-threaded programs. Three syscalls:
+  `SYS_THREAD_SPAWN = 21` (entry, sp, arg, placement → a new EL0 thread under the caller's `ttbr0`/ASID,
+  started at `entry` on a caller-carved `sp` with `arg` in x0, on the caller's core or a sibling; returns a
+  per-process thread handle), `SYS_THREAD_JOIN = 23` (block on the thread's completion `Semaphore`, then
+  reap), `SYS_THREAD_EXIT = 22` (post completion + release the slot). The slot now carries a **live-task
+  refcount** (`boot::SLOT_REFCOUNT`): `alloc_user_slot` seeds it to 1, `slot_thread_retain` bumps it per
+  thread, and `teardown_user_slot` frees the slot only on the 1→0 edge — so a shared address space outlives
+  the first thread to exit and is torn down only when the last leaves. **Multi-core soundness** (the same ASID
+  live on two cores): `teardown_user_slot` now repoints EACH exiting thread's core off the slot root
+  unconditionally (not only the last), so the final broadcast `TLBI ASIDE1IS` races no live slot root on any
+  other core — preserving `build_slot`'s "the ASID was flushed at teardown, no core can speculatively
+  re-cache it" realloc invariant. Completion is posted at the single point in `sched::exit()` (moved out of
+  `task_trampoline`), covering both a kernel thread's return and an EL0 thread's `SYS_THREAD_EXIT`; the thread
+  arg rides in x0 out of `user_task_trampoline` (placed AFTER the GPR/FP scrub — a deliberate ABI value, the
+  scrub's no-leak property unweakened). Test: a parent zeroes a shared counter, spawns 2 workers (one
+  co-located, one on a sibling core), each **atomically** (A72 LL/SC — ARMv8.0, no LSE) increments the
+  counter and exits, the parent joins both and reports the total. QEMU-verified (2026-07-23):
+  `:: EL0: threads test — spawned=2 joined=2 counter=2 cores=1,2 :: PASS ::` — genuine cross-core EL0 with a
+  shared `ttbr0`. Metal note: cross-core LL/SC atomicity depends on the user window being Normal
+  Inner-Shareable cacheable memory (an arc-boundary hardware check, not gated by QEMU).
+- **ELF-3 (landed 2026-07-23)** — rung 2 of the EL0-vug ladder: give EL0 something to **draw on** + real
+  **synchronisation**. Three syscalls (`SYS_FB_MAP = 24`, `SYS_FB_PRESENT = 25`, `SYS_FUTEX = 26`).
+  - **`SYS_FB_MAP()`** maps the calling process's dedicated, kernel-allocated **off-screen surface**
+    (32×32 ARGB8888 = one page, EL0-RW Normal-cacheable) plus a **read-only info page** (magic, width,
+    height, stride, format, size, surface-offset) into its EL0 window, and returns the surface VA. The
+    surface + info live in a **reserved VA hole** carved immediately above the 16 KiB program window (the
+    per-slot backing region grew from 0x4000 to 0x6000, 0x8000-aligned so the whole region stays inside one
+    2 MiB `L3_USER` block); `boot::map_slot_fb` repoints the slot's private L3 leaves at the slot's OWN FB
+    frames with a proper break-before-make (info EL0-RO `user_ro_page`, surface EL0-RW `user_data_page`).
+    **EL0 NEVER receives the real scan-out**, any kernel mapping, or a physical address — page-permission
+    laws (WXN, per-page perms) untouched.
+  - **`SYS_FB_PRESENT()`** is the only path from the surface to the screen: the kernel composites the
+    surface via a **present hook** (`syscall::register_fb_present_hook` — a public seam the video subsystem
+    registers, calling the existing dirty-rect damage+flush). Until that hook is wired (a 3-line deferred
+    diff in `video/screen.rs`, documented at the seam), present is a no-op composite; either way it records
+    a checksum of the surface for the self-verifying witness. EL0 owns the surface bytes, never the scan-out.
+  - **`SYS_FUTEX(uaddr, op, val)`** is a minimal wait/wake: `op=0` FUTEX_WAIT blocks iff `*uaddr == val`,
+    `op=1` FUTEX_WAKE wakes up to `val` waiters. Keyed by the **physical address** of the user word (via
+    `AT s1e0r` — globally unique, so a word shared across a process's threads keys the same bucket) on a
+    bounded kernel wait-queue pool (`sched::futex_wait`/`futex_wake`, reusing the Semaphore `PARK_WAITQ`
+    lock-handoff — lost-wakeup-safe). `uaddr` is validated inside the caller's writable user window. Enough
+    to build a userspace mutex/condvar.
+  - Test (`__fb_prog_*`, in-RAM): the parent maps its surface, reads geometry from the RO info page (proving
+    EL0-read), spawns 2 draw threads (one co-located, one on a sibling core) that each fill THEIR HALF of
+    the surface (top = 0xA1, bottom = 0xB2), an atomic counter + FUTEX wake/wait synchronises the parent to
+    both halves being drawn, the parent PRESENTS (the kernel checksums the surface), joins both threads, and
+    exits. QEMU-verified (2026-07-23): `:: EL0: fb test — mapped=32x32 threads=2 present=1 checksum=<hex>
+    :: PASS ::`, the checksum self-verified against the kernel-computed expected pattern. **DEFERRED wiring:
+    the `video/screen.rs` present-hook registration (3 lines) — out of the syscall/sched/boot lane.**
+- **EXEC-1 (landed 2026-07-23)** — connect the ELF-1 loader to the VFS: a panel shell **`run <path>`**
+  command that loads and executes an ELF64 (or flat) EL0 program off the filesystem and reports its exit
+  status. The EL1/ASID-0 shell reads the whole file through the VFS `MountTable` (`/fat` = FAT boot
+  partition, `/usb` = USB stick, `/` = native UnaFS), bounds it to the 16 KiB user window (an oversize file
+  is rejected `-E2BIG`, never silently truncated), pre-checks the ELF64 magic + aarch64 machine for a
+  friendly reason, then hands the bytes to the kernel loader **`run_user_image(name, bytes, deadline)`**.
+  The loader shares the ELF-1 mapping core: `load_program_into_slot` (the by-name FAT loader) and
+  `run_user_image` (the VFS-read path) both call a new FatKind-free **`map_image_into_slot`** — validate
+  fully → `alloc_user_slot` → copy+map+protect each PT_LOAD (per-segment W^X) → stamp the IMAGE_SHA256
+  principal — so the two paths never drift (m6g/ELF1 stay byte-identical). `run_user_image` endows the slot
+  a console write-cap, plants a **Proc entry** so the program's exit rides the SAME generic child-reap
+  short-circuit `sys_wait` uses (no dedicated `SYS_EXIT` arm — the program runs under an arbitrary name),
+  spawns it co-located, and deadline-bounded-yields until it exits or the fault-kill net contains a fault
+  (a killed run-image task marks its Proc entry with a kill sentinel, off the M6b `killed_unexpected`
+  count). On return the scheduler has already repointed the core to the boot root (ASID 0), honouring the
+  shell's ASID-0 invariant. The panel prints `run: <path>: exited with status <n>`; the headless witness is
+  `:: EXEC: run <path> — loaded <n> bytes, entry 0x<..>, exit=<code> ::`. QEMU-verified (2026-07-23) via a
+  boot self-test that reads `/fat/ELFHELLO.ELF` through the VFS and runs it through `run_user_image`:
+  `:: EXEC1: run /fat/ELFHELLO.ELF — loaded 8560 bytes, entry 0x268000, exit=0 -> PASS ::` (the program
+  prints its own `elf hello from EL0`).
+- **UVUG-1 (landed 2026-07-23)** — the first REAL EL0 graphics program: a userspace **mini-vug**, and the
+  affirmative answer to "is it possible to make EL0 vug more multi-threaded?". A static ELF64 program
+  (`crates/user-vug`, staged onto the FAT media as **VUG.ELF** by `arroyo`, same build path as ELFHELLO)
+  loaded and run through the EXEC-1 `run_user_image` machinery — the identical path the panel `run
+  /fat/VUG.ELF` drives. It maps its off-screen surface (`SYS_FB_MAP`), spawns **two persistent EL0 worker
+  threads** (`SYS_THREAD_SPAWN` — one co-located, one on a **sibling core**) that each render HALF of an
+  animated integer-math gradient into the shared surface, drives a **per-frame barrier**, `SYS_FB_PRESENT`s
+  each of 300 frames, then `SYS_THREAD_JOIN`s both, computes a deterministic FNV-1a checksum of the final
+  surface, and prints its own witness `:: UVUG: frames=300 threads=2 checksum=<hex> ::` before exiting 0.
+  The barrier direction is deliberately split for robustness under QEMU raspi4b (which delivers **no Group-1
+  timer IRQ**, so a core that parks with nothing else runnable is not preemptively rescheduled): **arrival**
+  (worker→parent) is a real `SYS_FUTEX` (workers bump `done` + WAKE, parent WAITs — the fb-proven direction,
+  reliable because the run core is kept cycling by the `run_user_image` driver loop); **release**
+  (parent→worker) is a `SYS_YIELD` poll on a `phase` word (keeps each worker runnable on its own core, so no
+  cross-core re-dispatch of an idle sibling is needed). Both wait loops re-check their condition, so the
+  barrier is lost-wakeup-safe by construction; on metal (real timer IRQs) either direction works. The
+  checksum is deterministic (the final surface is a pure integer function of pixel position and the last
+  frame index, independent of thread interleaving), so QEMU and metal agree. EL0 owns only the off-screen
+  surface bytes — never the scan-out, a physical address, or a kernel mapping; page-permission laws (WXN,
+  per-page perms) are untouched. Kernel side is a small additive fix only: `run_user_image` now calls the
+  idempotent `sched::futex_init()` (so a plain non-witness boot arms the futex pool before an EL0 program
+  can call `SYS_FUTEX`), plus a `uvug_witness` battery self-test that reads VUG.ELF through the VFS and runs
+  it, asserting `exit=0`. QEMU-verified (`UNAOS_V3D=1 UNAOS_GENET=1 UNAOS_PIUSB=1 ./arroyo kernel8-test`,
+  reproducible across runs): `:: UVUG: frames=300 threads=2 checksum=0x0313e510f24daae5 ::` then
+  `:: EXEC-UVUG: run /fat/VUG.ELF — loaded 8544 bytes, entry 0x270000, exit=0 -> PASS ::`, with the workers
+  scheduled on cores 2 (co-located) + 1 (sibling) and the whole prior battery (CAPSTONE 6/6, EXEC1,
+  ELF-2/-3) byte-equivalent. **DEFERRED (out of this lane):** the live panel animation still needs the
+  ELF-3 present-hook wiring (the 3-line `video/screen.rs` `register_fb_present_hook` registration) — until
+  it lands, `SYS_FB_PRESENT` composites nothing to the screen, so the panel run prints the witness and exits
+  cleanly but shows no pixels. Lane: `crates/user-vug` + `arroyo` (build/stage) + an additive
+  `arch/aarch64/syscall.rs` (`futex_init` in `run_user_image` + the `uvug_witness` self-test) + this doc.
+- **ELF-5 (landed 2026-07-23)** — rung 4 of the EL0-vug ladder: **input into EL0**. An interactive EL0 app
+  (built on ELF-3's surface + ELF-2's threads + ELF-3's futex) needs keys/mouse; this is the delivery half.
+  **`SYS_INPUT_POLL = 27`** is a NON-BLOCKING dequeue: it returns the next input event queued for the CALLING
+  process, or `-EAGAIN` when its ring is empty. The event is a **packed u64** whose bit 63 is always clear
+  (so it never aliases a negative errno): `[55:48]` = type (`1` KeyDown, `2` KeyUp, `3` MouseRel, `4`
+  MouseAbs, `5` Button), the low 32 bits the payload — key ASCII / button mask in `[7:0]`, mouse x/dx in
+  `[31:16]` and y/dy in `[15:0]` (i16). Kernel side mirrors how the GUI routes input to kernel apps today
+  (the GUI-CLICK-2b `SCREEN_APP_ACTIVE` gate + `gui_watchdog`: only the ACTIVE app receives input): a small
+  **per-ASID ring** (`EL0_INPUT_BUF`/`HEAD`/`TAIL`, cap 32), a single producer (the router) + single
+  consumer (the EL0 task) so it is a **lock-free SPSC ring** (drop-newest on a full ring — an unread event is
+  never overwritten). Two **public in-lane seams** (the ELF-3 present-hook twins): `el0_input_enqueue(ev)`
+  (the router pushes a decoded `pal::Event` into the active process's ring) and `el0_input_set_active(asid)` /
+  `el0_input_active()` (focus registration — the ELF-5 analogue of `SCREEN_APP_ACTIVE`; setting a focus
+  resets that ring, so a freshly-focused app starts clean). Teardown folds in: `clear_handle_row` now resets
+  the ASID's ring and clears the active designation if the dying slot held it (a reused ASID inherits no
+  stale input; the router never enqueues to a dead slot). **SYS_INPUT_WAIT = 28 is DEFERRED** (documented at
+  the seam) — a blocking variant on a per-ASID `Semaphore` that `el0_input_enqueue` would post; QEMU has no
+  real input source, so `SYS_INPUT_POLL` is the QEMU-provable rung this arc lands. Test (`__input_prog`,
+  in-RAM, register-only): the program polls its ring empty (`-EAGAIN`), the launcher — after the initial
+  empty observation, so the ordering is exact — injects ONE `KeyDown('A')` through the real
+  `el0_input_enqueue` seam, the program poll+yields until the event arrives, verifies the packed value, then
+  polls empty again. QEMU-verified (`UNAOS_V3D=1 UNAOS_GENET=1 UNAOS_PIUSB=1 ./arroyo kernel8-test`):
+  `:: EL0: input test — poll-empty=EAGAIN enqueue=1 event=0x1000000000041 drained=EAGAIN :: PASS ::` (the
+  packed event = `(KeyDown<<48) | 'A'`), with the whole prior battery (CAPSTONE 6/6, ELF1/EXEC1, ELF-2 threads,
+  ELF-3 fb, UVUG) byte-equivalent. **HONEST QEMU NOTE:** QEMU raspi4b delivers no USB HID, so the
+  kernel-injected event is what proves the enqueue->drain + `-EAGAIN` paths — the router edge (real HID ->
+  ring) is metal-only, lit up by the deferred fold. **DEFERRED ROUTER WIRING (2-3 lines, OUTSIDE this lane —
+  `main.rs` `pump_usb_into_gui`, the next arc folds):** when an EL0 app owns the screen (an ELF-5 analogue of
+  `SCREEN_APP_ACTIVE`, its ASID registered via `el0_input_set_active`), route drained pal events to the EL0
+  ring instead of `GUI_CHANNEL`:
+  ```rust
+  while let Some(ev) = unaos_kernel::pal::next_event() {
+      unaos_kernel::arch::aarch64::syscall::el0_input_enqueue(ev); // -> the active EL0 app's ring
+  }
+  ```
+  Lane: `arch/aarch64/syscall.rs` (the ring + seams + `sys_input_poll` + the `clear_handle_row` fold + the
+  in-RAM witness) + this doc — no scheduler primitive, no driver, no `main.rs`/`pal.rs` change, no x86 file.
+- **INPUT-WIRE (landed 2026-07-23)** — folds ELF-5's deferred router wiring so a running EL0 program receives
+  REAL keys/mouse. Two halves:
+  - **Router (main.rs `pump_usb_into_gui`).** When an EL0 program holds input focus (`el0_input_active() != 0`),
+    the GUI router drains `pal::next_event()` into that process's per-process ring via the `el0_input_enqueue`
+    seam — **keyboard AND mouse** (Key/KeyUp/Mouse/MouseAbsolute/Button; Timer/None/Unknown are dropped by the
+    seam) — instead of `GUI_CHANNEL`. Factored into `route_input_to_active_el0()`, the single router->ring choke
+    point. This branch takes **precedence over `SCREEN_APP_ACTIVE`**: the panel `run` verb dispatches through
+    `dispatch_command` (which sets `SCREEN_APP_ACTIVE`), so both flags are live during an EL0 `run`, and the EL0
+    ring is the real sink. Unlike the kernel-app `SCREEN_APP_ACTIVE` gate (which LEAVES events in `EVENT_QUEUE`
+    for the app's own `pump_and_poll`), the EL0 branch **drains** — an EL0 app cannot reach `EVENT_QUEUE`, so a
+    left event would never be consumed.
+  - **Focus lifecycle (`run_user_image`).** Focus is registered (`el0_input_set_active(asid)`) right after the
+    slot exists and the pid is published, and BEFORE the wait loop yields (the co-located task cannot dispatch
+    until then, so no input is missed). It is cleared (`el0_input_set_active(0)`) on return: `clear_handle_row`
+    already clears the designation on slot teardown (verified — ELF-5's `EL0_INPUT_ACTIVE` compare-exchange), so
+    the explicit clear is belt-and-suspenders for the exit/kill path and the **sole** clear on the Timeout path
+    (task still alive, no teardown). The shell regains input the instant the program returns.
+  - **Watchdog / escape hatch — decision (UVUG-5 correction).** The original ELF-5 decision left the
+    `gui_watchdog` `note_progress`/`poll` path **byte-untouched**, reasoning that `run_user_image`'s 5 s deadline
+    (`shell.rs`, equal to `gui_watchdog::WATCHDOG_TIMEOUT_SECS`) is the sole liveness bound for a focused EL0 app.
+    That was **wrong in practice** (P47): the `run` command sets `SCREEN_APP_ACTIVE` and calls
+    `gui_watchdog::on_app_enter`, so the wedge watchdog is *also* armed for the EL0 program — but an EL0 app drains
+    input through `SYS_INPUT_POLL`, not the kernel `pump_and_poll` that feeds `note_progress`, so the watchdog saw
+    **no heartbeat** and FALSELY reclaimed a healthy, polling UVUG at 5 s (`[gui] watchdog app wedged 5s (no drain
+    since …)` — the app never lost its poll but the shell was handed the keyboard back mid-run). **Fix:**
+    `sys_input_poll` now calls `gui_watchdog::note_progress()` on **every** poll (before the empty-ring return) —
+    the EL0 twin of the kernel app's per-drain heartbeat: a program calling `SYS_INPUT_POLL` IS making drain
+    progress. A live EL0 app is never falsely wedged; a genuinely dead one still loses the screen at the timeout.
+    `note_progress` is a no-op when no app owns the screen, so the call is safe on any caller.
+  - **QEMU proof.** A new BSP-side `input_router_selftest()` runs the REAL router drain against a fake active
+    focus (ASID 1, before any service task or EL0 slot is live, `EVENT_QUEUE` empty): a Key + a Mouse pushed into
+    `EVENT_QUEUE` are routed to the focused ring (`routed == 2`), a Timer is dropped, and `GUI_CHANNEL` is bypassed
+    (`GUI_SENT` unchanged) — `:: EL0: input router — routed=2 (key+mouse) to active-focus ring, Timer dropped,
+    GUI_CHANNEL bypassed :: PASS ::`. This proves the router->ring edge; the ELF-5 `:: EL0: input test … ::`
+    witness proves ring->EL0-drain; together they cover the full path. **HONEST QEMU NOTE:** the real HID *edge*
+    (a USB keypress landing in `EVENT_QUEUE`) is metal-only — QEMU raspi4b delivers no USB HID — so the selftest
+    drives the router with a synthetically pushed event. **What an interactive EL0 program can now do:** an ELF-3
+    surface + ELF-2 threads app run via `run <path>` receives live keyboard and mouse from real hardware through
+    `SYS_INPUT_POLL`, drawing/responding to input — the last delivery gap in the EL0-vug ladder.
+    Lane: `main.rs` (the router branch + `route_input_to_active_el0` + `input_router_selftest`) + the
+    `run_user_image` focus-registration call site in `arch/aarch64/syscall.rs` + this doc.
+- **INROUTE (landed 2026-07-25)** — the router selftest above was **flaky**, roughly 1 boot in 7 under a loaded
+  cascade: `:: EL0: input router — routed=1|0 gui_sent_delta=0 :: FAIL ::`, seen by two independent executors on
+  unrelated diffs, so the race predated both. **Root cause:** the selftest's stated precondition was false. It
+  borrows the two pieces of *global* input state — it fakes focus onto **ASID 1** and pushes synthetic events
+  into `pal::EVENT_QUEUE` — and then counts deliveries, so any concurrent owner of either makes the count wrong.
+  Its call site sat beside the input/render task spawn under the comment "EVENT_QUEUE is empty and no EL0 slot is
+  live". By that point in the boot the whole M6b..U7 fixture cascade has been spawned and is running on the APs,
+  and **M6d alone holds all eight slots, ASIDs 1–8** (`:: M6d: per-task address spaces (8 slots, ASID 1-8…) ::`
+  prints ~27 lines *before* the selftest's own verdict). ASID 1 was therefore a real, live fixture slot: when
+  that fixture exited mid-test its teardown ran `clear_handle_row(1)` → `EL0_INPUT_ACTIVE.compare_exchange(1, 0)`
+  and **revoked the focus the test had just set**. A router pass that had already enqueued the Key found no
+  active target for the Mouse and returned `routed=1`. Nothing was dropped by the queue (`[uvug10] evq drop`
+  stayed `0`) and nothing leaked into `GUI_CHANNEL` — the events were routed to a focus that no longer existed.
+  **Real input is unaffected, and neither mechanism is a bug:** revoking focus on teardown is required (a dead
+  slot must stop receiving input), and `el0_input_set_active`'s pre-launch discard is correct for a real
+  keystroke too (UVUG-8r2 — an event queued before an app existed was never meant for it). The defect was the
+  *test's* precondition. **Fix:** make the precondition true by construction — `input_router_selftest()` now runs
+  from the `start_aps` block **before the secondaries are started**, the only point in the boot where sole
+  ownership of focus and `EVENT_QUEUE` is structural. Rejected: a private sink for the synthetic events (it
+  would stop exercising the real global seam, which is the entire point of the witness) and any retry-on-mismatch
+  (launders a real race into a slower green). **Witness:** a new `[inroute] router window — routed=2
+  stale_dropped=1 revokes=0 gui_sent_delta=0` line prints before the verdict; `revokes` is a new counter
+  incremented whenever a slot teardown actually revokes the *live* focus (`el0_focus_revokes()`), so `revokes=0`
+  is the standing proof the measurement window stayed clean and a reintroduced concurrent owner is diagnosable
+  from the log alone. **Gate:** the `:: EL0: input router … PASS ::` and `[inroute] … revokes=0` lines are both
+  REQUIREs in `pi4-regression.spec` now (the FAIL half was already covered by the default `FAIL ::` FORBID, but
+  nothing required the PASS, so a selftest that silently stopped running went green). A/B: the interleaving
+  forced deterministically at the old call site reproduces `routed=1`; 20 consecutive runs on the fixed build are
+  clean. Lane: `main.rs` (call site + `input_router_selftest` witness) + `arch/aarch64/syscall.rs`
+  (`EL0_FOCUS_REVOKES` at the teardown CAS) + `scripts/specs/pi4-regression.spec` + this doc.
+- **UVUG-3 (landed 2026-07-23)** — the mini-vug becomes the first **interactive** EL0 application. `crates/user-vug`
+  is rewritten from the UVUG-1 animated gradient into a real **vug-style wireframe quartz crystal**: the Q16.16
+  fixed-point sin table, rotation (yaw-then-pitch), and the 14-vertex elongated hexagonal bipyramid are
+  reimplemented in the user crate from the kernel `vug.rs` geometry (integer math, no float), projected
+  screen-space to the surface and drawn as 30 Bresenham edges. **Surface size:** SYS_FB_MAP exposes exactly one
+  page (32×32 ARGB8888 — `boot::FB_SURFACE_W`/`FB_REGION_SIZE`, out of this lane), so the crystal is scaled to
+  32×32; the brief's "e.g. 256×256" is capped there until the kernel FB region grows. The two persistent worker
+  threads (one co-located, one sibling-core) keep the ELF-3 futex frame barrier, but now each **rasterises its
+  half** of the surface (worker A rows 0..16, B rows 16..32): it clears its band and draws every crystal edge
+  clipped to its band from the shared projected-vertex arrays the parent publishes each frame (release/acquire
+  on the `phase` word carries the `PX`/`PY` writes). Input folds into the parent's per-frame state exactly like
+  kernel game-mode: **SYS_INPUT_POLL** is drained each frame; WASD/arrows are TRUE held-state (KeyDown sets a
+  movement bit, KeyUp clears it) driving yaw/pitch, Q/E zoom the camera distance, a mouse drag (Button-press →
+  MouseRel while held → Button-release) rotates, and a click or ESC exits cleanly (workers signalled via a
+  `PHASE_EXIT` sentinel, both joined, exit 0). **Dual-path (the UVUG-3 crux):** if NO input event arrives within
+  the first `DETECT_FRAMES` (60) frames — always true under QEMU raspi4b, which has no USB HID — the program
+  COMMITS to the deterministic auto path: it keeps the fixed idle tumble it ran from frame 0 (yaw += 3, pitch +=
+  1 brad/frame), runs to `AUTO_FRAMES` = 300 total, FNV-1a-checksums the final surface, and prints the **unchanged
+  witness** `:: UVUG: frames=300 threads=2 checksum=<hex> ::` before exiting 0 (the checksum is a pure function
+  of the frame-300 geometry, so it is deterministic and thread-interleaving-independent). The interactive path is
+  metal-only, runs until an exit event (bounded by `INTERACTIVE_CAP` = 36000 frames), and prints
+  `:: UVUG: interactive exit=<key|click> frames=<n> ::`. The program is now written in Rust (a tiny `_start` in
+  `.text.entry` + the worker entry, syscalls via inline-asm helpers) rather than a single asm stream, staying
+  position-independent (relocation-model=static → adrp/add, **zero relocations** in the linked image; verified)
+  and fitting the 16 KiB window (12568-byte ELF, two PT_LOAD segments, per-segment W^X). QEMU-verified
+  (`UNAOS_V3D=1 UNAOS_GENET=1 UNAOS_PIUSB=1 ./arroyo kernel8-test`, and again with `UNAOS_VUGPAR=1`; reproducible):
+  `:: UVUG: frames=300 threads=2 checksum=0x48221e4101db3924 ::` *(superseded by WC-C -> `0xe68285b85121ac7c`)* then `:: EXEC-UVUG: run /fat/VUG.ELF — loaded
+  12568 bytes, entry 0x270000, exit=0 -> PASS ::`, with the whole prior battery (CAPSTONE 6/6, EXEC1, ELF-2
+  threads, ELF-3 fb, ELF-5/INPUT-WIRE input router+drain) byte-equivalent. The auto checksum is a NEW deterministic
+  value (0x48221e4101db3924 *(superseded by WC-C -> `0xe68285b85121ac7c`)*, vs UVUG-1's gradient 0x0313e510f24daae5 — the rendered content changed from gradient
+  to wireframe). **Metal is where the interactive path lights up:** at the panel, `run /fat/VUG.ELF` now shows a
+  rotating wireframe crystal (via the UVUG-2 present hook) that the operator drives with WASD/arrows/Q/E and the
+  mouse, exiting on a click or ESC — the `:: UVUG: interactive exit=… ::` line is the metal-only witness. Lane:
+  `crates/user-vug` only (no kernel/syscall/boot/arroyo change — same crate, linker script, and build/stage
+  path) + this doc.
+- **UVUG-4 (landed 2026-07-23)** — makes the interactive switch **input-driven** instead of time-boxed. P46 metal
+  showed UVUG never entered interactive mode: the old `DETECT_FRAMES` (60) fallback window elapsed in well under a
+  second at EL0 frame rates — the auto path committed and the checksum ran before a human could touch a key. The
+  fix drops the detection window entirely: the parent polls **SYS_INPUT_POLL every frame for the program's whole
+  life**, and the FIRST input event AT ANY FRAME flips it to interactive permanently — cancelling the auto-tumble
+  and the 300-frame cap and switching to held-state control. QEMU determinism is preserved automatically: raspi4b
+  has no USB HID, so zero events ever arrive, the 300-frame auto path + FNV-1a checksum run identically, and the
+  witness is byte-for-byte the same (`:: UVUG: frames=300 threads=2 checksum=0x48221e4101db3924 ::` *(superseded by WC-C -> `0xe68285b85121ac7c`)*, reproducible
+  across `kernel8-test` and `UNAOS_VUGPAR=1`). Two new/changed witnesses: `:: UVUG: interactive takeover at frame
+  <n> ::` prints at the switch (proving on metal that the input arrived and at which frame), and the exit line is
+  unchanged (`:: UVUG: interactive exit=<key|click> frames=<n> ::`). Drag-rotate is retuned toward the kernel
+  game-mode feel Peter flagged as awkward: the kernel `vug.rs` maps pointer motion 1 px = 1 brad with no scaling,
+  so instead of copying that this arc scales pointer delta down (`DRAG_DIV` = 8) and per-frame clamps it
+  (`DRAG_CLAMP` = 64 brad/axis) so a **full-panel drag ≈ one revolution** (256 brads over ~2048 px, panel ~1920 px
+  wide) and no single HID delta can spin past a quarter-turn in one frame. Lane: `crates/user-vug` only + this doc.
+- **UVUG-5 (this arc)** — two input-side corrections after the P47 metal capture (`run /fat/VUG.ELF` ran the
+  300-frame auto batch to `exit=0` with the unchanged checksum, but showed **no interactive takeover** and a
+  spurious `[gui] watchdog app wedged 5s`). (1) **Watchdog false-fire** — the `run` command arms `gui_watchdog`
+  via `on_app_enter`, but nothing fed `note_progress` on the EL0 path, so a healthy polling app was declared
+  wedged at 5 s and the shell was handed the keyboard back mid-run; fixed by feeding `gui_watchdog::note_progress`
+  from `sys_input_poll` (see the corrected ELF-5 decision above). (2) **Router-delivery witness** — the
+  router→ring code path is verified correct (`el0_input_active()` precedence in `pump_usb_into_gui`;
+  `current_asid()` == the `el0_input_set_active` ASID both derive from `TTBR0_EL1[63:48]`), so the metal
+  no-takeover is a HID-delivery/timing question QEMU (no HID) cannot reproduce; a rate-limited
+  `[el0in] routed N event(s) to active EL0 ring` line now fires the instant the router hands the active EL0 app
+  real input, so the next sitting reads delivery directly instead of inferring it. (3) **Host-side typematic** —
+  a USB HID boot keyboard under `SET_IDLE(0)` (which the held-state contract requires) never auto-repeats, so a
+  held key produced exactly one `Event::Key` everywhere; key repeat is the host's job. The USB pump
+  (`pump_usb_into_gui`, ~250×/s) now tracks the most-recently-pressed key from the Key/KeyUp edges it drains and,
+  once it has been held past `TYPEMATIC_DELAY_MS` (400 ms), injects a fresh `Event::Key` into `EVENT_QUEUE` at
+  `TYPEMATIC_RATE_MS` (40 ms ≈ 25 chars/s). Injecting into `EVENT_QUEUE` means the repeat rides the SAME routing
+  every real key takes — shell (`GUI_CHANNEL`), a kernel full-screen app's own `pump_and_poll` drain, AND an EL0
+  app's per-process ring — with no per-path code. Newest key wins; releasing the repeating key stops it. QEMU
+  raspi4b delivers no HID, so no key is ever held and no repeat is synthesised — the deterministic auto paths stay
+  byte-identical (`checksum=0x48221e4101db3924` *(superseded by WC-C -> `0xe68285b85121ac7c`)*, verified on `kernel8-test`). Lane: `arch/aarch64/syscall.rs`
+  (`sys_input_poll` heartbeat) + `main.rs` (typematic + `[el0in]` witness) + this doc.
+- **UVUG-6 (this arc)** — the UVUG-5 typematic tracker observed Key/KeyUp edges as they were **drained out of**
+  `EVENT_QUEUE`. `EventQueue::push` silently **drops** on a full 64-slot ring, so a `KeyUp` pushed while the
+  queue was saturated was never enqueued, never drained, never observed: the tracker held the key forever and
+  injected `Event::Key` every 40 ms, which kept the queue full, which dropped every subsequent real edge — a
+  **self-sustaining wedge** matching the P51 metal capture (keyboard events stop, no detach, repeat broken).
+  Fix — re-root the observation at the **HID report level, before any queue push**. The state + logic moved into
+  `pal` (`typematic_note_report` / `typematic_tick`); `drivers::xhci` feeds each keyboard report's newest press
+  and full held-ascii set directly, so a **release is learned from the report** (armed key absent from the held
+  set) and cannot be dropped by the queue. Three disarm layers cover every miss class: (1) report-level release;
+  (2) keyboard-detach generation (UVUG-5, unplug-mid-hold); (3) **positive liveness** — a still-"held" key with
+  no HID report for ~1 s is dropped (catches a release report that never reached the decode). Plus a
+  **backpressure guard**: `typematic_tick` refuses to inject while `EVENT_QUEUE` is past half full, so a stuck
+  repeat can never saturate the ring and starve real input. The drain-fed `typematic_observe` is gone. A QEMU
+  witness (`typematic_selftest`, run once on the BSP) proves all three legs — baseline repeat, backpressure
+  suppression, and dropped-`KeyUp` disarm — emitting `:: uvug6: typematic … :: PASS ::`. QEMU delivers no HID,
+  so no report is ever fed on the boot path and the deterministic auto paths stay byte-identical. Liveness note:
+  on a keyboard that sends **zero** reports while a key is held still (strict `SET_IDLE(0)`, no idle re-reports),
+  the 1 s liveness stops an ongoing repeat while physically held — a benign, self-correcting degradation
+  deliberately preferred over the catastrophic wedge it guards. **UVUG-9 retired that trade** — see below.
+  Lane: `pal.rs` (tracker + queue depth) + `drivers/xhci/mod.rs` (report-level feed) + `main.rs` (pump call +
+  selftest) + this doc.
+- **WC-B (this arc)** — the **window surface/verb seam**: the syscall half of the window-compositor arc
+  (unit WC-A owns the compositor core in `video/`). Four new verbs, `SYS_WIN_CREATE = 29`,
+  `SYS_WIN_PRESENT = 30`, `SYS_WIN_MOVE = 31`, `SYS_WIN_CLOSE = 32` (28 stays reserved for the deferred
+  `SYS_INPUT_WAIT`). ELF-3 exposed exactly ONE 4 KiB surface per process; WC-B turns that into **8 window
+  surface slots of 64 KiB each**.
+  - **FB region.** The reserved VA hole above the 16 KiB program window grew from `0x2000` to `0x81000`:
+    the RO info page, then 8 × 64 KiB window slots (`boot::FB_WIN_SLOTS`, `FB_WIN_SLOT_SIZE`). 64 KiB is
+    exactly a 128×128 ARGB8888 surface — the arc's maximum (`FB_WIN_MAX_W/H`). A surface's size is
+    **negotiated at create** and only its `ceil(w*4*h / 4096)` pages are mapped; the rest of the slot keeps
+    its reserved EL1-only identity leaf, so a process that asked for 32×32 cannot reach the remainder of
+    its own slot. Every mapped surface page uses the **same `user_data_page` shape** (EL0+EL1 RW, UXN,
+    Normal-cacheable, nG) the single ELF-3 surface page had — no MMU attribute changed.
+    `map_slot_fb_win` / `unmap_slot_fb_win` do proper **break-before-make** per page; unmap restores the
+    boot `L3_USER` descriptor, so a closed surface is unreachable from EL0 the instant the TLBI completes.
+    `map_slot_fb_info` is **idempotent** — it skips the leaf edit entirely when the descriptor is already
+    correct, because `SYS_WIN_CREATE` (unlike `SYS_FB_MAP`) carries no "before any thread spawns" ordering,
+    and a break-before-make on a live info page would fault a sibling thread on a correct program.
+    The VA anchor `USER_REGION` is now `align(0x100000)` (≥ its `0x85000` size) so the region still cannot
+    straddle a 2 MiB `L3_USER` block; the per-slot **backings** got their own page-aligned type, since a
+    backing is consumed one page at a time and does not need the anchor's alignment.
+  - **Slot recycling scrubs the FB region.** `build_slot` zeroes `[USER_REGION_SIZE, USER_STATIC_SIZE)` of
+    the slot's backing. Teardown retires the ASID and its mappings but never the backing bytes, and the
+    loader only writes the 16 KiB program window — so without this a recycled slot's `SYS_WIN_CREATE` would
+    map up to 16 pages of the PREVIOUS tenant's frame back in, EL0-RW. Build (not map) is the scrub point:
+    it is exactly the recycle boundary, runs once per tenant, and cannot wipe a caller's own pixels the way
+    zeroing on map would for a second (documented-idempotent) `SYS_FB_MAP`.
+  - **Two indices, deliberately distinct.** The **window id** (0..8) is global — what EL0 passes and what
+    the compositor names a window by. The **region slot** (0..8) is per-address-space — which 64 KiB
+    surface slot of the *owner's own* FB region backs it. Region slots are allocated lowest-first per
+    ASID, so a process's first window is always region slot 0, at the VA the single ELF-3 surface used.
+  - **Compat is exact.** `SYS_FB_MAP` and `SYS_FB_PRESENT` are wrappers over "window 0" = the caller's
+    region slot 0: `SYS_FB_MAP` returns the **same VA** as before and writes the **same legacy info-page
+    header** (magic, w, h, stride, format, size, surface-offset at offset 0), so the existing `VUG.ELF`
+    binary runs unchanged. Per-window geometry is published alongside it at `0x40 + rslot*0x20`
+    (magic, win id, w, h, stride, format, surface-offset), zeroed on close so EL0 can tell live from stale.
+    The **canonical info-page layout**, in one place:
+
+    | offset | contents |
+    | :--- | :--- |
+    | `0x00`–`0x1B` | legacy ELF-3 header — magic, w, h, stride, format, size, surface-offset (describes region slot 0) |
+    | `0x20` | **VUG-BG process flags** — bit 0 = `DETACHED` (launched by `bg`, not `run`); rest reserved, zero |
+    | `0x24`–`0x3F` | reserved, zero |
+    | `0x40 + rslot*0x20` | per region slot — magic, win id, w, h, stride, format, surface-offset; magic 0 = no live window |
+
+    Both info-page publishers write the flags word (the legacy header is only refreshed for region slot 0,
+    so the per-window publisher writes it too — a process whose first window landed on a higher slot would
+    otherwise read a zeroed, i.e. wrongly "not detached", word).
+    `SYS_FB_PRESENT` deliberately does **not** require a window-table row — it presents the region-slot-0
+    surface with the legacy accounting either way, so the ELF-3 fb-test verdict cannot regress on table
+    exhaustion.
+  - **Ownership is authoritative in the syscall layer**, not the compositor: every verb resolves the
+    caller's ASID from `TTBR0` (`current_asid`, the same read the handle gates use) and refuses a window
+    it does not own, errno-for-errno with those gates — `-EBADF` for an out-of-range or free id (the
+    `sys_close` shape), `-EACCES` for a live window owned by another ASID (the rights-denial shape). The
+    table is a `SpinMutex` taken IRQ-masked via `IrqGuard` on every access (syscall context AND the
+    IRQ-masked teardown path), held across the MMU maintenance so a create and a close on two cores cannot
+    interleave break-before-make on the same leaf. **Both present verbs hold that lock across the composite
+    itself**, not merely across the ownership check: a close+create pair on other cores can recycle a window
+    id, and a validate-then-drop-then-present would land the caller's pixels under the new owner's window
+    identity. `WINDOWS` is a leaf lock and `video::wm` state is acquired strictly inside it.
+  - **Teardown.** `clear_handle_row` closes every window the dying ASID still owns — the window twin of the
+    handle/file/input/latch clears, and for the same reason: a surviving row would name a surface inside a
+    backing frame the slot's NEXT tenant gets, compositing the next program's private memory to the panel.
+  - **UVUG-8 invariants preserved.** `SYS_WIN_PRESENT` and `SYS_FB_PRESENT` run one shared body, so the
+    **focus-scoped** `EL0_FOCUSED_PRESENT_COUNT` bump (under the same `EL0_INPUT_ACTIVE == asid` guard)
+    happens for window presents too — a window verb that skipped it would hand a focused app a way to
+    render forever without counting as progress, defeating the UVUG-8r2 suspension cap. Takeover latch,
+    heartbeat and orphan lifecycle are untouched.
+  - **Integration seam.** WC-A's `video::wm` does not exist in this unit's worktree (the units are
+    lane-disjoint and concurrent), so the four compositor calls go through a stateless private `wc_shim`
+    module, each call site marked `// WC-INTEGRATION:` with the real API it stands for
+    (`create`/`present`/`move_window`/`destroy`). The shim carries no state and no policy — ownership,
+    geometry validation and surface mapping all live in the gates above it — so the swap cannot move a
+    security check. Until then `present` forwards to the ELF-3 present hook, i.e. today's behaviour.
+- **UVUG-9 (this arc)** — three P54b metal defects, root-caused from the instrumentation the previous arcs
+  installed rather than from fresh guesses. QEMU raspi4b delivers no HID, so all three are metal-verified only;
+  the gates below prove no regression.
+  - **The interactive freeze** (crystal stops mid-animation, program keeps polling, presents stop, the 60 s
+    no-render cap fires). Confirmed **by the kernel's own witness algebra**: holding the takeover suspension for
+    `TAKEOVER_SUSPEND_MAX_SECS` requires the heartbeat — stamped *only* by `sys_input_poll` — to stay fresher
+    than `TAKEOVER_STALE_SECS` on every pass, while `EL0_FOCUSED_PRESENT_COUNT`, bumped by `sys_fb_present`
+    under the **identical focus predicate**, never moves. Polling forever while presenting never is a state only
+    one phase of UVUG's frame loop can occupy: the input drain, which UVUG-8 wrote as an **unbounded**
+    `loop { poll() }` running until the ring reported empty. Fix — a per-frame drain budget
+    (`MAX_DRAIN_PER_FRAME` = 64, twice the kernel's `INPUT_RING_CAP`); leftovers are consumed by the next
+    frame, so the render/present half of the loop is always reached and the freeze becomes input latency at
+    worst. The futex barrier was **refuted** as the cause, not merely doubted: `sched::futex_wait` compares
+    `*uaddr` against `val` under the same bucket lock `futex_wake` takes, so the park is race-free by
+    construction, and a parked parent could not have kept the heartbeat fresh anyway.
+  - **Present errors were invisible.** UVUG-8 discarded `SYS_FB_PRESENT`'s return, so a present that began
+    failing mid-run would have been indistinguishable from a freeze. It is now checked and witnessed.
+  - **`[uvug9]` stall witness** — an app-side, per-phase progress witness naming *which* phase stopped:
+    `[uvug9] stall frame=<n> phase=poll drained=<n>` (drain budget spent with the ring still non-empty — the
+    freeze signature, now a diagnosis of a runaway producer rather than a hang), `phase=barrier done=<0|1>`
+    (which worker half is missing), `phase=present rc=<errno>`. EL0 has no clock syscall, so the barrier budget
+    is counted in **passes**, which is both deterministic and exactly what "made no progress" means here; the
+    stated limitation is that it catches a *spinning* barrier, not a *parked* one (that case is refuted in the
+    kernel, above). There is no knob channel into EL0, so each phase **self-gates on its own anomaly** and
+    latches after one report — a healthy run prints nothing, and the QEMU auto path reaches no anomaly at all,
+    which is why its 300-frame checksum is untouched.
+  - **Key repeat stopped after ~10 characters at the shell.** Not a mystery: UVUG-6's liveness layer (3) firing
+    on a healthy keyboard. A strict `SET_IDLE(0)` boot keyboard sends one report on the press and then
+    **nothing** while the key is held still, so `LAST_REPORT_MS` freezes at the press; repeats run from
+    `DELAY_MS` (400 ms) to `LIVENESS_MS` (1000 ms) at `RATE_MS` (40 ms) — ~15, fewer once the press report's own
+    latency counts. The guard inferred "wedged" from silence on a device class whose correct behaviour *is*
+    silence, so it could never have been sound there. Fix — **evidence-gate** it: `typematic_note_report` sets a
+    sticky `STREAMS_WHILE_HELD` only on a **true idle re-report** — the armed key still down, no press edge, and
+    the held set **byte-identical** to the previous report's — sustained for `IDLE_RUN_TO_LATCH` (4) consecutive
+    reports. With that evidence the 1 s window applies unchanged and the P51 wedge stays shut; without it the
+    bound becomes `HOLD_MAX_MS` (30 s), a coarse backstop that keeps the pathological case finite while letting
+    a held key repeat as long as anyone actually holds one. Cleared on keyboard detach (along with the evidence
+    it was derived from), so a swapped device re-earns the verdict. Layers 1 and 2 are untouched and remain the
+    real release paths.
+    **Why the gate is that strict** — one false latch re-imposes the 1 s window for the whole boot and brings
+    the ~10-repeat stop straight back, so the gate is a fix-durability surface in its own right. "No press edge"
+    alone would have latched on (a) a two-key **rollover release** (press a, press b, release a — no press edge,
+    armed b still held) and (b) a **non-ascii tap** while holding (F-keys map to ascii 0). The byte-identical
+    test excludes (a); it cannot see (b), because the ascii projection the tracker receives has already
+    discarded the keycode that changed, so both the tap's press and its release arrive as unchanged-held
+    reports. The run threshold closes (b) from this side — a tap yields two such reports, a genuinely
+    idle-re-reporting keyboard yields them continuously. (Feeding raw keycodes would close it at the source, but
+    that is a `drivers::xhci` signature change and outside this arc's lane.) All three cases are now asserted by
+    the `uvug6` selftest: legs **(D)** rollover-release and **(E)** non-ascii-tap must NOT latch, leg **(F)**
+    genuine idle re-reports MUST — so the wedge guard still arms on the hardware it exists for.
+    A `[uvug9] typematic hold-max` line fires when the 30 s backstop is what disarmed a key, so the bench can
+    tell backstop from bug; the tight `LIVENESS_MS` disarm stays silent (it is the ordinary end of a hold).
+  - **Orphan residue: the GUI watchdog was silently disarmed for the rest of the boot.** `sys_input_poll` called
+    `gui_watchdog::note_progress()` **unscoped**. A timed-out run leaves its EL0 task alive and spinning on that
+    very syscall (this arch has no asynchronous kill primitive), so one timeout kept feeding the watchdog
+    forever — disabling the escape hatch that hands the screen back when a *later* full-screen app wedges. Fix —
+    focus-scope it, joining the takeover heartbeat under one `EL0_INPUT_ACTIVE == asid` test; they were always
+    the same question. This is the part of the orphan residue that outlives the run.
+  - **Mouse dead at the shell after a timeout while arrow keys still work** — **instrumented, not fixed.** The
+    asymmetry's likeliest owner is `drivers::xhci`: the dup-Success guard (`mouse_expect_phys`) returns from the
+    transfer dispatch **without** calling `queue_mouse_read`, so a single mismatched completion retires the
+    pointer read permanently while the keyboard's independently-armed endpoint carries on — on the endpoint that
+    generates by far the most traffic. That file is **outside this arc's lane**, so this arc adds the witness
+    that decides it instead of changing the driver: `[uvug9] shell-path input key=<n> ptr=<n>` counts keys and
+    pointer events separately at the shell-destined drain. Read against the existing `MOUSE-1` xHCI decode
+    counter: `MOUSE-1` advancing while `ptr=` is frozen puts the loss in the router/queue seam (this lane);
+    both frozen while `key=` advances puts it on the pointer interrupt-IN endpoint (the driver lane).
+  - Gates: `./arroyo check` green x86_64 + aarch64; `./arroyo kernel8` builds; `./arroyo kernel8-test` 46 PASS /
+    0 FAIL, UVUG batch `frames=300 checksum=0x48221e4101db3924 exit=0` **unchanged** *(superseded by WC-C -> `0xe68285b85121ac7c`)*, `:: uvug6: typematic … ::
+    PASS ::` still green (the evidence gate leaves all three selftest legs on their original verdicts). Lane:
+    `crates/user-vug/src/main.rs` + `pal.rs` (typematic liveness) + `arch/aarch64/syscall.rs`
+    (`sys_input_poll` focus scope) + `main.rs` (shell-path witness) + this doc.
+- **VUGGUARD — an app must not proceed as though a requested resource was granted** (`crates/user-vug` only;
+  the kernel-side thread-row reclamation and kill-aware futex are a separate arc). Attended P60 on a Pi 4:
+  after a few kill/relaunch cycles, new vugs came up as **empty windows** that could not be killed, and
+  eventually nothing would launch at all. The app's share of that chain is one omission. `SYS_THREAD_SPAWN`
+  draws from a **fixed, GLOBAL** 8-row thread-handle table (`NTHREAD`) whose rows are freed only by the owner's
+  voluntary `SYS_THREAD_JOIN`; UVUG joins its two workers only *after* its main loop, so a killed vug leaks both
+  rows and four such kills exhaust the table. From then on every spawn returns `-EAGAIN` — and UVUG **never read
+  the return**, capturing the two values only to join them later. A vug that got zero workers therefore entered
+  the frame barrier waiting for a `done` count of 2 that no living thread would ever bump, and parked in
+  `futex_wait` **before its first `SYS_WIN_PRESENT`**: kernel-drawn chrome, no content, and a process wedged in
+  a wait no kill reached.
+  - **Both returns are now checked**, and the failure behaviour is **DEGRADE**, not fail-fast. Every band no
+    worker owns is rasterised **inline by the parent** with the same `render_band` over the same published
+    projection, placed between the worker release and the barrier — exactly where the parent otherwise idles,
+    so with one worker alive the two halves still draw concurrently. A vug launched while the table is full
+    still comes up, still draws, still takes input and still exits 0; it is only single-threaded. Fail-fast was
+    the alternative and was rejected: table exhaustion is a *transient* condition, and refusing to launch would
+    convert a recoverable system into a hard one at exactly the moment the operator is trying to get a window
+    back. Because the inline raster is the same code over the same geometry, the **final surface is
+    byte-identical** to a two-worker run — the deterministic auto-path checksum is a property of the frame
+    count, not of how many threads drew it.
+  - **The barrier waits for the workers that EXIST**, never a hard-coded 2 — with none it is not entered at all.
+    That closes P60's class *structurally*: no pass budget could ever have caught it, because a parked parent
+    executes nothing. UVUG-9's `BARRIER_PASS_BUDGET` survives for the narrower case it can see — a thread that
+    exists and stops arriving — and is now a **deadline as well as a witness**: on the pass that prints
+    `[uvug9] stall … phase=barrier`, the parent signals `PHASE_EXIT`, retires the pool and takes both bands
+    inline for the rest of the run. UVUG-9 printed that line and then went straight back into the same wait.
+    The line now marks the one frame that presents partially-stale content, not a permanent state.
+  - **A retired worker is not joined.** `sys_thread_join` blocks until the thread finishes, so joining the very
+    thread that just failed to arrive would park the parent forever at exit — the symptom being removed. Its
+    kernel row is deliberately leaked instead: a leaked row is reclaimable from the kernel, a parked process is
+    not reclaimable from anywhere.
+  - The exit witness reports the workers the run actually **got** (`threads=<n>`) rather than the two it asked
+    for; on the healthy path that is the literal `2` the pi4 spec `REQUIRE`s. A degraded launch also names the
+    denied resource up front: `:: UVUG: SYS_THREAD_SPAWN denied a=<errno> b=<errno> workers=<n> -> inline
+    raster ::` — the diagnostic whose absence made P60 read as a compositor fault.
+  - **Healthy path untouched by construction.** The additions are two `if` predicates that are false when both
+    spawns succeed, one `live > 0` guard on the release, and `d >= live` in place of `d >= 2`. No syscall is
+    added, removed or reordered anywhere in the frame, so the WC-H present discipline is unchanged.
+  - Gates: `./arroyo check` green x86_64 + aarch64; `UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test 60`
+    replayed through `scripts/specs/pi4-regression.spec` → **63/63 required, 0 forbidden**; `./arroyo test-arm`
+    MISSION SUCCESS. Healthy-path evidence: the auto witness is byte-identical to the pre-change baseline
+    (`:: UVUG: frames=300 threads=2 checksum=0xe68285b85121ac7c ::`), `EXEC-UVUG … exit=0 -> PASS`, and no
+    `[uvug9] stall` or spawn-denied line appears anywhere in a healthy boot. Lane:
+    `crates/user-vug/src/main.rs` + this doc.
+- **UVUG-10 (this arc)** — the P55b pointer bisect, and the boot fixture that was costing a core every metal
+  boot.
+  - **`ptr=0` forever, from boot.** P55b read `[uvug9] shell-path input key=<n climbing> ptr=0` on metal for
+    the whole boot, while the xHCI `MOUSE-1` witness reported a live pointer — the mouse was never lost *after*
+    a takeover focus-drop, it never worked at all. UVUG-9 framed that reading as deciding between "the pointer
+    stopped being decoded" and "the pointer is decoded but does not reach the shell path", but the two
+    witnesses bracket `pal::EVENT_QUEUE` without measuring it, so the reading was not actually decisive: both
+    the driver's `push_event` and the queue itself sit inside the unmeasured gap.
+  - **The loss is at or after `EVENT_QUEUE` — settled, not suspected.** The driver's
+    `push_event(Event::Mouse)` (`drivers/xhci/mod.rs:2278/2286`) precedes the `MOUSE-1` print in
+    straight-line code with **no platform fork between them**, so P55b's `last dx=3 dy=5` is direct proof
+    that pointer events were pushed. An earlier all-zero-report-buffer suspect is refuted by that same fact,
+    and UVUG-9's dup-Success-guard theory is independently weakened (`queue_mouse_read` and
+    `queue_keyboard_read` are structurally identical in their `expect_phys`/`prev_phys` bookkeeping, so a
+    guard mis-firing on the pointer would mis-fire on the working keyboard).
+  - **Unified theory — and this arc's fixture gate is probably also the mouse fix.** The boot
+    `input_launcher` orphan held `el0_input_active()` for the *entire* boot, so the router's EL0 branch
+    (`route_input_to_active_el0`) swallowed the whole queue into a ring nothing would ever read. Keys still
+    reached the shell because `input_service`'s UART path calls `gui_send` **directly** and never touches
+    `EVENT_QUEUE` at all. One mechanism, no second defect, and it accounts for every observed fact including
+    "from boot" and "keys but never pointer". Gating the fixture off metal removes the orphan, and with it
+    the standing focus.
+  - **`[uvug10] evq` — the measurement that decides it on the wire.** `pal::push_event` classifies every
+    offered event (pointer / key) and, because `EventQueue::push` silently discards on a full ring, counts
+    the **drops** separately; `pop_event` counts consumption across *every* consumer. `event_queue_stats`
+    exposes the five totals and the router prints
+    `[uvug10] evq push ptr=<n> key=<n> / drop ptr=<n> key=<n> / pop=<n> depth=<n>`, throttled by a pass
+    counter (raspi4b's `ms()` is pinned at 0, so a wall-clock throttle would flood) and emitted only when a
+    counter moved. Two calibrations the reader needs. **Baseline:** the boot selftests are producers —
+    `input_router_selftest` pushes a synthetic `Mouse{3,-4}` — so "never produced" reads **`push ptr=1`**,
+    not `0`; QEMU's own line is `push ptr=1 key=38 / drop ptr=0 key=0 / pop=40`. **Re-circulation:** the
+    `SCREEN_APP_ACTIVE` peek drains and re-pushes the ring every pump pass (~250×/s) while a kernel app owns
+    the panel; that is neither production nor consumption, and counting it would inflate push/pop/drop
+    exactly in the state where a stalled drain is the hypothesis under test — so the peek now runs through
+    an uncounted seam (`pal::peek_event_uncounted` / `pal::requeue_event`) and the totals keep meaning
+    "entered the pipeline once" / "left it for good". Drop accounting earns its place regardless: a moving
+    mouse produces ~125 events/s against a handful of keystrokes, so any drain stall starves the pointer
+    class first, and did so invisibly before this arc.
+  - **P56 verdict table.** Expected: `[uvug9] ptr` climbs normally with a moving mouse and no orphan is
+    alive — the orphan theory held and nothing further is owed. If `[uvug9] ptr` is **still 0 with no
+    orphan**, the theory is refuted and the hunt resumes at or after the queue: `push ptr>1` with
+    `drop ptr≈push ptr` is a saturated ring behind a stalled drain; `push ptr>1` with `drop ptr=0` means a
+    second consumer takes them first (`pop` far above the router's own `[uvug9]` totals names it — an EL0
+    focus ring, or the focus-change pre-launch discard); `push ptr=1` unmoved should be unreachable given
+    the settled xHCI finding, and would put the question back in the driver lane.
+  - **The boot interactive-launcher fixture no longer runs on metal.** ELF-5's `input_launcher` is a *real*
+    interactive takeover — it registers itself as the active input target and spawns an EL0 program that
+    spins on `SYS_INPUT_POLL` until it drains the one event the launcher injects. That premise holds only
+    where the kernel injection is the sole producer. On metal, live HID traffic reaches the same ring first,
+    the program's fixed three-observation script stops matching, and the launcher's 2 s bounded wait expires
+    **with the EL0 task still alive**; with no asynchronous kill primitive on this arch the abandoned program
+    then spins its poll/yield loop for the rest of the boot — the pause during boot plus a core pegged at
+    100%, on every boot, that also starved later runs (`EXEC1` FAIL). It is now gated on
+    `timer::is_live()`, the same metal/QEMU discriminator `main` already uses to decide which service tasks
+    to spawn, and prints an uncounted `:: EL0: input test — SKIP on metal … ::`. **Why that gate:** a
+    HID-presence test would race asynchronous enumeration and run the fixture anyway behind a slow device,
+    and the real objection is not "a mouse is plugged in" but "this is an interactive machine whose input
+    belongs to the user"; a compile-time knob was rejected because the metal image and the QEMU battery
+    image are built from one feature set, so the knob would have to be remembered at every flash and a
+    forgotten knob silently restores a boot-time core leak. QEMU keeps the fixture and its verdict verbatim.
+    **Recorded residual:** `timer::is_live()` is a *proxy* — it asserts "the Group-1 timer IRQ was observed
+    delivering", not "this is hardware", so a metal boot whose Group-1 delivery failed reads `false` and
+    reinstates the orphan. Accepted rather than papered over: the same proxy already gates `rx_backstop` /
+    `status_tick` / `usb_pump`, so a board where it lies has already lost its timer-driven services and the
+    orphan is not what the bench would be chasing, and the failure is loud (`AARCH64: timer heartbeat live`
+    is absent from such a capture). A real "am I on hardware" predicate belongs with platform
+    identification, not with a fixture gate.
+  - Gates: `./arroyo check` green x86_64 + aarch64; `./arroyo kernel8` builds; `./arroyo kernel8-test 120`
+    **46/46 required witnesses, 0 forbidden**, UVUG batch `checksum=0x48221e4101db3924` **unchanged**,
+    `:: uvug6: typematic … PASS ::` green, `:: EL0: input test … PASS ::` still green in QEMU. Lane:
+    `pal.rs` (queue accounting) + `main.rs` (router witness) + `arch/aarch64/syscall.rs` (fixture gate) +
+    this doc.
+- **SKILL-1 (this arc)** — the **asynchronous kill primitive**, and the retirement of the orphan.
+  Every arc above had to work around the same missing piece: `sched::exit` retires only the **calling**
+  task, so nothing could stop a task that had stopped cooperating. `run_user_image`'s `Timeout` path could
+  only park the `Proc` row `PORPHANED` and walk away, and the metal cost of that was severe and cumulative
+  — the abandoned EL0 task kept **spinning a core at 100 % forever**, kept **rendering over the shell's
+  screen**, and starved every later run (observed on two boots as `EXEC1 … did not exit in time` on the run
+  *after* a timeout). UVUG-9's watchdog fix above ("orphan residue") treated one symptom of exactly this.
+  - **A kill is a request, never register surgery.** `sched::kill(tid, asid)` publishes an entry in a
+    four-slot table; the target retires **itself, on its own core**, at a boundary where switching away for
+    good is already proven safe. No cross-CPU stack or register is ever touched. Task ids are monotonic and
+    never reused, so a request cannot be mis-delivered to a later task.
+  - **The unit of a kill is the ADDRESS SPACE, not the thread.** An ELF-2 program can hold several tasks
+    under one ASID (`SYS_THREAD_SPAWN`), so a request that named only the tid `run_user_image` happens to
+    hold would retire one thread while its siblings kept running — still spinning, still rendering — under
+    a row we had just reported *reaped*. (Nothing unsafe: `teardown_user_slot` is refcounted and only the
+    last thread out retires the slot. The defect is a **false claim**, which is worse for being silent.) A
+    non-zero `asid` widens the request to every task in the slot; both arms match on it, and a per-ASID
+    live-task count (`ASID_THREADS`, maintained at every user spawn and every task death) makes
+    `kill_settle` **withhold the confirmation until the last sibling has retired**. If some sibling never
+    does, the witness says so outright — `confirmed=0 row=orphaned — <n> sibling thread(s) survive` — and
+    the row stays parked. A reap is only ever reported when the whole process is gone.
+  - **Slot-protocol races, all resolved by CAS.** `kill_settle` transitions with a
+    `compare_exchange(PENDING → DONE)`, never a load-then-store: it races `kill_detach` at precisely the
+    worst moment (a requester's bounded wait expiring is exactly when a slow kill lands), and a
+    load-then-store would stamp `KILL_DONE` over `KILL_DETACHED` — a terminal state with no owner left to
+    release it, four of which retire the primitive for the boot. Losing the CAS now means the state is
+    `DETACHED` and the slot is freed **inline**, on the owner-less path. A late settle likewise frees only
+    a slot it can CAS out of `DETACHED`, so a slot another requester has re-armed can never be clobbered.
+    `kill_retract` closes the mirror-image leak: the `PRUNNING` guard before arming is a *sampled* read,
+    and the task can complete its whole `SYS_EXIT` in the gap, leaving a request nothing can ever settle —
+    so the requester **re-checks the row after arming** and releases the slot at once if the target is
+    already gone. Exhaustion is never silent: `[skill] slot table EXHAUSTED — reverting to PORPHANED`
+    prints once per boot.
+  - **Two arms.** *(a) OFF-CPU* — `dispatch_next` checks the table after popping a task and **before**
+    switching into it: a killed task is never dispatched again, and is torn down on the scheduler's own
+    stack. This arm needs no cooperation from the target at all and covers ready, sleeping and wait-queued
+    tasks alike, since they all re-enter through a dispatch. *(b) ON-CPU* — `timer_preempt`, `yield_now`
+    and the SVC dispatcher call `kill_check_current`, which routes a killed current task straight into
+    `exit()`. The quantum tick is the load-bearing one: it is the **only involuntary boundary a spinning
+    EL0 task ever reaches**, and it is what turns the 100 %-core orphan into an actual death (~one tick,
+    ≈4 ms, on metal). All three call sites already run IRQ-masked on the task's own kernel stack and
+    already tolerate a never-returning `exit()` — that is precisely what the M6b EL0 fault-kill path does.
+  - **Teardown mirrors `exit()`** in both arms: `boot::teardown_user_slot(asid)` first (it repoints the
+    core's `TTBR0` off the dead root before the ASID broadcast-flush and the slot release), then the
+    `done_sem` post so a `JoinHandle` is never left blocked, then the kernel stack, and the kill slot is
+    settled **last**. The two arms are **deliberately asymmetric about the stack**, and the confirmation
+    contract is written to the weaker of them: the off-CPU arm owns the Box and drops it before publishing
+    `KILL_DONE`, whereas `exit()` is still *executing on* that stack and cannot, so there the stack is
+    reclaimed moments later by whichever core takes the Box. What both arms guarantee at confirmation — and
+    all a requester may rely on — is: **the address-space slot is torn down, the joiner is released, and
+    the task will never execute again.** Kernel-stack reclamation is scheduler-internal and explicitly not
+    part of the contract.
+  - **Confirmation is what licenses the reap.** `run_user_image` now kills **before** it parks:
+    `kill` → bounded wait (`KILL_CONFIRM_SECS` = 2 s, wall-clock off CNTPCT, yielding so the co-located
+    target reaches a dispatch) → on confirmation the row is **reaped outright**, because nothing is left
+    alive to post a late status onto a recycled entry, which was the entire reason `PORPHANED` existed. If
+    the task *did* manage a real `SYS_EXIT` or fault-kill on its way out (a boundary is where those land
+    too), the row is already `PEXITED` and is reaped through the ordinary status+`done` path instead.
+  - **Fail-closed everywhere.** No free kill slot, or a kill that does not confirm inside the bounded wait,
+    degrades to **exactly** the pre-arc `PORPHANED` behaviour — never to freeing a row under a live task.
+    A detached request stays **armed**, so the task still dies at its next boundary, and
+    `note_killed_task_retired` reclaims the parked row when it does (scoped to `PORPHANED` rows only, so it
+    can never race the confirmed path or touch a live parent/child row). Witness, printed only when a kill
+    actually happens: `[skill] killed pid=<n> asid=<n> confirmed=<0|1> row=<reaped|orphaned>`.
+  - **What a boundary-driven kill cannot reach — stated, not glossed.** A task **blocked on a wake that
+    never comes** (a semaphore nobody posts, a futex nobody wakes) is in neither a run queue nor on a CPU:
+    it reaches no dispatch and no preemption, so *neither* arm can see it, and its request stays
+    `KILL_DETACHED` for the boot. Sweeping the wait lists at detach time is the real fix and is
+    deliberately **not** attempted here — the waiters live behind `Semaphore`'s and `FutexBucket`'s own raw
+    spinlocks, and reaching into them from an arbitrary requester context would invert the lock order the
+    park-side handoff depends on (`Semaphore::wait` pushes the Box *while holding* that lock). That is a
+    wait-queue-ownership change, not a scheduler-kill change, and belongs to its own arc. The same is true
+    of a task that reaches no boundary at all (the QEMU case; on metal the quantum tick always arrives).
+    Both are bounded and **visible**: the table is four entries, every other path returns its slot, and the
+    resulting exhaustion is witnessed rather than silent.
+    > **Superseded by KILLBOUND (below).** The first limitation was not a bounded inconvenience — it was
+    > the P60 wedge, and it was reachable by an ordinary operator in an ordinary session. It is now closed
+    > from both sides, and **the lock-order objection recorded above was simply wrong**: the eviction takes
+    > exactly the lock `futex_wake`/`Semaphore::post` already take, in the same order, and calls
+    > `make_ready` outside it. The second limitation (no boundary at all) is genuine and stands.
+  - **QEMU proves both arms; only the timer *trigger* is metal-only.** The new `:: SKILL-1: async kill …
+    :: PASS ::` witness runs cooperatively on the boot core (before `SCHED_ACTIVE`, self-contained and
+    bounded, like the `prio_mix`/`load_accounting` witnesses beside it) and drives `dispatch_next` by hand,
+    so every step is observed rather than raced: an immortal victim is shown **running**, then killed and
+    shown **frozen** (never dispatched again — the actual claim, not merely "eventually stopped"), the
+    request confirms in **one pass**, the queue drains; a second victim arms its own kill *while running*
+    and is retired by `kill_check_current`; a third leg drives the **detach-vs-settle interleave** (arm,
+    detach while the victim is still off-CPU and un-reaped, *then* let the retirement land) and asserts the
+    slot comes back `KILL_FREE` — the exact ordering that stranded a slot before the CAS settle, and
+    verified to have teeth by a negative control (restoring the load-then-store settle fails that leg, and
+    only that leg: `det_freed=false pool=false`, everything else still true). Both tickets release, the
+    slot pool returns clean, and a fresh task then spawns, runs and exits. What QEMU raspi4b **cannot**
+    show is the timer-driven trigger: it
+    delivers no Group-1 timer IRQ, so `timer_preempt` never fires and a genuinely spinning task (no yield,
+    no syscall) could not be interrupted there at all — it would wedge the single cooperative core. That
+    trigger rides the bench.
+  - Gates: `./arroyo check` green x86_64 + aarch64; `./arroyo kernel8` builds; `./arroyo kernel8-test 120`
+    **46/46 required witnesses, 0 forbidden**, UVUG batch `frames=300 checksum=0x48221e4101db3924 exit=0`
+    **unchanged**. Lane: `arch/aarch64/sched.rs` + the `run_user_image` `Timeout` path and the SVC boundary
+    in `arch/aarch64/syscall.rs` + this doc.
+- **BGRUN-1 (background EL0 runs)** — `bg <path>` / `jobs` / `kill <pid>`: the concurrent-apps line.
+  `run` blocks the shell in `run_user_image`'s wait loop until the program dies, so two real windows never
+  coexisted longer than the `el0-wcb` fixture's split second — the WC-TAB focus ring was mechanism without
+  a workflow (bench-observed: windows open for a fraction of a second, nothing to TAB between).
+  - **`spawn_user_image_bg`** (syscall.rs) is `run_user_image`'s front half, verbatim — same bounds, same
+    console-cap endowment, same EXEC1-M asid-before-spawn publish order (the SYS_EXIT rescue arm covers the
+    same mid-publish window here, correctly) — and then RETURNS `(pid, asid, entry)` instead of waiting.
+    Deliberate non-inheritances: no `el0_input_set_active` (focus stays put; the operator TABs into a bg
+    window, which resets its ring exactly as the foreground path does), and no deadline/UVUG-8 machinery
+    (nothing waits, so nothing can strand the SHELL; and — stated plainly, lens-corrected — NOTHING bounds
+    a bg app: no deadline, no watchdog, no compositor cap. `kill <pid>` is the sole remedy, which is why
+    the focus-ring guard keys on where focus is (a focused window can ALWAYS TAB out, even at n = 0) —
+    the shell, and therefore `kill`, must be unreachable never.)
+  - **`jobs` is the SOLE reaper**: a bg row stays claimed after exit (`PEXITED`, `done` posted) until
+    `bg_poll(reap=true)` consumes the permit and frees it — bounded and honest (a shell that never reaps
+    eventually reads "process table full", not silent loss). The shell records jobs in a bounded 8-slot
+    table (8 — headroom over the true ceiling, the Proc table's MAX_PROCS = 4, which binds first: 3 bg
+    jobs alongside one foreground `run`); a spawn the table cannot record is killed, not leaked.
+  - **`kill <pid>`** is the SKILL-1 primitive (ASID-scoped so ELF-2 siblings die too), condensed: bounded
+    confirm wait, post-arm already-dead retract, `PORPHANED` fallback with the kill left armed. A
+    CONFIRMED kill reaps the row in place, both arms (a dispatch-boundary kill never reaches SYS_EXIT,
+    so waiting for `jobs` would read "running" forever); a repeat `kill` on a parked row returns early
+    (`proc_orphan`'s PRUNNING precondition is honoured — the round-1 lens showed the alternative parks
+    the shell task forever on a permitless `done.wait`).
+  - Witnesses: `:: BGRUN: bg <path> — … DETACHED ::` on spawn, `:: BGRUN: jobs — pid=… reaped ::` on reap,
+    and the boot-time `BGRUN-ST` selftest (spawn->exit->reap + kill-mid-run + BGRUN-2's persist+kill),
+    each spec-REQUIREd plus a `-> FAIL` FORBID — the round-1 lens showed the headless-observable core of
+    the contract was gateable after all. Only the INTERACTIVE half is bench-only (QEMU has no HID): see
+    BGRUN-2 below for the app that makes it testable. One widening worth knowing at the bench: the shell now consumes TAB at
+    n == 1, so TABbing during a single-window foreground `run` drops focus to the parked shell — TAB back
+    re-enters; linger instead and the takeover re-arm can SKILL-1 the app ~5 s later. The safety property
+    (never weld the operator away from `kill`) outranks that exposure, deliberately.
+- **BGRUN-2 (`stat.elf` — the persistence app)** — the fixture BGRUN-1 was missing. BGRUN-1's bench recipe
+  was "`bg /fat/uvug.elf` twice → TAB between two live crystals", and it does not work: a BACKGROUNDED UVUG
+  is UNFOCUSED, so no HID event ever reaches it, so it never leaves its deterministic auto path — 300 frames
+  and gone. Both windows flash past before a hand reaches TAB. The window ring was untestable at the bench
+  not because of a compositor defect but because there was no app that STAYS.
+  > **Superseded in part by VUG-BG (below):** a backgrounded `VUG.ELF` now persists too, so the original
+  > "`bg` the vug twice" recipe works after all. `STAT.ELF` is not thereby redundant — it has no exit
+  > condition *at all*, focused or not, which is a stronger property than VUG's conditional persistence,
+  > and it is what `BGRUN-ST` leg 3 rests on. It also puts its pid on screen, which is what makes the TAB
+  > walk checkable against `jobs`.
+  - **`crates/user-stat` → `STAT.ELF`** is that app: a static ELF64 EL0 program built and staged exactly
+    like `VUG.ELF` (own workspace + `user-stat.ld` PHDRS: R+X text, R+W data; `arroyo kernel8` builds it,
+    checks the ELF magic and the 16 KiB `USER_REGION_SIZE` bound, and copies it to the FAT staging dir).
+    ~8.5 KiB. It creates one 128x128 window (`SYS_WIN_CREATE`, the same one-slot geometry UVUG negotiates),
+    and each frame repaints its **own pid in large digits** (from `SYS_GETINFO`), a **frame counter** and a
+    **sweep block**, then `SYS_WIN_PRESENT`s and `SYS_SLEEP_MS(50)`s (~20 fps; on metal that is a real timed
+    sleep, so it costs nearly nothing sitting on the panel).
+  - **It has no exit condition.** Not on unfocus, not on a frame cap, not on ESC. `kill <pid>` is the whole
+    remedy — which is not a shortcut but BGRUN-1's stated contract for a bg app, now exercised rather than
+    described. It also does **not poll input**, so it behaves identically focused and unfocused (its ring
+    fills and drops, bounded and harmless) — the precise property the TAB walk depends on. The only
+    non-kill path out is a failed `SYS_WIN_CREATE`, which prints and exits 1 rather than writing an unmapped
+    VA.
+  - **The pid on screen is the point.** Two instances of the same image are otherwise pixel-identical; the
+    large pid is what lets the operator say WHICH window TAB just focused, and it is the same number `jobs`
+    prints and `kill` takes.
+  - Witnesses: `:: STAT: start pid=<n> win=<id> ::` and, once, `:: STAT: alive pid=<n> frames=40 ::` —
+    two one-shot lines and then silence forever (a program with no exit must never be a serial firehose).
+    Headless, `BGRUN-ST` leg 3 spawns it detached, dwells 2 s (comfortably longer than UVUG's entire
+    300-frame auto run, so "still running" cannot be confused with "has not got round to exiting"),
+    REQUIREs `Running`, kills it and requires the row settles: `:: BGRUN-ST: persist+kill PASS (pid=…) ::`.
+  - **Gate length: the QEMU window moved 35 s → 60 s with this arc**, in `pi4-regression.spec`'s header and
+    in `arroyo`'s `battery` step. Leg 3's dwell (2 s, plus STAT's yield-amplified cost while QEMU's
+    degraded `SYS_SLEEP_MS` makes it spin) consumed headroom that was only ~10% to begin with AND was
+    machine-dependent: one host still read 54/54 at 35 s while another dropped to 42/54, losing the twelve
+    witnesses that print LAST (K8b-snap, K8c-snapread, K6-migrate, all BANDY-*) — a truncation that reads
+    as a regression in arcs nobody touched. Measured on this branch: 24 s / 27 s → 44/54; 30 / 35 / 45 /
+    60 s → 54/54; at 60 s the last required witness lands ~40% into the log. **Known hazard, unfixed and
+    out of this lane:** `battery`'s pi4 step pattern-matches `CAPSTONE COMPLETE` only, which prints EARLY
+    — so a truncated log still reports the step GREEN. The battery cannot currently go red on a short
+    window; only an explicit `mbench --replay … --spec` can. Assert the spec, not the battery step.
+  - **Bench recipe (the TAB test, at last).** At the panel shell:
+    `bg /fat/STAT.ELF` → `bg /fat/STAT.ELF` → `jobs` (two `running` rows; note the pids) → press `TAB`
+    repeatedly and watch focus walk shell → window A → window B → shell, checking the large pid against the
+    `jobs` list each stop → `kill <pidA>` (its window vanishes; the line reads `killed — row reaped`) →
+    `jobs` (one row left) → `kill <pidB>` → `jobs` (`none`). Use `bg`, never `run`: a foreground `run` of a
+    program that never exits ends at `run_user_image`'s deadline with a SKILL-1 kill.
+- **VUG/STAT** — the two EL0 apps get their real names, a backgrounded vug stops looking like a
+  crash, and the compositor says which window has the keyboard. Three folds, one arc; app UX only.
+  - **Fold 1 — the rename.** `crates/user-uvug` → **`crates/user-vug`** (`UVUG.ELF` → **`VUG.ELF`**,
+    `user-uvug.ld` → `user-vug.ld`). The persistence app was renamed to `KVUG` in the same fold and that
+    half was **reverted by STAT-NAME (below)**: it is `crates/user-stat` → **`STAT.ELF`** again, the name
+    it has here throughout. Swept through `arroyo`'s build and staging stanzas,
+    the FAT staging names, the in-kernel witness paths that load the images by name (`uvug_witness`'s
+    `/fat/VUG.ELF`, `BGRUN-ST`'s kill and persistence legs), and the doc mentions here and in
+    `08_VIDEO/engine.md`.
+    - **The serial witness TAGS did NOT change, deliberately** — `UVUG:`, `EXEC-UVUG:`, `BGRUN-ST:`,
+      `STAT:` and the `UVUG-1`..`UVUG-10` arc identifiers all stand. Those name **arcs and witnesses**,
+      not files: they are the keys `pi4-regression.spec` matches on and the labels every landing report,
+      capture and hazard note in this repo already uses, and silently repointing them would make the
+      historical record unsearchable to buy nothing. The rename is of the *artifacts*; the ledger keeps
+      its names. Consequence, stated so it is not read as an oversight: `run /fat/VUG.ELF` prints
+      `:: EXEC-UVUG: …`, and `pi4-regression.spec` needed **no pattern change** for this fold.
+  - **Fold 2 — VUG-BG: a backgrounded vug persists.** `bg /fat/VUG.ELF` used to look like a crash. The
+    app was fine; the design was wrong. A bg'd vug is UNFOCUSED, so no input ever reaches it, so it never
+    left its deterministic auto path — 300 frames, `[gui] app-exit dur=0s wedged=false`, gone. The read
+    from the bench ("it crashes") was the only reasonable one.
+    - **Mechanism: the kernel tells the process how it was launched.** A per-ASID bit (`DETACHED_ASIDS`
+      in `arch/aarch64/syscall.rs`) is **set** by `spawn_user_image_bg` and explicitly **cleared** by
+      `run_user_image` — cleared rather than merely left alone, because ASIDs recycle and a slot last used
+      by a `bg` spawn must not hand its stale answer to the next foreground program that inherits the
+      number. It is published to EL0 in the **RO info page** as a process-flags `u32` at offset **`0x20`**
+      (bit 0 = `DETACHED`), in the reserved gap between the legacy ELF-3 header and the per-window
+      entries, so no existing field moves. Written by both info-page publishers (the legacy header, and
+      the per-window entry — the latter because the legacy header is only refreshed for region slot 0).
+    - **What the app does with it.** `crates/user-vug` reads the word once, after `SYS_WIN_CREATE` (which
+      is what maps the page), and a detached vug **skips the 300-frame cap** — same deterministic tumble,
+      no end. `kill <pid>` is the whole remedy, exactly as for `STAT.ELF`. Focused `run` is byte-identical
+      to before.
+    - **The checksum witness is untouched, structurally.** `uvug_witness` runs `VUG.ELF` through
+      `run_user_image` — the FOREGROUND launcher, which clears the bit — so `REQUIRE UVUG: frames=300
+      threads=2 checksum=0xe68285b85121ac7c` cannot be reached by this branch. `BGRUN-ST` leg 2 (kill a
+      bg'd vug mid-run) gets strictly *more* robust: its target no longer races its own exit.
+  - **Fold 3 — FOCUS-HL: the focused window is visible.** `video/wm.rs` records the focused ASID in
+    `FOCUS_ASID` (set only by `focus_changed`, `0` = the shell) and the composite pass snapshots it once,
+    for the same reason it snapshots `SHELL_Z` once — one pass, one focus owner, so no pass can draw two
+    highlights. `draw_window` takes a `focused` flag and swaps **only two colours**: `CHROME_BORDER` →
+    `CHROME_BORDER_FOCUS` and `CHROME_TITLE_BG` → `CHROME_TITLE_BG_FOCUS`. No geometry changes, so focus
+    never moves a pixel and costs nothing per present — it repaints the frame and strip that were going to
+    be painted anyway.
+    - **Shell-focused highlights nothing**, which is the honest reading: no app has the keyboard.
+    - **Both ends repaint.** `focus_changed` already damages the windows it raises; it now also damages
+      the windows of the ASID that is LOSING focus, which the raise never touches (and which the shell
+      branch does not raise at all). Without that the old holder would keep the bright chrome until
+      something unrelated happened to damage it.
+- **SPINHUNT (this arc)** — the **orphaned worker thread**: `SYS_EXIT` retired one task, not the address
+  space, so a leader that exited without joining its workers left them running forever. P61 was an attended
+  sitting: with several bg vugs launched, killed and relaunched, `:: SCHED: load c0=68% c1=99% c2=0% c3=0% ::`
+  was **sustained** — one core pegged — while `jobs` listed every vug pid as `exited 0 (reaped)`.
+  - **Why the process table was clean and the core was not.** Everything the operator can inspect is keyed
+    on a `Proc` row, and an EL0 **worker thread** has none — `SYS_THREAD_SPAWN` creates a task under the
+    caller's existing slot, tracked only by a `THREAD_TABLE` row and the slot's live-task count. So `jobs`
+    was telling the truth about every row it had; the thing burning core 1 was not in it. WC-J had already
+    ruled the compositor out by construction, and that was correct: the spinner was never kernel code.
+  - **The lifecycle gap.** `boot::slot_thread_retain` keeps a slot mapped until the **last** thread under it
+    exits. Nothing in the kernel ever made the last one exit. `SYS_THREAD_EXIT` retired a thread and
+    `SYS_EXIT` retired the calling task — neither retired the *address space*. An unjoined worker therefore
+    outlived its leader with no parent, no joiner, and no terminus.
+  - **Why it burns a core rather than idling.** `user-vug`'s barrier is asymmetric by design: ARRIVE
+    (worker → parent) is a futex, but RELEASE (parent → worker) is a **`SYS_YIELD` poll** on the phase word
+    (`uvug_worker`). A parked orphan would have been invisible and harmless; a polling orphan is
+    **runnable** — in a run queue, dispatched every pass, at 100% of its pinned core for the rest of the
+    boot. `place = 1` sends it to a sibling core, which is why the load landed on one core and stayed there.
+  - **And it is self-sealing.** KILLBOUND's `THREAD_TABLE` scavenge is gated on `ASID_GEN[owner]` having
+    been bumped, which happens on the slot's 1→0 teardown edge, which requires the last thread under the
+    slot to exit — the very thing the orphan will never do. The row is unreclaimable, the slot unrecyclable
+    and the core pegged, permanently. This is the one shape KILLBOUND's discipline could not reach: it made
+    every *reclaim* wait for a positive quiescence witness, and here quiescence never arrives.
+  - **Fix: `SYS_EXIT` terminates the address space.** At the top of the `SYS_EXIT` arm — before every
+    name-routed short-circuit, so there is one insertion point for all of them — if the caller's ASID still
+    holds live siblings, `sched::orphan_kill(asid)` arms an **address-space-scoped** kill through exactly
+    the machinery a `kill` uses. Each orphan is matched at its own next boundary (an EL0 syscall — a
+    yield-polling worker reaches one every pass — or a preemption on metal) and retires through its own
+    `exit()`. The request is **owner-less**: there is no requester to confirm to (the leader is on its way
+    into `exit()`), so the ticket is armed and immediately `kill_detach`ed — `kill_slot_for` still matches
+    `KILL_DETACHED`, and the last orphan out CASes the slot `KILL_DETACHED → KILL_FREE` inline, returning
+    it to the four-entry pool exactly once. A full request table is an honest, witnessed, bounded failure,
+    not a silent one.
+  - **KILLBOUND's discipline is preserved, not weakened.** Nothing is reclaimed at the leader's exit. Each
+    orphan decrements `SLOT_REFCOUNT` itself; only at zero does `teardown_user_slot` bump `ASID_GEN`, and
+    only then does the thread-table scavenge consider the row dead. The fix makes that edge **reachable**;
+    it does not move it earlier, and no row is ever freed while its task could be mid-execution on any core.
+  - **Semantics.** `SYS_EXIT` is the *process* terminus; `SYS_THREAD_EXIT` is the *thread* terminus. Only
+    the second one previously did anything. `user-vug`'s own `PHASE_EXIT`-then-join is now belt-and-braces
+    rather than the sole guarantee — which matters because VUGGUARD deliberately makes a killed vug skip the
+    join (joining a worker that is not answering would park the parent forever).
+  - **Witness: `BGRUN-ST` leg 0b / `:: SPINHUNT: …`,** `+4` spec REQUIREs and `+1` FORBID (66 → 70). The
+    fixture is an in-kernel flat blob (no SD card, no staged `.ELF`): the leader spawns two workers that
+    sign in and then yield-poll forever, waits for both sign-ins, and calls `SYS_EXIT(0)` with **no**
+    `SYS_THREAD_JOIN`. The positive witness — `2 sibling thread(s) left unjoined` — is stated by the
+    **leader itself** at the only instant it is exactly true; a poller on the witness core can miss that
+    window entirely, and a leg whose positive witness is a race is a leg that passes for the wrong reason.
+    The verdict is that the ASID drains to **zero** live tasks inside a bounded window. Two load rows
+    bracket it (evidence, not assertions — QEMU raspi4b delivers no timer IRQ, so the percentages there
+    read the dispatch-span accounting rather than the metal load line).
+  - **Verified to have teeth (A/B).** With `orphan_kill` disabled and nothing else changed, the leg reports
+    `orphaned=2 (want 2) reaped=true drained=false leftover=2 live task(s) under asid 1 -> FAIL`, and the
+    orphan-window row reads `c0=58 … / settled c0=61` where the fixed kernel reads `c0=0` on both — the P61
+    pegged core, reproduced in QEMU, with the leader's row already reaped. The leader's status is `0` in
+    both arms, so `jobs` reads clean in both: the A/B *is* the P61 symptom.
+  - Gates: `./arroyo check` green x86_64 + aarch64; `UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test 90`
+    → **70/70 required witnesses, 0 forbidden**; `./arroyo test-arm` MISSION SUCCESS. Lane:
+    `arch/aarch64/sched.rs` (`orphan_kill`) + `arch/aarch64/syscall.rs` (the `SYS_EXIT` hook, the fixture
+    and the leg) + the spec + this doc. QEMU-green ≠ correct: the metal confirmation rides the attended
+    sitting, where the property to watch is the `SCHED: load` line after a vug is killed and relaunched.
+- **BG-SPREAD (this arc)** — the **stacked background parent**: every `bg` launch pinned its parent task to
+  the launcher's core, so background programs piled onto one core no matter how idle the rest of the machine
+  was. P62 was an attended sitting: four bg vugs, each visibly slower than the last, while
+  `SCHED: load c0=51 c1=99 c2=52 c3=0` stayed flat — c1 saturated, **c3 completely idle**.
+  - **The meter was right; the placement was the bug.** This is the inverse of P61. There, the load line was
+    accurate and the *process table* was blind; here the load line is accurate and there is nothing wrong
+    with it at all. The evidence was in the scheduler's own placement witness, which printed the same thing
+    for every launch: `:: SCHED: task 'bg-el0' -> core 1 (policy: caller-pinned EL0, no-migrate) ::`. Every
+    `bg` runs from the same shell context, so "the caller's core" is one fixed core for the whole boot.
+  - **The parents stacked; the workers never did.** A bg vug's ELF-2 worker threads already spread —
+    `SYS_THREAD_SPAWN`'s `place = 1` routes them through `sched::other_online_cpu`, the least-loaded
+    *sibling* core. Only the parent, the task that owns the address space and does the frame work, was
+    pinned. So the symptom was specifically that each new bg program slowed *the ones already running*.
+  - **Why the pin was there — inheritance, not intent.** BGRUN-1 built `spawn_user_image_bg` as a mirror of
+    `run_user_image`'s front half, and copied `let cpu = this_cpu()` with it. In `run_user_image` that line
+    is the sys_spawn **co-location invariant**: the foreground launcher blocks in a wait loop immediately
+    after the spawn, so putting the child on the caller's core guaranteed the child could not be dispatched
+    until the parent yielded — which is what made the pre-EXEC1-M publish order safe. **Neither half of that
+    rationale survives in `bg`.** `bg` does not wait (it returns to the shell at once, so there is no yield
+    to sequence against), and EXEC1-M had already removed the dependence on co-location by publishing the
+    ASID *before* the spawn: the `SYS_EXIT` rescue arm (`proc_find_unpublished`, keyed off the exiting task's
+    live `TTBR0_EL1`) covers a child that runs to completion on another core before the `pid` store lands.
+    The pin bought nothing and cost the entire spread.
+  - **Fix: `CPU_AUTO`.** `spawn_user_image_bg` now passes the SCHED-3 sentinel instead of `this_cpu()`, so
+    `pick_cpu` places the parent on the **least-loaded online core** — minimum ready-queue depth, then the
+    lower rolling-window busy fraction, then a rotating cursor so equal-load cores fill round-robin. This is
+    the same discipline the orphan-reaper (SCHED-3b) and the ELF-2 worker threads already use; nothing new
+    was invented. **Spreading happens at SPAWN only.** Placement is still decided exactly once and the task
+    is still `steal_ok: false` — EL0 slots carry per-core TTBR0/ASID state, so they remain no-migrate. The
+    foreground `run` path deliberately keeps `this_cpu()`: its co-location invariant is real.
+  - **No interaction with SPINHUNT or KILLBOUND**, checked rather than assumed. SPINHUNT's orphan reaping is
+    keyed on the **ASID** (`orphan_kill(asid)`, `asid_live_threads`, the `SLOT_REFCOUNT` 1→0 edge) and its
+    kill requests are matched at each task's own next boundary on whatever core it sits on; KILLBOUND's
+    quiescence witness is likewise ASID-scoped (`ASID_GEN[owner]` bumped only at teardown) and its
+    `kill_wake_parked` sweep walks the futex buckets globally. Neither reads a core index, so a bg parent
+    that starts on a different core changes nothing either of them observes — and both legs pass unchanged
+    in the gate below.
+  - **Witness: `BGRUN-ST` leg 0c / `:: BGSPREAD: …`,** `+1` spec REQUIRE and `+1` FORBID (77 → 78). The
+    single-launch legs structurally cannot catch this: stacking is a relationship *between* launches, and a
+    spec REQUIRE matches one line at a time and cannot count distinct cores across several. The leg launches
+    **3** copies of a new in-kernel flat fixture (KILLBOUND with the threads removed: zero one futex word and
+    park on it forever — no `SYS_THREAD_SPAWN`, so three concurrent copies cannot exhaust the eight-row
+    `THREAD_TABLE` and no worker's own spread muddies a witness whose subject is the parent), records each
+    parent's core from `sched::last_user_placement()`, then kills and reaps all three so the process table is
+    left as it was found. The assertion is **`distinct >= 2`**, not `== 3`: a load-balanced policy may
+    legally reuse a core when it is genuinely still the least loaded, and `== 3` would make a correct
+    scheduler flap.
+  - **Verified to have teeth (A/B).** Reverting the one-line placement change and nothing else, the leg
+    reports `launched=3/3 distinct=1 settled=3 -> FAIL` and the gate drops to **77/78 with 3 forbidden hits**
+    (all three the same line, matched by the generic `-> FAIL` FORBIDs). `distinct=1` there is not luck: all
+    three launches run from one witness task on one core, so co-location can only ever produce 1. With the
+    fix the same run reports `3 bg launches over 4 online cores -> cores 0,0,1 distinct=2 PASS` — core 0 is
+    the idle BSP under QEMU raspi4b (render is on core 1, input on core 3), so "least loaded" correctly
+    prefers it, which is the policy working rather than a new pin.
+  - Gates: `./arroyo check` green x86_64 + aarch64; `UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test 90`
+    → **78/78 required witnesses, 0 forbidden**; `./arroyo test-arm` MISSION SUCCESS. Lane:
+    `arch/aarch64/syscall.rs` (the placement one-liner, the fixture and the leg) +
+    `arch/aarch64/sched.rs` (`last_user_placement` / `online_cpu_count`, witness aids only) + the spec + this
+    doc. QEMU-green ≠ correct: the metal confirmation rides the attended sitting, where the property to watch
+    is the `SCHED: task 'bg-el0' -> core N` lines across several `bg` launches — and then whether the fourth
+    bg vug still slows the first three.
+- **KILLBOUND (this arc)** — the **unkillable parked task**, and the two bounded tables it wedged. P60 was
+  an attended sitting on a real Pi 4, and the failure was reached by hand, not by a fixture: after several
+  `bg` vug launches and kills, `kill <pid>` stopped working. The shell printed `kill armed but unconfirmed`
+  and then, on retry, `already killed`; `jobs` listed the pids as `running` indefinitely; no
+  `[skill] killed … confirmed=1` line ever reached the wire for them; the relaunched programs showed an
+  **empty window** even though their creation blit byte-verified `PASS`; and once four such rows had piled
+  up, `bg` refused **every** further launch with `process table full`. Three faces, one fault.
+  - **The chain, end to end.** `THREAD_TABLE` (`syscall.rs`) is **global** and holds `NTHREAD = 8` rows for
+    the whole machine, and a row is released *only* by the owning program's own voluntary
+    `SYS_THREAD_JOIN`. A program that is **killed** never reaches its joins, so it leaks every row it
+    holds, permanently. `user-vug` spawns two workers, so **four killed vugs exhaust the table**; from then
+    on every `SYS_THREAD_SPAWN` returns `-EAGAIN`. vug does not check that return (its handles are used
+    only for the join), so the next launch runs with **no workers**, its `DONE` word never reaches 2, and
+    its per-frame barrier blocks in `futex_wait` **forever — before its first `SYS_WIN_PRESENT`**. That is
+    the empty window. And a task parked in a futex bucket is in no run queue and is no core's `current`, so
+    **neither SKILL-1 boundary can see it**: `asid_thread_leave` never runs, the ASID-scoped request is
+    never settled, the row is parked `PORPHANED` for the rest of the boot. That is the unkillable pid, and
+    four of them are the permanent `process table full`.
+  - **Refuted while measuring.** `slot_thread_retain(asid)` was reported as never balanced. It **is**
+    balanced — every spawned thread's own death path (`sched::exit` and the off-CPU `retire_killed`) calls
+    `teardown_user_slot(asid)`, which decrements `SLOT_REFCOUNT`. The leak is the `ThreadRec` row, not the
+    slot refcount. Worth recording, because a refcount "fix" here would have been a real bug.
+  - **Fix (a) — the waits are kill-aware, from both sides.** *Before parking*, `Semaphore::wait` and
+    `futex_wait` test the armed-kill flag and route the task straight into `exit()` — the wait's own
+    predicate is the right place for it, and those call sites qualify as kill boundaries for exactly the
+    reasons `kill_check_current`'s do (IRQ-masked, on the task's own kernel stack); the raw lock is
+    released first, since `exit()` never returns. *After parking*, `sched::kill` **evicts** already-parked
+    targets: `futex_wake_killed` walks all 16 buckets and `kill_wake_parked_semaphores` walks every
+    `Semaphore` an EL0 task can reach (`Proc::done`/`SYS_WAIT`, `BUS_SEM`/`SYS_MRECV`, a `ThreadRec`'s
+    join handle/`SYS_THREAD_JOIN` — the set is enumerable, which is why this is a sweep and not a
+    registry), re-readying each so the **off-CPU dispatch boundary** retires it before it executes another
+    instruction. The two orders — arm-then-park and park-then-arm — are covered one each; together the
+    property is total. No permit is handed over on eviction, and that is sound because an evicted task
+    **provably never resumes**: the request that matched it cannot be cleared while it is alive
+    (`kill_release` needs the target retired, `kill_settle` withholds that while the task is still counted,
+    `kill_retract` needs the requester to have observed it dead). `THREAD_TABLE` is swept under `try_lock`,
+    never `lock` — a kill must not be able to block behind a spinlock held by a preempted task.
+  - **Fix (b) — both bounded tables reclaim, each on a POSITIVE QUIESCENCE WITNESS.** Neither reclaim uses
+    elapsed time, and neither ever frees a resource whose task could still be executing on cores 1-3.
+    - *`Proc` rows.* `proc_reserve`'s last resort reclaims a `PORPHANED` row iff
+      `sched::asid_live_threads(row.asid) == 0`. That is a proof, not an estimate: every EL0 task is
+      counted by `asid_thread_enter` **before** its run-queue push (so a task that could still execute is
+      counted), and the count is decremented only from `sched::exit` — past the slot teardown, the joiner
+      post, and every syscall the task can make, with only the final `switch_context` left — or from
+      `retire_killed`, after the Box and its kernel stack have been dropped. Zero therefore means every
+      task ever entered under that ASID has passed the point where it can touch a `Proc` row. ASID reuse
+      cannot forge it in the unsafe direction: a live successor re-enters the count and reads non-zero, and
+      a successor can only exist if the slot was freed, which required our victim to exit first.
+    - *Thread rows.* `sys_thread_spawn` scavenges when the table is full, reclaiming any row whose
+      `ASID_GEN[owner] != rec.agen` — the gen word is bumped by `clear_handle_row` on
+      `teardown_user_slot`'s 1→0 edge, so a bump proves the **last live task under that ASID has retired**.
+      Deliberately lazy (reclaim under pressure) rather than eager at teardown: `teardown_user_slot` runs
+      IRQ-masked, sometimes on the scheduler's own stack, and taking that `SpinMutex` there would add a
+      lock-order hazard in exchange for nothing. The same gen word also makes `SYS_THREAD_JOIN` fail closed
+      (`-ESRCH`) when a **recycled-ASID successor** would otherwise have joined and reaped its
+      predecessor's thread handle.
+    - A still-*living* parked victim is reclaimed by **neither** — correctly. That case is closed at the
+      source by fix (a), which is why the two halves are complementary rather than redundant.
+  - **The operator messages now tell the truth.** `process table full (run `jobs` to reap …)` was right for
+    a table of corpses and a **lie** for a table of `PORPHANED` rows — `jobs` cannot reap those and never
+    could, so following the advice taught the operator nothing and blamed the wrong resource (this cost
+    real bench time). The refusal now names the state that actually caused it, and `bg_kill`'s unconfirmed
+    string no longer promises that the row "settles at the task's next boundary" — the untrue part when the
+    target had no next boundary.
+  - **Witness: `BGRUN-ST` leg 0 / `:: KILLBOUND: …`,** `+1` spec REQUIRE and `+1` FORBID (63 → 64). The
+    three existing BGRUN legs all kill **runnable** targets (VUG makes syscalls every frame, KVUG spins),
+    which is why all three passed green on the very boot where the operator's Pi wedged. The new leg kills
+    a target that is **parked**: an in-kernel flat blob (no SD card, no staged `.ELF`) zeroes two futex
+    words, spawns two worker threads, and every one of the three blocks in `SYS_FUTEX(FUTEX_WAIT)` on a
+    word nobody ever wakes. Each round waits for a **positive park witness** — `sched::futex_parked_total`
+    must rise by 3 — so a passing round cannot be passing vacuously, then kills and requires
+    kill-confirmed + row `Gone` + ASID drained inside a bounded window. It runs `NTHREAD/2 + 1 = 5` rounds
+    because each round leaks two thread rows on the pre-fix code: rounds 1–4 fill the global table and
+    round 5 is the one that must scavenge. **Verified to have teeth**: with the kill-awareness disabled and
+    nothing else changed, the leg reports `rounds_ok=0 parked_ok=4 of 5 (kill armed but unconfirmed …) ->
+    FAIL` — and `parked_ok=4` is the P60 chain reproducing itself in QEMU, round 5 unable even to reach the
+    parked state because the thread table was exhausted by the four leaked pairs.
+  - Gates: `./arroyo check` green x86_64 + aarch64; `UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test 60`
+    → **64/64 required witnesses, 0 forbidden**; `./arroyo test-arm` MISSION SUCCESS. Lane:
+    `arch/aarch64/sched.rs` (the kill primitive + the two wait primitives) + `arch/aarch64/syscall.rs`
+    (proc/thread row lifecycle, the fixture and the leg) + the spec + this doc. QEMU-green ≠ correct: the
+    metal confirmation rides the attended sitting.
+- **BGRUN-SCAV (this arc)** — P59b sent back two bench observations. **One of them is not a bug**, and
+  saying so is the more useful finding; the other is real and is fixed here.
+  - **NOT A BUG: "`jobs` reports `running` for a process that already exited."** The proposed mechanism
+    was that a row's state is only updated when something reaps it. **Measured, and false.** `SYS_EXIT`
+    stores `PEXITED` and posts `done` before the task retires, and `BGRUN-ST` leg 1 already asserts
+    exactly the claimed-broken property — a **non-reaping** `bg_poll` on an exited bg ELFHELLO returns
+    `Exited(0)` — and has passed on every gate run in this repo's history.
+    - The multithreaded case (a bg'd `VUG.ELF`, which is what the operator actually launched) was the one
+      genuinely untested gap, so it was measured directly rather than argued: with the detached bit
+      temporarily disabled to restore pre-arc behaviour, a probe polled a backgrounded vug non-reapingly
+      until it flipped. It **flipped to non-running at ~3 s**, and the vug's own
+      `:: UVUG: frames=300 … ::` witness printed. The row is not stale; the program was simply still
+      running.
+    - **Why 3 s and not "instant".** An unfocused vug still renders all 300 frames; it just gets less CPU
+      and no input. So `jobs` saying `running` 1–3 s after the launch was **honest**, and `kill` finding a
+      live target "every time" is the consistent reading, not a contradiction of it.
+    - **Where the `dur=0s` came from.** `[gui] app-exit … dur=0s wedged=false` is emitted by
+      `gui_watchdog`, which tracks the **foreground GUI session** (`main.rs`'s `on_app_enter`/
+      `on_app_exit` around the screen handover). It says nothing about background processes. Correlating
+      those lines with the two bg'd vugs is what produced the "they exited instantly" reading.
+  - **REAL, and fixed: exited-unreaped rows deny launches.** BGRUN-1 held that a row stays claimed until
+    `jobs` reaps it, and called the resulting "process table full" *honest* — right about the exit STATUS,
+    wrong about the ergonomics. `MAX_PROCS` is **4**, so four short-lived `bg` launches with no
+    intervening `jobs` exhaust the table, and the operator is refused by a table of corpses with the exact
+    message `process table full (run `jobs` to reap exited background programs)`.
+    - **The fix (`BGRUN-SCAV`)** is the minimal one: when `proc_reserve` finds no `PFREE` row it makes a
+      second pass and reclaims a `PEXITED` one, via a `PEXITED -> PRUNNING` **CAS**. The CAS is what keeps
+      reap-once intact — the row is claimed by exactly one of the scavenger and `jobs`, and a scavenged
+      job's later `jobs` entry takes the pre-existing `Gone` arm. The `done` permit is consumed here for
+      the same reason the reap arm consumes it (a reused entry must start at zero permits); it cannot
+      block, because `PEXITED` is published strictly after the permit is posted on every path that sets it.
+    - **The trade, stated:** an **unobserved exit status is discarded** (a later `jobs` prints `gone`
+      rather than `exited N`) in exchange for not refusing a launch the machine can satisfy. Never silent
+      — the reclaim prints `:: BGRUN-SCAV: process table full — reclaimed row N from EXITED unreaped
+      pid=… (status=… DISCARDED; `jobs` will read `gone`) ::`.
+    - **Witness: `BGRUN-ST` leg 1b**, `+1` spec REQUIRE (59 → 60). It spawns ELFHELLO `MAX_PROCS + 2`
+      times, waits for each to exit, and pointedly **never reaps**, requiring all six to succeed. It was
+      verified to be a real instrument rather than a decoration: with the scavenge disabled the leg goes
+      **red at the fifth launch** — `slot reclaim — spawn 4 of 6 refused (table full on corpses) -> FAIL`.
+  - **VUG-BG lifecycle (lens):** the detached bit is now cleared in `boot::teardown_user_slot`'s
+    final-release arm, beside `clear_handle_row` and before `SLOT_USED` is released. ASIDs recycle, and
+    `run_user_image`/`spawn_user_image_bg` only cover the two FAT-image launchers — `sys_spawn`'s
+    `load_program_into_slot` and the in-kernel fixture launchers produce address spaces too. One line at
+    the teardown funnel beats a rule every future launcher has to remember.
+- **STAT-NAME (this arc)** — the persistence app is the **stats viewer**, and its name is **STAT**. The
+  VUG/STAT rename above also renamed it `crates/user-stat` → `crates/user-kvug` (`STAT.ELF` →
+  `KVUG.ELF`); the K-for-kernel prefix is simply wrong for an EL0 app that draws its own pid and a frame
+  counter. This arc is the exact reverse sweep of that half: `crates/user-kvug` → **`crates/user-stat`**,
+  `KVUG.ELF` → **`STAT.ELF`**, `user-kvug.ld` → `user-stat.ld`, through `arroyo`'s build and staging
+  stanzas, the FAT staging name, `BGRUN-ST`'s persistence leg (which loads `/fat/STAT.ELF` by name), and
+  the docs here and in `08_VIDEO/engine.md`. The `VUG.ELF` half of that arc is untouched.
+  - **The serial witness tags are unchanged, for the same reason they were unchanged then**: `STAT:`,
+    `BGRUN-ST:`, `UVUG:` and friends name arcs and witnesses, not files, so `pi4-regression.spec` needed
+    **no pattern change** — only the file names inside its comments.
+- **EXEC1-M** — the **late-publish window** in `run_user_image`, and the end of the metal-only
+  `EXEC1` failure. On every real Pi 4 boot (P55b, P56) the run-path witness reported
+  `:: EXEC1: run /fat/ELFHELLO.ELF — EL0 program did not exit in time -> FAIL ::`, while QEMU raspi4b
+  reported `exit=0 -> PASS` from the same image. UVUG-10's fixture gate above removed the boot-time input
+  orphan and left cpu2 idle at boot, and `EXEC1` still failed — so orphan starvation was never the cause.
+  - **What actually happened.** `run_user_image` cannot know the pid until `sched::spawn_user_slot`
+    returns, so it spawned first and published `PROCS[pi].asid` / `.pid` afterwards. The comment justifying
+    that order — "the caller yields only in the wait loop below, so the pid is always stored before the
+    exit path's `proc_find_running` lookup" — is the *cooperative* reading of the `sys_spawn` co-location
+    invariant, and this scheduler is **preemptive**: a quantum tick dispatches the co-located EL0 task with
+    no yield involved. The window is therefore real, and on metal it is **milliseconds wide**, because
+    `spawn_user_slot` pushes the task onto the run queue and only *then* emits its
+    `:: SCHED: task '…' -> core N ::` placement line — a ~70-byte 115200-baud UART write, ≈6 ms. ELFHELLO
+    is three syscalls long (write, report, exit), so it ran to completion inside that print. Its `SYS_EXIT`
+    found no row keyed by its pid, fell through to the generic counters, and retired. The row stayed
+    `PRUNNING` forever; `run_user_image` waited out its whole 5 s deadline **on a task that had already
+    exited correctly** and returned `Timeout`. The SKILL-1 kill that follows then targeted an
+    already-retired task and could never confirm — which is exactly the
+    `[skill] killed pid=108 asid=1 confirmed=0 row=orphaned` in the P56 capture, and why the kill primitive
+    looked like it was failing when it was in fact being handed a corpse.
+  - **Why QEMU was green.** Nothing about the code differs; only the width of the window does. QEMU's
+    serial write is effectively free, so the gap between the run-queue push and the pid store is
+    nanoseconds and the tick essentially never lands there. This is the ordinary timing class — the null
+    hypothesis was our code throughout, and it held.
+  - **The fix: make the ASID the key that survives the window.** The ASID is known *before* the task can
+    exist, so it is now stored **before** the spawn. `SYS_EXIT` gains a rescue arm after the pid lookup:
+    `proc_find_unpublished(current_asid())` matches a row that is `PRUNNING` **and** `pid == 0` **and**
+    carries our ASID — by construction only a row that is mid-publish, since a live EL0 ASID names exactly
+    one slot and an ELF-2 sibling's process row already has its pid published. The status and `done` post
+    are identical to the live-child arm, so the parent observes `PEXITED` on its next pass. The pid store
+    still happens (it remains the key for wait/kill/orphan-reclaim); it is simply no longer load-bearing
+    for the correctness of the exit path.
+  - **Which other publishers the arm can match — corrected.** The first cut of this write-up claimed
+    `sys_spawn` / U7 / U6-grants rows "read `asid == 0` through their own window, so the new arm cannot
+    match them". **That was false**, and is recorded here rather than quietly deleted because it planted an
+    invariant the code does not have. Those paths spawn first and then store `asid` *before* `pid` — the
+    same order `run_user_image` used to — so mid-publish their rows genuinely are `PRUNNING`, `pid == 0`,
+    carrying the child's ASID, with the child already dispatchable. **They can match, and matching is
+    correct there:** the row is the exiting child's own, so posting its status and `done` is precisely what
+    the parent's `sys_wait` is blocked on. The arm silently closes the identical latent race on the spawn
+    path. Those windows are a handful of instructions with no UART write inside them, which is why only
+    `run_user_image` — whose window contains `spawn_user_slot`'s placement print — was ever wide enough to
+    fail on metal.
+  - **The two publishers where a match *would* be wrong are fixed at the source.** `proc_free` stored
+    `pid = 0` before `asid = 0`, leaving a transient `PRUNNING` / `pid == 0` / *old* asid row — matchable,
+    and a match would post a stray `done` permit onto a row about to be recycled, breaking the
+    "reaped-then-reused entry always starts at 0 permits" invariant `proc_orphan` documents. It now clears
+    the **asid first**, making the row unmatchable for the whole teardown. `u8_kernel_check` plants
+    synthetic rows under scratch ASIDs 6/7/8, which are **real allocatable ASIDs** — a genuine unrelated
+    process under ASID 7 exiting in the two-instruction window would have been mis-attributed onto a
+    synthetic row belonging to no parent. It now plants **pid-first**, so the row is never
+    `asid`-matchable; the planted pids (`0xE1`/`0xE2`) are not live task ids, so the pid lookup cannot
+    match either. Both are order-only changes with identical settled state.
+  - **Proven in QEMU by widening the window, not by argument.** A temporary 100 ms delay inserted between
+    the spawn and the pid store reproduces the metal failure in QEMU **exactly**, down to the SKILL-1
+    signature: `[uvug8] run deadline expired … parked PORPHANED (pid=102, asid=1)`,
+    `[skill] killed pid=102 asid=1 confirmed=0 row=orphaned`,
+    `:: EXEC1: … did not exit in time -> FAIL ::`. With the rescue arm restored and the same delay in
+    place, the run reports `[exec1] LATE-PUBLISH rescue — EL0 task exited (status=0) before its parent
+    stored the pid; Proc row 0 resolved by asid=1 and reaped normally` followed by
+    `:: EXEC1: … exit=0 -> PASS ::`. Both probes were removed before the commit; they are recorded here
+    because the negative control is what makes the diagnosis a proof rather than a plausible story.
+  - **Metal telemetry.** The `[exec1] LATE-PUBLISH rescue …` line is latched once per boot and is the
+    arc's one-line verdict on the bench: its **presence** means the window opened on that boot and was
+    handled instead of costing a spurious `Timeout`; its **absence** alongside `:: EXEC1: … PASS ::` means
+    the window never opened. Either way the FAIL line is gone, and it remains covered by the spec's
+    always-on `-> FAIL` forbid, so a regression fails the harness without a spec change.
+  - Gates: `./arroyo check` green x86_64 + aarch64; `./arroyo kernel8` builds; `./arroyo kernel8-test 120`
+    **49/49 required witnesses, 0 forbidden**, `:: EXEC1: run /fat/ELFHELLO.ELF — loaded 8560 bytes, entry
+    0x300000, exit=0 -> PASS ::`; `./arroyo test-arm` green. Lane: `arch/aarch64/syscall.rs`
+    (`run_user_image` publish order, `proc_find_unpublished`, the `SYS_EXIT` rescue arm, `proc_free` and
+    `u8_kernel_check` store order) + this doc.
+- **WC-D (scan-out verification)** — the answer to a P56 bench report of a **garbled** 128×128 windowed
+  crystal while every serial witness was green. Full write-up: `docs/dev/OS/08_VIDEO/engine.md` §8 "WC-D".
+  Nothing in the userspace ABI changes; what changes is what the kernel can *prove* about it:
+  - **`[wc-d] verify` — a panel verdict, not another surface checksum.** `[wc-c]`'s checksum hashes the
+    surface an app wrote, so it can only say the app drew; it is blind to every defect between that surface
+    and the scan-out. `wm::verify_window` re-derives each destination pixel of a window's content rect from
+    the source and reads the framebuffer back **twice**. `bad_cache` is the verdict on the BLIT (stride,
+    upscale indexing, colour encoding, clipping). `bad_ram` is read after a bare `DC IVAC` — invalidate
+    without write-back — so it reports whether those pixels reached the memory the HVS scans; a
+    clean+invalidate there would repair a short flush before measuring it. The line also carries `cksum=`
+    and `nonzero=` so a blank-but-faithful PASS is distinguishable from a verified crystal, and a
+    guarded-out window emits `-> SKIP` rather than silently burning its one-shot latch. Pinned in
+    `pi4-regression.spec` as a REQUIRE plus a `-> FAIL` FORBID.
+  - **`UNAOS_FBW` / `UNAOS_FBH` — force the panel geometry.** QEMU raspi4b is 640×480 and the bench Pi is
+    1920×1200, and `wm::place` derives a window's integer upscale FROM the panel: the same 128×128 window
+    is scale **1** on the gate and scale **4** on the bench. The gate could not reach the bench's blit path
+    at all. These compile-time knobs (default off — the firmware mode is queried, unchanged) override the
+    mailbox request so `UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test` reproduces bench geometry.
+  - **What it settled — and what it did not.** At the bench's exact geometry the verdict is
+    `checked=262144 bad_cache=0 bad_ram=0 -> PASS`. The `bad_cache` half **earns** the exclusion of
+    scale-blit indexing, stride/pitch arithmetic and pixel format as causes of the P56 garble. `bad_ram`
+    passing under QEMU earns nothing about metal — QEMU does not model the non-coherent scan-out — so
+    coherency remains the live suspect, and that column is what reports it in one line on the next bench
+    boot. Flush *extent* is excluded separately, by inspection: `draw_window` flushes whole scanlines over
+    the `outer_box`, a strict superset of the blitted pixels.
+  - **`bad_ram` is unvalidated off-metal, in both directions.** The falsifier (delete `draw_window`'s
+    `flush_range`, re-run at bench geometry) still reports PASS under QEMU — because QEMU raspi4b does not
+    model a non-coherent framebuffer, so there is nothing for `bad_ram` to detect. Its correctness rests on
+    the primitive being right by inspection, not on a green gate; the next bench boot is its first real
+    exercise.
+  - **Hazard: a `witness` build is not a neutral observer.** The `IVAC` can drop un-flushed pixels, so
+    `verify_window` redraws the window afterwards. In the presence of a flush defect an instrumented
+    build's panel can differ from a default build's, in either direction.
+
+- **WC-C (window compositor, clients + focus)** — the arc where real EL0 programs use the window verbs.
+  Full write-up: `docs/dev/OS/08_VIDEO/engine.md` §8 "WC-C". Userspace-visible changes:
+  - **UVUG is windowed.** `crates/user-vug` drops `SYS_FB_MAP`/`SYS_FB_PRESENT` for
+    `SYS_WIN_CREATE(128, 128)` + `SYS_WIN_PRESENT(id)`. It reads its surface at its own window base +
+    `0x5000` (window region slot 0 — the VA `SYS_FB_MAP` returned), which is part of the window ABI, not a
+    guess; the kernel also publishes the geometry in the RO info page at base + `0x4000`. `FOCAL` scales
+    6 → 24 so the crystal keeps its framing at 4× the linear resolution.
+  - **SPEC UPDATE, deliberate — the 300-frame auto checksum changes.** It is a pure function of the
+    surface, so a 128×128 surface produces a new one:
+    `:: UVUG: frames=300 threads=2 checksum=0xe68285b85121ac7c ::`, **superseding
+    `0x48221e4101db3924`** wherever it appears in the UVUG-1..9 records above. The brief allowed either a
+    compat shim that kept the old value or a deliberate spec change; this is the spec change, because a
+    shim would mean shipping the 32×32 render forever to protect a constant. What *is* preserved
+    byte-for-byte is the **compat path itself** — `SYS_FB_MAP` + `SYS_FB_PRESENT` still produce the
+    identical centred, chrome-less blit, and the ELF-3 fb test's `mapped=32x32 …
+    checksum=0x8d99530ca96d4b25` is unchanged. The UVUG-8 takeover/cap line is unaffected:
+    `sys_win_present` runs the same present body as `sys_fb_present`, so the focus-guarded
+    `EL0_FOCUSED_PRESENT_COUNT` bump happens per window.
+  - **midden owns a window.** `MIDDEN.BIN` creates a 24×16 window and renders its own bus stats — two
+    rows of four hex digits (live witness bitmask; legs passed) from a packed 3×5 font, blitted 1:1 at
+    EL0. Kernel draws border + title strip and nothing else. A refused create makes every repaint a
+    no-op, so the bus witnesses never depend on the compositor. Fitting the 4 KiB flat-blob code page
+    moved `crates/user-blob`'s release profile from `opt-level = "s"` to `"z"` (3792 B).
+  - **TAB is the window system's key.** Reserved at `el0_input_enqueue` (the single router→ring choke
+    point, so no app can withhold it) whenever two or more windows are in `wm::focus_ring`; it advances
+    `EL0_INPUT_ACTIVE` to the next owner ASID in window-id order via `el0_input_set_active`, so the ring
+    reset, the takeover-latch clear and the UVUG-8 cap all keep working per window. The matching KeyUp is
+    swallowed with it. Fewer than two windows: TAB is delivered as an ordinary key. The ring carries one
+    slot beyond the windows — **the shell** (focus 0) — so tabbing into a window is not a trap. WC-C
+    shipped that as a one-way exit (with focus 0 the router never calls the seam); **WC-TAB** closed the
+    loop by calling `syscall::wc_shell_focus_key` from `pump_usb_into_gui`'s non-routing paths — a second
+    entry point onto the same cycle body, sharing its `n < 2` guard, so TAB re-enters the ring at its
+    head and a system with fewer than two windows keeps an ordinary TAB at the shell. The load-bearing
+    site is the `SCREEN_APP_ACTIVE` peek/requeue branch, since `run_user_image` parks the shell task for
+    the whole EL0 run and that branch returns first; the TAB is consumed inside the scan and the buffer
+    dropped, never forwarded (`render_service` is blocked, so a `GUI_CHANNEL` send would saturate it).
+    Scope, as WC-C already conceded: the boot's real programs do not overlap, so a ring of two or more
+    exists today only under the `el0-wcb` fixture — this completes the mechanism, not yet an operator
+    workflow.
+  - Gates: `./arroyo check` green both arches; `./arroyo kernel8` builds (per-blob page assertions);
+    `./arroyo kernel8-test 120` MBENCH **49/49 required, 0 forbidden** (three new
+    `pi4-regression.spec` directives pin the UVUG checksum, the `witness=0x1fff` ledger and the
+    side-by-side line — the contracts this arc changed were machine-checked nowhere);
+    `:: EL0: window verbs — … witness=0x1fff … :: PASS ::` (the `el0-wcb` ledger widened 10 → 13 bits by
+    the side-by-side leg); `:: EXEC-UVUG: … exit=0 -> PASS ::`; all four BANDY verdicts PASS.
+    `target/pi-screen.png` **re-baselined by design** (the desktop repaint removes the WC-INT residue) —
+    new sha256 `2686a884320dbc389d6c33b1f37b097fa15eba769b51a751449e2c91a986bc19`. Lane:
+    `video/wm.rs`, `crates/user-vug/src/main.rs`, `crates/user-blob` (midden + profile),
+    `arch/aarch64/syscall.rs` (TAB seam + the `el0-wcb` fixture) + this doc + `08_VIDEO/engine.md`.
+- **UVUG7-W (witness-state honesty)** — the closing of the s1j residual: *"the `[uvug7]` witness NEVER
+  printed on the P53 metal wire."* No code was broken. The witness is **kept**, not retired.
+  - **What `[uvug7]` proves.** Two arch-wide aarch64 sites, both added by UVUG-7 and both
+    `#[cfg(feature = "witness")]`. (1) `arch/aarch64/timer.rs::init` — `[uvug7] ms clock: CNTFRQ=<f> Hz …
+    core-count-independent`, the standing record that `arch::ms()` is derived from `CNTVCT/CNTFRQ` and
+    **not** from `ticks()*4`; the global tick counter sums every core's timer IRQ, so on 4-core BCM2711
+    metal the old derivation ran `ms` ~4× fast and typematic repeated ~4× too fast. (2)
+    `video/screen.rs::present_surface` — `[uvug7] surface <w>x<h> scaled <n>x -> …`, the integer
+    nearest-neighbour upscale factor and centred placement actually chosen for the panel in hand. Both are
+    one-shot; neither is duplicated by the uvug8/9/10 family (those cover takeover deadlines, shell-path
+    input and event-queue algebra — nothing about the ms derivation or the present geometry).
+  - **Why it never printed on metal: default-quiet, not a dead gate.** `witness` is armed only for the
+    battery commands (`test`/`test-fat`/`test-arm`/`kernel8-test`). `./arroyo kernel8` — the **flashable
+    media** command, which is what P53 was staged from — leaves it OFF, so both call sites are compiled
+    clean out. Proven at the byte level: a default `kernel8` image contains **zero** `uvug7` strings
+    (`strings -a target/UnaOS-pi4-baremetal.img | grep -c uvug7` → 0).
+  - **It fires correctly on metal — audited, not assumed.** The P57 capture
+    (`rmbp-s18/cu.usbmodem143302.log`, staged from a witness-armed image at `hw-pi4@91bcc2d7`) carries
+    **4 `[uvug7]` hits** — both sites, across two boots: `ms clock: CNTFRQ=54000000 Hz` and
+    `surface 32x32 scaled 15x -> 480x480 at (720,360) on 1920x1200 panel`. So the witness is honest on
+    silicon; only the P53 *image* could not carry it. (Note the metal panel is 1920×1200 → scale 15,
+    versus QEMU raspi4b's 640×480 → scale 6 — the present witness is genuinely geometry-dependent, which
+    is most of its value and is unreachable from the gate alone.)
+  - **The real defect, and the fix.** Nothing named the build's witness state, so a default boot log was
+    **indistinguishable** from a witness-armed boot whose gate never became true: a missing `[uvugN]` read
+    as a live bug rather than as absent code. That ambiguity is what let the mystery survive four boots
+    (P53–P56). `arch/aarch64/mod.rs::boot_diag` now emits, unconditionally,
+    `:: AARCH64 build: witness=<on|off> — witness-gated [uvugN]/fixture lines are <PRESENT|ABSENT BY
+    CONSTRUCTION (not failures)> in this image ::`. The answer is now always in the log itself. A stale comment in `arroyo` that
+    claimed `witness` "gates nothing" on aarch64 and that arming it for `test-arm` was "a functional
+    no-op" was **false** (UVUG-7 added the two arch-wide sites above) and is corrected — `test-arm` does
+    emit `[uvug7] ms clock`, verified in `target/serial-arm.log`.
+  - **Retirement considered and rejected.** `[uvug7]` proves something no other witness does, and it
+    demonstrably fires. It is referenced by **no** `pi4-regression.spec` directive, so it is left unpinned
+    (pinning it would force every future metal image to be witness-armed). The ms-clock line stays
+    `witness`-gated rather than promoted to a boot-honesty line, because the adjacent unconditional
+    `:: AARCH64 generic timer armed (CNTFRQ=… ) ::` already publishes `CNTFRQ` — `[uvug7]` adds only the
+    derivation restatement, which is re-proof, exactly what DEFAULT-QUIET exists to silence.
+  - Gates: `./arroyo check` green both arches; `./arroyo kernel8` builds; `./arroyo kernel8-test 120`
+    MBENCH **50/50 required, 0 forbidden**; `./arroyo test-arm` green. Lane: `arch/aarch64/mod.rs`
+    (the witness-state line) + `arroyo` (comment correction) + this doc.
+- **BANDY-LOAD (witness load-immunity)** — the `BANDY-RT` launcher's wait on midden used to be a bare
+  5 s `CNTPCT` deadline. Under QEMU that is a **host-load thermometer, not a guest-progress measure**:
+  when the host is busy (parallel worktree builds), the guest gets fewer cycles per wall-second, so
+  midden's work — unchanged in guest terms — no longer fits the window. The run *completed*; the
+  verdict simply arrived after the launcher had given up (`done=0`, `midden_w=0x0`). That is budget
+  truncation, and it recurred as a **false red** in the battery.
+  - **The fix: verdict on work done, backstop denominated in scheduling opportunities.** Every
+    iteration of the wait calls `yield_now()`, so each iteration is one chance for midden to run.
+    `MIDDEN_YIELD_BUDGET` (1 000 000) bounds the wait in units host load does not dilate. Measured:
+    an unloaded completion spends **~74 k yields** (in 4.7 s of the old 5.0 s budget — the false red
+    was *that* close); the same completion under a saturated host spends **~107 k yields**. The
+    wall-clock blew straight past its budget; the yield count moved by only 1.45×. That ratio *is*
+    the argument for the design.
+  - **Honest margin — which bound actually binds.** The two guards are not independent: the wait can
+    only spend as many yields as 45 s of wall-clock affords it, and host dilation lowers the yield
+    *rate*. So under saturation the **wall ceiling binds first, not the yield budget** — the
+    effective budget truncates to roughly **500–700 k yields**. Against the measured loaded
+    completion of ~107 k, the real immunity margin is therefore **~5–6×, not the ~13× the nominal
+    1 000 000 budget suggests**. That is still ample for the observed failure mode, but the nominal
+    budget is a ceiling the loaded case never reaches and must not be quoted as the margin. A future
+    arc wanting true wall-clock independence would have to raise `MIDDEN_HARD_BACKSTOP_SECS` in step.
+  - **What this does not weaken.** A genuine hang still FAILs, and still within a bounded time — a
+    wedged midden burns the budget and falls through to the same `done=0` FAIL line. Two guards keep
+    the bound honest in both directions: `MIDDEN_MIN_WAIT_SECS` (5 s) is a **floor** the budget may
+    not fire before, so the wait can never truncate *earlier* than it did before this change; and
+    `MIDDEN_HARD_BACKSTOP_SECS` (45 s, 9× the measured unloaded completion) is an absolute ceiling —
+    and, per the honest-margin note above, the guard that actually binds under load. The PASS line and its
+    `[w=…/mw=…]` ledger are byte-identical — the witness proves exactly what it proved before. The
+    FAIL line gains `yields=`, which separates the two failure shapes at a glance: a value at the
+    budget means the wait genuinely ran out of scheduling opportunities (a real hang), anything well
+    below it means midden finished and failed on merit.
+  - **Gates:** `./arroyo check` green both arches; `./arroyo kernel8` builds; `./arroyo kernel8-test`
+    MBENCH **53/53 required, 0 forbidden** unloaded (1816 lines) **and under a saturated host**
+    (1083 lines, load average ~200–310). The immunity was proven by A/B under the *same* load: with
+    the budget forced to 0 (the old wall-clock behaviour reproduced exactly) the witness FAILs
+    `done=0 yields=107432`; with the budget restored it PASSes. Lane: `arch/aarch64/syscall.rs`
+    (the `bandy_rt_launcher` wait + `bandy_wait_expired`) + this doc.
+  - **Siblings sharing the hazard (NOT touched — out of this arc's scope).** The bare
+    `N * timer::cntfrq()` wait is the house idiom across the aarch64 witness family: ~40 sites in
+    `arch/aarch64/syscall.rs` alone (the `wdeadline`/`vdeadline`/`tdeadline` spawn-and-wait triads at
+    U-line, K-line and window-compositor fixtures, 2–15 s each). They are all load-sensitive by the
+    same mechanism; `BANDY-RT` is simply the one whose margin was thinnest (94% consumed). Promoting
+    `bandy_wait_expired` into a shared witness-wait helper is the obvious follow-on arc.
 - Not yet: **revocation trees** (a derived copy — re-grant or onward re-transfer — escapes
   single-level revoke today; derivation records + `CAP_REVOKE` are that arc), the **bandy Ring-3
   delegation wrapper**, `File` transfer (descriptor migration), real `Socket` fs/net syscalls.
   Not yet (M8): an arbitrary program-by-name `sys_spawn`, and a code-signing / allowlist gate on the
   loader (`SECURITY.md`).
+
+- **MBENCH-HONEST (the pi4 gate stops being able to lie)** — a **test-tooling** arc; zero kernel
+  source touched. The pi4 gate had two independent ways to report something it had not established,
+  and both were paid for repeatedly.
+  - **The truncation trap.** `./arroyo kernel8-test` defaulted to an **8 s** window. 8 s does not
+    finish a pi4 boot on this class of host: QEMU is killed part-way through the `u7_launcher`
+    fixture cascade and the witnesses that print LAST — K3/K4/K8/K6/BANDY and others — never get a
+    chance. The capture then replays at 25–41 of 63 witnesses (25–34 as reported this round; 41 when
+    re-measured on this host, 501 lines against a 60 s run's 1682) — which reads *exactly* like a
+    regression. Four separate executors investigated it independently in one round; one settled it
+    by gating a **clean base** and getting the identical shortfall. The spec header already carried
+    the warning and people still lost an hour to it — which is the evidence that the warning belonged
+    in the **tool**, not the prose.
+  - **The unfalsifiable battery step.** `battery()`'s pi4 step asserted one `awk` for
+    `CAPSTONE COMPLETE` against the serial log. CAPSTONE prints at **line 111** of a ~1700-line
+    capture, so *every* truncation this gate exists to catch still satisfied it while dozens of tail
+    witnesses were absent. The step could not go red on a short log — which is why the track's
+    standing law became "gate claims are evidenced by the runner's OWN mbench replay only", after two
+    false-greens in one round.
+  - **The fix — a third verdict.** `mbench.py` gains a `COMPLETE <regex>` spec directive: an
+    **end-of-run marker**. A capture that reaches no declared marker, *or* that ends mid-line (no
+    terminating newline — direct evidence the writer was killed mid-write), is **TRUNCATED /
+    INCONCLUSIVE**, exit code **3**: never a pass, and explicitly *not* a regression. Precedence is
+    one function (`Matcher.run_verdict`): a FORBID hit outranks everything (a `PANIC` in a short log
+    is still a fault); then truncation; then a short REQUIRE/COUNT in a **complete** capture, which
+    is a genuine regression and still FAILs; then PASS. **PASS semantics are unchanged** — 63/63
+    required, 0 forbidden — and a spec that declares no `COMPLETE` line can never be truncated, so
+    the x86/arm/jetson replays keep their exact prior behaviour and exit codes.
+  - **The markers, and why they are trustworthy.** `pi4-regression.spec` declares
+    `:: SCHED: task 'el0-midden' -> core` and `:: BANDY-RT:`. The first is `spawn_user_slot`'s own
+    placement line for MIDDEN.BIN, and `bandy_rt_launcher` is documented in `syscall.rs` as **LAST in
+    the chain** — reaching it means the boot got through every earlier fixture in the spec. It is
+    **structural, not a verdict**: no regression in any witness can suppress it, so a real regression
+    still reads FAIL instead of hiding behind "inconclusive". The second covers the launcher's honest
+    early exits (no card / MIDDEN.BIN absent / staging failed), which are also complete runs and must
+    fail on their missing witnesses. The residual is stated in the spec rather than hidden: a capture
+    severed inside the ~79-line window between the midden spawn and the five BANDY verdicts, exactly
+    on a newline, reports FAIL rather than TRUNCATED. Both are red; pinning anything later would mean
+    pinning a *verdict*, which is precisely what would let a genuine regression disguise itself.
+  - **The gate can now go red.** `kernel8-test`'s default window is **60 s** (the measured floor;
+    `kernel8-test` is pi4-only, so no x86/arm caller is affected), and it now **replays the spec
+    itself and propagates mbench's exit status** instead of printing a path and always exiting 0.
+    `UNAOS_K8T_ASSERT=0` opts out for deliberately off-spec configurations (`UNAOS_SDIMG=0` no-card
+    control, single-subsystem knob runs). `battery()`'s pi4 step therefore derives its verdict from
+    that exit status, and prints a distinct TRUNCATED line in the summary so a short boot is never
+    bisected as a regression.
+  - **Gates:** `./arroyo check` green both arches; `./arroyo kernel8-test 60` MBENCH **63/63
+    required, 0 forbidden**; `./arroyo test-arm 22` MISSION SUCCESS (the x86/arm replay paths
+    unregressed); `mbench --self-test` **28/28** (was 25), the ten new cases asserting the three
+    verdicts as genuinely *distinct* in both replay and follow — complete+all-witnesses → PASS,
+    cut-before-marker → TRUNCATED, complete-minus-one-witness → FAIL, mid-line cut → TRUNCATED, a
+    `PANIC` in a short log → FAIL (never "inconclusive"), and a marker-less spec keeping its plain
+    exit codes. Reproduced end-to-end on real captures: `kernel8-test 60` → **PASS 63/63** (markers
+    seen at lines 943 and 1016 of 1488); `kernel8-test 8` → **TRUNCATED 41/63, exit 3**, and the
+    command says so in words instead of printing a witness count; that same 60 s capture with one
+    `K3-mount` line deleted → **FAIL 62/63, exit 1**, annotated "the end-of-run marker was seen — the
+    run completed, so a missing witness here is a GENUINE regression". Lane: `scripts/mbench.py`,
+    `scripts/specs/pi4-regression.spec`, the `kernel8-test`/`battery` stanzas of `arroyo`, and this
+    doc.
+- **VUGCLICK (a click stops killing the vug)** — an **app-only** arc: `crates/user-vug` + this doc, no
+  kernel change. P62 attended metal reported "vug is crashing". The wire showed no panic, no fault and a
+  clean load — what it showed was `:: UVUG: interactive takeover at frame 24340 ::` followed immediately
+  by `:: UVUG: interactive exit=click frames=36000 ::`, twice. The vugs were leaving through their own
+  **designed** click-to-exit path. That rule was written for the full-screen takeover era, when the vug
+  owned the panel and any click meant "done"; since **WC-C** there is no takeover mode left to reach —
+  `_start` calls `SYS_WIN_CREATE` unconditionally, so every vug is a windowed app tiled beside others. In
+  a windowed desktop a click is how you focus or interact, so "click exits" meant *every attempt to touch
+  a vug killed it*, and **WC-J**'s instant erase of a dead window removed the ghost that would otherwise
+  have shown it had exited — which is precisely why a designed exit read as a spontaneous crash.
+  **Change:** a click (button press→release with drag motion under `CLICK_THRESH`) now toggles a
+  **pause** of the rotation instead of exiting — harmless, reversible, and visible, and it prints
+  `:: UVUG: click pause=<0|1> ::` per toggle, which doubles as proof that a click reached EL0 (clicks are
+  human-rate, so the line cannot flood the log). A **drag** still rotates, unchanged (`DRAG_DIV` /
+  `DRAG_CLAMP` untouched). **ESC remains the keyboard exit** and is now the only operator-driven one — it
+  already existed (`K_ESC` = 0x1B), so no new key was added. The exit witness is made honest in the same
+  stroke: the interactive line's reason was previously spelled `key` or `click`, so a run that merely ran
+  out `INTERACTIVE_CAP` claimed a click that never happened; the pair is now
+  `:: UVUG: interactive exit=<key|frames> frames=<n> ::`. **Background persistence is unchanged by
+  construction:** the auto/deterministic path is untouched (no HID in QEMU → no events → no interactive
+  mode → the 300-frame `checksum=0xe68285b85121ac7c` witness is byte-identical), a DETACHED vug still
+  runs uncapped until `kill`, and this arc *removes* an exit path rather than adding one — nothing the
+  BGRUN-ST legs depend on (they kill runnable targets) changed. **Gates:** `./arroyo check` green both
+  arches; `UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test 90` + `mbench --replay` **77/77
+  including the COMPLETE markers, 0 forbidden** (the `UVUG:` / `EXEC-UVUG:` / BGRUN-ST witnesses all
+  green); `./arroyo test-arm` MISSION SUCCESS.
 
 ### x86_64 (branch `hw-rmbp`)
 
@@ -463,8 +1840,27 @@ Conventions shared across arches:
   | 8 | `SYS_SPAWN` | — | **handle** / `-errno` | aarch64 M7→**U4** — loads the fixed `HELLO.BIN` into a fresh slot, runs it at EL0 as a child, and returns a **handle index into the caller's per-process handle table** (U4 — not the raw pid; arbitrary program-by-name is M8) |
   | 9 | `SYS_WAIT` | **handle** | exit status / `-ECHILD` | aarch64 M7→**U4** — blocks until the child that *handle* refers to exits (scheduler wake via the child's `done` post); `-ECHILD` if the handle is not in the caller's table (structural ownership) |
 
-  aarch64 leads 4–9 (M6f 4–7, M7 8–9); the x86 U-side port adopts the same numbers so
-  the arches stay aligned (x86 adds SMAP considerations aarch64's PAN-less A72 lacks).
+  (Numbers 10–20 are the aarch64 capability/FS/bus surface — `SYS_CAP`=10, `SYS_OPEN`=11,
+  `SYS_READ`=12, `SYS_XFER`=13, `SYS_RECV`=14, `SYS_SEEK`=15, `SYS_UNLINK`=16, `SYS_CLOSE`=17,
+  `SYS_FGRANT`=18, `SYS_MSEND`=19, `SYS_MRECV`=20 — documented in their U5–U11 / BANDY entries.)
+
+  | # | Name | Args | Returns | Notes |
+  | :--- | :--- | :--- | :--- | :--- |
+  | 21 | `SYS_THREAD_SPAWN` | entry, sp, arg, place | **thread handle** / `-errno` | aarch64 **ELF-2** — a new EL0 thread SHARING the caller's `ttbr0`/ASID; `place` 0=caller-core, 1=sibling-core; `arg` in x0; retains the slot (freed on the last thread's exit) |
+  | 22 | `SYS_THREAD_EXIT` | — | — (no return) | aarch64 **ELF-2** — posts the thread's completion + releases the slot; scheduler reclaims the task |
+  | 23 | `SYS_THREAD_JOIN` | handle | 0 / `-ESRCH` | aarch64 **ELF-2** — blocks on the thread's completion `Semaphore`; `-ESRCH` if the handle is not the caller's live thread |
+  | 24 | `SYS_FB_MAP` | — | surface VA / `-errno` | aarch64 **ELF-3** — maps the process's off-screen surface (EL0-RW) + RO info page; EL0 never gets the scan-out |
+  | 25 | `SYS_FB_PRESENT` | — | 0 / `-errno` | aarch64 **ELF-3** — kernel composites the surface to the screen (present hook); records the surface checksum |
+  | 26 | `SYS_FUTEX` | uaddr, op, val | op-specific / `-errno` | aarch64 **ELF-3** — op 0 WAIT (block iff `*uaddr==val`), op 1 WAKE (wake ≤`val`); phys-addr-keyed wait queue |
+  | 27 | `SYS_INPUT_POLL` | — | packed event ≥ 0 / `-EAGAIN` | aarch64 **ELF-5** — nonblocking next input event for the caller (packed u64: `[55:48]`=type, low 32=payload), `-EAGAIN` when its per-process ring is empty; the router fills the ACTIVE process's ring via `el0_input_enqueue` |
+  | 28 | *(reserved)* | — | — | `SYS_INPUT_WAIT` — DEFERRED blocking twin of 27; the number stays unused |
+  | 29 | `SYS_WIN_CREATE` | w, h | win id ≥ 0 / `-errno` | aarch64 **WC-B** — allocate a window owned by the caller's ASID and map its negotiated (page-multiple) ARGB8888 surface; `w`,`h` ∈ 1..=128; `-EINVAL` bad geometry / no per-process slot, `-EMFILE` the caller used all 8 of its own region slots, `-ENFILE` the global 8-window table is full |
+  | 30 | `SYS_WIN_PRESENT` | win | 0 / `-errno` | aarch64 **WC-B** — damage-mark + composite the window; `-EBADF` unknown/free id, `-EACCES` owned by another ASID. Bumps the focus-scoped present counter under the same focus guard as `SYS_FB_PRESENT` (the UVUG-8r2 cap reads it) |
+  | 31 | `SYS_WIN_MOVE` | win, x, y | 0 / `-errno` | aarch64 **WC-B** — reposition the window's top-left in screen space; same ownership gate, `-EINVAL` outside ±4096 |
+  | 32 | `SYS_WIN_CLOSE` | win | 0 / `-errno` | aarch64 **WC-B** — unmap the surface (leaves revert to the reserved EL1-only descriptors) and free the row; same ownership gate |
+
+  aarch64 leads 4–9 (M6f 4–7, M7 8–9) and 21–23 (ELF-2 threading); the x86 U-side port adopts the same
+  numbers so the arches stay aligned (x86 adds SMAP considerations aarch64's PAN-less A72 lacks).
 - **User faults kill the task, kernel faults stay fatal.** Fault accounting
   is matched (task, vector/EC, address) so demos assert exact outcomes.
 - **User pages are never executable-and-writable**; code pages are read-only

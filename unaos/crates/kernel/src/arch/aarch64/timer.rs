@@ -66,6 +66,15 @@ pub fn init() {
         ":: AARCH64 generic timer armed (CNTFRQ={} Hz, {} Hz tick, INTID {}) ::",
         freq, TICK_HZ, TIMER_INTID
     );
+    // UVUG-7 (P52): `arch::ms()` is derived directly from CNTVCT/CNTFRQ, NOT `ticks()*4`. The global
+    // tick counter is summed across every core's timer IRQ, so on 4-core BCM2711 metal `ticks()*4`
+    // ran ms ~4x fast and typematic repeated ~4x too fast. CNTFRQ is the true, frequency-independent
+    // tick rate the clock now uses: 1 CNTVCT tick = 1/CNTFRQ s, so ms = CNTVCT/(CNTFRQ/1000).
+    #[cfg(feature = "witness")]
+    serial_println!(
+        "[uvug7] ms clock: CNTFRQ={} Hz (={} kHz per ms); ms=CNTVCT/(CNTFRQ/1000), core-count-independent",
+        freq, freq / 1000
+    );
 }
 
 /// Arm THIS core's generic timer + enable its (banked) PPI at the GIC. The BSP reaches this via

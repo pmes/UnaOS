@@ -48,6 +48,9 @@ fn main() {
     if std::env::var("UNAOS_WITNESS").is_ok() { feats.push("witness"); }
     if std::env::var("UNAOS_SKIP_XHCI").is_ok() { feats.push("skip_xhci"); }
     if std::env::var("UNAOS_BOOTLOG").is_ok() { feats.push("bootlog"); }
+    // CLOCK-2: UNAOS_LOGTS=1 arms `logts` — a compact per-serial-line timestamp prefix (monotonic ms
+    // → UTC after a civil anchor). Kept in sync with arroyo; missing here would be silently dropped.
+    if std::env::var("UNAOS_LOGTS").is_ok() { feats.push("logts"); }
     if std::env::var("UNAOS_PI").is_ok() { feats.push("pi"); }
     if std::env::var("UNAOS_USBDEBUG").is_ok() { feats.push("usbdebug"); }
     // Wellspring raw-multitouch capture/decode (drivers/ehci §10g): the arroyo knob must survive

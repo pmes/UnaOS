@@ -27,7 +27,9 @@ use alloc::sync::Arc;
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{
+    AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+};
 // spin's Mutex is the low-level SPINLOCK guarding the run queues / sleeper lists; alias it so this
 // module's own sleeping `Mutex<T>` (below) owns the bare name — same split as x86's sched.rs.
 use spin::Mutex as SpinMutex;
@@ -180,6 +182,14 @@ pub struct Task {
     /// `dispatch_next` installs it (only if it differs from the live TTBR0); `exit` tears the slot down
     /// (when `asid = user_ttbr0 >> 48` is non-zero).
     user_ttbr0: u64,
+    /// SMP-BAL — the no-migrate flag. `true` = this task has NO hard core affinity and an idle core may
+    /// STEAL it from its current run queue (`try_steal`); `false` = it is PINNED and never migrates. Set
+    /// once at spawn: a `CPU_AUTO` (load-balanced) kernel task is steal-eligible; a task spawned with an
+    /// explicit core index (render/input/pump/backstop/capstone) and EVERY EL0/slot task (which carry
+    /// per-core TTBR0/ASID state) are pinned. Read ONLY under the owning run-queue lock (in `steal_one`),
+    /// mutated ONLY by the stealer while it exclusively owns the popped `Box` (retargeting `cpu`), so it
+    /// never races the owning core's dispatch. Honors the brief's "pinned tasks stay pinned" contract.
+    steal_ok: bool,
 }
 
 /// One CPU's scheduler bookkeeping (interior-mutable atomics, so the array is a plain static).
@@ -236,6 +246,270 @@ static SCHED: [SchedCpu; NUM_CPUS] = [const { SchedCpu::new() }; NUM_CPUS];
 static CPU_BUSY: [AtomicU64; NUM_CPUS] = [const { AtomicU64::new(0) }; NUM_CPUS];
 static CPU_IDLE: [AtomicU64; NUM_CPUS] = [const { AtomicU64::new(0) }; NUM_CPUS];
 
+/// SCHED-7 — the CNTPCT busy span `dispatch_next` folded into the load window on the CURRENT pass
+/// (0 when the run queue was empty). `run()` reads+clears it after every pass and folds the REST of
+/// the pass's wall span in as IDLE, so no wall time is left unaccounted. Single-writer (the owning
+/// core's scheduler loop writes it in `dispatch_next`; the same loop consumes it in `run()`); relaxed.
+static PASS_BUSY_CYC: [AtomicU64; NUM_CPUS] = [const { AtomicU64::new(0) }; NUM_CPUS];
+
+// ---------------------------------------------------------------------------------------------
+// SCHED-2 — per-core load accounting (rolling-window utilization, ctx-switch count, last task)
+// ---------------------------------------------------------------------------------------------
+//
+// The `CPU_BUSY`/`CPU_IDLE` pulse counters above are CUMULATIVE-since-boot pass counts — good for a
+// meter that diffs across its own frame window, but they never answer "what is this core doing NOW"
+// on demand (busy% since boot converges to a flat average). This adds a LIVE per-core view: a
+// busy fraction over the most-recent WINDOW dispatch passes, a running context-switch count, and the
+// id+name of the last task dispatched on the core.
+//
+// Cost & concurrency: strictly per-core, single-writer (only the owning core's scheduler loop writes
+// its slot, from the tick/switch path that is already running), lock-free, Relaxed atomics — it adds
+// NO new lock to the scheduler hot path and no cross-core contention. Each dispatch pass does a
+// handful of relaxed loads/stores. Reads (the `top` shell verb, the witnesses) may run from ANY core;
+// the counters are plain relaxed reads and the last-task (id + &'static str) is published under a
+// per-core SEQLOCK so a cross-core reader never observes a torn id/name/len triple. Introspection
+// only: `core_load` and the witnesses NEVER run on a scheduling decision path.
+//
+// SCHED-5 — TIME, NOT PASSES. `busy_pct_recent` was originally "fraction of the last WINDOW dispatch
+// PASSES that dispatched work". That counts scheduler activity, not CPU time: a task that wakes once
+// per 4 ms tick, runs for microseconds, then blocks looks 50% "loaded" (one busy pass, one idle pass
+// per tick) while consuming almost no CPU — it cannot tell a busy-loop apart from a bare cadence, and
+// it misled a whole downstream arc (NET-19 was briefed off a spurious `c1=50%`). SCHED-5 makes the
+// metric time-based: it measures the CYCLES (free-running CNTPCT, see `now_cyc`) this core spends
+// EXECUTING tasks vs sitting IDLE (WFI / empty-queue), and reports the busy time fraction over a
+// rolling ~250 ms window. The counter is read only at the dispatch entry/exit boundary (around
+// `switch_context`) and at the idle WFI in `run()` — no per-instruction cost. CNTPCT (unlike the
+// Group-1 timer IRQ, which QEMU withholds) is always running, so the accounting advances on every
+// path — cooperative and preemptive, QEMU and metal. The LINE FORMAT is unchanged
+// (`SCHED: load cN=..%`); only the meaning of the percentage moves from pass-fraction to time-fraction.
+
+/// Rolling-window size, in CNTPCT cycles, over which `busy_pct_recent` is computed. A completed window
+/// (busy+idle cycles reaching this budget) snapshots its busy TIME fraction and resets, so the reported
+/// percentage tracks recent utilization rather than the since-boot average. Derived from the counter
+/// frequency (`CNTFRQ_EL0`) as ~250 ms, so the window is a fixed wall-clock span on any board (the
+/// frequency differs — ~54 MHz on the BCM2711, ~62.5 MHz on QEMU virt — but the percentage is a ratio,
+/// so only the smoothing span is frequency-derived, never the value).
+static CNTFRQ_HZ: AtomicU64 = AtomicU64::new(0);
+
+/// Free-running system counter (CNTPCT_EL0) — the time base for time-based load accounting. Mirrors
+/// genet.rs's `now_cyc` probe but kept self-contained here (the scheduler pulls in no net code). A
+/// single non-trapping EL2/EL1 sysreg read; NOT CPU clock cycles (CNTPCT is a fixed-frequency counter),
+/// but a stable monotonic tick that is ALWAYS advancing, so it works even where the timer IRQ does not.
+#[inline]
+fn now_cyc() -> u64 {
+    let cnt: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, cntpct_el0", out(reg) cnt, options(nomem, nostack, preserves_flags));
+    }
+    cnt
+}
+
+/// The load window budget in CNTPCT cycles (~250 ms). Reads `CNTFRQ_EL0` once and caches it (some
+/// firmwares report it per-boot but not per-pass-cheap, so cache to keep the accounting fold O(1)).
+/// Falls back to a nominal 54 MHz if firmware leaves CNTFRQ_EL0 at 0 (only affects the smoothing span).
+#[inline]
+fn load_window_cyc() -> u64 {
+    let f = CNTFRQ_HZ.load(Ordering::Relaxed);
+    let frq = if f != 0 {
+        f
+    } else {
+        let v: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, cntfrq_el0", out(reg) v, options(nomem, nostack, preserves_flags));
+        }
+        let v = if v == 0 { 54_000_000 } else { v };
+        CNTFRQ_HZ.store(v, Ordering::Relaxed);
+        v
+    };
+    frq / 4
+}
+
+/// Sentinel `recent_pct` meaning "no window has completed yet" (fall back to the partial window).
+const LOAD_PCT_NONE: u32 = u32::MAX;
+
+/// One core's load accounting slot. All fields written ONLY by the owning core's scheduler loop
+/// (single-writer, Relaxed); read cross-core by introspection. The last-task triple is seqlock-
+/// protected (odd `last_seq` = write in progress) so a reader never reconstructs a torn `&str`.
+struct CoreAccount {
+    /// Cumulative context switches INTO a task on this core (one per busy dispatch).
+    ctx_switches: AtomicU64,
+    /// SCHED-5 — CNTPCT cycles spent EXECUTING tasks in the CURRENT (incomplete) window.
+    win_busy_cyc: AtomicU64,
+    /// SCHED-5 — CNTPCT cycles spent IDLE (WFI / empty queue) in the current window. The window rolls
+    /// over when `win_busy_cyc + win_idle_cyc` reaches `load_window_cyc()`.
+    win_idle_cyc: AtomicU64,
+    /// Busy percent (0..=100) of the last COMPLETED window, or `LOAD_PCT_NONE` before the first.
+    recent_pct: AtomicU32,
+    /// SCHED-8 — CNTPCT timestamp of the most recent `account()` fold (0 = never accounted). A core
+    /// running `run()` folds a busy OR idle span every dispatch pass, so this stays fresh; a core that
+    /// left `run()` (the Pi/tegra BSP `hlt_loop`s after spawning services; the virt boot core spin-loops
+    /// after CAPSTONE drains) stops folding, so this freezes and `tracked()` reports the slot STALE. That
+    /// is what makes the `SCHED: load` line print `--` for an untracked core instead of the last window's
+    /// frozen percent (the c0=100% artifact): honest "no current data" over a fabricated number.
+    last_acct_cyc: AtomicU64,
+    /// Seqlock sequence for the last-task triple: even = stable, odd = write in progress.
+    last_seq: AtomicU64,
+    /// Id of the last task dispatched here (0 = none yet).
+    last_id: AtomicU64,
+    /// `&'static str` name of the last task, split into `.as_ptr()` + `.len()` (both published under
+    /// the seqlock). A `&'static str` is a 16-byte fat pointer that no single atomic can hold, so the
+    /// seqlock is what makes the cross-core read of the pair sound.
+    last_name_ptr: AtomicUsize,
+    last_name_len: AtomicUsize,
+}
+
+impl CoreAccount {
+    const fn new() -> Self {
+        CoreAccount {
+            ctx_switches: AtomicU64::new(0),
+            win_busy_cyc: AtomicU64::new(0),
+            win_idle_cyc: AtomicU64::new(0),
+            recent_pct: AtomicU32::new(LOAD_PCT_NONE),
+            last_acct_cyc: AtomicU64::new(0),
+            last_seq: AtomicU64::new(0),
+            last_id: AtomicU64::new(0),
+            last_name_ptr: AtomicUsize::new(0),
+            last_name_len: AtomicUsize::new(0),
+        }
+    }
+
+    /// SCHED-5 — fold a measured span into the rolling window (single-writer, owning core). Exactly one
+    /// of `busy_cyc` / `idle_cyc` is non-zero per call: `account(delta, 0)` after a task's execution
+    /// span (around `switch_context`), `account(0, delta)` after an idle WFI. On window completion
+    /// (busy+idle cycles reaching the ~250 ms budget) it snapshots the busy TIME fraction and resets.
+    /// Relaxed loads/stores are sound because only this core's scheduler loop ever writes its slot.
+    #[inline]
+    fn account(&self, busy_cyc: u64, idle_cyc: u64) {
+        // SCHED-8: mark the slot fresh — every dispatch pass in `run()` folds a span, so a core still
+        // inside the scheduler keeps this current; a core that left `run()` stops touching it (goes STALE).
+        self.last_acct_cyc.store(now_cyc(), Ordering::Relaxed);
+        let busy = self.win_busy_cyc.load(Ordering::Relaxed) + busy_cyc;
+        let idle = self.win_idle_cyc.load(Ordering::Relaxed) + idle_cyc;
+        let total = busy + idle;
+        if total >= load_window_cyc() {
+            self.recent_pct.store((busy * 100 / total) as u32, Ordering::Relaxed); // total>=budget>0
+            self.win_busy_cyc.store(0, Ordering::Relaxed);
+            self.win_idle_cyc.store(0, Ordering::Relaxed);
+        } else {
+            self.win_busy_cyc.store(busy, Ordering::Relaxed);
+            self.win_idle_cyc.store(idle, Ordering::Relaxed);
+        }
+    }
+
+    /// Publish the last-dispatched task's id + name under the seqlock (owning core only). Bump the
+    /// sequence odd, write the triple, bump it even — a reader spinning on an even/matching sequence
+    /// then sees a consistent snapshot. Release fences pair with the reader's Acquire loads.
+    #[inline]
+    fn note_last(&self, id: u64, name: &'static str) {
+        let seq = self.last_seq.load(Ordering::Relaxed);
+        self.last_seq.store(seq + 1, Ordering::Release); // odd: write in progress
+        self.last_id.store(id, Ordering::Relaxed);
+        self.last_name_ptr.store(name.as_ptr() as usize, Ordering::Relaxed);
+        self.last_name_len.store(name.len(), Ordering::Relaxed);
+        self.last_seq.store(seq + 2, Ordering::Release); // even: stable
+    }
+
+    /// Busy percent (0..=100) for `core_load`: the last completed window, or the partial window if
+    /// none has completed yet (0 when the core has never run a pass).
+    fn busy_pct(&self) -> u32 {
+        let recent = self.recent_pct.load(Ordering::Relaxed);
+        if recent != LOAD_PCT_NONE {
+            return recent;
+        }
+        let busy = self.win_busy_cyc.load(Ordering::Relaxed);
+        let total = busy + self.win_idle_cyc.load(Ordering::Relaxed);
+        if total == 0 {
+            0
+        } else {
+            (busy * 100 / total) as u32
+        }
+    }
+
+    /// SCHED-8 — is this core's load being accounted RIGHT NOW? True when the owning core folded a span
+    /// within the last ~2 load windows (~500 ms): i.e. it is inside `run()`, folding a busy or idle span
+    /// every dispatch pass. False when the slot has never been touched (never-scheduled core) or has gone
+    /// stale — the core left the scheduler loop (the Pi/tegra BSP `hlt_loop`; the virt boot core's post-
+    /// CAPSTONE spin) and its `recent_pct` is a frozen snapshot, not a live number. Untracked cores are
+    /// reported `--` rather than that frozen percent. Two windows of slack absorbs a slow rollover so a
+    /// genuinely-scheduled core is never mislabeled stale.
+    fn tracked(&self) -> bool {
+        let last = self.last_acct_cyc.load(Ordering::Relaxed);
+        if last == 0 {
+            return false; // never accounted — this core has not run the scheduler loop
+        }
+        now_cyc().wrapping_sub(last) < load_window_cyc().saturating_mul(2)
+    }
+
+    /// Read the last-task triple with a bounded seqlock retry. `&'static str` reconstruction is sound:
+    /// the writer only ever publishes a live `'static` name's `(ptr, len)` pair, and the seqlock
+    /// guarantees the reader sees a matching pair (never a torn ptr-from-A / len-from-B).
+    fn last_task(&self) -> (u64, &'static str) {
+        for _ in 0..8 {
+            let s1 = self.last_seq.load(Ordering::Acquire);
+            if s1 & 1 != 0 {
+                continue; // write in progress; retry
+            }
+            let id = self.last_id.load(Ordering::Relaxed);
+            let ptr = self.last_name_ptr.load(Ordering::Relaxed);
+            let len = self.last_name_len.load(Ordering::Relaxed);
+            if self.last_seq.load(Ordering::Acquire) != s1 {
+                continue; // changed under us; retry
+            }
+            if ptr == 0 || len == 0 {
+                return (id, "-");
+            }
+            // SAFETY: `ptr`/`len` were published together (seqlock-consistent) from a live `&'static
+            // str`, so this reconstructs that exact still-live string slice.
+            let name = unsafe {
+                core::str::from_utf8_unchecked(core::slice::from_raw_parts(ptr as *const u8, len))
+            };
+            return (id, name);
+        }
+        (self.last_id.load(Ordering::Relaxed), "?")
+    }
+}
+
+static ACCT: [CoreAccount; NUM_CPUS] = [const { CoreAccount::new() }; NUM_CPUS];
+
+/// A snapshot of one core's live scheduler load (SCHED-2). Returned by `core_load`; consumed by the
+/// `top` shell verb and the load witnesses. All fields are a point-in-time read — introspection only.
+pub struct CoreLoad {
+    /// SCHED-5 — busy TIME fraction (0..=100): CNTPCT cycles spent executing tasks over the most recent
+    /// ~250 ms window (was, pre-SCHED-5, the fraction of dispatch PASSES that ran work — a cadence proxy
+    /// that read ~50% for a task waking once per tick; now it is real CPU utilization).
+    pub busy_pct_recent: u32,
+    /// Cumulative context switches into a task on this core since boot.
+    pub ctx_switches: u64,
+    /// Id of the last task dispatched on this core (0 = none yet).
+    pub last_task_id: u64,
+    /// Name of the last task dispatched on this core ("-" = none yet).
+    pub last_task: &'static str,
+    /// SCHED-8 — is `busy_pct_recent` a LIVE number? True when this core is currently inside `run()`
+    /// (folding a span every dispatch pass); false when its accounting slot is stale — the core left the
+    /// scheduler loop (BSP `hlt_loop` / post-CAPSTONE spin) or never ran it, so `busy_pct_recent` is a
+    /// frozen last-window snapshot. Honest views (`SCHED: load` line, `top`) render an untracked core as
+    /// `--`; the liveness gate still reads the raw `busy_pct_recent`/`ctx_switches` so it stays green.
+    pub tracked: bool,
+}
+
+/// SCHED-2 — read this core's live load: recent busy percent (rolling window), cumulative context
+/// switches, and the last task dispatched. Allocation-free and lock-free; callable from ANY core
+/// (the shell `top` verb, the witnesses). Introspection only — never consulted on a scheduling path.
+pub fn core_load(core: usize) -> CoreLoad {
+    if core >= NUM_CPUS {
+        return CoreLoad { busy_pct_recent: 0, ctx_switches: 0, last_task_id: 0, last_task: "-", tracked: false };
+    }
+    let acct = &ACCT[core];
+    let (last_task_id, last_task) = acct.last_task();
+    CoreLoad {
+        busy_pct_recent: acct.busy_pct(),
+        ctx_switches: acct.ctx_switches.load(Ordering::Relaxed),
+        last_task_id,
+        last_task,
+        tracked: acct.tracked(),
+    }
+}
+
 /// AARCH64-PRIO — a CPU's ready tasks, bucketed by EFFECTIVE level. A task normally sits at its base
 /// `priority` level, but the aging sweep (`age`) may transiently lift a long-waiting task to a higher
 /// level so strict priority does not starve it; on its next enqueue it re-bases. One spinlock (in
@@ -264,12 +538,32 @@ impl RunQueue {
         let level = (task.priority as usize).min(NUM_PRIORITIES - 1);
         self.levels[level].push_back(task);
     }
+    /// Total ready tasks across all levels — the depth signal SCHED-3 load-balanced placement reads
+    /// to pick the least-loaded core (introspection under the run-queue lock, never on the switch path).
+    fn len(&self) -> usize {
+        self.levels.iter().map(VecDeque::len).sum()
+    }
     /// Dequeue the front of the HIGHEST non-empty level (strict priority over the effective level,
     /// round-robin within).
     fn pop_highest(&mut self) -> Option<Box<Task>> {
         for level in self.levels.iter_mut().rev() {
             if let Some(task) = level.pop_front() {
                 return Some(task);
+            }
+        }
+        None
+    }
+    /// SMP-BAL — remove and return the first STEAL-ELIGIBLE (`steal_ok`) ready task, scanning LOW→HIGH
+    /// priority (take a core's BACKGROUND work first, never rob it of its most-urgent task) and front-
+    /// first within a level (oldest waiter). Pinned tasks (render/input/pump/capstone/EL0) are skipped
+    /// and left in place. Returns `None` if the queue holds only pinned work. Runs on the STEALER's core
+    /// under the VICTIM's run-queue lock; every task here is `STATE_READY` (a running task is out of the
+    /// queue in `current`, a blocked one is in a wait/sleeper list), so a stolen task is always safe to
+    /// re-home. O(ready tasks) worst case, off the switch hot path (only an idle core with an empty queue).
+    fn steal_one(&mut self) -> Option<Box<Task>> {
+        for level in self.levels.iter_mut() {
+            if let Some(pos) = level.iter().position(|t| t.steal_ok) {
+                return level.remove(pos);
             }
         }
         None
@@ -411,15 +705,9 @@ extern "C" fn task_trampoline() -> ! {
     debug_assert!(!raw.is_null(), "task_trampoline: current is null");
     let (entry, arg) = unsafe { ((*raw).entry, (*raw).arg) };
     entry(arg);
-    // Signal completion to any joiner. `post()` cross-core-wakes a parked joiner if there is one.
-    // BORROW `done_sem` (never move it): the Box's own Arc clone is this `post()`'s liveness anchor
-    // and must remain in the Box until the scheduler drops it on the Finished path — strictly AFTER
-    // this post (exit() switches away; the scheduler then reclaims and drops the Box).
-    unsafe {
-        if let Some(sem) = &(*raw).done_sem {
-            sem.post();
-        }
-    }
+    // Completion is signalled in `exit()` now (the single post point — see the note there), which covers
+    // this kernel-thread return AND the EL0-thread `SYS_THREAD_EXIT` path (ELF-2), whose task erets to EL0
+    // and never runs this trampoline tail.
     exit();
 }
 
@@ -450,6 +738,12 @@ extern "C" fn user_task_trampoline() -> ! {
     let raw = SCHED[cpu].current.load(Ordering::Acquire) as *const Task;
     debug_assert!(!raw.is_null(), "user_task_trampoline: current is null");
     let (entry, sp) = unsafe { ((*raw).user_entry, (*raw).user_sp) };
+    // ELF-2: the one u64 argument the EL0 task starts with in x0 (the thread ABI's single arg). Regular EL0
+    // tasks (`spawn_user`/`spawn_user_slot`) leave `arg` 0, so x0 stays 0 — byte-identical to the pre-ELF-2
+    // scrub. A `spawn_user_thread` sets it. This is a DELIBERATE ABI value, not kernel residue: it is placed
+    // in x0 AFTER the full GPR/FP scrub below, so the scrub's no-leak property is unweakened (every other
+    // register is still zeroed; x0 alone carries the intended argument, exactly as a syscall ABI arg would).
+    let arg = unsafe { (*raw).arg as u64 };
     // SPSR_EL1 = 0x240 (M6e): M[3:0]=0b0000 (EL0t — a dedicated SP_EL0; EL0h/0b0001 is an illegal
     // return from EL1 -> PSTATE.IL), M[4]=0 (AArch64), DAIF = D,F masked with A (SError) and I (IRQ)
     // CLEAR. I unmasked => the generic timer preempts a running EL0 task (M6e; safe now that
@@ -480,7 +774,7 @@ extern "C" fn user_task_trampoline() -> ! {
             "msr SPSR_EL1, x2",
             "mov x0, xzr",  "mov x1, xzr",  "mov x2, xzr",  "mov x3, xzr",
             "mov x4, xzr",  "mov x5, xzr",  "mov x6, xzr",  "mov x7, xzr",
-            "mov x8, xzr",  "mov x9, xzr",  "mov x10, xzr", "mov x11, xzr",
+            "mov x8, xzr",  /* x9 holds the ELF-2 thread arg; scrubbed at the tail */ "mov x10, xzr", "mov x11, xzr",
             "mov x12, xzr", "mov x13, xzr", "mov x14, xzr", "mov x15, xzr",
             "mov x16, xzr", "mov x17, xzr", "mov x18, xzr", "mov x19, xzr",
             "mov x20, xzr", "mov x21, xzr", "mov x22, xzr", "mov x23, xzr",
@@ -499,11 +793,16 @@ extern "C" fn user_task_trampoline() -> ! {
             "msr FPCR, xzr",        // default control (round-to-nearest, no FTZ, no traps)
             "msr TPIDR_EL0, xzr",   // EL0 RW thread pointer — no kernel residue reaches EL0
             "msr TPIDRRO_EL0, xzr", // EL0 RO thread pointer (EL1-writable)
+            // ELF-2: plant the thread argument in x0 AFTER the scrub (deliberate ABI value), then scrub the
+            // scratch x9 that carried it. For a 0-arg task this writes x0=0 — identical to the scrub result.
+            "mov x0, x9",
+            "mov x9, xzr",
             "isb",
             "eret",
             in("x0") sp,
             in("x1") entry,
             in("x2") 0x240u64,
+            in("x9") arg,
             options(noreturn, nostack),
         );
     }
@@ -529,16 +828,85 @@ fn build_initial_frame(stack: &mut [u8], trampoline: extern "C" fn() -> !) -> u6
     sp as u64
 }
 
+// ---------------------------------------------------------------------------------------------
+// SCHED-3 — load-balanced placement for UNPINNED spawns
+// ---------------------------------------------------------------------------------------------
+//
+// The scheduler is no-migrate: a task lives on the core its `Task.cpu` names, decided once at spawn.
+// Historically EVERY caller named that core explicitly, so placement was 100% caller-pinned and hot
+// services that all pass a hand-picked "off the render core" pin cluster on the SAME core (the metal
+// R23s1f/R23s1h sightings: net9 + orphan-reaper both land on core 2 -> c2 saturates while core 1 sits
+// near-idle). SCHED-3 keeps explicit pins verbatim (render/input MUST stay single-core) but adds an
+// opt-in placement: a caller that passes `CPU_AUTO` lets the scheduler drop the task on the LEAST-
+// loaded online core, so unpinned work spreads by actual load instead of piling onto one pin.
+//
+// The candidate set is the cores that are actually running the scheduler loop, registered via
+// `mark_online` when the BSP releases the APs (`start_aps`). The load metric is the ready-queue DEPTH
+// (the most direct "will this task wait" signal), tie-broken by the rolling-window busy fraction and
+// then a rotating cursor so equal-load cores fill round-robin rather than all landing on the lowest
+// index. Placement runs off the hot path (spawn only), so the brief per-queue depth read is free.
+
+/// Sentinel `cpu` for `spawn`/`spawn_prio`/`spawn_auto`: "don't pin me — place me on the least-loaded
+/// online core by actual load". Any real core index (`< NUM_CPUS`) is honored verbatim (no-migrate).
+pub const CPU_AUTO: usize = usize::MAX;
+
+/// Cores registered as online + scheduling (the `CPU_AUTO` placement candidate set). Set by
+/// `mark_online` when the BSP releases an AP into `run`; never cleared (a core stays a candidate).
+static ONLINE_MASK: [AtomicBool; NUM_CPUS] = [const { AtomicBool::new(false) }; NUM_CPUS];
+
+/// Round-robin cursor for `CPU_AUTO` tie-breaking: when several online cores share the minimum load,
+/// the scan starts at a rotating offset so consecutive auto-placements fan out instead of stacking.
+static AUTO_ROTATE: AtomicUsize = AtomicUsize::new(0);
+
+/// Register `cpu` as an online, scheduling core — a candidate for `CPU_AUTO` load-balanced placement.
+/// Called by the BSP as it releases the APs (`start_aps`); idempotent, introspection-only bookkeeping
+/// (no effect on any existing caller-pinned spawn, so boot behavior is byte-identical without CPU_AUTO).
+pub fn mark_online(cpu: usize) {
+    if cpu < NUM_CPUS {
+        ONLINE_MASK[cpu].store(true, Ordering::Release);
+    }
+}
+
+/// Resolve a requested `cpu` to a concrete core. An explicit index passes through verbatim (the
+/// no-migrate pin contract). `CPU_AUTO` selects the least-loaded online core: minimum ready-queue
+/// depth first, then the lower rolling-window busy fraction, then a rotating cursor for round-robin
+/// spread on ties. Falls back to core 0 only if no core is online yet (early BSP staging).
+fn pick_cpu(requested: usize) -> usize {
+    if requested != CPU_AUTO {
+        return requested;
+    }
+    let rot = AUTO_ROTATE.fetch_add(1, Ordering::Relaxed);
+    let mut best: Option<usize> = None;
+    let mut best_depth = usize::MAX;
+    let mut best_pct = u32::MAX;
+    for i in 0..NUM_CPUS {
+        let cpu = (rot + i) % NUM_CPUS; // rotating start => equal-load cores fill round-robin
+        if !ONLINE_MASK[cpu].load(Ordering::Acquire) {
+            continue;
+        }
+        let depth = RUN_QUEUES[cpu].lock().len();
+        let pct = ACCT[cpu].busy_pct();
+        if depth < best_depth || (depth == best_depth && pct < best_pct) {
+            best = Some(cpu);
+            best_depth = depth;
+            best_pct = pct;
+        }
+    }
+    best.unwrap_or(0)
+}
+
 /// Shared spawn path: build a kernel thread on `cpu`'s run queue (optionally carrying a `done_sem`
-/// completion signal for `join`), enqueue it, and poke that CPU. Returns the new task's id.
+/// completion signal for `join`), enqueue it, and poke that CPU. `cpu` may be `CPU_AUTO` for
+/// load-balanced placement (see `pick_cpu`); any real index is a verbatim no-migrate pin. Returns id.
 fn spawn_inner(
     name: &'static str,
     entry: fn(usize),
     arg: usize,
-    cpu: usize,
+    requested_cpu: usize,
     priority: u8,
     done_sem: Option<Arc<Semaphore>>,
 ) -> u64 {
+    let cpu = pick_cpu(requested_cpu);
     assert!(cpu < NUM_CPUS, "spawn: cpu out of range");
     let mut stack: Box<[u8]> = alloc::vec![0u8; TASK_STACK_SIZE].into_boxed_slice();
     let ctx_sp = build_initial_frame(&mut stack, task_trampoline);
@@ -558,8 +926,28 @@ fn spawn_inner(
         user_entry: 0,
         user_sp: 0,
         user_ttbr0: 0, // kernel task: no root switch (kernel mappings are Global in every root)
+        // SMP-BAL: a load-balanced (CPU_AUTO) kernel task has no core affinity → steal-eligible. A task
+        // spawned onto an explicit core is pinned there (no-migrate), so stealing never touches it.
+        steal_ok: requested_cpu == CPU_AUTO,
     });
     RUN_QUEUES[cpu].lock().push(task);
+    // PI-SCHED-1 — placement witness. The scheduler PINS a task to the caller-chosen core and never
+    // migrates it (see `Task.cpu` / `make_ready`), so the placement is decided entirely at the spawn
+    // site; this line makes that decision auditable (the probe's core deliverable). Gated behind the
+    // `pi` feature so it fires on the Raspberry Pi target (where the two core-placement sightings that
+    // motivated this arc were observed) and in the `kernel8-test` gate, while staying BYTE-IDENTICAL for
+    // the jetson/tegra + virt builds that share this aarch64 module. FLAG: this file is shared across the
+    // aarch64 sub-tracks — the addition is log-only and behind `pi`, so it cannot alter scheduling on any
+    // track. (The Pi `kernel8` build never sets `sched_demo`, so `pi` is the gate that makes the probe
+    // visible on the actual target.)
+    #[cfg(feature = "pi")]
+    serial_println!(
+        ":: SCHED: task '{}' -> core {} (policy: {}, no-migrate; prio {}) ::",
+        name,
+        cpu,
+        if requested_cpu == CPU_AUTO { "load-balanced" } else { "caller-pinned" },
+        priority
+    );
     // Wake the target if it's a different, possibly-idle core (same-core needs no poke).
     poke_cpu(cpu);
     id
@@ -578,6 +966,14 @@ pub fn spawn(name: &'static str, entry: fn(usize), arg: usize, cpu: usize) -> u6
 /// is protected from indefinite starvation by aging (see `AGE_TICKS`). Returns the task id.
 pub fn spawn_prio(name: &'static str, entry: fn(usize), arg: usize, cpu: usize, priority: u8) -> u64 {
     spawn_inner(name, entry, arg, cpu, priority, None)
+}
+
+/// SCHED-3: like `spawn`, but LOAD-BALANCED — the scheduler places the task on the least-loaded online
+/// core (see `pick_cpu`) instead of a caller-named pin. For fire-and-forget service/worker tasks that
+/// have no core affinity; use `spawn` (explicit `cpu`) when a task MUST run on a specific core (e.g. the
+/// single-core render loop). Equivalent to `spawn(.., CPU_AUTO)`. Returns the task id.
+pub fn spawn_auto(name: &'static str, entry: fn(usize), arg: usize) -> u64 {
+    spawn_inner(name, entry, arg, CPU_AUTO, PRIO_NORMAL, None)
 }
 
 /// Create a ready EL0 (user-mode) task on `cpu`'s run queue (M6a): when dispatched it drops to EL0 at
@@ -623,9 +1019,12 @@ fn spawn_user_inner(
     user_entry: u64,
     user_sp: u64,
     user_ttbr0: u64,
-    cpu: usize,
+    requested_cpu: usize,
 ) -> u64 {
+    let cpu = pick_cpu(requested_cpu);
     assert!(cpu < NUM_CPUS, "spawn_user: cpu out of range");
+    // BG-SPREAD witness aid — record the decision so the caller can read back where its task landed.
+    LAST_USER_PLACEMENT.store(cpu, Ordering::Release);
     let mut stack: Box<[u8]> = alloc::vec![0u8; TASK_STACK_SIZE].into_boxed_slice();
     let ctx_sp = build_initial_frame(&mut stack, user_task_trampoline);
     let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
@@ -644,10 +1043,127 @@ fn spawn_user_inner(
         user_entry,
         user_sp,
         user_ttbr0,
+        // SMP-BAL: EL0/slot tasks carry per-core TTBR0/ASID state — always pinned, never stolen.
+        steal_ok: false,
     });
+    // SKILL-1: count this task against its address-space slot BEFORE the push, so it is countable before
+    // it can ever be dispatched (and thus before any ASID-scoped kill could observe a short count).
+    asid_thread_enter(user_ttbr0);
     RUN_QUEUES[cpu].lock().push(task);
+    // PI-SCHED-1 — placement witness for EL0 tasks (the vug/midden GUI-app loads land here — the
+    // "all vug load on core 2" sighting). Same `pi`-gating + rationale as `spawn_inner`.
+    #[cfg(feature = "pi")]
+    serial_println!(
+        ":: SCHED: task '{}' -> core {} (policy: {} EL0, no-migrate) ::",
+        name,
+        cpu,
+        if requested_cpu == CPU_AUTO { "load-balanced" } else { "caller-pinned" }
+    );
     poke_cpu(cpu);
     id
+}
+
+/// ELF-2 — spawn an EL0 THREAD: a new user task that SHARES the address space named by `user_ttbr0` (the
+/// parent's slot root `slot_l1_pa | asid<<48`), rather than a fresh private slot. This is the primitive
+/// behind `SYS_THREAD_SPAWN`: the caller carves `user_sp` (a stack) from its own 16 KiB window, names an
+/// `user_entry` PC inside the shared window, and the new thread runs concurrently under the SAME ASID —
+/// possibly on a different core (`cpu`). It carries one u64 `arg` (delivered in x0 by `user_task_trampoline`)
+/// and a `JoinHandle` completion semaphore (posted in `exit()` — the single post point).
+///
+/// SLOT REFCOUNT: the caller MUST have already `slot_thread_retain`ed the slot BEFORE calling this, so the
+/// shared address space cannot be torn down between here and the thread's first dispatch. Teardown happens
+/// on the LAST thread's exit (`teardown_user_slot`'s 1->0 edge).
+///
+/// Multi-core soundness (shared ASID on two cores): `dispatch_next` installs `user_ttbr0` per-core, so both
+/// cores run under the same root/ASID; nG user leaves are ASID-tagged and TLB maintenance is Inner-Shareable
+/// broadcast; and `teardown_user_slot` now repoints EACH exiting thread's core off the slot root, so the
+/// final ASID flush races no live root on any other core. Baremetal-only (reaches the Pi-gated user MMU).
+#[cfg(feature = "baremetal")]
+pub fn spawn_user_thread(
+    name: &'static str,
+    user_entry: u64,
+    user_sp: u64,
+    arg: u64,
+    user_ttbr0: u64,
+    requested_cpu: usize,
+) -> JoinHandle {
+    let cpu = pick_cpu(requested_cpu);
+    assert!(cpu < NUM_CPUS, "spawn_user_thread: cpu out of range");
+    let done = Arc::new(Semaphore::new(0));
+    done.init(); // reserve the waiter list BEFORE the thread can run + post (alloc-free park)
+    let mut stack: Box<[u8]> = alloc::vec![0u8; TASK_STACK_SIZE].into_boxed_slice();
+    let ctx_sp = build_initial_frame(&mut stack, user_task_trampoline);
+    let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
+    let task = Box::new(Task {
+        id,
+        name,
+        state: AtomicU8::new(STATE_READY),
+        ctx_sp,
+        stack,
+        entry: user_never,
+        arg: arg as usize, // delivered to EL0 in x0 by user_task_trampoline (the thread's single argument)
+        cpu: cpu as u32,
+        priority: PRIO_NORMAL,
+        wait_ticks: 0,
+        done_sem: Some(done.clone()),
+        user_entry,
+        user_sp,
+        user_ttbr0,
+        // SMP-BAL: shared-ASID EL0 thread — per-core address-space state, always pinned.
+        steal_ok: false,
+    });
+    // SKILL-1: this is the path that MAKES a slot multi-threaded, so it is the one the ASID-scoped kill
+    // exists for — count the sibling before it can be dispatched.
+    asid_thread_enter(user_ttbr0);
+    RUN_QUEUES[cpu].lock().push(task);
+    #[cfg(feature = "pi")]
+    serial_println!(
+        ":: SCHED: thread '{}' -> core {} (ELF-2 shared-ASID EL0 thread, no-migrate) ::",
+        name,
+        cpu
+    );
+    poke_cpu(cpu);
+    JoinHandle { done, id }
+}
+
+/// BG-SPREAD — the core chosen by the most recent EL0-SLOT spawn (`spawn_user_slot`). Witness aid
+/// only: it makes the placement decision readable by the caller that just made it, which the
+/// `pid`-returning signature cannot express. Read it IMMEDIATELY after your own `spawn_user_slot`
+/// call, from the same task — it is a single global, so an interleaved slot spawn on another core
+/// would overwrite it. Never a scheduling input; nothing reads it but the BGSPREAD witness.
+static LAST_USER_PLACEMENT: AtomicUsize = AtomicUsize::new(0);
+
+/// BG-SPREAD — read the core the last `spawn_user_slot` placed its task on. See
+/// [`LAST_USER_PLACEMENT`] for the (deliberately narrow) contract.
+pub fn last_user_placement() -> usize {
+    LAST_USER_PLACEMENT.load(Ordering::Acquire)
+}
+
+/// BG-SPREAD — how many cores are registered online + scheduling (the `CPU_AUTO` candidate set).
+/// Lets a witness skip honestly on a boot that brought up fewer cores than it needs to observe a
+/// spread (the metal 3-of-4-cores variance documented in the pi4 regression spec).
+pub fn online_cpu_count() -> usize {
+    (0..NUM_CPUS).filter(|&c| ONLINE_MASK[c].load(Ordering::Acquire)).count()
+}
+
+/// ELF-2 — pick an online scheduling core DIFFERENT from `not`, for placing a thread on a sibling core (the
+/// `SYS_THREAD_SPAWN` "spread" hint). Returns the least-loaded such core, or `not` itself if no other core is
+/// online (uniprocessor / early staging). Lets a thread demonstrate genuine cross-core parallelism without
+/// the EL0 program knowing the CPU topology.
+pub fn other_online_cpu(not: usize) -> usize {
+    let mut best: Option<usize> = None;
+    let mut best_depth = usize::MAX;
+    for c in 0..NUM_CPUS {
+        if c == not || !ONLINE_MASK[c].load(Ordering::Acquire) {
+            continue;
+        }
+        let depth = RUN_QUEUES[c].lock().len();
+        if depth < best_depth {
+            best_depth = depth;
+            best = Some(c);
+        }
+    }
+    best.unwrap_or(not)
 }
 
 /// Like `spawn`, but returns a `JoinHandle` a scheduled task can `join()` to block until this task
@@ -676,6 +1192,12 @@ impl JoinHandle {
     /// Id of the task this handle joins.
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    /// KILLBOUND: evict any killed task parked on THIS completion semaphore (a `SYS_THREAD_JOIN`er).
+    /// Delegates to `Semaphore::wake_killed`; see there for why no permit is handed over.
+    pub fn wake_killed(&self) -> u32 {
+        self.done.wake_killed()
     }
 
     /// Block the current task until the joined task finishes. MUST be called from a scheduled task
@@ -750,6 +1272,8 @@ fn make_ready(task: Box<Task>) {
 pub fn yield_now() {
     let cpu = percpu::this_cpu().cpu_index as usize;
     mask_irq();
+    // SKILL-1 on-CPU kill boundary: a cooperative yield is as good a retirement point as a preemption.
+    kill_check_current(); // never returns if this task has been killed
     let raw = SCHED[cpu].current.load(Ordering::Acquire) as *mut Task;
     if !raw.is_null() {
         unsafe {
@@ -782,6 +1306,429 @@ pub fn current_id() -> Option<u64> {
     if raw.is_null() { None } else { Some(unsafe { (*raw).id }) }
 }
 
+// =============================================================================================
+// SKILL-1 — the ASYNCHRONOUS KILL primitive.
+//
+// Until this arc `exit()` was the only way a task could die, and it retires the CALLING task only.
+// A timed-out `run_user_image` therefore had no way to stop the EL0 task it had given up on: the
+// task kept running (observed on metal spinning a core at 100% forever, still rendering over the
+// screen, starving every later run), and the only containment was parking its `Proc` row PORPHANED.
+//
+// The design deliberately does NO cross-CPU register surgery. A kill is a REQUEST published in a
+// tiny fixed table keyed by task id; the target retires ITSELF, on its own core, at a boundary where
+// switching away is already proven safe:
+//
+//   (a) OFF-CPU — `dispatch_next` checks the request table after popping a task and BEFORE switching
+//       into it. A killed task is never dispatched again: it is torn down and dropped right there,
+//       on the scheduler's own stack. This covers every ready, sleeping, or wait-queued task (they
+//       all re-enter through a dispatch) and needs no cooperation from the target at all.
+//   (b) ON-CPU — `timer_preempt` (the per-core quantum tick, the only involuntary boundary a spinning
+//       EL0 task ever reaches), `yield_now`, and the SVC dispatcher (`aarch64_svc_handler`) call
+//       `kill_check_current`, which routes a killed current task straight into `exit()`. Both call
+//       sites already run IRQ-masked on the task's own kernel stack and already tolerate a
+//       never-returning `exit()` — that is exactly what the M6b EL0 fault-kill path does.
+//
+// Task ids are monotonic (`NEXT_TID`) and never reused, so a request can never be mis-delivered to a
+// later task that happened to inherit a number.
+//
+// CONFIRMATION is the point of the ticket: the requester needs to know the task is provably off every
+// CPU and will never run again before it reclaims resources the task owns (its `Proc` row). The
+// retiring side settles the slot as its LAST act before switching away for good / before its Box is
+// dropped, so `KILL_DONE` means "torn down; nothing of this task will execute again".
+//
+// FAIL-CLOSED throughout: no free slot, or a kill that does not confirm inside the caller's bounded
+// wait, degrades to exactly the pre-arc PORPHANED behaviour — never to freeing a row under a live task.
+// =============================================================================================
+
+/// How many kills may be in flight at once. Small on purpose: the only requester is the single-threaded
+/// `run_user_image` deadline path, and `MAX_PROCS` (4) bounds how many rows can be at risk. Exhaustion
+/// returns `None` and the caller falls back to PORPHANED — it never grows the table (a STOP tripwire).
+pub const MAX_KILL_REQS: usize = 4;
+
+const KILL_FREE: u8 = 0;
+/// Armed and owned by a live requester; the retiring task publishes `KILL_DONE` for it to observe.
+const KILL_PENDING: u8 = 1;
+/// The target retired. Terminal until the OWNER releases the slot (`kill_release`).
+const KILL_DONE: u8 = 2;
+/// The requester's bounded wait expired and it walked away, but the kill STAYS ARMED — the task is
+/// still owed a death, and its row is parked PORPHANED meanwhile. Whoever finally retires the task
+/// frees the slot directly (no owner is left to observe a `KILL_DONE`).
+const KILL_DETACHED: u8 = 3;
+
+struct KillReq {
+    /// The target task id. Only meaningful while `state != KILL_FREE`.
+    tid: AtomicU64,
+    /// The target's address-space ASID, or 0 for a kernel task / a tid-only request. NON-ZERO makes the
+    /// request ADDRESS-SPACE SCOPED: it names every EL0 thread sharing that ASID, not just `tid`. See
+    /// `kill` for why that is the correct unit.
+    asid: AtomicU64,
+    /// `KILL_*`. The ownership token: a requester CASes FREE->PENDING to claim.
+    state: AtomicU8,
+}
+
+static KILLS: [KillReq; MAX_KILL_REQS] = [const {
+    KillReq {
+        tid: AtomicU64::new(0),
+        asid: AtomicU64::new(0),
+        state: AtomicU8::new(KILL_FREE),
+    }
+}; MAX_KILL_REQS];
+
+/// SKILL-1 — LIVE EL0 THREADS PER ADDRESS-SPACE SLOT, indexed by ASID.
+///
+/// An ELF-2 process can hold several tasks under one ASID (`spawn_user_thread`), and a kill must be scoped
+/// to the ADDRESS SPACE, not to one thread: retiring the tid that `run_user_image` happens to know while
+/// its siblings keep running would leave the program alive — still spinning, still rendering — under a row
+/// we had just reported reaped. (There is no memory-unsafety in that: `teardown_user_slot` is refcounted
+/// and only the last thread out retires the slot. The lie is in the accounting, which is worse for being
+/// silent.) This counter is what lets the ASID-scoped request know when the LAST of the set has retired,
+/// and it is the reason a confirmation can be trusted for a multi-threaded target.
+///
+/// Sized for ASID 0 (never counted — kernel tasks and the shared window) plus `boot::USER_SLOTS` (8).
+/// Kept here rather than reading `boot::SLOT_REFCOUNT` because that is private, is baremetal-only, and
+/// counts slot RETAINS (which include the pre-spawn retain `SYS_THREAD_SPAWN` takes before a task exists);
+/// this counts TASKS, which is exactly the set a kill has to drain.
+const KILL_ASID_SLOTS: usize = 9;
+static ASID_THREADS: [AtomicU32; KILL_ASID_SLOTS] =
+    [const { AtomicU32::new(0) }; KILL_ASID_SLOTS];
+
+/// Count a freshly spawned EL0 task against its slot. Called from both user-task spawn paths BEFORE the
+/// run-queue push, so the task is countable before it can ever be dispatched. Kernel tasks (ASID 0) and
+/// out-of-range ASIDs are ignored, which makes this inert on `virt` (every task there is a kernel thread).
+#[cfg_attr(not(feature = "baremetal"), allow(dead_code))] // both user-spawn paths are baremetal-only
+fn asid_thread_enter(user_ttbr0: u64) {
+    let asid = (user_ttbr0 >> 48) as usize;
+    if asid != 0 && asid < KILL_ASID_SLOTS {
+        ASID_THREADS[asid].fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// Retire an EL0 task from its slot's live count, returning how many threads REMAIN under that ASID.
+/// Called from every task-death path (`exit` and the off-CPU `retire_killed`) beside the slot teardown, so
+/// the count tracks live tasks exactly. Returns 0 for kernel tasks, which is also the right answer for a
+/// tid-scoped request: "no siblings outstanding".
+fn asid_thread_leave(user_ttbr0: u64) -> u32 {
+    let asid = (user_ttbr0 >> 48) as usize;
+    if asid == 0 || asid >= KILL_ASID_SLOTS {
+        return 0;
+    }
+    let prev = ASID_THREADS[asid].fetch_sub(1, Ordering::AcqRel);
+    debug_assert!(prev > 0, "asid_thread_leave: underflow (a task retired twice?)");
+    prev.saturating_sub(1)
+}
+
+/// How many EL0 tasks are still live under `asid`. Introspection for the kill witness.
+pub fn asid_live_threads(asid: u64) -> u32 {
+    let a = asid as usize;
+    if a == 0 || a >= KILL_ASID_SLOTS {
+        return 0;
+    }
+    ASID_THREADS[a].load(Ordering::Acquire)
+}
+
+/// A requester's claim on one `KILLS` slot. Not `Copy`: it must be surrendered exactly once, via
+/// `kill_release` (confirmed) or `kill_detach` (gave up), so a slot can never be double-freed.
+pub struct KillTicket {
+    idx: usize,
+}
+
+/// The index of the ARMED kill request naming this task, if any — matched by TID, or by ASID when the
+/// request is address-space scoped (so every sibling thread of a killed process is caught by the same
+/// request). Lock-free scan of a 4-entry table: in the common case every entry is `KILL_FREE` and this is
+/// four acquire loads, cheap enough for the dispatch fast path.
+fn kill_slot_for(tid: u64, user_ttbr0: u64) -> Option<usize> {
+    let asid = user_ttbr0 >> 48;
+    (0..MAX_KILL_REQS).find(|&i| {
+        let st = KILLS[i].state.load(Ordering::Acquire);
+        if st != KILL_PENDING && st != KILL_DETACHED {
+            return false;
+        }
+        KILLS[i].tid.load(Ordering::Acquire) == tid
+            || (asid != 0 && KILLS[i].asid.load(Ordering::Acquire) == asid)
+    })
+}
+
+/// Settle slot `idx` from the RETIRING side — the last act of a killed task's teardown.
+///
+/// `remaining` is how many sibling threads still live under the request's ASID. A non-zero count means the
+/// address space is NOT yet drained, so the request stays ARMED and un-settled: the siblings are caught by
+/// the same request at their own next boundaries, and only the last one out settles the slot. That is what
+/// makes a confirmation on a multi-threaded target honest rather than a claim about one thread of several.
+///
+/// The state transition is a **compare_exchange, not a load-then-store**. It races `kill_detach`, and does
+/// so at precisely the worst moment — the requester's bounded wait expiring is exactly when a slow kill
+/// lands. A load-then-store would read PENDING, lose to the detach's CAS, then stamp `KILL_DONE` over
+/// `KILL_DETACHED`, stranding the slot in a terminal state with no owner left to release it: a permanently
+/// consumed entry, four of which retire the primitive for the rest of the boot. With the CAS, losing the
+/// race means the state is `KILL_DETACHED` and the slot is freed inline here — the owner-less path.
+///
+/// The `Proc`-row hook runs FIRST, while the slot is still un-settled: it reclaims a row that was parked
+/// PORPHANED because this very kill did not confirm in time. Restricted to PORPHANED rows, so it can
+/// never race the confirmed path (where the row is still PRUNNING and the requester frees it itself).
+fn kill_settle(idx: usize, tid: u64, remaining: u32) {
+    if remaining > 0 {
+        return; // siblings still live under this ASID — the request stays armed for them
+    }
+    #[cfg(feature = "baremetal")]
+    super::syscall::note_killed_task_retired(tid);
+    #[cfg(not(feature = "baremetal"))]
+    let _ = tid;
+    if KILLS[idx]
+        .state
+        .compare_exchange(KILL_PENDING, KILL_DONE, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        // Not PENDING. Free the slot ONLY if it is genuinely owner-less (`KILL_DETACHED`) — and do that
+        // with a CAS too, so a slot some other requester has meanwhile re-armed can never be clobbered by
+        // a late settle. Any other state (already FREE because the owner retracted, already DONE) is
+        // someone else's to dispose of; leave it alone.
+        let _ = KILLS[idx].state.compare_exchange(
+            KILL_DETACHED,
+            KILL_FREE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+}
+
+/// Request that a task be killed. Returns a ticket to confirm against, or `None` if the request table is
+/// full (the caller MUST fail closed — see `KILL_EXHAUSTED`). Pokes every online core so a killed task
+/// sitting in an idle core's run queue is dispatched — and thus reaped — promptly rather than at that
+/// core's next tick.
+///
+/// SCOPE. `tid` names the task the caller knows about; `asid` (non-zero) widens the request to EVERY EL0
+/// task sharing that address space. Pass the ASID whenever the target is a user process: an ELF-2 program
+/// may hold several tasks under one slot (`SYS_THREAD_SPAWN`), and killing only the tid the caller happens
+/// to hold would leave the program running under a row the caller is about to reclaim. With the ASID set,
+/// each sibling is matched by this same request at its own boundary and `kill_settle` withholds the
+/// confirmation until the LAST of them has retired — so a confirmation means the PROCESS is gone, not one
+/// thread of it. Pass 0 for a kernel task (no address space to scope to).
+pub fn kill(tid: u64, asid: u64) -> Option<KillTicket> {
+    if tid == 0 {
+        return None;
+    }
+    for i in 0..MAX_KILL_REQS {
+        if KILLS[i]
+            .state
+            .compare_exchange(KILL_FREE, KILL_PENDING, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            // Publish the target BEFORE any reader can match it: the CAS made the slot non-FREE, so
+            // `kill_slot_for` could already be scanning it — it compares tid/asid, and a stale 0 simply
+            // means "no match yet", never a match on the wrong task.
+            KILLS[i].asid.store(asid, Ordering::Release);
+            KILLS[i].tid.store(tid, Ordering::Release);
+            // KILLBOUND — evict any target already PARKED in a kernel wait, strictly AFTER the publish
+            // above (so `kill_slot_for` matches) and BEFORE the pokes (so a core woken by the poke finds
+            // the evicted task already on its run queue and retires it in that same dispatch pass). A
+            // parked task reaches neither SKILL-1 boundary on its own; without this the request stays
+            // armed forever and the row it owns is immortal. See `futex_wake_killed`.
+            let evicted = kill_wake_parked();
+            if evicted > 0 {
+                serial_println!(
+                    "[killbound] kill tid={} asid={} — {} task(s) evicted from a kernel wait to reach the boundary",
+                    tid, asid, evicted
+                );
+            }
+            for cpu in 0..NUM_CPUS {
+                if ONLINE_MASK[cpu].load(Ordering::Acquire) {
+                    poke_cpu(cpu);
+                }
+            }
+            return Some(KillTicket { idx: i });
+        }
+    }
+    None
+}
+
+/// Has the target of `ticket` provably retired? `true` means it is off every CPU, its address-space
+/// slot is torn down, and it will never execute again — the precondition for reclaiming its resources.
+pub fn kill_confirmed(ticket: &KillTicket) -> bool {
+    KILLS[ticket.idx].state.load(Ordering::Acquire) == KILL_DONE
+}
+
+/// Surrender a CONFIRMED ticket, returning the slot to the pool.
+pub fn kill_release(ticket: KillTicket) {
+    debug_assert_eq!(
+        KILLS[ticket.idx].state.load(Ordering::Acquire),
+        KILL_DONE,
+        "kill_release on an unconfirmed ticket"
+    );
+    KILLS[ticket.idx].tid.store(0, Ordering::Release);
+    KILLS[ticket.idx].asid.store(0, Ordering::Release);
+    KILLS[ticket.idx].state.store(KILL_FREE, Ordering::Release);
+}
+
+/// RETRACT a request whose target turns out to be already gone — the requester has independently observed
+/// that nothing is left alive to kill (for `run_user_image`: the `Proc` row reached `PEXITED` and the slot
+/// holds no live threads). Without this, a request armed in the sampling gap between "row reads PRUNNING"
+/// and `kill` — during which the task can complete its entire `SYS_EXIT` — could never be settled by
+/// anyone, and four such leaks would exhaust the table for the rest of the boot.
+///
+/// CAS from `KILL_PENDING`, never a blind store: a retirement may be settling this very slot concurrently.
+/// If the CAS fails the state is `KILL_DONE` (the kill landed after all) and the slot is freed anyway —
+/// either way it returns to the pool exactly once.
+pub fn kill_retract(ticket: KillTicket) {
+    if KILLS[ticket.idx]
+        .state
+        .compare_exchange(KILL_PENDING, KILL_FREE, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        let _ = KILLS[ticket.idx].state.compare_exchange(
+            KILL_DONE,
+            KILL_FREE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+}
+
+/// Surrender an UNCONFIRMED ticket: the requester's bounded wait expired. The request stays ARMED — the
+/// task is still owed its death and will take it at its next boundary — and the slot is freed by
+/// `kill_settle` when that finally happens. The caller has already fallen back to PORPHANED.
+///
+/// WHICH TARGETS CAN HOLD A SLOT FOREVER — the honest limits of a boundary-driven kill:
+///   * ~~A task blocked on a wake that never comes~~ — **CLOSED by KILLBOUND.** This was the real bug,
+///     not a theoretical limit: a task parked on a futex nobody wakes is in neither a run queue nor on a
+///     CPU, so neither arm saw it, and the operator's `kill` reported "armed but unconfirmed" forever
+///     (P60, a `bg`'d vug whose worker threads never spawned and whose frame barrier therefore blocked in
+///     `futex_wait` before its first present). It is now closed from BOTH sides: `Semaphore::wait` and
+///     `futex_wait` test the armed-kill flag before parking, and `kill` evicts already-parked targets via
+///     `kill_wake_parked`. The lock-order objection recorded here was WRONG — the eviction takes exactly
+///     the lock `futex_wake`/`Semaphore::post` already take, in the same order, and calls `make_ready`
+///     outside it; the park-side handoff releases that lock from the scheduler, so a requester spinning
+///     on it always makes progress.
+///   * A task that **never reaches any boundary at all** — no yield, no syscall, and no timer (the QEMU
+///     case; on metal the quantum tick always arrives). This one is genuine and remains.
+/// Both are bounded and visible rather than silent: the table is four entries, and the exhaustion that
+/// results is witnessed once per boot by the caller (`KILL_EXHAUSTED`). Every OTHER path returns its slot
+/// — a confirmed kill via `kill_release`, a detached-then-landed kill inline in `kill_settle`, and a
+/// request armed against an already-dead task via the requester's own post-arm re-check.
+pub fn kill_detach(ticket: KillTicket) {
+    let _ = KILLS[ticket.idx].state.compare_exchange(
+        KILL_PENDING,
+        KILL_DETACHED,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ); // a DONE slot lost the race (the task died just now) — leave it for the owner-less free below
+    if KILLS[ticket.idx].state.load(Ordering::Acquire) == KILL_DONE {
+        KILLS[ticket.idx].tid.store(0, Ordering::Release);
+        KILLS[ticket.idx].asid.store(0, Ordering::Release);
+        KILLS[ticket.idx].state.store(KILL_FREE, Ordering::Release);
+    }
+}
+
+/// SPINHUNT — the sentinel `tid` an ORPHAN-REAP request is armed with. Task ids are handed out by a
+/// monotone counter that starts at 1, so `u64::MAX` can never name a live task: the request therefore
+/// matches purely on its ASID, which is exactly its scope (every sibling thread of a dead leader).
+const ORPHAN_KILL_TID: u64 = u64::MAX;
+
+/// SPINHUNT — arm an OWNER-LESS, address-space-scoped kill against everything still alive under `asid`.
+///
+/// THE HOLE THIS CLOSES. `SYS_THREAD_SPAWN` gives an EL0 process several tasks under one slot, and
+/// `boot::slot_thread_retain` keeps that slot alive until the LAST of them exits. Nothing in the kernel
+/// ever made the last one exit. When a leader called `SYS_EXIT` without joining its workers — which is
+/// not a userspace bug but the DOCUMENTED VUGGUARD path, since joining a worker that is not answering
+/// would park the parent forever — the workers simply kept running. A worker whose release signal is a
+/// yield-poll (`user-vug`'s `uvug_worker`, and any barrier of that shape) then burns its pinned core at
+/// 100% for the rest of the boot against a parent that no longer exists.
+///
+/// AND IT IS SELF-SEALING WITHOUT THIS. The orphan holds a `THREAD_TABLE` row, and KILLBOUND's scavenge
+/// of that table is gated on `ASID_GEN[owner]` having been bumped — which happens on the slot's 1->0
+/// teardown edge, which requires the last thread under the slot to exit, which is the very thing the
+/// orphan will never do. So the leak is permanent by construction: the row is unreclaimable, the slot is
+/// unrecyclable, and the core stays pegged. Exactly the sustained one-core load with a clean `jobs`
+/// table (the leader's `Proc` row IS reaped; an orphaned worker never had one) that P61 observed.
+///
+/// WHY THE EXISTING MACHINERY, AND WHY DETACHED. `kill(_, asid)` is already address-space scoped: every
+/// sibling is matched by the one request at its own next boundary (an EL0 syscall — a yield-polling
+/// worker reaches one every pass — or a preemption on metal), and `kill_settle` withholds settlement
+/// while any sibling is still live. But there is no requester here to confirm to and none to hand the
+/// slot back: the leader is on its way into `exit()`. So the ticket is DETACHED immediately, which is
+/// the owner-less path `kill_settle` already implements — `kill_slot_for` still matches a `KILL_DETACHED`
+/// request, and the LAST orphan out CASes the slot `KILL_DETACHED -> KILL_FREE` inline. The request
+/// therefore returns to the four-entry pool exactly once, with nobody holding it.
+///
+/// QUIESCENCE IS PRESERVED, NOT WEAKENED. Nothing is reclaimed here. Each orphan retires through its own
+/// `exit()`/`retire_killed`, decrementing `SLOT_REFCOUNT` itself; only when that reaches zero does
+/// `teardown_user_slot` bump `ASID_GEN`, and only then does the KILLBOUND scavenge consider the row dead.
+/// This fix makes that edge REACHABLE; it does not move it earlier.
+///
+/// Returns `true` if a request was armed. `false` means the four-entry table is full — the honest,
+/// bounded failure the caller must WITNESS rather than paper over (the orphans then live on until some
+/// later kill happens to name their ASID, exactly as before this fix).
+pub fn orphan_kill(asid: u64) -> bool {
+    if asid == 0 {
+        return false;
+    }
+    match kill(ORPHAN_KILL_TID, asid) {
+        Some(ticket) => {
+            // Surrender it at once: the request stays ARMED (`KILL_DETACHED` matches in
+            // `kill_slot_for`) and frees itself when the last orphan under this ASID retires.
+            kill_detach(ticket);
+            true
+        }
+        None => false,
+    }
+}
+
+/// ON-CPU kill boundary. If the task running on THIS core has been killed, retire it here and now —
+/// `exit()` never returns, which is exactly what the M6b EL0 fault-kill path already does from the
+/// synchronous exception handler. No-op (and just four relaxed loads) otherwise.
+///
+/// Callers must be at a point where switching away for good is safe: IRQ-masked, on the task's own
+/// kernel stack, holding no scheduler lock. `timer_preempt`, `yield_now` and the SVC dispatcher all
+/// qualify — each already tolerates a `switch_context` that may never come back.
+pub fn kill_check_current() {
+    let cpu = percpu::this_cpu().cpu_index as usize;
+    let raw = SCHED[cpu].current.load(Ordering::Acquire) as *const Task;
+    if raw.is_null() {
+        return;
+    }
+    let (id, ttbr0) = unsafe { ((*raw).id, (*raw).user_ttbr0) };
+    if kill_slot_for(id, ttbr0).is_some() {
+        exit();
+    }
+}
+
+/// OFF-CPU kill boundary: retire `task` from the scheduler's own context, without ever switching into
+/// it. Mirrors `exit()`'s teardown — slot teardown first (it repoints THIS core's TTBR0 off the dead root
+/// before the ASID is flushed), then the joiner signal, then the Box drop that frees the kernel stack —
+/// and settles the kill slot LAST.
+///
+/// ORDERING NOTE (the two arms differ, deliberately): here the kernel stack is already freed when
+/// `KILL_DONE` is published, because the scheduler owns the Box and can drop it outright. The `exit()` arm
+/// cannot — it is still executing ON that stack — so there the confirmation is published with the state
+/// store and the final `switch_context` still to come, and the stack is freed a moment later by whichever
+/// core reclaims the Box. The guarantee both arms actually make, and the only one a requester may rely on,
+/// is: **the address-space slot is torn down, the joiner is released, and the task will never execute
+/// again.** Kernel-stack reclamation is scheduler-internal and is NOT part of the confirmation contract.
+fn retire_killed(idx: usize, task: Box<Task>) {
+    let tid = task.id;
+    let ttbr0 = task.user_ttbr0;
+    // M6d: the same slot retirement `exit()` performs, executed on the scheduler stack. Legal here for
+    // the same reason it is legal there — the kernel half of every root is Global and identical, so
+    // repointing TTBR0 to the boot root pulls nothing out from under the running (scheduler) context.
+    #[cfg(feature = "baremetal")]
+    {
+        let asid = task.user_ttbr0 >> 48;
+        if asid != 0 {
+            unsafe { super::boot::teardown_user_slot(asid) };
+        }
+    }
+    // Release any joiner: a killed task must not leave a `JoinHandle` blocked forever. Same single-post
+    // discipline as `exit()` — borrow, never move, so the Box's own Arc keeps the semaphore alive.
+    if let Some(sem) = &task.done_sem {
+        sem.post();
+    }
+    task.state.store(STATE_FINISHED, Ordering::Release);
+    drop(task); // frees the kernel stack
+    // Drop this task out of its slot's live count, then settle — which withholds the confirmation while
+    // sibling threads of the same address space are still alive (they are caught by this same request).
+    let remaining = asid_thread_leave(ttbr0);
+    kill_settle(idx, tid, remaining);
+}
+
 /// Terminate the current task: mark it finished and switch to the scheduler for good (which frees
 /// its stack). Never returns; called automatically when a task's entry returns.
 pub fn exit() -> ! {
@@ -803,6 +1750,31 @@ pub fn exit() -> ! {
             if asid != 0 {
                 super::boot::teardown_user_slot(asid);
             }
+        }
+        // Signal completion to any joiner — the SINGLE post point for `done_sem`, covering BOTH a kernel
+        // thread's normal `entry` return (via `task_trampoline`) and an EL0 thread's `SYS_THREAD_EXIT`
+        // (ELF-2), which reaches `exit()` directly from the syscall handler. BORROW `done_sem` (never move
+        // it): the Box's own Arc clone is this `post()`'s liveness anchor and must stay in the Box until the
+        // scheduler drops it on the Finished path — strictly AFTER this post (we `switch_context` away just
+        // below; the scheduler then reclaims and drops the Box). Only joinable spawns set `done_sem`; every
+        // other task carries `None`, so this is a no-op for them (byte-identical to the pre-ELF-2 path).
+        if let Some(sem) = &(*raw).done_sem {
+            sem.post();
+        }
+        // SKILL-1: drop this task out of its address space's live-thread count — on EVERY exit path, not
+        // just the killed one, or the count drifts and a later ASID-scoped kill would never confirm.
+        let remaining = asid_thread_leave((*raw).user_ttbr0);
+        // Settle any kill request naming this task (by tid, or by ASID for a whole-process kill). Placed
+        // HERE — after the slot teardown and the joiner post, with only the state store and the final
+        // switch left.
+        //
+        // ORDERING (asymmetric with the off-CPU arm, deliberately — see `retire_killed`): this task is
+        // still executing on its own kernel stack, so that stack is NOT yet freed when `KILL_DONE` is
+        // published; the scheduler reclaims the Box a moment later, after the `switch_context` below.
+        // What IS guaranteed at this point — and all the requester's contract claims — is that the
+        // address-space slot is retired, the joiner is released, and this task will never execute again.
+        if let Some(idx) = kill_slot_for((*raw).id, (*raw).user_ttbr0) {
+            kill_settle(idx, (*raw).id, remaining);
         }
         (*raw).state.store(STATE_FINISHED, Ordering::Release);
         // `old_sp` is a throwaway on the dying stack — the scheduler never reads it back and never
@@ -858,11 +1830,22 @@ pub fn timer_preempt() {
     if !SCHED_ACTIVE.load(Ordering::Acquire) {
         return;
     }
+    // SCHED-2: drive the periodic load heartbeat off the per-core timer tick (metal-only — QEMU never
+    // reaches here). Placed before the current-null return so an idle-but-ticking core still advances
+    // the aggregate cadence; the emit itself is change-only and single-core per window (see the fn).
+    load_witness_tick();
     let cpu = percpu::this_cpu().cpu_index as usize;
     let raw = SCHED[cpu].current.load(Ordering::Acquire) as *mut Task;
     if raw.is_null() {
         return; // scheduler/idle context, or an unscheduled core (the BSP)
     }
+    // SKILL-1 on-CPU kill boundary — the load-bearing one. The quantum tick is the ONLY involuntary
+    // boundary a spinning EL0 task ever reaches (it makes no syscalls and never yields), so this is what
+    // turns "parked PORPHANED but still burning a core at 100%" into an actual death. Checked BEFORE the
+    // quantum countdown so a killed task dies at the very next tick rather than at its next full quantum.
+    // Never returns if this task has been killed; the abandoned IRQ frame is harmless — EOI already ran
+    // (see `gic::handle_irq`) and the stack it sits on is freed with the task's Box.
+    kill_check_current();
     let remaining = SCHED[cpu].quantum.load(Ordering::Relaxed);
     if remaining > 1 {
         SCHED[cpu].quantum.store(remaining - 1, Ordering::Relaxed);
@@ -884,6 +1867,10 @@ pub fn timer_preempt() {
 /// scheduler on its own stack); on an empty queue IRQ is left UNMASKED for the caller to idle.
 fn dispatch_next(cpu: usize) -> bool {
     mask_irq();
+    // SCHED-7: start each pass with no busy span recorded; the busy branch below overwrites this with
+    // the task's measured execution span. An empty pass leaves it 0, so `run()` folds the whole pass
+    // (drain + this empty dispatch + the following WFI/poll-spin) in as idle.
+    PASS_BUSY_CYC[cpu].store(0, Ordering::Relaxed);
     // AARCH64-PRIO — age then pick, under ONE run-queue lock acquisition. Count this dispatch pass
     // (the aging clock) and, ~every AGING_INTERVAL passes, run the anti-starvation sweep BEFORE the
     // pop so a long-waiting task cannot be dispatched before it is aged in the same pass. The sweep
@@ -901,10 +1888,27 @@ fn dispatch_next(cpu: usize) -> bool {
     };
     let Some(task) = next else {
         CPU_IDLE[cpu].fetch_add(1, Ordering::Relaxed); // M3b CPU-pulse meter (introspection)
+        // SCHED-5: idle TIME is measured at the WFI in `run()` (the span the core actually sleeps), not
+        // here — this empty pass itself takes negligible time and returns straight to the idle loop.
         unmask_irq();
         return false;
     };
+    // SKILL-1 OFF-CPU kill boundary. A killed task is retired HERE — after the pop (so it is off every
+    // run queue), before the switch (so it never executes another instruction) and before any accounting
+    // (a task that does not run is not a dispatch). This is the arm that needs no cooperation from the
+    // target at all, and it covers ready, sleeping and wait-queued tasks alike: they all come back
+    // through a dispatch. IRQ is masked and the run-queue lock was dropped above, so the teardown inside
+    // is on the same footing as `exit()`'s. Returning `true` re-enters the loop for a real pass.
+    if let Some(idx) = kill_slot_for(task.id, task.user_ttbr0) {
+        retire_killed(idx, task);
+        return true; // leaves IRQ MASKED, exactly like the ordinary busy return below
+    }
     CPU_BUSY[cpu].fetch_add(1, Ordering::Relaxed); // M3b CPU-pulse meter (introspection)
+    // SCHED-2/SCHED-5: busy dispatch — one context switch into a task; record it + the last-task
+    // identity. The task's EXECUTION TIME is folded into the window AFTER `switch_context` returns
+    // (below), when the elapsed CNTPCT span is known. Single-writer (this core), relaxed; no lock added.
+    ACCT[cpu].ctx_switches.fetch_add(1, Ordering::Relaxed);
+    ACCT[cpu].note_last(task.id, task.name);
     task.state.store(STATE_RUNNING, Ordering::Release);
     SCHED[cpu].quantum.store(QUANTUM_TICKS, Ordering::Relaxed);
     let raw = Box::into_raw(task);
@@ -933,14 +1937,24 @@ fn dispatch_next(cpu: usize) -> bool {
             }
         }
     }
+    // SCHED-5: bracket the task's execution with a CNTPCT read. The span from here to the switch-back
+    // is exactly the wall-clock time this core spent running the dispatched task (plus any IRQ handling
+    // that fired while it ran) — the "busy" time for time-based load accounting. Two sysreg reads per
+    // dispatch, off the per-instruction path.
+    let busy_t0 = now_cyc();
     unsafe {
         switch_context(SCHED[cpu].scheduler_sp.as_ptr(), entry_sp);
     }
+    let busy_cyc = now_cyc().wrapping_sub(busy_t0);
     // The switch-back always lands IRQ-masked (yield_now/exit mask first; timer_preempt runs in the
     // auto-masked IRQ handler), so the Box reclaim below can't race a re-entrant preempt on this
     // core. Re-assert the mask explicitly so that safety doesn't rest on an inherited DAIF that a
     // future switch-in path could leave enabled.
     mask_irq();
+    ACCT[cpu].account(busy_cyc, 0); // fold this task's execution span into the rolling load window
+    // SCHED-7: publish this pass's busy span so `run()` can subtract it from the pass's total wall
+    // span and fold the remainder (scheduler overhead, then the WFI/poll-spin) in as idle.
+    PASS_BUSY_CYC[cpu].store(busy_cyc, Ordering::Relaxed);
     SCHED[cpu].current.store(0, Ordering::Release);
     // Consume the park action exactly once: read it and immediately reset to NONE, so a stale action
     // can never leak into the next task's switch-back. Only a task that switched back BLOCKED carries
@@ -1055,9 +2069,122 @@ pub fn run_until_empty(cpu: usize) {
     while dispatch_next(cpu) {}
 }
 
+// ---------------------------------------------------------------------------------------------
+// SMP-BAL — work stealing: an idle core pulls a steal-eligible task off the most-loaded core
+// ---------------------------------------------------------------------------------------------
+//
+// Placement (`pick_cpu`, SCHED-3) balances at SPAWN, but a task's cost is not known then and wake
+// bursts pile work unevenly AFTER placement (the metal P45 sighting: cores 1-3 "sort of" work but
+// never balance). Stealing is the runtime correction: whenever a core finds its own run queue empty
+// (in `run`), it looks for the most-loaded OTHER core and pulls ONE of its steal-eligible ready tasks
+// over, so backlog drains onto idle silicon instead of waiting behind a saturated core's queue.
+//
+// Protocol (provably race-free against the existing per-core run-queue spinlocks):
+//   1. VICTIM SELECT (lock-free peek): scan online cores != self, pick the one with the deepest run
+//      queue whose depth is >= STEAL_MIN_DEPTH. The floor leaves the last task at home (no ping-pong: a
+//      core with a single task keeps it) and means we only ever move genuine backlog.
+//   2. STEAL (under the victim's lock ONLY): re-read depth (it may have drained since the peek) and, if
+//      still >= the floor, `steal_one()` — remove the first steal-eligible ready task. Pinned tasks are
+//      skipped. The lock is released before we touch our own queue, so only ONE run-queue lock is ever
+//      held at a time — no lock-ordering hazard, no deadlock.
+//   3. RE-HOME (we exclusively own the popped Box): retarget `task.cpu` to self so a later wake returns
+//      it here (the no-migrate invariant is preserved for its NEW home), then push onto our own queue.
+// Soundness: a task sitting in a run queue is always `STATE_READY` (running → out in `current`; blocked
+// → in a wait/sleeper list), and both queues are touched only under their own lock with IRQ masked, so
+// the steal can never race the victim's own `dispatch_next`/`push` or observe a half-built task. Only an
+// idle core steals, and it steals at most one task per empty pass, so it self-limits.
+
+/// Minimum victim run-queue depth to steal from. `2` leaves the last ready task at its home core (a core
+/// with one task is not "loaded"), which prevents two idle cores from ping-ponging a lone task.
+const STEAL_MIN_DEPTH: usize = 2;
+
+/// SMP-BAL — rate limit for the `[smpbal] steal` witness: emit the first `STEAL_LOG_MAX` steals then go
+/// quiet, so a steady rebalancing workload cannot flood the serial log. Introspection only.
+#[cfg(feature = "pi")]
+const STEAL_LOG_MAX: u32 = 12;
+#[cfg(feature = "pi")]
+static STEAL_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// SMP-BAL — an idle `cpu` (empty local queue) tries to steal ONE steal-eligible ready task from the
+/// most-loaded online core. Returns `true` if a task was moved onto `cpu`'s queue (the caller then loops
+/// and dispatches it), `false` if there was nothing worth stealing. IRQ-masked throughout (matching the
+/// run-queue lock contract); acquires at most one run-queue lock at a time.
+fn try_steal(cpu: usize) -> bool {
+    mask_irq();
+    // 1. Peek for the deepest OTHER online queue at/above the floor (lock-free length reads).
+    let mut victim: Option<usize> = None;
+    let mut best_depth = STEAL_MIN_DEPTH - 1;
+    for c in 0..NUM_CPUS {
+        if c == cpu || !ONLINE_MASK[c].load(Ordering::Acquire) {
+            continue;
+        }
+        let depth = RUN_QUEUES[c].lock().len();
+        if depth > best_depth {
+            best_depth = depth;
+            victim = Some(c);
+        }
+    }
+    let Some(v) = victim else {
+        unmask_irq();
+        return false;
+    };
+    // 2. Steal under the victim's lock only (re-check depth — it may have drained since the peek).
+    let stolen = {
+        let mut vq = RUN_QUEUES[v].lock();
+        if vq.len() < STEAL_MIN_DEPTH {
+            None
+        } else {
+            vq.steal_one()
+        }
+    };
+    let Some(mut task) = stolen else {
+        unmask_irq();
+        return false;
+    };
+    // 3. Re-home onto this core and enqueue (we exclusively own the Box here).
+    let name = task.name;
+    task.cpu = cpu as u32;
+    RUN_QUEUES[cpu].lock().push(task);
+    // Rate-limited steal witness (pi-gated: fires on the target + kernel8-test, byte-identical elsewhere).
+    #[cfg(feature = "pi")]
+    if STEAL_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < STEAL_LOG_MAX {
+        serial_println!(":: [smpbal] steal '{}' c{}->c{} ::", name, v, cpu);
+    }
+    #[cfg(not(feature = "pi"))]
+    let _ = name;
+    unmask_irq();
+    true
+}
+
+/// SMP-BAL — the BSP's entry into the scheduler, after it finishes its one-time boot duties (service
+/// spawn + deferred USB enumerate). Mirrors the APs' `wait_and_run`→`run`, minus the `SCHED_GO` wait (the
+/// BSP is the core that SET `SCHED_GO` in `start_aps`, so scheduling is already live). Registers core 0
+/// as an online, scheduling core (so `CPU_AUTO` placement and stealing may use it) and enters the loop;
+/// never returns. Replaces the historical `hlt_loop()` the Pi/tegra BSP parked in.
+///
+/// Why this is safe (the "BSP never schedules" invariants audited):
+///   * MMU/percpu/vectors: all installed on the BSP long before it reaches here (boot path).
+///   * GIC/IRQ routing: distributor config is BSP-only and already done; the PL011 RX SPI is routed to
+///     the input core, not core 0. The BSP running scheduled tasks adds no distributor state.
+///   * ms-clock: the BSP's periodic timer IRQ still runs its tick bookkeeping BEFORE `timer_preempt`, so
+///     the global clock keeps advancing whether or not a task is preempted on core 0.
+///   * meter sentinel: the `c0 = --` display is `tracked()` returning false because core 0 never folded a
+///     load span. Once core 0 runs this loop it folds a busy/idle span every pass → `tracked()` true →
+///     the `SCHED: load` line and `top` show core 0's REAL utilization (the P45 `c0 = --` artifact heals).
+///   * only steal-eligible KERNEL tasks (`CPU_AUTO`) can land on core 0 (via placement or steal); pinned
+///     EL0/render/input tasks never do, so no ASID-0/per-core-window assumption is disturbed.
+pub fn run_bsp(cpu: usize) -> ! {
+    mark_online(cpu);
+    run(cpu)
+}
+
 /// The APs' scheduler loop: dispatch ready tasks forever, idling (WFI on metal / poll in QEMU, via
 /// `arch::hlt`) when the queue is empty until the timer/an IPI makes work. Never returns.
 fn run(cpu: usize) -> ! {
+    // SCHED-7: the wall-clock anchor for time-based load accounting. Every cycle between one pass's
+    // anchor and the next is either a task's EXECUTION span (folded in as busy by `dispatch_next`) or
+    // the core AWAITING work (WFI, poll-spin, sleeper drain, run-queue management) — which is idle.
+    let mut t_prev = now_cyc();
     loop {
         // Wake any sleepers whose deadline has passed (IRQ masked, matching the switch-back critical
         // section); `make_ready` pushes them onto THIS CPU's own run queue so the dispatch below
@@ -1068,8 +2195,30 @@ fn run(cpu: usize) -> ! {
         mask_irq();
         drain_due_sleepers(cpu);
         if !dispatch_next(cpu) {
-            crate::arch::hlt();
+            // SMP-BAL: local queue is empty — before parking, try to pull a steal-eligible task off the
+            // MOST-loaded core (work redistribution). A successful steal enqueues onto THIS core, so we
+            // loop straight back and `dispatch_next` runs it; nothing is parked. This is what lets an
+            // idle core (incl. the BSP once it runs `run_bsp`) drain a saturated core's backlog. Only an
+            // idle core ever steals, so it never competes with useful local work.
+            if !try_steal(cpu) {
+                // Nothing to steal either: park until the next tick/IPI — WFI on metal, a light poll-spin
+                // in QEMU (no Group-1 timer). This span is idle; it is folded in below along with the
+                // rest of the pass, so it does not matter whether WFI actually sleeps or returns at once.
+                crate::arch::hlt();
+            }
         }
+        // SCHED-7: fold EVERY cycle this pass did NOT spend executing a task in as IDLE — the whole
+        // pass span (`t_prev`→now) minus the busy span `dispatch_next` already accounted. This closes
+        // the phantom-100% hole: the old code bracketed ONLY the explicit WFI, so on a core whose WFI
+        // returns near-instantly (a peripheral IRQ pending on that core — the input/render cores) or
+        // that spins the empty-queue loop between infrequent micro-wakes, the drain + empty passes +
+        // instant-return WFI were UNACCOUNTED, and the only cycles ever landing in the window were the
+        // micro busy spans → a steady phantom 100%. Measuring wall-minus-busy makes busy% ==
+        // (task-execution / wall-time): ~0 for a provably-idle workload, ~100 for a CPU-bound one.
+        let t_now = now_cyc();
+        let busy = PASS_BUSY_CYC[cpu].swap(0, Ordering::Relaxed);
+        ACCT[cpu].account(0, t_now.wrapping_sub(t_prev).saturating_sub(busy));
+        t_prev = t_now;
     }
 }
 
@@ -1259,6 +2408,19 @@ impl Semaphore {
             return false;
         }
 
+        // KILLBOUND — the PRE-PARK kill boundary. A parked task is in neither a run queue nor any
+        // core's `current`, so NEITHER of SKILL-1's boundaries can reach it: parking here with a kill
+        // already armed would make the task permanently unkillable (see `kill_detach`'s limits note).
+        // The wait's own predicate is the right place to test the flag, and this call site qualifies as
+        // a kill boundary for exactly the reasons `kill_check_current`'s do — IRQ-masked, on the task's
+        // own kernel stack. RELEASE the raw lock first: `exit()` never returns, and a lock held across
+        // it would wedge every future waiter/poster on this semaphore.
+        let (id, ttbr0) = unsafe { ((*raw).id, (*raw).user_ttbr0) };
+        if kill_slot_for(id, ttbr0).is_some() {
+            self.unlock_raw();
+            exit(); // diverges
+        }
+
         // The lock is held continuously until the scheduler pushes, so the length cannot change
         // before then; asserting it here proves the park-side push won't reallocate.
         assert!(
@@ -1305,6 +2467,329 @@ impl Semaphore {
         }
         irq_restore(daif);
     }
+
+    /// KILLBOUND — the POST-PARK half: evict every waiter on this semaphore that an ARMED kill names,
+    /// and re-ready it so it reaches the off-CPU dispatch boundary (where `dispatch_next` retires it
+    /// before it can execute another instruction). Returns how many were evicted.
+    ///
+    /// The pre-park check in `wait` closes "kill armed, then park"; this closes "park, then kill" —
+    /// the operator case, where the app has been sitting at its barrier for minutes before anyone
+    /// types `kill`. Together they make the property total: an armed kill always reaches its target.
+    ///
+    /// NO PERMIT IS HANDED OVER (unlike `post`), and that is sound only because an evicted task
+    /// provably never resumes: the request that matched it cannot be cleared while it is alive
+    /// (`kill_release` needs `KILL_DONE`, i.e. the target retired; `kill_settle` withholds that while
+    /// `asid_thread_leave` still counts this task; `kill_retract` is only reachable once the requester
+    /// has independently observed the target dead). So the task is retired at its next dispatch,
+    /// having executed nothing — it never returns from `wait` to act on a permit it does not hold.
+    ///
+    /// `make_ready` is called with the raw lock RELEASED, the same rule `post` follows (the run-queue
+    /// lock must never nest under this one).
+    pub fn wake_killed(&self) -> u32 {
+        let daif = irq_save_mask();
+        let mut evicted = 0u32;
+        loop {
+            self.lock_raw();
+            let found = unsafe {
+                let q = &mut *self.waiters.get();
+                q.iter()
+                    .position(|t| kill_slot_for(t.id, t.user_ttbr0).is_some())
+                    .and_then(|i| q.remove(i))
+            };
+            self.unlock_raw();
+            match found {
+                Some(task) => {
+                    make_ready(task);
+                    evicted += 1;
+                }
+                None => break,
+            }
+        }
+        irq_restore(daif);
+        evicted
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// ELF-3: futex — a physical-address-keyed EL0 wait/wake primitive (backs SYS_FUTEX)
+// ---------------------------------------------------------------------------------------------
+//
+// A futex lets EL0 build a userspace mutex/condvar: block on a u32 user word iff it still holds an
+// expected value, and wake N blocked waiters. The KEY is the word's PHYSICAL address — globally unique,
+// so the threads of one process (same slot backing frame) that share a word key on the same bucket, and
+// two different processes never collide. Bucket selection reuses the exact Semaphore lock-handoff park
+// (PARK_WAITQ): the blocking task holds the bucket lock across the switch, the scheduler pushes its Box
+// then releases the lock — lost-wakeup-safe. A small fixed pool of buckets (one per live key); the ELF-3
+// test uses ONE. `-EAGAIN`-equivalent (TableFull) when every bucket is serving a different live key.
+
+/// Distinct futex keys the kernel can have waiters parked on at once (never grown — same discipline as
+/// the thread/proc tables).
+const NFUTEX: usize = 16;
+
+/// One futex wait bucket: a keyed FIFO wait queue with a Semaphore-style raw lock handed to the scheduler.
+struct FutexBucket {
+    /// Raw spinlock guarding `key` + `waiters` (Acquire on lock, Release on unlock; the PARK_WAITQ
+    /// lock-handoff releases it AFTER the scheduler pushes the blocking Box).
+    locked: AtomicBool,
+    /// The physical-address key this bucket serves, or 0 = free. Claimed on the first waiter for a key,
+    /// released back to 0 when its last waiter leaves.
+    key: AtomicU64,
+    /// FIFO waiter list; touched only under `locked`, pre-reserved by `futex_init`.
+    waiters: UnsafeCell<VecDeque<Box<Task>>>,
+}
+
+// SAFETY: every access to `key`/`waiters` is serialised by `locked`; identical argument to `Semaphore`.
+unsafe impl Sync for FutexBucket {}
+
+impl FutexBucket {
+    const fn new() -> Self {
+        FutexBucket {
+            locked: AtomicBool::new(false),
+            key: AtomicU64::new(0),
+            waiters: UnsafeCell::new(VecDeque::new()),
+        }
+    }
+    #[inline]
+    fn lock_raw(&self) {
+        while self.locked.swap(true, Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
+    }
+    #[inline]
+    fn unlock_raw(&self) {
+        self.locked.store(false, Ordering::Release);
+    }
+    #[inline]
+    fn waiters_empty(&self) -> bool {
+        unsafe { (*self.waiters.get()).is_empty() }
+    }
+}
+
+static FUTEX: [FutexBucket; NFUTEX] = [const { FutexBucket::new() }; NFUTEX];
+
+/// Reserve every futex bucket's waiter capacity on the BSP before any task can park on one (so the
+/// scheduler's park-side `push_back` never reallocates under the held lock). Call once at boot / before
+/// the first `futex_wait`.
+pub fn futex_init() {
+    for b in FUTEX.iter() {
+        b.lock_raw();
+        unsafe { (*b.waiters.get()).reserve(WAIT_CAPACITY) };
+        b.unlock_raw();
+    }
+}
+
+/// Outcome of `futex_wait`.
+pub enum FutexWait {
+    /// Was blocked, then woken by a `futex_wake` on the same key.
+    Woken,
+    /// `*uaddr != expected` at the compare — the caller must re-check and loop (no sleep happened).
+    Mismatch,
+    /// Every bucket is busy with a different live key — the futex pool is exhausted.
+    TableFull,
+    /// Called off a scheduled task (no `current` to park) — cannot block.
+    NoTask,
+}
+
+/// FUTEX_WAIT: block the current task on `key` iff the u32 at `uaddr` still equals `expected`. The compare
+/// is performed UNDER the bucket lock, and any `futex_wake(key, ..)` must take that same lock, so a wake
+/// can never slip between the compare and the park being enqueued (the classic race-free compare-and-block).
+/// `key` MUST be the physical address of `uaddr`. `uaddr` must already be validated (in the caller's user
+/// window) by the syscall layer; this reads it at EL1 (the syscall runs with the caller's TTBR0 live).
+pub fn futex_wait(key: u64, uaddr: u64, expected: u32) -> FutexWait {
+    debug_assert!(key != 0, "futex key must be non-zero");
+    let daif = irq_save_mask();
+    // Select the bucket: an existing one for this key, else claim a free one. Left LOCKED on success.
+    let mut chosen: Option<&FutexBucket> = None;
+    for b in FUTEX.iter() {
+        b.lock_raw();
+        if b.key.load(Ordering::Relaxed) == key {
+            chosen = Some(b);
+            break;
+        }
+        b.unlock_raw();
+    }
+    let b = match chosen {
+        Some(b) => b,
+        None => {
+            let mut claimed = None;
+            for b in FUTEX.iter() {
+                b.lock_raw();
+                if b.key.load(Ordering::Relaxed) == 0 {
+                    b.key.store(key, Ordering::Relaxed);
+                    claimed = Some(b);
+                    break;
+                }
+                b.unlock_raw();
+            }
+            match claimed {
+                Some(b) => b,
+                None => {
+                    irq_restore(daif);
+                    return FutexWait::TableFull;
+                }
+            }
+        }
+    };
+    // b is locked and serves `key`. Compare-and-block under the lock.
+    let cur = unsafe { core::ptr::read_volatile(uaddr as *const u32) };
+    if cur != expected {
+        if b.waiters_empty() {
+            b.key.store(0, Ordering::Relaxed); // release a bucket we claimed but won't park on
+        }
+        b.unlock_raw();
+        irq_restore(daif);
+        return FutexWait::Mismatch;
+    }
+    let cpu = percpu::this_cpu().cpu_index as usize;
+    let raw = SCHED[cpu].current.load(Ordering::Acquire) as *mut Task;
+    if raw.is_null() {
+        if b.waiters_empty() {
+            b.key.store(0, Ordering::Relaxed);
+        }
+        b.unlock_raw();
+        irq_restore(daif);
+        return FutexWait::NoTask;
+    }
+    // KILLBOUND — the PRE-PARK kill boundary; the `Semaphore::wait` twin, and the one that matters
+    // most in anger: the frame barrier of a windowed EL0 app (`user-vug`) blocks HERE, and a task
+    // parked in a futex bucket is invisible to both SKILL-1 boundaries. Release the bucket (dropping
+    // the key if we claimed it and are not going to park on it) before the never-returning `exit()`.
+    if kill_slot_for(unsafe { (*raw).id }, unsafe { (*raw).user_ttbr0 }).is_some() {
+        if b.waiters_empty() {
+            b.key.store(0, Ordering::Relaxed);
+        }
+        b.unlock_raw();
+        exit(); // diverges
+    }
+    assert!(
+        unsafe { (*b.waiters.get()).len() } < WAIT_CAPACITY,
+        "futex waiter overflow (raise WAIT_CAPACITY)"
+    );
+    unsafe {
+        debug_assert_eq!((*raw).cpu as usize, cpu, "futex_wait: task on the wrong CPU");
+        (*raw).state.store(STATE_BLOCKED, Ordering::Release);
+        // Hand the scheduler this bucket's waiter list + lock (PARK_WAITQ lock-handoff — see Semaphore::wait).
+        SCHED[cpu].park_waiters.store(b.waiters.get() as u64, Ordering::Relaxed);
+        SCHED[cpu].park_lock.store(&b.locked as *const AtomicBool as u64, Ordering::Relaxed);
+        SCHED[cpu].park_kind.store(PARK_WAITQ, Ordering::Relaxed);
+        switch_context(&raw mut (*raw).ctx_sp, SCHED[cpu].scheduler_sp.load(Ordering::Acquire));
+    }
+    // Resumed once `futex_wake` moved us back to our run queue (it released the lock).
+    irq_restore(daif);
+    FutexWait::Woken
+}
+
+/// FUTEX_WAKE: wake up to `n` waiters parked on `key`; returns the number actually woken. Releases the
+/// bucket back to free once its last waiter leaves. Waiters are re-readied OUTSIDE the bucket lock (the
+/// run-queue lock must never nest under it — same rule as `Semaphore::post`).
+pub fn futex_wake(key: u64, n: usize) -> usize {
+    debug_assert!(key != 0, "futex key must be non-zero");
+    let daif = irq_save_mask();
+    let mut woken = 0usize;
+    for b in FUTEX.iter() {
+        b.lock_raw();
+        if b.key.load(Ordering::Relaxed) != key {
+            b.unlock_raw();
+            continue;
+        }
+        while woken < n {
+            let next = unsafe { (*b.waiters.get()).pop_front() };
+            match next {
+                Some(task) => {
+                    b.unlock_raw();
+                    make_ready(task);
+                    woken += 1;
+                    b.lock_raw();
+                    // A concurrent drain may have freed + reclaimed this bucket for another key; stop.
+                    if b.key.load(Ordering::Relaxed) != key {
+                        break;
+                    }
+                }
+                None => break,
+            }
+        }
+        if b.key.load(Ordering::Relaxed) == key && b.waiters_empty() {
+            b.key.store(0, Ordering::Relaxed); // last waiter gone — release the bucket
+        }
+        b.unlock_raw();
+        break;
+    }
+    irq_restore(daif);
+    woken
+}
+
+/// KILLBOUND — the futex twin of `Semaphore::wake_killed`: evict every futex waiter that an ARMED kill
+/// names, across every bucket, and re-ready it so the off-CPU dispatch boundary retires it. Returns how
+/// many were evicted.
+///
+/// This is the load-bearing one. `user-vug`'s per-frame barrier blocks in `futex_wait` (main.rs:799-810),
+/// and when its workers are absent — the THREAD_TABLE-exhaustion chain — it blocks there FOREVER, before
+/// its first present. That task is in no run queue and is no core's `current`, so both SKILL-1 boundaries
+/// miss it, `asid_thread_leave` never runs, the ASID-scoped request is never settled, and the operator's
+/// `kill` reports "armed but unconfirmed" for the rest of the boot. Evicting it here is what turns the
+/// armed request into an actual death.
+///
+/// Same lock discipline as `futex_wake`: scan+remove under the bucket lock, `make_ready` outside it, and
+/// release a bucket whose last waiter has left so the key does not strand a pool entry.
+fn futex_wake_killed() -> u32 {
+    let daif = irq_save_mask();
+    let mut evicted = 0u32;
+    for b in FUTEX.iter() {
+        loop {
+            b.lock_raw();
+            let found = unsafe {
+                let q = &mut *b.waiters.get();
+                q.iter()
+                    .position(|t| kill_slot_for(t.id, t.user_ttbr0).is_some())
+                    .and_then(|i| q.remove(i))
+            };
+            if found.is_some() && b.waiters_empty() {
+                b.key.store(0, Ordering::Relaxed); // last waiter gone — release the bucket
+            }
+            b.unlock_raw();
+            match found {
+                Some(task) => {
+                    make_ready(task);
+                    evicted += 1;
+                }
+                None => break,
+            }
+        }
+    }
+    irq_restore(daif);
+    evicted
+}
+
+/// KILLBOUND introspection: how many tasks are parked across every futex bucket right now. Used by the
+/// `[killbound]` regression leg as a POSITIVE witness that its fixture really reached the futex park (the
+/// condition under test) before the kill is issued — so a leg that passes cannot be passing vacuously.
+pub fn futex_parked_total() -> usize {
+    let daif = irq_save_mask();
+    let mut n = 0usize;
+    for b in FUTEX.iter() {
+        b.lock_raw();
+        n += unsafe { (*b.waiters.get()).len() };
+        b.unlock_raw();
+    }
+    irq_restore(daif);
+    n
+}
+
+/// KILLBOUND — sweep every wait an EL0 task can be parked in and evict the ones an armed kill names.
+/// Called by `kill` once the request is published, so the predicate (`kill_slot_for`) already matches.
+///
+/// The set is enumerable because every blocking wait an EL0 program can reach is one of exactly two
+/// shapes: a futex bucket (`SYS_FUTEX`), or a `Semaphore` the syscall layer owns (`SYS_THREAD_JOIN`'s
+/// join handle, `SYS_WAIT`'s `Proc::done`, `SYS_MRECV`'s per-ASID bus mailbox). The futex half lives
+/// here; the semaphore half is delegated to `syscall`, which owns those tables — the same hook shape
+/// `note_killed_task_retired` already uses.
+fn kill_wake_parked() -> u32 {
+    let mut n = futex_wake_killed();
+    #[cfg(feature = "baremetal")]
+    {
+        n += super::syscall::kill_wake_parked_semaphores();
+    }
+    n
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1840,6 +3325,228 @@ pub fn demo_cooperative() {
     // On the `virt`/Orin paths the boot core diverges into `run_capstone_boot_core` before reaching here,
     // so those get the witness there instead (no double run).
     prio_mix_witness(0);
+
+    // SCHED-2: non-degeneracy proof for the per-core load accounting. The cooperative demo + prio-mix
+    // above drove dozens of dispatches on core 0, so the rolling-window busy fraction and the
+    // context-switch counter are both provably non-zero here — this witness catches a regression that
+    // freezes the accounting (a stuck-at-0 counter, a window that never advances). Runs in the QEMU
+    // `kernel8-test` gate (no timer needed — the accounting rides the cooperative dispatch path).
+    // `pi`-gated exactly like `core_load_report`: fires on the target + gate, byte-identical for the
+    // jetson/virt builds that diverge into `run_capstone_boot_core` before reaching here.
+    #[cfg(feature = "pi")]
+    load_accounting_witness();
+
+    // SKILL-1: prove the asynchronous kill primitive. Runs here for the same reason the two witnesses
+    // above do — cooperatively on the boot core, before `start_aps` flips `SCHED_ACTIVE`, self-contained
+    // and bounded, leaving the run queue empty. `pi`-gated, so the virt/Orin builds (which diverge into
+    // `run_capstone_boot_core` before reaching here) stay byte-identical.
+    #[cfg(feature = "pi")]
+    skill_kill_witness(0);
+}
+
+// --- SKILL-1 witness: the asynchronous kill primitive, exercised deterministically in QEMU ----------
+/// Dispatch passes the witness allows a kill to confirm in. Generous: the expected cost is ONE pass.
+#[cfg(feature = "pi")]
+const SKILL_MAX_PASSES: u32 = 32;
+/// The off-CPU victim's liveness counter — must ADVANCE before the kill and FREEZE after it.
+#[cfg(feature = "pi")]
+static SKILL_VICTIM_TICKS: AtomicU32 = AtomicU32::new(0);
+/// The on-CPU victim's liveness counter, same contract.
+#[cfg(feature = "pi")]
+static SKILL_SELF_TICKS: AtomicU32 = AtomicU32::new(0);
+/// The on-CPU victim publishes its own kill slot here (`idx + 1`; 0 = not yet armed) so the witness can
+/// release the ticket the victim could not carry across its own retirement.
+#[cfg(feature = "pi")]
+static SKILL_SELF_SLOT: AtomicU32 = AtomicU32::new(0);
+/// Set by the post-kill task: proves the scheduler still runs ordinary work after two reaps.
+#[cfg(feature = "pi")]
+static SKILL_RERUN_DONE: AtomicBool = AtomicBool::new(false);
+
+/// The OFF-CPU victim: an immortal cooperative loop. It never exits on its own, so the only thing that
+/// can retire it is the kill — which is precisely the property under test.
+#[cfg(feature = "pi")]
+fn skill_victim_body(_: usize) {
+    loop {
+        SKILL_VICTIM_TICKS.fetch_add(1, Ordering::AcqRel);
+        yield_now();
+    }
+}
+
+/// The ON-CPU victim: arms its OWN kill while it is the running task, then hits a boundary. It cannot be
+/// caught by the off-CPU dispatch arm (the request did not exist when it was dispatched), so the retire
+/// must come from `kill_check_current` — the same code path `timer_preempt` uses against a spinning EL0
+/// task on metal. This is the closest a timer-less QEMU can get to the metal case: the ARM is identical,
+/// only the trigger differs (a cooperative `yield_now` here, the quantum tick there).
+#[cfg(feature = "pi")]
+fn skill_self_body(_: usize) {
+    SKILL_SELF_TICKS.fetch_add(1, Ordering::AcqRel);
+    let id = current_id().expect("skill: self victim has no id");
+    let ticket = kill(id, 0).expect("skill: no kill slot for the self victim");
+    // Hand the slot index to the witness and forget the ticket: this task is about to stop existing
+    // mid-function, so it cannot be the one to surrender it. (The index is all a ticket ever was.)
+    SKILL_SELF_SLOT.store(ticket.idx as u32 + 1, Ordering::Release);
+    core::mem::forget(ticket);
+    SKILL_SELF_TICKS.fetch_add(1, Ordering::AcqRel);
+    yield_now(); // never returns — `kill_check_current` retires this task here
+    SKILL_SELF_TICKS.fetch_add(100, Ordering::AcqRel); // MUST NOT run; a huge step makes a leak obvious
+}
+
+/// A plain task spawned after both kills: it must run and exit normally.
+#[cfg(feature = "pi")]
+fn skill_rerun_body(_: usize) {
+    SKILL_RERUN_DONE.store(true, Ordering::Release);
+}
+
+/// SKILL-1 — the asynchronous-kill witness. Cooperative and fully deterministic under QEMU raspi4b (no
+/// timer, no IRQ, no SMP required): it drives `dispatch_next` by hand, so every step is observed rather
+/// than raced.
+///
+/// What it proves:
+///   1. LIVENESS — the victim really is running before the kill (its counter advances).
+///   2. OFF-CPU REAP — after `kill`, the victim is never dispatched again (counter frozen), the request
+///      confirms, and the run queue drains. This is the arm that needs no cooperation from the target.
+///   3. ON-CPU RETIRE — a task that is killed while it is the CURRENT task retires at its next boundary
+///      via `kill_check_current` (the same call `timer_preempt` makes on metal) and confirms.
+///   4. REUSE — both tickets release, every kill slot returns to the pool, and ordinary scheduling
+///      continues (a fresh task spawns, runs and exits). This is the "rerun after a kill" half.
+///
+/// What it CANNOT prove here: the TIMER-driven trigger. QEMU raspi4b delivers no Group-1 timer IRQ, so
+/// `timer_preempt` never fires and a genuinely spinning task (one that neither yields nor syscalls) can
+/// never be interrupted — it would wedge this single cooperative core. That trigger is metal-only.
+#[cfg(feature = "pi")]
+pub fn skill_kill_witness(cpu: usize) {
+    let queue_empty = || RUN_QUEUES[cpu].lock().len() == 0;
+    let slots_free = || {
+        (0..MAX_KILL_REQS).all(|i| KILLS[i].state.load(Ordering::Acquire) == KILL_FREE)
+    };
+
+    // --- 1 + 2: the OFF-CPU arm -----------------------------------------------------------------
+    let vid = spawn("skill-victim", skill_victim_body, 0, cpu);
+    for _ in 0..3 {
+        dispatch_next(cpu); // let it run a few cooperative rounds
+    }
+    let alive_ticks = SKILL_VICTIM_TICKS.load(Ordering::Acquire);
+    let was_alive = alive_ticks >= 3;
+
+    let ticket = kill(vid, 0);
+    let mut off_passes = 0u32;
+    let off_confirmed = match &ticket {
+        None => false,
+        Some(t) => {
+            let mut ok = false;
+            while off_passes < SKILL_MAX_PASSES {
+                off_passes += 1;
+                dispatch_next(cpu);
+                if kill_confirmed(t) {
+                    ok = true;
+                    break;
+                }
+            }
+            ok
+        }
+    };
+    // FROZEN is the real claim: "never scheduled again", not merely "eventually stopped".
+    let off_frozen = SKILL_VICTIM_TICKS.load(Ordering::Acquire) == alive_ticks;
+    let off_drained = queue_empty();
+    if let Some(t) = ticket {
+        if off_confirmed {
+            kill_release(t);
+        } else {
+            kill_detach(t);
+        }
+    }
+
+    // --- 3: the ON-CPU arm ----------------------------------------------------------------------
+    let _ = spawn("skill-self", skill_self_body, 0, cpu);
+    let mut self_passes = 0u32;
+    let mut self_confirmed = false;
+    while self_passes < SKILL_MAX_PASSES {
+        self_passes += 1;
+        dispatch_next(cpu);
+        let slot = SKILL_SELF_SLOT.load(Ordering::Acquire);
+        if slot != 0 && KILLS[(slot - 1) as usize].state.load(Ordering::Acquire) == KILL_DONE {
+            self_confirmed = true;
+            break;
+        }
+    }
+    // Exactly 2 = it reached the arm-and-yield point once and never came back past the yield.
+    let self_frozen = SKILL_SELF_TICKS.load(Ordering::Acquire) == 2;
+    let self_slot = SKILL_SELF_SLOT.load(Ordering::Acquire);
+    if self_confirmed && self_slot != 0 {
+        kill_release(KillTicket { idx: (self_slot - 1) as usize });
+    }
+    let self_drained = queue_empty();
+
+    // --- 3b: the DETACH/SETTLE INTERLEAVE (the F1 hazard, made deterministic) --------------------
+    // The cooperative harness can express the exact ordering that used to strand a slot: arm a kill, let
+    // the requester's bounded wait "expire" (detach) while the victim is still off-CPU and un-reaped, and
+    // only THEN let the retirement land. Under the old load-then-store settle, the retiring side read
+    // PENDING, lost to the detach's CAS, and stamped KILL_DONE over KILL_DETACHED — a terminal state with
+    // no owner left to release it, i.e. a permanently consumed slot. With the CAS settle the retirement
+    // discovers the detach and frees the slot inline, so the pool comes back whole. Asserting the slot is
+    // FREE (not DONE, not still DETACHED) after the reap is exactly that distinction.
+    SKILL_VICTIM_TICKS.store(0, Ordering::Release);
+    let did = spawn("skill-detach", skill_victim_body, 0, cpu);
+    dispatch_next(cpu); // victim runs once, then parks back in the run queue (off-CPU, un-reaped)
+    let dticket = kill(did, 0);
+    let detach_armed = dticket.is_some();
+    if let Some(t) = dticket {
+        kill_detach(t); // the requester gives up BEFORE the kill lands — the F1 interleave
+    }
+    let mut detach_passes = 0u32;
+    while detach_passes < SKILL_MAX_PASSES {
+        detach_passes += 1;
+        dispatch_next(cpu); // the retirement lands here, against a DETACHED slot
+        if queue_empty() {
+            break;
+        }
+    }
+    let detach_reaped = queue_empty();
+    // The whole point: an owner-less settle must FREE the slot, not strand it in DONE.
+    let detach_slot_freed = slots_free();
+
+    // --- 4: reuse -------------------------------------------------------------------------------
+    let pool_clean = slots_free();
+    let _ = spawn("skill-rerun", skill_rerun_body, 0, cpu);
+    run_until_empty(cpu);
+    let rerun_ok = SKILL_RERUN_DONE.load(Ordering::Acquire);
+
+    let pass = was_alive
+        && off_confirmed
+        && off_frozen
+        && off_drained
+        && self_confirmed
+        && self_frozen
+        && self_drained
+        && detach_armed
+        && detach_reaped
+        && detach_slot_freed
+        && pool_clean
+        && rerun_ok;
+    if pass {
+        serial_println!(
+            ":: SKILL-1: async kill — victim ran {} rounds then froze; off-CPU reap confirmed in {} pass(es), on-CPU boundary retire confirmed in {}; detach-then-settle interleave freed its slot inline; queue drained, kill slots returned, rerun OK :: PASS ::",
+            alive_ticks,
+            off_passes,
+            self_passes
+        );
+    } else {
+        serial_println!(
+            ":: SKILL-1: async kill — alive={} off_conf={} off_frozen={} off_drained={} self_conf={} self_frozen={} self_drained={} det_armed={} det_reaped={} det_freed={} pool={} rerun={} :: FAIL ::",
+            was_alive,
+            off_confirmed,
+            off_frozen,
+            off_drained,
+            self_confirmed,
+            self_frozen,
+            self_drained,
+            detach_armed,
+            detach_reaped,
+            detach_slot_freed,
+            pool_clean,
+            rerun_ok
+        );
+    }
 }
 
 /// Busy-wait `ms` milliseconds off the free-running CNTPCT (works even where the timer IRQ isn't
@@ -2017,6 +3724,134 @@ fn capstone_body(_: usize) {
     //    until the worker's completion post, at least one cross-core).
     cap_report("join", true);
     serial_println!(":: CAPSTONE COMPLETE — all 6 sync primitives verified in one boot ::");
+    // PI-SCHED-1 — one-shot per-core load snapshot at a steady state (after the capstone has driven
+    // real cross-core dispatch on every AP). `pi`-gated (fires on the target + `kernel8-test`, byte-
+    // identical for jetson/virt); `core_load_report()` itself is callable on demand for future paths.
+    #[cfg(feature = "pi")]
+    core_load_report();
+}
+
+/// PI-SCHED-1 — per-core task-slice activation snapshot (introspection only). Prints each core's
+/// dispatch BUSY vs IDLE pass counts, taken from the `CPU_BUSY`/`CPU_IDLE` pulse counters that
+/// `dispatch_next` already maintains (BUSY bumped when a task is dispatched, IDLE when the run queue is
+/// empty). A one-shot witness — call it on demand (e.g. a future shell command) or once at steady
+/// state. NEVER read on a scheduling path; it only observes the counters. Left `pub` (no dead-code
+/// warning) so the call site can stay behind `sched_demo` without gating the function itself.
+pub fn core_load_report() {
+    for cpu in 0..NUM_CPUS {
+        let busy = CPU_BUSY[cpu].load(Ordering::Relaxed);
+        let idle = CPU_IDLE[cpu].load(Ordering::Relaxed);
+        serial_println!(":: SCHED-LOAD: core {} busy {} idle {} ::", cpu, busy, idle);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// SCHED-2 — load witnesses (periodic serial line + on-demand `top` table + a non-degeneracy proof)
+// ---------------------------------------------------------------------------------------------
+
+/// Periodic-witness cadence, in aggregate timer ticks across all cores. At the ~4 ms/tick Pi quantum
+/// this fires roughly every few seconds. Metal-only — `timer_preempt` (its only driver) never runs in
+/// QEMU raspi4b (no Group-1 timer delivery), so this line appears on the real Pi, not in the gate.
+const LOAD_WITNESS_INTERVAL: u64 = 1024;
+/// Aggregate tick accumulator across cores (whichever core lands on the interval boundary emits).
+static LOAD_WITNESS_TICKS: AtomicU64 = AtomicU64::new(0);
+/// Packed busy-percents of the last emitted line (`c0 | c1<<8 | c2<<16 | c3<<24`), for change-only
+/// suppression — a steady-state system stops re-printing an unchanged load line.
+static LOAD_WITNESS_LAST: AtomicU64 = AtomicU64::new(u64::MAX);
+/// `ctx_switches` sum snapshot at the last emission, to derive the per-window context-switch delta.
+static LOAD_WITNESS_CTX: AtomicU64 = AtomicU64::new(0);
+
+/// SCHED-2 periodic load heartbeat: called once per `timer_preempt` (per core, per tick, metal-only).
+/// The core whose atomic increment lands exactly on the `LOAD_WITNESS_INTERVAL` boundary is the sole
+/// emitter for that window (fetch_add hands each multiple to exactly one core), so there is no
+/// double-print and no reader lock. Change-only: it prints only when the packed per-core busy-percents
+/// differ from the last emission. Cheap on the non-boundary passes (one relaxed fetch_add + a modulo).
+fn load_witness_tick() {
+    let n = LOAD_WITNESS_TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n % LOAD_WITNESS_INTERVAL != 0 {
+        return;
+    }
+    let mut packed = 0u64;
+    let mut ctx_now = 0u64;
+    for cpu in 0..NUM_CPUS.min(8) {
+        let ld = core_load(cpu);
+        // SCHED-8: pack 255 for an untracked (stale/never-run) core so a tracked→untracked transition
+        // changes the signature and re-emits the line; real percents are 0..100 so 255 never collides.
+        let byte = if ld.tracked { ld.busy_pct_recent.min(254) as u64 } else { 255 };
+        packed |= byte << (cpu * 8);
+        ctx_now += ld.ctx_switches;
+    }
+    if packed == LOAD_WITNESS_LAST.swap(packed, Ordering::Relaxed) {
+        return; // unchanged since the last window — stay quiet
+    }
+    let ctx_delta = ctx_now.saturating_sub(LOAD_WITNESS_CTX.swap(ctx_now, Ordering::Relaxed));
+    // SCHED-8: an untracked core prints `--` (no live number) rather than its frozen last-window percent.
+    let c = |i: usize| {
+        let ld = core_load(i);
+        if ld.tracked {
+            alloc::format!("{}%", ld.busy_pct_recent)
+        } else {
+            alloc::string::String::from("--")
+        }
+    };
+    serial_println!(
+        ":: SCHED: load c0={} c1={} c2={} c3={} (ctx +{}/win) ::",
+        c(0), c(1), c(2), c(3), ctx_delta
+    );
+}
+
+/// SCHED-2 on-demand per-core load table (the `top` shell verb's body, and a serial witness). Prints
+/// one row per core: recent busy percent (rolling window), cumulative context switches, and the last
+/// task (id + name). Reads `core_load` per core — introspection only, safe from any core.
+pub fn load_table(mut line: impl FnMut(&str)) {
+    line("core  busy%  ctx-switches  last-task");
+    for cpu in 0..NUM_CPUS {
+        let ld = core_load(cpu);
+        // SCHED-8: `--` for a core not being accounted right now (left `run()` / never ran it), so the
+        // busy% column never shows a frozen snapshot as if it were live.
+        let busy = if ld.tracked {
+            alloc::format!("{}", ld.busy_pct_recent)
+        } else {
+            alloc::string::String::from("--")
+        };
+        line(&alloc::format!(
+            "{:>3}   {:>4}   {:>11}   {} (tid {})",
+            cpu, busy, ld.ctx_switches, ld.last_task, ld.last_task_id
+        ));
+    }
+}
+
+/// SCHED-2 non-degeneracy witness (the QEMU-gate proof): assert the per-core accounting is LIVE — at
+/// least one core shows busy activity and its context-switch counter has advanced past zero. A
+/// regression that freezes the accounting (counters stuck at 0, no window ever completes) FAILs this
+/// loudly. Uncounted (not part of the timed battery); prints a single PASS/FAIL line. Reads only.
+pub fn load_accounting_witness() {
+    let mut any_busy = false;
+    let mut any_ctx = false;
+    let mut max_pct = 0u32;
+    let mut total_ctx = 0u64;
+    for cpu in 0..NUM_CPUS {
+        let ld = core_load(cpu);
+        if ld.busy_pct_recent > 0 {
+            any_busy = true;
+        }
+        if ld.ctx_switches > 0 {
+            any_ctx = true;
+        }
+        max_pct = max_pct.max(ld.busy_pct_recent);
+        total_ctx += ld.ctx_switches;
+    }
+    if any_busy && any_ctx {
+        serial_println!(
+            ":: AARCH64 SCHED: load-accounting PASS (max busy {}%, {} ctx-switches total) ::",
+            max_pct, total_ctx
+        );
+    } else {
+        serial_println!(
+            ":: AARCH64 SCHED: load-accounting FAIL (any_busy={}, any_ctx={}) ::",
+            any_busy, any_ctx
+        );
+    }
 }
 
 /// M3b/M4a/M4-capstone: turn on preemptive scheduling and put a workload on the APs, then flip
@@ -2029,6 +3864,22 @@ fn capstone_body(_: usize) {
 /// busy tasks run sequentially, the sleeper self-skips, and every block/wake is carried by the run()
 /// busy-poll (SGI delivery being the metal-only half). Call AFTER the BSP's cooperative demo.
 pub fn start_aps(online: &[usize]) {
+    // SCHED-3: register every online AP as a candidate for CPU_AUTO load-balanced placement. The BSP
+    // (core 0) is registered SEPARATELY by `run_bsp` if/when it enters the scheduler after its boot
+    // duties (SMP-BAL); until then it stays off the candidate set — a CPU_AUTO task only ever lands on a
+    // core that actually drains its run queue. No effect on the caller-pinned spawns below (they name
+    // their core), so the workload placement here is byte-identical.
+    for &c in online {
+        mark_online(c);
+    }
+    // SCHED-3: prove load-balanced placement spreads unpinned work across the online cores. Run HERE,
+    // BEFORE the caller-pinned workload below is staged, so every online core's run queue is empty and
+    // the depth-balancer fans the unpinned tasks evenly across ALL of them (a proof that once a core is
+    // loaded the balancer correctly steers away from it belongs to the accounting witness, not this
+    // one). Gated behind `witness` (armed for `kernel8-test`, OFF for a default `kernel8` boot) so quiet
+    // boot stays quiet, and `pi` so it fires only on the target/gate — byte-identical for jetson/virt.
+    #[cfg(all(feature = "pi", feature = "witness"))]
+    placement_spread_witness();
     if let Some(&c) = online.first() {
         spawn("busy-a", preempt_body, c * 10, c);
         spawn("busy-b", preempt_body, c * 10 + 1, c);
@@ -2053,6 +3904,179 @@ pub fn start_aps(online: &[usize]) {
         ":: AARCH64 SCHED: preemption ON; busy-pair + sleep + full M4 capstone on APs {:?} ::",
         online
     );
+
+    // SCHED-3: with the APs now released, the unpinned workers placed at the top of this fn drain and
+    // record the core they actually RAN on — corroboration that the placement spread is real execution,
+    // not just an enqueue decision. Informational (non-gating: cross-core drain timing under QEMU is not
+    // guaranteed); the PASS gate was the deterministic placement spread above.
+    #[cfg(all(feature = "pi", feature = "witness"))]
+    placement_spread_epilogue();
+
+    // SMP-BAL: with the placement/capstone workload drained and the APs idle-polling in `run`, exercise
+    // WORK STEALING end to end — pile movable tasks on one core and prove idle siblings pull them over.
+    #[cfg(all(feature = "pi", feature = "witness"))]
+    smpbal_steal_witness();
+}
+
+// ---------------------------------------------------------------------------------------------
+// SCHED-3 — load-balanced-placement spread witness (QEMU-testable, default-quiet)
+// ---------------------------------------------------------------------------------------------
+//
+// Asserts that N `CPU_AUTO` (unpinned) spawns land on >= 3 DISTINCT cores — the direct inverse of the
+// metal imbalance (all unpinned work piling onto one caller-picked pin). Run with every online core's
+// run queue empty (top of `start_aps`), so the depth-balancer fans the tasks evenly; the LANDING core
+// of each auto-placement (deterministic — decided at enqueue by `pick_cpu`) is folded into a bitset and
+// the distinct-core count is the PASS gate. The workers also record the core they actually RAN on
+// (`placement_spread_epilogue`, after the APs are released) as non-gating corroboration.
+#[cfg(all(feature = "pi", feature = "witness"))]
+const SPREAD_N: usize = 12;
+#[cfg(all(feature = "pi", feature = "witness"))]
+static SPREAD_RAN_MASK: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(all(feature = "pi", feature = "witness"))]
+fn spread_worker(_: usize) {
+    let cpu = percpu::this_cpu().cpu_index as usize;
+    SPREAD_RAN_MASK.fetch_or(1u32 << (cpu & 31), Ordering::Relaxed);
+}
+
+#[cfg(all(feature = "pi", feature = "witness"))]
+pub fn placement_spread_witness() {
+    let online_n = (0..NUM_CPUS)
+        .filter(|&c| ONLINE_MASK[c].load(Ordering::Acquire))
+        .count();
+    if online_n < 3 {
+        serial_println!(
+            ":: AARCH64 SCHED: placement-spread witness SKIP (needs >= 3 online cores, have {}) ::",
+            online_n
+        );
+        return;
+    }
+    SPREAD_RAN_MASK.store(0, Ordering::Relaxed);
+    let mut placed_mask: u32 = 0;
+    for _ in 0..SPREAD_N {
+        // Balance across the online cores, then pin to the chosen core so the landing is observable.
+        // Each spawn pushes onto its core's queue, so the depth signal `pick_cpu` reads climbs there and
+        // the next placement moves on — genuine load spread across the (empty) cores, not a fixed rotation.
+        let cpu = pick_cpu(CPU_AUTO);
+        spawn_prio("spread", spread_worker, 0, cpu, PRIO_NORMAL);
+        placed_mask |= 1u32 << (cpu & 31);
+    }
+    let distinct = placed_mask.count_ones();
+    if distinct >= 3 {
+        serial_println!(
+            ":: AARCH64 SCHED: placement-spread PASS ({} unpinned tasks -> {} distinct cores, mask {:#06b}) ::",
+            SPREAD_N, distinct, placed_mask
+        );
+    } else {
+        serial_println!(
+            ":: AARCH64 SCHED: placement-spread FAIL ({} unpinned tasks -> only {} distinct cores, mask {:#06b}) ::",
+            SPREAD_N, distinct, placed_mask
+        );
+    }
+}
+
+/// SCHED-3 corroboration: after the APs are released, give the unpinned spread workers a bounded window
+/// to drain and report the cores they actually RAN on. Informational only (never a PASS/FAIL gate) —
+/// cross-core drain timing under QEMU is not guaranteed, so this confirms live execution without gating.
+#[cfg(all(feature = "pi", feature = "witness"))]
+pub fn placement_spread_epilogue() {
+    busy_delay_ms(20);
+    let ran_mask = SPREAD_RAN_MASK.load(Ordering::Relaxed);
+    serial_println!(
+        ":: AARCH64 SCHED: placement-spread ran-mask {:#06b} ({} cores observed running) ::",
+        ran_mask,
+        ran_mask.count_ones()
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// SMP-BAL — work-stealing spread witness (QEMU-testable, default-quiet)
+// ---------------------------------------------------------------------------------------------
+//
+// Directly exercises STEALING (not just placement): concentrate N steal-eligible tasks on ONE core with
+// every OTHER online core idle in `run`, then assert the tasks actually RAN on >= 2 distinct cores — the
+// only way that can happen with a single-core spawn is that idle cores pulled the backlog over via
+// `try_steal`. Runs at the END of `start_aps`, after the capstone/placement workload has drained (so the
+// APs are idle-polling in `run`), and stages tasks that each spin briefly so the home core cannot drain
+// the whole pile before its idle siblings steal. `pi`+`witness` gated → byte-identical off the gate.
+
+#[cfg(all(feature = "pi", feature = "witness"))]
+const SMPBAL_N: usize = 4;
+#[cfg(all(feature = "pi", feature = "witness"))]
+static SMPBAL_RAN_MASK: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(all(feature = "pi", feature = "witness"))]
+fn smpbal_worker(_: usize) {
+    let cpu = percpu::this_cpu().cpu_index as usize;
+    SMPBAL_RAN_MASK.fetch_or(1u32 << (cpu & 31), Ordering::Relaxed);
+    busy_delay_ms(3); // hold the core long enough that idle siblings steal the rest of the pile
+}
+
+/// SMP-BAL witness-only spawn: enqueue a STEAL-ELIGIBLE task PINNED to `cpu` (i.e. `steal_ok = true` while
+/// starting concentrated on one core) — the exact runtime state "a movable task is currently queued on a
+/// loaded core". Mirrors `spawn_inner` minus the placement policy/log; used solely by `smpbal_steal_witness`.
+#[cfg(all(feature = "pi", feature = "witness"))]
+fn spawn_stealable_on(name: &'static str, entry: fn(usize), arg: usize, cpu: usize) {
+    let mut stack: Box<[u8]> = alloc::vec![0u8; TASK_STACK_SIZE].into_boxed_slice();
+    let ctx_sp = build_initial_frame(&mut stack, task_trampoline);
+    let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
+    let task = Box::new(Task {
+        id,
+        name,
+        state: AtomicU8::new(STATE_READY),
+        ctx_sp,
+        stack,
+        entry,
+        arg,
+        cpu: cpu as u32,
+        priority: PRIO_NORMAL,
+        wait_ticks: 0,
+        done_sem: None,
+        user_entry: 0,
+        user_sp: 0,
+        user_ttbr0: 0,
+        steal_ok: true, // the point of the fixture: movable, but staged on one core
+    });
+    RUN_QUEUES[cpu].lock().push(task);
+    poke_cpu(cpu);
+}
+
+/// SMP-BAL — the deliverable-4 spread test. Pile `SMPBAL_N` steal-eligible tasks on ONE online core while
+/// the others idle in `run`, wait a bounded window, and PASS iff they ran on >= 2 distinct cores (proving
+/// idle cores stole the backlog). Runs LAST in `start_aps` (APs already idle post-capstone). Emits
+/// `:: SMPBAL: spread test — tasks=N cores-used=M :: PASS ::`.
+#[cfg(all(feature = "pi", feature = "witness"))]
+pub fn smpbal_steal_witness() {
+    let online: alloc::vec::Vec<usize> = (0..NUM_CPUS)
+        .filter(|&c| ONLINE_MASK[c].load(Ordering::Acquire))
+        .collect();
+    if online.len() < 2 {
+        serial_println!(
+            ":: SMPBAL: spread test SKIP (needs >= 2 online cores, have {}) ::",
+            online.len()
+        );
+        return;
+    }
+    let home = online[0];
+    SMPBAL_RAN_MASK.store(0, Ordering::Relaxed);
+    for _ in 0..SMPBAL_N {
+        spawn_stealable_on("smpbal", smpbal_worker, 0, home);
+    }
+    // Give the idle siblings time to steal + everyone to drain (each worker spins ~3 ms).
+    busy_delay_ms(60);
+    let mask = SMPBAL_RAN_MASK.load(Ordering::Relaxed);
+    let used = mask.count_ones();
+    if used >= 2 {
+        serial_println!(
+            ":: SMPBAL: spread test — tasks={} cores-used={} :: PASS ::",
+            SMPBAL_N, used
+        );
+    } else {
+        serial_println!(
+            ":: SMPBAL: spread test — tasks={} cores-used={} (mask {:#06b}) :: FAIL ::",
+            SMPBAL_N, used, mask
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

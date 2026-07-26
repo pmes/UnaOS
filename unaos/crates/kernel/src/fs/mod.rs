@@ -26,3 +26,10 @@
 pub mod fat;
 #[cfg(target_arch = "aarch64")]
 pub mod unafs;
+
+/// VFS-1: the unifying virtual-filesystem spine (mount table + resolver + the
+/// backend trait, with thin adapters over FAT and native UnaFS). Design of
+/// record: `docs/dev/OS/09_FILESYSTEM/vfs.md`. Unconsumed this arc — the spine
+/// and doc land alone so the design can be reviewed before consumers move onto
+/// it (shell/syscall adoption is a follow-up).
+pub mod vfs;

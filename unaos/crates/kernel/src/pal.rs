@@ -22,6 +22,11 @@ use spin::Mutex;
 pub enum Event {
     Timer,
     Key(u8),
+    /// HID-KEYS: a key-RELEASE edge (payload = the ASCII the matching `Key` press carried).
+    /// The HID decoders track each keyboard slot's previous boot report and emit this when a
+    /// keycode leaves the pressed set. Consumers that only act on presses ignore it (they match
+    /// `Key` and fall through the wildcard); held-state consumers can pair it with `Key`.
+    KeyUp(u8),
     Mouse { x: i32, y: i32 },
     MouseAbsolute { x: i32, y: i32 },
     /// CLICK-1: a pointer button-DOWN edge (payload = the report's button bitmask, bit 0 = primary).
@@ -196,6 +201,19 @@ pub mod cursor {
     pub fn visible() -> bool {
         let t = LAST_INPUT_MS.load(Ordering::Relaxed);
         t != 0 && crate::arch::ms().wrapping_sub(t) < HIDE_AFTER_MS
+    }
+
+    /// FOCUS-VIS — whether a REAL pointer report has ever arrived this boot (the `visible()` predicate
+    /// without the auto-hide half). Distinct from `visible()` because it answers a different question:
+    /// "does this machine have a working pointer?", not "should the arrow be on screen right now?".
+    ///
+    /// It exists so the EL0 input router can keep the sprite alive while an app holds focus WITHOUT
+    /// arming a cursor that never existed. QEMU raspi4b delivers no HID pointer, but the boot-time
+    /// `input_router_selftest` pushes a synthetic `Event::Mouse` through the real router to prove the
+    /// routing path; gating on this keeps that synthetic event from stamping the activity clock,
+    /// drawing a sprite, and printing `[cursor] armed` on a gate that has no pointer at all.
+    pub fn has_reported() -> bool {
+        LAST_INPUT_MS.load(Ordering::Relaxed) != 0
     }
 
     /// Sprite magnification: one step above the text scale so the cursor reads at a glance
@@ -373,6 +391,9 @@ pub mod cursor {
 
 // --- EVENT QUEUE ---
 const QUEUE_SIZE: usize = 64;
+/// UVUG-6 — public mirror of the ring capacity so the QEMU typematic selftest can size its fill relative to
+/// the real backpressure threshold (`QUEUE_SIZE / 2`) instead of a magic number.
+pub const QUEUE_SIZE_PUB: usize = QUEUE_SIZE;
 
 struct EventQueue {
     buffer: [Event; QUEUE_SIZE],
@@ -388,11 +409,17 @@ impl EventQueue {
             tail: 0,
         }
     }
-    fn push(&mut self, event: Event) {
+    /// Returns `true` if the event was stored, `false` if the ring was full and it was dropped.
+    /// UVUG-10 — the drop verdict used to be swallowed here; it is now reported so `push_event`
+    /// can account for it (see `EVQ_*`).
+    fn push(&mut self, event: Event) -> bool {
         let next = (self.head + 1) % QUEUE_SIZE;
         if next != self.tail {
             self.buffer[self.head] = event;
             self.head = next;
+            true
+        } else {
+            false
         }
     }
     fn pop(&mut self) -> Option<Event> {
@@ -404,19 +431,443 @@ impl EventQueue {
             Some(event)
         }
     }
+    /// UVUG-6 — current occupancy (0..QUEUE_SIZE-1). `head - tail` modulo the ring size; correct across wrap
+    /// because 2^bits ≡ 0 (mod QUEUE_SIZE) makes the wrapping subtraction agree with the true difference.
+    fn len(&self) -> usize {
+        self.head.wrapping_sub(self.tail) % QUEUE_SIZE
+    }
 }
 
 lazy_static! {
     static ref EVENT_QUEUE: Mutex<EventQueue> = Mutex::new(EventQueue::new());
 }
 
+// --- UVUG-10: EVENT_QUEUE PRODUCER/CONSUMER ACCOUNTING ---
+//
+// P55b read `[uvug9] shell-path input key=<climbing> ptr=0` on metal for the whole boot, while the xHCI
+// `MOUSE-1` witness reported a live pointer with real deltas.
+//
+// THE LOSS IS AT OR AFTER THIS QUEUE — that much is now settled, not suspected. `push_event(Event::Mouse)`
+// (drivers/xhci/mod.rs:2278/2286) precedes the `MOUSE-1` print in straight-line code with no platform fork
+// between them, so P55b's `last dx=3 dy=5` is direct proof that pointer events WERE pushed. The earlier
+// all-zero-report-buffer theory is refuted by that same fact.
+//
+// LEADING THEORY (unified, and the one UVUG-10's fixture gate already kills): the boot `input_launcher`
+// fixture's orphan held `el0_input_active()` for the entire boot, so the router's EL0 branch
+// (`route_input_to_active_el0`, main.rs) swallowed the whole queue into a ring nothing would ever read —
+// while KEYS still reached the shell, because `input_service`'s UART path calls `gui_send` DIRECTLY and
+// never touches EVENT_QUEUE at all. That single mechanism explains "ptr=0 but key climbs", explains "from
+// boot", and requires no defect anywhere else. If it is right, gating the fixture off metal is also the
+// mouse fix.
+//
+// These counters exist to prove or refute that in ONE boot rather than by argument. They sit at the one
+// choke point every producer must pass, are classified (pointer vs key), and count DROPS separately:
+// `EventQueue::push` silently discards on a full ring, and pointer traffic (~125 reports/s from a moving
+// mouse) outnumbers keystrokes by two orders of magnitude, so a stalled drain starves the very class under
+// investigation — invisibly, before this arc. Re-circulated events are deliberately EXCLUDED (see
+// `requeue_event`). Plain relaxed atomics, no lock, no cfg gate: arch-neutral, one `fetch_add` on a path
+// that already takes a spinlock.
+//
+// BASELINE — the boot selftests are producers too. `main::input_router_selftest` pushes a synthetic
+// `Mouse{3,-4}` plus two `Key`s, and the typematic/uvug6 selftests push more keys, all before any HID
+// traffic exists. So "nothing was ever produced" reads as **`push ptr=1`**, NOT `push ptr=0`; the QEMU
+// battery's own line is `push ptr=1 key=38 / drop ptr=0 key=0 / pop=40`. Read the pointer counter against
+// that floor of 1, or a healthy zero-HID boot looks like a live pointer.
+//
+// P56 VERDICT TABLE — read `[uvug10] evq` against `[uvug9] shell-path`, with the fixture now gated off
+// metal (so no orphan should exist and `el0_input_active()` should be 0 all boot):
+//   * EXPECTED: `[uvug9] ptr` climbs normally with a moving mouse and `push ptr` climbs with it. The orphan
+//     theory was right and the fixture gate was the fix; nothing further is owed.
+//   * `[uvug9] ptr=0` STILL, with no orphan alive -> the orphan theory is refuted and the hunt RESUMES at
+//     or after this queue. These counters then discriminate:
+//       - `push ptr > 1` with `drop ptr ≈ push ptr` -> produced, then discarded by a saturated ring: the
+//         drain is not keeping up (check `depth` and the `[click2]` channel depth alongside).
+//       - `push ptr > 1` with `drop ptr = 0` -> produced and stored, then consumed by SOMEONE ELSE before
+//         the shell drain. `pop` far above the router's own `[uvug9]` totals names that second consumer;
+//         the candidates are an EL0 focus ring and `el0_input_set_active`'s pre-launch discard.
+//       - `push ptr = 1` (the selftest floor, unmoved) -> against the settled xHCI finding this should be
+//         unreachable; if it happens, the pointer endpoint itself stopped completing this boot and the
+//         question is back in the driver lane. Confirm against `MOUSE-1`'s report count before concluding.
+/// Pointer-class events (Mouse / MouseAbsolute / Button) offered to the queue.
+static EVQ_PUSH_PTR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Key-class events (Key / KeyUp) offered to the queue.
+static EVQ_PUSH_KEY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Pointer-class events DROPPED because the ring was full.
+static EVQ_DROP_PTR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Key-class events DROPPED because the ring was full.
+static EVQ_DROP_KEY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Events successfully popped by ANY consumer (the router drain, an EL0 focus discard, `pump_and_poll`, …).
+static EVQ_POP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// UVUG-10 — `(push_ptr, push_key, drop_ptr, drop_key, pop)`. Read by the router's `[uvug10] evq` witness.
+pub fn event_queue_stats() -> (u64, u64, u64, u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        EVQ_PUSH_PTR.load(Relaxed),
+        EVQ_PUSH_KEY.load(Relaxed),
+        EVQ_DROP_PTR.load(Relaxed),
+        EVQ_DROP_KEY.load(Relaxed),
+        EVQ_POP.load(Relaxed),
+    )
+}
+
 pub fn push_event(event: Event) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let is_ptr = matches!(
+        event,
+        Event::Mouse { .. } | Event::MouseAbsolute { .. } | Event::Button(_)
+    );
+    let is_key = matches!(event, Event::Key(_) | Event::KeyUp(_));
+    if is_ptr {
+        EVQ_PUSH_PTR.fetch_add(1, Relaxed);
+    } else if is_key {
+        EVQ_PUSH_KEY.fetch_add(1, Relaxed);
+    }
+    let stored = crate::arch::without_interrupts(|| EVENT_QUEUE.lock().push(event));
+    if !stored {
+        if is_ptr {
+            EVQ_DROP_PTR.fetch_add(1, Relaxed);
+        } else if is_key {
+            EVQ_DROP_KEY.fetch_add(1, Relaxed);
+        }
+    }
+}
+
+/// UVUG-6 — live EVENT_QUEUE occupancy, read by the host-side typematic backpressure guard so a synthesised
+/// key repeat is never injected while the ring is past half full (a stuck/phantom repeat must not be able to
+/// starve real HID edges — the self-sustaining wedge symptom).
+pub fn event_queue_depth() -> usize {
+    crate::arch::without_interrupts(|| EVENT_QUEUE.lock().len())
+}
+
+/// UVUG-5 — monotonically bumped every time a HID keyboard slot is torn down (a detach / disconnect /
+/// enumeration-recovery teardown), read by the host-side typematic tracker so it can drop a held key that
+/// will NEVER see its `Event::KeyUp`. A boot keyboard under `SET_IDLE(0)` sends one press and no further
+/// reports until release, so if the device is UNPLUGGED mid-hold there is no release edge — without this the
+/// typematic synthesiser would inject `Event::Key` forever at the repeat rate. The xHCI teardown chokepoint
+/// (`Slot::reset_soft_state`) bumps this for any slot that was a keyboard; the consumer clears its state when
+/// the generation advances. Arch-neutral (a plain counter); harmless on targets with no typematic consumer.
+static KEYBOARD_DETACH_GEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Record that a HID keyboard slot was torn down (see [`KEYBOARD_DETACH_GEN`]). Called from the xHCI slot
+/// teardown path; idempotent and lock-free, safe from any context.
+pub fn note_keyboard_detached() {
+    KEYBOARD_DETACH_GEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// The current keyboard-detach generation. The host-side typematic tracker compares this against the value it
+/// last observed and, on a change, drops any held key (whose `KeyUp` a detach guarantees will never arrive).
+pub fn keyboard_detach_gen() -> u64 {
+    KEYBOARD_DETACH_GEN.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+// --- UVUG-6: host-side typematic key-repeat tracker (HID-report-level) ---
+//
+// UVUG-5 synthesised a held key's repeat by tracking Key/KeyUp edges as they were DRAINED out of EVENT_QUEUE.
+// That was the hole behind the P51 boot wedge: `EventQueue::push` silently DROPS on a full ring, so a `KeyUp`
+// pushed while the 64-slot queue was saturated was never enqueued — hence never drained, never observed. The
+// tracker then held the key forever and injected `Event::Key` every RATE_MS, which kept the queue full, which
+// dropped every subsequent real edge (including new keys and their releases): a self-sustaining wedge that
+// exactly matches the capture (keyboard events stop, no detach, key repeat broken).
+//
+// UVUG-6 moves the observation to the HID REPORT level, BEFORE any EVENT_QUEUE push. The xHCI HID decode calls
+// `typematic_note_report` once per keyboard report with the newest press and the FULL currently-held ascii set.
+// A release is now learned by the armed key being ABSENT from the latest report's held set — a fact that can
+// never be dropped by the queue. Three independent safety layers close every remaining miss class:
+//   1. report-level release: armed key not in `held` -> disarm (covers a dropped/missed KeyUp on the queue);
+//   2. keyboard-detach generation (UVUG-5): an unplug mid-hold never sends a release report -> disarm;
+//   3. positive liveness: no HID report from the keyboard for ~1 s while a key is still "held" -> disarm
+//      (covers a release report that never reached the decode at all, or a wedged endpoint).
+// Plus a backpressure guard: `typematic_tick` refuses to inject while EVENT_QUEUE is past half full, so even a
+// momentarily-stuck repeat can never saturate the ring and starve real input.
+//
+// State lives HERE (the kernel lib) rather than in the `main` binary so the xHCI decode — which is in the lib
+// and cannot call into `main` — can feed it directly at the report level. `main`'s pump calls `typematic_tick`.
+//
+// UVUG-9 — LIVENESS IS NOW EVIDENCE-GATED (the ~10-repeat stop, P54b metal fact 3).
+//
+// UVUG-6 flagged this exact failure as a "benign, self-correcting degradation" and shipped it. P54b measured
+// it: holding a key at the shell repeated about ten times and then stopped dead. That is layer 3 firing on a
+// perfectly healthy keyboard, and the arithmetic matches the constants precisely — a strict SET_IDLE(0) boot
+// keyboard sends ONE report on the press and then nothing at all while the key is held still, so
+// `LAST_REPORT_MS` freezes at the press. Repeats begin at `DELAY_MS` (400 ms) and run every `RATE_MS` (40 ms)
+// until `now - last > LIVENESS_MS` (1000 ms) disarms the key: the window is 400..1000 ms, i.e. ~15 repeats,
+// and shorter once the press report's own latency is counted. "About ten, then it stops" is not a mystery
+// symptom; it is this guard's designed behaviour meeting hardware the guard was never valid for.
+//
+// The flaw is that layer 3 infers "the keyboard is wedged" from silence, on a device class whose CORRECT
+// behaviour under SET_IDLE(0) is silence. Silence carries no information here, so the guard cannot be sound.
+//
+// Fix: only trust silence from a keyboard that has DEMONSTRATED it does not stay silent. `typematic_note_report`
+// sets `STREAMS_WHILE_HELD` when it sees a report that is not a fresh press while the armed key is still down —
+// positive proof that this device re-reports during a hold, which is exactly the P51-class hardware layer 3 was
+// written for. With that evidence the 1 s window applies unchanged and the P51 wedge stays shut. Without it,
+// silence is expected and the bound becomes `HOLD_MAX_MS`, a coarse backstop that still keeps the catastrophic
+// case finite while letting a held key repeat for as long as anyone actually holds one.
+//
+// Layers 1 and 2 are untouched and are the real release paths for a SET_IDLE(0) keyboard: the release EDGE does
+// produce a report (that is what ends a hold), layer 1 reads it directly from the report's held set, and a
+// mid-hold unplug is layer 2's. Layer 3 only ever covered the residue where a release report never reaches the
+// decode at all — and the backpressure guard independently prevents a stuck repeat from starving real input in
+// the meantime. The evidence gate is cleared on a keyboard detach, so a swapped device re-earns its own verdict.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+mod typematic {
+    use core::sync::atomic::{AtomicU32, AtomicU64};
+    /// ASCII of the key eligible to repeat, +1 (0 = none). Newest press wins.
+    pub(super) static KEY_P1: AtomicU32 = AtomicU32::new(0);
+    /// `ms()` at which the next repeat is due.
+    pub(super) static NEXT_MS: AtomicU64 = AtomicU64::new(0);
+    /// `ms()` of the most recent HID keyboard report seen (0 = none yet) — the liveness signal.
+    pub(super) static LAST_REPORT_MS: AtomicU64 = AtomicU64::new(0);
+    /// Last `keyboard_detach_gen()` folded by `typematic_tick`; an advance means an unplug -> drop held key.
+    pub(super) static SEEN_DETACH_GEN: AtomicU64 = AtomicU64::new(0);
+    /// Hold time before the FIRST synthesised repeat (~desktop feel; a tap never repeats).
+    pub(super) const DELAY_MS: u64 = 400;
+    /// Repeat period once repeating (~25 chars/s).
+    pub(super) const RATE_MS: u64 = 40;
+    /// Liveness window for a keyboard PROVEN to re-report during a hold (see `STREAMS_WHILE_HELD`): silence
+    /// this long from such a device is genuinely anomalous -> drop the held key.
+    pub(super) const LIVENESS_MS: u64 = 1000;
+    /// UVUG-9 — the backstop window for a keyboard that has NOT proven it re-reports during a hold (a strict
+    /// `SET_IDLE(0)` device, whose correct behaviour is total silence while a key is held still). Silence says
+    /// nothing about health there, so it cannot be read as a wedge; this bound exists only so the pathological
+    /// case stays finite. Thirty seconds is far longer than any real key hold and far shorter than forever.
+    pub(super) const HOLD_MAX_MS: u64 = 30_000;
+    /// UVUG-9 — sticky evidence that THIS keyboard emits genuine IDLE RE-REPORTS while a key is held down
+    /// (0 = not yet observed, 1 = observed). Cleared on a keyboard detach so a newly attached device re-earns
+    /// the verdict. See `typematic_note_report` for why the test is "held set byte-identical to the previous
+    /// report" and not merely "no press edge".
+    pub(super) static STREAMS_WHILE_HELD: AtomicU32 = AtomicU32::new(0);
+    /// UVUG-9 — the PREVIOUS report's held-ascii set, packed (see `pack_held`), so an idle re-report can be
+    /// told apart from a report that merely carried no PRESS edge. Bit 63 marks the value valid (no previous
+    /// report yet == 0). Cleared on detach alongside the verdict it feeds.
+    pub(super) static PREV_HELD: AtomicU64 = AtomicU64::new(0);
+    /// UVUG-9 — how many CONSECUTIVE reports have arrived with the held set unchanged and no press edge. Reset
+    /// by any change to the held set. See `IDLE_RUN_TO_LATCH`.
+    pub(super) static IDLE_RUN: AtomicU32 = AtomicU32::new(0);
+    /// UVUG-9 — consecutive unchanged-held reports required before believing this keyboard idle-re-reports.
+    ///
+    /// One such report is not proof, and the residual case the byte-identical test alone cannot see is a key
+    /// that maps to ascii 0 (F-keys, and anything else absent from `HID_SCANCODE_TO_ASCII`) being tapped while
+    /// another key is held: the ascii projection this function receives discards the very keycode that changed,
+    /// so press and release both look like unchanged-held reports. Closing that properly would mean feeding the
+    /// tracker raw KEYCODES, which is a `drivers::xhci` signature change and outside this arc's lane. A run
+    /// threshold closes it from this side instead: a tap yields two such reports, whereas a keyboard that truly
+    /// idle-re-reports produces them continuously for as long as the key is held. Four is comfortably above a
+    /// tap (or a double-tap) and is reached within a few report periods of a genuine hold.
+    pub(super) const IDLE_RUN_TO_LATCH: u32 = 4;
+}
+
+/// UVUG-9 — pack a held-ascii set into one word for exact comparison against the previous report: bit 63 =
+/// valid, bits 56..62 = length, bytes 0..5 = the set in report order. A HID boot report carries at most six
+/// keycodes, so nothing is lost. Order-sensitive by design: a reordered set compares unequal, which only ever
+/// costs a missed latch (the safe direction — the conservative `HOLD_MAX_MS` window stays in force).
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn pack_held(held: &[u8]) -> u64 {
+    let n = held.len().min(6);
+    let mut v: u64 = (1 << 63) | ((n as u64) << 56);
+    for (i, &b) in held.iter().take(n).enumerate() {
+        v |= (b as u64) << (i * 8);
+    }
+    v
+}
+
+/// UVUG-6 — feed the typematic tracker one HID keyboard report at the REPORT LEVEL (before any EVENT_QUEUE
+/// push). `newest_press` is an ascii that went down THIS report (0 = none); `held` is every ascii currently
+/// down. Observing releases here (armed key absent from `held`) rather than from the drained event stream is
+/// what closes the UVUG-5 dropped-`KeyUp` hole. A synthesised repeat never comes through here (it is not a HID
+/// report), so the initial delay is honoured exactly once per physical press.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+pub fn typematic_note_report(newest_press: u8, held: &[u8]) {
+    use core::sync::atomic::Ordering;
+    let now = crate::arch::ms();
+    typematic::LAST_REPORT_MS.store(now.max(1), Ordering::Relaxed);
+    // Report-level release: if the currently-armed key is not in this report's held set, it was released
+    // (or was never really held) — disarm. This is the primary, queue-independent release path.
+    // UVUG-9: snapshot this report's held set and the previous one, for the idle-re-report test below.
+    let cur_packed = pack_held(held);
+    let prev_packed = typematic::PREV_HELD.swap(cur_packed, Ordering::Relaxed);
+    // UVUG-9: maintain the consecutive-idle-re-report run. Any press edge, or any change to the held set,
+    // means this report carried real user action and breaks the run.
+    let idle_report = newest_press == 0 && prev_packed == cur_packed;
+    let idle_run = if idle_report {
+        typematic::IDLE_RUN.fetch_add(1, Ordering::Relaxed) + 1
+    } else {
+        typematic::IDLE_RUN.store(0, Ordering::Relaxed);
+        0
+    };
+    let kp1 = typematic::KEY_P1.load(Ordering::Relaxed);
+    if kp1 != 0 {
+        let k = (kp1 - 1) as u8;
+        if !held.contains(&k) {
+            typematic::KEY_P1.store(0, Ordering::Relaxed);
+        } else if idle_run >= typematic::IDLE_RUN_TO_LATCH {
+            // UVUG-9: a TRUE IDLE RE-REPORT — the armed key is still down and this report's held set is
+            // byte-identical to the previous one, so the report carried no press edge AND no release edge. It
+            // conveys nothing except that the keyboard is still talking, which is precisely the evidence
+            // `LIVENESS_MS` (silence == wedge) needs to be a sound inference. Sticky until the device detaches.
+            //
+            // "No PRESS edge" alone would NOT have been sound, and the difference is the whole point: it also
+            // matches (a) a two-key rollover RELEASE (press a, press b, release a — no press edge, armed b
+            // still held) and (b) tapping any key that maps to ascii 0, e.g. an F-key, while holding. Both are
+            // ordinary things a strict `SET_IDLE(0)` keyboard does, and either one latching just once would
+            // re-impose the 1 s window for the rest of the boot — resurrecting the exact ~10-repeat stop this
+            // arc exists to remove. Requiring the held set to be UNCHANGED excludes (a) outright: a rollover
+            // release shrinks the set. It does NOT by itself exclude (b) — the ascii projection this function
+            // receives has already discarded the non-ascii keycode, so its press and release both arrive as
+            // unchanged-held reports — which is what `IDLE_RUN_TO_LATCH` is for.
+            typematic::STREAMS_WHILE_HELD.store(1, Ordering::Relaxed);
+        }
+    }
+    // Arm the newest press (newest-wins typematic) and (re)start the initial delay.
+    if newest_press != 0 {
+        typematic::KEY_P1.store(newest_press as u32 + 1, Ordering::Relaxed);
+        typematic::NEXT_MS.store(now.wrapping_add(typematic::DELAY_MS), Ordering::Relaxed);
+    }
+}
+
+/// UVUG-6 — if a held key's repeat is due, return its ascii and schedule the next one. Returns `None` when no
+/// key is held, the repeat is not yet due, the keyboard detached, liveness lapsed, or EVENT_QUEUE is past half
+/// full. Called once per USB pump pass, BEFORE the drain, by the host pump in `main`.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+pub fn typematic_tick() -> Option<u8> {
+    use core::sync::atomic::Ordering;
+    // (2) detach guard: a keyboard unplugged mid-hold never sends its release report.
+    let dg = keyboard_detach_gen();
+    if typematic::SEEN_DETACH_GEN.swap(dg, Ordering::Relaxed) != dg {
+        typematic::KEY_P1.store(0, Ordering::Relaxed);
+        // UVUG-9: the streaming verdict belongs to the DEVICE, not the boot — a detach means the next report
+        // may come from different hardware, which must earn its own verdict rather than inherit this one. The
+        // evidence it was derived from goes with it, or a run straddling the detach could re-latch on a mix of
+        // two keyboards' reports.
+        typematic::STREAMS_WHILE_HELD.store(0, Ordering::Relaxed);
+        typematic::PREV_HELD.store(0, Ordering::Relaxed);
+        typematic::IDLE_RUN.store(0, Ordering::Relaxed);
+        return None;
+    }
+    let kp1 = typematic::KEY_P1.load(Ordering::Relaxed);
+    if kp1 == 0 {
+        return None;
+    }
+    let now = crate::arch::ms();
+    // (3) positive liveness, UVUG-9 evidence-gated: silence only means "wedged" on a keyboard that has PROVEN
+    // it re-reports during a hold. On a strict SET_IDLE(0) device silence is the correct behaviour of a key
+    // being held, and reading it as a wedge is what stopped repeat after ~10 characters on metal (P54b).
+    let last = typematic::LAST_REPORT_MS.load(Ordering::Relaxed);
+    let window = if typematic::STREAMS_WHILE_HELD.load(Ordering::Relaxed) != 0 {
+        typematic::LIVENESS_MS
+    } else {
+        typematic::HOLD_MAX_MS
+    };
+    if last != 0 && now.wrapping_sub(last) > window && now >= last {
+        typematic::KEY_P1.store(0, Ordering::Relaxed);
+        // UVUG-9: name the BACKSTOP when it is what fired. A repeat that simply stops is indistinguishable at
+        // the bench from the bug this arc fixed, so the coarse 30 s bound must say so out loud — one line per
+        // disarm, which is self-limiting at a minimum of `HOLD_MAX_MS` apart. The tight `LIVENESS_MS` disarm
+        // stays silent: it is the ordinary, expected end of a hold on a streaming keyboard.
+        if window == typematic::HOLD_MAX_MS {
+            serial_println!(
+                "[uvug9] typematic hold-max — key held {}s without an idle re-report from this keyboard; repeat disarmed by the BACKSTOP, not by a release (re-press resumes)",
+                typematic::HOLD_MAX_MS / 1000
+            );
+        }
+        return None;
+    }
+    // backpressure guard: never inject while the ring is past half full (starvation / wedge guard).
+    if event_queue_depth() > QUEUE_SIZE / 2 {
+        return None;
+    }
+    let due = typematic::NEXT_MS.load(Ordering::Relaxed);
+    // `ms()` is monotonic; guard the wrap window so a rolled clock cannot spew repeats.
+    if now.wrapping_sub(due) < (1u64 << 62) && now >= due {
+        typematic::NEXT_MS.store(now.wrapping_add(typematic::RATE_MS), Ordering::Relaxed);
+        return Some((kp1 - 1) as u8);
+    }
+    None
+}
+
+/// UVUG-6 test aid — force the next repeat "due" now, so the QEMU selftest can exercise the inject/suppress
+/// decision deterministically without waiting out the real delay. Not used on any boot path.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+pub fn typematic_test_force_due() {
+    use core::sync::atomic::Ordering;
+    typematic::NEXT_MS.store(crate::arch::ms(), Ordering::Relaxed);
+    // keep liveness satisfied so the force-due path exercises the backpressure/arm logic, not the liveness drop
+    typematic::LAST_REPORT_MS.store(crate::arch::ms().max(1), Ordering::Relaxed);
+}
+
+/// UVUG-9 test aid — read the `STREAMS_WHILE_HELD` verdict, so the selftest can assert that ordinary hold-time
+/// traffic (a rollover release, a non-ascii tap) does NOT latch it. Not used on any boot path.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+pub fn typematic_test_streams_latched() -> bool {
+    typematic::STREAMS_WHILE_HELD.load(core::sync::atomic::Ordering::Relaxed) != 0
+}
+
+/// UVUG-9 test aid — clear all typematic tracker state so a selftest leg starts from a known baseline
+/// (equivalent to a fresh keyboard, without faking a detach generation). Not used on any boot path.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+pub fn typematic_test_reset() {
+    use core::sync::atomic::Ordering;
+    typematic::KEY_P1.store(0, Ordering::Relaxed);
+    typematic::STREAMS_WHILE_HELD.store(0, Ordering::Relaxed);
+    typematic::PREV_HELD.store(0, Ordering::Relaxed);
+    typematic::IDLE_RUN.store(0, Ordering::Relaxed);
+    typematic::LAST_REPORT_MS.store(0, Ordering::Relaxed);
+}
+
+/// UVUG-9 — the consecutive unchanged-held reports required to latch the streaming verdict, mirrored so the
+/// selftest sizes its idle-re-report run against the real threshold rather than a magic number.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+pub const TYPEMATIC_IDLE_RUN_TO_LATCH: u32 = typematic::IDLE_RUN_TO_LATCH;
+
+fn pop_event() -> Option<Event> {
+    let ev = crate::arch::without_interrupts(|| EVENT_QUEUE.lock().pop());
+    if ev.is_some() {
+        // UVUG-10: total consumption, across EVERY consumer — the router drain, the EL0 focus-change
+        // discard, `pump_and_poll`. `push - drop - pop` is the live ring occupancy; a `pop` count far
+        // above the router drain's own `[uvug9]` totals names a second consumer as the thief.
+        EVQ_POP.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    ev
+}
+
+/// UVUG-10 — the RE-CIRCULATION seam: pop / re-push an event WITHOUT touching the accounting counters.
+///
+/// `main::pump_usb_into_gui`'s `SCREEN_APP_ACTIVE` branch does a non-destructive PEEK: it drains the ring
+/// into a fixed buffer to look for a pending Button, then re-pushes every event in its original order and
+/// hands the queue back to the full-screen app's own drain. That is not production and not consumption —
+/// the same events go round again on the next pass, ~250×/s while a kernel app owns the panel. Counted
+/// through `push_event`/`pop_event` it would inflate `push`, `pop` AND (once the ring is deep) `drop` by
+/// orders of magnitude, in exactly the state where a stalled drain is the thing under suspicion — the
+/// witness would manufacture its own false positive. These two functions keep the peek invisible to the
+/// counters, so `push`/`pop` continue to mean "entered the pipeline once" / "left the pipeline for good".
+pub fn requeue_event(event: Event) {
     crate::arch::without_interrupts(|| {
         EVENT_QUEUE.lock().push(event);
     });
 }
 
-fn pop_event() -> Option<Event> {
+/// WC-TAB — the THIRD outcome of the re-circulation seam: an event taken with `peek_event_uncounted` that
+/// is deliberately NOT returned.
+///
+/// The seam was written for a strict peek: pop uncounted, re-push uncounted, nothing enters or leaves the
+/// pipeline. The compositor's shell-side TAB breaks that symmetry — the TAB itself is consumed by the
+/// window system, and on a real focus change the events held in the peek buffer are discarded (they are
+/// out of the queue only because the peek holds them; `el0_input_set_active` drains `EVENT_QUEUE` on every
+/// focus change and would have taken them itself). Those events entered through `push_event` and were
+/// COUNTED, so leaving them uncounted on the way out drifts `[uvug10] evq`'s `push - drop - pop`
+/// occupancy permanently high — by the buffer size plus one per consumed cycle. Call this with the number
+/// actually dropped so `pop` keeps meaning "left the pipeline for good".
+pub fn note_uncounted_discard(count: usize) {
+    if count > 0 {
+        EVQ_POP.fetch_add(count as u64, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The pop half of the re-circulation seam (see [`requeue_event`]). Every event taken with this MUST be
+/// returned with `requeue_event` — or, if it is deliberately consumed, accounted with
+/// [`note_uncounted_discard`]; otherwise the accounting silently loses it.
+pub fn peek_event_uncounted() -> Option<Event> {
     crate::arch::without_interrupts(|| EVENT_QUEUE.lock().pop())
 }
 
@@ -451,6 +902,9 @@ pub fn pump_and_poll() -> Option<Event> {
     while let Some(byte) = crate::arch::poll_input() {
         push_event(Event::Key(byte));
     }
+    // GUI-WIRE: liveness heartbeat for the app-input watchdog — the active full-screen app's drain
+    // loop proves it is still making progress once per pass. No-op when no app owns the screen.
+    crate::gui_watchdog::note_progress();
     pop_event()
 }
 
@@ -473,6 +927,16 @@ impl<'a> TargetPal<'a> {
             m.line_h
         );
         Self { surface }
+    }
+
+    /// VUG-FPS bandwidth witness: bytes the last `render()` (flush) copied to the framebuffer.
+    pub fn last_flush_bytes(&self) -> u64 {
+        self.surface.last_flush_bytes()
+    }
+
+    /// VUG-PAR witness: parallel bands the last `render()` (flush) used (1 = serial / feature-off).
+    pub fn last_flush_bands(&self) -> usize {
+        self.surface.last_flush_bands()
     }
 }
 

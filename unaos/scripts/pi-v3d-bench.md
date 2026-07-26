@@ -50,7 +50,7 @@ framebuffer).
 ## Pass / stop criteria
 
 - **PASS** = `M1 probe PASS` + `M2 MMU PASS` + `M3 clear-job PASS` all present, **0 `AARCH64
-  EXCEPTION`**, and the full `pi4-regression.spec` still 46/46 (the V3D bring-up must not regress the
+  EXCEPTION`**, and the full `pi4-regression.spec` still 49/49 (the V3D bring-up must not regress the
   syscall/CoW/BANDY chain — it runs on the BSP after `emmc2::probe`, ahead of the AP workload).
 - **STOP + record** (do not improvise a fix — report the exact lines) if any of:
   - `HUB_IDENT0` reads `0x00000000` or `0xFFFFFFFF` on metal (power/clock ordering or wrong base) →

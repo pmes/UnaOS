@@ -42,6 +42,18 @@ pub mod net_phy;
 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
 pub mod smolnet;
 
+// SNTP-X86: the shared, arch-neutral RFC 4330 SNTP reply parser + request builder. The x86 smolnet
+// SNTP client (`smolnet::sntp_*`) renders civil time through it; the pi/genet PI-NET-16 client migrates
+// onto it in a later fold. Pure no_std/no-alloc parser (all `pub`, so no dead-code warning where a given
+// arch has no consumer yet). See net_sntp.rs.
+pub mod net_sntp;
+
+// SOCK-8: the shared, arch-neutral DNS A-record query builder + response parser. The x86 smolnet resolver
+// (`smolnet::resolve`) renders name lookups through it; the pi/genet PI-NET-14 client migrates onto it in a
+// later fold. Pure no_std/no-alloc (all `pub`, so no dead-code warning where a given arch has no consumer
+// yet). See net_dns.rs.
+pub mod net_dns;
+
 pub mod allocator;
 pub mod shell;
 pub mod selftest;
@@ -84,12 +96,16 @@ pub mod bootlog;
 
 pub mod pal;
 pub mod ui;
+pub mod ui_status;
 pub mod video;
 pub mod clock;
+#[cfg(feature = "logts")]
+pub mod logts;
 pub mod console;
 pub mod user;
 pub mod splash;
 pub mod vug;
+pub mod gui_watchdog;
 
 pub fn init() {
     arch::init();
