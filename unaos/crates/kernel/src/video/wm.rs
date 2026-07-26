@@ -1953,9 +1953,23 @@ static CUR3_ENSURE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU6
 /// the P62 wire (`offers=4181 taken=2427`) could say only that 42% of offers fell back — not which
 /// of the three documented reasons was doing it, and therefore not which one was worth fixing.
 ///
-/// * `straddle` — offers where the sprite met this window's box only PARTIALLY. Under CURSOR-3 every
-///   one of these was a whole-sprite decline; under CURSOR-4 they are composed in part, so this
-///   counter is now a measure of how often the split MECHANISM runs, not of a loss.
+/// * `straddle` — offers where SOME painted sprite pixel fell outside this window's box.
+///
+/// ### CURSOR-6 — `straddle` was not a straddle count, and the 48% it implied was an artefact
+/// The P65v2 desktop wire reads `offers=33790 taken=16111 straddle=18443`, which invites the reading
+/// "half of all offers decline, and the straddle mechanism is why". It is not what those numbers say.
+/// An OFFER is made to every staged window of a pass that holds a plan — `stage_window` has no
+/// overlap test, deliberately, because a window that paints over sprite pixels without composing them
+/// must still clear their coverage. The sprite is over ONE window; every OTHER window in the pass
+/// receives an offer it misses ENTIRELY, and `missed > 0` counted that identically to a genuine
+/// partial carry. With ~1.6 offers per session (`offers / planned`), the arithmetic is not a mechanism
+/// declining half the time — it is one window taking the sprite and its neighbours being asked.
+///
+/// So the class is split, and only the second half is the mechanism:
+/// * `disjoint` — `taken == 0 && missed > 0`: the sprite was nowhere in this window. Not a decline at
+///   all, and not a loss; it is the shape of the offer set.
+/// * `partial` — `taken > 0 && missed > 0`: a real straddle, composed in part. The measure of how
+///   often the split mechanism actually runs.
 /// * `lock` — a contended plan lock, at either end: a `composite` that found another pass already
 ///   owning the overlay session, or a `compose_into` that could not take `OVERLAY` inside the guard.
 ///   Both fall back whole; neither spins.
@@ -1963,6 +1977,13 @@ static CUR3_ENSURE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU6
 ///   WC-D verification) or a WC-F reserved box overlapped the sprite. All one-shots.
 #[cfg(feature = "witness")]
 static CUR3_DECL_STRADDLE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// CURSOR-6 — the two halves of the old `straddle` class. See [`CUR3_DECL_STRADDLE`]'s comment for
+/// why the single counter could not be read.
+#[cfg(feature = "witness")]
+static CUR6_DECL_DISJOINT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "witness")]
+static CUR6_DECL_PARTIAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 #[cfg(feature = "witness")]
 static CUR3_DECL_LOCK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 #[cfg(feature = "witness")]
@@ -1990,6 +2011,13 @@ fn note_cursor_overlay(c: &super::cursor::Composed) {
     }
     if c.missed > 0 {
         CUR3_DECL_STRADDLE.fetch_add(1, Relaxed);
+        // CURSOR-6 — and WHICH half. `taken` is the discriminator and it is already to hand, so the
+        // split costs one branch on a path that was already doing four.
+        if c.taken > 0 {
+            CUR6_DECL_PARTIAL.fetch_add(1, Relaxed);
+        } else {
+            CUR6_DECL_DISJOINT.fetch_add(1, Relaxed);
+        }
     }
     if c.locked {
         CUR3_DECL_LOCK.fetch_add(1, Relaxed);
@@ -2085,13 +2113,20 @@ fn cursor3_rollup(scope: &str) {
     } else {
         "COMPOSED"
     };
+    let disjoint = CUR6_DECL_DISJOINT.load(Relaxed);
+    let partial = CUR6_DECL_PARTIAL.load(Relaxed);
     serial_println!(
-        "[cursor3] rollup scope={} planned={} offers={} taken={} adopt={} repaint={} ensure={} straddle={} lock={} budget={} stale={} -> {}",
-        scope, planned, offers, taken, adopt, repaint, ensure, straddle, lock, budget, stale, verdict
+        "[cursor3] rollup scope={} planned={} offers={} taken={} adopt={} repaint={} ensure={} straddle={} disjoint={} partial={} lock={} budget={} stale={} -> {}",
+        scope, planned, offers, taken, adopt, repaint, ensure, straddle, disjoint, partial, lock,
+        budget, stale, verdict
     );
     // CURSOR-5 — the coherence residual, immediately after the decline breakdown so a bench capture
     // shows "how often the mechanism ran" and "what it cost when it raced" as one block.
     super::cursor::cursor5_rollup(scope);
+    // CURSOR-6 — and what the PANEL got, which is the question neither of the two lines above can
+    // reach: both are taken from inside the sprite's own bookkeeping, and an overwrite by a painter
+    // that never consulted the module leaves that bookkeeping intact.
+    super::cursor::cursor6_rollup(scope);
 }
 
 /// WC-A — whether the first `[wc-a] composite` witness has been emitted (first composite only; a
@@ -2497,7 +2532,39 @@ fn draw_window(
     // these pixels no longer hold. Clearing here, in back-to-front draw order, makes the topmost
     // painter of each pixel the one whose verdict the tail acts on.
     if let (Some(p), false) = (cur, overlaid) {
-        super::cursor::overlay_uncover(&p, bx, by, bw, bh);
+        // CURSOR-6 — a clear that could not be applied is not a shrug. `overlay_uncover` now reports
+        // it, and the session is marked untrustworthy so the tail takes the whole-sprite refresh
+        // instead of installing coverage this window has just painted over. See
+        // `cursor::UNCOVER_LOST` for the interleave and for both symptoms it produces.
+        if !super::cursor::overlay_uncover(&p, bx, by, bw, bh) {
+            super::cursor::note_uncover_lost();
+        }
+    }
+    // CURSOR-6 — THE DIRECT MEASUREMENT. This window's pixels are on the panel now; did they land on
+    // a LIVE arrow, and was the arrow protected when they did?
+    //
+    // `cur.is_some()` is exactly "this pass opened an overlay session and mask-undrew the sprite over
+    // every window that meets it" — the paint set `composite_inner` builds is independent of the
+    // per-window `may_overlay` exclusion, so a plan in hand means the bracket ran whether or not this
+    // particular window was allowed to compose. Those pixels were handed back before the blit and the
+    // pass's tail owes them a repaint: healthy, and counted as the denominator.
+    //
+    // `cur.is_none()` with a live sprite over this box is the defect. The pass took no plan — the
+    // sprite was not on the panel when `sprite_plan()` was called, or no window met it then — and it
+    // is now blitting window content over an arrow nothing handed back. Those pixels hold the arrow
+    // before the blit and window content after it, no path tells the sprite module, and the module's
+    // own bookkeeping stays perfectly self-consistent throughout. That is why every CURSOR-5 counter
+    // can read `COHERENT` while the panel is spotty, and it is the one thing none of them can see.
+    //
+    // `live_box_relaxed` is two relaxed atomics and no lock, so this is admissible inside the
+    // `BlitGuard` window where `sprite_box()` (which takes `SPRITE`) would not be. Diagnostic only —
+    // no pixel decision is taken from it, so a box one pointer report stale costs precision and
+    // nothing else.
+    #[cfg(feature = "witness")]
+    if let Some(sb) = super::cursor::live_box_relaxed() {
+        if boxes_overlap(sb, (bx, by, bw, bh)) {
+            super::cursor::note_present_over_sprite(cur.is_some());
+        }
     }
 
     // Clean the touched rows (superset: whole scanlines of the outer box) for the non-coherent
