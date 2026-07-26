@@ -3,6 +3,46 @@
 Hard-won silicon facts from the fox-metal sitting series. Trust these over any
 QEMU behavior. Newest sitting first.
 
+## Sitting #36 (fence pull 32 register-side strip test, UnaOS-gemini@8d2baec0, 2026-07-26, fox-metal-r23s1n, s36boot1)
+
+**⭐⭐ FENCE ARC VERDICT — THE TENTH STRIP CLOSES THE INVESTIGATION: THE
+WALL IS THE ABSENT FECS CONTEXT MACHINERY, AND NOTHING ELSE.**
+Coordinator awk-verified:
+```
+:: kepler: witness pre-rewrite PFIFO_CHAN[1]=00002000 ::
+:: kepler: witness post-bind PFIFO_CHAN[1]=00002000 ::   <- NOT C0002000; strip persists with CHAN_CUR bound
+:: kepler: PFIFO_CHAN[1] post-submit: 00=00002000 04=11000001 ::
+:: kepler: witness-rematch end err=00000002 stat=00000005 valid=00002000 ::   <- tenth
+```
+The complete elimination, ten sittings of it: runlist encodings, USERD
+variants, flushes, CTRL_ADDR, powered engine, reset-pulsed engine, LIVE
+running engine, HALTED engine, and now a host-populated CHAN_CUR/CHAN_NEXT
+— the strip signature never moved once. Meanwhile every constructive fact
+points the same way: the submit path provably works (PLAYLIST_RD echoes
+our runlist), the falcon executes our code, the CTXCTL register surface is
+mapped and writable, and ENGINE_STATUS.CHAN_VALID — the bit PFIFO's
+validation plausibly keys on — is set by NOTHING we can reach from the
+host. **The remaining actor is the FECS context-switch microcode itself
+(STUDY-fecs-ctx-init phases): the arc's next era is authoring the minimal
+FECS ucode that brings up the ctx machinery.** K-GPU-4 pivots from
+probing the wall to building the gatekeeper.
+
+**SMC — Fox misread corrected at fold (facts-first):** the early sweep
+stuck (`BRSC stuck`, present=false retries=2/2) but the capture shows
+RECOVERY later in the same boot: `present=true soc=73% ac=derived:discharging
+retries=8/18` … `9/27` … hold/release cycling repeatedly. The robustness
+arc is functioning as designed on visibly flaky hardware; retry counters
+are earning their keep (8–9 retries per sweep some passes). Watch-item,
+not regression: per-key dropout density (volt/amp/full alternate missing)
+— if s37 shows the same, the per-key retry budget may deserve one more
+attempt.
+
+Other legs: MTRAW correctly absent (zero EHCI-MT lines); BOT summary
+n=0 (no USB storage attached — informational); console scale-4 unchanged.
+
+Capture from mark s36boot1. ESP by coordinator (8d2baec0…), Fox
+sha-verified, flashed only.
+
 ## Sitting #35 (fence pull 31 first context-bind + SMC derived-ac + scale-4 console, UnaOS-gemini@6fbbb939, 2026-07-25, fox-metal-r23s1n, s35boot1)
 
 **FENCE — THE BIND TAKES; CHAN_VALID DOES NOT; AND THE "VALID BIT HELD"

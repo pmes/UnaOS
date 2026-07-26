@@ -1,11 +1,15 @@
 # PETER'S RELAY SHEET — not for specialists. Coordinator overwrites this with
 # the message(s) Peter posts into each Gemini chat, verbatim.
-# (updated 2026-07-25: pull 32 APPROVED with one amendment — pre-rewrite read added)
+# (updated 2026-07-26: s36 folded — ARC VERDICT, the wall is the absent FECS ctx machinery; pull 33 = the new era)
 
 ## → kepler-fence session
 
-Fence: pull 32 APPROVED — this is exactly the corrected experiment, and the PLAYLIST_RD decode is accepted and banked (the hardware confirming it reads our exact runlist is a quietly important fact: the submit path works; only channel validation refuses). ONE BINDING AMENDMENT: read and print PFIFO_CHAN[1] word 0 BEFORE your rewrite too, labeled `witness pre-rewrite PFIFO_CHAN[1]=…`, so the capture shows resting and post-rewrite values side by side. Keep pull 31's bind block byte-identical, as you proposed. Implement as approved + amendment, commit ALL docs+code, no push. Report "PUSH OWED: n". (I run all builds and gates.)
+Fence: s36, and it's the verdict. Verbatim: `witness pre-rewrite PFIFO_CHAN[1]=00002000` → `witness post-bind PFIFO_CHAN[1]=00002000`. Not C0002000. The strip persists with CHAN_CUR and CHAN_NEXT bound, post-submit unchanged, rematch end err=00000002 stat=00000005 valid=00002000 — the tenth identical confirmation, and the last one we need.
+
+Step back and look at what ten sittings of elimination bought: the submit path WORKS (PLAYLIST_RD echoes our exact runlist), the falcon EXECUTES our code (F00DFACE, twice per boot, every boot), the CTXCTL surface is mapped and writable, the poison trigger is convicted and avoidable — and no host-reachable write moves the strip. The wall has exactly one account left: PFIFO's channel validation keys on state only the FECS context-switch microcode builds. We are done probing the wall. The next era builds the gatekeeper.
+
+PULL 33 INVITATION — the first FECS context ucode, proposal-first, and take the size seriously (this is a program, not a probe). From your own STUDY's phase list, propose the MINIMAL ucode that stands up just enough ctx machinery to flip validation — suggested shape, argue better if you see it: (1) self-init only as far as needed; (2) implement the smallest host↔FECS command loop on the CC_SCRATCH/WRCMD surface your study mapped (with 0x409504's poison behavior now understood, say explicitly how the ucode-side WRCMD interface relates to the host-side faulting offset — falcon-side IO may be exactly where WRCMD is legitimate); (3) the target observable: ENGINE_STATUS.CHAN_VALID asserting after a bind command, then the register-side strip test passing. Milestone it — pull 33 can be just the ucode skeleton + command-loop echo test (host writes a command, ucode acks in a scratch register), with ctx-state assertion as pull 34. Full annotated listing with per-instruction citations, as pull 25 set the precedent. Bound every loop.
 
 ## → kepler-display session
 
-Display: scale-4 confirmed on glass — Peter: "text looks great." The console question is fully closed; lane idle, nothing owed.
+Display: idle, graduated, nothing owed. (For your interest: the fence lane just closed its ten-refutation elimination — the wall is the absent FECS context machinery, and the campaign turns constructive.)
