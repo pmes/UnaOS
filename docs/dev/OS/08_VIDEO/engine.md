@@ -2604,3 +2604,39 @@ find `DESKTOP_BG` byte-for-byte at 5/5 and 3/3 — the staged fill lands the ide
   construction and falls back correctly rather than losing pixels.
 * The cursor over a closing window: the sprite must reappear after the fill, never be erased into the
   desktop and never leave a stale patch — the `undraw`/composite bracket is the thing being watched.
+
+## 9. CRISPY-PI — the theme table (`video/theme.rs`)
+
+The Crispy desktop theme now exists kernel-side as a `const` table:
+`crates/kernel/src/video/theme.rs`. It carries the 18 palette roles (chrome face,
+the two bevels, frame keyline, the four title-gradient stops, the two title inks,
+button face/pressed/ink, content fill/ink, scroll track/thumb, accent) plus the
+gloss highlight and its two alpha scalars, and all eleven metrics (`frame`,
+`bevel`, `title_height`, `corner_radius`, `scrollbar_width`, `button_height`,
+`button_pad_x`, `gap`, `control_box`, `text_px`, `line_height_pct`).
+
+**The shared-source law.** The source of record is `kits/crispy/theme.json` @
+`us-crispy` `08b42ede`, read on the host by `libs/quartzite/src/theme.rs`. Both
+arches — aarch64 Pi 4 and x86_64 — source their chrome and desktop constants from
+this one table, and the table mirrors that one json. No per-arch invented numbers.
+A value changes in the kit json first, then is re-lifted here.
+
+**Representation and the pinned rounding rule.** Colours are packed `0x00RRGGBB`:
+the json palette carries no per-colour alpha, so the top byte is zero rather than
+an invented `0xFF`. Each literal was produced from its json triple by quartzite's
+own converter, `to_u8(v) = (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8` — clamp,
+×255, +0.5, truncate toward zero, evaluated in `f32` at every step. Doing that
+rounding at authoring time is what keeps the kernel free of float at runtime while
+staying bit-identical to a quartzite-drawn pixel. The gloss alphas are lifted
+through the same rule into `u8` 0..=255.
+
+**Taste gate is OPEN.** These values are provisional-but-current — the visual
+verdict has not been taken. Because every consumer will read the names and never
+the literals, a verdict change edits that one file.
+
+**Wiring is a follow-up arc.** Nothing consumes the table yet; `wm.rs`,
+`screen.rs` and fbcon are untouched by CRISPY-PI. The module is byte-inert by
+construction (all `const`, no statics, no code, compile-time-only assertions), and
+that was verified rather than assumed: `target/pi_baremetal/kernel8.img` hashes
+identically with and without the change. `./arroyo check` clean on both arches;
+`./arroyo kernel8-test 90` MBENCH 80/80 required witnesses, 0 forbidden.

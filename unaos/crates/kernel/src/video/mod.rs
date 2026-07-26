@@ -32,6 +32,11 @@
 
 pub mod fbcon;
 pub mod framebuffer;
+// CRISPY-PI: the Crispy theme lifted from `kits/crispy/theme.json` (@ us-crispy 08b42ede) into a
+// kernel `const` table — packed 0x00RRGGBB palette roles + integer metrics, no float at runtime.
+// Both arches source chrome constants from here; no per-arch invented numbers. Nothing consumes it
+// yet (wiring is a follow-up arc), so it is byte-inert: all `const`, no statics, no code.
+pub mod theme;
 pub mod screen;
 // WC-A: the window table + compositor. Owns which pixels of which surface reach the panel; the
 // aarch64 window syscalls (WC-B) are thin fail-closed wrappers over its API.
