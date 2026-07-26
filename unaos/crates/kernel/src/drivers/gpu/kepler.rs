@@ -797,7 +797,45 @@ pub fn init(gpu: &GpuInfo) {
                                         }
                                     }
                                     serial_println!(":: kepler: post-bind playlist_rd={:08X} playlist_rd_len={:08X} ::", pl_rd, pl_rd_len);
-                                    
+
+                                    // --- GR6 runlist-sibling sweep (READ-ONLY; docs/dev/OS/08_VIDEO/gpu_spec.md §2.4.2) ---
+                                    // Under the gk104 array shape the host runlist controls are
+                                    // RUNLIST[i] base at 0x2270 + i*8 with its submit/length word at +4.
+                                    // We only ever submit to i=0. Reading i=1..3 discriminates the three
+                                    // surviving readings of the invariant bit 20 in PLAYLIST_RD_LEN
+                                    // (id field / commit-BUSY / unconditional status), and answers whether
+                                    // a non-PGRAPH (copy-engine) runlist exists — which would make
+                                    // FIFO-level method execution reachable without the Falcon ucode era.
+                                    // i=2 lands on 0x2280/0x2284, the pair already read above: a built-in
+                                    // cross-check on the array-stride assumption itself.
+                                    // Writes NOTHING — pull-28 no-unproven-writes rule.
+                                    let mut rl_occupied = 0u32;
+                                    for i in 1..4usize {
+                                        let base_off = 0x2270 + i * 8;
+                                        let len_off = base_off + 4;
+                                        let rl_base = mmio_read(bar0, base_off);
+                                        let rl_len = mmio_read(bar0, len_off);
+                                        let bit20 = (rl_len >> 20) & 1;
+                                        let engf = (rl_len >> 20) & 0xF;
+                                        let entries = rl_len & 0xFFF;
+                                        let poison = (rl_base >> 16) == 0xBADF || (rl_base >> 16) == 0xBAD0;
+                                        if !poison && rl_base != 0 {
+                                            rl_occupied |= 1 << i;
+                                        }
+                                        serial_println!(
+                                            ":: kepler: runlist-scan i={} base_off={:04X} base={:08X} len={:08X} bit20={} engfield={:X} entries={} {} ::",
+                                            i, base_off, rl_base, rl_len, bit20, engf, entries,
+                                            if poison { "POISON" } else if rl_base != 0 { "OCCUPIED" } else { "empty" }
+                                        );
+                                    }
+                                    serial_println!(
+                                        ":: kepler: runlist-scan verdict occupied_mask={:X} alias_i2_base={} alias_i2_len={} ::",
+                                        rl_occupied,
+                                        if mmio_read(bar0, 0x2280) == pl_rd { "match" } else { "DIVERGES" },
+                                        if mmio_read(bar0, 0x2284) == pl_rd_len { "match" } else { "DIVERGES" }
+                                    );
+
+
                                     let err = mmio_read(bar0, 0x252c);
                                     let stat = mmio_read(bar0, 0x263c);
                                     let err_str = if err == 0 || err == 0xFFFFFFFF || err == 0xBAD0BA20 { "absent?" } else { "present" };
