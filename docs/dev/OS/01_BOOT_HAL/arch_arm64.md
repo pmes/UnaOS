@@ -7461,3 +7461,81 @@ lowest-set-bit; a garbage readback (Tegra234 no-HCRST takeover) demanded an 8 Mi
 allocation that overshot the heap into firewalled DRAM. Fix: clamp to the spec-sane 4–32 KiB
 bits (xHCI 5.4.3 mandatory 4 KiB fallback), null/heap-bounds guard, heap-PA witness. No
 behavior change on healthy controllers (Pi VL805 reads bit 0 set → 4 KiB, unchanged).
+
+## PH-3 — is the aarch64 block-write path "fully polled emmc2"? (verdict: **premise FALSE**)
+
+An answer owed to the pi4 lane, which was deciding on the `fs/fat.rs` `FAT_MUTATION` span
+justification. **This section changes no behavior** — it records the traced facts. Any change to
+aarch64 storage dispatch belongs to the pi4 lane.
+
+### The claim under test
+
+`fs/fat.rs:581-585` (the `FAT_MUTATION` doc comment) justified holding an IRQ-masked lock across
+block I/O with: *"the aarch64 storage path is fully POLLED (an emmc2 busy-poll on metal; a spin-loop
+under the QEMU raspi4b/virt models, which deliver no timer IRQ so `hlt` degrades to a spin)"*, and
+`fs/fat.rs:600-601` restated it as *"the aarch64 I/O is polled … a couple of bounded polled sector
+transfers"*. Both halves are false as written.
+
+### Citation chain (traced 2026-07-27)
+
+1. `fs/fat.rs:602-610` — `with_fat_lock` is `#[cfg(target_arch = "aarch64")]`: **no `baremetal`
+   gate**. It wraps `f()` in `arch::without_interrupts`.
+2. `arch/aarch64/mod.rs:313-331` — `without_interrupts` does `msr daifset, #2` (mask I) around the
+   closure and restores DAIF. So the lock hold is IRQ-masked on **every** aarch64 build.
+3. `fs/fat.rs:568-573` — `write_sector(BlockSource::Default, ..)` calls
+   `drivers::block::write_block`.
+4. `drivers/block.rs:210-232` — `write_block` routes to `emmc2::write_block_512` **only** under
+   `#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]` **and** only when the runtime
+   `BACKEND` atomic reads `BACKEND_SD`. Otherwise it falls through to the xHCI BOT `WRITE(10)` body.
+5. `drivers/block.rs:22-25` — `BACKEND` initializes to `BACKEND_XHCI`; `drivers/block.rs:175-178`
+   `register_sd` is the **only** writer that flips it to SD.
+6. `drivers/emmc2.rs:400-427` — `register_sd` fires only from `finish()`, i.e. only after a
+   successful `try_init` on one of the two bases. No card / failed init → the driver prints
+   *":: M6g: no SD card on either base — no block device registered ::"* and `BACKEND` stays xHCI.
+7. `drivers/mod.rs:1-2` — `pub mod pci;` and `pub mod xhci;` are declared with **no arch cfg**.
+8. `arch/aarch64/pci.rs:37,94-125` — the aarch64 `pci::init` scans for xHCI and installs
+   `XHCI_CONTROLLER`; `main.rs:764-765` calls it under `#[cfg(not(feature = "skip_xhci"))]` only —
+   no arch gate.
+9. `drivers/xhci/mod.rs:5596` → `drivers/block.rs:150-160` — a USB stick's enumeration calls
+   `publish_usb_geometry`, which claims the global `BLOCK_DEVICE` whenever `BACKEND != BACKEND_SD`.
+
+**Therefore, two live aarch64 configurations put the xHCI BOT pump inside the IRQ-masked
+`FAT_MUTATION` span:**
+
+- **aarch64 non-`baremetal`** (QEMU `virt`): `emmc2` is not even compiled (`drivers/mod.rs:16-18`),
+  `write_block` has no SD branch at all, so BOT is the **only** path — while `with_fat_lock` is
+  still a real IRQ-masked lock.
+- **aarch64 `baremetal` with no usable microSD**: `main.rs:316-317` runs `emmc2::probe()` before
+  `arch::pci::init` (`main.rs:765`), so a *successful* card init does win the race — but a failed
+  one leaves `BACKEND_XHCI`, and a later-enumerated USB stick then owns `BLOCK_DEVICE`.
+
+### The second false half — "no timer IRQ, `hlt` degrades to a spin"
+
+- `arch/aarch64/mod.rs:236-243` — `hlt()` issues a real `wfi` whenever `timer::is_live()`; it
+  poll-spins **only** when timer liveness was never confirmed.
+- `drivers/xhci/mod.rs:5348-5350` — the BOT pump's own doc says *"On x86 / Pi / aarch64-virt … `hlt()`
+  waits for an interrupt (HLT / WFI with a live timer)"*. That is the direct contradiction.
+
+### Why the *conclusion* nevertheless survives (for a different reason)
+
+The span is still safe on aarch64, but not because the I/O is polled:
+
+- `wfi` **wakes on a pending physical interrupt even with PSTATE.I set** (stated at
+  `arch/aarch64/mod.rs:237-239`), unlike x86 `hlt` under `IF=0`, which is exactly why x86 is
+  excluded. So masking does not deadlock the pump.
+- `drivers/xhci/mod.rs:5355-5400` — `pump_until_bot_done` drains the event ring by **polling**
+  (`drain_event_ring_once`), not from an IRQ handler, and is bounded by a `now_cycles`/
+  `hw_wait_budget` **wall-clock deadline**, not an iteration count. `now_cycles` (CNTVCT) advances
+  with the timer masked.
+- The pump calls `crate::hlt()`, never a scheduler yield — so the "no scheduler yield" half of the
+  original justification does hold.
+
+### Verdict
+
+**FALSE.** The stated premise ("the aarch64 storage path is fully polled emmc2") is not an
+invariant of any aarch64 build; the xHCI BOT path is reachable under the IRQ-masked lock on
+aarch64-virt always, and on Pi metal whenever the microSD does not register. The safety conclusion
+is still correct, resting instead on (a) `wfi` waking with PSTATE.I set, (b) a polled event-ring
+drain, and (c) a wall-clock-bounded pump. `fs/fat.rs`'s comment has been corrected to state that
+real invariant. **No dispatch behavior was changed** — the pi4 lane owns any decision about whether
+a `baremetal` build should refuse the BOT fallback for `BLOCK_DEVICE`.

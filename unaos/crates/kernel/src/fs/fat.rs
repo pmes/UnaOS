@@ -578,11 +578,23 @@ fn write_sector(source: BlockSource, lba: u64, buf: &[u8; SECTOR_SIZE]) -> Resul
 /// so the mirrored FAT copies never diverge under concurrency. See [`with_fat_lock`] for the lock-span and the
 /// arch reasoning; the flag it closes is the U11-M2b reaper's downstream `set_fat_entry` RMW (docs/MILESTONES).
 ///
-/// aarch64-only on purpose: the aarch64 storage path is fully POLLED (an emmc2 busy-poll on metal; a spin-loop
-/// under the QEMU raspi4b/virt models, which deliver no timer IRQ so `hlt` degrades to a spin), so the lock can
-/// span the bounded RMW block I/O without ever yielding the scheduler. x86 is EXCLUDED because its FAT path
-/// `hlt`s awaiting an async xHCI transfer event and a `hlt` under a cleared IF never wakes — masking IRQs
-/// across it would hang; the x86 side carries its own U11x concurrency model in `arch/x86_64` regardless.
+/// aarch64-only on purpose. ⚠ PH-3 (2026-07-27) CORRECTED the reason: this comment previously claimed "the
+/// aarch64 storage path is fully POLLED (emmc2)". That is NOT an invariant of any aarch64 build — the xHCI
+/// BOT path IS reachable under this lock. `with_fat_lock` is gated on `target_arch` alone (no `baremetal`),
+/// while `block::write_block`/`read_block` route to `emmc2` only under `cfg(baremetal)` AND only once the
+/// runtime `BACKEND` atomic has been flipped by `emmc2::finish` → `block::register_sd`. So on aarch64-virt
+/// (no `emmc2` compiled at all) BOT is the ONLY path, and on Pi metal a failed card init leaves BACKEND_XHCI
+/// with a later-enumerated USB stick owning `BLOCK_DEVICE` (`block::publish_usb_geometry`).
+///
+/// THE REAL INVARIANT that makes the IRQ-masked span safe on aarch64 — it holds for BOTH backends:
+///   (a) emmc2 is a bounded busy-poll; and
+///   (b) the xHCI BOT pump (`xhci::pump_until_bot_done`) drains its event ring by POLLING, never from an IRQ
+///       handler, and is bounded by a `now_cycles`/`hw_wait_budget` WALL-CLOCK deadline (CNTVCT keeps
+///       advancing with the timer masked); its idle step is `arch::hlt`, whose `wfi` WAKES ON A PENDING
+///       PHYSICAL INTERRUPT EVEN WITH PSTATE.I SET, and which is never a scheduler yield.
+/// x86 is EXCLUDED because its `hlt` under a cleared IF never wakes — masking IRQs across it would hang; the
+/// x86 side carries its own U11x concurrency model in `arch/x86_64` regardless. Full traced citation chain:
+/// `docs/dev/OS/01_BOOT_HAL/arch_arm64.md` ("PH-3 — is the aarch64 block-write path 'fully polled emmc2'?").
 #[cfg(target_arch = "aarch64")]
 static FAT_MUTATION: spin::Mutex<()> = spin::Mutex::new(());
 
@@ -597,8 +609,10 @@ static FAT_MUTATION: spin::Mutex<()> = spin::Mutex::new(());
 ///
 /// LOCK SPAN: callers hold this ONLY across a single FAT-sector RMW (`set_fat_entry`'s bounded `num_fats`
 /// read+write loop) — never across a free-search (`alloc_cluster`), a data-cluster zero-fill/write loop, or a
-/// `mount()`. That is why "held across block I/O" is safe here: the aarch64 I/O is polled, so the span is a
-/// couple of bounded polled sector transfers with no scheduler yield, not an unbounded wait.
+/// `mount()`. That is why "held across block I/O" is safe here: the span is a couple of BOUNDED sector
+/// transfers with no scheduler yield, not an unbounded wait — bounded by the emmc2 busy-poll on the SD
+/// backend, and by the BOT pump's wall-clock deadline + polled event-ring drain on the xHCI backend (which
+/// PH-3 proved is reachable here; see [`FAT_MUTATION`] for the corrected invariant).
 #[cfg(target_arch = "aarch64")]
 #[inline]
 fn with_fat_lock<R>(f: impl FnOnce() -> R) -> R {
